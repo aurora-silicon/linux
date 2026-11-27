@@ -18,6 +18,9 @@ struct pmgr_ps_test_reg {
 	bool latched;		/* bit 11 latched: on stops at clock-gated, off still reaches 0 */
 	bool latch_sticky;	/* not even a PS reset clears it */
 	unsigned int reset_writes;	/* writes with the PS reset bit */
+	unsigned int flag_writes;	/* writes that would clear a WAS_*GATED flag */
+	unsigned int nwrites;	/* every write; the first of them are in @writes */
+	u32 writes[8];
 };
 
 static int pmgr_ps_test_read(void *ctx, unsigned int reg, unsigned int *val)
@@ -46,6 +49,9 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 	u32 parent = r->val & APPLE_PMGR_BUSY;
 	u32 actual;
 
+	if (r->nwrites < ARRAY_SIZE(r->writes))
+		r->writes[r->nwrites] = val;
+	r->nwrites++;
 	if (val & APPLE_PMGR_PS_RESET) {
 		r->reset_writes++;
 		if (r->latched && !r->latch_sticky) {
@@ -69,6 +75,8 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 		r->busy_writes++;
 	if (val & APPLE_PMGR_AUTO_ENABLE)
 		r->auto_writes++;
+	if (val & APPLE_PMGR_FLAGS)
+		r->flag_writes++;
 	r->val = (val & ~(APPLE_PMGR_PS_ACTUAL | APPLE_PMGR_BUSY)) | parent |
 		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, actual);
 	return 0;
@@ -83,11 +91,11 @@ static const struct regmap_config pmgr_ps_test_regmap = {
 	.fast_io = true,
 };
 
-/* A domain in power state @pstate, actual and target, on a device of its own */
-static struct apple_pmgr_ps *pmgr_ps_test_domain(struct kunit *test, u32 pstate,
-						 bool no_auto_pm, struct pmgr_ps_test_reg **reg)
+/* A domain in power state @pstate, actual and target, on a device of its own, @name */
+static struct apple_pmgr_ps *pmgr_ps_test_named_domain(struct kunit *test, const char *name,
+						       u32 pstate, bool no_auto_pm,
+						       struct pmgr_ps_test_reg **reg)
 {
-	static const char *const names[] = { "apple-pmgr-ps-auto", "apple-pmgr-ps-no-auto" };
 	struct pmgr_ps_test_reg *r;
 	struct apple_pmgr_ps *ps;
 	struct device *dev;
@@ -96,7 +104,7 @@ static struct apple_pmgr_ps *pmgr_ps_test_domain(struct kunit *test, u32 pstate,
 	KUNIT_ASSERT_NOT_NULL(test, r);
 	r->val = FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate) |
 		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, pstate);
-	dev = kunit_device_register(test, names[no_auto_pm]);
+	dev = kunit_device_register(test, name);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
 	ps = kunit_kzalloc(test, sizeof(*ps), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ps);
@@ -107,6 +115,14 @@ static struct apple_pmgr_ps *pmgr_ps_test_domain(struct kunit *test, u32 pstate,
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ps->regmap);
 	*reg = r;
 	return ps;
+}
+
+static struct apple_pmgr_ps *pmgr_ps_test_domain(struct kunit *test, u32 pstate,
+						 bool no_auto_pm, struct pmgr_ps_test_reg **reg)
+{
+	static const char *const names[] = { "apple-pmgr-ps-auto", "apple-pmgr-ps-no-auto" };
+
+	return pmgr_ps_test_named_domain(test, names[no_auto_pm], pstate, no_auto_pm, reg);
 }
 
 /* Powering on enables automatic PM, unless the domain is apple,no-auto-pm. */
@@ -544,6 +560,272 @@ static void pmgr_ps_consumer_refused_test(struct kunit *test)
 			APPLE_PMGR_PS_ACTIVE);
 }
 
+/*
+ * A powered-on domain with its reset controller, as probe registers it, on
+ * a device called @name.
+ */
+static struct apple_pmgr_ps *pmgr_ps_test_reset_domain(struct kunit *test, const char *name,
+							struct pmgr_ps_test_reg **reg)
+{
+	struct apple_pmgr_ps *ps = pmgr_ps_test_named_domain(test, name, APPLE_PMGR_PS_ACTIVE,
+							     false, reg);
+
+	spin_lock_init(&ps->genpd.slock);
+	ps->genpd.status = GENPD_STATE_ON;
+	ps->offset = 0x100;
+	ps->rcdev.ops = &apple_pmgr_reset_ops;
+	ps->rcdev.nr_resets = 1;
+	ps->rcdev.of_xlate = apple_pmgr_reset_xlate;
+	return ps;
+}
+
+/*
+ * The register writes since the log was last cleared were exactly two, with
+ * DEV_DISABLE and RESET as in @first and then as in @second. Clears the log.
+ */
+static void pmgr_ps_test_expect_writes(struct kunit *test, struct pmgr_ps_test_reg *r,
+				       u32 first, u32 second)
+{
+	const u32 mask = APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET;
+
+	KUNIT_EXPECT_EQ(test, r->nwrites, 2u);
+	KUNIT_EXPECT_EQ(test, r->writes[0] & mask, first);
+	KUNIT_EXPECT_EQ(test, r->writes[1] & mask, second);
+	r->nwrites = 0;
+	memset(r->writes, 0, sizeof(r->writes));
+}
+
+/*
+ * Assert quiesces, then resets; deassert releases the reset, then the
+ * quiesce; status reads the reset back.
+ */
+static void pmgr_ps_reset_assert_deassert_test(struct kunit *test)
+{
+	const struct of_phandle_args no_args = {};
+	const struct of_phandle_args args = { .args_count = 2, .args = { 7, 9 } };
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps = pmgr_ps_test_reset_domain(test, "apple-pmgr-ps-reset", &r);
+
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), 0);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), 0);
+	/* DEV_DISABLE in a write of its own, before the one that sets RESET. */
+	pmgr_ps_test_expect_writes(test, r, APPLE_PMGR_DEV_DISABLE,
+				   APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_DEV_DISABLE);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_RESET);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), 1);
+	/* The power state is left alone. */
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
+
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+	/* RESET released while the block is still quiesced, DEV_DISABLE after. */
+	pmgr_ps_test_expect_writes(test, r, APPLE_PMGR_DEV_DISABLE, 0);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_DEV_DISABLE);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_RESET);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 0u);
+
+	/* A pulse ends deasserted; the T8132 deassert delay changes nothing else. */
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_FALSE(test, r->val & (APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET));
+	ps->reset_time_us = APPLE_PMGR_T8132_RESET_TIME;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_FALSE(test, r->val & (APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET));
+
+	/*
+	 * A domain has one reset line, 0. Probe registers the controller with
+	 * no reset cells, so the core passes no arguments; xlate would not
+	 * read any either.
+	 */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_xlate(&ps->rcdev, &no_args), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_xlate(&ps->rcdev, &args), 0);
+}
+
+/* The WAS_*GATED flags are write-one-to-clear: reset writes never set them. */
+static void pmgr_ps_reset_keeps_flags_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps = pmgr_ps_test_reset_domain(test, "apple-pmgr-ps-reset", &r);
+
+	r->val |= APPLE_PMGR_FLAGS;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, r->flag_writes, 0u);
+	r->val |= APPLE_PMGR_FLAGS;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, r->flag_writes, 0u);
+	r->val |= APPLE_PMGR_FLAGS;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, r->flag_writes, 0u);
+}
+
+/* A domain the boot loader or firmware owns refuses every reset operation. */
+static void pmgr_ps_reset_refused_test(struct kunit *test)
+{
+	static const char *const names[] = {
+		"apple-pmgr-ps-reset-firmware", "apple-pmgr-ps-reset-inherited",
+	};
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+	unsigned int owner;
+	u32 val;
+
+	for (owner = 0; owner < 2; owner++) {
+		ps = pmgr_ps_test_reset_domain(test, names[owner], &r);
+		if (owner)
+			ps->inherited_on = true;
+		else
+			ps->firmware_owned = true;
+		r->val |= APPLE_PMGR_RESET;
+		val = r->val;
+
+		KUNIT_EXPECT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), -EPERM);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), -EPERM);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), -EPERM);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), -EPERM);
+		KUNIT_EXPECT_EQ(test, r->val, val);
+		KUNIT_EXPECT_EQ(test, r->nwrites, 0u);
+	}
+}
+
+/*
+ * With the idle wait before reset (T8132), the reset goes in only once the
+ * block is idle; a block that stays busy is never reset.
+ */
+static void pmgr_ps_reset_idle_wait_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps = pmgr_ps_test_reset_domain(test, "apple-pmgr-ps-reset", &r);
+
+	ps->needs_reset_idle_wait = true;
+	/* Idle: the wait passes and the reset goes in. */
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_RESET);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+
+	/*
+	 * Busy until the third read, which is the second of the wait (the
+	 * quiesce write reads the register first): the wait polls, and the
+	 * write that sets RESET follows the read that found the block idle.
+	 */
+	r->nwrites = 0;
+	r->val |= APPLE_PMGR_BUSY;
+	r->parent_reads = 3;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, r->parent_reads, 0u);
+	KUNIT_EXPECT_TRUE(test, r->writes[0] & APPLE_PMGR_BUSY);
+	KUNIT_EXPECT_FALSE(test, r->writes[1] & APPLE_PMGR_BUSY);
+	pmgr_ps_test_expect_writes(test, r, APPLE_PMGR_DEV_DISABLE,
+				   APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+
+	/* Busy for good: quiesced, but not reset, and the lock is released. */
+	r->nwrites = 0;
+	r->parent_stuck = true;
+	r->val |= APPLE_PMGR_BUSY;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->nwrites, 1u);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_DEV_DISABLE);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_RESET);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_RESET);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_DEV_DISABLE);
+}
+
+/* Without the idle wait, a block that stays busy is reset all the same. */
+static void pmgr_ps_reset_busy_no_idle_wait_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps = pmgr_ps_test_reset_domain(test, "apple-pmgr-ps-reset", &r);
+
+	r->parent_stuck = true;
+	r->val |= APPLE_PMGR_BUSY;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_assert(&ps->rcdev, 0), 0);
+	pmgr_ps_test_expect_writes(test, r, APPLE_PMGR_DEV_DISABLE,
+				   APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_BUSY);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_reset_status(&ps->rcdev, 0), 1);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_deassert(&ps->rcdev, 0), 0);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_reset_reset(&ps->rcdev, 0), 0);
+	KUNIT_EXPECT_FALSE(test, r->val & (APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET));
+}
+
+/* Forced-on auto-managed words write target 0xf, wait for actual 0xf, then AUTO_ENABLE. */
+static void pmgr_ps_auto_enable_test(struct kunit *test)
+{
+	static const u32 seq[][2] = {
+		{ 0, 0x0f0000ff },
+		{ 0, 0x1f0000ff },
+	};
+	struct pmgr_ps_test_bank *b;
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_consumer(test, 0x0f0003ff, &b);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 1);
+	pmgr_ps_test_expect_log(test, b, seq, ARRAY_SIZE(seq));
+	KUNIT_EXPECT_TRUE(test, b->word[0] & APPLE_PMGR_AUTO_ENABLE);
+
+	/* Delayed actual-state ACK completes before AUTO_ENABLE is written. */
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_CLKGATE, false, &r);
+	r->val = FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) |
+		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_CLKGATE) |
+		 APPLE_PMGR_FLAGS;
+	r->active_reads = 3;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 1);
+	KUNIT_EXPECT_EQ(test, r->active_reads, 0U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 1U);
+	KUNIT_EXPECT_EQ(test, r->busy_writes, 0U);
+}
+
+/* Fused-off, already-AUTO, and reset/disabled words are left completely untouched. */
+static void pmgr_ps_auto_enable_skip_test(struct kunit *test)
+{
+	static const u32 skipped[] = {
+		0x0f000300,					/* fused off (J616c dcs_24-31) */
+		0x1f0000ff,					/* already on AUTO_ENABLE */
+		0x0f0000ff | APPLE_PMGR_RESET,			/* held in reset */
+		0x0f0000ff | APPLE_PMGR_PS_RESET,		/* PS reset set */
+		0x0f0000ff | APPLE_PMGR_DEV_DISABLE,		/* device disabled */
+	};
+	struct pmgr_ps_test_bank *b;
+	struct apple_pmgr_ps *ps;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(skipped); i++) {
+		ps = pmgr_ps_test_consumer(test, skipped[i], &b);
+		KUNIT_EXPECT_EQ_MSG(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 0,
+				    "word %#x", skipped[i]);
+		KUNIT_EXPECT_EQ_MSG(test, b->nr_log, 0U, "word %#x", skipped[i]);
+		KUNIT_EXPECT_EQ_MSG(test, b->word[0], skipped[i], "word %#x", skipped[i]);
+	}
+}
+
+/* Stuck actual state times out without setting AUTO_ENABLE; read errors propagate. */
+static void pmgr_ps_auto_enable_fail_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_named_domain(test, "apple-pmgr-ps-auto-stuck",
+				       APPLE_PMGR_PS_CLKGATE, false, &r);
+	r->val = FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) |
+		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_CLKGATE);
+	r->stuck = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+
+	ps = pmgr_ps_test_named_domain(test, "apple-pmgr-ps-auto-err",
+				       APPLE_PMGR_PS_ACTIVE, false, &r);
+	r->parent_read_error = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
@@ -563,6 +845,14 @@ static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_consumer_retention_mask_test),
 	KUNIT_CASE(pmgr_ps_consumer_plain_test),
 	KUNIT_CASE(pmgr_ps_consumer_refused_test),
+	KUNIT_CASE(pmgr_ps_reset_assert_deassert_test),
+	KUNIT_CASE(pmgr_ps_reset_keeps_flags_test),
+	KUNIT_CASE(pmgr_ps_reset_refused_test),
+	KUNIT_CASE(pmgr_ps_reset_idle_wait_test),
+	KUNIT_CASE(pmgr_ps_reset_busy_no_idle_wait_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_skip_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_fail_test),
 	{}
 };
 

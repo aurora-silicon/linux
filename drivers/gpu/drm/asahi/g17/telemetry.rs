@@ -3,9 +3,11 @@
 //! Qualified V25G83/V26A428 statistics, decoded from complete copied records.
 //! No record of these firmwares measures power or temperature.
 //!
-//! The 26A428 firmware (the A18 Pro's, and the M5's) reports the performance state the
-//! GPU runs at (tags 0x19 and 0x1b), and its utilisation records carry their own
-//! timestamps, from which busy time is integrated ([`Protocol`]). 25G83 sends neither.
+//! The 26A428 firmware (the A18 Pro's, and the M5's) and T6041's 25G83
+//! firmware report the performance state the GPU runs at (tags 0x19 and 0x1b),
+//! and their utilisation records carry their own timestamps, from which busy
+//! time is integrated ([`Protocol`]). T6040's 25G83 is left on `Protocol::NONE`
+//! because it has not been measured yet.
 //! All state is protected by the device mutex.
 
 pub(super) const UNAVAILABLE: u32 = 0;
@@ -46,48 +48,61 @@ const _: () = {
 };
 
 const TIMER_HZ: u64 = 24_000_000;
+/// Records a firmware statistics ring holds (`fw::channels::STATISTICS_SLOTS`), repeated
+/// here so the decoder builds on its own (`tools/asahi/g17-telemetry-tests.rs`); the kernel
+/// build asserts the two are equal in `channel.rs`.
+pub(crate) const STATISTICS_RING_RECORDS: u32 = 256;
 
 /// What a firmware reports beyond utilisation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Protocol {
-    /// Highest performance state its state records (tags 0x19 and 0x1b) name; zero where it
-    /// sends none. State 0 is off.
-    pub(crate) max_pstate: u32,
+    /// Emits performance state reports in tags 0x19 (interval) and 0x1b (state).
+    pub(crate) reports_pstate: bool,
     /// Interval of its utilisation record (tag 0x13), in timer ticks, whose timestamps busy
     /// time is integrated from; zero where it is not integrated.
     pub(crate) util_period_ticks: u64,
 }
 
 impl Protocol {
-    /// 25G83: utilisation only.
+    /// Utilisation only: no 0x19/0x1b performance state reports and no busy-time integration.
     pub(crate) const NONE: Self = Self {
-        max_pstate: 0,
+        reports_pstate: false,
         util_period_ticks: 0,
     };
-    /// M5: the device tree's operating points 1 to 13, utilisation every 8 ms.
-    pub(crate) const M5: Self = Self {
-        max_pstate: 13,
+    /// Performance state reports (tags 0x19/0x1b) and 8 ms timestamped utilisation records
+    /// (192000 ticks at 24 MHz), as emitted by V26A428 M5 and T6041 25G83.
+    pub(crate) const PSTATE_8MS: Self = Self {
+        reports_pstate: true,
         util_period_ticks: 192_000,
     };
-    /// A18 Pro: states 1 to 10 of its eleven-state performance tables, utilisation every
-    /// 16 ms.
-    pub(crate) const A18_PRO: Self = Self {
-        max_pstate: 10,
+    /// Performance state reports (tags 0x19/0x1b) and 16 ms timestamped utilisation records
+    /// (384000 ticks at 24 MHz), as emitted by V26A428 on A18 Pro.
+    pub(crate) const PSTATE_16MS: Self = Self {
+        reports_pstate: true,
         util_period_ticks: 384_000,
     };
 
     pub(crate) const fn reports_pstate(self) -> bool {
-        self.max_pstate != 0
+        self.reports_pstate
     }
 
     fn integrates_busy(self) -> bool {
         self.util_period_ticks != 0
     }
 
-    /// A utilisation record more than two intervals after the previous one follows a gap the
-    /// firmware did not report (gated or lost records): it only sets the baseline.
+    /// A utilisation record at most two intervals after the previous one closes the window
+    /// since it. One after a longer gap the firmware did not report (the GPU was gated, or
+    /// records were lost) closes only its own sampling period.
     fn max_window_ticks(self) -> u64 {
         2 * self.util_period_ticks
+    }
+
+    /// How far a record can lag the busy mark and still have been queued: a full statistics
+    /// ring of the other role's utilisation records, one per interval, with a factor of two
+    /// for margin. A record further behind comes from a firmware clock that started again,
+    /// and only sets a new mark.
+    fn rebase_ticks(self) -> u64 {
+        2 * u64::from(STATISTICS_RING_RECORDS) * self.util_period_ticks
     }
 }
 
@@ -109,19 +124,25 @@ pub(super) struct Telemetry {
     gated: bool,
     /// The records decoded beyond utilisation.
     protocol: Protocol,
-    /// Timestamp of the latest utilisation record in this epoch: the start of the window the
-    /// next one closes.
-    busy_ts: Option<u64>,
+    /// Highest valid performance state index for tags 0x19/0x1b, derived from the device's
+    /// state-frequency table; zero fails closed and rejects all 0x1b states.
+    max_pstate: u32,
+    /// Firmware timestamp up to which busy time has been credited. It is kept across
+    /// epochs: power gates, suspend and restarts end the utilisation average, but never
+    /// let a record at or before this mark be credited again.
+    busy_mark: Option<u64>,
     busy_ns: u64,
     /// End of the latest performance state interval (tag 0x19), in timer ticks.
     pstate_interval_end: Option<u64>,
 }
 
 impl Telemetry {
-    /// Decoder for a firmware that also sends `protocol`'s records.
-    pub(super) fn new(protocol: Protocol) -> Self {
+    /// Decoder for a firmware that also sends `protocol`'s records, bounding 0x1b performance
+    /// state indices to `1..=max_pstate`.
+    pub(super) fn new(protocol: Protocol, max_pstate: u32) -> Self {
         Self {
             protocol,
+            max_pstate,
             ..Self::default()
         }
     }
@@ -141,8 +162,7 @@ impl Telemetry {
         self.delivery_ns = None;
         self.delivery_intervals = [None; 2];
         self.gated = false;
-        // Busy time keeps counting across epochs; only the window start is lost.
-        self.busy_ts = None;
+        // Busy time keeps counting across epochs, ordered by its own mark.
         self.pstate_interval_end = None;
     }
 
@@ -235,16 +255,16 @@ impl Telemetry {
                 self.view.pstate_status = if words[6] <= 10 { VALID } else { UNAVAILABLE };
                 self.view.pstate = words[6];
             }
-            // 26A428: the interval [words 3-4, words 1-2] that just ended. Its end
-            // timestamps the state report that follows it.
+            // The interval [words 3-4, words 1-2] that just ended. Its end timestamps the
+            // state report that follows it.
             0x19 if self.protocol.reports_pstate() => {
                 self.pstate_interval_end = Some(u64::from(words[1]) | (u64::from(words[2]) << 32));
             }
-            // 26A428: the performance state now in effect, in words 1 and 3. A report whose
-            // two words differ is not used.
+            // The performance state now in effect, in words 1 and 3. A report whose two
+            // words differ is not used.
             0x1b if self.protocol.reports_pstate() => {
                 let pstate = words[1];
-                if pstate != words[3] || pstate == 0 || pstate > self.protocol.max_pstate {
+                if pstate != words[3] || pstate == 0 || pstate > self.max_pstate {
                     self.view.pstate_status = UNAVAILABLE;
                     return;
                 }
@@ -257,20 +277,47 @@ impl Telemetry {
         }
     }
 
-    /// Credits the window a utilisation record closes, at its device utilisation. The window
-    /// starts at the previous record of the epoch; a record after a longer gap than
-    /// [`Protocol::max_window_ticks`] (the GPU was gated or records were lost) or one whose
-    /// timestamp went back only sets the baseline, so an idle gap is never credited.
+    /// A utilisation record that is kept out of the utilisation average: one a power boundary
+    /// cut off, or one drained while the cores read gated. The firmware produced it before
+    /// the boundary, so it describes powered time, which its own timestamp places. Only busy
+    /// time takes it; the average, the delivery cadence and the performance state are left
+    /// as they are.
+    pub(super) fn record_busy(&mut self, words: &[u32; 18]) {
+        if !self.protocol.integrates_busy()
+            || words[0] != 0x13
+            || [words[3], words[4], words[6]].iter().any(|&v| v > 100)
+        {
+            return;
+        }
+        self.integrate_busy(u64::from(words[1]) | (u64::from(words[2]) << 32), words[6]);
+    }
+
+    /// Credits the window a utilisation record closes, at its device utilisation.
+    ///
+    /// Records are credited in firmware timestamp order, from both roles and across
+    /// epochs: a record at or before [`Self::busy_mark`] was already covered and gets
+    /// nothing, so a time interval is never credited twice. A later record closes the
+    /// window since the mark when that is at most [`Protocol::max_window_ticks`]; after a
+    /// longer gap (the cores were gated, or records were lost) it closes only its own
+    /// sampling period, which starts after the mark, so the gap itself is never credited.
+    /// The first record only sets the mark.
     fn integrate_busy(&mut self, timestamp: u64, device: u32) {
-        if let Some(last) = self.busy_ts {
-            let window = timestamp.wrapping_sub(last);
-            if timestamp > last && window <= self.protocol.max_window_ticks() {
+        match self.busy_mark {
+            Some(mark) if timestamp > mark => {
+                let gap = timestamp - mark;
+                let window = if gap <= self.protocol.max_window_ticks() {
+                    gap
+                } else {
+                    self.protocol.util_period_ticks
+                };
                 // At most two 16 ms periods (768000 ticks) x 100 x 10^9: no overflow.
                 let ns = window * u64::from(device) * 1_000_000_000 / (100 * TIMER_HZ);
                 self.busy_ns = self.busy_ns.saturating_add(ns);
             }
+            Some(mark) if mark - timestamp <= self.protocol.rebase_ticks() => return,
+            _ => {}
         }
-        self.busy_ts = Some(timestamp);
+        self.busy_mark = Some(timestamp);
     }
 
     pub(super) fn read(&self, now_ns: u64, max_age_ns: u64) -> Readout {
@@ -533,7 +580,7 @@ mod tests {
 
     #[test]
     fn m5_state_reports_give_the_pstate() {
-        let mut stats = Telemetry::new(Protocol::M5);
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
         stats.record(&M5_INTERVAL, 100, AGE);
         assert_eq!(stats.read(100, AGE).pstate_status, UNAVAILABLE);
         stats.record(&M5_STATE, 101, AGE);
@@ -564,7 +611,7 @@ mod tests {
 
     #[test]
     fn m5_busy_time_integrates_utilisation_windows() {
-        let mut stats = Telemetry::new(Protocol::M5);
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
         assert_eq!(
             (stats.read(0, AGE).busy_status, stats.read(0, AGE).busy_ns),
             (VALID, 0)
@@ -584,27 +631,98 @@ mod tests {
         half[6] = 50;
         stats.record(&half, 103, AGE);
         assert_eq!(stats.read(103, AGE).busy_ns, windows + 4_000_000);
-        // A gate, a long gap or a timestamp going back only sets a new baseline.
+        // A gate ends the utilisation epoch, not the busy time: the next record still
+        // closes the window since the last one.
         let before = stats.read(103, AGE).busy_ns;
         stats.gate();
         let mut after = half;
         after[1] += 192_000;
         stats.record(&after, 104, AGE);
-        assert_eq!(stats.read(104, AGE).busy_ns, before);
-        after[1] += 3 * 192_000;
+        assert_eq!(stats.read(104, AGE).busy_ns, before + 4_000_000);
+        // After a longer gap the record closes only its own 8 ms period.
+        let before = stats.read(104, AGE).busy_ns;
+        after[1] += 10 * 192_000;
         stats.record(&after, 105, AGE);
-        assert_eq!(stats.read(105, AGE).busy_ns, before);
+        assert_eq!(stats.read(105, AGE).busy_ns, before + 4_000_000);
+        // A record at or before the mark was already covered.
+        let before = stats.read(105, AGE).busy_ns;
         after[1] -= 1000;
         stats.record(&after, 106, AGE);
+        after[1] += 1000;
+        stats.record(&after, 106, AGE);
         assert_eq!(stats.read(106, AGE).busy_ns, before);
-        // An epoch boundary keeps the total.
+        // An epoch boundary keeps the total and the mark.
         stats.invalidate();
         assert_eq!(stats.read(107, AGE).busy_ns, before);
+        stats.record(&after, 108, AGE);
+        assert_eq!(stats.read(108, AGE).busy_ns, before);
+    }
+
+    fn m5_util(ticks: u64, device: u32) -> [u32; 18] {
+        let mut words = M5_U[0];
+        (words[1], words[2], words[6]) = (ticks as u32, (ticks >> 32) as u32, device);
+        words
+    }
+
+    #[test]
+    fn m5_busy_time_counts_through_frequent_gates() {
+        // A frame-paced load: one record per epoch, a gate between any two.
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
+        let mut ticks = 0x59_0000_0000u64;
+        stats.record(&m5_util(ticks, 100), 1, AGE);
+        for n in 0..10u64 {
+            stats.gate();
+            stats.invalidate();
+            ticks += 250_000; // 10.4 ms: more than one period, at most two.
+            stats.record(&m5_util(ticks, 100), 2 + n, AGE);
+        }
+        assert_eq!(stats.read(20, AGE).busy_ns, 10 * ticks_ns(250_000));
+    }
+
+    #[test]
+    fn m5_records_kept_out_of_the_epoch_still_count_once() {
+        let base = 0x59_0000_0000u64;
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
+        stats.record(&m5_util(base, 100), 1, AGE);
+        // Cut off by a boundary, decoded by its own timestamp.
+        stats.gate();
+        stats.record_busy(&m5_util(base + 192_000, 100));
+        assert_eq!(stats.read(2, AGE).busy_ns, 8_000_000);
+        // It does not start a utilisation sample in the new epoch.
+        assert_eq!(stats.read(2, AGE).util_samples, 0);
+        // A copy of it, from the queue or from the other role, is not counted again,
+        // nor an older record drained later.
+        stats.record(&m5_util(base + 192_000, 100), 3, AGE);
+        stats.record_busy(&m5_util(base + 100_000, 100));
+        assert_eq!(stats.read(3, AGE).busy_ns, 8_000_000);
+        // Interleaved roles split the time between them and never overlap.
+        stats.record_busy(&m5_util(base + 288_000, 100));
+        stats.record(&m5_util(base + 384_000, 100), 4, AGE);
+        stats.record_busy(&m5_util(base + 336_000, 100));
+        assert_eq!(stats.read(4, AGE).busy_ns, 16_000_000);
+        // Records the decoder would refuse are ignored here too.
+        let mut bad = m5_util(base + 576_000, 100);
+        bad[4] = 101;
+        stats.record_busy(&bad);
+        let mut other = m5_util(base + 576_000, 100);
+        other[0] = 0x1b;
+        stats.record_busy(&other);
+        assert_eq!(stats.read(5, AGE).busy_ns, 16_000_000);
+        // A firmware clock that started again only sets a new mark.
+        stats.record_busy(&m5_util(1_000, 100));
+        assert_eq!(stats.read(6, AGE).busy_ns, 16_000_000);
+        stats.record_busy(&m5_util(1_000 + 192_000, 50));
+        assert_eq!(stats.read(7, AGE).busy_ns, 20_000_000);
+        // A firmware that integrates no busy time decodes none of it.
+        let mut legacy = Telemetry::default();
+        legacy.record_busy(&m5_util(base, 100));
+        legacy.record_busy(&m5_util(base + 192_000, 100));
+        assert_eq!(legacy.read(8, AGE).busy_ns, 0);
     }
 
     #[test]
     fn a18_pro_state_reports_give_the_pstate() {
-        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut stats = Telemetry::new(Protocol::PSTATE_16MS, 10);
         let mut interval = M5_INTERVAL;
         let mut state = M5_STATE;
         (state[1], state[3]) = (10, 10);
@@ -633,7 +751,7 @@ mod tests {
 
     #[test]
     fn a18_pro_busy_time_integrates_16_ms_windows() {
-        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut stats = Telemetry::new(Protocol::PSTATE_16MS, 10);
         let mut words = M5_U[0];
         stats.record(&words, 100, AGE);
         // One full 16 ms window at 100%, then one at 25%.
@@ -644,13 +762,88 @@ mod tests {
         words[6] = 25;
         stats.record(&words, 102, AGE);
         assert_eq!(stats.read(102, AGE).busy_ns, 20_000_000);
-        // Up to two periods is one window; longer is a gap the GPU spent gated.
+        // Up to two periods is one window; after a longer gap, which the GPU spent gated,
+        // a record closes only its own 16 ms period.
         words[1] += 768_000;
         stats.record(&words, 103, AGE);
         assert_eq!(stats.read(103, AGE).busy_ns, 28_000_000);
         words[1] += 768_001;
         stats.record(&words, 104, AGE);
-        assert_eq!(stats.read(104, AGE).busy_ns, 28_000_000);
+        assert_eq!(stats.read(104, AGE).busy_ns, 32_000_000);
+    }
+
+    #[test]
+    fn t6041_state_reports_give_the_pstate() {
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 10);
+        let mut interval = M5_INTERVAL;
+        let mut state = M5_STATE;
+        (state[1], state[3]) = (10, 10);
+        stats.record(&interval, 100, AGE);
+        stats.record(&state, 101, AGE);
+        let view = stats.read(101, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 10));
+        assert_eq!(view.pstate_timestamp, 0x59_3c04_2f8f);
+        // Mismatched words, off, or beyond state 10 (even though M5 shares PSTATE_8MS with
+        // max_pstate 13): not a state.
+        for (a, b) in [(1, 10), (0, 0), (11, 11), (13, 13)] {
+            (state[1], state[3]) = (a, b);
+            stats.record(&state, 102, AGE);
+            assert_eq!(stats.read(102, AGE).pstate_status, UNAVAILABLE);
+        }
+        // Tag 0x10 is not this firmware's state report.
+        interval[1] += 1;
+        stats.record(&interval, 103, AGE);
+        stats.record(&P1, 103, AGE);
+        assert_eq!(stats.read(103, AGE).pstate_status, UNAVAILABLE);
+        (state[1], state[3]) = (1, 1);
+        stats.record(&state, 104, AGE);
+        assert_eq!(stats.read(104, AGE).pstate, 1);
+        // Gated cores are off.
+        stats.gate();
+        let view = stats.read(105, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 0));
+        stats.invalidate();
+        assert_eq!(stats.read(106, AGE).pstate_status, STALE);
+    }
+
+    #[test]
+    fn t6041_busy_time_integrates_8_ms_windows() {
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 10);
+        let mut words = M5_U[0];
+        stats.record(&words, 100, AGE);
+        // One full 8 ms window at 100%, then one at 50%.
+        words[1] += 192_000;
+        stats.record(&words, 101, AGE);
+        assert_eq!(stats.read(101, AGE).busy_ns, 8_000_000);
+        words[1] += 192_000;
+        words[6] = 50;
+        stats.record(&words, 102, AGE);
+        assert_eq!(stats.read(102, AGE).busy_ns, 12_000_000);
+        // Up to two periods (16 ms) is one window; after a longer gap only the record's own
+        // period (8 ms at 50%) is credited.
+        words[1] += 384_000;
+        stats.record(&words, 103, AGE);
+        assert_eq!(stats.read(103, AGE).busy_ns, 20_000_000);
+        words[1] += 384_001;
+        stats.record(&words, 104, AGE);
+        assert_eq!(stats.read(104, AGE).busy_ns, 24_000_000);
+    }
+
+    #[test]
+    fn zero_max_pstate_fails_closed() {
+        for protocol in [Protocol::PSTATE_8MS, Protocol::PSTATE_16MS] {
+            let mut stats = Telemetry::new(protocol, 0);
+            stats.record(&M5_INTERVAL, 100, AGE);
+            for pstate in [0, 1, 10, 13] {
+                let mut words = M5_STATE;
+                (words[1], words[3]) = (pstate, pstate);
+                stats.record(&words, 101, AGE);
+                assert_eq!(stats.read(101, AGE).pstate_status, UNAVAILABLE);
+            }
+            // Tag 0x10 is still ignored when the protocol reports 0x19/0x1b.
+            stats.record(&P1, 102, AGE);
+            assert_eq!(stats.read(102, AGE).pstate_status, UNAVAILABLE);
+        }
     }
 
     #[test]

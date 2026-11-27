@@ -49,8 +49,8 @@ prefix = r'''
 #define kfree(p) free(p)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
-#define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
-#define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
+#define spin_lock_irqsave(l,f) do { assert(!*(l)); *(l)=1; (f)=0; } while(0)
+#define spin_unlock_irqrestore(l,f) do { assert(*(l)); *(l)=0; (void)(f); } while(0)
 #define dma_rmb() do {} while(0)
 #define dev_warn(...) do {} while(0)
 #define dev_err(...) do {} while(0)
@@ -119,6 +119,7 @@ static void bitmap_release_region(unsigned long *map,int i,int order)
 static int afk_send_epic(struct apple_dcp_afkep *ep,u32 channel,u16 tag,int type,int category,u8 subtype,const void *payload,size_t length)
 {
  struct cmd_info *c=&active->cmds[0];struct afkv2_command parsed;
+ assert(!active->lock && !ep->lock);
  assert(channel==4 && type==3 && category==0x30 && subtype==0xc0);
  sends++;
  /* The payload-envelope mock bounds the command separately from its response. */

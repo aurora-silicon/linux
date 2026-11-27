@@ -66,7 +66,11 @@ properties:
       - const: rx
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+    description:
+      DART streams of the transport. A second stream carries the coprocessor's
+      writes into the receive ring on firmware that has one.
 
   apple,fifo-size:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -164,7 +168,59 @@ properties:
           power method 2 notifications without controlling an AFE GPIO.
           Mutually exclusive with apple,afe-reset-gpios on the parent.
 
+      apple,touch-states:
+        type: boolean
+        description:
+          The first word of each contact record of the trackpad's standard
+          report (38-byte header) holds the contact's touch state in its
+          high byte (start in range, hover, make touch, touching, break
+          touch, linger, out of range) and in its low byte the path ID under
+          which the firmware tracks the contact until it leaves the pad.
+          Only contacts that make or keep touch are then reported, each in
+          the slot of its path ID.
+
+      apple,palm-debounce:
+        type: boolean
+        description:
+          The controller's palm classes (6 and above) flicker onto fingers
+          for single reports, so a contact counts as a palm once two
+          consecutive reports class it as one, whatever its tool area.
+
+      apple,palm-tool-area:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description:
+          Palm rule of a trackpad whose hand classes are 6, 7, 8 and 12, in
+          units of the record's contact ellipse major axis (10 um). A
+          contact in a hand class whose axis passes the first value on two
+          consecutive reports is a palm, and so is a contact on the surface
+          whose axis passes the second value, whatever its class. The force
+          of a palm, or of a contact past either value in a hand class, does
+          not count towards the click the host derives from the contacts'
+          force. The first value is below the second, and neither is above
+          32767, the largest axis the record's signed 16-bit field holds.
+        items:
+          - description: Axis that marks a hand-class contact on two
+              consecutive reports.
+            maximum: 32767
+          - description: Axis wider than any finger, marking a contact on
+              the surface at once.
+            maximum: 32767
+
     allOf:
+      - if:
+          required:
+            - apple,palm-tool-area
+        then:
+          properties:
+            apple,palm-debounce: false
+      - if:
+          required:
+            - compatible
+        then:
+          properties:
+            apple,touch-states: false
+            apple,palm-debounce: false
+            apple,palm-tool-area: false
       - if:
           required:
             - apple,firmware-managed-reset

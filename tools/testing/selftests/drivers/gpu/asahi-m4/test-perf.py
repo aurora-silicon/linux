@@ -27,6 +27,23 @@ def node(props, children=()):
 image = node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [node({'name': b'sgx\0', **properties})])])
 blob = out / 'measured-perf.adt'
 blob.write_bytes(image)
+clpc_props = {
+    'cpu-avg-limiter-input-tc': struct.pack('<I', 248),
+    'cpu-lowpeak-limiter-input-tc': struct.pack('<I', 16),
+    'cpu-lowpeak-limiter-ki': struct.pack('<I', 134217),
+    'cpu-lowpeak-limiter-kp': struct.pack('<I', 33554),
+}
+sgx_with_power = dict(properties)
+sgx_with_power['gpu-pwr-sample-period-aic-clks'] = struct.pack('<I', 200000)
+sgx_with_power['gpu-power-sample-period'] = struct.pack('<I', 8)
+image_clpc = node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [
+    node({'name': b'sgx\0', **sgx_with_power}),
+    node({'name': b'pmgr\0'}, [node({'name': b'clpc\0', **clpc_props})]),
+    node({'name': b'gfx-asc\0'}, [node({'name': b'iop-gfx-nub\0',
+                                        'coredump-copy-buffer': struct.pack('<I', 0x8000)})]),
+])])
+blob_clpc = out / 'measured-perf-clpc.adt'
+blob_clpc.write_bytes(image_clpc)
 backend = root / 'drivers/gpu/drm/asahi/g16'
 source = r'''
 #![allow(dead_code)]
@@ -37,6 +54,7 @@ mod backend {
 }
 use backend::{adt::perf, board::data, fw::initdata as wire};
 const MEASURED: &[u8] = include_bytes!("@FIXTURE@");
+const MEASURED_CLPC: &[u8] = include_bytes!("@FIXTURE_CLPC@");
 fn put32(out: &mut [u8], at: usize, value: u32) { out[at..at+4].copy_from_slice(&value.to_le_bytes()); }
 fn property_offset(data: &[u8], name: &[u8]) -> usize {
     data.windows(32).position(|value| value.starts_with(name) && value[name.len()..].iter().all(|&x| x==0)).unwrap()
@@ -44,7 +62,7 @@ fn property_offset(data: &[u8], name: &[u8]) -> usize {
 fn set_cell(data: &mut [u8], name: &[u8], value: u32) {
     let at = property_offset(data, name) + 36; put32(data, at, value);
 }
-fn source() -> perf::Source { perf::parse(MEASURED).unwrap() }
+fn source() -> perf::Source { perf::parse(MEASURED, b"gpu,t8132").unwrap() }
 fn tables() -> wire::Performance { data::select(&source()).unwrap() }
 fn input(performance: wire::Performance) -> wire::Input {
     const HOST: u64 = wire::HOST_START;
@@ -56,6 +74,10 @@ fn input(performance: wire::Performance) -> wire::Input {
         loader_va: core::array::from_fn(|i| if wire::LOADERS[i].length==0 {0} else {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}),
         scratch: HOST+0xa000000, lower_uma: wire::BOOTSTRAP_START,
         lower_parameter: wire::BOOTSTRAP_START+0x8000, ktrace_mask:0, progress_recovery:1,
+        enabled_cores: 10,
+        power_sample_clks:200_000, power_sample_us:8333, power_sample_period_ms:8,
+        timebase_khz:24_000, avg_power_filter_tc_ms:248, lowpeak_limiter_tc_ms:16,
+        lowpeak_limiter_ki_q16:134_217, lowpeak_limiter_kp_q16:33_554, coredump_copy_size:0x8000,
     }
 }
 fn encode(performance: wire::Performance) -> Result<[Vec<u8>; wire::OBJECT_COUNT], ()> {
@@ -66,11 +88,139 @@ fn encode(performance: wire::Performance) -> Result<[Vec<u8>; wire::OBJECT_COUNT
 fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].try_into().unwrap()) }
 #[test] fn measured_original_adt_produces_qualified_tables() {
     let s=source(); assert_eq!(s.count,16);
-    let p=tables();
-    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470]);
-    assert_eq!(p.auxiliary,[0,338,618,796,836,952,1053,1152,1204,1326]);
-    assert_eq!(p.voltage,[125,610,645,680,725,780,825,865,895,970]);
-    assert_eq!(p.sram,[780,780,780,780,780,780,825,865,895,970]);
+    // Keep the original frequency layout but use synthetic voltage bins.
+    let mut s=s;
+    s.core_mv[..16].copy_from_slice(&[100,600,650,700,750,750,800,800,850,850,900,900,950,950,1000,1000]);
+    s.sram_mv[..16].copy_from_slice(&[800,800,800,800,800,800,800,800,850,850,900,900,950,950,1000,1000]);
+    let p=data::select(&s).unwrap(); assert_eq!(p.count,10);
+    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,0]);
+    assert_eq!(p.auxiliary,[0,338,618,796,836,952,1053,1152,1204,1326,0]);
+    assert_eq!(p.voltage,[100,600,650,700,750,800,850,900,950,1000,0]);
+    assert_eq!(p.sram,[800,800,800,800,800,800,850,900,950,1000,0]);
+    assert_eq!(get32(&encode(p).unwrap()[wire::id::MAIN],0xfc0),10);
+}
+// J773g frequency layout with synthetic voltage bins, both with eleven groups.
+fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
+    let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
+    let mut s=source(); s.count=16;
+    s.frequency_mhz=[0;perf::MAX_STATES]; s.sram_frequency_mhz=[0;perf::MAX_STATES];
+    s.core_mv=[0;perf::MAX_STATES]; s.sram_mv=[0;perf::MAX_STATES];
+    s.frequency_mhz[..16].copy_from_slice(&mhz); s.sram_frequency_mhz[..16].copy_from_slice(&mhz);
+    s.core_mv[..16].copy_from_slice(&core); s.sram_mv[..16].copy_from_slice(&sram);
+    s
+}
+#[test] fn j773g_synthetic_bins_produce_eleven_rows_and_encode_all_of_them() {
+    for (core,sram,voltage,row_sram) in [
+        ([100,600,620,660,700,750,750,800,800,850,850,900,900,950,950,1000],
+         [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000],
+         [100,600,620,660,700,750,800,850,900,950,1000],
+         [740,740,740,740,740,750,800,850,900,950,1000]),
+        ([100,590,630,650,690,730,730,790,790,840,840,890,890,940,940,990],
+         [760,760,760,760,760,760,760,790,790,840,840,890,890,940,940,990],
+         [100,590,630,650,690,730,790,840,890,940,990],
+         [760,760,760,760,760,760,790,840,890,940,990]),
+    ] {
+        let (p,name)=data::select_named(&j773g(core,sram)).unwrap();
+        assert_eq!(name,"11-row"); assert_eq!(p.count,11);
+        assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
+        assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
+        assert_eq!(p.voltage,voltage); assert_eq!(p.sram,row_sram);
+        let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
+        wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),10).unwrap();
+        let main=&buffers[wire::id::MAIN];
+        assert_eq!(get32(main,0xfc0),11); assert_eq!(get32(main,0xfc4),10);
+        for i in 0..11 {
+            assert_eq!(get32(main,0xfc8+i*4),p.frequency[i]);
+            assert_eq!(get32(main,0x1808+i*4),p.auxiliary[i]);
+            assert_eq!(get32(main,0x1008+i*16*4),p.voltage[i]);
+            assert_eq!(get32(main,0x1408+(i*16+15)*4),p.sram[i]);
+        }
+    }
+}
+#[test] fn the_row_count_bounds_the_encoded_ceiling() {
+    let j713=tables(); let j773g=data::select_named(&j773g(
+        [100,600,620,660,700,750,750,800,800,850,850,900,900,950,950,1000],
+        [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000])).unwrap().0;
+    for (p,good,bad) in [(j713,[1,9],[0,10]),(j773g,[1,10],[0,11])] {
+        for ceiling in good {
+            let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
+            assert!(wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),ceiling).is_ok());
+            assert_eq!(get32(&buffers[wire::id::MAIN],0xfc0),p.count as u32);
+        }
+        for ceiling in bad {
+            let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
+            assert!(wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),ceiling).is_err());
+            assert!(buffers.iter().all(|buffer|buffer.iter().all(|&byte|byte==0xa5)));
+        }
+    }
+    // Rows past the count must stay zero, and the count must match the rows.
+    let mut p=tables(); p.frequency[10]=1500; assert!(!p.valid());
+    let mut p=tables(); p.count=11; assert!(!p.valid());
+}
+#[test]
+fn g15s_power_config_uses_the_encoded_ceiling_and_machine_adt_limiter() {
+    let mut sgx = source();
+    sgx.count = 14;
+    let (performance, shape) = data::select_named(&sgx).unwrap();
+    assert_eq!((performance.count, shape), (9, "9-row"));
+    assert_eq!(performance.frequency[8], sgx.frequency_mhz[13]);
+    assert_eq!(performance.auxiliary[8], sgx.frequency_mhz[12]);
+    sgx.core_mv[12] += 1;
+    assert_eq!(data::select(&sgx), Err(perf::Error::Shape));
+
+    let layout = &wire::G15S_26B123;
+    let mut input = input(performance);
+    input.enabled_cores = 18;
+    // T6030 ADT /arm-io/pmgr/clpc & /arm-io/sgx limiter properties (24 MHz timebase).
+    input.avg_power_filter_tc_ms = 300;
+    input.lowpeak_limiter_tc_ms = 30;
+    input.lowpeak_limiter_ki_q16 = 171_128;
+    input.lowpeak_limiter_kp_q16 = 11_073;
+    for (i, loader) in layout.loaders.iter().enumerate() {
+        input.loader_va[i] = if loader.length != 0 && layout.slot(i).is_some() {
+            wire::HOST_START + 0x5000000 + i as u64 * 0x100000 + (loader.pa & 0x3fff)
+        } else {
+            0
+        };
+    }
+    let mut buffers = layout.object_size.map(|size| vec![0; size]);
+    wire::encode_for(layout, &mut buffers.each_mut().map(|b| b.as_mut_slice()), &input, 8).unwrap();
+    let power = &buffers[wire::id::POWER_PERFORMANCE];
+    assert_eq!(get32(power, 0x04), 200_000);
+    assert_eq!(get32(power, 0x08), 200_000);
+    assert_eq!(get32(power, 0xb90), 800);
+    assert_eq!(get32(power, 0x2c), 8);
+    assert_eq!(get32(power, 0x30), 8);
+    // Average-power filter: (300 * 1000) / 8333 = 36 samples -> 144, 35/36, 1/36.
+    assert_eq!(get32(power, 0x29e4), 36 * 4);
+    assert_eq!(get32(power, 0x29f0), wire::f32_bits(35, 36));
+    assert_eq!(get32(power, 0x29f8), wire::f32_bits(1, 36));
+    // Low-peak limiter: 30 / 8 = 3 periods -> 12, 2/3, 1/3, ki*dt, kp, 30 ms, 576000 clks.
+    assert_eq!(get32(power, 0xa80), 3 * 4);
+    assert_eq!(get32(power, 0xa8c), wire::f32_bits(2, 3));
+    assert_eq!(get32(power, 0xa94), wire::f32_bits(1, 3));
+    assert_eq!(get32(power, 0xa9c), wire::f32_bits(171_128 * 8, 65536 * 1000));
+    assert_eq!(get32(power, 0xaac), wire::f32_bits(11_073, 65536));
+    assert_eq!(get32(power, 0xad8), 30);
+    assert_eq!(get32(power, 0xae0), 3 * 8 * 24_000);
+
+    // Missing ADT power limiter / sampling inputs must fail closed on G15S as well.
+    for bad in 0..5 {
+        let mut bad_input = wire::Input {
+            performance: input.performance.clone(),
+            ..input
+        };
+        match bad {
+            0 => bad_input.avg_power_filter_tc_ms = 0,
+            1 => bad_input.lowpeak_limiter_tc_ms = 0,
+            2 => bad_input.lowpeak_limiter_ki_q16 = 0,
+            3 => bad_input.lowpeak_limiter_kp_q16 = 0,
+            _ => bad_input.power_sample_period_ms = 0,
+        }
+        let mut out_bufs = layout.object_size.map(|size| vec![0xa5; size]);
+        assert!(wire::encode_for(layout, &mut out_bufs.each_mut().map(|b| b.as_mut_slice()), &bad_input, 8).is_err());
+        assert!(out_bufs.iter().all(|b| b.iter().all(|&x| x == 0xa5)));
+    }
 }
 #[test] fn different_real_bin_values_reach_all_firmware_lanes() {
     let mut raw=MEASURED.to_vec();
@@ -82,7 +232,7 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
             put32(&mut raw,at+i*8+4,mv+5);
         }
     }
-    let p=data::select(&perf::parse(&raw).unwrap()).unwrap();
+    let p=data::select(&perf::parse(&raw, b"gpu,t8132").unwrap()).unwrap();
     let encoded=encode(p.clone()).unwrap();let main=&encoded[wire::id::MAIN];
     for i in 0..10 {
         assert_eq!(get32(main,0xfc8+i*4),p.frequency[i]);
@@ -95,35 +245,35 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
     assert_eq!(p.frequency[9],1471);assert_eq!(p.voltage[9],975);
 }
 #[test] fn truncations_and_overflowing_tree_headers_reject_without_panic() {
-    for end in 0..MEASURED.len() {assert!(perf::parse(&MEASURED[..end]).is_err());}
+    for end in 0..MEASURED.len() {assert!(perf::parse(&MEASURED[..end], b"gpu,t8132").is_err());}
     for at in [0,4,40,property_offset(MEASURED,b"perf-states")+32,property_offset(MEASURED,b"compatible")+32] {
         let mut bad=MEASURED.to_vec();put32(&mut bad,at,u32::MAX);
-        assert!(perf::parse(&bad).is_err());
+        assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
-    assert!(perf::parse(&vec![0;0x20_0001]).is_err());
+    assert!(perf::parse(&vec![0;0x20_0001], b"gpu,t8132").is_err());
     let mut deep=Vec::new();
     for _ in 0..34 {deep.extend_from_slice(&0u32.to_le_bytes());deep.extend_from_slice(&1u32.to_le_bytes());}
-    deep.extend_from_slice(&[0;8]);assert!(perf::parse(&deep).is_err());
-    let mut padded=MEASURED.to_vec();padded.extend_from_slice(&[0;4096]);assert_eq!(perf::parse(&padded),Ok(source()));
+    deep.extend_from_slice(&[0;8]);assert!(perf::parse(&deep, b"gpu,t8132").is_err());
+    let mut padded=MEASURED.to_vec();padded.extend_from_slice(&[0;4096]);assert_eq!(perf::parse(&padded, b"gpu,t8132"),Ok(source()));
 }
 #[test] fn missing_wrong_identity_and_duplicate_required_properties_reject() {
     for name in [b"compatible".as_slice(),b"perf-state-count",b"perf-states",b"perf-states-sram"] {
         let mut bad=MEASURED.to_vec();let at=property_offset(&bad,name);bad[at]=b'X';
-        assert!(perf::parse(&bad).is_err());
+        assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
     let mut bad=MEASURED.to_vec();let at=property_offset(&bad,b"compatible")+36;bad[at]=b'X';
-    assert_eq!(perf::parse(&bad),Err(perf::Error::Identity));
+    assert_eq!(perf::parse(&bad, b"gpu,t8132"),Err(perf::Error::Identity));
     let mut bad=MEASURED.to_vec();let at=property_offset(&bad,b"perf-states-sram");
     bad[at..at+32].fill(0);bad[at..at+11].copy_from_slice(b"perf-states");
-    assert_eq!(perf::parse(&bad),Err(perf::Error::Duplicate));
+    assert_eq!(perf::parse(&bad, b"gpu,t8132"),Err(perf::Error::Duplicate));
 }
 #[test] fn metadata_shape_frequency_units_off_state_and_voltage_ranges_reject() {
     for (name,value) in [(b"perf-state-count".as_slice(),0),(b"perf-state-count",33),(b"perf-state-count",15),(b"perf-state-table-count",2),(b"gpu-num-perf-states",14)] {
-        let mut bad=MEASURED.to_vec();set_cell(&mut bad,name,value);assert!(perf::parse(&bad).is_err());
+        let mut bad=MEASURED.to_vec();set_cell(&mut bad,name,value);assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
     let at=property_offset(MEASURED,b"perf-states")+36;
     for (offset,value) in [(0,1),(8,0),(8,338_000_001),(8,3_001_000_000),(12,99),(12,1101)] {
-        let mut bad=MEASURED.to_vec();put32(&mut bad,at+offset,value);assert!(perf::parse(&bad).is_err());
+        let mut bad=MEASURED.to_vec();put32(&mut bad,at+offset,value);assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
 }
 #[test] fn unsupported_shape_pairs_and_ordering_reject_before_encoding() {
@@ -134,11 +284,13 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
     let mut s=source();s.frequency_mhz[4]=s.frequency_mhz[5]+1;s.sram_frequency_mhz[4]=s.frequency_mhz[4];assert!(data::select(&s).is_err());
     let mut s=source();s.frequency_mhz[7]=s.frequency_mhz[5];s.sram_frequency_mhz[7]=s.frequency_mhz[7];assert!(data::select(&s).is_err());
     let mut s=source();s.core_mv[14]=600;s.core_mv[15]=600;assert!(data::select(&s).is_err());
+    // Three states at one voltage, and split pairs, match no layout.
+    let mut s=source();s.core_mv[6]=s.core_mv[5];s.sram_mv[6]=s.sram_mv[5];assert!(data::select(&s).is_err());
+    let mut s=source();s.core_mv[4]-=1;s.core_mv[6]-=1;assert!(data::select(&s).is_err());
 }
-#[test] fn j604_shape_selects_its_own_layout_and_the_j713_keeps_its_own() {
-    assert_eq!(data::select_named(&source()).unwrap().1,"J713");
-    // J604 shape: five low states, equal-voltage pairs 5/6 to 13/14, a single top state 15.
-    // Rows 0-3 and 5-15 are the J604's selected values; state 4 (left out) is synthetic.
+#[test] fn eleven_row_shape_selects_all_eleven_rows_from_adt_without_board_check() {
+    assert_eq!(data::select_named(&source()).unwrap().1,"10-row");
+    // 11-row shape (J604/J773g): five low states, equal-voltage pairs 5/6 to 13/14, single top 15.
     let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
     let mv=[125,625,640,680,725,780,780,825,825,865,865,895,895,970,970,1045];
     let mut s=source();
@@ -147,13 +299,14 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
         s.core_mv[i]=mv[i];s.sram_mv[i]=mv[i].max(780);
     }
     let (p,name)=data::select_named(&s).unwrap();
-    assert_eq!(name,"J604");
-    assert_eq!(p.frequency,[0,338,618,796,1056,1170,1278,1338,1470,1578]);
-    assert_eq!(p.auxiliary,[0,338,618,796,952,1053,1152,1204,1326,1578]);
-    assert_eq!(p.voltage,[125,625,640,680,780,825,865,895,970,1045]);
-    assert_eq!(p.sram,[780,780,780,780,780,825,865,895,970,1045]);
-    assert!(encode(p).is_ok());
-    // A J604 shape with one unequal pair matches neither layout.
+    assert_eq!(name,"11-row"); assert_eq!(p.count,11);
+    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
+    assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
+    assert_eq!(p.voltage,[125,625,640,680,725,780,825,865,895,970,1045]);
+    assert_eq!(p.sram,[780,780,780,780,780,780,825,865,895,970,1045]);
+    let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
+    assert!(wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),10).is_ok());
+    // An 11-row shape with one unequal pair matches no layout.
     let mut bad=s;bad.core_mv[9]+=1;bad.sram_mv[9]+=1;
     assert_eq!(data::select(&bad),Err(perf::Error::Shape));
 }
@@ -165,9 +318,39 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
         assert!(buffers.iter().all(|buffer|buffer.iter().all(|&byte|byte==0xa5)));
     }
 }
+#[test] fn clpc_and_sgx_power_limiter_properties_parse_and_reject_zero() {
+    let minimal = source();
+    assert_eq!(minimal.avg_power_filter_tc_ms, None);
+    assert_eq!(minimal.lowpeak_limiter_tc_ms, None);
+    let full = perf::parse(MEASURED_CLPC, b"gpu,t8132").unwrap();
+    assert_eq!(full.power_sample_clks, Some(200_000));
+    assert_eq!(full.power_sample_period_ms, Some(8));
+    assert_eq!(full.avg_power_filter_tc_ms, Some(248));
+    assert_eq!(full.lowpeak_limiter_tc_ms, Some(16));
+    assert_eq!(full.lowpeak_limiter_ki_q16, Some(134_217));
+    assert_eq!(full.lowpeak_limiter_kp_q16, Some(33_554));
+    assert_eq!(full.coredump_copy_size, Some(0x8000));
+    for name in [
+        b"gpu-pwr-sample-period-aic-clks".as_slice(),
+        b"gpu-power-sample-period",
+        b"cpu-avg-limiter-input-tc",
+        b"cpu-lowpeak-limiter-input-tc",
+        b"cpu-lowpeak-limiter-ki",
+        b"cpu-lowpeak-limiter-kp",
+        b"coredump-copy-buffer",
+    ] {
+        let mut bad = MEASURED_CLPC.to_vec();
+        set_cell(&mut bad, name, 0);
+        assert_eq!(perf::parse(&bad, b"gpu,t8132"), Err(perf::Error::Range));
+    }
+    let mut unaligned = MEASURED_CLPC.to_vec();
+    set_cell(&mut unaligned, b"coredump-copy-buffer", 0x8001);
+    assert_eq!(perf::parse(&unaligned, b"gpu,t8132"), Err(perf::Error::Range));
+}
 '''
 for marker, value in {'PARSER': backend / 'adt/perf.rs', 'ENCODER': backend / 'fw/initdata.rs',
-                      'SELECT': backend / 'board/data.rs', 'FIXTURE': blob}.items():
+                      'SELECT': backend / 'board/data.rs', 'FIXTURE': blob,
+                      'FIXTURE_CLPC': blob_clpc}.items():
     source = source.replace('@' + marker + '@', str(value))
 path = out / 'perf.rs'
 path.write_text(source)
@@ -177,7 +360,7 @@ run = subprocess.run([str(binary), '--test-threads=1'], text=True, capture_outpu
 print(run.stdout, end='')
 print(run.stderr, end='')
 run.check_returncode()
-report = {'passed': True, 'test_groups': 8, 'hardware_validated': False,
+report = {'passed': True, 'test_groups': 12, 'hardware_validated': False,
           'fixture_sha256': sha(fixture), 'original_adt_sha256': metadata['provenance']['source_sha256'],
           'production_sha256': {str(p.relative_to(root)): sha(p) for p in
               [backend / 'adt.rs', backend / 'adt/perf.rs', backend / 'board.rs', backend / 'board/data.rs', backend / 'initdata.rs', backend / 'fw/initdata.rs']}}

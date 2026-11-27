@@ -21,6 +21,10 @@
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -179,10 +183,34 @@ static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
 }
 
+/*
+ * Endpoint 7 carries CoreAnalytics, or the auxiliary buffer of registry-v2 PMP
+ * firmware. The endpoint map starts it, and the dispatcher serves it, only then.
+ */
+static bool apple_rtkit_ep7_served(struct apple_rtkit *rtk)
+{
+	return rtk->pmp_registry_v2 || apple_rtkit_needs_coreanalytics(rtk);
+}
+
 static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 {
 	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
 }
+
+/*
+ * Whether RTKit maps a crash log the firmware placed at its own address: one rule for
+ * the buffer request on an endpoint the firmware announced and for the crash report on
+ * one it left out of its map. Not when the client says the firmware owns that buffer
+ * (taken unmapped) or sets placed buffers up itself (shmem_setup); otherwise it is
+ * mapped if apple_dart_fw_range() accepts it (apple_rtkit_crashlog_map()).
+ */
+static bool apple_rtkit_maps_placed_crashlog(struct apple_rtkit *rtk)
+{
+	return !apple_rtkit_firmware_owns_crashlog(rtk) &&
+	       !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep;
+}
+
+static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg);
 
 /* The crashlog endpoint is started while the endpoint map is handled. */
 static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
@@ -426,7 +454,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			break;
 
 		case APPLE_RTKIT_EP_COREANALYTICS:
-			if (!rtk->pmp_registry_v2 && !apple_rtkit_needs_coreanalytics(rtk))
+			if (!apple_rtkit_ep7_served(rtk))
 				break;
 			fallthrough;
 
@@ -481,7 +509,7 @@ static void apple_rtkit_management_rx_iop_pwr_ack(struct apple_rtkit *rtk,
 
 	dev_dbg(rtk->dev, "RTKit: IOP power state transition: 0x%x -> 0x%x\n",
 		rtk->iop_power_state, new_state);
-	rtk->iop_power_state = new_state;
+	WRITE_ONCE(rtk->iop_power_state, new_state);
 
 	/*
 	 * A retained wake: a co-processor may report QUIESCED when it starts
@@ -551,18 +579,16 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 		dev_dbg(rtk->dev, "RTKit: co-processor idle: 0x%llx\n", msg);
 		break;
 	default:
-		dev_warn(
+		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: unknown management message: 0x%llx (type: 0x%02x)\n",
 			msg, type);
 	}
 }
 
-static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
-				   struct apple_rtkit_shmem *buffer)
+static int apple_rtkit_alloc_first_shmem(struct apple_rtkit *rtk, u8 ep,
+					 struct apple_rtkit_shmem *buffer)
 {
-	if (READ_ONCE(rtk->ans_hold))
-		return apple_rtkit_ans_fail(rtk, -EBUSY);
 	/* The crash log's buffer is asked for only at a crash: serve it after a strict restart too. */
 	if (READ_ONCE(rtk->strict_retained_buffers) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		return -EPROTO;
@@ -575,6 +601,14 @@ static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 	buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
 					    &buffer->iova, GFP_KERNEL);
 	return buffer->buffer ? 0 : -ENOMEM;
+}
+
+static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
+				   struct apple_rtkit_shmem *buffer)
+{
+	if (READ_ONCE(rtk->ans_hold))
+		return apple_rtkit_ans_fail(rtk, -EBUSY);
+	return apple_rtkit_alloc_first_shmem(rtk, ep, buffer);
 }
 
 static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
@@ -636,6 +670,14 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
+	if (ep == APPLE_RTKIT_EP_CRASHLOG && request.iova &&
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
+		err = apple_rtkit_crashlog_map(rtk, msg);
+		if (err)
+			goto error;
+		return 0;
+	}
+
 	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_LOGS) && request.iova &&
 	    (ep == APPLE_RTKIT_EP_SYSLOG || ep == APPLE_RTKIT_EP_OSLOG)) {
 		*buffer = request;
@@ -650,7 +692,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		goto error;
 	}
 
-	err = apple_rtkit_alloc_shmem(rtk, ep, &request);
+	/* The endpoint has no buffer yet: a first one replaces nothing the ANS hold protects */
+	err = apple_rtkit_alloc_first_shmem(rtk, ep, &request);
 	if (err)
 		goto error;
 	*buffer = request;
@@ -911,7 +954,7 @@ static void apple_rtkit_coreanalytics_rx(struct apple_rtkit *rtk, u64 msg)
 					       reply, NULL, false);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown CoreAnalytics message: %llx\n", msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown CoreAnalytics message: %llx\n", msg);
 		return;
 	}
 	if (ret)
@@ -937,51 +980,31 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 }
 
 /*
- * Where a DVA of the crash buffer lands: in a mapping Linux made, or else in one the
- * firmware kept from the bootloader in a root its DART inherited (the T8140 AOP's own
- * slot). 0 when neither translates it.
- */
-static phys_addr_t apple_rtkit_crashlog_phys(struct apple_rtkit *rtk,
-					     struct iommu_domain *domain, dma_addr_t iova)
-{
-	phys_addr_t phys = iommu_iova_to_phys(domain, iova);
-
-	if (!phys && IS_REACHABLE(CONFIG_APPLE_DART) &&
-	    apple_dart_fw_remote(rtk->dev, iova, false, &phys))
-		phys = 0;
-
-	return phys;
-}
-
-/*
  * The buffer a crashing firmware placed at its own address, mapped if its IOMMU
- * translates every page of it to one contiguous range, and acknowledged as a placed
+ * translates every page of it, through Linux's mappings or those the firmware kept
+ * from the boot loader (the T8140 AOP's own slot), to one contiguous range of DRAM
+ * that nothing else claims (apple_dart_fw_range()), and acknowledged as a placed
  * buffer is. The firmware doesn't run again until a reboot.
+ *
+ * Write-combined, not cacheable: the co-processor isn't coherent with the CPU's
+ * caches, and apple_rtkit_crashlog_late() polls the buffer for a log written after
+ * the request, with no cache maintenance for a placed buffer, so a cacheable
+ * mapping could keep returning the header it read first.
  */
 static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg)
 {
 	struct apple_rtkit_shmem *bfr = &rtk->crashlog_buffer;
-	struct iommu_domain *domain = iommu_get_domain_for_dev(rtk->dev);
 	dma_addr_t iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
 	size_t size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
-	phys_addr_t phys, page;
-	size_t off;
+	phys_addr_t phys;
 	void *va;
+	int ret;
 
-	if (!domain || !iova || !size)
-		return -ENODEV;
-	phys = apple_rtkit_crashlog_phys(rtk, domain, iova);
-	for (off = 0; phys && off < size; off += PAGE_SIZE) {
-		page = apple_rtkit_crashlog_phys(rtk, domain, iova + off);
-		if (page != phys + off) {
-			dev_err(rtk->dev, "RTKit: crash log at %pad isn't contiguous at +%#zx\n",
-				&iova, off);
-			return -EINVAL;
-		}
-	}
-	if (!phys)
-		return -ENOENT;
-	va = memremap(phys, size, MEMREMAP_WB);
+	ret = apple_dart_fw_range(rtk->dev, iova, size,
+				  APPLE_DART_FW_LINUX | APPLE_DART_FW_RETAINED, &phys);
+	if (ret)
+		return ret;
+	va = memremap(phys, size, MEMREMAP_WC);
 	if (!va)
 		return -ENOMEM;
 	bfr->buffer = va;
@@ -1071,8 +1094,8 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	bool await_log = false;
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
-		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
+				     msg);
 		return;
 	}
 
@@ -1080,10 +1103,11 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	 * A firmware that never announced this endpoint asks for its buffer only when
 	 * it crashes, so there's no handshake to take the request for. Report the
 	 * crash now, as the log may never come. A client that sets such a buffer up
-	 * itself takes the path below, which also reads a log written later.
+	 * itself, or whose firmware owns it, takes the path below, which also reads a
+	 * log written later (apple_rtkit_maps_placed_crashlog()).
 	 */
 	if (!rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints) &&
-	    !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
 		int ret = apple_rtkit_crashlog_map(rtk, msg);
 
 		dev_err(rtk->dev, "RTKit: co-processor has crashed: crash log buffer at %#llx %s (%d)\n",
@@ -1223,8 +1247,8 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 					 NULL, false);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
+				     msg);
 	}
 }
 
@@ -1345,9 +1369,28 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 		apple_rtkit_syslog_rx_log(rtk, msg);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown syslog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown syslog message: %llx\n",
+				     msg);
 	}
+}
+
+/* Where a counter has only ever run unanswered: nothing is echoed. */
+static bool apple_rtkit_oslog_unanswered(struct apple_rtkit *rtk)
+{
+	return !rtk->oslog_echo &&
+	       (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
+		of_machine_is_compatible("apple,t8142"));
+}
+
+/* An OSLOG counter that is answered with its echo, on any lane. */
+static bool apple_rtkit_oslog_echoed(struct apple_rtkit *rtk, u64 msg)
+{
+	if (rtk->oslog_echo)
+		return true;
+	if (apple_rtkit_oslog_unanswered(rtk))
+		return false;
+	return (rtk->oslog_buffer.size || rtk->oslog_inherited) &&
+	       !(msg & APPLE_RTKIT_OSLOG_LOG_RESERVED);
 }
 
 static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
@@ -1373,11 +1416,13 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
-	if (type == APPLE_RTKIT_OSLOG_LOG &&
-	    (rtk->sync_syslog_ack || of_machine_is_compatible("apple,t8140") ||
-	     of_machine_is_compatible("apple,t8142"))) {
-		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+	if (type == APPLE_RTKIT_OSLOG_LOG && !apple_rtkit_oslog_echoed(rtk, msg)) {
+		/* Preserve the tested Neo/M5 and synchronous-log no-ACK policy. */
+		if (apple_rtkit_oslog_unanswered(rtk))
+			dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+		else
+			dev_warn_ratelimited(rtk->dev, "RTKit: invalid oslog notification: %llx\n",
+					     msg);
 		return;
 	}
 
@@ -1392,13 +1437,9 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		 * AppleDCP waits for its log transport to drain before AP sleep.
 		 * This is not a buffer offset and may wrap. Other channels do not
 		 * have a buffer admitted by this endpoint implementation. An inherited
-		 * channel zero needs no buffer mapping to acknowledge its counter.
+		 * channel zero needs no buffer mapping to acknowledge its counter
+		 * (apple_rtkit_oslog_echoed()).
 		 */
-		if ((!rtk->oslog_buffer.size && !rtk->oslog_inherited) ||
-		    (msg & APPLE_RTKIT_OSLOG_LOG_RESERVED)) {
-			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
-			break;
-		}
 		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG,
 					       msg, NULL, false);
 		if (err)
@@ -1413,8 +1454,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
+				     msg);
 	}
 }
 
@@ -1446,11 +1487,24 @@ static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 	    msg != (FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
 			       APPLE_RTKIT_BUFFER_REQUEST) |
 		    FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, 2))) {
-		dev_err(rtk->dev, "RTKit: refused auxiliary buffer request\n");
+		dev_err_ratelimited(rtk->dev, "RTKit: refused auxiliary buffer request\n");
 		return;
 	}
 	apple_rtkit_common_rx_get_buffer(rtk, &rtk->pmp_aux_buffer,
 					 APPLE_RTKIT_EP_PMP_AUX, msg);
+}
+
+/*
+ * A message to an endpoint this client doesn't serve. How often one arrives is
+ * up to the firmware, which may send its events periodically, so the warning
+ * is rate-limited, as every warning the receive path prints for a firmware
+ * message is.
+ */
+static void apple_rtkit_unserved_ep_msg(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	dev_warn_ratelimited(rtk->dev,
+			     "RTKit: message to unknown endpoint %02x: %llx\n",
+			     ep, msg);
 }
 
 static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
@@ -1482,12 +1536,12 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		if (rtk->sync_syslog_ack)
 			apple_rtkit_kdebug_rx(rtk, msg);
 		else
-			dev_warn(rtk->dev,
-				 "RTKit: message to unknown endpoint %02x: %llx\n",
-				 ep, msg);
+			apple_rtkit_unserved_ep_msg(rtk, ep, msg);
 		break;
 	case APPLE_RTKIT_EP_COREANALYTICS:
-		if (rtk->pmp_registry_v2)
+		if (!apple_rtkit_ep7_served(rtk))
+			apple_rtkit_unserved_ep_msg(rtk, ep, msg);
+		else if (rtk->pmp_registry_v2)
 			apple_rtkit_pmp_aux_rx(rtk, msg);
 		else
 			apple_rtkit_coreanalytics_rx(rtk, msg);
@@ -1504,15 +1558,13 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		else if (rtk->ops->recv_message_timed)
 			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, 0);
 		else
-			dev_warn(
+			dev_warn_ratelimited(
 				rtk->dev,
 				"Received unexpected message to EP%02d: %llx\n",
 				ep, msg);
 		break;
 	default:
-		dev_warn(rtk->dev,
-			 "RTKit: message to unknown endpoint %02x: %llx\n",
-			 ep, msg);
+		apple_rtkit_unserved_ep_msg(rtk, ep, msg);
 	}
 }
 
@@ -1676,10 +1728,15 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 				     msg.msg0);
 	}
 
-	if (!test_bit(ep, rtk->endpoints))
-		dev_warn(rtk->dev,
-			 "RTKit: Message to undiscovered endpoint 0x%02x\n",
-			 ep);
+	/*
+	 * Firmware that leaves the crashlog endpoint out of its map (the AOP)
+	 * still reports a crash there, and apple_rtkit_crashlog_rx() says so.
+	 * Warning about it here too reads as if the AP sent the message.
+	 */
+	if (!test_bit(ep, rtk->endpoints) && ep != APPLE_RTKIT_EP_CRASHLOG)
+		dev_warn_ratelimited(rtk->dev,
+				     "RTKit: Message from undiscovered endpoint 0x%02x\n",
+				     ep);
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
 	    rtk->ops->recv_message_early &&
@@ -1731,6 +1788,10 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 	 */
 	dma_wmb();
 
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_rtkit_send_message, rtk, ep, message,
+				   completion, atomic);
+#endif
 	return apple_mbox_send(rtk->mbox, msg, atomic);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_send_message);
@@ -1800,6 +1861,16 @@ bool apple_rtkit_m5_saved_unresolved(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_m5_saved_unresolved);
 
+/* A log word the ordinary handler answers with its echo and nothing else. */
+static bool apple_rtkit_log_word(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	if (ep == APPLE_RTKIT_EP_SYSLOG)
+		return apple_rtkit_notification_msg(ep, msg);
+	return ep == APPLE_RTKIT_EP_OSLOG &&
+	       FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg) == APPLE_RTKIT_OSLOG_LOG &&
+	       apple_rtkit_oslog_echoed(rtk, msg);
+}
+
 int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 {
 	struct apple_mbox_msg msg;
@@ -1824,6 +1895,10 @@ int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 	    rtk->ops->recv_message_early &&
 	    rtk->ops->recv_message_early(rtk->cookie, msg.msg1, msg.msg0))
 		return 1;
+	/* Echoed here, its record unread: the firmware takes no AP idle notice with one owed. */
+	if (apple_rtkit_log_word(rtk, msg.msg1, msg.msg0) &&
+	    !apple_mbox_send_nowait(rtk->mbox, msg))
+		return 1;
 	/* SMC notifications remain ordered for the ordinary notifier worker.
 	 * Every other packet is retained, and refuses this attempt. In
 	 * particular no crash/report message is silently eaten by polling.
@@ -1844,14 +1919,25 @@ int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_m5_saved_poll);
 
-static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
-				 u64 *sent)
+/*
+ * The AP power state's post and its ack in the saved scope have the APPLE_RTKIT_M5_LOOPS bound of
+ * every other saved-scope message. Past it the call returns -ETIMEDOUT, which a committed SMC
+ * notice treats as fatal. A post or an ack that takes more than APPLE_RTKIT_M5_AP_SLOW_LOOPS steps
+ * (5 ms nominal) is logged with its count, so an SMC that answers late shows in the log well
+ * before the bound.
+ */
+#define APPLE_RTKIT_M5_AP_SLOW_LOOPS	500
+
+static int apple_rtkit_m5_saved_tx_tries(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
+				       u64 *sent, unsigned int *tries)
 {
 	int i, ret;
 
+	*tries = 0;
 	if (!rtk->m5_saved.active)
 		return -EINVAL;
 	for (i = 0; i < APPLE_RTKIT_M5_LOOPS; i++) {
+		*tries = i;
 		if (rtk->m5_saved.error)
 			return rtk->m5_saved.error;
 		if (READ_ONCE(rtk->crashed) || READ_ONCE(rtk->shutting_down))
@@ -1870,7 +1956,16 @@ static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_ms
 		 */
 		udelay(APPLE_RTKIT_M5_STEP_US);
 	}
+	*tries = APPLE_RTKIT_M5_LOOPS;
 	return -ETIMEDOUT;
+}
+
+static int apple_rtkit_m5_saved_tx(struct apple_rtkit *rtk, struct apple_mbox_msg msg,
+				 u64 *sent)
+{
+	unsigned int tries;
+
+	return apple_rtkit_m5_saved_tx_tries(rtk, msg, sent, &tries);
 }
 
 int apple_rtkit_m5_saved_send(struct apple_rtkit *rtk, u64 message)
@@ -1891,15 +1986,23 @@ static int apple_rtkit_m5_saved_wait_ap(struct apple_rtkit *rtk, u64 *ack)
 
 	for (i = 0; i < APPLE_RTKIT_M5_LOOPS; i++) {
 		ret = apple_rtkit_m5_saved_poll(rtk);
-		if (ret < 0)
+		if (ret < 0) {
+			dev_err(rtk->dev, "RTKit: AP power state %u: poll error %d after %d polls\n",
+				rtk->m5_saved.ap_target, ret, i);
 			return ret;
+		}
 		if (!rtk->m5_saved.ap_pending) {
 			if (ack)
 				*ack = rtk->m5_saved.stamp();
+			if (i >= APPLE_RTKIT_M5_AP_SLOW_LOOPS)
+				dev_warn(rtk->dev, "RTKit: AP power state %u: acked late, after %d polls\n",
+					 rtk->m5_saved.ap_target, i + 1);
 			return 0;
 		}
 		udelay(APPLE_RTKIT_M5_STEP_US);
 	}
+	dev_err(rtk->dev, "RTKit: AP power state %u: no ack after %d polls\n",
+		rtk->m5_saved.ap_target, i);
 	return -ETIMEDOUT;
 }
 
@@ -1912,6 +2015,7 @@ int apple_rtkit_m5_saved_ap_power(struct apple_rtkit *rtk, bool on,
 			FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, target),
 		.msg1 = APPLE_RTKIT_EP_MGMT,
 	};
+	unsigned int tries;
 	int ret;
 
 	if (!rtk->m5_saved.active)
@@ -1924,7 +2028,10 @@ int apple_rtkit_m5_saved_ap_power(struct apple_rtkit *rtk, bool on,
 	}
 	rtk->m5_saved.ap_target = target;
 	smp_store_release(&rtk->m5_saved.ap_pending, true);
-	ret = apple_rtkit_m5_saved_tx(rtk, msg, sent);
+	ret = apple_rtkit_m5_saved_tx_tries(rtk, msg, sent, &tries);
+	if (ret || tries >= APPLE_RTKIT_M5_AP_SLOW_LOOPS)
+		dev_warn(rtk->dev, "RTKit: AP power state %u: posted %d after %u tries\n", target, ret,
+			 tries);
 	if (ret) {
 		/* nowait TX guarantees a negative return means never posted. */
 		smp_store_release(&rtk->m5_saved.ap_pending, false);
@@ -2057,6 +2164,18 @@ bool apple_rtkit_v27_rx_drained(struct apple_rtkit *rtk)
 		kfifo_is_empty(&rtk->m5_saved.deferred) && !READ_ONCE(rtk->oslog_owed);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_rx_drained);
+
+/*
+ * A co-processor adopted from the bootloader has already sent its endpoint
+ * map. A client that starts one of its application endpoints by hand
+ * registers it here, so its messages are not reported as undiscovered.
+ */
+void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep)
+{
+	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START)
+		set_bit(ep, rtk->endpoints);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_ep);
 
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
@@ -2222,12 +2341,61 @@ static int apple_rtkit_inherit_buffers(
 	return 0;
 }
 
+/*
+ * The endpoint map the previous owner received for this session. Management
+ * is always present; system endpoints are limited to those RTKit implements
+ * here, so that an unknown one is not silently ignored.
+ */
+static int apple_rtkit_inherit_endpoints(
+	struct apple_rtkit *rtk, const struct apple_rtkit_adopted_session *session)
+{
+	static const u8 system_endpoints[] = {
+		APPLE_RTKIT_EP_MGMT,	 APPLE_RTKIT_EP_CRASHLOG,
+		APPLE_RTKIT_EP_SYSLOG,	 APPLE_RTKIT_EP_DEBUG,
+		APPLE_RTKIT_EP_IOREPORT, APPLE_RTKIT_EP_COREANALYTICS,
+		APPLE_RTKIT_EP_OSLOG,	 APPLE_RTKIT_EP_TRACEKIT,
+	};
+	DECLARE_BITMAP(known, APPLE_RTKIT_APP_ENDPOINT_START) = {};
+	DECLARE_BITMAP(map, APPLE_RTKIT_MAX_ENDPOINTS);
+	unsigned int i;
+
+	BUILD_BUG_ON(APPLE_RTKIT_ADOPTED_EPMAP_WORDS * 32 !=
+		     APPLE_RTKIT_MAX_ENDPOINTS);
+
+	if (session->protocol_version < APPLE_RTKIT_MIN_SUPPORTED_VERSION ||
+	    session->protocol_version > APPLE_RTKIT_MAX_SUPPORTED_VERSION ||
+	    (rtk->ops->protocol_version &&
+	     session->protocol_version != rtk->ops->protocol_version))
+		return -EINVAL;
+
+	bitmap_from_arr32(map, session->epmap, APPLE_RTKIT_MAX_ENDPOINTS);
+	for (i = 0; i < ARRAY_SIZE(system_endpoints); i++)
+		set_bit(system_endpoints[i], known);
+	if (!test_bit(APPLE_RTKIT_EP_MGMT, map))
+		return -EINVAL;
+	for (i = 0; i < APPLE_RTKIT_APP_ENDPOINT_START; i++)
+		if (test_bit(i, map) && !test_bit(i, known))
+			return -EINVAL;
+	/* A retained buffer belongs to an endpoint the session has. */
+	if ((rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, map)) ||
+	    (rtk->syslog_buffer.size && !test_bit(APPLE_RTKIT_EP_SYSLOG, map)) ||
+	    (rtk->ioreport_buffer.size && !test_bit(APPLE_RTKIT_EP_IOREPORT, map)) ||
+	    (rtk->oslog_buffer.size && !test_bit(APPLE_RTKIT_EP_OSLOG, map)))
+		return -EINVAL;
+
+	bitmap_copy(rtk->endpoints, map, APPLE_RTKIT_MAX_ENDPOINTS);
+	rtk->version = session->protocol_version;
+	return 0;
+}
+
 static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+					      const char *mbox_prop,
 					      const char *mbox_name, int mbox_idx,
 					      const struct apple_rtkit_ops *ops,
 					      bool adopted,
 					      const struct apple_rtkit_inherited_buffer *buffers,
-					      unsigned int count, bool track_saved)
+					      unsigned int count, bool track_saved,
+					      const struct apple_rtkit_adopted_session *session)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -2273,8 +2441,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
+	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);
@@ -2287,7 +2454,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->started);
 
-	if (mbox_name)
+	if (mbox_prop)
+		rtk->mbox = apple_mbox_get_prop(dev, mbox_prop, 0);
+	else if (mbox_name)
 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
 	else
 		rtk->mbox = apple_mbox_get(dev, mbox_idx);
@@ -2309,6 +2478,12 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	/* Inherited system traffic may arrive as soon as mailbox RX is armed. */
 	if (adopted)
 		apple_rtkit_mark_running(rtk);
+	/* The firmware's own endpoint map replaces the assumed one. */
+	if (session) {
+		ret = apple_rtkit_inherit_endpoints(rtk, session);
+		if (ret)
+			goto destroy_wq;
+	}
 
 	ret = apple_rtkit_claim_rx(rtk);
 	if (ret)
@@ -2335,17 +2510,26 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				  NULL, 0, false);
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
+				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_prop, NULL, 0, ops, false,
+				  NULL, 0, false, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_mbox_prop);
 
 struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const char *mbox_name, int mbox_idx,
 					     const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
-				  NULL, 0, false);
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
+				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
@@ -2403,10 +2587,24 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	const struct apple_rtkit_ops *ops,
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
-				  buffers, count, false);
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
+				  buffers, count, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
+
+struct apple_rtkit *apple_rtkit_init_adopted_with_session(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops,
+	const struct apple_rtkit_adopted_session *session)
+{
+	if (!session)
+		return ERR_PTR(-EINVAL);
+
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
+				  session->buffers, session->num_buffers, false,
+				  session);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_session);
 
 static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
 					   struct completion *c)
@@ -2777,6 +2975,16 @@ static int apple_rtkit_strict_idle_state(struct apple_rtkit *rtk, bool ap)
 
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 {
+	return apple_rtkit_idle_strict_with(rtk, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+
+/*
+ * As apple_rtkit_idle_strict(), with a step between the AP state's and the IOP state's.
+ * A failed step fails the idle: the IOP state is not sent.
+ */
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, int (*after_ap)(void *data), void *data)
+{
 	int ret;
 
 	if (rtk->strict_idle_poisoned || rtk->crashed ||
@@ -2786,6 +2994,8 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->strict_idle_done);
 	WRITE_ONCE(rtk->strict_idle_waiting, true);
 	ret = apple_rtkit_strict_idle_state(rtk, true);
+	if (!ret && after_ap)
+		ret = after_ap(data);
 	if (!ret)
 		ret = apple_rtkit_strict_idle_state(rtk, false);
 	if (!ret && !wait_for_completion_timeout(&rtk->strict_idle_done,
@@ -2798,7 +3008,7 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 		rtk->strict_idle_poisoned = true;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict_with);
 
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk)
 {
@@ -2907,7 +3117,8 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_quiesce);
 
-static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
+static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power,
+				   bool reinit_iop_ack)
 {
 	u64 msg;
 	int ret;
@@ -2915,7 +3126,8 @@ static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 	if (apple_rtkit_is_running(rtk))
 		return -EINVAL;
 
-	reinit_completion(&rtk->iop_pwr_ack_completion);
+	if (reinit_iop_ack)
+		reinit_completion(&rtk->iop_pwr_ack_completion);
 
 	/*
 	 * Use open-coded apple_rtkit_set_iop_power_state since apple_rtkit_boot
@@ -2932,13 +3144,79 @@ static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 
 int apple_rtkit_wake(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_wake_common(rtk, false);
+	return apple_rtkit_wake_common(rtk, false, true);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
+/* Wait up to @ms for @c, polling the mailbox where waits poll it: true once it is done. */
+static int apple_rtkit_done_within(struct apple_rtkit *rtk, struct completion *c,
+				   unsigned int ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(ms);
+	long t;
+
+	do {
+		if ((rtk->sync_syslog_ack || rtk->poll_waits) && apple_rtkit_poll(rtk) < 0)
+			break;
+		t = apple_rtkit_wait_timeout(rtk, c, msecs_to_jiffies(1));
+		if (t < 0)
+			return t;
+		if (t > 0)
+			return 1;
+	} while (time_before(jiffies, deadline));
+
+	return try_wait_for_completion(c);
+}
+
+/*
+ * Some firmware reports in by itself once its CPU runs and then acknowledges
+ * IOP power on by itself, answering no request for it after that; other
+ * firmware waits to be asked. Give the firmware up to @self_ack_ms to report in
+ * (its endpoint map, and CoreAnalytics where the ops need it) and again to
+ * acknowledge IOP power on; ask for IOP power as apple_rtkit_wake() does if it
+ * does neither.
+ */
+int apple_rtkit_boot_or_wake(struct apple_rtkit *rtk, unsigned int self_ack_ms)
+{
+	int ret;
+
+	if (apple_rtkit_is_running(rtk))
+		return -EINVAL;
+	if (rtk->crashed)
+		return -EINVAL;
+
+	ret = apple_rtkit_done_within(rtk, &rtk->epmap_completion, self_ack_ms);
+	if (ret < 0)
+		return ret;
+	if (!ret || rtk->boot_result)
+		return apple_rtkit_wake(rtk);
+	if (apple_rtkit_needs_coreanalytics(rtk) &&
+	    test_bit(APPLE_RTKIT_EP_COREANALYTICS, rtk->endpoints)) {
+		ret = apple_rtkit_wait_for_completion(rtk, &rtk->coreanalytics_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: CoreAnalytics readiness failed: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = apple_rtkit_done_within(rtk, &rtk->iop_pwr_ack_completion, self_ack_ms);
+	if (ret < 0)
+		return ret;
+	if (READ_ONCE(rtk->iop_power_state) == APPLE_RTKIT_PWR_STATE_ON) {
+		dev_dbg(rtk->dev, "RTKit: the IOP acknowledged power on by itself\n");
+		return apple_rtkit_boot(rtk);
+	}
+	/*
+	 * When !ret, iop_pwr_ack_completion was not signaled; keep it intact so
+	 * a late self-ACK arriving before SET_IOP_PWR_STATE is not lost.
+	 */
+	return apple_rtkit_wake_common(rtk, false, ret != 0);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_or_wake);
+
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_wake_common(rtk, true);
+	return apple_rtkit_wake_common(rtk, true, true);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
 
@@ -3389,6 +3667,21 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake_retained);
 
+/*
+ * After a sleep that took the co-processor's power, its mailbox's enables are gone with
+ * it: set them again before the co-processor is started, or its messages never arrive.
+ * The receive enable is one the boot loader sets on M1, which Linux doesn't set otherwise.
+ */
+int apple_rtkit_mbox_restore(struct apple_rtkit *rtk)
+{
+	int ret = apple_mbox_restore(rtk->mbox);
+
+	if (!ret)
+		apple_mbox_set_recv_enabled(rtk->mbox, true);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_mbox_restore);
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_rtkit_stop_rx(rtk);
@@ -3460,8 +3753,8 @@ struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *coo
 	struct apple_rtkit *rtk;
 	int ret;
 
-	rtk = __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				NULL, 0, true);
+	rtk = __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
+				NULL, 0, true, NULL);
 	if (IS_ERR(rtk))
 		return rtk;
 	ret = devm_add_action_or_reset(dev, apple_rtkit_free_wrapper, rtk);
@@ -3482,3 +3775,7 @@ MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple RTKit driver");
 
 #include "rtkit-v27-late.inc"
+
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_KUNIT_TEST)
+#include "rtkit-test.c"
+#endif
