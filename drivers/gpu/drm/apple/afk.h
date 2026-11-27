@@ -584,6 +584,8 @@ struct apple_dcp_afkep {
 	void *rx_scratch;
 
 	spinlock_t lock;
+	/* Serializes TX ring writes and mailbox doorbells outside ep->lock. */
+	struct mutex tx_lock;
 	u16 qe_seq;
 	bool stopping; /* lock: no new receive work after shutdown. */
 
@@ -607,7 +609,6 @@ struct apple_dcp_afkep {
 	size_t compact_reply_bytes;
 	/* Accepted RX and queued replies, until each worker has returned. */
 	atomic_t sleep_jobs;
-	struct mutex compact_tx_lock;
 	struct afk_fragment_state compact_rx;
 	void *compact_rx_data;
 
@@ -638,10 +639,10 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 	u32 i;
 
 	spin_lock_init(&ep->lock);
+	mutex_init(&ep->tx_lock);
 	INIT_LIST_HEAD(&ep->compact_cmds);
 	init_waitqueue_head(&ep->compact_orphan_wq);
 	init_waitqueue_head(&ep->service_wq);
-	mutex_init(&ep->compact_tx_lock);
 	init_completion(&ep->started);
 	init_completion(&ep->stopped);
 	init_completion(&ep->sleep_done);

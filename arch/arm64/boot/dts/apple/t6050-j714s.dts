@@ -14,6 +14,8 @@
 /dts-v1/;
 
 #define T6050_J714S
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 #include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 

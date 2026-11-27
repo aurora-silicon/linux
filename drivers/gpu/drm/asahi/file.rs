@@ -171,41 +171,20 @@ impl Drop for Vm {
             // object must not outlive the client's VM handle.
             status.release_mirror();
         }
-        if self.vm.status().is_some() {
-            // Tracked jobs can outlive their file's VM handle. Their last guard performs
-            // these unmaps once no accepted work can still dereference the mappings.
-            if let Err(error) = self
-                .vm
-                .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
-            {
-                pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
-            }
-            self.vm.bo_deferred_cleanup();
-            self.gpu.vm_closed(&self.vm);
-            return;
-        }
-        // When the user Vm is dropped, verify that no user mappings exists.
-        let left_range = self.user_range.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..self.user_range.end;
-
-        if !left_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, left_range.start, left_range.range())
-                .is_err()
+        // Tracked jobs can outlive their file's VM handle: their last guard runs the
+        // teardown once no accepted work can still dereference the mappings. On
+        // untracked VMs this unmaps every user GPUVA at once without allocating or
+        // charging split nodes, so teardown succeeds even at the client's memory limit.
+        if let Err(error) = self
+            .vm
+            .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
         {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+            pr_err!("Vm::Drop: user unmap failed: {:?}\n", error);
         }
-        if !right_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, right_range.start, right_range.range())
-                .is_err()
-        {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
-        }
-
         self.vm.bo_deferred_cleanup();
+        if self.vm.status().is_some() {
+            self.gpu.vm_closed(&self.vm);
+        }
     }
 }
 
@@ -478,6 +457,18 @@ pub(crate) type DrmFile = drm::File<File>;
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
+
+/// Most VMs one file may hold at a time. Mesa creates one per file. Each VM holds kernel memory
+/// that is not charged to the client (its GPUVM, allocators and per-VM objects).
+const MAX_VMS_PER_FILE: u32 = 64;
+
+/// Takes a slot for a new VM in a file's VM table, or fails with EBUSY past
+/// [`MAX_VMS_PER_FILE`], as the ID allocator reports a full range.
+fn reserve_vm_slot<'a>(
+    vms: &'a xarray::XArray<KBox<Vm>>,
+) -> Result<xarray::Reservation<'a, KBox<Vm>>> {
+    vms.lock().reserve_limit(1..=MAX_VMS_PER_FILE, GFP_KERNEL)
+}
 
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
@@ -761,6 +752,11 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        // Take the table slot first, so that a VM past the cap is refused before anything of it
+        // is built.
+        let vm_xa = file.inner().vms();
+        let resv = reserve_vm_slot(vm_xa.get_ref())?;
+        let id: u32 = resv.index().try_into()?;
         reg_data.gpu.admit_vm(
             device.as_ref().as_ref(),
             file.inner()
@@ -810,10 +806,6 @@ impl File {
                 }
             },
         );
-
-        let vm_xa = file.inner().vms();
-        let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
-        let id: u32 = resv.index().try_into()?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM Create\n", file_id, id);
         mod_dev_dbg!(
@@ -2073,6 +2065,38 @@ impl Drop for File {
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
         Self::mark_clients_closed(this, |_| true);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_vm_table)]
+mod vm_table_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_holds_at_most_max_vms_per_file() -> Result {
+        let vms = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let mut held = KVec::new();
+        for _ in 0..MAX_VMS_PER_FILE {
+            held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        }
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // A destroyed VM frees its slot for the next.
+        held.pop();
+        held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // Another file's VM table has its own budget while the first is full.
+        let other = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let _other_slot = reserve_vm_slot(&other)?;
+        // Closing the first file releases every slot for reuse.
+        held.clear();
+        let _reused = reserve_vm_slot(&vms)?;
+        Ok(())
     }
 }
 
