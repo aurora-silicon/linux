@@ -11,7 +11,7 @@
 //! notifier unregistration joins callbacks without holding that mutex.
 //! The floor and the hints it drives are one [`Policy`] per GPU generation.
 //! Sustained demand can renew the deadline indefinitely; withdrawal occurs on a
-//! later worker poll, not at an exact eight-millisecond boundary.
+//! later worker poll, not at an exact boundary.
 //!
 //! Pass intervals are firmware command timestamps, which count the system time
 //! base at the firmware's own 24 MHz (not CNTFRQ_EL0, which is 1 GHz on T6040
@@ -45,7 +45,7 @@ unsafe extern "C" {
 const MAX_REFILL_PER_SEC: u64 = 500;
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
-const LINGER_NS: u64 = 8_000_000;
+const LINGER_NS: u64 = 20_000_000;
 const POLL_MS: i64 = 2;
 #[cfg(CONFIG_CPU_FREQ)]
 const MAX_POLICIES: usize = 8;
@@ -56,8 +56,9 @@ pub(crate) struct Policy {
     /// CPU frequency floor while host refills bound the GPU, in percent of each cpufreq
     /// policy's top frequency.
     floor_percent: u64,
-    /// Capacity hint for the submitter's syncobj waits while the floor is applied, and how
-    /// long it stays valid after each submission (`Gpu::syncobj_wait_hint`).
+    /// Capacity hint for the submitter's syncobj waits while the floor is applied or the GPU
+    /// is the bottleneck, and how long it stays valid after each submission
+    /// (`Gpu::syncobj_wait_hint`).
     wait_util_min: u32,
     wait_hint_ms: u32,
     /// Minimum utilization of the completion receive thread while the GPU itself is the
@@ -72,11 +73,12 @@ impl Policy {
         // Half of each cluster's top frequency: the original feed policy, developed on J700
         // (commit "drm/asahi: request temporary CPU capacity for sustained GPU feeds").
         floor_percent: 50,
-        // Half of the capacity scale for 8 ms, from the same commit; on G13/G14 the same hint
-        // was measured on an M2 (commit "drm/asahi: hint CPU capacity for G13/G14 syncobj
-        // waits").
+        // Half of the capacity scale, from the same commit; on G13/G14 the same hint was
+        // measured on an M2 (commit "drm/asahi: hint CPU capacity for G13/G14 syncobj
+        // waits"). Held 20 ms since GPU-bound streams take the hint too (commit "drm/asahi:
+        // g17: provide syncobj wait hint on GPU-bound streams").
         wait_util_min: 512,
-        wait_hint_ms: 8,
+        wait_hint_ms: 20,
         // Measured on J700 (commit "drm/asahi: g17: drop the completion thread's frequency
         // boost while the GPU is the bottleneck"): heavy render/compute rows 1.7-3.3% faster,
         // 0.4-0.5 W less; 512 left idle.wake 5% slower after a pause and 0 cost one
@@ -592,10 +594,18 @@ impl Feed {
         }
     }
 
+    /// Temporary capacity hint for blocking syncobj waits on active GPU streams.
+    ///
+    /// Host-refill-bound streams (`wanted`) require an applied cpufreq floor,
+    /// while GPU-bound streams (`bound`) return the hint without raising the
+    /// cpufreq floor so EAS keeps the waiter on a P-core across long passes.
     pub(crate) fn wait_hint(&self) -> Option<(u32, u32)> {
-        if cfg!(CONFIG_UCLAMP_TASK)
-            && self.detector.wanted(Self::now())
-            && self.applied.load(Ordering::Relaxed)
+        if !cfg!(CONFIG_UCLAMP_TASK) {
+            return None;
+        }
+        let now = Self::now();
+        if (self.detector.wanted(now) && self.applied.load(Ordering::Relaxed))
+            || self.detector.bound(now)
         {
             Some((self.policy.wait_util_min, self.policy.wait_hint_ms))
         } else {
@@ -665,7 +675,32 @@ mod detector_tests {
         let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ / 25_000);
         assert!(detector.bound(now));
         assert!(!detector.wanted(now));
+        // Still bound across an 8-16 ms pass, then expires at the 20 ms linger boundary.
+        assert!(detector.bound(now + 15_000_000));
         assert!(!detector.bound(now + LINGER_NS));
+    }
+
+    #[test]
+    fn gpu_bound_long_pass_lingers_for_full_frame() {
+        let detector = Detector::new();
+        // 8 ms GPU passes with 1.7 ms host gaps stay GPU-bound without requesting a CPU floor,
+        // and linger across a 16 ms frame until the 20 ms boundary.
+        let busy = CLOCK_HZ / 125;
+        let gap = CLOCK_HZ * 17 / 10_000;
+        let step_ns = 9_700_000;
+        let mut start = 1000;
+        let mut now = 1_000_000;
+        for _ in 0..16 {
+            detector.note(start, start + busy, now);
+            start += busy + gap;
+            now += step_ns;
+        }
+        let last = now - step_ns;
+        assert!(detector.bound(last));
+        assert!(!detector.wanted(last));
+        assert!(detector.bound(last + 16_000_000));
+        assert!(detector.bound(last + LINGER_NS - 1));
+        assert!(!detector.bound(last + LINGER_NS));
     }
 
     #[test]
@@ -682,6 +717,10 @@ mod detector_tests {
         let detector = Detector::new(CLOCK_HZ);
         // Each pass starts after a pause of at least the refill limit.
         let now = run(&detector, 16, CLOCK_HZ / 500, MAX_REFILL_TICKS);
+        assert!(!detector.bound(now) && !detector.wanted(now));
+        // 60 Hz paced frames (16.6 ms gap) keep resetting the streak.
+        let detector = Detector::new();
+        let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ * 166 / 10_000);
         assert!(!detector.bound(now) && !detector.wanted(now));
         // Fewer back-to-back passes than the streak needs.
         let detector = Detector::new(CLOCK_HZ);
