@@ -51,6 +51,7 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
 }
 
 const _: () = assert!(logic::RETIRED_COMPUTE_PIPES == super::hw::sizes::COMPUTE_PIPES);
+const _: () = assert!(logic::RETIRED_RENDER_PAIRS == super::hw::sizes::RENDER_PAIRS);
 
 pub(crate) struct Recovery {
     /// Render host deadlines, ordinary and long-job ([`logic::Deadlines`]).
@@ -435,7 +436,7 @@ impl Firmware {
     /// owner prevents acknowledgement: its failure cannot safely be attributed.
     fn mark_recovery(
         &mut self,
-        stage: [u32; 2 + super::hw::sizes::COMPUTE_PIPES],
+        stage: [u32; super::hw::sizes::STAGES],
         event: u32,
         asid: Option<u32>,
     ) -> Result {
@@ -540,18 +541,25 @@ impl Firmware {
                 // Which side stalled, and whether tiling or fragment work was left behind.
                 let stage = self
                     .recovery_snapshot()
-                    .unwrap_or([0; 2 + super::hw::sizes::COMPUTE_PIPES]);
+                    .unwrap_or([0; super::hw::sizes::STAGES]);
                 dev_err!(
                     self.dev(),
-                    "M4 GPU recovery exceeded 1000 ms: {} (phase {}, TA {:#x}/{:#x}, FS {:#x}/{:#x}, {} flights)\n",
+                    "M4 GPU recovery exceeded 1000 ms: {} (phase {}, {} flights)\n",
                     logic::Stall::of(last_phase, answered).describe(),
                     last_phase,
-                    stage[0],
-                    self.engine.ta_target,
-                    stage[1],
-                    self.engine.fs_target,
                     self.engine.flights.len()
                 );
+                for pair in 0..super::hw::sizes::RENDER_PAIRS {
+                    dev_err!(
+                        self.dev(),
+                        "M4 GPU recovery: render pair {} TA {:#x}/{:#x}, FS {:#x}/{:#x}\n",
+                        pair,
+                        stage[super::hw::sizes::render_stage(pair, 0)],
+                        self.engine.ta_target[pair],
+                        stage[super::hw::sizes::render_stage(pair, 1)],
+                        self.engine.fs_target[pair]
+                    );
+                }
                 return Err(ETIMEDOUT);
             }
             let phase = self.firmware_r32(self.init.firmware_data().phase)?;

@@ -1116,6 +1116,23 @@ pub(crate) mod sizes {
     /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
     /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
     pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
+    /// Firmware TA/FS render queue pairs. Each pair owns a disjoint `RenderGraph` (TA and FS
+    /// `qinfo`, work rings, `qstate`, stamps, notifier page, threshold) and its own completion
+    /// events (`work::render_pair::events`, at most eight); all pairs share `sched_ctx` and the
+    /// `Channel::Ta`/`Channel::Fs` submit rings.
+    pub(crate) const RENDER_PAIRS: usize = 1;
+    const _: () = assert!(RENDER_PAIRS >= 1 && RENDER_PAIRS <= 8);
+    /// Per-stage event and recovery-snapshot cells: pair 0 TA/FS at `0`/`1`, compute pipes at
+    /// `2..2 + COMPUTE_PIPES`, then TA/FS of pairs `1..RENDER_PAIRS` ([`render_stage`]).
+    pub(crate) const STAGES: usize = 2 + COMPUTE_PIPES + 2 * (RENDER_PAIRS - 1);
+    /// The [`STAGES`] cell of render pair `pair`'s TA (`stage` 0) or FS (`stage` 1).
+    pub(crate) const fn render_stage(pair: usize, stage: usize) -> usize {
+        if pair == 0 {
+            stage
+        } else {
+            2 + COMPUTE_PIPES + 2 * (pair - 1) + stage
+        }
+    }
     const _: () = assert!(COMPUTE_PIPES >= 2 && COMPUTE_PIPES <= 16);
     const _: () = assert!(MAX_VM_COMPUTE_PIPES >= 2 && MAX_VM_COMPUTE_PIPES <= COMPUTE_PIPES);
     const _: () = assert!(COMPUTE_UNITS - PIPE1_COMPUTE_START >= (COMPUTE_PIPES - 1) * 2);

@@ -160,8 +160,17 @@ impl SnapshotEntry {
 pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
 /// Number of compute pipes tracked by [`RetiredStamps`] (matches `hw::sizes::COMPUTE_PIPES`).
 pub(crate) const RETIRED_COMPUTE_PIPES: usize = 8;
-/// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, TA, FS.
-pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2;
+/// Number of TA/FS render queue pairs tracked by [`RetiredStamps`] (matches
+/// `hw::sizes::RENDER_PAIRS`).
+pub(crate) const RETIRED_RENDER_PAIRS: usize = 1;
+/// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, then TA and FS of each
+/// render pair ([`retired_render_stage`]).
+pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2 * RETIRED_RENDER_PAIRS;
+
+/// The [`RetiredStamps`] stage of render pair `pair`'s TA (`stage` 0) or FS (`stage` 1).
+pub(crate) const fn retired_render_stage(pair: usize, stage: usize) -> usize {
+    RETIRED_COMPUTE_PIPES + 2 * pair + stage
+}
 
 /// Bounded per-stage ring of recently retired compute pipe and TA/FS firmware stamps
 /// so a late recovery snapshot arriving after pipelined retirement resolves any recently
@@ -206,8 +215,10 @@ impl RetiredStamps {
     pub(crate) fn contains(&self, event: u32, target: u32) -> bool {
         let stage = match event {
             e if (15..15 + RETIRED_COMPUTE_PIPES as u32).contains(&e) => (e - 15) as usize,
-            0x70 => RETIRED_COMPUTE_PIPES,
-            0x71 => RETIRED_COMPUTE_PIPES + 1,
+            // Render pair p: TA 0x70 + 2p, FS 0x71 + 2p.
+            e if (0x70..0x70 + 2 * RETIRED_RENDER_PAIRS as u32).contains(&e) => {
+                RETIRED_COMPUTE_PIPES + (e - 0x70) as usize
+            }
             _ => return false,
         };
         let len = self.len[stage] as usize;

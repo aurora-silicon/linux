@@ -344,6 +344,16 @@ pub(crate) mod render_pair {
         let ta = TA_EVENT + 2 * pair as u32;
         [ta, ta + 1]
     }
+
+    /// The render pair (`0..MAX_PAIRS`) and stage (0 TA, 1 FS) of a completion event.
+    pub(crate) const fn of_event(event: u32) -> Option<(usize, usize)> {
+        if event >= TA_EVENT && event - TA_EVENT < 2 * MAX_PAIRS as u32 {
+            let i = (event - TA_EVENT) as usize;
+            Some((i / 2, i % 2))
+        } else {
+            None
+        }
+    }
 }
 
 /// InitBM record (0x20 bytes).
