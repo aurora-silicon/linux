@@ -1554,8 +1554,13 @@ int ane_fw_staged_runtime_suspend(struct device *dev)
 			return -EBUSY;
 		}
 	}
+	/* Do not cut power at runtime idle if clean firmware stop is disabled. */
+	if (!ane_fw_clean_stop(b) || !b->pmu_base_set) {
+		ane_h16_session_sleep(&b->session, false);
+		return -EBUSY;
+	}
 	b->in_rpm = true;
-	ret = ane_fw_clean_stop(b) ? ane_fw_firmware_stop(b) : 0;
+	ret = ane_fw_firmware_stop(b);
 	if (!ret)
 		ret = ane_fw_power_down(b);
 	b->in_rpm = false;
