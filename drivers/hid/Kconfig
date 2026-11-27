@@ -156,6 +156,18 @@ config HID_APPLE_MTP_HAPTIC
 	  This driver can also be built as a module. If so, it will be called
 	  hid-apple-mtp-haptic.
 
+config HID_APPLE_MTP_KIWI
+	tristate "Apple MTP touch screen (kiwi) support"
+	depends on HID
+	help
+	  Support for the touch screen of the 14 inch M5 Max MacBook Pro
+	  (K114c). The driver turns the raw capacitance image of the touch
+	  interface into multi-touch contacts. The sensor grid and the panel
+	  size are fixed in the driver, and it ignores frames of any other size.
+
+	  This driver can also be built as a module. If so, it will be called
+	  hid-apple-mtp-kiwi.
+
 config HID_APPLEIR
 	tristate "Apple infrared receiver"
 	depends on (USB_HID)
