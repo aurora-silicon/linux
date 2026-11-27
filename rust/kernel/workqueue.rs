@@ -484,7 +484,21 @@ impl OwnedQueue {
         Self::ordered(name, bindings::wq_flags_WQ_MEM_RECLAIM)
     }
 
+    /// Allocates an ordered high-priority workqueue named `name` that may be used on the memory
+    /// reclaim path (`WQ_MEM_RECLAIM | WQ_HIGHPRI`).
+    pub fn new_ordered_highpri_reclaim(name: &CStr) -> Result<Self> {
+        Self::ordered_flags(
+            name,
+            bindings::wq_flags_WQ_MEM_RECLAIM | bindings::wq_flags_WQ_HIGHPRI,
+            true,
+        )
+    }
+
     fn ordered(name: &CStr, flags: u32) -> Result<Self> {
+        Self::ordered_flags(name, flags, false)
+    }
+
+    fn ordered_flags(name: &CStr, flags: u32, highpri: bool) -> Result<Self> {
         // SAFETY: `name` is a valid NUL-terminated string; the C side copies it.
         let ptr = unsafe { bindings::alloc_ordered_workqueue(name.as_char_ptr(), flags) };
 
@@ -493,7 +507,7 @@ impl OwnedQueue {
             queue: NonNull::new(ptr).ok_or(ENOMEM)?,
             ordered: true,
             unbound: true,
-            highpri: false,
+            highpri,
         })
     }
 
