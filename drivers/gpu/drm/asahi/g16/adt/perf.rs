@@ -176,7 +176,7 @@ fn decode_record(data: &[u8], state: usize) -> Result<(u32, u32), Error> {
 
 /// Copying and physical reservation admission are the caller's responsibility. No reference to
 /// `data` escapes. Padding after the root is permitted because phram exports whole pages.
-pub(crate) fn parse(data: &[u8]) -> Result<Source, Error> {
+pub(crate) fn parse(data: &[u8], sgx_compatible: &[u8]) -> Result<Source, Error> {
     if data.is_empty() || data.len() > 0x20_0000 {
         return Err(Error::Malformed);
     }
@@ -188,7 +188,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<Source, Error> {
     if compatible.last() != Some(&0)
         || !compatible
             .split(|&c| c == 0)
-            .any(|value| value == b"gpu,t8132")
+            .any(|value| value == sgx_compatible)
     {
         return Err(Error::Identity);
     }

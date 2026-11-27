@@ -1891,6 +1891,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec0: connector {
 			compatible = "usb-c-connector";
@@ -1929,6 +1930,7 @@
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 	};
 
 	hpm1: usb-pd@a {
@@ -1940,6 +1942,7 @@
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1981,6 +1984,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec2: connector {
 			compatible = "usb-c-connector";
@@ -2848,19 +2852,9 @@
 /*
  * DisplayPort/HDMI audio, as on the M4 Pro boards (t6040-j616s-dpaudio.dtsi).
  * The J614c's ADT has the J616s's: dcpext0's audio is dp-audio1 (SIO DMA
- * channel 0x66) and dcpext1's is dp-audio2 (0x68), and the PMGR has UART_P
- * (0x1a0) and DPA_P (0x1a8) under SIO, and DPA1 (0x238) and DPA2 (0x240)
- * under DPA_P. The SIO stays disabled here: the loader enables it once it has
- * reserved the firmware iBoot loaded (it finds it by the alias).
+ * channel 0x66) and dcpext1's is dp-audio2 (0x68). The PMGR has DPA1
+ * (0x238) and DPA2 (0x240) under the shared DPA_P power state.
  */
-&ps_uart_p {
-	status = "okay";
-};
-
-&ps_dpa_p {
-	status = "okay";
-};
-
 &ps_dpa1 {
 	status = "okay";
 };
@@ -2870,10 +2864,6 @@
 };
 
 / {
-	aliases {
-		sio = &sio;
-	};
-
 	dpaudio1: audio-controller-1 {
 		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
 		dmas = <&sio 0x66>;
@@ -2939,41 +2929,6 @@
 			};
 		};
 	};
-};
-
-/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
-&ps_sio_cpu {
-	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
-	status = "okay";
-};
-
-&sio_dart {
-	status = "okay";
-};
-
-&sio_mbox {
-	status = "okay";
-};
-
-/*
- * The Neural Engine, as on the M4 Pro boards. The J614c's ADT has ane0 with
- * pre-loaded firmware (__TEXT;__DATA); the loader fills the reservations of
- * t6041-j616c-ane.dtsi and the firmware IOVAs from it.
- */
-&ane0_dart0 {
-	status = "okay";
-};
-
-&ane0_dart1 {
-	status = "okay";
-};
-
-&ane0_dart2 {
-	status = "okay";
-};
-
-&ane {
-	status = "okay";
 };
 
 /* Both JPEG engines, as on the M4 Pro boards; they have no board wiring. */

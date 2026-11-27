@@ -184,6 +184,13 @@ static void __init gt_remove(struct kunit *test, const char *path, const char *n
 	KUNIT_ASSERT_EQ(test, of_changeset_remove_property(&t->cs, np, prop), 0);
 }
 
+static void __init gt_add_bool(struct kunit *test, const char *path, const char *name)
+{
+	struct gate_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, gt_node(test, path), name), 0);
+}
+
 static void __init gt_add_u32(struct kunit *test, const char *path, const char *name, u32 val)
 {
 	struct gate_test *t = test->priv;
@@ -790,6 +797,17 @@ static void __init gate_t6030_other_pmp_image(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The 27.2 (26B123) T6030 PMP image is taken as well. */
+static void __init gate_t6030_pmp_image_27_2(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	t->pmp_uuid = "5D66805B-E4AD-335E-BDC3-26828C682AAC";
+	gt_set_string(test, gt_t6030.values, "apple,tunable-uuid", t->pmp_uuid);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 static void __init gate_t6030_enabled_again(struct kunit *test)
 {
 	gt_run(test);
@@ -979,10 +997,13 @@ static void __init gt_expect_window(struct kunit *test, const char *path, const 
 
 /*
  * The panel as gt_expect_enabled() checks it, and the dcpext enabled or not
- * with all it needs. @window: the window both dcpext DARTs must have, NULL
- * for the device tree's own.
+ * with all it needs. When enabled, @shared says whether its scanout DART joins
+ * the display subsystem's domain (disabling fbdma) or stays out (leaving fbdma
+ * available for framebuffer mirroring). @window: the window both dcpext DARTs
+ * must have, NULL for the device tree's own.
  */
-static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 *window)
+static void __init gt_expect_dcpext_mode(struct kunit *test, bool enabled, bool shared,
+					 const u64 *window)
 {
 	struct device_node *display = gt_node(test, gt_t8122.display);
 	struct device_node *entry = gt_node(test, GT_T8122_DCPEXT_ENTRY);
@@ -998,19 +1019,27 @@ static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 
 	KUNIT_EXPECT_EQ(test, of_property_read_bool(entry, "apple,defer-startup-ack"), enabled);
 	KUNIT_EXPECT_EQ(test, gt_u32(test, GT_T8122_DCPEXT_PS, "apple,min-state"),
 			enabled ? PMGR_PS_ACTIVE : 4);
-	/* Its scanout DART joins the display subsystem's, after the panel's. */
 	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"),
-			enabled ? 2 : 1);
+			(enabled && shared) ? 2 : 1);
 	if (enabled) {
-		KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus",
-								 "#iommu-cells", 1, &args), 0);
-		KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, GT_T8122_DISPEXT_DART));
-		of_node_put(args.np);
+		if (shared) {
+			KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus",
+									 "#iommu-cells", 1, &args),
+					0);
+			KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, GT_T8122_DISPEXT_DART));
+			of_node_put(args.np);
+		}
+		KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DCPEXT "/fbdma"), !shared);
 	}
 	gt_expect_window(test, GT_T8122_DCPEXT_DART, window ?: gt_t8122_dcpext_window);
 	gt_expect_window(test, GT_T8122_DISPEXT_DART, window ?: gt_t8122_dispext_window);
 	/* The panel's own window stays as it is. */
 	gt_expect_window(test, "/t8122-soc/iommu@28d30c000", gt_t8122_panel_window);
+}
+
+static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 *window)
+{
+	gt_expect_dcpext_mode(test, enabled, enabled, window);
 }
 
 static void __init gt_require_display_driver(struct kunit *test)
@@ -1035,6 +1064,58 @@ static void __init gate_t8122_dcpext_v14_7(struct kunit *test)
 	gt_run(test);
 	gt_expect_dcpext(test, true, NULL);
 	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+}
+
+/* The boot loader's default marker (<2>) is accepted alongside <1>. */
+static void __init gate_t8122_dcpext_loader_default_marker(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_add_u32(test, GT_T8122_DCPEXT, "apple,t8122-dcpext-firmware-ready", 2);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-version", gt_v14_7, 3);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", gt_v14_7, 3);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, NULL);
+}
+
+/* Any marker value other than 1 or 2 is refused. */
+static void __init gate_t8122_dcpext_other_marker(struct kunit *test)
+{
+	gt_add_u32(test, GT_T8122_DCPEXT, "apple,t8122-dcpext-firmware-ready", 3);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", gt_v14_7, 3);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* apple,no-shared-display-dart keeps dispext0_dart out and leaves fbdma on. */
+static void __init gate_t8122_dcpext_board_mirrors(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, NULL);
+}
+
+/* apple,no-shared-display-dart without an fbdma child is refused. */
+static void __init gate_t8122_dcpext_board_no_fbdma(struct kunit *test)
+{
+	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_detach(test, GT_T8122_DCPEXT "/fbdma");
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* On 27.2 with apple,no-shared-display-dart, DARTs get the panel window and fbdma stays on. */
+static void __init gate_t8122_dcpext_v27_2_mirrors(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_2, gt_v27_2);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, gt_t8122_panel_window);
 }
 
 /*
@@ -1185,6 +1266,7 @@ static struct kunit_case gate_t6030_cases[] __refdata = {
 	KUNIT_CASE(gate_t6030_no_marker),
 	KUNIT_CASE(gate_t6030_t6031_power_layout),
 	KUNIT_CASE(gate_t6030_other_pmp_image),
+	KUNIT_CASE(gate_t6030_pmp_image_27_2),
 	KUNIT_CASE(gate_t6030_enabled_again),
 	{}
 };
@@ -1215,7 +1297,12 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_not_inherited_on),
 	KUNIT_CASE(gate_t8122_dcpext_not_ready),
 	KUNIT_CASE(gate_t8122_dcpext_v14_7),
+	KUNIT_CASE(gate_t8122_dcpext_loader_default_marker),
+	KUNIT_CASE(gate_t8122_dcpext_other_marker),
+	KUNIT_CASE(gate_t8122_dcpext_board_mirrors),
+	KUNIT_CASE(gate_t8122_dcpext_board_no_fbdma),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_mirrors),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_internal_v14),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_other_version),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_no_version),
