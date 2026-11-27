@@ -194,7 +194,12 @@ struct apple_dart_dcp_allocation {
 
 /* SID0 slices for the retained copy surfaces; generic DMA gets the other free ones. */
 #define DCP_DART_SCANOUT_SLOTS		4
-/* An external display DART's SID0 arena: the surfaces and host windows. */
+/*
+ * An external display DART's SID0 arena (reserved at admission, before mode
+ * selection): up to 18 x 32-MiB slices (576 MiB of the 64-GiB aperture, +256 MiB
+ * over the previous 10-slice cap, leaving >63 GiB unreserved; external SID0 has
+ * no generic DMA consumer and allocates no physical RAM until surfaces are used).
+ */
 #define DCP_DART_DISPEXT_SLOTS		18
 /* Up to two contiguous 32-MiB slices (64 MiB) per external surface or window. */
 #define DCP_DART_DISPEXT_MAX_SLICES	2

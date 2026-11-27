@@ -382,8 +382,8 @@ int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid)
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_stream_ok);
 
-/* Find and claim @slices (1..DCP_DART_DISPEXT_MAX_SLICES) contiguous free SID0 arena slices. */
-static int apple_dart_dcp_arena_claim(struct apple_dart_dcp *dcp, unsigned int slices, bool window)
+/* Find @slices (1..DCP_DART_DISPEXT_MAX_SLICES) contiguous free SID0 arena slices. */
+static int apple_dart_dcp_arena_find(struct apple_dart_dcp *dcp, unsigned int slices)
 {
 	unsigned int root, s;
 
@@ -398,20 +398,29 @@ static int apple_dart_dcp_arena_claim(struct apple_dart_dcp *dcp, unsigned int s
 			    test_bit(r, dcp->foreign) || dcp->entry[r] || READ_ONCE(dcp->root[r]))
 				break;
 		}
-		if (s == slices) {
-			for (s = 0; s < slices; s++) {
-				set_bit(root + s, dcp->claimed);
-				/* Private map only, never generic unmap. */
-				set_bit(root + s, dcp->shared_roots);
-				if (window)
-					set_bit(root + s, dcp->window);
-			}
-			if (window)
-				dcp->window_slices[root] = slices;
+		if (s == slices)
 			return root;
-		}
 	}
 	return -ENOSPC;
+}
+
+/* Find and claim @slices (1..DCP_DART_DISPEXT_MAX_SLICES) contiguous free SID0 arena slices. */
+static int apple_dart_dcp_arena_claim(struct apple_dart_dcp *dcp, unsigned int slices, bool window)
+{
+	int root = apple_dart_dcp_arena_find(dcp, slices);
+
+	if (root < 0)
+		return root;
+	for (unsigned int s = 0; s < slices; s++) {
+		set_bit(root + s, dcp->claimed);
+		/* Private map only, never generic unmap. */
+		set_bit(root + s, dcp->shared_roots);
+		if (window)
+			set_bit(root + s, dcp->window);
+	}
+	if (window)
+		dcp->window_slices[root] = slices;
+	return root;
 }
 
 /*
@@ -458,19 +467,20 @@ static void *__apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_
 	result = ERR_PTR(-ENOSPC);
 	if (dcp->allocated > DCP_DART_DISPEXT_SCANOUT_MAX - size)
 		goto unlock;
+	/* Fail fast without allocating pages if contiguous slices are unavailable. */
 	spin_lock_irqsave(&dcp->lock, flags);
-	root = apple_dart_dcp_arena_claim(dcp, slices, false);
+	root = apple_dart_dcp_arena_find(dcp, slices);
 	spin_unlock_irqrestore(&dcp->lock, flags);
 	if (root < 0) {
 		result = ERR_PTR(root);
 		goto unlock;
 	}
+	/* Complete all fallible host allocations before claiming arena slices. */
 	result = ERR_PTR(-ENOMEM);
 	allocation = kzalloc(struct_size(allocation, pages, count), GFP_KERNEL);
 	if (!allocation)
 		goto unlock;
 	allocation->size = size;
-	allocation->dva = DCP_DART_ALIAS + (u64)root * DCP_DART_SLICE;
 	for (allocated = 0; allocated < count; allocated++) {
 		allocation->pages[allocated] = alloc_page(GFP_KERNEL | __GFP_ZERO);
 		if (!allocation->pages[allocated])
@@ -483,6 +493,14 @@ static void *__apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_
 						 __builtin_return_address(0));
 	if (!allocation->cpu)
 		goto free_unpublished;
+	spin_lock_irqsave(&dcp->lock, flags);
+	root = apple_dart_dcp_arena_claim(dcp, slices, false);
+	spin_unlock_irqrestore(&dcp->lock, flags);
+	if (root < 0) {
+		result = ERR_PTR(root);
+		goto free_unpublished;
+	}
+	allocation->dva = DCP_DART_ALIAS + (u64)root * DCP_DART_SLICE;
 	list_add_tail(&allocation->link, &dcp->allocations);
 	dcp->allocated += size;
 	/* Every outcome after the first possible PTE retains all backing and claims. */
@@ -525,6 +543,8 @@ pin_failure:
 	result = ERR_PTR(ret);
 	goto unlock;
 free_unpublished:
+	if (allocation->cpu)
+		dma_common_free_remap(allocation->cpu, size);
 	while (allocated)
 		__free_page(allocation->pages[--allocated]);
 	kfree(allocation);
