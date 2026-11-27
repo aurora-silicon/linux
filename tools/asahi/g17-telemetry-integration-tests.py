@@ -55,7 +55,7 @@ mod g17 {
     fn now_ns() -> u64 { NOW.with(|now| now.get()) }
     #[derive(Clone, Copy, Debug)]
     enum Role { Primary = 0, Secondary = 1 }
-    mod trace { pub fn report(_:u8, _:u8, _:&[u32;18]) {} pub fn message(_:u32,_:u64) {} pub const CONTROL:u32=0; }
+    mod trace { pub fn report_enabled()->bool { false } pub fn report(_:u8, _:u8, _:&[u32;18]) {} pub fn message(_:u32,_:u64) {} pub const CONTROL:u32=0; }
     mod fw {
         pub mod variant {
             #[derive(Clone, Copy, Debug)]
