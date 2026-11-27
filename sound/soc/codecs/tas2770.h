@@ -25,6 +25,7 @@
 #define TAS2770_PWR_CTRL_SHUTDOWN  0x2
     /* Playback Configuration Reg0 */
 #define TAS2770_PLAY_CFG_REG0  TAS2770_REG(0X0, 0x03)
+#define TAS2770_AMP_GAIN_MAX  0x14
     /* Playback Configuration Reg1 */
 #define TAS2770_PLAY_CFG_REG1  TAS2770_REG(0X0, 0x04)
     /* Playback Configuration Reg2 */
