@@ -9667,6 +9667,17 @@ static const struct dcp_s2r_layout dcp_s2r_t8103 = {
 	.disp_streams = BIT(0) | BIT(4),
 };
 
+/*
+ * T8103's external display processor: DISPEXT0's CPU (0x378) and front end (0x368)
+ * power words, with the same DART stream layout as the internal DCP.
+ */
+static const struct dcp_s2r_layout dcp_s2r_t8103_ext = {
+	.disp_cpu = 0x378,
+	.disp_fe = 0x368,
+	.dcp_streams = BIT(0),
+	.disp_streams = BIT(0) | BIT(4),
+};
+
 /* TEST: J813 external processors, ADT DISPEXT0/1 power words. */
 static const struct dcp_s2r_layout dcp_s2r_t8142_ext[] = {
 	{ .disp_cpu = 0x428, .disp_fe = 0x418, .disp_sys = 0x308,
@@ -9973,10 +9984,12 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
  */
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
+	if (!dcp->hw.s2r_ext || !of_property_present(dcp->dev->of_node, "apple,display-power"))
+		return false;
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		return dcp->hw.s2r_ext && s2r_untested && dcp->v27_methods &&
+		return (!dcp->hw.s2r_untested || s2r_untested) && dcp->v27_methods &&
 		       dcp->v27_methods[dcpep_unnamed_500].tag[0];
-	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
+	return dcp->fw_compat == DCP_FIRMWARE_H17P;
 }
 
 /*
@@ -10353,8 +10366,8 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	if (dcp_s2r_is_t8142_ext(dcp)) {
-		/* Retain the CPU when idle, as in the measured J813 wake sequence. */
+	if (dcp->hw.s2r_ext) {
+		/* Retain the external CPU when idle (apple,min-state = 4). */
 		val = (val & ~DCP_PS_MIN) | FIELD_PREP(DCP_PS_MIN, 4);
 		writel(val, ps + l->disp_cpu);
 	}
@@ -10396,7 +10409,7 @@ static int dcp_s2r_ext_domains_on(struct apple_dcp *dcp)
 	u32 val;
 	int i, ret = -ENODEV;
 
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp->hw.s2r_layout)
 		return dcp_s2r_domains_on(dcp);
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
@@ -10467,14 +10480,22 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 		ret = dcp_s2r_ext_domains_on(dcp);
 	if (ret)
 		return ret;
+	/* Powered again: the invalidations held while it was dark run now. */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, false);
 	/* After the domains, whose writes it would reject, the DART protects them again. */
 	apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams, true,
 				   false);
+	/* Set up again before the firmware runs, which uses it right away. */
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, true, false);
+		if (ret)
+			return ret;
+	}
 	if (!cycled)
 		return apple_rtkit_sleep_return(dcp->rtk, control);
 
-	if (dcp->s2r_disp_dart)
-		apple_dart_power_dark(dcp->s2r_disp_dart, false);
 	return apple_rtkit_power_cycled_return(dcp->rtk, control);
 }
 
@@ -10493,7 +10514,7 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 	int i, ret = -ENODEV;
 	u32 val;
 
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp->hw.s2r_layout)
 		return dcp_s2r_domains_off(dcp);
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
@@ -10552,7 +10573,7 @@ static bool dcp_s2r_ext_cpu_on(struct apple_dcp *dcp)
 	of_node_put(np);
 	if (!ps)
 		return false;
-	on = FIELD_GET(GENMASK(7, 4), readl(ps + (dcp_s2r_is_t8142_ext(dcp) ?
+	on = FIELD_GET(GENMASK(7, 4), readl(ps + (dcp->hw.s2r_layout ?
 				dcp_s2r_layout(dcp)->disp_cpu : 0x328)));
 	iounmap(ps);
 
@@ -11586,6 +11607,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8103 = {
 	.s2r_disp_dart_with_dcp = true,
 };
 
+/* T8103's external DCP: maps register windows through its DART and stops/restarts across S2R */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8103_dcpext = {
+	.num_dptx_ports = 2,
+	.s2r_ext = true,
+	.s2r_no_secure_port = true,
+	.s2r_layout = &dcp_s2r_t8103_ext,
+	.map_reg_dart = true,
+	.s2r_disp_dart_with_dcp = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -11689,6 +11720,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
 	.dptx_controller = true,
 	/* TEST: firmware 27.2 link release, gated by appledrm.s2r_untested. */
 	.s2r_ext = true,
+	.s2r_untested = true,
 	.s2r_no_secure_port = true,
 	.s2r_layout = &dcp_s2r_t8142_ext[0],
 };
@@ -11723,6 +11755,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
 	{ .compatible = "apple,t8103-dcp", .data = &apple_dcp_hw_t8103,  },
+	{ .compatible = "apple,t8103-dcpext", .data = &apple_dcp_hw_t8103_dcpext, },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
