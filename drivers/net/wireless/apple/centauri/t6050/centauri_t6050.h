@@ -55,8 +55,11 @@ struct centauri_t6050 {
 	dma_addr_t firmware_dma, descriptor_dma;
 	size_t firmware_size;
 	u32 image_response;
+	unsigned int generation;
 	bool boot_attempted;
+	bool boot_hw_failed;
 	bool link_ready;
+	bool warm_reset;
 	/* Torn down for a sleep; Function 2 stays bound until the N1 is enumerated again */
 	bool firmware_sleep;
 	/* Kept alive across a firmware sleep via ACIPC host-sleep */
@@ -83,11 +86,13 @@ int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_re
 struct pci_dev *centauri_t6050_ipc_alpha_dev(struct centauri_t6050 *c);
 int centauri_t6050_ipc_control_sleep(struct centauri_t6050 *c, bool asleep);
 bool centauri_t6050_stop_dma(struct pci_dev *pdev);
+void centauri_t6050_fault_report(struct centauri_t6050 *c, const char *why);
 
 #if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI)
 irqreturn_t centauri_t6050_alpha_irq(int irq, void *data);
 int centauri_t6050_wifi_register(struct centauri_t6050 *c);
 void centauri_t6050_wifi_unregister(struct centauri_t6050 *c);
+bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c);
 void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c);
 int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c);
 bool centauri_t6050_wifi_pm_disconnected(struct centauri_t6050 *c);
@@ -107,6 +112,11 @@ static inline int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 }
 static inline void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
 {
+}
+
+static inline bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c)
+{
+	return false;
 }
 
 static inline void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)

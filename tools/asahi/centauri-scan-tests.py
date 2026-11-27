@@ -70,6 +70,7 @@ typedef uint64_t u64;
 #define NL80211_STA_INFO_SIGNAL 5
 #define lockdep_assert_held(l) assert(*(l))
 #define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
 
 struct device { int dummy; };
 struct pci_dev { struct device dev; };
@@ -101,7 +102,7 @@ struct centauri_t6050_wifi {
 	u32 scans_done;
 	u16 reply_status, scan_status;
 	u8 scan_sequence;
-	bool stopping, command_failed, host_sleep_sent, scan_abort;
+	bool stopping, command_failed, stage_fault_logged, host_sleep_sent, pm_prepared, scan_abort;
 	s8 station_signal;
 	bool station_signal_valid;
 	unsigned long station_signal_at, connected_at;
@@ -112,7 +113,7 @@ static unsigned long jiffies;
 static unsigned int bar_reads, sleep_calls, link_queries, stop_commands;
 static unsigned int stop_event_delay, complete_after_drains, drains_seen;
 static unsigned int sleep_step_ms, sleep_sets_host_sleep_at;
-static unsigned int sleep_completes_on_drain_at;
+static unsigned int sleep_completes_on_drain_at, fault_reports;
 static bool stop_refuse_342, stop_refuse_other, sleep_sets_abort;
 static bool sleep_sets_host_sleep, sleep_checks_station, station_ran_in_sleep;
 static u32 bar_state;
@@ -134,6 +135,11 @@ static int ieee80211_frequency_to_channel(u32 freq)
 static void command_refused(struct centauri_t6050_wifi *w, const char *s, int r)
 {
 	(void)w; (void)s; (void)r;
+}
+static void centauri_t6050_fault_report(struct centauri_t6050 *c, const char *why)
+{
+	(void)c; (void)why;
+	fault_reports++;
 }
 static int query_link_status(struct centauri_t6050_wifi *wifi)
 {
@@ -240,7 +246,7 @@ static void reset_wifi(void)
 	bar_reads = sleep_calls = link_queries = stop_commands = 0;
 	stop_event_delay = complete_after_drains = drains_seen = 0;
 	sleep_step_ms = sleep_sets_host_sleep_at = 0;
-	sleep_completes_on_drain_at = 0;
+	sleep_completes_on_drain_at = fault_reports = 0;
 	stop_refuse_342 = stop_refuse_other = false;
 	sleep_sets_abort = sleep_sets_host_sleep = false;
 	sleep_checks_station = station_ran_in_sleep = false;
@@ -327,6 +333,22 @@ int main(void)
 	assert(scan_profile27(&wifi) == 0);
 	mutex_unlock(&wifi.lock);
 	assert(sleep_calls == 1 && stop_commands == 0 && wifi.scans_done == 1);
+
+	/* 9. Alpha stage != 2 during scan reports recovery outside PM without poisoning command_failed. */
+	reset_wifi();
+	bar_state = 3;
+	mutex_lock(&wifi.lock);
+	assert(scan_transport_stopped(&wifi));
+	mutex_unlock(&wifi.lock);
+	assert(!wifi.command_failed && wifi.stage_fault_logged && fault_reports == 1);
+
+	reset_wifi();
+	bar_state = 3;
+	wifi.pm_prepared = true;
+	mutex_lock(&wifi.lock);
+	assert(scan_transport_stopped(&wifi));
+	mutex_unlock(&wifi.lock);
+	assert(!wifi.command_failed && wifi.stage_fault_logged && fault_reports == 0);
 
 	puts("PASS: Centauri T6050 Wi-Fi scan lock-release and stop synchronization");
 	return 0;
