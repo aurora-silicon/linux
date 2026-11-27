@@ -781,7 +781,7 @@ err:
  *     the mailbox's first word read (0x2e);
  *  4. the PMP's AGX request (PTD request bit 4) withdrawn 20 us later;
  *  5. 0.24 ms later the GFX word out of automatic power with its target on (0x0f0000ff), then
- *     its target off (0x0f0003f0) 6 us after that.
+ *     its target off (0x0f0003f0) 6 us after that. Not copied yet: see below.
  * AFR, the GPU PMGR's +0x10000 and +0x14000 blocks stay for the sleep controller, which lowers
  * them 2.7 to 6.6 ms before the commit.
  *
@@ -794,7 +794,6 @@ err:
 struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk)
 {
 	struct asahi_g17_commit *c;
-	u32 val;
 
 	c = asahi_g16_commit_alloc(dev, rtk);
 	if (IS_ERR(c))
@@ -804,54 +803,32 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	c->ran = true;
 	asahi_g16_sleep_note(0x21);
 	/*
-	 * macOS stops a GFX that is up: it reads actual 0xf three times before its power-down,
-	 * in every record. Gated under automatic power, as G15S idles, it is brought up first,
-	 * while the firmware still runs (J516s: raised after the idle instead, the SoC went down).
+	 * No GFX write, and nothing on the ASC's own page. On J516s every AP write taking GFX out
+	 * of automatic power reset the SoC, before or after the idle and macOS's 0x0f0000ff too
+	 * (PMU notes 0x21 and 0x24), and the CPU's status didn't answer after the idle; what macOS
+	 * does before its GFX write isn't in its records yet. GFX stays under automatic power,
+	 * which the idle firmware gates, and the sleep controller takes AFR, its parent, down
+	 * before the commit. The PMGR word is only read, for the log and the wake.
 	 */
 	c->entry = readl(c->ps);
 	c->saved = c->entry;
-	/* Out of automatic power whether or not it is up now, so that the idle firmware can't gate it */
-	writel((c->entry & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) |
-	       FIELD_PREP(PS_TARGET, PS_ACTIVE), c->ps);
-	c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
-					  10, PS_TIMEOUT_US);
-	asahi_g16_sleep_note(0x28);
 	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
 	asahi_g16_sleep_note(0x22);
 	apple_rtkit_mailbox_recv_off(c->rtk[0]);
 	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
 	/*
-	 * Its receive interrupt masked as well, before its domain goes: unlike in the commit, the
-	 * kernel runs on with GFX off, and a read of the unpowered mailbox from its handler aborts.
-	 * The restart unmasks it once GFX is back.
+	 * Its receive interrupt masked as well: the kernel runs on with the domain gated, and a
+	 * read of the unpowered mailbox from its handler aborts. The wake unmasks it.
 	 */
 	apple_rtkit_hold_rx(c->rtk[0]);
 	asahi_g16_sleep_note(0x23);
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
 	asahi_g16_sleep_note(0x24);
-
-	/*
-	 * Nothing on the ASC's own page from here: the idle firmware gates GFX under automatic
-	 * power, and a read of the CPU's status or control then takes the SoC down (J516s: PMU
-	 * scratch 0x24, then a reset). As macOS: out of automatic power with the target on (it
-	 * reads actual 0xf), then the target off.
-	 */
-	val = readl(c->ps);
-	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
-	readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE, 10, PS_TIMEOUT_US);
-	c->words[1] = val;
-	asahi_g16_sleep_note(0x25);
-	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
-	asahi_g16_sleep_note(0x26);
-	c->lower_ret = readl_poll_timeout(c->ps, c->lowered,
-					  !FIELD_GET(PS_ACTUAL, c->lowered) &&
-					  !(c->lowered & PS_BUSY),
-					  10, PS_TIMEOUT_US);
+	c->lowered = readl(c->ps);
 	asahi_g16_sleep_note(0x27);
 
-	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, PMP request %d, GFX %#x, active %#x (%d), off %#x (%d)\n",
-		 c->idle[0], c->idle_us[0], c->words[0], c->request_ret, c->entry, c->words[1],
-		 c->raise_ret, c->lowered, c->lower_ret);
+	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, PMP request %d, GFX %#x, then %#x\n",
+		 c->idle[0], c->idle_us[0], c->words[0], c->request_ret, c->entry, c->lowered);
 
 	return c;
 }

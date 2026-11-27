@@ -55,6 +55,7 @@ extern "C" {
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
     fn asahi_g16_sleep_note(step: u8);
     fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
+    fn apple_rtkit_set_recv_enabled(rtk: *mut bindings::apple_rtkit, enabled: bool);
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
@@ -71,6 +72,23 @@ impl Firmware {
             && !self.engine.frozen
             && !self.slots.scrubbing_active()
             && self.recovery_idle()?)
+    }
+
+    /// Wakes firmware the stop idled and nothing reset (a sleep that didn't reach the
+    /// hardware): the mailbox's receive and its interrupt back on, then IOP and AP on, with the
+    /// RTKit session as it was. No GFX write and nothing on the ASC's page.
+    fn sleep_wake_idle(&mut self) -> Result {
+        self.pools.invalidate();
+        let rtk = self.session.rtkit.as_raw();
+        // SAFETY: The RTKit handle lasts until reboot; the stop masked the interrupt once.
+        unsafe {
+            apple_rtkit_set_recv_enabled(rtk, true);
+            apple_rtkit_resume_rx(rtk);
+        }
+        note(0x3a);
+        let result = self.session.rtkit.wake();
+        note(if result.is_ok() { 0x3b } else { 0x3e });
+        result
     }
 
     /// The run bit and the RTKit handshake, with the firmware's state as it was left. `held`:
@@ -321,9 +339,16 @@ impl Shared {
     /// stop was made in `.prepare`, with the mailbox's receive interrupt masked.
     fn sleep_up(self: &Arc<Self>, held: bool) -> Result {
         let started = now_ns();
+        // SAFETY: Reads a global flag word.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
         let result = {
             let mut state = self.state.lock();
             match state.as_deref_mut() {
+                Some(firmware) if held && !real && !self.crashed.load(Ordering::Acquire) => {
+                    // Stopped in `.prepare` and nothing reset: GFX stayed under automatic
+                    // power, so only the firmware wakes, then the PMP's request comes back.
+                    firmware.sleep_wake_idle().map(|_| self.pmp_request(true))
+                }
                 Some(firmware) if !self.crashed.load(Ordering::Acquire) => {
                     self.raise_domain().and_then(|_| {
                         // As macOS: the request once the domain is on, before the firmware's
