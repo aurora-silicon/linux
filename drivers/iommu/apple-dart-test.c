@@ -1639,6 +1639,118 @@ static void apple_dart_test_fw_mirror_prot(struct kunit *test)
 	pm_runtime_disable(dart->dev);
 }
 
+struct apple_dart_test_t8020_inv {
+	bool dark;
+	u32 tcr0;
+	u32 ttbr0;
+};
+
+struct apple_dart_test_t8020_ctx {
+	struct apple_dart_test_t8020_inv inv[8];
+	unsigned int count;
+};
+
+static int apple_dart_test_t8020_record_inv(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	struct kunit *test = kunit_get_current_test();
+	struct apple_dart_test_t8020_ctx *ctx = test ? test->priv : NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_LT(test, ctx->count, (unsigned int)ARRAY_SIZE(ctx->inv));
+	ctx->inv[ctx->count++] = (struct apple_dart_test_t8020_inv){
+		.dark = READ_ONCE(dart->display_dark),
+		.tcr0 = readl(dart->regs + DART_TCR(dart, 0)),
+		.ttbr0 = readl(dart->regs + DART_TTBR(dart, 0, 0)),
+	};
+	return 0;
+}
+
+/*
+ * T8020 display DARTs marked dark before stream stop (dcp_ext_idle_off_work())
+ * must still save TTBR/TCR/enable state, and on wake must restore TTBR/TCR
+ * before display_dark exits so the post-restore TLB invalidation runs.
+ */
+static void apple_dart_test_t8020_display_streams_dark_order(struct kunit *test)
+{
+	const u32 streams = BIT(0) | BIT(4);
+	const u32 saved_tcr = DART_T8020_TCR_TRANSLATE_ENABLE;
+	const u32 saved_ttbr = DART_T8020_TTBR_VALID | 0x4200;
+	struct apple_dart_test_t8020_ctx *ctx;
+	struct apple_dart_hw hw = apple_dart_hw_t8103;
+	struct apple_dart *dart;
+	void *regs;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, "apple-dart-t8020-dark-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	regs = vzalloc(APPLE_DART_TEST_REGS_SIZE);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, apple_dart_test_vfree, regs), 0);
+
+	hw.invalidate_tlb = apple_dart_test_t8020_record_inv;
+	dart->regs = (__force void __iomem *)regs;
+	dart->hw = &hw;
+	dart->num_streams = 8;
+	spin_lock_init(&dart->lock);
+	spin_lock_init(&dart->managed_lock);
+	dev_set_drvdata(dart->dev, dart);
+	test->priv = ctx;
+
+	writel(saved_tcr, dart->regs + DART_TCR(dart, 0));
+	writel(saved_ttbr, dart->regs + DART_TTBR(dart, 0, 0));
+	writel(saved_tcr, dart->regs + DART_TCR(dart, 4));
+	writel(saved_ttbr | 0x10, dart->regs + DART_TTBR(dart, 4, 0));
+	writel(streams, dart->regs + dart->hw->enable_streams);
+
+	/* Mark dark before stopping streams (as dcp_ext_idle_off_work() does). */
+	KUNIT_ASSERT_EQ(test, apple_dart_power_dark(dart->dev, true), 0);
+	KUNIT_ASSERT_TRUE(test, READ_ONCE(dart->display_dark));
+	KUNIT_ASSERT_EQ(test, apple_dart_display_streams(dart->dev, streams, false, true), 0);
+	KUNIT_EXPECT_TRUE(test, dart->display_saved);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->host_off));
+	KUNIT_EXPECT_EQ(test, dart->display_enable, streams);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), 0U);
+	KUNIT_EXPECT_EQ(test, ctx->count, 1U);
+
+	/* Power loss clears registers; wake must restore TTBR/TCR before dark exit. */
+	memset_io(dart->regs, 0, APPLE_DART_TEST_REGS_SIZE);
+	ctx->count = 0;
+	KUNIT_ASSERT_EQ(test, apple_dart_display_streams(dart->dev, streams, true, false), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->display_dark));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->display_tlb_stale));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->host_off));
+	KUNIT_EXPECT_FALSE(test, dart->display_saved);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), saved_tcr);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 0, 0)), saved_ttbr);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams) & streams, streams);
+	/* First invalidation is hw_reset() (pre-restore); second is dark exit (post-restore). */
+	KUNIT_ASSERT_EQ(test, ctx->count, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->inv[0].tcr0, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->inv[0].ttbr0, 0U);
+	KUNIT_EXPECT_TRUE(test, ctx->inv[1].dark);
+	KUNIT_EXPECT_EQ(test, ctx->inv[1].tcr0, saved_tcr);
+	KUNIT_EXPECT_EQ(test, ctx->inv[1].ttbr0, saved_ttbr);
+
+	/*
+	 * Clearing display_dark prematurely before display_streams(..., true, false)
+	 * would skip the post-restore invalidation and leave display_tlb_stale set.
+	 */
+	KUNIT_ASSERT_EQ(test, apple_dart_power_dark(dart->dev, true), 0);
+	KUNIT_ASSERT_EQ(test, apple_dart_display_streams(dart->dev, streams, false, true), 0);
+	memset_io(dart->regs, 0, APPLE_DART_TEST_REGS_SIZE);
+	ctx->count = 0;
+	KUNIT_ASSERT_EQ(test, apple_dart_power_dark(dart->dev, false), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->display_dark));
+	KUNIT_EXPECT_EQ(test, ctx->count, 0U);
+	KUNIT_ASSERT_EQ(test, apple_dart_display_streams(dart->dev, streams, true, false), 0);
+	KUNIT_EXPECT_EQ(test, ctx->count, 1U);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->display_tlb_stale));
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
@@ -1671,6 +1783,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_resume_reset_retry),
 	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8103),
 	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8110),
+	KUNIT_CASE(apple_dart_test_t8020_display_streams_dark_order),
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
 	KUNIT_CASE(apple_dart_test_host_power_cycle),
 	KUNIT_CASE(apple_dart_test_host_power_lost),
