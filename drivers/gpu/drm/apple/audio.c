@@ -1365,28 +1365,38 @@ static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)
 static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
-	int ret;
+	int ret = 0;
 
 	WRITE_ONCE(dcpaud->stream_dma, false);
 	if (READ_ONCE(dcpaud->dma_cleared)) {
-		guard(mutex)(&dcpaud->link_lock);
-		WRITE_ONCE(dcpaud->dma_cleared, false);
-		/*
-		 * The silence set first, the channel hands over to it in
-		 * descriptor order when the stream's DMA ends; synchronize
-		 * returns once the stream's issued periods have played.
-		 */
-		if (dcpaud->silence_running || !dcpaud->link_started ||
-		    !dcp_audiosrv_link_live(dcpaud->dcp_dev) || dcpaud_silence_start(dcpaud)) {
-			dmaengine_terminate_async(dcpaud->chan);
-			dmaengine_synchronize(dcpaud->chan);
-			dcpaud_link_teardown(dcpaud);
-			pm_runtime_mark_last_busy(dcpaud->dev);
-			pm_runtime_put_autosuspend(dcpaud->dev);
-			return 0;
+		scoped_guard(mutex, &dcpaud->link_lock) {
+			WRITE_ONCE(dcpaud->dma_cleared, false);
+			/*
+			 * The silence set first, the channel hands over to it
+			 * in descriptor order when the stream's DMA ends;
+			 * synchronize returns once the stream's issued periods
+			 * have played. Bounded under the lock the display's
+			 * unplug takes.
+			 */
+			if (dcpaud->silence_running || !dcpaud->link_started ||
+			    !dcp_audiosrv_link_live(dcpaud->dcp_dev) ||
+			    dcpaud_silence_start(dcpaud)) {
+				dmaengine_terminate_async(dcpaud->chan);
+				ret = apple_sio_synchronize_bounded(dcpaud->chan);
+				dcpaud_link_teardown(dcpaud);
+				pm_runtime_mark_last_busy(dcpaud->dev);
+				pm_runtime_put_autosuspend(dcpaud->dev);
+			} else {
+				dmaengine_terminate_async(dcpaud->chan);
+				ret = apple_sio_synchronize_bounded(dcpaud->chan);
+			}
 		}
-		dmaengine_terminate_async(dcpaud->chan);
-		dmaengine_synchronize(dcpaud->chan);
+		/*
+		 * The buffer may be freed next: a stream's DMA the firmware has
+		 * not stopped yet is waited for here, without the link lock.
+		 */
+		if (ret)
+			dmaengine_synchronize(dcpaud->chan);
 		return 0;
 	}
 
@@ -1600,8 +1610,13 @@ void dcpaud_release_link(struct platform_device *pdev, const u64 *gen)
 	/* A stopped stream still playing its cleared buffer: sync_stop finishes it. */
 	if (dcpaud->chan && READ_ONCE(dcpaud->dma_cleared))
 		dmaengine_terminate_async(dcpaud->chan);
+	/*
+	 * Bounded: this runs under the link lock, from the display's unplug and
+	 * the sleep, and frees no buffer. A DMA the firmware did not stop stays
+	 * with the channel, and the stream's sync_stop waits for it.
+	 */
 	if (dcpaud->chan)
-		dmaengine_synchronize(dcpaud->chan);
+		apple_sio_synchronize_bounded(dcpaud->chan);
 	dcpaud_link_teardown(dcpaud);
 }
 

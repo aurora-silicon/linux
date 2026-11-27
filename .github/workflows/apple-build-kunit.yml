@@ -15,6 +15,7 @@ on:
     paths:
       - 'arch/arm64/configs/**'
       - 'drivers/accel/ane/**'
+      - 'drivers/dma/apple-sio*'
       - 'drivers/gpu/drm/apple/**'
       - 'drivers/gpu/drm/asahi/**'
       - 'drivers/hid/spi-hid/**'
@@ -43,6 +44,7 @@ on:
     paths:
       - 'arch/arm64/configs/**'
       - 'drivers/accel/ane/**'
+      - 'drivers/dma/apple-sio*'
       - 'drivers/gpu/drm/apple/**'
       - 'drivers/gpu/drm/asahi/**'
       - 'drivers/hid/spi-hid/**'
@@ -111,7 +113,7 @@ jobs:
           for opt in RUST=y DRM_ASAHI=m DRM_APPLE=m DRM_ACCEL_ANE=m VIDEO_APPLE_AVD=m \
                      NVME_APPLE=m APPLE_DART=y PCIE_APPLE=y USB4=m USB4_APPLE_SOC=m \
                      SPI_HID_APPLE_OF=m MFD_MACSMC=y MACSMC_POWER=m POWER_RESET_MACSMC=m \
-                     APPLE_SEP=m KSM=y MM_SUBPAGE=y; do
+                     APPLE_SEP=m APPLE_SIO=m KSM=y MM_SUBPAGE=y; do
             grep -qx "CONFIG_$opt" .config || { echo "::error::CONFIG_$opt is not set"; exit 1; }
           done
       - name: Compile the Apple drivers
@@ -119,6 +121,7 @@ jobs:
           make -j"$(nproc)" LLVM=1 ARCH=arm64 modules_prepare
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             drivers/accel/ane/ \
+            drivers/dma/apple-sio.o \
             drivers/gpu/drm/apple/ \
             drivers/gpu/drm/asahi/ \
             drivers/hid/spi-hid/ \
@@ -150,6 +153,7 @@ jobs:
           - { suite: dcp-fabric, kunitconfig: drivers/gpu/drm/apple/tests/.kunitconfig }
           - { suite: dcp-topology, kunitconfig: drivers/gpu/drm/apple/tests/topology.kunitconfig }
           - { suite: asahi, kunitconfig: drivers/gpu/drm/asahi/.kunitconfig, rust: true }
+          - { suite: apple-sio, kunitconfig: drivers/dma/apple-sio.kunitconfig }
           - { suite: spi-hid-apple, kunitconfig: drivers/hid/spi-hid/.kunitconfig }
           # avd-pm.kunitconfig runs the same AVD suites. PM_SLEEP, which it
           # adds, is already on by default on arm64.
