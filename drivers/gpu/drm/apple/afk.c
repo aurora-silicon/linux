@@ -24,6 +24,7 @@
 #include <kunit/visibility.h>
 
 #include "afk.h"
+#include "dcp-hdcp-drv.h"
 #include "afkv2-codec.h"
 #include "afk_reply.h"
 #include "trace.h"
@@ -461,7 +462,7 @@ afk_match_service(struct apple_dcp_afkep *ep, const char *name)
 		return ops;
 	}
 
-	return NULL;
+	return dcp_hdcp_match_service(ep, name, false);
 }
 
 static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *ep,
@@ -841,6 +842,7 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	const struct apple_epic_service_ops *ops, *any = NULL;
 	const char *service_name;
 	size_t len;
+	bool cut;
 
 	if (!name[0] || !ep->ops)
 		return NULL;
@@ -867,13 +869,14 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	}
 
 	/* An announcement that filled its field may have lost its end. */
-	if (strlen(name) < AFK_COMPACT_NAME_LEN - 1)
-		return any;
-	for (ops = ep->ops; ops->name[0]; ops++)
-		if (afk_compact_cut_of(ops, service_name))
-			return ops;
+	cut = strlen(name) >= AFK_COMPACT_NAME_LEN - 1;
+	if (cut)
+		for (ops = ep->ops; ops->name[0]; ops++)
+			if (afk_compact_cut_of(ops, service_name))
+				return ops;
 
-	return any;
+	/* The HDCP services, by name, wherever they are announced. */
+	return dcp_hdcp_match_service(ep, service_name, cut) ?: any;
 }
 
 /*
@@ -1918,9 +1921,15 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 	}
 
-	if (ep->match_epic_name)
+	/*
+	 * The HDCP services go by their EPIC name: their provider classes are
+	 * shared with other services (the DP device class also names the AV
+	 * device, the interface class names the port controllers).
+	 */
+	ops = dcp_hdcp_match_service(ep, epic_name, false);
+	if (!ops && ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);
-	else
+	else if (!ops)
 		ops = afk_match_service(ep, service_name);
 	if (dcp_is_ext26(ep->dcp))
 		dev_dbg(ep->dcp->dev,
@@ -3032,7 +3041,12 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (ep->wire_v2) {
 		if (!channel || channel > U16_MAX || tag > U8_MAX || payload_len > SZ_1M)
 			return -EINVAL;
-		if (ecat == EPIC_CAT_REPORT) {
+		if (ecat == EPIC_CAT_REPORT && stype == EPIC_SUBTYPE_STD_SERVICE) {
+			/* A service report with its data (an HDCP session's progress). */
+			if (!payload_len)
+				return -EINVAL;
+			v2_category = AFKV2_REPORT;
+		} else if (ecat == EPIC_CAT_REPORT) {
 			if ((stype != AFKV2_OPEN && stype != AFKV2_CLOSE) || payload_len)
 				return -EOPNOTSUPP;
 			v2_flags = 1;

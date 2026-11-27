@@ -1327,6 +1327,8 @@ struct apple_dcp {
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
 	struct dcp_cec *cec;
+	/* HDCP 2.2 transmitter state, NULL without HDCP (dcp-hdcp.c). */
+	struct dcp_hdcp *hdcp;
 };
 
 /* A DCP driven through the firmware's iBoot interface alone. */

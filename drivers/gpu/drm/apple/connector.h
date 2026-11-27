@@ -89,6 +89,15 @@ struct apple_connector {
 	 * chosen one; -1 until then, and nothing is sent.
 	 */
 	int bl_level;
+
+	/*
+	 * Content Protection (dcp-hdcp-drv.h): the property is attached, and
+	 * what the last commit asked for. Written by the commit tail, read by
+	 * the display processor that drives the connector.
+	 */
+	bool hdcp_attached;
+	bool hdcp_want;
+	u8 hdcp_type;
 };
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)

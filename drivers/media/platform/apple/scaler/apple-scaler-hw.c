@@ -53,6 +53,32 @@ static const struct asc_format asc_formats[] = {
 		.sampling = 0x12, .swizzle = ASC_SWIZZLE_CBCR, .planes = 2,
 		.bpp = { 2, 4 }, .hsub = 2, .vsub = 2, .yuv = true, .wide = true,
 	}, {
+		/*
+		 * Bytes B, G, R, A with the alpha carried through (V4L2 ABGR32).
+		 * MSR23 (M5) only: its jobs write the source's alpha byte to a
+		 * BGRA output (J815 outputs matched the reference byte for byte,
+		 * alpha included). How the earlier engines treat alpha is not
+		 * checked, so they offer only ARGB32 and XRGB32.
+		 */
+		.fourcc = V4L2_PIX_FMT_ABGR32, .layout = 0x1, .code = 0x1e,
+		.sampling = 0x0, .swizzle = ASC_SWIZZLE_IDENTITY, .planes = 1,
+		.bpp = { 4 }, .hsub = 1, .vsub = 1, .alpha = true, .msr23_only = true,
+	}, {
+		/*
+		 * MSR23 only. .code is the MSR23 plane code; MSR23 uses neither
+		 * sampling nor swizzle, and .layout only keeps the table's rule
+		 * (0x1 for one plane of R'G'B' or grey, 0xc for two planes).
+		 */
+		.fourcc = V4L2_PIX_FMT_NV16, .layout = 0xc, .code = 0x1, .planes = 2,
+		.bpp = { 1, 2 }, .hsub = 2, .vsub = 1, .yuv = true, .msr23_only = true,
+	}, {
+		.fourcc = V4L2_PIX_FMT_NV24, .layout = 0xc, .code = 0x1, .planes = 2,
+		.bpp = { 1, 2 }, .hsub = 1, .vsub = 1, .yuv = true, .msr23_only = true,
+	}, {
+		/* One 8-bit component, no colorimetry: GREY to GREY only. */
+		.fourcc = V4L2_PIX_FMT_GREY, .layout = 0x1, .code = 0x1, .planes = 1,
+		.bpp = { 1 }, .hsub = 1, .vsub = 1, .msr23_only = true,
+	}, {
 		/* The AVE temporal filter's picture form; one buffer, four regions. */
 		.fourcc = V4L2_PIX_FMT_APPLE_L8V0, .layout = 0xc, .code = 0x78,
 		.sampling = 0x46, .swizzle = ASC_SWIZZLE_CBCR, .planes = 2,

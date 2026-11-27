@@ -38,7 +38,6 @@ read -r -a target_args <<< "${TARGET_SSH_ARGS:-}"
 tgt() { ssh "${ssh_opts[@]}" "${target_args[@]}" "$TARGET_SSH" "$@"; }
 box() { ssh "${ssh_opts[@]}" "$EMU_SSH" "$@"; }
 CTL=/run/hogkb/ctl
-TGT_DIR=/var/tmp/bt-wake
 BACKSTOP=120
 TRIGGER_AFTER=20
 out=${OUT:-./bt-wake-run-$(date +%Y%m%d-%H%M%S)}
@@ -81,9 +80,14 @@ pair)
 run)
 	n=${2:-5}
 	emu_start
-	tgt "mkdir -p $TGT_DIR" &&
-		scp -q "${target_args[@]}" "$(dirname "$0")/bt-wake-cycle.sh" \
-			"$TARGET_SSH:$TGT_DIR/"
+	# A fresh private directory on the target holds the copied script and
+	# every cycle's evidence, so nothing root runs or writes there can be
+	# planted or swapped by another user.
+	TGT_DIR=$(tgt "mktemp -d /var/tmp/bt-wake-run.XXXXXXXX")
+	[[ $TGT_DIR =~ ^/var/tmp/bt-wake-run\.[A-Za-z0-9]+$ ]] ||
+		{ echo "cannot create a directory on the target" >&2; exit 2; }
+	scp -q "${target_args[@]}" "$(dirname "$0")/bt-wake-cycle.sh" \
+		"$TARGET_SSH:$TGT_DIR/" || exit 2
 	pass=0
 	plan=()
 	for _ in $(seq 1 "$n"); do plan+=(on); done
@@ -96,7 +100,7 @@ run)
 		emu key 0x2c 30
 		sleep 8
 		say "cycle $k wake=$mode: suspending the target (backstop ${BACKSTOP}s)"
-		tgt "rm -rf $d; setsid nohup $TGT_DIR/bt-wake-cycle.sh -w $mode -s $BACKSTOP \
+		tgt "setsid nohup $TGT_DIR/bt-wake-cycle.sh -w $mode -s $BACKSTOP \
 			-a $EMU_ADDR -o $d > $d.log 2>&1 < /dev/null &"
 		for _ in $(seq 1 30); do
 			tgt "test -f $d/suspending" 2> /dev/null && break
