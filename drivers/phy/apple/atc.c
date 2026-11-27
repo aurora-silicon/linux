@@ -772,10 +772,11 @@ struct apple_atcphy;
  * @sleep_drops_common: Deep sleep lowers the common power domain behind
  *                      genpd's back, so resume must mark @pd_was_off even
  *                      without a genpd power-off notification
- * @idle_power_off: Let an idle PHY runtime-suspend, so that its power domain
- *                  can also drop while the system runs, see atcphy_rpm_get().
- *                  Only for PHYs without DisplayPort, whose phy ops and tunnel
- *                  calls take no runtime PM reference
+ * @idle_power_off: Default-enable runtime idle power-off even when the DT
+ *                  node lacks @apple,idle-power-off (for older T8132 DTs);
+ *                  other PHYs with @restore_after_pd_off require
+ *                  @apple,idle-power-off, and the DT power-domain hierarchy
+ *                  must still allow power-off, see atcphy_rpm_get()
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -7710,6 +7711,50 @@ static int atcphy_probe_power_domains(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * A PHY can power off at runtime only when its DT power domain can drop:
+ * neither the domain itself nor all of its parent domains carry
+ * apple,always-on (where ps_atcN_usb has ps_atcN_usb_aon plus ps_atcN_common,
+ * idle power-off drops ps_atcN_common while ps_atcN_usb_aon stays on for DWC3).
+ */
+static bool atcphy_pd_can_power_off(const struct device_node *np)
+{
+	struct device_node *pd_np __free(device_node) = of_parse_phandle(np, "power-domains", 0);
+	struct of_phandle_iterator it;
+	bool has_parents = false;
+	int err;
+
+	if (!pd_np || of_property_read_bool(pd_np, "apple,always-on"))
+		return false;
+	of_for_each_phandle(&it, err, pd_np, "power-domains", "#power-domain-cells", -1) {
+		has_parents = true;
+		if (!of_property_read_bool(it.node, "apple,always-on")) {
+			of_node_put(it.node);
+			return true;
+		}
+	}
+	if (err != -ENOENT)
+		return false;
+	return !has_parents;
+}
+
+/*
+ * Enable runtime idle power-off only when the PHY can restore state after
+ * power loss, either the hardware variant defaults it on for older DTs or the
+ * DT node explicitly advertises apple,idle-power-off, and its DT power-domain
+ * hierarchy allows power-off.
+ */
+static bool atcphy_can_idle_power_off(const struct atcphy_hw *hw,
+				      const struct device_node *np)
+{
+	if (!hw->restore_after_pd_off)
+		return false;
+	if (!hw->idle_power_off &&
+	    !of_property_read_bool(np, "apple,idle-power-off"))
+		return false;
+	return atcphy_pd_can_power_off(np);
+}
+
 static void atcphy_sleep_finish_work(struct work_struct *work);
 
 static int atcphy_probe(struct platform_device *pdev)
@@ -7774,10 +7819,12 @@ static int atcphy_probe(struct platform_device *pdev)
 	followed = atcphy_probe_pd_notifier(atcphy);
 
 	/*
-	 * Only a PHY that follows its domain may let it drop. Before the PHYs are
-	 * created, so that they follow runtime PM too.
+	 * Only a PHY that follows its domain, advertises idle power-off (or
+	 * defaults it on for older DTs), and has a droppable DT power-domain
+	 * hierarchy may let it drop. Before the PHYs are created, so that they
+	 * follow runtime PM too.
 	 */
-	if (atcphy->hw->idle_power_off && followed) {
+	if (followed && atcphy_can_idle_power_off(atcphy->hw, dev->of_node)) {
 		pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
 		pm_runtime_use_autosuspend(dev);
 		ret = devm_pm_runtime_set_active_enabled(dev);
@@ -8233,8 +8280,7 @@ static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
 	if ((!atcphy->hw->has_t8140_dp &&
 	     !atcphy->hw->sleep_drops_common &&
-	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy") &&
-	     !atcphy->hw->idle_power_off) ||
+	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy")) ||
 	    !atcphy->hw->restore_after_pd_off || !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
@@ -8766,25 +8812,6 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.park_dummy_phy = true,
 	.restore_after_pd_off = true,
 	.sleep_drops_common = true,
-	.idle_power_off = true,
-};
-
-/*
- * T8112/T600x/T602x list apple,t8103-atcphy as a fallback compatible; keep
- * them on the pre-existing non-idle-power-off behavior until validated there.
- */
-static const struct atcphy_hw atcphy_hw_t8103_always_on = {
-	.gen = ATCPHY_GENERATION_T8103,
-	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
-	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
-	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
-	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
-	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
-	.has_usb4 = true,
-	.park_pipe_unlocked = true,
-	.park_dummy_phy = true,
-	.restore_after_pd_off = true,
-	.sleep_drops_common = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {
@@ -8880,9 +8907,6 @@ static const struct atcphy_hw atcphy_hw_t8152 = {
 };
 
 static const struct of_device_id atcphy_match[] = {
-	{ .compatible = "apple,t8112-atcphy", .data = &atcphy_hw_t8103_always_on },
-	{ .compatible = "apple,t6000-atcphy", .data = &atcphy_hw_t8103_always_on },
-	{ .compatible = "apple,t6020-atcphy", .data = &atcphy_hw_t8103_always_on },
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
