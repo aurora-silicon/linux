@@ -85,6 +85,13 @@ impl Firmware {
         }
         note(0x33);
         let control = self.session.regs.asc_control()?;
+        if held {
+            dev_info!(
+                self.session.dev.as_ref(),
+                "GPU firmware restart: ASC control {:#x} with GFX back on\n",
+                control
+            );
+        }
         self.session.regs.set_asc_control(control | ASC_RUN)?;
         regs::mb();
         note(0x34);

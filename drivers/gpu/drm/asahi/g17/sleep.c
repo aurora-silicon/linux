@@ -785,9 +785,8 @@ err:
  * AFR, the GPU PMGR's +0x10000 and +0x14000 blocks stay for the sleep controller, which lowers
  * them 2.7 to 6.6 ms before the commit.
  *
- * Those records don't cover the ASC's own page, so what macOS does with the run bit isn't
- * known. The run bit goes off after the mailbox, as the commit's stop has it, so the restart
- * boots the firmware from its vector whether or not the sleep reached the hardware.
+ * Those records don't cover the ASC's own page. Linux doesn't touch it here either: with the
+ * firmware idle, GFX may be gated, and the page doesn't answer then.
  *
  * Interrupts on, in .prepare, before anything else suspends. Told to idle, the firmware can't
  * carry on, so the stop goes on whatever it answers, and only a restart brings it back.
@@ -819,14 +818,20 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	asahi_g16_sleep_note(0x23);
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
 	asahi_g16_sleep_note(0x24);
-	c->status[0] = readl(c->cpu[0] + ASC_CPU_STATUS);
-	writel(readl(c->cpu[0]) & ~ASC_CPU_CONTROL_RUN, c->cpu[0]);
-	asahi_g16_sleep_note(0x25);
 
+	/*
+	 * Nothing on the ASC's own page from here: the idle firmware gates GFX under automatic
+	 * power, and a read of the CPU's status or control then takes the SoC down (J516s: PMU
+	 * scratch 0x24, then a reset). As macOS: out of automatic power with the target on, which
+	 * brings a gated domain back (it reads actual 0xf), then the target off.
+	 */
 	val = readl(c->ps);
 	c->saved = val;
 	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
-	val = readl(c->ps);
+	c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
+					  10, PS_TIMEOUT_US);
+	c->words[1] = val;
+	asahi_g16_sleep_note(0x25);
 	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
 	asahi_g16_sleep_note(0x26);
 	c->lower_ret = readl_poll_timeout(c->ps, c->lowered,
@@ -835,9 +840,9 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 					  10, PS_TIMEOUT_US);
 	asahi_g16_sleep_note(0x27);
 
-	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, CPU status %#x, PMP request %d, GFX %#x -> %#x (%d)\n",
-		 c->idle[0], c->idle_us[0], c->words[0], c->status[0], c->request_ret,
-		 c->entry, c->lowered, c->lower_ret);
+	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, PMP request %d, GFX %#x, active %#x (%d), off %#x (%d)\n",
+		 c->idle[0], c->idle_us[0], c->words[0], c->request_ret, c->entry, c->words[1],
+		 c->raise_ret, c->lowered, c->lower_ret);
 
 	return c;
 }
