@@ -237,12 +237,3 @@
 	};
 };
 
-/* ADT /arm-io/spi4/dp855; chip select = /arm-io/spi4 function-spi_cs0. */
-&spi4 {
-	cs-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_LOW>;
-	status = "okay";
-};
-
-&tcon {
-	status = "okay";
-};

@@ -506,6 +506,8 @@
 };
 
 #define T6050_J775D
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
 #include "t6050-peripherals.dtsi"
 
 /*

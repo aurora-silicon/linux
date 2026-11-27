@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The M5 Max's die-0 SoC part, for every board built on it: the MacBook Pros J714c, J716c,
+ * K114c and K116c and the Mac Studios J775c and J775d. Boards include it before
+ * t6050-peripherals.dtsi; it selects the blocks the M5 Pro's die does not have.
+ *
+ * The Max's ADTs (27.2: J714cAP, J716cAP, J775cAP, J775dAP, K114cAP, K116cAP, and the live
+ * J716c ADT) have two more SPMI buses than the M5 Pro's (J714sAP, J716sAP, J873sAP, K114sAP,
+ * K116sAP, and the live K114s and K116s ADTs): nub-spmi1 (spmi-mosquitoM1, interrupt 731) and
+ * nub-spmi4 (spmi-jerezC0 and spmi-jerezC1, interrupt 746), the Max's other PMICs.
+ */
+#define T6050_MAX_PMIC_BUSES

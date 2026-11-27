@@ -2814,7 +2814,9 @@ F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
 F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
+F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
+F:	drivers/nvmem/apple-spmi-nvmem.kunitconfig
 F:	drivers/phy/apple/
 F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c

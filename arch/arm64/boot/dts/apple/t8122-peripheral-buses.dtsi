@@ -26,6 +26,7 @@
 		status = "disabled";
 	};
 
+	/* ADT /arm-io/nub-spmi1: the auxiliary PMU (pmu-aux) at USID 0xe. */
 	nub_spmi1: spmi@2e4794000 {
 		compatible = "apple,t8122-spmi", "apple,t8103-spmi";
 		reg = <0x2 0xe4794000 0 0x4000>,
@@ -37,7 +38,12 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
+		pmic@e {
+			compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+			read-only;
+		};
 	};
 
 	aop_spmi0: spmi@2f4894000 {

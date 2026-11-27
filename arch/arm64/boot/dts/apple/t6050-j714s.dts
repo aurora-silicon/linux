@@ -44,11 +44,6 @@
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
 	chassis-type = "laptop";
 
-	aliases {
-		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
-		sep = &sep;
-	};
-
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -528,64 +523,9 @@
 	power-domains = <&pmp0_gfx>;
 };
 
-/*
- * The SEP (ADT sep, dart-sep): its mailbox, and its power domain with the two
- * fabric parents left to the firmware, which genpd votes on and never turns off.
- * The boot loader enables the SEP itself through its alias.
- */
-&sep_mbox {
-	status = "okay";
-};
-
-&ps_sep {
-	status = "okay";
-};
-
-&ps_fab8_soc {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-&ps_fab0_piogw {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-/*
- * Touch ID (ADT spi2/mesa): J616s's Mesa sensor (sensor-id 0x3356) at 8 MHz on
- * chip select 0, powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP
- * GPIO 138. The controller's clock (ADT clock-ids 451) is the 24 MHz reference.
- */
-&ps_nub_gpio {
-	status = "okay";
-};
-
-&nub_gpio0 {
-	status = "okay";
-};
-
-&ps_spi2 {
-	status = "okay";
-};
-
-&spi2 {
-	clocks = <&clkref>;
-	status = "okay";
-
-	mesa: fingerprint@0 {
-		compatible = "apple,mesa-fingerprint";
-		reg = <0>;
-		spi-max-frequency = <8000000>;
-		spi-cpol;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
-		interrupt-parent = <&pinctrl_ap>;
-		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
-		/* Per-device factory data from this Mac's own iBoot system container */
-		firmware-name = "apple/mesacal-j714s.bin", "apple/msrk-j714s.bin";
-	};
-};
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-j714s.bin", "apple/msrk-j714s.bin"
+#include "t6050-touchid.dtsi"
 
 /*
  * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its

@@ -1017,7 +1017,9 @@ struct apple_dcp {
 	bool s2r_power_on;
 	bool s2r_power_oob;
 	u8 s2r_step;
+	struct mutex s2r_dart_lock; /* serializes D572 DART callback with s2r_active */
 	struct completion s2r_dart_done;
+	int s2r_dart_err;
 	struct completion s2r_hpd_done;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
