@@ -81,7 +81,13 @@
  */
 #define APPLE_DVFS_VERIFY_LAZY_NS	(1 * NSEC_PER_MSEC)
 #define APPLE_DVFS_VERIFY_SLACK_NS	(500 * NSEC_PER_USEC)
-#define APPLE_DVFS_TRANSITION_NS	(50 * NSEC_PER_USEC)
+/*
+ * Without an OPP clock-latency-ns, a transition is taken to finish within an
+ * eighth of the SoC's transaction timeout: 50 us of the default 400 us, as
+ * measured on T8140.
+ */
+#define APPLE_DVFS_TRANSITION_DIV	8
+/* First re-check of a transition still busy; doubles up to the above. */
 #define APPLE_DVFS_RETRY_NS		(4 * NSEC_PER_USEC)
 
 /*
@@ -246,6 +252,12 @@ struct apple_cpu_priv {
 	/* When the last request was written, and when it times out. */
 	ktime_t write_time;
 	ktime_t verify_deadline;
+	/*
+	 * When a transition should have finished after its write, and the
+	 * current re-check interval for one still busy, see "Lazy verification".
+	 */
+	u64 transition_ns;
+	u64 retry_ns;
 	/* P-state requested while a transition was busy, or -1. */
 	int pending_pstate;
 	/*
@@ -528,9 +540,10 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
 /*
  * Lazy verification (verify_transition SoCs)
  *
- * A transition takes about 50 us. The scheduler's fast-switch path must not
- * wait for one, nor drop a request: schedutil records the frequency it asked
- * for and does not ask again for the same one.
+ * A transition takes tens of microseconds (about 50 us on T8140), longer on
+ * some SoCs. The scheduler's fast-switch path must not wait for one, nor drop
+ * a request: schedutil records the frequency it asked for and does not ask
+ * again for the same one.
  *
  * A request finding the cluster idle requires the accepted state to be the
  * one last written, so verifying the previous request, and is written at
@@ -541,7 +554,12 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
  *
  * A request finding the cluster busy is kept as pending, replacing an older
  * pending one. The timer writes it as soon as the transition has finished,
- * after the same check, and then verifies it as above.
+ * after the same check, and then verifies it as above. It first looks when
+ * the transition should have finished, transition_ns after the write: the
+ * OPP table's clock-latency-ns, or an eighth of the SoC's transaction
+ * timeout. While the transition is still busy it looks again after a delay
+ * that starts at APPLE_DVFS_RETRY_NS and doubles up to transition_ns, so a
+ * slow transition costs a few timer runs, not one every few microseconds.
  *
  * A failure stops all further requests, as for a request that is waited for,
  * and the timer reports it.
@@ -597,6 +615,7 @@ static bool apple_soc_cpufreq_lazy_write(struct apple_cpu_priv *priv, u64 reg,
 	priv->write_time = ktime_get();
 	priv->verify_deadline = ktime_add_us(priv->write_time,
 					     apple_soc_cpufreq_timeout(priv->info));
+	priv->retry_ns = APPLE_DVFS_RETRY_NS;
 	return true;
 }
 
@@ -631,9 +650,12 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 
 		if (ktime_after(now, priv->verify_deadline))
 			apple_soc_cpufreq_fail(priv, reg);
-		else if (priv->pending_pstate >= 0)
-			hrtimer_start(timer, ns_to_ktime(APPLE_DVFS_RETRY_NS),
+		else if (priv->pending_pstate >= 0) {
+			hrtimer_start(timer, ns_to_ktime(priv->retry_ns),
 				      HRTIMER_MODE_REL_HARD);
+			priv->retry_ns = min(priv->retry_ns * 2,
+					     priv->transition_ns);
+		}
 		else
 			hrtimer_start(timer, priv->verify_deadline,
 				      HRTIMER_MODE_ABS_HARD);
@@ -675,7 +697,7 @@ static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
 	if (reg & APPLE_DVFS_CMD_BUSY) {
 		/* Retry about when the transition should have finished. */
 		ktime_t now = ktime_get();
-		ktime_t at = ktime_add_ns(priv->write_time, APPLE_DVFS_TRANSITION_NS);
+		ktime_t at = ktime_add_ns(priv->write_time, priv->transition_ns);
 
 		if (ktime_before(at, ktime_add_ns(now, APPLE_DVFS_RETRY_NS)))
 			at = ktime_add_ns(now, APPLE_DVFS_RETRY_NS);
@@ -1537,6 +1559,11 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	}
 
 	policy->cpuinfo.transition_latency = transition_latency;
+	/* Measured OPP latency if there is one, see "Lazy verification". */
+	priv->transition_ns = dev_pm_opp_get_max_transition_latency(cpu_dev) ?:
+		div_u64((u64)apple_soc_cpufreq_timeout(info) * NSEC_PER_USEC,
+			APPLE_DVFS_TRANSITION_DIV);
+	priv->retry_ns = APPLE_DVFS_RETRY_NS;
 	policy->dvfs_possible_from_any_cpu = true;
 	/* Verified transitions are checked lazily on the fast-switch path. */
 	policy->fast_switch_possible = true;
