@@ -541,3 +541,4 @@
 };
 
 #include "t6050-j775d-gpu.dtsi"
+#include "t6050-media.dtsi"

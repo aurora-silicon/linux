@@ -56,3 +56,4 @@
  */
 #include "t6050-k114-k116-usb.dtsi"
 #include "t6050-k114-usb.dtsi"
+#include "t6050-media.dtsi"

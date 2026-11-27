@@ -29,6 +29,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 /*
  * The speakers, through the AOP as on J813: the six SN012776 speaker amps on admac-base-ns

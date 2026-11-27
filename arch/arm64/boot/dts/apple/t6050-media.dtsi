@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6050 media engines: the video decoder (avd0), the first video encoder
+ * (ave0), the first ProRes engine (apr0) and both JPEG engines, with their
+ * DARTs and power states. Every T6050 board's ADT has all of them at the same
+ * addresses, so every board includes this file after t6050-peripherals.dtsi.
+ * The nodes themselves are in t6050-peripherals.dtsi (t6050-ultra.dtsi for
+ * the J775D's decoders); this file only enables them.
+ *
+ * Not enabled here:
+ * - ave1, the second encoder. The encoder runs firmware that iBoot
+ *   preloads; the boot loader hands only the first T6050 encoder's preload
+ *   (ADT ave0) to the DT, and the driver refuses an encoder without its two
+ *   preloaded segments.
+ * - apr1, the M5 Max's second ProRes engine. The driver's T6050 variant
+ *   needs the first engine's named core, wrapper, aux and ctrl windows and
+ *   its SCODEC rows; the second engine sits in the PRORES power state with a
+ *   different window layout, which the driver does not describe.
+ */
+
+#ifndef T6050_J775D
+/* The video decoder. t6050-ultra.dtsi describes both J775D decoders enabled. */
+&pmgr4 {
+	status = "okay";
+};
+
+/* macOS turns FAB1_SOC on once at boot and never gates it. */
+&ps_fab1_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};
+#endif
+
+/*
+ * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its
+ * parent fab7-soc also feeds the display pipeline, so it and fab0-piogw above
+ * it are left to the firmware.
+ */
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab7_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/*
+ * The video encoder (ave0), its DARTs and the VENC0 power states. Like
+ * FAB1_SOC, macOS sets FAB0_SOC active once at boot and never gates it; the
+ * PIO gateway above it is left to the firmware.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave0 {
+	status = "okay";
+};
+
+/*
+ * Both JPEG engines and their shared DART, under FAB0_SOC like the video
+ * encoder.
+ */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
