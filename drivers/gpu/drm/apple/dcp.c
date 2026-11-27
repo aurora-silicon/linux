@@ -11196,15 +11196,21 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 }
 
 /*
- * Internal 26.6 DCP firmware stops cold when firmware-driven deep sleep will
- * cut display power, because there is no cold-restart path for it yet. In a
- * sleep dry run the coprocessor is left running and takes the ordinary suspend
- * path instead.
+ * An internal DCP's firmware stops cold when a firmware-driven deep sleep will
+ * cut display power and nothing restarts it after the wake: the 26.6 image,
+ * and the internal display coprocessor on any image where the SoC's sleep data
+ * says its commit powers it down for good (apple_sleep_display_no_restart(),
+ * the firmware-27 T8122 DCP for one). Left running, the commit takes its power
+ * from under it and the resume talks to firmware that is gone. In a sleep dry
+ * run the coprocessor is left running and takes the ordinary suspend path
+ * instead.
  */
 static bool dcp_sleep_owned(struct apple_dcp *dcp)
 {
-	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
-	       !dcp->external && apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
+	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	       ((dcp->fw_compat == DCP_FIRMWARE_V_26_6 && !dcp->external) ||
+		apple_sleep_display_no_restart(dcp->dev)) &&
+	       apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
 }
 
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev)

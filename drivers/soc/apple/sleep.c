@@ -1736,6 +1736,21 @@ bool apple_sleep_commit_stops_coprocs(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
+/*
+ * Whether this firmware sleep's commit powers @dev, the internal display coprocessor (the first
+ * of apple,display-coprocessors), down with no restart after the wake, as the SoC's sleep data
+ * says (display_no_restart). Its driver then stops it cold itself, before the commit, and leaves
+ * it stopped until a reboot. Any other display coprocessor isn't covered.
+ */
+bool apple_sleep_display_no_restart(struct device *dev)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+
+	return s && dev && s->soc->display_no_restart && s->soc->ndisp &&
+	       s->display[0].np && s->display[0].np == dev->of_node && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_display_no_restart);
+
 /* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
 bool apple_sleep_dry_run(void)
 {
