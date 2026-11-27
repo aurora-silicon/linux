@@ -689,7 +689,11 @@ impl crate::g17::Shared {
                             rescan || scan.polling || firmware.non_compute_runtime_polling(now);
                         if polling {
                             self.queue_poll();
-                        } else if channel::Events::pending(&firmware.init, Role::Primary)?
+                            if firmware.render_control_backpressured() {
+                                self.queue_poll_after(1);
+                            }
+                        }
+                        if channel::Events::pending(&firmware.init, Role::Primary)?
                             || (firmware.secondary.is_some()
                                 && channel::Events::pending(&firmware.init, Role::Secondary)?)
                         {
@@ -831,6 +835,9 @@ impl crate::g17::Shared {
         let polling = firmware.runtime_polling(now);
         if polling {
             self.queue_poll();
+            if firmware.render_control_backpressured() {
+                self.queue_poll_after(1);
+            }
         }
         // A heap with growth to give back is re-evaluated at least once per
         // shrink period, also while the device is otherwise idle.
@@ -859,7 +866,6 @@ impl crate::g17::Shared {
             self.preparations.close();
             self.queue_events();
         } else if !recover
-            && !polling
             && (channel::Events::pending(&firmware.init, Role::Primary)?
                 || (firmware.secondary.is_some()
                     && channel::Events::pending(&firmware.init, Role::Secondary)?))
