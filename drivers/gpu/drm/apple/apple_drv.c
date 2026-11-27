@@ -55,6 +55,7 @@
 #include "apple_resume.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp.h"
+#include "dcp-hdcp-drv.h"
 #include "plane.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
@@ -1036,6 +1037,8 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 					DRM_PLANE_COMMIT_ACTIVE_ONLY);
 	drm_atomic_helper_fake_vblank(state);
 	drm_atomic_helper_commit_hw_done(state);
+	/* Content Protection requests go to the display processors' queues. */
+	dcp_hdcp_commit(state);
 	drm_atomic_helper_wait_for_flip_done(state->dev, state);
 	apple_fail_lost_flips(state);
 	drm_atomic_helper_cleanup_planes(state->dev, state);
@@ -1151,6 +1154,7 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	const struct drm_property_blob *blob = new->hdr_output_metadata;
 	struct drm_crtc_state *crtc_state;
 
+	dcp_hdcp_atomic_check(conn, state);
 	if (blob && (blob->length != sizeof(struct hdr_output_metadata) ||
 		     !dcp_hdr_is_type1(blob->data)))
 		return -EINVAL;
@@ -1355,6 +1359,9 @@ static int apple_connector_create(struct drm_device *drm,
 		goto err_cleanup;
 	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp),
 					 dcp_ext_color_props_supported(dcp));
+	if (ret)
+		goto err_cleanup;
+	ret = dcp_hdcp_attach_connector(connector, &dcp, 1, connector_type);
 	if (ret)
 		goto err_cleanup;
 
@@ -1718,6 +1725,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
 		connector->dcp = NULL;
+
+		/* Content Protection where a pipeline that can drive the port has HDCP. */
+		for (i = 0; i < num_dcp; i++) {
+			if (pipeline ? dcp[i] != pipeline :
+				       !dcp_typec_port_has_candidate(port_idx, dcp[i]))
+				continue;
+			ret = dcp_hdcp_attach_connector(connector, &dcp[i], 1,
+							DRM_MODE_CONNECTOR_DisplayPort);
+			if (ret)
+				return ret;
+		}
 
 		/*
 		 * One encoder per connector, covering its allowed pipelines.

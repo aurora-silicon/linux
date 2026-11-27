@@ -24,6 +24,7 @@
 #include <kunit/visibility.h>
 
 #include "afk.h"
+#include "dcp-hdcp-drv.h"
 #include "afkv2-codec.h"
 #include "afk_reply.h"
 #include "trace.h"
@@ -181,6 +182,9 @@ void afk_quiesce(struct apple_dcp_afkep *afkep)
 		destroy_workqueue(afkep->tx_wq);
 		afkep->tx_wq = NULL;
 	}
+	/* Drain any external TX sender that passed stopping before it was set. */
+	mutex_lock(&afkep->tx_lock);
+	mutex_unlock(&afkep->tx_lock);
 	kvfree(afkep->compact_rx_data);
 	afkep->compact_rx_data = NULL;
 	for (i = 0; i < afkep->num_channels; i++)
@@ -458,7 +462,7 @@ afk_match_service(struct apple_dcp_afkep *ep, const char *name)
 		return ops;
 	}
 
-	return NULL;
+	return dcp_hdcp_match_service(ep, name, false);
 }
 
 static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *ep,
@@ -651,7 +655,10 @@ static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
 	void *message;
 	size_t message_size, advance;
 	u32 rptr, wptr, old_wptr;
+	u64 doorbell;
 	int ret = 0;
+
+	lockdep_assert_held(&ep->tx_lock);
 
 	if (!ep->txbfr.ready || !ep->txbfr.stride)
 		return -EIO;
@@ -734,10 +741,15 @@ static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
 	dma_wmb();
 	WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
 	dma_wmb();
+	doorbell = FIELD_PREP(RBEP_TYPE, RBEP_RECV) |
+		   ((u64)(rptr & 0xffff) << 32) |
+		   ((u64)(wptr & 0xffff) << 16) | (old_wptr & 0xffff);
+	spin_unlock_irqrestore(&ep->lock, flags);
+
 	/* The firmware's own client rings with RECV and both pointers. */
-	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_RECV) |
-		     ((u64)(rptr & 0xffff) << 32) |
-		     ((u64)(wptr & 0xffff) << 16) | (old_wptr & 0xffff));
+	afk_send(ep, doorbell);
+	kfree(message);
+	return 0;
 
 out_unlock:
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -774,7 +786,7 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	if (payload_size)
 		memcpy(sub + 1, payload, payload_size);
 
-	mutex_lock(&ep->compact_tx_lock);
+	mutex_lock(&ep->tx_lock);
 	deadline = jiffies + msecs_to_jiffies(5000);
 	while (offset < total) {
 		chunk = min_t(size_t, total - offset, AFK_COMPACT_FRAGMENT_SIZE);
@@ -802,7 +814,7 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	/* Never start a new header into an unfinished remote assembly. */
 	if (ret && offset)
 		afk_compact_tx_desync(ep, ret);
-	mutex_unlock(&ep->compact_tx_lock);
+	mutex_unlock(&ep->tx_lock);
 	kvfree(body);
 	return ret;
 }
@@ -830,6 +842,7 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	const struct apple_epic_service_ops *ops, *any = NULL;
 	const char *service_name;
 	size_t len;
+	bool cut;
 
 	if (!name[0] || !ep->ops)
 		return NULL;
@@ -856,13 +869,14 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	}
 
 	/* An announcement that filled its field may have lost its end. */
-	if (strlen(name) < AFK_COMPACT_NAME_LEN - 1)
-		return any;
-	for (ops = ep->ops; ops->name[0]; ops++)
-		if (afk_compact_cut_of(ops, service_name))
-			return ops;
+	cut = strlen(name) >= AFK_COMPACT_NAME_LEN - 1;
+	if (cut)
+		for (ops = ep->ops; ops->name[0]; ops++)
+			if (afk_compact_cut_of(ops, service_name))
+				return ops;
 
-	return any;
+	/* The HDCP services, by name, wherever they are announced. */
+	return dcp_hdcp_match_service(ep, service_name, cut) ?: any;
 }
 
 /*
@@ -1645,15 +1659,16 @@ int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
 	ret = afk_v27_sleep_check(ep);
 	if (ret)
 		return ret;
+	mutex_lock(&ep->tx_lock);
 	spin_lock_irqsave(&ep->lock, flags);
 	/* A callback reply may have failed since the inventory check. */
 	if (ep->stopping || ep->sleep_poisoned || ep->sleep_waiting) {
 		ret = -EBUSY;
-		goto out;
+		goto out_tx_unlock;
 	}
 	if (ep->sleep_closed == !open) {
 		ret = -EALREADY;
-		goto out;
+		goto out_tx_unlock;
 	}
 	dma_rmb();
 	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
@@ -1664,7 +1679,7 @@ int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
 	    ep->txbfr.bufsz % ep->txbfr.stride ||
 	    ep->txbfr.bufsz - wptr < sizeof(*hdr)) {
 		ret = -EPROTO;
-		goto out;
+		goto out_tx_unlock;
 	}
 	/* Use the existing dummy-header wrap format and keep one slot empty. */
 	next = ALIGN(wptr + sizeof(*hdr) + sizeof(payload), ep->txbfr.stride);
@@ -1675,7 +1690,7 @@ int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
 	if ((wptr < rptr && next >= rptr) ||
 	    (wptr >= rptr && next <= wptr && next >= rptr)) {
 		ret = -EAGAIN;
-		goto out;
+		goto out_tx_unlock;
 	}
 	hdr = ep->txbfr.buf + wptr;
 	hdr->magic = cpu_to_le32(QE_MAGIC);
@@ -1701,6 +1716,7 @@ int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
 		FIELD_PREP(RBEP_TYPE, RBEP_RECV) | (u64)rptr << 32 |
 		(u64)next << 16 | old, NULL, true);
 	spin_unlock_irqrestore(&ep->lock, flags);
+	mutex_unlock(&ep->tx_lock);
 	if (!ret && !wait_for_completion_timeout(&ep->sleep_done,
 						 msecs_to_jiffies(250)))
 		ret = -ETIMEDOUT;
@@ -1709,8 +1725,12 @@ int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
 		ep->sleep_poisoned = true;
 		ep->sleep_waiting = false;
 	}
- out:
 	spin_unlock_irqrestore(&ep->lock, flags);
+	return ret;
+
+out_tx_unlock:
+	spin_unlock_irqrestore(&ep->lock, flags);
+	mutex_unlock(&ep->tx_lock);
 	return ret;
 }
 
@@ -1901,9 +1921,15 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 	}
 
-	if (ep->match_epic_name)
+	/*
+	 * The HDCP services go by their EPIC name: their provider classes are
+	 * shared with other services (the DP device class also names the AV
+	 * device, the interface class names the port controllers).
+	 */
+	ops = dcp_hdcp_match_service(ep, epic_name, false);
+	if (!ops && ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);
-	else
+	else if (!ops)
 		ops = afk_match_service(ep, service_name);
 	if (dcp_is_ext26(ep->dcp))
 		dev_dbg(ep->dcp->dev,
@@ -3015,7 +3041,12 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (ep->wire_v2) {
 		if (!channel || channel > U16_MAX || tag > U8_MAX || payload_len > SZ_1M)
 			return -EINVAL;
-		if (ecat == EPIC_CAT_REPORT) {
+		if (ecat == EPIC_CAT_REPORT && stype == EPIC_SUBTYPE_STD_SERVICE) {
+			/* A service report with its data (an HDCP session's progress). */
+			if (!payload_len)
+				return -EINVAL;
+			v2_category = AFKV2_REPORT;
+		} else if (ecat == EPIC_CAT_REPORT) {
 			if ((stype != AFKV2_OPEN && stype != AFKV2_CLOSE) || payload_len)
 				return -EOPNOTSUPP;
 			v2_flags = 1;
@@ -3051,6 +3082,7 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		}
 	}
 
+	mutex_lock(&ep->tx_lock);
 	spin_lock_irqsave(&ep->lock, flags);
 	if (READ_ONCE(ep->dcp->sleep_v27_closed) && ecat != EPIC_CAT_REPLY) {
 		ret = -EBUSY;
@@ -3236,12 +3268,17 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	/* Publish the completed entry before allowing the consumer to read it. */
 	dma_wmb();
 	*ep->txbfr.wptr = cpu_to_le32(wptr);
+	spin_unlock_irqrestore(&ep->lock, flags);
+
+	/* Keep tx_lock held across the doorbell so ring writes stay ordered. */
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-			     FIELD_PREP(SEND_WPTR, wptr));
-	ret = 0;
+		     FIELD_PREP(SEND_WPTR, wptr));
+	mutex_unlock(&ep->tx_lock);
+	return 0;
 
 out:
 	spin_unlock_irqrestore(&ep->lock, flags);
+	mutex_unlock(&ep->tx_lock);
 	return ret;
 }
 
@@ -3281,7 +3318,7 @@ static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
 	if (!ep->wire_v2)
 		return ((service->cmd_tag++ & 0xff) << 8) | slot;
 
-	/* Send already nests the endpoint lock below the service lock. */
+	/* Endpoint lock nests below the service lock. */
 	spin_lock_irqsave(&ep->lock, flags);
 	tag = afkv2_command_id(ep->command_tags[service->channel]++, slot);
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -3479,6 +3516,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = &completion;
 	init_completion(&completion);
+	spin_unlock_irqrestore(&service->lock, flags);
 
 	if (ep->inline_v2) {
 		ret = afkv2_encode_inline_command(inline_command,
@@ -3495,7 +3533,6 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	}
 	kfree(inline_command);
 	inline_command = NULL;
-	spin_unlock_irqrestore(&service->lock, flags);
 	if (ret)
 		goto err_free_cmd;
 

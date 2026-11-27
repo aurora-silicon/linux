@@ -22,6 +22,7 @@ on:
       - 'drivers/media/platform/apple/**'
       - 'drivers/mfd/**'
       - 'drivers/nvme/host/**'
+      - 'drivers/nvmem/**'
       - 'drivers/pci/controller/**'
       - 'drivers/power/**'
       - 'drivers/soc/apple/**'
@@ -49,6 +50,7 @@ on:
       - 'drivers/media/platform/apple/**'
       - 'drivers/mfd/**'
       - 'drivers/nvme/host/**'
+      - 'drivers/nvmem/**'
       - 'drivers/pci/controller/**'
       - 'drivers/power/**'
       - 'drivers/soc/apple/**'
@@ -124,6 +126,7 @@ jobs:
             drivers/media/platform/apple/ \
             drivers/mfd/ \
             drivers/nvme/host/ \
+            drivers/nvmem/ \
             drivers/pci/controller/ \
             drivers/power/ \
             drivers/soc/apple/ \
@@ -158,6 +161,7 @@ jobs:
           - { suite: scaler, kunitconfig: drivers/media/platform/apple/scaler/.kunitconfig }
           - { suite: macsmc, kunitconfig: drivers/mfd/macsmc.kunitconfig }
           - { suite: clpc, kunitconfig: drivers/soc/apple/clpc.kunitconfig }
+          - { suite: apple-spmi-nvmem, kunitconfig: drivers/nvmem/apple-spmi-nvmem.kunitconfig }
           - { suite: trusted-keys, kunitconfig: security/keys/trusted-keys/tests/.kunitconfig }
     steps:
       - uses: actions/checkout@v4

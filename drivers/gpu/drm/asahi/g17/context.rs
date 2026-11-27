@@ -14,7 +14,7 @@ use super::{
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 
 /// Both of a context's render channels are bound to other pairs whose publications have not
@@ -214,6 +214,15 @@ pub(crate) struct Context {
     /// A kill of this context was published, through a compute queue or on its render pairs'
     /// behalf. A context is killed at most once.
     kill_published: AtomicBool,
+    /// The host's recovery generation when it first saw the kill of this context done (its
+    /// scheduler page's killed state), `u64::MAX` before ([`Self::restarted_since_kill`]).
+    kill_seen: AtomicU64,
+    /// The host's recovery generation at this context's first close, `u64::MAX` while open
+    /// ([`Self::note_closed`], [`Self::restarted_since_close`]).
+    closed_generation: AtomicU64,
+    /// The kernel closed this context's queue on its client's behalf
+    /// (`Firmware::close_failed_owners`) and the client has not closed it yet.
+    closed_for_open_client: AtomicBool,
     /// Advisory count of bound compute channels: publication still checks the physical binding
     /// under the device mutex. Zero skips an inline attempt known to need admission.
     compute_bindings: AtomicU32,
@@ -304,13 +313,18 @@ impl Context {
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
         // Both firmware and host write work nodes (reused every 63 submissions
-        // and zeroed on pool reuse). Keep the whole work-state object uncached
-        // while retaining its VA and return mark in the pool.
+        // and zeroed on pool reuse). M5 keeps the whole work-state object
+        // uncached. G17P maps the node page firmware-cached: the host rewrites
+        // a node only after `WorkStorage::drained` has read the firmware's
+        // final `completed` count from memory, and zeroes a returned object
+        // only once its pool fence is met, so it never rewrites a node the
+        // firmware is still updating. The counter page, which the host writes
+        // on every kick, stays uncached.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            0,
+            if alloc.uat.is_m5() { 0 } else { UAT_PGSZ },
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
@@ -352,6 +366,9 @@ impl Context {
             scheduler_generation,
             published: AtomicBool::new(false),
             kill_published: AtomicBool::new(false),
+            kill_seen: AtomicU64::new(u64::MAX),
+            closed_generation: AtomicU64::new(u64::MAX),
+            closed_for_open_client: AtomicBool::new(false),
             compute_bindings: AtomicU32::new(0),
             compute_ordinal: AtomicU32::new(0),
             render_seen: AtomicBool::new(false),
@@ -564,6 +581,42 @@ impl Context {
     /// A kill of this context was published.
     pub(crate) fn kill_published(&self) -> bool {
         self.kill_published.load(Ordering::Acquire)
+    }
+
+    /// This context's queue closed at the host's recovery `generation`, under the device mutex:
+    /// by its client (`release_queue`), or on its behalf once a GPU recovery failed its VM as
+    /// guilty (`Firmware::close_failed_owners`). Only the first close counts. A close notes it
+    /// only after its teardown entry is reserved, so a close that failed there can be redone.
+    pub(crate) fn note_closed(&self, generation: u64) {
+        close_once(&self.closed_generation, generation);
+    }
+
+    /// This context's queue closed already ([`Self::note_closed`]). Under the device mutex.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed_generation.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// The kernel closed this context's queue for its still open client (`true`), or the client
+    /// closed it (`false`, `release_queue`). Under the device mutex.
+    pub(crate) fn note_open_client(&self, open: bool) {
+        self.closed_for_open_client.store(open, Ordering::Release);
+    }
+
+    /// See [`Self::note_open_client`]: until the client closes its queue, that queue still holds
+    /// this context, so its scheduler is not released and the context not reclaimed.
+    pub(crate) fn held_by_open_client(&self) -> bool {
+        self.closed_for_open_client.load(Ordering::Acquire)
+    }
+
+    /// The host accepted a GPU restart (`generation`) after this context's first close.
+    pub(crate) fn restarted_since_close(&self, generation: u64) -> bool {
+        restarted_after(self.closed_generation.load(Ordering::Acquire), generation)
+    }
+
+    /// The firmware finished the kill of this context (`killed`, its scheduler page) and the
+    /// host accepted a GPU restart (`generation`) after it first saw that. See [`restarted_since`].
+    pub(crate) fn restarted_since_kill(&self, killed: bool, generation: u64) -> bool {
+        restarted_since(&self.kill_seen, killed, generation)
     }
 
     pub(crate) fn is_published(&self) -> bool {
@@ -865,9 +918,69 @@ fn must_retain(head: Option<[u64; 2]>, head_va: u64, killed: u32) -> bool {
     killed == 0 && head.is_none_or(|head| head != [0, head_va])
 }
 
+/// A restart was accepted (`generation`) after the event recorded at generation `at`
+/// (`u64::MAX`: never happened).
+fn restarted_after(at: u64, generation: u64) -> bool {
+    at != u64::MAX && generation > at
+}
+
+/// Records the recovery `generation` of a context's first close in `at`; true for that close.
+fn close_once(at: &AtomicU64, generation: u64) -> bool {
+    at.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// Records in `seen` the recovery `generation` of the first call that sees a kill done
+/// (`killed`), and reports whether a later generation was accepted since. A restart accepted
+/// after that sighting was raised after the firmware had finished the kill, so it dropped
+/// whatever of the killed context was still running; a restart between the kill's
+/// publication and its completion does not count. A late first sighting only asks for a later
+/// restart.
+fn restarted_since(seen: &AtomicU64, killed: bool, generation: u64) -> bool {
+    if !killed {
+        return false;
+    }
+    let first = match seen.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => generation,
+        Err(first) => first,
+    };
+    restarted_after(first, generation)
+}
+
 #[kunit_tests(asahi_g17_qos_capacity)]
 mod capacity_tests {
     use super::*;
+
+    #[test]
+    fn only_a_restart_after_the_kill_was_seen_done_counts() {
+        let seen = AtomicU64::new(u64::MAX);
+        // No acknowledged kill: never, whatever restarts happened.
+        assert!(!restarted_since(&seen, false, 3));
+        assert!(!restarted_since(&seen, false, 9));
+        // The kill seen done at generation 4 (a restart at 3 came before it): not yet.
+        assert!(!restarted_since(&seen, true, 4));
+        assert!(!restarted_since(&seen, true, 4));
+        // The next accepted restart.
+        assert!(restarted_since(&seen, true, 5));
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn only_the_first_close_counts() {
+        let at = AtomicU64::new(u64::MAX);
+        // Closed on its client's behalf at generation 5, then by the client at 9.
+        assert!(close_once(&at, 5));
+        assert!(!close_once(&at, 9));
+        assert_eq!(at.load(Ordering::Relaxed), 5);
+        // So the restart at 6 still counts for its kill.
+        assert!(restarted_after(at.load(Ordering::Relaxed), 6));
+    }
+
+    #[test]
+    fn only_a_restart_after_the_close_counts() {
+        assert!(!restarted_after(u64::MAX, u64::MAX - 1));
+        assert!(!restarted_after(7, 7));
+        assert!(restarted_after(7, 8));
+    }
 
     #[test]
     fn linked_unkilled_work_is_retained() {
