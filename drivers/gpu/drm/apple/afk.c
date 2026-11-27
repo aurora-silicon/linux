@@ -132,6 +132,11 @@ static int afk_tx_admit_locked(struct apple_dcp_afkep *ep)
 	return ret;
 }
 
+static bool afk_send_may_sleep(struct apple_dcp_afkep *ep)
+{
+	return ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 || dcp_is_ext26(ep->dcp);
+}
+
 static int afk_send_raw_locked(struct apple_dcp_afkep *ep, u64 message)
 {
 	lockdep_assert_held(&ep->dcp->afk_tx_lock);
@@ -148,7 +153,7 @@ static int afk_send_ret(struct apple_dcp_afkep *ep, u64 message)
 	 * which never use the early-RX ring. Serialize all other raw doorbells
 	 * against early-RX overflow and crash latches under afk_tx_lock.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 || dcp_is_ext26(ep->dcp)) {
+	if (afk_send_may_sleep(ep)) {
 		if (READ_ONCE(ep->dcp->afk_rx_failed))
 			return -ENOSPC;
 		return dcp_send_message_ret(ep->dcp, ep->endpoint, message);
@@ -160,7 +165,7 @@ static int afk_send_ret(struct apple_dcp_afkep *ep, u64 message)
 	else if (READ_ONCE(ep->dcp->crashed))
 		ret = -EIO;
 	else
-		ret = dcp_send_message_ret(ep->dcp, ep->endpoint, message);
+		ret = afk_send_raw_locked(ep, message);
 	spin_unlock_irqrestore(&ep->dcp->afk_tx_lock, flags);
 	return ret;
 }
@@ -731,6 +736,7 @@ static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
 	size_t message_size, advance;
 	u32 rptr, wptr, old_wptr;
 	u64 doorbell;
+	bool desynced = false;
 	int ret = 0;
 
 	lockdep_assert_held(&ep->tx_lock);
@@ -825,22 +831,31 @@ static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
 		dma_wmb();
 		WRITE_ONCE(*ep->txbfr.wptr, cpu_to_le32(wptr));
 		dma_wmb();
+		if (!afk_send_may_sleep(ep)) {
+			ret = afk_send_raw_locked(ep, doorbell);
+			if (ret) {
+				ep->compact_tx_desync = true;
+				desynced = true;
+			}
+		}
 	}
 	spin_unlock(&ep->dcp->afk_tx_lock);
-	if (ret)
-		goto out_unlock;
 	spin_unlock_irqrestore(&ep->lock, flags);
 
-	/* The firmware's own client rings with RECV and both pointers. */
-	ret = afk_send_ret(ep, doorbell);
-	if (ret) {
-		spin_lock_irqsave(&ep->lock, flags);
-		ep->compact_tx_desync = true;
-		spin_unlock_irqrestore(&ep->lock, flags);
+	if (!ret && afk_send_may_sleep(ep)) {
+		/* The firmware's own client rings with RECV and both pointers. */
+		ret = afk_send_ret(ep, doorbell);
+		if (ret) {
+			spin_lock_irqsave(&ep->lock, flags);
+			ep->compact_tx_desync = true;
+			spin_unlock_irqrestore(&ep->lock, flags);
+			desynced = true;
+		}
+	}
+	if (desynced)
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: compact TX doorbell failed: %d\n",
 			ep->endpoint, ret);
-	}
 	kfree(message);
 	return ret;
 
@@ -3489,6 +3504,9 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (!ret) {
 		dma_wmb();
 		*ep->txbfr.wptr = cpu_to_le32(wptr);
+		if (!afk_send_may_sleep(ep))
+			afk_send_raw_locked(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+						FIELD_PREP(SEND_WPTR, wptr));
 	}
 	spin_unlock(&ep->dcp->afk_tx_lock);
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -3497,9 +3515,10 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		return ret;
 	}
 
-	/* Keep tx_lock held across the doorbell so ring writes stay ordered. */
-	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-		     FIELD_PREP(SEND_WPTR, wptr));
+	/* Keep tx_lock held across sleeping doorbells so ring writes stay ordered. */
+	if (afk_send_may_sleep(ep))
+		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+			     FIELD_PREP(SEND_WPTR, wptr));
 	mutex_unlock(&ep->tx_lock);
 	return 0;
 

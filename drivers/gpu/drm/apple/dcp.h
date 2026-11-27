@@ -156,7 +156,7 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
-/* Must be called from sleepable context; may sleep on 14.7/ext26 mailboxes. */
+/* May sleep on 14.7/ext26 mailboxes; uses atomic sends on other firmware. */
 int dcp_send_message_ret(struct apple_dcp *dcp, u8 endpoint, u64 message);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 

@@ -2335,9 +2335,11 @@ static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 int dcp_send_message_ret(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	bool native_14_7 = dcp->fw_compat == DCP_FIRMWARE_V_14_7;
+	bool may_sleep = native_14_7 || dcp_is_ext26(dcp);
 	int ret;
 
-	might_sleep();
+	if (may_sleep)
+		might_sleep();
 
 	if (READ_ONCE(dcp->quiescing) ||
 	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
@@ -2347,11 +2349,12 @@ int dcp_send_message_ret(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	 * The adopted T6030 14.7 and native26 (ext26) sessions share this
 	 * mailbox with the panel link. A non-sleeping send fails while that
 	 * FIFO is full, and the DisplayPort handshake then waits for a reply
-	 * that was never sent. All callers are sleepable, so always use
-	 * sleeping sends on 14.7/ext26 and keep atomic sends on other firmware.
+	 * that was never sent. Always use sleeping sends on 14.7/ext26 and
+	 * keep atomic sends on other firmware so callers can serialize under
+	 * spinlocks.
 	 */
 	ret = apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
-				       !(native_14_7 || dcp_is_ext26(dcp)));
+				       !may_sleep);
 	if (ret && dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_err(dcp->dev, "native26 mailbox send failed ep=%#x: %d\n", endpoint, ret);
