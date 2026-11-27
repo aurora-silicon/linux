@@ -3103,13 +3103,13 @@ static void t6030_eng_boot_record(struct apple_sleep *s)
 
 	for (i = 0; i < ARRAY_SIZE(wd); i++)
 		wd[i] = readl(s->wdt + 4 * i);
-	dev_info(s->dev, "boot engine: flag 0x3642d010c %#x, step 0x3642b8040 %#x, seq 0x3642b801c %#x, SPMI queue 0x36471c000 %#x +0x4 %#x +0x8 %#x +0x60 %#x, SMC 0x36c400910 %#x, E_ST %#x P_ST %#x\n",
+	/* Never the queue's +0x8: reading it drains the engine's reply */
+	dev_info(s->dev, "boot engine: flag 0x3642d010c %#x, step 0x3642b8040 %#x, seq 0x3642b801c %#x, SPMI queue 0x36471c000 %#x +0x4 %#x +0x60 %#x, SMC 0x36c400910 %#x, E_ST %#x P_ST %#x\n",
 		 t6030_eng_flag ? readl(t6030_eng_flag + T6030_ENG_FLAG) : ~0U,
 		 t6030_eng_step ? readl(t6030_eng_step + T6030_ENG_STEP) : ~0U,
 		 t6030_eng_step ? readl(t6030_eng_step + T6030_ENG_SEQ) : ~0U,
 		 t6030_eng_spmi ? readl(t6030_eng_spmi) : ~0U,
 		 t6030_eng_spmi ? readl(t6030_eng_spmi + 0x4) : ~0U,
-		 t6030_eng_spmi ? readl(t6030_eng_spmi + 0x8) : ~0U,
 		 t6030_eng_spmi ? readl(t6030_eng_spmi + T6030_ENG_SPMI_ACK) : ~0U,
 		 t6030_eng_smc ? readl(t6030_eng_smc + T6030_ENG_SMC_NOTIFY) : ~0U,
 		 t6030_eng_cst ? readl(t6030_eng_cst + T6030_ENG_E_ST) : ~0U,
