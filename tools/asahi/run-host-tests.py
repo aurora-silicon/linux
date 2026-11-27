@@ -271,10 +271,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
                                    'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
                                    'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
-                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'held-blocks-owner', 'released-owner-retakes', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake', 'spare-detach-reassigns'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'close-twice', 'latch-before-close',
+                                   'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -292,7 +293,8 @@ ASAHI_TESTS = {
                                    'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
-                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+                                   'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
+                                   'open-owed-skipped', 'post-latch-swallowed', 'reserve-fails-pass'), []),
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
