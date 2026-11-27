@@ -4072,6 +4072,10 @@ struct tb_test_cm {
 	struct tb *tb;
 	struct tb_switch *host, *dev;
 	u32 regs[2][20][16];
+	/* The host's display side (tb_test_cm_nhi_ops) */
+	bool awaits, retirable;
+	unsigned int retires, asked;
+	u64 retired;
 };
 
 #define TB_TEST_CM_CAP		0x10
@@ -4228,6 +4232,19 @@ static void tb_test_dp_shared_rate_counted(struct kunit *test)
 }
 
 /*
+ * tb_dp_host_rate_limit() for a pairing pass that is not part of a re-link:
+ * it holds no system sleep admission once it returns.
+ */
+static u32 tb_test_cm_rate_limit(struct kunit *test, struct tb *tb)
+{
+	bool relinking;
+	u32 rate = tb_dp_host_rate_limit(tb, &relinking);
+
+	KUNIT_EXPECT_FALSE(test, relinking);
+	return rate;
+}
+
+/*
  * TB_HOST_DP_SHARED_RATE, through the connection manager: A (host DP IN 5 to
  * device DP OUT 13) is left alone at HBR2 when B (DP IN 6 to DP OUT 14) goes,
  * and C is plugged into DP OUT 14 during the debounce. Pairing drops A's
@@ -4270,7 +4287,7 @@ static void tb_test_dp_shared_rate_arrival(struct kunit *test, bool bw_mode, boo
 
 	/* C comes on DP OUT 14: pairing takes HBR2 for it, A's re-link dropped */
 	list_add_tail(&cm->dev->ports[14].list, resources);
-	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_limit(cm->tb), 5400U);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 5400U);
 	KUNIT_EXPECT_FALSE(test, a->host_relink);
 	KUNIT_EXPECT_EQ(test, a->host_rate_limit, 5400U);
 	KUNIT_EXPECT_EQ(test, a->max_rate, 5400U);
@@ -4314,6 +4331,331 @@ static void tb_test_dp_shared_rate_debounce(struct kunit *test)
 static void tb_test_dp_shared_rate_debounce_deferred(struct kunit *test)
 {
 	tb_test_dp_shared_rate_arrival(test, false, true);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: a re-link that would be made now while the
+ * tunnel's display reads its DPRX through it is held until that is over;
+ * the other decisions stand.
+ */
+static void tb_test_dp_shared_rate_settle(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_NOW, true), TB_DP_RELINK_HOLD);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_NOW, false), TB_DP_RELINK_NOW);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_WAIT, true), TB_DP_RELINK_WAIT);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_NONE, true), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_WAIT, false), TB_DP_RELINK_WAIT);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_settle(TB_DP_RELINK_NONE, false), TB_DP_RELINK_NONE);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE, through the connection manager: A (host DP IN 5 to
+ * device DP OUT 13) came up alone at HBR3 and its display is reading its
+ * DPRX when a second display shows up on DP OUT 14 (a dock that reports
+ * its displays one at a time). Pairing does not re-link A under its
+ * display's Activate: A stays listed at HBR3 with its DPRX read going, no
+ * host DP IN is paired, and the pairing waits for A's activation. Once A's
+ * DPRX read is canceled the hold no longer applies.
+ */
+static void tb_test_dp_shared_rate_dprx_hold(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct list_head *resources = tb_test_cm_dp_resources(cm->tb);
+	struct tb_port *in = &cm->host->ports[5];
+	struct tb_tunnel *a;
+
+	a = tb_test_cm_dp_tunnel(test, cm, in, &cm->dev->ports[13], 8100, 8100);
+	a->host_max_rate = 8100;
+	/* Activated, its DPRX not done: tb_dp_dprx_start() */
+	a->state = TB_TUNNEL_ACTIVATING;
+	a->dprx_started = true;
+	list_add_tail(&cm->host->ports[5].list, resources);
+	list_add_tail(&cm->host->ports[6].list, resources);
+	list_add_tail(&cm->dev->ports[13].list, resources);
+	list_add_tail(&cm->dev->ports[14].list, resources);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_TRUE(test, tb_dp_tunnel_dprx_pending(a));
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	/* Not re-linked: the same tunnel, its rate and DPRX read as they were */
+	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(tb_test_cm_tunnels(cm->tb),
+						   struct tb_tunnel, list), a);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 8100U);
+	KUNIT_EXPECT_EQ(test, a->host_rate_limit, 8100U);
+	KUNIT_EXPECT_TRUE(test, a->dprx_started);
+	KUNIT_EXPECT_FALSE(test, a->dprx_canceled);
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_relink_armed(cm->tb));
+
+	/* Its DPRX read given up (torn down by whoever canceled it): no hold */
+	a->dprx_canceled = true;
+	KUNIT_EXPECT_FALSE(test, tb_dp_tunnel_dprx_pending(a));
+	a->dprx_canceled = false;
+	/* DPRX done: not pending any more either */
+	a->state = TB_TUNNEL_ACTIVE;
+	KUNIT_EXPECT_FALSE(test, tb_dp_tunnel_dprx_pending(a));
+	a->dprx_started = false;
+	mutex_unlock(&cm->tb->lock);
+
+	INIT_LIST_HEAD(resources);
+	tb_test_cm_dp_tunnel_put(a);
+	put_device(&cm->tb->dev);
+}
+
+/* The host's display side, as the Apple glue reports it */
+static bool tb_test_cm_awaits_display(struct tb_nhi *nhi, struct tb_port *in)
+{
+	struct tb_test_cm *cm = container_of(nhi, struct tb_test_cm, nhi);
+
+	return cm->awaits;
+}
+
+static bool tb_test_cm_retirable(struct tb_nhi *nhi, struct tb_port *in, u64 generation)
+{
+	struct tb_test_cm *cm = container_of(nhi, struct tb_test_cm, nhi);
+
+	cm->asked++;
+	return cm->retirable;
+}
+
+static bool tb_test_cm_retire_waiting(struct tb_nhi *nhi, struct tb_port *in, u64 generation)
+{
+	struct tb_test_cm *cm = container_of(nhi, struct tb_test_cm, nhi);
+
+	cm->retires++;
+	if (cm->retirable)
+		cm->retired = generation;
+	return cm->retirable;
+}
+
+static const struct tb_nhi_ops tb_test_cm_nhi_ops = {
+	.dp_tunnel_awaits_display = tb_test_cm_awaits_display,
+	.dp_tunnel_retirable = tb_test_cm_retirable,
+	.dp_tunnel_retire_waiting = tb_test_cm_retire_waiting,
+};
+
+/*
+ * TB_HOST_DP_SHARED_RATE: A (host DP IN 5 to device DP OUT 13) is up alone
+ * at HBR3, announced to the host's display side as handoff 7, its DPRX read
+ * started with the connection manager's callbacks, and a second display
+ * shows up on DP OUT 14. The DPRX work is the real one, on the domain queue,
+ * holding the references tb_dp_dprx_start() takes.
+ */
+static struct tb_tunnel *tb_test_cm_held_pair(struct kunit *test, struct tb_test_cm *cm)
+{
+	struct list_head *resources = tb_test_cm_dp_resources(cm->tb);
+	struct tb_tunnel *a;
+
+	cm->nhi.ops = &tb_test_cm_nhi_ops;
+	cm->tb->wq = alloc_ordered_workqueue("tb-cm-test", 0);
+	KUNIT_ASSERT_NOT_NULL(test, cm->tb->wq);
+	a = tb_test_cm_dp_tunnel(test, cm, &cm->host->ports[5], &cm->dev->ports[13],
+				 8100, 8100);
+	a->host_max_rate = 8100;
+	a->state = TB_TUNNEL_ACTIVATING;
+	a->host_dp_notified = true;
+	a->host_dp_generation = 7;
+	tb_test_cm_dp_callbacks(a);
+	list_add_tail(&cm->host->ports[5].list, resources);
+	list_add_tail(&cm->host->ports[6].list, resources);
+	list_add_tail(&cm->dev->ports[13].list, resources);
+	list_add_tail(&cm->dev->ports[14].list, resources);
+	kref_get(&a->kref);
+	tb_domain_get(cm->tb);
+	a->dprx_started = true;
+	a->dprx_timeout = ktime_sub_ms(ktime_get(), 1000);
+	/* Not before the test runs it (mod_delayed_work()) */
+	queue_delayed_work(cm->tb->wq, &a->dprx_work, 60 * HZ);
+	return a;
+}
+
+/* Stop A's DPRX work, drain the queue, and take A down as the test made it. */
+static void tb_test_cm_held_pair_put(struct kunit *test, struct tb_test_cm *cm,
+				     struct tb_tunnel *a)
+{
+	mutex_lock(&cm->tb->lock);
+	tb_dp_tunnel_cancel_dprx(a);
+	tb_test_cm_set_state(cm->tb, false, true);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+	tb_test_cm_stop(cm->tb);
+	destroy_workqueue(cm->tb->wq);
+	KUNIT_EXPECT_EQ(test, kref_read(&a->kref), 1U);
+	KUNIT_EXPECT_EQ(test, kref_read(&cm->tb->dev.kobj.kref), 1U);
+	INIT_LIST_HEAD(tb_test_cm_dp_resources(cm->tb));
+	tb_test_cm_dp_tunnel_put(a);
+	put_device(&cm->tb->dev);
+}
+
+/*
+ * The display side has A's DP IN and reads its DPRX: the host does not let
+ * it go, and pairing holds A's re-link. Then the display side refuses A a
+ * pipeline after all: A waits for one, with no display reading its DPRX.
+ * The real DPRX work, finding that, keeps waiting (its deadline renewed, no
+ * callback) and has pairing decide again, which lets A go now. Hotplug runs.
+ */
+static void tb_test_dp_shared_rate_hold_pipeline_wait(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_tunnel *a = tb_test_cm_held_pair(test, cm);
+
+	mutex_lock(&cm->tb->lock);
+	tb_test_cm_set_state(cm->tb, true, false);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_EQ(test, cm->retires, 1U);
+	KUNIT_EXPECT_EQ(test, cm->retired, 0ULL);
+	KUNIT_EXPECT_TRUE(test, a->host_dp_notified);
+
+	cm->awaits = true;
+	cm->retirable = true;
+	mod_delayed_work(cm->tb->wq, &a->dprx_work, 0);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_EQ(test, a->state, TB_TUNNEL_ACTIVATING);
+	KUNIT_EXPECT_TRUE(test, a->dprx_started);
+	KUNIT_EXPECT_TRUE(test, ktime_after(a->dprx_timeout, ktime_get()));
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_dp_pending(cm->tb));
+	/* What pairing finds now: A may go, its handoff retired */
+	KUNIT_EXPECT_TRUE(test, tb_dp_tunnel_release_display(a));
+	KUNIT_EXPECT_EQ(test, cm->retired, 7ULL);
+	KUNIT_EXPECT_FALSE(test, a->host_dp_notified);
+	mutex_unlock(&cm->tb->lock);
+
+	tb_test_cm_held_pair_put(test, cm, a);
+}
+
+/*
+ * A was refused a pipeline before and its retry is admitted when the second
+ * display shows up: pairing holds A's re-link. The real DPRX work finds the
+ * host waiting for a pipeline (the attempt is under way): it renews the
+ * DPRX deadline, so the retry keeps the tunnel however long it takes to
+ * reach the display, and does not have pairing ask again while the attempt
+ * runs. Once the attempt is refused, it does.
+ */
+static void tb_test_dp_shared_rate_hold_retry_admitted(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_tunnel *a = tb_test_cm_held_pair(test, cm);
+
+	mutex_lock(&cm->tb->lock);
+	tb_test_cm_set_state(cm->tb, true, false);
+	cm->awaits = true;
+	cm->retirable = false;
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_dp_pending(cm->tb));
+	mod_delayed_work(cm->tb->wq, &a->dprx_work, 0);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_EQ(test, a->state, TB_TUNNEL_ACTIVATING);
+	KUNIT_EXPECT_TRUE(test, ktime_after(a->dprx_timeout, ktime_get()));
+	KUNIT_EXPECT_EQ(test, cm->asked, 1U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_dp_pending(cm->tb));
+
+	/* The attempt is refused: no display reads A's DPRX */
+	cm->retirable = true;
+	mod_delayed_work(cm->tb->wq, &a->dprx_work, 0);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_EQ(test, cm->asked, 2U);
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_dp_pending(cm->tb));
+	KUNIT_EXPECT_EQ(test, cm->retired, 0ULL);
+	mutex_unlock(&cm->tb->lock);
+
+	tb_test_cm_held_pair_put(test, cm, a);
+}
+
+/*
+ * A waits for a display pipeline, but an attempt to hand it to a display is
+ * under way when the second display shows up: the host does not let A go
+ * (a display may be woken from that attempt), and pairing holds A's re-link
+ * instead of taking it. A host without the hook never lets a tunnel go
+ * while its DPRX read runs; one whose DPRX read is done always does.
+ */
+static void tb_test_dp_shared_rate_hold_handoff(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_tunnel *a = tb_test_cm_held_pair(test, cm);
+
+	mutex_lock(&cm->tb->lock);
+	cm->awaits = true;
+	cm->retirable = false;
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_EQ(test, cm->retires, 1U);
+	KUNIT_EXPECT_TRUE(test, a->host_dp_notified);
+	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(tb_test_cm_tunnels(cm->tb),
+						   struct tb_tunnel, list), a);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 8100U);
+
+	cm->nhi.ops = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_dp_tunnel_release_display(a));
+	a->state = TB_TUNNEL_ACTIVE;
+	KUNIT_EXPECT_TRUE(test, tb_dp_tunnel_release_display(a));
+	a->state = TB_TUNNEL_ACTIVATING;
+	cm->nhi.ops = &tb_test_cm_nhi_ops;
+	KUNIT_EXPECT_EQ(test, cm->retires, 1U);
+	mutex_unlock(&cm->tb->lock);
+
+	tb_test_cm_held_pair_put(test, cm, a);
+}
+
+/*
+ * A's re-link is held and its DPRX read ends (given up here) through the
+ * real DPRX work and callback while hotplug is stopped for system sleep:
+ * the pairing request is recorded for thaw, resume or complete to replay.
+ * Once the domain is stopping, nothing is recorded.
+ */
+static void tb_test_dp_shared_rate_hold_frozen(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_tunnel *a = tb_test_cm_held_pair(test, cm);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	/* tb_freeze_noirq() */
+	tb_test_cm_set_state(cm->tb, false, false);
+	a->dprx_canceled = true;
+	mod_delayed_work(cm->tb->wq, &a->dprx_work, 0);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_dp_pending(cm->tb));
+	/* The work's references are gone with its callback */
+	KUNIT_EXPECT_EQ(test, kref_read(&a->kref), 1U);
+
+	/* Held again, and the domain is stopping when it ends */
+	a->dprx_canceled = false;
+	tb_test_cm_set_state(cm->tb, true, false);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_rate_limit(test, cm->tb), 0U);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_held(cm->tb));
+	tb_test_cm_set_state(cm->tb, false, true);
+	kref_get(&a->kref);
+	tb_domain_get(cm->tb);
+	a->dprx_canceled = true;
+	queue_delayed_work(cm->tb->wq, &a->dprx_work, 0);
+	mutex_unlock(&cm->tb->lock);
+	flush_workqueue(cm->tb->wq);
+
+	mutex_lock(&cm->tb->lock);
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_relink_held(cm->tb));
+	KUNIT_EXPECT_FALSE(test, tb_test_cm_dp_pending(cm->tb));
+	mutex_unlock(&cm->tb->lock);
+
+	tb_test_cm_held_pair_put(test, cm, a);
 }
 
 /*
@@ -4659,6 +5001,12 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_dp_shared_rate_leave),
 	KUNIT_CASE(tb_test_dp_shared_rate_debounce),
 	KUNIT_CASE(tb_test_dp_shared_rate_debounce_deferred),
+	KUNIT_CASE(tb_test_dp_shared_rate_settle),
+	KUNIT_CASE(tb_test_dp_shared_rate_dprx_hold),
+	KUNIT_CASE(tb_test_dp_shared_rate_hold_pipeline_wait),
+	KUNIT_CASE(tb_test_dp_shared_rate_hold_retry_admitted),
+	KUNIT_CASE(tb_test_dp_shared_rate_hold_handoff),
+	KUNIT_CASE(tb_test_dp_shared_rate_hold_frozen),
 	KUNIT_CASE(tb_test_dp_shared_rate_flap),
 	KUNIT_CASE(tb_test_dp_shared_rate_sleep),
 	KUNIT_CASE(tb_test_dp_shared_rate_retry),

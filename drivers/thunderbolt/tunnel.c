@@ -1474,9 +1474,13 @@ static void tb_dp_dprx_work(struct work_struct *work)
 		/*
 		 * Nothing drives the tunnel yet, so DPRX cannot be done: leave
 		 * the adapter alone and let the timeout run from when the host
-		 * takes it.
+		 * takes it, also while an attempt to hand it to a display
+		 * runs. The await callback is told; whether a display may be
+		 * reading the DPRX it asks tb_dp_tunnel_retirable().
 		 */
 		tunnel->dprx_timeout = dprx_timeout_to_ktime(dprx_timeout);
+		if (tunnel->await_callback)
+			tunnel->await_callback(tunnel, tunnel->callback_data);
 		queue_delayed_work(tb->wq, &tunnel->dprx_work,
 				   msecs_to_jiffies(TB_DPRX_AWAIT_POLL_DELAY));
 		mutex_unlock(&tb->lock);
@@ -1506,6 +1510,77 @@ static void tb_dp_dprx_work(struct work_struct *work)
 	tunnel->callback(tunnel, tunnel->callback_data);
 	tb_tunnel_put(tunnel);
 	tb_domain_put(tb);
+}
+
+/**
+ * tb_dp_tunnel_dprx_pending() - Is a DP tunnel's DPRX read under way?
+ * @tunnel: DP tunnel
+ *
+ * The tunnel is activated and its DPRX capability read is running, not
+ * given up. Domain lock held.
+ *
+ * Return: %true if so.
+ */
+bool tb_dp_tunnel_dprx_pending(struct tb_tunnel *tunnel)
+{
+	lockdep_assert_held(&tunnel->tb->lock);
+	return tb_tunnel_is_dp(tunnel) && tunnel->state == TB_TUNNEL_ACTIVATING &&
+	       tunnel->dprx_started && !tunnel->dprx_canceled;
+}
+
+/**
+ * tb_dp_tunnel_release_display() - May a re-link take a DP tunnel's DP IN?
+ * @tunnel: DP tunnel
+ *
+ * While the tunnel's DPRX read is under way, a display it was handed to
+ * wakes and trains the DP IN adapter from its firmware's calls; torn down
+ * then, the display loses the adapter under those calls. Only a host that
+ * still waits for a display pipeline for the tunnel, with no attempt to hand
+ * it to one under way, lets it go: it retires the tunnel's display handoff
+ * now (&tb_nhi_ops.dp_tunnel_retire_waiting), atomically against such an
+ * attempt, and the tunnel is torn down without telling it again. Domain lock
+ * held.
+ *
+ * Return: %true if the tunnel may be torn down now, %false if a display may
+ * be reading its DPRX.
+ */
+bool tb_dp_tunnel_release_display(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	if (!tb_dp_tunnel_dprx_pending(tunnel))
+		return true;
+	if (!ops || !ops->dp_tunnel_retire_waiting)
+		return false;
+	if (tunnel->host_dp_notified &&
+	    !ops->dp_tunnel_retire_waiting(tunnel->tb->nhi, tunnel->src_port,
+					   tunnel->host_dp_generation))
+		return false;
+	tunnel->host_dp_notified = false;
+	return true;
+}
+
+/**
+ * tb_dp_tunnel_retirable() - May a re-link held for a DP tunnel go ahead?
+ * @tunnel: DP tunnel whose DPRX read is under way
+ *
+ * The host waits for a display pipeline for the tunnel, with no attempt to
+ * hand it to a display under way (&tb_nhi_ops.dp_tunnel_retirable): no
+ * display reads its DPRX, and a re-link held for one may be decided again,
+ * which tb_dp_tunnel_release_display() then settles. Domain lock held.
+ *
+ * Return: %true if so.
+ */
+bool tb_dp_tunnel_retirable(struct tb_tunnel *tunnel)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (!ops || !ops->dp_tunnel_retirable)
+		return false;
+	return !tunnel->host_dp_notified ||
+	       ops->dp_tunnel_retirable(tunnel->tb->nhi, tunnel->src_port,
+					tunnel->host_dp_generation);
 }
 
 static int tb_dp_dprx_start(struct tb_tunnel *tunnel)

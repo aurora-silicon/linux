@@ -406,6 +406,78 @@ static void apple_dpin_m4_policy(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_dpin_m1.host_policy & TB_HOST_DP_SHARED_RATE);
 }
 
+/*
+ * M4: the connection manager may retire a request for a re-link only while
+ * it waits for a display pipeline with no attempt to hand it to a display
+ * admitted (apple_dpin_retirable()). A pipeline retry admitted for it keeps
+ * it, and DCP's Activate meets its binding; retired between two attempts,
+ * the next retry admits none. A replaced request has nothing left, a handed
+ * one is never retirable, and a refused call says which case it met.
+ */
+static void apple_dpin_m4_retire_waiting(struct kunit *test)
+{
+	const struct apple_dpin_policy *p = &apple_dpin_m4;
+	struct apple_dpin_tokens t = {};
+	struct apple_dpin_state s = {};
+
+	/* Tunnel 1: the first attempt is admitted, then refused a pipeline */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 1, true));
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 1));
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_retirable(&s, &t, p, 1));
+	apple_dpin_token_revoke(&t, 1);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY),
+			APPLE_DPIN_FIRST_WAIT | APPLE_DPIN_ARM_RETRY);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, p));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+
+	/* The retry: retirable until admitted, not while its attempt runs */
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0),
+			APPLE_DPIN_QUEUE);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0),
+			APPLE_DPIN_ATTACH);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 1));
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_awaits_display(&s, p));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_token_access(&t, 1));
+
+	/* Refused again: nothing in flight */
+	apple_dpin_token_revoke(&t, 1);
+	apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "not admitted");
+
+	/* Retired for the re-link: the next retry admits no attempt */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 1, false));
+	apple_dpin_step(&s, p, APPLE_DPIN_DOWN, true, 0);
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_RETRY, true, 0), 0U);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_admit(&t, 1));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 1));
+	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "retired");
+	apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0);
+	apple_dpin_step(&s, p, APPLE_DPIN_DROPPED, false, 0);
+
+	/* Tunnel 2, the re-link: tunnel 1 has nothing left, 2 is handed */
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 2, true));
+	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
+	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "replaced");
+	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
+			APPLE_DPIN_ATTACH);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 2));
+	apple_dpin_step(&s, p, APPLE_DPIN_ADMITTED, true, 0);
+	KUNIT_ASSERT_TRUE(test, apple_dpin_token_complete(&t, 2));
+	apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, 0);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_awaits_display(&s, p));
+	KUNIT_EXPECT_FALSE(test, apple_dpin_retirable(&s, &t, p, 2));
+}
+
 static void apple_dpin_all_policy_fields(struct kunit *test)
 {
 	const struct apple_dpin_policy * const actual[] = {
@@ -1221,6 +1293,7 @@ static struct kunit_case apple_dpin_cases[] = {
 	KUNIT_CASE(apple_dpin_qualification_profiles),
 	KUNIT_CASE(apple_dpin_all_policy_fields),
 	KUNIT_CASE(apple_dpin_m4_policy),
+	KUNIT_CASE(apple_dpin_m4_retire_waiting),
 	KUNIT_CASE(apple_dpin_policy_independent_of_hooks),
 	{},
 };
