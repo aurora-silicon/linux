@@ -682,7 +682,7 @@ static int h16_fail(struct ane_h16_session *s, int error)
 	if (!s->error)
 		s->error = error;
 	if (!s->quarantined) {
-		s->quarantined = true;
+		WRITE_ONCE(s->quarantined, true);
 		ane_h16_pending_fail_all(&s->pending, s->error);
 		wake_up_all(&s->wake);
 		s->ops->log(s->ctx, "program quarantine", (u64)-s->error, 0);
@@ -1639,6 +1639,19 @@ static int h16_execute_room(struct ane_h16_session *s, struct ane_h16_program *p
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
+/*
+ * A request counts in ane_stats from its first firmware traffic (the opening
+ * gate, or the EXECUTE itself when the gate is already open) until it ends
+ * either way. A refusal or local failure before that point reached nothing.
+ */
+static void h16_count_begin(struct ane_h16_session *s, bool *counted, u64 *ticket)
+{
+	if (*counted)
+		return;
+	*ticket = ane_stats_begin(&s->sysfs_ctrs, &s->sysfs_ring, ktime_get_ns(), 1);
+	*counted = true;
+}
+
 static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
@@ -1653,7 +1666,8 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	unsigned int i;
 	u64 deadline, polls, t0, gate_open, t1 = 0, t2 = 0, t3, end;
 	u64 entry = h16_now(s);
-	u64 ticket;
+	bool counted = false;
+	u64 ticket = 0;
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -1697,14 +1711,10 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
 	polls = s->transport->polls;
-	/*
-	 * A request counts in ane_stats from its first firmware traffic until
-	 * it ends either way; a refusal before this point reached nothing.
-	 */
-	ticket = ane_stats_begin(&s->sysfs_ctrs, &s->sysfs_ring, ktime_get_ns(), 1);
 	trace->step = H16_STEP_GATE_OPEN;
 	t0 = h16_now(s);
 	if (!s->gate_held) {
+		h16_count_begin(s, &counted, &ticket);
 		ret = h16_gate(s, 0);
 		if (ret)
 			goto fail;
@@ -1739,6 +1749,8 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 					      ANE_FW_DATA_CHAIN);
 	if (!ret) {
 		trace->step = H16_STEP_SEND;
+		/* With the gate already open, the request itself is the first traffic. */
+		h16_count_begin(s, &counted, &ticket);
 		t1 = h16_now(s);
 		ret = h16_send(s, ANE_FW_DATA_CHAIN, command, length, &reply);
 	}
@@ -1783,7 +1795,8 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), 0, 0);
 	return 0;
 fail:
-	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), ret, 0);
+	if (counted)
+		ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), ret, 0);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request->key.uuid);
 	/*
 	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
@@ -2213,7 +2226,7 @@ void ane_h16_session_recovered(struct ane_h16_session *s)
 {
 	struct ane_h16_program *p, *n;
 
-	s->quarantined = false;
+	WRITE_ONCE(s->quarantined, false);
 	s->pending.quarantined = false;
 	s->pending.error = 0;
 	s->error = 0;
