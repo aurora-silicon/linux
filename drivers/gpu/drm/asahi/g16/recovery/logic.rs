@@ -162,7 +162,7 @@ pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
 pub(crate) const RETIRED_COMPUTE_PIPES: usize = 8;
 /// Number of TA/FS render queue pairs tracked by [`RetiredStamps`] (matches
 /// `hw::sizes::RENDER_PAIRS`).
-pub(crate) const RETIRED_RENDER_PAIRS: usize = 1;
+pub(crate) const RETIRED_RENDER_PAIRS: usize = 8;
 /// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, then TA and FS of each
 /// render pair ([`retired_render_stage`]).
 pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2 * RETIRED_RENDER_PAIRS;
@@ -347,6 +347,15 @@ mod tests {
             assert!(!retired.contains(event, target.wrapping_add(0x100)));
         }
         assert!(!retired.contains(0x72, 0));
+        // Render pair 1 (0x72/0x73) keeps its own history; dense per-pair stamps collide
+        // across pairs, so a pair-1 stamp never names a pair-0 owner.
+        retired.push(retired_render_stage(1, 1), 0x400);
+        assert!(retired.contains(0x73, 0x400));
+        assert!(!retired.contains(0x71, 0x400));
+        assert!(!retired.contains(0x72, 0x400));
+        retired.push(retired_render_stage(7, 0), 0x500);
+        assert!(retired.contains(0x7e, 0x500));
+        assert!(!retired.contains(0x80, 0x500));
         // Pipelined bursts retain all recent stamps up to RETIRED_STAMPS_CAP and evict oldest.
         let mut ring = RetiredStamps::new();
         for i in 0..(RETIRED_STAMPS_CAP as u32 + 4) {
