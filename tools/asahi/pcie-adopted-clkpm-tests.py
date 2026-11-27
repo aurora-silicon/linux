@@ -29,7 +29,7 @@ struct pci_dev { struct pci_bus *bus; bool pcie; };
 struct platform_device { int unused; };
 struct hw_info { bool adopt_link; };
 struct apple_pcie { struct hw_info *hw; };
-struct pci_host_bridge { struct pci_bus *bus; struct apple_pcie *priv; };
+struct pci_host_bridge { struct pci_bus *bus; struct apple_pcie *priv; bool no_reassign_bus; };
 static int reads, disables, locks, warnings, infos, walks, common_ret, disable_ret, read_ret;
 static u32 cap;
 static int apple_pcie_cfg_ecam_ops;
@@ -63,7 +63,7 @@ int main(void)
   reset();disable_ret=-EINVAL;apple_pcie_adopted_no_clkpm(&dev,locked);assert(disables==1&&locks==locked&&!infos&&!warnings);
   reset();disable_ret=-EIO;apple_pcie_adopted_no_clkpm(&dev,locked);assert(disables==1&&locks==locked&&!infos&&warnings==1);
  }
- struct hw_info hw={false};struct apple_pcie pcie={&hw};struct pci_host_bridge bridge={&bus,&pcie};struct platform_device platform={0};
+ struct hw_info hw={false};struct apple_pcie pcie={&hw};struct pci_host_bridge bridge={&bus,&pcie,false};struct platform_device platform={0};
  reset();assert(apple_pcie_host_init(&platform,&bridge)==0);assert(!walks&&!disables);
  reset();hw.adopt_link=true;assert(apple_pcie_host_init(&platform,&bridge)==0);assert(walks==1&&disables==1&&locks==1);
  reset();common_ret=-EIO;assert(apple_pcie_host_init(&platform,&bridge)==-EIO);assert(!walks&&!disables);
