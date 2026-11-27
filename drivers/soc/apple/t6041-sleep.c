@@ -89,6 +89,8 @@
 
 #define AOP_PS_WORDS		44
 
+#define T6041_GP_PORTS		4
+
 #define WAKE_WORDS		9
 #define WAKE_LAST_MASK		0x00003fffU
 #define WAKE_MAX_ID		(32 * (WAKE_WORDS - 1) + 14)
@@ -203,16 +205,21 @@ struct t6041_sleep {
 	u32 pre_mask[2];
 	u32 pre_wake[WAKE_WORDS];
 	u32 pre_votes[5];
+	u32 pre_disp_cluster[2];
 	/* Each AMCC plane's cache ways (+0x2800) and status (+0x2804). */
 	u32 pre_ways[4 * AMCC_MAX_GROUPS];
 	u32 pre_cache[4 * AMCC_MAX_GROUPS];
 	bool pre_a0;
-	/* GP PCIe ports 0/1: port block, PHY word, and saved state. */
-	void __iomem *gp_port[2];
-	void __iomem *gp_phy[2];
-	u32 gp_phy_pre[2];
-	u32 gp_app_pre[2];
-	u32 gp_perst_pre[2];
+	/*
+	 * GP PCIe ports: port block, PHY word, and saved state. Ports 0/1 are
+	 * required; 2/3 are restored when described and set up.
+	 */
+	void __iomem *gp_port[T6041_GP_PORTS];
+	void __iomem *gp_phy[T6041_GP_PORTS];
+	u32 gp_phy_pre[T6041_GP_PORTS];
+	u32 gp_app_pre[T6041_GP_PORTS];
+	u32 gp_perst_pre[T6041_GP_PORTS];
+	unsigned int gp_up;
 	bool gp_saved;
 	/* ANS's storage PCIe block and bootloader-supplied tunables (apple,apcie). */
 	void __iomem *ap_rc;
@@ -895,6 +902,8 @@ static void t6041_save(struct t6041_sleep *s)
 	}
 	for (i = 0; i < ARRAY_SIZE(t6041_pmc_vote_off); i++)
 		s->pre_votes[i] = readl(s->pmc + t6041_pmc_vote_off[i]);
+	s->pre_disp_cluster[0] = readl(s->cluster + 0x0c);
+	s->pre_disp_cluster[1] = readl(s->cluster + 0x10);
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	for (i = 0; i < s->n_restore; i++)
@@ -923,10 +932,16 @@ static void t6041_save(struct t6041_sleep *s)
 	s->gp_saved = s->gp_port[0] && s->gp_port[1] && s->gp_phy[0] && s->gp_phy[1] &&
 		      FIELD_GET(PS_ACTUAL, readl(s->ps_apcie[T6041_APCIE_GP])) == 0xf &&
 		      FIELD_GET(PS_ACTUAL, readl(s->ps_apcie[T6041_APCIE_SYS_GP])) == 0xf;
-	for (i = 0; i < 2 && s->gp_saved; i++) {
+	s->gp_up = 0;
+	for (i = 0; i < T6041_GP_PORTS && s->gp_saved; i++) {
+		if (!s->gp_port[i] || !s->gp_phy[i])
+			continue;
 		s->gp_phy_pre[i] = readl(s->gp_phy[i]);
 		s->gp_app_pre[i] = readl(s->gp_port[i] + 0x800);
 		s->gp_perst_pre[i] = readl(s->gp_port[i] + 0x82c);
+		/* The PCIe driver requests a port's refclk when it sets the port up. */
+		if (s->gp_phy_pre[i] & BIT(0))
+			s->gp_up |= BIT(i);
 	}
 }
 
@@ -1056,21 +1071,22 @@ static int t6041_apcie_raise(struct t6041_sleep *s)
 }
 
 /*
- * Restore GP PCIe port 0/1 reference and app clocks after deep sleep so their
- * DART blocks do not raise SErrors on resume. Returns a mask of late ports.
+ * Restore the reference and app clocks of the GP PCIe ports that were set up
+ * before the sleep, so their DART blocks do not raise SErrors on resume.
+ * Returns a mask of late ports.
  */
 static unsigned int t6041_gp_pcie_clk(struct t6041_sleep *s)
 {
 	unsigned int i, late = 0;
 	u32 v;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < T6041_GP_PORTS; i++) {
 		void __iomem *phy = s->gp_phy[i];
 		void __iomem *port = s->gp_port[i];
 		u32 cfg = s->gp_phy_pre[i];
 		u32 app = s->gp_app_pre[i];
 
-		if (!s->gp_saved ||
+		if (!s->gp_saved || !(s->gp_up & BIT(i)) ||
 		    FIELD_GET(PS_ACTUAL, readl(s->ps_apcie[T6041_APCIE_GP])) != 0xf ||
 		    FIELD_GET(PS_ACTUAL, readl(s->ps_apcie[T6041_APCIE_SYS_GP])) != 0xf)
 			continue;
@@ -1175,6 +1191,15 @@ static void t6041_sleep_return(struct t6041_sleep *s)
 	writel(0xf, s->cluster + 0x0);
 	writel(0xf, s->cluster + 0x4);
 	writel(0xf, s->cluster + 0x8);
+	/* Restore DISP_INT (+0x0c) and DISP_EXT (+0x10, DISPEXT_RAIL_V) complexes. */
+	for (i = 0; i < ARRAY_SIZE(s->pre_disp_cluster); i++) {
+		u32 on = s->pre_disp_cluster[i] & 0xf;
+
+		if (!on)
+			continue;
+		v = readl(s->cluster + 0x0c + 4 * i);
+		writel((v & ~0xfU) | on, s->cluster + 0x0c + 4 * i);
+	}
 	/* The two wake gates, then the CPM voters. */
 	writel(readl(s->pwrgate + 0x000) | BIT(31), s->pwrgate + 0x000);
 	writel(readl(s->pwrgate + 0x040) | BIT(31), s->pwrgate + 0x040);
@@ -1986,6 +2011,7 @@ static void t6041_map_apcie(struct t6041_sleep *s)
 {
 	struct device *dev = s->dev;
 	struct device_node *np;
+	unsigned int i;
 
 	np = of_parse_phandle(dev->of_node, "apple,apcie", 0);
 	if (!np)
@@ -2004,10 +2030,14 @@ static void t6041_map_apcie(struct t6041_sleep *s)
 					 "apple,tunable-phy-ip-pll", &s->tun_phy_ip_pll);
 	s->tun_phy_ip_lanes = t6041_apcie_tunable(dev, np, "phy-ip",
 						  "apple,tunable-phy-ip-auspma");
-	s->gp_port[0] = t6041_apcie_block(dev, np, "port0", 0x830, NULL, NULL);
-	s->gp_port[1] = t6041_apcie_block(dev, np, "port1", 0x830, NULL, NULL);
-	s->gp_phy[0] = t6041_apcie_block(dev, np, "phy0", 0x4, NULL, NULL);
-	s->gp_phy[1] = t6041_apcie_block(dev, np, "phy1", 0x4, NULL, NULL);
+	for (i = 0; i < T6041_GP_PORTS; i++) {
+		char name[8];
+
+		snprintf(name, sizeof(name), "port%u", i);
+		s->gp_port[i] = t6041_apcie_block(dev, np, name, 0x830, NULL, NULL);
+		snprintf(name, sizeof(name), "phy%u", i);
+		s->gp_phy[i] = t6041_apcie_block(dev, np, name, 0x4, NULL, NULL);
+	}
 	of_node_put(np);
 
 	if (s->ap_axi)
