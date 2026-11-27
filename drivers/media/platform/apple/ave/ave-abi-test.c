@@ -1680,11 +1680,13 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	 * The M5 Pro/Max 26A428 build: the same word, which differs per boot on
 	 * the J775D. The 26C5035 build has none set: its CRC matches as it is.
 	 */
-	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 2U);
+	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 3U);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_boot_word, off);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_crc, AVE_FW_TEXT_CRC_T6050_26A428);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_boot_word, 0U);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_crc, AVE_FW_TEXT_CRC_T6050_26C5035);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].text_boot_word, 0U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].text_crc, AVE_FW_TEXT_CRC_T6050_26B8125);
 	KUNIT_EXPECT_EQ(test, ave_t6050.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
