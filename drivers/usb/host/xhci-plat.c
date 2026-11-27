@@ -365,6 +365,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 		}
 
 		xhci->shared_hcd->tpl_support = hcd->tpl_support;
+		if (priv && priv->skip_usb3_phy_init)
+			xhci->shared_hcd->skip_phy_initialization = 1;
 	}
 
 	usb3_hcd = xhci_get_usb3_hcd(xhci);

@@ -58,6 +58,8 @@ pub(crate) struct KernelObject {
     obj: gem::ObjectRef,
     ptr: NonNull<u8>,
     size: usize,
+    /// The client charge of backing from [`Self::client_backing`], released with the object.
+    charge: Option<crate::memacct::Charge>,
 }
 
 // SAFETY: The object only refers to kernel memory; concurrent access goes through `&self`
@@ -108,6 +110,29 @@ impl KernelObject {
         }, size)
     }
 
+    /// Write-combined [`Self::backing`] that a client's commands size, charged to that client
+    /// (`client`) as a user buffer of the same size would be: admitted against its and the
+    /// device's memory limits before it is allocated, failing with ENOMEM over either, and then
+    /// counted as its held memory instead of kernel memory, until the object is dropped.
+    /// Without a client (a kernel VM's object) it is kernel memory, as [`Self::backing`].
+    pub(crate) fn client_backing(
+        dev: &AsahiDrmDevice,
+        size: usize,
+        client: Option<&kernel::sync::Arc<crate::memacct::Client>>,
+    ) -> Result<Self> {
+        let Some(client) = client else {
+            return Self::backing(dev, size, CpuMap::WriteCombined);
+        };
+        let bytes = gem::checked_object_size(size)? as u64;
+        let commit = crate::memacct::LEDGER.admit(client, bytes)?;
+        let mut object =
+            Self::with_object(gem::new_kernel_object_wc_user_charged(dev, size)?, size)?;
+        let charge = crate::memacct::Charge::user(commit, None);
+        charge.set_held(true);
+        object.charge = Some(charge);
+        Ok(object)
+    }
+
     fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
@@ -121,6 +146,7 @@ impl KernelObject {
             obj,
             ptr,
             size,
+            charge: None,
         })
     }
 
@@ -137,9 +163,9 @@ impl KernelObject {
             } else { error })
     }
 
-    /// Reuses only a complete alias of this exact retained backing. Permanent
-    /// queue aliases stay owned by the client VM after a physical pair moves;
-    /// returning to that VM must not replace or duplicate those mappings.
+    /// Reuses only a complete alias of this exact retained backing. A render pair keeps its
+    /// views of its kick rings while it moves between contexts of one VM; preparing the view
+    /// for that VM again must not replace or duplicate them.
     pub(crate) fn prepare_alias(
         &self,
         vm: &mmu::Vm,
@@ -717,13 +743,16 @@ impl Pool {
         )
     }
 
-    /// Allocates or reuses a matching object. Capacity pressure leaves a fresh
-    /// mapping uncached, preserving allocation and submission concurrency.
+    /// Allocates or reuses a matching object. A non-zero `prefix` maps `[0..prefix)`
+    /// firmware-cached; `prefix == 0` keeps the whole mapping uncached (for objects
+    /// that both firmware and host write) while still retaining and fencing the VA
+    /// in the pool. Capacity pressure leaves a fresh mapping unpooled and uncached,
+    /// preserving allocation and submission concurrency.
     ///
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
     /// returned longest ago once its fence is met (see `return_object`), and never one whose
-    /// fence is not met. With no room for a fresh cached object, a fresh one stays uncached;
+    /// fence is not met. With no room for a fresh pooled object, a fresh one stays unpooled;
     /// its drop keeps it mapped until the fence too (see `defer_object`).
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
@@ -821,6 +850,9 @@ impl Pool {
             // Nothing names the object yet: a failed reservation just frees it.
             self.reserve_deferred()?;
             result.defer = Some(self.clone());
+            return Ok(result);
+        }
+        if prefix == 0 {
             return Ok(result);
         }
         let (proof, mutated) = match result.mapping.as_ref() {

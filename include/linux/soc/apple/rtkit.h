@@ -164,6 +164,11 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
 
+/* As apple_rtkit_init(), with the mailbox named by @mbox_prop instead of mboxes. */
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops);
+
 /*
  * Initialize an instance for a co-processor that the bootloader left running
  * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
@@ -185,6 +190,28 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
 	const struct apple_rtkit_ops *ops,
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count);
+
+#define APPLE_RTKIT_ADOPTED_EPMAP_WORDS 8
+
+/*
+ * Negotiated state from the previous owner of a running session: the
+ * protocol version, the endpoint map the firmware advertised (word i holds
+ * endpoints 32i..32i+31) and the retained system buffers. The parent driver
+ * verifies that the co-processor runs and the backing of each buffer.
+ * Application endpoints in the map each need a start from the new owner.
+ * Everything is copied before mailbox RX starts.
+ */
+struct apple_rtkit_adopted_session {
+	const struct apple_rtkit_inherited_buffer *buffers;
+	unsigned int num_buffers;
+	u32 epmap[APPLE_RTKIT_ADOPTED_EPMAP_WORDS];
+	u16 protocol_version;
+};
+
+struct apple_rtkit *apple_rtkit_init_adopted_with_session(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops,
+	const struct apple_rtkit_adopted_session *session);
 
 /*
  * Free an instance of apple_rtkit.
@@ -248,6 +275,14 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk);
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
 
+/*
+ * Start a co-processor whose firmware may acknowledge IOP power on by itself
+ * once it has reported in: take that acknowledgment if it comes within
+ * @self_ack_ms, else ask for IOP power as apple_rtkit_wake() does. Call it
+ * after the co-processor's CPU has been started.
+ */
+int apple_rtkit_boot_or_wake(struct apple_rtkit *rtk, unsigned int self_ack_ms);
+
 /* Wake helpers which require AP readiness before their IOP power acknowledgment. */
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
 
@@ -270,6 +305,7 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
  */
 
 int apple_rtkit_poweroff(struct apple_rtkit *rtk);
+int apple_rtkit_mbox_restore(struct apple_rtkit *rtk);
 
 /*
  * After poweroff and a power cycle: start a fresh session, let @start start the
@@ -285,6 +321,7 @@ int apple_rtkit_idle(struct apple_rtkit *rtk);
 /* The mailbox's receive-enable bit (I2A_CONTROL bit 0): off once a slept firmware has answered its idle. */
 void apple_rtkit_set_recv_enabled(struct apple_rtkit *rtk, bool enabled);
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk);
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, int (*after_ap)(void *data), void *data);
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk);
 int apple_rtkit_warm_restart_stopped(struct apple_rtkit *rtk);
 

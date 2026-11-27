@@ -21,8 +21,10 @@ select:
         enum:
           - apple,t6020-aop-als
           - apple,t6030-aop-als
+          - apple,t6031-aop-als
           - apple,t6050-aop-als
           - apple,t8112-aop-als
+          - apple,t8122-aop-als
           - apple,t8142-aop-als
   required:
     - compatible
@@ -33,8 +35,10 @@ properties:
       - items:
           - enum:
               - apple,t6020-aop-als
+              - apple,t6031-aop-als
               - apple,t6050-aop-als
               - apple,t8112-aop-als
+              - apple,t8122-aop-als
               - apple,t8142-aop-als
           - const: apple,aop-als
       - items:

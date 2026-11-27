@@ -8,8 +8,16 @@ impl G18Session {
         translated: &crate::g18::uapi::command::TranslatedComputeCommand)
         -> core::result::Result<(), Failure> {
         self.poll_idle_faults("application compute prepare")?;
-        let (command, pool, generation, knobs) = self.memory.as_mut().ok_or(EIO)?
-            .prepare_application_compute(&self.dev, vm, translated)?;
+        let memory = self.memory.as_mut().ok_or(EIO)?;
+        let (command, pool, generation, knobs) =
+            match memory.prepare_application_compute(&self.dev, vm, translated) {
+                Ok(prepared) => prepared,
+                // A refusal that left the owner retired and nothing
+                // published fails this job only.
+                Err(error) => return Err(if memory.application_compute_unpublished() {
+                    Failure::Job(JobFailure::Refused(error))
+                } else { Failure::Fatal(error) }),
+            };
         if generation == 1 {
             self.queue_probe.as_mut().ok_or(EIO)?.prepare_initial_context(command.context_id)?;
             for phase in 1..=3 {

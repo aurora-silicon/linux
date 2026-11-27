@@ -185,9 +185,9 @@ int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 
 /*
  * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
- * with the per-boot word zeroed (the M4 Max and M4 27.2 builds).
+ * with the build's per-boot word at @word_off zeroed.
  */
-static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
+static int ave_fw_text_boot_id(struct ave_dev *ave, u32 word_off, u32 *crc)
 {
 	void *va;
 	int ret;
@@ -197,20 +197,20 @@ static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
 	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
 	if (!va)
 		return -ENOMEM;
-	ret = ave_fw_text_boot_crc(va, ave->text.size,
-				   ave->variant->text_boot_word, crc);
+	ret = ave_fw_text_boot_crc(va, ave->text.size, word_off, crc);
 	memunmap(va);
 	return ret;
 }
 
-static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
+static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
+			  u32 *crc)
 {
 	void *va;
 	int ret;
 
 	if (!ave->variant->text_link_cell)
-		return ave->variant->text_boot_word ?
-			       ave_fw_text_boot_id(ave, crc) : 0;
+		return build && build->text_boot_word ?
+			       ave_fw_text_boot_id(ave, build->text_boot_word, crc) : 0;
 	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
 	if (!va)
 		return -ENOMEM;
@@ -235,15 +235,15 @@ static const struct ave_fw_build *ave_fw_find_build(const struct ave_variant *v,
 	return NULL;
 }
 
-/* Whether these are the segment sizes of one of v's builds */
-static bool ave_fw_sizes_match(const struct ave_variant *v, size_t text,
-			       size_t data)
+/*
+ * Whether TEXT/DATA segments of these sizes are a build the variant pins.
+ * ave_fw_probe() refuses the firmware when they are not.
+ */
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data)
 {
 	if (v->build_count)
 		return ave_fw_find_build(v, text, data, 0);
-	return text == v->fw_text_size &&
-	       (data == v->fw_data_size ||
-		(v->fw_data_size_alt && data == v->fw_data_size_alt));
+	return text == v->fw_text_size && data == v->fw_data_size;
 }
 
 /*
@@ -297,12 +297,11 @@ int ave_fw_probe(struct ave_dev *ave)
 		want_crc = build->text_crc;
 	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
 		/* A probe-only variant that pins no build takes any segment sizes. */
-	} else if (ave->text.size != ave->variant->fw_text_size ||
-		   (ave->data.size != ave->variant->fw_data_size &&
-		    (!ave->variant->fw_data_size_alt ||
-		     ave->data.size != ave->variant->fw_data_size_alt))) {
+	} else if (!ave_fw_sizes_match(ave->variant, ave->text.size,
+				       ave->data.size)) {
 		return dev_err_probe(dev, -EINVAL,
-				     "unexpected firmware segment sizes\n");
+				     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
+				     ave->text.size, ave->data.size);
 	}
 	if ((ave->text.phys < ave->data.phys + ave->data.size &&
 	     ave->data.phys < ave->text.phys + ave->text.size) ||
@@ -336,7 +335,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
-	ret = ave_fw_text_id(ave, &text_crc);
+	ret = ave_fw_text_id(ave, build, &text_crc);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");

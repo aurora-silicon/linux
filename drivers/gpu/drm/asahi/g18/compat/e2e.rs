@@ -209,7 +209,9 @@ const PAGE: u64 = crate::pgtable::UAT_PGSZ as u64;
 fn map_power_sources() -> bool {
     let map_page = |slot: &AtomicPtr<u8>, link: u64| -> bool {
         if !slot.load(Ordering::Acquire).is_null() { return true; }
-        let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link);
+        let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link) else {
+            return false;
+        };
         // SAFETY: same page as the existing bounded diag_knobs probe; WB
         // read-only use; retained until module unload.
         let ptr = unsafe { bindings::memremap(physical & !(PAGE - 1), PAGE as usize,
@@ -232,7 +234,7 @@ fn map_power_sources() -> bool {
 fn read_firmware_word(page: &AtomicPtr<u8>, link: u64) -> Option<u64> {
     let base = page.load(Ordering::Acquire);
     if base.is_null() { return None; }
-    let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link);
+    let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link)?;
     let offset = (physical & (PAGE - 1)) as usize;
     // SAFETY: `base` maps the whole containing page for the module lifetime;
     // `offset` is 8-aligned (both links are) and below the page size. The
