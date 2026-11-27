@@ -157,11 +157,50 @@ struct audiosrv_data {
 	bool elements_empty;
 };
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): after a restart, the interface opened as the M5's panel AV
+ * opens its own (epic/panelavep.c: the firmware's plug ends by closing it, and the panel's modes
+ * are exported only while it is open), then counted.
+ */
+struct av_video_open_work {
+	struct work_struct work;
+	struct apple_epic_service *service;
+};
+
+static void av_video_open_worker(struct work_struct *work)
+{
+	struct av_video_open_work *w = container_of(work, struct av_video_open_work, work);
+	struct apple_epic_service *service = w->service;
+	struct apple_dcp *dcp = service->ep->dcp;
+	int ret = afk_service_open(service);
+
+	dev_info(dcp->dev, "AV video interface %u: OPEN after the restart: %d\n", service->channel,
+		 ret);
+	atomic_inc(&dcp->av_video_gen);
+	wake_up_all(&dcp->av_video_wq);
+	afk_service_put(service);
+	kfree(w);
+}
+
 static void av_interface_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
+	struct av_video_open_work *w;
 
+	if (READ_ONCE(dcp->av_video_reopen)) {
+		w = kzalloc(sizeof(*w), GFP_KERNEL);
+		if (w) {
+			w->service = afk_service_get(service);
+			if (w->service) {
+				INIT_WORK(&w->work, av_video_open_worker);
+				/* Not on the endpoint's own queue: the reply arrives there. */
+				queue_work(system_dfl_wq, &w->work);
+				return;
+			}
+			kfree(w);
+		}
+	}
 	/* A restarted firmware's pipe waits for this (dcp_v27_early_av_wait()). */
 	atomic_inc(&dcp->av_video_gen);
 	wake_up_all(&dcp->av_video_wq);

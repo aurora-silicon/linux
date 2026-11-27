@@ -994,6 +994,8 @@ struct apple_dcp {
 	/* Times the firmware published its AV video interface (av_interface_init()), and waiters */
 	atomic_t av_video_gen;
 	wait_queue_head_t av_video_wq;
+	/* DIAGNOSTIC: the restart opens the next publication before counting it (v27_early_av_open) */
+	bool av_video_reopen;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;

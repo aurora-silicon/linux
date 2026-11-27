@@ -14,6 +14,10 @@ static const u8 v27_sleep_endpoints[] = {
 enum v27_phase { V27_LIVE, V27_PREPARED, V27_ARMED, V27_STOPPED, V27_FAILED };
 static bool v27_two_stage = true;
 module_param(v27_two_stage, bool, 0644);
+/* DIAGNOSTIC (T6030 sleep bring-up) */
+static bool v27_early_av_open;
+module_param(v27_early_av_open, bool, 0644);
+MODULE_PARM_DESC(v27_early_av_open, "DIAGNOSTIC: V27 restart: open the AV video interface the restarted firmware publishes, before the CRTC comes on");
 MODULE_PARM_DESC(v27_two_stage, "V27 sleep: the panel's soft power state off before the hard one, on after it (macOS's display stage)");
 static bool v27_soft_first = true;
 module_param(v27_soft_first, bool, 0644);
@@ -2554,12 +2558,15 @@ static void dcp_v27_early_av_wait(struct apple_dcp *dcp, int gen)
 	if (!gen)
 		return;
 	if (!wait_event_timeout(dcp->av_video_wq, atomic_read(&dcp->av_video_gen) != gen,
-				msecs_to_jiffies(V27_EARLY_AV_MS)))
+				msecs_to_jiffies(V27_EARLY_AV_MS))) {
+		WRITE_ONCE(dcp->av_video_reopen, false);
 		dev_warn(dcp->dev, "V27 wake: no AV video interface again in %d ms\n",
 			 V27_EARLY_AV_MS);
-	else
-		dev_dbg(dcp->dev, "V27 wake: AV video interface back after %lld ms\n",
-			ktime_ms_delta(ktime_get(), start));
+	} else {
+		WRITE_ONCE(dcp->av_video_reopen, false);
+		dev_info(dcp->dev, "V27 wake: AV video interface back after %lld ms\n",
+			 ktime_ms_delta(ktime_get(), start));
+	}
 }
 
 /*
@@ -2608,6 +2615,7 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 			goto lost;
 		step = "RTKit";
 		dcp_s2r_forget_crash(dcp);
+		WRITE_ONCE(dcp->av_video_reopen, v27_early_av_open && av_gen);
 		ret = apple_rtkit_warm_restart(dcp->rtk);
 		if (ret)
 			goto lost;
