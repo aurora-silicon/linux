@@ -104,6 +104,7 @@ struct kiwi {
 	u8 cand_hot[(KIWI_CELLS + 7) / 8];	/* hot-cell map of the first baseline candidate */
 	bool have_hot;
 	u64 drop_hold, drop_still;	/* per-rule drop counters, debugfs */
+	u64 skip_frames, base_retakes;	/* frame gate counters, debugfs */
 	struct dentry *dbg;
 	int bad;
 	int agree;		/* agreeing pairs chained toward a baseline */
@@ -249,9 +250,37 @@ static void kiwi_take_base(struct kiwi *k, const u8 *data)
  * peak search: a baseline taken from the -126 frame, or a -126 frame passed
  * through, turns the top edge cells into a held touch.
  */
+/*
+ * The common-mode shift of n cells (stride apart), in the 1/256 counts of fp[]:
+ * a mean that leaves out the cells a touch moved. A plain mean is pulled by a
+ * finger's own signal (several cells hundreds of counts deep), which made a
+ * held touch look like a whole-image reference shift: its frames were skipped
+ * and the baseline retaken with the finger in it. Cells more than a touch
+ * threshold from the first-pass mean are left out of the second pass, so a
+ * true reference shift (every cell moves) still shows in full.
+ */
+static s32 kiwi_common(const s32 *fp, int n, int stride)
+{
+	s64 sum = 0, sum2 = 0;
+	s32 m0;
+	int i, kept = 0;
+
+	for (i = 0; i < n; i++)
+		sum += fp[i * stride];
+	m0 = div_s64(sum, n);
+	for (i = 0; i < n; i++) {
+		s32 v = fp[i * stride];
+
+		if (abs(v - m0) < (KIWI_THRESHOLD << 8)) {
+			sum2 += v;
+			kept++;
+		}
+	}
+	return kept > n / 2 ? div_s64(sum2, kept) : m0;
+}
+
 static bool kiwi_load(struct kiwi *k, const u8 *data)
 {
-	s64 sum = 0;
 	s32 common;
 	int rowmax;
 	int i, r, c;
@@ -260,25 +289,22 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 		kiwi_take_base(k, data);
 		return false;
 	}
-	for (i = 0; i < KIWI_CELLS; i++) {
+	for (i = 0; i < KIWI_CELLS; i++)
 		k->fp[i] = k->base[i] - (get_unaligned_le16(data + KIWI_HDR_LEN + 2 * i) << 8);
-		sum += k->fp[i];
-	}
-	common = div_s64(sum, KIWI_CELLS);
+	common = kiwi_common(k->fp, KIWI_CELLS, 1);
 	if (abs(common >> 8) > KIWI_GLITCH) {
-		if (++k->bad >= KIWI_GLITCH_MAX)
+		k->skip_frames++;
+		if (++k->bad >= KIWI_GLITCH_MAX) {
 			k->have_base = false;
+			k->base_retakes++;
+		}
 		return false;
 	}
 	k->bad = 0;
 	/* the shift differs a little from row to row, so remove it per row */
 	rowmax = 0;
 	for (r = 0; r < KIWI_ROWS; r++) {
-		s64 row = 0;
-
-		for (c = 0; c < KIWI_COLS; c++)
-			row += k->fp[r * KIWI_COLS + c];
-		common = div_s64(row, KIWI_COLS);
+		common = kiwi_common(&k->fp[r * KIWI_COLS], KIWI_COLS, 1);
 		k->rowmean[r] = (int)common;
 		if (abs(common >> 8) > rowmax)
 			rowmax = abs(common >> 8);
@@ -318,8 +344,11 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 			for (c = 0; c < KIWI_COLS; c++)
 				k->base[r * KIWI_COLS + c] -= step;
 		}
-		if (++k->bad >= KIWI_GLITCH_MAX)
+		k->skip_frames++;
+		if (++k->bad >= KIWI_GLITCH_MAX) {
 			k->have_base = false;
+			k->base_retakes++;
+		}
 		return false;
 	}
 	return true;
@@ -979,6 +1008,8 @@ static int kiwi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	kiwi->dbg = debugfs_create_dir("hid-apple-mtp-kiwi", NULL);
 	debugfs_create_u64("drop_hold", 0444, kiwi->dbg, &kiwi->drop_hold);
+	debugfs_create_u64("skip_frames", 0444, kiwi->dbg, &kiwi->skip_frames);
+	debugfs_create_u64("base_retakes", 0444, kiwi->dbg, &kiwi->base_retakes);
 	debugfs_create_u64("drop_still", 0444, kiwi->dbg, &kiwi->drop_still);
 
 	return hid_hw_start(hdev, HID_CONNECT_HIDRAW);
