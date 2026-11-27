@@ -3313,9 +3313,14 @@ MODULE_PARM_DESC(no_wfi_clean, "T6030 DIAGNOSTIC: no set/way clean or HID4 toggl
  * boot core's own clean is already in .pre_commit), and leaves only CYC_OVRD and DEEP_SLEEP, as
  * macOS writes them, between the release and each core's WFI.
  */
-static bool t6030_fast_wfi;
-module_param_named(fast_wfi, t6030_fast_wfi, bool, 0444);
-MODULE_PARM_DESC(fast_wfi, "T6030 DIAGNOSTIC: each held core's cache clean at its stop, before the commit; nothing but the WFI controls after the release");
+static unsigned int t6030_fast_wfi;
+module_param_named(fast_wfi, t6030_fast_wfi, uint, 0444);
+MODULE_PARM_DESC(fast_wfi, "T6030 DIAGNOSTIC: 1 each held core's cache clean at its stop, before the commit, nothing but the WFI controls after the release; 2 also spin, not WFE, for the release");
+
+static bool t6030_fast_wfi_spin(void)
+{
+	return READ_ONCE(t6030_fast_wfi) >= 2;
+}
 
 static void t6030_fast_wfi_stop(void)
 {

@@ -2759,6 +2759,7 @@ static void __noreturn sleep_deep_wfi(void)
 
 static void t6030_deep_wfi_arm(void);
 static void t6030_fast_wfi_stop(void);
+static bool t6030_fast_wfi_spin(void);
 
 static void sleep_cpu_stop(u64 mpidr)
 {
@@ -6009,6 +6010,9 @@ static int apple_sleep_commit(unsigned long unused)
 		spin_table_pen_deep_el1(sleep_pen_el1(s));
 		spin_table_release_stopped();
 	}
+	/* T6030 fast_wfi=2: the stopped cores spin for the release, not WFE */
+	if (s->soc->ops->deep_wfi_arm == t6030_deep_wfi_arm)
+		spin_table_stop_spin(t6030_fast_wfi_spin());
 	s->cpus_stop_ret = spin_table_stop_parked();
 	if (early)
 		udelay(SLEEP_EARLY_WFI_SETTLE_US);

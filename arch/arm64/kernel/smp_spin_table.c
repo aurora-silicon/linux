@@ -292,6 +292,13 @@ bool spin_table_cpu_tracked_off(unsigned int cpu)
 }
 
 static bool spin_table_pen_deep_armed, spin_table_pen_el1_on, spin_table_pen_ovrd_on;
+static bool spin_table_stop_spin_on;
+
+/* DIAGNOSTIC: stopped CPUs spin for the release instead of waiting in WFE */
+void spin_table_stop_spin(bool on)
+{
+	WRITE_ONCE(spin_table_stop_spin_on, on);
+}
 
 void spin_table_pen_deep_arm(bool on)
 {
@@ -341,6 +348,7 @@ void spin_table_stop_finished(void)
 	WRITE_ONCE(spin_table_hold_requested, false);
 	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
+	WRITE_ONCE(spin_table_stop_spin_on, false);
 	cpumask_clear(&spin_table_cpus_early);
 	cpumask_or(&spin_table_cpus_off, &spin_table_cpus_off, &spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_parked);
@@ -426,8 +434,12 @@ static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
 
 			while (!READ_ONCE(spin_table_stop_released) &&
-			       !cpumask_test_cpu(cpu, &spin_table_cpus_early))
-				wfe();
+			       !cpumask_test_cpu(cpu, &spin_table_cpus_early)) {
+				if (READ_ONCE(spin_table_stop_spin_on))
+					cpu_relax();
+				else
+					wfe();
+			}
 			spin_table_power->cpu_off(mpidr);
 		}
 		wfe();
