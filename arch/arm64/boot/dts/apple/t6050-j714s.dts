@@ -215,30 +215,14 @@
 	status = "okay";
 };
 
-/* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
 / {
 	aliases {
 		/* The loader fills the keyboard layout from the ADT's keyboard node */
 		keyboard = &keyboard;
 	};
-
-	led-controller {
-		compatible = "pwm-leds";
-
-		led-0 {
-			pwms = <&fpwm0 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
-		};
-	};
 };
 
-&fpwm0 {
-	status = "okay";
-};
+#include "t6050-kbd-backlight.dtsi"
 
 /* The MTP and its DockChannel FIFO, which carry the keyboard and trackpad */
 &mtp_mbox {
@@ -377,19 +361,9 @@
 			};
 		};
 	};
-
-	/*
-	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
-	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
-	 * for it, as on J616s. Its ADT features-supported is <3>, "Power In" only: no liquid
-	 * detection (LDCM, feature 2 of the USB-C ports' <1 2 3>).
-	 */
-	hpm5: usb-pd@8 {
-		compatible = "apple,sn201202x";
-		reg = <0x8 SPMI_USID>;
-		apple,no-liquid-detection;
-	};
 };
+
+#include "t6050-magsafe.dtsi"
 
 &usb_drd1 {
 	port {

@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The M5 Pro/Max MacBook Pros' MagSafe 3 port: its PD controller, an SN201202x at SPMI address
+ * 0x8 on nub-spmi-a0 (ADT hpm5, port-type 0x11). Every 14" and 16" board's ADT has the same
+ * node. It has no USB data path, so it gets no connector node; tipd registers a Type-C port
+ * and a power supply for it, as on J616s. Its ADT features-supported is <3>, "Power In" only:
+ * no liquid detection (LDCM, feature 2 of the USB-C ports' <1 2 3>).
+ *
+ * The bus status is the board's. The boards that described the node before include this
+ * after their left-front port's PD controller (hpm1), where the node was.
+ */
+
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
+};
