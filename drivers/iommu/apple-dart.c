@@ -8638,14 +8638,14 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
 	 */
 	if (READ_ONCE(dart->host_off))
 		return 0;
-	if (!READ_ONCE(dart->display_dark)) {
+	ret = apple_dart_display_dark_enter(dart);
+	if (ret)
+		return ret;
+	if (!dart->display_saved) {
 		apple_dart_save_state(dart);
 		dart->display_enable = readl(enable);
 		dart->display_saved = true;
 	}
-	ret = apple_dart_display_dark_enter(dart);
-	if (ret)
-		return ret;
 	writel(readl(enable) & ~streams, enable);
 	if (flush) {
 		for_each_set_bit(sid, &bits, dart->num_streams)
