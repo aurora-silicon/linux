@@ -177,8 +177,14 @@ def main():
     # The echo's predicate, where the receiver is built on one.
     if 'static bool apple_rtkit_oslog_echoed(' in source:
         names[:0] = ['apple_rtkit_oslog_unanswered', 'apple_rtkit_oslog_echoed']
+    # Where the session reset can keep the buffers, it frees them in a helper.
+    if 'static void apple_rtkit_free_session_buffers(' in source:
+        names.append('apple_rtkit_free_session_buffers')
     if 'static void apple_rtkit_reset_session(' in source:
         names.append('apple_rtkit_reset_session')
+    # reinit() is then a wrapper of the session reinit.
+    if 'static int apple_rtkit_reinit_session(' in source:
+        names.append('apple_rtkit_reinit_session')
     names.append('apple_rtkit_reinit')
     bodies = '\n'.join(function(source, name) for name in names)
     if args.mutate == 'admission':
