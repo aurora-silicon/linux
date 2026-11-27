@@ -1138,8 +1138,23 @@ static int centauri_t6050_suspend(struct device *dev)
 	bool beta_fallback;
 	int ret;
 
-	if (!apple_centauri_sleep_reboot(pdev))
-		return c->boot_phase == CEN_BOOT_READY ? pci_save_state(pdev) : -EBUSY;
+	if (!apple_centauri_sleep_reboot(pdev)) {
+		switch (READ_ONCE(c->boot_phase)) {
+		case CEN_BOOT_READY:
+			return pci_save_state(pdev);
+		case CEN_BOOT_FAILED:
+		case CEN_BOOT_STOPPED:
+			/*
+			 * The startup gave up (no firmware, say) or was stopped: nothing
+			 * runs on the N1 and nothing will, so it must not hold off a
+			 * system sleep. The PCI core saves the config space.
+			 */
+			return 0;
+		default:
+			/* A startup in progress finishes first. */
+			return -EBUSY;
+		}
+	}
 
 	mutex_lock(&cen_recovery_lock);
 	beta_fallback = c->recovery && c->recovery->beta_fallback;
