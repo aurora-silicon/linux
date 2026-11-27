@@ -810,12 +810,11 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	 */
 	c->entry = readl(c->ps);
 	c->saved = c->entry;
-	if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
-		writel((c->entry & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) |
-		       FIELD_PREP(PS_TARGET, PS_ACTIVE), c->ps);
-		c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
-						  10, PS_TIMEOUT_US);
-	}
+	/* Out of automatic power whether or not it is up now, so that the idle firmware can't gate it */
+	writel((c->entry & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) |
+	       FIELD_PREP(PS_TARGET, PS_ACTIVE), c->ps);
+	c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
+					  10, PS_TIMEOUT_US);
 	asahi_g16_sleep_note(0x28);
 	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
 	asahi_g16_sleep_note(0x22);
