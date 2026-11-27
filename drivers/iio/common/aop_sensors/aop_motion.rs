@@ -6,6 +6,13 @@
 //! acceleration and angular rate as two services, one fake-HID report per
 //! sample. A service starts reporting once it has been sent the machine's
 //! three calibration packets and a report interval.
+//!
+//! The reports run only while someone reads them: while a buffer is enabled,
+//! or until direct reads go quiet for a short idle window. Calibration is sent
+//! once per AOP boot (not on every start), and with nobody reading the reports
+//! stay off, as macOS keeps them (its accel and gyro drivers sit at report
+//! interval 0 on an idle desktop), so the AOP does not wake the application
+//! processor 50 times a second per sensor.
 
 use core::{
     ffi::{c_int, c_void},
@@ -15,16 +22,18 @@ use core::{
 
 use kernel::{
     bindings, c_str,
-    device::{self, Core},
-    module_platform_driver, new_spinlock, of, platform,
+    device::{self, Bound, Core},
+    devres, module_platform_driver, new_delayed_work, new_mutex, new_spinlock, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidListener, FakehidRegistration, AOP},
     sync::{
         aref::ARef,
         atomic::{Atomic, Relaxed},
-        Arc, SpinLock,
+        Arc, Mutex, SpinLock,
     },
+    time::{self, delay::fsleep, Delta, Instant, Monotonic},
     types::{ForeignOwnable, Opaque},
+    workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
 };
 
 /// The EPIC notification that writes a property of a sensor service.
@@ -33,6 +42,13 @@ const SUBTYPE_SET_PROPERTY: u16 = 4;
 const PROP_INTERVAL: u32 = 0;
 /// 50 Hz.
 const INTERVAL_US: u32 = 20_000;
+/// How long a direct read waits for the first report of a fresh start.
+const FIRST_SAMPLE_MS: i64 = 200;
+const FIRST_SAMPLE_POLL_MS: i64 = 5;
+/// How long reports stay on after the last direct read without a buffer, so
+/// multi-axis X/Y/Z reads and polling callers share one running stream instead
+/// of starting and stopping the service on every sysfs read.
+const DIRECT_IDLE_MS: i64 = 2_000;
 /// The calibration properties of a service and the device tree properties the
 /// bootloader fills them from. They are written in this order, before the
 /// report interval.
@@ -132,12 +148,118 @@ fn location0_packet(prop: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// What a stream state change requires from the service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncAction {
+    None,
+    /// Enable reports; send calibration packets first when `calibrate` is true.
+    Start {
+        calibrate: bool,
+    },
+    Stop,
+}
+
+/// Outcome of checking the direct-read idle deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleStep {
+    /// No direct-read hold to expire.
+    Ignore,
+    /// More reads extended the deadline; re-arm the work for this many ms.
+    RearmMs(u32),
+    /// The deadline passed; stop the reports if nothing else wants them.
+    Expire,
+}
+
+/// Who wants the reports of a service and whether calibration has already been
+/// sent in this AOP boot.
+struct Stream<T> {
+    /// Calibration has been accepted or confirmed held in this AOP boot.
+    calibrated: bool,
+    /// A buffer is enabled.
+    buffer_on: bool,
+    /// Reports are held on for recent direct reads until this deadline.
+    direct_until: Option<T>,
+    /// A start for a direct read failed with this error; direct reads return
+    /// it without another try until this deadline.
+    failed_until: Option<(T, Error)>,
+    /// Set across system sleep and after unbind: no reports.
+    parked: bool,
+    /// The reports are currently enabled (interval != 0).
+    active: bool,
+}
+
+impl<T> Stream<T> {
+    const fn new() -> Self {
+        Self {
+            calibrated: false,
+            buffer_on: false,
+            direct_until: None,
+            failed_until: None,
+            parked: false,
+            active: false,
+        }
+    }
+
+    fn want(&self) -> bool {
+        !self.parked && (self.buffer_on || self.direct_until.is_some())
+    }
+
+    fn next_action(&self) -> SyncAction {
+        match (self.want(), self.active) {
+            (true, false) => SyncAction::Start {
+                calibrate: !self.calibrated,
+            },
+            (false, true) => SyncAction::Stop,
+            _ => SyncAction::None,
+        }
+    }
+
+    /// Evaluates the direct-read idle deadline given the milliseconds left
+    /// until it expires (`<= 0` once expired).
+    fn check_idle(&mut self, remaining_ms: i64) -> IdleStep {
+        if self.direct_until.is_none() {
+            return IdleStep::Ignore;
+        }
+        if self.parked || self.buffer_on {
+            self.direct_until = None;
+            return IdleStep::Ignore;
+        }
+        if remaining_ms > 0 {
+            IdleStep::RearmMs(remaining_ms.clamp(1, DIRECT_IDLE_MS) as u32)
+        } else {
+            self.direct_until = None;
+            IdleStep::Expire
+        }
+    }
+
+    /// Returns the error of a failed start for as long as direct reads back
+    /// off from it, given the milliseconds left until they may try again
+    /// (`<= 0` once they may).
+    fn check_backoff(&mut self, remaining_ms: i64) -> Option<Error> {
+        if remaining_ms <= 0 {
+            self.failed_until = None;
+        }
+        self.failed_until.as_ref().map(|(_, e)| *e)
+    }
+}
+
 /// Starts and stops the reports of one service.
+#[pin_data]
 struct Control {
     dev: ARef<device::Device>,
     aop: Arc<dyn AOP>,
     service: EPICService,
     packets: [KVec<u8>; 3],
+    /// Serializes starting and stopping the reports.
+    #[pin]
+    stream: Mutex<Stream<Instant<Monotonic>>>,
+    /// Stops direct-read reports once reads go quiet.
+    #[pin]
+    idle_work: DelayedWork<Control>,
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<Self> for Control { self.idle_work }
 }
 
 impl Control {
@@ -159,15 +281,17 @@ impl Control {
             };
             packet.extend_from_slice(data, GFP_KERNEL)?;
         }
-        Ok(Arc::new(
-            Self {
+        Arc::pin_init(
+            pin_init!(Self {
                 dev: dev.into(),
                 aop,
                 service,
                 packets,
-            },
+                stream <- new_mutex!(Stream::new()),
+                idle_work <- new_delayed_work!("Control::idle_work"),
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     /// Writes a property and returns the firmware's status.
@@ -180,6 +304,8 @@ impl Control {
             .epic_call(&self.service, SUBTYPE_SET_PROPERTY, &msg)
     }
 
+    /// Direct reads back off after a failed start, so they log this at most
+    /// once per `DIRECT_IDLE_MS`.
     fn refused(&self, prop: u32, status: u32) -> Error {
         dev_err!(
             self.dev,
@@ -197,8 +323,10 @@ impl Control {
         }
     }
 
-    /// Sends the calibration, then the interval that starts the reports.
-    fn start(&self) -> Result {
+    /// Sends the three calibration packets. The firmware keeps calibration for
+    /// the whole AOP boot, so this runs once at probe and conservatively again
+    /// after firmware suspend, hibernation or restore.
+    fn calibrate(&self) -> Result {
         let mut held = 0;
         for ((prop, _), packet) in CALIBRATION.iter().zip(self.packets.iter()) {
             let status = self.write(*prop, packet)?;
@@ -209,18 +337,146 @@ impl Control {
             }
         }
         if held > 0 {
-            dev_info!(
+            dev_dbg!(
                 self.dev,
                 "{} of {} calibration packets kept from an earlier start\n",
                 held,
                 CALIBRATION.len()
             );
         }
+        Ok(())
+    }
+
+    fn start_reports(&self) -> Result {
         self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
     }
 
-    fn stop(&self) -> Result {
+    fn stop_reports(&self) -> Result {
         self.set(PROP_INTERVAL, &0u32.to_le_bytes())
+    }
+
+    /// Checks once at probe that the service accepts the calibration and the
+    /// report interval, then leaves the reports off until someone reads them.
+    fn probe_init(&self) -> Result {
+        let mut s = self.stream.lock();
+        self.calibrate()?;
+        s.calibrated = true;
+        self.start_reports()?;
+        self.stop_reports()
+    }
+
+    /// Starts or stops the reports to match their users. The caller holds the
+    /// stream lock.
+    fn sync_locked(&self, s: &mut Stream<Instant<Monotonic>>) -> Result {
+        match s.next_action() {
+            SyncAction::Start { calibrate } => {
+                if calibrate {
+                    self.calibrate()?;
+                    s.calibrated = true;
+                }
+                self.start_reports()?;
+                s.active = true;
+                Ok(())
+            }
+            SyncAction::Stop => {
+                self.stop_reports()?;
+                s.active = false;
+                Ok(())
+            }
+            SyncAction::None => Ok(()),
+        }
+    }
+
+    fn schedule_idle(self: &Arc<Self>, delay_ms: u32) {
+        let _ =
+            workqueue::system_dfl().enqueue_delayed(self.clone(), time::msecs_to_jiffies(delay_ms));
+    }
+
+    fn stop_idle_sync(self: &Arc<Self>, disable: bool) {
+        // SAFETY: `idle_work` is initialized and pinned in this `Arc`. Both
+        // helpers cancel pending work and join a running callback; the disable
+        // variant also prevents any later requeue.
+        let cancelled = unsafe {
+            let work = Work::raw_get(DelayedWork::raw_as_work(ptr::addr_of!(self.idle_work)));
+            let delayed = kernel::container_of!(work, bindings::delayed_work, work);
+            if disable {
+                bindings::disable_delayed_work_sync(delayed)
+            } else {
+                bindings::cancel_delayed_work_sync(delayed)
+            }
+        };
+        if cancelled {
+            // SAFETY: A cancelled pending callback owned exactly one `Arc`
+            // transferred by `enqueue_delayed`.
+            drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
+        }
+    }
+
+    fn set_buffer(&self, on: bool) -> Result {
+        let mut s = self.stream.lock();
+        s.buffer_on = on;
+        if on {
+            s.direct_until = None;
+            s.failed_until = None;
+        }
+        let ret = self.sync_locked(&mut s);
+        if on && ret.is_err() {
+            // The IIO core does not call predisable after a failed enable.
+            s.buffer_on = false;
+        }
+        ret
+    }
+
+    fn set_parked(self: &Arc<Self>, parked: bool, reset_cal: bool) -> Result {
+        let ret = {
+            let mut s = self.stream.lock();
+            s.parked = parked;
+            s.failed_until = None;
+            if parked {
+                s.direct_until = None;
+            } else if reset_cal {
+                s.calibrated = false;
+                s.active = false;
+            }
+            self.sync_locked(&mut s)
+        };
+        if parked {
+            self.stop_idle_sync(false);
+        }
+        ret
+    }
+
+    fn shutdown(self: &Arc<Self>) -> Result {
+        let ret = {
+            let mut s = self.stream.lock();
+            s.parked = true;
+            s.direct_until = None;
+            s.failed_until = None;
+            self.sync_locked(&mut s)
+        };
+        self.stop_idle_sync(true);
+        ret
+    }
+}
+
+impl WorkItem for Control {
+    type Pointer = Arc<Control>;
+
+    fn run(this: Arc<Control>) {
+        let mut s = this.stream.lock();
+        let Some(deadline) = s.direct_until else {
+            return;
+        };
+        let remaining_ms = (deadline - Instant::<Monotonic>::now()).as_millis_ceil();
+        match s.check_idle(remaining_ms) {
+            IdleStep::Ignore => {}
+            IdleStep::RearmMs(delay_ms) => this.schedule_idle(delay_ms),
+            IdleStep::Expire => {
+                if let Err(e) = this.sync_locked(&mut s) {
+                    dev_warn!(this.dev, "reports not stopped after idle: {:?}\n", e);
+                }
+            }
+        }
     }
 }
 
@@ -246,8 +502,63 @@ struct State {
     kind: &'static Kind,
     /// The IIO device, which outlives the report listener.
     iio: IioPtr,
+    control: Arc<Control>,
     #[pin]
     sample: SpinLock<Sample>,
+}
+
+impl State {
+    /// Returns the latest sample. Without a buffer the reports are started on
+    /// demand and kept running until direct reads go quiet for
+    /// `DIRECT_IDLE_MS`. A failed start is not tried again for as long; reads
+    /// in between return its error.
+    fn read_now(&self) -> Result<[i32; 3]> {
+        let mut s = self.control.stream.lock();
+        if s.parked {
+            return Err(EBUSY);
+        }
+        if let Some((until, _)) = s.failed_until {
+            let remaining_ms = (until - Instant::<Monotonic>::now()).as_millis_ceil();
+            if let Some(e) = s.check_backoff(remaining_ms) {
+                return Err(e);
+            }
+        }
+        let started = !s.active;
+        if started {
+            // A sample from an earlier start may be stale.
+            self.sample.lock().valid = false;
+        }
+        if !s.buffer_on {
+            s.direct_until = Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
+        }
+        if let Err(e) = self.control.sync_locked(&mut s) {
+            s.direct_until = None;
+            // Polling readers must not repeat a failing start at their rate.
+            let until = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+            s.failed_until = Some((until, e));
+            return Err(e);
+        }
+        if started {
+            let mut waited = 0;
+            while waited < FIRST_SAMPLE_MS && !self.sample.lock().valid {
+                fsleep(Delta::from_millis(FIRST_SAMPLE_POLL_MS));
+                waited += FIRST_SAMPLE_POLL_MS;
+            }
+            if !s.buffer_on {
+                s.direct_until =
+                    Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
+            }
+        }
+        if !s.buffer_on {
+            self.control.schedule_idle(DIRECT_IDLE_MS as u32);
+        }
+        let sample = *self.sample.lock();
+        if sample.valid {
+            Ok(sample.xyz)
+        } else {
+            Err(ENODATA)
+        }
+    }
 }
 
 struct IioPtr(*mut bindings::iio_dev);
@@ -318,11 +629,11 @@ unsafe extern "C" fn motion_read_raw(
     // SAFETY: `chan` is one of the registered channels.
     let axis = unsafe { (*chan).address };
     let (int, frac, ret) = if mask == bindings::BINDINGS_IIO_CHAN_INFO_RAW as isize {
-        let sample = *state.sample.lock();
-        if !sample.valid {
-            return ENODATA.to_errno();
-        }
-        let Some(&count) = sample.xyz.get(axis) else {
+        let xyz = match state.read_now() {
+            Ok(xyz) => xyz,
+            Err(e) => return e.to_errno(),
+        };
+        let Some(&count) = xyz.get(axis) else {
             return EINVAL.to_errno();
         };
         (count, 0, bindings::IIO_VAL_INT)
@@ -340,6 +651,42 @@ unsafe extern "C" fn motion_read_raw(
     }
     ret as i32
 }
+
+/// Starts the reports for an enabled buffer.
+///
+/// # Safety
+///
+/// The IIO core calls it with a device registered by [`MotionIio`].
+unsafe extern "C" fn buffer_postenable(indio_dev: *mut bindings::iio_dev) -> c_int {
+    // SAFETY: The private data is the `Arc<State>` stored by `MotionIio::new()`.
+    let state = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) };
+    match state.control.set_buffer(true) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Stops the reports when the buffer is disabled.
+///
+/// # Safety
+///
+/// As [`buffer_postenable`].
+unsafe extern "C" fn buffer_predisable(indio_dev: *mut bindings::iio_dev) -> c_int {
+    // SAFETY: As in `buffer_postenable()`.
+    let state = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) };
+    match state.control.set_buffer(false) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+static BUFFER_OPS: bindings::iio_buffer_setup_ops = bindings::iio_buffer_setup_ops {
+    preenable: None,
+    postenable: Some(buffer_postenable),
+    predisable: Some(buffer_predisable),
+    postdisable: None,
+    validate_scan_mask: None,
+};
 
 fn axis_channel(chan_type: u32, modifier: u32, index: i32) -> bindings::iio_chan_spec {
     let mut chan = bindings::iio_chan_spec {
@@ -387,18 +734,51 @@ struct Spec {
     _p: PhantomPinned,
 }
 
-/// The IIO device of a service, with its buffer.
-struct MotionIio {
+/// Owns the IIO device and what it points to.
+///
+/// It is handed to the platform device's resources right after the
+/// allocation. Those are released in reverse order, so the IIO device is
+/// freed after the trigger and the triggered buffer, whose release still
+/// uses it, and after the driver's own data is gone.
+struct IioAlloc {
     dev: *mut bindings::iio_dev,
     _spec: Pin<KBox<Spec>>,
+}
+
+impl Drop for IioAlloc {
+    fn drop(&mut self) {
+        // SAFETY: `self.dev` was allocated in `MotionIio::new()` with an
+        // `Arc<State>` as its private data. `MotionIio` has unregistered it
+        // and the resources registered after this one are released, so
+        // nothing uses either after this.
+        unsafe {
+            drop(Arc::<State>::from_foreign((*self.dev).priv_.cast()));
+            bindings::iio_device_free(self.dev);
+        }
+    }
+}
+
+// SAFETY: The IIO device may be freed from any thread, and the channel
+// table is only read.
+unsafe impl Send for IioAlloc {}
+
+/// The IIO device of a service, with its buffer.
+///
+/// The device itself belongs to the platform device's resources, which are
+/// released after the driver's data; this only takes it out of view again.
+struct MotionIio {
+    dev: *mut bindings::iio_dev,
     registered: bool,
 }
 
 impl MotionIio {
     /// Allocates the device and its buffer; [`MotionIio::register`] makes it
     /// visible.
-    fn new(pdev: &platform::Device<Core<'_>>, kind: &'static Kind) -> Result<(Self, Arc<State>)> {
-        let dev = pdev.as_ref();
+    fn new(
+        dev: &device::Device<Bound>,
+        kind: &'static Kind,
+        control: Arc<Control>,
+    ) -> Result<(Self, Arc<State>)> {
         let spec = KBox::pin(
             Spec {
                 channels: [
@@ -427,6 +807,7 @@ impl MotionIio {
             pin_init!(State {
                 kind,
                 iio: IioPtr(indio_dev),
+                control,
                 sample <- new_spinlock!(Sample::default()),
             }),
             GFP_KERNEL,
@@ -449,9 +830,20 @@ impl MotionIio {
             (*indio_dev).modes = bindings::INDIO_DIRECT_MODE as i32;
             (*indio_dev).available_scan_masks = SCAN_MASKS.as_ptr();
         }
+        // From here the device, its private data and `spec` are freed with
+        // the resources of `dev`, also if this fails. It has to come before
+        // the trigger and the buffer: resources are released in reverse
+        // order, and the release of those two uses the IIO device.
+        devres::register(
+            dev,
+            IioAlloc {
+                dev: indio_dev,
+                _spec: spec,
+            },
+            GFP_KERNEL,
+        )?;
         let this = Self {
             dev: indio_dev,
-            _spec: spec,
             registered: false,
         };
         // The buffer fills as the AOP reports, so the trigger never fires.
@@ -473,9 +865,9 @@ impl MotionIio {
         if trig.is_null() {
             return Err(ENOMEM);
         }
-        // SAFETY: `trig` was allocated above; it is unregistered and freed
-        // with the platform device's resources, after the IIO device that
-        // holds a reference to it.
+        // SAFETY: `trig` was allocated above; it is unregistered with the
+        // platform device's resources, before the IIO device is freed. The
+        // IIO device holds its own reference to it until then.
         let ret = unsafe { bindings::devm_iio_trigger_register(dev.as_raw(), trig) };
         if ret < 0 {
             return Err(Error::from_errno(ret));
@@ -484,10 +876,11 @@ impl MotionIio {
         // here is dropped when the IIO device is released.
         unsafe { (*indio_dev).trig = bindings::iio_trigger_get(trig) };
         // SAFETY: Both devices are valid. The buffer is released with the
-        // platform device's resources; the IIO device holds its own
-        // reference to it until it is freed. The poll function only stamps
-        // the time and completes the trigger; the report listener pushes the
-        // scans.
+        // platform device's resources, before the IIO device, which that
+        // release reads the buffer and the poll function from. The poll
+        // function only stamps the time and completes the trigger; the
+        // report listener pushes the scans. The setup ops start the reports
+        // for the buffer.
         let ret = unsafe {
             bindings::devm_iio_triggered_buffer_setup_ext(
                 dev.as_raw(),
@@ -495,7 +888,7 @@ impl MotionIio {
                 Some(bindings::iio_pollfunc_store_time),
                 Some(motion_trigger_handler),
                 bindings::iio_buffer_direction_IIO_BUFFER_DIRECTION_IN,
-                ptr::null(),
+                &BUFFER_OPS,
                 ptr::null_mut(),
             )
         };
@@ -519,14 +912,11 @@ impl MotionIio {
 
 impl Drop for MotionIio {
     fn drop(&mut self) {
-        // SAFETY: `self.dev` was allocated in `new()` with an `Arc<State>`
-        // as its private data, and nothing uses it after this.
-        unsafe {
-            if self.registered {
-                bindings::iio_device_unregister(self.dev);
-            }
-            drop(Arc::<State>::from_foreign((*self.dev).priv_.cast()));
-            bindings::iio_device_free(self.dev);
+        if self.registered {
+            // SAFETY: `self.dev` was registered by `register()`. It is
+            // freed with the platform device's resources, which outlive
+            // this.
+            unsafe { bindings::iio_device_unregister(self.dev) };
         }
     }
 }
@@ -536,8 +926,9 @@ unsafe impl Send for MotionIio {}
 // SAFETY: See above; `MotionIio` has no methods taking `&self`.
 unsafe impl Sync for MotionIio {}
 
-/// Stops the reports around system sleep, so that the AOP does not wake the
-/// application processor 50 times a second, and starts them again after.
+/// Stops the buffer's reports around system sleep, so that the AOP does not
+/// wake the application processor 50 times a second, and starts them again
+/// after if a buffer still wants them.
 #[repr(C)]
 struct PmHook {
     /// First, so that the callback finds the hook from it.
@@ -559,8 +950,22 @@ unsafe extern "C" fn pm_event(
     // SAFETY: `nb` is the first field of a registered `PmHook`.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
-        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => hook.control.stop(),
-        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.control.start(),
+        bindings::PM_SUSPEND_PREPARE
+        | bindings::PM_HIBERNATION_PREPARE
+        | bindings::PM_RESTORE_PREPARE => hook.control.set_parked(true, false),
+        // On s2idle the AOP core does nothing so calibration stays valid.
+        // Across firmware suspend, the AOP may have reset, so clear
+        // calibration conservatively; firmware that kept it answers packets
+        // 75/76 with STATUS_UNSUPPORTED once on the next start.
+        bindings::PM_POST_SUSPEND => {
+            // SAFETY: Reads the PM core's sleep-transition flag, which stays
+            // set until the next suspend entry.
+            let fw_sleep = unsafe { bindings::pm_suspend_via_firmware() };
+            hook.control.set_parked(false, fw_sleep)
+        }
+        bindings::PM_POST_HIBERNATION | bindings::PM_POST_RESTORE => {
+            hook.control.set_parked(false, true)
+        }
         _ => return bindings::NOTIFY_DONE as c_int,
     };
     if let Err(e) = ret {
@@ -696,12 +1101,15 @@ impl platform::Driver for IIOAopMotionDriver {
         let service = unsafe { *service };
 
         let control = Control::new(dev, aop.clone(), service)?;
-        let (mut iio, state) = MotionIio::new(pdev, kind)?;
+        let (mut iio, state) = MotionIio::new(dev, kind, control.clone())?;
         let listener = FakehidRegistration::new(aop, service, state)?;
         let pm = PmHook::new(control.clone())?;
-        control.start()?;
+        // Check once that the service takes the calibration and the interval,
+        // then leave the reports off until someone reads them.
+        control.probe_init()?;
         if let Err(e) = iio.register() {
-            let _ = control.stop();
+            pm.unregister();
+            let _ = control.shutdown();
             return Err(e);
         }
         Ok(IIOAopMotionDriver {
@@ -714,7 +1122,7 @@ impl platform::Driver for IIOAopMotionDriver {
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.pm.unregister();
-        let _ = this.control.stop();
+        let _ = this.control.shutdown();
         this.listener.unregister();
     }
 }
@@ -725,4 +1133,156 @@ module_platform_driver! {
     description: "AOP accelerometer and gyroscope driver",
     license: "Dual MIT/GPL",
     alias: ["platform:iio_aop_motion"],
+}
+
+#[kunit_tests(iio_aop_motion)]
+mod tests {
+    use super::*;
+    use kernel::{
+        faux,
+        soc::apple::aop::{ReportListener, SourceRing},
+    };
+
+    /// Stands in for the AOP core. The private data of the IIO device holds
+    /// the last reference to it once the test has dropped its own, so it
+    /// goes when that private data is freed, and notes that in `gone`.
+    struct FakeAop {
+        gone: Arc<Atomic<bool>>,
+    }
+
+    impl Drop for FakeAop {
+        fn drop(&mut self) {
+            self.gone.store(true, Relaxed);
+        }
+    }
+
+    impl AOP for FakeAop {
+        fn epic_call(&self, _svc: &EPICService, _subtype: u16, _msg: &[u8]) -> Result<u32> {
+            Ok(0)
+        }
+        fn epic_call_ret(
+            &self,
+            _svc: &EPICService,
+            _subtype: u16,
+            _msg: &[u8],
+            _ret_len: usize,
+        ) -> Result<(u32, KVec<u8>)> {
+            Err(ENODEV)
+        }
+        fn add_fakehid_listener(
+            &self,
+            _svc: EPICService,
+            _listener: Arc<dyn FakehidListener>,
+        ) -> Result<()> {
+            Err(ENODEV)
+        }
+        fn remove_fakehid_listener(&self, _svc: &EPICService) -> bool {
+            false
+        }
+        fn add_report_listener(
+            &self,
+            _svc: EPICService,
+            _subtype: u16,
+            _listener: Arc<dyn ReportListener>,
+        ) -> Result<()> {
+            Err(ENODEV)
+        }
+        fn remove_report_listener(&self, _svc: &EPICService, _subtype: u16) -> bool {
+            false
+        }
+        fn source_ring(
+            &self,
+            _dev: &device::Device<Bound>,
+            _size: usize,
+        ) -> Result<Arc<SourceRing>> {
+            Err(ENODEV)
+        }
+        fn bound_ring(
+            &self,
+            _dev: &device::Device<Bound>,
+            _size: usize,
+            _bind: &mut dyn FnMut(u64, u64) -> Result<()>,
+        ) -> Result<Arc<SourceRing>> {
+            Err(ENODEV)
+        }
+        fn remove(&self) {}
+    }
+
+    /// A device resource registered after the IIO device is set up, so that
+    /// it is released first: it notes whether the IIO device's private data
+    /// was already freed when the release of the resources began.
+    struct ReleaseStart {
+        gone: Arc<Atomic<bool>>,
+        ran: Arc<Atomic<bool>>,
+        gone_before: Arc<Atomic<bool>>,
+    }
+
+    impl Drop for ReleaseStart {
+        fn drop(&mut self) {
+            self.gone_before.store(self.gone.load(Relaxed), Relaxed);
+            self.ran.store(true, Relaxed);
+        }
+    }
+
+    /// The IIO device and its private data stay until the resources of the
+    /// parent device, among them the triggered buffer and the trigger, are
+    /// released; dropping `MotionIio`, as a failed probe and an unbind do
+    /// before that release, does not free them.
+    #[test]
+    fn iio_device_is_freed_with_the_device_resources() -> Result {
+        let gone = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+        let ran = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+        let gone_before = Arc::new(Atomic::new(false), GFP_KERNEL)?;
+
+        let reg = faux::Registration::new(c"iio-aop-motion-kunit", None)?;
+        let fdev: &faux::Device<Bound> = reg.as_ref();
+        let dev: &device::Device<Bound> = fdev.as_ref();
+        let plain: &device::Device = dev;
+        let aop: Arc<dyn AOP> = Arc::new(FakeAop { gone: gone.clone() }, GFP_KERNEL)?;
+        let control = Arc::pin_init(
+            pin_init!(Control {
+                dev: plain.into(),
+                aop,
+                service: EPICService {
+                    channel: 0,
+                    endpoint: 0,
+                },
+                packets: [KVec::new(), KVec::new(), KVec::new()],
+                stream <- new_mutex!(Stream::default()),
+            }),
+            GFP_KERNEL,
+        )?;
+        let (iio, state) = MotionIio::new(dev, &ACCEL, control.clone())?;
+        // The test's own reference keeps the memory of the IIO device valid
+        // whoever drops the allocation's reference, and whenever.
+        let indio_dev = iio.dev;
+        // SAFETY: `indio_dev` was just allocated and is live.
+        unsafe { bindings::get_device(&raw mut (*indio_dev).dev) };
+        let started = devres::register(
+            dev,
+            ReleaseStart {
+                gone: gone.clone(),
+                ran: ran.clone(),
+                gone_before: gone_before.clone(),
+            },
+            GFP_KERNEL,
+        );
+
+        drop(state);
+        drop(control);
+        drop(iio);
+        let gone_after_drop = gone.load(Relaxed);
+        // Unbinds the device, which releases its resources.
+        drop(reg);
+        let gone_after_release = gone.load(Relaxed);
+        // SAFETY: Drops the reference taken above.
+        unsafe { bindings::put_device(&raw mut (*indio_dev).dev) };
+
+        started?;
+        assert!(!gone_after_drop);
+        assert!(ran.load(Relaxed));
+        assert!(!gone_before.load(Relaxed));
+        assert!(gone_after_release);
+        Ok(())
+    }
 }

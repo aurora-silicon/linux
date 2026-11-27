@@ -11,6 +11,7 @@
 
 #include "t6030.dtsi"
 #include "t603x-j514-j516.dtsi"
+#include "t6030-j514s-j516s-audio.dtsi"
 #include "t603x-j514s-j516s-usb4.dtsi"
 #include "t603x-j514s-j516s-hdmi.dtsi"
 
@@ -39,36 +40,6 @@
 
 &bluetooth0 {
 	brcm,board-type = "apple,texa";
-};
-
-&speaker_left_tweet {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
-};
-
-&speaker_left_woof1 {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
-};
-
-&speaker_left_woof2 {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
-};
-
-&speaker_right_tweet {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
-};
-
-&speaker_right_woof1 {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
-};
-
-&speaker_right_woof2 {
-	shutdown-gpios = <&pinctrl_ap 171 GPIO_ACTIVE_HIGH>;
-	interrupts-extended = <&pinctrl_ap 29 IRQ_TYPE_LEVEL_LOW>;
 };
 
 &jack_codec {

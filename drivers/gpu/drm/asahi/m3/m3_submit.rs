@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Bounded M3 compute and graphics submissions through the common DRM scheduler/syncobjs.
 use kernel::{c_str,dma_fence::*,drm::sched,prelude::*,sync::{Arc,Mutex},new_mutex,xarray};
-use crate::{file,m3::agx_uapi,mmu,queue,m3::m3_drm::Shared};
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::{file,m3::agx_uapi,mmu,queue};
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+use crate::m3::m3_drm::Shared;
+use crate::alloc::Allocator as _;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[derive(Default)]
 pub(crate) struct Completion;
 #[vtable]
@@ -10,7 +13,7 @@ impl FenceOps for Completion {
     fn get_driver_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("asahi")}
     fn get_timeline_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("m3-native")}
 }
-pub(crate) struct Destination { mapping: Arc<mmu::KernelMapping>, offset: usize }
+pub(crate) struct Destination { _buffer: Arc<crate::timestamp::Bound>, iova: u64 }
 impl Destination {
     fn resolve(objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamp: agx_uapi::UapiTimestamp) -> Result<Option<Self>> {
@@ -24,11 +27,12 @@ impl Destination {
                 if offset & 7 != 0 || offset.checked_add(8).ok_or(EOVERFLOW)? > mapping.size() {
                     return Err(EINVAL);
                 }
-                Ok(Some(Self { mapping, offset }))
+                let iova = mapping.iova() + offset as u64;
+                Ok(Some(Self { _buffer: buffer.clone(), iova }))
             }
         }
     }
-    fn firmware_address(&self) -> u64 { self.mapping.iova() + self.offset as u64 }
+    fn firmware_address(&self) -> u64 { self.iova }
 }
 
 #[derive(Copy,Clone)]
@@ -44,7 +48,11 @@ pub(crate) struct Packet {
     pub(crate) wide_visibility:KVec<bool>,
     pub(crate) render_attachments:KVec<[crate::m3::agx_attachments::Attachments;2]>,
     completion:UserFence<Completion>,
-    finish_claimed: AtomicBool,
+    finish_state: AtomicU8,
+    /// Set once a terminal fault (`fail_vm == true`) quarantines `vm_job`;
+    /// thereafter `release_guard()` is a no-op so neither `fail_front()` nor
+    /// `withdraw()` can unmap a quarantined VM's pages.
+    guard_pinned: AtomicBool,
     /// Set before a batch with any of this packet's commands can change firmware-visible state,
     /// and never cleared.
     published: AtomicBool,
@@ -53,6 +61,18 @@ pub(crate) struct Packet {
     /// Who submitted the packet, for the failure log only.
     pub(crate) owner:Owner,
     vm_job:Pin<KBox<Mutex<Option<mmu::VmJobGuard>>>>,
+    /// G14 firmware 27.2: the compute preemption buffer in the packet's VM, kept until retirement.
+    pub(crate) preempt:Option<crate::fw::types::GpuArray<u8>>,
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) render_queue: Option<Arc<crate::g14_v27_2_render::QueueRender>>,
+}
+/// The runtime a queue's packets go to: the M3 runtime or the G14 firmware-27.2 compute runtime.
+#[derive(Clone)]
+pub(crate) enum Sink {
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    M3(Shared),
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    G14V27_2(Arc<crate::g14_v27_2::Runtime>),
 }
 /// The process and thread that submitted a packet, recorded in the submit ioctl. Only logged:
 /// a renamed task leaves a stale name, which is harmless.
@@ -62,8 +82,7 @@ impl Owner {
     fn current()->Self {
         let task=kernel::current!();
         let leader=task.group_leader();
-        Self {pid:leader.pid(),process:crate::m3::m3_client::task_comm(leader),
-            thread:crate::m3::m3_client::task_comm(task)}
+        Self {pid:leader.pid(),process:task_comm(leader),thread:task_comm(task)}
     }
     fn name(comm:&[u8;16])->&str {
         let len=comm.iter().position(|&b|b==0).unwrap_or(comm.len());
@@ -71,6 +90,19 @@ impl Owner {
     }
     pub(crate) fn process(&self)->&str {Self::name(&self.process)}
     pub(crate) fn thread(&self)->&str {Self::name(&self.thread)}
+}
+/// The name of `task`, for log lines only.
+pub(crate) fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
+    let mut name = [0u8; 16];
+    // SAFETY: `comm` is a fixed-size array inside the live task. It is read byte by byte with
+    // volatile loads because a concurrent rename may change it; a torn name is only printed.
+    unsafe {
+        let comm = core::ptr::addr_of!((*task.as_ptr()).comm).cast::<u8>();
+        for (i, byte) in name.iter_mut().enumerate() {
+            *byte = comm.add(i).read_volatile();
+        }
+    }
+    name
 }
 impl Packet {
     pub(crate) fn profile_id(&self)->usize {self as *const Self as usize}
@@ -82,24 +114,90 @@ impl Packet {
             self.timestamps[index][stage*2+i].as_ref().map_or(0,Destination::firmware_address)))
     }
     /// Called only after all published commands retired or before any publication.
-    pub(crate) fn release_guard(&self) {drop(self.vm_job.lock().take());}
+    /// Never drops a guard that was pinned by a terminal fault quarantine.
+    pub(crate) fn release_guard(&self) {
+        let mut guard_slot = self.vm_job.lock();
+        if self.guard_pinned.load(Ordering::Acquire) {
+            return;
+        }
+        drop(guard_slot.take());
+    }
     /// Called before the first firmware-visible change of a batch that includes this packet.
     pub(crate) fn mark_published(&self) {self.published.store(true,Ordering::Relaxed);}
     /// Whether the firmware may have seen any of this packet's commands.
     pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}
     pub(crate) fn finish(&self,result:Result) {
+        self.complete(result, true);
+    }
+    /// Fail the fence without making a packet rejection or cancellation a VM error.
+    /// Terminal device-loss errors still record on `VmStatus`.
+    /// A published prefix still owns its mappings until the runtime retires it.
+    pub(crate) fn fail_packet(&self,error:Error) {
+        self.complete(Err(error), false);
+    }
+    fn complete(&self,result:Result,fail_vm:bool) {
+        const PENDING: u8 = 0;
+        const PACKET_FAILED: u8 = 1;
+        const TERMINAL: u8 = 2;
         // Retirement, cancellation and a queued scheduler timeout can race.
-        // Claim error/signal ownership once; this flag is NOT proof that the
-        // fence is signaled or that hardware DMA has stopped.
-        if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
+        // Claim fence error/signal ownership once while still allowing a later
+        // terminal GPU fault (`fail_vm == true`) on a published prefix to record
+        // on `VmStatus` after an earlier `fail_packet()`.
+        let record_vm = |e: Error| {
+            if let Some(status) = self.vm.status() {
+                if fail_vm {
+                    status.record(e);
+                } else {
+                    status.record_if_device_loss(e);
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                if self.finish_state.swap(TERMINAL, Ordering::AcqRel) != PENDING {
+                    return;
+                }
+            }
+            Err(e) if fail_vm => match self.finish_state.swap(TERMINAL, Ordering::AcqRel) {
+                PENDING => {}
+                PACKET_FAILED => {
+                    let guard_slot = self.vm_job.lock();
+                    if let Some(guard) = guard_slot.as_ref() {
+                        self.guard_pinned.store(true, Ordering::Release);
+                        guard.quarantine();
+                    }
+                    drop(guard_slot);
+                    record_vm(e);
+                    return;
+                }
+                _ => return,
+            },
+            Err(_) => {
+                if self
+                    .finish_state
+                    .compare_exchange(PENDING, PACKET_FAILED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
         if let Err(e)=result {
             // A guard still held here belongs to work the firmware may still run: block
             // mapping changes before the error fence is visible (as G15 does), so userspace
-            // can't unmap memory under it. It stays with the packet until the runtime drops
-            // the packet, after the firmware has provably stopped.
-            if let Some(guard)=self.vm_job.lock().as_ref() {guard.quarantine();}
-            if let Some(status) = self.vm.status() { status.record(e); }
+            // can't unmap memory under it. Terminal faults (`fail_vm`) also pin the guard
+            // against later `release_guard()` calls so it stays with the packet until the
+            // runtime drops it after the firmware has provably stopped.
+            let guard_slot = self.vm_job.lock();
+            if let Some(guard) = guard_slot.as_ref() {
+                if fail_vm {
+                    self.guard_pinned.store(true, Ordering::Release);
+                }
+                guard.quarantine();
+            }
+            drop(guard_slot);
+            record_vm(e);
             self.completion.set_error(e);
         }
         // A scheduler job/fence and the runtime's last packet can outlive
@@ -107,9 +205,12 @@ impl Packet {
         // nonzero: GEM closes otherwise accumulate across completed frames.
         // Signalling an error is not retirement.
         crate::m3::agx_memory::publish();
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
         let profile=crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming);
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
         let before=if profile {crate::m3::m3_runtime::physical_counter()} else {0};
         self.completion.signal();
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
         if profile {
             let after=crate::m3::m3_runtime::physical_counter();
             let status=match result {Ok(())=>0,Err(e)=>e.to_errno()};
@@ -118,9 +219,9 @@ impl Packet {
         }
     }
 }
-pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}
+pub(crate) struct Job {shared:Sink,packet:Arc<Packet>}
 /// Timeout state of a [`Job`], owned by the scheduler's timeout worker.
-pub(crate) struct JobTimeout {shared:Shared,packet:Arc<Packet>}
+pub(crate) struct JobTimeout {shared:Sink,packet:Arc<Packet>}
 impl sched::JobImpl for Job {
     type TimeoutData = JobTimeout;
     fn timeout_data(&self)->JobTimeout {
@@ -129,21 +230,55 @@ impl sched::JobImpl for Job {
     fn run(job:&mut Self)->Result<Option<Fence>> {
         // Queue the packet and return its fence; the completion worker publishes and retires
         // it, so the scheduler can hand over further ready jobs meanwhile.
-        if let Err(e)=crate::m3::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
+        let submitted=match &job.shared {
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            Sink::M3(shared)=>crate::m3::m3_runtime::Runtime::submit(shared,job.packet.clone()),
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            Sink::G14V27_2(runtime)=>runtime.submit(job.packet.clone()),
+        };
+        if let Err(e)=submitted {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
             // submit() failed before this packet could be published.
-            job.packet.release_guard();job.packet.finish(Err(e));
+            job.packet.release_guard();job.packet.fail_packet(e);
         }
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
     fn timed_out(job:&mut JobTimeout,_finished:bool)->sched::Status {
+        match job.shared.clone() {
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            Sink::M3(shared)=>Self::timed_out_m3(shared,job),
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            Sink::G14V27_2(runtime)=>{
+                // The runtime's own command timeout fails a hung GPU; a healthy one is late.
+                // Run its service once, so a hang is found without a notification.
+                runtime.wake();
+                if runtime.healthy() {return sched::Status::NoHang;}
+                runtime.withdraw(&job.packet);
+                job.packet.finish(Err(EIO));
+                sched::Status::NoDevice
+            }
+        }
+    }
+    fn cancel(job:&mut Self) {
+        match &job.shared {
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            Sink::M3(shared)=>{crate::m3::m3_runtime::Runtime::withdraw(shared,&job.packet);}
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            Sink::G14V27_2(runtime)=>runtime.withdraw(&job.packet),
+        }
+        job.packet.fail_packet(ECANCELED);
+    }
+}
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+impl Job {
+    fn timed_out_m3(shared:Shared,job:&mut JobTimeout)->sched::Status {
         // Retain the publishing branch's explicit diagnostic override.
         if !crate::m3::m3_params::timeout_nohang() {
-            if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
-            crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+            if let Some(r)=Option::as_mut(&mut *shared.lock()) {r.health().mark_failed();}
+            crate::m3::m3_runtime::Runtime::withdraw(&shared,&job.packet);
             job.packet.finish(Err(ETIMEDOUT));return sched::Status::NoDevice;
         }
-        let guard=job.shared.lock();
+        let guard=shared.lock();
         let Some(runtime)=guard.as_ref() else {
             job.packet.finish(Err(ENODEV));
             return sched::Status::NoDevice;
@@ -154,13 +289,9 @@ impl sched::JobImpl for Job {
         // device loss or corrupting an already signaled fence.
         if runtime.health().healthy() { return sched::Status::NoHang; }
         drop(guard);
-        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
+        crate::m3::m3_runtime::Runtime::withdraw(&shared,&job.packet);
         job.packet.finish(Err(EIO));
         sched::Status::NoDevice
-    }
-    fn cancel(job:&mut Self) {
-        crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
-        job.packet.finish(Err(ECANCELED));
     }
 }
 struct AddressSpace<'a>(&'a mmu::Vm);
@@ -175,13 +306,27 @@ impl agx_uapi::GpuAddressSpace for AddressSpace<'_> {
 }
 pub(crate) struct Queue {
     entity:sched::Entity<Job>,_scheduler:Arc<sched::Scheduler<Job>>,
-    shared:Shared,vm:mmu::Vm,usc:u64,fences:FenceContexts,
+    shared:Sink,vm:mmu::Vm,usc:u64,fences:FenceContexts,
+    /// G14 firmware 27.2: the VM's private allocator and the size of the per-packet
+    /// preemption buffer it provides.
+    preempt_alloc:Option<(Arc<Mutex<crate::alloc::DefaultAllocator>>,usize)>,
     /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    render_queue: Option<Arc<crate::g14_v27_2_render::QueueRender>>,
     early_tiling:bool,
     wide_visibility:bool,
+    /// Whether this queue's render command builder encodes depth and stencil compression
+    /// for every sample count and layer count. Otherwise only the single-sample,
+    /// single-layer compressed depth layout is admitted.
+    zls_compression_all_layouts:bool,
+    /// Whether this queue's command builders encode the render and compute sampler heaps and
+    /// helper programs, in the 13.5 places. Otherwise they are refused: the M3 26.x commands
+    /// stream their sampler state and carry no helper.
+    samplers_and_helpers:bool,
     urgency:u8,
 }
 impl Queue {
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
     pub(crate) fn new(shared:Shared,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
         early_tiling:bool, wide_visibility:bool)->Result<Self> {
         agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
@@ -190,18 +335,51 @@ impl Queue {
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
-            shared,vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,urgency})
+            shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
+            early_tiling,wide_visibility,zls_compression_all_layouts:false,samplers_and_helpers:false,urgency,preempt_alloc:None,
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            render_queue: None})
+    }
+    /// A G14 firmware-27.2 compute queue: the same front end, published by that runtime.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn new_g14_v27_2(runtime:Arc<crate::g14_v27_2::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
+        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>,preempt_bytes:usize,
+        render_queue: Arc<crate::g14_v27_2_render::QueueRender>)->Result<Self> {
+        agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
+        let urgency=3u8.saturating_sub(priority.min(3) as u8);
+        let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
+            1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
+        Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
+            shared:Sink::G14V27_2(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_g14_queue"),kernel::static_lock_class!())?,
+            early_tiling:false,wide_visibility:false,
+            // The G14 render command carries the depth and stencil load, store and partial
+            // compression words in every layout (g14_v27_2_render.rs).
+            zls_compression_all_layouts:true,
+            // Its render commands carry the sampler heap and both helper programs, and its
+            // compute command the 13.5 compute JobParameters1 with the helper and the sampler
+            // heap words the firmware loads for every command type (g14_v27_2_render.rs,
+            // g14_v27_2_abi.rs, gpu/v27_2.rs).
+            samplers_and_helpers:true,
+            urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
+            render_queue: Some(render_queue)})
     }
 }
 impl queue::Queue for Queue {
-    fn submit(&mut self,_reg_data:&crate::driver::AsahiRegData<'_>,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
-        raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
+    fn submit(
+        &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
+        _id: u64,
+        mut syncs: KVVec<file::SyncItem>,
+        in_sync_count: usize,
+        raw: &[u8],
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
-                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
+                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling,
+                    self.zls_compression_all_layouts,self.samplers_and_helpers) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
@@ -221,7 +399,7 @@ impl queue::Queue for Queue {
             // Other engines and helpers need their own M3 firmware translation.
             let wide=kernel::uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_WIDE_VISIBILITY as u32;
             if payload.flags & !wide !=0 || (!self.wide_visibility && payload.flags & wide != 0)
-                || payload.sampler_count!=0 || payload.sampler_heap!=0 {
+                || (!self.samplers_and_helpers && (payload.sampler_count!=0 || payload.sampler_heap!=0)) {
                 pr_err!("M3 compute rejected: flags={:#x} samplers={} heap={:#x} attachments={} timestamps={}/{}\n",payload.flags,payload.sampler_count,payload.sampler_heap,attachments.as_slice().len(),payload.timestamps.start.handle,payload.timestamps.end.handle);
                 return Err(ENOTSUPP);
             }
@@ -229,23 +407,48 @@ impl queue::Queue for Queue {
             // The common translator validates the original command/attachment
             // addresses; this M3 scheduling hint changes none of them.
             payload.flags &= !wide;
+            // The common translator refuses helpers; a queue that encodes one validates and
+            // takes it here.
+            let empty=agx_uapi::UapiHelperProgram{binary:0,config:0,data:0};
+            let helper=if self.samplers_and_helpers {
+                agx_uapi::validate_helper(agx_uapi::QueueUscWindow{base:self.usc,user_start:0x4000,user_end:(1u64<<42)-0x8000},
+                    &AddressSpace(&self.vm),payload.helper).map_err(|e| {
+                        pr_err!("M3 compute helper rejected {:?}: helper={:?}\n",e,payload.helper);
+                        EINVAL
+                    })?;
+                core::mem::replace(&mut payload.helper,empty)
+            } else {empty};
             render_attachments.push([crate::m3::agx_attachments::Attachments::EMPTY;2],GFP_KERNEL)?;
             flushes.push(encode_attachments(&self.vm,&attachments)?,GFP_KERNEL)?;
             let c=agx_uapi::translate_compute_command(payload,attachments,
                 agx_uapi::QueueUscWindow{base:self.usc,user_start:0x4000,user_end:(1u64<<42)-0x8000},
                 &AddressSpace(&self.vm)).map_err(|e| {
-                    pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper);
+                    pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?} samplers={} heap={:#x}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper,payload.sampler_count,payload.sampler_heap);
                     EINVAL
                 })?;
-            crate::m3::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
+            // The launch check decodes the 26.x G15 CDM launch format; G14 streams differ.
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            if self.preempt_alloc.is_none() {
+                crate::m3::m3_client::check_compute_launches(&self.vm,&AddressSpace(&self.vm),c.control_stream_base,c.control_stream_end)?;
+            }
             timestamps.push([Destination::resolve(objects,payload.timestamps.start)?,
                 Destination::resolve(objects,payload.timestamps.end)?,None,None],GFP_KERNEL)?;
-            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc}),GFP_KERNEL)?;
+            // The translator checked the heap: at most 1024 samplers, both fields set or both zero,
+            // 8-byte aligned and readable in this VM. Only a queue that encodes it admits one.
+            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc,helper,
+                sampler_heap:c.sampler_heap,sampler_count:c.sampler_count}),GFP_KERNEL)?;
         }
         parser.finish().map_err(|_|EINVAL)?;
-        let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
+        let preempt=match &self.preempt_alloc {
+            Some((alloc,bytes)) if commands.iter().any(|c| matches!(c, Command::Compute(_))) =>
+                Some(alloc.lock().array_empty::<u8>(*bytes)?),
+            _ => None,
+        };
+        let packet=Arc::new(Packet{preempt,
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            render_queue: self.render_queue.clone(),vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
+            finish_state:AtomicU8::new(0),guard_pinned:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}
@@ -277,20 +480,24 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
 }
 
 fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,
-    early_tiling: bool) -> Result {
+    early_tiling: bool, zls_compression_all_layouts: bool, samplers_and_helpers: bool) -> Result {
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
     // Early tiling (render flag bit 5) only where it is advertised.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
     let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
+    #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
+    let stage_scope = { let _ = early_tiling; 0 };
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
-        || r.sampler_count != 0 || r.sampler_heap != 0
-        || r.vertex_helper != empty || r.fragment_helper != empty
-        || r.stencil.compression_base != 0 || r.stencil.compression_stride != 0
+        || (!samplers_and_helpers && (r.sampler_count != 0 || r.sampler_heap != 0
+            || r.vertex_helper != empty || r.fragment_helper != empty))
+        || (!zls_compression_all_layouts
+            && (r.stencil.compression_base != 0 || r.stencil.compression_stride != 0))
         || r.ppp_control & !0x203 != 0 { return Err(ENOTSUPP); }
     // Native 26A428 descriptors witness the ZLS metadata registers and mirrors
     // for single-sample, single-layer depth. Keep other layouts unqualified.
-    if (r.depth.compression_base != 0 || r.stencil.compression_base != 0)
+    if !zls_compression_all_layouts && (r.depth.compression_base != 0 || r.stencil.compression_base != 0)
         && (r.samples != 1 || r.layers != 1) {return Err(ENOTSUPP);}
     // sample_size describes color tilebuffer storage. Depth/stencil-only
     // passes legitimately require zero bytes of color storage.
@@ -299,6 +506,7 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
         || u32::from(r.sample_size)*u32::from(r.utile_width)*u32::from(r.utile_height)*u32::from(r.samples)>32768 {
         return Err(EINVAL);
     }
+    agx_uapi::validate_sampler(space, r.sampler_heap, r.sampler_count.into()).map_err(|_| EINVAL)?;
     crate::m3::agx_render_state::compact(r.vdm_base).map_err(|_| EINVAL)?;
     if r.vdm_base & 3 != 0 || !space.covers(r.vdm_base,4,GpuAccess::Read)
         || r.scissor_base == 0 || r.scissor_base & 7 != 0 || !space.covers(r.scissor_base,8,GpuAccess::Read) {
@@ -312,6 +520,10 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     for p in [r.background,r.end_of_tile,r.partial_background,r.partial_end_of_tile] {
         window.full_program(space,p.usc).map_err(|_| EINVAL)?;
         if !space.covers(usc+u64::from(p.usc & !63),64,GpuAccess::Read) { return Err(EINVAL); }
+    }
+    // Only a queue that encodes helpers gets here with one (refused above otherwise).
+    for helper in [r.vertex_helper,r.fragment_helper] {
+        agx_uapi::validate_helper(window,space,helper).map_err(|_| EINVAL)?;
     }
     Ok(())
 }

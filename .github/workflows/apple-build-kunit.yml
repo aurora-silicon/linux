@@ -1,0 +1,196 @@
+name: Apple build and KUnit
+
+# Compiles every Apple driver directory with the configuration a Mac runs
+# (arm64 defconfig plus asahi.config, LLVM=1 and Rust), and runs each Apple
+# KUnit suite on arm64 QEMU. The suites use synthetic devices and stubbed
+# firmware, so no Apple hardware is needed. Suites that have their own
+# workflow are not repeated here: sep.kunitconfig (sep-source.yml),
+# mt7932.kunitconfig (mt7932-kunit.yml), display.kunitconfig
+# (apple-drm-kunit.yml) and .kunitconfig.pmgr-pwrstate
+# (pmgr-pwrstate-kunit.yml).
+
+on:
+  pull_request:
+    branches: [main, integration/aurora, aurora-wip]
+    paths:
+      - 'arch/arm64/configs/**'
+      - 'drivers/accel/ane/**'
+      - 'drivers/gpu/drm/apple/**'
+      - 'drivers/gpu/drm/asahi/**'
+      - 'drivers/hid/spi-hid/**'
+      - 'drivers/iommu/**'
+      - 'drivers/media/platform/apple/**'
+      - 'drivers/mfd/**'
+      - 'drivers/net/wireless/apple/**'
+      - 'drivers/nvme/host/**'
+      - 'drivers/nvmem/**'
+      - 'drivers/pci/controller/**'
+      - 'drivers/power/**'
+      - 'drivers/soc/apple/**'
+      - 'drivers/thunderbolt/**'
+      - 'fs/splice.c'
+      - 'include/**'
+      - 'kernel/sys.c'
+      - 'mm/**'
+      - 'rust/**'
+      - 'security/keys/**'
+      - 'tools/testing/selftests/drivers/ane/**'
+      - '**/Kconfig*'
+      - '**/Makefile'
+      - '.github/workflows/apple-build-kunit.yml'
+  # Same paths as pull_request, so an unrelated merge does not start the jobs.
+  push:
+    branches: [main, integration/aurora]
+    paths:
+      - 'arch/arm64/configs/**'
+      - 'drivers/accel/ane/**'
+      - 'drivers/gpu/drm/apple/**'
+      - 'drivers/gpu/drm/asahi/**'
+      - 'drivers/hid/spi-hid/**'
+      - 'drivers/iommu/**'
+      - 'drivers/media/platform/apple/**'
+      - 'drivers/mfd/**'
+      - 'drivers/net/wireless/apple/**'
+      - 'drivers/nvme/host/**'
+      - 'drivers/nvmem/**'
+      - 'drivers/pci/controller/**'
+      - 'drivers/power/**'
+      - 'drivers/soc/apple/**'
+      - 'drivers/thunderbolt/**'
+      - 'fs/splice.c'
+      - 'include/**'
+      - 'kernel/sys.c'
+      - 'mm/**'
+      - 'rust/**'
+      - 'security/keys/**'
+      - 'tools/testing/selftests/drivers/ane/**'
+      - '**/Kconfig*'
+      - '**/Makefile'
+      - '.github/workflows/apple-build-kunit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-build-kunit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: '1.96.0'
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+
+jobs:
+  apple-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build dependencies
+        run: |
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rust-src --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+      - name: Prepare the layout-corrected bindgen
+        run: python3 tools/aurora-bindgen/build.py
+      - name: Configure as a Mac runs it
+        run: |
+          make LLVM=1 ARCH=arm64 rustavailable
+          make LLVM=1 ARCH=arm64 defconfig
+          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/asahi.config
+          make LLVM=1 ARCH=arm64 olddefconfig
+          # A driver that drops out of the configuration would build nothing and pass.
+          for opt in RUST=y DRM_ASAHI=m DRM_APPLE=m DRM_ACCEL_ANE=m VIDEO_APPLE_AVD=m \
+                     NVME_APPLE=m APPLE_DART=y PCIE_APPLE=y USB4=m USB4_APPLE_SOC=m \
+                     SPI_HID_APPLE_OF=m MFD_MACSMC=y MACSMC_POWER=m POWER_RESET_MACSMC=m \
+                     APPLE_SEP=m KSM=y MM_SUBPAGE=y APPLE_CENTAURI_T6050_WIFI=y; do
+            grep -qx "CONFIG_$opt" .config || { echo "::error::CONFIG_$opt is not set"; exit 1; }
+          done
+      - name: Compile the Apple drivers
+        run: |
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 modules_prepare
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+            drivers/accel/ane/ \
+            drivers/gpu/drm/apple/ \
+            drivers/gpu/drm/asahi/ \
+            drivers/hid/spi-hid/ \
+            drivers/iommu/ \
+            drivers/media/platform/apple/ \
+            drivers/mfd/ \
+            drivers/net/wireless/apple/ \
+            drivers/nvme/host/ \
+            drivers/nvmem/ \
+            drivers/pci/controller/ \
+            drivers/power/ \
+            drivers/soc/apple/ \
+            drivers/thunderbolt/ \
+            fs/splice.o kernel/sys.o mm/ksm.o mm/madvise.o mm/vma_exec.o
+
+  kunit:
+    name: KUnit ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          # boot.kunitconfig runs the same ANE suites as transport.kunitconfig.
+          # It also sets UBSAN_SHIFT, and KASAN_INLINE is the default, so it
+          # covers both.
+          - { suite: ane-boot, kunitconfig: drivers/accel/ane/boot.kunitconfig }
+          - { suite: ane-pm, kunitconfig: tools/testing/selftests/drivers/ane/pm.kunitconfig }
+          - { suite: dcp-fabric, kunitconfig: drivers/gpu/drm/apple/tests/.kunitconfig }
+          - { suite: dcp-topology, kunitconfig: drivers/gpu/drm/apple/tests/topology.kunitconfig }
+          - { suite: asahi, kunitconfig: drivers/gpu/drm/asahi/.kunitconfig, rust: true }
+          - { suite: spi-hid-apple, kunitconfig: drivers/hid/spi-hid/.kunitconfig }
+          # avd-pm.kunitconfig runs the same AVD suites. PM_SLEEP, which it
+          # adds, is already on by default on arm64.
+          - { suite: avd, kunitconfig: drivers/media/platform/apple/avd/tests/.kunitconfig }
+          - { suite: ave, kunitconfig: drivers/media/platform/apple/ave/.kunitconfig }
+          - { suite: isp, kunitconfig: drivers/media/platform/apple/isp/.kunitconfig }
+          - { suite: jpeg, kunitconfig: drivers/media/platform/apple/jpeg/.kunitconfig }
+          - { suite: prores, kunitconfig: drivers/media/platform/apple/prores/.kunitconfig }
+          - { suite: scaler, kunitconfig: drivers/media/platform/apple/scaler/.kunitconfig }
+          - { suite: macsmc, kunitconfig: drivers/mfd/macsmc.kunitconfig }
+          - { suite: clpc, kunitconfig: drivers/soc/apple/clpc.kunitconfig }
+          - { suite: apple-spmi-nvmem, kunitconfig: drivers/nvmem/apple-spmi-nvmem.kunitconfig }
+          - { suite: trusted-keys, kunitconfig: security/keys/trusted-keys/tests/.kunitconfig }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          # As sep-source.yml: avoid the hosted runner's Azure mirror.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl qemu-system-arm
+      - name: Pin the Rust toolchain and prepare bindgen
+        if: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rust-src --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+          python3 tools/aurora-bindgen/build.py
+      - name: Run ${{ matrix.kunitconfig }} on arm64 QEMU
+        env:
+          KUNITCONFIG: ${{ matrix.kunitconfig }}
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --make_options LLVM=1 \
+            --kunitconfig="$KUNITCONFIG" \
+            --jobs="$(nproc)" --timeout=900

@@ -179,6 +179,27 @@
 	status = "okay";
 };
 
+&sleep {
+	status = "okay";
+};
+
+/* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
+&smc {
+	apple,wake-reasons = <0 8 9 11 12 21 40 41 42 43 44 45 48>;
+	apple,wake-reason-names = "pwrbtn", "lid", "charger", "codec", "wifibt",
+				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
+				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+};
+
+/* The port controllers' system power state: S3 before a firmware-driven sleep, S0 after it */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
 &aop_audio {
 	apple,chassis-name = "J313";
 	apple,machine-kind = "MacBook Air";

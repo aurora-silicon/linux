@@ -7,6 +7,112 @@ from common import block
 import rate
 
 
+def indicator_dpms(root):
+    source = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#define SWAP_SURFACES 4
+#define BIT(i) (1U << (i))
+#define IOMFB_SET_BACKGROUND BIT(31)
+#define lockdep_assert_held(lock) ((void)(lock))
+#define scoped_guard(kind, lock) for (int once = ((void)(lock), 1); once; once = 0)
+struct drm_framebuffer { unsigned int refs; };
+struct dcp_swap_submit_req_h17p {
+    struct {
+        unsigned int swap_enabled, swap_completed, bg_color;
+        unsigned int src_rect[4], dst_rect[4], surf_ids[4], surf_flags[4], surf_unk[4];
+    } swap;
+    unsigned int surf[4], surf_iova[4];
+    bool surf_null[4];
+};
+struct iomfb_scanout_h17p {
+    struct drm_framebuffer *fb[4];
+    struct dcp_swap_submit_req_h17p request;
+};
+struct apple_dcp {
+    struct dcp_camera_indicator {
+        bool has_surf;
+        unsigned int surf;
+        int lock;
+        struct { bool wanted; } state;
+    } camera_ind;
+    struct { struct dcp_swap_submit_req_h17p h17p; } swap;
+    struct { int lock; struct iomfb_scanout_h17p *scanout, *next_scanout; } iomfb;
+};
+static void drm_framebuffer_put(struct drm_framebuffer *fb)
+{
+    assert(fb->refs);
+    fb->refs--;
+}
+static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout)
+{
+    if (scanout)
+        for (unsigned int i = 0; i < SWAP_SURFACES; ++i)
+            if (scanout->fb[i])
+                drm_framebuffer_put(scanout->fb[i]);
+}
+static struct drm_framebuffer *confirmed;
+static void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *fb)
+{
+    assert(dcp->camera_ind.has_surf);
+    confirmed = fb;
+}
+''' + '\n'.join(block(source, name) for name in (
+    'static void iomfb_null_surface_h17p(',
+    'void iomfb_prepare_indicator_h17p(',
+    'static void iomfb_retire_indicator_h17p(',
+    'void iomfb_scanout_complete_h17p(',
+)) + r'''
+int main(void)
+{
+    struct drm_framebuffer desktop = { 1 }, dot = { 2 };
+    struct iomfb_scanout_h17p old = { .fb = { [3] = &dot } };
+    struct iomfb_scanout_h17p next = { .fb = { [0] = &desktop, [3] = &dot } };
+    struct apple_dcp dcp = {
+        .camera_ind = { .has_surf = true, .surf = 3 },
+        .iomfb = { .scanout = &old, .next_scanout = &next },
+        .swap.h17p = {
+            .swap.swap_enabled = BIT(0),
+            .swap.swap_completed = BIT(0),
+            .surf_null = { false, true, true, true },
+        },
+    };
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(dcp.swap.h17p.swap.swap_enabled == (BIT(0) | BIT(3)));
+    assert(dcp.swap.h17p.swap.swap_completed == dcp.swap.h17p.swap.swap_enabled);
+    assert(old.fb[3] == &dot && dot.refs == 2);
+    confirmed = &dot;
+    iomfb_scanout_complete_h17p(&dcp);
+    assert(dcp.iomfb.scanout == &next && !dcp.iomfb.next_scanout);
+    assert(!next.fb[3] && !dot.refs && !confirmed);
+    assert(next.request.surf_null[3] && !(next.request.swap.swap_enabled & BIT(3)));
+    assert(next.fb[0] == &desktop && desktop.refs == 1);
+    assert(next.request.swap.swap_enabled == BIT(0));
+
+    /* A brightness or wake replay shares the retained scanout, with no next one. */
+    dot.refs = 1;
+    next.fb[3] = &dot;
+    next.request.surf_null[3] = false;
+    next.request.surf_iova[3] = 42;
+    next.request.swap.swap_enabled |= BIT(3);
+    dcp.swap.h17p = next.request;
+    dcp.camera_ind.state.wanted = true;
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(!dcp.swap.h17p.surf_null[3] && dcp.swap.h17p.surf_iova[3] == 42);
+    dcp.camera_ind.state.wanted = false;
+    iomfb_prepare_indicator_h17p(&dcp);
+    assert(dcp.swap.h17p.surf_null[3] && !dcp.swap.h17p.surf_iova[3]);
+    assert(next.fb[3] == &dot && dot.refs == 1);
+    iomfb_retire_indicator_h17p(&dcp, &next);
+    assert(!next.fb[3] && !dot.refs && !next.request.surf_iova[3]);
+    assert(next.request.surf_null[3] && next.request.swap.swap_enabled == BIT(0));
+    return 0;
+}
+'''
+
+
 def backlight(root):
     header = (root / 'drivers/gpu/drm/apple/dcp_backlight.h').read_text()
     header = '\n'.join(line for line in header.splitlines()
@@ -92,9 +198,93 @@ int main(void)
     assert(!dcp_bl_dpms(&s,false) && dcp_bl_effective(&s)==0);
     assert(!dcp_bl_dpms(&s,true) && dcp_bl_effective(&s)==450);
     assert(!dcp_bl_resend(&s));
+    /*
+     * DAC firmware: the report stays 0 after a display power cycle while the
+     * panel is lit again (J414s, 13.5). Boot and resume end at the same level.
+     */
+    {
+        struct dcp_bl_presented boot={0}, resume={0};
+        assert(dcp_bl_presented_actual(&boot,140)==140);
+        dcp_bl_presented_set(&boot,500);
+        dcp_bl_presented_set(&boot,0);
+        assert(dcp_bl_presented_actual(&boot,0)==0);
+        dcp_bl_presented_set(&boot,500);
+        assert(dcp_bl_presented_actual(&boot,0)==500);
+        dcp_bl_presented_set(&resume,500);
+        dcp_bl_presented_set(&resume,0);
+        dcp_bl_presented_set(&resume,0);
+        assert(dcp_bl_presented_actual(&resume,0)==0);
+        dcp_bl_presented_set(&resume,500);
+        assert(dcp_bl_presented_actual(&resume,500)==dcp_bl_presented_actual(&boot,0));
+    }
     return 0;
 }
 '''
+
+
+
+def dac_words(root):
+    """The production DAC tables, interpolate() and calculate_dac() at every level."""
+    import re
+    source = (root / 'drivers/gpu/drm/apple/dcp_backlight.c').read_text()
+    defines = '\n'.join(re.findall(r'^#define (?:MIN|MAX)_BRIGHTNESS_PART[12]\s.*$', source, re.M))
+    tables = '\n'.join(re.findall(r'^static u32 brightness_part[0-9]+\[\] = \{.*?\};', source, re.M | re.S))
+    functions = '\n'.join(block(source, marker) for marker in (
+        'static u32 interpolate(', 'static u32 calculate_dac('))
+    return r"""
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define WARN(c, ...) (c)
+#define SCALE_FACTOR (1 << 10)
+struct apple_dcp;
+""" + defines + '\n' + tables + '\n' + functions + r"""
+/* Every word is two 16-bit DAC halves, each a table value times 16. */
+static void check_word(u32 word, u32 *hi, u32 *lo)
+{
+    *hi = word >> 16;
+    *lo = word & 0xffff;
+    assert(!(*hi & 0xf) && !(*lo & 0xf));
+    assert(*hi <= 0x7ff0 && *lo <= *hi);
+}
+/* The widest gap between a table word's two halves, times 16. */
+static u32 widest(const u32 *tbl, size_t n, u32 gap)
+{
+    for (size_t i = 0; i < n; i++)
+        if (16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff)) > gap)
+            gap = 16 * ((tbl[i] >> 16) - (tbl[i] & 0xffff));
+    return gap;
+}
+int main(void)
+{
+    u32 prev_hi = 0, prev_lo = 0, hi, lo, gap;
+    gap = widest(brightness_part1, ARRAY_SIZE(brightness_part1), 0);
+    gap = widest(brightness_part12, ARRAY_SIZE(brightness_part12), gap);
+    gap = widest(brightness_part2, ARRAY_SIZE(brightness_part2), gap);
+    /* The table points themselves, as before. */
+    assert(calculate_dac(NULL, 2) == 0);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART1) == 16 * brightness_part1[ARRAY_SIZE(brightness_part1) - 1]);
+    assert(calculate_dac(NULL, MIN_BRIGHTNESS_PART2) == 16 * brightness_part2[0]);
+    assert(calculate_dac(NULL, MAX_BRIGHTNESS_PART2) == 16 * brightness_part2[ARRAY_SIZE(brightness_part2) - 1]);
+    for (int nits = 0; nits <= (int)MAX_BRIGHTNESS_PART2; nits++) {
+        check_word(calculate_dac(NULL, nits), &hi, &lo);
+        /* Both halves rise with the level; neither picks up the other's fraction. */
+        assert(hi >= prev_hi && lo >= prev_lo);
+        /* The lower half stays the half step below, as in the table. */
+        assert(hi - lo <= gap);
+        prev_hi = hi;
+        prev_lo = lo;
+    }
+    /* 370 nits (J313): the lower half was 0x10a0, a 4 to 5 nit value. */
+    check_word(calculate_dac(NULL, 370), &hi, &lo);
+    assert(hi > 0x7800 && lo > 0x7800);
+    return 0;
+}
+"""
 
 
 def modes(root):
@@ -285,7 +475,7 @@ static unsigned long jiffies;
 struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
-    int fw_compat;bool vrr_enabled,typec;
+    int fw_compat;bool vrr_enabled,typec,panel;
     struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
@@ -304,12 +494,13 @@ static void dcp_mode_invalidate(__typeof__(((struct apple_dcp *)0)->mode_state) 
 static void dcp_drm_crtc_vblank(void *c) {vblanks++;}
 static void dcp_queue_hotplug(void *c) {hotplugs++;}
 static bool dcp_is_typec_output(struct apple_dcp *d) {return d->typec;}
+static bool dcp_has_panel(struct apple_dcp *d) {return d->panel;}
 static void mod_delayed_work(void *q,struct delayed_work *w,unsigned long delay)
 {assert(delay==1000);scheduled++;}
 static void cancel_delayed_work(struct delayed_work *w) {cancelled++;}
 ''' + definitions + '\n' + helpers + '\n' + production + r'''
 int main(void) {
-    struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.mode_state={true},.connector=(void *)1};
+    struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.panel=true,.mode_state={true},.connector=(void *)1};
     __typeof__(*d.desktop) state={.present_id=42,.present_pending=true};d.desktop=&state;
     dcp_swap_watchdog_arm(&d);assert(scheduled==1 && d.swap_watchdog_deadline==1000);
     jiffies=999;dcp_swap_watchdog(&d.swap_watchdog_wq.work);
@@ -345,6 +536,11 @@ int main(void) {
     jiffies=d.swap_watchdog_deadline;unsigned hp=hotplugs;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);
     assert(!state.takeover_adopted && !state.mode_live && !d.mode_state.valid && hotplugs==hp+1);
+    /* Any external pipe is watched, not only Type-C: a fixed HDMI port
+     * (no panel, no Type-C route, no watched desktop swap) arms too. */
+    d.fw_compat=1;d.typec=false;d.vrr_enabled=false;state.takeover_adopted=false;
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    d.panel=false;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     return 0;
 }
 '''
@@ -408,8 +604,10 @@ int main(void) {
 
 
 def hdr_metadata(root):
-    """HDR10 static metadata message for DCPAV selector 0x15, byte for byte."""
-    header = (root / 'drivers/gpu/drm/apple/dcp-hdr-metadata.h').read_text()
+    """HDR10 metadata wire encoding and caching over the AV service (legacy and AFKv2)."""
+    apple = root / 'drivers/gpu/drm/apple'
+    header = (apple / 'dcp-hdr-metadata.h').read_text()
+    iomfb = (apple / 'iomfb.c').read_text()
     header = '\n'.join(line for line in header.splitlines()
                        if not line.startswith('#include'))
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
@@ -465,6 +663,161 @@ struct hdr_output_metadata {
     union { struct hdr_metadata_infoframe hdmi_metadata_type1; };
 };
 """ + header + r"""
+typedef uint64_t u64;
+#define HDMI_EOTF_TRADITIONAL_GAMMA_SDR 0
+#define HDMI_EOTF_SMPTE_ST2084 2
+#define EPIC_SUBTYPE_STD_SERVICE 0xc0
+#define READ_ONCE(x) (x)
+#define scoped_guard(kind, lock) for (bool held = true; held; held = false)
+#define lockdep_assert_held(lock) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+struct apple_dcp_afkep { bool wire_v2; };
+struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int refs; };
+struct drm_crtc { int dcp; };
+struct drm_atomic_commit { int unused; };
+struct drm_connector_state {
+    struct { size_t length; const void *data; } *hdr_output_metadata;
+};
+struct apple_dcp {
+    bool output_pq, output_hdr, crashed;
+    struct {
+        struct apple_epic_service *service;
+        u64 generation;
+        u8 sent[DCP_HDR_DATA_SIZE];
+        bool sent_valid, infoframe;
+    } hdr;
+};
+#define to_apple_crtc(crtc) (crtc)
+#define dcp_hdr_metadata_live(pdev) true
+static const struct drm_connector_state *test_connector;
+static int transport_result;
+static u32 dcp_status;
+static size_t reply_length;
+static unsigned int sends, v2_sends, legacy_sends, stop_sends;
+static bool reset_during_send;
+static struct apple_dcp test_dcp;
+static const struct drm_connector_state *dcp_crtc_connector_state(
+    struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+{
+    (void)dcp; (void)crtc; (void)commit;
+    return test_connector;
+}
+static struct apple_epic_service *afk_service_get(struct apple_epic_service *service)
+{
+    if (service)
+        service->refs++;
+    return service;
+}
+static void afk_service_put(struct apple_epic_service *service)
+{
+    assert(service->refs == 1);
+    service->refs--;
+}
+""" + block(iomfb, 'static void dcp_hdr_reset_locked(') + r"""
+static int mock_hdr_command(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    u32 selector = get_unaligned_le32((const u8 *)msg + 0x04);
+
+    assert(service->refs == 1 && type == EPIC_SUBTYPE_STD_SERVICE);
+    if (selector == DCP_HDR_SELECTOR_SET_STATIC) {
+        assert(msg_len == DCP_HDR_MSG_SIZE && capacity == DCP_HDR_MSG_SIZE);
+        sends++;
+    } else {
+        assert(selector == DCP_HDR_SELECTOR_STOP_INFOFRAME);
+        assert(msg_len == DCP_HDR_STOP_SIZE && capacity == DCP_HDR_STOP_SIZE);
+        stop_sends++;
+    }
+    if (reset_during_send)
+        dcp_hdr_reset_locked(&test_dcp);
+    if (transport_result)
+        return transport_result;
+    *retcode = 0;
+    *received = reply_length;
+    if (selector == DCP_HDR_SELECTOR_SET_STATIC)
+        put_unaligned_le32(dcp_status, (u8 *)reply + DCP_HDR_MSG_STATUS);
+    else
+        put_unaligned_le32(dcp_status, (u8 *)reply + DCP_HDR_STOP_STATUS);
+    return 0;
+}
+static int afk_send_command_len(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    assert(service->ep->wire_v2);
+    v2_sends++;
+    return mock_hdr_command(service, type, msg, msg_len, reply, capacity, retcode, received);
+}
+static int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    assert(!service->ep->wire_v2);
+    legacy_sends++;
+    return mock_hdr_command(service, type, msg, msg_len, reply, capacity, retcode, received);
+}
+""" + block(iomfb, 'static int dcp_hdr_send(') + block(iomfb, 'static void dcp_hdr_infoframe_stop(') + block(iomfb, 'static void dcp_hdr_metadata_sync(') + r"""
+static void test_metadata_cache(struct hdr_output_metadata hdr)
+{
+    struct apple_dcp_afkep ep = { .wire_v2 = false };
+    struct apple_epic_service service = { .ep = &ep };
+    struct drm_crtc crtc = {};
+    struct drm_atomic_commit commit = {};
+    struct drm_connector_state conn;
+    __typeof__(*conn.hdr_output_metadata) blob = { sizeof(hdr), &hdr };
+
+    conn.hdr_output_metadata = &blob;
+    test_connector = &conn;
+    test_dcp.output_pq = true;
+    test_dcp.output_hdr = true;
+    test_dcp.hdr.service = &service;
+    reply_length = DCP_HDR_MSG_SIZE;
+    transport_result = -EIO;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 1 && legacy_sends == 1 && !v2_sends && !test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    transport_result = 0;
+    reply_length = DCP_HDR_MSG_STATUS;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 2 && !test_dcp.hdr.sent_valid);
+
+    reply_length = DCP_HDR_MSG_SIZE;
+    reset_during_send = true;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 3 && !test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    reset_during_send = false;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 4 && test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+
+    dcp_hdr_reset_locked(&test_dcp);
+    dcp_status = 1;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 5 && test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    hdr.hdmi_metadata_type1.max_cll--;
+    dcp_status = 0;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 6 && test_dcp.hdr.infoframe && !service.refs);
+    hdr.hdmi_metadata_type1.max_cll++;
+    transport_result = -ETIMEDOUT;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 7 && !test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+    hdr.hdmi_metadata_type1.max_cll--;
+    transport_result = 0;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 8 && test_dcp.hdr.sent_valid && !service.refs);
+
+    /* AFKv2 transport (fw 27 / H17P) uses afk_send_command_len for 0x15 and 0x14. */
+    ep.wire_v2 = true;
+    dcp_hdr_reset_locked(&test_dcp);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 9 && v2_sends == 1 && test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+    reply_length = DCP_HDR_STOP_SIZE;
+    dcp_hdr_infoframe_stop(&test_dcp);
+    assert(stop_sends == 1 && v2_sends == 2 && !test_dcp.hdr.infoframe && !service.refs);
+    puts("PASS: retry transport and short replies, discard stale replies, deduplicate completed commands, AFKv2 0x15/0x14");
+}
+
 static const u8 expected[] = {""" + expected + r"""};
 static const u8 expected_stop[] = {""" + expected_stop + r"""};
 int main(void)
@@ -485,6 +838,7 @@ int main(void)
             fprintf(stderr, "byte %#zx: %#x, expected %#x\n", i, msg[i], expected[i]);
             return 1;
         }
+    test_metadata_cache(hdr);
     /* Only static metadata Type 1 is sent. */
     hdr.metadata_type = 1;
     assert(dcp_hdr_data(data, &hdr) == -EINVAL);
@@ -516,6 +870,218 @@ int main(void)
         assert(dcp_hdr_stop_reply(0, 0, sreply, sizeof(sreply)) == -EIO);
     }
     printf("PASS: HDR10 static metadata message (%zu bytes), InfoFrame stop and reply checks\n", sizeof(msg));
+    return 0;
+}
+"""
+
+
+def color_selection(root):
+    """Full colour mode selection across RGB/YCbCr 444/422/420, 8/10/12 bpc, range, gamut, PQ/HLG."""
+    apple = root / 'drivers/gpu/drm/apple'
+    parser_h = (apple / 'parser.h').read_text()
+    color_h = (apple / 'dcp-color.h').read_text()
+    # Extract enum + struct definitions from parser.h
+    p_start = parser_h.index('enum dcp_color_eotf {')
+    p_end = parser_h.index('struct dimension {')
+    parser_defs = parser_h[p_start:p_end]
+    color_defs = '\n'.join(line for line in color_h.splitlines()
+                           if not line.startswith('#include'))
+    color_defs = color_defs.replace('static inline ', 'static inline __attribute__((unused)) ')
+    return r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint64_t u64; typedef int64_t s64;
+struct drm_display_mode { int unused; };
+struct dcp_metadata_ticket { int unused; };
+enum hdmi_eotf {
+    HDMI_EOTF_TRADITIONAL_GAMMA_SDR = 0,
+    HDMI_EOTF_TRADITIONAL_GAMMA_HDR = 1,
+    HDMI_EOTF_SMPTE_ST2084 = 2,
+    HDMI_EOTF_BT_2100_HLG = 3,
+};
+enum drm_colorspace {
+    DRM_MODE_COLORIMETRY_DEFAULT = 0,
+    DRM_MODE_COLORIMETRY_SMPTE_170M_YCC = 1,
+    DRM_MODE_COLORIMETRY_BT709_YCC = 2,
+    DRM_MODE_COLORIMETRY_XVYCC_601 = 3,
+    DRM_MODE_COLORIMETRY_XVYCC_709 = 4,
+    DRM_MODE_COLORIMETRY_SYCC_601 = 5,
+    DRM_MODE_COLORIMETRY_OPYCC_601 = 6,
+    DRM_MODE_COLORIMETRY_OPRGB = 7,
+    DRM_MODE_COLORIMETRY_BT2020_CYCC = 8,
+    DRM_MODE_COLORIMETRY_BT2020_RGB = 9,
+    DRM_MODE_COLORIMETRY_BT2020_YCC = 10,
+    DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65 = 11,
+    DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER = 12,
+    DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED = 13,
+    DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT = 14,
+    DRM_MODE_COLORIMETRY_BT601_YCC = 15,
+};
+enum drm_connector_color_format {
+    DRM_CONNECTOR_COLOR_FORMAT_AUTO = 0,
+    DRM_CONNECTOR_COLOR_FORMAT_RGB444 = 1,
+    DRM_CONNECTOR_COLOR_FORMAT_YCBCR444 = 2,
+    DRM_CONNECTOR_COLOR_FORMAT_YCBCR422 = 3,
+    DRM_CONNECTOR_COLOR_FORMAT_YCBCR420 = 4,
+};
+enum drm_hdmi_broadcast_rgb {
+    DRM_HDMI_BROADCAST_RGB_AUTO = 0,
+    DRM_HDMI_BROADCAST_RGB_FULL = 1,
+    DRM_HDMI_BROADCAST_RGB_LIMITED = 2,
+};
+""" + parser_defs + color_defs + r"""
+static void add_entry(struct dcp_display_mode *m, u32 id, u8 eotf, u8 fmt,
+                      u8 space, u8 range, u8 depth, u8 flags)
+{
+    assert(m->nr_colors < DCP_MAX_COLOR_ENTRIES);
+    m->colors[m->nr_colors++] = (struct dcp_color_entry) {
+        .id = id, .eotf = eotf, .format = fmt, .colorimetry = space,
+        .range = range, .depth = depth, .flags = flags,
+    };
+}
+
+int main(void)
+{
+    struct dcp_display_mode acer = { .sdr_rgb = { .score = 100, .id = 81, .eotf = DCP_EOTF_SDR_GAMMA,
+        .format = DCP_COLOR_FORMAT_RGB, .colorimetry = DCP_COLORIMETRY_SRGB,
+        .range = DCP_COLOR_YCBCR_RANGE_FULL, .depth = 8 },
+        .pq = { .score = 200, .id = 113, .eotf = DCP_EOTF_ST_2084,
+        .format = DCP_COLOR_FORMAT_RGB, .colorimetry = DCP_COLORIMETRY_BT2020_RGB,
+        .range = DCP_COLOR_YCBCR_RANGE_FULL, .depth = 10 },
+        .color_mode_id = 81 };
+    struct dcp_color_request req;
+    struct dcp_color_mode out;
+
+    /* Populate Acer 1080p60-shaped catalog (enc 3 = YCbCr444, enc 2 = YCbCr422) */
+    add_entry(&acer, 81, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, 0);
+    add_entry(&acer, 82, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+    add_entry(&acer, 86, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
+    add_entry(&acer, 85, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
+    add_entry(&acer, 84, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+    add_entry(&acer, 83, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT601, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+    add_entry(&acer, 90, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 108, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&acer, 110, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&acer, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
+    add_entry(&acer, 114, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 116, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 117, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 12, 0);
+    add_entry(&acer, 120, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&acer, 121, DCP_EOTF_BT_2100, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 122, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR420, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+
+    /* Default SDR fast path */
+    req = (struct dcp_color_request){ .allow_hdr = true, .allow_dsc = true, .max_bpc = 12 };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 81);
+
+    /* Default PQ fast path (Mutter sets BT2020_RGB + PQ) */
+    req.eotf = HDMI_EOTF_SMPTE_ST2084; req.colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 113 && out.depth == 10);
+
+    /* Explicit 12 bpc PQ RGB vs 10 bpc PQ RGB vs Limited range */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444; req.max_bpc = 12;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 117 && out.depth == 12);
+    req.max_bpc = 10;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 113 && out.depth == 10);
+    req.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_LIMITED;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 114 && out.range == DCP_COLOR_YCBCR_RANGE_LIMITED);
+
+    /* Explicit YCbCr 4:4:4 (10b/12b) and 4:2:2 (plain outranks DP tunnel) PQ */
+    req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
+        .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR444, .max_bpc = 10, .allow_hdr = true };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 116 && out.depth == 10);
+    req.max_bpc = 12;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 120 && out.depth == 12);
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422; req.max_bpc = 12;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 108); /* plain 422 outranks 422_DP (110) */
+
+    /* HLG support */
+    req = (struct dcp_color_request){ .eotf = HDMI_EOTF_BT_2100_HLG, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
+        .max_bpc = 12, .allow_hdr = true };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 121);
+
+    /* SDR: RGB 8b Limited, RGB 10b wide-gamut BT.2020, YCbCr 4:4:4 BT.709/BT.601, YCbCr 4:2:0 */
+    req = (struct dcp_color_request){ .broadcast_rgb = DRM_HDMI_BROADCAST_RGB_LIMITED, .max_bpc = 8 };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 82);
+    req = (struct dcp_color_request){ .colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB, .max_bpc = 10 };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 85);
+    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR444,
+        .colorspace = DRM_MODE_COLORIMETRY_BT709_YCC, .max_bpc = 10 };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 90);
+    req.colorspace = DRM_MODE_COLORIMETRY_SMPTE_170M_YCC; req.max_bpc = 8;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 83);
+    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR420, .max_bpc = 8 };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 122);
+
+    /* MSI 1440p60-shaped timing: PQ RGB/444 unsafe, PQ 422 safe -> Mutter AUTO BT2020_RGB succeeds via 422 (105) */
+    struct dcp_display_mode msi = { .sdr_rgb = acer.sdr_rgb,
+        .pq = { .score = 10, .id = 105, .eotf = DCP_EOTF_ST_2084,
+        .format = DCP_COLOR_FORMAT_YCBCR422, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
+        .range = DCP_COLOR_YCBCR_RANGE_LIMITED, .depth = 12 },
+        .color_mode_id = 81 };
+    add_entry(&msi, 105, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&msi, 107, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&msi, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE);
+    req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB,
+        .max_bpc = 12, .allow_hdr = true };
+    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 105);
+    /* Explicit PQ RGB on MSI 1440p60 MUST be rejected (only unsafe RGB exists) */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444;
+    assert(dcp_select_color_mode(&msi, &req, &out) == -EINVAL);
+    /* Explicit PQ 4:2:2 on MSI 1440p60 picks plain 4:2:2 (105) over DP tunnel (107) */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422; req.colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC;
+    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 105);
+
+    /* Unsafe-only >340 MHz HDMI 2.0 timing (e.g. 1080p180 / 1440p144): SDR already uses unsafe
+     * elements (sdr_usable=false, sdr_unsafe=true), so non-DSC unsafe PQ within sdr_unsafe_max_bpp
+     * is permitted, whereas safe timings (sdr_usable=true) strictly reject unsafe SDR and PQ. */
+    struct dcp_display_mode msi144 = { .sdr_rgb = acer.sdr_rgb, .color_mode_id = 80,
+        .sdr_usable = false, .sdr_unsafe = true, .sdr_unsafe_max_bpp = 24,
+        .pq = { .score = 10, .id = 105, .eotf = DCP_EOTF_ST_2084,
+        .format = DCP_COLOR_FORMAT_YCBCR422, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
+        .range = DCP_COLOR_YCBCR_RANGE_LIMITED, .depth = 12 } };
+    add_entry(&msi144, 80, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, DCP_COLOR_FLAG_UNSAFE);
+    add_entry(&msi144, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE | DCP_COLOR_FLAG_DSC);
+    add_entry(&msi144, 114, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE);
+    add_entry(&msi144, 105, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, DCP_COLOR_FLAG_UNSAFE);
+    req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
+        .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422, .max_bpc = 12,
+        .allow_hdr = true, .allow_dsc = true, .allow_unsafe_sdr = true };
+    assert(!dcp_select_color_mode(&msi144, &req, &out) && out.id == 105);
+    /* Non-DSC 30-bpp RGB PQ (114) exceeds 24-bpp unsafe SDR ceiling -> rejected; 30-bpp SDR admits it */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444;
+    req.colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB;
+    assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
+    msi144.sdr_unsafe_max_bpp = 30;
+    assert(!dcp_select_color_mode(&msi144, &req, &out) && out.id == 114);
+    msi144.sdr_unsafe_max_bpp = 24;
+    /* DSC-required unsafe PQ (113) MUST be rejected even with allow_dsc=true and 30-bpp SDR */
+    msi144.colors[2].flags |= DCP_COLOR_FLAG_DSC;
+    msi144.sdr_unsafe_max_bpp = 30;
+    assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
+    /* Same unsafe entry on a timing with sdr_usable=true MUST be rejected (for both HDR and SDR) */
+    msi144.sdr_usable = true;
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422;
+    req.colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC;
+    assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
+    /* Explicit SDR request on a safe timing (e.g. 4K60 where only 4:2:0 is safe) MUST NOT fall through to unsafe SDR */
+    struct dcp_display_mode k4 = { .color_mode_id = 119, .sdr_usable = true, .sdr_unsafe = true };
+    add_entry(&k4, 80, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, DCP_COLOR_FLAG_UNSAFE);
+    add_entry(&k4, 119, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, DCP_COLOR_FLAG_DOWNSTREAM_420);
+    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444, .max_bpc = 8, .allow_unsafe_sdr = true };
+    assert(dcp_select_color_mode(&k4, &req, &out) == -EINVAL);
+    /* DownstreamFormat 4:2:0 matches YCBCR420 and reports wire YCbCr 4:2:0 while preserving upstream format */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR420;
+    assert(!dcp_select_color_mode(&k4, &req, &out) && out.id == 119 && out.format == DCP_COLOR_FORMAT_YCBCR420);
+    assert(k4.colors[1].format == DCP_COLOR_FORMAT_YCBCR444);
+
+    puts("PASS: colour mode selection across RGB/YCbCr 444/422/420, 8/10/12 bpc, Full/Limited, wide gamut, PQ/HLG, and -EINVAL rejection");
     return 0;
 }
 """
