@@ -10,6 +10,8 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* Defined before the includes: t6050-max.dtsi guards the ATC2 router on it. */
+#define T6050_K114S
 /* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
 #define T6050_K_N1_FIRMWARE	"apple/centauri/k114s-ftab.bin"
 #define T6050_K_BOARD_ID	0x14
@@ -24,7 +26,6 @@
 	firmware-name = "apple/tpmtfw-k114s.bin";
 };
 
-#define T6050_K114S
 #include "t6050-peripherals.dtsi"
 
 /* The 14-inch chassis: the Neural Engine, pins, the jack, the card and the AOP; no speakers */
@@ -70,5 +71,10 @@
 	};
 };
 
-/* The USB-C ports ATC1 and ATC2, as on the other K boards */
+/*
+ * The USB-C ports ATC1 and ATC2, as on the other K boards (t6050-k114-k116-usb.dtsi), then the
+ * 14-inch chassis' MagSafe 3 PD controller and the right port's USB4/Thunderbolt router
+ * (t6050-k114-usb.dtsi).
+ */
 #include "t6050-k114-k116-usb.dtsi"
+#include "t6050-k114-usb.dtsi"
