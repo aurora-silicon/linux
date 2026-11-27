@@ -1114,6 +1114,12 @@ struct apple_dcp {
 	char link_line[120];
 	u64 link_line_generation;
 	u8 link_dsc;
+	/*
+	 * hw.only_120hz_modes: the refresh rate iBoot left the panel at, from the
+	 * firmware's "update_rr_index syncrate N" line before our first mode set
+	 * (dcp_rtk_syslog_boot_rate()); 0 until seen.
+	 */
+	u32 boot_rate;
 
 	/* V27 sleep: the panel's next mode set is the mode it already has */
 	bool v27_keep_mode;

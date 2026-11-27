@@ -3643,11 +3643,14 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	/*
-	 * The T6050 internal DCP (M5 Max) crashes on 3024x1986@60 and the
-	 * other 60 Hz timings it lists.  Only the 120 Hz timing is known to
-	 * survive a modeset, so refuse the rest until they are understood.
+	 * The T6050 internal DCP (M5 Max, K114s) crashes on a mode set away
+	 * from the timing iBoot left the panel at: 120 -> 60 Hz, and 60 ->
+	 * 120 Hz when macOS left it at 60 Hz.  Offer only the rate the
+	 * firmware reported at start (dcp_rtk_syslog_boot_rate()), 120 Hz
+	 * when it reported none.
 	 */
-	if (dcp->hw.only_120hz_modes && drm_mode_vrefresh(mode) != 120)
+	if (dcp->hw.only_120hz_modes &&
+	    drm_mode_vrefresh(mode) != (READ_ONCE(dcp->boot_rate) ?: 120))
 		return false;
 
 	return true;
