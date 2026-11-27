@@ -1344,6 +1344,7 @@ static void cft_test_lazy_policy_limits_and_handoff(struct kunit *test)
 	ctx->policy->cur = 1800000;
 	KUNIT_EXPECT_TRUE(test, cft_lazy_request(ctx, 4, &freq));
 	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, 15);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 3000000U);
 
 	ctx->policy->fast_switch_enabled = false;
 	cft_set_cmd(ctx->regs, 7);
@@ -1354,7 +1355,7 @@ static void cft_test_lazy_policy_limits_and_handoff(struct kunit *test)
 
 	KUNIT_EXPECT_FALSE(test, cft_lazy_cap(ctx, 1, 600000, &moved));
 	KUNIT_EXPECT_EQ(test, moved, -1);
-	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 3000000U);
 }
 
 static struct kunit_case apple_soc_cpufreq_test_cases[] = {
@@ -1437,15 +1438,32 @@ static int cft_live_target(struct cpufreq_policy *policy, unsigned int index)
 	return 0;
 }
 
+static void (*cft_live_after_fast_switch)(struct cpufreq_policy *policy);
+
+static unsigned int cft_live_fast_switch(struct cpufreq_policy *policy,
+					 unsigned int target_freq)
+{
+	unsigned int freq = apple_soc_cpufreq_fast_switch(policy, target_freq);
+
+	if (cft_live_after_fast_switch) {
+		void (*hook)(struct cpufreq_policy *policy) = cft_live_after_fast_switch;
+
+		cft_live_after_fast_switch = NULL;
+		hook(policy);
+	}
+	return freq;
+}
+
 static struct cpufreq_driver cft_live_driver = {
 	.name		= "apple-cpufreq",
 	.flags		= CPUFREQ_HAVE_GOVERNOR_PER_POLICY |
-			  CPUFREQ_NEED_UPDATE_LIMITS,
+			  CPUFREQ_NEED_UPDATE_LIMITS |
+			  CPUFREQ_DRIVER_UPDATES_CUR,
 	.verify		= apple_soc_cpufreq_verify_policy,
 	.init		= cft_live_init,
 	.exit		= cft_live_exit,
 	.target_index	= cft_live_target,
-	.fast_switch	= apple_soc_cpufreq_fast_switch,
+	.fast_switch	= cft_live_fast_switch,
 };
 
 static int cft_live_suite_init(struct kunit_suite *suite)
@@ -1489,6 +1507,7 @@ static void cft_live_test_exit(struct kunit *test)
 {
 	if (cft_live_ret)
 		return;
+	cft_live_after_fast_switch = NULL;
 	cft_live_priv->info = &soc_default_info;
 	cft_set_cmd(cft_live_regs, 4);
 	cft_set_status(cft_live_regs, 0);
@@ -1893,15 +1912,17 @@ static void cft_test_verify_policy_cap_lift(struct kunit *test)
 
 	/*
 	 * Dropping the QoS ceiling to 0 (as store_scaling_max_freq("0") does)
-	 * must clamp a queued pending fast request to the lowest valid OPP when
-	 * the verify timer replays it, even before policy->update reconciles
-	 * policy->max.
+	 * must clamp a queued pending fast request to the lowest valid OPP and
+	 * publish policy->cur when the verify timer replays it, so policy->cur
+	 * is already 600 MHz after policy->update runs with no further
+	 * fast_switch().
 	 */
 	cft_set_cmd(cft_live_regs, 4 | APPLE_DVFS_CMD_BUSY);
 	priv->expected_pstate = 4;
 	policy->cur = 1200000;
 	freq = cpufreq_driver_fast_switch(policy, 3000000);
 	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 3000000U);
 	KUNIT_EXPECT_EQ(test, priv->pending_pstate, 15);
 
 	scoped_guard(cpufreq_policy_write, policy) {
@@ -1918,13 +1939,43 @@ static void cft_test_verify_policy_cap_lift(struct kunit *test)
 		KUNIT_EXPECT_EQ(test,
 				FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)),
 				1ULL);
-
-		freq = cpufreq_driver_fast_switch(policy, 3000000);
-		hrtimer_cancel(&priv->verify_timer);
-		KUNIT_EXPECT_EQ(test, freq, 600000U);
 		KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
 	}
 	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, policy->max, 600000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
+
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	KUNIT_EXPECT_EQ(test, policy->max, 3000000U);
+
+	/* Same replay when hardware was already at P-state 1: cur must still drop. */
+	cft_set_cmd(cft_live_regs, 1 | APPLE_DVFS_CMD_BUSY);
+	priv->expected_pstate = 1;
+	policy->cur = 600000;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, 15);
+
+	scoped_guard(cpufreq_policy_write, policy) {
+		KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 0), 0);
+		cft_set_cmd(cft_live_regs, 1);
+		local_irq_save(flags);
+		KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_verify(&priv->verify_timer),
+				HRTIMER_NORESTART);
+		hrtimer_cancel(&priv->verify_timer);
+		local_irq_restore(flags);
+		KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+		KUNIT_EXPECT_EQ(test, priv->expected_pstate, 1U);
+		KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
+	}
+	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, policy->max, 600000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
+
 	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
 	flush_work(&policy->update);
 	KUNIT_EXPECT_EQ(test, policy->max, 3000000U);
@@ -1945,11 +1996,88 @@ static void cft_test_verify_policy_cap_lift(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
 }
 
+static struct {
+	struct kunit *test;
+	struct freq_qos_request *user_req;
+} cft_race_ctx;
+
+static void cft_race_verify_after_unlock(struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = policy->driver_data;
+
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, priv->expected_pstate, 15U);
+	cft_set_cmd(cft_live_regs, 15);
+	KUNIT_ASSERT_GE(cft_race_ctx.test,
+			freq_qos_update_request(cft_race_ctx.user_req, 1200000), 0);
+	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, policy->cur, 1200000U);
+}
+
+static void cft_race_cap_after_unlock(struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = policy->driver_data;
+	unsigned long flags;
+	int moved;
+
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, priv->expected_pstate, 15U);
+	cft_set_cmd(cft_live_regs, 15);
+	local_irq_save(flags);
+	moved = apple_soc_cpufreq_lazy_cap(priv, 4, 1200000);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, moved, 4);
+	KUNIT_EXPECT_EQ(cft_race_ctx.test, policy->cur, 1200000U);
+}
+
+/*
+ * Reconciliation (from policy->update or lazy_cap) running after ->fast_switch()
+ * drops priv->lock and before cpufreq_driver_fast_switch() finishes must not
+ * have its lower policy->cur overwritten by the stale fast-switch return value.
+ */
+static void cft_test_fast_switch_reconcile_race(struct kunit *test)
+{
+	struct cpufreq_policy *policy = cft_live_policy_setup(test);
+	struct apple_cpu_priv *priv = cft_live_priv;
+	struct freq_qos_request *user_req, *min_req;
+	unsigned int freq;
+
+	cft_live_add_qos(test, policy, &user_req, FREQ_QOS_MAX, 3000000);
+	cft_live_add_qos(test, policy, &min_req, FREQ_QOS_MIN, 600000);
+	flush_work(&policy->update);
+	cft_live_reset_t6050(policy);
+
+	cft_race_ctx.test = test;
+	cft_race_ctx.user_req = user_req;
+	cft_live_after_fast_switch = cft_race_verify_after_unlock;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->max, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 4ULL);
+
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	cft_set_cmd(cft_live_regs, 4);
+	cft_live_after_fast_switch = cft_race_cap_after_unlock;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 4ULL);
+}
+
 static struct kunit_case apple_soc_cpufreq_policy_test_cases[] = {
 	KUNIT_CASE_PARAM(cft_test_get, cft_get_gen_params),
 	KUNIT_CASE(cft_test_thermal_owner),
 	KUNIT_CASE(cft_test_verify_policy_ceiling_drop),
 	KUNIT_CASE(cft_test_verify_policy_cap_lift),
+	KUNIT_CASE(cft_test_fast_switch_reconcile_race),
 	{}
 };
 

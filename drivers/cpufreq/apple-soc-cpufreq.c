@@ -640,6 +640,23 @@ static unsigned int apple_soc_cpufreq_pstate_freq(struct cpufreq_policy *policy,
 	return 0;
 }
 
+/* Called with priv->lock held. */
+static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
+					  unsigned int pstate)
+{
+	struct cpufreq_policy *policy = priv->policy;
+	unsigned int cur;
+
+	if (!policy || !policy->freq_table)
+		return;
+
+	cur = apple_soc_cpufreq_pstate_freq(policy, pstate);
+	if (!cur && pstate == priv->cap_pstate)
+		cur = priv->cap_freq;
+	if (cur)
+		WRITE_ONCE(policy->cur, cur);
+}
+
 /*
  * Clamps a deferred or restored lazy-verify P-state against the current
  * policy bounds and thermal ceiling using cpufreq's maximum-first OPP
@@ -761,6 +778,8 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 			priv->pending_pstate = -1;
 			if (apple_soc_cpufreq_lazy_write(priv, reg, pstate))
 				apple_soc_cpufreq_verify_later(priv);
+			if (!priv->transition_failed)
+				apple_soc_cpufreq_publish_cur(priv, pstate);
 		}
 	} else if (FIELD_GET(APPLE_DVFS_CMD_PS1, reg) != priv->expected_pstate) {
 		apple_soc_cpufreq_fail(priv, reg);
@@ -853,6 +872,8 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 			freq = priv->cap_freq;
 	}
 	ret = apple_soc_cpufreq_lazy_set(priv, pstate);
+	if (!ret)
+		WRITE_ONCE(policy->cur, freq);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return ret ? 0 : freq;
 }
@@ -879,13 +900,7 @@ static int apple_soc_cpufreq_lazy_reconcile(struct apple_cpu_priv *priv,
 	if (pstate == requested || apple_soc_cpufreq_lazy_set(priv, pstate))
 		return -1;
 
-	if (priv->policy && priv->policy->freq_table) {
-		unsigned int cur = apple_soc_cpufreq_pstate_freq(priv->policy,
-								 pstate);
-
-		if (cur)
-			WRITE_ONCE(priv->policy->cur, cur);
-	}
+	apple_soc_cpufreq_publish_cur(priv, pstate);
 	return pstate;
 }
 
@@ -1110,6 +1125,7 @@ static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
 	 * by a concurrent limits update. target_freq is already clamped.
 	 */
 	int idx = cpufreq_table_find_index_l(policy, target_freq, false);
+	unsigned int freq;
 
 	if (idx < 0)
 		return 0;
@@ -1118,7 +1134,9 @@ static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
 	if (apple_soc_cpufreq_request(policy, idx))
 		return 0;
 
-	return policy->freq_table[idx].frequency;
+	freq = policy->freq_table[idx].frequency;
+	WRITE_ONCE(policy->cur, freq);
+	return freq;
 }
 
 static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
@@ -1816,7 +1834,8 @@ static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.flags		= CPUFREQ_HAVE_GOVERNOR_PER_POLICY |
 			  CPUFREQ_NEED_INITIAL_FREQ_CHECK |
 			  CPUFREQ_IS_COOLING_DEV |
-			  CPUFREQ_NEED_UPDATE_LIMITS,
+			  CPUFREQ_NEED_UPDATE_LIMITS |
+			  CPUFREQ_DRIVER_UPDATES_CUR,
 	.verify		= apple_soc_cpufreq_verify_policy,
 	.get		= apple_soc_cpufreq_get_rate,
 	.init		= apple_soc_cpufreq_init,

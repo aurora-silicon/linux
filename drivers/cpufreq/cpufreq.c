@@ -2220,7 +2220,15 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 	if (!freq)
 		return 0;
 
-	policy->cur = freq;
+	/*
+	 * Drivers that also update hardware from asynchronous limit or timer
+	 * paths publish policy->cur under their own lock so a concurrent
+	 * clamp cannot be overwritten by an older ->fast_switch() result.
+	 */
+	if (cpufreq_driver->flags & CPUFREQ_DRIVER_UPDATES_CUR)
+		freq = READ_ONCE(policy->cur);
+	else
+		policy->cur = freq;
 	arch_set_freq_scale(policy->related_cpus, freq,
 			    arch_scale_freq_ref(policy->cpu));
 	cpufreq_stats_record_transition(policy, freq);
