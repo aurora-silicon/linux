@@ -3249,6 +3249,16 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *     5 0x3642b801c = 1 (a sequence ended), 6 = 0xa03 (one started), 7 any AMCC +0x40c bit 0;
  *     +4 the engine's SPMI queue: 0x36471c000 bits 18:16 (2:0), 0x36471c060 bits 2:0 (5:3),
  *     WD2 armed (6).
+ *  8: the PST handshake page the transition sequences write and poll (lane A's decode: the
+ *     engine writes a request in bits 1:0, 1 up and 2 down, and polls the agent's ack, bit 8),
+ *     against the values the observer read as it stopped, before the commit:
+ *     +0..+2 a bit per word that ever differed: bits 0-19 0x3642d0000..+0x4c, 20 the flag
+ *     +0x10c, 21 +0x100/104/108/110, 22 the step code 0x3642b8040, 23 0x3642b801c;
+ *     +3 the latest +0x38 (A:4, D2C's first handshake) as bits 1:0 and bit 8 (2:0), and the
+ *     lowest word of the first sample that differed (7:3, 0x1f: none);
+ *     +4 the latest +0x28 (A:10's first) as +3 (2:0), +0x40 bits 1:0 (4:3), 0x35072802c bits
+ *     25:16 nonzero (5: PMGR2:10's one-tick poll wants 0), WD2 armed (6), and 0x35072802c bits
+ *     25:16 nonzero at the observer's stop (7).
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -3276,7 +3286,7 @@ static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode >= 1 && mode <= 7;
+	return mode >= 1 && mode <= 8;
 }
 
 struct t6030_obs {
@@ -3394,10 +3404,29 @@ static void __iomem *t6030_eng_map(struct apple_sleep *s, u64 pa)
 	return apple_sleep_ioremap(s->dev, &res);
 }
 
+/* obs_timeline=8: the PST page (t6030_eng_flag's page), and PMGR2:10's poll word */
+#define T6030_PST_WORDS			20
+#define T6030_PST_CE			0x100
+#define T6030_PST_CE_WORDS		5
+#define T6030_PST_D2C_1A		(0x38 / 4)
+#define T6030_PST_D2C_1B		(0x28 / 4)
+#define T6030_PST_DESCENT		(0x40 / 4)
+#define T6030_PST_NONE			0x1f
+#define T6030_ENG_PG_PA			0x350728000ULL
+#define T6030_ENG_PG_BUSY		0x2c
+#define T6030_ENG_PG_BUSY_MASK		GENMASK(25, 16)
+
+static void __iomem *t6030_eng_pg;
+static u32 t6030_pst_ref[T6030_PST_WORDS], t6030_pst_ce_ref[T6030_PST_CE_WORDS];
+static u32 t6030_pst_step_ref, t6030_pst_seq_ref, t6030_pst_changed;
+static u8 t6030_pst_first;
+static bool t6030_pg_busy_ref;
+
 static void t6030_eng_probe(struct apple_sleep *s)
 {
 	unsigned int i;
 
+	t6030_eng_pg = t6030_eng_map(s, T6030_ENG_PG_PA);
 	t6030_eng_flag = t6030_eng_map(s, T6030_ENG_FLAG_PA);
 	t6030_eng_step = t6030_eng_map(s, T6030_ENG_STEP_PA);
 	t6030_eng_cst = t6030_eng_map(s, T6030_ENG_CST_PA);
@@ -3452,6 +3481,78 @@ static void t6030_eng_boot_record(struct apple_sleep *s)
 			 dcs[0], dcs[1], dcs[2], dcs[3], dcs[4], dcs[5], dcs[6], dcs[7], dcs[8],
 			 dcs[9], dcs[10], dcs[11]);
 	}
+	if (t6030_eng_flag) {
+		char buf[T6030_PST_WORDS * 9 + 1];
+		unsigned int n = 0;
+
+		for (i = 0; i < T6030_PST_WORDS; i++)
+			n += scnprintf(buf + n, sizeof(buf) - n, " %x",
+				       readl(t6030_eng_flag + 4 * i));
+		dev_info(s->dev, "boot engine: PST 0x3642d0000..4c:%s\n", buf);
+		dev_info(s->dev, "boot engine: PST +0x100 %x %x %x %x %x, 0x35072802c %#x\n",
+			 readl(t6030_eng_flag + 0x100), readl(t6030_eng_flag + 0x104),
+			 readl(t6030_eng_flag + 0x108), readl(t6030_eng_flag + 0x10c),
+			 readl(t6030_eng_flag + 0x110),
+			 t6030_eng_pg ? readl(t6030_eng_pg + T6030_ENG_PG_BUSY) : ~0U);
+	}
+}
+
+static u8 t6030_pst_pack(u32 v)
+{
+	return (v & 3) | !!(v & BIT(8)) << 2;
+}
+
+/* obs_timeline=8: the observer's reference, read as it stops (before the commit) */
+static void t6030_obs_entry(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	if (READ_ONCE(t6030_obs_timeline) != 8 || !t6030_eng_flag || !t6030_eng_step)
+		return;
+	for (i = 0; i < T6030_PST_WORDS; i++)
+		t6030_pst_ref[i] = readl(t6030_eng_flag + 4 * i);
+	for (i = 0; i < T6030_PST_CE_WORDS; i++)
+		t6030_pst_ce_ref[i] = readl(t6030_eng_flag + T6030_PST_CE + 4 * i);
+	t6030_pst_step_ref = readl(t6030_eng_step + T6030_ENG_STEP);
+	t6030_pst_seq_ref = readl(t6030_eng_step + T6030_ENG_SEQ);
+	t6030_pg_busy_ref = t6030_eng_pg &&
+			    (readl(t6030_eng_pg + T6030_ENG_PG_BUSY) & T6030_ENG_PG_BUSY_MASK);
+	t6030_pst_changed = 0;
+	t6030_pst_first = T6030_PST_NONE;
+}
+
+static void t6030_obs_pst(struct apple_sleep *s, u8 *v)
+{
+	u32 w[T6030_PST_WORDS], pg = 0;
+	unsigned int i;
+
+	if (!t6030_eng_flag || !t6030_eng_step) {
+		memset(v, 0xff, 5);
+		return;
+	}
+	for (i = 0; i < T6030_PST_WORDS; i++) {
+		w[i] = readl(t6030_eng_flag + 4 * i);
+		if (w[i] != t6030_pst_ref[i])
+			t6030_pst_changed |= BIT(i);
+	}
+	if (t6030_pst_first == T6030_PST_NONE && (t6030_pst_changed & GENMASK(19, 0)))
+		t6030_pst_first = __ffs(t6030_pst_changed);
+	for (i = 0; i < T6030_PST_CE_WORDS; i++)
+		if (readl(t6030_eng_flag + T6030_PST_CE + 4 * i) != t6030_pst_ce_ref[i])
+			t6030_pst_changed |= T6030_PST_CE + 4 * i == T6030_ENG_FLAG ? BIT(20) : BIT(21);
+	if (readl(t6030_eng_step + T6030_ENG_STEP) != t6030_pst_step_ref)
+		t6030_pst_changed |= BIT(22);
+	if (readl(t6030_eng_step + T6030_ENG_SEQ) != t6030_pst_seq_ref)
+		t6030_pst_changed |= BIT(23);
+	if (t6030_eng_pg)
+		pg = readl(t6030_eng_pg + T6030_ENG_PG_BUSY) & T6030_ENG_PG_BUSY_MASK;
+	v[0] = t6030_pst_changed;
+	v[1] = t6030_pst_changed >> 8;
+	v[2] = t6030_pst_changed >> 16;
+	v[3] = t6030_pst_pack(w[T6030_PST_D2C_1A]) | t6030_pst_first << 3;
+	v[4] = t6030_pst_pack(w[T6030_PST_D2C_1B]) | (w[T6030_PST_DESCENT] & 3) << 3 | !!pg << 5 |
+	       !!(readl(s->wdt + T6030_WDT_WD2_CTL) & T6030_WDT_WD2_ARMED) << 6 |
+	       t6030_pg_busy_ref << 7;
 }
 
 static void t6030_obs_engine(struct apple_sleep *s, u8 *v)
@@ -3575,7 +3676,9 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 		if (k == T6030_OBS_SETTLE)
 			ref = o;
 		if (cores) {
-			if (mode == 7) {
+			if (mode == 8) {
+				t6030_obs_pst(s, v);
+			} else if (mode == 7) {
 				t6030_obs_engine(s, v);
 			} else if (mode == 6) {
 				t6030_obs_waits(s, v);

@@ -2800,6 +2800,7 @@ static u8 t8142_obs_sample(struct apple_sleep *s)
 /* T6030's observer timeline, apple_sleep.obs_timeline (sleep-t6030.h) */
 static bool t6030_obs_timeline_on(void);
 static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t0);
+static void t6030_obs_entry(struct apple_sleep *s);
 
 /* E core 0 with apple_sleep.observer_ms: see sleep_observer_ms. */
 static void t8142_observe(struct apple_sleep *s, unsigned int ms)
@@ -2808,6 +2809,10 @@ static void t8142_observe(struct apple_sleep *s, unsigned int ms)
 	static const unsigned int at_ms[2] = { 20, 300 };
 	u8 b[3];
 	int i;
+
+	/* T6030 obs_timeline=8's reference: read here, before the boot core's commit */
+	if (s->soc->observer && t6030_obs_timeline_on())
+		t6030_obs_entry(s);
 
 	/* At most 30 s for the boot core to get there (a hang before it ends at WD2 anyway). */
 	while (!READ_ONCE(t8142_obs_boot_wfi) && read_sysreg(cntpct_el0) - t0 < 30 * freq)
