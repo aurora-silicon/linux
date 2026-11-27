@@ -58,6 +58,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'aurora-wake-output-tests.py': [(out(), PASS)],
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
@@ -183,8 +184,13 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
-                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
+                                   'rate-limit', 'stall-reset', 'ring-full', 'trap-bound'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-shared-tcm-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',
+                                   'flowring-idx', 'dma-counts', 'rptr-depth', 'wptr-depth',
+                                   'console-desc', 'console-none',
+                                   'console-buf', 'console-widx', 'console-reinit'), out()),
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
@@ -352,7 +358,9 @@ ASAHI_TESTS = {
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
-                                   'node-unmarked', 'no-release'), []),
+                                   'node-unmarked', 'no-release', 'm5-cached-nodes',
+                                   'm5-cached-descriptors', 'cached-queue-records',
+                                   'uncached-g17p-nodes'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.
