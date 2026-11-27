@@ -1041,6 +1041,8 @@ struct apple_dcp {
 	struct completion s2r_hpd_done;
 	/* Woken when a channel's call depth or the pending ACKs fall. */
 	wait_queue_head_t channels_idle_wq;
+	/* Swap completions from the firmware, counted for the commit after a wake. */
+	atomic_t swap_completions;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;

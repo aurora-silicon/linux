@@ -12391,6 +12391,7 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 	struct drm_crtc_state *cs;
 	struct drm_crtc *crtc;
 	ktime_t start = ktime_get();
+	bool modeset;
 	int ret;
 
 	reinit_completion(&dcp->s2r_hpd_done);
@@ -12419,25 +12420,43 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 		ret = 0;
 		goto unlock;
 	}
-	state = drm_atomic_commit_alloc(crtc->dev);
-	if (!state) {
-		ret = -ENOMEM;
-		goto unlock;
+	/*
+	 * The mode is the one the panel had before the sleep, and the warm restart brings the
+	 * firmware back with it: hand it the planes alone first. Set the mode again only if
+	 * that commit fails or the firmware completes no swap of it.
+	 */
+	for (modeset = false; ; modeset = true) {
+		int swaps = atomic_read(&dcp->swap_completions);
+		ktime_t t = ktime_get();
+
+		state = drm_atomic_commit_alloc(crtc->dev);
+		if (!state) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+		state->acquire_ctx = &ctx;
+		cs = drm_atomic_get_crtc_state(state, crtc);
+		if (IS_ERR(cs)) {
+			ret = PTR_ERR(cs);
+			drm_atomic_commit_put(state);
+			goto unlock;
+		}
+		cs->mode_changed = modeset;
+		ret = drm_atomic_add_affected_connectors(state, crtc);
+		if (!ret)
+			ret = drm_atomic_add_affected_planes(state, crtc);
+		if (!ret)
+			ret = drm_atomic_commit(state);
+		drm_atomic_commit_put(state);
+		if (ret == -EDEADLK)
+			goto unlock;
+		dev_dbg(dcp->dev, "wake commit %s the mode set: %d, %d swaps, %lld ms\n",
+			modeset ? "with" : "without", ret,
+			atomic_read(&dcp->swap_completions) - swaps,
+			ktime_ms_delta(ktime_get(), t));
+		if (modeset || (!ret && atomic_read(&dcp->swap_completions) != swaps))
+			break;
 	}
-	state->acquire_ctx = &ctx;
-	cs = drm_atomic_get_crtc_state(state, crtc);
-	if (IS_ERR(cs)) {
-		ret = PTR_ERR(cs);
-		goto put;
-	}
-	cs->mode_changed = true;
-	ret = drm_atomic_add_affected_connectors(state, crtc);
-	if (!ret)
-		ret = drm_atomic_add_affected_planes(state, crtc);
-	if (!ret)
-		ret = drm_atomic_commit(state);
-put:
-	drm_atomic_commit_put(state);
 unlock:
 	DRM_MODESET_LOCK_ALL_END(crtc->dev, ctx, ret);
 	return ret;

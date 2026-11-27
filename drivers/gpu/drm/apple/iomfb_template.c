@@ -866,6 +866,7 @@ static void dcp_swap_complete_id(struct apple_dcp *dcp, u32 swap_id, bool shown)
 {
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, swap_id);
+	atomic_inc(&dcp->swap_completions);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_swap_complete_v27(dcp, swap_id, now, shown,
 				      dcp_peer_queue_completion))
