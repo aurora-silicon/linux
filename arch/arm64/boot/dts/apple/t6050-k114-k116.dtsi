@@ -335,3 +335,11 @@
 	power-domains = <&ps_apcie_sys_gp>;
 };
 
+/*
+ * Port 1's DART (dart-apcie1, the SD reader's) sits in the same apcie block as port 0's and
+ * takes the same APCIE_SYS_GP, as the T6040's apcie1_dart at the same address does.
+ */
+&dart_apcie1 {
+	power-domains = <&ps_apcie_sys_gp>;
+};
+
