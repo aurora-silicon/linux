@@ -51,12 +51,13 @@
 					#size-cells = <1>;
 
 					/*
-					 * 64 KiB NVRAM v3 banks ("3VVN") from 0x24000
-					 * to 0x1f4000, as on T8140 J700.
+					 * 13 x 64 KiB NVRAM v3 banks ("3VVN") from 0x24000
+					 * to 0xf4000 (ADT /arm-io/qspi/spinor/anvram on the
+					 * 1 MiB W25Q80 boot NOR).
 					 */
 					nvram: partition@24000 {
 						label = "nvram";
-						reg = <0x24000 0x1d0000>;
+						reg = <0x24000 0xd0000>;
 					};
 				};
 			};
