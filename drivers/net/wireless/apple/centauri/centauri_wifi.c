@@ -2248,6 +2248,7 @@ static void scan_worker(struct work_struct *work)
 	struct cfg80211_scan_info info = {};
 	struct cfg80211_scan_request *request;
 	u32 channels_start, beacons_start;
+	bool alpha_halted;
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
@@ -2261,11 +2262,16 @@ static void scan_worker(struct work_struct *work)
 		ret = run_scan_tlvs(wifi, wifi->scan_request);
 	else
 		ret = run_scan_legacy(wifi);
+	/* Alpha can leave stage 2 without a fault interrupt: restart it. */
+	alpha_halted = !READ_ONCE(wifi->stopping) && !wifi->transport_paused &&
+		       readl(wifi->a.bar + 8) != 2;
 	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) ||
 		       scan_transport_stopped(wifi);
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
+	if (alpha_halted)
+		centauri_recovery_request(wifi->control, "scan: Alpha stage");
 	dev_dbg(&wifi->control->pdev->dev,
 		"Wi-Fi scan finished: rc=%d channels=%u beacons=%u\n",
 		ret, wifi->channels_seen - channels_start,
@@ -2934,7 +2940,7 @@ static void connect_worker(struct work_struct *work)
 static void link_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(to_delayed_work(work), struct centauri_wifi, link_work);
-	bool disconnected, local = false;
+	bool disconnected, alpha_halted, local = false;
 	u16 reason = WLAN_REASON_UNSPECIFIED;
 
 	mutex_lock(&wifi->lock);
@@ -2943,8 +2949,9 @@ static void link_worker(struct work_struct *work)
 		return;
 	}
 	drain(wifi);
+	alpha_halted = !READ_ONCE(wifi->stopping) && readl(wifi->a.bar + 8) != 2;
 	disconnected = wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
-		readl(wifi->a.bar + 8) != 2;
+		alpha_halted;
 	if (disconnected) {
 		reason = wifi->disconnect_reason ?: WLAN_REASON_UNSPECIFIED;
 		local = wifi->disconnect_local;
@@ -2982,6 +2989,8 @@ static void link_worker(struct work_struct *work)
 	} else {
 		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 	}
+	if (alpha_halted)
+		centauri_recovery_request(wifi->control, "link: Alpha stage");
 }
 
 /* MSI from Control or Alpha: service the data rings now instead of at the next poll. */
