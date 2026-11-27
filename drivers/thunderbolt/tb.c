@@ -247,6 +247,10 @@ static int tb_enable_clx(struct tb_switch *sw)
 	if (tb_switch_depth(sw) != 1)
 		return 0;
 
+	/* Bi-directional HiFi (non-USB4 routers, see tb_enable_tmu()) does not support CL states. */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && !tb_switch_is_usb4(sw))
+		return 0;
+
 	/*
 	 * If we are re-enabling then check if there is an active DMA
 	 * tunnel and in that case bail out.
@@ -363,6 +367,21 @@ static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
 
+	/*
+	 * Not for USB4 routers: a host router whose firmware runs its TMU applies a mode only
+	 * on the enhanced uni-directional path below, and a dock's DP OUT has no clock without it.
+	 */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && tb_route(sw) &&
+	    !tb_switch_is_usb4(sw)) {
+		ret = tb_switch_clx_disable(sw);
+		if (ret < 0)
+			return ret;
+		ret = tb_switch_tmu_configure(sw, TB_SWITCH_TMU_MODE_HIFI_BI);
+		if (ret)
+			return ret;
+		goto reenable;
+	}
+
 	/* The host router's firmware runs its TMU on these hosts. */
 	if (!tb_route(sw) && tb_switch_tmu_host_managed(sw))
 		return 0;
@@ -409,6 +428,7 @@ static int tb_enable_tmu(struct tb_switch *sw)
 	if (tb_switch_tmu_is_enabled(sw))
 		return 0;
 
+reenable:
 	ret = tb_switch_tmu_disable(sw);
 	if (ret)
 		return ret;
@@ -1451,6 +1471,10 @@ static void tb_scan_port(struct tb_port *port)
 	 * enabled for the upstream port of the router so we do it here.
 	 */
 	tb_switch_configuration_valid(sw);
+
+	/* TEST (J714s): then the link's PM roles, where macOS gives them. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to set the PM roles of its link\n");
 
 	/* Scan upstream retimers */
 	tb_retimer_scan(upstream_port, true);
@@ -4082,6 +4106,10 @@ static void tb_restore_children(struct tb_switch *sw)
 		tb_sw_warn(sw, "failed to restore TMU configuration\n");
 
 	tb_switch_configuration_valid(sw);
+
+	/* TEST (J714s): then the link's PM roles, where macOS gives them after a wake. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to restore the PM roles of its link\n");
 
 	tb_switch_for_each_port(sw, port) {
 		if (!tb_port_has_remote(port) && !port->xdomain)

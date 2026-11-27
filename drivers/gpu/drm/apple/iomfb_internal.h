@@ -66,11 +66,11 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 #define TRAMPOLINE_IN(func, handler, T_in)                                    \
 	typedef void (*callback_##handler)(struct apple_dcp *, T_in *);       \
-                                                                              \
+									      \
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		callback_##handler cb = handler;                              \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		cb(dcp, in);                                                  \
 		return true;                                                  \
@@ -78,12 +78,12 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 #define TRAMPOLINE_INOUT(func, handler, T_in, T_out)                          \
 	typedef T_out (*callback_##handler)(struct apple_dcp *, T_in *);      \
-                                                                              \
+									      \
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		T_out *typed_out = out;                                       \
 		callback_##handler cb = handler;                              \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		*typed_out = cb(dcp, in);                                     \
 		return true;                                                  \
@@ -93,7 +93,7 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		T_out *typed_out = out;                                       \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		*typed_out = handler(dcp);                                    \
 		return true;                                                  \
@@ -116,11 +116,20 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out);
 
+/* One line for an external display's link, sink and mode, after a mode set. */
+void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+
 u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		 struct drm_atomic_commit *commit);
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit);
 void dcp_hdr_metadata_forget(struct apple_dcp *dcp);
+void dcp_hdr_service_bind(struct apple_epic_service *service);
+void dcp_hdr_service_unbind(struct apple_epic_service *service);
+int iomfb_ext26_blank(struct apple_dcp *dcp);
+bool iomfb_ext26_backing_fresh(struct apple_dcp *dcp, struct drm_framebuffer *fb);
+int iomfb_ext26_retain_epoch(struct apple_dcp *dcp);
+bool iomfb_ext26_control_complete(struct apple_dcp *dcp, u32 id, bool aborted);
 int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
 		    void *data, dcp_callback_t cb, void *cookie);

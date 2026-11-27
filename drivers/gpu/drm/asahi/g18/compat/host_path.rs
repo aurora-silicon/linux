@@ -114,7 +114,7 @@
 //! each policy at `g17p_feed_perf_pct` percent of that policy's maximum.
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use kernel::{bindings, module_param::KernelParam};
+use kernel::bindings;
 
 pub(crate) const EARLY_PUBLISH: u32 = 1 << 0;
 pub(crate) const FEED_PERF: u32 = 1 << 1;
@@ -713,68 +713,38 @@ static PCT_P_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static PCT_E_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(pct_e_set), get: Some(pct_e_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static MASK_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_host_path"
-    } else { c"aurora.g17p_host_path" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&MASK_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
-#[link_section = "__param"]
-#[used]
-static PCT_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_feed_perf_pct"
-    } else { c"aurora.g17p_feed_perf_pct" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PCT_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
-#[link_section = "__param"]
-#[used]
-static DEPTH_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_early_depth"
-    } else { c"aurora.g17p_early_depth" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&DEPTH_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
-#[link_section = "__param"]
-#[used]
-static PCT_P_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_feed_perf_pct_p"
-    } else { c"aurora.g17p_feed_perf_pct_p" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PCT_P_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
-#[link_section = "__param"]
-#[used]
-static PCT_E_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_feed_perf_pct_e"
-    } else { c"aurora.g17p_feed_perf_pct_e" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PCT_E_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    MASK_PARAM,
+    "g17p_host_path",
+    ops: core::ptr::from_ref(&MASK_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
+crate::g18::params::g18_kernel_param!(
+    PCT_PARAM,
+    "g17p_feed_perf_pct",
+    ops: core::ptr::from_ref(&PCT_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
+crate::g18::params::g18_kernel_param!(
+    DEPTH_PARAM,
+    "g17p_early_depth",
+    ops: core::ptr::from_ref(&DEPTH_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
+crate::g18::params::g18_kernel_param!(
+    PCT_P_PARAM,
+    "g17p_feed_perf_pct_p",
+    ops: core::ptr::from_ref(&PCT_P_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
+crate::g18::params::g18_kernel_param!(
+    PCT_E_PARAM,
+    "g17p_feed_perf_pct_e",
+    ops: core::ptr::from_ref(&PCT_E_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);

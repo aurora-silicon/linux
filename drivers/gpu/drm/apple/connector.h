@@ -59,6 +59,9 @@ struct apple_connector {
 	bool edid_live;
 	u64 drm_edid_generation;
 	u64 drm_edid_service_epoch;
+	/* The published EDID's identity, for the link report: maker, product, block 0's CRC */
+	u16 edid_maker, edid_product;
+	u32 edid_crc;
 
 	/* Workqueue for sending hotplug events to the associated device */
 	struct work_struct hotplug_wq;

@@ -314,10 +314,17 @@ static const struct apple_soc_cpufreq_info soc_t8142_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
-/* T8152 ACC uses state 2 as the first OPP and shares P/M requests. */
+/*
+ * T8152 ACC uses state 2 as the first OPP and shares P/M requests. It has no
+ * PMP fast die-temperature loop, so states above 3 are held back until the
+ * board's thermal policy takes ownership, see
+ * apple_soc_cpufreq_set_thermal_owner(): the SMC thermal zones once they
+ * throttle the cluster (macsmc-hwmon). This bootstrap ceiling is a Linux
+ * restriction, not a firmware thermal or safety limit.
+ */
 static const struct apple_soc_cpufreq_info soc_t8152_info = {
 	.verify_transition = true,
-	.needs_thermal_policy = true,
+	.needs_thermal_owner = true,
 	.transition_timeout_us = 2000,
 	.max_unmanaged_pstate = 3,
 	.min_pstate = 2,
@@ -1626,6 +1633,19 @@ static int __init apple_soc_cpufreq_module_init(void)
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return -ENODEV;
+
+	/*
+	 * Boost only means something with turbo-mode OPPs. Without any, no
+	 * policy supports it, and turning it on through the global "boost"
+	 * file fails with -EINVAL; power-profiles-daemon then cannot set its
+	 * profile. Offer no boost control on such SoCs.
+	 */
+	np = of_find_node_with_property(NULL, "turbo-mode");
+	if (np)
+		of_node_put(np);
+	else
+		apple_soc_cpufreq_driver.set_boost = NULL;
+
 	if (of_machine_is_compatible("apple,t8132")) {
 		apple_soc_cpufreq_driver.online = apple_soc_cpufreq_online;
 		apple_soc_cpufreq_driver.offline = apple_soc_cpufreq_offline;
@@ -1652,6 +1672,18 @@ static int __init apple_soc_cpufreq_module_init(void)
 			apple_fast_die_hp_state = ret;
 	}
 
+	/*
+	 * Start with boost enabled, so that the turbo-mode states are usable
+	 * without userspace having to turn boost on first. It can still be
+	 * switched off globally or per policy through sysfs.
+	 *
+	 * Not on T8112: there the turbo-mode states do not raise the clock
+	 * the P-cores deliver, they only run them hotter. Boost stays off by
+	 * default and can still be switched on through sysfs.
+	 */
+	if (!of_machine_is_compatible("apple,t8112"))
+		apple_soc_cpufreq_driver.boost_enabled = true;
+
 	ret = cpufreq_register_driver(&apple_soc_cpufreq_driver);
 	if (ret && apple_fast_die_hp_state > 0)
 		cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
@@ -1667,6 +1699,10 @@ static void __exit apple_soc_cpufreq_module_exit(void)
 		cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
 }
 module_exit(apple_soc_cpufreq_module_exit);
+
+#if IS_ENABLED(CONFIG_ARM_APPLE_SOC_CPUFREQ_KUNIT_TEST)
+#include "apple-soc-cpufreq-test.c"
+#endif
 
 MODULE_DEVICE_TABLE(of, apple_soc_cpufreq_of_match);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");

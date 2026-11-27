@@ -14,7 +14,8 @@
 use kernel::{
     mm::Mm,
     prelude::*,
-    sync::aref::ARef, //
+    sync::aref::ARef,
+    task::Pid, //
 };
 
 kernel::sync::global_lock! {
@@ -38,6 +39,9 @@ pub(crate) struct Process {
     /// Keeps the `mm_struct`, and with it `key`, from being reused while queues count against it.
     _mm: Option<ARef<Mm>>,
     held: u32,
+    /// The process that took the first of these queues, for the capacity snapshot.
+    tgid: Pid,
+    comm: [u8; 16],
 }
 
 /// Queues kept free for the other processes once one process holds half of the device's `max`.
@@ -61,7 +65,44 @@ fn take(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u3
     }
     match index {
         Some(index) => processes[index].held += 1,
-        None => processes.push(Process { key, _mm: mm, held: 1 }, GFP_KERNEL)?,
+        None => {
+            let (tgid, comm) = current_name();
+            processes.push(Process { key, _mm: mm, held: 1, tgid, comm }, GFP_KERNEL)?
+        }
+    }
+    Ok(())
+}
+
+/// The current thread group and the current thread's name.
+fn current_name() -> (Pid, [u8; 16]) {
+    let task = kernel::current!();
+    // SAFETY: `comm` is a fixed array inside the live current task. A concurrent rename by
+    // another thread of the process may tear the copy, as with C's unlocked `current->comm`.
+    let comm: [u8; 16] =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*task.as_ptr()).comm).cast()) };
+    (task.tgid(), comm)
+}
+
+/// Writes the device's queue share for the capacity snapshot: the limit, its reserve, the
+/// queues held and, largest first, the processes holding the most.
+pub(crate) fn write_capacity(f: &mut kernel::fmt::Formatter<'_>, max: u32) -> kernel::fmt::Result {
+    const SHOWN: usize = 8;
+    let processes = PROCESSES.lock();
+    let held = processes.iter().map(|process| process.held).sum::<u32>();
+    writeln!(f, "queue_share held={} max={} reserve={} processes={}", held, max, reserve(max),
+             processes.len())?;
+    let mut shown = [usize::MAX; SHOWN];
+    for slot in 0..SHOWN {
+        let next = (0..processes.len())
+            .filter(|index| !shown[..slot].contains(index))
+            .max_by_key(|&index| processes[index].held);
+        let Some(index) = next else { break };
+        shown[slot] = index;
+        let process = &processes[index];
+        let len = process.comm.iter().position(|&b| b == 0).unwrap_or(process.comm.len());
+        // The name last: it may contain spaces.
+        writeln!(f, "queue_share_process tgid={} held={} comm={}", process.tgid, process.held,
+                 core::str::from_utf8(&process.comm[..len]).unwrap_or("?"))?;
     }
     Ok(())
 }

@@ -9,6 +9,7 @@
 use super::fw::buffer as fw;
 use crate::hw::t8140::resources as cfg;
 pub(crate) mod target;
+pub(crate) mod compact;
 mod geometry;
 pub(crate) use geometry::BlockGeometry;
 mod layout;
@@ -228,6 +229,10 @@ impl Scenes {
     }
 }
 
+unsafe extern "C" {
+    fn asahi_g17_mesh_tvb_floor() -> u32;
+}
+
 /// A snapshot of the block ring; all values are modulo its fixed capacity.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursors {
@@ -332,6 +337,23 @@ fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum
     )
 }
 
+/// Whether `bytes` more kernel memory keeps the device's GPU memory more than an
+/// eighth below the device limit, and `client`'s committed memory more than an
+/// eighth below the per-client limit (`memacct`). A busy pair's growth is only
+/// ahead of need, so it never takes the device or a client close to a limit;
+/// firmware grow requests still serve the pair.
+fn busy_growth_admitted(bytes: u64, client: Option<&Arc<crate::memacct::Client>>) -> bool {
+    let ledger = &crate::memacct::LEDGER;
+    let within = |used: u64, limit: u64| limit == 0 || used.saturating_add(bytes) <= limit - limit / 8;
+    within(
+        ledger.user_committed.load(Ordering::Relaxed)
+            .saturating_add(ledger.kernel_resident.load(Ordering::Relaxed)),
+        ledger.limit.load(Ordering::Relaxed),
+    ) && client.is_none_or(|client| {
+        within(client.committed(), ledger.client_limit.load(Ordering::Relaxed))
+    })
+}
+
 use super::object::{CpuMap, KernelObject};
 use crate::{driver::AsahiDrmDevice, mmu};
 use core::ops::Range;
@@ -393,6 +415,18 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
+    /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
+    /// the compact window, which is checked for room for all of them first, and the client's
+    /// passes and geometry size them, so they are charged to the client.
+    fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
+        -> Result<KernelObject> {
+        let bytes = Self::backing_bytes(geometry, blocks)?;
+        if geometry == BlockGeometry::NEO {
+            return KernelObject::backing(dev, bytes, CpuMap::WriteCombined);
+        }
+        compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
+        KernelObject::client_backing(dev, bytes, vm.memory_client())
+    }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
@@ -402,9 +436,8 @@ impl Tvb {
         if geometry != BlockGeometry::NEO {
             let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
             let source = start..start.checked_add(geometry.block_bytes).ok_or(EOVERFLOW)?;
-            let guard = geometry.stride - geometry.block_bytes;
-            let mapping = object.map_range(vm, source, geometry.base..geometry.end,
-                BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, guard)?;
+            let mapping = compact::PairObject::ParameterBlock.map(object, vm, source,
+                mmu::PROT_GPU_SHARED_RW)?;
             geometry.compact_page(mapping.iova())?;
             return Ok(mapping);
         }
@@ -437,8 +470,7 @@ impl Tvb {
         if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = KernelObject::backing(dev, Self::backing_bytes(geometry, blocks)?,
-            CpuMap::WriteCombined)?;
+        let backing = Self::allocate(dev, vm, geometry, blocks)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
@@ -490,8 +522,7 @@ impl Tvb {
         let added = target - self.blocks();
         self.extensions.reserve(1, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = KernelObject::backing(dev, Self::backing_bytes(self.geometry, added)?,
-            CpuMap::WriteCombined)?;
+        let backing = Self::allocate(dev, vm, self.geometry, added)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
         for relative in 0..added {
@@ -547,14 +578,17 @@ impl MetricsIds {
     /// backing each lease is taken from.
     pub(crate) fn with_stride(scene_stride: usize) -> Result<Self> {
         if scene_stride < 4 || scene_stride % 4 != 0 { return Err(EINVAL); }
-        let entry_pitch = scene_stride.checked_mul(fw::SCENES)
-            .and_then(|bytes| bytes.checked_next_multiple_of(mmu::UAT_PGSZ))
-            .ok_or(EOVERFLOW)?;
         Ok(Self {
             used: [AtomicU64::new(0), AtomicU64::new(0)],
             scene_stride,
-            entry_pitch,
+            entry_pitch: Self::entry_pitch(scene_stride)?,
         })
+    }
+    /// The pitch of entries of `scene_stride`-byte scenes: each starts its own pages.
+    pub(crate) fn entry_pitch(scene_stride: usize) -> Result<usize> {
+        scene_stride.checked_mul(fw::SCENES)
+            .and_then(|bytes| bytes.checked_next_multiple_of(mmu::UAT_PGSZ))
+            .ok_or(EOVERFLOW)
     }
     /// Backing required for every entry owned by this allocator.
     pub(crate) fn storage_bytes(&self) -> Result<usize> {
@@ -586,14 +620,14 @@ impl MetricsLease {
         // window's start (InitData::bind_m5_metrics), so place the entry where its offset puts
         // it there.
         let fixed = super::J813_FORMS.load(Ordering::Relaxed).then(|| {
-            let at = BlockGeometry::M5_COMPACT.start + offset as u64;
-            self.backing.map_range(vm, offset..offset + pitch, at..at + pitch as u64,
-                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0).ok()
+            let at = compact::WINDOW.start + offset as u64;
+            compact::PairObject::Metrics.map_at(&self.backing, vm, offset..offset + pitch, at,
+                mmu::PROT_GPU_SHARED_RW).ok()
         }).flatten();
         let client = match fixed {
             Some(client) => client,
-            None => self.backing.map_range(vm, offset..offset + pitch, BlockGeometry::M5_COMPACT,
-                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0)?,
+            None => compact::PairObject::Metrics.map(&self.backing, vm, offset..offset + pitch,
+                mmu::PROT_GPU_SHARED_RW)?,
         };
         self.addresses.client = client.iova();
         self.client = Some(client);
@@ -683,6 +717,8 @@ pub(crate) struct ManagerArgs {
     pub(crate) buffer_id: u8,
     pub(crate) generation: u64,
     pub(crate) first_ordinal: u64,
+    /// The heap's normal maximum in blocks (`Variant::tvb_normal_blocks`); NEO heaps only.
+    pub(crate) normal_blocks: usize,
 }
 
 /// A retained parameter-buffer graph and all of its sparse backing. Client
@@ -741,6 +777,14 @@ struct Shrink {
     window: [u32; SHRINK_WINDOW],
     window_next: usize,
     busy_peak: u32,
+    /// Blocks before the first growth the host made while the pair was busy,
+    /// since the last idle growth or the shrink that gave it back (0: none).
+    /// An idle shrink may return to this size: that growth only serves
+    /// renders overlapping in flight.
+    busy_base: usize,
+    /// Host ns before which a busy pair is not grown again after a growth
+    /// was refused or failed.
+    busy_retry: u64,
 }
 
 pub(crate) struct Submitted<'a> {
@@ -764,7 +808,13 @@ impl Manager {
     ) -> Result<Self> {
         let geometry = tvb.geometry;
         let neo = geometry == BlockGeometry::NEO;
-        let layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        let mut layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        if neo {
+            if args.normal_blocks == 0 || args.normal_blocks > geometry.max_blocks() {
+                return Err(EINVAL);
+            }
+            layout.normal_blocks = args.normal_blocks;
+        }
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
         }
@@ -785,8 +835,7 @@ impl Manager {
                 mmu::UAT_PGSZ,
             )?
         } else {
-            graph.map_range(vm, source, geometry.base..geometry.end,
-                cfg::TVB_PAGE, mmu::PROT_GPU_FW_SHARED_RW, mmu::UAT_PGSZ)?
+            compact::PairObject::PageList.map(&graph, vm, source, mmu::PROT_GPU_FW_SHARED_RW)?
         };
         let address = graph.gpu_va();
         let graph_args = fw::GraphArgs {
@@ -798,6 +847,7 @@ impl Manager {
             discard: args.discard,
             buffer_id: args.buffer_id.into(),
             generation: args.generation,
+            normal_blocks: layout.normal_blocks,
         };
         if neo {
             graph.initialize::<fw::Graph>(0, |view| view.init(&graph_args))?;
@@ -848,6 +898,14 @@ impl Manager {
     /// The most blocks this buffer's geometry can hold.
     pub(crate) fn max_blocks(&self) -> usize {
         self.tvb.geometry.max_blocks()
+    }
+    /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
+    /// (`aurora.g17_mesh_tvb_floor`): the size its automatic growth reaches.
+    /// None on other heaps, or with the switch off.
+    pub(crate) fn mesh_floor(&self) -> Option<usize> {
+        // SAFETY: Reads a module parameter; no other effect.
+        let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.layout.normal_blocks)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.
@@ -952,6 +1010,51 @@ impl Manager {
         Ok(automatic_target_for(pages as usize, self.blocks(), self.tvb.geometry.pages(),
             self.layout.normal_blocks))
     }
+    /// The growth of a pair with work in flight ahead of a render that needs
+    /// `required` blocks at `now`: the layout's blocks, or the automatic target
+    /// from the page high-water since the last sample, which is read without
+    /// requesting its reset (the idle growth check and the shrink period own the
+    /// samples). None keeps the heap: the growth is not needed, waits for a
+    /// retry after a refusal, or would take the device or `client` within an
+    /// eighth of a memory limit (it is then retried a shrink period later).
+    pub(crate) fn busy_target(
+        &mut self,
+        required: usize,
+        now: u64,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result<Option<usize>> {
+        // Every heap of the block geometry the A18 Pro and the M4 Pro and Max share takes
+        // appended blocks while the firmware uses it, the path its grow requests take. M5
+        // heaps have their own geometry and are never shrunk (`shrinkable`), so growth made
+        // for renders in flight together would never be given back.
+        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.busy_retry {
+            return Ok(None);
+        }
+        let max_pages = self
+            .graph
+            .word(self.layout.control + core::mem::offset_of!(fw::Control, max_pages))?;
+        fence(Ordering::Acquire);
+        let pages = max_pages.load(Ordering::Relaxed) as usize;
+        let current = self.blocks();
+        let feedback = automatic_target_for(pages, current, self.tvb.geometry.pages(),
+            self.layout.normal_blocks).unwrap_or(0);
+        let target = required.max(feedback).min(self.max_blocks());
+        if target <= current {
+            return Ok(None);
+        }
+        let bytes = Tvb::backing_bytes(self.tvb.geometry, target - current)? as u64;
+        if !busy_growth_admitted(bytes, client) {
+            self.defer_busy_growth(now);
+            super::trace::heap(super::trace::HEAP_HOST_BUSY, false, current, current);
+            return Ok(None);
+        }
+        Ok(Some(target))
+    }
+    /// A busy pair's growth was refused or failed at `now`: retry a shrink
+    /// period later.
+    pub(crate) fn defer_busy_growth(&mut self, now: u64) {
+        self.shrink.busy_retry = now.saturating_add(SHRINK_PERIOD_NS);
+    }
     /// Records the blocks a pass layout requires, the floor of any shrink.
     /// A pass is being prepared at `now`; the heap counts as busy.
     pub(crate) fn note_required(&mut self, blocks: usize, now: u64) {
@@ -965,7 +1068,22 @@ impl Manager {
         let recent = (self.shrink.busy_peak as usize)
             .saturating_mul(2)
             .div_ceil(cfg::TVB_PAGES_PER_BLOCK);
-        self.tvb.primary_blocks().max(self.shrink.required).max(recent)
+        let minimum = self.tvb.primary_blocks().max(self.shrink.required);
+        // Growth made while the pair was busy goes back down to the size it had
+        // before, also below the recent peak, which counts renders in flight
+        // together.
+        let busy = if self.shrink.busy_base != 0 {
+            minimum.max(self.shrink.busy_base)
+        } else {
+            usize::MAX
+        };
+        minimum.max(recent).min(busy)
+    }
+    /// The host grew this heap from `previous` blocks while the pair was busy.
+    pub(crate) fn note_busy_growth(&mut self, previous: usize) {
+        if self.shrink.busy_base == 0 {
+            self.shrink.busy_base = previous;
+        }
     }
     /// Whether the heap holds growth beyond its primary backing.
     /// M5 heaps are never shrunk.
@@ -1208,6 +1326,8 @@ impl Manager {
             write(at + 4, 0);
         }
         if descriptor.is_some() {
+            // An idle growth sizes the heap for the recent load, busy growth included.
+            self.shrink.busy_base = 0;
             for (entry, value) in rebuilt.into_iter().enumerate() {
                 write(self.layout.pages + entry * 4, value);
             }
@@ -1323,6 +1443,10 @@ impl Manager {
             }
         }
         self.shrink.credit = self.shrink.credit.saturating_sub(blocks - kept);
+        if kept <= self.shrink.busy_base {
+            self.shrink.busy_base = 0;
+        }
+        super::trace::heap(super::trace::HEAP_SHRINK, true, blocks, kept);
         Ok(Some((
             fw::reload_descriptor(descriptor, self.page_list_client, pages),
             release,

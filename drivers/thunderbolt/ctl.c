@@ -13,6 +13,11 @@
 #include <linux/pci.h>
 #include <linux/dmapool.h>
 #include <linux/workqueue.h>
+#include <linux/kobject.h>
+#include <linux/moduleparam.h>
+#include <linux/sched/clock.h>
+#include <linux/sysfs.h>
+#include <linux/vmalloc.h>
 #include <kunit/static_stub.h>
 
 #include "ctl.h"
@@ -74,6 +79,340 @@ struct tb_ctl {
 
 #define tb_ctl_dbg_once(ctl, format, arg...) \
 	dev_dbg_once((ctl)->nhi->dev, format, ## arg)
+
+/*
+ * TEST: a record of the control frames, for kernels built without the tracepoints' file
+ * system. Writing 1 to the module parameter cio_frames starts a new record (the first
+ * TB_CFR_MAX frames of every domain, sent and received, at most TB_CFR_WORDS words of each,
+ * in CPU order, without the checksum); writing 0 stops it and makes the text read from
+ * /sys/kernel/thunderbolt_cio_frames: one line a frame,
+ *	<kernel clock> d<domain> TX|RX|EV t<frame type> <bytes> <words...>
+ * Nothing is printed while frames are recorded.
+ */
+#define TB_CFR_MAX	16384
+#define TB_CFR_WORDS	32
+
+struct tb_cfr {
+	u64 ns;
+	u16 size;
+	u8 index;
+	u8 dir;
+	u8 type;
+	u32 w[TB_CFR_WORDS];
+};
+
+static DEFINE_SPINLOCK(tb_cfr_lock);
+static DEFINE_MUTEX(tb_cfr_text_lock);
+static struct tb_cfr *tb_cfr;
+static unsigned int tb_cfr_n, tb_cfr_lost;
+static bool tb_cfr_on, tb_cfr_file;
+static char *tb_cfr_text;
+static size_t tb_cfr_len;
+
+enum { TB_CFR_TX, TB_CFR_RX, TB_CFR_EV };
+
+static void tb_cfr_add(const struct tb_ctl *ctl, u8 dir, u8 type, const void *data, size_t size)
+{
+	struct tb_cfr *r;
+	unsigned long flags;
+
+	if (!READ_ONCE(tb_cfr_on))
+		return;
+	spin_lock_irqsave(&tb_cfr_lock, flags);
+	if (!tb_cfr_on || !tb_cfr) {
+		spin_unlock_irqrestore(&tb_cfr_lock, flags);
+		return;
+	}
+	if (tb_cfr_n >= TB_CFR_MAX) {
+		tb_cfr_lost++;
+		spin_unlock_irqrestore(&tb_cfr_lock, flags);
+		return;
+	}
+	r = &tb_cfr[tb_cfr_n++];
+	r->ns = local_clock();
+	r->size = size;
+	r->index = ctl->index;
+	r->dir = dir;
+	r->type = type;
+	memcpy(r->w, data, min_t(size_t, size, sizeof(r->w)));
+	spin_unlock_irqrestore(&tb_cfr_lock, flags);
+}
+
+static ssize_t tb_cfr_read(struct file *file, struct kobject *kobj, const struct bin_attribute *attr,
+			   char *buf, loff_t off, size_t count)
+{
+	guard(mutex)(&tb_cfr_text_lock);
+	if (!tb_cfr_text)
+		return 0;
+	return memory_read_from_buffer(buf, count, &off, tb_cfr_text, tb_cfr_len);
+}
+
+static const struct bin_attribute tb_cfr_attr = {
+	.attr = { .name = "thunderbolt_cio_frames", .mode = 0400 },
+	.read = tb_cfr_read,
+};
+
+/* Called with the record stopped. */
+static void tb_cfr_format(void)
+{
+	static const char * const dir[] = { "TX", "RX", "EV" };
+	size_t max = (size_t)tb_cfr_n * (48 + 9 * TB_CFR_WORDS) + 128, len = 0;
+	char *text = vmalloc(max);
+
+	if (!text)
+		return;
+	for (unsigned int i = 0; i < tb_cfr_n; i++) {
+		const struct tb_cfr *r = &tb_cfr[i];
+		unsigned int words = min_t(unsigned int, r->size / 4, TB_CFR_WORDS);
+
+		len += scnprintf(text + len, max - len, "%llu.%06llu d%u %s t%u %u",
+				 r->ns / NSEC_PER_SEC, (r->ns % NSEC_PER_SEC) / NSEC_PER_USEC,
+				 r->index, dir[r->dir], r->type, r->size);
+		for (unsigned int j = 0; j < words; j++)
+			len += scnprintf(text + len, max - len, " %08x", r->w[j]);
+		len += scnprintf(text + len, max - len, "\n");
+	}
+	len += scnprintf(text + len, max - len, "# %u frames, %u more not recorded\n",
+			 tb_cfr_n, tb_cfr_lost);
+	vfree(tb_cfr_text);
+	tb_cfr_text = text;
+	tb_cfr_len = len;
+}
+
+static int tb_cfr_set(const char *val, const struct kernel_param *kp)
+{
+	struct tb_cfr *new = NULL;
+	bool on;
+	int ret;
+
+	ret = kstrtobool(val, &on);
+	if (ret)
+		return ret;
+	guard(mutex)(&tb_cfr_text_lock);
+	if (on) {
+		if (!tb_cfr) {
+			new = vzalloc(array_size(TB_CFR_MAX, sizeof(*new)));
+			if (!new)
+				return -ENOMEM;
+		}
+		if (!tb_cfr_file) {
+			ret = sysfs_create_bin_file(kernel_kobj, &tb_cfr_attr);
+			if (ret) {
+				vfree(new);
+				return ret;
+			}
+			tb_cfr_file = true;
+		}
+	}
+	scoped_guard(spinlock_irqsave, &tb_cfr_lock) {
+		if (new)
+			tb_cfr = new;
+		if (on) {
+			tb_cfr_n = 0;
+			tb_cfr_lost = 0;
+		}
+		tb_cfr_on = on;
+	}
+	if (!on && tb_cfr)
+		tb_cfr_format();
+	return 0;
+}
+
+static int tb_cfr_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d %u %u\n", READ_ONCE(tb_cfr_on), READ_ONCE(tb_cfr_n),
+			  READ_ONCE(tb_cfr_lost));
+}
+
+static const struct kernel_param_ops tb_cfr_ops = { .set = tb_cfr_set, .get = tb_cfr_get };
+module_param_cb(cio_frames, &tb_cfr_ops, NULL, 0644);
+MODULE_PARM_DESC(cio_frames,
+		 "TEST: 1 starts a record of the control frames, 0 stops it; the text is /sys/kernel/thunderbolt_cio_frames (read back: on, frames, frames not recorded)");
+
+void tb_ctl_frames_exit(void)
+{
+	guard(mutex)(&tb_cfr_text_lock);
+	scoped_guard(spinlock_irqsave, &tb_cfr_lock)
+		tb_cfr_on = false;
+	if (tb_cfr_file)
+		sysfs_remove_bin_file(kernel_kobj, &tb_cfr_attr);
+	tb_cfr_file = false;
+	vfree(tb_cfr_text);
+	tb_cfr_text = NULL;
+	vfree(tb_cfr);
+	tb_cfr = NULL;
+}
+
+/*
+ * TEST (sv6t9, J714s): the writes of a T6050 host's sleep in place against what macOS sent
+ * there (run mxt6, both sleeps; mxt6b the same), from the dock's PORT_CS_19 writes to the
+ * state save's operation, and the acknowledgment of the host lane adapter's unplug anywhere
+ * behind the vendor request (macOS: between the save's data and its operation; here it
+ * comes from the event path, whose place among the writes is not fixed). The dock's
+ * ROUTER_CS_5 is compared in its low byte, the sleep bit and the wakes: its upper bits come
+ * from its enumeration (macOS's dock reads 0x97000000, sv6t8's 0x83000000). The adapter
+ * numbers are this rig's: dock lane adapters 1, 3, 5 and 7, the host's lane adapter 1.
+ */
+struct tb_cfr_want {
+	u8 route;
+	u8 space;
+	u8 port;
+	u8 len;
+	u16 off;
+	u32 val;
+	u32 mask;
+};
+
+static const struct tb_cfr_want tb_cfr_macos_sleep[] = {
+	{ 1, TB_CFG_PORT,   1,  1, 0xd3, 0x800f000e, ~0U },
+	{ 1, TB_CFG_PORT,   3,  1, 0xd3, 0x000f0006, ~0U },
+	{ 1, TB_CFG_PORT,   5,  1, 0xd3, 0x000f0006, ~0U },
+	{ 1, TB_CFG_PORT,   7,  1, 0xd3, 0x000f0006, ~0U },
+	{ 1, TB_CFG_SWITCH, 0,  1, 0x05, 0x97000006, 0xff },
+	{ 1, TB_CFG_SWITCH, 0,  1, 0x05, 0x97000007, 0xff },
+	{ 0, TB_CFG_PORT,   1,  1, 0x29, 0x800f000e, ~0U },
+	{ 0, TB_CFG_SWITCH, 0,  1, 0x05, 0x00000006, ~0U },
+	{ 0, TB_CFG_PORT,   1,  1, 0x29, 0x8004000e, ~0U },
+	{ 0, TB_CFG_SWITCH, 0,  1, 0x05, 0x00000000, ~0U },
+	{ 0, TB_CFG_SWITCH, 0,  1, 0x05, 0x00000001, ~0U },
+	{ 0, TB_CFG_SWITCH, 0,  1, 0x40, 0x00000001, ~0U },
+	{ 0, TB_CFG_SWITCH, 0, 17, 0x09, 0x00000000, ~0U },	/* 16 words of 0, metadata 0 */
+	{ 0, TB_CFG_SWITCH, 0,  1, 0x1a, 0x80008000, ~0U },
+};
+
+struct tb_cfr_got {
+	u64 route;
+	u8 space;
+	u8 port;
+	u8 len;
+	u16 off;
+	u32 val;
+	bool zero;
+};
+
+static const char *tb_cfr_space(u8 space)
+{
+	static const char * const names[] = { "path", "adapter", "router", "counters" };
+
+	return names[space & 3];
+}
+
+/* A write request as the record keeps it: CPU order, before the byte swap and the CRC. */
+static bool tb_cfr_get_write(const struct tb_cfr *r, struct tb_cfr_got *g)
+{
+	unsigned int words = min_t(unsigned int, r->size / 4, TB_CFR_WORDS);
+	u32 addr;
+
+	if (r->dir != TB_CFR_TX || r->type != TB_CFG_PKG_WRITE || words < 4)
+		return false;
+	addr = r->w[2];
+	g->route = ((u64)(r->w[0] & GENMASK(21, 0)) << 32) | r->w[1];
+	g->off = addr & GENMASK(12, 0);
+	g->len = (addr >> 13) & GENMASK(5, 0);
+	g->port = (addr >> 19) & GENMASK(5, 0);
+	g->space = (addr >> 25) & GENMASK(1, 0);
+	g->val = r->w[3];
+	g->zero = true;
+	for (unsigned int i = 3; i < words; i++) {
+		if (r->w[i])
+			g->zero = false;
+	}
+	return true;
+}
+
+static bool tb_cfr_host_unplug_ack(const struct tb_cfr *r)
+{
+	u32 w;
+
+	if (r->dir != TB_CFR_TX || r->type != TB_CFG_PKG_ERROR || r->size < 12)
+		return false;
+	w = r->w[2];
+	return !(r->w[0] & GENMASK(21, 0)) && !r->w[1] &&
+	       (w & 0xff) == TB_CFG_ERROR_ACK_PLUG_EVENT && ((w >> 8) & 0x3f) == 1 &&
+	       (w >> 30) == TB_CFG_ERROR_PG_HOT_UNPLUG;
+}
+
+/* Returns how many of macOS's writes came in its order; @buf gets the line's text. */
+int tb_ctl_frames_sleep_check(struct tb_ctl *ctl, char *buf, size_t size)
+{
+	const unsigned int want = ARRAY_SIZE(tb_cfr_macos_sleep);
+	struct tb_cfr_got got[ARRAY_SIZE(tb_cfr_macos_sleep) + 1], g;
+	bool in = false, requested = false, acked = false;
+	unsigned int i, n = 0, total = 0, same = 0;
+	unsigned long flags;
+	size_t len;
+
+	spin_lock_irqsave(&tb_cfr_lock, flags);
+	if (!tb_cfr || !tb_cfr_on) {
+		spin_unlock_irqrestore(&tb_cfr_lock, flags);
+		scnprintf(buf, size, "no frame record running (cio_frames)");
+		return -ENODATA;
+	}
+	for (i = 0; i < tb_cfr_n; i++) {
+		const struct tb_cfr *r = &tb_cfr[i];
+
+		if (r->index != ctl->index)
+			continue;
+		if (tb_cfr_get_write(r, &g)) {
+			/* The dock's first PORT_CS_19 write opens the window, again after a request. */
+			if (g.route == 1 && g.space == TB_CFG_PORT && g.off == 0xd3 &&
+			    (!in || requested)) {
+				in = true;
+				requested = false;
+				acked = false;
+				n = 0;
+				total = 0;
+			}
+			if (!in)
+				continue;
+			total++;
+			if (n < ARRAY_SIZE(got))
+				got[n++] = g;
+			if (!g.route && g.space == TB_CFG_SWITCH && g.off == 0x40)
+				requested = true;
+		} else if (in && requested && tb_cfr_host_unplug_ack(r)) {
+			acked = true;
+		}
+	}
+	spin_unlock_irqrestore(&tb_cfr_lock, flags);
+
+	for (i = 0; i < min(n, want); i++) {
+		const struct tb_cfr_want *w = &tb_cfr_macos_sleep[i];
+		const struct tb_cfr_got *x = &got[i];
+
+		if (x->route != w->route || x->space != w->space || x->port != w->port ||
+		    x->off != w->off || x->len != w->len)
+			break;
+		if (w->len > 1 ? !x->zero : (x->val & w->mask) != (w->val & w->mask))
+			break;
+		same++;
+	}
+	len = scnprintf(buf, size, "%u of macOS's %u writes the same in its order (%u written from the dock's PORT_CS_19 on)",
+			same, want, total);
+	if (same < want) {
+		const struct tb_cfr_want *w = &tb_cfr_macos_sleep[same];
+
+		len += scnprintf(buf + len, size - len,
+				 "; first difference at write %u: macOS [W r%u %s %u +%#x len %u = %#010x] Linux ",
+				 same + 1, w->route, tb_cfr_space(w->space), w->port, w->off, w->len,
+				 w->val);
+		if (same < n)
+			len += scnprintf(buf + len, size - len, "[W r%llx %s %u +%#x len %u = %#010x]",
+					 got[same].route, tb_cfr_space(got[same].space),
+					 got[same].port, got[same].off, got[same].len,
+					 got[same].val);
+		else
+			len += scnprintf(buf + len, size - len, "[nothing more]");
+	}
+	if (n > 5)
+		len += scnprintf(buf + len, size - len,
+				 "; the dock's ROUTER_CS_5 written %#x, %#x (macOS 0x97000006, 0x97000007; bits 31:8 not compared)",
+				 got[4].val, got[5].val);
+	scnprintf(buf + len, size - len,
+		  "; the host lane adapter's unplug acknowledged behind the request: %s (macOS: yes)",
+		  acked ? "yes" : "NO");
+	return same;
+}
 
 /* Serializes access to request kref_get/put */
 static DEFINE_MUTEX(tb_cfg_request_lock);
@@ -388,6 +727,7 @@ static int tb_ctl_tx(struct tb_ctl *ctl, const void *data, size_t len,
 	pkg->frame.eof = type;
 
 	trace_tb_tx(ctl->index, type, data, len);
+	tb_cfr_add(ctl, TB_CFR_TX, type, data, len);
 
 	cpu_to_be32_array(pkg->buffer, data, len / 4);
 	*(__be32 *) (pkg->buffer + len) = tb_crc(pkg->buffer, len);
@@ -405,6 +745,7 @@ static bool tb_ctl_handle_event(struct tb_ctl *ctl, enum tb_cfg_pkg_type type,
 				struct ctl_pkg *pkg, size_t size)
 {
 	trace_tb_event(ctl->index, type, pkg->buffer, size);
+	tb_cfr_add(ctl, TB_CFR_EV, type, pkg->buffer, size);
 	return ctl->callback(ctl->callback_data, type, pkg->buffer, size);
 }
 
@@ -512,6 +853,7 @@ static void tb_ctl_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	req = tb_cfg_request_find(pkg->ctl, pkg);
 
 	trace_tb_rx(pkg->ctl->index, frame->eof, pkg->buffer, frame->size, !req);
+	tb_cfr_add(pkg->ctl, TB_CFR_RX, frame->eof, pkg->buffer, frame->size);
 
 	if (req) {
 		scoped_guard(mutex, &pkg->ctl->request_queue_lock) {

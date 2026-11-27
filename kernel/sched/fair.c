@@ -8414,6 +8414,15 @@ static bool __dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	return true;
 }
 
+/* Account the run time since @p last slept, as it goes to sleep again. */
+static inline void update_burst_avg(struct task_struct *p)
+{
+	u64 burst = p->se.sum_exec_runtime - p->se.prev_sleep_sum_runtime;
+
+	p->se.prev_sleep_sum_runtime = p->se.sum_exec_runtime;
+	update_avg(&p->se.burst_avg, burst);
+}
+
 /*
  * The dequeue_task method is called before nr_running is
  * decreased. We remove the task from the rbtree and
@@ -8421,16 +8430,29 @@ static bool __dequeue_task(struct rq *rq, struct task_struct *p, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	bool sleep = (flags & (DEQUEUE_SLEEP | DEQUEUE_DELAYED)) == DEQUEUE_SLEEP;
+
 	if (task_is_throttled(p)) {
 		dequeue_throttled_task(p, flags);
+		if (sleep)
+			update_burst_avg(p);
 		return true;
 	}
 
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
-	if (!__dequeue_task(rq, p, flags))
+	/*
+	 * After the dequeue, which updated sum_exec_runtime. Without
+	 * DEQUEUE_DELAYED, @p is the task going to sleep and stays valid.
+	 */
+	if (!__dequeue_task(rq, p, flags)) {
+		if (sleep)
+			update_burst_avg(p);
 		return false;
+	}
+	if (sleep)
+		update_burst_avg(p);
 
 	/*
 	 * Must not reference @p after __dequeue_task(DEQUEUE_DELAYED).
@@ -9917,6 +9939,100 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 }
 
 /*
+ * Wake @p on @cpu, the waking CPU, rather than on an idle CPU, when @p and the
+ * waker both run only briefly between sleeps and the waker is alone on @cpu.
+ *
+ * Such a pair takes turns: one wakes the other and soon sleeps, as in a pipe
+ * or futex ping-pong, or a thread waking the thread that joins it. On an idle
+ * CPU every turn costs an IPI and the wake-up of a sleeping core, several
+ * microseconds on Apple cores, whose WFI lets the hardware power them down,
+ * and each CPU stays so lightly loaded that schedutil keeps the cluster at a
+ * low clock. On the waking CPU the wakee runs as soon as the waker sleeps,
+ * and the pair keeps one CPU busy at a high clock.
+ *
+ * Only brief runs qualify, so a task that keeps running after a wake-up does
+ * not hold up its wakee for longer than that; and only a waker alone on its
+ * CPU, so at most one wakee is stacked on it. Tasks that wake many others are
+ * spread by wake_wide() before this is considered.
+ */
+static bool wake_short_local(struct task_struct *p, int cpu)
+{
+	u64 limit = sysctl_sched_migration_cost / 8;
+	struct task_struct *waker = current;
+	struct rq *rq = cpu_rq(cpu);
+	struct rq_flags rf;
+	bool brief = false;
+
+	if (!in_task() || waker->sched_class != &fair_sched_class)
+		return false;
+	if (p->se.burst_avg > limit || waker->se.burst_avg > limit)
+		return false;
+	if (sched_asym_cpucap_active() && !task_fits_cpu(p, cpu))
+		return false;
+
+	/*
+	 * The wakeup path has IRQs disabled and holds p->pi_lock. Skip this
+	 * heuristic if the local rq lock is already held or contended.
+	 */
+	if (!raw_spin_rq_trylock(rq))
+		return false;
+	rq_pin_lock(rq, &rf);
+
+	if (rq->nr_running - cfs_h_nr_delayed(rq) == 1 &&
+	    task_current_donor(rq, waker) &&
+	    sched_cpu_cookie_match(rq, p)) {
+		u64 burst = waker->se.sum_exec_runtime - waker->se.prev_sleep_sum_runtime;
+		s64 delta;
+
+		update_rq_clock(rq);
+		delta = rq_clock_task(rq) - waker->se.exec_start;
+		if (delta > 0)
+			burst += delta;
+		brief = burst <= limit;
+	}
+	rq_unlock(rq, &rf);
+
+	return brief;
+}
+
+/*
+ * Returns an idle CPU sharing the last-level cache with @cpu, the CPU creating
+ * the thread @p, or -1.
+ *
+ * Fork balancing otherwise starts @p in the idlest group of the widest domain,
+ * which on a system of several clusters is usually another cluster: the
+ * thread then starts on a core of a cold, often clocked-down cluster, misses
+ * in a cache that does not hold its parent's data, and the wake-ups between
+ * it and its parent cross clusters. A thread that runs for long is spread by
+ * load balancing anyway; most short-lived threads are done before then.
+ *
+ * A new process gets the same start: most new processes exec at once, and
+ * exec balancing still places the program they run in the idlest group;
+ * until then the child shares its parent's pages and cache.
+ */
+static int fork_local_idle_cpu(struct sched_domain *sd,
+			       struct task_struct *p, int cpu)
+{
+	struct sched_domain *llc_sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
+	int i;
+
+	if (!llc_sd || !(llc_sd->flags & SD_BALANCE_FORK))
+		return -1;
+	for_each_cpu(i, sched_domain_span(llc_sd)) {
+		if (i == cpu || !cpumask_test_cpu(i, sched_domain_span(sd)) ||
+		    !cpumask_test_cpu(i, p->cpus_ptr))
+			continue;
+		if (!sched_core_cookie_match(cpu_rq(i), p))
+			continue;
+		if (sched_asym_cpucap_active() && !task_fits_cpu(p, i))
+			continue;
+		if (choose_idle_cpu(i, p))
+			return i;
+	}
+	return -1;
+}
+
+/*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
@@ -9956,6 +10072,11 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		}
 
 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+
+		/* Preserve a placement selected by EAS above. */
+		if (sched_feat(WAKE_SHORT_LOCAL) && want_affine &&
+		    wake_short_local(p, cpu))
+			return cpu;
 	}
 
 	for_each_domain(cpu, tmp) {
@@ -9984,8 +10105,15 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	}
 
 	/* Slow path */
-	if (unlikely(sd))
+	if (unlikely(sd)) {
+		if (sched_feat(FORK_LOCAL) && (wake_flags & WF_FORK) && p->mm) {
+			int i = fork_local_idle_cpu(sd, p, cpu);
+
+			if (i >= 0)
+				return i;
+		}
 		return sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
+	}
 
 	/* Fast path */
 	if (wake_flags & WF_TTWU)
@@ -15653,6 +15781,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 	WARN_ON_ONCE(p->se.sched_delayed);
 
 	attach_task_cfs_rq(p);
+	p->se.prev_sleep_sum_runtime = p->se.sum_exec_runtime;
 
 	set_task_max_allowed_capacity(p);
 

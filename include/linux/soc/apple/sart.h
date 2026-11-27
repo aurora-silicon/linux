@@ -26,6 +26,8 @@ struct apple_sart;
  * apple_sart_add_allowed_region and apple_sart_remove_allowed_region.
  */
 struct apple_sart *devm_apple_sart_get(struct device *dev);
+void apple_sart_save_now(struct apple_sart *sart);
+void apple_sart_restore_early(struct apple_sart *sart);
 
 /*
  * Adds the region [paddr, paddr+size] to the DMA allow list.
@@ -69,5 +71,7 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
  * each back. Returns how many didn't hold, or -EOPNOTSUPP.
  */
 int apple_sart_replay(struct apple_sart *sart);
+/* ANS's read-only last check, after supplier suspend_late. No ownership transfer. */
+int apple_sart_sleep_validate(struct apple_sart *sart);
 
 #endif /* _LINUX_SOC_APPLE_SART_H_ */

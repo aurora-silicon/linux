@@ -101,17 +101,25 @@ pub(crate) enum StampWait {
     /// The bound passed while the ioctl's work-state node still runs kicks: the stamp is not
     /// late, and the wait counts again from the given host time.
     Restart(u64),
-    /// The node drained and the stamp is still missing after the bound: retire on the record.
+    /// The node drained and the stamp is still missing after the bound, or the watchdog ended
+    /// the wait ([`STAMP_WAIT_EXPIRED`]): retire on the record.
     Aged,
 }
 
+/// The latch time a watchdog that gave up on a command with its record present stores: its
+/// stamp wait is over, however long the rest of its ioctl runs.
+pub(crate) const STAMP_WAIT_EXPIRED: u64 = 0;
+
 /// The stamp wait of a command whose exact record was latched at `observed_at` (host ns) and
 /// whose stamp is still missing, at `now`. `drained` reports whether every kick counted on the
-/// command's work-state node completed; it is asked only once the bound has passed.
+/// command's work-state node completed; it is asked only once the bound has passed, and never
+/// for a wait the watchdog ended.
 pub(crate) fn stamp_wait(observed_at: Option<u64>, now: u64, drained: impl FnOnce() -> bool)
     -> StampWait
 {
-    if !record_aged(observed_at, now) {
+    if observed_at == Some(STAMP_WAIT_EXPIRED) {
+        StampWait::Aged
+    } else if !record_aged(observed_at, now) {
         StampWait::Waiting
     } else if drained() {
         StampWait::Aged
@@ -284,10 +292,14 @@ pub(crate) struct Batch {
     /// ([`NO_FRONTIER`] for a QID without a staged queue). A record at or past it belongs
     /// to a command published during the scan, which a later batch stages.
     frontiers: [u64; QIDS],
+    /// Bitmasks of QIDs touched in `slots` and `frontiers` so `clear()` touches only active QIDs.
+    touched_slots: u128,
+    touched_frontiers: u128,
 }
 
 const NO_FRONTIER: u64 = u64::MAX;
 const KICK_MASK: u64 = (1 << 40) - 1;
+const _: () = assert!(QIDS <= 128);
 
 impl Batch {
     pub(crate) fn new() -> Result<Self> {
@@ -303,19 +315,34 @@ impl Batch {
             unobserved: 0,
             covered: 0,
             frontiers: [NO_FRONTIER; QIDS],
+            touched_slots: 0,
+            touched_frontiers: 0,
         })
     }
     pub(crate) fn clear(&mut self) {
         self.requests.clear();
-        self.slots.fill((0, 0));
+        let mut slots = self.touched_slots;
+        while slots != 0 {
+            let qid = slots.trailing_zeros() as usize;
+            slots &= slots - 1;
+            self.slots[qid] = (0, 0);
+        }
+        self.touched_slots = 0;
         self.open = None;
         self.unobserved = 0;
         self.covered = 0;
-        self.frontiers.fill(NO_FRONTIER);
+        let mut frontiers = self.touched_frontiers;
+        while frontiers != 0 {
+            let qid = frontiers.trailing_zeros() as usize;
+            frontiers &= frontiers - 1;
+            self.frontiers[qid] = NO_FRONTIER;
+        }
+        self.touched_frontiers = 0;
     }
     /// Records the first kick `qid`'s queue had not yet published when this batch was staged.
     pub(crate) fn stage_frontier(&mut self, qid: u8, next: u64) -> Result {
         *self.frontiers.get_mut(usize::from(qid)).ok_or(EINVAL)? = next & KICK_MASK;
+        self.touched_frontiers |= 1u128 << qid;
         Ok(())
     }
     /// A record of `qid` with `kick` names a command published after this batch was staged.
@@ -364,6 +391,7 @@ impl Batch {
             .map_err(|_| ENOSPC)?;
         *self.heads.get_mut(bucket).ok_or(EIO)? = index;
         *slot = (start, slot.1 + 1);
+        self.touched_slots |= 1u128 << ticket.qid;
         self.open = Some(ticket.qid);
         self.unobserved += 1;
         self.covered += usize::from(covered);
@@ -594,6 +622,11 @@ mod tests {
         // The node drained and the stamp is still missing after the bound.
         assert_eq!(stamp_wait(Some(late), late + STAMP_FALLBACK_NS, || true), StampWait::Aged);
         assert_eq!(stamp_wait(Some(at), late, || true), StampWait::Aged);
+        // The watchdog ended the wait: the node is not asked, and the bound does not apply.
+        for now in [0, 1, late] {
+            assert_eq!(stamp_wait(Some(STAMP_WAIT_EXPIRED), now, || panic!("node read")),
+                StampWait::Aged);
+        }
     }
 
     #[test]
@@ -799,5 +832,28 @@ mod index_tests {
         let other = record(&ticket(9, 33, 0x1000), [10, 20]);
         assert!(batch.fold_reader(|word| Ok(other[word])).unwrap());
         assert!(!batch.complete() && !batch.covered_pending());
+    }
+    #[test]
+    fn clear_resets_touched_slots_and_frontiers_across_batches() {
+        let mut batch = Batch::new().unwrap();
+        let low = ticket(0, 11, 0x1000);
+        let high = ticket((QIDS - 1) as u8, 22, 0x2000);
+        batch.stage_frontier(0, 12).unwrap();
+        batch.stage_frontier((QIDS - 1) as u8, 23).unwrap();
+        batch.request(&low, true).unwrap();
+        batch.request(&high, false).unwrap();
+        batch.clear();
+        assert!(batch.complete() && !batch.covered_pending());
+        assert_eq!(batch.touched_slots, 0);
+        assert_eq!(batch.touched_frontiers, 0);
+        assert!(!batch.published_after_staging(0, 12));
+        assert!(!batch.published_after_staging(QIDS - 1, 23));
+        // Re-staging the same QIDs with new kicks succeeds cleanly after clear().
+        let next = ticket((QIDS - 1) as u8, 25, 0x3000);
+        batch.request(&next, true).unwrap();
+        let words = record(&next, [50, 60]);
+        assert!(batch.fold_reader(|word| Ok(words[word])).unwrap());
+        assert!(batch.complete());
+        assert_eq!(batch.take(&next).unwrap().map(|obs| obs.timestamps), Some([50, 60]));
     }
 }

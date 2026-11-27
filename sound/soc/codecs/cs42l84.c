@@ -21,6 +21,7 @@
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
@@ -55,9 +56,12 @@ struct cs42l84_private {
 	bool dsp_a;
 	int hs_type;
 	bool remote_active;
+	/* cirrus,ring-sense-detect: plug state from ring sense, tip sense masked */
+	bool ring_detect;
 	unsigned int remote_btn1_prev;
 	unsigned int remote_short_prev;
 	struct delayed_work remote_poll_work;
+	bool sleep_reset;
 };
 
 static bool cs42l84_volatile_register(struct device *dev, unsigned int reg)
@@ -1008,6 +1012,40 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 				irq_params_table[i].mask;
 	}
 
+	if (cs42l84->ring_detect) {
+		/*
+		 * The detect setup unmasks two more sources in 0x1480 (bits 5
+		 * and 6). Their status latches in REMOTE_BUTTON_STATUS1 and is
+		 * cleared by reading it. Unread, it holds the interrupt line
+		 * asserted for good.
+		 */
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
+		regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+		current_ring_state = (((char)reg) &
+		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
+		      CS42L84_RS_PLUG_SHIFT;
+		if (current_ring_state == cs42l84->ring_state)
+			return IRQ_HANDLED;
+		cs42l84->ring_state = current_ring_state;
+		switch (current_ring_state) {
+		case CS42L84_PLUG:
+			dev_dbg(cs42l84->dev, "Plug event (ring sense)\n");
+			cs42l84->tip_state = CS42L84_PLUG;
+			cs42l84_detect_hs(cs42l84);
+			break;
+		case CS42L84_UNPLUG:
+			dev_dbg(cs42l84->dev, "Unplug event (ring sense)\n");
+			cs42l84->tip_state = CS42L84_UNPLUG;
+			cs42l84_revert_hs(cs42l84);
+			cs42l84->hs_type = 0;
+			snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+			break;
+		default:
+			break;
+		}
+		return IRQ_HANDLED;
+	}
+
 	/* When handling plug sene IRQs, we only care about EITHER tip OR ring.
 	 * Ring is useless on remove, and is only useful on insert for
 	 * detecting if the plug state has changed AFTER we have handled the
@@ -1090,7 +1128,7 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 {
 	unsigned int reg;
 
-	/* Set up plug detection */
+	/* Set up plug detection, as cs42l84_plug_detect_regs[] lists it */
 	regmap_update_bits(cs42l84->regmap, CS42L84_MIC_DET_CTL4,
 			CS42L84_MIC_DET_CTL4_LATCH_TO_VP,
 			CS42L84_MIC_DET_CTL4_LATCH_TO_VP);
@@ -1141,6 +1179,50 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 	regmap_update_bits(cs42l84->regmap,
 		CS42L84_HS_CLAMP_DISABLE, 1, 1);
 
+}
+
+/*
+ * Ring-sense detection: plug state from ring sense, tip sense masked
+ * (TSRS_PLUG_INT_MASK = 0xfc). Probe and the resume after a deep sleep both
+ * end here, after cs42l84_setup_plug_detect().
+ */
+static void cs42l84_ring_detect_setup(struct cs42l84_private *cs42l84)
+{
+	unsigned int reg;
+
+	regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+	cs42l84->ring_state = (((char)reg) &
+			      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
+			      CS42L84_RS_PLUG_SHIFT;
+	cs42l84_set_interrupt_masks(cs42l84,
+				    CS42L84_TS_PLUG | CS42L84_TS_UNPLUG);
+}
+
+/*
+ * The detect block setup for ring-sense detection. Apart from
+ * TIP_SENSE_CTL2 these registers have no public description: the
+ * addresses and values were read off the I2C bus of a J604 (MacBook Pro
+ * 14-inch, M4) while macOS probed the codec, and are written in that
+ * order. What the single bits do is not known, and no other machine has
+ * been measured. Probe and the resume after a deep sleep both write it.
+ */
+static int cs42l84_ring_detect_init(struct cs42l84_private *cs42l84)
+{
+	struct regmap *regmap = cs42l84->regmap;
+	int ret;
+
+	ret = regmap_write(regmap, CS42L84_TIP_SENSE_CTL2,
+			   FIELD_PREP(CS42L84_TIP_SENSE_CTL2_MODE,
+				      CS42L84_TIP_SENSE_CTL2_MODE_SHORT_DET));
+	/* 0xc0 -> 0xe0. Forced: after a reset the cache already holds the value. */
+	if (!ret)
+		ret = regmap_write_bits(regmap, 0x1471, BIT(5), BIT(5));
+	if (!ret)
+		ret = regmap_write(regmap, 0x1478, 0x8f);
+	/* 0xe0 -> 0x80: bits 5 and 6 cleared, see cs42l84_irq_thread() */
+	if (!ret)
+		ret = regmap_write(regmap, 0x1480, 0x80);
+	return ret;
 }
 
 static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
@@ -1229,11 +1311,55 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 	dev_info(&i2c_client->dev,
 		 "Cirrus Logic CS42L84, Revision: %02X\n", reg & 0xFF);
 
+	cs42l84->ring_detect = device_property_read_bool(&i2c_client->dev,
+							 "cirrus,ring-sense-detect");
+
+	/*
+	 * The interrupt is already requested. Keep its handler out until the
+	 * masks are written and the plug state it compares against is read:
+	 * the detect setup unmasks sources whose status is still latched.
+	 */
+	mutex_lock(&cs42l84->irq_lock);
+
+	if (cs42l84->ring_detect) {
+		ret = cs42l84_ring_detect_init(cs42l84);
+		if (ret) {
+			mutex_unlock(&cs42l84->irq_lock);
+			goto err_shutdown;
+		}
+		/* What the detect setup unmasks comes up latched (0x60): clear it. */
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
+	}
+
 	/* Setup plug detection */
 	cs42l84_setup_plug_detect(cs42l84);
 
-	/* Mask ring sense interrupts */
-	cs42l84_set_interrupt_masks(cs42l84, CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	/*
+	 * With ring-sense detection the plug state comes from ring sense and
+	 * tip sense stays masked (TSRS_PLUG_INT_MASK = 0xfc): on the J604 tip
+	 * sense keeps re-asserting with nothing plugged in, about 1000
+	 * interrupts and 2000 I2C transfers a second. Otherwise keep ring
+	 * sense masked until tip sense reports a plug.
+	 */
+	if (cs42l84->ring_detect) {
+		cs42l84_ring_detect_setup(cs42l84);
+		/*
+		 * A plug that is in already raises no ring interrupt, so run
+		 * the headset detection here, as resume does. The result is
+		 * reported when the machine driver sets the jack.
+		 */
+		if (cs42l84->ring_state == CS42L84_PLUG) {
+			cs42l84->tip_state = CS42L84_PLUG;
+			cs42l84_detect_hs(cs42l84);
+		} else {
+			cs42l84->tip_state = CS42L84_UNPLUG;
+		}
+	} else {
+		cs42l84_set_interrupt_masks(cs42l84,
+					    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	}
+
+	mutex_unlock(&cs42l84->irq_lock);
 
 	/* Register codec for machine driver */
 	ret = devm_snd_soc_register_component(&i2c_client->dev,
@@ -1268,6 +1394,235 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
 }
 
+/*
+ * The registers cs42l84_setup_plug_detect() turns plug detection on with, in
+ * its order. After a firmware sleep they are written back first, in this
+ * order, so the two must stay in step.
+ */
+static const unsigned int cs42l84_plug_detect_regs[] = {
+	CS42L84_MIC_DET_CTL4,
+	CS42L84_TIP_SENSE_CTL2,
+	CS42L84_RING_SENSE_CTL,
+	CS42L84_TIP_SENSE_CTL,
+	CS42L84_MSM_BLOCK_EN3,
+};
+
+static bool cs42l84_is_plug_detect_reg(unsigned int reg)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cs42l84_plug_detect_regs); i++) {
+		if (cs42l84_plug_detect_regs[i] == reg)
+			return true;
+	}
+	return false;
+}
+
+/* Write one cached register back, then clear what the write latched. */
+static int cs42l84_restore_reg(struct cs42l84_private *cs42l84, unsigned int reg)
+{
+	unsigned int status;
+	int ret;
+
+	ret = regcache_sync_region(cs42l84->regmap, reg, reg);
+	if (ret)
+		return ret;
+	return regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_INT_STATUS, &status);
+}
+
+/*
+ * Write the cache back after the codec's reset. Turning tip and ring sensing
+ * on latches plug events at once, and so do some of the other writes; the
+ * remote button sources also come up latched. With the interrupt off, nothing
+ * reads them, and a codec left with a latched event stops answering the bus a
+ * write or two later. So plug detection goes first, in the probe's order, then
+ * every other register the cache holds, one at a time, with the status read
+ * after each write to clear what it latched, as the interrupt thread does.
+ */
+static int cs42l84_restore_regs(struct cs42l84_private *cs42l84)
+{
+	unsigned int i, reg, val, max = regmap_get_max_register(cs42l84->regmap);
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(cs42l84_plug_detect_regs); i++) {
+		ret = cs42l84_restore_reg(cs42l84, cs42l84_plug_detect_regs[i]);
+		if (ret)
+			return ret;
+	}
+	ret = regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &val);
+	if (ret)
+		return ret;
+
+	for (reg = 0; reg <= max; reg++) {
+		/* Plug detection is back already */
+		if (cs42l84_is_plug_detect_reg(reg) ||
+		    !regcache_reg_cached(cs42l84->regmap, reg))
+			continue;
+		ret = cs42l84_restore_reg(cs42l84, reg);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * A firmware-driven system sleep holds the codec in reset, so it comes back
+ * with none of its registers and answers nothing until the reset is released.
+ * Take it into reset ourselves once nothing uses it, and after the wake
+ * release it as the probe does and write everything back from the cache.
+ * Other sleep states leave the codec alone, as before.
+ */
+static int cs42l84_suspend(struct device *dev)
+{
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	/* Still down from a resume that failed. */
+	if (cs42l84->sleep_reset)
+		return 0;
+
+	if (i2c_client->irq)
+		disable_irq(i2c_client->irq);
+	cancel_delayed_work_sync(&cs42l84->remote_poll_work);
+
+	mutex_lock(&cs42l84->irq_lock);
+	cs42l84_remote_stop(cs42l84);
+	regcache_cache_only(cs42l84->regmap, true);
+	regcache_mark_dirty(cs42l84->regmap);
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+	cs42l84->sleep_reset = true;
+	mutex_unlock(&cs42l84->irq_lock);
+
+	return 0;
+}
+
+static int cs42l84_resume(struct device *dev)
+{
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
+	unsigned int reg;
+	int ret, devid;
+
+	if (!cs42l84->sleep_reset)
+		return 0;
+
+	mutex_lock(&cs42l84->irq_lock);
+
+	/*
+	 * The codec restarts on its internal oscillator with the PLL off, and
+	 * stops answering if it is moved to a clock that isn't running. Put
+	 * the clock registers in the cache back to that state, so the sync
+	 * below can't select the PLL; the next unmute sets the clocks up.
+	 * This only reaches the cache: the bus is still closed.
+	 */
+	regmap_write(cs42l84->regmap, CS42L84_CCM_CTL1, CS42L84_CCM_CTL1_RCO);
+	regmap_update_bits(cs42l84->regmap, CS42L84_PLL_CTL1,
+			   CS42L84_PLL_CTL1_EN, 0);
+	regmap_update_bits(cs42l84->regmap, CS42L84_CCM_CTL4,
+			   CS42L84_CCM_CTL4_REFCLK_EN, 0);
+	regmap_update_bits(cs42l84->regmap, CS42L84_DAC_CTL1,
+			   CS42L84_DAC_CTL1_UNMUTE, 0);
+	cs42l84->stream_use = 0;
+
+	/* Out of reset, as in probe */
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 1);
+	usleep_range(CS42L84_BOOT_TIME_US, CS42L84_BOOT_TIME_US * 2);
+
+	regcache_cache_only(cs42l84->regmap, false);
+
+	devid = cirrus_read_device_id(cs42l84->regmap, CS42L84_DEVID);
+	if (devid != CS42L84_CHIP_ID) {
+		ret = devid < 0 ? devid : -ENODEV;
+		goto err;
+	}
+
+	/* The revision was read into the cache at probe; it isn't ours to write. */
+	regcache_drop_region(cs42l84->regmap, CS42L84_REVID, CS42L84_REVID);
+
+	/* The detect setup probe wrote, before the cache is written back. */
+	if (cs42l84->ring_detect) {
+		ret = cs42l84_ring_detect_init(cs42l84);
+		if (ret)
+			goto err;
+	}
+
+	ret = cs42l84_restore_regs(cs42l84);
+	if (ret)
+		goto err;
+
+	/*
+	 * cs42l84_ring_detect_init() and the cache sync wrote the detect
+	 * setup back, so the remote status latch is set again: clear it as
+	 * probe does.
+	 */
+	if (cs42l84->ring_detect)
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
+
+	/* The plug may have changed while the codec was down: detect it again. */
+	cs42l84_setup_plug_detect(cs42l84);
+	if (cs42l84->ring_detect) {
+		/* As in probe: ring sense reports the plug, tip sense stays masked. */
+		cs42l84_ring_detect_setup(cs42l84);
+		if (cs42l84->ring_state == CS42L84_PLUG) {
+			cs42l84->tip_state = CS42L84_PLUG;
+			cs42l84_detect_hs(cs42l84);
+		} else {
+			cs42l84->tip_state = CS42L84_UNPLUG;
+			/* As on an unplug: the cache may hold a headset's bias */
+			cs42l84_revert_hs(cs42l84);
+			cs42l84->hs_type = 0;
+			snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+		}
+	} else if (cs42l84->tip_state == CS42L84_PLUG) {
+		cs42l84->ring_state = CS42L84_UNPLUG;
+		cs42l84_detect_hs(cs42l84);
+		cs42l84_set_interrupt_masks(cs42l84, 0);
+	} else {
+		cs42l84->ring_state = CS42L84_UNPLUG;
+		/* As on an unplug: the cache may hold a headset's bias */
+		cs42l84_revert_hs(cs42l84);
+		cs42l84->hs_type = 0;
+		snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+		cs42l84_set_interrupt_masks(cs42l84,
+					    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	}
+
+	cs42l84->sleep_reset = false;
+	mutex_unlock(&cs42l84->irq_lock);
+
+	if (i2c_client->irq)
+		enable_irq(i2c_client->irq);
+
+	dev_dbg(dev, "back after the sleep: device ID %X, registers written back, jack %s\n",
+		devid, cs42l84->tip_state == CS42L84_PLUG ? "plugged" : "empty");
+
+	return 0;
+
+err:
+	/* Keep the bus closed and the codec in reset; the interrupt stays off. */
+	regcache_cache_only(cs42l84->regmap, true);
+	regcache_mark_dirty(cs42l84->regmap);
+	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+	mutex_unlock(&cs42l84->irq_lock);
+
+	if (devid < 0)
+		dev_err(dev, "not back after the sleep: no answer to the device ID read: %d\n",
+			devid);
+	else if (devid != CS42L84_CHIP_ID)
+		dev_err(dev, "not back after the sleep: device ID %X, expected %X\n",
+			devid, CS42L84_CHIP_ID);
+	else
+		dev_err(dev, "not back after the sleep: writing the registers back failed: %d\n",
+			ret);
+
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cs42l84_pm_ops, cs42l84_suspend, cs42l84_resume);
+
 static const struct of_device_id cs42l84_of_match[] = {
 	{ .compatible = "cirrus,cs42l84", },
 	{}
@@ -1284,6 +1639,7 @@ static struct i2c_driver cs42l84_i2c_driver = {
 	.driver = {
 		.name = "cs42l84",
 		.of_match_table = cs42l84_of_match,
+		.pm = pm_sleep_ptr(&cs42l84_pm_ops),
 	},
 	.id_table = cs42l84_id,
 	.probe = cs42l84_i2c_probe,

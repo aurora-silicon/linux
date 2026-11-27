@@ -7,7 +7,10 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/math64.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/suspend.h>
 #include <linux/slab.h>
@@ -48,6 +51,7 @@ struct asahi_gpu_memory {
 struct asahi_stats_attribute {
 	struct device_attribute attr;
 	struct device_attribute memory_attr;
+	struct device_attribute limit_attr;
 	const struct asahi_stats_snapshot *snapshot;
 	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
@@ -90,30 +94,46 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 				   "util_device_percent unsupported\n");
 	}
 	/*
-	 * unsupported comes from the firmware match data (g17::stats): V25G83
-	 * never emits a pstate record, so it is not a transient state.
+	 * unsupported comes from the firmware match data (g17::stats): builds
+	 * without a pstate telemetry protocol (such as T6040 25G83, left on
+	 * Protocol::NONE pending measurement) have no qualified pstate support,
+	 * so it is not a transient state.
 	 * unavailable keeps meaning "no qualified sample yet".
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
 			   asahi_stats_quality(snap.pstate_status));
+	/*
+	 * A pstate that is not valid reads its status word, so stale or
+	 * unavailable is not mistaken for a missing feature. Where it is
+	 * unsupported, the output is unchanged.
+	 */
 	if (snap.pstate_status == 1)
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else
-		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
+		n += sysfs_emit_at(buf, n, "pstate %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	/* No host frequency request, measured power or temperature. */
 	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
 	/*
-	 * V26A428 reports the state the GPU runs at: its frequency is the
-	 * achieved one. State 0 is off (gated cores) and runs at 0 Hz.
+	 * Firmwares with a pstate protocol (V26A428, T6041 25G83) report
+	 * the state the GPU runs at: its frequency is the achieved one. State 0
+	 * is off (gated cores) and runs at 0 Hz.
 	 */
 	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
 				   (unsigned long long)snap.achieved_frequency_hz);
-	else
+	else if (snap.pstate_status == 1)
+		/* A valid state with no frequency in the board's table. */
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz unsupported\n");
+	else
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	if (snap.busy_status == 1)
 		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
 				   (unsigned long long)snap.busy_ns);
+	else if (snap.busy_status == 2)
+		/* The total stopped (a statistics ring was quarantined). */
+		n += sysfs_emit_at(buf, n, "busy_ns stale\n");
 	else
 		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
 	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"
@@ -227,6 +247,35 @@ static ssize_t gpu_memory_show(struct device *dev,
 	return n;
 }
 
+static DEFINE_MUTEX(asahi_limit_lock);
+
+static ssize_t gpu_mem_limit_pct_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct asahi_stats_attribute *stats =
+		container_of(attr, struct asahi_stats_attribute, limit_attr);
+	u64 total = (u64)totalram_pages() << PAGE_SHIFT;
+	u64 client = READ_ONCE(stats->memory->client_limit);
+
+	return sysfs_emit(buf, "%llu\n",
+			  client ? (unsigned long long)div64_u64(client * 100 + total / 2, total) : 0);
+}
+
+static ssize_t gpu_mem_limit_pct_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	u32 pct;
+
+	if (kstrtou32(buf, 0, &pct))
+		return -EINVAL;
+
+	mutex_lock(&asahi_limit_lock);
+	asahi_set_mem_limit_pct(pct);
+	mutex_unlock(&asahi_limit_lock);
+	return count;
+}
+
 /*
  * Called from Rust's `AsahiDriver::probe` after the DRM device is
  * registered. Returns 0 on success, or a negative errno.
@@ -282,7 +331,14 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->memory_attr.attr.name = "gpu_memory";
 	stats->memory_attr.attr.mode = 0444;
 	stats->memory_attr.show = gpu_memory_show;
+	/* Rust owns the ledger and changes its limits. */
 	stats->memory = memory;
+
+	sysfs_attr_init(&stats->limit_attr.attr);
+	stats->limit_attr.attr.name = "gpu_mem_limit_pct";
+	stats->limit_attr.attr.mode = 0644;
+	stats->limit_attr.show = gpu_mem_limit_pct_show;
+	stats->limit_attr.store = gpu_mem_limit_pct_store;
 
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
@@ -294,6 +350,16 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 
 	ret = device_create_file(dev, &stats->memory_attr);
 	if (ret) {
+		device_remove_file(dev, &stats->attr);
+		if (stats->suspend)
+			unregister_pm_notifier(&stats->pm_notifier);
+		kfree(stats);
+		return ret;
+	}
+
+	ret = device_create_file(dev, &stats->limit_attr);
+	if (ret) {
+		device_remove_file(dev, &stats->memory_attr);
 		device_remove_file(dev, &stats->attr);
 		if (stats->suspend)
 			unregister_pm_notifier(&stats->pm_notifier);
@@ -357,6 +423,7 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 	if (stats->suspend)
 		unregister_pm_notifier(&stats->pm_notifier);
 	/* Removal drains active show callbacks before either allocation dies. */
+	device_remove_file(dev, &stats->limit_attr);
 	device_remove_file(dev, &stats->memory_attr);
 	device_remove_file(dev, &stats->attr);
 	if (asahi_idle_word) {

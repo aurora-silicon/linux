@@ -125,6 +125,8 @@ struct tb_tunnel {
 	bool dprx_started;
 	bool dprx_canceled;
 	bool sleep_paused, sleep_replay, sleep_changed;
+	/* TEST: the routers lost their power over the sleep: every hop is written again. */
+	bool sleep_lost;
 	u64 host_dp_generation;
 	bool host_dp_notified;
 	bool host_dp_activated;

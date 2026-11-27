@@ -4,6 +4,7 @@
  */
 
 #include <kunit/test.h>
+#include <linux/array_size.h>
 #include <linux/bits.h>
 
 #include "parser.h"
@@ -67,8 +68,26 @@ static void dcp_refresh_range_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(true, false), 0ULL);
 }
 
+static void dcp_refresh_needs_deadline_test(struct kunit *test)
+{
+	/* 16.16 rates of the fixed timings: 48, 47.952, 50 and 60 Hz. */
+	static const u32 fixed[] = { 48U << 16, 3142585, 50U << 16, 60U << 16 };
+	unsigned int i;
+
+	KUNIT_EXPECT_TRUE(test, dcp_refresh_needs_deadline(120U << 16, false, true, false));
+	KUNIT_EXPECT_TRUE(test, dcp_refresh_needs_deadline(48U << 16, true, false, false));
+	KUNIT_EXPECT_FALSE(test, dcp_refresh_needs_deadline(120U << 16, false, false, true));
+	for (i = 0; i < ARRAY_SIZE(fixed); i++) {
+		/* Legacy internal panels and external outputs keep zero stamps. */
+		KUNIT_EXPECT_FALSE(test, dcp_refresh_needs_deadline(fixed[i], false, true, false));
+		KUNIT_EXPECT_FALSE(test, dcp_refresh_needs_deadline(fixed[i], false, false, true));
+		KUNIT_EXPECT_TRUE(test, dcp_refresh_needs_deadline(fixed[i], false, true, true));
+	}
+}
+
 static struct kunit_case dcp_mode_rank_test_cases[] = {
 	KUNIT_CASE(dcp_refresh_range_test),
+	KUNIT_CASE(dcp_refresh_needs_deadline_test),
 	KUNIT_CASE_PARAM(dcp_mode_rank_test, dcp_mode_rank_gen_params),
 	{}
 };
