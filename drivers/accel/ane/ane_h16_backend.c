@@ -679,7 +679,7 @@ static void ane_h16_unpark(struct ane_h16_device *h)
 		/* Power and mappings stay for diagnosis: quarantine pins the device. */
 		ane_h16_quarantine(h, ret);
 		h->boot.quarantined = true;
-		h->session.quarantined = true;
+		WRITE_ONCE(h->session.quarantined, true);
 	}
 	ane_h16_session_sleep(&h->session, false);
 	dev_info(h->dev, "H16 ANE: up for a request%s in %llu ms, %u programs replayed, %u restarts\n",
@@ -886,7 +886,7 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		/* Powered, maybe suspended: keep everything, refuse, close. */
 		ane_h16_quarantine(h, ret);
 		h->boot.quarantined = true;
-		h->session.quarantined = true;
+		WRITE_ONCE(h->session.quarantined, true);
 		ane_h16_session_sleep(&h->session, false);
 		return ret;
 	}
@@ -954,7 +954,7 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 			/* Every mapping and backing stays for diagnosis. */
 			ane_h16_quarantine(h, ret);
 			h->boot.quarantined = true;
-			h->session.quarantined = true;
+			WRITE_ONCE(h->session.quarantined, true);
 		} else if (h->sleep_quarantined) {
 			h->recoveries++;
 			dev_info(h->dev, "H16 ANE: quarantined engine recovered by system sleep\n");

@@ -1501,6 +1501,68 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
 }
 
+/*
+ * The sysfs ane_stats counters take every request that reached the firmware,
+ * a failed one too, but not one refused before it: a client retrying on a
+ * quarantined engine does not inflate them. Resetting the debugfs statistics
+ * leaves them alone, and nothing stays in flight after either outcome.
+ */
+static void program_sysfs_stats_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	u64 busy;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 0LL);
+	KUNIT_EXPECT_EQ(test, ane_stats_snapshot(&f->s.sysfs_ctrs), 0ULL);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+	busy = ane_stats_snapshot(&f->s.sysfs_ctrs);
+	ane_h16_session_stats(&f->s, NULL, true);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 2LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+	KUNIT_EXPECT_GE(test, ane_stats_snapshot(&f->s.sysfs_ctrs), busy);
+
+	f->mode = FW_OK;
+	KUNIT_EXPECT_LT(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 2LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+}
+
+/*
+ * With the gate held open by earlier requests, the EXECUTE is the request's
+ * first firmware traffic: a request that fails locally before it went out
+ * (here no UUID is left for its pending entry) sent nothing and does not
+ * count in ane_stats.
+ */
+static void program_sysfs_stats_held_gate_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	unsigned int sent;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.gate_hold_ns = 1000;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_ASSERT_TRUE(test, f->s.gate_held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	f->s.pending.next_uuid = U64_MAX;
+	sent = f->count;
+	KUNIT_EXPECT_LT(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+}
+
 /* The phases of one EXECUTE add up, and only successful ones are accounted. */
 static void program_timing_test(struct kunit *test)
 {
@@ -4241,6 +4303,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_timing_test),
+	KUNIT_CASE(program_sysfs_stats_test),
+	KUNIT_CASE(program_sysfs_stats_held_gate_test),
 	KUNIT_CASE(program_fwlog_line_test),
 	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),

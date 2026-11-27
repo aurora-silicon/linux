@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
 
 #include <drm/drm_accel.h>
@@ -618,8 +619,65 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.desc = "Apple Neural Engine (H16 and later)",
 };
 
+/*
+ * ane_stats and wedged on the ANE device, as ane.ko and ane_t6021 have them
+ * (Documentation/ABI/testing/sysfs-class-accel-ane), for the node's lifetime.
+ * Both are lock-free reads, so a hung request cannot block them.
+ */
+struct ane_h16_sysfs {
+	struct ane_h16_session *session;
+	struct device_attribute stats, wedged;
+	struct attribute *attrs[3];
+	struct attribute_group group;
+};
+
+static ssize_t ane_h16_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ane_h16_sysfs *sys = container_of(attr, struct ane_h16_sysfs, stats);
+
+	return ane_stats_emit(buf, &sys->session->sysfs_ctrs);
+}
+
+/*
+ * 1 while the session is quarantined: a request hung or failed with an
+ * uncertain outcome, and requests are refused until a recovery or a system
+ * sleep proves the old firmware gone. A parked or sleeping engine is not
+ * wedged: the next request brings it up.
+ */
+static ssize_t ane_h16_wedged_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ane_h16_sysfs *sys = container_of(attr, struct ane_h16_sysfs, wedged);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(sys->session->quarantined));
+}
+
+static struct ane_h16_sysfs *ane_h16_sysfs_add(struct device *dev,
+					       struct ane_h16_session *session)
+{
+	struct ane_h16_sysfs *sys = devm_kzalloc(dev, sizeof(*sys), GFP_KERNEL);
+	int ret;
+
+	if (!sys)
+		return ERR_PTR(-ENOMEM);
+	sys->session = session;
+	sysfs_attr_init(&sys->stats.attr);
+	sys->stats.attr.name = "ane_stats";
+	sys->stats.attr.mode = 0444;
+	sys->stats.show = ane_h16_stats_show;
+	sysfs_attr_init(&sys->wedged.attr);
+	sys->wedged.attr.name = "wedged";
+	sys->wedged.attr.mode = 0444;
+	sys->wedged.show = ane_h16_wedged_show;
+	sys->attrs[0] = &sys->stats.attr;
+	sys->attrs[1] = &sys->wedged.attr;
+	sys->group.attrs = sys->attrs;
+	ret = devm_device_add_group(dev, &sys->group);
+	return ret ? ERR_PTR(ret) : sys;
+}
+
 int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 {
+	struct ane_h16_sysfs *sys;
 	struct ane_h16_accel *a;
 	int ret;
 
@@ -635,6 +693,10 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
+	/* The node works without them: report and go on. */
+	sys = ane_h16_sysfs_add(dev, session);
+	if (IS_ERR(sys))
+		drm_warn(&a->drm, "no ane_stats or wedged in sysfs (%pe)\n", sys);
 	drm_info(&a->drm, "H%u accel node ready (ABI 3, %s)\n",
 		 session->transport->soc->chip_family,
 		 ane_fw_transport_switch_safe(session->transport) ?
