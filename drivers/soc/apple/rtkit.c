@@ -3160,6 +3160,28 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
+/*
+ * Wakes firmware an RTKit idle left with its CPU and state kept (no reset): IOP ON rather than
+ * INIT, then the AP on. On J516s the G15S GPU firmware didn't acknowledge INIT after its idle.
+ */
+int apple_rtkit_wake_iop_on(struct apple_rtkit *rtk)
+{
+	u64 msg;
+	int ret;
+
+	if (apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE, msg);
+	if (ret)
+		return ret;
+
+	return apple_rtkit_boot_common(rtk, false, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_wake_iop_on);
+
 /* Wait up to @ms for @c, polling the mailbox where waits poll it: true once it is done. */
 static int apple_rtkit_done_within(struct apple_rtkit *rtk, struct completion *c,
 				   unsigned int ms)
