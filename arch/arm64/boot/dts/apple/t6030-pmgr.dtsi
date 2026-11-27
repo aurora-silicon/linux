@@ -1272,6 +1272,43 @@
 		power-domains = <&ps_venc_me0>;
 	};
 
+	/* These states serve only the ANE. */
+	ps_ane_mpm: power-controller@c000 {
+		compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_mpm";
+		power-domains = <&ps_ane_sys>;
+	};
+
+	ps_ane_cpu: power-controller@c008 {
+		compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_cpu";
+		power-domains = <&ps_ane_sys>;
+	};
+
+	ps_ane_td: power-controller@c010 {
+		compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_td";
+		power-domains = <&ps_ane_sys>;
+	};
+
+	ps_ane_base: power-controller@c018 {
+		compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_base";
+		power-domains = <&ps_ane_td>;
+	};
+
 	ps_disp_cpu: power-controller@10000 {
 		compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x10000 4>;
