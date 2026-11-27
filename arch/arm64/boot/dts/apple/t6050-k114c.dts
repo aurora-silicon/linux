@@ -11,6 +11,8 @@
 
 /* Defined before the includes: t6050-max.dtsi guards the ATC2 router on it. */
 #define T6050_K114C
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 /* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
 #define T6050_K_N1_FIRMWARE	"apple/centauri/k114c-ftab.bin"
 #define T6050_K_BOARD_ID	0x04
