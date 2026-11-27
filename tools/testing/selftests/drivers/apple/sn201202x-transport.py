@@ -56,8 +56,6 @@ static void reinit_completion(struct completion *c) { (void)c; }
 static bool wait_for_completion_timeout(struct completion *c,unsigned n)
 { (void)c; (void)n; return false; }
 static void msleep(unsigned n) { (void)n; }
-static bool of_device_is_compatible(void *node,const char *name)
-{ assert(!strcmp(name,"apple,t8132-sn201202x")); return node != NULL; }
 static int spmi_register_zero_write(struct spmi_device *s,u8 reg)
 { (void)s; selected=reg; writes++; return select_error; }
 static int spmi_register_read(struct spmi_device *s,u8 reg,u8 *value)
@@ -77,7 +75,7 @@ static int spmi_register_read(struct spmi_device *s,u8 reg,u8 *value)
 static int spmi_ext_register_read(struct spmi_device *s,unsigned off,void *val,size_t len)
 {
     assert(completed);
-    if(s->dev.of_node) assert(length_checked);
+    if(sn.select_polled) assert(length_checked);
     assert(len>0 && len<=16 && off==0x20+bytes && off+len<=0x60);
     payload_reads++;
     if(payload_error) return payload_error;
@@ -152,16 +150,14 @@ int main(void)
     reg=0x80;
     assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EINVAL && !writes);
     puts("ok 4 - transport errors and invalid transfer bounds propagate");
-    clean(&s); s.dev.of_node=NULL; reg=0x5f; advertised=0;
+    clean(&s); sn.polled=true; sn.select_polled=false; reg=0x5f; advertised=0;
     assert(!regmap_sn201202x_read(&s,&reg,1,out,4) && !length_reads && bytes==4);
     puts("ok 5 - older SN201202x transport behavior preserved");
     return 0;
 }
 '''
     busy = program.replace("err || val == reg", "err || (val & 0x7f) == reg")
-    unchecked = program.replace(
-        'if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x"))',
-        'if (false)', 1)
+    unchecked = program.replace("if (sn->select_polled)", "if (false && sn->select_polled)", 1)
     oversized = program.replace("size > TPS_MAX_LEN", "false", 1)
     assert all(text != program for text in [busy, unchecked, oversized])
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
