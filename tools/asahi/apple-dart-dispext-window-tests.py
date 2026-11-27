@@ -12,6 +12,7 @@ FUNCTIONS = (
     'apple_dart_dcp_arena_find',
     'apple_dart_dcp_arena_claim',
     '__apple_dart_dcp_dispext_scanout_alloc',
+    '__apple_dart_dcp_dispext_scanout_map_peer',
     '__apple_dart_dcp_dispext_window_claim',
     'apple_dart_dcp_window_root',
     '__apple_dart_dcp_dispext_window_map',
@@ -80,6 +81,12 @@ def apply_mutation(bodies, mutation):
         assert old_claim in fn
         fn = fn.replace(old_claim, '', 1)
         mutated['__apple_dart_dcp_dispext_scanout_alloc'] = fn
+    elif mutation == 'peer-allow-same-dart':
+        fn = mutated['__apple_dart_dcp_dispext_scanout_map_peer']
+        old = 'if (peer_pio->sid != 16 || !peer_pio->dart->dispext || peer_pio->dart == src_pio->dart)'
+        new = 'if (peer_pio->sid != 16 || !peer_pio->dart->dispext)'
+        assert old in fn
+        mutated['__apple_dart_dcp_dispext_scanout_map_peer'] = fn.replace(old, new, 1)
     else:
         raise ValueError(f'unknown mutation {mutation}')
     return mutated
@@ -89,6 +96,7 @@ SHIM = r'''
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,11 +159,19 @@ static inline void list_add_tail(struct list_head *entry, struct list_head *head
 	head->prev = entry;
 }
 
+#define container_of(ptr, type, member) \
+	((type *)((char *)(ptr) - offsetof(type, member)))
+#define list_for_each_entry(pos, head, member) \
+	for (pos = container_of((head)->next, typeof(*pos), member); \
+	     &pos->member != (head); \
+	     pos = container_of(pos->member.next, typeof(*pos), member))
+
 struct page {
 	phys_addr_t phys;
 };
 
-struct device { int dummy; };
+struct apple_dart_domain;
+struct device { struct apple_dart_domain *dom; };
 struct iommu_domain { int dummy; };
 struct apple_dart_dcp;
 struct apple_dart_domain {
@@ -234,14 +250,21 @@ static bool dev_is_dma_coherent(struct device *dev) { (void)dev; return false; }
 
 static struct iommu_domain *iommu_get_domain_for_dev(struct device *dev)
 {
-	(void)dev;
-	return &active_pio_domain.domain;
+	return dev && dev->dom ? &dev->dom->domain : &active_pio_domain.domain;
 }
 
 static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
 {
-	(void)dom;
-	return &active_pio_domain;
+	return container_of(dom, struct apple_dart_domain, domain);
+}
+
+static struct apple_dart_dcp *apple_dart_dcp_dispext_pio(struct device *piodma)
+{
+	struct apple_dart_domain *dom = to_dart_domain(iommu_get_domain_for_dev(piodma));
+
+	if (!dom || !dom->dcp || dom->dcp->sid != 16 || !dom->dcp->dart->dispext)
+		return NULL;
+	return dom->dcp;
 }
 
 static void *kzalloc(size_t sz, gfp_t gfp)
@@ -687,12 +710,92 @@ static void test_scanout_enomem_retry_and_postpub_pin(void)
 	puts("PASS scanout prepublication ENOMEM unwinds cleanly for retry and post-publication fails closed");
 }
 
+static void test_peer_scanout_map(void)
+{
+	static const unsigned int src_slots[] = { 4, 5 };
+	static const unsigned int peer_slots[] = { 10, 11 };
+	static const unsigned int frag_slots[] = { 2, 4 };
+	const size_t size_5k2k = 5120ULL * 2160 * 4;
+	const unsigned int pages_5k2k = size_5k2k / PAGE_SIZE;
+	struct apple_dart src_dart, peer_dart;
+	struct apple_dart_dcp src_dcp, peer_dcp, peer_pio;
+	struct apple_dart_domain src_dom = {}, peer_dom = {};
+	struct device src_dev = { .dom = &src_dom };
+	struct device peer_dev = { .dom = &peer_dom };
+	struct device same_dart_dev = { .dom = &src_dom };
+	u64 src_dva = 0, peer_dva = 0;
+	void *cpu;
+
+	setup_dcp(&src_dart, &src_dcp, src_slots, sizeof(src_slots) / sizeof(src_slots[0]));
+	src_dom.dcp = &pio_dcp;
+
+	memset(&peer_dart, 0, sizeof(peer_dart));
+	memset(&peer_dcp, 0, sizeof(peer_dcp));
+	memset(&peer_pio, 0, sizeof(peer_pio));
+	peer_dart.dispext = true;
+	peer_dcp.dart = &peer_dart;
+	peer_dcp.sid = 0;
+	INIT_LIST_HEAD(&peer_dcp.allocations);
+	peer_pio.dart = &peer_dart;
+	peer_pio.sid = 16;
+	peer_dart.frontend[0] = &peer_dcp;
+	peer_dart.frontend[1] = &peer_pio;
+	peer_dom.dcp = &peer_pio;
+	for (size_t i = 0; i < sizeof(peer_slots) / sizeof(peer_slots[0]); i++)
+		set_bit(peer_slots[i], peer_dcp.arena);
+
+	/* Allocate 2-slice 5120x2160 scanout surface on primary DART. */
+	cpu = __apple_dart_dcp_dispext_scanout_alloc(&src_dev, size_5k2k, &src_dva);
+	assert(!IS_ERR(cpu));
+	assert(live_pages == pages_5k2k);
+
+	/* Reject invalid args, same device, same DART, and unknown DVA. */
+	assert(__apple_dart_dcp_dispext_scanout_map_peer(&src_dev, src_dva, &src_dev, &peer_dva) == -EINVAL);
+	assert(__apple_dart_dcp_dispext_scanout_map_peer(&src_dev, src_dva, &same_dart_dev, &peer_dva) == -ENODEV);
+	assert(__apple_dart_dcp_dispext_scanout_map_peer(&src_dev, src_dva + DCP_DART_SLICE, &peer_dev, &peer_dva) == -ENOENT);
+
+	/* Map same physical pages into peer SID0: zero extra RAM allocated. */
+	assert(__apple_dart_dcp_dispext_scanout_map_peer(&src_dev, src_dva, &peer_dev, &peer_dva) == 0);
+	assert(peer_dva == DCP_DART_ALIAS + 10ULL * DCP_DART_SLICE);
+	assert(live_pages == pages_5k2k);
+	assert(peer_dcp.allocated == size_5k2k);
+	assert(peer_dcp.table[10] != NULL && peer_dcp.table[11] != NULL);
+	for (unsigned int i = 0; i < pages_5k2k; i++) {
+		u64 s_phys = apple_dart_dcp_translate(&src_dcp, src_dva + (u64)i * PAGE_SIZE);
+		u64 p_phys = apple_dart_dcp_translate(&peer_dcp, peer_dva + (u64)i * PAGE_SIZE);
+
+		assert(s_phys != 0 && s_phys == p_phys);
+	}
+	assert(!src_dart.retired && !peer_dart.retired);
+	free_dcp_tables(&peer_dcp);
+
+	/* Fragmented peer arena returns -ENOSPC without retiring either DART. */
+	memset(&peer_dart, 0, sizeof(peer_dart));
+	memset(&peer_dcp, 0, sizeof(peer_dcp));
+	peer_dart.dispext = true;
+	peer_dcp.dart = &peer_dart;
+	peer_dcp.sid = 0;
+	INIT_LIST_HEAD(&peer_dcp.allocations);
+	peer_dart.frontend[0] = &peer_dcp;
+	peer_dart.frontend[1] = &peer_pio;
+	peer_pio.dart = &peer_dart;
+	for (size_t i = 0; i < sizeof(frag_slots) / sizeof(frag_slots[0]); i++)
+		set_bit(frag_slots[i], peer_dcp.arena);
+	peer_dva = 0;
+	assert(__apple_dart_dcp_dispext_scanout_map_peer(&src_dev, src_dva, &peer_dev, &peer_dva) == -ENOSPC);
+	assert(peer_dva == 0 && !peer_dart.retired && !src_dart.retired);
+
+	free_dcp_tables(&src_dcp);
+	puts("PASS peer SID0 scanout mapping shares pages cleanly across distinct display DARTs");
+}
+
 int main(void)
 {
 	test_one_and_two_slice_lifecycle();
 	test_fragmented_arena_refuses_two_slices();
 	test_slice1_drift_fails_closed_atomically();
 	test_scanout_enomem_retry_and_postpub_pin();
+	test_peer_scanout_map();
 	return 0;
 }
 '''
@@ -704,7 +807,8 @@ def main():
                         default=ROOT / 'drivers/iommu/apple-dart-dcp-shared.h')
     parser.add_argument('--mutation',
                         choices=('single-slice-only', 'allow-second-slice-dva',
-                                 'skip-second-slice-unmap', 'claim-before-alloc'))
+                                 'skip-second-slice-unmap', 'claim-before-alloc',
+                                 'peer-allow-same-dart'))
     args = parser.parse_args()
 
     text = args.source.read_text()

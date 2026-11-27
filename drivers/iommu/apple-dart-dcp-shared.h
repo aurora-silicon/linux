@@ -553,12 +553,6 @@ unlock:
 	return result;
 }
 
-/*
- * A hardware qualification failure of an external display DART (a pending
- * fault, registers not as adopted, a failed check) retires the whole DART:
- * both frontends, SID0 and SID16 (PIODMA).
- */
-
 /* The SID16 (PIODMA) frontend of an external display DART, or NULL. */
 static struct apple_dart_dcp *apple_dart_dcp_dispext_pio(struct device *piodma)
 {
@@ -572,6 +566,130 @@ static struct apple_dart_dcp *apple_dart_dcp_dispext_pio(struct device *piodma)
 		return NULL;
 	return pio;
 }
+
+/*
+ * J713 external DCP dual-pipe peer: map the physical pages of an existing
+ * retained SID0 scanout surface (@src_dva on @src_piodma) into SID0 of a
+ * separate peer external display DART (@peer_piodma) at its own DVA (*@peer_dva).
+ * Zero extra RAM is allocated; the source surface's pages and size are immutable
+ * once retained on @src_piodma's allocations list. Retained until reboot.
+ */
+static int __apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+						     struct device *peer_piodma, u64 *peer_dva)
+{
+	struct apple_dart_dcp *src_pio, *src_dcp, *peer_pio, *peer_dcp;
+	struct apple_dart_dcp_allocation *iter, *found = NULL;
+	struct page **pages;
+	size_t size;
+	unsigned int slices, count;
+	unsigned long flags;
+	u64 base;
+	int root, ret;
+
+	if (!src_piodma || !peer_piodma || src_piodma == peer_piodma || !src_dva || !peer_dva ||
+	    dev_is_dma_coherent(src_piodma) || dev_is_dma_coherent(peer_piodma))
+		return -EINVAL;
+	src_pio = apple_dart_dcp_dispext_pio(src_piodma);
+	src_dcp = src_pio ? src_pio->dart->frontend[0] : NULL;
+	if (!src_dcp)
+		return -ENODEV;
+	mutex_lock(&src_dcp->alloc_lock);
+	list_for_each_entry(iter, &src_dcp->allocations, link) {
+		if (iter->dva == src_dva) {
+			found = iter;
+			break;
+		}
+	}
+	if (!found || !found->size || found->size > DCP_DART_DISPEXT_MAX_SIZE ||
+	    (found->size & (PAGE_SIZE - 1))) {
+		mutex_unlock(&src_dcp->alloc_lock);
+		return -ENOENT;
+	}
+	/* Retained until reboot: pages[] and size remain valid after unlock. */
+	pages = found->pages;
+	size = found->size;
+	mutex_unlock(&src_dcp->alloc_lock);
+
+	ret = __apple_dart_dcp_check(peer_piodma);
+	if (ret)
+		return ret;
+	peer_pio = to_dart_domain(iommu_get_domain_for_dev(peer_piodma))->dcp;
+	if (peer_pio->sid != 16 || !peer_pio->dart->dispext || peer_pio->dart == src_pio->dart)
+		return -ENODEV;
+	peer_dcp = peer_pio->dart->frontend[0];
+	if (!peer_dcp)
+		return -ENODEV;
+	slices = DIV_ROUND_UP(size, DCP_DART_SLICE);
+	count = size / PAGE_SIZE;
+
+	mutex_lock(&peer_dcp->alloc_lock);
+	ret = -EIO;
+	if (apple_dart_dispext_retired(peer_dcp->dart))
+		goto unlock;
+	if (!apple_dart_dcp_registers(peer_dcp))
+		goto unlock;
+	if (apple_dart_fault_pending(peer_dcp->dart)) {
+		apple_dart_dcp_dispext_fail(peer_dcp->dart,
+					    "a DART fault is pending (peer scanout surface)");
+		goto unlock;
+	}
+	ret = -ENOSPC;
+	if (peer_dcp->allocated > DCP_DART_DISPEXT_SCANOUT_MAX - size)
+		goto unlock;
+	spin_lock_irqsave(&peer_dcp->lock, flags);
+	root = apple_dart_dcp_arena_claim(peer_dcp, slices, false);
+	spin_unlock_irqrestore(&peer_dcp->lock, flags);
+	if (root < 0) {
+		ret = root;
+		goto unlock;
+	}
+	base = DCP_DART_ALIAS + (u64)root * DCP_DART_SLICE;
+	peer_dcp->allocated += size;
+	for (unsigned int i = 0; i < count; i++) {
+		size_t mapped = 0;
+
+		ret = apple_dart_dcp_map_owned(peer_dcp, base + (u64)i * PAGE_SIZE,
+					       page_to_phys(pages[i]), PAGE_SIZE, 1,
+					       IOMMU_READ | IOMMU_WRITE, GFP_KERNEL, &mapped, true);
+		if (!ret && mapped != PAGE_SIZE)
+			ret = -EIO;
+		if (ret)
+			goto pin_failure;
+	}
+	ret = apple_dart_dcp_flush(peer_dcp);
+	if (!ret)
+		ret = __apple_dart_dcp_check(peer_piodma);
+	for (unsigned int i = 0; !ret && i < count; i++) {
+		u64 addr = base + (u64)i * PAGE_SIZE;
+		unsigned int r = (addr >> 25) & 2047;
+		unsigned int leaf = (addr >> 14) & 2047;
+		u64 pte = READ_ONCE(peer_dcp->table[r][leaf]);
+
+		if (apple_dart_dcp_translate(peer_dcp, addr) != page_to_phys(pages[i]) ||
+		    pte != peer_dcp->expected[r][leaf] || !dcp_dart_pte_frontend(pte))
+			ret = -EIO;
+	}
+	for (unsigned int s = 0; !ret && s < slices; s++)
+		if (READ_ONCE(peer_dcp->root[root + s]) != peer_dcp->entry[root + s])
+			ret = -EIO;
+	if (ret)
+		goto pin_failure;
+	*peer_dva = base;
+	goto unlock;
+pin_failure:
+	apple_dart_dcp_dispext_fail(peer_dcp->dart, "peer SID0 scanout surface mapping failed: %d",
+				    ret);
+	dev_err(peer_piodma, "retaining %zu peer SID0 scanout bytes after failure: %d\n", size, ret);
+unlock:
+	mutex_unlock(&peer_dcp->alloc_lock);
+	return ret;
+}
+
+/*
+ * A hardware qualification failure of an external display DART (a pending
+ * fault, registers not as adopted, a failed check) retires the whole DART:
+ * both frontends, SID0 and SID16 (PIODMA).
+ */
 
 /*
  * The SID0 frontend of an external display DART, from its PIODMA
@@ -965,6 +1083,15 @@ void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_t size, u
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_scanout_alloc);
+
+int apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+					    struct device *peer_piodma, u64 *peer_dva)
+{
+	return APPLE_DART_DISPEXT_GATED(peer_piodma,
+		__apple_dart_dcp_dispext_scanout_map_peer(src_piodma, src_dva,
+							  peer_piodma, peer_dva));
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_scanout_map_peer);
 
 int apple_dart_dcp_dispext_qualify(struct device *piodma)
 {

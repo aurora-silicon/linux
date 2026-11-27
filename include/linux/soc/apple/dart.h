@@ -38,6 +38,9 @@ int apple_dart_dcp_dispext_map(struct device *piodma, unsigned int sid, u64 phys
 int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid);
 /* A host-written surface in SID0 of an external display DART (Normal-NC CPU view). */
 void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_t size, u64 *dva);
+/* Map an existing SID0 scanout surface's pages into a peer external display DART's SID0. */
+int apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+					    struct device *peer_piodma, u64 *peer_dva);
 /* An adopted external display DART's state after its power-up; reads only. */
 int apple_dart_dcp_dispext_state(struct device_node *consumer);
 /*
@@ -138,6 +141,13 @@ static inline void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, 
 							 u64 *dva)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+							  struct device *peer_piodma,
+							  u64 *peer_dva)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline void *apple_dart_dcp_scanout_alloc(struct device *dev, size_t size, dma_addr_t *dva)
