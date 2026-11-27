@@ -64,10 +64,10 @@ struct bcm4377_data {
 	pthread_mutex_t resume_lock;
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
-	/* T6041 S2R: zero, so a real sleep's power loss rebinds (not modelled: see below). */
+	/* T6041 S2R: zero, so a real sleep's power loss boots the firmware again (not modelled: see below). */
 	uint64_t dma_window_base;
-	bool resume_guarded, resume_recovering;
-	struct work_struct resume_work;
+	bool resume_guarded, resume_recovering, power_lost;
+	struct work_struct resume_work, power_lost_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;

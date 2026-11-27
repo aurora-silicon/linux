@@ -244,6 +244,8 @@ static int iomfb_queue_command(struct apple_dcp *d,bool o,const struct dcp_metho
 static u64 ktime_get_ns(void){return 1;}
 static void dcp_send_message(struct apple_dcp *,u8,u64);
 static void dcp_ack(struct apple_dcp *,enum dcp_context_id);
+/* No thread waits for the channels to go idle in this single-threaded control. */
+static void iomfb_channels_idle_wake(struct apple_dcp *d){(void)d;}
 static void dcp_push(struct apple_dcp *,bool,const struct dcp_method_entry *,u32,u32,void *,dcp_callback_t,void *);
 static void boot_done(struct apple_dcp *,void *,void *);
 static unsigned commands,callback_acks;static int bad_status,corrupt;static bool byte_reply;static u8 memory[0x100000];
