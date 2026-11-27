@@ -8747,6 +8747,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
 	init_completion(&dcp->s2r_dart_done);
 	init_completion(&dcp->s2r_hpd_done);
+	init_waitqueue_head(&dcp->channels_idle_wq);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
@@ -9882,7 +9883,6 @@ static int dcp_s2r_quiesce(struct apple_dcp *dcp, u32 *status)
 	bool display_off = dcp->s2r_refused_off;
 	bool idle_sent = false;
 	s64 power_ms;
-	bool idle;
 	int ret;
 
 	reinit_completion(&dcp->s2r_dart_done);
@@ -9917,7 +9917,7 @@ static int dcp_s2r_quiesce(struct apple_dcp *dcp, u32 *status)
 display_is_off:
 	/* D572 itself is still being answered, and a busy channel can't be sent on. */
 	usleep_range(5000, 6000);
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp))
+	if (iomfb_wait_channels_idle(dcp, 100))
 		dev_warn(dcp->dev, "firmware calls still in flight before A500\n");
 
 	ret = dcp_s2r_500(dcp);
@@ -9929,7 +9929,7 @@ display_is_off:
 
 	/* The firmware's callbacks after A500 have to be answered first. */
 	usleep_range(5000, 6000);
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp))
+	if (iomfb_wait_channels_idle(dcp, 100))
 		dev_warn(dcp->dev, "firmware calls still in flight before idle\n");
 
 	idle_sent = true;
@@ -11965,7 +11965,6 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	bool idle_attempted = false;
 	bool t6040 = dcp_t6040_relinks();
 	bool relink;
-	bool idle;
 	u32 ctrl, status;
 	int ret;
 
@@ -12060,8 +12059,7 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 			_dcp_poweroff(dcp);
 			powered_off = true;
 			if (t6040) {
-				if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000,
-						      false, dcp))
+				if (iomfb_wait_channels_idle(dcp, 200))
 					dev_warn(dev,
 						 "display calls still in flight after the power-off\n");
 				/*
@@ -12103,7 +12101,7 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 				goto err_unwind;
 			}
 		}
-		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+		if (iomfb_wait_channels_idle(dcp, 200)) {
 			dev_err(dev, "display calls still in flight after the power-off\n");
 			ret = -ETIMEDOUT;
 			goto err_unwind;
@@ -12114,7 +12112,7 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 		dev_err(dev, "no reply to A500: %d\n", ret);
 		goto err_unwind;
 	}
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp)) {
+	if (iomfb_wait_channels_idle(dcp, 100)) {
 		dev_err(dev, "display calls still in flight after A500\n");
 		ret = -ETIMEDOUT;
 		goto err_unwind;
@@ -12393,7 +12391,6 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 	struct drm_crtc_state *cs;
 	struct drm_crtc *crtc;
 	ktime_t start = ktime_get();
-	bool idle;
 	int ret;
 
 	reinit_completion(&dcp->s2r_hpd_done);
@@ -12410,7 +12407,7 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 	}
 	dev_dbg(dcp->dev, "D575 hotplug ready %lld ms after power-on\n",
 		ktime_ms_delta(ktime_get(), start));
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+	if (iomfb_wait_channels_idle(dcp, 200)) {
 		dev_err(dcp->dev, "display calls still in flight after D575\n");
 		return -ETIMEDOUT;
 	}
@@ -12457,7 +12454,6 @@ static int dcp_t6041_boot_ps_io(struct apple_dcp *dcp, bool restore)
 	static const char *const names[3] = { "sys", "fe", "cpu" };
 	struct dcp_t6041_power *pwr = &dcp->t6041_power;
 	const struct dcp_t6041_chain *main = pwr->main_chain;
-	bool idle;
 	u32 cur;
 	int i;
 
@@ -12476,7 +12472,7 @@ static int dcp_t6041_boot_ps_io(struct apple_dcp *dcp, bool restore)
 	if (!pwr->boot_ps_valid)
 		return 0;
 
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+	if (iomfb_wait_channels_idle(dcp, 200)) {
 		dev_err(dcp->dev, "display calls still in flight before restoring boot power words\n");
 		return -ETIMEDOUT;
 	}

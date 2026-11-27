@@ -390,6 +390,22 @@ bool iomfb_channels_idle(struct apple_dcp *dcp)
 	       !atomic_read_acquire(&dcp->pending_acks);
 }
 
+static void iomfb_channels_idle_wake(struct apple_dcp *dcp)
+{
+	/* The barrier in wq_has_sleeper() orders the depth and ACK updates before the check. */
+	if (wq_has_sleeper(&dcp->channels_idle_wq))
+		wake_up_all(&dcp->channels_idle_wq);
+}
+
+/* 0 once every channel is idle, -ETIMEDOUT if one is still busy after @timeout_ms. */
+int iomfb_wait_channels_idle(struct apple_dcp *dcp, unsigned int timeout_ms)
+{
+	if (!wait_event_timeout(dcp->channels_idle_wq, iomfb_channels_idle(dcp),
+				msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+	return 0;
+}
+
 enum iomfb_opaque_x_state {
 	IOMFB_OPAQUE_X_WAITING,
 	IOMFB_OPAQUE_X_NEEDED,
@@ -731,6 +747,7 @@ void iomfb_reset_transport(struct apple_dcp *dcp)
 	dcp->present_state_h17p.pending = false;
 	dcp->present_state_h17p.accepted = false;
 	mutex_unlock(&dcp->iomfb.lock);
+	iomfb_channels_idle_wake(dcp);
 }
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
@@ -1468,6 +1485,7 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	/* Order dcp_send_message() before publishing pending_acks == 0. */
 	smp_mb__before_atomic();
 	atomic_dec(&dcp->pending_acks);
+	iomfb_channels_idle_wake(dcp);
 }
 
 /*
@@ -2280,6 +2298,7 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	}
 
 	dcp_pop_depth(&ch->depth);
+	iomfb_channels_idle_wake(dcp);
 
 	cb = ch->callbacks[ch->depth];
 	cookie = ch->cookies[ch->depth];

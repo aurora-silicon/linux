@@ -256,6 +256,7 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_channels_idle(struct apple_dcp *dcp);
+int iomfb_wait_channels_idle(struct apple_dcp *dcp, unsigned int timeout_ms);
 int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on);
 bool iomfb_v27_sleep_described(struct apple_dcp *dcp);
 void iomfb_v27_wake_present(struct apple_dcp *dcp);
