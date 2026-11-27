@@ -1006,6 +1006,7 @@
 				compatible = "apple,t6050-clpc", "apple,t6041-clpc";
 				reg = <0x01>;
 				apple,smc = <&smc>;
+				apple,cpu-busy-floor = <6 3>;
 			};
 		};
 
