@@ -106,6 +106,28 @@ enum RunState {
     Unknown,
 }
 
+/// Firmware property transport needed by stream lifecycle transitions.
+trait IntervalIo {
+    fn get_interval(&self) -> Result<Option<u32>>;
+    fn set_interval_status(&self, interval: u32) -> Result<u32>;
+    fn set_interval(&self, interval: u32) -> Result;
+}
+
+/// Outcome of [`Stream::probe_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeEvent {
+    IdleStopped(u32),
+    StopRefused(u32),
+    StopTimedOutStopped(Error),
+    StopFailedStillRunning(Error, u32),
+    StopAmbiguousRestored(Error, u32),
+    StopAmbiguousRecoverable(Error, u32),
+    ExceedsBound(u32),
+    AlreadyZero,
+    NotReadable,
+    ReadFailed(Error),
+}
+
 /// On-demand stream state for lid angle reports.
 struct Stream<T> {
     /// Firmware's default interval when on-demand gating is supported (`None`
@@ -184,6 +206,109 @@ impl<T> Stream<T> {
         }
         self.failed_until.as_ref().map(|(_, e)| *e)
     }
+
+    /// Arms a rate-limited idle-stop retry whenever an unacknowledged start or
+    /// stop leaves an idle on-demand stream potentially running.
+    fn arm_stop_retry(&mut self, deadline: T) -> bool {
+        if self.interval_us.is_some() && !self.want() && self.run_state != RunState::Stopped {
+            self.direct_until = Some(deadline);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sync_with(&mut self, io: &dyn IntervalIo) -> Result {
+        match self.next_action() {
+            SyncAction::Start(interval) => match io.set_interval(interval) {
+                Ok(()) => {
+                    self.run_state = RunState::Running;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.run_state = RunState::Unknown;
+                    Err(e)
+                }
+            },
+            SyncAction::Stop => match io.set_interval(0) {
+                Ok(()) => {
+                    self.run_state = RunState::Stopped;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.run_state = RunState::Unknown;
+                    Err(e)
+                }
+            },
+            SyncAction::None => Ok(()),
+        }
+    }
+
+    /// Queries the firmware's reporting interval and stops idle streaming when
+    /// the service reports within `MAX_ONDEMAND_INTERVAL_US` and accepts
+    /// `PROP_INTERVAL = 0`.
+    fn probe_with(&mut self, io: &dyn IntervalIo, retry_deadline: T) -> (ProbeEvent, bool) {
+        match io.get_interval() {
+            Ok(Some(interval)) if interval > 0 && interval <= MAX_ONDEMAND_INTERVAL_US => {
+                match io.set_interval_status(0) {
+                    Ok(0) => {
+                        self.interval_us = Some(interval);
+                        self.restore_interval = Some(interval);
+                        self.run_state = RunState::Stopped;
+                        (ProbeEvent::IdleStopped(interval), false)
+                    }
+                    Ok(status) => (ProbeEvent::StopRefused(status), false),
+                    Err(e) => match io.get_interval() {
+                        // The stop write may have taken effect before the reply
+                        // timed out. Reconcile the live interval and preserve
+                        // the original period so unbind/rebind never inherits 0.
+                        Ok(Some(0)) => {
+                            self.interval_us = Some(interval);
+                            self.restore_interval = Some(interval);
+                            self.run_state = RunState::Stopped;
+                            (ProbeEvent::StopTimedOutStopped(e), false)
+                        }
+                        Ok(Some(cur)) if cur > 0 => {
+                            (ProbeEvent::StopFailedStillRunning(e, cur), false)
+                        }
+                        _ => match io.set_interval_status(interval) {
+                            Ok(0) => (ProbeEvent::StopAmbiguousRestored(e, interval), false),
+                            _ => {
+                                // Both readback and passive restoration failed;
+                                // keep on-demand mode from Unknown so direct
+                                // reads restart reports and idle retry stops
+                                // them instead of stranding passive ENODATA.
+                                self.interval_us = Some(interval);
+                                self.restore_interval = Some(interval);
+                                self.run_state = RunState::Unknown;
+                                let retry = self.arm_stop_retry(retry_deadline);
+                                (ProbeEvent::StopAmbiguousRecoverable(e, interval), retry)
+                            }
+                        },
+                    },
+                }
+            }
+            Ok(Some(interval)) if interval > MAX_ONDEMAND_INTERVAL_US => {
+                (ProbeEvent::ExceedsBound(interval), false)
+            }
+            Ok(Some(_)) => (ProbeEvent::AlreadyZero, false),
+            Ok(None) => (ProbeEvent::NotReadable, false),
+            Err(e) => (ProbeEvent::ReadFailed(e), false),
+        }
+    }
+
+    fn shutdown_with(&mut self, io: &dyn IntervalIo) -> Result {
+        self.parked = true;
+        self.direct_until = None;
+        self.failed_until = None;
+        if let Some(interval) = self.restore_interval {
+            io.set_interval(interval)?;
+            self.run_state = RunState::Running;
+            self.restore_interval = None;
+            self.interval_us = None;
+        }
+        Ok(())
+    }
 }
 
 #[pin_data]
@@ -201,6 +326,31 @@ impl_has_delayed_work! {
     impl HasDelayedWork<Self> for Control { self.idle_work }
 }
 
+impl IntervalIo for Control {
+    fn get_interval(&self) -> Result<Option<u32>> {
+        get_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL)
+    }
+
+    fn set_interval_status(&self, interval: u32) -> Result<u32> {
+        set_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL, interval)
+    }
+
+    fn set_interval(&self, interval: u32) -> Result {
+        match self.set_interval_status(interval)? {
+            0 => Ok(()),
+            status => {
+                dev_err!(
+                    self.dev,
+                    "interval {} us refused: status {:#x}\n",
+                    interval,
+                    status
+                );
+                Err(EIO)
+            }
+        }
+    }
+}
+
 impl Control {
     fn new(dev: &device::Device, aop: Arc<dyn AOP>, service: EPICService) -> Result<Arc<Self>> {
         Arc::pin_init(
@@ -215,135 +365,75 @@ impl Control {
         )
     }
 
-    fn set_interval(&self, interval: u32) -> Result {
-        match set_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL, interval)? {
-            0 => Ok(()),
-            status => {
-                dev_err!(
-                    self.dev,
-                    "interval {} us refused: status {:#x}\n",
-                    interval,
-                    status
-                );
-                Err(EIO)
-            }
-        }
-    }
-
     /// Queries the firmware's reporting interval and stops idle streaming when
     /// the service reports within `MAX_ONDEMAND_INTERVAL_US` and accepts
     /// `PROP_INTERVAL = 0`.
-    fn probe_init(&self) {
-        let mut s = self.stream.lock();
-        match get_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL) {
-            Ok(Some(interval)) if interval > 0 && interval <= MAX_ONDEMAND_INTERVAL_US => {
-                match set_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL, 0) {
-                    Ok(0) => {
-                        s.interval_us = Some(interval);
-                        s.restore_interval = Some(interval);
-                        s.run_state = RunState::Stopped;
-                        dev_dbg!(
-                            self.dev,
-                            "reports idle-stopped (interval {} us)\n",
-                            interval
-                        );
-                    }
-                    Ok(status) => dev_info!(
-                        self.dev,
-                        "idle stop refused (status {:#x}); leaving reports on\n",
-                        status
-                    ),
-                    Err(e) => {
-                        // The stop write may have taken effect before the reply
-                        // timed out. Reconcile the live interval and preserve
-                        // the original period so unbind/rebind never inherits 0.
-                        match get_u32(self.aop.as_ref(), &self.service, PROP_INTERVAL) {
-                            Ok(Some(0)) => {
-                                s.interval_us = Some(interval);
-                                s.restore_interval = Some(interval);
-                                s.run_state = RunState::Stopped;
-                                dev_dbg!(
-                                    self.dev,
-                                    "idle stop timed out ({:?}) but interval is 0; using on-demand mode\n",
-                                    e
-                                );
-                            }
-                            Ok(Some(cur)) if cur > 0 => dev_warn!(
-                                self.dev,
-                                "idle stop failed ({:?}); interval still {} us, leaving passive\n",
-                                e,
-                                cur
-                            ),
-                            _ => {
-                                dev_warn!(
-                                    self.dev,
-                                    "idle stop ambiguous ({:?}); restoring {} us and leaving passive\n",
-                                    e,
-                                    interval
-                                );
-                                match set_u32(
-                                    self.aop.as_ref(),
-                                    &self.service,
-                                    PROP_INTERVAL,
-                                    interval,
-                                ) {
-                                    Ok(0) => {}
-                                    _ => {
-                                        s.restore_interval = Some(interval);
-                                        s.run_state = RunState::Unknown;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Some(interval)) if interval > MAX_ONDEMAND_INTERVAL_US => dev_dbg!(
+    fn probe_init(self: &Arc<Self>) {
+        let (event, retry) = {
+            let mut s = self.stream.lock();
+            let retry_deadline = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+            s.probe_with(self.as_ref(), retry_deadline)
+        };
+        match event {
+            ProbeEvent::IdleStopped(interval) => dev_dbg!(
+                self.dev,
+                "reports idle-stopped (interval {} us)\n",
+                interval
+            ),
+            ProbeEvent::StopRefused(status) => dev_info!(
+                self.dev,
+                "idle stop refused (status {:#x}); leaving reports on\n",
+                status
+            ),
+            ProbeEvent::StopTimedOutStopped(e) => dev_dbg!(
+                self.dev,
+                "idle stop timed out ({:?}) but interval is 0; using on-demand mode\n",
+                e
+            ),
+            ProbeEvent::StopFailedStillRunning(e, cur) => dev_warn!(
+                self.dev,
+                "idle stop failed ({:?}); interval still {} us, leaving passive\n",
+                e,
+                cur
+            ),
+            ProbeEvent::StopAmbiguousRestored(e, interval) => dev_warn!(
+                self.dev,
+                "idle stop ambiguous ({:?}); restored {} us, leaving passive\n",
+                e,
+                interval
+            ),
+            ProbeEvent::StopAmbiguousRecoverable(e, interval) => dev_warn!(
+                self.dev,
+                "idle stop ambiguous ({:?}) and restore of {} us failed; keeping on-demand mode from unknown state\n",
+                e,
+                interval
+            ),
+            ProbeEvent::ExceedsBound(interval) => dev_dbg!(
                 self.dev,
                 "interval {} us exceeds on-demand bound; leaving reports passive\n",
                 interval
             ),
-            Ok(Some(_)) => dev_dbg!(self.dev, "interval is already 0 at probe\n"),
-            Ok(None) => dev_dbg!(self.dev, "interval not readable; leaving reports passive\n"),
-            Err(e) => dev_warn!(self.dev, "interval read failed at probe: {:?}\n", e),
+            ProbeEvent::AlreadyZero => dev_dbg!(self.dev, "interval is already 0 at probe\n"),
+            ProbeEvent::NotReadable => {
+                dev_dbg!(self.dev, "interval not readable; leaving reports passive\n")
+            }
+            ProbeEvent::ReadFailed(e) => {
+                dev_warn!(self.dev, "interval read failed at probe: {:?}\n", e)
+            }
+        }
+        if retry {
+            self.schedule_idle(DIRECT_IDLE_MS as u32);
         }
     }
 
     fn sync_locked(&self, s: &mut Stream<Instant<Monotonic>>) -> Result {
-        match s.next_action() {
-            SyncAction::Start(interval) => match self.set_interval(interval) {
-                Ok(()) => {
-                    s.run_state = RunState::Running;
-                    Ok(())
-                }
-                Err(e) => {
-                    s.run_state = RunState::Unknown;
-                    Err(e)
-                }
-            },
-            SyncAction::Stop => match self.set_interval(0) {
-                Ok(()) => {
-                    s.run_state = RunState::Stopped;
-                    Ok(())
-                }
-                Err(e) => {
-                    s.run_state = RunState::Unknown;
-                    Err(e)
-                }
-            },
-            SyncAction::None => Ok(()),
-        }
+        s.sync_with(self)
     }
 
     /// Arms a rate-limited idle-stop retry whenever an unacknowledged start or
     /// stop leaves an idle on-demand stream potentially running.
     fn arm_stop_retry_locked(&self, s: &mut Stream<Instant<Monotonic>>) -> bool {
-        if s.interval_us.is_some() && !s.want() && s.run_state != RunState::Stopped {
-            s.direct_until = Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
-            true
-        } else {
-            false
-        }
+        s.arm_stop_retry(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS))
     }
 
     fn schedule_idle(self: &Arc<Self>, delay_ms: u32) {
@@ -406,16 +496,7 @@ impl Control {
     fn shutdown(self: &Arc<Self>) -> Result {
         self.stop_idle_sync(true);
         let mut s = self.stream.lock();
-        s.parked = true;
-        s.direct_until = None;
-        s.failed_until = None;
-        if let Some(interval) = s.restore_interval {
-            self.set_interval(interval)?;
-            s.run_state = RunState::Running;
-            s.restore_interval = None;
-            s.interval_us = None;
-        }
-        Ok(())
+        s.shutdown_with(self.as_ref())
     }
 }
 
