@@ -289,9 +289,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
-        g16_sleep_at_prepare: u32 {
+        g16_sleep_at_commit: u32 {
             default: 0,
-            description: "DIAGNOSTIC: G16: stop the GPU firmware in .prepare instead of the sleep's commit (T6030 sleep bring-up)",
+            description: "DIAGNOSTIC: G16: stop the GPU firmware in the sleep's commit instead of .prepare (T6030 sleep bring-up)",
         },
         g16_sleep_no_pmp_request: u32 {
             default: 0,

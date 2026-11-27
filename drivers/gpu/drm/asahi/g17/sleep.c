@@ -808,63 +808,130 @@ err:
 }
 
 /*
- * The G15S stop as macOS 27.2 makes it on J516s: in its device sleep, before any display request
- * goes, 4.1 to 4.5 s before the commit. The same in all three full records
- * (s2r-trace ref/t6030-macos-s2r-entry-full-{1,2,3}.tsv; run 1's times from the AP IDLE):
- *  1. AP IDLE (0x201) on endpoint 0: echoed after 94 us;
- *  2. IOP IDLE (0x201): acknowledged after 0.12 ms;
- *  3. the mailbox's receive interrupt off (I2A control 0x21101 -> 0x21100) 38 us later, and
- *     the mailbox's first word read (0x2e);
- *  4. the PMP's AGX request (PTD request bit 4) withdrawn 20 us later;
- *  5. 0.24 ms later the GFX word out of automatic power with its target on (0x0f0000ff), then
- *     its target off (0x0f0003f0) 6 us after that. Not copied yet: see below.
- * AFR, the GPU PMGR's +0x10000 and +0x14000 blocks stay for the sleep controller, which lowers
- * them 2.7 to 6.6 ms before the commit.
- *
- * Those records don't cover the ASC's own page. Linux doesn't touch it here either: with the
- * firmware idle, GFX may be gated, and the page doesn't answer then.
+ * The SRAM a G15S stop saves while its firmware still runs and its restart writes back before the
+ * run bit, as macOS does (lane A, mac-gpustop-1): one buffer, the GPU being one device.
+ */
+static u64 *asahi_g16_sram;
+static void __iomem *asahi_g16_sram_io;
+static size_t asahi_g16_sram_save_len, asahi_g16_sram_restore_len;
+
+static int asahi_g16_sram_save(struct device *dev, u64 offset, size_t save_len, size_t restore_len)
+{
+	size_t i;
+
+	if (!save_len || restore_len > save_len || (save_len | restore_len | offset) & 7)
+		return -EINVAL;
+	if (!asahi_g16_sram) {
+		asahi_g16_sram = kvmalloc(save_len, GFP_KERNEL);
+		asahi_g16_sram_io = asahi_g17_map(dev->of_node, "sgx", 0, offset, save_len);
+		if (!asahi_g16_sram || !asahi_g16_sram_io) {
+			kvfree(asahi_g16_sram);
+			if (asahi_g16_sram_io)
+				iounmap(asahi_g16_sram_io);
+			asahi_g16_sram = NULL;
+			asahi_g16_sram_io = NULL;
+			return -ENOMEM;
+		}
+		asahi_g16_sram_save_len = save_len;
+	}
+	if (save_len != asahi_g16_sram_save_len)
+		return -EINVAL;
+	/* In order, 64 bits at a time, as macOS reads it */
+	for (i = 0; i < save_len / 8; i++)
+		asahi_g16_sram[i] = readq(asahi_g16_sram_io + 8 * i);
+	asahi_g16_sram_restore_len = restore_len;
+	return 0;
+}
+
+/* The restart's write-back, with GFX on and before the run bit: the first @restore_len only. */
+int asahi_g16_sram_restore(void)
+{
+	size_t i;
+
+	if (!asahi_g16_sram || !asahi_g16_sram_restore_len)
+		return -ENODATA;
+	for (i = 0; i < asahi_g16_sram_restore_len / 8; i++)
+		writeq(asahi_g16_sram[i], asahi_g16_sram_io + 8 * i);
+	asahi_g16_sram_restore_len = 0;
+	return 0;
+}
+
+/* The mailbox +0x0 bit macOS waits for after the receive goes off (0x2c -> 0x2e) */
+#define G16_MBOX_STOPPED	BIT(1)
+
+/*
+ * The G15S stop as macOS 27.2 makes it on J516s, in its device sleep before any display request
+ * goes, about 4.2 s before the commit (lane A's mac-gpustop-1 with the ASC page and sgx hooked,
+ * s2r-trace ref/t6030-macos-gpu-stop-asc-sgx.tsv; ms before the commit):
+ *  1. -4398 to -4240: the SRAM in sgx reg[1] read in order, 64 bits at a time (@save_len at
+ *     @sram_offset in "sgx"), with the firmware running;
+ *  2. -4239.87: AP IDLE (0x201), echoed; IOP IDLE, acknowledged at -4239.58;
+ *  3. -4239.56: the mailbox's receive interrupt off (I2A control 0x22201 -> 0x22200), then its
+ *     +0x0 polled until bit 1 (0x2c -> 0x2e, 1.26 ms);
+ *  4. -4238.29: ASC CPU_CONTROL read (0x10), written 0, read, written 0; CPU_STATUS is never read;
+ *  5. -4238.27: the PMP's AGX request (PTD request bit 4) withdrawn;
+ *  6. -4238.04: the GFX word out of automatic power with its target on (0x0f0000ff), then its
+ *     target off (0x0f0003f0); it reads 0x0f000100.
+ * The restart is the reverse (asahi_g16_sram_restore() and the driver's warm restart): GFX on,
+ * automatic power, the AGX request, the SRAM's first @restore_len written back, the receive on, the
+ * run bit, and the firmware's own HELLO.
  *
  * Interrupts on, in .prepare, before anything else suspends. Told to idle, the firmware can't
- * carry on, so the stop goes on whatever it answers, and only a restart brings it back.
+ * carry on, so the stop goes on whatever it answers, and only the restart brings it back.
  */
-struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk)
+struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk,
+					    u64 sram_offset, size_t save_len, size_t restore_len)
 {
 	struct asahi_g17_commit *c;
+	unsigned int i;
+	u32 val;
 
 	c = asahi_g16_commit_alloc(dev, rtk);
 	if (IS_ERR(c))
 		return c;
 
-	/* The step reached, in PMU scratch, which a reset keeps: 0x21 to 0x27 */
+	/* The step reached, in PMU scratch, which a reset keeps */
 	c->ran = true;
 	asahi_g16_sleep_note(0x21);
-	/*
-	 * No GFX write, and nothing on the ASC's own page. On J516s every AP write taking GFX out
-	 * of automatic power reset the SoC, before or after the idle and macOS's 0x0f0000ff too
-	 * (PMU notes 0x21 and 0x24), and the CPU's status didn't answer after the idle; what macOS
-	 * does before its GFX write isn't in its records yet. GFX stays under automatic power,
-	 * which the idle firmware gates, and the sleep controller takes AFR, its parent, down
-	 * before the commit. The PMGR word is only read, for the log and the wake.
-	 */
+	c->raise_ret = save_len ? asahi_g16_sram_save(dev, sram_offset, save_len, restore_len) : 0;
+	asahi_g16_sleep_note(0x28);
 	c->entry = readl(c->ps);
 	c->saved = c->entry;
 	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
 	asahi_g16_sleep_note(0x22);
 	apple_rtkit_mailbox_recv_off(c->rtk[0]);
-	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
-	/*
-	 * Its receive interrupt masked as well: the kernel runs on with the domain gated, and a
-	 * read of the unpowered mailbox from its handler aborts. The wake unmasks it.
-	 */
+	for (i = 0; i < 1000; i++) {
+		c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+		if (c->words[0] & G16_MBOX_STOPPED)
+			break;
+		udelay(10);
+	}
 	apple_rtkit_hold_rx(c->rtk[0]);
 	asahi_g16_sleep_note(0x23);
+	c->status[0] = readl(c->cpu[0]);
+	writel(0, c->cpu[0]);
+	readl(c->cpu[0]);
+	writel(0, c->cpu[0]);
+	asahi_g16_sleep_note(0x29);
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
 	asahi_g16_sleep_note(0x24);
-	c->lowered = readl(c->ps);
+
+	val = readl(c->ps);
+	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	val = readl(c->ps);
+	c->words[1] = val;
+	asahi_g16_sleep_note(0x25);
+	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
+	asahi_g16_sleep_note(0x26);
+	c->lower_ret = readl_poll_timeout(c->ps, c->lowered,
+					  !FIELD_GET(PS_ACTUAL, c->lowered) &&
+					  !(c->lowered & PS_BUSY),
+					  10, PS_TIMEOUT_US);
 	asahi_g16_sleep_note(0x27);
 
-	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, PMP request %d, GFX %#x, then %#x\n",
-		 c->idle[0], c->idle_us[0], c->words[0], c->request_ret, c->entry, c->lowered);
+	dev_info(dev, "GPU stopped for the sleep: SRAM %d, idle %d in %u us, mailbox %#x, control %#x, PMP request %d, GFX %#x, %#x then %#x (%d)\n",
+		 c->raise_ret, c->idle[0], c->idle_us[0], c->words[0], c->status[0],
+		 c->request_ret, c->entry, c->words[1], c->lowered, c->lower_ret);
 
 	return c;
 }

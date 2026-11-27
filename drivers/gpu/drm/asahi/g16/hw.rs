@@ -66,13 +66,27 @@ pub(crate) struct Config {
     pub(crate) deep_sleep: bool,
     /// Where a deep sleep stops the firmware.
     pub(crate) sleep_stop: SleepStop,
-    /// The stop at the commit touches neither the ASC's page nor the GFX word after the idle,
-    /// and the mailbox's interrupt is masked from `.prepare` (G15S).
+    /// The stop at the commit touches neither the ASC's page nor the GFX word after the idle
+    /// (G15S, where the stop is left to the commit).
     pub(crate) sleep_quiet_stop: bool,
+    /// The SRAM a stop in `.prepare` saves before the idle and the restart writes back.
+    pub(crate) sleep_sram: Option<SleepSram>,
     /// Whether render work accepts scratch for ray queries.
     pub(crate) supports_render_scs: bool,
     /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
     pub(crate) cross_engine_hold: bool,
+}
+
+/// SRAM in the "sgx" window that a stop in `.prepare` saves with the firmware running and the
+/// restart writes back with GFX on, before the run bit. Offsets in bytes from the window.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SleepSram {
+    /// Where the saved range starts.
+    pub(crate) start: usize,
+    /// Bytes saved.
+    pub(crate) save: usize,
+    /// Bytes written back, from `start`.
+    pub(crate) restore: usize,
 }
 
 /// When a deep sleep stops the GPU's firmware and powers its domain off.
@@ -212,6 +226,7 @@ pub(crate) mod t8132 {
         deep_sleep: true,
         sleep_stop: super::SleepStop::Commit,
         sleep_quiet_stop: false,
+        sleep_sram: None,
         supports_render_scs: true,
         cross_engine_hold: false,
     };
@@ -374,13 +389,21 @@ pub(crate) mod t6030 {
         // (s2r-trace ref/t6030-macos-s2r-{entry,wake}-full-{1,2,3}.tsv). There is no TVM gate:
         // AFR and the GPU PMGR's other blocks are the sleep controller's.
         //
-        // MEAS J516s (pm_test=devices): Linux can't stop it there. After the idle the ASC's page
-        // doesn't answer, every AP write taking GFX out of automatic power resets the SoC, and
-        // the idled firmware answers neither IOP INIT nor IOP ON without a reset. So the idle
-        // waits for the commit, after which only a real wake (a reset) follows.
+        //
+        // With the ASC page and sgx hooked as well (lane A, mac-gpustop-1,
+        // ref/t6030-macos-gpu-stop-asc-sgx.tsv): before the idle macOS saves sgx reg[1]
+        // +0x60000..+0x80000, in order, 64 bits at a time; after the idle it clears the ASC's
+        // CPU_CONTROL (never reading CPU_STATUS) before GFX goes off. Its restart writes back
+        // +0x60000..+0x74000 with GFX on, then sets the run bit and takes the firmware's HELLO.
+        // sgx reg[1] is at "sgx" +0xd00000 (ADT /arm-io/sgx reg[1], 0x290d00000).
         deep_sleep: true,
-        sleep_stop: super::SleepStop::Commit,
+        sleep_stop: super::SleepStop::Prepare,
         sleep_quiet_stop: true,
+        sleep_sram: Some(super::SleepSram {
+            start: 0xd60000,
+            save: 0x20000,
+            restore: 0x14000,
+        }),
         supports_render_scs: false,
         cross_engine_hold: true,
     };
