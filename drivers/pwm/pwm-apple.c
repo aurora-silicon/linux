@@ -61,6 +61,8 @@ static int apple_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	if (ret)
 		return ret;
 
+	bool driving = false;
+
 	if (state->enabled) {
 		u64 on_cycles, off_cycles;
 
@@ -78,16 +80,17 @@ static int apple_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 		writel(off_cycles, fpwm->base + APPLE_PWM_OFF_CYCLES);
 		writel(APPLE_PWM_CTRL_ENABLE | APPLE_PWM_CTRL_OUTPUT_ENABLE | APPLE_PWM_CTRL_UPDATE,
 		       fpwm->base + APPLE_PWM_CTRL);
+		driving = on_cycles > 0;
 	} else {
 		writel(0, fpwm->base + APPLE_PWM_CTRL);
 	}
 
-	/* Keep the controller powered for as long as it drives an output. */
-	if (state->enabled && !fpwm->enabled)
+	/* Keep the controller powered only while it actively drives a non-zero output. */
+	if (driving && !fpwm->enabled)
 		pm_runtime_get_noresume(dev);
-	else if (!state->enabled && fpwm->enabled)
+	else if (!driving && fpwm->enabled)
 		pm_runtime_put_noidle(dev);
-	fpwm->enabled = state->enabled;
+	fpwm->enabled = driving;
 	pm_runtime_put(dev);
 	return 0;
 }
@@ -212,10 +215,12 @@ static int apple_pwm_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/* Preserve an output that the bootloader left running. */
+	/* Preserve a non-zero output that the bootloader left running. */
 	fpwm->ctrl = readl(fpwm->base + APPLE_PWM_CTRL);
+	fpwm->on_cycles = readl(fpwm->base + APPLE_PWM_ON_CYCLES);
 	fpwm->enabled = (fpwm->ctrl & APPLE_PWM_CTRL_ENABLE) &&
-			(fpwm->ctrl & APPLE_PWM_CTRL_OUTPUT_ENABLE);
+			(fpwm->ctrl & APPLE_PWM_CTRL_OUTPUT_ENABLE) &&
+			fpwm->on_cycles > 0;
 	pm_runtime_get_noresume(dev); /* probe reference */
 	if (fpwm->enabled)
 		pm_runtime_get_noresume(dev); /* output reference */
