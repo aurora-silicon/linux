@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
- * HDR10 static metadata for the DCPAV service of desktop 26.x DCPs.
+ * HDR10 static metadata for the DCPAV service.
  *
  * The display's Dynamic Range and Mastering InfoFrame is link state the
  * firmware builds itself: the host sends DCPAV selector 0x15
@@ -62,6 +62,11 @@
 #define DCP_HDR_STOP_STATUS		0x70
 #define DCP_HDR_INFOFRAME_DRM		0x87
 
+static inline bool dcp_hdr_is_type1(const struct hdr_output_metadata *hdr)
+{
+	return !hdr->metadata_type && !hdr->hdmi_metadata_type1.metadata_type;
+}
+
 /* The 24-byte Type 1 body of @hdr; -EINVAL unless it is a Type 1 block. */
 static inline int dcp_hdr_data(u8 data[DCP_HDR_DATA_SIZE],
 			       const struct hdr_output_metadata *hdr)
@@ -69,7 +74,7 @@ static inline int dcp_hdr_data(u8 data[DCP_HDR_DATA_SIZE],
 	const struct hdr_metadata_infoframe *t1 = &hdr->hdmi_metadata_type1;
 	unsigned int i;
 
-	if (hdr->metadata_type || t1->metadata_type)
+	if (!dcp_hdr_is_type1(hdr))
 		return -EINVAL;
 	for (i = 0; i < 3; i++) {
 		put_unaligned_le16(t1->display_primaries[i].x, data + i * 4);

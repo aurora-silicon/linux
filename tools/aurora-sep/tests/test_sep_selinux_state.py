@@ -19,6 +19,8 @@ STATE = [
     'aurora-sep-host-state.bin', 'aurora-sep-xart-owned.bin',
     'aurora-sep-xart-allow-once.bin', 'aurora-sep-xart-policy-previous.bin',
 ]
+# Temporary names the kernel renames over the catacombs.
+TEMPORARY = ['.%s.new' % name for name in STATE[:3]]
 
 
 class SelinuxModuleTests(unittest.TestCase):
@@ -51,6 +53,21 @@ class SelinuxModuleTests(unittest.TestCase):
             self.assertIn(
                 'type_transition kernel_t var_lib_t:file aurora_sep_state_t "%s";' % name,
                 self.te)
+
+    def test_replacement_temporaries_get_the_state_type(self):
+        # Rename keeps the temporary inode's label, so it must be created with
+        # the state type, not var_lib_t.
+        for name in TEMPORARY:
+            hits = [c for r, k, c in self.contexts() if r.match('/var/lib/' + name)]
+            self.assertEqual(len(hits), 1, name)
+            self.assertIn(':aurora_sep_state_t,', hits[0], name)
+            self.assertIn(
+                'type_transition kernel_t var_lib_t:file aurora_sep_state_t "%s";' % name,
+                self.te)
+        # The kernel fixes the temporary's mode after a restrictive umask
+        # (setattr), renames it over the catacomb, and unlinks a leftover.
+        self.assertRegex(self.te, r'allow kernel_t aurora_sep_state_t:file \{[^}]*'
+                         r'setattr_file_perms rename_file_perms delete_file_perms \};')
 
     def test_no_access_to_generic_var_lib(self):
         self.assertNotRegex(self.te, r'allow\s+\S+\s+var_lib_t')

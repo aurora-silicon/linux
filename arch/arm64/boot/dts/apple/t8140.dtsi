@@ -1766,6 +1766,7 @@
 			      <0x3 0x81100000 0x0 0x10000>;
 			reg-names = "code", "sram", "mbox", "ctrl";
 			iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+			dma-coherent;
 		};
 
 		avd_dart: iommu@381020000 {

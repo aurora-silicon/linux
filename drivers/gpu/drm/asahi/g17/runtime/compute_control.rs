@@ -30,7 +30,7 @@ impl Backend {
                 return Ok(Decision::Defer);
             }
             // Each queue is locked on its own: release this one before visiting the others.
-            let Some(own) = firmware.queues.compute(self.owner)
+            let Some(own) = firmware.queues.compute_for_packet(self.owner, packet)
                 .filter(|queue| queue.can_classify_timeout(packet))
                 .and_then(|queue| queue.timeout_head()) else {
                 return Ok(Decision::Own);
@@ -48,7 +48,7 @@ impl Backend {
             }
             let decision = verdict.decision;
             if decision == Decision::Spare {
-                firmware.queues.compute(self.owner).ok_or(EIO)?
+                firmware.queues.compute_for_packet(self.owner, packet).ok_or(EIO)?
                     .classify(&|_| Class::Spared);
             }
             if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
@@ -73,13 +73,17 @@ impl Backend {
         deferred: &mut DeferredBatch) -> Result<crate::g17::timeout::Decision> {
         use crate::g17::timeout::Decision;
         use core::sync::atomic::{AtomicU32, Ordering};
-        let expired = firmware.queues.compute_mut(self.owner)
+        let expired = firmware.queues.compute_for_packet_mut(self.owner, packet)
             .is_some_and(|mut queue| queue.expire_stamp_wait(packet));
         if !expired {
             return Ok(Decision::Own);
         }
         firmware.scan_compute(None, deferred)?;
-        if !firmware.queues.compute(self.owner).is_some_and(|queue| queue.retired_held(packet)) {
+        if !firmware
+            .queues
+            .compute_for_packet(self.owner, packet)
+            .is_some_and(|queue| queue.retired_held(packet))
+        {
             return Ok(Decision::Own);
         }
         static REPORTED: AtomicU32 = AtomicU32::new(0);
@@ -122,7 +126,7 @@ impl Backend {
                 return Ok(None);
             };
             firmware.scan_compute(None, &mut deferred)?;
-            let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
+            let Some(mut queue) = firmware.queues.compute_for_packet_mut(self.owner, packet) else {
                 return Ok(None);
             };
             // A command that retired in this pass has its result.
@@ -150,7 +154,7 @@ impl Backend {
                 return Ok(());
             };
             firmware.scan_compute(None, &mut deferred)?;
-            if let Some(mut queue) = firmware.queues.compute_mut(self.owner) {
+            if let Some(mut queue) = firmware.queues.compute_for_packet_mut(self.owner, packet) {
                 queue.cancel(packet, &mut |event| deferred.push(event))?;
             }
             Ok(())
