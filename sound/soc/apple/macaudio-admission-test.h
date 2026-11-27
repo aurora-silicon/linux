@@ -11,7 +11,7 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
-	/* The AOP-fed machines: J714, J716 (v2-only) and J813 admitted, J873 without protection */
+	/* The AOP-fed machines: J714, J716 (v2-only) and J813 admitted, J873 and J704 without one */
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j714_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j716_cfg));
 	KUNIT_EXPECT_EQ(test, macaudio_j716_cfg.safe_vol, 0);
@@ -19,6 +19,8 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
 	/* The Mac Studio M5: no sense and no protection owner yet, speaker off */
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
+	/* J704: speakers off until their slots and protection are verified */
+	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j704_cfg));
 	/* K114: the J714 amps and frame, but no safe level for the chassis */
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_k114_cfg));
 	cfg = macaudio_j413_cfg;

@@ -769,6 +769,9 @@ struct apple_atcphy;
  *                        sleep, or at runtime with @idle_power_off, which
  *                        resets the block; bring the tracked state back once
  *                        the domain is on again
+ * @sleep_drops_common: Deep sleep lowers the common power domain behind
+ *                      genpd's back, so resume must mark @pd_was_off even
+ *                      without a genpd power-off notification
  * @idle_power_off: Let an idle PHY runtime-suspend, so that its power domain
  *                  can also drop while the system runs, see atcphy_rpm_get().
  *                  Only for PHYs without DisplayPort, whose phy ops and tunnel
@@ -799,6 +802,7 @@ struct atcphy_hw {
 	bool clear_boot_hold;
 	bool pipe_lock_unacked;
 	bool restore_after_pd_off;
+	bool sleep_drops_common;
 	bool idle_power_off;
 };
 
@@ -6389,10 +6393,24 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 	 * its USB on the other wires: USB2 next to four DP lanes (pin
 	 * assignments C and E), USB3 next to two (D). Serve that USB rather
 	 * than refuse the mode, which would leave the port without USB at all.
+	 *
+	 * The same goes for USB4 and Thunderbolt on a port without the CIO
+	 * calibration, such as those of the Mac mini (J773g). Its port
+	 * controller enters USB4 or Thunderbolt 3 by itself with a USB4 dock
+	 * or another Mac, and USB 2.0 on D+/D- does not depend on that link.
+	 * Do this first, so that the DisplayPort fallback below starts from
+	 * the mode actually served rather than putting USB4 back.
 	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
-		enum atcphy_mode usb_mode = target_mode;
+		enum atcphy_mode usb_mode;
 
+		if (atcphy_mode_is_cio(target_mode) && !atcphy->cio_tunables) {
+			dev_info(atcphy->dev,
+				 "USB4/Thunderbolt is not available on this port: serving its USB2 only\n");
+			target_mode = APPLE_ATCPHY_MODE_USB2;
+		}
+
+		usb_mode = target_mode;
 		/* 4-lane DP stays DP only on a port wired for DP alt mode */
 		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy_t8132_dp_on(atcphy))
 			usb_mode = APPLE_ATCPHY_MODE_USB2;
@@ -8196,6 +8214,7 @@ static int atcphy_suspend_noirq(struct device *dev)
 static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
 	if ((!atcphy->hw->has_t8140_dp &&
+	     !atcphy->hw->sleep_drops_common &&
 	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy")) ||
 	    !atcphy->hw->restore_after_pd_off || !pm_resume_via_firmware())
 		return;
@@ -8725,6 +8744,9 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
 	.park_pipe_unlocked = true,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
+	.sleep_drops_common = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {

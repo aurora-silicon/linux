@@ -7628,14 +7628,6 @@ Kernel parameters
 			See Documentation/admin-guide/mm/transhuge.rst for more
 			details.
 
-	thunderbolt.dp_video_counter=
-			[HW,ARM64]
-			Format: <bool>
-			Enable diagnostic counter 0 on the DP video path's
-			host and downstream ingress hops on the right-hand
-			USB-C route of the Apple M2 Pro and M2 Max laptops. Read counters through Thunderbolt
-			debugfs. This is a load-time setting. Default: false.
-
 	thunderbolt_apple.dp_display=
 			[HW,ARM64]
 			Format: <bool>
