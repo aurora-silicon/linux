@@ -383,6 +383,9 @@ static void t6030_ovrd_report(struct apple_sleep *s, const char *when)
 }
 
 static void t6030_late_map(struct apple_sleep *s);
+static bool t6030_last_writes_on(void);
+static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *seq);
+static void t6030_last_pmu_boot(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -459,6 +462,8 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_ovrd_report(s, "probe");
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
+	if (t6030_last_writes_on())
+		t6030_last_pmu_boot(s);
 
 	return apple_sleep_read_wake_sources(s);
 }
@@ -655,7 +660,12 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
  */
 static bool t6030_last_writes;
 module_param_named(last_writes, t6030_last_writes, bool, 0444);
-MODULE_PARM_DESC(last_writes, "T6030 DIAGNOSTIC: macOS's last-second RTC alarm edge, DVFS[0] vote and no AFR write");
+MODULE_PARM_DESC(last_writes, "T6030 DIAGNOSTIC: macOS's last-second PMU, RTC alarm, DVFS[0] and AFR writes");
+
+static bool t6030_last_writes_on(void)
+{
+	return READ_ONCE(t6030_last_writes);
+}
 
 #define T6030_LAST_DVFS0		0x900
 #define T6030_LAST_DVFS0_VOTE		(BIT_ULL(61) | 1)
@@ -684,6 +694,78 @@ static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *se
 		 n, seq->n);
 	seq->op = op;
 	seq->n = n;
+}
+
+/*
+ * last_writes: after the PMU's sleep stage write (0xf801), macOS reads 0xf801, 0xf808 (4 bytes),
+ * 0xf802, 0xf818, 0xf819 (2), 0xf800 and 0xf81f, all 0 there: latched event status, perhaps
+ * cleared by the read. Its I2C6 word is one write of 0x3f0; the last wake-mask word has only
+ * its 25 low bits set (0x01bfffff at macOS's boot), and NUB_FABRIC (ps-aon +0xa0) is under
+ * AUTO_ENABLE at its final WFI.
+ */
+#define T6030_LAST_I2C6			0x3f0
+#define T6030_LAST_WAKE_LAST_BITS	GENMASK(24, 0)
+#define T6030_AON_NUB_FABRIC		0xa0
+
+static void t6030_last_pmu_reads(struct apple_sleep *s);
+
+/*
+ * last_writes, at the driver's probe: macOS reads the PMU's 0xf803 (0x30 at its boot, after the
+ * boot stage 0xf801 = 0x30), writes it 0 and clears 0xf808, 1.27 s before its PMP starts. Linux's
+ * loader sets the same stage and never clears them.
+ */
+static void t6030_last_pmu_boot(struct apple_sleep *s)
+{
+	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	u8 v = 0, zero[4] = {};
+
+	t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_READL, 0xf803, NULL, &v, 1);
+	t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_WRITEL, 0xf803, zero, NULL, 1);
+	t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_WRITEL, 0xf808, zero, NULL, 4);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
+	dev_info(s->dev, "last_writes: PMU 0xf803 was %#x, cleared with 0xf808\n", v);
+}
+
+/*
+ * last_writes, at the entry: the alarm disarmed (control 0x01, as macOS has it until the commit)
+ * before the PMU's sleep stage write, so that the rearm after the commit word arms it with an
+ * edge, after that write, as on macOS.
+ */
+static void t6030_last_alarm_disarm(struct apple_sleep *s)
+{
+	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	u8 v = 0x01;
+
+	t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+		       NULL, 1);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
+}
+
+/* last_writes, at the wake: macOS's stage 0xf801 = 0xfe, then the same status reads */
+static void t6030_last_pmu_wake(struct apple_sleep *s)
+{
+	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	u8 v = 0xfe;
+
+	t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_WRITEL, 0xf801, &v, NULL, 1);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
+	t6030_last_pmu_reads(s);
+}
+
+static void t6030_last_pmu_reads(struct apple_sleep *s)
+{
+	static const struct { u16 reg; u8 len; } reads[] = {
+		{ 0xf801, 1 }, { 0xf808, 4 }, { 0xf802, 1 }, { 0xf818, 1 }, { 0xf819, 2 },
+		{ 0xf800, 1 }, { 0xf81f, 1 },
+	};
+	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	u8 buf[4];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(reads); i++)
+		t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_READL, reads[i].reg,
+			       NULL, buf, reads[i].len);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
 }
 
 /*
@@ -776,11 +858,6 @@ static void t6030_sleep_post_timer(struct apple_sleep *s)
 		step = 1;
 		v = 0x43;
 		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
-	} else if (!ret && READ_ONCE(t6030_last_writes) && (ctl & T6050_RTC_CTL_ARMED)) {
-		/* As macOS finds it here: disarmed, so that the 0x41 below arms it with an edge */
-		step = 5;
-		v = ctl & ~T6050_RTC_CTL_ARMED;
-		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
 	}
 	if (!ret) {
 		step = 2;
@@ -844,6 +921,8 @@ static void t6030_wake_masks_set(struct apple_sleep *s)
 	for (i = 0; i < s->wake_enable_count; i++)
 		if (s->wake_enable[i] / 32 < T6030_WAKE_WORDS)
 			val[s->wake_enable[i] / 32] &= ~BIT(s->wake_enable[i] % 32);
+	if (READ_ONCE(t6030_last_writes))
+		val[T6030_WAKE_WORDS - 1] &= T6030_LAST_WAKE_LAST_BITS;
 	for (i = 0; i < T6030_WAKE_WORDS; i++)
 		writel(val[i], s->wake + T6030_WAKE_MASK + 4 * i);
 }
@@ -1525,10 +1604,19 @@ static void t6030_sleep_after_ans(struct apple_sleep *s)
 	if (sleep_seq_run_strict(t->blk, &t->prepare))
 		t6030_sleep_failed("apple,seq-prepare");
 	t6030_alarm_snapshot(s, readl(s->spmi + SPMI_NOTIFY_ENABLE));
+	if (READ_ONCE(t6030_last_writes) && t->alarm_valid)
+		t6030_last_alarm_disarm(s);
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
 	sleep_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
-	sleep_ps_lower(s, T6030_PS_I2C6);
+	if (READ_ONCE(t6030_last_writes)) {
+		t6030_last_pmu_reads(s);
+		/* macOS's one write, read back as off (0x200) */
+		writel(T6030_LAST_I2C6, s->ps + T6030_PS_I2C6);
+		readl(s->ps + T6030_PS_I2C6);
+	} else {
+		sleep_ps_lower(s, T6030_PS_I2C6);
+	}
 	t->notify_saved[0] = readl(s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_saved[1] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	t->notify_staged = true;
@@ -1841,6 +1929,10 @@ static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 		if (sleep_ps_raise_start(s, t6030_wfi_on[i]))
 			stuck++;
 	}
+	/* NUB_FABRIC: on, under AUTO_ENABLE (0x1f0003ff at macOS's final WFI; Linux 0x0f0000ff) */
+	v = readl(s->ps_aon + T6030_AON_NUB_FABRIC);
+	if (FIELD_GET(PS_ACTUAL, v) == 0xf && !(v & PS_AUTO_ENABLE))
+		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + T6030_AON_NUB_FABRIC);
 	sleep_note_at(s, 2, 0x80 | min(stuck, 0x7fU));
 }
 
@@ -2517,6 +2609,8 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 		t->gate_dispext1_staged = false;
 	}
 	t6030_sleep_wake_check_ps(s, "at the end");
+	if (READ_ONCE(t6030_last_writes))
+		t6030_last_pmu_wake(s);
 	sleep_note(s, 0x75);
 }
 
