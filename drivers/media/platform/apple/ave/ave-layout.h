@@ -135,6 +135,8 @@ struct ave_start_layout {
 	u32 const_214;
 	u32 const_218;
 	struct ave_rational_layout fps;
+	/* A second copy of the integer frame rate (26A428 Start). */
+	u32 fps_int_copy;
 	u32 rc_mode;
 	/* Optional ABI-specific wire value for the driver's fixed-QP mode. */
 	u32 rc_mode_fixed_qp;

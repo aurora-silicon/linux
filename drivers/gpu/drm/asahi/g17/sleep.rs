@@ -315,8 +315,10 @@ impl Shared {
     /// With the sleeping flag set, joins whatever may be reading firmware state. The growth work
     /// isn't joined: it may be waiting on the closed gate, and can't publish while it is closed.
     fn join_event_workers(self: &Arc<Self>) {
+        self.cancel_rescan();
         self.cancel_timer(&self.poll);
         self.cancel_timer(&self.idle);
+        self.cancel_timer(&self.housekeeping_timer);
         // SAFETY: An initialized, pinned work field of this Shared.
         unsafe { bindings::flush_work(Work::raw_get(&self.work)) };
     }

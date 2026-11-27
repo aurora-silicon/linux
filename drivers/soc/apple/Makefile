@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+obj-$(CONFIG_APPLE_MCC_BOOT_DMA) += mcc-boot-dma.o
+
 obj-$(CONFIG_APPLE_J613_DISPLAY_SYNC) += j613-display.o
 
 obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
 apple-dbgview-y = dbgview.o
+obj-$(CONFIG_APPLE_DBGVIEW_KUNIT_TEST) += dbgview-test.o
 
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
@@ -17,7 +20,8 @@ obj-$(CONFIG_APPLE_CLUSTER_PWRGATE) += apple-cluster-pwrgate.o
 
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
 obj-$(CONFIG_APPLE_SOC_SLEEP) += t6050-aop.o
-apple-sleep-y = sleep.o
+apple-sleep-y = sleep.o sleep-perf-step.o
+obj-$(CONFIG_APPLE_SOC_SLEEP) += t6041-sleep.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
 apple-rtkit-y = rtkit.o rtkit-crashlog.o
@@ -52,6 +56,7 @@ obj-$(CONFIG_APPLE_TUNABLE_KUNIT_TEST) += tunable-test.o
 obj-$(CONFIG_APPLE_AOP) += aop.o
 
 obj-$(CONFIG_APPLE_SEP_FV_INTERFACE) += fv_shim.o
+obj-$(CONFIG_APPLE_SEP_HDCP_INTERFACE) += hdcp_shim.o
 
 obj-$(CONFIG_APPLE_SEP) += apple-sep.o
 apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
@@ -70,5 +75,6 @@ obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
+obj-$(CONFIG_APPLE_REGVIEW_KUNIT_TEST) += regview-test.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o

@@ -270,7 +270,6 @@
 	};
 
 	actuator {
-		apple,click-strength = <0xc0 0x6e>;
 	};
 
 	tp_accel {
@@ -313,16 +312,6 @@
 
 &pmp_report_isp_sys {
 	status = "okay";
-};
-
-&nub_spmi1 {
-	status = "okay";
-
-	pmic@e {
-		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
-		reg = <0xe SPMI_USID>;
-		read-only;
-	};
 };
 
 &i2c2 {
