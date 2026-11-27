@@ -20,7 +20,9 @@
 
 #include <kunit/device.h>
 #include <kunit/test.h>
+#include <linux/delay.h>
 #include <linux/irqflags.h>
+#include <linux/kernfs.h>
 
 #define CFT_REGS_SIZE	0x100
 #define CFT_NR_STATES	5
@@ -1710,6 +1712,7 @@ static void cft_live_reset_t6050(struct cpufreq_policy *policy)
 	policy->min = cft_live_table[0].frequency;
 	policy->max = cft_live_table[CFT_NR_STATES - 1].frequency;
 	policy->cur = cft_live_table[0].frequency;
+	cpufreq_stats_record_transition(policy, policy->cur);
 	policy->fast_switch_enabled = true;
 }
 
@@ -2072,12 +2075,306 @@ static void cft_test_fast_switch_reconcile_race(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 4ULL);
 }
 
+static void cft_read_stats_attr(struct kunit *test, struct cpufreq_policy *policy,
+				const char *name, char *buf)
+{
+	struct kernfs_node *stats_kn, *attr_kn;
+	ssize_t len;
+
+	stats_kn = kernfs_find_and_get(policy->kobj.sd, "stats");
+	KUNIT_ASSERT_NOT_NULL(test, stats_kn);
+	attr_kn = kernfs_find_and_get(stats_kn, name);
+	kernfs_put(stats_kn);
+	KUNIT_ASSERT_NOT_NULL(test, attr_kn);
+	KUNIT_ASSERT_NOT_NULL(test, policy->kobj.ktype);
+	KUNIT_ASSERT_NOT_NULL(test, policy->kobj.ktype->sysfs_ops);
+	KUNIT_ASSERT_NOT_NULL(test, policy->kobj.ktype->sysfs_ops->show);
+
+	len = policy->kobj.ktype->sysfs_ops->show(&policy->kobj, attr_kn->priv, buf);
+	kernfs_put(attr_kn);
+	KUNIT_ASSERT_GT(test, len, 0);
+}
+
+static unsigned int cft_stats_total_trans(struct kunit *test,
+					  struct cpufreq_policy *policy)
+{
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	unsigned int total;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	cft_read_stats_attr(test, policy, "total_trans", buf);
+	ret = kstrtouint(strim(buf), 10, &total);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	return total;
+}
+
+static unsigned int cft_stats_trans_count(struct kunit *test,
+					  struct cpufreq_policy *policy,
+					  unsigned int from_freq,
+					  unsigned int to_freq)
+{
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	char *p, *line;
+	int to_col = -1;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	cft_read_stats_attr(test, policy, "trans_table", buf);
+
+	p = buf;
+	while ((line = strsep(&p, "\n")) != NULL) {
+		char *colon = strchr(line, ':');
+		char *s;
+		unsigned int row_freq;
+		int col = 0;
+
+		if (!colon)
+			continue;
+		*colon = '\0';
+		s = skip_spaces(line);
+		if (!*s) {
+			s = colon + 1;
+			while (*(s = skip_spaces(s))) {
+				char *tok = strsep(&s, " ");
+				unsigned int col_freq;
+				int ret;
+
+				ret = kstrtouint(tok, 10, &col_freq);
+				KUNIT_ASSERT_EQ(test, ret, 0);
+				if (col_freq == to_freq)
+					to_col = col;
+				col++;
+				if (!s)
+					break;
+			}
+			continue;
+		}
+
+		if (kstrtouint(strim(s), 10, &row_freq) || row_freq != from_freq)
+			continue;
+
+		KUNIT_ASSERT_GE(test, to_col, 0);
+		s = colon + 1;
+		while (*(s = skip_spaces(s))) {
+			char *tok = strsep(&s, " ");
+			unsigned int count;
+			int ret;
+
+			ret = kstrtouint(tok, 10, &count);
+			KUNIT_ASSERT_EQ(test, ret, 0);
+			if (col == to_col)
+				return count;
+			col++;
+			if (!s)
+				break;
+		}
+		KUNIT_FAIL(test, "missing column %d for %u->%u", to_col,
+			   from_freq, to_freq);
+		return 0;
+	}
+
+	KUNIT_FAIL(test, "missing row %u in trans_table", from_freq);
+	return 0;
+}
+
+static u64 cft_stats_time_in_state(struct kunit *test,
+				   struct cpufreq_policy *policy,
+				   unsigned int freq)
+{
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	char *p, *line;
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	cft_read_stats_attr(test, policy, "time_in_state", buf);
+
+	p = buf;
+	while ((line = strsep(&p, "\n")) != NULL) {
+		unsigned int row_freq;
+		u64 ticks;
+
+		if (!*line)
+			continue;
+		if (sscanf(line, "%u %llu", &row_freq, &ticks) == 2 &&
+		    row_freq == freq)
+			return ticks;
+	}
+
+	KUNIT_FAIL(test, "missing %u in time_in_state", freq);
+	return 0;
+}
+
+/*
+ * Standalone QoS clamps, pending-request replays, and lazy_cap() updates must
+ * record cpufreq_stats transitions and residency immediately, and an older
+ * fast_switch() completing after a concurrent clamp must not overwrite stats.
+ */
+static void cft_test_stats_clamp_and_race(struct kunit *test)
+{
+	struct cpufreq_policy *policy;
+	struct apple_cpu_priv *priv = cft_live_priv;
+	struct freq_qos_request *user_req, *min_req;
+	unsigned int total, c_600_3000, c_3000_1200, c_3000_600, c_1200_3000;
+	unsigned long flags;
+	unsigned int freq;
+	u64 t3000_before, t3000_after, t1200_before, t1200_after;
+	int moved;
+
+	if (!IS_ENABLED(CONFIG_CPU_FREQ_STAT))
+		kunit_skip(test, "CONFIG_CPU_FREQ_STAT is disabled");
+
+	policy = cft_live_policy_setup(test);
+	cft_live_add_qos(test, policy, &user_req, FREQ_QOS_MAX, 3000000);
+	cft_live_add_qos(test, policy, &min_req, FREQ_QOS_MIN, 600000);
+	flush_work(&policy->update);
+	cft_live_reset_t6050(policy);
+
+	/* Standalone QoS ceiling drop (3 GHz -> 1.2 GHz) updates stats and residency. */
+	total = cft_stats_total_trans(test, policy);
+	c_600_3000 = cft_stats_trans_count(test, policy, 600000, 3000000);
+	c_3000_1200 = cft_stats_trans_count(test, policy, 3000000, 1200000);
+
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 600000, 3000000),
+			c_600_3000 + 1);
+	cft_set_cmd(cft_live_regs, 15);
+
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 1200000), 0);
+	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 2);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 1200000),
+			c_3000_1200 + 1);
+
+	t3000_before = cft_stats_time_in_state(test, policy, 3000000);
+	t1200_before = cft_stats_time_in_state(test, policy, 1200000);
+	msleep(25);
+	t3000_after = cft_stats_time_in_state(test, policy, 3000000);
+	t1200_after = cft_stats_time_in_state(test, policy, 1200000);
+	KUNIT_EXPECT_EQ(test, t3000_after, t3000_before);
+	KUNIT_EXPECT_GT(test, t1200_after, t1200_before);
+
+	/* Pending-request replay clamped to 600 MHz records 3 GHz -> 600 MHz. */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	cft_set_cmd(cft_live_regs, 4 | APPLE_DVFS_CMD_BUSY);
+	priv->expected_pstate = 4;
+	total = cft_stats_total_trans(test, policy);
+	c_3000_600 = cft_stats_trans_count(test, policy, 3000000, 600000);
+
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 1);
+
+	scoped_guard(cpufreq_policy_write, policy) {
+		KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 0), 0);
+		cft_set_cmd(cft_live_regs, 4);
+		local_irq_save(flags);
+		KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_verify(&priv->verify_timer),
+				HRTIMER_NORESTART);
+		hrtimer_cancel(&priv->verify_timer);
+		local_irq_restore(flags);
+		KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
+	}
+	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 2);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 600000),
+			c_3000_600 + 1);
+
+	/* Standalone lazy_cap() clamp (3 GHz -> 1.2 GHz) records transition. */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	cft_set_cmd(cft_live_regs, 15);
+	total = cft_stats_total_trans(test, policy);
+	c_3000_1200 = cft_stats_trans_count(test, policy, 3000000, 1200000);
+
+	local_irq_save(flags);
+	moved = apple_soc_cpufreq_lazy_cap(priv, 4, 1200000);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_EQ(test, moved, 4);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 1200000),
+			c_3000_1200 + 1);
+	priv->cap_pstate = soc_t6050_info.max_pstate;
+
+	/*
+	 * Concurrent policy->update or lazy_cap() clamp after priv->lock unlock
+	 * must not have its stats overwritten by the older fast_switch().
+	 */
+	freq = cpufreq_driver_fast_switch(policy, 600000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 600000U);
+	cft_set_cmd(cft_live_regs, 1);
+
+	total = cft_stats_total_trans(test, policy);
+	c_600_3000 = cft_stats_trans_count(test, policy, 600000, 3000000);
+	c_3000_1200 = cft_stats_trans_count(test, policy, 3000000, 1200000);
+	c_1200_3000 = cft_stats_trans_count(test, policy, 1200000, 3000000);
+
+	cft_race_ctx.test = test;
+	cft_race_ctx.user_req = user_req;
+	cft_live_after_fast_switch = cft_race_verify_after_unlock;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 2);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 600000, 3000000),
+			c_600_3000 + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 1200000),
+			c_3000_1200 + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 1200000, 3000000),
+			c_1200_3000);
+
+	t3000_before = cft_stats_time_in_state(test, policy, 3000000);
+	t1200_before = cft_stats_time_in_state(test, policy, 1200000);
+	msleep(25);
+	KUNIT_EXPECT_EQ(test, cft_stats_time_in_state(test, policy, 3000000),
+			t3000_before);
+	KUNIT_EXPECT_GT(test, cft_stats_time_in_state(test, policy, 1200000),
+			t1200_before);
+
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	freq = cpufreq_driver_fast_switch(policy, 600000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 600000U);
+	cft_set_cmd(cft_live_regs, 1);
+
+	total = cft_stats_total_trans(test, policy);
+	c_600_3000 = cft_stats_trans_count(test, policy, 600000, 3000000);
+	c_3000_1200 = cft_stats_trans_count(test, policy, 3000000, 1200000);
+	c_1200_3000 = cft_stats_trans_count(test, policy, 1200000, 3000000);
+
+	cft_live_after_fast_switch = cft_race_cap_after_unlock;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 2);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 600000, 3000000),
+			c_600_3000 + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 1200000),
+			c_3000_1200 + 1);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 1200000, 3000000),
+			c_1200_3000);
+}
+
 static struct kunit_case apple_soc_cpufreq_policy_test_cases[] = {
 	KUNIT_CASE_PARAM(cft_test_get, cft_get_gen_params),
 	KUNIT_CASE(cft_test_thermal_owner),
 	KUNIT_CASE(cft_test_verify_policy_ceiling_drop),
 	KUNIT_CASE(cft_test_verify_policy_cap_lift),
 	KUNIT_CASE(cft_test_fast_switch_reconcile_race),
+	KUNIT_CASE(cft_test_stats_clamp_and_race),
 	{}
 };
 

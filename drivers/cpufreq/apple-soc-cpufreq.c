@@ -640,6 +640,13 @@ static unsigned int apple_soc_cpufreq_pstate_freq(struct cpufreq_policy *policy,
 	return 0;
 }
 
+static void apple_soc_cpufreq_record_cur(struct cpufreq_policy *policy,
+					 unsigned int cur)
+{
+	WRITE_ONCE(policy->cur, cur);
+	cpufreq_stats_record_transition(policy, cur);
+}
+
 /* Called with priv->lock held. */
 static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
 					  unsigned int pstate)
@@ -654,7 +661,7 @@ static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
 	if (!cur && pstate == priv->cap_pstate)
 		cur = priv->cap_freq;
 	if (cur)
-		WRITE_ONCE(policy->cur, cur);
+		apple_soc_cpufreq_record_cur(policy, cur);
 }
 
 /*
@@ -873,7 +880,7 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 	}
 	ret = apple_soc_cpufreq_lazy_set(priv, pstate);
 	if (!ret)
-		WRITE_ONCE(policy->cur, freq);
+		apple_soc_cpufreq_record_cur(policy, freq);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return ret ? 0 : freq;
 }
@@ -881,7 +888,7 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 /*
  * Reconciles a lazy_verify cluster's accepted or pending P-state toward
  * @target, clamped to current policy bounds and thermal cap, and updates
- * policy->cur when hardware moves. Called with priv->lock held.
+ * policy->cur and cpufreq_stats when hardware moves. Called with priv->lock held.
  *
  * Returns the P-state the cluster was moved to, or -1.
  */
@@ -1078,7 +1085,7 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 		if (ret)
 			return ret;
 		if (freq)
-			policy->cur = freq;
+			apple_soc_cpufreq_record_cur(policy, freq);
 		return 0;
 	}
 
@@ -1135,7 +1142,7 @@ static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
 		return 0;
 
 	freq = policy->freq_table[idx].frequency;
-	WRITE_ONCE(policy->cur, freq);
+	apple_soc_cpufreq_record_cur(policy, freq);
 	return freq;
 }
 
