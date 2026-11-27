@@ -678,6 +678,8 @@ pub(crate) struct Engine {
     pub(crate) prof: KBox<Prof>,
     /// The `aurora-g16/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
+    /// LAB ONLY: the `aurora-g16/lab` file.
+    pub(crate) lab_file: Option<Pin<KBox<kernel::debugfs::File<()>>>>,
     scratch: Option<KBox<Scratch>>,
 }
 
@@ -724,6 +726,7 @@ impl Engine {
             stats: KBox::zeroed(GFP_KERNEL)?,
             prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
+            lab_file: None,
             // Allocate host encoder buffers before any submitted fence can depend on
             // the device mutex. Publication must never enter direct reclaim here.
             scratch: Some(Scratch::new_boxed()?),

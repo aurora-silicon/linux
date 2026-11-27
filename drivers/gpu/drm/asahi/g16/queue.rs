@@ -332,7 +332,32 @@ impl Queue {
             super::fence::FenceOrigin::new(gpu_id, self.vm.id, self.state.clone(), last_ordinal),
             GFP_KERNEL,
         )?;
-        let (inputs, fw_waits) = match super::fence::resolve_fw_waits(&inputs, gpu_id, self.vm.id) {
+        let resolved = super::fence::resolve_fw_waits(&inputs, gpu_id, self.vm.id);
+        // LAB ONLY (linux#3349): optionally send resolvable cross-queue waits to the host.
+        let resolved = match resolved {
+            Some(waits) if !waits.is_empty() => {
+                let host = match super::lab::knob(super::lab::FW_WAITS) {
+                    0 => false,
+                    1 => true,
+                    _ => waits
+                        .iter()
+                        .any(|w| w.last_ordinal[super::command::COMPUTE].is_some()),
+                };
+                let counter = if host {
+                    &super::lab::HOST_FORCED
+                } else {
+                    &super::lab::FW_RESOLVED
+                };
+                counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if host {
+                    None
+                } else {
+                    Some(waits)
+                }
+            }
+            other => other,
+        };
+        let (inputs, fw_waits) = match resolved {
             Some(waits) => (InputFences::new(), waits),
             None => (inputs, super::fence::FwWaits::Empty),
         };

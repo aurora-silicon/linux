@@ -605,10 +605,20 @@ impl Shared {
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
         )?;
+        let lab = KBox::pin_init(
+            dir.read_write_callback_file(
+                c_str!("lab"),
+                (),
+                &super::lab::show_knobs,
+                &super::lab::write_knobs,
+            ),
+            GFP_KERNEL,
+        )?;
         let mut state = self.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         firmware.engine.shared = Some(self.clone());
         firmware.engine.debugfs = Some(file);
+        firmware.engine.lab_file = Some(lab);
         Ok(())
     }
 }
