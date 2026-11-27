@@ -3,6 +3,7 @@
 #include <linux/bitfield.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
+#include <linux/hex.h>
 #include <linux/debugfs.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
@@ -12,12 +13,14 @@
 #include <linux/of_net.h>
 #include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
 #include <net/regulatory.h>
 #include <net/sock.h>
 #include "centauri.h"
+#include "centauri_awdl.h"
 
 #define CR_BASE 0x100000
 #define TR_BASE 0x400000
@@ -36,7 +39,11 @@
 
 /* The firmware owns window +8 MiB through +13 MiB as scratch memory. */
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
-static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
+static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= CEN_AWDL_TX_BUF_BASE);
+static_assert(CEN_AWDL_TX_BUF_BASE +
+	      CEN_AWDL_TOTAL_TX_RINGS * CEN_AWDL_TX_RING_BUF_SPAN <=
+	      DATA_RX_BUFFER);
+static_assert(CEN_AWDL_TR_BASE + CEN_AWDL_TOTAL_TX_RINGS * CEN_AWDL_TR_STRIDE <= TX_BUFFER);
 
 static bool auto_rings = true;
 module_param(auto_rings, bool, 0644);
@@ -218,12 +225,15 @@ struct centauri_wifi {
 	struct dentry *tx_power_report_file;
 	u16 stats_reply_size, stats_tag, stats_length;
 	u32 data_probe_done;
+	u32 data_rx_awdl_ring;	/* completions taken from ring 18 */
+	u32 data_awdl_txc, data_awdl_cr79;	/* entries taken from 78 / 79 */
 	struct ieee80211_supported_band bands[3];
 	struct ieee80211_channel channels[CEN_CHANNELS];
 	struct ieee80211_sband_iftype_data iftype_data[3];
 	u8 hw_channels[REPLY_SIZE], system_caps[REPLY_SIZE];
 	u8 stats_reply[REPLY_SIZE];
 	struct debugfs_blob_wrapper hw_channels_blob, system_caps_blob;
+	struct centauri_awdl *awdl;
 };
 
 /* These helpers require wifi->lock, including from the connect worker. */
@@ -299,29 +309,30 @@ static void completions(struct centauri_wifi *wifi)
 
 static int alpha_message(struct centauri_wifi *wifi, const void *message, size_t size)
 {
-	u16 head = wifi->main_head;
+	u16 head = wifi->main_head % 16;
+	u16 next = (head + 1) % 16;
 	u8 *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
 
 	if (READ_ONCE(wifi->transport_paused))
 		return -EBUSY;
-	if (head >= 15 || size > 512)
+	if (size > 512)
 		return -ENOSPC;
 	memcpy(wifi->a.messages + (head + 1) * 512, message, size);
 	descriptor = wifi->a.context + wifi->a.mtr + 16 * head;
 	put_unaligned_le32(1 | (size << 8), descriptor);
 	put_unaligned_le64(wifi->a.messages_dma + (head + 1) * 512, descriptor + 4);
 	put_unaligned_le32(head + 1, descriptor + 12);
-	index_write(wifi, 3, 0, head + 1);
-	if (head)
-		index_write(wifi, 3, 8, head + 1);
+	index_write(wifi, 3, 0, next);
+	if (wifi->main_head)
+		index_write(wifi, 3, 8, next);
 	dma_wmb();
 	wifi->main_head++;
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		if (readl(wifi->a.bar + 8) != 2)
 			return -EIO;
-		if (index_read(wifi, 1, 0) >= head + 1) {
+		if (index_read(wifi, 1, 0) == next) {
 			dma_rmb();
 			completions(wifi);
 			return 0;
@@ -367,8 +378,12 @@ static void report_beacon(struct centauri_wifi *wifi, const u8 *payload, size_t 
 		return;
 	frame_size = size - 0x60;
 	frame = payload + 0x60;
-	if (!ieee80211_is_beacon(*(__le16 *)frame) && !ieee80211_is_probe_resp(*(__le16 *)frame))
+	if (!ieee80211_is_beacon(*(__le16 *)frame) && !ieee80211_is_probe_resp(*(__le16 *)frame)) {
+		if (ieee80211_is_action(*(__le16 *)frame) &&
+		    centauri_awdl_is_active(wifi->awdl))
+			centauri_awdl_rx_mgmt(wifi->awdl, payload, size);
 		return;
+	}
 	end = frame + frame_size;
 	for (ie = frame + 36; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
 		if ((ie[0] == WLAN_EID_DS_PARAMS || ie[0] == WLAN_EID_HT_OPERATION) && ie[1]) {
@@ -453,29 +468,29 @@ static int rx_poll(struct napi_struct *napi, int budget)
 	return done;
 }
 
-/* Called with wifi->lock, including during connect/command polling. */
-static void drain_data_rx(struct centauri_wifi *wifi)
+/*
+ * Take the completions of one receive ring (15 or 18 on buffer ring 12, 12 on
+ * buffer ring 13) and give their buffers back on the pool from *postp. Called
+ * with wifi->lock.
+ */
+static bool drain_rx_ring(struct centauri_wifi *wifi, u16 vec, u32 off,
+			  u16 pool, u32 desc_off, u32 buf_base,
+			  u16 *postp, unsigned int *processedp, bool *repostedp,
+			  struct sk_buff_head *frames)
 {
-	u16 head, tail, post;
-	unsigned int processed = 0;
-	bool consumed = false, reposted = false;
-	struct sk_buff_head frames;
+	u16 head, tail, post = *postp;
+	unsigned int processed = *processedp;
+	bool consumed = false, reposted = *repostedp;
 
-	__skb_queue_head_init(&frames);
-
-	if (READ_ONCE(wifi->transport_paused) ||
-	    !(wifi->data_probe_done & BIT(4)) || readl(wifi->a.bar + 8) != 2)
-		return;
-	head = index_read(wifi, 0, 207);
-	tail = index_read(wifi, 2, 207);
-	post = index_read(wifi, 3, 12);
-	if (head >= 128 || tail >= 128 || post >= 128) {
+	head = index_read(wifi, 0, vec);
+	tail = index_read(wifi, 2, vec);
+	if (head >= 128 || tail >= 128) {
 		wifi->data_rx_bad++;
-		return;
+		return false;
 	}
 	dma_rmb();
 	while (tail != head && processed < 127) {
-		u8 *completion = wifi->a.window + 0x240000 + tail * 32;
+		u8 *completion = wifi->a.window + off + tail * 32;
 		u32 header = get_unaligned_le32(completion);
 		u32 info = get_unaligned_le32(completion + 4);
 		u32 status = get_unaligned_le32(completion + 8);
@@ -486,10 +501,10 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 		u8 *packet, *descriptor;
 		u32 buffer;
 
-		if ((header >> 16) != 12 || !valid_cookie || length > 4096 ||
+		if ((header >> 16) != pool || !valid_cookie || length > 4096 ||
 		    status) {
-			if ((header >> 16) == 12 && valid_cookie &&
-			    next == index_read(wifi, 1, 12))
+			if ((header >> 16) == pool && valid_cookie &&
+			    next == index_read(wifi, 1, pool))
 				break;
 			wifi->data_rx_bad++;
 			wifi->netdev->stats.rx_errors++;
@@ -497,9 +512,9 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 					     "Wi-Fi data RX bad completion: ring=%u cookie=%u len=%u status=%#x\n",
 					     header >> 16, cookie, length,
 					     status);
-			if ((header >> 16) == 12 && valid_cookie) {
-				buffer = DATA_RX_BUFFER + (cookie - 1) * 4096;
-				descriptor = wifi->a.window + 0x520000 +
+			if ((header >> 16) == pool && valid_cookie) {
+				buffer = buf_base + (cookie - 1) * 4096;
+				descriptor = wifi->a.window + desc_off +
 					     post * 16;
 				put_unaligned_le32(1 | (4096 << 8), descriptor);
 				put_unaligned_le64(wifi->a.window_dma + buffer,
@@ -515,9 +530,9 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 			continue;
 		}
 		/* Do not overwrite a descriptor the receive engine still owns. */
-		if (next == index_read(wifi, 1, 12))
+		if (next == index_read(wifi, 1, pool))
 			break;
-		buffer = DATA_RX_BUFFER + (cookie - 1) * 4096;
+		buffer = buf_base + (cookie - 1) * 4096;
 		packet = wifi->a.window + buffer;
 		if (count < ARRAY_SIZE(wifi->rx_snapshot.sample)) {
 			memcpy(wifi->rx_snapshot.sample[count].completion, completion, 32);
@@ -526,29 +541,42 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 			wifi->rx_snapshot.count = cpu_to_le32(count + 1);
 		}
 		wifi->data_rx_received++;
-		if (wifi->connected && netif_running(wifi->netdev)) {
+		{
 			u32 footer = get_unaligned_le32(completion + 12);
+			u8 if_id = cen_rx_footer_if_id(footer);
 			unsigned int offset, frame_length;
-			struct sk_buff *skb = NULL;
 
-			if (data_rx_frame(packet, 4096, length, footer, &offset,
-					  &frame_length))
-				skb = netdev_alloc_skb_ip_align(wifi->netdev,
-								frame_length);
-			if (skb) {
-				skb_put_data(skb, packet + offset, frame_length);
-				skb->protocol = eth_type_trans(skb, wifi->netdev);
-				skb->ip_summed = CHECKSUM_NONE;
-				wifi->netdev->stats.rx_packets++;
-				wifi->netdev->stats.rx_bytes += frame_length;
-				__skb_queue_tail(&frames, skb);
+			if (!data_rx_frame(packet, 4096, length, footer,
+					   &offset, &frame_length)) {
+				if (if_id == CEN_IF_AWDL)
+					centauri_awdl_rx_frame(wifi->awdl, NULL, 0);
+				else
+					wifi->netdev->stats.rx_dropped++;
+			} else if (if_id == CEN_IF_AWDL) {
+				centauri_awdl_rx_frame(wifi->awdl,
+						       packet + offset,
+						       frame_length);
+			} else if (wifi->connected && netif_running(wifi->netdev)) {
+				struct sk_buff *skb =
+					netdev_alloc_skb_ip_align(wifi->netdev,
+								  frame_length);
+
+				if (skb) {
+					skb_put_data(skb, packet + offset,
+						     frame_length);
+					skb->protocol = eth_type_trans(skb, wifi->netdev);
+					skb->ip_summed = CHECKSUM_NONE;
+					wifi->netdev->stats.rx_packets++;
+					wifi->netdev->stats.rx_bytes += frame_length;
+					__skb_queue_tail(frames, skb);
+				} else {
+					wifi->netdev->stats.rx_dropped++;
+				}
 			} else {
 				wifi->netdev->stats.rx_dropped++;
 			}
-		} else {
-			wifi->netdev->stats.rx_dropped++;
 		}
-		descriptor = wifi->a.window + 0x520000 + post * 16;
+		descriptor = wifi->a.window + desc_off + post * 16;
 		put_unaligned_le32(1 | (4096 << 8), descriptor);
 		put_unaligned_le64(wifi->a.window_dma + buffer, descriptor + 4);
 		put_unaligned_le32(cookie, descriptor + 12);
@@ -559,10 +587,94 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 		reposted = true;
 		processed++;
 	}
-	if (consumed || reposted) {
+	*postp = post;
+	*processedp = processed;
+	*repostedp = reposted;
+	if (consumed) {
 		dma_wmb();
-		if (consumed)
-			index_write(wifi, 2, 207, tail);
+		index_write(wifi, 2, vec, tail);
+	}
+	return consumed;
+}
+
+/*
+ * Rings 78 (interface 1 TX completions, same entry layout as ring 76) and
+ * 79 (type 7, layout unknown: its entries are counted and released). Called
+ * with wifi->lock.
+ */
+static void drain_awdl_crs(struct centauri_wifi *wifi)
+{
+	unsigned int r;
+
+	if (READ_ONCE(wifi->transport_paused) || readl(wifi->a.bar + 8) != 2)
+		return;
+	for (r = 0; r < 2; r++) {
+		u16 vec = r ? 195 : 194, head, tail;
+		u32 off = r ? 0x2a0000 : 0x280000;
+		bool done = false;
+
+		if (!(wifi->data_probe_done & BIT(7 + r)))
+			continue;
+		head = index_read(wifi, 0, vec);
+		tail = index_read(wifi, 2, vec);
+		if (head >= 1024 || tail >= 1024) {
+			wifi->data_tx_bad++;
+			continue;
+		}
+		dma_rmb();
+		while (tail != head) {
+			u8 *entry = wifi->a.window + off + tail * 32;
+
+			if (r) {
+				wifi->data_awdl_cr79++;
+			} else {
+				wifi->data_awdl_txc++;
+				centauri_awdl_tx_complete(wifi->awdl,
+							  get_unaligned_le32(entry) >> 16,
+							  get_unaligned_le16(entry + 4),
+							  get_unaligned_le16(entry + 9),
+							  entry[1], entry[12]);
+			}
+			tail = (tail + 1) % 1024;
+			done = true;
+		}
+		if (done) {
+			dma_wmb();
+			index_write(wifi, 2, vec, tail);
+		}
+	}
+}
+
+/* Called with wifi->lock, including during connect/command polling. */
+static void drain_data_rx(struct centauri_wifi *wifi)
+{
+	u16 post;
+	unsigned int processed = 0;
+	bool any_consumed = false, reposted = false;
+	struct sk_buff_head frames;
+
+	__skb_queue_head_init(&frames);
+
+	if (READ_ONCE(wifi->transport_paused) ||
+	    !(wifi->data_probe_done & BIT(4)) || readl(wifi->a.bar + 8) != 2)
+		return;
+	post = index_read(wifi, 3, 12);
+	if (post >= 128) {
+		wifi->data_rx_bad++;
+		return;
+	}
+	/* Ring 15 completes interface 0, ring 18 (when open) interface 1. */
+	if (drain_rx_ring(wifi, 207, 0x240000, 12, 0x520000, DATA_RX_BUFFER,
+			  &post, &processed, &reposted, &frames))
+		any_consumed = true;
+	if ((wifi->data_probe_done & BIT(6)) &&
+	    drain_rx_ring(wifi, 210, 0x260000, 12, 0x520000, DATA_RX_BUFFER,
+			  &post, &processed, &reposted, &frames)) {
+		any_consumed = true;
+		wifi->data_rx_awdl_ring++;
+	}
+	if (any_consumed || reposted) {
+		dma_wmb();
 		if (reposted)
 			index_write(wifi, 3, 12, post);
 		dma_wmb();
@@ -578,17 +690,25 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 	}
 }
 
-static bool data_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
-				    unsigned int *first, u16 *count)
+bool centauri_wifi_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
+				      u16 ring_slots, unsigned int *first,
+				      u16 *count)
 {
 	bool counted = (flags & BIT(0)) || (flags & 0x0e) == 8;
 
-	if (!cookie || cookie > DATA_TX_SLOTS || counted != !!wire_count ||
-	    wire_count >= DATA_TX_SLOTS)
+	if (!cookie || cookie > ring_slots || counted != !!wire_count ||
+	    wire_count >= ring_slots)
 		return false;
 	*count = counted ? wire_count : 1;
-	*first = (cookie + DATA_TX_SLOTS - *count) % DATA_TX_SLOTS;
+	*first = (cookie + ring_slots - *count) % ring_slots;
 	return true;
+}
+
+static bool data_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
+				    unsigned int *first, u16 *count)
+{
+	return centauri_wifi_tx_completion_span(cookie, wire_count, flags,
+						DATA_TX_SLOTS, first, count);
 }
 
 /* Serialized with the firmware poller. Payload slots remain owned until a
@@ -596,17 +716,21 @@ static bool data_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
  */
 static void drain_data_tx(struct centauri_wifi *wifi)
 {
-	u16 head, tail, post;
+	u16 head, tail, post = 0;
 	unsigned int budget = 256;
 	bool posted = false, completed = false;
+	bool sta_ring = !!(wifi->data_probe_done & BIT(5));
+	bool awdl_active = centauri_awdl_is_active(wifi->awdl);
 
 	if (READ_ONCE(wifi->transport_paused) ||
-	    !(wifi->data_probe_done & BIT(5)) || readl(wifi->a.bar + 8) != 2)
+	    !(wifi->data_probe_done & BIT(0)) ||
+	    (!sta_ring && !awdl_active) || readl(wifi->a.bar + 8) != 2)
 		return;
 	head = index_read(wifi, 0, 192);
 	tail = index_read(wifi, 2, 192);
-	post = index_read(wifi, 3, 25);
-	if (head >= 2048 || tail >= 2048 || post >= DATA_TX_SLOTS) {
+	if (sta_ring)
+		post = index_read(wifi, 3, 25);
+	if (head >= 2048 || tail >= 2048 || (sta_ring && post >= DATA_TX_SLOTS)) {
 		wifi->data_tx_bad++;
 		return;
 	}
@@ -618,7 +742,7 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		u16 count = get_unaligned_le16(entry + 9);
 		u8 status = entry[12];
 
-		if (ring == 25) {
+		if (ring == 25 && sta_ring) {
 			unsigned int first, i;
 
 			if (!data_tx_completion_span(cookie, count, entry[1],
@@ -671,13 +795,16 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 				}
 				wifi->data_tx_busy[slot] = false;
 			}
+		} else {
+			centauri_awdl_tx_complete(wifi->awdl, ring, cookie,
+						  count, entry[1], status);
 		}
 		tail = (tail + 1) % 2048;
 		completed = true;
 	}
 	if (completed)
 		index_write(wifi, 2, 192, tail);
-	budget = DATA_TX_SLOTS - 1;
+	budget = sta_ring ? DATA_TX_SLOTS - 1 : 0;
 	while (wifi->connected && !READ_ONCE(wifi->stopping) &&
 	       !READ_ONCE(wifi->transport_paused) &&
 	       netif_running(wifi->netdev) && budget--) {
@@ -754,6 +881,8 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 	    !READ_ONCE(wifi->transport_paused) && netif_running(wifi->netdev) &&
 	    skb_queue_len(&wifi->data_tx_queue) < DATA_TX_QUEUE_LIMIT)
 		netif_wake_queue(wifi->netdev);
+	if (awdl_active)
+		centauri_awdl_drain_tx(wifi->awdl);
 }
 
 /* Record a reply to the statistics command 0xb0001. */
@@ -1430,8 +1559,21 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 			if (size < 24 || size > BUFFER_SIZE)
 				goto refill;
 			if (ring == 4) {
-				report_beacon(wifi, packet + 24, size - 24);
+				if (packet[0x0d] == CEN_IF_AWDL)
+					centauri_awdl_rx_mgmt(wifi->awdl,
+							      packet + 24,
+							      size - 24);
+				else
+					report_beacon(wifi, packet + 24,
+						      size - 24);
 			} else if (command & BIT(31)) {
+				if (packet[0x0d] == CEN_IF_AWDL) {
+					centauri_awdl_handle_event(wifi->awdl,
+								   command,
+								   status,
+								   packet, size);
+					goto refill;
+				}
 				if (command == 0x80000030)
 					wifi->channels_seen++;
 				if (command == 0x80000005)
@@ -1525,6 +1667,7 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 	if (!READ_ONCE(wifi->transport_paused)) {
 		drain_data_rx(wifi);
 		drain_data_tx(wifi);
+		drain_awdl_crs(wifi);
 	}
 }
 
@@ -1533,9 +1676,9 @@ static void drain(struct centauri_wifi *wifi)
 	drain_control(wifi, false);
 }
 
-static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void *payload,
-				 size_t size, void *reply, size_t *reply_size,
-				 bool pm_command)
+static int command_reply_iface(struct centauri_wifi *wifi, u8 if_id, u32 id,
+			       const void *payload, size_t size, void *reply,
+			       size_t *reply_size, bool pm_command)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
 	u8 *packet, *descriptor;
@@ -1552,6 +1695,7 @@ static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void 
 	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
+	packet[0x0d] = if_id;
 	put_unaligned_le16(24 + size, packet + 0x10);
 	put_unaligned_le16(sequence, packet + 0x12);
 	put_unaligned_le32(id, packet + 0x14);
@@ -1588,8 +1732,8 @@ static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void 
 		    (wifi->reply_command & ~BIT(30)) == id) {
 			if (wifi->reply_status)
 				dev_dbg(&wifi->control->pdev->dev,
-					"Wi-Fi command %#x rejected: firmware_status=%u\n",
-					id, wifi->reply_status);
+					"Wi-Fi command %#x (if=%u) rejected: firmware_status=%u\n",
+					id, if_id, wifi->reply_status);
 			if (reply)
 				*reply_size = wifi->reply_size;
 			ret = wifi->reply_status ? -EREMOTEIO : 0;
@@ -1597,12 +1741,21 @@ static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void 
 		}
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
-	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
+	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x (if=%u) timed out (rx=%u)\n",
+		id, if_id, wifi->rx_seen[2]);
 	centauri_recovery_request(wifi->control, "command timeout");
 	ret = -ETIMEDOUT;
 out:
 	wifi->reply_buffer = NULL;
 	return ret;
+}
+
+static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void *payload,
+				 size_t size, void *reply, size_t *reply_size,
+				 bool pm_command)
+{
+	return command_reply_iface(wifi, CEN_IF_STA, id, payload, size,
+				   reply, reply_size, pm_command);
 }
 
 static int command_control(struct centauri_wifi *wifi, u32 id, const void *payload,
@@ -2251,7 +2404,7 @@ static void scan_worker(struct work_struct *work)
 	struct cfg80211_scan_info info = {};
 	struct cfg80211_scan_request *request;
 	u32 channels_start, beacons_start;
-	bool alpha_halted;
+	bool alpha_halted = false;
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
@@ -2265,7 +2418,6 @@ static void scan_worker(struct work_struct *work)
 		ret = run_scan_tlvs(wifi, wifi->scan_request);
 	else
 		ret = run_scan_legacy(wifi);
-	/* Alpha can leave stage 2 without a fault interrupt: restart it. */
 	alpha_halted = !READ_ONCE(wifi->stopping) && !wifi->transport_paused &&
 		       readl(wifi->a.bar + 8) != 2;
 	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) ||
@@ -2786,10 +2938,13 @@ static void connect_worker(struct work_struct *work)
 		return;
 	}
 	if (auto_rings) {
-		static const unsigned int ring_ids[] = { 76, 24, 15, 12 };
-		unsigned int n;
+		unsigned int ring_ids[5], count = 0, n;
 
-		for (n = 0; n < ARRAY_SIZE(ring_ids); n++) {
+		ring_ids[count++] = 76;
+		ring_ids[count++] = 24;
+		ring_ids[count++] = 15;
+		ring_ids[count++] = 12;
+		for (n = 0; n < count; n++) {
 			int ring_ret = data_probe_locked(wifi, ring_ids[n], true);
 
 			if (ring_ret && ring_ret != -EBUSY)
@@ -2943,7 +3098,7 @@ static void connect_worker(struct work_struct *work)
 static void link_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(to_delayed_work(work), struct centauri_wifi, link_work);
-	bool disconnected, alpha_halted, local = false;
+	bool was_connected, disconnected, awdl_active, alpha_halted, local = false;
 	u16 reason = WLAN_REASON_UNSPECIFIED;
 
 	mutex_lock(&wifi->lock);
@@ -2952,9 +3107,12 @@ static void link_worker(struct work_struct *work)
 		return;
 	}
 	drain(wifi);
+	was_connected = wifi->connected;
+	awdl_active = centauri_awdl_is_active(wifi->awdl);
 	alpha_halted = !READ_ONCE(wifi->stopping) && readl(wifi->a.bar + 8) != 2;
-	disconnected = wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
-		alpha_halted;
+	disconnected = was_connected &&
+		(wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
+		 alpha_halted);
 	if (disconnected) {
 		reason = wifi->disconnect_reason ?: WLAN_REASON_UNSPECIFIED;
 		local = wifi->disconnect_local;
@@ -2989,15 +3147,17 @@ static void link_worker(struct work_struct *work)
 		skb_queue_purge(&wifi->data_tx_queue);
 		netif_carrier_off(wifi->netdev);
 		cfg80211_disconnected(wifi->netdev, reason, NULL, 0, local, GFP_KERNEL);
-	} else {
-		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 	}
 	if (alpha_halted) {
 		dev_warn_ratelimited(&wifi->control->pdev->dev,
 				     "Alpha execution stage %#x\n",
 				     readl(wifi->a.bar + 8));
 		centauri_recovery_request(wifi->control, "link: Alpha stage");
+		return;
 	}
+	if ((!disconnected && was_connected) ||
+	    (awdl_active && !READ_ONCE(wifi->stopping)))
+		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 }
 
 /* MSI from Control or Alpha: service the data rings now instead of at the next poll. */
@@ -3005,7 +3165,9 @@ void centauri_wifi_kick(struct centauri *c)
 {
 	struct centauri_wifi *wifi = READ_ONCE(c->wifi);
 
-	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping) &&
+	if (wifi &&
+	    (READ_ONCE(wifi->connected) || centauri_awdl_is_active(wifi->awdl)) &&
+	    !READ_ONCE(wifi->stopping) &&
 	    !READ_ONCE(wifi->transport_paused))
 		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
 }
@@ -3954,6 +4116,22 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		bit = 2;
 		doorbell = 11;
 		irq = 8;
+	} else if (id == 18) {
+		/* Interface 1 (AWDL) receive completions, same buffer ring. */
+		vector = 210;
+		offset = 0x260000;
+		size = 128;
+		bit = 6;
+		doorbell = 11;
+		irq = 8;
+	} else if (id == 78 || id == 79) {
+		/* Interface 1 TX completions (78) and type 7 events (79). */
+		vector = id == 78 ? 194 : 195;
+		offset = id == 78 ? 0x280000 : 0x2a0000;
+		size = 1024;
+		bit = id == 78 ? 7 : 8;
+		doorbell = 18;
+		irq = id == 78 ? 4 : 7;
 	} else if (id == 24 || id == 25 || id == 12) {
 		transfer = true;
 		vector = id;
@@ -3986,16 +4164,23 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 	if (transfer) {
 		put_unaligned_le64(~0ULL, message + 0x10);
 		put_unaligned_le16(size, message + 0x18);
-		put_unaligned_le16(id == 12 ? 12 : 76, message + 0x1a);
+		put_unaligned_le16(id == 12 ? id : 76, message + 0x1a);
 		put_unaligned_le16(doorbell, message + 0x1c);
 		put_unaligned_le16(id == 12 ? 0x220 : 0, message + 0x1e);
 		put_unaligned_le32(16, message + 0x20);
 		put_unaligned_le16(irq, message + 0x24);
 	} else {
 		put_unaligned_le16(size, message + 0x10);
-		put_unaligned_le16(id == 15 ? 12 : 0xffff, message + 0x12);
+		put_unaligned_le16(id == 15 || id == 18 ? 12 : 0xffff,
+				   message + 0x12);
 		put_unaligned_le16(doorbell, message + 0x14);
-		put_unaligned_le32(1, message + 0x18);
+		/* The interface 1 rings follow the traced open byte for byte:
+		 * nothing at 0x18, extension version 0 then interface 1.
+		 */
+		if (id == 18 || id == 78 || id == 79)
+			message[0x2c + 1] = CEN_IF_AWDL;
+		else
+			put_unaligned_le32(1, message + 0x18);
 		put_unaligned_le16(irq, message + 0x1c);
 	}
 	/* The host MCBC transfer ring takes version 0, hardware
@@ -4017,6 +4202,7 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 	if (!ret && readl(wifi->a.bar + 8) != 2)
 		ret = -EIO;
 	if (!ret && transfer && id == 12) {
+		u32 base = DATA_RX_BUFFER;
 		unsigned int slot;
 
 		/* Give the receive engine bounded, individually identifiable buffers.
@@ -4024,7 +4210,7 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		 */
 		for (slot = 0; slot < size - 1; slot++) {
 			u8 *descriptor = wifi->a.window + offset + slot * 16;
-			u32 buffer = DATA_RX_BUFFER + slot * 4096;
+			u32 buffer = base + slot * 4096;
 
 			memset(wifi->a.window + buffer, 0, 4096);
 			put_unaligned_le32(1 | (4096 << 8), descriptor);
@@ -4037,8 +4223,9 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		writel(1, wifi->a.bar + 0x1050);
 		msleep(100);
 		dev_info(&wifi->control->pdev->dev,
-			 "data RX buffers posted=%u stage=%u tr_tail=%u cr_head=%u\n",
-			 size - 1, readl(wifi->a.bar + 8), index_read(wifi, 1, 12),
+			 "data RX buffers ring=%u posted=%u stage=%u tr_tail=%u cr_head=%u\n",
+			 id, size - 1, readl(wifi->a.bar + 8),
+			 index_read(wifi, 1, vector),
 			 index_read(wifi, 0, 207));
 	}
 	return ret;
@@ -4157,12 +4344,15 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 			       size_t count, loff_t *position)
 {
 	struct centauri_wifi *wifi = file->private_data;
-	char status[1536];
+	const size_t size = 3072;
 	unsigned int i, length;
+	char *status __free(kfree) = kmalloc(size, GFP_KERNEL);
 
+	if (!status)
+		return -ENOMEM;
 	mutex_lock(&wifi->lock);
 	dma_rmb();
-	length = scnprintf(status, sizeof(status),
+	length = scnprintf(status, size,
 			   "stage=%u tx_cr=%u tx_tr=%u/%u rx_cr=%u rx_tr=%u/%u received=%u reposted=%u bad=%u samples=%u normal_tx_tr=%u/%u submitted=%u completed=%u failed=%u queued=%u coalesced=%u tx_bad=%u\n",
 			   readl(wifi->a.bar + 8), index_read(wifi, 0, 192),
 			   index_read(wifi, 1, 24), index_read(wifi, 3, 24),
@@ -4174,10 +4364,19 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 			   wifi->data_tx_submitted, wifi->data_tx_completed,
 			   wifi->data_tx_failed, skb_queue_len(&wifi->data_tx_queue),
 			   wifi->data_tx_coalesced, wifi->data_tx_bad);
+	length += scnprintf(status + length, size - length,
+			    "awdl_rings=%#x cr18=%u/%u taken=%u cr78=%u/%u taken=%u cr79=%u/%u taken=%u\n",
+			    wifi->data_probe_done,
+			    index_read(wifi, 0, 210), index_read(wifi, 2, 210),
+			    wifi->data_rx_awdl_ring,
+			    index_read(wifi, 0, 194), index_read(wifi, 2, 194),
+			    wifi->data_awdl_txc,
+			    index_read(wifi, 0, 195), index_read(wifi, 2, 195),
+			    wifi->data_awdl_cr79);
 	for (i = 0; i < 8; i++) {
 		u8 *entry = wifi->a.window + 0x240000 + i * 32;
 
-		length += scnprintf(status + length, sizeof(status) - length,
+		length += scnprintf(status + length, size - length,
 			"rx_completion[%u]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			i, get_unaligned_le32(entry), get_unaligned_le32(entry + 4),
 			get_unaligned_le32(entry + 8), get_unaligned_le32(entry + 12),
@@ -4187,7 +4386,7 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 	for (i = 0; i < 8; i++) {
 		u8 *entry = wifi->a.window + 0x200000 + i * 32;
 
-		length += scnprintf(status + length, sizeof(status) - length,
+		length += scnprintf(status + length, size - length,
 			"tx_completion[%u]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			i, get_unaligned_le32(entry), get_unaligned_le32(entry + 4),
 			get_unaligned_le32(entry + 8), get_unaligned_le32(entry + 12),
@@ -4779,6 +4978,10 @@ int centauri_wifi_register(struct centauri *c)
 	wifi->fwlog_status_file = debugfs_create_file("fwlog_status", 0400, c->debug, wifi, &fwlog_status_ops);
 	wifi->fwlog_buffer_file = debugfs_create_file("fwlog_buffer", 0400, c->debug, wifi, &fwlog_buffer_ops);
 	wifi->fwlog_ack_file = debugfs_create_file("fwlog_ack", 0200, c->debug, wifi, &fwlog_ack_ops);
+	ret = centauri_awdl_register(wifi, &wifi->awdl);
+	if (ret)
+		dev_warn(&c->pdev->dev,
+			 "AWDL interface registration failed: %d\n", ret);
 	return 0;
 failed:
 	centauri_wifi_unregister(c);
@@ -4942,6 +5145,155 @@ int centauri_wifi_resume(struct centauri *c)
 	return ret;
 }
 
+struct mutex *centauri_wifi_lock_ptr(struct centauri_wifi *wifi)
+{
+	return &wifi->lock;
+}
+
+struct device *centauri_wifi_dev(struct centauri_wifi *wifi)
+{
+	return &wifi->control->pdev->dev;
+}
+
+struct dentry *centauri_wifi_debugfs(struct centauri_wifi *wifi)
+{
+	return wifi->control->debug;
+}
+
+struct cen_alpha_resources *centauri_wifi_alpha(struct centauri_wifi *wifi)
+{
+	return &wifi->a;
+}
+
+bool centauri_wifi_is_stopping(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping);
+}
+
+bool centauri_wifi_is_paused(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->transport_paused);
+}
+
+void centauri_wifi_schedule_poll(struct centauri_wifi *wifi)
+{
+	if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused))
+		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
+}
+
+int centauri_wifi_cmd_iface(struct centauri_wifi *wifi, u8 if_id, u32 id,
+			    const void *payload, size_t size,
+			    void *reply, size_t *reply_size)
+{
+	return command_reply_iface(wifi, if_id, id, payload, size,
+				   reply, reply_size, false);
+}
+
+int centauri_wifi_ensure_shared_data_rings(struct centauri_wifi *wifi)
+{
+	/*
+	 * The shared rings, then interface 1's (AWDL) in the traced order:
+	 * 18 for its receive completions (buffers from ring 12), 78 for its
+	 * transmit completions and 79 (type 7). Without 18 the firmware
+	 * faults as soon as a peer sends AWDL data.
+	 */
+	static const unsigned int ring_ids[] = { 76, 15, 18, 12, 78, 79 };
+	unsigned int i;
+
+	lockdep_assert_held(&wifi->lock);
+	for (i = 0; i < ARRAY_SIZE(ring_ids); i++) {
+		int ret = data_probe_locked(wifi, ring_ids[i], true);
+
+		if (ret && ret != -EBUSY)
+			return ret;
+	}
+	return 0;
+}
+
+int centauri_wifi_open_awdl_tx_ring(struct centauri_wifi *wifi, u16 tr_id,
+				    u32 ring_offset, u16 slots,
+				    const struct cen_awdl_tx_clientdata *cd)
+{
+	u8 message[0x34 + sizeof(*cd)] = { 0 };
+	bool on_78 = !!(wifi->data_probe_done & BIT(7));
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (readl(wifi->a.bar + 8) != 2)
+		return -EIO;
+	memset(wifi->a.window + ring_offset, 0, slots * 32U);
+	index_write(wifi, 1, tr_id, 0);
+	index_write(wifi, 3, tr_id, 0);
+	message[0] = 1;
+	message[2] = 4;
+	put_unaligned_le16(tr_id, message + 4);
+	put_unaligned_le16(tr_id, message + 6);
+	put_unaligned_le64(wifi->a.window_dma + ring_offset, message + 8);
+	put_unaligned_le64(~0ULL, message + 0x10);
+	put_unaligned_le16(slots, message + 0x18);
+	put_unaligned_le16(on_78 ? 78 : 76, message + 0x1a);
+	put_unaligned_le16(18, message + 0x1c);
+	put_unaligned_le32(16, message + 0x20);
+	put_unaligned_le16(on_78 ? 4 : 3, message + 0x24);
+	memcpy(message + 0x34, cd, sizeof(*cd));
+	ret = alpha_message(wifi, message, sizeof(message));
+	if (!ret && readl(wifi->a.bar + 8) != 2)
+		ret = -EIO;
+	return ret;
+}
+
+int centauri_wifi_close_awdl_tx_ring(struct centauri_wifi *wifi, u16 tr_id)
+{
+	u8 message[4];
+	int ret = 0;
+
+	lockdep_assert_held(&wifi->lock);
+	if (!READ_ONCE(wifi->transport_paused) && readl(wifi->a.bar + 8) == 2) {
+		cen_awdl_build_tr_close_msg(message, tr_id);
+		ret = alpha_message(wifi, message, sizeof(message));
+	}
+	index_write(wifi, 1, tr_id, 0);
+	index_write(wifi, 3, tr_id, 0);
+	return ret;
+}
+
+void centauri_wifi_get_country(const struct centauri_wifi *wifi, u8 out[3])
+{
+	if (wifi && wifi->country_valid &&
+	    country_code_valid(wifi->country, sizeof(wifi->country))) {
+		out[0] = wifi->country[0];
+		out[1] = wifi->country[1];
+		out[2] = 0;
+		return;
+	}
+	out[0] = 'U';
+	out[1] = 'S';
+	out[2] = 0;
+}
+
+/* The station's channel number while it is connected, else 0. */
+unsigned int centauri_wifi_station_channel(const struct centauri_wifi *wifi)
+{
+	const struct ieee80211_channel *chan;
+
+	if (!wifi || !READ_ONCE(wifi->connected))
+		return 0;
+	chan = READ_ONCE(wifi->connect_channel);
+	return chan ? ieee80211_frequency_to_channel(chan->center_freq) : 0;
+}
+
+u16 centauri_wifi_index_read(struct centauri_wifi *wifi, unsigned int array,
+			     unsigned int index)
+{
+	return index_read(wifi, array, index);
+}
+
+void centauri_wifi_index_write(struct centauri_wifi *wifi, unsigned int array,
+			       unsigned int index, u16 value)
+{
+	index_write(wifi, array, index, value);
+}
+
 int centauri_wifi_suspend(struct centauri *c)
 {
 	struct centauri_wifi *wifi = c->wifi;
@@ -4950,6 +5302,7 @@ int centauri_wifi_suspend(struct centauri *c)
 	if (!wifi || !of_machine_is_compatible("apple,j813") ||
 	    !READ_ONCE(alpha_sleep_untested))
 		return 0;
+	centauri_awdl_suspend(wifi->awdl);
 	mutex_lock(&wifi->lock);
 	if (wifi->transport_paused || wifi->connected || wifi->connecting || wifi->scan_request ||
 	    READ_ONCE(wifi->stopping)) {
@@ -4989,6 +5342,8 @@ void centauri_wifi_unregister(struct centauri *c)
 
 	if (!wifi)
 		return;
+	centauri_awdl_unregister(wifi->awdl);
+	wifi->awdl = NULL;
 	WRITE_ONCE(wifi->stopping, true);
 	WRITE_ONCE(wifi->connect_abort, true);
 	WRITE_ONCE(wifi->scan_abort, true);
