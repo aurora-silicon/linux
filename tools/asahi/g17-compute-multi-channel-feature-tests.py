@@ -11,7 +11,7 @@ of g17/mod.rs and the feature constant of file.rs, the latter against every
 DRM_ASAHI_FEATURE_* bit that include/uapi/drm/asahi_drm.h defines. It checks
 that the bit is set exactly when a logical compute queue may hold more than one
 physical compute channel: on the M5 Pro (J714), and neither on the M5 Max,
-the M5 Ultra and the M5 (J716C, J775D, J813), whose boards run one firmware
+the M5 Ultra and the M5 (J716C, J775D, T8142), whose boards run one firmware
 compute queue per command queue, nor on GPUs that never select an M5 board
 (G17P), so userspace keeps its own sibling queues there; that the decision reads
 the board's channel count alone, never its encoding forms; that GET_PARAMS
@@ -102,7 +102,7 @@ def build(mutation=None):
         base = re.search(r'^    \.\.(\w+)$', body, re.M)
         assert own or base, name
         boards[name] = int(own.group(1)) if own else boards[base.group(1)]
-    assert set(boards) == {'J714', 'J716C', 'J775D', 'J813', 'J813_26B123'}, boards
+    assert set(boards) == {'J714', 'J716C', 'J775D', 'T8142', 'T8142_26B123'}, boards
     board_table = ',\n'.join(f'    ("{name}", {n})' for name, n in boards.items())
     channels_fn = item(initdata, 'pub(crate) const fn compute_channels(').replace('pub(crate) ', '')
 
