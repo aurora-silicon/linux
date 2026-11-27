@@ -25,6 +25,7 @@
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
+#include <linux/soc/apple/t8132.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -1822,6 +1823,8 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
+	/* apple_dcp_usable(): only one on firmware 27.2 (apple_t8132_dcpext_v27_2()). */
+	{ .compatible = "apple,t8132-dcpext" },
 	{},
 };
 
@@ -1840,7 +1843,21 @@ static bool apple_dcp_usable(struct device_node *np)
 		dcp_h17p_external_supported(np)) &&
 	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
-		dcp_t6041_ext_enabled());
+		dcp_t6041_ext_enabled()) &&
+	       /*
+		* The T8132 main DCP is the M4 backend's on its 26.6.2
+		* firmware path, and the firmware-27 backend's wherever the
+		* boot loader handed it over with the 27.2 image and its
+		* clocks, on any board (see dcp_check_firmware_version()).
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
+		apple_t8132_firmware_path() || apple_t8132_dcp_v27_2(np)) &&
+	       /*
+		* A T8132 dcpext the M4 backend adopts is no component: its
+		* outputs are t8132_ext_drm.c's. One on the 27.2 image is a pipe.
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcpext") ||
+		apple_t8132_dcpext_v27_2(np));
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
