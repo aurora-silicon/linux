@@ -792,6 +792,52 @@ static void ane_hx_dma_h15_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 0, bound), -ENOEXEC);
 }
 
+/*
+ * Input and output channel counts (0x0c, 0x1c) reset to 16 on H16/H17, so
+ * programs omit them for 16-channel tensors while an explicit 0 is still
+ * refused. Destination word 0x5104 carries dependency bits in 30:24 without
+ * shifting the DMA address; bits outside 0x7f000000 remain refused.
+ */
+static void ane_hx_dma_channel_default_and_dst_dep_test(struct kunit *test)
+{
+	/* 16 channels interleaved 8 -> 2 planes of 0x400 (0x400 + 16*2*8 = 0x500). */
+	static const u32 omitted_ch[] = {
+		DMA_REC(0x4, 2), 16, 1,
+		DMA_REC(0x14, 2), 16, 1,
+		DMA_REC(0x4d18, 2), 0x100, 0x400, DMA_REC(0x4d68, 1), 0x8002031,
+		DMA_REC(0x5110, 2), 0x100, 0x400, DMA_REC(0x5138, 1), 0x8302031,
+		DMA_RELOC(0x4d10, 6), 0, 0,
+		DMA_RELOC(0x5108, 7), 0, 0,
+		DMA_REC(0x4d00, 1), 0x20010041,
+		DMA_REC(0x5100, 2), 0x10100e1, 0x01000000,
+	};
+	u64 bound[ANE_HX_DMA_SLOTS] = { [6] = 0x500, [7] = 0x500 };
+	u8 text[512];
+	size_t size;
+
+	memset(text, 0, sizeof(text));
+	put_unaligned_le32(1, text);
+	size = dma_append(text, 16, 0, 0, 0, 0, omitted_ch, ARRAY_SIZE(omitted_ch));
+	KUNIT_ASSERT_EQ(test, ane_h16_task_stream_validate(text, size, 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), 0);
+
+	/* One 64-byte line short of the 16-channel (2-plane) extent is refused. */
+	bound[6] = 0x4c0;
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), -ENOEXEC);
+	bound[6] = 0x500;
+	bound[7] = 0x4c0;
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), -ENOEXEC);
+	bound[7] = 0x500;
+
+	/* 0x5104 bits outside 30:24 are refused. */
+	put_unaligned_le32(0x24000000, text + 16 + 9 * 4 + (ARRAY_SIZE(omitted_ch) - 1) * 4);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), 0);
+	put_unaligned_le32(0x01000001, text + 16 + 9 * 4 + (ARRAY_SIZE(omitted_ch) - 1) * 4);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), -ENOEXEC);
+	put_unaligned_le32(0x80000000, text + 16 + 9 * 4 + (ARRAY_SIZE(omitted_ch) - 1) * 4);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_dma_validate(text, size, 9, bound), -ENOEXEC);
+}
+
 static struct kunit_case ane_h16_task_cases[] = {
 	KUNIT_CASE(ane_h16_prologue_test),
 	KUNIT_CASE(ane_h17_prologue_test),
@@ -806,6 +852,7 @@ static struct kunit_case ane_h16_task_cases[] = {
 	KUNIT_CASE(ane_hx_dma_count_test),
 	KUNIT_CASE(ane_hx_dma_repeat_test),
 	KUNIT_CASE(ane_hx_dma_h15_test),
+	KUNIT_CASE(ane_hx_dma_channel_default_and_dst_dep_test),
 	KUNIT_CASE(ane_hx_dma_reset_test),
 	KUNIT_CASE(ane_hx_dma_rewrite_test),
 	KUNIT_CASE(ane_hx_dma_strict_test),
