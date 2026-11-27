@@ -632,17 +632,23 @@
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
+	/*
+	 * The coprocessor's CPU DART. Its address filter is the page at
+	 * 0x267044000 (ADT dart-ave reg[3]), which the bootloader programs.
+	 */
 	ave_dart0: iommu@267040000 {
 		compatible = "apple,t8103-dart";
-		reg = <0x2 0x67040000 0x0 0x4000>;
+		reg = <0x2 0x67040000 0x0 0x4000>,
+		      <0x2 0x67044000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave: video-codec@267100000 {
@@ -663,7 +669,7 @@
 		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
 		reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
-		status = "disabled";
+		status = "okay";
 	};
 
 	atc0_dpin0: displayport@381e50000 {
