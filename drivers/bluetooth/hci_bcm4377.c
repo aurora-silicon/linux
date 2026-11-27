@@ -605,6 +605,8 @@ struct bcm4377_data {
 	const char *board_type;
 
 	bool needs_reset;
+	/* Fresh from a power loss: in reset already, the next reset skips the FLR */
+	bool power_lost;
 	/* Set while bcm4377_pci_reset() resets the function itself. */
 	bool own_reset;
 	bool cal_needed;
@@ -622,6 +624,8 @@ struct bcm4377_data {
 	bool resume_guarded;
 	bool resume_recovering;
 	struct work_struct resume_work;
+	/* Boots the firmware again after a sleep that took the function's power */
+	struct work_struct power_lost_work;
 	bdaddr_t bdaddr;
 
 	wait_queue_head_t event;
@@ -1449,16 +1453,23 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	if (bcm4377->hw->disable_aspm)
 		bcm4377_disable_aspm(bcm4377);
 
-	WRITE_ONCE(bcm4377->own_reset, true);
-	ret = pci_reset_function(bcm4377->pdev);
-	WRITE_ONCE(bcm4377->own_reset, false);
-	if (ret) {
-		dev_err(&bcm4377->pdev->dev,
-			"function level reset failed: %d\n", ret);
-		goto out_irq;
-	}
+	/*
+	 * A function that lost its power came back from PERST#, with its port's settle
+	 * time behind it: the FLR, and the wait for the chip after it, add nothing.
+	 */
+	if (!bcm4377->power_lost) {
+		WRITE_ONCE(bcm4377->own_reset, true);
+		ret = pci_reset_function(bcm4377->pdev);
+		WRITE_ONCE(bcm4377->own_reset, false);
+		if (ret) {
+			dev_err(&bcm4377->pdev->dev,
+				"function level reset failed: %d\n", ret);
+			goto out_irq;
+		}
 
-	msleep(100);
+		msleep(100);
+	}
+	bcm4377->power_lost = false;
 
 	pci_set_master(bcm4377->pdev);
 
@@ -1713,6 +1724,7 @@ static void bcm4377_resume_recovery_work(struct work_struct *work)
 }
 
 static void bcm4377_hci_reset(struct hci_dev *hdev);
+static void bcm4377_power_lost_work(struct work_struct *work);
 
 static void bcm4377_hci_timeout(struct hci_dev *hdev)
 {
@@ -1799,6 +1811,7 @@ static int bcm4377_hci_open(struct hci_dev *hdev)
 static int bcm4377_hci_close(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	bool reset_requested = bcm4377->needs_reset;
 
 	bcm4377_resume_recovery_invalidate(bcm4377);
 	dev_dbg(&bcm4377->pdev->dev, "destroying rings in hci_close\n");
@@ -1837,8 +1850,12 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 	}
 
 	if (bcm4377->needs_reset) {
-		dev_warn(&bcm4377->pdev->dev,
-			 "transport needs hardware reset on next open\n");
+		if (reset_requested)
+			dev_dbg(&bcm4377->pdev->dev,
+				"transport reset on next open, as requested\n");
+		else
+			dev_warn(&bcm4377->pdev->dev,
+				 "transport needs hardware reset on next open\n");
 		bcm4377->acl_d2h_ring.enabled = false;
 		bcm4377->acl_h2d_ring.enabled = false;
 		bcm4377->sco_d2h_ring.enabled = false;
@@ -2928,6 +2945,7 @@ static void bcm4377_hci_unregister_dev(void *data)
 	struct hci_dev *hdev = data;
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 
+	cancel_work_sync(&bcm4377->power_lost_work);
 	bcm4377_resume_recovery_stop(bcm4377);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
@@ -3022,6 +3040,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_DELAYED_WORK(&bcm4377->setup_retry_work, bcm4377_setup_retry_work);
 	spin_lock_init(&bcm4377->resume_lock);
 	INIT_WORK(&bcm4377->resume_work, bcm4377_resume_recovery_work);
+	INIT_WORK(&bcm4377->power_lost_work, bcm4377_power_lost_work);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -3169,6 +3188,33 @@ static void bcm4377_sleep_finish(struct device *dev)
 
 static int bcm4377_resume(struct device *dev);
 
+/*
+ * After a sleep that took the function's power. The transport is marked for a reset, so
+ * the close touches neither the rings nor the firmware, and the open boots the firmware
+ * and sends the calibration again. Only then does the HCI core resume, with commands the
+ * controller can answer. A controller that was off boots on its next open.
+ */
+static void bcm4377_power_lost_work(struct work_struct *work)
+{
+	struct bcm4377_data *bcm4377 = container_of(work, struct bcm4377_data,
+						 power_lost_work);
+	struct hci_dev *hdev = bcm4377->hdev;
+	int ret = 0;
+
+	hci_req_sync_lock(hdev);
+	if (test_bit(HCI_UP, &hdev->flags))
+		ret = hci_reset_dev_sync(hdev);
+	hci_req_sync_unlock(hdev);
+	if (ret) {
+		bt_dev_err(hdev, "firmware not back after the sleep: %d", ret);
+		return;
+	}
+	bt_dev_info(hdev, "firmware booted again after the sleep");
+	ret = hci_resume_dev(hdev);
+	if (ret)
+		bt_dev_err(hdev, "resume after the sleep failed: %d", ret);
+}
+
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -3181,6 +3227,8 @@ static int bcm4377_suspend(struct device *dev)
 	if (apple_radio_sleep_owned(dev) && device_may_wakeup(dev))
 		return -EBUSY;
 
+	/* A firmware boot after the last sleep finishes before this one. */
+	flush_work(&bcm4377->power_lost_work);
 	bcm4377_resume_recovery_stop(bcm4377);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
@@ -3254,19 +3302,20 @@ static int bcm4377_resume(struct device *dev)
 
 	/*
 	 * A real sleep took the function's power: the firmware is gone, and every resume command
-	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
-	 * Restore the private BAR0 windows and mark needs_reset before queueing the rebind so
-	 * neither hci_close() during device_reprobe() nor a stray frame can write BAR0 through
-	 * unconfigured reset windows. Skip the resume commands and rebind from the work queue;
-	 * probe boots the firmware from scratch.
+	 * would only time out (two times 2 s inside the system resume). Restore the private BAR0
+	 * windows and mark needs_reset so that neither the close before the firmware boots again
+	 * nor a stray frame can write BAR0 through unconfigured reset windows. Skip the resume
+	 * commands here: bcm4377_power_lost_work() boots the firmware and then resumes the HCI
+	 * core, outside the system resume.
 	 */
 	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
 		bcm4377->needs_reset = true;
+		bcm4377->power_lost = true;
 		bcm4377_init_cfg(bcm4377);
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
+		queue_work(system_freezable_wq, &bcm4377->power_lost_work);
 		return 0;
 	}
 
