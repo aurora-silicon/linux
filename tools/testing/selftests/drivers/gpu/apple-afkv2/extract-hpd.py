@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Exercise the production DPTX HPD request with mocked service-call replies.
 
-Covers the legacy, AFK-v2 and compact EPIC replies and the 14.7 AV client close.
+Covers the legacy, AFK-v2 and compact EPIC replies, the 14.7 AV client close,
+and a request that is not sent again while its timed-out copy is unanswered.
 """
 import pathlib
 import re
@@ -27,6 +28,7 @@ command = re.search(r"^struct dcpdptx_hotplug_cmd \{.*?\} __attribute__\(\(packe
                     dptx, re.M | re.S)
 if not command:
     raise RuntimeError("production HPD request layout not found")
+call_ids = re.findall(r"^#define DCPDPTX_HOTPLUG_\w+\s.*$", dptx, re.M)
 prefix = r'''
 #undef NDEBUG
 #include <assert.h>
@@ -48,6 +50,7 @@ typedef u32 __le32;
 #define EPIC_SERVICE_CALL_MAGIC 0x69706378
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 #define dev_warn(...) do {} while (0)
+#define dev_warn_ratelimited(...) do {} while (0)
 #define dev_dbg(...) do {} while (0)
 #define READ_ONCE(x) (x)
 static u32 get_unaligned_le32(const void *p)
@@ -95,6 +98,17 @@ __attribute__((unused)) static void dcp_cec_close_port(struct dcp *dcp,
  assert(dcp == expected_dcp && service != NULL);
  cec_closes++;
 }
+/* The HPD request queued last on the port timed out and is still unanswered. */
+static bool unanswered;
+static unsigned int sends, unanswered_asked;
+bool afk_service_call_unanswered(struct apple_epic_service *service, u16 group,
+ u32 command, const void *data, size_t data_len)
+{
+ (void)service; (void)data;
+ assert(group == 8 && command == 8 && data_len == 20);
+ unanswered_asked++;
+ return unanswered;
+}
 static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
  const void *payload, size_t payload_len, void *output, size_t output_len,
  u32 *retcode, unsigned int timeout_ms, size_t *received)
@@ -109,6 +123,7 @@ static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
  assert(call->group == 8 && call->command == 8);
  closes_at_send = v14_closes;
  cec_closes_at_send = cec_closes;
+ sends++;
  if (wire_v2 && !received && arrived < output_len - sizeof(*call))
   return -EMSGSIZE;
  memcpy(&echo, body + 16, sizeof(echo));
@@ -206,14 +221,25 @@ int main(void)
   }
   ep.compact = false; compact_status = 0;
  }
+ /* A copy of an unanswered request is not sent, and fails as the request did. */
+ for (int hpd = 0; hpd < 2; hpd++) {
+  unsigned int before = sends, asked = unanswered_asked;
+  int ret;
+
+  unanswered = true;
+  ret = dptxport_set_hpd_timeout(&service, hpd, 1000);
+  unanswered = false;
+  expect(ret == -ETIMEDOUT && sends == before && unanswered_asked == asked + 1,
+         "copy of an unanswered request not sent", hpd, ret);
+ }
  printf("%d HPD reply checks failed\n", failures);
  if (failures)
   return 1;
- puts("PASS: extracted production DPTX HPD request: short, oversized, wrong-echo and complete replies, legacy, AFK-v2 and compact status, AV client close on HPD low");
+ puts("PASS: extracted production DPTX HPD request: short, oversized, wrong-echo and complete replies, legacy, AFK-v2 and compact status, AV client close on HPD low, no copy of an unanswered request");
  return 0;
 }
 '''
-unit = (prefix + command.group(0) + "\n" + function(afk, "afk_service_call_timeout_len") + "\n" +
+unit = (prefix + "\n".join(call_ids) + "\n" + command.group(0) + "\n" + function(afk, "afk_service_call_timeout_len") + "\n" +
         function(afk, "afk_service_call_timeout") + "\n" +
         function(dptx, "dptxport_set_hpd_timeout") + suffix)
 pathlib.Path(sys.argv[3]).write_text(unit)

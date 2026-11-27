@@ -2409,16 +2409,21 @@ int dcp_send_message_checked(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (ret && dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_err(dcp->dev, "native26 mailbox send failed ep=%#x: %d\n", endpoint, ret);
-	}
-	if (ret && native_14_7)
+	} else if (ret) {
+		/*
+		 * Nothing retries the message: an AFK doorbell lost here leaves
+		 * its command unread until a later doorbell, which a stalled
+		 * mailbox never delivers either.
+		 */
 		dev_warn_ratelimited(dcp->dev, "DCP send ep %02x failed: %d\n",
 				     endpoint, ret);
+	}
 	return ret;
 }
 
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
-	dcp_send_message_checked(dcp, endpoint, message);
+	return dcp_send_message_checked(dcp, endpoint, message);
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit)

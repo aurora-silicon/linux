@@ -54,6 +54,9 @@ prefix = r'''
 #define dma_rmb() do {} while(0)
 #define dev_warn(...) do {} while(0)
 #define dev_err(...) do {} while(0)
+static void dev_info_ratelimited(const void *dev,const char *fmt,...) { (void)dev;(void)fmt; }
+#define jiffies 0UL
+#define jiffies_to_msecs(j) ((unsigned int)(j))
 #define complete(p) (*(p)=1)
 #define EPIC_TYPE_COMMAND 3
 #define EPIC_CAT_COMMAND 0x30
@@ -67,7 +70,7 @@ struct cmd_info {
  u16 tag; u8 type; size_t reply_length; void *rxbuf,*txbuf;
  dma_addr_t rxbuf_dma,txbuf_dma; size_t rxlen,txlen; u32 retcode;
  size_t reply_len; bool reply_len_valid;
- bool done,free_on_ack; int *completion;
+ bool done,free_on_ack; int *completion; unsigned long queued;
 };
 struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
 static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
@@ -78,7 +81,11 @@ struct ops { const char *name; };
 struct apple_epic_service {
  struct apple_dcp_afkep *ep; struct ops *ops; unsigned int channel; unsigned long cmd_map[1];
  int lock; unsigned int users; bool enabled,torndown; u8 cmd_tag; struct cmd_info cmds[16];
+ u16 last_tag; u8 last_slot; bool last_valid,stall_reported,full_reported;
 };
+/* The stall report reads the rings and the mailbox state; nothing here checks its text. */
+static void afk_report_stall(struct apple_epic_service *s,u16 tag) { (void)s;(void)tag; }
+__attribute__((unused)) static unsigned int afk_service_unanswered_locked(struct apple_epic_service *s) { (void)s; return 0; }
 static struct apple_epic_service *active;
 static unsigned int frees, sends;
 static int wire_fail, timeout, reply_status;

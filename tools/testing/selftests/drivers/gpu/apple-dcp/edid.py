@@ -46,6 +46,9 @@ static void bitmap_release_region(unsigned long *p,unsigned int bit,int order) {
 #define dev_warn(...) ((void)0)
 #define dev_err(...) do { diagnostic_errors++; } while (0)
 #define dev_dbg(dev,fmt,...) do { if(!strcmp(fmt,"DCPAVSERV: legacy EDID service published\n")) legacy_publishes++; } while (0)
+#define jiffies 0UL
+#define jiffies_to_msecs(j) ((unsigned int)(j))
+static void dev_info_ratelimited(const void *dev,const char *fmt,...) { (void)dev;(void)fmt; }
 #define dev_info(...) do { diagnostic_information++; } while (0)
 
 static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
@@ -86,10 +89,11 @@ struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 /* open_later: a firmware 27 panel service that sends its own OPEN; none is here. */
 struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later,singleton;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
-struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
+struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion;unsigned long queued; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
-    bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;
+    bool lock,enabled,torndown,stall_reported,full_reported;unsigned int users;u32 channel;u8 cmd_tag;
+    u16 last_tag;u8 last_slot;bool last_valid;
     unsigned long cmd_map[1];struct epic_cmd_info cmds[MAX_PENDING_CMDS];
     struct { u64 generation,epoch; } admission;void *cookie;
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;
