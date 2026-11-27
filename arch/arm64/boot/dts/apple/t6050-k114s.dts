@@ -27,6 +27,9 @@
 #define T6050_K114S
 #include "t6050-peripherals.dtsi"
 
+/* The 14-inch chassis: pins, the jack, the card and the AOP; no speakers */
+#include "t6050-k114.dtsi"
+
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
