@@ -877,9 +877,12 @@ CIO_STOP_FIXTURE = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+typedef uint64_t u64;
 #define ENODEV 19
 #define EIO 5
+#define APPLE_DPIN_MAX 2
 #define READ_ONCE(x) (x)
 #define lockdep_assert_held(l) ((void)(l))
 #define scoped_guard(type, lock) if ((void)(lock), 1)
@@ -890,6 +893,13 @@ CIO_STOP_FIXTURE = r'''
 #define APPLE_CIO_LSTX_CTRL_LEVEL 1u
 struct device { int unused; };
 struct platform_device { struct device dev; };
+struct apple_dpin_ctx {
+    int lock, work, retry, poll, irq;
+    bool irq_enabled;
+    void *regs;
+    struct { bool alive; } state;
+    struct { u64 requested; } tokens;
+};
 struct apple_cio_hw { bool sleep_router_on_stop; bool lstx_after_boot; };
 struct apple_cio {
     const struct apple_cio_hw *hw;
@@ -897,6 +907,8 @@ struct apple_cio {
     struct device *dev;
     struct platform_device *nhi_pdev;
     unsigned int current_cable_info, target_cable_info;
+    unsigned int dpin_count;
+    struct apple_dpin_ctx dpin[APPLE_DPIN_MAX];
     bool pcie_tunnel_populated, pcie_quiesce_pending;
     bool resume_link_failed, link_lost_restart;
     void *rtk;
@@ -909,6 +921,11 @@ static int apple_cio_sleep_router_for_stop(struct apple_cio *acio) { (void)acio;
 static void apple_cio_reopen_pcie_tunnel(struct apple_cio *acio, bool pcie) { (void)acio; assert(pcie); reopens++; }
 static void of_platform_device_destroy(struct device *dev, void *data) { (void)dev; (void)data; destroyed++; }
 static void flush_workqueue(int wq) { (void)wq; }
+static void queue_work(int wq, int *w) { (void)wq; (void)w; }
+static void cancel_delayed_work_sync(int *w) { (void)w; }
+static void synchronize_irq(int irq) { (void)irq; }
+static void apple_dpin_request(struct apple_dpin_ctx *c, u64 gen, bool up) { (void)c; (void)gen; (void)up; }
+static void apple_dpin_irq_stop(struct apple_dpin_ctx *c) { (void)c; }
 static void of_platform_depopulate(struct device *dev) { (void)dev; depopulated++; }
 static int apple_rtkit_poweroff(void *rtk) { (void)rtk; poweroffs++; return 0; }
 static void apple_rtkit_mailbox_off(void *rtk) { (void)rtk; }
