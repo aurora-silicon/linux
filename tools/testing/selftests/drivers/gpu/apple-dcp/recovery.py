@@ -110,6 +110,10 @@ def check(root, output):
             current_channel=channel;current_tag=tag;return 0;
         }
     '''+marker)
+    unit=unit.replace('static void afk_v2_callback(',
+                      'static int afk_send_epic_published(struct apple_dcp_afkep *e,u32 channel,u16 tag,int type,int category,u8 subtype,const void *p,size_t n,bool *published)\n'
+                      '{ int r=afk_send_epic(e,channel,tag,type,category,subtype,p,n); if(published) *published=!r; return r; }\n'
+                      'static void afk_v2_callback(')
 
     tests=r'''
     static void setup(void) {
@@ -371,7 +375,7 @@ def check(root, output):
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
     if 'mutex_lock(&afkep->tx_lock);' in af:
-        queued=queued.replace('bool lock,stopping;','bool lock,tx_lock,stopping;',1)
+        queued=queued.replace('bool lock,stopping','bool lock,tx_lock,stopping',1)
     if 'atomic_inc(&ep->sleep_jobs);' in af:
         # The receive jobs a firmware sleep waits for; nothing here waits.
         anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'
