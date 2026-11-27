@@ -7927,7 +7927,7 @@ static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 	if (!((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK))
 		return 0;
 
-	saved = kzalloc(sizeof(*saved), GFP_KERNEL);
+	saved = kzalloc_obj(*saved);
 	if (!saved) {
 		walk->err = -ENOMEM;
 		return 1;
@@ -8185,6 +8185,7 @@ static int apple_pcie_resume(struct device *dev)
 static int apple_pcie_prepare(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+	int ret;
 
 	/*
 	 * A host-owned PCIe-C DART sleeps only inside the NHI's deep-sleep
@@ -8206,8 +8207,6 @@ static int apple_pcie_prepare(struct device *dev)
 	 */
 	if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&
 	    apple_pcie_adopted_sleep_host(pcie)) {
-		int ret;
-
 		/* A firmware suspend: the port and DART apple_pcie_t6050_sleep_down() takes down */
 		if (pm_suspend_via_firmware())
 			ret = pcie->t6050_port && pcie->t6050_dart ? 0 : -EBUSY;
@@ -8220,7 +8219,7 @@ static int apple_pcie_prepare(struct device *dev)
 			return ret;
 		}
 	}
-	int ret = apple_radio_prepare(dev);
+	ret = apple_radio_prepare(dev);
 	if (ret)
 		return ret;
 	if (pcie && apple_pcie_s2r_reinit(pcie) &&
