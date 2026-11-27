@@ -315,18 +315,21 @@ impl Context {
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
         // Both firmware and host write work nodes (reused every 63 submissions
-        // and zeroed on pool reuse). M5 keeps the whole work-state object
-        // uncached. G17P maps the node page firmware-cached: the host rewrites
-        // a node only after `WorkStorage::drained` has read the firmware's
-        // final `completed` count from memory, and zeroes a returned object
-        // only once its pool fence is met, so it never rewrites a node the
-        // firmware is still updating. The counter page, which the host writes
-        // on every kick, stays uncached.
+        // and zeroed on pool reuse). Map the node page firmware-cached on all
+        // G17 (G17P and M5): within a healthy context a node slot is rewritten
+        // only after every command holding its `WorkStateLease` has retired
+        // with post-maintenance completion stamps (or after `WorkStorage::drained`
+        // observed `completed >= submitted` from memory on stampless render
+        // fallback). Across contexts, `Pool::allocate` never overruns a pool
+        // fence for firmware-cached objects, and `retain_linked_work` keeps a
+        // killed, failed, or still-linked context's work storage out of pool
+        // reuse until firmware stop. The counter page, which the host writes on
+        // every kick, stays uncached.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            if alloc.uat.is_m5() { 0 } else { UAT_PGSZ },
+            UAT_PGSZ,
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
@@ -535,8 +538,12 @@ impl Context {
     /// cursor snapshot that proved the release consumed, so the witness already covers it.
     pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
         // An unreadable head counts as linked: retaining is the safe side.
+        // A killed context or failed VM may also leave firmware-cached work
+        // nodes dirty after aborted work without a normal stamped completion:
+        // keep the storage out of reuse until firmware stop even if the list
+        // head is empty.
         let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_address()]);
-        if linked {
+        if linked || self.kill_published() || self.status.get() != 0 {
             self.work.lock().object.retain_until_stop(pool);
         } else if let Some(mark) = &self.work_mark {
             mark.released(super::channel::control_witnessed());
