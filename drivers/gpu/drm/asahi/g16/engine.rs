@@ -4060,8 +4060,9 @@ impl Firmware {
         }
         // Pipelined render->render and cross-engine (CDM->TA, CDM->FS) barriers use
         // `BarrierType::Stamp` (type 0) only when neither producer, any live flight, nor this
-        // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
-        // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
+        // consumer carries `InitBM` (unlike G15's `CROSS_ENGINE_HOLD`; see
+        // `cross_engine_barrier_type`). Waits on compute wait on its service stamp; the
+        // render->render waits below, on `fw_stamp`, only order the TA and FS engines.
         // Cold `InitBM` transitions and recovery paths drain completely before publishing.
         // Renders reach the TA and FS engines in publication order across render pairs, as on
         // one pair's in-order queues: the PB and pass slot displacement proofs rely on it
