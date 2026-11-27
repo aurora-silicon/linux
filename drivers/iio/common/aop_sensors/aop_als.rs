@@ -162,8 +162,10 @@ struct PmHook {
     service: EPICService,
     /// The part arms only through the whole CT817 sequence.
     ct817: bool,
-    /// The reports were stopped for the sleep in progress.
-    stopped: Atomic<bool>,
+    /// A stop was tried for the sleep in progress. It is set before the
+    /// command goes out: a stop whose reply was lost may still have been
+    /// applied, so the wake restores the interval after every attempt.
+    stop_attempted: Atomic<bool>,
     registered: Atomic<bool>,
 }
 
@@ -184,21 +186,22 @@ unsafe extern "C" fn pm_event(
         bindings::PM_SUSPEND_PREPARE => {
             // A sensor that keeps reporting only costs wakeups: never refuse
             // the sleep over it.
+            hook.stop_attempted.store(true, Relaxed);
             match set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes()) {
-                Ok(_) => {
-                    hook.stopped.store(true, Relaxed);
-                    dev_dbg!(hook.dev, "reports off for sleep\n");
-                }
-                Err(e) => dev_warn!(hook.dev, "reports left on for sleep: {:?}\n", e),
+                Ok(_) => dev_dbg!(hook.dev, "reports off for sleep\n"),
+                Err(e) => dev_warn!(hook.dev, "reports may be left on for sleep: {:?}\n", e),
             }
         }
         bindings::PM_POST_SUSPEND => {
-            let stopped = hook.stopped.xchg(false, Relaxed);
+            let attempted = hook.stop_attempted.xchg(false, Relaxed);
             // The CT817 is stopped by the firmware even when the host did not
-            // stop it, so it is armed again after every sleep.
+            // stop it, so it is armed again after every sleep. The other parts
+            // get their interval back after every attempted stop, whether or
+            // not the stop's reply arrived; writing the active interval to a
+            // sensor that kept reporting changes nothing.
             let rearm = if hook.ct817 {
                 arm_ct817(aop, &hook.dev, &hook.service)
-            } else if stopped {
+            } else if attempted {
                 set_als_property(
                     aop,
                     &hook.service,
@@ -277,7 +280,7 @@ impl PmHook {
                 aop,
                 service,
                 ct817,
-                stopped: Atomic::new(false),
+                stop_attempted: Atomic::new(false),
                 registered: Atomic::new(false),
             },
             GFP_KERNEL,
