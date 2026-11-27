@@ -66,6 +66,8 @@ type Result<T = ()> = std::result::Result<T, Error>;
 const ENODEV: i32 = -19;
 const EPROBE_DEFER: i32 = -517;
 const GFP_KERNEL: u32 = 0;
+#[allow(unused_macros)]
+macro_rules! c_str { ($s:literal) => { $s }; }
 macro_rules! dev_info { ($($x:tt)*) => {{}}; }
 macro_rules! dev_err { ($($x:tt)*) => {{}}; }
 thread_local! {
@@ -80,13 +82,20 @@ thread_local! {
     static BINDING_READY: Cell<bool> = const { Cell::new(false) };
     static QUEUE_SHARE_READY: Cell<bool> = const { Cell::new(false) };
     static EXEC_SHARE_READY: Cell<bool> = const { Cell::new(false) };
+    static G17_READY: Cell<bool> = const { Cell::new(false) };
     static ATTACH_ERROR: Cell<bool> = const { Cell::new(false) };
     static PROBE_ERROR: Cell<i32> = const { Cell::new(0) };
+    static PRE_ACTIVATION: Cell<u32> = const { Cell::new(0) };
 }
 struct Core<'a>(PhantomData<&'a ()>);
-struct Device { data: Cell<*mut core::ffi::c_void> }
+struct Device { data: Cell<*mut core::ffi::c_void>, g16_handoff: bool }
 impl Device {
     fn as_raw(&self) -> *mut Device { self as *const Device as *mut Device }
+    fn of_node(&self) -> Option<&Self> { Some(self) }
+    fn get_opt_property<T: Default>(&self, name: &str) -> Result<Option<T>> {
+        assert_eq!(name, "apple,g16-handoff-version");
+        Ok(self.g16_handoff.then(T::default))
+    }
     // SET_DRVDATA
 }
 mod bindings {
@@ -137,7 +146,7 @@ mod platform {
         ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound;
     }
 }
-struct Config { name: &'static str }
+struct Config { name: &'static str, chip_id: u32 }
 pub struct ThisModule;
 pub trait ModuleMetadata { const NAME: &'static std::ffi::CStr; }
 pub trait InPlaceModule: Sized {
@@ -154,6 +163,7 @@ mod queue_share {
 }
 // So must the registry of execution contexts shared by a VM's G17P queues.
 mod g17 {
+    pub unsafe fn init() { crate::G17_READY.set(true); }
     pub mod exec_share {
         pub unsafe fn init() { crate::EXEC_SHARE_READY.set(true); }
     }
@@ -175,6 +185,7 @@ mod driver {
             assert!(BINDING_READY.get(), "adapter registered before binding registry init");
             assert!(QUEUE_SHARE_READY.get(), "adapter registered before queue-share registry init");
             assert!(EXEC_SHARE_READY.get(), "adapter registered before execution-context share registry init");
+            assert!(G17_READY.get(), "adapter registered before g17 compute-waiter target registry init");
             try_pin_init!(Self {
                 stage: {
                     let stage = match name.to_bytes() {
@@ -184,7 +195,16 @@ mod driver {
                     };
                     // Model driver_attach and a late driver_add_groups failure. A deferred
                     // worker can also retry G15 while the other registration is in progress.
-                    let _ = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
+                    let ready = MODULE_READY.load(Ordering::Acquire);
+                    let started = PROBES.get();
+                    let result = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
+                    // A probe that started firmware here is the readiness-gate failure, checked below.
+                    if !ready && PROBES.get() == started {
+                        // A deferral would keep the GPU in devices_deferred after a later
+                        // terminal failure; before activation the probe must decline outright.
+                        assert_eq!(result, Err(ENODEV), "pre-activation probe deferred instead of ENODEV");
+                        PRE_ACTIVATION.set(PRE_ACTIVATION.get() + 1);
+                    }
                     if FAIL_REGISTRATION.get() == stage { return Err(-5); }
                     COMPLETED_REGISTRATION.set(stage);
                     stage
@@ -228,12 +248,13 @@ fn reset(fail_alloc: bool, touch: bool, error: i32) {
     BINDING_READY.set(false);
     QUEUE_SHARE_READY.set(false);
     EXEC_SHARE_READY.set(false);
+    G17_READY.set(false);
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }
-static CFG: Config = Config { name: "test" };
+static CFG: Config = Config { name: "test", chip_id: 0x6030 };
 static PDEV: platform::Device<Core<'static>> = platform::Device {
-    base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData,
+    base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: false }, ctx: PhantomData,
 };
 fn activation_reprobe() {
     let last = if cfg!(CONFIG_DRM_ASAHI_G16) { 3 } else { 2 };
@@ -252,7 +273,7 @@ fn module_cases() {
         PDEV.base.data.set(core::ptr::null_mut());
         MODULE_READY.store(false, Ordering::Release);
         COMPLETED_REGISTRATION.set(0); FAIL_REGISTRATION.set(failure);
-        ACTIVATED.set(false); ATTACH_ERROR.set(failure == 0);
+        ACTIVATED.set(false); ATTACH_ERROR.set(failure == 0); PRE_ACTIVATION.set(0);
         let init = <DriverModule as InPlaceModule>::init(&MODULE);
         assert_eq!(PROBES.get(), 0, "module initializer eagerly started firmware");
         let result = KBox::pin_init(init, GFP_KERNEL);
@@ -269,6 +290,12 @@ fn module_cases() {
             assert!(!PDEV.base.data.get().is_null());
             unsafe { drop(Box::from_raw(PDEV.base.data.get().cast::<Driver<'_>>())); }
         }
+        // Every probe before activation declined: one per completed or failing registration.
+        // The registrations run G15 (1), the generic driver (2), then G16 (3) where it is built.
+        let expected = if cfg!(CONFIG_DRM_ASAHI_G16) {
+            match failure { 1 => 1, 2 => 2, _ => 3 }
+        } else if failure == 1 { 1 } else { 2 };
+        assert_eq!(PRE_ACTIVATION.get(), expected, "pre-activation probes");
         println!("module-registration-{failure}: PASS");
     }
 }
@@ -283,7 +310,7 @@ fn main() {
         ("successful-registration-binds", false, true, 0, Ok(0), true, 1),
     ] {
         reset(allocation_fails, touched, error);
-        let pdev = platform::Device { base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData };
+        let pdev = platform::Device { base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: false }, ctx: PhantomData };
         let result = callback::<Driver<'static>>(&pdev, Some(&cfg));
         assert_eq!(result, expected, "{name}: callback result");
         assert_eq!(PROBES.get(), calls, "{name}: firmware probe before drvdata allocation");
@@ -296,6 +323,14 @@ fn main() {
         }
         println!("{name}: PASS");
     }
+    reset(false, true, 0);
+    let pdev = platform::Device {
+        base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: true },
+        ctx: PhantomData,
+    };
+    assert_eq!(callback::<Driver<'static>>(&pdev, Some(&cfg)), Err(ENODEV));
+    assert_eq!(PROBES.get(), 0);
+    println!("g16-handoff-declined: PASS");
     module_cases();
 }
 '''
@@ -415,9 +450,10 @@ int main(void) {
         needle = "                        None\n"
         assert probe.count(needle) == 1
         variants["retained-error-unbinds"] = (probe.replace(needle, "                        return Err(error);\n"), module_code)
-        gate = "                if !MODULE_READY.load(Ordering::Acquire) {\n                    return Err(EPROBE_DEFER);\n                }\n"
+        gate = "                if !MODULE_READY.load(Ordering::Acquire) {\n                    return Err(ENODEV);\n                }\n"
         assert probe.count(gate) == 1
         variants["no-registration-readiness-gate"] = (probe.replace(gate, ""), module_code)
+        variants["pre-activation-defers"] = (probe.replace(gate, gate.replace("ENODEV", "EPROBE_DEFER")), module_code)
         late = "            #[cfg(CONFIG_DRM_ASAHI_G15)]\n            _g15_ready: g15::activate(),\n"
         assert module_code.count(late) == 1
         early = module_code.replace(late, "").replace("            _driver <-", late + "            _driver <-", 1)
@@ -442,11 +478,11 @@ int main(void) {
             if name == "actual":
                 receipt["g16_control" if enable_g16 else "control"] = result
                 if r.returncode: raise SystemExit(r.stderr)
-                if r.stdout.count(": PASS\n") != (10 if enable_g16 else 9): raise SystemExit("control did not run every case")
+                if r.stdout.count(": PASS\n") != (11 if enable_g16 else 10): raise SystemExit("control did not run every case")
             else:
                 receipt["mutants"][label] = result
                 if r.returncode == 0: raise SystemExit("SURVIVED: " + name)
-                intended = {"eager-probe-before-allocation": "allocation-before-start: firmware probe before drvdata allocation", "retained-error-unbinds": "retained-start-failure-binds: callback result", "no-registration-readiness-gate": "late registration failure started firmware", "activation-before-last-registration": "activation before all registrations completed", "activation-before-g16-registration": "activation before all registrations completed"}[name]
+                intended = {"pre-activation-defers": "pre-activation probe deferred instead of ENODEV", "eager-probe-before-allocation": "allocation-before-start: firmware probe before drvdata allocation", "retained-error-unbinds": "retained-start-failure-binds: callback result", "no-registration-readiness-gate": "late registration failure started firmware", "activation-before-last-registration": "activation before all registrations completed", "activation-before-g16-registration": "activation before all registrations completed"}[name]
                 result["intended_failure"] = intended in r.stderr
                 if not result["intended_failure"]: raise SystemExit("INVALID unrelated failure: " + name + "\n" + r.stderr)
     (out / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")

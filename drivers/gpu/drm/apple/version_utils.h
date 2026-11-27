@@ -62,6 +62,12 @@ enum dcp_firmware_version {
 	 */
 	DCP_FIRMWARE_V_26_6_DESKTOP,
 	DCP_FIRMWARE_V_27_0,
+	/*
+	 * A DCP driven through its firmware's iBoot interface alone
+	 * (disp0-service, dispext-service; see ibootep.c), not through
+	 * IOMFB: the T8152 one.
+	 */
+	DCP_FIRMWARE_IBOOT,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/

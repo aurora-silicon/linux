@@ -296,7 +296,31 @@ static inline u32 __attribute_const__ read_cpuid_id(void)
 	return read_cpuid(MIDR_EL1);
 }
 
-/* Apple part numbers from Donan onward identify the M4 and later generations. */
+/*
+ * Apple part numbers from Donan onward identify the M4 and later generations.
+ *
+ * These cores can come back from WFI and WFIT with their general-purpose and
+ * FP/SIMD registers cleared; SP and memory survive. On M1 to M3 the boot
+ * loader sets the cores up to keep that state in WFI (CYC_OVRD); from M4 on
+ * that register is locked before the kernel runs. The kernel keeps the state
+ * itself on every part matched here: cpu_do_idle() saves it around WFI, and
+ * WFxT is recorded as absent so that nothing executes WFIT. Neither idle=nop
+ * nor arm64.nowfxt is needed.
+ *
+ * Seen on:
+ *   0x054/0x055 T6040 (M4 Pro, J616s): the boot P core in WFI.
+ *   0x060/0x061 T8140 (A18 Pro, J700): the secondaries in WFI and WFIT.
+ *   0x062/0x063 T8142 (M5, J813): WFI in the idle loop, WFIT in a cpufreq
+ *               __delay().
+ *   0x064/0x065 T6050 (M5 Pro/Max, J714s/J716s): WFI.
+ *   0x072/0x073 T8152 (M6, J873): WFI at the first idle; WFIT under
+ *               schedutil gave wrong SHA-256 results.
+ * Not measured separately, matched as the same core generations: 0x052/0x053
+ * T8132 (M4), 0x058/0x059 T6041 (M4 Max), 0x068/0x069 and 0x06c/0x06d (M5
+ * Pro/Max/Ultra variants). Later parts are matched as well: where the state
+ * would have survived, the save costs a few stores per idle entry; where it
+ * does not, a missing save corrupts the idle loop.
+ */
 static inline bool midr_is_apple_m4_or_later(u32 midr)
 {
 	return MIDR_IMPLEMENTOR(midr) == ARM_CPU_IMP_APPLE &&

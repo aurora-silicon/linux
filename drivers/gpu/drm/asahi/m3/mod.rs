@@ -70,18 +70,17 @@ pub(crate) fn t8122_admitted(pdev: &platform::Device<Core<'_>>) -> Result<&'stat
 }
 
 // The T8122 runtime, ported from the 7.1.12 release-20 kernel (c46d7dcdb871).
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_attachments;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_compute;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+// The 26.x submission front end, shared with the G14 firmware-27.2 runtime.
+#[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
+pub(crate) mod agx_attachments;
+#[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
+pub(crate) mod agx_compute;
+#[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
 mod agx_memory;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_resources;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_status;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_uapi;
+#[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
+pub(crate) mod agx_uapi;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod g15_raw;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -124,8 +123,8 @@ mod m3_resources;
 mod m3_rtkit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_runtime;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod m3_submit;
+#[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
+pub(crate) mod m3_submit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_thermal;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -140,8 +139,6 @@ mod m3_compute_layout;
 mod m3_compute_sequence;
 
 mod m3_compute_storage;
-
-mod m3_coverage;
 
 mod m3_init_layout;
 
@@ -201,11 +198,16 @@ pub(crate) mod m3_soc;
 
 mod t8122_hwdata;
 
-mod m3_init_26;
+pub(crate) mod m3_init_26;
 mod m3_profile;
-mod m3_mmio_26;
+mod m3_recovery;
+pub(crate) mod m3_mmio_26;
 
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_power_26;
 
-mod m3_channel_format;
+pub(crate) mod m3_channel_format;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) use m3_channel_format::{idle_cursor, submission_entry, Action, CONTROL_BYTES};
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) use m3_init_storage::DEVICE_CONTROL;

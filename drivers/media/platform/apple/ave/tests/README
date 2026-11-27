@@ -58,6 +58,31 @@ expiry boundaries, with staggered attempts and across jiffies wrap. Run with
 ../.kunitconfig using tools/testing/kunit/kunit.py. The existing
 tools/asahi/ave-pm-tests.py also checks the #651 sleep rollback contract.
 
+OUTPUT input address
+--------------------
+
+Run python3 run-input.py for ASan/UBSan checks of the production
+ave_sess_input(). The fake DMA boundary makes each DART address the host
+address of the memory behind it, and the test reads the picture there as the
+encoder does (p->ch luma lines, then p->ch / 2 chroma lines after p->height
+luma lines). It sweeps every 64-byte data_offset vb2 accepts, for MMAP and
+imported buffers, and checks that each accepted address has the whole read
+inside the OUTPUT buffer or the slot's bounce copy, that a whole picture
+after a non-zero data_offset is still used in place, and that tightly packed
+lines are moved to the encoder's stride unchanged.
+
+Channel descriptor checks
+-------------------------
+
+Run python3 run-ipc.py for ASan/UBSan checks of the production channel parser
+(ave_ipc_parse_channels with the 6070 transport). ipc-boundary.h routes every
+read of the channel area through a fake firmware that rewrites a descriptor
+field (ring size, ring address or name) right after the host has read it, and
+can assert that no descriptor byte is fetched twice. Each case must parse the
+rings a well-behaved firmware publishes and hand over exactly the validated
+host-to-firmware slots; the rest of the IPC window must stay untouched.
+An argument (slots, addr, name or once) runs a single case.
+
 MCTF streaming tool
 -------------------
 
