@@ -55,10 +55,8 @@ extern "C" {
         sram_offset: u64,
         save_len: usize,
         restore_len: usize,
-        tvm_offset: u32,
     ) -> *mut core::ffi::c_void;
     fn asahi_g16_sram_restore() -> core::ffi::c_int;
-    fn asahi_g16_tvm_restore(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
     fn asahi_g16_sleep_note(step: u8);
     fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
@@ -155,8 +153,6 @@ impl Shared {
         let saved = self.sleep_ps.load(Ordering::Relaxed);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe { asahi_g16_tvm_enable(self.dev.as_raw().cast()) })?;
-        // SAFETY: `dev` is the live GPU device.
-        kernel::error::to_result(unsafe { asahi_g16_tvm_restore(self.dev.as_raw().cast()) })?;
         note(0x30);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe {
@@ -239,9 +235,9 @@ impl Shared {
             match stop {
                 SleepStop::Commit => asahi_g16_commit_prepare(dev, rtk, quiet),
                 SleepStop::Prepare => {
-                    let (start, save, restore, tvm) = sram
-                        .map_or((0, 0, 0, 0), |r| (r.start as u64, r.save, r.restore, r.tvm));
-                    asahi_g16_stop_now(dev, rtk, start, save, restore, tvm)
+                    let (start, save, restore) =
+                        sram.map_or((0, 0, 0), |r| (r.start as u64, r.save, r.restore));
+                    asahi_g16_stop_now(dev, rtk, start, save, restore)
                 }
             }
         };

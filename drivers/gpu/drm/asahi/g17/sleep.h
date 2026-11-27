@@ -17,9 +17,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
 						  bool quiet);
 struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk,
-					    u64 sram_offset, size_t save_len, size_t restore_len,
-					    u32 tvm_offset);
-int asahi_g16_tvm_restore(struct device *dev);
+					    u64 sram_offset, size_t save_len, size_t restore_len);
 int asahi_g16_sram_restore(void);
 void asahi_g16_sleep_note(u8 step);
 bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
