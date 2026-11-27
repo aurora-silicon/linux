@@ -80,6 +80,7 @@ struct iomfb_transaction {
 struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
+void dcp_swap_watchdog_cancel(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,

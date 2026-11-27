@@ -4257,7 +4257,7 @@ static bool iomfb_retire_present_locked_h17p(struct apple_dcp *dcp,
 	*recorded_id = true;
 	*retired_swap_id = swap_id;
 	if (cancel_watchdog)
-		dcp_swap_watchdog_complete(dcp);
+		dcp_swap_watchdog_cancel(dcp);
 	iomfb_present_failed_h17p(dcp);
 	if (!iomfb_present_brightness_only_h17p(dcp)) {
 		dcp_unarm_retained_framebuffers(dcp, swap_id);

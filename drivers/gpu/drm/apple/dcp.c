@@ -1769,9 +1769,19 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 	}
 }
 
-void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
+/*
+ * Cancel a pending swap watchdog without crediting a completed swap.
+ * Retiring an uncompleted present must preserve retrain tracking and
+ * unproved takeover state.
+ */
+void dcp_swap_watchdog_cancel(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
+}
+
+void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
+{
+	dcp_swap_watchdog_cancel(dcp);
 	dcp->swap_watchdog_retrains = 0;
 	/* A completed swap on the adopted mode proves it. */
 	dcp_takeover_adopt_proven(dcp);
