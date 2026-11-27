@@ -697,7 +697,7 @@ static inline int ane_h16_startup_commands(struct ane_h16_boot *b)
 					       f->startup[i].size, deadline);
 		if (ret)
 			return ret;
-		ret = ane_fw_transport_wait(&b->transport, ANE_FW_IO);
+		ret = ane_fw_transport_wait(&b->transport, ANE_FW_IO, false);
 		reply = (u8 *)b->pool.cpu +
 			(b->transport.pending[ANE_FW_IO].dva - b->pool.dva);
 		if (ret) {
@@ -726,7 +726,8 @@ static inline int ane_h16_startup_commands(struct ane_h16_boot *b)
 			ret = ane_fw_transport_publish_pmu_base(&b->transport, b->pmu_base,
 								deadline);
 			if (!ret)
-				ret = ane_fw_transport_wait(&b->transport, b->transport.control_ch);
+				ret = ane_fw_transport_wait(&b->transport,
+							    b->transport.control_ch, false);
 			b->ops->log(b->ctx, "SET_SNE_PMU_BASE2 base/result", b->pmu_base, (u64)ret);
 			if (ret)
 				return ret;

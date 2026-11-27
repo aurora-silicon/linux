@@ -24,6 +24,8 @@ enum fw_mode {
 	FW_LOAD_ID_UNCHANGED,
 	FW_LOAD_NAK,
 	FW_CREATE_BODY,
+	/* CREATE asks for its EXPP pool on SHAREDMALLOC and waits for it. */
+	FW_CREATE_SHARED,
 	FW_REPORT_FOREIGN_UUID,
 	FW_REPORT_WRONG_PROCESS,
 	FW_REPORT_FAILURE,
@@ -50,6 +52,7 @@ struct prog_fw {
 	unsigned int late_polls;
 	u64 next_dva;
 	u32 head[ANE_FW_CHANNELS];
+	u32 irq;
 	u32 reports;
 	/* First IDs; the firmware hands out the lowest free one, reused after teardown. */
 	u32 program, process;
@@ -90,6 +93,9 @@ struct prog_fw {
 	 */
 	u64 live, window;
 	unsigned int unmaps, map_fail_at;
+	/* What the SHAREDMALLOC allocator returns, and a CREATE parked on it. */
+	int alloc_error;
+	bool create_blocked;
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -108,7 +114,9 @@ static void fw_barrier(void *ctx)
 
 static u32 fw_read32(void *ctx, u32 reg)
 {
-	return 0;
+	struct prog_fw *f = ctx;
+
+	return reg == f->soc.irq_status ? f->irq : 0;
 }
 
 static u8 *fw_slot(struct prog_fw *f, unsigned int ch)
@@ -235,6 +243,7 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 					   cmd + ANE_H16_LOAD_ID_OFFSET);
 		break;
 	case ANE_H16_UNLOAD_PROGRAM:
+		f->create_blocked = false;
 		if (get_unaligned_le32(cmd + 8) - f->program < 32)
 			f->programs_live &= ~BIT(get_unaligned_le32(cmd + 8) - f->program);
 		break;
@@ -244,6 +253,18 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 		break;
 	case ANE_H16_CREATE_PROCESS:
 		KUNIT_EXPECT_FALSE(f->test, memchr_inv(cmd + 0xc, 0, ANE_H16_CREATE_SIZE - 0xc));
+		if (f->mode == FW_CREATE_SHARED) {
+			u8 *p = fw_slot(f, ANE_FW_SHAREDMALLOC);
+
+			/* Its EXPP pool first: the CREATE completes once granted. */
+			put_unaligned_le64(0, p);
+			put_unaligned_le64(SZ_2M, p + 8);
+			put_unaligned_le64(ANE_FW_SHARED_EXPP, p + 16);
+			fw_advance(f, ANE_FW_SHAREDMALLOC);
+			f->irq |= BIT(f->t.channels[ANE_FW_SHAREDMALLOC].bit);
+			f->create_blocked = true;
+			return;
+		}
 		put_unaligned_le32(fw_take_id(&f->processes_live, f->process), cmd + 0xc);
 		if (f->mode == FW_CREATE_BODY)
 			cmd[0x100] = 1;
@@ -265,6 +286,10 @@ static void fw_write32(void *ctx, u32 reg, u32 value)
 {
 	struct prog_fw *f = ctx;
 
+	if (reg == f->soc.irq_ack) {
+		f->irq &= ~value;
+		return;
+	}
 	if (reg != f->soc.doorbell)
 		return;
 	/* Commands take doorbell_ns to answer; returning report slots is free. */
@@ -297,9 +322,40 @@ static void fw_relax(void *ctx, u64 waited_ns)
 	}
 }
 
+static void *fw_zalloc(struct kunit *test, size_t size);
+
+/* The blocked CREATE at the IO head answers once its EXPP pool is granted. */
+static void fw_create_done(struct prog_fw *f)
+{
+	u8 *slot = fw_slot(f, ANE_FW_IO), *cmd;
+	u64 dva = get_unaligned_le64(slot), length = get_unaligned_le64(slot + 8);
+
+	f->create_blocked = false;
+	cmd = (u8 *)f->pool.cpu + (dva - f->pool.dva);
+	put_unaligned_le32(fw_take_id(&f->processes_live, f->process), cmd + 0xc);
+	put_unaligned_le64(length, slot + 8);
+	put_unaligned_le64(0, slot + 16);
+	put_unaligned_le64(dva | 1, slot);
+	fw_advance(f, ANE_FW_IO);
+}
+
 static int fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
 {
-	return -ENOMEM;
+	struct prog_fw *f = ctx;
+
+	if (f->alloc_error)
+		return f->alloc_error;
+	*s = (struct ane_fw_surface) {
+		.cpu = fw_zalloc(f->test, size),
+		.dva = f->next_dva,
+		.size = size,
+	};
+	if (!s->cpu)
+		return -ENOMEM;
+	f->next_dva += size;
+	if (f->create_blocked)
+		fw_create_done(f);
+	return 0;
 }
 
 static void fw_refused(void *ctx, u64 w0, u64 w1, u64 w2, int error)
@@ -484,6 +540,7 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 		put_unaligned_le64(f->ipc.dva + 0x800 + i * 0x200, p + 0x50);
 	}
 	f->next_dva = FW_MAP_DVA;
+	f->alloc_error = -ENOMEM;
 	f->program = 0x11;
 	f->process = 0;
 	if (ane_fw_transport_init(&f->t, &f->soc, &fw_ops, f, f->ipc, f->pool, SZ_16K,
@@ -1317,6 +1374,40 @@ static void program_bad_load_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->count, modes[i] == FW_CREATE_BODY ? 2 : 1);
 		KUNIT_EXPECT_EQ(test, fw_load_program(f, &p), -EIO);
 	}
+}
+
+/*
+ * The residency cap: the firmware asks for its EXPP pool on SHAREDMALLOC
+ * while the CREATE runs and the allocator has no room. That refusal is
+ * transient — it must not poison the transport, quarantine the session, or
+ * pin the program. The driver UNLOADs what the firmware took, and the next
+ * program loads and runs on the same session.
+ */
+static void program_shared_refused_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->mode = FW_CREATE_SHARED;
+	f->alloc_error = -ENOSPC;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &p), -ENOSPC);
+	KUNIT_EXPECT_PTR_EQ(test, p, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	/* LOAD, CREATE, then the UNLOAD giving the loaded program back. */
+	KUNIT_ASSERT_GE(test, f->count, 3U);
+	KUNIT_EXPECT_EQ(test, f->ids[f->count - 1], ANE_H16_UNLOAD_PROGRAM);
+	KUNIT_EXPECT_EQ(test, f->programs_live, 0U);
+	/* Its surfaces went back to the spare pool; none stay with the program. */
+	KUNIT_EXPECT_EQ(test, f->live, f->s.spare_bytes);
+	/* Room again: the same session loads and executes the next program. */
+	f->alloc_error = 0;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
 /*
@@ -3378,7 +3469,7 @@ static void program_pool_placed_bounds_test(struct kunit *test)
 							  sizeof(command), U64_MAX,
 							  end - ANE_FW_SLOT_SIZE),
 			0);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
 	KUNIT_EXPECT_EQ(test, f->count, 1U);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_mark(&f->t), end);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_release(&f->t, end - 1), -EINVAL);
@@ -3988,6 +4079,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_gate_hold_test),
 	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
+	KUNIT_CASE(program_shared_refused_test),
 	KUNIT_CASE(program_bad_operation_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),

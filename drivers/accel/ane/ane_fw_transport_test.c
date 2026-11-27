@@ -42,6 +42,7 @@ struct ane_transport_test {
 	int alloc_error;
 	int alloc_bad;
 	bool post_next_unnotified;
+	bool reply_in_alloc;
 };
 
 static void ane_test_access(struct ane_transport_test *f, char kind, const void *p, u64 value)
@@ -126,6 +127,16 @@ static int ane_test_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface
 		put_unaligned_le64(SZ_16K, p + 8);
 		put_unaligned_le64(0x5678, p + 16);
 		f->post_next_unnotified = false;
+	}
+	if (f->reply_in_alloc) {
+		const struct ane_fw_transaction *tx = &f->t.pending[ANE_FW_IO];
+		u8 *slot = ane_fw_transport_slot(&f->t, ANE_FW_IO);
+
+		/* The pending command answers while its alloc is refused. */
+		put_unaligned_le64(tx->dva | 1, slot);
+		put_unaligned_le64(tx->size, slot + 8);
+		put_unaligned_le64(0, slot + 16);
+		f->reply_in_alloc = false;
 	}
 	if (f->alloc_error)
 		return f->alloc_error;
@@ -924,6 +935,75 @@ static void ane_transport_shared_total_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->allocs, 12U);
 }
 
+/*
+ * The allocator saying "no room" is a refusal, not a failure: the transport
+ * stays up, the request stays the firmware's to retry, and a command whose
+ * wait died with it frees the channel for the next one.
+ */
+static void ane_transport_shared_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->alloc_error = -ENOSPC;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	KUNIT_EXPECT_EQ(test, f->refused_error, -ENOSPC);
+
+	/* The refused entry is consumed; the retry lands behind it and is served. */
+	f->alloc_error = 0;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+
+	/* A wait that died on a refusal leaves the channel free. */
+	f->alloc_error = -ENOMEM;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, true), -ENOMEM);
+	KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+	f->alloc_error = 0;
+	KUNIT_EXPECT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+}
+
+/*
+ * A wait whose command cannot be blocked by a SHAREDMALLOC rides a refusal
+ * out: the command's own reply still ends the wait and the channel is free
+ * for the next one.
+ */
+static void ane_transport_wait_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->alloc_error = -ENOSPC;
+	f->reply_in_alloc = true;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+	KUNIT_EXPECT_EQ(test, f->refused_error, -ENOSPC);
+	f->alloc_error = 0;
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
+}
+
+/* An alloc refused while settling does not fail the settle. */
+static void ane_transport_settle_refused_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.allow_free = true;
+	f->alloc_error = -ENOSPC;
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_settle(&f->t, 5, 100), 0);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
 static void ane_transport_shared_report_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1006,7 +1086,7 @@ static void ane_transport_deadline_service_test(struct kunit *test)
 	f->alloc_time = 2;
 	f->irq = BIT(5);
 	ane_test_shared_request(f, 0, SZ_16K, 0);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN, false), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
 	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
 	KUNIT_EXPECT_EQ(test, f->t.pending[ANE_FW_DATA_CHAIN].deadline_ns, TEST_DEADLINE);
@@ -1020,9 +1100,9 @@ static void ane_transport_wait_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
 	ane_test_reply(f, ANE_FW_IO);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_DATA_CHAIN), 0);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN, false), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, f->now, TEST_DEADLINE);
 }
 
@@ -1267,7 +1347,7 @@ static void ane_transport_mode_stop_test(struct kunit *test)
 			(u64)ANE_FW_MODE_STOP_SIZE);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_poll(&f->t, ch), -EAGAIN);
 	ane_test_reply(f, ch);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch, false), 0);
 	KUNIT_EXPECT_FALSE(test, f->t.pending[ch].active);
 	KUNIT_EXPECT_EQ(test, f->t.head[ch], 1U);
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
@@ -1329,7 +1409,7 @@ static void ane_transport_mode_stop_completion_test(struct kunit *test)
 	put_unaligned_le64(f->t.pending[ch].dva | 1, slot);
 	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 8);
 	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 16);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch, false), 0);
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
 
 	/* Any other result word is still refused. */
@@ -1338,7 +1418,7 @@ static void ane_transport_mode_stop_completion_test(struct kunit *test)
 	put_unaligned_le64(f->t.pending[ch].dva | 1, slot);
 	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 8);
 	put_unaligned_le64(1, slot + 16);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch, false), -EPROTO);
 }
 
 static void ane_transport_io_result_size_test(struct kunit *test)
@@ -1351,7 +1431,7 @@ static void ane_transport_io_result_size_test(struct kunit *test)
 	put_unaligned_le64(f->t.pending[ANE_FW_IO].dva | 1, slot);
 	put_unaligned_le64(16, slot + 8);
 	put_unaligned_le64(16, slot + 16);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), -EPROTO);
 }
 
 /* A table whose position 2 is not a host command ring has no control ring. */
@@ -1488,12 +1568,12 @@ static void ane_transport_wait_polls_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
 	ane_test_reply(f, ANE_FW_IO);
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO, false), 0);
 	/* A reply already there: no sleep at all. */
 	KUNIT_EXPECT_EQ(test, f->t.polls, 0ULL);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_DATA_CHAIN), 0);
 	f->now = TEST_DEADLINE - 5;
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN, false), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, f->t.polls, 5ULL);
 	/* The fifth sleep came four ticks after the wait began. */
 	KUNIT_EXPECT_EQ(test, f->waited, 4ULL);
@@ -1620,6 +1700,9 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_shared_overlap_test),
 	KUNIT_CASE(ane_transport_shared_count_test),
 	KUNIT_CASE(ane_transport_shared_total_test),
+	KUNIT_CASE(ane_transport_shared_refused_test),
+	KUNIT_CASE(ane_transport_wait_refused_test),
+	KUNIT_CASE(ane_transport_settle_refused_test),
 	KUNIT_CASE(ane_transport_shared_report_test),
 	KUNIT_CASE(ane_transport_irq_test),
 	KUNIT_CASE(ane_transport_match_data_test),
