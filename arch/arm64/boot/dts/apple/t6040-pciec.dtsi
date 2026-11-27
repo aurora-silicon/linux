@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J614s: PCIe-C (tunneled PCIe) on the three Thunderbolt ports, e.g. a
+ * T6040 PCIe-C (tunneled PCIe) on the three Thunderbolt ports, e.g. a
  * Studio Display's xHCI. No boot loader hands the ports over: the kernel
- * cold-initializes them.
+ * cold-initializes them. Boards enable the tunnel, DART and controller of
+ * each port they wire up.
  *
- * From the j614s ADT (macOS 26 IODeviceTree), identical for apciec0-2 and
- * dart-apciec0-2:
+ * From the ADT (macOS 26 IODeviceTree), identical for apciec0-2 and
+ * dart-apciec0-2 and between the J614s and J616s:
  * - the DART's DMA window: vm-base 1 TiB + 2 GiB, vm-size 0x7ff00000, its
  *   first 16 KiB a dead mapping;
  * - bypass-253 and bypass-255: the port's own writes (MSIs turned into AIC
@@ -16,11 +17,7 @@
  * T6050's PCIe-C DART.
  */
 
-#define J614S_PCIEC(n)								\
-&usb4_##n##_pcie_tunnel {							\
-	status = "okay";							\
-};										\
-										\
+#define T6040_PCIEC(n)								\
 &apciec##n##_dart {								\
 	apple,dma-range = <0x100 0x80004000 0x0 0x7fefc000>;			\
 	power-domains = <&ps_atc##n##_pcie>;					\
@@ -33,7 +30,6 @@
 			<0x300 0x1f31 0x1>,					\
 			<0x308 0x3ffffffc 0x10000000>,				\
 			<0x310 0x3ffffffc 0x3ffffffc>;				\
-	status = "okay";							\
 };										\
 										\
 &usb4_##n##_pcie {								\
@@ -78,7 +74,6 @@
 			       <0xb4 0x801f 0x4>,				\
 			       <0xbc 0x801f 0x4>,				\
 			       <0xc4 0x801f 0x4>;				\
-	status = "okay";							\
 };										\
 										\
 &usb4_##n##_pcie_port {								\
@@ -87,8 +82,8 @@
 			<0x1090 0x1 0x0>;					\
 };
 
-J614S_PCIEC(0)
-J614S_PCIEC(1)
-J614S_PCIEC(2)
+T6040_PCIEC(0)
+T6040_PCIEC(1)
+T6040_PCIEC(2)
 
-#undef J614S_PCIEC
+#undef T6040_PCIEC

@@ -700,3 +700,4 @@
 };
 
 #include "t6040-usb4.dtsi"
+#include "t6040-pciec.dtsi"
