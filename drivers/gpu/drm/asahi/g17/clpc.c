@@ -16,6 +16,11 @@ void asahi_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille)
 	apple_clpc_gpu_set_busy(gpu, permille);
 }
 
+void asahi_clpc_gpu_clear_busy(struct apple_clpc_gpu *gpu)
+{
+	apple_clpc_gpu_clear_busy(gpu);
+}
+
 void asahi_clpc_gpu_put(struct apple_clpc_gpu *gpu)
 {
 	apple_clpc_gpu_put(gpu);

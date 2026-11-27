@@ -325,9 +325,6 @@ void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
 	if (active && !gpu->active && gpu->wake)
 		mod_delayed_work(system_freezable_power_efficient_wq, gpu->wake, 0);
 	gpu->active = active;
-	/* A new burst after idle starts from the top, not from an old share. */
-	if (!active)
-		gpu->busy_valid = false;
 	gpu->updated_ns = ktime_get_mono_fast_ns();
 	gpu->sequence++;
 	spin_unlock_irqrestore(&gpu->lock, flags);
@@ -354,10 +351,30 @@ void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille)
 }
 EXPORT_SYMBOL_GPL(apple_clpc_gpu_set_busy);
 
+/**
+ * apple_clpc_gpu_clear_busy() - Forget the GPU busy share after genuine idle
+ * @gpu: the GPU input, from apple_clpc_gpu_get()
+ *
+ * Returns reported GPU work to the top column of &struct apple_clpc_hw.gpu_busy
+ * until the driver reports a fresh window via apple_clpc_gpu_set_busy().
+ */
+void apple_clpc_gpu_clear_busy(struct apple_clpc_gpu *gpu)
+{
+	unsigned long flags;
+
+	if (!gpu)
+		return;
+	spin_lock_irqsave(&gpu->lock, flags);
+	gpu->busy_valid = false;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_clear_busy);
+
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu)
 {
 	if (gpu) {
 		apple_clpc_gpu_set_active(gpu, false);
+		apple_clpc_gpu_clear_busy(gpu);
 		kref_put(&gpu->ref, apple_clpc_gpu_free);
 	}
 }
@@ -3063,11 +3080,60 @@ static void apple_clpc_floor_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0xf00u);
 }
 
+static void apple_clpc_gpu_busy_clear_test(struct kunit *test)
+{
+	struct apple_clpc_hw hw = apple_clpc_hw_t6041;
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+	unsigned int demand[APPLE_CLPC_RAILS] = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	hw.gpu_busy[APPLE_CLPC_DCS][0] = 1;
+	hw.gpu_busy[APPLE_CLPC_DCS][1] = 2;
+	hw.gpu_busy[APPLE_CLPC_DCS][2] = 4;
+	hw.gpu_busy[APPLE_CLPC_DCS][3] = 5;
+	hw.gpu_busy[APPLE_CLPC_SOC][3] = 3;
+	hw.gpu_busy_mid = 160;
+	hw.gpu_busy_high = 500;
+	hw.gpu_busy_top = 800;
+
+	/* Brief inactivity preserves the reported busy share across paced frames. */
+	apple_clpc_gpu_set_active(gpu, true);
+	apple_clpc_gpu_set_busy(gpu, 15);
+	gpu->level = 0;
+	gpu->level_since = jiffies - msecs_to_jiffies(APPLE_CLPC_GPU_DOWN_MS);
+	apple_clpc_gpu_set_active(gpu, false);
+	KUNIT_EXPECT_TRUE(test, gpu->busy_valid);
+	KUNIT_EXPECT_EQ(test, gpu->busy, 15u);
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_input_demand(&hw, gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 1u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
+
+	/* Explicit clear_busy returns the next burst to the top column at once. */
+	apple_clpc_gpu_clear_busy(gpu);
+	KUNIT_EXPECT_FALSE(test, gpu->busy_valid);
+	memset(demand, 0, sizeof(demand));
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_input_demand(&hw, gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 5u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+
+	/* Releasing the consumer clears both activity and busy_valid. */
+	kref_get(&gpu->ref);
+	apple_clpc_gpu_set_busy(gpu, 15);
+	apple_clpc_gpu_put(gpu);
+	KUNIT_EXPECT_FALSE(test, gpu->active);
+	KUNIT_EXPECT_FALSE(test, gpu->busy_valid);
+	kref_put(&gpu->ref, apple_clpc_gpu_free);
+}
+
 static struct kunit_case apple_clpc_policy_cases[] = {
 	KUNIT_CASE(apple_clpc_step_khz_test),
 	KUNIT_CASE(apple_clpc_steps_first_test),
 	KUNIT_CASE(apple_clpc_vote_test),
 	KUNIT_CASE(apple_clpc_floor_test),
+	KUNIT_CASE(apple_clpc_gpu_busy_clear_test),
 	{}
 };
 static struct kunit_suite apple_clpc_policy_suite = {
