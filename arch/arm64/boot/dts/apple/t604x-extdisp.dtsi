@@ -18,7 +18,6 @@
 		mboxes = <&dcpext0_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext0_dart 23>;
-		apple,hdcp-channels = <7 8>;
 		/* guessed: the internal DCP uses 0x20000, J700 DISPEXT0 is +0x8000 */
 		apple,bw-scratch = <&pmgr_dcp 0 4 0x28000>;
 		/* firmware Disp_Index, the dual-pipe endpoint ID */
@@ -57,7 +56,6 @@
 		mboxes = <&dcpext1_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext1_dart 23>;
-		apple,hdcp-channels = <9 10>;
 		/* guessed, as dcpext0 */
 		apple,bw-scratch = <&pmgr_dcp 0 4 0x30000>;
 		apple,dcp-endpoint = <2>;
