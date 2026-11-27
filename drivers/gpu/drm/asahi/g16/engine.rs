@@ -175,6 +175,13 @@ fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> 
     f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
 }
 
+/// Whether a compute command of `vm` using hardware compute UMA slots `uma_mask` must wait
+/// for active compute flight `f` to retire because another VM currently owns a conflicting
+/// hardware compute UMA slot (`COMPUTE_UMA_SLOT..RENDER_UMA_SLOT`).
+fn compute_uma_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, uma_mask: u32) -> bool {
+    f.computes != 0 && !Arc::ptr_eq(&f.job.vm, vm) && (f.compute_uma_mask & uma_mask) != 0
+}
+
 /// Whether a render of `vm`, multisampled when `msaa`, must wait for render flight `f` to
 /// retire before it is published.
 ///
@@ -363,6 +370,8 @@ pub(crate) struct Flight {
     pub(crate) has_timestamps: bool,
     /// Whether this flight runs ray-tracing or SCS-scratch compute (pinned to compute pipe 0).
     pub(crate) rt_compute: bool,
+    /// Bitmask of hardware compute UMA slots (`0..COMPUTE_UMA_SLOTS`) active in this flight.
+    pub(crate) compute_uma_mask: u32,
     /// Whether this flight includes any heavy-TA render pass (multi-layer or large tilemap).
     pub(crate) heavy_render: bool,
     /// Whether this flight includes a multisampled render pass; its VM is marked
@@ -411,6 +420,7 @@ impl Flight {
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
+            compute_uma_mask: 0,
             heavy_render: false,
             msaa: false,
         }
@@ -438,6 +448,8 @@ struct Prefix {
     last_ct: u32,
     last_ta: u32,
     last_fs: u32,
+    /// Compute commands staged onto the VM's shared compute UMA descriptor in this prefix.
+    uma_delta: u64,
 }
 
 /// Error provenance must remain independent of errno: EIO can be an ordinary failed VM
@@ -1454,6 +1466,11 @@ impl Firmware {
         let is_rt_compute = is_compute
             && (job.resources.compute_scs()
                 || matches!(cmd, Some(Command::Compute(c)) if c.is_rt()));
+        let uma_mask = if is_compute {
+            job.resources.compute_uma_mask()
+        } else {
+            0
+        };
         let is_msaa_render = matches!(cmd, Some(Command::Render(r)) if r.is_multisampled());
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
@@ -1461,6 +1478,7 @@ impl Firmware {
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
+                    || (is_compute && compute_uma_conflict(f, &job.vm, uma_mask))
                     || (is_render && msaa_render_conflict(f, &job.vm, is_msaa_render))
                     || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
@@ -1743,13 +1761,20 @@ impl Firmware {
                     .iter()
                     .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let scs = job.resources.compute_scs() || c.is_rt();
+                let uma_mask = job.resources.compute_uma_mask();
                 let scs_conflict = e
                     .flights
                     .iter()
                     .any(|f| scs_compute_conflict(f, &job.vm, scs));
+                let uma_conflict = e
+                    .flights
+                    .iter()
+                    .any(|f| compute_uma_conflict(f, &job.vm, uma_mask));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
                 !cross_vm_render
                     && !scs_conflict
+                    && !uma_conflict
+                    && !self.slots.compute_uma_quarantined(uma_mask)
                     && !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
@@ -3450,6 +3475,11 @@ impl Firmware {
         f.count = (end - index) as usize;
         f.computes = prefix.computes;
         f.renders = prefix.renders;
+        f.compute_uma_mask = if render {
+            0
+        } else {
+            job.resources.compute_uma_mask()
+        };
         f.target = prefix.last_ct;
         f.ta_target = if render { prefix.last_ta } else { 0 };
         f.fs_target = prefix.last_fs;
@@ -3458,6 +3488,9 @@ impl Firmware {
         f.fs_head = prefix.fs_head;
         if self.recovery_pending()? {
             return Err(EAGAIN);
+        }
+        if !render && self.slots.compute_uma_quarantined(f.compute_uma_mask) {
+            return Err(EIO);
         }
         if render {
             f.pb.as_ref()
@@ -3498,12 +3531,21 @@ impl Firmware {
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {
-                for m in 0..f.claims.slot_count as usize {
-                    let k = f.claims.slot[m] as usize;
-                    job.resources
-                        .compute_unit(k)?
-                        .counter
-                        .w64(0, f.csubmitted[m])?;
+                if let Some(shared) = job.resources.shared_compute_uma() {
+                    if f.claims.slot_count != 0 {
+                        let tail_sub = f.csubmitted[(f.claims.slot_count - 1) as usize];
+                        shared.submitted.store(tail_sub, Ordering::Release);
+                        shared.counter.w64(0, tail_sub)?;
+                    }
+                } else {
+                    for m in 0..f.claims.slot_count as usize {
+                        let k = f.claims.slot[m] as usize;
+                        job.resources
+                            .compute_unit(k)?
+                            .private_uma()?
+                            .counter
+                            .w64(0, f.csubmitted[m])?;
+                    }
                 }
                 self.graph.compute[compute_pipe]
                     .threshold
@@ -3686,8 +3728,42 @@ impl Firmware {
         self.slots.hold_compute_slot(index, &job.vm, resources)?;
         let s = resources.compute_unit(index)?;
         let g = &self.graph.compute[pipe];
-        let before = s.counter.r64(0)?;
-        let submitted = before.checked_add(1).ok_or(EOVERFLOW)?;
+        let (
+            before,
+            submitted,
+            descriptor_fw,
+            counter_fw,
+            pool_state_gva,
+            page_list_gva,
+            uma_slot,
+            seeds,
+        ) = if let Some(shared) = resources.shared_compute_uma() {
+            let base = shared.submitted.load(Ordering::Acquire);
+            pf.uma_delta = pf.uma_delta.checked_add(1).ok_or(EOVERFLOW)?;
+            (
+                base,
+                base.checked_add(pf.uma_delta).ok_or(EOVERFLOW)?,
+                shared.descriptor.va,
+                shared.counter.va,
+                shared.pool_state.gva.ok_or(EINVAL)?,
+                shared.page_list.gva.ok_or(EINVAL)?,
+                shared.uma_slot,
+                shared.seeds,
+            )
+        } else {
+            let u = s.private_uma()?;
+            let b = u.counter.r64(0)?;
+            (
+                b,
+                b.checked_add(1).ok_or(EOVERFLOW)?,
+                u.descriptor.va,
+                u.counter.va,
+                u.pool_state.gva.ok_or(EINVAL)?,
+                u.page_list.gva.ok_or(EINVAL)?,
+                u.uma_slot,
+                u.seeds,
+            )
+        };
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             qinfo: g.qinfo.va,
@@ -3697,23 +3773,23 @@ impl Firmware {
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
             // Separate device-lifetime firmware-cached microsequence record for this unit index.
             seq: s.seq.va,
-            // Separate per-VM uncached UMA manager descriptor inside `s.uma_lease`.
-            descriptor_fw: s.descriptor.va,
+            // Separate per-VM uncached UMA manager descriptor inside `uma_lease`.
+            descriptor_fw,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
             its: s.its.va,
             stats_fw: self.init.compute_activity.va,
             auxiliary_fw: s.aux.va,
             auxiliary_gva: s.aux.gva.ok_or(EINVAL)?,
             context_store_gva: s.context_store.gva.ok_or(EINVAL)?,
-            counter_fw: s.counter.va,
-            pool_state_gva: s.pool_state.gva.ok_or(EINVAL)?,
-            page_list_gva: s.page_list.gva.ok_or(EINVAL)?,
+            counter_fw,
+            pool_state_gva,
+            page_list_gva,
             usc_base: job.queue.usc_base,
             record_fw: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             binding_generation: generation,
-            // Each unit owns its UMA slot: the firmware starts a queued command while the
-            // one before it still runs, and two owners of one slot then corrupt each other.
-            uma_slot: engine_ids::COMPUTE_UMA_SLOT + index as u32,
+            // Non-SCS units share one hardware UMA slot per VM (serialized across VMs by
+            // `compute_uma_conflict`); SCS units retain per-unit slots.
+            uma_slot,
             event: work::compute::EVENTS[pipe],
             // Preserve the already qualified packet bytes while expressing the native
             // fields separately. This compatibility identifier is not proof of native
@@ -3724,7 +3800,7 @@ impl Firmware {
             target_stamp: target,
             submitted,
         };
-        let rt = compute_rt(&cmd.ray, s.seeds);
+        let rt = compute_rt(&cmd.ray, seeds);
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         let w = image(&mut scratch.cw)?;
         let q = image(&mut scratch.cq)?;
@@ -3748,17 +3824,33 @@ impl Firmware {
         let full_work = self.slots.compute_needs_full_work(index) || before == 0;
         if full_work {
             if before != 0 {
-                // Slots::claim_compute proved a different fully retired unit displaced this
-                // descriptor in the same hardware slot. Validate the retained descriptor in place.
-                let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-                s.descriptor.read(0, &mut descriptor)?;
-                if encode::validate_compute_descriptor(&refs, &descriptor, before).is_err() {
-                    // This is retained allocator identity/completion corruption, not a client
-                    // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
-                    // preparation would make the corrupt descriptor available to another job.
-                    self.slots.quarantine(&mut f.claims);
-                    self.sync_quarantine_hints();
-                    return Err(EIO);
+                if let Some(shared) = resources.shared_compute_uma() {
+                    // Validate the VM-shared UMA descriptor at idle boundaries (when no other
+                    // flight of this VM is mutating `COMPLETED`).
+                    if pf.uma_delta == 1 && before == shared.retired.load(Ordering::Acquire) {
+                        let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
+                        shared.descriptor.read(0, &mut descriptor)?;
+                        if encode::validate_shared_compute_descriptor(&refs, &descriptor, before)
+                            .is_err()
+                        {
+                            self.slots.quarantine(&mut f.claims);
+                            self.sync_quarantine_hints();
+                            return Err(EIO);
+                        }
+                    }
+                } else {
+                    // Slots::claim_compute proved a different fully retired unit displaced this
+                    // descriptor in the same hardware slot. Validate it in place.
+                    let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
+                    s.private_uma()?.descriptor.read(0, &mut descriptor)?;
+                    if encode::validate_compute_descriptor(&refs, &descriptor, before).is_err() {
+                        // Retained allocator identity/completion corruption, not a client refusal.
+                        // Keep the unit and its previous VM lease mapped forever; cancelling
+                        // preparation would make the corrupt descriptor available to another job.
+                        self.slots.quarantine(&mut f.claims);
+                        self.sync_quarantine_hints();
+                        return Err(EIO);
+                    }
                 }
             }
             s.work.write(0, &w[..work::compute::BODY_ACTIVE_END])?;

@@ -1215,6 +1215,13 @@ pub(crate) mod sizes {
     /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
     /// `snapshot_entries = 448`).
     pub(crate) const COMPUTE_UNITS: usize = 24;
+    /// Device-wide hardware compute UMA manager slots (`COMPUTE_UMA_SLOT..RENDER_UMA_SLOT`,
+    /// slots `1..=32`). Non-SCS compute VMs share one UMA descriptor, pool, and hardware slot
+    /// across all of their compute units and pipes so firmware skips UMA teardown and rebind
+    /// while any command of the VM remains queued or active.
+    pub(crate) const COMPUTE_UMA_SLOTS: usize =
+        (super::engine::RENDER_UMA_SLOT - super::engine::COMPUTE_UMA_SLOT) as usize;
+    const _: () = assert!(COMPUTE_UMA_SLOTS == 32);
     const _: () = assert!(COMPUTE_UNITS >= 2);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(
