@@ -1477,7 +1477,10 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 		dcp->panel.height_mm = panel.height_mm;
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
-	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
+	if (ret || !dcp_panel_gamut_color_space(panel.gamut))
+		dev_info(dcp->dev, "panel ADT: no known colour gamut, EDID primaries default to Display P3\n");
+	dcp->panel.color_target =
+		dcp_panel_color_target(ret ? DCP_PANEL_GAMUT_UNSPECIFIED : panel.gamut);
 	/*
 	 * Whether the panel has EDR headroom at all is the machine's to say: an
 	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
