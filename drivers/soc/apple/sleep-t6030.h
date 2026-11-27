@@ -718,6 +718,7 @@ static void t6030_pmu2_report(struct apple_sleep *s, const char *when)
 
 static void t6030_spmi1_probe(struct apple_sleep *s)
 {
+	struct resource res;
 	u32 ps;
 
 	if (!READ_ONCE(t6030_spmi1) || t6030_spmi1_base)
@@ -727,7 +728,10 @@ static void t6030_spmi1_probe(struct apple_sleep *s)
 		dev_info(s->dev, "spmi1 PMU: nub-spmi1's power word reads %#x, not mapped\n", ps);
 		return;
 	}
-	t6030_spmi1_base = devm_ioremap(s->dev, T6030_SPMI1_BASE, T6030_SPMI1_SIZE);
+	/* Nonposted, as the bus it sits on (nonposted-mmio): a posted write there resets the SoC */
+	res = (struct resource)DEFINE_RES_MEM(T6030_SPMI1_BASE, T6030_SPMI1_SIZE);
+	res.flags |= IORESOURCE_MEM_NONPOSTED;
+	t6030_spmi1_base = apple_sleep_ioremap(s->dev, &res);
 	if (!t6030_spmi1_base)
 		return;
 	dev_info(s->dev, "spmi1: power %#x, status %#x, mask0 %#x ack0 %#x, notify %#x\n", ps,
