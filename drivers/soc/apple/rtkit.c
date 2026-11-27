@@ -3182,6 +3182,30 @@ int apple_rtkit_wake_iop_on(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake_iop_on);
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): IOP ON to firmware that may have kept its CPU and state
+ * through an idle and a halt, with its acknowledgment awaited alone (no HELLO, no endpoint map,
+ * which apple_rtkit_wake_iop_on() waits for first), then AP ON. -ETIME: no acknowledgment.
+ */
+int apple_rtkit_iop_on_ack(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
+					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
+						     APPLE_RTKIT_PWR_STATE_ON));
+	if (ret)
+		return ret;
+	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	if (ret)
+		return ret;
+	if (READ_ONCE(rtk->iop_power_state) != APPLE_RTKIT_PWR_STATE_ON)
+		return -EPROTO;
+	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_iop_on_ack);
+
 /* Wait up to @ms for @c, polling the mailbox where waits poll it: true once it is done. */
 static int apple_rtkit_done_within(struct apple_rtkit *rtk, struct completion *c,
 				   unsigned int ms)

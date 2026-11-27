@@ -20,6 +20,8 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 					    u64 sram_offset, size_t save_len, size_t restore_len);
 int asahi_g16_sram_restore(void);
 void asahi_g16_sleep_note(u8 step);
+int asahi_g16_wake_gpu_pmgr(struct device *dev);
+void asahi_g16_mbox_log(struct device *dev, const char *when);
 bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
 bool asahi_g17_commit_required(void);
 bool asahi_g17_commit_stops_firmware(void);

@@ -25,7 +25,7 @@
 use core::sync::atomic::Ordering;
 
 use kernel::{
-    bindings,
+    bindings, c_str,
     prelude::*,
     sync::Arc,
     time::{delay::fsleep, Delta},
@@ -59,6 +59,9 @@ extern "C" {
     fn asahi_g16_sram_restore() -> core::ffi::c_int;
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
     fn asahi_g16_sleep_note(step: u8);
+    fn asahi_g16_wake_gpu_pmgr(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_g16_mbox_log(dev: *mut core::ffi::c_void, when: *const core::ffi::c_char);
+    fn apple_rtkit_iop_on_ack(rtk: *mut bindings::apple_rtkit) -> core::ffi::c_int;
     fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
@@ -100,9 +103,41 @@ impl Firmware {
         self.session.regs.set_asc_control(control | ASC_RUN)?;
         regs::mb();
         note(0x34);
-        let result = self.session.rtkit.boot();
+        let mut result = self.session.rtkit.boot();
         note(if result.is_ok() { 0x35 } else { 0x3f });
+        if held && result.is_err() {
+            mbox_log(self.session.dev.as_raw().cast(), c_str!("after the HELLO wait"));
+            if macos_wake() & 4 != 0 {
+                // DIAGNOSTIC (T6030 sleep bring-up): a CPU that kept its state through the idle
+                // and the halt answers IOP ON from its idle loop instead of saying HELLO.
+                // SAFETY: The RTKit handle lasts until reboot.
+                let ret = unsafe { apple_rtkit_iop_on_ack(self.session.rtkit.as_raw()) };
+                dev_info!(
+                    self.session.dev.as_ref(),
+                    "GPU firmware restart without HELLO: IOP ON then AP ON: {}\n",
+                    ret
+                );
+                note(if ret == 0 { 0x36 } else { 0x3e });
+                if ret == 0 {
+                    result = Ok(());
+                }
+            }
+        }
         result
+    }
+}
+
+/// DIAGNOSTIC (T6030 sleep bring-up): `aurora.g16_sleep_macos_wake`.
+fn macos_wake() -> u32 {
+    crate::module_parameters::g16_sleep_macos_wake.value()
+}
+
+/// DIAGNOSTIC (T6030 sleep bring-up): with bit 1 of `aurora.g16_sleep_macos_wake`, the ASC's
+/// mailbox words and CPU_CONTROL, `when`.
+pub(crate) fn mbox_log(dev: *mut core::ffi::c_void, when: &CStr) {
+    if macos_wake() & 2 != 0 {
+        // SAFETY: `dev` is the live GPU device; the C side only reads words the driver reads.
+        unsafe { asahi_g16_mbox_log(dev, when.as_char_ptr()) };
     }
 }
 
@@ -358,6 +393,15 @@ impl Shared {
             let mut state = self.state.lock();
             match state.as_deref_mut() {
                 Some(firmware) if !self.crashed.load(Ordering::Acquire) => {
+                    let dev = self.dev.as_raw().cast();
+                    if held && macos_wake() & 1 != 0 {
+                        // DIAGNOSTIC (T6030 sleep bring-up): macOS's wake before GFX on.
+                        // SAFETY: `dev` is the live GPU device.
+                        let ret = unsafe { asahi_g16_wake_gpu_pmgr(dev) };
+                        if ret != 0 {
+                            dev_warn!(self.dev.as_ref(), "GPU PMGR wake replay: {}\n", ret);
+                        }
+                    }
                     self.raise_domain().and_then(|_| {
                         // As macOS: the request once the domain is on, before the firmware's
                         // mailbox and handshake.
@@ -370,6 +414,7 @@ impl Shared {
                             if ret != 0 {
                                 dev_warn!(self.dev.as_ref(), "GPU SRAM not written back: {}\n", ret);
                             }
+                            mbox_log(dev, c_str!("with GFX back on, before RUN"));
                         }
                         firmware.sleep_restart(held)
                     })

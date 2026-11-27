@@ -16,7 +16,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
 use kernel::{
-    bindings, device,
+    bindings, c_str, device,
     device::Core,
     error::{from_err_ptr, to_result},
     platform,
@@ -990,6 +990,8 @@ pub(crate) fn start(
     if regs.asc_control()? & regs::ASC_RUN != 0 {
         return Err(EBUSY);
     }
+    // DIAGNOSTIC (T6030 sleep bring-up): the reset values, for the restart's log to compare.
+    super::sleep::mbox_log(d.as_raw().cast(), c_str!("at the cold start, before RUN"));
     let kind = adt.layout.start;
     if kind == hw::Start::MacOs27_2 {
         // 26B123 sends no PMP AGX vote: the firmware acknowledges its own IOP power-on once

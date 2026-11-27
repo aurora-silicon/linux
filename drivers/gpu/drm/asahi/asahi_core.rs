@@ -293,6 +293,10 @@ module! {
             default: 0,
             description: "DIAGNOSTIC: G16: stop the GPU firmware in the sleep's commit instead of .prepare (T6030 sleep bring-up)",
         },
+        g16_sleep_macos_wake: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: a .prepare stop's restart: bit 0 replays macOS's wake before GFX on (AFR, the GPU PMGR +0x10000 block), bit 1 logs the ASC mailbox and CPU_CONTROL, bit 2 sends IOP ON when no HELLO comes (T6030 sleep bring-up)",
+        },
         g16_sleep_no_pmp_request: u32 {
             default: 0,
             description: "DIAGNOSTIC: G16: never make or withdraw the PMP's request for the GPU (T6030 sleep bring-up)",
