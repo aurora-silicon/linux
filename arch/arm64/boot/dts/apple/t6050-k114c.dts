@@ -167,6 +167,10 @@
 	height-mm = <199>;
 };
 
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k114c.bin", "apple/msrk-k114c.bin"
+#include "t6050-touchid.dtsi"
+
 /*
  * The K114c keeps J714's card with its speakers, at the J714's safe level. The
  * chassis' K114 entry (t6050-k114.dtsi) has the jack only.

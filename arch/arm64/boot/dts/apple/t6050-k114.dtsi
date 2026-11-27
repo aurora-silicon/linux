@@ -45,10 +45,10 @@
  * exposed: 80 and 81 (PCIe ports 0 and 1's PERST#); 106 and 107, the speaker amps'
  * interrupt and shutdown line (ADT audio-speaker, used only where a board describes
  * the amps); 134 and 139, the jack codec's interrupt and reset; 136 and 137, the
- * speaker ID.
+ * speaker ID; 138, the Touch ID sensor's data-ready line (t6050-touchid.dtsi).
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
 };
 
 /*

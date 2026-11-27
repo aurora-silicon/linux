@@ -26,13 +26,6 @@
 #define T6050_K116S
 #include "t6050-peripherals.dtsi"
 
-/ {
-	aliases {
-		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
-		sep = &sep;
-	};
-};
-
 &pinctrl_ap {
 	/*
 	 * Pin 112 takes an SError when read, so only the pins a node names are
@@ -175,29 +168,6 @@
 };
 
 #include "t6050-k116s-pmp-tunables.dtsi"
-
-/*
- * The SEP (ADT sep, dart-sep), as on the J714s: its mailbox, and its power domain with the two
- * fabric parents left to the firmware, which genpd votes on and never turns off. The boot
- * loader enables the SEP itself through its alias.
- */
-&sep_mbox {
-	status = "okay";
-};
-
-&ps_sep {
-	status = "okay";
-};
-
-&ps_fab8_soc {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-&ps_fab0_piogw {
-	apple,firmware-owned;
-	status = "okay";
-};
 
 /* Sound: the J714s description, every value checked against the K116s ADT. */
 /*
@@ -544,41 +514,9 @@
 	status = "okay";
 };
 
-/*
- * Touch ID (ADT spi2/mesa): the Mesa sensor on spi2 at 8 MHz, chip select 0,
- * powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP GPIO 138, as
- * on the J714s. spi2 runs from the 24 MHz reference (ADT clock-ids 451).
- */
-&ps_nub_gpio {
-	status = "okay";
-};
-
-&nub_gpio0 {
-	status = "okay";
-};
-
-&ps_spi2 {
-	status = "okay";
-};
-
-&spi2 {
-	clocks = <&clkref>;
-	status = "okay";
-
-	mesa: fingerprint@0 {
-		compatible = "apple,mesa-fingerprint";
-		reg = <0>;
-		spi-max-frequency = <8000000>;
-		spi-cpol;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
-		interrupt-parent = <&pinctrl_ap>;
-		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
-		/* Per-device factory data from this Mac's own iBoot system container */
-		firmware-name = "apple/mesacal-k116s.bin", "apple/msrk-k116s.bin";
-	};
-};
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116s.bin", "apple/msrk-k116s.bin"
+#include "t6050-touchid.dtsi"
 
 /*
  * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does

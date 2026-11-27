@@ -41,5 +41,9 @@
 	height-mm = <223>;
 };
 
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116c.bin", "apple/msrk-k116c.bin"
+#include "t6050-touchid.dtsi"
+
 /* The USB-C ports ATC1 and ATC2, as on the other K boards */
 #include "t6050-k114-k116-usb.dtsi"
