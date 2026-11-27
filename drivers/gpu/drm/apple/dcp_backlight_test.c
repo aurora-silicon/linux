@@ -649,6 +649,24 @@ static void edr_ceiling_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(U32_MAX), 65535999U);
 }
 
+/* PQ 203 cd/m^2, where compositors put SDR content, lands on the user's brightness */
+static void edr_pq_sdr_test(struct kunit *test)
+{
+	u32 sdr;
+
+	KUNIT_EXPECT_EQ(test, dcp_edr_pq_sdr(0), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_pq_sdr(1), 1U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_pq_sdr(203), 100U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_pq_sdr(1000), 493U);
+	/* SDR content (PQ 203) shows at the user's level, give or take rounding */
+	for (sdr = 10; sdr <= 1600; sdr += 7)
+		KUNIT_EXPECT_LE(test, abs((s64)dcp_edr_pq_sdr(sdr) * DCP_EDR_PQ_REFERENCE_NITS /
+					  DCP_EDR_FW_UNITY_NITS - sdr), 2);
+	/* A lower SDR white leaves more headroom to the same peak */
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(2000, dcp_edr_pq_sdr(500), 16000),
+			div_u64(2000ULL * DCP_EDR_UNITY, dcp_edr_pq_sdr(500)));
+}
+
 static void edr_target_test(struct kunit *test)
 {
 	u32 ceiling = dcp_edr_ceiling(EDR_TEST_CEILING);
@@ -874,6 +892,7 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_fade_blank_test),
 	KUNIT_CASE(edr_ceiling_test),
 	KUNIT_CASE(edr_target_test),
+	KUNIT_CASE(edr_pq_sdr_test),
 	KUNIT_CASE(edr_low_end_steady_test),
 	KUNIT_CASE(edr_fade_monotonic_test),
 	KUNIT_CASE(edr_start_ramp_test),

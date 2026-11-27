@@ -170,6 +170,9 @@ static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) 
 		return;		/* no EDR, and none to wind down */
 	if (!sdr)
 		return;
+	/* PQ's reference white on the user's brightness (dcp_edr_pq_sdr()) */
+	if (dcp->output_edr)
+		sdr = dcp_edr_pq_sdr(sdr);
 	if (dcp->output_edr)
 		target = dcp_edr_target(peak, sdr, dcp->panel.edr_ceiling);
 	if (restart && dcp->output_edr) {
@@ -373,6 +376,9 @@ static void dcp_edr_prepare_v27(struct apple_dcp *dcp, struct dcp_swap_v27 *swap
 	WRITE_ONCE(dcp->edr_ramping, false);
 	if ((!dcp->output_edr && !dcp->edr_hm) || !sdr)
 		return;
+	/* PQ's reference white on the user's brightness (dcp_edr_pq_sdr()) */
+	if (dcp->output_edr)
+		sdr = dcp_edr_pq_sdr(sdr);
 	cap = dcp_edr_target(READ_ONCE(dcp->panel.peak_nits), sdr, dcp->panel.edr_ceiling);
 	if (dcp->output_edr)
 		target = cap;

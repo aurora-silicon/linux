@@ -55,6 +55,7 @@
 #include "apple_resume.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp.h"
+#include "dcp-edr.h"
 #include "plane.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
@@ -1204,14 +1205,13 @@ static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 };
 
 /*
- * A desktop 26.x panel shows PQ as EDR (see dcp_edr_prepare()): PQ 100 cd/m²
- * lands on the white the backlight sets, and brighter levels use the
- * headroom above it, up to the panel's peak. macOS uses the panel the same
- * way. PQ_REFERENCE_LUMINANCE tells a compositor where that white is in PQ,
- * so it can put its reference white there and keep using the backlight as
- * the brightness control in PQ.
+ * A panel shows PQ as EDR (see dcp_edr_prepare() and dcp_edr_pq_sdr()): PQ
+ * DCP_EDR_PQ_REFERENCE_NITS lands on the white the backlight sets, and
+ * brighter levels use the headroom above it, up to the panel's peak. macOS
+ * uses the panel the same way. PQ_REFERENCE_LUMINANCE tells a compositor
+ * where that white is in PQ, so it can put its reference white there and
+ * keep using the backlight as the brightness control in PQ.
  */
-#define DCP_EDR_PQ_REFERENCE_NITS	100
 
 static int apple_connector_attach_pq_reference(struct drm_connector *connector)
 {

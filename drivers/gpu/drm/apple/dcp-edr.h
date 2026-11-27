@@ -45,6 +45,27 @@ static inline u32 dcp_edr_ceiling(u32 fixed)
 	return hm > DCP_EDR_UNITY && hm <= U32_MAX ? hm : 0;
 }
 
+/*
+ * PQ levels in EDR.  The firmware shows PQ 100 cd/m^2 at SDR white, the level
+ * a swap's brightness sets, and brighter PQ levels in the headroom above it.
+ * Compositors put SDR content at the PQ reference white of ITU-R BT.2408,
+ * 203 cd/m^2 (Mutter and KWin by default), and turn the backlight over to
+ * that reference white in HDR.  Taken as is, SDR content then shows at 2.03
+ * times the user's brightness, up to the panel's peak.  So while PQ is shown
+ * the firmware is given SDR white x 100 / 203: PQ 203 lands on the user's
+ * brightness, and only brighter levels use the headroom, as macOS shows SDR
+ * content in EDR.  PQ_REFERENCE_LUMINANCE tells compositors the same.
+ */
+#define DCP_EDR_FW_UNITY_NITS		100U
+#define DCP_EDR_PQ_REFERENCE_NITS	203U
+
+/* The SDR white to hand the firmware for @sdr nits while PQ is shown */
+static inline u32 dcp_edr_pq_sdr(u32 sdr)
+{
+	return sdr ? max_t(u32, 1, DIV_ROUND_CLOSEST_ULL((u64)sdr * DCP_EDR_FW_UNITY_NITS,
+							 DCP_EDR_PQ_REFERENCE_NITS)) : 0;
+}
+
 /* The headroom the panel has above @sdr nits: peak / sdr, up to @ceiling. */
 static inline u32 dcp_edr_target(u32 peak, u32 sdr, u32 ceiling)
 {
