@@ -224,14 +224,13 @@ def main():
     gpu_states = dt_states or [1, 2, 4, 5, 0, 0, 0, 3]
     gpu_busy = dt_busy or [160, 500, 800]
 
-    # Parse T6050's shared CLPC node when present.
+    # Parse T6050's shared CLPC node directly; both DT properties are required.
     t6050_dts = (ROOT / 'arch/arm64/boot/dts/apple/t6050-die0.dtsi').read_text()
     t6050_clpc_node = item(t6050_dts, 'clpc: performance-controller@1 {')
-    t6050_dt_states = cells(t6050_clpc_node, 'apple,gpu-busy-memory-states')
-    t6050_dt_busy = cells(t6050_clpc_node, 'apple,gpu-busy-permille')
-    assert (t6050_dt_states is None) == (t6050_dt_busy is None)
-    t6050_states = t6050_dt_states or [1, 2, 4, 6, 0, 0, 0, 2]
-    t6050_busy = t6050_dt_busy or [160, 500, 800]
+    t6050_states = cells(t6050_clpc_node, 'apple,gpu-busy-memory-states')
+    t6050_busy = cells(t6050_clpc_node, 'apple,gpu-busy-permille')
+    assert t6050_states and t6050_busy, \
+        't6050-die0.dtsi clpc node must define both gpu-busy DT properties'
 
     t6041_dt = (
         'static const u32 t6041_gpu_states[] = {' + ', '.join(str(x) for x in gpu_states) + '};\n'
