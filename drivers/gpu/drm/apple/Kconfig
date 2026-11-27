@@ -46,9 +46,10 @@ config DRM_APPLE_HDCP
 	  Support the standard "Content Protection" and "HDCP Content Type"
 	  connector properties on external DisplayPort, HDMI and USB-C
 	  outputs. The SEP holds the transmitter's keys and does the HDCP 2.2
-	  cryptography; DCP carries the messages to the receiver. Sessions
-	  run only with the appledrm.hdcp module parameter set and the SEP
-	  HDCP service (APPLE_SEP_HDCP_INTERFACE) available.
+	  cryptography; DCP carries the messages to the receiver. The
+	  property is attached on display processors whose device tree node
+	  has "apple,hdcp-channels", with the SEP HDCP service
+	  (APPLE_SEP_HDCP_INTERFACE) built in.
 
 config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"

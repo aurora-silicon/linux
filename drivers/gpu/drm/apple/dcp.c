@@ -5544,8 +5544,8 @@ void dcp_poweroff(struct platform_device *pdev)
 	bool display_gone = false;
 	int ret;
 
-	/* DPMS off ends any HDCP session; the next power-on starts another. */
-	dcp_hdcp_link_changed(dcp);
+	/* DPMS off ends any HDCP session before the pipe goes down; the next power-on starts another. */
+	dcp_hdcp_quiesce(dcp);
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
@@ -9934,7 +9934,8 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	bool was_off;
 	int ret;
 
-	dcp_hdcp_link_changed(dcp);
+	/* Encryption off and the HDCP session ended while DCP still runs. */
+	dcp_hdcp_quiesce(dcp);
 
 	/*
 	 * Not bound into the display subsystem (a component unbind released the RTKit

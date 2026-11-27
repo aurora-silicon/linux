@@ -82,7 +82,7 @@ static void glue_declined_open_forgets_slot(struct kunit *test)
 	INIT_WORK(&g->h.event_work, dcp_hdcp_event_work);
 	INIT_WORK(&g->h.teardown_work, dcp_hdcp_teardown_work);
 	INIT_WORK(&g->h.prop_work, dcp_hdcp_prop_work);
-	INIT_DELAYED_WORK(&g->h.kick_work, dcp_hdcp_kick_work);
+	INIT_WORK(&g->h.caps_work, dcp_hdcp_caps_work);
 	g->h.session = &g->service;
 
 	/* Nothing asks for protection here: the open is declined. */
@@ -124,11 +124,47 @@ static void glue_hdcp1_session_declined(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_hdcp_is_hdcp1(&g->h, &g->service));
 }
 
+/* A teardown asked for before DCP opened a newer session leaves that session alone. */
+static void glue_stale_teardown_skipped(struct kunit *test)
+{
+	struct glue_fixture *g = glue_new(test, true);
+
+	spin_lock_init(&g->h.svc_lock);
+	g->h.td_seq = 1;
+	g->h.open_seq = 2;
+	g->h.tx.sep_open = true;
+	dcp_hdcp_teardown_work(&g->h.teardown_work);
+	KUNIT_EXPECT_TRUE(test, g->h.tx.sep_open);
+}
+
+/* Unbind stops all work and unpublishes the state. */
+static void glue_fini_unpublishes(struct kunit *test)
+{
+	struct glue_fixture *g = glue_new(test, true);
+
+	mutex_init(&g->h.lock);
+	spin_lock_init(&g->h.svc_lock);
+	init_waitqueue_head(&g->h.ev_wq);
+	INIT_WORK(&g->h.event_work, dcp_hdcp_event_work);
+	INIT_WORK(&g->h.teardown_work, dcp_hdcp_teardown_work);
+	INIT_WORK(&g->h.prop_work, dcp_hdcp_prop_work);
+	INIT_WORK(&g->h.relay_work, dcp_hdcp_relay_work);
+	INIT_WORK(&g->h.caps_work, dcp_hdcp_caps_work);
+	dcp_hdcp_fini(&g->dcp);
+	KUNIT_EXPECT_NULL(test, READ_ONCE(g->dcp.hdcp));
+	KUNIT_EXPECT_TRUE(test, g->h.cancel);
+	/* Work queued after unbind never runs. */
+	KUNIT_EXPECT_FALSE(test, queue_work(system_wq, &g->h.teardown_work));
+	KUNIT_EXPECT_NULL(test, dcp_hdcp_match_service(&g->ep, "dcpdp-device-epic", false));
+}
+
 static struct kunit_case dcp_hdcp_glue_cases[] = {
 	KUNIT_CASE(glue_match_by_name),
 	KUNIT_CASE(glue_session_without_hdcp_declines),
 	KUNIT_CASE(glue_declined_open_forgets_slot),
 	KUNIT_CASE(glue_hdcp1_session_declined),
+	KUNIT_CASE(glue_stale_teardown_skipped),
+	KUNIT_CASE(glue_fini_unpublishes),
 	{ }
 };
 

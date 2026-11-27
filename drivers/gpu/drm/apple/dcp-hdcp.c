@@ -13,8 +13,9 @@
  * seen here: only the protocol fields the HDCP 2.2 messages carry in the
  * clear.
  *
- * Off unless appledrm.hdcp=1: the property is not attached and DCP's
- * sessions are declined, as before.
+ * Only a display processor whose node has "apple,hdcp-channels" takes
+ * part; elsewhere the property is not attached and nothing changes. While
+ * userspace does not ask for protection, DCP's sessions are declined.
  */
 
 #include <linux/apple-sep-hdcp.h>
@@ -45,15 +46,14 @@
 #include "dcp-hdcp-wire.h"
 #include "dcp-internal.h"
 
-static bool hdcp;
-module_param(hdcp, bool, 0444);
-MODULE_PARM_DESC(hdcp, "HDCP 2.2 on external outputs: attach Content Protection and take DCP's authentication sessions (needs the SEP HDCP service)");
 
-/* How long a register access may take: DCP's AUX timeout, and some. */
+/*
+ * How long a register access may take: DCP applies its own AUX timeout
+ * (DCP_HDCP_REG_TIMEOUT_MS, carried in the request); the extra 500 ms covers
+ * the mailbox round trip, so a slow transaction ends with DCP's answer, not
+ * ours. Not a spec value.
+ */
 #define DCP_HDCP_CALL_MS	(DCP_HDCP_REG_TIMEOUT_MS + 500)
-/* Asking DCP for a session again, while one is wanted and none came. */
-#define DCP_HDCP_KICK_MS	5000
-#define DCP_HDCP_KICKS		6
 /* The receiver's status on an encrypted link. */
 #define DCP_HDCP_IFACES		4
 #define DCP_HDCP_QUEUE		16
@@ -98,8 +98,10 @@ struct dcp_hdcp {
 	struct work_struct teardown_work;
 	struct work_struct prop_work;
 	struct work_struct relay_work;
-	struct delayed_work kick_work;
-	unsigned int kicks;
+	struct work_struct caps_work;
+	/* Accepted session opens; a teardown older than the latest is stale. */
+	unsigned int open_seq;
+	unsigned int td_seq;
 
 	struct dcp_hdcp_tx tx;
 };
@@ -382,12 +384,10 @@ static void dcp_hdcp_apply(struct dcp_hdcp *h, enum dcp_hdcp_action action)
 	if (action == DCP_HDCP_TEARDOWN) {
 		spin_lock_irqsave(&h->svc_lock, flags);
 		h->cancel = true;
+		h->td_seq = h->open_seq;
 		spin_unlock_irqrestore(&h->svc_lock, flags);
 		wake_up_all(&h->ev_wq);
 		queue_work(h->wq, &h->teardown_work);
-	} else if (action == DCP_HDCP_KICK) {
-		h->kicks = 0;
-		mod_delayed_work(h->wq, &h->kick_work, 0);
 	}
 	queue_work(h->wq, &h->prop_work);
 }
@@ -437,21 +437,16 @@ static void dcp_hdcp_prop_work(struct work_struct *work)
 	drm_modeset_unlock(&drm->mode_config.connection_mutex);
 }
 
-/* Asks DCP for a session through the HDCP interfaces, while one is wanted. */
-static void dcp_hdcp_kick_work(struct work_struct *work)
+/*
+ * The transmitter's capability, once per HDCP interface after it opens (as
+ * macOS does at boot): DCP then offers sessions at each link-up.
+ */
+static void dcp_hdcp_caps_work(struct work_struct *work)
 {
-	struct dcp_hdcp *h = container_of(to_delayed_work(work), struct dcp_hdcp,
-					  kick_work);
+	struct dcp_hdcp *h = container_of(work, struct dcp_hdcp, caps_work);
 	struct apple_epic_service *service;
-	bool ready;
 	int i;
 
-	mutex_lock(&h->lock);
-	ready = dcp_hdcp_ready(&h->link, jiffies);
-	mutex_unlock(&h->lock);
-	if (!ready || h->kicks >= DCP_HDCP_KICKS)
-		return;
-	h->kicks++;
 	for (i = 0; i < DCP_HDCP_IFACES; i++) {
 		service = dcp_hdcp_pin(h, &h->iface[i]);
 		if (!service)
@@ -460,10 +455,8 @@ static void dcp_hdcp_kick_work(struct work_struct *work)
 				    DCP_HDCP_IF_CAPS_LEN, DCP_HDCP_IF_CAPS_VALUE);
 		afk_service_put(service);
 	}
-	queue_delayed_work(h->wq, &h->kick_work, msecs_to_jiffies(DCP_HDCP_KICK_MS));
 }
 
-/* Encryption off, the SEP session closed, DCP told; the picture stays. */
 /* Tells the DP device service the session it was asked for has ended. */
 static void dcp_hdcp_dev_end(struct dcp_hdcp *h)
 {
@@ -479,11 +472,23 @@ static void dcp_hdcp_dev_end(struct dcp_hdcp *h)
 	afk_service_put(relay);
 }
 
+/* Encryption off, the SEP session closed, DCP told; the picture stays. */
 static void dcp_hdcp_teardown_work(struct work_struct *work)
 {
 	struct dcp_hdcp *h = container_of(work, struct dcp_hdcp, teardown_work);
-	bool was_open = h->tx.sep_open;
+	unsigned long flags;
+	bool was_open, stale;
 
+	/*
+	 * A session DCP opened after this teardown was asked for has already
+	 * replaced what it would end (dcp_hdcp_run() aborts a leftover first).
+	 */
+	spin_lock_irqsave(&h->svc_lock, flags);
+	stale = h->open_seq != h->td_seq;
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	if (stale)
+		return;
+	was_open = h->tx.sep_open;
 	dcp_hdcp_abort(&h->tx);
 	if (was_open)
 		dcp_hdcp_report(h, DCP_HDCP_PROGRESS_IDLE, false, false, false);
@@ -508,6 +513,9 @@ static void dcp_hdcp_run(struct dcp_hdcp *h)
 		return;
 	}
 	mutex_unlock(&h->lock);
+	/* What an earlier session left open (its teardown has not run yet). */
+	if (h->tx.sep_open)
+		dcp_hdcp_abort(&h->tx);
 	h->tx.ops = &dcp_hdcp_tx_ops;
 	h->tx.ctx = h;
 	h->tx.channel = h->channel;
@@ -543,12 +551,22 @@ static void dcp_hdcp_run(struct dcp_hdcp *h)
 
 static void dcp_hdcp_close(struct dcp_hdcp *h, struct apple_epic_service *service)
 {
+	enum dcp_hdcp_action action;
 	unsigned long flags;
+	bool ours;
 
+	/* A close of an earlier session, after DCP opened a newer one: nothing to end. */
+	spin_lock_irqsave(&h->svc_lock, flags);
+	ours = !h->session || h->session == service;
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	if (!ours)
+		return;
 	dcp_hdcp_abort(&h->tx);
 	mutex_lock(&h->lock);
-	dcp_hdcp_closed(&h->link, h->session_gen, jiffies);
+	action = dcp_hdcp_closed(&h->link, h->session_gen, jiffies);
 	mutex_unlock(&h->lock);
+	if (action != DCP_HDCP_TEARDOWN)
+		dcp_hdcp_apply(h, action);
 	/* The session goes back to idle on DCP's side. */
 	if (service)
 		dcp_hdcp_report(h, DCP_HDCP_PROGRESS_IDLE, false, false, false);
@@ -682,13 +700,12 @@ static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 			h->ev_bits = 0;
 			h->closed = false;
 			h->cancel = false;
+			h->open_seq++;
 		} else if (h->session == service) {
 			/* The slot of an earlier session, declined this time. */
 			h->session = NULL;
 		}
 		spin_unlock_irqrestore(&h->svc_lock, flags);
-		if (accept)
-			cancel_delayed_work(&h->kick_work);
 	}
 	ret = dcp_hdcp_auth_reply(group, command, data, size, reply, room,
 				  accept);
@@ -816,9 +833,7 @@ static void dcp_hdcp_iface_init(struct apple_epic_service *service,
 		}
 	}
 	spin_unlock_irqrestore(&h->svc_lock, flags);
-	/* The capability goes out once the interface is open, as the first kick. */
-	h->kicks = 0;
-	mod_delayed_work(h->wq, &h->kick_work, 0);
+	queue_work(h->wq, &h->caps_work);
 }
 
 static void dcp_hdcp_iface_teardown(struct apple_epic_service *service)
@@ -992,7 +1007,7 @@ struct dcp_hdcp *dcp_hdcp_init(struct apple_dcp *dcp)
 	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
 	u32 channel;
 
-	if (h || !hdcp || dcp_has_panel(dcp) || !dcp_hdcp_channel(dcp, &channel))
+	if (h || dcp_has_panel(dcp) || !dcp_hdcp_channel(dcp, &channel))
 		return h;
 	h = devm_kzalloc(dcp->dev, sizeof(*h), GFP_KERNEL);
 	if (!h)
@@ -1006,8 +1021,9 @@ struct dcp_hdcp *dcp_hdcp_init(struct apple_dcp *dcp)
 	INIT_WORK(&h->teardown_work, dcp_hdcp_teardown_work);
 	INIT_WORK(&h->prop_work, dcp_hdcp_prop_work);
 	INIT_WORK(&h->relay_work, dcp_hdcp_relay_work);
-	INIT_DELAYED_WORK(&h->kick_work, dcp_hdcp_kick_work);
-	h->wq = alloc_ordered_workqueue("apple-dcp-hdcp", WQ_FREEZABLE);
+	INIT_WORK(&h->caps_work, dcp_hdcp_caps_work);
+	/* Not freezable: a suspend's teardown must reach DCP before it sleeps. */
+	h->wq = alloc_ordered_workqueue("apple-dcp-hdcp", 0);
 	if (!h->wq)
 		return NULL;
 	if (devm_add_action_or_reset(dcp->dev, dcp_hdcp_destroy_wq, h->wq))
@@ -1020,9 +1036,15 @@ struct dcp_hdcp *dcp_hdcp_init(struct apple_dcp *dcp)
 	return h;
 }
 
+/*
+ * Component unbind: the state is device-managed and goes with the bind, so
+ * nothing may reach it afterwards. Stop all work, end what is open, shut the
+ * endpoints this file started, and unpublish it.
+ */
 void dcp_hdcp_fini(struct apple_dcp *dcp)
 {
 	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
+	struct apple_dcp_afkep *ep;
 	unsigned long flags;
 
 	if (!h)
@@ -1031,9 +1053,34 @@ void dcp_hdcp_fini(struct apple_dcp *dcp)
 	h->cancel = true;
 	spin_unlock_irqrestore(&h->svc_lock, flags);
 	wake_up_all(&h->ev_wq);
-	cancel_delayed_work_sync(&h->kick_work);
-	flush_workqueue(h->wq);
+	disable_work_sync(&h->event_work);
+	disable_work_sync(&h->teardown_work);
+	disable_work_sync(&h->prop_work);
+	disable_work_sync(&h->relay_work);
+	disable_work_sync(&h->caps_work);
 	dcp_hdcp_abort(&h->tx);
+	dcp_hdcp_dev_end(h);
+	ep = xchg(&h->if_ep, NULL);
+	if (ep)
+		afk_shutdown(ep);
+	ep = xchg(&h->dpdev_ep, NULL);
+	if (ep)
+		afk_shutdown(ep);
+	WRITE_ONCE(dcp->hdcp, NULL);
+}
+
+/*
+ * Before DCP sleeps or powers a pipe down: the link change, then its
+ * teardown done here, so encryption is off and DCP has the device service's
+ * end call before it waits for it.
+ */
+void dcp_hdcp_quiesce(struct apple_dcp *dcp)
+{
+	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
+
+	dcp_hdcp_link_changed(dcp);
+	if (h)
+		flush_work(&h->teardown_work);
 }
 
 /* DRM. */
@@ -1046,7 +1093,7 @@ int dcp_hdcp_attach_connector(struct apple_connector *connector,
 	unsigned int i;
 	int ret;
 
-	if (!hdcp || connector->hdcp_attached ||
+	if (connector->hdcp_attached ||
 	    connector_type == DRM_MODE_CONNECTOR_eDP)
 		return 0;
 	for (i = 0; i < n; i++) {

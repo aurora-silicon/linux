@@ -18,7 +18,10 @@
  * specification asks for it. It never touches the display.
  *
  * DCP owns the receiver timeouts and closes an attempt that runs out of
- * time; the waits below only guard against a session DCP forgets.
+ * time; the waits below only guard against a session DCP forgets. An event
+ * travels receiver CP_IRQ -> DCP -> mailbox -> this driver's work queue on
+ * top of the spec time, so the guard is the spec time plus this slack; it is
+ * not a spec value and only decides when RxStatus is read as a fallback.
  */
 #define DCP_HDCP_EVENT_SLACK_MS		500
 /* Locality check attempts, each with a fresh r_n. */

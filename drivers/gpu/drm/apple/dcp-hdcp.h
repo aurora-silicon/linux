@@ -60,7 +60,7 @@ enum dcp_hdcp_state {
 enum dcp_hdcp_action {
 	DCP_HDCP_NONE,
 	DCP_HDCP_TEARDOWN,	/* encryption off and close, display untouched */
-	DCP_HDCP_KICK,		/* ask DCP for a session */
+	DCP_HDCP_KICK,		/* ready: the next session DCP offers is taken */
 };
 
 struct dcp_hdcp_link {

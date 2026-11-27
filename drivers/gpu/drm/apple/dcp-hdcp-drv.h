@@ -36,6 +36,8 @@ dcp_hdcp_match_service(struct apple_dcp_afkep *ep, const char *service_name,
 		       bool cut);
 /* Hotplug, power off or on, suspend, a new route: a new link generation. */
 void dcp_hdcp_link_changed(struct apple_dcp *dcp);
+/* The same, and its teardown finished before returning (suspend, DPMS off). */
+void dcp_hdcp_quiesce(struct apple_dcp *dcp);
 
 int dcp_hdcp_attach_connector(struct apple_connector *connector,
 			      struct platform_device **dcps, unsigned int n,
@@ -61,6 +63,7 @@ dcp_hdcp_match_service(struct apple_dcp_afkep *ep, const char *service_name,
 }
 
 static inline void dcp_hdcp_link_changed(struct apple_dcp *dcp) { }
+static inline void dcp_hdcp_quiesce(struct apple_dcp *dcp) { }
 static inline int dcp_hdcp_attach_connector(struct apple_connector *connector,
 					    struct platform_device **dcps,
 					    unsigned int n, int connector_type)
