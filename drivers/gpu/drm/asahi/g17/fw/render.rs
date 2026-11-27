@@ -47,10 +47,10 @@ pub(crate) const RENDER_KICK_EVENT_MASK: [u64; 4] = [0; 4];
 /// from it rather than addresses.
 const USER_BASE: u64 = 0x10_0000_0000;
 /// The VDM control-stream register holds a 39-bit offset from [`USER_BASE`].
-const VDM_OFFSET_LIMIT: u64 = 1 << 39;
+pub(super) const VDM_OFFSET_LIMIT: u64 = 1 << 39;
 /// The deflake (context) buffer holds three sub-buffers: at its start and at two offsets
 /// that follow the control words of each cluster.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Deflake {
     /// Offsets of the second and third sub-buffers.
     pub(crate) sub: [u64; 2],
@@ -174,7 +174,7 @@ const ZLS_COMPRESS_DEPTH: u64 = 1 << 6;
 const ZLS_COMPRESS_STENCIL: u64 = 1 << 8;
 /// Bits of the main word a partial render sets for itself.
 const ZLS_PARTIAL_CLEAR: u64 = ZLS_COMPRESS_DEPTH | ZLS_COMPRESS_STENCIL | 0xf << 56;
-const STENCIL_CLEAR_BASE: u32 = 0x300;
+pub(super) const STENCIL_CLEAR_BASE: u32 = 0x300;
 /// Value of the ZLS swizzle registers and descriptor field.
 const ZLS_SWIZZLE: u32 = 0x0404_0404;
 /// Value of register 0x15359 in the partial store and resume arrays; the
@@ -184,10 +184,10 @@ const UNK_15359_PARTIAL: u64 = 0x20;
 /// +0x1f50.
 const UNK_15049: u64 = 0x10_0000;
 /// USC program offsets carry tag bits that are not part of the address.
-const USC_OFFSET_TAG_MASK: u32 = 7;
+pub(super) const USC_OFFSET_TAG_MASK: u32 = 7;
 
 /// A depth or stencil surface.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ZlsSurface {
     /// GPU address of the surface, or zero when it is not attached.
     pub(crate) va: u64,
@@ -200,7 +200,7 @@ pub(crate) struct ZlsSurface {
 }
 
 /// A USC program and the resource specifier it is launched with.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UscProgram {
     /// Tagged offset of the program in the queue's USC window.
     pub(crate) offset: u32,
@@ -209,7 +209,7 @@ pub(crate) struct UscProgram {
 }
 
 /// Render-pass state from the userspace command.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderPass {
     /// Width of the render target in pixels.
     pub(crate) width: u32,
@@ -295,7 +295,7 @@ pub(crate) struct RenderPass {
 }
 
 /// Kernel-owned objects and identities a render pass uses.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderResources {
     /// UAT context the pass runs in.
     pub(crate) context_id: u16,
@@ -365,7 +365,7 @@ pub(crate) struct RenderResources {
 }
 
 /// Per-stage inputs of a render pass.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderStage {
     /// Queue the stage is kicked on.
     pub(crate) qid: u8,
@@ -408,7 +408,7 @@ pub(crate) struct RenderArgs<'a> {
 impl RenderArgs<'_> {
     /// Completion stamp value of this pass: the pass's sequence number is the
     /// pair's submission ordinal plus one.
-    fn stamp_value(&self) -> u32 {
+    pub(super) fn stamp_value(&self) -> u32 {
         stamp_value((self.ordinal as u32).wrapping_add(1))
     }
 }
@@ -581,12 +581,12 @@ impl PassWords {
 }
 
 /// Offset of an address from the user window base.
-fn user_offset(va: u64) -> Result<u64> {
+pub(super) fn user_offset(va: u64) -> Result<u64> {
     va.checked_sub(USER_BASE).ok_or(EINVAL)
 }
 
 /// Offset of an address from the user window base that fits 32 bits.
-fn user_offset32(va: u64) -> Result<u32> {
+pub(super) fn user_offset32(va: u64) -> Result<u32> {
     u32::try_from(user_offset(va)?).map_err(|_| EINVAL)
 }
 
@@ -1257,19 +1257,24 @@ static_assert!(core::mem::offset_of!(TaDescriptor, status_va) == 0x945);
 unsafe impl Zeroable for TaDescriptor {}
 
 impl TaDescriptor {
-    const ARRAY_OFFSET: u64 = core::mem::offset_of!(Self, registers) as u64;
+    pub(super) const ARRAY_OFFSET: u64 = core::mem::offset_of!(Self, registers) as u64;
     const UNK_876: u32 = u32::MAX;
     const UNK_932: u8 = 0x44;
     const UNK_93C: u8 = 1;
-    const UNK_93E_FIRST_KICK: [u8; 2] = [0xd0, 0x91];
+    pub(super) const UNK_93E_FIRST_KICK: [u8; 2] = [0xd0, 0x91];
 
     /// Writes the complete descriptor except the completion link.
+    #[cfg(any(test, CONFIG_KUNIT = "y"))]
     pub(crate) fn write(&mut self, args: &RenderArgs<'_>) -> Result {
+        let geometry = Geometry::new(args.pass)?;
+        let words = PassWords::new(args.pass)?;
+        self.write_with(args, &geometry, &words)
+    }
+
+    fn write_with(&mut self, args: &RenderArgs<'_>, geometry: &Geometry, words: &PassWords) -> Result {
         let pass = args.pass;
         let resources = args.resources;
-        let geometry = Geometry::new(pass)?;
-        let words = PassWords::new(pass)?;
-        let registers = ta_registers(args, &geometry, &words)?;
+        let registers = ta_registers(args, geometry, words)?;
         let deflake_2a0_offset =
             user_offset32(offset_va(resources.deflake_va, args.deflake.sub[1])?)?;
         let array_va = offset_va(args.ta.descriptor_va, Self::ARRAY_OFFSET)?;
@@ -1290,7 +1295,7 @@ impl TaDescriptor {
         self.unk_48 = (args.ordinal as u32).wrapping_add((args.ordinal / 2) as u32);
         if args.programs == RegisterPrograms::V25G83 {
             self.checkpoints = TA_CHECKPOINTS_25G83.map(|count| count + u16::from(scs_register));
-            let (registers, count) = ta_registers_25g83(args, &geometry, &words)?;
+            let (registers, count) = ta_registers_25g83(args, geometry, words)?;
             self.registers.set(array_va, &registers[..count])?;
         } else if scs_register {
             self.registers.set(array_va, &registers)?;
@@ -1548,7 +1553,7 @@ unsafe impl Zeroable for FragmentDescriptor {}
 
 impl FragmentDescriptor {
     /// Offset of register array `index` within the descriptor.
-    const fn array_offset(index: usize) -> u64 {
+    pub(super) const fn array_offset(index: usize) -> u64 {
         (core::mem::offset_of!(Self, arrays) + index * size_of::<RegisterArray>()) as u64
     }
 
@@ -1609,99 +1614,11 @@ impl FragmentSlot {
     ///
     /// The spill table is left as it is: a kick entry names it only after
     /// [`Self::set_mcache`] rewrote it, so stale bytes there are never read.
+    #[cfg(any(test, CONFIG_KUNIT = "y"))]
     pub(crate) fn write(&mut self, args: &RenderArgs<'_>) -> Result {
-        let pass = args.pass;
-        let resources = args.resources;
-        let geometry = Geometry::new(pass)?;
-        let words = PassWords::new(pass)?;
-        let base = args.fragment.descriptor_va;
-        let array_va = |index| offset_va(base, FragmentDescriptor::array_offset(index));
-        let arrays = [array_va(0)?, array_va(1)?, array_va(2)?, array_va(3)?];
-        let timestamp_end_va = timestamp_end_va(resources.timestamp_va)?;
-        let desc = &mut self.descriptor;
-
-        clear(desc);
-        desc.tag = CommandTag::Fragment as u32;
-        desc.submit_sequence = args.ordinal.wrapping_mul(2);
-        desc.context_id = resources.context_id.into();
-        desc.kick_record_va = resources.kick_record_va;
-        desc.pb_va = resources.pb_va;
-        desc.scene_va = resources.scene_va;
-        desc.scene_end_va = resources.scene_end_va;
-        desc.tilemap_va = resources.tilemap_va;
-        desc.msaa_control = pass.msaa_control;
-        desc.samples = 1 << pass.samples_log2;
-        desc.macro_size = geometry.macro_size as u32;
-        desc.merge_upper_x = pass.merge_upper_x;
-        desc.merge_upper_y = pass.merge_upper_y;
-        desc.tiles = geometry.tiles_x * geometry.tiles_y;
-        let scs_register = args.ray_query[1].scratch.enabled();
-        let extra = u16::from(scs_register);
-        desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
-        desc.entries = FRAGMENT_REGISTERS as u16 + extra;
-        let registers = fragment_registers(args, &geometry, &words);
-        if args.programs == RegisterPrograms::V25G83 {
-            desc.checkpoints = FRAGMENT_CHECKPOINTS_25G83.map(|count| count + extra);
-            desc.entries = FRAGMENT_REGISTERS_25G83 as u16 + extra;
-            let (registers, count) = fragment_registers_25g83(args, &geometry, &words)?;
-            desc.arrays[0].set(arrays[0], &registers[..count])?;
-        } else if scs_register {
-            desc.arrays[0].set(arrays[0], &registers)?;
-        } else {
-            desc.arrays[0].set_without(arrays[0], &registers, FRAGMENT_SCS_ENABLE_INDEX)?;
-        }
-        desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
-        desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;
-        desc.arrays[3].set(arrays[3], &partial_load_registers(pass, &words))?;
-        desc.depth_bias_va = pass.depth_bias_va;
-        desc.scissor_va = pass.scissor_va;
-        desc.occlusion_query_va = pass.occlusion_query_va;
-        desc.bg_rsrc_spec = words.bg_rsrc_spec;
-        desc.bg_va = words.bg_va;
-        desc.partial_bg_rsrc_spec = words.partial_bg_rsrc_spec;
-        desc.partial_bg_va = words.partial_bg_va;
-        desc.zls_swizzle = ZLS_SWIZZLE;
-        desc.tib_blocks = words.tib_blocks;
-        desc.aux_fb_flags = words.aux_fb_flags;
-        desc.width = pass.width;
-        desc.height = pass.height;
-        desc.unk_1f50 = UNK_15049;
-        desc.tile_config = words.tile_config;
-        desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
-        desc.eot_va = words.eot_va;
-        desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
-        desc.partial_eot_va = words.partial_eot_va;
-        desc.depth_clear = pass.depth_clear;
-        desc.unk_1fac = words.tib_blocks << Self::UNK_1FAC_TIB_SHIFT | Self::UNK_1FAC_BASE;
-        desc.unk_2104 = resources.unk_2104;
-        desc.predecessor_id = resources.fragment_ids.predecessor;
-        desc.unk_210c = resources.unk_210c;
-        desc.unk_2110 = Self::UNK_2110;
-        desc.unk_2124 = Self::UNK_2124;
-        desc.stamp_va = args.fragment.stamp_va;
-        desc.aux_stamp_va = args.fragment.aux_stamp_va;
-        desc.stamp_value = args.stamp_value();
-        desc.qid = args.fragment.qid.into();
-        desc.first_kick = u32::from(args.ordinal == 0);
-        desc.current_id = resources.fragment_ids.current.into();
-        desc.ordinal = args.ordinal as u32;
-        desc.timestamp_start_va = resources.timestamp_va;
-        desc.timestamp_end_va = timestamp_end_va;
-        desc.unk_21a8[..8].copy_from_slice(&resources.timestamp_window[2].to_le_bytes());
-        desc.unk_21a8[8..16].copy_from_slice(&resources.timestamp_window[3].to_le_bytes());
-        desc.unk_21cc = match args.programs == RegisterPrograms::V25G83 {
-            true => FRAGMENT_SLOT_INDEX_25G83 + u8::from(args.ray_query[1].scratch.enabled()),
-            false => Self::UNK_21CC,
-        };
-        desc.free_list_control_va = resources.free_list_control_va;
-        desc.unk_21d6 = Self::UNK_21D6;
-        desc.status_va = resources.fragment_status_va;
-        desc.status_fw_va = resources.fragment_status_fw_va;
-        desc.context_generation = resources.context_generation;
-        desc.unk_2208 = Self::UNK_2208;
-        desc.unk_220c = Self::UNK_220C;
-        desc.unk_222d = Self::UNK_222D;
-        Ok(())
+        let geometry = Geometry::new(args.pass)?;
+        let words = PassWords::new(args.pass)?;
+        write_fragment_descriptor(&mut self.descriptor, args, &geometry, &words)
     }
 
     /// Links the pass to the timestamp of its fragment kick.
@@ -1752,6 +1669,125 @@ impl FragmentSlot {
         }
         Ok(Some(table))
     }
+}
+
+fn write_fragment_descriptor(
+    desc: &mut FragmentDescriptor,
+    args: &RenderArgs<'_>,
+    geometry: &Geometry,
+    words: &PassWords,
+) -> Result {
+    let pass = args.pass;
+    let resources = args.resources;
+    let base = args.fragment.descriptor_va;
+    let array_va = |index| offset_va(base, FragmentDescriptor::array_offset(index));
+    let arrays = [array_va(0)?, array_va(1)?, array_va(2)?, array_va(3)?];
+    let timestamp_end_va = timestamp_end_va(resources.timestamp_va)?;
+
+    clear(desc);
+    desc.tag = CommandTag::Fragment as u32;
+    desc.submit_sequence = args.ordinal.wrapping_mul(2);
+    desc.context_id = resources.context_id.into();
+    desc.kick_record_va = resources.kick_record_va;
+    desc.pb_va = resources.pb_va;
+    desc.scene_va = resources.scene_va;
+    desc.scene_end_va = resources.scene_end_va;
+    desc.tilemap_va = resources.tilemap_va;
+    desc.msaa_control = pass.msaa_control;
+    desc.samples = 1 << pass.samples_log2;
+    desc.macro_size = geometry.macro_size as u32;
+    desc.merge_upper_x = pass.merge_upper_x;
+    desc.merge_upper_y = pass.merge_upper_y;
+    desc.tiles = geometry.tiles_x * geometry.tiles_y;
+    let scs_register = args.ray_query[1].scratch.enabled();
+    let extra = u16::from(scs_register);
+    desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
+    desc.entries = FRAGMENT_REGISTERS as u16 + extra;
+    let registers = fragment_registers(args, geometry, words);
+    if args.programs == RegisterPrograms::V25G83 {
+        desc.checkpoints = FRAGMENT_CHECKPOINTS_25G83.map(|count| count + extra);
+        desc.entries = FRAGMENT_REGISTERS_25G83 as u16 + extra;
+        let (registers, count) = fragment_registers_25g83(args, geometry, words)?;
+        desc.arrays[0].set(arrays[0], &registers[..count])?;
+    } else if scs_register {
+        desc.arrays[0].set(arrays[0], &registers)?;
+    } else {
+        desc.arrays[0].set_without(arrays[0], &registers, FRAGMENT_SCS_ENABLE_INDEX)?;
+    }
+    desc.arrays[1].set(arrays[1], &partial_store_registers(pass, words))?;
+    desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, words))?;
+    desc.arrays[3].set(arrays[3], &partial_load_registers(pass, words))?;
+    desc.depth_bias_va = pass.depth_bias_va;
+    desc.scissor_va = pass.scissor_va;
+    desc.occlusion_query_va = pass.occlusion_query_va;
+    desc.bg_rsrc_spec = words.bg_rsrc_spec;
+    desc.bg_va = words.bg_va;
+    desc.partial_bg_rsrc_spec = words.partial_bg_rsrc_spec;
+    desc.partial_bg_va = words.partial_bg_va;
+    desc.zls_swizzle = ZLS_SWIZZLE;
+    desc.tib_blocks = words.tib_blocks;
+    desc.aux_fb_flags = words.aux_fb_flags;
+    desc.width = pass.width;
+    desc.height = pass.height;
+    desc.unk_1f50 = UNK_15049;
+    desc.tile_config = words.tile_config;
+    desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
+    desc.eot_va = words.eot_va;
+    desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
+    desc.partial_eot_va = words.partial_eot_va;
+    desc.depth_clear = pass.depth_clear;
+    desc.unk_1fac =
+        words.tib_blocks << FragmentSlot::UNK_1FAC_TIB_SHIFT | FragmentSlot::UNK_1FAC_BASE;
+    desc.unk_2104 = resources.unk_2104;
+    desc.predecessor_id = resources.fragment_ids.predecessor;
+    desc.unk_210c = resources.unk_210c;
+    desc.unk_2110 = FragmentSlot::UNK_2110;
+    desc.unk_2124 = FragmentSlot::UNK_2124;
+    desc.stamp_va = args.fragment.stamp_va;
+    desc.aux_stamp_va = args.fragment.aux_stamp_va;
+    desc.stamp_value = args.stamp_value();
+    desc.qid = args.fragment.qid.into();
+    desc.first_kick = u32::from(args.ordinal == 0);
+    desc.current_id = resources.fragment_ids.current.into();
+    desc.ordinal = args.ordinal as u32;
+    desc.timestamp_start_va = resources.timestamp_va;
+    desc.timestamp_end_va = timestamp_end_va;
+    desc.unk_21a8[..8].copy_from_slice(&resources.timestamp_window[2].to_le_bytes());
+    desc.unk_21a8[8..16].copy_from_slice(&resources.timestamp_window[3].to_le_bytes());
+    desc.unk_21cc = match args.programs == RegisterPrograms::V25G83 {
+        true => FRAGMENT_SLOT_INDEX_25G83 + u8::from(args.ray_query[1].scratch.enabled()),
+        false => FragmentSlot::UNK_21CC,
+    };
+    desc.free_list_control_va = resources.free_list_control_va;
+    desc.unk_21d6 = FragmentSlot::UNK_21D6;
+    desc.status_va = resources.fragment_status_va;
+    desc.status_fw_va = resources.fragment_status_fw_va;
+    desc.context_generation = resources.context_generation;
+    desc.unk_2208 = FragmentSlot::UNK_2208;
+    desc.unk_220c = FragmentSlot::UNK_220C;
+    desc.unk_222d = FragmentSlot::UNK_222D;
+    Ok(())
+}
+
+/// Writes both descriptors of a render pass, deriving [`Geometry`] and
+/// [`PassWords`] once.
+pub(super) fn write_pair(
+    ta: &mut TaDescriptor,
+    fragment: &mut FragmentSlot,
+    args: &RenderArgs<'_>,
+) -> Result {
+    write_pair_descriptors(ta, &mut fragment.descriptor, args)
+}
+
+pub(super) fn write_pair_descriptors(
+    ta: &mut TaDescriptor,
+    fragment: &mut FragmentDescriptor,
+    args: &RenderArgs<'_>,
+) -> Result {
+    let geometry = Geometry::new(args.pass)?;
+    let words = PassWords::new(args.pass)?;
+    ta.write_with(args, &geometry, &words)?;
+    write_fragment_descriptor(fragment, args, &geometry, &words)
 }
 
 #[kunit_tests(asahi_g17_ta_mode)]

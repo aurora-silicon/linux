@@ -76,6 +76,13 @@ impl kernel::debugfs::Writer for View {
         writeln!(f, "execution_contexts_fenced free_waiting={} overruns={}", fenced, overruns)?;
         let [kept, fallbacks] = super::completion::window_counters();
         writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
+        let [t_full, t_patched, t_verified, t_mismatched, t_unmapped] =
+            super::fw::render_template::counters();
+        writeln!(
+            f,
+            "g17_render_template full={} patched={} verified={} mismatched={} unmapped={}",
+            t_full, t_patched, t_verified, t_mismatched, t_unmapped
+        )?;
         let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [
             ("dynamic_lower_bytes", uat.kernel_lower_vm(), uat.kernel_lower_dynamic_range()),

@@ -49,7 +49,7 @@ const V25F84_UNK_0A599_FIRST: u64 = 0x0000_0132_0040_0020;
 /// registers the program writes are the native `generateRegisterList`
 /// formulas use `com.apple.AGXG17P`; the
 /// disabled program keeps the native disabled constants.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScratchRequest {
     pages: u16,
     window: u64,
@@ -251,7 +251,7 @@ impl OperandState {
 /// count.
 const CHECKPOINTS: [u16; 4] = [39, 40, 40, COMPUTE_REGISTERS as u16];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IntersectionTables {
     pub(crate) pool: u64,
     pub(crate) pool_bytes: u64,

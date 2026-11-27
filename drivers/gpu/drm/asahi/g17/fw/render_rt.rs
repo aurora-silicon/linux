@@ -8,7 +8,7 @@ use super::{
 };
 use kernel::prelude::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RayQueryStage {
     pub(crate) intersection: IntersectionTables,
     pub(crate) scratch: ScratchRequest,
