@@ -426,3 +426,8 @@
 &avd {
 	status = "okay";
 };
+
+/* The J773g ADT has no DP855 on spi4. */
+&spi4 {
+	/delete-node/ panel-timing-controller@0;
+};

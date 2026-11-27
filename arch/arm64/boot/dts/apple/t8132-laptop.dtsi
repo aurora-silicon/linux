@@ -187,20 +187,10 @@
 };
 
 /*
- * ADT /arm-io/spi4/dp855: the panel timing controller, chip select from the
- * spi4 function-spi_cs0 (the same pin on the J604 and J713). i2c-dp855 reads
- * the panel management devices behind it and shares its I2C engine with the
- * display firmware through the controller's lock.
+ * ADT /arm-io/spi4/dp855: the panel timing controller. Chip select from the
+ * spi4 function-spi_cs0, the same pin on the J604, J713 and J715.
  */
 &spi4 {
 	cs-gpios = <&pinctrl_ap 76 GPIO_ACTIVE_LOW>;
 	status = "okay";
-
-	panel_controller: panel-timing-controller@0 {
-		compatible = "parade,dp855";
-		reg = <0>;
-		spi-max-frequency = <1000000>;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-	};
 };

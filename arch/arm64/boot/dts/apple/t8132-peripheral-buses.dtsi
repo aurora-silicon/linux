@@ -16,6 +16,21 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 		status = "disabled";
+
+		/*
+		 * The DP855 panel timing controller (ADT /arm-io/spi4/dp855).
+		 * i2c-dp855 reads the panel management devices behind it and
+		 * shares its I2C engine with the display firmware through the
+		 * controller's lock. Boards that have it set the chip select
+		 * and enable spi4.
+		 */
+		panel_controller: panel-timing-controller@0 {
+			compatible = "parade,dp855";
+			reg = <0>;
+			spi-max-frequency = <1000000>;
+			spi-cs-setup-delay-ns = <20>;
+			spi-cs-hold-delay-ns = <20>;
+		};
 	};
 
 	nub_spmi_a1: spmi@388a08000 {
