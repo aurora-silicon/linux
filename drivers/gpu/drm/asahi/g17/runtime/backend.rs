@@ -2,10 +2,11 @@
 
 //! Scheduler callbacks and the off-lock fence boundary of a logical queue.
 
-use super::{Backend, DeferredBatch};
+use super::{Backend, DeferredBatch, PerChannel, Uninstalled};
 use crate::g17::{
     completion::Deferred,
     job::{self, Engine, Packet},
+    queue::compute::Binding,
 };
 use core::sync::atomic::Ordering;
 use kernel::{dma_fence::{Fence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
@@ -34,30 +35,21 @@ impl Backend {
         // No outer preparation lease survives compute_packet's return. Hold a
         // fresh epoch through alias destruction so recovery can join this work.
         loop {
-        let lease = self.shared.preparations.enter(false)?;
-        let mut retired = None;
-        let mut state = self.shared.state.lock();
-        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-        if !lease.is_current() { drop(state); drop(lease); continue; }
-        let mut binding = None;
-        if let Some(index) = firmware.queues.compute.iter().position(|entry| {
-            entry.as_ref().and_then(|entry| entry.queue.as_deref())
-                .is_some_and(|queue| queue.owner() == Some(self.owner))
-        }) {
-            let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
-            let (cancel, replaced) = entry.queue.as_deref_mut().ok_or(EIO)?
-                .rollback_unpublished(self.owner, &self.context)?;
-            binding = replaced;
-            if cancel {
-                retired = entry.queue.take().map(|queue| (entry.reservation, queue));
-            }
-        }
-        drop(state);
-        drop(binding);
-        self.finish_uninstalled_compute(retired)?;
-        self.shared.channels.notify();
-        self.shared.queue_events();
-        return Ok(());
+            let lease = self.shared.preparations.enter(false)?;
+            let mut retired: PerChannel<Uninstalled> = Default::default();
+            let mut bindings: PerChannel<Binding> = Default::default();
+            let mut state = self.shared.state.lock();
+            let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() { drop(state); drop(lease); continue; }
+            let result = firmware.queues.rollback_unpublished_compute(
+                self.owner, &self.context, &mut retired, &mut bindings);
+            drop(state);
+            // Off-lock, and after a failure too: no cancelled queue's reservation stays behind.
+            drop(bindings);
+            let finished = self.finish_retired_compute(&mut retired);
+            self.shared.channels.notify();
+            self.shared.queue_events();
+            return result.and(finished);
         }
     }
 
@@ -97,22 +89,33 @@ impl Backend {
         self.release_outer(Engine::Compute);
         self.release_outer(Engine::Render);
         let mut state = self.shared.state.lock();
+        // The client closes its queue itself now (see `Context::held_by_open_client`).
+        self.context.note_open_client(false);
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
         };
-        // Retain a published scheduler before a never-kicked physical graph is
-        // removed. The teardown entry owns its root until control consumption.
-        firmware
-            .queues
-            .teardown
-            .close(&self.context, super::now_ns())?;
-        firmware.queues.release_compute(self.owner)?;
-        firmware.queues.release_render(self.owner)?;
-        // The armed release holds the owner's pairs from every other owner until it is
-        // consumed. Hold them before admission releases the owner: admission does not take
-        // the device mutex, so a slot released first could be taken in between.
-        firmware.queues.sync_render_holds();
-        firmware.queues.admission.release_owner(self.owner);
+        // A pair of this context that holds guilty work counts for a kill only after a restart
+        // since this close (`Pair::guilty_for_kill`). Only the first close counts: the kernel
+        // may have closed this queue on its client's behalf already (`Firmware::close_failed_owners`),
+        // and its teardown entry may be released and reclaimed since. Closing it again would
+        // release its scheduler twice.
+        if !self.context.is_closed() {
+            // Retain a published scheduler before a never-kicked physical graph is
+            // removed. The teardown entry owns its root until control consumption.
+            firmware
+                .queues
+                .teardown
+                .close(&self.context, super::now_ns())?;
+            // Only now: a close that could not reserve its teardown entry is redone by the next.
+            self.context.note_closed(firmware.recovery.generation());
+            firmware.queues.release_compute(self.owner)?;
+            firmware.queues.release_render(self.owner)?;
+            // The armed release holds the owner's pairs from every other owner until it is
+            // consumed. Hold them before admission releases the owner: admission does not take
+            // the device mutex, so a slot released first could be taken in between.
+            firmware.queues.sync_render_holds();
+            firmware.queues.admission.release_owner(self.owner);
+        }
         drop(state);
         // Its idle channel, or its slot and never-published QID, is free.
         self.shared.channels.notify();
@@ -123,7 +126,7 @@ impl Backend {
 
 impl job::Backend for Backend {
     fn creator_cluster_scheduling(&self) -> bool {
-        self.shared.follows_submitter()
+        self.shared.pin_scheduler_cluster()
     }
     fn host_producer_waits(&self) -> bool {
         self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())
@@ -144,11 +147,20 @@ impl job::Backend for Backend {
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
         let mut publication_waits = KVec::new();
+        let mut unchecked: KVec<usize> = KVec::new();
+        let lease = self.shared.preparations.try_enter().ok();
+        let port_epoch = lease.as_ref().and_then(|lease| {
+            let port = self.shared.port(lease)?;
+            if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
+                return None;
+            }
+            Some(port.generation())
+        });
         for input in inputs.iter().filter_map(|input| input.fence.as_ref()) {
             let status = job::fence_status(input);
             if status > 0 { continue; }
             if status < 0 { return None; }
-            let leaves = sync_input::collect(input)?;
+            let leaves = sync_input::collect_coalesced(input)?;
             for leaf in &leaves {
                 if leaf.status > 0 { continue; }
                 if leaf.status < 0 { return None; }
@@ -160,29 +172,52 @@ impl job::Backend for Backend {
                     continue;
                 }
                 if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
-                let published = {
-                    let state = self.shared.state.lock();
-                    let firmware = state.as_deref()?;
-                    if self.shared.crashed.load(Ordering::Acquire) || firmware.recovery.pending()
-                        || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
-                    { return None; }
-                    firmware.queues.compute.iter().flatten()
-                        .filter_map(|entry| entry.queue.as_deref())
-                        .any(|queue| queue.has_input_source(&submission, self.context.status(),
-                            firmware.recovery.generation()))
-                };
+                let published_fast =
+                    port_epoch.is_some_and(|epoch| submission.has_published_epoch(epoch));
+                let idx = sources.len();
+                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
+                if !published_fast {
+                    unchecked.push(idx, GFP_KERNEL).ok()?;
+                }
+            }
+            heads.push(input.clone(), GFP_KERNEL).ok()?;
+        }
+        drop(lease);
+        if sources.is_empty() { return None; }
+        if !unchecked.is_empty() {
+            // Hoist the device mutex outside the leaf loop when any source was not already
+            // confirmed via the lock-free `PublishedSource` snapshot.
+            let state = self.shared.state.lock();
+            let firmware = state.as_deref()?;
+            if self.shared.crashed.load(Ordering::Acquire)
+                || firmware.recovery.pending()
+                || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
+            {
+                return None;
+            }
+            let generation = firmware.recovery.generation();
+            for idx in unchecked {
+                let submission = &sources[idx].submission;
+                let published = firmware
+                    .queues
+                    .compute
+                    .iter()
+                    .flatten()
+                    .filter_map(|entry| entry.queue.as_deref())
+                    .any(|queue| {
+                        queue.has_input_source(submission, self.context.status(), generation)
+                    });
                 if !published {
-                    if submission.source_status().ok()? { continue; }
+                    if submission.source_status().ok()? {
+                        continue;
+                    }
                     // The existing scheduler fence becomes ready after actual
                     // publication, not GPU completion. No binding loan or
                     // consumer hardware capacity is acquired while waiting.
                     publication_waits.push(submission.ready()?, GFP_KERNEL).ok()?;
                 }
-                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
             }
-            heads.push(input.clone(), GFP_KERNEL).ok()?;
         }
-        if sources.is_empty() { return None; }
         sync_input::Sources::new(heads, sources, publication_waits).ok()
     }
 
@@ -207,9 +242,15 @@ impl job::Backend for Backend {
                 let programs = resources.as_deref().ok_or(EINVAL)?;
                 *plan = Some(policy.plan(programs, priority)?);
                 // The M5 target layout refuses the passes the M5 path cannot run. Derive it
-                // here, so that SUBMIT returns the refusal before anything is queued.
-                crate::g17::queue::render::m5_render_submission::layout(
-                    command, self.shared.clusters, self.shared.variant.programs)?;
+                // here, so that SUBMIT returns the refusal before anything is queued, and keep
+                // the window its pairs reserve for choosing their count (`render_pairs`).
+                let (_, window) =
+                    crate::g17::queue::render::m5_render_submission::layout_and_window(
+                        command, self.shared.clusters, self.shared.variant.programs,
+                        self.shared.m5_board)?;
+                if let Validated::Render { pair_window, .. } = command {
+                    *pair_window = window;
+                }
             }
             Validated::Compute { resources, plan, m5_scratch, cdm_auxiliary_allocation, .. } => {
                 if let Some(programs) = resources {
@@ -225,7 +266,12 @@ impl job::Backend for Backend {
     }
 
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
-        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages, self.pairs)
+        crate::g17::fw::render_rt::required_blocks(
+            self.shared.active_cores,
+            self.shared.clusters,
+            pages,
+            self.pairs,
+        )
     }
 
     fn ensure_compute(&self, command: &crate::g17::command::Validated) -> Result {

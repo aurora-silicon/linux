@@ -139,8 +139,17 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	 */
 	wait_for_completion_timeout(&cpu_running,
 				    msecs_to_jiffies(5000));
-	if (cpu_online(cpu))
+	if (cpu_online(cpu)) {
+		/*
+		 * The CPU has taken its task. Cleared, as kernels before 5.x did, so a core that
+		 * reaches __secondary_switched without a bring-up of its own waits in
+		 * __secondary_too_slow instead of running as this CPU a second time.
+		 */
+		WRITE_ONCE(secondary_data.task, NULL);
+		dcache_clean_inval_poc((unsigned long)&secondary_data,
+				       (unsigned long)&secondary_data + sizeof(secondary_data));
 		return 0;
+	}
 
 	pr_crit("CPU%u: failed to come online\n", cpu);
 	secondary_data.task = NULL;

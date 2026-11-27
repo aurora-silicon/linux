@@ -111,19 +111,19 @@ static DEFINE_SPINLOCK(t8132_ext_lock);
 /* Registered outputs, for t8132_ext_drm_hotplug() (t8132_ext_lock) */
 static struct t8132_ext_out *t8132_ext_live[T8132_EXT_MAX];
 /*
- * Every output initialised, for the layer's one PM notifier, all of one DRM
- * device (t8132_ext_pm_drm, the first to init; a second one's outputs get no
- * sleep handling): set up by its t8132_ext_drm_init(), the notifier registered
- * after them; its t8132_ext_drm_fini() unregisters it before anything is torn
- * down. All under t8132_ext_reg_lock, which the notifier holds throughout:
- * outermost, before any modeset lock, and never held to (un)register the
- * notifier.
+ * Every output initialised, for the sleep handling (t8132_ext_drm_pm_event(),
+ * called from appledrm's one PM notifier, registered at module init), all of
+ * one DRM device (t8132_ext_pm_drm, the first to init; a second one's outputs
+ * get no sleep handling): set up by its t8132_ext_drm_init(), emptied by its
+ * t8132_ext_drm_fini() before anything is torn down. All under
+ * t8132_ext_reg_lock, which the sleep handling holds throughout, so a call
+ * under way finishes before fini empties the registry: outermost, before any
+ * modeset lock.
  */
 static DEFINE_MUTEX(t8132_ext_reg_lock);
 static struct drm_device *t8132_ext_pm_drm;
 static struct t8132_ext_out *t8132_ext_outs[T8132_EXT_MAX];
 static unsigned int t8132_ext_nouts;
-static bool t8132_ext_pm_registered;
 
 static const u32 t8132_ext_formats[] = {
 	DRM_FORMAT_XRGB8888,
@@ -919,7 +919,7 @@ static void t8132_ext_relink_end(struct t8132_ext_out *out)
  * display DART and a frame shown, iomfb_m4_ext_restore_result()) sets the
  * connector's link status BAD and sends a hotplug event: the compositor has
  * to set the mode again. A display released for the sleep was waited for
- * before (t8132_ext_pm_notify()); its connector's hold ends here, and the
+ * before (t8132_ext_drm_pm_event()); its connector's hold ends here, and the
  * hotplug held meanwhile goes out at the end.
  */
 static void t8132_ext_sleep_restore(struct t8132_ext_out *out)
@@ -1012,11 +1012,12 @@ static void t8132_ext_sleep_end(struct t8132_ext_out *out)
 }
 
 /*
- * The layer's one PM notifier, for every output. A refused sleep gets
- * no PM_POST_SUSPEND here (the chain rolls back only the notifiers before
- * this one): the outputs already prepared come back at once.
+ * The layer's sleep handling, for every output, called from appledrm's PM
+ * notifier (apple_drm_pm_notify()). A sleep this refuses gets no
+ * PM_POST_SUSPEND here, since the chain rolls back only the notifiers before
+ * appledrm's: the outputs already prepared come back at once.
  */
-static int t8132_ext_pm_notify(struct notifier_block *nb, unsigned long event, void *unused)
+int t8132_ext_drm_pm_event(unsigned long event)
 {
 	unsigned long deadline;
 	unsigned int i;
@@ -1046,14 +1047,10 @@ static int t8132_ext_pm_notify(struct notifier_block *nb, unsigned long event, v
 	return NOTIFY_DONE;
 }
 
-static struct notifier_block t8132_ext_pm_nb = {
-	.notifier_call = t8132_ext_pm_notify,
-};
-
 /*
  * First in the DRM device's unbind (and its probe's failure paths),
- * before drm_dev_unregister() and any DRM object is torn down: the PM
- * notifier unregistered (a call of it under way finishes first), then every
+ * before drm_dev_unregister() and any DRM object is torn down: the registry
+ * emptied for the sleep handling (a call of it under way finishes first), then every
  * output dying, its work cancelled, and one left in a sleep (no
  * PM_POST_SUSPEND will come) out of it, its connector's hold ended. Only for
  * the DRM device whose outputs these are; called again, nothing.
@@ -1063,19 +1060,15 @@ void t8132_ext_drm_fini(struct drm_device *drm)
 	struct t8132_ext_out *outs[T8132_EXT_MAX];
 	unsigned int n = 0;
 	unsigned long flags;
-	bool mine, reg;
+	bool mine;
 
+	/* A sleep-handling call under way holds the registry lock: it finishes first. */
 	mutex_lock(&t8132_ext_reg_lock);
 	mine = drm && t8132_ext_pm_drm == drm;
-	reg = mine && t8132_ext_pm_registered;
-	mutex_unlock(&t8132_ext_reg_lock);
-	if (!mine)
+	if (!mine) {
+		mutex_unlock(&t8132_ext_reg_lock);
 		return;
-	/* Not under the registry lock: a call under way holds it. */
-	if (reg)
-		unregister_pm_notifier(&t8132_ext_pm_nb);
-	mutex_lock(&t8132_ext_reg_lock);
-	t8132_ext_pm_registered = false;
+	}
 	for (n = 0; n < t8132_ext_nouts; n++) {
 		outs[n] = t8132_ext_outs[n];
 		t8132_ext_outs[n] = NULL;
@@ -1195,7 +1188,7 @@ int t8132_ext_drm_init(struct drm_device *drm)
 	struct device_node *np;
 	unsigned int count = 0;
 	int err;
-	bool mine, reg;
+	bool mine;
 	int ret = 0;
 
 	if (!apple_t8132_firmware_path())
@@ -1228,18 +1221,6 @@ int t8132_ext_drm_init(struct drm_device *drm)
 			count++;
 		put_device(&pdev->dev);
 		ret = ret ?: err;
-	}
-	/*
-	 * After the outputs, not under the registry lock (see there);
-	 * unregistered first by t8132_ext_drm_fini().
-	 */
-	mutex_lock(&t8132_ext_reg_lock);
-	reg = mine && t8132_ext_nouts && !t8132_ext_pm_registered;
-	mutex_unlock(&t8132_ext_reg_lock);
-	if (reg && !register_pm_notifier(&t8132_ext_pm_nb)) {
-		mutex_lock(&t8132_ext_reg_lock);
-		t8132_ext_pm_registered = true;
-		mutex_unlock(&t8132_ext_reg_lock);
 	}
 	if (count || ret)
 		drm_info(drm, "%u T8132 external output(s): %d\n", count, ret);

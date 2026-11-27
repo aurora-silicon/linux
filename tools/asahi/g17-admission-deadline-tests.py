@@ -27,7 +27,7 @@ def fixture():
     source = (ROOT / 'queue/admission.rs').read_text()
     return r'''
 #![allow(dead_code)]
-use std::sync::{Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}};
 type Result<T=()> = std::result::Result<T,i32>;
 const EBUSY:i32=-16;const EIO:i32=-5;const EINVAL:i32=-22;
 const ERESTARTSYS:i32=-512;const ECANCELED:i32=-125;
@@ -41,13 +41,15 @@ mod cfg {pub const RENDER_SLOTS:usize=2;}
 const QUARANTINE_WAIT_MS:u32=1000;
 #[derive(Clone,Copy,PartialEq)] enum Plan {Any,Conflict}
 #[derive(Clone,Copy)] struct Request<'a>(&'a ());
-struct State {owners:[u64;cfg::RENDER_SLOTS],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
+struct State {owners:[u64;cfg::RENDER_SLOTS],released:u64,quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
 impl State {
  fn exhausted(&self)->bool {false}
-''' + item(source, 'fn owner_quarantine(') + r'''
+''' + item(source, 'fn owns_live(') + '\n' + item(source, 'fn owner_quarantine(') + r'''
+ fn owner_released(&self,_:u64)->bool {false}
  fn refusal(&self,_:u64)->Result {Ok(())}
  fn plan(&self,_:u64,_:Option<Request<'_>>,_:Option<u64>)->Plan {if self.conflict {Plan::Conflict}else{Plan::Any}}
  fn pick(&mut self,_:u64,_:usize,_:Plan)->Option<u8> {if self.ready{Some(1)}else{None}}
+ fn pick_for(&mut self,owner:u64,pairs:usize,_:usize,plan:Plan)->Option<u8> {self.pick(owner,pairs,plan)}
  fn record(&mut self,_:u64,slot:Option<u8>,_:u64,_:Request<'_>)->Option<usize> {if slot.is_none(){self.waiters+=1;}Some(0)}
  fn forget_waiter(&mut self,t:Option<u64>){if t.is_some(){self.waiters-=1;}}
 }
@@ -66,12 +68,12 @@ impl CondVar {
   }
  }
 }
-struct Pool {state:Lock,released:CondVar}
+struct Pool {state:Lock,released:CondVar,queues:AtomicU32}
 struct RenderLease {pool:Arc<Pool>,slot:u8,record:Option<usize>}
 ''' + item(source, 'fn wait_slice_ms(') + '\nimpl Pool {\n' + item(source, 'pub(crate) fn acquire_render(') + r'''
 }
 fn new_pool(conflict:bool,quarantined:u64)->Arc<Pool> {
- Arc::new(Pool{state:Lock(Mutex::new(State{owners:[0,1],quarantined,spared:0,next_ticket:1,waiters:0,conflict,ready:false})),released:CondVar})
+ Arc::new(Pool{state:Lock(Mutex::new(State{owners:[0,1],released:0,quarantined,spared:0,next_ticket:1,waiters:0,conflict,ready:false})),released:CondVar,queues:AtomicU32::new(1)})
 }
 fn reset(mode:usize){NOW.store(0,Ordering::SeqCst);WAITS.store(0,Ordering::SeqCst);MODE.store(mode,Ordering::SeqCst);}
 fn main(){

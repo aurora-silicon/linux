@@ -377,7 +377,7 @@ ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
  */
 static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
 {
-	return t->soc->chip_family == 16 || t->soc->chip_family == 17;
+	return t->soc->chip_family >= 15;
 }
 
 /* ane_fw_transport_publish_at() offset that copies to the end of the arena. */
