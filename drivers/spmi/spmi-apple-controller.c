@@ -132,6 +132,18 @@ struct apple_spmi {
 	bool prev_fail;
 };
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2 leaves nub-spmi0's pending sources latched: in its
+ * last 60 s before the commit it reads the ack words and writes none (15 sources pending at its
+ * commit, +0x78 = 0x2050300 among them, the engine queue's +0x60 at a clean boot). Linux clears
+ * them all at probe, then every source no driver uses ("stray") and every other queue's response
+ * in the notify word whenever the interrupt fires. keep_pending=1 clears only this queue's own
+ * notify bit and the sources its drivers use; all others stay masked, so they can't fire.
+ */
+static bool keep_pending;
+module_param(keep_pending, bool, 0444);
+MODULE_PARM_DESC(keep_pending, "DIAGNOSTIC: leave pending the sources no driver uses and other queues' responses, as macOS does");
+
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
 {
 	u32 __iomem *reg = spmi->regs + spmi->hw->irq_ack + (irq / 32) * 4;
@@ -531,7 +543,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		handled = true;
 	}
 	/* Other queues' responses, such as the sleep's own commands at the debug link's cut. */
-	if (val & ~BIT(notify % 32)) {
+	if (!keep_pending && (val & ~BIT(notify % 32))) {
 		writel(val & ~BIT(notify % 32), spmi->regs + spmi->hw->irq_ack + (notify / 32) * 4);
 		handled = true;
 	}
@@ -549,7 +561,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		 * pending for its unmask: it isn't a bad interrupt either.
 		 */
 		stray = val & ~spmi->irq_used[offset / sizeof(val)];
-		if (stray) {
+		if (stray && !keep_pending) {
 			writel(lower_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset);
 			writel(upper_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset + 4);
 			handled = true;
@@ -613,7 +625,19 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	for (size_t offset = 0; offset < spmi->num_irqs / 8 + (spmi->hw->legacy_irqs ? 4 : 0);
 	     offset += 4) {
 		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
-		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
+		if (!keep_pending)
+			writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
+	}
+	if (keep_pending) {
+		u32 w[8];
+		unsigned int i;
+
+		/* This queue's own notify bit must start clear: the FIFO waits on it */
+		apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
+		for (i = 0; i < ARRAY_SIZE(w); i++)
+			w[i] = readl(spmi->regs + spmi->hw->irq_ack + 4 * i);
+		dev_info(&pdev->dev, "keep_pending: ack words left latched at probe: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 	}
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);

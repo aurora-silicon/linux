@@ -3814,6 +3814,17 @@ static int t6030_pmic_dump_set(const char *val, const struct kernel_param *kp)
 
 	if (!s || !s->spmi)
 		return -ENODEV;
+	{
+		u32 w[8];
+		unsigned int i;
+
+		/* Both windows' latched sources: nub-spmi0's ack words and the engine queue's +0x60 */
+		for (i = 0; i < ARRAY_SIZE(w); i++)
+			w[i] = readl(s->spmi + T6030_SPMI_ACK(i));
+		dev_info(s->dev, "pmic nub-spmi0 ack words +0x60: %08x %08x %08x %08x %08x %08x %08x %08x; engine queue +0x60 %08x\n",
+			 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+			 t6030_eng_spmi ? readl(t6030_eng_spmi + T6030_ENG_SPMI_ACK) : ~0U);
+	}
 	t6030_pmic_report(s, s->spmi, "nub-spmi0", T6030_PMIC_SPITFIRE_E1);
 	if (!t6030_spmi1_base) {
 		dev_info(s->dev, "pmic nub-spmi1: not mapped (apple_sleep.spmi1=1)\n");
