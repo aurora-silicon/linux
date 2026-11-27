@@ -11,8 +11,10 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
-	/* The AOP-fed machines: J714 and J813 with their safe level, J873 and J704 without one */
+	/* The AOP-fed machines: J714, J716 (v2-only) and J813 admitted, J873 and J704 without one */
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j714_cfg));
+	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j716_cfg));
+	KUNIT_EXPECT_EQ(test, macaudio_j716_cfg.safe_vol, 0);
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
 	/* The Mac Studio M5: no sense and no protection owner yet, speaker off */
@@ -23,6 +25,14 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_k114_cfg));
 	cfg = macaudio_j413_cfg;
 	cfg.safe_vol = 0;
+	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
+	/* v2-only without safe_vol requires a digital mute-floor amp without fixed ceiling */
+	cfg = macaudio_j700_cfg;
+	cfg.safe_vol = 0;
+	cfg.spk_v2_only = true;
+	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
+	cfg = macaudio_j716_cfg;
+	cfg.spk_fixed_ceiling = true;
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
 	cfg = macaudio_j413_cfg;
 	cfg.speakers = SPKR_NONE;
@@ -53,6 +63,14 @@ static void macaudio_admission_fixed_ceiling_is_lease_only(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&cfg, true, false), 1);
 	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&cfg, false, true), 1);
 	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&cfg, true, true), SN012776_DB(-16));
+
+	/* v2-only with sense: only a lease lifts the amps, to 0 dB */
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_lease_only(&macaudio_j716_cfg));
+	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&macaudio_j716_cfg, false, false), 1);
+	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&macaudio_j716_cfg, true, false), 1);
+	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&macaudio_j716_cfg, false, true), 1);
+	KUNIT_EXPECT_EQ(test, macaudio_sn012776_vlimit(&macaudio_j716_cfg, true, true),
+			SN012776_0DB);
 }
 
 static struct kunit_case macaudio_admission_cases[] = {
