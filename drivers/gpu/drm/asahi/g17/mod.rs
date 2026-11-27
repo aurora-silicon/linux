@@ -1077,7 +1077,7 @@ impl Firmware {
                 self.apply_effort(power::FULL_EFFORT)?;
             }
         }
-        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
+        let effort = match self.effort.idle(now_ns, in_flight) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
                 self.port.set_effort_full(false);
@@ -1098,7 +1098,7 @@ impl Firmware {
         } else {
             None
         };
-        let hold = self.idle_hold(now_ns, in_flight || submitted);
+        let hold = self.idle_hold(now_ns, in_flight);
         Ok([effort, hold, busy_recheck].into_iter().flatten().min())
     }
 
