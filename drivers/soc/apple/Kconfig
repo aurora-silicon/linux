@@ -25,6 +25,20 @@ config APPLE_DBGVIEW
 
 	  Say m here if you debug an Apple SoC.
 
+config APPLE_DBGVIEW_KUNIT_TEST
+	tristate "KUnit tests for the Apple SoC debug register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_DBGVIEW && KUNIT && PM
+	default KUNIT_ALL_TESTS
+	help
+	  Read the regs and snapshot views of a register block that the
+	  test backs with kernel memory: whole, partial, unaligned, short
+	  and page-sized reads, end of block, runtime PM references and
+	  failures, bad user buffers, the snapshot format and its size
+	  parameter, and that no view writes the block. The tests touch no
+	  hardware.
+
+	  If unsure, say N.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -33,6 +47,22 @@ config APPLE_DOCKCHANNEL
 	  communications.
 
 	  Say 'y' here if you have an Apple SoC.
+
+config APPLE_DOCKCHANNEL_KUNIT_TEST
+	bool "KUnit tests for the Apple DockChannel FIFO" if !KUNIT_ALL_TESTS
+	depends on APPLE_DOCKCHANNEL=y && KUNIT=y
+	select IRQ_SIM
+	default KUNIT_ALL_TESTS
+	help
+	  Send and receive through a DockChannel FIFO that the test models
+	  behind static stubs: whole words and tail bytes, a FIFO with
+	  partial, exact or no room, the TX and RX thresholds and waits,
+	  timeouts, a count register that reports more than the caller's
+	  buffer, and the receive callback. The FIFO interrupts are
+	  simulated interrupts and the interrupt controller registers are
+	  kernel memory. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config APPLE_MAILBOX
 	tristate "Apple SoC mailboxes"
@@ -46,18 +76,22 @@ config APPLE_MAILBOX
 
 	  Say Y here if you have an Apple SoC.
 
+config APPLE_MCC_BOOT_DMA
+	bool
+
 config APPLE_MCC
-	tristate "Apple T8140 and T6040 system level cache"
+	tristate "Apple T8140, T6040 and T6050 system level cache"
+	select APPLE_MCC_BOOT_DMA
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF
 	default ARCH_APPLE
 	help
-	  The boot firmware of the Apple T8140 and T6040 SoCs enables the
-	  system level cache without letting it allocate. This driver allows
-	  allocation once the devices that took over DMA from the bootloader
-	  are bound.
+	  The boot firmware of the Apple T8140, T6040 and T6050 SoCs enables
+	  the system level cache without letting it allocate. This driver
+	  allows allocation once the devices that took over DMA from the
+	  bootloader are bound.
 
-	  Say 'y' or 'm' here if you have an Apple T8140 or T6040 SoC.
+	  Say 'y' or 'm' here if you have an Apple T8140, T6040 or T6050 SoC.
 
 config APPLE_MCC_KUNIT_TEST
 	bool "KUnit tests for Apple MCC allocation and unwind" if !KUNIT_ALL_TESTS
@@ -90,6 +124,18 @@ config APPLE_PMGR_DCS_KUNIT_TEST
 	  Also verify that boot constraints and concurrent endpoints retain
 	  their votes, and that suspend restores the last confirmed request.
 
+config APPLE_PMGR_FABRIC_KUNIT_TEST
+	bool "KUnit tests for the Apple PMGR fabric controls" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && APPLE_PMGR_MISC=y && OF_DYNAMIC && MFD_SYSCON
+	default KUNIT_ALL_TESTS
+	help
+	  Test the fabric and DCS suspend and resume p-states with and
+	  without PMP, the confirmed fabric raise and its timeout, fabric
+	  holds, the idle fabric governor and its parameter, and the device
+	  tree lookup of the governor's bandwidth voters, on simulated
+	  registers and a test device tree fragment. No hardware is accessed;
+	  only useful for kernel developers.
+
 config APPLE_CLUSTER_PWRGATE
 	bool "Apple SoC CPU cluster power gates"
 	depends on OF
@@ -113,8 +159,12 @@ config APPLE_SOC_SLEEP
 	  /chosen/aurora,s2r-mailbox.
 
 	  Only SoCs whose sleep has been measured and tested are supported,
-	  each by its match data: today T8140, T8132 and T6050. On every other
+	  each by its match data: today T8140, T8132, T6050 and T8103. On every other
 	  SoC the driver doesn't bind, and s2idle stays the only system sleep.
+
+	  T6041 (M4 Max) has a driver of its own, t6041-sleep, which binds
+	  to an "apple,t6041-sleep" node and uses this driver's coprocessor
+	  stop.
 
 config APPLE_SOC_SLEEP_KUNIT_TEST
 	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS
@@ -125,6 +175,17 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	  suspend, that every list names only words of the SoC's full lists,
 	  with no duplicates, and that the lists fit the driver's books. The
 	  tests touch no hardware.
+
+	  If unsure, say N.
+
+config APPLE_T6050_AOP_KUNIT_TEST
+	bool "KUnit tests for the T6050 AOP2 driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_SOC_SLEEP && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Checks that each AOP2 endpoint gets one ring buffer for as long as
+	  its firmware runs, and that a ring is read only inside it. The tests
+	  touch no hardware.
 
 	  If unsure, say N.
 
@@ -140,6 +201,21 @@ config APPLE_RTKIT
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_RTKIT_KUNIT_TEST
+	bool "KUnit tests for the Apple RTKit IPC library" if !KUNIT_ALL_TESTS
+	depends on APPLE_RTKIT=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Feed the RTKit receive handlers the messages a co-processor sends
+	  (HELLO version negotiation, the endpoint map, power state ACKs,
+	  buffer requests, syslog, ioreport, kdebug, CoreAnalytics and crash
+	  reports) and check the replies, with the mailbox send replaced by a
+	  static stub. Check that the crashlog parser follows containers to
+	  the right log and never reads past a truncated or malformed
+	  crashlog. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_RTKIT_HELPER
 	tristate "Apple Generic RTKit helper co-processor"
 	depends on APPLE_RTKIT
@@ -153,6 +229,22 @@ config APPLE_RTKIT_HELPER
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_RTKIT_HELPER_KUNIT_TEST
+	bool "KUnit tests for the Apple RTKit helper co-processor" if !KUNIT_ALL_TESTS
+	depends on APPLE_RTKIT_HELPER=y && KUNIT=y && SUSPEND
+	default KUNIT_ALL_TESTS
+	help
+	  Hand the helper's shared memory callbacks the buffer requests a
+	  co-processor sends (no address, addresses in and around the SRAM
+	  region, zero, unaligned and wrapping sizes, repeats), parse the
+	  buffer inventory of a handed over session from a device node built
+	  by the test, and walk the AP power notices of a sleep: prepare,
+	  suspend, resume and complete, unanswered and late answered idle
+	  notices. The RTKit AP power call is a static stub and the ASC and
+	  SRAM registers are kernel memory. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_SART
 	tristate "Apple SART DMA address filter"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -163,9 +255,38 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_SART_KUNIT_TEST
+	bool "KUnit tests for the Apple SART DMA address filter" if !KUNIT_ALL_TESTS
+	depends on APPLE_SART=y && KUNIT=y
+	depends on ARM64 && OF
+	default KUNIT_ALL_TESTS
+	help
+	  Add and remove allowed regions on a SART whose registers are a
+	  buffer of kernel memory, and check the register encoding of each
+	  SART generation, the handling of a full table, of regions that are
+	  not whole pages and of the bootloader's entries, and what a
+	  firmware-driven sleep saves, restores and refuses. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
+
+config APPLE_TUNABLE_KUNIT_TEST
+	tristate "KUnit tests for Apple Silicon hardware tunables" if !KUNIT_ALL_TESTS
+	depends on KUNIT && ARM64 && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select APPLE_TUNABLE
+	default KUNIT_ALL_TESTS
+	help
+	  Parse tunable properties from a device node built by the test and
+	  apply them to a buffer of kernel memory: the triplet decoding, the
+	  length, alignment and bounds checks, and the mask and value
+	  arithmetic. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config RUST_APPLE_MAILBOX
 	bool
@@ -197,6 +318,12 @@ config APPLE_AOP
 config APPLE_SEP_FV_INTERFACE
 	bool
 
+config APPLE_SEP_HDCP_INTERFACE
+	bool
+	help
+	  The kernel interface through which the display driver runs HDCP 2.2
+	  authentication on the SEP. Selected by the SEP driver.
+
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
 	default m if ARCH_APPLE
@@ -217,6 +344,7 @@ config APPLE_SEP
 	select CRYPTO_GCM
 	select CRYPTO_ECDH
 	select APPLE_SEP_FV_INTERFACE
+	select APPLE_SEP_HDCP_INTERFACE
 	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
@@ -228,13 +356,13 @@ config APPLE_SEP
 	  the iBoot system container, locating its .gl extent through read-only,
 	  checksum-validated APFS metadata. It validates the complete store and
 	  both root records before registering with SEP.
-	  xART writes are enabled by default, but accepted only when the driver
+	  xART writes are always on, and accepted only when the driver
 	  validates the physical extent ownership invariants. Unsupported APFS
 	  layouts fail closed. A Linux identity keybag is created automatically
 	  when none exists; existing identities and reference keys are retained.
-	  Set xart_writes=0 provision_keybag=0 for read-only operation.
-	  With writes off the driver still attaches, but refuses Touch ID enrol
-	  and verify: the enclave saves anti-replay state after every match.
+	  There is no read-only mode: the xart_writes and provision_keybag
+	  module parameters were removed, and a stale value on the kernel
+	  command line or in modprobe.d is ignored.
 
 	  Say Y here if you have an Apple silicon Mac.
 
@@ -313,10 +441,23 @@ config APPLE_REGVIEW
 
 	  This is a development aid. If unsure, say 'n'.
 
+config APPLE_REGVIEW_KUNIT_TEST
+	tristate "KUnit tests for the Apple SoC read-only register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_REGVIEW && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Check every built-in register list against the apertures it
+	  needs, the bounds check for short, misnumbered, empty and
+	  wrapping ranges, and the exact text of the views, on register
+	  windows that the test backs with kernel memory. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on APPLE_PMC && CPU_FREQ
+	depends on (APPLE_PMC || !APPLE_PMC) && CPU_FREQ
 	depends on MFD_MACSMC || !MFD_MACSMC
 	select ACPI_PLATFORM_PROFILE if ACPI
 	default ARCH_APPLE
@@ -324,9 +465,9 @@ config APPLE_CLPC
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters are busy, and releases
 	  them at idle. On SoCs with power modes it also offers them as
-	  platform profiles.
+	  platform profiles (with or without a PMC parent).
 
-	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
+	  Say 'y' or 'm' here if you have an Apple SoC.
 
 config APPLE_DISPLAY_GATE
 	bool "Apple internal display enable gate"
@@ -375,6 +516,15 @@ config APPLE_DISPLAY_GATE
 
 	  Say 'y' if you want the native display on M3 Pro, M3 Max, M3 and
 	  M4 Pro Macs.
+
+config APPLE_T8122_GPU_PMP_LINK
+	bool
+	depends on APPLE_PMP_REPORT
+	default n
+	help
+	  Let T8122 (M3 MacBook Air) GPU power commands wait for the display
+	  request the PMP report acknowledges on the 14.8.3 firmware, as the
+	  M3 runtime of DRM_ASAHI_M3_T8122 requires.
 
 config APPLE_T6030_GPU_PMP_LINK
 	bool

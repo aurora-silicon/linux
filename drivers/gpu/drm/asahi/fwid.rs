@@ -287,6 +287,7 @@ impl fmt::Display for Identity {
 /// Identifies the firmware build loaded at `text` (DATA `data_size` bytes) among `builds`,
 /// before any firmware-visible write.
 #[cfg_attr(not(CONFIG_DRM_ASAHI_G16), allow(dead_code))]
+#[inline(never)]
 pub(crate) fn identify(
     dev: &device::Device,
     text: Range<u64>,
@@ -458,6 +459,11 @@ mod tests {
                 0xb5, 0xcd, 0xfb, 0xd6, 0xd7, 0xcb, 0xc7, 0xf1, 0xba, 0xa2, 0xcc, 0x8b, 0x37, 0xee,
                 0x5d, 0x6e, 0x5e, 0x98,
             ],
+            [
+                0x19, 0xd9, 0x97, 0x49, 0x3e, 0x00, 0x76, 0x3d, 0xe3, 0x1f, 0x40, 0x0a, 0x59, 0x2d,
+                0x8a, 0xea, 0xe6, 0xbd, 0x11, 0x72, 0xc5, 0x85, 0x96, 0x61, 0x78, 0x1b, 0x42, 0x15,
+                0xde, 0xbc, 0x87, 0x0b,
+            ],
         ];
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(build.images, 0x138000, &[[0x59839, 0x5991c]], digest).unwrap();
@@ -476,10 +482,14 @@ mod tests {
         else {
             panic!("T6041 must identify its loaded firmware");
         };
-        assert_eq!(builds.len(), 3);
-        // The last two admit the 25G83 images, with the 40- and the 32-core configuration.
+        assert_eq!(builds.len(), 5);
+        // Builds 1..=2 (25G83) and 3..=4 (26B123) admit the 40- and 32-core configurations.
         assert_eq!(builds[1].images.len(), builds[2].images.len());
         for (a, b) in builds[1].images.iter().zip(builds[2].images) {
+            assert_eq!((a.entropy, a.text_sha256), (b.entropy, b.text_sha256));
+        }
+        assert_eq!(builds[3].images.len(), builds[4].images.len());
+        for (a, b) in builds[3].images.iter().zip(builds[4].images) {
             assert_eq!((a.entropy, a.text_sha256), (b.entropy, b.text_sha256));
         }
         for (i, build) in builds[..2].iter().enumerate() {
@@ -489,10 +499,27 @@ mod tests {
                 let found = measured(build.images, image.data_size, entropy, digest);
                 assert!(core::ptr::eq(found.unwrap(), image));
                 assert!(measured(other.images, image.data_size, entropy, digest).is_none());
+                assert!(measured(builds[3].images, image.data_size, entropy, digest).is_none());
                 assert!(measured(build.images, 0x13c000, entropy, digest).is_none());
             }
         }
-        // Only the 25G83 build runs its own configuration: the 25G83 register map, 40 cores.
+        for image in builds[3].images {
+            let digest = image.text_sha256;
+            let found = lookup(builds[3].images, image.text_size, image.data_size, |_| {
+                Some(digest)
+            });
+            assert!(core::ptr::eq(found.unwrap(), image));
+            assert!(
+                lookup(builds[0].images, image.text_size, image.data_size, |_| Some(digest))
+                    .is_none()
+            );
+            assert!(
+                lookup(builds[1].images, image.text_size, image.data_size, |_| Some(digest))
+                    .is_none()
+            );
+            assert!(lookup(builds[3].images, 0x60000, image.data_size, |_| Some(digest)).is_none());
+        }
+        // 25F84 uses CONFIG directly; 25G83 and 26B123 pair 40- and 32-core configurations.
         assert!(builds[0].config.is_none());
         let g83 = builds[1].config.unwrap();
         let map = &crate::hw::t6041::REGISTER_WINDOWS_25G83;
@@ -514,6 +541,11 @@ mod tests {
         assert_eq!(g83_32.core_layout.cores, Some((4, 32)));
         assert!(g83_32.reserved_slots.is_empty());
         assert_eq!(g83_32.windows.len(), map.len());
+        let b123_40 = builds[3].config.unwrap();
+        assert_eq!(b123_40.core_layout.cores, Some((4, 40)));
+        let b123_32 = builds[4].config.unwrap();
+        assert_eq!(b123_32.core_layout.cores, Some((4, 32)));
+        assert_eq!(b123_32.windows.len(), map.len());
     }
 
     #[cfg(CONFIG_DRM_ASAHI_G16)]
@@ -537,12 +569,69 @@ mod tests {
                 0x86, 0x8b, 0xc9, 0xcf,
             ],
         ];
+        // builds[0] is the normalized entry; the per-board J713 entries follow it.
+        let normalized = &builds[0];
+        assert!(normalized
+            .boot_filled
+            .iter()
+            .all(|&(offset, len)| u64::from(offset) + u64::from(len) <= normalized.text_size));
+        let found = measured(
+            builds,
+            0x13c000,
+            &[[0x5c8df, 0x5c9c2]],
+            normalized.text_sha256,
+        )
+        .unwrap();
+        assert!(core::ptr::eq(found, normalized));
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
-            assert!(core::ptr::eq(found, &builds[i]));
+            assert!(core::ptr::eq(found, &builds[i + 1]));
             assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
         }
         assert!(measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], [0; 32]).is_none());
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[test]
+    fn j773g_accepts_its_loaded_image() {
+        let builds = crate::g16::hw::t8132::CONFIG.firmware;
+        let digest = [
+            0x91, 0x54, 0xc7, 0xf8, 0x4b, 0xce, 0x32, 0x15, 0x1e, 0x8a, 0x97, 0x41, 0x7d, 0x6a,
+            0x20, 0x7a, 0x9e, 0xaf, 0x03, 0x54, 0xb4, 0xb8, 0xd6, 0xf0, 0x2a, 0xf5, 0x29, 0x95,
+            0x40, 0xd3, 0xe8, 0x5a,
+        ];
+        let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
+        assert_eq!(found.name, "Apple GFX 25G83 (normalized loaded image, J773g)");
+        assert_eq!(found.boot_filled, &[(0x224, 4), (0x5c917, 8)]);
+        assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[test]
+    fn t8132_25g83_b000_zeroes_what_iboot_fills() {
+        let builds = crate::g16::hw::t8132::CONFIG.firmware;
+        let filled = crate::g16::hw::t8132::BOOT_FILLED_25G83_B000;
+        let build = builds.iter().find(|b| b.boot_filled == filled).unwrap();
+        let [gkts, ecap] = build.entropy[0];
+        // The header's per-boot word and DATA address, then one value per parameter record:
+        // each follows its 8-byte tag and length, back to back from the GKTS record.
+        assert_eq!(filled[..2], [(0x224, 4), (0x23c, 8)]);
+        let mut next = gkts;
+        for &(off, len) in &filled[2..filled.len() - 4] {
+            assert_eq!(off, next + 8);
+            next = off + len;
+        }
+        assert_eq!(next, 0x5c8df + 0x231);
+        assert!(filled.contains(&(gkts + 8, 8)));
+        assert!(filled.contains(&(ecap + 8, 8)));
+        // Then each tunable table's count byte and body, 0x350 bytes from its header.
+        for (i, table) in [next, next + 0x350].into_iter().enumerate() {
+            let at = filled.len() - 4 + 2 * i;
+            assert_eq!(filled[at..at + 2], [(table + 3, 1), (table + 4, 0x34c)]);
+        }
+        let found = measured(builds, 0x13c000, &[[gkts, ecap]], build.text_sha256).unwrap();
+        assert!(core::ptr::eq(found, build));
+        assert!(measured(builds, 0x138000, &[[gkts, ecap]], build.text_sha256).is_none());
     }
 
     #[test]
@@ -556,6 +645,28 @@ mod tests {
                 panic!("an M5 board on bare metal must identify its loaded firmware");
             };
             t6050_admits_only(builds);
+        }
+    }
+
+    #[test]
+    fn m5_builds_name_their_layouts() {
+        use crate::g17::fw::variant::{Firmware, M5Layouts};
+        for cfg in [&crate::hw::t6050::CONFIG, &crate::hw::t6050::CONFIG_MAX] {
+            let Firmware::Identified(builds) = cfg.firmware else {
+                panic!("the M5 Pro and Max must identify their loaded firmware");
+            };
+            for (i, build) in builds.iter().enumerate() {
+                // 27.2 (26B123) moved the InitData layouts.
+                let layouts = if build.os_version >= [27, 2, 0] {
+                    M5Layouts::V26B123
+                } else {
+                    M5Layouts::V26A428
+                };
+                assert_eq!(build.variant.m5_layouts, Some(layouts));
+                for other in &builds[i + 1..] {
+                    assert_ne!(build.images[0].text_sha256, other.images[0].text_sha256);
+                }
+            }
         }
     }
 

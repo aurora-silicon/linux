@@ -58,14 +58,18 @@ def main():
     tests = [
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
+        ('audio', 'cec-only-av-endpoint', audio.cec_only_endpoint, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
+        ('display', 'color-mode-selection', display.color_selection, ((),), ()),
         ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
+        ('display', 'panel-dac-words', display.dac_words, ((),), ()),
         ('display', 'panel-takeover-registration', desktop.brightness_takeover, ((),), ()),
         ('display', 'panel-brightness-commit', display.brightness_commit, ((),), ()),
+        ('display', 'camera-indicator-dpms', display.indicator_dpms, ((),), ()),
         ('display', 'panel-brightness-takeover', display.takeover, ((),), ()),
         ('display', 'panel-mode-catalog', display.modes, ((),), ()),
         ('display', 'desktop-brightness-notifications', desktop.brightness_notifications, ((),), ()),
@@ -88,6 +92,10 @@ def main():
         ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
+        ('boot', 'v27-panel-handoff', boot.v27_panel_handoff, ((),), ()),
+        ('boot', 't6041-v27-admission', boot.t6041_v27_admission, ((),), ()),
+        ('boot', 't8122-dcpext-v27-admission', boot.t8122_dcpext_v27_admission, ((),), ()),
+        ('boot', 'v27-tag-translation', boot.v27_tag_translation, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),
@@ -171,6 +179,11 @@ def main():
                     # The T6050 PMP registry-v2 buffer shares endpoint 7.
                     prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
                                'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
+                    # A display co-processor doesn't take CoreAnalytics buffers.
+                    prefix += '#define apple_rtkit_ep7_served(...) false\n'
+                    # Nor does it receive messages for endpoints it doesn't serve.
+                    prefix += ('#define apple_rtkit_unserved_ep_msg(...) '
+                               'assert(!"No unserved endpoint is in this ordered-display fixture")\n')
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)

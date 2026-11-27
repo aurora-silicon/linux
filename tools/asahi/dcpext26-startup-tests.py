@@ -59,6 +59,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef uint64_t u6
 #define kmalloc(n,f) malloc(n)
 #define kzalloc_obj(v) calloc(1,sizeof(v))
 #define kfree(p) free((void *)(p))
+#define kstrdup(s,f) strdup(s)
 #define max(a,b) ((a)>(b)?(a):(b))
 #define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
@@ -90,11 +91,12 @@ identity=pre+codec+r'''
 #define MAX_PENDING_CMDS 16
 struct dcp_parse_ctx {void *dcp;const void *blob;u32 pos,len;};
 struct apple_epic_service;struct apple_dcp_afkep;
-struct apple_epic_service_ops {const char *name;bool reusable,optional,open_later;int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);};
+struct apple_epic_service_ops {const char *name;bool reusable,optional,open_later,singleton;int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);};
 struct apple_epic_service {struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;bool enabled,torndown,pending_open,defer_start;unsigned users;int lock;u32 channel;void *cookie;const char *pending_name,*pending_class;s64 pending_unit;int cmd_map[1];};
 struct dptx_port {struct apple_epic_service *service;s64 unit;bool enabled,connected;int enable_completion;};
-struct apple_dcp {const void *push_out_prefill;bool native,ext26_services_open,v27_j714s,v27_sleep_transport;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;int iomfb_method_profile,firmware_compat;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
-struct apple_dcp_afkep {struct apple_dcp *dcp;u32 endpoint,num_channels;bool wire_v2,stopping,match_epic_name,compact;int lock;void *wq,*service_work;const struct apple_epic_service_ops *ops;struct apple_epic_service services[AFK_MAX_CHANNEL];};
+struct apple_dcp {const void *push_out_prefill;bool native,ext26_services_open,v27_j714s,v27_sleep_transport,dcpext;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;int iomfb_method_profile,firmware_compat;bool afk_announced_names;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
+struct apple_dcp_afkep {struct apple_dcp *dcp;u32 endpoint,num_channels;bool wire_v2,stopping,match_epic_name,compact;int lock;void *wq,*service_work;const struct apple_epic_service_ops *ops,*unmatched_ops;struct apple_epic_service services[AFK_MAX_CHANNEL];int service_wq;};
+#define wake_up_all(q) ((void)(q))
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
 static bool dcp_is_v14_7_external(struct apple_dcp *d){return false;}
@@ -106,6 +108,7 @@ static void complete(int *c){(*c)++;}
 static unsigned opened[256][16],queued,published;
 static int open_error;
 static void afk_populate_service_debugfs(struct apple_epic_service *s){}
+static void afk_remove_service_debugfs(struct apple_epic_service *s){}
 static void afk_recv_handle_teardown(struct apple_dcp_afkep *e,u32 c){}
 static void afk_retry_service_init(struct apple_dcp_afkep *ep);
 void afk_service_retry(struct apple_dcp_afkep *ep);
@@ -117,7 +120,7 @@ identity+=parser[parser.index('#define DCP_PARSE_HEADER'):parser.index('static i
 # Drop the audio-only helper region from the extracted prefix.
 identity=re.sub(r'#if IS_ENABLED\(CONFIG_DRM_APPLE_AUDIO\).*?#endif','',identity,flags=re.S)
 identity+=block(parser,'struct iterator {')+'\n'+fn(parser,'iterator_begin')+'\n'+fn(parser,'parse')+'\n'+fn(parser,'parse_epic_service_init')+'\n'
-for name in ['afk_service_reclaimable','afk_service_reinit','afk_service_discard','afk_service_publish','afk_service_matches']:
+for name in ['afk_service_reclaimable','afk_service_reinit','afk_service_discard','afk_service_publish','afk_service_matches','afk_service_supersede']:
     identity+=fn(h,name)+'\n'
 identity+=fn(dptx,'dptx_native_controllers_ready')+'\n'+fn(dptx,'dptx_native_controller_prepare')+'\n'+fn(dptx,'dptx_controller_service_init')+'\n'
 for name in ['afk_match_service','afk_epic_find_service','afk_discard_pending_open','afk_retry_service_init','afk_service_retry']:
@@ -147,7 +150,7 @@ static void announce(struct apple_dcp_afkep *e,unsigned ch,struct blob b){
  assert(!afkv2_decode_frame(record,size,false,&f));afk_recv_handle_init(e,f.interface,(void *)f.payload,f.payload_size);
 }
 int main(void){
- struct apple_dcp d={.native=true,.fw_compat=DCP_FIRMWARE_H17P,.index=1,.hw.num_dptx_ports=2};struct apple_dcp_afkep eps[8]={0};
+ struct apple_dcp d={.native=true,.dcpext=true,.fw_compat=DCP_FIRMWARE_H17P,.index=1,.hw.num_dptx_ports=2};struct apple_dcp_afkep eps[8]={0};
  struct apple_dcp_afkep **slots[]={&d.systemep,&d.ibootep,&d.dptx_controller_ep,&d.ext26_aux[0],&d.dcpavservep,&d.ext26_aux[1],&d.dptxep,&d.ext26_aux[2]};
  const unsigned ids[]={0x20,0x23,0x24,0x27,0x28,0x29,0x2a,0x2c};
  for(unsigned i=0;i<8;i++){*slots[i]=&eps[i];eps[i]=(struct apple_dcp_afkep){.dcp=&d,.endpoint=ids[i],.wire_v2=true};eps[i].wq=&eps[i];}
@@ -220,6 +223,11 @@ transport=pre+r'''
 #define current ((void *)1)
 #define dma_wmb() ((void)0)
 #define dma_rmb() ((void)0)
+#define smp_store_release(p,v) (*(p)=(v))
+#define smp_mb__before_atomic() ((void)0)
+typedef int atomic_t;
+#define atomic_inc(v) ((*(v))++)
+#define atomic_dec(v) ((*(v))--)
 #define trace_iomfb_push(...)
 #define IOMFB_METHOD(t,n) [n]={#n,{t[0],t[1],t[2],t[3]},{0},{0}}
 #define IOMFB_METHOD_H17(t,h,n) [n]={#n,{t[0],t[1],t[2],t[3]},{h[0],h[1],h[2],h[3]},{0}}
@@ -228,7 +236,7 @@ struct apple_dcp;typedef void (*dcp_callback_t)(struct apple_dcp *,void *,void *
 struct dcp_method_entry {const char *name;char tag[4],tag_h17g[4],tag_ext26[4];};
 '''
 transport+=block(ih,'enum dcp_context_id {')+'\n'+block(ih,'struct dcp_packet_header {')+'\n'+block(internal,'struct dcp_channel {')+'\n'+block(ih,'enum dcpep_method {')+r'''
-struct apple_dcp {const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;};
+struct apple_dcp {const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;atomic_t pending_acks;};
 static bool iomfb_uses_queue(struct apple_dcp *d){return true;}
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
