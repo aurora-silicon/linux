@@ -28,7 +28,7 @@
 //! alike.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{
     drm::gem::BaseObject,
     new_mutex,
@@ -134,6 +134,8 @@ pub(crate) struct VmStateInner {
     /// Private mappings are kept outside generic close's user GPUVA teardown.
     context_mappings: KVec<mmu::KernelMapping>,
     pub(crate) resources: Option<Arc<super::resources::Cache>>,
+    /// Set once a multisampled render pass of this VM becomes visible ([`Self::renders_msaa`]).
+    renders_msaa: AtomicBool,
     #[allow(dead_code)]
     pub(crate) live: Arc<LiveToken>,
 }
@@ -144,6 +146,18 @@ impl VmStateInner {
         self.resources
             .as_ref()
             .is_some_and(|cache| cache.renders_unpublished())
+    }
+
+    /// Whether this VM has published a multisampled render pass. Its later passes can still
+    /// read multisampled images (an attachmentless pass reading them as input attachments is
+    /// single-sampled), so the property is the VM's from then on.
+    pub(crate) fn renders_msaa(&self) -> bool {
+        self.renders_msaa.load(Ordering::Relaxed)
+    }
+
+    /// Records that a multisampled render pass of this VM became visible to the firmware.
+    pub(crate) fn note_msaa_render(&self) {
+        self.renders_msaa.store(true, Ordering::Relaxed);
     }
 }
 
@@ -434,6 +448,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         vm: vm.clone(),
         context_mappings: mappings,
         resources: Some(resources),
+        renders_msaa: AtomicBool::new(false),
         live,
     };
     let state = Arc::new(VmState(crate::cleanup::Deferred::new(inner)?), GFP_KERNEL)?;

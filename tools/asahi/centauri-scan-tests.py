@@ -394,6 +394,11 @@ static struct centauri_wifi *g_swifi;
 static void mutex_lock(int *l) { assert(!*l); *l = 1; }
 static void mutex_unlock(int *l) { assert(*l); *l = 0; }
 static u32 readl(void *addr) { (void)addr; return bar_state; }
+static unsigned int recovery_requests;
+static void centauri_recovery_request(struct centauri *c, const char *why)
+{
+	(void)c; (void)why; recovery_requests++;
+}
 static size_t build_scan(struct centauri_wifi *w, unsigned int c, u8 *b)
 {
 	(void)w; (void)c; (void)b;

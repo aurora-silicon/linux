@@ -8,7 +8,7 @@ mod exit;
 mod dependencies;
 mod direct;
 mod grow;
-mod observe;
+pub(super) mod observe;
 mod pools;
 mod prepare;
 mod recovery;
@@ -79,6 +79,9 @@ pub(super) struct RenderState {
     /// Graphs of released contexts the firmware may still walk (see `detach_context`): kept
     /// until the firmware stops, when this state is dropped.
     kept_graphs: KVec<crate::g17::queue::render::RetiredBinding>,
+    /// Killed guilty pairs whose rings the firmware never consumed (see `detach_context`):
+    /// kept, with their slots out of service, until the firmware stops.
+    kept_pairs: KVec<crate::g17::queue::render::parked::ParkedPair>,
     next_pm_generation: u64,
 }
 
@@ -106,6 +109,7 @@ impl RenderState {
             grow: grow::Grow::new()?,
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
             kept_graphs: KVec::new(),
+            kept_pairs: KVec::new(),
             next_pm_generation: 1,
         })
     }
@@ -291,13 +295,16 @@ impl Registry {
         }
         // Prefer an empty reservation or an already parked channel, then a
         // reusable or warmed unpublished pair, then an idle drained published
-        // sibling (render only).
-        for pass in 0..3u8 {
-            if pass == 2 && owner.is_none() {
+        // sibling (render only), preferring non-wide siblings before wide ones.
+        for pass in 0..4u8 {
+            if pass >= 2 && owner.is_none() {
                 break;
             }
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()
@@ -454,9 +461,12 @@ impl Registry {
     /// only that slot's owner so the next queue reuses them via `bind_owner()`.
     /// The caller destroys any returned backing after dropping the device lock.
     pub(super) fn reclaim_unused_render_sibling(&mut self) -> Result<Option<UnusedRenderSpare>> {
-        for pass in 0..3u8 {
+        for pass in 0..4u8 {
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()
@@ -1184,6 +1194,29 @@ impl crate::g17::Firmware {
         })
     }
 
+    /// Undoes an unpublished pool preparation and flushes any final release
+    /// exposed when sibling renders completed while the preparation was lent.
+    fn rollback_render_pool(&mut self, preparation: pools::Preparation) -> Result {
+        let pending = match self.queues.render.pools.rollback(preparation) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.primary.state.shared.lose_device_quietly();
+                return Err(error);
+            }
+        };
+        if pending {
+            match self.release_render_lists() {
+                Ok(()) => {}
+                Err(error) if error == EAGAIN => self.primary.state.shared.queue_events(),
+                Err(error) => {
+                    self.primary.state.shared.lose_device_quietly();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Events have already been consumed by the caller. Each healthy completion
     /// services its final pool release before examining the next retained job.
     fn retire_render_slot(
@@ -1312,6 +1345,29 @@ impl Registry {
             .filter_map(|entry| entry.pair.as_ref())
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_spared())
+    }
+    /// See `recovery::Queues::collateral_before`.
+    pub(in crate::g17) fn render_collateral_before(&self, qid: u8, generation: u64) -> bool {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .find(|pair| pair.qids().contains(&qid))
+            .is_some_and(|pair| pair.collateral_before(generation))
+    }
+    /// See `recovery::Queues::note_collateral`.
+    pub(in crate::g17) fn note_render_collateral(&mut self, qid: u8, generation: u64) {
+        if let Some(pair) = self
+            .render
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_mut())
+            .find(|pair| pair.qids().contains(&qid))
+        {
+            pair.note_collateral(generation);
+        }
     }
     /// Marks the interrupted group of the pair that owns `qid`.
     pub(in crate::g17) fn note_render_interrupted(
@@ -1545,11 +1601,16 @@ impl Registry {
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
+            // A completion that arrived while the pair was borrowed (`missed_event`) is owed to
+            // its borrower, whose return observes the pair or requests an event pass: no
+            // rescan waits for it.
             let active = entry
                 .pair
                 .as_ref()
                 .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                    (entry.preparing.is_some() || entry.growing)
+                        && entry.borrowed_active
+                        && !entry.missed_event,
                     |pair| pair.published_in_flight(),
                 );
             active
@@ -1643,7 +1704,7 @@ impl Registry {
 impl RenderState {
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
-        writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
+        writeln!(f, "firmware_linked_render_graphs kept={} kept_guilty_pairs={} leaked={}", self.kept_graphs.len(), self.kept_pairs.len(),
                  teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
         let unsettled = self.entries.iter().flatten()
             .filter_map(|entry| entry.pair.as_ref())

@@ -139,6 +139,23 @@ pub(crate) fn create_policy(flags: u32) -> Result<Policy> {
 /// none until this long has passed; one capture itself waits up to a minute.
 const TOUCH_WAIT_MS: u64 = 60_000;
 
+/// Whether the capture a verify is waiting on is still wanted.
+///
+/// While a touch-gated `/dev/sep-key` call owns the capture (`key_wait`), it
+/// is wanted until that call ends (`key_ended`: `CANCEL`, a signal, the
+/// driver going away) or `/dev/sep-bio` starts an enrolment or a verify of
+/// its own (`bio_live`). The call holds the sensor lock, so that capture's
+/// work item can only be queued behind it: the call gives the sensor up
+/// rather than keep a login prompt waiting for the rest of its minute.
+/// Otherwise the capture is `/dev/sep-bio`'s and lives as its session says.
+pub(crate) fn touch_capture_wanted(key_wait: bool, key_ended: bool, bio_live: bool) -> bool {
+    if key_wait {
+        !key_ended && !bio_live
+    } else {
+        bio_live
+    }
+}
+
 const MAGIC: u32 = 0xB1;
 
 /// Handle header: `"SEPK"`, version, flags, reserved u16, blob length (LE u32).
@@ -1345,6 +1362,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bio_capture_takes_the_sensor_from_a_key_touch_wait() {
+        // A touch-gated call waits alone: its capture is wanted.
+        assert!(touch_capture_wanted(true, false, false));
+        // /dev/sep-bio starts a verify or an enrolment behind it: the call
+        // gives the sensor up at once.
+        assert!(!touch_capture_wanted(true, false, true));
+        // CANCEL, a signal or shutdown ends the wait, also while a
+        // /dev/sep-bio capture is queued behind it.
+        assert!(!touch_capture_wanted(true, true, false));
+        assert!(!touch_capture_wanted(true, true, true));
+        // No touch-gated call: the capture is /dev/sep-bio's own.
+        assert!(touch_capture_wanted(false, false, true));
+        assert!(!touch_capture_wanted(false, false, false));
+    }
+
+    #[test]
     fn version_4_ioctls_have_their_sizes() {
         assert_eq!(IOC_CREATE_USER & 0xff, 0x28);
         assert_eq!(IOC_SIGN_PASSWORD >> 16 & 0x3fff, (2164 + 8 + PASSWORD_MAX) as u32);
@@ -1391,12 +1424,22 @@ impl SepData {
     /// touch-gated signature that owns it, or /dev/sep-bio's live session.
     /// A touch-gated call runs its capture in the caller's own thread, so a
     /// signal to the caller (or its death) ends the capture at once.
+    /// A capture `/dev/sep-bio` starts meanwhile ends it too (see
+    /// [`touch_capture_wanted`]).
     pub(crate) fn capture_live(&self) -> bool {
-        (self.key_touch_active.load(Relaxed)
-            && !self.key_touch_cancel.load(Relaxed)
-            && !self.shutting_down.load(Relaxed)
-            && !kernel::current!().signal_pending())
-            || crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+        let key_wait = self.key_touch_active.load(Relaxed);
+        let key_ended = key_wait
+            && (self.key_touch_cancel.load(Relaxed)
+                || self.shutting_down.load(Relaxed)
+                || kernel::current!().signal_pending());
+        touch_capture_wanted(key_wait, key_ended, self.bio_capture_live())
+    }
+
+    /// Whether `/dev/sep-bio` has an enrolment or a verify that has not
+    /// ended. During a touch-gated call, which holds the sensor lock, that
+    /// is one whose work item waits for the lock.
+    fn bio_capture_live(&self) -> bool {
+        crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
     }
 
     fn key_bio_acl(&self, any: bool) -> Result<BioAcl> {
@@ -1598,7 +1641,8 @@ impl SepData {
 
     /// A touch-gated operation (see `key_sign_with_touch`). `CANCEL` ends
     /// the wait with `ECANCELED`, a signal to the caller (including its
-    /// death) with `EINTR`.
+    /// death) with `EINTR`, and an enrolment or a verify that `/dev/sep-bio`
+    /// starts meanwhile with `EBUSY`: the sensor goes to that prompt.
     fn key_touch_run(
         &self,
         blob: &[u8],
@@ -1635,6 +1679,9 @@ impl SepData {
             if kernel::current!().signal_pending() {
                 break Err(EINTR);
             }
+            if self.bio_capture_live() {
+                break Err(EBUSY);
+            }
             if !self.capture_begin() {
                 break Err(EAGAIN);
             }
@@ -1661,6 +1708,8 @@ impl SepData {
                     }
                 }
                 Some(TouchOutcome::Failed(s)) if s == crate::ENROL_STATUS_LOCKOUT => break Err(EACCES),
+                // A capture given up for /dev/sep-bio ends as a failed one.
+                Some(TouchOutcome::Failed(_)) | None if self.bio_capture_live() => break Err(EBUSY),
                 Some(TouchOutcome::Failed(_)) | None => break Err(EIO),
             }
         };

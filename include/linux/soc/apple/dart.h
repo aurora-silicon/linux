@@ -6,10 +6,25 @@
 #include <linux/kconfig.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
 struct device_node;
+
+/*
+ * Whether apple-dart keeps the firmware's root slots of a DART of @np's kind
+ * that the boot loader leaves locked (fw_mirror). Only then can a coprocessor
+ * the boot loader leaves running behind such a DART be adopted: on the plain
+ * locked path its firmware loses the mappings it runs on.
+ */
+static inline bool apple_dart_keeps_locked_roots(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6041-dart") ||
+	       of_device_is_compatible(np, "apple,t6050-dart") ||
+	       of_device_is_compatible(np, "apple,t8140-dart") ||
+	       of_device_is_compatible(np, "apple,t8142-dart");
+}
 
 /* Retained internal-display ownership is qualified only with a built-in
  * DART provider. Other consumers, including modular DART, keep the APIs below.
@@ -206,6 +221,8 @@ int apple_dart_sleep_prepare(struct device *dev);
 void apple_dart_sleep_restore(struct device *dev);
 /* A display DART's streams around a display power cycle, see the DART driver. */
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush);
+/* The streams 0 to 31 a display DART has enabled; 0 if any stream above 31 is on. */
+u32 apple_dart_enabled_streams(struct device *dev);
 /* A locked display DART's TCR and TTBR words kept across a real sleep (T6041). */
 int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
 /* The display streams turned off read disabled and the DART has nothing in flight. */
@@ -242,6 +259,11 @@ static inline int apple_dart_display_streams(struct device *dev, u32 streams, bo
 					     bool flush)
 {
 	return -ENODEV;
+}
+
+static inline u32 apple_dart_enabled_streams(struct device *dev)
+{
+	return 0;
 }
 
 static inline int apple_dart_display_keep(struct device *dev, u32 streams, bool save)

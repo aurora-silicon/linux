@@ -11,6 +11,7 @@
 //! retirement can complete its commands or their free-list references.
 
 use super::super::{Backend, DeferredBatch};
+use super::observe::FastRenderOutcome;
 use crate::g17::{
     job::Packet,
     object::Allocator,
@@ -43,7 +44,7 @@ enum DirectTarget {
 /// graph that needs no growth.
 struct DirectHost<'a> {
     port: &'a Port,
-    render: &'a MutexGuard<'a, ()>,
+    render: Option<MutexGuard<'a, ()>>,
     m5_outer: Option<MutexGuard<'a, Option<(u32, u64, u64)>>>,
     m5_claim: Option<&'a mut crate::g17::initdata::OuterClaim>,
     target: DirectTarget,
@@ -95,8 +96,9 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 self.port.write_render_pair(
-                    self.render,
+                    render,
                     room,
                     fragment,
                     tiling,
@@ -108,9 +110,10 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 let m5_outer = self.m5_outer.as_ref().ok_or(EIO)?;
                 self.port.write_m5_render_pair(
-                    self.render,
+                    render,
                     m5_outer,
                     room,
                     fragment,
@@ -149,16 +152,18 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
-                self.port.expose_render_pair(self.render, room, next)
+                let render = self.render.as_ref().ok_or(EIO)?;
+                self.port.expose_render_pair(render, room, next)
             }
             DirectTarget::M5(room) => {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 let m5_outer = self.m5_outer.as_ref().ok_or(EIO)?;
                 let claim = self.m5_claim.as_deref_mut().ok_or(EIO)?;
                 self.port
-                    .expose_m5_render_pair(self.render, m5_outer, room, claim, next)
+                    .expose_m5_render_pair(render, m5_outer, room, claim, next)
             }
         }
     }
@@ -170,7 +175,13 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
             if let Err(error) = self.port.note_m5_submission_history_locked(geometry, 2) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
+            // Drop `m5_outer` before ringing the mailbox doorbell so competing M5 submitters
+            // do not wait behind mailbox I/O.
+            self.m5_outer = None;
         }
+        // Outer ring producers, credits, and hazard order are committed; drop the render
+        // publication lock before mailbox I/O as well.
+        self.render = None;
         self.port.notify(super::render_doorbell_message(m5, priority))
     }
     fn note_submission(&mut self) -> Result {
@@ -266,8 +277,9 @@ impl crate::g17::Firmware {
         let pair = match self.queues.render.take_pair(slot, owner, packet) {
             Ok(pair) => pair,
             Err(error) => {
-                self.queues.render.pools.rollback(preparation);
+                let rollback = self.rollback_render_pool(preparation);
                 self.queues.buffers.release(buffer)?;
+                rollback?;
                 return if error == EBUSY { Ok(None) } else { Err(error) };
             }
         };
@@ -286,19 +298,17 @@ impl crate::g17::Firmware {
 
     /// Takes a lent pair back and settles what its publication held: the
     /// free-list preparation is activated once published, rolled back with the
-    /// parameter-buffer reference otherwise.
+    /// parameter-buffer reference otherwise. True when a completion of the pair
+    /// arrived while it was lent: the caller owes the pair that observation.
     fn return_render(
         &mut self,
         slot: u8,
         loan: &mut Loan,
         activation: Option<(u16, u64)>,
         packet: &Arc<Packet>,
-    ) -> Result {
+    ) -> Result<bool> {
         self.queues.render.return_pair(slot, &mut loan.pair)?;
-        if self.queues.render.take_missed_event(slot) {
-            // The record is retired by the next pass's observation, like any completion.
-            self.primary.state.shared.queue_event_records();
-        }
+        let missed = self.queues.render.take_missed_event(slot);
         let entry = self.queues.render.entry_mut(slot)?;
         // A failure or timeout recorded against the lent pair is settled by the
         // event worker's collector, as after any other loan.
@@ -329,10 +339,11 @@ impl crate::g17::Firmware {
         if packet.is_published() {
             self.queues.render.entry_mut(slot)?.published = true;
         } else {
-            self.queues.render.pools.rollback(preparation);
+            let rollback = self.rollback_render_pool(preparation);
             self.queues.buffers.release(loan.buffer)?;
+            rollback?;
         }
-        Ok(())
+        Ok(missed)
     }
 }
 
@@ -427,7 +438,7 @@ impl Backend {
             }
             let mut host = DirectHost {
                 port,
-                render: &render,
+                render: Some(render),
                 m5_outer,
                 m5_claim: m5_claim.as_mut(),
                 target,
@@ -458,13 +469,47 @@ impl Backend {
             Ok(())
         })();
         drop(m5_claim);
+        // The collector of the observation the return may owe, taken without waiting.
+        let mut collector = None;
         let returned = {
             let mut state = self.shared.state.lock();
             match (*state).as_deref_mut() {
                 Some(firmware) => {
                     let returned = firmware.return_render(slot, &mut loan, activation, packet);
+                    let returned = match returned {
+                        // A completion arrived while the pair was lent. The event pass it would
+                        // request takes the device mutex from another CPU after this owner's
+                        // next lend and finds the pair lent again: observe it here, in this
+                        // hold, unless recovery, a crash or another borrower's observation
+                        // leaves it to that pass.
+                        Ok(true) => {
+                            if !recovery_started
+                                && lease.is_current()
+                                && !self.shared.crashed.load(Ordering::Acquire)
+                            {
+                                collector = self.shared.render_collector.try_lock();
+                            }
+                            match collector.as_deref_mut() {
+                                Some(batch) => firmware.observe_returned_render(slot, batch),
+                                None => Ok(FastRenderOutcome::Fallback),
+                            }
+                            .map(|outcome| match outcome {
+                                // Retired by the next pass's observation, like any completion.
+                                FastRenderOutcome::Fallback => self.shared.queue_event_records(),
+                                FastRenderOutcome::Rescan => self.shared.queue_poll(),
+                                FastRenderOutcome::Done | FastRenderOutcome::Idle => {}
+                            })
+                        }
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    };
                     let grow_ready = firmware.render_grow_ready();
                     drop(state);
+                    // Fences signal off the device mutex, before another borrower can collect.
+                    if let Some(batch) = collector.as_deref_mut() {
+                        batch.finish();
+                    }
+                    drop(collector);
                     if grow_ready {
                         self.shared.queue_grow();
                     }

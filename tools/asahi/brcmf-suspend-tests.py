@@ -226,9 +226,9 @@ static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
 static unsigned wowl_offs;
 static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
-/* The firmware's link down event completes the vif's link_down. */
+/* A DISASSOC goes out for a connected vif; the firmware's link down event completes its link_down. */
 static unsigned link_downs, link_waits;
-static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)r;(void)b;can_command();link_downs++;v->link_down.done=true;}
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {bool sent=v->sme_state&BIT(BRCMF_VIF_STATUS_CONNECTED);(void)r;(void)b;can_command();link_downs++;if(sent)v->link_down.done=true;return sent;}
 static void reinit_completion(struct completion *c) {c->done=false;}
 static unsigned long msecs_to_jiffies(unsigned int m) {return m;}
 static unsigned long wait_for_completion_timeout(struct completion *c,unsigned long t) {assert(t==500);link_waits++;return c->done;}
