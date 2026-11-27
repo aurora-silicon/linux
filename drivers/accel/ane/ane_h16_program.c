@@ -649,6 +649,8 @@ static int h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *
 	INIT_LIST_HEAD(&s->programs);
 	INIT_LIST_HEAD(&s->held);
 	spin_lock_init(&s->stats_lock);
+	ane_stats_counters_init(&s->sysfs_ctrs, &s->sysfs_ring, 0);
+	s->sysfs_ring.slots = &s->sysfs_slot;
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
 	spin_lock_init(&s->export_lock);
 	INIT_LIST_HEAD(&s->exports_done);
@@ -1651,6 +1653,7 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	unsigned int i;
 	u64 deadline, polls, t0, gate_open, t1 = 0, t2 = 0, t3, end;
 	u64 entry = h16_now(s);
+	u64 ticket;
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -1694,6 +1697,11 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
 	polls = s->transport->polls;
+	/*
+	 * A request counts in ane_stats from its first firmware traffic until
+	 * it ends either way; a refusal before this point reached nothing.
+	 */
+	ticket = ane_stats_begin(&s->sysfs_ctrs, &s->sysfs_ring, ktime_get_ns(), 1);
 	trace->step = H16_STEP_GATE_OPEN;
 	t0 = h16_now(s);
 	if (!s->gate_held) {
@@ -1772,8 +1780,10 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	x->polls = s->transport->polls - polls;
 	kfree(command);
 	x->ns[ANE_H16_T_FINISH] = h16_now(s) - end;
+	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), 0, 0);
 	return 0;
 fail:
+	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), ret, 0);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request->key.uuid);
 	/*
 	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
