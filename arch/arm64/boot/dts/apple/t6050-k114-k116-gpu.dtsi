@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * K114c (M5 Max, G17C) GPU, for the boot loader's GPU handoff. Everything here
- * stays disabled: the loader checks the ADT and the live GPU firmware build,
- * fills the GPU reservations, then enables the power states, both mailboxes and
- * the GPU, the GPU last. A loader that refuses leaves the GPU off.
+ * The GPU of the K114c, K114s, K116s and K116c (ADT /arm-io/sgx "gpu,t6050"), for the boot
+ * loader's GPU hand-off. It is the GPU half of t6050-j714s-gpu-panel.dtsi: the four boards'
+ * ADTs have the J714s's sgx, gfx-asc and gfx1-asc.
  *
- * Same layout as t6050-j714s-gpu-panel.dtsi; the GPU is G17C and, in the ADT,
- * sgx and both GPU ASCs are the same as on the M5 Pro.
+ * Everything here stays disabled: the loader checks the ADT and the live GPU firmware build,
+ * fills the six reservations, then enables the GPU PMGR, GPX, AFR, GFX, both mailboxes and the
+ * GPU, the GPU last. A loader that refuses leaves the GPU off and the rest of the boot as it is.
+ *
+ * arm-io's ranges add 0x2_0000_0000 to the ADT's 0x21_xxxx_xxxx bus addresses.
  */
 
 / {
@@ -16,7 +18,12 @@
 	};
 
 	reserved-memory {
-		/* Filled and enabled by the loader from the ADT */
+		/*
+		 * Filled and enabled by the loader from the ADT: sgx gpu-region-*,
+		 * gfx-shared-region-*, gfx-shared-l2-region-* and gfx-handoff-* (the UAT
+		 * ranges), the GPU ASCs' __TEXT (fw-text) and gfx-data-base to the end of
+		 * gfx1-data-shared-ro (fw-data). iBoot places them; they differ per Mac.
+		 */
 		gpu_fw_text: gpu-fw-text {
 			reg = <0 0 0 0>;
 			no-map;
@@ -61,9 +68,9 @@
 
 &{/soc} {
 	/*
-	 * ADT gfx-asc and gfx1-asc at their physical windows: the wrapper, the
-	 * 8-byte iop-vbar, and their second and third interrupts (send-empty,
-	 * recv-not-empty), as T8140/T8142.
+	 * ADT gfx-asc: reg 0x21_02600000 + 0x88000 (wrapper), 0x21_02050000 + 8 (iop-vbar);
+	 * interrupts [2798, 2797, 2800, 2799], of which the second and third are send-empty
+	 * and recv-not-empty; role "GFX"; power-gates [614] (GFX_ASC).
 	 */
 	gfx_mbox: mailbox@2302600000 {
 		compatible = "apple,t6050-j775d-ascwrap-v6";
@@ -79,6 +86,11 @@
 		status = "disabled";
 	};
 
+	/*
+	 * ADT gfx1-asc: reg 0x21_02e00000 + 0x88000, 0x21_02850000 (ADT size 0x60000; the
+	 * driver uses the first 8 bytes); interrupts [2802, 2801, 2804, 2803]; role "GFX1";
+	 * power-gates [657] (GFX_ASC1).
+	 */
 	gfx1_mbox: mailbox@2302e00000 {
 		compatible = "apple,t6050-j775d-ascwrap-v6";
 		reg = <0x23 0x2e00000 0x0 0x88000>,
@@ -94,7 +106,10 @@
 	};
 };
 
-/* The ADT marks GPX and AFR, GFX's parents, critical. */
+/*
+ * ADT pmgr devices GPX (id 359, +0x0), AFR (id 360, +0x100) and GFX (id 362, +0x110) in the
+ * GPU PMGR. The ADT marks GPX and AFR, GFX's parents, critical; GFX not.
+ */
 &ps_gpx {
 	apple,always-on;
 };
@@ -112,8 +127,9 @@
 };
 
 &sgx {
+	/* What the loader checks and drivers/gpu/drm/asahi binds */
 	compatible = "apple,agx-g17s";
-	/* ADT sgx reg[0]; the driver maps the first 16 MiB as "sgx" */
+	/* ADT sgx reg[0] 0x21_00000000 + 0x3fdc000; the driver maps the first 16 MiB as "sgx" */
 	reg = <0x23 0x0 0x0 0x3fdc000>;
 	reg-names = "sgx";
 	/delete-property/ interrupts;

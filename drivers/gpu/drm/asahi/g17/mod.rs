@@ -1201,6 +1201,17 @@ fn compute_channel_features(channels: u8) -> u64 {
     }
 }
 
+/// Whether the firmware keeps partial renders (tiler-heap overflow fragment passes) strictly
+/// ordered behind earlier fragment work: advertised where `fragment_busy` drains an outstanding
+/// fragment pass on the pair and each logical render queue uses a single physical render pair.
+fn ordered_partial_renders_feature(fragment_busy: bool, render_pairs: u8) -> u64 {
+    if fragment_busy && render_pairs == 1 {
+        uapi::DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS as u64
+    } else {
+        0
+    }
+}
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -2904,6 +2915,8 @@ impl gpu::Gpu for Gpu {
                 | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT
                 | compute_channel_features(pairs::compute_channels_per_owner());
         let variant = self.shared.variant;
+        params.features |=
+            ordered_partial_renders_feature(variant.fragment_busy, pairs::per_owner());
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
