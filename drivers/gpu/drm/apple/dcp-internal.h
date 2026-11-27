@@ -991,9 +991,11 @@ struct apple_dcp {
 	u8 s2r_step;
 	struct completion s2r_dart_done;
 	struct completion s2r_hpd_done;
-	/* Times the firmware published its AV video interface (av_interface_init()), and waiters */
+	/* Times the internal DCP published its AV video interface, and their waiters */
 	atomic_t av_video_gen;
 	wait_queue_head_t av_video_wq;
+	/* After a T6030 V27 restart: the count the next mode set waits to see change (0: none) */
+	int v27_early_av_gen;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;

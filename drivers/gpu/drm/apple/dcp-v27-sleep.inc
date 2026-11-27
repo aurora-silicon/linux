@@ -1938,8 +1938,27 @@ static int dcp_v27_early_any_report(struct apple_epic_service *service, enum epi
 	return 0;
 }
 
+/*
+ * The internal DCP's AV endpoint (0x29) is one of these, not avep's (it has no audio device):
+ * its video interface's publications are counted for the mode set after a restart to wait on
+ * (iomfb_template.c). T6030 announces it with its class as the service's name
+ * (DCPAVSimpleVideoInterface); its EPIC name may name it instead.
+ */
+static void dcp_v27_early_any_init(struct apple_epic_service *service, const char *name,
+				   const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	if (service->ep->endpoint != AV_ENDPOINT ||
+	    !((class && strstr(class, "VideoInterface")) || (name && strstr(name, "VideoInterface")) ||
+	      (name && strstr(name, "video-interface"))))
+		return;
+	atomic_inc(&dcp->av_video_gen);
+	wake_up_all(&dcp->av_video_wq);
+}
+
 static const struct apple_epic_service_ops dcp_v27_early_any_service[] = {
-	{ .name = "*", .report = dcp_v27_early_any_report },
+	{ .name = "*", .init = dcp_v27_early_any_init, .report = dcp_v27_early_any_report },
 	{},
 };
 
@@ -2533,35 +2552,6 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	return dcp_v27_early_power_down(dcp, e);
 }
 
-/* The longest a restarted firmware is given to publish its AV video interface again */
-#define V27_EARLY_AV_MS		2000
-
-/*
- * A restarted firmware tears its AV video interface down and publishes it again on new
- * channels some 250 ms after its HELLO (J516s, 27.2: DCPAVSimpleVideoInterface, then
- * "IOAVVideoInterface published", plug, HPD asserted). The pipe's power-on and mode set before
- * that find no link ("open_ioav_gated(): IOAVVideoInterface open failed", "set_mode_shutdown_gated
- * return HPD is 0 link_status is 0"): the mode is dropped, the first swap never completes, the
- * IOMFB queue times out 10 s later and takes the DCP as crashed, and every later sleep is refused
- * ("the firmware is not live"). So the CRTC comes on only once the interface is back, as at boot,
- * where iBoot left it published, and as the T6041 restart waits for its hotplug. @gen: the count
- * before the restart; none (0): this DCP publishes no such interface.
- */
-static void dcp_v27_early_av_wait(struct apple_dcp *dcp, int gen)
-{
-	ktime_t start = ktime_get();
-
-	if (!gen)
-		return;
-	if (!wait_event_timeout(dcp->av_video_wq, atomic_read(&dcp->av_video_gen) != gen,
-				msecs_to_jiffies(V27_EARLY_AV_MS)))
-		dev_warn(dcp->dev, "V27 wake: no AV video interface again in %d ms\n",
-			 V27_EARLY_AV_MS);
-	else
-		dev_dbg(dcp->dev, "V27 wake: AV video interface back after %lld ms\n",
-			ktime_ms_delta(ktime_get(), start));
-}
-
 /*
  * The firmware back from a stop, from what that stop did: the domains on, both DARTs back
  * and checked, RTKit restarted warm, RUN on and the boot's handshake, then the wake's calls
@@ -2629,7 +2619,8 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	WRITE_ONCE(dcp->s2r_fw_down, false);
 	dcp_v27_early_reopen(dcp, e);
 	dcp_s2r_put_darts(dcp);
-	dcp_v27_early_av_wait(dcp, av_gen);
+	/* The mode set waits for the video interface the power-on brings back (iomfb_template.c) */
+	WRITE_ONCE(dcp->v27_early_av_gen, av_gen);
 	dev_info(dcp->dev, "V27 wake: firmware %s; the panel comes on with its CRTC\n",
 		 pm_resume_via_firmware() ? "back after the sleep" : "restarted, the sleep given up");
 	return 0;
@@ -2722,6 +2713,8 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 		}
 		dcp->v27_early = e;
 	}
+	/* A restart's wait that no mode set took is not the next sleep's */
+	WRITE_ONCE(dcp->v27_early_av_gen, 0);
 	/* Not stopped, so no DART was lost and no floor is kept aside: a fresh start. */
 	memset(e, 0, sizeof(*e));
 	e->steps_start = ktime_get();
