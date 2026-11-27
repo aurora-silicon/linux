@@ -673,6 +673,8 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
  * boot, and the scratch notes are what the last sleep left. Reads only.
  */
 #define T6030_PMU_OFF2WAKE		0x281c
+/* The register the sleep program's PMU commands write: D2C 1, C2S 2; at the wake S2C 1, C2D 0 */
+#define T6030_PMU_PSTATE		0x200
 
 /*
  * DIAGNOSTIC (T6030 sleep bring-up): the cluster power-gate enables in pmgr[28] ("pwrgate").
@@ -715,6 +717,7 @@ static void t6030_pmu_boot_record(struct apple_sleep *s)
 {
 	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE), mask = runtime & ~T6030_SPMI_DONE;
 	u8 ctl = 0, rmask = 0, compare[4] = {}, ticks[6] = {}, stage[4] = {}, wake = 0, notes[5] = {};
+	u8 pst[2] = {};
 	u32 cmp, now;
 	int ret;
 
@@ -724,14 +727,15 @@ static void t6030_pmu_boot_record(struct apple_sleep *s)
 	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6) ?:
 	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, 0xf800, NULL, stage, 4) ?:
 	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6030_PMU_OFF2WAKE, NULL, &wake, 1) ?:
-	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, PMU_NOTE_BASE, NULL, notes, 5);
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, PMU_NOTE_BASE, NULL, notes, 5) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6030_PMU_PSTATE, NULL, pst, 2);
 	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
 	cmp = get_unaligned_le32(compare);
 	now = get_unaligned_le32(ticks + 2);
-	dev_info(s->dev, "boot PMU%s: 0x2000 %#04x (armed %d event %d) 0x200e %#x compare-counter %+d s, f801 %#04x f802 %#04x f803 %#04x, 0x281c %#04x, notes %5ph\n",
+	dev_info(s->dev, "boot PMU%s: 0x2000 %#04x (armed %d event %d) 0x200e %#x compare-counter %+d s, f801 %#04x f802 %#04x f803 %#04x, 0x281c %#04x, 0x200/0x201 %#04x %#04x, notes %5ph\n",
 		 ret ? " (a read failed)" : "", ctl, !!(ctl & T6050_RTC_CTL_ARMED),
 		 !!(ctl & T6050_RTC_CTL_FIRED), rmask, (s32)(cmp - now), stage[1], stage[2], stage[3],
-		 wake, notes);
+		 wake, pst[0], pst[1], notes);
 }
 
 /*
