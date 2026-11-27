@@ -2889,6 +2889,9 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *  4: with apple_sleep.spmi1, the second PMU's latest values (one SPMI read set on nub-spmi1 a
  *     sample): +0 its alarm control (0xff: unread), +1 its 0xf801, +2 its 0x281c, +3 its compare
  *     minus its counter in seconds (signed, clamped), +4 the main PMU's alarm control.
+ *  5: the cores: +0/+1 a bit per core (ECPU0-5 bits 0-5, PCPU0-5 bits 6-11) whose power word
+ *     never read off in the window, +2/+3 the E and P cluster words' low bytes, +4 every core's
+ *     FIQ sources still firing at its last instruction before WFI, ORed (t8142_fiq_sources()).
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -2916,7 +2919,7 @@ static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode >= 1 && mode <= 4;
+	return mode >= 1 && mode <= 5;
 }
 
 struct t6030_obs {
@@ -3012,13 +3015,14 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i, w;
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 	unsigned int scale = DIV_ROUND_UP(n, T6030_OBS_LAST + 1);
-	bool pmu2 = mode == 4, values = mode == 2 || pmu2, word = mode == 3;
+	bool pmu2 = mode == 4, values = mode == 2 || pmu2, word = mode == 3, cores = mode == 5;
+	u16 never_off = GENMASK(11, 0);
 	bool off_seen = false, hit, moved;
 	struct t6030_obs o, ref = {};
 	u8 at[5], v[5], last[5] = {};
 
 	memset(at, T6030_OBS_NOT_YET, sizeof(at));
-	for (i = 0; !values && i < ARRAY_SIZE(at); i++)
+	for (i = 0; !values && !cores && i < ARRAY_SIZE(at); i++)
 		sleep_note_at(s, i, T6030_OBS_NOT_YET);
 	for (k = 0; k < n; k++) {
 		while (read_sysreg(cntpct_el0) - t0 < k * period)
@@ -3028,6 +3032,23 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 			t6030_obs_read_pmu2(&o);
 		if (k == T6030_OBS_SETTLE)
 			ref = o;
+		if (cores) {
+			for (i = 0; i < 12; i++)
+				if (!FIELD_GET(T6030_PS_ACTUAL, readl(s->ps + 8 * i)))
+					never_off &= ~BIT(i);
+			v[0] = never_off & 0xff;
+			v[1] = never_off >> 8;
+			v[2] = o.cluster[0] & 0xff;
+			v[3] = o.cluster[1] & 0xff;
+			v[4] = atomic_read(&sleep_fiq_or);
+			for (i = 0; i < ARRAY_SIZE(v); i++) {
+				if (k && v[i] == last[i])
+					continue;
+				sleep_note_at(s, i, v[i]);
+				last[i] = v[i];
+			}
+			continue;
+		}
 		if (values) {
 			t6030_obs_values(&o, v, pmu2);
 			for (i = 0; i < ARRAY_SIZE(v); i++) {
@@ -3067,7 +3088,7 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 			  o.commit != ref.commit || o.cllt != ref.cllt));
 		t6030_obs_mark(s, at, 4, moved, k / scale);
 	}
-	for (i = 0; !values && i < ARRAY_SIZE(at); i++)
+	for (i = 0; !values && !cores && i < ARRAY_SIZE(at); i++)
 		if (at[i] == T6030_OBS_NOT_YET)
 			sleep_note_at(s, i, T6030_OBS_NEVER);
 }

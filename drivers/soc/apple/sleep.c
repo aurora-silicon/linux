@@ -2738,10 +2738,16 @@ static void sleep_deep_wfi_arm(void)
 	apple_sleep->soc->ops->deep_wfi_arm();
 }
 
+/* With the observer: every core's FIQ sources still firing at its last instruction, ORed */
+static atomic_t sleep_fiq_or = ATOMIC_INIT(0);
+static u8 t8142_fiq_sources(void);
+
 /* A core's last instructions: nothing brings it back but a reset. */
 static void __noreturn sleep_deep_wfi(void)
 {
 	sleep_deep_wfi_arm();
+	if (READ_ONCE(sleep_observer_ms))
+		atomic_or(t8142_fiq_sources(), &sleep_fiq_or);
 
 	while (true) {
 		dsb(sy);
@@ -5916,6 +5922,8 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 		dsb(sy);
 	}
 	sleep_deep_wfi_arm();
+	if (observed)
+		atomic_or(t8142_fiq_sources(), &sleep_fiq_or);
 	t0 = read_sysreg(cntpct_el0);
 
 	while (true) {
