@@ -111,15 +111,23 @@ static int apple_wdt_set_timeout(struct watchdog_device *wdd, unsigned int s)
 static unsigned int apple_wdt_get_timeleft(struct watchdog_device *wdd)
 {
 	struct apple_wdt *wdt = to_apple_wdt(wdd);
-	u32 cur_time, reset_time;
+	u32 ctrl, cur_time, reset_time;
+
+	/*
+	 * Without the reset armed the counter runs freely and wraps every
+	 * 2^32 ticks (about 179 s at 24 MHz), so its distance to the bite
+	 * time means nothing: no reset is coming.
+	 */
+	ctrl = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CTRL);
+	if (!(ctrl & APPLE_WDT_CTRL_RESET_EN))
+		return 0;
 
 	cur_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CUR_TIME);
 	reset_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_BITE_TIME);
 
 	/*
-	 * The counter runs on past the bite time while the reset is not
-	 * armed; the unsigned difference would wrap to up to the whole
-	 * counter range.
+	 * Armed, the counter can read past the bite time while the reset
+	 * is on its way; the unsigned difference would wrap.
 	 */
 	if (cur_time >= reset_time)
 		return 0;

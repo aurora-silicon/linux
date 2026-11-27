@@ -198,6 +198,7 @@ static void apple_wdt_test_set_timeout(struct kunit *test)
 
 	apple_wdt_test_set_rate(ctx, t->rate);
 	KUNIT_ASSERT_EQ(test, ctx->wdt.wdd.max_hw_heartbeat_ms / 1000, t->max_hw_s);
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL, APPLE_WDT_CTRL_RESET_EN);
 
 	KUNIT_ASSERT_EQ(test, apple_wdt_ops.set_timeout(&ctx->wdt.wdd, t->timeout), 0);
 
@@ -211,12 +212,13 @@ static void apple_wdt_test_set_timeout(struct kunit *test)
 			min(t->timeout, t->max_hw_s));
 }
 
-/* The time left is the distance to the bite time in whole seconds. */
+/* Armed, the time left is the distance to the bite time in whole seconds. */
 static void apple_wdt_test_timeleft(struct kunit *test)
 {
 	struct apple_wdt_test *ctx = test->priv;
 	struct watchdog_device *wdd = &ctx->wdt.wdd;
 
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL, APPLE_WDT_CTRL_RESET_EN);
 	apple_wdt_test_set(ctx, APPLE_WDT_WD1_BITE_TIME, 30 * APPLE_WDT_TEST_RATE);
 
 	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, 0);
@@ -247,16 +249,15 @@ static void apple_wdt_test_timeleft(struct kunit *test)
 }
 
 /*
- * The counter keeps counting past the bite time while the reset is not
- * armed (a stopped watchdog, or one that was never started). No time is
- * left then; the distance must not wrap to minutes.
+ * Armed, the counter can read past the bite time while the reset is on
+ * its way. No time is left then; the distance must not wrap to minutes.
  */
 static void apple_wdt_test_timeleft_past_bite(struct kunit *test)
 {
 	struct apple_wdt_test *ctx = test->priv;
 	struct watchdog_device *wdd = &ctx->wdt.wdd;
 
-	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL, 0);
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL, APPLE_WDT_CTRL_RESET_EN);
 	apple_wdt_test_set(ctx, APPLE_WDT_WD1_BITE_TIME, 30 * APPLE_WDT_TEST_RATE);
 
 	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, 30 * APPLE_WDT_TEST_RATE + 1);
@@ -269,6 +270,45 @@ static void apple_wdt_test_timeleft_past_bite(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
 
 	apple_wdt_test_check(test);
+}
+
+/*
+ * Not armed (a stopped watchdog, or one that was never started), the
+ * counter runs freely and wraps past zero every 2^32 ticks. No reset is
+ * coming, so no time is left, whether the counter is past the bite time
+ * or has wrapped back below it.
+ */
+static void apple_wdt_test_timeleft_disarmed(struct kunit *test)
+{
+	struct apple_wdt_test *ctx = test->priv;
+	struct watchdog_device *wdd = &ctx->wdt.wdd;
+
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL, 0);
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_BITE_TIME, 30 * APPLE_WDT_TEST_RATE);
+
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, 31 * APPLE_WDT_TEST_RATE);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
+
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, U32_MAX);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
+
+	/* Wrapped back below the bite time. */
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, 0);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
+
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CUR_TIME, 10 * APPLE_WDT_TEST_RATE);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
+
+	/* A pending interrupt status alone does not arm the reset. */
+	apple_wdt_test_set(ctx, APPLE_WDT_WD1_CTRL,
+			   APPLE_WDT_CTRL_IRQ_EN | APPLE_WDT_CTRL_IRQ_STATUS);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
+
+	/* Stopping a started watchdog takes its time left away. */
+	KUNIT_ASSERT_EQ(test, apple_wdt_ops.start(wdd), 0);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 30);
+	KUNIT_ASSERT_EQ(test, apple_wdt_ops.stop(wdd), 0);
+	KUNIT_EXPECT_EQ(test, apple_wdt_ops.get_timeleft(wdd), 0);
 }
 
 /* A ping gives the whole timeout back. */
@@ -363,6 +403,7 @@ static struct kunit_case apple_wdt_test_cases[] = {
 	KUNIT_CASE_PARAM(apple_wdt_test_set_timeout, apple_wdt_test_timeout_gen_params),
 	KUNIT_CASE(apple_wdt_test_timeleft),
 	KUNIT_CASE(apple_wdt_test_timeleft_past_bite),
+	KUNIT_CASE(apple_wdt_test_timeleft_disarmed),
 	KUNIT_CASE(apple_wdt_test_ping_restores_timeleft),
 	KUNIT_CASE(apple_wdt_test_restart),
 	KUNIT_CASE(apple_wdt_test_sleep_idle),
