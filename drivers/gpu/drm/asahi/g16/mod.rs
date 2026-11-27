@@ -298,7 +298,7 @@ pub(crate) struct Shared {
     /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) has been quarantined.
     pub(crate) base_compute_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
-    pub(crate) quarantined_compute_mask: AtomicU32,
+    pub(crate) quarantined_compute_mask: AtomicU64,
     /// Bitmask of permanently quarantined device-wide compute UMA slots (`0..COMPUTE_UMA_SLOTS`).
     pub(crate) quarantined_compute_uma_mask: AtomicU32,
     /// Round-robin cursor assigning each non-SCS compute VM a slot in `0..COMPUTE_UMA_SLOTS`.
@@ -689,7 +689,7 @@ impl Gpu {
                 sleeping: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
                 base_compute_quarantined: AtomicBool::new(false),
-                quarantined_compute_mask: AtomicU32::new(0),
+                quarantined_compute_mask: AtomicU64::new(0),
                 quarantined_compute_uma_mask: AtomicU32::new(0),
                 next_compute_uma_slot: AtomicU32::new(0),
                 compute_uma_slot_users,
@@ -782,7 +782,11 @@ impl Firmware {
             let recovery = recovery::Recovery::new()?;
             let render_cmds = resources::RenderCmds::new()?;
             let compute_cmds = resources::ComputeCmds::new()?;
-            let private_factory = booted.objects.private_factory(render_cmds, compute_cmds);
+            let compute_uma_pool = resources::ComputeUmaPool::new()?;
+            let private_factory =
+                booted
+                    .objects
+                    .private_factory(render_cmds, compute_cmds, compute_uma_pool);
             let graph = graph::Graphs::finish(dev, graph_session, &private_factory)?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
             Ok((graph, private_factory, slots, pools, vms, engine, recovery, slot))

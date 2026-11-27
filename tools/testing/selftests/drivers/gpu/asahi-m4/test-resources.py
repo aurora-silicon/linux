@@ -131,11 +131,20 @@ pub mod g16 {
             }
         }
         pub struct Factory;
+        std::thread_local!{
+            pub static COMPUTE_UMA_POOL: std::cell::RefCell<Option<Arc<super::resources::ComputeUmaPool>>> = const { std::cell::RefCell::new(None) };
+        }
         impl Factory{
             pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
             pub fn fw_objects(&self)->Objects{Objects::new()}
             pub fn persistent_objects(&self)->Objects{Objects::persistent()}
             pub fn persistent_objects_probe(&self)->Objects{Objects::persistent()}
+            pub fn compute_uma_pool(&self)->Arc<super::resources::ComputeUmaPool>{
+                COMPUTE_UMA_POOL.with(|p|{
+                    let mut p = p.borrow_mut();
+                    p.get_or_insert_with(||super::resources::ComputeUmaPool::new().unwrap()).clone()
+                })
+            }
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
@@ -304,14 +313,14 @@ pub mod g16 {
         }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
-            pub fn compute_slot_mask(&self)->Result<u32>{
+            pub fn compute_slot_mask(&self)->Result<u64>{
                 if let Some(slots)=self.hw_slots {
-                    let mut mask=0u32;
-                    for slot in slots { mask |= 1u32 << slot; }
+                    let mut mask=0u64;
+                    for slot in slots { mask |= 1u64 << slot; }
                     return Ok(mask);
                 }
                 let n=self.compute.len().min(super::hw::sizes::COMPUTE_UNITS);
-                Ok(if n>=32 { u32::MAX } else { (1u32 << n) - 1 })
+                Ok(if n>=64 { u64::MAX } else { (1u64 << n) - 1 })
             }
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{
                 if let Some(slots)=self.hw_slots {
@@ -1134,9 +1143,11 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn forty_eight_render_passes_and_twenty_four_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn forty_eight_render_passes_and_sixty_four_compute_units_are_disjoint_in_mesa_hole(){
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
-        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 64);
+        assert_eq!(g16::hw::sizes::COMPUTE_PIPES, 16);
+        assert_eq!(g16::hw::sizes::FLIGHTS, 64);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         for idx in 0..g16::hw::sizes::EXT_PB_SLOTS {
@@ -1146,7 +1157,13 @@ pub mod g16 {
             assert_eq!(ext.refs().unwrap().parameter_id,hw_slot);
         }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap();
+            g16::slots::ComputeSlot::new_shared_in(&mut o,k,&crate::g16::object::test_unit_cmds(k)).unwrap();
+        }
+        let pl=g16::slots::Placement::Base;
+        for w in 0..g16::hw::sizes::COMPUTE_UMA_WINDOWS as u64 {
+            o.alloc(g16::object::Request{size:pl.pool_bytes(),class:g16::object::Class::Shared,placement:g16::object::Placement::Anywhere,offset:0,client:Some((pl.pool(w),g16::hw::pte::LEAF_NC)),lower:None,cpu:false}).unwrap();
+            g16::graph::alloc(&mut o,pl.freelist_bytes(),g16::object::Class::Shared,g16::graph::Client::nc(pl.freelist(w)),0,false).unwrap();
+            g16::graph::alloc(&mut o,0x4000,g16::object::Class::Shared,g16::graph::Client::nc(pl.state(w)+g16::hw::client::COMPUTE_LIST_OFF),0,false).unwrap();
         }
         let mut scene_lists=Vec::new();
         let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
@@ -2111,7 +2128,7 @@ pub mod g16 {
         let mut c=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c,Some(bad.id),0).unwrap(),Some(0));
         s.hold_vm(&c,&bad).unwrap();s.publish(&mut c).unwrap();s.quarantine(&mut c);
-        assert_eq!(s.quarantined_compute_mask(), 1u32 << 0);
+        assert_eq!(s.quarantined_compute_mask(), 1u64 << 0);
         // Pipe 1 runs concurrent non-SCS compute on PIPE1_COMPUTE_START..COMPUTE_UNITS.
         let mut c_p1=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c_p1,Some(other.id),1).unwrap(),Some(p1_start));
@@ -2125,7 +2142,7 @@ pub mod g16 {
         }
         let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots),shared_uma:None};
         let scs_mask = prep_scs.compute_slot_mask().unwrap();
-        assert_eq!(scs_mask, (1u32 << 1) | (1u32 << 2));
+        assert_eq!(scs_mask, (1u64 << 1) | (1u64 << 2));
         // Execute two back-to-back SCS compute commands (e.g. rt.scene p_rt + p_comp) repeatedly:
         // must never hit compute_exhausted_in_mask and must ping-pong cleanly across [1, 2].
         for expected in [1usize, 2, 1, 2] {
@@ -2384,7 +2401,7 @@ pub mod g16 {
         assert_eq!(c1.qinfo.class, Class::FwCached);
         assert_eq!(c1.qstate.class, Class::Fw);
         assert_eq!(c1.ring.class, Class::FwCoherent);
-        assert_eq!(c1.fw_stamp.class, Class::Shared);
+        assert_eq!(c1.fw_stamp.class, Class::FwCached);
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
         assert_eq!(c.job_list.class, Class::FwCached);
@@ -2394,7 +2411,7 @@ pub mod g16 {
         assert_eq!(c.threshold.class, Class::Fw);
         assert_eq!(c.ring.class, Class::FwCoherent);
         assert_eq!(c.user_stamp.class, Class::Shared);
-        assert_eq!(c.fw_stamp.class, Class::Shared);
+        assert_eq!(c.fw_stamp.class, Class::FwCached);
         for stage in 0..2 {
             assert_eq!(r.qinfo[stage].class, Class::FwCached);
             assert_eq!(r.qscratch[stage].class, Class::FwCached);
@@ -3635,7 +3652,11 @@ pub mod g16 {
             .unwrap();
         s.hold_compute_slot(ka, &vm_a, &prep_a).unwrap();
         s.publish(&mut ca).unwrap();
+        uma_a.uma_lease.publish();
         s.quarantine(&mut ca);
+        assert!(!uma_a.uma_lease.settled(), "aborted UMA lease must never recycle");
+        assert_eq!(uma_a.descriptor.class, g16::object::Class::FwCoherent);
+        assert_eq!(uma_a.counter.class, g16::object::Class::Fw);
         let qmask = s.quarantined_compute_uma_mask();
         assert_eq!(qmask, 1u32 << 0);
         assert!(s.compute_uma_quarantined(1u32 << 0));
@@ -3677,12 +3698,25 @@ pub mod g16 {
         );
         s.hold_compute_slot(kb1, &vm_b, &prep_b).unwrap();
         s.publish(&mut cb1).unwrap();
+        uma_b1.uma_lease.publish();
         s.retire(&mut cb1).unwrap();
+        uma_b1.uma_lease.retire();
+        assert!(uma_b1.uma_lease.settled(), "cleanly retired UMA lease settles for reuse");
+        let desc_a_va = uma_a.descriptor.va;
+        let desc_b0_va = uma_b0.descriptor.va;
+        let desc_b1_va = uma_b1.descriptor.va;
         let lease_b1 = uma_b1.uma_lease.clone();
-        // Exhausting pool_va_idx >= COMPUTE_UNITS returns EIO.
+        // Exhausting pool_va_idx >= COMPUTE_UMA_WINDOWS returns EIO.
         assert!(
-            SharedComputeUma::new(&factory, &bind_b, &vm_b.vm, &live_b, s2, COMPUTE_UNITS)
-                .is_err()
+            SharedComputeUma::new(
+                &factory,
+                &bind_b,
+                &vm_b.vm,
+                &live_b,
+                s2,
+                g16::hw::sizes::COMPUTE_UMA_WINDOWS,
+            )
+            .is_err()
         );
         drop(bind_b);
         drop(prep_b);
@@ -3690,9 +3724,27 @@ pub mod g16 {
         drop(uma_b0);
         drop(occ_b1);
         assert_eq!(users[s2].load(Ordering::Acquire), 0);
-        assert_eq!(sync::Arc::strong_count(&lease_b1), 2, "retired FwLease retained");
+        assert_eq!(sync::Arc::strong_count(&lease_b1), 2, "retired ComputeUmaLease retained");
+        drop(lease_b1);
         drop(s);
         drop(uma_a);
+        // Once every holder of cleanly settled ComputeUmaLeases drops, the pool recycles
+        // both settled FwCoherent descriptors and never recycles the aborted one (`desc_a_va`).
+        let vm_c = vm(2003);
+        let vm_d = vm(2004);
+        let (bind_c, live_c, _) = g16::vm::test_live_token();
+        let (bind_d, live_d, _) = g16::vm::test_live_token();
+        let uma_c = SharedComputeUma::new(&factory, &bind_c, &vm_c.vm, &live_c, s2, 0).unwrap();
+        let uma_d = SharedComputeUma::new(&factory, &bind_d, &vm_d.vm, &live_d, s2, 0).unwrap();
+        let (vc, vd) = (uma_c.descriptor.va, uma_d.descriptor.va);
+        drop(bind_c);
+        drop(bind_d);
+        drop(uma_c);
+        drop(uma_d);
+        assert_eq!(vc, desc_b0_va, "first settled FwCoherent descriptor recycled");
+        assert_eq!(vd, desc_b1_va, "second settled FwCoherent descriptor recycled");
+        assert_ne!(vc, desc_a_va);
+        assert_ne!(vd, desc_a_va);
     }
 
 }
@@ -3790,7 +3842,29 @@ assert alloc_private_in_fn.index('UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?
 assert alloc_private_in_fn.index('self.uat.kernel_lower_vm().map_in_range(') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must map uncached aliases before firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range(') < alloc_private_in_fn.index('self.mappings.push_within_capacity(firmware)'), 'alloc_private_in must commit mappings infallibly after firmware map'
 shared_uma_code = (
-    'pub(crate) struct SharedComputeUma(crate::cleanup::Deferred<SharedComputeUmaInner>);\n'
+    'use core::sync::atomic::AtomicBool;\n'
+    + item(resources_source, 'pub(crate) struct ComputeUmaRecordSet {')
+    + '\n'
+    + item(resources_source, 'impl ComputeUmaRecordSet {')
+    + '\n'
+    + item(resources_source, 'struct ComputeUmaEntry {')
+    + '\n'
+    + 'pub(crate) struct ComputeUmaPool { entries: crate::sync::Mutex<KVec<crate::sync::Arc<ComputeUmaEntry>>> }\n'
+    + 'impl ComputeUmaPool {\n'
+    + '    pub(crate) fn new() -> Result<crate::sync::Arc<Self>> {\n'
+    + '        crate::sync::Arc::new(Self { entries: crate::sync::Mutex::new(KVec::new()) }, 0)\n'
+    + '    }\n'
+    + item(resources_source, 'pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<ComputeUmaLease>, bool)> {')
+    + '\n}\n'
+    + item(resources_source, 'pub(crate) struct ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl core::ops::Deref for ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl Drop for ComputeUmaLease {')
+    + '\n'
+    + 'pub(crate) struct SharedComputeUma(crate::cleanup::Deferred<SharedComputeUmaInner>);\n'
     + item(resources_source, 'impl core::ops::Deref for SharedComputeUma {')
     + '\n'
     + item(resources_source, 'pub(crate) struct SharedComputeUmaInner {')

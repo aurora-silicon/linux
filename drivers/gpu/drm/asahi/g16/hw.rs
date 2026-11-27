@@ -937,12 +937,14 @@ pub(crate) mod client {
     // pack at a 40 MiB stride from 0x7080000000 up to the SCS compute records (0x70b8000000),
     // clear of [`DYNAMIC`] and [`SCS_POOLS`] and leaving 7.25 MiB guard above each unit's
     // 32.75 MiB footprint (`0x20c0000`). Every alias is inside Mesa's reserved hole.
-    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02800000;
+    pub(crate) const EXT_COMPUTE_POOL_STRIDE: u64 = 0x02100000;
+    pub(crate) const EXT_COMPUTE_REC_BASE: u64 = 0x70b4000000;
+    pub(crate) const EXT_COMPUTE_REC_STRIDE: u64 = 0x00100000;
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7080000000 + (k - 2) * EXT_COMPUTE_STRIDE
+            0x7080000000 + (k - 2) * EXT_COMPUTE_POOL_STRIDE
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -955,13 +957,25 @@ pub(crate) mod client {
         compute_base(k) + 0x2020000
     }
     pub(crate) const fn compute_preempt(k: u64) -> u64 {
-        compute_base(k) + 0x2030000
+        if k < 2 {
+            compute_base(k) + 0x2030000
+        } else {
+            EXT_COMPUTE_REC_BASE + (k - 2) * EXT_COMPUTE_REC_STRIDE
+        }
     }
     pub(crate) const fn compute_aux(k: u64) -> u64 {
-        compute_base(k) + 0x2040000
+        if k < 2 {
+            compute_base(k) + 0x2040000
+        } else {
+            EXT_COMPUTE_REC_BASE + (k - 2) * EXT_COMPUTE_REC_STRIDE + 0x10000
+        }
     }
     pub(crate) const fn compute_context(k: u64) -> u64 {
-        compute_base(k) + 0x2080000
+        if k < 2 {
+            compute_base(k) + 0x2080000
+        } else {
+            EXT_COMPUTE_REC_BASE + (k - 2) * EXT_COMPUTE_REC_STRIDE + 0x40000
+        }
     }
     pub(crate) const WORK_PAGE: u64 = 0x7000100000;
     pub(crate) const WORK_OFF: u64 = 0;
@@ -1110,9 +1124,9 @@ pub(crate) mod sizes {
     /// `notifier`, `threshold`, `job_list`) and completion event (`work::compute::EVENTS`) so
     /// concurrent compute VMs lease disjoint workqueues instead of mixing ASIDs in one active
     /// `qinfo`. Pipe 0 exclusively owns `0..PIPE1_COMPUTE_START` for base-only and SCS VMs;
-    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (18 units
-    /// for 7 secondary pipes, leaving 11 active units beyond the 7 undisplaced retired leases).
-    pub(crate) const COMPUTE_PIPES: usize = 8;
+    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (58 units
+    /// for 15 secondary pipes, leaving 43 active units beyond the 15 undisplaced retired leases).
+    pub(crate) const COMPUTE_PIPES: usize = 16;
     /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
     /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
     pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
@@ -1177,7 +1191,7 @@ pub(crate) mod sizes {
     /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
     /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), use
     /// per-allocator hardware UMA slots `RENDER_UMA_SLOT + slot` (`33..38`, strictly inside the
-    /// firmware render slot range `33..64`), post at most `FLIGHTS = 32` `SubmitRecord`s (vs
+    /// firmware render slot range `33..64`), post at most `FLIGHTS = 64` `SubmitRecord`s (vs
     /// `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the firmware recovery
     /// `snapshot_entries = 448` limit.
     pub(crate) const RENDER_SLOTS: usize = 48;
@@ -1206,15 +1220,18 @@ pub(crate) mod sizes {
     pub(crate) const PB_GROW_STEP: u32 = 10;
     /// Published prefixes at most. Warm render commands may pipeline across VMs on disjoint
     /// hardware UMA slots, compute only behind its own VM's work, while cold `InitBM` renders
-    /// and recovery paths drain.
-    pub(crate) const FLIGHTS: usize = 32;
-    /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
-    /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
-    /// only after a later publication retired (it displaced the unit), so `n` units keep up to
-    /// `n - 1` compute commands in flight (`23 * 2 = 46` entries of the 256-entry compute work
-    /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
-    /// `snapshot_entries = 448`).
-    pub(crate) const COMPUTE_UNITS: usize = 24;
+    /// and recovery paths drain. Bounded by channel ahead limit (`AHEAD_RECORDS = 128`).
+    pub(crate) const FLIGHTS: usize = 64;
+    /// Retained compute units per VM at most. Non-SCS compute VMs share one UMA descriptor,
+    /// pool, and hardware UMA slot (`1..=32`) across all units, so unit count is bounded by
+    /// the 26B123 compute work ring (`(COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < 256`,
+    /// `63 * 3 = 189 < 256`), the `u64` slot mask (`<= 64`), `SCHEDULER_CREDITS = 64`, and
+    /// recovery `snapshot_entries = 448`. With `COMPUTE_PIPES = 16` holding up to 16
+    /// undisplaced retired owners, 64 units leave 48 reusable units (3 per VM at 16 processes).
+    pub(crate) const COMPUTE_UNITS: usize = 64;
+    /// Disjoint per-VM client VA windows for `SharedComputeUma` pool/freelist/list allocation
+    /// (2 base windows + 24 extension windows below `EXT_COMPUTE_REC_BASE`).
+    pub(crate) const COMPUTE_UMA_WINDOWS: usize = 26;
     /// Device-wide hardware compute UMA manager slots (`COMPUTE_UMA_SLOT..RENDER_UMA_SLOT`,
     /// slots `1..=32`). Non-SCS compute VMs share one UMA descriptor, pool, and hardware slot
     /// across all of their compute units and pipes so firmware skips UMA teardown and rebind
@@ -1222,18 +1239,21 @@ pub(crate) mod sizes {
     pub(crate) const COMPUTE_UMA_SLOTS: usize =
         (super::engine::RENDER_UMA_SLOT - super::engine::COMPUTE_UMA_SLOT) as usize;
     const _: () = assert!(COMPUTE_UMA_SLOTS == 32);
-    const _: () = assert!(COMPUTE_UNITS >= 2);
+    const _: () = assert!(COMPUTE_UNITS >= 2 && COMPUTE_UNITS <= 64);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
+    const _: () =
+        assert!(super::client::compute_list(2) + 0x4000 <= super::client::compute_base(3));
     const _: () = assert!(
-        super::client::compute_context(2) + 0x40000 <= super::client::compute_base(3)
+        super::client::compute_base(COMPUTE_UMA_WINDOWS as u64)
+            <= super::client::EXT_COMPUTE_REC_BASE
     );
+    const _: () =
+        assert!(super::client::compute_context(2) + 0x40000 <= super::client::compute_preempt(3));
     const _: () = assert!(
-        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP
+        super::client::compute_context(COMPUTE_UNITS as u64 - 1) + 0x40000
+            <= super::client::scs_compute_records(0)
     );
-    const _: () = assert!(
-        super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
-            <= super::engine::RENDER_UMA_SLOT
-    );
+    const _: () = assert!(SCS_COMPUTE_UNITS <= COMPUTE_UMA_SLOTS);
     /// SCS-capable compute units per VM, bound dynamically to healthy compute ledger indices
     /// (and UMA slots) preferring pipe-0-exclusive indices `0..PIPE1_COMPUTE_START`.
     pub(crate) const SCS_COMPUTE_UNITS: usize = 2;
@@ -1248,11 +1268,10 @@ pub(crate) mod sizes {
     /// Bytes of a base UMA pool (its seeds of 4 KiB).
     pub(crate) const POOL_BYTES: u64 = 0x2000000;
     const _: () = assert!(
-        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::scs_compute_records(0)
-            && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64 - 1)
-                + super::client::COMPUTE_CONTEXT_OFF
-                + 0x40000
-                <= super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
+        super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64 - 1)
+            + super::client::COMPUTE_CONTEXT_OFF
+            + 0x40000
+            <= super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
             && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
                 <= super::client::PB_HEAP
             && super::client::WORK_PAGE

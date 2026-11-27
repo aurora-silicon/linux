@@ -31,7 +31,7 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 #[path="__LOGIC__"]mod logic;
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
-mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; } }
+mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 16; } }
 struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
 impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {
@@ -156,9 +156,10 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
         f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,9);
         assert_eq!(f.retired(),Ok(Retirement::Full));
-        f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n-1)));
+        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n)));
+        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n)));
+        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,n-1);
@@ -233,7 +234,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     for stage in 0..2 { f2.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
     f2.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
     f2.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
-    f2.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
+    f2.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(29)));
     assert_eq!(f2.retired_flight(),Ok(Some((1,Retirement::Full))));
 }
 #[test]fn multi_compute_horizon_requires_every_claimed_unit_receipt(){
@@ -273,9 +274,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     // Render-only retirement performs zero compute WC reads.
     let mut fr=firmware(true,5);
     assert_eq!(fr.retired_flight(),Ok(Some((0,Retirement::Full))));
-    assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(),0);
     assert_eq!(fr.graph.compute[0].notifier.reads.get(),0);
-    assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(),0);
+    assert_eq!(fr.graph.compute[0].notifier.reads.get(),0);
+    assert_eq!(fr.graph.compute[1].notifier.reads.get(),0);
     assert_eq!(fr.graph.compute[1].notifier.reads.get(),0);
     // In-progress render (TA done, FS still running) fails fast on FS stamp without reading TA or scene.
     let mut fp=firmware(true,7);
@@ -292,9 +293,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     // Mixed flight pending is polled once, not twice.
     let mut fm=firmware(false,9);
     fm.engine.flights[0].renders=1;
-    fm.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(8)));
+    fm.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(8)));
     assert_eq!(fm.retired_flight(),Ok(None));
-    assert_eq!(fm.graph.compute[0].fw_stamp.reads.get(),1);
+    assert_eq!(fm.graph.compute[0].notifier.reads.get(),1);
     assert_eq!(fm.graph.render.fw_stamp[1].reads.get(),0);
     // Pending compute class is not re-polled while retiring a burst of render flights.
     let mut fmix=firmware(false,30);
@@ -307,7 +308,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     for stage in 0..2 { fmix.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
     fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
     fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
-    fmix.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
+    fmix.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(29)));
     let (mut check_c,mut check_r)=([true;hw::sizes::COMPUTE_PIPES],true);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
     assert!(!check_c[0] && !check_c[1] && check_r);
@@ -315,7 +316,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(None));
-    assert_eq!(fmix.graph.compute[0].fw_stamp.reads.get(),1);
+    assert_eq!(fmix.graph.compute[0].notifier.reads.get(),1);
 }
 #[test]fn innocent_suspect_flight_does_not_false_abort_after_recovery_grace(){
     let mut f=firmware(true,15);
@@ -446,7 +447,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights.push(c1);
     f.engine.target[0]=encode::stamp(10);f.engine.target[1]=encode::stamp(11);
     f.channels.compute_producer=2;
-    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(9)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(9)));
     f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(11)));
     f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(11)));
     f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
@@ -456,7 +457,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(f.retired_flight(),Ok(None));
     // Now finish pipe 0: rec[2]=1 != producer=2 still sets chan_behind=true.
     f.last_chan_passed.set(None);
-    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(10)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(10)));
     assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
     assert_eq!(f.last_chan_passed.get(),Some(true));
 }
@@ -713,19 +714,18 @@ mod queue_proof {
     f.engine.target[1]=second.target;
     f.engine.flights.push(second);
     assert_eq!(f.retired_at(1),Ok(Retirement::Full));
-    // With only flight 0 left (`last_vm_flight == true`), even when `needed == 1 <= COMPLETED`
-    // (retired == 0, count == 1, counter == 2, COMPLETED == 1), idle conservation MUST reject
-    // `COMPLETED != counter` so an unretired earlier command cannot be missed.
+    // With only flight 0 left (`last_vm_flight == true`), `needed == 1 != counter == 2`
+    // (retired == 0, count == 1, counter == 2) MUST reject so an unretired command cannot be
+    // missed before the VM drains idle.
     f.engine.flights.pop();
     assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
-    // Advancing `retired == 1` (`needed == 2 > COMPLETED == 1`) also stays Pending.
+    // Advancing `retired == 1` (`needed == 2 == counter == 2`) retires Full without reading
+    // the ASC-cached descriptor from the host.
     f.engine.flights[0].job.resources.compute_uma.as_ref().unwrap().retired.store(1,Ordering::Release);
-    assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
-    // Matching `COMPLETED == counter == 2` retires Full.
-    f.engine.flights[0].job.resources.compute_uma.as_mut().unwrap().descriptor.set(manager::COMPLETED,2);
     assert_eq!(f.retired_at(0),Ok(Retirement::Full));
-    // Mismatched descriptor COUNTER pointer stays Pending.
-    f.engine.flights[0].job.resources.compute_uma.as_mut().unwrap().descriptor.set(manager::COUNTER,0x9999);
+    assert_eq!(f.engine.flights[0].job.resources.compute_uma.as_ref().unwrap().descriptor.reads.get(),0);
+    // Counter lagging behind `needed` stays Pending.
+    f.engine.flights[0].job.resources.compute_uma.as_mut().unwrap().counter.set(0,1);
     assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
 }
 

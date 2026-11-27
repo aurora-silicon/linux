@@ -349,14 +349,13 @@ impl ComputeSlot {
     /// rebuilding per-unit arenas.
     pub(crate) fn new_shared_in(o: &mut Objects, k: u64, cmds: &UnitCmds) -> Result<Self> {
         let sh = Class::Shared;
-        let state = Placement::Base.state(k);
         Ok(Self {
             its: alloc(o, 16, sh, None, 0, false)?,
             preempt: alloc(
                 o,
                 0x4000,
                 sh,
-                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
+                Client::nc(client::compute_preempt(k)),
                 0,
                 false,
             )?,
@@ -367,18 +366,11 @@ impl ComputeSlot {
                 o,
                 0x40000,
                 sh,
-                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
+                Client::nc(client::compute_context(k)),
                 0,
                 false,
             )?,
-            aux: alloc(
-                o,
-                0x4000,
-                sh,
-                Client::nc(state + client::COMPUTE_AUX_OFF),
-                0,
-                false,
-            )?,
+            aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
             private_uma: None,
         })
     }
@@ -791,8 +783,8 @@ pub(crate) struct ComputeOwners {
     /// VM-free firmware leases keeping each hardware compute UMA slot's `descriptor` + `counter`
     /// mapped in context-0 UAT across closed-VM reclaim until a later compute retirement
     /// overwrites firmware `uma_mgr_table[COMPUTE_UMA_SLOT + slot]`.
-    retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UMA_SLOTS],
-    pending_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
+    retained_uma: [Option<ComputeUmaRetain>; sizes::COMPUTE_UMA_SLOTS],
+    pending_uma: [Option<ComputeUmaRetain>; sizes::COMPUTE_UNITS],
     pending_uma_slot: [usize; sizes::COMPUTE_UNITS],
     /// In-flight VM-shared compute UMA backing (`None` for private/SCS units). Dropped on clean
     /// retirement (`retained_uma[slot]` keeps the VM-free `FwLease`) and moved into
@@ -810,6 +802,13 @@ pub(crate) struct ComputeOwners {
     scrub_full: [bool; sizes::COMPUTE_UNITS],
     /// Whether the most recent claim of each compute unit required a full scrub/work write.
     last_full: [bool; sizes::COMPUTE_UNITS],
+}
+
+/// Hardware compute UMA descriptor/counter retention lease keeping firmware's global
+/// `uma_mgr_table[COMPUTE_UMA_SLOT + slot]` mapped across closed-VM reclaim until overwritten.
+enum ComputeUmaRetain {
+    Private(Arc<FwLease>),
+    Shared(Arc<super::resources::ComputeUmaLease>),
 }
 
 /// Bitmask of valid hardware compute UMA slot indices (`0..sizes::COMPUTE_UMA_SLOTS`).
@@ -1152,11 +1151,11 @@ impl Slots {
         self.compute.lifetime.exhausted_within(n)
     }
     /// Whether none of the compute units in `mask` (bit `k` -> unit `k`) can ever be claimed.
-    pub(crate) fn compute_exhausted_in_mask(&self, mask: u32) -> bool {
+    pub(crate) fn compute_exhausted_in_mask(&self, mask: u64) -> bool {
         self.compute.lifetime.exhausted_in_mask(mask)
     }
     /// Bitmask of permanently quarantined compute units (`0..COMPUTE_UNITS`).
-    pub(crate) fn quarantined_compute_mask(&self) -> u32 {
+    pub(crate) fn quarantined_compute_mask(&self) -> u64 {
         self.compute.lifetime.quarantined_mask()
     }
     pub(crate) fn render_exhausted(&self) -> bool {
@@ -1187,7 +1186,7 @@ impl Slots {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
     /// Whether any compute unit in `mask` can be claimed now.
-    pub(crate) fn compute_available_in_mask(&self, mask: u32) -> bool {
+    pub(crate) fn compute_available_in_mask(&self, mask: u64) -> bool {
         let mut rem = mask;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -1202,11 +1201,11 @@ impl Slots {
     /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
     /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
     /// leases.
-    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u64, pipe: usize) -> bool {
         let allowed = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         self.compute_available_in_mask(allowed)
     }
@@ -1214,10 +1213,10 @@ impl Slots {
     #[allow(dead_code)]
     pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let mask = if limit >= 32 {
-            u32::MAX
+        let mask = if limit >= 64 {
+            u64::MAX
         } else {
-            (1u32 << limit) - 1
+            (1u64 << limit) - 1
         };
         self.compute_available_in_mask_for_pipe(mask, pipe)
     }
@@ -1428,11 +1427,11 @@ impl Slots {
         self.free_compute_in_for_pipe(n, 0)
     }
     /// Available compute units in `mask` eligible for `pipe`.
-    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u64, pipe: usize) -> u32 {
         let mut rem = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         let mut count = 0u32;
         while rem != 0 {
@@ -1448,10 +1447,10 @@ impl Slots {
     #[allow(dead_code)]
     pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let mask = if limit >= 32 {
-            u32::MAX
+        let mask = if limit >= 64 {
+            u64::MAX
         } else {
-            (1u32 << limit) - 1
+            (1u64 << limit) - 1
         };
         self.free_compute_in_mask_for_pipe(mask, pipe)
     }
@@ -1527,18 +1526,18 @@ impl Slots {
         let allowed = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         if allowed == 0 {
             return Ok(None);
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
-        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+        let p0_mask = (1u64 << sizes::PIPE1_COMPUTE_START) - 1;
         // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
         // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
         // secondary pipes keep maximum unit headroom.
-        let tiers: [u32; 2] = if pipe == 0 {
+        let tiers: [u64; 2] = if pipe == 0 {
             [allowed & p0_mask, allowed & !p0_mask]
         } else {
             [allowed, 0]
@@ -1552,7 +1551,7 @@ impl Slots {
                 }
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (tier & (1u32 << k)) != 0
+                    if (tier & (1u64 << k)) != 0
                         && !self.compute.scrub_full[k]
                         && self.compute.owner[k]
                             .as_ref()
@@ -1572,7 +1571,7 @@ impl Slots {
                     }
                     for i in 0..n {
                         let k = (base_cursor + i) % n;
-                        if (tier & (1u32 << k)) != 0
+                        if (tier & (1u64 << k)) != 0
                             && self.compute.owner[k].is_none()
                             && self.compute.lifetime.claim(k)
                         {
@@ -1591,7 +1590,7 @@ impl Slots {
                 }
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (tier & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
+                    if (tier & (1u64 << k)) != 0 && self.compute.lifetime.claim(k) {
                         chosen = Some(k);
                         break 'any;
                     }
@@ -1972,7 +1971,7 @@ impl Slots {
         self.compute.pending_owner[k] = Some(vm.clone());
         self.compute.pending_arena[k] = resources.compute_arena(k);
         if let Some(shared) = resources.shared_compute_uma() {
-            self.compute.pending_uma[k] = Some(shared.uma_lease.clone());
+            self.compute.pending_uma[k] = Some(ComputeUmaRetain::Shared(shared.uma_lease.clone()));
             self.compute.pending_uma_slot[k] = shared.uma_slot_idx;
             self.compute.pending_shared_uma[k] = Some(shared.clone());
         } else if let Some(private) = resources
@@ -1980,7 +1979,7 @@ impl Slots {
             .ok()
             .and_then(|unit| unit.private_uma.as_ref())
         {
-            self.compute.pending_uma[k] = Some(private.uma_lease());
+            self.compute.pending_uma[k] = Some(ComputeUmaRetain::Private(private.uma_lease()));
             self.compute.pending_uma_slot[k] = private.uma_slot_idx();
             self.compute.pending_shared_uma[k] = None;
         } else {
@@ -2111,7 +2110,7 @@ impl Slots {
             }
             if let Some(cell) = self.compute.pending_uma.get_mut(k as usize) {
                 if let Some(shared) = resources.shared_compute_uma() {
-                    *cell = Some(shared.uma_lease.clone());
+                    *cell = Some(ComputeUmaRetain::Shared(shared.uma_lease.clone()));
                     self.compute.pending_uma_slot[k as usize] = shared.uma_slot_idx;
                     self.compute.pending_shared_uma[k as usize] = Some(shared.clone());
                 } else if let Some(private) = resources
@@ -2119,7 +2118,7 @@ impl Slots {
                     .ok()
                     .and_then(|unit| unit.private_uma.as_ref())
                 {
-                    *cell = Some(private.uma_lease());
+                    *cell = Some(ComputeUmaRetain::Private(private.uma_lease()));
                     self.compute.pending_uma_slot[k as usize] = private.uma_slot_idx();
                     self.compute.pending_shared_uma[k as usize] = None;
                 } else {

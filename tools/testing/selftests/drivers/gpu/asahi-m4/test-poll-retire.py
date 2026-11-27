@@ -68,7 +68,7 @@ mod hw {
         pub const TA_WAVE_PASSES: usize = 4;
         pub const TA_WAVE_PASSES_LIGHT: usize = 8;
         pub const TA_WAVE_REFILL_HEADROOM: usize = 2;
-        pub const COMPUTE_PIPES: usize = 8;
+        pub const COMPUTE_PIPES: usize = 16;
         pub const COALESCE_WINDOW_US: u32 = 18;
     }
 }
@@ -122,8 +122,11 @@ impl Cell32 {
     }
 }
 
+mod notifier_page {
+    pub const COMPUTE_STAMP: usize = 0x640;
+}
 struct ComputeGraph {
-    fw_stamp: Cell32,
+    notifier: Cell32,
 }
 struct RenderGraph {
     fw_stamp: [Cell32; 2],
@@ -350,7 +353,7 @@ impl Firmware {
             objects: Objects,
             graph: Graph {
                 compute: core::array::from_fn(|_| ComputeGraph {
-                    fw_stamp: Cell32::new(0),
+                    notifier: Cell32::new(0),
                 }),
                 render: RenderGraph {
                     fw_stamp: [Cell32::new(0), Cell32::new(0)],
@@ -598,7 +601,7 @@ fn submit_locked_retires_inline_on_reached_stamp_without_full_housekeeping() {
         fs_target: 0,
     });
     fw.engine.target[0] = 0x100;
-    fw.graph.compute[0].fw_stamp.set(0x100);
+    fw.graph.compute[0].notifier.set(0x100);
     fw.retire_on_call = true;
 
     let mut done = vec![];
@@ -867,9 +870,9 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     fw.engine.target[0] = 0x100;
     // Render still running, compute reached its stamp.
     fw.graph.render.fw_stamp[1].set(0x100);
-    fw.graph.compute[0].fw_stamp.set(0x100);
+    fw.graph.compute[0].notifier.set(0x100);
     assert!(fw.oldest_stamp_reached());
-    assert_eq!(fw.graph.compute[0].fw_stamp.reads.get(), 1);
+    assert_eq!(fw.graph.compute[0].notifier.reads.get(), 1);
     assert_eq!(fw.graph.render.fw_stamp[1].reads.get(), 0);
     assert_eq!(fw.oldest_terminal_events(), Some((Some(0), Some(0))));
 
@@ -891,11 +894,11 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     });
     fw2.engine.target[0] = 0x200;
     fw2.engine.target[1] = 0x100;
-    fw2.graph.compute[0].fw_stamp.set(0x100);
-    fw2.graph.compute[1].fw_stamp.set(0x100);
+    fw2.graph.compute[0].notifier.set(0x100);
+    fw2.graph.compute[1].notifier.set(0x100);
     assert!(fw2.oldest_stamp_reached());
-    assert_eq!(fw2.graph.compute[0].fw_stamp.reads.get(), 1);
-    assert_eq!(fw2.graph.compute[1].fw_stamp.reads.get(), 1);
+    assert_eq!(fw2.graph.compute[0].notifier.reads.get(), 1);
+    assert_eq!(fw2.graph.compute[1].notifier.reads.get(), 1);
     assert_eq!(fw2.graph.render.fw_stamp[1].reads.get(), 0);
 }
 
@@ -911,10 +914,10 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
         fs_target: 0,
     });
     fc.engine.target[0] = 0x200;
-    fc.graph.compute[0].fw_stamp.set(0x100);
+    fc.graph.compute[0].notifier.set(0x100);
     assert!(!fc.oldest_stamp_reached());
-    assert_eq!(fc.graph.compute[0].fw_stamp.reads.get(), 1);
-    assert_eq!(fc.graph.compute[1].fw_stamp.reads.get(), 0);
+    assert_eq!(fc.graph.compute[0].notifier.reads.get(), 1);
+    assert_eq!(fc.graph.compute[1].notifier.reads.get(), 0);
     assert_eq!(fc.graph.render.fw_stamp[0].reads.get(), 0);
     assert_eq!(fc.graph.render.fw_stamp[1].reads.get(), 0);
 
@@ -930,8 +933,8 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
     fr.engine.fs_target = 0x200;
     fr.graph.render.fw_stamp[1].set(0x100);
     assert!(!fr.oldest_stamp_reached());
-    assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(), 0);
-    assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(), 0);
+    assert_eq!(fr.graph.compute[0].notifier.reads.get(), 0);
+    assert_eq!(fr.graph.compute[1].notifier.reads.get(), 0);
     assert_eq!(fr.graph.render.fw_stamp[0].reads.get(), 0);
     assert_eq!(fr.graph.render.fw_stamp[1].reads.get(), 1);
 }
@@ -1278,7 +1281,7 @@ mod event_drain_test {
     const STATE_WRITE: usize = 0x40;
     const RING_SLOTS: u32 = 128;
     const RECORD_WORDS: usize = 18;
-    const COMPUTE_PIPES: usize = 8;
+    const COMPUTE_PIPES: usize = 16;
     const STAGE_COUNT: usize = 2 + COMPUTE_PIPES;
     mod compute {
         pub const EVENT: u32 = 15;
