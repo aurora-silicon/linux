@@ -946,6 +946,82 @@ static void t6030_pmu2_report(struct apple_sleep *s, const char *when)
 		 (int)sizeof(stage), stage);
 }
 
+static int t6030_pmu2_write(u16 reg, const u8 *buf, unsigned int len)
+{
+	void __iomem *spmi = t6030_spmi1_base;
+	u32 runtime;
+	int ret;
+
+	if (!spmi || !len || len > 8)
+		return -EINVAL;
+	runtime = readl(spmi + SPMI_NOTIFY_ENABLE);
+	ret = t6030_spmi_xfer(spmi, T6030_PMU2_USID, runtime & ~T6030_SPMI_DONE,
+			      T6050_SPMI_EXT_WRITEL, reg, buf, NULL, len);
+	writel(runtime, spmi + SPMI_NOTIFY_ENABLE);
+	return ret;
+}
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up), apple_sleep.spmi1_boot=1 (with spmi1): the second PMU's
+ * housekeeping macOS 27.2's boot does and Linux never did (lane A, mac-spmi1-1), literally:
+ * nub-spmi1's notify mask raised to its steady 0x3f833ff1; 0xf801 = 0x30 and the status reads;
+ * 0xf803 read and cleared, 0xf808 cleared; the fault log 0x2200 (7 bytes, 0x9000 there) and the
+ * wake latch 0x281c (2 bytes, 4 there) read and written back to clear them; 0x8b00 read; then
+ * 0xf802 = 0 and the reads again. Every value is logged before it is cleared. At the entry,
+ * 26.6 ms before its commit, macOS sets the notify mask to 0x2000001 (t6030_spmi1_entry).
+ */
+#define T6030_SPMI1_NOTIFY_RUN		0x3f833ff1
+#define T6030_SPMI1_NOTIFY_SLEEP	0x2000001
+
+static bool t6030_spmi1_boot;
+module_param_named(spmi1_boot, t6030_spmi1_boot, bool, 0444);
+MODULE_PARM_DESC(spmi1_boot, "T6030 DIAGNOSTIC: with spmi1, macOS's second-PMU boot housekeeping and entry mask");
+
+static void t6030_pmu2_status_reads(u8 *st)
+{
+	static const struct { u16 reg; u8 len; } reads[] = {
+		{ 0xf801, 1 }, { 0xf808, 4 }, { 0xf802, 1 }, { 0xf818, 1 }, { 0xf819, 2 },
+		{ 0xf800, 1 }, { 0xf81f, 1 },
+	};
+	unsigned int i, o = 0;
+
+	for (i = 0; i < ARRAY_SIZE(reads); i++) {
+		t6030_pmu2_read(reads[i].reg, st + o, reads[i].len);
+		o += reads[i].len;
+	}
+}
+
+static void t6030_spmi1_housekeeping(struct apple_sleep *s)
+{
+	u8 v30 = 0x30, zero[4] = {}, st[11] = {}, st2[11] = {}, f803 = 0, fault[7] = {};
+	u8 wake[2] = {}, id[5] = {};
+	u32 mask = readl(t6030_spmi1_base + SPMI_NOTIFY_ENABLE);
+
+	writel(T6030_SPMI1_NOTIFY_RUN, t6030_spmi1_base + SPMI_NOTIFY_ENABLE);
+	t6030_pmu2_write(0xf801, &v30, 1);
+	t6030_pmu2_status_reads(st);
+	t6030_pmu2_read(0xf803, &f803, 1);
+	t6030_pmu2_write(0xf803, zero, 1);
+	t6030_pmu2_write(0xf808, zero, 4);
+	t6030_pmu2_read(0x2200, fault, sizeof(fault));
+	t6030_pmu2_write(0x2200, fault, sizeof(fault));
+	t6030_pmu2_read(T6030_PMU_OFF2WAKE, wake, sizeof(wake));
+	t6030_pmu2_write(T6030_PMU_OFF2WAKE, wake, sizeof(wake));
+	t6030_pmu2_read(0x8b00, id, sizeof(id));
+	t6030_pmu2_write(0xf802, zero, 1);
+	t6030_pmu2_status_reads(st2);
+	dev_info(s->dev, "spmi1_boot: notify %#x -> %#x; status %*ph; f803 %#04x (cleared); fault 0x2200 %*ph; wake 0x281c %*ph (written back); 0x8b00 %*ph; after %*ph\n",
+		 mask, readl(t6030_spmi1_base + SPMI_NOTIFY_ENABLE), (int)sizeof(st), st, f803,
+		 (int)sizeof(fault), fault, (int)sizeof(wake), wake, (int)sizeof(id), id,
+		 (int)sizeof(st2), st2);
+}
+
+static void t6030_spmi1_entry(struct apple_sleep *s)
+{
+	if (READ_ONCE(t6030_spmi1_boot) && t6030_spmi1_base)
+		writel(T6030_SPMI1_NOTIFY_SLEEP, t6030_spmi1_base + SPMI_NOTIFY_ENABLE);
+}
+
 static void t6030_spmi1_probe(struct apple_sleep *s)
 {
 	struct resource res;
@@ -969,6 +1045,8 @@ static void t6030_spmi1_probe(struct apple_sleep *s)
 		 readl(t6030_spmi1_base + T6030_SPMI_ACK(0)),
 		 readl(t6030_spmi1_base + SPMI_NOTIFY_ENABLE));
 	t6030_pmu2_report(s, "probe");
+	if (READ_ONCE(t6030_spmi1_boot))
+		t6030_spmi1_housekeeping(s);
 }
 
 static int t6030_spmi1_dump_set(const char *val, const struct kernel_param *kp)
@@ -1962,6 +2040,7 @@ static void t6030_sleep_after_ans(struct apple_sleep *s)
 	t6030_wake_masks_set(s);
 	writel(s->soc->spmi_notify_sleep, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	writel(s->soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
+	t6030_spmi1_entry(s);
 }
 
 static void t6030_sleep_undo_regs(struct apple_sleep *s)
