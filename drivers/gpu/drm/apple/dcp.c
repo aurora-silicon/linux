@@ -8246,6 +8246,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
 	init_completion(&dcp->s2r_dart_done);
 	init_completion(&dcp->s2r_hpd_done);
+	init_waitqueue_head(&dcp->av_video_wq);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);

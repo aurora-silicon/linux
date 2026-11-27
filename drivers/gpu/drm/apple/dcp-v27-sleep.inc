@@ -2533,6 +2533,35 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	return dcp_v27_early_power_down(dcp, e);
 }
 
+/* The longest a restarted firmware is given to publish its AV video interface again */
+#define V27_EARLY_AV_MS		2000
+
+/*
+ * A restarted firmware tears its AV video interface down and publishes it again on new
+ * channels some 250 ms after its HELLO (J516s, 27.2: DCPAVSimpleVideoInterface, then
+ * "IOAVVideoInterface published", plug, HPD asserted). The pipe's power-on and mode set before
+ * that find no link ("open_ioav_gated(): IOAVVideoInterface open failed", "set_mode_shutdown_gated
+ * return HPD is 0 link_status is 0"): the mode is dropped, the first swap never completes, the
+ * IOMFB queue times out 10 s later and takes the DCP as crashed, and every later sleep is refused
+ * ("the firmware is not live"). So the CRTC comes on only once the interface is back, as at boot,
+ * where iBoot left it published, and as the T6041 restart waits for its hotplug. @gen: the count
+ * before the restart; none (0): this DCP publishes no such interface.
+ */
+static void dcp_v27_early_av_wait(struct apple_dcp *dcp, int gen)
+{
+	ktime_t start = ktime_get();
+
+	if (!gen)
+		return;
+	if (!wait_event_timeout(dcp->av_video_wq, atomic_read(&dcp->av_video_gen) != gen,
+				msecs_to_jiffies(V27_EARLY_AV_MS)))
+		dev_warn(dcp->dev, "V27 wake: no AV video interface again in %d ms\n",
+			 V27_EARLY_AV_MS);
+	else
+		dev_dbg(dcp->dev, "V27 wake: AV video interface back after %lld ms\n",
+			ktime_ms_delta(ktime_get(), start));
+}
+
 /*
  * The firmware back from a stop, from what that stop did: the domains on, both DARTs back
  * and checked, RTKit restarted warm, RUN on and the boot's handshake, then the wake's calls
@@ -2545,6 +2574,7 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	int av_gen = e->stopped ? atomic_read(&dcp->av_video_gen) : 0;
 	const char *step = "DART";
 	int ret = -EUCLEAN;
 
@@ -2599,6 +2629,7 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	WRITE_ONCE(dcp->s2r_fw_down, false);
 	dcp_v27_early_reopen(dcp, e);
 	dcp_s2r_put_darts(dcp);
+	dcp_v27_early_av_wait(dcp, av_gen);
 	dev_info(dcp->dev, "V27 wake: firmware %s; the panel comes on with its CRTC\n",
 		 pm_resume_via_firmware() ? "back after the sleep" : "restarted, the sleep given up");
 	return 0;

@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -990,6 +991,9 @@ struct apple_dcp {
 	u8 s2r_step;
 	struct completion s2r_dart_done;
 	struct completion s2r_hpd_done;
+	/* Times the firmware published its AV video interface (av_interface_init()), and waiters */
+	atomic_t av_video_gen;
+	wait_queue_head_t av_video_wq;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;

@@ -160,6 +160,11 @@ struct audiosrv_data {
 static void av_interface_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	/* A restarted firmware's pipe waits for this (dcp_v27_early_av_wait()). */
+	atomic_inc(&dcp->av_video_gen);
+	wake_up_all(&dcp->av_video_wq);
 }
 
 static void av_interface_teardown(struct apple_epic_service *service)
