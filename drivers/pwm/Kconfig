@@ -85,6 +85,19 @@ config PWM_APPLE
 	  To compile this driver as a module, choose M here: the module
 	  will be called pwm-apple.
 
+config PWM_APPLE_KUNIT_TEST
+	bool "KUnit tests for the Apple SoC PWM" if !KUNIT_ALL_TESTS
+	depends on PWM_APPLE=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SoC PWM driver: the conversion of a
+	  period and duty cycle to ON and OFF cycle counts at the clock
+	  rate with its rounding and 32-bit saturation, the state read back
+	  from the registers, the refusal of inverted polarity and the
+	  runtime PM reference held for a running output. The chip is
+	  registered on a KUnit device with its registers in kernel
+	  memory, so the tests need no Apple hardware.
+
 config PWM_ARGON_FAN_HAT
 	tristate "Argon40 Fan HAT support"
 	depends on I2C && OF

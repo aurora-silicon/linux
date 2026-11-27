@@ -29,8 +29,16 @@ def main():
             print(f'1..0 # SKIP missing host prerequisite: {variable}={executable}')
             return 4
     verify_fixtures()
-    output = args.output or (Path(os.environ['ASAHI_M4_OUTPUT']) if os.environ.get('ASAHI_M4_OUTPUT')
-                             else Path(tempfile.mkdtemp(prefix='asahi-m4-suite-')))
+    # With no output directory given, the suite makes its own and removes it when every test
+    # passed. It goes under $TMPDIR when the caller set one (the umbrella runner does), else
+    # under the kernel tree's hidden .asahi-m4-suite/, never in a RAM-backed /tmp by default.
+    owned = not args.output and not os.environ.get('ASAHI_M4_OUTPUT')
+    if owned:
+        parent = Path(os.environ['TMPDIR']) if os.environ.get('TMPDIR') else root / '.asahi-m4-suite'
+        parent.mkdir(parents=True, exist_ok=True)
+        output = Path(tempfile.mkdtemp(prefix='asahi-m4-suite-', dir=parent))
+    else:
+        output = args.output or Path(os.environ['ASAHI_M4_OUTPUT'])
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     tests = sorted(HERE.glob('test-*.py'))
@@ -44,6 +52,9 @@ def main():
         environment['ASAHI_M4_OUTPUT'] = str(directory)
         environment['ASAHI_M4_KERNEL'] = str(root)
         environment['PYTHONDONTWRITEBYTECODE'] = '1'
+        # A test's own temporary files live in its output directory and go with it.
+        (directory / 'tmp').mkdir(exist_ok=True)
+        environment['TMPDIR'] = str(directory / 'tmp')
         command = [sys.executable, str(test)]
         # Resource allocator predates the shared output environment option.
         if test.name == 'test-resources.py':
@@ -68,7 +79,11 @@ def main():
     report = {'cpu_only': True, 'hardware_execution': False, 'passed': all(x['returncode'] in (0, 4) for x in results),
               'kernel_source': str(root), 'fixture_manifest_sha256': sha(HERE / 'fixtures/manifest.json'), 'tests': results}
     (output / 'host-tests.json').write_text(json.dumps(report, indent=2)+'\n')
-    print('# Results: ' + str(output / 'host-tests.json'), flush=True)
+    if owned and report['passed']:
+        shutil.rmtree(output)
+        print('# All passed; removed ' + str(output), flush=True)
+    else:
+        print('# Results: ' + str(output / 'host-tests.json'), flush=True)
     return 0 if report['passed'] else 1
 
 

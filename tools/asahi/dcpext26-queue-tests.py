@@ -55,11 +55,12 @@ struct obj {u64 size;};
 struct drm_framebuffer {struct obj *obj[1];int refs;};
 static void drm_framebuffer_get(struct drm_framebuffer *f){assert(f->refs>0);f->refs++;}
 static void drm_framebuffer_put(struct drm_framebuffer *f){assert(f->refs>1);f->refs--;}
-struct drm_crtc {int unused;};
 struct drm_plane {unsigned iomfb_surf;};
+struct drm_crtc {struct drm_plane *primary;};
 #define to_apple_plane(p) (p)
 struct drm_plane_state {struct drm_crtc *crtc;bool visible;struct drm_framebuffer *fb;};
 struct drm_atomic_commit {int refs,count;struct drm_plane plane[4];struct drm_plane_state old[4],new[4];};
+static struct drm_plane_state *drm_atomic_get_new_plane_state(struct drm_atomic_commit *s,struct drm_plane *p){for(int i=0;i<s->count;i++)if(&s->plane[i]==p)return &s->new[i];return NULL;}
 #define for_each_oldnew_plane_in_state(s,p,o,n,i) for(i=0;i<(s)->count&&((p)=&(s)->plane[i],(o)=&(s)->old[i],(n)=&(s)->new[i],1);i++)
 static struct drm_atomic_commit *drm_atomic_commit_get(struct drm_atomic_commit *s){s->refs++;return s;}
 static void drm_atomic_commit_put(struct drm_atomic_commit *s){assert(s->refs>1);s->refs--;}
@@ -79,7 +80,7 @@ struct apple_dcp {
  struct {bool pending;} present_state_h17p;struct {bool valid;} mode_state;struct {bool connected;} *connector;
  struct {void *data;} chunks;bool native,crashed,ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
  unsigned ext26_epochs;u64 ext26_retained_bytes;struct list_head ext26_retained;
- int fw_compat;struct work_struct vblank_wq,bl_update_wq;
+ int fw_compat;bool boot_surface_pending;struct work_struct vblank_wq,bl_update_wq;
 };
 static void iomfb_v27_sleep_start(struct apple_dcp *d, struct iomfb_transaction *t) { }
 #define DCP_FIRMWARE_V_27_0 27
