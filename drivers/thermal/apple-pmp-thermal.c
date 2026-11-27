@@ -61,6 +61,7 @@ static struct {
 	struct delayed_work power_work;
 	struct device *power_hwmon;
 	unsigned int rail_mw[3];
+	u64 validated_smc_gen;
 	int power_error;
 	u64 gpu_epoch;
 	bool power_polling;
@@ -133,33 +134,48 @@ static int apple_pmp_power_read_rails(unsigned int mw[3])
 	dev = &pdev->dev;
 	/* A device reference alone does not pin its driver's private data.
 	 * Serialize every transaction with supplier unbind and fetch drvdata
-	 * only while the bound supplier is locked. Do not cache the SMC pointer.
+	 * only while the bound supplier is locked. Do not cache the SMC pointer;
+	 * validated_smc_gen records only the monotonic bind_gen whose key
+	 * metadata has been verified.
 	 */
 	device_lock(dev);
 	smc = dev_get_drvdata(dev);
-	if (!dev->driver || !smc)
+	if (!dev->driver || !smc) {
+		pmp_thermal.validated_smc_gen = 0;
 		goto out;
+	}
+	if (!smc->bind_gen || smc->bind_gen != pmp_thermal.validated_smc_gen) {
+		pmp_thermal.validated_smc_gen = 0;
+		for (i = 0; i < ARRAY_SIZE(apple_pmp_power_keys); i++) {
+			struct apple_smc_key_info info;
+
+			ret = apple_smc_get_key_info(smc,
+						     apple_pmp_power_keys[i],
+						     &info);
+			if (ret)
+				goto out;
+			if (info.size != 4 ||
+			    info.type_code != _SMC_KEY("flt ") ||
+			    !(info.flags & APPLE_SMC_READABLE)) {
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+		pmp_thermal.validated_smc_gen = smc->bind_gen;
+	}
 	for (i = 0; i < ARRAY_SIZE(apple_pmp_power_keys); i++) {
-		struct apple_smc_key_info info;
 		__le32 bits;
 		int bytes;
 
-		ret = apple_smc_get_key_info(smc, apple_pmp_power_keys[i], &info);
-		if (ret)
-			goto out;
-		if (info.size != 4 || info.type_code != _SMC_KEY("flt ") ||
-		    !(info.flags & APPLE_SMC_READABLE)) {
-			ret = -EINVAL;
-			goto out;
-		}
 		bytes = apple_smc_read(smc, apple_pmp_power_keys[i], &bits,
 				       sizeof(bits));
-
 		if (bytes != sizeof(bits)) {
+			pmp_thermal.validated_smc_gen = 0;
 			ret = bytes < 0 ? bytes : -EIO;
 			goto out;
 		}
 		if (!apple_pmp_power_decode(le32_to_cpu(bits), &mw[i])) {
+			pmp_thermal.validated_smc_gen = 0;
 			ret = -ERANGE;
 			goto out;
 		}
@@ -191,8 +207,10 @@ static void apple_pmp_power_work(struct work_struct *work)
 	 * reset/all-zero image must not refill the energy bucket; an idle
 	 * system may still draw well under 0.1 W on all three rails.
 	 */
-	if (!ret && !mw[0] && !mw[1])
+	if (!ret && !mw[0] && !mw[1]) {
+		pmp_thermal.validated_smc_gen = 0;
 		ret = -ENODATA;
+	}
 	/* Clock under the lock: a raw sample published while the SMC reads ran
 	 * must not make the unsigned age below wrap into a false -EAGAIN.
 	 */

@@ -107,6 +107,7 @@ struct apple_sleep_smc_policy;
 
 struct apple_smc {
 	struct device *dev;
+	u64 bind_gen;
 
 	u32 key_count;
 	smc_key first_key;
