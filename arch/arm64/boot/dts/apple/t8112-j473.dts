@@ -9,8 +9,6 @@
 
 /dts-v1/;
 
-#define T8112_TYPEC_DCP
-
 #include "t8112.dtsi"
 #include "t8112-jxxx.dtsi"
 
@@ -44,6 +42,25 @@
 };
 &dcpext {
 	status = "okay";
+};
+
+&display {
+	/* the boot display (HDMI on dcp) DART first, for the boot loader */
+	iommus = <&disp0_dart 0 0x0 0x0 0xf 0xffff0000>,
+		 <&dispext0_dart 0 0x0 0x0 0xf 0xffff0000>;
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+/*
+ * As macOS does: the HDMI port (DP to HDMI converter behind dptxphy, DFP
+ * endpoint 5 of the display switch) on the primary DCP, the USB-C ports on
+ * dcpext (t8112-jxxx.dtsi), which offers DSC.
+ */
+&dcp {
+	status = "okay";
 	apple,connector-type = "HDMI-A";
 
 	/*  HDMI HPD gpio, used as interrupt*/
@@ -57,103 +74,16 @@
 	apple,dptx-phy = <5>;
 };
 
-&display {
-	/* dispext0_dart needs to be first for m1n1's */
-	iommus = <&dispext0_dart 0 0x0 0x0 0xf 0xffff0000>,
-		 <&disp0_dart 0 0x0 0x0 0xf 0xffff0000>;
-};
-
-&disp0_dart {
-	status = "okay";
-};
-
-&dcp {
-	status = "okay";
-	apple,connector-type = "USB-C";
-	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
-	phy-names = "typec0", "typec1";
-	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
-	mux-control-names = "typec0", "typec1";
-	apple,typec-mux-indices = <0 0>;
-	apple,typec-dptx-phys = <0 1>;
-
-	typec-routes {
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		route@0 {
-			reg = <0>;
-			mode-switch;
-
-			port {
-				dcp_typec0: endpoint {
-					remote-endpoint = <&typec0_dcp>;
-				};
-			};
-		};
-
-		route@1 {
-			reg = <1>;
-			mode-switch;
-
-			port {
-				dcp_typec1: endpoint {
-					remote-endpoint = <&typec1_dcp>;
-				};
-			};
-		};
-	};
-};
-
-&dcpext {
-	/delete-property/ mux-controls;
-	/delete-property/ mux-control-names;
-	/delete-property/ mux-index;
-};
-
 &dpaudio0 {
 	status = "okay";
 };
 
-&typec0 {
-	ports {
-		port@3 {
-			reg = <3>;
-			typec0_dcp: endpoint {
-				remote-endpoint = <&dcp_typec0>;
-			};
-		};
-	};
-};
-
-&typec1 {
-	ports {
-		port@3 {
-			reg = <3>;
-			typec1_dcp: endpoint {
-				remote-endpoint = <&dcp_typec1>;
-			};
-		};
-	};
-};
-
 /*
- * Keep the power-domains used for the HDMI port on.
+ * Keep the power-domains used for the HDMI port on (disp0 stays always-on
+ * from t8112.dtsi).
  */
 &framebuffer0 {
-	power-domains = <&ps_dispext_cpu0>, <&ps_dptx_ext_phy>;
-};
-
-/*
- * The M2 Mac mini uses dispext for the HDMI output so it's not necessary to
- * keep disp0 power-domains always-on.
- */
-&ps_disp0_sys {
-	/delete-property/ apple,always-on;
-};
-
-&ps_disp0_fe {
-	/delete-property/ apple,always-on;
+	power-domains = <&ps_disp0_cpu0>, <&ps_dptx_ext_phy>;
 };
 
 /*
