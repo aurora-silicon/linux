@@ -69,6 +69,14 @@ fs2c_slice = prefix_compute_fn[
 assert 'work::compute::EVENTS[pipe]' in prefix_compute_fn
 assert 'work::compute::EVENTS[p_idx]' in c2ta_slice
 assert 'work::compute::EVENTS[p_idx]' in c2fs_slice
+# linux#3349: a render's barriers on a compute pipe wait on that pipe's service stamp, not FINALIZE.
+assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2ta_slice, c2ta_slice
+assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2fs_slice, c2fs_slice
+assert 'fw_stamp' not in c2ta_slice and 'fw_stamp' not in c2fs_slice
+graph_src = (production.parent / 'graph.rs').read_text()
+service_fn = graph_src[graph_src.index('pub(crate) fn service_stamp_va(&self) -> u64 {'):]
+service_fn = service_fn[:service_fn.index('\n    }\n') + 6]
+assert 'self.notifier.va + notifier_page::COMPUTE_STAMP as u64' in service_fn, service_fn
 assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
 assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]

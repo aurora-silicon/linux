@@ -148,13 +148,12 @@ struct WaitTarget {
 ///
 /// Unlike G15 (`g15/hw.rs: CROSS_ENGINE_HOLD` — "Never both type 0"), G16 (M4 25G83/26B123)
 /// does not require a software-job hold on one cross-engine direction when neither side
-/// carries `InitBM`. On G16, every stage (CDM, TA, FS) executes its `FINALIZE`
-/// micro-sequence — flushing stage caches to the shared coherent fabric — before firmware
-/// advances `fw_stamp`, so waiting on `fw_stamp` with `BarrierType::Stamp` (type 0) in both
-/// directions (`fs2c` and `c2ta`/`c2fs`) avoids hold bubbles within one VM (same ASID and
-/// UAT page tables). Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0
-/// handoffs) confirm no GPU wedge or hang, while CTS synchronization / pipeline-barrier
-/// coverage validates producer-to-consumer memory visibility.
+/// carries `InitBM`: `BarrierType::Stamp` (type 0) in both directions (`fs2c` and
+/// `c2ta`/`c2fs`) avoids hold bubbles within one VM (same ASID and UAT page tables).
+/// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
+/// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
+/// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
+/// queue, so waits on compute use `ComputeGraph::service_stamp_va` (linux#3349).
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
 /// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
@@ -3914,9 +3913,11 @@ impl Firmware {
         }
         for p_idx in 0..sizes::COMPUTE_PIPES {
             let off = p_idx * work::barrier::SIZE;
+            // A render reads what compute wrote: wait for the producer pipe's service stamp, not
+            // its FINALIZE fw_stamp (see `ComputeGraph::service_stamp_va`).
             if let Some(wait_c) = plan.ta_compute_wait[p_idx] {
                 let cbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp_va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -3932,7 +3933,7 @@ impl Firmware {
             }
             if let Some(wait_c) = plan.fs_compute_wait[p_idx] {
                 let fcbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp_va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,

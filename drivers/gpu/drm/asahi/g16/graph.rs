@@ -263,6 +263,15 @@ impl ComputeGraph {
         )?;
         self.threshold.w64(0, 1)
     }
+
+    /// The pipe's terminal service-stamp cell. The firmware stores a work item's stamp here after
+    /// it has finished servicing the item's record, later than [`Self::fw_stamp`], which it stores
+    /// at FINALIZE. Work on another firmware queue that reads what this pipe's work wrote waits on
+    /// this cell: at FINALIZE those writes are not yet visible there (linux#3349). Retirement
+    /// waits for the same cell.
+    pub(crate) fn service_stamp_va(&self) -> u64 {
+        self.notifier.va + notifier_page::COMPUTE_STAMP as u64
+    }
 }
 
 pub(crate) struct RenderGraph {
