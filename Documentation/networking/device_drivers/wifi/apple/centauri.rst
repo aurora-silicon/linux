@@ -98,6 +98,84 @@ Both Wi-Fi backends implement ``cfg80211`` station-mode interfaces with:
   it then frees, to debugfs ``firmware_crash_saved``, and the Alpha DRAM
   log, when ``fwlog_start`` set one up, to ``firmware_log_saved``. The
   Alpha execution stage that stopped the firmware is logged with it.
+* **Peer-to-Peer AWDL (``awdl0``):** On T8142/T8152 hosts,
+  ``centauri_awdl.c`` registers a virtual Ethernet interface (``awdl0``,
+  module parameter ``awdl_enable``, default 1) on firmware interface ID 1.
+  All values below are as traced on the host side of a working AWDL link
+  or as captured over the air from nearby peers.
+
+  Bringing ``awdl0`` up opens the shared data rings (RX 12, 15, 18, 78 and
+  79 next to TX 76), queries the firmware defaults (command 8), sets the
+  MAC address (command 1) and starts the interface (command 2) with these
+  TLVs: an empty general configuration (``0xfe08``), the election
+  parameters (``0xff05``, 19 bytes: flags, election ID, distance from the
+  top master, a reserved byte, top master address and metric, own
+  metric; own metric 65 at start), ``0xfe00`` (43 bytes: byte 8 enables
+  synchronization, byte 9 is the sync role, 2, and bytes 10..15 the
+  master to synchronize to), the MIF/PSF sync parameters (``0xfe01``,
+  PSF periods 110 and 0) and the sync parameters (``0xff04``, the
+  firmware's 33-byte header followed by the channel sequence in a
+  (flags, channel) pair per slot). It then sends the channel sequence
+  (``0xff12``, 38 bytes, 16 slots of four-slot dwell blocks), ``0xfe0a``
+  and the frame templates, and opens the multicast TX ring 26
+  (``tid=6``).
+
+  The channel sequence follows the station: on a 2.4 GHz channel that
+  channel only; on the lower channel of a 5 GHz 40 MHz pair, channel 6
+  and that channel; otherwise channels 6 and 149. 5 GHz slots use the
+  80 MHz operating class 128. Writing ``awdl_chanseq`` in debugfs
+  replaces it until the module is reloaded.
+
+  The firmware writes the sync, channel-sequence and election TLVs of
+  each action frame itself; the host appends the rest through
+  ``0xfe02`` (sync frames) and ``0xfe03`` (master-indication frames), in
+  the order captured from peers. Sync frames carry service parameters,
+  the election tree, the 47-byte data-path state (country code and
+  social-channel bitmask), HT capabilities, the firmware's VHT
+  capabilities element (command 8 TLV ``0x00bf``) and the version
+  (``0xa2``); master-indication frames carry the election tree,
+  data-path state, HT and VHT capabilities, the hostname, the version,
+  service parameters and any service-response TLVs written to debugfs
+  ``awdl_service_tlvs``. Every 3.15 s the driver sends the election,
+  ``0xfe00`` and sync parameters again, then ``0xfe01`` with the sync
+  parameters, the templates and ``0xfe0a``.
+
+  Received PSF/MIF action frames (management ring 4, behind a radiotap
+  header) give the sender's election state and sync parameters. When a
+  frame's top master beats ours and its sync parameters carry AW
+  extension length 16, a presence mode and a receive time, the driver
+  follows the sender: it first sends ``0xfe00`` with the sender as the
+  master to synchronize to, byte 16 set and that frame's timing
+  (receive time at bytes 17..20, TX delay at 21..24, down counter, AW
+  period and AW length at 25..30, presence mode at 31, AW sequence at
+  32..33), then the new election state and templates. The receive time
+  is the radiotap timestamp field, else TSFT; the TX delay is the action
+  frame header's actual minus planned transmit time. Our own address is
+  never followed, and after 5 s without a frame from the parent the
+  driver is top master again.
+
+  Every peer heard in an action frame or on received data, reported by
+  the peer state event (``0x2c``) or addressed by unicast TX is added to
+  the firmware peer cache with the host channel sequence; a peer is not
+  given to the firmware again within 5 s. Unicast TX (or an ``add``
+  written to ``awdl_peers``) opens the one per-peer TX ring (27, sharing
+  completion ring 76); opening a second unicast ring faulted the
+  firmware about 1.5 s later on the J815. The ring is handed to another
+  peer only after 5 s unused. Stopping ``awdl0`` or recycling the peer
+  ring sends the 4-byte transfer-ring close message (opcode ``0x0003``)
+  before ``CEN_AWDL_CMD_STOP`` or reopening the ring.
+
+  When the firmware reports ``fw_llc_encap == 0`` the driver adds the
+  16-byte LLC/SNAP + AWDL data header on TX and removes it on RX (also
+  accepting 8-byte RFC1042 frames). Received data is demultiplexed by the
+  3-bit interface ID in completion footer bits 10:8. Debugfs
+  ``awdl_status``, ``awdl_peers``, ``awdl_chanseq``, ``awdl_arpa`` and
+  ``awdl_service_tlvs`` show and update the state. ``awdl_status`` counts
+  adoptions, reverts, refreshes and rejected frames.
+
+  Userspace keeps IPv6 duplicate address detection off on ``awdl0``
+  (``accept_dad=0``) and leaves the interface unmanaged by network
+  managers; the driver does not change either.
 
 Bluetooth Capabilities
 ======================
@@ -147,6 +225,7 @@ live under ``tools/asahi/``:
 .. code-block:: sh
 
    python3 tools/asahi/centauri-scan-tests.py --negative-controls
+   python3 tools/asahi/centauri-awdl-tests.py --negative-controls
    python3 tools/asahi/centauri-wifi-pm-tests.py --negative-controls
    python3 tools/asahi/centauri-wifi-avoid-tests.py
    python3 tools/asahi/centauri-bt-arena-tests.py --negative-controls
