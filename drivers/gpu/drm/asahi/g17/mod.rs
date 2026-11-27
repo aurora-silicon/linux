@@ -2454,7 +2454,9 @@ impl Gpu {
                     shared.variant.telemetry_protocol,
                     shared.max_pstate,
                 )?,
-                recovery: recovery::State::new(),
+                recovery: recovery::State::with_forgive_limit(
+                    pairs::render_depth_for_device(shared.variant.m5_commands),
+                ),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
@@ -2662,7 +2664,9 @@ impl Gpu {
                     shared.variant.telemetry_protocol,
                     shared.max_pstate,
                 )?,
-                recovery: recovery::State::new(),
+                recovery: recovery::State::with_forgive_limit(
+                    pairs::render_depth_for_device(shared.variant.m5_commands),
+                ),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
@@ -3087,7 +3091,7 @@ impl gpu::Gpu for Gpu {
                 return Err(error);
             }
         };
-        Ok(KBox::new(frontend, GFP_KERNEL)?)
+        Ok(frontend)
     }
 
     fn timestamp_window_size(&self) -> u64 {
