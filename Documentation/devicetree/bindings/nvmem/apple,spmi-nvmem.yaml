@@ -21,6 +21,7 @@ properties:
           - apple,abbey-pmic
           - apple,baku-pmic
           - apple,chapel-pmic
+          - apple,club-pmic
           - apple,maverick-pmic
           - apple,mirabeau-pmic
           - apple,monaco-pmic

@@ -194,6 +194,13 @@ impl State {
         let quarantined = self.quarantined & owned;
         (quarantined != 0).then_some(quarantined & !self.spared == 0)
     }
+    /// Released means closed: by its client, or by the kernel for a client that keeps it open
+    /// (`Firmware::close_failed_owners`), which then never releases it again. A pair taken
+    /// back, or a sibling claimed, would clear `released` and leak. Owner IDs are never reused.
+    /// Checked where a lease is made only, so `admits_render` lets such a job fail at once.
+    fn owner_released(&self, owner: u64) -> bool {
+        (0..cfg::RENDER_SLOTS).any(|slot| self.owners[slot] == owner && self.released & (1u64 << slot) != 0)
+    }
     fn refusal(&self, owner: u64) -> Result {
         if self.exhausted() {
             return Err(EIO);
@@ -1139,6 +1146,9 @@ impl Pool {
                 }
                 continue;
             }
+            if state.owner_released(owner) {
+                return Err(ECANCELED);
+            }
             state.refusal(owner)?;
             expired |= now >= conflict_deadline;
             let plan = if expired {
@@ -1197,7 +1207,7 @@ impl Pool {
             return Ok(None);
         }
         let mut state = self.state.lock();
-        if state.refusal(owner).is_err() || !state.has_live_owner(owner) {
+        if state.owner_released(owner) || state.refusal(owner).is_err() || !state.has_live_owner(owner) {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
@@ -1694,7 +1704,8 @@ impl State {
             if slots & bit == 0 {
                 continue;
             }
-            // A pair whose commands all ran is held with them (see `Pair::executed_for_kill`).
+            // A pair that only the kill releases is held with its commands (see
+            // `Pair::releasable_by_kill`: they all ran, or they are a guilty context's).
             if self.owners[slot] != owner
                 || (executed & bit == 0
                     && (self.refs[slot] != 0 || self.active & bit != 0 || self.released & bit == 0))
@@ -1721,6 +1732,16 @@ impl Pool {
         }
         self.state.lock().kill_hold &= !slots;
         self.returned();
+    }
+
+    /// Keep `slots` out of service until both processors stop: the killed guilty pairs
+    /// `detach_context` kept there still have their queues installed. The kill held only the
+    /// slots whose queues the scheduler page listed at the kill, so the hold is set here too.
+    pub(crate) fn hold_kept_slots(&self, slots: u64) {
+        if slots == 0 {
+            return;
+        }
+        self.state.lock().kill_hold |= slots & State::MASK;
     }
 
     /// End the kill hold of `slots` once their killed context's scheduler release was
@@ -1814,6 +1835,30 @@ mod fault_capacity_tests {
     }
 
     #[test]
+    fn a_released_owner_takes_no_pair_again() {
+        // The kernel closed a guilty owner for its open client, and its pair drained: an
+        // early publication that passed the status check before the failure asks again.
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let queue = pool.reserve_queue().unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
+        let slot = lease.slot();
+        drop(lease);
+        pool.release_owner(1);
+        assert!(pool.try_acquire_render(1, 2, None).unwrap().is_none());
+        assert!(matches!(pool.acquire_render(1, 2, None, u64::MAX, || Ok(())), Err(ECANCELED)));
+        // The scheduler's prepare step does not wait for it: publication fails the job at once.
+        assert!(pool.admits_render(1, 2, None));
+        let state = pool.state.lock();
+        // Its pair stays released, and it claims no sibling.
+        assert_ne!(state.released & (1u64 << slot), 0);
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        drop(state);
+        // Another owner takes the pair.
+        assert_eq!(pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap().slot(), slot);
+        drop(queue);
+    }
+
+    #[test]
     fn closed_faulting_clients_return_leases_after_drain() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         for owner in 1..=512 {
@@ -1847,6 +1892,27 @@ mod fault_capacity_tests {
         assert!(!pool.reassign_unused_spare(bit.trailing_zeros() as u8, Some(1), Some(2)));
         // A failed (unpublished) control may roll back its hold. Published kills
         // keep the existing processor-stop rule; this test must not weaken it.
+        pool.release_retained_owners_after_processor_stop();
+        assert_eq!(pool.state.lock().kill_hold, 0);
+    }
+
+    #[test]
+    fn a_kept_slot_stays_out_of_service_without_a_kill_hold() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
+        let slot = lease.slot();
+        let bit = 1u64 << slot;
+        pool.release_owner(1);
+        drop(lease);
+        // The kill held nothing here (the scheduler page did not list the pair's queues).
+        assert_eq!(pool.state.lock().kill_hold, 0);
+        pool.hold_kept_slots(bit);
+        pool.release_killed_slots(0);
+        assert_eq!(pool.state.lock().kill_hold, bit);
+        assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
+        let next = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
+        assert_ne!(next.slot(), slot);
+        drop(next);
         pool.release_retained_owners_after_processor_stop();
         assert_eq!(pool.state.lock().kill_hold, 0);
     }
