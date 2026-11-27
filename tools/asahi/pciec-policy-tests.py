@@ -270,6 +270,41 @@ static int apple_radio_prepare(struct device *dev)
     radio_prepare_calls++;
     return 0;
 }
+static void apple_radio_complete(struct device *dev)
+{
+    (void)dev;
+}
+struct pci_bus { int dummy; };
+struct pci_dev { int dummy; };
+struct pci_host_bridge { struct pci_bus *bus; };
+struct apple_pcie_l1ss_walk { struct apple_pcie *pcie; int err; };
+static struct pci_host_bridge *pci_host_bridge_from_priv(struct apple_pcie *pcie)
+{
+    (void)pcie;
+    return NULL;
+}
+static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie)
+{
+    (void)pcie;
+    return false;
+}
+static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *pdev, void *data)
+{
+    (void)pdev;
+    (void)data;
+    return 0;
+}
+static void apple_pcie_hib_restore_l1ss(struct apple_pcie *pcie)
+{
+    (void)pcie;
+}
+static void pci_walk_bus(struct pci_bus *top,
+                         int (*cb)(struct pci_dev *, void *), void *userdata)
+{
+    (void)top;
+    (void)cb;
+    (void)userdata;
+}
 static int dev_pm_genpd_add_notifier(struct device *dev,
                                      struct notifier_block *nb)
 {
