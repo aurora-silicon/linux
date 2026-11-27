@@ -959,24 +959,23 @@ static bool genpd_must_defer(struct generic_pm_domain *genpd, bool one_dev_probi
 	return false;
 }
 
-/**
- * genpd_power_off - Remove power from a given PM domain.
- * @genpd: PM domain to power down.
- * @one_dev_on: If invoked from genpd's ->runtime_suspend|resume() callback, the
- * RPM status of the releated device is in an intermediate state, not yet turned
- * into RPM_SUSPENDED. This means genpd_power_off() must allow one device to not
- * be RPM_SUSPENDED, while it tries to power off the PM domain.
- * @depth: nesting count for lockdep.
- *
- * If all of the @genpd's devices have been suspended and all of its subdomains
- * have been powered down, remove power from @genpd.
+/*
+ * Remove power from @genpd if all of its devices are suspended and all of its
+ * subdomains are powered down. When invoked from genpd's runtime PM callbacks
+ * (@one_dev_on), allow one device to still be mid-transition. If power-off is
+ * declined only because all non-suspended devices are in RPM_SUSPENDING, either
+ * return one via @wait_dev (for genpd_power_off_work_fn) or queue
+ * genpd->power_off_work so the domain is reevaluated once they finish.
  */
-static void genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
-			    bool one_dev_probing, unsigned int depth)
+static void genpd_power_off_wait(struct generic_pm_domain *genpd,
+				 bool one_dev_on, bool one_dev_probing,
+				 unsigned int depth, struct device **wait_dev)
 {
+	struct device *suspending_dev = NULL;
 	struct pm_domain_data *pdd;
 	struct gpd_link *link;
 	unsigned int not_suspended = 0;
+	unsigned int suspending = 0;
 
 	/*
 	 * Do not try to power off the domain in the following situations:
@@ -1004,21 +1003,38 @@ static void genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
 	}
 
 	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
+		enum rpm_status status = READ_ONCE(pdd->dev->power.runtime_status);
+		bool disabled = !pm_runtime_enabled(pdd->dev);
+
 		/*
 		 * Do not allow PM domain to be powered off, when an IRQ safe
 		 * device is part of a non-IRQ safe domain.
 		 */
-		if (!pm_runtime_suspended(pdd->dev) ||
-			irq_safe_dev_in_sleep_domain(pdd->dev, genpd))
+		if (irq_safe_dev_in_sleep_domain(pdd->dev, genpd)) {
 			not_suspended++;
+		} else if (disabled || status != RPM_SUSPENDED) {
+			not_suspended++;
+			if (!disabled && status == RPM_SUSPENDING) {
+				suspending++;
+				if (!suspending_dev)
+					suspending_dev = pdd->dev;
+			}
+		}
 
 		/* The device may need its PM domain to stay powered on. */
 		if (to_gpd_data(pdd)->rpm_always_on)
 			return;
 	}
 
-	if (not_suspended > 1 || (not_suspended == 1 && !one_dev_on))
+	if (not_suspended > 1 || (not_suspended == 1 && !one_dev_on)) {
+		if (not_suspended == suspending) {
+			if (wait_dev)
+				*wait_dev = get_device(suspending_dev);
+			else
+				genpd_queue_power_off_work(genpd);
+		}
 		return;
+	}
 
 	/*
 	 * Do not allow PM domain to be powered off if it is marked
@@ -1053,9 +1069,15 @@ static void genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
 	list_for_each_entry(link, &genpd->child_links, child_node) {
 		genpd_sd_counter_dec(link->parent);
 		genpd_lock_nested(link->parent, depth + 1);
-		genpd_power_off(link->parent, false, false, depth + 1);
+		genpd_power_off_wait(link->parent, false, false, depth + 1, NULL);
 		genpd_unlock(link->parent);
 	}
+}
+
+static void genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
+			    bool one_dev_probing, unsigned int depth)
+{
+	genpd_power_off_wait(genpd, one_dev_on, one_dev_probing, depth, NULL);
 }
 
 /**
@@ -1168,6 +1190,24 @@ static int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static void genpd_wait_suspending(struct device *dev)
+{
+	DEFINE_WAIT(wait);
+
+	spin_lock_irq(&dev->power.lock);
+	for (;;) {
+		prepare_to_wait(&dev->power.wait_queue, &wait,
+				TASK_UNINTERRUPTIBLE);
+		if (dev->power.runtime_status != RPM_SUSPENDING)
+			break;
+		spin_unlock_irq(&dev->power.lock);
+		schedule();
+		spin_lock_irq(&dev->power.lock);
+	}
+	finish_wait(&dev->power.wait_queue, &wait);
+	spin_unlock_irq(&dev->power.lock);
+}
+
 /**
  * genpd_power_off_work_fn - Power off PM domain whose subdomain count is 0.
  * @work: Work structure used for scheduling the execution of this function.
@@ -1175,12 +1215,20 @@ static int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
 static void genpd_power_off_work_fn(struct work_struct *work)
 {
 	struct generic_pm_domain *genpd;
+	struct device *wait_dev;
 
 	genpd = container_of(work, struct generic_pm_domain, power_off_work);
 
-	genpd_lock(genpd);
-	genpd_power_off(genpd, false, false, 0);
-	genpd_unlock(genpd);
+	for (;;) {
+		wait_dev = NULL;
+		genpd_lock(genpd);
+		genpd_power_off_wait(genpd, false, false, 0, &wait_dev);
+		genpd_unlock(genpd);
+		if (!wait_dev)
+			break;
+		genpd_wait_suspending(wait_dev);
+		put_device(wait_dev);
+	}
 }
 
 /**

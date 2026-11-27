@@ -410,6 +410,8 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
                  'apple_dart_mod_streams(',
                  'static int apple_dart_domain_add_streams(',
                  'apple_dart_setup_translation(',
+                 'static int apple_dart_cfg_pm_get(',
+                 'static void apple_dart_cfg_pm_put(',
                  'static int apple_dart_attach_dev_paging_unguarded(',
                  'static int apple_dart_attach_dev_paging_v27(',
                  'static int apple_dart_attach_dev_paging(',

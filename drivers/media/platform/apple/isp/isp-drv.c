@@ -547,7 +547,8 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 
 	isp->domain = iommu_get_domain_for_dev(isp->dev);
 	if (!isp->domain)
-		return -ENODEV;
+		return of_property_present(dev->of_node, "iommus") ?
+		       -EPROBE_DEFER : -ENODEV;
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
 	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 
@@ -981,7 +982,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	err = apple_isp_init_iommu(isp);
 	if (err) {
-		dev_err(dev, "failed to init iommu: %d\n", err);
+		dev_err_probe(dev, err, "failed to init iommu\n");
 		goto destroy_wq;
 	}
 
@@ -1000,13 +1001,19 @@ static int apple_isp_probe(struct platform_device *pdev)
 		}
 	}
 
+	pm_runtime_get_noresume(dev);
+	err = pm_runtime_set_active(dev);
+	if (err) {
+		pm_runtime_put_noidle(dev);
+		goto free_surface;
+	}
 	pm_runtime_enable(dev);
 
 	if (!isp->hw->deferred_start) {
 		err = apple_isp_detect_camera(isp);
 		if (err) {
 			dev_err(dev, "failed to detect camera: %d\n", err);
-			goto free_surface;
+			goto disable_rpm;
 		}
 	}
 
@@ -1021,12 +1028,17 @@ static int apple_isp_probe(struct platform_device *pdev)
 		register_pm_notifier(&isp->pm_nb);
 	}
 
+	pm_runtime_put_sync(dev);
+
 	return 0;
 
 halt_firmware:
 	apple_isp_firmware_halt(isp);
-free_surface:
+disable_rpm:
 	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_put_noidle(dev);
+free_surface:
 	apple_isp_free_firmware_surface(isp);
 free_iommu:
 	apple_isp_free_iommu(isp);
