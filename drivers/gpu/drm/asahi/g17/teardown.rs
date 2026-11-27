@@ -173,20 +173,22 @@ impl Pending {
     }
 
     /// No allocation is needed at close. A scheduler page never exposed to firmware requires
-    /// no release, unless the Registry already retained one of its displaced graphs.
-    pub(crate) fn close(&mut self, context: &Arc<Context>, now: u64) -> Result {
+    /// no release, unless the Registry already retained one of its displaced graphs. Returns
+    /// whether the context waits here for a release.
+    pub(crate) fn close(&mut self, context: &Arc<Context>, now: u64) -> Result<bool> {
         if let Some(index) = self.find(context) {
             let entry = &mut self.entries[index];
             if entry.phase == Phase::Deferred {
                 entry.phase = Phase::Draining;
                 entry.armed = now;
             }
-            return Ok(());
+            return Ok(true);
         }
         if context.is_published() {
             self.insert(context, Phase::Draining, now)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Publish in insertion order. Mandatory control replies and a full control ring stop this

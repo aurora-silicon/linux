@@ -434,6 +434,8 @@ mod g17 {
         impl Context {
             pub fn is_published(&self) -> bool { self.published }
             pub fn scheduler_va(&self) -> u64 { self.scheduler }
+            // The identities are not modelled; release_queue() returns them at close.
+            pub fn release_unpublished(&self) {}
         }
     }
     pub mod teardown {

@@ -81,6 +81,7 @@ impl QosIds {
                 ids: self.clone(),
                 id: id as u8,
                 seen: AtomicBool::new(false),
+                returned: AtomicBool::new(false),
             },
             GFP_KERNEL,
         )?)
@@ -92,9 +93,15 @@ struct QosLease {
     id: u8,
     /// The firmware may have seen this ID.
     seen: AtomicBool,
+    /// The ID went back to the device's pool.
+    returned: AtomicBool,
 }
-impl Drop for QosLease {
-    fn drop(&mut self) {
+impl QosLease {
+    /// Gives the ID back, once: early ([`Context::release_unpublished`]) or on drop.
+    fn give_back(&self) {
+        if self.returned.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let fence = if self.seen.load(Ordering::Acquire) {
             super::channel::control_fence()
         } else {
@@ -107,6 +114,11 @@ impl Drop for QosLease {
         state.fences[id] = fence;
         state.used &= !(1u128 << id);
         state.released |= 1u128 << id;
+    }
+}
+impl Drop for QosLease {
+    fn drop(&mut self) {
+        self.give_back();
     }
 }
 
@@ -476,6 +488,19 @@ impl Context {
             Some(share) => share.release_execution(),
             None => self.execution.release(),
         }
+    }
+    /// Its queue closed before the firmware saw this context, and nothing of the queue can
+    /// publish any more. Returns the finite identities no firmware record can name: the
+    /// execution identity, the QoS ID and an unused render identity. A published context
+    /// returns its own once its scheduler release is consumed. Either way they do not wait
+    /// for the context's last reference, which a cancelled job keeps until its inputs signal.
+    pub(crate) fn release_unpublished(&self) {
+        if self.is_published() {
+            return;
+        }
+        self.release_execution();
+        self.qos.give_back();
+        self.release_render_id();
     }
     /// `other` runs in this context's shared execution context.
     pub(crate) fn shares_execution(&self, other: &Context) -> bool {
@@ -893,6 +918,30 @@ mod capacity_tests {
             assert_eq!(ids.used(), 0);
             assert_eq!(ids.state.lock().used, 3);
         }
+    }
+
+    #[test]
+    fn an_id_given_back_early_is_given_back_once() {
+        let ids = QosIds::new().unwrap();
+        let (early, other) = (ids.acquire().unwrap(), ids.acquire().unwrap());
+        assert_eq!(ids.used(), 2);
+        early.give_back();
+        early.give_back();
+        assert_eq!(ids.used(), 1);
+        let clock = ids.state.lock().clock;
+        // Every free ID is taken while the early holder lives, its own again among them.
+        let mut rest = KVec::with_capacity(QOS_IDS - 3, GFP_KERNEL).unwrap();
+        for _ in 0..QOS_IDS - 3 {
+            rest.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+        }
+        assert!(matches!(ids.acquire(), Err(ENOSPC)));
+        assert!(rest.iter().any(|lease| lease.id == early.id));
+        // Dropping the early holder gives nothing back: its ID is the new owner's.
+        drop(early);
+        assert_eq!(ids.used(), QOS_IDS as u32 - 2);
+        assert_eq!(ids.state.lock().clock, clock);
+        drop((other, rest));
+        assert_eq!(ids.used(), 0);
     }
 
     #[test]

@@ -2848,6 +2848,10 @@ impl gpu::Gpu for Gpu {
         command::MAX_STREAM
     }
 
+    fn max_syncs(&self) -> usize {
+        crate::file::MAX_SYNCS_PER_SUBMISSION
+    }
+
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         self.shared.feed.wait_hint()
     }

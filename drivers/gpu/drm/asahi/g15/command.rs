@@ -39,7 +39,7 @@ use crate::{file, mmu, timestamp, util::AnyBitPattern, util::Reader};
 /// Largest command buffer.
 pub(crate) const MAX_CMDBUF: usize = 4 << 20;
 /// Most input plus output syncs of one SUBMIT.
-pub(crate) const MAX_SYNCS: usize = 4096;
+pub(crate) const MAX_SYNCS: usize = crate::file::MAX_SYNCS_PER_SUBMISSION;
 /// Hardware commands per SUBMIT.
 const MAX_COMMANDS: u32 = crate::file::MAX_COMMANDS_PER_SUBMISSION;
 

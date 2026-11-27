@@ -94,7 +94,7 @@ impl Backend {
         };
         // Retain a published scheduler before a never-kicked physical graph is
         // removed. The teardown entry owns its root until control consumption.
-        firmware
+        let retained = firmware
             .queues
             .teardown
             .close(&self.context, super::now_ns())?;
@@ -106,6 +106,12 @@ impl Backend {
         firmware.queues.sync_render_holds();
         firmware.queues.admission.release_owner(self.owner);
         drop(state);
+        // Both schedulers are gone, so the firmware cannot see a context it has not seen yet.
+        // Its identities return with the queue's admission, not after the jobs that the
+        // closing entities cancelled: those wait for their inputs before they are freed.
+        if !retained {
+            self.context.release_unpublished();
+        }
         // Its idle channel, or its slot and never-published QID, is free.
         self.shared.channels.notify();
         self.shared.queue_events();

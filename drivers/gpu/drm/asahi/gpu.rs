@@ -410,6 +410,11 @@ pub(crate) trait Gpu: Send + Sync {
         usize::MAX
     }
 
+    /// Admission bound on a submission's input plus output syncs, checked before parsing them.
+    fn max_syncs(&self) -> usize {
+        usize::MAX
+    }
+
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
 
