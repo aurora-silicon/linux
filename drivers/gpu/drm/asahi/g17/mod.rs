@@ -1721,14 +1721,15 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
-        // Firmware command timestamps count the system counter.
+        // Firmware command timestamps count the system time base at its own 24 MHz, not at
+        // the CPU counter's rate (CNTFRQ_EL0 is 1 GHz on T6040 and T8140).
         let feed = feed::Feed::new(
             if m5 {
                 &feed::Policy::M5
             } else {
                 &feed::Policy::DEFAULT
             },
-            qos::clock().1,
+            crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ,
         )?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters

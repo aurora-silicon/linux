@@ -13,9 +13,10 @@
 //! Sustained demand can renew the deadline indefinitely; withdrawal occurs on a
 //! later worker poll, not at an exact eight-millisecond boundary.
 //!
-//! Pass intervals are firmware command timestamps, which count the SoC's
-//! architected system counter (CNTFRQ_EL0); the detector takes that rate at
-//! creation and keeps its thresholds in time.
+//! Pass intervals are firmware command timestamps, which count the system time
+//! base at the firmware's own 24 MHz (not CNTFRQ_EL0, which is 1 GHz on T6040
+//! and T8140); the detector takes that rate at creation and keeps its
+//! thresholds in time.
 
 use core::{
     pin::Pin,
