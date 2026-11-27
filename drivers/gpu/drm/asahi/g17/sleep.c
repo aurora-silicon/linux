@@ -850,6 +850,35 @@ static int asahi_g16_sram_save(struct device *dev, u64 offset, size_t save_len, 
 	return 0;
 }
 
+/*
+ * GFX's TVM gate, bit 0 of a word in the GPU PMGR ("sgx" @asahi_g16_tvm_offset, from the
+ * hwdata): a GFX power-down without a reset leaves it clear (J516s: 0x30000 after the stop, and
+ * the firmware then never runs after the run bit). macOS's sleep controller sets it (0x30001)
+ * 52 ms before GFX goes on at the wake.
+ */
+static u32 asahi_g16_tvm_offset;
+
+int asahi_g16_tvm_restore(struct device *dev)
+{
+	void __iomem *reg;
+	u32 val;
+	int ret = 0;
+
+	if (!asahi_g16_tvm_offset)
+		return 0;
+	reg = asahi_g17_map(dev->of_node, "sgx", 0, asahi_g16_tvm_offset, 4);
+	if (!reg)
+		return -ENOMEM;
+	val = readl(reg);
+	if (!(val & BIT(0))) {
+		writel(val | BIT(0), reg);
+		ret = readl_poll_timeout(reg, val, val & BIT(0), 1, 1000);
+		dev_info(dev, "GFX TVM gate was off after the stop: now %#x (%d)\n", val, ret);
+	}
+	iounmap(reg);
+	return ret;
+}
+
 /* The restart's write-back, with GFX on and before the run bit: the first @restore_len only. */
 int asahi_g16_sram_restore(void)
 {
@@ -887,7 +916,8 @@ int asahi_g16_sram_restore(void)
  * carry on, so the stop goes on whatever it answers, and only the restart brings it back.
  */
 struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk,
-					    u64 sram_offset, size_t save_len, size_t restore_len)
+					    u64 sram_offset, size_t save_len, size_t restore_len,
+					    u32 tvm_offset)
 {
 	struct asahi_g17_commit *c;
 	unsigned int i;
@@ -899,6 +929,7 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 
 	/* The step reached, in PMU scratch, which a reset keeps */
 	c->ran = true;
+	asahi_g16_tvm_offset = tvm_offset;
 	asahi_g16_sleep_note(0x21);
 	c->raise_ret = save_len ? asahi_g16_sram_save(dev, sram_offset, save_len, restore_len) : 0;
 	asahi_g16_sleep_note(0x28);

@@ -87,6 +87,8 @@ pub(crate) struct SleepSram {
     pub(crate) save: usize,
     /// Bytes written back, from `start`.
     pub(crate) restore: usize,
+    /// GFX's TVM gate word in the "sgx" window, bit 0, set again before GFX goes on.
+    pub(crate) tvm: u32,
 }
 
 /// When a deep sleep stops the GPU's firmware and powers its domain off.
@@ -399,10 +401,14 @@ pub(crate) mod t6030 {
         deep_sleep: true,
         sleep_stop: super::SleepStop::Prepare,
         sleep_quiet_stop: true,
+        // GFX's TVM gate (ADT pmgr gfx-tvm) is bit 0 of the GPU PMGR's +0x10000, "sgx"
+        // +0xe90000: macOS's sleep controller clears it 6.5 ms before the commit and sets it
+        // (0x30001) 52 ms before GFX goes on at the wake; a GFX power-down alone leaves it clear.
         sleep_sram: Some(super::SleepSram {
             start: 0xd60000,
             save: 0x20000,
             restore: 0x14000,
+            tvm: 0xe90000,
         }),
         supports_render_scs: false,
         cross_engine_hold: true,
