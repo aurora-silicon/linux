@@ -40,6 +40,10 @@ h17p_slice = H17P[H17P.index('#define IOMFB_DROPPED_MAX'):H17P.index('\n/* The H
 forget_fn = extract_fn(V26, 'dcp_peer_forget')
 sync_fn = extract_fn(V26, 'dcp_peer_retire_sync')
 record_fn = extract_fn(RUNTIME, 'dcp_peer_record_retired_v27')
+transition_end_fn = extract_fn(RUNTIME, 'dcp_peer_transition_end')
+stop_once_fn = extract_fn(RUNTIME, 'dcp_peer_stop_v27_once')
+stop_fn = extract_fn(RUNTIME, 'dcp_peer_stop_v27')
+stop_wait_fn = extract_fn(RUNTIME, 'dcp_peer_stop_wait_v27')
 
 if '--drop-retire-sync' in sys.argv:
     sync_fn = 'static void dcp_peer_retire_sync(void) { (void)down_write; (void)up_write; }\n'
@@ -47,6 +51,7 @@ if '--drop-retire-sync' in sys.argv:
 TEST = r'''
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -56,6 +61,85 @@ TEST = r'''
 #include <time.h>
 #include <unistd.h>
 typedef uint32_t u32; typedef int32_t s32;
+
+#define DCP_FIRMWARE_V_27_0 27
+#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
+#define smp_load_acquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define msecs_to_jiffies(ms) ((unsigned long)(ms))
+#define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
+#define min_t(t, a, b) ({ t _a = (a); t _b = (b); _a < _b ? _a : _b; })
+#define max_t(t, a, b) ({ t _a = (a); t _b = (b); _a > _b ? _a : _b; })
+
+static unsigned long mock_jiffies_ms(void)
+{
+	struct timespec ts;
+
+	assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+	return (unsigned long)ts.tv_sec * 1000UL + (unsigned long)(ts.tv_nsec / 1000000L);
+}
+#define jiffies mock_jiffies_ms()
+
+struct device_mock {
+	pthread_mutex_t m;
+};
+
+static bool device_trylock(struct device_mock *d)
+{
+	return pthread_mutex_trylock(&d->m) == 0;
+}
+
+static void device_unlock(struct device_mock *d)
+{
+	assert(pthread_mutex_unlock(&d->m) == 0);
+}
+
+struct wq_mock {
+	pthread_mutex_t m;
+	pthread_cond_t cv;
+};
+
+static struct wq_mock dcp_peer_stop_wq = { .m = PTHREAD_MUTEX_INITIALIZER };
+static atomic_uint g_wait_calls;
+
+static void init_wq_monotonic(struct wq_mock *wq)
+{
+	pthread_condattr_t attr;
+
+	assert(pthread_condattr_init(&attr) == 0);
+	assert(pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0);
+	assert(pthread_cond_init(&wq->cv, &attr) == 0);
+	assert(pthread_condattr_destroy(&attr) == 0);
+}
+
+static void wake_up_all(struct wq_mock *wq)
+{
+	assert(pthread_mutex_lock(&wq->m) == 0);
+	assert(pthread_cond_broadcast(&wq->cv) == 0);
+	assert(pthread_mutex_unlock(&wq->m) == 0);
+}
+
+#define wait_event_timeout(wq, cond, timeout_ms) ({ \
+	struct timespec _ts; \
+	unsigned long _rem = (timeout_ms); \
+	int _rc = 0; \
+	bool _ok; \
+	atomic_fetch_add(&g_wait_calls, 1); \
+	assert(clock_gettime(CLOCK_MONOTONIC, &_ts) == 0); \
+	_ts.tv_sec += _rem / 1000; \
+	_ts.tv_nsec += (_rem % 1000) * 1000000L; \
+	if (_ts.tv_nsec >= 1000000000L) { \
+		_ts.tv_sec++; \
+		_ts.tv_nsec -= 1000000000L; \
+	} \
+	assert(pthread_mutex_lock(&(wq).m) == 0); \
+	while (!(cond) && _rc != ETIMEDOUT) \
+		_rc = pthread_cond_timedwait(&(wq).cv, &(wq).m, &_ts); \
+	_ok = (cond); \
+	assert(pthread_mutex_unlock(&(wq).m) == 0); \
+	_ok ? 1L : 0L; \
+})
 
 struct mutex_mock {
 	pthread_mutex_t m;
@@ -143,28 +227,85 @@ struct dcp_peer_tiling {
 };
 
 struct apple_dcp {
+	struct device_mock *dev;
+	int fw_compat;
 	struct apple_dcp *peer_reserved;
 	struct apple_dcp *peer_owner;
 	struct dcp_peer_tiling peer_tiling;
+	struct dcp_peer_frames_v27 peer_frames;
 	bool peer_unbinding;
+	bool peer_transition_active;
+	u32 peer_transition_seq;
 	struct {
 		struct mutex_mock lock;
 		bool stopped;
+		bool peer_paused;
 	} iomfb;
 	struct dcp_present_state_h17p present_state_h17p;
 };
 
 static bool peer_scanout = true;
 
-''' + forget_fn + '\n' + sync_fn + '\n' + record_fn + r'''
+static void (*g_quiesce_hook)(struct apple_dcp *dcp, struct apple_dcp *peer, int *ret);
+static int g_settle_ret;
+static atomic_uint g_quiesce_calls;
+
+static void iomfb_pause_peer(struct apple_dcp *dcp, bool pause)
+{
+	WRITE_ONCE(dcp->iomfb.peer_paused, pause);
+}
+
+static int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
+{
+	(void)dcp;
+	(void)timeout;
+	return g_settle_ret;
+}
+
+static bool iomfb_retire_stalled_present_h17p(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	return false;
+}
+
+static bool dcp_peer_transport_idle(struct apple_dcp *dcp)
+{
+	return !READ_ONCE(dcp->peer_unbinding);
+}
+
+static int dcp_peer_probe_quiesce(struct apple_dcp *dcp, struct apple_dcp *peer,
+				  bool invalidate_mode)
+{
+	int ret = 0;
+
+	(void)invalidate_mode;
+	atomic_fetch_add(&g_quiesce_calls, 1);
+	if (g_quiesce_hook)
+		g_quiesce_hook(dcp, peer, &ret);
+	return ret;
+}
+
+''' + forget_fn + '\n' + sync_fn + '\n' + record_fn + '\n' + transition_end_fn + '\n' + stop_once_fn + '\n' + stop_fn + '\n' + stop_wait_fn + r'''
 
 static struct apple_dcp *make_dcp(void)
 {
 	struct apple_dcp *d = calloc(1, sizeof(*d));
 
 	assert(d);
+	d->dev = calloc(1, sizeof(*d->dev));
+	assert(d->dev);
+	assert(pthread_mutex_init(&d->dev->m, NULL) == 0);
 	assert(pthread_mutex_init(&d->iomfb.lock.m, NULL) == 0);
+	d->fw_compat = DCP_FIRMWARE_V_27_0;
 	return d;
+}
+
+static void free_dcp(struct apple_dcp *d)
+{
+	pthread_mutex_destroy(&d->iomfb.lock.m);
+	pthread_mutex_destroy(&d->dev->m);
+	free(d->dev);
+	free(d);
 }
 
 static struct apple_dcp *g_hook_peer;
@@ -231,8 +372,7 @@ static void *unbind_thread(void *arg)
 	dcp_peer_forget(ctx->peer);
 	dcp_peer_retire_sync();
 	atomic_store(&ctx->peer_freed, true);
-	pthread_mutex_destroy(&ctx->peer->iomfb.lock.m);
-	free(ctx->peer);
+	free_dcp(ctx->peer);
 	return NULL;
 }
 
@@ -307,10 +447,199 @@ static void test_record_retired_races(void)
 	assert(pthread_join(u_tid, NULL) == 0);
 	assert(atomic_load(&ctx.peer_freed));
 
-	pthread_mutex_destroy(&owner->iomfb.lock.m);
-	pthread_mutex_destroy(&other->iomfb.lock.m);
-	free(owner);
-	free(other);
+	free_dcp(owner);
+	free_dcp(other);
+}
+
+struct stop_race_ctx {
+	struct apple_dcp *owner;
+	unsigned int timeout_ms;
+	int ret;
+	pthread_mutex_t m;
+	pthread_cond_t cv;
+	bool in_quiesce;
+	bool release_quiesce;
+	int quiesce_ret;
+	bool clear_active;
+};
+
+static struct stop_race_ctx *g_stop_ctx;
+
+static void hook_quiesce_race(struct apple_dcp *dcp, struct apple_dcp *peer, int *ret)
+{
+	struct stop_race_ctx *ctx = g_stop_ctx;
+	int call = atomic_load(&g_quiesce_calls);
+
+	(void)peer;
+	if (call == 1) {
+		pthread_mutex_lock(&ctx->m);
+		ctx->in_quiesce = true;
+		pthread_cond_broadcast(&ctx->cv);
+		while (!ctx->release_quiesce)
+			pthread_cond_wait(&ctx->cv, &ctx->m);
+		pthread_mutex_unlock(&ctx->m);
+		if (ctx->clear_active)
+			smp_store_release(&dcp->peer_frames.active, false);
+		*ret = ctx->quiesce_ret;
+	} else {
+		smp_store_release(&dcp->peer_frames.active, false);
+		*ret = 0;
+	}
+}
+
+static void *stop_wait_worker(void *arg)
+{
+	struct stop_race_ctx *ctx = arg;
+
+	ctx->ret = dcp_peer_stop_wait_v27(ctx->owner, ctx->timeout_ms);
+	return NULL;
+}
+
+static void test_peer_stop_wait(void)
+{
+	struct apple_dcp *owner = make_dcp();
+	struct apple_dcp *peer = make_dcp();
+
+	init_wq_monotonic(&dcp_peer_stop_wq);
+	g_quiesce_hook = hook_quiesce_race;
+
+	/* 1. Concurrent paired stop waits once on dcp_peer_stop_wq (no polling). */
+	owner->peer_reserved = peer;
+	peer->peer_owner = owner;
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+
+	struct stop_race_ctx first = {
+		.owner = owner,
+		.timeout_ms = 1000,
+		.m = PTHREAD_MUTEX_INITIALIZER,
+		.cv = PTHREAD_COND_INITIALIZER,
+		.clear_active = true,
+	};
+	struct stop_race_ctx second = {
+		.owner = owner,
+		.timeout_ms = 1000,
+	};
+	g_stop_ctx = &first;
+
+	pthread_t t1, t2;
+	assert(pthread_create(&t1, NULL, stop_wait_worker, &first) == 0);
+	pthread_mutex_lock(&first.m);
+	while (!first.in_quiesce)
+		pthread_cond_wait(&first.cv, &first.m);
+	pthread_mutex_unlock(&first.m);
+
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	nanosleep(&(struct timespec){ .tv_nsec = 30 * 1000 * 1000 }, NULL);
+	assert(atomic_load(&g_wait_calls) == 1);
+
+	pthread_mutex_lock(&first.m);
+	first.release_quiesce = true;
+	pthread_cond_broadcast(&first.cv);
+	pthread_mutex_unlock(&first.m);
+
+	assert(pthread_join(t1, NULL) == 0);
+	assert(pthread_join(t2, NULL) == 0);
+	assert(first.ret == 1);
+	assert(second.ret == 0);
+	assert(atomic_load(&g_quiesce_calls) == 1);
+	assert(atomic_load(&g_wait_calls) == 1);
+
+	/* 2. Failed in-flight stop wakes waiter, which retries and succeeds. */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	first = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+		.m = PTHREAD_MUTEX_INITIALIZER,
+		.cv = PTHREAD_COND_INITIALIZER,
+		.quiesce_ret = -EIO,
+		.clear_active = false,
+	};
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+	};
+	g_stop_ctx = &first;
+
+	assert(pthread_create(&t1, NULL, stop_wait_worker, &first) == 0);
+	pthread_mutex_lock(&first.m);
+	while (!first.in_quiesce)
+		pthread_cond_wait(&first.cv, &first.m);
+	pthread_mutex_unlock(&first.m);
+
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	nanosleep(&(struct timespec){ .tv_nsec = 20 * 1000 * 1000 }, NULL);
+	assert(atomic_load(&g_wait_calls) == 1);
+
+	pthread_mutex_lock(&first.m);
+	first.release_quiesce = true;
+	pthread_cond_broadcast(&first.cv);
+	pthread_mutex_unlock(&first.m);
+
+	assert(pthread_join(t1, NULL) == 0);
+	assert(pthread_join(t2, NULL) == 0);
+	assert(first.ret == -EIO);
+	assert(second.ret == 1);
+	assert(atomic_load(&g_quiesce_calls) == 2);
+	assert(atomic_load(&g_wait_calls) == 1);
+
+	/* 3. Contended wait times out cleanly at deadline without extra retry. */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	first = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+		.m = PTHREAD_MUTEX_INITIALIZER,
+		.cv = PTHREAD_COND_INITIALIZER,
+		.clear_active = true,
+	};
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 25,
+	};
+	g_stop_ctx = &first;
+
+	assert(pthread_create(&t1, NULL, stop_wait_worker, &first) == 0);
+	pthread_mutex_lock(&first.m);
+	while (!first.in_quiesce)
+		pthread_cond_wait(&first.cv, &first.m);
+	pthread_mutex_unlock(&first.m);
+
+	unsigned long start_ms = mock_jiffies_ms();
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	assert(pthread_join(t2, NULL) == 0);
+	unsigned long elapsed_ms = mock_jiffies_ms() - start_ms;
+	assert(second.ret == -EBUSY);
+	assert(elapsed_ms >= 20 && elapsed_ms < 80);
+	assert(atomic_load(&g_wait_calls) == 1);
+
+	pthread_mutex_lock(&first.m);
+	first.release_quiesce = true;
+	pthread_cond_broadcast(&first.cv);
+	pthread_mutex_unlock(&first.m);
+	assert(pthread_join(t1, NULL) == 0);
+	assert(first.ret == 1);
+
+	/* 4. Uncontended -EBUSY (held device lock) stops cleanly at deadline. */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	assert(pthread_mutex_lock(&owner->dev->m) == 0);
+	start_ms = mock_jiffies_ms();
+	int ret = dcp_peer_stop_wait_v27(owner, 25);
+	elapsed_ms = mock_jiffies_ms() - start_ms;
+	assert(pthread_mutex_unlock(&owner->dev->m) == 0);
+	assert(ret == -EBUSY);
+	assert(elapsed_ms >= 20 && elapsed_ms < 60);
+	assert(atomic_load(&g_wait_calls) >= 1);
+
+	g_quiesce_hook = NULL;
+	g_stop_ctx = NULL;
+	free_dcp(owner);
+	free_dcp(peer);
 }
 
 static struct dcp_peer_frames_v27 paired(u32 first, u32 last)
@@ -381,6 +710,7 @@ int main(void)
 	/* A stale or duplicate completion is not a retirement. */
 	assert(!dcp_peer_frame_complete_v27(&s, 1, 6, true, &w, &shown));
 	test_record_retired_races();
+	test_peer_stop_wait();
 	return 0;
 }
 '''

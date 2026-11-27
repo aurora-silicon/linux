@@ -109,6 +109,16 @@ static int dcp_peer_limited_stop_v27(struct apple_dcp *dcp, struct apple_dcp *pe
 	return -EOPNOTSUPP;
 }
 
+static void dcp_peer_transition_end(struct apple_dcp *dcp)
+{
+	scoped_guard(mutex, &dcp_peer_lock) {
+		WRITE_ONCE(dcp->peer_transition_seq,
+			   dcp->peer_transition_seq + 1);
+		smp_store_release(&dcp->peer_transition_active, false);
+	}
+	wake_up_all(&dcp_peer_stop_wq);
+}
+
 int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr)
 {
 	struct apple_dcp *peer;
@@ -130,9 +140,14 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
 		if (limited && !prepared)
 			return ret;
+		if (dcp->peer_transition_active)
+			return -EBUSY;
+		WRITE_ONCE(dcp->peer_transition_active, true);
 	}
-	if (!device_trylock(dcp->dev))
-		return -EBUSY;
+	if (!device_trylock(dcp->dev)) {
+		ret = -EBUSY;
+		goto clear_transition;
+	}
 	iomfb_pause_peer(dcp, true);
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
 	if (ret) {
@@ -233,6 +248,8 @@ peer_unlock:
 unpause:
 	iomfb_pause_peer(dcp, false);
 	device_unlock(dcp->dev);
+clear_transition:
+	dcp_peer_transition_end(dcp);
 	return ret;
 }
 
@@ -310,16 +327,29 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 	return 0;
 }
 
-/* Return 1 after a paired stop, 0 for a normal CRTC, or an error. */
-int dcp_peer_stop_v27(struct apple_dcp *dcp)
+static int dcp_peer_stop_v27_once(struct apple_dcp *dcp, bool *contended)
 {
 	struct apple_dcp *peer;
 	int ret = 0;
 
+	if (contended)
+		*contended = false;
 	if (!peer_scanout || !smp_load_acquire(&dcp->peer_frames.active))
 		return 0;
-	if (!device_trylock(dcp->dev))
-		return -EBUSY;
+	scoped_guard(mutex, &dcp_peer_lock) {
+		if (!dcp->peer_frames.active)
+			return 0;
+		if (dcp->peer_transition_active) {
+			if (contended)
+				*contended = true;
+			return -EBUSY;
+		}
+		WRITE_ONCE(dcp->peer_transition_active, true);
+	}
+	if (!device_trylock(dcp->dev)) {
+		ret = -EBUSY;
+		goto clear_transition;
+	}
 	/* Re-check under device_lock: a racing unplug/power-off may have finished. */
 	if (!READ_ONCE(dcp->peer_frames.active))
 		goto unlock;
@@ -359,26 +389,60 @@ unpause:
 	iomfb_pause_peer(dcp, false);
 unlock:
 	device_unlock(dcp->dev);
+clear_transition:
+	dcp_peer_transition_end(dcp);
 	return ret;
 }
 
+/* Return 1 after a paired stop, 0 for a normal CRTC, or an error. */
+int dcp_peer_stop_v27(struct apple_dcp *dcp)
+{
+	return dcp_peer_stop_v27_once(dcp, NULL);
+}
+
 /*
- * Retry transient -EBUSY from dcp_peer_stop_v27() until timeout_ms elapses
- * (the deadline bounds starting new retries; an attempt already in settle or
- * firmware RPCs runs to completion).
+ * Stop an active pair, waiting on dcp_peer_stop_wq for any in-flight paired
+ * stop or modeset (bounded by timeout_ms) and bounding any remaining transient
+ * -EBUSY retries so none start at or after the deadline.
  */
 int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 {
 	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	bool contended;
 	int ret;
 
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return 0;
 	for (;;) {
-		ret = dcp_peer_stop_v27(dcp);
-		if (ret != -EBUSY || time_after_eq(jiffies, deadline))
+		u32 seq = READ_ONCE(dcp->peer_transition_seq);
+		unsigned long now, remaining;
+
+		ret = dcp_peer_stop_v27_once(dcp, &contended);
+		if (ret != -EBUSY)
 			return ret;
-		usleep_range(5000, 6000);
+		if (!smp_load_acquire(&dcp->peer_frames.active))
+			return 0;
+		now = jiffies;
+		if (time_after_eq(now, deadline))
+			return -EBUSY;
+		remaining = deadline - now;
+		if (contended) {
+			wait_event_timeout(dcp_peer_stop_wq,
+					   (!smp_load_acquire(&dcp->peer_transition_active) &&
+					    READ_ONCE(dcp->peer_transition_seq) != seq) ||
+					   !smp_load_acquire(&dcp->peer_frames.active),
+					   remaining);
+		} else {
+			wait_event_timeout(dcp_peer_stop_wq,
+					   !smp_load_acquire(&dcp->peer_frames.active),
+					   min_t(unsigned long, remaining,
+						 max_t(unsigned long, 1,
+						       msecs_to_jiffies(5))));
+		}
+		if (!smp_load_acquire(&dcp->peer_frames.active))
+			return 0;
+		if (time_after_eq(jiffies, deadline))
+			return -EBUSY;
 	}
 }
 

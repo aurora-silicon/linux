@@ -48,6 +48,7 @@
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_color_mgmt.h>

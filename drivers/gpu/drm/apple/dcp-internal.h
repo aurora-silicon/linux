@@ -579,6 +579,9 @@ struct apple_dcp {
 	 * dcp_peer_lock.
 	 */
 	bool peer_limited;
+	/* Firmware-27 paired modeset/stop serialization; under dcp_peer_lock. */
+	bool peer_transition_active;
+	u32 peer_transition_seq;
 	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint;
 	 * separate from index, which also selects the doorbell and PHY mode. */
 	u32 peer_endpoint;

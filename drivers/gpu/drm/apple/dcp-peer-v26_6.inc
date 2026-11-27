@@ -19,6 +19,7 @@ static DEFINE_MUTEX(dcp_peer_lock);
  * dcp_peer_lock so unbind/remove cannot devm-free the peer under it.
  */
 static DECLARE_RWSEM(dcp_peer_retire_rwsem);
+static DECLARE_WAIT_QUEUE_HEAD(dcp_peer_stop_wq);
 
 /* ---- tiling state (D114/D115 callbacks) ---- */
 
