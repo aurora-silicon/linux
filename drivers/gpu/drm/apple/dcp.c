@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 #include <linux/suspend.h>
 #include <linux/align.h>
@@ -10418,6 +10419,8 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	u32 val;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_domains_on, dcp);
+
 	ret = dcp_s2r_map_power(dcp, &ps, &pwrgate, &pmc);
 	if (ret)
 		goto out;
@@ -10473,6 +10476,8 @@ static int dcp_s2r_ext_domains_on(struct apple_dcp *dcp)
 	u32 val;
 	int i, ret = -ENODEV;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_ext_domains_on, dcp);
+
 	if (dcp->hw.s2r_layout)
 		return dcp_s2r_domains_on(dcp);
 
@@ -10526,6 +10531,63 @@ static void dcp_s2r_forget_crash(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->crashed, false);
 }
 
+static int dcp_s2r_dart_gapf_ready(struct device *dev)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_dart_gapf_ready, dev);
+	return apple_dart_gapf_ready(dev);
+}
+
+static int dcp_s2r_dart_power_dark(struct device *dev, bool dark)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_dart_power_dark, dev, dark);
+	return apple_dart_power_dark(dev, dark);
+}
+
+static int dcp_s2r_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_dart_display_streams, dev, streams, on, flush);
+	return apple_dart_display_streams(dev, streams, on, flush);
+}
+
+static int dcp_s2r_ext_rtkit_wake(struct apple_dcp *dcp, void __iomem *control, bool cycled)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_ext_rtkit_wake, dcp, control, cycled);
+	if (!cycled)
+		return apple_rtkit_sleep_return(dcp->rtk, control);
+
+	return apple_rtkit_power_cycled_return(dcp->rtk, control);
+}
+
+/*
+ * Re-open and restore a woken DCP's DARTs in order. When s2r_disp_dart_with_dcp is
+ * true, defer clearing display_dark to apple_dart_display_streams(..., true, false)
+ * so TTBR/TCR restore runs before dark-exit invalidation.
+ */
+static int dcp_s2r_wake_darts(struct apple_dcp *dcp)
+{
+	const struct dcp_s2r_layout *l = dcp_s2r_layout(dcp);
+	int ret;
+
+	/* Powered again: the invalidations held while it was dark run now. */
+	if (dcp->s2r_disp_dart && !dcp->hw.s2r_disp_dart_with_dcp) {
+		ret = dcp_s2r_dart_power_dark(dcp->s2r_disp_dart, false);
+		if (ret)
+			return ret;
+	}
+	/* After the domains, whose writes it would reject, the DART protects them again. */
+	if (dcp->s2r_dcp_dart) {
+		ret = dcp_s2r_dart_display_streams(dcp->s2r_dcp_dart, l->dcp_streams, true, false);
+		if (ret)
+			return ret;
+	}
+	/* Set up again before the firmware runs, which uses it right away. */
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart)
+		return dcp_s2r_dart_display_streams(dcp->s2r_disp_dart, l->disp_streams, true,
+						    false);
+
+	return 0;
+}
+
 /*
  * DCPEXT back after a real sleep, the same way in every macOS wake measured: its domains,
  * its DART's streams, and a warm restart, with no secure port and no display-on call. After
@@ -10539,34 +10601,15 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 	dcp_s2r_forget_crash(dcp);
 	if (!dcp->s2r_dcp_dart)
 		return -ENODEV;
-	ret = apple_dart_gapf_ready(dcp->s2r_dcp_dart);
+	ret = dcp_s2r_dart_gapf_ready(dcp->s2r_dcp_dart);
 	if (!ret)
 		ret = dcp_s2r_ext_domains_on(dcp);
+	if (!ret)
+		ret = dcp_s2r_wake_darts(dcp);
 	if (ret)
 		return ret;
-	/* Powered again: the invalidations held while it was dark run now. */
-	if (dcp->s2r_disp_dart) {
-		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
-		if (ret)
-			return ret;
-	}
-	/* After the domains, whose writes it would reject, the DART protects them again. */
-	ret = apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
-					 true, false);
-	if (ret)
-		return ret;
-	/* Set up again before the firmware runs, which uses it right away. */
-	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
-		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
-						 dcp_s2r_layout(dcp)->disp_streams, true, false);
-		if (ret)
-			return ret;
-	}
 	dcp->ext_idle_domains_off = false;
-	if (!cycled)
-		return apple_rtkit_sleep_return(dcp->rtk, control);
-
-	return apple_rtkit_power_cycled_return(dcp->rtk, control);
+	return dcp_s2r_ext_rtkit_wake(dcp, control, cycled);
 }
 
 /* DISPEXT0 off in its own order, CPU first. Only the CPU has to power-gate to start again. */
@@ -10698,6 +10741,20 @@ static void dcp_secure_port_map(void *data)
 	dcp->secure_map_us = ktime_us_delta(ktime_get(), start);
 }
 
+static int dcp_s2r_warm_rtkit_boot(struct apple_dcp *dcp)
+{
+	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_s2r_warm_rtkit_boot, dcp);
+	ret = apple_rtkit_warm_restart(dcp->rtk);
+	if (ret)
+		return ret;
+
+	writel(APPLE_DCP_COPROC_CPU_CONTROL_RUN, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+
+	return apple_rtkit_boot_with(dcp->rtk, dcp->secure_rtk ? dcp_secure_port_map : NULL, dcp);
+}
+
 static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 {
 	int ret;
@@ -10708,28 +10765,9 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
-	/* Powered again: the invalidations held while it was dark run now. */
-	if (dcp->s2r_disp_dart && !dcp->hw.s2r_disp_dart_with_dcp) {
-		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
-		if (ret)
-			return ret;
-	}
-
-	/* After the domains, whose writes it would reject, the DART protects them again. */
-	if (dcp->s2r_dcp_dart) {
-		ret = apple_dart_display_streams(dcp->s2r_dcp_dart,
-						 dcp_s2r_layout(dcp)->dcp_streams,
-						 true, false);
-		if (ret)
-			return ret;
-	}
-	/* Set up again before the firmware runs, which uses it right away. */
-	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
-		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
-						 dcp_s2r_layout(dcp)->disp_streams, true, false);
-		if (ret)
-			return ret;
-	}
+	ret = dcp_s2r_wake_darts(dcp);
+	if (ret)
+		return ret;
 
 	if (dcp->secure_rtk) {
 		dcp_secure_poll_stop(dcp);
@@ -10738,13 +10776,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 			return ret;
 	}
 
-	ret = apple_rtkit_warm_restart(dcp->rtk);
-	if (ret)
-		return ret;
-
-	writel(APPLE_DCP_COPROC_CPU_CONTROL_RUN, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-
-	ret = apple_rtkit_boot_with(dcp->rtk, dcp->secure_rtk ? dcp_secure_port_map : NULL, dcp);
+	ret = dcp_s2r_warm_rtkit_boot(dcp);
 	if (ret)
 		return ret;
 
@@ -13088,4 +13120,5 @@ void dcp_unregister(void)
 #include "dcp_external_audio_test.c"
 #include "dcp_handoff_test.c"
 #include "dcp-firmware-test.c"
+#include "dcp_s2r_test.c"
 #endif
