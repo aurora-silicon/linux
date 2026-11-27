@@ -12461,6 +12461,34 @@ restore_fab:
 	return ret;
 }
 
+struct dcp_wake_swap_mark {
+	u32 started;
+	int shown;
+};
+
+static void dcp_wake_swap_mark(struct apple_dcp *dcp, struct dcp_wake_swap_mark *mark)
+{
+	mark->started = READ_ONCE(dcp->started_swap_id);
+	mark->shown = atomic_read(&dcp->shown_swaps);
+}
+
+/*
+ * The plane-only commit after a wake lit the panel only if it started a swap of its own and
+ * the firmware completed that very swap with shown set. A completion with shown clear, or a
+ * shown one of an older swap, leaves the panel dark.
+ */
+static bool dcp_wake_swap_shown(struct apple_dcp *dcp, const struct dcp_wake_swap_mark *before,
+				u32 *started)
+{
+	struct dcp_wake_swap_mark now;
+
+	dcp_wake_swap_mark(dcp, &now);
+	smp_rmb();	/* the count before the id: pairs with dcp_note_swap_complete() */
+	*started = now.started;
+	return now.started != before->started && now.shown != before->shown &&
+	       READ_ONCE(dcp->shown_swap_id) == now.started;
+}
+
 /*
  * After a real wake: the internal DCP back, as linux#1477 does it for the M4 Pro
  * (t6040_disp_back, dcp_t6041_s2r_domains_on, dcp_t6041_s2r_resume, the warm restart and the
@@ -12508,11 +12536,15 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 	/*
 	 * The mode is the one the panel had before the sleep, and the warm restart brings the
 	 * firmware back with it: hand it the planes alone first. Set the mode again only if
-	 * that commit fails or the firmware completes no swap of it.
+	 * that commit fails or the firmware does not show the swap it started.
 	 */
 	for (modeset = false; ; modeset = true) {
-		int swaps = atomic_read(&dcp->swap_completions);
+		struct dcp_wake_swap_mark mark;
 		ktime_t t = ktime_get();
+		bool shown;
+		u32 swap;
+
+		dcp_wake_swap_mark(dcp, &mark);
 
 		state = drm_atomic_commit_alloc(crtc->dev);
 		if (!state) {
@@ -12535,11 +12567,11 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 		drm_atomic_commit_put(state);
 		if (ret == -EDEADLK)
 			goto unlock;
-		dev_dbg(dcp->dev, "wake commit %s the mode set: %d, %d swaps, %lld ms\n",
-			modeset ? "with" : "without", ret,
-			atomic_read(&dcp->swap_completions) - swaps,
+		shown = dcp_wake_swap_shown(dcp, &mark, &swap);
+		dev_dbg(dcp->dev, "wake commit %s the mode set: %d, swap %u %s, %lld ms\n",
+			modeset ? "with" : "without", ret, swap, shown ? "shown" : "not shown",
 			ktime_ms_delta(ktime_get(), t));
-		if (modeset || (!ret && atomic_read(&dcp->swap_completions) != swaps))
+		if (modeset || (!ret && shown))
 			break;
 	}
 unlock:
@@ -13163,5 +13195,6 @@ void dcp_unregister(void)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
 #include "dcp_handoff_test.c"
+#include "dcp_t6041_wake_test.c"
 #include "dcp-firmware-test.c"
 #endif

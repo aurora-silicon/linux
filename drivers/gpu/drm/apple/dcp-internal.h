@@ -1043,8 +1043,9 @@ struct apple_dcp {
 	struct completion s2r_hpd_done;
 	/* Woken when a channel's call depth or the pending ACKs fall. */
 	wait_queue_head_t channels_idle_wq;
-	/* Swap completions from the firmware, counted for the commit after a wake. */
-	atomic_t swap_completions;
+	/* Shown swap completions and the last one's id, for the commit after a wake. */
+	atomic_t shown_swaps;
+	u32 shown_swap_id;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
@@ -1629,5 +1630,18 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
 void dcp_indicator_display_resumed(struct apple_dcp *dcp);
 extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
+
+/*
+ * A swap the firmware completed with shown set, recorded for the commit after a T6041 wake:
+ * the id first, so a reader that sees the new count sees that swap's id or a later one.
+ */
+static inline void dcp_note_swap_complete(struct apple_dcp *dcp, u32 swap_id, bool shown)
+{
+	if (!shown)
+		return;
+	WRITE_ONCE(dcp->shown_swap_id, swap_id);
+	smp_mb__before_atomic();	/* pairs with the smp_rmb() in dcp_wake_swap_shown() */
+	atomic_inc(&dcp->shown_swaps);
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */
