@@ -656,8 +656,10 @@ mod tests {
                 panic!("the M5 Pro and Max must identify their loaded firmware");
             };
             for (i, build) in builds.iter().enumerate() {
-                // 27.2 (26B123) moved the InitData layouts.
-                let layouts = if build.os_version >= [27, 2, 0] {
+                // 27.2 (26B123) moved the InitData layouts; 27.3 (26C5035r) added a HW-data word.
+                let layouts = if build.os_version >= [27, 3, 0] {
+                    M5Layouts::V26C5035
+                } else if build.os_version >= [27, 2, 0] {
                     M5Layouts::V26B123
                 } else {
                     M5Layouts::V26A428

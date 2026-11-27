@@ -1684,10 +1684,12 @@ impl InitData {
     /// the running command and otherwise lets it fall to the base state.
     ///
     /// M5 publishes none while paced work streams, and publishes the full effort while either a
-    /// host thread waits for submitted work (`waited`) or a client has kept the GPU running
-    /// without going idle for longer than the effort hold (`bound`, [`super::power::BusyRuns`]):
-    /// pipelined compute and render loops that keep the GPU continuously busy without blocking on
-    /// an unsignalled fence would otherwise fall to the base performance state.
+    /// host thread waits for submitted work (`waited`), waits on a pure-compute syncobj
+    /// (`compute_waited`, which `sync_scope.c` notes separately from `ExportFence::waited`), or a
+    /// client has kept the GPU running without going idle for longer than the effort hold
+    /// (`bound`, [`super::power::BusyRuns`]): pipelined compute and render loops that keep the GPU
+    /// continuously busy without blocking on an unsignalled fence, or submit-and-wait compute
+    /// loops using scoped syncobj waits, would otherwise fall to the base performance state.
     ///
     /// The other G17 SoCs publish the full effort while `bound` or while a host thread is waiting
     /// on a pure-compute submission (`compute_waited`): a submit-and-wait loop queues nothing
@@ -1709,7 +1711,7 @@ impl InitData {
         compute_waited: bool,
     ) -> u32 {
         if self.m5 {
-            return if waited || bound { effort } else { 0 };
+            return if waited || bound || compute_waited { effort } else { 0 };
         }
         if bound || compute_waited {
             effort
