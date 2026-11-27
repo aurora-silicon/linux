@@ -46,7 +46,7 @@ PRELUDE = r'''
 #define list_for_each_entry(v,h,n) for ((v)=owner; (v); (v)=NULL)
 struct device { int lock; void *data; };
 struct pci_bus;
-struct pci_dev { struct device dev; struct pci_bus *bus, *subordinate; unsigned devfn; };
+struct pci_dev { struct device dev; struct pci_bus *bus, *subordinate; unsigned devfn; bool state_saved; };
 struct pci_bus { struct pci_dev *self; struct pci_bus *subordinate; };
 struct kref { int refs; };
 struct work_struct { int queued; };
@@ -54,8 +54,9 @@ struct centauri_t6050_ipc { bool fenced; };
 struct centauri_t6050_rewake {
     struct pci_dev *bridge, *control, *beta;
     unsigned slot, generation, work_generation;
-    bool active, rerun;
+    bool active, rerun, beta_fallback;
     int error, node;
+    void *arena;
     struct kref ref;
     struct work_struct work;
 };
@@ -71,9 +72,9 @@ static int cen_recovery_lock, cen_recovery_owners, cen_rewake_wq;
 static bool cen_exiting, supported_sleep=true;
 static struct centauri_t6050_rewake *owner;
 static struct pci_dev *slots[3];
-static int events[100], nevents, stop_error, beta_error, release_error;
-static int wifi_error, requested_error, requests, queues;
-enum { STOP_BOOT=1, QUIESCE, WIFI_STOP, IRQ_STOP, CLEAR, FENCE, RELEASE, FREE,
+static int events[100], nevents, stop_error, beta_error, release_error, save_error;
+static int wifi_error, requested_error, requests, queues, saved_fns[3];
+enum { STOP_BOOT=1, QUIESCE, WIFI_STOP, IRQ_STOP, CLEAR, FENCE, SAVE, RELEASE, FREE,
        PM_ERROR, PM_COMPLETE, REQUEST };
 static void event(int n) { assert(nevents < 100); events[nevents++]=n; }
 static void mutex_lock(int *p) { assert(!*p); *p=1; }
@@ -89,6 +90,16 @@ static void pci_clear_master(struct pci_dev *p)
 { assert(p); event(CLEAR); }
 static bool centauri_t6050_stop_dma(struct pci_dev *p)
 { assert(p); event(FENCE); return !stop_error; }
+static int pci_save_state(struct pci_dev *p)
+{
+    assert(p && (p->devfn & 7) < 3);
+    event(SAVE);
+    if (save_error)
+        return save_error;
+    p->state_saved = true;
+    saved_fns[p->devfn & 7]++;
+    return 0;
+}
 static bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *p)
 { return !p || p->fenced; }
 static void cancel_delayed_work_sync(int *p) { (void)p; event(STOP_BOOT); }
@@ -129,7 +140,8 @@ static void reset(struct centauri_t6050 *c, struct centauri_t6050_rewake *rw,
     rw->ref.refs=1; rw->generation=1;
     c->pdev=&fn[0]; c->recovery=rw; c->ready=true;
     fn[0].dev.data=c;
-    nevents=stop_error=beta_error=release_error=wifi_error=requests=queues=0;
+    nevents=stop_error=beta_error=release_error=save_error=wifi_error=requests=queues=0;
+    memset(saved_fns,0,sizeof(saved_fns));
     cen_exiting=false;
 }
 static int count(int value)
@@ -174,8 +186,37 @@ int main(void)
     reset(&c,&rw,fn,&bridge,&bus); slots[2]=NULL;
     assert(!centauri_t6050_domain_fence(&rw)); /* old-owner identity cannot vanish */
 
+    /* Keep-alive saved PCI state on fn1/fn2 must be refreshed after fence, before release. */
     reset(&c,&rw,fn,&bridge,&bus);
-    assert(!centauri_t6050_prepare(&fn[0].dev) && c.pm_prepared);
+    ipc.fenced=true;
+    c.ipc=&ipc; c.firmware=&c; c.descriptor=&rw;
+    fn[0].state_saved=fn[1].state_saved=fn[2].state_saved=true;
+    assert(!centauri_t6050_quiesce(&c));
+    assert(!saved_fns[0] && saved_fns[1]==1 && saved_fns[2]==1);
+    assert(fn[1].state_saved && fn[2].state_saved);
+    assert(first(SAVE)>first(FENCE) && first(RELEASE)>first(SAVE));
+
+    /* If re-save fails, clear stale state_saved so aborted resume cannot restore it. */
+    reset(&c,&rw,fn,&bridge,&bus);
+    c.ipc=&ipc; c.firmware=&c; c.descriptor=&rw;
+    fn[1].state_saved=fn[2].state_saved=true;
+    save_error=-ENOMEM;
+    assert(!centauri_t6050_quiesce(&c));
+    assert(!saved_fns[1] && !saved_fns[2]);
+    assert(!fn[1].state_saved && !fn[2].state_saved);
+
+    /* Unreadable/gone function (stop_dma fails) must clear state_saved without saving 0xffff. */
+    reset(&c,&rw,fn,&bridge,&bus);
+    c.ipc=&ipc; c.firmware=&c; c.descriptor=&rw;
+    fn[1].state_saved=fn[2].state_saved=true;
+    stop_error=1;
+    assert(centauri_t6050_quiesce(&c)==-EBUSY);
+    assert(!saved_fns[1] && !saved_fns[2]);
+    assert(!fn[1].state_saved && !fn[2].state_saved);
+
+    reset(&c,&rw,fn,&bridge,&bus);
+    rw.beta_fallback=true;
+    assert(!centauri_t6050_prepare(&fn[0].dev) && c.pm_prepared && !rw.beta_fallback);
     wifi_error=-ETIMEDOUT; /* cfg80211 abort: F0 suspend never called */
     centauri_t6050_complete(&fn[0].dev);
     assert(!c.pm_prepared && rw.active && rw.error==-ETIMEDOUT && queues==1);
@@ -224,7 +265,7 @@ typedef uint64_t dma_addr_t;
 struct module { int refs; };
 struct device { int lock, leases, refs; };
 struct pci_bus;
-struct pci_dev { struct device dev; struct pci_bus *bus, *subordinate; unsigned devfn; };
+struct pci_dev { struct device dev; struct pci_bus *bus, *subordinate; unsigned devfn; bool state_saved; };
 struct pci_bus { struct pci_dev *self; };
 struct kref { int refs; };
 struct apple_centauri_sleep_ops {
@@ -482,6 +523,8 @@ def run():
     variants = [('baseline', bodies),
                 ('negative-skip-fence', bodies.replace('!centauri_t6050_domain_fence(c->recovery)', 'false')),
                 ('negative-skip-release', bodies.replace('ret = centauri_t6050_beta_call(c->recovery, true);', 'ret = 0;')),
+                ('negative-stale-state-saved', bodies.replace('fn[i]->state_saved &&', 'false && fn[i]->state_saved &&')),
+                ('negative-save-unreadable-fn', bodies.replace('(!fn_stopped || pci_save_state(fn[i]))', 'pci_save_state(fn[i])')),
                 ('negative-lost-pm-error', bodies.replace('error = centauri_t6050_wifi_pm_error(c);', 'error = 0;')),
                 ('negative-drop-new-generation', bodies.replace('rw->rerun = true;', 'rw->rerun = false;'))]
     ownership = '\n'.join(block(name) for name in [
@@ -500,6 +543,8 @@ def run():
         'negative-unlock-before-tuples': '!remove_done && original->dev.locked && rw->control==original',
         'negative-skip-fence': 'first(WIFI_STOP)<first(CLEAR)',
         'negative-skip-release': 'first(RELEASE)>first(FENCE) && first(FREE)>first(RELEASE)',
+        'negative-stale-state-saved': '!saved_fns[0] && saved_fns[1]==1 && saved_fns[2]==1',
+        'negative-save-unreadable-fn': '!saved_fns[1] && !saved_fns[2]',
         'negative-lost-pm-error': '!c.pm_prepared && rw.active && rw.error==-ETIMEDOUT && queues==1',
         'negative-drop-new-generation': 'rw.rerun && queues==1 && rw.ref.refs==2',
         'negative-lost-orphan': '!rw.ops && !rw.data && rw.arena==arena && rw.beta==&fn',

@@ -12,8 +12,9 @@ config VIDEO_APPLE_AVE
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
 	  T6000 (M1 Pro) and T8112 (M2) support lifecycle-only validation
 	  of firmware 6070.11.1 through debugfs; encoding stays disabled.
-	  T6041 (M4 Pro) has probe-only support. T6050 (M5 Pro/Max) encodes
-	  H.264.
+	  T8122 (M3) with the macOS 27.2 firmware encodes H.264 and HEVC.
+	  T6041 (M4 Pro) and the M3 Pro/Max (T603x) have probe-only
+	  support. T6050 (M5 Pro/Max) encodes H.264.
 
 	  The encoder firmware is loaded by the bootloader; the driver builds
 	  every command itself. See Documentation/admin-guide/media/apple-ave.rst.
@@ -34,7 +35,8 @@ config VIDEO_APPLE_AVE_KUNIT_TEST
 
 config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	bool "KUnit tests for Apple AVE firmware ABIs" if !KUNIT_ALL_TESTS
-	depends on KUNIT && VIDEO_APPLE_AVE=y
+	depends on VIDEO_APPLE_AVE && KUNIT
+	depends on KUNIT=y || VIDEO_APPLE_AVE=m
 	default KUNIT_ALL_TESTS
 	help
 	  Compare AVC/HEVC 9003 Start and Process images byte for byte with
@@ -43,3 +45,17 @@ config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	  entropy interleave, alignment refusal, seven-channel discovery and
 	  encoding refusal.
 	  These tests run without firmware or encoder hardware.
+
+config VIDEO_APPLE_AVE_IPC_KUNIT_TEST
+	bool "KUnit tests for Apple AVE firmware and userspace input checks" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && VIDEO_APPLE_AVE=y
+	default KUNIT_ALL_TESTS
+	help
+	  Feed malformed firmware input to the AVE IPC layer: hello words,
+	  channel tables with overlapping or out-of-range rings, ring index
+	  wrap, full and empty rings, command acks and messages outside the
+	  shared window, log lines and shared-memory requests. Also test that
+	  the 6070 Start and Process builders refuse out-of-range session
+	  counts, unaligned buffers and short codec state before writing.
+	  The tests use kernel memory for the shared window and the mailbox
+	  and run without firmware or encoder hardware.

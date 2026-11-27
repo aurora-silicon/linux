@@ -1,0 +1,437 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6041-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6041 system sleep controls
+
+maintainers:
+  - AxxzyWasTaken <axxzytte@gmail.com>
+
+description: |
+  The registers and PMGR power-state domains a kernel running directly at EL2
+  on the M4 Max (T6041) writes to enter and return from suspend-to-RAM and to
+  power its secondary CPUs off. They belong to several hardware blocks, some of
+  which other drivers also use, so this node overlaps those drivers' register
+  ranges and the driver does not claim them. The way back from a sleep is the
+  boot loader's S2R mailbox, which the boot loader names in /chosen; without it
+  the driver offers no deep sleep.
+
+properties:
+  compatible:
+    const: apple,t6041-sleep
+
+  reg:
+    minItems: 40
+    maxItems: 40
+
+  reg-names:
+    items:
+      - const: ps-aop
+      - const: cluster
+      - const: pwrgate
+      - const: cpu-start
+      - const: wdt
+      - const: aon-misc
+      - const: commit
+      - const: clk-mux
+      - const: ka-pmgr
+      - const: ka-east
+      - const: pmc
+      - const: ptd
+      - const: perf
+      - const: wake
+      - const: amcc0
+      - const: amcc1
+      - const: amcc2
+      - const: amcc3
+      - const: amcc4
+      - const: amcc5
+      - const: amcc6
+      - const: amcc7
+      - const: dcs0
+      - const: dcs1
+      - const: dcs2
+      - const: dcs3
+      - const: dcs4
+      - const: dcs5
+      - const: dcs6
+      - const: dcs7
+      - const: axi2af-disp
+      - const: axi2af-dispext0
+      - const: axi2af-dispext1
+      - const: axi2af-dispext2
+      - const: axi2af-dispext3
+      - const: axi2af-ans
+      - const: axi2af-avd
+      - const: axi2af-venc0
+      - const: axi2af-venc1
+      - const: axi2af-jpg
+
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The AP pin controller whose pins a deep sleep resets. Its pins are saved
+      before a sleep and restored on wake.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Pins of that controller to leave alone across a sleep, neither saved nor
+      restored.
+
+  apple,apcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose shared registers and tunables the storage
+      controller's link depends on, and whose GP ports need clock restoration
+      after deep sleep. Without it or its tunables, deep sleep is refused.
+
+  apple,spmi-buses:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 2
+    maxItems: 2
+    items:
+      maxItems: 1
+    description: |
+      The SPMI buses driven around a sleep: nub-spmi0 first (PMU boot stage
+      and notify mask), then nub-spmi-a0 (notify mask when powered).
+
+  apple,atc-phys:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 4
+    maxItems: 4
+    items:
+      maxItems: 1
+    description:
+      The four ATC PHY nodes (atcphy0 through atcphy3) whose axi2af fabric
+      bridges are disarmed at sleep entry and re-armed on wake.
+
+  apple,wake-enable:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 64
+    description:
+      The AP wake source IDs left unmasked across suspend-to-RAM (ADT
+      ap-wake-sources). Every other wake source is masked.
+
+  apple,sleep-off-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 256
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes powered off before the sleep commit (sorted
+      child-before-parent from their DT power-domains edges) and restored to
+      their pre-commit states on wake.
+
+  apple,atc-off-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 64
+    items:
+      maxItems: 1
+    description:
+      USB-C / ATC PMGR power-state nodes lowered in hardware order after PS
+      matching and PMC/PTD quiesce, and restored to their pre-commit states on
+      wake.
+
+  apple,sleep-auto-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 128
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes placed into hardware automatic power management
+      with auto-state 0 (power gated) before the sleep commit, skipping fused-off
+      words, and restored on wake.
+
+  apple,sleep-auto-clkgate-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 128
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes placed into hardware automatic power management
+      with auto-state 4 (clock gated) before the sleep commit, skipping fused-off
+      words, and restored on wake.
+
+  apple,sleep-auto-active-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 64
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes placed into hardware automatic power management
+      with auto-state 15 (active) before the sleep commit and restored on wake.
+
+  apple,sleep-keep-on-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 64
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes held manually on (target 15, auto-enable clear)
+      before the sleep commit and restored on wake.
+
+  apple,cpu-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 16
+    maxItems: 16
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes for the 16 CPU cores in ADT CPU ID order
+      (ecpu_0..3, pcpu0_0..5, pcpu1_0..5), matched before commit and polled off
+      as secondary CPUs enter deep WFI.
+
+  apple,cpm-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 3
+    maxItems: 3
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes for the three cluster power managers in order
+      (ecpm, pcpm0, pcpm1).
+
+  apple,sep-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMGR power-state node for SEP, whose DEV_DISABLE bit is set before the
+      sleep commit and cleared with BUSY polled clear on wake.
+
+  apple,spmi-a0-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMGR power-state node for nub-spmi-a0, tested before accessing the second
+      SPMI bus's notify mask register.
+
+  apple,atc-common-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 4
+    maxItems: 4
+    items:
+      maxItems: 1
+    description:
+      PMGR power-state nodes for the four ATC common domains (atc0_common
+      through atc3_common), raised right before the sleep commit.
+
+  apple,atc-fabric-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Parent fabric PMGR power-state node (fab2_soc) raised manually while
+      bringing up the ATC common domains and returned to auto-enable.
+
+  apple,atc-afi-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      AFI fabric PMGR power-state node left in hardware auto-enable after
+      lowering the ATC power domains.
+
+  apple,apcie-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 8
+    maxItems: 8
+    items:
+      maxItems: 1
+    description: |
+      The eight storage and GP PCIe PMGR power-state nodes in order:
+      ans, apcie_gp, apcie_sys_gp, apcie_st0, apcie_sys_st0, apcie_st1,
+      apcie_sys_st1, apcie_phy_sw.
+
+  apple,commit-sio-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 2
+    maxItems: 2
+    items:
+      maxItems: 1
+    description: |
+      The two SIO PMGR power-state nodes written in the final commit sequence,
+      in order: sio, sio_cpu.
+
+  apple,commit-periph-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 5
+    maxItems: 5
+    items:
+      maxItems: 1
+    description: |
+      The five peripheral PMGR power-state nodes lowered after the PMU boot
+      stage write in the final commit sequence, in order: i2c6, i2c3, i2c2,
+      i2c1, spi2.
+
+  apple,axi2af-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 15
+    maxItems: 15
+    items:
+      maxItems: 1
+    description: |
+      PMGR power-state nodes paired 1:1 with the 15 AXI2AF fabric bridges in
+      order: atc0..3_common (0..3), disp_sys (4), dispext0..3_sys (5..8),
+      ans (9), avd_sys (10), venc0_sys (11), venc1_sys (12), jpg (13),
+      apcie_sys_gp (14).
+
+  apple,full-part-detect-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 2
+    maxItems: 2
+    items:
+      maxItems: 1
+    description: |
+      The two AMCC PMGR power-state nodes (amcc24, amcc28) probed at driver
+      init to distinguish 24-channel binned parts from 32-channel full parts.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,pinctrl
+  - apple,spmi-buses
+  - apple,wake-enable
+  - apple,sleep-off-domains
+  - apple,atc-off-domains
+  - apple,sleep-auto-domains
+  - apple,sleep-auto-clkgate-domains
+  - apple,sleep-auto-active-domains
+  - apple,sleep-keep-on-domains
+  - apple,cpu-domains
+  - apple,cpm-domains
+  - apple,sep-domain
+  - apple,spmi-a0-domain
+  - apple,atc-common-domains
+  - apple,atc-fabric-domain
+  - apple,atc-afi-domain
+  - apple,apcie-domains
+  - apple,commit-sio-domains
+  - apple,commit-periph-domains
+  - apple,axi2af-domains
+  - apple,full-part-detect-domains
+
+allOf:
+  - if:
+      not:
+        properties:
+          status:
+            const: disabled
+        required:
+          - status
+    then:
+      required:
+        - apple,atc-phys
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        sleep-controller@508304000 {
+            compatible = "apple,t6041-sleep";
+            reg = <0x5 0x08304000 0x0 0x4000>,
+                  <0x5 0x02820000 0x0 0x4000>,
+                  <0x5 0x0282c000 0x0 0x4000>,
+                  <0x5 0x02888000 0x0 0x4000>,
+                  <0x5 0x0836c000 0x0 0x4000>,
+                  <0x5 0x08330000 0x0 0x4000>,
+                  <0x5 0x08904000 0x0 0x4>,
+                  <0x5 0x00038000 0x0 0x4000>,
+                  <0x5 0x029dc000 0x0 0x880>,
+                  <0x5 0x022d0000 0x0 0x880>,
+                  <0x5 0x04800000 0x0 0xb0000>,
+                  <0x5 0x003c0000 0x0 0x20000>,
+                  <0x5 0x0020c000 0x0 0x800>,
+                  <0x5 0x08004000 0x0 0x58>,
+                  <0x2 0x20000000 0x0 0x200000>,
+                  <0x2 0x22000000 0x0 0x200000>,
+                  <0x2 0x24000000 0x0 0x200000>,
+                  <0x2 0x26000000 0x0 0x200000>,
+                  <0x2 0x28000000 0x0 0x200000>,
+                  <0x2 0x2a000000 0x0 0x200000>,
+                  <0x2 0x2c000000 0x0 0x200000>,
+                  <0x2 0x2e000000 0x0 0x200000>,
+                  <0x2 0x20200000 0x0 0x601000>,
+                  <0x2 0x22200000 0x0 0x601000>,
+                  <0x2 0x24200000 0x0 0x601000>,
+                  <0x2 0x26200000 0x0 0x601000>,
+                  <0x2 0x28200000 0x0 0x601000>,
+                  <0x2 0x2a200000 0x0 0x601000>,
+                  <0x2 0x2c200000 0x0 0x601000>,
+                  <0x2 0x2e200000 0x0 0x601000>,
+                  <0x4 0x03000100 0x0 0x10>,
+                  <0x3 0xa3000100 0x0 0x10>,
+                  <0x6 0x03000100 0x0 0x10>,
+                  <0x6 0x07000100 0x0 0x10>,
+                  <0x3 0x07000100 0x0 0x10>,
+                  <0x4 0x0b000100 0x0 0x10>,
+                  <0x2 0x80000100 0x0 0x10>,
+                  <0x2 0x82000100 0x0 0x10>,
+                  <0x2 0x84000100 0x0 0x10>,
+                  <0x4 0x86000100 0x0 0x10>;
+            reg-names = "ps-aop",
+                        "cluster", "pwrgate", "cpu-start", "wdt",
+                        "aon-misc", "commit", "clk-mux", "ka-pmgr",
+                        "ka-east", "pmc", "ptd", "perf", "wake",
+                        "amcc0", "amcc1", "amcc2", "amcc3",
+                        "amcc4", "amcc5", "amcc6", "amcc7",
+                        "dcs0", "dcs1", "dcs2", "dcs3",
+                        "dcs4", "dcs5", "dcs6", "dcs7",
+                        "axi2af-disp", "axi2af-dispext0",
+                        "axi2af-dispext1", "axi2af-dispext2",
+                        "axi2af-dispext3", "axi2af-ans",
+                        "axi2af-avd", "axi2af-venc0",
+                        "axi2af-venc1", "axi2af-jpg";
+            apple,pinctrl = <&pinctrl>;
+            apple,pinctrl-skip-pins = <190 191 192>;
+            apple,apcie = <&pcie0>;
+            apple,spmi-buses = <&nub_spmi0>, <&nub_spmi_a0>;
+            apple,atc-phys = <&atcphy0>, <&atcphy1>, <&atcphy2>, <&atcphy3>;
+            apple,wake-enable = <13 15 25 27 28 41 44 48 50 51 52 53 55
+                                 101 106 126 127 128 129 130 131 132 133
+                                 155 167>;
+            apple,sleep-off-domains = <&ps_gfx>, <&ps_afr>;
+            apple,atc-off-domains = <&ps_atc0_phymxwrap>, <&ps_atc0_common>;
+            apple,sleep-auto-domains = <&ps_fab0_soc>, <&ps_amcc0>;
+            apple,sleep-auto-clkgate-domains = <&ps_fab3_soc>, <&ps_dcs_00>;
+            apple,sleep-auto-active-domains = <&ps_fab2_soc>, <&ps_afi>;
+            apple,sleep-keep-on-domains = <&ps_sio>, <&ps_sio_cpu>;
+            apple,cpu-domains = <&ps_ecpu_0>, <&ps_ecpu_1>, <&ps_ecpu_2>,
+                                <&ps_ecpu_3>, <&ps_pcpu0_0>, <&ps_pcpu0_1>,
+                                <&ps_pcpu0_2>, <&ps_pcpu0_3>, <&ps_pcpu0_4>,
+                                <&ps_pcpu0_5>, <&ps_pcpu1_0>, <&ps_pcpu1_1>,
+                                <&ps_pcpu1_2>, <&ps_pcpu1_3>, <&ps_pcpu1_4>,
+                                <&ps_pcpu1_5>;
+            apple,cpm-domains = <&ps_ecpm>, <&ps_pcpm0>, <&ps_pcpm1>;
+            apple,sep-domain = <&ps_sep>;
+            apple,spmi-a0-domain = <&ps_nub_spmi_a0>;
+            apple,atc-common-domains = <&ps_atc0_common>, <&ps_atc1_common>,
+                                       <&ps_atc2_common>, <&ps_atc3_common>;
+            apple,atc-fabric-domain = <&ps_fab2_soc>;
+            apple,atc-afi-domain = <&ps_afi>;
+            apple,apcie-domains = <&ps_ans>, <&ps_apcie_gp>,
+                                  <&ps_apcie_sys_gp>, <&ps_apcie_st0>,
+                                  <&ps_apcie_sys_st0>, <&ps_apcie_st1>,
+                                  <&ps_apcie_sys_st1>, <&ps_apcie_phy_sw>;
+            apple,commit-sio-domains = <&ps_sio>, <&ps_sio_cpu>;
+            apple,commit-periph-domains = <&ps_i2c6>, <&ps_i2c3>, <&ps_i2c2>,
+                                          <&ps_i2c1>, <&ps_spi2>;
+            apple,axi2af-domains = <&ps_atc0_common>, <&ps_atc1_common>,
+                                   <&ps_atc2_common>, <&ps_atc3_common>,
+                                   <&ps_disp_sys>, <&ps_dispext0_sys>,
+                                   <&ps_dispext1_sys>, <&ps_dispext2_sys>,
+                                   <&ps_dispext3_sys>, <&ps_ans>,
+                                   <&ps_avd_sys>, <&ps_venc0_sys>,
+                                   <&ps_venc1_sys>, <&ps_jpg>,
+                                   <&ps_apcie_sys_gp>;
+            apple,full-part-detect-domains = <&ps_amcc24>, <&ps_amcc28>;
+        };
+    };

@@ -10,6 +10,12 @@ pub(crate) const RUN_LIST_SIZE: usize = 0x1_0000;
 pub(crate) const TABLE_SIZE: usize = PAGE_LIST_SIZE + RUN_LIST_SIZE;
 pub(crate) const CONTROL_SIZE: usize = 0x4000;
 pub(crate) const RENDER_BLOCKS: usize = 44;
+/// Minimum render pool per active USC core (in 1 MiB blocks) on GPUs with more
+/// than two clusters. With clustered tiling running vertex work across all
+/// clusters concurrently with fragment work, 44 blocks run out under Vulkan
+/// vertex load (reason-0 no-progress recoveries); three blocks per enabled core
+/// yield 96 blocks on 32-core T6041 and scale linearly on larger parts.
+pub(crate) const MULTI_CLUSTER_RENDER_BLOCKS_PER_CORE: usize = 3;
 pub(crate) const COMPUTE_BLOCKS: usize = 21;
 
 /// Render reserves eight run words per block; compute packs runs consecutively.

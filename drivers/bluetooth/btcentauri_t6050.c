@@ -13,6 +13,7 @@
 #include <linux/property.h>
 #include <linux/random.h>
 #include <linux/sizes.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/bluetooth/bluetooth.h>
@@ -81,6 +82,7 @@ struct cen_bt {
 	bool sleep_registered;
 	/* Host quiesced for sleep; arena ownership is tracked independently. */
 	bool asleep;
+	bool transport_paused, transport_sleep_sent;
 	int suspend_error;
 	u8 native_startup_steps;
 	bool connection_command_supported, connection_status_pending;
@@ -441,6 +443,29 @@ static void cen_fixup_scan_response(u8 *event, size_t length)
 	}
 }
 
+static bool cen_rx_pending(struct cen_bt *bt)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++) {
+		if (!bt->aux[i].opened || !cen_aux_specs[i].receive)
+			continue;
+		if (bt->aux[i].head != cen_tail(bt, cen_aux_specs[i].id))
+			return true;
+	}
+	if (bt->le_rx_head != cen_tail(bt, 10))
+		return true;
+	return bt->rx_head != cen_tail(bt, 7);
+}
+
+static bool cen_tx_ready(struct cen_bt *bt, struct sk_buff_head *queue,
+			 u16 ring, u16 slots, u16 head)
+{
+	if (skb_queue_empty(queue))
+		return false;
+	return (head + 1) % slots != cen_tail(bt, ring);
+}
+
 static void cen_io_work(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(work, struct cen_bt, io_work);
@@ -452,7 +477,7 @@ static void cen_io_work(struct work_struct *work)
 	int budget = CEN_RX_SLOTS;
 
 	mutex_lock(&bt->lock);
-	if (!bt->running)
+	if (!bt->running || READ_ONCE(bt->transport_paused))
 		goto unlock;
 	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2) {
 		if (readl(bt->bar) == 2)
@@ -534,6 +559,12 @@ static void cen_io_work(struct work_struct *work)
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
 			  CEN_LE_FOOTER, &bt->le_tx_head)))
 		goto protocol_error;
+	if (cen_rx_pending(bt) ||
+	    cen_tx_ready(bt, &bt->txq, 1, CEN_TX_SLOTS, bt->tx_head) ||
+	    cen_tx_ready(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
+			 bt->acl_tx_head) ||
+	    cen_tx_ready(bt, &bt->le_txq, 4, CEN_LE_SLOTS, bt->le_tx_head))
+		schedule_work(&bt->io_work);
 	goto unlock;
 protocol_error:
 	bt->running = false;
@@ -765,7 +796,8 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		ret = -ENOBUFS;
 	else {
 		skb_queue_tail(queue, skb);
-		schedule_work(&bt->io_work);
+		if (!READ_ONCE(bt->transport_paused))
+			schedule_work(&bt->io_work);
 	}
 	mutex_unlock(&bt->lock);
 	if (!ret)
@@ -779,7 +811,7 @@ static irqreturn_t cen_irq(int irq, void *data)
 {
 	struct cen_bt *bt = data;
 
-	if (READ_ONCE(bt->running))
+	if (READ_ONCE(bt->running) && !READ_ONCE(bt->transport_paused))
 		schedule_work(&bt->io_work);
 	return IRQ_HANDLED;
 }
@@ -812,6 +844,8 @@ static int cen_request_irqs(struct cen_bt *bt)
 	return 0;
 }
 
+static int cen_transport_state(struct cen_bt *bt, bool asleep);
+
 /*
  * Called with the participant device locked, outside Control's boot_lock. Keep
  * the transport alive through HCI unregister: its close may send final commands.
@@ -821,11 +855,23 @@ static int cen_request_irqs(struct cen_bt *bt)
 static int cen_quiesce(void *data)
 {
 	struct cen_bt *bt = data;
+	int wake_ret = 0;
 
 	if (bt->host_quiesced)
 		return 0;
+	if (bt->transport_sleep_sent) {
+		bt->transport_sleep_sent = false;
+		wake_ret = cen_transport_state(bt, false);
+		if (wake_ret)
+			dev_warn(&bt->pdev->dev,
+				 "Beta ACIPC host wake failed during teardown (%d)\n",
+				 wake_ret);
+	}
 	mutex_lock(&bt->lock);
 	bt->quiescing = true;
+	if (wake_ret)
+		bt->running = false;
+	WRITE_ONCE(bt->transport_paused, false);
 	mutex_unlock(&bt->lock);
 	if (bt->hci_registered) {
 		hci_unregister_dev(bt->hdev);
@@ -848,6 +894,8 @@ static int cen_quiesce(void *data)
 		hci_free_dev(bt->hdev);
 		bt->hdev = NULL;
 	}
+	bt->transport_sleep_sent = false;
+	bt->asleep = true;
 	bt->host_quiesced = true;
 	return 0;
 }
@@ -1057,15 +1105,68 @@ static void cen_remove(struct pci_dev *pdev)
 	}
 }
 
-/* Retain the arena until Control has fenced the complete old DMA set. */
+static u32 cen_sleep_status(struct cen_bt *bt)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x70)));
+}
+
+static int cen_transport_state(struct cen_bt *bt, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	if (!bt->arena || !bt->bar || readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, bt->bar + 0x1078);
+	ret = read_poll_timeout(cen_sleep_status, status,
+				(asleep ? status == 3 : status <= 1) ||
+				readl(bt->bar + 0x18) != 2,
+				100, 2000000, false, bt);
+	dma_rmb();
+	if (readl(bt->bar + 0x18) != 2)
+		ret = -EIO;
+	dev_dbg(&bt->pdev->dev,
+		"Beta ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(bt->bar + 0x18), readl(bt->bar));
+	return ret;
+}
+
+/*
+ * Keep firmware and HCI alive across deep sleep via ACIPC host-sleep;
+ * fall back to teardown on fault.
+ */
 static int cen_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct cen_bt *bt = pci_get_drvdata(pdev);
+	unsigned int i;
 	int ret, save_ret;
 
 	ret = bt->suspend_error;
 	if (!bt->asleep && apple_centauri_sleep_reboot(pdev)) {
+		if (!ret && bt->arena && bt->bar && bt->ipc_requested &&
+		    readl(bt->bar + 0x18) == 2 && readl(bt->bar) == 2) {
+			mutex_lock(&bt->lock);
+			WRITE_ONCE(bt->transport_paused, true);
+			mutex_unlock(&bt->lock);
+			for (i = 0; i < bt->irq_count; i++)
+				synchronize_irq(pci_irq_vector(pdev, i));
+			cancel_work_sync(&bt->io_work);
+			ret = cen_transport_state(bt, true);
+			if (!ret) {
+				bt->transport_sleep_sent = true;
+				ret = pci_save_state(pdev);
+				if (!ret)
+					return 0;
+				cen_transport_state(bt, false);
+				bt->transport_sleep_sent = false;
+			}
+			dev_warn(dev, "Beta ACIPC host sleep failed (%d); falling back to teardown\n",
+				 ret);
+		}
+		apple_centauri_sleep_mark_fallback(pdev);
 		ret = cen_quiesce(bt);
 		if (ret)
 			return ret;
@@ -1086,17 +1187,99 @@ static int cen_suspend(struct device *dev)
 	return ret ?: save_ret;
 }
 
-static int cen_resume(struct device *dev)
+static int cen_suspend_noirq(struct device *dev)
 {
-	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct cen_bt *bt = pci_get_drvdata(pdev);
+	u16 pmctrl;
 
-	/* Normally queued by Control's resume; for a suspend stopped before Control's */
-	if (bt->asleep)
-		apple_centauri_sleep_rewake(to_pci_dev(dev));
+	if (!bt->transport_sleep_sent || !pm_suspend_via_firmware() || !pdev->pm_cap)
+		return 0;
+	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl)) {
+		pmctrl &= ~(PCI_PM_CTRL_STATE_MASK | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl |= (__force u16)PCI_D3hot;
+		if (device_may_wakeup(dev) && READ_ONCE(bt->running))
+			pmctrl |= PCI_PM_CTRL_PME_ENABLE;
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, pmctrl);
+		mdelay(pdev->d3hot_delay);
+	}
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(cen_pm_ops, cen_suspend, cen_resume);
+static u32 cen_pci_id(const struct pci_dev *pdev)
+{
+	return ((u32)pdev->device << 16) | pdev->vendor;
+}
+
+static int cen_resume_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct cen_bt *bt = pci_get_drvdata(pdev);
+	u32 id = 0;
+	u16 cmd = 0, pmctrl = 0;
+
+	if (!bt->transport_sleep_sent)
+		return 0;
+	if (pci_read_config_dword(pdev, PCI_VENDOR_ID, &id) || id != cen_pci_id(pdev)) {
+		dev_err(dev, "Beta after sleep: unexpected id %#x\n", id);
+		return 0;
+	}
+	if (pdev->pm_cap &&
+	    !pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl) &&
+	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != (__force u16)PCI_D0) {
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
+				      pmctrl & ~PCI_PM_CTRL_STATE_MASK);
+		mdelay(pdev->d3hot_delay);
+	}
+	pci_set_master(pdev);
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (pdev->pm_cap)
+		pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl);
+	dev_dbg(dev, "Beta noirq wake: id=%#x cmd=%#x pmcsr=%#x exec=%u ipc=%u\n",
+		id, cmd, pmctrl, readl(bt->bar + 0x18), readl(bt->bar));
+	return 0;
+}
+
+static int cen_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct cen_bt *bt = pci_get_drvdata(pdev);
+	int ret;
+
+	/* Normally queued by Control's resume; for a suspend stopped before Control's */
+	if (bt->asleep) {
+		apple_centauri_sleep_rewake(pdev);
+		return 0;
+	}
+	if (!bt->transport_sleep_sent)
+		return 0;
+	bt->transport_sleep_sent = false;
+	{
+		u32 id = 0;
+
+		if (pci_read_config_dword(pdev, PCI_VENDOR_ID, &id) || id != cen_pci_id(pdev))
+			ret = -ENODEV;
+		else
+			ret = cen_transport_state(bt, false);
+	}
+	if (ret) {
+		dev_err(dev, "Beta ACIPC host wake failed (%d); scheduling warm-reset recovery\n",
+			ret);
+		apple_centauri_sleep_recovery_needed(pdev, ret);
+		return 0;
+	}
+	mutex_lock(&bt->lock);
+	WRITE_ONCE(bt->transport_paused, false);
+	if (bt->running)
+		schedule_work(&bt->io_work);
+	mutex_unlock(&bt->lock);
+	return 0;
+}
+
+static const struct dev_pm_ops cen_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(cen_suspend, cen_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(cen_suspend_noirq, cen_resume_noirq)
+};
 
 static const struct pci_device_id cen_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903) },

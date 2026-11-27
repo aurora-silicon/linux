@@ -73,7 +73,7 @@ def fixture():
             'pair.retire(None, generation, state, host,', 'pair.fail_after_observation(packet, error, host,')
     # A first signal gives the lease back without ending a quarantine (the `complete` mock).
     ordered(item(completion, 'fn complete_with_compute('),
-            'if self.signalled.swap(true, Ordering::AcqRel) {\n            return;\n        }',
+            'if self.signalled.swap(true, Ordering::AcqRel) {\n            return false;\n        }',
             'self.release_healthy();')
     # The drain release runs once the drain proof, event service and accounting passed.
     ordered(item(settle, 'fn drain_render_slot('), 'pair.firmware_drained(host)', 'self.service_runtime_events(deferred)',
@@ -84,8 +84,11 @@ def fixture():
     at = pairs.index('const SIBLING_BACKLOG')
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(admission, name) for name in [
-        'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn usable(', 'fn position(', 'fn release(',
+        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
+        'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
+        'fn claim_sibling(', 'fn usable(', 'fn position(', 'fn release(',
         'fn rehabilitate(', 'fn pair_drained(&mut self', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(admission, name) for name in [
         'pub(crate) fn release_owner(', 'pub(crate) fn release_retained_owners_after_processor_stop(',
@@ -103,6 +106,7 @@ def fixture():
 #![allow(dead_code, unused_macros, unused_imports, unused_variables, unused_mut)]
 use std::collections::VecDeque;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst}};
+macro_rules! pr_warn { ($($arg:tt)*) => { eprint!($($arg)*) }; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error(i32);
@@ -155,7 +159,7 @@ impl Status {
     fn report_failure(&self, _: Error) {}
 }
 pub struct Output;
-impl Output { fn finish(&self, _: Result<[u64; 4]>) {} }
+impl Output { fn finish(&self, _: Result<[u64; 4]>, _: &Status) {} }
 pub struct Sources;
 impl Sources { fn release(&self) {} }
 
@@ -175,6 +179,7 @@ pub struct Completion {
     sources: Option<Arc<Sources>>,
     vm_job: Mutex<Option<VmJobGuard>>,
     render: Mutex<Option<RenderLease>>,
+    is_compute: bool,
     signalled: AtomicBool,
     accepted: AtomicBool,
     spared: AtomicBool,
@@ -188,13 +193,14 @@ impl Completion {
     fn report(&self, _: Error) {}
     fn signal_terminal(&self, result: Result<[u64; 4]>) { *self.result.lock() = Some(result); }
     /// The lease handling of the real complete_with_compute (checked against it above).
-    fn complete(&self, result: Result<[u64; 4]>) { self.complete_with_compute(result, None) }
-    fn complete_with_compute(&self, result: Result<[u64; 4]>, _: Option<[u64; 2]>) {
+    fn complete(&self, result: Result<[u64; 4]>) -> bool { self.complete_with_compute(result, None) }
+    fn complete_with_compute(&self, result: Result<[u64; 4]>, _: Option<[u64; 2]>) -> bool {
         if self.signalled.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         self.release_healthy();
         self.signal_terminal(result);
+        true
     }
 ''' + command + '\n}\n' + item(completion, 'pub(crate) enum Deferred {') + '\n' + item(completion, 'impl Deferred {') + r'''
 
@@ -222,7 +228,11 @@ pub struct Memory { retired: Vec<u64> }
 impl Memory { fn retire(&mut self, ordinal: u64) -> Result { self.retired.push(ordinal); Ok(()) } }
 /// The firmware state behind `Pair::firmware_drained`: cursors done == write, free-list
 /// blocks returned, and stamps covering the last publication or the context's kill acknowledged.
-pub trait Host { fn drained(&self) -> bool; }
+pub trait Host {
+    fn drained(&self) -> bool;
+    /// No restart in progress (recovery generation, state).
+    fn epoch(&self) -> Result<(u64, u32)> { Ok((1, 0)) }
+}
 pub struct FakeHost { drained: bool }
 impl Host for FakeHost { fn drained(&self) -> bool { self.drained } }
 pub struct Pair {
@@ -232,10 +242,16 @@ pub struct Pair {
     memory: Memory,
     drain_failures: u32,
     drain_retry_at: u64,
+    guilty_released: bool,
+    slot: u8,
 }
 impl Pair {
     fn firmware_drained(&self, host: &impl Host) -> Result<bool> { Ok(host.drained()) }
+    // This fixture models no killed guilty context (`Pair::guilty_killed`).
+    fn guilty_killed(&self, _generation: u64, _state: u32) -> bool { false }
     fn resync(&mut self) {}
+    // The cross-pair task-stage order is not modelled here (KUnit asahi_g17_render_cross_pair_order).
+    fn release_task_order_if_held(&self) {}
 ''' + pair + r'''
 }
 
@@ -288,6 +304,7 @@ fn command(pool: &Arc<Pool>, lease: RenderLease) -> Command {
     let completion = Arc::new(Completion {
         status: Arc::new(Status), output: Output, sources: Some(Arc::new(Sources)),
         vm_job: Mutex::new(Some(guard)), render: Mutex::new(Some(lease)),
+        is_compute: false,
         signalled: AtomicBool::new(false), accepted: AtomicBool::new(true), spared: AtomicBool::new(false),
         result: Mutex::new(None),
     });
@@ -300,7 +317,8 @@ fn firmware(pool: &Arc<Pool>, commands: &[(&Command, u64)]) -> Firmware {
         stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
     }).collect();
     let pair = Pair { quarantined: false, active: Ring(active), terminal: None, memory: Memory { retired: Vec::new() },
-                      drain_failures: 0, drain_retry_at: 0 };
+                      drain_failures: 0, drain_retry_at: 0, guilty_released: false,
+                      slot: 0 };
     Firmware { queues: Queues { admission: pool.clone() }, pair: Some(Box::new(pair)), host: FakeHost { drained: false } }
 }
 fn batch() -> DeferredBatch { DeferredBatch { values: Vec::new() } }

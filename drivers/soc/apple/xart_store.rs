@@ -12,7 +12,8 @@ use crate::shim;
 use kernel::prelude::*;
 
 /// The raw-extent owner opens this whole partition (the iBoot system container,
-/// where the gigalocker lives) and serves the gigalocker window directly.
+/// where the gigalocker lives) and serves the gigalocker window directly. The
+/// name is only a hint: the opened device must be on the internal NVMe disk.
 pub(crate) const OWNER_PATH: &CStr = c"/dev/disk/by-partlabel/iBootSystemContainer";
 
 const BLOCK_SIZE: usize = 0x1000;
@@ -118,7 +119,7 @@ impl Store {
     /// an override of it. Writes additionally require a single-owner extent
     /// with no snapshots or pending revert, checked on the same block handle.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        let file = shim::StoreFile::open_block(OWNER_PATH, writes_enabled)?;
+        let file = shim::StoreFile::open_internal_block(OWNER_PATH, writes_enabled)?;
         let base = crate::xart_apfs::locate(&file, writes_enabled)?;
         if start_sector != 0 {
             if start_sector.checked_mul(512).ok_or(EINVAL)? != base {
@@ -442,8 +443,9 @@ impl Store {
         Ok(true)
     }
 
-    /// Whether this store accepts writes: `xart_writes=1` and APFS proved the
-    /// extent writable.
+    /// Whether this store accepts writes: it was opened for writing (every
+    /// open but the key-store-only initrd phase's) and APFS proved the extent
+    /// writable.
     pub(crate) fn writes_enabled(&self) -> bool {
         self.writes_enabled
     }
