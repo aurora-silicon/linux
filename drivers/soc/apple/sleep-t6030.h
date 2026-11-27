@@ -3303,6 +3303,29 @@ static bool t6030_no_wfi_clean;
 module_param_named(no_wfi_clean, t6030_no_wfi_clean, bool, 0444);
 MODULE_PARM_DESC(no_wfi_clean, "T6030 DIAGNOSTIC: no set/way clean or HID4 toggles before each core's final WFI");
 
+/*
+ * DIAGNOSTIC (the reviewer's R1): on macOS every core takes its final WFI within ~0.09 ms of the
+ * last commit word; on Linux the P cores take ~0.97 ms (the HV stops of 8628f787/ce1ff743), their
+ * set/way clean of the P cluster's L2 after the release. apple_sleep.fast_wfi=1 has each held
+ * core clean its own L1 and its cluster's L2 when it takes its stop bit, before the commit (the
+ * boot core's own clean is already in .pre_commit), and leaves only CYC_OVRD and DEEP_SLEEP, as
+ * macOS writes them, between the release and each core's WFI.
+ */
+static bool t6030_fast_wfi;
+module_param_named(fast_wfi, t6030_fast_wfi, bool, 0444);
+MODULE_PARM_DESC(fast_wfi, "T6030 DIAGNOSTIC: each held core's cache clean at its stop, before the commit; nothing but the WFI controls after the release");
+
+static void t6030_fast_wfi_stop(void)
+{
+	u64 hid4;
+
+	if (!READ_ONCE(t6030_fast_wfi) || READ_ONCE(t6030_no_wfi_clean))
+		return;
+	hid4 = t6030_dc_unblock();
+	t6030_clean_all_levels();
+	t6030_dc_reblock(hid4);
+}
+
 static bool t6030_quiet;
 module_param_named(quiet, t6030_quiet, bool, 0444);
 MODULE_PARM_DESC(quiet, "T6030 DIAGNOSTIC: mask the EL1 timers and stop the core PMU before each core's final WFI");
@@ -3329,7 +3352,7 @@ static void t6030_deep_wfi_arm(void)
 	 * DIAGNOSTIC: apple_sleep.no_wfi_clean=1 leaves out the clean and the HID4/EHID4 toggles,
 	 * which no working SoC's last WFI does (A/B).
 	 */
-	if (!READ_ONCE(t6030_no_wfi_clean)) {
+	if (!READ_ONCE(t6030_no_wfi_clean) && !READ_ONCE(t6030_fast_wfi)) {
 		hid4 = t6030_dc_unblock();
 		t6030_clean_all_levels();
 		t6030_dc_reblock(hid4);

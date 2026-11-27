@@ -2757,10 +2757,16 @@ static void __noreturn sleep_deep_wfi(void)
 	}
 }
 
+static void t6030_deep_wfi_arm(void);
+static void t6030_fast_wfi_stop(void);
+
 static void sleep_cpu_stop(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 
+	/* T6030 fast_wfi: this core's clean now, before the commit, not after its release */
+	if (s->soc->ops->deep_wfi_arm == t6030_deep_wfi_arm)
+		t6030_fast_wfi_stop();
 	writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_STOP);
 	dsb(sy);
 }
