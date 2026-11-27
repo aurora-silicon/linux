@@ -1659,7 +1659,7 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 	*generation = id->generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	/* PQ content is shown as EDR up to the peak (see dcp_edr_prepare()). */
-	if (READ_ONCE(dcp->panel.peak_nits)) {
+	if (READ_ONCE(dcp->panel.peak_nits) && dcp_fw_panel_decodes_pq(dcp)) {
 		metadata.pq = true;
 		metadata.static_metadata_type1 = true;
 		metadata.bt2020_rgb = true;
@@ -4556,8 +4556,8 @@ bool dcp_panel_edr(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
-	       dcp->panel.edr_ceiling;
+	return dcp_fw_swap_has_edr(dcp) && dcp_fw_panel_decodes_pq(dcp) &&
+	       dcp_has_panel(dcp) && dcp->panel.edr_ceiling;
 }
 
 /* External connectors driven by iomfb_template support full colour selection. */
