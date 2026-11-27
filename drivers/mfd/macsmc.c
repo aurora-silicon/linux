@@ -592,6 +592,65 @@ static const struct apple_rtkit_ops apple_smc_rtkit_ops = {
 	.shmem_setup = apple_smc_rtkit_shmem_setup,
 };
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2 boots J516s's SMC again although iBoot left it
+ * running (lane A, mac-smcboot-1, ref/t6030-macos-smc-boot-keys-values.tsv): IOP power INIT, the
+ * whole RTKit handshake with endpoints 1-4 started and the SMC's own crashlog buffer in its SRAM
+ * acknowledged, endpoint 0x20, AP power on; then its one-time keys UB0C, the six zE* written
+ * twice (enable 0, then 1) and CHLS. Linux only wakes it and starts 0x20. macsmc.smc_cold_init=1
+ * does macOS's sequence at probe and logs every step.
+ */
+static bool smc_cold_init;
+module_param(smc_cold_init, bool, 0444);
+MODULE_PARM_DESC(smc_cold_init, "T6030 DIAGNOSTIC: boot the SMC's RTKit from IOP power INIT and write macOS's one-time keys, as macOS's boot does");
+
+static const struct apple_rtkit_ops apple_smc_rtkit_ops_cold = {
+	.crashed = apple_smc_rtkit_crashed,
+	.recv_message = apple_smc_rtkit_recv,
+	.recv_message_early = apple_smc_rtkit_recv_early,
+	.shmem_setup = apple_smc_rtkit_shmem_setup,
+	.flags = APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG,
+};
+
+static int apple_smc_cold_ep_ret = -EINPROGRESS;
+
+static void apple_smc_cold_key_ep(void *data)
+{
+	struct apple_smc *smc = data;
+
+	apple_smc_cold_ep_ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+}
+
+/* macOS's one-time keys after the SMC's boot, in its order: zE* is { id, 1, enable, 0... } */
+static const struct { char key[5]; u8 id; u8 size; } apple_smc_cold_ze[] = {
+	{ "zECm", 0x0b, 64 }, { "zEWi", 0x03, 32 }, { "zETC", 0x04, 32 },
+	{ "zETM", 0x1d, 120 }, { "zETN", 0x06, 120 }, { "zEAR", 0x02, 32 },
+};
+
+static void apple_smc_cold_keys(struct apple_smc *smc)
+{
+	u8 buf[120], one = 1, chls[2] = {};
+	unsigned int pass, i;
+	int ret;
+
+	ret = apple_smc_write(smc, SMC_KEY(UB0C), &one, sizeof(one));
+	dev_info(smc->dev, "smc_cold_init: UB0C = 01: %d\n", ret);
+	for (pass = 0; pass < 2; pass++)
+		for (i = 0; i < ARRAY_SIZE(apple_smc_cold_ze); i++) {
+			memset(buf, 0, sizeof(buf));
+			buf[0] = apple_smc_cold_ze[i].id;
+			buf[1] = 1;
+			buf[2] = pass;
+			ret = apple_smc_write(smc, _SMC_KEY(apple_smc_cold_ze[i].key), buf,
+					      apple_smc_cold_ze[i].size);
+			dev_info(smc->dev, "smc_cold_init: %s = %02x 01 %02x (%u bytes): %d\n",
+				 apple_smc_cold_ze[i].key, buf[0], pass,
+				 apple_smc_cold_ze[i].size, ret);
+		}
+	ret = apple_smc_write(smc, SMC_KEY(CHLS), chls, sizeof(chls));
+	dev_info(smc->dev, "smc_cold_init: CHLS = 0000: %d\n", ret);
+}
+
 static void apple_smc_rtkit_shutdown(void *data)
 {
 	struct apple_smc *smc = data;
@@ -738,7 +797,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");
 
-	if (smc->saved_enabled)
+	if (smc_cold_init)
+		smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops_cold);
+	else if (smc->saved_enabled)
 		smc->rtk = devm_apple_rtkit_init_m5_saved(dev, smc, NULL, 0, &apple_smc_rtkit_ops);
 	else
 		smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops);
@@ -746,15 +807,26 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(smc->rtk), "Failed to initialize RTKit");
 
 	smc->boot_stage = APPLE_SMC_BOOTING;
-	ret = apple_rtkit_wake(smc->rtk);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to wake up SMC");
+	if (smc_cold_init) {
+		ret = apple_rtkit_boot_from_init_with(smc->rtk, apple_smc_cold_key_ep, smc);
+		dev_info(dev, "smc_cold_init: RTKit boot from IOP power INIT: %d; endpoint 0x20 before AP power on: %d\n",
+			 ret, apple_smc_cold_ep_ret);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to boot SMC from INIT");
+	} else {
+		ret = apple_rtkit_wake(smc->rtk);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to wake up SMC");
+	}
 
 	ret = devm_add_action_or_reset(dev, apple_smc_rtkit_shutdown, smc);
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+	if (smc_cold_init)
+		ret = apple_smc_cold_ep_ret;
+	else
+		ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
 
@@ -787,6 +859,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
+
+	if (smc_cold_init)
+		apple_smc_cold_keys(smc);
 
 	if (smc->sleep_pmvc_set)
 		apple_smc_sleep_pmvc_report(smc);

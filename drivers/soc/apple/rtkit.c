@@ -2881,6 +2881,28 @@ int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot_with);
 
+/*
+ * DIAGNOSTIC: a coprocessor the boot loader left running, booted again the way XNU boots T6030's
+ * SMC: IOP power state INIT, after which the firmware says HELLO again, then the whole handshake
+ * (its endpoint map with the system endpoints, their buffers, the IOP power ack), @before_ap, and
+ * AP power on.
+ */
+int apple_rtkit_boot_from_init_with(struct apple_rtkit *rtk, void (*before_ap)(void *data),
+				    void *data)
+{
+	int ret;
+
+	if (rtk->crashed)
+		return -EINVAL;
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
+					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
+						     APPLE_RTKIT_PWR_STATE_INIT));
+	if (ret)
+		return ret;
+	return apple_rtkit_boot_common(rtk, false, before_ap, data);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_from_init_with);
+
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 {
 	if (rtk->crashed)
