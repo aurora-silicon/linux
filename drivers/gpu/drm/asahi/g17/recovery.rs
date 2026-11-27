@@ -132,6 +132,12 @@ pub(super) enum Class {
     Spared,
     /// This VM owns guilty work.
     Guilty,
+    /// The watchdog failed this compute work because another VM's waiting work took the rest
+    /// of its allowance ([`super::timeout::Verdict::forfeits`]), not because a recovery dropped
+    /// it. Unlike spared work it fails as a command past its allowance does: its VM fails, and
+    /// its queue's quarantine is not a spared one, so the queue never returns to service and on
+    /// M5 its context is killed ([`super::queue::compute::Queue::timed_out`]).
+    Forfeited,
 }
 
 /// Queue operations under the device mutex. Completion signalling belongs to the caller after

@@ -147,6 +147,12 @@ impl Queue {
     /// how long ago the watchdog failed it. The owner's VM has already failed, so it loses
     /// nothing it could still use; without the kill a command that never terminates keeps
     /// running, and keeps this queue, until the owner closes.
+    ///
+    /// That holds for a command whose allowance another VM's waiting work took
+    /// ([`crate::g17::recovery::Class::Forfeited`]) too: only spared work keeps its VM through
+    /// [`Self::timeout`], so the timeout of a forfeited command fails its VM as it does any
+    /// command past its allowance. The kill names every queue of the context, sibling
+    /// channels included, so it must not reach a VM that can still submit to them.
     pub(crate) fn open_timeout_kill(&self, now: u64) -> Option<(Arc<Context>, u64)> {
         if self.released || self.timed_out_at == 0 || !self.timed_out() {
             return None;

@@ -48,13 +48,16 @@ impl Backend {
             }
             let decision = verdict.decision;
             // A command that lost its allowance to another VM's waiting work
-            // ([`timeout::Verdict::forfeits`]) is failed for that, not found hung: it is spared,
-            // as the waiting work would have been.
-            if decision == Decision::Spare
-                || (decision == Decision::Own && packet.allowance_forfeited())
-            {
+            // ([`timeout::Verdict::forfeits`]) is failed for that. It is not spared: a spared
+            // quarantine is never killed, and a forfeited command may be one that never ends.
+            let class = match decision {
+                Decision::Spare => Some(Class::Spared),
+                Decision::Own if packet.allowance_forfeited() => Some(Class::Forfeited),
+                _ => None,
+            };
+            if let Some(class) = class {
                 firmware.queues.compute_for_packet(self.owner, packet).ok_or(EIO)?
-                    .classify(&|_| Class::Spared);
+                    .classify(&|_| class);
             }
             if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
                 dev_warn!(self.shared.dev.as_ref(),

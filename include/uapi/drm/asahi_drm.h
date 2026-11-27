@@ -1347,9 +1347,11 @@ struct drm_asahi_queue_create {
 	 * used up, a later command it waits behind (not the one it first
 	 * waited behind) loses what is left of its allowance and its other
 	 * renewals. The watchdog then settles that command like any command
-	 * past its allowance, normally failing it, so that the waiting command
-	 * can go on. Userspace should ask for an allowance only for queues
-	 * whose commands need one, and keep those commands as short as it can.
+	 * past its allowance, normally failing it with -ETIMEDOUT as a lost
+	 * device, together with the commands queued behind it, so that the
+	 * waiting command can go on. Userspace should ask for an allowance only
+	 * for queues whose commands need one, and keep those commands as short
+	 * as it can.
 	 */
 	__u32 compute_timeout_ms;
 
