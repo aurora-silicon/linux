@@ -1751,7 +1751,8 @@ out:
 
 static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
-			       const void *payload, size_t payload_len, u64 token);
+			       const void *payload, size_t payload_len, u64 token,
+			       bool *published);
 
 /* Caller has closed host publication and settled ordinary commands first. */
 int afk_v27_sleep_check(struct apple_dcp_afkep *ep)
@@ -2483,7 +2484,7 @@ static void afk_v2_status(struct apple_dcp_afkep *ep,
 		ret = afk_send_epic_token(ep, frame->interface, command->id,
 					  EPIC_TYPE_REPLY, EPIC_CAT_REPLY, frame->type,
 					  record + AFKV2_HEADER_SIZE,
-					  size - AFKV2_HEADER_SIZE, frame->token);
+					  size - AFKV2_HEADER_SIZE, frame->token, NULL);
 	if (ret)
 		dev_warn(ep->dcp->dev, "AFKV2 error reply failed: %d\n", ret);
 }
@@ -2693,7 +2694,8 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 		reply_size = AFKV2_COMMAND_SIZE + AFKV2_OOB_SIZE;
 	}
 	ret = afk_send_epic_token(ep, frame->interface, command->id, EPIC_TYPE_REPLY,
-				  EPIC_CAT_REPLY, frame->type, reply, reply_size, frame->token);
+				  EPIC_CAT_REPLY, frame->type, reply, reply_size,
+				  frame->token, NULL);
 	kfree(reply);
 	kfree(owned_request);
 	afk_service_put(service);
@@ -3250,7 +3252,8 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 
 static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
-			       const void *payload, size_t payload_len, u64 token)
+			       const void *payload, size_t payload_len, u64 token,
+			       bool *published)
 {
 	u32 rptr, wptr;
 	struct afk_qe *hdr, *hdr2;
@@ -3262,6 +3265,9 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	u8 v2_category = 0;
 	u16 v2_flags = 0;
 	int ret;
+
+	if (published)
+		*published = false;
 
 	/* External H17P services use AFKV2; the internal profile has no EPIC sender. */
 	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !ep->wire_v2) {
@@ -3504,9 +3510,11 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (!ret) {
 		dma_wmb();
 		*ep->txbfr.wptr = cpu_to_le32(wptr);
+		if (published)
+			*published = true;
 		if (!afk_send_may_sleep(ep))
-			afk_send_raw_locked(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-						FIELD_PREP(SEND_WPTR, wptr));
+			ret = afk_send_raw_locked(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+						      FIELD_PREP(SEND_WPTR, wptr));
 	}
 	spin_unlock(&ep->dcp->afk_tx_lock);
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -3517,10 +3525,10 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	/* Keep tx_lock held across sleeping doorbells so ring writes stay ordered. */
 	if (afk_send_may_sleep(ep))
-		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-			     FIELD_PREP(SEND_WPTR, wptr));
+		ret = afk_send_ret(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+				       FIELD_PREP(SEND_WPTR, wptr));
 	mutex_unlock(&ep->tx_lock);
-	return 0;
+	return ret;
 
 out:
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -3528,12 +3536,21 @@ out:
 	return ret;
 }
 
+static int afk_send_epic_published(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
+				   enum epic_type etype, enum epic_category ecat, u8 stype,
+				   const void *payload, size_t payload_len,
+				   bool *published)
+{
+	return afk_send_epic_token(ep, channel, tag, etype, ecat, stype,
+				   payload, payload_len, 0, published);
+}
+
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		  enum epic_type etype, enum epic_category ecat, u8 stype,
 		  const void *payload, size_t payload_len)
 {
 	return afk_send_epic_token(ep, channel, tag, etype, ecat, stype,
-				   payload, payload_len, 0);
+				   payload, payload_len, 0, NULL);
 }
 
 /* AFKV2: the OPEN of a service whose provider sends it itself (open_later). */
@@ -3621,6 +3638,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	unsigned long flags;
+	bool published = false;
 	int ret, idx;
 	u16 tag;
 	struct apple_dcp_afkep *ep;
@@ -3778,18 +3796,40 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 						  AFKV2_COMMAND_SIZE + payload_len,
 						  tag, payload, payload_len, output_len);
 		if (!ret)
-			ret = afk_send_epic(ep, service->channel, tag, EPIC_TYPE_COMMAND,
-					    EPIC_CAT_COMMAND, type, inline_command,
-					    AFKV2_COMMAND_SIZE + payload_len);
+			ret = afk_send_epic_published(ep, service->channel, tag,
+						      EPIC_TYPE_COMMAND,
+						      EPIC_CAT_COMMAND, type,
+						      inline_command,
+						      AFKV2_COMMAND_SIZE + payload_len,
+						      &published);
 	} else {
-		ret = afk_send_epic(service->ep, service->channel, tag,
-				    EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND, type, &cmd,
-				    sizeof(cmd));
+		ret = afk_send_epic_published(service->ep, service->channel, tag,
+					      EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND,
+					      type, &cmd, sizeof(cmd),
+					      &published);
 	}
 	kfree(inline_command);
 	inline_command = NULL;
-	if (ret)
-		goto err_free_cmd;
+	if (ret) {
+		if (!published)
+			goto err_free_cmd;
+		spin_lock_irqsave(&service->lock, flags);
+		if (service->cmds[idx].done) {
+			spin_unlock_irqrestore(&service->lock, flags);
+			goto err_free_cmd;
+		}
+		/*
+		 * The TX entry is already published and a later doorbell or poll
+		 * can expose it, so keep the slot and DMA buffers owned until
+		 * a late reply frees them or the session is quarantined.
+		 */
+		service->cmds[idx].completion = NULL;
+		service->cmds[idx].free_on_ack = !dcp_is_ext26(ep->dcp);
+		if (dcp_is_ext26(ep->dcp))
+			WRITE_ONCE(ep->dcp->crashed, true);
+		spin_unlock_irqrestore(&service->lock, flags);
+		goto err_put_service;
+	}
 
 	ret = wait_for_completion_timeout(&completion,
 					  msecs_to_jiffies(timeout_ms));
@@ -3826,8 +3866,8 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 					 apple_rtkit_is_running(ep->dcp->rtk),
 					 apple_rtkit_is_crashed(ep->dcp->rtk));
 			}
-			afk_service_put(service);
-			return -ETIMEDOUT;
+			ret = -ETIMEDOUT;
+			goto err_put_service;
 		}
 		spin_unlock_irqrestore(&service->lock, flags);
 	}
