@@ -87,6 +87,23 @@ static void macaudio_levels_fixed_ceiling(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_level_allowed(cfg, 16));
 }
 
+/* A v2-only SN012776 machine also requires DC-blocker config from the boot loader */
+static void macaudio_levels_v2_only_requires_dcblocker(struct kunit *test)
+{
+	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_EXPECT_TRUE(test, macaudio_level_test_present(test, dev, &macaudio_j716_cfg,
+							    "macaudio-kunit-codec-v2-good"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, &macaudio_j716_cfg,
+							     "macaudio-kunit-codec-v2-no-dcblk"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, &macaudio_j716_cfg,
+							     "macaudio-kunit-codec-v2-short-dcblk"));
+	/* Non-v2-only boards keep compatibility with older boot loaders */
+	KUNIT_EXPECT_TRUE(test, macaudio_level_test_present(test, dev, &macaudio_j316_cfg,
+							    "macaudio-kunit-codec-v2-no-dcblk"));
+}
+
 /* No board table carries an SN012776 gain any more */
 static void macaudio_level_no_table(struct kunit *test)
 {
@@ -95,8 +112,9 @@ static void macaudio_level_no_table(struct kunit *test)
 		&macaudio_j37x_j47x_cfg, &macaudio_j413_cfg, &macaudio_j415_cfg,
 		&macaudio_j493_cfg, &macaudio_j575c_j773_cfg, &macaudio_j604_cfg,
 		&macaudio_j614_cfg, &macaudio_j616_cfg, &macaudio_j713_cfg,
-		&macaudio_j714_cfg, &macaudio_j715_cfg, &macaudio_j813_cfg,
-		&macaudio_j775_cfg, &macaudio_j873_cfg, &macaudio_k114_cfg,
+		&macaudio_j714_cfg, &macaudio_j715_cfg, &macaudio_j716_cfg,
+		&macaudio_j813_cfg, &macaudio_j775_cfg, &macaudio_j873_cfg,
+		&macaudio_k114_cfg,
 	};
 	unsigned int i;
 
@@ -116,6 +134,7 @@ static struct kunit_case macaudio_level_cases[] = {
 	KUNIT_CASE(macaudio_level_rejects),
 	KUNIT_CASE(macaudio_levels_every_amp),
 	KUNIT_CASE(macaudio_levels_fixed_ceiling),
+	KUNIT_CASE(macaudio_levels_v2_only_requires_dcblocker),
 	KUNIT_CASE(macaudio_level_no_table),
 	{}
 };

@@ -385,6 +385,37 @@ static void macaudio_hpf_restores_each_dt_corner(struct kunit *test)
 	macaudio_test_expect_hpf(test, &h, MACAUDIO_TEST_HPF_800HZ);
 }
 
+static const char * const macaudio_test_hpf_unordered[] = {
+	"800 Hz", "Disabled", "1600 Hz", "50 Hz",
+};
+
+static const char * const macaudio_test_hpf_no_hz[] = {
+	"Disabled", "Off",
+};
+
+static int macaudio_test_hpf_unordered_info(struct snd_kcontrol *kctl,
+					    struct snd_ctl_elem_info *uinfo)
+{
+	return snd_ctl_enum_info(uinfo, 1, ARRAY_SIZE(macaudio_test_hpf_unordered),
+				 macaudio_test_hpf_unordered);
+}
+
+static int macaudio_test_hpf_no_hz_info(struct snd_kcontrol *kctl,
+					struct snd_ctl_elem_info *uinfo)
+{
+	return snd_ctl_enum_info(uinfo, 1, ARRAY_SIZE(macaudio_test_hpf_no_hz),
+				 macaudio_test_hpf_no_hz);
+}
+
+static void macaudio_hpf_safe_item_picks_highest_hz(struct kunit *test)
+{
+	struct snd_kcontrol kctl_unordered = { .info = macaudio_test_hpf_unordered_info };
+	struct snd_kcontrol kctl_no_hz = { .info = macaudio_test_hpf_no_hz_info };
+
+	KUNIT_EXPECT_EQ(test, macaudio_hpf_safe_item(&kctl_unordered), 2);
+	KUNIT_EXPECT_EQ(test, macaudio_hpf_safe_item(&kctl_no_hz), -ENOENT);
+}
+
 static struct kunit_case macaudio_hpf_cases[] = {
 	KUNIT_CASE(macaudio_hpf_grant_opens_the_tweeters),
 	KUNIT_CASE(macaudio_hpf_release_restores_800hz),
@@ -397,6 +428,7 @@ static struct kunit_case macaudio_hpf_cases[] = {
 	KUNIT_CASE(macaudio_hpf_crossover_latched_by_grant),
 	KUNIT_CASE(macaudio_hpf_crossover_is_the_owners),
 	KUNIT_CASE(macaudio_hpf_crossover_cleared_with_the_owner),
+	KUNIT_CASE(macaudio_hpf_safe_item_picks_highest_hz),
 	{}
 };
 

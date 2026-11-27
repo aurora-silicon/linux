@@ -36,6 +36,20 @@
 		#sound-dai-cells = <0>;
 	};
 
+	ma_amp_dcblk_a: macaudio-kunit-amp-dcblk-a {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 0f 00 02];
+		apple,amp-dcblocker-config = [01 41 00 00];
+	};
+
+	ma_amp_dcblk_short: macaudio-kunit-amp-dcblk-short {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [01 0f 04 06];
+		apple,amp-dcblocker-config = [01];
+	};
+
 	macaudio-kunit-codec-good {
 		sound-dai = <&ma_amp_a>, <&ma_amp_b>;
 	};
@@ -50,5 +64,17 @@
 
 	macaudio-kunit-codec-level-15 {
 		sound-dai = <&ma_amp_a>;
+	};
+
+	macaudio-kunit-codec-v2-good {
+		sound-dai = <&ma_amp_dcblk_a>;
+	};
+
+	macaudio-kunit-codec-v2-no-dcblk {
+		sound-dai = <&ma_amp_dcblk_a>, <&ma_amp_a>;
+	};
+
+	macaudio-kunit-codec-v2-short-dcblk {
+		sound-dai = <&ma_amp_dcblk_a>, <&ma_amp_dcblk_short>;
 	};
 };

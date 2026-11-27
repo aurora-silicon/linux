@@ -1330,19 +1330,37 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	struct device_node *pmp_node;
 	struct platform_device *pmp;
 	struct device_link *link;
+	bool pmp_unavailable = false;
 
 	pmp_node = of_parse_phandle(np, "apple,pmp", 0);
 	if (pmp_node) {
-		pmp = of_find_device_by_node(pmp_node);
-		of_node_put(pmp_node);
-		if (!pmp)
-			return -EPROBE_DEFER;
-		link = device_link_add(dev, &pmp->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
-		put_device(&pmp->dev);
-		if (!link)
-			return -EINVAL;
-		if (link->supplier->links.status != DL_DEV_DRIVER_BOUND)
-			return -EPROBE_DEFER;
+		/*
+		 * A DT whose PMP relies on boot-loader ADT handoff leaves
+		 * apple,board-id and apple,dram-vendor-id absent when booted
+		 * by an older loader. In that case apple_pmp fails permanently,
+		 * so keep PMC (and its CLPC child) running without the PMP
+		 * static voter instead of deferring forever.
+		 */
+		if (of_device_is_available(pmp_node) &&
+		    of_property_present(pmp_node, "apple,board-id") &&
+		    of_property_present(pmp_node, "apple,dram-vendor-id")) {
+			pmp = of_find_device_by_node(pmp_node);
+			of_node_put(pmp_node);
+			if (!pmp)
+				return -EPROBE_DEFER;
+			link = device_link_add(dev, &pmp->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+			put_device(&pmp->dev);
+			if (!link)
+				return -EINVAL;
+			if (link->supplier->links.status != DL_DEV_DRIVER_BOUND)
+				return -EPROBE_DEFER;
+		} else {
+			dev_info(dev,
+				 "PMP supplier %pOF lacks boot-loader properties; probing PMC without PMP\n",
+				 pmp_node);
+			of_node_put(pmp_node);
+			pmp_unavailable = true;
+		}
 	}
 
 	pmc = devm_kzalloc(dev, sizeof(*pmc), GFP_KERNEL);
@@ -1401,6 +1419,8 @@ static int apple_pmc_probe(struct platform_device *pdev)
 						     agents[i]);
 			pmc->static_agents |= BIT(agents[i]);
 		}
+		if (pmp_unavailable)
+			pmc->static_agents &= ~BIT(0);
 	}
 
 	platform_set_drvdata(pdev, pmc);

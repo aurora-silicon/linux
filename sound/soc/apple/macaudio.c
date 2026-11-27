@@ -198,6 +198,14 @@ struct macaudio_platform_cfg {
 	 * the speakers stay off.
 	 */
 	int spk_ceiling_level;
+	/*
+	 * Only the "Speaker Protection" lease may own the speakers: legacy
+	 * "Speaker Volume Unlock" and "Speaker Protection Interface" are not
+	 * exposed, the card binds directly in lease mode (muted at the hardware
+	 * floor until an owner grants a lease), and losing the owner never
+	 * reverts to the legacy interface.
+	 */
+	bool spk_v2_only;
 };
 
 static const char *volume_control_names[] = {
@@ -416,21 +424,24 @@ static bool macaudio_spk_leased(const struct macaudio_snd_data *ma)
 	return READ_ONCE(ma->spk_iface) == MACAUDIO_SPK_IFACE_LEASE;
 }
 
-/* Only a "Speaker Protection" lease may lift these speakers (spk_fixed_ceiling) */
+/* Only a "Speaker Protection" lease may lift these speakers */
 static bool macaudio_spk_lease_only(const struct macaudio_platform_cfg *cfg)
 {
-	return cfg->spk_fixed_ceiling;
+	return cfg->spk_fixed_ceiling || cfg->spk_v2_only;
 }
 
 /*
  * The SN012776 volumes' limit: the floor while locked; unlocked, 0 dB, or
- * on a lease-only machine safe_vol, and there only under the lease.
+ * on a fixed-ceiling machine safe_vol, and on a lease-only machine only
+ * under the lease.
  */
 static int macaudio_sn012776_vlimit(const struct macaudio_platform_cfg *cfg,
 				    bool unlock, bool leased)
 {
-	if (macaudio_spk_lease_only(cfg))
+	if (cfg->spk_fixed_ceiling)
 		return unlock && leased ? SN012776_DB(cfg->safe_vol) : 1;
+	if (cfg->spk_v2_only)
+		return unlock && leased ? SN012776_0DB : 1;
 	if (unlock)
 		return SN012776_0DB;
 	return 1; //SN012776_DB(cfg->safe_vol);
@@ -852,8 +863,9 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 			schedule_work(&ma->sw_gain_stop_work);
 		}
 		ma->speaker_volume_unlocked = unlock;
-		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
-			       &ma->speaker_lock_kctl->id);
+		if (ma->speaker_lock_kctl)
+			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &ma->speaker_lock_kctl->id);
 	}
 }
 
@@ -1074,7 +1086,6 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 	}
 }
 
-#define MACAUDIO_TWEETER_HPF_SAFE	"800 Hz"
 #define MACAUDIO_TWEETER_HPF_NAME	"* Tweeter HPF Corner Frequency"
 
 /*
@@ -1814,7 +1825,7 @@ static void macaudio_spk_leave_lease(struct macaudio_snd_data *ma, const char *w
 {
 	lockdep_assert_held(&ma->spk_mutex);
 
-	if (!macaudio_spk_leased(ma))
+	if (ma->cfg->spk_v2_only || !macaudio_spk_leased(ma))
 		return;
 	cancel_delayed_work(&ma->spk_unowned_work);
 
@@ -1896,6 +1907,8 @@ static int macaudio_spk_iface_put(struct snd_kcontrol *kcontrol,
 
 	if (item >= ARRAY_SIZE(macaudio_spk_iface_texts))
 		return -EINVAL;
+	if (ma->cfg->spk_v2_only && item != MACAUDIO_SPK_IFACE_LEASE)
+		return -EOPNOTSUPP;
 	/* The speakers are not a seat user's to hand over */
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -2056,7 +2069,7 @@ static void macaudio_spk_unlock(struct snd_kcontrol *kcontrol)
 	if (macaudio_spk_leased(ma)) {
 		macaudio_spk_floor_ramped(ma, "owner gone");
 		/* A restarting engine takes it back in time; a dead one does not */
-		if (!ma->spk_dead)
+		if (!ma->spk_dead && !ma->cfg->spk_v2_only)
 			mod_delayed_work(system_percpu_wq, &ma->spk_unowned_work,
 					 msecs_to_jiffies(SPEAKER_LEASE_UNOWNED_MS));
 	}
@@ -2233,6 +2246,7 @@ static int macaudio_spk_take_volumes(struct macaudio_snd_data *ma)
 	if (!nr)
 		return -ENOENT;
 
+	ma->spk_nr_vols = 0;
 	ma->spk_vols = devm_kcalloc(dev, nr, sizeof(*ma->spk_vols), GFP_KERNEL);
 	ma->spk_uval = devm_kzalloc(dev, sizeof(*ma->spk_uval), GFP_KERNEL);
 	if (!ma->spk_vols || !ma->spk_uval)
@@ -2274,6 +2288,7 @@ static int macaudio_spk_take_amp_gains(struct macaudio_snd_data *ma)
 	if (!nr)
 		return 0;
 
+	ma->spk_nr_amp_gains = 0;
 	ma->spk_amp_gains = devm_kcalloc(dev, nr, sizeof(*ma->spk_amp_gains), GFP_KERNEL);
 	if (!ma->spk_amp_gains)
 		return -ENOMEM;
@@ -2286,11 +2301,17 @@ static int macaudio_spk_take_amp_gains(struct macaudio_snd_data *ma)
 	return 0;
 }
 
-/* The item of enum control @kctl named @text, or a negative error */
-static int macaudio_enum_item(struct snd_kcontrol *kctl, const char *text)
+/*
+ * The highest corner frequency ("<N> Hz") of a codec's playback high-pass enum,
+ * derived from the codec control's advertised items rather than a hard-coded
+ * frequency string.
+ */
+static int macaudio_hpf_safe_item(struct snd_kcontrol *kctl)
 {
 	struct snd_ctl_elem_info *uinfo;
 	unsigned int i, items;
+	unsigned long hz, best_hz = 0;
+	int best = -ENOENT;
 	int ret;
 
 	uinfo = kzalloc_obj(*uinfo);
@@ -2301,18 +2322,28 @@ static int macaudio_enum_item(struct snd_kcontrol *kctl, const char *text)
 	if (!ret && uinfo->type != SNDRV_CTL_ELEM_TYPE_ENUMERATED)
 		ret = -EINVAL;
 	items = ret ? 0 : uinfo->value.enumerated.items;
-	ret = -ENOENT;
 	for (i = 0; i < items; i++) {
+		const char *name;
+		char *end;
+
 		uinfo->value.enumerated.item = i;
-		if (kctl->info(kctl, uinfo))
+		if (kctl->info(kctl, uinfo)) {
+			ret = -EIO;
 			break;
-		if (!strcmp(uinfo->value.enumerated.name, text)) {
-			ret = i;
-			break;
+		}
+		name = uinfo->value.enumerated.name;
+		if (name[0] < '0' || name[0] > '9')
+			continue;
+		hz = simple_strtoul(name, &end, 10);
+		if (!hz || strcmp(end, " Hz"))
+			continue;
+		if (hz > best_hz) {
+			best_hz = hz;
+			best = i;
 		}
 	}
 	kfree(uinfo);
-	return ret;
+	return ret ?: best;
 }
 
 /*
@@ -2338,6 +2369,7 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 	if (!nr)
 		return -ENOENT;
 
+	ma->spk_nr_hpfs = 0;
 	ma->spk_hpfs = devm_kcalloc(dev, nr, sizeof(*ma->spk_hpfs), GFP_KERNEL);
 	ma->spk_hpf_granted = devm_kcalloc(dev, nr, sizeof(*ma->spk_hpf_granted), GFP_KERNEL);
 	if (!ma->spk_hpfs || !ma->spk_hpf_granted)
@@ -2350,7 +2382,7 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
 		if (!snd_soc_control_matches(kctl, MACAUDIO_TWEETER_HPF_NAME))
 			continue;
-		safe = macaudio_enum_item(kctl, MACAUDIO_TWEETER_HPF_SAFE);
+		safe = macaudio_hpf_safe_item(kctl);
 		if (safe < 0) {
 			ret = safe;
 			goto out;
@@ -2401,8 +2433,17 @@ static int macaudio_copy_link(struct device *dev, struct snd_soc_dai_link *targe
 /* A Speaker DT link alone does not establish a protected backend. */
 static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
 {
-	/* Every admitted backend must have a configured, enforced safe level. */
-	return cfg->enable_speakers && cfg->safe_vol < 0 &&
+	/*
+	 * Every admitted backend must have a configured, enforced safe floor:
+	 * either an explicit negative safe_vol, or a v2-only digital-gain amp
+	 * whose ungranted floor is hardware mute (0) and which never unlocks
+	 * without an active protection lease.
+	 */
+	bool has_safe_floor = cfg->safe_vol < 0 ||
+		(cfg->spk_v2_only && !cfg->spk_fixed_ceiling &&
+		 (cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776));
+
+	return cfg->enable_speakers && has_safe_floor &&
 		cfg->speakers != SPKR_NONE &&
 		(cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776 ||
 		 cfg->amp == AMP_MAX98360A);
@@ -2444,7 +2485,9 @@ static bool macaudio_sn012776_level_allowed(const struct macaudio_platform_cfg *
 /*
  * Speakers on SN012776 amps run only when every amp has its level from the
  * Mac, and under a fixed ceiling only at the level that ceiling was computed
- * for; otherwise they stay off.
+ * for; on a v2-only machine every amp also requires its DC-blocker setting
+ * from the boot loader. Otherwise the speakers stay off while the jack stays
+ * available.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
 					     const struct macaudio_platform_cfg *cfg,
@@ -2455,20 +2498,27 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 
 	n = of_count_phandle_with_args(codec, "sound-dai", "#sound-dai-cells");
 	for (i = 0; i < n; i++) {
+		bool ok;
+
 		if (of_parse_phandle_with_args(codec, "sound-dai",
 					       "#sound-dai-cells", i, &args))
 			return false;
 		level = macaudio_sn012776_level(args.np);
+		ok = macaudio_sn012776_level_allowed(cfg, level);
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
-		else if (!macaudio_sn012776_level_allowed(cfg, level))
+		else if (!ok)
 			dev_err(dev, "%pOF: amp level %d, the fixed ceiling holds only at %d\n",
 				args.np, level, cfg->spk_ceiling_level);
-		else if (cfg->spk_fixed_ceiling)
+		else if (cfg->spk_v2_only &&
+			 of_property_count_u8_elems(args.np, "apple,amp-dcblocker-config") < 2) {
+			dev_err(dev, "%pOF: no DC blocker config from the boot loader\n", args.np);
+			ok = false;
+		} else if (cfg->spk_fixed_ceiling)
 			dev_info(dev, "%pOF: amp level %d from the boot loader\n", args.np, level);
 		of_node_put(args.np);
-		if (!macaudio_sn012776_level_allowed(cfg, level))
+		if (!ok)
 			return false;
 	}
 	return n > 0;
@@ -2713,12 +2763,13 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 
 				of_node_put(spk_codec);
 				if (!levels) {
-					dev_err(card->dev, "no usable amp levels from the boot loader, disabling speakers\n");
+					dev_err(card->dev, "no usable amp configuration from the boot loader, disabling speakers\n");
 					continue;
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
+			if (ma->cfg->amp != AMP_SSM3515 &&
+			    (ma->cfg->safe_vol != 0 || ma->cfg->spk_v2_only) &&
 			    !ma->cfg->spk_fixed_ceiling)
 				ma->has_sense = 1;
 		}
@@ -3514,19 +3565,38 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 	}
 
 	/*
-	 * The volume lock's floor holds from here on, before userspace sees the
-	 * card: "Speaker Volume Unlock" is in charge at every bind.
+	 * Put the speakers at the hardware floor before userspace sees the card:
+	 * on dual-interface cards "Speaker Volume Unlock" starts in charge; on
+	 * v2-only cards "Speaker Protection" starts in charge directly.
 	 */
 	if (ma->has_speakers) {
+		/* Reset per-bind protection state so ASoC component rebind starts clean. */
+		mutex_lock(&ma->spk_mutex);
+		ma->spk_dead = false;
+		ma->spk_owner = NULL;
+		ma->spk_active = false;
+		ma->spk_lapsed = false;
+		WRITE_ONCE(ma->spk_granted, false);
+		WRITE_ONCE(ma->spk_xover, false);
+		WRITE_ONCE(ma->spk_iface, ma->cfg->spk_v2_only ?
+			   MACAUDIO_SPK_IFACE_LEASE : MACAUDIO_SPK_IFACE_UNLOCK);
+		ma->sw_gain_component = NULL;
+		ma->speaker_lock_kctl = NULL;
+		ma->spk_iface_kctl = NULL;
+		ma->spk_xover_kctl = NULL;
+		mutex_unlock(&ma->spk_mutex);
+
 		ma->speaker_sample_rate_kctl = snd_soc_card_get_kcontrol(card,
 									 "Speaker Sample Rate");
-		ma->speaker_lock_kctl = snd_soc_card_get_kcontrol(card,
-								  "Speaker Volume Unlock");
 		ma->spk_kctl = snd_soc_card_get_kcontrol(card, "Speaker Protection");
-		ma->spk_iface_kctl = snd_soc_card_get_kcontrol(card,
-							       "Speaker Protection Interface");
-		if (!ma->speaker_sample_rate_kctl || !ma->speaker_lock_kctl ||
-		    !ma->spk_kctl || !ma->spk_iface_kctl)
+		if (!ma->cfg->spk_v2_only) {
+			ma->speaker_lock_kctl = snd_soc_card_get_kcontrol(card,
+									  "Speaker Volume Unlock");
+			ma->spk_iface_kctl = snd_soc_card_get_kcontrol(card,
+								       "Speaker Protection Interface");
+		}
+		if (!ma->speaker_sample_rate_kctl || !ma->spk_kctl ||
+		    (!ma->cfg->spk_v2_only && (!ma->speaker_lock_kctl || !ma->spk_iface_kctl)))
 			return -EINVAL;
 		ret = macaudio_spk_take_volumes(ma);
 		if (ret)
@@ -3544,17 +3614,36 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 			    ma->link_props[rtd->dai_link->id].sw_gain)
 				ma->sw_gain_component = snd_soc_rtd_to_cpu(rtd, 0)->component;
 		}
-		/* The volume table's top under the lock: the legacy ceiling */
-		ret = macaudio_sw_gain_full_scale(ma, false);
-		if (ret < 0)
-			return dev_err_probe(card->dev, ret, "software gain ceiling not set\n");
+		if (ma->cfg->spk_v2_only) {
+			ret = macaudio_sw_gain_full_scale(ma, true);
+			if (ret < 0)
+				return dev_err_probe(card->dev, ret,
+						     "software gain full scale not set\n");
+			mutex_lock(&ma->spk_mutex);
+			macaudio_spk_floor(ma, "card bound");
+			ret = READ_ONCE(ma->spk_floor_failed) ? -EIO : 0;
+			mutex_unlock(&ma->spk_mutex);
+			if (ret)
+				return dev_err_probe(card->dev, ret,
+						     "speaker protection floor not set\n");
+			mutex_lock(&ma->volume_lock_mutex);
+			macaudio_vlimit_unlock(ma, true);
+			mutex_unlock(&ma->volume_lock_mutex);
+		} else {
+			/* The volume table's top under the lock: the legacy ceiling */
+			ret = macaudio_sw_gain_full_scale(ma, false);
+			if (ret < 0)
+				return dev_err_probe(card->dev, ret,
+						     "software gain ceiling not set\n");
 
-		mutex_lock(&ma->volume_lock_mutex);
-		macaudio_vlimit_unlock(ma, false);
-		ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
-		mutex_unlock(&ma->volume_lock_mutex);
-		if (ret)
-			return dev_err_probe(card->dev, ret, "speaker volume lock not set\n");
+			mutex_lock(&ma->volume_lock_mutex);
+			macaudio_vlimit_unlock(ma, false);
+			ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
+			mutex_unlock(&ma->volume_lock_mutex);
+			if (ret)
+				return dev_err_probe(card->dev, ret,
+						     "speaker volume lock not set\n");
+		}
 #ifdef CONFIG_DEBUG_FS
 		debugfs_create_atomic_t("speaker_starts_refused", 0444, card->debugfs_card_root,
 					&ma->spk_refused);
@@ -3613,6 +3702,28 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	mutex_lock(&ma->volume_lock_mutex);
 	macaudio_pm_volumes_drop(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
+
+	/* Clear per-bind control references before any subsequent ASoC rebind. */
+	mutex_lock(&ma->spk_mutex);
+	ma->spk_owner = NULL;
+	ma->spk_active = false;
+	ma->spk_lapsed = false;
+	WRITE_ONCE(ma->spk_xover, false);
+	ma->spk_vols = NULL;
+	ma->spk_nr_vols = 0;
+	ma->spk_hpfs = NULL;
+	ma->spk_hpf_granted = NULL;
+	ma->spk_nr_hpfs = 0;
+	ma->spk_amp_gains = NULL;
+	ma->spk_nr_amp_gains = 0;
+	ma->spk_uval = NULL;
+	ma->sw_gain_component = NULL;
+	ma->speaker_sample_rate_kctl = NULL;
+	ma->speaker_lock_kctl = NULL;
+	ma->spk_kctl = NULL;
+	ma->spk_iface_kctl = NULL;
+	ma->spk_xover_kctl = NULL;
+	mutex_unlock(&ma->spk_mutex);
 	return 0;
 }
 
@@ -3649,6 +3760,54 @@ static int macaudio_set_fixed_enum(struct snd_soc_card *card, const char *name,
 
 	/* INACTIVE only hides controls; direct ALSA writes require WRITE. */
 	macaudio_deny_write(card, name);
+	return ret;
+}
+
+/*
+ * Called during control fixup, before the card is exposed to userspace.
+ * When @set_safe is true, sets each matching HPF enum control to its highest
+ * frequency corner before deactivating it and denying userspace writes.
+ */
+static int macaudio_set_fixed_hpf(struct snd_soc_card *card, const char *name,
+				  bool set_safe)
+{
+	struct snd_ctl_elem_value *uval = NULL;
+	struct snd_kcontrol *kctl;
+	int hits = 0, ret = 0;
+
+	if (set_safe) {
+		uval = kzalloc_obj(*uval);
+		if (!uval)
+			return -ENOMEM;
+	}
+
+	list_for_each_entry(kctl, &card->snd_card->controls, list) {
+		if (!snd_soc_control_matches(kctl, name))
+			continue;
+		if (set_safe) {
+			int safe = macaudio_hpf_safe_item(kctl);
+
+			if (safe < 0) {
+				ret = safe;
+				goto out;
+			}
+			memset(uval, 0, sizeof(*uval));
+			uval->id = kctl->id;
+			uval->value.enumerated.item[0] = safe;
+			ret = kctl->put(kctl, uval);
+			if (ret < 0)
+				goto out;
+		}
+		hits++;
+	}
+
+	ret = snd_soc_deactivate_kctl(card, name, 0);
+	if (ret < 0)
+		goto out;
+	macaudio_deny_write(card, name);
+	ret = hits;
+out:
+	kfree(uval);
 	return ret;
 }
 
@@ -3694,11 +3853,10 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 		/*
 		 * Each amp's gain ends at its level from the Mac's ADT
 		 * (macaudio_limit_sn012776_levels()). The tweeters' playback
-		 * high-pass starts at the protection floor; the woofers keep
-		 * the corner the amps were given from the ADT.
+		 * high-pass starts at the codec's highest corner frequency;
+		 * the woofers keep the corner the amps were given from the ADT.
 		 */
-		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
-			     tweeter ? MACAUDIO_TWEETER_HPF_SAFE : NULL);
+		CHECK_CONCAT(macaudio_set_fixed_hpf, "HPF Corner Frequency", tweeter);
 
 		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
@@ -3788,6 +3946,23 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 		break;
 	}
 
+	/*
+	 * On a v2-only card the amps start in lease mode: fix their operating
+	 * gains at the ADT-derived limits just installed above before the card
+	 * is exposed to userspace.
+	 */
+	if (ma->cfg->spk_v2_only) {
+		int ret;
+
+		mutex_lock(&ma->spk_mutex);
+		ret = macaudio_spk_fix_amp_gains(ma);
+		if (ret)
+			WRITE_ONCE(ma->spk_floor_failed, true);
+		mutex_unlock(&ma->spk_mutex);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -3867,6 +4042,9 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	long val = uvalue->value.integer.value[0];
+
+	if (ma->cfg->spk_v2_only)
+		return -EOPNOTSUPP;
 
 	/*
 	 * Reads return the lock state (0 or 1), so a saved mixer state holds
@@ -3981,8 +4159,12 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	mutex_unlock(&ma->volume_lock_mutex);
 }
 
-/* The speaker controls go last: a card without speakers drops them. */
+/*
+ * The speaker controls go last: a card without speakers drops all four, and a
+ * v2-only card drops the final two legacy controls.
+ */
 #define MACAUDIO_NUM_SPEAKER_CONTROLS 4
+#define MACAUDIO_NUM_LEGACY_SPEAKER_CONTROLS 2
 
 static const struct snd_kcontrol_new macaudio_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Speaker"),
@@ -3997,6 +4179,14 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 	},
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = MACAUDIO_SPK_OWNERSHIP_ACCESS,
+		.name = "Speaker Protection",
+		.info = macaudio_spk_info,
+		.put = macaudio_spk_put, .get = macaudio_spk_get,
+		.lock = macaudio_spk_lock, .unlock = macaudio_spk_unlock,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.access = SNDRV_CTL_ELEM_ACCESS_READ |
 			SNDRV_CTL_ELEM_ACCESS_WRITE |
 			SNDRV_CTL_ELEM_ACCESS_VOLATILE,
@@ -4004,14 +4194,6 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.info = macaudio_slk_info,
 		.put = macaudio_slk_put, .get = macaudio_slk_get,
 		.lock = macaudio_slk_lock, .unlock = macaudio_slk_unlock,
-	},
-	{
-		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-		.access = MACAUDIO_SPK_OWNERSHIP_ACCESS,
-		.name = "Speaker Protection",
-		.info = macaudio_spk_info,
-		.put = macaudio_spk_put, .get = macaudio_spk_get,
-		.lock = macaudio_spk_lock, .unlock = macaudio_spk_unlock,
 	},
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
@@ -4210,6 +4392,29 @@ struct macaudio_platform_cfg macaudio_j714_cfg = {
 	.spk_secondary_only = true,
 	/* Granted, the tweeters restore their DT corner, as on the J616s */
 	.tweeter_hpf_granted = true,
+};
+
+/*
+ * J716 (T6050, MacBook Pro 16" M5 Pro/Max): AOP-fed CS42L84 jack and six
+ * SN012776 speaker amps (two woofers and a tweeter per side) with twelve V/I
+ * sense slots in the 250-BCLK 12 MHz frame. All per-amp operating levels and
+ * DC-blocker settings come from the boot loader's DT properties, and speakers
+ * run behind the v2 "Speaker Protection" lease only (spk_v2_only): without a
+ * live lease owner, volumes stay locked at the hardware mute floor and speaker
+ * PCM starts are refused, with no legacy unlock fallback or guessed safe_vol.
+ */
+struct macaudio_platform_cfg macaudio_j716_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+	.tweeter_hpf_granted = true,
+	.spk_v2_only = true,
 };
 
 /*
@@ -4542,6 +4747,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j714    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
+	/* j716    AID41   sn012776    -       2x 2W+1T (AOP-fed, V/I sense, v2 lease only) */
+	{ .compatible = "apple,j716-macaudio", .data = &macaudio_j716_cfg },
 	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
 	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
 	/* k114    -       sn012776    -       2x 2W+1T (AOP-fed; jack only, speakers off) */
@@ -4642,10 +4849,12 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	if (!data->has_sense)
 		card->num_dapm_routes--;
 
-	/* Admitted speakers always have a safe level (macaudio_speakers_allowed()) */
+	/* Admitted speakers always have a safe floor (macaudio_speakers_allowed()) */
 	if (!data->has_speakers) {
 		card->num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
 	} else {
+		if (data->cfg->spk_v2_only)
+			card->num_controls -= MACAUDIO_NUM_LEGACY_SPEAKER_CONTROLS;
 		data->has_safety = true;
 		macaudio_quiet_refusals(card);
 	}
@@ -4668,7 +4877,8 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	atomic_set(&data->sw_gain_lock_epoch, 0);
 	atomic_set(&data->sw_gain_prepared_epoch, -1);
 	atomic_set(&data->sw_gain_limit_failed, 0);
-	data->spk_iface = MACAUDIO_SPK_IFACE_UNLOCK;
+	data->spk_iface = data->cfg->spk_v2_only ?
+			  MACAUDIO_SPK_IFACE_LEASE : MACAUDIO_SPK_IFACE_UNLOCK;
 
 	ret = macaudio_spk_init(data);
 	if (ret)

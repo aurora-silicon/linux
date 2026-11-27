@@ -290,6 +290,114 @@ static void macaudio_iface_j813_speakers_protected(struct kunit *test)
 	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
 }
 
+/*
+ * J716 (v2-only): binds directly in lease mode at the hardware floor, refuses
+ * legacy unlock and interface revert, and never schedules the unowned fallback
+ * when the owner leaves.
+ */
+static void macaudio_iface_v2_only_never_leaves_lease(struct kunit *test)
+{
+	struct macaudio_test_iface f;
+
+	KUNIT_ASSERT_TRUE(test, macaudio_speakers_allowed(&macaudio_j716_cfg));
+	macaudio_test_spk_card(test, &f.t, &macaudio_j716_cfg, SN012776_0DB);
+	f.t.ma->has_safety = true;
+	{
+		struct snd_kcontrol_new slk = macaudio_test_control("Speaker Volume Unlock");
+		struct snd_kcontrol_new iface = macaudio_test_control("Speaker Protection Interface");
+
+		f.daemon = kunit_kzalloc(test, sizeof(*f.daemon), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, f.daemon);
+		f.slk = macaudio_test_add_kctl(test, f.t.ma->card.snd_card, &slk, &f.t.ma->card);
+		f.iface = macaudio_test_add_kctl(test, f.t.ma->card.snd_card, &iface, &f.t.ma->card);
+	}
+
+	/* Cold bind: already leased, muted at floor 0, userspace writes refused */
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+	KUNIT_EXPECT_EQ(test, f.t.vols[0]->write_check(f.t.vols[0], NULL), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), -EPERM);
+
+	/* Legacy unlock and switching back to unlock are refused */
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_UNLOCK),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	macaudio_test_daemon_take(test, &f);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+
+	/* Owner takes lease, grants operating gain, then leaves */
+	macaudio_test_take(test, &f.t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_vols(test, &f.t, SN012776_0DB);
+
+	macaudio_spk_unlock(f.t.spk);
+	macaudio_test_settle(f.t.ma);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_vols(test, &f.t, 0);
+	/* No revert timer is armed on a v2-only card */
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f.t.ma->spk_unowned_work));
+
+	/* Even an explicit leave-lease call cannot exit lease mode */
+	mutex_lock(&f.t.ma->spk_mutex);
+	macaudio_spk_leave_lease(f.t.ma, "test");
+	mutex_unlock(&f.t.ma->spk_mutex);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+}
+
+/*
+ * Component unbind and rebind reuse macaudio_snd_data: removal clears per-bind
+ * control state and marks spk_dead, and the next bind clears spk_dead, retakes
+ * volumes without overflowing spk_vols, and reapplies the cold-bind mute floor.
+ */
+static void macaudio_iface_v2_only_rebind_resets_floor(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j716_cfg, SN012776_0DB);
+	t.ma->has_safety = true;
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 50), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+
+	/* Simulate ASoC card unbind */
+	KUNIT_EXPECT_EQ(test, macaudio_card_remove(&t.ma->card), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->spk_dead);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_vols, 0U);
+	KUNIT_EXPECT_NULL(test, t.ma->spk_vols);
+	KUNIT_EXPECT_NULL(test, t.ma->spk_owner);
+
+	/* Simulate rebind with stale non-zero codec volumes before cold-bind floor */
+	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
+		macaudio_test_vol(t.vols[i])->value = MACAUDIO_TEST_START_VOL;
+
+	mutex_lock(&t.ma->spk_mutex);
+	t.ma->spk_dead = false;
+	t.ma->spk_owner = NULL;
+	t.ma->spk_active = false;
+	t.ma->spk_lapsed = false;
+	WRITE_ONCE(t.ma->spk_granted, false);
+	WRITE_ONCE(t.ma->spk_xover, false);
+	WRITE_ONCE(t.ma->spk_iface, MACAUDIO_SPK_IFACE_LEASE);
+	mutex_unlock(&t.ma->spk_mutex);
+
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_vols, (unsigned int)MACAUDIO_TEST_NR_SPK);
+
+	mutex_lock(&t.ma->spk_mutex);
+	macaudio_spk_floor(t.ma, "card bound");
+	mutex_unlock(&t.ma->spk_mutex);
+
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(t.ma));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_expect_vols(test, &t, 0);
+}
+
 /* The switch is no mixer setting: alsactl neither saves nor restores it */
 static void macaudio_iface_control_is_inactive(struct kunit *test)
 {
@@ -307,6 +415,8 @@ static struct kunit_case macaudio_iface_cases[] = {
 	KUNIT_CASE(macaudio_iface_needs_cap_sys_admin),
 	KUNIT_CASE(macaudio_iface_control_is_inactive),
 	KUNIT_CASE(macaudio_iface_j813_speakers_protected),
+	KUNIT_CASE(macaudio_iface_v2_only_never_leaves_lease),
+	KUNIT_CASE(macaudio_iface_v2_only_rebind_resets_floor),
 	{}
 };
 
