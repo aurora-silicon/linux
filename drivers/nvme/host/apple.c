@@ -2969,10 +2969,12 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 }
 
 /*
- * macOS sees the firmware report on 68 ms after HELLO. Each try waits up to RTKit's
- * handshake timeout; stop trying once this long has passed since the run bit.
+ * macOS sees the firmware report on 68 ms after HELLO. Stop trying once this long has passed
+ * since the run bit; no try's handshake wait runs past it.
  */
 #define APPLE_NVME_SLEEP_ON_MS	15000
+/* Even a late try gets this long, so the whole wait ends within about 16 s. */
+#define APPLE_NVME_SLEEP_TRY_MIN_MS	1000
 
 /*
  * After a real sleep ANS has lost power, and its resident firmware restarts once the run bit
@@ -3024,10 +3026,13 @@ static int apple_nvme_resume_early(struct device *dev)
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv)
 {
 	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
+	s64 left;
 	int ret;
 
 	do {
-		ret = apple_rtkit_boot(anv->rtk);
+		left = APPLE_NVME_SLEEP_ON_MS - ktime_ms_delta(ktime_get(), anv->sleep_run_time);
+		left = max_t(s64, left, APPLE_NVME_SLEEP_TRY_MIN_MS);
+		ret = apple_rtkit_boot_by(anv->rtk, jiffies + msecs_to_jiffies(left));
 		if (ret != -ETIME)
 			break;
 		dev_warn(anv->dev, "ANS: not on %lld ms after the run bit, waiting again\n",
