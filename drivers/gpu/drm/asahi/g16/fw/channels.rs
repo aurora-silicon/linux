@@ -46,7 +46,10 @@ impl SubmitRecord {
     }
 }
 
-/// Device-control opcodes of the qualified 25G83 M4 firmware.
+/// Device-control opcodes of each supported M4 firmware ABI.
+///
+/// The host advances its generation word alongside the device-control producer for each posted
+/// record.
 pub(crate) mod devctl {
     /// Re-import Globals.
     pub(crate) const IMPORT_GLOBALS: u32 = 0x34;
@@ -56,6 +59,31 @@ pub(crate) mod devctl {
     pub(crate) const NOP: u32 = 0x1a;
     /// PB growth reply.
     pub(crate) const GROW_REPLY: u32 = 7;
+
+    /// The opcodes the host sends, in one firmware ABI.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Opcodes {
+        pub(crate) import_globals: u32,
+        pub(crate) start: u32,
+        pub(crate) nop: u32,
+        pub(crate) grow_reply: u32,
+    }
+
+    pub(crate) const V25G83: Opcodes = Opcodes {
+        import_globals: IMPORT_GLOBALS,
+        start: START,
+        nop: NOP,
+        grow_reply: GROW_REPLY,
+    };
+
+    /// 26B123 device-control opcodes (re-import Globals 0x35, start 0x0a, no-op 0x19,
+    /// PB growth reply 7).
+    pub(crate) const V26B123: Opcodes = Opcodes {
+        import_globals: 0x35,
+        start: 0x0a,
+        nop: 0x19,
+        grow_reply: 7,
+    };
 }
 
 /// A device-control record (0x40 bytes, opcode first).

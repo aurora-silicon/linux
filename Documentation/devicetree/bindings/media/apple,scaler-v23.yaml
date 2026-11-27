@@ -20,7 +20,9 @@ description: |
   resources. Each instance has its own DART; an advertised MSRn-DART
   gate belongs to that DART, rather than the scaler functional domains.
   Keep the device disabled until its firmware handoff, clocks,
-  power and reset ownership have been qualified.
+  power and reset ownership have been qualified. They have been on
+  T8142, whose firmware core the OS starts from the image the boot
+  loader pre-loads.
 
 properties:
   compatible:
@@ -59,15 +61,11 @@ properties:
   resets:
     maxItems: 1
 
-  status:
-    const: disabled
-
 required:
   - compatible
   - reg
   - interrupts
   - iommus
-  - status
 
 allOf:
   - if:
@@ -107,5 +105,19 @@ allOf:
         - clocks
         - power-domains
         - resets
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6050-scaler
+              - apple,t8152-scaler
+    then:
+      properties:
+        status:
+          const: disabled
+      required:
+        - status
 
 additionalProperties: false

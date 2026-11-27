@@ -20,8 +20,12 @@ use kernel::{
 };
 
 type Rv = fw::vertex::raw::RunVertexG14V13_5<'static>;
+type Rv13 = fw::vertex::raw::RunVertexG13V13_5<'static>;
 type Rf = fw::fragment::raw::RunFragmentG14V13_5<'static>;
+type Rf13 = fw::fragment::raw::RunFragmentG13V13_5<'static>;
 type Meta = fw::job::raw::JobMeta;
+
+const TILECTL_DISABLE_CLUSTERING: u32 = 1 << 0;
 
 pub(crate) const INITBUF_AT: usize = 0xf00;
 pub(crate) const OWN_BARRIER_AT: usize = 0xf40;
@@ -63,6 +67,9 @@ pub(crate) struct Prep {
     scene27: GpuArray<u8>,
     info_va: u64,
     usc: u64,
+    gpu_gen: crate::hw::GpuGen,
+    tiling_control: u32,
+    core_masks: [u32; 2],
     pub(crate) buffer_op: Option<BufferOp>,
 }
 
@@ -75,6 +82,17 @@ pub(crate) enum BufferOp {
 impl Prep {
     pub(crate) fn slot(&self) -> u32 {
         self.scene.slot()
+    }
+
+    /// Clears the tiler's TPC storage after a firmware recovery stopped the tiler.
+    /// Zeroes the scene's TPC after a firmware recovery stopped its tiler.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::buffer::Scene::clear_tpc`].
+    pub(crate) unsafe fn clear_tpc(&self) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.scene.clear_tpc(self.tile.tpc_size) }
     }
 }
 
@@ -92,6 +110,8 @@ fn to_cmdbuf(r: &UapiRenderCommand) -> kernel::uapi::drm_asahi_cmd_render {
     c.sample_size_B = r.sample_size;
     c.ppp_ctrl = r.ppp_control;
     c.ppp_multisamplectl = r.multisample_control;
+    // The tiling parameters carry the vertex helper's configuration, as in the 13.5 command.
+    c.vertex_helper.cfg = r.vertex_helper.config;
     c
 }
 
@@ -168,6 +188,13 @@ impl QueueRender {
         } else {
             None
         };
+        let cfg = <crate::gpu::GpuManagerG14V13_5 as crate::gpu::GpuManager>::get_cfg(&self.graph);
+        let dyncfg =
+            <crate::gpu::GpuManagerG14V13_5 as crate::gpu::GpuManager>::get_dyncfg(&self.graph);
+        let core_masks = [
+            *dyncfg.id.core_masks_packed.first().unwrap_or(&0),
+            *dyncfg.id.core_masks_packed.get(1).unwrap_or(&0),
+        ];
         Ok(Prep {
             scene,
             aux_fb,
@@ -175,6 +202,9 @@ impl QueueRender {
             scene27,
             info_va: binding.info.gpu_va().get(),
             usc,
+            gpu_gen: cfg.gpu_gen,
+            tiling_control: cfg.render.tiling_control | TILECTL_DISABLE_CLUSTERING,
+            core_masks,
             buffer_op,
         })
     }
@@ -224,7 +254,8 @@ fn header(b: &mut [u8], kind: u32, c: &Common) {
     put64(b, 0x10, c.tracking);
 }
 
-/// Write the destinations used by both internal timestamp paths.
+/// Write the destinations used by both internal timestamp paths. `user` names the command's
+/// pair of user destinations, or is 0 ([`crate::g14_v27_2_abi::user_timestamp_pointer`]).
 fn timestamp_op(
     s: &mut [u8],
     at: usize,
@@ -234,7 +265,7 @@ fn timestamp_op(
     ts_pointers: u64,
     internal0: u64,
     internal1: u64,
-    user: [u64; 2],
+    user: u64,
 ) {
     put32(s, at, if start { 0x8000_0003 } else { 3 });
     put64(s, at + 0x04, command_time);
@@ -245,7 +276,7 @@ fn timestamp_op(
         if start { ts_pointers } else { ts_pointers + 8 },
     );
     put64(s, at + 0x1c, q.queue);
-    put64(s, at + 0x24, user[usize::from(!start)]);
+    put64(s, at + 0x24, user);
     put64(s, at + 0x2c, internal0);
     put64(s, at + 0x34, internal1);
 }
@@ -285,7 +316,6 @@ pub(crate) fn encode_vertex(
     timestamps: [u64; 2],
     attachments: &Attachments,
 ) -> Result {
-    let jp1 = |field: usize| 0x38 + field - offset_of!(Rv, job_params1);
     let jp2 = |field: usize| 0x488 + field - offset_of!(Rv, job_params2);
     header(cmd, 0, c);
     let scene = &p.scene;
@@ -304,87 +334,111 @@ pub(crate) fn encode_vertex(
     put64(cmd, 0x20, info_va);
     put64(cmd, 0x28, scene_va);
     put64(cmd, 0x30, scene.kernel_buffer_pointer().into());
-    // JobParameters1 at 0x38, 13.5 G14 internal layout.
-    put64(cmd, jp1(offset_of!(Rv, job_params1.unk_0)), 0x200);
-    put32(cmd, jp1(offset_of!(Rv, job_params1.unk_8)), 0x1e3c_e508);
-    put32(cmd, jp1(offset_of!(Rv, job_params1.unk_c)), 0x1e3c_e508);
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.tvb_tilemap)),
-        scene.tvb_tilemap_pointer().into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.tpc)),
-        scene.tpc_pointer().into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.tvb_heapmeta)),
-        scene
-            .tvb_heapmeta_pointer()
-            .or(0x8000_0000_0000_0000)
-            .into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.iogpu_unk_54)),
-        0x3a_0012_006b_0003,
-    );
-    put64(cmd, jp1(offset_of!(Rv, job_params1.iogpu_unk_56)), 1);
-    put32(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.utile_config)),
-        utile_config,
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.ppp_multisamplectl)),
-        r.multisample_control,
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.tvb_layermeta)),
-        scene.tvb_layermeta_pointer().into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.preempt_buf1)),
-        scene.preempt_buf_1_pointer().into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.preempt_buf2)),
-        scene.preempt_buf_2_pointer().into(),
-    );
-    put64(cmd, jp1(offset_of!(Rv, job_params1.unk_80)), 1);
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.preempt_buf3)),
-        scene.preempt_buf_3_pointer().or(0x4_0000_0000_0000).into(),
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.vdm_ctrl_stream_base)),
-        r.vdm_base,
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.usc_exec_base_ta)),
-        p.usc,
-    );
-    put64(cmd, jp1(offset_of!(Rv, job_params1.unk_f8)), 0x8c60);
-    put32(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.helper_program)),
-        r.vertex_helper.binary,
-    );
-    put64(
-        cmd,
-        jp1(offset_of!(Rv, job_params1.helper_arg)),
-        r.vertex_helper.data,
-    );
-    put32(cmd, jp1(offset_of!(Rv, job_params1.unk_118)), 0x1c);
+    // JobParameters1 at 0x38, 13.5 G13 or G14 internal layout.
+    macro_rules! write_vtx_jp1 {
+        ($R:ty) => {{
+            let jp1 = |field: usize| 0x38 + field - offset_of!($R, job_params1);
+            put64(cmd, jp1(offset_of!($R, job_params1.unk_0)), 0x200);
+            put32(cmd, jp1(offset_of!($R, job_params1.unk_8)), 0x1e3c_e508);
+            put32(cmd, jp1(offset_of!($R, job_params1.unk_c)), 0x1e3c_e508);
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.tvb_tilemap)),
+                scene.tvb_tilemap_pointer().into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.tpc)),
+                scene.tpc_pointer().into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.tvb_heapmeta)),
+                scene
+                    .tvb_heapmeta_pointer()
+                    .or(0x8000_0000_0000_0000)
+                    .into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.iogpu_unk_54)),
+                0x3a_0012_006b_0003,
+            );
+            put64(cmd, jp1(offset_of!($R, job_params1.iogpu_unk_56)), 1);
+            put32(
+                cmd,
+                jp1(offset_of!($R, job_params1.utile_config)),
+                utile_config,
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.ppp_multisamplectl)),
+                r.multisample_control,
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.tvb_layermeta)),
+                scene.tvb_layermeta_pointer().into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.preempt_buf1)),
+                scene.preempt_buf_1_pointer().into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.preempt_buf2)),
+                scene.preempt_buf_2_pointer().into(),
+            );
+            put64(cmd, jp1(offset_of!($R, job_params1.unk_80)), 1);
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.preempt_buf3)),
+                scene.preempt_buf_3_pointer().or(0x4_0000_0000_0000).into(),
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.vdm_ctrl_stream_base)),
+                r.vdm_base,
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.usc_exec_base_ta)),
+                p.usc,
+            );
+            put64(cmd, jp1(offset_of!($R, job_params1.unk_f8)), 0x8c60);
+            put32(
+                cmd,
+                jp1(offset_of!($R, job_params1.helper_program)),
+                r.vertex_helper.binary,
+            );
+            put64(
+                cmd,
+                jp1(offset_of!($R, job_params1.helper_arg)),
+                r.vertex_helper.data,
+            );
+            put32(cmd, jp1(offset_of!($R, job_params1.unk_118)), 0x1c);
+        }};
+    }
+    if p.gpu_gen == crate::hw::GpuGen::G13 {
+        write_vtx_jp1!(Rv13);
+        let jp1 = |field: usize| 0x38 + field - offset_of!(Rv13, job_params1);
+        let mask_off = jp1(offset_of!(Rv13, job_params1.core_mask));
+        put32(cmd, mask_off, p.core_masks[0]);
+        put32(cmd, mask_off + 4, p.core_masks[1]);
+        put32(
+            cmd,
+            jp1(offset_of!(Rv13, job_params1.tiling_control)),
+            p.tiling_control,
+        );
+        put64(
+            cmd,
+            jp1(offset_of!(Rv13, job_params1.unk_f0)),
+            0x1c + u64::from(crate::util::align(p.tile.meta1_blocks, 4)),
+        );
+    } else {
+        write_vtx_jp1!(Rv);
+    }
     // Tiling parameters at 0x3bc (13.5 block), + the new word at +0x30.
     {
         let at = 0x3bc;
@@ -430,6 +484,7 @@ pub(crate) fn encode_vertex(
     put64(cmd, 0x5dc, c.timestamps + 8);
     put64(cmd, 0x5e4, timestamps[0]);
     put64(cmd, 0x5ec, timestamps[1]);
+    let user = crate::g14_v27_2_abi::user_timestamp_pointer(c.cmd_va + 0x5e4, timestamps);
     let internal0 = c.cmd_va + 0x61c;
     let internal1 = c.cmd_va + 0x538;
     let flag = c.cmd_va + 0x568;
@@ -469,7 +524,7 @@ pub(crate) fn encode_vertex(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     put32(s, 0x1e8, 0x0000_0100);
     timestamp_op(
@@ -481,7 +536,7 @@ pub(crate) fn encode_vertex(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     let fin = 0x238;
     put32(s, fin, 6);
@@ -614,140 +669,150 @@ pub(crate) fn encode_fragment(
     w32(cmd, offset_of!(Rf, isp_merge_upper_x), r.merge_upper_x);
     w32(cmd, offset_of!(Rf, isp_merge_upper_y), r.merge_upper_y);
     w64(cmd, offset_of!(Rf, tile_count), u64::from(p.tile.tiles));
-    // Job parameters 1.
-    w32(cmd, offset_of!(Rf, job_params1.utile_config), utile_config);
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.bg.rsrc_spec),
-        r.background.resource_spec,
-    );
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.bg.address),
-        u64::from(r.background.usc),
-    );
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.ppp_multisamplectl),
-        r.multisample_control,
-    );
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.isp_scissor_base),
-        r.scissor_base,
-    );
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.isp_dbias_base),
-        r.depth_bias_base,
-    );
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.isp_oclqry_base),
-        r.occlusion_query_base,
-    );
-    for base in [
-        offset_of!(Rf, job_params1.aux_fb_info),
-        offset_of!(Rf, job_params3.aux_fb_info),
-    ] {
-        w32(cmd, base, isp_ctl);
-        w32(cmd, base + 8, u32::from(r.width));
-        w32(cmd, base + 0xc, u32::from(r.height));
-        w64(cmd, base + 0x10, 0x10_0000);
+    // Job parameters 1 (13.5 G13 or G14 internal layout).
+    let g13 = p.gpu_gen == crate::hw::GpuGen::G13;
+    macro_rules! write_frag_jp1 {
+        ($R:ty) => {{
+            w32(cmd, offset_of!($R, job_params1.utile_config), utile_config);
+            w64(
+                cmd,
+                offset_of!($R, job_params1.bg.rsrc_spec),
+                r.background.resource_spec,
+            );
+            w64(
+                cmd,
+                offset_of!($R, job_params1.bg.address),
+                u64::from(r.background.usc),
+            );
+            w64(
+                cmd,
+                offset_of!($R, job_params1.ppp_multisamplectl),
+                r.multisample_control,
+            );
+            w64(
+                cmd,
+                offset_of!($R, job_params1.isp_scissor_base),
+                r.scissor_base,
+            );
+            w64(
+                cmd,
+                offset_of!($R, job_params1.isp_dbias_base),
+                r.depth_bias_base,
+            );
+            w64(
+                cmd,
+                offset_of!($R, job_params1.isp_oclqry_base),
+                r.occlusion_query_base,
+            );
+            for base in [
+                offset_of!($R, job_params1.aux_fb_info),
+                offset_of!($R, job_params3.aux_fb_info),
+            ] {
+                w32(cmd, base, isp_ctl);
+                w32(cmd, base + 8, u32::from(r.width));
+                w32(cmd, base + 0xc, u32::from(r.height));
+                w64(cmd, base + 0x10, 0x10_0000);
+            }
+            w64(
+                cmd,
+                offset_of!($R, job_params1.isp_zls_pixels),
+                u64::from(r.depth_dimensions),
+            );
+            w64(cmd, offset_of!($R, job_params1.zls_ctrl), r.zls_control);
+            for (o, v) in [
+                (offset_of!($R, job_params1.z_load), r.depth.base),
+                (offset_of!($R, job_params1.z_store), r.depth.base),
+                (offset_of!($R, job_params1.s_load), r.stencil.base),
+                (offset_of!($R, job_params1.s_store), r.stencil.base),
+                (
+                    offset_of!($R, job_params1.z_load_stride),
+                    u64::from(r.depth.stride),
+                ),
+                (
+                    offset_of!($R, job_params1.z_store_stride),
+                    u64::from(r.depth.stride),
+                ),
+                (
+                    offset_of!($R, job_params1.s_load_stride),
+                    u64::from(r.stencil.stride),
+                ),
+                (
+                    offset_of!($R, job_params1.s_store_stride),
+                    u64::from(r.stencil.stride),
+                ),
+                (
+                    offset_of!($R, job_params1.z_load_comp),
+                    r.depth.compression_base,
+                ),
+                (
+                    offset_of!($R, job_params1.z_load_comp_stride),
+                    u64::from(r.depth.compression_stride),
+                ),
+                (
+                    offset_of!($R, job_params1.z_store_comp),
+                    r.depth.compression_base,
+                ),
+                (
+                    offset_of!($R, job_params1.z_store_comp_stride),
+                    u64::from(r.depth.compression_stride),
+                ),
+                (
+                    offset_of!($R, job_params1.s_load_comp),
+                    r.stencil.compression_base,
+                ),
+                (
+                    offset_of!($R, job_params1.s_load_comp_stride),
+                    u64::from(r.stencil.compression_stride),
+                ),
+                (
+                    offset_of!($R, job_params1.s_store_comp),
+                    r.stencil.compression_base,
+                ),
+                (
+                    offset_of!($R, job_params1.s_store_comp_stride),
+                    u64::from(r.stencil.compression_stride),
+                ),
+                (
+                    offset_of!($R, job_params1.tvb_tilemap),
+                    scene.tvb_tilemap_pointer().into(),
+                ),
+                (
+                    offset_of!($R, job_params1.tvb_layermeta),
+                    scene.tvb_layermeta_pointer().into(),
+                ),
+                (
+                    offset_of!($R, job_params1.mtile_stride_dwords),
+                    (4 * rgn_size) << 24,
+                ),
+                (
+                    offset_of!($R, job_params1.tvb_heapmeta),
+                    scene.tvb_heapmeta_pointer().into(),
+                ),
+                (offset_of!($R, job_params1.tile_config), tile_config),
+                (offset_of!($R, job_params1.aux_fb), p.aux_fb.gpu_va().get()),
+                (offset_of!($R, job_params1.usc_exec_base_isp), p.usc),
+                (offset_of!($R, job_params1.unk_140), 0x8c60),
+                (
+                    offset_of!($R, job_params1.helper_arg),
+                    r.fragment_helper.data,
+                ),
+                (offset_of!($R, job_params1.unk_158), 0x1c),
+            ] {
+                w64(cmd, o, v);
+            }
+            w32(
+                cmd,
+                offset_of!($R, job_params1.helper_program),
+                r.fragment_helper.binary,
+            );
+        }};
     }
-    w64(
-        cmd,
-        offset_of!(Rf, job_params1.isp_zls_pixels),
-        u64::from(r.depth_dimensions),
-    );
-    w64(cmd, offset_of!(Rf, job_params1.zls_ctrl), r.zls_control);
-    w64(cmd, offset_of!(Rf, job_params1.unk_58_g14_0), 0x404_0404);
-    for (o, v) in [
-        (offset_of!(Rf, job_params1.z_load), r.depth.base),
-        (offset_of!(Rf, job_params1.z_store), r.depth.base),
-        (offset_of!(Rf, job_params1.s_load), r.stencil.base),
-        (offset_of!(Rf, job_params1.s_store), r.stencil.base),
-        (
-            offset_of!(Rf, job_params1.z_load_stride),
-            u64::from(r.depth.stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.z_store_stride),
-            u64::from(r.depth.stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.s_load_stride),
-            u64::from(r.stencil.stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.s_store_stride),
-            u64::from(r.stencil.stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.z_load_comp),
-            r.depth.compression_base,
-        ),
-        (
-            offset_of!(Rf, job_params1.z_load_comp_stride),
-            u64::from(r.depth.compression_stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.z_store_comp),
-            r.depth.compression_base,
-        ),
-        (
-            offset_of!(Rf, job_params1.z_store_comp_stride),
-            u64::from(r.depth.compression_stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.s_load_comp),
-            r.stencil.compression_base,
-        ),
-        (
-            offset_of!(Rf, job_params1.s_load_comp_stride),
-            u64::from(r.stencil.compression_stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.s_store_comp),
-            r.stencil.compression_base,
-        ),
-        (
-            offset_of!(Rf, job_params1.s_store_comp_stride),
-            u64::from(r.stencil.compression_stride),
-        ),
-        (
-            offset_of!(Rf, job_params1.tvb_tilemap),
-            scene.tvb_tilemap_pointer().into(),
-        ),
-        (
-            offset_of!(Rf, job_params1.tvb_layermeta),
-            scene.tvb_layermeta_pointer().into(),
-        ),
-        (
-            offset_of!(Rf, job_params1.mtile_stride_dwords),
-            (4 * rgn_size) << 24,
-        ),
-        (
-            offset_of!(Rf, job_params1.tvb_heapmeta),
-            scene.tvb_heapmeta_pointer().into(),
-        ),
-        (offset_of!(Rf, job_params1.tile_config), tile_config),
-        (offset_of!(Rf, job_params1.aux_fb), p.aux_fb.gpu_va().get()),
-        (offset_of!(Rf, job_params1.usc_exec_base_isp), p.usc),
-        (offset_of!(Rf, job_params1.unk_140), 0x8c60),
-        (
-            offset_of!(Rf, job_params1.helper_arg),
-            r.fragment_helper.data,
-        ),
-        (offset_of!(Rf, job_params1.unk_158), 0x1c),
-    ] {
-        w64(cmd, o, v);
+    if g13 {
+        write_frag_jp1!(Rf13);
+    } else {
+        write_frag_jp1!(Rf);
+        w64(cmd, offset_of!(Rf, job_params1.unk_58_g14_0), 0x404_0404);
     }
-    w32(
-        cmd,
-        offset_of!(Rf, job_params1.helper_program),
-        r.fragment_helper.binary,
-    );
     // Job parameters 2, + the new JP2+0x44 = buffer slot (cmd+0x40c).
     w32(
         cmd,
@@ -789,7 +854,7 @@ pub(crate) fn encode_fragment(
     w32(
         cmd,
         offset_of!(Rf, job_params2.isp_bgobjvals),
-        r.stencil_clear,
+        if g13 { r.stencil_clear | 0x400 } else { r.stencil_clear },
     );
     w32(cmd, offset_of!(Rf, job_params2.unk_3c), 1);
     w32(
@@ -829,7 +894,10 @@ pub(crate) fn encode_fragment(
             u64::from(r.partial_background.usc),
         ),
         (offset_of!(Rf, job_params3.zls_ctrl), r.zls_control),
-        (offset_of!(Rf, job_params3.unk_290), 0x404_0404),
+        (
+            offset_of!(Rf, job_params3.unk_290),
+            if g13 { 0 } else { 0x404_0404 },
+        ),
         (offset_of!(Rf, job_params3.z_load), r.depth.base),
         (
             offset_of!(Rf, job_params3.z_partial_stride),
@@ -933,6 +1001,7 @@ pub(crate) fn encode_fragment(
     let ts = va(frag_at(offset_of!(Rf, timestamp_pointers)));
     put64(cmd, 0x948, timestamps[0]);
     put64(cmd, 0x950, timestamps[1]);
+    let user = crate::g14_v27_2_abi::user_timestamp_pointer(va(0x948), timestamps);
     let internal0 = va(0x980);
     let internal1 = va(0x89c);
     let (jp1, jp2) = (va(0x80), va(0x3c8));
@@ -989,7 +1058,7 @@ pub(crate) fn encode_fragment(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     put32(s, 0x200, 0x0001_0000); // wait for the fragment pipe
     timestamp_op(
@@ -1001,7 +1070,7 @@ pub(crate) fn encode_fragment(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     // op 8 FinalizeFragment (0xbc).
     let fin = 0x250;

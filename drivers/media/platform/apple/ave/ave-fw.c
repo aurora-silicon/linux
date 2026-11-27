@@ -185,9 +185,9 @@ int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 
 /*
  * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
- * with the per-boot word zeroed (the M4 Max and M4 27.2 builds).
+ * with the build's per-boot word at @word_off zeroed.
  */
-static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
+static int ave_fw_text_boot_id(struct ave_dev *ave, u32 word_off, u32 *crc)
 {
 	void *va;
 	int ret;
@@ -197,20 +197,20 @@ static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
 	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
 	if (!va)
 		return -ENOMEM;
-	ret = ave_fw_text_boot_crc(va, ave->text.size,
-				   ave->variant->text_boot_word, crc);
+	ret = ave_fw_text_boot_crc(va, ave->text.size, word_off, crc);
 	memunmap(va);
 	return ret;
 }
 
-static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
+static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
+			  u32 *crc)
 {
 	void *va;
 	int ret;
 
 	if (!ave->variant->text_link_cell)
-		return ave->variant->text_boot_word ?
-			       ave_fw_text_boot_id(ave, crc) : 0;
+		return build && build->text_boot_word ?
+			       ave_fw_text_boot_id(ave, build->text_boot_word, crc) : 0;
 	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
 	if (!va)
 		return -ENOMEM;
@@ -243,9 +243,7 @@ bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data)
 {
 	if (v->build_count)
 		return ave_fw_find_build(v, text, data, 0);
-	return text == v->fw_text_size &&
-	       (data == v->fw_data_size ||
-		(v->fw_data_size_alt && data == v->fw_data_size_alt));
+	return text == v->fw_text_size && data == v->fw_data_size;
 }
 
 /*
@@ -337,7 +335,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
-	ret = ave_fw_text_id(ave, &text_crc);
+	ret = ave_fw_text_id(ave, build, &text_crc);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");

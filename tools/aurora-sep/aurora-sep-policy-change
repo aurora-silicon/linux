@@ -36,6 +36,7 @@ root, and never adds the record to Linux's list. See XART-SAFETY.md.
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -57,8 +58,11 @@ HOST_FILES = (
 )
 FPRINT = "/var/lib/fprint"
 
-REFUSED = re.compile(r"xART guard: refused to rewrite kind-([34]) record ([0-9a-f]{32})")
-BASE = re.compile(r"xART: APFS-resolved \.gl extent \(base (0x[0-9a-f]+)\)")
+# Matched at the start of the driver's own messages only (kernel_log): a line
+# anyone can get into the kernel log (a USB product string, say) is not one.
+REFUSED = re.compile(r"^xART guard: refused to rewrite kind-([34]) record ([0-9a-f]{32}),", re.M)
+BASE = re.compile(r"^xART: APFS-resolved \.gl extent \(base (0x[0-9a-f]+)\);", re.M)
+DRIVER = "apple_sep"
 
 
 def die(msg):
@@ -70,13 +74,51 @@ def say(msg):
     print(f"aurora-sep-policy-change: {msg}")
 
 
+def driver_message(entry):
+    """The text of one journal entry if the apple_sep driver logged it, else None.
+
+    Its device messages carry the SEP platform device in the journal's
+    kernel fields and start "apple_sep <device>: "; its messages without a
+    device start "apple_sep: ". The prefix is removed.
+
+    The journal's kernel transport also carries what processes write to
+    /dev/kmsg; only the kernel's own messages have facility 0 there."""
+    if not isinstance(entry, dict) or entry.get("_TRANSPORT") != "kernel":
+        return None
+    if entry.get("SYSLOG_FACILITY") != "0":
+        return None
+    msg = entry.get("MESSAGE")
+    if not isinstance(msg, str):
+        return None
+    device = entry.get("_KERNEL_DEVICE")
+    if device is None:
+        prefix = f"{DRIVER}: "
+    else:
+        if not isinstance(device, str) or not device.startswith("+platform:"):
+            return None
+        name = device[len("+platform:"):]
+        if entry.get("_KERNEL_SUBSYSTEM") != "platform" or not name.endswith(".sep"):
+            return None
+        prefix = f"{DRIVER} {name}: "
+    return msg[len(prefix):] if msg.startswith(prefix) else None
+
+
 def kernel_log():
+    """This boot's apple_sep messages, one per line, without the driver prefix."""
     out = subprocess.run(
-        ["journalctl", "-k", "-b", "-o", "cat", "--no-pager", "-g", "apple_sep|xART"],
+        ["journalctl", "-k", "-b", "-o", "json", "--no-pager", "-g", "apple_sep|xART"],
         capture_output=True,
         text=True,
     )
-    return out.stdout
+    lines = []
+    for raw in out.stdout.splitlines():
+        try:
+            msg = driver_message(json.loads(raw))
+        except ValueError:
+            continue
+        if msg is not None:
+            lines.append(msg.rstrip("\n"))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def entry(kind, uuid):
@@ -174,7 +216,7 @@ def status(log):
         say(f"refused this boot: kind-{kind} record {uuid}")
     for line in log.splitlines():
         if "one-time rewrite" in line or "one-time allowance" in line:
-            say("this boot: " + line.split("apple_sep: ")[-1])
+            say("this boot: " + line)
 
 
 def main(argv):

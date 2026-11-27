@@ -40,6 +40,15 @@ use crate::{
     m3::m3_submit::{Command, Packet},
 };
 
+/// The recovery handshake is the one G16 answers: share its decisions (which phase the host may
+/// answer, how a snapshot entry decodes, the recovery-storm window) instead of restating them.
+/// Its FirmwareData offsets are G16's own and unused here.
+#[path = "g16/recovery/logic.rs"]
+#[allow(dead_code)]
+mod recovery_logic;
+use recovery_logic::{RecoveryAction, SnapshotEntry};
+use crate::g14_v27_2_abi::{self, Stopped};
+
 /// RTKit endpoints of the GPU firmware.
 const EP_FIRMWARE: u8 = 0x20;
 const EP_DOORBELL: u8 = 0x21;
@@ -47,6 +56,59 @@ const EP_DOORBELL: u8 = 0x21;
 /// ASC CPU control register and its run bit.
 const ASC_CPU_CONTROL: usize = 0x44;
 const ASC_RUN: u32 = 0x10;
+
+#[cfg(CONFIG_APPLE_SOC_SLEEP)]
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    fn apple_sleep_commit_stops_coprocs() -> bool;
+    fn apple_sleep_coproc_register_first(
+        dev: *mut kernel::bindings::device,
+        last_stop: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int>,
+        data: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int;
+    fn apple_sleep_coproc_set_ready(dev: *mut kernel::bindings::device, ready: bool);
+    fn apple_sleep_coproc_stopped(dev: *mut kernel::bindings::device) -> bool;
+    fn apple_sleep_coproc_wake_error(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn apple_sleep_coproc_unregister(dev: *mut kernel::bindings::device);
+}
+
+#[cfg(CONFIG_APPLE_SOC_SLEEP)]
+struct CommitStop {
+    rtk: *mut kernel::bindings::apple_rtkit,
+    asc_ctl: *mut u8,
+    ran: bool,
+    idle_ret: core::ffi::c_int,
+    idle_us: u32,
+}
+
+#[cfg(CONFIG_APPLE_SOC_SLEEP)]
+// SAFETY: Owned by `State` under `Runtime::state`; read and written in the commit callback with
+// interrupts off on the single boot CPU.
+unsafe impl Send for CommitStop {}
+
+#[cfg(CONFIG_APPLE_SOC_SLEEP)]
+unsafe extern "C" fn g14_v27_2_commit_stop(data: *mut core::ffi::c_void) -> core::ffi::c_int {
+    // SAFETY: `data` points to the heap-allocated `CommitStop` owned by `State::commit_stop`
+    // until `sleep_complete` (or `stop`) unregisters this callback.
+    let c = unsafe { &mut *data.cast::<CommitStop>() };
+    c.ran = true;
+    // SAFETY: `rtk` and `asc_ctl` remain mapped and live for the boot; runs at commit time with
+    // interrupts off and all refusals behind it.
+    unsafe {
+        c.idle_ret = kernel::bindings::apple_rtkit_sleep_idle_polled(
+            c.rtk,
+            c.asc_ctl.cast(),
+            &mut c.idle_us,
+        );
+        if c.idle_ret != 0 {
+            return c.idle_ret;
+        }
+        kernel::bindings::apple_rtkit_mailbox_recv_off(c.rtk);
+        let ctl = kernel::bindings::readl(c.asc_ctl.cast());
+        kernel::bindings::writel(ctl & !ASC_RUN, c.asc_ctl.cast());
+    }
+    0
+}
 
 /// Commands slower than this are a hang; the firmware state is then not trusted.
 const COMMAND_TIMEOUT_MS: i64 = 5000;
@@ -58,6 +120,20 @@ const RETIRE_WAIT_US: i64 = 2000;
 const RESOURCE_RETRY_MS: u32 = 10;
 /// Work item for the poll. Ordinary firmware notifications can still queue immediate work.
 const RETRY_WORK: u64 = 1;
+/// The firmware's recovery handshake (the G16/M3 order and limits): phase 1 follows the error
+/// event within 50 ms; the whole handshake within 1 s; then the stopped work leaves its queue.
+const PHASE1_WAIT_MS: i64 = 50;
+const HANDSHAKE_MS: i64 = 1000;
+const RECOVERY_DRAIN_MS: i64 = 1000;
+/// Further recoveries answered while the stopped work drains (work behind it can time out in
+/// turn) before the runtime gives up.
+const FURTHER_RECOVERIES: u32 = 4;
+/// Event ring record kinds kept for the logs of a timeout or a recovery.
+const EVENT_HISTORY: usize = 8;
+/// Rounds start only within this budget; one round takes at most PHASE1_WAIT_MS +
+/// HANDSHAKE_MS + RECOVERY_DRAIN_MS, so the lock is released well within the 10 s scheduler
+/// job timeout.
+const RECOVERY_BUDGET_MS: i64 = 5000;
 
 struct FirmwareWait {
     since: Instant<Monotonic>,
@@ -82,19 +158,28 @@ impl FirmwareWait {
     }
 }
 
-/// The ASC control page, kept mapped until the firmware is stopped.
-pub(crate) struct AscControl(*mut u8);
-// SAFETY: a device register page; accesses are single 32-bit MMIO operations.
+/// The ASC control page and Fender operating-point page, kept mapped until the firmware is stopped.
+pub(crate) struct AscControl(*mut u8, *mut u8);
+// SAFETY: device register pages; accesses are single 32-bit MMIO operations.
 unsafe impl Send for AscControl {}
 // SAFETY: as above.
 unsafe impl Sync for AscControl {}
 
 impl AscControl {
-    fn new(phys: u64) -> Result<Self> {
-        // SAFETY: `phys` is the ASC register window of this platform device.
-        let ptr = unsafe { kernel::bindings::ioremap(phys, 0x4000) };
+    fn new(phys: u64, sgx: u64) -> Result<Self> {
+        // SAFETY: `phys` is the ASC register window of this platform device. Apple SoC fabrics
+        // require non-posted MMIO (`nonposted-mmio`); a posted write to ASC_CPU_CONTROL resets
+        // T8103 immediately.
+        let ptr = unsafe { kernel::bindings::ioremap_np(phys, 0x4000) };
         if ptr.is_null() { return Err(ENOMEM); }
-        Ok(Self(ptr.cast()))
+        // SAFETY: `sgx + 0xd01000` is the Fender operating-point register inside the SGX window.
+        let fender = unsafe { kernel::bindings::ioremap_np(sgx + 0xd01000, 0x1000) };
+        if fender.is_null() {
+            // SAFETY: mapped above.
+            unsafe { kernel::bindings::iounmap(ptr) };
+            return Err(ENOMEM);
+        }
+        Ok(Self(ptr.cast(), fender.cast()))
     }
     fn read(&self, at: usize) -> u32 {
         // SAFETY: `at` is a register offset inside the mapped page.
@@ -103,6 +188,10 @@ impl AscControl {
     fn write(&self, at: usize, value: u32) {
         // SAFETY: as above.
         unsafe { kernel::bindings::writel(value, self.0.add(at).cast()) }
+    }
+    fn fender(&self) -> u32 {
+        // SAFETY: mapped Fender register page.
+        unsafe { kernel::bindings::readl(self.1.cast()) }
     }
     /// Clears the ASC run bit.
     fn halt(&self) {
@@ -113,8 +202,21 @@ impl AscControl {
 impl Drop for AscControl {
     fn drop(&mut self) {
         // SAFETY: mapped in `new`, unmapped once.
-        unsafe { kernel::bindings::iounmap(self.0.cast()) }
+        unsafe {
+            kernel::bindings::iounmap(self.1.cast());
+            kernel::bindings::iounmap(self.0.cast());
+        }
     }
+}
+
+/// Whether a Fender word says the GPU is powered: a nonzero index and no request pending.
+fn gpu_powered(fender: u32) -> bool {
+    fender & 0x10 == 0 && fender & 0xf != 0
+}
+
+/// Whether a Fender word says the GPU is powered off: zero index and no request pending.
+fn gpu_powered_off(fender: u32) -> bool {
+    fender & 0x1f == 0
 }
 
 /// The GPU MMU fault status, read when a command times out: a pending fault names the faulting
@@ -138,7 +240,7 @@ impl FaultStatus {
             return Err(EINVAL);
         }
         // SAFETY: the page lies inside this platform device's SGX register window.
-        let page = unsafe { kernel::bindings::ioremap(sgx + base as u64, 0x1000) };
+        let page = unsafe { kernel::bindings::ioremap_np(sgx + base as u64, 0x1000) };
         if page.is_null() { return Err(ENOMEM); }
         Ok(Self { page: page.cast(), info: info - base, addr: addr.map(|a| a - base), g14x })
     }
@@ -191,14 +293,16 @@ impl Notify {
     /// Queues one service run if a runtime is attached. A run already queued covers this one.
     fn wake(&self) {
         if let Some(runtime) = self.runtime.lock().as_ref() {
-            let _ = runtime.queue.enqueue::<Arc<Runtime>, 0>(runtime.clone());
+            if !runtime.deep_sleeping.load(Ordering::Acquire) {
+                let _ = runtime.queue.enqueue::<Arc<Runtime>, 0>(runtime.clone());
+            }
         }
     }
 
     /// Queues a poll while attached. Detaching also fences off poll requests before teardown.
     fn retry(&self) {
         if let Some(runtime) = self.runtime.lock().as_ref() {
-            if runtime.healthy() {
+            if runtime.healthy() && !runtime.deep_sleeping.load(Ordering::Acquire) {
                 let _ = runtime.queue.enqueue_delayed::<Arc<Runtime>, RETRY_WORK>(
                     runtime.clone(), msecs_to_jiffies(RESOURCE_RETRY_MS),
                 );
@@ -208,6 +312,14 @@ impl Notify {
 
     fn attach(&self, runtime: Arc<Runtime>) {
         *self.runtime.lock() = Some(runtime);
+    }
+
+    /// Toggles `deep_sleeping` under the same lock that guards `wake` and `retry`, so no
+    /// notification can race a queue drain after this returns with `deep == true`.
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    fn set_deep_sleeping(&self, runtime: &Runtime, deep: bool) {
+        let _guard = self.runtime.lock();
+        runtime.deep_sleeping.store(deep, Ordering::Release);
     }
 
     /// After this returns, nothing queues service work.
@@ -272,11 +384,27 @@ fn wait(root: &RootV27_2, ms: i64, mut done: impl FnMut() -> Result<bool>) -> Re
 }
 
 /// Publishes an idle-policy record and waits until the firmware has consumed and
+/// acknowledged it. On error, returns `(published, err)` where `published` is true if the
+/// control record was already written to shared memory before the failure.
+fn try_set_idle_policy(
+    root: &RootV27_2,
+    peer: &mut Peer,
+    allow_off: bool,
+) -> core::result::Result<(), (bool, Error)> {
+    let (target, generation) = root.publish_idle_policy(allow_off).map_err(|e| (false, e))?;
+    peer.as_mut()
+        .send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)
+        .map_err(|e| (true, e))?;
+    wait(root, 3000, || {
+        Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation)
+    })
+    .map_err(|e| (true, e))
+}
+
+/// Publishes an idle-policy record and waits until the firmware has consumed and
 /// acknowledged it.
 fn set_idle_policy(root: &RootV27_2, peer: &mut Peer, allow_off: bool) -> Result {
-    let (target, generation) = root.publish_idle_policy(allow_off)?;
-    peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)?;
-    wait(root, 500, || Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation))
+    try_set_idle_policy(root, peer, allow_off).map_err(|(_, e)| e)
 }
 
 /// Stops firmware that no runtime owns: allow power-off, then RTKit power-off, then the ASC
@@ -314,7 +442,8 @@ pub(crate) fn start<'a>(
     let dev: &device::Device = pdev.as_ref();
     let geometry = mmu::UatGeometry { ias: cfg.uat_ias, oas: cfg.uat_oas };
     let mut window = mmu::FirmwareWindow::reserve(dev, geometry)?;
-    let asc = AscControl::new(pdev.resource_by_name(c"asc").ok_or(EINVAL)?.start())?;
+    let sgx = pdev.resource_by_name(c"sgx").ok_or(EINVAL)?;
+    let asc = AscControl::new(pdev.resource_by_name(c"asc").ok_or(EINVAL)?.start(), sgx.start())?;
     let control = asc.read(ASC_CPU_CONTROL);
     if control & ASC_RUN != 0 { return Err(EBUSY); }
     let notify = Notify::new(dev)?;
@@ -322,7 +451,6 @@ pub(crate) fn start<'a>(
         rtkit::RtKit::<Firmware>::new(dev, None, 0, notify.clone())?,
         GFP_KERNEL)?;
     let resources = crate::regs::Resources::new(pdev)?;
-    let sgx = pdev.resource_by_name(c"sgx").ok_or(EINVAL)?;
     let fault = FaultStatus::new(sgx.start(), cfg)?;
     let copy_bytes: u32 = dev.fwnode().ok_or(ENODEV)?
         .property_read(c"apple,coredump-copy-buffer").required_by(dev)?;
@@ -340,6 +468,9 @@ pub(crate) fn start<'a>(
                                                 gpu::GraphProfile::G14V27_2)?;
     let root = RootV27_2::build(&graph, &board)?;
     let pool = CommandPool::new(&mut gpu::GpuManager::alloc(&*graph), cfg)?;
+    // Timestamp buffers are bound in the timestamp aperture while the firmware runs, and the
+    // window only carries the tables that exist now: link the aperture's tables first.
+    graph.kernel_uat().prepare_kernel_tables(&[graph.timestamp_range()])?;
     window.mirror(graph.kernel_uat())?;
     window.install()?;
     window.announce();
@@ -390,6 +521,20 @@ pub(crate) fn start<'a>(
     Ok(Started { backend, drm, binding, resources })
 }
 
+/// Whether the packet's VM has failed (`VmStatus` latched): its work is no longer admitted.
+fn vm_failed(packet: &Packet) -> bool {
+    packet.vm.status().is_some_and(|status| status.get() != 0)
+}
+
+/// Latches the VM of work a recovery stopped as guilty, before the work drains: from here on
+/// `submit` refuses it and `pump` publishes none of its queued packets.
+fn latch_guilty(packet: &Packet, error: Error) {
+    if let Some(status) = packet.vm.status() {
+        status.note_recovery_guilty();
+        status.record(error);
+    }
+}
+
 struct Inflight {
     packet: Arc<Packet>,
     last: bool,
@@ -399,6 +544,8 @@ struct Inflight {
     /// Queue publications up to and including this command, counted from take-over.
     ordinal: u64,
     started: Instant<Monotonic>,
+    /// Set when the firmware stopped this command: it fails its packet when it leaves the queue.
+    doomed: Option<Error>,
     _bind: mmu::VmBind,
 }
 
@@ -411,6 +558,17 @@ struct RenderFlight {
     stamps: [event::EventValue; 2],
     targets: [u32; 2],
     started: Instant<Monotonic>,
+    doomed: Option<Error>,
+}
+
+/// Who a recovery round blamed, for its log line: the client, and the stopped work's stamps
+/// (render: tiler and fragment; compute: the stopped command's and the queue's current one).
+struct Blamed {
+    owner: crate::m3::m3_submit::Owner,
+    stamps: [u32; 2],
+    /// The stopped compute command's queue ordinal: the drain waits for this command only. The
+    /// packet's later commands were not stopped and retire (failed) through the normal path.
+    stopped: Option<u64>,
 }
 
 struct State {
@@ -447,6 +605,30 @@ struct State {
     accepting: bool,
     submitted: u64,
     retired: u64,
+    /// A fault or timeout the firmware reported (error, named slot), answered by `recover`.
+    firmware_error: Option<(Error, i32)>,
+    recoveries: u64,
+    /// Recovery-storm window (`recovery_logic::admit`): its start and the recoveries in it.
+    recovery_window: u64,
+    recovery_count: u32,
+    /// Reports read and rounds answered: tells a stale report from a new one.
+    ledger: g14_v27_2_abi::RecoveryLedger,
+    /// Kind words of the last event ring records read, and how many were read in all.
+    events: [u32; EVENT_HISTORY],
+    events_read: u64,
+    /// Packets with a command the firmware stopped (`blame`), with their VM job guard, kept
+    /// for the rest of the boot: the firmware may still reach that memory. Allocated with
+    /// `g14_v27_2_abi::QUARANTINE_LIMIT` places at start, so keeping one never allocates.
+    kept: KVec<Arc<Packet>>,
+    /// The stopped commands of those packets, with their VM binding and scene, once they left
+    /// their queue (`Runtime::keep`). Held, never read.
+    kept_compute: KVec<Inflight>,
+    kept_renders: KVec<RenderFlight>,
+    /// Set when a sleep/wake failure may have left the GPU domain unpowered or stopped so
+    /// teardown skips live-hardware MMIO and RTKit operations.
+    hardware_unreachable: bool,
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    commit_stop: Option<KBox<CommitStop>>,
 }
 
 impl State {
@@ -458,18 +640,42 @@ impl State {
         {
             last.publication_error = Some(err);
         } else {
-            packet.release_guard();
+            if g14_v27_2_abi::guard_releasable(false, self.kept(packet)) {
+                packet.release_guard();
+            }
             packet.finish(Err(err));
         }
+    }
+
+    /// The kinds of the last event ring records read, oldest first, for a log line.
+    fn recent_events(&self) -> ([u32; EVENT_HISTORY], usize) {
+        let count = self.events_read.min(EVENT_HISTORY as u64) as usize;
+        let mut out = [0; EVENT_HISTORY];
+        for (i, kind) in out.iter_mut().take(count).enumerate() {
+            let at = (self.events_read - count as u64 + i as u64) % EVENT_HISTORY as u64;
+            *kind = self.events[at as usize];
+        }
+        (out, count)
     }
 
     fn running(&self) -> bool {
         !self.inflight.is_empty() || self.rendering.is_some()
     }
 
-    fn owns(&self, packet: &Arc<Packet>) -> bool {
+    /// Whether a queue holds any of the packet's commands.
+    fn live(&self, packet: &Arc<Packet>) -> bool {
         self.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, packet))
             || self.rendering.as_ref().is_some_and(|flight| Arc::ptr_eq(&flight.packet, packet))
+    }
+
+    /// Whether a recovery stopped a command of the packet: it stays owned for the boot.
+    fn kept(&self, packet: &Arc<Packet>) -> bool {
+        self.kept.iter().any(|kept| Arc::ptr_eq(kept, packet))
+    }
+
+    /// Whether the runtime owns the packet's VM job guard (`g14_v27_2_abi::guard_releasable`).
+    fn owns(&self, packet: &Arc<Packet>) -> bool {
+        !g14_v27_2_abi::guard_releasable(self.live(packet), self.kept(packet))
     }
 
     fn pending(&self, packet: &Arc<Packet>) -> bool {
@@ -493,6 +699,9 @@ pub(crate) struct Runtime {
     /// Set between [`Runtime::sleep_prepare`] and [`Runtime::sleep_complete`]: nothing is
     /// published across a system sleep.
     asleep: AtomicBool,
+    /// Set across a firmware-driven deep sleep once workers are drained and the commit stop
+    /// is armed; prevents workers from touching the stopped firmware or mailbox.
+    deep_sleeping: AtomicBool,
     notify: Arc<Notify>,
     /// Runs the service. Only `Notify` queues on it, and `stop` drains it.
     queue: OwnedQueue,
@@ -554,6 +763,9 @@ impl Runtime {
         if packet.commands.is_empty() {
             return Err(ENOTSUPP);
         }
+        // A VM that lost its context (a recovery found it guilty, or its work failed) runs
+        // nothing more on the GPU.
+        if vm_failed(&packet) { return Err(EIO); }
         let mut guard = self.state.lock();
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
         if !self.healthy() { return Err(EIO); }
@@ -624,6 +836,11 @@ impl Runtime {
             let slot = (state.next_slot + k) % POOL_SLOTS;
             if state.busy & (1 << slot) != 0 { continue; }
             if state.pool.registered(slot)? {
+                // The firmware can count another record for a retired slot after its cursor
+                // was advanced, and keeps the slot listed until the cursor matches again:
+                // advance it to the current count. The slot's last command stays intact in
+                // its buffer, so an early unlink is harmless.
+                state.pool.retire(slot)?;
                 state.skipped += 1;
                 continue;
             }
@@ -655,6 +872,11 @@ impl Runtime {
         }
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
+            if vm_failed(&packet) {
+                // Queued before its VM failed: none of it is published from now on.
+                state.fail_publication(&packet, EIO);
+                continue;
+            }
             let command = packet.commands[index];
             let paired = matches!(command, Command::Render { .. });
             if paired && state.running() { return; }
@@ -663,14 +885,24 @@ impl Runtime {
                 Ok(Some(slots)) => slots,
                 Ok(None) => return,
                 Err(err) => {
-                    dev_err!(self.dev, "GPU: command pool stalled: {:?}\n", err);
+                    dev_err!(self.dev, "GPU: command pool stalled: {:?} busy={:#x} unacked={:#x} inflight={} rendering={}\n",
+                             err, state.busy, state.unacked, state.inflight.len(), state.rendering.is_some());
+                    for slot in 0..POOL_SLOTS {
+                        if let Ok((count, cursor, linked)) = state.pool.describe(slot) {
+                            if linked != 0 || count != cursor {
+                                dev_err!(self.dev, "GPU: slot {}: records={} cursor={} linked={}\n",
+                                         slot, count, cursor, linked);
+                            }
+                        }
+                    }
                     self.fail_all(state, err);
                     return;
                 }
             };
             let last = index + 1 == packet.commands.len();
             let result = match command {
-                Command::Compute(control) => self.publish_compute(state, &packet, control, last, slots[0]),
+                Command::Compute(control) =>
+                    self.publish_compute(state, &packet, index, control, last, slots[0]),
                 Command::Render { command, usc } =>
                     self.publish_render(state, &packet, index, &command, usc, last, slots),
             };
@@ -687,7 +919,7 @@ impl Runtime {
     }
 
     fn publish_compute(
-        &self, state: &mut State, packet: &Arc<Packet>,
+        &self, state: &mut State, packet: &Arc<Packet>, index: usize,
         control: crate::m3::agx_compute::Control, last: bool, slot: usize,
     ) -> Result {
         let bind = self.graph.kernel_uat().bind(&packet.vm)?;
@@ -700,15 +932,21 @@ impl Runtime {
             cdm_end: control.end,
             usc_base: control.usc_base,
             preempt,
+            timestamps: packet.timestamp_addresses(index),
+            helper: control.helper,
+            sampler_heap: control.sampler_heap,
+            sampler_count: control.sampler_count,
         };
         let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
         let submission = state.root.stage_compute(command)?;
         let ordinal = state.published + 1;
         // Commit ownership before the firmware can see the new work.
         state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-            publication_error: None, started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
+            publication_error: None, started: Instant::now(), doomed: None, _bind: bind },
+            GFP_KERNEL)?;
         packet.mark_published();
         submission.publish();
+        state.pool.mark_published(slot);
         state.last = stamp;
         state.sequence += 1;
         state.unacked &= !(1 << slot);
@@ -762,13 +1000,16 @@ impl Runtime {
         let fs_post = state.root.stage_render(FRAGMENT, &fs_work)?;
         state.rendering = Some(RenderFlight {
             packet: packet.clone(), last, bind, scene, slots, stamps,
-            targets: [ta_post.target(), fs_post.target()], started: Instant::now(),
+            targets: [ta_post.target(), fs_post.target()], started: Instant::now(), doomed: None,
         });
         queue.published();
         packet.mark_published();
         // Queue the fragment dependency before kicking the tiler that satisfies it.
         fs_post.publish();
         ta_post.publish();
+        for slot in slots {
+            state.pool.mark_published(slot);
+        }
         for slot in slots {
             state.busy |= 1 << slot;
             state.unacked &= !(1 << slot);
@@ -801,19 +1042,26 @@ impl Runtime {
 
     fn retire_render(&self, state: &mut State) -> Result {
         let Some(flight) = state.rendering.as_ref() else { return Ok(()); };
-        let mut ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
-        let mut fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+        let (targets, stamps, doomed, started) =
+            (flight.targets, flight.stamps, flight.doomed, flight.started);
+        let done = |root: &RootV27_2, dm: usize| -> Result<bool> {
+            // A command the firmware stopped leaves its queue without reaching its stamp.
+            if doomed.is_some() { root.render_retired(dm, targets[dm]) }
+            else { root.render_done(dm, targets[dm], stamps[dm]) }
+        };
+        let mut ta_done = done(&state.root, TILER)?;
+        let mut fs_done = done(&state.root, FRAGMENT)?;
         if !(ta_done && fs_done)
-            && state.root.render_queue(TILER).1 >= flight.stamps[TILER]
-            && state.root.render_queue(FRAGMENT).1 >= flight.stamps[FRAGMENT]
+            && state.root.render_queue(TILER).1 >= stamps[TILER]
+            && state.root.render_queue(FRAGMENT).1 >= stamps[FRAGMENT]
         {
             // As on the compute queue, the final stamp precedes the retired cursor and
             // there may be no separate notification when the cursor changes.
             let start = Instant::<Monotonic>::now();
             while !(ta_done && fs_done) && start.elapsed() < Delta::from_micros(RETIRE_WAIT_US) {
                 fsleep(Delta::from_micros(20));
-                ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
-                fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+                ta_done = done(&state.root, TILER)?;
+                fs_done = done(&state.root, FRAGMENT)?;
             }
         }
         if ta_done && fs_done {
@@ -821,18 +1069,314 @@ impl Runtime {
             for slot in flight.slots {
                 self.retire_slot(state, slot);
             }
-            if flight.last {
+            if let Some(err) = flight.doomed {
+                self.fail_doomed(state, &flight.packet, err);
+                self.keep(&mut state.kept_renders, flight);
+            } else if flight.last {
                 flight.packet.retired();
             } else if !state.pending(&flight.packet) {
                 flight.packet.release_guard();
             }
-        } else if flight.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
+        } else if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
-            state.root.log_timeout(&self.dev);
-            state.fault.log(&self.dev);
+            if g14_v27_2_abi::command_timeout_action(state.root.recovery_phase()?)
+                == g14_v27_2_abi::TimeoutAction::Recover
+            {
+                // The firmware has a round open whose event was not seen. Recovery blames the
+                // work it stopped and waits until that left its queue. Then retire again, so a
+                // stopped render's fence is signalled and the queue behind it runs without
+                // waiting for another message; an innocent render got its clock restarted.
+                if self.recover(state, ETIMEDOUT, -1)? {
+                    return self.retire_render(state);
+                }
+            }
+            self.log_silent_hang(state, "render");
             return Err(ETIMEDOUT);
         }
         Ok(())
+    }
+
+    /// Fails a packet the firmware stopped, once none of its commands is in a queue: its
+    /// unpublished commands are withdrawn, and its VM records the error (the client sees a
+    /// lost context). Other clients' work is not touched.
+    ///
+    /// A stopped command left its queue without a completion stamp: that proves queue progress,
+    /// not that the GPU no longer reaches its memory (the G16 rule, `Retirement::Aborted`). So
+    /// its VM job guard is not released: the error completion quarantines it (no mapping
+    /// changes), the packet stays in `State::kept` (`blame`), and the caller keeps the flight
+    /// with its VM binding and scene (`keep`), all for the rest of the boot. Pool slots follow
+    /// the normal rule: reused only after the firmware unregisters them (`free_slots`), and
+    /// then in the slot's other buffer, so the stopped command stays intact.
+    fn fail_doomed(&self, state: &mut State, packet: &Arc<Packet>, err: Error) {
+        if state.live(packet) { return; }
+        if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
+            let _ = state.pending.remove(i);
+        }
+        // Record it even if a racing scheduler timeout already claimed the fence (as fail_all).
+        if let Some(status) = packet.vm.status() { status.record(err); }
+        packet.finish(Err(err));
+    }
+
+    /// Keeps a stopped command that left its queue, with its VM binding and scene, for the rest
+    /// of the boot (`State::kept_compute`, `kept_renders`). Its packet is already in
+    /// `State::kept`, so ownership does not depend on this allocation. If it fails, the flight
+    /// is leaked, which keeps it as well; it is never dropped.
+    fn keep<T>(&self, list: &mut KVec<T>, flight: T) {
+        if list.reserve(1, GFP_KERNEL).is_err() {
+            dev_warn!(self.dev, "GPU: no memory to track a stopped command; leaking it\n");
+            core::mem::forget(flight);
+            return;
+        }
+        if let Err(kernel::alloc::kvec::PushError(flight)) = list.push_within_capacity(flight) {
+            core::mem::forget(flight);
+        }
+    }
+
+    /// Adds the packet of stopped work to `State::kept` before anything is marked, so it stays
+    /// owned from here on. Err(EIO) once `g14_v27_2_abi::QUARANTINE_LIMIT` packets are kept:
+    /// the caller then fails all work, and published work stays owned.
+    fn reserve_kept(&self, state: &mut State, packet: &Arc<Packet>) -> Result {
+        if state.kept(packet) { return Ok(()); }
+        if !g14_v27_2_abi::quarantine_fits(state.kept.len()) {
+            dev_err!(self.dev, "GPU: {} clients' stopped work kept this boot; not recovering more\n",
+                     state.kept.len());
+            return Err(EIO);
+        }
+        // Within the capacity allocated at start: never allocates.
+        state.kept.push_within_capacity(packet.clone()).map_err(|_| EIO)
+    }
+
+    /// Marks the work the firmware's snapshot named (`g14_v27_2_abi::Attribution`): the
+    /// published render pair, or the compute command with that completion stamp and the rest of
+    /// its packet. Err(EIO) if that work is no longer tracked: the caller then fails all work.
+    fn blame(&self, state: &mut State, error: Error, work: Stopped) -> Result<Blamed> {
+        let blamed = match work {
+            Stopped::Render => {
+                let Some(packet) = state.rendering.as_ref().map(|f| f.packet.clone())
+                    else { return Err(EIO); };
+                self.reserve_kept(state, &packet)?;
+                let Some(flight) = state.rendering.as_mut() else { return Err(EIO); };
+                flight.doomed = Some(error);
+                latch_guilty(&flight.packet, error);
+                Blamed { owner: flight.packet.owner,
+                         stamps: [flight.stamps[TILER].raw(), flight.stamps[FRAGMENT].raw()],
+                         stopped: None }
+            }
+            Stopped::Compute(stamp) => {
+                let flights = state.inflight.iter().map(|f| (f.stamp.raw(), f.ordinal));
+                let Some((packet, stopped)) = g14_v27_2_abi::stopped_compute(flights, state.retired_total, stamp)
+                    .map(|i| (state.inflight[i].packet.clone(), state.inflight[i].ordinal))
+                    else { return Err(EIO); };
+                self.reserve_kept(state, &packet)?;
+                let owned = |f: &&mut Inflight| Arc::ptr_eq(&f.packet, &packet);
+                for flight in state.inflight.iter_mut().filter(owned) {
+                    flight.doomed.get_or_insert(error);
+                }
+                latch_guilty(&packet, error);
+                Blamed { owner: packet.owner, stamps: [stamp, state.queue_stamp()],
+                         stopped: Some(stopped) }
+            }
+        };
+        Ok(blamed)
+    }
+
+    /// The last resort of a command timeout: the firmware has no recovery round open, so it
+    /// reported nothing the host can answer. Logs what a row needs to tell a silent hang from a
+    /// missed report: queue positions and recovery words (`log_timeout`), the MMU fault status,
+    /// and the last event ring kinds with the report and round counts.
+    fn log_silent_hang(&self, state: &State, work: &str) {
+        state.root.log_timeout(&self.dev);
+        state.fault.log(&self.dev);
+        let (events, seen) = state.recent_events();
+        let (reports, answered) = state.ledger.counts();
+        dev_err!(self.dev, "GPU: {} timed out with no recovery round open: last events {:?} ({} read), {} reports, {} rounds answered (last {:?}); failing all work\n",
+                 work, &events[..seen], state.events_read, reports, answered, state.ledger.last());
+    }
+
+    /// Whether the stopped work has left its queue: the render pair, or the compute command at
+    /// `stopped` (its packet's later commands run normally and are failed as they retire).
+    fn doomed_retired(&self, state: &mut State, stopped: Option<u64>) -> Result<bool> {
+        if let Some(flight) = state.rendering.as_ref() {
+            if flight.doomed.is_some() {
+                return Ok(state.root.render_retired(TILER, flight.targets[TILER])?
+                    && state.root.render_retired(FRAGMENT, flight.targets[FRAGMENT])?);
+            }
+        }
+        let Some(ordinal) = stopped.or_else(||
+            state.inflight.iter().rev().find(|f| f.doomed.is_some()).map(|f| f.ordinal))
+            else { return Ok(true); };
+        self.advance(state)?;
+        Ok(state.retired_total >= ordinal)
+    }
+
+    /// Waits up to `ms` for the firmware's next recovery phase: 1 before the host answered,
+    /// 3 with the same `generation` after it answered 2. Ok(None) on timeout; Err(EPROTO) on
+    /// any phase the protocol does not allow (`recovery_logic::action`).
+    fn wait_recovery(&self, state: &mut State, answered: bool, generation: u64, ms: i64)
+        -> Result<Option<RecoveryAction>> {
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let phase = state.root.recovery_phase()?;
+            let same = !answered || state.root.halt_count()? == generation;
+            match recovery_logic::action(phase, answered, same) {
+                RecoveryAction::Wait => {}
+                RecoveryAction::ProtocolError => {
+                    dev_err!(self.dev, "GPU: recovery phase {} (answered {}, same generation {})\n",
+                             phase, answered, same);
+                    return Err(EPROTO);
+                }
+                found => return Ok(Some(found)),
+            }
+            if start.elapsed() > Delta::from_millis(ms) { return Ok(None); }
+            if state.peer.is_crashed() { return Err(EIO); }
+            let _ = state.root.drain();
+            fsleep(Delta::from_millis(1));
+        }
+    }
+
+    /// The firmware recovery handshake after a fault or command timeout (the G16/M3 protocol).
+    /// The firmware stops every queue and publishes phase 1 with a generation and a snapshot of
+    /// the stopped work; the host marks that work (`blame`), clears the tiler storage of a
+    /// stopped tiler, answers 2, waits for 3 with the same generation and answers 0. The stopped
+    /// work then leaves its queue and fails only its own packet and VM; the next recoveries
+    /// while it drains are answered the same way, a bounded number of times. Errors here fail
+    /// all work (the runtime is not trusted). Ok(false) if the firmware opened no round within
+    /// PHASE1_WAIT_MS: the caller decides whether its report was stale.
+    fn recover(&self, state: &mut State, error: Error, slot: i32) -> Result<bool> {
+        state.root.log_timeout(&self.dev);
+        let mut rounds = 0;
+        // A round the host already answered must not be answered again.
+        let mut previous = state.ledger.last();
+        let began = Instant::<Monotonic>::now();
+        loop {
+            // The state lock is held throughout: keep the whole recovery, including a last round
+            // started at the budget, inside the DRM scheduler's job timeout.
+            if began.elapsed() > Delta::from_millis(RECOVERY_BUDGET_MS) {
+                dev_err!(self.dev, "GPU: recovery took more than {} ms\n", RECOVERY_BUDGET_MS);
+                return Err(ETIMEDOUT);
+            }
+            if self.wait_recovery(state, false, 0, PHASE1_WAIT_MS)?.is_none() {
+                // A further round starts at a phase 1 the drain saw: it cannot go missing.
+                if rounds > 0 { return Err(EPROTO); }
+                return Ok(false);
+            }
+            let now = <Monotonic as kernel::time::ClockSource>::ktime_get() as u64;
+            if !recovery_logic::admit(now, &mut state.recovery_window, &mut state.recovery_count) {
+                dev_err!(self.dev, "GPU: {} recoveries in {} s; not answering more\n",
+                         recovery_logic::WINDOW_LIMIT, recovery_logic::WINDOW_NS / 1_000_000_000);
+                return Err(EIO);
+            }
+            let generation = state.root.halt_count()?;
+            if !g14_v27_2_abi::new_round(previous, generation) {
+                dev_err!(self.dev, "GPU: recovery generation {} repeated\n", generation);
+                return Err(EPROTO);
+            }
+            previous = Some(generation);
+            // Retired work must not be blamed: refresh the retired position first.
+            self.advance(state)?;
+            let render = state.rendering.as_ref()
+                .map(|f| [f.stamps[TILER].raw(), f.stamps[FRAGMENT].raw()]);
+            let mut attribution = g14_v27_2_abi::Attribution::default();
+            let mut entries = 0;
+            let mut first = [(0u32, 0u32); 4];
+            let mut stopped_tiler = false;
+            for i in 0..gpu::RECOVERY_SNAPSHOT_ENTRIES {
+                let (flags, target) = state.root.recovery_entry(i)?;
+                let Some(entry) = SnapshotEntry::decode(flags, target) else { break; };
+                entries += 1;
+                stopped_tiler |= gpu::stopped_tiler(entry.flags);
+                let retired = state.retired_total;
+                let inflight = &state.inflight;
+                attribution.add(entry.flags, entry.target, render, |stamp| {
+                    let flights = inflight.iter().map(|f| (f.stamp.raw(), f.ordinal));
+                    g14_v27_2_abi::stopped_compute(flights, retired, stamp).is_some()
+                });
+                if let Some(at) = first.get_mut(i) { *at = (entry.flags, entry.target); }
+            }
+            let shown = &first[..entries.min(first.len())];
+            let (events, seen) = state.recent_events();
+            // Every round is attributed: work behind the first stopped command can time out in
+            // turn. Unnamed or ambiguous stopped work keeps the fail-stop.
+            let Some(work) = attribution.result() else {
+                dev_err!(self.dev, "GPU: recovery {} ({:?}, slot {}) names no single tracked command: snapshot ({} entries) {:x?}, events {:?}\n",
+                         generation, error, slot, entries, shown, &events[..seen]);
+                return Err(EIO);
+            };
+            let blamed = self.blame(state, error, work)?;
+            let (what, second) = match work {
+                Stopped::Render => ("render, tiler", "fragment"),
+                Stopped::Compute(_) => ("compute", "queue at"),
+            };
+            dev_warn!(self.dev, "GPU: recovery {} ({:?}, slot {}, events {:?}): snapshot ({} entries) {:x?}; stopped {} {:#x} ({} {:#x}) of {}[{}]\n",
+                      generation, error, slot, &events[..seen], entries, shown, what,
+                      blamed.stamps[0], second, blamed.stamps[1],
+                      blamed.owner.process(), blamed.owner.pid);
+            if stopped_tiler {
+                if let Some(flight) = state.rendering.as_ref() {
+                    let ta_left = state.root.render_retired(TILER, flight.targets[TILER])?;
+                    if !ta_left {
+                        // SAFETY: the firmware is in recovery phase 1 with every queue stopped,
+                        // so the GPU does not access the stopped tiler's TPC; the CPU reads it
+                        // nowhere, and the state lock (held) serializes every render flight.
+                        unsafe { flight.scene.clear_tpc()? };
+                        dev_err!(self.dev, "GPU: cleared the stopped tiler's TPC storage\n");
+                    }
+                }
+            }
+            let start = Instant::<Monotonic>::now();
+            state.root.answer_recovery(2)?;
+            let mut reached = self.wait_recovery(state, true, generation, HANDSHAKE_MS / 2)?;
+            if reached.is_none() {
+                dev_warn!(self.dev, "GPU: no recovery phase 3 in {} ms; ringing the device-control doorbell\n",
+                          HANDSHAKE_MS / 2);
+                let _ = state.peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK);
+                reached = self.wait_recovery(state, true, generation, HANDSHAKE_MS / 2)?;
+            }
+            if reached != Some(RecoveryAction::Resume) {
+                return Err(ETIMEDOUT);
+            }
+            state.root.answer_recovery(0)?;
+            state.ledger.answered(generation);
+            dev_info!(self.dev, "GPU: recovery {} answered in {} ms\n",
+                      generation, start.elapsed().as_millis());
+            let start = Instant::<Monotonic>::now();
+            loop {
+                let _ = state.root.drain();
+                if self.doomed_retired(state, blamed.stopped)? {
+                    state.recoveries += 1;
+                    // Work behind the stopped command waited out the recovery: restart its clocks.
+                    let now = Instant::now();
+                    for flight in state.inflight.iter_mut() { flight.started = now; }
+                    if let Some(flight) = state.rendering.as_mut() { flight.started = now; }
+                    dev_err!(self.dev,
+                             "GPU: recovered ({} so far): stopped work left the queue after {} ms\n",
+                             state.recoveries, start.elapsed().as_millis());
+                    return Ok(true);
+                }
+                if state.peer.is_crashed() { return Err(EIO); }
+                // Phase 0 = still draining; 1 = a new recovery (a new generation is checked
+                // at the next round); the host's own phases mean the handshake was misread.
+                match recovery_logic::action(state.root.recovery_phase()?, false, true) {
+                    RecoveryAction::Wait => {}
+                    RecoveryAction::MarkAndAcknowledge => break,
+                    _ => {
+                        dev_err!(self.dev, "GPU: recovery phase {} while the stopped work drained\n",
+                                 state.root.recovery_phase()?);
+                        return Err(EPROTO);
+                    }
+                }
+                if start.elapsed() > Delta::from_millis(RECOVERY_DRAIN_MS) {
+                    dev_err!(self.dev, "GPU: stopped work did not leave the queue\n");
+                    state.root.log_timeout(&self.dev);
+                    return Err(ETIMEDOUT);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            rounds += 1;
+            dev_err!(self.dev, "GPU: firmware entered recovery again while the stopped work drained ({})\n",
+                     rounds);
+            if rounds > FURTHER_RECOVERIES { return Err(EIO); }
+        }
     }
 
     /// Reads the queue's retired position into `retired_total`.
@@ -857,9 +1401,13 @@ impl Runtime {
     }
 
     fn process_events(&self, state: &mut State) -> Result {
+        // A fault and a timeout read in one pass are one report (`RecoveryLedger`).
+        let mut reported = false;
         // Limit one pass to the ring capacity. Further arrivals notify the worker again.
         for _ in 0..256 {
-            let Some((cursor, event)) = state.root.peek_event()? else { break; };
+            let Some((cursor, kind, event)) = state.root.peek_event()? else { break; };
+            state.events[(state.events_read % EVENT_HISTORY as u64) as usize] = kind;
+            state.events_read += 1;
             match event {
                 FirmwareEvent::Grow(request) if request.halt_count == state.root.halt_count()? => {
                     let Some(reply) = state.root.reserve_control_reply()? else {
@@ -885,6 +1433,17 @@ impl Runtime {
                     state.root.consume_event(cursor)?;
                     return Err(EIO);
                 }
+                FirmwareEvent::Timeout { slot } => {
+                    dev_err!(self.dev, "GPU firmware timed out a command (slot {})\n", slot);
+                    state.firmware_error.get_or_insert((ETIMEDOUT, slot));
+                    if !core::mem::replace(&mut reported, true) { state.ledger.report(); }
+                }
+                FirmwareEvent::Fault => {
+                    dev_err!(self.dev, "GPU firmware reported a GPU fault\n");
+                    state.fault.log(&self.dev);
+                    state.firmware_error.get_or_insert((EIO, -1));
+                    if !core::mem::replace(&mut reported, true) { state.ledger.report(); }
+                }
                 FirmwareEvent::Grow(_) | FirmwareEvent::Notification => {}
             }
             state.waiting_control = None;
@@ -907,6 +1466,28 @@ impl Runtime {
             self.fail_all(state, err);
             return;
         }
+        if let Some((error, slot)) = state.firmware_error.take() {
+            match self.recover(state, error, slot) {
+                Ok(true) => {}
+                // The host answered this report's round before it read the report (a round
+                // opened while stopped work drained, or found at a command timeout).
+                Ok(false) if state.ledger.report_answered() => {
+                    dev_warn!(self.dev, "GPU: firmware report {:?} (slot {}) is for recovery {:?}, already answered\n",
+                              error, slot, state.ledger.last());
+                }
+                Ok(false) => {
+                    dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
+                             error, slot);
+                    self.fail_all(state, ETIMEDOUT);
+                    return;
+                }
+                Err(err) => {
+                    dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
+                    self.fail_all(state, err);
+                    return;
+                }
+            }
+        }
         if let Err(err) = self.retire_render(state) { self.fail_all(state, err); return; }
         if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
         // The completion stamp is written before the firmware's post-processing advances the
@@ -925,10 +1506,14 @@ impl Runtime {
         }
         while !state.inflight.is_empty() {
             let front = &state.inflight[0];
-            if state.retired_total >= front.ordinal {
+            let (ordinal, started, expected) = (front.ordinal, front.started, front.stamp.raw());
+            if state.retired_total >= ordinal {
                 if let Ok(done) = state.inflight.remove(0) {
                     self.retire_slot(state, done.slot);
-                    if let Some(err) = done.publication_error {
+                    if let Some(err) = done.doomed {
+                        self.fail_doomed(state, &done.packet, err);
+                        self.keep(&mut state.kept_compute, done);
+                    } else if let Some(err) = done.publication_error {
                         done.packet.release_guard();
                         done.packet.finish(Err(err));
                     } else if done.last {
@@ -939,11 +1524,25 @@ impl Runtime {
                 }
                 continue;
             }
-            if front.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
+            if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
-                         state.queue_stamp(), front.stamp.raw(), state.submitted, state.retired);
-                state.root.log_timeout(&self.dev);
-                state.fault.log(&self.dev);
+                         state.queue_stamp(), expected, state.submitted, state.retired);
+                let phase = state.root.recovery_phase().unwrap_or(0);
+                if g14_v27_2_abi::command_timeout_action(phase) == g14_v27_2_abi::TimeoutAction::Recover {
+                    // The firmware has a round open whose event was not seen. Recovery blames
+                    // the command it names by stamp, which need not be this front one, and
+                    // fails only that client; the others' work resumes after phase 0.
+                    match self.recover(state, ETIMEDOUT, -1) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(err) => {
+                            dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
+                            self.fail_all(state, err);
+                            return;
+                        }
+                    }
+                }
+                self.log_silent_hang(state, "compute");
                 self.fail_all(state, ETIMEDOUT);
                 return;
             }
@@ -953,17 +1552,46 @@ impl Runtime {
         self.pump(state);
     }
 
-    /// Before a suspend-to-idle: holds new publications and lets published work retire, so the
-    /// sleep starts with nothing in flight. The firmware keeps running with its keep-powered
-    /// policy: its GPU power domain is kept through the sleep (`apple,sleep-retained`), and the
-    /// ASC, its memory and the root stay as they are. Refuses the sleep (EBUSY) if published work
-    /// does not retire within the stop drain time.
+    /// Rolls back a failed deep-sleep prepare. If an allow-off policy record was published,
+    /// keep-powered must be confirmed before reopening submissions; otherwise the backend is
+    /// failed rather than resuming with an unconfirmed idle policy.
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    fn abort_deep_prepare(&self, state: &mut State, policy_published: bool, err: Error) -> Error {
+        if policy_published {
+            if let Err(rb_err) = set_idle_policy(&state.root, &mut state.peer, false) {
+                dev_err!(
+                    self.dev,
+                    "GPU: deep sleep rollback failed to restore keep-powered: {:?}\n",
+                    rb_err
+                );
+                self.fail_all(state, rb_err);
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                return err;
+            }
+        }
+        self.notify.set_deep_sleeping(self, false);
+        self.asleep.store(false, Ordering::Release);
+        if self.healthy() {
+            self.pump(state);
+            self.notify.wake();
+        }
+        err
+    }
+
+    /// Before a system sleep: holds new publications and lets published work retire.
     ///
-    /// The firmware's own power-off handshake (idle policy allow-off, then keep-powered again
-    /// after the wake) is not used: on phellos the firmware crashed in the wake that followed it.
-    pub(crate) fn sleep_prepare(&self) -> Result {
+    /// For suspend-to-idle (`!deep`), the firmware keeps running with its keep-powered policy
+    /// (`apple,sleep-retained`). For a firmware-driven deep sleep (`deep`), workers are drained,
+    /// idle power-off is permitted, and a commit-time stop is registered with the SoC sleep
+    /// driver so the firmware is idled and halted only after all refusals have passed, then
+    /// warm-restarted in [`sleep_complete`].
+    pub(crate) fn sleep_prepare(&self, deep: bool) -> Result {
         let mut guard = self.state.lock();
         if !self.healthy() || guard.is_none() { return Ok(()); }
+        if self.deep_sleeping.load(Ordering::Acquire) {
+            return Err(EBUSY);
+        }
         // Hold publications first, then let what is published retire. User space is frozen by
         // now; only the scheduler's queued jobs can still arrive, and they wait in `pending`.
         self.asleep.store(true, Ordering::Release);
@@ -972,9 +1600,17 @@ impl Runtime {
             let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
             if !self.healthy() { return Ok(()); }
             if !state.running() {
-                dev_info!(self.dev, "GPU held for sleep: submitted={} completed={} pending={}\n",
-                          state.submitted, state.retired, state.pending.len());
-                return Ok(());
+                // No recovery round crosses a sleep: a round open now (the firmware stopped
+                // without anything of ours running) is answered by the service first.
+                let phase = state.root.recovery_phase().unwrap_or(0);
+                if phase != 0 {
+                    dev_err!(self.dev, "GPU: sleep refused, firmware recovery phase {}\n", phase);
+                    self.asleep.store(false, Ordering::Release);
+                    self.pump(state);
+                    self.notify.wake();
+                    return Err(EBUSY);
+                }
+                break;
             }
             if remaining == 0 {
                 dev_err!(self.dev, "GPU: sleep refused, {} compute commands and {} render pairs still running\n",
@@ -988,13 +1624,198 @@ impl Runtime {
                 _ => 0,
             };
         }
+        if !deep {
+            if let Some(state) = Option::as_ref(&*guard) {
+                dev_info!(self.dev, "GPU held for sleep: submitted={} completed={} pending={}\n",
+                          state.submitted, state.retired, state.pending.len());
+            }
+            return Ok(());
+        }
+        #[cfg(not(CONFIG_APPLE_SOC_SLEEP))]
+        {
+            if let Some(state) = Option::as_mut(&mut *guard) {
+                self.asleep.store(false, Ordering::Release);
+                self.pump(state);
+            }
+            return Err(EBUSY);
+        }
+        #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+        {
+            let has_pwr_controller =
+                Option::as_ref(&*guard).is_some_and(|s| s.root.has_pwr_controller());
+            // SAFETY: Reads global sleep-driver availability and suspend mode.
+            if !has_pwr_controller || !unsafe { apple_sleep_commit_stops_coprocs() } {
+                if let Some(state) = Option::as_mut(&mut *guard) {
+                    self.asleep.store(false, Ordering::Release);
+                    self.pump(state);
+                }
+                return Err(EBUSY);
+            }
+            // Close Notify admission under its spinlock before dropping `state` and draining.
+            self.notify.set_deep_sleeping(self, true);
+            drop(guard);
+            // Flush any queued retry or service work; `deep_sleeping` keeps new work out.
+            // SAFETY: `self.retry` is an initialized, pinned delayed work item.
+            unsafe {
+                let work = Work::raw_get(DelayedWork::raw_as_work(&self.retry));
+                let delayed = kernel::container_of!(work, kernel::bindings::delayed_work, work);
+                kernel::bindings::flush_delayed_work(delayed);
+            }
+            self.queue.drain();
+
+            let mut guard = self.state.lock();
+            let Some(state) = Option::as_mut(&mut *guard) else {
+                self.notify.set_deep_sleeping(self, false);
+                return Ok(());
+            };
+            if !self.healthy() || state.running() {
+                return Err(self.abort_deep_prepare(state, false, EBUSY));
+            }
+            if let Err((published, err)) = try_set_idle_policy(&state.root, &mut state.peer, true) {
+                dev_err!(self.dev, "GPU: deep sleep refused, allow-off failed: {:?}\n", err);
+                return Err(self.abort_deep_prepare(state, published, err));
+            }
+            if let Err(err) = wait(&state.root, 500, || Ok(gpu_powered_off(state.asc.fender()))) {
+                dev_err!(
+                    self.dev,
+                    "GPU: deep sleep refused, GPU did not power off (fender={:#x}): {:?}\n",
+                    state.asc.fender(),
+                    err
+                );
+                return Err(self.abort_deep_prepare(state, true, err));
+            }
+            // SAFETY: `ASC_CPU_CONTROL` lies within the mapped ASC page.
+            let asc_ctl = unsafe { state.asc.0.add(ASC_CPU_CONTROL) };
+            let commit = match KBox::new(CommitStop {
+                rtk: state.peer.as_raw(),
+                asc_ctl,
+                ran: false,
+                idle_ret: 0,
+                idle_us: 0,
+            }, GFP_KERNEL) {
+                Ok(c) => c,
+                Err(err) => return Err(self.abort_deep_prepare(state, true, err.into())),
+            };
+            state.commit_stop = Some(commit);
+            let data = state.commit_stop.as_deref_mut().map_or(core::ptr::null_mut(), |c| {
+                core::ptr::from_mut(c).cast::<core::ffi::c_void>()
+            });
+            // SAFETY: `dev` is the live GPU device; `data` points to `state.commit_stop` which
+            // remains allocated at the same address until unregistered in `sleep_complete`/`stop`.
+            let ret = unsafe {
+                apple_sleep_coproc_register_first(
+                    self.dev.as_raw(),
+                    Some(g14_v27_2_commit_stop),
+                    data,
+                )
+            };
+            if ret != 0 {
+                state.commit_stop = None;
+                return Err(self.abort_deep_prepare(state, true, Error::from_errno(ret)));
+            }
+            // SAFETY: `dev` was just registered above.
+            unsafe { apple_sleep_coproc_set_ready(self.dev.as_raw(), true) };
+            dev_info!(self.dev, "GPU prepared for deep sleep: submitted={} completed={} pending={}\n",
+                      state.submitted, state.retired, state.pending.len());
+            Ok(())
+        }
     }
 
-    /// After the sleep: publishes the work held during it.
+    /// After the sleep: warm-restarts the firmware after a real deep sleep, then publishes held work.
     pub(crate) fn sleep_complete(&self) {
         let mut guard = self.state.lock();
+        let Some(state) = Option::as_mut(&mut *guard) else {
+            #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+            self.notify.set_deep_sleeping(self, false);
+            self.asleep.store(false, Ordering::Release);
+            return;
+        };
+        #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+        if let Some(commit) = state.commit_stop.take() {
+            // SAFETY: `dev` was registered in `sleep_prepare`; `commit` stays live until after
+            // `apple_sleep_coproc_unregister` completes.
+            let stopped = commit.ran
+                || unsafe { apple_sleep_coproc_stopped(self.dev.as_raw()) };
+            // SAFETY: `dev` is still registered until the unregister below.
+            let wake_err = unsafe { apple_sleep_coproc_wake_error(self.dev.as_raw()) };
+            // SAFETY: Matches `apple_sleep_coproc_register_first` in `sleep_prepare`.
+            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw()) };
+            // SAFETY: Reads a global flag word.
+            let real = unsafe { kernel::bindings::pm_resume_via_firmware() };
+            if !stopped && !real {
+                dev_info!(self.dev, "GPU: deep sleep refused before commit; restoring keep-powered\n");
+                if let Err(err) = set_idle_policy(&state.root, &mut state.peer, false) {
+                    dev_err!(self.dev, "GPU: failed to restore keep-powered policy: {:?}\n", err);
+                    self.fail_all(state, err);
+                }
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                state.waiting_unlink = None;
+                if self.healthy() {
+                    self.pump(state);
+                    self.notify.wake();
+                }
+                return;
+            }
+            if !real {
+                dev_warn!(self.dev, "GPU: sleep refused after commit stop; firmware stays stopped\n");
+                state.hardware_unreachable = true;
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                self.fail_all(state, EIO);
+                return;
+            }
+            if commit.idle_ret != 0 || wake_err != 0 {
+                dev_err!(
+                    self.dev,
+                    "GPU: skipping warm restart after commit/wake error (idle_ret={} wake_err={})\n",
+                    commit.idle_ret,
+                    wake_err
+                );
+                state.hardware_unreachable = true;
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                self.fail_all(state, EIO);
+                return;
+            }
+            let started = Instant::<Monotonic>::now();
+            let ctl_before = state.asc.read(ASC_CPU_CONTROL);
+            let restart = (|| -> Result {
+                // SAFETY: `peer` is live and the firmware was stopped at the commit.
+                kernel::error::to_result(unsafe {
+                    kernel::bindings::apple_rtkit_warm_restart(state.peer.as_raw())
+                })?;
+                state.asc.write(ASC_CPU_CONTROL, ctl_before | ASC_RUN);
+                state.peer.as_mut().boot()?;
+                set_idle_policy(&state.root, &mut state.peer, false)?;
+                wait(&state.root, 500, || Ok(gpu_powered(state.asc.fender())))
+            })();
+            self.notify.set_deep_sleeping(self, false);
+            self.asleep.store(false, Ordering::Release);
+            state.waiting_unlink = None;
+            state.waiting_control = None;
+            match restart {
+                Ok(()) => {
+                    // No round crosses a sleep (sleep_prepare refuses one), and the restarted
+                    // firmware may count generations again from its start: forget old rounds.
+                    state.ledger = g14_v27_2_abi::RecoveryLedger::default();
+                    dev_info!(self.dev, "GPU firmware 27.2 back in {} us (commit idle={} {} us, pending={})\n",
+                              started.elapsed().as_micros_ceil(), commit.idle_ret, commit.idle_us,
+                              state.pending.len());
+                    if self.healthy() {
+                        self.pump(state);
+                        self.notify.wake();
+                    }
+                }
+                Err(err) => {
+                    dev_err!(self.dev, "GPU firmware 27.2 warm restart failed: {:?} (crashed={})\n",
+                             err, state.peer.is_crashed());
+                    self.fail_all(state, err);
+                }
+            }
+            return;
+        }
         if !self.asleep.swap(false, Ordering::AcqRel) { return; }
-        let Some(state) = Option::as_mut(&mut *guard) else { return; };
         dev_info!(self.dev, "GPU released after sleep: running={:?} pending={}\n",
                   state.root.firmware_running(), state.pending.len());
         state.waiting_unlink = None;
@@ -1030,21 +1851,38 @@ impl Runtime {
         self.queue.drain();
         let mut guard = self.state.lock();
         let Some(mut state) = guard.take() else { return; };
+        #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+        if let Some(_commit) = state.commit_stop.take() {
+            // SAFETY: Matches `apple_sleep_coproc_register_first` in `sleep_prepare`; PM
+            // unbind/shutdown does not run concurrently with the IRQ-off commit, and `_commit`
+            // stays alive until after unregister completes.
+            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw()) };
+        }
         self.fail_all(&mut state, ENODEV);
-        let allowed = set_idle_policy(&state.root, &mut state.peer, true);
-        let root = &state.root;
-        let _ = wait(root, 500, || Ok(root.firmware_running()? == 0));
-        let running = root.firmware_running();
-        let forced = (running != Ok(0)).then(|| {
-            // SAFETY: the RTKit instance is live and owned here.
-            kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
-        });
-        state.asc.halt();
-        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={} deferred-cursors={}\n",
-                  allowed, running, forced, state.submitted, state.retired,
-                  self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped, state.deferred);
-        if running != Ok(0) && forced != Some(Ok(())) {
-            dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
+        if state.hardware_unreachable {
+            dev_info!(
+                self.dev,
+                "GPU stopped: skipping hardware teardown after failed sleep/wake (submitted={} completed={} notifications={})\n",
+                state.submitted,
+                state.retired,
+                self.notify.messages.load(Ordering::Relaxed)
+            );
+        } else {
+            let allowed = set_idle_policy(&state.root, &mut state.peer, true);
+            let root = &state.root;
+            let _ = wait(root, 500, || Ok(root.firmware_running()? == 0));
+            let running = root.firmware_running();
+            let forced = (running != Ok(0)).then(|| {
+                // SAFETY: the RTKit instance is live and owned here.
+                kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
+            });
+            state.asc.halt();
+            dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={} deferred-cursors={}\n",
+                      allowed, running, forced, state.submitted, state.retired,
+                      self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped, state.deferred);
+            if running != Ok(0) && forced != Some(Ok(())) {
+                dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
+            }
         }
         // Keep everything the firmware could reach for the rest of the boot, halted or not:
         // its page tables still name these pages, and the boot handoff window that start()
@@ -1095,6 +1933,7 @@ impl Backend {
                 graph: runtime_graph,
                 healthy: AtomicBool::new(true),
                 asleep: AtomicBool::new(false),
+                deep_sleeping: AtomicBool::new(false),
                 notify: runtime_notify,
                 queue,
                 state <- new_mutex!(None, "g14_v27_2::Runtime::state"),
@@ -1111,12 +1950,13 @@ impl Backend {
             }
         };
         let (queue, last) = root.queue();
-        let checked = (|| -> Result<(u32, u32)> {
+        let checked = (|| -> Result<(u32, u32, KVec<Arc<Packet>>)> {
             let (head, retired) = root.progress()?;
             if head != retired { return Err(EBUSY); }
-            Ok((head, root.capacity()?))
+            let kept = KVec::with_capacity(g14_v27_2_abi::QUARANTINE_LIMIT, GFP_KERNEL)?;
+            Ok((head, root.capacity()?, kept))
         })();
-        let (head, capacity) = match checked {
+        let (head, capacity, kept) = match checked {
             Ok(v) => v,
             Err(e) => {
                 halt_unowned(dev, peer, root, asc, true);
@@ -1146,6 +1986,19 @@ impl Backend {
             accepting: true,
             submitted: 0,
             retired: 0,
+            firmware_error: None,
+            recoveries: 0,
+            recovery_window: 0,
+            recovery_count: 0,
+            ledger: g14_v27_2_abi::RecoveryLedger::default(),
+            events: [0; EVENT_HISTORY],
+            events_read: 0,
+            kept,
+            kept_compute: KVec::new(),
+            kept_renders: KVec::new(),
+            hardware_unreachable: false,
+            #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+            commit_stop: None,
         });
         // From here the firmware's messages run the service; one run consumes anything it
         // published before.
@@ -1169,7 +2022,7 @@ impl Backend {
     }
 
     pub(crate) fn stop(&self) { self.runtime.stop(); }
-    pub(crate) fn sleep_prepare(&self) -> Result { self.runtime.sleep_prepare() }
+    pub(crate) fn sleep_prepare(&self, deep: bool) -> Result { self.runtime.sleep_prepare(deep) }
     pub(crate) fn sleep_complete(&self) { self.runtime.sleep_complete() }
 }
 
@@ -1210,8 +2063,16 @@ impl gpu::Gpu for Backend {
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_g14_v27_2(self.runtime.clone(), self.scheduler.clone(),
             vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes, render)?, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>) -> Result<crate::timestamp::Buffer> {
-        // Timestamp buffers would need new tables in the firmware window after boot.
-        Err(ENOTSUPP)
+    fn timestamp_window_size(&self) -> u64 {
+        <GpuManagerG14V13_5 as gpu::Gpu>::timestamp_window_size(&self.graph)
+    }
+    fn map_timestamp_buffer(
+        &self,
+        bo: gem::ObjectRef,
+        range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
+    ) -> Result<crate::timestamp::Buffer> {
+        // The aperture's tables were linked before the firmware window was mirrored (start()).
+        <GpuManagerG14V13_5 as gpu::Gpu>::map_timestamp_buffer(&self.graph, bo, range, window)
     }
 }
