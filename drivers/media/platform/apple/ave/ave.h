@@ -176,6 +176,8 @@ enum ave_opcode {
  */
 #define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
+/* Firmware 27.2 (26B123) / T6050: TEXT 0x158000, DATA 0x134000. */
+#define AVE_FW_TEXT_CRC_T6050_26B123 0xd33ed3b4
 /* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 /* The M5 (T8142) build of the same 26A428 firmware (encoder firmware 9013.45.1). */
@@ -585,6 +587,7 @@ extern const struct ave_variant ave_t6000, ave_t6041, ave_t6050, ave_t8112,
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
 bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
+bool ave_fw_known_crc(u32 crc);
 const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
 					      size_t text, size_t data);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
