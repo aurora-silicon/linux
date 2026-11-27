@@ -446,6 +446,7 @@ ASAHI_TESTS = {
     't6040-calibration-tests.py': [([], PASS)],
     't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't6050-combo-join-tests.py': [([], PASS)],
+    't8132-display-gate-tests.py': [([], PASS)],
     't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
     'tb-dock-pm-tests.py': [(out('--output'), PASS)],
@@ -464,6 +465,8 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 ASAHI_RUST.append('m3-firmware-tests.rs')
+# G14 firmware 27.2 queue, event and recovery records (its KUnit suite, run on the host).
+ASAHI_RUST.append('g14-v27-2-abi-tests.rs')
 ASAHI_RUST.append('pmp-alloc-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the

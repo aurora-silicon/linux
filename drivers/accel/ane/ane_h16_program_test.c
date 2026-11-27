@@ -592,6 +592,15 @@ static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410, 0x38, 0x28 };
 
 #define TEST_GENERIC_BASE 8
 
+/* The procedure and text-properties sections a host builder writes for hwx. */
+static void fixed_fill(const struct ane_h16_hwx *hwx)
+{
+	ane_h16_fixed_sections(hwx, test_aux[ANE_H16_AUX_PROCEDURE],
+			       test_aux[ANE_H16_AUX_TEXT_PROPERTIES]);
+	test_aux_size[ANE_H16_AUX_PROCEDURE] = ANE_H16_PROCEDURE_SIZE;
+	test_aux_size[ANE_H16_AUX_TEXT_PROPERTIES] = ANE_H16_PROPERTIES_SIZE;
+}
+
 static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snapshot,
 			    struct ane_h16_program **p)
 {
@@ -604,6 +613,7 @@ static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snap
 	test_aux_size[ANE_H16_AUX_OPERATION] =
 		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
 			       TEST_GENERIC_BASE);
+	fixed_fill(&hwx);
 	return ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size, p);
 }
 
@@ -1248,6 +1258,7 @@ static void program_scratch_test(struct kunit *test)
 	put_unaligned_le32(TEST_GENERIC_BASE + 2, e + 4);
 
 	test_aux_size[ANE_H16_AUX_GENERIC] = size;
+	fixed_fill(hwx);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size,
 						   &p), 0);
 	KUNIT_ASSERT_TRUE(test, p->has_scratch);
@@ -1328,6 +1339,7 @@ static void program_bad_operation_test(struct kunit *test)
 	test_aux_size[ANE_H16_AUX_OPERATION] =
 		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
 			       TEST_GENERIC_BASE);
+	fixed_fill(&hwx);
 	/* One record more than the section carries. */
 	put_unaligned_le32(get_unaligned_le32(test_aux[ANE_H16_AUX_OPERATION]) + 1,
 			   test_aux[ANE_H16_AUX_OPERATION]);
@@ -1613,6 +1625,68 @@ static void program_pool_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->count, sent + 2);
 }
 
+/* The add-128 source 1 base record: [0x4d10, 0x4d14], relocated on BAR slot 6. */
+#define ADD128_SRC1 (0x4d10 / 4 | 1 << 15 | BIT(29) | 6 << 23)
+
+/*
+ * Run the LOAD checks of the add-128 program with its source 1 base record
+ * header and offset replaced. The operation section binds x, y, z to slots
+ * 6, 7, 8; source 1 reads 128 rows of 0x100 bytes, all 32 KiB of x.
+ */
+static int add128_dma_load(struct kunit *test, u32 header, u64 offset)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	u8 *hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs),
+			       ADD128_HWX_SIZE);
+	u8 *generic = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+				   ADD128_GENERIC_SIZE);
+	u8 *operation = sparse_bytes(test, add128_operation_runs,
+				     ARRAY_SIZE(add128_operation_runs), ADD128_OPERATION_SIZE);
+	unsigned int count;
+	size_t at;
+	int ret;
+
+	if (!snapshot || !hwx || !generic || !operation)
+		return -ENOMEM;
+	for (at = 0; at + 12 <= ADD128_HWX_SIZE; at += 4)
+		if (get_unaligned_le32(hwx + at) == ADD128_SRC1)
+			break;
+	if (at + 12 > ADD128_HWX_SIZE)
+		return -ENOENT;
+	put_unaligned_le32(header, hwx + at);
+	put_unaligned_le64(offset, hwx + at + 4);
+	ret = ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot);
+	if (ret)
+		return ret;
+	ret = kunit_add_action_or_reset(test, snapshot_free, snapshot);
+	if (ret)
+		return ret;
+	ret = ane_h16_process_bindings(&snapshot->info, generic, ADD128_GENERIC_SIZE, bindings,
+				       &count, &scratch);
+	if (!ret)
+		ret = ane_h16_operation_validate(snapshot, &snapshot->info, operation,
+						 ADD128_OPERATION_SIZE, bindings, count, &scratch);
+	return ret;
+}
+
+/* Each DMA base stays inside the buffer its slot binds, at LOAD and before any mapping. */
+static void program_add128_dma_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0), 0);
+	/* One 64-byte line past the end of x, into z's place, and before x. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x40), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x10000), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, -0x8000), -ENOEXEC);
+	/* Slot 9, which the operation section does not bind. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, (ADD128_SRC1 & ~(0x3f << 23)) | 9 << 23, 0),
+			-ENOEXEC);
+	/* The base without its relocation: an absolute DVA. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1 & ~(BIT(29) | 0x3f << 23), 0),
+			-ENOEXEC);
+}
+
 static u8 *fw_sparse_large(struct kunit *test, const struct ane_h16_sparse_run *runs,
 			   unsigned int count, size_t size)
 {
@@ -1658,6 +1732,147 @@ static void mobilenet_sections(struct kunit *test, const void *aux[ANE_H16_AUX_C
 			      ARRAY_SIZE(mobilenet_procedure_runs), aux_size[2]);
 	aux[3] = sparse_bytes(test, mobilenet_properties_runs,
 			      ARRAY_SIZE(mobilenet_properties_runs), aux_size[3]);
+}
+
+/*
+ * Every byte of the four host-built sections has its one value. The add128
+ * and mobilenet fixtures' sections from h16-sections.py are the kernel's
+ * procedure and text properties, and any other procedure, text framing or
+ * nonzero reserved byte is refused at LOAD, before anything is mapped or sent.
+ */
+static void program_sections_exact_test(struct kunit *test)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	size_t aux_size[ANE_H16_AUX_COUNT] = {
+		ADD128_GENERIC_SIZE, ADD128_OPERATION_SIZE,
+		ADD128_PROCEDURE_SIZE, ADD128_PROPERTIES_SIZE,
+	};
+	static const size_t generic_bytes[] = { 0x8, 0x100, 0x203 };
+	static const size_t entry_bytes[] = { 0xc, 0x14, 0x1f, 0x28, 0x2c };
+	const void *mobilenet[ANE_H16_AUX_COUNT];
+	size_t mobilenet_size[ANE_H16_AUX_COUNT];
+	struct ane_h16_hwx_snapshot *m = mobilenet_snapshot(test);
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	void *aux[ANE_H16_AUX_COUNT];
+	u8 *hwx, *g, *o, *pr, *tp;
+	unsigned int i, count;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs), ADD128_HWX_SIZE);
+	g = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+			 ADD128_GENERIC_SIZE);
+	o = sparse_bytes(test, add128_operation_runs, ARRAY_SIZE(add128_operation_runs),
+			 ADD128_OPERATION_SIZE);
+	pr = sparse_bytes(test, add128_procedure_runs, ARRAY_SIZE(add128_procedure_runs),
+			  ADD128_PROCEDURE_SIZE);
+	tp = sparse_bytes(test, add128_properties_runs, ARRAY_SIZE(add128_properties_runs),
+			  ADD128_PROPERTIES_SIZE);
+	aux[0] = g;
+	aux[1] = o;
+	aux[2] = pr;
+	aux[3] = tp;
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		KUNIT_ASSERT_NOT_NULL(test, aux[i]);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, snapshot_free, snapshot), 0);
+
+	/* What the builder wrote is the kernel's form, for one task and for 28. */
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), 0);
+	mobilenet_sections(test, mobilenet, mobilenet_size);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&m->info, mobilenet,
+							      mobilenet_size), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&m->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+
+	/* Another task count, segment offset or size, or a longer section. */
+	put_unaligned_le32(2, tp + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le32(1, tp + 0xc);
+	put_unaligned_le64(0x10, tp + 0x10);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le64(0, tp + 0x10);
+	put_unaligned_le64(0x120, tp + 0x20);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le64(0x130, tp + 0x20);
+	aux_size[3] = ADD128_PROPERTIES_SIZE + 4;
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	aux_size[3] = ADD128_PROPERTIES_SIZE;
+	/* A second procedure, or another word of the one there is. */
+	put_unaligned_le32(2, pr);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le32(1, pr);
+	pr[0x34] = 5;
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	pr[0x34] = 4;
+
+	/* Reserved generic bytes: in the header and in every field of an entry. */
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(&snapshot->info, g, ADD128_GENERIC_SIZE,
+						       bindings, &count, &scratch), 0);
+	for (i = 0; i < ARRAY_SIZE(generic_bytes); i++) {
+		g[generic_bytes[i]] ^= 1;
+		KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(&snapshot->info, g,
+							       ADD128_GENERIC_SIZE, bindings,
+							       &count, &scratch), -ENOEXEC);
+		g[generic_bytes[i]] ^= 1;
+	}
+	for (i = 0; i < ARRAY_SIZE(entry_bytes); i++) {
+		u8 *e = g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + entry_bytes[i];
+
+		*e ^= 1;
+		KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(&snapshot->info, g,
+							       ADD128_GENERIC_SIZE, bindings,
+							       &count, &scratch), -ENOEXEC);
+		*e ^= 1;
+	}
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(&snapshot->info, g, ADD128_GENERIC_SIZE,
+						       bindings, &count, &scratch), 0);
+	/* An operation record's bytes after its last reference. */
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), 0);
+	o[4 + 0xc + 3 * 8] = 7;
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), -ENOEXEC);
+	o[4 + 0xc + 3 * 8] = 0;
+	o[ADD128_OPERATION_SIZE - 1] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), -ENOEXEC);
+	o[ADD128_OPERATION_SIZE - 1] = 0;
+
+	/* At LOAD: refused before any mapping or firmware traffic, then loads. */
+	put_unaligned_le32(2, tp + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&f->s, snapshot, (const void *const *)aux,
+						   aux_size, &p), -ENOEXEC);
+	KUNIT_EXPECT_PTR_EQ(test, p, NULL);
+	KUNIT_EXPECT_EQ(test, f->count, 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	put_unaligned_le32(1, tp + 0xc);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, (const void *const *)aux,
+						   aux_size, &p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 }
 
 /*
@@ -3764,6 +3979,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
+	KUNIT_CASE(program_add128_dma_test),
+	KUNIT_CASE(program_sections_exact_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),

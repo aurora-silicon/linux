@@ -20,6 +20,8 @@ struct dcpaud_legacy_test {
 	/* The runtime PM usage count when the terminate was waited for */
 	int usage_at_drain;
 	int startlink_err;
+	/* The published service instance, as dcp_audiosrv_instance() reports it */
+	u64 instance;
 	size_t elements_asked;
 	size_t catalog;
 	struct device *dev;
@@ -76,8 +78,10 @@ static enum dma_status dcpaud_legacy_status(struct dma_chan *chan, dma_cookie_t 
 	return DMA_COMPLETE;
 }
 
-static int dcpaud_legacy_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
+static int dcpaud_legacy_startlink(struct device *dev, struct dcp_sound_cookie *cookie, u64 *gen)
 {
+	if (gen)
+		*gen = dcpaud_legacy_current->instance;
 	dcpaud_legacy_record('T');
 	return dcpaud_legacy_current->startlink_err;
 }
@@ -241,6 +245,96 @@ static void dcpaud_legacy_void_takes_no_reference(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcpaud_legacy_usage(audio), 0);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+static u64 dcpaud_legacy_instance(struct device *dev)
+{
+	return dcpaud_legacy_current->instance;
+}
+
+/* A started stream, RUNNING as the PCM core has it, on service instance 5 */
+static struct snd_pcm_substream *dcpaud_legacy_running(struct kunit *test,
+						       struct dcp_audio **audio)
+{
+	struct snd_pcm_substream *sub = dcpaud_legacy_setup(test, audio);
+	struct snd_pcm_runtime *runtime = sub->runtime;
+
+	runtime->status = kunit_kzalloc(test, sizeof(*runtime->status), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, runtime->status);
+	init_waitqueue_head(&runtime->sleep);
+	init_waitqueue_head(&runtime->tsleep);
+	sub->ops = &dcp_playback_ops;
+	INIT_WORK(&(*audio)->replaced_work, dcpaud_replaced_work);
+	dcpaud_legacy_current->instance = 5;
+	kunit_activate_static_stub(test, dcp_audiosrv_instance, dcpaud_legacy_instance);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_START), 0);
+	runtime->state = SNDRV_PCM_STATE_RUNNING;
+	runtime->status->state = SNDRV_PCM_STATE_RUNNING;
+	return sub;
+}
+
+/*
+ * The firmware published a successor of the service with the sink still
+ * connected: the stream's link went with the old instance. The connect that
+ * follows the successor's Open ends the stream as an xrun (DMA terminate and
+ * link stop, as on any STOP); sync_stop then puts the PM reference.
+ */
+static void dcpaud_legacy_replaced_instance_ends_stream(struct kunit *test)
+{
+	struct dcp_audio *audio;
+	struct snd_pcm_substream *sub = dcpaud_legacy_running(test, &audio);
+
+	KUNIT_EXPECT_EQ(test, audio->start_gen, 5ULL);
+	dcpaud_legacy_current->instance = 6;
+	dcpaud_replaced_work(&audio->replaced_work);
+	KUNIT_EXPECT_EQ(test, (int)sub->runtime->state, (int)SNDRV_PCM_STATE_XRUN);
+	KUNIT_EXPECT_STREQ(test, dcpaud_legacy_current->sequence, "TQXS");
+	KUNIT_ASSERT_EQ(test, dcp_pcm_sync_stop(sub), 0);
+	KUNIT_EXPECT_EQ(test, dcpaud_legacy_usage(audio), 0);
+
+	/* Prepared again by userspace, the next START is the successor's */
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_START), 0);
+	KUNIT_EXPECT_EQ(test, audio->start_gen, 6ULL);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_sync_stop(sub), 0);
+}
+
+/* A connect with the stream's own instance still published leaves it playing */
+static void dcpaud_legacy_same_instance_keeps_stream(struct kunit *test)
+{
+	struct dcp_audio *audio;
+	struct snd_pcm_substream *sub = dcpaud_legacy_running(test, &audio);
+
+	dcpaud_replaced_work(&audio->replaced_work);
+	KUNIT_EXPECT_EQ(test, (int)sub->runtime->state, (int)SNDRV_PCM_STATE_RUNNING);
+	KUNIT_EXPECT_STREQ(test, dcpaud_legacy_current->sequence, "TQ");
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_sync_stop(sub), 0);
+	KUNIT_EXPECT_EQ(test, dcpaud_legacy_usage(audio), 0);
+}
+
+/* A stream playing into the void has no link to lose */
+static void dcpaud_legacy_replaced_instance_keeps_void(struct kunit *test)
+{
+	struct dcp_audio *audio;
+	struct snd_pcm_substream *sub = dcpaud_legacy_setup(test, &audio);
+
+	sub->runtime->status = kunit_kzalloc(test, sizeof(*sub->runtime->status), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sub->runtime->status);
+	sub->ops = &dcp_playback_ops;
+	INIT_WORK(&audio->replaced_work, dcpaud_replaced_work);
+	kunit_activate_static_stub(test, dcp_audiosrv_instance, dcpaud_legacy_instance);
+	audio->open_unplugged = true;
+	sub->runtime->period_size = 480000;
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_START), 0);
+	sub->runtime->state = SNDRV_PCM_STATE_RUNNING;
+	dcpaud_legacy_current->instance = 6;
+	dcpaud_replaced_work(&audio->replaced_work);
+	KUNIT_EXPECT_EQ(test, (int)sub->runtime->state, (int)SNDRV_PCM_STATE_RUNNING);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_trigger(sub, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_sync_stop(sub), 0);
+}
+#endif
+
 static int dcpaud_legacy_get_elements(struct device *dev, void *elements, size_t maxsize)
 {
 	struct dcpaud_legacy_test *t = dcpaud_legacy_current;
@@ -291,6 +385,11 @@ static struct kunit_case dcpaud_legacy_cases[] = {
 	KUNIT_CASE(dcpaud_legacy_failed_start),
 	KUNIT_CASE(dcpaud_legacy_void_takes_no_reference),
 	KUNIT_CASE(dcpaud_legacy_elements_capacity),
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	KUNIT_CASE(dcpaud_legacy_replaced_instance_ends_stream),
+	KUNIT_CASE(dcpaud_legacy_same_instance_keeps_stream),
+	KUNIT_CASE(dcpaud_legacy_replaced_instance_keeps_void),
+#endif
 	{}
 };
 
