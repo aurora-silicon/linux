@@ -309,6 +309,30 @@ static inline void dcp_m4_swap_set_deadline(void *output, u64 deadline)
 	put_unaligned_le64(deadline, data + 0x30);
 }
 
+/*
+ * Retarget surface 0 of an encoded external swap to a horizontal tile
+ * [src_x, src_x + tile_w) x [0, height) scanned onto [0, tile_w) x [0, height)
+ * of a dual-pipe merged output, keeping the full-frame surface descriptor.
+ */
+static inline int dcp_m4_swap_set_tile(void *output, size_t length, u32 full_width,
+				       u32 src_x, u32 tile_w, u32 height)
+{
+	u8 *data = output;
+
+	if (!output || length < 0x11c || !tile_w || !height ||
+	    tile_w > full_width || src_x > full_width - tile_w)
+		return -EINVAL;
+	put_unaligned_le32(src_x, data + 0xac);
+	put_unaligned_le32(0, data + 0xb0);
+	put_unaligned_le32(tile_w, data + 0xb4);
+	put_unaligned_le32(height, data + 0xb8);
+	put_unaligned_le32(0, data + 0x10c);
+	put_unaligned_le32(0, data + 0x110);
+	put_unaligned_le32(tile_w, data + 0x114);
+	put_unaligned_le32(height, data + 0x118);
+	return 0;
+}
+
 static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
 					     const struct dcp_m4_frame *frame,
 					     bool brightness_change, u32 nits,

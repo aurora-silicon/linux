@@ -148,6 +148,8 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('single-slice-only', 'allow-second-slice-dva',
                                    'skip-second-slice-unmap', 'claim-before-alloc',
                                    'peer-allow-same-dart'), []),
+    'apple-dcp-m4-peer-tests.py': [([], PASS)]
+        + mutations('--mutation', ('width-only', 'no-concurrent-oob'), []),
     'apple-dart-range-tests.py': [([], PASS)],
     # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
     # every-dart mutation waits it out on every locked DART, not just the display's.

@@ -62,6 +62,7 @@
 #include "dcp-m4-callback.h"
 #include "dcp-m4-property.h"
 #include "dcp-m4-frame.h"
+#include "dcp-m4-peer.h"
 #include "dcp-refresh.h"
 #include "parser.h"
 #include "t8132_ext_drm.h"
@@ -300,7 +301,29 @@ struct iomfb_m4 {
 	/* what iomfb_m4_ext_get_modes() last logged */
 	unsigned int ext_logged_modes, ext_logged_link;
 	int ext_logged_pick;
+	/* Dual-pipe peer bonding (all under dcp_m4_peer_lock). */
+	struct list_head ext_peer_node;
+	struct iomfb_m4 *peer_reserved;
+	struct iomfb_m4 *peer_owner;
+	struct dcp_peer_tiling peer_tiling;
+	bool peer_active;
+	bool peer_failed;
+	bool peer_unbinding;
+	u32 peer_mode_timing, peer_mode_color;
+	struct work_struct peer_stop_work;
 };
+
+static DEFINE_MUTEX(dcp_m4_peer_lock);
+static LIST_HEAD(dcp_m4_ext_list);
+
+static bool dcp_m4_peer_tiling_state(struct iomfb_m4 *dcp, bool write,
+				     u32 event, u32 param, u32 *value);
+static void dcp_m4_peer_display_ids(struct iomfb_m4 *dcp, u32 own, u32 related);
+static bool dcp_m4_peer_is_paired(struct iomfb_m4 *dcp);
+static void dcp_m4_peer_release(struct iomfb_m4 *dcp);
+static void dcp_m4_peer_schedule_stop(struct iomfb_m4 *dcp);
+static void dcp_m4_peer_stop_work(struct work_struct *work);
+static void dcp_m4_peer_forget(struct iomfb_m4 *dcp);
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
 struct dcp_m4_runtime;
@@ -984,6 +1007,13 @@ struct dcp_m4_runtime {
 	struct dcp_m4_frame ext_buf[2];
 	bool ext_buf_stale[2];
 	bool ext_buf_pending; /* the mode is set, its surfaces are not yet */
+	/* Dual-pipe peer SID0 mappings of primary's ext_buf[0..1] (same physical pages). */
+	u64 ext_peer_buf_dva[2];
+	u64 ext_peer_buf_src[2];
+	bool ext_peer_buf_pending;
+	bool ext_peer_buf_ready; /* set on peer runtime once copy fallback slices are mapped */
+	struct dcp_m4_peer_dsc *peer_dsc;
+	bool peer_dsc_trigger;
 	unsigned int ext_back;
 	struct drm_rect ext_prev_damage;
 	/*
@@ -1044,6 +1074,8 @@ struct dcp_m4_runtime {
 	int ext_front;
 	u32 ext_buf_lost[2];
 };
+
+static void dcp_m4_peer_read_dsc_oob(struct dcp_m4_runtime *r);
 
 static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r, int i, enum dcp_m4_ext_end end);
 static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int older,
@@ -1758,9 +1790,35 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 
 		if (cb && dcp_m4_ext_size(cb->input, input_size) &&
 		    dcp_m4_ext_size(cb->output, output_size)) {
-			if (cb->answer == DCP_M4_EXT_TILING) {
-				put_unaligned_le32(0, output);
+			if (method == 115) {
+				u32 event = get_unaligned_le32(input);
+				u32 param = get_unaligned_le32(input + 4);
+				u32 value = get_unaligned_le32(input + 8);
+				bool handled = dcp_m4_peer_tiling_state(r->dcp, false,
+									event, param, &value);
+
+				put_unaligned_le32(handled ? value : 0, output);
 				put_unaligned_le32(1, (u8 *)output + 4);
+				dev_dbg(r->dcp->dev, "D115 tiling get event=%u param=%u val=%u handled=%d\n",
+					event, param, handled ? value : 0, handled);
+				return 0;
+			}
+			if (method == 116) {
+				u32 event = get_unaligned_le32(input);
+				u32 param = get_unaligned_le32(input + 4);
+				u32 value = get_unaligned_le32(input + 8);
+				bool null_val = input[12] & 1;
+				bool handled = !null_val &&
+					dcp_m4_peer_tiling_state(r->dcp, true,
+								 event, param, &value);
+
+				put_unaligned_le32(handled, output);
+				if (handled && event == 1 && param == 10 && value >= 2 &&
+				    r->peer_dsc)
+					r->peer_dsc_trigger = true;
+				dev_dbg(r->dcp->dev, "D116 tiling set event=%u param=%u val=%u null=%u handled=%d\n",
+					event, param, value, null_val, handled);
+				return 0;
 			}
 			if (cb->answer == DCP_M4_EXT_MEMDESC)
 				dcp_m4_ext_memdesc(r, method, input, output);
@@ -1828,19 +1886,33 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 	 * pipes do: zeros, and 0xffffffff at 0x47 while connected.
 	 */
 	if (method == 575) {
+		const u8 *tiled = (const u8 *)input + 8;
+		bool tiled_valid, paired;
 		u64 connected;
 
 		if (input_size != 88 || output_size != 76)
 			return -EMSGSIZE;
 		connected = get_unaligned_le64(input);
-		dev_dbg(r->dcp->dev, "D575 hotplug: connected %llu, record %s\n",
-			connected, (input[84] & 1) ? "absent" : "present");
+		tiled_valid = !(input[84] & 1);
+		paired = dcp_m4_peer_is_paired(r->dcp);
+		dev_dbg(r->dcp->dev, "D575 hotplug: connected %llu, record %s, paired %u\n",
+			connected, tiled_valid ? "present" : "absent", paired);
+		if (paired && tiled_valid && connected &&
+		    !(get_unaligned_le32(tiled + 0xc) & BIT(3))) {
+			u32 own = get_unaligned_le32(tiled + 0x3b);
+			u32 related = get_unaligned_le32(tiled + 0x47);
+
+			dcp_m4_peer_display_ids(r->dcp, own, related);
+		}
 		memset(output, 0, 76);
-		if (connected)
+		if (paired && tiled_valid)
+			memcpy(output, tiled, 76);
+		else if (connected)
 			put_unaligned_le32(0xffffffff, (u8 *)output + 0x47);
 		r->ext_connected = !!connected;
 		/* A sink that went takes a new power-on and mode. */
 		if (!connected) {
+			dcp_m4_peer_schedule_stop(r->dcp);
 			atomic_inc(&r->ext_link_gen);
 			/* The direct swaps in flight are given up now. */
 			if (r->ext_qn)
@@ -2020,6 +2092,10 @@ static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int met
 			break;
 		}
 		ret = dcp_m4_runtime_callback(r, word);
+		if (!ret && r->peer_dsc_trigger && !dcp->transaction.callbacks) {
+			r->peer_dsc_trigger = false;
+			dcp_m4_peer_read_dsc_oob(r);
+		}
 	}
 finished:
 	r->deadline = previous;
@@ -2108,7 +2184,8 @@ static int dcp_m4_ext_swap_wait(struct dcp_m4_runtime *r, int link_gen, u64 *wor
 	int ret;
 
 	for (;;) {
-		if (!r->ext_connected || atomic_read(&r->ext_link_gen) != link_gen)
+		if ((!READ_ONCE(r->dcp->peer_owner) && !r->ext_connected) ||
+		    atomic_read(&r->ext_link_gen) != link_gen)
 			return -ENOLINK;
 		if (time_before(jiffies + msecs_to_jiffies(50), deadline))
 			r->deadline = jiffies + msecs_to_jiffies(50);
@@ -2734,6 +2811,8 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	INIT_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
 	spin_lock_init(&dcp->ext_put_lock);
 	INIT_LIST_HEAD(&dcp->ext_puts);
+	INIT_LIST_HEAD(&dcp->ext_peer_node);
+	INIT_WORK(&dcp->peer_stop_work, dcp_m4_peer_stop_work);
 	INIT_WORK(&dcp->ext_put_work, iomfb_m4_ext_put_work);
 	init_waitqueue_head(&dcp->ext_settle_wq);
 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
@@ -2918,6 +2997,10 @@ int iomfb_m4_adopt_external(struct apple_dcp *owner)
 		mutex_lock(&dcp->lock);
 		dcp_m4_startup(dcp);
 		mutex_unlock(&dcp->lock);
+		mutex_lock(&dcp_m4_peer_lock);
+		if (list_empty(&dcp->ext_peer_node))
+			list_add_tail(&dcp->ext_peer_node, &dcp_m4_ext_list);
+		mutex_unlock(&dcp_m4_peer_lock);
 	}
 	return ret;
 }
@@ -3073,8 +3156,10 @@ void iomfb_m4_external_link_gone(struct apple_dcp *owner)
 		WRITE_ONCE(r->ext_cur_timing, 0);
 	}
 	/* The next sink's timing catalog is its own, nothing received before. */
-	if (dcp && dcp->external)
+	if (dcp && dcp->external) {
+		dcp_m4_peer_schedule_stop(dcp);
 		dcp_m4_ext_sink_gone(dcp, true);
+	}
 	/* No sink until the next D575 reports one. */
 	if (dcp && dcp->external && READ_ONCE(dcp->ext_sink)) {
 		WRITE_ONCE(dcp->ext_sink, false);
@@ -4037,12 +4122,16 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
 	}
 	for (unsigned int i = 0; !ret && i < count; i++) {
 		const struct dcp_display_mode *m = &modes[i];
-		struct dcp_color_element color;
+		struct dcp_color_element color = {};
 
 		if ((m->mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLCLK)) ||
 		    !dcp_m4_ext_timing_color(blob, size, m->timing_mode_id, &color) ||
-		    color.depth != 8)
+		    color.depth != 8) {
+			dev_dbg(dcp->dev, "skipped timing %u %ux%u@%d: flags=%#x depth=%lld\n",
+				m->timing_mode_id, m->mode.hdisplay, m->mode.vdisplay,
+				drm_mode_vrefresh(&m->mode), m->mode.flags, color.depth);
 			continue;
+		}
 		drm_mode_copy(&list[kept].mode, &m->mode);
 		/* The connector's preferred mode is chosen at get_modes. */
 		list[kept].mode.type &= ~DRM_MODE_TYPE_PREFERRED;
@@ -4196,6 +4285,13 @@ static int dcp_m4_ext_set_mode(struct dcp_m4_runtime *r, const char *what, u32 t
 		dev_warn(dcp->dev, "%s: A364 mode info (timing %u, color %u): %d\n",
 			 what, timing, color, ret);
 		return ret;
+	}
+	dev_dbg(dcp->dev, "%s: A364 timing=%u color=%u requires_merge=%u success=%u\n",
+		what, timing, color, reply[0x70] & 1, reply[0x71] & 1);
+	if (reply[0x70] & 1) {
+		dev_warn(dcp->dev, "%s: timing %u color %u requires dual-pipe merge (no peer reserved)\n",
+			 what, timing, color);
+		return -EOPNOTSUPP;
 	}
 	memset(out, 0, sizeof(out));
 	/* The firmware itself gives a modeset about 8 s. */
@@ -4399,6 +4495,8 @@ static int dcp_m4_ext_settle(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r, con
 	return 0;
 }
 
+#include "dcp-m4-peer.inc"
+
 /*
  * A DRM modeset of an external output: the display power-on (A414, A473 1,
  * A411) once per link, the mode (A364/A413, the bootstrap colour first if
@@ -4408,11 +4506,12 @@ static int dcp_m4_ext_settle(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r, con
 int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *ids,
 			u32 width, u32 height)
 {
-	struct iomfb_m4 *dcp = owner->v26_6;
-	struct dcp_m4_runtime *r;
+	struct iomfb_m4 *dcp = owner->v26_6, *peer = NULL;
+	struct dcp_m4_runtime *r, *peer_r = NULL;
 	const char *why = "";
 	int link_gen, sink_gen;
 	u32 status = 0;
+	bool paired_kept = false, merged = false;
 	int ret = -ENOLINK;
 
 	if (!dcp || !dcp->external)
@@ -4458,29 +4557,78 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
 		why = "the mode is not one of the current sink's";
 		goto out;
 	}
-	ret = 0;
-	if (!READ_ONCE(r->ext_powered)) {
-		ret = dcp_m4_ext_power_on(r);
+	peer = dcp_m4_peer_get_locked(dcp, &peer_r, false, NULL);
+	if (peer) {
+		ret = dcp_m4_ext_settle(peer, peer_r, "enable-peer");
 		if (ret)
 			goto out;
-		WRITE_ONCE(r->ext_powered, true);
+		mutex_lock(&dcp_m4_peer_lock);
+		paired_kept = dcp->peer_tiling.modeset_complete &&
+			      peer->peer_tiling.modeset_complete && !dcp->peer_failed &&
+			      dcp->peer_mode_timing == ids->timing &&
+			      dcp->peer_mode_color == ids->color;
+		merged = dcp->peer_tiling.vftg || dcp->peer_tiling.member || dcp->peer_active ||
+			 peer->peer_tiling.vftg || peer->peer_tiling.member;
+		if (paired_kept)
+			dcp->peer_active = true;
+		else
+			dcp->peer_active = false;
+		mutex_unlock(&dcp_m4_peer_lock);
 	}
-	if (READ_ONCE(r->ext_cur_timing) != ids->timing || r->ext_cur_color != ids->color) {
-		WRITE_ONCE(r->ext_cur_timing, 0);
-		if (ids->bootstrap) {
-			ret = dcp_m4_ext_set_mode(r, "DRM bootstrap", ids->timing, ids->bootstrap,
-						  &status);
-			if (!ret && status)
-				ret = -EIO;
-		}
-		if (!ret)
-			ret = dcp_m4_ext_set_mode(r, "DRM mode", ids->timing, ids->color, &status);
-		if (!ret && status)
-			ret = -EIO;
-		if (ret)
-			goto out;
+	ret = 0;
+	if (paired_kept) {
 		r->ext_cur_color = ids->color;
 		WRITE_ONCE(r->ext_cur_timing, ids->timing);
+		dev_info(dcp->dev, "paired DRM modeset %ux%u timing %u color %u: kept\n",
+			 width, height, ids->timing, ids->color);
+	} else {
+		if (peer && merged) {
+			ret = dcp_m4_peer_unpair(r, peer_r);
+			if (ret)
+				goto out;
+			WRITE_ONCE(r->ext_cur_timing, 0);
+		}
+		if (!READ_ONCE(r->ext_powered)) {
+			ret = dcp_m4_ext_power_on(r);
+			if (ret)
+				goto out;
+			WRITE_ONCE(r->ext_powered, true);
+		}
+		if (READ_ONCE(r->ext_cur_timing) != ids->timing || r->ext_cur_color != ids->color) {
+			int pret = -EOPNOTSUPP;
+
+			WRITE_ONCE(r->ext_cur_timing, 0);
+			if (peer) {
+				pret = dcp_m4_peer_install_video(r, peer_r, ids->timing, ids->color,
+								 width, height);
+				if (pret && pret != -EOPNOTSUPP) {
+					mutex_lock(&dcp_m4_peer_lock);
+					merged = dcp->peer_tiling.vftg || peer->peer_tiling.vftg;
+					mutex_unlock(&dcp_m4_peer_lock);
+					if (merged)
+						dcp_m4_peer_unpair(r, peer_r);
+					ret = pret;
+					goto out;
+				}
+			}
+			if (pret == -EOPNOTSUPP) {
+				if (ids->bootstrap) {
+					ret = dcp_m4_ext_set_mode(r, "DRM bootstrap", ids->timing,
+								  ids->bootstrap, &status);
+					if (!ret && status)
+						ret = -EIO;
+				}
+				if (!ret)
+					ret = dcp_m4_ext_set_mode(r, "DRM mode", ids->timing,
+								  ids->color, &status);
+				if (!ret && status)
+					ret = -EIO;
+				if (ret)
+					goto out;
+			}
+			r->ext_cur_color = ids->color;
+			WRITE_ONCE(r->ext_cur_timing, ids->timing);
+		}
 	}
 	r->ext_width = width;
 	r->ext_height = height;
@@ -4496,7 +4644,21 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
 		r->ext_buf_pending = false;
 	else if (dcp_m4_ext_scanout_gate(dcp))
 		ret = 0;
+	if (!ret && peer && READ_ONCE(dcp->peer_active)) {
+		r->ext_peer_buf_pending = true;
+		if (!r->ext_buf_pending) {
+			ret = dcp_m4_peer_drm_buffers(r, peer_r);
+			if (!ret)
+				r->ext_peer_buf_pending = false;
+			else if (dcp_m4_ext_scanout_gate(peer))
+				ret = 0;
+		}
+	} else {
+		r->ext_peer_buf_pending = false;
+	}
 out:
+	if (peer)
+		mutex_unlock(&peer->lock);
 	/*
 	 * DRM takes the mode as set whatever this returns: after a
 	 * failure no frame goes out (with the old mode) until an enable works.
@@ -4583,11 +4745,12 @@ static u64 dcp_m4_ext_copy(void *dst, u32 stride, const struct iosys_map *src, u
 int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u32 pitch,
 			 const struct drm_rect *damage)
 {
-	struct iomfb_m4 *dcp = owner->v26_6;
-	struct dcp_m4_runtime *r;
+	struct iomfb_m4 *dcp = owner->v26_6, *peer = NULL;
+	struct dcp_m4_runtime *r, *peer_r = NULL;
 	struct drm_rect full, rect, cur;
-	struct dcp_m4_frame *f;
+	struct dcp_m4_frame *f, pf;
 	unsigned int back;
+	u32 tile_w = 0;
 	void *cpu;
 	int ret = -ENOLINK;
 
@@ -4599,6 +4762,13 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	if (!r || !smp_load_acquire(&r->done) || READ_ONCE(dcp->error) || !r->ext_connected ||
 	    !READ_ONCE(r->ext_cur_timing))
 		goto out;
+	if (READ_ONCE(dcp->peer_active)) {
+		peer = dcp_m4_peer_get_locked(dcp, &peer_r, true, &tile_w);
+		if (!peer) {
+			ret = -EIO;
+			goto out;
+		}
+	}
 	/*
 	 * Surfaces an enable could not prepare (D572(0) then): now, once the
 	 * display DART is on, PIODMA included. Only a DART still off retries.
@@ -4613,6 +4783,19 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	ret = dcp_m4_ext_scanout_gate(dcp);
 	if (ret)
 		goto out;
+	if (peer) {
+		if (r->ext_peer_buf_pending) {
+			ret = READ_ONCE(peer->ext_dart_down) ? -EAGAIN :
+				dcp_m4_peer_drm_buffers(r, peer_r);
+			if (ret != -EAGAIN || !READ_ONCE(peer->ext_dart_down))
+				r->ext_peer_buf_pending = false;
+			if (ret)
+				goto out;
+		}
+		ret = dcp_m4_ext_scanout_gate(peer);
+		if (ret)
+			goto out;
+	}
 	/*
 	 * After a swap given up on a live link, nothing until its D590,
 	 * except the one probe a DRM enable allows; a confirmed swap ends the
@@ -4624,7 +4807,8 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		goto out;
 	ret = -EBUSY;
 	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn || r->ext_sleeping)
+	    r->ext_qn || r->ext_sleeping ||
+	    (peer && (peer_r->ext_hold_id || peer_r->ext_orphan_start || peer_r->ext_qn)))
 		goto out;
 	r->ext_hold_probe = false;
 	/*
@@ -4639,7 +4823,8 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	}
 	if (back == r->ext_front || r->ext_buf_lost[back]) {
 		r->ext_swap_surface = -1;
-		ret = dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
+		ret = peer ? dcp_m4_peer_swap(r, peer_r, NULL, NULL, -1, -1, 0, tile_w) :
+			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
 		dev_dbg(dcp->dev, "no free copy surface (on screen %d, uncertain swaps %u/%u): surfaceless swap first: %d\n",
 			back ^ 1, r->ext_buf_lost[0], r->ext_buf_lost[1], ret);
 		if (ret)
@@ -4649,6 +4834,8 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		if (!dcp_m4_ext_sync_shown(r, "copy"))
 			goto out;
 		dcp_m4_ext_retired(r, -1);
+		if (peer)
+			dcp_m4_ext_retired(peer_r, -1);
 		r->ext_buf_stale[0] = true;
 		r->ext_buf_stale[1] = true;
 		back = r->ext_back;
@@ -4657,7 +4844,7 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	cpu = r->ext_buf_cpu[back];
 	ret = -ENODEV;
 	if (!cpu || f->width != r->ext_width || f->height != r->ext_height ||
-	    pitch < f->width * 4)
+	    pitch < f->width * 4 || (peer && !r->ext_peer_buf_dva[back]))
 		goto out;
 	full = DRM_RECT_INIT(0, 0, f->width, f->height);
 	cur = *damage;
@@ -4695,7 +4882,13 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	/* Only through the Normal-NC view; nothing else maps these pages. */
 	dma_wmb();
 	r->ext_swap_surface = back;
-	ret = dcp_m4_runtime_swap_full(r, true, f, NULL, 0, false, 0, 0, 0);
+	if (peer) {
+		pf = *f;
+		pf.dva = r->ext_peer_buf_dva[back];
+		ret = dcp_m4_peer_swap(r, peer_r, f, &pf, -1, -1, 0, tile_w);
+	} else {
+		ret = dcp_m4_runtime_swap_full(r, true, f, NULL, 0, false, 0, 0, 0);
+	}
 	r->ext_swap_surface = -1;
 	if (ret) {
 		r->ext_buf_stale[back] = true;
@@ -4712,10 +4905,14 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		goto out;
 	}
 	dcp_m4_ext_retired(r, back);
+	if (peer)
+		dcp_m4_ext_retired(peer_r, -1);
 	/* A frame shown, for the replay after a sleep. */
 	if (r->ext_restore_pending)
 		WRITE_ONCE(r->ext_restore_frame, true);
 out:
+	if (peer)
+		mutex_unlock(&peer->lock);
 	mutex_unlock(&dcp->lock);
 	return ret;
 }
@@ -4876,7 +5073,8 @@ static int dcp_m4_ext_win_get(struct dcp_m4_runtime *r, const struct iomfb_m4_ex
 	 * A new slice only once the copy surfaces have theirs: the copy
 	 * fallback must never find the arena used up by windows.
 	 */
-	for (int i = 0; pick < 0 && r->ext_buf_cpu[0] && r->ext_buf_cpu[1] &&
+	for (int i = 0; pick < 0 && ((r->ext_buf_cpu[0] && r->ext_buf_cpu[1]) ||
+				     r->ext_peer_buf_ready) &&
 	     i < DCP_M4_EXT_WINDOWS; i++) {
 		u64 dva;
 
@@ -4958,7 +5156,7 @@ static void dcp_m4_ext_flip_after(struct dcp_m4_runtime *r, const struct dcp_m4_
 		r->ext_q[0].flip_held = false;
 		send = true;
 	}
-	if (send)
+	if (send && !READ_ONCE(r->dcp->peer_owner))
 		t8132_ext_drm_flip_done(r->dcp->dev);
 }
 
@@ -5029,7 +5227,8 @@ static bool dcp_m4_ext_async_due(struct dcp_m4_runtime *r, bool *went)
 {
 	const struct dcp_m4_ext_inflight *e = &r->ext_q[0];
 
-	*went = !r->ext_connected || atomic_read(&r->ext_link_gen) != e->gen;
+	*went = (!READ_ONCE(r->dcp->peer_owner) && !r->ext_connected) ||
+		atomic_read(&r->ext_link_gen) != e->gen;
 	return *went || !time_before(jiffies, e->deadline);
 }
 
@@ -5106,11 +5305,12 @@ static void dcp_m4_ext_async_work(struct work_struct *work)
  */
 int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_ext_fb *fb)
 {
-	struct iomfb_m4 *dcp = owner->v26_6;
-	struct dcp_m4_runtime *r;
-	struct dcp_m4_frame f;
-	int ret = -ENOLINK, w;
-	unsigned int depth, free;
+	struct iomfb_m4 *dcp = owner->v26_6, *peer = NULL;
+	struct dcp_m4_runtime *r, *peer_r = NULL;
+	struct dcp_m4_frame f, pf;
+	int ret = -ENOLINK, w, pw = -1;
+	unsigned int depth, free, peer_free;
+	u32 tile_w = 0;
 	size_t need;
 
 	if (!dcp || !dcp->external)
@@ -5121,6 +5321,13 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	if (!r || !smp_load_acquire(&r->done) || READ_ONCE(dcp->error) || !r->ext_connected ||
 	    !READ_ONCE(r->ext_cur_timing))
 		goto out;
+	if (READ_ONCE(dcp->peer_active)) {
+		peer = dcp_m4_peer_get_locked(dcp, &peer_r, true, &tile_w);
+		if (!peer) {
+			ret = -EIO;
+			goto out;
+		}
+	}
 	/* After a failed enable, never a frame with the old mode. */
 	ret = -ESTALE;
 	if (r->ext_mode_stale)
@@ -5128,7 +5335,9 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	ret = -EBUSY;
 	depth = clamp_val(READ_ONCE(t8132_ext_swap_depth), 1, DCP_M4_EXT_INFLIGHT);
 	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn >= depth || r->ext_sleeping)
+	    r->ext_qn >= depth || r->ext_sleeping ||
+	    (peer && (peer_r->ext_hold_id || peer_r->ext_orphan_start ||
+		      peer_r->ext_qn >= depth)))
 		goto out;
 	/*
 	 * A slot for each swap in flight, this one included, that a later D590
@@ -5143,6 +5352,13 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 				     (unsigned int)ARRAY_SIZE(r->ext_early) - free);
 		goto out;
 	}
+	if (peer) {
+		peer_free = 0;
+		for (unsigned int i = 0; i < ARRAY_SIZE(peer_r->ext_early); i++)
+			peer_free += !peer_r->ext_early[i];
+		if (peer_free <= peer_r->ext_qn)
+			goto out;
+	}
 	ret = -EOPNOTSUPP;
 	need = PAGE_ALIGN((size_t)fb->pitch * fb->height);
 	if (fb->width != r->ext_width || fb->height != r->ext_height ||
@@ -5152,6 +5368,11 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	ret = dcp_m4_ext_scanout_gate(dcp);
 	if (ret)
 		goto out;
+	if (peer) {
+		ret = dcp_m4_ext_scanout_gate(peer);
+		if (ret)
+			goto out;
+	}
 	/*
 	 * The copy surfaces an enable deferred (D572(0) then), before any
 	 * window takes a slice: the copy fallback keeps its own.
@@ -5162,13 +5383,31 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 		if (ret)
 			goto out;
 	}
+	if (peer && r->ext_peer_buf_pending) {
+		ret = dcp_m4_peer_drm_buffers(r, peer_r);
+		r->ext_peer_buf_pending = !!ret;
+		if (ret)
+			goto out;
+	}
 	ret = dcp_m4_ext_win_release_idle(r, 2 * HZ);
 	if (ret)
 		goto out;
+	if (peer) {
+		ret = dcp_m4_ext_win_release_idle(peer_r, 2 * HZ);
+		if (ret)
+			goto out;
+	}
 	w = dcp_m4_ext_win_get(r, fb, need);
 	if (w < 0) {
 		ret = w;
 		goto out;
+	}
+	if (peer) {
+		pw = dcp_m4_ext_win_get(peer_r, fb, need);
+		if (pw < 0) {
+			ret = pw;
+			goto out;
+		}
 	}
 	f = (struct dcp_m4_frame) {
 		.dva = r->ext_win[w].dva, .backing_size = (u64)r->ext_win[w].count * SZ_16K,
@@ -5180,12 +5419,24 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	r->ext_swap_win = w;
 	r->ext_swap_async = depth;
 	r->ext_swap_now = false;
-	ret = dcp_m4_runtime_swap_full(r, true, &f, NULL, 0, false, 0, 0, 0);
+	if (peer) {
+		pf = (struct dcp_m4_frame) {
+			.dva = peer_r->ext_win[pw].dva,
+			.backing_size = (u64)peer_r->ext_win[pw].count * SZ_16K,
+			.width = fb->width, .height = fb->height, .stride = fb->pitch,
+			.format = DCP_M4_XRGB8888,
+		};
+		ret = dcp_m4_peer_swap(r, peer_r, &f, &pf, w, pw, depth, tile_w);
+	} else {
+		ret = dcp_m4_runtime_swap_full(r, true, &f, NULL, 0, false, 0, 0, 0);
+	}
 	r->ext_swap_async = 0;
 	r->ext_swap_win = -1;
 	if (!ret && r->ext_swap_now)
 		ret = 1;
 out:
+	if (peer)
+		mutex_unlock(&peer->lock);
 	mutex_unlock(&dcp->lock);
 	return ret;
 }
@@ -5197,8 +5448,9 @@ out:
  */
 int iomfb_m4_ext_blank(struct apple_dcp *owner)
 {
-	struct iomfb_m4 *dcp = owner->v26_6;
-	struct dcp_m4_runtime *r;
+	struct iomfb_m4 *dcp = owner->v26_6, *peer = NULL;
+	struct dcp_m4_runtime *r, *peer_r = NULL;
+	u32 tile_w = 0;
 	int ret = 0;
 
 	if (!dcp || !dcp->external)
@@ -5233,22 +5485,37 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 	/* Pairs with the release store of r->done in startup. */
 	if (r && !ret && smp_load_acquire(&r->done) && dcp_m4_ext_route_ready(dcp, r) &&
 	    READ_ONCE(r->ext_cur_timing)) {
+		if (READ_ONCE(dcp->peer_active))
+			peer = dcp_m4_peer_get_locked(dcp, &peer_r, true, &tile_w);
+		if (peer)
+			ret = dcp_m4_ext_settle(peer, peer_r, "disable-peer");
 		/* Not into a pipe that holds swaps; its surfaces stay as they are. */
 		r->ext_swap_surface = -1;
-		ret = r->ext_hold_id || r->ext_orphan_start ? -EBUSY :
-			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
+		if (!ret)
+			ret = (r->ext_hold_id || r->ext_orphan_start ||
+			       (peer && (peer_r->ext_hold_id || peer_r->ext_orphan_start))) ?
+			      -EBUSY :
+			      (peer ? dcp_m4_peer_swap(r, peer_r, NULL, NULL, -1, -1, 0, tile_w) :
+				      dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0,
+							       0));
 		if (ret == -EBUSY)
 			dev_info(dcp->dev, "disable: swaps held or a start orphaned: the last frame stays\n");
 		/* Only a displayed blank takes the windows off screen. */
 		if (!ret && dcp_m4_ext_sync_shown(r, "disable")) {
 			dcp_m4_ext_retired(r, -1);
+			if (peer)
+				dcp_m4_ext_retired(peer_r, -1);
 			/* The windows are off screen: let them go. */
 			if (dcp_m4_ext_win_release_idle(r, 0))
 				dev_dbg(dcp->dev, "disable: idle windows not let go of\n");
+			if (peer && dcp_m4_ext_win_release_idle(peer_r, 0))
+				dev_dbg(peer->dev, "disable: peer idle windows not let go of\n");
 		}
 		r->ext_buf_stale[0] = true;
 		r->ext_buf_stale[1] = true;
 		dev_dbg(dcp->dev, "disable: surfaceless swap: %d\n", ret);
+		if (peer)
+			mutex_unlock(&peer->lock);
 	}
 	mutex_unlock(&dcp->lock);
 	return ret;
@@ -5295,8 +5562,10 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 {
 	struct dcp_m4_power_state_req req = { .state = cpu_to_le64(0) };
 	struct dcp_m4_power_state_reply reply = {};
-	struct iomfb_m4 *dcp = owner->v26_6;
-	struct dcp_m4_runtime *r;
+	struct iomfb_m4 *dcp = owner->v26_6, *peer = NULL;
+	struct dcp_m4_runtime *r, *peer_r = NULL;
+	bool peer_merged = false, peer_active = false;
+	u32 tile_w = 0;
 	int ret = 0, mapped = 0, left = 0;
 
 	if (!dcp || !dcp->external)
@@ -5312,19 +5581,39 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 		r->ext_qn ? r->ext_q[0].swap.id : 0);
 	/* The workers run: the swaps in flight complete or are given up as ever. */
 	ret = dcp_m4_ext_settle(dcp, r, "sleep");
+	peer = dcp_m4_peer_get_locked(dcp, &peer_r, false, &tile_w);
+	if (peer) {
+		if (!ret)
+			ret = dcp_m4_ext_settle(peer, peer_r, "sleep-peer");
+		mutex_lock(&dcp_m4_peer_lock);
+		peer_active = dcp->peer_active && !dcp->peer_failed &&
+			      dcp->peer_tiling.modeset_complete &&
+			      peer->peer_tiling.modeset_complete;
+		peer_merged = peer_active || dcp->peer_tiling.vftg || dcp->peer_tiling.member ||
+			      peer->peer_tiling.vftg || peer->peer_tiling.member;
+		mutex_unlock(&dcp_m4_peer_lock);
+	}
 	if (!ret && dcp_m4_ext_route_ready(dcp, r) && READ_ONCE(r->ext_cur_timing)) {
 		r->ext_swap_surface = -1;
-		ret = r->ext_hold_id || r->ext_orphan_start ? -EBUSY :
-			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
+		ret = (r->ext_hold_id || r->ext_orphan_start ||
+		       (peer_active && (peer_r->ext_hold_id || peer_r->ext_orphan_start))) ?
+		      -EBUSY :
+		      (peer_active ? dcp_m4_peer_swap(r, peer_r, NULL, NULL, -1, -1, 0, tile_w) :
+				     dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0,
+							      0));
 		if (ret)
 			dev_warn(dcp->dev, "sleep: surfaceless swap failed: %d\n", ret);
 		/* Only a displayed blank takes the windows off screen. */
 		if (!ret && dcp_m4_ext_sync_shown(r, "sleep")) {
 			dcp_m4_ext_retired(r, -1);
+			if (peer)
+				dcp_m4_ext_retired(peer_r, -1);
 			for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 				mapped += !!r->ext_win[i].key;
 			if (dcp_m4_ext_win_release_idle(r, 0))
 				dev_dbg(dcp->dev, "sleep: idle windows not let go of\n");
+			if (peer && dcp_m4_ext_win_release_idle(peer_r, 0))
+				dev_dbg(peer->dev, "sleep: peer idle windows not let go of\n");
 			for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 				left += !!r->ext_win[i].key;
 			dev_dbg(dcp->dev, "sleep: windows released: %d of %d\n",
@@ -5333,17 +5622,41 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 		r->ext_buf_stale[0] = true;
 		r->ext_buf_stale[1] = true;
 	}
-	if (!ret && READ_ONCE(r->ext_powered) && r->ext_connected) {
+	if (!ret && peer && peer_merged) {
+		/* Never send single-pipe A473(0) against a merged pair: quiesce both. */
+		ret = dcp_m4_peer_quiesce(r, peer_r);
+		dev_info(dcp->dev, "sleep: paired quiesce: %d (primary DART %s, peer DART %s)\n",
+			 ret, READ_ONCE(dcp->ext_dart_down) ? "off" : "on",
+			 READ_ONCE(peer->ext_dart_down) ? "off" : "on");
+		if (!ret && (!READ_ONCE(dcp->ext_dart_down) || !READ_ONCE(peer->ext_dart_down))) {
+			mutex_unlock(&peer->lock);
+			mutex_unlock(&dcp->lock);
+			wait_event_timeout(dcp->ext_settle_wq,
+					   READ_ONCE(dcp->ext_dart_down) || READ_ONCE(dcp->error),
+					   msecs_to_jiffies(1000));
+			wait_event_timeout(peer->ext_settle_wq,
+					   READ_ONCE(peer->ext_dart_down) || READ_ONCE(peer->error),
+					   msecs_to_jiffies(1000));
+			mutex_lock(&dcp->lock);
+			mutex_lock_nested(&peer->lock, SINGLE_DEPTH_NESTING);
+		}
+		if (!READ_ONCE(dcp->ext_dart_down) || !READ_ONCE(peer->ext_dart_down))
+			dev_warn(dcp->dev, "sleep: paired display DART(s) still on after quiesce\n");
+	} else if (!ret && READ_ONCE(r->ext_powered) && r->ext_connected) {
 		ret = dcp_m4_ext_call(r, 473, 1, &req, sizeof(req), &reply, sizeof(reply), 5000);
 		dev_dbg(dcp->dev, "sleep: A473 power state 0: %d, value %u, status %#x\n",
 			ret, le32_to_cpu(reply.value), le32_to_cpu(reply.status));
 		/* Its D572(0), nested in it or after it (the idle worker), 1 s at most. */
 		if (!ret && !READ_ONCE(dcp->ext_dart_down)) {
+			if (peer)
+				mutex_unlock(&peer->lock);
 			mutex_unlock(&dcp->lock);
 			wait_event_timeout(dcp->ext_settle_wq,
 					   READ_ONCE(dcp->ext_dart_down) || READ_ONCE(dcp->error),
 					   msecs_to_jiffies(1000));
 			mutex_lock(&dcp->lock);
+			if (peer)
+				mutex_lock_nested(&peer->lock, SINGLE_DEPTH_NESTING);
 		}
 		if (!READ_ONCE(dcp->ext_dart_down))
 			dev_warn(dcp->dev, "sleep: the display DART not powered down within 1 s of the power-off (%d): the DCP refuses to suspend\n",
@@ -5352,7 +5665,10 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 	/* After the sleep the display is powered on and its mode set from scratch. */
 	WRITE_ONCE(r->ext_powered, false);
 	WRITE_ONCE(r->ext_cur_timing, 0);
+	if (peer)
+		mutex_unlock(&peer->lock);
 	mutex_unlock(&dcp->lock);
+	dcp_m4_peer_release(dcp);
 }
 
 /*
@@ -6048,6 +6364,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
 
 	if (!dcp)
 		return;
+	dcp_m4_peer_forget(dcp);
 	/* Wake any RPC waiter before waiting for workers; never recycle its DMA. */
 	dcp_m4_failed(dcp, -ENODEV);
 	cancel_work_sync(&dcp->backlight_work);
