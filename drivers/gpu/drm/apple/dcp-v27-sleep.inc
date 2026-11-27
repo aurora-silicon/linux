@@ -2129,25 +2129,6 @@ static int dcp_v27_ext_idle_reopen_sessions(struct apple_dcp *dcp)
 	return 0;
 }
 
-static void dcp_v27_dpms_complete(struct apple_dcp *dcp)
-{
-	if (!dcp_v27_dpms_capable(dcp))
-		return;
-
-	guard(mutex)(&dcp->s2r_prewarm_lock);
-	dcp->v27_dpms_pm_suspend = false;
-	if (dcp->v27_dpms_was_soft_off) {
-		WRITE_ONCE(dcp->v27_dpms_was_soft_off, false);
-		dcp_v27_dpms_off_locked(dcp);
-	}
-}
-
-static void dcp_v27_dpms_handoff(struct apple_dcp *dcp)
-{
-	if (!dcp || !READ_ONCE(dcp->v27_dpms_soft_off))
-		return;
-	guard(mutex)(&dcp->s2r_prewarm_lock);
-	dcp_v27_dpms_on_locked(dcp, false);
 /*
  * Checked rollback to a live coprocessor when a clean refusal occurs before
  * RTKit idle is issued. Returns > 0 (1) if the pipe was cleanly restored so
