@@ -109,7 +109,9 @@ static struct cft_ctx *cft_setup(struct kunit *test,
 	ctx->policy->min = ctx->table[0].frequency;
 	ctx->policy->max = ctx->table[CFT_NR_STATES - 1].frequency;
 	ctx->policy->cur = ctx->table[0].frequency;
+	ctx->policy->fast_switch_enabled = info->lazy_verify;
 	ctx->policy->driver_data = ctx->priv;
+	ctx->priv->policy = ctx->policy;
 
 	test->priv = ctx;
 	return ctx;
@@ -1289,7 +1291,74 @@ static void cft_test_fast_die_init_invalid(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cft_qos_max(ctx), FREQ_QOS_MAX_DEFAULT_VALUE);
 }
 
+/*
+ * A deferred pending request and a lifted thermal cap must both respect a
+ * newer policy->max, and losing fast-switch ownership must drop any pending
+ * request instead of writing it under a non-fast-switch governor.
+ */
+static void cft_test_lazy_policy_limits_and_handoff(struct kunit *test)
+{
+	struct cft_ctx *ctx = cft_setup(test, &soc_t6050_info, 1);
+	unsigned int freq;
+	int moved;
+
+	/* Queue a high pending state while BUSY, then lower policy->max. */
+	cft_set_cmd(ctx->regs, 1 | APPLE_DVFS_CMD_BUSY);
+	KUNIT_EXPECT_TRUE(test, cft_lazy_request(ctx, 4, &freq));
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, 15);
+
+	ctx->policy->max = 1800000;
+	cft_set_cmd(ctx->regs, 1);
+	KUNIT_EXPECT_TRUE(test, cft_verify(ctx));
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 7ULL);
+	KUNIT_EXPECT_EQ(test, ctx->priv->expected_pstate, 7U);
+
+	/* Thermal cap restore must also stay within the lowered policy->max. */
+	KUNIT_EXPECT_TRUE(test, cft_lazy_cap(ctx, 4, 1200000, &moved));
+	KUNIT_EXPECT_EQ(test, moved, 4);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 4ULL);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1200000U);
+	KUNIT_EXPECT_TRUE(test, cft_lazy_cap(ctx, 15, 3000000, &moved));
+	KUNIT_EXPECT_EQ(test, moved, 7);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 7ULL);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
+
+	/*
+	 * Once QoS publishes a higher policy->max after a cap lift, re-running
+	 * lazy_cap restores asked_pstate even without a new schedutil request.
+	 */
+	ctx->policy->max = 3000000;
+	KUNIT_EXPECT_TRUE(test, cft_lazy_cap(ctx, 15, 3000000, &moved));
+	KUNIT_EXPECT_EQ(test, moved, 15);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 15ULL);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 3000000U);
+
+	/*
+	 * Switching away from a fast-switch governor clears
+	 * fast_switch_enabled: the timer must drop the pending state and
+	 * thermal samples must leave hardware and policy->cur untouched.
+	 */
+	cft_set_cmd(ctx->regs, 7 | APPLE_DVFS_CMD_BUSY);
+	ctx->priv->expected_pstate = 7;
+	ctx->policy->cur = 1800000;
+	KUNIT_EXPECT_TRUE(test, cft_lazy_request(ctx, 4, &freq));
+	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, 15);
+
+	ctx->policy->fast_switch_enabled = false;
+	cft_set_cmd(ctx->regs, 7);
+	KUNIT_EXPECT_FALSE(test, cft_verify(ctx));
+	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 7ULL);
+	KUNIT_EXPECT_FALSE(test, ctx->priv->transition_failed);
+
+	KUNIT_EXPECT_FALSE(test, cft_lazy_cap(ctx, 1, 600000, &moved));
+	KUNIT_EXPECT_EQ(test, moved, -1);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
+}
+
 static struct kunit_case apple_soc_cpufreq_test_cases[] = {
+	KUNIT_CASE(cft_test_lazy_policy_limits_and_handoff),
 	KUNIT_CASE_PARAM(cft_test_layout, cft_layout_gen_params),
 	KUNIT_CASE(cft_test_layout_invariants),
 	KUNIT_CASE_PARAM(cft_test_write, cft_write_gen_params),
@@ -1370,11 +1439,13 @@ static int cft_live_target(struct cpufreq_policy *policy, unsigned int index)
 
 static struct cpufreq_driver cft_live_driver = {
 	.name		= "apple-cpufreq",
-	.flags		= CPUFREQ_HAVE_GOVERNOR_PER_POLICY,
+	.flags		= CPUFREQ_HAVE_GOVERNOR_PER_POLICY |
+			  CPUFREQ_NEED_UPDATE_LIMITS,
 	.verify		= cpufreq_generic_frequency_table_verify,
 	.init		= cft_live_init,
 	.exit		= cft_live_exit,
 	.target_index	= cft_live_target,
+	.fast_switch	= apple_soc_cpufreq_fast_switch,
 };
 
 static int cft_live_suite_init(struct kunit_suite *suite)
@@ -1524,9 +1595,221 @@ out:
 	cpufreq_cpu_put(policy);
 }
 
+struct cft_cap_lift_ctx {
+	struct cpufreq_policy *policy;
+	struct apple_cpu_priv *priv;
+	bool gov_stopped;
+};
+
+static void cft_cap_lift_cleanup(void *data)
+{
+	struct cft_cap_lift_ctx *ctx = data;
+	struct cpufreq_policy *policy = ctx->policy;
+	struct apple_cpu_priv *priv = ctx->priv;
+
+	hrtimer_cancel(&priv->verify_timer);
+	scoped_guard(cpufreq_policy_write, policy) {
+		policy->suspend_freq = 0;
+		policy->fast_switch_enabled = false;
+		priv->policy = NULL;
+		priv->policy_bounds_valid = false;
+		priv->waited = true;
+		if (ctx->gov_stopped)
+			cpufreq_start_governor(policy);
+	}
+	cpufreq_cpu_put(policy);
+}
+
+static void cft_remove_qos_req(void *data)
+{
+	struct freq_qos_request *req = data;
+
+	if (freq_qos_request_active(req))
+		freq_qos_remove_request(req);
+}
+
+static void cft_test_verify_policy_cap_lift(struct kunit *test)
+{
+	unsigned int cpu = cpumask_first(cpu_online_mask);
+	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+	struct apple_cpu_priv *priv = cft_live_priv;
+	struct cft_cap_lift_ctx *ctx;
+	struct freq_qos_request *thermal_req, *user_req, *min_req;
+	struct cpufreq_policy_data data = {};
+	unsigned long flags;
+	unsigned int freq;
+	int moved;
+
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		cpufreq_cpu_put(policy);
+		KUNIT_FAIL_AND_ABORT(test, "failed to allocate test context");
+	}
+	ctx->policy = policy;
+	ctx->priv = priv;
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, cft_cap_lift_cleanup,
+						  ctx),
+			0);
+	/*
+	 * Stop the live governor before enabling fast_switch_enabled on the
+	 * shared policy so scheduler utilization callbacks cannot race this
+	 * test over cft_live_regs or priv state.
+	 */
+	scoped_guard(cpufreq_policy_write, policy) {
+		cpufreq_stop_governor(policy);
+		ctx->gov_stopped = true;
+	}
+	thermal_req = kunit_kzalloc(test, sizeof(*thermal_req), GFP_KERNEL);
+	user_req = kunit_kzalloc(test, sizeof(*user_req), GFP_KERNEL);
+	min_req = kunit_kzalloc(test, sizeof(*min_req), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, thermal_req);
+	KUNIT_ASSERT_NOT_NULL(test, user_req);
+	KUNIT_ASSERT_NOT_NULL(test, min_req);
+	KUNIT_EXPECT_TRUE(test,
+			  apple_soc_cpufreq_driver.flags & CPUFREQ_NEED_UPDATE_LIMITS);
+	KUNIT_ASSERT_GE(test,
+			freq_qos_add_request(&policy->constraints, thermal_req,
+					     FREQ_QOS_MAX, 3000000),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, cft_remove_qos_req,
+						  thermal_req),
+			0);
+	KUNIT_ASSERT_GE(test,
+			freq_qos_add_request(&policy->constraints, user_req,
+					     FREQ_QOS_MAX, 3000000),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, cft_remove_qos_req,
+						  user_req),
+			0);
+	KUNIT_ASSERT_GE(test,
+			freq_qos_add_request(&policy->constraints, min_req,
+					     FREQ_QOS_MIN, 600000),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, cft_remove_qos_req,
+						  min_req),
+			0);
+	flush_work(&policy->update);
+	priv->info = &soc_t6050_info;
+	priv->policy = policy;
+	priv->policy_bounds_valid = false;
+	priv->cap_pstate = soc_t6050_info.max_pstate;
+	priv->expected_pstate = 1;
+	priv->pending_pstate = -1;
+	priv->waited = true;
+	cft_set_cmd(cft_live_regs, 1);
+
+	policy->min = cft_live_table[0].frequency;
+	policy->max = cft_live_table[CFT_NR_STATES - 1].frequency;
+	policy->cur = cft_live_table[0].frequency;
+	policy->fast_switch_enabled = true;
+
+	/* Schedutil asks for 3 GHz (pstate 15) through the core fast-switch wrapper. */
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 15ULL);
+
+	/*
+	 * Fast-die drops to 1.2 GHz and publishes its QoS ceiling, while a
+	 * separate userspace ceiling stays at 1.8 GHz. Serialize policy->update
+	 * then simulate the stale-policy window: a core fast-switch for 3 GHz
+	 * stays clamped to 1.2 GHz by the live QoS aggregate.
+	 */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 1800000), 0);
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(thermal_req, 1200000), 0);
+	flush_work(&policy->update);
+	policy->max = 3000000;
+	local_irq_save(flags);
+	moved = apple_soc_cpufreq_lazy_cap(priv, 4, 1200000);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_EQ(test, moved, 4);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 4ULL);
+
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+
+	/*
+	 * When the thermal cap lifts back to 3 GHz and apple_fast_die_work()
+	 * updates its QoS request, re-applying lazy_cap() restores immediately
+	 * to the 1.8 GHz userspace ceiling (pstate 7) even while policy->max
+	 * still reads 1.2 GHz.
+	 */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(thermal_req, 3000000), 0);
+	flush_work(&policy->update);
+	policy->max = 1200000;
+	local_irq_save(flags);
+	moved = apple_soc_cpufreq_lazy_cap(priv, 15, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_EQ(test, moved, 7);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 7ULL);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1800000U);
+
+	/*
+	 * Maximum-first OPP resolution: QoS min=max=1.5 GHz resolves max down
+	 * to 1.2 GHz (pstate 4) instead of promoting 1.2 GHz up to 1.8 GHz,
+	 * and a ceiling below the lowest OPP clamps to the lowest OPP (600 MHz).
+	 */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 1500000), 0);
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(min_req, 1500000), 0);
+	flush_work(&policy->update);
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_clamp_pstate(priv, 4), 4U);
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_clamp_pstate(priv, 15), 4U);
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(min_req, 600000), 0);
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 400000), 0);
+	flush_work(&policy->update);
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_clamp_pstate(priv, 15), 1U);
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+
+	/* Lifting the userspace ceiling restores full 3 GHz on the next fast-switch. */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	data.cpu = cpu;
+	data.freq_table = cft_live_table;
+	data.cpuinfo.min_freq = cft_live_table[0].frequency;
+	data.cpuinfo.max_freq = cft_live_table[CFT_NR_STATES - 1].frequency;
+	data.min = cft_live_table[0].frequency;
+	data.max = 3000000;
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_verify_policy(&data), 0);
+	policy->max = 3000000;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 15ULL);
+
+	/*
+	 * Suspend must enforce the live ceiling even when suspend_freq is set
+	 * and policy->min is still stale at 3 GHz.
+	 */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(thermal_req, 1200000), 0);
+	flush_work(&policy->update);
+	policy->min = 3000000;
+	policy->suspend_freq = 3000000;
+	priv->pending_pstate = 15;
+	priv->cap_pstate = 4;
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_suspend(policy), 0);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 4ULL);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+}
+
 static struct kunit_case apple_soc_cpufreq_policy_test_cases[] = {
 	KUNIT_CASE_PARAM(cft_test_get, cft_get_gen_params),
 	KUNIT_CASE(cft_test_thermal_owner),
+	KUNIT_CASE(cft_test_verify_policy_cap_lift),
 	{}
 };
 
