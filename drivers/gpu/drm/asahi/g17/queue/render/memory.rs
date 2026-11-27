@@ -22,6 +22,8 @@ use kernel::{prelude::*, sync::Arc};
 use crate::g17::fw::m5::initdata::Board;
 
 pub(super) const RECORDS: usize = 32;
+// The render template tracks each descriptor slot by `ordinal % RING_SLOTS`.
+const _: () = assert!(fw::render_template::RING_SLOTS == RECORDS);
 pub(super) const TA_BYTES: usize = 0x14000;
 pub(super) const FRAGMENT_BYTES: usize = 0x48000;
 pub(super) const GRAPH_SIZE: usize = 0x1c000;

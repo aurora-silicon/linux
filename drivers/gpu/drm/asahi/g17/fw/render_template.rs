@@ -863,6 +863,15 @@ mod template_tests {
         }
     }
 
+    fn zero_kvbox<T>() -> KVBox<T> {
+        let mut b = KVBox::<T>::new_uninit(GFP_KERNEL).unwrap();
+        // SAFETY: Called only for arrays of POD integer descriptor structs.
+        unsafe {
+            core::ptr::write_bytes(b.as_mut_ptr(), 0, 1);
+            b.assume_init()
+        }
+    }
+
     fn base_fixture() -> (RenderPass, RenderResources) {
         // SAFETY: Both structs contain only integers, bools, and integer structs.
         let mut pass: RenderPass = unsafe { core::mem::zeroed() };
@@ -991,8 +1000,11 @@ mod template_tests {
 
     #[test]
     fn template_matches_full_across_programs_scs_and_ring_wraparound() {
-        let mut ta_ring: KBox<[TaDescriptor; 4]> = zero_box();
-        let mut frag_ring: KBox<[FragmentSlot; 4]> = zero_box();
+        // `encode` keeps per-slot state for `ordinal % RING_SLOTS` and expects
+        // that index to name the same descriptor storage every time, as the
+        // driver's `RECORDS`-deep descriptor ring does.
+        let mut ta_ring: KVBox<[TaDescriptor; RING_SLOTS]> = zero_kvbox();
+        let mut frag_ring: KVBox<[FragmentSlot; RING_SLOTS]> = zero_kvbox();
         let mut ref_ta: KBox<TaDescriptor> = zero_box();
         let mut ref_frag: KBox<FragmentSlot> = zero_box();
         let mut slot = TemplateSlot::new_box().unwrap();
@@ -1001,9 +1013,9 @@ mod template_tests {
         for programs in [RegisterPrograms::G17P, RegisterPrograms::V25G83] {
             for scs in [false, true] {
                 for i in 0u64..40 {
-                    // Use ordinal multiples that collide on ring slot `0..4` after wraparound.
+                    // Ordinals `0..4` and `32..68` wrap around the ring twice.
                     let ordinal = if i < 4 { i } else { i + 28 };
-                    let idx = (ordinal as usize) % 4;
+                    let idx = (ordinal as usize) % RING_SLOTS;
                     let args = make_args(&mut pass, &mut resources, ordinal, programs, scs);
                     let mc = match i % 5 {
                         0 => 0,
