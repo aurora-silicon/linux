@@ -3200,6 +3200,7 @@ impl Backend {
             holds.push(hold, GFP_KERNEL).ok()?;
             cross_qid_mask |= 1u64 << idx;
         }
+        sources.check().ok()?;
         Some((frontier, native, holds, cross_qid_mask))
     }
 

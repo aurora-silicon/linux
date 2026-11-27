@@ -135,9 +135,10 @@ fn collect_with(
 }
 
 /// The leaves of `input`, coalescing unsignalled non-error leaves sharing a `dma_fence` context
-/// or a published compute queue `(epoch, qid)` to their latest sequence number so deep timeline
-/// chains stay bounded by distinct producers. Allocation, unsupported containers, or a large
-/// prefix retain normal waits.
+/// to their latest sequence number so deep timeline chains stay bounded by distinct contexts.
+/// Distinct-context `ExportFence`s are all returned so `Backend::input_sources()` can coalesce
+/// same-`(epoch, QID)` firmware waits while retaining earlier error dependencies separately.
+/// Allocation, unsupported containers, or a large prefix retain normal waits.
 pub(crate) fn collect_coalesced(input: &Fence) -> Option<Leaves> {
     collect_with(input, asahi_g17_collect_fences_coalesced)
 }
@@ -149,6 +150,61 @@ use kernel::{new_mutex, sync::{Arc, Mutex}};
 
 pub(super) struct Source {
     pub(super) submission: Arc<Submission>,
+}
+
+pub(super) enum Coalesce {
+    Duplicate,
+    Coalesced,
+    Insert,
+}
+
+/// Deduplicates and coalesces `submission` into `(sources, source_keys, coalesced_errors)`.
+///
+/// Two healthy unsignalled published compute submissions on the same `(epoch, QID)` execute in
+/// FIFO order on that QID, so firmware only needs a barrier on the latest publication ordinal.
+/// Because an earlier submission can still fail independently after collection (for example via
+/// its own producer failure, cancellation, or recovery interrupt) while the retained later
+/// submission completes cleanly, every superseded earlier submission is retained in
+/// `coalesced_errors` so [`Sources::check`] propagates its error to the consumer.
+pub(super) fn coalesce_source(
+    sources: &mut KVec<Source>,
+    source_keys: &mut KVec<Option<(u64, u64)>>,
+    coalesced_errors: &mut KVec<Arc<Submission>>,
+    submission: Arc<Submission>,
+    pub_key: Option<(u64, u64)>,
+) -> Result<Coalesce> {
+    if sources
+        .iter()
+        .any(|known| Arc::ptr_eq(&known.submission, &submission))
+        || coalesced_errors
+            .iter()
+            .any(|known| Arc::ptr_eq(known, &submission))
+    {
+        return Ok(Coalesce::Duplicate);
+    }
+    if let Some((key, seq)) = pub_key {
+        if let Some(pos) = source_keys
+            .iter()
+            .position(|existing| existing.is_some_and(|(k, _)| k == key))
+        {
+            if let Some((_, existing_seq)) = source_keys[pos] {
+                let earlier = if seq > existing_seq {
+                    source_keys[pos] = Some((key, seq));
+                    core::mem::replace(&mut sources[pos].submission, submission)
+                } else {
+                    submission
+                };
+                coalesced_errors.push(earlier, GFP_KERNEL)?;
+                return Ok(Coalesce::Coalesced);
+            }
+        }
+    }
+    if sources.len() == super::fw::kick::KICK_BARRIERS_MAX {
+        return Err(ENOSPC);
+    }
+    sources.push(Source { submission }, GFP_KERNEL)?;
+    source_keys.push(pub_key, GFP_KERNEL)?;
+    Ok(Coalesce::Insert)
 }
 
 /// The counter is independent of a physical queue's allocation and survives
@@ -195,16 +251,21 @@ pub(super) struct Sources {
     inputs: KVec<Fence>,
     publication_waits: KVec<Fence>,
     pub(super) sources: KVec<Source>,
+    coalesced_errors: KVec<Arc<Submission>>,
     #[pin]
     holds: Mutex<KVec<Hold>>,
 }
 impl Sources {
-    pub(super) fn new(inputs: KVec<Fence>, sources: KVec<Source>,
-        publication_waits: KVec<Fence>) -> Result<Arc<Self>> {
+    pub(super) fn new(
+        inputs: KVec<Fence>,
+        sources: KVec<Source>,
+        coalesced_errors: KVec<Arc<Submission>>,
+        publication_waits: KVec<Fence>,
+    ) -> Result<Arc<Self>> {
         CONVERTED.fetch_add(1, Ordering::Relaxed);
         if !publication_waits.is_empty() { PENDING.fetch_add(1, Ordering::Relaxed); }
         Arc::pin_init(pin_init!(Self {
-            inputs, sources, publication_waits,
+            inputs, sources, coalesced_errors, publication_waits,
             holds <- new_mutex!(KVec::new(), "G17 source binding loans"),
         }), GFP_KERNEL)
     }
@@ -214,6 +275,7 @@ impl Sources {
     pub(super) fn publication_waits(&self) -> &[Fence] { &self.publication_waits }
     pub(super) fn check(&self) -> Result {
         for source in &self.sources { source.submission.source_status()?; }
+        for submission in &self.coalesced_errors { submission.source_status()?; }
         Ok(())
     }
     pub(super) fn set_holds(&self, holds: KVec<Hold>) {

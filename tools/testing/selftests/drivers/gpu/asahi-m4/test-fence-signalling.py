@@ -566,8 +566,6 @@ struct dma_fence {
 	int refcount;
 	bool is_chain;
 	bool is_container;
-	uint64_t pub_key;
-	uint64_t pub_seq;
 	struct dma_fence *chain_next;
 	struct dma_fence *chain_fence;
 };
@@ -679,16 +677,6 @@ static inline unsigned int asahi_g17_scope_children(struct dma_fence *f,
 }
 
 #include "sync_input.h"
-
-bool asahi_g17_export_coalesce_key(struct dma_fence *fence, u64 *key, u64 *seq)
-{
-	if (!fence || !fence->pub_key)
-		return false;
-	*key = fence->pub_key;
-	*seq = fence->pub_seq;
-	return true;
-}
-
 #include "sync_input.c"
 
 int main(void)
@@ -767,7 +755,8 @@ int main(void)
 		assert(saw_err && saw_ctx10 && saw_ctx20);
 	}
 
-	/* Published ExportFences on distinct contexts sharing (epoch, qid) coalesce to latest seq. */
+	/* Distinct-context unsignalled leaves (such as independent ExportFences) are all
+	 * preserved by the C collector so Backend::input_sources() retains error dependencies. */
 	{
 		struct dma_fence pub_leaves[3];
 		struct dma_fence pub_chains[3];
@@ -777,8 +766,6 @@ int main(void)
 		for (i = 0; i < 3; ++i) {
 			pub_leaves[i].context = (uint64_t)(100 + i);
 			pub_leaves[i].refcount = 1;
-			pub_leaves[i].pub_key = (7ULL << 8) | 3;
-			pub_leaves[i].pub_seq = (uint64_t)(i == 1 ? 30 : (i == 0 ? 10 : 20));
 
 			pub_chains[i].is_chain = true;
 			pub_chains[i].refcount = 1;
@@ -786,9 +773,11 @@ int main(void)
 			pub_chains[i].chain_next = (i > 0) ? &pub_chains[i - 1] : NULL;
 		}
 		n = asahi_g17_collect_fences_coalesced(&pub_chains[2], out, 4);
-		assert(n == 1);
-		assert(out[0].fence == &pub_leaves[1] && out[0].status == 0);
-		asahi_g17_put_fence(out[0].fence);
+		assert(n == 3);
+		for (i = 0; i < n; ++i) {
+			assert(out[i].status == 0);
+			asahi_g17_put_fence(out[i].fence);
+		}
 		for (i = 0; i < 3; ++i) {
 			assert(pub_leaves[i].refcount == 1);
 			assert(pub_chains[i].refcount == 1);

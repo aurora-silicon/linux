@@ -222,47 +222,6 @@ pub(super) unsafe fn exported_source_raw(raw: *mut bindings::dma_fence) -> Optio
         .cloned()
 }
 
-/// Lock-free coalescing key for an unsignalled, currently published compute `ExportFence`.
-///
-/// Two healthy published compute submissions on the same `(epoch, physical QID)` execute and
-/// retire in strict FIFO order on that QID, so waiting on the later publication ordinal in
-/// firmware subsumes the earlier one without sharing a `dma_fence` context across submits that
-/// could fail out of order before publication.
-///
-/// # Safety
-///
-/// `raw` must point to a live `dma_fence`, and `key` and `seq` must be valid writable pointers.
-#[no_mangle]
-pub(super) unsafe extern "C" fn asahi_g17_export_coalesce_key(
-    raw: *mut bindings::dma_fence,
-    key: *mut u64,
-    seq: *mut u64,
-) -> bool {
-    let expected = EXPORT_OPS.load(Ordering::Acquire);
-    if expected == 0 || raw.is_null() {
-        return false;
-    }
-    // SAFETY: Caller holds a live fence reference; vtable check precedes cast to FenceObject.
-    let object = unsafe {
-        if (*raw).ops as usize != expected {
-            return false;
-        }
-        &*(raw as *const FenceObject<ExportFence>)
-    };
-    let Some(source) = object.source.as_ref() else {
-        return false;
-    };
-    let Some((pub_key, pub_seq)) = source.published_order_key() else {
-        return false;
-    };
-    // SAFETY: Caller supplies valid writable output pointers.
-    unsafe {
-        *key = pub_key;
-        *seq = pub_seq;
-    }
-    true
-}
-
 /// Immutable cross-QID kick metadata published once a compute source is committed in firmware.
 /// Consumers on the same VM read this without acquiring the global device mutex.
 #[derive(Clone)]
@@ -305,7 +264,8 @@ pub(crate) struct Submission {
     /// live `PublishedSource` snapshot, or `0` when unpublished.
     published_epoch: AtomicU64,
     /// Packed `(qid << 56) | published_seq` written before `published_epoch` (Release), so
-    /// lock-free coalescing in `sync_input` can collapse same-QID leaves without locking `state`.
+    /// `Backend::input_sources()` can collapse same-QID firmware wait barriers without locking
+    /// `state` while retaining earlier submissions for error checking in `Sources::check()`.
     published_order: AtomicU64,
     /// Set atomically when a firmware kick depends on this source so replay/retirement
     /// observes consumers without scanning producer queues under the device mutex.
@@ -681,6 +641,7 @@ mod tests {
     #[test]
     fn published_export_coalesce_key_tracks_epoch_qid_and_invalidation() {
         use crate::g17::fw::kick::{KickDependency, KickTimestamp};
+        use crate::g17::sync_input::{coalesce_source, Coalesce, Source, Sources};
 
         let contexts = contexts();
         let a = aggregate(&contexts);
@@ -692,8 +653,7 @@ mod tests {
         let dep_q6_1 = KickDependency::new(6, KickTimestamp::new(12).unwrap()).unwrap();
 
         // Unpublished submissions expose no coalesce key.
-        let (mut k, mut s) = (0u64, 0u64);
-        assert!(!unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut k, &mut s) });
+        assert_eq!(a.source().published_order_key(), None);
 
         // Simulate published snapshots (set_published requires state.work.is_some() in production;
         // test the atomic publication contract directly here without a GPU Context).
@@ -716,36 +676,111 @@ mod tests {
         publish_direct(b.source(), 7, 101, dep_q5_2);
         publish_direct(c.source(), 7, 102, dep_q6_1);
 
-        let (mut ka, mut sa) = (0u64, 0u64);
-        let (mut kb, mut sb) = (0u64, 0u64);
-        let (mut kc, mut sc) = (0u64, 0u64);
-        assert!(unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut ka, &mut sa) });
-        assert!(unsafe { asahi_g17_export_coalesce_key(b.0.raw(), &mut kb, &mut sb) });
-        assert!(unsafe { asahi_g17_export_coalesce_key(c.0.raw(), &mut kc, &mut sc) });
+        let (ka, sa) = a.source().published_order_key().unwrap();
+        let (kb, sb) = b.source().published_order_key().unwrap();
+        let (kc, sc) = c.source().published_order_key().unwrap();
         assert_eq!(ka, kb);
         assert!(sb > sa);
         assert_ne!(ka, kc);
         assert_eq!(a.source().published_order_key_for(7), Some((ka, sa)));
         assert_eq!(a.source().published_order_key_for(8), None);
 
-        // Coalescing two same-(epoch, qid) exports collapses to the newer publication ordinal,
-        // while keeping distinct QIDs separate.
+        // Distinct-context ExportFences are all preserved by collect_coalesced() so
+        // Backend::input_sources() retains error dependencies for every earlier export.
         let merged = super::super::sync_input::merge(&[a.fence(), b.fence(), c.fence()]).unwrap();
         let leaves = super::super::sync_input::collect_coalesced(&merged).unwrap();
-        assert_eq!(leaves.len(), 2);
-        assert!(leaves.iter().any(|l| l.fence == b.0.raw()));
-        assert!(leaves.iter().any(|l| l.fence == c.0.raw()));
-        assert!(!leaves.iter().any(|l| l.fence == a.0.raw()));
+        assert_eq!(leaves.len(), 3);
 
-        // Error or retirement clears/suppresses coalescing so errors are never dropped.
-        a.source().note_error(EIO);
-        assert!(!unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut ka, &mut sa) });
-        b.source().clear_published();
-        assert!(!unsafe { asahi_g17_export_coalesce_key(b.0.raw(), &mut kb, &mut sb) });
+        // Coalescing two same-(epoch, qid) exports keeps only the newest wait source while
+        // retaining the earlier submission in coalesced_errors (both arrival orders).
+        let build_sources = |order: [&Aggregate; 3]| -> Arc<Sources> {
+            let mut wait_sources: KVec<Source> = KVec::new();
+            let mut keys: KVec<Option<(u64, u64)>> = KVec::new();
+            let mut coalesced_errors: KVec<Arc<Submission>> = KVec::new();
+            for agg in order {
+                let sub = agg.source().clone();
+                let key = sub.published_order_key_for(7);
+                let _ = coalesce_source(
+                    &mut wait_sources,
+                    &mut keys,
+                    &mut coalesced_errors,
+                    sub,
+                    key,
+                )
+                .unwrap();
+            }
+            assert_eq!(wait_sources.len(), 2);
+            assert!(wait_sources.iter().any(|s| Arc::ptr_eq(&s.submission, b.source())));
+            assert!(wait_sources.iter().any(|s| Arc::ptr_eq(&s.submission, c.source())));
+            assert_eq!(coalesced_errors.len(), 1);
+            assert!(Arc::ptr_eq(&coalesced_errors[0], a.source()));
+            Sources::new(KVec::new(), wait_sources, coalesced_errors, KVec::new()).unwrap()
+        };
+        let consumer_fwd = build_sources([&a, &b, &c]);
+        let consumer_rev = build_sources([&b, &a, &c]);
+        assert!(consumer_fwd.check().is_ok());
+        assert!(consumer_rev.check().is_ok());
 
-        a.finish_enqueue(Err(EIO));
+        // Duplicate leaf after coalescing is recognized cleanly without duplicating error entries.
+        {
+            let mut wait_sources: KVec<Source> = KVec::new();
+            let mut keys: KVec<Option<(u64, u64)>> = KVec::new();
+            let mut coalesced_errors: KVec<Arc<Submission>> = KVec::new();
+            assert!(matches!(
+                coalesce_source(
+                    &mut wait_sources,
+                    &mut keys,
+                    &mut coalesced_errors,
+                    b.source().clone(),
+                    Some((kb, sb)),
+                ),
+                Ok(Coalesce::Insert)
+            ));
+            assert!(matches!(
+                coalesce_source(
+                    &mut wait_sources,
+                    &mut keys,
+                    &mut coalesced_errors,
+                    a.source().clone(),
+                    Some((ka, sa)),
+                ),
+                Ok(Coalesce::Coalesced)
+            ));
+            assert!(matches!(
+                coalesce_source(
+                    &mut wait_sources,
+                    &mut keys,
+                    &mut coalesced_errors,
+                    a.source().clone(),
+                    Some((ka, sa)),
+                ),
+                Ok(Coalesce::Duplicate)
+            ));
+            assert_eq!(coalesced_errors.len(), 1);
+        }
+
+        // Late error after collection: retained later export `b` (and `c`) complete cleanly,
+        // while earlier coalesced export `a` fails later. Consumer check MUST observe the error.
         b.finish_enqueue(Ok(()));
         c.finish_enqueue(Ok(()));
+        assert_eq!(b.source().source_status(), Ok(true));
+        assert_eq!(c.source().source_status(), Ok(true));
+        assert!(consumer_fwd.check().is_ok());
+        assert!(consumer_rev.check().is_ok());
+
+        a.finish_enqueue(Err(EIO));
+        assert_eq!(a.source().published_order_key(), None);
+        assert_eq!(
+            consumer_fwd.check(),
+            Err(crate::g17::dependency::PRODUCER_FAILED)
+        );
+        assert_eq!(
+            consumer_rev.check(),
+            Err(crate::g17::dependency::PRODUCER_FAILED)
+        );
+
+        b.source().clear_published();
+        assert_eq!(b.source().published_order_key(), None);
     }
 
     #[test]

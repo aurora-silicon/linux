@@ -29,16 +29,11 @@ static int collect_leaf(struct dma_fence *leaf,
 			size_t *count, bool coalesce_contexts)
 {
 	int status = asahi_g17_fence_status(leaf);
-	u64 pub_key = 0, pub_seq = 0;
-	bool has_pub = false;
 	size_t i;
 
 	/* Already-signalled non-error leaves need no further wait or barrier. */
 	if (status > 0)
 		return 0;
-
-	if (coalesce_contexts && status == 0)
-		has_pub = asahi_g17_export_coalesce_key(leaf, &pub_key, &pub_seq);
 
 	for (i = 0; i < *count; ++i) {
 		if (out[i].fence == leaf) {
@@ -59,25 +54,6 @@ static int collect_leaf(struct dma_fence *leaf,
 				out[i].fence = dma_fence_get(leaf);
 			}
 			return 0;
-		}
-		/*
-		 * Coalesce healthy unsignaled exported compute sources already
-		 * published on the same (epoch, physical QID), keeping only the
-		 * latest publication ordinal. Each ExportFence retains its own
-		 * dma_fence context so out-of-order early errors cannot violate
-		 * core dma_fence monotonicity.
-		 */
-		if (has_pub && out[i].status == 0) {
-			u64 out_key = 0, out_seq = 0;
-
-			if (asahi_g17_export_coalesce_key(out[i].fence, &out_key, &out_seq) &&
-			    out_key == pub_key) {
-				if (pub_seq > out_seq) {
-					dma_fence_put(out[i].fence);
-					out[i].fence = dma_fence_get(leaf);
-				}
-				return 0;
-			}
 		}
 	}
 
