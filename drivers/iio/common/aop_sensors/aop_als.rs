@@ -110,7 +110,8 @@ fn enable_als(
     arm_ct817(aop, dev.as_ref(), svc)
 }
 
-/// Arms the CT817: its configuration, then the interval that starts the reports.
+/// Arms the CT817: interval zero, its configuration, then the interval that
+/// starts the reports.
 fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<()> {
     // The CT817 gets its calibration from the AOP driver over the setup port,
     // not as an ALS property. Only the transport can fail here; the sensor's
@@ -123,6 +124,10 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
         dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
+    // The sensor arms only on a zero to non-zero transition of the interval.
+    // It is zero at boot and stopped after a sleep, but a previous driver
+    // instance may have left it running, so write zero first every time.
+    set(ALS_PROP_INTERVAL, 0, "interval")?;
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
     set(
         ALS_PROP_BATCH_INTERVAL,
@@ -130,8 +135,7 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
         "batch interval",
     )?;
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
-    // The interval is zero at probe, and the wake writes it to zero first, so
-    // this is the transition that arms the sensor.
+    // The transition that arms the sensor.
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
@@ -141,8 +145,8 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
 /// start them again: on the J700 every read after the first wake of a boot
 /// returned the last sample from before that sleep, while the room's light
 /// changed. The sensor starts reporting only on a zero to non-zero transition
-/// of its interval, so the wake writes the interval to zero and then repeats
-/// the arming of the probe.
+/// of its interval, so the wake repeats the arming of the probe, which starts
+/// with an interval of zero.
 #[repr(C)]
 struct PmHook {
     /// First, so that the callback finds the hook from it.
@@ -168,10 +172,7 @@ unsafe extern "C" fn pm_event(
     }
     // SAFETY: `nb` is the first field of a registered `PmHook`.
     let hook = unsafe { &*nb.cast::<PmHook>() };
-    let aop = hook.aop.as_ref();
-    let rearm = set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes())
-        .and_then(|_| arm_ct817(aop, &hook.dev, &hook.service));
-    match rearm {
+    match arm_ct817(hook.aop.as_ref(), &hook.dev, &hook.service) {
         Ok(()) => dev_dbg!(hook.dev, "reports armed again after sleep\n"),
         Err(e) => dev_warn!(hook.dev, "reports not armed again after sleep: {:?}\n", e),
     }
@@ -349,6 +350,8 @@ struct IIOAopAlsDriver {
     pm: Option<Pin<KBox<PmHook>>>,
     listener: FakehidRegistration,
     _iio: AlsIio,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
 }
 
 fn register_channels<const N: usize>(
@@ -426,7 +429,7 @@ impl platform::Driver for IIOAopAlsDriver {
             )
         };
         let pm = if offset == LUX_OFFSET_CT817 {
-            Some(PmHook::new(dev, adata, service)?)
+            Some(PmHook::new(dev, adata.clone(), service)?)
         } else {
             None
         };
@@ -434,12 +437,25 @@ impl platform::Driver for IIOAopAlsDriver {
             pm,
             listener,
             _iio: iio,
+            aop: adata,
+            service,
         })
     }
 
-    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+    fn unbind(dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         if let Some(pm) = &this.pm {
             pm.unregister();
+        }
+        // The sensor keeps reporting until its interval is zero, and every
+        // report is an AOP mailbox interrupt. Stop it before the listener
+        // goes; a failure only costs those interrupts, so unbind goes on.
+        if let Err(e) = set_als_property(
+            this.aop.as_ref(),
+            &this.service,
+            ALS_PROP_INTERVAL,
+            &0u32.to_le_bytes(),
+        ) {
+            dev_warn!(dev.as_ref(), "reports not stopped at unbind: {:?}\n", e);
         }
         this.listener.unregister();
     }
