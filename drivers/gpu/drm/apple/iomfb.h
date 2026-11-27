@@ -198,6 +198,28 @@ enum dcpep_method {
 	dcpep_pipe_set_476,
 	dcpep_unnamed_500,
 	iomfbep_set_brightness_correction,
+	/*
+	 * Firmware 27.x sleep and paired-mode calls named by their 27.0 ID.
+	 * Optional for single-engine boot (iomfb_v27_missing_method() skips
+	 * them); iomfb_v27_tag() refuses any call missing from a renumbered
+	 * table.
+	 */
+	dcpep_v27_sleep_a115,
+	dcpep_v27_wake_a442,
+	dcpep_v27_peer_a360,
+	dcpep_v27_peer_a361,
+	dcpep_v27_peer_a362,
+	dcpep_v27_peer_a364,
+	dcpep_v27_peer_a365,
+	dcpep_v27_peer_a366,
+	dcpep_v27_peer_a367,
+	dcpep_v27_peer_a368,
+	dcpep_v27_peer_a369,
+	dcpep_v27_peer_a370,
+	dcpep_v27_peer_a371,
+	dcpep_v27_peer_a372,
+	dcpep_v27_peer_a373,
+	dcpep_v27_peer_a449,
 	dcpep_num_methods
 };
 
@@ -211,10 +233,18 @@ struct dcp_method_entry {
 	char tag[4];
 	/* H17G shares the H17P transport but changes selected method IDs. */
 	char tag_h17g[4];
+	char tag_ext26[4];
 };
+
+#define IOMFB_METHOD_EXT26(tag, native, name) [name] = { #name, \
+	{ tag[0], tag[1], tag[2], tag[3] }, {0}, \
+	{ native[0], native[1], native[2], native[3] } }
 
 /* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
 const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *methods);
+int iomfb_v27_tag(const struct dcp_method_entry *methods, const char *tag, char *out);
+bool iomfb_v27_sleep_methods_complete(const struct dcp_method_entry *methods);
 const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
 						       const struct dcp_method_entry *methods);
 /* The first method of a firmware 27.x table that has no ID, NULL if none. */
@@ -233,6 +263,7 @@ int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on);
 int iomfb_v27_sleep_call(struct apple_dcp *dcp, const char *tag, const void *in,
 			 u32 in_len, u32 out_len);
 int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake);
+int iomfb_v27_sleep_call_a442(struct apple_dcp *dcp, const char *tag, u32 out_len, u8 key);
 /* The display stage's DT arguments: A414's eight, then A487's four. */
 #define IOMFB_V27_STAGE_ARGS	12
 int iomfb_v27_display_args(struct apple_dcp *dcp, bool stage, u8 *args);

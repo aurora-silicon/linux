@@ -4,12 +4,15 @@
 
 use crate::debug::*;
 use crate::gem;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use kernel::{new_mutex, prelude::*, str::BStr, sync::Mutex, task::Pid};
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Errors;
 
 const MIRROR_MAX_SIZE: usize = 64 * 1024;
+
+/// [`VmStatus::restarts_left`] of a VM no restart has been charged to.
+const UNCHARGED: u32 = u32::MAX;
 
 /// A VM and its accepted jobs share this status, including after queue destruction.
 /// Client failure is separate from hardware admission: recovery may preserve the
@@ -27,6 +30,13 @@ pub(crate) struct VmStatus {
     warned: AtomicBool,
     /// A GPU recovery found this VM's work guilty.
     recovery_guilty: AtomicBool,
+    /// Further restarts that may find this VM guilty and still be charged to it
+    /// ([`Self::charge_restart`]), or [`UNCHARGED`] before the first.
+    restarts_left: AtomicU32,
+    /// Commands whose public fence is failing ([`Self::signal_failure`]): counted before
+    /// its error is set, and again once it has signalled.
+    failures_started: AtomicU64,
+    failures_finished: AtomicU64,
     /// The process that created the VM, named in the failure report.
     tgid: Pid,
     comm: [u8; 16],
@@ -45,6 +55,14 @@ struct Mirror {
 // only accessed atomically through this pointer while the mutex is held.
 unsafe impl Send for Mirror {}
 
+/// [`VmStatus::signal_failure`] counts: every failure in `finished` has signalled its error,
+/// and those in `started` but not `finished` may be anywhere between.
+#[derive(Clone, Copy)]
+pub(crate) struct Failures {
+    pub(crate) started: u64,
+    pub(crate) finished: u64,
+}
+
 impl VmStatus {
     /// Called from the creating client's ioctl: the VM records who it belongs to.
     pub(crate) fn new() -> impl PinInit<Self> {
@@ -62,6 +80,9 @@ impl VmStatus {
             teardown_expired: AtomicBool::new(false),
             warned: AtomicBool::new(false),
             recovery_guilty: AtomicBool::new(false),
+            restarts_left: AtomicU32::new(UNCHARGED),
+            failures_started: AtomicU64::new(0),
+            failures_finished: AtomicU64::new(0),
             tgid,
             comm,
             mirror <- new_mutex!(None, "Asahi VM status mirror"),
@@ -72,6 +93,34 @@ impl VmStatus {
         self.error.load(Ordering::Acquire)
     }
 
+    /// The process that created the VM: its name and thread-group ID.
+    pub(crate) fn client(&self) -> (&BStr, Pid) {
+        let len = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        (BStr::from_bytes(&self.comm[..len]), self.tgid)
+    }
+
+    /// Fails a command's public fence: `signal` sets its error and signals it. The failure
+    /// counts as started before anyone can see the error and as finished after the signal, so
+    /// a frontier prune that reads the counts in between can tell that one is in flight.
+    pub(crate) fn signal_failure(&self, signal: impl FnOnce()) {
+        // Relaxed: the fence's signal, a release, publishes it together with the error.
+        self.failures_started.fetch_add(1, Ordering::Relaxed);
+        signal();
+        // Release: whoever sees this count also sees the signalled error.
+        self.failures_finished.fetch_add(1, Ordering::Release);
+    }
+
+    /// This VM's failure counts, `finished` read first so that `started` covers it.
+    pub(crate) fn failures(&self) -> Failures {
+        let finished = self.failures_finished.load(Ordering::Acquire);
+        let started = self.failures_started.load(Ordering::Acquire);
+        Failures { started, finished }
+    }
+
     pub(crate) fn note_recovery_guilty(&self) {
         self.recovery_guilty.store(true, Ordering::Release);
     }
@@ -80,6 +129,22 @@ impl VmStatus {
     /// failed only for its own client.
     pub(crate) fn recovery_guilty(&self) -> bool {
         self.recovery_guilty.load(Ordering::Acquire)
+    }
+
+    /// Charges a firmware restart that found this VM guilty to it, with `in_flight` of its
+    /// commands still held then. The first such restart costs its client the device. After it the
+    /// VM publishes nothing new, but each command it had in flight may still hang or fault the
+    /// GPU once as it runs. Returns false once restarts have found the VM guilty more often than
+    /// that: the firmware keeps blaming it for something it no longer runs. Called only from a
+    /// recovery, under the device mutex.
+    pub(crate) fn charge_restart(&self, in_flight: u32) -> bool {
+        let left = match self.restarts_left.load(Ordering::Relaxed) {
+            UNCHARGED => in_flight.min(UNCHARGED - 1),
+            0 => return false,
+            left => left - 1,
+        };
+        self.restarts_left.store(left, Ordering::Relaxed);
+        true
     }
 
     /// The client's VM handle is gone (`release_mirror`): the client submits nothing more.
@@ -284,6 +349,25 @@ mod tests {
         assert_eq!(status.get(), 0);
         // Device loss after a hidden teardown error is still warned about.
         assert!(status.warned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn restarts_are_charged_to_a_vm_only_for_the_work_it_had_in_flight() {
+        let Ok(status) = KBox::pin_init(VmStatus::new(), GFP_KERNEL) else {
+            panic!("allocation failed");
+        };
+        // The first restart is charged whatever the VM holds, then one per command it held.
+        assert!(status.charge_restart(3));
+        for _ in 0..3 {
+            assert!(status.charge_restart(5));
+        }
+        assert!(!status.charge_restart(5));
+        assert!(!status.charge_restart(0));
+        let Ok(status) = KBox::pin_init(VmStatus::new(), GFP_KERNEL) else {
+            panic!("allocation failed");
+        };
+        assert!(status.charge_restart(0));
+        assert!(!status.charge_restart(1));
     }
 
     #[test]

@@ -64,6 +64,9 @@ impl platform::Driver for Driver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let soc = *info.ok_or(ENODEV)?;
+        // The memory limits the parameter buffer's growth is admitted
+        // against (memacct), as the other generations' probe sets them.
+        crate::memacct::LEDGER.configure();
         AsahiPlatformDriver::probe_g18(pdev, soc)
     }
 
@@ -118,6 +121,8 @@ pub(crate) struct T8152Probe {
     pub(crate) stage: u32,
     /// Whether /chosen `aurora,g18g-gpu-firmware-profile` matched.
     pub(crate) firmware_profile_admitted: bool,
+    /// The InitData profile of the admitted firmware build.
+    pub(crate) firmware_build: Option<crate::g18::fw::initdata::RootProfile>,
     /// Read-only samples of PSD services 3, 81 and 82, in that order.
     pub(crate) psd: [regs::T8152PsdSample; 3],
     /// SGX mapping. Every further SGX read must again follow a powered
@@ -128,12 +133,18 @@ pub(crate) struct T8152Probe {
     /// The DRM device, not yet registered. The live-boot module allocates
     /// its kernel objects on it; the shared probe registers it at stage 10.
     pub(crate) drm: ARef<AsahiDrmDevice>,
+    /// The CLPC's GPU input, taken before the probe touched the GPU.
+    pub(crate) demand: crate::g18::demand::G18Demand,
 }
 
-/// Loader receipt the G18G firmware stages require. The loader writes it
+/// Loader receipts the G18G firmware stages require. The loader writes one
 /// only after hashing both loaded TEXT images (b000 GFX 0x50000, b010 GFX1
-/// 0x54000) against the 26A428 profile (plan step 0.2).
-const G18G_FIRMWARE_PROFILE: &[u8] = b"G18G-RTKit-3514.0.15.release\0";
+/// 0x54000) against that build's images (plan step 0.2): 26A428 (macOS 27.0
+/// and 27.0.1) or 26B123 (macOS 27.2).
+const G18G_FIRMWARE_PROFILES: [(&[u8], crate::g18::fw::initdata::RootProfile); 2] = [
+    (b"G18G-RTKit-3514.0.15.release\0", crate::g18::fw::initdata::RootProfile::J873G18G26A428),
+    (b"G18G-RTKit-3514.41.1.release\0", crate::g18::fw::initdata::RootProfile::J873G18G26B123),
+];
 
 /// T8152 probe gate. With `g18_initdata_test=0` (the default) this is a
 /// complete no-op: it logs and refuses with ENODEV before any MMIO, DMA
@@ -277,6 +288,10 @@ fn prepare_t8152_device(
     let identity =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
             .ok_or(EINVAL)?;
+    // Before any GPU access: a CLPC that has not probed yet defers this probe
+    // here, while it can still be repeated, instead of the GPU running
+    // without the floor for the whole boot.
+    let demand = crate::g18::demand::G18Demand::new(pdev.as_ref())?;
     if soc.chip_id != 0x8152
         || identity.gpu_gen != hw::GpuGen::G18
         || identity.gpu_variant != identity::GpuVariant::G
@@ -297,23 +312,27 @@ fn prepare_t8152_device(
         soc.uat_ias
     );
 
-    let firmware_profile_admitted = match of::chosen() {
+    let firmware_build = match of::chosen() {
         Some(chosen) => {
             let profile: Result<KVec<u8>> =
                 chosen.get_property(c"aurora,g18g-gpu-firmware-profile");
-            matches!(profile, Ok(profile) if profile.as_slice() == G18G_FIRMWARE_PROFILE)
+            profile.ok().and_then(|profile| {
+                G18G_FIRMWARE_PROFILES.iter()
+                    .find(|(name, _)| profile.as_slice() == *name)
+                    .map(|(_, build)| *build)
+            })
         }
-        None => false,
+        None => None,
     };
-    dev_info!(
-        pdev.as_ref(),
-        "G18G: firmware receipt {}\n",
-        (if firmware_profile_admitted { "admitted" } else { "absent or different" })
-    );
+    let firmware_profile_admitted = firmware_build.is_some();
+    match firmware_build {
+        Some(build) => dev_info!(pdev.as_ref(), "G18G: firmware receipt admitted {:?}\n", build),
+        None => dev_info!(pdev.as_ref(), "G18G: firmware receipt absent or different\n"),
+    }
     if g18_live_boot::stage_runs_firmware(stage) && !firmware_profile_admitted {
         dev_err!(
             pdev.as_ref(),
-            "G18G: stage {} needs /chosen aurora,g18g-gpu-firmware-profile = G18G-RTKit-3514.0.15.release\n",
+            "G18G: stage {} needs a G18G firmware receipt in /chosen aurora,g18g-gpu-firmware-profile\n",
             stage
         );
         return Err(ENODEV);
@@ -367,10 +386,12 @@ fn prepare_t8152_device(
         identity,
         stage,
         firmware_profile_admitted,
+        firmware_build,
         psd,
         registers,
         observed,
         drm,
+        demand,
     })
 }
 

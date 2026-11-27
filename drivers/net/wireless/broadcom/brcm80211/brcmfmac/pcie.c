@@ -307,6 +307,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_SHARED_FLAGS3_OFFSET		108
 #define BRCMF_SHARED_HOST_CAP2_OFFSET		112
 #define BRCMF_SHARED_HOST_CAP3_OFFSET		116
+/* The end of the last shared RAM field the driver reads or writes */
+#define BRCMF_SHARED_SIZE			(BRCMF_SHARED_HOST_CAP2_OFFSET + 4)
 
 #define BRCMF_RING_H2D_RING_COUNT_OFFSET	0
 #define BRCMF_RING_D2H_RING_COUNT_OFFSET	1
@@ -429,6 +431,7 @@ struct brcmf_pciedev_info {
 	const struct brcmf_pcie_reginfo *reginfo;
 	void __iomem *regs;
 	void __iomem *tcm;
+	size_t tcm_size;
 	u32 fw_size;
 	bool skip_reset_vector;
 	struct brcmf_chip *ci;
@@ -779,12 +782,36 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 		BRCMF_PCIE_CFGREG_REG_BAR2_CONFIG,
 		BRCMF_PCIE_CFGREG_REG_BAR3_CONFIG
 	};
+	bool fn_reset = false;
+	bool saved = false;
 	u32 i;
 	u32 val;
 	u32 lsc;
 
 	if (!devinfo->ci)
 		return;
+
+	/*
+	 * On chipcommon rev >= 65 the watchdog below also resets PCIe function
+	 * 0 (CC_WD_SSRESET_PCIE_F0_EN), which puts its config space back to the
+	 * chip defaults: e.g. the resizable BAR 2 drops from the size the PCI
+	 * core assigned to 8 MiB. Save what the PCI core programmed, before
+	 * ASPM is turned off for the reset, so it can be put back afterwards.
+	 * Older chips keep their config space, so save nothing there: a saved
+	 * state left behind would stand in for the live one at the next
+	 * suspend.
+	 */
+	core = brcmf_chip_get_chipcommon(devinfo->ci);
+	if (core->rev >= 65) {
+		int err = pci_save_state(devinfo->pdev);
+
+		if (err) {
+			pci_err(devinfo->pdev, "failed to save PCI state: %d\n", err);
+			devinfo->pdev->state_saved = false;
+		} else {
+			saved = true;
+		}
+	}
 
 	/* Disable ASPM */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
@@ -800,6 +827,8 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 
 	if (core->rev >= 65) {
 		u32 mask = CC_WD_SSRESET_PCIE_F0_EN;
+
+		fn_reset = true;
 
 		core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 		if (core->rev < 66)
@@ -825,6 +854,16 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 	pci_write_config_dword(devinfo->pdev, BRCMF_PCIE_REG_LINK_STATUS_CTRL,
 			       lsc);
+
+	/*
+	 * Put the PCI core's configuration back. Otherwise the function runs
+	 * with the reset defaults while the core still holds the assigned
+	 * values, and the next pci_restore_state() (system resume) rewrites
+	 * them on a live, bus-mastering function: BAR 2 changes size under
+	 * running firmware. Only a state saved above is put back.
+	 */
+	if (fn_reset && saved)
+		pci_restore_state(devinfo->pdev);
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 	if (core->rev <= 13) {
@@ -1056,9 +1095,13 @@ static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
 		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
 					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
 		/* trap type, then the exception pc */
-		brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
-			  brcmf_pcie_read_tcm32(devinfo, addr),
-			  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		if (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))
+			brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+				  brcmf_pcie_read_tcm32(devinfo, addr),
+				  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		else
+			brcmf_err(bus, "firmware trap record at 0x%08x is outside the TCM\n",
+				  addr);
 		reason = "trap in shared RAM";
 	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
 		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
@@ -1133,14 +1176,33 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console = &shared->console;
 	addr = shared->tcm_base_address + BRCMF_SHARED_CONSOLE_ADDR_OFFSET;
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->bufsize = 0;
+	console->read_idx = 0;
+	console->log_idx = 0;
+	console->scan_idx = 0;
+	console->scan_len = 0;
+	if (!console->base_addr ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
+					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
+		console->base_addr = 0;
+		return;
+	}
 
 	addr = console->base_addr + BRCMF_CONSOLE_BUFADDR_OFFSET;
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (!console->bufsize ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,
+					console->bufsize)) {
+		console->base_addr = 0;
+		console->bufsize = 0;
+		return;
+	}
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
-	console->scan_len = 0;
+	if (console->scan_idx >= console->bufsize)
+		console->scan_idx = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
@@ -1170,6 +1232,8 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		return;
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	newidx = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (newidx >= console->bufsize || console->read_idx >= console->bufsize)
+		return;
 	while (newidx != console->read_idx) {
 		addr = console->buf_addr + console->read_idx;
 		ch = brcmf_pcie_read_tcm8(devinfo, addr);
@@ -1286,6 +1350,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_intr_disable(devinfo);
 	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_s2idle_only = false;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1320,6 +1385,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1351,6 +1417,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -1431,11 +1498,20 @@ static int brcmf_pcie_ring_mb_update_rptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->r_ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: r_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->r_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R r_ptr %d (%d), ring %d\n", commonring->r_ptr,
 		  commonring->w_ptr, ring->id);
@@ -1449,11 +1525,20 @@ static int brcmf_pcie_ring_mb_update_wptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->w_ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: w_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->w_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R w_ptr %d (%d), ring %d\n", commonring->w_ptr,
 		  commonring->r_ptr, ring->id);
@@ -1582,6 +1667,8 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 	u32 h2d_w_idx_ptr;
 	u32 h2d_r_idx_ptr;
 	u32 ring_mem_ptr;
+	u32 h2d_idx_len;
+	u32 d2h_idx_len;
 	u32 i;
 	u64 address;
 	u32 bufsz;
@@ -1607,8 +1694,24 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		brcmf_err(bus, "invalid max_flowrings(%d)\n", max_flowrings);
 		return -EIO;
 	}
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					le32_to_cpu(ringinfo.ringmem),
+					BRCMF_NROF_COMMON_MSGRINGS *
+					BRCMF_RING_MEM_SZ)) {
+		brcmf_err(bus, "ring memory outside the TCM\n");
+		return -EINVAL;
+	}
 
 	if (devinfo->dma_idx_sz != 0) {
+		/* The host index arrays hold one index per ring the driver uses */
+		if (max_submissionrings <
+		    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||
+		    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {
+			brcmf_err(bus, "invalid ring counts: %u submission, %u completion, %u flowrings\n",
+				  max_submissionrings, max_completionrings,
+				  max_flowrings);
+			return -EINVAL;
+		}
 		bufsz = (max_submissionrings + max_completionrings) *
 			devinfo->dma_idx_sz * 2;
 		devinfo->idxbuf = dma_alloc_coherent(&devinfo->pdev->dev, bufsz,
@@ -1624,6 +1727,21 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		h2d_w_idx_ptr = le32_to_cpu(ringinfo.h2d_w_idx_ptr);
 		h2d_r_idx_ptr = le32_to_cpu(ringinfo.h2d_r_idx_ptr);
 		idx_offset = sizeof(u32);
+		/* One index per common ring and flowring, each way */
+		h2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings) *
+			      idx_offset;
+		d2h_idx_len = BRCMF_NROF_D2H_COMMON_MSGRINGS * idx_offset;
+		if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_w_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_r_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_w_idx_ptr, d2h_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_r_idx_ptr, d2h_idx_len)) {
+			brcmf_err(bus, "ring indices outside the TCM\n");
+			return -EINVAL;
+		}
 		devinfo->write_ptr = brcmf_pcie_write_tcm16;
 		devinfo->read_ptr = brcmf_pcie_read_tcm16;
 		brcmf_dbg(PCIE, "Using TCM indices\n");
@@ -2014,6 +2132,12 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	u32 addr;
 
 	shared = &devinfo->shared;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, sharedram_addr,
+					BRCMF_SHARED_SIZE)) {
+		brcmf_err(bus, "shared RAM at 0x%08x is outside the TCM\n",
+			  sharedram_addr);
+		return -EINVAL;
+	}
 	shared->tcm_base_address = sharedram_addr;
 
 	shared->flags = brcmf_pcie_read_tcm32(devinfo, sharedram_addr +
@@ -2052,6 +2176,17 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 
 	addr = sharedram_addr + BRCMF_SHARED_RING_INFO_ADDR_OFFSET;
 	shared->ring_info_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->htod_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->dtoh_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->ring_info_addr,
+					sizeof(struct brcmf_pcie_dhi_ringinfo))) {
+		brcmf_err(bus, "shared RAM addresses outside the TCM\n");
+		return -EINVAL;
+	}
 
 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
 		  shared->max_rxbufpost, shared->rx_dataoffset);
@@ -2392,6 +2527,7 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 
 	devinfo->regs = ioremap(bar0_addr, BRCMF_PCIE_REG_MAP_SIZE);
 	devinfo->tcm = ioremap(bar1_addr, bar1_size);
+	devinfo->tcm_size = bar1_size;
 
 	if (!devinfo->regs || !devinfo->tcm) {
 		brcmf_err(bus, "ioremap() failed (%p,%p)\n", devinfo->regs,
@@ -3102,22 +3238,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
-
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
 
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);

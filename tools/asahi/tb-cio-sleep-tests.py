@@ -24,14 +24,17 @@ def main():
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     paths = ['drivers/thunderbolt/path-sleep.c', 'drivers/thunderbolt/tunnel.c',
-             'drivers/thunderbolt/tb-cio-sleep.c', 'drivers/thunderbolt/tb_regs.h']
+             'drivers/thunderbolt/tb-cio-sleep.c', 'drivers/thunderbolt/tb_regs.h',
+             'drivers/thunderbolt/nhi.h']
     src = {p: (ROOT / p).read_text() for p in paths}
     regs = re.search(r'struct tb_regs_hop \{.*?\} __packed;', src[paths[3]], re.S).group()
+    # The host's sleep-in-place quirks, as the NHI driver sets them.
+    quirks = '\n'.join(re.findall(r'^#define QUIRK_CIO_\w+\s+BIT\(\d+\)', src[paths[4]], re.M))
     methods = '\n'.join(function(src[paths[1]], n) for n in
                         ('tb_tunnel_sleep_prepare', 'tb_tunnel_sleep',
                          'tb_tunnel_wake', 'tb_tunnel_sleep_complete'))
     unit = Path(__file__).with_suffix('.c').read_text()
-    for key, value in [('REGS', regs), ('PATH', src[paths[0]]),
+    for key, value in [('REGS', regs), ('QUIRKS', quirks), ('PATH', src[paths[0]]),
                        ('TUNNEL', methods), ('CM', src[paths[2]])]:
         unit = unit.replace('/* ACTUAL_' + key + ' */', value)
     mutations = {
@@ -51,6 +54,21 @@ def main():
         'keep-display-tunnels': ('tb_tunnel_is_dp(tunnel) || ', ''),
         'allow-host-callbacks': ('tunnel->sleep_replay = true;', 'tunnel->sleep_replay = false;'),
         'skip-system-work-drain': ('cancel_delayed_work_sync(&tcm->groups[i].release_work)', 'false'),
+        'skip-pm-roles': ('ret = tb_switch_cio_pm_roles(port->remote->sw);', 'ret = 0;'),
+        'save-without-state': ('if (!(tb->nhi->quirks & QUIRK_CIO_NO_ROUTER_STATE)) {', 'if (true) {'),
+        'restore-failure-fatal': ('if (ret && !(tb->nhi->quirks & QUIRK_CIO_WAKE_GIVES_UP))', 'if (ret)'),
+        'wait-links-long': ('QUIRK_CIO_WAKE_GIVES_UP ? 2 : 30', 'QUIRK_CIO_WAKE_GIVES_UP ? 30 : 30'),
+        'drain-macos-paths': ('if (path->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)\n\t\treturn 0;',
+                              'if (false)\n\t\treturn 0;'),
+        'rewrite-unslept-hops': ('!path->sleep_lost && observed.enable', 'false && observed.enable'),
+        'keep-xdomain-plugged': ('\t\txd->is_unplugged = true;\n', ''),
+        'skip-xdomain-unregister': ('the host must not hold across its power cycle.\n\t */\n\ttb_domain_unregister_unplugged_xdomains(tb);\n',
+                                    'the host must not hold across its power cycle.\n\t */\n'),
+        'skip-device-router-xdomains': ('\t\t\ttb_cio_release_xdomains(tb, port->remote->sw);\n', ''),
+        'refused-skips-rescan': ('\t\ttb_scan_switch(tb->root_switch);\n}', '\t\t(void)0;\n}'),
+        'rescan-while-stopping': ('if (tcm->hotplug_active && !tcm->stopping)\n\t\ttb_scan_switch', 'if (true)\n\t\ttb_scan_switch'),
+        'refused-keeps-cleanup': ('\t\t\ttcm->resume_cleanup_pending = false;\n\t\t}\n\t}\n\ttb_domain_unregister', '\t\t}\n\t}\n\ttb_domain_unregister'),
+        'keep-xdomain-port': ('\t\tif (port->xdomain == xd)\n\t\t\tport->xdomain = NULL;\n', ''),
     }
     variants = {'real': unit}
     for name, (old, new) in mutations.items():

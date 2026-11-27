@@ -4,14 +4,14 @@
 //! their backing owners; a generation is reusable only after paired retirement.
 
 use crate::g17::{
-    buffer::{self, BlockGeometry},
+    buffer::{self, compact::PairObject},
     fw::{
         m5::{initdata::Board, render_registers::ContextStore},
         render::{storage, RenderPass},
     },
     object::{Allocator, CpuMap, KernelObject, Placement},
 };
-use crate::{hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{hw::t8140::resources as cfg, mmu};
 use kernel::prelude::*;
 
 /// Offsets within a single client allocation, not fixed GPU addresses.
@@ -101,10 +101,10 @@ pub(in crate::g17) struct Generation {
 impl Generation {
     pub(in crate::g17) fn allocate_state(alloc: &Allocator<'_>, vm: &mmu::Vm,
         board: Option<&'static Board>) -> Result<KernelObject> {
-        let (range, layout) = if alloc.uat.is_m5() {
-            (BlockGeometry::M5_COMPACT, Layout::m5(board.ok_or(EINVAL)?))
-        } else { (dynamic::CLIENT_LOWER, Layout::NEO) };
-        KernelObject::new(alloc.dev, vm, Placement::In(range, cfg::TVB_PAGE), layout.bytes,
+        let (placement, layout) = if alloc.uat.is_m5() {
+            (PairObject::SlotState.placement()?, Layout::m5(board.ok_or(EINVAL)?))
+        } else { (Placement::In(vm.client_private_range(), cfg::TVB_PAGE), Layout::NEO) };
+        KernelObject::new(alloc.dev, vm, placement, layout.bytes,
             mmu::PROT_GPU_FW_SHARED_RW, CpuMap::WriteCombined)
     }
 
@@ -167,11 +167,5 @@ impl Generation {
                     base + layout.auxiliary as u64]
             }
         }
-    }
-
-    pub(in crate::g17) fn retire(&mut self, ordinal: u64) -> Result {
-        if self.ordinal != Some(ordinal) { return Err(EIO); }
-        self.ordinal = None;
-        Ok(())
     }
 }

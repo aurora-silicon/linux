@@ -27,24 +27,24 @@
 	 * ADT's order; the labels already follow it.
 	 */
 	cpus {
-		T6050_M_CPU(cpu0, 40000, cpufreq_mc0);
-		T6050_M_CPU(cpu1, 40001, cpufreq_mc0);
-		T6050_M_CPU(cpu2, 40002, cpufreq_mc0);
-		T6050_M_CPU(cpu3, 40003, cpufreq_mc0);
-		T6050_M_CPU(cpu4, 40004, cpufreq_mc0);
-		T6050_M_CPU(cpu5, 40005, cpufreq_mc0);
-		T6050_M_CPU(cpu6, 40100, cpufreq_mc1);
-		T6050_M_CPU(cpu7, 40101, cpufreq_mc1);
-		T6050_M_CPU(cpu8, 40102, cpufreq_mc1);
-		T6050_M_CPU(cpu9, 40103, cpufreq_mc1);
-		T6050_M_CPU(cpu10, 40104, cpufreq_mc1);
-		T6050_M_CPU(cpu11, 40105, cpufreq_mc1);
-		T6050_P_CPU(cpu12, 10200, cpufreq_pc);
-		T6050_P_CPU(cpu13, 10201, cpufreq_pc);
-		T6050_P_CPU(cpu14, 10202, cpufreq_pc);
-		T6050_P_CPU(cpu15, 10203, cpufreq_pc);
-		T6050_P_CPU(cpu16, 10204, cpufreq_pc);
-		T6050_P_CPU(cpu17, 10205, cpufreq_pc);
+		T6050_M_CPU(cpu0, 40000, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu1, 40001, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu2, 40002, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu3, 40003, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu4, 40004, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu5, 40005, cpufreq_mc0, l2_cache_mc0);
+		T6050_M_CPU(cpu6, 40100, cpufreq_mc1, l2_cache_mc1);
+		T6050_M_CPU(cpu7, 40101, cpufreq_mc1, l2_cache_mc1);
+		T6050_M_CPU(cpu8, 40102, cpufreq_mc1, l2_cache_mc1);
+		T6050_M_CPU(cpu9, 40103, cpufreq_mc1, l2_cache_mc1);
+		T6050_M_CPU(cpu10, 40104, cpufreq_mc1, l2_cache_mc1);
+		T6050_M_CPU(cpu11, 40105, cpufreq_mc1, l2_cache_mc1);
+		T6050_P_CPU(cpu12, 10200, cpufreq_pc, l2_cache_p0);
+		T6050_P_CPU(cpu13, 10201, cpufreq_pc, l2_cache_p1);
+		T6050_P_CPU(cpu14, 10202, cpufreq_pc, l2_cache_p2);
+		T6050_P_CPU(cpu15, 10203, cpufreq_pc, l2_cache_p3);
+		T6050_P_CPU(cpu16, 10204, cpufreq_pc, l2_cache_p4);
+		T6050_P_CPU(cpu17, 10205, cpufreq_pc, l2_cache_p5);
 
 		/*
 		 * The clusters are MPIDR Aff1 (M0, M1, then P), each with its own L2. The boot
@@ -115,6 +115,17 @@
 			};
 		};
 	};
+
+	/* L2 per M cluster, L2 per P core, L3 per P cluster (t6050-base.dtsi, "Caches"). */
+	T6050_M_L2(l2_cache_mc0, l2-cache-mcluster0);
+	T6050_M_L2(l2_cache_mc1, l2-cache-mcluster1);
+	T6050_P_L3(l3_cache_pc, l3-cache-pcluster);
+	T6050_P_L2(l2_cache_p0, l2-cache-pcore0, l3_cache_pc);
+	T6050_P_L2(l2_cache_p1, l2-cache-pcore1, l3_cache_pc);
+	T6050_P_L2(l2_cache_p2, l2-cache-pcore2, l3_cache_pc);
+	T6050_P_L2(l2_cache_p3, l2-cache-pcore3, l3_cache_pc);
+	T6050_P_L2(l2_cache_p4, l2-cache-pcore4, l3_cache_pc);
+	T6050_P_L2(l2_cache_p5, l2-cache-pcore5, l3_cache_pc);
 };
 
 #define DIE
@@ -139,6 +150,11 @@
  * +0x8000; interrupts [677, 676, 679, 678]: 676..679 in send-empty, send-not-empty, recv-empty,
  * recv-not-empty order), dart-mtp 0x294800000 (interrupt 659, SID 0, vm-base 0x100_00004000),
  * dockchannel-mtp 0x294b14000 for its interrupts (660) and 0x294b28000.. for the FIFOs.
+ *
+ * Only the laptops have this block: their ADTs carry mtp, dart-mtp and dockchannel-mtp, while
+ * the desktops' (J775c, J873s) carry none of them, and nothing brings the MTP up there. Its
+ * registers are then not live, so the first access at probe takes an SError. The four nodes are
+ * therefore off here, and each laptop board that adds the HID transport turns them on.
  */
 &die0 {
 	mtp_mbox: mailbox@294608000 {
@@ -151,6 +167,7 @@
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
+		status = "disabled";
 	};
 
 	mtp_dart: iommu@294800000 {
@@ -159,6 +176,7 @@
 		interrupts = <AIC_IRQ 0 659 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+		status = "disabled";
 	};
 
 	mtp: mtp@294600000 {
@@ -170,6 +188,7 @@
 		mboxes = <&mtp_mbox>;
 		iommus = <&mtp_dart 0>;
 		#helper-cells = <0>;
+		status = "disabled";
 	};
 
 	mtp_dockchannel: fifo@294b14000 {
@@ -183,6 +202,7 @@
 		#size-cells = <1>;
 		interrupt-controller;
 		#interrupt-cells = <2>;
+		status = "disabled";
 	};
 
 #if defined(T6050_J714C) || defined(T6050_J716C)
@@ -199,7 +219,8 @@
 #endif
 };
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_K114C)
+/* Boards whose ADT has ATC2's USB4 router (acio2) define T6050_ATC2_USB4_ROUTER. */
+#ifdef T6050_ATC2_USB4_ROUTER
 /*
  * ATC2's USB4/Thunderbolt router (ADT /arm-io/acio2, acio-cpu2 and dart-acio2), powered per
  * connection: the PHY enters CIO mode, then the router's domains come on (ATC2_CIO, _PCIE, _USB,
@@ -436,7 +457,6 @@
 			reg-names = "config", "rc", "port0", "fabric", "debug", "ltssm", "intr2axi";
 			/* The port's: link events and INTx */
 			interrupts = <AIC_IRQ 0 1469 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "port0";
 			power-domains = <&ps_atc2_pcie>;
 			/* No boot loader hands the port over: the kernel cold-initializes it. */
 			apple,pciec-kernel-init;
@@ -477,3 +497,47 @@
 	};
 };
 #endif
+
+/*
+ * Die 0's memory cache controllers (ADT /arm-io/mcc: amcc-count 8,
+ * dcs-count-per-amcc 4, AMCC a at 0x2220000000 + a * 0x2000000, four 16 KiB
+ * planes at +0x40000). Both M5 Pro and M5 Max boards include this file; M5 Pro
+ * enables AMCC 0..3 only (ADT amcc-enable-mask = 0xf, 16 planes), and M5 Max
+ * ships in both 460 GB/s (binned) and 614 GB/s (amcc-enable-mask = 0xff,
+ * 8 AMCCs) variants under the same board DTS. Because the binned 460 GB/s M5
+ * Max's amcc-enable-mask has not been read from hardware yet and apple-mcc
+ * reads every listed plane aperture before rejecting it, keep mcc disabled
+ * here until the boot loader populates reg from the live ADT's
+ * amcc-enable-mask and enables the node (or a board whose enable mask is
+ * verified across all SKUs enables it); ranges covers all eight AMCCs for
+ * that update.
+ *
+ * The boot loader leaves every enabled plane's ways powered with allocation
+ * disabled until apple-mcc allows it. On laptops, each board's framebuffer0
+ * names &dcp as its display so once mcc is enabled, allocation waits for the
+ * DCP to retire the boot scanout (and stays off when the boot loader keeps
+ * simpledrm).
+ */
+/ {
+	soc@2220000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x22 0x20000000 0x22 0x20000000 0x0 0x10000000>;
+		nonposted-mmio;
+
+		mcc: memory-controller@2220000000 {
+			compatible = "apple,t6050-mcc";
+			reg = <0x22 0x20000000 0x0 0x4000>, <0x22 0x20040000 0x0 0x4000>,
+			      <0x22 0x20080000 0x0 0x4000>, <0x22 0x200c0000 0x0 0x4000>,
+			      <0x22 0x22000000 0x0 0x4000>, <0x22 0x22040000 0x0 0x4000>,
+			      <0x22 0x22080000 0x0 0x4000>, <0x22 0x220c0000 0x0 0x4000>,
+			      <0x22 0x24000000 0x0 0x4000>, <0x22 0x24040000 0x0 0x4000>,
+			      <0x22 0x24080000 0x0 0x4000>, <0x22 0x240c0000 0x0 0x4000>,
+			      <0x22 0x26000000 0x0 0x4000>, <0x22 0x26040000 0x0 0x4000>,
+			      <0x22 0x26080000 0x0 0x4000>, <0x22 0x260c0000 0x0 0x4000>;
+			apple,boot-dma-devices = <&dcp>;
+			status = "disabled";
+		};
+	};
+};

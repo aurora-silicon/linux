@@ -199,7 +199,7 @@
 	label = "USB-C Left Rear";
 };
 
-/* hpm3 is ATC3's port controller; hpm5, the MagSafe port's, is not wired. */
+/* hpm3 is ATC3's port controller. The MagSafe port's, hpm5, is in t8132-laptop.dtsi. */
 &nub_spmi_a1 {
 	status = "okay";
 
@@ -266,7 +266,6 @@
 };
 
 &dwc3_3 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -327,10 +326,6 @@
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j604.bin";
 	};
-
-	/* J604 ADT /arm-io/dockchannel-mtp/mtp-transport/actuator: Force Touch */
-	actuator {
-	};
 };
 
 /*
@@ -351,7 +346,8 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
-#include "hwmon-fan-dual.dtsi"
+#include "hwmon-fan.dtsi"
+#include "t8132-j604-hwmon-rails.dtsi"
 
 /*
  * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
@@ -376,6 +372,8 @@
 &avd {
 	status = "okay";
 };
+
+#include "t8132-j604-atcphy-tunables.dtsi"
 
 /*
  * External displays over USB-C: both pipes (dcpext0/1), routed through each
@@ -616,4 +614,34 @@
 			};
 		};
 	};
+};
+
+/*
+ * Keyboard backlight on macOS's scale: its levels 0.0625..1.0 drive
+ * 69..336 of 960 PWM cycles, on = 52 + 284 * level, so the top level is
+ * 35 % duty and the line starts at 5.42 %.
+ */
+&kbd_led {
+	min-duty-cycle-bp = <542>;
+	max-duty-cycle-bp = <3500>;
+};
+
+/*
+ * The headset jack reports the plug on ring sense; tip sense keeps
+ * re-asserting with nothing plugged in.
+ */
+&jack_codec {
+	cirrus,ring-sense-detect;
+};
+
+/*
+ * ProRes: the engine and its DART. The driver binds the T8132 engine whenever
+ * apple/prores-t8132-init.bin is installed and leaves it off without it.
+ */
+&dart_apr0 {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
 };

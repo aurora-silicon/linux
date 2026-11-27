@@ -292,6 +292,8 @@ pub(crate) struct Head {
     /// The owning VM's [`crate::mmu::Vm::id`], one per VM status; the watchdog lines print it.
     pub(crate) vm: u64,
     pub(crate) published: u64,
+    /// Its command finished and only its retirement is outstanding: a compute command whose
+    /// completion record (M5: completion stamp) is present. A render head never is.
     pub(crate) finished: bool,
     /// Its queue already failed (quarantined) and holds the GPU only until the firmware drains
     /// it. No later watchdog of its own will settle it.
@@ -310,6 +312,10 @@ pub(crate) enum Decision {
     /// only.
     Excuse,
     Spare,
+    /// Its own command finished ([`Head::finished`]): it is retired on its completion record,
+    /// its stamp owed, instead of failed. The caller fails it as [`Decision::Own`] where it
+    /// cannot be retired that way.
+    Retire,
 }
 
 /// Another VM's older unfinished work that can block `own`: live work before work whose queue
@@ -340,9 +346,11 @@ pub(crate) fn blocker(own: Head, others: impl Iterator<Item = Head>) -> Option<H
 /// own allowance and its other deferrals ([`renew_execution`], [`renew_shared`]) are counted
 /// separately and come on top, and each renewal re-arms a timer rather than an absolute
 /// deadline, so the time until the job is failed (spared) can exceed 46 s.
+///
+/// Work that finished is not hung, whatever is ahead of it: it is retired, not failed.
 pub(crate) fn decide(own: Head, renewals: u8, excuse: Excuse, blocker: Option<Head>) -> Decision {
     match blocker {
-        _ if own.finished => Decision::Own,
+        _ if own.finished => Decision::Retire,
         None => Decision::Own,
         Some(blocker) if blocker.excused && !blocker.failed && excuse.used < excuse.limit => {
             Decision::Excuse
@@ -369,6 +377,7 @@ impl Verdict {
             Decision::Excuse => excuse.used == 0,
             Decision::Defer => renewals == 0,
             Decision::Own | Decision::Spare => true,
+            Decision::Retire => false,
         })
     }
 }
@@ -835,11 +844,11 @@ mod tests {
         assert_eq!(classify(own, MAX_RENEWALS, others.into_iter()), Decision::Excuse);
     }
     #[test]
-    fn no_blocker_or_finished_work_is_own() {
+    fn no_blocker_is_own_and_finished_work_retires() {
         assert_eq!(classify(head(9, 103, false), 0, [].into_iter()), Decision::Own);
         // The oldest unfinished work is never excused, not even by later excused work.
         assert_eq!(classify(head(9, 100, false), 0, [excused(5, 101)].into_iter()), Decision::Own);
-        assert_eq!(classify(head(9, 103, true), 0, [excused(5, 100)].into_iter()), Decision::Own);
+        assert_eq!(classify(head(9, 103, true), 0, [excused(5, 100)].into_iter()), Decision::Retire);
         // Same-VM work does not excuse either.
         assert_eq!(classify(head(5, 103, false), MAX_RENEWALS, [excused(5, 100)].into_iter()),
             Decision::Own);
@@ -859,7 +868,33 @@ mod tests {
     fn same_vm_finished_and_later_work_do_not_block() {
         let own = head(5, 101, false);
         assert_eq!(classify(own, 0, [head(5, 100, false), head(7, 100, true), head(7, 101, false), head(7, 102, false)].into_iter()), Decision::Own);
-        assert_eq!(classify(head(5, 101, true), 0, [head(7, 100, false)].into_iter()), Decision::Own);
+        assert_eq!(classify(head(5, 101, true), 0, [head(7, 100, false)].into_iter()),
+            Decision::Retire);
+    }
+    #[test]
+    fn finished_work_is_retired_not_failed() {
+        // Only its stamp is missing: whatever is ahead of it, at any renewal count, it retires.
+        let own = head(9, 103, true);
+        let ahead: [&[Head]; 5] = [&[], &[failed(5, 100)], &[head(5, 100, false)], &[excused(5, 100)],
+            &[failed(5, 100), head(7, 101, false)]];
+        for renewals in [0, 1, MAX_RENEWALS, u8::MAX] {
+            for others in ahead {
+                let verdict = attribute(own, renewals, FRESH, others.iter().copied());
+                assert_eq!(verdict.decision, Decision::Retire);
+                // Nothing ahead of it is to blame.
+                assert_eq!(verdict.reported_blocker(renewals, FRESH), None);
+            }
+        }
+        // Unfinished work keeps the rules: behind a failed blocker it is deferred, then its own.
+        let unfinished = head(9, 103, false);
+        for renewals in 0..MAX_RENEWALS {
+            assert_eq!(classify(unfinished, renewals, [failed(5, 100)].into_iter()), Decision::Defer);
+        }
+        assert_eq!(classify(unfinished, MAX_RENEWALS, [failed(5, 100)].into_iter()), Decision::Own);
+        assert_eq!(classify(unfinished, MAX_RENEWALS, [head(5, 100, false)].into_iter()),
+            Decision::Spare);
+        // Another VM's finished work blocks nobody.
+        assert_eq!(classify(unfinished, MAX_RENEWALS, [head(5, 100, true)].into_iter()), Decision::Own);
     }
     #[test]
     fn giving_up_says_what_the_watchdog_had_granted() {

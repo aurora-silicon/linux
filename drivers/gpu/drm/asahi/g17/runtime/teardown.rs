@@ -33,6 +33,7 @@ impl Reclaim {
             Self::Context(context) => {
                 context.release_execution();
                 drop(context.take_render_pool());
+                context.release_render_id();
                 drop(context);
             }
         }
@@ -139,12 +140,15 @@ impl Host for Service<'_> {
         let linked = context.retain_linked_work(self.objects);
         let (_, _, slots) = self.render.exit_scope(context);
         crate::g17::trace::teardown(5, u64::from(context.id()), slots, u64::from(linked));
-        self.render
+        let kept = self
+            .render
             .detach_context(context, self.buffers, self.reclaim)?;
         // The firmware consumed this context's scheduler release after its kill (if any)
         // was acknowledged and its pairs went idle: it no longer names these pairs, so
-        // their kill hold ends here rather than at the next processor stop.
-        self.admission.release_killed_slots(slots);
+        // their kill hold ends here rather than at the next processor stop. Pairs kept out
+        // of service keep theirs until then.
+        self.admission.release_killed_slots(slots & !kept);
+        self.admission.hold_kept_slots(kept);
         // detach_context preflights this slot together with every graph slot.
         // Retain it before Pending removes its reference under the device lock.
         self.reclaim.context(context)
@@ -174,6 +178,7 @@ impl Firmware {
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
         self.queues.render.collect_reclaimable(reclaim)?;
         if self.queues.teardown.is_empty() {
+            self.queues.sync_render_holds();
             return Ok(());
         }
         self.queues.render.observe_teardown_releases(&self.init)?;
@@ -211,6 +216,9 @@ impl Firmware {
             // A channel whose last scheduler release is consumed can change owner.
             self.primary.state.shared.channels.notify();
         }
+        // The pairs of consumed releases are parked: their holds end, which wakes the
+        // publications waiting for render capacity.
+        self.queues.sync_render_holds();
         Ok(())
     }
 }

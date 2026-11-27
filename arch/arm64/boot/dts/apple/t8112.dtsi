@@ -27,6 +27,11 @@
 		#endif
 	};
 
+	clpc: performance-controller {
+		compatible = "apple,t8112-clpc", "apple,clpc";
+		apple,smc = <&smc>;
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -1519,12 +1524,18 @@
 			};
 		};
 
+		/* ADT /arm-io/nub-spmi1: the auxiliary PMU (pmu-aux) at USID 0xe. */
 		nub_spmi1: spmi@23d794000 {
 			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
 			reg = <0x2 0x3d794000 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
-			status = "disabled";
+
+			pmic@e {
+				compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+				read-only;
+			};
 		};
 
 		smc: smc@23e400000 {
@@ -1847,6 +1858,16 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Disabled here on every board by design. The SEP is already
+		 * running when Linux starts (warm attach: one shared-memory
+		 * registration, no cold boot), so apple_sep enables this node
+		 * and sep_dart with a changeset at module load, once it has
+		 * picked this SoC's profile and before the DART probes. A
+		 * board with the enclave only needs the sep alias, which the
+		 * boot loader uses to add the sepfw region and the boot
+		 * manifests.
+		 */
 		sep: sep@25e400000 {
 			compatible = "apple,sep";
 			reg = <0x2 0x5e400000 0x0 0x6C000>;
@@ -2111,6 +2132,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1065 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_cio>;
 			};
 
 			usb4_0_nhi: nhi@f00000 {
@@ -2170,6 +2192,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_pcie>;
 			};
 
 			apciec0: pcie@3b0000000 {
@@ -2332,6 +2355,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1146 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_cio>;
 			};
 
 			usb4_1_nhi: nhi@f00000 {
@@ -2391,6 +2415,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_pcie>;
 			};
 
 			apciec1: pcie@530000000 {

@@ -601,7 +601,7 @@ impl KernelMapping {
         // own DMA-reservation references whose Drop would reacquire this lock.
         let node = anchor.0.as_mut().split_tail(size as u64, KernelMappingInner {
             owner: owner_ref.clone(), uat_inner: inner.uat_inner.clone(), prot,
-            bo: None, _gem: None, offset: self.0.offset, mapped_size: size,
+            bo: None, _gem: None, offset: self.0.offset, mapped_size: size, private: None,
         });
         let mut node = match node {
             Ok(node) => node,

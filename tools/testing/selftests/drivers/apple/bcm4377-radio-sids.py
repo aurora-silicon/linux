@@ -36,13 +36,22 @@ def main():
 typedef uint16_t u16;
 typedef uint8_t u8;
 typedef uint32_t u32;
-typedef uint64_t u64;
+typedef unsigned long long u64;
 typedef u64 phys_addr_t;
 typedef unsigned long atomic_long_t;
 #define BIT(n) (1UL << (n))
+#define BIT_ULL(n) (1ULL << (n))
+#define SZ_16K 16384
+#define GFP_KERNEL 0
+#define IOMMU_READ 1
+#define IOMMU_WRITE 2
+#define IOMMU_MMIO 4
+#define APPLE_DART2 1
+#define DART_T8110_DISABLE_STREAMS 0xc20
 #define WRITE_ONCE(x,v) ((x) = (v))
 #define READ_ONCE(x) (x)
-#define dev_err(...) ((void)0)
+#define dev_err(dev,...) do { (void)(dev); if (false) fprintf(stderr,__VA_ARGS__); } while (0)
+#define dev_warn(dev,...) do { (void)(dev); if (false) fprintf(stderr,__VA_ARGS__); } while (0)
 #define dev_err_probe(dev, error, ...) (error)
 #define dev_err_ratelimited(...) ((void)0)
 #define dev_dbg(dev,...) do { (void)(dev); if (false) fprintf(stderr,__VA_ARGS__); } while (0)
@@ -97,6 +106,7 @@ struct apple_dart_hw {
     u32 tcr_enabled, tcr_4level, ttbr_shift, ttbr_addr_field_shift;
     void (*enable_remap)(struct apple_dart *, int, int);
     int (*invalidate_tlb)(struct apple_dart_stream_map *);
+    bool gen3;
 };
 struct apple_dart {
     const struct apple_dart_hw *hw;
@@ -104,29 +114,60 @@ struct apple_dart {
     bool locked, managed_failed, managed_lock, retained, retained_mtp, supports_bypass;
     bool four_level, per_stream, tunneled, fw_mirror, fw_handoff;
     bool pending, preserve_display;
+    bool isp_host, cold_ane, live_mtp, display_dark, display_tlb_stale;
+    unsigned int display_writers, display_dark_writers;
+    bool cold_gen3, cold_gen3_pcie;
+    u32 cold_gen3_sids;
+    void *tunables;
+    unsigned long static_bypass[4];
     void *dcp, *frontend[2];
     struct { bool ready; } iommu;
     void *dev;
-    unsigned pgsize;
+    unsigned pgsize, oas;
     int num_streams;
+    u64 sid16_page;
+    struct io_pgtable_ops *sid16_ops;
+    u32 sid16_ttbr;
+    u32 sid16_init_tcr;
+    u32 sid16_init_ttbr;
+    bool sid16_init_enabled;
     u32 regs[0x5000/4];
 };
 struct apple_dart_stream_map { struct apple_dart *dart; unsigned long sidmap[4]; };
 struct apple_dart_atomic_stream_map { struct apple_dart *dart; atomic_long_t sidmap[4]; };
 static u32 apple_dart_readl(struct apple_dart *d, unsigned o) { return d->regs[o/4]; }
-static unsigned enable_writes, all_writes, guard_calls, device_pins, noidle_puts;
-static bool drop_bypass_write;
+static unsigned enable_writes, disable_writes, all_writes, guard_calls, device_pins, noidle_puts;
+static bool drop_bypass_write, drop_enable_write, drop_disable_write, drop_ttbr_write;
+static bool tcr_clear_dapf, sid16_saw_translate;
+static unsigned sid16_tcr_writes;
+static u32 last_sid16_tcr_write;
 static int guard_result, apple_dart_radio_kexec;
 static int kexec_block(void *guard)
 { assert(guard==&apple_dart_radio_kexec); guard_calls++; return guard_result; }
 static void get_device(void *dev) { assert(dev); device_pins++; }
-static u32 last_enable;
+static u32 last_enable, last_disable;
 static void apple_dart_writel(struct apple_dart *d, u32 v, unsigned o)
 {
     all_writes++;
+    if (o == DART_TCR(d, 16)) {
+        sid16_tcr_writes++;
+        last_sid16_tcr_write = v;
+        if (v & DART_T8110_TCR_TRANSLATE_ENABLE)
+            sid16_saw_translate = true;
+    }
     if (drop_bypass_write && o==DART_TCR(d,16)) return;
+    if (drop_ttbr_write && o==DART_TTBR(d,16,0)) return;
     if (o >= d->hw->enable_streams && o < d->hw->enable_streams + 32) {
-        d->regs[o/4] |= v; enable_writes++; last_enable=v;
+        enable_writes++; last_enable=v;
+        if (!drop_enable_write)
+            d->regs[o/4] |= v;
+    } else if (o >= DART_T8110_DISABLE_STREAMS && o < DART_T8110_DISABLE_STREAMS + 32) {
+        unsigned en = d->hw->enable_streams + (o - DART_T8110_DISABLE_STREAMS);
+        disable_writes++; last_disable=v;
+        if (!drop_disable_write)
+            d->regs[en/4] &= ~v;
+    } else if (tcr_clear_dapf && o >= 0x1000 && o < 0x1000 + 4 * DART_MAX_STREAMS) {
+        d->regs[o/4] = v & ~DART_T8110_TCR_BYPASS_DAPF;
     } else d->regs[o/4]=v;
 }
 static void writel(u32 v, void *p) { (void)v; (void)p; abort(); }
@@ -134,11 +175,71 @@ static int find_first_bit(const unsigned long *p, int max)
 { int sid; for_each_set_bit(sid,p,max) return sid; return max; }
 static u64 virt_to_phys(void *p) { return (uintptr_t)p; }
 static int tlb_result;
+static unsigned tlb_flushes;
+static unsigned long last_tlb_sidmap;
 static int test_invalidate_tlb(struct apple_dart_stream_map *m)
-{ assert(m->sidmap[0] && !(m->sidmap[0] & ~m->dart->managed_sids)); return tlb_result; }
+{
+    assert(m->sidmap[0] && !(m->sidmap[0] & ~(m->dart->managed_sids | BIT(16))));
+    tlb_flushes++;
+    last_tlb_sidmap = m->sidmap[0];
+    return tlb_result;
+}
 struct io_pgtable_cfg {
+    unsigned pgsize_bitmap, ias, oas;
+    int coherent_walk;
+    void *iommu_dev;
     struct { int n_ttbrs, n_levels; void *ttbr[1]; } apple_dart_cfg;
 };
+struct io_pgtable_ops {
+    int (*map_pages)(struct io_pgtable_ops *ops, unsigned long iova,
+                     phys_addr_t paddr, size_t pgsize, size_t pgcount,
+                     int prot, int gfp, size_t *mapped);
+    phys_addr_t (*iova_to_phys)(struct io_pgtable_ops *ops, unsigned long iova);
+    u64 mapped_iova;
+    phys_addr_t mapped_phys;
+    size_t mapped_size;
+};
+static u64 sid16_root_page[1];
+static unsigned sid16_allocs, sid16_frees;
+static int test_sid16_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
+                                phys_addr_t paddr, size_t pgsize, size_t pgcount,
+                                int prot, int gfp, size_t *mapped)
+{
+    (void)gfp;
+    assert(pgsize == SZ_16K && pgcount == 1);
+    assert(prot == (IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO));
+    ops->mapped_iova = iova;
+    ops->mapped_phys = paddr;
+    ops->mapped_size = pgsize * pgcount;
+    *mapped = ops->mapped_size;
+    return 0;
+}
+static phys_addr_t test_sid16_iova_to_phys(struct io_pgtable_ops *ops, unsigned long iova)
+{
+    return iova == ops->mapped_iova ? ops->mapped_phys : 0;
+}
+static struct io_pgtable_ops *alloc_io_pgtable_ops(int fmt, struct io_pgtable_cfg *cfg, void *cookie)
+{
+    (void)cookie;
+    assert(fmt == APPLE_DART2 && cfg->pgsize_bitmap == SZ_16K && cfg->ias == 36);
+    struct io_pgtable_ops *ops = calloc(1, sizeof(*ops));
+    assert(ops);
+    ops->map_pages = test_sid16_map_pages;
+    ops->iova_to_phys = test_sid16_iova_to_phys;
+    cfg->apple_dart_cfg.n_ttbrs = 1;
+    cfg->apple_dart_cfg.n_levels = 3;
+    cfg->apple_dart_cfg.ttbr[0] = (void *)0x4000;
+    (void)sid16_root_page;
+    sid16_allocs++;
+    return ops;
+}
+static void free_io_pgtable_ops(struct io_pgtable_ops *ops)
+{
+    if (!ops)
+        return;
+    sid16_frees++;
+    free(ops);
+}
 struct io_pgtable { struct io_pgtable_cfg cfg; };
 #define io_pgtable_ops_to_pgtable(p) (p)
 struct iommu_domain { int unused; };
@@ -170,10 +271,24 @@ static void *dev_get_drvdata(struct device *d) { return d->data; }
 static bool apple_dart_fault_pending(struct apple_dart *d) { return d->pending; }
 struct apple_dart_master_cfg { struct apple_dart_stream_map stream_maps[2]; bool supports_bypass, locked; };
 static struct apple_dart_master_cfg *active_cfg;
-static bool board_j713=true;
+static bool board_t8132_air=true;
 static void *dev_iommu_priv_get(struct device *d) { (void)d; return active_cfg; }
 static bool dev_is_pci(struct device *d) { return d->pci; }
-static bool of_machine_is_compatible(const char *s) { assert(!strcmp(s,"apple,j713")); return board_j713; }
+static bool apple_t8132_air(void) { return board_t8132_air; }
+static bool apple_dart_master_needs_strict(struct device *d) { assert(!d->of_node); return false; }
+static int apple_dart_isp_host_reset(struct apple_dart *d) { (void)d; abort(); }
+static void apple_dart_apply_own_tunables(struct apple_dart *d) { (void)d; abort(); }
+#define bitmap_weight(p,max) ({ int w=0, n; for_each_set_bit(n,p,max) w++; w; })
+#define test_bit(n,p) (!!((p)[(n)/64] & BIT((n)%64)))
+/* The radio DART is no J714s/J716c display provider and stays powered. */
+static int apple_dart_v27_cfg_enter(struct apple_dart_master_cfg *c) { (void)c; return 0; }
+static void apple_dart_v27_cfg_leave(struct apple_dart_master_cfg *c) { (void)c; }
+#define APPLE_DART_WRITER_CLOSED 2
+static int writer_gate, writer_refs;
+static int apple_dart_sleep_writer_get(struct apple_dart *d) { (void)d; writer_refs++; return writer_gate; }
+static void apple_dart_sleep_writer_put(struct apple_dart *d, int gate)
+{ (void)d; assert(gate==writer_gate && writer_refs>0); writer_refs--; }
+static void apple_dart_sleep_release_failed(void) { abort(); }
 static u32 readl(const void *p) { (void)p; abort(); }
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *p,
         int op, bool range, unsigned long a, unsigned long b)
@@ -205,7 +320,9 @@ static int apple_dart_dcp_domain_flush(struct apple_dart_domain *d)
 #define DART_T8110_TLB_CMD_OP_FLUSH_SID 1
 #define for_each_stream_map(i,base,m) for ((i)=0,(m)=&(base)->stream_maps[0]; \
     (i)<MAX_DARTS_PER_DEVICE && (m)->dart; (m)=&(base)->stream_maps[++(i)])
-struct apple_pcie_hw { bool tunneled; };
+struct apple_pcie_hw { bool tunneled, adopt_link; };
+#define PORT_MSICFG 0x124
+#define BITS_PER_LONG 64
 struct apple_pcie { u16 managed_sids; struct apple_pcie_hw *hw; struct device *dev; };
 struct list_head { bool linked; };
 struct apple_pcie_port {
@@ -214,6 +331,7 @@ struct apple_pcie_port {
     u32 entries[16];
     void *base, *domain, *np;
     bool started, needs_stop;
+    unsigned long adopted_slots;
     unsigned irq;
     u32 status, link;
     struct list_head entry;
@@ -229,6 +347,7 @@ static void apple_pcie_port_disable_irq(struct apple_pcie_port *p) { (void)p; }
 static void apple_pcie_port_writel(struct apple_pcie_port *p, u32 v, unsigned o)
 { (void)p; assert(v==U32_MAX && o==PORT_INTMSK); pci_irq_writes++; }
 static void apple_pcie_tunnel_stop(struct apple_pcie_port *p) { (void)p; pci_tunnel_stops++; }
+static void apple_pcie_rid2sid_write(struct apple_pcie_port *p, int slot, u32 v) { (void)p; (void)slot; (void)v; abort(); }
 static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *p) { (void)p; }
 static void irq_set_chained_handler(unsigned i, void *f) { (void)i; (void)f; }
 static void synchronize_rcu(void) {}
@@ -278,6 +397,9 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
                  'apple_dart_hw_enable_bypass(',
                  'static void apple_dart_hw_disable_dma(',
                  'static bool apple_dart_managed_static_bypass(',
+                 'static bool apple_dart_managed_sid16_narrowed(',
+                 'static int apple_dart_managed_narrow_sid16(',
+                 'static void apple_dart_managed_unnarrow_sid16(',
                  'static int apple_dart_managed_admit(',
                  'int apple_dart_radio_check_idle(',
                  'static void apple_dart_managed_quarantine_locked(',
@@ -288,6 +410,8 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
                  'apple_dart_mod_streams(',
                  'static int apple_dart_domain_add_streams(',
                  'apple_dart_setup_translation(',
+                 'static int apple_dart_attach_dev_paging_unguarded(',
+                 'static int apple_dart_attach_dev_paging_v27(',
                  'static int apple_dart_attach_dev_paging(',
                  'static int apple_dart_domain_flush_tlb_range('):
         # This definition has its static int return type on a preceding line.
@@ -300,8 +424,9 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
     code += definition(pci, 'static int apple_pcie_radio_check_cold(struct apple_pcie_port *port)\n{') + '\n'
     code += definition(dart, 'static int apple_dart_retain_radio(') + '\n'
     probe = definition(dart, 'static int apple_dart_probe(struct platform_device *pdev)\n{')
-    start = probe.index('\tif (dart->managed_sids) {', probe.index('Retaining the live T8132 MTP bypass'))
-    end = probe.index('\n\t} else if (!dart->locked', start)
+    # The managed-SID branch of the reset/acquisition chain, up to its next sibling.
+    start = probe.index('} else if (dart->managed_sids) {') + len('} else ')
+    end = probe.index('\n\t} else if (', start)
     cleanup = probe[probe.index('err_clk_disable:'):probe.index('\n\tclk_bulk_disable_unprepare', probe.index('err_clk_disable:'))]
     code += 'static int test_probe_start(struct apple_dart *dart) { int ret; void *dev=dart->dev;\n' + probe[start:end] + '\n\t}\nreturn 0;\n' + cleanup + '\nreturn ret; }\n'
     code += r'''
@@ -335,6 +460,219 @@ static void test_probe_guard(const struct apple_dart_hw *hw)
     assert(noidle_puts==1 && !pm_refs);
     drop_bypass_write=false;
     guard_result=0;
+
+    /*
+     * SID16 narrowing + error-path teardown preserves inherited TCR, TTBR, and
+     * ENABLE[16] state (with write-one-to-clear DISABLE_STREAMS and T8132
+     * non-retained DAPF request modeling) and allows clean rebind without -EBUSY.
+     */
+    const struct {
+        u32 init_tcr, init_ttbr;
+        bool init_enabled, clear_dapf;
+    } sid16_cases[] = {
+        { 0, 0, false, true },
+        { 0, 0x123400, false, true },
+        { 0, 0x123400, true, true },
+        { 2, 0, false, true },
+        { 2, 0x5678001, false, true },
+        { 2, 0xabcd001, true, true },
+        { 6, 0, false, false },
+        { 6, 0xabcd001, false, false },
+        { 6, 0xabcd001, true, false },
+    };
+    for (unsigned i=0; i<ARRAY_SIZE(sid16_cases); i++) {
+        struct apple_dart narrow={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                  .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                  .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+        tcr_clear_dapf=sid16_cases[i].clear_dapf;
+        narrow.regs[DART_TCR(&narrow,16)/4]=sid16_cases[i].init_tcr;
+        narrow.regs[DART_TTBR(&narrow,16,0)/4]=sid16_cases[i].init_ttbr;
+        narrow.regs[hw->enable_streams/4]=BIT(18)|(sid16_cases[i].init_enabled?BIT(16):0);
+        tlb_result=0; tlb_flushes=0; last_tlb_sidmap=0;
+        sid16_allocs=sid16_frees=disable_writes=0; pm_refs=1; guard_result=0;
+        assert(!test_probe_start(&narrow));
+        assert(narrow.sid16_ops && narrow.regs[DART_TCR(&narrow,16)/4]==1);
+        assert(narrow.regs[DART_TTBR(&narrow,16,0)/4]==narrow.sid16_ttbr);
+        assert(narrow.regs[hw->enable_streams/4]==(BIT(1)|BIT(2)|BIT(16)|BIT(18)));
+        assert(tlb_flushes==1 && last_tlb_sidmap==BIT(16));
+        assert(sid16_allocs==1 && !sid16_frees);
+        bool ib=false;
+        assert(!apple_dart_managed_admit(&narrow,&ib));
+        narrow.regs[hw->enable_streams/4]&=~BIT(16);
+        assert(apple_dart_managed_admit(&narrow,&ib)==-EBUSY);
+        narrow.regs[hw->enable_streams/4]|=BIT(16);
+
+        /* Simulated post-narrowing probe failure tears down and frees table. */
+        tlb_flushes=0; last_tlb_sidmap=0; disable_writes=0; last_disable=0;
+        last_sid16_tcr_write=0;
+        apple_dart_managed_quarantine(&narrow);
+        apple_dart_managed_unnarrow_sid16(&narrow);
+        assert(!narrow.sid16_ops && !narrow.sid16_ttbr && sid16_frees==1);
+        assert(last_sid16_tcr_write==
+               (sid16_cases[i].init_tcr?hw->tcr_bypass:hw->tcr_disabled));
+        assert(narrow.regs[DART_TCR(&narrow,16)/4]==sid16_cases[i].init_tcr);
+        assert(narrow.regs[DART_TTBR(&narrow,16,0)/4]==sid16_cases[i].init_ttbr);
+        assert(narrow.regs[hw->enable_streams/4]==
+               (BIT(1)|BIT(2)|BIT(18)|(sid16_cases[i].init_enabled?BIT(16):0)));
+        assert(disable_writes==(sid16_cases[i].init_enabled?0u:1u));
+        if (!sid16_cases[i].init_enabled)
+            assert(last_disable==BIT(16));
+        assert(tlb_flushes==1 && last_tlb_sidmap==BIT(16));
+
+        /* A fresh rebind sees the restored state and admits cleanly. */
+        struct apple_dart rebind={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                  .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                  .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+        memcpy(rebind.regs,narrow.regs,sizeof(rebind.regs));
+        pm_refs=1;
+        assert(!test_probe_start(&rebind));
+        assert(rebind.sid16_ops && rebind.regs[DART_TCR(&rebind,16)/4]==1);
+        free_io_pgtable_ops(rebind.sid16_ops);
+        pm_refs=0;
+    }
+
+    /* Entry states that cannot be restored are rejected before narrowing. */
+    tcr_clear_dapf=true;
+    struct apple_dart bad_entry={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                 .num_streams=19,.supports_bypass=false,.pgsize=SZ_16K,
+                                 .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    bad_entry.regs[DART_TCR(&bad_entry,16)/4]=2;
+    sid16_allocs=0; all_writes=0;
+    assert(apple_dart_managed_narrow_sid16(&bad_entry)==-EBUSY);
+    assert(!bad_entry.sid16_ops && !sid16_allocs && !all_writes);
+    bad_entry.supports_bypass=true;
+    bad_entry.regs[DART_TCR(&bad_entry,16)/4]=0;
+    bad_entry.regs[DART_TTBR(&bad_entry,16,0)/4]=hw->ttbr_valid|0x1000;
+    pm_refs=1;
+    assert(test_probe_start(&bad_entry)==-EBUSY && !pm_refs);
+    assert(apple_dart_managed_narrow_sid16(&bad_entry)==-EBUSY);
+    assert(!bad_entry.sid16_ops && !sid16_allocs && !all_writes);
+    bad_entry.regs[DART_TTBR(&bad_entry,16,0)/4]=0;
+    const u32 bad_tcrs[]={1,4,8,0x80};
+    for (unsigned i=0; i<ARRAY_SIZE(bad_tcrs); i++) {
+        bad_entry.regs[DART_TCR(&bad_entry,16)/4]=bad_tcrs[i];
+        pm_refs=1;
+        assert(test_probe_start(&bad_entry)==-EBUSY && !pm_refs);
+        assert(apple_dart_managed_narrow_sid16(&bad_entry)==-EBUSY);
+        assert(!bad_entry.sid16_ops && !sid16_allocs && !all_writes);
+    }
+
+    /* Dropped TTBR0 write during narrowing fails before enabling translation. */
+    struct apple_dart drop_ttbr={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                 .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                 .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    drop_ttbr.regs[DART_TCR(&drop_ttbr,16)/4]=2;
+    drop_ttbr.regs[DART_TTBR(&drop_ttbr,16,0)/4]=0xabcd001;
+    drop_ttbr.regs[hw->enable_streams/4]=BIT(16);
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1; noidle_puts=0;
+    sid16_saw_translate=false; sid16_tcr_writes=0; last_sid16_tcr_write=0;
+    drop_ttbr_write=true;
+    assert(test_probe_start(&drop_ttbr)==-EIO);
+    drop_ttbr_write=false;
+    assert(!sid16_saw_translate);
+    assert(drop_ttbr.retained && drop_ttbr.managed_failed && noidle_puts==1 && !pm_refs);
+    assert(!drop_ttbr.sid16_ops && !drop_ttbr.sid16_ttbr && sid16_allocs==1 && sid16_frees==1);
+    assert(drop_ttbr.regs[DART_TCR(&drop_ttbr,16)/4]==2);
+    assert(last_sid16_tcr_write==hw->tcr_bypass);
+    assert(drop_ttbr.regs[DART_TTBR(&drop_ttbr,16,0)/4]==0xabcd001);
+    assert((drop_ttbr.regs[hw->enable_streams/4]&(BIT(1)|BIT(2)|BIT(16)))==BIT(16));
+
+    /* Dropped ENABLE[16] write during narrowing fails probe and rolls back. */
+    struct apple_dart drop_en={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                               .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                               .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    drop_en.regs[DART_TCR(&drop_en,16)/4]=2;
+    drop_en.regs[DART_TTBR(&drop_en,16,0)/4]=0xabcd001;
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1; noidle_puts=0;
+    last_sid16_tcr_write=0;
+    drop_enable_write=true;
+    assert(test_probe_start(&drop_en)==-EIO);
+    drop_enable_write=false;
+    assert(drop_en.retained && drop_en.managed_failed && noidle_puts==1 && !pm_refs);
+    assert(!drop_en.sid16_ops && !drop_en.sid16_ttbr && sid16_allocs==1 && sid16_frees==1);
+    assert(last_sid16_tcr_write==hw->tcr_bypass);
+    assert(drop_en.regs[DART_TCR(&drop_en,16)/4]==2);
+    assert(drop_en.regs[DART_TTBR(&drop_en,16,0)/4]==0xabcd001);
+    assert(!(drop_en.regs[hw->enable_streams/4]&(BIT(1)|BIT(2)|BIT(16))));
+
+    /* Mismatched TCR readback on restore keeps table unfreed. */
+    struct apple_dart mismatch_tcr={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                    .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                    .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    mismatch_tcr.regs[DART_TCR(&mismatch_tcr,16)/4]=6;
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1;
+    assert(!test_probe_start(&mismatch_tcr));
+    apple_dart_managed_unnarrow_sid16(&mismatch_tcr);
+    assert(mismatch_tcr.sid16_ops && sid16_frees==0);
+    assert(mismatch_tcr.regs[DART_TCR(&mismatch_tcr,16)/4]==2);
+    free_io_pgtable_ops(mismatch_tcr.sid16_ops);
+    pm_refs=0;
+
+    /* Failed DISABLE_STREAMS clear refuses to restore bypass and keeps table unfreed. */
+    struct apple_dart stuck_en={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    stuck_en.regs[DART_TCR(&stuck_en,16)/4]=2;
+    stuck_en.regs[DART_TTBR(&stuck_en,16,0)/4]=0xabcd001;
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1;
+    assert(!test_probe_start(&stuck_en));
+    drop_disable_write=true;
+    apple_dart_managed_unnarrow_sid16(&stuck_en);
+    assert(stuck_en.sid16_ops && sid16_frees==0);
+    assert(stuck_en.regs[DART_TCR(&stuck_en,16)/4]==1);
+    assert(stuck_en.regs[DART_TTBR(&stuck_en,16,0)/4]==stuck_en.sid16_ttbr);
+    drop_disable_write=false;
+    free_io_pgtable_ops(stuck_en.sid16_ops);
+    pm_refs=0;
+
+    /* Failed TCR restore keeps TTBR intact and keeps table unfreed. */
+    struct apple_dart stuck_tcr={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                 .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                 .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    stuck_tcr.regs[DART_TCR(&stuck_tcr,16)/4]=2;
+    stuck_tcr.regs[DART_TTBR(&stuck_tcr,16,0)/4]=0xabcd001;
+    stuck_tcr.regs[hw->enable_streams/4]=BIT(16);
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1;
+    assert(!test_probe_start(&stuck_tcr));
+    drop_bypass_write=true;
+    apple_dart_managed_unnarrow_sid16(&stuck_tcr);
+    assert(stuck_tcr.sid16_ops && sid16_frees==0);
+    assert(stuck_tcr.regs[DART_TCR(&stuck_tcr,16)/4]==1);
+    assert(stuck_tcr.regs[DART_TTBR(&stuck_tcr,16,0)/4]==stuck_tcr.sid16_ttbr);
+    drop_bypass_write=false;
+    free_io_pgtable_ops(stuck_tcr.sid16_ops);
+    pm_refs=0;
+
+    /* Failed TTBR restore keeps table unfreed. */
+    struct apple_dart stuck_ttbr={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                                  .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                                  .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    stuck_ttbr.regs[DART_TCR(&stuck_ttbr,16)/4]=2;
+    stuck_ttbr.regs[DART_TTBR(&stuck_ttbr,16,0)/4]=0xabcd001;
+    stuck_ttbr.regs[hw->enable_streams/4]=BIT(16);
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1;
+    assert(!test_probe_start(&stuck_ttbr));
+    drop_ttbr_write=true;
+    apple_dart_managed_unnarrow_sid16(&stuck_ttbr);
+    assert(stuck_ttbr.sid16_ops && sid16_frees==0);
+    assert(stuck_ttbr.regs[DART_TTBR(&stuck_ttbr,16,0)/4]==stuck_ttbr.sid16_ttbr);
+    drop_ttbr_write=false;
+    free_io_pgtable_ops(stuck_ttbr.sid16_ops);
+    pm_refs=0;
+
+    /* Failed TLB flush during teardown keeps the page table unfreed. */
+    struct apple_dart stuck={.hw=hw,.managed_sids=BIT(1)|BIT(2),.version=0x202,
+                             .num_streams=19,.supports_bypass=true,.pgsize=SZ_16K,
+                             .oas=36,.sid16_page=0x381204000ULL,.dev=(void *)1};
+    stuck.regs[DART_TCR(&stuck,16)/4]=2;
+    stuck.regs[hw->enable_streams/4]=BIT(16);
+    tlb_result=0; sid16_allocs=sid16_frees=0; pm_refs=1;
+    assert(!test_probe_start(&stuck));
+    tlb_result=-EIO;
+    apple_dart_managed_unnarrow_sid16(&stuck);
+    assert(stuck.sid16_ops && sid16_frees==0);
+    free_io_pgtable_ops(stuck.sid16_ops);
+    tlb_result=0; pm_refs=0; tcr_clear_dapf=false;
 }
 '''
     code += r'''
@@ -445,8 +783,8 @@ int main(void)
     d.frontend[0]=&d;
     assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_DMA);
     d.frontend[0]=NULL;
-    assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_IDENTITY); /* legacy J713 */
-    board_j713=false;
+    assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_IDENTITY); /* T8132 Air PCIe (J713/J715) */
+    board_t8132_air=false;
     assert(apple_dart_def_domain_type(&dev)==0); /* other machines retain default */
     d.managed_sids=BIT(1)|BIT(2);
     struct apple_dart_atomic_stream_map domain[2]={{.dart=&d}};
@@ -473,6 +811,12 @@ int main(void)
     assert(apple_dart_attach_dev_paging(&attach.domain,&dev,NULL)==0);
     assert(enable_writes==2 && last_enable==BIT(2) && !pm_refs);
     assert(attach.stream_maps[0].sidmap[0]==(BIT(1)|BIT(2)));
+    /* A DART closed for its sleep takes no attach and no register write. */
+    u32 closed[ARRAY_SIZE(d.regs)]; memcpy(closed,d.regs,sizeof(closed));
+    writer_gate=APPLE_DART_WRITER_CLOSED; all_writes=0;
+    assert(apple_dart_attach_dev_paging(&attach.domain,&dev,NULL)==-EBUSY);
+    assert(!all_writes && !pm_refs && !writer_refs && !memcmp(closed,d.regs,sizeof(closed)));
+    writer_gate=0;
     for (unsigned sid=3; sid<64; sid++) {
         assert(d.regs[DART_TCR(&d,sid)/4]==before[DART_TCR(&d,sid)/4]);
         assert(d.regs[DART_TTBR(&d,sid,0)/4]==before[DART_TTBR(&d,sid,0)/4]);
@@ -579,6 +923,16 @@ int main(void)
     map_result[1]=-ENODEV; assert(apple_pcie_radio_check_cold(&port)==-ENODEV); map_result[1]=0;
     assert(!memcmp(before,d.regs,sizeof(before)) && !node_refs && !provider_refs);
     assert(!radio_provider.dev.locked && !d.managed_lock);
+    d.sid16_ops=(void *)1; d.sid16_ttbr=0x4001;
+    d.regs[DART_TCR(&d,16)/4]=1; d.regs[DART_TTBR(&d,16,0)/4]=0x4001;
+    assert(apple_pcie_radio_check_cold(&port)==0);
+    d.regs[hw.enable_streams/4]&=~BIT(16);
+    assert(apple_pcie_radio_check_cold(&port)==-EBUSY);
+    d.regs[hw.enable_streams/4]|=BIT(16);
+    assert(apple_pcie_radio_check_cold(&port)==0);
+    d.sid16_ops=NULL; d.sid16_ttbr=0;
+    d.regs[DART_TCR(&d,16)/4]=before[DART_TCR(&d,16)/4];
+    d.regs[DART_TTBR(&d,16,0)/4]=before[DART_TTBR(&d,16,0)/4];
     puts("radio normal SIDs: admission, scoped publication, foreign preservation, TLB failure rollback, quarantine, group merge and checked cold start PASS");
 }
 '''

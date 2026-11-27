@@ -21,6 +21,7 @@ properties:
           - apple,abbey-pmic
           - apple,baku-pmic
           - apple,chapel-pmic
+          - apple,club-pmic
           - apple,maverick-pmic
           - apple,mirabeau-pmic
           - apple,monaco-pmic
@@ -28,6 +29,7 @@ properties:
           - apple,simetra-pmic
           - apple,stowe-pmic
           - apple,vale-pmic
+          - apple,woodcote-pmic
       - const: apple,spmi-nvmem
 
   reg:

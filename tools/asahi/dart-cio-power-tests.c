@@ -164,6 +164,34 @@ static int restore(struct dart_cio_power *s)
 	ntrace = flushes = enables = 0;
 	return dart_cio_restore(regs, s);
 }
+/*
+ * A v2.4 disable, as macOS takes T6050's ACIO and PCIe-C DARTs down: after the error mask and
+ * before the streams, the error status words 0 and 0x4204 all ones. Older layouts write neither.
+ */
+static void check_disable_order(unsigned int from, const struct dart_cio_power *s)
+{
+	unsigned int mask = ~0U, status = ~0U, pending = 0, stream = ~0U;
+
+	for (unsigned int i = from; i < ntrace; i++) {
+		if (trace[i] == 0x4060 && mask == ~0U)
+			mask = i;
+		if (trace[i] == 0x4204)
+			status = i;
+		if (trace[i] >= 0x4000 && trace[i] < 0x4020) {
+			assert(mask != ~0U && stream == ~0U && !regs[trace[i] / 4]);
+			pending++;
+		}
+		if (trace[i] >= 0xc20 && trace[i] < 0xc40 && stream == ~0U)
+			stream = i;
+	}
+	assert(mask != ~0U && stream != ~0U && mask < stream);
+	if (s->common.version != 0x204) {
+		assert(status == ~0U && !pending);
+		return;
+	}
+	assert(pending == DIV_ROUND_UP(s->streams, 32));
+	assert(mask < status && status < stream && regs[0x4204 / 4] == ~0U);
+}
 int main(void)
 {
 	struct dart_cio_power s = {};
@@ -185,14 +213,20 @@ int main(void)
 	for (unsigned int streams = 28; streams <= 256; streams += 228) {
 		bool parts = streams == 28;
 
-		for (unsigned int version = 0x202; version <= 0x203;
+		/* v2.4: T6050's ACIO and PCIe-C DARTs, admitted with v2.2 and v2.3. */
+		for (unsigned int version = 0x202; version <= 0x204;
 		     version++) {
 			reset(streams, parts);
 			regs[2] = version;
+			/* The check that refuses a sleep early takes nothing and writes nothing. */
+			assert(!dart_cio_check(regs, &s, streams, parts, false) &&
+			       !dart_cio_check(regs, &s, streams, parts, true) &&
+			       !s.valid && !writes);
 			assert(!dart_cio_capture(regs, &s, streams, parts) &&
-			       s.valid && !writes);
+			       s.valid && !writes && s.common.version == version);
 			assert(partition_reads == (parts ? 16 : 0));
 			assert(!dart_cio_disable(regs, &s));
+			check_disable_order(0, &s);
 			for (unsigned int i = 0; i < DIV_ROUND_UP(streams, 32);
 			     i++)
 				assert(!regs[(0xc00 + 4 * i) / 4]);
@@ -201,7 +235,10 @@ int main(void)
 			check_restored(&s);
 			cases++;
 			assert(!dart_cio_capture(regs, &s, streams, parts));
+			unsigned int from = ntrace;
+
 			assert(!dart_cio_disable(regs, &s));
+			check_disable_order(from, &s);
 			/* Abort without losing power also restores the saved context. */
 			assert(!restore(&s));
 			check_restored(&s);
@@ -222,7 +259,8 @@ int main(void)
 			regs[2] = 0x201;
 			break;
 		case 1:
-			regs[2] = 0x204;
+			/* Newer than v2.4 (T6050) is not guessed at. */
+			regs[2] = 0x205;
 			break;
 		case 2:
 			regs[0] = 0;
@@ -246,6 +284,17 @@ int main(void)
 			regs[0xc00 / 4] |= BIT(31);
 			break;
 		}
+		/*
+		 * The early check refuses what the capture will, with nothing written: the
+		 * layout and the TrustZone lock with the requesters running, the faults and the
+		 * error mask once they are stopped. A stream enabled outside the bank (kind 8)
+		 * is left to the capture.
+		 */
+		int early = dart_cio_check(regs, &s, 28, true, false);
+		int quiesced = dart_cio_check(regs, &s, 28, true, true);
+
+		assert((early < 0) == (kind <= 4 || kind == 7) && !writes && !s.valid);
+		assert((quiesced < 0) == (kind != 8) && !writes && !s.valid);
 		assert(dart_cio_capture(regs, &s, 28, true) < 0 && !writes &&
 		       !s.valid);
 		cases++;
@@ -253,6 +302,8 @@ int main(void)
 	for (unsigned int kind = 1; kind <= 3; kind++) {
 		reset(28, true);
 		busy = kind;
+		assert(!dart_cio_check(regs, &s, 28, true, false) &&
+		       dart_cio_check(regs, &s, 28, true, true) == -ETIMEDOUT && !writes);
 		assert(dart_cio_capture(regs, &s, 28, true) == -ETIMEDOUT &&
 		       !writes);
 		cases++;

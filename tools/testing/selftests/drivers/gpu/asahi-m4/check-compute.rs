@@ -9,7 +9,10 @@ mod fw {
     }
 }
 #[allow(unused_imports)]
-use fw::{graph::manager, work::compute};
+use fw::{
+    graph::{manager, pools},
+    work::compute,
+};
 mod uapi {
     #[derive(Default)]
     pub struct drm_asahi_cmd_compute {pub cdm_ctrl_stream_base:u64,pub cdm_ctrl_stream_end:u64}
@@ -27,12 +30,13 @@ fn refs(variant:u64)->encode::ComputeRefs {
     let g=0x1000000000+variant*0x100000000;
     encode::ComputeRefs {
         notifier:f+0x600400,qinfo:f+0x200000,user_stamp:f+0x600648,fw_stamp:f+0x600640,
-        work:f+0x100000,work_gva:g+0x100000,seq:f+0x100900,preempt_gva:g+0x200000,
+        work:f+0x100000,work_gva:g+0x100000,seq:f+0x100900,descriptor_fw:0,preempt_gva:g+0x200000,
         its:if variant&2!=0{f+0x500040}else{f+0x1008c0},stats_fw:f+0x300000,
         auxiliary_fw:f+0x400000,auxiliary_gva:g+0x400000,context_store_gva:g+0x500000,
         counter_fw:f+0x500000,pool_state_gva:g+0x600000,page_list_gva:g+0x700000,
         usc_base:if variant&1!=0{1<<40}else{0},record_fw:if variant&1!=0{f+0x700000}else{0},
-        binding_generation:1,uma_slot:1,command_id:1,compute_index:0,work_818:0,target_stamp:0x100,submitted:1,
+        binding_generation:1,uma_slot:1,command_id:1,compute_index:0,work_818:0,
+        target_stamp:0x100,submitted:1,event:compute::EVENT,
     }
 }
 
@@ -85,6 +89,18 @@ fn main(){
         assert_eq!(&q[0x3c..0x40],&opaque.to_le_bytes());
         assert_eq!(&w[0x810..0x814],&target.to_le_bytes());
     }
+    // Second concurrent compute pipe uses event 16 at w+0x814 and q+0x1b8.
+    {
+        let r_p1 = encode::ComputeRefs { event: compute::EVENTS[1], ..refs(0) };
+        let c = uapi::drm_asahi_cmd_compute {
+            cdm_ctrl_stream_base: 0x1000300000,
+            cdm_ctrl_stream_end: 0x1000300200,
+        };
+        let mut w=[0xa5;compute::WORK_SIZE];let mut q=[0x5a;compute::SEQ_SIZE];
+        encode::encode_compute(&r_p1,&c,&[],&[0;2],1,1,1,&mut w,&mut q).unwrap();
+        assert_eq!(&w[0x814..0x818],&compute::EVENTS[1].to_le_bytes());
+        assert_eq!(&q[0x1b8..0x1bc],&compute::EVENTS[1].to_le_bytes());
+    }
     let mut cases=0;
     let r=refs(0);let c=uapi::drm_asahi_cmd_compute {cdm_ctrl_stream_base:0x1000300000,cdm_ctrl_stream_end:0x1000300200};
     let invalid:Vec<(encode::ComputeRefs,u32)>=vec![
@@ -93,6 +109,7 @@ fn main(){
         (encode::ComputeRefs {uma_slot:0,..r},1),(encode::ComputeRefs {uma_slot:33,..r},1),
         (encode::ComputeRefs {target_stamp:0x101,..r},1),
         (encode::ComputeRefs {submitted:0,..r},1),
+        (encode::ComputeRefs {event:0,..r},1),(encode::ComputeRefs {event:128,..r},1),
         (encode::ComputeRefs {work:0xfffffc1ffffffff8,..r},1),
         (encode::ComputeRefs {work:0xfffffc2ffbfff000,..r},1),
         (encode::ComputeRefs {seq:0xfffffc2ffbffff00,..r},1),

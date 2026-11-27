@@ -8,6 +8,7 @@
  * read here. On T8140 at EL2 the sleep driver sends the request at the
  * irreversible commit boundary. Only errors before send may refuse.
  */
+#include <linux/bitfield.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -35,6 +36,15 @@
 /* The state word of a PMGR power domain, as pmgr-pwrstate has it. */
 #define SEP_PS_DEV_DISABLE	BIT(10)
 #define SEP_PS_ACTUAL		GENMASK(7, 4)
+
+/*
+ * After its sleep request, the enclave has gone down: DEV_DISABLE where its firmware sets
+ * it, or its actual state at 0. The M1's enclave never sets DEV_DISABLE (measured on J313).
+ */
+static bool sep_ps_down(u32 state)
+{
+	return (state & SEP_PS_DEV_DISABLE) || !FIELD_GET(SEP_PS_ACTUAL, state);
+}
 
 /* One-shot precommit test: no SLEEP request or commit coprocessor stop. */
 static bool sleep_refuse_before_send;
@@ -153,6 +163,39 @@ static struct device *sep_pm_dart(struct device *dev)
 	of_node_put(np);
 
 	return pdev ? &pdev->dev : NULL;
+}
+
+/*
+ * Saves the enclave's DART while it can be read, before the enclave is told at suspend. Only
+ * a DART with apple,sleep-restore in its node is saved here and then left alone by its own
+ * callbacks. Without it, the DART's noirq suspend would read its registers after the enclave
+ * slept and its power domain went off, which hangs the suspend: refuse instead.
+ */
+int sep_pm_dart_prepare(void *ptr)
+{
+	struct device *dart = sep_pm_dart(ptr);
+	int ret;
+
+	if (!dart)
+		return -ENODEV;
+	if (!apple_dart_sleep_listed(dart)) {
+		dev_err(dart, "no apple,sleep-restore list: the enclave can't sleep at suspend\n");
+		put_device(dart);
+		return -EOPNOTSUPP;
+	}
+	ret = apple_dart_sleep_prepare(dart);
+	put_device(dart);
+
+	return ret;
+}
+
+/*
+ * Whether a sleep core commit sends the staged SLEEP (T8140). Without one, a firmware suspend
+ * (T6041's own sleep driver) tells the enclave at device suspend instead.
+ */
+bool sep_pm_platform_commit(void)
+{
+	return apple_sleep_commit_stops_coprocs();
 }
 
 void sep_pm_dart_restore(void *ptr)
@@ -301,7 +344,7 @@ out:
 	 * the native contract, not proved atomic by the preceding PMGR sample.
 	 */
 	apple_mbox_set_recv_enabled(c->mbox, false);
-	c->gate_ret = readl_poll_timeout_atomic(c->ps, c->state, c->state & SEP_PS_DEV_DISABLE,
+	c->gate_ret = readl_poll_timeout_atomic(c->ps, c->state, sep_ps_down(c->state),
 						SEP_PM_POLL_US, SEP_PM_TIMEOUT_US);
 	c->gate_valid = true;
 	if (c->gate_ret)
