@@ -388,13 +388,6 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
     }
 
-    /// Turns the mailbox off for a coprocessor that has acknowledged idle, before its run bit and
-    /// power state go. Only [`Self::warm_restart`] follows this.
-    pub fn mailbox_off(self: Pin<&mut Self>) {
-        // SAFETY: `rtk` is valid per the type invariant.
-        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
-    }
-
     /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings. The
     /// caller then sets the run bit and calls [`Self::boot`].
     pub fn warm_restart(self: Pin<&mut Self>) -> Result {

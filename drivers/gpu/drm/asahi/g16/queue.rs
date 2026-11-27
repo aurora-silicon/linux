@@ -396,7 +396,7 @@ impl crate::queue::Queue for Queue {
         &mut self,
         _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
