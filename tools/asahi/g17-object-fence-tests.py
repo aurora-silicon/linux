@@ -72,10 +72,20 @@ MUTATIONS = {
         '            front.stamps_owed_work = Some(front.packet.completion.work_state()?);\n',
         '',
     ),
-    # Pair-wide drain of a stampless render group fails to mark the context stampless-drained.
-    'drop-stampless-drain-mark': (
+    # Pair-wide drain of a stampless render group fails to pin its work-state lease.
+    'drop-stampless-drain-pin': (
         'policy-render',
+        '                if let Some(work) = &active.stamps_owed_work {\n'
+        '                    work.pin_until_stop();\n'
+        '                } else {\n'
+        '                    active.packet.context.note_stampless_drain();\n'
+        '                }\n',
         '                active.packet.context.note_stampless_drain();\n',
+    ),
+    # WorkStates::pin forgets to record the pin bit, allowing same-context reuse after unstamped drain.
+    'same-context-reuse-pinned-slot': (
+        'identity',
+        '        self.pinned.fetch_or(mask, Ordering::AcqRel);\n',
         '',
     ),
     # A compute queue recycled after kill/quarantine returns its cached descriptor ring to the pool.
@@ -140,6 +150,17 @@ def context_source(text):
         '    pub(crate) fn work_head_va(', '    pub(crate) fn work_head_address(', '    fn expose_work('])
     node = block(text, '    pub(crate) fn node_va(&self) -> Result<u64> {')
     return pages, methods, node
+
+
+def identity_source(text):
+    """Extract the real WorkStates allocator, pin, older_live, used, and may_take from context/identity.rs."""
+    consts = '\n'.join(re.search(r'^pub\(super\) const ' + name + r': [^;]+;', text, re.M).group(0)
+                        for name in ['FREE', 'STATE_COUNT', 'ENGINES'])
+    may_take = block(text, 'pub(super) const fn may_take(')
+    struct = block(text, 'pub(super) struct WorkStates {')
+    impl1 = block(text, 'impl WorkStates {')
+    impl2 = block(text, 'impl WorkStates {', text.index('impl WorkStates {') + 1)
+    return '\n'.join([consts, may_take, struct, impl1, impl2])
 
 
 PRELUDE = r'''
@@ -240,7 +261,12 @@ impl Allocator<'_> {
     }
 }
 
-pub mod channel {
+pub mod identity {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+@IDENTITY@
+}
+mod channel {
     use core::sync::atomic::{AtomicU64, Ordering};
 @CHANNEL@
     /// Sets the published and consumed control-record counts.
@@ -894,7 +920,60 @@ pub mod now {
     }
 }
 
+fn work_states_pin_prevents_same_context_reuse() {
+    use crate::identity::{WorkStates, STATE_COUNT};
+    let states = WorkStates::new();
+    let drained = states.allocate(0).expect("initial render slot");
+    let drained_slot = drained & 63;
+    let newer = states.allocate(0).expect("newer slot");
+    assert_eq!(states.older_live(newer), Some(drained));
+    assert!(states.pin(drained, 0), "pinning a live slot succeeds once");
+    assert!(!states.pin(drained, 0), "double pin is a no-op");
+    assert_eq!(states.older_live(newer), None, "pinned slot must not stall older_live");
+    assert_eq!(states.used(), 2, "pinned slot stays counted in used()");
+    assert!(states.release(newer, 0));
+    assert_eq!(states.used(), 1);
+    for _ in 0..(STATE_COUNT * 4) {
+        let w = states.allocate(0).expect("same-context submission");
+        assert_ne!(w & 63, drained_slot, "same-context submission re-acquired pinned slot");
+        assert!(states.release(w, 0));
+    }
+    for _ in 1..(STATE_COUNT - 2) {
+        let w = states.allocate(0).expect("slot to pin");
+        assert!(states.pin(w, 0));
+    }
+    let r = states.allocate(0).expect("render takes 1 of 2 remaining");
+    let c = states.allocate(1).expect("compute takes last remaining");
+    assert!(states.release(r, 0));
+    assert!(states.release(c, 1));
+    for _ in 0..2 {
+        let w = states.allocate(0).expect("final slot to pin");
+        assert!(states.pin(w, 0));
+    }
+    assert!(states.exhausted(), "all 63 slots pinned must report exhausted()");
+    assert!(states.allocate(0).is_none());
+    assert!(states.allocate(1).is_none());
+    let claims = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ctx_a = WorkStates::shared(claims.clone());
+    let ctx_b = WorkStates::shared(claims.clone());
+    let wa = ctx_a.allocate(0).expect("shared ctx_a slot");
+    let sa = wa & 63;
+    assert!(ctx_a.pin(wa, 0));
+    assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire) & (1u64 << sa), 0,
+               "pinned slot releases shared work-key claim for sibling context");
+    assert_eq!(ctx_a.used(), 1, "pinning context still accounts for its pinned slot");
+    for _ in 0..(STATE_COUNT * 2) {
+        let w = ctx_a.allocate(0).expect("shared ctx_a retry");
+        assert_ne!(w & 63, sa, "shared context re-acquired its own pinned slot");
+        assert!(ctx_a.release(w, 0));
+    }
+    let wb = ctx_b.allocate(0).expect("sibling ctx_b slot");
+    assert!(ctx_b.release(wb, 0));
+    println!("same-context WorkStates pin: pinned slot never re-acquired, older_live unblocked, exhaustion clean");
+}
+
 fn main() {
+    work_states_pin_prevents_same_context_reuse();
     now::uncached_pooled();
     now::return_classes();
     now::full_family();
@@ -985,11 +1064,23 @@ def cache_policy(context, compute, memory, runtime, render):
     # Render queue records, retargeted and bound to work slots in place, stay uncached.
     need(memory, r'Family::QueueState,\s*GRAPH_SIZE,\s*0,\s*prot,', 'render queue records uncached')
     # Stampless render retains its WorkStateLease until post-maintenance stamps arrive,
-    # and marks the context stampless-drained if released via pair-wide drain instead.
+    # and every unstamped drain path pins the slot via pin_until_stop() (same-context + cross-context).
     need(render, r'if stampless \{[^}]*front\.stamps_owed_work = Some\(front\.packet\.completion\.work_state\(\)\?\);[^}]*\}\s*defer\(Deferred::Retired\(',
          'stampless render retains WorkStateLease across stamps_owed')
-    need(render, r'if active\.stamps_owed \{\s*active\.packet\.context\.note_stampless_drain\(\);',
-         'stampless render drain retains WorkState until stop')
+    need(render, r'if active\.stamps_owed \{\s*if let Some\(work\) = &active\.stamps_owed_work \{\s*work\.pin_until_stop\(\);',
+         'stampless render drain pins WorkStateLease until stop')
+    need(render, r'fn fail_dropped\([\s\S]*?work\.pin_until_stop\(\);',
+         'fail_dropped pins WorkStateLease until stop')
+    need(render, r'fn settle_interrupted_front\([\s\S]*?work\.pin_until_stop\(\);',
+         'settle_interrupted_front pins WorkStateLease until stop')
+    need(render, r'fn fail_after_observation\([\s\S]*?work\.pin_until_stop\(\);',
+         'fail_after_observation pins WorkStateLease until stop')
+    need(context, r'pub\(crate\) fn pin_until_stop\(&self\) \{\s*self\.pinned\.store\(true, Ordering::Release\);\s*self\.context\.note_stampless_drain\(\);\s*\}',
+         'WorkStateLease::pin_until_stop sets pinned and stampless_drained')
+    need(context, r'if self\.pinned\.load\(Ordering::Acquire\) \{\s*self\.context\.pin_state\(word, engine\);',
+         'WorkStateLease::drop pins slot on unstamped drain')
+    need(context, r'if self\.context\.states\.exhausted\(\) \{\s*return Err\(EIO\);\s*\}',
+         'WorkStateLease::acquire fails cleanly when all slots are pinned')
     return failures
 
 
@@ -1026,17 +1117,20 @@ def main():
 
     now = pool_source(obj)
     pages, methods, node = context_source(ctx)
+    ident = identity_source((DRIVER / 'g17/context/identity.rs').read_text())
     if args.mutation:
         where, old, new = MUTATIONS[args.mutation]
         if where == 'object':
             now = replace(now, old, new)
+        elif where == 'identity':
+            ident = replace(ident, old, new)
         else:
             methods, node = (replace(methods, old, new), node) if old in methods else (methods, replace(node, old, new))
     channel = '\n'.join(re.search(r'(?ms)^(?:///[^\n]*\n)*static ' + name + r': AtomicU64 = AtomicU64::new\(0\);', chan).group(0)
                         for name in ['CONTROL_PUBLISHED', 'CONTROL_CONSUMED'])
     channel += '\n' + '\n'.join(block(chan, 'pub(crate) fn ' + name + '()')
                                 for name in ['control_fence', 'control_published', 'control_witnessed'])
-    code = (PRELUDE.replace('@CHANNEL@', channel).replace('@BASE@', pool_source(base)).replace('@NOW@', now)
+    code = (PRELUDE.replace('@CHANNEL@', channel).replace('@IDENTITY@', ident).replace('@BASE@', pool_source(base)).replace('@NOW@', now)
             .replace('@PAGES@', pages).replace('@METHODS@', methods).replace('@NODE@', node))
 
     with tempfile.TemporaryDirectory() as work:

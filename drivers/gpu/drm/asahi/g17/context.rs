@@ -317,11 +317,13 @@ impl Context {
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
         // Both firmware and host write work nodes (reused every 63 submissions
         // and zeroed on pool reuse). Map the node page firmware-cached on all
-        // G17 (G17P and M5): within a healthy context a node slot is rewritten
-        // only after every command holding its `WorkStateLease` has retired
-        // with post-maintenance completion stamps (including stampless render,
-        // where `Active` retains `WorkStateLease` until those stamps arrive).
-        // Across contexts, `Pool::allocate` never overruns a pool fence for
+        // G17 (G17P and M5): within a context a node slot is rewritten only
+        // after every command holding its `WorkStateLease` has retired with
+        // post-maintenance completion stamps (including stampless render, where
+        // `Active` retains `WorkStateLease` until those stamps arrive; any
+        // unstamped drain pins the slot via `WorkStateLease::pin_until_stop` so
+        // later submissions in the same context never acquire it). Across
+        // contexts, `Pool::allocate` never overruns a pool fence for
         // firmware-cached objects, and `retain_linked_work` keeps a killed,
         // failed, stampless-drained, or still-linked context's work storage
         // out of pool reuse until firmware stop. The counter page, which the
@@ -747,6 +749,9 @@ pub(crate) struct WorkStateLease {
     word: AtomicU32,
     /// Index of the engine whose admission took the node, valid once `word` is set.
     engine: AtomicU8,
+    /// Retired through an unstamped drain: keep the slot out of same-context
+    /// reuse when this lease drops instead of returning it to `WorkStates`.
+    pinned: AtomicBool,
     /// The ioctl's place in its context's submission order.
     ordinal: u64,
 }
@@ -761,6 +766,7 @@ impl WorkStateLease {
             context,
             word: AtomicU32::new(FREE),
             engine: AtomicU8::new(0),
+            pinned: AtomicBool::new(false),
             ordinal,
         })
     }
@@ -782,6 +788,9 @@ impl WorkStateLease {
         let mut order = self.context.order.lock();
         if !order.admits(self.ordinal) {
             return Err(EBUSY);
+        }
+        if self.context.states.exhausted() {
+            return Err(EIO);
         }
         let engine = engine.index();
         let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
@@ -885,12 +894,25 @@ impl WorkStateLease {
             .payload(pair, ordinal)
             .ok_or(EINVAL)
     }
+    /// Keeps this lease's work-state slot out of reuse within its context and
+    /// retains the context's work storage out of pool reuse until firmware stop.
+    /// Used on unstamped drain paths whose cached work node may still hold dirty
+    /// firmware cache lines.
+    pub(crate) fn pin_until_stop(&self) {
+        self.pinned.store(true, Ordering::Release);
+        self.context.note_stampless_drain();
+    }
 }
 impl Drop for WorkStateLease {
     fn drop(&mut self) {
         let word = self.word();
         if word != FREE {
-            self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
+            let engine = usize::from(self.engine.load(Ordering::Relaxed));
+            if self.pinned.load(Ordering::Acquire) {
+                self.context.pin_state(word, engine);
+            } else {
+                self.context.release_state(word, engine);
+            }
         } else if self.context.order.lock().leave(self.ordinal) {
             self.context.pass_turn();
         }
@@ -902,6 +924,13 @@ impl Context {
     /// failed acquire() then never sleeps through this node.
     fn release_state(&self, word: u32, engine: usize) {
         if self.states.release(word, engine) {
+            self.state_returns.notify();
+        }
+    }
+    /// Retires a slot without returning its index to `allocate`: decrementing
+    /// `held[engine]` may still satisfy `may_take(1, 0)` for a waiting engine.
+    fn pin_state(&self, word: u32, engine: usize) {
+        if self.states.pin(word, engine) {
             self.state_returns.notify();
         }
     }

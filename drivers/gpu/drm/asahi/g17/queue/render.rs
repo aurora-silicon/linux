@@ -2509,6 +2509,11 @@ impl Pair {
             if failing {
                 // decide() replays only innocent groups that never ran: like `fail_dropped`,
                 // they fail without poisoning their VM. Restarts other VMs caused dropped them.
+                if let Ok(work) = packet.completion.work_state() {
+                    work.pin_until_stop();
+                } else {
+                    packet.context.note_stampless_drain();
+                }
                 packet.completion.classify(recovery::Class::Spared);
                 defer(Deferred::Retired(packet.completion.clone(), Err(ENODATA)))?;
                 self.memory.retire(ordinal)?;
@@ -2555,6 +2560,11 @@ impl Pair {
             }
             let ordinal = front.ticket.ordinal;
             let completion = front.packet.completion.clone();
+            if let Ok(work) = completion.work_state() {
+                work.pin_until_stop();
+            } else {
+                front.packet.context.note_stampless_drain();
+            }
             completion.classify(recovery::Class::Spared);
             defer(Deferred::Retired(completion, Err(ENODATA)))?;
             self.memory.retire(ordinal)?;
@@ -2633,6 +2643,11 @@ impl Pair {
             ordinal
         );
         let packet = self.active.front().ok_or(EIO)?.packet.clone();
+        if let Ok(work) = packet.completion.work_state() {
+            work.pin_until_stop();
+        } else {
+            packet.context.note_stampless_drain();
+        }
         defer(Deferred::Retired(packet.completion.clone(), Err(ECANCELED)))?;
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
@@ -2895,11 +2910,20 @@ impl Pair {
         }
         while let Some(active) = self.active.front() {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
-            // proof above covers its stamps too (or the kill of its context), so only its
-            // descriptor is released. It has no drained result of its own.
+            // drain does not deliver per-node post-maintenance stamps, so pin its work-state slot
+            // against same-context reuse and retain the context's work storage until firmware stop.
             if active.stamps_owed {
-                active.packet.context.note_stampless_drain();
+                if let Some(work) = &active.stamps_owed_work {
+                    work.pin_until_stop();
+                } else {
+                    active.packet.context.note_stampless_drain();
+                }
             } else {
+                if let Ok(work) = active.packet.completion.work_state() {
+                    work.pin_until_stop();
+                } else {
+                    active.packet.context.note_stampless_drain();
+                }
                 let result = active.drained_result.ok_or(EIO)?;
                 defer(Deferred::Drained(active.packet.completion.clone(), result))?;
             }
@@ -3009,6 +3033,11 @@ impl Pair {
                     active.ticket.ordinal,
                     left
                 );
+                if let Ok(work) = active.packet.completion.work_state() {
+                    work.pin_until_stop();
+                } else {
+                    active.packet.context.note_stampless_drain();
+                }
                 defer(Deferred::Retired(
                     active.packet.completion.clone(),
                     Err(if spared { ECANCELED } else { EIO }),

@@ -363,7 +363,7 @@ ASAHI_TESTS = {
                                    'retain-not-sticky', 'node-unmarked', 'no-release',
                                    'reuse-killed-work-state', 'reuse-stampless-drained-work-state',
                                    'reuse-failed-work-state', 'drop-stampless-work-lease',
-                                   'drop-stampless-drain-mark',
+                                   'drop-stampless-drain-pin', 'same-context-reuse-pinned-slot',
                                    'reuse-recycled-descriptor-ring', 'uncached-nodes',
                                    'uncached-descriptors', 'cached-queue-records',
                                    'cached-scheduler'), []),
