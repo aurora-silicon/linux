@@ -296,14 +296,17 @@ def modes(root):
     checks = []
     blobs = []
 
-    def case(elements, expected, ranges=None, desktop=True):
+    def case(elements, expected, ranges=None, desktop=True, zero=None):
+        # zero: the firmware's zero-placeholder convention, on for desktop 26.6
+        # and 13.5; only desktop 26.6 sends deadlines at every internal timing.
+        zero = desktop if zero is None else zero
         raw = bytearray(struct.pack('<I', 0xd3))
         f['wire'](elements, raw)
         i = len(blobs)
         blobs.append('static const unsigned char b%u[]={%s};' %
                      (i, ','.join(map(str, raw))))
         check = (f'{{ struct dcp_parse_ctx c; unsigned n=99; '
-                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; c.internal_present_deadline={int(desktop)}; '
+                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(zero)}; c.internal_present_deadline={int(desktop)}; '
                  'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false); '
                  f'assert(!IS_ERR(m) && n=={len(expected)});')
         for j, hz in enumerate(expected):
@@ -343,6 +346,11 @@ def modes(root):
         case([m],[120],[(lo or 24<<16,hi or 120<<16) if valid else (0,0)])
     m=copy.deepcopy(supported[0]);m['MinimumVariableRefreshRate']=0;m['MaximumVariableRefreshRate']=0
     case([m],[120],[(0,0)],desktop=False)
+    # Firmware 13.5 uses the placeholders too: its ProMotion timing gets
+    # 24-120 Hz, a 60 Hz panel's timing stays fixed.
+    case([m],[120],[(24<<16,120<<16)],desktop=False,zero=True)
+    m60=copy.deepcopy(supported[1]);m60['MinimumVariableRefreshRate']=0;m60['MaximumVariableRefreshRate']=0
+    case([m60],[60],[(0,0)],desktop=False,zero=True)
     for key in ('MinimumVariableRefreshRate', 'MaximumVariableRefreshRate'):
         m=copy.deepcopy(supported[0]);m[key]=0
         case([m],[120],[(0,0)])
@@ -389,6 +397,25 @@ int main(void) {
     assert(!dcp_refresh_needs_deadline(60U<<16,false,false,true));
     assert(dcp_refresh_needs_deadline(120U<<16,false,true,false));
     assert(dcp_refresh_needs_deadline(48U<<16,true,false,false));
+    /* VRR_ENABLED on a live 24-120 Hz timing moves only the minimum rate:
+     * 0x180000 follows the frames, 0x780000 holds 120 Hz; each once. */
+    struct dcp_vrr_floor floor={0};
+    u32 min=0;
+    assert(!dcp_vrr_floor_next(&floor,true,&min) && !dcp_vrr_floor_next(&floor,false,&min));
+    dcp_vrr_floor_arm(&floor,24U<<16,120U<<16,120U<<16);
+    assert(!dcp_vrr_floor_next(&floor,true,&min) && !min);
+    assert(dcp_vrr_floor_next(&floor,false,&min) && min==0x780000);
+    assert(!dcp_vrr_floor_next(&floor,false,&min));
+    assert(dcp_vrr_floor_next(&floor,true,&min) && min==0x180000);
+    assert(!dcp_vrr_floor_next(&floor,true,&min));
+    /* Fixed refresh never asks for more than the timing's maximum. */
+    dcp_vrr_floor_arm(&floor,48U<<16,(280U<<16)+66,281U<<16);
+    assert(dcp_vrr_floor_next(&floor,false,&min) && min==(280U<<16)+66);
+    dcp_vrr_floor_arm(&floor,24U<<16,0,120U<<16);
+    assert(dcp_vrr_floor_next(&floor,false,&min) && min==120U<<16);
+    /* A mode set that did not arm adaptive sync this way leaves it alone. */
+    floor.on=0;
+    assert(!dcp_vrr_floor_next(&floor,true,&min) && !dcp_vrr_floor_next(&floor,false,&min));
     return 0;
 }
 '''
@@ -451,7 +478,10 @@ def watchdog(root):
     internal=(root/'drivers/gpu/drm/apple/dcp-internal.h').read_text()
     helpers='\n'.join(block(internal, marker) for marker in (
         'static inline bool dcp_desktop_swap_watched(',
-        'static inline void dcp_takeover_adopt_proven('))
+        'static inline void dcp_takeover_adopt_proven(',
+        'static inline bool dcp_fw_vrr_live(',
+        'static inline bool dcp_vrr_live(',
+        'static inline bool dcp_vrr_live_armed('))
     definitions='\n'.join(line for line in source.splitlines()
                           if line.startswith('#define DCP_SWAP_WATCHDOG_'))
     return r'''
@@ -464,6 +494,7 @@ typedef uint32_t u32;
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define xchg(p,v) __atomic_exchange_n((p),(v),__ATOMIC_SEQ_CST)
 #define VISIBLE_IF_KUNIT
+#define DCP_FIRMWARE_V_13_5 2
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
 #define dev_warn(...) ((void)0)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
@@ -475,8 +506,8 @@ static unsigned long jiffies;
 struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
-    int fw_compat;bool vrr_enabled,typec,panel;
-    struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
+    int fw_compat;bool vrr_enabled,vrr_failed,typec,panel,main_display;
+    struct {u32 present_id;bool present_pending,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
     unsigned long swap_watchdog_deadline;
@@ -513,7 +544,7 @@ int main(void) {
     /* Expiry owns this dropped swap, retains its buffers and triggers reset. */
     state.present_id=43;state.present_pending=true;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);
-    assert(state.vrr_failed && !d.vrr_enabled && !state.present_pending);
+    assert(d.vrr_failed && !d.vrr_enabled && !state.present_pending);
     assert(!d.mode_state.valid && hotplugs==1 && vblanks==1 && unarmed==1 && rejected==1);
     assert(!dcp_desktop_present_complete(&d,43));
     /* A late completion cannot finish the new fixed-refresh present. */
@@ -541,6 +572,21 @@ int main(void) {
     d.fw_compat=1;d.typec=false;d.vrr_enabled=false;state.takeover_adopted=false;
     before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
     d.panel=false;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    /* The firmware 13.5 panel takes VRR_ENABLED live: its swaps are
+     * watched while adaptive sync is armed, and one that does not complete
+     * restores fixed refresh until the next boot. */
+    d.fw_compat=DCP_FIRMWARE_V_13_5;d.panel=true;d.main_display=true;d.typec=false;
+    d.vrr_enabled=false;d.vrr_failed=false;d.mode_state.valid=true;d.swap_watchdog_retrains=0;
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    d.vrr_enabled=true;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    hp=hotplugs;dcp_swap_watchdog(&d.swap_watchdog_wq.work);
+    assert(d.vrr_failed && !d.vrr_enabled && !d.mode_state.valid && hotplugs==hp+1);
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    /* Firmware 12.3 and a pipe that is not the main display stay unwatched. */
+    d.vrr_failed=false;d.vrr_enabled=true;d.fw_compat=1;
+    dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    d.fw_compat=DCP_FIRMWARE_V_13_5;d.main_display=false;
+    dcp_swap_watchdog_arm(&d);assert(scheduled==before);
     return 0;
 }
 '''

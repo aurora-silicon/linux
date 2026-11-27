@@ -3523,18 +3523,25 @@ static u64 __maybe_unused dcp_swap_time(void)
 }
 
 /*
- * The previous accepted swap's time, or now without one. On firmware 27 also
- * now when it is from the future or more than a second old, as after an idle
- * period: the firmware paces the swap from it.
+ * The previous accepted swap's time, or now without one.  Also now when it
+ * is from the future or more than a second old, as after an idle period, on
+ * firmware 27 and while adaptive sync is armed on a panel that takes
+ * VRR_ENABLED live: the firmware paces the swap from it.
  */
-static u64 __maybe_unused dcp_swap_prev_time(u64 now, u64 prev)
+static u64 __maybe_unused dcp_swap_prev_time(struct apple_dcp *dcp, u64 now, u64 prev)
 {
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	const bool paced = true;
+	const u64 second = DCP_V27_TIMEBASE_HZ;
+#else
+	bool paced = dcp_vrr_live_armed(dcp);
+	u64 second = arch_timer_get_cntfrq();
+#endif
+
 	if (!prev)
 		return now;
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (prev > now || now - prev > DCP_V27_TIMEBASE_HZ)
+	if (paced && (prev > now || now - prev > second))
 		return now;
-#endif
 	return prev;
 }
 
@@ -4141,8 +4148,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 */
 	modeset->vrr = mode->vrr &&
 		       (dcp_vrr_live(dcp) || crtc_state->vrr_enabled) &&
-		       !READ_ONCE(dcp->desktop->vrr_failed);
-	dcp->desktop->vrr_min_on = 0;
+		       !READ_ONCE(dcp->vrr_failed);
+	dcp->vrr_floor.on = 0;
 
 	cookie->status = ~0U;
 	init_completion(&cookie->done);
@@ -4219,18 +4226,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	WRITE_ONCE(dcp->desktop->modeset_active, false);
 	dcp->vrr_enabled = !ret && modeset->vrr;
-	if (dcp->vrr_enabled && dcp_vrr_live(dcp)) {
-		/*
-		 * Fixed refresh holds the minimum at the timing's own rate,
-		 * never above the sink's maximum (a 280.001 Hz timing reports
-		 * a maximum just over 280 Hz).
-		 */
-		dcp->desktop->vrr_min_on = mode->min_vrr;
-		dcp->desktop->vrr_min_off = drm_mode_vrefresh(&crtc_state->mode) << 16;
-		if (mode->max_vrr && mode->max_vrr < dcp->desktop->vrr_min_off)
-			dcp->desktop->vrr_min_off = mode->max_vrr;
-		dcp->desktop->vrr_min_sent = mode->min_vrr;
-	}
+	if (dcp->vrr_enabled && dcp_vrr_live(dcp))
+		dcp_vrr_floor_arm(&dcp->vrr_floor, mode->min_vrr, mode->max_vrr,
+				  drm_mode_vrefresh(&crtc_state->mode) << 16);
 	kref_put(&cookie->refcount, release_wait_cookie);
 
 	dcp->desktop->mode_live = !ret;
@@ -4296,6 +4294,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
 	bool keep_mode = false;
+	bool vrr;
 	int ret;
 
 	if (!mode)
@@ -4416,6 +4415,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
 
+	/*
+	 * A panel that takes VRR_ENABLED live (dcp_vrr_live()) gets a VRR
+	 * timing with adaptive sync on whatever VRR_ENABLED says, at the
+	 * mode's minimum rate: VRR_ENABLED then only moves the minimum on the
+	 * live mode, see dcp_vrr_update().  After an adaptive swap timed out
+	 * (dcp_swap_watchdog()), it stays fixed.  Other pipes install what
+	 * VRR_ENABLED asks.
+	 */
+	vrr = mode->vrr && !READ_ONCE(dcp->vrr_failed) &&
+	      (dcp_vrr_live(dcp) || crtc_state->vrr_enabled);
+	dcp->vrr_floor.on = 0;
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
 		return -ENOMEM;
@@ -4469,10 +4480,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	if ((mode->vrr || dcp->vrr_enabled) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
-		dcp_set_adaptive_sync(dcp,
-				      mode->vrr && crtc_state->vrr_enabled ?
-				      mode->min_vrr : 0,
-				      cookie);
+		dcp_set_adaptive_sync(dcp, vrr ? mode->min_vrr : 0, cookie);
 	else
 		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 					 complete_set_digital_out_mode, cookie);
@@ -4537,7 +4545,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 #endif
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
+	dcp->vrr_enabled = vrr;
+	if (vrr && dcp_vrr_live(dcp))
+		dcp_vrr_floor_arm(&dcp->vrr_floor, mode->min_vrr, mode->max_vrr,
+				  drm_mode_vrefresh(&crtc_state->mode) << 16);
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
@@ -4548,7 +4559,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 }
 #endif
 
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+/*
+ * The instances whose panel can take VRR_ENABLED live (dcp_vrr_live()):
+ * desktop 26.6, and the 13.3 one that firmware 13.5 runs.
+ */
+#define DCP_VRR_LIVE \
+	(DCP_FW_DESKTOP_26(DCP_FW_VER) || DCP_FW_VER == DCP_FW_VERSION(13, 3, 0))
+
+#if DCP_VRR_LIVE
 /*
  * VRR_ENABLED on a live VRR timing.  The firmware takes a new minimum rate
  * (IOMFBParameter 14) without a mode set: the mode's own minimum lets the
@@ -4559,23 +4577,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state,
 			   dcp_callback_t next)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
 	struct dcp_set_parameter_dcp param = {
 		.param = IOMFBPARAM_ADAPTIVE_SYNC,
 		.count = 3,
 	};
-	u32 min;
 
-	if (!dcp->vrr_enabled || !d->vrr_min_on)
-		return false;
-	min = crtc_state->vrr_enabled ? d->vrr_min_on : d->vrr_min_off;
-	if (min == d->vrr_min_sent)
-		return false;
-	d->vrr_min_sent = min;
 	/* minRR (16.16 Hz), then mediaTargetRate and the fractional rate */
-	param.value[0] = min;
-	dev_dbg(dcp->dev, "adaptive sync minimum %#x (VRR_ENABLED %u)\n", min,
-		crtc_state->vrr_enabled);
+	if (!dcp->vrr_enabled ||
+	    !dcp_vrr_floor_next(&dcp->vrr_floor, crtc_state->vrr_enabled,
+				&param.value[0]))
+		return false;
+	dev_dbg(dcp->dev, "adaptive sync minimum %#x (VRR_ENABLED %u)\n",
+		param.value[0], crtc_state->vrr_enabled);
 	dcp_set_parameter_dcp(dcp, false, &param, next, NULL);
 	return true;
 }
@@ -4583,7 +4596,7 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 /* After an adaptive sync update: the frame's colour matrix, gamma and swap. */
 static void dcp_matrix_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_set_matrix_done, NULL);
+	iomfb_set_matrix(dcp, false, &dcp->vrr_matrix, dcp_set_matrix_done, NULL);
 }
 #endif
 
@@ -4765,7 +4778,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
 		u64 timestamp = dcp_swap_time();
 		u64 submit_timestamp =
-			dcp_swap_prev_time(timestamp, dcp->swap_submit_timestamp);
+			dcp_swap_prev_time(dcp, timestamp, dcp->swap_submit_timestamp);
 
 		/*
 		 * The firmware takes continuous-time values here, in its own
@@ -4843,13 +4856,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
-		dcp->desktop->matrix = mat;
+#endif
+#if DCP_VRR_LIVE
+		dcp->vrr_matrix = mat;
 		if (dcp_vrr_update(dcp, crtc_state, dcp_matrix_then_swap))
 			return;
 #endif
 		iomfb_set_matrix(dcp, false, &mat, dcp_set_matrix_done, NULL);
 	} else {
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_VRR_LIVE
 		if (dcp_vrr_update(dcp, crtc_state, do_swap))
 			return;
 #endif

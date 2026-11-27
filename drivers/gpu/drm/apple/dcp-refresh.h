@@ -43,6 +43,46 @@ static inline bool dcp_refresh_needs_deadline(u32 rate, bool vrr, bool internal,
 }
 
 /*
+ * The adaptive sync minimum rate (16.16 Hz) of a VRR timing on a panel that
+ * takes VRR_ENABLED on its live mode: @on, the mode's own minimum, lets the
+ * panel follow the frames; @off, the nominal rate, holds it fixed; @sent is
+ * the one the firmware was last given.  @on is zero while adaptive sync was
+ * not armed that way.
+ */
+struct dcp_vrr_floor {
+	u32 on, off, sent;
+};
+
+/*
+ * A mode set armed adaptive sync at the timing's @minimum.  Fixed refresh
+ * holds the minimum at the timing's @nominal rate, never above its @maximum
+ * (a 280.001 Hz timing reports a maximum just over 280 Hz).
+ */
+static inline void dcp_vrr_floor_arm(struct dcp_vrr_floor *floor, u32 minimum,
+				     u32 maximum, u32 nominal)
+{
+	floor->on = minimum;
+	floor->off = maximum && maximum < nominal ? maximum : nominal;
+	floor->sent = minimum;
+}
+
+/*
+ * The minimum VRR_ENABLED (@enabled) asks for, if the firmware has not been
+ * given it yet: then true, with it in @minimum, and recorded as sent.
+ */
+static inline bool dcp_vrr_floor_next(struct dcp_vrr_floor *floor, bool enabled,
+				      u32 *minimum)
+{
+	u32 next = enabled ? floor->on : floor->off;
+
+	if (!floor->on || next == floor->sent)
+		return false;
+	floor->sent = next;
+	*minimum = next;
+	return true;
+}
+
+/*
  * Desktop 26.6 uses its own presentation clock. A deadline long past asks
  * for the next permitted refresh. ARM counter values can stall the swap.
  */

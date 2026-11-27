@@ -1871,9 +1871,9 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 	if (!iomfb_retire_dropped_present_h17p(dcp))
 		return;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    READ_ONCE(dcp->vrr_enabled)) {
-		WRITE_ONCE(dcp->desktop->vrr_failed, true);
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	     READ_ONCE(dcp->vrr_enabled)) || dcp_vrr_live_armed(dcp)) {
+		WRITE_ONCE(dcp->vrr_failed, true);
 		WRITE_ONCE(dcp->vrr_enabled, false);
 		dev_warn(dcp->dev, "adaptive swap timed out, restoring fixed refresh\n");
 	}
@@ -1893,10 +1893,12 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 	 * for instance while it wakes from standby after DPMS on.  Unwatched,
 	 * the dropped present holds the IOMFB queue until its ten second
 	 * timeout, which declares the coprocessor crashed, and the mode set
-	 * that would bring the display back waits behind it.
+	 * that would bring the display back waits behind it.  A panel's
+	 * adaptive swaps are watched too: one that does not complete restores
+	 * fixed refresh.
 	 */
 	if (dcp_is_typec_output(dcp) || !dcp_has_panel(dcp) ||
-	    dcp_desktop_swap_watched(dcp)) {
+	    dcp_desktop_swap_watched(dcp) || dcp_vrr_live_armed(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
@@ -2414,13 +2416,16 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		return -EINVAL;
 
 	/*
-	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
-	 * frame, without a mode set (see dcp_vrr_update()), once a mode set
-	 * has armed adaptive sync.  An adopted boot mode starts fixed
-	 * (!dcp->vrr_enabled), so enabling VRR_ENABLED the first time still
-	 * needs one mode set; other template pipes change adaptive sync inside
-	 * iomfb_modeset() via a full mode set, except firmware 27 panels which
-	 * do not re-modeset on VRR.
+	 * A panel that takes VRR_ENABLED live (dcp_vrr_live()) changes it with
+	 * the next frame, without a mode set (see dcp_vrr_update()), once a
+	 * mode set has armed adaptive sync: every mode set of a VRR timing
+	 * does.  Compositors toggle VRR_ENABLED in page flips that do not
+	 * allow a mode set, and a forced one fails them.  On desktop 26.6 an
+	 * adopted boot mode starts fixed (!dcp->vrr_enabled), so enabling
+	 * VRR_ENABLED the first time still needs one mode set there; firmware
+	 * 13.5 sets the mode of every enable.  Other template pipes change
+	 * adaptive sync inside iomfb_modeset() via a full mode set, except
+	 * firmware 27 panels which do not re-modeset on VRR.
 	 */
 	if (READ_ONCE(dcp->iomfb_template_pq) &&
 	    !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
@@ -2428,7 +2433,8 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	    crtc_state->enable &&
 	    !(dcp_vrr_live(dcp) &&
 	      (READ_ONCE(dcp->vrr_enabled) || !crtc_state->vrr_enabled ||
-	       (dcp->desktop && READ_ONCE(dcp->desktop->vrr_failed))))) {
+	       READ_ONCE(dcp->vrr_failed) ||
+	       dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP))) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 

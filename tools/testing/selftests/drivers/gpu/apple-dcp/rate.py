@@ -1009,6 +1009,8 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #endif
 /* Nor the desktop 26.6 firmware. */
 #define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+/* Nor firmware 13.5, which the catalogue helpers name for the panel's VRR range. */
+#define DCP_FIRMWARE_V_13_5 (DCP_FIRMWARE_H17P + 4)
 /* Nor firmware 27, which the catalogue helpers name for its externals' parse flags. */
 #ifndef DCP_FIRMWARE_V_27_0
 #define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
@@ -1016,7 +1018,7 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_connector *c)
 { (void)c;assert(d->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP); }
-'''+firmware_lineage(root)+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
+'''+firmware_lineage(root)+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_fw_vrr_live')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [

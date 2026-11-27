@@ -26,7 +26,10 @@ struct dcp_parse_ctx {
 	/* External H17P candidates require separate publication/lookup proof. */
 	bool automatic_1080p180_rgb8;
 	bool ambiguous_180hz;
-	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
+	/*
+	 * The firmware reports an unreported VRR range of the internal panel
+	 * as zero placeholders (dcp_fw_vrr_live()).
+	 */
 	bool zero_vrr_range_fallback;
 	/* Desktop 26.6 internal panels take a deadline at every timing. */
 	bool internal_present_deadline;
