@@ -65,7 +65,14 @@ typedef uint32_t u32; typedef int32_t s32;
 #define DCP_FIRMWARE_V_27_0 27
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 #define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
-#define smp_load_acquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+static void (*g_acquire_hook)(const volatile void *ptr);
+#define smp_load_acquire(p) ({ \
+	typeof(*(p)) _v; \
+	if (g_acquire_hook) \
+		g_acquire_hook((const volatile void *)(p)); \
+	_v = __atomic_load_n((p), __ATOMIC_ACQUIRE); \
+	_v; \
+})
 #define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #define msecs_to_jiffies(ms) ((unsigned long)(ms))
 #define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
@@ -497,6 +504,57 @@ static void *stop_wait_worker(void *arg)
 	return NULL;
 }
 
+struct split_modeset_ctx {
+	struct apple_dcp *owner;
+	pthread_mutex_t m;
+	pthread_cond_t cv;
+	bool dev_locked;
+	bool modeset_started;
+};
+
+static struct split_modeset_ctx *g_split_ctx;
+
+static void hook_modeset_between_acquire(const volatile void *ptr)
+{
+	struct split_modeset_ctx *ctx = g_split_ctx;
+
+	if (!ctx || ptr != &ctx->owner->peer_frames.active)
+		return;
+	g_acquire_hook = NULL;
+	mutex_lock_impl(&dcp_peer_lock);
+	assert(!ctx->owner->peer_transition_active);
+	assert(ctx->owner->peer_frames.active);
+	smp_store_release(&ctx->owner->peer_transition_active, true);
+	smp_store_release(&ctx->owner->peer_frames.active, false);
+	mutex_unlock_impl(&dcp_peer_lock);
+
+	pthread_mutex_lock(&ctx->m);
+	ctx->modeset_started = true;
+	pthread_cond_broadcast(&ctx->cv);
+	pthread_mutex_unlock(&ctx->m);
+}
+
+static void *split_modeset_worker(void *arg)
+{
+	struct split_modeset_ctx *ctx = arg;
+
+	assert(pthread_mutex_lock(&ctx->owner->dev->m) == 0);
+	pthread_mutex_lock(&ctx->m);
+	ctx->dev_locked = true;
+	pthread_cond_broadcast(&ctx->cv);
+	while (!ctx->modeset_started)
+		pthread_cond_wait(&ctx->cv, &ctx->m);
+	pthread_mutex_unlock(&ctx->m);
+	assert(pthread_mutex_unlock(&ctx->owner->dev->m) == 0);
+
+	nanosleep(&(struct timespec){ .tv_nsec = 20 * 1000 * 1000 }, NULL);
+	mutex_lock_impl(&dcp_peer_lock);
+	ctx->owner->peer_frames.active = true;
+	mutex_unlock_impl(&dcp_peer_lock);
+	dcp_peer_transition_end(ctx->owner);
+	return NULL;
+}
+
 static void test_peer_stop_wait(void)
 {
 	struct apple_dcp *owner = make_dcp();
@@ -701,6 +759,61 @@ static void test_peer_stop_wait(void)
 	dcp_peer_transition_end(owner);
 
 	assert(pthread_join(t2, NULL) == 0);
+	assert(second.ret == 1);
+	assert(atomic_load(&g_quiesce_calls) == 1);
+	assert(!owner->peer_frames.active);
+
+	/*
+	 * 5c/5d. A modeset claiming transition and clearing peer_frames.active
+	 * between reading peer_transition_active and peer_frames.active cannot
+	 * cause a false-success 0 return at stop entry or retry exits; the stop
+	 * waits for the modeset to finish and stops the new replacement pair.
+	 */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	struct split_modeset_ctx split_entry = {
+		.owner = owner,
+		.m = PTHREAD_MUTEX_INITIALIZER,
+		.cv = PTHREAD_COND_INITIALIZER,
+	};
+	g_split_ctx = &split_entry;
+	g_acquire_hook = hook_modeset_between_acquire;
+	ret = dcp_peer_stop_wait_v27(owner, 1000);
+	g_acquire_hook = NULL;
+	g_split_ctx = NULL;
+	assert(!split_entry.modeset_started);
+	assert(ret == 1);
+	assert(atomic_load(&g_quiesce_calls) == 1);
+	assert(!owner->peer_frames.active);
+
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	struct split_modeset_ctx split_retry = {
+		.owner = owner,
+		.m = PTHREAD_MUTEX_INITIALIZER,
+		.cv = PTHREAD_COND_INITIALIZER,
+	};
+	g_split_ctx = &split_retry;
+	pthread_t m_tid;
+	assert(pthread_create(&m_tid, NULL, split_modeset_worker, &split_retry) == 0);
+	pthread_mutex_lock(&split_retry.m);
+	while (!split_retry.dev_locked)
+		pthread_cond_wait(&split_retry.cv, &split_retry.m);
+	pthread_mutex_unlock(&split_retry.m);
+
+	g_acquire_hook = hook_modeset_between_acquire;
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+	};
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	assert(pthread_join(t2, NULL) == 0);
+	assert(pthread_join(m_tid, NULL) == 0);
+	g_acquire_hook = NULL;
+	g_split_ctx = NULL;
+	assert(split_retry.modeset_started);
 	assert(second.ret == 1);
 	assert(atomic_load(&g_quiesce_calls) == 1);
 	assert(!owner->peer_frames.active);

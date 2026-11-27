@@ -337,9 +337,6 @@ static int dcp_peer_stop_v27_once(struct apple_dcp *dcp, bool *contended,
 		*contended = false;
 	if (!peer_scanout)
 		return 0;
-	if (!smp_load_acquire(&dcp->peer_transition_active) &&
-	    !smp_load_acquire(&dcp->peer_frames.active))
-		return 0;
 	scoped_guard(mutex, &dcp_peer_lock) {
 		if (dcp->peer_transition_active) {
 			if (contended)
@@ -427,9 +424,6 @@ int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 		ret = dcp_peer_stop_v27_once(dcp, &contended, &deadline);
 		if (ret != -EBUSY)
 			return ret;
-		if (!smp_load_acquire(&dcp->peer_transition_active) &&
-		    !smp_load_acquire(&dcp->peer_frames.active))
-			return 0;
 		now = jiffies;
 		if (time_after_eq(now, deadline))
 			return -EBUSY;
@@ -448,11 +442,6 @@ int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 						 max_t(unsigned long, 1,
 						       msecs_to_jiffies(5))));
 		}
-		if (!smp_load_acquire(&dcp->peer_transition_active) &&
-		    !smp_load_acquire(&dcp->peer_frames.active))
-			return 0;
-		if (time_after_eq(jiffies, deadline))
-			return -EBUSY;
 	}
 }
 
