@@ -37,6 +37,7 @@
 #include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/property.h>
 #include <linux/random.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
@@ -7523,6 +7524,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		apple_sleep_v27_unregister(dev);
 	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
+	dcp_peer_retire_sync();
 	/*
 	 * Stop the native initializer before looking up its owner, including
 	 * the dead-session path. Owner allocation may have landed in an open
@@ -9138,6 +9140,10 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		return;
 	}
 	component_del(&pdev->dev, &dcp_comp_ops);
+	if (dcp) {
+		dcp_peer_forget(dcp);
+		dcp_peer_retire_sync();
+	}
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
 	/* Unbind does not wait for RTKit callbacks, or run if bind failed late. */
@@ -9203,6 +9209,10 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	if (dcp_t8132_ext_m4_node(pdev->dev.of_node))
 		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
+	if (dcp) {
+		dcp_peer_forget(dcp);
+		dcp_peer_retire_sync();
+	}
 }
 
 /*

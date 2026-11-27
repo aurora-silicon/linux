@@ -436,15 +436,24 @@ void dcp_peer_record_retired_v27(struct apple_dcp *dcp, u32 swap_id)
 
 	if (!peer_scanout)
 		return;
+	guard(rwsem_read)(&dcp_peer_retire_rwsem);
 	scoped_guard(mutex, &dcp_peer_lock) {
 		peer = dcp->peer_reserved;
-		if (!peer || peer->peer_owner != dcp)
+		if (!peer || peer->peer_owner != dcp || peer->peer_unbinding)
 			return;
-		get_device(peer->dev);
 	}
-	scoped_guard(mutex, &peer->iomfb.lock)
-		dcp_present_record_retired_h17p(&peer->present_state_h17p, swap_id);
-	put_device(peer->dev);
+	/*
+	 * Preserve iomfb.lock -> dcp_peer_lock order while revalidating the
+	 * reservation before mutating peer->present_state_h17p.
+	 */
+	scoped_guard(mutex, &peer->iomfb.lock) {
+		guard(mutex)(&dcp_peer_lock);
+		if (dcp->peer_reserved != peer || peer->peer_owner != dcp ||
+		    peer->peer_unbinding || peer->iomfb.stopped)
+			return;
+		dcp_present_record_retired_h17p(&peer->present_state_h17p,
+						swap_id);
+	}
 }
 
 bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
