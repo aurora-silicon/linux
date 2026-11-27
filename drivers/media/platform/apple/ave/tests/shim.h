@@ -74,6 +74,7 @@ static inline void sort(void *p, size_t n, size_t size,
 }
 
 #define dev_err(...) test_log(__VA_ARGS__)
+#define dev_err_ratelimited(...) test_log(__VA_ARGS__)
 #define dev_info(...) test_log(__VA_ARGS__)
 #define dev_dbg(...) test_log(__VA_ARGS__)
 #define dev_warn(...) test_log(__VA_ARGS__)

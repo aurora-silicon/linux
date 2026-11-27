@@ -104,6 +104,11 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 typedef int64_t s64; typedef long long ktime_t;
 #define BIT(n) (1u << (n))
 #define SEP_PS_DEV_DISABLE BIT(10)
+#define GENMASK(h, l) ((~0u << (l)) & (~0u >> (31 - (h))))
+#define FIELD_GET(m, v) (((v) & (m)) / ((m) & -(m)))
+/* The enclave's power word while it runs (target and actual 0xf), and gated without DEV_DISABLE */
+#define SEP_PS_RUNNING 0xffu
+#define SEP_PS_ACTUAL_OFF 0x0fu
 #define USEC_PER_MSEC 1000
 #define NSEC_PER_USEC 1000
 #define READ_ONCE(x) (x)
@@ -139,6 +144,7 @@ static struct apple_mbox_hw hw;
 static struct apple_mbox mbox;
 static int apple_sleep_coprocs_lock;
 static void *apple_sleep;
+static bool apple_sleep_external_commit;
 static struct {
     struct device *dev; int (*stop)(void *); void *data;
 } apple_sleep_enclave;
@@ -148,7 +154,7 @@ static int domain_error, property_error, address_error, read_error, read_error_a
 static int gate_after, reads, put_refs, maps, unmaps, lookups, prepares, restores;
 static int prepare_error, send_error, bulk_error, one_error, sends, closes;
 static int mailbox_reads, message_reads, forwarded, lock_depth;
-static int resource_bytes, close_gate, early_gate;
+static int resource_bytes, close_gate, early_gate, actual_gate;
 static bool message_in_lock, matched_read;
 static struct apple_mbox_msg queue[4];
 static unsigned queued, consumed;
@@ -230,7 +236,9 @@ static void apple_mbox_set_recv_enabled(struct apple_mbox *m, bool enabled) {
 }
 static u32 readl(void *p) {
     // PMGR is the sole permitted query after the matched reply/receive close.
-    return early_gate || (closes && close_gate) ? SEP_PS_DEV_DISABLE : 0;
+    if (early_gate || (closes && close_gate))
+        return SEP_PS_DEV_DISABLE;
+    return closes && actual_gate ? SEP_PS_ACTUAL_OFF : SEP_PS_RUNNING;
 }
 static jmp_buf fatal_env;
 static bool fatal_armed;
@@ -251,13 +259,13 @@ void fixture(void) {
     memset(&hw, 0, sizeof(hw));
     mbox = (struct apple_mbox){ .regs = &hw, .hw = &hw, .rx = foreign_rx, .cookie = &device };
     config_enabled = hyp = sep_pm_suspending = dart_present = dart_ready = map_ok = true;
-    firmware = tx_ready = true; apple_sleep = &device;
+    firmware = tx_ready = true; apple_sleep = &device; apple_sleep_external_commit = false;
     real_wake = pending_wake = late_wake = sleep_refuse_before_send = false;
     domain_error = property_error = address_error = read_error = gate_after = reads = 0;
     put_refs = maps = unmaps = lookups = prepares = restores = sends = closes = 0;
     prepare_error = send_error = bulk_error = one_error = 0;
     mailbox_reads = message_reads = forwarded = lock_depth = 0;
-    resource_bytes = 4; close_gate = 1; early_gate = 0; read_error_after = 1;
+    resource_bytes = 4; close_gate = 1; early_gate = 0; actual_gate = 0; read_error_after = 1;
     queued = consumed = 0; message_in_lock = matched_read = false; now = 0;
     fatal_armed = false; fatal_message[0] = 0; sep_pm_told = yes;
 }
@@ -276,6 +284,7 @@ void parameter(int which, int value) {
     case 19: apple_sleep_enclave.dev = value ? &device : NULL; break;
     case 20: sep_pm_commit.sent = value; break; case 21: firmware = value; break;
     case 22: sep_pm_told = value ? yes : NULL; break;
+    case 23: apple_sleep_external_commit = value; break;
     }
 }
 int counter(int which) {
@@ -343,6 +352,14 @@ static void test_prepare_and_cleanup(void) {
     assert(sep_pm_commit.registered); assert(sep_pm_commit_finish(&device) == 0);
     assert(put_refs == 1 && unmaps == 1 && !apple_sleep_enclave.dev);
     assert(sep_pm_commit_finish(&device) == -ENOENT);
+    // An external EL2 sleep driver (T6041) advertises commit-stop without apple_sleep.
+    fixture(); apple_sleep = NULL; apple_sleep_external_commit = true;
+    assert(apple_sleep_commit_stops_coprocs());
+    assert(stage() == 0);
+    assert(sep_pm_commit_finish(&device) == 0);
+    assert(put_refs == 1 && unmaps == 1 && !apple_sleep_enclave.dev);
+    firmware = false;
+    assert(!apple_sleep_commit_stops_coprocs());
 }
 static void test_unsent(void) {
     for (int scenario = 0; scenario < 7; ++scenario) {
@@ -387,6 +404,10 @@ static void test_sent(void) {
     fixture(); assert(stage() == 0); reply(0); close_gate = 0;
     expect_stop_fatal("did not gate after send: -110");
     assert(closes == 1 && sep_pm_commit.gate_valid && sep_pm_commit.gate_ret == -ETIMEDOUT);
+    /* An enclave that gates without ever setting DEV_DISABLE (M1): its actual state at 0. */
+    fixture(); assert(stage() == 0); reply(0); close_gate = 0; actual_gate = 1;
+    assert(sep_pm_commit_stop(&sep_pm_commit) == 0);
+    assert(closes == 1 && sep_pm_commit.gate_valid && !sep_pm_commit.gate_ret);
 
     fixture(); assert(stage() == 0); reply(0); assert(sep_pm_commit_stop(&sep_pm_commit) == 0);
     fatal_armed = true;
@@ -446,7 +467,7 @@ RUST_PREFIX = r'''
 #![allow(dead_code, unused_imports, unused_variables)]
 use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU32, Ordering, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] struct Error(i32);
 impl Error { fn from_errno(n: i32) -> Self { assert!(n < 0); Self(n) } }
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -529,17 +550,25 @@ const PHASE_READY: u32 = 1;
 struct SepData {
     dev: kernel::device::Device, phase: AtomicU32, control: Lock<Control>, mbox: Lock<Option<Mbox>>,
     gate: Cell<pm::SleepGate>, sleep_rx_held: Flag, endpoint: Cell<bool>, control_wq: Wq,
+    // T6041's suspend-time path (no sleep core commit); never taken here.
+    sleep_at_suspend: AtomicBool,
 }
 impl SepData {
     fn new() -> Self {
         Self { dev: kernel::device::Device, phase: AtomicU32::new(PHASE_READY),
             control: Lock(RefCell::new(Control { busy: false, wake_ok: true })),
             mbox: Lock(RefCell::new(Some(Mbox))), gate: Cell::new(pm::SleepGate::Open),
-            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq }
+            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq,
+            sleep_at_suspend: AtomicBool::new(false) }
     }
     fn endpoint_present(&self, _: u32) -> bool { self.endpoint.get() }
     fn sleep_gate(&self) -> pm::SleepGate { self.gate.get() }
     fn set_sleep_gate(&self, g: pm::SleepGate) { self.gate.set(g); }
+    // T6041's suspend-time path and its mailbox check: the platform commits here, so the
+    // first is never reached, and the mailbox always drains.
+    fn sleep_enter_at_suspend(&self) -> Result<()> { unreachable!() }
+    fn sleep_exit_at_suspend(&self) -> bool { unreachable!() }
+    fn mailbox_drains(&self) -> bool { true }
     fn ring(_: &Mbox, msg: kernel::soc::apple::mailbox::Message) -> Result<()> {
         assert_eq!(msg.msg0, proto::WAKE_KICK.msg0); event(4); RING.with(|v|v.get())
     }
@@ -663,7 +692,7 @@ def sources(source, contracts, mutation):
     sleep = (source / 'drivers/soc/apple/sleep.c').read_text()
     iopoll = (contracts / 'include/linux/iopoll.h').read_text()
     names = {
-        'shim': ['sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
+        'shim': ['sep_ps_down', 'sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
                  'sep_pm_commit_rx', 'sep_pm_commit_take_rx', 'sep_pm_commit_stop',
                  'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
@@ -682,7 +711,7 @@ def sources(source, contracts, mutation):
               'read_poll_timeout_atomic', 'readx_poll_timeout_atomic', 'readl_poll_timeout_atomic']
     c = C_PREFIX + '\n' + '\n'.join(macro(iopoll, n) for n in macros)
     c += '\n' + '\n'.join(re.search(r'^#define ' + n + r'\s+.*$', shim, re.M).group()
-                            for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US'])
+                            for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US', 'SEP_PS_ACTUAL'])
     start = shim.index('static struct sep_pm_commit {')
     c += '\n' + shim[start:shim.index('} sep_pm_commit;', start) + len('} sep_pm_commit;')]
     # Use the actual provider helper, with only removal/capability dependency state
@@ -700,7 +729,9 @@ def sources(source, contracts, mutation):
     }
 '''
     rust += pm[gate_start:gate_end]
-    rust += '\n'.join(bodies[n] for n in names['pm']) + '\n}\nimpl SepData {\n'
+    rust += '\n'.join(bodies[n] for n in names['pm'])
+    # T6041 has no sleep core commit; every platform modelled here has one.
+    rust += '\npub(crate) fn platform_commit() -> bool { true }\n}\nimpl SepData {\n'
     rust += '\n'.join(bodies[n] for n in names['sep']) + '\n}\n' + RUST_TESTS
     return c, rust
 

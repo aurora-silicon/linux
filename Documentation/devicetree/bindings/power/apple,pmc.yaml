@@ -285,6 +285,61 @@ patternProperties:
           platform profile holds the CPU clusters to it, up to the next
           frequency of their tables.
 
+      apple,gpu-busy-memory-states:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description:
+          The DCS state (first row) and fabric state (second row) for GPU work
+          the GPU driver reports, by the busy share it reports, below each of
+          the three apple,gpu-busy-permille shares and at or above the last.
+          A non-zero top DCS state enables the busy-share ladder; without
+          these properties, reported GPU work gets the compatible's default
+          floor.
+        minItems: 2
+        maxItems: 2
+        items:
+          minItems: 4
+          maxItems: 4
+          items:
+            maximum: 15
+
+      apple,gpu-busy-permille:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description:
+          The GPU busy shares, in permille of the time the GPU spends
+          executing, from which reported GPU work gets the second, third and
+          top column of apple,gpu-busy-memory-states.
+        minItems: 3
+        maxItems: 3
+        items:
+          maximum: 1000
+
+      apple,cpu-busy-floor:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description:
+              DCS state index on the CLPC's DCS rail, 0 for the lowest state
+            minimum: 0
+            maximum: 15
+          - description:
+              Fabric state index on the CLPC's fabric rail, 0 for the lowest
+              state
+            minimum: 0
+            maximum: 15
+        description:
+          The DCS and fabric state pair a CPU cluster busy in the top quarter
+          of its frequency range requests on this board outside the low-power
+          platform profile, taken from the CLPC floor residency macOS shows on
+          it in its default energy mode. Each index is a 4-bit PMC rail field;
+          an index above 15, or a cell count other than two, is rejected and
+          the SoC's table applies. Without the property, or while the
+          low-power platform profile is active, the SoC's table applies.
+
+    dependentRequired:
+      apple,gpu-busy-memory-states:
+        - apple,gpu-busy-permille
+      apple,gpu-busy-permille:
+        - apple,gpu-busy-memory-states
+
     required:
       - compatible
       - reg

@@ -17,6 +17,8 @@ struct xhci_plat_priv {
 	unsigned long long quirks;
 	bool power_lost;
 	unsigned sideband_at_suspend:1;
+	/* The platform glue sets up the USB3 PHY: the SuperSpeed root hub leaves it alone. */
+	unsigned skip_usb3_phy_init:1;
 	void (*plat_start)(struct usb_hcd *);
 	int (*init_quirk)(struct usb_hcd *);
 	int (*suspend_quirk)(struct usb_hcd *);

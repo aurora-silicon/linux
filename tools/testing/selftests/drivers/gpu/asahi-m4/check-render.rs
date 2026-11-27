@@ -77,6 +77,17 @@ fn main() {
         for i in 0..ta.len(){if !(0x90f..0x917).contains(&i){assert_eq!(ta[i],ta_separate[i],"TA unrelated byte {i:#x}");}}
         for i in 0..fs.len(){if !(0xc57..0xc5f).contains(&i){assert_eq!(fs[i],fs_separate[i],"FS unrelated byte {i:#x}");}}
         assert_eq!(tq,tq_separate);assert_eq!(fq,fq_separate);
+        let mut p_sl=p;p_sl.scene_list=g+0x540000;
+        let mut ta_sl=[0xa5;fw::work::ta::WORK_SIZE];let mut fs_sl=[0xa5;fw::work::fs::WORK_SIZE];
+        let mut tq_sl=[0xa5;fw::work::ta::SEQ_SIZE];let mut fq_sl=[0xa5;fw::work::fs::SEQ_SIZE];
+        encode::encode_ta(&r,&p_sl,&u,&[0;4],ctx,target,&geo,None,&mut ta_sl,&mut tq_sl);
+        encode::encode_fs(&r,&p_sl,&u,&[0;4],ctx,1<<40,1,target,&geo,&mut fs_sl,&mut fq_sl);
+        let mut scene_r=vec![0xa5;fw::work::scene::SIZE];
+        let mut scene_p=vec![0xa5;fw::work::scene::SIZE];
+        encode::fill_scene(&r,&p,&mut scene_r);encode::fill_scene(&r,&p_sl,&mut scene_p);
+        assert_ne!(ta,ta_sl);assert_ne!(fs,fs_sl);assert_ne!(scene_r,scene_p);
+        assert_ne!(&scene_r[0x28..0x30],&scene_p[0x28..0x30]);
+        assert_eq!(tq,tq_sl);assert_eq!(fq,fq_sl);
         for engine in 0..2 {
             let att:Vec<_>=(0..counts[v][engine]).map(|i|uapi::drm_asahi_attachment {pointer:g+0x50000000+i as u64*0x10000+v as u64*13,size:(i as u64+1)*137,..Default::default()}).collect();
             encode::render_attachments(if engine==0{&mut tq[..]}else{&mut fq[..]},engine,&att);

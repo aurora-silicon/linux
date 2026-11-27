@@ -34,6 +34,12 @@ pub(crate) struct Compute {
     last_progress_ns: i64,
     head: u16,
     cached_views: KVec<CachedViews>,
+    /// Quarantined client views retained after firmware-aborted computes so their
+    /// ASIDs and driver mappings are never evicted or recycled.
+    quarantined_views: KVec<CachedViews>,
+    quarantine_active_vm: bool,
+    /// Cumulative computes aborted by recovery that did not advance pool+0x54.
+    pool_delta: u64,
     slot: usize,
     batch_count: usize,
     checkpoint: (u64,u16,usize),
@@ -119,7 +125,7 @@ impl Compute {
         // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,stamp_epoch:timeline::StampEpoch::default(),sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers,profile,_lower_tlbi:lower_tlbi})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,stamp_epoch:timeline::StampEpoch::default(),sequence:1,head:1,cached_views:KVec::new(),quarantined_views:KVec::new(),quarantine_active_vm:false,pool_delta:0,slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers,profile,_lower_tlbi:lower_tlbi})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
         control: crate::m3::agx_compute::Control, sequence: u64, stamp_value: u32, slot: usize,
@@ -224,9 +230,13 @@ impl Compute {
             // Complete allocations before moving the active views. Eviction
             // drops only an idle cached view; no arena storage is duplicated.
             let old_views = KVec::with_capacity(next.views.len(), GFP_KERNEL)?;
-            self.cached_views.reserve(1, GFP_KERNEL)?;
-            if self.cached_views.len() == 3 {
-                drop(self.cached_views.remove(0).map_err(|_| EIO)?);
+            if self.quarantine_active_vm {
+                self.quarantined_views.reserve(1, GFP_KERNEL)?;
+            } else {
+                self.cached_views.reserve(1, GFP_KERNEL)?;
+                if self.cached_views.len() == 3 {
+                    drop(self.cached_views.remove(0).map_err(|_| EIO)?);
+                }
             }
             let mut old = CachedViews {
                 binding: core::mem::replace(&mut self._binding, next.binding),
@@ -236,7 +246,12 @@ impl Compute {
             for (i, view) in next.views {
                 old.views.push((i, self.objects[i].swap_gpu_view(view)?), GFP_KERNEL)?;
             }
-            self.cached_views.push(old, GFP_KERNEL)?;
+            if self.quarantine_active_vm {
+                self.quarantine_active_vm = false;
+                self.quarantined_views.push(old, GFP_KERNEL)?;
+            } else {
+                self.cached_views.push(old, GFP_KERNEL)?;
+            }
         }
         self.checkpoint=(self.sequence,self.head,self.batch_count);
         self.batch_count=0;
@@ -434,9 +449,42 @@ impl Compute {
             && self.objects[storage::QUEUE_STATE].read_u32(queue::READ)? == u32::from(self.head);
         if !stamped { return Ok(false); }
         if self.profile == super::m3_profile::Profile::Extended {
-            return Ok(self.objects[storage::POOL].read_u64(0x54)? == self.sequence);
+            let actual = self.objects[storage::POOL].read_u64(0x54)?;
+            let expected = self.sequence.saturating_sub(self.pool_delta);
+            if actual < expected || actual > self.sequence {
+                return Ok(false);
+            }
+            if actual > expected {
+                self.pool_delta = self.sequence - actual;
+            }
         }
         Ok(true)
+    }
+    /// Whether the firmware has drained the compute work ring to its current write head.
+    pub(crate) fn queues_drained(&mut self) -> Result<bool> {
+        Ok(self.objects[storage::QUEUE_STATE].read_u32(queue::DONE)? == u32::from(self.head)
+            && self.objects[storage::QUEUE_STATE].read_u32(queue::READ)? == u32::from(self.head))
+    }
+    /// Re-synchronize compute stamps and pool expectations after firmware recovery
+    /// drained the stopped batch, and mark the faulting VM's binding for quarantine.
+    pub(crate) fn finish_recovery(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
+        self.quarantine_active_vm = true;
+        let expected = self.stamp();
+        let host = self.objects[storage::STAMP].read_u32(0)?;
+        let fw = self.objects[storage::FW_STAMP].read_u32(0)?;
+        let pool54 = self.objects[storage::POOL].read_u64(0x54)?;
+        dev_info!(
+            dev.as_ref(),
+            "M3 recovery compute post-drain: seq={} stamps={:#x}/{:#x} (want {:#x}) pool54={}\n",
+            self.sequence, host, fw, expected, pool54
+        );
+        if host != expected { self.objects[storage::STAMP].u32(0, expected)?; }
+        if fw != expected { self.objects[storage::FW_STAMP].u32(0, expected)?; }
+        if self.profile == super::m3_profile::Profile::Extended {
+            self.pool_delta = self.sequence.saturating_sub(pool54);
+        }
+        agx_memory::publish();
+        Ok(())
     }
     pub(crate) fn log(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         for off in (0..512).step_by(128) {
