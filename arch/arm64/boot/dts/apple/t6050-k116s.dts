@@ -37,9 +37,10 @@
 	/*
 	 * Pin 112 takes an SError when read, so only the pins a node names are
 	 * exposed: 80/81 (PCIe ports 0 and 1's PERST#), 106/107 (amp fault, amp
-	 * shutdown), 134/139 (jack codec interrupt, reset) and 136/137 (speaker ID).
+	 * shutdown), 134/139 (jack codec interrupt, reset), 136/137 (speaker ID)
+	 * and 138 (Touch ID data ready).
 	 */
-	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
 };
 
 /*
@@ -432,44 +433,6 @@
 		width-mm = <345>;
 		height-mm = <223>;
 	};
-};
-
-/* The ADT lists no clocks for the external engines (clock-ids = []) */
-&dcpext1 {
-	apple,clock-ids;
-};
-
-&dcpext2 {
-	apple,clock-ids;
-};
-
-&dcpext3 {
-	apple,clock-ids;
-};
-
-/* ADT dart-dcpextN and dart-dispextN: vm-base 1 TiB, vm-size 3 TiB */
-&dcpext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
 };
 
 /*
@@ -872,18 +835,17 @@
 #include "t6050-j716c-isp.dtsi"
 
 /*
- * Two things the shared T6050 files now turn on for every board are held back here until
- * they have been tried on the K116s: the CPU PMU (t6050-base.dtsi, measured on the J714s)
- * and the CLPC's SMC link (t6050-die0.dtsi), through which the low-power platform profile
- * polls the package power. Without the link that profile has only its frequency ceiling.
- * To try them, remove this block.
+ * The CPU PMU the shared T6050 files turn on for every board (t6050-base.dtsi, measured on
+ * the J714s) is held back here until it has been tried on the K116s. To try it, remove
+ * this block.
  */
 &cpu_pmu {
 	status = "disabled";
 };
 
+/* macOS offers High Power mode on this machine */
 &clpc {
-	/delete-property/ apple,smc;
+	apple,high-power-mode;
 };
 
 /*
@@ -912,4 +874,144 @@
 
 &avd {
 	status = "okay";
+};
+
+/*
+ * Touch ID (ADT spi2/mesa): the Mesa sensor on spi2 at 8 MHz, chip select 0,
+ * powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP GPIO 138, as
+ * on the J714s. spi2 runs from the 24 MHz reference (ADT clock-ids 451).
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-k116s.bin", "apple/msrk-k116s.bin";
+	};
+};
+
+/*
+ * The PMU's RTC and its alarm. ADT: the PMU's info-rtc (0x2002),
+ * info-rtc_alarm_offset (0x2008), info-rtc_irq_mask_offset (0x200e),
+ * info-rtc_alarm_ctrl (0x2000) and info-rtc_scrpad (0x2100), the registers of
+ * the T6041 PMU. It raises no interrupt on this SoC: an armed alarm can only
+ * wake the machine from a firmware sleep, not from s2idle.
+ */
+&pmu {
+	pmu_rtc: rtc {
+		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+		wakeup-source;
+	};
+};
+
+/*
+ * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does
+ * not enter the firmware-driven sleep with it on. Enabled and unused, genpd turns it off at
+ * boot. No encoder is described yet.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+/*
+ * Deep sleep: the sleep controller's description and the J714s's SoC values, then what differs
+ * on this board (firmware 27.2).
+ */
+#include "t6050-k116s-sleep.dtsi"
+/* No USB4 router is described on this board: without the J714s's CIO sleep part. */
+#define T6050_SLEEP_SOC_NO_CIO
+#include "t6050-j714s-sleep-soc.dtsi"
+
+/*
+ * macOS on this board parks the four clock words with 0x80100000 in the last 0.5 ms before its
+ * commit (traced as an aura guest); the J714s's values have bit 10 set.
+ */
+&sleep {
+	apple,seq-commit-sio =
+		<0x0 17 0x290 0x400024f>,
+		<0x0 17 0x2a0 0x400024f>,
+		<0x1 51 0xa0 0x0>,
+		<0x0 51 0xa0 0x80100000>,
+		<0x1 51 0xa0 0x0>,
+		<0x1 51 0xa4 0x0>,
+		<0x0 51 0xa4 0x80100000>,
+		<0x1 51 0xa4 0x0>,
+		<0x1 51 0x94 0x0>,
+		<0x0 51 0x94 0x80100000>,
+		<0x1 51 0x94 0x0>,
+		<0x1 51 0x90 0x0>,
+		<0x0 51 0x90 0x80100000>,
+		<0x1 51 0x90 0x0>;
+};
+
+/*
+ * The PMP firmware's __DATA starts at 0x56000 on 27.2 (ADT pmp0 segment-ranges: __TEXT 0x56000
+ * bytes, __DATA 0x9b000 bytes), not at the J714s's 0x58000. With the wrong range kept over the
+ * sleep the PMP does not come back (endpoint discovery -62).
+ */
+&pmp0 {
+	apple,sram-keep = <0x56000 0x9b000>;
+};
+
+/*
+ * The panel's plug takes about 2.9 ms here from the video interface's announcement to the
+ * firmware's "ioav i/f is now closed", and the next round of reports follows about 33 ms later.
+ * With the J714s's 2500 us the open landed 25 us before the close.
+ */
+&dcp {
+	apple,panel-video-open-delay-us = <10000>;
 };

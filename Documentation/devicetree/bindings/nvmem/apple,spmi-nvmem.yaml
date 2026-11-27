@@ -28,6 +28,7 @@ properties:
           - apple,simetra-pmic
           - apple,stowe-pmic
           - apple,vale-pmic
+          - apple,woodcote-pmic
       - const: apple,spmi-nvmem
 
   reg:

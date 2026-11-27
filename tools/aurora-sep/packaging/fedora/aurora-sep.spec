@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        13%{?dist}
+Release:        15%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -108,7 +108,7 @@ grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
 sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
     >%{buildroot}%{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
 install -Dpm 0644 %{SOURCE8} \
-    %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
+    %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/05-aurora-sep.conf
 install -Dpm 0755 %{SOURCE16} %{buildroot}%{_bindir}/sep-bio-identities
 install -Dpm 0755 %{SOURCE26} %{buildroot}%{_bindir}/aurora-sep
 sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1%{_libexecdir}/|" \
@@ -189,7 +189,7 @@ fi
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
 %{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
-%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
+%{_prefix}/lib/systemd/logind.conf.d/05-aurora-sep.conf
 %{_presetdir}/80-aurora-sep.preset
 
 %files selinux
@@ -197,6 +197,16 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Wed Nov 25 2026 Matt <mmdisbro@gmail.com> - 1-15
+- aurora-sep-selinux 1.4.0: label the kernel's catacomb replacement files
+  (/var/lib/.apple-sep-catacomb-*.bin.new) as SEP state at creation, and let
+  the kernel set the mode of (setattr), rename and unlink state files. Install
+  it before a kernel that publishes catacombs by atomic replacement.
+
+* Sat Nov 21 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-14
+- Install the logind drop-in as 05-aurora-sep.conf, so that a distribution's
+  or an administrator's power key setting overrides it
+
 * Fri Nov 20 2026 Diljit Singh <hey@djdev.me> - 1-13
 - SEP writes are always on: aurora-sep-load runs modprobe apple_sep with no
   options, since the driver no longer has xart_writes or provision_keybag

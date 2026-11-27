@@ -33,6 +33,20 @@ static const u32 ane_t8132_reg_sizes[] = {
 	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x4000,
 };
 
+/* T8122 (M3) H15: engine, PMGR and PMGR aux-0 windows from the ADT. */
+static const char * const ane_t8122_reg_names[] = {
+	"engine", "pmgr", "aux-0",
+};
+
+static const u32 ane_t8122_reg_sizes[] = {
+	0x2000000, 0x18000, 0x4000,
+};
+
+/* The same five domains; ANE_SYS sits at +0x438 in the T8122 PMGR. */
+static const u32 ane_t8122_power_words[] = {
+	0x438, 0xc008, 0xc000, 0xc010, 0xc018,
+};
+
 /* Offsets in reg[1]; genpd, never the ANE driver, owns transitions. */
 static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
@@ -62,6 +76,51 @@ static const u8 ane_t6050_text_pin_27_0[] = {
 	0xa9, 0x26, 0x8c, 0x5b, 0xfd, 0x94, 0xba, 0xa9,
 	0x9d, 0x8d, 0xd5, 0x9c, 0xbe, 0xc9, 0x99, 0xe2,
 	0xd1, 0xa2, 0x20, 0xd0, 0xee, 0x43, 0x8b, 0x8f,
+};
+
+/*
+ * M3 (T8122): H15 engine running the macOS 27.2 (26B123) firmware on the
+ * shared H16 AP-direct backend: ASC wrapper at +0x1400000, scratch at
+ * +0x1840050, doorbell/IPI at +0x1844000, ANE_SYS at PMGR +0x438, and five
+ * DAPF records at DART0 + 0x4000. Cold restart + program replay across sleep.
+ */
+const struct ane_fw_platform ane_t8122_platform = {
+	.h16_profiles = ane_t8122_profiles_26b123,
+	.h16_profile_count = ARRAY_SIZE(ane_t8122_profiles_26b123),
+	.h16_mmio = ane_h15_mmio_t8122,
+	.h16_mmio_count = ARRAY_SIZE(ane_h15_mmio_t8122),
+	.dart_params = 0x8,
+	.dapf_dart = 0,
+	.dapf_offset = 0x4000,
+	.dapf_size = SZ_16K,
+	.dapf_count = 5,
+	.soc = 0x8122,
+	.chip_family = 15,
+	.ane_type = 0xb0,
+	.hwx_subtype = 6,
+	.task_generation = 15,
+	.interrupt_count = 1,
+	.irq_role = ANE_FW_IRQ_UNKNOWN,
+	.owner = ANE_FW_OWNER_AP,
+	.reg_names = ane_t8122_reg_names,
+	.reg_sizes = ane_t8122_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_t8122_reg_names),
+	.wrapper = 0x1400000,
+	.mailbox = 0x1408000,
+	.scratch = 0x1840050,
+	.doorbell = 0x1844000,
+	.irq_status = 0x184c000,
+	.irq_ack = 0x1850000,
+	.power_words = ane_t8122_power_words,
+	.power_count = ARRAY_SIZE(ane_t8122_power_words),
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000c8000 },
+	.preload_size = { 0xc8000, 0x2a4000 },
+	.stream_mask = BIT(0),
+	.sleep_cold = true,
+	.boot_qualified = true,
+	.firmware_preloaded = true,
+	.safe_reset = false,
 };
 
 const struct ane_fw_platform ane_h16_platform = {
@@ -117,44 +176,62 @@ const struct ane_fw_platform ane_h16_platform = {
  * (no aux-3 window), its own engine writes and firmware builds, ANE_SYS at
  * PMGR +0x570 and five DAPF records. The backend polls the F2H channels.
  */
+#define ANE_T8132_PLATFORM						\
+	.h16_mmio = ane_h16_mmio_t6041,					\
+	.h16_mmio_count = ARRAY_SIZE(ane_h16_mmio_t6041),		\
+	.dart_params = 0x8,						\
+	.soc = 0x8132,							\
+	.chip_family = 16,						\
+	.ane_type = 0x100,						\
+	.hwx_subtype = 7,						\
+	.task_generation = 17,						\
+	.interrupt_count = 2,						\
+	.irq_role = ANE_FW_IRQ_UNKNOWN,					\
+	.owner = ANE_FW_OWNER_AP,					\
+	.reg_names = ane_t8132_reg_names,				\
+	.reg_sizes = ane_t8132_reg_sizes,				\
+	.reg_count = ARRAY_SIZE(ane_t8132_reg_names),			\
+	.wrapper = 0x1600000,						\
+	.mailbox = 0x1608000,						\
+	.scratch = 0x1880020,						\
+	.doorbell = 0x1884000,						\
+	.irq_status = 0x188c000,					\
+	.irq_ack = 0x1890000,						\
+	.power_words = ane_t8132_power_words,				\
+	.power_count = ARRAY_SIZE(ane_t8132_power_words),		\
+	.dapf_dart = 0,							\
+	.dapf_offset = 0x10000,						\
+	.dapf_size = SZ_16K,						\
+	.dapf_count = 5,						\
+	.stream_mask = BIT(0) | BIT(11),				\
+	/* System sleep cycles the engine cold and replays every program, as on T6041. */ \
+	.sleep_cold = true,						\
+	.boot_qualified = true,						\
+	.firmware_preloaded = true,					\
+	.safe_reset = false,						\
+	.pmp_report = "apple,t8132-pmp-v2-report"
+
+/*
+ * The macOS 27.2 (26B123) firmware: iBoot preloads TEXT 0xbc000 and DATA
+ * 0x2b0000, DATA at 0x100_000b_c000, as on T6050 and T8142 at 27.2.
+ */
+static const struct ane_fw_platform ane_t8132_platform_26b123 = {
+	ANE_T8132_PLATFORM,
+	.h16_profiles = ane_t8132_profiles_26b123,
+	.h16_profile_count = ARRAY_SIZE(ane_t8132_profiles_26b123),
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000bc000 },
+	.preload_size = { 0xbc000, 0x2b0000 },
+};
+
 const struct ane_fw_platform ane_t8132_platform = {
+	ANE_T8132_PLATFORM,
 	.h16_profiles = ane_t8132_profiles,
 	.h16_profile_count = ARRAY_SIZE(ane_t8132_profiles),
-	.h16_mmio = ane_h16_mmio_t6041,
-	.h16_mmio_count = ARRAY_SIZE(ane_h16_mmio_t6041),
-	.dart_params = 0x8,
-	.soc = 0x8132,
-	.chip_family = 16,
-	.ane_type = 0x100,
-	.hwx_subtype = 7,
-	.task_generation = 17,
-	.interrupt_count = 2,
-	.irq_role = ANE_FW_IRQ_UNKNOWN,
-	.owner = ANE_FW_OWNER_AP,
-	.reg_names = ane_t8132_reg_names,
-	.reg_sizes = ane_t8132_reg_sizes,
-	.reg_count = ARRAY_SIZE(ane_t8132_reg_names),
-	.wrapper = 0x1600000,
-	.mailbox = 0x1608000,
-	.scratch = 0x1880020,
-	.doorbell = 0x1884000,
-	.irq_status = 0x188c000,
-	.irq_ack = 0x1890000,
-	.power_words = ane_t8132_power_words,
-	.power_count = ARRAY_SIZE(ane_t8132_power_words),
-	.dapf_dart = 0,
-	.dapf_offset = 0x10000,
-	.dapf_size = SZ_16K,
-	.dapf_count = 5,
+	.build_name = "26.6.2 25G83",
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.stream_mask = BIT(0) | BIT(11),
-	/* System sleep cycles the engine cold and replays every program, as on T6041. */
-	.sleep_cold = true,
-	.boot_qualified = true,
-	.firmware_preloaded = true,
-	.safe_reset = false,
-	.pmp_report = "apple,t8132-pmp-v2-report",
+	.next_build = &ane_t8132_platform_26b123,
 };
 
 const struct ane_fw_platform ane_h17_platform = {
@@ -229,6 +306,9 @@ const struct ane_fw_platform ane_h17_platform = {
 	.boot_qualified = true,						\
 	.firmware_preloaded = true,					\
 	.safe_reset = false,						\
+	/* Exclave mode at boot, cold sleep cycle and parked start. */	\
+	.exclave_mode_stop = true,					\
+	.macos_sleep = true,						\
 	.sleep_warm = false,						\
 	.pmgr_sys = 0x3a8,						\
 	.pmgr_cpu = 0x3c8,						\
@@ -300,7 +380,55 @@ const struct ane_fw_platform ane_t6050_platform = {
  * T8140's order: sub-block, PWGATE request 3, acknowledge 0, CPU, then
  * ANE_SYS. So sleep and the parked start follow T8140.
  */
+/*
+ * T8142 engine bus-bridge setup (engine + 0x0000..0x400c), written after
+ * CE bring-up and before releasing the ANE CPU on every power-up. Without
+ * these register updates the bridge remains at its reset configuration and
+ * bottlenecks compute-bound models by 1.4x-3.1x on J813.
+ *
+ * Derived directly from clean-room Aura Stage-2 hypervisor MMIO traces of
+ * engine + 0x0000..0x401c across two consecutive ANE power-up cycles on
+ * J813 (T8142); /arm-io/ane in the T8142 ADT carries no bridge tunable
+ * properties. Each entry records only the bits observed to change
+ * (clear = R32 & ~W32, set = W32 & ~R32) on the 25 registers whose value
+ * changed (8 traced no-op writes where W32 == R32 are omitted), preserving
+ * all unmodified reset bits without inferred field masks.
+ */
+static const struct ane_fw_bridge_op ane_t8142_bridge_ops[] = {
+	/* Engine bridge block +0x0000..0x0034. */
+	{ 0x0000, 0x00000000, 0x8000001a },
+	{ 0x0004, 0x00000002, 0x800c000c },
+	{ 0x0008, 0x00000002, 0x800c000c },
+	{ 0x000c, 0x00000002, 0x800c000c },
+	{ 0x0010, 0x00000000, 0x80000001 },
+	{ 0x0014, 0x00000000, 0x80000001 },
+	{ 0x0018, 0x00000008, 0x80000012 },
+	{ 0x001c, 0x00000000, 0x80000010 },
+	{ 0x0020, 0x00000002, 0x8010000c },
+	{ 0x0024, 0x00000002, 0x80000004 },
+	{ 0x0028, 0x00000002, 0x80000004 },
+	{ 0x002c, 0x00000000, 0x80000004 },
+	{ 0x0030, 0x00000008, 0x80000010 },
+	{ 0x0034, 0x00000008, 0x80000010 },
+	/* Engine bridge block +0x0100..0x0108. */
+	{ 0x0100, 0x00000000, 0x000000ff },
+	{ 0x0104, 0x00000000, 0x00000003 },
+	{ 0x0108, 0x00000006, 0x00000001 },
+	/* Engine bridge block +0x0300..0x0404. */
+	{ 0x0300, 0x00000000, 0x1c000001 },
+	{ 0x0304, 0x00000000, 0x02020000 },
+	{ 0x0314, 0x00000000, 0x80000000 },
+	{ 0x031c, 0x00000000, 0x80000000 },
+	{ 0x0324, 0x00000000, 0x80000000 },
+	{ 0x0404, 0xffee0000, 0x00000041 },
+	/* Engine bridge registers +0x0b00 and +0x400c. */
+	{ 0x0b00, 0x00000000, 0x7fffffff },
+	{ 0x400c, 0x00000001, 0x00000000 },
+};
+
 #define ANE_T8142_PLATFORM						\
+	.bridge_ops = ane_t8142_bridge_ops,				\
+	.bridge_op_count = ARRAY_SIZE(ane_t8142_bridge_ops),		\
 	.soc = 0x8142,							\
 	.chip_family = 17,						\
 	.ane_type = 0x210,						\
@@ -485,6 +613,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	unsigned int i;
 	int ret;
 
+	/* Check the build the loader preloaded (a no-op for a selected build). */
+	soc = ane_fw_platform_build(np, soc);
 	/* Refuse unqualified SoCs before resources, DMA, power or MMIO. */
 	if (!soc->boot_qualified)
 		return dev_err_probe(dev, -EOPNOTSUPP,
@@ -546,6 +676,8 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 	/* H17: the staged backend owns the engine; the device binds for it. */
 	if (ane_fw_platform_staged(soc))
 		return ane_fw_staged_bind(pdev);
+	/* The firmware build the loader preloaded, if the SoC has several. */
+	soc = ane_fw_platform_build(pdev->dev.of_node, soc);
 	ret = ane_fw_platform_preflight(pdev, soc);
 
 	if (ret)
@@ -575,4 +707,19 @@ int ane_fw_platform_resume(struct device *dev)
 	if (ane_fw_staged_bound(dev))
 		return 0;
 	return ane_h16_backend_resume(dev);
+}
+
+/* Runtime PM callbacks of the bound H16 or H17 device. */
+int ane_fw_platform_runtime_suspend(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_suspend(dev);
+	return ane_h16_backend_runtime_suspend(dev);
+}
+
+int ane_fw_platform_runtime_resume(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_resume(dev);
+	return ane_h16_backend_runtime_resume(dev);
 }
