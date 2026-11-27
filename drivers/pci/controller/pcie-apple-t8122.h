@@ -2,6 +2,10 @@
 #ifndef PCIE_APPLE_T8122_H
 #define PCIE_APPLE_T8122_H
 
+#ifndef __KERNEL__
+#include <stdbool.h>
+#endif
+
 /*
  * A T8122 PCIe-C bridge's MSI slice, as its node describes it: the first
  * vector of the shared window it owns (apple,msi-vector-base) and that
