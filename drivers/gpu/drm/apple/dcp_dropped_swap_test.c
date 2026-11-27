@@ -451,6 +451,48 @@ static void legacy_watchdog_test(struct kunit *test)
 	dcp_dropped_legacy_watchdog(test, DCP_FIRMWARE_V_13_5, 0);
 }
 
+/*
+ * The firmware 13.5 panel takes VRR_ENABLED live: its swaps are watched
+ * while adaptive sync is armed, and one that does not complete restores
+ * fixed refresh until the next boot.  Its fixed swaps stay unwatched, as do
+ * those of a firmware 12.3 panel.
+ */
+static void legacy_panel_adaptive_watchdog_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_init(test, DCP_FIRMWARE_V_13_5, 0);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
+	dcp->panel.width_mm = 345;
+	dcp->main_display = true;
+	KUNIT_ASSERT_TRUE(test, dcp_vrr_live(dcp));
+	dcp_swap_watchdog_arm(dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+
+	dcp->vrr_enabled = true;
+	dcp_swap_watchdog_arm(dcp);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+	dcp_swap_watchdog_complete(dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+
+	/* An adaptive swap that never completes. */
+	dcp_swap_watchdog_arm(dcp);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	dcp_swap_watchdog(&dcp->swap_watchdog_wq.work);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->vrr_failed));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->vrr_enabled));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->mode_state.valid));
+	dcp_swap_watchdog_arm(dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+
+	dcp->vrr_failed = false;
+	dcp->vrr_enabled = true;
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	KUNIT_EXPECT_FALSE(test, dcp_vrr_live(dcp));
+	dcp_swap_watchdog_arm(dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+}
+
 /* H17P firmware with the H17G method profile keeps its transport too. */
 static void h17g_watchdog_test(struct kunit *test)
 {
@@ -593,6 +635,7 @@ static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(stop_deferred_test),
 	KUNIT_CASE(dropped_present_bounded_test),
 	KUNIT_CASE(legacy_watchdog_test),
+	KUNIT_CASE(legacy_panel_adaptive_watchdog_test),
 	KUNIT_CASE(h17g_watchdog_test),
 	KUNIT_CASE(older_retired_completion_test),
 	KUNIT_CASE(retired_completion_in_flight_test),

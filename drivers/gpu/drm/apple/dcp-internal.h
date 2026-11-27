@@ -33,6 +33,7 @@
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
+#include "dcp-refresh.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb_v27.h"
@@ -459,16 +460,6 @@ struct dcp_desktop_state {
 	/* RX records an unsupported callback until the modeset RPC has drained. */
 	bool modeset_active;
 	bool modeset_callback_error;
-	/* An adaptive swap that timed out keeps fixed refresh until the next boot. */
-	bool vrr_failed;
-	/*
-	 * Adaptive sync of a VRR timing installed by this pipe alone: the
-	 * minimum rates for VRR_ENABLED on and off (16.16 Hz), and the one
-	 * the firmware was last given.  Zero when not installed that way.
-	 */
-	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
-	/* The frame's colour matrix, sent after an adaptive sync update. */
-	struct iomfb_set_matrix_req matrix;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -893,6 +884,15 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	/*
+	 * The adaptive sync minimum of a VRR timing on a panel that takes
+	 * VRR_ENABLED live (dcp_vrr_live()), see dcp_vrr_update().
+	 */
+	struct dcp_vrr_floor vrr_floor;
+	/* An adaptive swap that timed out keeps fixed refresh until the next boot. */
+	bool vrr_failed;
+	/* The frame's colour matrix, sent after an adaptive sync update. */
+	struct iomfb_set_matrix_req vrr_matrix;
 	struct {
 		/* Pins the AV service and tracks HDR10 metadata for its link. */
 		spinlock_t lock;
@@ -1450,11 +1450,6 @@ extern int fw27_panel_boot_mode;
 extern int notify_clients_form;
 
 /*
- * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the
- * adaptive sync minimum rate (see dcp_vrr_update()).  The external
- * processors ignore a new minimum on a live mode.
- */
-/*
  * Desktop 26.x swaps that the watchdog follows: adaptive ones, and those on a
  * loader mode the takeover adopted until one of them completes.
  */
@@ -1483,10 +1478,30 @@ static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
 	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 }
 
+/*
+ * Firmware whose internal panel takes VRR_ENABLED on its live mode, through
+ * the adaptive sync minimum rate (see dcp_vrr_update()): desktop 26.6 and
+ * 13.5.  The external processors ignore a new minimum on a live mode.
+ */
+static inline bool dcp_fw_vrr_live(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
-	       dcp_has_panel(dcp);
+	return dcp_fw_vrr_live(dcp) && dcp->main_display && dcp_has_panel(dcp);
+}
+
+/*
+ * Adaptive sync is armed on a panel that takes VRR_ENABLED live.  The swap
+ * watchdog follows its swaps: one that does not complete restores fixed
+ * refresh (dcp_swap_watchdog()).
+ */
+static inline bool dcp_vrr_live_armed(struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->vrr_enabled) && dcp_vrr_live(dcp);
 }
 
 /*

@@ -1886,13 +1886,13 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_enabled;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq;
+    bool vrr_enabled, vrr_failed;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
-    struct { bool vrr_failed; } *desktop;
     struct apple_connector *connector;
     void *dev;
 };
@@ -1924,12 +1924,10 @@ static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
 static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
     struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; return 0; }
-/* The panel of a desktop 26.6 machine takes VRR_ENABLED live. */
-static bool dcp_vrr_live(struct apple_dcp *d)
-{ return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static bool dcp_has_panel(struct apple_dcp *d) { return d->panel; }
-/* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
+/* The panels that take VRR_ENABLED live, as production decides. */
+VRR_LIVE_HELPERS/* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
 static unsigned int peer_checks;
 static int dcp_peer_check_v27(struct apple_dcp *d, struct drm_atomic_commit *s,
     struct drm_crtc_state *c)
@@ -1951,6 +1949,8 @@ static int __attribute__((unused)) dcp_typec_follow_check(struct apple_dcp *d, s
     struct drm_atomic_commit *s, const struct drm_display_mode *m)
 { (void)d; (void)c; (void)s; (void)m; assert(!"route-follow without Type-C routes"); return -EINVAL; }
 """ + apple_function(root, 'dcp_typec_follows_crtc')
+    prefix = prefix.replace('VRR_LIVE_HELPERS', internal_inline(root, 'dcp_fw_vrr_live') +
+                            internal_inline(root, 'dcp_vrr_live'), 1)
     suffix = r"""
 int main(void)
 {
@@ -2009,6 +2009,7 @@ FW27_VRR    dcp.crashed = true;
     for (unsigned int old_vrr = 0; old_vrr < 3; old_vrr++)
     for (unsigned int vrr = 0; vrr < 2; vrr++) {
         dcp.main_display = panel;
+        dcp.panel = panel;
         state.crtc.enable = enable;
         state.crtc.vrr_enabled = vrr;
         state.crtc.mode_changed = false;
@@ -2026,24 +2027,55 @@ FW27_VRR    dcp.crashed = true;
     /* Adopted desktop 26.6 panel boot mode starts fixed (!dcp.vrr_enabled):
      * enabling VRR_ENABLED triggers one modeset to arm adaptive sync unless vrr_failed. */
     {
-        __typeof__(*dcp.desktop) ds = { .vrr_failed = false };
-        dcp.desktop = &ds;
         dcp.main_display = true;
+        dcp.panel = true;
         dcp.vrr_enabled = false;
+        dcp.vrr_failed = false;
         state.crtc.enable = true;
         state.no_old_crtc = false;
         state.old_crtc.vrr_enabled = false;
         state.crtc.vrr_enabled = true;
         state.crtc.mode_changed = false;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
-        ds.vrr_failed = true;
+        dcp.vrr_failed = true;
         state.crtc.mode_changed = false;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
-        dcp.desktop = NULL;
         cases += 2;
     }
+    /* The firmware 13.5 panel takes VRR_ENABLED live as well, and sets the
+     * mode of every enable: a VRR_ENABLED change alone is never a mode set
+     * there, armed or not (GDM enables VRR in its mode set, then Niri turns
+     * it off in a page flip that does not allow one).  Its externals still
+     * apply VRR_ENABLED with a mode set. */
+    dcp.fw_compat = DCP_FIRMWARE_V_13_5;
+    for (unsigned int panel = 0; panel < 2; panel++)
+    for (unsigned int armed = 0; armed < 2; armed++)
+    for (unsigned int failed = 0; failed < 2; failed++)
+    for (unsigned int enable = 0; enable < 2; enable++)
+    for (unsigned int old_vrr = 0; old_vrr < 3; old_vrr++)
+    for (unsigned int vrr = 0; vrr < 2; vrr++) {
+        dcp.main_display = panel;
+        dcp.panel = panel;
+        dcp.vrr_enabled = armed;
+        dcp.vrr_failed = failed;
+        state.crtc.enable = enable;
+        state.crtc.vrr_enabled = vrr;
+        state.crtc.mode_changed = false;
+        state.no_old_crtc = old_vrr == 2;
+        state.old_crtc.vrr_enabled = old_vrr == 1;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0);
+        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
+        if (state.crtc.mode_changed != expected) {
+            fprintf(stderr, "13.5 panel=%u armed=%u failed=%u enable=%u old_vrr=%u vrr=%u: mode_changed=%d expected %d\n",
+                    panel, armed, failed, enable, old_vrr, vrr, state.crtc.mode_changed, expected);
+            return 1;
+        }
+        cases++;
+    }
     dcp.main_display = false;
+    dcp.panel = false;
     dcp.vrr_enabled = false;
+    dcp.vrr_failed = false;
     dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
