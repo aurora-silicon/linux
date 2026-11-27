@@ -206,6 +206,7 @@
 
 	ecluster_opp: opp-table-0 {
 		compatible = "operating-points-v2";
+		opp-shared;
 
 		opp01 {
 			opp-hz = /bits/ 64 <600000000>;
@@ -241,6 +242,7 @@
 
 	pcluster_opp: opp-table-1 {
 		compatible = "operating-points-v2";
+		opp-shared;
 
 		opp01 {
 			opp-hz = /bits/ 64 <600000000>;
