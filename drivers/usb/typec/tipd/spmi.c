@@ -435,7 +435,10 @@ static bool sn201202x_ldcm_wet(void *ctx)
 /*
  * The first call starts the wait, and it is overdue SN201202X_LDCM_STUCK_MS
  * later. Overdue, it starts again, for the measurement that follows, and
- * returns how many waits have been overrun in a row (up to 2).
+ * returns how many waits have been overrun in a row (up to 2). After the
+ * first overrun, the measurement is to be started again: until
+ * sn201202x_ldcm_wait_rerun() says it was, every call returns 1 again,
+ * and the second wait does not run.
  */
 VISIBLE_IF_KUNIT unsigned int
 sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
@@ -445,14 +448,26 @@ sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
 		wait->since = now;
 		return 0;
 	}
+	if (wait->rerun_due)
+		return wait->overdue;
 	if (time_before(now, wait->since + msecs_to_jiffies(SN201202X_LDCM_STUCK_MS)))
 		return 0;
 	wait->since = now;
 	if (wait->overdue < 2)
 		wait->overdue++;
+	wait->rerun_due = wait->overdue == 1;
 	return wait->overdue;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_overdue);
+
+/* The measurement was started again: it gets a whole wait from now. */
+VISIBLE_IF_KUNIT void
+sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait, unsigned long now)
+{
+	wait->rerun_due = false;
+	wait->since = now;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_rerun);
 
 /*
  * Retried every 500 ms while it measures, but every 2 s once a wait has
@@ -473,15 +488,16 @@ VISIBLE_IF_KUNIT unsigned int sn201202x_ldcm_overdue(void *ctx)
 {
 	struct tps6598x *tps = ctx;
 	struct sn201202x *sn = tps_to_sn(tps);
+	bool rerun_due = sn->ldcm_wait.rerun_due;
 	unsigned int overdue;
 
 	if (READ_ONCE(sn->atomic))
 		return 0;
 	overdue = sn201202x_ldcm_wait_overdue(&sn->ldcm_wait, jiffies);
-	if (overdue == 1)
+	if (overdue == 1 && !rerun_due)
 		dev_warn(tps->dev, "liquid detection gave no result in %u ms, measuring again\n",
 			 SN201202X_LDCM_STUCK_MS);
-	else if (overdue)
+	else if (overdue > 1)
 		dev_warn(tps->dev, "liquid detection still gave no result, enabling the port\n");
 	return overdue;
 }
@@ -491,6 +507,7 @@ VISIBLE_IF_KUNIT int sn201202x_ldcm_rerun(void *ctx)
 {
 	struct tps6598x *tps = ctx;
 	struct sn201202x *sn = tps_to_sn(tps);
+	int ret;
 
 	if (READ_ONCE(sn->atomic))
 		return -EAGAIN;
@@ -501,7 +518,15 @@ VISIBLE_IF_KUNIT int sn201202x_ldcm_rerun(void *ctx)
 	 */
 	sn->ldcm_mitigation_known = false;
 	sn->ldcm_requested = true;
-	return sn201202x_ldcm_set_mitigation(ctx, false);
+	ret = sn201202x_ldcm_set_mitigation(ctx, false);
+	/*
+	 * Failed (a bus error, a busy controller, no completion): the
+	 * measurement may not have started again, so the next update sends
+	 * the command again instead of letting the second wait run.
+	 */
+	if (!ret)
+		sn201202x_ldcm_wait_rerun(&sn->ldcm_wait, jiffies);
+	return ret;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_rerun);
 

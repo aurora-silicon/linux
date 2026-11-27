@@ -1288,6 +1288,8 @@ static void sn201202x_ldcm_wait_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck), 1U);
 	/* Overrun once: retried slowly, and the measurement run again gets a whole wait. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	sn201202x_ldcm_wait_rerun(&wait, start + stuck);
+	KUNIT_EXPECT_FALSE(test, wait.rerun_due);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck - 1), 0U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 2U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 3 * stuck), 2U);
@@ -1297,6 +1299,35 @@ static void sn201202x_ldcm_wait_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 10 * stuck), 0U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 11 * stuck - 1), 0U);
+}
+
+/*
+ * A measurement that was not started again (the command failed or was not
+ * sent) does not use up the second wait: every update tries again, and the
+ * second wait runs from the restart that went through.
+ */
+static void sn201202x_ldcm_wait_rerun_failure_test(struct kunit *test)
+{
+	unsigned long stuck = msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+	struct sn201202x_ldcm_wait wait = {};
+	unsigned long start = -(stuck / 2);	/* across a jiffies wrap */
+	unsigned long rerun = start + 3 * stuck;
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start), 0U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck), 1U);
+	KUNIT_EXPECT_TRUE(test, wait.rerun_due);
+	/* No restart: the next update tries again, slowly, never the second overrun. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck + 1), 1U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 1U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun), 1U);
+
+	/* The restart went through: a whole wait from then before the port is enabled. */
+	sn201202x_ldcm_wait_rerun(&wait, rerun);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun + stuck - 1), 0U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun + stuck), 2U);
+	KUNIT_EXPECT_FALSE(test, wait.rerun_due);
 }
 
 /* In the busy-wait of suspend-to-idle, mitigation is never removed. */
@@ -1316,8 +1347,14 @@ static void sn201202x_ldcm_atomic_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigation_known);
 	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigated);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_set_mitigation(tps, true), 0);
+	/* A restart refused is still due: its second wait does not start. */
+	sn->ldcm_wait.waiting = true;
+	sn->ldcm_wait.overdue = 1;
+	sn->ldcm_wait.rerun_due = true;
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_rerun(tps), -EAGAIN);
 	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigation_known);
+	KUNIT_EXPECT_TRUE(test, sn->ldcm_wait.rerun_due);
+	sn->ldcm_wait = (struct sn201202x_ldcm_wait){};
 
 	/* No wait runs out there: the update after the resume decides. */
 	sn->ldcm_wait.waiting = true;
@@ -1505,6 +1542,7 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_liquid_read_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_liquid_mitigation_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_wait_test),
+	KUNIT_CASE(sn201202x_ldcm_wait_rerun_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_atomic_test),
 	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_read_failure_retried_test),

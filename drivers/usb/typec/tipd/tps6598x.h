@@ -347,7 +347,8 @@ struct sn201202x_ldcm_ops {
 	bool (*wet)(void *ctx);
 	/*
 	 * Waits that a measurement without an earlier result has overrun in a
-	 * row (0, 1 or 2); each overrun starts another wait
+	 * row (0, 1 or 2); each overrun starts another wait, the second only
+	 * once ->rerun() succeeded (1 until then)
 	 */
 	unsigned int (*overdue)(void *ctx);
 	/* Remove mitigation even if removed already: the controller measures again */
@@ -362,6 +363,8 @@ struct sn201202x_ldcm_wait {
 	unsigned long since;
 	/* Waits overrun in a row, up to 2; reset by a result */
 	unsigned int overdue;
+	/* Overrun once, and the measurement not started again yet */
+	bool rerun_due;
 };
 
 struct tipd_data {
@@ -680,6 +683,8 @@ int sn201202x_ldcm_update_state(void *ctx,
 				enum typec_contaminant last);
 unsigned int sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait,
 					 unsigned long now);
+void sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait,
+			       unsigned long now);
 unsigned int sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
 				     unsigned int read_failures);
 int sn201202x_ldcm_set_mitigation(void *ctx, bool enable);
