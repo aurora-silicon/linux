@@ -2321,6 +2321,7 @@ static const u32 t6030_wfi_on[] = {
 
 static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 {
+	struct t6030_sleep *t = t6030_state(s);
 	unsigned int i, stuck = 0;
 	u32 v, now;
 
