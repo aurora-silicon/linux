@@ -27,6 +27,7 @@ select:
           - apple,t6030-dpaudio
           - apple,t6041-dpaudio
           - apple,t6050-dpaudio
+          - apple,t8122-dpaudio
           - apple,t8140-dpaudio
   required:
     - compatible
@@ -38,6 +39,7 @@ properties:
           - apple,t6030-dpaudio
           - apple,t6041-dpaudio
           - apple,t6050-dpaudio
+          - apple,t8122-dpaudio
           - apple,t8140-dpaudio
       - const: apple,dpaudio
 
