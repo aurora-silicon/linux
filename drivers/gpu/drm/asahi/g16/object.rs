@@ -396,6 +396,7 @@ pub(crate) struct Factory {
     firmware: core::ops::Range<u64>,
     render_cmds: Arc<super::resources::RenderCmds>,
     compute_cmds: Arc<super::resources::ComputeCmds>,
+    compute_uma_pool: Arc<super::resources::ComputeUmaPool>,
 }
 
 impl Factory {
@@ -489,6 +490,10 @@ impl Factory {
     pub(crate) fn compute_cmds(&self, k: usize) -> Result<super::slots::UnitCmds> {
         self.compute_cmds.get(self, k)
     }
+
+    pub(crate) fn compute_uma_pool(&self) -> &Arc<super::resources::ComputeUmaPool> {
+        &self.compute_uma_pool
+    }
 }
 
 /// The firmware object allocator and the set of retained objects.
@@ -547,6 +552,7 @@ impl Objects {
         &mut self,
         render_cmds: Arc<super::resources::RenderCmds>,
         compute_cmds: Arc<super::resources::ComputeCmds>,
+        compute_uma_pool: Arc<super::resources::ComputeUmaPool>,
     ) -> Factory {
         self.sealed = true;
         Factory {
@@ -556,6 +562,7 @@ impl Objects {
             firmware: self.fw_next..hw::va::FW_ALLOC.end,
             render_cmds,
             compute_cmds,
+            compute_uma_pool,
         }
     }
 

@@ -899,7 +899,7 @@ impl Firmware {
         stage[0] = self.graph.render.fw_stamp[0].r32(0)?;
         stage[1] = self.graph.render.fw_stamp[1].r32(0)?;
         for (p, compute) in self.graph.compute.iter().enumerate() {
-            stage[2 + p] = compute.fw_stamp.r32(0)?;
+            stage[2 + p] = compute.notifier.r32(notifier_page::COMPUTE_STAMP)?;
         }
         Ok(stage)
     }
@@ -3489,6 +3489,7 @@ impl Firmware {
                 if let Some(shared) = job.resources.shared_compute_uma() {
                     if f.claims.slot_count != 0 {
                         let tail_sub = f.csubmitted[(f.claims.slot_count - 1) as usize];
+                        shared.uma_lease.publish();
                         shared.submitted.store(tail_sub, Ordering::Release);
                         shared.counter.w64(0, tail_sub)?;
                     }
@@ -3780,18 +3781,16 @@ impl Firmware {
         if full_work {
             if before != 0 {
                 if let Some(shared) = resources.shared_compute_uma() {
-                    // Validate the VM-shared UMA descriptor at idle boundaries (when no other
-                    // flight of this VM is mutating `COMPLETED`).
-                    if pf.uma_delta == 1 && before == shared.retired.load(Ordering::Acquire) {
-                        let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-                        shared.descriptor.read(0, &mut descriptor)?;
-                        if encode::validate_shared_compute_descriptor(&refs, &descriptor, before)
-                            .is_err()
-                        {
-                            self.slots.quarantine(&mut f.claims);
-                            self.sync_quarantine_hints();
-                            return Err(EIO);
-                        }
+                    // The shared UMA descriptor is ASC-cached (`FwCoherent`) so the host does
+                    // not read firmware-cached completion words; verify the uncached host
+                    // submission counter matches `before` at idle boundaries.
+                    if pf.uma_delta == 1
+                        && before == shared.retired.load(Ordering::Acquire)
+                        && shared.counter.r64(0)? != before
+                    {
+                        self.slots.quarantine(&mut f.claims);
+                        self.sync_quarantine_hints();
+                        return Err(EIO);
                     }
                 } else {
                     // Slots::claim_compute proved a different fully retired unit displaced this

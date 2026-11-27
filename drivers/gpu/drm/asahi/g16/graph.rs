@@ -135,11 +135,14 @@ struct QueueSession {
 }
 impl QueueSession {
     fn new(o: &mut Objects) -> Result<Self> {
+        Self::new_with(o, Class::Shared)
+    }
+    fn new_with(o: &mut Objects, fw_stamp_class: Class) -> Result<Self> {
         Ok(Self {
             qinfo: alloc(o, qinfo::SIZE, graph_fw(), None, 0, false)?,
             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
-            fw_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
+            fw_stamp: alloc(o, 8, fw_stamp_class, None, 0, false)?,
         })
     }
     /// Completes the queue with its firmware-cached work ring from a device-lifetime
@@ -220,7 +223,7 @@ impl ComputeGraphSession {
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
-            q: QueueSession::new(o)?,
+            q: QueueSession::new_with(o, Class::FwCached)?,
         })
     }
     fn finish(self, rings: &mut Objects) -> Result<ComputeGraph> {

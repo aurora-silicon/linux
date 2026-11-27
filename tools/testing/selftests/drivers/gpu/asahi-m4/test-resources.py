@@ -131,11 +131,20 @@ pub mod g16 {
             }
         }
         pub struct Factory;
+        std::thread_local!{
+            pub static COMPUTE_UMA_POOL: std::cell::RefCell<Option<Arc<super::resources::ComputeUmaPool>>> = const { std::cell::RefCell::new(None) };
+        }
         impl Factory{
             pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
             pub fn fw_objects(&self)->Objects{Objects::new()}
             pub fn persistent_objects(&self)->Objects{Objects::persistent()}
             pub fn persistent_objects_probe(&self)->Objects{Objects::persistent()}
+            pub fn compute_uma_pool(&self)->Arc<super::resources::ComputeUmaPool>{
+                COMPUTE_UMA_POOL.with(|p|{
+                    let mut p = p.borrow_mut();
+                    p.get_or_insert_with(||super::resources::ComputeUmaPool::new().unwrap()).clone()
+                })
+            }
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
@@ -2392,7 +2401,7 @@ pub mod g16 {
         assert_eq!(c1.qinfo.class, Class::FwCached);
         assert_eq!(c1.qstate.class, Class::Fw);
         assert_eq!(c1.ring.class, Class::FwCoherent);
-        assert_eq!(c1.fw_stamp.class, Class::Shared);
+        assert_eq!(c1.fw_stamp.class, Class::FwCached);
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
         assert_eq!(c.job_list.class, Class::FwCached);
@@ -2402,7 +2411,7 @@ pub mod g16 {
         assert_eq!(c.threshold.class, Class::Fw);
         assert_eq!(c.ring.class, Class::FwCoherent);
         assert_eq!(c.user_stamp.class, Class::Shared);
-        assert_eq!(c.fw_stamp.class, Class::Shared);
+        assert_eq!(c.fw_stamp.class, Class::FwCached);
         for stage in 0..2 {
             assert_eq!(r.qinfo[stage].class, Class::FwCached);
             assert_eq!(r.qscratch[stage].class, Class::FwCached);
@@ -3643,7 +3652,11 @@ pub mod g16 {
             .unwrap();
         s.hold_compute_slot(ka, &vm_a, &prep_a).unwrap();
         s.publish(&mut ca).unwrap();
+        uma_a.uma_lease.publish();
         s.quarantine(&mut ca);
+        assert!(!uma_a.uma_lease.settled(), "aborted UMA lease must never recycle");
+        assert_eq!(uma_a.descriptor.class, g16::object::Class::FwCoherent);
+        assert_eq!(uma_a.counter.class, g16::object::Class::Fw);
         let qmask = s.quarantined_compute_uma_mask();
         assert_eq!(qmask, 1u32 << 0);
         assert!(s.compute_uma_quarantined(1u32 << 0));
@@ -3685,7 +3698,13 @@ pub mod g16 {
         );
         s.hold_compute_slot(kb1, &vm_b, &prep_b).unwrap();
         s.publish(&mut cb1).unwrap();
+        uma_b1.uma_lease.publish();
         s.retire(&mut cb1).unwrap();
+        uma_b1.uma_lease.retire();
+        assert!(uma_b1.uma_lease.settled(), "cleanly retired UMA lease settles for reuse");
+        let desc_a_va = uma_a.descriptor.va;
+        let desc_b0_va = uma_b0.descriptor.va;
+        let desc_b1_va = uma_b1.descriptor.va;
         let lease_b1 = uma_b1.uma_lease.clone();
         // Exhausting pool_va_idx >= COMPUTE_UMA_WINDOWS returns EIO.
         assert!(
@@ -3705,9 +3724,27 @@ pub mod g16 {
         drop(uma_b0);
         drop(occ_b1);
         assert_eq!(users[s2].load(Ordering::Acquire), 0);
-        assert_eq!(sync::Arc::strong_count(&lease_b1), 2, "retired FwLease retained");
+        assert_eq!(sync::Arc::strong_count(&lease_b1), 2, "retired ComputeUmaLease retained");
+        drop(lease_b1);
         drop(s);
         drop(uma_a);
+        // Once every holder of cleanly settled ComputeUmaLeases drops, the pool recycles
+        // both settled FwCoherent descriptors and never recycles the aborted one (`desc_a_va`).
+        let vm_c = vm(2003);
+        let vm_d = vm(2004);
+        let (bind_c, live_c, _) = g16::vm::test_live_token();
+        let (bind_d, live_d, _) = g16::vm::test_live_token();
+        let uma_c = SharedComputeUma::new(&factory, &bind_c, &vm_c.vm, &live_c, s2, 0).unwrap();
+        let uma_d = SharedComputeUma::new(&factory, &bind_d, &vm_d.vm, &live_d, s2, 0).unwrap();
+        let (vc, vd) = (uma_c.descriptor.va, uma_d.descriptor.va);
+        drop(bind_c);
+        drop(bind_d);
+        drop(uma_c);
+        drop(uma_d);
+        assert_eq!(vc, desc_b0_va, "first settled FwCoherent descriptor recycled");
+        assert_eq!(vd, desc_b1_va, "second settled FwCoherent descriptor recycled");
+        assert_ne!(vc, desc_a_va);
+        assert_ne!(vd, desc_a_va);
     }
 
 }
@@ -3805,7 +3842,29 @@ assert alloc_private_in_fn.index('UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?
 assert alloc_private_in_fn.index('self.uat.kernel_lower_vm().map_in_range(') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must map uncached aliases before firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range(') < alloc_private_in_fn.index('self.mappings.push_within_capacity(firmware)'), 'alloc_private_in must commit mappings infallibly after firmware map'
 shared_uma_code = (
-    'pub(crate) struct SharedComputeUma(crate::cleanup::Deferred<SharedComputeUmaInner>);\n'
+    'use core::sync::atomic::AtomicBool;\n'
+    + item(resources_source, 'pub(crate) struct ComputeUmaRecordSet {')
+    + '\n'
+    + item(resources_source, 'impl ComputeUmaRecordSet {')
+    + '\n'
+    + item(resources_source, 'struct ComputeUmaEntry {')
+    + '\n'
+    + 'pub(crate) struct ComputeUmaPool { entries: crate::sync::Mutex<KVec<crate::sync::Arc<ComputeUmaEntry>>> }\n'
+    + 'impl ComputeUmaPool {\n'
+    + '    pub(crate) fn new() -> Result<crate::sync::Arc<Self>> {\n'
+    + '        crate::sync::Arc::new(Self { entries: crate::sync::Mutex::new(KVec::new()) }, 0)\n'
+    + '    }\n'
+    + item(resources_source, 'pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<ComputeUmaLease>, bool)> {')
+    + '\n}\n'
+    + item(resources_source, 'pub(crate) struct ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl core::ops::Deref for ComputeUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl Drop for ComputeUmaLease {')
+    + '\n'
+    + 'pub(crate) struct SharedComputeUma(crate::cleanup::Deferred<SharedComputeUmaInner>);\n'
     + item(resources_source, 'impl core::ops::Deref for SharedComputeUma {')
     + '\n'
     + item(resources_source, 'pub(crate) struct SharedComputeUmaInner {')

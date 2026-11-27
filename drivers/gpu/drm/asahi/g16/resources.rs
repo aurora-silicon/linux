@@ -158,6 +158,141 @@ impl ComputeCmds {
 /// avoids allocating and mapping fresh epochs whenever submission depth rises.
 const SPARE_EPOCHS: usize = 32;
 
+/// Firmware-cached descriptor and uncached submission counter of one shared compute UMA slot
+/// ([`SharedComputeUma`]), kept for the device lifetime because ASC-cached mappings have no
+/// qualified teardown.
+pub(crate) struct ComputeUmaRecordSet {
+    pub(crate) descriptor: Arc<FwObject>,
+    /// Uncached submission counter written by the host at every compute publication.
+    pub(crate) counter: Arc<FwObject>,
+}
+
+impl ComputeUmaRecordSet {
+    fn alloc(o: &mut Objects) -> Result<Self> {
+        Ok(Self {
+            descriptor: super::graph::alloc(
+                o,
+                super::fw::work::compute::DESCRIPTOR_SIZE,
+                super::object::Class::FwCoherent,
+                None,
+                0,
+                false,
+            )?,
+            counter: super::graph::alloc(o, 0x80, super::object::Class::Fw, None, 0, false)?,
+        })
+    }
+}
+
+struct ComputeUmaEntry {
+    set: ComputeUmaRecordSet,
+    in_use: AtomicBool,
+}
+
+/// Device-lifetime pool of ASC-cached compute UMA descriptor/counter record sets.
+///
+/// A set returns to the pool only when every flight published on it retired normally (firmware
+/// cleans the descriptor on idle before storing the flight's service stamp) and the last holder
+/// (the VM's [`SharedComputeUma`] and [`super::slots::Slots`]'s hardware-slot retention lease)
+/// drops. A set that carried an aborted or quarantined flight stays out of the pool forever.
+#[pin_data]
+pub(crate) struct ComputeUmaPool {
+    #[pin]
+    entries: Mutex<KVec<Arc<ComputeUmaEntry>>>,
+}
+
+impl ComputeUmaPool {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                entries <- new_mutex!(KVec::new(), "g16::ComputeUmaPool"),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<ComputeUmaLease>, bool)> {
+        let idle = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| {
+                entry
+                    .in_use
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .cloned();
+        let (entry, used) = match idle {
+            Some(entry) => (entry, true),
+            None => {
+                // Never dropped, also on partial failure: maps ASC-cached FwCoherent records.
+                let mut objects = core::mem::ManuallyDrop::new(factory.persistent_objects());
+                let set = ComputeUmaRecordSet::alloc(&mut objects)?;
+                objects.finish_private()?;
+                let entry = Arc::new(
+                    ComputeUmaEntry {
+                        set,
+                        in_use: AtomicBool::new(true),
+                    },
+                    GFP_KERNEL,
+                )?;
+                self.entries.lock().push(entry.clone(), GFP_KERNEL)?;
+                (entry, false)
+            }
+        };
+        let lease = Arc::new(
+            ComputeUmaLease {
+                entry,
+                published_flights: AtomicU64::new(0),
+                retired_flights: AtomicU64::new(0),
+            },
+            GFP_KERNEL,
+        )?;
+        Ok((lease, used))
+    }
+}
+
+/// Lease on one [`ComputeUmaPool`] record set, shared by [`SharedComputeUma`] and
+/// [`super::slots::Slots`] until firmware's hardware UMA slot is overwritten by another owner.
+pub(crate) struct ComputeUmaLease {
+    entry: Arc<ComputeUmaEntry>,
+    published_flights: AtomicU64,
+    retired_flights: AtomicU64,
+}
+
+impl ComputeUmaLease {
+    /// Records a published compute flight using this descriptor.
+    pub(crate) fn publish(&self) {
+        self.published_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a normal full retirement of a compute flight using this descriptor.
+    pub(crate) fn retire(&self) {
+        self.retired_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether every flight published on this descriptor retired normally.
+    pub(crate) fn settled(&self) -> bool {
+        self.published_flights.load(Ordering::Acquire)
+            == self.retired_flights.load(Ordering::Acquire)
+    }
+}
+
+impl core::ops::Deref for ComputeUmaLease {
+    type Target = ComputeUmaRecordSet;
+    fn deref(&self) -> &Self::Target {
+        &self.entry.set
+    }
+}
+
+impl Drop for ComputeUmaLease {
+    fn drop(&mut self) {
+        if self.settled() {
+            self.entry.in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Per-VM shared compute UMA manager descriptor, submission counter, and 32 MiB backing pool.
 ///
 /// All non-SCS compute units (`0..COMPUTE_UNITS`) of a VM reference this single descriptor and
@@ -177,7 +312,7 @@ pub(crate) struct SharedComputeUmaInner {
     pub(crate) pool: Arc<FwObject>,
     pub(crate) pool_state: Arc<FwObject>,
     pub(crate) page_list: Arc<FwObject>,
-    pub(crate) uma_lease: Arc<super::object::FwLease>,
+    pub(crate) uma_lease: Arc<ComputeUmaLease>,
     pub(crate) uma_slot: u32,
     pub(crate) uma_slot_idx: usize,
     pub(crate) seeds: u32,
@@ -208,12 +343,13 @@ impl SharedComputeUma {
         let state = placement.state(va_idx);
         let seeds = placement.seeds();
         let uma_slot = super::hw::engine::COMPUTE_UMA_SLOT + uma_slot_idx as u32;
-        let mut fw = factory.fw_objects();
-        let uma_page =
-            super::graph::alloc(&mut fw, 0x200, super::object::Class::Fw, None, 0, false)?;
-        let descriptor = FwObject::view(&uma_page, 0, super::fw::work::compute::DESCRIPTOR_SIZE)?;
-        let counter = FwObject::view(&uma_page, 0x100, 0x80)?;
-        let uma_lease = super::object::FwLease::new(fw)?;
+        let (uma_lease, used) = factory.compute_uma_pool().take(factory)?;
+        let descriptor = uma_lease.descriptor.clone();
+        let counter = uma_lease.counter.clone();
+        if used {
+            counter.fill(0, 0, counter.size)?;
+            descriptor.fill(0, 0, super::fw::work::compute::DESCRIPTOR_SIZE)?;
+        }
         let mut objects = factory.objects(vm);
         let pool = objects.alloc(super::object::Request {
             size: placement.pool_bytes(),
@@ -1858,9 +1994,11 @@ impl Prepared {
             self.compute_slot_mask().unwrap_or(0) as u32
         }
     }
-    /// Whether the VM's shared compute UMA descriptor has completed at least `count` additional
-    /// commands beyond previously retired flights, and matches the host counter exactly when
-    /// `last_vm_flight` drains the VM idle.
+    /// Whether the VM's shared compute UMA submission counter accounts for at least `count`
+    /// additional commands beyond previously retired flights, and matches exact host conservation
+    /// when `last_vm_flight` drains the VM idle. The descriptor itself is ASC-cached (`FwCoherent`)
+    /// so its completion count is not read by the host: firmware advances `COMPLETED` and cleans
+    /// the descriptor on idle strictly before storing the flight's service stamp (`user_stamp`).
     pub(crate) fn compute_uma_retired(&self, count: u32, last_vm_flight: bool) -> Result<bool> {
         let Some(uma) = &self.compute_uma else {
             return Ok(false);
@@ -1870,16 +2008,13 @@ impl Prepared {
             .load(Ordering::Acquire)
             .saturating_add(u64::from(count));
         let counter = uma.counter.r64(0)?;
-        let completed = uma.descriptor.r64(super::fw::graph::manager::COMPLETED)?;
-        Ok(counter >= needed
-            && completed >= needed
-            && (!last_vm_flight || completed == counter)
-            && uma.descriptor.r64(super::fw::graph::manager::COUNTER)? == uma.counter.va)
+        Ok(counter >= needed && (!last_vm_flight || needed == counter))
     }
     /// Records `count` cleanly retired compute commands against the VM's shared UMA descriptor.
     pub(crate) fn note_compute_uma_retired(&self, count: u32) {
         if let Some(uma) = &self.compute_uma {
             uma.retired.fetch_add(u64::from(count), Ordering::AcqRel);
+            uma.uma_lease.retire();
         }
     }
     /// Whether this job's renders use SCS-capable render allocators.

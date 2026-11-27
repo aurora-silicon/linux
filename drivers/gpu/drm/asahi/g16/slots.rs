@@ -783,8 +783,8 @@ pub(crate) struct ComputeOwners {
     /// VM-free firmware leases keeping each hardware compute UMA slot's `descriptor` + `counter`
     /// mapped in context-0 UAT across closed-VM reclaim until a later compute retirement
     /// overwrites firmware `uma_mgr_table[COMPUTE_UMA_SLOT + slot]`.
-    retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UMA_SLOTS],
-    pending_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
+    retained_uma: [Option<ComputeUmaRetain>; sizes::COMPUTE_UMA_SLOTS],
+    pending_uma: [Option<ComputeUmaRetain>; sizes::COMPUTE_UNITS],
     pending_uma_slot: [usize; sizes::COMPUTE_UNITS],
     /// In-flight VM-shared compute UMA backing (`None` for private/SCS units). Dropped on clean
     /// retirement (`retained_uma[slot]` keeps the VM-free `FwLease`) and moved into
@@ -802,6 +802,13 @@ pub(crate) struct ComputeOwners {
     scrub_full: [bool; sizes::COMPUTE_UNITS],
     /// Whether the most recent claim of each compute unit required a full scrub/work write.
     last_full: [bool; sizes::COMPUTE_UNITS],
+}
+
+/// Hardware compute UMA descriptor/counter retention lease keeping firmware's global
+/// `uma_mgr_table[COMPUTE_UMA_SLOT + slot]` mapped across closed-VM reclaim until overwritten.
+enum ComputeUmaRetain {
+    Private(Arc<FwLease>),
+    Shared(Arc<super::resources::ComputeUmaLease>),
 }
 
 /// Bitmask of valid hardware compute UMA slot indices (`0..sizes::COMPUTE_UMA_SLOTS`).
@@ -1964,7 +1971,7 @@ impl Slots {
         self.compute.pending_owner[k] = Some(vm.clone());
         self.compute.pending_arena[k] = resources.compute_arena(k);
         if let Some(shared) = resources.shared_compute_uma() {
-            self.compute.pending_uma[k] = Some(shared.uma_lease.clone());
+            self.compute.pending_uma[k] = Some(ComputeUmaRetain::Shared(shared.uma_lease.clone()));
             self.compute.pending_uma_slot[k] = shared.uma_slot_idx;
             self.compute.pending_shared_uma[k] = Some(shared.clone());
         } else if let Some(private) = resources
@@ -1972,7 +1979,7 @@ impl Slots {
             .ok()
             .and_then(|unit| unit.private_uma.as_ref())
         {
-            self.compute.pending_uma[k] = Some(private.uma_lease());
+            self.compute.pending_uma[k] = Some(ComputeUmaRetain::Private(private.uma_lease()));
             self.compute.pending_uma_slot[k] = private.uma_slot_idx();
             self.compute.pending_shared_uma[k] = None;
         } else {
@@ -2103,7 +2110,7 @@ impl Slots {
             }
             if let Some(cell) = self.compute.pending_uma.get_mut(k as usize) {
                 if let Some(shared) = resources.shared_compute_uma() {
-                    *cell = Some(shared.uma_lease.clone());
+                    *cell = Some(ComputeUmaRetain::Shared(shared.uma_lease.clone()));
                     self.compute.pending_uma_slot[k as usize] = shared.uma_slot_idx;
                     self.compute.pending_shared_uma[k as usize] = Some(shared.clone());
                 } else if let Some(private) = resources
@@ -2111,7 +2118,7 @@ impl Slots {
                     .ok()
                     .and_then(|unit| unit.private_uma.as_ref())
                 {
-                    *cell = Some(private.uma_lease());
+                    *cell = Some(ComputeUmaRetain::Private(private.uma_lease()));
                     self.compute.pending_uma_slot[k as usize] = private.uma_slot_idx();
                     self.compute.pending_shared_uma[k as usize] = None;
                 } else {

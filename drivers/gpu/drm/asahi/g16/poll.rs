@@ -925,7 +925,10 @@ impl Firmware {
         rmb();
         for p in 0..super::hw::sizes::COMPUTE_PIPES {
             if let Some(f) = oldest_compute[p] {
-                if let Ok(obs) = self.graph.compute[p].fw_stamp.r32(0) {
+                if let Ok(obs) = self.graph.compute[p]
+                    .notifier
+                    .r32(notifier_page::COMPUTE_STAMP)
+                {
                     let reached = if compute_behind[p] {
                         stamp_reached(obs, f.target, self.engine.target[p])
                     } else {
@@ -1290,9 +1293,13 @@ impl Firmware {
                 .is_some()
                 || f.rec[2] != self.channels.producer(Channel::Compute);
             let g = &self.graph.compute[pipe];
+            // Compute `fw_stamp` is ASC-cached (`FwCached`), matching macOS 26B123; the host
+            // checks the uncached compute service stamp that firmware stores strictly after
+            // updating `fw_stamp` and completing work-item, microsequence, and UMA accesses.
             if pipe_behind {
                 let tail = self.engine.target[pipe];
-                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, tail)
+                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+                if !stamp_reached(stamp, f.target, tail)
                     || !self.queue_ring_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
                     || !(f.chan_settled
                         || self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?)
@@ -1300,12 +1307,10 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, tail)
-                    && (stamp != f.target
-                        || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+                full &= stamp != f.target
+                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             } else {
-                if g.fw_stamp.r32(0)? != f.target
+                if g.notifier.r32(notifier_page::COMPUTE_STAMP)? != f.target
                     || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
                     || !(f.chan_settled
                         || self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?)
@@ -1313,8 +1318,7 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
+                full &= g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             }
             let count = f.claims.slot_count as usize;
             full &= count != 0 && count == f.computes as usize;
@@ -1861,7 +1865,9 @@ impl Firmware {
         for p in 0..CP {
             if let Some(f) = fc[p] {
                 next_progress[p] = pending(
-                    g[p].fw_stamp.r32(0).unwrap_or(0),
+                    g[p].notifier
+                        .r32(notifier_page::COMPUTE_STAMP)
+                        .unwrap_or(0),
                     f.target,
                     e.target[p],
                 );
@@ -2147,15 +2153,14 @@ impl Firmware {
 
         dev_info!(
             self.graph.dev.as_ref(),
-            "G16: {}: ctx={} prefixes={} n={} pipe={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
+            "G16: {}: ctx={} prefixes={} n={} pipe={} target={:#x} user={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
             what,
             f.map_or(0, |f| f.job.vm.slot),
             e.flights.len(),
             e.ordinal,
             pipe,
             e.target[pipe],
-            rd(&g.user_stamp, 0),
-            rd(&g.fw_stamp, 0),
+            rd(&g.notifier, notifier_page::COMPUTE_STAMP),
             rd(&g.qstate, qstate::DONE),
             rd(&g.qstate, qstate::READ),
             rd(&g.qstate, qstate::WRITE),
