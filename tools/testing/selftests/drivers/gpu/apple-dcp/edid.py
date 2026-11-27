@@ -181,6 +181,9 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            '/* These scenarios model a Type-C output (dcp-fabric.c decides it in the driver). */\nstatic bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n'+function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
            function('epic/dpavservep.c','static int dcpavserv_revalidate('),function('epic/dpavservep.c','static void dcpavserv_init('),function('epic/dpavservep.c','static void dcpavserv_invalidate_edid('),
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
+           '/* These scenarios have no HDCP channel, as dcp-hdcp-drv.h is without CONFIG_DRM_APPLE_HDCP. */\n'
+           'static const struct apple_epic_service_ops *dcp_hdcp_match_service(struct apple_dcp_afkep *ep, const char *name, bool cut)\n'
+           '{ (void)ep; (void)name; (void)cut; return NULL; }\n',
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
            function('afk.c','static struct apple_epic_service *afk_epic_find_service('),
            function('afk.h','static inline bool afk_service_retired('),function('afk.h','static inline bool afk_service_supersede('),function('afk.c','static bool afk_epic_channel_retired('),
@@ -761,6 +764,9 @@ static int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
     parts = [function('epic/dpavservep.c', 'static void dcpavserv_notify_edid('),
              function('epic/dpavservep.c', 'static void dcpavserv_invalidate_edid('),
              function('epic/dpavservep.c', 'static void dcpavserv_teardown('),
+             '/* No HDCP channel here, as dcp-hdcp-drv.h is without CONFIG_DRM_APPLE_HDCP. */\n'
+             'static struct apple_dcp_afkep *dcp_hdcp_route(struct apple_dcp *dcp, unsigned int endpoint)\n'
+             '{ (void)dcp; (void)endpoint; return NULL; }\n',
              function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
              function('dcp.c', 'static void dcp_recv_msg('),
              function('epic/dpavservep.c', 'static bool dcpavserv_hdr_class('),
@@ -1043,6 +1049,9 @@ rx_unused(apple_rtkit_oslog_rx)
     else:
         parts.append('static void dcp_update_connector_dimensions(struct apple_dcp *d, struct drm_connector *c) { (void)d; (void)c; }')
     parts += [function(iomfb,'void iomfb_recv_msg('),function(af,'int afk_receive_message('),
+              '/* No HDCP channel here, as dcp-hdcp-drv.h is without CONFIG_DRM_APPLE_HDCP. */\n'
+              'static struct apple_dcp_afkep *dcp_hdcp_route(struct apple_dcp *dcp, unsigned int endpoint)\n'
+              '{ (void)dcp; (void)endpoint; return NULL; }\n',
               function(dcp,'static struct apple_dcp_afkep *dcp_afkep('),
               function(dcp,'static void dcp_recv_msg(')]
     # The RX work's dispatch, shared with the messages a firmware sleep holds.

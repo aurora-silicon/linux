@@ -123,6 +123,8 @@ identity+=block(parser,'struct iterator {')+'\n'+fn(parser,'iterator_begin')+'\n
 for name in ['afk_service_reclaimable','afk_service_reinit','afk_service_discard','afk_service_publish','afk_service_matches','afk_service_supersede']:
     identity+=fn(h,name)+'\n'
 identity+=fn(dptx,'dptx_native_controllers_ready')+'\n'+fn(dptx,'dptx_native_controller_prepare')+'\n'+fn(dptx,'dptx_controller_service_init')+'\n'
+# No HDCP channel here, as dcp-hdcp-drv.h is without CONFIG_DRM_APPLE_HDCP.
+identity+='static const struct apple_epic_service_ops *dcp_hdcp_match_service(struct apple_dcp_afkep *ep,const char *name,bool cut){(void)ep;(void)name;(void)cut;return NULL;}\n'
 for name in ['afk_match_service','afk_epic_find_service','afk_discard_pending_open','afk_retry_service_init','afk_service_retry']:
     identity+=fn(afk,name)+'\n'
 service=(A/'dptx-service.h').read_text()
