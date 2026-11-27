@@ -30,12 +30,6 @@
 
 #include "t6050-peripherals.dtsi"
 
-/ {
-	aliases {
-		nvram = &nvram;
-	};
-};
-
 /*
  * The speakers, through the AOP as on J813: the six SN012776 speaker amps on admac-base-ns
  * TX0, their voltage and current sense on RX0 (ADT iop-audio-controller). The jack, the
@@ -212,32 +206,6 @@
  */
 #include "t6050-k114-k116-usb.dtsi"
 #include "t6050-k114-usb.dtsi"
-
-/*
- * The boot NOR. spi-nor reads the part's JEDEC ID itself. The partition is
- * read-only: no program or erase reaches the flash until a later change lifts it.
- */
-&qspi {
-	status = "okay";
-
-	flash@0 {
-		compatible = "jedec,spi-nor";
-		reg = <0>;
-		spi-max-frequency = <25000000>;
-
-		partitions {
-			compatible = "fixed-partitions";
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			nvram: partition@700000 {
-				label = "nvram";
-				reg = <0x700000 0xc0000>;
-				read-only;
-			};
-		};
-	};
-};
 
 /*
  * PCIe port 1: the SD card reader, this board's own beside the shared port 0
