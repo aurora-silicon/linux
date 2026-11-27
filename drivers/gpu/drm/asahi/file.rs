@@ -274,13 +274,15 @@ impl SyncItem {
         in_count: u32,
         out_count: u32,
         allow_cumulative: bool,
-    ) -> Result<KVec<SyncItem>> {
+    ) -> Result<KVVec<SyncItem>> {
         let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         const CHUNK: usize = 8;
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        // Userspace sets the count. Charge the allocation to the caller and
+        // allow noncontiguous backing pages.
+        let mut vec = KVVec::with_capacity(count as usize, GFP_KERNEL_ACCOUNT)?;
         let mut anchor = None;
 
         // Read each record once in small stack chunks so validation and use see the
@@ -313,7 +315,7 @@ impl SyncItem {
                 }
                 vec.push(
                     Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
-                    GFP_KERNEL,
+                    GFP_KERNEL_ACCOUNT,
                 )?;
             }
             base += chunk as u32;
@@ -377,7 +379,7 @@ pub(crate) struct TableQueue {
     queue: KBox<dyn queue::Queue>,
     /// Reusable staging buffer for `SUBMIT` command buffers, avoiding per-submit heap
     /// allocations and keeping large command buffers off the kernel stack.
-    cmdbuf: KVec<u8>,
+    cmdbuf: KVVec<u8>,
     _share: Option<queue_share::Share>,
 }
 
@@ -387,13 +389,13 @@ impl TableQueue {
 
     /// Takes the cached command-buffer staging allocation so userspace copies run outside the
     /// queue mutex (preventing `queue.lock()` -> `mmap_lock` lock-order inversion).
-    fn take_cmdbuf(&mut self) -> KVec<u8> {
+    fn take_cmdbuf(&mut self) -> KVVec<u8> {
         core::mem::take(&mut self.cmdbuf)
     }
 
     /// Returns a cleared command-buffer allocation to the per-queue cache when within the
     /// reuse capacity cap; oversized buffers are dropped.
-    fn return_cmdbuf(&mut self, mut buf: KVec<u8>) {
+    fn return_cmdbuf(&mut self, mut buf: KVVec<u8>) {
         buf.clear();
         if buf.capacity() > 0
             && buf.capacity() <= Self::REUSE_CMDBUF_CAP
@@ -404,11 +406,11 @@ impl TableQueue {
     }
 }
 
-fn copy_cmdbuf_from_user(buf: &mut KVec<u8>, addr: u64, size: usize) -> Result {
+fn copy_cmdbuf_from_user(buf: &mut KVVec<u8>, addr: u64, size: usize) -> Result {
     buf.clear();
     UserSlice::new(UserPtr::from_addr(addr as usize), size)
         .reader()
-        .read_all(buf, GFP_KERNEL)
+        .read_all(buf, GFP_KERNEL_ACCOUNT)
 }
 
 impl Deref for TableQueue {
@@ -1847,7 +1849,7 @@ impl File {
         resv.fill(Arc::pin_init(
             new_mutex!(TableQueue {
                 queue,
-                cmdbuf: KVec::new(),
+                cmdbuf: KVVec::new(),
                 _share: share,
             }),
             GFP_KERNEL,
