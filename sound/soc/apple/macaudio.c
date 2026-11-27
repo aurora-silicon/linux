@@ -4213,27 +4213,6 @@ struct macaudio_platform_cfg macaudio_j714_cfg = {
 };
 
 /*
- * K114s (T6050, MacBook Pro 14" M5 Pro): the J714s's AOP-fed card for the
- * headphone jack only. Its ADT describes the same jack codec, AOP audio
- * service and six SN012776 as the J714s's, but no speaker protection data
- * exists for this chassis, so the speakers stay off as on the J873: no safe
- * level and speakers disabled, so macaudio_speakers_allowed() refuses a
- * speaker link however the DT is written. The jack frame is the J714s's.
- */
-struct macaudio_platform_cfg macaudio_k114_cfg = {
-	.enable_speakers = false,
-	.amp = AMP_SN012776,
-	.speakers = SPKR_2W1T,
-	.stereo = true,
-	.safe_vol = 0,
-	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
-	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
-	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
-		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
-	.spk_secondary_only = true,
-};
-
-/*
  * J815 (T8142, MacBook Air M5 15"): J813's AOP-fed card with six SN012776,
  * two woofers and a tweeter per side, in ADT speaker-config order (left
  * woofer 1, right woofer 1, left tweeter, right tweeter, left woofer 2,
@@ -4544,8 +4523,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
 	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
 	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
-	/* k114    -       sn012776    -       2x 2W+1T (AOP-fed; jack only, speakers off) */
-	{ .compatible = "apple,k114-macaudio", .data = &macaudio_k114_cfg },
+	/* k114    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 14" PROLED chassis, J714's amps and frame) */
+	{ .compatible = "apple,k114-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
