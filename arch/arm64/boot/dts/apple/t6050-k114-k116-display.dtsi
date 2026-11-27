@@ -59,3 +59,53 @@
 		compatible = "apple,panel";
 	};
 };
+
+/*
+ * The external display engines (dcpext0..3, die 0) on the USB-C ports. Each empty
+ * typec-routes container asks the boot loader to write the engine's routes from the ADT
+ * (dp-switch-* on the engine and on each port's direct DP output), for the ports whose PHY,
+ * crossbar and PD controller this tree describes: ATC1 (left-front) and ATC2 (right). The
+ * loader hands an engine over with its routes, or leaves it, and what its routes need,
+ * disabled. dcpext0's route through ATC2 in t6050-die0.dtsi is dropped, with the PHY and
+ * crossbar it names, so that its routes come from the ADT too (the loader writes no routes for
+ * an engine that already names PHYs or crossbars).
+ */
+&dcpext0 {
+	/delete-property/ apple,typec-dptx-phys;
+	/delete-property/ apple,typec-mux-indices;
+	/delete-property/ phys;
+	/delete-property/ phy-names;
+	/delete-property/ mux-controls;
+	/delete-property/ mux-control-names;
+
+	typec-routes {
+		/delete-node/ route@0;
+	};
+};
+
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
