@@ -355,7 +355,8 @@ ASAHI_TESTS = {
     'g17-direct-stage-prefixes-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-staged', 'skip-render-tiling',
                                    'skip-tiling-prefix', 'skip-compute-resolve',
-                                   'skip-eagain-fallback'), []),
+                                   'skip-eagain-fallback', 'skip-other-pair-guard',
+                                   'skip-borrowed-sibling', 'skip-tiling-sibling'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',

@@ -218,6 +218,15 @@ impl crate::g17::Firmware {
         if self.recovery.pending() || self.recovery.generation() != generation {
             return Ok(None);
         }
+        // Check cross-pair dependencies before sampling host growth (which resets
+        // firmware page high-water): `Pair::own_dependencies` only sees `slot`, and
+        // `publication_barriers` skips same-owner renders covered by `wait_through[0]`,
+        // so any sibling pair with live prefix-covered work (resident or borrowed,
+        // under either `wait_through[0]` or `tiling_wait_through[0]`) must fall back
+        // to the device-mutex path.
+        if self.queues.has_other_pair_dependencies(slot, owner, packet)? {
+            return Ok(None);
+        }
         let Ok(entry) = self.queues.render.entry_mut(slot) else {
             return Ok(None);
         };
