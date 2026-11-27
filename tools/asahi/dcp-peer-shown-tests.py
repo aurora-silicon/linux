@@ -455,6 +455,7 @@ struct stop_race_ctx {
 	struct apple_dcp *owner;
 	unsigned int timeout_ms;
 	int ret;
+	atomic_bool done;
 	pthread_mutex_t m;
 	pthread_cond_t cv;
 	bool in_quiesce;
@@ -471,7 +472,7 @@ static void hook_quiesce_race(struct apple_dcp *dcp, struct apple_dcp *peer, int
 	int call = atomic_load(&g_quiesce_calls);
 
 	(void)peer;
-	if (call == 1) {
+	if (ctx && call == 1) {
 		pthread_mutex_lock(&ctx->m);
 		ctx->in_quiesce = true;
 		pthread_cond_broadcast(&ctx->cv);
@@ -492,6 +493,7 @@ static void *stop_wait_worker(void *arg)
 	struct stop_race_ctx *ctx = arg;
 
 	ctx->ret = dcp_peer_stop_wait_v27(ctx->owner, ctx->timeout_ms);
+	atomic_store(&ctx->done, true);
 	return NULL;
 }
 
@@ -635,6 +637,117 @@ static void test_peer_stop_wait(void)
 	assert(ret == -EBUSY);
 	assert(elapsed_ms >= 20 && elapsed_ms < 60);
 	assert(atomic_load(&g_wait_calls) >= 1);
+
+	/*
+	 * 5. In-flight paired modeset clearing active mid-quiesce and setting it
+	 * again on completion does not let a waiter bypass waiting or skip
+	 * stopping the new pair (both when active clears mid-wait and when a
+	 * waiter arrives while active is already false during the transition).
+	 */
+	g_stop_ctx = NULL;
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	mutex_lock_impl(&dcp_peer_lock);
+	smp_store_release(&owner->peer_transition_active, true);
+	mutex_unlock_impl(&dcp_peer_lock);
+
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+	};
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	while (atomic_load(&g_wait_calls) < 1)
+		nanosleep(&(struct timespec){ .tv_nsec = 1000 * 1000 }, NULL);
+
+	mutex_lock_impl(&dcp_peer_lock);
+	owner->peer_frames.active = false;
+	mutex_unlock_impl(&dcp_peer_lock);
+	wake_up_all(&dcp_peer_stop_wq);
+	nanosleep(&(struct timespec){ .tv_nsec = 20 * 1000 * 1000 }, NULL);
+	assert(!atomic_load(&second.done));
+
+	mutex_lock_impl(&dcp_peer_lock);
+	owner->peer_frames.active = true;
+	mutex_unlock_impl(&dcp_peer_lock);
+	dcp_peer_transition_end(owner);
+
+	assert(pthread_join(t2, NULL) == 0);
+	assert(second.ret == 1);
+	assert(atomic_load(&g_quiesce_calls) == 1);
+	assert(!owner->peer_frames.active);
+
+	/* 5b. Waiter arriving while active == false mid-modeset waits and stops new pair. */
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	mutex_lock_impl(&dcp_peer_lock);
+	owner->peer_frames.active = false;
+	smp_store_release(&owner->peer_transition_active, true);
+	mutex_unlock_impl(&dcp_peer_lock);
+
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 1000,
+	};
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	while (atomic_load(&g_wait_calls) < 1)
+		nanosleep(&(struct timespec){ .tv_nsec = 1000 * 1000 }, NULL);
+	nanosleep(&(struct timespec){ .tv_nsec = 20 * 1000 * 1000 }, NULL);
+	assert(!atomic_load(&second.done));
+
+	mutex_lock_impl(&dcp_peer_lock);
+	owner->peer_frames.active = true;
+	mutex_unlock_impl(&dcp_peer_lock);
+	dcp_peer_transition_end(owner);
+
+	assert(pthread_join(t2, NULL) == 0);
+	assert(second.ret == 1);
+	assert(atomic_load(&g_quiesce_calls) == 1);
+	assert(!owner->peer_frames.active);
+
+	/*
+	 * 6. Holding dcp_peer_lock across deadline expiry prevents both initial
+	 * admission and retry admission after a prior -EBUSY from claiming the
+	 * transition or running quiesce past the deadline.
+	 */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 25,
+	};
+	mutex_lock_impl(&dcp_peer_lock);
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	nanosleep(&(struct timespec){ .tv_nsec = 40 * 1000 * 1000 }, NULL);
+	mutex_unlock_impl(&dcp_peer_lock);
+	assert(pthread_join(t2, NULL) == 0);
+	assert(second.ret == -EBUSY);
+	assert(atomic_load(&g_quiesce_calls) == 0);
+	assert(!owner->peer_transition_active);
+	assert(owner->peer_frames.active);
+
+	/* 6b. Retry admission blocked on dcp_peer_lock across expiry is not admitted. */
+	owner->peer_frames.active = true;
+	atomic_store(&g_wait_calls, 0);
+	atomic_store(&g_quiesce_calls, 0);
+	second = (struct stop_race_ctx){
+		.owner = owner,
+		.timeout_ms = 30,
+	};
+	assert(pthread_mutex_lock(&owner->dev->m) == 0);
+	assert(pthread_create(&t2, NULL, stop_wait_worker, &second) == 0);
+	while (atomic_load(&g_wait_calls) < 1)
+		nanosleep(&(struct timespec){ .tv_nsec = 1000 * 1000 }, NULL);
+	mutex_lock_impl(&dcp_peer_lock);
+	assert(pthread_mutex_unlock(&owner->dev->m) == 0);
+	nanosleep(&(struct timespec){ .tv_nsec = 45 * 1000 * 1000 }, NULL);
+	mutex_unlock_impl(&dcp_peer_lock);
+	assert(pthread_join(t2, NULL) == 0);
+	assert(second.ret == -EBUSY);
+	assert(atomic_load(&g_quiesce_calls) == 0);
+	assert(!owner->peer_transition_active);
+	assert(owner->peer_frames.active);
 
 	g_quiesce_hook = NULL;
 	g_stop_ctx = NULL;

@@ -142,7 +142,7 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 			return ret;
 		if (dcp->peer_transition_active)
 			return -EBUSY;
-		WRITE_ONCE(dcp->peer_transition_active, true);
+		smp_store_release(&dcp->peer_transition_active, true);
 	}
 	if (!device_trylock(dcp->dev)) {
 		ret = -EBUSY;
@@ -327,24 +327,30 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 	return 0;
 }
 
-static int dcp_peer_stop_v27_once(struct apple_dcp *dcp, bool *contended)
+static int dcp_peer_stop_v27_once(struct apple_dcp *dcp, bool *contended,
+				  const unsigned long *deadline)
 {
 	struct apple_dcp *peer;
 	int ret = 0;
 
 	if (contended)
 		*contended = false;
-	if (!peer_scanout || !smp_load_acquire(&dcp->peer_frames.active))
+	if (!peer_scanout)
+		return 0;
+	if (!smp_load_acquire(&dcp->peer_transition_active) &&
+	    !smp_load_acquire(&dcp->peer_frames.active))
 		return 0;
 	scoped_guard(mutex, &dcp_peer_lock) {
-		if (!dcp->peer_frames.active)
-			return 0;
 		if (dcp->peer_transition_active) {
 			if (contended)
 				*contended = true;
 			return -EBUSY;
 		}
-		WRITE_ONCE(dcp->peer_transition_active, true);
+		if (!dcp->peer_frames.active)
+			return 0;
+		if (deadline && time_after_eq(jiffies, *deadline))
+			return -EBUSY;
+		smp_store_release(&dcp->peer_transition_active, true);
 	}
 	if (!device_trylock(dcp->dev)) {
 		ret = -EBUSY;
@@ -397,13 +403,14 @@ clear_transition:
 /* Return 1 after a paired stop, 0 for a normal CRTC, or an error. */
 int dcp_peer_stop_v27(struct apple_dcp *dcp)
 {
-	return dcp_peer_stop_v27_once(dcp, NULL);
+	return dcp_peer_stop_v27_once(dcp, NULL, NULL);
 }
 
 /*
  * Stop an active pair, waiting on dcp_peer_stop_wq for any in-flight paired
- * stop or modeset (bounded by timeout_ms) and bounding any remaining transient
- * -EBUSY retries so none start at or after the deadline.
+ * stop or modeset (bounded by timeout_ms) and bounding retry admission so no
+ * new attempt starts at or after the deadline (an already-admitted attempt runs
+ * to completion).
  */
 int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 {
@@ -417,10 +424,11 @@ int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 		u32 seq = READ_ONCE(dcp->peer_transition_seq);
 		unsigned long now, remaining;
 
-		ret = dcp_peer_stop_v27_once(dcp, &contended);
+		ret = dcp_peer_stop_v27_once(dcp, &contended, &deadline);
 		if (ret != -EBUSY)
 			return ret;
-		if (!smp_load_acquire(&dcp->peer_frames.active))
+		if (!smp_load_acquire(&dcp->peer_transition_active) &&
+		    !smp_load_acquire(&dcp->peer_frames.active))
 			return 0;
 		now = jiffies;
 		if (time_after_eq(now, deadline))
@@ -428,18 +436,20 @@ int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
 		remaining = deadline - now;
 		if (contended) {
 			wait_event_timeout(dcp_peer_stop_wq,
-					   (!smp_load_acquire(&dcp->peer_transition_active) &&
-					    READ_ONCE(dcp->peer_transition_seq) != seq) ||
-					   !smp_load_acquire(&dcp->peer_frames.active),
+					   !smp_load_acquire(&dcp->peer_transition_active) &&
+					   (READ_ONCE(dcp->peer_transition_seq) != seq ||
+					    !smp_load_acquire(&dcp->peer_frames.active)),
 					   remaining);
 		} else {
 			wait_event_timeout(dcp_peer_stop_wq,
+					   !smp_load_acquire(&dcp->peer_transition_active) &&
 					   !smp_load_acquire(&dcp->peer_frames.active),
 					   min_t(unsigned long, remaining,
 						 max_t(unsigned long, 1,
 						       msecs_to_jiffies(5))));
 		}
-		if (!smp_load_acquire(&dcp->peer_frames.active))
+		if (!smp_load_acquire(&dcp->peer_transition_active) &&
+		    !smp_load_acquire(&dcp->peer_frames.active))
 			return 0;
 		if (time_after_eq(jiffies, deadline))
 			return -EBUSY;
