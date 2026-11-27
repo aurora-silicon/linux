@@ -11,6 +11,36 @@
  */
 
 /*
+ * The Neural Engine (ADT ane0, "ane,t8132exclave", firmware pre-loaded by iBoot), started only
+ * after the boot loader's preload hand-off
+ */
+#include "t6050-j714s-ane.dtsi"
+
+/*
+ * ANE_SYS's declared suppliers are the fabric domains: enabled the way
+ * the J714s enables them (t6050-j714s.dts for fab8/fab0,
+ * t6050-j716c-isp.dtsi for fab9). Left disabled they never register a
+ * provider and the enabled ps_ane_sys defers forever, taking ane0 and its
+ * three DARTs with it.
+ */
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab9_soc {
+	/delete-property/ power-domains;
+	apple,no-auto-pm;
+	apple,firmware-owned;
+	status = "okay";
+};
+
+/*
  * Pin 112's register takes an SError when read, so only the pins a node names are
  * exposed: 80 (PCIe port 0's PERST#); 106 and 107, the speaker amps' interrupt and
  * shutdown line (ADT audio-speaker, used only where a board describes the amps);
