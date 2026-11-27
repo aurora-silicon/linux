@@ -64,10 +64,26 @@ pub(crate) struct Config {
     pub(crate) host_block_ready: bool,
     /// Whether the TVM gate and firmware warm restart are supported.
     pub(crate) deep_sleep: bool,
+    /// Where a deep sleep stops the firmware.
+    pub(crate) sleep_stop: SleepStop,
+    /// The stop at the commit touches neither the ASC's page nor the GFX word after the idle,
+    /// and the mailbox's interrupt is masked from `.prepare` (G15S).
+    pub(crate) sleep_quiet_stop: bool,
     /// Whether render work accepts scratch for ray queries.
     pub(crate) supports_render_scs: bool,
     /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
     pub(crate) cross_engine_hold: bool,
+}
+
+/// When a deep sleep stops the GPU's firmware and powers its domain off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SleepStop {
+    /// In the sleep's commit, with interrupts off and every refusal behind it. A sleep refused
+    /// before then finds the firmware running; only a real wake restarts it.
+    Commit,
+    /// In `.prepare`, before any other device suspends, as macOS does: the firmware restarts
+    /// warm after every sleep, real or refused.
+    Prepare,
 }
 
 impl Config {
@@ -194,6 +210,8 @@ pub(crate) mod t8132 {
         host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
         host_block_ready: true,
         deep_sleep: true,
+        sleep_stop: super::SleepStop::Commit,
+        sleep_quiet_stop: false,
         supports_render_scs: true,
         cross_engine_hold: false,
     };
@@ -349,7 +367,20 @@ pub(crate) mod t6030 {
         // per-pipe host-block control words cleared before endpoints 0x20/0x21 start.
         host_block_zero_order: &[0, 0x1808, 0x3010],
         host_block_ready: false,
-        deep_sleep: false,
+        // macOS 27.2 on J516s stops the GPU in its device sleep, before any display request
+        // goes, 4.1 to 4.5 s before the commit: AP and IOP IDLE, the mailbox's receive off, the
+        // PMP's AGX request withdrawn, then the GFX word off. Its wake raises GFX, makes the
+        // request again and takes the firmware's HELLO. The same in all three full records
+        // (s2r-trace ref/t6030-macos-s2r-{entry,wake}-full-{1,2,3}.tsv). There is no TVM gate:
+        // AFR and the GPU PMGR's other blocks are the sleep controller's.
+        //
+        // MEAS J516s (pm_test=devices): Linux can't stop it there. After the idle the ASC's page
+        // doesn't answer, every AP write taking GFX out of automatic power resets the SoC, and
+        // the idled firmware answers neither IOP INIT nor IOP ON without a reset. So the idle
+        // waits for the commit, after which only a real wake (a reset) follows.
+        deep_sleep: true,
+        sleep_stop: super::SleepStop::Commit,
+        sleep_quiet_stop: true,
         supports_render_scs: false,
         cross_engine_hold: true,
     };

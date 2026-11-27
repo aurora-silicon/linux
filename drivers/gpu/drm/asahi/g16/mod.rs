@@ -698,6 +698,9 @@ impl Gpu {
         let firmware = Firmware::start_backend(dev, cfg, booted, &shared, power)?;
         let vms = firmware.vms.clone();
         *shared.state.lock() = Some(firmware);
+        // The PMP's request for the GPU while its firmware runs, where the device tree names
+        // one: macOS holds it from its GPU's start (T6030 PTD request bit 4).
+        shared.pmp_request(true);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
             dev_warn!(dev.as_ref(), "G16: no aurora-g16 debugfs ({:?})\n", error);
