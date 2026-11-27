@@ -149,7 +149,8 @@ struct apple_pmc {
  * @floor: the domain is a rail floor held through the AP's agent
  * @rail: with @floor, the rail
  * @level: with @floor, the performance state held while powered
- * @on: with @floor, whether the floor is held; protected by pmc->lock
+ * @on: with @floor or @interface, whether the domain is powered; protected by
+ *	pmc->lock
  * @cluster: the domain is a cluster enable bit in the "clusters" region
  * @bit: with @cluster, the bit in the control and status words
  * @interface: the domain is a display pipe's BWR and boost interface enables
@@ -763,22 +764,19 @@ static int apple_pmc_interface_update(struct apple_pmc *pmc, u32 offset,
 }
 
 /*
- * Set or clear the boost and BWR enables of a display pipe. If the BWR
- * enable does not take the change, put the boost enable back to what it
- * was: genpd keeps the domain in its old state when a callback fails, and
- * a boost enable that was already set, such as one the boot loader left
- * for a running pipe, must not be lost to a failed power on. Called with
- * IRQs off for an IRQ-safe domain; everything here is atomic.
+ * Caller holds pmc->lock. Set or clear the boost and BWR enables of a display
+ * pipe. If the BWR enable does not take the change, put the boost enable back
+ * to what it was: genpd keeps the domain in its old state when a callback
+ * fails, and a boost enable that was already set, such as one the boot loader
+ * left for a running pipe, must not be lost to a failed power on.
  */
-static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
+static int apple_pmc_interface_apply(struct apple_pmc_domain *dom, bool on)
 {
 	struct apple_pmc *pmc = dom->pmc;
 	const struct apple_pmc_hw *hw = pmc->hw;
-	unsigned long flags;
 	bool boost;
 	int ret;
 
-	raw_spin_lock_irqsave(&pmc->lock, flags);
 	boost = apple_pmc_interface_read(pmc, hw->boost_enable) & BIT(dom->boost_bit);
 	ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit, on);
 	if (!ret) {
@@ -787,7 +785,49 @@ static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
 			apple_pmc_interface_update(pmc, hw->boost_enable,
 						   dom->boost_bit, boost);
 	}
+
+	return ret;
+}
+
+/*
+ * Set or clear the boost and BWR enables of a display pipe. Called with IRQs
+ * off for an IRQ-safe domain; everything here is atomic.
+ */
+static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
+{
+	struct apple_pmc *pmc = dom->pmc;
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	ret = apple_pmc_interface_apply(dom, on);
+	if (!ret)
+		dom->on = on;
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	return ret;
+}
+
+/*
+ * Caller holds pmc->lock. Restore the BWR and boost interface enables of
+ * powered genpd interface domains after deep sleep, which clears them while
+ * genpd still tracks the domains as on. Consumer-switched interfaces are
+ * managed by their consumer and left alone.
+ */
+static int apple_pmc_interfaces_restore(struct apple_pmc *pmc)
+{
+	struct apple_pmc_domain *dom;
+	int ret = 0, err;
+
+	if (!pmc->hw->bwr_enable || !pmc->hw->boost_enable)
+		return 0;
+
+	list_for_each_entry(dom, &pmc->domains, list) {
+		if (!dom->interface || dom->consumer_switched || !dom->on)
+			continue;
+		err = apple_pmc_interface_apply(dom, true);
+		ret = ret ?: err;
+	}
 
 	return ret;
 }
@@ -1096,6 +1136,7 @@ static int apple_pmc_interface_init(struct apple_pmc *pmc,
 	bool on = (pmc->saved_bwr & BIT(dom->bwr_bit)) &&
 		  (pmc->saved_boost & BIT(dom->boost_bit));
 
+	dom->on = on;
 	dom->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	dom->genpd.power_on = apple_pmc_domain_power_on;
 	dom->genpd.power_off = apple_pmc_domain_power_off;
@@ -1578,6 +1619,8 @@ static int apple_pmc_resume_early(struct device *dev)
 		err = apple_pmc_dcs_vote(pmc);
 		ret = ret ?: err;
 	}
+	err = apple_pmc_interfaces_restore(pmc);
+	ret = ret ?: err;
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 	if (ret)
 		dev_err(dev, "state not restored after sleep: %d\n", ret);
