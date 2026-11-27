@@ -100,7 +100,17 @@ where
         self.ring.state.with(|raw, _inner| {
             let wptr = T::wptr(raw, index);
             let rptr = &mut self.rptr[index];
-            if wptr == *rptr {
+            if wptr >= self.count {
+                // The firmware writes this pointer. One outside the ring never equals our read
+                // pointer, so the receive loops would spin on stale entries forever: treat the
+                // channel as empty instead.
+                kernel::pr_err_once!(
+                    "RxChannel: firmware write pointer {} outside the {}-entry ring\n",
+                    wptr,
+                    self.count
+                );
+                None
+            } else if wptr == *rptr {
                 None
             } else {
                 let off = self.count as usize * index;

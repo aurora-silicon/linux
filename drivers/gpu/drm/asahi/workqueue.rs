@@ -563,10 +563,12 @@ impl Job::ver {
         // The done pointer is written by the firmware. One inside the slots this job is about to
         // fill does not match our own count of pending commands: refuse the job rather than
         // overwrite entries the firmware may still read.
+        // A done pointer outside the ring is no position at all: refuse it as well.
         let doneptr = inner.doneptr();
-        if ring_reaches_done(wptr, command_count, inner.size, doneptr) {
-            pr_err!(
-                "WorkQueue: firmware done pointer {} inside the {} slots after {} (ring size {})\n",
+        if doneptr >= inner.size || ring_reaches_done(wptr, command_count, inner.size, doneptr) {
+            // Every refused job would log again; the first report is the useful one.
+            kernel::pr_err_once!(
+                "WorkQueue: firmware done pointer {} out of range or inside the {} slots after {} (ring size {})\n",
                 doneptr,
                 command_count,
                 wptr,
@@ -1229,7 +1231,8 @@ mod tests {
         assert!(ring_reaches_done(5, 3, 8, 6));
         assert!(ring_reaches_done(5, 3, 8, 0));
         assert!(!ring_reaches_done(5, 3, 8, 1));
-        // A done pointer outside the ring never matches.
+        // A done pointer outside the ring never matches here; submit() refuses it on its own
+        // (`doneptr >= size`) before asking.
         assert!(!ring_reaches_done(5, 3, 8, 8));
         assert!(!ring_reaches_done(5, 3, 8, u32::MAX));
     }
