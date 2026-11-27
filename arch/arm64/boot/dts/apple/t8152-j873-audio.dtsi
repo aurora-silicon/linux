@@ -186,14 +186,15 @@
 			/*
 			 * Bound by name to the firmware's "audio" EPIC service.
 			 * ADT iop-audio-controller: cout/cin on base-ns TX5/RX5,
-			 * spkr on TX1 with its sense data on RX1; Linux ADMAC
-			 * channel = 2 * N for TX N, 2 * N + 1 for RX N.
+			 * spkr on TX1 (ADT audio-speaker has speaker-protection = 0
+			 * and zero RX sense slots, so no "sense" DMA channel);
+			 * Linux ADMAC channel = 2 * N for TX N, 2 * N + 1 for RX N.
 			 */
 			aop_audio: audio {
 				compatible = "apple,t8152-aop-audio";
 				dmas = <&admac_base_ns 10>, <&admac_base_ns 11>,
-				       <&admac_base_ns 2>, <&admac_base_ns 3>;
-				dma-names = "cout", "cin", "spkr", "sense";
+				       <&admac_base_ns 2>;
+				dma-names = "cout", "cin", "spkr";
 				power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
 						<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
 						<&ps_audio_mca4_m>, <&ps_audio_mca5_m>;
