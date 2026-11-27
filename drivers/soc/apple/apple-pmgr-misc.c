@@ -242,6 +242,7 @@ static struct {
 	unsigned int busy_count;
 	u64 busy_since_ns;
 	u64 busy_ns;
+	bool wake_pending;
 	struct apple_pmgr_misc *wake;
 } apple_pmgr_gpu = {
 	.lock = __SPIN_LOCK_UNLOCKED(apple_pmgr_gpu.lock),
@@ -1005,6 +1006,17 @@ static void apple_pmgr_gpu_wake_set(struct apple_pmgr_misc *misc)
 
 	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
 	apple_pmgr_gpu.wake = misc;
+	if (!misc)
+		apple_pmgr_gpu.wake_pending = false;
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+}
+
+static void apple_pmgr_gpu_wake_clear(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	apple_pmgr_gpu.wake_pending = false;
 	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 }
 
@@ -1133,6 +1145,7 @@ int apple_pmgr_gpu_busy_get(void)
 			 * locks or run in atomic context. Pull in both a
 			 * deferrable wait and a longer IDLE-tier poll.
 			 */
+			apple_pmgr_gpu.wake_pending = true;
 			cancel_delayed_work(&misc->idle_work);
 			mod_delayed_work(system_freezable_power_efficient_wq,
 					 &misc->idle_work_prompt, 0);
@@ -1153,8 +1166,11 @@ void apple_pmgr_gpu_busy_put(void)
 		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 		return;
 	}
-	if (--apple_pmgr_gpu.busy_count == 0 && now > apple_pmgr_gpu.busy_since_ns)
-		apple_pmgr_gpu.busy_ns += now - apple_pmgr_gpu.busy_since_ns;
+	if (--apple_pmgr_gpu.busy_count == 0) {
+		apple_pmgr_gpu.wake_pending = false;
+		if (now > apple_pmgr_gpu.busy_since_ns)
+			apple_pmgr_gpu.busy_ns += now - apple_pmgr_gpu.busy_since_ns;
+	}
 	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_gpu_busy_put);
@@ -1364,47 +1380,48 @@ static bool apple_pmgr_cpus_at_min(void)
 static void apple_pmgr_queue_work(struct apple_pmgr_misc *misc,
 				  bool deferrable, unsigned int delay_ms)
 {
-	unsigned long delay = msecs_to_jiffies(delay_ms);
+	unsigned long delay;
 	unsigned long flags;
-	bool gpu_busy;
+	bool gpu_busy, wake_pending;
 
 	lockdep_assert_held(&misc->lock);
 	/*
 	 * Freezable, so it stops before devices suspend. Queued under
 	 * misc->lock so teardown setting sleeping=true prevents any
 	 * cross-requeue between idle_work and idle_work_prompt.
+	 *
+	 * Hold apple_pmgr_gpu.lock across the cancel/requeue decision so a
+	 * 0 -> 1 GPU busy edge in apple_pmgr_gpu_busy_get() cannot race
+	 * between reading busy_count and updating the workqueues.
+	 * Lock order: misc->lock -> apple_pmgr_gpu.lock -> workqueue/timer locks.
 	 */
-	if (deferrable) {
-		cancel_delayed_work(&misc->idle_work_prompt);
-		/*
-		 * Serialize with apple_pmgr_gpu_busy_get() so a 0 -> 1 GPU
-		 * edge racing with this re-arm cannot leave deferrable work
-		 * pending while GPU work is in flight.
-		 */
-		spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
-		gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
-			   apple_pmgr_gpu.busy_count > 0;
-		if (gpu_busy)
-			mod_delayed_work(system_freezable_power_efficient_wq,
-					 &misc->idle_work_prompt, 0);
-		else
-			queue_delayed_work(system_freezable_power_efficient_wq,
-					   &misc->idle_work, delay);
-		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
-	} else {
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
+		   apple_pmgr_gpu.busy_count > 0;
+	wake_pending = gpu_busy && apple_pmgr_gpu.wake_pending;
+	apple_pmgr_gpu.wake_pending = false;
+
+	if (gpu_busy) {
 		cancel_delayed_work(&misc->idle_work);
-		spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
-		gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
-			   apple_pmgr_gpu.busy_count > 0;
-		if (gpu_busy && delay_ms > APPLE_PMGR_TIER_SAMPLE_MS)
-			delay = 0;
+		delay = wake_pending ? 0 :
+			msecs_to_jiffies(min_t(unsigned int, delay_ms,
+					       APPLE_PMGR_TIER_SAMPLE_MS));
 		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &misc->idle_work_prompt, delay);
-		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+	} else if (deferrable) {
+		cancel_delayed_work(&misc->idle_work_prompt);
+		queue_delayed_work(system_freezable_power_efficient_wq,
+				   &misc->idle_work, msecs_to_jiffies(delay_ms));
+	} else {
+		cancel_delayed_work(&misc->idle_work);
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &misc->idle_work_prompt,
+				 msecs_to_jiffies(delay_ms));
 	}
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 }
 
-static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
+static void apple_pmgr_tiered_eval_locked(struct apple_pmgr_misc *misc, u64 now)
 {
 	unsigned int idle_fab = READ_ONCE(idle_fabric_pstate);
 	unsigned int idle_dcs = READ_ONCE(idle_dcs_pstate);
@@ -1416,9 +1433,10 @@ static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
 	bool hard_override, primed;
 	int ret;
 
-	guard(mutex)(&misc->lock);
+	lockdep_assert_held(&misc->lock);
 	if (misc->sleeping)
 		return;
+	apple_pmgr_gpu_wake_clear();
 	if (!idle_fab && !idle_dcs) {
 		apple_pmgr_apply_targets(misc, active_fab, active_dcs);
 		if (!misc->pmp_owned)
@@ -1469,6 +1487,12 @@ static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
 		apple_pmgr_queue_work(misc, false, APPLE_PMGR_TIER_SAMPLE_MS);
 }
 
+static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
+{
+	guard(mutex)(&misc->lock);
+	apple_pmgr_tiered_eval_locked(misc, now);
+}
+
 static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 {
 	unsigned int idle_fab = READ_ONCE(idle_fabric_pstate);
@@ -1490,6 +1514,7 @@ static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 	scoped_guard(mutex, &misc->lock) {
 		if (misc->sleeping)
 			return;
+		apple_pmgr_gpu_wake_clear();
 		can_scale_fab = idle_fab && idle_fab < active_fab;
 		can_scale_dcs = idle_dcs && idle_dcs < active_dcs &&
 				misc->devices[DEV_DCS].base && !misc->dcs_data &&
