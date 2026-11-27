@@ -7,6 +7,8 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/hwmon.h>
+#include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -59,6 +61,15 @@ struct asahi_stats_attribute {
 	asahi_stats_suspend_fn suspend;
 	asahi_stats_frequency_fn frequency;
 	struct notifier_block pm_notifier;
+#if IS_REACHABLE(CONFIG_HWMON)
+	struct device *hwmon;
+	struct mutex hwmon_lock;
+	ktime_t hwmon_at;
+	struct asahi_qualified_stats hwmon_snap;
+	bool hwmon_has_power;
+	bool hwmon_has_temp;
+	bool hwmon_has_freq;
+#endif
 };
 
 /* 0: unavailable, 1: valid, 2: stale, 3: unsupported; matches g17::telemetry. */
@@ -136,8 +147,15 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 		n += sysfs_emit_at(buf, n, "busy_ns stale\n");
 	else
 		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
-	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"
-			   "temperature_raw unsupported\n");
+	if (snap.power_status == 1)
+		n += sysfs_emit_at(buf, n, "power_mw %u\n", snap.power_mw);
+	else
+		n += sysfs_emit_at(buf, n, "power_mw unsupported\n");
+	n += sysfs_emit_at(buf, n, "temperature_raw unsupported\n");
+	if (snap.temp_status == 1)
+		n += sysfs_emit_at(buf, n, "hotspot_temperature_mc %d\n", snap.temp_mc);
+	else
+		n += sysfs_emit_at(buf, n, "hotspot_temperature_mc unsupported\n");
 	n += sysfs_emit_at(buf, n, "utilisation_source firmware-statistics-tag-0x13\n"
 			   "utilisation_samples %llu\n"
 			   "utilisation_host_ns %llu\n",
@@ -276,6 +294,162 @@ static ssize_t gpu_mem_limit_pct_store(struct device *dev,
 	return count;
 }
 
+#if IS_REACHABLE(CONFIG_HWMON)
+#define ASAHI_HWMON_CACHE_NS	250000000LL
+
+static void asahi_hwmon_sample(struct asahi_stats_attribute *stats,
+			       struct asahi_qualified_stats *out)
+{
+	ktime_t now = ktime_get();
+
+	mutex_lock(&stats->hwmon_lock);
+	if (!stats->hwmon_at || ktime_sub(now, stats->hwmon_at) >= ASAHI_HWMON_CACHE_NS) {
+		stats->read(stats->snapshot, &stats->hwmon_snap);
+		stats->hwmon_at = now ? now : 1;
+	}
+	*out = stats->hwmon_snap;
+	mutex_unlock(&stats->hwmon_lock);
+}
+
+static umode_t asahi_hwmon_is_visible(const void *data,
+				      enum hwmon_sensor_types type,
+				      u32 attr, int channel)
+{
+	const struct asahi_stats_attribute *stats = data;
+
+	switch (type) {
+	case hwmon_temp:
+		return stats->hwmon_has_temp ? 0444 : 0;
+	case hwmon_power:
+		return stats->hwmon_has_power ? 0444 : 0;
+	default:
+		return 0;
+	}
+}
+
+static int asahi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			    u32 attr, int channel, long *val)
+{
+	struct asahi_stats_attribute *stats = dev_get_drvdata(dev);
+	struct asahi_qualified_stats snap;
+
+	asahi_hwmon_sample(stats, &snap);
+
+	switch (type) {
+	case hwmon_temp:
+		if (attr != hwmon_temp_input)
+			return -EOPNOTSUPP;
+		if (snap.temp_status != 1)
+			return -ENODATA;
+		*val = snap.temp_mc;
+		return 0;
+	case hwmon_power:
+		if (attr != hwmon_power_input && attr != hwmon_power_average)
+			return -EOPNOTSUPP;
+		if (snap.power_status != 1)
+			return -ENODATA;
+		*val = (long)((u64)snap.power_mw * 1000ULL);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int asahi_hwmon_read_string(struct device *dev,
+				   enum hwmon_sensor_types type, u32 attr,
+				   int channel, const char **str)
+{
+	switch (type) {
+	case hwmon_temp:
+		*str = "SoC hotspot";
+		return 0;
+	case hwmon_power:
+		*str = "GPU";
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static const struct hwmon_channel_info *const asahi_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_AVERAGE | HWMON_P_LABEL),
+	NULL
+};
+
+static const struct hwmon_ops asahi_hwmon_ops = {
+	.is_visible = asahi_hwmon_is_visible,
+	.read = asahi_hwmon_read,
+	.read_string = asahi_hwmon_read_string,
+};
+
+static const struct hwmon_chip_info asahi_hwmon_chip = {
+	.ops = &asahi_hwmon_ops,
+	.info = asahi_hwmon_info,
+};
+
+static ssize_t freq1_input_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct asahi_stats_attribute *stats = dev_get_drvdata(dev);
+	struct asahi_qualified_stats snap;
+
+	asahi_hwmon_sample(stats, &snap);
+	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
+		return sysfs_emit(buf, "%llu\n",
+				  (unsigned long long)snap.achieved_frequency_hz);
+	return -ENODATA;
+}
+static DEVICE_ATTR_RO(freq1_input);
+
+static ssize_t freq1_label_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "sclk\n");
+}
+static DEVICE_ATTR_RO(freq1_label);
+
+static struct attribute *asahi_hwmon_attrs[] = {
+	&dev_attr_freq1_input.attr,
+	&dev_attr_freq1_label.attr,
+	NULL,
+};
+
+static const struct attribute_group asahi_hwmon_group = {
+	.attrs = asahi_hwmon_attrs,
+};
+
+static const struct attribute_group *asahi_hwmon_groups[] = {
+	&asahi_hwmon_group,
+	NULL,
+};
+
+static void asahi_hwmon_register(struct device *dev,
+				 struct asahi_stats_attribute *stats)
+{
+	struct asahi_qualified_stats probe;
+	struct device *hwmon;
+
+	mutex_init(&stats->hwmon_lock);
+	stats->read(stats->snapshot, &probe);
+	stats->hwmon_has_power = probe.power_status != 3;
+	stats->hwmon_has_temp = probe.temp_status != 3;
+	stats->hwmon_has_freq = probe.pstate_status != 3;
+
+	if (!stats->hwmon_has_power && !stats->hwmon_has_temp && !stats->hwmon_has_freq)
+		return;
+
+	hwmon = hwmon_device_register_with_info(dev, "asahi_gpu", stats,
+						&asahi_hwmon_chip,
+						stats->hwmon_has_freq ? asahi_hwmon_groups : NULL);
+	if (IS_ERR(hwmon)) {
+		dev_warn(dev, "GPU sensors not registered (%pe)\n", hwmon);
+		return;
+	}
+	stats->hwmon = hwmon;
+}
+#endif
+
 /*
  * Called from Rust's `AsahiDriver::probe` after the DRM device is
  * registered. Returns 0 on success, or a negative errno.
@@ -294,7 +468,9 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 
 	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, util_host_ns) != 24);
 	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, busy_ns) != 56);
-	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 80);
+	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, power_status) != 80);
+	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, temp_mc) != 92);
+	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 96);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, refused) != 24);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, client_limit) != 40);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, user_kept) != 48);
@@ -367,6 +543,11 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 		return ret;
 	}
 
+#if IS_REACHABLE(CONFIG_HWMON)
+	if (stats->read)
+		asahi_hwmon_register(dev, stats);
+#endif
+
 	*handle = stats;
 	return 0;
 }
@@ -418,6 +599,13 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 
 	if (!dev || !stats)
 		return;
+
+#if IS_REACHABLE(CONFIG_HWMON)
+	if (stats->hwmon)
+		hwmon_device_unregister(stats->hwmon);
+	if (stats->read)
+		mutex_destroy(&stats->hwmon_lock);
+#endif
 
 	/* Both notifier removal and file removal join readers of the Rust Arc. */
 	if (stats->suspend)

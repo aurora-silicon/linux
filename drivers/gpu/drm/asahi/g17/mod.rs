@@ -2241,7 +2241,7 @@ impl Gpu {
         )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
+                g17_reader: Some(stats::Reader::new(shared.clone(), frequencies)),
                 ..Default::default()
             },
             GFP_KERNEL,
