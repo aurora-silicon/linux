@@ -41,7 +41,6 @@ appledrm-y += epic/dpavservep.o
 appledrm-y += epic/panelavep.o
 appledrm-y += plane.o
 appledrm-y += dcp-indicator.o
-appledrm-$(CONFIG_DRM_APPLE_HDCP) += dcp-hdcp.o dcp-hdcp-tx.o
 
 
 appledrm-$(CONFIG_TRACING) += trace.o
@@ -51,8 +50,6 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-indicator-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
-obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-hdcp-test.o
-obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-hdcp-wire-test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_cec_test.o
