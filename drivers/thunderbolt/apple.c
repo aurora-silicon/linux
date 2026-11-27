@@ -2798,7 +2798,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC |
-			   QUIRK_TMU_HIFI_BI;
+			   QUIRK_TMU_HIFI_BI | QUIRK_NO_RETIMER_SCAN;
 	if (anhi->nhi.host_dp_policy)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
 	if (acio->hw->no_host_clx)

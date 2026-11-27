@@ -8,7 +8,6 @@
  */
 
 #include <linux/delay.h>
-#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/sched/signal.h>
 
@@ -503,19 +502,15 @@ static struct tb_retimer *tb_port_find_retimer(struct tb_port *port, u8 index)
 }
 
 /*
- * TEST (J714s, sv6u5): macOS sends no retimer sideband operation on the links of this machine's
- * USB4 routers: no retimer enumeration and no access to a retimer index, only reads of the
- * routers' own sideband registers (runs mxt6 and mxt6b, two wakes and two sleeps), and its host
- * router firmware logs no retimer command timeout. The scan below makes that firmware time out
- * a retimer command three times at each dock enumeration (every Linux run since sv6t4). Skip it
- * here, as macOS does.
+ * Skip USB4 retimer sideband scanning on host routers that do not support it
+ * (macOS sends no retimer sideband operations on Apple USB4 host routers).
  */
 static bool tb_retimer_scan_skip(struct tb_port *port)
 {
-	if (!(port->sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) ||
-	    !(of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c")))
+	if (!(port->sw->tb->nhi->quirks & QUIRK_NO_RETIMER_SCAN))
 		return false;
-	tb_port_info(port, "TEST sv6u5: no retimer scan on this link (macOS sends no retimer sideband operation)\n");
+
+	tb_port_dbg(port, "skipping retimer scan (QUIRK_NO_RETIMER_SCAN)\n");
 	return true;
 }
 
