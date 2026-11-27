@@ -1088,7 +1088,7 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 
 	if (priv->info->lazy_verify) {
 		int pstate = apple_soc_cpufreq_drain(priv);
-		unsigned int freq;
+		unsigned int old_freq, freq;
 		unsigned long flags;
 		int ret;
 
@@ -1103,6 +1103,10 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 		if (pstate < 0)
 			pstate = priv->expected_pstate;
 		pstate = apple_soc_cpufreq_clamp_pstate(priv, pstate);
+		old_freq = apple_soc_cpufreq_pstate_freq(policy,
+							 priv->expected_pstate);
+		if (!old_freq && priv->expected_pstate == priv->cap_pstate)
+			old_freq = priv->cap_freq;
 		raw_spin_unlock_irqrestore(&priv->lock, flags);
 
 		ret = apple_soc_cpufreq_set_pstate(priv, pstate);
@@ -1117,8 +1121,17 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 			return ret;
 		}
 		freq = apple_soc_cpufreq_pstate_freq(policy, pstate);
-		if (freq)
+		if (policy->suspend_freq && freq && freq != old_freq) {
+			struct cpufreq_freqs freqs = {
+				.old = old_freq ?: READ_ONCE(policy->cur),
+				.new = freq,
+			};
+
+			cpufreq_freq_transition_begin(policy, &freqs);
+			cpufreq_freq_transition_end(policy, &freqs, 0);
+		} else if (freq) {
 			apple_soc_cpufreq_record_cur(policy, freq, true);
+		}
 		return 0;
 	}
 

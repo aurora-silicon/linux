@@ -23,6 +23,7 @@
 #include <linux/delay.h>
 #include <linux/irqflags.h>
 #include <linux/kernfs.h>
+#include <trace/events/power.h>
 
 #define CFT_REGS_SIZE	0x100
 #define CFT_NR_STATES	5
@@ -2601,17 +2602,42 @@ static void cft_test_stats_busy_then_discard(struct kunit *test)
 	cft_expect_freq_scale(test, policy, 3000000);
 }
 
+struct cft_freq_trace {
+	unsigned int cpu;
+	unsigned int count;
+	unsigned int last_freq;
+};
+
+static void cft_trace_cpu_freq(void *data, unsigned int freq,
+			       unsigned int cpu_id)
+{
+	struct cft_freq_trace *t = data;
+
+	if (cpu_id != t->cpu)
+		return;
+	t->last_freq = freq;
+	t->count++;
+}
+
+static void cft_unregister_freq_trace(void *data)
+{
+	unregister_trace_cpu_frequency(cft_trace_cpu_freq, data);
+	tracepoint_synchronize_unregister();
+}
+
 /*
  * Queueing a fast-switch request behind BUSY and then hitting a failed suspend
  * toward suspend_freq must restore policy->cur to the accepted hardware state
- * and keep cpufreq_stats residency/transitions strictly on that state, never
- * charging the discarded queued request or a spurious suspend target.
+ * and keep cpufreq_stats residency/transitions, FIE scale, and trace events
+ * strictly on that state; a subsequent successful suspend must update
+ * policy->cur, stats, FIE scale, and emit power:cpu_frequency once.
  */
 static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 {
 	struct cpufreq_policy *policy;
 	struct apple_cpu_priv *priv = cft_live_priv;
 	struct freq_qos_request *user_req, *min_req;
+	struct cft_freq_trace trace_ctx = {};
 	unsigned int total, c_1200_3000, c_1200_600, c_600_3000, c_600_1200;
 	unsigned int c_3000_600;
 	u64 t1200_before, t3000_before, t600_before;
@@ -2625,6 +2651,19 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 	cft_live_add_qos(test, policy, &min_req, FREQ_QOS_MIN, 600000);
 	flush_work(&policy->update);
 	cft_live_reset_t6050(policy);
+
+	if (IS_ENABLED(CONFIG_TRACEPOINTS)) {
+		trace_ctx.cpu = policy->cpu;
+		KUNIT_ASSERT_EQ(test,
+				register_trace_cpu_frequency(cft_trace_cpu_freq,
+							     &trace_ctx),
+				0);
+		KUNIT_ASSERT_EQ(test,
+				kunit_add_action_or_reset(test,
+							  cft_unregister_freq_trace,
+							  &trace_ctx),
+				0);
+	}
 
 	/* Put hardware cleanly at 1.2 GHz (pstate 4). */
 	freq = cpufreq_driver_fast_switch(policy, 1200000);
@@ -2656,14 +2695,18 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 
 	/*
 	 * Suspend toward 600 MHz while BUSY persists: suspend fails without
-	 * charging 3 GHz or 600 MHz.
+	 * charging 3 GHz or 600 MHz or emitting power:cpu_frequency.
 	 */
+	trace_ctx.count = 0;
+	trace_ctx.last_freq = 0;
 	policy->suspend_freq = 600000;
 	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_suspend(policy), -EIO);
 	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
 	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
 	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
 	cft_expect_freq_scale(test, policy, 1200000);
+	if (IS_ENABLED(CONFIG_TRACEPOINTS))
+		KUNIT_EXPECT_EQ(test, trace_ctx.count, 0U);
 
 	msleep(25);
 	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
@@ -2686,7 +2729,8 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 
 	/*
 	 * When DVFS clears BUSY before suspend runs, suspend drops the queued
-	 * 3 GHz request and transitions directly from 1.2 GHz to 600 MHz.
+	 * 3 GHz request and transitions directly from 1.2 GHz to 600 MHz,
+	 * emitting power:cpu_frequency once.
 	 */
 	priv->transition_failed = false;
 	cft_set_cmd(cft_live_regs, 4 | APPLE_DVFS_CMD_BUSY);
@@ -2695,12 +2739,18 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, freq, 3000000U);
 	KUNIT_EXPECT_EQ(test, priv->pending_pstate, 15);
 
+	trace_ctx.count = 0;
+	trace_ctx.last_freq = 0;
 	cft_set_cmd(cft_live_regs, 4);
 	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_suspend(policy), 0);
 	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 1ULL);
 	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 1U);
 	KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
 	cft_expect_freq_scale(test, policy, 600000);
+	if (IS_ENABLED(CONFIG_TRACEPOINTS)) {
+		KUNIT_EXPECT_EQ(test, trace_ctx.count, 1U);
+		KUNIT_EXPECT_EQ(test, trace_ctx.last_freq, 600000U);
+	}
 	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 1);
 	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 1200000, 600000),
 			c_1200_600 + 1);
@@ -2708,6 +2758,14 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 			c_1200_3000);
 	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 3000000, 600000),
 			c_3000_600);
+
+	/* Suspending at the already-settled frequency emits no extra trace or transition. */
+	trace_ctx.count = 0;
+	trace_ctx.last_freq = 0;
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_suspend(policy), 0);
+	if (IS_ENABLED(CONFIG_TRACEPOINTS))
+		KUNIT_EXPECT_EQ(test, trace_ctx.count, 0U);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total + 1);
 }
 
 static void cft_live_queue_3g_at_1200(struct kunit *test,
