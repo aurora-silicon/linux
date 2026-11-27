@@ -173,6 +173,30 @@
 &pmc {
 	apple,static-voters = <3>;
 	status = "okay";
+
+	/*
+	 * The ProRes engine has no voter agent of its own: its time per frame
+	 * follows the DCS and SoC fabric states the AP agent votes for, which
+	 * the CLPC raises only for CPU load. It holds DCS 5 and SoC 3, the
+	 * states the CLPC votes under load, while it runs.
+	 */
+	pmc_apr_dcs: floor-apr-dcs {
+		label = "apr-dcs";
+		#power-domain-cells = <0>;
+		apple,rail = <0>;
+		apple,level = <5>;
+	};
+
+	pmc_apr_soc: floor-apr-soc {
+		label = "apr-soc";
+		#power-domain-cells = <0>;
+		apple,rail = <1>;
+		apple,level = <3>;
+	};
+};
+
+&apr {
+	power-domains = <&ps_scodec>, <&pmc_apr_dcs>, <&pmc_apr_soc>;
 };
 
 &sep_mbox {
