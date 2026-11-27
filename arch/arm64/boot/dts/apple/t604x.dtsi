@@ -1860,10 +1860,10 @@
 	};
 
 	/*
-	 * Disabled until the H16 firmware path is proven on hardware. The
-	 * loader fills the preload reservations and the firmware IOVAs from
-	 * the ADT, so enabling it then only takes status = "okay" here and on
-	 * the three DARTs.
+	 * Off here; each board enables it with its memory-region
+	 * (t6041.dtsi for J575c/J614c/J616c, t604x-j614-j616.dtsi for
+	 * J614s/J616s, and t6040-j773s.dts for J773s). The loader fills
+	 * the preload reservations and firmware IOVAs from the ADT.
 	 */
 	ane: ane@484000000 {
 		compatible = "apple,t6041-ane";
