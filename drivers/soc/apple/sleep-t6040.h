@@ -226,6 +226,8 @@ enum {
  */
 #define WDT_MAX_SECS		178U
 #define T6040_WDT_PA		0x50836c000ULL	/* the address t6040_resume_stub writes */
+/* Through WD2_CTL, the last register the sleep entry and the shared sleep code access. */
+#define T6040_WDT_SIZE		(WDT_WD2_CTL + sizeof(u32))
 #define T6040_GP_PORTS		4	/* the GP PCIe host's port0 .. port3 */
 
 struct t6040_sleep_group {
@@ -1915,6 +1917,17 @@ static int t6040_sleep_parse_groups(struct t6040_sleep *s)
 }
 
 /*
+ * The wake stub restarts the WD2 at T6040_WDT_PA before anything else runs; on another
+ * watchdog the one the wake program leaves running would reset the Mac mid-resume. The
+ * block must also reach WD2_CTL: one cut short at that address would let the sleep entry
+ * write past its end.
+ */
+static bool t6040_wdt_resource_ok(const struct resource *res)
+{
+	return res->start == T6040_WDT_PA && resource_size(res) >= T6040_WDT_SIZE;
+}
+
+/*
  * A named register block, shared with the owning driver: mapped, not claimed. NULL when it is
  * missing from the node or smaller than @min, the extent the driver accesses.
  */
@@ -2080,7 +2093,7 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc) !=
 		     ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
 	s->cpu_start = t6040_sleep_map(dev, "cpu-start");
-	s->wdt = t6040_sleep_map(dev, "wdt");
+	s->wdt = t6040_sleep_map_min(dev, "wdt", T6040_WDT_SIZE);
 	s->cluster_ctl = t6040_sleep_map(dev, "cluster");
 	s->pwrgate = t6040_sleep_map(dev, "pwrgate");
 	s->spmi0 = t6040_sleep_map(dev, "spmi");
@@ -2095,12 +2108,8 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 		return dev_err_probe(dev, -ENODEV, "a register block is missing or not mapped\n");
 
 	widx = of_property_match_string(dev->of_node, "reg-names", "wdt");
-	/*
-	 * The wake stub restarts the WD2 at T6040_WDT_PA before anything else runs; on another
-	 * watchdog the one the wake program leaves running would reset the Mac mid-resume.
-	 */
 	if (widx < 0 || of_address_to_resource(dev->of_node, widx, &wres) ||
-	    wres.start != T6040_WDT_PA)
+	    !t6040_wdt_resource_ok(&wres))
 		return dev_err_probe(dev, -ENODEV,
 				     "the wdt block is not the AON watchdog the wake stub restarts\n");
 

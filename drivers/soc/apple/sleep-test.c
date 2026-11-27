@@ -506,6 +506,23 @@ static void apple_sleep_test_wdt_handoff(struct kunit *test)
 	apple_sleep_wdt_unregister(&st->dev2);
 }
 
+static void apple_sleep_test_t6040_wdt_span(struct kunit *test)
+{
+	struct resource full = DEFINE_RES_MEM(T6040_WDT_PA, 0x4000);
+	struct resource exact = DEFINE_RES_MEM(T6040_WDT_PA, T6040_WDT_SIZE);
+	struct resource short_wd2 = DEFINE_RES_MEM(T6040_WDT_PA, WDT_WD2_CTL);
+	struct resource wd0_only = DEFINE_RES_MEM(T6040_WDT_PA, 0x10);
+	struct resource elsewhere = DEFINE_RES_MEM(0x23d2b0000ULL, 0x4000);
+
+	KUNIT_EXPECT_EQ(test, T6040_WDT_SIZE, (size_t)0x30);
+	KUNIT_EXPECT_TRUE(test, t6040_wdt_resource_ok(&full));
+	KUNIT_EXPECT_TRUE(test, t6040_wdt_resource_ok(&exact));
+	/* At the right address but short of WD2_CTL: rejected. */
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&short_wd2));
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&wd0_only));
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&elsewhere));
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
@@ -520,6 +537,7 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
 	KUNIT_CASE(apple_sleep_test_wdt_handoff),
+	KUNIT_CASE(apple_sleep_test_t6040_wdt_span),
 	{}
 };
 
