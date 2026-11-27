@@ -826,6 +826,8 @@ struct apple_dcp {
 	struct dcp_channel ch_cb, ch_oobcb, ch_async, ch_oobasync;
 	/* In-flight dcp_ack() mailbox sends not yet queued to RTKit. */
 	atomic_t pending_acks;
+	/* Count of failed dcp_send_message() mailbox sends. */
+	atomic_t tx_errors;
 
 	/* iomfb EP callback handlers */
 	const iomfb_cb_handler *cb_handlers;
@@ -946,15 +948,26 @@ struct apple_dcp {
 	struct delayed_work ext_idle_wq;
 	enum {
 		DCP_EXT_IDLE_ON,
+		DCP_EXT_IDLE_STOPPING,
 		DCP_EXT_IDLE_OFF,
 		DCP_EXT_IDLE_FAILED,
 		DCP_EXT_IDLE_CLOSED,
 	} ext_idle_state;
+	enum {
+		DCP_EXT_POWER_ON,
+		DCP_EXT_POWER_OFF,
+		DCP_EXT_POWER_UNCERTAIN,
+	} ext_idle_power;
 	int ext_idle_err;
 	bool ext_idle_armed;
 	bool ext_idle_paused;
 	bool ext_idle_domains_off;
+	bool ext_idle_v27;
+	bool ext_idle_disp_saved;
+	bool ext_idle_unsupported;
 	bool ext_idle_initialized;
+	unsigned int peer_waking;
+	unsigned int peer_idle_users;
 
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;

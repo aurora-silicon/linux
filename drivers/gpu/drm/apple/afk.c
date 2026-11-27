@@ -646,7 +646,8 @@ static void afk_compact_tx_desync(struct apple_dcp_afkep *ep, int error)
 }
 
 static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
-				     const void *body, size_t size, u32 total)
+				     const void *body, size_t size, u32 total,
+				     bool allow_closed)
 {
 	struct epic_compact_hdr *chdr;
 	struct afk_qe *qhdr;
@@ -673,7 +674,8 @@ static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
 	memcpy(message + offsetof(struct epic_compact_hdr, timestamp), body, size);
 
 	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->compact_shutting_down || ep->stopping) {
+	if (ep->compact_shutting_down || ep->stopping ||
+	    (!allow_closed && READ_ONCE(ep->dcp->sleep_v27_closed))) {
 		ret = -ESHUTDOWN;
 		goto out_unlock;
 	}
@@ -790,7 +792,8 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	while (offset < total) {
 		chunk = min_t(size_t, total - offset, AFK_COMPACT_FRAGMENT_SIZE);
 		ret = afk_send_compact_fragment(ep, intf_id, body + offset,
-						chunk, total);
+						chunk, total,
+						category == 2 || offset > 0);
 		if (ret == -EAGAIN) {
 			if (!waiting_for_space) {
 				afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_WAIT_FOR_SPACE) |
@@ -1520,7 +1523,8 @@ static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
 	}
 
 	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->compact_shutting_down || ep->stopping) {
+	if (ep->compact_shutting_down || ep->stopping ||
+	    READ_ONCE(ep->dcp->sleep_v27_closed)) {
 		spin_unlock_irqrestore(&ep->lock, flags);
 		ret = -ESHUTDOWN;
 		goto out;
