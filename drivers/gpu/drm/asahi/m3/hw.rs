@@ -15,7 +15,6 @@ const MAX_POWERZONES: usize = 5;
 /// J516S runtime ADT perf-states-sram table floors SRAM at 810 mV (7.1.12 `hw::t6030`).
 const G15_MIN_SRAM_MICROVOLT: u32 = 810_000;
 
-pub(crate) mod agx3;
 pub(crate) mod t8122;
 
 /// GPU revision enumeration. Note: Part of the UABI.

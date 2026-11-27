@@ -525,7 +525,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         &mut self,
         _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         input_count: usize,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,

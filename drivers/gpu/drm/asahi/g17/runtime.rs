@@ -4170,6 +4170,7 @@ impl super::Shared {
     /// mappings owned in state. Only a later joined stop may detach/free them.
     pub(super) fn stop_runtime(&self) {
         let Some(_stopping) = self.stop.try_lock() else { return; };
+        self.disable_rescan();
         {
             let mut state = self.state.lock();
             if let Some(firmware) = state.as_deref_mut() {
