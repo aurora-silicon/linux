@@ -987,6 +987,8 @@ struct apple_dcp {
 	bool s2r_fw_down;
 	/* Stopped cold for firmware-driven sleep, with no restart until reboot. */
 	bool sleep_cold_stopped;
+	/* The sleep engine stops it after its last refusal, see dcp_commit_stop_arm(). */
+	bool commit_stop_armed;
 	/*
 	 * Its last system suspend left the firmware running and its domains on
 	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
