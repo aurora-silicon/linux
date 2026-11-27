@@ -198,6 +198,12 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, unsigned int port)
 	return st.connect_ret;
 }
 
+/* The same tunnel requested again: its display connects if it is not (no effect here). */
+static void dcp_typec_attach_repeated(struct apple_dcp *dcp)
+{
+	(void)dcp;
+}
+
 static int dcp_tb_release_locked(struct apple_dcp_typec_port *port, unsigned int dpin)
 {
 	st.release++;

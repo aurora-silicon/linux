@@ -123,6 +123,7 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	INIT_WORK(&dcp->vblank_wq, announce_test_noop);
 	INIT_WORK(&dcp->dimensions_wq, announce_test_noop);
 	INIT_WORK(&dcp->tb_event_work, announce_test_noop);
+	INIT_WORK(&dcp->t8132_port_work, announce_test_noop);
 	INIT_WORK(&t->con.hotplug_wq, announce_test_event);
 	mutex_init(&t->drm.mode_config.mutex);
 

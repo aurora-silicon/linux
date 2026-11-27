@@ -229,12 +229,20 @@ int dptxport_request_display(struct apple_epic_service *service)
 	return afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
 }
 
-int dptxport_release_display(struct apple_epic_service *service)
+/* As dptxport_release_display(), the call followed by @ticket if set (struct afk_ticket). */
+int dptxport_release_display_ticket(struct apple_epic_service *service,
+				    struct afk_ticket *ticket)
 {
 	dcp_180hz_invalidate(service->ep->dcp);
 	dcpavserv_v14_close(service->ep->dcp);
 	dcp_cec_close_port(service->ep->dcp, service);
-	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	return afk_service_call_ticket(service, 0, 7, NULL, 0, 16, NULL, 0, 16,
+				       MSEC_PER_SEC, NULL, ticket);
+}
+
+int dptxport_release_display(struct apple_epic_service *service)
+{
+	return dptxport_release_display_ticket(service, NULL);
 }
 
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
@@ -477,6 +485,13 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		return -1;
 
 	u64 lane_count = le64_to_cpu(request->lane_count);
+
+	/* The released display's, not the next connect's (see dcp_dptx_release_locked()). */
+	if (dcp_t8132_link_report_late(dcp, "SetActiveLaneCount")) {
+		reply->retcode = cpu_to_le32(0);
+		reply->lane_count = request->lane_count;
+		return 0;
+	}
 
 	if (dcp_is_external_h17p(dcp)) {
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
@@ -936,6 +951,28 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 				     DUMP_PREFIX_OFFSET, 16, 1, data,
 				     min(data_size, (size_t)64), true);
 
+	/*
+	 * Firmware 27: a T8132 dcpext's port held for an unanswered release
+	 * (dcp_dptx_release_locked()). The firmware's link calls now are the
+	 * released display's: answered as done, and nothing is acted on, not
+	 * even the state they would reset for the display that comes next.
+	 * The lane and rate reports keep their own checks.
+	 */
+	switch (idx) {
+	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
+	case DPTX_APCALL_ACTIVATE:
+	case DPTX_APCALL_DEACTIVATE:
+		if (!dcp_is_t8132_ext(service->ep->dcp) &&
+		    dcp_t8132_link_report_late(service->ep->dcp, "link call")) {
+			memcpy(reply, data, min(reply_size, data_size));
+			if (reply_size >= 4)
+				memset(reply, 0, 4);
+			return 0;
+		}
+		break;
+	}
+
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
 		/* A re-link takes an established tunnel's crossbar down first. */
@@ -1068,7 +1105,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 						reply, reply_size);
 	case DPTX_APCALL_FORCE_HOTPLUG_DETECT:
 		dev_dbg(service->ep->dcp->dev, "DPTXPort: FORCE_HOTPLUG_DETECT\n");
-		complete(&dptx->linkcfg_completion);
+		if (!dcp_t8132_link_report_late(service->ep->dcp, "ForceHotplugDetect"))
+			complete(&dptx->linkcfg_completion);
 		memcpy(reply, data, min(reply_size, data_size));
 		if (reply_size >= 4)
 			memset(reply, 0, 4);
@@ -1163,6 +1201,8 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 
 	dptx_service_publish(service);
 	complete(&port->enable_completion);
+	/* Firmware 27 T8132: a display attached meanwhile connects now. */
+	dcp_typec_attach_repeated(service->ep->dcp);
 	/* A connect that found no port yet is retried from process context. */
 	if (service->ep->dcp->external_native)
 		schedule_work(&service->ep->dcp->external_ready_work);
@@ -1649,6 +1689,17 @@ int dptxep_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	ep->wire_v2 = wire_v2;
+	/*
+	 * Firmware 27 T8132: the answer to a timed-out call may free a held
+	 * port (dcp_t8132_port_work()). A new endpoint has no call outstanding.
+	 */
+	if (dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp)) {
+		ep->late_reply_work = &dcp->t8132_port_work;
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			WRITE_ONCE(dcp->t8132_release_late, false);
+			WRITE_ONCE(dcp->t8132_release.state, AFK_TICKET_IDLE);
+		}
+	}
 	dcp->dptxep = ep;
 
 	ret = afk_start(dcp->dptxep);

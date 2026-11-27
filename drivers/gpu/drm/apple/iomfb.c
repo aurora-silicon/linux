@@ -4218,13 +4218,16 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
  * it displaced stay referenced.  Without a completed present for
  * IOMFB_DROPPED_MAX retired ones, the queue is left to its timeout.  Returns
  * false if the present ended or a newer one re-armed the watchdog in the
- * meantime.  Other firmware has no present state.
+ * meantime.  Other firmware has no present state.  *@lost tells whether
+ * the present was begun for a display that went since
+ * (iomfb_present_begun_h17p()).
  */
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, u64 *attachment)
 {
 	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
 	u32 swap_id;
 
+	*attachment = READ_ONCE(dcp->typec_unplugs);
 	if (!iomfb_uses_queue(dcp))
 		return true;
 
@@ -4233,6 +4236,8 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
 	    !state->pending || !state->accepted)
 		return false;
+	/* The display it was started for (iomfb_present_begun_h17p()). */
+	*attachment = state->attachment;
 	if (!dcp_present_retire_h17p(state, swap_id))
 		return true;
 
@@ -4247,6 +4252,55 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	}
 	iomfb_queue_advance(dcp);
 	return true;
+}
+
+/*
+ * A present begins (the firmware's answer to its swap start): it is for the
+ * display attached when the host started it (@attachment, the detaches
+ * before it as typec_unplugs counted them, carried by its SwapStart). Its
+ * watchdog compares that with the count when it retires the present
+ * (dcp_swap_watchdog()): a present started before a detach, whenever the
+ * firmware answers its start or accepts it, belongs to the display that
+ * went, not to one attached since. Outputs without Type-C detaches keep
+ * their first count. In the IOMFB receive thread, as the present's state.
+ */
+void iomfb_present_begun_h17p(struct apple_dcp *dcp, u64 attachment)
+{
+	dcp->present_state_h17p.attachment = attachment;
+}
+
+/*
+ * The display a present was taken for went: its Type-C attachment ended
+ * (dcp_dptx_disconnect_oob()), or its CRTC is turned off after that
+ * (@poweroff, dcp_poweroff()). On firmware with the IOMFB queue a present
+ * the firmware accepted and has not completed may never complete now, and
+ * the queue waits behind it: its swap watchdog is kept to retire it
+ * (dcp_swap_watchdog_keep()). Under the queue's lock, as the firmware's
+ * acceptance (which arms the watchdog) and completion are, so a present
+ * accepted meanwhile is either seen here or armed after. A power-off with
+ * no such present stops the watchdog, as before. Whether a present is the
+ * lost display's is decided by the attachment it was begun for
+ * (iomfb_present_begun_h17p()), not by whether it was accepted by now: one
+ * accepted after this is retired without a retrain too. Returns whether
+ * one was in flight.
+ */
+bool iomfb_present_lost(struct apple_dcp *dcp, bool poweroff)
+{
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+
+	if (!iomfb_uses_queue(dcp)) {
+		if (poweroff)
+			cancel_delayed_work(&dcp->swap_watchdog_wq);
+		return false;
+	}
+	guard(mutex)(&dcp->iomfb.lock);
+	if (state->pending && state->accepted) {
+		dcp_swap_watchdog_keep(dcp);
+		return true;
+	}
+	if (poweroff)
+		cancel_delayed_work(&dcp->swap_watchdog_wq);
+	return false;
 }
 
 /* Release a present's scanout unless it is displayed or was dropped. */

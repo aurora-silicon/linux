@@ -777,6 +777,7 @@ int main(void)
              ' struct { bool active; } split;\n struct apple_dcp_afkep *dptxep; bool t8132_release_late;')
         firmware += ('struct apple_dcp_afkep;\nstruct dcp_fabric_session;\n'
                      'static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }\n'
+                     'static bool dcp_t8132_ext_hw(const struct apple_dcp *d) { (void)d; return false; }\n'
                      'static bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)\n'
                      '{ (void)ep; assert(!"T8132 dcpext teardown in an H17P scenario"); return false; }\n'
                      'static int dcp_t8132_wait_teardown_answers(struct apple_dcp *d, u32 port,\n'
@@ -795,6 +796,29 @@ int main(void)
                      'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
                      '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
                      apple_function(root, 'dcp_dptx_wait_linkcfg'))
+    if 'dcp_connect_admitted_locked(' in raw:
+        # The session checks before each DPTX call; no tunnel binding here.
+        firmware += apple_function(root, 'dcp_connect_admitted_locked')
+    if 'dcp_dptx_gate_open(' in raw:
+        # No Thunderbolt tunnel here: the gate lets every call through.
+        swap(' struct { bool active; } split;',
+             ' struct { bool active; } split;\n void *dptx_gate_task;')
+        firmware += ('#define dcp_dptx_gate_open(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_arm(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_disarm(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_close(...) ((void)0)\n'
+                     '#define dcp_connect_admitted(d, s, c, r) dcp_connect_session_valid(d, s, c, r)\n')
+    if 'dcp_dptx_release_locked(' in raw:
+        # A failed connect releases its display as a detach does: not a T8132 dcpext here.
+        swap(' struct { bool connected, closed, tile_hint;',
+             ' struct { bool connected, release_owed, closed, tile_hint;')
+        firmware += ('static bool dcp_t8132_port_held_locked(struct apple_dcp *d) { (void)d; return false; }\n'
+                     '/* dcp_dptx_release_locked() for this display: an H17P external, no tunnel. */\n'
+                     'static int dcp_dptx_release_locked(struct apple_dcp *d, u32 port)\n'
+                     '{ int r; if (!dptx_service_available(&d->dptxport[port]) ||\n'
+                     '  !(d->dptxport[port].connected || d->dptxport[port].release_owed)) return 0;\n'
+                     '  r = dptxport_release_display(d->dptxport[port].service); if (r) return r;\n'
+                     '  d->dptxport[port].connected = d->dptxport[port].release_owed = false; return 0; }\n')
     if 'dcp_assert_hpd_before_link_wait(' in raw:
         # The HPD assertion before the link wait, as the driver has it. This scenario is a
         # Type-C H17P link, so the fixed-HDMI branch is not taken.
@@ -879,6 +903,24 @@ static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
 static void av_service_disconnect(struct apple_dcp *d)
 { (void)d; av_disconnects++; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
+/*
+ * A present the firmware took and has not completed: its watchdog is kept
+ * for a display that went (iomfb_present_lost()); the power-off of a live
+ * output stops it.
+ */
+static bool present_in_flight;
+static int watchdog_keeps;
+static bool iomfb_present_lost(struct apple_dcp *d, bool poweroff)
+{
+	assert(poweroff);
+	if (!present_in_flight) {
+		d->swap_watchdog_wq.pending = false;
+		return false;
+	}
+	d->swap_watchdog_wq.pending = true;
+	watchdog_keeps++;
+	return true;
+}
 static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
 static void reinit_completion(struct completion *c) { c->done = 0; }
 static bool dptx_service_available(struct dptx_port *p) { return p->available; }
@@ -890,6 +932,9 @@ static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, 
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
 static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
+/* The CRTC turned off, under hpd_mutex, for a display still attached. */
+static void dcp_typec_crtc_turned_off(struct apple_dcp *d)
+{ if (d->typec_cable_connected) d->typec_crtc_off = true; }
 ''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
 static struct apple_connector connector;
@@ -905,6 +950,7 @@ static void init(u64 released, u64 claimed)
  dcp.typec_reconnect_wq.pending = true;
  connector.connected = true;
  poweroffs = hpd_drops = disconnects = retries = av_disconnects = 0;
+ present_in_flight = false; watchdog_keeps = 0;
 }
 int main(void)
 {
@@ -924,6 +970,16 @@ int main(void)
  /* A successful replacement modeset refreshes the token before later DPMS. */
  init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ assert(!dcp.swap_watchdog_wq.pending && !watchdog_keeps);
+
+ /* The display went with a present in flight: power-off keeps its watchdog. */
+ init(4, 3); dcp.swap_watchdog_wq.pending = true; present_in_flight = true;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && watchdog_keeps == 1 && dcp.swap_watchdog_wq.pending);
+ /* DPMS of the display still attached stops it, a present in flight or not. */
+ init(4, 4); dcp.swap_watchdog_wq.pending = true; present_in_flight = true;
+ dcp_poweroff(&pdev);
+ assert(!watchdog_keeps && !dcp.swap_watchdog_wq.pending);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }

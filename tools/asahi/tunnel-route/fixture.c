@@ -61,14 +61,19 @@ struct apple_dcp_typec_port {
 	struct apple_connector *connector, *secondary_connector;
 	bool dp_wanted, dp_hpd, typec_yielded;
 };
-static bool t6030, t8132_ext;
+static bool t6030, t8132_ext, t8132_m4;
 static bool of_machine_is_compatible(const char *compatible)
 {
 	assert(!strcmp(compatible, "apple,t6030"));
 	return t6030;
 }
 /* Production: an M4-adopted apple,t8132-dcpext (dcp_t8132_ext_m4_node()). */
-static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+static bool __attribute__((unused)) dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return t8132_ext && t8132_m4;
+}
+/* Production: any apple,t8132-dcpext, on the M4 backend or firmware 27. */
+static bool __attribute__((unused)) dcp_t8132_ext_hw(const struct apple_dcp *dcp)
 {
 	return t8132_ext;
 }
@@ -159,11 +164,13 @@ int main(void)
 	}
 	/*
 	 * A T8132 dcpext is a tunnel clock source as crossbar source 2 or 4,
-	 * on either DP IN, never as 0, 1 or 3, whatever the machine.
+	 * on either DP IN, never as 0, 1 or 3, whatever the machine, and
+	 * whatever backend drives it: the M4 one or firmware 27 (27.2).
 	 */
 	t8132_ext = true;
-	for (unsigned int soc = 0; soc < 2; soc++) {
-		t6030 = soc;
+	for (unsigned int soc = 0; soc < 4; soc++) {
+		t6030 = soc & 1;
+		t8132_m4 = soc & 2;
 		for (unsigned int source = 0; source < 5; source++) {
 			struct apple_dcp_typec_route r = {
 				.dcp = &dcp,
@@ -183,6 +190,7 @@ int main(void)
 		}
 	}
 	t8132_ext = false;
+	t8132_m4 = false;
 	/*
 	 * T6050: a T8142-layout crossbar has an output per DP IN, named or by
 	 * the legacy order; a four-output one has no DP IN 3.

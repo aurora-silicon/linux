@@ -35,7 +35,7 @@ if args.drop_native26:
     assert link.count(old) == 1
     link = link.replace(old, '', 1)
 if args.drop_t8132:
-    old = '!dcp_is_t8132_ext(dcp) && '
+    old = '!dcp_t8132_ext_hw(dcp) && '
     assert link.count(old) == 1
     link = link.replace(old, '', 1)
 if args.drop_on_link:
@@ -157,10 +157,29 @@ int main(void) {
     machine = "apple,other"; node.compatible = "apple,t8132-dcpext"; node.v27_2 = true;
     struct apple_dcp j773g = { .dev = &dev, .active_typec_route = &route,
                                .fw_compat = DCP_FIRMWARE_V_27_0, .desktop_external = true };
-    assert(!dcp_is_t8132_ext(&j773g));
+    assert(!dcp_is_t8132_ext(&j773g) && dcp_t8132_ext_hw(&j773g));
     reset(); assert(dcp_direct_crossbar_link(&j773g, true) == 0);
     assert(v27 == 0 && links == 1 && locks == 1 && j773g.direct_xbar_up == &a);
+
+    /*
+     * The Air's (J713) dcpexts on firmware 27.2: T8132 display hardware
+     * (dcp_t8132_ext_hw()), no M4 backend. A Type-C route whose crossbar
+     * clocks follow the link is linked here; without that, the T6050 path.
+     */
+    struct apple_dcp j713 = { .dev = &dev, .active_typec_route = &route,
+                              .fw_compat = DCP_FIRMWARE_V_27_0 };
+    assert(!dcp_is_t8132_ext(&j713) && dcp_t8132_ext_hw(&j713));
+    xbar_clocks_on_link = true;
+    reset(); assert(dcp_direct_crossbar_link(&j713, true) == 0);
+    assert(queries == 1 && v27 == 0 && links == 1 && last_up && j713.direct_xbar_up == &a);
+    reset(); assert(dcp_direct_crossbar_link(&j713, false) == 0);
+    assert(queries == 0 && links == 1 && !last_up && !j713.direct_xbar_up);
+    xbar_clocks_on_link = false;
+    reset(); assert(dcp_direct_crossbar_link(&j713, true) == 37);
+    assert(v27 == 1 && links == 0 && !j713.direct_xbar_up);
     node.v27_2 = false;
+    /* On the M4 26.6.2 path the same processor is both. */
+    assert(dcp_is_t8132_ext(&j713) && dcp_t8132_ext_hw(&j713));
 
     /*
      * Firmware 27 on a Type-C route: the crossbar decides. An output whose
@@ -202,14 +221,16 @@ int main(void) {
     reset(); assert(dcp_direct_crossbar_link(&unrelated, true) == 0);
     assert(links == 0 && locks == 0);
     puts("PASS production crossbar union, route/cache/error behavior, V27 precedence, "
-         "firmware-27 clocks-on-link crossbar (true/false/no module/tunnel), J773g 27.2 and unrelated exclusion");
+         "firmware-27 clocks-on-link crossbar (true/false/no module/tunnel), J773g 27.2, J713 27.2 "
+         "(hardware, not M4) and unrelated exclusion");
     return 0;
 }
 '''
 unit = pre + function(header, 'dcp_is_ext26') + '\n'
 unit += function(source, 'dcp_t6041_ext_v27') + '\n'
 unit += function(source, 'dcp_t8132_ext_m4_node') + '\n'
-unit += function(source, 'dcp_is_t8132_ext') + '\n' + clocks_on_link + '\n' + link + '\n' + cases
+unit += function(source, 'dcp_is_t8132_ext') + '\n'
+unit += function(source, 'dcp_t8132_ext_hw') + '\n' + clocks_on_link + '\n' + link + '\n' + cases
 with tempfile.TemporaryDirectory() as tmp:
     c = Path(tmp) / 'crossbar.c'
     binary = Path(tmp) / 'crossbar'

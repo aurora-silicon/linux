@@ -58,6 +58,12 @@ struct apple_epic_service;
 struct dptx_port {
 	struct dcp_dptx_caps caps;
 	bool enabled, connected;
+	/*
+	 * A display requested by a connect that failed, whose release was not
+	 * sent or was refused: the next release sends it again
+	 * (dcp_dptx_release_locked()), and the next connect does so first.
+	 */
+	bool release_owed;
 	/* A published session closed; unlike initial discovery, this is terminal. */
 	bool closed;
 	struct completion enable_completion;
@@ -97,6 +103,9 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 		     u8 die, bool supports_hpd);
 int dptxport_request_display(struct apple_epic_service *service);
 int dptxport_release_display(struct apple_epic_service *service);
+struct afk_ticket;
+int dptxport_release_display_ticket(struct apple_epic_service *service,
+				    struct afk_ticket *ticket);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms);

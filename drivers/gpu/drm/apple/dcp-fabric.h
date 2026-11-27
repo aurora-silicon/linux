@@ -80,6 +80,8 @@ bool dcp_has_typec_routes(struct platform_device *pdev);
 unsigned int dcp_typec_nr_ports(void);
 struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+bool dcp_typec_port_carries_stream(unsigned int idx, struct platform_device *pdev,
+				   unsigned int slot);
 #if IS_ENABLED(CONFIG_KUNIT)
 /* apple_drv.c: whether a native26 pipeline can drive Type-C port @port_idx */
 bool apple_typec_port_rgb8_only(struct platform_device **dcp, int num_dcp,
@@ -130,11 +132,22 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
 /*
  * A T8132 dcpext adopted through the M4 26.6.2 backend (iomfb_m4.c,
- * t8132_ext_drm.c). A J773g dcpext on firmware 27.2 is an ordinary
- * firmware-27 pipe instead and is neither of these.
+ * t8132_ext_drm.c): its probe, teardown, sleep and DRM paths, and the
+ * firmware protocol they follow. A T8132 dcpext on firmware 27.2 is an
+ * ordinary firmware-27 pipe instead and is neither of these.
  */
 bool dcp_t8132_ext_m4_node(const struct device_node *np);
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
+
+/*
+ * Any T8132 dcpext, whatever firmware backend drives it: its display
+ * crossbar, the DP IN tunnel pixel clocks it sources (2 or 4), the PHYs
+ * behind its Type-C routes and its Thunderbolt tunnel flow are hardware.
+ */
+bool dcp_t8132_ext_hw(const struct apple_dcp *dcp);
+
+/* A DPTX link report that belongs to an unanswered earlier release. */
+bool dcp_t8132_link_report_late(struct apple_dcp *dcp, const char *what);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 static inline bool dcp_typec_routes_available(const struct device_node *routes)

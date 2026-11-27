@@ -160,6 +160,14 @@ static bool dcp_is_t8132_ext(struct apple_dcp *dcp)
 	return dcp->t8132_ext;
 }
 
+/* No T8132 release is outstanding in these cases. */
+static bool dcp_t8132_link_report_late(struct apple_dcp *dcp, const char *what)
+{
+	(void)dcp;
+	(void)what;
+	return false;
+}
+
 static int dptx_j700_validate_lanes(struct dptx_port *dptx, u64 lane_count)
 {
 	(void)dptx;

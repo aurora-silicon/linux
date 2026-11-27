@@ -6,7 +6,7 @@ import re
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text()
-match = re.search(r"^int afk_service_call_timeout_len\([^;]*?\)\n\{", source, re.M)
+match = re.search(r"^int afk_service_call_ticket\([^;]*?\)\n\{", source, re.M)
 if not match:
     raise RuntimeError("production service-call definition not found")
 start = match.start()
@@ -44,12 +44,14 @@ struct ops { const char *name; };
 struct ep { struct dcp *dcp; int endpoint; bool inline_v2; };
 struct apple_epic_service { struct ep *ep; struct ops *ops; u32 channel; };
 static int error_status, malformed, short_header, too_long, wire_error;
-static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
+struct afk_ticket;
+static int afk_send_command_ticket(struct apple_epic_service *s, u8 type,
  const void *payload, size_t payload_len, void *output, size_t output_len,
- u32 *retcode, unsigned int timeout_ms, size_t *received)
+ u32 *retcode, unsigned int timeout_ms, size_t *received, struct afk_ticket *ticket)
 {
  struct epic_service_call *call=output;
  (void)payload;
+ assert(!ticket);
  assert(payload_len==(s->ep->inline_v2?68:output_len));
  assert(call->data_len==(s->ep->inline_v2?4:4100));
  assert(type==0xc0 && timeout_ms==1000 && output_len>=68);
@@ -89,4 +91,8 @@ int main(void)
  puts("PASS: extracted production service-call actual request / OOB padding and short reply / legacy / status / context / length tests");
 }
 '''
-pathlib.Path(sys.argv[2]).write_text(prefix + source[start:end] + suffix)
+# The production wrapper the callers use, without a ticket.
+wrapper = re.search(r"^int afk_service_call_timeout_len\([^;]*?\)\n\{.*?^\}\n", source, re.M | re.S)
+if not wrapper:
+    raise RuntimeError("production service-call wrapper not found")
+pathlib.Path(sys.argv[2]).write_text(prefix + source[start:end] + "\n" + wrapper.group(0) + suffix)

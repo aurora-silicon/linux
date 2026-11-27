@@ -2216,7 +2216,21 @@ struct dcp_swap_cookie {
 	struct completion done;
 	u32 status;
 	u32 swap_id;
+	/* the Type-C attachment it is started for (dcp_present_attachment()) */
+	u64 attachment;
 };
+
+/*
+ * The Type-C attachment a present is started for, counted by the detaches
+ * before it (typec_unplugs), read as the host starts it. Its SwapStart
+ * carries it to the reply, which begins the present with it
+ * (dcp_present_begin()): a reply that comes after a detach still begins the
+ * present of the display that went.
+ */
+static u64 dcp_present_attachment(struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->typec_unplugs);
+}
 
 static void release_swap_cookie(struct kref *ref)
 {
@@ -2315,14 +2329,16 @@ static void dcp_present_failed(struct apple_dcp *dcp)
 #endif
 }
 
-static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
+static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id, u64 attachment)
 {
 #if DCP_FW_H17(DCP_FW_VER)
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
-	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
-		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
-		dcp->crashed = true;
-		return false;
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (!dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
+			dev_err(dcp->dev, "overlapping present %u\n", swap_id);
+			dcp->crashed = true;
+			return false;
+		}
+		iomfb_present_begun_h17p(dcp, attachment);
 	}
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
 	WRITE_ONCE(dcp->desktop->present_id, swap_id);
@@ -2461,7 +2477,8 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
-	if (!dcp_present_begin(dcp, resp->swap_id)) {
+	if (!dcp_present_begin(dcp, resp->swap_id,
+			       info ? info->attachment : dcp_present_attachment(dcp))) {
 		if (info) {
 			WRITE_ONCE(info->status, ~0U);
 			complete(&info->done);
@@ -2980,6 +2997,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	if (dcp_has_panel(dcp))
 		dcp_backlight_presented(dcp, 0);
 
+	cookie->attachment = dcp_present_attachment(dcp);
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
 	/*
@@ -3091,6 +3109,7 @@ void DCP_FW_NAME(iomfb_blank)(struct apple_dcp *dcp)
 		dcp_backlight_presented(dcp, 0);
 	}
 
+	cookie->attachment = dcp_present_attachment(dcp);
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
 	if (!ret || READ_ONCE(cookie->status))
@@ -3602,7 +3621,8 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
-	if (!dcp_present_begin(dcp, resp->swap_id)) {
+	/* The attachment its SwapStart carries (do_swap()). */
+	if (!dcp_present_begin(dcp, resp->swap_id, (unsigned long)cookie)) {
 		dcp_present_rejected(dcp);
 		if (dcp_present_retires(dcp))
 			dcp_drm_crtc_vblank(dcp->crtc);
@@ -3652,7 +3672,8 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
 	    READ_ONCE(dcp->connector->connected))
-		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
+		dcp_swap_start(dcp, false, &start_req, dcp_swap_started,
+			       (void *)(unsigned long)dcp_present_attachment(dcp));
 	else
 		dcp_drm_crtc_vblank(dcp->crtc);
 #else
@@ -3688,7 +3709,8 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 				req->swap.timestamp[1] = dcp_swap_time();
 		}
 #endif
-		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
+		dcp_swap_start(dcp, false, &start_req, dcp_swap_started,
+			       (void *)(unsigned long)dcp_present_attachment(dcp));
 	} else {
 		dcp_drm_crtc_vblank(dcp->crtc);
 	}

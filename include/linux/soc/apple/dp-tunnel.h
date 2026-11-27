@@ -46,6 +46,17 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 bool apple_dp_tunnel_binding_live(void *binding);
 
+/*
+ * Thunderbolt glue: run @call(@arg) while the tunnel handed to appledrm
+ * with @binding is still requested, under the DP IN adapter's lock, so
+ * that the tunnel's deactivation comes before @call or after it, never
+ * during it. appledrm queues a DCP call for the tunnel's display there.
+ * @call must not wait for DCP: DCP's calls of @set_active take the same
+ * lock. Returns -ESTALE if the tunnel is no longer requested, else what
+ * @call returns. May sleep.
+ */
+int apple_dp_tunnel_binding_call(void *binding, int (*call)(void *arg), void *arg);
+
 /* The sink raised IRQ_HPD on the tunnel's DP IN adapter. */
 #define APPLE_DP_TUNNEL_IRQ_HPD		BIT(0)
 /* The HPD level of the tunnel's DP IN adapter changed to @hpd. */

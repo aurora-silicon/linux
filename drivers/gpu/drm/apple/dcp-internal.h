@@ -22,6 +22,7 @@
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "afk-ticket.h"
 #include "dcp-fabric.h"
 #include "dcp-peer-v26_6.h"
 #include "dcp-fabric-session.h"
@@ -80,6 +81,7 @@ struct iomfb_transaction {
 struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
+void dcp_swap_watchdog_keep(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
@@ -1152,9 +1154,23 @@ struct apple_dcp {
 	bool typec_cable_connected;
 	/*
 	 * T8132 dcpext: a teardown call timed out; the firmware's late
-	 * Activate/Deactivate belong to it until its answer is in.
+	 * Activate/Deactivate belong to it until its answer is in. Firmware
+	 * 27: the DPTX port is held meanwhile (dcp_t8132_port_held_locked()),
+	 * set and cleared under hpd_mutex.
 	 */
 	bool t8132_release_late;
+	/* Firmware 27: what became of the display's release (dcp_t8132_settle_locked()) */
+	struct afk_ticket t8132_release;
+	/* Frees a held port on the firmware's answer, then resumes its display. */
+	struct work_struct t8132_port_work;
+	/*
+	 * A Thunderbolt tunnel's connect sends its DPTX calls under the
+	 * provider's admission of the session's binding (cookie): see
+	 * dcp_dptx_send_gated(). Held by the connect across them.
+	 */
+	struct mutex dptx_gate_lock;
+	struct task_struct *dptx_gate_task;	/* dptx_gate_lock to write */
+	u64 dptx_gate_cookie;			/* dptx_gate_lock */
 	/*
 	 * T8132 dcpext: its display was released and its route parked for a
 	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
@@ -1213,6 +1229,8 @@ struct apple_dcp {
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
+	/* The queued connect must not wake a CRTC turned off (hpd_mutex). */
+	bool typec_reconnect_recovery;
 	/* hpd_mutex: what DRM reports for the external display, and when */
 	struct dcp_announce announce;
 	struct delayed_work announce_wq;
@@ -1390,7 +1408,9 @@ void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, u64 *attachment);
+bool iomfb_present_lost(struct apple_dcp *dcp, bool poweroff);
+void iomfb_present_begun_h17p(struct apple_dcp *dcp, u64 attachment);
 bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
