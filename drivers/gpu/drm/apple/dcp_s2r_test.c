@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /* Included by dcp.c to verify DART wake ordering on s2r_disp_dart_with_dcp pipelines. */
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
