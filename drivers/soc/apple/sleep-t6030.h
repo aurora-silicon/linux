@@ -1572,6 +1572,52 @@ static void t6030_gate_pulse_entry(struct apple_sleep *s)
 		 readl(s->pwrgate + gate[1]), readl(s->pwrgate + gate[2]));
 }
 
+/*
+ * DIAGNOSTIC: lane A's stop comparison 4 (ref/t6030-stopcmp-4v3-diff.tsv): the first state
+ * difference in M2D_1B's order is at #51-#80, twelve DISPEXT sub-domains that aren't in the ADT's
+ * pmgr device list. macOS has them off at its final WFI (0xf000300 / 0x300) and their parents'
+ * power gates' +0x50 bit 30 set (0xc0050300); Linux has iBoot's AUTO and on (0x1f0003ff / 0x3ff)
+ * and bit 30 clear, so the engine has to power down live domains inside its 0xfff bound.
+ * apple_sleep.dispext_off=1 writes the engine's own values in its order at the late entry, waits
+ * for each to read off, and logs the parents' gates.
+ */
+#define T6030_DISPEXT_OFF_US		1000
+#define T6030_PWRGATE_DISPEXT1_GRP	0x15d0
+#define T6030_PWRGATE_DISPEXT0_GRP	0x1250
+#define T6030_PWRGATE_GRP_OFF		BIT(30)
+static const struct { u16 off; u32 val; } t6030_dispext_off_words[] = {
+	{ 0x450, 0xf000300 }, { 0x448, 0xf000300 }, { 0x440, 0xf000300 }, { 0x438, 0xf000300 },
+	{ 0x470, 0x300 }, { 0x468, 0x300 }, { 0x430, 0x300 },
+	{ 0x428, 0xf000300 }, { 0x420, 0xf000300 }, { 0x418, 0xf000300 }, { 0x410, 0xf000300 },
+	{ 0x460, 0x300 }, { 0x458, 0x300 }, { 0x400, 0x300 },
+};
+static bool t6030_dispext_off;
+module_param_named(dispext_off, t6030_dispext_off, bool, 0444);
+MODULE_PARM_DESC(dispext_off, "T6030 DIAGNOSTIC: at the late entry, the engine's M2D_1B writes to the 12 DISPEXT sub-domains (+DPEXT0/1), in its order");
+
+static void t6030_dispext_off_entry(struct apple_sleep *s)
+{
+	unsigned int i, on = 0, slow = 0;
+	u32 g1, g0, v;
+
+	g1 = readl(s->pwrgate + T6030_PWRGATE_DISPEXT1_GRP);
+	g0 = readl(s->pwrgate + T6030_PWRGATE_DISPEXT0_GRP);
+	for (i = 0; i < ARRAY_SIZE(t6030_dispext_off_words); i++) {
+		void __iomem *reg = s->ps + t6030_dispext_off_words[i].off;
+
+		on |= (u32)!!FIELD_GET(PS_ACTUAL, readl(reg)) << i;
+		writel(t6030_dispext_off_words[i].val, reg);
+		if (readl_poll_timeout_atomic(reg, v, !FIELD_GET(PS_ACTUAL, v), 1,
+					      T6030_DISPEXT_OFF_US))
+			slow |= BIT(i);
+	}
+	dev_info(s->dev, "dispext_off: on before %#x, not off in 1 ms %#x; group gates +0x15d0 %#x -> %#x, +0x1250 %#x -> %#x (bit 30: %d %d)\n",
+		 on, slow, g1, readl(s->pwrgate + T6030_PWRGATE_DISPEXT1_GRP), g0,
+		 readl(s->pwrgate + T6030_PWRGATE_DISPEXT0_GRP),
+		 !!(readl(s->pwrgate + T6030_PWRGATE_DISPEXT1_GRP) & T6030_PWRGATE_GRP_OFF),
+		 !!(readl(s->pwrgate + T6030_PWRGATE_DISPEXT0_GRP) & T6030_PWRGATE_GRP_OFF));
+}
+
 static void t6030_sleep_late_entry(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -1583,6 +1629,8 @@ static void t6030_sleep_late_entry(struct apple_sleep *s)
 		t6030_gate_pulse_entry(s);
 	else
 		writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
+	if (READ_ONCE(t6030_dispext_off))
+		t6030_dispext_off_entry(s);
 	sleep_ps_lower(s, T6030_PS_SPI2);
 }
 
