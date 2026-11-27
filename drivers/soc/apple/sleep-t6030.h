@@ -2721,6 +2721,10 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *  2: the latest values: +0 the alarm control, +1 the wake status words nonzero (bits 0-6) and
  *     +0x34 bit 31 (bit 7), +2 nub-spmi0 +0x60 bits 7:0, +3 nub-spmi0 +0x20 bits 3:0 and 15:12
  *     (bits 3:0 and 7:4), +4 nub-spmi-a0 +0x68 bits 31:24.
+ *  3: as 1 for +0 (the alarm event), +1 (a wake status word nonzero) and +4 (nub-spmi0 +0x60
+ *     nonzero); +2 and +3 the first nonzero status word at +1's sample: +2 its index (bits 7:5)
+ *     and lowest set bit (4:0), +3 its set bits, at most 6 (7:5), and highest set bit (4:0).
+ * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
 #define T6030_OBS_PERIOD_MS		100
@@ -2736,13 +2740,13 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
 
 static unsigned int t6030_obs_timeline;
 module_param_named(obs_timeline, t6030_obs_timeline, uint, 0644);
-MODULE_PARM_DESC(obs_timeline, "T6030 DIAGNOSTIC: with observer_ms, the observer's 100 ms samples in PMU scratch: 1 when each first changed, 2 the latest values (0 = off)");
+MODULE_PARM_DESC(obs_timeline, "T6030 DIAGNOSTIC: with observer_ms, the observer's 100 ms samples in PMU scratch: 1 when each first changed, 2 the latest values, 3 when, with the first wake status word (0 = off)");
 
 static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode == 1 || mode == 2;
+	return mode >= 1 && mode <= 3;
 }
 
 struct t6030_obs {
@@ -2805,8 +2809,10 @@ static void t6030_obs_values(const struct t6030_obs *o, u8 *v)
 static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t0)
 {
 	u64 period = arch_timer_get_cntfrq() * T6030_OBS_PERIOD_MS / 1000;
-	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i;
-	bool values = READ_ONCE(t6030_obs_timeline) == 2, off_seen = false, hit, moved;
+	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i, w;
+	unsigned int mode = READ_ONCE(t6030_obs_timeline);
+	unsigned int scale = DIV_ROUND_UP(n, T6030_OBS_LAST + 1);
+	bool values = mode == 2, word = mode == 3, off_seen = false, hit, moved;
 	struct t6030_obs o, ref = {};
 	u8 at[5], v[5], last[5] = {};
 
@@ -2829,12 +2835,26 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 			}
 			continue;
 		}
-		t6030_obs_mark(s, at, 0, o.ctl_read && (o.ctl & T6050_RTC_CTL_FIRED), k);
+		t6030_obs_mark(s, at, 0, o.ctl_read && (o.ctl & T6050_RTC_CTL_FIRED), k / scale);
 		for (hit = false, i = 0; i < T6030_OBS_STATUS_WORDS; i++)
 			hit |= !!o.status[i];
-		t6030_obs_mark(s, at, 1, hit, k);
-		t6030_obs_mark(s, at, 2, !!o.ack0, k);
-		t6030_obs_mark(s, at, 3, !!o.a0_ack2, k);
+		if (word) {
+			if (hit && at[1] == T6030_OBS_NOT_YET) {
+				for (i = 0; !o.status[i]; i++)
+					;
+				w = o.status[i];
+				at[2] = i << 5 | __ffs(w);
+				at[3] = min(hweight32(w), 6U) << 5 | __fls(w);
+				sleep_note_at(s, 2, at[2]);
+				sleep_note_at(s, 3, at[3]);
+			}
+			t6030_obs_mark(s, at, 1, hit, k / scale);
+			t6030_obs_mark(s, at, 4, !!o.ack0, k / scale);
+			continue;
+		}
+		t6030_obs_mark(s, at, 1, hit, k / scale);
+		t6030_obs_mark(s, at, 2, !!o.ack0, k / scale);
+		t6030_obs_mark(s, at, 3, !!o.a0_ack2, k / scale);
 		if (!FIELD_GET(T6030_PS_ACTUAL, o.pcpu))
 			off_seen = true;
 		moved = READ_ONCE(t8142_obs_wfi_back) ||
@@ -2842,7 +2862,7 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 			(k > T6030_OBS_SETTLE &&
 			 (o.cluster[0] != ref.cluster[0] || o.cluster[1] != ref.cluster[1] ||
 			  o.commit != ref.commit || o.cllt != ref.cllt));
-		t6030_obs_mark(s, at, 4, moved, k);
+		t6030_obs_mark(s, at, 4, moved, k / scale);
 	}
 	for (i = 0; !values && i < ARRAY_SIZE(at); i++)
 		if (at[i] == T6030_OBS_NOT_YET)
