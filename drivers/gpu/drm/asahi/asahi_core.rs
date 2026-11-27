@@ -59,8 +59,6 @@ mod sysfs_exports;
 mod timestamp;
 mod usage;
 mod util;
-#[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
-mod vm;
 mod workqueue;
 
 use kernel::prelude::*;

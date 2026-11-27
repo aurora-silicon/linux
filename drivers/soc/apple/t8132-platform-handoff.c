@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Supply missing platform descriptions for the original J713 loader ABI,
- * which the J715 shares, and the M4 PMGR ownership policy on the qualified
- * firmware for every M4 Mac.
+ * which the J715 shares, and apply the M4 PMGR ownership policy wherever
+ * the T8132 PMGR is described.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -320,14 +320,18 @@ static int __init t8132_platform_handoff(void)
 	int root, node, ret;
 
 	/*
-	 * Key the handoff on the PMP node's own compatible rather than the root
-	 * SoC compatible or OS firmware version. The copy only adds nodes the
-	 * loader's tree lacks, and the PMP path they depend on runs on every
-	 * firmware whose image header names its data segment.
+	 * The memory descriptions follow the PMP provider. PMGR ownership
+	 * also applies to trees which describe the PMGR without a PMP.
 	 */
 	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
-	if (!pmp)
-		return 0;
+	if (!pmp) {
+		struct device_node *pmgr;
+
+		pmgr = of_find_compatible_node(NULL, NULL, "apple,t8132-pmgr");
+		if (!pmgr)
+			return 0;
+		of_node_put(pmgr);
+	}
 	if (fdt_check_header(data)) {
 		ret = -EINVAL;
 		goto out;
@@ -347,11 +351,14 @@ static int __init t8132_platform_handoff(void)
 	if (ret)
 		goto destroy;
 
+	if (!pmp)
+		goto apply;
+
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8132");
 	gfx = gpu ? of_parse_phandle(gpu, "power-domains", 0) : NULL;
 	if (!gfx)
 		gfx = t8132_find_gfx();
-	if (!pmp || !gfx || !pmp->phandle || !gfx->phandle) {
+	if (!gfx || !pmp->phandle || !gfx->phandle) {
 		pr_warn("t8132-platform-handoff: memory compatibility requires PMP/GFX providers\n");
 		goto apply;
 	}
