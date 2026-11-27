@@ -690,6 +690,26 @@ static const struct kernel_param_ops apple_smc_gp19_off_ops = {
 module_param_cb(gp19_off, &apple_smc_gp19_off_ops, NULL, 0200);
 MODULE_PARM_DESC(gp19_off, "T6030 DIAGNOSTIC: write macOS's gP19 = 00000000 (SD reader power) now");
 
+/*
+ * DIAGNOSTIC (T6030): gp02_macos=1 writes gP02 = 0x04000001 (bytes 01 00 00 04) at probe, macOS's
+ * raw boot write to a GPIO key the ADT doesn't name (lane A, mac-pmgr3-2); Linux only queries it.
+ * Over the key path, not gpio-macsmc's 0x01 << 24 | value encoding.
+ */
+static bool gp02_macos;
+module_param(gp02_macos, bool, 0444);
+MODULE_PARM_DESC(gp02_macos, "T6030 DIAGNOSTIC: at probe, macOS's raw gP02 = 0x04000001");
+
+static void apple_smc_gp02_macos(struct apple_smc *smc)
+{
+	static const u8 val[4] = { 0x01, 0x00, 0x00, 0x04 };
+	u8 before[4] = {};
+	int r0, r1;
+
+	r0 = apple_smc_read(smc, SMC_KEY(gP02), before, sizeof(before));
+	r1 = apple_smc_write(smc, SMC_KEY(gP02), val, sizeof(val));
+	dev_info(smc->dev, "gp02_macos: gP02 read %4ph (%d), written 01000004: %d\n", before, r0, r1);
+}
+
 static void apple_smc_rtkit_shutdown(void *data)
 {
 	struct apple_smc *smc = data;
@@ -915,6 +935,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 	if (smc_cold_init || smc_lite)
 		apple_smc_cold_keys(smc);
+	if (gp02_macos)
+		apple_smc_gp02_macos(smc);
 	apple_smc_lite_smc = smc;
 
 	if (smc->sleep_pmvc_set)

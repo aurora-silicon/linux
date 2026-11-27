@@ -392,6 +392,7 @@ static void t6030_pwrgate_boot(struct apple_sleep *s);
 static void t6030_cpm_probe(struct apple_sleep *s);
 static void t6030_nub_fabric_probe(struct apple_sleep *s);
 static void t6030_pmgr_aon_probe(struct apple_sleep *s);
+static void t6030_pmgr3_probe(struct apple_sleep *s);
 static void t6030_cpm_entry(void);
 static void t6030_eng_probe(struct apple_sleep *s);
 static void t6030_eng_boot_record(struct apple_sleep *s);
@@ -478,6 +479,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_cpm_probe(s);
 	t6030_nub_fabric_probe(s);
 	t6030_pmgr_aon_probe(s);
+	t6030_pmgr3_probe(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -3638,6 +3640,40 @@ static const struct { u16 off; u8 val; } t6030_pmgr_aon_boot_writes[] = {
 static bool t6030_pmgr_aon_boot;
 module_param_named(pmgr_aon_boot, t6030_pmgr_aon_boot, bool, 0444);
 MODULE_PARM_DESC(pmgr_aon_boot, "T6030 DIAGNOSTIC: at probe, XNU's boot writes to the pmgr-aon page 0x3642b4000");
+
+/*
+ * DIAGNOSTIC: the same kind of table in pmgr[3] (lane A, mac-pmgr3-2): XNU writes 0x36427b82c = 4,
+ * then 0x36427b800 = 0x30000 -> 0x30001, and reads +0x838/+0x83c periodically; Linux never touches
+ * pmgr[3]. apple_sleep.pmgr3_boot=1 makes those two writes at probe; the probe record reads the
+ * page's words and the engine's 0x364240008, 0x364202008 and 0x36424002c either way.
+ */
+#define T6030_PMGR3_PA			0x36427b000ULL
+#define T6030_PMGR3_ENTRY		0x82c
+#define T6030_PMGR3_CTL			0x800
+#define T6030_PMGR3_ENTRY_MACOS		4
+#define T6030_ENG_AIC_PA		0x364240000ULL
+#define T6030_ENG_AIC2_PA		0x364202000ULL
+static bool t6030_pmgr3_boot;
+module_param_named(pmgr3_boot, t6030_pmgr3_boot, bool, 0444);
+MODULE_PARM_DESC(pmgr3_boot, "T6030 DIAGNOSTIC: at probe, XNU's 0x36427b82c = 4 and 0x36427b800 = 0x30001 (pmgr[3])");
+
+static void t6030_pmgr3_probe(struct apple_sleep *s)
+{
+	void __iomem *p = t6030_eng_map(s, T6030_PMGR3_PA);
+	void __iomem *a = t6030_eng_map(s, T6030_ENG_AIC_PA);
+	void __iomem *b = t6030_eng_map(s, T6030_ENG_AIC2_PA);
+
+	dev_info(s->dev, "boot engine: pmgr3 +0x800 %#x +0x82c %#x +0x838 %#x +0x83c %#x; 0x364240008 %#x 0x36424002c %#x 0x364202008 %#x\n",
+		 p ? readl(p + 0x800) : ~0U, p ? readl(p + 0x82c) : ~0U, p ? readl(p + 0x838) : ~0U,
+		 p ? readl(p + 0x83c) : ~0U, a ? readl(a + 0x8) : ~0U, a ? readl(a + 0x2c) : ~0U,
+		 b ? readl(b + 0x8) : ~0U);
+	if (!READ_ONCE(t6030_pmgr3_boot) || !p)
+		return;
+	writel(T6030_PMGR3_ENTRY_MACOS, p + T6030_PMGR3_ENTRY);
+	writel(T6030_PMGR_AON_CTL_MACOS, p + T6030_PMGR3_CTL);
+	dev_info(s->dev, "pmgr3_boot: +0x82c -> %#x, +0x800 -> %#x\n", readl(p + T6030_PMGR3_ENTRY),
+		 readl(p + T6030_PMGR3_CTL));
+}
 
 static void t6030_pmgr_aon_probe(struct apple_sleep *s)
 {
