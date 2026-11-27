@@ -354,32 +354,8 @@
  */
 #include "t6050-j714s-ane.dtsi"
 
-/*
- * Wire SPMI controller interrupts (with fault queue windows) and per-port
- * event/sleep/wake IRQs on the four USB-PD controllers so tipd uses
- * interrupt-driven handling and idle sleep instead of 500 ms polling.
- */
-&nub_spmi_a0 {
-	reg = <0x2 0x8a188000 0x0 0x4000>,
-	      <0x2 0x8a184000 0x0 0x4000>;
-	interrupt-controller;
-	#interrupt-cells = <2>;
-	interrupt-parent = <&aic>;
-	interrupts = <AIC_IRQ 0 761 IRQ_TYPE_LEVEL_HIGH>;
-};
-
-&nub_spmi_a1 {
-	reg = <0x2 0x8a1a8000 0x0 0x4000>,
-	      <0x2 0x8a1a4000 0x0 0x4000>;
-	interrupt-controller;
-	#interrupt-cells = <2>;
-	interrupt-parent = <&aic>;
-	interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
-};
-
 /* The port controllers follow the sleep's command rules and use SPMI event/sleep/wake IRQs. */
 &hpm0 {
-	compatible = "apple,t8132-sn201202x", "apple,sn201202x";
 	interrupts = <11 IRQ_TYPE_EDGE_RISING>,
 		     <17 IRQ_TYPE_EDGE_RISING>,
 		     <19 IRQ_TYPE_EDGE_RISING>;
@@ -388,7 +364,6 @@
 };
 
 &hpm1 {
-	compatible = "apple,t8132-sn201202x", "apple,sn201202x";
 	interrupts = <37 IRQ_TYPE_EDGE_RISING>,
 		     <43 IRQ_TYPE_EDGE_RISING>,
 		     <45 IRQ_TYPE_EDGE_RISING>;
@@ -397,7 +372,6 @@
 };
 
 &hpm2 {
-	compatible = "apple,t8132-sn201202x", "apple,sn201202x";
 	interrupts = <11 IRQ_TYPE_EDGE_RISING>,
 		     <17 IRQ_TYPE_EDGE_RISING>,
 		     <19 IRQ_TYPE_EDGE_RISING>;
@@ -406,7 +380,6 @@
 };
 
 &hpm5 {
-	compatible = "apple,t8132-sn201202x", "apple,sn201202x";
 	interrupts = <63 IRQ_TYPE_EDGE_RISING>,
 		     <69 IRQ_TYPE_EDGE_RISING>,
 		     <71 IRQ_TYPE_EDGE_RISING>;
