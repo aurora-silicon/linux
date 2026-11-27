@@ -29,5 +29,15 @@
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+};
+
 /* The USB-C ports ATC1 and ATC2, as on the other K boards */
 #include "t6050-k114-k116-usb.dtsi"
