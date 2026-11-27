@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Disabled auxiliary SPMI resources; primary polled PMIC access is retained. */
+/*
+ * Auxiliary SPMI resources; primary polled PMIC access is retained.
+ * The CLVR buses (Monaco CPU-cluster regulator PMICs) are enabled read-only.
+ */
 
 &die0 {
 	primary_spmi_monitor: spmi-monitor@2920a0e00 {
@@ -26,11 +29,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 
@@ -45,11 +48,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 };
@@ -104,11 +107,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 
@@ -123,11 +126,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 
@@ -142,11 +145,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 
@@ -161,11 +164,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 
@@ -180,11 +183,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
 		pmic@f {
 			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
-			status = "disabled";
+			read-only;
 		};
 	};
 };
@@ -227,11 +230,12 @@
 	interrupts = <AIC_IRQ 0 340 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
+
 	pmic@f {
 		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 		reg = <0xf SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
@@ -243,11 +247,12 @@
 	interrupts = <AIC_IRQ 0 342 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
+
 	pmic@f {
 		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 		reg = <0xf SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
@@ -259,11 +264,12 @@
 	interrupts = <AIC_IRQ 0 344 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
+
 	pmic@f {
 		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
 		reg = <0xf SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
