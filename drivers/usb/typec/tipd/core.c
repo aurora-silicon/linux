@@ -916,25 +916,26 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 
 		/*
 		 * The sink dropped HPD and raised it again within the debounce
-		 * window, as a monitor does after losing the link. The coalesced
-		 * state looks unchanged, so the display side would never hear of
-		 * it: report the pulse as IRQ_HPD. A port with a displayport
-		 * reference reports the pulse out of band instead, as a
-		 * disconnect and a connect (see cd321x_update_work()).
+		 * window, as a monitor does after losing the link or waking
+		 * from standby. Replay HPD low first so the display route
+		 * disconnects and retrains the link anew, matching an
+		 * uncoalesced HPD drop. A port with a displayport reference
+		 * reports the pulse out of band instead, as a disconnect and
+		 * a connect (see cd321x_update_work()).
 		 */
 		hpd_pulse = !tps->h17_display &&
 			    !(IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode) &&
+			    cd321x->state_valid &&
+			    cd321x->state.alt == cd321x->port_altmode_dp &&
 			    (st->data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
 			    (dp_data.status & DP_STATUS_HPD_STATE) &&
 			    (cd321x->dp_status & DP_STATUS_HPD_STATE);
-		if (hpd_pulse)
-			dp_data.status |= DP_STATUS_IRQ_HPD;
 
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_dp &&
 		    cd321x->state.mode == mode && cd321x->dp_conf == dp_data.conf)
 			send = cd321x_dp_send(cd321x->dp_status, dp_data.status, hpd_pulse);
 		else
-			send = CD321X_DP_SEND;
+			send = hpd_pulse ? CD321X_DP_SEND_EDGE : CD321X_DP_SEND;
 		if (send == CD321X_DP_SEND_NONE)
 			return 0;
 
@@ -946,7 +947,8 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			goto out;
 		if (send == CD321X_DP_SEND_EDGE) {
 			struct typec_displayport_data edge = {
-				.status = dp_data.status & ~DP_STATUS_IRQ_HPD,
+				.status = dp_data.status &
+					  ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD),
 				.conf = dp_data.conf,
 			};
 
@@ -1358,6 +1360,8 @@ static void cd321x_update_work(struct work_struct *work)
 			cd321x->state = old_state;
 			goto retry;
 		}
+		cd321x->dp_status = 0;
+		cd321x->dp_conf = 0;
 		cd321x->display_route_active = false;
 	}
 
