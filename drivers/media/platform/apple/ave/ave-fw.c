@@ -48,6 +48,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T8132_26B123, /* encoder firmware macOS 27.2 26B123 / T8132 */
 	AVE_FW_TEXT_CRC_T8142_26B123, /* encoder firmware 9013.55.1, macOS 27.2 26B123 / T8142 */
 	0x460c7a7c, /* encoder firmware 6070.11.1 / T6000 */
+	AVE_FW_TEXT_CRC_T6001_6070, /* encoder firmware 6070.11.1 / T6001 */
 	0x25bfd039, /* encoder firmware 6070.11.1 / T8112 */
 };
 

@@ -194,6 +194,12 @@ enum ave_opcode {
  * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
  */
 #define AVE_FW_TEXT_CRC_T8142_26B123 0x24eb4625
+/*
+ * The M1 Max (T6001) build of encoder firmware 6070.11.1, as the macOS 13.5
+ * stub preloads it: TEXT 0xec000, DATA 0x134000. The TEXT CRC with the
+ * TEXT->DATA link cell at 0x423c zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T6001_6070 0x65d16c38
 
 struct ave_ctx;
 

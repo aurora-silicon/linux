@@ -51,14 +51,28 @@ static const struct ave_coproc_regs ave_coproc_6070 = {
 	.keep_mappings = 0x400808,
 };
 
+/*
+ * The M1 Pro (T6000) and the M1 Max (T6001) die 0 encoders, both
+ * apple,t6000-ave, start the same way and speak the 6070.11.1 command
+ * layout, but the macOS 13.5 (22G74) stub preloads each chip's own build of
+ * that firmware: the M1 Max's has TEXT 0xec000 and DATA 0x134000. The
+ * segment sizes select the build. Both builds have the TEXT->DATA link cell
+ * at 0x423c, and each one's TEXT CRC, with that cell hashed as zero, must
+ * match.
+ */
+static const struct ave_fw_build ave_t6000_builds[] = {
+	{ "22G74", 0xd0000, 0x128000, 0x460c7a7c },
+	/* The M1 Max's build */
+	{ "22G74", 0xec000, 0x134000, AVE_FW_TEXT_CRC_T6001_6070 },
+};
+
 const struct ave_variant ave_t6000 = {
 	.regs = &ave_coproc_6070,
-	.fw_text_size = 0xd0000,
-	.fw_data_size = 0x128000,
+	.builds = ave_t6000_builds,
+	.build_count = ARRAY_SIZE(ave_t6000_builds),
 	.boot_device_id = 14,
 	.device_type = 11,
 	.lfs_ref_scale = 1,
-	.text_crc = 0x460c7a7c,
 	.boot_arg_value = 0x400,
 	.timebase_multiplier = 1000000,
 	.text_link_cell = 0x423c,

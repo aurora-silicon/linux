@@ -49,6 +49,10 @@ T6000 (M1 Pro) and T8112 (M2) have probe-only support in this driver. Their
 device tree nodes and both encoder DARTs remain disabled. The firmware
 handoff must reserve their preloaded TEXT (0xd0000 bytes) and DATA
 (0x128000 bytes), preserve the ADT remap addresses and export both CRCs.
+The M1 Max (T6001) encoder matches as T6000 but gets its own build of the
+firmware, with TEXT 0xec000 and DATA 0x134000 bytes and TEXT CRC
+``65d16c38``; the segment sizes select the build and only that CRC is
+admitted with them.
 An enabled node with a valid handoff may bind, but encoding is refused with
 an informational message until per-SoC command constants, MCC DSID and the
 firmware CRCs have been qualified. The T8140 command constants are never a

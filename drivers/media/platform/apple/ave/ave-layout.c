@@ -992,6 +992,9 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
+	/* The M1 Max's build of 6070.11.1 takes the M1 Pro's commands. */
+	if (crc == AVE_FW_TEXT_CRC_T6001_6070)
+		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
 	 * same firmware version (9013.45.1): one macOS driver builds the
