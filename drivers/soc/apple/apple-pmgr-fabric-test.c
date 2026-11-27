@@ -342,7 +342,7 @@ static void pf_voters_active_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE_MSG(test, apple_pmgr_voters_active(misc), "voter %u", i);
 		f->votes[i] = PF_VOTE_IDLE;
 	}
-	/* Absent optional voter (venc_sys) is skipped cleanly. */
+	/* Absent optional voter (venc_dma) is skipped cleanly. */
 	misc->votes[3].regmap = NULL;
 	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
 
@@ -864,13 +864,13 @@ static void pf_tiered_eval_order_and_timers_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pf_step_log[2], 5U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[3], 6U);
 
-	/* Return to IDLE; venc_sys override promotes immediately (0-sample latency). */
+	/* Return to IDLE; venc_dma override promotes immediately (0-sample latency). */
 	f->sample = (struct apple_pmgr_gov_sample){};
 	apple_pmgr_tiered_eval(misc, PF_MS(2000));
 	apple_pmgr_tiered_eval(misc, PF_MS(2500));
 	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
 
-	f->votes[3] = PF_VOTE_BUSY;	/* venc_sys */
+	f->votes[3] = PF_VOTE_BUSY;	/* venc_dma */
 	pf_step_cnt = 0;
 	apple_pmgr_tiered_eval(misc, PF_MS(2520));
 	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
@@ -1091,7 +1091,7 @@ static void pf_dt_voters_test(struct kunit *test)
 		{ "power-controller@100", "gfx", 0x100 },
 		{ "power-controller@110", "avd_sys", 0x110 },
 		{ "power-controller@118", "isp_sys", 0x118 },
-		{ "power-controller@128", "venc_sys", 0x128 },
+		{ "power-controller@128", "venc_dma", 0x128 },
 	};
 	struct pf_test *f = test->priv;
 	struct apple_pmgr_misc *misc = &f->misc;
@@ -1100,7 +1100,7 @@ static void pf_dt_voters_test(struct kunit *test)
 	pf_dt_require_fixture_only(test);
 
 	KUNIT_ASSERT_FALSE(test, IS_ERR(map));
-	/* Optional venc_sys absent: voters_ok is still true. */
+	/* Optional venc_dma absent: voters_ok is still true. */
 	KUNIT_EXPECT_TRUE(test, pf_dt_find(test, misc, c, ARRAY_SIZE(c)));
 	/* Matched by label, in the order of apple_pmgr_fabric_voters. */
 	KUNIT_EXPECT_EQ(test, misc->votes[0].reg, 0x100U);
@@ -1119,7 +1119,7 @@ static void pf_dt_voters_test(struct kunit *test)
 	pf_dt_regs[0x100 / 4] = PF_VOTE_IDLE;
 	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
 
-	/* When venc_sys is present, it is bound and active checks include it. */
+	/* When venc_dma is present, it is bound and active checks include it. */
 	KUNIT_EXPECT_TRUE(test, pf_dt_find(test, misc, c_venc, ARRAY_SIZE(c_venc)));
 	KUNIT_EXPECT_EQ(test, misc->votes[3].reg, 0x128U);
 	KUNIT_EXPECT_PTR_EQ(test, misc->votes[3].regmap, map);

@@ -76,14 +76,15 @@ struct apple_pmgr_voter_spec {
  * Bandwidth users that keep the fabric up whenever their power domain is
  * active. External display and ANE system domains stay on even when idle,
  * so external displays vote through apple_pmgr_fabric_hold() instead, and
- * the ANE is not covered. venc_sys is optional so platforms whose DT omits
- * it keep voters_ok intact.
+ * the ANE is not covered. venc_dma (the encoder's own domain, rather than
+ * parent venc_sys which stays on for attached AVE DARTs when unbound) is
+ * optional so platforms whose DT omits it keep voters_ok intact.
  */
 static const struct apple_pmgr_voter_spec apple_pmgr_fabric_voters[] = {
 	{ .label = "gfx" },
 	{ .label = "avd_sys" },
 	{ .label = "isp_sys" },
-	{ .label = "venc_sys", .optional = true },
+	{ .label = "venc_dma", .optional = true },
 };
 
 enum sys_device {
@@ -1456,7 +1457,7 @@ static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
 	ret = apple_pmgr_apply_targets(misc, target_fab, target_dcs);
 	/*
 	 * Keep a non-deferrable poll whenever fabric or DCS is lowered so hard
-	 * voters (avd_sys, isp_sys, venc_sys) and cross-core CPU load are
+	 * voters (avd_sys, isp_sys, venc_dma) and cross-core CPU load are
 	 * raised within a bounded window; FULL under a hard override stays
 	 * deferrable since fabric/DCS are already at max and cannot demote.
 	 */
