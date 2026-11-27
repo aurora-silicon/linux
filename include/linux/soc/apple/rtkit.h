@@ -258,8 +258,8 @@ int apple_rtkit_boot(struct apple_rtkit *rtk);
 
 /* apple_rtkit_boot(), calling @before_ap between the IOP's report and the AP going on. */
 int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data), void *data);
-int apple_rtkit_boot_from_init_with(struct apple_rtkit *rtk, void (*before_ap)(void *data),
-				    void *data);
+int apple_rtkit_boot_from_init_with(struct apple_rtkit *rtk, unsigned int ms,
+				    void (*before_ap)(void *data), void *data);
 
 /*
  * Mark an instance created with apple_rtkit_init() as running without a

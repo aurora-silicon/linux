@@ -2881,28 +2881,6 @@ int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot_with);
 
-/*
- * DIAGNOSTIC: a coprocessor the boot loader left running, booted again the way XNU boots T6030's
- * SMC: IOP power state INIT, after which the firmware says HELLO again, then the whole handshake
- * (its endpoint map with the system endpoints, their buffers, the IOP power ack), @before_ap, and
- * AP power on.
- */
-int apple_rtkit_boot_from_init_with(struct apple_rtkit *rtk, void (*before_ap)(void *data),
-				    void *data)
-{
-	int ret;
-
-	if (rtk->crashed)
-		return -EINVAL;
-	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
-					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
-						     APPLE_RTKIT_PWR_STATE_INIT));
-	if (ret)
-		return ret;
-	return apple_rtkit_boot_common(rtk, false, before_ap, data);
-}
-EXPORT_SYMBOL_GPL(apple_rtkit_boot_from_init_with);
-
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 {
 	if (rtk->crashed)
@@ -3201,6 +3179,40 @@ static int apple_rtkit_done_within(struct apple_rtkit *rtk, struct completion *c
 
 	return try_wait_for_completion(c);
 }
+
+/*
+ * DIAGNOSTIC: a coprocessor the boot loader left running, booted again the way XNU boots T6030's
+ * SMC: IOP power state INIT, after which the firmware says HELLO again, then the whole handshake
+ * (its endpoint map with the system endpoints, their buffers, the IOP power ack), @before_ap, and
+ * AP power on. -ETIMEDOUT, with nothing else sent, if the endpoint map isn't done within @ms
+ * (the caller then wakes the coprocessor as usual).
+ */
+int apple_rtkit_boot_from_init_with(struct apple_rtkit *rtk, unsigned int ms,
+				    void (*before_ap)(void *data), void *data)
+{
+	bool poll_waits;
+	int ret;
+
+	if (rtk->crashed)
+		return -EINVAL;
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
+					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
+						     APPLE_RTKIT_PWR_STATE_INIT));
+	if (ret)
+		return ret;
+	ret = apple_rtkit_done_within(rtk, &rtk->epmap_completion, ms);
+	if (ret < 0)
+		return ret;
+	if (!ret)
+		return -ETIMEDOUT;
+	/* The rest of the handshake bounded too (handshake_timeout_ms per wait, mailbox polled) */
+	poll_waits = rtk->poll_waits;
+	rtk->poll_waits = true;
+	ret = apple_rtkit_boot_common(rtk, false, before_ap, data);
+	rtk->poll_waits = poll_waits;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_from_init_with);
 
 /*
  * Some firmware reports in by itself once its CPU runs and then acknowledges

@@ -613,6 +613,7 @@ static const struct apple_rtkit_ops apple_smc_rtkit_ops_cold = {
 };
 
 static int apple_smc_cold_ep_ret = -EINPROGRESS;
+#define SMC_COLD_INIT_MS	2000
 
 static void apple_smc_cold_key_ep(void *data)
 {
@@ -807,23 +808,28 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(smc->rtk), "Failed to initialize RTKit");
 
 	smc->boot_stage = APPLE_SMC_BOOTING;
+	ret = -ENOENT;
 	if (smc_cold_init) {
-		ret = apple_rtkit_boot_from_init_with(smc->rtk, apple_smc_cold_key_ep, smc);
-		dev_info(dev, "smc_cold_init: RTKit boot from IOP power INIT: %d; endpoint 0x20 before AP power on: %d\n",
-			 ret, apple_smc_cold_ep_ret);
-		if (ret)
+		ret = apple_rtkit_boot_from_init_with(smc->rtk, SMC_COLD_INIT_MS,
+						      apple_smc_cold_key_ep, smc);
+		dev_info(dev, "smc_cold_init: RTKit boot from IOP power INIT: %d; endpoint 0x20 before AP power on: %d%s\n",
+			 ret, apple_smc_cold_ep_ret,
+			 ret == -ETIMEDOUT ? " (no HELLO in time: waking as usual)" : "");
+		if (ret && ret != -ETIMEDOUT)
 			return dev_err_probe(dev, ret, "Failed to boot SMC from INIT");
-	} else {
+	}
+	if (ret) {
 		ret = apple_rtkit_wake(smc->rtk);
 		if (ret)
 			return dev_err_probe(dev, ret, "Failed to wake up SMC");
+		apple_smc_cold_ep_ret = -ENOENT;
 	}
 
 	ret = devm_add_action_or_reset(dev, apple_smc_rtkit_shutdown, smc);
 	if (ret)
 		return ret;
 
-	if (smc_cold_init)
+	if (apple_smc_cold_ep_ret != -ENOENT && smc_cold_init)
 		ret = apple_smc_cold_ep_ret;
 	else
 		ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
