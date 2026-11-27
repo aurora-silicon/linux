@@ -1013,6 +1013,13 @@
 				reg = <0x01>;
 				apple,smc = <&smc>;
 				apple,cpu-busy-floor = <6 3>;
+				/*
+				 * GPU busy-share memory-state ladder split at 160, 500, and
+				 * 800 permille; top column matches apple_clpc_hw_t6050's
+				 * DCS 6 / fabric 2 floor.
+				 */
+				apple,gpu-busy-memory-states = <1 2 4 6>, <0 0 0 2>;
+				apple,gpu-busy-permille = <160 500 800>;
 			};
 		};
 
