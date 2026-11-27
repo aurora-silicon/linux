@@ -1977,7 +1977,10 @@ static void dcp_v27_early_any_init(struct apple_epic_service *service, const cha
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct dcp_v27_early_open_work *w;
 
-	if (service->ep->endpoint != AV_ENDPOINT || !name || !strstr(name, "VideoInterface"))
+	/* Announced with its class as the service's name (T6030: DCPAVSimpleVideoInterface) */
+	if (service->ep->endpoint != AV_ENDPOINT ||
+	    !((class && strstr(class, "VideoInterface")) || (name && strstr(name, "VideoInterface")) ||
+	      (name && strstr(name, "video-interface"))))
 		return;
 	if (READ_ONCE(dcp->av_video_reopen)) {
 		w = kzalloc(sizeof(*w), GFP_KERNEL);
