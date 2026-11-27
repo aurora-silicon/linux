@@ -25,8 +25,11 @@ struct avd_h264_br {
 	bool err;
 };
 
+bool avd_h264_mode_supported(s32 decode_mode, s32 start_code);
 int avd_h264_next_nalu(const u8 *buf, u32 len, u32 *cursor,
 		       struct avd_h264_nalu *nalu);
+int avd_h264_next_frame_nalu(const u8 *buf, u32 len, s32 start_code,
+			     u32 *cursor, struct avd_h264_nalu *nalu);
 
 int avd_h264_parse_slice_header(const u8 *nal, u32 nal_len,
 				u8 nal_ref_idc, u8 nal_unit_type,

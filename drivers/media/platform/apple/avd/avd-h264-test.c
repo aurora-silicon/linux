@@ -1379,6 +1379,163 @@ static void avd_slice_hdr_real_annexb_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, bit_off, 0);
 }
 
+static void avd_frame_mode_framing_test(struct kunit *test)
+{
+	/* Real libx264 CABAC IDR slice, unprefixed (7.3.1 NALU) and Annex-B. */
+	static const u8 raw_idr[] = {
+		0x65, 0x88, 0x84, 0x00, 0x87, 0x69, 0xd7, 0xdc, 0x00, 0x00,
+	};
+	static const u8 annexb_two_slice[] = {
+		0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x08, 0x7c, 0x42, 0x22, 0xb0,
+		0x00, 0x00, 0x01, 0x65, 0x12, 0x22, 0x10, 0x77, 0xf1, 0xff, 0x87,
+	};
+	static const u8 raw_with_embedded_sc[] = {
+		0x65, 0x88, 0x84, 0x00, 0x00, 0x01, 0x65, 0x12,
+	};
+	static const u8 bad_raw_hdrs[] = {
+		0x00, 0x06, 0x09, 0x67, 0x68, 0x22, 0x23, 0x24, 0x2e, 0x34, 0xe5,
+	};
+	static const u8 one_byte[] = { 0x65 };
+	static const u8 trunc_zeros[] = { 0x00, 0x00 };
+	struct avd_parse_test_ctx *t = avd_parse_test_alloc(test);
+	struct avd_h264_nalu nalu;
+	u32 cursor, data_off;
+	u8 bit_off;
+
+	/* Mode / start-code pairing matrix */
+	KUNIT_EXPECT_TRUE(test,
+			  avd_h264_mode_supported(V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
+						  V4L2_STATELESS_H264_START_CODE_NONE));
+	KUNIT_EXPECT_FALSE(test,
+			   avd_h264_mode_supported(V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
+						   V4L2_STATELESS_H264_START_CODE_ANNEX_B));
+	KUNIT_EXPECT_TRUE(test,
+			  avd_h264_mode_supported(V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
+						  V4L2_STATELESS_H264_START_CODE_ANNEX_B));
+	KUNIT_EXPECT_TRUE(test,
+			  avd_h264_mode_supported(V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
+						  V4L2_STATELESS_H264_START_CODE_NONE));
+	KUNIT_EXPECT_FALSE(test,
+			   avd_h264_mode_supported(-1, V4L2_STATELESS_H264_START_CODE_NONE));
+	KUNIT_EXPECT_FALSE(test,
+			   avd_h264_mode_supported(V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED, 2));
+
+	/* FRAME_BASED + START_CODE_ANNEX_B: accepts Annex-B, rejects raw NALU */
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+						 &cursor, &nalu),
+			1);
+	KUNIT_EXPECT_EQ(test, nalu.nal_unit_type, 5);
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+						 &cursor, &nalu),
+			1);
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+						 &cursor, &nalu),
+			0);
+
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(raw_idr, sizeof(raw_idr),
+						 V4L2_STATELESS_H264_START_CODE_ANNEX_B,
+						 &cursor, &nalu),
+			-EINVAL);
+
+	/* FRAME_BASED + START_CODE_NONE: accepts unprefixed 7.3.1 VCL slice NALU */
+	t->sps.chroma_format_idc = 1;
+	t->sps.pic_order_cnt_type = 0;
+	t->pps.num_ref_idx_l0_default_active_minus1 = 1;
+	t->pps.flags = V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE |
+		       V4L2_H264_PPS_FLAG_WEIGHTED_PRED |
+		       V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
+
+	cursor = 0;
+	KUNIT_ASSERT_EQ(test,
+			avd_h264_next_frame_nalu(raw_idr, sizeof(raw_idr),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			1);
+	KUNIT_EXPECT_EQ(test, nalu.off, 0);
+	KUNIT_EXPECT_EQ(test, nalu.len, sizeof(raw_idr) - 2);
+	KUNIT_EXPECT_EQ(test, nalu.nal_unit_type, 5);
+	KUNIT_EXPECT_EQ(test, nalu.nal_ref_idc, 3);
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(raw_idr, sizeof(raw_idr),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			avd_h264_parse_slice_header(raw_idr + nalu.off, nalu.len,
+						    nalu.nal_ref_idc, nalu.nal_unit_type,
+						    &t->sps, &t->pps, &t->decode,
+						    0, NULL, NULL, NULL,
+						    &t->sl, &t->weights,
+						    &data_off, &bit_off),
+			0);
+	KUNIT_EXPECT_EQ(test, t->sl.slice_type, V4L2_H264_SLICE_TYPE_I);
+	KUNIT_EXPECT_EQ(test, t->sl.slice_qp_delta, 8);
+	KUNIT_EXPECT_EQ(test, data_off, 5);
+	KUNIT_EXPECT_EQ(test, bit_off, 0);
+
+	/* FRAME_BASED + START_CODE_NONE: Chromium Annex-B compatibility path */
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			1);
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			1);
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(annexb_two_slice, sizeof(annexb_two_slice),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			0);
+
+	/* Error paths for FRAME_BASED + START_CODE_NONE and invalid start_code */
+	for (unsigned int i = 0; i < ARRAY_SIZE(bad_raw_hdrs); i++) {
+		u8 buf[] = { bad_raw_hdrs[i], 0x88, 0x84 };
+
+		cursor = 0;
+		KUNIT_EXPECT_EQ(test,
+				avd_h264_next_frame_nalu(buf, sizeof(buf),
+							 V4L2_STATELESS_H264_START_CODE_NONE,
+							 &cursor, &nalu),
+				-EINVAL);
+	}
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(one_byte, sizeof(one_byte),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			-EINVAL);
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(trunc_zeros, sizeof(trunc_zeros),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			-EINVAL);
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(raw_with_embedded_sc, sizeof(raw_with_embedded_sc),
+						 V4L2_STATELESS_H264_START_CODE_NONE,
+						 &cursor, &nalu),
+			-EINVAL);
+	cursor = 0;
+	KUNIT_EXPECT_EQ(test,
+			avd_h264_next_frame_nalu(raw_idr, sizeof(raw_idr), 2,
+						 &cursor, &nalu),
+			-EINVAL);
+}
+
 static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE(avd_scaling_flat_test),
 	KUNIT_CASE_PARAM(avd_slice_data_test, avd_slice_data_gen_params),
@@ -1388,6 +1545,7 @@ static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE(avd_sps_range_test),
 	KUNIT_CASE(avd_start_slices_test),
 	KUNIT_CASE(avd_annexb_scanner_test),
+	KUNIT_CASE(avd_frame_mode_framing_test),
 	KUNIT_CASE(avd_bitreader_epb_test),
 	KUNIT_CASE(avd_slice_hdr_epb_boundary_test),
 	KUNIT_CASE(avd_slice_hdr_fields_test),

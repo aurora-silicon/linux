@@ -1163,7 +1163,9 @@ static int avd_h264_run_frame(struct avd_ctx *ctx, struct avd_h264_run *run)
 	max_slices = avd_h264_max_slices(run->sps);
 	cursor = 0;
 	num_slices = 0;
-	while ((ret = avd_h264_next_nalu(data, payload_len, &cursor, &nalu)) > 0) {
+	while ((ret = avd_h264_next_frame_nalu(data, payload_len,
+					       run->start_code,
+					       &cursor, &nalu)) > 0) {
 		num_slices++;
 		if (num_slices > max_slices) {
 			dev_err_ratelimited(ctx->dev->dev,
@@ -1173,7 +1175,7 @@ static int avd_h264_run_frame(struct avd_ctx *ctx, struct avd_h264_run *run)
 	}
 	if (ret < 0 || !num_slices) {
 		dev_dbg_ratelimited(ctx->dev->dev,
-				    "no valid H.264 slice NALUs in Annex-B buffer\n");
+				    "no valid H.264 slice NALUs in frame buffer\n");
 		return -EINVAL;
 	}
 
@@ -1199,7 +1201,9 @@ static int avd_h264_run_frame(struct avd_ctx *ctx, struct avd_h264_run *run)
 	cursor = 0;
 	slice_idx = 0;
 	last_mb = 0;
-	while ((ret = avd_h264_next_nalu(data, payload_len, &cursor, &nalu)) > 0) {
+	while ((ret = avd_h264_next_frame_nalu(data, payload_len,
+					       run->start_code,
+					       &cursor, &nalu)) > 0) {
 		u32 slice_data_off;
 		u8 slice_bit_off;
 
@@ -1277,19 +1281,12 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	if (ret)
 		goto err_free_jobs;
 
+	if (!avd_h264_mode_supported(run.decode_mode, run.start_code)) {
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
 	if (run.decode_mode == V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED) {
-		/*
-		 * Frame-based stateless clients (for example Chromium's V4L2
-		 * H.264 delegate) may set DECODE_MODE=FRAME_BASED while
-		 * leaving START_CODE at the driver default (START_CODE_NONE)
-		 * and still emit Annex-B start codes in the OUTPUT buffer.
-		 * Annex-B framing is still validated in avd_h264_run_frame().
-		 */
-		if (run.start_code != V4L2_STATELESS_H264_START_CODE_ANNEX_B &&
-		    run.start_code != V4L2_STATELESS_H264_START_CODE_NONE) {
-			ret = -EINVAL;
-			goto err_free_jobs;
-		}
 		ret = avd_h264_run_frame(ctx, &run);
 		if (ret)
 			goto err_free_jobs;
@@ -1297,12 +1294,6 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		ctx->job_fifo = h264_ctx->b->bufs.inst.addr;
 		h264_ctx->b->submitted = true;
 		return avd_submit_job(ctx);
-	}
-
-	if (run.decode_mode != V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED ||
-	    run.start_code != V4L2_STATELESS_H264_START_CODE_NONE) {
-		ret = -EINVAL;
-		goto err_free_jobs;
 	}
 
 	ret = avd_h264_validate_slice(ctx, run.slice_params);
