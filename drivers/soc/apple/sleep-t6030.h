@@ -2315,6 +2315,10 @@ static const u32 t6030_wfi_on[] = {
 	0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, /* UART1-6 */
 };
 
+#define T6030_PS_GPU_GPX		0x0
+#define T6030_PS_MIN			GENMASK(19, 16)
+#define T6030_GPX_MIN_MACOS		4
+
 static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 {
 	unsigned int i, stuck = 0;
@@ -2351,6 +2355,17 @@ static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 	v = readl(s->ps_aon + T6030_AON_NUB_FABRIC);
 	if (FIELD_GET(PS_ACTUAL, v) == 0xf && !(v & PS_AUTO_ENABLE))
 		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + T6030_AON_NUB_FABRIC);
+	/*
+	 * GPX (ps-gpu +0x0): its minimum state 4 (bits 19:16), the one real value left between
+	 * Linux's words and macOS's at the final WFI (0x1f0402ff there; Linux 0x1f0002ff).
+	 */
+	if (t->blk[T6030_BLK_PS_GPU]) {
+		v = readl(t->blk[T6030_BLK_PS_GPU] + T6030_PS_GPU_GPX);
+		if (FIELD_GET(T6030_PS_MIN, v) != T6030_GPX_MIN_MACOS)
+			writel((v & ~(PS_FLAGS | T6030_PS_MIN)) |
+			       FIELD_PREP(T6030_PS_MIN, T6030_GPX_MIN_MACOS),
+			       t->blk[T6030_BLK_PS_GPU] + T6030_PS_GPU_GPX);
+	}
 	sleep_note_at(s, 2, 0x80 | min(stuck, 0x7fU));
 }
 
