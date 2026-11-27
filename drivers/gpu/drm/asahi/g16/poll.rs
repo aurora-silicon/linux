@@ -886,8 +886,9 @@ impl Firmware {
         let mut oldest_compute: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
             [None; super::hw::sizes::COMPUTE_PIPES];
         let mut compute_behind = [false; super::hw::sizes::COMPUTE_PIPES];
-        let mut oldest_render: Option<&Flight> = None;
-        let mut render_behind = false;
+        let mut oldest_render: [Option<&Flight>; super::hw::sizes::RENDER_PAIRS] =
+            [None; super::hw::sizes::RENDER_PAIRS];
+        let mut render_behind = [false; super::hw::sizes::RENDER_PAIRS];
         for f in self.engine.flights.iter() {
             if f.computes != 0 {
                 let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
@@ -898,10 +899,11 @@ impl Firmware {
                 }
             }
             if f.renders != 0 {
-                if oldest_render.is_none() {
-                    oldest_render = Some(f);
+                let r = (f.render_pair as usize).min(super::hw::sizes::RENDER_PAIRS - 1);
+                if oldest_render[r].is_none() {
+                    oldest_render[r] = Some(f);
                 } else {
-                    render_behind = true;
+                    render_behind[r] = true;
                 }
             }
         }
@@ -920,15 +922,17 @@ impl Firmware {
                 }
             }
         }
-        if let Some(f) = oldest_render {
-            if let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) {
-                let reached = if render_behind {
-                    stamp_reached(obs, f.fs_target, self.engine.fs_target)
-                } else {
-                    obs == f.fs_target
-                };
-                if reached {
-                    return true;
+        for r in 0..super::hw::sizes::RENDER_PAIRS {
+            if let Some(f) = oldest_render[r] {
+                if let Ok(obs) = self.graph.render[r].fw_stamp[1].r32(0) {
+                    let reached = if render_behind[r] {
+                        stamp_reached(obs, f.fs_target, self.engine.fs_target[r])
+                    } else {
+                        obs == f.fs_target
+                    };
+                    if reached {
+                        return true;
+                    }
                 }
             }
         }
@@ -950,7 +954,10 @@ impl Firmware {
             return Ok(false);
         }
         let mut retired_any = false;
-        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
+        let (mut check_compute, mut check_render) = (
+            [true; super::hw::sizes::COMPUTE_PIPES],
+            [true; super::hw::sizes::RENDER_PAIRS],
+        );
         let mut ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         while let Ok(Some((index, receipt))) = ret {
             let outcome = self.retire_outcome_at(index, receipt);
@@ -1051,8 +1058,14 @@ impl Firmware {
                 let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
                 (f.c_start, f.head, self.engine.head[p])
             }
-            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head),
-            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head),
+            Channel::Ta | Channel::Fs => {
+                let r = (f.render_pair as usize).min(super::hw::sizes::RENDER_PAIRS - 1);
+                if matches!(channel, Channel::Ta) {
+                    (f.ta_start, f.ta_head, self.engine.ta_head[r])
+                } else {
+                    (f.fs_start, f.fs_head, self.engine.fs_head[r])
+                }
+            }
         };
         if head >= cap || start >= cap || tail >= cap {
             return Err(EINVAL);
@@ -1131,6 +1144,46 @@ impl Firmware {
         Ok(())
     }
 
+    /// Latches `Channel::Ta` / `Channel::Fs` read and completion proofs onto active render
+    /// flights before the shared submit rings can lap them, so a long flight on one render pair
+    /// stays retirable while another pair keeps posting records.
+    pub(crate) fn latch_render_channel_receipts(&mut self) -> Result {
+        if !self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.renders != 0 && f.render_chan_settled.contains(&false))
+        {
+            return Ok(());
+        }
+        let slots = super::fw::channels::RING_SLOTS;
+        for (i, channel) in [Channel::Ta, Channel::Fs].into_iter().enumerate() {
+            let pipe = self.channels.channel(channel);
+            let read = pipe.read()?;
+            let comp = pipe.completion()?;
+            if read >= slots || comp >= slots {
+                continue;
+            }
+            let producer = self.channels.producer(channel);
+            for f in self.engine.flights.iter_mut() {
+                if f.renders == 0 || f.render_chan_settled[i] {
+                    continue;
+                }
+                let record = f.rec[i];
+                if record >= slots {
+                    return Err(EINVAL);
+                }
+                let first = (record + slots - 1) % slots;
+                if ring_passed(read, first, record, producer, slots)
+                    && ring_passed(comp, first, record, producer, slots)
+                {
+                    f.render_chan_settled[i] = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
     pub(crate) fn queue_receipt(
@@ -1143,25 +1196,6 @@ impl Firmware {
     ) -> Result<bool> {
         Ok(self.queue_ring_receipt(state, info, head)?
             && self.channel_receipt(channel, record, false)?)
-    }
-
-    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
-    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
-    /// pipe's read and completion cursors passed its record.
-    fn queue_passed(
-        &self,
-        channel: Channel,
-        state: &super::object::FwObject,
-        info: &super::object::FwObject,
-        f: &Flight,
-    ) -> Result<bool> {
-        let record = match channel {
-            Channel::Compute => f.rec[2],
-            Channel::Ta => f.rec[0],
-            Channel::Fs => f.rec[1],
-        };
-        Ok(self.queue_ring_passed(channel, state, info, f)?
-            && self.channel_receipt(channel, record, true)?)
     }
 
     /// A full receipt includes stage and notifier stamps, every physical consumer,
@@ -1183,7 +1217,10 @@ impl Firmware {
     /// Inspects the oldest compute flight per pipe and oldest render flight independently so any
     /// pipe/class can retire as soon as its hardware receipt settles without waiting on another.
     pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
-        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
+        let (mut check_compute, mut check_render) = (
+            [true; super::hw::sizes::COMPUTE_PIPES],
+            [true; super::hw::sizes::RENDER_PAIRS],
+        );
         self.retired_flight_classes(&mut check_compute, &mut check_render)
     }
 
@@ -1192,11 +1229,12 @@ impl Firmware {
     fn retired_flight_classes(
         &mut self,
         check_compute: &mut [bool; super::hw::sizes::COMPUTE_PIPES],
-        check_render: &mut bool,
+        check_render: &mut [bool; super::hw::sizes::RENDER_PAIRS],
     ) -> Result<Option<(usize, Retirement)>> {
+        const RP: usize = super::hw::sizes::RENDER_PAIRS;
         let mut compute_idx = [None; super::hw::sizes::COMPUTE_PIPES];
-        let mut render_idx = None;
-        if check_compute.iter().any(|&c| c) || *check_render {
+        let mut render_idx: [Option<usize>; RP] = [None; RP];
+        if check_compute.iter().any(|&c| c) || check_render.iter().any(|&c| c) {
             for (i, f) in self.engine.flights.iter().enumerate() {
                 if f.computes != 0 {
                     let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
@@ -1204,8 +1242,11 @@ impl Firmware {
                         compute_idx[p] = Some(i);
                     }
                 }
-                if *check_render && render_idx.is_none() && f.renders != 0 {
-                    render_idx = Some(i);
+                if f.renders != 0 {
+                    let r = (f.render_pair as usize).min(RP - 1);
+                    if check_render[r] && render_idx[r].is_none() {
+                        render_idx[r] = Some(i);
+                    }
                 }
             }
         }
@@ -1214,8 +1255,10 @@ impl Firmware {
                 check_compute[p] = false;
             }
         }
-        if render_idx.is_none() {
-            *check_render = false;
+        for r in 0..RP {
+            if render_idx[r].is_none() {
+                check_render[r] = false;
+            }
         }
         for p in 0..super::hw::sizes::COMPUTE_PIPES {
             if let Some(index) = compute_idx[p] {
@@ -1224,18 +1267,23 @@ impl Firmware {
                     return Ok(Some((index, receipt)));
                 }
                 check_compute[p] = false;
-                if render_idx == Some(index) {
-                    *check_render = false;
-                    render_idx = None;
+                for r in 0..RP {
+                    if render_idx[r] == Some(index) {
+                        check_render[r] = false;
+                        render_idx[r] = None;
+                    }
                 }
             }
         }
-        if let Some(index) = render_idx {
-            let receipt = self.retired_at(index)?;
-            if receipt.complete() {
-                return Ok(Some((index, receipt)));
+        // Render pairs retire independently, out of order across pairs.
+        for r in 0..RP {
+            if let Some(index) = render_idx[r] {
+                let receipt = self.retired_at(index)?;
+                if receipt.complete() {
+                    return Ok(Some((index, receipt)));
+                }
+                check_render[r] = false;
             }
-            *check_render = false;
         }
         Ok(None)
     }
@@ -1326,34 +1374,52 @@ impl Firmware {
             }
         }
         if f.renders != 0 {
+            // Renders retire in order per render pair. A later flight on the same pair makes the
+            // queue and stamp proof a "passed" one; the TA/FS submit channels are shared by every
+            // pair, so any other render flight or later record makes the channel proof a
+            // "passed" one, unless latched before another pair's records could lap it.
+            let pair = (f.render_pair as usize).min(super::hw::sizes::RENDER_PAIRS - 1);
             let render_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.renders != 0 && o.render_pair == f.render_pair)
+                .nth(1)
+                .is_some();
+            let chan_behind = self
                 .engine
                 .flights
                 .iter()
                 .filter(|o| o.renders != 0)
                 .nth(1)
-                .is_some();
-            let g = &self.graph.render;
+                .is_some()
+                || f.rec[0] != self.channels.producer(Channel::Ta)
+                || f.rec[1] != self.channels.producer(Channel::Fs);
+            let g = &self.graph.render[pair];
             let a = f.pb_slot as usize;
             if render_behind {
                 let e = &self.engine;
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
-                if !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
-                    || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
-                    || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
-                    || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+                if !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target[pair])
+                    || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target[pair])
+                    || !self.queue_ring_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                    || !self.queue_ring_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+                    || !(f.render_chan_settled[0]
+                        || self.channel_receipt(Channel::Ta, f.rec[0], true)?)
+                    || !(f.render_chan_settled[1]
+                        || self.channel_receipt(Channel::Fs, f.rec[1], true)?)
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
                 let fs_stamp = g.fs_service_stamp().read()?;
                 let ta_stamp = g.ta_service_stamp().read()?;
-                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target[pair])
                     && (fs_stamp != f.fs_target
                         || g.notifier
                             .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                             == f.job.vm.slot)
-                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
+                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target[pair])
                     && (ta_stamp != f.ta_target
                         || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
                     && f.job
@@ -1363,20 +1429,12 @@ impl Firmware {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
                 if g.fw_stamp[1].r32(0)? != f.fs_target
                     || g.fw_stamp[0].r32(0)? != f.ta_target
-                    || !self.queue_receipt(
-                        Channel::Ta,
-                        &g.qstate[0],
-                        &g.qinfo[0],
-                        f.ta_head,
-                        f.rec[0],
-                    )?
-                    || !self.queue_receipt(
-                        Channel::Fs,
-                        &g.qstate[1],
-                        &g.qinfo[1],
-                        f.fs_head,
-                        f.rec[1],
-                    )?
+                    || !self.queue_ring_receipt(&g.qstate[0], &g.qinfo[0], f.ta_head)?
+                    || !self.queue_ring_receipt(&g.qstate[1], &g.qinfo[1], f.fs_head)?
+                    || !(f.render_chan_settled[0]
+                        || self.channel_receipt(Channel::Ta, f.rec[0], chan_behind)?)
+                    || !(f.render_chan_settled[1]
+                        || self.channel_receipt(Channel::Fs, f.rec[1], chan_behind)?)
                 {
                     return Ok(Retirement::Pending);
                 }
@@ -1536,17 +1594,20 @@ impl Firmware {
                 }
             }
             if f.renders != 0 {
+                let pair = f.render_pair as usize;
+                let stage = super::recovery::logic::retired_render_stage;
                 for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
                     self.recovery
                         .last_retired
-                        .push(super::hw::sizes::COMPUTE_PIPES, f.r_ta_stamp[m]);
+                        .push(stage(pair, 0), f.r_ta_stamp[m]);
                     self.recovery
                         .last_retired
-                        .push(super::hw::sizes::COMPUTE_PIPES + 1, f.r_fs_stamp[m]);
+                        .push(stage(pair, 1), f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
                         f.pb_slot as usize,
+                        f.pb_seq,
                         epoch,
                         f.pb_binding,
                         result.is_ok(),
@@ -1661,7 +1722,7 @@ impl Firmware {
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
             self.power.report_work(false);
         }
-        // The next prefix on the retired flight's pipe/class starts executing about now.
+        // The next prefix on the retired flight's pipe/pair starts executing about now.
         if f.renders != 0 {
             self.renew_render_deadline();
         }
@@ -1788,9 +1849,10 @@ impl Firmware {
             return;
         }
         const CP: usize = super::hw::sizes::COMPUTE_PIPES;
+        const RP: usize = super::hw::sizes::RENDER_PAIRS;
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         let mut fc: [Option<&Flight>; CP] = [None; CP];
-        let mut fr = None;
+        let mut fr: [Option<&Flight>; RP] = [None; RP];
         for f in e.flights.iter() {
             if f.computes != 0 {
                 let p = (f.compute_pipe as usize).min(CP - 1);
@@ -1798,16 +1860,19 @@ impl Firmware {
                     fc[p] = Some(f);
                 }
             }
-            if fr.is_none() && f.renders != 0 {
-                fr = Some(f);
+            if f.renders != 0 {
+                let q = (f.render_pair as usize).min(RP - 1);
+                if fr[q].is_none() {
+                    fr[q] = Some(f);
+                }
             }
         }
         // None denotes an inactive/reached stage. A real unreached stamp may be zero
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
-        let mut next_progress = [None; CP + 2];
-        let mut published = [0u64; CP + 1];
+        let mut next_progress = [None; CP + 2 * RP];
+        let mut published = [0u64; CP + RP];
         for p in 0..CP {
             if let Some(f) = fc[p] {
                 next_progress[p] = pending(
@@ -1818,15 +1883,20 @@ impl Firmware {
                 published[p] = f.published_ns;
             }
         }
-        if let Some(fr) = fr {
-            next_progress[CP] = pending(
-                r.fw_stamp[0].r32(0).unwrap_or(0),
-                fr.ta_target,
-                e.ta_target,
-            );
-            next_progress[CP + 1] =
-                pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
-            published[CP] = fr.published_ns;
+        for q in 0..RP {
+            if let Some(fr) = fr[q] {
+                next_progress[CP + 2 * q] = pending(
+                    r[q].fw_stamp[0].r32(0).unwrap_or(0),
+                    fr.ta_target,
+                    e.ta_target[q],
+                );
+                next_progress[CP + 2 * q + 1] = pending(
+                    r[q].fw_stamp[1].r32(0).unwrap_or(0),
+                    fr.fs_target,
+                    e.fs_target[q],
+                );
+                published[CP + q] = fr.published_ns;
+            }
         }
         let mut compute_moved = [false; CP];
         for p in 0..CP {
@@ -1834,9 +1904,14 @@ impl Firmware {
                 && e.progress_flight[p] == published[p]
                 && next_progress[p] != e.progress[p];
         }
-        let render_moved = fr.is_some()
-            && e.progress_flight[CP] == published[CP]
-            && [next_progress[CP], next_progress[CP + 1]] != [e.progress[CP], e.progress[CP + 1]];
+        // One render deadline covers every render pair: a render can wait on another pair's
+        // (`prefix_render` orders them), so a stall on any pair holds the others.
+        let render_moved = (0..RP).any(|q| {
+            let (ta, fs) = (CP + 2 * q, CP + 2 * q + 1);
+            fr[q].is_some()
+                && e.progress_flight[CP + q] == published[CP + q]
+                && [next_progress[ta], next_progress[fs]] != [e.progress[ta], e.progress[fs]]
+        });
         for (p, moved) in compute_moved.into_iter().enumerate() {
             if moved {
                 self.renew_compute_pipe_deadline(p);
@@ -2043,8 +2118,9 @@ impl Firmware {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
         }
         if f.renders != 0 {
+            let pair = (f.render_pair as usize).min(super::hw::sizes::RENDER_PAIRS - 1);
             for b in 0..2 {
-                let t = self.events.event_ns[b];
+                let t = self.events.event_ns[super::hw::sizes::render_stage(pair, b)];
                 first = first.min(t);
                 last = last.max(t);
             }
@@ -2073,7 +2149,7 @@ impl Firmware {
     /// readiness and Flags words).
     #[allow(dead_code)]
     pub(crate) fn report(&self, what: &str) {
-        let (r, e) = (&self.graph.render, &self.engine);
+        let e = &self.engine;
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
         let state = self
@@ -2119,32 +2195,39 @@ impl Firmware {
             state.fault(),
             ms
         );
-        if f.is_some_and(|f| f.renders != 0) {
-            dev_info!(
-                self.graph.dev.as_ref(),
-                "G16:   render: draw={} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch0={}/{}; fs {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch1={}/{}; stage events={}/{}\n",
-                e.draw,
-                e.ta_target,
-                rd(&r.user_stamp[0], 0),
-                rd(&r.fw_stamp[0], 0),
-                rd(&r.qstate[0], qstate::DONE),
-                rd(&r.qstate[0], qstate::READ),
-                rd(&r.qstate[0], qstate::WRITE),
-                e.ta_head,
-                ch.read(Channel::Ta).unwrap_or(0xdeadbeef),
-                ch.write_cell(Channel::Ta).unwrap_or(0xdeadbeef),
-                e.fs_target,
-                rd(&r.user_stamp[1], 0),
-                rd(&r.fw_stamp[1], 0),
-                rd(&r.qstate[1], qstate::DONE),
-                rd(&r.qstate[1], qstate::READ),
-                rd(&r.qstate[1], qstate::WRITE),
-                e.fs_head,
-                ch.read(Channel::Fs).unwrap_or(0xdeadbeef),
-                ch.write_cell(Channel::Fs).unwrap_or(0xdeadbeef),
-                self.events.stage_events,
-                e.stage_seen
-            );
+        if e.flights.iter().any(|f| f.renders != 0) {
+            for (pair, r) in self.graph.render.iter().enumerate() {
+                if !e.flights.iter().any(|f| f.renders != 0 && f.render_pair as usize == pair) {
+                    continue;
+                }
+                dev_info!(
+                    self.graph.dev.as_ref(),
+                    "G16:   render pair {}: draw={}/{} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch0={}/{}; fs {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch1={}/{}; stage events={}/{}\n",
+                    pair,
+                    e.pair_draw[pair],
+                    e.draw,
+                    e.ta_target[pair],
+                    rd(&r.user_stamp[0], 0),
+                    rd(&r.fw_stamp[0], 0),
+                    rd(&r.qstate[0], qstate::DONE),
+                    rd(&r.qstate[0], qstate::READ),
+                    rd(&r.qstate[0], qstate::WRITE),
+                    e.ta_head[pair],
+                    ch.read(Channel::Ta).unwrap_or(0xdeadbeef),
+                    ch.write_cell(Channel::Ta).unwrap_or(0xdeadbeef),
+                    e.fs_target[pair],
+                    rd(&r.user_stamp[1], 0),
+                    rd(&r.fw_stamp[1], 0),
+                    rd(&r.qstate[1], qstate::DONE),
+                    rd(&r.qstate[1], qstate::READ),
+                    rd(&r.qstate[1], qstate::WRITE),
+                    e.fs_head[pair],
+                    ch.read(Channel::Fs).unwrap_or(0xdeadbeef),
+                    ch.write_cell(Channel::Fs).unwrap_or(0xdeadbeef),
+                    self.events.stage_events,
+                    e.stage_seen
+                );
+            }
         }
     }
 
@@ -2308,6 +2391,11 @@ impl Firmware {
                 write!(f, " {} {}", name, n)?;
             }
             writeln!(f)?;
+            write!(f, "render_pairs: publications")?;
+            for n in s.render_pair_publications {
+                write!(f, " {}", n)?;
+            }
+            writeln!(f, " cross_pair {}", s.cross_pair_renders)?;
         }
         let p = &self.engine.prof;
         writeln!(

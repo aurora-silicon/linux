@@ -131,7 +131,7 @@ fn render(out: &std::path::Path) {
         uma_mgr: [f + 0x300000, f + 0x300000], uma_aux: [f + 0x300100, f + 0x300200],
         uma_gpu: g + 0x6000000, pb_mgr: f + 0x3000000, scene_list: g + 0x500000,
         parameter_id: 3, generation: 254, activity: [f + 0x900004, f + 0xa00008],
-        counter: [4, 3], uma_submitted: 4, uuid: 0x123401, usc_base: 1 << 40,
+        counter: [4, 3], uma_submitted: 4, uuid: 0x123401, usc_base: 1 << 40, event: [0x70, 0x71],
         ..Default::default()
     };
     let p = encode::PassRefs {
@@ -397,7 +397,7 @@ fn g15s_26b123() {
         uma_gpu: g + 0x6000000, pb_mgr: f + 0x3000000, scene_list: g + 0x500000,
         pb_init_blocks: 512, parameter_id: 6, generation: 254,
         activity: [f + 0x900004, f + 0xa00008], counter: [4, 3], uma_submitted: 4,
-        uuid: 0x123401, usc_base: 1 << 40, ..Default::default()
+        uuid: 0x123401, usc_base: 1 << 40, event: [0x70, 0x71], ..Default::default()
     };
     let p = encode::PassRefs {
         ta_work: f + 0xb00000, ta_work_gva: g + 0x7000000, fs_work: f + 0xc00000,

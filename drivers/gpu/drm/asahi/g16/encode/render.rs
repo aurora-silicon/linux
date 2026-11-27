@@ -37,6 +37,8 @@ pub(crate) struct RenderRefs {
     pub(crate) uma_submitted: u64,
     pub(crate) uuid: u32,
     pub(crate) usc_base: u64,
+    /// `[TA, FS]` completion events of the render's queue pair (`work::render_pair::events`).
+    pub(crate) event: [u32; 2],
 }
 
 /// Addresses retained for one render pass.
@@ -149,7 +151,7 @@ fn metadata(w: &mut [u8], off: usize, r: &RenderRefs, engine: usize, target: u32
     put64(w, off, r.user_stamp[engine]);
     put64(w, off + 8, r.fw_stamp[engine]);
     put32(w, off + 0x10, target);
-    put32(w, off + 0x14, 0x70 + engine as u32);
+    put32(w, off + 0x14, r.event[engine]);
     put32(w, off + 0x1c, 1);
     put32(w, off + 0x20, r.uuid);
     // Wire sequence stays zero; host reservations are 64-bit notifier state.
@@ -163,7 +165,7 @@ fn inline_uma(q: &mut [u8], off: usize, r: &RenderRefs, engine: usize, engine_by
         r.uma_gpu + if engine == 0 { 0x100 } else { 0x200 },
     );
     put64(q, off + 0x28, r.counter[engine]);
-    put32(q, off + 0x30, 0x70 + engine as u32);
+    put32(q, off + 0x30, r.event[engine]);
     if engine_byte {
         put8(q, off + 0x34, engine as u8);
     }
@@ -452,7 +454,7 @@ pub(crate) fn encode_ta_rt(
     put64(w, ta::TPC_BYTES, geo.tpc_bytes);
     put64(w, 0x770, p.ta_seq);
     put32(w, 0x778, ta::SEQ_SIZE as u32);
-    put32(w, 0x77c, 0x71);
+    put32(w, 0x77c, r.event[1]);
     put32(w, 0x780, target);
     put64(w, 0x7a8, compact(p.pre_gva[0]));
     metadata(w, 0x878, r, 0, target);
@@ -890,12 +892,12 @@ pub(crate) fn encode_fs_rt(
     put32(q, f + 0xa0, 0u32.wrapping_sub(f as u32));
     put64(q, f + 0xa5, work + layout.completion as u64);
     if layout.compact_finalize {
-        put32(q, f + 0xad, 0x71);
+        put32(q, f + 0xad, r.event[1]);
         put32(q, f + 0xb4, work::op::END);
     } else {
         put32(q, f + 0xad, 1);
         put8(q, f + 0xb1, 1);
-        put32(q, f + 0xb2, 0x71);
+        put32(q, f + 0xb2, r.event[1]);
         put32(q, f + 0xbc, work::op::END);
     }
 }
@@ -977,7 +979,7 @@ pub(crate) fn scene_prefix(r: &RenderRefs, ctx: u32, target: u32, init: bool) ->
         &barrier(
             r.fw_stamp[0],
             target,
-            0x70,
+            r.event[0],
             target,
             0,
             work::BarrierType::Stamp,
@@ -1005,7 +1007,7 @@ pub(crate) fn scene_render(
         &barrier(
             r.fw_stamp[0],
             target,
-            0x70,
+            r.event[0],
             target,
             0,
             work::BarrierType::Stamp,

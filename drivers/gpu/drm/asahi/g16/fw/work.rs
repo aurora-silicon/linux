@@ -330,6 +330,32 @@ pub(crate) mod barrier {
     pub(crate) const RENDER_WAIT_UUID: u32 = 0x3d420;
 }
 
+/// Completion events of the render queue pairs. Pair `p` finishes its TA work with event
+/// `0x70 + 2p` and its FS work with `0x71 + 2p`; pair 0 keeps the 0x70/0x71 of the native
+/// runtime's render queues. The block `0x70..0x80` is bits 16..32 of type-1 event word 4, so it
+/// names at most [`MAX_PAIRS`] pairs.
+pub(crate) mod render_pair {
+    pub(crate) const TA_EVENT: u32 = 0x70;
+    pub(crate) const MAX_PAIRS: usize = 8;
+    const _: () = assert!(TA_EVENT % 32 == 16 && TA_EVENT % 32 + 2 * MAX_PAIRS as u32 == 32);
+
+    /// `[TA, FS]` completion events of render pair `pair`.
+    pub(crate) const fn events(pair: usize) -> [u32; 2] {
+        let ta = TA_EVENT + 2 * pair as u32;
+        [ta, ta + 1]
+    }
+
+    /// The render pair (`0..MAX_PAIRS`) and stage (0 TA, 1 FS) of a completion event.
+    pub(crate) const fn of_event(event: u32) -> Option<(usize, usize)> {
+        if event >= TA_EVENT && event - TA_EVENT < 2 * MAX_PAIRS as u32 {
+            let i = (event - TA_EVENT) as usize;
+            Some((i / 2, i % 2))
+        } else {
+            None
+        }
+    }
+}
+
 /// InitBM record (0x20 bytes).
 pub(crate) mod initbm {
     pub(crate) const SIZE: usize = 0x20;

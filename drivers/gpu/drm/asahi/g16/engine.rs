@@ -142,6 +142,9 @@ struct WaitTarget {
     stamp: u32,
     /// True if the waited producer flight carries `InitBM` (buffer-manager initialization).
     initbm: bool,
+    /// Render queue pair of a waited render (0 for compute): an `fs2c` barrier waits on that
+    /// pair's FS stamp and event.
+    pair: u8,
 }
 
 /// Selects the hardware ring barrier type for a same-VM handoff.
@@ -153,12 +156,13 @@ struct WaitTarget {
 /// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
 /// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
 /// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
-/// queue, so waits on compute use `ComputeGraph::service_stamp` (linux#3349) and waits on a
-/// render's FS use `RenderGraph::fs_service_stamp`.
+/// queue. Cross-engine data dependencies on compute use `ComputeGraph::service_stamp`
+/// (linux#3349), and those on render use `RenderGraph::fs_service_stamp`.
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
-/// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
-/// recovery paths, and `query_access` CPU-timestamp waits drain `flights` completely first.
+/// (checked against both the waited target and any live `InitBM` flight). Compute and render from
+/// different VMs cannot overlap. Renders of different VMs can overlap on separate pairs.
+/// Recovery and `query_access` CPU-timestamp waits still drain all flights.
 const fn cross_engine_barrier_type(producer_initbm: bool, consumer_initbm: bool) -> BarrierType {
     BarrierType::from_stamp_only(!producer_initbm && !consumer_initbm)
 }
@@ -175,19 +179,23 @@ fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> 
     f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
 }
 
-/// Whether a render of `vm` must wait for flight `f` to retire before it is published.
+/// Whether a render of `vm` on render queue pair `pair` must wait for flight `f` of another VM
+/// to retire before it is published.
 ///
-/// Every VM's render passes share the one firmware TA/FS queue pair. While passes of two VMs
-/// are both published there, the GPU faults in the VM whose pass runs (linux#3201): its VDM
-/// reads the pass slot's kernel prefix and its control stream, and its shader cores read
-/// from a null base, at addresses that are not mapped in its context. Multisampled passes
-/// also lose coverage and their fragment shaders read VA 0. Ordering the two passes' TA and
-/// FS with ring barriers does not prevent it; publishing one only after the other retired
-/// does. A render of another VM also never runs beside compute, so a long compute dispatch
-/// cannot starve its fragment shading into a firmware DM1 timeout. Renders of one VM still
-/// share the queues.
-fn cross_vm_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>) -> bool {
+/// While render passes of two VMs are both published on one firmware TA/FS queue pair, the GPU
+/// faults in the VM whose pass runs (linux#3201): its VDM reads the pass slot's kernel prefix
+/// and its control stream, and its shader cores read from a null base, at addresses that are
+/// not mapped in its context. Multisampled passes also lose coverage and their fragment
+/// shaders read VA 0. Ordering the two passes' TA and FS with ring barriers does not prevent
+/// it; publishing one only after the other retired does. Renders of different VMs on different
+/// pairs run cleanly side by side. macOS 26B123 likewise gives every Metal process its own TA
+/// and FS queue, each with its own job-list entry, all rung through one doorbell.
+///
+/// A render of another VM also never runs beside compute, so a long compute dispatch cannot
+/// starve its fragment shading into a firmware DM1 timeout.
+fn cross_vm_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, pair: usize) -> bool {
     !Arc::ptr_eq(&f.job.vm, vm)
+        && (f.computes != 0 || (f.renders != 0 && f.render_pair as usize == pair))
 }
 
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
@@ -297,6 +305,8 @@ pub(crate) struct Flight {
     pub(crate) renders: u32,
     /// Compute pipe (`0..COMPUTE_PIPES`) this flight was published to.
     pub(crate) compute_pipe: u8,
+    /// Render queue pair (`0..RENDER_PAIRS`) this flight was published to.
+    pub(crate) render_pair: u8,
     /// Compute: final FW stamp, ring end (exclusive) and ring position before the prefix.
     pub(crate) target: u32,
     pub(crate) head: u32,
@@ -313,6 +323,9 @@ pub(crate) struct Flight {
     /// Whether `Channel::Compute` read and completion cursors already passed `rec[2]` before
     /// the shared submit ring could wrap past this flight.
     pub(crate) chan_settled: bool,
+    /// Whether `Channel::Ta` / `Channel::Fs` read and completion cursors already passed
+    /// `rec[0]` / `rec[1]` before another render pair's records could lap them.
+    pub(crate) render_chan_settled: [bool; 2],
     /// Compute member j's FW stamp target, the FS target it waits on directly (0: none), and
     /// its private UMA counter value after publication.
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
@@ -342,8 +355,10 @@ pub(crate) struct Flight {
     pub(crate) pb: Option<Arc<super::pools::PbEpoch>>,
     /// Its allocator slot (`0` or `1`, decoupled from `claims.pass[0]`).
     pub(crate) pb_slot: u32,
-    /// Its allocator slot binding (`Pools::bind`).
+    /// Its allocator slot binding (`Pools::bind`) and publication sequence
+    /// (`Pools::publish_flight`).
     pub(crate) pb_binding: u64,
+    pub(crate) pb_seq: u64,
     /// Whether this render carries InitBM (priming renders always drain before pipelining).
     pub(crate) initbm: bool,
     /// Whether this flight publishes CPU-written command timestamps on retirement.
@@ -362,6 +377,7 @@ impl Flight {
             computes: 0,
             renders: 0,
             compute_pipe: 0,
+            render_pair: 0,
             target: 0,
             head: 0,
             c_start: 0,
@@ -373,6 +389,7 @@ impl Flight {
             fs_start: 0,
             rec: [0; 3],
             chan_settled: false,
+            render_chan_settled: [false; 2],
             cstamp: [0; sizes::COMPUTE_SLOTS],
             cwait: [0; sizes::COMPUTE_SLOTS],
             csubmitted: [0; sizes::COMPUTE_SLOTS],
@@ -390,6 +407,7 @@ impl Flight {
             pb: None,
             pb_slot: 0,
             pb_binding: 0,
+            pb_seq: 0,
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
@@ -405,16 +423,20 @@ struct Prefix {
     computes: u32,
     renders: u32,
     compute_pipe: usize,
+    /// Render queue pair of a render prefix.
+    render_pair: usize,
     prev: Prev,
     /// This prefix (re)initializes the PB with InitBM.
     initbm: bool,
     c_head: u32,
     ta_head: u32,
     fs_head: u32,
-    /// Last total compute ordinal, per-pipe compute ordinal, and draw ordinal.
+    /// Last total compute ordinal, per-pipe compute ordinal, draw ordinal, and the render
+    /// pair's dense draw ordinal (its stamps and thresholds).
     n: u64,
     pipe_n: u64,
     draw: u64,
+    pair_draw: u64,
     last_ct: u32,
     last_ta: u32,
     last_fs: u32,
@@ -438,7 +460,7 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute behind render of another VM, render behind any flight of another VM, or an SCS
+    /// Compute behind render of another VM, render behind compute of another VM, or an SCS
     /// compute conflict.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
@@ -521,6 +543,10 @@ pub(crate) struct Stats {
     pub(crate) behind: u64,
     /// Most flights in flight at once.
     pub(crate) max_flights: u64,
+    /// Render prefixes published per render pair, and those published while another VM's
+    /// renders were in flight on another pair (`render_pairs:` in `aurora-g16/stats`).
+    pub(crate) render_pair_publications: [u64; sizes::RENDER_PAIRS],
+    pub(crate) cross_pair_renders: u64,
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
@@ -624,17 +650,19 @@ pub(crate) struct Engine {
     /// flight (`[start, end, 0, 0]` for compute; `[ta_start, ta_end, fs_start, fs_end]` for
     /// render), reused by accounting without re-reading WC cells.
     pub(crate) retired_ticks: [u64; 4],
-    /// Host compute ordinal, per-pipe compute ordinals, and draw ordinal of the last publication.
+    /// Host compute ordinal, per-pipe compute ordinals, draw ordinal and per-render-pair draw
+    /// ordinals of the last publication.
     pub(crate) ordinal: u64,
     pub(crate) pipe_ordinal: [u64; sizes::COMPUTE_PIPES],
     pub(crate) draw: u64,
-    /// Newest published receipts, the tail.
+    pub(crate) pair_draw: [u64; sizes::RENDER_PAIRS],
+    /// Newest published receipts, the tail (per compute pipe, per render pair).
     pub(crate) target: [u32; sizes::COMPUTE_PIPES],
     pub(crate) head: [u32; sizes::COMPUTE_PIPES],
-    pub(crate) ta_target: u32,
-    pub(crate) fs_target: u32,
-    pub(crate) ta_head: u32,
-    pub(crate) fs_head: u32,
+    pub(crate) ta_target: [u32; sizes::RENDER_PAIRS],
+    pub(crate) fs_target: [u32; sizes::RENDER_PAIRS],
+    pub(crate) ta_head: [u32; sizes::RENDER_PAIRS],
+    pub(crate) fs_head: [u32; sizes::RENDER_PAIRS],
     /// Event counts at the tail's publication.
     pub(crate) events: u32,
     pub(crate) stage_seen: u32,
@@ -649,8 +677,15 @@ pub(crate) struct Engine {
     /// Transient bitmask of compute pipes being drained for handoff to a waiting job that has
     /// no eligible pipe (e.g. a base-only VM limited to pipe 0).
     pub(crate) handoff_avoid_pipes: u32,
-    pub(crate) render_registered: bool,
-    pub(crate) ta_registered: bool,
+    /// Transient bitmask of render pairs being drained for handoff to a waiting render whose VM
+    /// finds every pair holding another VM's renders ([`Firmware::render_handoff_pair`]).
+    pub(crate) handoff_avoid_pairs: u8,
+    /// Per TTBAT slot, the render pair of its VM's newest render (`u8::MAX`: none), which the
+    /// VM takes again when it is free.
+    pub(crate) vm_pair: [u8; sizes::MAX_VMS as usize + 1],
+    /// The FS / TA queues of each render pair were registered by a first record.
+    pub(crate) render_registered: [bool; sizes::RENDER_PAIRS],
+    pub(crate) ta_registered: [bool; sizes::RENDER_PAIRS],
     /// A ready prefix waits only for a record's consumption: repoll sooner.
     pub(crate) chan_wait: bool,
     /// A ready same-VM pending job is blocked solely on flight, pass/compute slot, or work-ring
@@ -669,9 +704,10 @@ pub(crate) struct Engine {
     /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
     /// (0 when no batch is held).
     pub(crate) coalesce_deadline_ns: u64,
-    /// Progress tracking of the oldest compute pipes `0..COMPUTE_PIPES` and render flights.
-    pub(crate) progress_flight: [u64; sizes::COMPUTE_PIPES + 1],
-    pub(crate) progress: [Option<u32>; sizes::COMPUTE_PIPES + 2],
+    /// Progress tracking of the oldest flights of compute pipes `0..COMPUTE_PIPES` and of each
+    /// render pair (`COMPUTE_PIPES + pair`; stages `COMPUTE_PIPES + 2 * pair + {0, 1}`).
+    pub(crate) progress_flight: [u64; sizes::COMPUTE_PIPES + sizes::RENDER_PAIRS],
+    pub(crate) progress: [Option<u32>; sizes::COMPUTE_PIPES + 2 * sizes::RENDER_PAIRS],
     /// Boxed with [`Self::prof`]: `Firmware` is built on the probe's stack.
     pub(crate) stats: KBox<Stats>,
     /// Phase timers (debug_flags bit 49).
@@ -697,12 +733,13 @@ impl Engine {
             ordinal: 0,
             pipe_ordinal: [0; sizes::COMPUTE_PIPES],
             draw: 0,
+            pair_draw: [0; sizes::RENDER_PAIRS],
             target: [0; sizes::COMPUTE_PIPES],
             head: [0; sizes::COMPUTE_PIPES],
-            ta_target: 0,
-            fs_target: 0,
-            ta_head: 0,
-            fs_head: 0,
+            ta_target: [0; sizes::RENDER_PAIRS],
+            fs_target: [0; sizes::RENDER_PAIRS],
+            ta_head: [0; sizes::RENDER_PAIRS],
+            fs_head: [0; sizes::RENDER_PAIRS],
             events: 0,
             stage_seen: 0,
             queue_registered: [false; sizes::COMPUTE_PIPES],
@@ -711,16 +748,18 @@ impl Engine {
             pipe_last_used: [0; sizes::COMPUTE_PIPES],
             pipe_use_seq: 0,
             handoff_avoid_pipes: 0,
-            render_registered: false,
-            ta_registered: false,
+            handoff_avoid_pairs: 0,
+            vm_pair: [u8::MAX; sizes::MAX_VMS as usize + 1],
+            render_registered: [false; sizes::RENDER_PAIRS],
+            ta_registered: [false; sizes::RENDER_PAIRS],
             chan_wait: false,
             slot_wait: false,
             short_repoll: false,
             housekeeping_owed: false,
             held_wait: false,
             coalesce_deadline_ns: 0,
-            progress_flight: [0; sizes::COMPUTE_PIPES + 1],
-            progress: [None; sizes::COMPUTE_PIPES + 2],
+            progress_flight: [0; sizes::COMPUTE_PIPES + sizes::RENDER_PAIRS],
+            progress: [None; sizes::COMPUTE_PIPES + 2 * sizes::RENDER_PAIRS],
             stats: KBox::zeroed(GFP_KERNEL)?,
             prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
@@ -733,6 +772,21 @@ impl Engine {
     /// The oldest published prefix.
     pub(crate) fn oldest(&self) -> Option<&Flight> {
         self.flights.first()
+    }
+
+    /// The render pair of `vm`'s newest render, if any.
+    pub(crate) fn render_pair_hint(&self, vm: &super::vm::VmState) -> Option<usize> {
+        self.vm_pair
+            .get(vm.slot as usize)
+            .map(|&pair| pair as usize)
+            .filter(|&pair| pair < sizes::RENDER_PAIRS)
+    }
+
+    /// `vm` published a render on `pair`.
+    fn note_render_pair(&mut self, vm: &super::vm::VmState, pair: usize) {
+        if let Some(entry) = self.vm_pair.get_mut(vm.slot as usize) {
+            *entry = pair as u8;
+        }
     }
 
     /// Jobs of the queue in published prefixes.
@@ -799,7 +853,8 @@ impl Firmware {
     /// Registers the one shared scheduling context using the proven queue-0 zero-stamp
     /// barrier before any shader work or user ASID is published (exec-runtime.h contract).
     pub(crate) fn register_context(&mut self) -> Result {
-        let r = &self.graph.render;
+        // The shared scheduling context registers through render pair 0's TA queue.
+        let r = &self.graph.render[0];
         let barrier = &r.registration_barrier;
         let zero = r.legacy_empty.va;
         let mut bytes = [0u8; work::barrier::SIZE];
@@ -840,15 +895,15 @@ impl Firmware {
             if now >= deadline {
                 return Err(ETIMEDOUT);
             }
-            let context = self.graph.render.sched_ctx.r32(0)?;
+            let context = self.graph.render[0].sched_ctx.r32(0)?;
             let registered = context & 0xff != 0xff
                 && (context >> 8) & 0xff != 0xff
                 && (context >> 16) & 0xff == 4;
             if registered
                 && self.queue_receipt(
                     Channel::Ta,
-                    &self.graph.render.qstate[0],
-                    &self.graph.render.qinfo[0],
+                    &self.graph.render[0].qstate[0],
+                    &self.graph.render[0].qinfo[0],
                     1,
                     1,
                 )?
@@ -869,17 +924,19 @@ impl Firmware {
                 )
             };
         }
-        self.engine.ta_head = 1;
-        self.engine.ta_registered = true;
+        self.engine.ta_head[0] = 1;
+        self.engine.ta_registered[0] = true;
         Ok(())
     }
 
     /// The single in-order Finalize frontier for each held M4 event. These cells are never
     /// reset after first publication, including across client VM switches and recovery.
-    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 2 + sizes::COMPUTE_PIPES]> {
-        let mut stage = [0u32; 2 + sizes::COMPUTE_PIPES];
-        stage[0] = self.graph.render.fw_stamp[0].r32(0)?;
-        stage[1] = self.graph.render.fw_stamp[1].r32(0)?;
+    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; sizes::STAGES]> {
+        let mut stage = [0u32; sizes::STAGES];
+        for (pair, render) in self.graph.render.iter().enumerate() {
+            stage[sizes::render_stage(pair, 0)] = render.fw_stamp[0].r32(0)?;
+            stage[sizes::render_stage(pair, 1)] = render.fw_stamp[1].r32(0)?;
+        }
         for (p, compute) in self.graph.compute.iter().enumerate() {
             stage[2 + p] = compute.fw_stamp.r32(0)?;
         }
@@ -893,7 +950,7 @@ impl Firmware {
         flags: u32,
         event: u32,
         target: u32,
-        stage: [u32; 2 + sizes::COMPUTE_PIPES],
+        stage: [u32; sizes::STAGES],
     ) -> Result {
         if flags & 1 != 0 && self.recovery.last_retired.contains(event, target) {
             // A notification may follow the full receipt. It names the retained old
@@ -902,22 +959,26 @@ impl Firmware {
         }
         // The named owner: the oldest flight, or with compute/render queued behind it a later one.
         let compute_pipe = work::compute::pipe_of_event(event);
+        // Render pairs number their stamps densely, so only flights of the event's pair match.
+        let render = work::render_pair::of_event(event);
         let f = self
             .engine
             .flights
             .iter_mut()
-            .find(|f| match event {
-                0x70 => {
+            .find(|f| match render {
+                Some((pair, 0)) => {
                     f.renders != 0
+                        && f.render_pair as usize == pair
                         && f.r_ta_stamp[..(f.renders as usize).min(f.r_ta_stamp.len())]
                             .contains(&target)
                 }
-                0x71 => {
+                Some((pair, _)) => {
                     f.renders != 0
+                        && f.render_pair as usize == pair
                         && f.r_fs_stamp[..(f.renders as usize).min(f.r_fs_stamp.len())]
                             .contains(&target)
                 }
-                _ => compute_pipe.is_some_and(|pipe| {
+                None => compute_pipe.is_some_and(|pipe| {
                     f.computes != 0
                         && f.compute_pipe as usize == pipe
                         && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
@@ -929,9 +990,14 @@ impl Firmware {
         }
         if flags & 9 == 9 && f.renders != 0 {
             let mut cleaned = false;
+            let pair = (f.render_pair as usize).min(sizes::RENDER_PAIRS - 1);
             let count = (f.renders as usize).min(f.r_ta_stamp.len());
             for m in 0..count {
-                if super::poll::stamp_reached(stage[0], f.r_ta_stamp[m], self.engine.ta_target) {
+                if super::poll::stamp_reached(
+                    stage[sizes::render_stage(pair, 0)],
+                    f.r_ta_stamp[m],
+                    self.engine.ta_target[pair],
+                ) {
                     continue;
                 }
                 let k = f.claims.pass[m] as usize;
@@ -959,7 +1025,7 @@ impl Firmware {
     /// in the snapshot. Keep it until either its full receipt or its passed-abort proof.
     pub(crate) fn recovery_prepare_suspects(
         &mut self,
-        stage: [u32; 2 + sizes::COMPUTE_PIPES],
+        stage: [u32; sizes::STAGES],
         _event: u32,
         fault_asid: Option<u32>,
     ) -> Result {
@@ -972,10 +1038,18 @@ impl Firmware {
         // Every unfinished flight, including compute queued behind the oldest on either pipe.
         for f in self.engine.flights.iter_mut() {
             let pipe = (f.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+            let pair = (f.render_pair as usize).min(sizes::RENDER_PAIRS - 1);
             let unfinished = (f.computes != 0 && !reached(stage[2 + pipe], f.target, target[pipe]))
                 || (f.renders != 0
-                    && (!reached(stage[0], f.ta_target, ta_target)
-                        || !reached(stage[1], f.fs_target, fs_target)));
+                    && (!reached(
+                        stage[sizes::render_stage(pair, 0)],
+                        f.ta_target,
+                        ta_target[pair],
+                    ) || !reached(
+                        stage[sizes::render_stage(pair, 1)],
+                        f.fs_target,
+                        fs_target[pair],
+                    )));
             if unfinished {
                 f.recovery_suspect = true;
                 f.recovery_started_ns = now_ns();
@@ -1064,12 +1138,14 @@ impl Firmware {
         self.engine.slot_wait = false;
         self.engine.held_wait = false;
         self.engine.handoff_avoid_pipes = 0;
+        self.engine.handoff_avoid_pairs = 0;
         self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
         {
             self.engine.handoff_avoid_pipes = 0;
+            self.engine.handoff_avoid_pairs = 0;
             let Some(index) = self.engine.pick() else {
                 break;
             };
@@ -1094,6 +1170,10 @@ impl Firmware {
                 self.engine.handoff_avoid_pipes = self
                     .compute_handoff_pipe(&job)
                     .map_or(0, |pipe| 1u32 << pipe);
+                // Likewise, when every render pair holds another VM's renders, let the least
+                // loaded pair drain for this render's VM while the other pairs keep going.
+                self.engine.handoff_avoid_pairs =
+                    self.render_handoff_pair(&job).map_or(0, |pair| 1u8 << pair);
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
                     // `Engine::pick` chose the earliest pending job of `job.queue`, so later
@@ -1130,6 +1210,7 @@ impl Firmware {
                     Some(i) => job = self.engine.pending[i].clone(),
                     None => {
                         self.engine.handoff_avoid_pipes = 0;
+                        self.engine.handoff_avoid_pairs = 0;
                         self.engine.slot_wait = self
                             .engine
                             .pending
@@ -1219,6 +1300,7 @@ impl Firmware {
                 Ok(()) => {}
                 Err(e) if e == EAGAIN => {
                     self.engine.handoff_avoid_pipes = 0;
+                    self.engine.handoff_avoid_pairs = 0;
                     break;
                 }
                 Err(e) => {
@@ -1230,6 +1312,7 @@ impl Firmware {
             }
             let pub_res = self.publish_prefix(&job, done, &mut pending_rings);
             self.engine.handoff_avoid_pipes = 0;
+            self.engine.handoff_avoid_pairs = 0;
             match pub_res {
                 Ok(()) => {
                     self.engine.turn += 1;
@@ -1342,6 +1425,52 @@ impl Firmware {
         Ok(())
     }
 
+    /// The render queue pair of `vm`'s next render: the pair of its renders in flight;
+    /// otherwise its last pair if free, else the lowest free pair; `None` while every pair holds
+    /// another VM's renders or drains for a handoff. One VM's renders never use two pairs at
+    /// once, so its render waits stay within one in-order pair.
+    pub(crate) fn render_pair_for(&self, vm: &Arc<super::vm::VmState>) -> Option<usize> {
+        let flights = &self.engine.flights;
+        if let Some(f) = flights
+            .iter()
+            .find(|f| f.renders != 0 && Arc::ptr_eq(&f.job.vm, vm))
+        {
+            return Some(f.render_pair as usize);
+        }
+        let avoid = self.engine.handoff_avoid_pairs;
+        let free = |pair: usize| {
+            avoid & (1u8 << pair) == 0
+                && !flights
+                    .iter()
+                    .any(|f| f.renders != 0 && f.render_pair as usize == pair)
+        };
+        self.engine
+            .render_pair_hint(vm)
+            .filter(|&pair| free(pair))
+            .or_else(|| (0..sizes::RENDER_PAIRS).find(|&pair| free(pair)))
+    }
+
+    /// When the ready render `job` finds every render pair holding another VM's renders, the
+    /// pair to drain for it, as [`Self::compute_handoff_pipe`] drains a compute pipe: the one
+    /// with the fewest render passes in flight. Its VM publishes nothing more there meanwhile.
+    fn render_handoff_pair(&self, job: &Arc<Job>) -> Option<usize> {
+        let sent = job.progress.sent();
+        if !matches!(command(job, sent), Some(Command::Render(_)))
+            || job.vm.status.get() != 0
+            || job.check_command_dependencies(sent).is_err()
+            || self.render_pair_for(&job.vm).is_some()
+        {
+            return None;
+        }
+        let mut load = [0usize; sizes::RENDER_PAIRS];
+        for f in &self.engine.flights {
+            if f.renders != 0 {
+                load[(f.render_pair as usize).min(sizes::RENDER_PAIRS - 1)] += f.renders as usize;
+            }
+        }
+        (0..sizes::RENDER_PAIRS).min_by_key(|&pair| load[pair])
+    }
+
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
@@ -1357,7 +1486,7 @@ impl Firmware {
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
-                    || (is_render && cross_vm_render_conflict(f, &job.vm))
+                    || (is_render && f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm))
                     || (is_compute && f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render && !self.render_can_pipeline(job))
@@ -1486,7 +1615,8 @@ impl Firmware {
     ///   while reusing that VM's warm PB/UMA allocator slot (`Pools::can_pipeline_within`,
     ///   each owning its own hardware UMA slot `RENDER_UMA_SLOT + slot`). Hardware barriers on
     ///   the CDM/TA/FS rings preserve exact same-engine and cross-engine ordering. A render
-    ///   never queues behind a flight of another VM ([`cross_vm_render_conflict`]).
+    ///   queues behind renders of another VM only on another render pair
+    ///   ([`cross_vm_render_conflict`], [`Self::render_pair_for`]).
     /// - Compute never queues behind a render of another VM either, so a long compute
     ///   dispatch from one client cannot starve another client's fragment shading into a
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
@@ -1575,10 +1705,13 @@ impl Firmware {
                         .is_ok_and(|mask| self.has_compute_pipe_for_vm(&job.vm, mask, scs))
             }
             Some(Command::Render(_)) => {
-                let cross_vm = e
-                    .flights
-                    .iter()
-                    .any(|f| cross_vm_render_conflict(f, &job.vm));
+                let Some(pair) = self.render_pair_for(&job.vm) else {
+                    return false;
+                };
+                let cross_vm = e.handoff_avoid_pairs & (1u8 << pair) != 0
+                    || e.flights
+                        .iter()
+                        .any(|f| cross_vm_render_conflict(f, &job.vm, pair));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
                 !cross_vm
                     && render_count < params::render_flights()
@@ -1879,6 +2012,7 @@ impl Firmware {
                                 *newest = Some(WaitTarget {
                                     stamp,
                                     initbm: flight.initbm,
+                                    pair: flight.render_pair,
                                 });
                             }
                         }
@@ -1904,6 +2038,7 @@ impl Firmware {
                                     *newest = Some(WaitTarget {
                                         stamp,
                                         initbm: flight.initbm,
+                                        pair: flight.render_pair,
                                     });
                                 }
                             }
@@ -2023,6 +2158,7 @@ impl Firmware {
                             waits[pipe] = Some(WaitTarget {
                                 stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
                                 initbm: flight.initbm,
+                                pair: 0,
                             });
                         }
                     }
@@ -2046,6 +2182,7 @@ impl Firmware {
                                 waits[pipe] = Some(WaitTarget {
                                     stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
                                     initbm: flight.initbm,
+                                    pair: 0,
                                 });
                             }
                         }
@@ -2405,6 +2542,7 @@ impl Firmware {
         alloc_slot: usize,
         job: &Job,
         draw: u64,
+        pair: usize,
         render_pipelined: bool,
         engine_behind: bool,
     ) -> Result<(RenderRefs, bool, Arc<super::pools::PbEpoch>, u64)> {
@@ -2451,7 +2589,7 @@ impl Firmware {
         let binding = self.pools.bind(alloc_slot, reused);
         a.pb_mgr = epoch.manager.va;
         a.mgr_misc = epoch.misc.va;
-        let r = &self.graph.render;
+        let r = self.graph.render.get(pair).ok_or(EINVAL)?;
         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
         Ok((
             RenderRefs {
@@ -2474,6 +2612,7 @@ impl Firmware {
                 uma_submitted: a.uma_submitted,
                 uuid: (draw as u32).wrapping_add(1),
                 usc_base: job.queue.usc_base,
+                event: work::render_pair::events(pair),
             },
             a.init_buffer,
             epoch,
@@ -2488,11 +2627,12 @@ impl Firmware {
         alloc_slot: usize,
         job: &Job,
         draw: u64,
+        pair: usize,
         epoch: &super::pools::PbEpoch,
         prev_uma_submitted: u64,
     ) -> Result<RenderRefs> {
         let a = job.resources.pb_allocator_refs(alloc_slot)?;
-        let r = &self.graph.render;
+        let r = self.graph.render.get(pair).ok_or(EINVAL)?;
         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
         let uma_submitted = prev_uma_submitted.checked_add(2).ok_or(EOVERFLOW)?;
         Ok(RenderRefs {
@@ -2515,6 +2655,7 @@ impl Firmware {
             uma_submitted,
             uuid: (draw as u32).wrapping_add(1),
             usc_base: job.queue.usc_base,
+            event: work::render_pair::events(pair),
         })
     }
 
@@ -2580,11 +2721,35 @@ impl Firmware {
         let index = job.progress.sent();
         let cmd = command(job, index).ok_or(EINVAL)?;
         let render = matches!(cmd, Command::Render(_));
+        // The render queue pair of this publication. `class_behind` (any render flight) governs
+        // the shared TA/FS submit channels, `pair_behind` the pair's own queues, stamps and
+        // barriers. Two VMs' renders never share a pair (linux#3201).
+        let pair = if render {
+            let pair = self.render_pair_for(&job.vm).ok_or(EAGAIN)?;
+            if self.engine.handoff_avoid_pairs & (1u8 << pair) != 0
+                || self
+                    .engine
+                    .flights
+                    .iter()
+                    .any(|fl| cross_vm_render_conflict(fl, &job.vm, pair))
+            {
+                return Err(EAGAIN);
+            }
+            pair
+        } else {
+            0
+        };
         let class_behind = self
             .engine
             .flights
             .iter()
             .any(|f| if render { f.renders != 0 } else { f.computes != 0 });
+        let pair_behind = render
+            && self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.renders != 0 && fl.render_pair as usize == pair);
         if job.vm.status.get() != 0 {
             return Err(EIO);
         }
@@ -2634,21 +2799,35 @@ impl Firmware {
         if !render && class_behind {
             self.latch_compute_channel_receipts()?;
         }
+        // Only another pair's records can lap a render flight on the shared TA/FS channels.
+        let other_pair = render
+            && self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.renders != 0 && fl.render_pair as usize != pair);
+        if other_pair {
+            self.latch_render_channel_receipts()?;
+        }
         for &channel in channels {
             let pipe = self.channels.channel(channel);
             let producer = self.channels.producer(channel);
             let busy = if class_behind {
                 // Behind in-flight commands on this class: post after their unconsumed records
-                // and never lap an unsettled compute flight's shared submit-channel record.
-                let wrap_bound = channel == Channel::Compute
-                    && self.engine.flights.iter().any(|fl| {
-                        fl.computes != 0
-                            && !fl.chan_settled
-                            && producer
-                                .wrapping_sub((fl.rec[2] + RING_SLOTS - 1) % RING_SLOTS)
-                                % RING_SLOTS
-                                >= RING_SLOTS - 2
-                    });
+                // and never lap an unsettled flight's shared submit-channel record (of another
+                // compute pipe, or of another render pair on TA/FS).
+                let wrap_bound = self.engine.flights.iter().any(|fl| {
+                    let (active, settled, record) = match channel {
+                        Channel::Compute => (fl.computes != 0, fl.chan_settled, fl.rec[2]),
+                        Channel::Ta => (fl.renders != 0, fl.render_chan_settled[0], fl.rec[0]),
+                        Channel::Fs => (fl.renders != 0, fl.render_chan_settled[1], fl.rec[1]),
+                    };
+                    active
+                        && !settled
+                        && producer.wrapping_sub((record + RING_SLOTS - 1) % RING_SLOTS)
+                            % RING_SLOTS
+                            >= RING_SLOTS - 2
+                });
                 pipe.write()? != producer
                     || producer.wrapping_sub(pipe.read()?) % RING_SLOTS >= sizes::AHEAD_RECORDS
                     || wrap_bound
@@ -2667,10 +2846,11 @@ impl Firmware {
         }
         self.engine.stats.prep_from_ns = now_ns();
         let (c_head, ta_head, fs_head) = if render {
+            let r = self.graph.render.get(pair).ok_or(EINVAL)?;
             (
                 0,
-                self.graph.render.qstate[0].r32(qstate::WRITE)?,
-                self.graph.render.qstate[1].r32(qstate::WRITE)?,
+                r.qstate[0].r32(qstate::WRITE)?,
+                r.qstate[1].r32(qstate::WRITE)?,
             )
         } else {
             (
@@ -2681,6 +2861,12 @@ impl Firmware {
         };
         let mut prefix = Prefix {
             compute_pipe,
+            render_pair: pair,
+            pair_draw: if render {
+                self.engine.pair_draw[pair]
+            } else {
+                0
+            },
             n: self.engine.ordinal,
             pipe_n: if render {
                 0
@@ -2699,11 +2885,11 @@ impl Firmware {
         let mut c_read = prefix.c_head;
         let mut ta_read = prefix.ta_head;
         let mut fs_read = prefix.fs_head;
-        if render && class_behind {
+        if render && pair_behind {
             // Room for up to 5 TA entries (prev_barrier, ta_fs_barrier, 2x compute_barrier,
             // ta_work) and 5 FS entries (fs_dep, 2x fs_compute_barrier, own_barrier, fs_work).
-            ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
-            fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
+            ta_read = self.graph.render[pair].qstate[0].r32(qstate::READ)?;
+            fs_read = self.graph.render[pair].qstate[1].r32(qstate::READ)?;
             if ta_read >= 256
                 || fs_read >= 256
                 || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 6
@@ -2726,6 +2912,8 @@ impl Firmware {
         }
         f.first = index as usize;
         f.compute_pipe = compute_pipe as u8;
+        f.render_pair = pair as u8;
+        f.claims.render_pair = pair as u8;
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
         f.fs_start = prefix.fs_head;
@@ -2923,7 +3111,7 @@ impl Firmware {
                     &mut prefix,
                     f,
                     behind,
-                    class_behind,
+                    pair_behind,
                 )?;
                 f.count = 1;
                 // Batch consecutive ready non-InitBM render passes of the same SUBMIT into
@@ -3032,7 +3220,7 @@ impl Firmware {
                             &mut prefix,
                             f,
                             behind,
-                            class_behind,
+                            pair_behind,
                         )?;
                         last_seq = Some(next_seq);
                         end += 1;
@@ -3192,7 +3380,7 @@ impl Firmware {
                                     &mut prefix,
                                     f,
                                     behind,
-                                    class_behind,
+                                    pair_behind,
                                 )?;
                             }
                             last_seq = Some(first_seq + u64::from(n2 - 1));
@@ -3243,13 +3431,14 @@ impl Firmware {
                 }
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
-                self.pools.publish_flight(a);
+                f.pb_seq = self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding. Always
-                // advance both TA and FS thresholds to the newest published draw ordinal
-                // so firmware never skips updating `TA_STAMP` on fast tail flights.
-                self.graph.render.threshold.w32(0, prefix.draw as u32)?;
-                self.graph.render.threshold.w32(8, prefix.draw as u32)?;
+                // advance both TA and FS thresholds to the pair's newest published draw
+                // ordinal so firmware never skips updating `TA_STAMP` on fast tail flights.
+                let r = &self.graph.render[pair];
+                r.threshold.w32(0, prefix.pair_draw as u32)?;
+                r.threshold.w32(8, prefix.pair_draw as u32)?;
             } else {
                 for m in 0..f.claims.slot_count as usize {
                     let k = f.claims.slot[m] as usize;
@@ -3265,11 +3454,11 @@ impl Firmware {
             wmb();
             if render {
                 publish_producer(
-                    &self.graph.render.qstate[0],
+                    &self.graph.render[pair].qstate[0],
                     prefix.ta_head,
                     &mut self.engine.stats.publications[1],
                 )?;
-                self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
+                self.graph.render[pair].qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
             } else {
                 publish_producer(
                     &self.graph.compute[compute_pipe].qstate,
@@ -3289,16 +3478,16 @@ impl Firmware {
                         !self.engine.queue_registered[compute_pipe],
                     ),
                     Channel::Ta => (
-                        self.graph.render.qinfo[0].va,
+                        self.graph.render[pair].qinfo[0].va,
                         prefix.ta_head,
-                        0x70,
-                        !self.engine.ta_registered,
+                        work::render_pair::events(pair)[0] as u8,
+                        !self.engine.ta_registered[pair],
                     ),
                     Channel::Fs => (
-                        self.graph.render.qinfo[1].va,
+                        self.graph.render[pair].qinfo[1].va,
                         prefix.fs_head,
-                        0x71,
-                        !self.engine.render_registered,
+                        work::render_pair::events(pair)[1] as u8,
+                        !self.engine.render_registered[pair],
                     ),
                 };
                 let record = SubmitRecord {
@@ -3331,12 +3520,18 @@ impl Firmware {
         self.engine.ordinal = prefix.n;
         self.engine.draw = prefix.draw;
         if render {
-            self.engine.ta_target = f.ta_target;
-            self.engine.fs_target = f.fs_target;
-            self.engine.ta_head = f.ta_head;
-            self.engine.fs_head = f.fs_head;
-            self.engine.ta_registered = true;
-            self.engine.render_registered = true;
+            self.engine.note_render_pair(&job.vm, pair);
+            self.engine.stats.render_pair_publications[pair] += 1;
+            if other_pair {
+                self.engine.stats.cross_pair_renders += 1;
+            }
+            self.engine.pair_draw[pair] = prefix.pair_draw;
+            self.engine.ta_target[pair] = f.ta_target;
+            self.engine.fs_target[pair] = f.fs_target;
+            self.engine.ta_head[pair] = f.ta_head;
+            self.engine.fs_head[pair] = f.fs_head;
+            self.engine.ta_registered[pair] = true;
+            self.engine.render_registered[pair] = true;
         } else {
             self.engine.pipe_ordinal[compute_pipe] = prefix.pipe_n;
             self.engine.target[compute_pipe] = f.target;
@@ -3351,8 +3546,8 @@ impl Firmware {
         self.engine.stage_seen = self.events.stage_events;
         f.behind = behind;
         self.stat_publish(f);
-        // First in-flight command on this render class or compute pipe starts about now;
-        // commands queued behind the same class/pipe keep its oldest deadline.
+        // First in-flight command on this render pair or compute pipe starts about now;
+        // commands queued behind the same pair/pipe keep its oldest deadline.
         if render {
             if !class_behind {
                 self.renew_render_deadline();
@@ -3537,10 +3732,12 @@ impl Firmware {
                 || wait_fs.initbm
                 || self.engine.flights.iter().any(|fl| fl.initbm);
             let bar_type = cross_engine_barrier_type(producer_initbm, false);
+            // The waited render's pair names the FS stamp and event.
+            let wait_pair = wait_fs.pair as usize;
             let bar = encode::barrier(
-                self.graph.render.fs_service_stamp().va(),
+                self.graph.render.get(wait_pair).ok_or(EINVAL)?.fs_service_stamp().va(),
                 wait_fs.stamp,
-                0x71,
+                work::render_pair::events(wait_pair)[1],
                 target,
                 0,
                 bar_type,
@@ -3626,25 +3823,30 @@ impl Firmware {
         pf: &mut Prefix,
         f: &mut Flight,
         behind: bool,
-        class_behind: bool,
+        pair_behind: bool,
     ) -> Result {
         let member = pf.renders as usize;
         if member >= sizes::RENDER_SLOTS {
             return Err(EAGAIN);
         }
         let k = f.claims.pass[member] as usize;
+        // Stamps and thresholds follow the render pair's dense draw ordinal; the global draw
+        // ordinal keeps the UMA counters and the work UUID.
+        let pair = pf.render_pair;
+        let events = work::render_pair::events(pair);
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
-        let target = encode::stamp(draw);
-        let has_prior_render = class_behind || member > 0;
+        let pair_draw = super::recovery::logic::next_ordinal(pf.pair_draw).ok_or(EOVERFLOW)?;
+        let target = encode::stamp(pair_draw);
+        let has_prior_render = pair_behind || member > 0;
         let prev_ta = if member > 0 {
             pf.last_ta
         } else {
-            self.engine.ta_target
+            self.engine.ta_target[pair]
         };
         let prev_fs = if member > 0 {
             pf.last_fs
         } else {
-            self.engine.fs_target
+            self.engine.fs_target[pair]
         };
         let order = job.command_order(cmd_index);
         let staged = cmd.cmd.flags
@@ -3669,6 +3871,7 @@ impl Firmware {
                 None => Some(WaitTarget {
                     stamp: prev_fs,
                     initbm: false,
+                    pair: pair as u8,
                 }),
             }
         } else {
@@ -3684,6 +3887,12 @@ impl Firmware {
         } else {
             None
         };
+        // A VM's renders stay on one pair, so a render wait never names another pair's stamp.
+        if fs_wait_render.iter().any(|w| w.pair as usize != pair)
+            || ta_wait_fs.iter().any(|w| w.pair as usize != pair)
+        {
+            return Err(EAGAIN);
+        }
         let plan_flags = if !staged
             && job.fw_waits.iter().any(|w| {
                 w.last_ordinal[super::command::RENDER].is_some_and(|last| {
@@ -3728,7 +3937,7 @@ impl Firmware {
                 .ok_or(EAGAIN)?;
             let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
-                self.render_refs(alloc_slot, job, draw, slot_pipelined, behind)?;
+                self.render_refs(alloc_slot, job, draw, pair, slot_pipelined, behind)?;
             f.pb = Some(epoch);
             f.pb_slot = alloc_slot as u32;
             f.pb_binding = binding;
@@ -3743,6 +3952,7 @@ impl Firmware {
                 f.pb_slot as usize,
                 &f.job,
                 draw,
+                pair,
                 epoch,
                 f.uma_submitted,
             )?;
@@ -3839,7 +4049,7 @@ impl Firmware {
         // One retained descriptor is shared by TA and FS; its private submitted counter
         // advances by two per pass. Reused descriptors and their pool/list bytes remain intact.
         f.uma_submitted = refs.uma_submitted;
-        let r = &self.graph.render;
+        let r = self.graph.render.get(pair).ok_or(EINVAL)?;
         let cap = sizes::QUEUE_CAP;
         if init_buffer {
             pf.initbm = true;
@@ -3851,10 +4061,40 @@ impl Firmware {
         }
         // Pipelined render->render and cross-engine (CDM->TA, CDM->FS) barriers use
         // `BarrierType::Stamp` (type 0) only when neither producer, any live flight, nor this
-        // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
-        // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
+        // consumer carries `InitBM` (unlike G15's `CROSS_ENGINE_HOLD`; see
+        // `cross_engine_barrier_type`). Waits on compute wait on its service stamp; the
+        // render->render waits below, on `fw_stamp`, only order the TA and FS engines.
         // Cold `InitBM` transitions and recovery paths drain completely before publishing.
+        // Renders reach the TA and FS engines in publication order across render pairs, as on
+        // one pair's in-order queues: the PB and pass slot displacement proofs rely on it
+        // (`Pools::retire_flight`). A prefix's first pass whose newest predecessor in flight is
+        // on another pair waits for that render's TA and FS. Its completion implies every
+        // earlier render's, so those waits stand in for this pair's own `prev_barrier` and
+        // `fs_dep`, and a pass still takes at most `MAX_RENDER_RING_ENTRIES` entries per ring.
+        // The TA of one VM's render can still overlap the FS of another VM's. Waiting on
+        // the other pair's FINALIZE fw_stamp orders each engine across pairs. It provides
+        // no cross-pair data visibility. A VM's live renders stay on one pair, and a
+        // dependency on another VM is a host wait for the producer's retirement.
+        let prior = if member == 0 {
+            self.engine
+                .flights
+                .iter()
+                .rev()
+                .find(|fl| fl.renders != 0)
+                .filter(|fl| fl.render_pair as usize != pair)
+                .map(|fl| {
+                    (
+                        fl.render_pair as usize,
+                        fl.ta_target,
+                        fl.fs_target,
+                        fl.initbm,
+                    )
+                })
+        } else {
+            None
+        };
         let producer_initbm = pf.initbm
+            || prior.is_some_and(|(_, _, _, initbm)| initbm)
             || self.engine.flights.iter().any(|fl| fl.initbm)
             || ta_wait_compute.iter().flatten().any(|w| w.initbm)
             || fs_wait_compute.iter().flatten().any(|w| w.initbm)
@@ -3866,11 +4106,27 @@ impl Firmware {
         // behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait` names an in-flight
         // FS stamp, and `fs_dep` only when `plan.fs_render_wait` names an in-flight FS
         // dependency not already dominated by TA.
-        if plan.ta_prev_wait {
+        let (ta_prev, fs_prev) = match prior {
+            Some((q, ta, fs, _)) => {
+                let other = self.graph.render.get(q).ok_or(EINVAL)?;
+                let [ta_event, fs_event] = work::render_pair::events(q);
+                (
+                    Some((other.fw_stamp[0].va, ta, ta_event)),
+                    Some((other.fw_stamp[1].va, fs, fs_event)),
+                )
+            }
+            None => (
+                plan.ta_prev_wait
+                    .then_some((r.fw_stamp[0].va, prev_ta, events[0])),
+                plan.fs_render_wait
+                    .map(|wait_fs| (r.fw_stamp[1].va, wait_fs, events[1])),
+            ),
+        };
+        if let Some((stamp, wait_ta, event)) = ta_prev {
             let prev = encode::barrier(
-                r.fw_stamp[0].va,
-                prev_ta,
-                0x70,
+                stamp,
+                wait_ta,
+                event,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
                 render_bar,
@@ -3883,7 +4139,7 @@ impl Firmware {
             let ta_fs = encode::barrier(
                 r.fw_stamp[1].va,
                 wait_fs,
-                0x71,
+                events[1],
                 target,
                 work::barrier::RENDER_WAIT_UUID,
                 render_bar,
@@ -3892,11 +4148,11 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, p.ta_fs_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        if let Some(wait_fs) = plan.fs_render_wait {
+        if let Some((stamp, wait_fs, event)) = fs_prev {
             let dep = encode::barrier(
-                r.fw_stamp[1].va,
+                stamp,
                 wait_fs,
-                0x71,
+                event,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
                 render_bar,
@@ -3949,7 +4205,7 @@ impl Firmware {
         let own = encode::barrier(
             r.fw_stamp[0].va,
             target,
-            0x70,
+            events[0],
             target,
             refs.uuid,
             BarrierType::Stamp,
@@ -3966,6 +4222,7 @@ impl Firmware {
         pf.renders += 1;
         f.renders = pf.renders;
         pf.draw = draw;
+        pf.pair_draw = pair_draw;
         pf.last_ta = target;
         pf.last_fs = target;
         pf.prev = Prev::Render;

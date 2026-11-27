@@ -660,6 +660,8 @@ pub(crate) struct Claims {
     pub(crate) slot: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) slot_count: u32,
     pub(crate) compute_pipe: u8,
+    /// Render queue pair the pass slots are published on.
+    pub(crate) render_pair: u8,
     pub(crate) pass: [u32; sizes::RENDER_SLOTS],
     pub(crate) pass_count: u32,
     pub(crate) pass_mask: u64,
@@ -678,6 +680,7 @@ impl Claims {
             slot: [0; sizes::COMPUTE_SLOTS],
             slot_count: 0,
             compute_pipe: 0,
+            render_pair: 0,
             pass: [0; sizes::RENDER_SLOTS],
             pass_count: 0,
             pass_mask: 0,
@@ -1017,7 +1020,8 @@ impl Slots {
             )?,
             render: KBox::init(
                 init!(RenderOwners {
-                    lifetime: Lifetime::new(true),
+                    // Every render queue pair feeds the TA and FS engines in publication order.
+                    lifetime: Lifetime::new(true).ordered(),
                     owner: [const { None }; sizes::RENDER_SLOTS],
                     pending_retarget: [None; sizes::RENDER_SLOTS],
                     pending_owner: [const { None }; sizes::RENDER_SLOTS],
@@ -2025,7 +2029,7 @@ impl Slots {
                 return Err(EINVAL);
             }
             for &k in &f.pass[..f.pass_count as usize] {
-                if k as usize >= sizes::RENDER_SLOTS || !p.publish(k as usize) {
+                if k as usize >= sizes::RENDER_SLOTS || !p.publish_on(k as usize, f.render_pair) {
                     return Err(EBUSY);
                 }
             }
@@ -2034,7 +2038,7 @@ impl Slots {
             while mask != 0 {
                 let k = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
-                if !p.publish(k) {
+                if !p.publish_on(k, f.render_pair) {
                     return Err(EBUSY);
                 }
             }

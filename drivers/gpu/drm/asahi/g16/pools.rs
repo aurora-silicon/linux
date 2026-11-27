@@ -496,8 +496,12 @@ pub(crate) struct Pools {
     keep: [bool; sizes::PB_SLOTS],
     /// Most recently published allocator slot (`0..PB_SLOTS`).
     active: Option<usize>,
-    /// Most recently cleanly retired allocator slot (proves every other slot is displaced).
-    last_clean_retired: Option<usize>,
+    /// Publication sequence of the newest render, and per allocator slot the sequence of its
+    /// newest render and whether a later render of another slot has yet to retire
+    /// ([`Self::retire_flight`]).
+    pub_seq: u64,
+    slot_seq: [u64; sizes::PB_SLOTS],
+    undisplaced: [bool; sizes::PB_SLOTS],
     /// Live in-flight render count per allocator slot.
     inflight: [u32; sizes::PB_SLOTS],
     /// Permanently quarantined allocator slots after an aborted receipt.
@@ -532,7 +536,9 @@ impl Pools {
             binds: [0; sizes::PB_SLOTS],
             keep: [false; sizes::PB_SLOTS],
             active: None,
-            last_clean_retired: None,
+            pub_seq: 0,
+            slot_seq: [0; sizes::PB_SLOTS],
+            undisplaced: [false; sizes::PB_SLOTS],
             inflight: [0; sizes::PB_SLOTS],
             quarantined: [false; sizes::PB_SLOTS],
             quarantined_epochs: [const { None }; sizes::PB_SLOTS],
@@ -560,7 +566,9 @@ impl Pools {
                 binds: [0; sizes::PB_SLOTS],
                 keep: [false; sizes::PB_SLOTS],
                 active: None,
-                last_clean_retired: None,
+                pub_seq: 0,
+                slot_seq: [0; sizes::PB_SLOTS],
+                undisplaced: [false; sizes::PB_SLOTS],
                 inflight: [0; sizes::PB_SLOTS],
                 quarantined: [false; sizes::PB_SLOTS],
                 quarantined_epochs: [const { None }; sizes::PB_SLOTS],
@@ -594,13 +602,12 @@ impl Pools {
     pub(crate) fn slot_inflight(&self, k: usize) -> u32 {
         self.inflight.get(k).copied().unwrap_or(0)
     }
-    /// Whether slot `k` is healthy, idle, not active, and either fresh or displaced by a clean
-    /// retirement of some other slot.
+    /// Whether slot `k` is healthy, idle, and either fresh or displaced: a render of another
+    /// slot published after `k`'s newest render retired normally ([`Self::retire_flight`]).
     fn slot_displaced(&self, k: usize) -> bool {
         !self.quarantined[k]
             && self.inflight[k] == 0
-            && self.active != Some(k)
-            && (self.owners[k].is_none() || self.last_clean_retired.is_some_and(|r| r != k))
+            && (self.owners[k].is_none() || !self.undisplaced[k])
     }
     /// Whether at least one displaced physical PB allocator slot exists in `0..limit`.
     fn has_displaced_slot_within(&self, limit: usize) -> bool {
@@ -955,19 +962,35 @@ impl Pools {
             self.pending_uma[k] = None;
         }
     }
-    /// Records a render reaching firmware visibility on allocator slot `k`.
+    /// Records a render reaching firmware visibility on allocator slot `k`. Returns its
+    /// publication sequence, which the render retires with ([`Self::retire_flight`]).
     #[allow(dead_code)]
-    pub(crate) fn publish_flight(&mut self, k: usize) {
-        if k < sizes::PB_SLOTS {
-            self.active = Some(k);
-            self.inflight[k] = self.inflight[k].saturating_add(1);
+    pub(crate) fn publish_flight(&mut self, k: usize) -> u64 {
+        if k >= sizes::PB_SLOTS {
+            return 0;
         }
+        self.pub_seq += 1;
+        self.active = Some(k);
+        self.slot_seq[k] = self.pub_seq;
+        self.undisplaced[k] = true;
+        self.inflight[k] = self.inflight[k].saturating_add(1);
+        self.pub_seq
     }
-    /// Retires one render flight on allocator slot `k` after a full normal receipt.
+    /// Retires one render flight on allocator slot `k`, published as `seq`, after a full normal
+    /// receipt.
+    ///
+    /// After its last render retires a slot stays the TA and FS engines' current allocator
+    /// (UMA slot `RENDER_UMA_SLOT + k`, `pb_mgr_table[k]`) until they run a render of another
+    /// slot: until then no other VM's fresh epoch may rebind it, and its closed owner's arena
+    /// stays mapped. Renders run on those engines in publication order, so this retirement
+    /// displaces every other slot whose newest render was published before it. Retirements are
+    /// observed in publication order only within one render queue pair; the sequence, not the
+    /// order they are observed in, decides.
     #[allow(dead_code)]
     pub(crate) fn retire_flight(
         &mut self,
         k: usize,
+        seq: u64,
         epoch: &Arc<PbEpoch>,
         binding: u64,
         completed: bool,
@@ -998,7 +1021,11 @@ impl Pools {
         if let Some(uma) = self.pending_uma[k].take() {
             self.retained_uma[k] = Some(uma);
         }
-        self.last_clean_retired = Some(k);
+        for j in 0..sizes::PB_SLOTS {
+            if j != k && self.slot_seq[j] < seq {
+                self.undisplaced[j] = false;
+            }
+        }
         self.retire_epoch(k, binding, completed);
         Ok(())
     }

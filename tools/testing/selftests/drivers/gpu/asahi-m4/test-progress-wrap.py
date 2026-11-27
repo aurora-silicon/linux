@@ -9,7 +9,7 @@ def function(text,name):
     marker=text.index('fn '+name+'(');start=text.rfind('\n',0,marker)+1;at=text.index('{',marker);depth,end=1,at+1
     while depth:depth+=(text[end]=='{')-(text[end]=='}');end+=1
     return text[start:end]
-option='progress: [Option<u32>; sizes::COMPUTE_PIPES + 2]' in engine
+option='progress: [Option<u32>; sizes::COMPUTE_PIPES + 2 * sizes::RENDER_PAIRS]' in engine
 harness=r'''
 #![allow(dead_code)]
 use std::cell::Cell;
@@ -18,7 +18,7 @@ use logic::stamp_reached;
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]struct Error(i32);
 const EIO:Error=Error(5);const ETIMEDOUT:Error=Error(110);
 type Result<T=()>=core::result::Result<T,Error>;
-mod hw{pub mod sizes{pub const COMPUTE_PIPES:usize=8;}}
+mod hw{pub mod sizes{pub const COMPUTE_PIPES:usize=8;pub const RENDER_PAIRS:usize=2;}}
 mod command{pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 mod params{
     pub fn recovery()->bool{true}
@@ -31,11 +31,11 @@ fn set_now_ns(v:u64){CLOCK.with(|c|c.set(v));}
 macro_rules! dev_warn{($($tt:tt)*)=>{};}
 macro_rules! dev_err{($($tt:tt)*)=>{};}
 struct Object(Cell<u32>);impl Object{fn r32(&self,_off:usize)->core::result::Result<u32,()>{Ok(self.0.get())}}
-struct Compute{fw_stamp:Object}struct Render{fw_stamp:[Object;2]}struct Graph{compute:[Compute;hw::sizes::COMPUTE_PIPES],render:Render}
+struct Compute{fw_stamp:Object}struct Render{fw_stamp:[Object;2]}struct Graph{compute:[Compute;hw::sizes::COMPUTE_PIPES],render:[Render;hw::sizes::RENDER_PAIRS]}
 struct Job{long:bool}
 impl Job{fn long(&self)->bool{self.long}}
-struct Flight{job:Job,computes:u32,compute_pipe:u8,renders:u32,target:u32,ta_target:u32,fs_target:u32,published_ns:u64}
-struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,progress_flight:[u64;hw::sizes::COMPUTE_PIPES+1],progress:[__TYPE__;hw::sizes::COMPUTE_PIPES+2]}
+struct Flight{render_pair:u8,job:Job,computes:u32,compute_pipe:u8,renders:u32,target:u32,ta_target:u32,fs_target:u32,published_ns:u64}
+struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:[u32;hw::sizes::RENDER_PAIRS],fs_target:[u32;hw::sizes::RENDER_PAIRS],progress_flight:[u64;hw::sizes::COMPUTE_PIPES+hw::sizes::RENDER_PAIRS],progress:[__TYPE__;hw::sizes::COMPUTE_PIPES+2*hw::sizes::RENDER_PAIRS]}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct Recovery{deadlines:logic::Deadlines,compute_deadlines:[logic::Deadlines;hw::sizes::COMPUTE_PIPES],warning_deadline_ns:[u64;2],compute_warning_deadline_ns:[u64;hw::sizes::COMPUTE_PIPES],long_commands:u64,receipt_fault:bool,failed:Option<Error>}
 struct Firmware{graph:Graph,engine:Engine,recovery:Recovery,render_renewed:u32,compute_renewed:u32,pipe_renewed:[u32;hw::sizes::COMPUTE_PIPES],fail_stops:Vec<Error>}
@@ -75,8 +75,8 @@ type Completions=();
 fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     set_now_ns(1_000_000_000);
     let mut t=[0u32;hw::sizes::COMPUTE_PIPES];t[0]=target;
-    let mut f=Firmware{graph:Graph{compute:core::array::from_fn(|_|Compute{fw_stamp:Object(Cell::new(previous))}),render:Render{fw_stamp:[Object(Cell::new(previous)),Object(Cell::new(previous))]}},
-        engine:Engine{flights:vec![Flight{job:Job{long:false},computes:u32::from(!render),compute_pipe:0,renders:u32::from(render),target,ta_target:target,fs_target:target,published_ns:1}],target:t,ta_target:target,fs_target:target,progress_flight:[0;hw::sizes::COMPUTE_PIPES+1],progress:[__ZERO__;hw::sizes::COMPUTE_PIPES+2]},
+    let mut f=Firmware{graph:Graph{compute:core::array::from_fn(|_|Compute{fw_stamp:Object(Cell::new(previous))}),render:core::array::from_fn(|_|Render{fw_stamp:[Object(Cell::new(previous)),Object(Cell::new(previous))]})},
+        engine:Engine{flights:vec![Flight{render_pair:0,job:Job{long:false},computes:u32::from(!render),compute_pipe:0,renders:u32::from(render),target,ta_target:target,fs_target:target,published_ns:1}],target:t,ta_target:[target;hw::sizes::RENDER_PAIRS],fs_target:[target;hw::sizes::RENDER_PAIRS],progress_flight:[0;hw::sizes::COMPUTE_PIPES+hw::sizes::RENDER_PAIRS],progress:[__ZERO__;hw::sizes::COMPUTE_PIPES+2*hw::sizes::RENDER_PAIRS]},
         recovery:Recovery{deadlines:logic::Deadlines::EXPIRED,compute_deadlines:[logic::Deadlines::EXPIRED;hw::sizes::COMPUTE_PIPES],warning_deadline_ns:[u64::MAX;2],compute_warning_deadline_ns:[u64::MAX;hw::sizes::COMPUTE_PIPES],long_commands:0,receipt_fault:false,failed:None},
         render_renewed:0,compute_renewed:0,pipe_renewed:[0;hw::sizes::COMPUTE_PIPES],fail_stops:vec![]};
     f.renew_render_deadline();f.renew_compute_deadline();f.render_renewed=0;f.compute_renewed=0;f.pipe_renewed=[0;hw::sizes::COMPUTE_PIPES];f
@@ -90,8 +90,8 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 #[test]fn paired_ta_fs_zero_each_renews_once_without_lending_other_engine_progress(){
     let mut f=firmware(true,0x100,0);f.progress();
     f.graph.compute[0].fw_stamp.0.set(0x100);f.progress();assert_eq!(f.render_renewed,0);assert_eq!(f.compute_renewed,0);
-    f.graph.render.fw_stamp[0].0.set(0x100);f.progress();assert_eq!(f.render_renewed,1);assert_eq!(f.compute_renewed,0);
-    f.graph.render.fw_stamp[1].0.set(0x100);f.progress();assert_eq!(f.render_renewed,2);assert_eq!(f.compute_renewed,0);
+    f.graph.render[0].fw_stamp[0].0.set(0x100);f.progress();assert_eq!(f.render_renewed,1);assert_eq!(f.compute_renewed,0);
+    f.graph.render[0].fw_stamp[1].0.set(0x100);f.progress();assert_eq!(f.render_renewed,2);assert_eq!(f.compute_renewed,0);
     f.progress();assert_eq!(f.render_renewed,2);
 }
 #[test]fn before_at_and_after_zero_completions_have_the_same_progress_contract(){
@@ -103,15 +103,15 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn concurrent_compute_and_render_renew_deadlines_independently(){
     let mut f=firmware(true,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x300;
     f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(0,0));
     f.graph.compute[0].fw_stamp.0.set(0x300);f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(0,1));
-    f.graph.render.fw_stamp[0].0.set(0x200);f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(1,1));
+    f.graph.render[0].fw_stamp[0].0.set(0x200);f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(1,1));
 }
 #[test]fn two_concurrent_compute_pipes_sample_progress_independently(){
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:1,renders:0,target:0x200,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:false},computes:1,compute_pipe:1,renders:0,target:0x200,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x200;f.engine.target[1]=0x200;
     f.progress();assert_eq!(f.compute_renewed,0);
     // Pipe 1 advances while pipe 0 stays pending -> renews compute deadline once.
@@ -124,7 +124,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn stuck_render_times_out_while_compute_keeps_advancing_and_retiring(){
     let mut f=firmware(true,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x300;
     let mut done=();
     assert_eq!(f.check_hangs(&mut done),Ok(()));
@@ -149,21 +149,21 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn stuck_compute_times_out_while_render_keeps_advancing_and_retiring(){
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:false},computes:0,compute_pipe:0,renders:1,target:0,ta_target:0x300,fs_target:0x300,published_ns:2});
-    f.engine.ta_target=0x300;f.engine.fs_target=0x300;
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:false},computes:0,compute_pipe:0,renders:1,target:0,ta_target:0x300,fs_target:0x300,published_ns:2});
+    f.engine.ta_target[0]=0x300;f.engine.fs_target[0]=0x300;
     let mut done=();
     assert_eq!(f.check_hangs(&mut done),Ok(()));
     // Render keeps advancing and retiring every 2 s across 6 s while compute stays stuck at 0x100.
     for step in 1u64..=3 {
         set_now_ns(1_000_000_000 + step * 2_000_000_000);
         let next_target = 0x300 + (step as u32) * 0x100;
-        f.graph.render.fw_stamp[0].0.set(next_target - 0x100);
-        f.graph.render.fw_stamp[1].0.set(next_target - 0x100);
+        f.graph.render[0].fw_stamp[0].0.set(next_target - 0x100);
+        f.graph.render[0].fw_stamp[1].0.set(next_target - 0x100);
         f.engine.flights[1].ta_target = next_target;
         f.engine.flights[1].fs_target = next_target;
         f.engine.flights[1].published_ns = 2 + step;
-        f.engine.ta_target = next_target;
-        f.engine.fs_target = next_target;
+        f.engine.ta_target[0] = next_target;
+        f.engine.fs_target[0] = next_target;
         f.renew_render_deadline();
         let res = f.check_hangs(&mut done);
         if step < 3 {
@@ -180,7 +180,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     // keeps advancing and retiring every 2s across 6s. Pipe 1 progress/retirement must never
     // renew pipe 0's deadline or grant pipe 0 the 10s long-job allowance.
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:true},computes:1,compute_pipe:1,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:true},computes:1,compute_pipe:1,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[1]=0x300;
     let mut done=();
     assert_eq!(f.check_hangs(&mut done),Ok(()));
@@ -208,7 +208,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     // on the same pipe (10s allowance). Only the oldest active flight on a pipe selects its
     // deadline, so the stalled normal head still times out at 6s instead of inheriting 10s.
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{job:Job{long:true},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{render_pair:0,job:Job{long:true},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x300;
     let mut done=();
     set_now_ns(1_000_000_000 + 6_000_000_000);
@@ -218,15 +218,25 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     // queued behind it on the same pipe, pipe 0 keeps its 10s long-job allowance at 6s.
     let mut fl=firmware(false,0x200,0x100);
     fl.engine.flights[0].job.long=true;
-    fl.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    fl.engine.flights.push(Flight{render_pair:0,job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     fl.engine.target[0]=0x300;
     set_now_ns(1_000_000_000 + 6_000_000_000);
     assert_eq!(fl.check_hangs(&mut done), Ok(()));
     assert!(fl.fail_stops.is_empty());
+}
+#[test]fn progress_on_any_render_pair_renews_the_render_deadline(){
+    // Each pair's oldest flight has its own progress cells; the pairs share one deadline.
+    let mut f=firmware(true,0x200,0x100);
+    f.engine.flights.push(Flight{render_pair:1,job:Job{long:false},computes:0,compute_pipe:0,renders:1,target:0,ta_target:0x200,fs_target:0x200,published_ns:2});
+    f.progress();assert_eq!(f.render_renewed,0);
+    f.graph.render[1].fw_stamp[0].0.set(0x200);f.progress();assert_eq!(f.render_renewed,1);
+    f.graph.render[0].fw_stamp[1].0.set(0x200);f.progress();assert_eq!(f.render_renewed,2);
+    f.progress();assert_eq!(f.render_renewed,2);
+    assert_eq!(f.compute_renewed,0);
 }
 '''.replace('__LOGIC__',str(backend/'recovery/logic.rs')).replace('__PROGRESS__',function(source,'progress').replace('super::hw::','hw::')).replace('__CHECK_HANGS__',function(recovery_src,'check_hangs').replace('super::command::','command::').replace('super::hw::','hw::')).replace('__TYPE__','Option<u32>' if option else 'u32').replace('__ZERO__','None' if option else '0')
 unit=out/'progress-wrap.rs';unit.write_text(harness);log=''
 for command in [rustc()+['--edition=2021','--test',str(unit),'-o',str(out/'progress-wrap')],[str(out/'progress-wrap'),'--nocapture']]:
     result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True);log+=result.stdout;print(result.stdout,end='');(out/'progress-wrap.log').write_text(log)
     if result.returncode:raise SystemExit(result.returncode)
-(out/'progress-wrap.json').write_text(json.dumps({'passed':True,'cpu_only':True,'tests':11,'scope':'Copied production progress and modular comparison logic; mapped-register reads and deadline renewal mocked. No GPU or real deadline expiration.','source_sha256':{name:sha(backend/name)for name in ['engine.rs','poll.rs','recovery/logic.rs']}},indent=2)+'\n')
+(out/'progress-wrap.json').write_text(json.dumps({'passed':True,'cpu_only':True,'tests':12,'scope':'Copied production progress and modular comparison logic; mapped-register reads and deadline renewal mocked. No GPU or real deadline expiration.','source_sha256':{name:sha(backend/name)for name in ['engine.rs','poll.rs','recovery/logic.rs']}},indent=2)+'\n')
