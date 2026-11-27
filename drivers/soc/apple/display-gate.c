@@ -960,6 +960,24 @@ out:
 }
 
 /*
+ * A GPU linked to its PMP request runs GFX under automatic power, as macOS runs it (J516s: GFX
+ * 0x1f0003ff). The boot loader's 27.2 handoff marks the domain apple,no-auto-pm for a GPU it
+ * finds unlinked (the link is made here, after it); drop that mark with the link, before
+ * the PMGR driver probes the domain, so that it arms automatic power as for any other.
+ */
+static int __init gate_gpu_auto_pm(struct of_changeset *cs, struct device_node *gpu)
+{
+	struct device_node *domain = of_parse_phandle(gpu, "power-domains", 0);
+	struct property *prop = domain ? of_find_property(domain, "apple,no-auto-pm", NULL) : NULL;
+	int ret = 0;
+
+	if (prop)
+		ret = of_changeset_remove_property(cs, domain, prop);
+	of_node_put(domain);
+	return ret;
+}
+
+/*
  * The T6030 GPU's own PMP request (AGX, report@4), for a GPU linked to the PMP above: the GPU
  * driver holds it while its firmware runs and withdraws it before GFX goes off, as macOS does.
  */
@@ -980,8 +998,11 @@ static int __init gate_gpu_agx_entry(struct of_changeset *cs, struct device_node
 	}
 	gpu = gate_find_one("apple,agx-t6030");
 	if (gpu && of_device_is_available(gpu) && agx && agx->phandle &&
-	    !of_property_present(gpu, "apple,pmp-report-entry"))
+	    !of_property_present(gpu, "apple,pmp-report-entry")) {
 		ret = of_changeset_add_prop_u32(cs, gpu, "apple,pmp-report-entry", agx->phandle);
+		if (!ret)
+			ret = gate_gpu_auto_pm(cs, gpu);
+	}
 	of_node_put(agx);
 	of_node_put(gpu);
 	return ret;
