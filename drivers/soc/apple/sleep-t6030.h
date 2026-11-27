@@ -2742,6 +2742,11 @@ static unsigned int t6030_obs_timeline;
 module_param_named(obs_timeline, t6030_obs_timeline, uint, 0644);
 MODULE_PARM_DESC(obs_timeline, "T6030 DIAGNOSTIC: with observer_ms, the observer's 100 ms samples in PMU scratch: 1 when each first changed, 2 the latest values, 3 when, with the first wake status word (0 = off)");
 
+/* obs_pmu=0: MMIO reads only, no SPMI read of the PMU per sample (+0 then reads never) */
+static bool t6030_obs_pmu = true;
+module_param_named(obs_pmu, t6030_obs_pmu, bool, 0644);
+MODULE_PARM_DESC(obs_pmu, "T6030 DIAGNOSTIC: with obs_timeline, read the PMU's alarm control each sample (default Y)");
+
 static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
@@ -2773,9 +2778,12 @@ static void t6030_obs_read(struct apple_sleep *s, struct t6030_obs *o)
 	o->cluster[1] = readl(s->cluster + T6030_CLUSTER_P);
 	o->commit = readl(s->commit);
 	o->cllt = readl(s->cllt + T6030_CLLT_SLEEP);
+	o->ctl = T6030_OBS_CTL_UNREAD;
+	o->ctl_read = false;
+	if (!READ_ONCE(t6030_obs_pmu))
+		return;
 	/* The notify mask as the commit left it, without the done bit during the read */
 	runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
-	o->ctl = T6030_OBS_CTL_UNREAD;
 	o->ctl_read = !t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_READL,
 				      T6050_RTC_CTL, NULL, &o->ctl, 1);
 	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
