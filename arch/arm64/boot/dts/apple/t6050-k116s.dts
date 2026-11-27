@@ -165,57 +165,6 @@
 };
 
 /*
- * The internal panel and the display coprocessor, for the boot loader's display
- * hand-off (aura, chosen.aurora,t6050-display=1). Everything stays disabled: the
- * loader checks the ADT and the live DCP and DART state, publishes the DCP's
- * firmware properties, reserves the ADT /vram as the framebuffer and only then
- * enables dcp, its DARTs and mailbox and the display subsystem. A loader without
- * the hand-off leaves the boot framebuffer to simpledrm.
- */
-/ {
-	aliases {
-		/* The loader writes apple,notch-height into the "dcp" alias */
-		dcp = &dcp;
-		disp0 = &display;
-	};
-
-	/* As on J714s, with the internal display's DART (disp0, SID 0) */
-	display: display-subsystem {
-		compatible = "apple,display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
-};
-
-/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
-&dcp_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&disp0_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcp {
-	/*
-	 * ADT disp0 clock-ids. The loader adds the clock nodes, "clocks" and the
-	 * bandwidth request scratch ("apple,bw-scratch") when it hands the panel
-	 * over, as on the J714s, and refuses a tree that already has them.
-	 */
-	apple,clock-ids = <361 458>;
-
-	/*
-	 * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
-	 * these are the panel's active area, for the DPI only.
-	 */
-	panel {
-		compatible = "apple,panel-k116", "apple,panel";
-		width-mm = <345>;
-		height-mm = <223>;
-	};
-};
-
-/*
  * The trackpad's AFE reset. The ADT names the SMC pcIO template (0x10000,
  * 0x11c0000), the same line as SMC GPIO gp1c, active low, which gpio-macsmc
  * drives; through the pcIO outputs the multi-touch interface never comes up.
@@ -580,6 +529,16 @@
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+};
+
 /*
  * As t6050-j714s.dts: the GPU on the PMP's GFX report entry (report@f, on ps_gfx), so the PMP
  * is told the GPU is on only while it is powered. This board runs the PMP with its report
@@ -750,9 +709,8 @@
 };
 
 /*
- * The panel's plug takes about 2.9 ms here from the video interface's announcement to the
- * firmware's "ioav i/f is now closed", and the next round of reports follows about 33 ms later.
- * With the J714s's 2500 us the open landed 25 us before the close.
+ * t6050-j714s-sleep-soc.dtsi, included above, sets the J714s's 2500 us; keep the K boards'
+ * 10000 us (t6050-k114-k116-display.dtsi).
  */
 &dcp {
 	apple,panel-video-open-delay-us = <10000>;

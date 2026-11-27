@@ -29,6 +29,16 @@
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+};
+
 /* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
 #define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116c.bin", "apple/msrk-k116c.bin"
 #include "t6050-touchid.dtsi"
