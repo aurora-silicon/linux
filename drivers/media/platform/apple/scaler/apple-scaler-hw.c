@@ -451,8 +451,13 @@ int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max
 	asc_emit_image(&e, &asc_rdma, &job->src);
 	asc_emit_image(&e, &asc_wdma, &job->dst);
 	asc_emit_memory(&e, job);
-	/* Alpha fill: constant opaque alpha when the source has none. */
-	asc_emit(&e, 0x8c, (d->alpha && !s->alpha ? BIT(31) : 0) | 0xffff);
+	/*
+	 * Alpha fill: constant opaque alpha for R'G'B' written from a source
+	 * without alpha. macOS sets it for every such job in our capture, and
+	 * the engine writes the fourth byte of XRGB32 as it does that of ARGB32,
+	 * so an XRGB32 destination is programmed exactly like ARGB32.
+	 */
+	asc_emit(&e, 0x8c, (!d->yuv && !s->alpha ? BIT(31) : 0) | 0xffff);
 	asc_emit_chroma(&e, job);
 	asc_emit_unscaled(&e, job);
 	if (job->csc)

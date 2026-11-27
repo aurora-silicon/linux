@@ -638,6 +638,66 @@ static void asc_test_job_rejects(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), -EINVAL);
 }
 
+/*
+ * An XRGB32 destination is programmed write for write like ARGB32: the
+ * engine writes both four bytes per pixel, and a source without alpha has
+ * the fill on, as macOS drives every Y'CbCr to R'G'B' job.
+ */
+static void asc_test_job_xrgb(struct kunit *test)
+{
+	static const u32 sources[] = {
+		V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_P010,
+		V4L2_PIX_FMT_ARGB32, V4L2_PIX_FMT_XRGB32,
+	};
+	struct asc_reg *a, *x;
+	struct asc_csc csc;
+
+	a = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*a), GFP_KERNEL);
+	x = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*x), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, x);
+	KUNIT_ASSERT_EQ(test, asc_csc_compute(V4L2_YCBCR_ENC_709, V4L2_QUANTIZATION_LIM_RANGE,
+					      true, &csc), 0);
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(sources); i++) {
+		struct asc_job job = {
+			.src = {
+				.fmt = asc_find_format(sources[i]),
+				.width = 1280, .height = 720,
+				.dva = { 0x100000000ULL, 0x100400000ULL },
+				.stride = { 2560, 2560 },
+			},
+			.dst = {
+				.width = 1280, .height = 720,
+				.dva = { 0x200000000ULL }, .stride = { 5120 },
+			},
+			.transform_id = 0x94,
+			.msr20 = true,
+		};
+		int na, nx;
+		u32 fill = 0;
+
+		KUNIT_ASSERT_NOT_NULL(test, job.src.fmt);
+		job.csc = job.src.fmt->yuv ? &csc : NULL;
+		job.dst.fmt = asc_find_format(V4L2_PIX_FMT_ARGB32);
+		na = asc_job_build(&job, a, ASC_JOB_MAX_WRITES);
+		job.dst.fmt = asc_find_format(V4L2_PIX_FMT_XRGB32);
+		nx = asc_job_build(&job, x, ASC_JOB_MAX_WRITES);
+		KUNIT_ASSERT_GT(test, na, 0);
+		KUNIT_ASSERT_EQ(test, nx, na);
+		for (int j = 0; j < na; j++) {
+			KUNIT_EXPECT_EQ_MSG(test, x[j].off, a[j].off, "source %p4cc, write %d",
+					    &sources[i], j);
+			KUNIT_EXPECT_EQ_MSG(test, x[j].val, a[j].val, "source %p4cc, register %#x",
+					    &sources[i], a[j].off);
+			if (x[j].off == 0x8c)
+				fill = x[j].val;
+		}
+		KUNIT_EXPECT_EQ_MSG(test, fill, job.src.fmt->alpha ? 0x0000ffffU : 0x8000ffffU,
+				    "source %p4cc", &sources[i]);
+	}
+}
+
 static struct kunit_case asc_test_cases[] = {
 	KUNIT_CASE_PARAM(asc_test_csc, asc_csc_gen_params),
 	KUNIT_CASE(asc_test_csc_rejects),
@@ -648,6 +708,7 @@ static struct kunit_case asc_test_cases[] = {
 	KUNIT_CASE(asc_test_job_rejects),
 	KUNIT_CASE(asc_test_lossless_geom),
 	KUNIT_CASE(asc_test_job_lossless),
+	KUNIT_CASE(asc_test_job_xrgb),
 	{}
 };
 
