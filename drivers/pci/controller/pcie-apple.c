@@ -7739,6 +7739,10 @@ struct apple_pcie_hib_l1ss {
 	u32			pl_ctl1;
 	u32			cl_ctl2;
 	u32			cl_ctl1;
+	u16			pl_lnkctl;
+	u16			fn_lnkctl[8];
+	u8			fn_devfn[8];
+	unsigned int		nfn;
 };
 
 struct apple_pcie_l1ss_walk {
@@ -7778,27 +7782,101 @@ static int apple_pcie_lnkctl_write(struct pci_dev *pdev, u16 val)
 	return pcibios_err_to_errno(pcie_capability_write_word(pdev, PCI_EXP_LNKCTL, val));
 }
 
-static int apple_pcie_link_set_l1ss(struct pci_dev *parent, struct pci_dev *child,
-				    u32 pl_ctl2, u32 pl_ctl1, u32 cl_ctl2, u32 cl_ctl1,
-				    bool enable)
+static int apple_pcie_hib_save_lnkctl(struct pci_dev *parent,
+				      struct apple_pcie_hib_l1ss *saved)
 {
+	struct pci_dev *fn;
+	int ret;
+
+	ret = apple_pcie_lnkctl_read(parent, &saved->pl_lnkctl);
+	if (ret)
+		return ret;
+
+	saved->nfn = 0;
+	list_for_each_entry(fn, &parent->subordinate->devices, bus_list) {
+		if (saved->nfn >= ARRAY_SIZE(saved->fn_lnkctl))
+			return -E2BIG;
+		ret = apple_pcie_lnkctl_read(fn, &saved->fn_lnkctl[saved->nfn]);
+		if (ret)
+			return ret;
+		saved->fn_devfn[saved->nfn++] = fn->devfn;
+	}
+	return 0;
+}
+
+static u16 apple_pcie_hib_merge_aspm(u16 cur, u16 orig)
+{
+	u16 aspm = orig & PCI_EXP_LNKCTL_ASPMC;
+
+	if (!aspm)
+		return cur;
+	return (cur & ~PCI_EXP_LNKCTL_ASPMC) | aspm;
+}
+
+static u16 apple_pcie_hib_orig_fn_lnkctl(const struct apple_pcie_hib_l1ss *saved,
+					 u8 devfn, u16 fallback)
+{
+	unsigned int i;
+
+	for (i = 0; i < saved->nfn; i++) {
+		if (saved->fn_devfn[i] == devfn)
+			return saved->fn_lnkctl[i];
+	}
+	return fallback;
+}
+
+static int apple_pcie_link_set_l1ss(const struct apple_pcie_hib_l1ss *saved,
+				    bool enable, bool rollback)
+{
+	struct pci_dev *parent = saved->parent;
+	struct pci_dev *child = saved->child;
+	u32 pl_ctl2 = saved->pl_ctl2;
+	u32 pl_ctl1 = saved->pl_ctl1;
+	u32 cl_ctl2 = saved->cl_ctl2;
+	u32 cl_ctl1 = saved->cl_ctl1;
 	struct pci_bus *bus = parent->subordinate;
 	struct pci_dev *fn;
-	u16 plnkctl, fn_lnkctl[8];
+	u16 plnkctl, restore_plnkctl;
+	u16 fn_lnkctl[8], restore_fn_lnkctl[8];
 	unsigned int nfn = 0, i;
 	struct pci_dev *fns[8];
 	int ret;
 
-	ret = apple_pcie_lnkctl_read(parent, &plnkctl);
-	if (ret)
-		return ret;
+	if (enable) {
+		ret = apple_pcie_lnkctl_read(parent, &plnkctl);
+		if (ret)
+			return ret;
+		if (rollback)
+			restore_plnkctl =
+				apple_pcie_hib_merge_aspm(plnkctl, saved->pl_lnkctl);
+		else
+			restore_plnkctl = plnkctl;
+	} else {
+		plnkctl = saved->pl_lnkctl;
+		restore_plnkctl = saved->pl_lnkctl;
+	}
 
 	list_for_each_entry(fn, &bus->devices, bus_list) {
 		if (nfn >= ARRAY_SIZE(fns))
 			return -E2BIG;
-		ret = apple_pcie_lnkctl_read(fn, &fn_lnkctl[nfn]);
-		if (ret)
-			return ret;
+		if (enable) {
+			ret = apple_pcie_lnkctl_read(fn, &fn_lnkctl[nfn]);
+			if (ret)
+				return ret;
+			if (rollback) {
+				u16 orig = apple_pcie_hib_orig_fn_lnkctl(saved,
+									 fn->devfn,
+									 fn_lnkctl[nfn]);
+
+				restore_fn_lnkctl[nfn] =
+					apple_pcie_hib_merge_aspm(fn_lnkctl[nfn], orig);
+			} else {
+				restore_fn_lnkctl[nfn] = fn_lnkctl[nfn];
+			}
+		} else {
+			fn_lnkctl[nfn] = apple_pcie_hib_orig_fn_lnkctl(saved, fn->devfn, 0);
+			restore_fn_lnkctl[nfn] = fn_lnkctl[nfn];
+		}
 		fns[nfn++] = fn;
 	}
 
@@ -7861,15 +7939,15 @@ static int apple_pcie_link_set_l1ss(struct pci_dev *parent, struct pci_dev *chil
 	}
 
 restore_aspm:
-	if (FIELD_GET(PCI_EXP_LNKCTL_ASPMC, plnkctl)) {
-		int r = apple_pcie_lnkctl_write(parent, plnkctl);
+	if (FIELD_GET(PCI_EXP_LNKCTL_ASPMC, restore_plnkctl)) {
+		int r = apple_pcie_lnkctl_write(parent, restore_plnkctl);
 
 		if (!ret)
 			ret = r;
 	}
 	for (i = 0; i < nfn; i++) {
-		if (FIELD_GET(PCI_EXP_LNKCTL_ASPMC, fn_lnkctl[i])) {
-			int r = apple_pcie_lnkctl_write(fns[i], fn_lnkctl[i]);
+		if (FIELD_GET(PCI_EXP_LNKCTL_ASPMC, restore_fn_lnkctl[i])) {
+			int r = apple_pcie_lnkctl_write(fns[i], restore_fn_lnkctl[i]);
 
 			if (!ret)
 				ret = r;
@@ -7932,12 +8010,18 @@ static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 		walk->err = -ENOMEM;
 		return 1;
 	}
-	saved->parent = pci_dev_get(parent);
-	saved->child = pci_dev_get(child);
 	saved->pl_ctl2 = pl_ctl2;
 	saved->pl_ctl1 = pl_ctl1;
 	saved->cl_ctl2 = cl_ctl2;
 	saved->cl_ctl1 = cl_ctl1;
+	ret = apple_pcie_hib_save_lnkctl(parent, saved);
+	if (ret) {
+		kfree(saved);
+		walk->err = ret;
+		return 1;
+	}
+	saved->parent = pci_dev_get(parent);
+	saved->child = pci_dev_get(child);
 	list_add_tail(&saved->entry, &pcie->hib_l1ss);
 
 	/*
@@ -7946,7 +8030,7 @@ static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 	 * commit. Added to hib_l1ss first so a partial failure rolls back this
 	 * link together with earlier links.
 	 */
-	ret = apple_pcie_link_set_l1ss(parent, child, pl_ctl2, pl_ctl1, cl_ctl2, cl_ctl1, false);
+	ret = apple_pcie_link_set_l1ss(saved, false, false);
 	if (ret) {
 		walk->err = ret;
 		return 1;
@@ -7954,7 +8038,7 @@ static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 	return 0;
 }
 
-static void apple_pcie_hib_restore_l1ss(struct apple_pcie *pcie)
+static void apple_pcie_hib_restore_l1ss(struct apple_pcie *pcie, bool rollback)
 {
 	struct apple_pcie_hib_l1ss *saved, *tmp;
 
@@ -7966,9 +8050,8 @@ static void apple_pcie_hib_restore_l1ss(struct apple_pcie *pcie)
 		list_del(&saved->entry);
 		if (!apple_pcie_cfg_read_u32(parent, PCI_VENDOR_ID, &id) &&
 		    !apple_pcie_cfg_read_u32(child, PCI_VENDOR_ID, &id)) {
-			int ret = apple_pcie_link_set_l1ss(parent, child,
-							   saved->pl_ctl2, saved->pl_ctl1,
-							   saved->cl_ctl2, saved->cl_ctl1, true);
+			int ret = apple_pcie_link_set_l1ss(saved, true, rollback);
+
 			if (ret)
 				pci_warn(child, "failed to restore PCIe L1SS after sleep: %d\n",
 					 ret);
@@ -8232,7 +8315,7 @@ static int apple_pcie_prepare(struct device *dev)
 
 			pci_walk_bus(bridge->bus, apple_pcie_hib_disable_l1ss_cb, &walk);
 			if (walk.err) {
-				apple_pcie_hib_restore_l1ss(pcie);
+				apple_pcie_hib_restore_l1ss(pcie, true);
 				apple_radio_complete(dev);
 				return walk.err;
 			}
@@ -8246,7 +8329,7 @@ static void apple_pcie_complete(struct device *dev)
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
 	if (pcie && !list_empty(&pcie->hib_l1ss))
-		apple_pcie_hib_restore_l1ss(pcie);
+		apple_pcie_hib_restore_l1ss(pcie, false);
 	apple_radio_complete(dev);
 }
 
