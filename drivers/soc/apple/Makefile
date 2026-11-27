@@ -56,6 +56,7 @@ obj-$(CONFIG_APPLE_TUNABLE_KUNIT_TEST) += tunable-test.o
 obj-$(CONFIG_APPLE_AOP) += aop.o
 
 obj-$(CONFIG_APPLE_SEP_FV_INTERFACE) += fv_shim.o
+obj-$(CONFIG_APPLE_SEP_HDCP_INTERFACE) += hdcp_shim.o
 
 obj-$(CONFIG_APPLE_SEP) += apple-sep.o
 apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \

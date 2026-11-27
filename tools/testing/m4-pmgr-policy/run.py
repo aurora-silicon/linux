@@ -63,6 +63,7 @@ def run(args, output):
     production = path.read_text()
     policy = block(production, "t8132_pmgr_policy")
     helper = block(production, "t8132_fdt_node_offset")
+    applies = block(production, "t8132_policy_applies")
     bad_lookup = "int parent = t8132_fdt_node_offset(data, pmgr);"
     if policy.count(bad_lookup) != 1:
         raise RuntimeError("Production PMGR lookup changed; update the negative control")
@@ -95,7 +96,9 @@ def run(args, output):
         "source": str(path), "source_sha256": hashlib.sha256(production.encode()).hexdigest(),
         "legacy_fixture": str(args.legacy_dtb) if args.legacy_dtb else "synthesized from native DTB",
     }
-    for mode, code in [("negative-control", negative), ("production", helper + "\n" + policy)]:
+    helpers = helper + "\n" + applies + "\n"
+    for mode, code in [("negative-control", helpers + negative),
+                       ("production", helpers + policy)]:
         c = output / (mode + ".c")
         binary = output / mode
         c.write_text(template.replace("/* PRODUCTION_CODE */", code))

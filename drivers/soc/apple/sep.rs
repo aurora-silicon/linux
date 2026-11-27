@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hdcp;
 mod hibe;
 mod hwrng;
 mod image;
@@ -830,6 +831,21 @@ struct SepData {
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
 
+    // The HDCP endpoint (see `hdcp`): its buffers, the sessions per slot
+    // (held for a whole step, so one exchange is in flight), the reply wait,
+    // discovery state, and quarantine flag.
+    #[pin]
+    ool_hdcp: Mutex<Option<OolPair>>,
+    #[pin]
+    hdcp_state: Mutex<hdcp::State>,
+    #[pin]
+    hdcp_rx: Mutex<hdcp::Exchange>,
+    #[pin]
+    hdcp_wq: CondVar,
+    hdcp_named: Atomic<bool>,
+    hdcp_layout: Atomic<u32>,
+    hdcp_quarantined: Atomic<bool>,
+
     // The boot-policy endpoint (see `pnon`): its buffers, its one
     // exchange, and what discovery said about it.
     #[pin]
@@ -1103,6 +1119,12 @@ impl SepData {
             stac::OOL_SIZE_STAC,
             (stac::OOL_SIZE_STAC, stac::OOL_SIZE_STAC),
         )?;
+        let ool_hdcp = Self::alloc_ool(
+            dev,
+            hdcp::EP_HDCP,
+            hdcp::OOL_SIZE_HDCP,
+            (hdcp::OOL_SIZE_HDCP, hdcp::OOL_SIZE_HDCP),
+        )?;
         // Sized from the endpoint's layout before it is registered.
         let ool_pnon = Self::alloc_ool(dev, pnon::EP_PNON, pnon::OOL_SIZE_PNON, (0, 0))?;
         let ool_xars = Self::alloc_ool(
@@ -1273,6 +1295,13 @@ impl SepData {
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
+                ool_hdcp <- new_mutex!(Some(ool_hdcp)),
+                hdcp_state <- new_mutex!(hdcp::State::new()),
+                hdcp_rx <- new_mutex!(hdcp::Exchange::new()),
+                hdcp_wq <- new_condvar!("SepData::hdcp_wq"),
+                hdcp_named: Atomic::new(false),
+                hdcp_layout: Atomic::new(0),
+                hdcp_quarantined: Atomic::new(false),
                 ool_pnon <- new_mutex!(Some(ool_pnon)),
                 pnon_rx <- new_mutex!(pnon::Exchange::new()),
                 pnon_wq <- new_condvar!("SepData::pnon_wq"),
@@ -3409,6 +3438,8 @@ impl SepData {
 
             stac::EP_STAC => self.on_stac(msg),
 
+            hdcp::EP_HDCP => self.on_hdcp(msg),
+
             pnon::EP_PNON => self.on_pnon(msg),
 
             sse::EP_SSE => self.on_sse(msg),
@@ -3463,6 +3494,7 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
+                self.hdcp_discovered(&f);
                 self.pnon_discovered(&f);
                 self.xars_discovered(&f);
                 self.sse_discovered(&f);
@@ -3503,12 +3535,14 @@ impl SepData {
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
         self.xars_wq.notify_all();
+        self.hdcp_wq.notify_all();
         pm::unregister();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
         trusted::unregister();
         self.unregister_fv_kernel();
+        self.unregister_hdcp_kernel();
 
         let dev = self.bio_dev.lock().take();
         drop(dev);
@@ -3562,6 +3596,7 @@ impl SepData {
             &self.ool_sks,
             &self.ool_scrd,
             &self.ool_stac,
+            &self.ool_hdcp,
             &self.ool_pnon,
         ] {
             if let Some(buffers) = slot.lock().take() {
@@ -3873,6 +3908,12 @@ impl platform::Driver for SepDriver {
             if let Err(e) = data.register_fv_kernel() {
                 dev_err_ratelimited!(dev, "could not register the FileVault kernel API: {:?}\n", e);
             }
+        }
+
+        // The display driver's HDCP 2.2 transmitter service. Nothing is sent
+        // to the endpoint until the display driver starts a session.
+        if let Err(e) = data.register_hdcp_kernel() {
+            dev_warn_ratelimited!(dev, "hdcp: could not register the kernel API: {:?}\n", e);
         }
 
         if module_parameters::trusted_keys.value() != 0 {
