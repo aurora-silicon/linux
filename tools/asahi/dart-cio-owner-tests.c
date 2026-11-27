@@ -405,5 +405,14 @@ int main(void)
 		assert(!apple_dart_cio_finish(&state) && !provider.refs);
 		cases++;
 	}
+	/* Runtime prepare works outside PM_SUSPEND_MEM while sleep prepare refuses. */
+	reset_owner(5, false);
+	pm_suspend_target_state = 0;
+	assert(apple_dart_cio_prepare(&state) == -EINVAL && !dart.cio_active && !provider.refs);
+	assert(!apple_dart_cio_prepare_runtime(&state) && !apple_dart_cio_off(&state));
+	lose_power();
+	assert(!apple_dart_cio_on(&state) && !apple_dart_cio_finish(&state) && !provider.refs);
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	cases++;
 	printf("PASS %u CIO DART ownership cases\n", cases);
 }
