@@ -92,6 +92,10 @@ pub(crate) struct Config {
     pub(crate) supports_render_scs: bool,
     /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
     pub(crate) cross_engine_hold: bool,
+    /// Largest tile buffer a render command may use, in bytes per tile (sample size times
+    /// utile width, utile height and samples). Reported as DRM_ASAHI_FEATURE_TILE_BUFFER_48K
+    /// when it reaches [`sizes::TILE_BUFFER_48K`].
+    pub(crate) max_tile_buffer: u32,
 }
 
 impl Config {
@@ -242,6 +246,8 @@ pub(crate) mod t8132 {
         deep_sleep: true,
         supports_render_scs: true,
         cross_engine_hold: false,
+        // macOS 26B123 programs 48 KiB tiles (MSAA4, 32x16 utiles) on this GPU.
+        max_tile_buffer: super::sizes::TILE_BUFFER_48K,
     };
 
     /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
@@ -401,6 +407,7 @@ pub(crate) mod t6030 {
         deep_sleep: false,
         supports_render_scs: false,
         cross_engine_hold: true,
+        max_tile_buffer: super::sizes::TILE_BUFFER_32K,
     };
 
     const LAYOUT: FwLayout = FwLayout {
@@ -541,6 +548,7 @@ pub(crate) mod t8122 {
         deep_sleep: false,
         supports_render_scs: false,
         cross_engine_hold: true,
+        max_tile_buffer: super::sizes::TILE_BUFFER_32K,
     };
 
     /// 26B123 G15G: __TEXT 0x64000 as on G16G, __DATA 0xb4000 and the 0x8000 __DATA_SHARED_RO
@@ -1101,6 +1109,9 @@ pub(crate) mod client {
 
 /// Sizes and counts of the engine's objects.
 pub(crate) mod sizes {
+    /// Tile buffer limits of [`super::Config::max_tile_buffer`].
+    pub(crate) const TILE_BUFFER_32K: u32 = 32 * 1024;
+    pub(crate) const TILE_BUFFER_48K: u32 = 48 * 1024;
     pub(crate) const POOLS: usize = 16;
     pub(crate) const POOL_SIZE: u64 = 0x200000;
     pub(crate) const FREELIST_SEED: u32 = 8192;
