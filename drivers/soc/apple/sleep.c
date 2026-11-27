@@ -3101,11 +3101,11 @@ EXPORT_SYMBOL_GPL(apple_sleep_domain_is_down);
 #define ENGINE_RESET_PS		4
 #define ENGINE_RESET_DARTS	2
 
-static int sleep_engine_reset_wait(struct apple_sleep *s, u32 offset, u32 actual)
+static int sleep_engine_reset_wait(void __iomem *reg, u32 actual)
 {
 	u32 val;
 
-	return readl_poll_timeout_atomic(sleep_power_reg(s, offset), val,
+	return readl_poll_timeout_atomic(reg, val,
 					 FIELD_GET(PS_ACTUAL, val) == actual && !(val & PS_BUSY),
 					 10, PS_OFF_TIMEOUT_US);
 }
@@ -3126,6 +3126,40 @@ static bool sleep_ps_domain(struct apple_sleep *s, struct device_node *pd, u32 *
 	return ours;
 }
 
+/* Map a PMGR power-state word directly when apple_sleep is not bound on this board. */
+static void __iomem *sleep_map_pmgr_domain(struct device_node *pd, void __iomem **map)
+{
+	struct device_node *parent;
+	struct resource res;
+	void __iomem *base;
+	u32 offset;
+
+	if (!(of_device_is_compatible(pd, "apple,pmgr-pwrstate") ||
+	      of_device_is_compatible(pd, "apple,t8103-pmgr-pwrstate")) ||
+	    of_property_read_bool(pd, "apple,firmware-owned") ||
+	    of_property_read_bool(pd, "apple,inherited-on") ||
+	    of_property_read_bool(pd, "apple,auto-managed") ||
+	    of_property_read_u32(pd, "reg", &offset))
+		return NULL;
+
+	parent = of_get_parent(pd);
+	if (!parent || !of_device_is_compatible(parent, "apple,pmgr") ||
+	    of_address_to_resource(parent, 0, &res) ||
+	    resource_size(&res) < sizeof(u32) ||
+	    offset > resource_size(&res) - sizeof(u32)) {
+		of_node_put(parent);
+		return NULL;
+	}
+
+	base = of_iomap(parent, 0);
+	of_node_put(parent);
+	if (!base)
+		return NULL;
+
+	*map = base;
+	return base + offset;
+}
+
 /* The @index-th DART in @np's iommus, a reference held, or NULL past the last. */
 static struct device *sleep_iommus_dart(struct device_node *np, int index)
 {
@@ -3144,33 +3178,53 @@ int apple_sleep_engine_reset(struct device *dev)
 {
 	struct apple_sleep *s = apple_sleep;
 	struct device *darts[ENGINE_RESET_DARTS] = {};
-	u32 ps[ENGINE_RESET_PS], saved[ENGINE_RESET_PS], val;
+	void __iomem *ps_regs[ENGINE_RESET_PS];
+	void __iomem *pmgr_maps[ENGINE_RESET_PS] = {};
+	u32 saved[ENGINE_RESET_PS], val;
 	struct of_phandle_iterator it;
 	void __iomem *asc;
 	int i, n = 0, idx, err, ret = 0;
 
-	if (!s)
-		return -ENODEV;
-	if (s->soc->regions)
+	if (s && s->soc->regions)
 		return -EOPNOTSUPP; /* T6050 has no standalone engine reset here. */
 	of_for_each_phandle(&it, err, dev->of_node, "power-domains", NULL, 0) {
-		if (!sleep_ps_domain(s, it.node, &val))
-			continue;
-		if (n == ENGINE_RESET_PS) {
-			of_node_put(it.node);
-			return -E2BIG;
+		void __iomem *map = NULL;
+		void __iomem *reg;
+
+		if (s) {
+			if (!sleep_ps_domain(s, it.node, &val))
+				continue;
+			reg = sleep_power_reg(s, val);
+		} else {
+			reg = sleep_map_pmgr_domain(it.node, &map);
+			if (!reg)
+				continue;
 		}
-		ps[n++] = val;
+		if (n == ENGINE_RESET_PS) {
+			if (map)
+				iounmap(map);
+			of_node_put(it.node);
+			ret = -E2BIG;
+			goto out_unmap;
+		}
+		pmgr_maps[n] = map;
+		ps_regs[n++] = reg;
 	}
-	if (!n)
-		return -ENODEV;
+	if (!n) {
+		ret = -ENODEV;
+		goto out_unmap;
+	}
 
 	idx = of_property_match_string(dev->of_node, "reg-names", "coproc");
 	if (idx < 0)
 		idx = of_property_match_string(dev->of_node, "reg-names", "asc");
+	if (idx < 0 && !of_property_present(dev->of_node, "reg-names"))
+		idx = 0;
 	asc = idx >= 0 ? of_iomap(dev->of_node, idx) : NULL;
-	if (!asc)
-		return -ENODEV;
+	if (!asc) {
+		ret = -ENODEV;
+		goto out_unmap;
+	}
 
 	for (i = 0; i < ENGINE_RESET_DARTS; i++) {
 		darts[i] = sleep_iommus_dart(dev->of_node, i);
@@ -3180,24 +3234,24 @@ int apple_sleep_engine_reset(struct device *dev)
 	}
 
 	for (i = 0; i < n && !ret; i++) {
-		saved[i] = readl(sleep_power_reg(s, ps[i]));
-		writel(PS_ENGINE_RESET_4, sleep_power_reg(s, ps[i]));
-		ret = sleep_engine_reset_wait(s, ps[i], 4);
+		saved[i] = readl(ps_regs[i]);
+		writel(PS_ENGINE_RESET_4, ps_regs[i]);
+		ret = sleep_engine_reset_wait(ps_regs[i], 4);
 		if (!ret) {
-			writel(PS_ENGINE_RESET_0, sleep_power_reg(s, ps[i]));
-			ret = sleep_engine_reset_wait(s, ps[i], 0);
+			writel(PS_ENGINE_RESET_0, ps_regs[i]);
+			ret = sleep_engine_reset_wait(ps_regs[i], 0);
 		}
 	}
 	if (!ret) {
 		usleep_range(1000, 2000);
 		for (i = 0; i < n; i++)
-			writel(0, sleep_power_reg(s, ps[i]));
+			writel(0, ps_regs[i]);
 		for (i = n - 1; i >= 0 && !ret; i--) {
-			writel(PS_TARGET, sleep_power_reg(s, ps[i]));
-			ret = sleep_engine_reset_wait(s, ps[i], FIELD_MAX(PS_ACTUAL));
+			writel(PS_TARGET, ps_regs[i]);
+			ret = sleep_engine_reset_wait(ps_regs[i], FIELD_MAX(PS_ACTUAL));
 			if (!ret)
 				writel(saved[i] & ~(PS_FLAGS | PS_RESET | PS_ACTUAL),
-				       sleep_power_reg(s, ps[i]));
+				       ps_regs[i]);
 		}
 	}
 	if (!ret)
@@ -3209,6 +3263,11 @@ int apple_sleep_engine_reset(struct device *dev)
 		put_device(darts[i]);
 	}
 	iounmap(asc);
+
+out_unmap:
+	for (i = 0; i < n; i++)
+		if (pmgr_maps[i])
+			iounmap(pmgr_maps[i]);
 
 	return ret;
 }

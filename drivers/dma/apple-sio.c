@@ -188,6 +188,8 @@ struct sio_data {
 	struct apple_rtkit *rtk;
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
+	/* The firmware is stopped while runtime-suspended. */
+	bool rpm_stopped;
 	bool firmware_only;
 	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
 	bool tables_mismatch;
@@ -1221,8 +1223,10 @@ static int sio_terminate_all(struct dma_chan *chan)
 static void sio_terminate_work(struct work_struct *wq)
 {
 	struct sio_chan *siochan = container_of(wq, struct sio_chan, terminate_wq);
+	struct sio_data *sio = siochan->host;
 	struct sio_tx *tx;
 	unsigned long flags;
+	bool resumed;
 	int ret;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
@@ -1232,15 +1236,22 @@ static void sio_terminate_work(struct work_struct *wq)
 	if (WARN_ON(!tx))
 		return;
 
-	ret = sio_call(siochan->host, FIELD_PREP(SIOMSG_EP, siochan->no) |
-				      FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
-	if (ret < 0)
-		dev_err(siochan->host->dev, "terminate call on chan %d failed: %d\n",
+	ret = pm_runtime_resume_and_get(sio->dev);
+	resumed = ret >= 0;
+	if (!resumed) {
+		dev_err(sio->dev, "runtime resume before terminate on chan %d failed: %d\n",
 			siochan->no, ret);
+	} else {
+		ret = sio_call(sio, FIELD_PREP(SIOMSG_EP, siochan->no) |
+				    FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
+		if (ret < 0)
+			dev_err(sio->dev, "terminate call on chan %d failed: %d\n",
+				siochan->no, ret);
 
-	ret = wait_for_completion_timeout(&tx->done, msecs_to_jiffies(500));
-	if (!ret)
-		dev_err(siochan->host->dev, "terminate descriptor wait timed out\n");
+		ret = wait_for_completion_timeout(&tx->done, msecs_to_jiffies(500));
+		if (!ret)
+			dev_err(sio->dev, "terminate descriptor wait timed out\n");
+	}
 
 	tasklet_kill(&siochan->vc.task);
 
@@ -1251,6 +1262,11 @@ static void sio_terminate_work(struct work_struct *wq)
 	sio_update_current_tx_locked(siochan);
 	sio_ring_leave_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	if (resumed) {
+		pm_runtime_mark_last_busy(sio->dev);
+		pm_runtime_put_autosuspend(sio->dev);
+	}
 
 	sio_tx_free(&tx->vd);
 }
@@ -1297,6 +1313,13 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 	unsigned int i;
 	int ret;
 
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0) {
+		dev_err(dev, "chan %d: runtime resume before stop failed: %d\n",
+			siochan->no, ret);
+		return ret;
+	}
+
 	dev_err(dev, "chan %d: issued descriptors did not complete, stopping it\n", siochan->no);
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	siochan->stopping = true;
@@ -1336,6 +1359,9 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 	siochan->stopping = false;
 	sio_fill_in_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 
 	return ret == 1 ? 0 : -EIO;
 }
@@ -1424,12 +1450,16 @@ static int sio_clear_idle(struct sio_chan *siochan)
 
 	sio_tx_free(&idle->vd);
 	sio_free_dead(siochan);
+
+	pm_runtime_mark_last_busy(siochan->host->dev);
+	pm_runtime_put_autosuspend(siochan->host->dev);
 	return 0;
 }
 
 /* See struct apple_sio_idle */
 static int sio_set_idle(struct sio_chan *siochan, const struct apple_sio_idle *config)
 {
+	struct device *dev = siochan->host->dev;
 	struct sio_tx *idle;
 	unsigned long flags;
 	int ret;
@@ -1443,12 +1473,20 @@ static int sio_set_idle(struct sio_chan *siochan, const struct apple_sio_idle *c
 	if (!idle)
 		return -ENOMEM;
 
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0) {
+		sio_tx_free(&idle->vd);
+		return ret;
+	}
+
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	ret = siochan->idle ? -EBUSY : 0;
 	if (!ret && !siochan->ring)
 		ret = sio_ring_enter_locked(siochan);
 	if (ret) {
 		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		pm_runtime_mark_last_busy(dev);
+		pm_runtime_put_autosuspend(dev);
 		sio_tx_free(&idle->vd);
 		return ret;
 	}
@@ -1770,6 +1808,10 @@ static int sio_device_config(struct dma_chan *chan,
 	if (siochan->configured && memcmp(&siochan->cfg, &cfg, sizeof(cfg)))
 		return -EBUSY;
 
+	ret = pm_runtime_resume_and_get(sio->dev);
+	if (ret < 0)
+		return ret;
+
 	sio_write_config(sio->hw, cfg_shmem, &cfg);
 	dma_wmb();
 
@@ -1785,6 +1827,9 @@ static int sio_device_config(struct dma_chan *chan,
 		siochan->configured = true;
 		siochan->cfg = cfg;
 	}
+
+	pm_runtime_mark_last_busy(sio->dev);
+	pm_runtime_put_autosuspend(sio->dev);
 
 	return ret;
 }
@@ -1871,11 +1916,13 @@ static void sio_free_v9_shmem(void *data)
 	struct sio_data *sio = data;
 	int err;
 
-	/* An acknowledged shutdown must precede releasing firmware DMA targets. */
-	err = apple_rtkit_shutdown(sio->rtk);
-	if (err) {
-		dev_err(sio->dev, "SIO shutdown failed: %d; retaining DMA buffers\n", err);
-		return;
+	if (!sio->rpm_stopped && !sio->asleep) {
+		/* An acknowledged shutdown must precede releasing firmware DMA targets. */
+		err = apple_rtkit_shutdown(sio->rtk);
+		if (err) {
+			dev_err(sio->dev, "SIO shutdown failed: %d; retaining DMA buffers\n", err);
+			return;
+		}
 	}
 	dma_free_coherent(sio->dev, sio->arrays->responses * sio->arrays->response_size,
 			  sio->responses, sio->responses_iova);
@@ -2045,6 +2092,11 @@ static int sio_commit_stop(void *data)
 	return ret;
 }
 
+static bool sio_can_runtime_suspend(const struct sio_data *sio)
+{
+	return !sio->hw->commit_stop && !sio->hw->stop_at_commit;
+}
+
 static int sio_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -2104,15 +2156,16 @@ static int sio_probe(struct platform_device *pdev)
 	pm_runtime_get_noresume(&pdev->dev);
 	pm_runtime_set_active(&pdev->dev);
 	err = devm_pm_runtime_enable(&pdev->dev);
-	if (err < 0)
-		return dev_err_probe(&pdev->dev, err,
-				     "pm_runtime_enable failed: %d\n", err);
+	if (err < 0) {
+		dev_err_probe(&pdev->dev, err, "pm_runtime_enable failed: %d\n", err);
+		goto err_rpm_put;
+	}
 
 	sio->rtk = devm_apple_rtkit_init(&pdev->dev, sio, NULL, 0, &sio_rtkit_ops);
 	if (IS_ERR(sio->rtk)) {
 		err = PTR_ERR(sio->rtk);
 		dev_err(&pdev->dev, "couldn't initialize rtkit\n");
-		goto rpm_put;
+		goto err_rpm_put;
 	}
 	for (i = 0; i < SIO_NTAGS; i++)
 		init_completion(&sio->tags.completions[i]);
@@ -2153,8 +2206,10 @@ static int sio_probe(struct platform_device *pdev)
 	writel(CPU_CONTROL_RUN, sio->base + REG_CPU_CONTROL);
 
 	err = apple_rtkit_boot(sio->rtk);
-	if (err)
-		return dev_err_probe(&pdev->dev, err, "SIO did not boot\n");
+	if (err) {
+		dev_err_probe(&pdev->dev, err, "SIO did not boot\n");
+		goto err_rpm_put;
+	}
 
 	if (sio->firmware_only) {
 		dev_info(&pdev->dev, "firmware running, no DMA service\n");
@@ -2162,23 +2217,30 @@ static int sio_probe(struct platform_device *pdev)
 	}
 
 	err = apple_rtkit_start_ep(sio->rtk, EP_SIO);
-	if (err)
-		return dev_err_probe(&pdev->dev, err, "starting SIO endpoint\n");
+	if (err) {
+		dev_err_probe(&pdev->dev, err, "starting SIO endpoint\n");
+		goto err_rpm_put;
+	}
 
 	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_START));
 	if (err < 1) {
 		if (err == 0)
 			err = -ENXIO;
-		return dev_err_probe(&pdev->dev, err, "starting SIO service\n");
+		dev_err_probe(&pdev->dev, err, "starting SIO service\n");
+		goto err_rpm_put;
 	}
-	if (hw->protocol && sio->protocol != hw->protocol)
-		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "SIO firmware protocol %u, this SoC's is %u\n",
-				     sio->protocol, hw->protocol);
+	if (hw->protocol && sio->protocol != hw->protocol) {
+		err = dev_err_probe(&pdev->dev, -ENODEV,
+				    "SIO firmware protocol %u, this SoC's is %u\n",
+				    sio->protocol, hw->protocol);
+		goto err_rpm_put;
+	}
 
 	err = sio_send_dt_params(sio);
-	if (err < 0)
-		return dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
+	if (err < 0) {
+		dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
+		goto err_rpm_put;
+	}
 	if (sio->tables_mismatch) {
 		sio->firmware_only = true;
 		goto rpm_put;
@@ -2186,36 +2248,52 @@ static int sio_probe(struct platform_device *pdev)
 
 	err = sio_alloc_shmem(sio);
 	if (err < 0)
-		return err;
+		goto err_rpm_put;
 
 	if (hw->commit_stop) {
 		err = apple_sleep_coproc_register(&pdev->dev, sio->base, false, sio_commit_stop, sio);
-		if (err)
-			return dev_err_probe(&pdev->dev, err, "registering the sleep's stop\n");
+		if (err) {
+			dev_err_probe(&pdev->dev, err, "registering the sleep's stop\n");
+			goto err_rpm_put;
+		}
 		apple_sleep_coproc_set_early(&pdev->dev);
 	}
 
 	err = dma_async_device_register(&sio->dma);
-	if (err)
-		return dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
+	if (err) {
+		dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
+		goto err_unregister_coproc;
+	}
 
 	err = of_dma_controller_register(pdev->dev.of_node, sio_dma_of_xlate, sio);
 	if (err) {
 		dma_async_device_unregister(&sio->dma);
-		return dev_err_probe(&pdev->dev, err, "failed to register with OF\n");
+		dev_err_probe(&pdev->dev, err, "failed to register with OF\n");
+		goto err_unregister_coproc;
 	}
 
 rpm_put:
-	if (!err && hw->stop_at_commit)
+	if (hw->stop_at_commit)
 		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
 								      sio_commit_stop, sio);
 	/*
-	 * One stopped by the sleep's commit runs until then: a runtime suspend would let its domain
-	 * go off under the firmware.
+	 * Firmware stopped at the sleep commit stays active at runtime: a runtime
+	 * suspend would let its domain go off under live firmware.
 	 */
-	if (!hw->commit_stop)
-		pm_runtime_put(&pdev->dev);
+	if (sio_can_runtime_suspend(sio)) {
+		pm_runtime_set_autosuspend_delay(&pdev->dev, 500);
+		pm_runtime_use_autosuspend(&pdev->dev);
+		pm_runtime_mark_last_busy(&pdev->dev);
+		pm_runtime_put_autosuspend(&pdev->dev);
+	}
 
+	return 0;
+
+err_unregister_coproc:
+	if (hw->commit_stop)
+		apple_sleep_coproc_unregister(&pdev->dev);
+err_rpm_put:
+	pm_runtime_put_noidle(&pdev->dev);
 	return err;
 }
 
@@ -2225,24 +2303,16 @@ static void sio_remove(struct platform_device *pdev)
 
 	if (sio->commit_registered || sio->hw->commit_stop)
 		apple_sleep_coproc_unregister(&pdev->dev);
-	if (sio->firmware_only)
-		return;
-
-	of_dma_controller_free(pdev->dev.of_node);
-	dma_async_device_unregister(&sio->dma);
-}
-
-static __maybe_unused int sio_suspend(struct device *dev)
-{
-	/*
-	 * TODO: SIO coproc sleep state
-	 */
-	return 0;
-}
-
-static __maybe_unused int sio_resume(struct device *dev)
-{
-	return 0;
+	if (!sio->firmware_only) {
+		of_dma_controller_free(pdev->dev.of_node);
+		dma_async_device_unregister(&sio->dma);
+	}
+	if (sio_can_runtime_suspend(sio)) {
+		pm_runtime_dont_use_autosuspend(&pdev->dev);
+		pm_runtime_barrier(&pdev->dev);
+	} else {
+		pm_runtime_put_noidle(&pdev->dev);
+	}
 }
 
 /* A channel with a transfer can't be carried through a firmware restart. */
@@ -2252,25 +2322,93 @@ static bool sio_chan_busy(struct sio_chan *siochan)
 	bool busy;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
-	busy = siochan->current_tx || siochan->idle || siochan->ring;
+	busy = siochan->current_tx || siochan->idle || siochan->ring ||
+	       siochan->pending;
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
 	return busy;
 }
 
-/* One stopped in the commit stays up through the system suspend. */
+static __maybe_unused void sio_halt_cpu(struct sio_data *sio)
+{
+	apple_rtkit_mailbox_off(sio->rtk);
+	writel(readl(sio->base + REG_CPU_CONTROL) & ~CPU_CONTROL_RUN,
+	       sio->base + REG_CPU_CONTROL);
+	writel(readl(sio->base + REG_CPU_CONTROL) & ~CPU_CONTROL_RUN,
+	       sio->base + REG_CPU_CONTROL);
+}
+
+static __maybe_unused int sio_suspend(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int i, ret;
+
+	if (!sio_can_runtime_suspend(sio) || sio->asleep || sio->rpm_stopped)
+		return 0;
+
+	for (i = 0; i < sio->nchannels; i++) {
+		if (sio_chan_busy(&sio->channels[i]))
+			return -EBUSY;
+	}
+	if (!bitmap_empty(sio->tags.allocated, SIO_NTAGS))
+		return -EBUSY;
+
+	ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "firmware did not stop for runtime suspend: %d\n", ret);
+		if (apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL))
+			dev_err(dev, "firmware did not come back\n");
+		return ret;
+	}
+	sio->rpm_stopped = true;
+
+	return 0;
+}
+
+static __maybe_unused int sio_resume(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int ret;
+
+	if (!sio->rpm_stopped)
+		return 0;
+
+	/*
+	 * A sibling domain (for example SPI or audio) can keep SIO's shared
+	 * power switch up across runtime suspend, leaving the idled firmware
+	 * in place where power_cycled_return() would time out after 1 s.
+	 * Pulse the PMGR engine reset first when available so resume finishes
+	 * cleanly regardless of whether the domain power-cycled.
+	 */
+	ret = apple_sleep_engine_reset(dev);
+	if (ret && ret != -ENODEV && ret != -EOPNOTSUPP) {
+		dev_err(dev, "engine reset before runtime resume failed: %d\n", ret);
+		return ret;
+	}
+	ret = apple_rtkit_power_cycled_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret) {
+		sio_halt_cpu(sio);
+		dev_err(dev, "firmware did not come back from runtime suspend: %d\n", ret);
+		return ret;
+	}
+	sio->rpm_stopped = false;
+
+	return 0;
+}
+
+/* One stopped at the sleep commit stays up through system suspend. */
 static __maybe_unused int sio_system_suspend(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
 
-	return sio->hw->commit_stop ? 0 : pm_runtime_force_suspend(dev);
+	return sio_can_runtime_suspend(sio) ? pm_runtime_force_suspend(dev) : 0;
 }
 
 static __maybe_unused int sio_system_resume(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
 
-	return sio->hw->commit_stop ? 0 : pm_runtime_force_resume(dev);
+	return sio_can_runtime_suspend(sio) ? pm_runtime_force_resume(dev) : 0;
 }
 
 static __maybe_unused int sio_suspend_late(struct device *dev)
@@ -2278,7 +2416,7 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 	struct sio_data *sio = dev_get_drvdata(dev);
 	int i, ret;
 
-	if (!pm_suspend_via_firmware() || sio->asleep)
+	if (!pm_suspend_via_firmware() || sio->asleep || sio->rpm_stopped)
 		return 0;
 
 	for (i = 0; i < sio->nchannels; i++) {
