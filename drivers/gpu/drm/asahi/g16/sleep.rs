@@ -356,6 +356,8 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
+    suspend_noirq: Some(crate::driver::sleep_suspend_noirq),
+    resume_noirq: Some(crate::driver::sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });

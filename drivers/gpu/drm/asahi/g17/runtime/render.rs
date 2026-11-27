@@ -8,7 +8,7 @@ mod exit;
 mod dependencies;
 mod direct;
 mod grow;
-mod observe;
+pub(super) mod observe;
 mod pools;
 mod prepare;
 mod recovery;
@@ -291,13 +291,16 @@ impl Registry {
         }
         // Prefer an empty reservation or an already parked channel, then a
         // reusable or warmed unpublished pair, then an idle drained published
-        // sibling (render only).
-        for pass in 0..3u8 {
-            if pass == 2 && owner.is_none() {
+        // sibling (render only), preferring non-wide siblings before wide ones.
+        for pass in 0..4u8 {
+            if pass >= 2 && owner.is_none() {
                 break;
             }
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()
@@ -454,9 +457,12 @@ impl Registry {
     /// only that slot's owner so the next queue reuses them via `bind_owner()`.
     /// The caller destroys any returned backing after dropping the device lock.
     pub(super) fn reclaim_unused_render_sibling(&mut self) -> Result<Option<UnusedRenderSpare>> {
-        for pass in 0..3u8 {
+        for pass in 0..4u8 {
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()
@@ -1184,6 +1190,29 @@ impl crate::g17::Firmware {
         })
     }
 
+    /// Undoes an unpublished pool preparation and flushes any final release
+    /// exposed when sibling renders completed while the preparation was lent.
+    fn rollback_render_pool(&mut self, preparation: pools::Preparation) -> Result {
+        let pending = match self.queues.render.pools.rollback(preparation) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.primary.state.shared.lose_device_quietly();
+                return Err(error);
+            }
+        };
+        if pending {
+            match self.release_render_lists() {
+                Ok(()) => {}
+                Err(error) if error == EAGAIN => self.primary.state.shared.queue_events(),
+                Err(error) => {
+                    self.primary.state.shared.lose_device_quietly();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Events have already been consumed by the caller. Each healthy completion
     /// services its final pool release before examining the next retained job.
     fn retire_render_slot(
@@ -1545,11 +1574,16 @@ impl Registry {
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
+            // A completion that arrived while the pair was borrowed (`missed_event`) is owed to
+            // its borrower, whose return observes the pair or requests an event pass: no
+            // rescan waits for it.
             let active = entry
                 .pair
                 .as_ref()
                 .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                    (entry.preparing.is_some() || entry.growing)
+                        && entry.borrowed_active
+                        && !entry.missed_event,
                     |pair| pair.published_in_flight(),
                 );
             active

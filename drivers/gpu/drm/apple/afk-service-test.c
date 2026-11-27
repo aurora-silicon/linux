@@ -266,11 +266,86 @@ static void afk_service_declined_channel_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, afk_service_retired(service, 3));
 }
 
+static const struct apple_epic_service_ops singleton_video_ops = {
+	.name = "singleton-video",
+	.reusable = true,
+	.singleton = true,
+};
+
+static const struct apple_epic_service_ops singleton_audio_ops = {
+	.name = "singleton-audio",
+	.reusable = true,
+	.singleton = true,
+};
+
+/*
+ * The firmware announces its AV video and audio interfaces again on fresh
+ * channels on every display attach and never closes the old ones. Announce
+ * them as the endpoint's receive path does: take the first reclaimable
+ * slot, then supersede the previous instance. The superseded audio
+ * instance stays pinned by its owner until the successor's init drops it.
+ */
+static struct apple_epic_service *
+afk_test_announce(struct apple_epic_service *slots, unsigned int nr,
+		  const struct apple_epic_service_ops *ops, u32 channel)
+{
+	struct apple_epic_service *admitted = NULL;
+	unsigned int i;
+
+	/* As afk_recv_handle_init(): admit first, then retire what it replaces. */
+	for (i = 0; i < nr && !admitted; i++)
+		if (afk_service_reinit(&slots[i], NULL, ops, channel))
+			admitted = &slots[i];
+	if (!admitted)
+		return NULL;
+	for (i = 0; i < nr; i++)
+		if (&slots[i] != admitted)
+			afk_service_supersede(&slots[i], ops, channel);
+	return admitted;
+}
+
+static void afk_service_singleton_reannounce_test(struct kunit *test)
+{
+	struct apple_epic_service *slots, *video, *audio, *owned = NULL;
+	const unsigned int nr = 4;
+	unsigned int i;
+	u32 channel = 5;
+
+	slots = kunit_kcalloc(test, nr, sizeof(*slots), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, slots);
+	for (i = 0; i < nr; i++)
+		spin_lock_init(&slots[i].lock);
+
+	/* Many more attaches than slots: the budget stays bounded. */
+	for (i = 0; i < 4 * AFK_MAX_CHANNEL; i++, channel += 4) {
+		video = afk_test_announce(slots, nr, &singleton_video_ops, channel);
+		KUNIT_ASSERT_NOT_NULL(test, video);
+		KUNIT_EXPECT_TRUE(test, afk_service_matches(video, channel));
+		audio = afk_test_announce(slots, nr, &singleton_audio_ops, channel + 2);
+		KUNIT_ASSERT_NOT_NULL(test, audio);
+		/* The audio owner pins the new instance and lets go of the old one. */
+		KUNIT_ASSERT_PTR_EQ(test, afk_service_get(audio), audio);
+		if (owned)
+			afk_service_put(owned);
+		owned = audio;
+	}
+
+	/* A different service is never superseded by a singleton announcement. */
+	KUNIT_EXPECT_FALSE(test, afk_service_supersede(owned, &singleton_video_ops, 1));
+	/* Nor is the instance announced on the same channel. */
+	KUNIT_EXPECT_FALSE(test, afk_service_supersede(owned, &singleton_audio_ops,
+						       owned->channel));
+	/* Only singleton services are superseded. */
+	KUNIT_EXPECT_FALSE(test, afk_service_supersede(owned, &reusable_ops, 1));
+	afk_service_put(owned);
+}
+
 static struct kunit_case afk_service_cases[] = {
 	KUNIT_CASE(afk_service_admission_test),
 	KUNIT_CASE(dptx_service_identity_test),
 	KUNIT_CASE(dptx_service_duplicate_close_test),
 	KUNIT_CASE(afk_service_many_generations_test),
+	KUNIT_CASE(afk_service_singleton_reannounce_test),
 	KUNIT_CASE(afk_service_reader_pin_test),
 	KUNIT_CASE(afk_service_pending_reply_test),
 	KUNIT_CASE(afk_service_completed_reader_test),

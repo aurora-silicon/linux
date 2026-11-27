@@ -95,3 +95,11 @@
 &ps_gfx {
 	status = "okay";
 };
+
+&ps_sio_cpu {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};

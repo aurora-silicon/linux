@@ -942,6 +942,7 @@ impl gpu::Gpu for Gpu {
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        _window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
         timestamp::map(self, bo, range)
     }

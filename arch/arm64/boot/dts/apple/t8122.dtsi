@@ -1177,6 +1177,17 @@
 				apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b",
 						     "Tg0j", "Tg0v", "Te05", "Te0P",
 						     "Tp05", "Tp0L", "Tp0b", "Tp0r";
+				/*
+				 * SoC die limits from the ADT's /arm-io/pmp/iop-pmp-nub,
+				 * the same in the J433, J434, J504, J613 and J615 device
+				 * trees: the PMP's fast die control holds the average die
+				 * temperature at fast-die-ctrl-ts-avg-temp (100 C) and the
+				 * hottest die sensor at the fast-die-ctrl-loop target
+				 * (110 C). Power consumers shed performance from the first
+				 * and hold their lowest state at the second.
+				 */
+				apple,soc-die-passive-millicelsius = <100000>;
+				apple,soc-die-hot-millicelsius = <110000>;
 				apple,thermal-pressure-key = "mTPL";
 
 				/* CPU die temperatures, first: thermal zones index them. */

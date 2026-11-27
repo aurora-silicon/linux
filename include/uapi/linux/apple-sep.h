@@ -306,8 +306,10 @@ struct sep_bio_rearm {
  * install, or an access-control list not satisfied), EACCES when the touch
  * did not match (or Touch ID is locked out), ETIMEDOUT when no finger came,
  * ENODEV while the key store or Touch ID is not up, EOPNOTSUPP for a
- * reserved policy, ECANCELED after SEP_KEY_CANCEL, EIO for any other
- * enclave failure.
+ * reserved policy, ECANCELED after SEP_KEY_CANCEL, EBUSY when a Touch ID
+ * verify or enrolment on /dev/sep-bio wants the sensor during the wait (try
+ * again later, backing off: a verify such as a lock screen's can stay open
+ * for a long time), EIO for any other enclave failure.
  */
 #define SEP_KEY_IFACE_VERSION 4
 #define SEP_KEY_FEATURE_CANCEL 0x1

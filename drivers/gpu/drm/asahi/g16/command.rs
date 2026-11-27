@@ -185,6 +185,13 @@ pub(crate) struct RenderCommand {
     pub(crate) fragment_attachments: KVec<uapi::drm_asahi_attachment>,
 }
 
+impl RenderCommand {
+    /// Whether this render pass is multisampled.
+    pub(crate) fn is_multisampled(&self) -> bool {
+        self.cmd.samples > 1
+    }
+}
+
 /// A validated compute command.
 pub(crate) struct ComputeCommand {
     pub(crate) cmd: uapi::drm_asahi_cmd_compute,

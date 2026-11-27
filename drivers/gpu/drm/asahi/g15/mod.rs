@@ -691,11 +691,19 @@ impl gpu::Gpu for Gpu {
         )?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        hw::va::TIMESTAMPS_SIZE
+    }
+
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        crate::timestamp::Buffer::firmware(timestamp::map(self, bo, range)?)
+        if !window.is_allowed() {
+            return Err(ENOSPC);
+        }
+        crate::timestamp::Buffer::firmware(timestamp::map(self, bo, range)?, window.into_share())
     }
 }
