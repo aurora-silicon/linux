@@ -1060,6 +1060,28 @@ static void dcp_v27_ext_wq_destroy(void *data)
 	destroy_workqueue(data);
 }
 
+/*
+ * The whole endpoint set, checked before the first endpoint is started: each one exists, and
+ * one the sleep does not track runs no ring yet (starting it again makes the firmware assert).
+ * A refusal here leaves every endpoint as it was, with nothing sent.
+ */
+static int dcp_v27_sleep_endpoints_check(struct apple_dcp *dcp)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
+		u8 id = v27_sleep_endpoints[i];
+
+		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
+			return -ENODEV;
+		if (READ_ONCE(dcp->sleep_v27_ep[id - 0x20]))
+			continue;
+		if (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))
+			return -EPROTO;
+	}
+	return 0;
+}
+
 /* Do not replace a running endpoint or call afk_shutdown: both keep their
  * rings, service references and outstanding callback lifetimes across sleep.
  * New auxiliary endpoints get only the actual ring start and code4/5 handshake;
@@ -1072,23 +1094,18 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 	struct apple_dcp_afkep *ep;
 	int i, ret, check;
 
+	ret = dcp_v27_sleep_endpoints_check(dcp);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
 		u8 id = v27_sleep_endpoints[i];
 		bool ext = s && dcp_v27_external(dcp) && t6050_ext_services;
 		bool served = ext && (id == 0x29 || id == 0x2a);
 		const struct apple_epic_service_ops *ops = no_services;
 
-		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
-			return -ENODEV;
 		ep = READ_ONCE(dcp->sleep_v27_ep[id - 0x20]);
 		if (ep)
 			continue;
-		/*
-		 * A ring already runs there without being tracked for the sleep: starting the
-		 * endpoint again makes the firmware assert. Refused before anything is sent.
-		 */
-		if (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))
-			return -EPROTO;
 		if (served && !s->ext_wq) {
 			/* Not ordered and not the endpoint's: a call waits for its reply. */
 			s->ext_wq = alloc_workqueue("apple-dcp-ext-av", WQ_UNBOUND, 0);
