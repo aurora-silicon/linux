@@ -8,7 +8,7 @@ const WINDOW_NS: u64 = 30_000_000_000;
 const LIMIT: u8 = 8;
 /// Restarts forgiven per window: one per group a render pair holds. Leftover work of a failed
 /// VM ends on its own, but an unknown firmware loop must still reach the limit.
-const FORGIVE_LIMIT: u8 = crate::hw::t8140::queues::RENDER_DEPTH;
+const FORGIVE_LIMIT: u8 = crate::hw::t8140::queues::RENDER_DEPTH_MAX;
 
 /// Commands retired successfully. A watchdog storm means the GPU stopped making progress;
 /// timeouts of overloaded clients while other work keeps retiring are not one.

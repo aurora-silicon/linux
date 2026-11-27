@@ -140,6 +140,9 @@ impl job::Backend for Backend {
     fn render_pairs(&self) -> u32 {
         u32::from(self.pairs)
     }
+    fn render_depth(&self) -> u32 {
+        u32::from(self.render_depth)
+    }
     fn input_sources(&self, inputs: &[crate::file::SyncItem])
         -> Option<Arc<crate::g17::sync_input::Sources>>
     {

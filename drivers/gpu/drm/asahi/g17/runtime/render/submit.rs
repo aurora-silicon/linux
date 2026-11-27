@@ -742,7 +742,7 @@ impl crate::g17::Firmware {
         if !pending_timeout {
             return Ok(());
         }
-        for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH {
+        for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH_MAX {
             if self.recovery.pending() || self.primary.state.shared.crashed.load(Ordering::Acquire)
             {
                 return Ok(());

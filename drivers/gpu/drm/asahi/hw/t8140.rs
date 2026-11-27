@@ -454,10 +454,12 @@ pub(crate) mod queues {
     // The QID budget reserves one physical pair per logical owner, which
     // leaves room for every execution context in the shared 128-QID
     // namespace. A second pair comes only from surplus, on G17C and G17D
-    // (g17::pairs). Commands queue at RENDER_DEPTH per pair, as many as a pair
-    // has command records (the render memory's RECORDS).
+    // (g17::pairs). Commands queue at RENDER_DEPTH per pair by default, up
+    // to RENDER_DEPTH_MAX on single-pair queues whose parameter-buffer scene
+    // table can back that many in-flight renders.
     pub(crate) const RENDER_PAIRS_MAX: usize = 2;
     pub(crate) const RENDER_DEPTH: u8 = 32;
+    pub(crate) const RENDER_DEPTH_MAX: u8 = 64;
     // The firmware stores an ioctl's compute completion stamps only once all of the ioctl's
     // kicks finished, so finished commands hold their place until the ioctl's longest one ends.
     pub(crate) const COMPUTE_DEPTH: usize = 32;

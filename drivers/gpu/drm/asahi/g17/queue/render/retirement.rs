@@ -8,7 +8,7 @@ use crate::hw::t8140::queues;
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 
-const DEPTH: usize = queues::RENDER_DEPTH as usize;
+const DEPTH_MAX: usize = queues::RENDER_DEPTH_MAX as usize;
 const MAX_GROUP_ITEMS: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +56,8 @@ impl Window {
     fn normalize(self, cursors: Cursors) -> Result<Cursors> {
         // Earlier and later groups can coexist in a snapshot. Anchor behind
         // this group's base so a backwards observation cannot look like wrap.
-        let back = MAX_GROUP_ITEMS * (DEPTH as u32 - 1);
-        let limit = MAX_GROUP_ITEMS * DEPTH as u32 + back;
+        let back = MAX_GROUP_ITEMS * (DEPTH_MAX as u32 - 1);
+        let limit = MAX_GROUP_ITEMS * DEPTH_MAX as u32 + back;
         if limit >= self.capacity {
             return Err(EINVAL);
         }
@@ -84,7 +84,7 @@ impl Window {
     fn progress(self, previous: Cursors, current: Cursors) -> Result<(bool, bool, bool)> {
         let previous = self.normalize(previous)?;
         let current = self.normalize(current)?;
-        let prefix = MAX_GROUP_ITEMS * (DEPTH as u32 - 1) + self.count;
+        let prefix = MAX_GROUP_ITEMS * (DEPTH_MAX as u32 - 1) + self.count;
         if !previous.valid()
             || !current.valid()
             || current.done < previous.done
@@ -359,28 +359,34 @@ pub(crate) fn drained(
             && recovery_state == 0)
 }
 
-/// Fixed storage keeps admission, rollback and retirement allocation-free.
+/// Fixed pre-allocated storage keeps admission, rollback and retirement allocation-free
+/// while keeping `Pair` small on the stack across `Pair::park()`.
 /// Each element retains its packet and resource leases independently of fences.
 pub(crate) struct Tracker<T> {
-    entries: [Option<T>; DEPTH],
+    entries: KVec<Option<T>>,
     head: usize,
     len: usize,
 }
 
 impl<T> Tracker<T> {
-    pub(crate) const fn new() -> Self {
-        Self {
-            entries: [const { None }; DEPTH],
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self> {
+        let capacity = capacity.clamp(1, DEPTH_MAX);
+        let mut entries = KVec::with_capacity(capacity, GFP_KERNEL)?;
+        for _ in 0..capacity {
+            entries.push(None, GFP_KERNEL)?;
+        }
+        Ok(Self {
+            entries,
             head: 0,
             len: 0,
-        }
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.len
     }
     pub(crate) fn room(&self) -> bool {
-        self.len < DEPTH
+        self.len < self.entries.len()
     }
     pub(crate) fn front(&self) -> Option<&T> {
         if self.len == 0 {
@@ -400,21 +406,24 @@ impl<T> Tracker<T> {
         if self.len == 0 {
             None
         } else {
-            self.entries[(self.head + self.len - 1) % DEPTH].as_ref()
+            let cap = self.entries.len();
+            self.entries[(self.head + self.len - 1) % cap].as_ref()
         }
     }
     pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
             None
         } else {
-            self.entries[(self.head + self.len - 1) % DEPTH].as_mut()
+            let cap = self.entries.len();
+            self.entries[(self.head + self.len - 1) % cap].as_mut()
         }
     }
     pub(crate) fn push(&mut self, value: T) -> core::result::Result<(), T> {
         if !self.room() {
             return Err(value);
         }
-        self.entries[(self.head + self.len) % DEPTH] = Some(value);
+        let cap = self.entries.len();
+        self.entries[(self.head + self.len) % cap] = Some(value);
         self.len += 1;
         Ok(())
     }
@@ -423,7 +432,7 @@ impl<T> Tracker<T> {
             return None;
         }
         let value = self.entries[self.head].take();
-        self.head = (self.head + 1) % DEPTH;
+        self.head = (self.head + 1) % self.entries.len();
         self.len -= 1;
         value
     }

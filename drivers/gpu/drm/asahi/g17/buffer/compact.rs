@@ -13,7 +13,7 @@
 use super::BlockGeometry;
 use crate::g17::object::{KernelObject, Placement};
 use crate::{
-    hw::t8140::{queues, resources as cfg},
+    hw::t8140::resources as cfg,
     mmu,
 };
 use core::ops::Range;
@@ -23,8 +23,6 @@ use kernel::prelude::*;
 pub(crate) const WINDOW: Range<u64> = BlockGeometry::M5_COMPACT;
 /// Its size: 4 GiB.
 pub(crate) const WINDOW_BYTES: u64 = WINDOW.end - WINDOW.start;
-
-const DEPTH: usize = queues::RENDER_DEPTH as usize;
 
 /// The task-stage mesh storage chunk: chunk bases are 64 KiB aligned, and the storage register
 /// counts 64 KiB chunks.
@@ -226,6 +224,8 @@ pub(crate) struct PairSizes {
     pub(crate) blocks: usize,
     /// The parameter-buffer geometry, which sizes the blocks, scratch, page list and metrics.
     pub(crate) geometry: BlockGeometry,
+    /// Command slots this render pair holds in flight.
+    pub(crate) depth: usize,
     /// One command slot's context state.
     pub(crate) state: usize,
     /// The task-stage mesh storage the pair may map ([`mesh_storage`]).
@@ -239,7 +239,7 @@ impl PairSizes {
             PairObject::Records => (1, self.records),
             PairObject::Tpc => (1, self.tpc),
             PairObject::ParameterBlock => (self.blocks, self.geometry.block_bytes),
-            PairObject::SlotState => (DEPTH, self.state),
+            PairObject::SlotState => (self.depth, self.state),
             PairObject::Scratch => (1, scratch_bytes(self.geometry)?),
             PairObject::Discard => (1, crate::g17::fw::m5::pool::DISCARD_BYTES),
             PairObject::PageList => (1, page_list_bytes(self.geometry)?),

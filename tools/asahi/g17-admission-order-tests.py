@@ -340,8 +340,8 @@ HELD_MUTATIONS = {
     'no-held-stop': ('state.held = 0;', ''),
     'released-owner-retakes': ('.any(|slot| self.owners[slot] == owner && self.released & (1u64 << slot) != 0)',
                                '.any(|_| false)'),
-    'held-blocks-owner': ('&& (self.quarantined | self.kill_hold) & (1u64 << slot) == 0\n            && self.refs[slot] < cfg::RENDER_DEPTH',
-                          '&& (self.quarantined | self.kill_hold | self.held) & (1u64 << slot) == 0\n            && self.refs[slot] < cfg::RENDER_DEPTH'),
+    'held-blocks-owner': ('&& (self.quarantined | self.kill_hold) & (1u64 << slot) == 0\n            && self.refs[slot] < self.render_depth',
+                          '&& (self.quarantined | self.kill_hold | self.held) & (1u64 << slot) == 0\n            && self.refs[slot] < self.render_depth'),
 }
 
 

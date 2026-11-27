@@ -393,8 +393,7 @@ impl crate::g17::Shared {
                             .pair
                             .as_ref()
                             .is_some_and(|pair| pair.published_in_flight());
-                        entry.borrowed_dependencies =
-                            entry.pair.as_ref().map(|pair| pair.dependency_snapshot());
+                        entry.snapshot_dependencies();
                         entry.borrowed_switch =
                             entry.pair.as_ref().and_then(|pair| pair.switch_in_flight());
                         entry.growing = true;
@@ -437,7 +436,7 @@ impl crate::g17::Shared {
                     return Err(EIO);
                 }
                 entry.pair = pair.take();
-                entry.borrowed_dependencies = None;
+                entry.clear_dependencies();
                 entry.borrowed_switch = None;
                 entry.growing = false;
                 // The grow work item requests an event pass when it finishes.

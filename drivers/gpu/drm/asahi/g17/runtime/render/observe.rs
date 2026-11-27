@@ -292,7 +292,7 @@ impl crate::g17::Shared {
             deferred.finish();
         }
         let mut cursor = 1;
-        let mut remaining = crate::hw::t8140::queues::RENDER_DEPTH;
+        let mut remaining = crate::hw::t8140::queues::RENDER_DEPTH_MAX;
         let mut retries = 0;
         loop {
             let epoch = match self.preparations.try_enter() {
@@ -316,7 +316,7 @@ impl crate::g17::Shared {
                 break;
             };
             if slot != cursor {
-                remaining = crate::hw::t8140::queues::RENDER_DEPTH;
+                remaining = crate::hw::t8140::queues::RENDER_DEPTH_MAX;
                 retries = 0;
             }
             let observed = firmware.queues.render.entries[slot]
@@ -376,7 +376,7 @@ impl crate::g17::Shared {
                 cursor = if retries >= 2 { slot + 1 } else { slot };
             }
             if cursor != slot {
-                remaining = crate::hw::t8140::queues::RENDER_DEPTH;
+                remaining = crate::hw::t8140::queues::RENDER_DEPTH_MAX;
                 retries = 0;
             }
         }

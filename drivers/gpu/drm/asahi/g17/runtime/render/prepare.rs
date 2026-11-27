@@ -372,8 +372,7 @@ impl super::super::Backend {
                             .pair
                             .as_ref()
                             .is_some_and(|pair| pair.published_in_flight());
-                        entry.borrowed_dependencies =
-                            entry.pair.as_ref().map(|pair| pair.dependency_snapshot());
+                        entry.snapshot_dependencies();
                         entry.borrowed_switch =
                             entry.pair.as_ref().and_then(|pair| pair.switch_in_flight());
                         Build::Rebind {
@@ -757,7 +756,7 @@ impl super::super::Backend {
             entry.pending_owner = None;
             entry.pending_owner_closed = false;
             entry.pair = Some(pair);
-            entry.borrowed_dependencies = None;
+            entry.clear_dependencies();
             entry.borrowed_switch = None;
             // A displaced context's release is armed now: its other pairs are held as well.
             firmware.queues.sync_render_holds();

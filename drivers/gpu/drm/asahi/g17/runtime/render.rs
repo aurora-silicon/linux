@@ -49,6 +49,7 @@ struct Entry {
     pending_owner_closed: bool,
     borrowed_active: bool,
     borrowed_dependencies: Option<crate::g17::queue::render::Dependencies>,
+    dependencies_scratch: Option<crate::g17::queue::render::Dependencies>,
     /// `Pair::switch_in_flight` of a borrowed pair. A borrowed pair publishes
     /// nothing, so the snapshot can only be stale towards an older switch.
     borrowed_switch: Option<u64>,
@@ -62,6 +63,30 @@ struct Entry {
     constructing: bool,
     growing: bool,
     published: bool,
+}
+
+impl Entry {
+    fn snapshot_dependencies(&mut self) {
+        let Some(pair) = self.pair.as_ref() else {
+            return;
+        };
+        let Some(mut deps) = self
+            .dependencies_scratch
+            .take()
+            .or_else(|| self.borrowed_dependencies.take())
+        else {
+            return;
+        };
+        pair.snapshot_dependencies_into(&mut deps);
+        self.borrowed_dependencies = Some(deps);
+    }
+
+    fn clear_dependencies(&mut self) {
+        if let Some(mut deps) = self.borrowed_dependencies.take() {
+            deps.clear();
+            self.dependencies_scratch = Some(deps);
+        }
+    }
 }
 
 /// Unpublished objects removed together, then destroyed outside the device lock.
@@ -192,9 +217,9 @@ impl RenderState {
             return Err(EIO);
         }
         entry.borrowed_active = pair.published_in_flight();
-        entry.borrowed_dependencies = Some(pair.dependency_snapshot());
         entry.borrowed_switch = pair.switch_in_flight();
         entry.preparing = Some(packet.clone());
+        entry.snapshot_dependencies();
         entry.pair.take().ok_or(EIO)
     }
 
@@ -212,7 +237,7 @@ impl RenderState {
             return Err(EIO);
         }
         entry.pair = pair.take();
-        entry.borrowed_dependencies = None;
+        entry.clear_dependencies();
         entry.borrowed_switch = None;
         entry.preparing = None;
         Ok(())
@@ -638,6 +663,7 @@ impl Registry {
 
     fn build_render_ids(&mut self, slot: u8, owner: u64) -> Result {
         {
+            let dependencies_scratch = crate::g17::queue::render::Dependencies::new()?;
             let identity = self.identities.reserve(2)?.start;
             let tiling = self.qids.reserve(identity, DataMaster::Tiling, None)?;
             let fragment = match self.qids.reserve(identity + 1, DataMaster::Fragment, None) {
@@ -663,6 +689,7 @@ impl Registry {
                 pending_owner_closed: false,
                 borrowed_active: false,
                 borrowed_dependencies: None,
+                dependencies_scratch: Some(dependencies_scratch),
                 borrowed_switch: None,
                 event_masks: [0; 2],
                 missed_event: false,

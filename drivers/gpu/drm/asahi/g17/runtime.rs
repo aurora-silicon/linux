@@ -307,7 +307,12 @@ impl Registry {
             buffers <- BufferIds::new(),
             metrics: Arc::new(MetricsIds::for_firmware(variant.m5_commands)?, GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
+            admission: admission::Pool::with_waiters_and_depth(
+                kick::queue_limit(variant.qid_floor),
+                super::pairs::render_depth_for_device(variant.m5_commands),
+                queues,
+                renders,
+            )?,
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
@@ -1358,6 +1363,8 @@ pub(super) struct Backend {
     /// Render pairs this owner may hold, fixed at creation with its scheduler's
     /// credits and its render pool's sizing.
     pairs: u8,
+    /// Commands each physical render pair of this owner holds in flight.
+    render_depth: u8,
     /// Physical compute channels this owner may hold (up to three on M5 Pro, one elsewhere).
     compute_channels: u8,
 }
@@ -1556,6 +1563,7 @@ impl Backend {
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
                     pairs: super::pairs::per_owner(),
+                    render_depth: super::pairs::render_depth_for_device(shared.variant.m5_commands),
                     compute_channels: super::pairs::compute_channels_per_owner(),
                 }),
                 GFP_KERNEL,
@@ -2242,10 +2250,10 @@ pub(super) struct DeferredBatch {
     tvb: KVVec<super::buffer::TvbRelease>,
 }
 impl DeferredBatch {
-    const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
+    const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH_MAX as usize
         > crate::hw::t8140::queues::COMPUTE_DEPTH
     {
-        crate::hw::t8140::queues::RENDER_DEPTH as usize
+        crate::hw::t8140::queues::RENDER_DEPTH_MAX as usize
     } else {
         crate::hw::t8140::queues::COMPUTE_DEPTH
     };
