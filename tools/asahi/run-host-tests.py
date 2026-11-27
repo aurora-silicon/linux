@@ -568,10 +568,7 @@ def kill_group(p):
 def run(job, timeout):
     label, cmd, cwd, expect, d, extra = job
     (d / 'tmp').mkdir(parents=True, exist_ok=True)
-    # Several tests compare against old revisions with `git show <sha>:<path>` and skip that check when the commit is
-    # missing. In a partial (blob:none) clone a missing object is fetched on demand instead, and a commit the remote no
-    # longer has (g15-pb-growth's dba2a110) makes git retry for hours at several GB. Fail fast, as a shallow clone does.
-    env = dict(os.environ, TMPDIR=str(d / 'tmp'), GIT_NO_LAZY_FETCH='1', **extra)
+    env = dict(os.environ, TMPDIR=str(d / 'tmp'), **extra)
     start = time.monotonic()
     # Each test runs in its own session: a timeout (or an interrupted run) stops the test and everything it started, such
     # as a compiler or a `git show` of an old revision, which would otherwise outlive it, re-parented to init.
