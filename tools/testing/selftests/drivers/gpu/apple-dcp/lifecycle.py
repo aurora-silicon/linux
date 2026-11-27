@@ -2255,11 +2255,17 @@ static bool last_flush_vrr, next_mode_vrr, next_param_null, scanout_fail;
 static u32 next_param_status, last_min_rr;
 static struct dcp_color_request next_color_req;
 static struct iomfb_scanout_h17p dummy_scanout;
+static void (*before_begin_hook)(struct apple_dcp *);
 static void (*param_in_flight_hook)(struct apple_dcp *);
 
 static void dcp_crtc_color_request(struct apple_dcp *dcp, struct drm_crtc *c,
                                    struct drm_atomic_commit *a, struct dcp_color_request *req)
-{ (void)dcp; (void)c; (void)a; *req = next_color_req; }
+{
+    (void)c; (void)a;
+    if (before_begin_hook)
+        before_begin_hook(dcp);
+    *req = next_color_req;
+}
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp) { (void)dcp; return false; }
 static bool dcp_crtc_bt2020(struct apple_dcp *dcp, struct drm_crtc *c, struct drm_atomic_commit *a)
 { (void)dcp; (void)c; (void)a; return false; }
@@ -2443,7 +2449,18 @@ int main(void)
     assert(run_modeset(&dcp, true, false, true, 1, 1, 0, false) == 0);
     assert(dcp.vrr_enabled && dcp.mode_state.valid);
 
-    /* 7. Switching to a different (fixed) timing while VRR armed: refused invalidates timing, accepted clears. */
+    /* 7. Invalidation BEFORE dcp_mode_begin() during a refused VRR change must NOT restore valid timing. */
+    hdr_forgets = 0;
+    before_begin_hook = invalidate_in_flight;
+    assert(run_modeset(&dcp, true, true, false, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    before_begin_hook = NULL;
+    assert(dcp.vrr_enabled && !dcp.mode_state.valid && hdr_forgets == 1);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 0 && vblanks == 1);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0, false) == 0);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+
+    /* 8. Switching to a different (fixed) timing while VRR armed: refused invalidates timing, accepted clears. */
     assert(run_modeset(&dcp, false, true, false, 1, 2, 0, true) == -EOPNOTSUPP);
     assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0);
     assert(dcp.vrr_enabled && !dcp.mode_state.valid);
@@ -2455,7 +2472,7 @@ int main(void)
     submit_plane_flip(&dcp, &crtc, &flip);
     assert(flushes == 1 && vblanks == 0 && !last_flush_vrr);
 
-    /* 8. External display: initial VRR refusal fails invalid; property-only VRR refusal keeps valid timing and VRR state. */
+    /* 9. External display: initial VRR refusal fails invalid; property-only VRR refusal keeps valid timing and VRR state. */
     dcp.panel = false;
     dcp.mode_state.valid = false;
     assert(run_modeset(&dcp, true, false, true, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
@@ -2547,6 +2564,233 @@ int main(void)
 }
 """
     return prefix + production + controls
+
+
+def vrr_wake_readiness(root):
+    source = (root / 'drivers/gpu/drm/apple/iomfb_template.c').read_text()
+    cookie_def = block(source, 'struct dcp_wait_cookie {') + ';\n'
+    on_set = block(source, 'static void dcp_on_set_adaptive_sync(')
+    set_as = block(source, 'static void dcp_set_adaptive_sync(')
+    modeset_start = source.rindex('int DCP_FW_NAME(iomfb_modeset)(')
+    wake_start = source.index('#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))', modeset_start)
+    wake_end = source.index('\tscoped_guard(spinlock_irqsave, &dcp->hdr.lock)', wake_start)
+    wake_block = source[wake_start:wake_end]
+    disp_start = source.index('\tif (keep_mode) {', wake_end)
+    disp_end = source.index('\t/*\n\t * The DCP firmware has an internal timeout', disp_start)
+    dispatch = source[disp_start:disp_end]
+    fin_start = source.index('#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))\n\tif (!paired && READ_ONCE(cookie->vrr_refused)', disp_end)
+    fin_end = source.index('\tkref_put(&cookie->refcount, release_wait_cookie);\n\t/* A firmware 27 pair', fin_start)
+    finish = source[fin_start:fin_end]
+
+    return r"""
+#undef NDEBUG
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+#define DCP_FW_VER 0x270200
+#define DCP_FW_H17(v) 1
+#define DCP_FW_VERSION(a,b,c) (((a) << 16) | ((b) << 8) | (c))
+#define DCP_FW_NAME(n) n
+#define DCP_INHERIT_BOOT_MODE 0
+#define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define V27_WAKE_VIDEO_MS 1500
+#define V27_WAKE_HOTPLUG_MS 250
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define xchg(ptr, val) ({ __typeof__(*(ptr)) _old = *(ptr); *(ptr) = (val); _old; })
+#define msecs_to_jiffies(m) (m)
+#define dev_info(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_warn_once(...) ((void)0)
+static inline u32 get_unaligned_le32(const void *p) { u32 v; memcpy(&v, p, sizeof(v)); return v; }
+struct apple_dcp;
+struct kref { int refcount; };
+struct completion { bool done; };
+struct dcp_method_entry { int dummy; };
+struct dcp_set_digital_out_mode_req { int color_mode_id, timing_mode_id; };
+struct dcp_display_mode {
+    int color_mode_id, timing_mode_id;
+    bool vrr;
+    u32 min_vrr;
+    struct { int clock; } mode;
+};
+struct drm_crtc_state { bool vrr_enabled, color_mgmt_changed; };
+struct dcp_set_parameter_dcp { u32 param; u32 value[3]; u32 count; };
+typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
+struct apple_dcp {
+    bool panel, v27_j714s, v27_keep_mode, vrr_enabled;
+    int nr_modes;
+    struct { int iomfb_method_profile; } hw;
+    const struct dcp_method_entry *v27_methods;
+    struct dcp_set_digital_out_mode_req mode;
+    struct completion v27_wake_video, v27_wake_hotplug;
+    void *dev;
+};
+""" + cookie_def + r"""
+static unsigned int wait_video_calls, wait_hotplug_calls, param_calls, digital_out_calls, kept_calls;
+static u32 last_min_rr;
+static bool video_wait_ok, hotplug_wait_ok;
+static struct dcp_method_entry renumbered_methods;
+
+static bool dcp_has_panel(const struct apple_dcp *dcp) { return dcp->panel; }
+static bool dcp_is_ext26(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool dcp_fw27_keep_panel_mode(struct apple_dcp *dcp) { (void)dcp; return false; }
+static int dcp_peer_modeset_v27(struct apple_dcp *dcp, int t, int c, u32 min_vrr)
+{ (void)dcp; (void)t; (void)c; (void)min_vrr; return -EOPNOTSUPP; }
+static bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, int clock)
+{ (void)dcp; (void)clock; return false; }
+static bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *m) { return m != NULL; }
+static void complete(struct completion *c) { c->done = true; }
+static void release_wait_cookie(struct kref *r) { (void)r; }
+static void kref_put(struct kref *r, void (*rel)(struct kref *)) { if (--r->refcount == 0) rel(r); }
+static unsigned long wait_for_completion_timeout(struct completion *c, unsigned long timeout)
+{
+    assert(timeout > 0);
+    assert(param_calls == 0 && digital_out_calls == 0 && kept_calls == 0);
+    if (c->done)
+        return 1;
+    return 0;
+}
+#define wait_for_completion_timeout(c, t) ({ \
+    struct apple_dcp *_d = dcp; \
+    if ((c) == &_d->v27_wake_video) { \
+        wait_video_calls++; \
+        (c)->done = video_wait_ok; \
+    } else if ((c) == &_d->v27_wake_hotplug) { \
+        assert(wait_video_calls == 1); \
+        wait_hotplug_calls++; \
+        (c)->done = hotplug_wait_ok; \
+    } \
+    wait_for_completion_timeout(c, t); \
+})
+static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data, void *cookie)
+{
+    struct dcp_wait_cookie *wait = cookie;
+    (void)dcp;
+    if (data) {
+        wait->status = *(u32 *)data;
+        wait->replied = true;
+    } else {
+        kept_calls++;
+    }
+    complete(&wait->done);
+    kref_put(&wait->refcount, release_wait_cookie);
+}
+static void dcp_set_digital_out_mode(struct apple_dcp *dcp, bool sync,
+                                     struct dcp_set_digital_out_mode_req *mode,
+                                     dcp_callback_t cb, void *cookie)
+{
+    u32 ok = 0;
+    (void)sync; (void)mode;
+    digital_out_calls++;
+    cb(dcp, &ok, cookie);
+}
+static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out, void *cookie);
+static void dcp_set_parameter_dcp(struct apple_dcp *dcp, bool sync,
+                                  struct dcp_set_parameter_dcp *p,
+                                  dcp_callback_t cb, void *cookie)
+{
+    u32 ok = 0;
+    (void)sync;
+    assert(p->param == 15 && p->count == 3);
+    if (dcp->v27_methods)
+        assert(wait_video_calls == 1 && wait_hotplug_calls == (video_wait_ok ? 1 : 0));
+    param_calls++;
+    last_min_rr = p->value[0];
+    cb(dcp, &ok, cookie);
+}
+""" + on_set + "\n" + set_as + r"""
+static int run_wake_modeset(struct apple_dcp *dcp, bool renumbered, bool keep_pending,
+                            bool mode_vrr, bool req_vrr, int old_timing, int new_timing,
+                            bool vid_ok, bool hpd_ok)
+{
+    struct dcp_display_mode mode_val = {
+        .color_mode_id = 1,
+        .timing_mode_id = new_timing,
+        .vrr = mode_vrr,
+        .min_vrr = 24U << 16,
+    };
+    struct dcp_display_mode *mode = &mode_val;
+    struct drm_crtc_state crtc_val = { .vrr_enabled = req_vrr };
+    struct drm_crtc_state *crtc_state = &crtc_val;
+    struct dcp_wait_cookie c_val = { .refcount = { 2 }, .status = ~0U };
+    struct dcp_wait_cookie *cookie = &c_val;
+    bool paired = false, keep_mode = false, vrr_sent = false;
+    int ret;
+
+    dcp->v27_methods = renumbered ? &renumbered_methods : NULL;
+    dcp->v27_keep_mode = keep_pending;
+    dcp->mode.color_mode_id = 1;
+    dcp->mode.timing_mode_id = old_timing;
+    dcp->v27_wake_video.done = false;
+    dcp->v27_wake_hotplug.done = false;
+    video_wait_ok = vid_ok;
+    hotplug_wait_ok = hpd_ok;
+    wait_video_calls = wait_hotplug_calls = param_calls = digital_out_calls = kept_calls = 0;
+    last_min_rr = ~0U;
+
+""" + wake_block + "\n" + r"""
+    dcp->mode = (struct dcp_set_digital_out_mode_req){
+        .color_mode_id = mode->color_mode_id,
+        .timing_mode_id = mode->timing_mode_id,
+    };
+""" + dispatch + "\n" + finish + r"""
+    kref_put(&cookie->refcount, release_wait_cookie);
+    assert(cookie->done.done && cookie->refcount.refcount == 0);
+    return 0;
+}
+
+int main(void)
+{
+    struct apple_dcp dcp = { .panel = true, .v27_j714s = true };
+
+    /* 1. Renumbered 27.2 wake with VRR requested: readiness waits MUST run before param 15. */
+    assert(run_wake_modeset(&dcp, true, true, true, true, 1, 1, true, true) == 0);
+    assert(!dcp.v27_keep_mode && wait_video_calls == 1 && wait_hotplug_calls == 1);
+    assert(kept_calls == 0 && param_calls == 1 && last_min_rr == (24U << 16));
+    assert(digital_out_calls == 1 && dcp.vrr_enabled);
+
+    /* 2. Renumbered 27.2 wake without VRR on a fixed mode: readiness waits run and set_digital_out_mode executes. */
+    dcp.vrr_enabled = false;
+    assert(run_wake_modeset(&dcp, true, true, false, false, 1, 1, true, true) == 0);
+    assert(wait_video_calls == 1 && wait_hotplug_calls == 1 && kept_calls == 0);
+    assert(param_calls == 0 && digital_out_calls == 1 && !dcp.vrr_enabled);
+
+    /* 2b. Renumbered 27.2 wake without VRR on a VRR-capable mode: readiness waits run before param 15 (0). */
+    assert(run_wake_modeset(&dcp, true, true, true, false, 1, 1, true, true) == 0);
+    assert(wait_video_calls == 1 && wait_hotplug_calls == 1 && kept_calls == 0);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1 && !dcp.vrr_enabled);
+
+    /* 3. Renumbered 27.2 wake with video-open timeout still proceeds to reprogram VRR. */
+    assert(run_wake_modeset(&dcp, true, true, true, true, 1, 1, false, true) == 0);
+    assert(wait_video_calls == 1 && wait_hotplug_calls == 0);
+    assert(param_calls == 1 && digital_out_calls == 1 && dcp.vrr_enabled);
+
+    /* 4. Renumbered 27.2 wake with timing change and VRR requested: readiness waits still run. */
+    assert(run_wake_modeset(&dcp, true, true, true, true, 1, 2, true, true) == 0);
+    assert(wait_video_calls == 1 && wait_hotplug_calls == 1);
+    assert(param_calls == 1 && digital_out_calls == 1 && dcp.vrr_enabled);
+
+    /* 5. Non-renumbered 27.0 wake with VRR requested: skips waits, clears keep_mode, programs VRR. */
+    assert(run_wake_modeset(&dcp, false, true, true, true, 1, 1, true, true) == 0);
+    assert(wait_video_calls == 0 && wait_hotplug_calls == 0 && kept_calls == 0);
+    assert(param_calls == 1 && digital_out_calls == 1 && dcp.vrr_enabled);
+
+    /* 6. Non-renumbered 27.0 wake without VRR: keeps mode without waits or mode set. */
+    dcp.vrr_enabled = false;
+    assert(run_wake_modeset(&dcp, false, true, true, false, 1, 1, true, true) == 0);
+    assert(wait_video_calls == 0 && wait_hotplug_calls == 0 && kept_calls == 1);
+    assert(param_calls == 0 && digital_out_calls == 0 && !dcp.vrr_enabled);
+
+    return 0;
+}
+"""
+
 
 
 def dispatcher(root):

@@ -90,10 +90,21 @@ static void dcp_mode_invalidation_order_test(struct kunit *test)
 	dcp_mode_finish(&state, true, &connected);
 	KUNIT_EXPECT_FALSE(test, state.valid);
 	/* So must invalidation just after completion. */
-	dcp_mode_begin(&state);
+	KUNIT_EXPECT_FALSE(test, dcp_mode_begin(&state));
 	dcp_mode_finish(&state, true, &connected);
+	KUNIT_EXPECT_TRUE(test, state.valid);
 	dcp_mode_invalidate(&state);
 	KUNIT_EXPECT_FALSE(test, state.valid);
+	/* Invalidation before begin must not be reported valid by begin. */
+	KUNIT_EXPECT_FALSE(test, dcp_mode_begin(&state));
+	dcp_mode_finish(&state, false, &connected);
+	KUNIT_EXPECT_FALSE(test, state.valid);
+	/* A valid mode is reported as valid by the following begin. */
+	KUNIT_EXPECT_FALSE(test, dcp_mode_begin(&state));
+	dcp_mode_finish(&state, true, &connected);
+	KUNIT_EXPECT_TRUE(test, dcp_mode_begin(&state));
+	dcp_mode_finish(&state, true, &connected);
+	KUNIT_EXPECT_TRUE(test, state.valid);
 }
 
 static void dcp_mode_disconnected_test(struct kunit *test)

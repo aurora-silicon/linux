@@ -136,6 +136,7 @@ def main():
         ('lifecycle', 'readiness', lifecycle.readiness, ((),), ()),
         ('lifecycle', 'vrr-rejection', lifecycle.vrr, ((),), ()),
         ('lifecycle', 'vrr-refusal', lifecycle.vrr_refusal, ((),), ()),
+        ('lifecycle', 'vrr-wake-readiness', lifecycle.vrr_wake_readiness, ((),), ()),
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
     ]

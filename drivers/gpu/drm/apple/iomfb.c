@@ -3791,14 +3791,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return -EAGAIN;
 	}
 
-	was_valid = READ_ONCE(dcp->mode_state.valid);
 	old_crtc_state = drm_atomic_get_old_crtc_state(commit, crtc);
 	dcp_crtc_color_request(dcp, crtc, commit, &color_req);
 	pq_requested = color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
 	output_edr = pq_requested && dcp_panel_edr_supported(dcp) &&
 		     dcp_crtc_bt2020(dcp, crtc, commit);
 	pq_requested &= dcp_hdr_output_supported(dcp);
-	vrr_only = was_valid && old_crtc_state &&
+	vrr_only = old_crtc_state &&
 		   old_crtc_state->active && crtc_state->active &&
 		   !crtc_state->active_changed &&
 		   !crtc_state->connectors_changed &&
@@ -3811,9 +3810,10 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp->color_req = color_req;
 	dcp->pq_requested = pq_requested;
 	dcp->output_edr = output_edr;
+	was_valid = dcp_mode_begin(&dcp->mode_state);
+	vrr_only = vrr_only && was_valid;
 	if (!vrr_only)
 		dcp_crtc_prepare_hdr(dcp);
-	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		ret = iomfb_modeset_v12_3(dcp, crtc_state);

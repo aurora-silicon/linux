@@ -4395,29 +4395,39 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			cmode->range, mode->vrr);
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	/*
-	 * After a V27 sleep the panel's firmware brings its link and its mode back
-	 * itself once frames arrive; macOS sends no mode set then, and one
-	 * sent before the link is up waits out the firmware's timeout.
-	 */
-	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
-		    dcp->mode.color_mode_id == mode->color_mode_id &&
-		    dcp->mode.timing_mode_id == mode->timing_mode_id &&
-		    !(mode->vrr && crtc_state->vrr_enabled);
-	/*
-	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
-	 * has reported the panel, which it does after the open.
-	 */
-	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
-		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
-						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
-			dev_warn(dcp->dev, "V27 wake: panel video interface not open after %u ms\n",
-				 V27_WAKE_VIDEO_MS);
-		else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
-						      msecs_to_jiffies(V27_WAKE_HOTPLUG_MS)))
-			dev_warn(dcp->dev, "V27 wake: no hotplug report %u ms after the panel's open\n",
-				 V27_WAKE_HOTPLUG_MS);
-		keep_mode = false;
+	{
+		bool wake_ready;
+
+		/*
+		 * After a V27 sleep the panel's firmware brings its link and
+		 * its mode back itself once frames arrive; macOS sends no mode
+		 * set then, and one sent before the link is up waits out the
+		 * firmware's timeout.
+		 */
+		wake_ready = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false);
+		keep_mode = wake_ready &&
+			    dcp->mode.color_mode_id == mode->color_mode_id &&
+			    dcp->mode.timing_mode_id == mode->timing_mode_id &&
+			    !(mode->vrr && crtc_state->vrr_enabled);
+		/*
+		 * Firmware 27.2: wait until the panel's video interface is
+		 * open again and the firmware has reported the panel, even
+		 * when VRR reprogramming clears keep_mode.
+		 */
+		if (wake_ready && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+			unsigned long video_wait = msecs_to_jiffies(V27_WAKE_VIDEO_MS);
+			unsigned long hotplug_wait = msecs_to_jiffies(V27_WAKE_HOTPLUG_MS);
+
+			if (!wait_for_completion_timeout(&dcp->v27_wake_video, video_wait))
+				dev_warn(dcp->dev,
+					 "V27 wake: panel video interface not open after %u ms\n",
+					 V27_WAKE_VIDEO_MS);
+			else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug, hotplug_wait))
+				dev_warn(dcp->dev,
+					 "V27 wake: no hotplug report %u ms after the panel's open\n",
+					 V27_WAKE_HOTPLUG_MS);
+			keep_mode = false;
+		}
 	}
 #endif
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
