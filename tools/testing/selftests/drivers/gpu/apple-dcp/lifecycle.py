@@ -2121,6 +2121,11 @@ FW27_VRR    dcp.crashed = true;
 
 def vrr_refusal(root):
     source = (root / 'drivers/gpu/drm/apple/iomfb_template.c').read_text()
+    iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+    state_hdr = (root / 'drivers/gpu/drm/apple/iomfb-state.h').read_text()
+    state_body = state_hdr[state_hdr.index('struct dcp_mode_state {'):state_hdr.rindex('#endif')]
+    state_body = state_body.replace('static inline ', 'static inline __attribute__((unused)) ')
+
     cookie_def = block(source, 'struct dcp_wait_cookie {') + ';\n'
     on_set = block(source, 'static void dcp_on_set_adaptive_sync(')
     set_as = block(source, 'static void dcp_set_adaptive_sync(')
@@ -2131,44 +2136,155 @@ def vrr_refusal(root):
     fin_start = source.index('#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))\n\tif (!paired && READ_ONCE(cookie->vrr_refused)', disp_end)
     fin_end = source.index('\tkref_put(&cookie->refcount, release_wait_cookie);\n\t/* A firmware 27 pair', fin_start)
     finish = source[fin_start:fin_end]
+
+    hdr_prep = block(iomfb, 'static void dcp_crtc_prepare_hdr(')
+    color_eq = block(iomfb, 'static bool dcp_color_request_equal(')
+    atomic_modeset = block(iomfb, 'int dcp_crtc_atomic_modeset(')
+    atomic_tx = block(iomfb, 'struct iomfb_atomic_transaction {') + ';\n'
+    atomic_start = block(iomfb, 'static void iomfb_atomic_start(')
+
     return r"""
 #undef NDEBUG
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+typedef uint8_t u8;
 typedef uint32_t u32;
+typedef unsigned long spinlock_t;
+#define BIT(n) (1U << (n))
 #define DCP_FW_VER 0x270200
 #define DCP_FW_H17(v) 1
 #define DCP_FW_VERSION(a,b,c) (((a) << 16) | ((b) << 8) | (c))
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define HDMI_EOTF_TRADITIONAL_GAMMA_SDR 0
+#define HDMI_EOTF_SMPTE_ST2084 2
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+#define container_of(p,t,m) ((t *)((char *)(p) - offsetof(t,m)))
+#define guard(x) fake_guard
+#define fake_guard(x) ((void)(x))
+#define scoped_guard(x,y) for (int once = ((void)(y), 1); once; once = 0)
+#define spin_lock_init(l) ((void)(l))
+#define spin_lock_irqsave(l,f) ((void)(l), (f) = 0)
+#define spin_unlock_irqrestore(l,f) ((void)(l), (void)(f))
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_warn_once(...) ((void)0)
+#define WARN_ONCE(c, ...) do { (void)(c); assert(0); } while (0)
 static inline u32 get_unaligned_le32(const void *p) { u32 v; memcpy(&v, p, sizeof(v)); return v; }
+enum dcp_firmware_version {
+    DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,
+    DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
+    DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_H17P, DCP_FIRMWARE_V_27_0,
+};
+""" + state_body + r"""
 struct kref { int refcount; };
 struct completion { bool done; };
+struct apple_dcp;
+struct dcp_color_request {
+    u8 eotf, colorspace, color_format, broadcast_rgb, max_bpc;
+    bool allow_hdr, allow_dsc, allow_unsafe_sdr, default_rgb;
+};
+struct apple_connector { bool connected; };
+struct iomfb_scanout_h17p { int dummy; };
+struct iomfb_transaction {
+    void (*start)(struct apple_dcp *, struct iomfb_transaction *);
+    bool presentation;
+    void (*release)(struct iomfb_transaction *);
+};
 struct apple_dcp {
-    bool panel, vrr_enabled;
-    int mode;
+    bool panel, vrr_enabled, pq_requested, output_edr, crashed;
+    bool external_running, quiescing;
+    bool s2r_scanout_stale, s2r_scanout_hold, hdmi_hpd;
+    enum dcp_firmware_version fw_compat;
+    int mode, external_error;
+    unsigned long long crtc_unplugs, typec_unplugs;
+    struct dcp_color_request color_req;
+    struct dcp_mode_state mode_state;
+    struct { bool active; } peer_frames;
     struct { int iomfb_method_profile; } hw;
+    struct { struct iomfb_scanout_h17p *next_scanout; bool presentation_paused; } iomfb;
+    struct apple_connector *connector;
+    int external_lock, hpd_mutex, vblank_wq;
     void *dev;
 };
+struct platform_device { struct apple_dcp *data; };
+struct drm_display_mode { int hdisplay, vdisplay, id; };
+struct drm_crtc { struct platform_device *dcp; void *primary; };
+struct apple_crtc { struct platform_device *dcp; };
+struct drm_crtc_state {
+    bool active, active_changed, connectors_changed, vrr_enabled, modeset;
+    struct drm_display_mode mode;
+};
+struct drm_atomic_commit {
+    struct drm_crtc_state crtc, old_crtc;
+    bool no_old_crtc;
+};
 struct dcp_display_mode { bool vrr; u32 min_vrr; };
-struct drm_crtc_state { bool vrr_enabled; };
 struct dcp_set_parameter_dcp { u32 param; u32 value[3]; u32 count; };
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 """ + cookie_def + r"""
+#define to_apple_crtc(x) ((struct apple_crtc *)(x))
+#define platform_get_drvdata(x) ((x)->data)
 static bool dcp_has_panel(const struct apple_dcp *dcp) { return dcp->panel; }
+static bool iomfb_is_m4(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool dcp_is_retained_external(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool dcp_is_typec_output(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool dcp_is_ext26(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s) { return s->modeset; }
+static struct drm_crtc_state *drm_atomic_get_new_crtc_state(struct drm_atomic_commit *c, struct drm_crtc *r)
+{ (void)r; return &c->crtc; }
+static struct drm_crtc_state *drm_atomic_get_old_crtc_state(struct drm_atomic_commit *c, struct drm_crtc *r)
+{ (void)r; return c->no_old_crtc ? NULL : &c->old_crtc; }
+static void *drm_atomic_get_new_plane_state(struct drm_atomic_commit *c, void *p) { (void)c; (void)p; return NULL; }
+static bool drm_mode_equal(const struct drm_display_mode *a, const struct drm_display_mode *b)
+{ return a->hdisplay == b->hdisplay && a->vdisplay == b->vdisplay && a->id == b->id; }
+static int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *m)
+{ (void)dcp; (void)m; assert(false); return -EINVAL; }
 static void complete(struct completion *c) { c->done = true; }
 static void release_wait_cookie(struct kref *r) { (void)r; }
 static void kref_put(struct kref *r, void (*rel)(struct kref *)) { if (--r->refcount == 0) rel(r); }
-static unsigned int digital_out_calls, param_calls;
+
+static unsigned int digital_out_calls, param_calls, flushes, vblanks, hdr_forgets, hotplug_actions;
+static bool last_flush_vrr, next_mode_vrr, next_param_null, scanout_fail;
 static u32 next_param_status, last_min_rr;
-static bool next_param_null;
+static struct dcp_color_request next_color_req;
+static struct iomfb_scanout_h17p dummy_scanout;
+static void (*param_in_flight_hook)(struct apple_dcp *);
+
+static void dcp_crtc_color_request(struct apple_dcp *dcp, struct drm_crtc *c,
+                                   struct drm_atomic_commit *a, struct dcp_color_request *req)
+{ (void)dcp; (void)c; (void)a; *req = next_color_req; }
+static bool dcp_panel_edr_supported(struct apple_dcp *dcp) { (void)dcp; return false; }
+static bool dcp_crtc_bt2020(struct apple_dcp *dcp, struct drm_crtc *c, struct drm_atomic_commit *a)
+{ (void)dcp; (void)c; (void)a; return false; }
+static bool dcp_hdr_output_supported(struct apple_dcp *dcp) { (void)dcp; return false; }
+static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp) { (void)dcp; }
+static void dcp_hdr_metadata_forget(struct apple_dcp *dcp) { (void)dcp; hdr_forgets++; }
+static void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action)
+{ (void)dcp; hotplug_actions = action; }
+static void schedule_work(int *w) { (void)w; vblanks++; }
+static struct iomfb_scanout_h17p *iomfb_scanout_prepare_h17p(struct apple_dcp *d,
+                                                             struct drm_crtc *c,
+                                                             struct drm_atomic_commit *a)
+{ (void)d; (void)c; (void)a; return scanout_fail ? NULL : &dummy_scanout; }
+static void iomfb_flush_v27(struct apple_dcp *d, struct drm_crtc *c, struct drm_atomic_commit *a)
+{ (void)c; (void)a; flushes++; last_flush_vrr = d->vrr_enabled; }
+static void iomfb_flush_h17p(struct apple_dcp *d, struct drm_crtc *c, struct drm_atomic_commit *a)
+{ (void)d; (void)c; (void)a; assert(false); }
+static int iomfb_modeset_v12_3(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int iomfb_modeset_v13_3(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int iomfb_modeset_v14_7_0(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int dcp_desktop_modeset(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int iomfb_v26_6_modeset(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int iomfb_v14_7_modeset(struct apple_dcp *d, struct drm_crtc_state *s) { (void)d; (void)s; assert(false); return -EINVAL; }
+static int iomfb_modeset_h17p(struct apple_dcp *d, struct drm_crtc_state *s, void *p) { (void)d; (void)s; (void)p; assert(false); return -EINVAL; }
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data, void *cookie)
 {
     struct dcp_wait_cookie *wait = cookie;
@@ -2197,77 +2313,165 @@ static void dcp_set_parameter_dcp(struct apple_dcp *dcp, bool sync,
     assert(p->param == 15 && p->count == 3);
     param_calls++;
     last_min_rr = p->value[0];
+    if (param_in_flight_hook)
+        param_in_flight_hook(dcp);
     cb(dcp, next_param_null ? NULL : &next_param_status, cookie);
 }
 """ + on_set + "\n" + set_as + r"""
-static int run_modeset(struct apple_dcp *dcp, bool mode_vrr, bool crtc_vrr,
-                       u32 param_status, bool param_null)
+static int iomfb_modeset_v27(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
-    struct dcp_display_mode mode_val = { .vrr = mode_vrr, .min_vrr = 24U << 16 };
+    struct dcp_display_mode mode_val = { .vrr = next_mode_vrr, .min_vrr = 24U << 16 };
     struct dcp_display_mode *mode = &mode_val;
-    struct drm_crtc_state cs_val = { .vrr_enabled = crtc_vrr };
-    struct drm_crtc_state *crtc_state = &cs_val;
     struct dcp_wait_cookie c_val = { .refcount = { 2 }, .status = ~0U };
     struct dcp_wait_cookie *cookie = &c_val;
     bool paired = false, vrr_sent = false;
     int ret;
 
-    next_param_status = param_status;
-    next_param_null = param_null;
-    digital_out_calls = 0;
-    param_calls = 0;
 """ + dispatch + "\n" + finish + r"""
     kref_put(&cookie->refcount, release_wait_cookie);
     assert(cookie->done.done);
     assert(cookie->refcount.refcount == 0);
     return 0;
 }
+""" + hdr_prep + "\n" + color_eq + "\n" + atomic_modeset + "\n" + atomic_tx + "\n" + atomic_start + r"""
+static void submit_plane_flip(struct apple_dcp *dcp, struct drm_crtc *crtc,
+                              struct drm_atomic_commit *commit)
+{
+    struct iomfb_atomic_transaction tx = {
+        .dcp = dcp,
+        .crtc = crtc,
+        .state = commit,
+    };
+    flushes = 0;
+    vblanks = 0;
+    iomfb_atomic_start(dcp, &tx.transaction);
+}
+
+static int run_modeset(struct apple_dcp *dcp, bool mode_vrr, bool old_vrr, bool new_vrr,
+                       int old_mode_id, int new_mode_id, u32 param_status, bool param_null)
+{
+    struct platform_device pdev = { .data = dcp };
+    struct drm_crtc crtc = { .dcp = &pdev };
+    struct drm_atomic_commit commit = {
+        .old_crtc = {
+            .active = true,
+            .vrr_enabled = old_vrr,
+            .mode = { .hdisplay = 3456, .vdisplay = 2234, .id = old_mode_id },
+        },
+        .crtc = {
+            .active = true,
+            .vrr_enabled = new_vrr,
+            .modeset = true,
+            .mode = { .hdisplay = 3456, .vdisplay = 2234, .id = new_mode_id },
+        },
+    };
+
+    next_mode_vrr = mode_vrr;
+    next_param_status = param_status;
+    next_param_null = param_null;
+    digital_out_calls = 0;
+    param_calls = 0;
+    hotplug_actions = 0;
+    return dcp_crtc_atomic_modeset(&crtc, &commit);
+}
+
+static void invalidate_in_flight(struct apple_dcp *dcp)
+{
+    dcp_mode_invalidate(&dcp->mode_state);
+}
 
 int main(void)
 {
-    struct apple_dcp dcp = { .panel = true };
+    struct apple_connector conn = { .connected = true };
+    struct apple_dcp dcp = {
+        .panel = true,
+        .fw_compat = DCP_FIRMWARE_V_27_0,
+        .connector = &conn,
+    };
+    struct platform_device pdev = { .data = &dcp };
+    struct drm_crtc crtc = { .dcp = &pdev };
+    struct drm_atomic_commit flip = {
+        .crtc = { .active = true, .mode = { .hdisplay = 3456, .vdisplay = 2234, .id = 1 } },
+    };
 
-    /* 1. Internal panel, VRR initially off, param 15 refused -> keeps fixed refresh. */
-    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == 0);
+    spin_lock_init(&dcp.mode_state.lock);
+
+    /* 1. Internal panel, VRR initially off, param 15 refused -> fixed refresh, valid timing. */
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0x8000000bU, false) == 0);
     assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 1);
-    assert(!dcp.vrr_enabled);
+    assert(!dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && !last_flush_vrr);
 
     /* 2. Internal panel, VRR initially off, param 15 accepted -> enables VRR. */
-    assert(run_modeset(&dcp, true, true, 0, false) == 0);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0, false) == 0);
     assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 1);
-    assert(dcp.vrr_enabled);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && last_flush_vrr);
 
-    /* 3. Transition starting with VRR enabled: disable refused -> fails and keeps VRR active. */
-    assert(run_modeset(&dcp, true, false, 0x8000000bU, false) == -EOPNOTSUPP);
-    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0);
-    assert(dcp.vrr_enabled);
+    /* 3. Property-only VRR disable refused while VRR armed -> keeps VRR and valid timing; next plane-only flip submits. */
+    hdr_forgets = 0;
+    assert(run_modeset(&dcp, true, true, false, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0 && hdr_forgets == 0);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && last_flush_vrr);
 
-    /* 4. Following modeset while VRR still armed: disable accepted -> clears VRR. */
-    assert(run_modeset(&dcp, true, false, 0, false) == 0);
-    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1);
-    assert(!dcp.vrr_enabled);
+    /* 4. Following property-only VRR disable accepted -> clears VRR and keeps valid timing. */
+    assert(run_modeset(&dcp, true, true, false, 1, 1, 0, false) == 0);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1 && hdr_forgets == 1);
+    assert(!dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && !last_flush_vrr);
 
-    /* 5. Re-arm refusal while VRR already active -> fails and keeps VRR active. */
+    /* 5. Re-arm refusal while VRR already active -> keeps VRR and valid timing; next plane-only flip submits. */
     dcp.vrr_enabled = true;
-    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
     assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 0);
-    assert(dcp.vrr_enabled);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && last_flush_vrr);
 
-    /* 6. Switching to fixed timing while VRR armed: refused keeps active, accepted clears. */
-    assert(run_modeset(&dcp, false, false, 0, true) == -EOPNOTSUPP);
+    /* 6. Concurrent invalidation during a refused VRR change must NOT keep mode_state.valid. */
+    param_in_flight_hook = invalidate_in_flight;
+    assert(run_modeset(&dcp, true, true, false, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    param_in_flight_hook = NULL;
+    assert(dcp.vrr_enabled && !dcp.mode_state.valid && hotplug_actions == DCP_HOTPLUG_NOTIFY);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 0 && vblanks == 1);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0, false) == 0);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+
+    /* 7. Switching to a different (fixed) timing while VRR armed: refused invalidates timing, accepted clears. */
+    assert(run_modeset(&dcp, false, true, false, 1, 2, 0, true) == -EOPNOTSUPP);
     assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0);
-    assert(dcp.vrr_enabled);
-    assert(run_modeset(&dcp, false, false, 0, false) == 0);
+    assert(dcp.vrr_enabled && !dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 0 && vblanks == 1);
+    assert(run_modeset(&dcp, false, false, false, 2, 2, 0, false) == 0);
     assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1);
-    assert(!dcp.vrr_enabled);
+    assert(!dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && !last_flush_vrr);
 
-    /* 7. External display: param 15 refusal always fails without calling digital_out_mode. */
+    /* 8. External display: initial VRR refusal fails invalid; property-only VRR refusal keeps valid timing and VRR state. */
     dcp.panel = false;
-    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == -EOPNOTSUPP);
-    assert(param_calls == 1 && digital_out_calls == 0 && !dcp.vrr_enabled);
-    dcp.vrr_enabled = true;
-    assert(run_modeset(&dcp, true, false, 0x8000000bU, false) == -EOPNOTSUPP);
-    assert(param_calls == 1 && digital_out_calls == 0 && dcp.vrr_enabled);
+    dcp.mode_state.valid = false;
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && digital_out_calls == 0 && !dcp.vrr_enabled && !dcp.mode_state.valid);
+    assert(run_modeset(&dcp, true, false, false, 1, 1, 0, false) == 0);
+    assert(!dcp.vrr_enabled && dcp.mode_state.valid);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && digital_out_calls == 0 && !dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && !last_flush_vrr);
+    assert(run_modeset(&dcp, true, false, true, 1, 1, 0, false) == 0);
+    assert(dcp.vrr_enabled && dcp.mode_state.valid);
+    assert(run_modeset(&dcp, true, true, false, 1, 1, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && digital_out_calls == 0 && dcp.vrr_enabled && dcp.mode_state.valid);
+    submit_plane_flip(&dcp, &crtc, &flip);
+    assert(flushes == 1 && vblanks == 0 && last_flush_vrr);
 
     return 0;
 }
