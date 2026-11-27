@@ -2718,9 +2718,6 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
-			    !ma->cfg->spk_fixed_ceiling)
-				ma->has_sense = 1;
 		}
 
 		cpu = of_get_child_by_name(np, "cpu");
@@ -2800,6 +2797,14 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 
 			link_props->is_speakers = speakers;
 			link_props->is_headphones = !speakers;
+			if (speakers && ma->cfg->amp != AMP_SSM3515 &&
+			    ma->cfg->safe_vol != 0 && !ma->cfg->spk_fixed_ceiling) {
+				if (of_property_match_string(link->cpus->of_node,
+							     "dma-names", "spkr") < 0 ||
+				    of_property_match_string(link->cpus->of_node,
+							     "dma-names", "sense") >= 0)
+					ma->has_sense = 1;
+			}
 			if (speakers && ma->cfg->spk_dai_fmt)
 				link->dai_fmt = ma->cfg->spk_dai_fmt;
 
@@ -4096,19 +4101,21 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
  * both serializers run on the firmware's clocks. The speaker frame is 250
  * BCLKs of 12 MHz (the amp is told so by its ti,bclk-ratio), with the data
  * sampled on the rising edge, as macOS programs the amp.
+ *
+ * The ADT's audio-speaker stream has speaker-protection = 0 and no RX sense
+ * slots, so the audio node omits "sense" from dma-names and ma->has_sense
+ * stays false (no sense PCM). The speaker is governed under a "Speaker
+ * Protection" lease by a feed-forward protection daemon (speakerguardd v2,
+ * AID48 atsp), running at 0 dB under grant and returning to the muted floor
+ * when unowned or if the lease lapses. The amp level comes from the boot
+ * loader's apple,speaker-config.
  */
 struct macaudio_platform_cfg macaudio_j873_cfg = {
-	/*
-	 * No qualified speaker protection exists for J873 yet (no verified
-	 * sense path, thermal model or power budget), and there is no safe
-	 * level: macaudio_speakers_allowed() keeps the speaker off. The jack
-	 * is unaffected.
-	 */
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_1W,
 	.stereo = false,
-	.safe_vol = 0,
+	.safe_vol = -20,
 	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
 	/* jack: a one-BCLK sync pulse, data launched on the rising edge */
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
@@ -4536,7 +4543,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
 	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
-	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
+	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no V/I sense) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j775c   -       sn012776    -       1x 1W    (AOP-fed, no sense: speaker off) */
 	{ .compatible = "apple,j775c-macaudio", .data = &macaudio_j775_cfg },
