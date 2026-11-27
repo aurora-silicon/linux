@@ -158,13 +158,20 @@
 #define SN201202X_LDCM_STATUS_LEN	55
 /*
  * How long a measurement without an earlier result may run before the
- * controller is made to measure again, and then before the port is enabled,
- * see sn201202x_ldcm_update_state(): ten of its 500 ms retries.
+ * controller is made to measure again, and then before the port is held
+ * mitigated, see sn201202x_ldcm_update_state(): ten of its 500 ms retries.
  */
 #define SN201202X_LDCM_STUCK_MS		5000
 #define SN201202X_LDCM_RETRY_MS		500
 /* The retry once a measurement has overrun its wait, until a result */
 #define SN201202X_LDCM_SLOW_RETRY_MS	2000
+/*
+ * How long a port without a result is held mitigated before the controller is
+ * made to measure again: doubled after each measurement that gives none, up
+ * to the maximum, until a result.
+ */
+#define SN201202X_LDCM_HOLD_MS		10000
+#define SN201202X_LDCM_HOLD_MAX_MS	300000
 /* Failed status reads in a row that a port reported dry takes before mitigation */
 #define SN201202X_LDCM_READ_TRIES	3
 
@@ -346,9 +353,9 @@ struct sn201202x_ldcm_ops {
 	/* Liquid was reported since the last dry result or reset */
 	bool (*wet)(void *ctx);
 	/*
-	 * Waits that a measurement without an earlier result has overrun in a
-	 * row (0, 1 or 2); each overrun starts another wait, the second only
-	 * once ->rerun() succeeded (1 until then)
+	 * For a measurement without an earlier result: 0 while it may run on,
+	 * 1 when the controller is to measure again (until ->rerun() succeeded),
+	 * 2 while the port is to be held mitigated, see struct sn201202x_ldcm_wait
 	 */
 	unsigned int (*overdue)(void *ctx);
 	/* Remove mitigation even if removed already: the controller measures again */
@@ -357,14 +364,20 @@ struct sn201202x_ldcm_ops {
 	unsigned int (*read_failures)(void *ctx);
 };
 
-/* How long a measurement without an earlier result has been running */
+/*
+ * A port without a result: its first measurement's wait (overdue 0), the
+ * wait of a measurement the controller was made to start again (1), or a hold
+ * with mitigation until the next restart (2). Reset by a result or a reset.
+ */
 struct sn201202x_ldcm_wait {
 	bool waiting;
+	/* When the current wait or hold began */
 	unsigned long since;
-	/* Waits overrun in a row, up to 2; reset by a result */
 	unsigned int overdue;
-	/* Overrun once, and the measurement not started again yet */
+	/* The measurement is to be started again, and was not yet */
 	bool rerun_due;
+	/* Holds since the last result, which set the next hold's length */
+	unsigned int holds;
 };
 
 struct tipd_data {
@@ -685,8 +698,9 @@ unsigned int sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait,
 					 unsigned long now);
 void sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait,
 			       unsigned long now);
+unsigned int sn201202x_ldcm_hold_ms(unsigned int holds);
 unsigned int sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
-				     unsigned int read_failures);
+				     unsigned int read_failures, unsigned long now);
 int sn201202x_ldcm_set_mitigation(void *ctx, bool enable);
 unsigned int sn201202x_ldcm_overdue(void *ctx);
 int sn201202x_ldcm_rerun(void *ctx);

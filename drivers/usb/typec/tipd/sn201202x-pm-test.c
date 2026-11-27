@@ -1075,69 +1075,66 @@ static void sn201202x_ldcm_overdue_once_rerun_failure_test(struct kunit *test)
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
 }
 
-static void sn201202x_ldcm_overdue_twice_dry_test(struct kunit *test)
+/*
+ * The measurement run again overran too: the port is held mitigated and
+ * stays "unknown", never taken for dry. Nothing else is read or sent.
+ */
+static void sn201202x_ldcm_overdue_twice_holds_test(struct kunit *test)
 {
 	const enum sn201202x_ldcm_test_action actions[] = {
 		LDCM_TEST_READ,
 		LDCM_TEST_OVERDUE,
-		LDCM_TEST_MITIGATE_OFF,
-		LDCM_TEST_READ,
-		LDCM_TEST_PUBLISH_NONE,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
 	};
 	struct sn201202x_ldcm_test t = {
 		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_NONE },
 		.overdue = 2,
 	};
 
-	/* The measurement run again overran too: ended toward a working port. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
-							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-EAGAIN);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_EQ(test, t.read_count, 1U);
+	KUNIT_EXPECT_EQ(test, t.results, 0U);
 }
 
-static void sn201202x_ldcm_overdue_still_busy_test(struct kunit *test)
+/* A dry result read during a hold enables the port, as any dry result. */
+static void sn201202x_ldcm_hold_dry_test(struct kunit *test)
 {
 	const enum sn201202x_ldcm_test_action actions[] = {
 		LDCM_TEST_READ,
-		LDCM_TEST_OVERDUE,
 		LDCM_TEST_MITIGATE_OFF,
 		LDCM_TEST_READ,
 		LDCM_TEST_PUBLISH_NONE,
 	};
 	struct sn201202x_ldcm_test t = {
-		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_UNKNOWN },
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_NONE },
 		.overdue = 2,
 	};
 
-	/*
-	 * Still measuring once mitigation is removed: the port is enabled
-	 * while the controller measures on, and the measurement keeps that
-	 * result until it reports a new one.
-	 */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
-							  TYPEC_CONTAMINANT_UNKNOWN),
-			-EINPROGRESS);
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_EQ(test, t.results, 2U);
 }
 
-static void sn201202x_ldcm_overdue_liquid_test(struct kunit *test)
+/* Liquid read during a hold is mitigated and reported, as any liquid. */
+static void sn201202x_ldcm_hold_liquid_test(struct kunit *test)
 {
 	const enum sn201202x_ldcm_test_action actions[] = {
-		LDCM_TEST_READ,
-		LDCM_TEST_OVERDUE,
-		LDCM_TEST_MITIGATE_OFF,
 		LDCM_TEST_READ,
 		LDCM_TEST_MITIGATE_ON,
 		LDCM_TEST_PUBLISH_LIQUID,
 	};
 	struct sn201202x_ldcm_test t = {
-		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_LIQUID },
+		.reads = { TYPEC_CONTAMINANT_LIQUID },
 		.overdue = 2,
 	};
 
-	/* Liquid that the measurement run again reports is mitigated. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN), 0);
@@ -1150,7 +1147,7 @@ static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
 	const enum sn201202x_ldcm_test_action actions[] = {
 		LDCM_TEST_READ,
 		LDCM_TEST_OVERDUE,
-		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_MITIGATE_ON,
 		LDCM_TEST_PUBLISH_UNKNOWN,
 	};
 	struct sn201202x_ldcm_test t = {
@@ -1159,7 +1156,7 @@ static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
 		.overdue = 2,
 	};
 
-	/* A controller that does not take the command keeps the port down. */
+	/* A hold whose command fails keeps the port down, and is retried. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN),
@@ -1169,8 +1166,8 @@ static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
 
 /*
  * Liquid, then a mitigation command that fails: "unknown" is published, but
- * the port is still known to be wet. The measurement that follows is never
- * waited out toward a working port: the port is mitigated, and the liquid
+ * the port is still known to be wet. The measurement that follows is not
+ * waited for as one without a result: the port is mitigated, and the liquid
  * reported again.
  */
 static void sn201202x_ldcm_wet_never_overdue_test(struct kunit *test)
@@ -1281,22 +1278,26 @@ static void sn201202x_ldcm_wait_test(struct kunit *test)
 	/* The first measurement without a result starts the wait. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start), 0U);
 	KUNIT_EXPECT_TRUE(test, wait.waiting);
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, start), SN201202X_LDCM_RETRY_MS);
 	/* A failed read is retried slowly too. */
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 1), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 1, start),
+			SN201202X_LDCM_SLOW_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck - 1), 0U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck), 1U);
 	/* Overrun once: retried slowly, and the measurement run again gets a whole wait. */
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, start + stuck),
+			SN201202X_LDCM_SLOW_RETRY_MS);
 	sn201202x_ldcm_wait_rerun(&wait, start + stuck);
 	KUNIT_EXPECT_FALSE(test, wait.rerun_due);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck - 1), 0U);
+	/* Overrun again: held, and the hold lasts, it does not end in dry. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 2U);
+	KUNIT_EXPECT_EQ(test, wait.holds, 1U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 3 * stuck), 2U);
 
 	/* A result ends the wait; the next measurement starts another. */
 	wait = (struct sn201202x_ldcm_wait){};
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, start), SN201202X_LDCM_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 10 * stuck), 0U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 11 * stuck - 1), 0U);
 }
@@ -1318,16 +1319,258 @@ static void sn201202x_ldcm_wait_rerun_failure_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, wait.rerun_due);
 	/* No restart: the next update tries again, slowly, never the second overrun. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck + 1), 1U);
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, start + stuck + 1),
+			SN201202X_LDCM_SLOW_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 1U);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun), 1U);
 
-	/* The restart went through: a whole wait from then before the port is enabled. */
+	/* The restart went through: a whole wait from then before the hold. */
 	sn201202x_ldcm_wait_rerun(&wait, rerun);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun + stuck - 1), 0U);
-	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, rerun + stuck - 1),
+			SN201202X_LDCM_SLOW_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, rerun + stuck), 2U);
 	KUNIT_EXPECT_FALSE(test, wait.rerun_due);
+}
+
+/*
+ * Holds: each ends in a restart of the measurement, which gets a whole wait,
+ * and is then twice as long as the last, up to SN201202X_LDCM_HOLD_MAX_MS.
+ * A hold is not polled: the retry comes at its end. A restart that fails at
+ * the end of a hold stays due, as the first one.
+ */
+static void sn201202x_ldcm_wait_hold_backoff_test(struct kunit *test)
+{
+	static const unsigned int hold_ms[] = {
+		10000, 20000, 40000, 80000, 160000, 300000, 300000, 300000,
+	};
+	unsigned long stuck = msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+	struct sn201202x_ldcm_wait wait = {};
+	unsigned long now = -(stuck / 2);	/* across a jiffies wrap */
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_hold_ms(UINT_MAX), SN201202X_LDCM_HOLD_MAX_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now), 0U);
+	now += stuck;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now), 1U);
+	sn201202x_ldcm_wait_rerun(&wait, now);
+
+	for (i = 0; i < ARRAY_SIZE(hold_ms); i++) {
+		unsigned long hold = msecs_to_jiffies(hold_ms[i]);
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_hold_ms(i + 1), hold_ms[i]);
+		now += stuck;
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now), 2U);
+		KUNIT_EXPECT_EQ(test, wait.holds, i + 1);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, now),
+				jiffies_to_msecs(hold));
+		/* Not even a failed read polls a hold. */
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 1, now + hold / 2),
+				max_t(unsigned int, jiffies_to_msecs(hold - hold / 2),
+				      SN201202X_LDCM_SLOW_RETRY_MS));
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now + hold - 1), 2U);
+		/* Late (an update that came after the end) is retried at once, slowly. */
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, now + hold + stuck),
+				SN201202X_LDCM_SLOW_RETRY_MS);
+		now += hold;
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now), 1U);
+		KUNIT_EXPECT_TRUE(test, wait.rerun_due);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, now),
+				SN201202X_LDCM_SLOW_RETRY_MS);
+		/* The first restart attempt fails; the second goes through. */
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now + stuck), 1U);
+		now += stuck;
+		sn201202x_ldcm_wait_rerun(&wait, now);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now + stuck - 1), 0U);
+	}
+}
+
+/*
+ * The whole path of a port without an earlier result, through
+ * sn201202x_ldcm_update_state() with the driver's wait and a clock that runs
+ * by the driver's retry delays: a controller that reports no result, or one
+ * from a given time on.
+ */
+struct sn201202x_ldcm_sim {
+	struct sn201202x_ldcm_wait wait;
+	unsigned long now;
+	/* The controller reports dry from dry_at on, if it dries */
+	bool dries;
+	unsigned long dry_at;
+	bool mitigated;
+	bool wet;
+	enum typec_contaminant published;
+	unsigned int reruns;
+	unsigned int updates;
+};
+
+static int sn201202x_ldcm_sim_read(void *ctx, enum typec_contaminant *contaminant)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	*contaminant = sim->dries && !time_before(sim->now, sim->dry_at) ?
+		       TYPEC_CONTAMINANT_NONE : TYPEC_CONTAMINANT_UNKNOWN;
+	return 0;
+}
+
+static int sn201202x_ldcm_sim_mitigate(void *ctx, bool enable)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	sim->mitigated = enable;
+	return 0;
+}
+
+static void sn201202x_ldcm_sim_publish(void *ctx, enum typec_contaminant contaminant)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	sim->published = contaminant;
+}
+
+static void sn201202x_ldcm_sim_result(void *ctx, enum typec_contaminant contaminant)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	sim->wet = contaminant == TYPEC_CONTAMINANT_LIQUID;
+	sim->wait = (struct sn201202x_ldcm_wait){};
+}
+
+static bool sn201202x_ldcm_sim_wet(void *ctx)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	return sim->wet;
+}
+
+static unsigned int sn201202x_ldcm_sim_overdue(void *ctx)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	return sn201202x_ldcm_wait_overdue(&sim->wait, sim->now);
+}
+
+static int sn201202x_ldcm_sim_rerun(void *ctx)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	sim->reruns++;
+	sim->mitigated = false;
+	sn201202x_ldcm_wait_rerun(&sim->wait, sim->now);
+	return 0;
+}
+
+static unsigned int sn201202x_ldcm_sim_read_failures(void *ctx)
+{
+	return 0;
+}
+
+static const struct sn201202x_ldcm_ops sn201202x_ldcm_sim_ops = {
+	.read = sn201202x_ldcm_sim_read,
+	.set_mitigation = sn201202x_ldcm_sim_mitigate,
+	.publish = sn201202x_ldcm_sim_publish,
+	.result = sn201202x_ldcm_sim_result,
+	.wet = sn201202x_ldcm_sim_wet,
+	.overdue = sn201202x_ldcm_sim_overdue,
+	.rerun = sn201202x_ldcm_sim_rerun,
+	.read_failures = sn201202x_ldcm_sim_read_failures,
+};
+
+/* Updates until @end or until the port is enabled; the last return */
+static int sn201202x_ldcm_sim_run(struct kunit *test, struct sn201202x_ldcm_sim *sim,
+				  unsigned long end)
+{
+	int ret = -EINPROGRESS;
+
+	while (time_before(sim->now, end)) {
+		sim->updates++;
+		ret = sn201202x_ldcm_update_state(sim, &sn201202x_ldcm_sim_ops,
+						  sim->published);
+		if (sim->published == TYPEC_CONTAMINANT_NONE)
+			break;
+		KUNIT_ASSERT_TRUE(test, ret == -EINPROGRESS || ret == -EAGAIN);
+		sim->now += msecs_to_jiffies(sn201202x_ldcm_retry_ms(&sim->wait, 0,
+								     sim->now));
+	}
+	return ret;
+}
+
+/*
+ * A port without an earlier result (wet at probe, say) whose measurement
+ * never gives one: never enabled, held mitigated between restarts that come
+ * further and further apart, with few updates. A dry result enables it.
+ */
+static void sn201202x_ldcm_never_a_result_test(struct kunit *test)
+{
+	unsigned long start = -msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+	unsigned long hour = msecs_to_jiffies(3600 * MSEC_PER_SEC);
+	unsigned long hold_max = msecs_to_jiffies(SN201202X_LDCM_HOLD_MAX_MS);
+	struct sn201202x_ldcm_sim sim = {
+		.now = start,
+		.published = TYPEC_CONTAMINANT_UNKNOWN,
+	};
+	unsigned long dried;
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_run(test, &sim, start + hour), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, sim.published, TYPEC_CONTAMINANT_UNKNOWN);
+	KUNIT_EXPECT_TRUE(test, sim.mitigated);
+	KUNIT_EXPECT_EQ(test, sim.reruns, sim.wait.holds);
+	/* Restarts at 5 s, then after holds of 10 s to 5 min: 16 in the hour */
+	KUNIT_EXPECT_GE(test, sim.reruns, 10U);
+	KUNIT_EXPECT_LE(test, sim.reruns, 20U);
+	/* No busy loop: a few updates per restart */
+	KUNIT_EXPECT_LE(test, sim.updates, 200U);
+
+	/* Dry from now on: enabled at the end of the hold at the latest. */
+	sim.dries = true;
+	sim.dry_at = sim.now;
+	dried = sim.now;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_run(test, &sim, dried + 2 * hold_max), 0);
+	KUNIT_EXPECT_EQ(test, sim.published, TYPEC_CONTAMINANT_NONE);
+	KUNIT_EXPECT_FALSE(test, sim.mitigated);
+	KUNIT_EXPECT_LE(test, sim.now - dried, hold_max);
+	KUNIT_EXPECT_EQ(test, sim.wait.holds, 0U);
+}
+
+/*
+ * A slow controller, the case the waits are for: a measurement that ends
+ * within the first wait, after the restart, or during a hold enables the port
+ * as soon as it is read, and is never forced into mitigation before the
+ * restart had its whole wait. Without a controller event (as here), a result
+ * that comes during a hold is read at its end.
+ */
+static void sn201202x_ldcm_slow_result_test(struct kunit *test)
+{
+	static const struct {
+		unsigned int dry_ms;
+		unsigned int reruns;
+		unsigned int by_ms;
+	} cases[] = {
+		/* Read at once, in the first wait and after the restart */
+		{ 3000, 0, 3500 },
+		{ 7000, 1, 7500 },
+		/* Read at the end of the hold (11-21 s, then 27-47 s and 53-93 s) */
+		{ 12000, 1, 22000 },
+		{ 60000, 3, 95000 },
+	};
+	unsigned long hour = msecs_to_jiffies(3600 * MSEC_PER_SEC);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long start = -msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+		struct sn201202x_ldcm_sim sim = {
+			.now = start,
+			.published = TYPEC_CONTAMINANT_UNKNOWN,
+			.dries = true,
+			.dry_at = start + msecs_to_jiffies(cases[i].dry_ms),
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_run(test, &sim, start + hour), 0);
+		KUNIT_EXPECT_EQ(test, sim.published, TYPEC_CONTAMINANT_NONE);
+		KUNIT_EXPECT_FALSE(test, sim.mitigated);
+		KUNIT_EXPECT_EQ(test, sim.reruns, cases[i].reruns);
+		KUNIT_EXPECT_LE(test, jiffies_to_msecs(sim.now - start), cases[i].by_ms);
+	}
 }
 
 /* In the busy-wait of suspend-to-idle, mitigation is never removed. */
@@ -1533,9 +1776,9 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_busy_without_result_test),
 	KUNIT_CASE(sn201202x_ldcm_overdue_once_test),
 	KUNIT_CASE(sn201202x_ldcm_overdue_once_rerun_failure_test),
-	KUNIT_CASE(sn201202x_ldcm_overdue_twice_dry_test),
-	KUNIT_CASE(sn201202x_ldcm_overdue_still_busy_test),
-	KUNIT_CASE(sn201202x_ldcm_overdue_liquid_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_twice_holds_test),
+	KUNIT_CASE(sn201202x_ldcm_hold_dry_test),
+	KUNIT_CASE(sn201202x_ldcm_hold_liquid_test),
 	KUNIT_CASE(sn201202x_ldcm_overdue_mitigation_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_wet_never_overdue_test),
 	KUNIT_CASE(sn201202x_ldcm_wet_mitigation_failure_test),
@@ -1543,6 +1786,9 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_liquid_mitigation_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_wait_test),
 	KUNIT_CASE(sn201202x_ldcm_wait_rerun_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_wait_hold_backoff_test),
+	KUNIT_CASE(sn201202x_ldcm_never_a_result_test),
+	KUNIT_CASE(sn201202x_ldcm_slow_result_test),
 	KUNIT_CASE(sn201202x_ldcm_atomic_test),
 	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_read_failure_retried_test),
