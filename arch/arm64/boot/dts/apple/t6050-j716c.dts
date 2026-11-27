@@ -348,47 +348,6 @@
 };
 
 /*
- * The PMP (ADT pmp0): iBoot loads its firmware and the boot loader fills
- * apple,board-id, apple,dram-vendor-id, apple,pmc, apple,pmc-pmgr, and
- * apple,tunable-* from the running machine's ADT onto pmp0. The AOP's audio
- * firmware requires the PMP to bring up its LEAP power domains so the audio
- * controller reaches systemReady.
- */
-&ps_pms {
-	status = "okay";
-};
-
-&ps_pmp {
-	status = "okay";
-};
-
-&ps_pms_sram {
-	status = "okay";
-};
-
-&pmp0_dart {
-	status = "okay";
-};
-
-&pmp0_mbox {
-	status = "okay";
-};
-
-&pmp0 {
-	status = "okay";
-};
-
-&pmp0_report {
-	status = "okay";
-};
-
-&pmc {
-	/* PMP, CLPC and AP agents, once the PMP runs */
-	apple,static-voters = <0 1 3>;
-	apple,pmp = <&pmp0>;
-};
-
-/*
  * Sound through the AOP, as on J714s: its audio service runs the serializers, the
  * CS42L84 headphone jack on admac-base-ns TX2/RX2 and the six SN012776 speaker amps
  * on TX0, their voltage and current sense on RX0 (ADT iop-audio-controller).
