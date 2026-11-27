@@ -125,7 +125,7 @@ static int __apple_dart_dcp_shared_alloc(struct device *dev, struct device *piod
 	if (!ret && mapped != size)
 		ret = -EIO;
 	if (!ret)
-		ret = apple_dart_domain_flush_tlb_range(a->domain, false, 0, 0);
+		ret = apple_dart_domain_flush_tlb_range(a->domain, false, 0, 0, NULL);
 	if (!ret)
 		ret = apple_dart_dcp_shared_verify(a, object);
 	if (!ret)
@@ -238,7 +238,7 @@ int apple_dart_dcp_shared_alloc_link(struct device *dev, size_t size, u64 *phys,
 	if (!ret && mapped != size)
 		ret = -EIO;
 	if (!ret)
-		ret = apple_dart_domain_flush_tlb_range(a->domain, false, 0, 0);
+		ret = apple_dart_domain_flush_tlb_range(a->domain, false, 0, 0, NULL);
 	if (!ret)
 		ret = apple_dart_dcp_shared_verify(a, object);
 	if (!ret)

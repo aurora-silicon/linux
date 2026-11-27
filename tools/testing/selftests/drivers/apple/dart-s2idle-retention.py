@@ -96,6 +96,7 @@ struct apple_dart_domain {
     struct io_pgtable_ops *pgtbl_ops;
     struct apple_dart_dcp *dcp;
     struct apple_dart_stream_map stream_maps[1];
+    bool retire_failed;
     u64 dma_offset, mask;
 };
 #define to_dart_domain(d) container_of(d, struct apple_dart_domain, domain)

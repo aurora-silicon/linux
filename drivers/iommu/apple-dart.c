@@ -866,6 +866,11 @@ struct apple_dart_domain {
 	struct apple_dart_dcp *dcp;
 
 	bool finalized;
+	/*
+	 * An unmap's retirement failed: no mapping until the domain is freed
+	 * (apple_dart_retire_check()).
+	 */
+	bool retire_failed;
 	u64 mask;
 	dma_addr_t dma_offset;
 	struct mutex init_lock;
@@ -1948,6 +1953,9 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 	unsigned long flags;
 	int sid, ret = 0;
 
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_dart_fw_invalidate, stream_map, lo, hi);
+#endif
 	if (entries > DART_MAX_ROOT_ENTRIES)
 		return 0;
 
@@ -2954,14 +2962,96 @@ static int __apple_dart_dcp_domain_flush(struct apple_dart_domain *domain)
 	return ret;
 }
 
+/*
+ * A flush that retires unmapped pages: its caller frees them, and their IOVA,
+ * once it returns. @err is the first DART that failed to publish or invalidate
+ * them; @stuck is one that could not then be shown to have stopped its
+ * streams' DMA.
+ */
+struct apple_dart_retire {
+	int err;
+	struct apple_dart *stuck;
+};
+
+/*
+ * Stops the DMA of @stream's streams, which a failed flush left able to reach
+ * unmapped pages: their TCRs disabled, whatever their TLBs and tables still
+ * hold. Whether every one reads back disabled; a locked DART may not take it.
+ */
+static bool apple_dart_retire_fence(struct apple_dart_stream_map *stream)
+{
+	struct apple_dart *dart = stream->dart;
+	int sid;
+
+	apple_dart_hw_disable_dma(stream);
+	for_each_set_bit(sid, stream->sidmap, dart->num_streams)
+		if (apple_dart_readl(dart, DART_TCR(dart, sid)) != dart->hw->tcr_disabled)
+			return false;
+	return true;
+}
+
+/*
+ * @stream failed to retire unmapped pages (@ret). If its DART can be reached
+ * now (@reachable: powered, its commands not gated), its streams are stopped;
+ * otherwise, or if they do not stop, it is stuck.
+ */
+static void apple_dart_retire_fail(struct apple_dart_retire *retire,
+				   struct apple_dart_stream_map *stream, int ret, bool reachable)
+{
+	if (!retire || !ret)
+		return;
+	retire->err = retire->err ?: ret;
+	if (reachable && apple_dart_retire_fence(stream)) {
+		dev_err_ratelimited(stream->dart->dev,
+				    "streams %*pbl stopped: unmapped pages not retired: %d\n",
+				    (int)stream->dart->num_streams, stream->sidmap, ret);
+		return;
+	}
+	retire->stuck = retire->stuck ?: stream->dart;
+}
+
+/*
+ * A DART that may still translate unmapped pages, which the caller frees
+ * next, and whose streams could not be stopped: as the display sleep's live
+ * unmap, stop rather than hand that memory out again.
+ */
+static void apple_dart_retire_stuck(struct apple_dart *dart, int err)
+{
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_dart_retire_stuck, dart, err);
+#endif
+	panic("%s: unmapped pages not retired (%d) and its streams not stopped; DMA backing retained\n",
+	      dev_name(dart->dev), err);
+}
+
+/*
+ * After a flush that retires unmapped pages: if one failed, the domain takes
+ * no mapping any more, and a DART that could not be stopped stops the machine.
+ */
+static void apple_dart_retire_check(struct apple_dart_domain *domain,
+				    struct apple_dart_retire *retire)
+{
+	if (!retire->err)
+		return;
+	WRITE_ONCE(domain->retire_failed, true);
+	if (retire->stuck)
+		apple_dart_retire_stuck(retire->stuck, retire->err);
+}
+
+/*
+ * @retire, for a flush whose caller frees what was unmapped: a DART that fails
+ * to publish or invalidate has its streams stopped, or is stuck. See
+ * apple_dart_retire_check().
+ */
 static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
-					   bool range, u64 first, u64 last)
+					   bool range, u64 first, u64 last,
+					   struct apple_dart_retire *retire)
 {
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
 	struct io_pgtable_cfg *cfg;
 	const u32 op = DART_T8110_TLB_CMD_OP_FLUSH_SID;
-	int i, j, ret, gate, err = 0;
+	int i, j, ret, published, gate, err = 0;
 	u64 start, end;
 
 	if (domain->dcp)
@@ -2987,6 +3077,8 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			ret = stream.dart->locked ?
 				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
 			WRITE_ONCE(stream.dart->display_tlb_stale, true);
+			/* Unpublished, the tables its power-up walks still map them. */
+			apple_dart_retire_fail(retire, &stream, ret, false);
 			err = err ?: ret;
 			continue;
 		}
@@ -2997,6 +3089,7 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		if (gate == APPLE_DART_WRITER_CLOSED) {
 			ret = stream.dart->locked ?
 				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
+			apple_dart_retire_fail(retire, &stream, ret, false);
 			apple_dart_sleep_writer_put(stream.dart, gate);
 			err = err ?: ret;
 			continue;
@@ -3006,15 +3099,17 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			apple_dart_sleep_writer_put(stream.dart, gate);
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to power DART for TLB synchronization: %d\n", ret);
+			/* Unpowered by us, its TLB cannot be shown dropped. */
+			apple_dart_retire_fail(retire, &stream, ret, false);
 			err = err ?: ret;
 			continue;
 		}
-		ret = stream.dart->locked ?
+		published = stream.dart->locked ?
 			apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
-		if (ret) {
+		if (published) {
 			dev_err_ratelimited(stream.dart->dev,
-				"failed to publish host page-table entries: %d\n", ret);
-			err = err ?: ret;
+				"failed to publish host page-table entries: %d\n", published);
+			err = err ?: published;
 		}
 		/* The range registers take the DVA the device issues. */
 		start = first + domain->dma_offset;
@@ -3032,6 +3127,14 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			ret = stream.dart->hw->invalidate_tlb(&stream);
 		if (ret && stream.dart->managed_sids)
 			apple_dart_managed_quarantine(stream.dart);
+		/*
+		 * Gated commands mean the DART's sleep list stopped every stream and
+		 * flushed its TLB first: nothing translates until a restore. Gated,
+		 * its registers are not touched either.
+		 */
+		apple_dart_retire_fail(retire, &stream,
+				       published ?: (ret == -EHOSTDOWN ? 0 : ret),
+				       !READ_ONCE(stream.dart->commands_gated));
 		pm_runtime_put(stream.dart->dev);
 		apple_dart_sleep_writer_put(stream.dart, gate);
 		err = err ?: ret;
@@ -3039,26 +3142,31 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 	return err;
 }
 
-static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
-{
-	(void)apple_dart_domain_flush_tlb_range(domain, false, 0, 0);
-}
-
 static void apple_dart_flush_iotlb_all(struct iommu_domain *domain)
 {
-	apple_dart_v27_domain_hold(to_dart_domain(domain));
-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
-	apple_dart_v27_domain_drop(to_dart_domain(domain));
+	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
+	struct apple_dart_retire retire = {};
+	/* With a flush queue, this retires the unmaps queued until now. */
+	bool retiring = domain->type == IOMMU_DOMAIN_DMA_FQ;
+
+	apple_dart_v27_domain_hold(dart_domain);
+	(void)apple_dart_domain_flush_tlb_range(dart_domain, false, 0, 0,
+						retiring ? &retire : NULL);
+	apple_dart_v27_domain_drop(dart_domain);
+	apple_dart_retire_check(dart_domain, &retire);
 }
 
 static void apple_dart_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *gather)
 {
-	apple_dart_v27_domain_hold(to_dart_domain(domain));
-	(void)apple_dart_domain_flush_tlb_range(to_dart_domain(domain),
-					      gather->start <= gather->end,
-					      gather->start, gather->end);
-	apple_dart_v27_domain_drop(to_dart_domain(domain));
+	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
+	struct apple_dart_retire retire = {};
+
+	apple_dart_v27_domain_hold(dart_domain);
+	(void)apple_dart_domain_flush_tlb_range(dart_domain, gather->start <= gather->end,
+						gather->start, gather->end, &retire);
+	apple_dart_v27_domain_drop(dart_domain);
+	apple_dart_retire_check(dart_domain, &retire);
 }
 
 static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
@@ -3070,7 +3178,7 @@ static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
 		return -EINVAL;
 	apple_dart_v27_domain_hold(to_dart_domain(domain));
 	ret = apple_dart_domain_flush_tlb_range(to_dart_domain(domain), true,
-					     iova, iova + size - 1);
+					     iova, iova + size - 1, NULL);
 	apple_dart_v27_domain_drop(to_dart_domain(domain));
 	return ret;
 }
@@ -3419,6 +3527,9 @@ static int apple_dart_map_pages_unguarded(struct iommu_domain *domain, unsigned 
 	if (dart_domain->stream_maps[0].dart &&
 	    READ_ONCE(dart_domain->stream_maps[0].dart->managed_failed))
 		return -EIO;
+	/* Its streams are stopped: see apple_dart_retire_check(). */
+	if (READ_ONCE(dart_domain->retire_failed))
+		return -EIO;
 
 	dva = (iova + dart_domain->dma_offset) & dart_domain->mask;
 	ret = apple_dart_check_fw_map(dart_domain, dva, paddr, pgsize * pgcount,
@@ -3509,7 +3620,7 @@ static size_t apple_dart_unmap_pages_v27(struct iommu_domain *domain,
 		 * the flush until restore. Never report success over a failed live
 		 * invalidation: that could let the caller reuse DMA-visible memory.
 		 */
-		ret = apple_dart_domain_flush_tlb_range(dd, false, 0, U64_MAX);
+		ret = apple_dart_domain_flush_tlb_range(dd, false, 0, U64_MAX, NULL);
 		if (ret)
 			panic("DCP DART live unmap invalidation failed: %d; DMA backing retained", ret);
 	}

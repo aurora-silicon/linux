@@ -2807,6 +2807,7 @@ F:	drivers/iommu/apple-dart-power.h
 F:	drivers/iommu/apple-dart-sleep.c
 F:	drivers/iommu/apple-dart-test.c
 F:	drivers/iommu/apple-dart.c
+F:	drivers/iommu/apple-dart.kunitconfig
 F:	drivers/iommu/io-pgtable-dart.c
 F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c

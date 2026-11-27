@@ -155,6 +155,7 @@ jobs:
           # adds, is already on by default on arm64.
           - { suite: avd, kunitconfig: drivers/media/platform/apple/avd/tests/.kunitconfig }
           - { suite: ave, kunitconfig: drivers/media/platform/apple/ave/.kunitconfig }
+          - { suite: apple-dart, kunitconfig: drivers/iommu/apple-dart.kunitconfig }
           - { suite: isp, kunitconfig: drivers/media/platform/apple/isp/.kunitconfig }
           - { suite: jpeg, kunitconfig: drivers/media/platform/apple/jpeg/.kunitconfig }
           - { suite: prores, kunitconfig: drivers/media/platform/apple/prores/.kunitconfig }

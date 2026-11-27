@@ -1481,6 +1481,268 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 }
 #endif
 
+/*
+ * Unmap retirement. Each source of a failed flush leaves the domain refusing
+ * mappings. A DART that can be reached has the domain's streams stopped; one
+ * that cannot, or whose streams do not stop, is stuck.
+ */
+struct apple_dart_test_retire {
+	struct apple_dart *stuck;
+	int err;
+	unsigned int calls;
+};
+
+static void apple_dart_test_stuck(struct apple_dart *dart, int err)
+{
+	struct apple_dart_test_retire *retire = kunit_get_current_test()->priv;
+
+	retire->stuck = dart;
+	retire->err = err;
+	retire->calls++;
+}
+
+static int apple_dart_test_tlb_timeout(struct apple_dart_stream_map *stream_map)
+{
+	return -ETIMEDOUT;
+}
+
+static int apple_dart_test_fw_invalidate_failure(struct apple_dart_stream_map *stream_map,
+						 u64 lo, u64 hi)
+{
+	return -EIO;
+}
+
+/* Writes reach everything but the TCRs, as on a DART that does not take them. */
+static void apple_dart_test_keep_tcr(struct apple_dart *dart, u32 value, u32 offset)
+{
+	if (offset >= DART_TCR(dart, 0) && offset <= DART_TCR(dart, dart->num_streams - 1))
+		return;
+	writel(value, dart->regs + offset);
+}
+
+/* A T8110 DART whose streams 0 and 1 translate for a strict domain. */
+static struct apple_dart_domain *
+apple_dart_test_retire_domain(struct kunit *test, struct apple_dart_test_retire *retire,
+			      struct apple_dart **dartp)
+{
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+	struct io_pgtable *iop;
+	int sid;
+
+	dart = apple_dart_test_t8110(test, "apple-dart-retire");
+	dart->num_streams = 2;
+	dart->pgsize = SZ_16K;
+	dev_set_drvdata(dart->dev, dart);
+	for (sid = 0; sid < 2; sid++)
+		writel(dart->hw->tcr_enabled, dart->regs + DART_TCR(dart, sid));
+
+	iop = kunit_kzalloc(test, sizeof(*iop), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, iop);
+	iop->cfg.apple_dart_cfg.n_ttbrs = 1;
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	domain->pgtbl_ops = &iop->ops;
+	domain->domain.type = IOMMU_DOMAIN_DMA;
+	domain->stream_maps[0].dart = dart;
+	atomic_long_set(&domain->stream_maps[0].sidmap[0], BIT(0) | BIT(1));
+
+	test->priv = retire;
+	kunit_activate_static_stub(test, apple_dart_retire_stuck, apple_dart_test_stuck);
+	*dartp = dart;
+	return domain;
+}
+
+/* An unmap of the domain's first 16 KiB: the pages are freed after this. */
+static void apple_dart_test_unmap_sync(struct apple_dart_domain *domain)
+{
+	struct iommu_iotlb_gather gather = { .start = 0, .end = SZ_16K - 1 };
+
+	apple_dart_iotlb_sync(&domain->domain, &gather);
+}
+
+static int apple_dart_test_map(struct apple_dart_domain *domain)
+{
+	size_t mapped = 0;
+
+	return apple_dart_map_pages_unguarded(&domain->domain, 0, 0x10000, SZ_16K, 1,
+					      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL, &mapped);
+}
+
+/* The domain's streams were stopped, and it takes no mapping any more. */
+static void apple_dart_test_expect_fenced(struct kunit *test, struct apple_dart_domain *domain,
+					  struct apple_dart *dart,
+					  struct apple_dart_test_retire *retire)
+{
+	KUNIT_EXPECT_EQ(test, retire->calls, 0U);
+	KUNIT_EXPECT_TRUE(test, domain->retire_failed);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), dart->hw->tcr_disabled);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 1)), dart->hw->tcr_disabled);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_map(domain), -EIO);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
+}
+
+/* A hardware TLB invalidate that times out */
+static void apple_dart_test_retire_tlb_timeout(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_hw hw = apple_dart_hw_t8110;
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	hw.invalidate_tlb = apple_dart_test_tlb_timeout;
+	dart->hw = &hw;
+	apple_dart_test_unmap_sync(domain);
+	apple_dart_test_expect_fenced(test, domain, dart, &retire);
+	pm_runtime_disable(dart->dev);
+}
+
+/* A firmware-coordinated range invalidate that fails */
+static void apple_dart_test_retire_fw_invalidate(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	dart->fw_mirror = true;
+	kunit_activate_static_stub(test, apple_dart_fw_invalidate,
+				   apple_dart_test_fw_invalidate_failure);
+	apple_dart_test_unmap_sync(domain);
+	apple_dart_test_expect_fenced(test, domain, dart, &retire);
+	pm_runtime_disable(dart->dev);
+}
+
+/*
+ * A locked root that cannot be published: live, the streams are stopped; dark,
+ * the tables its power-up walks still map the pages, and the DART is stuck.
+ */
+static void apple_dart_test_retire_publish(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+	struct io_pgtable *iop;
+	u64 live[] = { 0x1001, 0, 0, 0 };
+	u64 owned[ARRAY_SIZE(live)] = {};
+	u64 ours[] = { 0x3001, 0, 0, 0 };
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	iop = io_pgtable_ops_to_pgtable(domain->pgtbl_ops);
+	iop->cfg.apple_dart_cfg.ttbr[0] = ours;
+	dart->locked = true;
+	dart->pgsize = sizeof(live);
+	dart->locked_ttbr[0][0] = live;
+	dart->locked_owned[0][0] = owned;
+
+	apple_dart_test_unmap_sync(domain);
+	apple_dart_test_expect_fenced(test, domain, dart, &retire);
+	KUNIT_EXPECT_EQ(test, live[0], 0x1001ULL);
+
+	domain->retire_failed = false;
+	dart->display_dark = true;
+	apple_dart_test_unmap_sync(domain);
+	KUNIT_EXPECT_EQ(test, retire.calls, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, retire.stuck, dart);
+	KUNIT_EXPECT_EQ(test, retire.err, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, domain->retire_failed);
+	pm_runtime_disable(dart->dev);
+}
+
+/* A DART runtime PM cannot resume: its registers are not touched, and it is stuck. */
+static void apple_dart_test_retire_pm(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	scoped_guard(spinlock_irqsave, &dart->dev->power.lock)
+		dart->dev->power.runtime_error = -EIO;
+	apple_dart_test_unmap_sync(domain);
+	KUNIT_EXPECT_EQ(test, retire.calls, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, retire.stuck, dart);
+	KUNIT_EXPECT_LT(test, retire.err, 0);
+	KUNIT_EXPECT_TRUE(test, domain->retire_failed);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), dart->hw->tcr_enabled);
+	KUNIT_EXPECT_EQ(test, apple_dart_test_map(domain), -EIO);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
+	KUNIT_EXPECT_EQ(test, pm_runtime_set_active(dart->dev), 0);
+	pm_runtime_disable(dart->dev);
+}
+
+/* Streams that do not take the disable: the DART is stuck. */
+static void apple_dart_test_retire_unfenced(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_hw hw = apple_dart_hw_t8110;
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	hw.invalidate_tlb = apple_dart_test_tlb_timeout;
+	dart->hw = &hw;
+	kunit_activate_static_stub(test, apple_dart_writel, apple_dart_test_keep_tcr);
+	apple_dart_test_unmap_sync(domain);
+	KUNIT_EXPECT_EQ(test, retire.calls, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, retire.stuck, dart);
+	KUNIT_EXPECT_EQ(test, retire.err, -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, domain->retire_failed);
+	pm_runtime_disable(dart->dev);
+}
+
+/*
+ * Gated commands: the sleep list stopped the streams and flushed the TLB, so
+ * nothing fails, and the DART is not touched. A working flush changes
+ * nothing either.
+ */
+static void apple_dart_test_retire_gated_and_clean(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	apple_dart_quiesce_commands(dart->dev);
+	apple_dart_test_unmap_sync(domain);
+	KUNIT_EXPECT_EQ(test, retire.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, domain->retire_failed);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), dart->hw->tcr_enabled);
+
+	KUNIT_EXPECT_EQ(test, apple_dart_resume_commands(dart->dev), 0);
+	apple_dart_test_unmap_sync(domain);
+	KUNIT_EXPECT_EQ(test, retire.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, domain->retire_failed);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 1)), dart->hw->tcr_enabled);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
+	pm_runtime_disable(dart->dev);
+}
+
+/*
+ * A full flush retires the queued unmaps of a flush-queue domain only: there a
+ * failure stops the streams; in a strict domain it does not.
+ */
+static void apple_dart_test_retire_flush_queue(struct kunit *test)
+{
+	struct apple_dart_test_retire retire = {};
+	struct apple_dart_hw hw = apple_dart_hw_t8110;
+	struct apple_dart_domain *domain;
+	struct apple_dart *dart;
+
+	domain = apple_dart_test_retire_domain(test, &retire, &dart);
+	hw.invalidate_tlb = apple_dart_test_tlb_timeout;
+	dart->hw = &hw;
+	apple_dart_flush_iotlb_all(&domain->domain);
+	KUNIT_EXPECT_FALSE(test, domain->retire_failed);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), dart->hw->tcr_enabled);
+
+	domain->domain.type = IOMMU_DOMAIN_DMA_FQ;
+	apple_dart_flush_iotlb_all(&domain->domain);
+	apple_dart_test_expect_fenced(test, domain, dart, &retire);
+	pm_runtime_disable(dart->dev);
+}
+
 /* A zeroed 16 KiB page marked reserved, as the firmware's tables are. */
 static void apple_dart_test_free_reserved(void *data)
 {
@@ -1654,6 +1916,13 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_t8132_fw_mirror_selection),
 	KUNIT_CASE(apple_dart_test_fw_mirror_prot),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
+	KUNIT_CASE(apple_dart_test_retire_tlb_timeout),
+	KUNIT_CASE(apple_dart_test_retire_fw_invalidate),
+	KUNIT_CASE(apple_dart_test_retire_publish),
+	KUNIT_CASE(apple_dart_test_retire_pm),
+	KUNIT_CASE(apple_dart_test_retire_unfenced),
+	KUNIT_CASE(apple_dart_test_retire_gated_and_clean),
+	KUNIT_CASE(apple_dart_test_retire_flush_queue),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
 	KUNIT_CASE(apple_dart_test_tunnel_restore),

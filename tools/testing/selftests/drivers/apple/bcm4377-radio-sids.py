@@ -114,7 +114,7 @@ struct apple_dart {
     bool locked, managed_failed, managed_lock, retained, retained_mtp, supports_bypass;
     bool four_level, per_stream, tunneled, fw_mirror, fw_handoff;
     bool pending, preserve_display;
-    bool isp_host, cold_ane, live_mtp, display_dark, display_tlb_stale;
+    bool isp_host, cold_ane, live_mtp, display_dark, display_tlb_stale, commands_gated;
     bool cold_gen3, cold_gen3_pcie;
     u32 cold_gen3_sids;
     void *tunables;
@@ -288,6 +288,10 @@ static int apple_dart_sleep_writer_get(struct apple_dart *d) { (void)d; writer_r
 static void apple_dart_sleep_writer_put(struct apple_dart *d, int gate)
 { (void)d; assert(gate==writer_gate && writer_refs>0); writer_refs--; }
 static void apple_dart_sleep_release_failed(void) { abort(); }
+/* Attach and map flushes: nothing is retired, so no retirement record. */
+struct apple_dart_retire;
+static void apple_dart_retire_fail(struct apple_dart_retire *retire,
+    struct apple_dart_stream_map *stream, int ret, bool reachable) { if (retire) abort(); }
 static u32 readl(const void *p) { (void)p; abort(); }
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *p,
         int op, bool range, unsigned long a, unsigned long b)
@@ -835,7 +839,7 @@ int main(void)
     /* Later map/unmap synchronization also fails closed on a TLB timeout. */
     d.managed_failed=false;
     d.regs[DART_TCR(&d,1)/4]=1; d.regs[DART_TCR(&d,2)/4]=1;
-    assert(apple_dart_domain_flush_tlb_range(&attach,false,0,0)==-ETIMEDOUT);
+    assert(apple_dart_domain_flush_tlb_range(&attach,false,0,0,NULL)==-ETIMEDOUT);
     assert(d.managed_failed && !d.managed_lock && !pm_refs);
     assert(!d.regs[DART_TCR(&d,1)/4] && !d.regs[DART_TCR(&d,2)/4]);
     for (unsigned sid=3; sid<64; sid++) {

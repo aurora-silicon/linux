@@ -19,6 +19,8 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef uint64_t ph
 #define GFP_KERNEL 0
 #define MEMREMAP_WB 0
 #define READ_ONCE(x) (x)
+/* Kernel options, all off on the host: KUnit-only hooks drop out. */
+#define IS_ENABLED(option) 0
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define dma_wmb() ((void)0)
 #define IS_ALIGNED(x,a) (((x)&((a)-1))==0)
