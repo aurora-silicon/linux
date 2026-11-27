@@ -626,7 +626,7 @@ mod tests {
         point1.signal();
 
         let mut window = super::super::context::TestOrderWindow::new_full()?;
-        let mut syncs = KVec::with_capacity(1, GFP_KERNEL)?;
+        let mut syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
         syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
         let mut outputs = Outputs::new(&contexts, syncs, 0, &allocation_failure)?;
 
@@ -657,7 +657,7 @@ mod tests {
             1,
         );
         p1_anchor.signal();
-        let mut cum_syncs = KVec::with_capacity(2, GFP_KERNEL)?;
+        let mut cum_syncs = KVVec::with_capacity(2, GFP_KERNEL)?;
         cum_syncs.push(cumulative_item(anchor.clone(), 2), GFP_KERNEL)?;
         cum_syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
         let bundle = super::super::sync_output::SignalBundle::new(&cum_syncs, 0)?;
@@ -675,7 +675,7 @@ mod tests {
         let restarted_ordinal = window.assign()?;
         assert_eq!(restarted_ordinal, super::super::context::ORDER_WINDOW);
 
-        let mut restart_syncs = KVec::with_capacity(1, GFP_KERNEL)?;
+        let mut restart_syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
         restart_syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
         let mut restart_outputs = Outputs::new(&contexts, restart_syncs, 0, &allocation_failure)?;
         let aggregate = restart_outputs.publish_with(None, false, false)?;
@@ -696,7 +696,7 @@ mod tests {
 
         // Non-ERESTARTSYS failures (e.g. full-window timeout -> -EBUSY) still publish
         // an error fence.
-        let mut fail_syncs = KVec::with_capacity(1, GFP_KERNEL)?;
+        let mut fail_syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
         fail_syncs.push(timeline_item(syncobj.clone(), 3)?, GFP_KERNEL)?;
         let mut fail_outputs = Outputs::new(&contexts, fail_syncs, 0, &allocation_failure)?;
         fail_outputs.set_result(Err(EBUSY));
