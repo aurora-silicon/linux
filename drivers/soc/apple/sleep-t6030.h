@@ -2319,6 +2319,11 @@ static const u32 t6030_wfi_on[] = {
 #define T6030_PS_MIN			GENMASK(19, 16)
 #define T6030_GPX_MIN_MACOS		4
 
+/* DIAGNOSTIC: wfi_match's GPX minimum state, apart (it stopped the program before D2C once) */
+static bool t6030_gpx_min;
+module_param_named(gpx_min, t6030_gpx_min, bool, 0444);
+MODULE_PARM_DESC(gpx_min, "T6030 DIAGNOSTIC: with wfi_match, also GPX's minimum state 4 as macOS");
+
 static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -2360,7 +2365,7 @@ static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 	 * GPX (ps-gpu +0x0): its minimum state 4 (bits 19:16), the one real value left between
 	 * Linux's words and macOS's at the final WFI (0x1f0402ff there; Linux 0x1f0002ff).
 	 */
-	if (t->blk[T6030_BLK_PS_GPU]) {
+	if (READ_ONCE(t6030_gpx_min) && t->blk[T6030_BLK_PS_GPU]) {
 		v = readl(t->blk[T6030_BLK_PS_GPU] + T6030_PS_GPU_GPX);
 		if (FIELD_GET(T6030_PS_MIN, v) != T6030_GPX_MIN_MACOS)
 			writel((v & ~(PS_FLAGS | T6030_PS_MIN)) |
