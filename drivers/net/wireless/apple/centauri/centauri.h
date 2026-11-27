@@ -25,9 +25,10 @@ struct centauri {
 	resource_size_t size;
 	u32 stage_offset;
 	struct dentry *debug, *crash_file, *crash_saved_file;
-	/* The crash region as a restart found it, kept for debugfs */
-	void *crash_saved;
-	u32 crash_saved_len;
+	/* The crash region and the firmware log as a restart found them, kept for debugfs */
+	void *crash_saved, *log_saved;
+	u32 crash_saved_len, log_saved_len;
+	struct dentry *log_saved_file;
 	struct mutex boot_lock;
 	void *firmware, *descriptor, *msi_page;
 	dma_addr_t firmware_dma, descriptor_dma, msi_dma;

@@ -455,6 +455,7 @@ static void centauri_remove(struct pci_dev *pdev)
 	debugfs_remove_recursive(c->debug);
 	centauri_free_boot(c);
 	kvfree(c->crash_saved);
+	kvfree(c->log_saved);
 }
 
 /*

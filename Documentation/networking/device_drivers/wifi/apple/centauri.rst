@@ -95,7 +95,9 @@ Both Wi-Fi backends implement ``cfg80211`` station-mode interfaces with:
   persistent transport faults, including silent Alpha stage halts
   detected by ``link_worker`` or ``scan_worker``. A restart first copies
   the crash region the firmware reserves in its secondary memory, which
-  it then frees, to debugfs ``firmware_crash_saved``.
+  it then frees, to debugfs ``firmware_crash_saved``, and the Alpha DRAM
+  log, when ``fwlog_start`` set one up, to ``firmware_log_saved``. The
+  Alpha execution stage that stopped the firmware is logged with it.
 
 Bluetooth Capabilities
 ======================

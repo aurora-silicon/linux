@@ -1574,6 +1574,9 @@ static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void 
 	do {
 		drain_control(wifi, pm_command);
 		if (readl(wifi->a.bar + 8) != 2) {
+			dev_warn_ratelimited(&wifi->control->pdev->dev,
+					     "Alpha execution stage %#x\n",
+					     readl(wifi->a.bar + 8));
 			centauri_recovery_request(wifi->control, "command: Alpha stage");
 			ret = -EIO;
 			goto out;
@@ -2989,8 +2992,12 @@ static void link_worker(struct work_struct *work)
 	} else {
 		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 	}
-	if (alpha_halted)
+	if (alpha_halted) {
+		dev_warn_ratelimited(&wifi->control->pdev->dev,
+				     "Alpha execution stage %#x\n",
+				     readl(wifi->a.bar + 8));
 		centauri_recovery_request(wifi->control, "link: Alpha stage");
+	}
 }
 
 /* MSI from Control or Alpha: service the data rings now instead of at the next poll. */
