@@ -2991,10 +2991,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	if (dcp->dptxport[port].connected)
 		goto out_unlock;
-	/* A release an earlier connect owes goes first, as a detach sends it. */
+	/*
+	 * A release an earlier connect owes goes first, as a detach sends it.
+	 * A timed-out release may still hold the port, or have settled with a
+	 * late refusal that leaves the release owed.
+	 */
 	if (dcp->dptxport[port].release_owed) {
 		ret = dcp_dptx_release_locked(dcp, port);
-		if (!ret && dcp_t8132_port_held_locked(dcp))
+		if (!ret && (dcp_t8132_port_held_locked(dcp) ||
+			     dcp->dptxport[port].release_owed))
 			ret = -EBUSY;
 		if (ret)
 			goto out_unlock;

@@ -44,8 +44,10 @@ firmware 27.2:
   dock's repeated request or the answer, only one release is ever
   outstanding, nothing is connected until it is answered, and an answer that
   carries it out connects the display with no release sent again; one that
-  refuses it has it sent once more. A release refused at once by the detach,
-  sent again by the fabric and unanswered, holds as well;
+  refuses it has it sent once more, also when the refusal settles before
+  the release call returns (port free, release still owed). A release
+  refused at once by the detach, sent again by the fabric and unanswered,
+  holds as well;
 - the DPTX service's publication, or the tunnel's repeated request, connects
   a display attached while its connect could not run;
 - the display processor's component unbinds with a release unanswered: its
@@ -129,6 +131,10 @@ MUTATIONS = {
     # A release owed and sent again holds only while no tunnel is bound, as before.
     'owed-retry-unfenced': ('dcp', '\t\t\t   ((ticket && owed) || dcp_t8132_tunnel_gone(dcp, port))) {',
                             '\t\t\t   dcp_t8132_tunnel_gone(dcp, port)) {'),
+    # An owed release answered with a late refusal before returning leaves release_owed set without stopping the connect.
+    'owed-late-refusal-connects': ('dcp', '\t\tif (!ret && (dcp_t8132_port_held_locked(dcp) ||\n'
+                                   '\t\t\t     dcp->dptxport[port].release_owed))\n',
+                                   '\t\tif (!ret && dcp_t8132_port_held_locked(dcp))\n'),
     # A failed connect's release is owed only once it failed, as before.
     'failed-connect-not-owed': ('dcp', '\tdcp->dptxport[port].release_owed = true;\n\terr = dcp_dptx_release_locked(dcp, port);\n'
                                 '\tif (err) {\n\t\tdev_warn(dcp->dev, "dcp_dptx_connect: port %u not released (%d): its release is owed\\n",\n'
@@ -1287,6 +1293,28 @@ static void owed_retry_cases(void)
 	assert(rpc_count("release") == 2 && !strcmp(rpcs[1], "release") && !strcmp(rpcs[2], "validate"));
 	assert(hpd_high && dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
 	puts("ok owed retry: refused again: sent once more once answered, then connected");
+
+	/*
+	 * Timed out, and a late refusal settles before the release call
+	 * returns: the port is free, the release stays owed, and the connect
+	 * stops until the work sends it again.
+	 */
+	held_replug();
+	answer_refused();
+	run_port_work();
+	assert(dcp->typec_reconnect_wq.pending && binding_live);
+	release_ret = -ETIMEDOUT;
+	at_release_timeout = answer_refused;
+	run_work();
+	assert(nrpcs == 1 && !strcmp(rpcs[0], "release") && !late_pending);
+	assert(!dcp->t8132_release_late && dcp->dptxport[0].release_owed);
+	assert(!hpd_high && !dcp->dptxport[0].connected && !dcp->typec_reconnect_wq.pending);
+	release_ret = 0;
+	run_port_work();
+	run_work();
+	assert(rpc_count("release") == 2 && !strcmp(rpcs[1], "release") && !strcmp(rpcs[2], "validate"));
+	assert(hpd_high && dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	puts("ok owed retry: late refusal before return stops the connect and leaves the release owed");
 
 	/* Unanswered, the replacement goes too: nothing connects, still held. */
 	owed_retry_late();
