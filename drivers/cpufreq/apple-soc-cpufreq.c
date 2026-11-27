@@ -641,15 +641,17 @@ static unsigned int apple_soc_cpufreq_pstate_freq(struct cpufreq_policy *policy,
 }
 
 static void apple_soc_cpufreq_record_cur(struct cpufreq_policy *policy,
-					 unsigned int cur)
+					 unsigned int cur, bool record_stats)
 {
 	WRITE_ONCE(policy->cur, cur);
-	cpufreq_stats_record_transition(policy, cur);
+	if (record_stats)
+		cpufreq_stats_record_transition(policy, cur);
 }
 
 /* Called with priv->lock held. */
 static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
-					  unsigned int pstate)
+					  unsigned int pstate,
+					  bool record_stats)
 {
 	struct cpufreq_policy *policy = priv->policy;
 	unsigned int cur;
@@ -661,7 +663,7 @@ static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
 	if (!cur && pstate == priv->cap_pstate)
 		cur = priv->cap_freq;
 	if (cur)
-		apple_soc_cpufreq_record_cur(policy, cur);
+		apple_soc_cpufreq_record_cur(policy, cur, record_stats);
 }
 
 /*
@@ -786,7 +788,7 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 			if (apple_soc_cpufreq_lazy_write(priv, reg, pstate))
 				apple_soc_cpufreq_verify_later(priv);
 			if (!priv->transition_failed)
-				apple_soc_cpufreq_publish_cur(priv, pstate);
+				apple_soc_cpufreq_publish_cur(priv, pstate, true);
 		}
 	} else if (FIELD_GET(APPLE_DVFS_CMD_PS1, reg) != priv->expected_pstate) {
 		apple_soc_cpufreq_fail(priv, reg);
@@ -805,13 +807,17 @@ out:
 }
 
 /*
- * Requests @pstate without waiting, see "Lazy verification" above.
- * Called with priv->lock held.
+ * Requests @pstate without waiting, see "Lazy verification" above. Sets
+ * *@accepted to true when hardware accepted @pstate (written immediately or
+ * already matching expected_pstate), and false when queued behind busy DVFS
+ * or on error. Called with priv->lock held.
  */
 static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
-				      unsigned int pstate)
+				      unsigned int pstate, bool *accepted)
 {
 	u64 reg;
+
+	*accepted = false;
 
 	if (priv->transition_failed)
 		return -EIO;
@@ -845,6 +851,7 @@ static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
 		hrtimer_start(&priv->verify_timer, 0, HRTIMER_MODE_REL_HARD);
 		return -EIO;
 	}
+	*accepted = true;
 	return 0;
 }
 
@@ -861,6 +868,7 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 	unsigned int pstate = policy->freq_table[index].driver_data;
 	unsigned int freq = policy->freq_table[index].frequency;
 	unsigned long flags;
+	bool accepted;
 	int ret;
 
 	if (pstate < priv->info->min_pstate || pstate > priv->info->max_pstate)
@@ -878,17 +886,18 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 		else if (pstate == priv->cap_pstate && priv->cap_freq)
 			freq = priv->cap_freq;
 	}
-	ret = apple_soc_cpufreq_lazy_set(priv, pstate);
+	ret = apple_soc_cpufreq_lazy_set(priv, pstate, &accepted);
 	if (!ret)
-		apple_soc_cpufreq_record_cur(policy, freq);
+		apple_soc_cpufreq_record_cur(policy, freq, accepted);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return ret ? 0 : freq;
 }
 
 /*
  * Reconciles a lazy_verify cluster's accepted or pending P-state toward
- * @target, clamped to current policy bounds and thermal cap, and updates
- * policy->cur and cpufreq_stats when hardware moves. Called with priv->lock held.
+ * @target, clamped to current policy bounds and thermal cap, updates
+ * policy->cur, and records cpufreq_stats when hardware accepts the P-state.
+ * Called with priv->lock held.
  *
  * Returns the P-state the cluster was moved to, or -1.
  */
@@ -896,6 +905,7 @@ static int apple_soc_cpufreq_lazy_reconcile(struct apple_cpu_priv *priv,
 					    unsigned int target)
 {
 	unsigned int requested, pstate;
+	bool accepted;
 
 	if (priv->waited ||
 	    (priv->policy && !READ_ONCE(priv->policy->fast_switch_enabled)))
@@ -904,10 +914,11 @@ static int apple_soc_cpufreq_lazy_reconcile(struct apple_cpu_priv *priv,
 	requested = priv->pending_pstate >= 0 ? priv->pending_pstate :
 						priv->expected_pstate;
 	pstate = apple_soc_cpufreq_clamp_pstate(priv, target);
-	if (pstate == requested || apple_soc_cpufreq_lazy_set(priv, pstate))
+	if (pstate == requested ||
+	    apple_soc_cpufreq_lazy_set(priv, pstate, &accepted))
 		return -1;
 
-	apple_soc_cpufreq_publish_cur(priv, pstate);
+	apple_soc_cpufreq_publish_cur(priv, pstate, accepted);
 	return pstate;
 }
 
@@ -1085,7 +1096,7 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 		if (ret)
 			return ret;
 		if (freq)
-			apple_soc_cpufreq_record_cur(policy, freq);
+			apple_soc_cpufreq_record_cur(policy, freq, true);
 		return 0;
 	}
 
@@ -1142,7 +1153,7 @@ static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
 		return 0;
 
 	freq = policy->freq_table[idx].frequency;
-	apple_soc_cpufreq_record_cur(policy, freq);
+	apple_soc_cpufreq_record_cur(policy, freq, true);
 	return freq;
 }
 
