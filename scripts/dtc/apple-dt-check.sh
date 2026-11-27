@@ -132,7 +132,7 @@ extract_warnings() { # src_dir out_dir log_file out_warn tag
 	grep -E '\.dtb: |[Ww]arning|rror' "$filtered" | grep -v '^  ' |
 		sed -E "s#$t/##g; s#$o/##g" |
 		sed -E "s#arch/arm64/boot/dts/##; $variants" | sed -E 's#^apple/#arch/arm64/boot/dts/apple/#' |
-		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g; s{( not match any of the regexes): .*}{$1: ...}' |
+		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{(?:^|(?<=[\s\[(=]))b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g; s{( not match any of the regexes): .*}{$1: ...}' |
 		sort -u > "$out"
 	local ps=("${PIPESTATUS[@]}")
 	if [ "${ps[0]}" -gt 1 ] || [ "${ps[1]}" -gt 1 ] || [ "${ps[2]}" -ne 0 ] || [ "${ps[3]}" -ne 0 ] || [ "${ps[4]}" -ne 0 ] || [ "${ps[5]}" -ne 0 ] || [ "${ps[6]}" -ne 0 ]; then
