@@ -303,6 +303,13 @@ impl Shared {
                     .sleep_quiet()
                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
                     .and_then(|_| {
+                        // G15S: the PMP's request goes now, with the work drained, as macOS
+                        // withdraws it at its GPU stop 4.4 s before the commit: at the commit
+                        // the PMP is in its own sleep steps and its acknowledgment doesn't come
+                        // (J516s: the commit's withdrawal failed, PMU +4 0xfe).
+                        if quiet {
+                            self.pmp_request(false);
+                        }
                         if self.leave_for_commit(firmware, stop, quiet) {
                             firmware.power.release_clpc_now();
                             self.active_flights.store(0, Ordering::Release);
@@ -317,6 +324,9 @@ impl Shared {
         match left {
             Ok(()) => Ok(()),
             Err(error) => {
+                if quiet {
+                    self.pmp_request(true);
+                }
                 self.feed.resume();
                 self.sleeping.store(false, Ordering::Release);
                 self.poll_now();
@@ -434,6 +444,9 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            if self.cfg.sleep_quiet_stop {
+                self.shared.pmp_request(true);
+            }
             self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
