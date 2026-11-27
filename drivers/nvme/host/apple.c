@@ -1610,6 +1610,8 @@ static int apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
  * All of a sleep's stop that can be taken back. Nothing is in flight or can start, and
  * the controller and its firmware keep running for a refused sleep to come back to.
  */
+static const struct apple_nvme_hw *apple_nvme_bisect_hw(const struct apple_nvme_hw *hw);
+
 /* The controller's ANS stays up through a firmware sleep: every post-M4 one, and sleep_legacy */
 static bool apple_nvme_fw_sleep(const struct apple_nvme *anv)
 {
@@ -2806,7 +2808,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	/* Its resume waits on the coprocessor (0.2 to 0.9 s after a real sleep): not in the others' way. */
 	device_enable_async_suspend(&pdev->dev);
 
-	anv->hw = of_device_get_match_data(&pdev->dev);
+	anv->hw = apple_nvme_bisect_hw(of_device_get_match_data(&pdev->dev));
 	if (!anv->hw) {
 		ret = -ENODEV;
 		goto out_detach_genpd;
@@ -3542,6 +3544,22 @@ static const struct apple_nvme_hw apple_nvme_t6030_hw = {
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
 };
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): t6030_fw_sleep=0 binds T6030 to the T8103 path it had
+ * before its firmware sleep (RTKit shut down, its domains powered off by genpd, a cold reset at
+ * the wake), so a sleep can be compared with and without ANS kept up. Off by default.
+ */
+static bool apple_nvme_t6030_fw_sleep = true;
+module_param_named(t6030_fw_sleep, apple_nvme_t6030_fw_sleep, bool, 0444);
+MODULE_PARM_DESC(t6030_fw_sleep, "DIAGNOSTIC: T6030's firmware sleep (0: the T8103 path, as before it)");
+
+static const struct apple_nvme_hw *apple_nvme_bisect_hw(const struct apple_nvme_hw *hw)
+{
+	if (hw == &apple_nvme_t6030_hw && !apple_nvme_t6030_fw_sleep)
+		return &apple_nvme_t8103_hw;
+	return hw;
+}
 
 /*
  * The post-M4 (T8132 and later) I/O queue setup follows Yureka Lilian's T8132

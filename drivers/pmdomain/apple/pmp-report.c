@@ -1531,6 +1531,14 @@ static bool pmp_diag_preboot;
 module_param_named(diag_preboot, pmp_diag_preboot, bool, 0444);
 MODULE_PARM_DESC(diag_preboot, "DIAGNOSTIC (T6030): macOS's PTD writes before its PMP starts, in its order and spacing");
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): leave a halted PMP halted, as on a build that doesn't start
+ * it, so a boot can be compared with and without the PMP running. Boot parameter, off by default.
+ */
+static bool pmp_diag_no_start;
+module_param_named(diag_no_start, pmp_diag_no_start, bool, 0444);
+MODULE_PARM_DESC(diag_no_start, "DIAGNOSTIC: don't start a halted PMP this report would start");
+
 static struct apple_pmp_report *pmp_diag_hb_rep;
 static void pmp_diag_hb_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(pmp_diag_hb_work, pmp_diag_hb_fn);
@@ -3005,7 +3013,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return ret;
 
 	/* Before the entries exist: they request by soc-device record through it. */
-	if (rep->offsets->starts_pmp) {
+	if (rep->offsets->starts_pmp && !pmp_diag_no_start) {
 		ret = apple_pmp_start_init(rep);
 		if (ret)
 			return ret;
