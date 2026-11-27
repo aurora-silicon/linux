@@ -712,6 +712,8 @@ struct apple_pcie_port {
 	/* Set up again after the sleep: its link keeps L1.2 off from then on */
 	bool			hib_retrained;
 	bool			l1_2_off;
+	/* Its link-up interrupt, for the noirq bring-up after a sleep */
+	struct completion	hib_link;
 	bool			started;
 	bool			needs_stop;
 	bool			link_failed;
@@ -1144,6 +1146,7 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 		dev_info_ratelimited(port->pcie->dev, "Link up on %pOF\n",
 				     port->np);
 		complete_all(&port->pcie->event);
+		complete_all(&port->hib_link);
 		break;
 	case PORT_INT_LINK_DOWN:
 		if (port->pcie->hw->adopt_link)
@@ -1244,7 +1247,9 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		if (irq <= 0)
 			return irq ?: -ENOMEM;
 
-		ret = request_irq(irq, apple_pcie_port_irq, 0,
+		/* The noirq bring-up after a sleep waits for its link-up interrupt. */
+		ret = request_irq(irq, apple_pcie_port_irq,
+				  port->pcie->hw->s2r_noirq ? IRQF_NO_SUSPEND : 0,
 				  port_irqs[i].name, port);
 		if (ret) {
 			irq_domain_free_irqs(irq, 1);
@@ -3203,6 +3208,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	raw_spin_lock_init(&port->lock);
 	raw_spin_lock_init(&port->irq_lock);
 	INIT_LIST_HEAD(&port->entry);
+	init_completion(&port->hib_link);
 
 	snprintf(name, sizeof(name), "port%d", port->idx);
 	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
@@ -7977,6 +7983,11 @@ static void apple_pcie_hib_ports_phased(struct apple_pcie *pcie)
 	else
 		usleep_range(100, 200);
 
+	/*
+	 * No wait after PERST#: these root ports go beyond 5 GT/s, so configuration requests
+	 * wait for 100 ms after training instead (PCIe r5.0, 6.6.1), below. The PHY's ready bit
+	 * has no interrupt.
+	 */
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->hib_cold)
 			continue;
@@ -7985,27 +7996,34 @@ static void apple_pcie_hib_ports_phased(struct apple_pcie *pcie)
 		if (ret)
 			apple_pcie_hib_port_failed(pcie, port, ret);
 	}
-	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
-	msleep(100);
 
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->hib_cold)
 			continue;
 		ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
 						 stat & PORT_STATUS_READY, 100, 250000);
-		if (ret < 0)
+		if (ret < 0) {
 			apple_pcie_hib_port_failed(pcie, port, ret);
-		else
-			apple_pcie_hib_port_start(pcie, port);
+			continue;
+		}
+		reinit_completion(&port->hib_link);
+		apple_pcie_hib_port_start(pcie, port);
+		/* Its link-up interrupt (IRQF_NO_SUSPEND) ends the wait for training. */
+		apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+		apple_pcie_port_enable_irq(port);
 	}
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->hib_cold)
 			continue;
-		ret = apple_pcie_hib_port_trained(pcie, port);
-		if (ret)
-			apple_pcie_hib_port_failed(pcie, port, ret);
-		else
-			port->hib_retrained = true;
+		wait_for_completion_timeout(&port->hib_link, msecs_to_jiffies(link_up_timeout));
+		if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)) {
+			dev_err(pcie->dev, "S2R: %pOF status %#x link %#x after training\n",
+				port->np, apple_pcie_port_readl(port, PORT_STATUS),
+				apple_pcie_port_readl(port, PORT_LINKSTS));
+			apple_pcie_hib_port_failed(pcie, port, -ETIMEDOUT);
+			continue;
+		}
+		port->hib_retrained = true;
 	}
 	/* 100 ms after the links before configuration requests (PCIe r5.0, 6.6.1). */
 	list_for_each_entry(port, &pcie->ports, entry) {
