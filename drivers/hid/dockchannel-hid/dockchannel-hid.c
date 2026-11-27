@@ -1300,6 +1300,7 @@ static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, s
 	if (dchid_clamp_report_sizes(iface, iface->hid_desc, desc_len)) {
 		/* No padded-report buffer: leave no descriptor, as when its copy fails. */
 		dev_err(iface->dchid->dev, "%s: no memory for the report buffer\n", iface->name);
+		devm_kfree(iface->dchid->dev, iface->hid_desc);
 		iface->hid_desc = NULL;
 		iface->hid_desc_len = 0;
 	}
