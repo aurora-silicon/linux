@@ -436,10 +436,6 @@ impl Objects {
         } else {
             gem::new_kernel_object_wc(&self.dev, bytes)?
         };
-        if let Some(charge) = charge {
-            charge.set_held(true);
-            self.charges.push(charge, GFP_KERNEL)?;
-        }
         let registered = self.dev.registration_guard().ok_or(ENODEV)?;
         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
         gem::prepare_new_object(&backing.gem, parent.as_ref())?;
@@ -535,6 +531,13 @@ impl Objects {
             GFP_KERNEL,
         )?;
         self.retained.push(object.clone(), GFP_KERNEL)?;
+        // Held only once nothing can fail any more: an earlier error frees the backing, and a
+        // held charge left behind in a container that lives on would count memory that is gone.
+        // `charges` has room reserved, so this push does not allocate.
+        if let Some(charge) = charge {
+            charge.set_held(true);
+            self.charges.push(charge, GFP_KERNEL)?;
+        }
         self.pages += bytes / hw::PAGE as usize;
         Ok(object)
     }

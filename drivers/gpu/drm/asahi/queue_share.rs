@@ -55,17 +55,24 @@ fn may_take(held: u32, total: u32, max: u32) -> bool {
     held < max / 2 || held == total || max.saturating_sub(total.saturating_add(1)) >= reserve(max)
 }
 
+/// [`may_take`] for a resource a process keeps until it closes it (a G16 VM's TTBAT slot):
+/// even a process alone leaves [`reserve`] free, or one client started before the compositor
+/// would hold every slot until it exits.
+fn may_take_held(held: u32, total: u32, max: u32) -> bool {
+    held < max / 2 || max.saturating_sub(total.saturating_add(1)) >= reserve(max)
+}
+
 /// Counts a new queue against the process `key`; EBUSY when [`may_take`] refuses it.
 fn take(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u32) -> Result {
-    take_with(processes, key, mm, max, GFP_KERNEL)
+    take_with(processes, key, mm, max, GFP_KERNEL, may_take)
 }
 
 fn take_with(processes: &mut KVec<Process>, key: usize, mm: Option<ARef<Mm>>, max: u32,
-             flags: kernel::alloc::Flags) -> Result {
+             flags: kernel::alloc::Flags, allowed: fn(u32, u32, u32) -> bool) -> Result {
     let total = processes.iter().map(|process| process.held).sum::<u32>();
     let index = processes.iter().position(|process| process.key == key);
     let held = index.map_or(0, |index| processes[index].held);
-    if !may_take(held, total, max) {
+    if !allowed(held, total, max) {
         return Err(EBUSY);
     }
     match index {
@@ -125,8 +132,8 @@ fn current_key() -> (usize, Option<ARef<Mm>>) {
     (mm.as_ref().map_or(0, |mm| mm.as_raw() as usize), mm)
 }
 
-/// Another device-wide resource shared between processes by the same rule as the queues,
-/// under its owner's lock.
+/// Another device-wide resource shared between processes, under its owner's lock: by the
+/// queues' rule, except that a process alone also leaves the reserve ([`may_take_held`]).
 pub(crate) struct Shares(KVec<Process>);
 
 impl Shares {
@@ -135,10 +142,10 @@ impl Shares {
     }
 
     /// Counts one more of the `max` against the current process and returns its key; EBUSY
-    /// when [`may_take`] refuses it.
+    /// when [`may_take_held`] refuses it.
     pub(crate) fn take_current(&mut self, max: u32, flags: kernel::alloc::Flags) -> Result<usize> {
         let (key, mm) = current_key();
-        take_with(&mut self.0, key, mm, max, flags)?;
+        take_with(&mut self.0, key, mm, max, flags, may_take_held)?;
         Ok(key)
     }
 
@@ -192,6 +199,30 @@ mod tests {
         // Below half its share, a process may take queues from the reserve.
         assert!(may_take(3, 51, 58));
         assert!(may_take(28, 57, 58));
+    }
+
+    #[test]
+    fn a_lone_vm_holder_still_leaves_the_reserve() -> Result {
+        // 63 G16 VM slots keep 7 free. A process alone stops at 56: the compositor started
+        // after it still gets a slot.
+        assert_eq!(reserve(63), 7);
+        assert!(may_take_held(55, 55, 63));
+        assert!(!may_take_held(56, 56, 63));
+        // Below half its share a process may still take from the reserve.
+        assert!(may_take_held(3, 60, 63));
+        let mut processes = KVec::new();
+        for _ in 0..56 {
+            take_with(&mut processes, 1, None, 63, GFP_KERNEL, may_take_held)?;
+        }
+        assert_eq!(
+            take_with(&mut processes, 1, None, 63, GFP_KERNEL, may_take_held),
+            Err(EBUSY)
+        );
+        // A second process (the compositor) gets one of the slots that were held back.
+        take_with(&mut processes, 2, None, 63, GFP_KERNEL, may_take_held)?;
+        // The same lone process may take every queue: queues are not held until close.
+        assert!(may_take(56, 56, 63));
+        Ok(())
     }
 
     #[test]

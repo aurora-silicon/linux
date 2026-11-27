@@ -9,7 +9,8 @@ the live VMs must be shared per process: one process with many files must leave 
 others, and giving VMs back must make room again.
 
 --mutations also runs the checks against each mutant below and expects every one to fail:
-the registry as it was before the process share, and the share taken but never given back.
+the registry as it was before the process share, the share taken but never given back, and a
+process alone allowed to take every VM slot (the reserve it must leave for later clients).
 """
 import argparse
 import os
@@ -67,6 +68,8 @@ def fixture(mutation):
     release = item(vm, 'fn release(&self, file_id: u64')
     if mutation == 'before-share':
         reserve = before_share()
+    elif mutation == 'lone-takes-all':
+        pass
     elif mutation == 'never-give-back':
         old = 'self.processes.lock().give_back(process)'
         if old not in release:
@@ -76,7 +79,13 @@ def fixture(mutation):
     max_vms = next(line.strip() for line in (ASAHI / 'g16/hw.rs').read_text().splitlines()
                    if 'const MAX_VMS:' in line).replace('pub(crate) ', '')
     policy = '\n'.join(item(share, signature) for signature in (
-        'fn reserve(max: u32)', 'fn may_take(', 'fn take_with(', 'fn give_back(processes'))
+        'fn reserve(max: u32)', 'fn may_take(', 'fn may_take_held(', 'fn take_with(',
+        'fn give_back(processes'))
+    if mutation == 'lone-takes-all':
+        old = 'held < max / 2 || max.saturating_sub'
+        if old not in policy:
+            raise RuntimeError('mutation site changed: lone-takes-all')
+        policy = policy.replace(old, 'held < max / 2 || held == total || max.saturating_sub', 1)
     shares = item(share, 'impl Shares {')
     return r'''
 #![allow(dead_code, unused_imports, non_upper_case_globals)]
@@ -178,7 +187,8 @@ fn main() {
     taken.push(registry.reserve(9999).expect("FAIL line 3: a given back VM cannot be created again"));
     drop(taken);
     drop(compositor);
-    // Everything given back: one process alone may use every VM.
+    // Everything given back: a process alone still leaves the reserve, since a VM keeps its
+    // slot until it is closed, and a process started after it gets a VM.
     as_process(4);
     let mut all = Vec::new();
     for file in 0..(max as u64 + 8) {
@@ -186,7 +196,11 @@ fn main() {
             if let Ok(r) = registry.reserve(1000 + file) { all.push(r) }
         }
     }
-    assert_eq!(all.len() as u32, max, "FAIL line 4: a process alone cannot use every VM");
+    assert_eq!(all.len() as u32, max - reserve(max),
+               "FAIL line 4: a process alone takes the reserve (or less than the rest)");
+    as_process(5);
+    let after = registry.reserve(5000).expect("FAIL line 6: a process started later gets no VM");
+    drop(after);
     drop(all);
     assert_eq!(registry.live.load(Ordering::Acquire), 0);
     assert!(registry.processes.lock().0.is_empty(), "FAIL line 5: a process share outlives its VMs");
@@ -221,7 +235,7 @@ def main():
         if not args.mutations:
             return 0
         killed = 0
-        names = ('before-share', 'never-give-back')
+        names = ('before-share', 'never-give-back', 'lone-takes-all')
         for name in names:
             code, output = run(name, work)
             if code and 'panicked at' in output:

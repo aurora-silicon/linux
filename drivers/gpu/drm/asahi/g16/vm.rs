@@ -242,11 +242,12 @@ impl Registry {
                     files[index].1 += 1;
                     process
                 }
-                Err(_) => {
+                Err(error) => {
                     if files[index].1 == 0 {
                         let _ = files.remove(index);
                     }
-                    return Err(ENOSPC);
+                    // The share refusing is "no room"; a failed allocation stays ENOMEM.
+                    return Err(if error == EBUSY { ENOSPC } else { error });
                 }
             }
         };
