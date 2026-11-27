@@ -2061,8 +2061,13 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 				 READ_ONCE(anv->sleep_restarted) ? " and warm-restarted" : "");
 			WRITE_ONCE(anv->sleep_restarted, false);
 			WRITE_ONCE(anv->sleep_kept, false);
+			/*
+			 * Not apple_nvme_disable_legacy(): the suspend's quiesce already froze the
+			 * queues and stopped them, and a second freeze would outlast this reset's
+			 * one unfreeze, holding every request.
+			 */
 			if (readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) {
-				ret = apple_nvme_disable_legacy(anv, false);
+				ret = nvme_disable_ctrl(&anv->ctrl, false);
 				if (ret)
 					goto out;
 			}
