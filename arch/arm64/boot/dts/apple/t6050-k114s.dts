@@ -4,7 +4,8 @@
  *
  * target-type: K114s (Mac17,13)
  *
- * Described from the ADT and booted on a K114s.
+ * Preliminary: described from the ADT. Only the NVRAM partition (t6050-k114-k116.dtsi) has been run
+ * on a K114s, from the boot loader's tree; this file as a whole has not been booted.
  *
  * Copyright The Asahi Linux Contributors
  */

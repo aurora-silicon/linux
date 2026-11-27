@@ -331,8 +331,8 @@
  * banks of 64 KiB. Only this partition is described, so the rest of the NOR has no device
  * node. Single-wire, as on the J775D: spi-nor then sends no quad-enable status write at probe.
  *
- * The partition is writable, as on the other Macs with a boot NOR, so asahi-bless and
- * aurora-bless can set the next boot. spi-apple-qspi still starts read-only and, once root
+ * The partition is writable, as on the J616s, J713 and J700, so asahi-bless and aurora-bless
+ * can set the next boot. spi-apple-qspi still starts read-only and, once root
  * opts in, admits only bounded, verified programs and 4 KiB erases of a known part inside it.
  */
 &qspi {
