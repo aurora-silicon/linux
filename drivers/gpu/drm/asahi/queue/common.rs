@@ -28,12 +28,13 @@ pub(super) fn get_timestamp_object(
 
     #[allow(irrefutable_let_patterns)]
     if let file::Object::TimestampBuffer(mapping) = object {
+        let fw_mapping = mapping.firmware_mapping()?;
         let offset = timestamp.offset;
-        if (offset.checked_add(8).ok_or(EINVAL)?) as usize > mapping.size() {
+        if (offset.checked_add(8).ok_or(EINVAL)?) as usize > fw_mapping.size() {
             return Err(ERANGE);
         }
         Ok(Some(UserTimestamp {
-            mapping: mapping.firmware_mapping()?,
+            mapping,
             offset: offset as usize,
         }))
     } else {

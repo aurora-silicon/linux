@@ -5,6 +5,7 @@
 
 #include <kunit/test.h>
 #include <linux/sizes.h>
+#include <media/v4l2-common.h>
 
 #include "avd.h"
 
@@ -107,6 +108,145 @@ static void avd_slice_fits_test(struct kunit *test)
 			c->fits);
 }
 
+/* The H.264 OUTPUT frame size limits in avd-v4l2.c */
+static const struct v4l2_frmsize_stepwise avd_test_h264_frmsize = {
+	.min_width = 64, .max_width = 4096, .step_width = 64,
+	.min_height = 64, .max_height = 4096, .step_height = 16,
+};
+
+struct avd_sps_size_case {
+	const char *desc;
+	/* OUTPUT format as the client asks for it */
+	u32 width;
+	u32 height;
+	u16 width_mbs;
+	u16 height_map_units;
+	int ret;
+};
+
+static const struct avd_sps_size_case avd_sps_size_cases[] = {
+	{ "1080p, OUTPUT 1920x1080", 1920, 1080, 120, 68, 0 },
+	{ "1080p, OUTPUT 1920x1088", 1920, 1088, 120, 68, 0 },
+	{ "720p", 1280, 720, 80, 45, 0 },
+	{ "720p, one row over", 1280, 720, 80, 46, -EINVAL },
+	{ "720p, one column over", 1280, 720, 81, 45, -EINVAL },
+	{ "picture smaller than the format", 1920, 1088, 40, 30, 0 },
+	{ "64x64, matching picture", 64, 64, 4, 4, 0 },
+	{ "64x64, 4096x4096 picture", 64, 64, 256, 256, -EINVAL },
+	{ "64x64, largest SPS size", 64, 64, U16_MAX, U16_MAX, -EINVAL },
+};
+
+KUNIT_ARRAY_PARAM_DESC(avd_sps_size, avd_sps_size_cases, desc);
+
+static void avd_sps_size_test(struct kunit *test)
+{
+	const struct avd_sps_size_case *c = test->param_value;
+	struct v4l2_ctrl_h264_sps sps = {
+		.chroma_format_idc = 1,
+		.pic_width_in_mbs_minus1 = c->width_mbs - 1,
+		.pic_height_in_map_units_minus1 = c->height_map_units - 1,
+		.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY,
+	};
+	struct avd_ctx *ctx;
+	u32 w = c->width, h = c->height;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	/* As S_FMT(OUTPUT) does */
+	v4l2_apply_frmsize_constraints(&w, &h, &avd_test_h264_frmsize);
+	ctx->coded_fmt.fmt.pix_mp.width = w;
+	ctx->coded_fmt.fmt.pix_mp.height = h;
+
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), c->ret);
+}
+
+/*
+ * Pre-streaming format negotiation (e.g. Chromium V4L2VideoDecoder::SetExtCtrlsInit)
+ * supplies chroma_format_idc and bit depth with flags == 0 and zeroed dimensions
+ * before the first frame request carries the parsed SPS. Format validation accepts
+ * those controls while full SPS validation still rejects interlaced streams.
+ */
+static void avd_sps_fmt_init_test(struct kunit *test)
+{
+	struct v4l2_ctrl_h264_sps sps = {
+		.chroma_format_idc = 1,
+	};
+	struct avd_dev *dev;
+	struct avd_ctx *ctx;
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->dev = dev;
+	ctx->coded_fmt.fmt.pix_mp.width = 1280;
+	ctx->coded_fmt.fmt.pix_mp.height = 720;
+
+	/* 8-bit and 10-bit 4:2:0 pre-streaming init controls */
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), -EINVAL);
+
+	sps.bit_depth_luma_minus8 = 2;
+	sps.bit_depth_chroma_minus8 = 2;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), -EINVAL);
+
+	/* Populated interlaced SPS must still be rejected pre-streaming */
+	sps = (struct v4l2_ctrl_h264_sps) {
+		.chroma_format_idc = 1,
+		.pic_width_in_mbs_minus1 = 79,
+		.pic_height_in_map_units_minus1 = 22,
+	};
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
+	sps.pic_width_in_mbs_minus1 = 0;
+	sps.pic_height_in_map_units_minus1 = 0;
+	sps.flags = V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
+
+	/* Unsupported formats remain rejected pre-streaming */
+	sps = (struct v4l2_ctrl_h264_sps) {
+		.chroma_format_idc = 3,
+		.bit_depth_luma_minus8 = 2,
+		.bit_depth_chroma_minus8 = 2,
+	};
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
+	sps.chroma_format_idc = 2;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.chroma_format_idc = 1;
+	sps.bit_depth_luma_minus8 = 4;
+	sps.bit_depth_chroma_minus8 = 4;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.bit_depth_luma_minus8 = 2;
+	sps.bit_depth_chroma_minus8 = 0;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
+}
+
+static void avd_start_slices_test(struct kunit *test)
+{
+	struct v4l2_ctrl_h264_sps sps = {
+		.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY,
+	};
+
+	/* One slice per row */
+	sps.pic_width_in_mbs_minus1 = 119;
+	sps.pic_height_in_map_units_minus1 = 67;
+	KUNIT_EXPECT_EQ(test, avd_h264_start_slices(&sps), 68);
+
+	/* No more rows than macroblocks, and never more than the table */
+	sps.pic_width_in_mbs_minus1 = 0;
+	sps.pic_height_in_map_units_minus1 = U16_MAX;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+	sps.pic_width_in_mbs_minus1 = U16_MAX;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+	sps.flags = 0;
+	KUNIT_EXPECT_LE(test, avd_h264_start_slices(&sps), AVD_TEST_MAX_SLICES);
+}
+
 static void avd_scaling_flat_test(struct kunit *test)
 {
 	struct v4l2_ctrl_h264_pps pps = {};
@@ -134,6 +274,9 @@ static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE(avd_scaling_flat_test),
 	KUNIT_CASE_PARAM(avd_slice_data_test, avd_slice_data_gen_params),
 	KUNIT_CASE_PARAM(avd_slice_fits_test, avd_slice_fits_gen_params),
+	KUNIT_CASE_PARAM(avd_sps_size_test, avd_sps_size_gen_params),
+	KUNIT_CASE(avd_sps_fmt_init_test),
+	KUNIT_CASE(avd_start_slices_test),
 	{}
 };
 

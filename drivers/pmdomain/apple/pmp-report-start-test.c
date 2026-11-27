@@ -6,6 +6,9 @@
  * bind, no ready status, no acknowledgment), a consumer's own timeout and
  * the teardown of the provider can be driven without Apple hardware.
  *
+ * The fast die-temperature effort is read from a report in memory, too: its
+ * lanes, the reports that have none or do not run, and the T8142 layout.
+ *
  * Included by pmp-report.c.
  */
 
@@ -407,4 +410,196 @@ static struct kunit_suite pmp_start_suite = {
 	.test_cases = pmp_start_cases,
 };
 
-kunit_test_suite(pmp_start_suite);
+/*
+ * A report in memory with the PMP's status in its first word and the fast
+ * die-temperature efforts in an entry of its own: 16 bytes, of which the
+ * low 32 bits hold the lanes.
+ */
+#define PFD_STATUS	0x08
+#define PFD_EFFORT	0x10
+#define PFD_LANES	0xa4c30f5aU
+#define PFD_OTHER	0x1122334400000000ULL
+
+struct pfd {
+	struct apple_pmp_report rep;
+	struct apple_pmp_report_offsets offsets;
+	struct device dev;
+	struct device_node node;
+	u64 regs[4];
+};
+
+static void pfd_remove(void *data)
+{
+	struct pfd *t = data;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_del_rcu(&t->rep.list);
+	mutex_unlock(&apple_pmp_reports_lock);
+	synchronize_rcu();
+}
+
+/* A running report with @lanes fast-die lanes, published as probe does. */
+static struct pfd *pfd_new(struct kunit *test, u32 lanes)
+{
+	struct pfd *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t->offsets.status = PFD_STATUS;
+	t->offsets.fast_die = lanes ? PFD_EFFORT : 0;
+	t->offsets.fast_die_lanes = lanes;
+	t->dev.of_node = &t->node;
+	t->rep.dev = &t->dev;
+	t->rep.offsets = &t->offsets;
+	t->rep.base = (__force void __iomem *)t->regs;
+	spin_lock_init(&t->rep.lock);
+
+	t->regs[PFD_STATUS / sizeof(u64)] = PMP_REPORT_READY;
+	t->regs[PFD_EFFORT / sizeof(u64)] = PFD_OTHER | PFD_LANES;
+	t->regs[PFD_EFFORT / sizeof(u64) + 1] = ~0ULL;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&t->rep.list, &apple_pmp_reports);
+	mutex_unlock(&apple_pmp_reports_lock);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, pfd_remove, t), 0);
+	return t;
+}
+
+static int pfd_effort(struct pfd *t, unsigned int lane, u8 *effort)
+{
+	*effort = 0xee;
+	return apple_pmp_report_fast_die_effort(&t->node, lane, effort);
+}
+
+/* Each lane is one byte of the low word, read 32 or 64 bits wide. */
+static void pmp_fast_die_lanes_test(struct kunit *test)
+{
+	struct pfd *t = pfd_new(test, 3);
+	u8 effort;
+	int wide;
+
+	for (wide = 0; wide < 2; wide++) {
+		t->offsets.fast_die_wide = wide;
+		t->offsets.fast_die_lanes = 3;
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 0, &effort), 0);
+		KUNIT_EXPECT_EQ(test, effort, 0x5a);
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 1, &effort), 0);
+		KUNIT_EXPECT_EQ(test, effort, 0x0f);
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 2, &effort), 0);
+		KUNIT_EXPECT_EQ(test, effort, 0xc3);
+
+		/* Past the report's lanes: refused, nothing is stored. */
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 3, &effort), -EINVAL);
+		KUNIT_EXPECT_EQ(test, effort, 0xee);
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 4, &effort), -EINVAL);
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, UINT_MAX, &effort), -EINVAL);
+
+		t->offsets.fast_die_lanes = 4;
+		KUNIT_EXPECT_EQ(test, pfd_effort(t, 3, &effort), 0);
+		KUNIT_EXPECT_EQ(test, effort, 0xa4);
+	}
+}
+
+/* A stopped PMP reads 0, which would ask for no limit: no effort then. */
+static void pmp_fast_die_running_test(struct kunit *test)
+{
+	struct pfd *t = pfd_new(test, 2);
+	u64 *status = &t->regs[PFD_STATUS / sizeof(u64)];
+	u8 effort;
+
+	WRITE_ONCE(*status, 0);
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 0, &effort), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, effort, 0xee);
+	t->offsets.running_any = true;
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 0, &effort), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, effort, 0xee);
+
+	/* Status bits other than "ready" only count where the SoC says so. */
+	WRITE_ONCE(*status, BIT_ULL(36));
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 1, &effort), 0);
+	KUNIT_EXPECT_EQ(test, effort, 0x0f);
+	t->offsets.running_any = false;
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 1, &effort), -EAGAIN);
+
+	WRITE_ONCE(*status, BIT_ULL(36) | PMP_REPORT_READY);
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 1, &effort), 0);
+	KUNIT_EXPECT_EQ(test, effort, 0x0f);
+
+	/* A lane the report does not have is the caller's error, running or not. */
+	WRITE_ONCE(*status, 0);
+	KUNIT_EXPECT_EQ(test, pfd_effort(t, 2, &effort), -EINVAL);
+}
+
+/* The report is found by its node; one without the entry says so. */
+static void pmp_fast_die_lookup_test(struct kunit *test)
+{
+	struct pfd *none = pfd_new(test, 0);
+	struct pfd *a = pfd_new(test, 2);
+	struct pfd *b = pfd_new(test, 2);
+	struct device_node *unbound;
+	u8 effort = 0xee;
+
+	unbound = kunit_kzalloc(test, sizeof(*unbound), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, unbound);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_fast_die_effort(unbound, 0, &effort),
+			-EPROBE_DEFER);
+	KUNIT_EXPECT_EQ(test, effort, 0xee);
+
+	b->regs[PFD_EFFORT / sizeof(u64)] = 0x7781;
+	KUNIT_EXPECT_EQ(test, pfd_effort(a, 0, &effort), 0);
+	KUNIT_EXPECT_EQ(test, effort, 0x5a);
+	KUNIT_EXPECT_EQ(test, pfd_effort(b, 0, &effort), 0);
+	KUNIT_EXPECT_EQ(test, effort, 0x81);
+	KUNIT_EXPECT_EQ(test, pfd_effort(b, 1, &effort), 0);
+	KUNIT_EXPECT_EQ(test, effort, 0x77);
+
+	/* No entry: unsupported whatever the lane and the PMP's state. */
+	KUNIT_EXPECT_EQ(test, pfd_effort(none, 0, &effort), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, effort, 0xee);
+	none->regs[PFD_STATUS / sizeof(u64)] = 0;
+	KUNIT_EXPECT_EQ(test, pfd_effort(none, 0, &effort), -EOPNOTSUPP);
+}
+
+/*
+ * The T8142 report as its PMP's table of PTD entries gives it: PMP-STATUS 1,
+ * FAST-DIE-CE 15 (E, P), SOC-DEV-PS-REQ 39, SOC-DEV-PS-ACK 47 and
+ * SOC-DEV-DVFS 55 to 70. An entry is read in 16 bytes from the base and
+ * written in 8 bytes from the update aperture.
+ */
+static void pmp_fast_die_t8142_test(struct kunit *test)
+{
+	const struct apple_pmp_report_offsets *offs = NULL;
+	const struct of_device_id *id;
+
+	for (id = apple_pmp_report_of_match; id->compatible[0]; id++)
+		if (!strcmp(id->compatible, "apple,t8142-pmp-v2-report"))
+			offs = id->data;
+	KUNIT_ASSERT_NOT_NULL(test, offs);
+
+	KUNIT_EXPECT_EQ(test, offs->status, 1 * 16);
+	KUNIT_EXPECT_EQ(test, offs->fast_die, 15 * 16);
+	KUNIT_EXPECT_EQ(test, offs->fast_die_lanes, 2);
+	KUNIT_EXPECT_TRUE(test, offs->fast_die_wide);
+	KUNIT_EXPECT_EQ(test, offs->tgt_read, 39 * 16);
+	KUNIT_EXPECT_EQ(test, offs->tgt_write, offs->update + 39 * 8);
+	KUNIT_EXPECT_EQ(test, offs->actual, 47 * 16);
+	KUNIT_EXPECT_EQ(test, offs->dvfs_first, 55);
+	KUNIT_EXPECT_EQ(test, offs->dvfs_first + offs->dvfs_count - 1, 70);
+	KUNIT_EXPECT_TRUE(test, offs->running_any);
+	KUNIT_EXPECT_TRUE(test, offs->defer_requests);
+	KUNIT_EXPECT_FALSE(test, offs->starts_pmp);
+}
+
+static struct kunit_case pmp_fast_die_cases[] = {
+	KUNIT_CASE(pmp_fast_die_lanes_test),
+	KUNIT_CASE(pmp_fast_die_running_test),
+	KUNIT_CASE(pmp_fast_die_lookup_test),
+	KUNIT_CASE(pmp_fast_die_t8142_test),
+	{}
+};
+
+static struct kunit_suite pmp_fast_die_suite = {
+	.name = "apple-pmp-fast-die",
+	.test_cases = pmp_fast_die_cases,
+};
+
+kunit_test_suites(&pmp_start_suite, &pmp_fast_die_suite);
