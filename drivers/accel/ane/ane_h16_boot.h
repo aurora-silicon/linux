@@ -185,6 +185,8 @@ struct ane_h16_boot {
 	/* Startup timeouts answered with a verified restart, and the budget. */
 	unsigned int restarts;
 	unsigned int max_restarts;
+	/* The restart under way, from 1 within its budget, for ops->restart. */
+	unsigned int restart_attempt;
 };
 
 static inline int ane_h16_stage_parse(const char *name)
@@ -795,6 +797,7 @@ static inline int ane_h16_startup_restarting(struct ane_h16_boot *b,
 	while ((ret == -ETIMEDOUT || ret == -ESHUTDOWN) && b->ops->restart &&
 	       *used < b->max_restarts) {
 		(*used)++;
+		b->restart_attempt = *used;
 		b->ops->log(b->ctx, what, *used, b->max_restarts);
 		ret = ane_h16_restart(b);
 		if (!ret)

@@ -892,6 +892,8 @@ static void ane_h16_startup_restart_budget_test(struct kunit *test)
 	sim_use_restart(s, 4, 2);
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, s->boot.restarts, 2U);
+	/* ops->restart sees which restart it is, for its wait. */
+	KUNIT_EXPECT_EQ(test, s->boot.restart_attempt, 2U);
 	KUNIT_EXPECT_EQ(test, s->power_cycles, 2U);
 	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
 	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
