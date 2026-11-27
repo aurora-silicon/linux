@@ -70,7 +70,8 @@
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 1>, <138 1>, <140 81>;
 };
 
-#include "t6050-k114c-gpu.dtsi"
+/* The GPU, handed over by the boot loader */
+#include "t6050-k114-k116-gpu.dtsi"
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the
