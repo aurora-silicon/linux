@@ -180,6 +180,12 @@ struct Active {
     stamps_owed: bool,
 }
 
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.packet.context.dec_render_active();
+    }
+}
+
 /// A firmware-retired, unexecuted group must hold on two observations this far
 /// apart before it is republished; a single sample may straddle an update.
 const ABANDON_GRACE_NS: u64 = 2_000_000;
@@ -1256,6 +1262,7 @@ impl Pair {
         let flist_submission = self.free_list.prepare_submission(2)?;
         let pm_submission = memory.manager.prepare_submission()?;
         let published = host.next_publication()?;
+        packet.context.inc_render_active();
         self.active
             .push(Active {
                 published,

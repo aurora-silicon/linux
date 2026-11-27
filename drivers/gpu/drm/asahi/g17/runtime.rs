@@ -3206,7 +3206,6 @@ impl Backend {
         let has_sources = packet.completion.sources().is_some();
         let bound_count = self.context.compute_binding_count() as usize;
         if (has_sources && !m5)
-            || self.context.render_seen()
             || bound_count == 0
             || bound_count > super::pairs::COMPUTE_CHANNELS_MAX
             || (bound_count > 1 && packet.order.wait_through[1].is_some())
@@ -3215,6 +3214,9 @@ impl Backend {
             || self.admission_open().is_err()
         {
             return None;
+        }
+        if let Err(error) = packet.check_firmware_producers() {
+            return Some(Err(error));
         }
         let cells = self.direct.lock().clone();
         let cached_count = cells.iter().filter(|cell| cell.is_some()).count();
@@ -3228,12 +3230,39 @@ impl Backend {
             return None;
         }
         let generation = port.generation();
-        let (direct_frontier, direct_holds, cross_qid_mask) =
+        let (mut direct_frontier, direct_holds, cross_qid_mask) =
             if let Some(sources) = packet.completion.sources() {
                 self.resolve_direct_sources(port, generation, target_qid, sources)?
             } else {
                 (super::dependency::Frontier::new(), KVec::new(), 0)
             };
+        // Mixed-engine contexts resolve any active render prefix briefly under the device mutex
+        // (and skip the mutex altogether when no render of this context is in flight), then keep
+        // compute descriptor encoding, cache maintenance, and doorbell rings off the device mutex.
+        if self.context.render_seen()
+            && packet.order.wait_through[0].is_some()
+            && self.context.render_active() != 0
+        {
+            let render_frontier = {
+                let state = self.shared.state.lock();
+                let firmware = (*state).as_deref()?;
+                if !lease.is_current()
+                    || firmware.recovery.pending()
+                    || firmware.queues.render.replay_parked()
+                {
+                    return None;
+                }
+                match firmware.queues.render_prefix(self.owner, packet) {
+                    Ok(frontier) => frontier,
+                    Err(error) => return Some(Err(error)),
+                }
+            };
+            for dep in render_frontier.as_slice() {
+                if direct_frontier.insert(0, *dep).is_err() {
+                    return None;
+                }
+            }
+        }
         // Only an independent kick without input sources of an owner whose primary channel runs
         // sustained heavy work may leave the primary ring ([`Self::fans_out`]); the primary
         // cell's lock-free hint answers that without a lock.

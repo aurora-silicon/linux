@@ -229,8 +229,10 @@ pub(crate) struct Context {
     /// Shared monotonic compute completion ordinal / submit sequence across an M5 multi-channel
     /// context's physical compute queues.
     compute_ordinal: AtomicU32,
-    /// Mixed-engine contexts keep the original inline publication path.
+    /// Whether this logical queue has submitted render work (so compute may have a render prefix).
     render_seen: AtomicBool,
+    /// Number of currently active (published and unretired) render entries for this context.
+    render_active: AtomicU32,
     qos: Arc<QosLease>,
     owner_pid: u32,
     states: WorkStates,
@@ -372,6 +374,7 @@ impl Context {
             compute_bindings: AtomicU32::new(0),
             compute_ordinal: AtomicU32::new(0),
             render_seen: AtomicBool::new(false),
+            render_active: AtomicU32::new(0),
             qos,
             owner_pid,
             states: match &share {
@@ -411,6 +414,16 @@ impl Context {
         if !self.render_seen.load(Ordering::Relaxed) {
             self.render_seen.store(true, Ordering::Release);
         }
+    }
+    /// Active (published and unretired) render count for this context.
+    pub(crate) fn render_active(&self) -> u32 {
+        self.render_active.load(Ordering::Acquire)
+    }
+    pub(crate) fn inc_render_active(&self) {
+        self.render_active.fetch_add(1, Ordering::AcqRel);
+    }
+    pub(crate) fn dec_render_active(&self) {
+        self.render_active.fetch_sub(1, Ordering::AcqRel);
     }
     pub(crate) fn note_compute_binding(&self, owned: bool) {
         if owned {
