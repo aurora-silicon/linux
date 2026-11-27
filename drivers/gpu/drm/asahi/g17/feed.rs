@@ -682,7 +682,7 @@ mod detector_tests {
 
     #[test]
     fn gpu_bound_long_pass_lingers_for_full_frame() {
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         // 8 ms GPU passes with 1.7 ms host gaps stay GPU-bound without requesting a CPU floor,
         // and linger across a 16 ms frame until the 20 ms boundary.
         let busy = CLOCK_HZ / 125;
@@ -719,7 +719,7 @@ mod detector_tests {
         let now = run(&detector, 16, CLOCK_HZ / 500, MAX_REFILL_TICKS);
         assert!(!detector.bound(now) && !detector.wanted(now));
         // 60 Hz paced frames (16.6 ms gap) keep resetting the streak.
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ * 166 / 10_000);
         assert!(!detector.bound(now) && !detector.wanted(now));
         // Fewer back-to-back passes than the streak needs.
