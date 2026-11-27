@@ -28,8 +28,11 @@ the first sample; a raw read before the first valid sample returns
 leave the last valid reading unchanged.
 
 Report 1 carries a 9-bit little-endian value following the report ID.
-The remaining bits in the last byte are padding. Reads return the cached
-unsolicited report, rather than issuing a synchronous HID feature request.
+The remaining bits in the last byte are padding. When the service supports
+reading and clearing its report interval, reports are stopped at probe and
+started on demand for direct ``in_angl_raw`` reads, stopping again after an
+idle window so the AOP does not wake the application processor at idle. Services
+whose interval cannot be read or cleared fall back to passive cached reads.
 
 Accelerometer and gyroscope
 ===========================
@@ -116,16 +119,21 @@ degrees Celsius at offset 2; the driver timestamps it on receipt.
 The bootloader may provide ``apple,temp-offset-calibration``,
 ``apple,absolute-temp-offset-cal``, ``apple,absolute-temp-offset-fcm-cal`` and
 ``apple,absolute-temp-offset-bcm-cal`` containers. Location-zero packets are
-sent unchanged before the one-hertz interval. If none are present the driver
-warns and selects the firmware's default calibration state; otherwise it
-selects the calibrated state. A missing optional calibration therefore does
-not hide an otherwise usable sensor.
+sent once per AOP boot (and conservatively again after firmware sleep or
+hibernation) before enabling the one-hertz interval. Reports stay off while
+nobody reads them: enabling the kfifo buffer starts them and disabling it stops
+them, while direct ``in_temp_input`` reads start them on demand and stop them
+again once reads go quiet. If no calibration containers are present the driver
+selects the firmware's default calibration state; otherwise it selects the
+calibrated state. A missing optional calibration therefore does not hide an
+otherwise usable sensor.
 
 
 Host regression tests require Python 3 and a Rust compiler::
 
   tools/testing/selftests/drivers/apple/aop-las.py
   tools/testing/selftests/drivers/apple/aop-motion.py
+  tools/testing/selftests/drivers/apple/aop-temp.py
 
 The tests compile the production decoder and shared IIO read callback
 against host mocks. They cover all 16-bit payloads (including padding),

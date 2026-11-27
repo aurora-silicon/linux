@@ -19,6 +19,11 @@ def block(source, marker):
     return source[start:end]
 
 
+def const(source, name):
+    start = source.index(f"const {name}")
+    return source[start:source.index(";", start) + 1]
+
+
 def main():
     root = Path(__file__).resolve().parents[5]
     common = (root / "rust/kernel/iio/common/aop_sensors.rs").read_text()
@@ -28,7 +33,7 @@ def main():
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 const MICRO: u64 = 1_000_000;
 const MAX_MICRO: u64 = i32::MAX as u64 * MICRO + MICRO - 1;
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Error(i32);
 impl Error { fn to_errno(&self) -> i32 { self.0 } }
 const EINVAL: Error = Error(-22);
@@ -64,7 +69,14 @@ struct AopSensorData<T: MessageProcessor, const N: usize = 1> {
     ty: [u32; N], value: [Atomic<u64>; N], valid: [Atomic<bool>; N], msg_proc: T,
 }
 struct MsgProc;
-''', block(common, "pub trait MessageProcessor"),
+''', const(las, "DIRECT_IDLE_MS"),
+        block(las, "fn first_sample_wait_ms("),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum SyncAction"),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum IdleStep"),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum RunState"),
+        block(las, "struct Stream<T>"),
+        block(las, "impl<T> Stream<T>"),
+        block(common, "pub trait MessageProcessor"),
         block(las, "impl MessageProcessor for MsgProc"),
         block(common, "impl<T: MessageProcessor, const N: usize> FakehidListener"),
         block(common, 'unsafe extern "C" fn aop_read_raw'), r'''
@@ -141,6 +153,51 @@ fn processed_channel_unchanged() {
     assert_eq!(read(&data, BINDINGS_IIO_CHAN_INFO_PROCESSED), (2, 12, 345_678));
     assert_eq!(read(&data, BINDINGS_IIO_CHAN_INFO_SCALE).0, -22);
     assert_eq!(read(&data, 999).0, -22);
+}
+#[test]
+fn on_demand_stream_lifecycle_and_passive_fallback() {
+    assert_eq!(first_sample_wait_ms(100_000), 600);
+    assert_eq!(first_sample_wait_ms(1_000_000), 1_500);
+    assert_eq!(first_sample_wait_ms(2_000_000), 2_500);
+
+    // Passive fallback (interval unreadable): never emits start/stop actions.
+    let mut passive = Stream::<u64>::new();
+    passive.direct_until = Some(5_000);
+    assert_eq!(passive.next_action(), SyncAction::None);
+    assert_eq!(passive.check_idle(0), IdleStep::Ignore);
+
+    // On-demand lifecycle: idle off -> in-flight read starts -> idle rearms while reading -> expires -> stops.
+    let mut s = Stream::<u64>::new();
+    s.interval_us = Some(1_000_000);
+    s.restore_interval = Some(1_000_000);
+    assert_eq!(s.restore_interval, Some(1_000_000));
+    assert_eq!(s.next_action(), SyncAction::None);
+    s.direct_readers = 1;
+    assert_eq!(s.next_action(), SyncAction::Start(1_000_000));
+    s.run_state = RunState::Running;
+    s.direct_until = Some(5_000);
+    assert_eq!(s.check_idle(0), IdleStep::RearmMs(DIRECT_IDLE_MS as u32));
+    s.direct_readers = 0;
+    assert_eq!(s.check_idle(2_000), IdleStep::RearmMs(2_000));
+    assert_eq!(s.check_idle(0), IdleStep::Expire);
+    assert_eq!(s.next_action(), SyncAction::Stop);
+    s.run_state = RunState::Stopped;
+    assert_eq!(s.next_action(), SyncAction::None);
+
+    // Firmware reset on wake or unacknowledged stop marks Unknown:
+    // idle reasserts Stop, while a new reader reasserts Start.
+    s.parked = false;
+    s.run_state = RunState::Unknown;
+    assert_eq!(s.next_action(), SyncAction::Stop);
+    s.direct_readers = 1;
+    assert_eq!(s.next_action(), SyncAction::Start(1_000_000));
+    s.direct_readers = 0;
+    s.run_state = RunState::Stopped;
+
+    // Failed start backoff.
+    s.failed_until = Some((5_000, Error(-5)));
+    assert_eq!(s.check_backoff(500), Some(Error(-5)));
+    assert_eq!(s.check_backoff(0), None);
 }
 ''']
     with tempfile.TemporaryDirectory(prefix="aop-las-") as tmp:
