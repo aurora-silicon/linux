@@ -85,7 +85,7 @@ use kernel::{
     c_str,
     device::{self, Core},
     drm::gem::shmem,
-    impl_has_delayed_work, impl_has_work,
+    impl_has_delayed_work, impl_has_hr_timer, impl_has_work,
     io::{
         IoBase,
         IoSysMap,
@@ -97,13 +97,19 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc,
+        ArcBorrow,
         CondVar,
         Mutex, //
     },
     time::{
         delay::fsleep,
+        hrtimer::{
+            ArcHrTimerHandle, HrTimer, HrTimerCallback, HrTimerCallbackContext, HrTimerPointer,
+            HrTimerRestart, RelativeMode,
+        },
         msecs_to_jiffies,
-        Delta, //
+        Delta,
+        Monotonic, //
     },
     types::{ForeignOwnable, Opaque},
     uapi,
@@ -1328,6 +1334,14 @@ struct Shared {
     housekeeping_ns: AtomicU64,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
+    /// Active retirement rescan hrtimer, replacing 1-jiffy delayed-work waits while GPU work
+    /// stays in flight.
+    rescan_stopped: AtomicBool,
+    rescan_deadline_ns: AtomicU64,
+    #[pin]
+    rescan: HrTimer<Shared>,
+    #[pin]
+    rescan_handle: Mutex<Option<ArcHrTimerHandle<Shared>>>,
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
     #[pin]
@@ -1395,6 +1409,26 @@ impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, POLL_WORK> for Shared { self.poll }
+}
+impl_has_hr_timer! {
+    impl HasHrTimer<Self> for Shared {
+        mode: RelativeMode<Monotonic>, field: self.rescan
+    }
+}
+impl HrTimerCallback for Shared {
+    type Pointer<'a> = Arc<Self>;
+
+    fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
+        let this: Arc<Self> = this.into();
+        this.rescan_deadline_ns.store(0, Ordering::Release);
+        if !this.sleeping()
+            && !this.rescan_stopped.load(Ordering::Acquire)
+            && !this.crashed.load(Ordering::Acquire)
+        {
+            this.queue_event_records();
+        }
+        HrTimerRestart::NoRestart
+    }
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
@@ -1811,7 +1845,48 @@ impl Shared {
     }
 
     fn queue_poll(self: &Arc<Self>) {
-        self.queue_poll_after(1);
+        // Sub-ms retirement rescan hrtimer: avoids 1-jiffy (4 ms at HZ=250) stalls when a
+        // completion's stamps or ring cursors lag its event notification.
+        const RESCAN_POLL_US: i64 = 50;
+        const RESCAN_POLL_NS: u64 = (RESCAN_POLL_US as u64) * 1_000;
+        if !self.submission_enabled
+            || self.sleeping()
+            || self.rescan_stopped.load(Ordering::Acquire)
+            || self.crashed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let now = now_ns();
+        let armed_ns = self.rescan_deadline_ns.load(Ordering::Acquire);
+        if armed_ns != 0 && armed_ns > now {
+            return;
+        }
+        let mut handle = self.rescan_handle.lock();
+        if self.sleeping()
+            || self.rescan_stopped.load(Ordering::Acquire)
+            || self.crashed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let armed_ns = self.rescan_deadline_ns.load(Ordering::Acquire);
+        if armed_ns != 0 && armed_ns > now {
+            return;
+        }
+        drop(handle.take());
+        self.rescan_deadline_ns
+            .store(now.saturating_add(RESCAN_POLL_NS), Ordering::Release);
+        *handle = Some(self.clone().start(Delta::from_micros(RESCAN_POLL_US)));
+    }
+
+    fn cancel_rescan(&self) {
+        let mut handle = self.rescan_handle.lock();
+        self.rescan_deadline_ns.store(0, Ordering::Release);
+        drop(handle.take());
+    }
+
+    fn disable_rescan(&self) {
+        self.rescan_stopped.store(true, Ordering::Release);
+        self.cancel_rescan();
     }
 
     fn queue_poll_after(self: &Arc<Self>, delay_ms: u32) {
@@ -2108,6 +2183,10 @@ impl Gpu {
                 housekeeping: AtomicBool::new(true),
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
+                rescan_stopped: AtomicBool::new(false),
+                rescan_deadline_ns: AtomicU64::new(0),
+                rescan <- HrTimer::new(),
+                rescan_handle <- new_mutex!(None, "g17::Shared::rescan_handle"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 housekeeping_timer <- new_delayed_work!("g17::Shared::housekeeping_timer"),
                 governs: m5,
@@ -2825,6 +2904,7 @@ impl Gpu {
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
+        self.shared.disable_rescan();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
         self.shared.disable_timer(&self.shared.housekeeping_timer);

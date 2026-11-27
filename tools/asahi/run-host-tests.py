@@ -382,6 +382,10 @@ ASAHI_TESTS = {
                                    'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
                                    'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
                                    'owed-slow-path'), []),
+    'g17-rescan-poll-tests.py': [([], PASS)]
+        + mutations('--mutation', ('starve-fast-pending', 'starve-slow-pending', 'jiffy-poll',
+                                   'skip-backpressure-poll', 'skip-sleep-cancel',
+                                   'skip-shutdown-disable'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),
