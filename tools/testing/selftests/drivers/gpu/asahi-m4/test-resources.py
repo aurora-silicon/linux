@@ -427,8 +427,8 @@ pub mod g16 {
                 for (owner, backing) in [(&vm, &epoch), (&replacement, &newer)] {
                     let binding = pools.bind(0, false);
                     pools.hold_alloc(0, owner, None, None).unwrap();
-                    pools.publish_flight(0);
-                    pools.retire_flight(0, backing, binding, true).unwrap();
+                    let sq=pools.publish_flight(0);
+                    pools.retire_flight(0, sq, backing, binding, true).unwrap();
                 }
                 let firmware = Firmware {
                     engine: Engine { shared: Some(shared) },
@@ -1168,36 +1168,37 @@ pub mod g16 {
         let b1=p.bind(0,false);
         let a1=pools.prepare_in_flight(0,1,false).unwrap();
         assert_eq!(a1.uma_submitted,2);
-        pools.publish_batch(0,2,1).unwrap();p.publish_flight(0);
+        pools.publish_batch(0,2,1).unwrap();let sq=p.publish_flight(0);
         let d0=find_va(a1.uma_mgr[0]);
         d0.w64(0x54,2).unwrap();
-        p.retire_flight(0,&e1,b1,true).unwrap();
+        p.retire_flight(0, sq,&e1,b1,true).unwrap();
         // Same-VM pipelining: 3 concurrent renders share slot 0 with cumulative uma_submitted (4, 6, 8).
         assert!(p.can_pipeline(&vm1));
         assert!(!p.can_pipeline(&vm2));
+        let mut seqs=Vec::new();
         for draw in 2..=4u64 {
             assert_eq!(p.pick_slot(&vm1,draw>2),Some(0));
             let refs=pools.prepare_in_flight(0,draw,draw>2).unwrap();
             assert_eq!(refs.uma_submitted,draw*2);
             pools.publish_batch(0,refs.uma_submitted,1).unwrap();
-            p.publish_flight(0);
+            seqs.push(p.publish_flight(0));
         }
         assert!(!pools.retired_at(0,4).unwrap());
         d0.w64(0x54,4).unwrap();
         assert!(pools.retired_at(0,4).unwrap());
         assert!(!pools.retired_at(0,6).unwrap());
-        p.retire_flight(0,&e1,b1,true).unwrap();
+        p.retire_flight(0, seqs[0],&e1,b1,true).unwrap();
         d0.w64(0x54,6).unwrap();
         assert!(pools.retired_at(0,6).unwrap());
-        p.retire_flight(0,&e1,b1,true).unwrap();
+        p.retire_flight(0, seqs[1],&e1,b1,true).unwrap();
         d0.w64(0x54,8).unwrap();
         assert!(pools.retired(0).unwrap());
-        p.retire_flight(0,&e1,b1,true).unwrap();
+        p.retire_flight(0, seqs[2],&e1,b1,true).unwrap();
         // Cross-VM switch drains and switches to slot 1 (displacing slot 0 upon clean retirement).
         assert_eq!(p.pick_slot(&vm2,false),Some(1));
         let b2=p.bind(1,false);
-        p.publish_flight(1);
-        p.retire_flight(1,&e2,b2,true).unwrap();
+        let sq=p.publish_flight(1);
+        p.retire_flight(1, sq,&e2,b2,true).unwrap();
         assert!(!p.exhausted());
         assert_eq!(p.needed_slots(),g16::hw::sizes::BASE_PB_SLOTS);
         // Normal cross-VM switch back to VM1 reuses displaced slot 0 rather than claiming slot 2.
@@ -1254,6 +1255,38 @@ pub mod g16 {
         }
     }
 
+    #[test]fn pb_slots_displace_in_publication_order_not_retirement_order(){
+        // Renders on different render pairs can be observed retiring out of publication order.
+        // Displacement follows the publication sequence: the later render displaces the
+        // earlier slot, never the reverse.
+        let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);
+        let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mk_epoch=|owner:&sync::Arc<g16::vm::VmState>,slot:usize|{
+            let e=g16::pools::PbEpoch::new(&factory,owner,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+            e.prepare(slot,0x70c0000000,2048).unwrap();e.check_assignment(slot).unwrap();e.expose();
+            e
+        };
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let e1=mk_epoch(&vm1,0);
+        let b1=p.bind(0,false);let s1=p.publish_flight(0);
+        let e2=mk_epoch(&vm2,1);
+        let b2=p.bind(1,false);let s2=p.publish_flight(1);
+        assert!(s2>s1);
+        // The later render is observed first; the earlier slot is still in flight.
+        p.retire_flight(1, s2, &e2, b2, true).unwrap();
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm3,false,0b11,0,0,false),None);
+        p.retire_flight(0, s1, &e1, b1, true).unwrap();
+        // Slot 0 ran before slot 1's render: displaced. Slot 1 holds the newest render.
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm3,false,0b11,0,0,false),Some(0));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm3,false,0b10,1,0,false),None);
+        assert!(!p.exhausted_for_mask_mode(&vm3,0b11,0,false));
+        // A render published after both displaces slot 1 too.
+        let e3=mk_epoch(&vm3,2);
+        let b3=p.bind(2,false);let s3=p.publish_flight(2);
+        p.retire_flight(2, s3, &e3, b3, true).unwrap();
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm3,false,0b10,1,0,false),Some(1));
+    }
+
     #[test]fn multi_active_pools_allow_warm_cross_vm_reuse_and_gate_cold_initbm(){
         let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);
         let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
@@ -1266,14 +1299,14 @@ pub mod g16 {
         // Prime VM1 on slot 0 and VM2 on slot 1 (drained InitBM).
         let e1=mk_epoch(&vm1,0);
         assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
-        let b1=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1,b1,true).unwrap();
+        let b1=p.bind(0,false);let sq=p.publish_flight(0);p.retire_flight(0, sq,&e1,b1,true).unwrap();
         let e2=mk_epoch(&vm2,1);
         assert_eq!(p.pick_slot_within(&vm2,false,2),Some(1));
-        let b2=p.bind(1,false);p.publish_flight(1);p.retire_flight(1,&e2,b2,true).unwrap();
+        let b2=p.bind(1,false);let sq=p.publish_flight(1);p.retire_flight(1, sq,&e2,b2,true).unwrap();
         // VM1 starts a render on warm slot 0 (no InitBM).
         assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
         assert!(p.reusable(0,&vm1).is_some());
-        let b1=p.bind(0,true);p.publish_flight(0);
+        let b1=p.bind(0,true);let s1=p.publish_flight(0);
         assert_eq!(p.slot_inflight(0),1);
         assert_eq!(p.slot_inflight(1),0);
         // While VM1 is live on slot 0 (behind=true):
@@ -1284,16 +1317,16 @@ pub mod g16 {
         assert!(!p.can_pipeline_within(&vm3,2));
         assert_eq!(p.pick_slot_within(&vm3,true,2),None);
         // VM2 publishes on slot 1 concurrently with VM1 on slot 0.
-        let b2=p.bind(1,true);p.publish_flight(1);
+        let b2=p.bind(1,true);let s2=p.publish_flight(1);
         assert_eq!(p.slot_inflight(0),1);
         assert_eq!(p.slot_inflight(1),1);
         // Neither in-flight slot is displaced while live.
         assert!(!p.exhausted());
         // Both retire cleanly in order.
-        p.retire_flight(0,&e1,b1,true).unwrap();
+        p.retire_flight(0, s1,&e1,b1,true).unwrap();
         assert_eq!(p.slot_inflight(0),0);
         assert_eq!(p.slot_inflight(1),1);
-        p.retire_flight(1,&e2,b2,true).unwrap();
+        p.retire_flight(1, s2,&e2,b2,true).unwrap();
         assert_eq!(p.slot_inflight(1),0);
         // Recovery invalidation clears warm reuse for BOTH slots so both VMs drain for InitBM.
         p.invalidate();
@@ -1313,13 +1346,13 @@ pub mod g16 {
         // Exact live cross-VM sequence: VM1 on slot 0 -> VM2 on slot 1 -> VM1 on slot 0.
         let e1=mk_epoch(&vm1,0);
         assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
-        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1,b,true).unwrap();
+        let b=p.bind(0,false);let sq=p.publish_flight(0);p.retire_flight(0, sq,&e1,b,true).unwrap();
         let e2=mk_epoch(&vm2,1);
         assert_eq!(p.pick_slot_within(&vm2,false,2),Some(1));
-        let b=p.bind(1,false);p.publish_flight(1);p.retire_flight(1,&e2,b,true).unwrap();
+        let b=p.bind(1,false);let sq=p.publish_flight(1);p.retire_flight(1, sq,&e2,b,true).unwrap();
         let e1b=mk_epoch(&vm1,0);
         assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
-        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1b,b,true).unwrap();
+        let b=p.bind(0,false);let sq=p.publish_flight(0);p.retire_flight(0, sq,&e1b,b,true).unwrap();
         // VM3 switches to slot 1 with a fresh epoch and hangs: recovery invalidates epochs
         // and quarantines slot 1 while retaining BOTH the prior owner (e2) and fresh epoch (e3).
         let e3=mk_epoch(&vm3,1);
@@ -1339,12 +1372,12 @@ pub mod g16 {
         assert!(!p.exhausted_for_within(&vm4,3));
         assert_eq!(p.pick_slot_within(&vm4,false,3),Some(2));
         let e4=mk_epoch(&vm4,2);
-        let b=p.bind(2,false);p.publish_flight(2);p.retire_flight(2,&e4,b,true).unwrap();
+        let b=p.bind(2,false);let sq=p.publish_flight(2);p.retire_flight(2, sq,&e4,b,true).unwrap();
         // Clean retirement on slot 2 displaces surviving slot 0 back to reusable!
         assert!(!p.exhausted_for_within(&vm1,3));
         assert_eq!(p.pick_slot_within(&vm1,false,3),Some(0));
         let e1c=mk_epoch(&vm1,0);
-        let b=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1c,b,true).unwrap();
+        let b=p.bind(0,false);let sq=p.publish_flight(0);p.retire_flight(0, sq,&e1c,b,true).unwrap();
         // Subsequent cross-VM render reuses displaced slot 2 (does not consume slot 3).
         assert_eq!(p.pick_slot_within(&vm2,false,3),Some(2));
         // An unrelated compute hang calling invalidate() does not wedge render either.
@@ -1382,10 +1415,10 @@ pub mod g16 {
         let s_a=warm+2;let s_b=warm+3;
         assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm1,false,vm_mask,0,0,false),Some(s_a));
         let ea=mk_epoch(&vm1,s_a);
-        let b=p.bind(s_a,false);p.publish_flight(s_a);p.retire_flight(s_a,&ea,b,true).unwrap();
+        let b=p.bind(s_a,false);let sq=p.publish_flight(s_a);p.retire_flight(s_a, sq,&ea,b,true).unwrap();
         assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm2,false,vm_mask,0,0,false),Some(s_b));
         let eb=mk_epoch(&vm2,s_b);
-        let b=p.bind(s_b,false);p.publish_flight(s_b);p.retire_flight(s_b,&eb,b,true).unwrap();
+        let b=p.bind(s_b,false);let sq=p.publish_flight(s_b);p.retire_flight(s_b, sq,&eb,b,true).unwrap();
         assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm1,false,vm_mask,0,0,false),Some(s_a));
         // 5th hang quarantines s_a: only s_b survives (reuse-only for VM2; VM1/VM3 exhausted).
         p.publish_flight(s_a);
@@ -1410,9 +1443,9 @@ pub mod g16 {
         assert_eq!(q.pick_slot(&vm2,false),Some(last));
         let qlast=mk_epoch(&vm2,last);
         let qb=q.bind(last,false);
-        q.publish_flight(last);
+        let sq=q.publish_flight(last);
         assert!(!q.exhausted_for(&vm3)); // in-flight: waits for drain first
-        q.retire_flight(last,&qlast,qb,true).unwrap();
+        q.retire_flight(last, sq,&qlast,qb,true).unwrap();
         assert!(!q.exhausted());
         assert!(!q.exhausted_for(&vm2));
         assert_eq!(q.pick_slot(&vm2,false),Some(last));
@@ -2406,8 +2439,8 @@ pub mod g16 {
         assert_eq!(e512.heap_blocks(), 512);
         e512.expose();
         let b0 = p.bind(0, false);
-        p.publish_flight(0);
-        p.retire_flight(0, &e512, b0, true).unwrap();
+        let sq=p.publish_flight(0);
+        p.retire_flight(0, sq, &e512, b0, true).unwrap();
 
         // At 512 blocks VM1 pipelines cleanly on slot 0.
         assert!(p.can_pipeline_within_blocks(&vm1, 2, 512));
@@ -2425,8 +2458,8 @@ pub mod g16 {
         assert_eq!(e1024.heap_blocks(), 1024);
         e1024.expose();
         let b1 = p.bind(1, false);
-        p.publish_flight(1);
-        p.retire_flight(1, &e1024, b1, true).unwrap();
+        let sq=p.publish_flight(1);
+        p.retire_flight(1, sq, &e1024, b1, true).unwrap();
 
         // Slot 1 now pipelines at 1024 blocks; expanding to 2048 rotates cleanly back to displaced slot 0.
         assert!(p.can_pipeline_within_blocks(&vm1, 2, 1024));
@@ -2540,8 +2573,8 @@ pub mod g16 {
             assert_eq!(slot, home, "VM {i} must claim its home slot {home} despite reverse arrival");
             let e = mk_epoch(&vms[i], slot);
             let b = p.bind(slot, false);
-            p.publish_flight(slot);
-            p.retire_flight(slot, &e, b, true).unwrap();
+            let sq=p.publish_flight(slot);
+            p.retire_flight(slot, sq, &e, b, true).unwrap();
             epochs.push((i, e));
         }
         // All 16 VMs now pipeline concurrently (behind=true) on 16 disjoint warm slots with 0 InitBM.
@@ -2553,12 +2586,12 @@ pub mod g16 {
             assert_eq!(slot, home);
             assert!(p.reusable_for_mask_mode(slot, &vms[i], mask, 512, false).is_some());
             let b = p.bind(slot, true);
-            p.publish_flight(slot);
-            binds.push((i, slot, b));
+            let sq = p.publish_flight(slot);
+            binds.push((i, slot, b, sq));
         }
-        for (idx, (i, slot, b)) in binds.into_iter().enumerate() {
+        for (idx, (i, slot, b, sq)) in binds.into_iter().enumerate() {
             assert_eq!(p.slot_inflight(slot), 1);
-            p.retire_flight(slot, &epochs[idx].1, b, true).unwrap();
+            p.retire_flight(slot, sq, &epochs[idx].1, b, true).unwrap();
             assert_eq!(p.slot_inflight(slot), 0);
             let _ = i;
         }
@@ -2570,8 +2603,8 @@ pub mod g16 {
             assert_ne!(mask & (1u32 << slot), 0);
             let e = mk_epoch(&vms[i], slot);
             let b = p.bind(slot, false);
-            p.publish_flight(slot);
-            p.retire_flight(slot, &e, b, true).unwrap();
+            let sq=p.publish_flight(slot);
+            p.retire_flight(slot, sq, &e, b, true).unwrap();
         }
     }
 
@@ -2739,8 +2772,8 @@ pub mod g16 {
             e.expose();
             let b = p.bind(pb_slot, false);
             p.hold_alloc(pb_slot, &v, Some(PbOwnerArena::Base(pb_arena.clone())), None).unwrap();
-            p.publish_flight(pb_slot);
-            p.retire_flight(pb_slot, &e, b, true).unwrap();
+            let sq=p.publish_flight(pb_slot);
+            p.retire_flight(pb_slot, sq, &e, b, true).unwrap();
 
             // 2) Render pass slot i
             let pk = s.pick_pass_in_for(&r_prep, &geo, 0, Some(v.id)).unwrap();
@@ -2824,8 +2857,8 @@ pub mod g16 {
         live_e.expose();
         let lb = p.bind(live_slot, false);
         p.hold_alloc(live_slot, &live, Some(PbOwnerArena::Base(live_r_arena.clone())), None).unwrap();
-        p.publish_flight(live_slot);
-        p.retire_flight(live_slot, &live_e, lb, true).unwrap();
+        let sq=p.publish_flight(live_slot);
+        p.retire_flight(live_slot, sq, &live_e, lb, true).unwrap();
 
         let lpk = s.pick_pass_in_for(&live_r_prep, &geo, 0, Some(live.id)).unwrap();
         s.claim_pass_in(&live_r_prep, lpk, Some(live.id), geo.tilemap_bytes).unwrap();
@@ -2869,8 +2902,8 @@ pub mod g16 {
             e.expose();
             let b = p.bind(i, false);
             p.hold_alloc(i, &next, None, None).unwrap();
-            p.publish_flight(i);
-            p.retire_flight(i, &e, b, true).unwrap();
+            let sq=p.publish_flight(i);
+            p.retire_flight(i, sq, &e, b, true).unwrap();
             assert_eq!(sync::Arc::strong_count(&epochs[i]), 1, "replaced PB epoch {i} released");
         }
         assert!(!p.reclaim_closed());
@@ -3053,8 +3086,8 @@ pub mod g16 {
         e1.expose();
         let b1 = p.bind(0, false);
         p.hold_alloc(0, &vm1, Some(PbOwnerArena::Base(r_arena1.clone())), Some(uma1.clone())).unwrap();
-        p.publish_flight(0);
-        p.retire_flight(0, &e1, b1, true).unwrap();
+        let sq=p.publish_flight(0);
+        p.retire_flight(0, sq, &e1, b1, true).unwrap();
 
         let pools2 = PoolSet::new_with_slots(&mut o, &factory, [1, 2]).unwrap();
         let uma2 = pools2.unit(0).unwrap().uma_lease();
@@ -3068,8 +3101,8 @@ pub mod g16 {
         e2.expose();
         let b2 = p.bind(1, false);
         p.hold_alloc(1, &vm2, Some(PbOwnerArena::Base(r_arena2.clone())), Some(uma2.clone())).unwrap();
-        p.publish_flight(1);
-        p.retire_flight(1, &e2, b2, true).unwrap();
+        let sq=p.publish_flight(1);
+        p.retire_flight(1, sq, &e2, b2, true).unwrap();
 
         // Compute unit 0 owned by VM1, displaced by VM2 on unit 1.
         let mut units1 = KVec::new();
@@ -3153,8 +3186,8 @@ pub mod g16 {
         e3.expose();
         let b3 = p.bind(0, false);
         p.hold_alloc(0, &vm3, Some(PbOwnerArena::Base(r_arena3)), Some(uma3.clone())).unwrap();
-        p.publish_flight(0);
-        p.retire_flight(0, &e3, b3, true).unwrap();
+        let sq=p.publish_flight(0);
+        p.retire_flight(0, sq, &e3, b3, true).unwrap();
         assert_eq!(sync::Arc::strong_count(&pb_lease1), 1, "overwritten pb_mgr_table[0] lease dropped");
         assert_eq!(sync::Arc::strong_count(&vm1), 1, "replaced PB epoch releases VM1's TTBAT slot");
         assert_eq!(sync::Arc::strong_count(&uma1), 1, "overwritten render uma_mgr_table[33] lease dropped");
@@ -3199,14 +3232,14 @@ pub mod g16 {
         let x_records = ex.records_lease();
         let bx = p.bind(3, false);
         p.hold_alloc(3, &x, Some(PbOwnerArena::Base(x_arena.clone())), None).unwrap();
-        p.publish_flight(3);
-        p.retire_flight(3, &ex, bx, true).unwrap();
+        let sq=p.publish_flight(3);
+        p.retire_flight(3, sq, &ex, bx, true).unwrap();
         let y = vm(47);
         let ey = epoch(&y, 4);
         let by = p.bind(4, false);
         p.hold_alloc(4, &y, None, None).unwrap();
-        p.publish_flight(4);
-        p.retire_flight(4, &ey, by, true).unwrap();
+        let sq=p.publish_flight(4);
+        p.retire_flight(4, sq, &ey, by, true).unwrap();
 
         // X closes. Its arena and PB heap go, but not the epoch firmware still names.
         x.vm.close();
@@ -3225,11 +3258,11 @@ pub mod g16 {
         let ez = epoch(&z, 3);
         let bz = p.bind(3, false);
         p.hold_alloc(3, &z, None, None).unwrap();
-        p.publish_flight(3);
+        let sq = p.publish_flight(3);
         assert!(p.reclaim_closed(), "rebinding render still in flight");
         assert_eq!(sync::Arc::strong_count(&ex), 2);
         assert_eq!(sync::Arc::strong_count(&x), 2);
-        p.retire_flight(3, &ez, bz, true).unwrap();
+        p.retire_flight(3, sq, &ez, bz, true).unwrap();
         assert_eq!(sync::Arc::strong_count(&ex), 1, "replaced epoch released");
         drop(ex);
         assert_eq!(sync::Arc::strong_count(&x), 1, "closed VM released after replacement");
@@ -3260,8 +3293,8 @@ pub mod g16 {
                    e: &sync::Arc<g16::pools::PbEpoch>, completed: bool| {
             let b = p.bind(k, false);
             p.hold_alloc(k, v, None, None).unwrap();
-            p.publish_flight(k);
-            p.retire_flight(k, e, b, completed).unwrap();
+            let sq=p.publish_flight(k);
+            p.retire_flight(k, sq, e, b, completed).unwrap();
         };
 
         let a = vm(62);
@@ -3279,9 +3312,9 @@ pub mod g16 {
         let ea2 = epoch(&a, 4);
         let b2 = p.bind(4, false);
         p.hold_alloc(4, &a, None, None).unwrap();
-        p.publish_flight(4);
+        let sq = p.publish_flight(4);
         assert_eq!(sync::Arc::strong_count(&ea1), 2);
-        p.retire_flight(4, &ea2, b2, false).unwrap();
+        p.retire_flight(4, sq, &ea2, b2, false).unwrap();
         assert_eq!(sync::Arc::strong_count(&ea1), 2, "a failed render released the old list");
         let ea3 = epoch(&a, 4);
         run(&mut p, &a, 4, &ea3, true);
@@ -3317,8 +3350,8 @@ pub mod g16 {
                    e: &sync::Arc<g16::pools::PbEpoch>| {
             let b = p.bind(k, false);
             p.hold_alloc(k, v, None, None).unwrap();
-            p.publish_flight(k);
-            p.retire_flight(k, e, b, true).unwrap();
+            let sq=p.publish_flight(k);
+            p.retire_flight(k, sq, e, b, true).unwrap();
         };
 
         let a = vm(20);
@@ -3339,10 +3372,10 @@ pub mod g16 {
         let ea2 = epoch(&a, 4);
         let b2 = p.bind(4, false);
         p.hold_alloc(4, &a, None, None).unwrap();
-        p.publish_flight(4);
+        let sq = p.publish_flight(4);
         assert!(p.reclaim_closed(), "render of the closed VM in flight");
         assert_eq!(sync::Arc::strong_count(&ea1), 2);
-        p.retire_flight(4, &ea2, b2, true).unwrap();
+        p.retire_flight(4, sq, &ea2, b2, true).unwrap();
         assert_eq!(sync::Arc::strong_count(&ea1), 1, "older epoch released after the InitBM");
         assert!(p.take_closed_vm_last(), "a closed VM's entry asks for another reclaim pass");
         assert!(!p.take_closed_vm_last());

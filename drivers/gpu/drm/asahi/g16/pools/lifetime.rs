@@ -11,6 +11,11 @@
 //! in flight (the compute queue); without it, publication stays serialized against every
 //! owner (the render pass slots).
 //!
+//! With `ordered` pipes, the owners of every pipe run on the engines that load them in
+//! publication order (the render queue pairs, ordered by their stage barriers): an owner is
+//! then reusable once any owner published after it retired, on any pipe. Retirement is still
+//! observed in order only per pipe.
+//!
 //! Core-only so the transition system is executable in host tests.
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -47,6 +52,8 @@ pub(crate) struct Lifetime<const N: usize> {
     units: [Unit; N],
     sequence: u64,
     pipelined: bool,
+    /// Owners of every pipe run in publication order (module documentation).
+    ordered: bool,
 }
 impl<const N: usize> Lifetime<N> {
     pub(crate) const fn new(pipelined: bool) -> Self {
@@ -61,7 +68,13 @@ impl<const N: usize> Lifetime<N> {
             units: [unit; N],
             sequence: 0,
             pipelined,
+            ordered: false,
         }
+    }
+    /// The owners of every pipe run in publication order (module documentation).
+    pub(crate) const fn ordered(mut self) -> Self {
+        self.ordered = true;
+        self
     }
     #[allow(dead_code)]
     pub(crate) fn generation(&self, k: usize) -> u8 {
@@ -96,10 +109,11 @@ impl<const N: usize> Lifetime<N> {
             State::Fresh => true,
             // A later publication on the same hardware pipe retired: it started only after this
             // owner finished on that pipe, and its load displaced this owner from the slot.
+            // A later publication retired: with `ordered` pipes on any pipe, else on this one.
             State::Retired => self.units.iter().enumerate().any(|(b, other)| {
                 b != k
                     && other.state == State::Retired
-                    && other.pipe == u.pipe
+                    && (self.ordered || other.pipe == u.pipe)
                     && other.publication > u.publication
             }),
             _ => false,
@@ -172,6 +186,7 @@ impl<const N: usize> Lifetime<N> {
             };
         }
     }
+    #[allow(dead_code)]
     pub(crate) fn publish(&mut self, k: usize) -> bool {
         self.publish_on(k, 0)
     }
@@ -224,6 +239,28 @@ impl<const N: usize> Lifetime<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordered_pipes_displace_by_publication_on_any_pipe() {
+        // Owner 0 on pipe 0, then owner 1 on pipe 1; pipe 1 retires first.
+        let mut l = Lifetime::<3>::new(true).ordered();
+        assert!(l.claim(0) && l.publish_on(0, 0));
+        assert!(l.claim(1) && l.publish_on(1, 1));
+        assert!(l.retire(1));
+        assert!(!l.available(1));
+        assert!(l.retire(0));
+        // The later publication displaced the earlier one across pipes, not the reverse.
+        assert!(l.available(0) && !l.available(1));
+        // Each pipe still retires its own owners in order.
+        assert!(l.claim(0) && l.publish_on(0, 0));
+        assert!(l.claim(2) && l.publish_on(2, 0));
+        assert!(!l.retire(2));
+        assert!(l.retire(0) && l.retire(2));
+        // Without ordered pipes only the same pipe displaces (the compute pipes).
+        let mut c = Lifetime::<3>::new(true);
+        assert!(c.claim(0) && c.publish_on(0, 0) && c.retire(0));
+        assert!(c.claim(2) && c.publish_on(2, 1) && c.retire(2));
+        assert!(!c.available(0));
+    }
     #[test]
     fn distinct_retired_displacement_is_required() {
         let mut l = Lifetime::<2>::new(false);
