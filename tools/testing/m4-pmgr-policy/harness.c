@@ -73,6 +73,11 @@ static bool of_property_present(const struct device_node *n, const char *name)
 	return find_property(n, name) != NULL;
 }
 
+static bool of_machine_is_compatible(const char *machine)
+{
+	return !strcmp(machine, "apple,j713");
+}
+
 static int of_property_read_string(const struct device_node *n,
 				   const char *name, const char **s)
 {
@@ -412,7 +417,7 @@ static unsigned int validate_policy(const char *name, unsigned int staged)
 		enabled += available(n);
 		owned += of_property_present(n, "apple,firmware-owned");
 	}
-	CHECK(domains == 129);
+	CHECK(domains == 145);
 	printf("%s: staged=%u enabled=%u/%u firmware_owned=%u mismatches=%u\n",
 	       name, staged, enabled, domains, owned, mismatches);
 	return mismatches;
@@ -431,7 +436,7 @@ static unsigned int run_case(const char *name, const char *live_path,
 	struct of_changeset cs = { 0 };
 	unsigned int changed = 0;
 
-	CHECK(t8132_pmgr_policy(&cs, &changed) == 0);
+	CHECK(t8132_pmgr_policy(&cs, &changed, !native) == 0);
 	CHECK(changed == cs.count);
 	unsigned int staged = cs.count;
 
@@ -465,7 +470,7 @@ static void run_errors(const char *legacy)
 	struct of_changeset cs = { 0 };
 	unsigned int changed = 0;
 
-	CHECK(t8132_pmgr_policy(&cs, &changed) == 0);
+	CHECK(t8132_pmgr_policy(&cs, &changed, true) == 0);
 	total = cs.count;
 	discard(&cs);
 	free_fixture();
@@ -475,7 +480,7 @@ static void run_errors(const char *legacy)
 
 		cs.fail_at = fail;
 		changed = 0;
-		CHECK(t8132_pmgr_policy(&cs, &changed) == -ENOMEM);
+		CHECK(t8132_pmgr_policy(&cs, &changed, true) == -ENOMEM);
 		CHECK(cs.count == fail - 1 && changed == cs.count);
 		CHECK(state_hash() ==
 		      before); /* Abort staging: caller must not apply it. */
@@ -496,7 +501,7 @@ static void run_errors(const char *legacy)
 
 		free(parent->full_name);
 		parent->full_name = strdup("power-management@deadbeef");
-		CHECK(t8132_pmgr_policy(&cs, &changed) == -EINVAL);
+		CHECK(t8132_pmgr_policy(&cs, &changed, true) == -EINVAL);
 		CHECK(state_hash() == before);
 		if (i == 0)
 			CHECK(cs.count == 0);
@@ -515,7 +520,7 @@ static void run_errors(const char *legacy)
 	const char compat[] = "apple,t8132-pmgr-pwrstate";
 
 	set_property(unknown, "compatible", compat, sizeof(compat));
-	CHECK(t8132_pmgr_policy(&cs, &changed) == 0);
+	CHECK(t8132_pmgr_policy(&cs, &changed, true) == 0);
 	apply(&cs);
 	CHECK(!available(unknown));
 	CHECK(available(by_path(

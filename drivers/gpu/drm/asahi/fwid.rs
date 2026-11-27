@@ -287,6 +287,7 @@ impl fmt::Display for Identity {
 /// Identifies the firmware build loaded at `text` (DATA `data_size` bytes) among `builds`,
 /// before any firmware-visible write.
 #[cfg_attr(not(CONFIG_DRM_ASAHI_G16), allow(dead_code))]
+#[inline(never)]
 pub(crate) fn identify(
     dev: &device::Device,
     text: Range<u64>,
@@ -458,6 +459,11 @@ mod tests {
                 0xb5, 0xcd, 0xfb, 0xd6, 0xd7, 0xcb, 0xc7, 0xf1, 0xba, 0xa2, 0xcc, 0x8b, 0x37, 0xee,
                 0x5d, 0x6e, 0x5e, 0x98,
             ],
+            [
+                0x19, 0xd9, 0x97, 0x49, 0x3e, 0x00, 0x76, 0x3d, 0xe3, 0x1f, 0x40, 0x0a, 0x59, 0x2d,
+                0x8a, 0xea, 0xe6, 0xbd, 0x11, 0x72, 0xc5, 0x85, 0x96, 0x61, 0x78, 0x1b, 0x42, 0x15,
+                0xde, 0xbc, 0x87, 0x0b,
+            ],
         ];
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(build.images, 0x138000, &[[0x59839, 0x5991c]], digest).unwrap();
@@ -563,9 +569,23 @@ mod tests {
                 0x86, 0x8b, 0xc9, 0xcf,
             ],
         ];
+        // builds[0] is the normalized entry; the per-board J713 entries follow it.
+        let normalized = &builds[0];
+        assert!(normalized
+            .boot_filled
+            .iter()
+            .all(|&(offset, len)| u64::from(offset) + u64::from(len) <= normalized.text_size));
+        let found = measured(
+            builds,
+            0x13c000,
+            &[[0x5c8df, 0x5c9c2]],
+            normalized.text_sha256,
+        )
+        .unwrap();
+        assert!(core::ptr::eq(found, normalized));
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
-            assert!(core::ptr::eq(found, &builds[i]));
+            assert!(core::ptr::eq(found, &builds[i + 1]));
             assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
         }
         assert!(measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], [0; 32]).is_none());

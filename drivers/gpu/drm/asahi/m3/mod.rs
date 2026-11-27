@@ -79,8 +79,6 @@ pub(crate) mod agx_compute;
 mod agx_memory;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod agx_resources;
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-mod agx_status;
 #[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
 pub(crate) mod agx_uapi;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -141,8 +139,6 @@ mod m3_compute_layout;
 mod m3_compute_sequence;
 
 mod m3_compute_storage;
-
-mod m3_coverage;
 
 mod m3_init_layout;
 

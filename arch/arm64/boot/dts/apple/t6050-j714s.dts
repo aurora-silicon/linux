@@ -14,6 +14,8 @@
 /dts-v1/;
 
 #define T6050_J714S
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 #include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
@@ -793,6 +795,36 @@
 #include "t6050-j714s-sleep.dtsi"
 #include "t6050-j714s-sleep-soc.dtsi"
 #include "t6050-j714s-sleep-adt.dtsi"
+
+/* A merged mode's pair is given only while every external display has an engine */
+&dcpext0 {
+	apple,merged-mode-limit;
+};
+
+&dcpext1 {
+	apple,merged-mode-limit;
+};
+
+&dcpext2 {
+	apple,merged-mode-limit;
+};
+
+&dcpext3 {
+	apple,merged-mode-limit;
+};
+
+/* The display coprocessors take the sleep through their firmware 27 method table */
+&sleep {
+	apple,display-method-sleep;
+};
+
+/* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
+&smc {
+	apple,wake-reasons = <0 8 9 11 13 35 40 41 42 43 44 45 48>;
+	apple,wake-reason-names = "pwrbtn", "lid", "sdconn", "charger", "wifibt",
+				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
+				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+};
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the

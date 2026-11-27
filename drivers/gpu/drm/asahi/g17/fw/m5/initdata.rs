@@ -2726,6 +2726,9 @@ pub(crate) struct Board {
     /// Whether firmware accepts tiling kicks without an entry signal and retained
     /// render pairs kicked through the host port alone.
     pub(crate) host_only_render_kicks: bool,
+    /// Firmware compute queues of one context over which a single command queue's independent
+    /// kicks may run ([`Board::compute_channels`]).
+    compute_channels: u8,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2755,6 +2758,9 @@ pub(crate) const J714: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     host_only_render_kicks: false,
+    // macOS runs one M5 Pro command queue on up to three firmware compute queues of the same
+    // context, created on demand and sharing one completion ordinal (its own kicks under aura).
+    compute_channels: 3,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2789,6 +2795,7 @@ pub(crate) const J716C: Board = Board {
     // G17D has distinct kick encodings, and common 26A428 publishes descriptors
     // on the item ring. Qualify those interfaces separately.
     host_only_render_kicks: true,
+    compute_channels: 1,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2830,6 +2837,7 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     host_only_render_kicks: false,
+    compute_channels: 1,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2869,12 +2877,24 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     host_only_render_kicks: false,
+    compute_channels: 1,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
 pub(crate) const J813_26B123: Board = Board {
     graph: &COMMON26B123_GRAPH,
     ..J813
+};
+
+// Every board runs at least one compute channel per command queue and no more than the per-owner
+// channel arrays hold.
+const _: () = {
+    let mut boards = [&J714, &J716C, &J775D, &J813, &J813_26B123].as_slice();
+    while let [board, rest @ ..] = boards {
+        assert!(board.compute_channels >= 1);
+        assert!(board.compute_channels as usize <= crate::g17::pairs::COMPUTE_CHANNELS_MAX);
+        boards = rest;
+    }
 };
 
 const _: () = {
@@ -3482,6 +3502,14 @@ impl Board {
     ///   there and has not been run on a G17D, where a wrong kick form never completes.
     pub(crate) const fn completion_inputs(&self) -> bool {
         matches!(self.graph.profile, RootProfile::J714G17S26A428) && !self.g17d_forms
+    }
+
+    /// Firmware compute queues of one context over which a single command queue's independent
+    /// kicks may run, each with its own preemption, operand, usage, status and stamp state and all
+    /// of them sharing the context's completion ordinal. 1 where the board's own macOS driver has
+    /// not been seen to spread a command queue: one firmware compute queue per command queue.
+    pub(crate) const fn compute_channels(&self) -> u8 {
+        self.compute_channels
     }
 
     /// Whether this is the J813, whose register programs macOS 27.0 writes in the common 26A428

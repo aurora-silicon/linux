@@ -361,6 +361,9 @@ static void macsmc_lid_wake_test(struct kunit *test)
 
 static void macsmc_wake_reason_test(struct kunit *test)
 {
+	static const struct apple_smc_wake_reason j714s[] = {
+		{ 8, "lid" }, { 9, "sdconn" }, { 13, "wifibt" }, { }
+	};
 	struct macsmc_test_context *ctx = test->priv;
 	char names[128];
 
@@ -380,8 +383,8 @@ static void macsmc_wake_reason_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "lid"), 8);
 	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "ipd_touch"), -1);
 
-	/* The J714s's: T8132's lid and radio bits, its SD reader at bit 9. */
-	ctx->smc.wake_reasons = apple_smc_j714s_wake_reasons;
+	/* A device tree's own, here the J714s's: its SD reader at bit 9. */
+	ctx->smc.wake_reasons = j714s;
 	apple_smc_wake_reason_names(&ctx->smc, BIT_ULL(8) | BIT_ULL(9) | BIT_ULL(10) | BIT_ULL(13),
 				    names, sizeof(names));
 	KUNIT_EXPECT_STREQ(test, names, "lid sdconn wifibt");
@@ -402,6 +405,31 @@ static void macsmc_port_reasons_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(42) | BIT_ULL(10)));
 	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(23)));
 	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(43)));
+}
+
+/*
+ * The SMC's first message may come as soon as its endpoint is started: the
+ * state the probe sets up before the RTKit is enough to take it.
+ */
+static void macsmc_early_message_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	struct resource sram = DEFINE_RES_MEM(0x10000, SMC_SHMEM_SIZE);
+	struct apple_smc *smc;
+
+	smc = kunit_kzalloc(test, sizeof(*smc), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, smc);
+	apple_smc_init_state(smc);
+	smc->sram = &sram;
+	smc->sram_base = (void __iomem *)ctx->shmem;
+
+	KUNIT_EXPECT_EQ(test, smc->boot_stage, APPLE_SMC_BOOTING);
+	KUNIT_EXPECT_FALSE(test, completion_done(&smc->init_done));
+
+	KUNIT_EXPECT_TRUE(test, apple_smc_rtkit_recv_early(smc, SMC_ENDPOINT, sram.start));
+	KUNIT_EXPECT_EQ(test, smc->boot_stage, APPLE_SMC_INITIALIZED);
+	KUNIT_EXPECT_TRUE(test, completion_done(&smc->init_done));
+	KUNIT_EXPECT_PTR_EQ(test, smc->shmem.iomem, smc->sram_base);
 }
 
 static struct device *macsmc_test_attach_dev(struct kunit *test,
@@ -532,6 +560,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
 	KUNIT_CASE(macsmc_port_reasons_test),
+	KUNIT_CASE(macsmc_early_message_test),
 	KUNIT_CASE(macsmc_wktp_probe_test),
 	KUNIT_CASE(macsmc_wktp_full_wake_test),
 	KUNIT_CASE(macsmc_wktp_dark_wake_test),

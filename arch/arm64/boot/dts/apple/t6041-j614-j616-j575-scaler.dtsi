@@ -26,19 +26,6 @@
 	};
 };
 
-&pmgr_aux {
-	ps_fab5_soc: power-controller@440 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x440 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab5_soc";
-		power-domains = <&ps_afi>;
-		apple,always-on;
-		status = "disabled";
-	};
-};
-
 /* PMGR group 1 resolves via ps-groups to the main bank at 0x502280000. */
 &pmgr {
 	ps_msr1: ps_msr1_dart: power-controller@3b0 {

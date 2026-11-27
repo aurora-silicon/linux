@@ -58,6 +58,11 @@
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
 #define APPLE_ANS_COPROC_CPU_STATUS	 0x48
+/*
+ * A word of the NVMe block that gates its SART (measured on M1). The boot loader leaves 1
+ * here, and a firmware sleep, which takes ANS's power, leaves 0: put back before ANS runs again.
+ */
+#define APPLE_ANS_SART_POWER		0x13e8
 
 #define APPLE_ANS_ACQ_DB  0x1004
 #define APPLE_ANS_IOCQ_DB 0x100c
@@ -236,6 +241,8 @@ struct apple_nvme_hw {
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
+	/* Pre-M4 controller that warm-idles and warm-restarts across deep sleep. */
+	bool warm_sleep;
 	bool secure_reg_layout;
 	/* Also send the NVMe shutdown notification (CC.SHN) on removal. */
 	bool shutdown_notify;
@@ -270,11 +277,18 @@ struct apple_nvme {
 	u32 sleep_csts;
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
+	/* A firmware sleep took ANS's power: its next start is from that power-on */
+	bool fw_sleep_restart;
+	/* This suspend idled ANS for a firmware sleep, whether or not the sleep happened */
+	bool fw_sleep_idled;
+	/* The SART power word as it was before that sleep */
+	u32 sart_power;
 	bool sleep_failed;
 	/* Run bit set after a sleep, and not yet reported on. */
 	bool sleep_restarting;
 	ktime_t sleep_run_time;
 	bool sleep_registered;
+	bool t8122_warm_sleep;
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -1897,6 +1911,8 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
 	bool inherited = !anv->owns_rtkit;
+	bool fw_sleep;
+	bool warm_restarted = false;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -2003,6 +2019,11 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 				goto out;
 			goto rtkit_ready;
 		}
+		if (READ_ONCE(anv->sleep_restarted)) {
+			WRITE_ONCE(anv->sleep_restarted, false);
+			warm_restarted = true;
+			goto rtkit_ready;
+		}
 		/* reset the controller if it is enabled */
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
 			apple_nvme_disable_legacy(anv, false);
@@ -2037,6 +2058,9 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 			goto booted;
 		}
 
+		fw_sleep = READ_ONCE(anv->fw_sleep_restart);
+		WRITE_ONCE(anv->fw_sleep_restart, false);
+
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
@@ -2049,10 +2073,31 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		if (ret)
 			goto out;
 
+		/*
+		 * After a firmware sleep, out of reset and before the run bit: the SART's
+		 * power word, and the mailbox's enables, which went with ANS's power.
+		 * On T8122 (which shares the ANS reset with SART), replay saved SART
+		 * entries before starting ANS (no-op on cold boot when replay_valid is false).
+		 */
+		if (fw_sleep) {
+			if (readl(anv->mmio_nvme + APPLE_ANS_SART_POWER) != anv->sart_power)
+				writel(anv->sart_power, anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			/* Only after a sleep that didn't happen: the wake wrote them already. */
+			if (anv->sart)
+				apple_sart_restore_early(anv->sart);
+			ret = apple_rtkit_mbox_restore(anv->rtk);
+			if (ret)
+				goto out;
+		} else if (anv->sart) {
+			apple_sart_replay(anv->sart);
+		}
+
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
 		ret = apple_rtkit_boot(anv->rtk);
+		if (fw_sleep && !ret)
+			dev_info(anv->dev, "ANS: on after the sleep\n");
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}
@@ -2088,12 +2133,14 @@ rtkit_ready:
 	 * queues. Woken this way, it would ignore the queue registers below,
 	 * which may only change while CC.EN is clear. Disable it first.
 	 */
-	if (inherited && !anv->hw->needs_ioq_registers) {
+	if ((inherited || warm_restarted) && !anv->hw->needs_ioq_registers) {
 		anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
 		anv->ctrl.ctrl_config = readl(anv->mmio_nvme + NVME_REG_CC);
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE) {
 			dev_info(anv->dev,
-				 "controller handed over enabled, disabling it\n");
+				 "controller %s enabled, disabling it\n",
+				 warm_restarted ? "retained after warm restart" :
+						  "handed over");
 			ret = nvme_disable_ctrl(&anv->ctrl, false);
 			if (ret)
 				goto out;
@@ -2719,6 +2766,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		return ERR_PTR(ret);
 	anv->adminq.is_adminq = true;
 	platform_set_drvdata(pdev, anv);
+	/* Its resume waits on the coprocessor (0.2 to 0.9 s after a real sleep): not in the others' way. */
+	device_enable_async_suspend(&pdev->dev);
 
 	anv->hw = of_device_get_match_data(&pdev->dev);
 	if (!anv->hw) {
@@ -3135,6 +3184,36 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
  * macOS. The wait for on doesn't: macOS rings the SEP a few ms after ANS's HELLO, before ANS
  * reports on, so the reset work waits, after the SEP's own resume has had its turn.
  */
+static void apple_nvme_t8122_warm_resume(struct apple_nvme *anv)
+{
+	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
+	int ret;
+
+	if (!xchg(&anv->t8122_warm_sleep, false))
+		return;
+
+	/*
+	 * A sleep refused before the commit left ANS powered, so a warm
+	 * restart without a power cycle can hang; fall back to the cold PMGR
+	 * reset path in apple_nvme_reset_work_impl().
+	 */
+	if (!pm_resume_via_firmware())
+		return;
+
+	apple_sleep_restore_pins();
+	if (anv->sart)
+		apple_sart_replay(anv->sart);
+	apple_rtkit_set_warm_epmap_mask(anv->rtk, BIT(0));
+	anv->sleep_run_time = ktime_get();
+	ret = apple_rtkit_sleep_return_start(anv->rtk, control);
+	if (ret) {
+		dev_err(anv->dev, "ANS warm restart failed: %d\n", ret);
+		anv->sleep_failed = true;
+	} else {
+		WRITE_ONCE(anv->sleep_restarting, true);
+	}
+}
+
 static int apple_nvme_resume_early(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
@@ -3145,7 +3224,11 @@ static int apple_nvme_resume_early(struct device *dev)
 	    READ_ONCE(anv->m5.phase) != APPLE_M5_ANS_LIVE)
 		return apple_nvme_m5_resume_early(anv);
 
-	if (!anv->hw->needs_ioq_registers || !anv->suspended || !anv->sleep_idled)
+	if (!anv->hw->needs_ioq_registers) {
+		apple_nvme_t8122_warm_resume(anv);
+		return 0;
+	}
+	if (!anv->suspended || !anv->sleep_idled)
 		return 0;
 	anv->sleep_idled = false;
 	if (anv->sleep_stop)
@@ -3229,6 +3312,22 @@ static int apple_nvme_resume(struct device *dev)
 		/* The reset work waits for ANS first, if it's still coming up. */
 		WRITE_ONCE(anv->suspended, false);
 		return nvme_try_sched_reset(&anv->ctrl);
+	}
+	if (anv->hw->warm_sleep) {
+		apple_nvme_t8122_warm_resume(anv);
+		if (READ_ONCE(anv->sleep_failed)) {
+			dev_crit(dev, "holding all I/O: ANS is down after the sleep, reboot to recover\n");
+			return 0;
+		}
+	} else {
+		/*
+		 * A firmware sleep took ANS's power: the reset work starts it from that power-on.
+		 * A sleep that didn't happen after ANS was idled for it leaves it idle with its
+		 * SART gated: the same start, from its reset, with the SART's entries written back.
+		 */
+		if (anv->rtk && (pm_resume_via_firmware() || anv->fw_sleep_idled))
+			WRITE_ONCE(anv->fw_sleep_restart, true);
+		anv->fw_sleep_idled = false;
 	}
 	return nvme_reset_ctrl(&anv->ctrl);
 }
@@ -3390,9 +3489,49 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		ret = apple_rtkit_shutdown(anv->rtk);
+		if (anv->hw->warm_sleep &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM &&
+		    pm_suspend_via_firmware() &&
+		    !apple_sleep_dry_run()) {
+			anv->sleep_failed = false;
+			anv->sleep_restarted = false;
+			ret = apple_rtkit_idle(anv->rtk);
+			if (ret) {
+				dev_err(dev, "ANS warm idle failed: %d\n", ret);
+				return ret;
+			}
+			writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+			WRITE_ONCE(anv->t8122_warm_sleep, true);
+			return 0;
+		}
+		if (!anv->hw->warm_sleep &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM &&
+		    pm_suspend_via_firmware()) {
+			/*
+			 * A firmware sleep takes ANS's power. ANS is put in IDLE, both
+			 * the AP's state and its own, as for a sleep it is woken from:
+			 * after its power-on it then brings its flash links back itself.
+			 * In IDLE it gates its SART, so the SART's entries and the word
+			 * that gates it are read before that.
+			 */
+			anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			if (anv->sart)
+				apple_sart_save_now(anv->sart);
+			anv->fw_sleep_idled = true;
+			ret = apple_rtkit_idle(anv->rtk);
+			if (!ret)
+				ret = apple_rtkit_reinit(anv->rtk);
+		} else {
+			ret = apple_rtkit_shutdown(anv->rtk);
+		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+		/* Refused here, so no resume follows: ANS starts again now, from its reset. */
+		if (ret && anv->fw_sleep_idled) {
+			anv->fw_sleep_idled = false;
+			WRITE_ONCE(anv->fw_sleep_restart, true);
+			nvme_reset_ctrl(&anv->ctrl);
+		}
 	}
 
 	return ret;
@@ -3412,6 +3551,13 @@ static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
 	.has_queue_count = true,
+	.max_queue_depth = 64,
+};
+
+static const struct apple_nvme_hw apple_nvme_t8122_hw = {
+	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.warm_sleep = true,
 	.max_queue_depth = 64,
 };
 
@@ -3480,6 +3626,10 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.needs_ioq_registers = true,
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
+	/* ANS takes part in a firmware sleep, whole endpoint map echoed. */
+	.sleep_traced = true,
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
 };
 
@@ -3522,6 +3672,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t8122-nvme-ans2", .data = &apple_nvme_t8122_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },

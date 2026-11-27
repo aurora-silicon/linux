@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hdcp;
 mod hibe;
 mod hwrng;
 mod image;
@@ -231,6 +232,8 @@ const RNG_MAX_WORDS_PER_READ: usize = 16;
 // already being written can still go out once the sleep has begun; see
 // `send_entropy_request()`.
 const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
+/// How long a full mailbox may take to drain before a sleep is refused.
+const MAILBOX_DRAIN_MS: u32 = 100;
 
 extern "C" {
     fn sep_cancel_work_sync(work: *mut c_void);
@@ -681,6 +684,11 @@ struct SepData {
 
     // The mailbox's receive interrupt is held off for the enclave's sleep.
     sleep_rx_held: Atomic<bool>,
+    /// Told at device suspend (no sleep core commit, T6041) rather than staged for the commit.
+    sleep_at_suspend: Atomic<bool>,
+    /// The enclave didn't answer a sleep request or a wake this boot: no deep sleep until a
+    /// reboot, as a commit over a running enclave resets the SoC.
+    sleep_unanswered: Atomic<bool>,
 
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
@@ -821,6 +829,21 @@ struct SepData {
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
+
+    // The HDCP endpoint (see `hdcp`): its buffers, the sessions per slot
+    // (held for a whole step, so one exchange is in flight), the reply wait,
+    // discovery state, and quarantine flag.
+    #[pin]
+    ool_hdcp: Mutex<Option<OolPair>>,
+    #[pin]
+    hdcp_state: Mutex<hdcp::State>,
+    #[pin]
+    hdcp_rx: Mutex<hdcp::Exchange>,
+    #[pin]
+    hdcp_wq: CondVar,
+    hdcp_named: Atomic<bool>,
+    hdcp_layout: Atomic<u32>,
+    hdcp_quarantined: Atomic<bool>,
 
     // The boot-policy endpoint (see `pnon`): its buffers, its one
     // exchange, and what discovery said about it.
@@ -1080,6 +1103,12 @@ impl SepData {
             stac::OOL_SIZE_STAC,
             (stac::OOL_SIZE_STAC, stac::OOL_SIZE_STAC),
         )?;
+        let ool_hdcp = Self::alloc_ool(
+            dev,
+            hdcp::EP_HDCP,
+            hdcp::OOL_SIZE_HDCP,
+            (hdcp::OOL_SIZE_HDCP, hdcp::OOL_SIZE_HDCP),
+        )?;
         // Sized from the endpoint's layout before it is registered.
         let ool_pnon = Self::alloc_ool(dev, pnon::EP_PNON, pnon::OOL_SIZE_PNON, (0, 0))?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
@@ -1226,6 +1255,8 @@ impl SepData {
                 phase: Atomic::new(PHASE_ATTACH),
                 sleep_gate: Atomic::new(pm::SleepGate::Open as u32),
                 sleep_rx_held: Atomic::new(false),
+                sleep_at_suspend: Atomic::new(false),
+                sleep_unanswered: Atomic::new(false),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1242,6 +1273,13 @@ impl SepData {
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
+                ool_hdcp <- new_mutex!(Some(ool_hdcp)),
+                hdcp_state <- new_mutex!(hdcp::State::new()),
+                hdcp_rx <- new_mutex!(hdcp::Exchange::new()),
+                hdcp_wq <- new_condvar!("SepData::hdcp_wq"),
+                hdcp_named: Atomic::new(false),
+                hdcp_layout: Atomic::new(0),
+                hdcp_quarantined: Atomic::new(false),
                 ool_pnon <- new_mutex!(Some(ool_pnon)),
                 pnon_rx <- new_mutex!(pnon::Exchange::new()),
                 pnon_wq <- new_condvar!("SepData::pnon_wq"),
@@ -1543,6 +1581,10 @@ impl SepData {
     /// Prepare a firmware-driven suspend without sending SLEEP. The platform
     /// owns the irreversible request, after every returnable refusal.
     pub(crate) fn sleep_enter(&self) -> Result<()> {
+        // T6041: its sleep driver has no sleep core commit, so the enclave is told now.
+        if !pm::platform_commit() {
+            return self.sleep_enter_at_suspend();
+        }
         match self.sleep_gate() {
             // A failed earlier wake is not repaired by another precommit attempt.
             pm::SleepGate::Lost => return Err(EIO),
@@ -1554,6 +1596,14 @@ impl SepData {
             dev_warn_ratelimited!(
                 self.dev,
                 "sleep refused: the enclave did not finish coming up\n"
+            );
+            return Err(EBUSY);
+        }
+        // Refused here, at once, rather than at the commit after its send wait.
+        if !self.mailbox_drains() {
+            dev_err_ratelimited!(
+                self.dev,
+                "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
             );
             return Err(EBUSY);
         }
@@ -1586,6 +1636,195 @@ impl SepData {
         Ok(())
     }
 
+    /// Without a sleep core commit (T6041): tell the enclave at device suspend, seconds before
+    /// the platform's commit, which answers, saves its state and gates its own domain (waited
+    /// for in suspend_noirq). A deep sleep commits only over an enclave that is asleep.
+    fn sleep_enter_at_suspend(&self) -> Result<()> {
+        if self.sleep_unanswered.load(Relaxed) {
+            dev_err_ratelimited!(
+                self.dev,
+                "deep sleep refused: the enclave did not answer a sleep request or wake earlier this boot\n"
+            );
+            return Err(EBUSY);
+        }
+        match self.sleep_gate() {
+            // Gated already at an earlier, refused sleep: it stays asleep until a real wake.
+            pm::SleepGate::Lost if self.sleep_at_suspend.load(Relaxed) => return Ok(()),
+            pm::SleepGate::Lost => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "deep sleep refused: the enclave did not come back from a sleep earlier this boot\n"
+                );
+                return Err(EBUSY);
+            }
+            pm::SleepGate::Open => {}
+            _ => return Err(EBUSY),
+        }
+        // One that didn't come up still runs: a commit over it resets the SoC.
+        if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
+            dev_err_ratelimited!(
+                self.dev,
+                "deep sleep refused: the enclave did not finish coming up, so it can't be put to sleep\n"
+            );
+            return Err(EBUSY);
+        }
+        if !self.mailbox_drains() {
+            dev_err_ratelimited!(
+                self.dev,
+                "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
+            );
+            return Err(EBUSY);
+        }
+
+        self.set_sleep_gate(pm::SleepGate::Draining);
+        let idle = control::wait_idle(
+            proto::CONTROL_TIMEOUT_MS,
+            10,
+            || self.control.lock().requests_in_flight(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: a request is still waiting for its reply\n"
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+
+        if let Err(e) = pm::dart_prepare(&self.dev) {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: its DART could not be saved ({:?})\n",
+                e
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+
+        self.sleep_at_suspend.store(true, Relaxed);
+        match self.sleep_request() {
+            Ok(()) => {
+                if let Some(mbox) = self.mbox.lock().as_ref() {
+                    mbox.set_recv_enabled(false);
+                }
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Told);
+                dev_dbg!(self.dev, "the enclave answered the sleep request\n");
+                Ok(())
+            }
+            Err(e) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "sleep refused: no answer to the sleep request ({:?})\n",
+                    e
+                );
+                self.sleep_unanswered.store(true, Relaxed);
+                // A request that timed out may still have been taken.
+                self.set_sleep_gate(pm::SleepGate::Told);
+                self.sleep_exit();
+                Err(e)
+            }
+        }
+    }
+
+    /// Asks the enclave to go to sleep (told at suspend). The request is sent past the gate.
+    fn sleep_request(&self) -> Result<()> {
+        let op = proto::op_sleep();
+        let tag = proto::TAG_SLEEP;
+        let idx = self.control.lock().alloc_sleep()?;
+        let msg = proto::encode_control(&op, tag);
+
+        let sent = match self.mbox.lock().as_ref() {
+            Some(mbox) => Self::ring(mbox, msg),
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sent {
+            self.control.lock().abandon(idx);
+            return Err(e);
+        }
+        match self.control_wait(&op, idx, tag)? {
+            Some(_) => Ok(()),
+            None => Err(ETIMEDOUT),
+        }
+    }
+
+    /// The wake of an enclave told at suspend: a real wake starts it, a refused sleep finds
+    /// it gated (it stays asleep until the next real sleep) or asks whether it still answers.
+    fn sleep_exit_at_suspend(&self) -> bool {
+        let gate = self.sleep_gate();
+        if gate == pm::SleepGate::Draining {
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return false;
+        }
+        if !gate.needs_wake() {
+            return false;
+        }
+        // SAFETY: only reads a flag.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
+        if !real && gate == pm::SleepGate::Lost {
+            return false;
+        }
+        let answered = if real {
+            self.sleep_kick()
+        } else if pm::wait_gated(&self.dev) {
+            self.sleep_hold_rx();
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            dev_warn_ratelimited!(
+                self.dev,
+                "the enclave stays asleep until the next real sleep or a reboot\n"
+            );
+            return false;
+        } else {
+            dev_warn_ratelimited!(self.dev, "the enclave never gated its power domain\n");
+            self.sleep_probe()
+        };
+        match answered {
+            Ok(()) => {
+                self.sleep_at_suspend.store(false, Relaxed);
+                self.set_sleep_gate(pm::SleepGate::Open);
+                // One line per sleep it was told of: nothing else says it came back.
+                dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
+                true
+            }
+            Err(e) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused\n",
+                    e
+                );
+                self.sleep_unanswered.store(true, Relaxed);
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+                false
+            }
+        }
+    }
+
+    /// Whether an enclave that was told and never gated still answers.
+    fn sleep_probe(&self) -> Result<()> {
+        pm::dart_restore(&self.dev);
+        self.sleep_release_rx();
+        let op = proto::op_nop(0);
+        let (idx, tag) = self.control.lock().alloc()?;
+        let msg = proto::encode_control(&op, tag);
+        let sent = match self.mbox.lock().as_ref() {
+            Some(mbox) => {
+                mbox.set_recv_enabled(true);
+                Self::ring(mbox, msg)
+            }
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sent {
+            self.control.lock().abandon(idx);
+            return Err(e);
+        }
+        match self.control_wait(&op, idx, tag)? {
+            Some(_) => Ok(()),
+            None => Err(ETIMEDOUT),
+        }
+    }
+
     /// Stage without sending; the platform's commit owns SLEEP with IRQs off.
     fn sleep_leave_for_commit(&self) -> Result<()> {
         let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
@@ -1602,6 +1841,20 @@ impl SepData {
         self.sleep_hold_rx();
         dev_dbg!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
         Ok(())
+    }
+
+    /// Whether the enclave takes messages: its receive FIFO drains within `MAILBOX_DRAIN_MS`. A
+    /// FIFO that stays full means it stopped reading, and a sleep request would only time out.
+    fn mailbox_drains(&self) -> bool {
+        for _ in 0..MAILBOX_DRAIN_MS / 5 {
+            match self.mbox.lock().as_ref() {
+                Some(mbox) if mbox.send_ready() => return true,
+                Some(_) => {}
+                None => return false,
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(5));
+        }
+        false
     }
 
     /// Holds off the receive interrupt, whose handler reads the mailbox.
@@ -1625,6 +1878,9 @@ impl SepData {
     /// A sent request can be restarted only after actual physical sleep/wake.
     /// Returns whether the enclave came back from a sleep it was told of.
     pub(crate) fn sleep_exit(&self) -> bool {
+        if self.sleep_at_suspend.load(Relaxed) {
+            return self.sleep_exit_at_suspend();
+        }
         // Staged only: an unsent refusal releases RX without a restart.
         match pm::commit_finish(&self.dev) {
             Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
@@ -3139,6 +3395,8 @@ impl SepData {
 
             stac::EP_STAC => self.on_stac(msg),
 
+            hdcp::EP_HDCP => self.on_hdcp(msg),
+
             pnon::EP_PNON => self.on_pnon(msg),
 
             sse::EP_SSE => self.on_sse(msg),
@@ -3193,6 +3451,7 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
+                self.hdcp_discovered(&f);
                 self.pnon_discovered(&f);
                 self.sse_discovered(&f);
                 self.hibe_discovered(&f);
@@ -3231,12 +3490,14 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        self.hdcp_wq.notify_all();
         pm::unregister();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
         trusted::unregister();
         self.unregister_fv_kernel();
+        self.unregister_hdcp_kernel();
 
         let dev = self.bio_dev.lock().take();
         drop(dev);
@@ -3288,6 +3549,7 @@ impl SepData {
             &self.ool_sks,
             &self.ool_scrd,
             &self.ool_stac,
+            &self.ool_hdcp,
             &self.ool_pnon,
         ] {
             if let Some(buffers) = slot.lock().take() {
@@ -3599,6 +3861,12 @@ impl platform::Driver for SepDriver {
             if let Err(e) = data.register_fv_kernel() {
                 dev_err_ratelimited!(dev, "could not register the FileVault kernel API: {:?}\n", e);
             }
+        }
+
+        // The display driver's HDCP 2.2 transmitter service. Nothing is sent
+        // to the endpoint until the display driver starts a session.
+        if let Err(e) = data.register_hdcp_kernel() {
+            dev_warn_ratelimited!(dev, "hdcp: could not register the kernel API: {:?}\n", e);
         }
 
         if module_parameters::trusted_keys.value() != 0 {

@@ -68,7 +68,6 @@
 #define APPLE_T8140_GFX1_IOP_VBAR_BASE 0x482850000ULL
 #define APPLE_T6040_GFX_WRAPPER_BASE 0x28a600000ULL
 #define APPLE_T6040_GFX_IOP_VBAR_BASE 0x28a050000ULL
-#define APPLE_T6050_ASCWRAP_BASE_DELTA 0x380000000ULL
 /* T8142 (M5) moves T8140's 0x4... GPU ASC bank to 0x5.... */
 #define APPLE_T8142_ASCWRAP_BASE_DELTA 0x100000000ULL
 
@@ -1361,14 +1360,14 @@ static void apple_mbox_quiesce(void *data)
 	pm_runtime_barrier(mbox->dev);
 }
 
-struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+struct apple_mbox *apple_mbox_get_prop(struct device *dev, const char *prop, int index)
 {
 	struct of_phandle_args args;
 	struct platform_device *pdev;
 	struct apple_mbox *mbox;
 	int ret;
 
-	ret = of_parse_phandle_with_args(dev->of_node, "mboxes", "#mbox-cells",
+	ret = of_parse_phandle_with_args(dev->of_node, prop, "#mbox-cells",
 					 index, &args);
 	if (ret || !args.np)
 		return ERR_PTR(ret);
@@ -1394,6 +1393,12 @@ out_put_pdev:
 	put_device(&pdev->dev);
 
 	return mbox;
+}
+EXPORT_SYMBOL(apple_mbox_get_prop);
+
+struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+{
+	return apple_mbox_get_prop(dev, "mboxes", index);
 }
 EXPORT_SYMBOL(apple_mbox_get);
 
@@ -1904,41 +1909,15 @@ static const struct apple_mbox_hw apple_mbox_t8152_gfx_ascwrap_v8_hw = {
 
 static_assert(0x20 + sizeof(u32) <= APPLE_ASCWRAP_V8_MBOX_SIZE);
 
-/* Retained T6050 wrapper/VBAR alias profile. */
-static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_ascwrap_v6_roles[] = {
-	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
-	  APPLE_T8140_GFX_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
-	  APPLE_T8140_GFX_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
-	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
-	  APPLE_T8140_GFX1_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
-	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
-};
-
 /*
  * T6050 at its physical addresses, with both roles in the GPU aperture at
- * 0x2300000000 on die 0. The other T6050 profiles retain their alias windows.
+ * 0x2300000000 on die 0.
  */
 static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_j775d_ascwrap_v6_roles[] = {
 	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
 	  APPLE_J775D_GFX_WRAPPER_BASE, APPLE_J775D_GFX_IOP_VBAR_BASE },
 	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
 	  APPLE_J775D_GFX1_WRAPPER_BASE, APPLE_J775D_GFX1_IOP_VBAR_BASE },
-};
-
-static const struct apple_mbox_hw apple_mbox_t6050_ascwrap_v6_hw = {
-	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
-	.is_ascwrap_v6 = true,
-	.ascwrap_v6_roles = apple_mbox_t6050_ascwrap_v6_roles,
-	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t6050_ascwrap_v6_roles),
-	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
-	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
-	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
-	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
-	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
-	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
-	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
-	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
-	.has_irq_controls = false,
 };
 
 static const struct apple_mbox_hw apple_mbox_t6050_j775d_ascwrap_v6_hw = {
@@ -1984,8 +1963,6 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t6040-ascwrap-v6", .data = &apple_mbox_t6040_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_t8140_ascwrap_v6_hw },
 	{ .compatible = "apple,t8142-ascwrap-v6", .data = &apple_mbox_t8142_ascwrap_v6_hw },
-	{ .compatible = "apple,t6050-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
-	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-j775d-ascwrap-v6",
 	  .data = &apple_mbox_t6050_j775d_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },

@@ -401,3 +401,7 @@ MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC input driver");
 MODULE_ALIAS("platform:macsmc-input");
+
+#if IS_ENABLED(CONFIG_INPUT_MACSMC_INPUT_KUNIT_TEST)
+#include "macsmc-input-test.c"
+#endif
