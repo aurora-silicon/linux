@@ -386,6 +386,7 @@ static void t6030_late_map(struct apple_sleep *s);
 static bool t6030_last_writes_on(void);
 static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *seq);
 static void t6030_last_pmu_boot(struct apple_sleep *s);
+static void t6030_spmi1_probe(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -464,6 +465,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
 		t6030_last_pmu_boot(s);
+	t6030_spmi1_probe(s);
 
 	return apple_sleep_read_wake_sources(s);
 }
@@ -602,51 +604,154 @@ static void t6030_sleep_check_stops(void)
 #define T6030_SPMI_ACK(n)		(0x60 + 4 * (n))
 #define T6030_SPMI_POLL_US		1000
 
-static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 address,
-			  const u8 *wr, u8 *rd, unsigned int len)
+static int t6030_spmi_xfer(void __iomem *spmi, u8 usid, u32 mask, u8 opcode, u16 address,
+			   const u8 *wr, u8 *rd, unsigned int len)
 {
-	u8 command = opcode | (len - 1), usid = s->soc->pmu_usid;
+	u8 command = opcode | (len - 1);
 	unsigned int i, n;
 	u32 value, data;
 	int ret = 0;
 
 	if (!len || len > 8 || !!wr == !!rd)
 		return -EINVAL;
-	readl(s->spmi + SPMI_STATUS);
-	writel(mask, s->spmi + SPMI_NOTIFY_ENABLE);
+	readl(spmi + SPMI_STATUS);
+	writel(mask, spmi + SPMI_NOTIFY_ENABLE);
 	writel((u32)address << 16 | SPMI_CMD_ACTIVE | (u32)usid << 8 | command,
-	       s->spmi + SPMI_CMD);
+	       spmi + SPMI_CMD);
 	for (i = 0; wr && i < len; i += 4) {
 		data = 0;
 		for (n = 0; n < min(4U, len - i); n++)
 			data |= (u32)wr[i + n] << (8 * n);
-		writel(data, s->spmi + SPMI_CMD);
+		writel(data, spmi + SPMI_CMD);
 	}
-	if (!readl_poll_timeout_atomic(s->spmi + SPMI_NOTIFY_ACK, value,
+	if (!readl_poll_timeout_atomic(spmi + SPMI_NOTIFY_ACK, value,
 				       value & T6030_SPMI_DONE, 1, T6030_SPMI_POLL_US))
-		writel(T6030_SPMI_DONE, s->spmi + SPMI_NOTIFY_ACK);
-	if (readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, value,
+		writel(T6030_SPMI_DONE, spmi + SPMI_NOTIFY_ACK);
+	if (readl_poll_timeout_atomic(spmi + SPMI_STATUS, value,
 				      !(value & T6030_SPMI_RX_EMPTY), 1, T6030_SPMI_POLL_US))
 		return -ETIMEDOUT;
-	value = readl(s->spmi + SPMI_REPLY);
+	value = readl(spmi + SPMI_REPLY);
 	if ((value & 0xff) != command || ((value >> 8) & 0x7f) != usid ||
 	    (wr && !(value & SPMI_CMD_ACTIVE)))
 		ret = -EIO;
 	for (i = 0; !ret && rd && i < len; i += 4) {
-		if (readl(s->spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY) {
+		if (readl(spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY) {
 			ret = -EIO;
 			break;
 		}
-		data = readl(s->spmi + SPMI_REPLY);
+		data = readl(spmi + SPMI_REPLY);
 		for (n = 0; n < min(4U, len - i); n++)
 			rd[i + n] = data >> (8 * n);
 	}
 	/* Nothing left behind for the SPMI driver: the FIFO read empty, at most its 16 entries */
-	for (i = 0; i < SPMI_DRAIN_MAX && !(readl(s->spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY);
+	for (i = 0; i < SPMI_DRAIN_MAX && !(readl(spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY);
 	     i++)
-		readl(s->spmi + SPMI_REPLY);
+		readl(spmi + SPMI_REPLY);
 	return ret;
 }
+
+static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 address,
+			  const u8 *wr, u8 *rd, unsigned int len)
+{
+	return t6030_spmi_xfer(s->spmi, s->soc->pmu_usid, mask, opcode, address, wr, rd, len);
+}
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the second Chapel PMU (ADT spmi-chapelF1, SID 0xb on
+ * nub-spmi1, with its own RTC block and off2wake latch), which the DT leaves disabled and no
+ * driver touches. apple_sleep.spmi1=1 maps nub-spmi1 at probe, once its always-on power word
+ * reads on, and logs one line of that PMU's RTC words, its 0xf800 block and 0x281c; writing
+ * spmi1_dump logs another, and the observer's obs_timeline=4 samples it. Read commands only:
+ * the controller's notify mask is put back as found after each. Boot parameter, off by default.
+ */
+#define T6030_SPMI1_BASE		0x364794000ULL
+#define T6030_SPMI1_SIZE		0x100
+#define T6030_AON_NUB_SPMI1		0x60
+#define T6030_PMU2_USID			0xb
+#define T6030_PMU_OFF2WAKE		0x281c
+#define T6030_PS_ACTIVE			0xf
+
+static bool t6030_spmi1;
+module_param_named(spmi1, t6030_spmi1, bool, 0444);
+MODULE_PARM_DESC(spmi1, "T6030 DIAGNOSTIC: read the second PMU on nub-spmi1 (probe line, spmi1_dump, obs_timeline=4)");
+
+static void __iomem *t6030_spmi1_base;
+
+static int t6030_pmu2_read(u16 reg, u8 *buf, unsigned int len)
+{
+	void __iomem *spmi = t6030_spmi1_base;
+	unsigned int done, n;
+	u32 runtime;
+	int ret = 0;
+
+	if (!spmi)
+		return -ENODEV;
+	runtime = readl(spmi + SPMI_NOTIFY_ENABLE);
+	for (done = 0; !ret && done < len; done += n) {
+		n = min(len - done, 8U);
+		ret = t6030_spmi_xfer(spmi, T6030_PMU2_USID, runtime & ~T6030_SPMI_DONE,
+				      T6050_SPMI_EXT_READL, reg + done, NULL, buf + done, n);
+	}
+	writel(runtime, spmi + SPMI_NOTIFY_ENABLE);
+	return ret;
+}
+
+static void t6030_pmu2_report(struct apple_sleep *s, const char *when)
+{
+	u8 ctl = 0, mask = 0, wake = 0, ticks[6] = {}, compare[4] = {}, stage[32] = {};
+	int ret;
+
+	ret = t6030_pmu2_read(T6050_RTC_CTL, &ctl, 1) ?:
+	      t6030_pmu2_read(T6050_RTC_COUNTER, ticks, 6) ?:
+	      t6030_pmu2_read(T6050_RTC_COMPARE, compare, 4) ?:
+	      t6030_pmu2_read(T6050_RTC_MASK, &mask, 1) ?:
+	      t6030_pmu2_read(T6030_PMU_OFF2WAKE, &wake, 1) ?:
+	      t6030_pmu2_read(0xf800, stage, sizeof(stage));
+	if (ret) {
+		dev_info(s->dev, "spmi1 PMU at %s: read failed (%d)\n", when, ret);
+		return;
+	}
+	dev_info(s->dev, "spmi1 PMU at %s: ctl %#04x counter %u s compare %u s mask %#x 0x281c %#04x | f800: %*ph\n",
+		 when, ctl, get_unaligned_le32(ticks + 2), get_unaligned_le32(compare), mask, wake,
+		 (int)sizeof(stage), stage);
+}
+
+static void t6030_spmi1_probe(struct apple_sleep *s)
+{
+	u32 ps;
+
+	if (!READ_ONCE(t6030_spmi1) || t6030_spmi1_base)
+		return;
+	ps = readl(s->ps_aon + T6030_AON_NUB_SPMI1);
+	if (FIELD_GET(PS_ACTUAL, ps) != T6030_PS_ACTIVE) {
+		dev_info(s->dev, "spmi1 PMU: nub-spmi1's power word reads %#x, not mapped\n", ps);
+		return;
+	}
+	t6030_spmi1_base = devm_ioremap(s->dev, T6030_SPMI1_BASE, T6030_SPMI1_SIZE);
+	if (!t6030_spmi1_base)
+		return;
+	dev_info(s->dev, "spmi1: power %#x, status %#x, mask0 %#x ack0 %#x, notify %#x\n", ps,
+		 readl(t6030_spmi1_base + SPMI_STATUS), readl(t6030_spmi1_base + T6030_SPMI_MASK(0)),
+		 readl(t6030_spmi1_base + T6030_SPMI_ACK(0)),
+		 readl(t6030_spmi1_base + SPMI_NOTIFY_ENABLE));
+	t6030_pmu2_report(s, "probe");
+}
+
+static int t6030_spmi1_dump_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !t6030_spmi1_base)
+		return -ENODEV;
+	t6030_pmu2_report(s, "dump");
+	return 0;
+}
+
+static const struct kernel_param_ops t6030_spmi1_dump_ops = {
+	.set = t6030_spmi1_dump_set,
+};
+module_param_cb(spmi1_dump, &t6030_spmi1_dump_ops, NULL, 0200);
+MODULE_PARM_DESC(spmi1_dump, "T6030 DIAGNOSTIC: with spmi1, log the second PMU's words now");
 
 /*
  * DIAGNOSTIC (T6030 sleep bring-up): the last-second differences lane A's 0x1000 stops of macOS
@@ -2724,6 +2829,9 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *  3: as 1 for +0 (the alarm event), +1 (a wake status word nonzero) and +4 (nub-spmi0 +0x60
  *     nonzero); +2 and +3 the first nonzero status word at +1's sample: +2 its index (bits 7:5)
  *     and lowest set bit (4:0), +3 its set bits, at most 6 (7:5), and highest set bit (4:0).
+ *  4: with apple_sleep.spmi1, the second PMU's latest values (one SPMI read set on nub-spmi1 a
+ *     sample): +0 its alarm control (0xff: unread), +1 its 0xf801, +2 its 0x281c, +3 its compare
+ *     minus its counter in seconds (signed, clamped), +4 the main PMU's alarm control.
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -2751,7 +2859,7 @@ static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode >= 1 && mode <= 3;
+	return mode >= 1 && mode <= 4;
 }
 
 struct t6030_obs {
@@ -2760,7 +2868,25 @@ struct t6030_obs {
 	u32 pcpu, cluster[2], commit, cllt;
 	u8 ctl;
 	bool ctl_read;
+	/* obs_timeline=4: the second PMU */
+	u8 p2_ctl, p2_stage, p2_wake;
+	s8 p2_left;
+	bool p2_read;
 };
+
+static void t6030_obs_read_pmu2(struct t6030_obs *o)
+{
+	u8 ticks[6] = {}, compare[4] = {};
+	s64 left;
+
+	o->p2_read = !t6030_pmu2_read(T6050_RTC_CTL, &o->p2_ctl, 1) &&
+		     !t6030_pmu2_read(0xf801, &o->p2_stage, 1) &&
+		     !t6030_pmu2_read(T6030_PMU_OFF2WAKE, &o->p2_wake, 1) &&
+		     !t6030_pmu2_read(T6050_RTC_COUNTER, ticks, 6) &&
+		     !t6030_pmu2_read(T6050_RTC_COMPARE, compare, 4);
+	left = (s64)get_unaligned_le32(compare) - get_unaligned_le32(ticks + 2);
+	o->p2_left = clamp_t(s64, left, S8_MIN, S8_MAX);
+}
 
 static void t6030_obs_read(struct apple_sleep *s, struct t6030_obs *o)
 {
@@ -2798,9 +2924,18 @@ static void t6030_obs_mark(struct apple_sleep *s, u8 *at, unsigned int off, bool
 	sleep_note_at(s, off, at[off]);
 }
 
-static void t6030_obs_values(const struct t6030_obs *o, u8 *v)
+static void t6030_obs_values(const struct t6030_obs *o, u8 *v, bool pmu2)
 {
 	int i;
+
+	if (pmu2) {
+		v[0] = o->p2_read ? o->p2_ctl : T6030_OBS_CTL_UNREAD;
+		v[1] = o->p2_read ? o->p2_stage : T6030_OBS_CTL_UNREAD;
+		v[2] = o->p2_read ? o->p2_wake : T6030_OBS_CTL_UNREAD;
+		v[3] = o->p2_read ? (u8)o->p2_left : T6030_OBS_CTL_UNREAD;
+		v[4] = o->ctl_read ? o->ctl : T6030_OBS_CTL_UNREAD;
+		return;
+	}
 
 	v[0] = o->ctl_read ? o->ctl : T6030_OBS_CTL_UNREAD;
 	v[1] = 0;
@@ -2820,7 +2955,8 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i, w;
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 	unsigned int scale = DIV_ROUND_UP(n, T6030_OBS_LAST + 1);
-	bool values = mode == 2, word = mode == 3, off_seen = false, hit, moved;
+	bool pmu2 = mode == 4, values = mode == 2 || pmu2, word = mode == 3;
+	bool off_seen = false, hit, moved;
 	struct t6030_obs o, ref = {};
 	u8 at[5], v[5], last[5] = {};
 
@@ -2831,10 +2967,12 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 		while (read_sysreg(cntpct_el0) - t0 < k * period)
 			cpu_relax();
 		t6030_obs_read(s, &o);
+		if (pmu2)
+			t6030_obs_read_pmu2(&o);
 		if (k == T6030_OBS_SETTLE)
 			ref = o;
 		if (values) {
-			t6030_obs_values(&o, v);
+			t6030_obs_values(&o, v, pmu2);
 			for (i = 0; i < ARRAY_SIZE(v); i++) {
 				if (k && v[i] == last[i])
 					continue;
