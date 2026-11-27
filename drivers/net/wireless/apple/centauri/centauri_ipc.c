@@ -134,6 +134,56 @@ static const struct file_operations firmware_crash_fops = {
 	.llseek = default_llseek,
 };
 
+/*
+ * A restart frees the secondary memory and with it the crash region of the
+ * firmware that stopped. Keep a copy, read through "firmware_crash_saved".
+ * Called with boot_lock held, before the restart frees anything.
+ */
+void centauri_save_crash(struct centauri *c)
+{
+	struct cen_buffer *secondary;
+	u32 offset, length;
+	void *copy;
+
+	lockdep_assert_held(&c->boot_lock);
+	if (!c->ipc || !c->ipc->secondary)
+		return;
+	secondary = c->ipc->secondary;
+	if (ftab_entry(secondary->cpu, secondary->size, "cras", &offset, &length, false))
+		return;
+	copy = kvmalloc(length, GFP_KERNEL);
+	if (!copy)
+		return;
+	dma_rmb();
+	memcpy(copy, secondary->cpu + offset, length);
+	kvfree(c->crash_saved);
+	c->crash_saved = copy;
+	c->crash_saved_len = length;
+	dev_info(&c->pdev->dev, "recovery: kept the firmware crash region (%u bytes%s)\n",
+		 length, memchr_inv(copy, 0, length) ? "" : ", all zero");
+}
+
+static ssize_t firmware_crash_saved_read(struct file *file, char __user *buffer,
+					 size_t count, loff_t *pos)
+{
+	struct centauri *c = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&c->boot_lock);
+	ret = c->crash_saved ?
+	      simple_read_from_buffer(buffer, count, pos, c->crash_saved,
+				      c->crash_saved_len) : -ENODATA;
+	mutex_unlock(&c->boot_lock);
+	return ret;
+}
+
+static const struct file_operations firmware_crash_saved_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = firmware_crash_saved_read,
+	.llseek = default_llseek,
+};
+
 static int secondary_init(struct centauri *c)
 {
 	u32 offset, length, count, i, required;
@@ -174,6 +224,10 @@ static int secondary_init(struct centauri *c)
 	if (!c->crash_file)
 		c->crash_file = debugfs_create_file("firmware_crash", 0400, c->debug, c,
 						    &firmware_crash_fops);
+	if (!c->crash_saved_file)
+		c->crash_saved_file = debugfs_create_file("firmware_crash_saved", 0400,
+							  c->debug, c,
+							  &firmware_crash_saved_fops);
 	return 0;
 }
 

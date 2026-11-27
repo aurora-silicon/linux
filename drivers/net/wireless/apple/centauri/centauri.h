@@ -24,7 +24,10 @@ struct centauri {
 	void __iomem *bar;
 	resource_size_t size;
 	u32 stage_offset;
-	struct dentry *debug, *crash_file;
+	struct dentry *debug, *crash_file, *crash_saved_file;
+	/* The crash region as a restart found it, kept for debugfs */
+	void *crash_saved;
+	u32 crash_saved_len;
 	struct mutex boot_lock;
 	void *firmware, *descriptor, *msi_page;
 	dma_addr_t firmware_dma, descriptor_dma, msi_dma;
@@ -96,6 +99,7 @@ static inline const struct centauri_board *centauri_board(void)
 int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret);
 bool centauri_warm_reset_described(struct pci_dev *pdev);
 int centauri_start_ipc(struct centauri *c);
+void centauri_save_crash(struct centauri *c);
 bool centauri_beta_running(struct centauri *c);
 void centauri_free_ipc(struct centauri *c);
 int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *resources);

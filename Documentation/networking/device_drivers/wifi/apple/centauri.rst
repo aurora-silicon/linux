@@ -92,7 +92,9 @@ Both Wi-Fi backends implement ``cfg80211`` station-mode interfaces with:
   ``dev_consume_skb_any()``, decodes both single and coalesced TX
   completions, and exports throughput/backpressure counters via debugfs
   ``data_stats``. Control backends support warm-reset recovery on
-  persistent transport faults.
+  persistent transport faults. A restart first copies the crash region
+  the firmware reserves in its secondary memory, which it then frees, to
+  debugfs ``firmware_crash_saved``.
 
 Bluetooth Capabilities
 ======================
