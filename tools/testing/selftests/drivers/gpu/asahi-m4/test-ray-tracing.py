@@ -312,7 +312,7 @@ fn render_refs() -> (encode::RenderRefs, encode::PassRefs, uapi::drm_asahi_cmd_r
         notifier: f + 0x800000, qinfo: [f + 0xf00000, f + 0x1000000], user_stamp: [f + 0x800620, f + 0x800630],
         fw_stamp: [f + 0x4000000, f + 0x4004000], uma_mgr: [f + 0x300000; 2], uma_aux: [f + 0x300100, f + 0x300200],
         uma_gpu: g + 0x6000000, pb_mgr: f + 0x3000000, scene_list: g + 0x500000, parameter_id: 1, generation: 1,
-        activity: [f + 0x900004, f + 0xa00008], counter: [2, 1], uma_submitted: 2, uuid: 0x123400, usc_base: 1 << 40,
+        activity: [f + 0x900004, f + 0xa00008], counter: [2, 1], uma_submitted: 2, uuid: 0x123400, usc_base: 1 << 40, event: [0x70, 0x71],
         ..Default::default()
     };
     let p = encode::PassRefs {

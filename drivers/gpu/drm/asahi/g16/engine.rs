@@ -2477,6 +2477,7 @@ impl Firmware {
                 uma_submitted: a.uma_submitted,
                 uuid: (draw as u32).wrapping_add(1),
                 usc_base: job.queue.usc_base,
+                event: work::render_pair::events(0),
             },
             a.init_buffer,
             epoch,
@@ -2521,6 +2522,7 @@ impl Firmware {
             uma_submitted,
             uuid: (draw as u32).wrapping_add(1),
             usc_base: job.queue.usc_base,
+            event: work::render_pair::events(0),
         })
     }
 
