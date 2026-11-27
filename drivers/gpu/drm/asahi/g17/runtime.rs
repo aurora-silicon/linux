@@ -1575,8 +1575,7 @@ impl Backend {
         loop {
             admission.check()?;
             let lease = self.shared.preparations.enter_until(admission)?;
-            let dev = self.shared.drm()?;
-            let uat = {
+            {
                 let mut state = self.shared.state.lock();
                 loop {
                     admission.check()?;
@@ -1596,18 +1595,14 @@ impl Backend {
                     }
                     if !firmware.queues.compute_building {
                         firmware.queues.compute_building = true;
-                        break firmware.uat.clone();
+                        break;
                     }
                     let _ = self.shared.changed.wait_timeout(
                         &mut state, kernel::time::msecs_to_jiffies(admission.slice_ms()?)
                     );
                 }
-            };
-            let alloc = super::object::Allocator {
-                dev: &dev,
-                uat: &uat,
-            };
-            let mut built = Some(super::initdata::ComputeShared::new(&alloc));
+            }
+            let mut built = Some(super::initdata::ComputeShared::new());
             let result = {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;

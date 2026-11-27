@@ -120,21 +120,22 @@ impl Graph {
         qids: [u8; 2],
         pointers: fw::variant::PointerLayout,
     ) -> Result<Self> {
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        // The kernel's mappings of a pair's command storage and queue records sit in the upper
+        // half, which every execution context includes: only the firmware reaches them there.
+        // The GPU reads command storage only through the read-only aliases below.
+        let prot = mmu::PROT_FW_SHARED_RW;
         let m5 = alloc.uat.is_m5();
         // M5 selects cached firmware attributes at initial mapping creation;
         // write-combined CPU stores also support the uncached capacity fallback.
         let cpu = if m5 { CpuMap::WriteCombined } else { CpuMap::WriteBack };
         let bytes = if m5 { RECORDS * fw::m5::render_assembly::COMMAND_STORAGE_BYTES }
             else { TA_BYTES + FRAGMENT_BYTES };
-        // The GPU reads command storage only through the read-only aliases below. On M5 the
-        // kernel mapping, in the upper half every execution context includes, is firmware-only.
         let descriptors = pool.allocate(
             alloc,
             Family::Descriptor,
             bytes,
             bytes,
-            if m5 { mmu::PROT_FW_SHARED_RW } else { prot },
+            prot,
             cpu,
         )?;
         let ta = Aliases::new(&descriptors, alloc, context.vm(),

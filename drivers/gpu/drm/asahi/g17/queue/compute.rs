@@ -111,8 +111,8 @@ impl DescriptorRing {
     /// at `+0xfac`, and the host rewrites each slot every 32 kicks, so a
     /// firmware-cached mapping carries the same dirty-line writeback hazard.
     /// The hardware reads the same pages through an uncached canonical low
-    /// alias; on M5 the kernel mapping, in the upper half every execution
-    /// context includes, is firmware-only.
+    /// alias; the kernel mapping, in the upper half every execution context
+    /// includes, is firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
@@ -120,7 +120,7 @@ impl DescriptorRing {
             Family::Descriptor,
             size,
             0,
-            if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let low = object.alias_in(
@@ -177,15 +177,20 @@ impl Graph {
         mcache: bool,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        // The kernel's mappings of the queue's records sit in the upper half, which every
+        // execution context includes: only the firmware reaches them there. The GPU reaches the
+        // preemption buffer and usage page through the aliases a binding maps into its VM.
+        let prot = mmu::PROT_FW_SHARED_RW;
+        // The kernel lower VM is context 0's alone.
+        let lower = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
         let ring = DescriptorRing::new(alloc, objects)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
-        let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
-        // The M5 support page is firmware-only; the GPU has no access to it.
-        let support_prot = if m5 { mmu::PROT_FW_SHARED_RW } else { prot };
-        let mut support = alloc.kernel(if m5 { mmu::UAT_PGSZ } else { 0xc000 }, page, support_prot, cpu)?;
+        let operand = alloc.lower(operand_state.size, page, lower, cpu)?;
+        // The support page holds the completion stamp the host retires commands on: it is
+        // firmware-only, as the queue's records are.
+        let mut support = alloc.kernel(if m5 { mmu::UAT_PGSZ } else { 0xc000 }, page, prot, cpu)?;
         if !m5 {
             let support_va = support.gpu_va();
             support.write(0, support_va + page)?;
@@ -227,12 +232,13 @@ impl Graph {
             graph.write(0, QueueRecord::new(&record))?;
         }
         let (context_low, context_high) = if m5 { (None, None) } else {
-            (Some(alloc.lower(CONTEXT_SIZE, page, prot, cpu)?),
+            (Some(alloc.lower(CONTEXT_SIZE, page, lower, cpu)?),
              Some(alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?))
         };
         let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
         let m5_timestamps = if m5 {
-            Some(Arc::new(alloc.kernel(RECORD_SLOTS * 16, page, prot, cpu)?, GFP_KERNEL)?)
+            Some(Arc::new(alloc.kernel(RECORD_SLOTS * 16, page, mmu::PROT_GPU_FW_SHARED_RW, cpu)?,
+                GFP_KERNEL)?)
         } else { None };
         let cached_records = objects.allocate(
             alloc,

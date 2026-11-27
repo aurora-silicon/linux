@@ -62,7 +62,7 @@ struct Backend{shared:Shared,context:Context}
 struct Allocator<'a>{dev:&'a (),uat:&'a ()}
 struct ComputeShared;struct ComputeScheduler;
 fn allocate(){if ALLOCATE.load(Ordering::SeqCst){NOW.fetch_add(25_000_000,Ordering::SeqCst);}}
-impl ComputeShared{fn new(_:&Allocator<'_>)->Result<Self>{allocate();Ok(Self)}}
+impl ComputeShared{fn new()->Result<Self>{allocate();Ok(Self)}}
 impl ComputeScheduler{fn new(_:&Allocator<'_>)->Result<Self>{allocate();Ok(Self)}}
 struct Init{shared:bool,scheduler:bool}
 impl Init{
