@@ -67,7 +67,7 @@ static bool of_machine_is_compatible(const char *compatible)
 	assert(!strcmp(compatible, "apple,t6030"));
 	return t6030;
 }
-/* Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext"). */
+/* Production: an M4-adopted apple,t8132-dcpext (dcp_t8132_ext_m4_node()). */
 static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 {
 	return t8132_ext;

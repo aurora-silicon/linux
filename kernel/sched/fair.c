@@ -9996,6 +9996,43 @@ static bool wake_short_local(struct task_struct *p, int cpu)
 }
 
 /*
+ * Returns an idle CPU sharing the last-level cache with @cpu, the CPU creating
+ * the thread @p, or -1.
+ *
+ * Fork balancing otherwise starts @p in the idlest group of the widest domain,
+ * which on a system of several clusters is usually another cluster: the
+ * thread then starts on a core of a cold, often clocked-down cluster, misses
+ * in a cache that does not hold its parent's data, and the wake-ups between
+ * it and its parent cross clusters. A thread that runs for long is spread by
+ * load balancing anyway; most short-lived threads are done before then.
+ *
+ * A new process gets the same start: most new processes exec at once, and
+ * exec balancing still places the program they run in the idlest group;
+ * until then the child shares its parent's pages and cache.
+ */
+static int fork_local_idle_cpu(struct sched_domain *sd,
+			       struct task_struct *p, int cpu)
+{
+	struct sched_domain *llc_sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
+	int i;
+
+	if (!llc_sd || !(llc_sd->flags & SD_BALANCE_FORK))
+		return -1;
+	for_each_cpu(i, sched_domain_span(llc_sd)) {
+		if (i == cpu || !cpumask_test_cpu(i, sched_domain_span(sd)) ||
+		    !cpumask_test_cpu(i, p->cpus_ptr))
+			continue;
+		if (!sched_core_cookie_match(cpu_rq(i), p))
+			continue;
+		if (sched_asym_cpucap_active() && !task_fits_cpu(p, i))
+			continue;
+		if (choose_idle_cpu(i, p))
+			return i;
+	}
+	return -1;
+}
+
+/*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
@@ -10068,8 +10105,15 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	}
 
 	/* Slow path */
-	if (unlikely(sd))
+	if (unlikely(sd)) {
+		if (sched_feat(FORK_LOCAL) && (wake_flags & WF_FORK) && p->mm) {
+			int i = fork_local_idle_cpu(sd, p, cpu);
+
+			if (i >= 0)
+				return i;
+		}
 		return sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
+	}
 
 	/* Fast path */
 	if (wake_flags & WF_TTWU)
