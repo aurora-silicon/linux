@@ -239,6 +239,16 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk);
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
 
 /*
+ * As apple_rtkit_reinit(), for a co-processor that was idled, not shut down,
+ * and so may keep its state across the reset: the shared buffers stay
+ * allocated and, through the client's shmem_setup, admitted. A firmware that
+ * asks for a buffer again is given the one it had; one that does not keeps
+ * using it, and its syslog is still served. A later apple_rtkit_reinit() or
+ * apple_rtkit_free() releases them.
+ */
+int apple_rtkit_reinit_retaining_buffers(struct apple_rtkit *rtk);
+
+/*
  * Set how long each handshake step (power state and endpoint map replies)
  * waits for the co-processor, for one that is known to answer slowly. Call
  * before apple_rtkit_boot() or apple_rtkit_wake(). Zero restores the default
