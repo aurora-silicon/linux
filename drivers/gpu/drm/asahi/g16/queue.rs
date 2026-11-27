@@ -288,6 +288,7 @@ impl Queue {
                 usc_base: self.state.usc_base,
                 active_cores: self.active_cores,
                 render_scs: self.render_scs,
+                max_tile_buffer: self.cfg.max_tile_buffer,
             },
             &mut self.proof,
         )?;
@@ -390,7 +391,7 @@ impl crate::queue::Queue for Queue {
         &mut self,
         _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,

@@ -793,7 +793,6 @@
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcp_dart 5 0x8 0x00000000 0x7 0xffff0000>;
-			apple,hdcp-channels = <5 6>;
 
 			/* the ADT has 2 additional regs which seems to be unused */
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
@@ -1525,12 +1524,18 @@
 			};
 		};
 
+		/* ADT /arm-io/nub-spmi1: the auxiliary PMU (pmu-aux) at USID 0xe. */
 		nub_spmi1: spmi@23d794000 {
 			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
 			reg = <0x2 0x3d794000 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
-			status = "disabled";
+
+			pmic@e {
+				compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+				read-only;
+			};
 		};
 
 		smc: smc@23e400000 {
@@ -2008,7 +2013,6 @@
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcpext_dart 5 0x8 0x00000000 0x7 0xffff0000>;
-			apple,hdcp-channels = <7 8>;
 			phandle = <&dcpext>;
 
 			/* the ADT has 2 additional regs which seems to be unused */

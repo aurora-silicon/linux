@@ -41,7 +41,6 @@
 #include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
-#include "dcp-hdcp-drv.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
@@ -2030,9 +2029,6 @@ void dcp_hotplug(struct work_struct *work)
 	 */
 	if (!READ_ONCE(connector->connected) && dcp_t6040_relinks())
 		cancel_delayed_work(&dcp->link_recovery_wq);
-	/* An unplugged sink ends its HDCP session; a new link brings another. */
-	if (!READ_ONCE(connector->connected))
-		dcp_hdcp_link_changed(dcp);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
 		if (READ_ONCE(connector->dcp) == pdev)
