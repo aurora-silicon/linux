@@ -43,6 +43,12 @@ mod notifier {pub const CONTEXT:usize=16;}
 mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
 #[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
+// Production service-stamp accessors (graph.rs) over the mock objects: retirement reads the cells
+// through exactly the accessors that work items and cross-engine barriers name them by.
+type FwObject=Object;
+__STAMP_CELL__
+impl CGraph{__COMPUTE_SERVICE_STAMP__}
+impl RGraph{__TA_SERVICE_STAMP__ __FS_SERVICE_STAMP__}
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:[RGraph;hw::sizes::RENDER_PAIRS]}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
@@ -751,6 +757,19 @@ for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP_
     if token in ('__RETIRED_FLIGHT__', '__RETIRED_FLIGHT_CLASSES__', '__RETIRED_SNAPSHOT_AT__'):
         body = body.replace('super::hw::', 'hw::')
     harness=harness.replace(token, body)
+graph_text=(backend/'graph.rs').read_text()
+cell_start=graph_text.index('/// A 32-bit stamp cell')
+cell_impl=graph_text.index("impl<'a> StampCell<'a> {")
+cell_at=graph_text.index('{',cell_impl)
+depth,cell_end=1,cell_at+1
+while depth:
+    depth+=(graph_text[cell_end]=='{')-(graph_text[cell_end]=='}')
+    cell_end+=1
+harness=(harness
+    .replace('__STAMP_CELL__',graph_text[cell_start:cell_end])
+    .replace('__COMPUTE_SERVICE_STAMP__',function(graph_text,'service_stamp'))
+    .replace('__TA_SERVICE_STAMP__',function(graph_text,'ta_service_stamp'))
+    .replace('__FS_SERVICE_STAMP__',function(graph_text,'fs_service_stamp')))
 hw_text=(backend/'hw.rs').read_text()
 def mod_block(text, name):
     start=text.index('pub(crate) mod '+name+' {')

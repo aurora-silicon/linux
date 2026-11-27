@@ -3587,6 +3587,8 @@ source = source.replace('__CMD_CLASSES__', '\n'.join(item(graph_source, decl) fo
 graph_types = '\n'.join(
     item(graph_source, decl)
     for decl in (
+        "pub(crate) struct StampCell<'a> {",
+        "impl<'a> StampCell<'a> {",
         'pub(crate) struct ComputeGraph {',
         'struct QueueSession {',
         'impl QueueSession {',

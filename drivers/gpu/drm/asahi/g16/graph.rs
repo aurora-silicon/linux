@@ -110,6 +110,29 @@ pub(crate) fn alloc_work(
     })
 }
 
+/// A 32-bit stamp cell the firmware stores into: an object and a byte offset in it.
+#[derive(Clone, Copy)]
+pub(crate) struct StampCell<'a> {
+    obj: &'a FwObject,
+    off: usize,
+}
+
+impl<'a> StampCell<'a> {
+    fn new(obj: &'a FwObject, off: usize) -> Self {
+        Self { obj, off }
+    }
+
+    /// The cell's firmware VA, as work items and barriers name it.
+    pub(crate) fn va(&self) -> u64 {
+        self.obj.va + self.off as u64
+    }
+
+    /// Reads the cell.
+    pub(crate) fn read(&self) -> Result<u32> {
+        self.obj.r32(self.off)
+    }
+}
+
 pub(crate) struct ComputeGraph {
     pub(crate) sched_ctx: Arc<FwObject>,
     /// Whole 0x1000 page; compute's record is +0x400, service stamps +0x640/+0x648.
@@ -263,6 +286,16 @@ impl ComputeGraph {
         )?;
         self.threshold.w64(0, 1)
     }
+
+    /// The pipe's terminal service-stamp cell. Each compute work item names this cell as the one
+    /// the firmware stores its stamp into after it has finished servicing the item's record, later
+    /// than [`Self::fw_stamp`], which it stores at FINALIZE. Retirement reads its completion from
+    /// this cell, and work on another firmware queue that reads what this pipe wrote waits on it:
+    /// at FINALIZE those writes are not yet visible there (linux#3349). All three go through this
+    /// accessor so that they can never name different cells.
+    pub(crate) fn service_stamp(&self) -> StampCell<'_> {
+        StampCell::new(&self.notifier, notifier_page::COMPUTE_STAMP)
+    }
 }
 
 pub(crate) struct RenderGraph {
@@ -369,6 +402,20 @@ impl RenderGraph {
             self.threshold.w64(e * 8, 2)?;
         }
         Ok(())
+    }
+
+    /// The TA queue's terminal service-stamp cell, as named by every render's TA work item and
+    /// read by retirement.
+    pub(crate) fn ta_service_stamp(&self) -> StampCell<'_> {
+        StampCell::new(&self.notifier, notifier_page::TA_STAMP)
+    }
+
+    /// The FS queue's terminal service-stamp cell, stored after the firmware has serviced a
+    /// pass's FS record, later than `fw_stamp[1]` (`FINALIZE`). Every render's FS work item names
+    /// it, retirement reads it, and work on another firmware queue that reads what a render wrote
+    /// waits on it, as for compute ([`ComputeGraph::service_stamp`]).
+    pub(crate) fn fs_service_stamp(&self) -> StampCell<'_> {
+        StampCell::new(&self.notifier, notifier_page::FS_STAMP)
     }
 }
 

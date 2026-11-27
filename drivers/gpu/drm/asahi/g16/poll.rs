@@ -1351,7 +1351,7 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+                let stamp = g.service_stamp().read()?;
                 full &= stamp_reached(stamp, f.target, tail)
                     && (stamp != f.target
                         || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
@@ -1364,7 +1364,7 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
+                full &= g.service_stamp().read()? == f.target
                     && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             }
             let count = f.claims.slot_count as usize;
@@ -1432,8 +1432,8 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+                let fs_stamp = g.fs_service_stamp().read()?;
+                let ta_stamp = g.ta_service_stamp().read()?;
                 full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target[pair])
                     && (fs_stamp != f.fs_target
                         || g.notifier
@@ -1459,8 +1459,8 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                full &= g.fs_service_stamp().read()? == f.fs_target
+                    && g.ta_service_stamp().read()? == f.ta_target
                     && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
                     && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?

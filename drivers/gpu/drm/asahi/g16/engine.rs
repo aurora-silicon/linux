@@ -151,13 +151,13 @@ struct WaitTarget {
 ///
 /// Unlike G15 (`g15/hw.rs: CROSS_ENGINE_HOLD` — "Never both type 0"), G16 (M4 25G83/26B123)
 /// does not require a software-job hold on one cross-engine direction when neither side
-/// carries `InitBM`. On G16, every stage (CDM, TA, FS) executes its `FINALIZE`
-/// micro-sequence — flushing stage caches to the shared coherent fabric — before firmware
-/// advances `fw_stamp`, so waiting on `fw_stamp` with `BarrierType::Stamp` (type 0) in both
-/// directions (`fs2c` and `c2ta`/`c2fs`) avoids hold bubbles within one VM (same ASID and
-/// UAT page tables). Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0
-/// handoffs) confirm no GPU wedge or hang, while CTS synchronization / pipeline-barrier
-/// coverage validates producer-to-consumer memory visibility.
+/// carries `InitBM`: `BarrierType::Stamp` (type 0) in both directions (`fs2c` and
+/// `c2ta`/`c2fs`) avoids hold bubbles within one VM (same ASID and UAT page tables).
+/// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
+/// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
+/// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
+/// queue, so waits on compute use `ComputeGraph::service_stamp` (linux#3349) and waits on a
+/// render's FS use `RenderGraph::fs_service_stamp`.
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
 /// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
@@ -2595,10 +2595,7 @@ impl Firmware {
                 notifier: r.notifier.va,
                 legacy_empty: r.legacy_empty.va,
                 qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-                user_stamp: [
-                    r.notifier.va + notifier_page::TA_STAMP as u64,
-                    r.notifier.va + notifier_page::FS_STAMP as u64,
-                ],
+                user_stamp: [r.ta_service_stamp().va(), r.fs_service_stamp().va()],
                 fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
                 uma_mgr: a.uma_mgr,
                 uma_aux: a.uma_aux,
@@ -2641,10 +2638,7 @@ impl Firmware {
             notifier: r.notifier.va,
             legacy_empty: r.legacy_empty.va,
             qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-            user_stamp: [
-                r.notifier.va + notifier_page::TA_STAMP as u64,
-                r.notifier.va + notifier_page::FS_STAMP as u64,
-            ],
+            user_stamp: [r.ta_service_stamp().va(), r.fs_service_stamp().va()],
             fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
             uma_mgr: a.uma_mgr,
             uma_aux: a.uma_aux,
@@ -3644,7 +3638,7 @@ impl Firmware {
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             qinfo: g.qinfo.va,
-            user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+            user_stamp: g.service_stamp().va(),
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
@@ -3731,8 +3725,8 @@ impl Firmware {
             // Check producer InitBM explicitly in addition to the scheduler drain guard so
             // FS -> CDM handoff: downgrade to `BarrierType::Stamp` (type 0) only when neither
             // the waited render nor any live flight carries `InitBM` and the GPU does not need
-            // G15's cross-engine hold; G16 FS `FINALIZE` flushes caches before advancing
-            // `fw_stamp[1]` (see `cross_engine_barrier_type`).
+            // G15's cross-engine hold (see `cross_engine_barrier_type`). Compute may read what
+            // the render wrote: wait for the FS service stamp, not its FINALIZE `fw_stamp[1]`.
             let producer_initbm = self.cfg.cross_engine_hold
                 || wait_fs.initbm
                 || self.engine.flights.iter().any(|fl| fl.initbm);
@@ -3740,7 +3734,7 @@ impl Firmware {
             // The waited render's pair names the FS stamp and event.
             let wait_pair = wait_fs.pair as usize;
             let bar = encode::barrier(
-                self.graph.render.get(wait_pair).ok_or(EINVAL)?.fw_stamp[1].va,
+                self.graph.render.get(wait_pair).ok_or(EINVAL)?.fs_service_stamp().va(),
                 wait_fs.stamp,
                 work::render_pair::events(wait_pair)[1],
                 target,
@@ -3761,8 +3755,10 @@ impl Firmware {
                 let producer_initbm =
                     wait_c.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
                 let bar_type = cross_engine_barrier_type(producer_initbm, false);
+                // Compute on another pipe may read what the producer wrote: wait for the
+                // producer pipe's service stamp, not its FINALIZE fw_stamp.
                 let bar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c.stamp,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -4165,9 +4161,11 @@ impl Firmware {
         }
         for p_idx in 0..sizes::COMPUTE_PIPES {
             let off = p_idx * work::barrier::SIZE;
+            // A render reads what compute wrote: wait for the producer pipe's service stamp, not
+            // its FINALIZE fw_stamp (see `ComputeGraph::service_stamp`).
             if let Some(wait_c) = plan.ta_compute_wait[p_idx] {
                 let cbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -4183,7 +4181,7 @@ impl Firmware {
             }
             if let Some(wait_c) = plan.fs_compute_wait[p_idx] {
                 let fcbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
