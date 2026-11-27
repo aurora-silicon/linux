@@ -333,10 +333,30 @@ void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille)
 }
 EXPORT_SYMBOL_GPL(apple_clpc_gpu_set_busy);
 
+/**
+ * apple_clpc_gpu_clear_busy() - Forget the GPU busy share after genuine idle
+ * @gpu: the GPU input, from apple_clpc_gpu_get()
+ *
+ * Returns reported GPU work to the top column of &struct apple_clpc_hw.gpu_busy
+ * until the driver reports a fresh window via apple_clpc_gpu_set_busy().
+ */
+void apple_clpc_gpu_clear_busy(struct apple_clpc_gpu *gpu)
+{
+	unsigned long flags;
+
+	if (!gpu)
+		return;
+	spin_lock_irqsave(&gpu->lock, flags);
+	gpu->busy_valid = false;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_clear_busy);
+
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu)
 {
 	if (gpu) {
 		apple_clpc_gpu_set_active(gpu, false);
+		apple_clpc_gpu_clear_busy(gpu);
 		kref_put(&gpu->ref, apple_clpc_gpu_free);
 	}
 }
