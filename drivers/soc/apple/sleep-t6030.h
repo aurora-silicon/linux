@@ -3068,6 +3068,17 @@ static const u8 t6030_obs_aon_words[] = {
 static void __iomem *t6030_eng_flag, *t6030_eng_step, *t6030_eng_cst, *t6030_eng_spmi;
 static void __iomem *t6030_eng_smc;
 
+/* The DRAM step's DCS self-refresh words (A:10, POLL bit 11), 6 channels per AMCC */
+#define T6030_ENG_DCS_CHANNELS		12
+#define T6030_ENG_DCS_SR		0x5b500
+static void __iomem *t6030_eng_dcs[T6030_ENG_DCS_CHANNELS];
+
+static u64 t6030_eng_dcs_pa(unsigned int i)
+{
+	return (i < 6 ? 0x220000000ULL : 0x222000000ULL) + 0x400000 + 0x200000 * (i % 6) +
+	       (T6030_ENG_DCS_SR & ~0xfffULL);
+}
+
 /* The SMC word each sequence writes at its start and end */
 #define T6030_ENG_SMC_PA		0x36c400000ULL
 #define T6030_ENG_SMC_NOTIFY		0x910
@@ -3082,11 +3093,15 @@ static void __iomem *t6030_eng_map(struct apple_sleep *s, u64 pa)
 
 static void t6030_eng_probe(struct apple_sleep *s)
 {
+	unsigned int i;
+
 	t6030_eng_flag = t6030_eng_map(s, T6030_ENG_FLAG_PA);
 	t6030_eng_step = t6030_eng_map(s, T6030_ENG_STEP_PA);
 	t6030_eng_cst = t6030_eng_map(s, T6030_ENG_CST_PA);
 	t6030_eng_spmi = t6030_eng_map(s, T6030_ENG_SPMI_PA);
 	t6030_eng_smc = t6030_eng_map(s, T6030_ENG_SMC_PA);
+	for (i = 0; i < T6030_ENG_DCS_CHANNELS; i++)
+		t6030_eng_dcs[i] = t6030_eng_map(s, t6030_eng_dcs_pa(i));
 	t6030_block(s, T6030_OBS_BLK_AMCC0);
 	t6030_block(s, T6030_OBS_BLK_AMCC1);
 }
@@ -3115,6 +3130,25 @@ static void t6030_eng_boot_record(struct apple_sleep *s)
 		 t6030_eng_cst ? readl(t6030_eng_cst + T6030_ENG_E_ST) : ~0U,
 		 t6030_eng_cst ? readl(t6030_eng_cst + T6030_ENG_P_ST) : ~0U);
 	dev_info(s->dev, "boot engine: WD 0x3642b0000: %*ph\n", (int)sizeof(wd), wd);
+	{
+		struct t6030_sleep *t = t6030_state(s);
+		u32 amcc[6] = {}, dcs[T6030_ENG_DCS_CHANNELS] = {};
+		unsigned int b, c;
+
+		for (b = 0; b < 2; b++)
+			for (c = 0; c < 3; c++)
+				if (t->blk[T6030_OBS_BLK_AMCC0 + b])
+					amcc[3 * b + c] = readl(t->blk[T6030_OBS_BLK_AMCC0 + b] +
+								0x40000 * c + T6030_ENG_AMCC_CH);
+		for (c = 0; c < T6030_ENG_DCS_CHANNELS; c++)
+			if (t6030_eng_dcs[c])
+				dcs[c] = readl(t6030_eng_dcs[c] + (T6030_ENG_DCS_SR & 0xfff));
+		dev_info(s->dev, "boot engine: AMCC +0x40c %08x %08x %08x %08x %08x %08x\n", amcc[0],
+			 amcc[1], amcc[2], amcc[3], amcc[4], amcc[5]);
+		dev_info(s->dev, "boot engine: DCS +0x5b500 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 dcs[0], dcs[1], dcs[2], dcs[3], dcs[4], dcs[5], dcs[6], dcs[7], dcs[8],
+			 dcs[9], dcs[10], dcs[11]);
+	}
 }
 
 static void t6030_obs_engine(struct apple_sleep *s, u8 *v)
