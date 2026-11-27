@@ -28,7 +28,7 @@ HEALTHY = {
     "matching": "unverified", "os_identity": "explicit", "hwrng": "registered",
     "xarm_failures": "0", "unhandled_messages": "0", "sleep": "awake",
     "sleeps": "3", "stac": "online", "stac_onlines": "4", "pnon": "read",
-    "sse": "idle", "sse_events": "0", "hibe": "idle", "skdl": "idle",
+    "xars": "ready", "sse": "idle", "sse_events": "0", "hibe": "idle", "skdl": "idle",
 }
 
 
@@ -143,6 +143,28 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("pnon", v)
         row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
         self.assertIn("pnon", row["detail"])
+
+    def test_the_xars_shutdown_barrier_is_reported(self):
+        rc, report, v = self.run_status()
+        self.assertEqual((rc, v["xars"]), (0, "PASS"))
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("xars=", row["value"])
+        self.assertNotIn("xars", row["detail"])
+        self.set("xars", "readonly")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["xars"]), (0, "WARN"))
+        self.set("xars", "failed")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["xars"]), (0, "WARN"))
+        self.set("xars", "absent")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["xars"]), (0, "INFO"))
+        # A kernel without the client lists xars as unserved.
+        self.set("xars", None)
+        rc, report, v = self.run_status()
+        self.assertNotIn("xars", v)
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("xars", row["detail"])
 
     def test_the_endpoints_checked_at_boot_are_reported(self):
         rc, report, v = self.run_status()

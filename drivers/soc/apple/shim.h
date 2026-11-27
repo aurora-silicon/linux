@@ -27,7 +27,8 @@ void sep_cancel_delayed_work_sync(void *work);
 /* -- pm_shim.c ---------------------------------------------------------- */
 
 int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
-		    void (*wake)(void), bool (*told)(void));
+		    void (*wake)(void), bool (*told)(void),
+		    void (*shutdown)(void));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
 int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
@@ -209,6 +210,14 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_PNON_FAILED		3
 #define SEP_DIAG_PNON_DIGEST_LEN	48
 
+/* Mirrored by diag.rs (Xars). */
+#define SEP_DIAG_XARS_PENDING		0
+#define SEP_DIAG_XARS_READY		1
+#define SEP_DIAG_XARS_READONLY		2
+#define SEP_DIAG_XARS_ABSENT		3
+#define SEP_DIAG_XARS_FLUSHED		4
+#define SEP_DIAG_XARS_FAILED		5
+
 /* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
 #define SEP_DIAG_OFFER_PENDING		0
 #define SEP_DIAG_OFFER_IDLE		1
@@ -244,6 +253,7 @@ void sep_diag_set_os_identity(int source);
 void sep_diag_set_hwrng(bool registered);
 void sep_diag_set_stac(int state);
 void sep_diag_set_pnon(int state, const u8 *digest, size_t len);
+void sep_diag_set_xars(int state);
 void sep_diag_set_offer(u8 endpoint, int state);
 unsigned int sep_diag_sse_event(void);
 unsigned int sep_diag_xarm_failed(void);

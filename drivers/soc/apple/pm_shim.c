@@ -23,6 +23,7 @@
 #include <linux/pm.h>
 #include <linux/panic.h>
 #include <linux/pm_domain.h>
+#include <linux/reboot.h>
 #include <linux/regmap.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/mailbox.h>
@@ -56,6 +57,7 @@ static void (*sep_pm_event)(bool entering);
 static int (*sep_pm_sleep)(void);
 static void (*sep_pm_wake)(void);
 static bool (*sep_pm_told)(void);
+static void (*sep_pm_shutdown)(void);
 /* In the device's .suspend, the only caller that can leave the request to the sleep. */
 static bool sep_pm_suspending;
 
@@ -87,6 +89,29 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 
 static struct notifier_block sep_pm_nb = {
 	.notifier_call = sep_pm_notify,
+};
+
+static int sep_reboot_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	void (*shutdown)(void) = READ_ONCE(sep_pm_shutdown);
+
+	if (!shutdown)
+		return NOTIFY_DONE;
+
+	switch (action) {
+	case SYS_RESTART:
+	case SYS_HALT:
+	case SYS_POWER_OFF:
+		shutdown();
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+static struct notifier_block sep_reboot_nb = {
+	.notifier_call = sep_reboot_notify,
 };
 
 /* The enclave's own domain is the first one its node lists. */
@@ -518,7 +543,8 @@ const struct dev_pm_ops sep_pm_ops = {
 };
 
 int sep_pm_register(void *ptr, void (*event)(bool entering), int (*sleep)(void),
-		    void (*wake)(void), bool (*told)(void))
+		    void (*wake)(void), bool (*told)(void),
+		    void (*shutdown)(void))
 {
 	int ret;
 
@@ -526,26 +552,38 @@ int sep_pm_register(void *ptr, void (*event)(bool entering), int (*sleep)(void),
 	WRITE_ONCE(sep_pm_sleep, sleep);
 	WRITE_ONCE(sep_pm_wake, wake);
 	WRITE_ONCE(sep_pm_told, told);
+	WRITE_ONCE(sep_pm_shutdown, shutdown);
 	ret = register_pm_notifier(&sep_pm_nb);
+	if (ret)
+		goto err_clear;
+
+	ret = register_reboot_notifier(&sep_reboot_nb);
 	if (ret) {
-		WRITE_ONCE(sep_pm_event, NULL);
-		WRITE_ONCE(sep_pm_sleep, NULL);
-		WRITE_ONCE(sep_pm_wake, NULL);
-		WRITE_ONCE(sep_pm_told, NULL);
-		return ret;
+		unregister_pm_notifier(&sep_pm_nb);
+		goto err_clear;
 	}
 
 	return 0;
+
+err_clear:
+	WRITE_ONCE(sep_pm_event, NULL);
+	WRITE_ONCE(sep_pm_sleep, NULL);
+	WRITE_ONCE(sep_pm_wake, NULL);
+	WRITE_ONCE(sep_pm_told, NULL);
+	WRITE_ONCE(sep_pm_shutdown, NULL);
+	return ret;
 }
 
 /* Returns only once no notifier call is still running. */
 void sep_pm_unregister(void)
 {
+	unregister_reboot_notifier(&sep_reboot_nb);
 	unregister_pm_notifier(&sep_pm_nb);
 	WRITE_ONCE(sep_pm_event, NULL);
 	WRITE_ONCE(sep_pm_sleep, NULL);
 	WRITE_ONCE(sep_pm_wake, NULL);
 	WRITE_ONCE(sep_pm_told, NULL);
+	WRITE_ONCE(sep_pm_shutdown, NULL);
 }
 
 static void sep_pm_release_domains(void *data)
