@@ -10373,7 +10373,7 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 			goto out;
 	}
 	dcp->s2r_domains_up = false;
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp->hw.s2r_ext)
 		dcp->ext_idle_domains_off = true;
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
