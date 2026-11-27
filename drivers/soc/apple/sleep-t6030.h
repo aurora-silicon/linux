@@ -390,6 +390,7 @@ static void t6030_spmi1_probe(struct apple_sleep *s);
 static void t6030_pmu_boot_record(struct apple_sleep *s);
 static void t6030_pwrgate_boot(struct apple_sleep *s);
 static void t6030_cpm_probe(struct apple_sleep *s);
+static void t6030_nub_fabric_probe(struct apple_sleep *s);
 static void t6030_cpm_entry(void);
 static void t6030_eng_probe(struct apple_sleep *s);
 static void t6030_eng_boot_record(struct apple_sleep *s);
@@ -474,6 +475,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_pmu_boot_record(s);
 	t6030_pwrgate_boot(s);
 	t6030_cpm_probe(s);
+	t6030_nub_fabric_probe(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -2358,6 +2360,51 @@ static void t6030_w1c_hist_at_commit(struct apple_sleep *s)
 	}
 }
 
+/*
+ * DIAGNOSTIC: NUB_FABRIC (ps-aon +0xa0) is the one power word whose state differs at the final WFI
+ * (lane A's stop comparison 2): macOS 0x1f0003ff (AUTO_ENABLE, on), Linux with wfi_match
+ * 0x1f00030f (AUTO_ENABLE, gated off). macOS sets AUTO_ENABLE at its boot, ~199 s before the
+ * commit. 0 (default): AUTO_ENABLE at the commit (wfi_match); 1: never, the boot's manual on
+ * (0x0f0000ff) through the commit; 2: AUTO_ENABLE at the probe instead, as macOS; 3: at the
+ * commit, then wait for it to read on (actual 0xf) before going on.
+ */
+#define T6030_NUB_FABRIC_ON_US		1000
+static unsigned int t6030_nub_fabric;
+module_param_named(nub_fabric, t6030_nub_fabric, uint, 0444);
+MODULE_PARM_DESC(nub_fabric, "T6030 DIAGNOSTIC: NUB_FABRIC's AUTO_ENABLE: 0 at the commit, 1 never, 2 at probe, 3 at the commit and wait for it on");
+
+static void t6030_nub_fabric_auto(struct apple_sleep *s)
+{
+	u32 v = readl(s->ps_aon + T6030_AON_NUB_FABRIC);
+
+	if (FIELD_GET(PS_ACTUAL, v) == 0xf && !(v & PS_AUTO_ENABLE))
+		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + T6030_AON_NUB_FABRIC);
+}
+
+static void t6030_nub_fabric_probe(struct apple_sleep *s)
+{
+	if (READ_ONCE(t6030_nub_fabric) != 2 || !s->ps_aon)
+		return;
+	dev_info(s->dev, "nub_fabric: NUB_FABRIC %#x at probe\n",
+		 readl(s->ps_aon + T6030_AON_NUB_FABRIC));
+	t6030_nub_fabric_auto(s);
+	dev_info(s->dev, "nub_fabric: AUTO_ENABLE at probe: %#x\n",
+		 readl(s->ps_aon + T6030_AON_NUB_FABRIC));
+}
+
+static void t6030_nub_fabric_at_commit(struct apple_sleep *s)
+{
+	unsigned int mode = READ_ONCE(t6030_nub_fabric);
+	u32 v;
+
+	if (mode == 1 || mode == 2)
+		return;
+	t6030_nub_fabric_auto(s);
+	if (mode == 3)
+		readl_poll_timeout_atomic(s->ps_aon + T6030_AON_NUB_FABRIC, v,
+					  FIELD_GET(PS_ACTUAL, v) == 0xf, 1, T6030_NUB_FABRIC_ON_US);
+}
+
 static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -2392,9 +2439,7 @@ static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 			stuck++;
 	}
 	/* NUB_FABRIC: on, under AUTO_ENABLE (0x1f0003ff at macOS's final WFI; Linux 0x0f0000ff) */
-	v = readl(s->ps_aon + T6030_AON_NUB_FABRIC);
-	if (FIELD_GET(PS_ACTUAL, v) == 0xf && !(v & PS_AUTO_ENABLE))
-		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + T6030_AON_NUB_FABRIC);
+	t6030_nub_fabric_at_commit(s);
 	/*
 	 * GPX (ps-gpu +0x0): its minimum state 4 (bits 19:16), the one real value left between
 	 * Linux's words and macOS's at the final WFI (0x1f0402ff there; Linux 0x1f0002ff).
