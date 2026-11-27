@@ -26,6 +26,7 @@
 #include <linux/of_address.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
+#include <linux/sched/topology.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
@@ -575,8 +576,14 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
  *
  * Called with priv->lock held.
  */
+static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
+					  unsigned int pstate,
+					  bool record_stats);
+
 static void apple_soc_cpufreq_fail(struct apple_cpu_priv *priv, u64 reg)
 {
+	if (priv->pending_pstate >= 0)
+		apple_soc_cpufreq_publish_cur(priv, priv->expected_pstate, false);
 	priv->transition_failed = true;
 	priv->pending_pstate = -1;
 	/* The scheduler may hold a runqueue lock: the timer reports it. */
@@ -644,8 +651,15 @@ static void apple_soc_cpufreq_record_cur(struct cpufreq_policy *policy,
 					 unsigned int cur, bool record_stats)
 {
 	WRITE_ONCE(policy->cur, cur);
-	if (record_stats)
+	if (record_stats) {
+		unsigned long max_freq = arch_scale_freq_ref(policy->cpu) ?:
+					 policy->cpuinfo.max_freq;
+
 		cpufreq_stats_record_transition(policy, cur);
+		if (max_freq && cpumask_available(policy->related_cpus) &&
+		    !cpumask_empty(policy->related_cpus))
+			arch_set_freq_scale(policy->related_cpus, cur, max_freq);
+	}
 }
 
 /* Called with priv->lock held. */
@@ -784,11 +798,12 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 			unsigned int pstate =
 				apple_soc_cpufreq_clamp_pstate(priv, priv->pending_pstate);
 
-			priv->pending_pstate = -1;
 			if (apple_soc_cpufreq_lazy_write(priv, reg, pstate))
 				apple_soc_cpufreq_verify_later(priv);
-			if (!priv->transition_failed)
+			if (!priv->transition_failed) {
+				priv->pending_pstate = -1;
 				apple_soc_cpufreq_publish_cur(priv, pstate, true);
+			}
 		}
 	} else if (FIELD_GET(APPLE_DVFS_CMD_PS1, reg) != priv->expected_pstate) {
 		apple_soc_cpufreq_fail(priv, reg);
@@ -975,8 +990,10 @@ static int apple_soc_cpufreq_drain(struct apple_cpu_priv *priv)
 	raw_spin_lock_irqsave(&priv->lock, flags);
 	pstate = priv->pending_pstate;
 	priv->pending_pstate = -1;
-	if (pstate >= 0)
+	if (pstate >= 0) {
+		apple_soc_cpufreq_publish_cur(priv, priv->expected_pstate, false);
 		pstate = apple_soc_cpufreq_clamp_pstate(priv, pstate);
+	}
 	report = priv->failure_unreported;
 	priv->failure_unreported = false;
 	reg = priv->failure_command;
@@ -1080,21 +1097,18 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 		pstate = apple_soc_cpufreq_clamp_pstate(priv, pstate);
 		raw_spin_unlock_irqrestore(&priv->lock, flags);
 
-		freq = apple_soc_cpufreq_pstate_freq(policy, pstate);
-		if (policy->suspend_freq && freq && freq != policy->cur) {
-			struct cpufreq_freqs freqs = {
-				.old = policy->cur,
-				.new = freq,
-			};
-
-			cpufreq_freq_transition_begin(policy, &freqs);
-			ret = apple_soc_cpufreq_set_pstate(priv, pstate);
-			cpufreq_freq_transition_end(policy, &freqs, ret);
+		ret = apple_soc_cpufreq_set_pstate(priv, pstate);
+		if (ret) {
+			if (policy->suspend_freq) {
+				raw_spin_lock_irqsave(&priv->lock, flags);
+				apple_soc_cpufreq_publish_cur(priv,
+							      priv->expected_pstate,
+							      false);
+				raw_spin_unlock_irqrestore(&priv->lock, flags);
+			}
 			return ret;
 		}
-		ret = apple_soc_cpufreq_set_pstate(priv, pstate);
-		if (ret)
-			return ret;
+		freq = apple_soc_cpufreq_pstate_freq(policy, pstate);
 		if (freq)
 			apple_soc_cpufreq_record_cur(policy, freq, true);
 		return 0;

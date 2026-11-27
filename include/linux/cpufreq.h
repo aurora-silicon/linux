@@ -487,9 +487,10 @@ struct cpufreq_driver {
 #define CPUFREQ_NO_AUTO_DYNAMIC_SWITCHING	BIT(6)
 
 /*
- * Set by drivers whose ->fast_switch() publishes policy->cur and records
- * cpufreq stats under internal synchronization because asynchronous limit or
- * verification paths may concurrently update hardware and policy->cur.
+ * Set by drivers whose ->fast_switch() publishes policy->cur, records cpufreq
+ * stats, and updates frequency-invariance scale under internal synchronization
+ * because asynchronous limit or verification paths may concurrently update
+ * hardware and policy->cur.
  */
 #define CPUFREQ_DRIVER_UPDATES_CUR		BIT(7)
 

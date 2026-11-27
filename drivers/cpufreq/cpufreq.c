@@ -2222,8 +2222,9 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 
 	/*
 	 * Drivers that also update hardware from asynchronous limit or timer
-	 * paths publish policy->cur and record cpufreq stats under their own
-	 * lock so a concurrent clamp cannot overwrite policy->cur or stats
+	 * paths publish policy->cur, record cpufreq stats, and update
+	 * frequency-invariance scale under their own lock so a concurrent
+	 * clamp cannot overwrite policy->cur, stats, or scheduler freq scale
 	 * with an older ->fast_switch() result.
 	 */
 	if (cpufreq_driver->flags & CPUFREQ_DRIVER_UPDATES_CUR) {
@@ -2231,9 +2232,9 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 	} else {
 		policy->cur = freq;
 		cpufreq_stats_record_transition(policy, freq);
+		arch_set_freq_scale(policy->related_cpus, freq,
+				    arch_scale_freq_ref(policy->cpu));
 	}
-	arch_set_freq_scale(policy->related_cpus, freq,
-			    arch_scale_freq_ref(policy->cpu));
 
 	if (trace_cpu_frequency_enabled()) {
 		for_each_cpu(cpu, policy->cpus)
