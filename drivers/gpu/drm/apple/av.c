@@ -264,16 +264,21 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 	return ret;
 }
 
-int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
+/* @gen: the instance the link starts on (dcp_audiosrv_instance()), or NULL */
+int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie, u64 *gen)
 {
 	struct apple_dcp *dcp;
 	struct audiosrv_data *asrv;
 	int ret;
 
-	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_startlink, dev, cookie);
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_startlink, dev, cookie, gen);
 	dcp = dev_get_drvdata(dev);
 	asrv = dcp->audiosrv;
 	down_write(&asrv->srv_rwsem);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	if (gen)
+		*gen = asrv->gen;
+#endif
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
 			       64);
@@ -361,9 +366,12 @@ static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const v
 /* The audio service instance now published, as dcp_audiosrv_replaced() takes it. */
 u64 dcp_audiosrv_instance(struct device *dev)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_instance, dev);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 	if (!asrv)
 		return 0;
 	guard(rwsem_read)(&asrv->srv_rwsem);
