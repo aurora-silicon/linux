@@ -425,3 +425,14 @@
 	interrupt-names = "irq", "sleep", "wake";
 	apple,sleep-ssps-rules;
 };
+
+/*
+ * The GPU's memory states by the busy share the GPU driver reports, split at
+ * 160, 500 and 800 permille, with the top column matching apple_clpc_hw_t6050's
+ * DCS 6 / fabric 2 floor so saturated GPU work keeps full memory bandwidth
+ * while light compositor and video work drops to lower memory states.
+ */
+&clpc {
+	apple,gpu-busy-memory-states = <1 2 4 6>, <0 0 0 2>;
+	apple,gpu-busy-permille = <160 500 800>;
+};
