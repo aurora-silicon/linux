@@ -194,6 +194,58 @@ fn main() {
     return events, idle_events
 
 
+def strip_dts_comments(text):
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+        lambda m: m.group(0) if m.group(0).startswith('"') else ' ',
+        text,
+        flags=re.S,
+    )
+
+
+def dt_cells(node_text, name):
+    match = re.search(r'(?:^|[\s;])' + re.escape(name) + r'\s*=\s*([^;]*);', node_text)
+    if not match:
+        return None
+    return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
+
+
+def parse_clpc_dt_gpu_busy(dts_text, node_sig):
+    clpc_node = item(strip_dts_comments(dts_text), node_sig)
+    return (
+        dt_cells(clpc_node, 'apple,gpu-busy-memory-states'),
+        dt_cells(clpc_node, 'apple,gpu-busy-permille'),
+    )
+
+
+def parse_t6050_gpu_busy(dts_text):
+    states, busy = parse_clpc_dt_gpu_busy(dts_text, 'clpc: performance-controller@1 {')
+    assert states and busy, \
+        't6050-die0.dtsi clpc node must define both gpu-busy DT properties'
+    return states, busy
+
+
+def test_t6050_dt_negative_controls(t6050_dts):
+    for prop, short in [
+        ('apple,gpu-busy-memory-states', 'states'),
+        ('apple,gpu-busy-permille', 'permille'),
+    ]:
+        pat = re.compile(r'^([ \t]*)(' + re.escape(prop) + r'\s*=[^;]*;)', re.M)
+        for kind, repl in [
+            ('delete', ''),
+            ('block-comment', r'\1/* \2 */'),
+            ('line-comment', r'\1// \2'),
+        ]:
+            mutated, count = pat.subn(repl, t6050_dts, count=1)
+            assert count == 1 and mutated != t6050_dts, f'stale mutation: {kind}-{short}'
+            try:
+                parse_t6050_gpu_busy(mutated)
+            except AssertionError:
+                print(f'PASS negative control: t6050-dt-{kind}-{short}')
+            else:
+                raise AssertionError(f'negative control passed unexpectedly: t6050-dt-{kind}-{short}')
+
+
 def main():
     g17_events, g17_idle_events = test_g17_busy_share()
     source = (ROOT / 'drivers/soc/apple/clpc.c').read_text()
@@ -208,29 +260,19 @@ def main():
                        for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140',
                                  'apple_clpc_hw_t6040', 'apple_clpc_hw_t6041',
                                  'apple_clpc_hw_t6050'])
-    def cells(node_text, name):
-        match = re.search(r'\s' + re.escape(name) + r'\s*=\s*([^;]*);', node_text)
-        if not match:
-            return None
-        return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
 
     # When t6041.dtsi supplies the GPU busy-share properties, parse and test them directly;
     # otherwise exercise the DT parsers and ladder against the reference values.
     dts = (ROOT / 'arch/arm64/boot/dts/apple/t6041.dtsi').read_text()
-    clpc_node = item(dts, '&clpc {')
-    dt_states = cells(clpc_node, 'apple,gpu-busy-memory-states')
-    dt_busy = cells(clpc_node, 'apple,gpu-busy-permille')
+    dt_states, dt_busy = parse_clpc_dt_gpu_busy(dts, '&clpc {')
     assert (dt_states is None) == (dt_busy is None)
     gpu_states = dt_states or [1, 2, 4, 5, 0, 0, 0, 3]
     gpu_busy = dt_busy or [160, 500, 800]
 
     # Parse T6050's shared CLPC node directly; both DT properties are required.
     t6050_dts = (ROOT / 'arch/arm64/boot/dts/apple/t6050-die0.dtsi').read_text()
-    t6050_clpc_node = item(t6050_dts, 'clpc: performance-controller@1 {')
-    t6050_states = cells(t6050_clpc_node, 'apple,gpu-busy-memory-states')
-    t6050_busy = cells(t6050_clpc_node, 'apple,gpu-busy-permille')
-    assert t6050_states and t6050_busy, \
-        't6050-die0.dtsi clpc node must define both gpu-busy DT properties'
+    t6050_states, t6050_busy = parse_t6050_gpu_busy(t6050_dts)
+    test_t6050_dt_negative_controls(t6050_dts)
 
     t6041_dt = (
         'static const u32 t6041_gpu_states[] = {' + ', '.join(str(x) for x in gpu_states) + '};\n'
