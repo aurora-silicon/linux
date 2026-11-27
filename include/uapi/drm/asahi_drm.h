@@ -606,10 +606,10 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS ((1ULL) << 45)
 
 /*
- * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands accept tile buffers of
- * up to 48 KiB (sample_size_B * utile_width_px * utile_height_px * samples
- * <= 49152), instead of 32 KiB. A feature bit like those of enum
- * drm_asahi_feature, defined here like bit 32.
+ * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands on this GPU accept tile
+ * buffers of up to 48 KiB (sample_size_B * utile_width_px * utile_height_px *
+ * samples <= 49152). Without it, 32 KiB is the portable limit. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_TILE_BUFFER_48K ((1ULL) << 46)
 
