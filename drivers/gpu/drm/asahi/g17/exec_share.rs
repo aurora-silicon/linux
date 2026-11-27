@@ -18,11 +18,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 struct Entry {
+    id: u64,
     vm: u64,
     execution: Arc<ExecutionContext>,
     claims: Arc<AtomicU64>,
     users: u32,
 }
+
+static NEXT_SHARE_ID: AtomicU64 = AtomicU64::new(1);
 
 kernel::sync::global_lock! {
     // SAFETY: Module initialization initializes this lock before registering adapters.
@@ -39,6 +42,7 @@ pub(crate) unsafe fn init() {
 
 /// One logical queue's use of a shared execution context.
 pub(crate) struct Use {
+    id: u64,
     vm: u64,
     execution: Arc<ExecutionContext>,
     claims: Arc<AtomicU64>,
@@ -46,6 +50,10 @@ pub(crate) struct Use {
 }
 
 impl Use {
+    /// Non-zero identity shared by every logical queue in this execution context.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
     /// The work-state index claims of the sharers.
     pub(crate) fn claims(&self) -> &Arc<AtomicU64> {
         &self.claims
@@ -93,6 +101,7 @@ pub(crate) fn join(vm: &Vm) -> Option<(Arc<ExecutionContext>, Use)> {
     Some((
         entry.execution.clone(),
         Use {
+            id: entry.id,
             vm: entry.vm,
             execution: entry.execution.clone(),
             claims: entry.claims.clone(),
@@ -104,9 +113,14 @@ pub(crate) fn join(vm: &Vm) -> Option<(Arc<ExecutionContext>, Use)> {
 /// Offers a new context of `vm` for sharing.
 pub(crate) fn offer(vm: &Vm, execution: &Arc<ExecutionContext>) -> Result<Use> {
     let claims = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
+    let id = NEXT_SHARE_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        return Err(EOVERFLOW);
+    }
     let mut shares = SHARES.lock();
     shares.push(
         Entry {
+            id,
             vm: vm.id(),
             execution: execution.clone(),
             claims: claims.clone(),
@@ -115,6 +129,7 @@ pub(crate) fn offer(vm: &Vm, execution: &Arc<ExecutionContext>) -> Result<Use> {
         GFP_KERNEL,
     )?;
     Ok(Use {
+        id,
         vm: vm.id(),
         execution: execution.clone(),
         claims,

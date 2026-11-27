@@ -11,6 +11,8 @@ struct asahi_g17_fence_leaf {
 	int status;
 };
 
+int asahi_g17_fence_status(struct dma_fence *fence);
+bool asahi_g17_export_coalesce_key(struct dma_fence *fence, u64 *key, u64 *seq);
 int asahi_g17_collect_fences(struct dma_fence *head,
 			   struct asahi_g17_fence_leaf *out, size_t capacity);
 int asahi_g17_collect_fences_coalesced(struct dma_fence *head,

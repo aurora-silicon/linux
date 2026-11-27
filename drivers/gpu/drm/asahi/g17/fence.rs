@@ -222,6 +222,47 @@ pub(super) unsafe fn exported_source_raw(raw: *mut bindings::dma_fence) -> Optio
         .cloned()
 }
 
+/// Lock-free coalescing key for an unsignalled, currently published compute `ExportFence`.
+///
+/// Two healthy published compute submissions on the same `(epoch, physical QID)` execute and
+/// retire in strict FIFO order on that QID, so waiting on the later publication ordinal in
+/// firmware subsumes the earlier one without sharing a `dma_fence` context across submits that
+/// could fail out of order before publication.
+///
+/// # Safety
+///
+/// `raw` must point to a live `dma_fence`, and `key` and `seq` must be valid writable pointers.
+#[no_mangle]
+pub(super) unsafe extern "C" fn asahi_g17_export_coalesce_key(
+    raw: *mut bindings::dma_fence,
+    key: *mut u64,
+    seq: *mut u64,
+) -> bool {
+    let expected = EXPORT_OPS.load(Ordering::Acquire);
+    if expected == 0 || raw.is_null() {
+        return false;
+    }
+    // SAFETY: Caller holds a live fence reference; vtable check precedes cast to FenceObject.
+    let object = unsafe {
+        if (*raw).ops as usize != expected {
+            return false;
+        }
+        &*(raw as *const FenceObject<ExportFence>)
+    };
+    let Some(source) = object.source.as_ref() else {
+        return false;
+    };
+    let Some((pub_key, pub_seq)) = source.published_order_key() else {
+        return false;
+    };
+    // SAFETY: Caller supplies valid writable output pointers.
+    unsafe {
+        *key = pub_key;
+        *seq = pub_seq;
+    }
+    true
+}
+
 /// Immutable cross-QID kick metadata published once a compute source is committed in firmware.
 /// Consumers on the same VM read this without acquiring the global device mutex.
 #[derive(Clone)]
@@ -229,6 +270,8 @@ pub(crate) struct PublishedSource {
     pub(crate) epoch: u64,
     pub(crate) published: u64,
     pub(crate) dependency: super::fw::kick::KickDependency,
+    pub(crate) stamp_va: u64,
+    pub(crate) execution_share: u64,
     pub(crate) readers: Arc<core::sync::atomic::AtomicU32>,
 }
 
@@ -261,14 +304,25 @@ pub(crate) struct Submission {
     /// Non-zero encoded recovery epoch (`epoch.wrapping_add(1)`) while `state.published` holds a
     /// live `PublishedSource` snapshot, or `0` when unpublished.
     published_epoch: AtomicU64,
+    /// Packed `(qid << 56) | published_seq` written before `published_epoch` (Release), so
+    /// lock-free coalescing in `sync_input` can collapse same-QID leaves without locking `state`.
+    published_order: AtomicU64,
     /// Set atomically when a firmware kick depends on this source so replay/retirement
     /// observes consumers without scanning producer queues under the device mutex.
     firmware_consumer: AtomicBool,
 }
 
 impl Submission {
+    const PUBLISHED_SEQ_MASK: u64 = (1u64 << 56) - 1;
+
     fn encode_epoch(epoch: u64) -> u64 {
         epoch.wrapping_add(1)
+    }
+    fn encode_order(qid: u8, published: u64) -> u64 {
+        if published == 0 || published > Self::PUBLISHED_SEQ_MASK {
+            return 0;
+        }
+        (u64::from(qid) << 56) | published
     }
     fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
         let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
@@ -289,6 +343,7 @@ impl Submission {
                 firmware_source,
                 retired: AtomicBool::new(false),
                 published_epoch: AtomicU64::new(0),
+                published_order: AtomicU64::new(0),
                 firmware_consumer: AtomicBool::new(false),
             }),
             GFP_KERNEL,
@@ -316,12 +371,14 @@ impl Submission {
             return;
         }
         let tag = Self::encode_epoch(source.epoch);
+        let order = Self::encode_order(source.dependency.qid(), source.published);
         let mut state = self.state.lock();
         if state.work.is_some()
             && self.error.load(Ordering::Acquire) == 0
             && !self.retired.load(Ordering::Acquire)
         {
             state.published = Some(source);
+            self.published_order.store(order, Ordering::Relaxed);
             self.published_epoch.store(tag, Ordering::Release);
         }
     }
@@ -346,6 +403,39 @@ impl Submission {
     pub(super) fn has_published_epoch(&self, epoch: u64) -> bool {
         let tag = Self::encode_epoch(epoch);
         self.firmware_source && tag != 0 && self.published_epoch.load(Ordering::Acquire) == tag
+    }
+    /// Lock-free `(coalesce_key, published_seq)` for a healthy, currently published compute source.
+    /// Returns `None` when unpublished, retired, errored, or out of packing range.
+    pub(super) fn published_order_key(&self) -> Option<(u64, u64)> {
+        if !self.firmware_source {
+            return None;
+        }
+        let epoch_tag = self.published_epoch.load(Ordering::Acquire);
+        if epoch_tag == 0 || epoch_tag > Self::PUBLISHED_SEQ_MASK {
+            return None;
+        }
+        if self.error.load(Ordering::Acquire) != 0 || self.retired.load(Ordering::Acquire) {
+            return None;
+        }
+        let order = self.published_order.load(Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Acquire);
+        if self.published_epoch.load(Ordering::Relaxed) != epoch_tag {
+            return None;
+        }
+        let seq = order & Self::PUBLISHED_SEQ_MASK;
+        if seq == 0 {
+            return None;
+        }
+        let qid = order >> 56;
+        Some(((epoch_tag << 8) | qid, seq))
+    }
+    pub(super) fn published_order_key_for(&self, epoch: u64) -> Option<(u64, u64)> {
+        let tag = Self::encode_epoch(epoch);
+        if tag == 0 || tag > Self::PUBLISHED_SEQ_MASK {
+            return None;
+        }
+        let (key, seq) = self.published_order_key()?;
+        ((key >> 8) == tag).then_some((key, seq))
     }
     pub(super) fn note_firmware_consumer(&self) {
         self.firmware_consumer.store(true, Ordering::Release);
@@ -586,6 +676,93 @@ mod tests {
             drop(member.take());
         }
         assert_eq!(source.owners.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn published_export_coalesce_key_tracks_epoch_qid_and_invalidation() {
+        use crate::g17::fw::kick::{KickDependency, KickTimestamp};
+
+        let contexts = contexts();
+        let a = aggregate(&contexts);
+        let b = aggregate(&contexts);
+        let c = aggregate(&contexts);
+        let readers = Arc::new(AtomicU32::new(0), GFP_KERNEL).unwrap();
+        let dep_q5_1 = KickDependency::new(5, KickTimestamp::new(10).unwrap()).unwrap();
+        let dep_q5_2 = KickDependency::new(5, KickTimestamp::new(11).unwrap()).unwrap();
+        let dep_q6_1 = KickDependency::new(6, KickTimestamp::new(12).unwrap()).unwrap();
+
+        // Unpublished submissions expose no coalesce key.
+        let (mut k, mut s) = (0u64, 0u64);
+        assert!(!unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut k, &mut s) });
+
+        // Simulate published snapshots (set_published requires state.work.is_some() in production;
+        // test the atomic publication contract directly here without a GPU Context).
+        let publish_direct = |sub: &Submission, epoch: u64, seq: u64, dep: KickDependency| {
+            let tag = Submission::encode_epoch(epoch);
+            let order = Submission::encode_order(dep.qid(), seq);
+            sub.state.lock().published = Some(PublishedSource {
+                epoch,
+                published: seq,
+                dependency: dep,
+                stamp_va: 0x1000,
+                execution_share: 1,
+                readers: readers.clone(),
+            });
+            sub.published_order.store(order, Ordering::Relaxed);
+            sub.published_epoch.store(tag, Ordering::Release);
+        };
+
+        publish_direct(a.source(), 7, 100, dep_q5_1);
+        publish_direct(b.source(), 7, 101, dep_q5_2);
+        publish_direct(c.source(), 7, 102, dep_q6_1);
+
+        let (mut ka, mut sa) = (0u64, 0u64);
+        let (mut kb, mut sb) = (0u64, 0u64);
+        let (mut kc, mut sc) = (0u64, 0u64);
+        assert!(unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut ka, &mut sa) });
+        assert!(unsafe { asahi_g17_export_coalesce_key(b.0.raw(), &mut kb, &mut sb) });
+        assert!(unsafe { asahi_g17_export_coalesce_key(c.0.raw(), &mut kc, &mut sc) });
+        assert_eq!(ka, kb);
+        assert!(sb > sa);
+        assert_ne!(ka, kc);
+        assert_eq!(a.source().published_order_key_for(7), Some((ka, sa)));
+        assert_eq!(a.source().published_order_key_for(8), None);
+
+        // Coalescing two same-(epoch, qid) exports collapses to the newer publication ordinal,
+        // while keeping distinct QIDs separate.
+        let merged = super::super::sync_input::merge(&[a.fence(), b.fence(), c.fence()]).unwrap();
+        let leaves = super::super::sync_input::collect_coalesced(&merged).unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|l| l.fence == b.0.raw()));
+        assert!(leaves.iter().any(|l| l.fence == c.0.raw()));
+        assert!(!leaves.iter().any(|l| l.fence == a.0.raw()));
+
+        // Error or retirement clears/suppresses coalescing so errors are never dropped.
+        a.source().note_error(EIO);
+        assert!(!unsafe { asahi_g17_export_coalesce_key(a.0.raw(), &mut ka, &mut sa) });
+        b.source().clear_published();
+        assert!(!unsafe { asahi_g17_export_coalesce_key(b.0.raw(), &mut kb, &mut sb) });
+
+        a.finish_enqueue(Err(EIO));
+        b.finish_enqueue(Ok(()));
+        c.finish_enqueue(Ok(()));
+    }
+
+    #[test]
+    fn lockless_fence_status_tracks_unsignaled_success_and_error() {
+        let contexts = contexts();
+        let ok_fence = independent(&contexts).unwrap();
+        let ok_handle = Fence::from_fence(&ok_fence);
+        assert_eq!(super::super::job::fence_status(&ok_handle), 0);
+        ok_fence.signal();
+        assert_eq!(super::super::job::fence_status(&ok_handle), 1);
+
+        let err_fence = independent(&contexts).unwrap();
+        let err_handle = Fence::from_fence(&err_fence);
+        assert_eq!(super::super::job::fence_status(&err_handle), 0);
+        err_fence.set_error(EIO);
+        err_fence.signal();
+        assert_eq!(super::super::job::fence_status(&err_handle), EIO.to_errno());
     }
 }
 impl Drop for Member {
