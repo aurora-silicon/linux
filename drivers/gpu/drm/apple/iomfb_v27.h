@@ -160,7 +160,13 @@ void iomfb_v27_idle_cache_kick(struct apple_dcp *dcp);
 void iomfb_v27_idle_cache_retry(struct apple_dcp *dcp);
 void iomfb_v27_idle_cache_cancel(struct apple_dcp *dcp);
 void iomfb_v27_idle_cache_reset(struct apple_dcp *dcp);
+struct drm_framebuffer;
+struct drm_framebuffer_funcs;
+
+extern const struct drm_framebuffer_funcs apple_drm_client_fb_funcs;
+
 void iomfb_v27_idle_cache_release_obj(struct apple_dcp *dcp);
+bool iomfb_v27_idle_cache_fb_eligible(const struct drm_framebuffer *fb);
 void iomfb_v27_idle_cache_on_present(struct apple_dcp *dcp,
 				     const struct dcp_surface *surf,
 				     const struct dcp_rect *src_rect,

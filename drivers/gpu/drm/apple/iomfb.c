@@ -1247,13 +1247,21 @@ static bool iomfb_v27_idle_surface_span(const struct dcp_surface *surf,
 	return true;
 }
 
+bool iomfb_v27_idle_cache_fb_eligible(const struct drm_framebuffer *fb)
+{
+	if (!fb)
+		return false;
+	if (fb->funcs && fb->funcs->dirty)
+		return true;
+	return fb->funcs != &apple_drm_client_fb_funcs;
+}
+
 void iomfb_v27_idle_cache_kick(struct apple_dcp *dcp)
 {
 	unsigned long delay = msecs_to_jiffies(DCP_V27_IDLE_CACHE_DELAY_MS);
 	unsigned long flags;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
-	    !dcp->main_display || !dcp_has_panel(dcp) ||
+	if (!dcp_v27_idle_cache_supported(dcp) ||
 	    READ_ONCE(dcp->v27_idle_unavailable))
 		return;
 	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
@@ -1270,8 +1278,7 @@ void iomfb_v27_idle_cache_retry(struct apple_dcp *dcp)
 {
 	unsigned long flags;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
-	    !dcp->main_display || !dcp_has_panel(dcp) ||
+	if (!dcp_v27_idle_cache_supported(dcp) ||
 	    READ_ONCE(dcp->v27_idle_unavailable))
 		return;
 	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
@@ -1288,12 +1295,16 @@ void iomfb_v27_idle_cache_on_present(struct apple_dcp *dcp,
 				     bool valid)
 {
 	unsigned long flags;
+	bool armed;
 
+	if (!dcp_v27_idle_cache_supported(dcp))
+		return;
 	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
 	dcp->v27_idle_gen++;
 	dcp->v27_idle_closed = false;
 	dcp->v27_idle_template_valid = false;
-	if (valid && iomfb_v27_idle_surface_span(surf, NULL)) {
+	armed = valid && iomfb_v27_idle_surface_span(surf, NULL);
+	if (armed) {
 		dcp->v27_idle_pending_surf = *surf;
 		dcp->v27_idle_pending_src = *src_rect;
 		dcp->v27_idle_pending_dst = *dst_rect;
@@ -1302,6 +1313,8 @@ void iomfb_v27_idle_cache_on_present(struct apple_dcp *dcp,
 		dcp->v27_idle_pending_valid = false;
 	}
 	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	if (!armed)
+		cancel_delayed_work(&dcp->v27_idle_cache_work);
 }
 
 void iomfb_v27_idle_cache_on_displayed(struct apple_dcp *dcp)
@@ -1309,6 +1322,8 @@ void iomfb_v27_idle_cache_on_displayed(struct apple_dcp *dcp)
 	unsigned long delay = msecs_to_jiffies(DCP_V27_IDLE_CACHE_DELAY_MS);
 	unsigned long flags;
 
+	if (!dcp_v27_idle_cache_supported(dcp))
+		return;
 	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
 	if (!dcp->v27_idle_closed && dcp->v27_idle_pending_valid) {
 		dcp->v27_idle_template_surf = dcp->v27_idle_pending_surf;
@@ -1717,8 +1732,7 @@ void iomfb_v27_idle_cache_work(struct work_struct *work)
 	u64 gen;
 	int ret;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
-	    !dcp->main_display || !dcp_has_panel(dcp) ||
+	if (!dcp_v27_idle_cache_supported(dcp) ||
 	    !dcp->v27_methods || !dcp->v27_methods[dcpep_pipe_set_352].tag[0] ||
 	    !dcp->active || !dcp->crtc || !dcp->connector ||
 	    !READ_ONCE(dcp->connector->connected) ||
@@ -1729,6 +1743,7 @@ void iomfb_v27_idle_cache_work(struct work_struct *work)
 
 	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
 	if (dcp->v27_idle_closed || !dcp->v27_idle_template_valid ||
+	    READ_ONCE(dcp->v27_idle_unavailable) ||
 	    dcp->v27_idle_state != DCP_V27_IDLE_STATE_OFF ||
 	    dcp->v27_idle_fences || dcp->v27_idle_in_flight ||
 	    dcp->v27_idle_swap_pending) {
@@ -5045,7 +5060,7 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 
 	dcp->swap.h17p = scanout->request;
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-		if (dcp->main_display && dcp_has_panel(dcp))
+		if (dcp_v27_idle_cache_supported(dcp))
 			iomfb_v27_idle_cache_kick(dcp);
 		iomfb_present_backlight_v27(dcp);
 	} else {

@@ -37,6 +37,7 @@
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_file.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_print.h>
@@ -57,6 +58,7 @@
 #include "dcp.h"
 #include "plane.h"
 #include "iomfb_m4.h"
+#include "iomfb_v27.h"
 #include "t8132_ext_drm.h"
 
 #define DRIVER_NAME     "apple"
@@ -999,13 +1001,41 @@ static int apple_atomic_check(struct drm_device *dev,
 	return 0;
 }
 
+/*
+ * Distinct funcs for in-kernel client framebuffers (such as unshadowed
+ * fbdev / fbcon) that have no dirty callback and draw directly in place
+ * without KMS commits.
+ */
+const struct drm_framebuffer_funcs apple_drm_client_fb_funcs = {
+	.destroy	= drm_gem_fb_destroy,
+	.create_handle	= drm_gem_fb_create_handle,
+};
+
+static struct drm_framebuffer *
+apple_drm_fb_create(struct drm_device *dev, struct drm_file *file,
+		    const struct drm_format_info *info,
+		    const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	/*
+	 * In-kernel DRM clients allocate a headless drm_file (file->filp == NULL),
+	 * whereas userspace KMS opens always attach a struct file. Tag headless
+	 * client framebuffers with immutable framebuffer funcs so idle-cache
+	 * eligibility never dereferences dev->fb_helper during DRM unplug.
+	 */
+	if (!file || !file->filp)
+		return drm_gem_fb_create_with_funcs(dev, file, info, mode_cmd,
+						    &apple_drm_client_fb_funcs);
+
+	return drm_gem_fb_create(dev, file, info, mode_cmd);
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= apple_atomic_commit,
-	.fb_create		= drm_gem_fb_create,
+	.fb_create		= apple_drm_fb_create,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)

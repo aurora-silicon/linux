@@ -829,7 +829,7 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now,
 		dcp_release_retained_framebuffers(dcp, id);
 		dcp_drm_crtc_page_flip(dcp, now);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-		if (shown && dcp->main_display && dcp_has_panel(dcp))
+		if (shown && dcp_v27_idle_cache_supported(dcp))
 			iomfb_v27_idle_cache_on_displayed(dcp);
 #endif
 	}
@@ -4601,6 +4601,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *new_state, *old_state;
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	struct drm_framebuffer *primary_fb = NULL;
+#endif
 	struct drm_crtc_state *crtc_state;
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_SWAP(dcp);
 	int plane_idx, l;
@@ -4657,6 +4660,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp_fb_mirror(dcp, new_state->fb))
 			continue;
 		req->surf_null[l] = false;
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (!l)
+			primary_fb = new_state->fb;
+#endif
 		has_surface = 1;
 
 		req->swap.src_rect[l] = apple_state->src_rect;
@@ -4797,14 +4804,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	req->swap.swap_completed = req->swap.swap_enabled;
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (dcp->main_display && dcp_has_panel(dcp)) {
-		if (req->swap.swap_enabled & BIT(0))
+	if (dcp_v27_idle_cache_supported(dcp)) {
+		if (req->swap.swap_enabled & BIT(0)) {
+			bool valid = !req->surf_null[0] &&
+				     iomfb_v27_idle_cache_fb_eligible(primary_fb);
+
 			iomfb_v27_idle_cache_on_present(dcp, &req->surf[0].base,
 							&req->swap.src_rect[0],
 							&req->swap.dst_rect[0],
-							!req->surf_null[0]);
-		else
+							valid);
+		} else {
 			iomfb_v27_idle_cache_kick(dcp);
+		}
 	}
 #endif
 

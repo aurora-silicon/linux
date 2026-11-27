@@ -11779,6 +11779,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.only_120hz_modes = true,
+	/*
+	 * T6050 firmware accepts applyProperty(138, 2) and swap_intent = 8
+	 * into setup state 2 with zero transitions to active replay state 4;
+	 * gate off before swap_submit allocates a cache surface and retains
+	 * the live session for no power savings.
+	 */
+	.no_v27_idle_cache = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {

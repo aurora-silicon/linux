@@ -427,6 +427,16 @@ struct apple_dcp_hw_data {
 	 * D572 turns it off first, and the stop's power-down resets it (T8103).
 	 */
 	bool s2r_disp_dart_with_dcp;
+	/*
+	 * Firmware 27 static-frame idle caching ("replay") is enabled by default
+	 * on firmware-27 internal panels. Set only where hardware testing proved
+	 * firmware accepts applyProperty(138, 2) and swap_intent = 8 into setup
+	 * state 2 with periodic refreshes and zero transitions to active replay
+	 * state 4 (T6050), because no narrower static DT or pre-submit query
+	 * distinguishes setup-only firmware before swap_submit allocates the
+	 * cache surface and commits live-session retention.
+	 */
+	bool no_v27_idle_cache;
 };
 
 enum dcp_test_point {
@@ -1534,6 +1544,13 @@ static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
+	       dcp_has_panel(dcp);
+}
+
+static inline bool dcp_v27_idle_cache_supported(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       !dcp->hw.no_v27_idle_cache && dcp->main_display &&
 	       dcp_has_panel(dcp);
 }
 

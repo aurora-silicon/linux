@@ -9,6 +9,7 @@
  */
 
 #include <drm/drm_drv.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_kunit_helpers.h>
 #include <kunit/test.h>
@@ -409,6 +410,104 @@ static void v27_idle_unwind_preserves_outer_callback_and_pin_test(struct kunit *
 	KUNIT_EXPECT_NOT_NULL(test, dcp->v27_idle_obj);
 }
 
+static int v27_idle_test_fb_dirty(struct drm_framebuffer *fb,
+				  struct drm_file *file, unsigned int flags,
+				  unsigned int color, struct drm_clip_rect *clips,
+				  unsigned int num_clips)
+{
+	return 0;
+}
+
+/*
+ * Firmware-27 internal panels are eligible by default; profiles opted out via
+ * hw.no_v27_idle_cache must never negotiate, allocate, or retain a session.
+ */
+static void v27_idle_profile_opt_out_test(struct kunit *test)
+{
+	struct v27_idle_test *t = v27_idle_test_init(test, false);
+	struct apple_dcp *dcp = &t->dcp;
+	unsigned int base_dev_refs = kref_read(&dcp->dev->kobj.kref);
+
+	KUNIT_EXPECT_TRUE(test, dcp_v27_idle_cache_supported(dcp));
+
+	dcp->hw.no_v27_idle_cache = true;
+	KUNIT_EXPECT_FALSE(test, dcp_v27_idle_cache_supported(dcp));
+
+	v27_idle_test_present_static(t);
+	KUNIT_EXPECT_FALSE(test, dcp->v27_idle_pending_valid);
+	KUNIT_EXPECT_FALSE(test, dcp->v27_idle_template_valid);
+
+	v27_idle_test_trigger_worker(dcp);
+	flush_work(&dcp->iomfb.work);
+	flush_work(&t->ack_work);
+
+	KUNIT_EXPECT_FALSE(test, t->saw_negotiate);
+	KUNIT_EXPECT_FALSE(test, t->saw_swap_start);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->v27_idle_obj, NULL);
+	KUNIT_EXPECT_FALSE(test, dcp->retain_dma);
+	KUNIT_EXPECT_FALSE(test, dcp_test_session_retained(dcp->dev));
+	KUNIT_EXPECT_EQ(test, kref_read(&dcp->dev->kobj.kref), base_dev_refs);
+}
+
+/*
+ * Headless in-kernel client framebuffers (apple_drm_client_fb_funcs without a
+ * dirty hook) draw directly in place without KMS commits and must skip
+ * idle-cache admission without touching dev->fb_helper, while shadowed fbdev
+ * and compositor framebuffers stay eligible.
+ */
+static void v27_idle_skips_unshadowed_fbdev_test(struct kunit *test)
+{
+	struct v27_idle_test *t = v27_idle_test_init(test, false);
+	struct apple_dcp *dcp = &t->dcp;
+	struct drm_framebuffer_funcs plain_funcs = {};
+	struct drm_framebuffer_funcs dirty_funcs = {
+		.dirty = v27_idle_test_fb_dirty,
+	};
+	struct drm_framebuffer fbdev_fb = {
+		.dev = &t->drm,
+		.funcs = &apple_drm_client_fb_funcs,
+	};
+	struct drm_framebuffer kms_fb = {
+		.dev = &t->drm,
+		.funcs = &plain_funcs,
+	};
+	struct dcp_surface surf = {
+		.width = 64,
+		.height = 64,
+		.stride = 256,
+		.buf_size = 64 * 256,
+		.plane_cnt = 1,
+		.plane_cnt2 = 1,
+		.has_planes = true,
+		.planes = { [0] = { .width = 64, .height = 64, .stride = 256, .size = 64 * 256 } },
+	};
+	struct dcp_rect rect = { .w = 64, .h = 64 };
+
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_idle_cache_fb_eligible(NULL));
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_idle_cache_fb_eligible(&fbdev_fb));
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_idle_cache_fb_eligible(&kms_fb));
+
+	fbdev_fb.funcs = &dirty_funcs;
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_idle_cache_fb_eligible(&fbdev_fb));
+	fbdev_fb.funcs = &apple_drm_client_fb_funcs;
+
+	/* Switching from a compositor FB to unshadowed fbdev clears the template. */
+	v27_idle_test_present_static(t);
+	KUNIT_ASSERT_TRUE(test, dcp->v27_idle_template_valid);
+	iomfb_v27_idle_cache_on_present(dcp, &surf, &rect, &rect,
+					iomfb_v27_idle_cache_fb_eligible(&fbdev_fb));
+	iomfb_v27_idle_cache_on_displayed(dcp);
+	iomfb_v27_idle_cache_kick(dcp);
+	KUNIT_EXPECT_FALSE(test, dcp->v27_idle_pending_valid);
+	KUNIT_EXPECT_FALSE(test, dcp->v27_idle_template_valid);
+
+	v27_idle_test_trigger_worker(dcp);
+	flush_work(&dcp->iomfb.work);
+	flush_work(&t->ack_work);
+	KUNIT_EXPECT_FALSE(test, t->saw_negotiate);
+	KUNIT_EXPECT_PTR_EQ(test, dcp->v27_idle_obj, NULL);
+}
+
 static enum dcp_v27_admission admission(const char *compat)
 {
 	const struct dcp_method_entry *methods;
@@ -467,6 +566,8 @@ static struct kunit_case v27_cases[] = {
 	KUNIT_CASE(v27_older_firmware_not_v27_test),
 	KUNIT_CASE(v27_idle_failed_submit_unwind_test),
 	KUNIT_CASE(v27_idle_unwind_preserves_outer_callback_and_pin_test),
+	KUNIT_CASE(v27_idle_profile_opt_out_test),
+	KUNIT_CASE(v27_idle_skips_unshadowed_fbdev_test),
 	{}
 };
 
