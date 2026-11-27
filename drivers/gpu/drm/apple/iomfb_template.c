@@ -4348,6 +4348,26 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
 	 * has reported the panel, which it does after the open.
 	 */
+	/*
+	 * T6030 after a V27 restart: the restarted firmware tears its AV video interface down and
+	 * publishes it again some 250 ms after the display's power-on, then plugs the panel; a mode
+	 * set before that finds no link ("set_mode_shutdown_gated return HPD is 0 link_status is
+	 * 0"), is dropped, and the first swap never completes. Sent once it is back, as at boot.
+	 */
+	{
+		int gen = xchg(&dcp->v27_early_av_gen, 0);
+		ktime_t start = ktime_get();
+
+		if (gen && !wait_event_timeout(dcp->av_video_wq,
+					       atomic_read(&dcp->av_video_gen) != gen,
+					       msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
+			dev_warn(dcp->dev, "V27 wake: no video interface %u ms after the power-on\n",
+				 V27_WAKE_VIDEO_MS);
+		else if (gen)
+			dev_info(dcp->dev, "V27 wake: video interface back %lld ms into the mode set\n",
+				 ktime_ms_delta(ktime_get(), start));
+		WRITE_ONCE(dcp->av_video_reopen, false);
+	}
 	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
 		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
 						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
