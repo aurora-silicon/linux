@@ -539,6 +539,8 @@ struct dcp_camera_indicator {
 	bool has_surf;
 };
 
+struct dcp_s2r_test_ops;
+
 struct apple_dcp {
 	struct dcp_camera_indicator camera_ind;
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
@@ -1038,6 +1040,11 @@ struct apple_dcp {
 	struct notifier_block s2r_pm_nb;
 	/* This driver raised the display domains, and nothing has lowered them since. */
 	bool s2r_domains_up;
+	/* This driver cleared the pipe's PMC interface enables in dcp_s2r_domains_off(). */
+	bool s2r_pmc_off;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+	const struct dcp_s2r_test_ops *s2r_test_ops;
+#endif
 	/* Firmware started by the resume, panel still dark: DPMS on lights it. */
 	bool s2r_prewarmed;
 	struct work_struct s2r_prewarm_work;
@@ -1475,6 +1482,19 @@ static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point poi
 		test_point(dcp, point);
 #endif
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+struct dcp_s2r_test_ops {
+	int (*map_power)(struct apple_dcp *dcp, void __iomem **ps,
+			 void __iomem **pwrgate, void __iomem **pmc);
+	void (*ps_sync)(struct apple_dcp *dcp, void __iomem *reg);
+	int (*pmc_check)(struct apple_dcp *dcp);
+	int (*pmc_off)(struct apple_dcp *dcp);
+	int (*pmc_on)(struct apple_dcp *dcp);
+	int (*boot)(struct apple_dcp *dcp);
+	int (*display_on)(struct apple_dcp *dcp);
+};
+#endif
 
 #if IS_ENABLED(CONFIG_KUNIT)
 void dcp_work_register_backlight(struct work_struct *work);
