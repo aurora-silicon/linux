@@ -1618,6 +1618,23 @@ static void t6030_dispext_off_entry(struct apple_sleep *s)
 		 !!(readl(s->pwrgate + T6030_PWRGATE_DISPEXT0_GRP) & T6030_PWRGATE_GRP_OFF));
 }
 
+/* DIAGNOSTIC: dispext_off_now=1 makes the same writes on a running system and logs them (no sleep) */
+static int t6030_dispext_off_now_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->ps || !s->pwrgate)
+		return -ENODEV;
+	t6030_dispext_off_entry(s);
+	return 0;
+}
+
+static const struct kernel_param_ops t6030_dispext_off_now_ops = {
+	.set = t6030_dispext_off_now_set,
+};
+module_param_cb(dispext_off_now, &t6030_dispext_off_now_ops, NULL, 0200);
+MODULE_PARM_DESC(dispext_off_now, "T6030 DIAGNOSTIC: run dispext_off's writes now, awake, and log them");
+
 static void t6030_sleep_late_entry(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
