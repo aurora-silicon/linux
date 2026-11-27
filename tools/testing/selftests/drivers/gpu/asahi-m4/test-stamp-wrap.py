@@ -74,7 +74,6 @@ impl Firmware{
     fn queue_ring_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
     fn channel_receipt(&self,_ch:Channel,_rec:u32,passed:bool)->Result<bool>{self.last_chan_passed.set(Some(passed));Ok(self.queue_passed)}
     fn queue_receipt(&self,_ch:Channel,_state:&Object,_info:&Object,_head:u32,_rec:u32)->Result<bool>{Ok(self.queue_passed)}
-    fn queue_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
     // The ITS-pair ticks (25G83, and the first choice on 26B123): the receipt tests set them.
     fn compute_ticks(&self,unit:&CUnit)->Result<(u64,u64)>{Ok((unit.its.r64(0)?,unit.its.r64(8)?))}
     __RETIRED__
@@ -624,7 +623,6 @@ mod queue_proof {
             __CHANNEL_RECEIPT__
             __LATCH_COMPUTE_CHANNEL_RECEIPTS__
             __QUEUE_RECEIPT__
-            __QUEUE_PASSED__
         }
         #[test]
         fn cached_qinfo_skips_info_wc_reads_and_authenticates_on_nc_qstate_and_pipe() {
@@ -678,20 +676,20 @@ mod queue_proof {
             assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(false));
             assert_eq!(info.reads.get(), 0);
 
-            // queue_passed with queued work behind flight (including wrap-around) never reads qinfo.
+            // A queued TA flight can pass its ring and channel receipts across a ring wrap.
             fw.engine.ta_head[0] = 2;
             fw.channels.ta = Pipe { read: 2, completion: 2, write: 3 };
             let f = Flight { render_pair: 0, computes: 0, compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
             state.set(qstate::READ, 1);
-            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(true));
+            assert_eq!(fw.queue_ring_passed(Channel::Ta, &state, &info, &f), Ok(true));
             assert_eq!(info.reads.get(), 0);
-            // Unpassed NC qstate::READ rejects queue_passed.
+            assert_eq!(fw.channel_receipt(Channel::Ta, f.rec[0], true), Ok(true));
+            // A lagging read cursor prevents the ring receipt.
             state.set(qstate::READ, 255);
-            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(false));
-            state.set(qstate::READ, 1);
-            // Unpassed pipe completion rejects queue_passed.
+            assert_eq!(fw.queue_ring_passed(Channel::Ta, &state, &info, &f), Ok(false));
+            // A lagging completion cursor prevents the channel receipt.
             fw.channels.ta.completion = 0;
-            assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(false));
+            assert_eq!(fw.channel_receipt(Channel::Ta, f.rec[0], true), Ok(false));
             assert_eq!(info.reads.get(), 0);
         }
         #[test]
@@ -752,7 +750,7 @@ mod queue_proof {
 }
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__LATCH_COMPUTE_CHANNEL_RECEIPTS__','poll.rs','latch_compute_channel_receipts'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__LATCH_COMPUTE_CHANNEL_RECEIPTS__','poll.rs','latch_compute_channel_receipts'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
     body = function((backend/path).read_text(),name)
     if token in ('__RETIRED_FLIGHT__', '__RETIRED_FLIGHT_CLASSES__', '__RETIRED_SNAPSHOT_AT__'):
         body = body.replace('super::hw::', 'hw::')

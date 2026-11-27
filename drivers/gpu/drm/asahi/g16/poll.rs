@@ -1198,26 +1198,6 @@ impl Firmware {
             && self.channel_receipt(channel, record, false)?)
     }
 
-    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
-    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
-    /// pipe's read and completion cursors passed its record.
-    #[allow(dead_code)]
-    fn queue_passed(
-        &self,
-        channel: Channel,
-        state: &super::object::FwObject,
-        info: &super::object::FwObject,
-        f: &Flight,
-    ) -> Result<bool> {
-        let record = match channel {
-            Channel::Compute => f.rec[2],
-            Channel::Ta => f.rec[0],
-            Channel::Fs => f.rec[1],
-        };
-        Ok(self.queue_ring_passed(channel, state, info, f)?
-            && self.channel_receipt(channel, record, true)?)
-    }
-
     /// A full receipt includes stage and notifier stamps, every physical consumer,
     /// the private allocator completion and the internal timestamp pair. An aborted
     /// receipt omits only the writes firmware does not make for an aborted command,

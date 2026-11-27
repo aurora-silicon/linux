@@ -186,7 +186,7 @@ impl<const N: usize> Lifetime<N> {
             };
         }
     }
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn publish(&mut self, k: usize) -> bool {
         self.publish_on(k, 0)
     }

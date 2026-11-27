@@ -156,12 +156,13 @@ struct WaitTarget {
 /// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
 /// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
 /// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
-/// queue, so waits on compute use `ComputeGraph::service_stamp` (linux#3349) and waits on a
-/// render's FS use `RenderGraph::fs_service_stamp`.
+/// queue. Cross-engine data dependencies on compute use `ComputeGraph::service_stamp`
+/// (linux#3349), and those on render use `RenderGraph::fs_service_stamp`.
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
-/// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
-/// recovery paths, and `query_access` CPU-timestamp waits drain `flights` completely first.
+/// (checked against both the waited target and any live `InitBM` flight). Compute and render from
+/// different VMs cannot overlap. Renders of different VMs can overlap on separate pairs.
+/// Recovery and `query_access` CPU-timestamp waits still drain all flights.
 const fn cross_engine_barrier_type(producer_initbm: bool, consumer_initbm: bool) -> BarrierType {
     BarrierType::from_stamp_only(!producer_initbm && !consumer_initbm)
 }
@@ -4070,7 +4071,10 @@ impl Firmware {
         // on another pair waits for that render's TA and FS. Its completion implies every
         // earlier render's, so those waits stand in for this pair's own `prev_barrier` and
         // `fs_dep`, and a pass still takes at most `MAX_RENDER_RING_ENTRIES` entries per ring.
-        // The TA of one VM's render still overlaps the FS of the other VM's.
+        // The TA of one VM's render can still overlap the FS of another VM's. Waiting on
+        // the other pair's FINALIZE fw_stamp orders each engine across pairs. It provides
+        // no cross-pair data visibility. A VM's live renders stay on one pair, and a
+        // dependency on another VM is a host wait for the producer's retirement.
         let prior = if member == 0 {
             self.engine
                 .flights
