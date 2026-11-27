@@ -201,10 +201,21 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		return -ENODEV;
 	}
 	if (!extra || !(r->hints[0] & 1)) {
+		struct device *peer_dev = NULL;
+
 		released = dcp_peer_release_locked(dcp);
+		if (released && !released->peer_unbinding &&
+		    READ_ONCE(released->ext_idle_state) != DCP_EXT_IDLE_CLOSED)
+			peer_dev = dcp_peer_idle_get_locked(released);
+		else
+			released = NULL;
 		mutex_unlock(&dcp_peer_lock);
-		if (released)
+		if (released) {
 			dcp_ext_idle_kick(released);
+			scoped_guard(mutex, &dcp_peer_lock)
+				dcp_peer_idle_put_locked(released);
+			put_device(peer_dev);
+		}
 		memset(&r->allocation, 0, sizeof(r->allocation));
 		return 0;
 	}
@@ -258,19 +269,18 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 	}
 	need_wake = READ_ONCE(peer->ext_idle_state) != DCP_EXT_IDLE_ON;
 	if (need_wake) {
-		peer->peer_waking = true;
+		struct device *peer_dev;
+		int wake_ret;
+
+		peer_dev = dcp_peer_idle_get_locked(peer);
+		peer->peer_waking++;
 		mutex_unlock(&dcp_peer_lock);
-		if (dcp_ext_idle_wake(peer)) {
-			mutex_lock(&dcp_peer_lock);
-			peer->peer_waking = false;
-			if (dcp->peer_reserved == peer && peer->peer_owner == dcp)
-				dcp_peer_release_locked(dcp);
-			mutex_unlock(&dcp_peer_lock);
-			return 0;
-		}
+		wake_ret = dcp_ext_idle_wake(peer);
 		mutex_lock(&dcp_peer_lock);
-		peer->peer_waking = false;
-		if (dcp->peer_unbinding || dcp->crashed ||
+		if (!WARN_ON_ONCE(!peer->peer_waking))
+			peer->peer_waking--;
+		dcp_peer_idle_put_locked(peer);
+		if (wake_ret || dcp->peer_unbinding || dcp->crashed ||
 		    dcp->peer_reserved != peer || peer->peer_owner != dcp ||
 		    peer->peer_unbinding || peer->crashed ||
 		    READ_ONCE(peer->sleep_v27_closed) ||
@@ -278,8 +288,10 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 			if (dcp->peer_reserved == peer && peer->peer_owner == dcp)
 				dcp_peer_release_locked(dcp);
 			mutex_unlock(&dcp_peer_lock);
-			return -ENODEV;
+			put_device(peer_dev);
+			return wake_ret ? 0 : -ENODEV;
 		}
+		put_device(peer_dev);
 	}
 	/*
 	 * The platform limit keeps the reservation: the peer is an engine no

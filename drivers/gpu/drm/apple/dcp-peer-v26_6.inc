@@ -14,6 +14,32 @@
  */
 
 static DEFINE_MUTEX(dcp_peer_lock);
+static DECLARE_WAIT_QUEUE_HEAD(dcp_peer_idle_wq);
+
+static struct device *dcp_peer_idle_get_locked(struct apple_dcp *peer)
+{
+	lockdep_assert_held(&dcp_peer_lock);
+	peer->peer_idle_users++;
+	return get_device(peer->dev);
+}
+
+static void dcp_peer_idle_put_locked(struct apple_dcp *peer)
+{
+	lockdep_assert_held(&dcp_peer_lock);
+	if (!WARN_ON_ONCE(!peer->peer_idle_users) && !--peer->peer_idle_users)
+		wake_up_all(&dcp_peer_idle_wq);
+}
+
+static bool dcp_peer_idle_busy(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp_peer_lock);
+	return dcp->peer_idle_users > 0;
+}
+
+static void dcp_peer_idle_drain(struct apple_dcp *dcp)
+{
+	wait_event(dcp_peer_idle_wq, !dcp_peer_idle_busy(dcp));
+}
 
 /* ---- tiling state (D114/D115 callbacks) ---- */
 

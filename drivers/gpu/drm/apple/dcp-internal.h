@@ -966,7 +966,8 @@ struct apple_dcp {
 	bool ext_idle_disp_saved;
 	bool ext_idle_unsupported;
 	bool ext_idle_initialized;
-	bool peer_waking;
+	unsigned int peer_waking;
+	unsigned int peer_idle_users;
 
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;

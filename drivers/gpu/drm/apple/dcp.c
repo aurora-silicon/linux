@@ -7710,6 +7710,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		apple_sleep_v27_unregister(dev);
 	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
+	dcp_peer_idle_drain(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
 	 * the dead-session path. Owner allocation may have landed in an open
@@ -11063,6 +11064,7 @@ static void dcp_ext_idle_close(struct apple_dcp *dcp, bool wake)
 			dcp_ext_idle_wake_locked(dcp);
 		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_CLOSED);
 	}
+	dcp_peer_idle_drain(dcp);
 }
 
 /*
