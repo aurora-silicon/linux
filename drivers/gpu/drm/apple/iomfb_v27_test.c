@@ -115,6 +115,15 @@ static int v27_idle_test_send(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	return 0;
 }
 
+static int v27_idle_test_send_no_ack(struct apple_dcp *dcp, u8 endpoint,
+				     u64 message)
+{
+	(void)dcp;
+	(void)endpoint;
+	(void)message;
+	return 0;
+}
+
 static void v27_idle_test_sentinel_cb(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct v27_idle_test *t = container_of(dcp, struct v27_idle_test, dcp);
@@ -278,6 +287,7 @@ static void v27_idle_failed_submit_unwind_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, kref_read(&dcp->dev->kobj.kref), base_dev_refs);
 
 	/* Subsequent commands on the unwound channel preserve callback delivery. */
+	dcp->test_send = v27_idle_test_send_no_ack;
 	mutex_lock(&dcp->iomfb.lock);
 	WRITE_ONCE(dcp->iomfb.owner, current);
 	dcp_push(dcp, false, &dcp->v27_methods[dcpep_pipe_set_352],
@@ -325,26 +335,29 @@ static void v27_idle_unwind_preserves_outer_callback_and_pin_test(struct kunit *
 	unsigned int base_dev_refs;
 	int outer_cookie = 0x1111, inner_cookie = 0x2222;
 	u32 prop = 0;
-	int ret;
+	int outer_ret, ret = 0;
+	u8 outer_depth;
 
 	/* Outer slot 0 stays intact when inner slot 1 unwinds on send error. */
 	dcp->test_send = v27_idle_test_fail_second_send;
 	mutex_lock(&dcp->iomfb.lock);
 	WRITE_ONCE(dcp->iomfb.owner, current);
-	ret = iomfb_test_push_context(dcp, DCP_CONTEXT_CMD,
-				      &dcp->v27_methods[dcpep_pipe_set_352],
-				      sizeof(prop), sizeof(prop), &prop,
-				      v27_idle_test_sentinel_cb, &outer_cookie,
-				      true);
-	KUNIT_ASSERT_EQ(test, ret, 0);
-	KUNIT_ASSERT_EQ(test, dcp->ch_cmd.depth, 1);
-	ret = iomfb_test_push_context(dcp, DCP_CONTEXT_CMD,
-				      &dcp->v27_methods[dcpep_pipe_set_352],
-				      sizeof(prop), sizeof(prop), &prop,
-				      v27_idle_test_sentinel_cb, &inner_cookie,
-				      true);
+	outer_ret = iomfb_test_push_context(dcp, DCP_CONTEXT_CMD,
+					    &dcp->v27_methods[dcpep_pipe_set_352],
+					    sizeof(prop), sizeof(prop), &prop,
+					    v27_idle_test_sentinel_cb,
+					    &outer_cookie, true);
+	outer_depth = dcp->ch_cmd.depth;
+	if (!outer_ret && outer_depth == 1)
+		ret = iomfb_test_push_context(dcp, DCP_CONTEXT_CMD,
+					      &dcp->v27_methods[dcpep_pipe_set_352],
+					      sizeof(prop), sizeof(prop), &prop,
+					      v27_idle_test_sentinel_cb,
+					      &inner_cookie, true);
 	WRITE_ONCE(dcp->iomfb.owner, NULL);
 	mutex_unlock(&dcp->iomfb.lock);
+	KUNIT_ASSERT_EQ(test, outer_ret, 0);
+	KUNIT_ASSERT_EQ(test, outer_depth, 1);
 	KUNIT_EXPECT_EQ(test, ret, -EAGAIN);
 	KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 1);
 	KUNIT_EXPECT_NULL(test, dcp->ch_cmd.callbacks[1]);
