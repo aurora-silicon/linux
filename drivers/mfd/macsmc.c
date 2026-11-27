@@ -605,11 +605,15 @@ module_param(smc_cold_init, bool, 0444);
 MODULE_PARM_DESC(smc_cold_init, "T6030 DIAGNOSTIC: boot the SMC's RTKit from IOP power INIT and write macOS's one-time keys, as macOS's boot does");
 
 /*
- * DIAGNOSTIC: macsmc.smc_lite=1 is smc_cold_init without the INIT (which hangs the handed-over SMC
- * on J516s): the usual wake and endpoint 0x20, then START_EP for whichever of the system endpoints
- * 1-4 the endpoint map lists (the SMC's own crashlog buffer acknowledged by echo, as macOS does),
- * then macOS's one-time keys. Every step is logged; none waits longer than an SMC command.
+ * DIAGNOSTIC: macsmc.smc_lite=1 adds to Linux's SMC boot, which already matches macOS's handshake
+ * (one INIT, HELLO, the endpoint map, START_EP 1-4 and 0x20, AP on: lane A's HV records), the two
+ * endpoint messages only macOS sends, then its one-time keys: on ep 1 the echo of the SMC's
+ * crashlog buffer offer (SRAM 0x36de6c000; Linux never replies), on ep 3 0x0008000000000000 (the SMC
+ * answers 0x000300036de72000 on macOS), then UB0C = 01, the six zE* twice and CHLS = 0000. The
+ * usual transport and ops are kept. Every step is logged; none waits longer than an SMC command.
  */
+#define SMC_LITE_CRASHLOG_ECHO	0x001040036de6c000ULL
+#define SMC_LITE_EP3_MSG	0x0008000000000000ULL
 static bool smc_lite;
 module_param(smc_lite, bool, 0444);
 MODULE_PARM_DESC(smc_lite, "T6030 DIAGNOSTIC: after the usual SMC wake, start its system endpoints 1-4 if listed and write macOS's one-time keys (no INIT)");
@@ -808,7 +812,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");
 
-	if (smc_cold_init || smc_lite)
+	if (smc_cold_init)
 		smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops_cold);
 	else if (smc->saved_enabled)
 		smc->rtk = devm_apple_rtkit_init_m5_saved(dev, smc, NULL, 0, &apple_smc_rtkit_ops);
@@ -847,16 +851,12 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
 
 	if (smc_lite) {
-		u8 ep;
-
-		for (ep = 1; ep <= 4; ep++) {
-			if (!apple_rtkit_has_endpoint(smc->rtk, ep)) {
-				dev_info(dev, "smc_lite: endpoint %u not in the map: skipped\n", ep);
-				continue;
-			}
-			dev_info(dev, "smc_lite: START_EP %u: %d\n", ep,
-				 apple_rtkit_start_ep(smc->rtk, ep));
-		}
+		dev_info(dev, "smc_lite: ep 1 (in map %d) echo %#llx: %d\n",
+			 apple_rtkit_has_endpoint(smc->rtk, 1), SMC_LITE_CRASHLOG_ECHO,
+			 apple_rtkit_send_message(smc->rtk, 1, SMC_LITE_CRASHLOG_ECHO, NULL, false));
+		dev_info(dev, "smc_lite: ep 3 (in map %d) %#llx: %d\n",
+			 apple_rtkit_has_endpoint(smc->rtk, 3), SMC_LITE_EP3_MSG,
+			 apple_rtkit_send_message(smc->rtk, 3, SMC_LITE_EP3_MSG, NULL, false));
 	}
 
 	init_completion(&smc->init_done);
