@@ -562,6 +562,7 @@ impl Shared {
                         }
                         firmware.rings.invalidate_statistics();
                         firmware.port.statistics_epoch_bump();
+                        firmware.port.clear_effort_and_busy();
                     }
                     result
                 }
