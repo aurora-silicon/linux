@@ -2892,6 +2892,11 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *  5: the cores: +0/+1 a bit per core (ECPU0-5 bits 0-5, PCPU0-5 bits 6-11) whose power word
  *     never read off in the window, +2/+3 the E and P cluster words' low bytes, +4 every core's
  *     FIQ sources still firing at its last instruction before WFI, ORed (t8142_fiq_sources()).
+ *  6: what else a sleep program would wait on, at the latest sample: a bit per power word not
+ *     off (actual state nonzero), in the order of t6030_obs_ps_words (ECPM, PCPM, AMCC0,
+ *     DCS0-5, AMCC1, DCS6-11, PMP: bits 0-16) then t6030_obs_aon_words (the nub words
+ *     ps-aon +0x58..+0xa8: bits 17-27), in +0..+3 (+3 bits 3:0); +3 bit 4 the PTD request not
+ *     equal to its ack, bit 5 the PTD unread; +4 ECPM's actual state (7:4) and PCPM's (3:0).
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -2919,7 +2924,7 @@ static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode >= 1 && mode <= 5;
+	return mode >= 1 && mode <= 6;
 }
 
 struct t6030_obs {
@@ -2975,6 +2980,42 @@ static void t6030_obs_read(struct apple_sleep *s, struct t6030_obs *o)
 	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
 }
 
+/* obs_timeline=6: ECPM, PCPM, AMCC0, DCS0-5, AMCC1, DCS6-11, PMP ("ps"); the nub words ("ps-aon") */
+static const u16 t6030_obs_ps_words[] = {
+	0x60, 0x68, 0x318, 0x320, 0x328, 0x330, 0x338, 0x340, 0x348, 0x350, 0x358, 0x360,
+	0x368, 0x370, 0x378, 0x380, 0x4c8,
+};
+static const u8 t6030_obs_aon_words[] = {
+	0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8,
+};
+#define T6030_OBS_BLK_PTD		17
+#define T6030_PTD_REQUEST		0x1180
+#define T6030_PTD_ACK			0x11c0
+
+static void t6030_obs_waits(struct apple_sleep *s, u8 *v)
+{
+	void __iomem *ptd = t6030_state(s)->blk[T6030_OBS_BLK_PTD];
+	unsigned int i, n = ARRAY_SIZE(t6030_obs_ps_words);
+	u32 on = 0;
+
+	for (i = 0; i < n; i++)
+		if (FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_obs_ps_words[i])))
+			on |= BIT(i);
+	for (i = 0; i < ARRAY_SIZE(t6030_obs_aon_words); i++)
+		if (FIELD_GET(PS_ACTUAL, readl(s->ps_aon + t6030_obs_aon_words[i])))
+			on |= BIT(n + i);
+	v[0] = on;
+	v[1] = on >> 8;
+	v[2] = on >> 16;
+	v[3] = (on >> 24) & 0xf;
+	if (!ptd)
+		v[3] |= BIT(5);
+	else if (readl(ptd + T6030_PTD_REQUEST) != readl(ptd + T6030_PTD_ACK))
+		v[3] |= BIT(4);
+	v[4] = FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_obs_ps_words[0])) << 4 |
+	       FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_obs_ps_words[1]));
+}
+
 static void t6030_obs_mark(struct apple_sleep *s, u8 *at, unsigned int off, bool hit,
 			   unsigned int k)
 {
@@ -3015,7 +3056,7 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i, w;
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 	unsigned int scale = DIV_ROUND_UP(n, T6030_OBS_LAST + 1);
-	bool pmu2 = mode == 4, values = mode == 2 || pmu2, word = mode == 3, cores = mode == 5;
+	bool pmu2 = mode == 4, values = mode == 2 || pmu2, word = mode == 3, cores = mode >= 5;
 	u16 never_off = GENMASK(11, 0);
 	bool off_seen = false, hit, moved;
 	struct t6030_obs o, ref = {};
@@ -3033,14 +3074,18 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 		if (k == T6030_OBS_SETTLE)
 			ref = o;
 		if (cores) {
-			for (i = 0; i < 12; i++)
-				if (!FIELD_GET(T6030_PS_ACTUAL, readl(s->ps + 8 * i)))
-					never_off &= ~BIT(i);
-			v[0] = never_off & 0xff;
-			v[1] = never_off >> 8;
-			v[2] = o.cluster[0] & 0xff;
-			v[3] = o.cluster[1] & 0xff;
-			v[4] = atomic_read(&sleep_fiq_or);
+			if (mode == 6) {
+				t6030_obs_waits(s, v);
+			} else {
+				for (i = 0; i < 12; i++)
+					if (!FIELD_GET(T6030_PS_ACTUAL, readl(s->ps + 8 * i)))
+						never_off &= ~BIT(i);
+				v[0] = never_off & 0xff;
+				v[1] = never_off >> 8;
+				v[2] = o.cluster[0] & 0xff;
+				v[3] = o.cluster[1] & 0xff;
+				v[4] = atomic_read(&sleep_fiq_or);
+			}
 			for (i = 0; i < ARRAY_SIZE(v); i++) {
 				if (k && v[i] == last[i])
 					continue;
