@@ -58,11 +58,26 @@ MUTATIONS = {
     # A consumed release with an empty list does not mark the work state.
     'no-release': ('context', 'mark.released(super::channel::control_witnessed());', 'let _ = mark;'),
     # A killed context with an empty list returns its cached work state to the pool.
-    'reuse-killed-work-state': ('context', 'if linked || self.kill_published() || self.status.get() != 0 {',
-                                'if linked || self.status.get() != 0 {'),
+    'reuse-killed-work-state': ('context',
+                                '            || self.kill_published()\n', ''),
+    # A stampless-drained context with an empty list returns its cached work state to the pool.
+    'reuse-stampless-drained-work-state': ('context',
+                                           '            || self.stampless_drained()\n', ''),
     # A failed VM with an empty list returns its cached work state to the pool.
-    'reuse-failed-work-state': ('context', 'if linked || self.kill_published() || self.status.get() != 0 {',
-                                'if linked || self.kill_published() {'),
+    'reuse-failed-work-state': ('context',
+                                '            || self.status.get() != 0\n', ''),
+    # Stampless render drops its WorkStateLease before completion stamps arrive.
+    'drop-stampless-work-lease': (
+        'policy-render',
+        '            front.stamps_owed_work = Some(front.packet.completion.work_state()?);\n',
+        '',
+    ),
+    # Pair-wide drain of a stampless render group fails to mark the context stampless-drained.
+    'drop-stampless-drain-mark': (
+        'policy-render',
+        '                active.packet.context.note_stampless_drain();\n',
+        '',
+    ),
     # A compute queue recycled after kill/quarantine returns its cached descriptor ring to the pool.
     'reuse-recycled-descriptor-ring': (
         'policy-runtime',
@@ -742,6 +757,7 @@ pub mod now {
             hold: Arc<mmu::ContextHold>,
             qos: Arc<QosLease>,
             kill_published: core::sync::atomic::AtomicBool,
+            stampless_drained: core::sync::atomic::AtomicBool,
             status: Arc<VmStatus>,
             /// The work-list head the firmware left.
             head: Cell<[u64; 2]>,
@@ -749,6 +765,7 @@ pub mod now {
         impl Context {
             fn work_head(&self) -> Result<[u64; 2]> { Ok(self.head.get()) }
             fn kill_published(&self) -> bool { self.kill_published.load(Ordering::Acquire) }
+            fn stampless_drained(&self) -> bool { self.stampless_drained.load(Ordering::Acquire) }
 @METHODS@
         }
         pub struct WorkStateLease { context: Arc<Context>, word: core::sync::atomic::AtomicU32 }
@@ -764,6 +781,7 @@ pub mod now {
                 work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark,
                 scheduler: Arc::new(SchedulerStorage), hold: Arc::new(mmu::ContextHold), qos: Arc::new(QosLease),
                 kill_published: core::sync::atomic::AtomicBool::new(false),
+                stampless_drained: core::sync::atomic::AtomicBool::new(false),
                 status: Arc::new(VmStatus::new()),
                 head: Cell::new([0, work_base + (UAT_PGSZ + 0x400) as u64]),
             });
@@ -838,6 +856,16 @@ pub mod now {
                            "a killed context's work state is kept out of reuse until stop");
                 assert!(!unmapped(killed_id));
 
+                // A stampless-drained render context with an empty list keeps its cached work state until stop.
+                let (context, stampless_id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                context.stampless_drained.store(true, Ordering::Release);
+                assert!(!context.retain_linked_work(&pool));
+                drop(context);
+                assert_eq!(super::fence(&pool, Family::WorkState, stampless_id), None,
+                           "a stampless-drained context's work state is kept out of reuse until stop");
+                assert!(!unmapped(stampless_id));
+
                 // A failed VM (recovery/fault) with an empty list keeps its cached work state until stop.
                 let (context, failed_id) = new_context(&pool, &alloc);
                 let _ = context.work_head_va();
@@ -853,6 +881,7 @@ pub mod now {
                 let next_ws = super::work_state(&pool, &alloc);
                 assert_ne!(next_ws.id, id);
                 assert_ne!(next_ws.id, killed_id);
+                assert_ne!(next_ws.id, stampless_id);
                 assert_ne!(next_ws.id, failed_id);
                 drop(next_ws);
 
@@ -907,7 +936,7 @@ def source_rules(context, observation, tree):
     assert 'fw::WorkNode::new(self.object.gpu_va() + counter as u64, word)' in context
     # A release is marked only where retain_linked_work found a clean, unkilled, empty-list context.
     linked = block(context, '    pub(crate) fn retain_linked_work(')
-    assert re.search(r'if linked \|\| self\.kill_published\(\) \|\| self\.status\.get\(\) != 0 \{\n'
+    assert re.search(r'if linked\s+\|\| self\.kill_published\(\)\s+\|\| self\.stampless_drained\(\)\s+\|\| self\.status\.get\(\) != 0\s+\{\n'
                      r'\s+self\.work\.lock\(\)\.object\.retain_until_stop\(pool\);\n'
                      r'\s+\} else if let Some\(mark\) = &self\.work_mark \{\n'
                      r'\s+mark\.released\(super::channel::control_witnessed\(\)\);', linked), linked
@@ -927,7 +956,7 @@ def source_rules(context, observation, tree):
     print('source: records and commands mark the work state; only a consumed empty-list release releases it')
 
 
-def cache_policy(context, compute, memory, runtime):
+def cache_policy(context, compute, memory, runtime, render):
     """The firmware-cached prefix and recovery retention policy each pooled G17 object family gets."""
     failures = []
 
@@ -955,6 +984,12 @@ def cache_policy(context, compute, memory, runtime):
         failures.append('compute graph not pooled')
     # Render queue records, retargeted and bound to work slots in place, stay uncached.
     need(memory, r'Family::QueueState,\s*GRAPH_SIZE,\s*0,\s*prot,', 'render queue records uncached')
+    # Stampless render retains its WorkStateLease until post-maintenance stamps arrive,
+    # and marks the context stampless-drained if released via pair-wide drain instead.
+    need(render, r'if stampless \{[^}]*front\.stamps_owed_work = Some\(front\.packet\.completion\.work_state\(\)\?\);[^}]*\}\s*defer\(Deferred::Retired\(',
+         'stampless render retains WorkStateLease across stamps_owed')
+    need(render, r'if active\.stamps_owed \{\s*active\.packet\.context\.note_stampless_drain\(\);',
+         'stampless render drain retains WorkState until stop')
     return failures
 
 
@@ -973,11 +1008,13 @@ def main():
 
     policy = {'context': ctx, 'compute': (DRIVER / 'g17/queue/compute.rs').read_text(),
               'memory': (DRIVER / 'g17/queue/render/memory.rs').read_text(),
-              'runtime': (DRIVER / 'g17/runtime.rs').read_text()}
+              'runtime': (DRIVER / 'g17/runtime.rs').read_text(),
+              'render': (DRIVER / 'g17/queue/render.rs').read_text()}
     if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
         where, old, new = MUTATIONS[args.mutation]
         policy[where[len('policy-'):]] = replace(policy[where[len('policy-'):]], old, new)
-    failures = cache_policy(policy['context'], policy['compute'], policy['memory'], policy['runtime'])
+    failures = cache_policy(policy['context'], policy['compute'], policy['memory'],
+                            policy['runtime'], policy['render'])
     for failure in failures:
         print(f'FAIL line 0: cache policy: {failure}')
     if failures:

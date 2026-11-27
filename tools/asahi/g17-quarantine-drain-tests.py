@@ -204,7 +204,11 @@ impl Completion {
     }
 ''' + command + '\n}\n' + item(completion, 'pub(crate) enum Deferred {') + '\n' + item(completion, 'impl Deferred {') + r'''
 
-pub struct Packet { completion: Arc<Completion> }
+pub struct Context { stampless_drained: AtomicBool }
+impl Context {
+    fn note_stampless_drain(&self) { self.stampless_drained.store(true, Ordering::Release); }
+}
+pub struct Packet { completion: Arc<Completion>, context: Context }
 pub struct Ticket { ordinal: u64 }
 pub struct Active {
     packet: Arc<Packet>,
@@ -312,7 +316,7 @@ fn command(pool: &Arc<Pool>, lease: RenderLease) -> Command {
 }
 fn firmware(pool: &Arc<Pool>, commands: &[(&Command, u64)]) -> Firmware {
     let active = commands.iter().map(|(command, ordinal)| Active {
-        packet: Arc::new(Packet { completion: command.completion.clone() }),
+        packet: Arc::new(Packet { completion: command.completion.clone(), context: Context { stampless_drained: AtomicBool::new(false) } }),
         ticket: Ticket { ordinal: *ordinal },
         stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
     }).collect();

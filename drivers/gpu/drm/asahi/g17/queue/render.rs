@@ -175,9 +175,11 @@ struct Active {
     /// First observation of this group executed and consumed while its stamps lagged.
     stamp_wait_since: Option<u64>,
     /// The group retired on its pass record without completion stamps and its client has its
-    /// result, but the firmware may still store the stamps through its descriptor: the
-    /// descriptor slot stays held until stamps cover the group.
+    /// result, but the firmware may still store the stamps through its descriptor and hold
+    /// dirty cache lines on its work node: both the descriptor slot and `stamps_owed_work`
+    /// stay held until stamps cover the group.
     stamps_owed: bool,
+    stamps_owed_work: Option<Arc<crate::g17::context::WorkStateLease>>,
 }
 
 /// A firmware-retired, unexecuted group must hold on two observations this far
@@ -1280,6 +1282,7 @@ impl Pair {
                 abandoned_since: None,
                 stamp_wait_since: None,
                 stamps_owed: false,
+                stamps_owed_work: None,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -2313,14 +2316,20 @@ impl Pair {
             &front.packet,
             [timestamps[0], timestamps[3]],
         );
+        if stampless {
+            // Retain the work-state lease before Deferred::Retired releases the
+            // submission's own lease: the pass record does not witness cache
+            // writeback on the firmware-cached work node.
+            front.stamps_owed_work = Some(front.packet.completion.work_state()?);
+        }
         defer(Deferred::Retired(
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
         ))?;
         if stampless {
-            // The pass record is no witness that the firmware is done with the descriptor: it
-            // can still store the completion stamps through it, and a reused slot names no
-            // stamp target. Keep the slot until stamps cover the group.
+            // The pass record is no witness that the firmware is done with the descriptor or
+            // its work node: it can still store the completion stamps through it, and a reused
+            // slot names no stamp target. Keep both until stamps cover the group.
             front.stamps_owed = true;
             return Ok(true);
         }
@@ -2888,7 +2897,9 @@ impl Pair {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
             // proof above covers its stamps too (or the kill of its context), so only its
             // descriptor is released. It has no drained result of its own.
-            if !active.stamps_owed {
+            if active.stamps_owed {
+                active.packet.context.note_stampless_drain();
+            } else {
                 let result = active.drained_result.ok_or(EIO)?;
                 defer(Deferred::Drained(active.packet.completion.clone(), result))?;
             }

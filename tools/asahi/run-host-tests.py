@@ -361,7 +361,9 @@ ASAHI_TESTS = {
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'overrun-cached-prefix', 'unseen-strict',
                                    'retain-not-sticky', 'node-unmarked', 'no-release',
-                                   'reuse-killed-work-state', 'reuse-failed-work-state',
+                                   'reuse-killed-work-state', 'reuse-stampless-drained-work-state',
+                                   'reuse-failed-work-state', 'drop-stampless-work-lease',
+                                   'drop-stampless-drain-mark',
                                    'reuse-recycled-descriptor-ring', 'uncached-nodes',
                                    'uncached-descriptors', 'cached-queue-records',
                                    'cached-scheduler'), []),
