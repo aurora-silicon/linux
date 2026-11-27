@@ -858,6 +858,38 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 }
 
 /*
+ * Reconciles a lazy_verify cluster's accepted or pending P-state toward
+ * @target, clamped to current policy bounds and thermal cap, and updates
+ * policy->cur when hardware moves. Called with priv->lock held.
+ *
+ * Returns the P-state the cluster was moved to, or -1.
+ */
+static int apple_soc_cpufreq_lazy_reconcile(struct apple_cpu_priv *priv,
+					    unsigned int target)
+{
+	unsigned int requested, pstate;
+
+	if (priv->waited ||
+	    (priv->policy && !READ_ONCE(priv->policy->fast_switch_enabled)))
+		return -1;
+
+	requested = priv->pending_pstate >= 0 ? priv->pending_pstate :
+						priv->expected_pstate;
+	pstate = apple_soc_cpufreq_clamp_pstate(priv, target);
+	if (pstate == requested || apple_soc_cpufreq_lazy_set(priv, pstate))
+		return -1;
+
+	if (priv->policy && priv->policy->freq_table) {
+		unsigned int cur = apple_soc_cpufreq_pstate_freq(priv->policy,
+								 pstate);
+
+		if (cur)
+			WRITE_ONCE(priv->policy->cur, cur);
+	}
+	return pstate;
+}
+
+/*
  * Applies a new fast die-temperature limit, whose highest P-state is @cap at
  * @freq, to a lazy_verify cluster at once. schedutil picks up a lower limit
  * only at its next frequency update, which a nohz_full CPU running with its
@@ -875,28 +907,13 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 static int apple_soc_cpufreq_lazy_cap(struct apple_cpu_priv *priv,
 				      unsigned int cap, unsigned int freq)
 {
-	unsigned int requested, pstate;
 	unsigned long flags;
-	int moved = -1;
+	int moved;
 
 	raw_spin_lock_irqsave(&priv->lock, flags);
 	priv->cap_pstate = cap;
 	priv->cap_freq = freq;
-	requested = priv->pending_pstate >= 0 ? priv->pending_pstate :
-						priv->expected_pstate;
-	pstate = apple_soc_cpufreq_clamp_pstate(priv, priv->asked_pstate);
-	if (!priv->waited &&
-	    (!priv->policy || READ_ONCE(priv->policy->fast_switch_enabled)) &&
-	    pstate != requested &&
-	    !apple_soc_cpufreq_lazy_set(priv, pstate)) {
-		moved = pstate;
-		if (priv->policy && priv->policy->freq_table) {
-			unsigned int cur = apple_soc_cpufreq_pstate_freq(priv->policy, moved);
-
-			if (cur)
-				WRITE_ONCE(priv->policy->cur, cur);
-		}
-	}
+	moved = apple_soc_cpufreq_lazy_reconcile(priv, priv->asked_pstate);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return moved;
 }
@@ -954,11 +971,20 @@ static int apple_soc_cpufreq_verify_policy(struct cpufreq_policy_data *data)
 	priv = policy->driver_data;
 	if (priv && priv->info->lazy_verify) {
 		unsigned long flags;
+		unsigned int requested;
 
 		raw_spin_lock_irqsave(&priv->lock, flags);
 		priv->policy_min_freq = data->min;
 		priv->policy_max_freq = data->max;
 		priv->policy_bounds_valid = true;
+		/*
+		 * Schedutil skips cpufreq_policy_apply_limits() when
+		 * fast_switch_enabled is set, so reconcile the active or
+		 * pending P-state immediately if new bounds clamp it.
+		 */
+		requested = priv->pending_pstate >= 0 ? priv->pending_pstate :
+							priv->expected_pstate;
+		apple_soc_cpufreq_lazy_reconcile(priv, requested);
 		raw_spin_unlock_irqrestore(&priv->lock, flags);
 	}
 	return 0;
@@ -1256,7 +1282,9 @@ static void apple_fast_die_work(struct work_struct *work)
 	if (ret >= 0) {
 		/*
 		 * Re-apply once the QoS aggregate reflects the lifted limit so
-		 * a tickless cluster restores immediately without waiting for
+		 * a tickless cluster whose last fast-switch request
+		 * (asked_pstate) has not been overwritten by a post-reconcile
+		 * capped fast_switch() restores immediately without waiting for
 		 * policy->update or a scheduler utilization callback. Hold
 		 * fd->lock across the limit read and cap update so a concurrent
 		 * lower sample cannot be overwritten by a stale high limit.
