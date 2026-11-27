@@ -261,17 +261,20 @@
 /*
  * The DP855 panel timing controller. i2c-dp855 reads the panel management
  * devices behind it and shares its I2C engine with the display firmware
- * through the controller's lock. Its chip select is board wiring, so the
- * board files that have the ADT's spi4 function-spi_cs0 enable it.
+ * through the controller's lock. Every T8122 board's ADT has the controller
+ * at /arm-io/spi4/dp855, with the chip select at /arm-io/spi4
+ * function-spi_cs0: GPIO 136 on gpio0 (J613, J615, J504, J433 and J434).
  */
 &spi4 {
+	cs-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
 	tcon: panel-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;
 		spi-max-frequency = <1000000>;
 		spi-cs-setup-delay-ns = <20>;
 		spi-cs-hold-delay-ns = <20>;
-		status = "disabled";
 	};
 };
 
