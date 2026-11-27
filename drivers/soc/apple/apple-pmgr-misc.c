@@ -5,15 +5,21 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/arch_topology.h>
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
+#include <linux/cpu.h>
 #include <linux/cpufreq.h>
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/interconnect-provider.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/kernel_stat.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/mfd/syscon.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -21,9 +27,11 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/rwsem.h>
+#include <linux/sched/topology.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmgr-misc.h>
 #include <linux/sort.h>
+#include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
 #if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST) || IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
@@ -42,24 +50,113 @@
 #define SYS_DEV_PSTATE_SUSPEND 1
 
 #define APPLE_PMGR_IDLE_POLL_MS 250
+#define APPLE_PMGR_TIER_SAMPLE_MS 40
 #define APPLE_PMGR_RAISE_TIMEOUT_US 1000
 #define APPLE_PMGR_PS_ACTUAL GENMASK(7, 4)
 #define APPLE_PMGR_PS_ACTIVE 0xf
+
+#define APPLE_PMGR_GOV_IDLE_CPU_PCT 5
+#define APPLE_PMGR_GOV_IDLE_GPU_PCT 5
+#define APPLE_PMGR_GOV_P_MAX_FULL_PCT 65
+#define APPLE_PMGR_GOV_P_SUM_FULL_PCT 85
+#define APPLE_PMGR_GOV_E_SUM_FULL_PCT 250
+#define APPLE_PMGR_GOV_GPU_FULL_PCT 35
+#define APPLE_PMGR_GOV_GPU_INFLIGHT_MS 10
+#define APPLE_PMGR_GOV_RAISE_FULL_SAMPLES 2
+#define APPLE_PMGR_GOV_HOLD_FULL_MS 500
+#define APPLE_PMGR_GOV_HOLD_LIGHT_MS 500
+#define APPLE_PMGR_GOV_MIN_INTERVAL_MS 100
+
+struct apple_pmgr_voter_spec {
+	const char *label;
+	bool optional;
+};
 
 /*
  * Bandwidth users that keep the fabric up whenever their power domain is
  * active. External display and ANE system domains stay on even when idle,
  * so external displays vote through apple_pmgr_fabric_hold() instead, and
- * the ANE is not covered.
+ * the ANE is not covered. venc_dma (the encoder's own domain, rather than
+ * parent venc_sys which stays on for attached AVE DARTs when unbound) is
+ * optional so platforms whose DT omits it keep voters_ok intact.
  */
-static const char * const apple_pmgr_fabric_voters[] = {
-	"gfx", "avd_sys", "isp_sys",
+static const struct apple_pmgr_voter_spec apple_pmgr_fabric_voters[] = {
+	{ .label = "gfx" },
+	{ .label = "avd_sys" },
+	{ .label = "isp_sys" },
+	{ .label = "venc_dma", .optional = true },
 };
 
 enum sys_device {
 	DEV_FABRIC,
 	DEV_DCS,
 	DEV_MAX,
+};
+
+enum apple_pmgr_tier {
+	APPLE_PMGR_TIER_IDLE = 0,
+	APPLE_PMGR_TIER_LIGHT = 1,
+	APPLE_PMGR_TIER_FULL = 2,
+	APPLE_PMGR_TIER_MAX,
+};
+
+static const char * const apple_pmgr_tier_names[APPLE_PMGR_TIER_MAX] = {
+	[APPLE_PMGR_TIER_IDLE] = "idle",
+	[APPLE_PMGR_TIER_LIGHT] = "light",
+	[APPLE_PMGR_TIER_FULL] = "full",
+};
+
+struct apple_pmgr_gov_cfg {
+	unsigned int idle_cpu_pct;
+	unsigned int idle_gpu_pct;
+	unsigned int p_max_full_pct;
+	unsigned int p_sum_full_pct;
+	unsigned int e_sum_full_pct;
+	unsigned int gpu_full_pct;
+	unsigned int gpu_inflight_full_ms;
+	unsigned int raise_full_samples;
+	unsigned int hold_full_ms;
+	unsigned int hold_light_ms;
+	unsigned int min_interval_ms;
+};
+
+static const struct apple_pmgr_gov_cfg apple_pmgr_gov_cfg_default = {
+	.idle_cpu_pct = APPLE_PMGR_GOV_IDLE_CPU_PCT,
+	.idle_gpu_pct = APPLE_PMGR_GOV_IDLE_GPU_PCT,
+	.p_max_full_pct = APPLE_PMGR_GOV_P_MAX_FULL_PCT,
+	.p_sum_full_pct = APPLE_PMGR_GOV_P_SUM_FULL_PCT,
+	.e_sum_full_pct = APPLE_PMGR_GOV_E_SUM_FULL_PCT,
+	.gpu_full_pct = APPLE_PMGR_GOV_GPU_FULL_PCT,
+	.gpu_inflight_full_ms = APPLE_PMGR_GOV_GPU_INFLIGHT_MS,
+	.raise_full_samples = APPLE_PMGR_GOV_RAISE_FULL_SAMPLES,
+	.hold_full_ms = APPLE_PMGR_GOV_HOLD_FULL_MS,
+	.hold_light_ms = APPLE_PMGR_GOV_HOLD_LIGHT_MS,
+	.min_interval_ms = APPLE_PMGR_GOV_MIN_INTERVAL_MS,
+};
+
+struct apple_pmgr_gov_sample {
+	unsigned int e_max;
+	unsigned int e_sum;
+	unsigned int p_max;
+	unsigned int p_sum;
+	unsigned int gpu_pct;
+	unsigned int gpu_inflight_ms;
+	bool gpu_inflight;
+	bool hard_override;
+};
+
+struct apple_pmgr_gov {
+	enum apple_pmgr_tier tier;
+	bool initialized;
+	bool transitioned;
+	unsigned int full_streak;
+	u64 last_full_ns;
+	u64 last_light_ns;
+	u64 last_transition_ns;
+	u64 tier_since_ns;
+	u64 residency_ns[APPLE_PMGR_TIER_MAX];
+	u64 transitions;
+	u64 rate_limited;
 };
 
 struct apple_pmgr_sys_device {
@@ -73,7 +170,10 @@ struct apple_pmgr_misc_hw {
 	u32 dcs_valid_states;
 	u32 default_idle_fabric;
 	u32 default_idle_dcs;
+	u32 light_fabric;
+	u32 light_dcs;
 	bool single_step;
+	bool tiered_scaling;
 };
 
 struct apple_pmgr_cpu_snap {
@@ -92,15 +192,18 @@ struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
 
-	/* Idle fabric governor; lock serializes fabric writes while awake. */
+	/* Fabric/DCS governor; lock serializes writes and governor state. */
 	struct mutex lock;
-	struct delayed_work idle_work;		/* deferrable: fabric high */
-	struct delayed_work idle_work_prompt;	/* bounded raise: fabric low */
+	struct delayed_work idle_work;		/* deferrable: fabric high / held */
+	struct delayed_work idle_work_prompt;	/* bounded raise: fabric/DCS lowered */
 	u32 fabric_now;				/* protected by lock */
 	u32 dcs_now;				/* protected by lock */
 	unsigned int holds;			/* protected by lock */
 	bool sleeping;				/* protected by lock */
 	bool single_step;
+	bool tiered_scaling;
+	u32 light_fabric;
+	u32 light_dcs;
 	bool voters_ok;
 	bool pmp_owned; /* PMP is described: no governor, holds don't raise */
 	bool pmp_sleep; /* PMP runs: this sleep leaves DCS to it (see prepare) */
@@ -117,6 +220,12 @@ struct apple_pmgr_misc {
 		u32 reg;
 	} votes[ARRAY_SIZE(apple_pmgr_fabric_voters)];
 	struct apple_pmgr_cpu_snap *cpu_snap;
+	struct apple_pmgr_gov gov;
+	struct apple_pmgr_gov_cfg gov_cfg;
+	struct apple_pmgr_gov_sample last_sample;
+	bool gov_primed;
+	u64 gov_gpu_prev_ns;
+	u64 gov_last_ns;
 };
 
 static struct apple_pmgr_misc *apple_pmgr_misc_inst;
@@ -126,11 +235,180 @@ static unsigned int idle_dcs_pstate;
 static bool idle_fabric_pstate_explicit;
 static bool idle_dcs_pstate_explicit;
 static atomic_t apple_pmgr_gpu_tracked = ATOMIC_INIT(0);
-static atomic_t apple_pmgr_gpu_busy = ATOMIC_INIT(0);
+
+/* IRQ/atomic-safe GPU duty-cycle state pushed on busy/idle edges. */
+static struct {
+	spinlock_t lock;	/* protects all fields below */
+	unsigned int busy_count;
+	u64 busy_since_ns;
+	u64 busy_ns;
+	bool wake_pending;
+	struct apple_pmgr_misc *wake;
+} apple_pmgr_gpu = {
+	.lock = __SPIN_LOCK_UNLOCKED(apple_pmgr_gpu.lock),
+};
 
 static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc);
 static int apple_pmgr_raise_dcs(struct apple_pmgr_misc *misc);
 static bool apple_pmgr_voters_active(struct apple_pmgr_misc *misc);
+static void apple_pmgr_queue_work(struct apple_pmgr_misc *misc,
+				  bool deferrable, unsigned int delay_ms);
+
+static unsigned int apple_pmgr_busy_pct(u64 busy, u64 wall)
+{
+	if (!wall)
+		return 0;
+	if (busy >= wall)
+		return 100;
+	if (busy > U64_MAX / 100)
+		return div64_u64(busy, div64_u64(wall, 100));
+	return div64_u64(busy * 100, wall);
+}
+
+static unsigned int apple_pmgr_cpu_busy_pct(u64 idle0, u64 wall0, u64 idle1, u64 wall1)
+{
+	u64 dw, di;
+
+	if (wall1 <= wall0 || idle1 < idle0)
+		return 0;
+	dw = wall1 - wall0;
+	di = idle1 - idle0;
+	return di >= dw ? 0 : apple_pmgr_busy_pct(dw - di, dw);
+}
+
+static void apple_pmgr_gov_force_tier(struct apple_pmgr_gov *gov,
+				      enum apple_pmgr_tier tier, u64 now_ns)
+{
+	if (!gov->initialized) {
+		gov->tier = tier;
+		gov->tier_since_ns = now_ns;
+		gov->last_full_ns = now_ns;
+		gov->last_light_ns = now_ns;
+		gov->initialized = true;
+		return;
+	}
+	if (gov->tier != tier) {
+		if (now_ns > gov->tier_since_ns)
+			gov->residency_ns[gov->tier] += now_ns - gov->tier_since_ns;
+		gov->tier = tier;
+		gov->tier_since_ns = now_ns;
+		gov->last_transition_ns = now_ns;
+		gov->transitioned = true;
+		gov->transitions++;
+	}
+	if (tier == APPLE_PMGR_TIER_FULL) {
+		gov->last_full_ns = now_ns;
+		gov->last_light_ns = now_ns;
+	} else if (tier == APPLE_PMGR_TIER_LIGHT) {
+		gov->last_light_ns = now_ns;
+	}
+	gov->full_streak = 0;
+}
+
+/*
+ * Pure tiered governor step: no MMIO, locking or clock source.
+ *
+ * Hard overrides promote to FULL immediately and bypass rate limiting.
+ * Otherwise: IDLE -> LIGHT promotes in 1 sample; LIGHT -> FULL promotes after
+ * raise_full_samples consecutive FULL-demand samples (or immediately on a
+ * continuous GPU job at or above gpu_inflight_full_ms); demotions hold for
+ * hold_full_ms (FULL -> LIGHT) and hold_light_ms (LIGHT -> IDLE), with
+ * min_interval_ms rate limiting non-override transitions.
+ */
+static enum apple_pmgr_tier
+apple_pmgr_gov_step(struct apple_pmgr_gov *gov,
+		    const struct apple_pmgr_gov_cfg *cfg,
+		    u64 now_ns, const struct apple_pmgr_gov_sample *sample)
+{
+	unsigned int raise_samples = cfg->raise_full_samples ?: 1;
+	u64 hold_full_ns = (u64)cfg->hold_full_ms * NSEC_PER_MSEC;
+	u64 hold_light_ns = (u64)cfg->hold_light_ms * NSEC_PER_MSEC;
+	u64 min_interval_ns = (u64)cfg->min_interval_ms * NSEC_PER_MSEC;
+	bool gpu_long, full_demand, light_demand;
+	enum apple_pmgr_tier want = gov->tier;
+
+	if (!gov->initialized) {
+		gov->tier_since_ns = now_ns;
+		gov->last_full_ns = now_ns;
+		gov->last_light_ns = now_ns;
+		gov->initialized = true;
+	}
+
+	gpu_long = sample->gpu_inflight &&
+		   sample->gpu_inflight_ms >= cfg->gpu_inflight_full_ms;
+	full_demand = sample->hard_override ||
+		      sample->p_max >= cfg->p_max_full_pct ||
+		      sample->p_sum >= cfg->p_sum_full_pct ||
+		      sample->e_sum >= cfg->e_sum_full_pct ||
+		      sample->gpu_pct >= cfg->gpu_full_pct ||
+		      gpu_long;
+	light_demand = full_demand ||
+		       sample->e_max > cfg->idle_cpu_pct ||
+		       sample->p_max > cfg->idle_cpu_pct ||
+		       sample->gpu_pct >= cfg->idle_gpu_pct ||
+		       sample->gpu_inflight;
+
+	if (full_demand) {
+		if (gov->full_streak < UINT_MAX)
+			gov->full_streak++;
+		gov->last_full_ns = now_ns;
+		gov->last_light_ns = now_ns;
+	} else {
+		gov->full_streak = 0;
+		if (light_demand)
+			gov->last_light_ns = now_ns;
+	}
+
+	if (sample->hard_override) {
+		want = APPLE_PMGR_TIER_FULL;
+	} else {
+		switch (gov->tier) {
+		case APPLE_PMGR_TIER_IDLE:
+			if (full_demand && (gpu_long || gov->full_streak >= raise_samples))
+				want = APPLE_PMGR_TIER_FULL;
+			else if (light_demand)
+				want = APPLE_PMGR_TIER_LIGHT;
+			break;
+		case APPLE_PMGR_TIER_LIGHT:
+			if (full_demand && (gpu_long || gov->full_streak >= raise_samples))
+				want = APPLE_PMGR_TIER_FULL;
+			else if (!light_demand && now_ns >= gov->last_light_ns &&
+				 now_ns - gov->last_light_ns >= hold_light_ns)
+				want = APPLE_PMGR_TIER_IDLE;
+			break;
+		case APPLE_PMGR_TIER_FULL:
+			if (!full_demand && now_ns >= gov->last_full_ns &&
+			    now_ns - gov->last_full_ns >= hold_full_ns)
+				want = APPLE_PMGR_TIER_LIGHT;
+			break;
+		default:
+			want = APPLE_PMGR_TIER_FULL;
+			break;
+		}
+	}
+
+	if (want == gov->tier)
+		return gov->tier;
+
+	if (!sample->hard_override && gov->transitioned &&
+	    now_ns >= gov->last_transition_ns &&
+	    now_ns - gov->last_transition_ns < min_interval_ns) {
+		gov->rate_limited++;
+		return gov->tier;
+	}
+
+	if (now_ns > gov->tier_since_ns)
+		gov->residency_ns[gov->tier] += now_ns - gov->tier_since_ns;
+	if (gov->tier == APPLE_PMGR_TIER_FULL && want == APPLE_PMGR_TIER_LIGHT)
+		gov->last_light_ns = now_ns;
+
+	gov->tier = want;
+	gov->tier_since_ns = now_ns;
+	gov->last_transition_ns = now_ns;
+	gov->transitioned = true;
+	gov->transitions++;
+	return gov->tier;
+}
 
 #ifdef CONFIG_ARM64
 static noinline u32 apple_pmgr_perf_step(void __iomem *reg, u32 state)
@@ -622,6 +900,158 @@ static int apple_pmgr_raise_dcs(struct apple_pmgr_misc *misc)
 	return ret;
 }
 
+static int apple_pmgr_apply_targets(struct apple_pmgr_misc *misc,
+				    u32 target_fab, u32 target_dcs)
+{
+	u32 active_fab = misc->devices[DEV_FABRIC].active_state;
+	u32 active_dcs = misc->devices[DEV_DCS].active_state;
+	bool has_dcs = misc->devices[DEV_DCS].base && !misc->dcs_data;
+	bool fab_raising, fab_lowering, dcs_raising, dcs_lowering;
+	int ret = 0;
+
+	lockdep_assert_held(&misc->lock);
+	if (misc->pmp_owned)
+		return 0;
+
+	fab_raising = (misc->fabric_now == U32_MAX && target_fab == active_fab) ||
+		      (misc->fabric_now != U32_MAX && target_fab > misc->fabric_now);
+	fab_lowering = (misc->fabric_now == U32_MAX && target_fab < active_fab) ||
+		       (misc->fabric_now != U32_MAX && target_fab < misc->fabric_now);
+	dcs_raising = has_dcs &&
+		      ((misc->dcs_now == U32_MAX && target_dcs == active_dcs) ||
+		       (misc->dcs_now != U32_MAX && target_dcs > misc->dcs_now));
+	dcs_lowering = has_dcs &&
+		       ((misc->dcs_now == U32_MAX && target_dcs < active_dcs) ||
+			(misc->dcs_now != U32_MAX && target_dcs < misc->dcs_now));
+
+	/* Promote fabric first, then DCS. */
+	if (fab_raising) {
+		if (target_fab == active_fab)
+			ret = apple_pmgr_raise_fabric(misc);
+		else
+			ret = apple_pmgr_write_fabric(misc, target_fab);
+		if (ret)
+			return ret;
+	}
+
+	if (dcs_raising) {
+		if (target_dcs == active_dcs)
+			ret = apple_pmgr_raise_dcs(misc);
+		else
+			ret = apple_pmgr_write_dcs(misc, target_dcs);
+		if (ret)
+			return ret;
+	} else if (dcs_lowering) {
+		/* Demote DCS first, then fabric. */
+		ret = apple_pmgr_write_dcs(misc, target_dcs);
+		if (ret)
+			return ret;
+	}
+
+	if (fab_lowering)
+		ret = apple_pmgr_write_fabric(misc, target_fab);
+
+	return ret;
+}
+
+static void apple_pmgr_tier_targets(struct apple_pmgr_misc *misc,
+				    enum apple_pmgr_tier tier,
+				    unsigned int idle_fab,
+				    unsigned int idle_dcs,
+				    u32 *target_fab, u32 *target_dcs)
+{
+	u32 active_fab = misc->devices[DEV_FABRIC].active_state;
+	u32 active_dcs = misc->devices[DEV_DCS].active_state;
+	bool fab_ok = idle_fab && idle_fab < active_fab;
+	bool dcs_ok = idle_dcs && idle_dcs < active_dcs &&
+		      misc->devices[DEV_DCS].base && !misc->dcs_data &&
+		      (!misc->dcs_valid_states ||
+		       apple_pmgr_dcs_state_valid(misc, idle_dcs));
+	u32 light_fab, light_dcs;
+
+	switch (tier) {
+	case APPLE_PMGR_TIER_IDLE:
+		*target_fab = fab_ok ? idle_fab : active_fab;
+		*target_dcs = dcs_ok ? idle_dcs : active_dcs;
+		break;
+	case APPLE_PMGR_TIER_LIGHT:
+		if (fab_ok) {
+			light_fab = misc->light_fabric ?: idle_fab;
+			*target_fab = clamp(light_fab, (u32)idle_fab, active_fab);
+		} else {
+			*target_fab = active_fab;
+		}
+		if (dcs_ok) {
+			light_dcs = misc->light_dcs ?: idle_dcs;
+			light_dcs = clamp(light_dcs, (u32)idle_dcs, active_dcs);
+			if (misc->dcs_valid_states &&
+			    !apple_pmgr_dcs_state_valid(misc, light_dcs))
+				light_dcs = active_dcs;
+			*target_dcs = light_dcs;
+		} else {
+			*target_dcs = active_dcs;
+		}
+		break;
+	case APPLE_PMGR_TIER_FULL:
+	default:
+		*target_fab = active_fab;
+		*target_dcs = active_dcs;
+		break;
+	}
+}
+
+static void apple_pmgr_gpu_wake_set(struct apple_pmgr_misc *misc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	apple_pmgr_gpu.wake = misc;
+	if (!misc)
+		apple_pmgr_gpu.wake_pending = false;
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+}
+
+static void apple_pmgr_gpu_wake_clear(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	apple_pmgr_gpu.wake_pending = false;
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+}
+
+static unsigned int apple_pmgr_gpu_busy_count(void)
+{
+	unsigned long flags;
+	unsigned int count;
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	count = apple_pmgr_gpu.busy_count;
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+	return count;
+}
+
+static void apple_pmgr_gpu_snapshot(u64 now, u64 *busy_ns, bool *inflight,
+				    unsigned int *inflight_ms)
+{
+	unsigned long flags;
+	u64 ns, dur_ns = 0;
+	bool active;
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	ns = apple_pmgr_gpu.busy_ns;
+	active = apple_pmgr_gpu.busy_count > 0;
+	if (active && now > apple_pmgr_gpu.busy_since_ns) {
+		dur_ns = now - apple_pmgr_gpu.busy_since_ns;
+		ns += dur_ns;
+	}
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+
+	*busy_ns = ns;
+	*inflight = active;
+	*inflight_ms = min_t(u64, div_u64(dur_ns, NSEC_PER_MSEC), UINT_MAX);
+}
+
 /**
  * apple_pmgr_fabric_hold() - keep the fabric at its boot p-state
  *
@@ -643,6 +1073,9 @@ int apple_pmgr_fabric_hold(void)
 	misc->holds++;
 	ret = apple_pmgr_raise_fabric(misc);
 	ret = apple_pmgr_raise_dcs(misc) ?: ret;
+	if (misc->tiered_scaling && !misc->pmp_owned)
+		apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL,
+					  ktime_get_ns());
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_fabric_hold);
@@ -655,8 +1088,18 @@ void apple_pmgr_fabric_release(void)
 	if (!misc)
 		return;
 	guard(mutex)(&misc->lock);
-	if (!WARN_ON_ONCE(!misc->holds))
+	if (!WARN_ON_ONCE(!misc->holds)) {
 		misc->holds--;
+		if (misc->tiered_scaling && !misc->holds &&
+		    !misc->sleeping && !misc->pmp_owned &&
+		    (READ_ONCE(idle_fabric_pstate) || READ_ONCE(idle_dcs_pstate))) {
+			u64 now = ktime_get_ns();
+
+			misc->gov.last_full_ns = now;
+			misc->gov.last_light_ns = now;
+			apple_pmgr_queue_work(misc, false, APPLE_PMGR_TIER_SAMPLE_MS);
+		}
+	}
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_fabric_release);
 
@@ -678,67 +1121,104 @@ void apple_pmgr_gpu_tracking_stop(void)
 	if (!misc->sleeping && apple_pmgr_voters_active(misc)) {
 		apple_pmgr_raise_fabric(misc);
 		apple_pmgr_raise_dcs(misc);
+		if (misc->tiered_scaling && !misc->pmp_owned)
+			apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL,
+						  ktime_get_ns());
 	}
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_gpu_tracking_stop);
 
 int apple_pmgr_gpu_busy_get(void)
 {
-	guard(rwsem_read)(&apple_pmgr_inst_sem);
-	struct apple_pmgr_misc *misc = smp_load_acquire(&apple_pmgr_misc_inst);
-	int ret;
+	unsigned long flags;
+	u64 now = ktime_get_ns();
 
-	atomic_inc(&apple_pmgr_gpu_busy);
-	if (!misc)
-		return 0;
-	guard(mutex)(&misc->lock);
-	if (misc->sleeping)
-		return 0;
-	ret = apple_pmgr_raise_fabric(misc);
-	ret = apple_pmgr_raise_dcs(misc) ?: ret;
-	if (ret)
-		atomic_dec(&apple_pmgr_gpu_busy);
-	return ret;
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	if (apple_pmgr_gpu.busy_count++ == 0) {
+		apple_pmgr_gpu.busy_since_ns = now;
+		if (apple_pmgr_gpu.wake &&
+		    (READ_ONCE(idle_fabric_pstate) || READ_ONCE(idle_dcs_pstate))) {
+			struct apple_pmgr_misc *misc = apple_pmgr_gpu.wake;
+
+			/*
+			 * Not cancel_delayed_work_sync: callers may hold
+			 * locks or run in atomic context. Pull in both a
+			 * deferrable wait and a longer IDLE-tier poll.
+			 */
+			apple_pmgr_gpu.wake_pending = true;
+			cancel_delayed_work(&misc->idle_work);
+			mod_delayed_work(system_freezable_power_efficient_wq,
+					 &misc->idle_work_prompt, 0);
+		}
+	}
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_gpu_busy_get);
 
 void apple_pmgr_gpu_busy_put(void)
 {
-	WARN_ON_ONCE(atomic_dec_return(&apple_pmgr_gpu_busy) < 0);
+	unsigned long flags;
+	u64 now = ktime_get_ns();
+
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	if (WARN_ON_ONCE(!apple_pmgr_gpu.busy_count)) {
+		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+		return;
+	}
+	if (--apple_pmgr_gpu.busy_count == 0) {
+		apple_pmgr_gpu.wake_pending = false;
+		if (now > apple_pmgr_gpu.busy_since_ns)
+			apple_pmgr_gpu.busy_ns += now - apple_pmgr_gpu.busy_since_ns;
+	}
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_gpu_busy_put);
 
-static bool apple_pmgr_voters_active(struct apple_pmgr_misc *misc)
+static bool apple_pmgr_hard_voters_active(struct apple_pmgr_misc *misc)
 {
 	unsigned int i;
 	u32 val;
 
 	for (i = 0; i < ARRAY_SIZE(misc->votes); i++) {
-		if (i == 0 && atomic_read(&apple_pmgr_gpu_tracked) > 0) {
-			if (atomic_read(&apple_pmgr_gpu_busy) > 0)
-				return true;
+		if (i == 0 && atomic_read(&apple_pmgr_gpu_tracked) > 0)
 			continue;
+		if (!misc->votes[i].regmap) {
+			if (apple_pmgr_fabric_voters[i].optional)
+				continue;
+			return true;
 		}
 		/*
 		 * Only the actual state shows activity: the GPU domain keeps its
 		 * target on with auto power gating and the hardware gates it
-		 * when idle. Missing or unreadable voter counts as busy.
+		 * when idle. Unreadable voters count as busy.
 		 */
-		if (!misc->votes[i].regmap ||
-		    regmap_read(misc->votes[i].regmap, misc->votes[i].reg, &val) ||
+		if (regmap_read(misc->votes[i].regmap, misc->votes[i].reg, &val) ||
 		    FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) == APPLE_PMGR_PS_ACTIVE)
 			return true;
 	}
 	return false;
 }
 
-/* Every expected voter must be found, or the governor never lowers. */
+static bool apple_pmgr_voters_active(struct apple_pmgr_misc *misc)
+{
+	if (atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
+	    apple_pmgr_gpu_busy_count() > 0)
+		return true;
+	return apple_pmgr_hard_voters_active(misc);
+}
+
+/* Every required voter must be found, or the governor never lowers. */
 static void apple_pmgr_find_voters(struct apple_pmgr_misc *misc)
 {
-	unsigned int found = 0, i;
+	unsigned int required = 0, found_req = 0, i;
 	struct device_node *np;
 	const char *label;
 	u32 reg;
+
+	for (i = 0; i < ARRAY_SIZE(apple_pmgr_fabric_voters); i++)
+		if (!apple_pmgr_fabric_voters[i].optional)
+			required++;
 
 	for_each_compatible_node(np, NULL, "apple,pmgr-pwrstate") {
 		if (!of_device_is_available(np) ||
@@ -748,7 +1228,7 @@ static void apple_pmgr_find_voters(struct apple_pmgr_misc *misc)
 		for (i = 0; i < ARRAY_SIZE(apple_pmgr_fabric_voters); i++) {
 			struct regmap *map;
 
-			if (strcmp(label, apple_pmgr_fabric_voters[i]) ||
+			if (strcmp(label, apple_pmgr_fabric_voters[i].label) ||
 			    misc->votes[i].regmap)
 				continue;
 			map = syscon_node_to_regmap(np->parent);
@@ -756,18 +1236,94 @@ static void apple_pmgr_find_voters(struct apple_pmgr_misc *misc)
 				break;
 			misc->votes[i].regmap = map;
 			misc->votes[i].reg = reg;
-			found++;
+			if (!apple_pmgr_fabric_voters[i].optional)
+				found_req++;
 			break;
 		}
 	}
-	misc->voters_ok = found == ARRAY_SIZE(apple_pmgr_fabric_voters);
+	misc->voters_ok = found_req == required;
 	/* Desktops have no ISP: say so only where the governor is wanted. */
 	if (!misc->voters_ok && READ_ONCE(idle_fabric_pstate))
-		dev_warn(misc->dev, "idle fabric: found %u of %zu bandwidth voters, staying high\n",
-			 found, ARRAY_SIZE(apple_pmgr_fabric_voters));
+		dev_warn(misc->dev, "idle fabric: found %u of %u required bandwidth voters, staying high\n",
+			 found_req, required);
 	else if (!misc->voters_ok)
-		dev_dbg(misc->dev, "idle fabric: found %u of %zu bandwidth voters\n",
-			found, ARRAY_SIZE(apple_pmgr_fabric_voters));
+		dev_dbg(misc->dev, "idle fabric: found %u of %u required bandwidth voters\n",
+			found_req, required);
+}
+
+static bool apple_pmgr_cpu_is_little(unsigned int cpu)
+{
+	return arch_scale_cpu_capacity(cpu) < SCHED_CAPACITY_SCALE;
+}
+
+static bool apple_pmgr_sample_load(struct apple_pmgr_misc *misc, u64 now,
+				   struct apple_pmgr_gov_sample *sample)
+{
+	u64 period = (u64)APPLE_PMGR_TIER_SAMPLE_MS * NSEC_PER_MSEC;
+	unsigned int gpu_inflight_ms = 0;
+	bool gpu_inflight = false;
+	u64 gpu_ns = 0;
+	unsigned int cpu;
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmgr_sample_load, misc, now, sample);
+#endif
+	if (misc->cpu_snap) {
+		cpus_read_lock();
+		for_each_possible_cpu(cpu) {
+			if (cpu < nr_cpu_ids && !cpu_online(cpu))
+				misc->cpu_snap[cpu].valid = false;
+		}
+		for_each_online_cpu(cpu) {
+			struct apple_pmgr_cpu_snap *s;
+			u64 wall = 0, idle, iowait;
+
+			if (cpu >= nr_cpu_ids)
+				continue;
+			s = &misc->cpu_snap[cpu];
+			idle = get_cpu_idle_time_us(cpu, NULL);
+			iowait = get_cpu_iowait_time_us(cpu, &wall);
+			if (idle == (u64)-1 || iowait == (u64)-1)
+				continue;
+			idle += iowait;
+			if (misc->gov_primed && s->valid && wall > s->wall_us &&
+			    (wall - s->wall_us) * NSEC_PER_USEC <= 10 * period) {
+				unsigned int pct = apple_pmgr_cpu_busy_pct(s->idle_us, s->wall_us,
+									   idle, wall);
+
+				s->was_idle = pct <= APPLE_PMGR_GOV_IDLE_CPU_PCT;
+				if (apple_pmgr_cpu_is_little(cpu)) {
+					sample->e_max = max(sample->e_max, pct);
+					sample->e_sum += pct;
+				} else {
+					sample->p_max = max(sample->p_max, pct);
+					sample->p_sum += pct;
+				}
+			}
+			s->idle_us = idle;
+			s->wall_us = wall;
+			s->valid = true;
+		}
+		cpus_read_unlock();
+	}
+
+	apple_pmgr_gpu_snapshot(now, &gpu_ns, &gpu_inflight, &gpu_inflight_ms);
+	if (misc->gov_primed && now > misc->gov_last_ns) {
+		u64 dgpu = gpu_ns >= misc->gov_gpu_prev_ns ?
+			   gpu_ns - misc->gov_gpu_prev_ns : 0;
+
+		sample->gpu_pct = apple_pmgr_busy_pct(dgpu, now - misc->gov_last_ns);
+	}
+	misc->gov_gpu_prev_ns = gpu_ns;
+	misc->gov_last_ns = now;
+	sample->gpu_inflight = gpu_inflight;
+	sample->gpu_inflight_ms = gpu_inflight_ms;
+
+	if (!misc->gov_primed) {
+		misc->gov_primed = true;
+		return false;
+	}
+	return true;
 }
 
 /* True while every cpufreq policy runs at its lowest frequency or is idle. */
@@ -821,44 +1377,171 @@ static bool apple_pmgr_cpus_at_min(void)
 	return at_min;
 }
 
+static void apple_pmgr_queue_work(struct apple_pmgr_misc *misc,
+				  bool deferrable, unsigned int delay_ms)
+{
+	unsigned long delay;
+	unsigned long flags;
+	bool gpu_busy, wake_pending;
+
+	lockdep_assert_held(&misc->lock);
+	/*
+	 * Freezable, so it stops before devices suspend. Queued under
+	 * misc->lock so teardown setting sleeping=true prevents any
+	 * cross-requeue between idle_work and idle_work_prompt.
+	 *
+	 * Hold apple_pmgr_gpu.lock across the cancel/requeue decision so a
+	 * 0 -> 1 GPU busy edge in apple_pmgr_gpu_busy_get() cannot race
+	 * between reading busy_count and updating the workqueues.
+	 * Lock order: misc->lock -> apple_pmgr_gpu.lock -> workqueue/timer locks.
+	 */
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
+		   apple_pmgr_gpu.busy_count > 0;
+	wake_pending = gpu_busy && apple_pmgr_gpu.wake_pending;
+	apple_pmgr_gpu.wake_pending = false;
+
+	if (gpu_busy) {
+		cancel_delayed_work(&misc->idle_work);
+		delay = wake_pending ? 0 :
+			msecs_to_jiffies(min_t(unsigned int, delay_ms,
+					       APPLE_PMGR_TIER_SAMPLE_MS));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &misc->idle_work_prompt, delay);
+	} else if (deferrable) {
+		cancel_delayed_work(&misc->idle_work_prompt);
+		queue_delayed_work(system_freezable_power_efficient_wq,
+				   &misc->idle_work, msecs_to_jiffies(delay_ms));
+	} else {
+		cancel_delayed_work(&misc->idle_work);
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &misc->idle_work_prompt,
+				 msecs_to_jiffies(delay_ms));
+	}
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
+}
+
+static void apple_pmgr_tiered_eval_locked(struct apple_pmgr_misc *misc, u64 now)
+{
+	unsigned int idle_fab = READ_ONCE(idle_fabric_pstate);
+	unsigned int idle_dcs = READ_ONCE(idle_dcs_pstate);
+	u32 active_fab = misc->devices[DEV_FABRIC].active_state;
+	u32 active_dcs = misc->devices[DEV_DCS].active_state;
+	struct apple_pmgr_gov_sample sample;
+	enum apple_pmgr_tier tier;
+	u32 target_fab, target_dcs;
+	bool hard_override, primed;
+	int ret;
+
+	lockdep_assert_held(&misc->lock);
+	if (misc->sleeping)
+		return;
+	apple_pmgr_gpu_wake_clear();
+	if (!idle_fab && !idle_dcs) {
+		apple_pmgr_apply_targets(misc, active_fab, active_dcs);
+		if (!misc->pmp_owned)
+			apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL, now);
+		return;
+	}
+	if (misc->pmp_owned) {
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_TIER_SAMPLE_MS);
+		return;
+	}
+	if (!misc->voters_ok) {
+		apple_pmgr_apply_targets(misc, active_fab, active_dcs);
+		apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL, now);
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_TIER_SAMPLE_MS);
+		return;
+	}
+
+	hard_override = misc->holds > 0 || misc->dcs_bw_active ||
+			apple_pmgr_hard_voters_active(misc);
+	memset(&sample, 0, sizeof(sample));
+	primed = apple_pmgr_sample_load(misc, now, &sample);
+	sample.hard_override = hard_override;
+	misc->last_sample = sample;
+
+	if (!primed) {
+		if (!misc->gov.initialized || hard_override)
+			apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL, now);
+		if (hard_override)
+			apple_pmgr_apply_targets(misc, active_fab, active_dcs);
+		apple_pmgr_queue_work(misc, false, APPLE_PMGR_TIER_SAMPLE_MS);
+		return;
+	}
+
+	tier = apple_pmgr_gov_step(&misc->gov, &misc->gov_cfg, now, &sample);
+	apple_pmgr_tier_targets(misc, tier, idle_fab, idle_dcs, &target_fab, &target_dcs);
+	ret = apple_pmgr_apply_targets(misc, target_fab, target_dcs);
+	/*
+	 * Keep a non-deferrable poll whenever fabric or DCS is lowered so hard
+	 * voters (avd_sys, isp_sys, venc_dma) and cross-core CPU load are
+	 * raised within a bounded window; FULL under a hard override stays
+	 * deferrable since fabric/DCS are already at max and cannot demote.
+	 */
+	if (tier == APPLE_PMGR_TIER_IDLE && !ret)
+		apple_pmgr_queue_work(misc, false, APPLE_PMGR_IDLE_POLL_MS);
+	else if (tier == APPLE_PMGR_TIER_FULL && hard_override && !ret)
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_IDLE_POLL_MS);
+	else
+		apple_pmgr_queue_work(misc, false, APPLE_PMGR_TIER_SAMPLE_MS);
+}
+
+static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
+{
+	guard(mutex)(&misc->lock);
+	apple_pmgr_tiered_eval_locked(misc, now);
+}
+
 static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 {
 	unsigned int idle_fab = READ_ONCE(idle_fabric_pstate);
 	unsigned int idle_dcs = READ_ONCE(idle_dcs_pstate);
 	u32 active_fab = misc->devices[DEV_FABRIC].active_state;
 	u32 active_dcs = misc->devices[DEV_DCS].active_state;
+	bool can_scale_fab, can_scale_dcs;
 	bool idle_ok = false;
 	bool low_fab = false;
 	bool low_dcs = false;
+	bool lowered;
+	u32 target_fab, target_dcs;
+
+	if (misc->tiered_scaling) {
+		apple_pmgr_tiered_eval(misc, ktime_get_ns());
+		return;
+	}
 
 	scoped_guard(mutex, &misc->lock) {
 		if (misc->sleeping)
 			return;
+		apple_pmgr_gpu_wake_clear();
+		can_scale_fab = idle_fab && idle_fab < active_fab;
+		can_scale_dcs = idle_dcs && idle_dcs < active_dcs &&
+				misc->devices[DEV_DCS].base && !misc->dcs_data &&
+				(!misc->dcs_valid_states ||
+				 apple_pmgr_dcs_state_valid(misc, idle_dcs));
 		idle_ok = misc->voters_ok && !misc->pmp_owned &&
 			  !misc->holds && !misc->dcs_bw_active &&
 			  !apple_pmgr_voters_active(misc) &&
 			  apple_pmgr_cpus_at_min();
-		low_fab = idle_fab && idle_fab < active_fab && idle_ok;
-		low_dcs = idle_dcs && idle_dcs < active_dcs &&
-			  misc->devices[DEV_DCS].base && !misc->dcs_data && idle_ok;
-		if (low_fab && misc->fabric_now != idle_fab)
-			apple_pmgr_write_fabric(misc, idle_fab);
-		else if (!low_fab)
-			apple_pmgr_raise_fabric(misc);
-		if (low_dcs && misc->dcs_now != idle_dcs)
-			apple_pmgr_write_dcs(misc, idle_dcs);
-		else if (!low_dcs)
-			apple_pmgr_raise_dcs(misc);
+		low_fab = can_scale_fab && idle_ok;
+		low_dcs = can_scale_dcs && idle_ok;
+		target_fab = low_fab ? idle_fab : active_fab;
+		target_dcs = low_dcs ? idle_dcs : active_dcs;
+		apple_pmgr_apply_targets(misc, target_fab, target_dcs);
 		if (!idle_fab && !idle_dcs)
 			return;
 		/*
-		 * Freezable, so it stops before devices suspend. Queued under
-		 * misc->lock so teardown setting sleeping=true prevents any
-		 * cross-requeue between idle_work and idle_work_prompt.
+		 * Keep a non-deferrable poll while fabric or DCS is lowered so
+		 * hard voters and cross-core CPU load are raised within a
+		 * bounded window; stay deferrable when at active p-states.
 		 */
-		queue_delayed_work(system_freezable_power_efficient_wq,
-				   (low_fab || low_dcs) ? &misc->idle_work_prompt : &misc->idle_work,
-				   msecs_to_jiffies(APPLE_PMGR_IDLE_POLL_MS));
+		lowered = !misc->pmp_owned &&
+			  ((misc->fabric_now != U32_MAX &&
+			    misc->fabric_now < active_fab) ||
+			   (misc->dcs_now != U32_MAX &&
+			    misc->dcs_now < active_dcs));
+		apple_pmgr_queue_work(misc, !lowered, APPLE_PMGR_IDLE_POLL_MS);
 	}
 }
 
@@ -881,6 +1564,9 @@ static void apple_pmgr_idle_stop(struct apple_pmgr_misc *misc)
 	guard(mutex)(&misc->lock);
 	apple_pmgr_raise_fabric(misc);
 	apple_pmgr_raise_dcs(misc);
+	if (misc->tiered_scaling && !misc->pmp_owned)
+		apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL,
+					  ktime_get_ns());
 }
 
 static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp)
@@ -1020,6 +1706,7 @@ static int __maybe_unused apple_pmgr_misc_prepare(struct device *dev)
 		dev_warn_once(dev, "PMP is described but not running: sleeping without it\n");
 	if (!misc->devices[DEV_FABRIC].base)
 		return 0;
+	apple_pmgr_gpu_wake_set(NULL);
 	apple_pmgr_idle_stop(misc);
 	return 0;
 }
@@ -1030,8 +1717,15 @@ static void __maybe_unused apple_pmgr_misc_complete(struct device *dev)
 
 	if (!misc->devices[DEV_FABRIC].base)
 		return;
-	scoped_guard(mutex, &misc->lock)
+	scoped_guard(mutex, &misc->lock) {
 		misc->sleeping = false;
+		misc->gov_primed = false;
+		if (misc->tiered_scaling && !misc->pmp_owned)
+			apple_pmgr_gov_force_tier(&misc->gov, APPLE_PMGR_TIER_FULL,
+						  ktime_get_ns());
+		if (!misc->pmp_owned)
+			apple_pmgr_gpu_wake_set(misc);
+	}
 	if (READ_ONCE(idle_fabric_pstate) || READ_ONCE(idle_dcs_pstate))
 		mod_delayed_work(system_freezable_power_efficient_wq, &misc->idle_work, 0);
 }
@@ -1203,22 +1897,49 @@ static int apple_pmgr_misc_status_show(struct seq_file *s, void *unused)
 	u32 val;
 
 	guard(mutex)(&misc->lock);
-	seq_printf(s, "pmp_owned=%d voters_ok=%d holds=%u dcs_bw_active=%d cpus_at_min=%d gpu_tracked=%d gpu_busy=%d\n",
+	seq_printf(s, "pmp_owned=%d voters_ok=%d holds=%u dcs_bw_active=%d cpus_at_min=%d gpu_tracked=%d gpu_busy=%u\n",
 		   misc->pmp_owned, misc->voters_ok, misc->holds,
 		   misc->dcs_bw_active, apple_pmgr_cpus_at_min_peek(misc),
 		   atomic_read(&apple_pmgr_gpu_tracked),
-		   atomic_read(&apple_pmgr_gpu_busy));
+		   apple_pmgr_gpu_busy_count());
 	seq_printf(s, "fabric_active=%u fabric_now=%u dcs_active=%u dcs_now=%u\n",
 		   misc->devices[DEV_FABRIC].active_state, misc->fabric_now,
 		   misc->devices[DEV_DCS].active_state, misc->dcs_now);
+	if (misc->tiered_scaling) {
+		u64 res_ms[APPLE_PMGR_TIER_MAX];
+		u64 now = ktime_get_ns();
+
+		for (i = 0; i < APPLE_PMGR_TIER_MAX; i++) {
+			u64 ns = misc->gov.residency_ns[i];
+
+			if (misc->gov.initialized && i == misc->gov.tier &&
+			    now > misc->gov.tier_since_ns)
+				ns += now - misc->gov.tier_since_ns;
+			res_ms[i] = div_u64(ns, NSEC_PER_MSEC);
+		}
+		seq_printf(s, "tier=%s transitions=%llu rate_limited=%llu\n",
+			   apple_pmgr_tier_names[misc->gov.tier],
+			   misc->gov.transitions, misc->gov.rate_limited);
+		seq_printf(s, "load e_max=%u e_sum=%u p_max=%u p_sum=%u gpu_pct=%u gpu_inflight=%d gpu_inflight_ms=%u\n",
+			   misc->last_sample.e_max, misc->last_sample.e_sum,
+			   misc->last_sample.p_max, misc->last_sample.p_sum,
+			   misc->last_sample.gpu_pct,
+			   misc->last_sample.gpu_inflight,
+			   misc->last_sample.gpu_inflight_ms);
+		seq_printf(s, "residency_ms idle=%llu light=%llu full=%llu\n",
+			   res_ms[APPLE_PMGR_TIER_IDLE],
+			   res_ms[APPLE_PMGR_TIER_LIGHT],
+			   res_ms[APPLE_PMGR_TIER_FULL]);
+	}
 	for (i = 0; i < ARRAY_SIZE(misc->votes); i++) {
 		if (!misc->votes[i].regmap) {
-			seq_printf(s, "voter[%s]=missing\n", apple_pmgr_fabric_voters[i]);
+			seq_printf(s, "voter[%s]=%s\n", apple_pmgr_fabric_voters[i].label,
+				   apple_pmgr_fabric_voters[i].optional ? "absent" : "missing");
 		} else if (regmap_read(misc->votes[i].regmap, misc->votes[i].reg, &val)) {
-			seq_printf(s, "voter[%s]=err\n", apple_pmgr_fabric_voters[i]);
+			seq_printf(s, "voter[%s]=err\n", apple_pmgr_fabric_voters[i].label);
 		} else {
 			seq_printf(s, "voter[%s]=%#010x actual=%lu\n",
-				   apple_pmgr_fabric_voters[i], val,
+				   apple_pmgr_fabric_voters[i].label, val,
 				   FIELD_GET(APPLE_PMGR_PS_ACTUAL, val));
 		}
 	}
@@ -1254,8 +1975,10 @@ static void apple_pmgr_misc_teardown(void *data)
 
 	scoped_guard(rwsem_write, &apple_pmgr_inst_sem)
 		smp_store_release(&apple_pmgr_misc_inst, NULL);
-	scoped_guard(mutex, &misc->lock)
+	scoped_guard(mutex, &misc->lock) {
 		misc->sleeping = true;
+		apple_pmgr_gpu_wake_set(NULL);
+	}
 	cancel_delayed_work_sync(&misc->idle_work);
 	cancel_delayed_work_sync(&misc->idle_work_prompt);
 	guard(mutex)(&misc->lock);
@@ -1281,6 +2004,11 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		return -EINVAL;
 	misc->dcs_valid_states = hw->dcs_valid_states;
 	misc->single_step = hw->single_step;
+	misc->tiered_scaling = hw->tiered_scaling;
+	misc->light_fabric = hw->light_fabric;
+	misc->light_dcs = hw->light_dcs;
+	misc->gov_cfg = apple_pmgr_gov_cfg_default;
+	misc->gov.tier = APPLE_PMGR_TIER_FULL;
 
 	ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
 	if (ret)
@@ -1315,6 +2043,12 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 		if (!misc->pmp_owned) {
+			if (READ_ONCE(idle_dcs_pstate) && misc->dcs_valid_states &&
+			    !apple_pmgr_dcs_state_valid(misc, READ_ONCE(idle_dcs_pstate))) {
+				dev_warn(dev, "idle_dcs_pstate=%u is invalid on this SoC; disabling\n",
+					 READ_ONCE(idle_dcs_pstate));
+				WRITE_ONCE(idle_dcs_pstate, 0);
+			}
 			if (!READ_ONCE(idle_fabric_pstate_explicit) &&
 			    !READ_ONCE(idle_fabric_pstate) && hw->default_idle_fabric)
 				WRITE_ONCE(idle_fabric_pstate, hw->default_idle_fabric);
@@ -1323,6 +2057,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 			    apple_pmgr_dcs_state_valid(misc, misc->devices[DEV_DCS].active_state) &&
 			    apple_pmgr_dcs_state_valid(misc, hw->default_idle_dcs))
 				WRITE_ONCE(idle_dcs_pstate, hw->default_idle_dcs);
+			apple_pmgr_gpu_wake_set(misc);
 		}
 		/* Publish only a set-up instance; pairs with the readers' acquire. */
 		smp_store_release(&apple_pmgr_misc_inst, misc);
@@ -1348,8 +2083,11 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t8103 = {
 	.dcs_valid_states = DCS_VALID_STATES_T8103,
 	.single_step = true,
+	.tiered_scaling = true,
 	.default_idle_fabric = SYS_DEV_PSTATE_SUSPEND,
 	.default_idle_dcs = DCS_DEV_PSTATE_MIN_T8103,
+	.light_fabric = 2,
+	.light_dcs = DCS_DEV_PSTATE_MIN_T8103,
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = DCS_DEV_PSTATE_MIN_T8103,

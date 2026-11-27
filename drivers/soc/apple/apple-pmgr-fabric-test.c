@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * KUnit tests for the PMGR misc fabric controls: suspend/resume p-states
- * with and without PMP, the confirmed fabric raise, holds, the idle fabric
- * governor and its parameter, and the device tree lookup of its bandwidth
- * voters. The fabric and DCS controls are words in kernel memory and the
- * voters a regmap on a buffer; nothing touches MMIO.
+ * with and without PMP, the confirmed fabric raise, holds, the idle and
+ * tiered active fabric/DCS governors, GPU duty-cycle tracking, and the
+ * device tree lookup of bandwidth voters. The fabric and DCS controls are
+ * words in kernel memory and the voters a regmap on a buffer; nothing
+ * touches MMIO.
  */
 
 #include <kunit/device.h>
@@ -14,6 +15,7 @@
 #define PF_DEFAULT	0xa5000077	/* desired 7, actual 7, unknown upper bits */
 #define PF_VOTE_IDLE	0x0f		/* target on, hardware gated: idle */
 #define PF_VOTE_BUSY	0xff
+#define PF_MS(n)	((u64)(n) * NSEC_PER_MSEC)
 
 struct pf_test {
 	struct apple_pmgr_misc misc;	/* first: test->priv is both */
@@ -21,7 +23,14 @@ struct pf_test {
 	u32 *votes;
 	bool cpus_min;
 	bool published;
+	struct apple_pmgr_gov_sample sample;
+	bool sample_primed;
+	bool gpu_edge_on_sample;
+	bool gpu_edge_on_step;
 	unsigned int saved_idle_pstate;
+	unsigned int saved_idle_dcs_pstate;
+	bool saved_idle_pstate_explicit;
+	bool saved_idle_dcs_pstate_explicit;
 };
 
 static const struct regmap_config pf_vote_regmap_config = {
@@ -36,6 +45,33 @@ static bool pf_fake_cpus_at_min(void)
 	struct pf_test *f = kunit_get_current_test()->priv;
 
 	return f->cpus_min;
+}
+
+static bool pf_fake_sample_load(struct apple_pmgr_misc *misc, u64 now,
+				struct apple_pmgr_gov_sample *sample)
+{
+	struct pf_test *f = kunit_get_current_test()->priv;
+
+	*sample = f->sample;
+	if (f->gpu_edge_on_sample) {
+		f->gpu_edge_on_sample = false;
+		apple_pmgr_gpu_busy_get();
+	}
+	return f->sample_primed;
+}
+
+static void pf_gpu_reset(void)
+{
+	unsigned long flags;
+
+	atomic_set(&apple_pmgr_gpu_tracked, 0);
+	spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+	apple_pmgr_gpu.busy_count = 0;
+	apple_pmgr_gpu.busy_since_ns = 0;
+	apple_pmgr_gpu.busy_ns = 0;
+	apple_pmgr_gpu.wake_pending = false;
+	apple_pmgr_gpu.wake = NULL;
+	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 }
 
 static int pf_test_init(struct kunit *test)
@@ -57,7 +93,15 @@ static int pf_test_init(struct kunit *test)
 		return -ENOMEM;
 	misc = &f->misc;
 	f->saved_idle_pstate = READ_ONCE(idle_fabric_pstate);
+	f->saved_idle_dcs_pstate = READ_ONCE(idle_dcs_pstate);
+	f->saved_idle_pstate_explicit = READ_ONCE(idle_fabric_pstate_explicit);
+	f->saved_idle_dcs_pstate_explicit = READ_ONCE(idle_dcs_pstate_explicit);
 	WRITE_ONCE(idle_fabric_pstate, 0);
+	WRITE_ONCE(idle_dcs_pstate, 0);
+	WRITE_ONCE(idle_fabric_pstate_explicit, false);
+	WRITE_ONCE(idle_dcs_pstate_explicit, false);
+	pf_gpu_reset();
+
 	f->fabric = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->dcs = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->votes = kunit_kzalloc(test, 8 * sizeof(u32), GFP_KERNEL);
@@ -82,6 +126,9 @@ static int pf_test_init(struct kunit *test)
 	misc->devices[DEV_DCS].suspend_state = SYS_DEV_PSTATE_SUSPEND;
 	mutex_init(&misc->lock);
 	misc->fabric_now = 7;
+	misc->dcs_now = 9;
+	misc->gov_cfg = apple_pmgr_gov_cfg_default;
+	misc->gov.tier = APPLE_PMGR_TIER_FULL;
 	INIT_DEFERRABLE_WORK(&misc->idle_work, apple_pmgr_idle_work);
 	INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 	for (i = 0; i < ARRAY_SIZE(misc->votes); i++) {
@@ -92,6 +139,7 @@ static int pf_test_init(struct kunit *test)
 	misc->voters_ok = true;
 	dev_set_drvdata(misc->dev, misc);
 	f->cpus_min = true;
+	f->sample_primed = true;
 	test->priv = f;
 	kunit_activate_static_stub(test, apple_pmgr_cpus_at_min, pf_fake_cpus_at_min);
 	return 0;
@@ -103,9 +151,14 @@ static void pf_test_exit(struct kunit *test)
 
 	if (!f)
 		return;
+	apple_pmgr_gpu_wake_set(NULL);
 	cancel_delayed_work_sync(&f->misc.idle_work);
 	cancel_delayed_work_sync(&f->misc.idle_work_prompt);
+	pf_gpu_reset();
 	WRITE_ONCE(idle_fabric_pstate, f->saved_idle_pstate);
+	WRITE_ONCE(idle_dcs_pstate, f->saved_idle_dcs_pstate);
+	WRITE_ONCE(idle_fabric_pstate_explicit, f->saved_idle_pstate_explicit);
+	WRITE_ONCE(idle_dcs_pstate_explicit, f->saved_idle_dcs_pstate_explicit);
 	if (f->published) {
 		/* Pairs with the acquire in the driver's readers. */
 		smp_store_release(&apple_pmgr_misc_inst, NULL);
@@ -115,6 +168,7 @@ static void pf_test_exit(struct kunit *test)
 static void pf_publish(struct pf_test *f)
 {
 	f->published = true;
+	apple_pmgr_gpu_wake_set(&f->misc);
 	/* Pairs with the acquire in the driver's readers, as probe's release. */
 	smp_store_release(&apple_pmgr_misc_inst, &f->misc);
 }
@@ -295,7 +349,11 @@ static void pf_voters_active_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE_MSG(test, apple_pmgr_voters_active(misc), "voter %u", i);
 		f->votes[i] = PF_VOTE_IDLE;
 	}
-	/* An unreadable voter counts as busy. */
+	/* Absent optional voter (venc_dma) is skipped cleanly. */
+	misc->votes[3].regmap = NULL;
+	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
+
+	/* An unreadable required voter counts as busy. */
 	misc->votes[2].reg = 0x100;
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
 }
@@ -309,9 +367,9 @@ static void pf_idle_lowers_test(struct kunit *test)
 	apple_pmgr_idle_eval(misc);
 	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0xa5000071U);
 	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
-	/* While low, the prompt timer watches for new load. */
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	/* Lowered: prompt non-deferrable work guarantees a bounded raise. */
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
 	cancel_delayed_work_sync(&misc->idle_work_prompt);
 
 	/* Already low: no second write. */
@@ -470,15 +528,20 @@ static void pf_match_data_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_DCS], 4U);
 	KUNIT_EXPECT_EQ(test, t8103->dcs_valid_states, (u32)DCS_VALID_STATES_T8103);
 	KUNIT_EXPECT_TRUE(test, t8103->single_step);
+	KUNIT_EXPECT_TRUE(test, t8103->tiered_scaling);
 	KUNIT_EXPECT_EQ(test, t8103->default_idle_fabric, 1U);
 	KUNIT_EXPECT_EQ(test, t8103->default_idle_dcs, 4U);
+	KUNIT_EXPECT_EQ(test, t8103->light_fabric, 2U);
+	KUNIT_EXPECT_EQ(test, t8103->light_dcs, 4U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_FABRIC], 1U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_DCS], 7U);
 	KUNIT_EXPECT_EQ(test, t600x->dcs_valid_states, (u32)DCS_VALID_STATES_T600X);
+	KUNIT_EXPECT_FALSE(test, t600x->tiered_scaling);
 	KUNIT_EXPECT_EQ(test, t602x->dev_min_ps[DEV_FABRIC], 1U);
 	KUNIT_EXPECT_EQ(test, t602x->dev_min_ps[DEV_DCS], 1U);
 	/* No DCS state list: suspend uses the plain read-modify-write. */
 	KUNIT_EXPECT_EQ(test, t602x->dcs_valid_states, 0U);
+	KUNIT_EXPECT_FALSE(test, t602x->tiered_scaling);
 }
 
 static u32 pf_step_log[16];
@@ -487,6 +550,7 @@ static bool pf_step_inject_busy;
 
 static u32 pf_fake_perf_step(void __iomem *reg, u32 state)
 {
+	struct pf_test *f = kunit_get_current_test()->priv;
 	u32 val = readl_relaxed(reg);
 
 	if (pf_step_cnt < ARRAY_SIZE(pf_step_log))
@@ -499,7 +563,35 @@ static u32 pf_fake_perf_step(void __iomem *reg, u32 state)
 		FIELD_MODIFY(APPLE_CLKGEN_PSTATE_ACTUAL, &val, state);
 	}
 	writel_relaxed(val, reg);
+	if (f->gpu_edge_on_step) {
+		f->gpu_edge_on_step = false;
+		apple_pmgr_gpu_busy_get();
+	}
 	return val;
+}
+
+static void pf_setup_t8103(struct kunit *test, struct pf_test *f, bool tiered)
+{
+	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_step_cnt = 0;
+	pf_step_inject_busy = false;
+	kunit_activate_static_stub(test, apple_pmgr_perf_step, pf_fake_perf_step);
+
+	misc->single_step = true;
+	misc->tiered_scaling = tiered;
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->light_fabric = 2;
+	misc->light_dcs = 4;
+	misc->devices[DEV_FABRIC].suspend_state = 1;
+	misc->devices[DEV_DCS].suspend_state = 4;
+	misc->devices[DEV_FABRIC].active_state = 4;
+	misc->devices[DEV_DCS].active_state = 6;
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	misc->gov.tier = APPLE_PMGR_TIER_FULL;
+	writel(0x00000444, f->fabric);
+	writel(0x00000666, f->dcs);
 }
 
 static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
@@ -508,20 +600,7 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	struct apple_pmgr_misc *misc = &f->misc;
 	u32 last = 0;
 
-	pf_step_cnt = 0;
-	pf_step_inject_busy = false;
-	kunit_activate_static_stub(test, apple_pmgr_perf_step, pf_fake_perf_step);
-
-	misc->single_step = true;
-	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
-	misc->devices[DEV_FABRIC].suspend_state = 1;
-	misc->devices[DEV_DCS].suspend_state = 4;
-	misc->devices[DEV_FABRIC].active_state = 4;
-	misc->devices[DEV_DCS].active_state = 6;
-	misc->fabric_now = 4;
-	misc->dcs_now = 6;
-	writel(0x00000444, f->fabric);
-	writel(0x00000666, f->dcs);
+	pf_setup_t8103(test, f, false);
 	pf_publish(f);
 
 	/* T8103 DCS rejects unsafe states (1, 2, 3) and accepts 4..6. */
@@ -535,8 +614,8 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 
 	/*
 	 * With GPU tracking active, an always-on gfx PMGR voter does not
-	 * block idle while gpu_busy == 0, and single-stepping walks 4->3->2->1
-	 * on fabric and 6->5->4 on DCS.
+	 * block idle while gpu_busy == 0, and single-stepping demotes DCS
+	 * first (6->5->4) and then fabric (4->3->2->1).
 	 */
 	f->votes[0] = PF_VOTE_BUSY;
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
@@ -551,43 +630,581 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
 	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
 	KUNIT_EXPECT_EQ(test, pf_step_cnt, 5U);
-	KUNIT_EXPECT_EQ(test, pf_step_log[0], 3U);
-	KUNIT_EXPECT_EQ(test, pf_step_log[2], 1U);
-	KUNIT_EXPECT_EQ(test, pf_step_log[3], 5U);
-	KUNIT_EXPECT_EQ(test, pf_step_log[4], 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[1], 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 2U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[4], 1U);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+
+	/*
+	 * GPU busy 0 -> 1 edge never takes misc->lock or slams (4, 6)
+	 * synchronously; it pulls idle_work_prompt in immediately while
+	 * recording duty cycle.
+	 */
+	scoped_guard(mutex, &misc->lock) {
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_count(), 1U);
+		KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+		KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+		apple_pmgr_gpu_busy_put();
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_count(), 0U);
+	}
 	cancel_delayed_work_sync(&misc->idle_work_prompt);
 
-	/* Busy timeout on raise unwinds gpu_busy and returns error. */
+	/* Busy timeout on step_to returns -ETIMEDOUT and leaves BUSY set. */
 	pf_step_inject_busy = true;
-	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), -ETIMEDOUT);
-	KUNIT_EXPECT_EQ(test, atomic_read(&apple_pmgr_gpu_busy), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->fabric, 4, 0, &last), -ETIMEDOUT);
 	/* Subsequent write while BUSY is still set fails -EBUSY without stepping. */
 	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->fabric, 4, 0, &last), -EBUSY);
-	/* Clear injected busy and restore clean registers. */
 	pf_step_inject_busy = false;
 	writel(0x00000111, f->fabric);
 	writel(0x00000444, f->dcs);
 	misc->fabric_now = 1;
 	misc->dcs_now = 4;
 
-	/* Normal raise succeeds and lifts both fabric and DCS synchronously. */
-	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	/* Missing required voter regmap counts as busy on tracking stop. */
+	misc->votes[2].regmap = NULL;
+	apple_pmgr_gpu_tracking_stop();
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
 	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
 	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
 
-	/* Missing voter regmap counts as busy (no NULL deref on tracking stop). */
-	misc->votes[2].regmap = NULL;
-	apple_pmgr_gpu_busy_put();
-	apple_pmgr_gpu_tracking_stop();
-	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
-
 	/* Path validation rejects stepping across an invalid intermediate DCS state. */
 	writel(0x00000666, f->dcs);
 	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 4, BIT(4) | BIT(6), &last), -EINVAL);
+}
+
+static void pf_gov_tiers_and_hysteresis_test(struct kunit *test)
+{
+	struct apple_pmgr_gov gov = { .tier = APPLE_PMGR_TIER_FULL };
+	const struct apple_pmgr_gov_cfg *cfg = &apple_pmgr_gov_cfg_default;
+	struct apple_pmgr_gov_sample idle_s = {
+		.e_max = 5, .e_sum = 12, .p_max = 5, .p_sum = 8, .gpu_pct = 4,
+	};
+	struct apple_pmgr_gov_sample light_s = { .e_max = 15, .e_sum = 30 };
+	struct apple_pmgr_gov_sample near_full_s = {
+		.e_max = 64, .e_sum = 249, .p_max = 64, .p_sum = 84,
+		.gpu_pct = 34, .gpu_inflight = true, .gpu_inflight_ms = 9,
+	};
+	struct apple_pmgr_gov_sample full_pmax = { .p_max = 65 };
+	struct apple_pmgr_gov_sample full_psum = { .p_max = 40, .p_sum = 85 };
+	struct apple_pmgr_gov_sample full_esum = { .e_max = 63, .e_sum = 250 };
+	struct apple_pmgr_gov_sample full_gpu = { .gpu_pct = 35 };
+
+	/* Prime at t=0 in FULL; 500 ms hold required for FULL -> LIGHT. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(0), &idle_s),
+			APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(460), &idle_s),
+			APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(500), &idle_s),
+			APPLE_PMGR_TIER_LIGHT);
+
+	/* Another 500 ms hold in LIGHT required for LIGHT -> IDLE. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(960), &idle_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1000), &idle_s),
+			APPLE_PMGR_TIER_IDLE);
+
+	/* Boundary idle sample keeps IDLE. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1200), &idle_s),
+			APPLE_PMGR_TIER_IDLE);
+
+	/* Fast raise: 1 sample promotes IDLE -> LIGHT. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1400), &light_s),
+			APPLE_PMGR_TIER_LIGHT);
+
+	/* Just below every FULL threshold stays at LIGHT indefinitely. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1600), &near_full_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1640), &near_full_s),
+			APPLE_PMGR_TIER_LIGHT);
+
+	/* Single-sample spike to FULL demand resets when followed by light load. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1800), &full_pmax),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1840), &light_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, gov.full_streak, 0U);
+
+	/* Two consecutive samples promote LIGHT -> FULL (p_max >= 65). */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(2000), &full_pmax),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(2040), &full_pmax),
+			APPLE_PMGR_TIER_FULL);
+
+	/* Verify p_sum >= 85, e_sum >= 250, and gpu_pct >= 35 each promote in 2 samples. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(2600), &light_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(2800), &full_psum),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(2840), &full_psum),
+			APPLE_PMGR_TIER_FULL);
+
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(3400), &light_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(3600), &full_esum),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(3640), &full_esum),
+			APPLE_PMGR_TIER_FULL);
+
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(4200), &light_s),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(4400), &full_gpu),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(4440), &full_gpu),
+			APPLE_PMGR_TIER_FULL);
+
+	/* Residency sums match elapsed time across all tiers. */
+	KUNIT_EXPECT_EQ(test, gov.residency_ns[APPLE_PMGR_TIER_IDLE], PF_MS(400));
+	KUNIT_EXPECT_EQ(test, gov.residency_ns[APPLE_PMGR_TIER_LIGHT], PF_MS(1860));
+	KUNIT_EXPECT_EQ(test, gov.residency_ns[APPLE_PMGR_TIER_FULL], PF_MS(2180));
+	KUNIT_EXPECT_EQ(test, gov.transitions, 10ULL);
+}
+
+static void pf_gov_gpu_inflight_and_ratelimit_test(struct kunit *test)
+{
+	struct apple_pmgr_gov gov = { .tier = APPLE_PMGR_TIER_IDLE };
+	const struct apple_pmgr_gov_cfg *cfg = &apple_pmgr_gov_cfg_default;
+	struct apple_pmgr_gov_sample frame_1ms = {
+		.gpu_pct = 6, .gpu_inflight = true, .gpu_inflight_ms = 1,
+	};
+	struct apple_pmgr_gov_sample gpu_long = {
+		.gpu_pct = 25, .gpu_inflight = true, .gpu_inflight_ms = 10,
+	};
+	struct apple_pmgr_gov_sample override_s = { .hard_override = true };
+
+	/* 1 ms compositor frame raises IDLE -> LIGHT in 1 sample and stays LIGHT. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(100), &frame_1ms),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(140), &frame_1ms),
+			APPLE_PMGR_TIER_LIGHT);
+
+	/* Continuous GPU job >= 10 ms within 100 ms min_interval is rate-limited. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(180), &gpu_long),
+			APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, gov.rate_limited, 1ULL);
+
+	/* Once min_interval (100 ms) elapses, GPU >= 10 ms promotes in 1 sample. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(200), &gpu_long),
+			APPLE_PMGR_TIER_FULL);
+
+	/* Hard override from IDLE bypasses both 2-sample streak and rate limit. */
+	gov = (struct apple_pmgr_gov){
+		.tier = APPLE_PMGR_TIER_IDLE,
+		.initialized = true,
+		.transitioned = true,
+		.last_transition_ns = PF_MS(1000),
+		.tier_since_ns = PF_MS(1000),
+	};
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gov_step(&gov, cfg, PF_MS(1020), &override_s),
+			APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_EQ(test, gov.rate_limited, 0ULL);
+	KUNIT_EXPECT_EQ(test, gov.transitions, 1ULL);
+}
+
+static void pf_tiered_eval_order_and_timers_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_setup_t8103(test, f, true);
+	kunit_activate_static_stub(test, apple_pmgr_sample_load, pf_fake_sample_load);
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	WRITE_ONCE(idle_dcs_pstate, 4);
+
+	/* Prime at t=0 in FULL; quiet for 500 ms -> demote FULL (4,6) -> LIGHT (2,4). */
+	f->sample = (struct apple_pmgr_gov_sample){};
+	apple_pmgr_tiered_eval(misc, PF_MS(0));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+
+	/* FULL -> LIGHT demotes DCS first (5, 4), then fabric (3, 2). */
+	pf_step_cnt = 0;
+	apple_pmgr_tiered_eval(misc, PF_MS(500));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 2U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[1], 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 2U);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+
+	/* Quiet another 500 ms -> demote LIGHT (2,4) -> IDLE (1,4); bounded prompt poll armed. */
+	pf_step_cnt = 0;
+	apple_pmgr_tiered_eval(misc, PF_MS(1000));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 1U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 1U);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+
+	/* Light E-core activity promotes IDLE (1,4) -> LIGHT (2,4) without touching DCS. */
+	f->sample = (struct apple_pmgr_gov_sample){ .e_max = 20, .e_sum = 35 };
+	pf_step_cnt = 0;
+	apple_pmgr_tiered_eval(misc, PF_MS(1200));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 2U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 1U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 2U);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+
+	/* Heavy P-core load promotes LIGHT -> FULL: fabric first (3,4), then DCS (5,6). */
+	f->sample = (struct apple_pmgr_gov_sample){ .p_max = 75, .p_sum = 90 };
+	apple_pmgr_tiered_eval(misc, PF_MS(1400));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_LIGHT);
+	pf_step_cnt = 0;
+	apple_pmgr_tiered_eval(misc, PF_MS(1440));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[1], 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 6U);
+
+	/* Return to IDLE; venc_dma override promotes immediately (0-sample latency). */
+	f->sample = (struct apple_pmgr_gov_sample){};
+	apple_pmgr_tiered_eval(misc, PF_MS(2000));
+	apple_pmgr_tiered_eval(misc, PF_MS(2500));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+
+	f->votes[3] = PF_VOTE_BUSY;	/* venc_dma */
+	pf_step_cnt = 0;
+	apple_pmgr_tiered_eval(misc, PF_MS(2520));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 2U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[1], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[4], 6U);
+	f->votes[3] = PF_VOTE_IDLE;
+
+	/* Verify avd_sys and holds overrides also promote immediately from IDLE. */
+	apple_pmgr_tiered_eval(misc, PF_MS(3100));
+	apple_pmgr_tiered_eval(misc, PF_MS(3600));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	f->votes[1] = PF_VOTE_BUSY;	/* avd_sys */
+	apple_pmgr_tiered_eval(misc, PF_MS(3610));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	f->votes[1] = PF_VOTE_IDLE;
+
+	/* Deep sleep prepare() from IDLE raises to (4, 6), and complete() resumes cleanly. */
+	apple_pmgr_tiered_eval(misc, PF_MS(4200));
+	apple_pmgr_tiered_eval(misc, PF_MS(4700));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_prepare(misc->dev), 0);
+	KUNIT_EXPECT_TRUE(test, misc->sleeping);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+
+	misc->gov_primed = true;
+	apple_pmgr_misc_complete(misc->dev);
+	KUNIT_EXPECT_FALSE(test, misc->sleeping);
+	KUNIT_EXPECT_TRUE(test, flush_delayed_work(&misc->idle_work));
+	cancel_delayed_work_sync(&misc->idle_work);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+}
+
+static void pf_tiered_optout_and_dcs_floor_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+	u32 fab = 0, dcs = 0;
+
+	pf_setup_t8103(test, f, true);
+	kunit_activate_static_stub(test, apple_pmgr_sample_load, pf_fake_sample_load);
+
+	/* idle_fabric_pstate=0 keeps fabric at 4 while DCS scales 4..6. */
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_IDLE, 0, 4, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 4U);
+	KUNIT_EXPECT_EQ(test, dcs, 4U);
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_LIGHT, 0, 4, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 4U);
+	KUNIT_EXPECT_EQ(test, dcs, 4U);
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_FULL, 0, 4, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 4U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+
+	/* idle_dcs_pstate=0 keeps DCS at 6 while fabric scales 1..2..4. */
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_IDLE, 1, 0, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 1U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_LIGHT, 1, 0, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 2U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_FULL, 1, 0, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 4U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+
+	/* DCS >= 4 invariant: invalid DCS target falls back to active_state (6). */
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_IDLE, 1, 3, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 1U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+	misc->light_dcs = 3;
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_LIGHT, 1, 4, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 2U);
+	KUNIT_EXPECT_EQ(test, dcs, 4U);
+	misc->dcs_valid_states = BIT(4) | BIT(6);
+	misc->light_dcs = 5;
+	apple_pmgr_tier_targets(misc, APPLE_PMGR_TIER_LIGHT, 1, 4, &fab, &dcs);
+	KUNIT_EXPECT_EQ(test, fab, 2U);
+	KUNIT_EXPECT_EQ(test, dcs, 6U);
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->light_dcs = 4;
+
+	/* Both 0 disables scaling, raises to (4, 6), and arms no work. */
+	misc->fabric_now = 1;
+	misc->dcs_now = 4;
+	writel(0x00000111, f->fabric);
+	writel(0x00000444, f->dcs);
+	WRITE_ONCE(idle_fabric_pstate, 0);
 	WRITE_ONCE(idle_dcs_pstate, 0);
-	WRITE_ONCE(idle_dcs_pstate_explicit, false);
-	WRITE_ONCE(idle_fabric_pstate_explicit, false);
+	apple_pmgr_tiered_eval(misc, PF_MS(100));
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+}
+
+static void pf_tiered_gpu_busy_full_hold_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_setup_t8103(test, f, true);
+	kunit_activate_static_stub(test, apple_pmgr_sample_load, pf_fake_sample_load);
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	WRITE_ONCE(idle_dcs_pstate, 4);
+	apple_pmgr_gpu_tracking_start();
+
+	/* AVD holds FULL with deferrable idle_work while GPU is idle. */
+	f->votes[1] = PF_VOTE_BUSY;
+	f->sample = (struct apple_pmgr_gov_sample){};
+	apple_pmgr_tiered_eval(misc, PF_MS(0));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+
+	/* GPU 0 -> 1 edge kicks idle_work_prompt immediately (0 delay). */
+	scoped_guard(mutex, &misc->lock) {
+		apple_pmgr_gpu_wake_set(misc);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_FALSE(test, timer_pending(&misc->idle_work_prompt.timer));
+		apple_pmgr_gpu_wake_set(NULL);
+		misc->sleeping = true;
+	}
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	misc->sleeping = false;
+
+	/* Steady-state in-flight GPU work while AVD holds FULL re-arms at a nonzero cadence. */
+	apple_pmgr_tiered_eval(misc, PF_MS(40));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(80));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	/* Once GPU finishes, AVD hold returns to deferrable idle_work. */
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_gpu_busy_put();
+	apple_pmgr_tiered_eval(misc, PF_MS(120));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+
+	/* A 0 -> 1 GPU edge racing with deferrable re-arm kicks once, then uses nonzero delay. */
+	scoped_guard(mutex, &misc->lock) {
+		apple_pmgr_gpu_wake_set(misc);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_IDLE_POLL_MS);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_FALSE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_IDLE_POLL_MS);
+		KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+		KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+		apple_pmgr_gpu_wake_set(NULL);
+		misc->sleeping = true;
+	}
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	misc->sleeping = false;
+	apple_pmgr_gpu_busy_put();
+}
+
+static void pf_tiered_gpu_busy_idle_ratelimit_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_setup_t8103(test, f, true);
+	kunit_activate_static_stub(test, apple_pmgr_sample_load, pf_fake_sample_load);
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	WRITE_ONCE(idle_dcs_pstate, 4);
+	apple_pmgr_gpu_tracking_start();
+
+	/* Enter IDLE at t=1000 ms (arms 250 ms non-deferrable poll). */
+	f->sample = (struct apple_pmgr_gov_sample){};
+	apple_pmgr_tiered_eval(misc, PF_MS(0));
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(500));
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(1000));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	/* GPU 0 -> 1 edge just after IDLE entry pulls the 250 ms poll in immediately. */
+	scoped_guard(mutex, &misc->lock) {
+		apple_pmgr_gpu_wake_set(misc);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_FALSE(test, timer_pending(&misc->idle_work_prompt.timer));
+		apple_pmgr_gpu_wake_set(NULL);
+		misc->sleeping = true;
+	}
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	misc->sleeping = false;
+
+	/*
+	 * Evaluations blocked by the 100 ms transition rate limit keep IDLE
+	 * and must re-arm idle_work_prompt at a nonzero cadence (not 0 delay).
+	 */
+	f->sample = (struct apple_pmgr_gov_sample){
+		.gpu_inflight = true,
+		.gpu_inflight_ms = 1,
+		.gpu_pct = 10,
+	};
+	apple_pmgr_tiered_eval(misc, PF_MS(1010));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_EQ(test, misc->gov.rate_limited, 1ULL);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(1050));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_EQ(test, misc->gov.rate_limited, 2ULL);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	/* Once 100 ms elapses, the governor promotes IDLE -> LIGHT. */
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(1100));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_LIGHT);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 2U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_gpu_busy_put();
+}
+
+static void pf_tiered_gpu_edge_mid_eval_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_setup_t8103(test, f, true);
+	kunit_activate_static_stub(test, apple_pmgr_sample_load, pf_fake_sample_load);
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	WRITE_ONCE(idle_dcs_pstate, 4);
+	apple_pmgr_gpu_tracking_start();
+
+	/* Prime at t=0 in FULL and demote to LIGHT at t=500 ms. */
+	f->sample = (struct apple_pmgr_gov_sample){};
+	apple_pmgr_tiered_eval(misc, PF_MS(0));
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_tiered_eval(misc, PF_MS(500));
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_LIGHT);
+
+	/*
+	 * A 0 -> 1 GPU edge firing between snapshot and queue update during
+	 * LIGHT -> IDLE demotion must keep idle_work_prompt immediate (0 delay)
+	 * rather than pushing it back to the 250 ms IDLE poll.
+	 */
+	scoped_guard(mutex, &misc->lock) {
+		apple_pmgr_gpu_wake_set(misc);
+		f->gpu_edge_on_step = true;
+		apple_pmgr_tiered_eval_locked(misc, PF_MS(1000));
+		KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_count(), 1U);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_FALSE(test, timer_pending(&misc->idle_work_prompt.timer));
+		apple_pmgr_gpu_wake_set(NULL);
+		misc->sleeping = true;
+	}
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	misc->sleeping = false;
+
+	/* Steady-state evaluation afterward consumes no wake and re-arms at 40 ms. */
+	f->sample = (struct apple_pmgr_gov_sample){
+		.gpu_inflight = true,
+		.gpu_inflight_ms = 1,
+		.gpu_pct = 10,
+	};
+	apple_pmgr_tiered_eval(misc, PF_MS(1040));
+	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_TRUE(test, timer_pending(&misc->idle_work_prompt.timer));
+
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	apple_pmgr_gpu_busy_put();
+
+	/*
+	 * A 0 -> 1 GPU edge firing right after an idle snapshot under a
+	 * deferrable AVD FULL hold must keep idle_work_prompt immediate
+	 * instead of cancelling it in favor of deferrable idle_work.
+	 */
+	f->votes[1] = PF_VOTE_BUSY;
+	f->sample = (struct apple_pmgr_gov_sample){};
+	scoped_guard(mutex, &misc->lock) {
+		apple_pmgr_gpu_wake_set(misc);
+		f->gpu_edge_on_sample = true;
+		apple_pmgr_tiered_eval_locked(misc, PF_MS(1080));
+		KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_FULL);
+		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_count(), 1U);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+		KUNIT_EXPECT_NE(test, work_busy(&misc->idle_work_prompt.work), 0U);
+		KUNIT_EXPECT_FALSE(test, timer_pending(&misc->idle_work_prompt.timer));
+		apple_pmgr_gpu_wake_set(NULL);
+		misc->sleeping = true;
+	}
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	misc->sleeping = false;
+	apple_pmgr_gpu_busy_put();
 }
 
 /*
@@ -700,6 +1317,12 @@ static void pf_dt_voters_test(struct kunit *test)
 		{ "power-controller@118", "isp_sys", 0x118 },
 		{ "clock@120", "isp_sys", 0x120, false, "apple,t6000-clkgen" },
 	};
+	static const struct pf_dt_child c_venc[] = {
+		{ "power-controller@100", "gfx", 0x100 },
+		{ "power-controller@110", "avd_sys", 0x110 },
+		{ "power-controller@118", "isp_sys", 0x118 },
+		{ "power-controller@128", "venc_dma", 0x128 },
+	};
 	struct pf_test *f = test->priv;
 	struct apple_pmgr_misc *misc = &f->misc;
 	struct regmap *map = syscon_node_to_regmap(pf_dt_pmgr);
@@ -707,6 +1330,7 @@ static void pf_dt_voters_test(struct kunit *test)
 	pf_dt_require_fixture_only(test);
 
 	KUNIT_ASSERT_FALSE(test, IS_ERR(map));
+	/* Optional venc_dma absent: voters_ok is still true. */
 	KUNIT_EXPECT_TRUE(test, pf_dt_find(test, misc, c, ARRAY_SIZE(c)));
 	/* Matched by label, in the order of apple_pmgr_fabric_voters. */
 	KUNIT_EXPECT_EQ(test, misc->votes[0].reg, 0x100U);
@@ -715,6 +1339,7 @@ static void pf_dt_voters_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, misc->votes[0].regmap, map);
 	KUNIT_EXPECT_PTR_EQ(test, misc->votes[1].regmap, map);
 	KUNIT_EXPECT_PTR_EQ(test, misc->votes[2].regmap, map);
+	KUNIT_EXPECT_NULL(test, misc->votes[3].regmap);
 
 	/* The voters read through the parent's register map. */
 	pf_dt_regs[0x110 / 4] = PF_VOTE_IDLE;
@@ -722,6 +1347,15 @@ static void pf_dt_voters_test(struct kunit *test)
 	pf_dt_regs[0x100 / 4] = PF_VOTE_BUSY;
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
 	pf_dt_regs[0x100 / 4] = PF_VOTE_IDLE;
+	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
+
+	/* When venc_dma is present, it is bound and active checks include it. */
+	KUNIT_EXPECT_TRUE(test, pf_dt_find(test, misc, c_venc, ARRAY_SIZE(c_venc)));
+	KUNIT_EXPECT_EQ(test, misc->votes[3].reg, 0x128U);
+	KUNIT_EXPECT_PTR_EQ(test, misc->votes[3].regmap, map);
+	pf_dt_regs[0x128 / 4] = PF_VOTE_BUSY;
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+	pf_dt_regs[0x128 / 4] = PF_VOTE_IDLE;
 	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
 }
 
@@ -861,6 +1495,13 @@ static struct kunit_case apple_pmgr_fabric_test_cases[] = {
 	KUNIT_CASE(pf_prepare_complete_test),
 	KUNIT_CASE(pf_match_data_test),
 	KUNIT_CASE(pf_t8103_gpu_tracking_and_dcs_valid_test),
+	KUNIT_CASE(pf_gov_tiers_and_hysteresis_test),
+	KUNIT_CASE(pf_gov_gpu_inflight_and_ratelimit_test),
+	KUNIT_CASE(pf_tiered_eval_order_and_timers_test),
+	KUNIT_CASE(pf_tiered_optout_and_dcs_floor_test),
+	KUNIT_CASE(pf_tiered_gpu_busy_full_hold_test),
+	KUNIT_CASE(pf_tiered_gpu_busy_idle_ratelimit_test),
+	KUNIT_CASE(pf_tiered_gpu_edge_mid_eval_test),
 	KUNIT_CASE(pf_dt_voters_test),
 	KUNIT_CASE(pf_dt_voters_missing_test),
 	KUNIT_CASE(pf_dt_voters_duplicate_test),
