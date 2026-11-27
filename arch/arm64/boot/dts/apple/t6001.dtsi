@@ -22,6 +22,17 @@
 
 #define APPLE_T600X_NON_ULTRA
 
+#ifndef APPLE_T6000_SUBSET
+/*
+ * The PMP manages system power states on every M1 Max: m1n1 boots it, it
+ * takes over the fabric and DCS p-states, and the GPU's AGX vote, the CPU
+ * memory floor and the AVD, JPEG, scaler and video encoder report to it.
+ * The PMP firmware, its DVFS domain table and the report layout are the
+ * SoC's, the same on every T6001 board.
+ */
+#define APPLE_USE_PMP
+#endif
+
 #include "t600x-common.dtsi"
 
 / {
@@ -157,8 +168,8 @@
  * PMP's DVFS domain table lists four DCS states. State IDs below describe
  * firmware DCS states, not PMGR codes.
  *
- * This describes the SoC on every T6001 board, PMP or not: the report only
- * validates it and publishes it read-only (its dram/ sysfs group).
+ * The report only validates this description and publishes it read-only
+ * (its dram/ sysfs group); nothing else reads it.
  */
 / {
 	dram_opp: opp-table-dram {

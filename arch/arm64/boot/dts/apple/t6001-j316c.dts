@@ -9,14 +9,6 @@
 
 /dts-v1/;
 
-/*
- * PMP manages system power states, as on the J314s and J316s: the GPU's AGX
- * vote and the CPU memory floor lift DCS and fabric out of their idle
- * states, and the AVD, JPEG, scaler and video encoder report to it. Only
- * the J316c has been qualified; the J314c and J375c keep PMP off.
- */
-#define APPLE_USE_PMP
-
 #include "t6001.dtsi"
 #include "t600x-j314-j316.dtsi"
 
