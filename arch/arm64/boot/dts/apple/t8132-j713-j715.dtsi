@@ -53,6 +53,7 @@
 /* The radio's firmware island: the J713's here, the J715 overrides it. */
 &wifi0 {
 	brcm,board-type = "apple,garden";
+	wakeup-source;
 };
 
 &bluetooth0 {
@@ -128,6 +129,15 @@
 
 /* The GPU itself is described for every M4 Mac in t8132-gpu.dtsi. */
 &ps_gfx {
+	status = "okay";
+};
+
+/* The SIO itself is described for every M4 Mac in t8132-sio.dtsi. */
+&ps_sio_cpu {
+	status = "okay";
+};
+
+&ps_dpa_p {
 	status = "okay";
 };
 
@@ -357,19 +367,11 @@
 };
 
 /*
- * t8132-j713-pmgr.dtsi disables VENC, SCODEC and SIO_CPU, and their engines
- * with them. Their DARTs, which name those states in t8132-peripherals.dtsi,
- * would wait for them forever if anything enabled them, so drop the reference
- * here.
+ * t8132-j713-pmgr.dtsi disables SCODEC, and its engines with it. Their DARTs,
+ * which name those states in t8132-peripherals.dtsi, would wait for them
+ * forever if anything enabled them, so drop the reference here. VENC is
+ * enabled there: the video encoder and its DARTs below.
  */
-&dart_ave0 {
-	/delete-property/ power-domains;
-};
-
-&dart_ave1 {
-	/delete-property/ power-domains;
-};
-
 &dart_ave2 {
 	/delete-property/ power-domains;
 };
@@ -378,6 +380,15 @@
 	/delete-property/ power-domains;
 };
 
-&dart_sio0 {
-	/delete-property/ power-domains;
+/* The video encoder; t8132-j713-pmgr.dtsi enables its VENC states. */
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
 };

@@ -66,13 +66,34 @@ fn main(){
  assert_eq!(patch_with(&d,&[(1,Some(0x12345678)),(2,None)]),Ok(()));assert_eq!(*d.bytes.borrow(),expected,"None overwrote the firmware value");
  // Per-SoC nCal: T8112 and T6000 keep the image value, T6040/T8132 write 1, the others write 0.
  let ncal=from_fourcc(b"nCal");
- for (name,cfg,want) in [("T8103",&HW_CFG_T8103,None),("T8112",&HW_CFG_T8112,Some(1u32)),("T6000",&HW_CFG_T6000,Some(1)),("T6020",&HW_CFG_T6020,None),("T6040",&HW_CFG_T6040,None),("T8132",&HW_CFG_T8132,None),("T8140",&HW_CFG_T8140,None)] {
-  let expect=match name {"T8112"|"T6000"=>None,"T6040"|"T8132"=>Some(1u64),_=>Some(0u64)};
+ for (name,cfg,want) in [("T8103",&HW_CFG_T8103,None),("T8112",&HW_CFG_T8112,Some(1u32)),("T6000",&HW_CFG_T6000,Some(1)),("T6020",&HW_CFG_T6020,None),("T6040",&HW_CFG_T6040,None),("T8132",&HW_CFG_T8132,None),("T8122",&HW_CFG_T8122,None),("T8140",&HW_CFG_T8140,None)] {
+  let expect=match name {"T8112"|"T6000"=>None,"T6040"|"T8132"|"T8122"=>Some(1u64),_=>Some(0u64)};
   assert_eq!(cfg.ncal,expect,"{} nCal choice",name);
   let mut t=[0u8;12];t[0..4].copy_from_slice(&ncal.to_le_bytes());t[4..8].copy_from_slice(&4u32.to_le_bytes());t[8..12].copy_from_slice(&1u32.to_le_bytes());
   let d=fixture(32,&t);assert_eq!(patch_with(&d,&[(ncal,cfg.ncal)]),Ok(()));
   let got=u32::from_le_bytes(d.bytes.borrow()[40..44].try_into().unwrap());
   let wanted=want.unwrap_or_else(||cfg.ncal.unwrap() as u32);assert_eq!(got,wanted,"{} nCal written",name);
+ }
+ // Without a bootloader memory-region a T8122 AOP starts as its apple,t6020-aop fallback; no other block names one.
+ let t8122:&'static AopHwConfig=&HW_CFG_T8122;
+ assert!(t8122.fw_regions,"T8122 checks its firmware regions");
+ assert!(std::ptr::eq(t8122.for_regions(true),t8122),"T8122 with regions keeps its own configuration");
+ let alt=t8122.for_regions(false);
+ assert!(!std::ptr::eq(alt,t8122),"T8122 without regions takes its fallback");
+ assert!(!alt.fw_regions&&alt.without_fw_regions.is_none(),"the fallback needs no regions");
+ assert!(alt.ncal==HW_CFG_T6020.ncal&&alt.ec0p==HW_CFG_T6020.ec0p&&alt.quiesce_on_unbind==HW_CFG_T6020.quiesce_on_unbind&&alt.bootargs_word_access==HW_CFG_T6020.bootargs_word_access&&alt.halt_on_failed_start==HW_CFG_T6020.halt_on_failed_start,"T8122 fallback is T6020's");
+ // A T8103 AOP the bootloader reserved no regions for (firmware 13.5) starts as before.
+ let t8103:&'static AopHwConfig=&HW_CFG_T8103;
+ assert!(t8103.fw_regions,"T8103 checks its firmware regions");
+ assert!(std::ptr::eq(t8103.for_regions(true),t8103),"T8103 with regions keeps its own configuration");
+ let direct=t8103.for_regions(false);
+ assert!(!std::ptr::eq(direct,t8103),"T8103 without regions takes its direct start");
+ assert!(!direct.fw_regions&&direct.without_fw_regions.is_none(),"the direct start needs no regions");
+ assert!(direct.ncal==t8103.ncal&&direct.ec0p==t8103.ec0p&&direct.aopt==t8103.aopt,"the direct start is the same AOP");
+ let others:[(&str,&'static AopHwConfig);9]=[("T8112",&HW_CFG_T8112),("T6000",&HW_CFG_T6000),("T6020",&HW_CFG_T6020),("T6040",&HW_CFG_T6040),("T8132",&HW_CFG_T8132),("T8140",&HW_CFG_T8140),("T8152",&HW_CFG_T8152),("T8142",&HW_CFG_T8142),("T6050",&HW_CFG_T6050)];
+ for (name,cfg) in others {
+  assert!(cfg.without_fw_regions.is_none(),"{} names no fallback",name);
+  for regions in [true,false] {assert!(std::ptr::eq(cfg.for_regions(regions),cfg),"{} keeps its configuration (regions {})",name,regions);}
  }
  // ED0p: writes 8-byte IOVA when an external data region is present, preserves unused ED0p when None,
  // and rejects missing, duplicate, or non-8-byte ED0p entries without writing MMIO.
@@ -127,7 +148,8 @@ def method(source):
 
 
 def configs(source):
-    """struct AopHwConfig and the HW_CFG_* constants, each with its doc comment.
+    """struct AopHwConfig, the HW_CFG_* constants and the AOP_S2R_* flags they use, each with its
+    doc comment.
 
     Other items between them (the sleep's PM callbacks) use kernel bindings the harness
     doesn't have.
@@ -140,7 +162,8 @@ def configs(source):
             if not line.strip() or line.startswith(('//', '#[')):
                 pending.append(line)
                 continue
-            keep = line.startswith(('struct AopHwConfig', 'const HW_CFG_'))
+            keep = line.startswith(('struct AopHwConfig', 'impl AopHwConfig', 'const HW_CFG_',
+                                    'const AOP_S2R_'))
             item, pending, depth = pending + [line], [], 0
         else:
             item.append(line)
