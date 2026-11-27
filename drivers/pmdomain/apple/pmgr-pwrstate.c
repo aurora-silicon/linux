@@ -59,6 +59,15 @@
 #define APPLE_PMGR_RESET_TIME 1
 #define APPLE_PMGR_T8132_RESET_TIME 10
 
+/*
+ * DIAGNOSTIC (T6030 GPU sleep bring-up): the label of one domain whose apple,no-auto-pm is
+ * ignored, so that it runs under automatic power as macOS runs it (J516s GFX: 0x1f0003ff on
+ * macOS, 0x0f0003ff with the boot loader's apple,no-auto-pm).
+ */
+static char *ignore_no_auto_pm;
+module_param(ignore_no_auto_pm, charp, 0444);
+MODULE_PARM_DESC(ignore_no_auto_pm, "DIAGNOSTIC: label of a domain whose apple,no-auto-pm is ignored");
+
 struct apple_pmgr_ps {
 	struct device *dev;
 	struct generic_pm_domain genpd;
@@ -956,7 +965,10 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
 	ps->sleep_wakeup_path = of_property_read_bool(node, "apple,sleep-wakeup-path");
 	/* A cold-started coprocessor CPU must not be gated behind its firmware. */
-	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
+	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm") &&
+			 !(ignore_no_auto_pm && !strcmp(ignore_no_auto_pm, name));
+	if (ignore_no_auto_pm && !strcmp(ignore_no_auto_pm, name))
+		dev_info(dev, "DIAGNOSTIC: %s under automatic power, apple,no-auto-pm ignored\n", name);
 	ps->auto_managed = of_property_read_bool(node, "apple,auto-managed");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
