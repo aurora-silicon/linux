@@ -1206,8 +1206,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		return -EINVAL;
 
 	/*
-	 * External H17P stays fixed. Desktop zero placeholders are also an
-	 * absent range; a partial or duplicate pair must not enable fallback.
+	 * External H17P stays fixed. Zero placeholders, from firmware that
+	 * uses them (zero_vrr_range_fallback), are also an absent range; a
+	 * partial or duplicate pair must not enable fallback.
 	 */
 	vrr_fallback = !vrr_seen || (vrr_seen == 3 && handle->zero_vrr_range_fallback);
 	if (!external_sdr && !vrr_ambiguous)

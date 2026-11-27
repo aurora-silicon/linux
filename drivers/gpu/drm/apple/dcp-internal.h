@@ -1481,7 +1481,9 @@ static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
 /*
  * Firmware whose internal panel takes VRR_ENABLED on its live mode, through
  * the adaptive sync minimum rate (see dcp_vrr_update()): desktop 26.6 and
- * 13.5.  The external processors ignore a new minimum on a live mode.
+ * 13.5.  The external processors ignore a new minimum on a live mode.  Both
+ * report the range of the panel's ProMotion timing as two zero fields, for
+ * the panel's own 24 Hz to nominal range (see dcp_modes_replace()).
  */
 static inline bool dcp_fw_vrr_live(const struct apple_dcp *dcp)
 {

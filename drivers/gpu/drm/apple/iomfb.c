@@ -2512,7 +2512,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->pq_dsc = READ_ONCE(dcp->iomfb_template_pq) &&
 			      !dcp_has_panel(dcp);
 	}
-	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	ctx->zero_vrr_range_fallback = dcp_fw_vrr_live(dcp);
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP &&
 	    smp_load_acquire(&dcp->dptxport[0].tile_hint)) {

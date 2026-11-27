@@ -296,14 +296,17 @@ def modes(root):
     checks = []
     blobs = []
 
-    def case(elements, expected, ranges=None, desktop=True):
+    def case(elements, expected, ranges=None, desktop=True, zero=None):
+        # zero: the firmware's zero-placeholder convention, on for desktop 26.6
+        # and 13.5; only desktop 26.6 sends deadlines at every internal timing.
+        zero = desktop if zero is None else zero
         raw = bytearray(struct.pack('<I', 0xd3))
         f['wire'](elements, raw)
         i = len(blobs)
         blobs.append('static const unsigned char b%u[]={%s};' %
                      (i, ','.join(map(str, raw))))
         check = (f'{{ struct dcp_parse_ctx c; unsigned n=99; '
-                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; c.internal_present_deadline={int(desktop)}; '
+                 f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(zero)}; c.internal_present_deadline={int(desktop)}; '
                  'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false); '
                  f'assert(!IS_ERR(m) && n=={len(expected)});')
         for j, hz in enumerate(expected):
@@ -343,6 +346,11 @@ def modes(root):
         case([m],[120],[(lo or 24<<16,hi or 120<<16) if valid else (0,0)])
     m=copy.deepcopy(supported[0]);m['MinimumVariableRefreshRate']=0;m['MaximumVariableRefreshRate']=0
     case([m],[120],[(0,0)],desktop=False)
+    # Firmware 13.5 uses the placeholders too: its ProMotion timing gets
+    # 24-120 Hz, a 60 Hz panel's timing stays fixed.
+    case([m],[120],[(24<<16,120<<16)],desktop=False,zero=True)
+    m60=copy.deepcopy(supported[1]);m60['MinimumVariableRefreshRate']=0;m60['MaximumVariableRefreshRate']=0
+    case([m60],[60],[(0,0)],desktop=False,zero=True)
     for key in ('MinimumVariableRefreshRate', 'MaximumVariableRefreshRate'):
         m=copy.deepcopy(supported[0]);m[key]=0
         case([m],[120],[(0,0)])
