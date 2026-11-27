@@ -1405,6 +1405,7 @@
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				label = "fab0-piogw";
+				apple,firmware-owned;
 				status = "okay";
 			};
 
@@ -1416,6 +1417,7 @@
 				#reset-cells = <0x00>;
 				label = "fab3-soc";
 				power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+				apple,firmware-owned;
 				status = "okay";
 			};
 
@@ -2621,7 +2623,8 @@
 				#reset-cells = <0x00>;
 				label = "fab7-soc";
 				power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
-				status = "disabled";
+				apple,firmware-owned;
+				status = "okay";
 			};
 
 			power-controller@180 {
@@ -2655,7 +2658,7 @@
 				#reset-cells = <0x00>;
 				label = "scodec";
 				power-domains = <&{/soc/power-management@280900000/power-controller@178}>;
-				status = "disabled";
+				status = "okay";
 			};
 
 			power-controller@198 {
@@ -3135,7 +3138,7 @@
 			reg = <0x23 0x80600000 0x00 0xc000>;
 			#address-cells = <0x01>;
 			#size-cells = <0x01>;
-			status = "disabled";
+			status = "okay";
 
 			ps_fab1_soc: power-controller@1b0 {
 				compatible = "apple,t6050-pmgr-pwrstate" ,
@@ -3144,7 +3147,8 @@
 				label = "fab1_soc";
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
-				status = "disabled";
+				apple,always-on;
+				status = "okay";
 			};
 
 			ps_avd_sys: power-controller@1d8 {
@@ -3155,7 +3159,7 @@
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				power-domains = <&ps_fab1_soc>;
-				status = "disabled";
+				status = "okay";
 			};
 
 			power-controller@1a0 {
@@ -3165,7 +3169,8 @@
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				label = "fab1-piogw";
-				status = "disabled";
+				apple,firmware-owned;
+				status = "okay";
 			};
 
 			power-controller@1a8 {
@@ -3176,7 +3181,8 @@
 				#reset-cells = <0x00>;
 				label = "fab0-soc";
 				power-domains = <&{/soc/power-management@2380600000/power-controller@1a0}>;
-				status = "disabled";
+				apple,always-on;
+				status = "okay";
 			};
 
 			power-controller@1b8 {
@@ -3220,7 +3226,7 @@
 				#reset-cells = <0x00>;
 				label = "jpg";
 				power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
-				status = "disabled";
+				status = "okay";
 			};
 
 			power-controller@1e0 {
@@ -3398,8 +3404,7 @@
 			power-domains = <&ps_avd_sys>;
 			resets = <&ps_avd_sys>;
 			iommus = <&avd_dart 0x00>, <&avd_dart 0x01>, <&avd_dart 0x02>;
-			/* Off with its DART and ps_avd_sys, as video-decoder@2308000000 is. */
-			status = "disabled";
+			status = "okay";
 		};
 
 		avd_dart: iommu@2309020000 {
@@ -3408,7 +3413,7 @@
 			#iommu-cells = <0x01>;
 			interrupts = <0x00 0x00 0x978 0x04>;
 			power-domains = <&ps_avd_sys>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		dart_apcie1: iommu@411000000 {
@@ -5388,7 +5393,7 @@
 			interrupts = <0x00 0x00 0x6b1 0x04 0x00 0x00 0x6d6 0x04>;
 			iommus = <&{/soc/iommu@48d020000} 0x01>;
 			power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
-			status = "disabled";
+			status = "okay";
 			reg-names = "core", "wrapper", "aux", "ctrl", "ctrl1";
 			resets = <&{/soc/power-management@280900000/power-controller@190}>;
 		};
@@ -5399,7 +5404,7 @@
 			interrupts = <0x00 0x00 0x6b0 0x04>;
 			power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
 			#iommu-cells = <0x01>;
-			status = "disabled";
+			status = "okay";
 			apple,dma-range = <0x100 0x00 0x300 0x00>;
 		};
 
@@ -5420,7 +5425,7 @@
 			power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
 			clocks = <&{/soc/clock-controller@280600000} 0x1e6
 				&{/soc/clock-controller@280600000} 0x1e7>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		jpeg@2281060000 {
@@ -5431,16 +5436,17 @@
 			power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
 			clocks = <&{/soc/clock-controller@280600000} 0x1e6
 				&{/soc/clock-controller@280600000} 0x1e7>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		iommu@2281020000 {
 			compatible = "apple,t6050-dart", "apple,t8110-dart";
 			reg = <0x22 0x81020000 0x00 0xc000 0x02 0x74000000 0x00 0x4000>;
+			reg-names = "dart", "auxiliary";
 			interrupts = <0x00 0x00 0x54c 0x04>;
 			power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
 			#iommu-cells = <0x01>;
-			status = "disabled";
+			status = "okay";
 			apple,dma-range = <0x100 0x00 0x300 0x00>;
 		};
 
