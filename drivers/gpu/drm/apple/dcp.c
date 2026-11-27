@@ -73,7 +73,6 @@
 #include <linux/sizes.h>
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
-#include "dcp-hdcp-drv.h"
 #include "dcp-hdmi.h"
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
@@ -1478,7 +1477,10 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 		dcp->panel.height_mm = panel.height_mm;
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
-	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
+	if (ret || !dcp_panel_gamut_color_space(panel.gamut))
+		dev_info(dcp->dev, "panel ADT: no known colour gamut, EDID primaries default to Display P3\n");
+	dcp->panel.color_target =
+		dcp_panel_color_target(ret ? DCP_PANEL_GAMUT_UNSPECIFIED : panel.gamut);
 	/*
 	 * Whether the panel has EDR headroom at all is the machine's to say: an
 	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
@@ -1799,9 +1801,6 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
-	/* The DP device endpoint HDCP started. */
-	if (dcp_hdcp_route(dcp, endpoint))
-		return dcp_hdcp_route(dcp, endpoint);
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -1819,12 +1818,6 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 	default:
 		return NULL;
 	}
-}
-
-/* Whether something already drives @endpoint (HDCP starts only idle ones). */
-bool dcp_endpoint_routed(struct apple_dcp *dcp, u8 endpoint)
-{
-	return !!dcp_afkep(dcp, endpoint);
 }
 
 /* RX and the watchdog may race to finish one present, never both. */
@@ -5084,11 +5077,9 @@ int dcp_start(struct platform_device *pdev)
 	}
 
 
-	/* Before any endpoint announces its services: they are matched by name. */
-	dcp_hdcp_init(dcp);
-
 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
+	mutex_init(&dcp->s2r_dart_lock);
 	init_completion(&dcp->s2r_dart_done);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_start(dcp);
@@ -5238,7 +5229,6 @@ int dcp_start(struct platform_device *pdev)
 		dcp_cec_register(dcp);
 	}
 #endif
-	dcp_hdcp_start_endpoints(dcp);
 
 	return ret;
 }
@@ -5519,9 +5509,6 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
-	/* A new link: DCP opens a new HDCP session once it is up. */
-	dcp_hdcp_link_changed(dcp);
-
 	/* The takeover trial powered it on before the eviction. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    dcp->desktop->trial_powered) {
@@ -5704,9 +5691,6 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
 	int ret;
-
-	/* DPMS off ends any HDCP session before the pipe goes down; the next power-on starts another. */
-	dcp_hdcp_quiesce(dcp);
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
@@ -7690,7 +7674,6 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
-	dcp_hdcp_fini(dcp);
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
 	dcp_indicator_release(dcp);
@@ -8717,6 +8700,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
+	mutex_init(&dcp->s2r_dart_lock);
 	init_completion(&dcp->s2r_dart_done);
 	init_completion(&dcp->s2r_hpd_done);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
@@ -9764,19 +9748,31 @@ static void dcp_s2r_find_darts(struct apple_dcp *dcp)
 	}
 }
 
+static void dcp_s2r_dart_end(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->s2r_dart_lock);
+	WRITE_ONCE(dcp->s2r_active, false);
+}
+
 void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on)
 {
+	int ret = 0;
+
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dev_dbg(dcp->dev, "D572(%u) s2r_active=%u\n",
 			on, READ_ONCE(dcp->s2r_active));
 
+	guard(mutex)(&dcp->s2r_dart_lock);
 	if (!READ_ONCE(dcp->s2r_active))
 		return;
 
 	if (dcp->s2r_disp_dart)
-		apple_dart_display_streams(dcp->s2r_disp_dart, dcp_s2r_layout(dcp)->disp_streams,
-					   on, false);
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !on)
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams,
+						 on, false);
+	if (ret)
+		WRITE_ONCE(dcp->s2r_dart_err, ret);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !on || ret)
 		complete(&dcp->s2r_dart_done);
 }
 
@@ -9853,6 +9849,7 @@ static int dcp_s2r_quiesce(struct apple_dcp *dcp, u32 *status)
 	bool idle;
 	int ret;
 
+	WRITE_ONCE(dcp->s2r_dart_err, 0);
 	reinit_completion(&dcp->s2r_dart_done);
 	dcp_s2r_find_darts(dcp);
 	WRITE_ONCE(dcp->s2r_active, true);
@@ -9876,6 +9873,11 @@ static int dcp_s2r_quiesce(struct apple_dcp *dcp, u32 *status)
 		dev_err(dcp->dev, "no D572 %lld ms after set_power_state(0)\n",
 			ktime_ms_delta(ktime_get(), start));
 		ret = -ETIMEDOUT;
+		goto err;
+	}
+	ret = READ_ONCE(dcp->s2r_dart_err);
+	if (ret) {
+		dev_err(dcp->dev, "display DART stream off failed on D572: %d\n", ret);
 		goto err;
 	}
 	dev_dbg(dcp->dev, "display off: set_power_state(0) %lld ms, D572 %lld ms\n", power_ms,
@@ -9930,13 +9932,13 @@ display_is_off:
 	dev_dbg(dcp->dev, "firmware idle after %lld ms, status %#x\n",
 		ktime_ms_delta(ktime_get(), start), *status);
 
-	WRITE_ONCE(dcp->s2r_active, false);
+	dcp_s2r_dart_end(dcp);
 	dcp->s2r_refused_off = false;
 
 	return 0;
 
 err:
-	WRITE_ONCE(dcp->s2r_active, false);
+	dcp_s2r_dart_end(dcp);
 	dcp_s2r_put_darts(dcp);
 	/*
 	 * Refused with the display off: leave the firmware running, never stop it under its
@@ -10216,9 +10218,6 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	bool was_off;
 	int ret;
 
-	/* Encryption off and the HDCP session ended while DCP still runs. */
-	dcp_hdcp_quiesce(dcp);
-
 	/*
 	 * Not bound into the display subsystem (a component unbind released the RTKit
 	 * session): nothing of the firmware is this driver's to stop.
@@ -10320,7 +10319,6 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	u32 val;
 	int ret;
 
-	dcp->s2r_domains_up = false;
 	ret = dcp_s2r_map_power(dcp, &ps, &pwrgate, &pmc);
 	if (ret)
 		goto out;
@@ -10332,8 +10330,12 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	 * so on every firmware (27.2 reports 1 at the stop). Dark until the domains are
 	 * back, as for an external DCP.
 	 */
-	if (dcp->s2r_disp_dart)
-		apple_dart_power_dark(dcp->s2r_disp_dart, true);
+	if (dcp->s2r_disp_dart) {
+		ret = apple_dart_power_dark(dcp->s2r_disp_dart, true);
+		if (ret)
+			goto out;
+	}
+	dcp->s2r_domains_up = false;
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
 	val = readl(ps + l->disp_cpu);
@@ -10505,11 +10507,16 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 	if (ret)
 		return ret;
 	/* Powered again: the invalidations held while it was dark run now. */
-	if (dcp->s2r_disp_dart)
-		apple_dart_power_dark(dcp->s2r_disp_dart, false);
+	if (dcp->s2r_disp_dart) {
+		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
+		if (ret)
+			return ret;
+	}
 	/* After the domains, whose writes it would reject, the DART protects them again. */
-	apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams, true,
-				   false);
+	ret = apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
+					 true, false);
+	if (ret)
+		return ret;
 	/* Set up again before the firmware runs, which uses it right away. */
 	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
 		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
@@ -10554,8 +10561,11 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 	 * Its display DART goes off with DISPEXT0, and every framebuffer is mapped into it: a
 	 * map during the hold would reach its registers. Dark until the domains are back.
 	 */
-	if (dcp->s2r_disp_dart)
-		apple_dart_power_dark(dcp->s2r_disp_dart, true);
+	if (dcp->s2r_disp_dart) {
+		ret = apple_dart_power_dark(dcp->s2r_disp_dart, true);
+		if (ret)
+			goto out;
+	}
 	dcp->s2r_domains_up = false;
 	dcp_pmc_set(dcp, pmc, false);
 	ret = 0;
@@ -10659,13 +10669,20 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 	/* Powered again: the invalidations held while it was dark run now. */
-	if (dcp->s2r_disp_dart)
-		apple_dart_power_dark(dcp->s2r_disp_dart, false);
+	if (dcp->s2r_disp_dart) {
+		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
+		if (ret)
+			return ret;
+	}
 
 	/* After the domains, whose writes it would reject, the DART protects them again. */
-	if (dcp->s2r_dcp_dart)
-		apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
-					   true, false);
+	if (dcp->s2r_dcp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_dcp_dart,
+						 dcp_s2r_layout(dcp)->dcp_streams,
+						 true, false);
+		if (ret)
+			return ret;
+	}
 	/* Set up again before the firmware runs, which uses it right away. */
 	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
 		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
@@ -10715,6 +10732,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
  */
 static int dcp_s2r_display_on(struct apple_dcp *dcp)
 {
+	bool done;
 	int ret;
 
 	ret = dcp_s2r_warm_restart(dcp);
@@ -10723,6 +10741,7 @@ static int dcp_s2r_display_on(struct apple_dcp *dcp)
 		return ret;
 	}
 
+	WRITE_ONCE(dcp->s2r_dart_err, 0);
 	reinit_completion(&dcp->s2r_dart_done);
 	WRITE_ONCE(dcp->s2r_active, true);
 
@@ -10730,13 +10749,19 @@ static int dcp_s2r_display_on(struct apple_dcp *dcp)
 	ret = dcp_s2r_power(dcp, true, true, true);
 	if (ret) {
 		dev_err(dcp->dev, "no reply to set_power_state(1): %d\n", ret);
-		goto out;
+		dcp_s2r_dart_end(dcp);
+		return ret;
 	}
-	if (!wait_for_completion_timeout(&dcp->s2r_dart_done,
-					 msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS)))
+	done = wait_for_completion_timeout(&dcp->s2r_dart_done,
+					   msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS));
+	dcp_s2r_dart_end(dcp);
+	if (!done && !completion_done(&dcp->s2r_dart_done)) {
 		dev_warn(dcp->dev, "no D572 after set_power_state(1), scanout DART left off\n");
-out:
-	WRITE_ONCE(dcp->s2r_active, false);
+		return -ETIMEDOUT;
+	}
+	ret = READ_ONCE(dcp->s2r_dart_err);
+	if (ret)
+		dev_err(dcp->dev, "display DART stream on failed on D572: %d\n", ret);
 
 	return ret;
 }
@@ -10993,13 +11018,28 @@ static void dcp_s2r_light_running(struct apple_dcp *dcp)
 	int ret;
 
 	dcp_s2r_find_darts(dcp);
+	WRITE_ONCE(dcp->s2r_dart_err, 0);
 	reinit_completion(&dcp->s2r_dart_done);
 	WRITE_ONCE(dcp->s2r_active, true);
 	ret = dcp_s2r_power(dcp, true, true, true);
-	if (!ret && !wait_for_completion_timeout(&dcp->s2r_dart_done,
-						 msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS)))
-		dev_warn(dcp->dev, "no D572 after set_power_state(1), scanout DART left off\n");
-	WRITE_ONCE(dcp->s2r_active, false);
+	if (!ret) {
+		bool done = wait_for_completion_timeout(&dcp->s2r_dart_done,
+							msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS));
+
+		dcp_s2r_dart_end(dcp);
+		if (!done && !completion_done(&dcp->s2r_dart_done)) {
+			dev_warn(dcp->dev,
+				 "no D572 after set_power_state(1), scanout DART left off\n");
+			ret = -ETIMEDOUT;
+		} else {
+			ret = READ_ONCE(dcp->s2r_dart_err);
+			if (ret)
+				dev_err(dcp->dev, "display DART stream on failed on D572: %d\n",
+					ret);
+		}
+	} else {
+		dcp_s2r_dart_end(dcp);
+	}
 	dcp_s2r_put_darts(dcp);
 	if (ret) {
 		WRITE_ONCE(dcp->crashed, true);
@@ -11085,8 +11125,10 @@ static void dcp_s2r_prewarm_work(struct work_struct *work)
 	if (ret) {
 		/* Back as DPMS off left it, stopped and powered down: DPMS on starts it again. */
 		dcp_s2r_stop_failed_start(dcp);
-		dcp_s2r_stop_streams(dcp);
-		dcp_s2r_domains_off(dcp);
+		if (!dcp_s2r_stop_streams(dcp))
+			dcp_s2r_domains_off(dcp);
+		else
+			WRITE_ONCE(dcp->crashed, true);
 		dcp_s2r_put_darts(dcp);
 		dev_warn(dcp->dev, "wake: firmware start failed, DPMS on tries again: %d\n", ret);
 		return;
@@ -11852,21 +11894,39 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	 * An external DCP stopped for an earlier sleep stays down, with its domains forced off by
 	 * the power word step: reading its registers again hung the second sleep of a boot (11 Nov).
 	 */
-	if (external) {
-		/* Also one that was never running: the power word step took its domains down too. */
-		if (READ_ONCE(dcp->ext_dead) || dcp->t6041_ext_seen)
-			return 0;
-	}
+	if (external && dcp->t6041_ext_seen)
+		return 0;
 	if (!apple_rtkit_is_running(dcp->rtk)) {
+		ret = 0;
 		if (external) {
+			if (dcp->coproc_reg &&
+			    (readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) &
+			     APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+				dcp_s2r_cpu_stop(dcp);
+				ret = readl_poll_timeout(dcp->coproc_reg +
+							 APPLE_DCP_COPROC_CPU_CONTROL,
+							 ctrl,
+							 !(ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN),
+							 100, 10000);
+				if (ret) {
+					dev_err(dev,
+						"coprocessor RUN bit did not clear: control %#x\n",
+						ctrl);
+					return ret;
+				}
+			}
 			dcp_s2r_find_darts(dcp);
 			if (dcp->s2r_disp_dart)
-				apple_dart_display_streams(dcp->s2r_disp_dart,
-							   DCP_S2R_DISP_STREAMS, false, true);
-			dcp->t6041_ext_seen = true;
+				ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+								 DCP_S2R_DISP_STREAMS,
+								 false, true);
+			if (!ret && dcp->s2r_dcp_dart)
+				ret = dcp_s2r_stop_streams(dcp);
+			if (!ret)
+				dcp->t6041_ext_seen = true;
 		}
 		dcp_s2r_put_darts(dcp);
-		return 0;
+		return ret;
 	}
 	dcp_drain_for_sleep(dcp);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
@@ -11903,24 +11963,33 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 		if (READ_ONCE(dcp->pipe_off)) {
 			dev_info(dev, "display already off: no second power-off\n");
 			if (dcp->s2r_disp_dart) {
-				apple_dart_display_streams(dcp->s2r_disp_dart,
-							   DCP_S2R_DISP_STREAMS, false, false);
 				streams_off = true;
+				ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+								 DCP_S2R_DISP_STREAMS,
+								 false, false);
+				if (ret)
+					goto err_unwind;
 			}
 		} else {
 			unsigned long d572 = msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS);
 
+			WRITE_ONCE(dcp->s2r_dart_err, 0);
 			reinit_completion(&dcp->s2r_dart_done);
 			WRITE_ONCE(dcp->s2r_active, true);
 			_dcp_poweroff(dcp);
 			powered_off = true;
 			if (!wait_for_completion_timeout(&dcp->s2r_dart_done, d572)) {
-				WRITE_ONCE(dcp->s2r_active, false);
+				dcp_s2r_dart_end(dcp);
 				dev_err(dev, "no D572 after the power-off\n");
 				ret = -ETIMEDOUT;
 				goto err_unwind;
 			}
-			WRITE_ONCE(dcp->s2r_active, false);
+			dcp_s2r_dart_end(dcp);
+			ret = READ_ONCE(dcp->s2r_dart_err);
+			if (ret) {
+				dev_err(dev, "display DART stream off failed on D572: %d\n", ret);
+				goto err_unwind;
+			}
 		}
 		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
 			dev_err(dev, "display calls still in flight after the power-off\n");
@@ -11968,7 +12037,6 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	 * data abort at 0xffffffff00000040 right after the first shmem_setup).
 	 */
 	if (external) {
-		dcp->t6041_ext_seen = true;
 		ret = apple_rtkit_shutdown(dcp->rtk);
 		if (ret)
 			dev_warn(dev, "external coprocessor shutdown failed: %d\n", ret);
@@ -11999,33 +12067,48 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	 * later unmap would flush a DART behind a dead block (11 Nov).
 	 * Marked dark, the flush only publishes to memory.
 	 */
+	ret = 0;
 	if (external && dcp->s2r_disp_dart)
-		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
-					   false, true);
-	ret = dcp_s2r_stop_streams(dcp);
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+						 false, true);
+	if (!ret)
+		ret = dcp_s2r_stop_streams(dcp);
 	dcp_s2r_put_darts(dcp);
 	if (ret) {
 		dev_err(dev, "failed to stop DCP DART streams: %d\n", ret);
 		return ret;
 	}
+	if (external)
+		dcp->t6041_ext_seen = true;
 
 	return 0;
 
 err_unwind:
-	if (!external) {
-		if (keep_set) {
-			if (dcp->s2r_disp_dart)
-				apple_dart_display_keep(dcp->s2r_disp_dart,
-							DCP_S2R_DISP_STREAMS, false);
-			if (dcp->s2r_dcp_dart)
-				apple_dart_display_keep(dcp->s2r_dcp_dart,
-							DCP_S2R_DCP_STREAMS, false);
+	{
+		int dart_ret = 0;
+
+		if (!external) {
+			if (keep_set) {
+				if (dcp->s2r_disp_dart)
+					apple_dart_display_keep(dcp->s2r_disp_dart,
+								DCP_S2R_DISP_STREAMS, false);
+				if (dcp->s2r_dcp_dart)
+					apple_dart_display_keep(dcp->s2r_dcp_dart,
+								DCP_S2R_DCP_STREAMS, false);
+			}
+			if ((powered_off || streams_off) && dcp->s2r_disp_dart)
+				dart_ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+								      DCP_S2R_DISP_STREAMS,
+								      true, false);
 		}
-		if ((powered_off || streams_off) && dcp->s2r_disp_dart)
-			apple_dart_display_streams(dcp->s2r_disp_dart,
-						   DCP_S2R_DISP_STREAMS, true, false);
+		dcp_s2r_put_darts(dcp);
+		if (dart_ret) {
+			dev_err(dev, "display DART restore after failed stop failed: %d\n",
+				dart_ret);
+			WRITE_ONCE(dcp->crashed, true);
+			return ret;
+		}
 	}
-	dcp_s2r_put_darts(dcp);
 	iomfb_pause_presentation(dcp, false);
 	if (idle_attempted) {
 		int ap_ret = apple_rtkit_ap_power(dcp->rtk, true);
@@ -12409,15 +12492,23 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 		dev_warn(dev, "display child domains not on after the sleep: %#x\n", to);
 
 	dcp_s2r_find_darts(dcp);
+	ret = 0;
 	if (dcp->s2r_disp_dart) {
 		apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false);
-		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+						 true, false);
 	}
-	if (dcp->s2r_dcp_dart) {
+	if (!ret && dcp->s2r_dcp_dart) {
 		apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, false);
-		apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true, false);
+		ret = apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS,
+						 true, false);
 	}
 	dcp_s2r_put_darts(dcp);
+	if (ret) {
+		dev_err(dev, "display DART stream restore after the sleep failed: %d\n", ret);
+		WRITE_ONCE(dcp->crashed, true);
+		return ret;
+	}
 
 	WRITE_ONCE(dcp->crashed, false);
 	WRITE_ONCE(dcp->ext_dead, false);
@@ -12451,18 +12542,20 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 
 static bool dcp_t6041_down, dcp_t6041_words;
 
-/* @np's first DART, dark if its driver is bound. */
-static void dcp_t6041_dart_dark(struct device_node *np)
+/* @np's first DART, dark or lit if its driver is bound. */
+static int dcp_t6041_dart_dark(struct device_node *np, bool dark)
 {
 	struct device_node *dart = np ? of_parse_phandle(np, "iommus", 0) : NULL;
 	struct platform_device *pdev = dart ? of_find_device_by_node(dart) : NULL;
+	int ret = 0;
 
 	of_node_put(dart);
 	if (!pdev)
-		return;
+		return 0;
 	if (device_is_bound(&pdev->dev))
-		apple_dart_power_dark(&pdev->dev, true);
+		ret = apple_dart_power_dark(&pdev->dev, dark);
 	put_device(&pdev->dev);
+	return ret;
 }
 
 /*
@@ -12472,18 +12565,50 @@ static void dcp_t6041_dart_dark(struct device_node *np)
  * whose DCP never bound, which the display subsystem skips as unusable, is covered too, and so
  * is every chain a board enables, not only the first two.
  */
-static void dcp_t6041_ext_darts_dark(void)
+static int dcp_t6041_ext_darts_dark(void)
 {
-	struct device_node *np, *piodma;
+	struct device_node *np, *piodma, *fail_np = NULL;
+	bool fail_on_dcp = false;
+	int ret = 0;
 
 	for_each_compatible_node(np, NULL, "apple,t6041-dcpext") {
 		if (!of_device_is_available(np))
 			continue;
 		piodma = of_get_child_by_name(np, "piodma");
-		dcp_t6041_dart_dark(piodma);
+		ret = dcp_t6041_dart_dark(piodma, true);
 		of_node_put(piodma);
-		dcp_t6041_dart_dark(np);
+		if (ret) {
+			fail_np = np;
+			break;
+		}
+		ret = dcp_t6041_dart_dark(np, true);
+		if (ret) {
+			fail_np = np;
+			fail_on_dcp = true;
+			break;
+		}
 	}
+	if (!ret)
+		return 0;
+	for_each_compatible_node(np, NULL, "apple,t6041-dcpext") {
+		if (!of_device_is_available(np))
+			continue;
+		if (np == fail_np) {
+			if (fail_on_dcp) {
+				piodma = of_get_child_by_name(np, "piodma");
+				dcp_t6041_dart_dark(piodma, false);
+				of_node_put(piodma);
+			}
+			of_node_put(np);
+			break;
+		}
+		dcp_t6041_dart_dark(np, false);
+		piodma = of_get_child_by_name(np, "piodma");
+		dcp_t6041_dart_dark(piodma, false);
+		of_node_put(piodma);
+	}
+	of_node_put(fail_np);
+	return ret;
 }
 
 enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
@@ -12510,8 +12635,10 @@ static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 	if (step == DCP_S2R_WORDS_DOWN) {
 		if (dcp_t6041_words || !dcp_t6041_down)
 			return 0;
+		ret = dcp_t6041_ext_darts_dark();
+		if (ret)
+			return ret;
 		dcp_t6041_words = true;
-		dcp_t6041_ext_darts_dark();
 		for (i = 0; i < host->t6041_power.num_chains; i++) {
 			ret = dcp_t6041_word_try(host->dev, &host->t6041_power,
 						 &host->t6041_power.chains[i]);
