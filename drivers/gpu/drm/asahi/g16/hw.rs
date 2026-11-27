@@ -16,6 +16,25 @@ pub(crate) struct HwId {
     pub(crate) version: u32,
     /// SGX layout word (`sgx + 0xd04010`).
     pub(crate) counts: u32,
+    /// Bits of `version` and `counts` that must match; the others are not qualified.
+    pub(crate) version_mask: u32,
+    pub(crate) counts_mask: u32,
+}
+
+impl HwId {
+    /// Mask both words exactly; rows give their values with `..HwId::EXACT`.
+    pub(crate) const EXACT: HwId = HwId {
+        version: 0,
+        counts: 0,
+        version_mask: u32::MAX,
+        counts_mask: u32::MAX,
+    };
+
+    /// Whether the identification registers read `version` and `counts`.
+    pub(crate) const fn matches(&self, version: u32, counts: u32) -> bool {
+        (version ^ self.version) & self.version_mask == 0
+            && (counts ^ self.counts) & self.counts_mask == 0
+    }
 }
 
 pub(crate) use crate::fwid::FirmwareBuild;
@@ -50,6 +69,11 @@ pub(crate) struct Config {
     pub(crate) firmware: &'static [FirmwareBuild],
     /// Whether this compatible also has a legacy driver.
     pub(crate) needs_handoff_marker: bool,
+    /// GPU node property holding the boot loader's handoff version (the handoff marker).
+    pub(crate) handoff_property: &'static core::ffi::CStr,
+    /// `apple,firmware-compat` values this backend owns on a compatible that another backend
+    /// also serves; empty when the handoff layout alone selects the backend.
+    pub(crate) firmware_compat: &'static [[u32; 3]],
     /// T8132 retains the PMP bridge even on firmware that does not send an AGX vote.
     pub(crate) prepare_pmp: bool,
     /// PMGR register offset of the GFX domain.
@@ -93,11 +117,31 @@ pub(crate) mod t8132 {
         hw_ids: &[HwId {
             version: 0x0a021100,
             counts: 0x0011010a,
+            ..HwId::EXACT
         }],
         adt_compatible: b"gpu,t8132",
         display_compatible: b"apple,t8132-display-subsystem\0",
         layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
+            FirmwareBuild {
+                // 25G83 (build 2 of armfw_g16g.im4p) as iBoot loads it on a T8132 Air. Besides
+                // the entropy, iBoot fills a header field, the record block the header points at
+                // (0x5c8df, 0x231) and the tunables block its TUNS/TUNZ records describe
+                // (0x5cb10, 0x6a0). With those zeroed, the loaded image hashes the same as the
+                // TEXT of the firmware file.
+                name: "Apple GFX 25G83 (normalized loaded image, boot-filled ranges)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[(0x23c, 8), (0x5c8df, 0x231), (0x5cb10, 0x6a0)],
+                text_sha256: [
+                    0x3a, 0x41, 0xe4, 0x77, 0xb1, 0x2d, 0x48, 0x8d, 0x0c, 0x27, 0x7d, 0x1d, 0x30,
+                    0x6b, 0x60, 0x88, 0x5e, 0x67, 0x5e, 0xc7, 0x98, 0x54, 0xca, 0xaf, 0x90, 0x29,
+                    0x35, 0xc2, 0x7e, 0xf8, 0x76, 0x5e,
+                ],
+            },
+            // The per-board entries below stay until an 8-core and a 10-core J713 on 26.6.2
+            // have booted with only the normalized entry above.
             FirmwareBuild {
                 name: "Apple GFX 25G83 (normalized loaded image)",
                 text_size: 0x60000,
@@ -187,6 +231,8 @@ pub(crate) mod t8132 {
             },
         ],
         needs_handoff_marker: false,
+        handoff_property: super::G16_HANDOFF_PROPERTY,
+        firmware_compat: &[],
         prepare_pmp: true,
         power_offset: 0x250,
         fault_banks: 8,
@@ -323,6 +369,7 @@ pub(crate) mod t6030 {
         hw_ids: &[HwId {
             version: 0x07031100,
             counts: 0x00110209,
+            ..HwId::EXACT
         }],
         adt_compatible: b"gpu,t6030",
         display_compatible: b"apple,t6030-display-subsystem\0",
@@ -340,6 +387,8 @@ pub(crate) mod t6030 {
             ],
         }],
         needs_handoff_marker: true,
+        handoff_property: super::G16_HANDOFF_PROPERTY,
+        firmware_compat: &[],
         prepare_pmp: false,
         power_offset: 0x110,
         fault_banks: 2,
@@ -424,6 +473,91 @@ pub(crate) mod t6030 {
         (0x5c370, 1),
         (0x5c371, 0x2d4),
     ];
+}
+
+/// The handoff marker aura publishes for the T8132 and T6030 GPUs.
+pub(crate) const G16_HANDOFF_PROPERTY: &core::ffi::CStr = c"apple,g16-handoff-version";
+
+/// T8122 (G15G), qualified with the C0 image the macOS 27.2 boot chain loads (26B123).
+///
+/// The same compatible is served by the `m3` runtime for the 14.8.3 and 26.6.2 firmware, so this
+/// row owns a device only when its `firmware-compat` is 27.2 and the handoff describes [`LAYOUT`]
+/// ([`Config::firmware_compat`], `adt::claims`). Aura names the handoff version
+/// `apple,m3-handoff-version` on this SoC (aura#448/#455).
+pub(crate) mod t8122 {
+    use super::super::fw::initdata;
+    use super::{Config, FirmwareBuild, FwLayout, HwId, FW_26B123, UPPER};
+
+    pub(crate) const CONFIG: Config = Config {
+        chip_id: 0x8122,
+        gpu_generation: 15,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
+        gpu_variant: crate::hw::GpuVariant::G,
+        // C0 (`crate::hw::GpuRevision::C0`), as the m3 runtime reports it.
+        gpu_revision: 0x20,
+        uat_ias: 42,
+        uat_oas: 42,
+        // One cluster of ten core slots; eight or ten are enabled.
+        num_clusters: 1,
+        num_cores_per_cluster: 10,
+        // Family 7, variant 2 (G15G), revision 0x20; one die and one cluster. The other bits
+        // of the two words are not qualified (`m3_soc::T8122.id`).
+        hw_ids: &[HwId {
+            version: 0x07022000,
+            counts: 0x00010100,
+            version_mask: 0xffffff00,
+            counts_mask: 0x000fff00,
+        }],
+        adt_compatible: b"gpu,t8122",
+        display_compatible: b"apple,t8122-display-subsystem\0",
+        layouts: &[&LAYOUT],
+        firmware: &[FirmwareBuild {
+            // GKTS/ECAP-normalized loaded TEXT, measured on the J615 over three boots
+            // (linux#2781, `m3_firmware::T8122_IMAGES_27`): only the two entropy values are
+            // zeroed, which is this backend's normalization with no boot-filled ranges.
+            name: "Apple GFX 26B123 G15G (C0, entropy zeroed)",
+            text_size: LAYOUT.text_size,
+            data_size: LAYOUT.data_size,
+            entropy: &[[0x60f60, 0x61043]],
+            boot_filled: &[],
+            text_sha256: [
+                0x74, 0x06, 0xa5, 0x68, 0x34, 0x28, 0x37, 0xa7, 0x9f, 0x22, 0xc0, 0x3f, 0x7d, 0x45,
+                0x7f, 0x9f, 0x9d, 0x3e, 0x08, 0x8c, 0x4b, 0x78, 0xd7, 0x83, 0xe2, 0xdc, 0xad, 0x76,
+                0x71, 0x6f, 0x16, 0xf5,
+            ],
+        }],
+        needs_handoff_marker: true,
+        handoff_property: c"apple,m3-handoff-version",
+        firmware_compat: &[[27, 2, 0]],
+        // The 27.2 start sends no PMP vote.
+        prepare_pmp: false,
+        // `ps_gfx` in t8122-pmgr.dtsi.
+        power_offset: 0x1e0,
+        fault_banks: 1,
+        // The m3 27.2 start on the J615 writes no GFXCAXI2AF enables (no slot 22 either).
+        axi2af: false,
+        host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
+        host_block_ready: true,
+        deep_sleep: false,
+        supports_render_scs: false,
+        cross_engine_hold: true,
+    };
+
+    /// 26B123 G15G: __TEXT 0x64000 as on G16G, __DATA 0xb4000 and the 0x8000 __DATA_SHARED_RO
+    /// tail, so the third segment is at UPPER + 0x118000 (aura's version-2 handoff).
+    pub(crate) const LAYOUT: FwLayout = FwLayout {
+        name: "26B123 G15G",
+        segment_vas: &[UPPER, UPPER + 0x64000, UPPER + 0x118000],
+        data_size: 0xbc000,
+        initdata: &initdata::G15G_26B123,
+        // The G15 family's 26B123 protocol: the J615 firmware installs root[1] at root + 3
+        // pages with 0x403 attributes, the G15S convention, not G16G's.
+        abi: super::FwAbi::V26B123G15S,
+        // Not known for this firmware; the host keeps reading GPU registers while it runs, as
+        // the m3 runtime does.
+        powered: None,
+        ..FW_26B123
+    };
 }
 
 /// Which part of the loaded image a firmware page-table leaf maps.
@@ -972,7 +1106,19 @@ pub(crate) mod sizes {
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
     /// Independent firmware compute workqueue pipes sharing `Channel::Compute` and `sched_ctx`.
-    pub(crate) const COMPUTE_PIPES: usize = 2;
+    /// Each pipe owns a disjoint `ComputeGraph` (`qinfo`, work ring, `qstate`, `fw_stamp`,
+    /// `notifier`, `threshold`, `job_list`) and completion event (`work::compute::EVENTS`) so
+    /// concurrent compute VMs lease disjoint workqueues instead of mixing ASIDs in one active
+    /// `qinfo`. Pipe 0 exclusively owns `0..PIPE1_COMPUTE_START` for base-only and SCS VMs;
+    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (18 units
+    /// for 7 secondary pipes, leaving 11 active units beyond the 7 undisplaced retired leases).
+    pub(crate) const COMPUTE_PIPES: usize = 8;
+    /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
+    /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
+    pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
+    const _: () = assert!(COMPUTE_PIPES >= 2 && COMPUTE_PIPES <= 16);
+    const _: () = assert!(MAX_VM_COMPUTE_PIPES >= 2 && MAX_VM_COMPUTE_PIPES <= COMPUTE_PIPES);
+    const _: () = assert!(COMPUTE_UNITS - PIPE1_COMPUTE_START >= (COMPUTE_PIPES - 1) * 2);
     /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base physical PB/UMA allocator slots allocated per VM on first render.

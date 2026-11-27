@@ -128,6 +128,9 @@ config DRM_APPLE_PARSER_KUNIT_TEST
 	help
 	  Build tests for AFKv2 lengths, DMA ownership and reply correlation,
 	  legacy EPIC replies, and H17P IOMFB callback envelopes and sizes.
+	  Also check that the DCP dictionary parsers (display metadata,
+	  DPTX capabilities, log events, timing catalogs, EDID properties
+	  and audio elements) reject truncated and malformed blobs.
 	  The tests use allocated buffers and fake devices and do not require
 	  an Apple display controller or any firmware.
 

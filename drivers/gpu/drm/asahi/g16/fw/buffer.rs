@@ -238,6 +238,24 @@ pub(crate) fn uma_manager_image(
     m
 }
 
+/// One retained M4 compute UMA descriptor (`COMPUTE_UMA_SLOT + hw_slot`), identical to
+/// [`uma_manager_image`] with `COMPUTE_EXCLUSION = 1` and `work_fw` at offset 0.
+pub(crate) fn compute_uma_manager_image(
+    work_fw: u64,
+    slot: u32,
+    state_gpu: u64,
+    list_gpu: u64,
+    counter_fw: u64,
+    seeds: u32,
+    records: u32,
+) -> [u8; uma_manager::SIZE] {
+    let mut m = uma_manager_image(
+        work_fw, slot, state_gpu, list_gpu, counter_fw, seeds, records,
+    );
+    put32(&mut m, super::graph::manager::COMPUTE_EXCLUSION, 1);
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

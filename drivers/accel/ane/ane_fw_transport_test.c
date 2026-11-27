@@ -1186,6 +1186,87 @@ static void ane_transport_pool_no_free_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOSPC);
 }
 
+/*
+ * A reserved allocation is kept retired and serves the request it was made
+ * for, with no allocation then; a full quota or no memory refuses the
+ * reservation without failing the transport or touching the ring.
+ */
+static void ane_transport_shared_reserve_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	unsigned int i;
+	u64 dva;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, 1, ANE_FW_SHARED_EXPP),
+			-EINVAL);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			0);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	KUNIT_EXPECT_TRUE(test, f->t.shared_retired[0]);
+	dva = f->t.shared[0].dva;
+	/* Already there: no second allocation. */
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			0);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	KUNIT_EXPECT_FALSE(test, f->t.shared_retired[0]);
+	KUNIT_EXPECT_EQ(test, ane_test_load(f, ane_test_slot(f, ANE_FW_SHAREDMALLOC) -
+					    ANE_FW_SLOT_SIZE), dva | 1);
+
+	/* No memory: refused, and nothing recorded. */
+	f->alloc_error = -ENOMEM;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-ENOMEM);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	f->alloc_error = 0;
+	f->allocs = 1;
+
+	/* Fill the quota with live pools; one more is refused cleanly. */
+	for (i = 1; i < ANE_FW_SHARED_TOTAL / SZ_2M; i++) {
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M,
+								      ANE_FW_SHARED_EXPP), 0);
+		ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	}
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-ENOSPC);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	KUNIT_EXPECT_EQ(test, f->refusals, 0U);
+
+	/* A FREE gives one back, which serves the next reservation. */
+	f->t.native_free = true;
+	ane_test_shared_request(f, dva, 0, 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			0);
+	KUNIT_EXPECT_EQ(test, f->allocs, (unsigned int)(ANE_FW_SHARED_TOTAL / SZ_2M));
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+/*
+ * A backend surface that fails validation fails the transport, as it does for
+ * a request, so a later LOAD does not map another one.
+ */
+static void ane_transport_shared_reserve_invalid_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->alloc_bad = 1;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, f->t.error, -EPROTO);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, 0UL);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_reserve(&f->t, SZ_2M, ANE_FW_SHARED_EXPP),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+}
+
 /* A FREE posted after UNLOAD is answered by the settle loop. */
 static void ane_transport_settle_test(struct kunit *test)
 {
@@ -1270,6 +1351,46 @@ static void ane_transport_mode_stop_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
 	KUNIT_EXPECT_FALSE(test, f->t.pending[ch].active);
 	KUNIT_EXPECT_EQ(test, f->t.head[ch], 1U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+/*
+ * A warm sleep publishes EXCLAVE_MODE_STOP and SUSPEND on a transport that
+ * survives the wake (ane_fw_suspend_firmware()). Once both are answered and
+ * the SUSPEND reply was read, releasing to the mark taken before them gives
+ * the arena back: the next command lands where 0x31 did, and sleep after
+ * sleep the arena does not shrink.
+ */
+static void ane_transport_sleep_release_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 command[8] = {};
+	u32 ch = f->t.control_ch;
+	size_t mark;
+	u64 first;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	mark = ane_fw_transport_mark(&f->t);
+	for (i = 0; i < 64; i++) {
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), 0);
+		if (!i)
+			first = f->t.pending[ch].dva;
+		KUNIT_ASSERT_EQ(test, f->t.pending[ch].dva, first);
+		/* Released too early: a command is still pending. */
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_release(&f->t, mark), -EBUSY);
+		ane_test_reply(f, ch);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+
+		put_unaligned_le16(0x24, command + 4);	/* SUSPEND */
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+							       sizeof(command), TEST_DEADLINE), 0);
+		KUNIT_ASSERT_GT(test, ane_fw_transport_mark(&f->t), mark);
+		ane_test_reply(f, ANE_FW_IO);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_release(&f->t, mark), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_mark(&f->t), mark);
+	}
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
 }
 
@@ -1550,6 +1671,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_pool_reuse_test),
 	KUNIT_CASE(ane_transport_pool_reuse_native_test),
 	KUNIT_CASE(ane_transport_pool_no_free_test),
+	KUNIT_CASE(ane_transport_shared_reserve_test),
+	KUNIT_CASE(ane_transport_shared_reserve_invalid_test),
 	KUNIT_CASE(ane_transport_settle_test),
 	KUNIT_CASE(ane_transport_carry_shared_test),
 	KUNIT_CASE(ane_transport_mode_stop_test),
@@ -1588,6 +1711,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_wait_test),
 	KUNIT_CASE(ane_transport_wait_polls_test),
 	KUNIT_CASE(ane_transport_poll_sleep_test),
+	KUNIT_CASE(ane_transport_sleep_release_test),
 	{}
 };
 

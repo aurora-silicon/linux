@@ -105,6 +105,7 @@ impl ApplicationOwner {
             Err(Failure::Fatal(error))=>error.to_errno(),
             Err(Failure::Job(JobFailure::Recovered(_) | JobFailure::Unbound(..) | JobFailure::Released))=>JobOutcome::Recovered as i32,
             Err(Failure::Job(JobFailure::Stranded(..) | JobFailure::Retained))=>JobOutcome::Stranded as i32,
+            Err(Failure::Job(JobFailure::Refused(error)))=>JobOutcome::Refused as i32-error.to_errno(),
         }
     }
 
@@ -114,6 +115,8 @@ impl ApplicationOwner {
             0 => Ok(()),
             code if code==JobOutcome::Recovered as i32 => Err(Failure::Job(JobFailure::Released)),
             code if code==JobOutcome::Stranded as i32 => Err(Failure::Job(JobFailure::Retained)),
+            code if code>JobOutcome::Refused as i32 =>
+                Err(Failure::Job(JobFailure::Refused(Error::from_errno(JobOutcome::Refused as i32-code)))),
             errno => Err(Failure::Fatal(Error::from_errno(errno))),
         }
     }
@@ -125,6 +128,8 @@ impl ApplicationOwner {
         match result {
             Ok(()) => Ok(()),
             Err(Failure::Job(JobFailure::Released)) | Err(Failure::Job(JobFailure::Recovered(_))) => Err(EIO),
+            // Nothing ran: the client's VM stays usable.
+            Err(Failure::Job(JobFailure::Refused(error))) => Err(error),
             Err(Failure::Job(_)) => {if let Some(status)=vm.status(){status.record(EIO);}Err(EIO)}
             Err(Failure::Fatal(error)) => {if let Some(status)=vm.status(){status.record(error);}Err(error)}
         }
@@ -137,6 +142,8 @@ const TICKET_RUNNING: i32 = 1;
 enum JobOutcome {
     Recovered = 2,
     Stranded = 3,
+    /// Plus the errno: [`JobFailure::Refused`].
+    Refused = 0x1000,
 }
 
 impl G18Runtime for ApplicationOwner {
@@ -200,6 +207,9 @@ fn log_job_failure(session:&G18Session,failure:&JobFailure) {
         JobFailure::Unbound(r,path,unready) => dev_err!(session.device(),
             "G18_APP_JOB_FAILED error={:?} recovery epoch={} host={} us={} reason={:#x} slot-mask={:#x} queues=retired unbound={} path={:?} quarantined session=live recoveries={}\n",
             EIO,r.epoch,r.host,r.us,r.cause.reason,r.cause.slot_mask,unready,path,recovery::recoveries()),
+        // The submitter's own error, returned to it: not logged above debug level.
+        JobFailure::Refused(error) => dev_dbg!(session.device(),
+            "G18_APP_JOB_REFUSED error={:?} unpublished session=live\n",error),
         // Only the submitting thread's summaries; the worker logs the rest.
         JobFailure::Released | JobFailure::Retained => {}
     }
@@ -213,7 +223,11 @@ impl G18Session {
             self.application_job=Some(ApplicationJob::new(self.render_job.take().ok_or(EIO)?)?);
         }
         let job=self.application_job.as_mut().ok_or(EIO)?;
-        job.prepare(&self.dev,&self.uat,vm,render)?;
+        if let Err(error)=job.prepare(&self.dev,&self.uat,vm,render) {
+            // Nothing is published before prepare() commits the frame: a
+            // job it refused leaves the owner retired, the session serves on.
+            return Err(if job.unpublished() {Failure::Job(JobFailure::Refused(error))} else {Failure::Fatal(error)});
+        }
         if job.pool_aliases.is_empty() {
             job.pool_aliases=self.memory.as_mut().ok_or(EIO)?.application_aliases(vm)?;
         }

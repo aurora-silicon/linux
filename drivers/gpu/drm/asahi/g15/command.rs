@@ -34,7 +34,7 @@ use kernel::{prelude::*, sync::Arc, xarray};
 use super::wire as uapi;
 
 use super::{gate, hw};
-use crate::{file, mmu, util::AnyBitPattern, util::Reader};
+use crate::{file, mmu, timestamp, util::AnyBitPattern, util::Reader};
 
 /// Largest command buffer.
 pub(crate) const MAX_CMDBUF: usize = 4 << 20;
@@ -135,7 +135,7 @@ pub(crate) struct Submission {
     /// Render and compute commands, for the queue's EXACT_PRIOR ordinals.
     pub(crate) counts: [u64; 2],
     /// The timestamp buffers the commands name, retained with the job.
-    pub(crate) timestamps: KVec<Arc<mmu::KernelMapping>>,
+    pub(crate) timestamps: KVec<Arc<timestamp::Bound>>,
 }
 
 /// What the per-command checks need.
@@ -158,7 +158,7 @@ pub(crate) struct Prepared<'a> {
     /// Arena VAs of each command's timestamp slots.
     resolved: KVec<[u64; 4]>,
     counts: [u64; 2],
-    timestamps: KVec<Arc<mmu::KernelMapping>>,
+    timestamps: KVec<Arc<timestamp::Bound>>,
 }
 
 /// One command of the stream.
@@ -349,7 +349,7 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
 /// The timestamp buffers named by a submission, resolved to firmware arena VAs.
 struct Timestamps<'a> {
     objects: Pin<&'a xarray::XArray<KBox<file::Object>>>,
-    held: KVec<Arc<mmu::KernelMapping>>,
+    held: KVec<Arc<timestamp::Bound>>,
 }
 
 impl Timestamps<'_> {
@@ -365,15 +365,15 @@ impl Timestamps<'_> {
             .get(timestamp.handle.try_into()?)
             .ok_or(ENOENT)?
             .clone();
-        let file::Object::TimestampBuffer(mapping) = object;
-        let mapping = mapping.firmware_mapping()?;
+        let file::Object::TimestampBuffer(buffer) = object;
+        let mapping = buffer.firmware_mapping()?;
         let offset = timestamp.offset as usize;
         if offset % 8 != 0 || offset >= mapping.size() || mapping.size() - offset < 8 {
             return Err(EINVAL);
         }
         let va = mapping.iova() + offset as u64;
-        if !self.held.iter().any(|held| Arc::ptr_eq(held, &mapping)) {
-            self.held.push(mapping, GFP_KERNEL)?;
+        if !self.held.iter().any(|held| Arc::ptr_eq(held, &buffer)) {
+            self.held.push(buffer, GFP_KERNEL)?;
         }
         Ok(va)
     }

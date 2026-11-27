@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/xarray.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -251,6 +252,13 @@ struct dcp_s2r_layout {
 	u32 disp_streams;
 	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
 	bool pmc_dcp;
+	/*
+	 * From the device tree (dcp_s2r_layout_from_dt()): only the @*_mask bits of a
+	 * retention word are written, @*_off while off and the value read at probe back on.
+	 * Zero masks: the whole words, as above.
+	 */
+	u32 ret_ff_mask, ret_ff_off, ret_ff_on;
+	u32 ret_mem_mask, ret_mem_off, ret_mem_on;
 };
 
 /*
@@ -409,6 +417,16 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {
@@ -579,6 +597,18 @@ struct apple_dcp {
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
+	/*
+	 * J615 dcpext: a child device on the display DART stream the external
+	 * pipe scans framebuffers through. Framebuffers are mirrored into its
+	 * domain at the display subsystem's addresses. fb_mirrors holds the
+	 * mapped length of every mirrored GEM object, indexed by the object's
+	 * address, until the object is freed; fb_mirror_lock protects it and
+	 * fb_dom.
+	 */
+	struct platform_device *fbdma;
+	struct iommu_domain *fb_dom;
+	struct xarray fb_mirrors;
+	struct mutex fb_mirror_lock;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
 	struct apple_rtkit *rtk;
@@ -634,7 +664,11 @@ struct apple_dcp {
 	bool external;
 	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
 	bool dcpext;
-	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	/*
+	 * A desktop external processor: apple,t6041-dcpext (26.x or 27.2), or
+	 * the J773g's apple,t8132-dcpext on 27.2 (apple_t8132_dcpext_v27_2()),
+	 * which drives the HDMI port the same way.
+	 */
 	bool desktop_external;
 	/*
 	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
@@ -769,6 +803,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
@@ -928,6 +964,7 @@ struct apple_dcp {
 	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
+	bool s2r_hdmi_irq_disabled;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
 	/*
@@ -948,6 +985,8 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* Stopped cold for firmware-driven sleep, with no restart until reboot. */
+	bool sleep_cold_stopped;
 	/*
 	 * Its last system suspend left the firmware running and its domains on
 	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
@@ -984,6 +1023,9 @@ struct apple_dcp {
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
+	/* hw.s2r without a layout in its hw data: the device tree's, see dcp_s2r_layout_from_dt() */
+	struct dcp_s2r_layout s2r_dt_layout;
+	bool s2r_dt_layout_ok;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

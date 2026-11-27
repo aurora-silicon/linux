@@ -58,6 +58,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'aurora-wake-output-tests.py': [(out(), PASS)],
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
@@ -72,6 +73,8 @@ ASAHI_TESTS = {
                               (['--resume-after-detach'], KILL)],
     'dcp-peer-shown-tests.py': [([], PASS), (['--always-shown'], KILL), (['--owner-only'], KILL)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
+    'rtkit-v27-late-tests.py': [(out(), PASS), (out() + ['--consume-committed'], KILL),
+                                (out() + ['--fail-foreign'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
     'dcpext26-modeset-tests.py': [([], PASS)],
@@ -89,6 +92,8 @@ ASAHI_TESTS = {
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
         '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
                        'ignore-typec-routes'], []),
+    'dptx-set-active-lane-count-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['drop-fixed-phy', 'skip-all-unexpected'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
@@ -142,11 +147,11 @@ ASAHI_TESTS = {
     'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
-    # every-handoff mutation waits it out on every handed-off DART, not just the display's.
+    # every-dart mutation waits it out on every locked DART, not just the display's.
     'apple-dart-tlb-stall-tests.py': [(['--dtc', '{dtc}'], PASS),
                                       (['--ref', '551b937502b54b0d1eb250bba6d9442b3672a0fb'],
                                        KILL),
-                                      (['--dtc', '{dtc}', '--mutation', 'every-handoff'],
+                                      (['--dtc', '{dtc}', '--mutation', 'every-dart'],
                                        KILL)],
     'apple-router-sleep-tests.py': [(out('--output'), PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
@@ -158,6 +163,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('round-up', 'cpu-unaligned', 'seg-cpu-unaligned',
                                    'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'), out()),
     'avd-codec-tail-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'bcm4377-completion-tests.py': [([], PASS)],
     # The old revision is the one before the J493 hardware-table ID match.
     'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
     # These mutations are caught inside the test, which then exits 0.
@@ -178,8 +184,13 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
-                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
+                                   'rate-limit', 'stall-reset', 'ring-full', 'trap-bound'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-shared-tcm-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',
+                                   'flowring-idx', 'dma-counts', 'rptr-depth', 'wptr-depth',
+                                   'console-desc', 'console-none',
+                                   'console-buf', 'console-widx', 'console-reinit'), out()),
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
@@ -192,6 +203,7 @@ ASAHI_TESTS = {
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
     'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-wifi-avoid-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'centauri-scan-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
@@ -248,6 +260,9 @@ ASAHI_TESTS = {
     'g15-retention-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
+    'g18-client-handoff-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'g18-job-error-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'm5-client-handoff-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
@@ -256,10 +271,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
                                    'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
                                    'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
-                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'held-blocks-owner', 'released-owner-retakes', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake', 'spare-detach-reassigns'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'close-twice', 'latch-before-close',
+                                   'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -267,26 +283,101 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',
                                    'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
                                    'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
-                                   'timeout-fails-retired', 'no-owed-poll'), []),
+                                   'timeout-fails-retired', 'no-owed-poll', 'count-recordless',
+                                   'count-owed-twice'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-compute-retired-tests.py': [([], PASS)]
+        + mutations('--mutation', ('queue-under-lock', 'binding-under-lock', 'drain-under-lock',
+                                   'drain-local-on-eagain', 'finish-stops-at-error',
+                                   'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
-                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+                                   'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
+                                   'open-owed-skipped', 'post-latch-swallowed', 'reserve-fails-pass'), []),
+    'g17-m5-direct-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
+                                   'scope-allows-reserve'), []),
+    'g17-m5-multiqueue-contention-tests.py': [([], PASS)]
+        + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
+                                   'raw-render-scope', 'unlocked-scope-drop',
+                                   'drop-direct-claim-on-fallback', 'pin-single-die'), []),
+    'g17-m5-idle-housekeeping-tests.py': [([], PASS)]
+        + mutations('--mutation', ('idle-forces-housekeeping', 'no-deferred-timer',
+                                   'hardcode-in-flight-true', 'skip-cadence-expiry'), []),
+    'g17-m5-event-placement-tests.py': [([], PASS)]
+        + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
+                                   'record-never', 'not-reclaim', 'split-flag'), []),
+    'g17-m5-render-fast-done-tests.py': [([], PASS)]
+        + mutations('--mutation', ('hold-m5-outer-across-doorbell',
+                                   'hold-render-lock-across-doorbell',
+                                   'skip-pending-error-fallback',
+                                   'single-slot-bailout',
+                                   'skip-epoch-check',
+                                   'unconditional-changed-notify',
+                                   'skip-generation-bump'), []),
+    'g17-m5-cross-qid-direct-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-chain-dedup',
+                                   'coalesce-failed-leaf',
+                                   'hint-blind-spot',
+                                   'skip-epoch-check',
+                                   'skip-recovery-recheck',
+                                   'lock-per-leaf',
+                                   'hold-m5-outer-compute-host',
+                                   'same-qid-emits-barrier',
+                                   'lock-has-published-epoch',
+                                   'lock-same-vm'), []),
+    'g17-m5-sibling-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('fixed-object-ids', 'primary-before-sibling',
+                                   'exit-ack-stops-first', 'direct-allows-multi-barrier',
+                                   'direct-blocks-sibling', 'direct-locks-sibling-when-idle',
+                                   'direct-skips-multi', 'same-qid-pipelined'), []),
+    'g17-m5-sibling-gate-tests.py': [([], PASS)]
+        + mutations('--mutation', ('sources-fan-out', 'select-sources-anywhere', 'tiny-fans-out',
+                                   'no-sustain-run', 'short-keeps-run', 'direct-ignores-gate',
+                                   'direct-can-add-ungated', 'wants-ignores-sustained',
+                                   'select-ignores-sustained', 'cell-drops-sustained',
+                                   'fans-out-locks-first', 'keep-run-across-owners', 'overlap-at-one',
+                                   'direct-ignores-in-flight', 'select-ignores-in-flight',
+                                   'wants-ignores-in-flight', 'detour-at-one'), []),
+    'g17-m5-sibling-rearm-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-headroom', 'no-vacant-sibling', 'no-foreign-sibling',
+                                   'steal-shareable', 'steal-unowned', 'ignore-rearm-reservation',
+                                   'ignore-releasing', 'parallel-give-back', 'foreign-before-fresh',
+                                   'rearm-binds-primary', 'try-add-ignores-waiters', 'try-add-skips-rearm',
+                                   'rearm-any-index', 'primary-own-give-back'), []),
+    'g17-compute-multi-channel-feature-tests.py': [([], PASS)]
+        + mutations('--mutation', ('always-multi', 'never-multi', 'not-reported', 'per-board-gate',
+                                   'colliding-bit', 'unsynced-binding', 'forms-gate',
+                                   'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
+    'g17-freelist-lease-direct-tests.py': [([], PASS)]
+        + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
+                                   'drop-pending-flush', 'drop-doorbell-loss'), []),
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
-                                   'node-unmarked', 'no-release'), []),
+                                   'node-unmarked', 'no-release', 'm5-cached-nodes',
+                                   'm5-cached-descriptors', 'cached-queue-records',
+                                   'uncached-g17p-nodes'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-return-observe-tests.py': [([], PASS)]
+        + mutations('--mutation', ('rescan-owed', 'observe-all-slots', 'observe-ignores-gate',
+                                   'rescan-in-loop-bail', 'rescan-is-fallback', 'missed-dropped',
+                                   'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
+                                   'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
+                                   'owed-slow-path'), []),
+    'g17-render-direct-recovery-tests.py': [([], PASS)]
+        + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
+                                   'wrong-j813-pipe'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
@@ -365,6 +456,7 @@ ASAHI_TESTS = {
     't6040-calibration-tests.py': [([], PASS)],
     't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't6050-combo-join-tests.py': [([], PASS)],
+    't8132-display-gate-tests.py': [([], PASS)],
     't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
     'tb-dock-pm-tests.py': [(out('--output'), PASS)],
@@ -383,6 +475,9 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 ASAHI_RUST.append('m3-firmware-tests.rs')
+# G14 firmware 27.2 queue, event and recovery records (its KUnit suite, run on the host).
+ASAHI_RUST.append('g14-v27-2-abi-tests.rs')
+ASAHI_RUST.append('pmp-alloc-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).

@@ -670,6 +670,332 @@ def test_pm_order(out, acio):
             print('PASS negative control:', name)
 
 
+T8122_SLEEP_FIXTURE = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+struct apple_dpin_policy { int unused; };
+static const struct apple_dpin_policy apple_dpin_m1, apple_dpin_m2;
+struct apple_cio_hw {
+    bool sleep_removes_domains;
+    bool restart_on_wake;
+    bool phy_shared_with_dwc3;
+    bool psd_power_cycle;
+    bool stop_at_reboot;
+    bool sleep_router_on_stop;
+    const struct apple_dpin_policy *dp;
+};
+struct notifier_block { int (*notifier_call)(void); int priority; };
+struct apple_cio { const struct apple_cio_hw *hw; struct notifier_block pm_notifier; };
+struct dwc3_apple { struct notifier_block pm_nb; };
+struct match_entry { const char *compatible; const struct apple_cio_hw *data; };
+static bool default_s2idle, no_platform;
+static bool pm_suspend_default_s2idle(void) { return default_s2idle; }
+static bool pm_suspend_no_platform(void) { return no_platform; }
+/* PRODUCTION_HW */
+static const struct match_entry match_table[] = {
+/* MATCH_ENTRIES */
+    { NULL, NULL },
+};
+/* PRODUCTION_FN */
+static const struct apple_cio_hw *match_of(const char *const *compat)
+{
+    for (size_t i = 0; compat[i]; i++)
+        for (size_t j = 0; match_table[j].compatible; j++)
+            if (!strcmp(compat[i], match_table[j].compatible))
+                return match_table[j].data;
+    return NULL;
+}
+static struct notifier_block *chain[2];
+static int count;
+static bool phy_off, pci_off;
+static int register_pm_notifier(struct notifier_block *nb)
+{
+    int i = count++;
+    assert(count <= 2);
+    while (i && chain[i - 1]->priority < nb->priority) {
+        chain[i] = chain[i - 1];
+        i--;
+    }
+    chain[i] = nb;
+    return 0;
+}
+static int apple_cio_pm_notify(void)
+{
+    assert(!phy_off);
+    pci_off = true;
+    return 0;
+}
+static int dwc3_apple_pm_notify(void)
+{
+    assert(pci_off);
+    phy_off = true;
+    return 0;
+}
+static void add_cio(struct apple_cio *acio)
+{
+    /* ACIO_REGISTRATION */
+}
+static void add_dwc(struct dwc3_apple *appledwc)
+{
+    int ret;
+    /* DWC_REGISTRATION */
+    assert(!ret);
+}
+int main(void)
+{
+    static const char *const t8122_compat[] = {
+        "apple,t8122-usb4-acio", "apple,t8103-usb4-acio", NULL
+    };
+    static const char *const t8103_compat[] = {
+        "apple,t8103-usb4-acio", NULL
+    };
+    static const char *const t6020_compat[] = {
+        "apple,t6020-usb4-acio", "apple,t8103-usb4-acio", NULL
+    };
+    const struct apple_cio_hw *t8122 = match_of(t8122_compat);
+    const struct apple_cio_hw *t8103 = match_of(t8103_compat);
+    const struct apple_cio_hw *t6020 = match_of(t6020_compat);
+    assert(t8122 == &apple_cio_t8122_hw);
+    assert(t8103 == &apple_cio_t8103_hw);
+    assert(t6020 == &apple_cio_t6020_hw);
+    assert(t8122->sleep_removes_domains && t8103->sleep_removes_domains);
+    assert(t8122->restart_on_wake && t8103->restart_on_wake);
+    assert(t8122->phy_shared_with_dwc3 && t8103->phy_shared_with_dwc3);
+    assert(t8103->psd_power_cycle && t8103->stop_at_reboot && t8103->sleep_router_on_stop);
+    assert(t8122->dp == &apple_dpin_m1 && t8103->dp == &apple_dpin_m1);
+
+    struct apple_cio acio_t8122 = { .hw = t8122 };
+    struct apple_cio acio_t8103 = { .hw = t8103 };
+    struct apple_cio acio_t6020 = { .hw = t6020 };
+
+    /* mem_sleep=deep + mem tears down T8103 and T8122 ACIO, leaves T6020 unchanged. */
+    default_s2idle = false;
+    no_platform = false;
+    assert(apple_cio_sleep_removes_domains(&acio_t8122));
+    assert(apple_cio_sleep_removes_domains(&acio_t8103));
+    assert(!apple_cio_sleep_removes_domains(&acio_t6020));
+
+    /* s2idle keeps the port up. */
+    default_s2idle = true;
+    no_platform = false;
+    assert(!apple_cio_sleep_removes_domains(&acio_t8122));
+    assert(!apple_cio_sleep_removes_domains(&acio_t8103));
+
+    /* freeze keeps the port up even when mem_sleep=deep is the default. */
+    default_s2idle = false;
+    no_platform = true;
+    assert(!apple_cio_sleep_removes_domains(&acio_t8122));
+    assert(!apple_cio_sleep_removes_domains(&acio_t8103));
+
+    /* Shared ATC PHY: ACIO PM notifier must run before DWC3's. */
+    struct dwc3_apple dwc = { 0 };
+    add_dwc(&dwc);
+    add_cio(&acio_t8122);
+    for (int i = 0; i < count; i++)
+        assert(!chain[i]->notifier_call());
+    assert(pci_off && phy_off);
+
+    puts("PASS: T8103/T8122 ACIO deep-sleep teardown, freeze/s2idle preservation, and DWC3 PM order");
+    return 0;
+}
+'''
+
+
+def test_t8122_cio_sleep(out, acio):
+    dwc = (ROOT / 'drivers/usb/dwc3/dwc3-apple.c').read_text()
+    hw_defs = []
+    for sym in ('apple_cio_t8103_hw', 'apple_cio_t8122_hw', 'apple_cio_t6020_hw'):
+        m = re.search(r'^static const struct apple_cio_hw ' + sym +
+                      r' = \{.*?\n\};', acio, re.M | re.S)
+        assert m, sym
+        hw_defs.append(m.group())
+    match_block = re.search(
+        r'static const struct of_device_id apple_acio_match\[\] = \{.*?\n\};',
+        acio, re.S)
+    assert match_block
+    entries = re.findall(
+        r'\.compatible\s*=\s*"([^"]+)"\s*,\s*\.data\s*=\s*(&apple_cio_\w+_hw)',
+        match_block.group())
+    match_lines = [f'    {{ "{c}", {d} }},' for c, d in entries
+                   if c in ('apple,t8122-usb4-acio', 'apple,t6020-usb4-acio',
+                            'apple,t8103-usb4-acio')]
+    assert len(match_lines) == 3, match_lines
+    code = T8122_SLEEP_FIXTURE
+    code = code.replace('/* PRODUCTION_HW */', '\n'.join(hw_defs))
+    code = code.replace('/* MATCH_ENTRIES */', '\n'.join(match_lines))
+    code = code.replace('/* PRODUCTION_FN */',
+                        function(acio, 'apple_cio_sleep_removes_domains'))
+    code = code.replace('/* ACIO_REGISTRATION */', pm_registration(
+        acio, 'acio->pm_notifier.notifier_call = apple_cio_pm_notify;',
+        'register_pm_notifier(&acio->pm_notifier);'))
+    code = code.replace('/* DWC_REGISTRATION */', pm_registration(
+        dwc, 'appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;',
+        'ret = register_pm_notifier(&appledwc->pm_nb);'))
+    muts = {
+        't8122-drop-match': ('    { "apple,t8122-usb4-acio", &apple_cio_t8122_hw },', ''),
+        't8103-drop-sleep-removes-domains': (
+            'static const struct apple_cio_hw apple_cio_t8103_hw = {\n'
+            '\t.sleep_removes_domains = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8103_hw = {\n'),
+        't8122-drop-sleep-removes-domains': (
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'),
+        't8122-drop-phy-shared': (
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n'
+            '\t.restart_on_wake = true,\n'
+            '\t.phy_shared_with_dwc3 = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n'
+            '\t.restart_on_wake = true,\n'),
+    }
+    cases = {'t8122-cio-sleep': code}
+    for name, (old, new) in muts.items():
+        assert code.count(old) == 1, name
+        cases[name] = code.replace(old, new)
+    for name, body in cases.items():
+        source, binary = out / (name + '.c'), out / name
+        source.write_text(body)
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        str(source), '-o', str(binary)], check=True)
+        run = subprocess.run([str(binary)], capture_output=True, text=True)
+        (out / (name + '.log')).write_text(run.stdout + run.stderr)
+        if name == 't8122-cio-sleep':
+            assert run.returncode == 0, run.stderr
+            print(run.stdout, end='')
+        else:
+            assert run.returncode < 0 and 'Assertion' in run.stderr, (
+                name, run.returncode, run.stderr)
+            print('PASS negative control:', name)
+
+
+CIO_STOP_FIXTURE = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#define ENODEV 19
+#define EIO 5
+#define READ_ONCE(x) (x)
+#define lockdep_assert_held(l) ((void)(l))
+#define scoped_guard(type, lock) if ((void)(lock), 1)
+#define dev_err(dev, ...) ((void)(dev), errs++)
+#define dev_warn(dev, ...) ((void)(dev))
+#define readl(addr) ((void)(addr), 0u)
+#define APPLE_CIO_M3_CTRL 0
+#define APPLE_CIO_LSTX_CTRL_LEVEL 1u
+struct device { int unused; };
+struct platform_device { struct device dev; };
+struct apple_cio_hw { bool sleep_router_on_stop; bool lstx_after_boot; };
+struct apple_cio {
+    const struct apple_cio_hw *hw;
+    int lock, pcie_tunnel_lock, dp_wq;
+    struct device *dev;
+    struct platform_device *nhi_pdev;
+    unsigned int current_cable_info, target_cable_info;
+    bool pcie_tunnel_populated, pcie_quiesce_pending;
+    bool resume_link_failed, link_lost_restart;
+    void *rtk;
+    char *rc_base;
+};
+static int errs, sleep_ret, sleeps, reopens, destroyed, depopulated;
+static int poweroffs, freed, released;
+static bool apple_cio_stop_pcie_tunnel(struct apple_cio *acio) { (void)acio; return true; }
+static int apple_cio_sleep_router_for_stop(struct apple_cio *acio) { (void)acio; sleeps++; return sleep_ret; }
+static void apple_cio_reopen_pcie_tunnel(struct apple_cio *acio, bool pcie) { (void)acio; assert(pcie); reopens++; }
+static void of_platform_device_destroy(struct device *dev, void *data) { (void)dev; (void)data; destroyed++; }
+static void flush_workqueue(int wq) { (void)wq; }
+static void of_platform_depopulate(struct device *dev) { (void)dev; depopulated++; }
+static int apple_rtkit_poweroff(void *rtk) { (void)rtk; poweroffs++; return 0; }
+static void apple_rtkit_mailbox_off(void *rtk) { (void)rtk; }
+static void apple_rtkit_free(void *rtk) { (void)rtk; freed++; }
+static void apple_cio_cpu_halt(struct apple_cio *acio) { (void)acio; }
+static void apple_cio_lstx_hold(struct apple_cio *acio, bool high) { (void)acio; (void)high; }
+static void apple_cio_test_log_guards(struct apple_cio *acio) { (void)acio; }
+static void apple_cio_release_domains(struct apple_cio *acio) { (void)acio; released++; }
+/* PRODUCTION */
+static struct device dev;
+static struct platform_device nhi;
+static int rtk;
+static int stop(const struct apple_cio_hw *hw, int ret, enum apple_cio_awake awake,
+                struct apple_cio *acio)
+{
+    *acio = (struct apple_cio){ .hw = hw, .dev = &dev, .nhi_pdev = &nhi,
+                                .current_cable_info = 0x51, .rtk = &rtk };
+    errs = sleeps = reopens = destroyed = depopulated = poweroffs = freed = released = 0;
+    sleep_ret = ret;
+    return apple_cio_stop(acio, awake);
+}
+int main(void)
+{
+    static const struct apple_cio_hw sleeps_first = { .sleep_router_on_stop = true };
+    static const struct apple_cio_hw plain = { 0 };
+    struct apple_cio acio;
+
+    /* A router that sleeps: the complex goes off whatever the caller. */
+    for (int awake = APPLE_CIO_AWAKE_KEEP; awake <= APPLE_CIO_AWAKE_FORCE; awake++) {
+        assert(stop(&sleeps_first, 0, awake, &acio) == 0);
+        assert(sleeps == 1 && destroyed == 1 && depopulated == 1 && !reopens);
+        assert(poweroffs == 1 && freed == 1 && released == 1 && !acio.current_cable_info);
+    }
+    /* No sleep needed: unchanged. */
+    assert(stop(&plain, -EIO, APPLE_CIO_AWAKE_KEEP, &acio) == 0);
+    assert(!sleeps && destroyed == 1 && released == 1 && !acio.current_cable_info);
+
+    /* Sleep or cable change: the port stays up with its NHI and domains. */
+    assert(stop(&sleeps_first, -EIO, APPLE_CIO_AWAKE_KEEP, &acio) == -EIO);
+    assert(reopens == 1 && !destroyed && !depopulated && !poweroffs && !freed && !released);
+    assert(acio.current_cable_info == 0x51 && acio.rtk == &rtk && errs);
+
+    /* Reboot: the children go, the co-processor and the domains stay. */
+    assert(stop(&sleeps_first, -ENODEV, APPLE_CIO_AWAKE_HOLD, &acio) == -ENODEV);
+    assert(!reopens && destroyed == 1 && depopulated == 1);
+    assert(!poweroffs && !freed && !released && acio.rtk == &rtk && errs);
+
+    /* Removal: the device and its domains go. */
+    assert(stop(&sleeps_first, -EIO, APPLE_CIO_AWAKE_FORCE, &acio) == 0);
+    assert(!reopens && destroyed == 1 && released == 1 && freed == 1 && errs);
+
+    puts("PASS: ACIO stop keeps the port or its domains up for a router that does not sleep");
+    return 0;
+}
+'''
+
+
+def test_cio_stop(out, acio):
+    enum = re.search(r'^enum apple_cio_awake \{.*?\n\};', acio, re.M | re.S)
+    assert enum
+    production = '\n'.join((enum.group(),
+                            function(acio, 'apple_cio_remove_children'),
+                            function(acio, 'apple_cio_stop')))
+    code = CIO_STOP_FIXTURE.replace('/* PRODUCTION */', production)
+    muts = {
+        'cio-stop-ignore-sleep-error': (
+            'ret = apple_cio_sleep_router_for_stop(acio);\n'
+            '\t\tif (ret && awake == APPLE_CIO_AWAKE_KEEP) {',
+            'ret = apple_cio_sleep_router_for_stop(acio);\n'
+            '\t\tif (false) {'),
+        'cio-stop-no-reopen': (
+            'apple_cio_reopen_pcie_tunnel(acio, pcie);', '(void)pcie;'),
+        'cio-stop-hold-powers-off': (
+            'if (ret && awake == APPLE_CIO_AWAKE_HOLD) {', 'if (false) {'),
+        'cio-stop-keep-powers-off': (
+            'if (ret && awake == APPLE_CIO_AWAKE_KEEP) {\n'
+            '\t\tdev_err(acio->dev, "the port stays up',
+            'if (false) {\n'
+            '\t\tdev_err(acio->dev, "the port stays up'),
+    }
+    cases = {'cio-stop-production': code}
+    for name, (old, new) in muts.items():
+        assert code.count(old) == 1, name
+        cases[name] = code.replace(old, new)
+    run_cases(out, cases, extra_flags=('-Wextra', '-Wno-unused-parameter'))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path)
@@ -743,6 +1069,8 @@ def main():
         out = args.out or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)
         test_pm_order(out, acio)
+        test_t8122_cio_sleep(out, acio)
+        test_cio_stop(out, acio)
         cases = {
             'production': code,
             'm2-fallback': code.replace(
