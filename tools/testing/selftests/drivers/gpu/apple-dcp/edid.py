@@ -93,6 +93,7 @@ struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
     bool lock,enabled,torndown,stall_reported,full_reported;unsigned int users;u32 channel;u8 cmd_tag;
+    u16 last_tag;u8 last_slot;bool last_valid;
     unsigned long cmd_map[1];struct epic_cmd_info cmds[MAX_PENDING_CMDS];
     struct { u64 generation,epoch; } admission;void *cookie;
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;

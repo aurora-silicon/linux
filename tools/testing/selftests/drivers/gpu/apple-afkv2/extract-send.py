@@ -81,7 +81,7 @@ struct ops { const char *name; };
 struct apple_epic_service {
  struct apple_dcp_afkep *ep; struct ops *ops; unsigned int channel; unsigned long cmd_map[1];
  int lock; unsigned int users; bool enabled,torndown; u8 cmd_tag; struct cmd_info cmds[16];
- bool stall_reported,full_reported;
+ u16 last_tag; u8 last_slot; bool last_valid,stall_reported,full_reported;
 };
 /* The stall report reads the rings and the mailbox state; nothing here checks its text. */
 static void afk_report_stall(struct apple_epic_service *s,u16 tag) { (void)s;(void)tag; }

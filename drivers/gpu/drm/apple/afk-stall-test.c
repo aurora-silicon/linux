@@ -109,6 +109,100 @@ static void afk_stall_answer_all(struct afk_stall_test *t)
 }
 
 /*
+ * The SAFE state of a port whose firmware stopped answering is retried, and
+ * each retry lowers HPD again: one request waits in the queue, however often.
+ */
+static void afk_stall_hpd_low_repeats_test(struct kunit *test)
+{
+	struct afk_stall_test *t = test->priv;
+	struct apple_epic_service *service = &t->ep.services[0];
+	u32 unread;
+	int i;
+
+	KUNIT_EXPECT_EQ(test, dptxport_set_hpd_timeout(service, false, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->doorbells, 1U);
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 1U);
+	unread = afk_stall_unread(&t->ep);
+	KUNIT_EXPECT_GT(test, unread, 0U);
+
+	/* More retries than there are slots: nothing more is queued. */
+	for (i = 0; i < 2 * MAX_PENDING_CMDS; i++)
+		KUNIT_EXPECT_EQ(test,
+				dptxport_set_hpd_timeout(service, false, AFK_STALL_TIMEOUT_MS),
+				-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->doorbells, 1U);
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 1U);
+	KUNIT_EXPECT_EQ(test, afk_stall_unread(&t->ep), unread);
+
+	/* The next display's HPD still gets a slot, and its unplug another. */
+	KUNIT_EXPECT_EQ(test, dptxport_set_hpd_timeout(service, true, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, dptxport_set_hpd_timeout(service, false, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->doorbells, 3U);
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 3U);
+	KUNIT_EXPECT_EQ(test, afk_stall_unread(&t->ep), 3 * unread);
+
+	afk_stall_answer_all(t);
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 0U);
+}
+
+/* A late answer frees its slot, and the same request is then sent again. */
+static void afk_stall_answered_resends_test(struct kunit *test)
+{
+	struct afk_stall_test *t = test->priv;
+	struct apple_epic_service *service = &t->ep.services[0];
+	struct epic_cmd reply = {};
+
+	KUNIT_EXPECT_EQ(test, dptxport_set_hpd_timeout(service, false, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_ASSERT_EQ(test, afk_stall_held(service), 1U);
+	KUNIT_EXPECT_TRUE(test, service->stall_reported);
+	afk_recv_handle_reply(&t->ep, service->channel, service->last_tag, &reply,
+			      sizeof(reply));
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 0U);
+	KUNIT_EXPECT_FALSE(test, service->stall_reported);
+
+	KUNIT_EXPECT_EQ(test, dptxport_set_hpd_timeout(service, false, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->doorbells, 2U);
+	KUNIT_EXPECT_EQ(test, afk_stall_held(service), 1U);
+	afk_stall_answer_all(t);
+}
+
+/* Only the call queued last, with the same input, and only once it timed out. */
+static void afk_stall_unanswered_match_test(struct kunit *test)
+{
+	struct afk_stall_test *t = test->priv;
+	struct apple_epic_service *service = &t->ep.services[0];
+	u8 data[20] = {}, other[20] = { [16] = 1 };
+
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 8, 8, data, sizeof(data)));
+	KUNIT_EXPECT_EQ(test, afk_service_call_timeout(service, 8, 8, data, sizeof(data), 12,
+						       NULL, 0, 12, AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, afk_service_call_unanswered(service, 8, 8, data, sizeof(data)));
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 8, 8, other, sizeof(other)));
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 8, 7, data, sizeof(data)));
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 0, 8, data, sizeof(data)));
+
+	/* Another call queued behind it: the copy would no longer be redundant. */
+	KUNIT_EXPECT_EQ(test, afk_service_call_timeout(service, 0, 6, NULL, 0, 16, NULL, 0, 16,
+						       AFK_STALL_TIMEOUT_MS),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 8, 8, data, sizeof(data)));
+	KUNIT_EXPECT_TRUE(test, afk_service_call_unanswered(service, 0, 6, NULL, 0));
+
+	/* Compact EPIC keeps its timed-out commands elsewhere. */
+	t->ep.compact = true;
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 0, 6, NULL, 0));
+	t->ep.compact = false;
+	afk_stall_answer_all(t);
+	KUNIT_EXPECT_FALSE(test, afk_service_call_unanswered(service, 0, 6, NULL, 0));
+}
+
+/*
  * A doorbell the mailbox did not deliver leaves its entry in the ring for the
  * next one: the command keeps its slot until answered, and the loss is noted.
  */
@@ -134,6 +228,9 @@ static void afk_stall_lost_doorbell_test(struct kunit *test)
 }
 
 static struct kunit_case afk_stall_cases[] = {
+	KUNIT_CASE(afk_stall_hpd_low_repeats_test),
+	KUNIT_CASE(afk_stall_answered_resends_test),
+	KUNIT_CASE(afk_stall_unanswered_match_test),
 	KUNIT_CASE(afk_stall_lost_doorbell_test),
 	{}
 };

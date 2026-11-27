@@ -32,6 +32,10 @@ struct dcpdptx_connection_cmd {
 	__le32 target;
 } __attribute__((packed));
 
+/* The port's HPD level: group and command of the call, and its input. */
+#define DCPDPTX_HOTPLUG_GROUP	8
+#define DCPDPTX_HOTPLUG_CMD	8
+
 struct dcpdptx_hotplug_cmd {
 	u8 _pad0[16];
 	__le32 unk;
@@ -254,7 +258,25 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 	if (hpd)
 		cmd.unk = cpu_to_le32(1);
 
-	ret = afk_service_call_timeout_len(service, 8, 8, &cmd, sizeof(cmd), 12,
+	/*
+	 * The same HPD level, queued last on the port, timed out and is still
+	 * unanswered: the firmware takes none of the port's calls for now. A
+	 * copy would queue behind it to the same effect, and keep a command
+	 * slot until answered. A port whose Type-C SAFE state is retried
+	 * (dcp_typec_route_prepare()) repeats its HPD low, and would otherwise
+	 * take every slot: the port then refuses all its calls with -ENOSPC,
+	 * the HPD of the next display among them.
+	 */
+	if (afk_service_call_unanswered(service, DCPDPTX_HOTPLUG_GROUP,
+					DCPDPTX_HOTPLUG_CMD, &cmd, sizeof(cmd))) {
+		dev_warn_ratelimited(service->ep->dcp->dev,
+				     "set_hpd(%d): the same request is still unanswered, not sent again\n",
+				     hpd);
+		return -ETIMEDOUT;
+	}
+
+	ret = afk_service_call_timeout_len(service, DCPDPTX_HOTPLUG_GROUP,
+					   DCPDPTX_HOTPLUG_CMD, &cmd, sizeof(cmd), 12,
 					   &resp, sizeof(resp), 12, timeout_ms,
 					   &received);
 	if (ret)

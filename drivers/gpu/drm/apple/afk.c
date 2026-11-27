@@ -3398,6 +3398,54 @@ static void afk_report_stall(struct apple_epic_service *service, u16 tag)
 		 !IS_ERR_OR_NULL(rtk) && apple_rtkit_is_crashed(rtk));
 }
 
+/**
+ * afk_service_call_unanswered - whether a standard call is already queued unanswered
+ * @service: the service the call is for
+ * @group: the call's group
+ * @command: the call's command
+ * @data: the call's input
+ * @data_len: the length of @data
+ *
+ * True when the command queued last on @service is this call, with the same
+ * input, and it timed out with its answer still to come. The call then still
+ * waits in the firmware's queue with nothing queued behind it, and a copy
+ * would only queue behind it, to the same effect. The copy would also keep a
+ * command slot of its own until the firmware answers it (see
+ * afk_service_unanswered_locked()), so a caller that repeats such a call to
+ * firmware that has stopped answering takes every slot, and the service then
+ * refuses all of its calls with -ENOSPC.
+ *
+ * Compact EPIC keeps its timed-out commands apart (compact_keep_orphans), and
+ * is not covered.
+ */
+bool afk_service_call_unanswered(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len)
+{
+	const struct epic_service_call *call;
+	const struct epic_cmd_info *cmd;
+	unsigned long flags;
+	bool queued;
+
+	if (!service || !service->ep || READ_ONCE(service->ep->compact))
+		return false;
+
+	spin_lock_irqsave(&service->lock, flags);
+	cmd = &service->cmds[service->last_slot];
+	call = cmd->txbuf;
+	/* A set slot bit keeps the buffers: the reply clears it before freeing them. */
+	queued = service->last_valid && test_bit(service->last_slot, service->cmd_map) &&
+		 cmd->tag == service->last_tag && !cmd->done && !cmd->completion &&
+		 cmd->type == EPIC_SUBTYPE_STD_SERVICE && call &&
+		 cmd->txlen >= sizeof(*call) + data_len &&
+		 le32_to_cpu(call->magic) == EPIC_SERVICE_CALL_MAGIC &&
+		 le16_to_cpu(call->group) == group &&
+		 le32_to_cpu(call->command) == command &&
+		 (!data_len || !memcmp(call + 1, data, data_len));
+	spin_unlock_irqrestore(&service->lock, flags);
+	return queued;
+}
+EXPORT_SYMBOL_IF_KUNIT(afk_service_call_unanswered);
+
 static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   const void *payload, size_t payload_len,
 				   void *output, size_t output_len, u32 *retcode,
@@ -3596,6 +3644,9 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = &completion;
 	service->cmds[idx].queued = jiffies;
+	service->last_slot = idx;
+	service->last_tag = tag;
+	service->last_valid = true;
 	init_completion(&completion);
 	spin_unlock_irqrestore(&service->lock, flags);
 

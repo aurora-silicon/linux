@@ -60,6 +60,14 @@ struct apple_epic_service {
 	/* Legacy EPIC sequence; AFKV2 history belongs to the interface. */
 	u8 cmd_tag;
 	/*
+	 * The command queued last, see afk_service_call_unanswered(). A reused
+	 * service has an empty cmd_map, so this names no command of the new
+	 * instance (lock).
+	 */
+	u16 last_tag;
+	u8 last_slot;
+	bool last_valid;
+	/*
 	 * A command that timed out unanswered was reported with the state of
 	 * its endpoint, and so was a call refused for want of a free slot.
 	 * The next reply on the service ends both; only a reply frees the slot
@@ -727,6 +735,8 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 size_t data_pad, void *output, size_t output_len,
 				 size_t output_pad, unsigned int timeout_ms,
 				 size_t *received);
+bool afk_service_call_unanswered(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len);
 
 /* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
 int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
