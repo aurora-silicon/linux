@@ -2324,6 +2324,40 @@ static bool t6030_gpx_min;
 module_param_named(gpx_min, t6030_gpx_min, bool, 0444);
 MODULE_PARM_DESC(gpx_min, "T6030 DIAGNOSTIC: with wfi_match, also GPX's minimum state 4 as macOS");
 
+/*
+ * DIAGNOSTIC: the power words of the blocks M2D_2B power-cycles and waits for one by one (lane A),
+ * whose history flags (bits 8 and 9, write 1 to clear) differ at the final WFI: macOS has
+ * DISPEXT0/1 SYS/FE at 0x2200, Linux 0x2300. 1: clear bits 8-9 on all seven, 2: bit 8 on the
+ * DISPEXT four only, as macOS. Just before the commit, after wfi_match.
+ */
+#define T6030_PS_ISP_CPU		0x4000
+#define T6030_PS_HIST			GENMASK(9, 8)
+static const u32 t6030_w1c_hist_words[] = {
+	T6030_PS_DISPEXT0_SYS, T6030_PS_DISPEXT1_SYS, T6030_PS_DISPEXT0_FE, T6030_PS_DISPEXT1_FE,
+	T6030_PS_ISP_CPU, T6030_PS_DISP_SYS, T6030_PS_DISP_FE,
+};
+#define T6030_W1C_HIST_DISPEXT		4
+
+static unsigned int t6030_w1c_hist;
+module_param_named(w1c_hist, t6030_w1c_hist, uint, 0444);
+MODULE_PARM_DESC(w1c_hist, "T6030 DIAGNOSTIC: before the commit, clear the history flags of M2D_2B's blocks: 1 bits 8-9 on all seven, 2 bit 8 on DISPEXT0/1 SYS/FE as macOS");
+
+static void t6030_w1c_hist_at_commit(struct apple_sleep *s)
+{
+	unsigned int mode = READ_ONCE(t6030_w1c_hist), n, i;
+	u32 clear, v;
+
+	if (mode != 1 && mode != 2)
+		return;
+	n = mode == 1 ? ARRAY_SIZE(t6030_w1c_hist_words) : T6030_W1C_HIST_DISPEXT;
+	clear = mode == 1 ? T6030_PS_HIST : BIT(8);
+	for (i = 0; i < n; i++) {
+		v = readl(s->ps + t6030_w1c_hist_words[i]);
+		if (v & clear)
+			writel((v & ~T6030_PS_HIST) | (v & clear), s->ps + t6030_w1c_hist_words[i]);
+	}
+}
+
 static void t6030_wfi_match_at_commit(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -2411,6 +2445,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	t6030_sleep_down(s);
 	t6030_storage_on_at_commit(s);
 	t6030_wfi_match_at_commit(s);
+	t6030_w1c_hist_at_commit(s);
 	t6030_gp_phy_park(s);
 	if (t6030_sleep_lower(s, T6030_LOWER_PHY, ARRAY_SIZE(t6030_lowered)))
 		t6030_sleep_failed("storage PHY power word");
