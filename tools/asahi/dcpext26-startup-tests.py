@@ -244,13 +244,14 @@ static int iomfb_queue_command(struct apple_dcp *d,bool o,const struct dcp_metho
 static u64 ktime_get_ns(void){return 1;}
 static void dcp_send_message(struct apple_dcp *,u8,u64);
 static void dcp_ack(struct apple_dcp *,enum dcp_context_id);
+static int dcp_push_try(struct apple_dcp *,bool,const struct dcp_method_entry *,u32,u32,void *,dcp_callback_t,void *);
 static void dcp_push(struct apple_dcp *,bool,const struct dcp_method_entry *,u32,u32,void *,dcp_callback_t,void *);
 static void boot_done(struct apple_dcp *,void *,void *);
 static unsigned commands,callback_acks;static int bad_status,corrupt;static bool byte_reply;static u8 memory[0x100000];
 '''
-for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcpep_msg','dcpep_ack','dcp_push_context','dcp_push','dcp_ack','dcpep_handle_ack']:
+for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcpep_msg','dcpep_ack','dcp_push_context','dcp_push_try','dcp_push','dcp_ack','dcpep_handle_ack']:
     code=fn(iom,name)
-    if name in ['dcp_push','dcp_ack']:code='static '+code
+    if name in ['dcp_push_try','dcp_push','dcp_ack']:code='static '+code
     transport+=code+'\n'
 transport+=block(native,'static const struct dcp_method_entry dcp_methods[')+'\n'+block(native,'struct ext26_boot {')+'\n'
 for name in ['ext26_boot_next','ext26_boot_callback','ext26_bandwidth']:
