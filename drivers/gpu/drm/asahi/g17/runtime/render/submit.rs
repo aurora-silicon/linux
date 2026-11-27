@@ -578,12 +578,22 @@ impl Backend {
     }
 
     pub(in crate::g17) fn try_render_early(&self, packet: &Arc<Packet>) -> bool {
-        if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+        if self.backlog.load(Ordering::Acquire) != 0 || packet.has_host_dependencies() {
             return false;
         }
         // As for compute: a render that traces rays is admitted by its scheduler.
         if !self.traversal_inline(packet) {
             return false;
+        }
+        if let Err(error) = packet.check_firmware_producers() {
+            if !packet.begin_publication() {
+                packet.completion.fail_unpublished(ECANCELED);
+                packet.set_early_result(Err(ECANCELED));
+                return true;
+            }
+            packet.completion.fail_unpublished(error);
+            packet.set_early_result(Err(error));
+            return true;
         }
         let admission = match self.admission.try_acquire_render(self.owner, self.render_pairs(packet).into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,

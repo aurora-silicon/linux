@@ -246,6 +246,12 @@ impl Packet {
         !self.inputs.is_empty() || !self.firmware.is_empty()
     }
 
+    /// Host-waited inputs keep a packet on the scheduler publication path;
+    /// already-published cross-engine firmware producers do not.
+    pub(crate) fn has_host_dependencies(&self) -> bool {
+        !self.inputs.is_empty()
+    }
+
     pub(crate) fn begin_publication(&self) -> bool {
         self.publication
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -550,6 +556,10 @@ pub(crate) struct Fences {
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
     pub(crate) owner: Arc<Completion>,
+    /// True when `Scheduler::enqueue()` already published this command inline
+    /// before returning, so later cross-engine consumers can publish inline too
+    /// without waiting for `scheduled` to signal through `drm_sched`.
+    pub(crate) inline_published: bool,
 }
 
 impl super::dependency::Retention for Fences {
@@ -680,7 +690,14 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, scheduled, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences {
+            ready,
+            scheduled,
+            completed,
+            publication: host_publication,
+            owner: packet.completion.clone(),
+            inline_published: inline && packet.is_published(),
+        })
     }
 }
 
