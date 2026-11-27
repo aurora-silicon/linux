@@ -569,6 +569,12 @@ static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int
 	    offset + size > resource_size(&res))
 		return NULL;
 
+	/*
+	 * As the bus says (nonposted-mmio): on T6030 a posted write to the GPU's ASC page or its
+	 * PMGR word took the SoC down (J516s: PMU notes 0x21, 0x23, 0x24 at those writes).
+	 */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED)
+		return ioremap_np(res.start + offset, size);
 	return ioremap(res.start + offset, size);
 }
 
