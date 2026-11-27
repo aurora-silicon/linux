@@ -318,3 +318,42 @@
 	power-domains = <&ps_apcie_sys_gp>;
 };
 
+/ {
+	aliases {
+		/* asahi-bless and the boot loader find the NVRAM partition by this alias */
+		nvram = &nvram;
+	};
+};
+
+/*
+ * The boot NOR's NVRAM partition, the same in the live K114s, K116s and J716c ADTs and the
+ * K114c and K116c 27.2 DeviceTrees: /arm-io/qspi/spinor/anvram, 0x700000, 0xc0000 bytes, 12
+ * banks of 64 KiB. Only this partition is described, so the rest of the NOR has no device
+ * node. Single-wire, as on the J775D: spi-nor then sends no quad-enable status write at probe.
+ *
+ * The partition is writable, as on the J616s, J713 and J700, so asahi-bless and aurora-bless
+ * can set the next boot. spi-apple-qspi still starts read-only and, once root
+ * opts in, admits only bounded, verified programs and 4 KiB erases of a known part inside it.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0xc0000>;
+			};
+		};
+	};
+};
