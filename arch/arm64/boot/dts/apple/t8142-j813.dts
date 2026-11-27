@@ -213,6 +213,9 @@
 
 #include "t8142-j813-dcpext.dtsi"
 
+/* The Neural Engine, started only after the boot loader's preload hand-off */
+#include "t8142-j813-ane.dtsi"
+
 &{/reserved-memory} {
 	/*
 	 * Both roles' __TEXT, contiguous (ADT gfx-asc and gfx1-asc segment-ranges),

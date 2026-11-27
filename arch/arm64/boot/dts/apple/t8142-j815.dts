@@ -474,3 +474,6 @@
  * them; without its hand-off they stay disabled.
  */
 #include "t8142-j813-dcpext.dtsi"
+
+/* The Neural Engine, started only after the boot loader's preload hand-off */
+#include "t8142-j813-ane.dtsi"
