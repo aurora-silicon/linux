@@ -638,6 +638,18 @@ module_param(t6041_dcpext, bool, 0444);
 MODULE_PARM_DESC(t6041_dcpext,
 		 "T6041: drive the external display processors (default 1; 0 leaves them alone)");
 
+#define DCP_EXT_IDLE_OFF_DELAY_MS	5000U
+static bool dcp_s2r_ext_capable(struct apple_dcp *dcp);
+static bool dcp_ext_idle_capable(struct apple_dcp *dcp);
+static void dcp_ext_idle_off_work(struct work_struct *work);
+static void dcp_ext_idle_open(struct apple_dcp *dcp);
+static void dcp_ext_idle_close(struct apple_dcp *dcp, bool wake);
+static int dcp_ext_idle_suspend(struct apple_dcp *dcp);
+static bool dcp_v27_ext_idle_capable(struct apple_dcp *dcp);
+static int dcp_v27_ext_idle_prepare(struct apple_dcp *dcp);
+static int dcp_v27_ext_idle_off(struct apple_dcp *dcp);
+static int dcp_v27_ext_idle_wake(struct apple_dcp *dcp);
+
 /*
  * After a wake that finds the internal panel off by DPMS, start its firmware from the
  * resume, as macOS does about 83 ms into a wake, so that DPMS on only has to light the
@@ -2392,6 +2404,8 @@ int dcp_send_message_checked(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	 */
 	ret = apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 				       !(native_14_7 || dcp_is_ext26(dcp)));
+	if (ret)
+		atomic_inc(&dcp->tx_errors);
 	if (ret && dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_err(dcp->dev, "native26 mailbox send failed ep=%#x: %d\n", endpoint, ret);
@@ -2575,6 +2589,7 @@ static bool dcp_connect_session_valid_locked(struct apple_dcp *dcp,
 	if (!session)
 		return true;
 	return (!recovery || (dcp->typec_work_enabled &&
+			     !dcp->ext_idle_paused &&
 			     !READ_ONCE(dcp->typec_crtc_off) &&
 			     !READ_ONCE(dcp->crashed))) &&
 	       dcp_session_valid_locked(dcp, *session, cable);
@@ -3570,6 +3585,10 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	struct dcp_fabric_session session = {};
 	int ret;
 
+	ret = dcp_ext_idle_wake(dcp);
+	if (ret)
+		return ret;
+
 	/* The fixed HDMI output of a desktop 26.x processor has no Type-C session. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
@@ -4108,6 +4127,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	 */
 	/* Most tunnels are excluded above; direct follows use the carried gate. */
 	return READ_ONCE(dcp->typec_work_enabled) &&
+	       !READ_ONCE(dcp->ext_idle_paused) &&
 	       READ_ONCE(dcp->typec_cable_connected) &&
 	       !READ_ONCE(dcp->typec_crtc_off) &&
 	       !READ_ONCE(dcp->typec_hpd_held) &&
@@ -4345,6 +4365,11 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
+
+	ret = dcp_ext_idle_wake(dcp);
+	if (ret)
+		return ret;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
@@ -4482,7 +4507,7 @@ int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 		ret = 0;
 		goto out_unlock;
 	}
-	if (!dcp->typec_work_enabled || READ_ONCE(dcp->crashed) ||
+	if (!dcp->typec_work_enabled || dcp->ext_idle_paused || READ_ONCE(dcp->crashed) ||
 	    !READ_ONCE(dcp->typec_cable_connected) ||
 	    READ_ONCE(dcp->typec_follow_retiring) ||
 	    !dcp->dptxport[0].enabled ||
@@ -5563,6 +5588,12 @@ void dcp_poweron(struct platform_device *pdev)
 	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp->desktop->ext_pipe_off = false;
+
+	ret = dcp_ext_idle_wake(dcp);
+	if (ret) {
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, true);
@@ -7663,6 +7694,9 @@ session_ready:
 	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
 	av_audiosrv_reports_restart(dcp);
+	dcp_ext_idle_open(dcp);
+	if (dcp_ext_idle_capable(dcp))
+		dcp_ext_idle_kick(dcp);
 	return 0;
 
 err_piodma:
@@ -7727,6 +7761,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	dcp_ext_idle_close(dcp, true);
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
 	/* Restore a soft-off panel while the IOMFB queue is still active. */
@@ -8537,6 +8572,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	mutex_init(&dcp->ext_idle_lock);
+	INIT_DELAYED_WORK(&dcp->ext_idle_wq, dcp_ext_idle_off_work);
+	dcp->ext_idle_initialized = true;
 	xa_init(&dcp->fb_mirrors);
 	mutex_init(&dcp->fb_mirror_lock);
 	init_completion(&dcp->v27_wake_video);
@@ -9350,6 +9388,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	if (dcp) {
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
+		dcp_ext_idle_close(dcp, true);
 	}
 	/* Registration pins callback/provider lifetimes until same-task scope end. */
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
@@ -9415,6 +9454,8 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 		return;
 	if (dcp)
 		dcp_v27_dpms_handoff(dcp);
+
+	dcp_ext_idle_close(dcp, false);
 
 	if (dcp && iomfb_is_m4(dcp)) {
 		dcp_comp_unbind(&pdev->dev, NULL, NULL);
@@ -9597,6 +9638,7 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
  * same HPD lock serializes this gate against explicit firmware startup.
  */
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp);
+static bool dcp_v27_sleep_active(struct apple_dcp *dcp);
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp);
 
 static int dcp_platform_prepare(struct device *dev)
@@ -10201,6 +10243,10 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 {
 	int ret;
 
+	ret = dcp_ext_idle_suspend(dcp);
+	if (ret)
+		return ret;
+
 	if (READ_ONCE(dcp->s2r_fw_down)) {
 		dcp_s2r_hdmi_irq_disable(dcp);
 		dcp_s2r_stop_failed_start(dcp);
@@ -10424,6 +10470,8 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 			goto out;
 	}
 	dcp->s2r_domains_up = false;
+	if (dcp_s2r_is_t8142_ext(dcp))
+		dcp->ext_idle_domains_off = true;
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
 	val = readl(ps + l->disp_cpu);
@@ -10612,6 +10660,7 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 		if (ret)
 			return ret;
 	}
+	dcp->ext_idle_domains_off = false;
 	if (!cycled)
 		return apple_rtkit_sleep_return(dcp->rtk, control);
 
@@ -10655,6 +10704,7 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 			goto out;
 	}
 	dcp->s2r_domains_up = false;
+	dcp->ext_idle_domains_off = true;
 	dcp_pmc_set(dcp, pmc, false);
 	ret = 0;
 	for (i = 0; i < ARRAY_SIZE(steps); i++) {
@@ -10897,6 +10947,17 @@ static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
 	}
 	if (ext)
 		dcp_s2r_hdmi_irq_enable(dcp);
+	if (dcp->ext_idle_initialized && dcp_ext_idle_capable(dcp)) {
+		scoped_guard(mutex, &dcp->ext_idle_lock) {
+			scoped_guard(mutex, &dcp->hpd_mutex)
+				WRITE_ONCE(dcp->ext_idle_paused, false);
+			if (dcp->ext_idle_state != DCP_EXT_IDLE_CLOSED) {
+				WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_ON);
+				dcp->ext_idle_err = 0;
+			}
+		}
+		dcp_ext_idle_kick(dcp);
+	}
 }
 
 /*
@@ -10995,6 +11056,405 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 	return 0;
 }
 
+static bool dcp_ext_idle_capable(struct apple_dcp *dcp)
+{
+	if (dcp_v27_ext_idle_capable(dcp))
+		return true;
+	return dcp_s2r_ext_capable(dcp) &&
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB &&
+	       !dcp->hdmi_hpd;
+}
+
+static bool dcp_ext_idle_eligible(struct apple_dcp *dcp)
+{
+	return dcp_ext_idle_capable(dcp) &&
+	       !READ_ONCE(dcp->ext_idle_unsupported) &&
+	       !READ_ONCE(dcp->crashed) &&
+	       !IS_ERR_OR_NULL(dcp->rtk) &&
+	       pm_suspend_target_state == PM_SUSPEND_ON &&
+	       !READ_ONCE(dcp->sleep_v27_closed) &&
+	       !READ_ONCE(dcp->peer_reserved) &&
+	       !READ_ONCE(dcp->peer_owner) &&
+	       !READ_ONCE(dcp->active_typec_route) &&
+	       !READ_ONCE(dcp->typec_cable_connected) &&
+	       !READ_ONCE(dcp->external_cable) &&
+	       !READ_ONCE(dcp->external_running) &&
+	       !(dcp->connector && READ_ONCE(dcp->connector->connected));
+}
+
+static void dcp_ext_idle_open(struct apple_dcp *dcp)
+{
+	if (!dcp || !dcp->ext_idle_initialized)
+		return;
+	guard(mutex)(&dcp->ext_idle_lock);
+	dcp->ext_idle_armed = false;
+	if (dcp->ext_idle_domains_off || dcp->ext_idle_power != DCP_EXT_POWER_ON) {
+		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_FAILED);
+		return;
+	}
+	dcp->ext_idle_v27 = false;
+	dcp->ext_idle_disp_saved = false;
+	WRITE_ONCE(dcp->ext_idle_unsupported, false);
+	WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_ON);
+	dcp->ext_idle_err = 0;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		WRITE_ONCE(dcp->ext_idle_paused, false);
+}
+
+static int dcp_ext_idle_wake_locked(struct apple_dcp *dcp)
+{
+	ktime_t start = ktime_get();
+	int ret;
+
+	lockdep_assert_held(&dcp->ext_idle_lock);
+	dcp_s2r_find_darts(dcp);
+	if (dcp->ext_idle_v27)
+		ret = dcp_v27_ext_idle_wake(dcp);
+	else
+		ret = dcp_s2r_ext_start(dcp, true);
+	dcp_s2r_put_darts(dcp);
+	if (ret) {
+		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_FAILED);
+		dcp->ext_idle_err = ret;
+		WRITE_ONCE(dcp->crashed, true);
+		dev_err(dcp->dev, "dcpext idle: wake failed: %d\n", ret);
+		return ret;
+	}
+	dcp->ext_idle_v27 = false;
+	WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_ON);
+	dcp->ext_idle_err = 0;
+	WRITE_ONCE(dcp->crashed, false);
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	iomfb_pause_presentation(dcp, false);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		WRITE_ONCE(dcp->ext_idle_paused, false);
+	dev_dbg(dcp->dev, "dcpext idle: woke in %lld ms\n",
+		ktime_ms_delta(ktime_get(), start));
+	return 0;
+}
+
+static void dcp_ext_idle_close(struct apple_dcp *dcp, bool wake)
+{
+	if (!dcp || !dcp->ext_idle_initialized)
+		return;
+	scoped_guard(mutex, &dcp->ext_idle_lock) {
+		if (!dcp_ext_idle_capable(dcp) &&
+		    dcp->ext_idle_state == DCP_EXT_IDLE_ON &&
+		    !dcp->ext_idle_armed &&
+		    !dcp->ext_idle_domains_off &&
+		    dcp->ext_idle_power == DCP_EXT_POWER_ON)
+			return;
+		dcp->ext_idle_armed = false;
+		if (!wake || dcp->ext_idle_state != DCP_EXT_IDLE_OFF)
+			WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_CLOSED);
+	}
+	cancel_delayed_work_sync(&dcp->ext_idle_wq);
+	scoped_guard(mutex, &dcp->ext_idle_lock) {
+		if (wake && dcp->ext_idle_state == DCP_EXT_IDLE_OFF)
+			dcp_ext_idle_wake_locked(dcp);
+		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_CLOSED);
+	}
+}
+
+/*
+ * Disarm and drain idle work before system suspend, and bring an idle-gated
+ * pipe back up so DART PM never accesses registers while the display domains
+ * are powered off.
+ */
+static int dcp_ext_idle_suspend(struct apple_dcp *dcp)
+{
+	if (!dcp || !dcp->ext_idle_initialized)
+		return 0;
+	scoped_guard(mutex, &dcp->ext_idle_lock)
+		dcp->ext_idle_armed = false;
+	cancel_delayed_work_sync(&dcp->ext_idle_wq);
+
+	guard(mutex)(&dcp->ext_idle_lock);
+	if (dcp->ext_idle_state == DCP_EXT_IDLE_OFF)
+		return dcp_ext_idle_wake_locked(dcp);
+	if (dcp->ext_idle_domains_off)
+		return dcp->ext_idle_err ?: -EIO;
+	return 0;
+}
+
+void dcp_ext_idle_kick(struct apple_dcp *dcp)
+{
+	if (!dcp || !dcp->ext_idle_initialized || !dcp_ext_idle_capable(dcp))
+		return;
+	guard(mutex)(&dcp->ext_idle_lock);
+	if (dcp->ext_idle_state != DCP_EXT_IDLE_ON)
+		return;
+	dcp->ext_idle_armed = true;
+	mod_delayed_work(system_dfl_wq, &dcp->ext_idle_wq,
+			 msecs_to_jiffies(DCP_EXT_IDLE_OFF_DELAY_MS));
+}
+
+static void dcp_ext_idle_off_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					  struct apple_dcp, ext_idle_wq);
+	ktime_t start = ktime_get();
+	bool defer = false, idle, use_v27;
+	int ret;
+
+	guard(mutex)(&dcp->ext_idle_lock);
+	if (dcp->ext_idle_state != DCP_EXT_IDLE_ON ||
+	    !dcp->ext_idle_armed ||
+	    !dcp_ext_idle_eligible(dcp))
+		return;
+	use_v27 = dcp_v27_ext_idle_capable(dcp);
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (!dcp->typec_work_enabled ||
+		    dcp->ext_idle_paused ||
+		    dcp->typec_cable_connected ||
+		    dcp->dptxport[0].connected ||
+		    READ_ONCE(dcp->typec_hpd_held) ||
+		    READ_ONCE(dcp->active_typec_route))
+			return;
+		if (work_busy(&dcp->typec_reconnect_wq.work) ||
+		    work_busy(&dcp->placeholder_edid_wq.work) ||
+		    work_busy(&dcp->typec_relink_wq.work) ||
+		    work_busy(&dcp->tb_event_work)) {
+			defer = true;
+		} else {
+			WRITE_ONCE(dcp->ext_idle_paused, true);
+			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+		}
+	}
+	if (defer) {
+		mod_delayed_work(system_dfl_wq, &dcp->ext_idle_wq,
+				 msecs_to_jiffies(DCP_EXT_IDLE_OFF_DELAY_MS));
+		dev_dbg(dcp->dev, "dcpext idle: Type-C work busy, deferring\n");
+		return;
+	}
+
+	dcp_drain_for_sleep(dcp);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	iomfb_pause_presentation(dcp, true);
+	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
+		iomfb_pause_presentation(dcp, false);
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			WRITE_ONCE(dcp->ext_idle_paused, false);
+		mod_delayed_work(system_dfl_wq, &dcp->ext_idle_wq,
+				 msecs_to_jiffies(DCP_EXT_IDLE_OFF_DELAY_MS));
+		dev_dbg(dcp->dev, "dcpext idle: updates pending, deferring\n");
+		return;
+	}
+
+	dcp_s2r_find_darts(dcp);
+	if (!dcp->s2r_dcp_dart || (use_v27 && !dcp->s2r_disp_dart)) {
+		ret = -ENODEV;
+		goto err_defer_darts;
+	}
+	if (use_v27) {
+		bool peer_busy;
+
+		scoped_guard(mutex, &dcp_peer_lock) {
+			peer_busy = dcp->peer_reserved || dcp->peer_owner;
+			if (!peer_busy)
+				WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_STOPPING);
+		}
+		if (peer_busy) {
+			ret = -EBUSY;
+			goto err_defer_darts;
+		}
+		ret = dcp_v27_ext_idle_prepare(dcp);
+		if (ret)
+			goto err_defer_darts;
+	}
+	if (dcp->s2r_disp_dart) {
+		ret = apple_dart_power_dark(dcp->s2r_disp_dart, true);
+		if (ret) {
+			int un_ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
+
+			if (un_ret) {
+				dev_err(dcp->dev, "dcpext idle: display DART reopen failed: %d\n",
+					un_ret);
+				ret = un_ret;
+				goto err_latch_fail;
+			}
+			goto err_defer_darts;
+		}
+	}
+	ret = apple_dart_power_dark(dcp->s2r_dcp_dart, true);
+	if (ret) {
+		int un_ret = apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+
+		if (dcp->s2r_disp_dart)
+			un_ret = apple_dart_power_dark(dcp->s2r_disp_dart, false) ?: un_ret;
+		if (un_ret) {
+			dev_err(dcp->dev, "dcpext idle: DART reopen failed after entry error: %d\n",
+				un_ret);
+			ret = un_ret;
+			goto err_latch_fail;
+		}
+		goto err_defer_darts;
+	}
+
+	if (use_v27) {
+		dcp->ext_idle_v27 = true;
+		ret = dcp_v27_ext_idle_off(dcp);
+		if (ret > 0) {
+			int un_ret = apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+
+			dcp->ext_idle_v27 = false;
+			if (dcp->s2r_disp_dart)
+				un_ret = apple_dart_power_dark(dcp->s2r_disp_dart, false) ?: un_ret;
+			if (un_ret) {
+				dev_err(dcp->dev, "dcpext idle: DART reopen failed after rollback: %d\n",
+					un_ret);
+				ret = un_ret;
+				goto err_latch_fail;
+			}
+			if (READ_ONCE(dcp->ext_idle_unsupported)) {
+				dcp_s2r_put_darts(dcp);
+				dcp->ext_idle_armed = false;
+				WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_ON);
+				iomfb_pause_presentation(dcp, false);
+				scoped_guard(mutex, &dcp->hpd_mutex)
+					WRITE_ONCE(dcp->ext_idle_paused, false);
+				return;
+			}
+			ret = -EAGAIN;
+			goto err_defer_darts;
+		}
+		if (ret) {
+			if (!READ_ONCE(dcp->s2r_fw_down) &&
+			    dcp->ext_idle_power == DCP_EXT_POWER_ON) {
+				dcp->ext_idle_v27 = false;
+				goto err_prestop_fail;
+			}
+			if (dcp->ext_idle_power == DCP_EXT_POWER_ON) {
+				if (dcp->s2r_disp_dart)
+					apple_dart_power_dark(dcp->s2r_disp_dart, false);
+				apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+			}
+			goto err_latch_fail;
+		}
+		dcp_s2r_put_darts(dcp);
+		dcp->ext_idle_armed = false;
+		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_OFF);
+		dev_dbg(dcp->dev, "dcpext idle: powered off in %lld ms\n",
+			ktime_ms_delta(ktime_get(), start));
+		return;
+	}
+
+	ret = dcp_s2r_500(dcp);
+	if (ret == -ENOMEM) {
+		int un_ret = apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+
+		if (dcp->s2r_disp_dart)
+			un_ret = apple_dart_power_dark(dcp->s2r_disp_dart, false) ?: un_ret;
+		if (un_ret) {
+			dev_err(dcp->dev, "dcpext idle: DART reopen failed after A500 -ENOMEM: %d\n",
+				un_ret);
+			ret = un_ret;
+			goto err_latch_fail;
+		}
+		goto err_defer_darts;
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: A500 failed: %d\n", ret);
+		goto err_prestop_fail;
+	}
+	ret = read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: firmware calls still in flight, aborting: %d\n",
+			 ret);
+		goto err_prestop_fail;
+	}
+
+	ret = apple_rtkit_sleep_stop(dcp->rtk,
+				     dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: RTKit stop failed: %d\n", ret);
+		goto err_prestop_fail;
+	}
+
+	WRITE_ONCE(dcp->s2r_fw_down, true);
+	ret = dcp_s2r_stop_streams(dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: DART stream stop failed: %d\n", ret);
+		if (!dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart)
+			apple_dart_power_dark(dcp->s2r_disp_dart, false);
+		dcp_s2r_put_darts(dcp);
+		WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_FAILED);
+		dcp->ext_idle_err = ret;
+		dcp->ext_idle_armed = false;
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+
+	ret = dcp_s2r_ext_domains_off(dcp);
+	dcp_pmc_forget(dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: domain power-off failed (%d), restarting\n", ret);
+		ret = dcp_s2r_ext_cycle(dcp);
+		dcp_s2r_put_darts(dcp);
+		if (ret) {
+			WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_FAILED);
+			dcp->ext_idle_err = ret;
+			dcp->ext_idle_armed = false;
+			WRITE_ONCE(dcp->crashed, true);
+			return;
+		}
+		WRITE_ONCE(dcp->s2r_fw_down, false);
+		iomfb_pause_presentation(dcp, false);
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			WRITE_ONCE(dcp->ext_idle_paused, false);
+		return;
+	}
+	dcp_s2r_put_darts(dcp);
+
+	dcp->ext_idle_armed = false;
+	WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_OFF);
+	dev_dbg(dcp->dev, "dcpext idle: powered off in %lld ms\n",
+		ktime_ms_delta(ktime_get(), start));
+	return;
+
+err_defer_darts:
+	dcp_s2r_put_darts(dcp);
+	WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_ON);
+	iomfb_pause_presentation(dcp, false);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		WRITE_ONCE(dcp->ext_idle_paused, false);
+	mod_delayed_work(system_dfl_wq, &dcp->ext_idle_wq,
+			 msecs_to_jiffies(DCP_EXT_IDLE_OFF_DELAY_MS));
+	dev_dbg(dcp->dev, "dcpext idle: deferring before stop (%d)\n", ret);
+	return;
+
+err_prestop_fail:
+	apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, false);
+err_latch_fail:
+	dcp_s2r_put_darts(dcp);
+	WRITE_ONCE(dcp->ext_idle_state, DCP_EXT_IDLE_FAILED);
+	dcp->ext_idle_err = ret;
+	dcp->ext_idle_armed = false;
+	WRITE_ONCE(dcp->crashed, true);
+}
+
+int dcp_ext_idle_wake(struct apple_dcp *dcp)
+{
+	if (!dcp || !dcp->ext_idle_initialized)
+		return 0;
+	guard(mutex)(&dcp->ext_idle_lock);
+	dcp->ext_idle_armed = false;
+	cancel_delayed_work(&dcp->ext_idle_wq);
+	if (dcp->ext_idle_state == DCP_EXT_IDLE_ON)
+		return 0;
+	if (dcp->ext_idle_state == DCP_EXT_IDLE_CLOSED)
+		return -ENODEV;
+	if (dcp->ext_idle_state == DCP_EXT_IDLE_FAILED)
+		return dcp->ext_idle_err ?: -EIO;
+
+	return dcp_ext_idle_wake_locked(dcp);
+}
+
 /*
  * The suspend after a dark wake failed before suspending DCPEXT, or before preparing it. It's
  * still down from the real sleep, whose wake reset its CPU: start it as after one.
@@ -11021,6 +11481,8 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 	if (action == PM_POST_SUSPEND) {
 		dcp_s2r_dark_finish(dcp);
 		dcp_v27_dark_replug_owed(dcp);
+		if (dcp_ext_idle_capable(dcp))
+			dcp_ext_idle_kick(dcp);
 	}
 	/*
 	 * A J714s external display processor that has crashed cannot take its sleep calls, and
@@ -11471,6 +11933,12 @@ static int dcp_platform_suspend(struct device *dev)
 	}
 	if (pm_suspend_via_firmware() && dcp_s2r_ext_capable(dcp))
 		return dcp_s2r_ext_suspend(dcp);
+	if (dcp->ext_idle_initialized) {
+		int idle_ret = dcp_ext_idle_suspend(dcp);
+
+		if (idle_ret)
+			return idle_ret;
+	}
 
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
@@ -11621,7 +12089,7 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp_is_iboot(dcp))
 		return 0;
 
-	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
+	if (dcp_v27_sleep_selected(dcp) && dcp_v27_sleep_active(dcp))
 		return dcp_v27_sleep_resume(dcp);
 
 	/* Stopped cold, with no restart path until reboot. */
@@ -11674,6 +12142,9 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp->avep)
 		av_service_connect(dcp);
+
+	if (dcp_ext_idle_capable(dcp))
+		dcp_ext_idle_kick(dcp);
 
 	return 0;
 }

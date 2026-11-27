@@ -8199,9 +8199,78 @@ static const struct {
 	{ 6, 5 },	/* DISPEXT2 */
 	{ 8, 6 },	/* DISPEXT3 */
 };
-#define T6050_DISP_PMC_BWR	0x20
-#define T6050_DISP_PMC_BOOST	0x28
-static void __iomem *t6050_disp_pmc_en;
+
+#define T6050_DISP_PMC_DISP4_BASE	0x286700000ULL
+#define T6050_DISP_PMC_DISP4_OFF	0x106000
+#define T6050_DISP_PMC_BASE		(T6050_DISP_PMC_DISP4_BASE + T6050_DISP_PMC_DISP4_OFF)
+#define T6050_DISP_PMC_SIZE		0x2030
+#define T6050_DISP_PMC_REQ		0x0154
+#define T6050_DISP_PMC_ACK		0x0158
+#define T6050_DISP_PMC_BWR		0x2020
+#define T6050_DISP_PMC_BOOST		0x2028
+static DEFINE_MUTEX(t6050_disp_pmc_lock);
+static void __iomem *t6050_disp_pmc;
+
+static void __iomem *t6050_disp_pmc_map_locked(void)
+{
+	lockdep_assert_held(&t6050_disp_pmc_lock);
+	if (!t6050_disp_pmc)
+		t6050_disp_pmc = ioremap(T6050_DISP_PMC_BASE, T6050_DISP_PMC_SIZE);
+	return t6050_disp_pmc;
+}
+
+int apple_sleep_m5_display_pmc(struct device *dev, bool on)
+{
+	struct apple_sleep *s = apple_sleep;
+	struct resource *res;
+	void __iomem *pmc;
+	u32 v;
+	int ret;
+
+	if (!dev || !s || !s->soc->regions || !s->region || !apple_sleep_t6050_full(s))
+		return -ENODEV;
+	res = platform_get_resource_byname(to_platform_device(dev), IORESOURCE_MEM, "disp-4");
+	if (!res || res->start != T6050_DISP_PMC_DISP4_BASE ||
+	    resource_size(res) < T6050_DISP_PMC_DISP4_OFF + T6050_DISP_PMC_SIZE)
+		return -ENODEV;
+	guard(mutex)(&t6050_disp_pmc_lock);
+	pmc = t6050_disp_pmc_map_locked();
+	if (!pmc)
+		return -ENOMEM;
+	if (on) {
+		writel(readl(pmc + T6050_DISP_PMC_BOOST) | BIT(0), pmc + T6050_DISP_PMC_BOOST);
+		writel(readl(pmc + T6050_DISP_PMC_BWR) | BIT(0), pmc + T6050_DISP_PMC_BWR);
+		v = readl(pmc + T6050_DISP_PMC_REQ);
+		writel(v | BIT(2), pmc + T6050_DISP_PMC_REQ);
+	} else {
+		writel(readl(pmc + T6050_DISP_PMC_BOOST) & ~BIT(0), pmc + T6050_DISP_PMC_BOOST);
+		writel(readl(pmc + T6050_DISP_PMC_BWR) & ~BIT(0), pmc + T6050_DISP_PMC_BWR);
+		v = readl(pmc + T6050_DISP_PMC_REQ);
+		writel((v & ~BIT(2)) | BIT(10), pmc + T6050_DISP_PMC_REQ);
+	}
+	ret = readl_poll_timeout(pmc + T6050_DISP_PMC_ACK, v, (v & 0xf) == 0xf, 1, 2000);
+	if (ret)
+		dev_warn(s->dev, "internal display PMC %s: status %#x\n", on ? "on" : "off", v);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_m5_display_pmc);
+
+bool apple_sleep_m5_dispext_power_ready(struct device *dev)
+{
+	struct apple_sleep *s = apple_sleep;
+	unsigned int d;
+
+	if (!dev || !s || !s->soc->regions || !s->region || !apple_sleep_t6050_full(s) ||
+	    s->soc->ndisp != ARRAY_SIZE(t6050_disp_ext_pmc) + 1)
+		return false;
+	for (d = 1; d < s->soc->ndisp; d++)
+		if (s->display[d].np == dev->of_node) {
+			guard(mutex)(&t6050_disp_pmc_lock);
+			return !!t6050_disp_pmc_map_locked();
+		}
+	return false;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_m5_dispext_power_ready);
 
 int apple_sleep_m5_dispext_power(struct device *dev, bool on)
 {
@@ -8219,9 +8288,8 @@ int apple_sleep_m5_dispext_power(struct device *dev, bool on)
 			break;
 	if (d == s->soc->ndisp)
 		return -ENODEV;
-	if (!t6050_disp_pmc_en)
-		t6050_disp_pmc_en = ioremap(0x286808000ULL, 0x30);
-	pmc = t6050_disp_pmc_en;
+	guard(mutex)(&t6050_disp_pmc_lock);
+	pmc = t6050_disp_pmc_map_locked();
 	if (!pmc)
 		return -ENOMEM;
 	boost = BIT(t6050_disp_ext_pmc[d - 1].boost);

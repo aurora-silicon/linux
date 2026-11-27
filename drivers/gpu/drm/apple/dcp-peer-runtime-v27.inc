@@ -150,7 +150,10 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
 		if (limited && !prepared)
 			goto unpause;
-		if (peer->peer_owner != dcp || !dcp_peer_transport_idle(dcp) ||
+		if (peer->peer_owner != dcp || peer->peer_waking ||
+		    READ_ONCE(peer->ext_idle_state) != DCP_EXT_IDLE_ON ||
+		    READ_ONCE(peer->sleep_v27_closed) ||
+		    !dcp_peer_transport_idle(dcp) ||
 		    !dcp_peer_transport_idle(peer) || peer->fixed_phy ||
 		    peer->nr_typec_routes || !peer->crtc ||
 		    !peer->crtc->base.state || peer->crtc->base.state->active ||

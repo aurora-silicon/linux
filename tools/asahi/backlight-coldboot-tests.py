@@ -121,6 +121,7 @@ static int dcp_external_start_locked(struct apple_dcp *p) { (void)p;return 0; }
 static void dcp_relink_wake(int *r,unsigned g,unsigned long j) { (void)r;(void)g;(void)j; }
 static void dcp_relink_link_up(int *r,unsigned g,unsigned long j) { (void)r;(void)g;(void)j; }
 static int dcp_dptx_connect(struct apple_dcp *p,int n) { (void)p;(void)n;return 0; }
+static int dcp_ext_idle_wake(struct apple_dcp *p) { (void)p;return 0; }
 static void dcp_queue_typec_reconnect(struct apple_dcp *p,int n) { (void)p;(void)n; }
 static unsigned long wait_for_completion_timeout(int *p,unsigned long n) { (void)p;return n; }
 static unsigned long msecs_to_jiffies(unsigned long n) { return n; }

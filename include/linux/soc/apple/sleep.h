@@ -82,8 +82,10 @@ void apple_sleep_display_quiesced(struct device *dev, bool quiesced);
 int apple_sleep_display_v27_power_ready(struct device *dev);
 /* T6050: the internal display's power words around its coprocessor's restart after a wake. */
 int apple_sleep_m5_display_power(bool on);
+int apple_sleep_m5_display_pmc(struct device *dev, bool on);
 /* T6050: one external display coprocessor's, by its device. */
 int apple_sleep_m5_dispext_power(struct device *dev, bool on);
+bool apple_sleep_m5_dispext_power_ready(struct device *dev);
 
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
@@ -337,7 +339,9 @@ static inline int apple_sleep_display_v27_power_ready(struct device *dev)
 }
 
 static inline int apple_sleep_m5_display_power(bool on) { return -ENODEV; }
+static inline int apple_sleep_m5_display_pmc(struct device *dev, bool on) { return -ENODEV; }
 static inline int apple_sleep_m5_dispext_power(struct device *dev, bool on) { return -ENODEV; }
+static inline bool apple_sleep_m5_dispext_power_ready(struct device *dev) { return false; }
 
 static inline int apple_sleep_coproc_register_first(struct device *dev,
 						    int (*last_stop)(void *data), void *data)
