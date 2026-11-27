@@ -16,6 +16,9 @@
 
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
 / {
 	compatible = "apple,j775c", "apple,t6050", "apple,arm-platform";
 	#address-cells = <0x02>;
@@ -3029,16 +3032,6 @@
 			#address-cells = <0x01>;
 			#size-cells = <0x00>;
 			power-domains = <&ps_i2c1>;
-
-			speaker_amp: codec@38 {
-				compatible = "ti,sn012776", "ti,tas2764";
-				reg = <0x38>;
-				shutdown-gpios = <&pinctrl_ap 0x6b 0x00>;
-				interrupts-extended = <&pinctrl_ap 0x6a 0x08>;
-				#sound-dai-cells = <0x00>;
-				ti,imon-slot-no = <0x00>;
-				ti,vmon-slot-no = <0x02>;
-			};
 		};
 
 		i2c2: i2c@505018000 {
@@ -3050,15 +3043,6 @@
 			#address-cells = <0x01>;
 			#size-cells = <0x00>;
 			power-domains = <&ps_i2c2>;
-
-			jack_codec: codec@4b {
-				compatible = "cirrus,cs42l84";
-				reg = <0x4b>;
-				reset-gpios = <&pinctrl_ap 0x8b 0x00>;
-				interrupts-extended = <&pinctrl_ap 0x86 0x08>;
-				#sound-dai-cells = <0x00>;
-				sound-name-prefix = "Jack";
-			};
 		};
 
 		qspi: spi@505118000 {
@@ -5980,39 +5964,6 @@
 		};
 	};
 
-	sound {
-		compatible = "apple,j775c-macaudio", "apple,macaudio";
-		model = "Mac Studio J775";
-		#address-cells = <0x01>;
-		#size-cells = <0x00>;
-
-		dai-link@0 {
-			reg = <0x00>;
-			link-name = "Headphone Jack";
-
-			cpu {
-				sound-dai = <&aop_audio 0x00>;
-			};
-
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
-
-		dai-link@1 {
-			reg = <0x01>;
-			link-name = "Speaker";
-
-			cpu {
-				sound-dai = <&aop_audio 0x03>;
-			};
-
-			codec {
-				sound-dai = <&speaker_amp>;
-			};
-		};
-	};
-
 	dpaudio_dispext1: audio-controller-dispext1 {
 		compatible = "apple,t6050-dpaudio", "apple,dpaudio";
 		dmas = <&admac_dispext1 0x00>;
@@ -6198,4 +6149,11 @@
 			opp-microvolt = <0x00>;
 		};
 	};
+};
+
+#include "t6050-studio-audio.dtsi"
+
+&sound {
+	compatible = "apple,j775c-macaudio", "apple,macaudio";
+	model = "Mac Studio J775";
 };
