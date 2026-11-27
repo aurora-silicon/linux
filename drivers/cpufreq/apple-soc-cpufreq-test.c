@@ -1792,6 +1792,44 @@ static void cft_test_verify_policy_cap_lift(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)), 15ULL);
 
 	/*
+	 * Dropping the QoS ceiling to 0 (as store_scaling_max_freq("0") does)
+	 * must clamp a queued pending fast request to the lowest valid OPP when
+	 * the verify timer replays it, even before policy->update reconciles
+	 * policy->max.
+	 */
+	cft_set_cmd(cft_live_regs, 4 | APPLE_DVFS_CMD_BUSY);
+	priv->expected_pstate = 4;
+	policy->cur = 1200000;
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, 15);
+
+	scoped_guard(cpufreq_policy_write, policy) {
+		KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 0), 0);
+		KUNIT_EXPECT_EQ(test, policy->max, 3000000U);
+		cft_set_cmd(cft_live_regs, 4);
+		local_irq_save(flags);
+		KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_verify(&priv->verify_timer),
+				HRTIMER_NORESTART);
+		hrtimer_cancel(&priv->verify_timer);
+		local_irq_restore(flags);
+		KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+		KUNIT_EXPECT_EQ(test, priv->expected_pstate, 1U);
+		KUNIT_EXPECT_EQ(test,
+				FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(cft_live_regs)),
+				1ULL);
+
+		freq = cpufreq_driver_fast_switch(policy, 3000000);
+		hrtimer_cancel(&priv->verify_timer);
+		KUNIT_EXPECT_EQ(test, freq, 600000U);
+		KUNIT_EXPECT_EQ(test, policy->cur, 600000U);
+	}
+	flush_work(&policy->update);
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	policy->max = 3000000;
+
+	/*
 	 * Suspend must enforce the live ceiling even when suspend_freq is set
 	 * and policy->min is still stale at 3 GHz.
 	 */

@@ -669,12 +669,12 @@ static unsigned int apple_soc_cpufreq_clamp_pstate(struct apple_cpu_priv *priv,
 			s32 qos_min = freq_qos_read_value(&policy->constraints,
 							  FREQ_QOS_MIN);
 
-			if (qos_max > 0)
+			if (qos_max >= 0)
 				max_f = policy->cpuinfo.max_freq ?
 					min_t(unsigned int, qos_max,
 					      policy->cpuinfo.max_freq) :
 					(unsigned int)qos_max;
-			if (qos_min > 0)
+			if (qos_min >= 0)
 				min_f = max_t(unsigned int, qos_min,
 					      policy->cpuinfo.min_freq);
 		}
