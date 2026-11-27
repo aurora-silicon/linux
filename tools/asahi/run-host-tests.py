@@ -58,6 +58,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'aurora-wake-output-tests.py': [(out(), PASS)],
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
@@ -183,8 +184,13 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
-                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
+                                   'rate-limit', 'stall-reset', 'ring-full', 'trap-bound'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-shared-tcm-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',
+                                   'flowring-idx', 'dma-counts', 'rptr-depth', 'wptr-depth',
+                                   'console-desc', 'console-none',
+                                   'console-buf', 'console-widx', 'console-reinit'), out()),
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
@@ -265,10 +271,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
                                    'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
                                    'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
-                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'held-blocks-owner', 'released-owner-retakes', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake', 'spare-detach-reassigns'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'close-twice', 'latch-before-close',
+                                   'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -286,7 +293,8 @@ ASAHI_TESTS = {
                                    'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
-                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+                                   'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
+                                   'open-owed-skipped', 'post-latch-swallowed', 'reserve-fails-pass'), []),
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
@@ -352,7 +360,9 @@ ASAHI_TESTS = {
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
-                                   'node-unmarked', 'no-release'), []),
+                                   'node-unmarked', 'no-release', 'm5-cached-nodes',
+                                   'm5-cached-descriptors', 'cached-queue-records',
+                                   'uncached-g17p-nodes'), []),
     'g17-output-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('unlocked-member-done', 'set-error-when-signalled',
                                    'check-outside-lock'), []),
@@ -468,6 +478,8 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 ASAHI_RUST.append('m3-firmware-tests.rs')
+# G14 firmware 27.2 queue, event and recovery records (its KUnit suite, run on the host).
+ASAHI_RUST.append('g14-v27-2-abi-tests.rs')
 ASAHI_RUST.append('pmp-alloc-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
