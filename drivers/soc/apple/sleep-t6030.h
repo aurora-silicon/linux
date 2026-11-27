@@ -2774,9 +2774,30 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 #define T6030_CYC_OVRD_WFI_MODE		GENMASK_ULL(25, 24)
 #define T6030_CYC_OVRD_DISABLE_WFI_RET	BIT_ULL(0)
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): each core's own FIQ sources quiet before its final WFI, as
+ * T8142's m5_quiet. A pending FIQ ends a WFI, masked or not, and a stopped core's loop only
+ * clears IPI_SR. With VHE, sleep_deep_wfi_arm masks the EL2 timers only; this also masks the
+ * EL1 pair (macOS's per-core init leaves cntp_ctl = 2) and stops the core PMU (PMCR0 = 0), as
+ * XNU's core-offline path does before its deep WFI. Boot parameter, off by default (A/B).
+ */
+static bool t6030_quiet;
+module_param_named(quiet, t6030_quiet, bool, 0444);
+MODULE_PARM_DESC(quiet, "T6030 DIAGNOSTIC: mask the EL1 timers and stop the core PMU before each core's final WFI");
+
 static void t6030_deep_wfi_arm(void)
 {
-	u64 hid4 = t6030_dc_unblock();
+	u64 hid4;
+
+	if (READ_ONCE(t6030_quiet)) {
+		if (is_kernel_in_hyp_mode()) {
+			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTP_CTL_EL02);
+			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTV_CTL_EL02);
+		}
+		write_sysreg_s(0, T8142_PMCR0);
+		isb();
+	}
+	hid4 = t6030_dc_unblock();
 
 	/*
 	 * This core's last stores are in by now: its L1 and its cluster's L2 back to memory, as
