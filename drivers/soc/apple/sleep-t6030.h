@@ -3254,11 +3254,11 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *     against the values the observer read as it stopped, before the commit:
  *     +0..+2 a bit per word that ever differed: bits 0-19 0x3642d0000..+0x4c, 20 the flag
  *     +0x10c, 21 +0x100/104/108/110, 22 the step code 0x3642b8040, 23 0x3642b801c;
- *     +3 the latest +0x38 (A:4, D2C's first handshake) as bits 1:0 and bit 8 (2:0), and the
- *     lowest word of the first sample that differed (7:3, 0x1f: none);
- *     +4 the latest +0x28 (A:10's first) as +3 (2:0), +0x40 bits 1:0 (4:3), 0x35072802c bits
- *     25:16 nonzero (5: PMGR2:10's one-tick poll wants 0), WD2 armed (6), and 0x35072802c bits
- *     25:16 nonzero at the observer's stop (7).
+ *     +3 WD2's seconds left to its IRQ time (+0x28, where apple_sleep_set_wd2() arms it)
+ *     from its count (+0x20), signed, clamped;
+ *     +4 the latest +0x28 (A:10's first handshake) as bits 1:0 and bit 8 (2:0), +0x40 bits
+ *     1:0 (4:3), WD1's reset enable (5: 0x3642b001c bit 2), WD2's reset enable (6: the CE
+ *     sequences' 0x3642b002c = 4) and its IRQ enable (7: apple_sleep_set_wd2()'s 1).
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -3375,6 +3375,10 @@ static const u8 t6030_obs_aon_words[] = {
 #define T6030_ENG_AMCC_CH		0x40c
 #define T6030_WDT_WD2_CTL		0x2c
 #define T6030_WDT_WD2_ARMED		BIT(2)
+#define T6030_WDT_WD1_CTL		0x1c
+#define T6030_WDT_WD2_COUNT		0x20
+#define T6030_WDT_WD2_IRQ		0x28
+#define T6030_WDT_TICKS_PER_S		24000000
 #define T6030_OBS_BLK_AMCC0		14
 #define T6030_OBS_BLK_AMCC1		15
 
@@ -3523,8 +3527,9 @@ static void t6030_obs_entry(struct apple_sleep *s)
 
 static void t6030_obs_pst(struct apple_sleep *s, u8 *v)
 {
-	u32 w[T6030_PST_WORDS], pg = 0;
+	u32 w[T6030_PST_WORDS], wd2;
 	unsigned int i;
+	s32 left;
 
 	if (!t6030_eng_flag || !t6030_eng_step) {
 		memset(v, 0xff, 5);
@@ -3544,15 +3549,16 @@ static void t6030_obs_pst(struct apple_sleep *s, u8 *v)
 		t6030_pst_changed |= BIT(22);
 	if (readl(t6030_eng_step + T6030_ENG_SEQ) != t6030_pst_seq_ref)
 		t6030_pst_changed |= BIT(23);
-	if (t6030_eng_pg)
-		pg = readl(t6030_eng_pg + T6030_ENG_PG_BUSY) & T6030_ENG_PG_BUSY_MASK;
 	v[0] = t6030_pst_changed;
 	v[1] = t6030_pst_changed >> 8;
 	v[2] = t6030_pst_changed >> 16;
-	v[3] = t6030_pst_pack(w[T6030_PST_D2C_1A]) | t6030_pst_first << 3;
-	v[4] = t6030_pst_pack(w[T6030_PST_D2C_1B]) | (w[T6030_PST_DESCENT] & 3) << 3 | !!pg << 5 |
-	       !!(readl(s->wdt + T6030_WDT_WD2_CTL) & T6030_WDT_WD2_ARMED) << 6 |
-	       t6030_pg_busy_ref << 7;
+	wd2 = readl(s->wdt + T6030_WDT_WD2_CTL);
+	left = (s32)(readl(s->wdt + T6030_WDT_WD2_IRQ) - readl(s->wdt + T6030_WDT_WD2_COUNT)) /
+	       T6030_WDT_TICKS_PER_S;
+	v[3] = (u8)clamp_t(s32, left, S8_MIN, S8_MAX);
+	v[4] = t6030_pst_pack(w[T6030_PST_D2C_1B]) | (w[T6030_PST_DESCENT] & 3) << 3 |
+	       !!(readl(s->wdt + T6030_WDT_WD1_CTL) & T6030_WDT_WD2_ARMED) << 5 |
+	       !!(wd2 & T6030_WDT_WD2_ARMED) << 6 | !!(wd2 & BIT(0)) << 7;
 }
 
 static void t6030_obs_engine(struct apple_sleep *s, u8 *v)
