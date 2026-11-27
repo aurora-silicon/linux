@@ -181,7 +181,7 @@ impl gpu::Gpu for M5DrmGpu {
         };
         Ok(KBox::new(queue, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>)
+    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>, _window: crate::timestamp::WindowPermit)
         -> Result<crate::timestamp::Buffer> { Err(ENOTSUPP) }
 }
 
@@ -196,7 +196,7 @@ impl FenceOps for M5SubmissionFence {
 /// allocation failure after userspace has already supplied its wait targets.
 struct OutputPublication {
     fence: UserFence<M5SubmissionFence>,
-    syncs: KVec<file::SyncItem>,
+    syncs: KVVec<file::SyncItem>,
     input_count: usize,
     result: Result,
 }
@@ -237,7 +237,7 @@ struct M5Queue {
 
 impl queue::Queue for M5Queue {
     fn submit(&mut self, _reg_data: &AsahiRegData<'_>, _submission_id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize, cmdbuf_raw: &[u8],
         _objects: Pin<&xarray::XArray<KBox<file::Object>>>) -> Result {
         if in_sync_count > syncs.len() { return Err(EINVAL); }

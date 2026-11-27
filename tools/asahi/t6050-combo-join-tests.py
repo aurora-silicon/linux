@@ -16,13 +16,14 @@ PAIRS = (('apple_t6050_usb3_init_normal', 'mf_normal_init'),
          ('apple_t6050_usb3_init_reverse', 'mf_reverse_init'),
          ('apple_t6050_usb3_shutdown', 'mf_poweroff'))
 ROW = re.compile(r'\{\s*(T6050_\w+|ATC_\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)'
-                 r'\s*,\s*(\w+)(?:\s*,\s*("[^"]*"|0))?\s*\}')
+                 r'\s*,\s*(\w+)(?:\s*,\s*("[^"]*"|0|NULL))?\s*\}')
 
 
 def table(text, name):
     m = re.search(r'\b' + re.escape(name) + r'\[\]\s*=\s*\{(.*?)\n\};', text, re.S)
     assert m, name
-    return [(r[0].split('_', 1)[1], *(int(x, 0) for x in r[1:6]), (r[6] or '').strip('"'))
+    return [(r[0].split('_', 1)[1], *(int(x, 0) for x in r[1:6]),
+             '' if r[6] in ('0', 'NULL') else r[6].strip('"'))
             for r in ROW.findall(m.group(1))]
 
 

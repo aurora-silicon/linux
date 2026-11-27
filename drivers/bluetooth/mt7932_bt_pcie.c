@@ -69,6 +69,15 @@
 /* How long a wake reason may take to arrive once the transport is back. */
 #define BT7932_WAKE_REASON_MS 200
 
+/*
+ * The firmware files carry their version in their names, and a firmware
+ * update renames them. User space can install the newest image of each kind
+ * under a name that does not change; look for that first, then for the
+ * versioned names.
+ */
+#define BT7932_FW_B0_STABLE "mediatek/mt7932/bt-b0.bin"
+#define BT7932_FW_B1_STABLE "mediatek/mt7932/bt-b1.bin"
+#define BT7932_PTX_STABLE "mediatek/mt7932/bt-ptb.ptx"
 #define BT7932_FW_B0 "mediatek/MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin"
 #define BT7932_FW_B1 "mediatek/MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin"
 #define BT7932_FW_B1_FALLBACK "mediatek/MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin"
@@ -401,31 +410,76 @@ static int bt7932_validate_ptx(const u8 *data, size_t size)
 	return next == size ? 0 : -EINVAL;
 }
 
+static int bt7932_validate_image(const u8 *data, size_t size)
+{
+	if (size <= 32 || size - 32 > U32_MAX - 3)
+		return -EINVAL;
+	if (memcmp(data + size - 32 + 16, "ALPS\x8a\x10\x8a\x10", 8))
+		return -EINVAL;
+	return 0;
+}
+
+static const char *const bt7932_b0_names[] = {
+	BT7932_FW_B0_STABLE, BT7932_FW_B0,
+};
+
+static const char *const bt7932_b1_names[] = {
+	BT7932_FW_B1_STABLE, BT7932_FW_B1, BT7932_FW_B1_FALLBACK,
+};
+
+static const char *const bt7932_ptx_names[] = {
+	BT7932_PTX_STABLE, BT7932_PTX,
+};
+
+/*
+ * Load the first of @names that exists and passes @validate. A file that is
+ * missing or fails validation moves on to the next name, so a bad
+ * version-independent file cannot hide a good versioned one. Only the last
+ * name warns when it is missing.
+ */
+static int bt7932_request_valid(struct bt7932 *bt, const struct firmware **fw,
+				const char *const *names, size_t count,
+				int (*validate)(const u8 *data, size_t size))
+{
+	struct device *dev = &bt->pdev->dev;
+	int ret = -ENOENT;
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		if (i + 1 < count)
+			ret = firmware_request_nowarn(fw, names[i], dev);
+		else
+			ret = request_firmware(fw, names[i], dev);
+		if (ret == -ENOENT)
+			continue;
+		if (ret)
+			return ret;
+		ret = validate((*fw)->data, (*fw)->size);
+		if (!ret)
+			return 0;
+		dev_warn(dev, "%s is not usable (%d)\n", names[i], ret);
+		release_firmware(*fw);
+		*fw = NULL;
+	}
+	return ret;
+}
+
 static int bt7932_read_inputs(struct bt7932 *bt)
 {
 	const struct firmware *fw;
-	const u8 *trailer;
 	u64 last;
 	int i, ret;
 
-	if (!bt->rom) {
-		ret = request_firmware(&fw, BT7932_FW_B0, &bt->pdev->dev);
-	} else {
-		ret = firmware_request_nowarn(&fw, BT7932_FW_B1, &bt->pdev->dev);
-		if (ret == -ENOENT)
-			ret = request_firmware(&fw, BT7932_FW_B1_FALLBACK, &bt->pdev->dev);
-	}
+	if (!bt->rom)
+		ret = bt7932_request_valid(bt, &fw, bt7932_b0_names,
+					   ARRAY_SIZE(bt7932_b0_names),
+					   bt7932_validate_image);
+	else
+		ret = bt7932_request_valid(bt, &fw, bt7932_b1_names,
+					   ARRAY_SIZE(bt7932_b1_names),
+					   bt7932_validate_image);
 	if (ret)
 		return ret;
-	if (fw->size <= 32 || fw->size - 32 > U32_MAX - 3) {
-		ret = -EINVAL;
-		goto release_image;
-	}
-	trailer = fw->data + fw->size - 32;
-	if (memcmp(trailer + 16, "ALPS\x8a\x10\x8a\x10", 8)) {
-		ret = -EINVAL;
-		goto release_image;
-	}
 	bt->image_body = fw->size - 32;
 	bt->image_size = ALIGN(bt->image_body, 4);
 	bt->image = dma_alloc_coherent(&bt->pdev->dev, bt->image_size,
@@ -459,16 +513,15 @@ release_image:
 	release_firmware(fw);
 	if (ret)
 		return ret;
-	ret = request_firmware(&fw, BT7932_PTX, &bt->pdev->dev);
+	ret = bt7932_request_valid(bt, &fw, bt7932_ptx_names,
+				   ARRAY_SIZE(bt7932_ptx_names),
+				   bt7932_validate_ptx);
 	if (ret)
 		return ret;
-	ret = bt7932_validate_ptx(fw->data, fw->size);
-	if (!ret) {
-		bt->ptx_size = fw->size;
-		bt->ptx = kmemdup(fw->data, fw->size, GFP_KERNEL);
-		if (!bt->ptx)
-			ret = -ENOMEM;
-	}
+	bt->ptx_size = fw->size;
+	bt->ptx = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!bt->ptx)
+		ret = -ENOMEM;
 	release_firmware(fw);
 	if (ret)
 		return ret;
@@ -1988,6 +2041,9 @@ module_pci_driver(bt7932_driver);
 
 MODULE_DESCRIPTION("MediaTek MT7932 Bluetooth PCIe transport for the Apple MacBook Neo");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(BT7932_FW_B0_STABLE);
+MODULE_FIRMWARE(BT7932_FW_B1_STABLE);
+MODULE_FIRMWARE(BT7932_PTX_STABLE);
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
 MODULE_FIRMWARE(BT7932_FW_B1_FALLBACK);

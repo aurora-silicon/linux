@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,clpc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC host performance controller (standalone)
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Platform-profile provider for Apple SoCs whose host performance controller
+  (CLPC) does not sit under a PMC voter block (apple,pmc.yaml). Exposes
+  low-power, balanced and performance platform profiles and enforces CPU
+  frequency ceilings (and optional SMC package power targets or High Power
+  mode) through the shared apple-clpc driver.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8112-clpc
+          - const: apple,clpc
+      - const: apple,clpc
+
+  apple,smc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The SMC, whose package power reading (PHPC) the low-power platform
+      profile can monitor or target, and which the performance profile tells
+      about High Power mode on Macs that have it.
+
+  apple,high-power-mode:
+    type: boolean
+    description:
+      The machine has High Power mode, the fan and power headroom macOS
+      offers on some MacBook Pros. The performance platform profile then
+      tells the SMC (apple,smc) that it is on.
+
+  apple,low-power-frequency-max-mhz:
+    description:
+      The machine's CPU frequency ceiling in macOS's Low Power mode, in
+      MHz, as the ADT's cpu-low-power-frequency-max has it. The low-power
+      platform profile holds the CPU clusters to it, up to the next
+      frequency of their tables. When absent and apple,high-power-mode is
+      not set, no platform profile is registered.
+
+  apple,low-power-mw:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Optional package power target in milliwatts (measured from SMC PHPC)
+      for the low-power platform profile.
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    performance-controller {
+        compatible = "apple,t8112-clpc", "apple,clpc";
+        apple,smc = <&smc>;
+    };

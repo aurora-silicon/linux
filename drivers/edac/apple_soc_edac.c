@@ -5,6 +5,9 @@
  * Copyright The Aurora Silicon Contributors
  */
 
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
 #include <linux/bitops.h>
 #include <linux/edac.h>
 #include <linux/io.h>
@@ -16,71 +19,14 @@
 
 #include "edac_module.h"
 
-#define APPLE_SOC_EDAC_NAME	"apple_soc_edac"
+#include "apple_soc_edac-internal.h"
 
-/*
- * The sources' status registers have no established acknowledge contract,
- * so a line is masked when it fires and unmasked again after a backoff.
- * A line still asserted after APPLE_SOC_EDAC_MAX_RETRIES backoffs stays
- * masked; its count keeps the record.
- */
-#define APPLE_SOC_EDAC_BACKOFF_MS	1000
-#define APPLE_SOC_EDAC_BACKOFF_MAX_MS	60000
-#define APPLE_SOC_EDAC_MAX_RETRIES	8
-
-#define T6041_NI_REGS		25
-#define T6041_NI_STATUS		0x416c
-
-struct apple_soc_edac_range {
-	u8 first;
-	u8 count;
-	const char *name;
-};
-
-/*
- * A fabric NI whose error status sits in its aperture: a block of status words,
- * one per error type, whose set bits name the port. They're acknowledged by
- * writing the set bits back.
- */
-struct apple_soc_edac_ni {
-	u8 index;	/* interrupt index */
-	u8 reg;		/* reg index of the NI's aperture */
-	u16 status;	/* offset of the first status word */
-	u32 words;	/* bit n: a status word at status + 4 * n */
-};
-
-struct apple_soc_edac_hw {
-	const struct apple_soc_edac_range *ranges;
-	size_t nranges;
-	const struct apple_soc_edac_ni *ni;
-	size_t nni;
-	unsigned int num_irqs;
-	unsigned int num_status_regs;
-	bool event_log;
-};
-
-struct apple_soc_edac;
-
-struct apple_soc_edac_irq {
-	struct apple_soc_edac *edac;
-	const char *source;
-	unsigned int index;
-	int irq;
-	const struct apple_soc_edac_ni *ni;
-	void __iomem *ni_base;
-	unsigned int retries;
-	unsigned int backoff_ms;
-	unsigned long armed_jiffies;
-	struct delayed_work rearm;
-};
-
-struct apple_soc_edac {
-	struct device *dev;
-	struct edac_device_ctl_info *dci;
-	const struct apple_soc_edac_hw *hw;
-	struct apple_soc_edac_irq *irqs;
-	void __iomem **status_regs;
-};
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
+#include <kunit/visibility.h>
+#else
+#define VISIBLE_IF_KUNIT static
+#define EXPORT_SYMBOL_IF_KUNIT(symbol)
+#endif
 
 /*
  * DCS IRQs drive a separate thermal loop and are intentionally omitted.
@@ -200,8 +146,8 @@ static const struct apple_soc_edac_hw t8140_event_hw = {
 	.event_log = true,
 };
 
-static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
-					 unsigned int index)
+VISIBLE_IF_KUNIT const char *
+apple_soc_edac_source(const struct apple_soc_edac_hw *hw, unsigned int index)
 {
 	size_t i;
 
@@ -217,13 +163,33 @@ static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
 
 	return NULL;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_source);
+
+/* Status register accessors; KUnit redirects them to a fake register block. */
+VISIBLE_IF_KUNIT u32 apple_soc_edac_read(void __iomem *reg)
+{
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_read, reg);
+#endif
+	return readl(reg);
+}
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_read);
+
+VISIBLE_IF_KUNIT void apple_soc_edac_write(void __iomem *reg, u32 val)
+{
+#if IS_ENABLED(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_soc_edac_write, reg, val);
+#endif
+	writel(val, reg);
+}
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_write);
 
 /*
  * Read and acknowledge a T6041 NI status word. Returns whether it was set;
  * @error says whether a bit in the platform error policy was set and
  * @cleared whether the word reads back clear after the acknowledge.
  */
-static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
+VISIBLE_IF_KUNIT bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
 					bool *error, bool *cleared)
 {
 	struct apple_soc_edac *edac = irq_data->edac;
@@ -236,14 +202,14 @@ static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
 		void __iomem *reg = edac->status_regs[irq_data->index - 45] +
 				    T6041_NI_STATUS;
 
-		status = readl(reg);
+		status = apple_soc_edac_read(reg);
 		if (!status)
 			return false;
 
 		/* Bit 3 is not part of the platform error policy. */
 		*error = status & 0xf7;
-		writel(status, reg);
-		left = readl(reg);
+		apple_soc_edac_write(reg, status);
+		left = apple_soc_edac_read(reg);
 		if (left) {
 			*cleared = false;
 			dev_info_ratelimited(edac->dev,
@@ -256,12 +222,13 @@ static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
 
 	return false;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_t6041_status);
 
 /*
  * Log and acknowledge an NI's set status words. Returns whether any was set;
  * @cleared says whether all of them read back clear.
  */
-static bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
+VISIBLE_IF_KUNIT bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
 				     bool *cleared)
 {
 	const struct apple_soc_edac_ni *ni = irq_data->ni;
@@ -273,11 +240,11 @@ static bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
 	*cleared = true;
 	for_each_set_bit(bit, &words, 32) {
 		offset = ni->status + 4 * bit;
-		status = readl(irq_data->ni_base + offset);
+		status = apple_soc_edac_read(irq_data->ni_base + offset);
 		if (!status)
 			continue;
-		writel(status, irq_data->ni_base + offset);
-		left = readl(irq_data->ni_base + offset);
+		apple_soc_edac_write(irq_data->ni_base + offset, status);
+		left = apple_soc_edac_read(irq_data->ni_base + offset);
 		dev_err_ratelimited(irq_data->edac->dev,
 				    "%s: status %#x at %#x, %#x after the acknowledge\n",
 				    irq_data->source, status, offset, left);
@@ -288,8 +255,9 @@ static bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
 
 	return found;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_ni_status);
 
-static void apple_soc_edac_rearm(struct work_struct *work)
+VISIBLE_IF_KUNIT void apple_soc_edac_rearm(struct work_struct *work)
 {
 	struct apple_soc_edac_irq *irq_data =
 		container_of(to_delayed_work(work), struct apple_soc_edac_irq,
@@ -298,8 +266,9 @@ static void apple_soc_edac_rearm(struct work_struct *work)
 	irq_data->armed_jiffies = jiffies;
 	enable_irq(irq_data->irq);
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_rearm);
 
-static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
+VISIBLE_IF_KUNIT irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 {
 	struct apple_soc_edac_irq *irq_data = data;
 	struct apple_soc_edac *edac = irq_data->edac;
@@ -371,6 +340,7 @@ static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_irq_thread);
 
 static int apple_soc_edac_map_ni(struct platform_device *pdev,
 				 struct apple_soc_edac_irq *irq_data)
@@ -515,7 +485,7 @@ static void apple_soc_edac_remove(struct platform_device *pdev)
 	edac_device_free_ctl_info(edac->dci);
 }
 
-static const struct of_device_id apple_soc_edac_of_match[] = {
+VISIBLE_IF_KUNIT const struct of_device_id apple_soc_edac_of_match[] = {
 	{ .compatible = "apple,t6000-error-handler", .data = &t6000_error_hw },
 	{ .compatible = "apple,t6041-error-handler", .data = &t6041_error_hw },
 	{ .compatible = "apple,t8112-error-handler", .data = &t8112_error_hw },
@@ -526,6 +496,7 @@ static const struct of_device_id apple_soc_edac_of_match[] = {
 	{ .compatible = "apple,t8140-event-log", .data = &t8140_event_hw },
 	{ }
 };
+EXPORT_SYMBOL_IF_KUNIT(apple_soc_edac_of_match);
 MODULE_DEVICE_TABLE(of, apple_soc_edac_of_match);
 
 static struct platform_driver apple_soc_edac_driver = {

@@ -1428,8 +1428,9 @@ static void parser_panel_identity(struct kunit *test)
 	struct dcp_parse_ctx ctx;
 	const struct drm_edid *edid;
 	const struct edid *raw;
-	struct dcp_display_mode modes[2] = {};
+	struct dcp_display_mode *modes = kunit_kcalloc(test, 2, sizeof(*modes), GFP_KERNEL);
 
+	KUNIT_ASSERT_NOT_NULL(test, modes);
 	modes[0].mode = (struct drm_display_mode) {
 		.clock = 540005, .hdisplay = 3456, .hsync_start = 3500,
 		.hsync_end = 3550, .htotal = 4000, .vdisplay = 2160,
@@ -1457,7 +1458,7 @@ static void parser_panel_identity(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	KUNIT_ASSERT_EQ(test, parse_panel_metadata(&ctx, &metadata), 0);
 	KUNIT_EXPECT_STREQ(test, metadata.name, "Synthetic Int");
-	edid = dcp_panel_edid(&metadata, NULL, modes, ARRAY_SIZE(modes), 345, 223);
+	edid = dcp_panel_edid(&metadata, NULL, modes, 2, 345, 223);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
 	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
 	raw = drm_edid_raw(edid);
@@ -1654,6 +1655,28 @@ static void parser_panel_adt_color_target(struct kunit *test)
 	for (unsigned int i = 0; i < ARRAY_SIZE(srgb); i++)
 		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), srgb[i]);
 
+	/*
+	 * A gamut not known here (the K114s ADT says "Rec2020") gives no
+	 * target of its own: the panel is described as Display P3, the space
+	 * its surfaces are tagged with, never with zero primaries.
+	 */
+	parser_adt_synthetic_matrix(matrix, 1 << 20);
+	size = parser_adt_color_fixture(adt, sizeof(adt), "Rec2020", sizeof("Rec2020"),
+					matrix, sizeof(matrix));
+	panel = (struct dcp_panel_adt) {};
+	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
+	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
+	KUNIT_EXPECT_NULL(test, dcp_panel_gamut_color_space(panel.gamut));
+	target = dcp_panel_color_target(panel.gamut);
+	KUNIT_EXPECT_PTR_EQ(test, target, dcp_color_space_lookup("display-p3"));
+	raw = panel_color_edid(test, &metadata, target);
+	for (unsigned int i = 0; i < ARRAY_SIZE(p3); i++)
+		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), p3[i]);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 120);
+	/* A known gamut keeps its own space. */
+	KUNIT_EXPECT_PTR_EQ(test, dcp_panel_color_target(DCP_PANEL_GAMUT_SRGB),
+			    dcp_color_space_lookup("srgb"));
+
 	/* Unknown, malformed, short, wrong-version, unbounded, non-neutral or singular. */
 	for (unsigned int fault = 0; fault < 7; fault++) {
 		const char *name = fault == 0 ? "AdobeRGB" : "P3";
@@ -1790,6 +1813,7 @@ static void parser_panel_of_dimensions(struct kunit *test)
 static void parser_panel_publication(struct kunit *test,
 				     enum dcp_firmware_version fw_compat, bool desktop_state)
 {
+	const size_t adt_capacity = 512;
 	const char *gamut = fw_compat == DCP_FIRMWARE_H17P ? "sRGB" : "P3";
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct dcp_desktop_state *desktop = kunit_kzalloc(test, sizeof(*desktop), GFP_KERNEL);
@@ -1802,7 +1826,7 @@ static void parser_panel_publication(struct kunit *test,
 	};
 	struct dcp_panel_adt before = panel;
 	__le32 matrix[10];
-	u8 adt[512];
+	u8 *adt = kunit_kmalloc(test, adt_capacity, GFP_KERNEL);
 	size_t adt_size;
 	struct device *dev = drm_kunit_helper_alloc_device(test);
 	struct drm_device *drm;
@@ -1820,11 +1844,12 @@ static void parser_panel_publication(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, id);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, adt);
 	ret = drmm_connector_init(drm, &connector->base, &parser_route_connector_funcs,
 				  DRM_MODE_CONNECTOR_eDP, NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
-	adt_size = parser_adt_color_fixture(adt, sizeof(adt), gamut, strlen(gamut) + 1,
+	adt_size = parser_adt_color_fixture(adt, adt_capacity, gamut, strlen(gamut) + 1,
 					    matrix, sizeof(matrix));
 	KUNIT_ASSERT_GT(test, adt_size, (size_t)0);
 	ret = dcp_panel_adt_parse(adt, adt_size, &panel);
@@ -1843,7 +1868,7 @@ static void parser_panel_publication(struct kunit *test,
 	dcp->fw_compat = fw_compat;
 	dcp->panel.width_mm = panel.width_mm;
 	dcp->panel.height_mm = panel.height_mm;
-	dcp->panel.color_target = dcp_panel_gamut_color_space(panel.gamut);
+	dcp->panel.color_target = dcp_panel_color_target(panel.gamut);
 	id->adt = panel.identity;
 	dcp->connector = connector;
 	dcp->modes = &mode;
@@ -2028,12 +2053,13 @@ static void parser_desktop_metadata_timing(struct kunit *test)
  */
 static void parser_internal_v27_only_120hz(struct kunit *test)
 {
-	struct dcp_display_mode catalog[2] = {};
+	struct dcp_display_mode *catalog = kunit_kcalloc(test, 2, sizeof(*catalog), GFP_KERNEL);
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
 	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
 	unsigned int i;
 
+	KUNIT_ASSERT_NOT_NULL(test, catalog);
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
@@ -2070,6 +2096,268 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
 	dcp_modes_release(dcp);
+}
+
+struct parser_unsafe_timing {
+	s64 id, score;
+	s64 hactive, htotal, hporch, hsync;
+	s64 vactive, vtotal, vporch, vsync, refresh;
+	bool preferred, unsafe, dsc, second;
+};
+
+static void blob_color_ids(struct parser_blob *blob, const char *key, bool listed)
+{
+	blob_key(blob, key);
+	blob_tag(blob, 2, listed);
+	if (listed) {
+		blob_tag(blob, 4, 0);
+		put_unaligned_le64(80, blob->data + blob->size);
+		blob->size += 8;
+	}
+}
+
+/*
+ * A timing as a desktop dcpext lists it for a monitor behind a DP to HDMI
+ * converter: one RGB element (ID 80), which UnsafeColorElementIDs and
+ * DSCRequiredColorElementIDs may list, and optionally a second (ID 81) that
+ * neither does.
+ */
+static void blob_unsafe_timing(struct parser_blob *blob,
+			       const struct parser_unsafe_timing *t)
+{
+	blob_tag(blob, 1, 10);
+	blob_bool(blob, "IsVirtual", false);
+	blob_int(blob, "ID", t->id);
+	blob_int(blob, "Score", t->score);
+	blob_timing_dimension(blob, "HorizontalAttributes", t->hactive, t->htotal,
+			      t->hporch, t->hsync,
+			      ((u64)t->vtotal * t->refresh << 16) / 1000);
+	blob_timing_dimension(blob, "VerticalAttributes", t->vactive, t->vtotal,
+			      t->vporch, t->vsync, t->refresh << 16);
+	blob_color_ids(blob, "UnsafeColorElementIDs", t->unsafe);
+	blob_color_ids(blob, "DSCRequiredColorElementIDs", t->dsc);
+	blob_key(blob, "ColorModes");
+	blob_tag(blob, 2, 1 + t->second);
+	blob_color(blob, 80, 242999, 0, DCP_COLOR_FORMAT_RGB);
+	if (t->second)
+		blob_color(blob, 81, 242998, 0, DCP_COLOR_FORMAT_RGB);
+	blob_bool(blob, "IsPreferred", t->preferred);
+	blob_bool(blob, "IsInterlaced", false);
+}
+
+static struct dcp_display_mode *
+parser_unsafe_modes(struct kunit *test, struct parser_blob *blob,
+		    const struct parser_unsafe_timing *timings, unsigned int n,
+		    bool external_sdr, unsigned int *count)
+{
+	struct dcp_parse_ctx ctx;
+	unsigned int i;
+
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 2, n);
+	for (i = 0; i < n; i++)
+		blob_unsafe_timing(blob, &timings[i]);
+	if (parse(blob->data, blob->size, &ctx))
+		return ERR_PTR(-EINVAL);
+	ctx.dcp = &parser_dcp;
+	return enumerate_modes(&ctx, count, 600, 340, 0, false, external_sdr);
+}
+
+static const struct dcp_display_mode *
+parser_default_mode(const struct dcp_display_mode *modes, unsigned int count)
+{
+	const struct dcp_display_mode *found = NULL;
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		if (modes[i].mode.type & DRM_MODE_TYPE_PREFERRED) {
+			if (found)
+				return NULL;
+			found = &modes[i];
+		}
+	return found;
+}
+
+/*
+ * A Dell S2725QS behind a USB-C to HDMI cable: firmware marks 3840x2160 at
+ * 60 Hz IsPreferred with the highest score, but lists its only element as
+ * unsafe (594 MHz is above the 340 MHz of the EDID's HDMI 1.4 block), and
+ * also prefers 1920x1080 at 120 Hz.  macOS drives the 60 Hz timing; so must
+ * the default.  An unsafe timing the firmware does not prefer never is.
+ */
+static void parser_unsafe_preferred_default(struct kunit *test)
+{
+	struct parser_unsafe_timing timings[] = {
+		{ 72, 16349, 1920, 2200, 88, 44, 1080, 1125, 4, 5, 120, true, false },
+		{ 50, 16598, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 60, true, true },
+		{ 48, 15379, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 30, false, false },
+		{ 77, 6442, 2560, 2720, 48, 32, 1440, 1525, 3, 5, 120, false, true },
+	};
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	const struct dcp_display_mode *def;
+	struct dcp_display_mode *modes;
+	unsigned int count, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+				    false, &count);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 4U);
+	for (i = 0; i < count; i++) {
+		KUNIT_EXPECT_EQ(test, modes[i].color_mode_id, 80);
+		KUNIT_EXPECT_EQ(test, modes[i].sdr_usable, !timings[i].unsafe);
+		KUNIT_EXPECT_EQ(test, modes[i].sdr_unsafe, timings[i].unsafe);
+	}
+	def = parser_default_mode(modes, count);
+	KUNIT_ASSERT_NOT_NULL(test, def);
+	KUNIT_EXPECT_EQ(test, def->timing_mode_id, 50);
+	KUNIT_EXPECT_EQ(test, def->mode.clock, 594000);
+	kfree(modes);
+
+	/* Not preferred, the unsafe 60 Hz timing leaves 1920x1080 the default. */
+	timings[1].preferred = false;
+	modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+				    false, &count);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 4U);
+	def = parser_default_mode(modes, count);
+	KUNIT_ASSERT_NOT_NULL(test, def);
+	KUNIT_EXPECT_EQ(test, def->timing_mode_id, 72);
+	kfree(modes);
+}
+
+/*
+ * A timing only DSC can carry is not an unsafe one: preferred or not, and
+ * whether or not its element is listed as unsafe too, it is never a default
+ * candidate.
+ */
+static void parser_unsafe_preferred_dsc(struct kunit *test)
+{
+	struct parser_unsafe_timing timings[] = {
+		{ 72, 16349, 1920, 2200, 88, 44, 1080, 1125, 4, 5, 120, true, false },
+		{ 50, 16598, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 60, true, false, true },
+	};
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	const struct dcp_display_mode *def;
+	struct dcp_display_mode *modes;
+	unsigned int count, pass;
+
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	for (pass = 0; pass < 2; pass++) {
+		timings[1].unsafe = pass;
+		modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+					    false, &count);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+		KUNIT_ASSERT_EQ(test, count, 2U);
+		KUNIT_EXPECT_EQ(test, modes[1].timing_mode_id, 50);
+		KUNIT_EXPECT_TRUE(test, modes[1].firmware_preferred);
+		KUNIT_EXPECT_FALSE(test, modes[1].sdr_usable);
+		KUNIT_EXPECT_FALSE(test, modes[1].sdr_unsafe);
+		KUNIT_EXPECT_FALSE(test, dcp_mode_default_candidate(&modes[1]));
+		KUNIT_EXPECT_TRUE(test, dcp_mode_default_candidate(&modes[0]));
+		def = parser_default_mode(modes, count);
+		KUNIT_ASSERT_NOT_NULL(test, def);
+		KUNIT_EXPECT_EQ(test, def->timing_mode_id, 72);
+		kfree(modes);
+	}
+}
+
+/*
+ * The external SDR path (T8140) never records an unsafe element: it drops a
+ * timing whose only element is unsafe, and one with a safe element besides
+ * is plainly usable.  The same catalog elsewhere records both.
+ */
+static void parser_unsafe_external_sdr(struct kunit *test)
+{
+	struct parser_unsafe_timing timings[] = {
+		{ 72, 16349, 1920, 2200, 88, 44, 1080, 1125, 4, 5, 120, true, false },
+		{ 50, 16598, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 60, true, true },
+		{ 48, 15379, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 30, true, true,
+		  false, true },
+	};
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	const struct dcp_display_mode *def;
+	struct dcp_display_mode *modes;
+	unsigned int count, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+				    true, &count);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 2U);
+	KUNIT_EXPECT_EQ(test, modes[0].timing_mode_id, 72);
+	KUNIT_EXPECT_EQ(test, modes[1].timing_mode_id, 48);
+	KUNIT_EXPECT_EQ(test, modes[1].color_mode_id, 81);
+	for (i = 0; i < count; i++) {
+		KUNIT_EXPECT_TRUE(test, modes[i].firmware_preferred);
+		KUNIT_EXPECT_TRUE(test, modes[i].sdr_usable);
+		KUNIT_EXPECT_FALSE(test, modes[i].sdr_unsafe);
+	}
+	def = parser_default_mode(modes, count);
+	KUNIT_ASSERT_NOT_NULL(test, def);
+	KUNIT_EXPECT_EQ(test, def->timing_mode_id, 48);
+	kfree(modes);
+
+	modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+				    false, &count);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 3U);
+	KUNIT_EXPECT_FALSE(test, modes[1].sdr_usable);
+	KUNIT_EXPECT_TRUE(test, modes[1].sdr_unsafe);
+	KUNIT_EXPECT_TRUE(test, modes[2].sdr_usable);
+	KUNIT_EXPECT_TRUE(test, modes[2].sdr_unsafe);
+	kfree(modes);
+}
+
+/*
+ * Two timings of the native resolution, both IsPreferred: the one with a
+ * usable SDR element is the default, whatever the refresh rate of the unsafe
+ * one, since nothing falls back to it when the unsafe timing fails.  The
+ * unsafe timing is then out of the ranking altogether, as it was before it
+ * could be a candidate.
+ */
+static void parser_unsafe_preferred_usable_wins(struct kunit *test)
+{
+	struct parser_unsafe_timing timings[] = {
+		{ 72, 16349, 1920, 2200, 88, 44, 1080, 1125, 4, 5, 120, true, false },
+		{ 50, 16598, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 60, true, true },
+		{ 48, 15379, 3840, 4400, 176, 88, 2160, 2250, 8, 10, 30, true, false },
+		{ 46, 15000, 3840, 5500, 1276, 88, 2160, 2250, 8, 10, 24, false, false },
+	};
+	static const struct {
+		bool preferred_30, preferred_24;
+		s64 expect;
+	} cases[] = {
+		/* Usable and preferred at 30 Hz beats unsafe and preferred at 60 Hz. */
+		{ true, false, 48 },
+		/* No usable timing is preferred: the Dell S2725QS case, 60 Hz. */
+		{ false, false, 50 },
+		/*
+		 * Only the 24 Hz one is: the unsafe timing is out, and the
+		 * usable ones rank as ever, the higher refresh rate first.
+		 */
+		{ false, true, 48 },
+	};
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+	const struct dcp_display_mode *def;
+	struct dcp_display_mode *modes;
+	unsigned int count, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		timings[2].preferred = cases[i].preferred_30;
+		timings[3].preferred = cases[i].preferred_24;
+		modes = parser_unsafe_modes(test, blob, timings, ARRAY_SIZE(timings),
+					    false, &count);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+		KUNIT_ASSERT_EQ(test, count, 4U);
+		KUNIT_EXPECT_TRUE(test, dcp_mode_default_candidate(&modes[1]));
+		def = parser_default_mode(modes, count);
+		KUNIT_ASSERT_NOT_NULL(test, def);
+		KUNIT_EXPECT_EQ(test, def->timing_mode_id, cases[i].expect);
+		kfree(modes);
+	}
 }
 
 static struct kunit_case parser_cases[] = {
@@ -2116,6 +2404,10 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_catalog_release),
 	KUNIT_CASE(parser_property_bounds),
 	KUNIT_CASE(parser_desktop_metadata_timing),
+	KUNIT_CASE(parser_unsafe_preferred_default),
+	KUNIT_CASE(parser_unsafe_preferred_dsc),
+	KUNIT_CASE(parser_unsafe_external_sdr),
+	KUNIT_CASE(parser_unsafe_preferred_usable_wins),
 	{}
 };
 

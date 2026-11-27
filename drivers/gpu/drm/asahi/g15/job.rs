@@ -36,7 +36,7 @@ use kernel::{
 };
 
 use super::{command::Command, fence::JobFence, hw, queue::QueueState, vm::VmState, Shared};
-use crate::mmu;
+use crate::{mmu, timestamp};
 
 /// A job as the engine sees it.
 #[pin_data]
@@ -58,7 +58,7 @@ pub(crate) struct Job {
     /// The engine's bookkeeping; `progress.signaled` makes [`Job::complete`] act once.
     pub(crate) progress: super::engine::Progress,
     /// The timestamp buffers the commands name (their arena VAs stay mapped while the job lives).
-    _timestamps: KVec<Arc<mmu::KernelMapping>>,
+    _timestamps: KVec<Arc<timestamp::Bound>>,
     /// Retains the VM's mappings (deferred unmaps, deferred VM close) while the firmware may
     /// access them.
     _guard: mmu::VmJobGuard,
@@ -75,7 +75,7 @@ impl Job {
         vm: Arc<VmState>,
         commands: KVec<Command>,
         fence: JobFence,
-        timestamps: KVec<Arc<mmu::KernelMapping>>,
+        timestamps: KVec<Arc<timestamp::Bound>>,
         guard: mmu::VmJobGuard,
     ) -> Result<Arc<Self>> {
         let progress = super::engine::Progress::new(commands.len());

@@ -537,7 +537,7 @@ impl super::super::Backend {
             first,
         } = *ctx;
         let built = (|| -> Result<_> {
-            parked.clear_for_vm(self.context.vm().id())?;
+            parked.clear_for_vm(self.context.vm())?;
             let free_list = self.context.render_pool(
                 alloc,
                 &resources.ids,
@@ -613,10 +613,15 @@ impl super::super::Backend {
         // returns, while the original installed kick owner stays live.
         drop(prepared);
         drop(storage);
+        // Views a returning pair gives up because its VM closed meanwhile; they drop after the
+        // device lock. Checked under the lock, so a VM closed before the pair is back is seen
+        // either here or by the close's own pass (`Registry::take_closed_parked_views`).
+        let mut closed_views = [None, None];
         let grow_ready = {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if result.is_err() {
+                closed_views = parked.take_closed_views();
                 firmware.queues.render.entry_mut(slot)?.parked = Some(parked);
                 firmware.queues.buffers.release(buffer.0)?;
             } else {
@@ -634,6 +639,7 @@ impl super::super::Backend {
             }
             firmware.render_grow_ready()
         };
+        drop(closed_views);
         self.shared.note_changed();
         if grow_ready {
             self.shared.queue_grow();
@@ -717,11 +723,12 @@ impl super::super::Backend {
                     return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::RetiredRenderBindings));
                 }
                 // A rebind of the same context (a render that needs a bigger pool) keeps its
-                // live scheduler state; only another context's is displaced.
+                // live scheduler state; only another context's is displaced. A detached sibling
+                // of a still-open owner stays in Deferred until that owner closes.
                 if !pair.matches(self.owner, &self.context)? {
                     firmware.queues.teardown.displace(
                         pair.context(),
-                        true,
+                        entry.closed,
                         super::super::now_ns(),
                     )?;
                 }
@@ -816,8 +823,8 @@ impl super::super::Backend {
 
     pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, sleep: bool) -> Result {
         self.build_render_pair(slot, packet, false, sleep)?;
-        // An owner held to one pair has no sibling to warm.
-        if self.pairs == 1 {
+        // An owner held to one pair, or running this layout on one, has no sibling to warm.
+        if self.render_pairs(packet) == 1 {
             return Ok(());
         }
         let sibling = {
@@ -834,8 +841,15 @@ impl super::super::Backend {
             // construction and its final device-locked install have finished.
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
+            // A sibling for which the client's window or memory limit has no room now, as the
+            // queue's other objects hold it, is not built either: this render runs on its pair.
             match self.build_render_pair(sibling.slot(), packet, true, sleep) {
-                Err(error) if error == EBUSY || error == EAGAIN || error == super::submit::FALLBACK => {}
+                Err(error)
+                    if error == EBUSY
+                        || error == EAGAIN
+                        || error == super::submit::FALLBACK
+                        || error == ENOSPC
+                        || error == ENOMEM => {}
                 result => result?,
             }
         }
@@ -987,7 +1001,7 @@ impl super::super::Backend {
             let _scope = (*held)
                 .as_mut()
                 .filter(|claim| claim.remaining() != 0)
-                .map(|claim| firmware.init.outer_scope(claim))
+                .map(|claim| firmware.port.outer_scope(&firmware.init, claim))
                 .transpose()?;
             firmware.publish_render(self.owner, slot, packet, deferred)
         })();

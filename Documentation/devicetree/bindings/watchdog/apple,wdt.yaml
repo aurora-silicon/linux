@@ -11,6 +11,15 @@ maintainers:
 
 allOf:
   - $ref: watchdog.yaml#
+  - if:
+      properties:
+        reg:
+          minItems: 2
+      required:
+        - reg
+    then:
+      required:
+        - reg-names
 
 properties:
   compatible:
@@ -26,6 +35,7 @@ properties:
               - apple,t8132-wdt
               - apple,t8140-wdt
               - apple,t8142-wdt
+              - apple,t8152-wdt
           - const: apple,t8103-wdt
       - items:
           - enum:
@@ -41,7 +51,16 @@ properties:
           - const: apple,wdt
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: Watchdog timer registers
+      - description: Simple-reconfig routing register
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: wdt
+      - const: reconfig
 
   clocks:
     maxItems: 1
@@ -67,6 +86,18 @@ examples:
         reg = <0x50000000 0x4000>;
         clocks = <&clk>;
         interrupts = <AIC_IRQ 123 IRQ_TYPE_LEVEL_HIGH>;
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    watchdog@8836c000 {
+        compatible = "apple,t6050-wdt", "apple,t8103-wdt";
+        reg = <0x8836c000 0x4000>,
+              <0x8833002c 0x4>;
+        reg-names = "wdt", "reconfig";
+        clocks = <&clk>;
+        interrupts = <AIC_IRQ 0 721 IRQ_TYPE_LEVEL_HIGH>;
     };
 
 ...
