@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * KUnit tests of the SN012776 amp levels: each amp's level is the second byte
+ * KUnit tests of the SN012776 and TAS5770L amp levels: each amp's level is the second byte
  * of its apple,speaker-config, which the boot loader copies from the Mac's
  * ADT, and the speakers stay off when any amp lacks it, or under a fixed
  * ceiling when any amp has another level than the ceiling was computed for.
@@ -22,7 +22,7 @@ static bool macaudio_level_test_present(struct kunit *test, struct device *dev,
 					const struct macaudio_platform_cfg *cfg,
 					const char *name)
 {
-	return macaudio_sn012776_levels_present(dev, cfg, macaudio_level_test_node(test, name));
+	return macaudio_amp_level_count(dev, cfg, macaudio_level_test_node(test, name)) > 0;
 }
 
 /* The level is the row's second byte, its low five bits */
@@ -83,27 +83,41 @@ static void macaudio_levels_fixed_ceiling(struct kunit *test)
 							     "macaudio-kunit-codec-good"));
 	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, cfg,
 							     "macaudio-kunit-codec-one-missing"));
-	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_level_allowed(cfg, 14));
-	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_level_allowed(cfg, 16));
+	KUNIT_EXPECT_FALSE(test, macaudio_amp_level_allowed(cfg, 14));
+	KUNIT_EXPECT_FALSE(test, macaudio_amp_level_allowed(cfg, 16));
 }
 
-/* No board table carries an SN012776 gain any more */
-static void macaudio_level_no_table(struct kunit *test)
+static void macaudio_tas_level_from_row(struct kunit *test)
 {
-	const struct macaudio_platform_cfg *cfgs[] = {
-		&macaudio_j180_cfg, &macaudio_j314_cfg, &macaudio_j316_cfg,
-		&macaudio_j37x_j47x_cfg, &macaudio_j413_cfg, &macaudio_j415_cfg,
-		&macaudio_j493_cfg, &macaudio_j575c_j773_cfg, &macaudio_j604_cfg,
-		&macaudio_j614_cfg, &macaudio_j616_cfg, &macaudio_j713_cfg,
-		&macaudio_j714_cfg, &macaudio_j715_cfg, &macaudio_j813_cfg,
-		&macaudio_j775_cfg, &macaudio_j873_cfg,
-	};
-	unsigned int i;
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-a")), 4);
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-b")), 14);
+}
 
-	for (i = 0; i < ARRAY_SIZE(cfgs); i++) {
-		KUNIT_EXPECT_EQ(test, cfgs[i]->amp, AMP_SN012776);
-		KUNIT_EXPECT_EQ(test, cfgs[i]->amp_gain, 0);
-	}
+static void macaudio_tas_level_rejects(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-zero")), -ERANGE);
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-high")), -ERANGE);
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-short")), -ENOENT);
+	KUNIT_EXPECT_EQ(test, macaudio_tas5770_level(
+		macaudio_level_test_node(test, "macaudio-kunit-tas-none")), -ENOENT);
+}
+
+static void macaudio_tas_levels_every_amp(struct kunit *test)
+{
+	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_EXPECT_TRUE(test, macaudio_level_test_present(test, dev, &macaudio_j313_cfg,
+							    "macaudio-kunit-tas-codec-good"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, &macaudio_j313_cfg,
+							     "macaudio-kunit-tas-codec-missing"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, &macaudio_j313_cfg,
+							     "macaudio-kunit-tas-codec-wrong"));
 }
 
 static int macaudio_level_test_init(struct kunit *test)
@@ -116,7 +130,9 @@ static struct kunit_case macaudio_level_cases[] = {
 	KUNIT_CASE(macaudio_level_rejects),
 	KUNIT_CASE(macaudio_levels_every_amp),
 	KUNIT_CASE(macaudio_levels_fixed_ceiling),
-	KUNIT_CASE(macaudio_level_no_table),
+	KUNIT_CASE(macaudio_tas_level_from_row),
+	KUNIT_CASE(macaudio_tas_level_rejects),
+	KUNIT_CASE(macaudio_tas_levels_every_amp),
 	{}
 };
 

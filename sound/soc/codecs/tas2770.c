@@ -771,7 +771,7 @@ static DECLARE_TLV_DB_SCALE(tas2770_playback_volume, -10050, 50, 0);
 static const struct snd_kcontrol_new tas2770_snd_controls[] = {
 	SOC_SINGLE_TLV("Speaker Playback Volume", TAS2770_PLAY_CFG_REG2,
 		       0, TAS2770_PLAY_CFG_REG2_VMAX, 1, tas2770_playback_volume),
-	SOC_SINGLE_TLV("Amp Gain Volume", TAS2770_PLAY_CFG_REG0, 0, 0x14, 0,
+	SOC_SINGLE_TLV("Amp Gain Volume", TAS2770_PLAY_CFG_REG0, 0, TAS2770_AMP_GAIN_MAX, 0,
 		       tas2770_digital_tlv),
 };
 

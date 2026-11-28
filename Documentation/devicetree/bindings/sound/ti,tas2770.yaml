@@ -18,6 +18,15 @@ description: |
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: ti,tas5770l
+    then:
+      properties:
+        apple,speaker-config: false
 
 properties:
   compatible:
@@ -44,6 +53,16 @@ properties:
 
   interrupts:
     maxItems: 1
+
+  apple,speaker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description:
+      This amplifier's speaker-config row from Apple's device tree, copied
+      by the bootloader. The second byte specifies the analog operating
+      gain. The other bytes are RX and sense slot selections in the source
+      format. Linux uses its own DAI and sense-slot properties for routing.
 
   ti,imon-slot-no:
     $ref: /schemas/types.yaml#/definitions/uint32

@@ -51,4 +51,51 @@
 	macaudio-kunit-codec-level-15 {
 		sound-dai = <&ma_amp_a>;
 	};
+
+	ma_tas_a: macaudio-kunit-tas-a {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 04 00 00];
+	};
+
+	ma_tas_b: macaudio-kunit-tas-b {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [01 0e 00 00];
+	};
+
+	ma_tas_zero: macaudio-kunit-tas-zero {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 00 00 00];
+	};
+
+	ma_tas_high: macaudio-kunit-tas-high {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 1f 00 00];
+	};
+
+	ma_tas_short: macaudio-kunit-tas-short {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 04 00];
+	};
+
+	ma_tas_none: macaudio-kunit-tas-none {
+		compatible = "ti,tas5770l", "ti,tas2770";
+		#sound-dai-cells = <0>;
+	};
+
+	macaudio-kunit-tas-codec-good {
+		sound-dai = <&ma_tas_a>, <&ma_tas_b>;
+	};
+
+	macaudio-kunit-tas-codec-missing {
+		sound-dai = <&ma_tas_a>, <&ma_tas_none>;
+	};
+
+	macaudio-kunit-tas-codec-wrong {
+		sound-dai = <&ma_tas_a>, <&ma_amp_a>;
+	};
 };
