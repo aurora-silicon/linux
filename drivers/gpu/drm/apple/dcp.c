@@ -4569,6 +4569,20 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 }
 
 /*
+ * Whether @pdev's firmware interface may keep presenting a cached copy of the
+ * last swapped frame instead of scanning out the framebuffer (the M4 IOMFB
+ * backend's idle cache, see iomfb_m4_idle_cache_work()). Drawing into the
+ * scanout buffer without a swap is then not seen until the next swap. The
+ * other interfaces scan the buffer out, so such drawing shows as it is made.
+ */
+bool dcp_caches_scanout(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return iomfb_is_m4(dcp);
+}
+
+/*
  * Whether @pdev's internal panel can show PQ content as EDR: the panel has
  * EDR headroom (the ADT's EDRPotentialHeadroom, see dcp_panel_read_adt()),
  * and the firmware interface is one whose swaps carry EDR, which the driver

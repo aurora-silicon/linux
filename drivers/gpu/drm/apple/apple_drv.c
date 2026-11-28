@@ -999,13 +999,40 @@ static int apple_atomic_check(struct drm_device *dev,
 	return 0;
 }
 
+/*
+ * A firmware interface that caches scanout (dcp_caches_scanout(): the M4 idle
+ * cache) keeps presenting a copy of a frame that has stopped flipping, so a
+ * client that draws into the scanout buffer without a flip (fbcon, a DIRTYFB
+ * caller) is not seen. Give such devices framebuffers with the dirty hook:
+ * the damage becomes a commit, and the fbdev emulation takes its shadowed,
+ * deferred-I/O path. Interfaces that scan the buffer out already show that
+ * drawing; they keep the plain framebuffers, with no shadow copy and no
+ * commit per console update.
+ */
+static struct drm_framebuffer *apple_fb_create(struct drm_device *dev,
+					       struct drm_file *file,
+					       const struct drm_format_info *info,
+					       const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, dev) {
+		/* The T8132 external CRTCs are not apple_crtcs. */
+		if (!t8132_ext_crtc(crtc) &&
+		    dcp_caches_scanout(to_apple_crtc(crtc)->dcp))
+			return drm_gem_fb_create_with_dirty(dev, file, info, mode_cmd);
+	}
+
+	return drm_gem_fb_create(dev, file, info, mode_cmd);
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= apple_atomic_commit,
-	.fb_create		= drm_gem_fb_create,
+	.fb_create		= apple_fb_create,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)

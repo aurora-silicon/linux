@@ -91,6 +91,7 @@ int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
+bool dcp_caches_scanout(struct platform_device *pdev);
 bool dcp_panel_edr(struct platform_device *pdev);
 bool dcp_ext_color_props_supported(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
