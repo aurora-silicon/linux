@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
@@ -113,6 +114,8 @@ static int __regmap_sn201202x_read(void *context,
 				   void *val, size_t val_size)
 {
 	struct spmi_device *sdev = context;
+	struct tps6598x *tps = spmi_device_get_drvdata(sdev);
+	struct sn201202x *sn = tps_to_sn(tps);
 	int err;
 	unsigned int offset = 0x20;
 	size_t len;
@@ -133,7 +136,7 @@ static int __regmap_sn201202x_read(void *context,
 	if (err)
 		return err;
 
-	if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x")) {
+	if (sn->select_polled) {
 		u8 size;
 
 		/* Selection completion does not establish the payload's length. */
@@ -919,6 +922,40 @@ static int sn201202x_init(struct sn201202x *sn)
 
 static int sn201202x_usbw_notify(struct notifier_block *nb, unsigned long usb_asleep, void *unused);
 
+VISIBLE_IF_KUNIT int sn201202x_select_irq_get(struct device_node *np,
+					      bool *select_polled)
+{
+	int index, ret;
+
+	if (!np) {
+		*select_polled = false;
+		return -EINVAL;
+	}
+
+	index = of_property_match_string(np, "interrupt-names", "select");
+	if (index < 0) {
+		/*
+		 * Some controllers omit the select notification, retaining
+		 * event/sleep/wake IRQs; poll register selection there.
+		 */
+		if (index == -EINVAL || index == -ENODATA) {
+			*select_polled = true;
+			return 0;
+		}
+		*select_polled = false;
+		return index;
+	}
+
+	*select_polled = false;
+	ret = of_irq_get(np, index);
+	if (ret < 0)
+		return ret;
+	if (!ret)
+		return -EINVAL;
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_select_irq_get);
+
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
@@ -975,16 +1012,10 @@ static int sn201202x_probe(struct spmi_device *device)
 		tps->irq = of_irq_get_byname(device->dev.of_node, "irq");
 		if (tps->irq < 0)
 			return tps->irq;
-		irq_select = of_irq_get_byname(device->dev.of_node, "select");
-		/* T8132 has no select notification, but retains event/sleep/wake IRQs. */
-		if (irq_select == -EINVAL || irq_select == -ENODATA) {
-			if (!of_device_is_compatible(device->dev.of_node,
-						     "apple,t8132-sn201202x"))
-				return irq_select;
-			sn->select_polled = true;
-		} else if (irq_select < 0) {
+		irq_select = sn201202x_select_irq_get(device->dev.of_node,
+						      &sn->select_polled);
+		if (irq_select < 0)
 			return irq_select;
-		}
 		irq_sleep = of_irq_get_byname(device->dev.of_node, "sleep");
 		if (irq_sleep < 0)
 			return irq_sleep;
@@ -1016,8 +1047,8 @@ static int sn201202x_probe(struct spmi_device *device)
 		tps->sleep_event = sn201202x_sleep_event;
 	/*
 	 * Idle sleep needs only the event interrupt to stay live while the
-	 * controller sleeps. T8132's select-polled controllers have that, as
-	 * the system sleep filter above relies on; elsewhere the DT says so
+	 * controller sleeps. Select-polled controllers have that, as the
+	 * system sleep filter above relies on; elsewhere the DT says so
 	 * (apple,event-irq-in-sleep). A register access then wakes the
 	 * controller through runtime PM, select notification or not. Those
 	 * controllers keep their own system sleep path (a wake IRQ).

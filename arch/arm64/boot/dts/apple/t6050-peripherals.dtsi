@@ -1470,6 +1470,9 @@
 		reg = <0x2 0x8a1a8000 0x0 0x4000>,
 		      <0x2 0x8a1a4000 0x0 0x4000>,
 		      <0x2 0x8a1a0000 0x0 0x4000>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
 		#address-cells = <2>;
 		#size-cells = <0>;

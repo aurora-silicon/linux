@@ -70,13 +70,18 @@
 /* A block t6050-die0.dtsi does not describe yet: the third HPM bus */
 &die0 {
 	/*
-	 * ADT nub-spmi-a1, the right-hand port's HPM bus (hpm2). Polled like a0:
-	 * the generation 4 driver takes no interrupt. pmgr NUB_SPMI_A1 is
-	 * critical, as NUB_SPMI_A0, so no power-domains.
+	 * ADT nub-spmi-a1, the right-hand port's HPM bus (hpm2), with its fault-queue
+	 * window and AIC 763 interrupt. pmgr NUB_SPMI_A1 is critical, as NUB_SPMI_A0, so
+	 * no power-domains.
 	 */
 	nub_spmi_a1: spmi@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
-		reg = <0x2 0x8a1a8000 0x0 0x4000>;
+		reg = <0x2 0x8a1a8000 0x0 0x4000>,
+		      <0x2 0x8a1a4000 0x0 0x4000>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
 		#address-cells = <2>;
 		#size-cells = <0>;
 	};

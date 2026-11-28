@@ -611,6 +611,8 @@ static inline void tipd_debugfs_exit(void) { }
 #endif
 
 #if IS_ENABLED(CONFIG_KUNIT)
+struct device_node;
+int sn201202x_select_irq_get(struct device_node *np, bool *select_polled);
 void cd321x_mux_failed(struct cd321x *cd321x, const char *what, int ret, bool held);
 void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries, unsigned int held_ms);
 void cd321x_init_work(struct cd321x *cd321x);

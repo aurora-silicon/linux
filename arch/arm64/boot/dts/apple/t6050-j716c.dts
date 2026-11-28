@@ -124,7 +124,7 @@
 	};
 };
 
-/* ATC1, ATC3 and the PD controller buses nub-spmi-a0 and -a2: not yet described for this board */
+/* ATC1, ATC3 and the PD controller bus nub-spmi-a2: not yet described for this board */
 &nub_spmi_a0 {
 	status = "disabled";
 };
@@ -208,6 +208,26 @@
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
 		apple,fan-manual-control;
+	};
+
+	power-PSTR {
+		apple,key-id = "PSTR";
+		label = "Total System Power";
+	};
+
+	power-PHPC {
+		apple,key-id = "PHPC";
+		label = "Heatpipe Power";
+	};
+
+	power-PDTR {
+		apple,key-id = "PDTR";
+		label = "AC Input Power";
+	};
+
+	voltage-SBAV {
+		apple,key-id = "SBAV";
+		label = "Battery Voltage";
 	};
 };
 
@@ -304,19 +324,35 @@
  */
 #include "t6050-j714s-ane.dtsi"
 
-/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+/* The port controllers follow the sleep's command rules and use SPMI event/sleep/wake IRQs. */
 &hpm0 {
+	interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+		     <17 IRQ_TYPE_EDGE_RISING>,
+		     <19 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "irq", "sleep", "wake";
 	apple,sleep-ssps-rules;
 };
 
 &hpm1 {
+	interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+		     <43 IRQ_TYPE_EDGE_RISING>,
+		     <45 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "irq", "sleep", "wake";
 	apple,sleep-ssps-rules;
 };
 
 &hpm2 {
+	interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+		     <17 IRQ_TYPE_EDGE_RISING>,
+		     <19 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "irq", "sleep", "wake";
 	apple,sleep-ssps-rules;
 };
 
 &hpm5 {
+	interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+		     <69 IRQ_TYPE_EDGE_RISING>,
+		     <71 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "irq", "sleep", "wake";
 	apple,sleep-ssps-rules;
 };

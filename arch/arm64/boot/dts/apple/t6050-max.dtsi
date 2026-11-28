@@ -207,12 +207,17 @@
 
 #if defined(T6050_J714C) || defined(T6050_J716C)
 	/*
-	 * /arm-io/nub-spmi-a1: reg[0] 0x8a1a8000, generation 4, a bus of USB-C PD controllers (the
-	 * board's). They are polled, as on nub-spmi-a0, so the bus takes no interrupt.
+	 * /arm-io/nub-spmi-a1: reg[0] 0x8a1a8000, reg[1] 0x8a1a4000 (fault queue), generation 4,
+	 * interrupt 763, a bus of USB-C PD controllers (the board's).
 	 */
 	nub_spmi_a1: spmi@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
-		reg = <0x2 0x8a1a8000 0x0 0x4000>;
+		reg = <0x2 0x8a1a8000 0x0 0x4000>,
+		      <0x2 0x8a1a4000 0x0 0x4000>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
 		#address-cells = <2>;
 		#size-cells = <0>;
 	};

@@ -4,11 +4,14 @@
  */
 
 #include <kunit/device.h>
+#include <kunit/of.h>
 #include <kunit/test.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/regmap.h>
@@ -1032,6 +1035,148 @@ static void sn201202x_ldcm_stop_requeue_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->sn.ldcm_work));
 }
 
+#ifdef CONFIG_OF_DYNAMIC
+static void sn201202x_test_changeset_cleanup(void *data)
+{
+	struct of_changeset *cs = data;
+
+	of_changeset_revert(cs);
+	of_changeset_destroy(cs);
+}
+
+static void sn201202x_test_irq_domain_remove(void *data)
+{
+	irq_domain_remove(data);
+}
+#endif
+
+static void sn201202x_select_irq_test(struct kunit *test)
+{
+#ifndef CONFIG_OF_DYNAMIC
+	kunit_skip(test, "requires CONFIG_OF_DYNAMIC");
+#else
+	static const char * const names_3irq[] = { "irq", "sleep", "wake" };
+	static const char * const names_4irq[] = { "irq", "select", "sleep", "wake" };
+	static const u32 irqs_3irq[] = { 1, 0, 2, 0, 3, 0 };
+	static const u32 irqs_4irq[] = { 1, 0, 2, 0, 3, 0, 4, 0 };
+	static const u32 irqs_bad_phandle[] = {
+		0xffffffff, 0, 0xffffffff, 1, 0xffffffff, 2, 0xffffffff, 3,
+	};
+	static const u32 irqs_trunc[] = { 1, 0 };
+	struct device_node *ic, *polled_3irq, *bad_spec, *trunc_spec, *valid_4irq;
+	struct of_changeset *cs;
+	struct irq_domain *domain;
+	bool select_polled;
+	int ret;
+
+	if (!of_root)
+		kunit_skip(test, "requires a device tree");
+
+	cs = kunit_kzalloc(test, sizeof(*cs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cs);
+	of_changeset_init(cs);
+
+	ic = of_changeset_create_node(cs, of_root, "sn201202x-irq-test");
+	KUNIT_ASSERT_NOT_NULL(test, ic);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(cs, ic, "interrupt-controller"), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(cs, ic, "#interrupt-cells", 2), 0);
+
+	polled_3irq = of_changeset_create_node(cs, ic, "polled-select");
+	KUNIT_ASSERT_NOT_NULL(test, polled_3irq);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string_array(cs, polled_3irq,
+								 "interrupt-names",
+								 names_3irq,
+								 ARRAY_SIZE(names_3irq)), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32_array(cs, polled_3irq,
+							      "interrupts",
+							      irqs_3irq,
+							      ARRAY_SIZE(irqs_3irq)), 0);
+
+	bad_spec = of_changeset_create_node(cs, ic, "bad-select-spec");
+	KUNIT_ASSERT_NOT_NULL(test, bad_spec);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string_array(cs, bad_spec,
+								 "interrupt-names",
+								 names_4irq,
+								 ARRAY_SIZE(names_4irq)), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32_array(cs, bad_spec,
+							      "interrupts-extended",
+							      irqs_bad_phandle,
+							      ARRAY_SIZE(irqs_bad_phandle)), 0);
+
+	trunc_spec = of_changeset_create_node(cs, ic, "trunc-select-spec");
+	KUNIT_ASSERT_NOT_NULL(test, trunc_spec);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string_array(cs, trunc_spec,
+								 "interrupt-names",
+								 names_4irq,
+								 ARRAY_SIZE(names_4irq)), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32_array(cs, trunc_spec,
+							      "interrupts",
+							      irqs_trunc,
+							      ARRAY_SIZE(irqs_trunc)), 0);
+
+	valid_4irq = of_changeset_create_node(cs, ic, "valid-4irq");
+	KUNIT_ASSERT_NOT_NULL(test, valid_4irq);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string_array(cs, valid_4irq,
+								 "interrupt-names",
+								 names_4irq,
+								 ARRAY_SIZE(names_4irq)), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32_array(cs, valid_4irq,
+							      "interrupts",
+							      irqs_4irq,
+							      ARRAY_SIZE(irqs_4irq)), 0);
+
+	ret = of_changeset_apply(cs);
+	if (ret) {
+		of_node_put(valid_4irq);
+		of_node_put(trunc_spec);
+		of_node_put(bad_spec);
+		of_node_put(polled_3irq);
+		of_node_put(ic);
+		of_changeset_destroy(cs);
+		KUNIT_ASSERT_EQ(test, ret, 0);
+	}
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_changeset_cleanup,
+							cs), 0);
+	of_node_put_kunit(test, ic);
+	of_node_put_kunit(test, polled_3irq);
+	of_node_put_kunit(test, bad_spec);
+	of_node_put_kunit(test, trunc_spec);
+	of_node_put_kunit(test, valid_4irq);
+
+	/* Absent "select" IRQ falls back to select-polled. */
+	select_polled = false;
+	KUNIT_EXPECT_EQ(test, sn201202x_select_irq_get(polled_3irq, &select_polled), 0);
+	KUNIT_EXPECT_TRUE(test, select_polled);
+
+	/* Declared "select" IRQ with unparseable specifier propagates -EINVAL. */
+	select_polled = true;
+	KUNIT_EXPECT_EQ(test, sn201202x_select_irq_get(bad_spec, &select_polled), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, select_polled);
+
+	/* Declared "select" IRQ missing from interrupts array propagates -EOVERFLOW. */
+	select_polled = true;
+	KUNIT_EXPECT_EQ(test, sn201202x_select_irq_get(trunc_spec, &select_polled), -EOVERFLOW);
+	KUNIT_EXPECT_FALSE(test, select_polled);
+
+	/* Declared "select" IRQ without a registered domain propagates -EPROBE_DEFER. */
+	select_polled = true;
+	KUNIT_EXPECT_EQ(test, sn201202x_select_irq_get(valid_4irq, &select_polled), -EPROBE_DEFER);
+	KUNIT_EXPECT_FALSE(test, select_polled);
+
+	/* Declared "select" IRQ with a registered domain maps cleanly and disables polling. */
+	domain = irq_domain_create_linear(of_fwnode_handle(ic), 8, &irq_domain_simple_ops, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, sn201202x_test_irq_domain_remove,
+							domain), 0);
+	select_polled = true;
+	ret = sn201202x_select_irq_get(valid_4irq, &select_polled);
+	KUNIT_EXPECT_GT(test, ret, 0);
+	KUNIT_EXPECT_FALSE(test, select_polled);
+	if (ret > 0)
+		irq_dispose_mapping(ret);
+#endif
+}
+
 static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_cycle_test),
 	KUNIT_CASE(sn201202x_failed_wakeup_test),
@@ -1069,6 +1214,7 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_from_idle_test),
 	KUNIT_CASE(sn201202x_sleep_from_idle_failed_wakeup_test),
 	KUNIT_CASE(sn201202x_watched_sleep_from_idle_test),
+	KUNIT_CASE(sn201202x_select_irq_test),
 	{}
 };
 
