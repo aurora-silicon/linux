@@ -220,6 +220,7 @@ static const struct ave_variant ave_t8140 = {
  * beside it. As on the M4 Max, the 26A428 build's TEXT word at 0x4224 differs on every boot
  * (the Mac Studio, J775D), so an unknown TEXT CRC of that build is retried with the word zeroed.
  * The 26C5035 build has not been checked for such a word, so its CRC must match as it is.
+ * The macOS 27.2 (26B8125) build has the 26C5035 sizes and is told apart by its CRC.
  */
 static const struct ave_fw_build ave_t6050_builds[] = {
 	{ "26A428", 0x154000, 0x134000, AVE_FW_TEXT_CRC_T6050_26A428, 0x4224 },
@@ -229,6 +230,8 @@ static const struct ave_fw_build ave_t6050_builds[] = {
 	 * layout (ave_layout_for_crc()).
 	 */
 	{ "26C5035", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26C5035 },
+	/* macOS 27.2: 26A428's command layout, as the 27.2 build of the M5 (T8142). */
+	{ "26B8125", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26B8125 },
 };
 
 const struct ave_variant ave_t6050 = {
