@@ -7690,6 +7690,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
  * We need to shutdown DCP before tearing down the display subsystem. Otherwise
  * the DCP will crash and briefly flash a green screen of death.
  */
+static int dcp_v27_dpms_prepare(struct apple_dcp *dcp, bool deep_sleep);
+static void dcp_v27_dpms_complete(struct apple_dcp *dcp);
+static void dcp_v27_dpms_handoff(struct apple_dcp *dcp);
+static void dcp_v27_dpms_off_locked(struct apple_dcp *dcp);
+static int dcp_v27_dpms_on_locked(struct apple_dcp *dcp, bool present);
+
 VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -7698,6 +7704,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		return;
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
+	/* Restore a soft-off panel while the IOMFB queue is still active. */
+	dcp_v27_dpms_handoff(dcp);
 	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
 	/*
@@ -9373,6 +9381,8 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	/* The iBoot interface's display stays as it is: no component to remove. */
 	if (dcp && dcp_is_iboot(dcp))
 		return;
+	if (dcp)
+		dcp_v27_dpms_handoff(dcp);
 
 	if (dcp && iomfb_is_m4(dcp)) {
 		dcp_comp_unbind(&pdev->dev, NULL, NULL);
@@ -9483,6 +9493,13 @@ static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 	    READ_ONCE(dcp->crashed) || READ_ONCE(dcp->s2r_fw_down))
 		return;
 
+	if (READ_ONCE(dcp->v27_dpms_soft_off)) {
+		/* Panel is already soft-powered off with presentation paused. */
+		apple_rtkit_hold_rx(dcp->rtk);
+		dcp->rx_held = true;
+		return;
+	}
+
 	iomfb_pause_presentation(dcp, true);
 	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
 		iomfb_pause_presentation(dcp, false);
@@ -9498,7 +9515,8 @@ static void dcp_release_after_sleep(struct apple_dcp *dcp)
 		return;
 	dcp->rx_held = false;
 	apple_rtkit_resume_rx(dcp->rtk);
-	iomfb_pause_presentation(dcp, false);
+	if (!READ_ONCE(dcp->v27_dpms_soft_off))
+		iomfb_pause_presentation(dcp, false);
 }
 
 /*
@@ -9549,8 +9567,16 @@ static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
+	bool deep_v27 = dcp && pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp);
+	int ret;
 
-	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
+	if (dcp) {
+		ret = dcp_v27_dpms_prepare(dcp, deep_v27);
+		if (ret)
+			return ret;
+	}
+
+	if (deep_v27) {
 		dcp_v27_sleep_invalidate(dcp);
 		return 0;
 	}
@@ -9607,6 +9633,8 @@ static void dcp_platform_complete(struct device *dev)
 	/* The iBoot interface's display stays powered across system sleep. */
 	if (dcp_is_iboot(dcp))
 		return;
+	if (dcp)
+		dcp_v27_dpms_complete(dcp);
 	if (dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->ext26_pm_preparing, false);
 		if (dcp->ext26_pm_work_off && !READ_ONCE(dcp->ext26_blocked) &&
@@ -11102,6 +11130,11 @@ static void dcp_dpms_power_on(struct apple_dcp *dcp)
 		dcp_s2r_light_running(dcp);
 		return;
 	}
+	WRITE_ONCE(dcp->v27_dpms_was_soft_off, false);
+	if (dcp->v27_dpms_soft_off) {
+		dcp_v27_dpms_on_locked(dcp, true);
+		return;
+	}
 	if (!dcp->dpms_powered_off)
 		return;
 	dcp->dpms_powered_off = false;
@@ -11215,6 +11248,7 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 	dcp->s2r_prewarmed = false;
 	dcp->s2r_wake_lit = false;
 	__dcp_dpms_power_off(dcp);
+	dcp_v27_dpms_off_locked(dcp);
 }
 
 /*

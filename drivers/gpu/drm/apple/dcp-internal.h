@@ -967,6 +967,14 @@ struct apple_dcp {
 	bool s2r_hdmi_irq_disabled;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
+	/* Firmware-27 internal panel soft-powered off on DPMS off via plain A484(0). */
+	bool v27_dpms_soft_off;
+	/* Firmware-27 DPMS off timed out: firmware state uncertain until A484(1) recovers it. */
+	bool v27_dpms_uncertain;
+	/* System PM transition in flight (prepare..complete): skip runtime DPMS soft-off. */
+	bool v27_dpms_pm_suspend;
+	/* Panel was soft-powered off before PM prepare; return to soft-off on complete. */
+	bool v27_dpms_was_soft_off;
 	/*
 	 * The firmware confirmed the scanout stop of a set_power_state(0) and no power-on has
 	 * started since: its D572(0) has come and gone, and a second set_power_state(0) gets none.

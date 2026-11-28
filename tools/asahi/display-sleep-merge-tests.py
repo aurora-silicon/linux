@@ -50,7 +50,7 @@ common = '#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#inclu
 dcp = (A / 'dcp.c').read_text()
 prefix = dcp[dcp.index('static int dcp_platform_prepare('):]
 prefix = prefix[:prefix.index('\t/*\n\t * J713:')]
-v27 = re.search(r'\tif \(pm_suspend_via_firmware\(\) && dcp_v27_sleep_selected\(dcp\)\) \{.*?\n\t\}', prefix, re.S)[0]
+v27 = re.search(r'\tif \((?:deep_v27|pm_suspend_via_firmware\(\) && dcp_v27_sleep_selected\(dcp\))\) \{.*?\n\t\}', prefix, re.S)[0]
 native = re.search(r'\tif \(dcp_is_ext26\(dcp\)\) \{.*?\n\t\}', prefix, re.S)[0]
 assert prefix.index(v27) < prefix.index(native)
 pre = common + r'''
@@ -62,6 +62,7 @@ static int invalidations, cancellations, disables; static bool firmware;
 static void *dev_get_drvdata(struct device *v) { return v->d; }
 static bool pm_suspend_via_firmware(void) { return firmware; }
 static bool dcp_v27_sleep_selected(struct apple_dcp *d) { return d->v27; }
+static int dcp_v27_dpms_prepare(struct apple_dcp *d, bool deep) { (void)d; (void)deep; return 0; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *d) { invalidations++; }
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native26; }
 static void cancel_work_sync(int *w) { cancellations++; }
