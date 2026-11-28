@@ -166,10 +166,6 @@ struct apple_cio_hw {
 	bool run_store;
 	/* Hold LSTX low as a GPIO from probe until the router first takes it. */
 	bool lstx_hold_from_probe;
-	/* The router trains Gen4 only on a cable word that says Gen4. */
-	bool gen4_cable;
-	/* Run Gen4 links with link recovery enabled at both ends. */
-	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
 	/* Drain PSD runtime power-off before the PHY is reset or reused. */
@@ -291,6 +287,8 @@ static const struct apple_cio_hw apple_cio_t8142_hw = {
  * the M5 policy, see apple_dpin_m5. A Gen4 link times out CL training once CL
  * states are enabled, then drops; it also dropped in the middle of a
  * transition to an asymmetric width. Its links stay in CL0 and symmetric.
+ * Gen4 itself is not a property of this description: see
+ * apple_nhi_probe_host_gen4().
  */
 static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.dpin_count = 4,
@@ -300,10 +298,8 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.lstx_after_boot = true,
 	.lstx_hold_from_probe = true,
 	.strict_fw_ready = true,
-	.gen4_cable = true,
 	.no_host_clx = true,
 	.no_asym = true,
-	.gen4_link_recovery = true,
 	.host_tmu = true,
 	.dp = &apple_dpin_m5,
 };
@@ -1518,6 +1514,8 @@ struct apple_nhi {
 	struct tb *tb;
 	struct tb_nhi nhi;
 	struct tb_nhi_ops ops;
+	/* the host router's lane adapters report Gen4 (read once at probe) */
+	bool host_gen4;
 
 	void __iomem *nhi_base;
 	struct apple_tunable *nhi_tunable;
@@ -2678,6 +2676,54 @@ static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
 	.options_stride = APPLE_CIO_NHI_RING_STRIDE,
 };
 
+/*
+ * A host router that can run USB4 Gen4 says so in the Supported Link Speeds
+ * field of its lane adapters (USB4 v2, LANE_ADP_CS_0). The field is the
+ * same on every Apple USB4 router, so this, not the SoC, decides whether a
+ * Gen4 cable word is handed to the router. It is a property of the router
+ * itself, so it is read once at probe and kept: a read that fails later
+ * (around a wake) must not turn a Gen4 router into a 20 Gb/s one.
+ */
+static bool apple_nhi_probe_host_gen4(struct apple_nhi *anhi)
+{
+	struct tb_port *port;
+	bool read_any = false;
+	u32 val;
+
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
+		if (!tb_port_is_null(port) || !port->cap_phy)
+			continue;
+		if (tb_port_read(port, &val, TB_CFG_PORT,
+				 port->cap_phy + LANE_ADP_CS_0, 1))
+			continue;
+		read_any = true;
+		if (FIELD_GET(LANE_ADP_CS_0_SUPPORTED_SPEED_MASK, val) &
+		    LANE_ADP_CS_0_SUPPORTED_SPEED_GEN4)
+			return true;
+	}
+	if (!read_any)
+		dev_warn(anhi->dev,
+			 "no host lane adapter readable, Gen4 cables get the 20 Gb/s word\n");
+	return false;
+}
+
+/*
+ * The cable word as the host router gets it: a Gen4 cable on a router
+ * without Gen4 is a 20 Gb/s cable to it.
+ */
+static u32 apple_nhi_cable_info(struct apple_nhi *anhi, u32 info)
+{
+	if (!(info & TB_VSE_CAP_APPLE_CABLE_INFO_GEN4))
+		return info;
+	if (anhi->host_gen4) {
+		dev_dbg(anhi->dev, "Gen4 cable, host router supports Gen4\n");
+		return info;
+	}
+	dev_dbg(anhi->dev, "Gen4 cable, host router is Gen3: 20 Gb/s cable word\n");
+	return (info & ~TB_VSE_CAP_APPLE_CABLE_INFO_GEN4) |
+	       TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
+}
+
 static int apple_nhi_probe(struct platform_device *pdev)
 {
 	struct apple_cio *acio = dev_get_drvdata(pdev->dev.parent);
@@ -2686,6 +2732,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	struct resource *res;
 	struct tb_port *port;
 	enum apple_dpin_flow dp_hooks;
+	u32 cable_info;
 	int cap_apple;
 	int ret = 0;
 
@@ -2805,8 +2852,13 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->nhi.quirks |= QUIRK_NO_HOST_CLX;
 	if (acio->hw->no_asym)
 		anhi->nhi.quirks |= QUIRK_NO_ASYM;
-	if (acio->hw->gen4_link_recovery)
-		anhi->nhi.quirks |= QUIRK_GEN4_LINK_RECOVERY;
+	/*
+	 * The router firmware has no way back from a Gen4 link error but to
+	 * disconnect the link unless link recovery is on at both ends. The core
+	 * only touches links that trained at Gen4, so this is a no-op on routers
+	 * and cables without Gen4.
+	 */
+	anhi->nhi.quirks |= QUIRK_GEN4_LINK_RECOVERY;
 	if (acio->hw->host_tmu)
 		anhi->nhi.quirks |= QUIRK_HOST_TMU;
 
@@ -2901,7 +2953,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
 				 port->port, ret);
 	}
 
-	ret = tb_sw_write(anhi->tb->root_switch, &acio->target_cable_info, TB_CFG_SWITCH,
+	anhi->host_gen4 = apple_nhi_probe_host_gen4(anhi);
+	cable_info = apple_nhi_cable_info(anhi, acio->target_cable_info);
+	ret = tb_sw_write(anhi->tb->root_switch, &cable_info, TB_CFG_SWITCH,
 			  cap_apple + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
 	if (ret) {
 		dev_warn(anhi->dev, "Setting VSE Apple cable info failed: %d\n", ret);
@@ -4113,11 +4167,13 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		if (FIELD_GET(EUDO_CABLE_TYPE_MASK, data->usb4.eudo) != EUDO_CABLE_TYPE_PASSIVE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ACTIVE_CABLE;
 		/*
-		 * The T6050 router firmware trains Gen4 only on a Gen4 cable, and
-		 * takes Gen4 alone: no 20 Gb/s bit beside it.
+		 * The router firmware trains Gen4 only on a Gen4 cable, and takes
+		 * Gen4 alone: no 20 Gb/s bit beside it. Whether the host router
+		 * can run Gen4 at all is only known once its config space is up:
+		 * apple_nhi_cable_info() turns this into the 20 Gb/s word there
+		 * for a router without Gen4.
 		 */
-		if (acio->hw->gen4_cable &&
-		    FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >=
+		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >=
 		    APPLE_EUDO_CABLE_SPEED_USB4_GEN4)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_GEN4;
 		else if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >=
@@ -4125,7 +4181,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
 		if (data->orientation == TYPEC_ORIENTATION_REVERSE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ORIENTATION_REVERSE;
-		dev_dbg(acio->dev, "USB4 cable: eudo 0x%x, orientation %d -> cable info 0x%x\n",
+		dev_dbg(acio->dev, "USB4 cable: eudo 0x%x, orientation %d -> requested cable info 0x%x\n",
 			data->usb4.eudo, data->orientation, acio->target_cable_info);
 		break;
 	}

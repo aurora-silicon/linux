@@ -48,6 +48,7 @@ static int apple_nhi_cio_router_wake(struct tb_nhi *nhi)
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct tb_switch *sw = anhi->tb->root_switch;
 	struct tb_port *port;
+	u32 cable_info;
 	int cap, ret;
 
 	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_APPLE);
@@ -60,10 +61,10 @@ static int apple_nhi_cio_router_wake(struct tb_nhi *nhi)
 		if (ret)
 			dev_warn(anhi->dev, "CIO port %u unlock failed: %d\n", port->port, ret);
 	}
-	ret = tb_sw_write(sw, &anhi->acio->current_cable_info, TB_CFG_SWITCH,
+	cable_info = apple_nhi_cable_info(anhi, anhi->acio->current_cable_info);
+	ret = tb_sw_write(sw, &cable_info, TB_CFG_SWITCH,
 			  cap + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
-	dev_info(anhi->dev, "CIO cable word %#x written: %d\n", anhi->acio->current_cable_info,
-		 ret);
+	dev_info(anhi->dev, "CIO cable word %#x written: %d\n", cable_info, ret);
 	return ret;
 }
 
@@ -285,6 +286,7 @@ static int apple_nhi_cio_router_wake_t6050(struct tb_nhi *nhi)
 {
 	struct apple_nhi *anhi = nhi_to_anhi(nhi);
 	struct tb_switch *sw = anhi->tb->root_switch;
+	u32 cable_info;
 	int cap, ret;
 
 	apple_nhi_cio_wake_op_t6050(anhi, APPLE_CIO_T6050_WAKE_OP_A, 0);
@@ -292,10 +294,10 @@ static int apple_nhi_cio_router_wake_t6050(struct tb_nhi *nhi)
 	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_APPLE);
 	if (cap < 0)
 		return cap;
-	ret = tb_sw_write(sw, &anhi->acio->current_cable_info, TB_CFG_SWITCH,
+	cable_info = apple_nhi_cable_info(anhi, anhi->acio->current_cable_info);
+	ret = tb_sw_write(sw, &cable_info, TB_CFG_SWITCH,
 			  cap + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
-	dev_info(anhi->dev, "CIO cable word %#x written: %d\n", anhi->acio->current_cable_info,
-		 ret);
+	dev_info(anhi->dev, "CIO cable word %#x written: %d\n", cable_info, ret);
 	return ret;
 }
 
