@@ -15,8 +15,9 @@ at 1920x1080 with B-frames enabled/disabled, and 3840x2160 with B-frames enabled
 They compare both deterministic synthetic DART addresses and masked images.
 The constant image tables in ave-image.c are unchanged by this refactor.
 
-6070.11.1 is selected only for T6000 TEXT CRC 460c7a7c or T8112 TEXT CRC 25bfd039,
-with the corresponding SoC identity. Boot, seven-channel discovery, Config,
+6070.11.1 is selected only for T6000 TEXT CRC 460c7a7c, the T6001 (M1 Max) build's
+65d16c38 under the same T6000 match, or T8112 TEXT CRC 25bfd039, with the
+corresponding SoC identity. Boot, seven-channel discovery, Config,
 Open, Close and scratch-confirmed Halt are implemented from the clean derived
 SPEC-6070-lifecycle.md ledger. Start and ordinary Process writers implement the
 clean revision-2/P1 field ledgers: fixed-capacity address banks, split output

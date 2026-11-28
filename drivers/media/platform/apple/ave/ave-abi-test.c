@@ -1461,7 +1461,7 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t6000.device_type, 11U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.boot_arg_value, 0x400U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.timebase_multiplier, 1000000U);
-	KUNIT_EXPECT_EQ(test, ave_t6000.text_crc, 0x460c7a7cU);
+	KUNIT_EXPECT_EQ(test, ave_t6000.builds[0].text_crc, 0x460c7a7cU);
 	KUNIT_EXPECT_EQ(test, ave_t6000.mbox_idle, 0x38U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.boot_device_id, 18U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.device_type, 15U);
@@ -1634,6 +1634,150 @@ static void ave_t8112_26b123_build(struct kunit *test)
 }
 
 /*
+ * The probe's firmware gate: the segment sizes pick the build, and the TEXT
+ * identity CRC must be a known one that is that build's own.
+ */
+static void ave_fw_admit_gate(struct kunit *test)
+{
+	/* Two builds of the same sizes, told apart by their CRCs. */
+	static const struct ave_fw_build shared_builds[] = {
+		{ "a", 0x10000, 0x20000, 0x460c7a7c },
+		{ "b", 0x10000, 0x20000, 0x25bfd039 },
+	};
+	static const struct ave_variant shared = {
+		.builds = shared_builds,
+		.build_count = ARRAY_SIZE(shared_builds),
+		.boot_qualified = true,
+	};
+	const struct ave_variant *m2_272 = ave_t8112.next_build;
+	const struct ave_fw_build *b;
+
+	/* A variant without builds[] takes its own sizes and CRC only. */
+	b = shared_builds;
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x25bfd039, &b), 0);
+	KUNIT_EXPECT_NULL(test, b);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x460c7a7c, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x25bfd038, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x12c000,
+					   0x25bfd039, &b), -EINVAL);
+
+	/* Builds of the same sizes: the CRC picks one and must be one of them. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   0x25bfd039, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &shared_builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   0x460c7a7c, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &shared_builds[0]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   AVE_FW_TEXT_CRC_9003_78_0, &b), -ENODEV);
+
+	/* Each build's CRC only with its own sizes. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x158000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &ave_t6050.builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x154000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x158000, 0x130000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(m2_272, 0x11c000, 0x128000,
+					   AVE_FW_TEXT_CRC_T8112_26B123, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &m2_272->builds[0]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(m2_272, 0x11c000, 0x128000,
+					   0x25bfd039, &b), -ENODEV);
+
+	/* A build that names no CRC takes any known one, never another. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6041, 0x14c000, 0x130000,
+					   AVE_FW_TEXT_CRC_T6041_25G83, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &ave_t6041.builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6041, 0x14c000, 0x130000,
+					   0x9a080cac, &b), -ENODEV);
+
+	/* The probe-only M3 generation takes any sizes and CRC. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_m3, 0x134000, 0x128000,
+					   0x12345678, &b), 0);
+	KUNIT_EXPECT_NULL(test, b);
+}
+
+/*
+ * The M1 Max's encoder matches as the M1 Pro's and runs a larger build of
+ * the same firmware: its segment sizes pick that build, and only that
+ * build's CRC is admitted with them.
+ */
+static void ave_t6001_build(struct kunit *test)
+{
+	const u32 off = ave_t6000.text_link_cell, size = off + 0x100;
+	const struct ave_fw_build *pro, *max, *b;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, crc;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_ASSERT_EQ(test, ave_t6000.build_count, 2U);
+	pro = &ave_t6000.builds[0];
+	max = &ave_t6000.builds[1];
+	KUNIT_EXPECT_EQ(test, pro->text_size, 0xd0000U);
+	KUNIT_EXPECT_EQ(test, pro->data_size, 0x128000U);
+	KUNIT_EXPECT_EQ(test, max->text_size, 0xec000U);
+	KUNIT_EXPECT_EQ(test, max->data_size, 0x134000U);
+	KUNIT_EXPECT_EQ(test, max->text_crc, 0x65d16c38U);
+	/* No per-boot word: the CRCs match as they are. */
+	KUNIT_EXPECT_EQ(test, pro->text_boot_word, 0U);
+	KUNIT_EXPECT_EQ(test, max->text_boot_word, 0U);
+	/* One start for both: no later variant to select. */
+	KUNIT_EXPECT_NULL(test, ave_t6000.next_build);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t6000, 0xec000, 0x134000),
+			    &ave_t6000);
+
+	/* Each build with its own sizes and CRC. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xd0000, 0x128000,
+					   0x460c7a7c, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, pro);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xec000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6001_6070, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, max);
+	/* An image of the M1 Max's sizes with another CRC, a known one too. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xec000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6001_6070 ^ 1, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xec000, 0x134000,
+					   0x460c7a7c, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xec000, 0x134000,
+					   0x25bfd039, &b), -ENODEV);
+	/* The M1 Max's CRC with the M1 Pro's sizes. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xd0000, 0x128000,
+					   AVE_FW_TEXT_CRC_T6001_6070, &b), -ENODEV);
+	/* Mixed and other sizes pick no build. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xec000, 0x128000,
+					   AVE_FW_TEXT_CRC_T6001_6070, &b), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xd0000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6001_6070, &b), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6000, 0xf0000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6001_6070, &b), -EINVAL);
+
+	/*
+	 * DATA follows the M1 Max's larger TEXT, and the loader puts its
+	 * address in the link cell; the identity hashes the cell as zero.
+	 */
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 5 + 1;
+	memset(text + off, 0, 8);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+	put_unaligned_le64(max->text_size, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, max->text_size,
+						 &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
+	/* The M1 Pro's DATA address there is a different TEXT. */
+	put_unaligned_le64(pro->text_size, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, max->text_size,
+						 &crc), -ENODEV);
+
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6001_6070),
+			    &ave_layout_6070_11_1);
+	KUNIT_EXPECT_NULL(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6001_6070 ^ 1));
+}
+
+/*
  * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
  * comes with the IDR access unit; the B slice after it has two extra bits
  * before slice_type, and reads as an I slice if they are not skipped.
@@ -1747,6 +1891,8 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
 	KUNIT_CASE(ave_t8112_26b123_build),
+	KUNIT_CASE(ave_fw_admit_gate),
+	KUNIT_CASE(ave_t6001_build),
 	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };

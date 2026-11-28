@@ -48,6 +48,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T8132_26B123, /* encoder firmware macOS 27.2 26B123 / T8132 */
 	AVE_FW_TEXT_CRC_T8142_26B123, /* encoder firmware 9013.55.1, macOS 27.2 26B123 / T8142 */
 	0x460c7a7c, /* encoder firmware 6070.11.1 / T6000 */
+	AVE_FW_TEXT_CRC_T6001_6070, /* encoder firmware 6070.11.1 / T6001 */
 	0x25bfd039, /* encoder firmware 6070.11.1 / T8112 */
 };
 
@@ -262,15 +263,61 @@ const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
 }
 
 /*
+ * The first of the variant's builds with these segment sizes, or NULL for a
+ * variant without builds[]. -EINVAL when the variant pins other sizes; a
+ * probe-only variant that pins none takes any.
+ */
+static int ave_fw_size_build(const struct ave_variant *v, size_t text,
+			     size_t data, const struct ave_fw_build **build)
+{
+	*build = NULL;
+	if (v->build_count) {
+		*build = ave_fw_find_build(v, text, data, 0);
+		return *build ? 0 : -EINVAL;
+	}
+	if (!v->boot_qualified && !v->fw_text_size)
+		return 0;
+	return ave_fw_sizes_match(v, text, data) ? 0 : -EINVAL;
+}
+
+/*
+ * Whether firmware with these segment sizes and TEXT identity CRC is a
+ * build the variant admits, and which (NULL for a variant without builds[]).
+ * Of the builds sharing these sizes, the one with this CRC is picked. A
+ * boot-qualified variant needs a CRC in the known list that is also the
+ * picked build's, or without builds the variant's, unless that names none;
+ * a probe-only variant takes any CRC. Returns -EINVAL when no build has
+ * these sizes and -ENODEV when the CRC is not admitted.
+ */
+int ave_fw_admit(const struct ave_variant *v, size_t text, size_t data,
+		 u32 crc, const struct ave_fw_build **build)
+{
+	const struct ave_fw_build *b;
+	u32 want;
+	int ret;
+
+	ret = ave_fw_size_build(v, text, data, &b);
+	if (ret)
+		return ret;
+	if (b)
+		b = ave_fw_find_build(v, text, data, crc) ?: b;
+	want = b ? b->text_crc : v->text_crc;
+	if ((v->boot_qualified && !ave_fw_known_crc(crc)) ||
+	    (want && crc != want))
+		return -ENODEV;
+	*build = b;
+	return 0;
+}
+
+/*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
  */
 int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
-	const struct ave_fw_build *build = NULL;
-	u32 text_crc, data_crc, want, want_crc;
-	bool known;
+	const struct ave_fw_build *build;
+	u32 text_crc, data_crc, want;
 	int ret;
 
 	if (of_count_phandle_with_args(dev->of_node, "memory-region", NULL) !=
@@ -285,24 +332,12 @@ int ave_fw_probe(struct ave_dev *ave)
 
 	ave->variant = ave_fw_select_build(ave->variant, ave->text.size,
 					   ave->data.size);
-	want_crc = ave->variant->text_crc;
-	known = !ave->variant->boot_qualified;
-	if (ave->variant->build_count) {
-		build = ave_fw_find_build(ave->variant, ave->text.size,
-					  ave->data.size, 0);
-		if (!build)
-			return dev_err_probe(dev, -EINVAL,
-					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
-					     ave->text.size, ave->data.size);
-		want_crc = build->text_crc;
-	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
-		/* A probe-only variant that pins no build takes any segment sizes. */
-	} else if (!ave_fw_sizes_match(ave->variant, ave->text.size,
-				       ave->data.size)) {
-		return dev_err_probe(dev, -EINVAL,
+	ret = ave_fw_size_build(ave->variant, ave->text.size, ave->data.size,
+				&build);
+	if (ret)
+		return dev_err_probe(dev, ret,
 				     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
 				     ave->text.size, ave->data.size);
-	}
 	if ((ave->text.phys < ave->data.phys + ave->data.size &&
 	     ave->data.phys < ave->text.phys + ave->text.size) ||
 	    (ave->text.iova < ave->data.iova + ave->data.size &&
@@ -339,19 +374,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
-	known |= ave_fw_known_crc(text_crc);
-	if (build) {
-		const struct ave_fw_build *same_size =
-			ave_fw_find_build(ave->variant, ave->text.size,
-					  ave->data.size, text_crc);
-
-		if (same_size) {
-			build = same_size;
-			want_crc = build->text_crc;
-		}
-	}
-	if (!known || (want_crc && text_crc != want_crc))
-		return dev_err_probe(dev, -ENODEV,
+	ret = ave_fw_admit(ave->variant, ave->text.size, ave->data.size,
+			   text_crc, &build);
+	if (ret)
+		return dev_err_probe(dev, ret,
 				     "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
 	ave->text_crc = text_crc;
