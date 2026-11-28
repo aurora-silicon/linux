@@ -1249,6 +1249,7 @@ static void dcp_hdmi_capacity_available(void *ctx)
 {
 	dcp_typec_pipeline_freed();
 	dcp_typec_move_starved_locked();
+	dcp_fabric_hybrid_kick(ctx, 0);
 }
 
 /*
@@ -1281,6 +1282,63 @@ void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
 	dcp_fabric_hdmi_unplugged_locked(dcp);
 }
 
+static void dcp_hdmi_release_unplugged_locked(struct apple_dcp *dcp,
+					      const char *log_msg)
+{
+	bool connected;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+
+	if (dcp->active_typec_route)
+		return;
+
+	connected = dcp->connector && READ_ONCE(dcp->connector->connected);
+	if (!connected && !READ_ONCE(dcp->dptxport[0].connected))
+		return;
+
+	if (!dcp->hdmi_hpd || gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
+		return;
+
+	if (!connected) {
+		dcp_dptx_disconnect(dcp, 0);
+		return;
+	}
+
+	if (log_msg)
+		dev_info(dcp->dev, "%s\n", log_msg);
+	dcp_hdmi_disconnect(dcp);
+	dcp_fabric_hdmi_unplugged_locked(dcp);
+}
+
+/*
+ * Release a fixed HDMI link on system suspend when the display is gone or
+ * when a T6030 native output needs the link down for resume-side PHY and
+ * crossbar reinit. Hold the fabric lock across the ownership check, port
+ * release and presence update so a Type-C route cannot take the same DPTX
+ * port during the release.
+ */
+void dcp_hdmi_suspend(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	if (dcp->active_typec_route)
+		return;
+
+	if (dcp->external_native) {
+		bool unplugged = dcp->connector &&
+				 READ_ONCE(dcp->connector->connected) &&
+				 dcp->hdmi_hpd &&
+				 gpiod_get_value_cansleep(dcp->hdmi_hpd) == 0;
+
+		dcp_hdmi_disconnect(dcp);
+		if (unplugged)
+			dcp_fabric_hdmi_unplugged_locked(dcp);
+		return;
+	}
+
+	dcp_hdmi_release_unplugged_locked(dcp, NULL);
+}
+
 /*
  * Release a fixed HDMI link unplugged while its HPD IRQ was masked. Hold
  * the fabric lock from the ownership check through the presence update so
@@ -1290,14 +1348,7 @@ void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp_typec_fabric_lock);
 
-	if (dcp->active_typec_route || !dcp->connector ||
-	    !READ_ONCE(dcp->connector->connected) ||
-	    gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
-		return;
-
-	dev_info(dcp->dev, "HDMI display unplugged during sleep\n");
-	dcp_hdmi_disconnect(dcp);
-	dcp_fabric_hdmi_unplugged_locked(dcp);
+	dcp_hdmi_release_unplugged_locked(dcp, "HDMI display unplugged during sleep");
 }
 
 static void dcp_hdmi_settle_work(struct work_struct *work)

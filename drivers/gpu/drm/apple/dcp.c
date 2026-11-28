@@ -11509,12 +11509,7 @@ static int dcp_platform_suspend(struct device *dev)
 		 * its PHY and crossbar up again (dcp_fabric_hdmi_reinit()),
 		 * which needs the link down, so it is still released.
 		 */
-		if (!dcp->active_typec_route &&
-		    (dcp->external_native ||
-		     gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)) {
-			disconnected_hpd_event(dcp->connector);
-			dcp_dptx_disconnect(dcp, 0);
-		}
+		dcp_hdmi_suspend(dcp);
 	}
 	/*
 	 * Set the device as a wakeup device, which forces its power

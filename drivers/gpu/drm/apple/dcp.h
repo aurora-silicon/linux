@@ -204,6 +204,7 @@ bool apple_t8122_25g83_board(void);
 
 void dcp_typec_hybrid_first_dt(void);
 void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
+void dcp_hdmi_suspend(struct apple_dcp *dcp);
 void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp);
 void dcp_hdmi_disconnect(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
