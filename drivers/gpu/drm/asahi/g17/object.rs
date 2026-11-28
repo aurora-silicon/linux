@@ -12,6 +12,7 @@
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{
+    AtomicBool,
     AtomicU32,
     AtomicU64,
     Ordering, //
@@ -595,6 +596,31 @@ impl ReturnMark {
     }
 }
 
+/// Whether its owner handed the address of an unpooled object to the firmware. An owner whose
+/// accessors call [`Self::expose`] before any record, command or control message may name the
+/// object attaches one with [`PooledObject::defer_once_exposed`]. Until it is exposed nothing
+/// the firmware reads names the object, so when it is dropped it is unmapped at once instead
+/// of waiting for the control fence (`Pool::defer_object`): a queue created and closed without
+/// any work publishes no control record that would meet that fence. An unpooled object without
+/// one always waits for the fence.
+pub(crate) struct Exposure(AtomicBool);
+
+impl Exposure {
+    pub(crate) fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// The address is being handed to the firmware: a record, command or control message may
+    /// name the object from now on.
+    pub(crate) fn expose(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn exposed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 struct Retained {
     object: KernelObject,
     prefix: usize,
@@ -618,9 +644,19 @@ struct PoolInner {
     kept_bytes: usize,
     /// Kept objects still owned by their users, whose list entries are reserved.
     kept_reserved: usize,
+    /// Uncached objects their owner dropped, kept mapped until the firmware has met their
+    /// fence (see `Pool::defer_object`), with that fence.
+    deferred: KVec<(KernelObject, u64)>,
+    deferred_bytes: usize,
+    /// Uncached objects still owned by their users, whose list entries are reserved.
+    deferred_reserved: usize,
+    /// Uncached objects unmapped at their drop because their address never reached the
+    /// firmware ([`Exposure`]).
+    unexposed_freed: u64,
     /// Objects returned so far, ordering the reuse cache.
     returns: u64,
     /// Reuses that had to take an object whose fence the firmware had not met yet, per family.
+    /// Reuse waits for the fence, so this stays zero; the snapshot keeps the count.
     fence_overruns: [u64; POOL_FAMILIES],
     /// Fresh objects left uncached because their family had no room, per family.
     uncached: [u64; POOL_FAMILIES],
@@ -660,6 +696,10 @@ pub(crate) struct PooledObject {
     /// The pool keeping this object until firmware stop, and whether `reserve_kept` took its
     /// list entry.
     keep: Option<(kernel::sync::Arc<Pool>, bool)>,
+    /// The pool that keeps this uncached object mapped until its fence once it is dropped.
+    defer: Option<kernel::sync::Arc<Pool>>,
+    /// Whether the owner exposed this uncached object to the firmware; none counts as exposed.
+    exposure: Option<kernel::sync::Arc<Exposure>>,
 }
 
 impl core::ops::Deref for PooledObject {
@@ -685,6 +725,13 @@ impl PooledObject {
         }
     }
 
+    /// Its owner hands this object's address to the firmware only after `exposure.expose()`:
+    /// dropped uncached before that, it is unmapped at once (see [`Exposure`]). A cached object
+    /// keeps the fence its return decides.
+    pub(crate) fn defer_once_exposed(&mut self, exposure: &kernel::sync::Arc<Exposure>) {
+        self.exposure = Some(exposure.clone());
+    }
+
     /// The mark its owner keeps up to date, for a cached work state on the A18 Pro.
     pub(crate) fn return_mark(&self) -> Option<kernel::sync::Arc<ReturnMark>> {
         self.lease.as_ref().and_then(|lease| lease.mark.clone())
@@ -696,13 +743,21 @@ impl Drop for PooledObject {
         // SAFETY: This destructor is the only operation that moves `object`
         // out; ManuallyDrop prevents a second implicit drop of the field.
         let object = unsafe { core::mem::ManuallyDrop::take(&mut self.object) };
+        let defer = self.defer.take();
         if let Some((pool, reserved)) = self.keep.take() {
+            if let Some(defer) = &defer {
+                defer.cancel_deferred();
+            }
             pool.keep_object(object, self.lease.take(), reserved);
             return;
         }
-        match self.lease.take() {
-            Some(lease) => lease.pool.return_object(object, &lease),
-            None => drop(object),
+        match (self.lease.take(), defer) {
+            (Some(lease), _) => lease.pool.return_object(object, &lease),
+            // No cache slot: the firmware may follow the owner's pointers into this object
+            // exactly as into a cached one, so it stays mapped until the same fence, unless
+            // its address never reached the firmware.
+            (None, Some(pool)) => pool.defer_object(object, self.exposure.take()),
+            (None, None) => drop(object),
         }
     }
 }
@@ -717,7 +772,8 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: [0; POOL_FAMILIES],
+                    kept_bytes: 0, kept_reserved: 0, deferred: KVec::new(), deferred_bytes: 0,
+                    deferred_reserved: 0, unexposed_freed: 0, returns: 0, fence_overruns: [0; POOL_FAMILIES],
                     uncached: [0; POOL_FAMILIES], work_returns: [0; 3],
                 }, "g17::object::Pool"),
                 after_release,
@@ -734,10 +790,10 @@ impl Pool {
     ///
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
-    /// returned longest ago once its fence is met (see `return_object`); a younger one is
-    /// reused only when the family has no room for a fresh pooled object, because an
-    /// unpooled one is unmapped as soon as its owner drops it. On the A18 Pro a work state is
-    /// never reused before its fence: with no room, a fresh one stays unpooled instead.
+    /// returned longest ago once its fence is met (see `return_object`), and never one whose
+    /// fence is not met. With no room for a fresh pooled object, a fresh one stays unpooled;
+    /// its drop keeps it mapped until the fence too, once its address reached the firmware
+    /// (see `defer_object`).
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -750,6 +806,7 @@ impl Pool {
         let family_index = family as usize;
         let begin = family_index * POOL_SLOTS;
         let witnessed = super::channel::control_witnessed();
+        self.reap_deferred(witnessed);
         // On the A18 Pro a cached work state carries a ReturnMark, allocated before an entry is
         // taken so that a failure loses no returned object, and is never reused before its fence.
         let marked = self.after_release && family == Family::WorkState;
@@ -763,8 +820,6 @@ impl Pool {
             if inner.stopped {
                 return Err(ENODEV);
             }
-            let room = inner.reserved[family_index] < POOL_SLOTS
-                && inner.bytes.checked_add(size).is_some_and(|bytes| bytes <= POOL_BYTES);
             let mut oldest: Option<(usize, u64, bool)> = None;
             for (index, entry) in inner.returned[begin..begin + POOL_SLOTS].iter().enumerate() {
                 let Some(entry) = entry.as_ref().filter(|entry| {
@@ -783,12 +838,7 @@ impl Pool {
                 }
             }
             match oldest {
-                Some((index, _, ready)) if ready || (!room && !marked) => {
-                    if !ready {
-                        inner.fence_overruns[family_index] += 1;
-                    }
-                    inner.returned[index].take()
-                }
+                Some((index, _, true)) => inner.returned[index].take(),
                 _ => None,
             }
         };
@@ -807,6 +857,8 @@ impl Pool {
                 object: core::mem::ManuallyDrop::new(entry.object),
                 lease: Some(lease()),
                 keep: None,
+                exposure: None,
+                defer: None,
             });
         }
         let object = alloc.kernel(size, mmu::UAT_PGSZ as u64, prot, cpu)?;
@@ -833,8 +885,13 @@ impl Pool {
             object: core::mem::ManuallyDrop::new(object),
             lease: reserved.then(lease),
             keep: None,
+            exposure: None,
+            defer: None,
         };
         if !reserved {
+            // Nothing names the object yet: a failed reservation just frees it.
+            self.reserve_deferred()?;
+            result.defer = Some(self.clone());
             return Ok(result);
         }
         if prefix == 0 {
@@ -858,9 +915,13 @@ impl Pool {
             }
             Err(_) => {
                 result.lease = None;
-                let mut inner = self.inner.lock();
-                inner.reserved[family_index] -= 1;
-                inner.bytes -= size;
+                {
+                    let mut inner = self.inner.lock();
+                    inner.reserved[family_index] -= 1;
+                    inner.bytes -= size;
+                }
+                self.reserve_deferred()?;
+                result.defer = Some(self.clone());
                 Ok(result)
             }
         }
@@ -915,6 +976,83 @@ impl Pool {
         // object the firmware may still hold in that failure case.
         pr_err!("G17 cached-object return capacity was lost\n");
         core::mem::forget(object);
+    }
+
+    /// Room for one more deferred object, taken by the matching `defer_object` or given back
+    /// by `cancel_deferred`, so that the drop does not allocate.
+    fn reserve_deferred(&self) -> Result {
+        let mut inner = self.inner.lock();
+        if inner.stopped {
+            return Err(ENODEV);
+        }
+        let pending = inner.deferred_reserved + 1;
+        if inner.deferred.capacity() - inner.deferred.len() < pending {
+            inner.deferred.reserve(pending, GFP_KERNEL)?;
+        }
+        inner.deferred_reserved = pending;
+        Ok(())
+    }
+
+    fn cancel_deferred(&self) {
+        let mut inner = self.inner.lock();
+        inner.deferred_reserved = inner.deferred_reserved.saturating_sub(1);
+    }
+
+    /// An uncached object came back. It has no slot in the reuse cache, but the firmware may
+    /// still follow its previous owner's pointers into it like into a cached one: keep it
+    /// mapped until the strict fence, then unmap it (`reap_deferred`). One whose owner never
+    /// exposed it (`exposure`, see [`Exposure`]) is named by nothing the firmware reads and is
+    /// unmapped at once, so that the list grows only with objects the firmware saw.
+    fn defer_object(&self, object: KernelObject, exposure: Option<kernel::sync::Arc<Exposure>>) {
+        let unexposed = exposure.as_deref().is_some_and(|exposure| !exposure.exposed());
+        let mut inner = self.inner.lock();
+        inner.deferred_reserved = inner.deferred_reserved.saturating_sub(1);
+        if inner.stopped || unexposed {
+            if unexposed {
+                inner.unexposed_freed += 1;
+            }
+            // Mapping teardown must not run while the pool mutex is held.
+            drop(inner);
+            drop(object);
+            return;
+        }
+        let fence = super::channel::control_fence();
+        let size = object.size();
+        if inner.deferred.len() == KEPT_WARN {
+            kernel::pr_warn_once!(
+                "G17 keeps {} uncached firmware objects until their control fence\n",
+                KEPT_WARN
+            );
+        }
+        // reserve_deferred reserved the entry; this never allocates.
+        match inner.deferred.push_within_capacity((object, fence)) {
+            Ok(()) => inner.deferred_bytes += size,
+            Err(error) => {
+                // Never unmap an object the firmware may still reference.
+                pr_err!("G17 could not record an uncached firmware object; leaking it\n");
+                core::mem::forget(error.0);
+            }
+        }
+        drop(inner);
+        self.reap_deferred(super::channel::control_witnessed());
+    }
+
+    /// Unmaps the deferred objects whose fence the firmware has met.
+    fn reap_deferred(&self, witnessed: u64) {
+        loop {
+            let entry = {
+                let mut inner = self.inner.lock();
+                let Some(index) = inner.deferred.iter().position(|(_, fence)| *fence <= witnessed)
+                else {
+                    return;
+                };
+                let entry = inner.deferred.swap_remove(index);
+                inner.deferred_bytes -= entry.0.size();
+                entry
+            };
+            // Mapping teardown must not run while the pool mutex is held.
+            drop(entry);
+        }
     }
 
     /// Room for one more kept object, taken by the matching `keep_object`. Returns whether
@@ -974,7 +1112,8 @@ impl Pool {
             let mut inner = self.inner.lock();
             inner.stopped = true;
             inner.kept_bytes = 0;
-            core::mem::take(&mut inner.kept)
+            inner.deferred_bytes = 0;
+            (core::mem::take(&mut inner.kept), core::mem::take(&mut inner.deferred))
         };
         // Mapping teardown must not run while the pool mutex is held.
         drop(kept);
@@ -1014,6 +1153,8 @@ impl Pool {
         writeln!(f, "workstate_returns unseen={} released={} strict={}",
                  inner.work_returns[RETURN_UNSEEN], inner.work_returns[RETURN_RELEASED],
                  inner.work_returns[RETURN_STRICT])?;
-        writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
+        writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)?;
+        writeln!(f, "uncached_objects_fenced waiting={} bytes={} unexposed_freed={}", inner.deferred.len(),
+                 inner.deferred_bytes, inner.unexposed_freed)
     }
 }

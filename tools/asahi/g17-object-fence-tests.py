@@ -10,11 +10,19 @@ this is not GPU execution. Checks:
 - A18 Pro (`after_release`): a work state its context never exposed comes back
   with fence 0; one whose owner's release was consumed with an empty work list
   comes back with that witness; one a record or command may name, or that a
-  retained queue record named, keeps `control_fence()`. A full work-state
-  family with only waiting entries hands out an uncached object instead of
-  reusing one, and counts it.
+  retained queue record named, keeps `control_fence()`.
+- Every family on every GPU: a returned object is never reused before its
+  fence. A full family with only waiting entries hands out an uncached object
+  instead, and counts it. An uncached object stays mapped after its owner drops
+  it until the firmware has met `control_fence()`, and is unmapped after that
+  or at firmware stop, never earlier.
+- A context's uncached work state (and M5 scheduler page) whose address never
+  reached the firmware is unmapped at its drop: creating and closing queues
+  without submitting does not grow the deferred list, while one exposed by a
+  queue record, a command or publication still waits for its fence.
 - Without `after_release` (M4, M5) every decision, and the snapshot counts,
-  match the pool before linux#1978 (BASE) on the same random operations.
+  match the pool before linux#1978 (BASE) on the same random operations, with
+  BASE's reuse limited to met fences.
 - Source rules: every accessor that hands the address to the firmware marks it,
   and only the release path of `retain_linked_work` marks it released.
 - Cache policy (linux#3170 and its G17P follow-up): records the host rewrites
@@ -39,8 +47,23 @@ DRIVER = ROOT / 'drivers/gpu/drm/asahi'
 BASE = 'fc050503ffcd1032cd1590fb30252eb5a722a5a5'
 
 MUTATIONS = {
-    # Work states may overrun a fence again when their family is full.
-    'overrun-work-states': ('object', 'if ready || (!room && !marked) => {', 'if ready || !room => {'),
+    # A full family reuses its oldest waiting entry again.
+    'overrun-full-family': ('object', 'Some((index, _, true)) => inner.returned[index].take(),',
+                            'Some((index, _, _)) => inner.returned[index].take(),'),
+    # An uncached object is unmapped as soon as its owner drops it.
+    'unmap-uncached': ('object', '(None, Some(pool)) => pool.defer_object(object, self.exposure.take()),',
+                       '(None, Some(_)) => drop(object),'),
+    # An uncached object nobody exposed is deferred anyway (linux#2959 review: unbounded list).
+    'defer-unexposed': ('object', 'let unexposed = exposure.as_deref().is_some_and(|exposure| !exposure.exposed());',
+                        'let unexposed = false;'),
+    # Handing out the work-list head does not count as exposure.
+    'unexposed-head': ('context', '        self.exposure.expose();\n        if let Some(mark) = &self.work_mark {',
+                       '        if let Some(mark) = &self.work_mark {'),
+    # A deferred object is unmapped one control record early.
+    'reap-early': ('object', '.position(|(_, fence)| *fence <= witnessed)', '.position(|(_, fence)| *fence <= witnessed + 1)'),
+    # Firmware stop leaves deferred objects mapped.
+    'stop-keeps-deferred': ('object', '(core::mem::take(&mut inner.kept), core::mem::take(&mut inner.deferred))',
+                            '(core::mem::take(&mut inner.kept), KVec::<(KernelObject, u64)>::new())'),
     # An unseen work state keeps the strict fence.
     'unseen-strict': ('object', 'Self::UNSEEN => (RETURN_UNSEEN, 0),',
                       'Self::UNSEEN => (RETURN_UNSEEN, super::channel::control_fence()),'),
@@ -120,10 +143,12 @@ impl From<AllocError> for Error { fn from(_: AllocError) -> Error { ENOMEM } }
 pub const GFP_KERNEL: Flags = Flags;
 macro_rules! pr_err { ($($t:tt)*) => { eprintln!($($t)*) } }
 macro_rules! pr_warn { ($($t:tt)*) => { eprintln!($($t)*) } }
+macro_rules! pr_warn_once_stub { ($($t:tt)*) => { eprintln!($($t)*) } }
 macro_rules! new_mutex_stub { ($value:expr, $name:expr $(,)?) => { $crate::kernel::sync::Mutex::new($value) } }
 
 pub mod kernel {
     pub(crate) use new_mutex_stub as new_mutex;
+    pub(crate) use pr_warn_once_stub as pr_warn_once;
     pub mod sync {
         pub type Arc<T> = std::sync::Arc<T>;
         pub fn arc_new<T>(value: T, _: crate::Flags) -> core::result::Result<Arc<T>, crate::AllocError> {
@@ -170,6 +195,8 @@ pub mod mmu {
 thread_local! {
     /// Objects whose mapping was torn down, in order.
     pub static UNMAPPED: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    /// The control-ring witness when each object was unmapped, and whether the pool was stopped.
+    pub static UNMAPPED_AT: RefCell<std::collections::HashMap<u64, u64>> = RefCell::new(Default::default());
 }
 
 /// A firmware object: `id` is unique per allocation, the mapping is its address.
@@ -180,11 +207,19 @@ impl KernelObject {
     pub fn gpu_va(&self) -> u64 { self.mapping.as_ref().map_or(0, |m| m.iova) }
 }
 impl Drop for KernelObject {
-    fn drop(&mut self) { UNMAPPED.with(|u| u.borrow_mut().push(self.id)); }
+    fn drop(&mut self) {
+        UNMAPPED.with(|u| u.borrow_mut().push(self.id));
+        UNMAPPED_AT.with(|u| u.borrow_mut().insert(self.id, crate::channel::control_witnessed()));
+    }
 }
 pub fn unmapped(id: u64) -> bool { UNMAPPED.with(|u| u.borrow().contains(&id)) }
 /// Starts a scenario: objects of earlier ones, which reuse the same ids, no longer count.
-pub fn forget_unmapped() { UNMAPPED.with(|u| u.borrow_mut().clear()) }
+pub fn forget_unmapped() {
+    UNMAPPED.with(|u| u.borrow_mut().clear());
+    UNMAPPED_AT.with(|u| u.borrow_mut().clear());
+}
+/// The control-ring witness when `id` was unmapped.
+pub fn unmapped_at(id: u64) -> Option<u64> { UNMAPPED_AT.with(|u| u.borrow().get(&id).copied()) }
 
 pub struct Allocator<'a> { pub next: &'a Cell<u64> }
 impl Allocator<'_> {
@@ -343,7 +378,7 @@ pub mod base {
 
 pub mod now {
     use super::*;
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 @NOW@
     driver!(|after_release| Pool::new(after_release).unwrap(), |object: &PooledObject, op: &crate::Op| {
         // Without after_release there is no mark: the context's updates change nothing.
@@ -503,66 +538,112 @@ pub mod now {
         println!("return classes: unseen 0, released at its witness, exposed or retained control_fence()");
     }
 
-    /// A full work-state family whose returned entries all wait leaves a new one uncached on
-    /// the A18 Pro, and overruns the oldest without after_release, as before.
+    /// A full family whose returned entries all wait leaves a new object uncached instead of
+    /// reusing one, on every GPU. Its owner's drop keeps it mapped until `control_fence()`.
     pub fn full_family() {
         for after_release in [true, false] {
+            for family in [Family::WorkState, Family::Descriptor] {
+                let what = format!("{family:?}, after_release {after_release}");
+                let line = format!("cached_objects_{} ", family as usize);
+                let next = Cell::new(1);
+                let alloc = Allocator { next: &next };
+                let pool = Pool::new(after_release).unwrap();
+                let get = || match family {
+                    Family::WorkState => work_state(&pool, &alloc),
+                    _ => descriptor(&pool, &alloc),
+                };
+                crate::forget_unmapped();
+                crate::channel::set(10, 7);
+                let mut live: Vec<_> = (0..POOL_SLOTS).map(|_| get()).collect();
+                assert!(live.iter().all(|o| o.lease.is_some()));
+                for object in &live {
+                    if let Some(mark) = object.return_mark() { mark.expose(); }
+                }
+                let waiting: Vec<_> = live.drain(..POOL_SLOTS / 2).collect();
+                drop(waiting);
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, &line, "waiting="), 32, "{what}\n{s}");
+                assert_eq!(crate::count(&s, &line, "used="), 64, "{what}\n{s}");
+
+                // No room and no met fence: a fresh object, uncached, never an overrun.
+                let object = get();
+                let s = snapshot(&pool);
+                assert!(object.lease.is_none(), "{what}: a waiting entry was reused before its fence");
+                assert_eq!(object.id, 65, "{what}");
+                assert_eq!(crate::count(&s, &line, "overruns="), 0, "{what}\n{s}");
+                assert_eq!(crate::count(&s, &line, "uncached="), 1, "{what}\n{s}");
+                assert_eq!(crate::count(&s, &line, "returned="), 32, "{what}\n{s}");
+                assert!(object.return_mark().is_none(), "an uncached work state has no mark");
+                let (id, size) = (object.id, object.size());
+                drop(object);
+                assert!(!unmapped(id), "{what}: an uncached object was unmapped before its fence");
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), 1, "{what}\n{s}");
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "bytes="), size as u64, "{what}\n{s}");
+
+                // Still no progress: another uncached object, the first one stays mapped.
+                let second = get();
+                assert!(second.lease.is_none() && second.id == 66, "{what}");
+                assert!(!unmapped(id), "{what}: unmapped before its fence");
+                // Every record consumed but not the one after the drop: still mapped.
+                crate::channel::set(10, 10);
+                let third = get();
+                if family == Family::Descriptor && after_release {
+                    // A18 Pro descriptors wait for control_published() only: reused now.
+                    assert!(third.lease.is_some(), "{what}");
+                } else {
+                    assert!(third.lease.is_none(), "{what}");
+                }
+                drop(third);
+                assert!(!unmapped(id), "{what}: unmapped one record before its fence");
+                // The next record is consumed: the next allocation unmaps it, and reuses.
+                crate::channel::set(11, 11);
+                let reused = get();
+                assert!(reused.lease.is_some(), "{what}: a met fence is reused in a full family");
+                assert!(unmapped(id), "{what}: a met fence unmaps the uncached object");
+                assert!(crate::unmapped_at(id).unwrap() >= 11, "{what}: unmapped before its fence");
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, &line, "overruns="), 0, "{what}\n{s}");
+
+                // Firmware stop unmaps what still waits; later drops unmap at once.
+                let id = second.id;
+                drop(second);
+                assert!(!unmapped(id), "{what}");
+                pool.stop_after_firmware();
+                assert!(unmapped(id), "{what}: firmware stop releases deferred objects");
+                assert_eq!(crate::count(&snapshot(&pool), "uncached_objects_fenced", "waiting="), 0);
+                drop((reused, live));
+                if !after_release {
+                    assert_eq!(returns(&pool), [0, 0, 0], "work-state classes are counted on the A18 Pro only");
+                }
+            }
+
+            // An uncached object kept until stop leaves the deferred list alone.
             let next = Cell::new(1);
             let alloc = Allocator { next: &next };
             let pool = Pool::new(after_release).unwrap();
             crate::forget_unmapped();
             crate::channel::set(10, 7);
-            let mut live: Vec<_> = (0..POOL_SLOTS).map(|_| work_state(&pool, &alloc)).collect();
-            assert!(live.iter().all(|o| o.lease.is_some()));
-            for object in &live {
-                if let Some(mark) = object.return_mark() { mark.expose(); }
-            }
-            let waiting: Vec<_> = live.drain(..POOL_SLOTS / 2).collect();
-            let oldest = waiting[0].id;
-            drop(waiting);
+            let live: Vec<_> = (0..POOL_SLOTS).map(|_| descriptor(&pool, &alloc)).collect();
+            let mut kept = descriptor(&pool, &alloc);
+            let late = descriptor(&pool, &alloc);
+            assert!(kept.lease.is_none() && late.lease.is_none());
+            kept.retain_until_stop(&pool);
+            let id = kept.id;
+            drop(kept);
+            crate::channel::set(20, 20);
+            drop(descriptor(&pool, &alloc));
             let s = snapshot(&pool);
-            assert_eq!(crate::count(&s, "cached_objects_1 ", "waiting="), 32, "{s}");
-            assert_eq!(crate::count(&s, "cached_objects_1 ", "used="), 64, "{s}");
-            let object = work_state(&pool, &alloc);
-            let s = snapshot(&pool);
-            if after_release {
-                assert!(object.lease.is_none(), "an A18 Pro work state is not reused before its fence");
-                assert_eq!(object.id, 65);
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 0, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), 1, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "returned="), 32, "{s}");
-                assert!(object.return_mark().is_none(), "an uncached work state has no mark");
-                let id = object.id;
-                drop(object);
-                assert!(unmapped(id), "an uncached object is unmapped when dropped");
-                assert_eq!(crate::count(&snapshot(&pool), "cached_objects_1 ", "returned="), 32);
-                // An entry whose fence is met is still reused when the family is full.
-                let ready = live.pop().unwrap();
-                ready.return_mark().unwrap().released(7);
-                let id = ready.id;
-                drop(ready);
-                assert_eq!(work_state(&pool, &alloc).id, id, "a met fence is reused in a full family");
-            } else {
-                assert!(object.lease.is_some());
-                assert_eq!(object.id, oldest, "without after_release the oldest waiting object is overrun");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 1, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), 0, "{s}");
-                assert_eq!(returns(&pool), [0, 0, 0], "work-state classes are counted on the A18 Pro only");
-            }
+            assert!(!unmapped(id), "a kept object is unmapped only at stop");
+            assert_eq!(crate::count(&s, "firmware_linked_objects", "kept="), 1, "{s}");
+            pool.stop_after_firmware();
+            assert!(unmapped(id));
+            let id = late.id;
+            drop(late);
+            assert!(unmapped(id), "after firmware stop an uncached object is unmapped at once");
+            drop(live);
         }
-        // Descriptors on the A18 Pro still overrun in a full family, as #1978 left them.
-        let next = Cell::new(1);
-        let alloc = Allocator { next: &next };
-        let pool = Pool::new(true).unwrap();
-        crate::channel::set(10, 7);
-        let mut live: Vec<_> = (0..POOL_SLOTS).map(|_| descriptor(&pool, &alloc)).collect();
-        let returned: Vec<_> = live.drain(..POOL_SLOTS / 2).collect();
-        let oldest = returned[0].id;
-        drop(returned);
-        assert_eq!(descriptor(&pool, &alloc).id, oldest, "a full descriptor family overruns its oldest entry");
-        let s = snapshot(&pool);
-        assert_eq!(crate::count(&s, "cached_objects_0 ", "overruns="), 1, "{s}");
-        println!("full family: A18 Pro work states are left uncached and counted, never overrun; others unchanged");
+        println!("full family: no family reuses a waiting entry; uncached objects stay mapped until control_fence() or stop");
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -581,7 +662,17 @@ pub mod now {
         let mut expected = std::collections::HashMap::new();
         let mut classes = [0u64; 3];
         let mut uncached = 0;
+        // Uncached objects their owner dropped, with the fence they must stay mapped for.
+        let mut deferred: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut reaped = 0;
         for _ in 0..steps {
+            for (id, fence) in deferred.clone() {
+                if let Some(at) = crate::unmapped_at(id) {
+                    assert!(at >= fence, "uncached object {id} unmapped at {at} before its fence {fence}");
+                    deferred.remove(&id);
+                    reaped += 1;
+                }
+            }
             let witnessed = crate::channel::control_witnessed();
             // Allocations outnumber drops below a full family and the reverse above it.
             let roll = rng.below(100);
@@ -622,7 +713,8 @@ pub mod now {
                         assert_eq!(self::fence(&pool, Family::WorkState, id), Some(fence), "{mark:?}");
                         expected.insert(id, fence);
                     } else {
-                        assert!(unmapped(id));
+                        assert!(!unmapped(id), "an uncached work state was unmapped before its fence");
+                        deferred.insert(id, published + 1);
                     }
                 }
                 55..=74 if !work.is_empty() => {
@@ -649,6 +741,9 @@ pub mod now {
                         drop(object);
                         if cached {
                             assert_eq!(fence(&pool, Family::Descriptor, id), Some(published));
+                        } else {
+                            assert!(!unmapped(id), "an uncached descriptor was unmapped before its fence");
+                            deferred.insert(id, published + 1);
                         }
                     }
                 }
@@ -660,7 +755,11 @@ pub mod now {
         assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 0, "{s}");
         assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), uncached, "{s}");
         assert_eq!(returns(&pool), classes, "{s}");
-        println!("model seed {seed}: classes unseen/released/strict {classes:?}, uncached {uncached}, overruns 0");
+        assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), deferred.len() as u64, "{s}");
+        pool.stop_after_firmware();
+        assert!(deferred.keys().all(|&id| unmapped(id)), "firmware stop leaves deferred objects mapped");
+        println!("model seed {seed}: classes unseen/released/strict {classes:?}, uncached {uncached}, \
+                  reaped after fence {reaped}, overruns 0");
     }
 
     /// The context accessors, compiled from context.rs, against the pool above.
@@ -680,6 +779,7 @@ pub mod now {
             work: Arc<Mutex<WorkStorage>>,
             work_base: u64,
             work_mark: Option<Arc<ReturnMark>>,
+            exposure: Arc<Exposure>,
             scheduler: Arc<SchedulerStorage>,
             hold: Arc<mmu::ContextHold>,
             qos: Arc<QosLease>,
@@ -697,10 +797,12 @@ pub mod now {
         }
 
         fn new_context(pool: &kernel::sync::Arc<Pool>, alloc: &Allocator<'_>) -> (Arc<Context>, u64) {
-            let object = super::work_state(pool, alloc);
+            let mut object = super::work_state(pool, alloc);
+            let exposure = Arc::new(Exposure::new());
+            object.defer_once_exposed(&exposure);
             let (id, work_base, work_mark) = (object.id, object.gpu_va(), object.return_mark());
             let context = Arc::new(Context {
-                work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark,
+                work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark, exposure,
                 scheduler: Arc::new(SchedulerStorage), hold: Arc::new(mmu::ContextHold), qos: Arc::new(QosLease),
                 head: Cell::new([0, work_base + (UAT_PGSZ + 0x400) as u64]),
             });
@@ -767,6 +869,64 @@ pub mod now {
             }
             println!("context: records, commands and retained records mark the work state; a consumed release with an empty list releases it");
         }
+
+        /// Queues created and closed without work publish no control record, so the control
+        /// fence never moves. Once the work-state family is full of objects waiting for it,
+        /// each further context gets an uncached work state: one never exposed is unmapped at
+        /// once and the deferred list does not grow; one a record or a command exposed still
+        /// waits for the fence.
+        pub fn create_close_loop() {
+            for after_release in [true, false] {
+                let what = format!("after_release {after_release}");
+                let next = Cell::new(1);
+                let alloc = Allocator { next: &next };
+                let pool = Pool::new(after_release).unwrap();
+                crate::forget_unmapped();
+                crate::channel::set(10, 7);
+                // Fill the family with work states a queue record exposed and nothing released.
+                let exposed: Vec<_> = (0..POOL_SLOTS).map(|_| new_context(&pool, &alloc)).collect();
+                for (context, _) in &exposed {
+                    let _ = context.work_head_va();
+                }
+                drop(exposed);
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "cached_objects_1 ", "waiting="), POOL_SLOTS as u64, "{what}\n{s}");
+
+                // The loop: create, compare the head (no exposure), close.
+                for round in 0..4096u64 {
+                    let (context, id) = new_context(&pool, &alloc);
+                    assert!(context.work.lock().object.lease.is_none(), "{what}: full family, uncached");
+                    assert_eq!(context.work_head_address(), context.work_base + 0x4400);
+                    drop(context);
+                    assert!(unmapped(id), "{what}: round {round}: an unexposed work state waits for a fence");
+                }
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), 0, "{what}\n{s}");
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "bytes="), 0, "{what}\n{s}");
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "unexposed_freed="), 4096, "{what}\n{s}");
+                assert_eq!(pool.inner.lock().deferred_reserved, 0, "{what}: no reservation is left behind");
+
+                // A queue record names the head: it waits for the fence like any uncached object.
+                let (context, id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                drop(context);
+                assert!(!unmapped(id), "{what}: an exposed uncached work state was unmapped before its fence");
+                // A command names a node of another: the same.
+                let (context, node_id) = new_context(&pool, &alloc);
+                let lease = WorkStateLease { context: context.clone(), word: 5.into() };
+                let _ = lease.node_va().unwrap();
+                drop((lease, context));
+                assert!(!unmapped(node_id), "{what}: a command's uncached work state was unmapped early");
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), 2, "{what}\n{s}");
+                // The fence is met: the next allocation unmaps both.
+                crate::channel::set(11, 11);
+                drop(new_context(&pool, &alloc));
+                assert!(unmapped(id) && unmapped(node_id), "{what}: unmapped once the fence is met");
+                assert_eq!(crate::count(&snapshot(&pool), "uncached_objects_fenced", "waiting="), 0);
+            }
+            println!("context: 4096 queue create/close cycles without work leave no deferred object; exposed ones wait for the fence");
+        }
     }
 }
 
@@ -784,13 +944,15 @@ fn main() {
         uncached += trace.iter().filter(|line| line.ends_with("cached=false")).count();
         overruns += count(trace.last().unwrap(), "cached_objects_fenced", "overruns=");
     }
-    assert!(uncached > 0 && overruns > 0, "the traces must fill families");
+    assert!(uncached > 0, "the traces must fill families");
+    assert_eq!(overruns, 0, "a reuse before its fence");
     println!("differential: without after_release, 24 random traces match the pool before linux#1978 \
-              ({allocations} allocations, {uncached} uncached, {overruns} overruns)");
+              with reuse limited to met fences ({allocations} allocations, {uncached} uncached, 0 overruns)");
     for seed in 1..=24u64 {
         now::model(seed.wrapping_mul(0x2545_f491_4f6c_dd1d), 6000);
     }
     now::context::accessors();
+    now::context::create_close_loop();
 }
 '''
 
@@ -827,6 +989,16 @@ def source_rules(context, observation, tree):
         assert ('== [0, ' in line or '!= [0, ' in line or line.startswith('must_retain(')
                 or line == 'self.work_head_address()'), (name, line)
     assert len(users) == 4, users
+    # Whatever may hand an address of the context's pages to the firmware exposes them: the
+    # work storage's accessors (above), the scheduler page's only address reader, publication.
+    assert context.count('scheduler.gpu_va()') == 1, context.count('scheduler.gpu_va()')
+    assert 'self.exposure.expose();' in block(context, '    pub(crate) fn scheduler_va(')
+    assert 'self.exposure.expose();' in block(context, '    fn expose_work(')
+    assert 'self.exposure.expose();' in block(context, '    pub(crate) fn mark_published(')
+    assert context.count('object.defer_once_exposed(&exposure);') == 2
+    for path in sorted(tree.rglob('*.rs')):
+        text = path.read_text()
+        assert not re.search(r'scheduler_owner\(\)[^;]*gpu_va', text), path
     assert 'job_list_empty: head == [0, memory.context.work_head_address()],' in observation
     print('source: records and commands mark the work state; only a consumed empty-list release releases it')
 
@@ -866,8 +1038,10 @@ def main():
     ctx = (DRIVER / 'g17/context.rs').read_text()
     chan = (DRIVER / 'g17/channel.rs').read_text()
     observation = (DRIVER / 'g17/queue/render/observation.rs').read_text()
-    base = subprocess.run(['git', '-C', str(ROOT), 'show', f'{BASE}:drivers/gpu/drm/asahi/g17/object.rs'],
+    base_text = subprocess.run(['git', '-C', str(ROOT), 'show', f'{BASE}:drivers/gpu/drm/asahi/g17/object.rs'],
                           check=True, capture_output=True, text=True).stdout
+    # BASE's decisions with reuse limited to met fences: a full family never overruns.
+    base = replace(base_text, 'Some((index, _, ready)) if ready || !room => {', 'Some((index, _, ready)) if ready => {')
     source_rules(ctx, observation, DRIVER)
 
     policy = {'context': ctx, 'compute': (DRIVER / 'g17/queue/compute.rs').read_text(),
