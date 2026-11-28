@@ -1282,7 +1282,10 @@ static void atcphy_test_t8132_rpm_busy(struct kunit *test)
 }
 
 #ifdef CONFIG_SUSPEND
-/* An epoch with a host survives suspend-to-idle only; without one, or incomplete, never. */
+/*
+ * An epoch with DWC3 running, or in CIO mode with the domain held, survives
+ * suspend-to-idle only; without either, or incomplete, never.
+ */
 static void atcphy_test_t8132_system_suspend(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
@@ -1297,12 +1300,14 @@ static void atcphy_test_t8132_system_suspend(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
 	atcphy->mode_dirty = false;
 
-	/* Without a host, as in a USB3 device role, nothing holds the domain */
+	/* With DWC3 held in reset, nothing holds the domain */
 	atcphy->t8132_common_owned = true;
 	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
 	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
 
+	/* A running DWC3 does, as a host or as a device */
 	atcphy->host_active = true;
+	atcphy->dwc3_running = true;
 	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
 	KUNIT_EXPECT_TRUE(test, atcphy->t8132_suspended);
 	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
@@ -1311,6 +1316,29 @@ static void atcphy_test_t8132_system_suspend(struct kunit *test)
 	pm_suspend_target_state = PM_SUSPEND_MEM;
 	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
 	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	/* In CIO mode, without DWC3, only a held domain survives suspend-to-idle */
+	atcphy->host_active = false;
+	atcphy->dwc3_running = false;
+	atcphy->mode = APPLE_ATCPHY_MODE_USB4;
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->pd_hold_sleep);
+
+	/* Only the pointer is used: a held domain is never given up to genpd */
+	atcphy->pd_hold = atcphy->dev;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->pd_hold_sleep);
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy_pd_hold_release(atcphy);
+	KUNIT_EXPECT_FALSE(test, atcphy->pd_hold_released);
+	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+	KUNIT_EXPECT_FALSE(test, atcphy->pd_hold_sleep);
+
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->pd_hold_sleep);
 
 	pm_suspend_target_state = target;
 }

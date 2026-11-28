@@ -100,7 +100,7 @@ struct apple_atcphy {
     enum atcphy_pipehandler_state pipe_state;
     enum atcphy_mode typec_mode;
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
-    bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, fixed_usb3, t8140_dp_tunables, dp_tunables;
+    bool host_active, dwc3_running, usb3_port_off, dp_only, ss_tunables, fixed_usb2, fixed_usb3, t8140_dp_tunables, dp_tunables;
     /* T8132 ownership is tested without entering its lane-setup backend. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     /* T8132: SuperSpeed device mode is not supported by this driver; keep USB2. */
@@ -402,16 +402,16 @@ static void fixed_hub_host_dispatch(void) {
 static void reset_release_retries_before_writes(void) {
  setup_legacy_usb3();unlock_ret=-ETIMEDOUT;assert(atcphy_park_live_t8103_pipehandler(&p)==-ETIMEDOUT);
  u32 aon=BIT(14)|PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN;writel(aon,memory+PIPEHANDLER_AON_GEN);
- assert(atcphy_dwc3_reset_deassert(&p.rcdev,0)==-ETIMEDOUT);assert(readl(memory+PIPEHANDLER_AON_GEN)==aon);
- unlock_ret=0;assert(!atcphy_dwc3_reset_deassert(&p.rcdev,0));assert(!p.t8103_dummy_pending&&p.t8103_usb3_retry);
+ assert(atcphy_dwc3_reset_deassert(&p.rcdev,0)==-ETIMEDOUT);assert(readl(memory+PIPEHANDLER_AON_GEN)==aon&&!p.dwc3_running);
+ unlock_ret=0;assert(!atcphy_dwc3_reset_deassert(&p.rcdev,0));assert(!p.t8103_dummy_pending&&p.t8103_usb3_retry&&p.dwc3_running);
  assert(readl(memory+PIPEHANDLER_AON_GEN)==((aon&~PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN)|PIPEHANDLER_AON_GEN_DWC3_RESET_N));
  assert(!atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0));assert(!p.t8103_usb3_retry&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
 }
 static void reset_assert_failure_and_stop(void) {
  setup_legacy_usb3();unlock_ret=-ETIMEDOUT;assert(atcphy_park_live_t8103_pipehandler(&p)==-ETIMEDOUT);
- u32 aon=BIT(14)|PIPEHANDLER_AON_GEN_DWC3_RESET_N;writel(aon,memory+PIPEHANDLER_AON_GEN);
- assert(atcphy_dwc3_reset_assert(&p.rcdev,0)==-ETIMEDOUT);assert(readl(memory+PIPEHANDLER_AON_GEN)==aon&&!usb2_power_off_calls);
- unlock_ret=0;assert(!atcphy_dwc3_reset_assert(&p.rcdev,0));assert(!p.t8103_dummy_pending&&!p.t8103_usb3_retry&&usb2_power_off_calls==1);
+ u32 aon=BIT(14)|PIPEHANDLER_AON_GEN_DWC3_RESET_N;writel(aon,memory+PIPEHANDLER_AON_GEN);p.dwc3_running=true;
+ assert(atcphy_dwc3_reset_assert(&p.rcdev,0)==-ETIMEDOUT);assert(readl(memory+PIPEHANDLER_AON_GEN)==aon&&!usb2_power_off_calls&&p.dwc3_running);
+ unlock_ret=0;assert(!atcphy_dwc3_reset_assert(&p.rcdev,0));assert(!p.t8103_dummy_pending&&!p.t8103_usb3_retry&&usb2_power_off_calls==1&&!p.dwc3_running);
 }
 static void power_off_preserves_dp_and_finishes_pending(void) {
  setup_legacy_usb3();unlock_ret=-ETIMEDOUT;assert(atcphy_park_live_t8103_pipehandler(&p)==-ETIMEDOUT);p.mode=APPLE_ATCPHY_MODE_USB3_DP;
@@ -979,6 +979,12 @@ MUTATIONS = {'usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
                                 'clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, '
                                 'PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);\n'
                                 '\tif (atcphy->t8103_dummy_pending) {'),
+ 'reset-release-not-running': ('atcphy_dwc3_reset_deassert',
+                               'atcphy->dwc3_running = true;',
+                               '(void)0;'),
+ 'reset-assert-keeps-running': ('void _atcphy_dwc3_reset_assert',
+                                'atcphy->dwc3_running = false;',
+                                '(void)0;'),
  'reset-no-retry-clear': ('atcphy_dwc3_reset_assert',
                           'atcphy->t8103_usb3_retry = false;',
                           '(void)0;'),

@@ -49,7 +49,7 @@ struct apple_atcphy {
     struct reset_controller_dev rcdev;
     void *dev;
     int lock, dp_link_rate;
-    bool fixed_usb2, fixed_usb3, cio_only, host_active, swap_lanes, ss_tunables, dp_tunables;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, dwc3_running, swap_lanes, ss_tunables, dp_tunables;
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;
@@ -1966,7 +1966,7 @@ struct apple_atcphy {
     struct { unsigned char *core, *pipehandler; } regs;
     void *dev;
     int lock;
-    bool fixed_usb2, fixed_usb3, cio_only, host_active, ss_tunables, dp_tunables, mode_dirty;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, dwc3_running, ss_tunables, dp_tunables, mode_dirty;
     unsigned int dp_owned_pmas, dp_idle_pmas;
     unsigned int dp_usb_context_valid, dp_usb_context_dirty;
     u32 dp_usb_context[2][27];
@@ -2375,7 +2375,7 @@ struct apple_atcphy {
     struct { unsigned char *core, *lpdptx, *lioa; } regs;
     void *dev;
     int lock, dp_link_rate;
-    bool fixed_usb2, fixed_usb3, cio_only, host_active, swap_lanes, ss_tunables, dp_tunables;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, dwc3_running, swap_lanes, ss_tunables, dp_tunables;
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;

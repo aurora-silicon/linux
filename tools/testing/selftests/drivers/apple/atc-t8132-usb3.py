@@ -82,7 +82,8 @@ typedef uint32_t u32;
 #define FIELD_PREP(m,v) (((v) << __builtin_ctz(m)) & (m))
 #define __iomem
 #define guard(x) fake_guard
-#define dev_warn(...) ((void)0)
+static unsigned warns __attribute__((unused));
+#define dev_warn(...) ((void)warns++)
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 #define READ_ONCE(x) (x)
@@ -107,10 +108,12 @@ struct atcphy_mode_configuration { u32 crossbar, crossbar_dp_single_pma; bool cr
 struct apple_atcphy {
     const struct atcphy_hw *hw;
     struct device *dev;
-    bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
+    bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active, dwc3_running;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
     bool t8103_dummy_pending, t8103_usb3_workaround, fixed_usb3, cio_only;
+    struct device *pd_hold;
+    bool pd_hold_sleep, pd_hold_released;
     unsigned tunnel_users;
     struct { bool prepared, changed, restored; } cio_sleep;
     int mode, pipe_state, lock;
@@ -125,6 +128,20 @@ struct phy { struct apple_atcphy *atc; unsigned power_count,init_count,mutex;
     const struct phy_ops *ops;void *pwr; };
 struct device { struct apple_atcphy *atc; };
 static struct apple_atcphy *dev_get_drvdata(struct device *d) { return d->atc; }
+/*
+ * genpd's system-sleep accounting of ATCn_USB: the PHY and its syscore hold device.
+ * The domain goes off once both are counted suspended, and its notifier tells the PHY.
+ */
+static struct device hold_dev;
+static struct apple_atcphy *pd_owner;
+static unsigned pd_suspended, pd_offs;
+static bool pd_off;
+static void pd_sync_off(void)
+{
+    if (!pd_off && pd_suspended == 2) { pd_off = true; pd_offs++; pd_owner->pd_was_off = true; }
+}
+static void dev_pm_genpd_suspend(struct device *d) { assert(d == &hold_dev); pd_suspended++; pd_sync_off(); }
+static void dev_pm_genpd_resume(struct device *d) { assert(d == &hold_dev); pd_off = false; pd_suspended--; }
 static struct apple_atcphy *phy_get_drvdata(struct phy *p) { return p->atc; }
 /* T8152 only: these rows run T8132, which never reaches it. */
 static void atcphy_lanes_down_t8152(struct apple_atcphy *a) { (void)a; assert(0); }
@@ -226,11 +243,25 @@ static void apple_tunable_apply(void *regs, struct apple_tunable *t)
              "atcphy_t8132_full_stop",
              "atcphy_configure_t8132", "atcphy_usb2_set_mode", "atcphy_t8132_bist_pulse",
              "atcphy_t8132_bist_ack", "atcphy_configure_pipehandler_usb3_host_t8132",
-             "atcphy_suspend", "atcphy_resume"]
+             "atcphy_cio_can_hold", "atcphy_suspend", "atcphy_resume",
+             "atcphy_pd_hold_release", "atcphy_pd_hold_reclaim"]
     tests = r'''
 static struct atcphy_hw hw = { .gen=ATCPHY_GENERATION_T8132, .usb2_only=true,
                               .usb2phy_sig_host=USB2PHY_SIG_HOST_T8132 };
 static struct apple_tunable calibration[9];
+/* One system sleep, as the PM core and genpd run it for the PHY: 0 or the refusal. */
+#define sleep_cycle(dev) ({ \
+    struct apple_atcphy *sa = dev_get_drvdata(dev); \
+    int sret = atcphy_suspend(dev); \
+    if (!sret) { \
+        pd_owner = sa; pd_suspended = pd_offs = 0; pd_off = false; \
+        atcphy_pd_hold_release(sa);     /* suspend_noirq */ \
+        pd_suspended++; pd_sync_off();  /* genpd counts the PHY */ \
+        pd_off = false; pd_suspended--; /* genpd resumes the PHY */ \
+        atcphy_pd_hold_reclaim(sa);     /* resume_noirq */ \
+        assert(!pd_suspended && !sa->pd_hold_released); \
+        sret = atcphy_resume(dev); \
+    } sret; })
 static void init(struct apple_atcphy *a)
 {
     memset(a,0,sizeof(*a)); memset(core,0,sizeof(core)); memset(usb2,0,sizeof(usb2));
@@ -333,17 +364,71 @@ int main(void)
     assert(!atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_USB3));
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     /* A running host keeps the epoch through suspend-to-idle only (cda0923e3d56). */
-    a.host_active=true; pm_suspend_target_state=PM_SUSPEND_MEM;
+    a.host_active=a.dwc3_running=true; pm_suspend_target_state=PM_SUSPEND_MEM;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
     unsigned kept=writes;
     assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned);
     assert(atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_USB3)==-EBUSY && writes==kept);
     assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.t8132_common_owned);
-    a.host_active=false; pm_suspend_target_state=0;
+    /* So does a running device: the glue keeps the shared domain on for either role. */
+    a.host_active=false; pm_suspend_target_state=PM_SUSPEND_MEM;
+    assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+    pm_suspend_target_state=PM_SUSPEND_TO_IDLE; kept=writes;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned && writes==kept);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.t8132_common_owned);
+    /* Losing the domain under it is reported for a device as for a host. */
+    warns=0;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended);
+    a.pd_was_off=true;
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && warns==1);
+    a.pd_was_off=false;
+    /* A controller held in reset has nothing keeping the domain on. */
+    a.dwc3_running=false;
+    assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
+    /*
+     * A port in CIO mode keeps its domain through suspend-to-idle by holding it
+     * itself: no off transition, nothing restored, nothing to warn about.
+     */
+    { enum atcphy_mode m = a.mode; a.mode = APPLE_ATCPHY_MODE_USB4; kept = writes;
+      a.pd_hold = &hold_dev; warns = 0;
+      assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned && writes==kept);
+      assert(a.pd_hold_sleep);
+      assert(!atcphy_resume(&dev) && !a.t8132_suspended && !a.pd_hold_sleep);
+      assert(!sleep_cycle(&dev) && !pd_offs && !a.pd_was_off && !warns && writes==kept);
+      /* Losing it anyway is reported, as for USB3. */
+      assert(!atcphy_suspend(&dev));
+      a.pd_was_off = true;
+      assert(!atcphy_resume(&dev) && warns==1);
+      a.pd_was_off = false;
+      /* A deeper sleep is refused, and leaves nothing held. */
+      pm_suspend_target_state=PM_SUSPEND_MEM;
+      assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended && !a.pd_hold_sleep);
+      pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
+      /* Without a domain to hold (no hold device), CIO mode does not survive it. */
+      a.pd_hold = NULL;
+      assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended && !a.pd_hold_sleep);
+      a.pd_hold = &hold_dev; a.mode = m; }
+    pm_suspend_target_state=0;
     assert(atcphy_suspend(&dev)==-EBUSY && !a.t8132_suspended);
     assert(!atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_OFF));
     assert(!a.t8132_common_owned && !a.mode_dirty && !atcphy_suspend(&dev));
+    assert(!atcphy_resume(&dev));
+    /* Out of CIO mode the hold is given up: the domain goes off as before. */
+    pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
+    assert(!sleep_cycle(&dev) && pd_offs==1 && !a.pd_hold_sleep);
+    a.pd_was_off = false;
+    /* So it is, still in CIO mode, for a deeper sleep the router's handoff took. */
+    a.mode = APPLE_ATCPHY_MODE_USB4; a.cio_sleep.prepared = true;
+    pm_suspend_target_state=PM_SUSPEND_MEM;
+    assert(!atcphy_suspend(&dev) && !a.pd_hold_sleep);
+    pd_owner = &a; pd_suspended = pd_offs = 0; pd_off = false;
+    atcphy_pd_hold_release(&a); pd_suspended++; pd_sync_off();
+    assert(pd_offs==1 && a.pd_hold_released);
+    pd_off = false; pd_suspended--; atcphy_pd_hold_reclaim(&a);
+    assert(!pd_suspended && !a.pd_hold_released);
+    a.cio_sleep.prepared = false; a.mode = APPLE_ATCPHY_MODE_OFF; a.pd_was_off = false;
+    pm_suspend_target_state=0;
     init(&a); stall_power=1;
     assert(atcphy_configure_t8132(&a,APPLE_ATCPHY_MODE_USB3)==-ETIMEDOUT);
     assert(a.t8132_common_owned && a.mode_dirty);
@@ -637,9 +722,48 @@ int main(void)
             assert control != role_program, name
             run(Path(directory), name + "-negative-control", control, expect_failure=True, expect=expect)
         permissive = program.replace(
-            "(!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
+            "(pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||\n\t     !(atcphy->dwc3_running || atcphy_cio_can_hold(atcphy)))", "false", 1)
         assert permissive != program
         run(Path(directory), "suspend-deep-negative-control", permissive, expect_failure=True)
+        host_only = program.replace(
+            "!(atcphy->dwc3_running ||", "!(atcphy->host_active ||", 1)
+        assert host_only != program
+        run(Path(directory), "suspend-host-only-negative-control", host_only, expect_failure=True)
+        no_reset = program.replace(
+            "!(atcphy->dwc3_running ||", "!(atcphy->t8132_ss ||", 1)
+        assert no_reset != program
+        run(Path(directory), "suspend-reset-negative-control", no_reset, expect_failure=True)
+        no_cio = program.replace(" || atcphy_cio_can_hold(atcphy))))", ")))", 1)
+        assert no_cio != program
+        run(Path(directory), "suspend-cio-negative-control", no_cio, expect_failure=True)
+        mode_only = program.replace(
+            "return atcphy_mode_is_cio(atcphy->mode) && atcphy->pd_hold;",
+            "return atcphy_mode_is_cio(atcphy->mode);", 1)
+        assert mode_only != program
+        run(Path(directory), "suspend-cio-without-hold-negative-control", mode_only, expect_failure=True)
+        no_hold = program.replace(
+            "atcphy->pd_hold_sleep = pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&\n\t\t\t\tatcphy_cio_can_hold(atcphy);",
+            "atcphy->pd_hold_sleep = false;", 1)
+        assert no_hold != program
+        run(Path(directory), "cio-domain-not-held-negative-control", no_hold, expect_failure=True)
+        always_release = program.replace(
+            "if (!atcphy->pd_hold || atcphy->pd_hold_sleep)\n\t\treturn;", "if (!atcphy->pd_hold)\n\t\treturn;", 1)
+        assert always_release != program
+        run(Path(directory), "hold-always-released-negative-control", always_release, expect_failure=True)
+        never_release = program.replace(
+            "if (!atcphy->pd_hold || atcphy->pd_hold_sleep)\n\t\treturn;", "if (atcphy->pd_hold)\n\t\treturn;", 1)
+        assert never_release != program
+        run(Path(directory), "hold-never-released-negative-control", never_release, expect_failure=True)
+        no_cio_warn = program.replace(
+            "atcphy_mode_is_cio(atcphy->mode)) &&\n\t    READ_ONCE(atcphy->pd_was_off)",
+            "false) &&\n\t    READ_ONCE(atcphy->pd_was_off)", 1)
+        assert no_cio_warn != program
+        run(Path(directory), "resume-warn-no-cio-negative-control", no_cio_warn, expect_failure=True)
+        host_warn = program.replace(
+            "(atcphy->t8132_common_owned && atcphy->dwc3_running) ||",
+            "(atcphy->t8132_common_owned && atcphy->host_active) ||", 1)
+        assert host_warn != program
+        run(Path(directory), "resume-warn-host-only-negative-control", host_warn, expect_failure=True)
         permissive = program.replace(
             "if (atcphy->mode_dirty)\n\t\treturn -EBUSY;", "if (false)\n\t\treturn -EBUSY;", 1)
         assert permissive != program
@@ -890,7 +1014,7 @@ struct dwc3_probe_data { struct dwc3 *dwc; void *res; bool ignore_clocks_and_res
 struct atcphy_hw { int gen; };
 struct apple_atcphy {
     const struct atcphy_hw *hw;struct device *dev;int lock,pipe_state;
-    bool t8132_ss,t8132_suspended,t8132_common_owned,t8132_failed,host_active,pipe_pending;
+    bool t8132_ss,t8132_suspended,t8132_common_owned,t8132_failed,host_active,dwc3_running,pipe_pending;
 };
 #define APPLE_ATCPHY_MODE_OFF 0
 static struct apple_atcphy atc;
@@ -914,7 +1038,7 @@ static void usb_phy_set_suspend(void *p,int v) { (void)p;assert(v==1); }
 static void dwc3_core_exit_after_phy_power_off(struct dwc3 *d) {
     (void)d;assert(!atc.t8132_common_owned);event(6);
 }
-static int reset_control_assert(void *p) { (void)p;reset_calls++;event(7);return 0; }
+static int reset_control_assert(void *p) { (void)p;reset_calls++;atc.dwc3_running=false;event(7);return 0; }
 static unsigned rpm_puts,cancels;
 static const int dwc3_apple_glue_ops;
 static void pm_runtime_get_noresume(struct device *d) { (void)d;assert(0); }
@@ -983,7 +1107,7 @@ int main(void)
     }
     init(&p,&a);a.state=DWC3_APPLE_HOST;a.core_active=a.reset_pending=true;
     a.usb3_power_off_pending=a.usb2_power_off_pending=1;
-    atc.t8132_common_owned=atc.host_active=true;a.rpm_held=true;
+    atc.t8132_common_owned=atc.host_active=atc.dwc3_running=true;a.rpm_held=true;
     dwc3_apple_shutdown(&p);
     unsigned expected[]={1,2,3,4,5,6,7};
     assert(count==7 && !memcmp(stage,expected,sizeof(expected)));
@@ -994,10 +1118,11 @@ int main(void)
     /* A failed PHY release never reaches core exit or controller reset. */
     init(&p,&a);a.state=DWC3_APPLE_HOST;a.core_active=a.reset_pending=true;
     a.usb3_power_off_pending=a.usb2_power_off_pending=1;
-    atc.t8132_common_owned=atc.host_active=true;fail_phy=1;
+    atc.t8132_common_owned=atc.host_active=atc.dwc3_running=true;fail_phy=1;
     dwc3_apple_shutdown(&p);
     assert(count==4 && stage[0]==1 && stage[3]==4 && !reset_calls);
     assert(atc.t8132_common_owned && atc.t8132_failed && a.core_active && a.reset_pending);
+    assert(atc.dwc3_running);
     supplier.dev.data=&atc;atcphy_shutdown(&supplier);assert(!provider_stops);
     /* Provider may finish a successful configured epoch with no consumer. */
     init(&p,&a);atc.t8132_common_owned=true;supplier.dev.data=&atc;
@@ -1005,7 +1130,8 @@ int main(void)
     for(unsigned blocked=0;blocked<4;blocked++) {
         init(&p,&a);atc.t8132_common_owned=true;supplier.dev.data=&atc;
         if(blocked==0) atc.t8132_failed=true;
-        if(blocked==1) atc.host_active=true;
+        /* DWC3 left out of reset, as a device: its reset assert failed. */
+        if(blocked==1) atc.dwc3_running=true;
         if(blocked==2) atc.pipe_pending=true;
         if(blocked==3) atc.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
         atcphy_shutdown(&supplier);assert(!provider_stops && atc.t8132_common_owned);
@@ -1028,6 +1154,10 @@ int main(void)
             broken=broken.replace("static void platform_set_drvdata", "static inline void platform_set_drvdata")
             broken=broken.replace("static void dev_set_drvdata", "static inline void dev_set_drvdata")
             run(Path(directory),"shutdown-negative-"+name,broken,expect_failure=True)
+        host_guard=shutdown.replace("atcphy->t8132_failed || atcphy->dwc3_running ||",
+                                    "atcphy->t8132_failed || atcphy->host_active ||",1)
+        assert host_guard!=shutdown
+        run(Path(directory),"shutdown-negative-host-only-guard",host_guard,expect_failure=True)
         framework = (root / "drivers/phy/phy-core.c").read_text()
         for name in ["phy_init", "phy_exit", "phy_power_off"]:
             framework = framework.replace("\nint "+name+"(", "\nstatic int "+name+"(")

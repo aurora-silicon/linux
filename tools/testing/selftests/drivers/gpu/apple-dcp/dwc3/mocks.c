@@ -25,7 +25,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, fixed_usb3, cio_only, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_usb3, cio_only, host_active, dwc3_running, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
