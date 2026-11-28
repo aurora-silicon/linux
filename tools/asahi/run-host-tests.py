@@ -360,6 +360,9 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-m5-governor-stop-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('drop-stop-gate', 'drop-ineligible-restore',
+                                   'drop-publish-retry'), out()),
     'g17-highpri-sched-wq-tests.py': [([], PASS)]
         + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],

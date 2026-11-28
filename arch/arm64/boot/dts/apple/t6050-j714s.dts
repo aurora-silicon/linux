@@ -587,6 +587,16 @@
 #include "hwmon-laptop.dtsi"
 
 &smc_hwmon {
+	/*
+	 * SoC die limits from the J714sAP ADT's PMP nub (iop-pmp0-nub): the PMP's
+	 * fast die control holds the average die temperature at
+	 * fast-die-ctrl-ts-avg-temp (100 C), and its lts-config carries the 110 C
+	 * limit that T6030 and T8132 give as the fast-die-ctrl-loop target. The GPU
+	 * thermal governor settles the hotspot at the passive trip.
+	 */
+	apple,soc-die-passive-millicelsius = <100000>;
+	apple,soc-die-hot-millicelsius = <110000>;
+
 	/delete-node/ temperature-TH0x;
 	/delete-node/ temperature-TB0T;
 	/delete-node/ temperature-TCHP;
