@@ -2266,22 +2266,23 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 		struct apple_dcp *dcp = port->owner->dcp;
 
 		/*
-		 * A T6030 external processor services the request itself, and
-		 * reads the display again if it changed; elsewhere the active
-		 * mode is applied again. H17P always applies it again. A running
-		 * relink connects the sink anew; see dcp_typec_sink_relink().
+		 * The request goes to the firmware's DPTX port, which reads the
+		 * sink's status and services it (dcp_dptx_sink_irq()). H17P
+		 * applies the active mode again. A running relink connects the
+		 * sink anew; see dcp_typec_sink_relink(). A sink the firmware
+		 * disconnected is recovered (dcp_dptx_recover_irq()).
 		 */
 		if (dcp->typec_connector && dcp->fw_compat == DCP_FIRMWARE_H17P)
 			dcp_retrain_oob(dcp->typec_connector);
 		else if (dcp->typec_connector && dcp->external_native)
-			dcp_external_sink_irq(dcp);
+			dcp_dptx_sink_irq(dcp);
 		else if (dcp->typec_connector && !dcp_typec_sink_relink(dcp)) {
 			if (!READ_ONCE(dcp->typec_connector->connected)) {
 				ret = dcp_dptx_recover_irq(dcp);
 				if (ret)
 					return ret;
 			} else {
-				dcp_retrain_oob(dcp->typec_connector);
+				dcp_dptx_sink_irq(dcp);
 			}
 		}
 	}

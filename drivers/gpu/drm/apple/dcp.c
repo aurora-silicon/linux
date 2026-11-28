@@ -3328,25 +3328,29 @@ void dcp_external_retry_work(struct work_struct *work)
 }
 
 /*
- * The sink of a native external pipe raised IRQ_HPD with HPD staying high,
- * as a DP branch device does when the display behind it changes. Pass the
- * request to the firmware, which services it as a DP source does. If it
+ * The sink of a connected DPTX link raised IRQ_HPD with HPD staying high: it
+ * asks the source to read its status, because its link lost lock, a display
+ * behind a branch device changed, or for HDCP, MCCS or a test request. Only
+ * the firmware's DPTX port can read the sink's status over AUX, so pass the
+ * request to it, as its own HPD input would: the DP source is the one to read
+ * that status and train a link the sink lost again. The USB4 tunnel path
+ * passes the request the same way (dcp_tb_event_work()). If the firmware
  * cannot take the request, connect the display link anew, which makes the
- * firmware read the display again.
+ * firmware train it and read the display again.
  */
-void dcp_external_sink_irq(struct apple_dcp *dcp)
+void dcp_dptx_sink_irq(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
 	struct apple_epic_service *service = READ_ONCE(dcp->dptxport[0].service);
 	int ret;
 
 	/* With no link up, the next connect reads the display anyway. */
-	if (!dcp->external_native || !service || !dptx_service_available(&dcp->dptxport[0]) ||
+	if (!service || !dptx_service_available(&dcp->dptxport[0]) ||
 	    !READ_ONCE(dcp->dptxport[0].connected))
 		return;
 	ret = dptxport_sink_irq(service);
 	if (!ret) {
-		dev_info(dcp->dev, "display sink IRQ_HPD passed to the firmware\n");
+		dev_dbg(dcp->dev, "display sink IRQ_HPD passed to the firmware\n");
 		return;
 	}
 	dev_info(dcp->dev, "display sink IRQ_HPD not passed (%d): connecting the display anew\n",

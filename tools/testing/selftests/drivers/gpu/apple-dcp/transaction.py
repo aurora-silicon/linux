@@ -119,8 +119,9 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     #ifndef DCP_IOMFB_METHODS_H17P_EXTERNAL
     #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
     #endif
-    /* T6030 external processors (dcp->external_native) are not in these scenarios. */
-    static void __attribute__((unused)) dcp_external_sink_irq(struct apple_dcp *d) { (void)d;assert(!"T6030 external sink IRQ"); }
+    /* A connected sink's IRQ_HPD goes to the firmware's DPTX port; these scenarios only count it. */
+    static int sink_irqs;
+    static void __attribute__((unused)) dcp_dptx_sink_irq(struct apple_dcp *d) { (void)d;sink_irqs++; }
     static bool __attribute__((unused)) iomfb_v14_7_external_failed(struct apple_dcp *d) { (void)d;assert(!"T6030 external state");return false; }
     /* fw_compat is UNKNOWN here: never H17P, 14.7 or 26.6. */
     #ifndef DCP_FIRMWARE_H17P
@@ -203,6 +204,20 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
       fprintf(stderr,"DP after failed SAFE: ret=%d connects=%d pending=%d wanted=%d hpd=%d\n",ret,connect_calls,port.safe_pending,port.dp_wanted,port.hpd);
       assert(ret<0&&connect_calls==0&&!port.dp_wanted);
      }
+     if(argv[1][0]=='i') {
+      /* A connected sink's IRQ_HPD goes to the firmware's DPTX port, once per request. */
+      struct typec_altmode alt={.svid=USB_TYPEC_DP_SID};
+      struct typec_displayport_data data={.status=DP_STATUS_HPD_STATE};
+      struct typec_mux_state dp={.alt=&alt,.mode=TYPEC_DP_STATE_A,.data=&data};
+      int ret=typec_mux_set(&mux,&dp);
+      fprintf(stderr,"DP: ret=%d connects=%d hpd=%d sink_irqs=%d\n",ret,connect_calls,port.hpd,sink_irqs);
+      assert(ret==0&&port.hpd&&sink_irqs==0);
+      data.status=DP_STATUS_HPD_STATE|DP_STATUS_IRQ_HPD;
+      ret=typec_mux_set(&mux,&dp);
+      fprintf(stderr,"IRQ_HPD: ret=%d sink_irqs=%d\n",ret,sink_irqs);
+      assert(ret==0&&sink_irqs==1);
+      puts("PASS a connected sink's IRQ_HPD is passed to the firmware's DPTX port");
+     }
      if(argv[1][0]=='a') {
       struct altmode alt={.mux=&mux,.adev={.svid=USB_TYPEC_DP_SID}};phy_error=-ETIMEDOUT;
       int ret=typec_altmode_set_mux(&alt,TYPEC_STATE_SAFE,NULL);
@@ -234,6 +249,64 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
     check('provider-order-releases-failed-lease',actual,(('release',),))
     check('failed-safe-allows-new-dp-admission',actual,(('dp',),))
     check('altmode-safe-skips-quiescence',actual,(('altmode',),))
+    check('connected-irq-hpd-to-firmware',actual,(('irq',),))
+
+    # Exact production dcp_dptx_sink_irq(): passed-through, reconnect fallback,
+    # disconnect-error stop, and no-link/unavailable guards.
+    sink_irq_unit = r'''
+    #include <assert.h>
+    #include <errno.h>
+    #include <stdbool.h>
+    #include <stdio.h>
+    #include <string.h>
+    #define READ_ONCE(x) (x)
+    #define dev_dbg(...) ((void)0)
+    #define dev_info(...) ((void)0)
+    struct device { int unused; };
+    struct platform_device { struct device dev; };
+    struct apple_epic_service { int id; };
+    struct apple_dptxport { struct apple_epic_service *service; bool available, connected; };
+    struct apple_dcp { struct device *dev; struct apple_dptxport dptxport[1]; };
+    static struct platform_device pdev_inst;
+    static struct platform_device *to_platform_device(struct device *d) { (void)d; return &pdev_inst; }
+    static bool dptx_service_available(struct apple_dptxport *p) { return p->available; }
+    static int sink_irq_error, disconnect_error;
+    static int sink_irq_calls, disconnect_calls, connect_calls;
+    static char seq[16];
+    static void rec(char c) { size_t n = strlen(seq); if (n + 1 < sizeof(seq)) { seq[n] = c; seq[n + 1] = 0; } }
+    static int dptxport_sink_irq(struct apple_epic_service *s) { (void)s; rec('I'); sink_irq_calls++; return sink_irq_error; }
+    static int dcp_dptx_disconnect_oob(struct platform_device *p, unsigned idx) { (void)p; assert(idx == 0); rec('D'); disconnect_calls++; return disconnect_error; }
+    static int dcp_dptx_connect_oob(struct platform_device *p, unsigned idx) { (void)p; assert(idx == 0); rec('C'); connect_calls++; return 0; }
+    ''' + block(dcp, 'void dcp_dptx_sink_irq(') + r'''
+    static void reset(void) { sink_irq_error = disconnect_error = 0; sink_irq_calls = disconnect_calls = connect_calls = 0; seq[0] = 0; }
+    int main(void) {
+     struct apple_epic_service svc = { .id = 1 };
+     struct apple_dcp dcp = { .dev = &pdev_inst.dev, .dptxport = {{ .service = &svc, .available = true, .connected = true }} };
+     /* Passed to firmware: no reconnect. */
+     reset();
+     dcp_dptx_sink_irq(&dcp);
+     assert(sink_irq_calls == 1 && disconnect_calls == 0 && connect_calls == 0 && !strcmp(seq, "I"));
+     /* Firmware refuses/fails call: fall back to disconnect then connect. */
+     reset(); sink_irq_error = -EOPNOTSUPP;
+     dcp_dptx_sink_irq(&dcp);
+     assert(sink_irq_calls == 1 && disconnect_calls == 1 && connect_calls == 1 && !strcmp(seq, "IDC"));
+     /* Disconnect error stops before reconnect. */
+     reset(); sink_irq_error = -EIO; disconnect_error = -ENODEV;
+     dcp_dptx_sink_irq(&dcp);
+     assert(sink_irq_calls == 1 && disconnect_calls == 1 && connect_calls == 0 && !strcmp(seq, "ID"));
+     /* Early guards: missing service, unavailable service, or disconnected link. */
+     reset(); dcp.dptxport[0].service = NULL;
+     dcp_dptx_sink_irq(&dcp);
+     dcp.dptxport[0].service = &svc; dcp.dptxport[0].available = false;
+     dcp_dptx_sink_irq(&dcp);
+     dcp.dptxport[0].available = true; dcp.dptxport[0].connected = false;
+     dcp_dptx_sink_irq(&dcp);
+     assert(sink_irq_calls == 0 && disconnect_calls == 0 && connect_calls == 0 && seq[0] == 0);
+     puts("PASS dcp_dptx_sink_irq passes IRQ_HPD to firmware and falls back to reconnect on error");
+     return 0;
+    }
+    '''
+    check('dcp-sink-irq-fallback', sink_irq_unit)
 
     # Real pthread fabric/consumer mutexes. Pause the SAFE actor after its actual
     # DCP prepare has returned and released its locks, before any set callback.
