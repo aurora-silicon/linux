@@ -111,16 +111,23 @@
 	/delete-property/ mux-index;
 };
 
-/* No internal microphones, ambient light sensor, or lid. */
-&aop_audio {
+/*
+ * iBoot on Mac mini does not start AOP firmware (no internal mic, ALS, or lid),
+ * so apple_aop fails RTKit wake with -ETIME (-62) if enabled.
+ */
+&aop_mbox {
 	status = "disabled";
 };
 
-&aop_als {
+&aop_dart {
 	status = "disabled";
 };
 
-&aop_las {
+&aop_admac {
+	status = "disabled";
+};
+
+&aop {
 	status = "disabled";
 };
 
