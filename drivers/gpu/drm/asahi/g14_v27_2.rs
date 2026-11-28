@@ -57,6 +57,28 @@ const EP_DOORBELL: u8 = 0x21;
 const ASC_CPU_CONTROL: usize = 0x44;
 const ASC_RUN: u32 = 0x10;
 
+#[cfg(CONFIG_APPLE_PMGR_PWRSTATE)]
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    fn apple_pmgr_ps_set_auto_pm(
+        consumer: *mut kernel::bindings::device,
+        enable: bool,
+    ) -> core::ffi::c_int;
+}
+
+fn set_gpu_auto_pm(dev: &device::Device, enable: bool) {
+    #[cfg(CONFIG_APPLE_PMGR_PWRSTATE)]
+    {
+        // SAFETY: `dev` is a live bound GPU platform device.
+        let ret = unsafe { apple_pmgr_ps_set_auto_pm(dev.as_raw(), enable) };
+        if ret != 0 {
+            dev_warn!(dev, "GPU: apple_pmgr_ps_set_auto_pm({}) failed: {}\n", enable, ret);
+        }
+    }
+    #[cfg(not(CONFIG_APPLE_PMGR_PWRSTATE))]
+    let _ = (dev, enable);
+}
+
 #[cfg(CONFIG_APPLE_SOC_SLEEP)]
 #[allow(improper_ctypes)]
 unsafe extern "C" {
@@ -547,6 +569,7 @@ pub(crate) fn start<'a>(
         if root.has_pwr_controller() {
             step = "idle power-off policy";
             set_idle_policy(&root, &mut peer, true)?;
+            set_gpu_auto_pm(dev, true);
         }
         Ok(())
     })();
@@ -1663,6 +1686,9 @@ impl Runtime {
                 return err;
             }
         }
+        if state.idle_off_allowed {
+            set_gpu_auto_pm(self.dev.as_ref(), true);
+        }
         self.notify.set_deep_sleeping(self, false);
         self.asleep.store(false, Ordering::Release);
         if self.healthy() {
@@ -1783,6 +1809,9 @@ impl Runtime {
                 );
                 return Err(self.abort_deep_prepare(state, policy_published, err));
             }
+            if state.idle_off_allowed {
+                set_gpu_auto_pm(self.dev.as_ref(), false);
+            }
             // SAFETY: `ASC_CPU_CONTROL` lies within the mapped ASC page.
             let asc_ctl = unsafe { state.asc.0.add(ASC_CPU_CONTROL) };
             let commit = match KBox::new(CommitStop {
@@ -1850,6 +1879,7 @@ impl Runtime {
                     }
                 } else {
                     dev_info!(self.dev, "GPU: deep sleep refused before commit\n");
+                    set_gpu_auto_pm(self.dev.as_ref(), true);
                 }
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
@@ -1894,6 +1924,7 @@ impl Runtime {
                 wait(&state.root, 500, || Ok(gpu_powered(state.asc.fender())))?;
                 if state.idle_off_allowed {
                     set_idle_policy(&state.root, &mut state.peer, true)?;
+                    set_gpu_auto_pm(self.dev.as_ref(), true);
                 }
                 Ok(())
             })();
@@ -1975,6 +2006,9 @@ impl Runtime {
                 self.notify.messages.load(Ordering::Relaxed)
             );
         } else {
+            if state.idle_off_allowed {
+                set_gpu_auto_pm(self.dev.as_ref(), false);
+            }
             let allowed = if state.idle_off_allowed {
                 Ok(())
             } else {
