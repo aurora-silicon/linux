@@ -9,12 +9,13 @@
  * Author: Michael White <michael.white@cirrus.com>
  */
 
+#include <linux/bitops.h>
 #include <linux/cleanup.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/types.h>
 #include <linux/init.h>
-#include <linux/of.h>
+#include <linux/workqueue.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/regmap.h>
@@ -1074,12 +1075,123 @@ static int cs42l42_set_bclk_ratio(struct snd_soc_dai *dai,
 	return 0;
 }
 
+/* Move the codec onto SCLK if this is the first stream, then unmute it. */
+static int cs42l42_unmute_locked(struct snd_soc_component *component, int stream)
+{
+	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
+	unsigned int regval;
+	int ret;
+
+	lockdep_assert_held(&cs42l42->stream_lock);
+
+	if (!cs42l42->stream_use) {
+		/* SCLK must be running before codec unmute.
+		 *
+		 * PLL must not be started with ADC and HP both off
+		 * otherwise the FILT+ supply will not charge properly.
+		 * DAPM widgets power-up before stream unmute so at least
+		 * one of the "DAC" or "ADC" widgets will already have
+		 * powered-up.
+		 */
+		if (pll_ratio_table[cs42l42->pll_config].mclk_src_sel) {
+			snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+						      CS42L42_PLL_START_MASK, 1);
+
+			if (pll_ratio_table[cs42l42->pll_config].n > 1) {
+				usleep_range(CS42L42_PLL_DIVOUT_TIME_US,
+					     CS42L42_PLL_DIVOUT_TIME_US * 2);
+				regval = pll_ratio_table[cs42l42->pll_config].pll_divout;
+				snd_soc_component_update_bits(component, CS42L42_PLL_CTL3,
+							      CS42L42_PLL_DIVOUT_MASK,
+							      regval <<
+							      CS42L42_PLL_DIVOUT_SHIFT);
+			}
+
+			ret = regmap_read_poll_timeout(cs42l42->regmap,
+						       CS42L42_PLL_LOCK_STATUS,
+						       regval,
+						       (regval & 1),
+						       CS42L42_PLL_LOCK_POLL_US,
+						       CS42L42_PLL_LOCK_TIMEOUT_US);
+			if (ret < 0) {
+				/*
+				 * Without a locked PLL the codec has no clock
+				 * once it leaves the oscillator, and then the
+				 * I2C bus stops working. Stay on the oscillator.
+				 */
+				dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+				snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+							      CS42L42_PLL_START_MASK, 0);
+				return ret;
+			}
+
+			/* PLL must be running to drive glitchless switch logic */
+			snd_soc_component_update_bits(component,
+						      CS42L42_MCLK_SRC_SEL,
+						      CS42L42_MCLK_SRC_SEL_MASK,
+						      CS42L42_MCLK_SRC_SEL_MASK);
+		}
+
+		/* Mark SCLK as present, turn off internal oscillator */
+		regmap_multi_reg_write(cs42l42->regmap, cs42l42_to_sclk_seq,
+				       ARRAY_SIZE(cs42l42_to_sclk_seq));
+	}
+	cs42l42->stream_use |= 1 << stream;
+
+	if (stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		/* Un-mute the headphone */
+		snd_soc_component_update_bits(component, CS42L42_HP_CTL,
+					      CS42L42_HP_ANA_AMUTE_MASK |
+					      CS42L42_HP_ANA_BMUTE_MASK,
+					      0);
+	}
+
+	return 0;
+}
+
+/*
+ * The unmutes that ASoC's card resume asked for, run once the host clocks the
+ * stream again: the host DAI's trigger has run before the codec DAI's, so SCLK
+ * runs. With the PLL the lock below is the codec's own proof of that.
+ *
+ * The held unmute is only dropped once it has been applied. If the PLL does
+ * not lock, the codec stays on the oscillator and the unmute stays held for
+ * the stream's next START, RESUME or PAUSE_RELEASE: with PCM RESUME there may
+ * be no new prepare to unmute it.
+ */
+static void cs42l42_resume_unmute_work(struct work_struct *work)
+{
+	struct cs42l42_private *cs42l42 = container_of(work, struct cs42l42_private,
+						       resume_unmute_work);
+	int stream, ret;
+
+	guard(mutex)(&cs42l42->stream_lock);
+	for_each_pcm_streams(stream) {
+		if (!test_bit(stream, &cs42l42->resume_unmute_clocked) ||
+		    !test_bit(stream, &cs42l42->resume_unmute))
+			continue;
+
+		ret = cs42l42_unmute_locked(cs42l42->resume_unmute_dai->component, stream);
+		if (ret) {
+			/* SCLK is not there yet: wait for the next trigger */
+			clear_bit(stream, &cs42l42->resume_unmute_clocked);
+			dev_warn(cs42l42->dev, "unmute after resume failed: %d\n", ret);
+			continue;
+		}
+
+		clear_bit(stream, &cs42l42->resume_unmute);
+	}
+}
+
 int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 {
 	struct snd_soc_component *component = dai->component;
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(component);
-	unsigned int regval;
-	int ret;
+
+	guard(mutex)(&cs42l42->stream_lock);
+
+	/* Whichever comes, a mute or an unmute at D0 replaces a held resume unmute */
+	clear_bit(stream, &cs42l42->resume_unmute);
 
 	if (mute) {
 		/* Mute the headphone */
@@ -1112,100 +1224,57 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 		}
 	} else {
 		/*
-		 * On the admitted base-M1 I2C path, ASoC resume unmutes
-		 * playback while the card is still below D0. The PCM is
-		 * suspended then and the host may not be driving SCLK yet,
-		 * so moving the codec onto it would take the I2C bus down.
-		 * Stay on the oscillator; playback prepare disables PCM RESUME
-		 * so userspace must prepare and send another unmute at D0.
+		 * ASoC's card resume unmutes the playback DAIs that were
+		 * active at suspend while the card is still below D0 and the
+		 * PCM is still suspended. The ASP's SCLK comes from the host,
+		 * which need not clock it until the stream runs again, and
+		 * moving the codec off the oscillator without it takes the
+		 * codec off the I2C bus. Hold the unmute until the host has
+		 * triggered the stream (START, or RESUME without another
+		 * prepare). A prepare at D0 unmutes as usual. A SoundWire
+		 * codec is clocked by its bus and unmutes here.
 		 */
-		if (cs42l42->resume_reprepare &&
-		    snd_power_get_state(component->card->snd_card) != SNDRV_CTL_POWER_D0)
+		if (!cs42l42->sdw_peripheral &&
+		    snd_power_get_state(component->card->snd_card) != SNDRV_CTL_POWER_D0) {
+			cs42l42->resume_unmute_dai = dai;
+			clear_bit(stream, &cs42l42->resume_unmute_clocked);
+			set_bit(stream, &cs42l42->resume_unmute);
 			return 0;
-
-		if (!cs42l42->stream_use) {
-			/* SCLK must be running before codec unmute.
-			 *
-			 * PLL must not be started with ADC and HP both off
-			 * otherwise the FILT+ supply will not charge properly.
-			 * DAPM widgets power-up before stream unmute so at least
-			 * one of the "DAC" or "ADC" widgets will already have
-			 * powered-up.
-			 */
-			if (pll_ratio_table[cs42l42->pll_config].mclk_src_sel) {
-				snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
-							      CS42L42_PLL_START_MASK, 1);
-
-				if (pll_ratio_table[cs42l42->pll_config].n > 1) {
-					usleep_range(CS42L42_PLL_DIVOUT_TIME_US,
-						     CS42L42_PLL_DIVOUT_TIME_US * 2);
-					regval = pll_ratio_table[cs42l42->pll_config].pll_divout;
-					snd_soc_component_update_bits(component, CS42L42_PLL_CTL3,
-								      CS42L42_PLL_DIVOUT_MASK,
-								      regval <<
-								      CS42L42_PLL_DIVOUT_SHIFT);
-				}
-
-				ret = regmap_read_poll_timeout(cs42l42->regmap,
-							       CS42L42_PLL_LOCK_STATUS,
-							       regval,
-							       (regval & 1),
-							       CS42L42_PLL_LOCK_POLL_US,
-							       CS42L42_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0) {
-					/*
-					 * Without a locked PLL the codec has no clock
-					 * once it leaves the oscillator, and then the
-					 * I2C bus stops working. Stay on the oscillator.
-					 */
-					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
-					snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
-								      CS42L42_PLL_START_MASK, 0);
-					return ret;
-				}
-
-				/* PLL must be running to drive glitchless switch logic */
-				snd_soc_component_update_bits(component,
-							      CS42L42_MCLK_SRC_SEL,
-							      CS42L42_MCLK_SRC_SEL_MASK,
-							      CS42L42_MCLK_SRC_SEL_MASK);
-			}
-
-			/* Mark SCLK as present, turn off internal oscillator */
-			regmap_multi_reg_write(cs42l42->regmap, cs42l42_to_sclk_seq,
-					       ARRAY_SIZE(cs42l42_to_sclk_seq));
 		}
-		cs42l42->stream_use |= 1 << stream;
 
-		if (stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			/* Un-mute the headphone */
-			snd_soc_component_update_bits(component, CS42L42_HP_CTL,
-						      CS42L42_HP_ANA_AMUTE_MASK |
-						      CS42L42_HP_ANA_BMUTE_MASK,
-						      0);
-		}
+		return cs42l42_unmute_locked(component, stream);
 	}
 
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cs42l42_mute_stream, "SND_SOC_CS42L42_CORE");
 
-int cs42l42_dai_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
+/* Atomic context: the unmute itself needs I2C and sleeps, so it runs from a work. */
+static int cs42l42_dai_trigger(struct snd_pcm_substream *substream, int cmd,
+			       struct snd_soc_dai *dai)
 {
 	struct cs42l42_private *cs42l42 = snd_soc_component_get_drvdata(dai->component);
 
-	/*
-	 * Only the admitted base-M1 I2C workaround drops the D2 unmute and
-	 * needs another prepare. Its macaudio topology permits one FE per BE,
-	 * whose runtime is shared. This is not a generic shared-BE workaround:
-	 * generic and SoundWire users retain their existing resume capability.
-	 */
-	if (cs42l42->resume_reprepare && substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		substream->runtime->info &= ~SNDRV_PCM_INFO_RESUME;
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (test_bit(substream->stream, &cs42l42->resume_unmute)) {
+			set_bit(substream->stream, &cs42l42->resume_unmute_clocked);
+			schedule_work(&cs42l42->resume_unmute_work);
+		}
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		clear_bit(substream->stream, &cs42l42->resume_unmute_clocked);
+		break;
+	default:
+		break;
+	}
 
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cs42l42_dai_prepare, "SND_SOC_CS42L42_CORE");
 
 #define CS42L42_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
 			 SNDRV_PCM_FMTBIT_S24_LE |\
@@ -1218,7 +1287,7 @@ static const struct snd_soc_dai_ops cs42l42_ops = {
 	.set_sysclk	= cs42l42_set_sysclk,
 	.set_bclk_ratio	= cs42l42_set_bclk_ratio,
 	.mute_stream	= cs42l42_mute_stream,
-	.prepare	= cs42l42_dai_prepare,
+	.trigger	= cs42l42_dai_trigger,
 };
 
 struct snd_soc_dai_driver cs42l42_dai = {
@@ -2572,6 +2641,9 @@ int cs42l42_suspend(struct device *dev)
 	if (!cs42l42->init_done)
 		return 0;
 
+	/* ASoC has muted the streams by now, which drops a held resume unmute */
+	cancel_work_sync(&cs42l42->resume_unmute_work);
+
 	/*
 	 * Wait for threaded irq handler to be idle and stop it processing
 	 * future interrupts. This ensures a safe disable if the interrupt
@@ -2691,31 +2763,22 @@ static int __maybe_unused cs42l42_i2c_resume(struct device *dev)
 	return 0;
 }
 
-/* No new policy for unqualified hosts, ACPI codecs or SoundWire devices. */
-bool cs42l42_resume_workaround_required(const struct device_node *root,
-					const struct device_node *codec, bool soundwire)
+void cs42l42_init_streams(struct cs42l42_private *cs42l42)
 {
-	if (soundwire || !root || !codec)
-		return false;
-
-	return of_device_is_compatible(root, "apple,t8103") &&
-		(of_device_is_compatible(codec, "cirrus,cs42l42") ||
-		 of_device_is_compatible(codec, "cirrus,cs42l83"));
+	mutex_init(&cs42l42->stream_lock);
+	INIT_WORK(&cs42l42->resume_unmute_work, cs42l42_resume_unmute_work);
 }
+EXPORT_SYMBOL_NS_GPL(cs42l42_init_streams, "SND_SOC_CS42L42_CORE");
 
 int cs42l42_common_probe(struct cs42l42_private *cs42l42,
 			 const struct snd_soc_component_driver *component_drv,
 			 struct snd_soc_dai_driver *dai)
 {
-	struct device_node *root = of_find_node_by_path("/");
-	bool reprepare = cs42l42_resume_workaround_required(root, cs42l42->dev->of_node,
-							 !!cs42l42->sdw_peripheral);
 	int ret, i;
 
-	cs42l42->resume_reprepare = reprepare;
-	of_node_put(root);
 	dev_set_drvdata(cs42l42->dev, cs42l42);
 	mutex_init(&cs42l42->irq_lock);
+	cs42l42_init_streams(cs42l42);
 
 	BUILD_BUG_ON(ARRAY_SIZE(cs42l42_supply_names) != ARRAY_SIZE(cs42l42->supplies));
 	for (i = 0; i < ARRAY_SIZE(cs42l42->supplies); i++)
@@ -2910,6 +2973,8 @@ EXPORT_SYMBOL_NS_GPL(cs42l42_init, "SND_SOC_CS42L42_CORE");
 
 void cs42l42_common_remove(struct cs42l42_private *cs42l42)
 {
+	cancel_work_sync(&cs42l42->resume_unmute_work);
+
 	if (cs42l42->irq)
 		free_irq(cs42l42->irq, cs42l42);
 

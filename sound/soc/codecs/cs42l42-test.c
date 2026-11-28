@@ -16,9 +16,9 @@
 #include <linux/fs.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/regmap.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/cs42l42.h>
 #include <sound/pcm.h>
@@ -235,7 +235,7 @@ static void cs42l42_test_expect_switch_to_pll(struct kunit *test,
  * ASoC resume sets the card to D2, unmutes the playback DAIs that were
  * active at suspend and only then sets D0. That early unmute must not move
  * the codec off the oscillator: the stream is still suspended and SCLK may
- * not be running yet.
+ * not be running yet. It is held for the host's trigger instead.
  */
 static void cs42l42_test_unmute_below_d0_does_nothing(struct kunit *test)
 {
@@ -258,12 +258,14 @@ static void cs42l42_test_unmute_below_d0_does_nothing(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK,
 			CS42L42_TEST_HP_MUTE_MASK);
 	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_OSC_SWITCH], 0);
+	KUNIT_EXPECT_TRUE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK, &priv->cs42l42.resume_unmute));
 }
 
 /*
  * Use real ALSA RESUME/PREPARE ioctls and the ASoC trigger installed by
  * soc_new_pcm(). Only the host DAI and prepare callback are synthetic: the
- * host prepare supplies a working clock before calling the codec unmute.
+ * host prepare, and the host trigger that starts or resumes the stream,
+ * supply a working clock, so the codec's PLL locks from then on.
  */
 struct cs42l42_test_pcm {
 	struct snd_soc_pcm_runtime rtd;
@@ -284,6 +286,8 @@ struct cs42l42_test_pcm {
 	unsigned int resumes;
 	unsigned int suspends;
 	unsigned int prepares;
+	/* Whether the host trigger gets SCLK running */
+	bool host_clocks;
 };
 
 static int cs42l42_test_cpu_trigger(struct snd_pcm_substream *substream,
@@ -296,6 +300,8 @@ static int cs42l42_test_cpu_trigger(struct snd_pcm_substream *substream,
 		pcm->resumes++;
 	else if (cmd == SNDRV_PCM_TRIGGER_SUSPEND)
 		pcm->suspends++;
+	if (cmd == SNDRV_PCM_TRIGGER_START || cmd == SNDRV_PCM_TRIGGER_RESUME)
+		pcm->priv->pll_locks = pcm->host_clocks;
 	return 0;
 }
 
@@ -359,6 +365,7 @@ static struct cs42l42_test_pcm *cs42l42_test_pcm_init(struct kunit *test)
 	priv->soc_card.snd_card = card;
 	priv->soc_card.dev = priv->component.dev;
 	pcm->priv = priv;
+	pcm->host_clocks = true;
 	pcm->rtd.dev = priv->component.dev;
 	pcm->rtd.card = &priv->soc_card;
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, cs42l42_test_pcm_free, pcm), 0);
@@ -401,7 +408,50 @@ static long cs42l42_test_pcm_command(struct cs42l42_test_pcm *pcm, unsigned int 
 	return snd_pcm_f_ops[SNDRV_PCM_STREAM_PLAYBACK].unlocked_ioctl(&pcm->file, cmd, 0);
 }
 
-static void cs42l42_test_resume_requires_prepare(struct kunit *test)
+/*
+ * Prepare and start a playback stream at D0, then suspend it the way ASoC
+ * does: mute at suspend, PCM suspended, and the host no longer clocking.
+ * Then the card resume's unmute at D2, and D0.
+ */
+static struct cs42l42_test_pcm *cs42l42_test_suspend_resume(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
+	struct cs42l42_test_priv *priv = test->priv;
+	struct cs42l42_test_pcm *pcm;
+
+	pcm = cs42l42_test_pcm_init(test);
+	KUNIT_ASSERT_NOT_NULL(test, pcm);
+	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
+	cs42l42_test_set_clk(test, clk->sclk, clk->rate);
+	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SETUP);
+	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
+	KUNIT_EXPECT_TRUE(test, pcm->runtime.info & SNDRV_PCM_INFO_RESUME);
+	KUNIT_ASSERT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+
+	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D3hot);
+	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 1, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	KUNIT_ASSERT_EQ(test, priv->cs42l42.stream_use, 0);
+	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SUSPENDED);
+	priv->pll_locks = false;
+	cs42l42_test_clear_log(priv);
+
+	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D2);
+	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
+
+	/* Nothing touched the clocks before the host runs the stream again */
+	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
+	KUNIT_EXPECT_EQ(test, priv->num_lock_reads, 0);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+
+	return pcm;
+}
+
+/*
+ * PCM RESUME needs no new prepare: the host's RESUME trigger clocks the ASP,
+ * and the held unmute then moves the codec onto SCLK and unmutes it.
+ */
+static void cs42l42_test_resume_unmutes_after_host_trigger(struct kunit *test)
 {
 	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
 	struct cs42l42_test_priv *priv = test->priv;
@@ -409,78 +459,171 @@ static void cs42l42_test_resume_requires_prepare(struct kunit *test)
 
 	if (!IS_ENABLED(CONFIG_PM))
 		kunit_skip(test, "card power state needs CONFIG_PM");
-	pcm = cs42l42_test_pcm_init(test);
-	KUNIT_ASSERT_NOT_NULL(test, pcm);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
-	cs42l42_test_set_clk(test, clk->sclk, clk->rate);
-	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SETUP);
-	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
-	KUNIT_EXPECT_FALSE(test, pcm->runtime.info & SNDRV_PCM_INFO_RESUME);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D3hot);
-	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 1, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SUSPENDED);
-	cs42l42_test_clear_log(priv);
-	priv->pll_locks = false;
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D2);
-	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
+	pcm = cs42l42_test_suspend_resume(test);
 
-	/* ALSA rejects before the real ASoC trigger can start any DAI. */
-	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), -ENOSYS);
-	KUNIT_EXPECT_EQ(test, pcm->resumes, 0);
-	KUNIT_EXPECT_EQ(test, pcm->suspends, 0);
-	KUNIT_EXPECT_EQ(test, pcm->runtime.state, SNDRV_PCM_STATE_SUSPENDED);
+	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+
+	KUNIT_EXPECT_EQ(test, pcm->resumes, 1);
 	KUNIT_EXPECT_EQ(test, pcm->prepares, 1);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
+	KUNIT_EXPECT_EQ(test, pcm->runtime.state, SNDRV_PCM_STATE_RUNNING);
+	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK, 0);
+	KUNIT_EXPECT_FALSE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					  &priv->cs42l42.resume_unmute));
+}
 
-	/* ALSA's documented -ENOSYS recovery is PREPARE, not a D0 callback. */
+/* A prepare instead of RESUME unmutes as usual, and the held unmute is gone */
+static void cs42l42_test_resume_prepare_replaces_held_unmute(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
+	struct cs42l42_test_priv *priv = test->priv;
+	struct cs42l42_test_pcm *pcm;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+	pcm = cs42l42_test_suspend_resume(test);
+
 	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
 	KUNIT_EXPECT_EQ(test, pcm->prepares, 2);
 	KUNIT_EXPECT_EQ(test, pcm->runtime.state, SNDRV_PCM_STATE_PREPARED);
 	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_FALSE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					  &priv->cs42l42.resume_unmute));
+
+	/* Starting it later does not switch a second time */
+	cs42l42_test_clear_log(priv);
+	KUNIT_EXPECT_EQ(test, priv->dai.driver->ops->trigger(pcm->pcm_file.substream,
+							     SNDRV_PCM_TRIGGER_START,
+							     &priv->dai), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
 	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
 }
 
-static void cs42l42_test_linked_resume_preflight(struct kunit *test)
+/* A mute before the host runs the stream drops the held unmute */
+static void cs42l42_test_resume_mute_drops_held_unmute(struct kunit *test)
 {
 	struct cs42l42_test_priv *priv = test->priv;
 	struct cs42l42_test_pcm *pcm;
-	struct snd_pcm_substream *playback, *capture;
 
 	if (!IS_ENABLED(CONFIG_PM))
 		kunit_skip(test, "card power state needs CONFIG_PM");
-	pcm = cs42l42_test_pcm_init(test);
-	KUNIT_ASSERT_NOT_NULL(test, pcm);
-	playback = pcm->pcm_file.substream;
-	capture = pcm->rtd.pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
-	capture->private_data = &pcm->rtd;
-	capture->runtime = &pcm->capture_runtime;
-	pcm->capture_runtime.info = SNDRV_PCM_INFO_RESUME;
-	pcm->capture_runtime.status = &pcm->capture_status;
-	pcm->capture_runtime.suspended_state = SNDRV_PCM_STATE_RUNNING;
-	__snd_pcm_set_state(&pcm->capture_runtime, SNDRV_PCM_STATE_SUSPENDED);
-	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SUSPENDED);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
-	KUNIT_ASSERT_EQ(test, snd_soc_pcm_dai_prepare(playback), 0);
+	pcm = cs42l42_test_suspend_resume(test);
 
-	/* Same group layout as linked ALSA streams, with capture visited first. */
-	spin_lock_init(&pcm->linked_group.lock);
-	mutex_init(&pcm->linked_group.mutex);
-	INIT_LIST_HEAD(&pcm->linked_group.substreams);
-	refcount_set(&pcm->linked_group.refs, 2);
-	list_move_tail(&capture->link_list, &pcm->linked_group.substreams);
-	list_move_tail(&playback->link_list, &pcm->linked_group.substreams);
-	capture->group = &pcm->linked_group;
-	playback->group = &pcm->linked_group;
+	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 1, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	cs42l42_test_clear_log(priv);
+	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
 
-	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), -ENOSYS);
-	KUNIT_EXPECT_EQ(test, pcm->resumes, 0);
-	KUNIT_EXPECT_EQ(test, pcm->suspends, 0);
-	KUNIT_EXPECT_EQ(test, pcm->runtime.state, SNDRV_PCM_STATE_SUSPENDED);
-	KUNIT_EXPECT_EQ(test, pcm->capture_runtime.state, SNDRV_PCM_STATE_SUSPENDED);
-	KUNIT_EXPECT_TRUE(test, pcm->capture_runtime.info & SNDRV_PCM_INFO_RESUME);
+	KUNIT_EXPECT_EQ(test, pcm->resumes, 1);
 	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
+	KUNIT_EXPECT_EQ(test, priv->num_lock_reads, 0);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+}
+
+/*
+ * If the host does not clock the stream after its RESUME trigger, the PLL
+ * does not lock: the codec stays on the oscillator with the headphone muted,
+ * and a prepare later does the whole switch.
+ */
+static void cs42l42_test_resume_without_host_clock(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
+	struct cs42l42_test_priv *priv = test->priv;
+	struct cs42l42_test_pcm *pcm;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+	pcm = cs42l42_test_suspend_resume(test);
+	pcm->host_clocks = false;
+
+	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+
+	KUNIT_EXPECT_GT(test, priv->num_lock_reads, 0);
+	KUNIT_EXPECT_EQ(test, cs42l42_test_count_writes(priv, CS42L42_OSC_SWITCH), 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_OSC_SWITCH], 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_PLL_CTL1] & CS42L42_PLL_START_MASK, 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK,
+			CS42L42_TEST_HP_MUTE_MASK);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+	KUNIT_EXPECT_TRUE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					 &priv->cs42l42.resume_unmute));
+
+	/* Stopped and prepared again, it switches */
+	cs42l42_test_clear_log(priv);
+	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SETUP);
+	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
+	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+}
+
+/*
+ * A PLL that fails to lock after RESUME keeps the unmute held: with no new
+ * prepare, the stream's next trigger from a clocking host switches the codec
+ * onto SCLK and unmutes it.
+ */
+static void cs42l42_test_resume_pll_fail_keeps_held_unmute(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[0];
+	struct cs42l42_test_priv *priv = test->priv;
+	struct snd_pcm_substream *substream;
+	struct cs42l42_test_pcm *pcm;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+	pcm = cs42l42_test_suspend_resume(test);
+	substream = pcm->pcm_file.substream;
+	pcm->host_clocks = false;
+
+	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+	KUNIT_EXPECT_GT(test, priv->num_lock_reads, 0);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK,
+			CS42L42_TEST_HP_MUTE_MASK);
+	KUNIT_EXPECT_TRUE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					 &priv->cs42l42.resume_unmute));
+
+	/* The host clocks the next START: host DAI first, then the codec DAI */
+	pcm->host_clocks = true;
+	cs42l42_test_clear_log(priv);
+	KUNIT_EXPECT_EQ(test, cs42l42_test_cpu_trigger(substream, SNDRV_PCM_TRIGGER_START,
+						       &pcm->cpu), 0);
+	KUNIT_EXPECT_EQ(test, priv->dai.driver->ops->trigger(substream,
+							     SNDRV_PCM_TRIGGER_START,
+							     &priv->dai), 0);
+	flush_work(&priv->cs42l42.resume_unmute_work);
+
+	KUNIT_EXPECT_EQ(test, pcm->prepares, 1);
+	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK, 0);
+	KUNIT_EXPECT_FALSE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					  &priv->cs42l42.resume_unmute));
+}
+
+/* A SoundWire codec is clocked by its bus: the D2 unmute goes ahead */
+static void cs42l42_test_soundwire_unmutes_below_d0(struct kunit *test)
+{
+	const struct cs42l42_test_clk_param *clk = &cs42l42_test_pll_clks[1];
+	struct cs42l42_test_priv *priv = test->priv;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+	priv->cs42l42.sdw_peripheral = kunit_kzalloc(test, sizeof(*priv->cs42l42.sdw_peripheral),
+						     GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, priv->cs42l42.sdw_peripheral);
+	cs42l42_test_set_clk(test, clk->sclk, clk->rate);
+	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D2);
+
+	KUNIT_EXPECT_EQ(test, cs42l42_mute_stream(&priv->dai, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
+
+	cs42l42_test_expect_switch_to_pll(test, clk, false);
+	KUNIT_EXPECT_FALSE(test, test_bit(SNDRV_PCM_STREAM_PLAYBACK,
+					  &priv->cs42l42.resume_unmute));
 }
 
 static void cs42l42_test_capture_resume_remains_supported(struct kunit *test)
@@ -507,147 +650,6 @@ static void cs42l42_test_capture_resume_remains_supported(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pcm->resumes, 1);
 	KUNIT_EXPECT_EQ(test, pcm->suspends, 0);
 	KUNIT_EXPECT_EQ(test, pcm->capture_runtime.state, SNDRV_PCM_STATE_RUNNING);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-}
-
-static void cs42l42_test_prepare_resume_capability_is_per_stream(struct kunit *test)
-{
-	struct cs42l42_test_priv *priv = test->priv;
-	struct snd_pcm_runtime runtime = {
-		.info = SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_MMAP,
-	};
-	struct snd_pcm_substream substream = {
-		.stream = SNDRV_PCM_STREAM_CAPTURE,
-		.runtime = &runtime,
-	};
-
-	KUNIT_ASSERT_EQ(test, snd_soc_dai_prepare(&priv->dai, &substream), 0);
-	KUNIT_EXPECT_EQ(test, runtime.info,
-			SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_MMAP);
-	substream.stream = SNDRV_PCM_STREAM_PLAYBACK;
-	KUNIT_ASSERT_EQ(test, snd_soc_dai_prepare(&priv->dai, &substream), 0);
-	KUNIT_EXPECT_EQ(test, runtime.info, SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_MMAP);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-}
-
-struct cs42l42_test_admission_param {
-	const char *name;
-	const char *root;
-	size_t root_len;
-	const char *codec;
-	size_t codec_len;
-	bool soundwire;
-	bool expected;
-};
-
-#define CS42L42_TEST_M1_ROOT(board) "apple," board "\0apple,t8103\0apple,arm-platform"
-#define CS42L42_TEST_ADMISSION(label, machine, device, sdw, admitted) \
-	{ label, machine, sizeof(machine), device, sizeof(device), sdw, admitted }
-
-static const struct cs42l42_test_admission_param cs42l42_test_admissions[] = {
-	CS42L42_TEST_ADMISSION("J274 CS42L83", CS42L42_TEST_M1_ROOT("j274"),
-			       "cirrus,cs42l83", false, true),
-	CS42L42_TEST_ADMISSION("J293 CS42L83", CS42L42_TEST_M1_ROOT("j293"),
-			       "cirrus,cs42l83", false, true),
-	CS42L42_TEST_ADMISSION("J313 CS42L83", CS42L42_TEST_M1_ROOT("j313"),
-			       "cirrus,cs42l83", false, true),
-	CS42L42_TEST_ADMISSION("J456 CS42L83", CS42L42_TEST_M1_ROOT("j456"),
-			       "cirrus,cs42l83", false, true),
-	CS42L42_TEST_ADMISSION("J457 CS42L83", CS42L42_TEST_M1_ROOT("j457"),
-			       "cirrus,cs42l83", false, true),
-	CS42L42_TEST_ADMISSION("base-M1 CS42L42", "apple,t8103",
-			       "cirrus,cs42l42", false, true),
-	CS42L42_TEST_ADMISSION("J700 CS42L83", "apple,j700\0apple,t8140",
-			       "cirrus,cs42l83", false, false),
-	CS42L42_TEST_ADMISSION("M1 Pro", "apple,j314s\0apple,t6000",
-			       "cirrus,cs42l83", false, false),
-	CS42L42_TEST_ADMISSION("M2 Air", "apple,j413\0apple,t8112",
-			       "cirrus,cs42l83", false, false),
-	CS42L42_TEST_ADMISSION("other codec", "apple,t8103",
-			       "cirrus,cs42l84", false, false),
-	CS42L42_TEST_ADMISSION("absent codec OF node", "apple,t8103",
-			       NULL, false, false),
-	CS42L42_TEST_ADMISSION("ACPI/non-OF host", NULL,
-			       "cirrus,cs42l42", false, false),
-	CS42L42_TEST_ADMISSION("CS42L42 SoundWire", "apple,t8103",
-			       "cirrus,cs42l42", true, false),
-	CS42L42_TEST_ADMISSION("CS42L83 SoundWire", "apple,t8103",
-			       "cirrus,cs42l83", true, false),
-	CS42L42_TEST_ADMISSION("generic shared-BE host", "test,shared-be",
-			       "cirrus,cs42l42", false, false),
-	CS42L42_TEST_ADMISSION("root lookalike", "apple,t8103-other",
-			       "cirrus,cs42l83", false, false),
-};
-
-static void cs42l42_test_resume_admission(struct kunit *test)
-{
-	const struct cs42l42_test_admission_param *param = test->param_value;
-	struct property root_prop = {
-		.name = "compatible", .value = (void *)param->root, .length = param->root_len,
-	};
-	struct property codec_prop = {
-		.name = "compatible", .value = (void *)param->codec, .length = param->codec_len,
-	};
-	struct device_node root = { .full_name = "/", .properties = &root_prop };
-	struct device_node codec = { .full_name = "/codec", .properties = &codec_prop };
-	bool required;
-
-	if (!IS_ENABLED(CONFIG_OF))
-		kunit_skip(test, "admission matching needs CONFIG_OF");
-	required = cs42l42_resume_workaround_required(param->root ? &root : NULL,
-						      param->codec ? &codec : NULL,
-						      param->soundwire);
-	KUNIT_EXPECT_EQ(test, required, param->expected);
-}
-
-/* Excluded hosts keep their sole D2 unmute and transparent PCM resume. */
-static void cs42l42_test_unadmitted_resume_without_prepare(struct kunit *test)
-{
-	struct cs42l42_test_priv *priv = test->priv;
-	struct cs42l42_test_pcm *pcm;
-
-	if (!IS_ENABLED(CONFIG_PM))
-		kunit_skip(test, "card power state needs CONFIG_PM");
-	priv->cs42l42.resume_reprepare = false;
-	pcm = cs42l42_test_pcm_init(test);
-	KUNIT_ASSERT_NOT_NULL(test, pcm);
-	cs42l42_test_set_clk(test, 3072000, 48000);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
-	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SETUP);
-	KUNIT_ASSERT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_PREPARE), 0);
-	KUNIT_EXPECT_TRUE(test, pcm->runtime.info & SNDRV_PCM_INFO_RESUME);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D3hot);
-	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 1, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	__snd_pcm_set_state(&pcm->runtime, SNDRV_PCM_STATE_SUSPENDED);
-	cs42l42_test_clear_log(priv);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D2);
-	KUNIT_ASSERT_EQ(test, cs42l42_mute_stream(&priv->dai, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	cs42l42_test_expect_switch_to_pll(test, &cs42l42_test_pll_clks[1], false);
-	cs42l42_test_set_power(priv, SNDRV_CTL_POWER_D0);
-	cs42l42_test_clear_log(priv);
-	KUNIT_EXPECT_EQ(test, cs42l42_test_pcm_command(pcm, SNDRV_PCM_IOCTL_RESUME), 0);
-	KUNIT_EXPECT_EQ(test, pcm->runtime.state, SNDRV_PCM_STATE_RUNNING);
-	KUNIT_EXPECT_EQ(test, pcm->prepares, 1);
-	KUNIT_EXPECT_EQ(test, pcm->resumes, 1);
-	KUNIT_EXPECT_EQ(test, priv->cs42l42.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
-	KUNIT_EXPECT_EQ(test, priv->regs[CS42L42_HP_CTL] & CS42L42_TEST_HP_MUTE_MASK, 0);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-}
-
-static void cs42l42_test_unadmitted_prepare_preserves_capabilities(struct kunit *test)
-{
-	struct cs42l42_test_priv *priv = test->priv;
-	struct snd_pcm_runtime runtime = {
-		.info = SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_MMAP,
-	};
-	struct snd_pcm_substream substream = {
-		.stream = SNDRV_PCM_STREAM_PLAYBACK, .runtime = &runtime,
-	};
-
-	priv->cs42l42.resume_reprepare = false;
-	KUNIT_ASSERT_EQ(test, snd_soc_dai_prepare(&priv->dai, &substream), 0);
-	KUNIT_EXPECT_EQ(test, runtime.info,
-			SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_MMAP);
 	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
 }
 
@@ -807,8 +809,7 @@ static int cs42l42_test_case_init(struct kunit *test)
 	/* Construct the minimal set of driver structs */
 	priv->cs42l42.dev = dev;
 	priv->cs42l42.regmap = regmap;
-	/* Existing clock-safety cases model the admitted base-M1 I2C path. */
-	priv->cs42l42.resume_reprepare = true;
+	cs42l42_init_streams(&priv->cs42l42);
 
 	priv->component.dev = dev;
 	priv->component.card = &priv->soc_card;
@@ -834,6 +835,13 @@ static int cs42l42_test_case_init(struct kunit *test)
 	return 0;
 }
 
+static void cs42l42_test_case_exit(struct kunit *test)
+{
+	struct cs42l42_test_priv *priv = test->priv;
+
+	cancel_work_sync(&priv->cs42l42.resume_unmute_work);
+}
+
 static void cs42l42_test_clk_desc(const struct cs42l42_test_clk_param *param, char *desc)
 {
 	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "SCLK %u Hz, %u Hz", param->sclk, param->rate);
@@ -844,26 +852,19 @@ static void cs42l42_test_power_desc(const struct cs42l42_test_power_param *param
 	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "%s", param->name);
 }
 
-static void cs42l42_test_admission_desc(const struct cs42l42_test_admission_param *param,
-					char *desc)
-{
-	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "%s", param->name);
-}
-
-KUNIT_ARRAY_PARAM(cs42l42_test_admissions, cs42l42_test_admissions, cs42l42_test_admission_desc);
 KUNIT_ARRAY_PARAM(cs42l42_test_pll_clks, cs42l42_test_pll_clks, cs42l42_test_clk_desc);
 KUNIT_ARRAY_PARAM(cs42l42_test_low_power, cs42l42_test_low_power, cs42l42_test_power_desc);
 
 static struct kunit_case cs42l42_test_cases[] = {
-	KUNIT_CASE_PARAM(cs42l42_test_resume_admission, cs42l42_test_admissions_gen_params),
-	KUNIT_CASE(cs42l42_test_unadmitted_resume_without_prepare),
-	KUNIT_CASE(cs42l42_test_unadmitted_prepare_preserves_capabilities),
 	KUNIT_CASE_PARAM(cs42l42_test_unmute_below_d0_does_nothing,
 			 cs42l42_test_low_power_gen_params),
-	KUNIT_CASE(cs42l42_test_resume_requires_prepare),
-	KUNIT_CASE(cs42l42_test_linked_resume_preflight),
+	KUNIT_CASE(cs42l42_test_resume_unmutes_after_host_trigger),
+	KUNIT_CASE(cs42l42_test_resume_prepare_replaces_held_unmute),
+	KUNIT_CASE(cs42l42_test_resume_mute_drops_held_unmute),
+	KUNIT_CASE(cs42l42_test_resume_without_host_clock),
+	KUNIT_CASE(cs42l42_test_resume_pll_fail_keeps_held_unmute),
+	KUNIT_CASE(cs42l42_test_soundwire_unmutes_below_d0),
 	KUNIT_CASE(cs42l42_test_capture_resume_remains_supported),
-	KUNIT_CASE(cs42l42_test_prepare_resume_capability_is_per_stream),
 	KUNIT_CASE_PARAM(cs42l42_test_unmute_pll_locked, cs42l42_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l42_test_unmute_pll_lock_timeout, cs42l42_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l42_test_unmute_after_pll_lock_timeout,
@@ -876,6 +877,7 @@ static struct kunit_case cs42l42_test_cases[] = {
 static struct kunit_suite cs42l42_test_suite = {
 	.name = "snd-soc-cs42l42-test",
 	.init = cs42l42_test_case_init,
+	.exit = cs42l42_test_case_exit,
 	.test_cases = cs42l42_test_cases,
 };
 
