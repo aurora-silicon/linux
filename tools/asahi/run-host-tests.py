@@ -365,6 +365,10 @@ ASAHI_TESTS = {
                                    'drop-publish-retry'), out()),
     'g17-highpri-sched-wq-tests.py': [([], PASS)]
         + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
+    'g17-feed-burst-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-min-run', 'single-context', 'per-ctx-gap',
+                                   'shared-linger', 'short-bound-linger', 'count-subsumed',
+                                   'clip-overlap'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
