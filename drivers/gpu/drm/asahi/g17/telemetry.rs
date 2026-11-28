@@ -3,11 +3,10 @@
 //! Qualified V25G83/V26A428 statistics, decoded from complete copied records.
 //! No record of these firmwares measures power or temperature.
 //!
-//! The 26A428 firmware (the A18 Pro's, and the M5's) and T6041's 25G83
-//! firmware report the performance state the GPU runs at (tags 0x19 and 0x1b),
-//! and their utilisation records carry their own timestamps, from which busy
-//! time is integrated ([`Protocol`]). T6040's 25G83 is left on `Protocol::NONE`
-//! because it has not been measured yet.
+//! The 26A428 firmware (the A18 Pro's, and the M5's) and the 25G83 firmware
+//! (T6040 and T6041) report the performance state the GPU runs at (tags 0x19
+//! and 0x1b), and their utilisation records carry their own timestamps, from
+//! which busy time is integrated ([`Protocol`]).
 //! All state is protected by the device mutex.
 
 pub(super) const UNAVAILABLE: u32 = 0;

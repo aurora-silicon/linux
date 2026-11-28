@@ -121,10 +121,9 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
 
 /// Whether the firmware reports its performance state. V25G83 and V26A428 accept
 /// the logical pstate record (tag 0x10) but never emit it. V26A428 (A18 Pro and
-/// M5) and T6041's 25G83 report the state in tags 0x19 and 0x1b instead
-/// (`Variant::telemetry_protocol`); T6040's 25G83 is left on `Protocol::NONE`
-/// because it has not been measured yet, so it is unsupported there. A firmware
-/// that reports it reads valid or stale.
+/// M5) and 25G83 (T6040, T6041) report the state in tags 0x19 and 0x1b instead
+/// (`Variant::telemetry_protocol`). A firmware that reports it reads valid or
+/// stale.
 pub(super) const fn reports_pstate(protocol: super::telemetry::Protocol) -> bool {
     protocol.reports_pstate()
 }

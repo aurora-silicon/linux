@@ -232,7 +232,9 @@ pub(crate) const V25G83: Variant = Variant {
     // 25G83 build since ec3ced95 and measured on the M4 Pro (J616s).
     render_id_at_create: true,
     objects_after_release: false,
-    telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
+    // Pstate reports (tags 0x19/0x1b) and 8 ms timestamped utilisation records (tag 0x13),
+    // measured on T6040 (J616s) and T6041.
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -265,6 +267,8 @@ pub(crate) const V25F84: Variant = Variant {
     // Not measured on 25F84 or on 26B123, which inherits this.
     render_stage_prefixes: false,
     render_id_at_create: false,
+    // Not measured on 25F84 or 26B123.
+    telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
     ..V25G83
 };
 

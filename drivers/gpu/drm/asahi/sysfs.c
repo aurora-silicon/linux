@@ -95,8 +95,8 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	}
 	/*
 	 * unsupported comes from the firmware match data (g17::stats): builds
-	 * without a pstate telemetry protocol (such as T6040 25G83, left on
-	 * Protocol::NONE pending measurement) have no qualified pstate support,
+	 * without a pstate telemetry protocol (such as the unmeasured 25F84 and
+	 * 26B123 G17 builds, on Protocol::NONE) have no qualified pstate support,
 	 * so it is not a transient state.
 	 * unavailable keeps meaning "no qualified sample yet".
 	 */
