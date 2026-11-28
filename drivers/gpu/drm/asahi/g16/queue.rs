@@ -305,20 +305,54 @@ impl Queue {
         }
         // Allocate and map private backing before a fence or accepted ordinal exists.
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
-        let hints = super::resources::PrepareHints {
-            expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
-            quarantined_compute_mask: self.shared.quarantined_compute_mask.load(Ordering::Acquire),
-            expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
-            quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
-            next_pb_slot: &self.shared.next_pb_slot,
-            active_render_vms: &self.shared.active_render_vms,
+        // Non-SCS compute jobs verify safe-pipe admission and register their waiter mask under
+        // `Shared::state` before acceptance, re-preparing with a fresh non-tail unit if a
+        // concurrent publication raced between `Cache::prepare()` and admission.
+        let mut quarantined_compute_mask =
+            self.shared.quarantined_compute_mask.load(Ordering::Acquire);
+        let mut pipe0_exclusive_mask = self.shared.pipe0_exclusive_mask.load(Ordering::Acquire);
+        let mut scs_compute_mask = self.shared.scs_compute_mask.load(Ordering::Acquire);
+        let mut compute_tail_mask = self.shared.compute_tail_mask.load(Ordering::Acquire);
+        let mut force_add_compute_non_tail = false;
+        let mut prev_compute_mask = 0u32;
+        let has_compute = submission.counts[command::COMPUTE] != 0;
+        let cache = self.vm.resources.as_ref().ok_or(EIO)?;
+        let resources = loop {
+            let hints = super::resources::PrepareHints {
+                quarantined_compute_mask,
+                pipe0_exclusive_mask,
+                scs_compute_mask,
+                compute_tail_mask,
+                force_add_compute_non_tail,
+                compute_vm_state: &self.shared.compute_vm_state,
+                expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
+                quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
+                next_pb_slot: &self.shared.next_pb_slot,
+                active_render_vms: &self.shared.active_render_vms,
+            };
+            let mut prepared = cache.prepare(&self.vm, &submission.commands, hints)?;
+            if !has_compute || prepared.compute_scs() {
+                break prepared;
+            }
+            let slot_mask = prepared.compute_slot_mask()?;
+            match self.shared.admit_compute_job(&mut prepared, slot_mask)? {
+                None => break prepared,
+                Some(fresh) => {
+                    if force_add_compute_non_tail && slot_mask == prev_compute_mask {
+                        // No further healthy non-tail unit can be added (device exhausted):
+                        // let engine class-exhaustion cancellation handle it cleanly.
+                        break prepared;
+                    }
+                    prev_compute_mask = slot_mask;
+                    quarantined_compute_mask = fresh.quarantined_compute_mask;
+                    pipe0_exclusive_mask = fresh.pipe0_exclusive_mask;
+                    scs_compute_mask = fresh.scs_compute_mask;
+                    compute_tail_mask = fresh.compute_tail_mask;
+                    force_add_compute_non_tail = true;
+                    drop(prepared);
+                }
+            }
         };
-        let resources = self
-            .vm
-            .resources
-            .as_ref()
-            .ok_or(EIO)?
-            .prepare(&self.vm, &submission.commands, hints)?;
         let gpu_id = Arc::as_ptr(&self.shared) as usize;
         // Record cumulative queue ordinals across both engines so coalescing multiple
         // same-queue fences in a timeline semaphore chain to the latest fence preserves

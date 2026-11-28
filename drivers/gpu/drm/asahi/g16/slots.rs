@@ -8,7 +8,7 @@
 //! Private backing and old VM leases survive until a distinct replacement fully retires.
 //! Aborted storage remains mapped and quarantined. Pool cursors are never scrubbed.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
@@ -107,6 +107,15 @@ pub(crate) struct ComputeSlot {
     /// VM-free firmware lease keeping this unit's `descriptor` and `counter` mapped in context-0
     /// UAT until a later compute retirement overwrites firmware `uma_mgr_table[1 + k]`.
     uma_lease: Arc<FwLease>,
+    /// VM ID that last claimed this private unit (`0` while freshly allocated and unused).
+    last_vm: AtomicU64,
+    /// `Slots::scrub_gen` observed when this private unit was last claimed (`0` while freshly
+    /// allocated and still zero-filled from `Objects::alloc_private_in`).
+    used_gen: AtomicU64,
+    /// Forces a full private scratch scrub on the next claim of this unit (after scrub error,
+    /// cancelled preparation, affected error, or quarantine) even if another VM uses the same
+    /// hardware slot index in between.
+    scratch_dirty: Arc<AtomicBool>,
 }
 
 /// Where a compute unit lives and how large its UMA pool is.
@@ -299,6 +308,9 @@ impl ComputeSlot {
             )?,
             seeds: placement.seeds(),
             uma_lease,
+            last_vm: AtomicU64::new(0),
+            used_gen: AtomicU64::new(0),
+            scratch_dirty: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
         };
         init_uma_pool(
             &unit.pool_state,
@@ -328,16 +340,22 @@ impl ComputeSlot {
     }
     /// Resets command-local state before reuse. Pool/list/counter/descriptor state is preserved.
     ///
-    /// Clean same-VM reuse only zeroes the 16-byte internal timestamp pair so retirement
-    /// checks cannot observe stale ticks; `work` and `seq` are overwritten by `prefix_compute`.
-    /// First use, cross-VM retarget, cancelled preparation, or post-recovery/error reuse runs
-    /// the full scrub of all scratch areas.
-    fn scrub(&self, full: bool) -> Result {
+    /// Clean same-VM reuse and clean cross-VM retargets onto distinct per-VM units zero only the
+    /// 16-byte internal timestamp pair so retirement checks cannot observe stale ticks; `work`
+    /// and `seq` are overwritten by `prefix_compute`. Device-lifetime shared command records
+    /// (`work`, `seq`) are scrubbed when `shared` is true (first use, cancel, error, or recovery).
+    /// Per-VM private WC scratch (`aux`, `context_store`, `preempt`) is already zero-filled at
+    /// allocation and is scrubbed only when `private` is true (cancel, error, recovery, or
+    /// cross-VM reuse of the same unit object).
+    fn scrub(&self, shared: bool, private: bool) -> Result {
         self.its.fill(0, 0, 16)?;
-        if !full {
+        if shared {
+            self.work.fill(0, 0, compute::WORK_SIZE)?;
+            self.seq.fill(0, 0, compute::SEQ_SIZE)?;
+        }
+        if !private {
             return Ok(());
         }
-        self.seq.fill(0, 0, 0x300)?;
         self.aux.fill(0, 0, 0x4000)?;
         self.context_store.fill(0, 0, 0x40000)?;
         self.preempt.fill(0, 0, 0x4000)
@@ -447,6 +465,15 @@ pub(crate) struct PassSlot {
     pub(crate) fs_dep: Arc<FwObject>,
     pub(crate) compute_barrier: Arc<FwObject>,
     pub(crate) fs_compute_barrier: Arc<FwObject>,
+    /// VM ID that last claimed this private pass slot (`0` while freshly allocated and unused).
+    last_vm: AtomicU64,
+    /// `Slots::scrub_gen` observed when this private pass slot was last claimed (`0` while
+    /// freshly allocated and still zero-filled from `Objects::alloc_private_in`).
+    used_gen: AtomicU64,
+    /// Forces a full private scratch scrub on the next claim of this pass slot (after scrub
+    /// error, cancelled preparation, affected error, or quarantine) even if another VM uses the
+    /// same hardware slot index in between.
+    scratch_dirty: Arc<AtomicBool>,
 }
 
 impl PassSlot {
@@ -553,6 +580,9 @@ impl PassSlot {
             fs_dep: cmds.fs_dep.clone(),
             compute_barrier: cmds.compute_barrier.clone(),
             fs_compute_barrier: cmds.fs_compute_barrier.clone(),
+            last_vm: AtomicU64::new(0),
+            used_gen: AtomicU64::new(0),
+            scratch_dirty: Arc::new(AtomicBool::new(false), GFP_KERNEL)?,
         })
     }
 
@@ -584,26 +614,41 @@ impl PassSlot {
         Ok(())
     }
 
+    fn scrub_shared(&self) -> Result {
+        self.ta_work.fill(0, 0, ta::WORK_SIZE)?;
+        self.fs_work.fill(0, 0, fs::WORK_SIZE)?;
+        self.ta_seq.fill(0, 0, ta::SEQ_OBJECT)?;
+        self.fs_seq.fill(0, 0, fs::SEQ_OBJECT)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Tracks shared/private scrub flags and dirty byte spans for one pass reset."
+    )]
     fn scrub(
         &self,
         tpc_dirty: u64,
         tilemap_start: u64,
         tilemap_len: u64,
         heap_dirty: u64,
-        full: bool,
+        shared: bool,
+        private: bool,
+        clear_its: bool,
         stats: &mut SlotStats,
     ) -> Result {
-        if !full {
+        if shared {
+            self.scrub_shared()?;
+        }
+        if !private {
+            if clear_its {
+                self.its.fill(0, 0, 32)?;
+            }
             self.scrub_clean(tilemap_start, tilemap_len, heap_dirty)?;
             stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_len);
             stats.pass_scrubs = stats.pass_scrubs.saturating_add(1);
             return Ok(());
         }
 
-        self.ta_work.fill(0, 0, ta::WORK_SIZE)?;
-        self.fs_work.fill(0, 0, fs::WORK_SIZE)?;
-        self.ta_seq.fill(0, 0, ta::SEQ_OBJECT)?;
-        self.fs_seq.fill(0, 0, fs::SEQ_OBJECT)?;
         self.ta_scratch.fill(0, 0, 0x10000)?;
         self.fs_scratch.fill(0, 0, 0x10000)?;
         self.its.fill(0, 0, 32)?;
@@ -732,11 +777,26 @@ pub(crate) struct ComputeOwners {
     /// firmware `uma_mgr_table[1 + k]`.
     retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
     pending_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
-    /// Force a full scrub on next claim (first use, cancel, error, or firmware recovery).
+    /// Force a full scrub of shared command records on next claim (first use, cancel, error,
+    /// closed-VM reclaim, or firmware recovery).
     scrub_full: [bool; sizes::COMPUTE_UNITS],
-    /// Whether the most recent claim of each compute unit required a full scrub/work write.
+    /// Whether the most recent claim of each compute unit required a full work write.
     last_full: [bool; sizes::COMPUTE_UNITS],
+    /// Private scratch-dirty flag of the current and pending unit owners so `mark_dirty`,
+    /// `release`, `quarantine`, and recovery-straddling `retire` mark the exact affected VM's
+    /// private unit dirty even if another VM uses the hardware slot in between.
+    dirty: [Option<Arc<AtomicBool>>; sizes::COMPUTE_UNITS],
+    pending_dirty: [Option<Arc<AtomicBool>>; sizes::COMPUTE_UNITS],
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0 (never
+    /// claimable by secondary pipes `1..COMPUTE_PIPES`). Starts at `INITIAL_PIPE0_RESERVED`
+    /// (`[0, 1]`) and promotes clean non-secondary-pinned replacements when a reserved unit is
+    /// permanently quarantined.
+    pipe0_reserved: u32,
 }
+
+/// Initial pipe-0-exclusive compute unit reservation (`0..PIPE1_COMPUTE_START` = `[0, 1]`).
+const INITIAL_PIPE0_RESERVED: u32 = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+const _: () = assert!(sizes::COMPUTE_UNITS <= 32 && sizes::PIPE1_COMPUTE_START < 32);
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
 const PASS_MASK: u64 = u64::MAX >> (64 - sizes::RENDER_SLOTS);
@@ -966,15 +1026,151 @@ pub(crate) struct RenderOwners {
     /// The render arena (base or extension) holding each pass slot's owner.
     arena: [Option<super::resources::PassOwnerArena>; sizes::RENDER_SLOTS],
     pending_arena: [Option<super::resources::PassOwnerArena>; sizes::RENDER_SLOTS],
-    /// Force a full scrub on next pass claim (first use, cancel, error, or firmware recovery).
+    /// Force a full scrub of shared command records on next pass claim (first use, cancel, error,
+    /// closed-VM reclaim, or firmware recovery).
     scrub_full: [bool; sizes::RENDER_SLOTS],
-    /// Whether the most recent claim of each render pass slot required a full scrub/work write.
+    /// Whether the most recent claim of each render pass slot required a full work write.
     last_full: [bool; sizes::RENDER_SLOTS],
+    /// Private scratch-dirty flag of the current and pending pass-slot owners.
+    dirty: [Option<Arc<AtomicBool>>; sizes::RENDER_SLOTS],
+    pending_dirty: [Option<Arc<AtomicBool>>; sizes::RENDER_SLOTS],
     /// Displaced pass slots staged after publication to run once `Shared::state` is released.
     staged: ScrubBatch,
     /// A clean render retired since the last unlock; stage any remaining displaced pass slots
     /// only after publication finishes so a freshly displaced slot never blocks immediate reuse.
     scrub_pending: bool,
+}
+
+/// Maximum distinct unpublished compute `slot_mask`s tracked simultaneously across all VMs.
+/// At most 63 user VMs exist on G16, each with at most a few sparse growth tiers before sharing
+/// the full `u32::MAX` mask, so 256 entries cover all concurrent VMs without heap resizing.
+const COMPUTE_WAITER_SLOTS: usize = 256;
+/// Any healthy compute mask with at least `COMPUTE_PIPES + 2` units always retains at least two
+/// non-other-tail units on pipe 0 regardless of the `COMPUTE_PIPES - 1` secondary tails.
+const FULL_SAFE_COMPUTE_UNITS: u32 = (sizes::COMPUTE_PIPES + 2) as u32;
+
+struct ComputeWaiterSlots {
+    entries: [AtomicU64; COMPUTE_WAITER_SLOTS],
+}
+
+/// Lock-free reference-counted registry of unpublished compute `slot_mask`s for accepted
+/// (`drm_sched`-queued) and `engine.pending` jobs.
+///
+/// [`Self::acquire`] is called exclusively under `Shared::state`, while [`Self::release`] may
+/// run concurrently from any thread (`Job::finish`, `Job::cancel_unstarted`, `Prepared::drop`,
+/// or publication) without locks, sleeping, or allocation. Each entry packs `(mask << 32) | count`.
+pub(crate) struct ComputeWaiters {
+    slots: KBox<ComputeWaiterSlots>,
+    scan_limit: AtomicUsize,
+    non_full_count: AtomicU32,
+    total_count: AtomicU32,
+}
+
+impl ComputeWaiters {
+    #[inline(never)]
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        let slots = KBox::init(
+            init!(ComputeWaiterSlots {
+                entries: [const { AtomicU64::new(0) }; COMPUTE_WAITER_SLOTS],
+            }),
+            GFP_KERNEL,
+        )?;
+        Ok(Arc::new(
+            Self {
+                slots,
+                scan_limit: AtomicUsize::new(0),
+                non_full_count: AtomicU32::new(0),
+                total_count: AtomicU32::new(0),
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    /// Registers one unpublished compute job with `mask`. Must be called under `Shared::state`.
+    fn acquire(&self, mask: u32) -> Result {
+        if mask == 0 {
+            return Ok(());
+        }
+        let non_full = mask.count_ones() < FULL_SAFE_COMPUTE_UNITS;
+        let limit = self
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.slots.entries[..limit] {
+            let mut cur = slot.load(Ordering::Acquire);
+            while (cur >> 32) as u32 == mask {
+                let count = cur as u32;
+                if count == 0 {
+                    break;
+                }
+                if count == u32::MAX {
+                    return Err(EBUSY);
+                }
+                let next = ((mask as u64) << 32) | u64::from(count + 1);
+                match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        if non_full {
+                            self.non_full_count.fetch_add(1, Ordering::AcqRel);
+                        }
+                        self.total_count.fetch_add(1, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                    Err(obs) => cur = obs,
+                }
+            }
+        }
+        for (i, slot) in self.slots.entries.iter().enumerate() {
+            let next = ((mask as u64) << 32) | 1u64;
+            if slot
+                .compare_exchange(0, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.scan_limit.fetch_max(i + 1, Ordering::Release);
+                if non_full {
+                    self.non_full_count.fetch_add(1, Ordering::AcqRel);
+                }
+                self.total_count.fetch_add(1, Ordering::AcqRel);
+                return Ok(());
+            }
+        }
+        Err(EBUSY)
+    }
+
+    /// Releases one unpublished compute job reservation for `mask` (`SignallingGuard`-safe).
+    pub(crate) fn release(&self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        let non_full = mask.count_ones() < FULL_SAFE_COMPUTE_UNITS;
+        let limit = self
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.slots.entries[..limit] {
+            let mut cur = slot.load(Ordering::Acquire);
+            while (cur >> 32) as u32 == mask {
+                let count = cur as u32;
+                if count == 0 {
+                    break;
+                }
+                let next = if count == 1 {
+                    0u64
+                } else {
+                    ((mask as u64) << 32) | u64::from(count - 1)
+                };
+                match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        if non_full {
+                            self.non_full_count.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        self.total_count.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
+                    Err(obs) => cur = obs,
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct Slots {
@@ -985,6 +1181,8 @@ pub(crate) struct Slots {
     pub(crate) stats: SlotStats,
     /// Shared atomic state for off-lock pre-scrubbing of displaced render pass slots.
     scrub: Arc<ScrubState>,
+    /// Unpublished compute job masks across `drm_sched` and `engine.pending`.
+    compute_waiters: Arc<ComputeWaiters>,
     /// The compute and render owners, on the heap: `Firmware` (and so `Slots`) is built on the
     /// probe's stack, which has no room for them.
     compute: KBox<ComputeOwners>,
@@ -997,9 +1195,10 @@ impl Slots {
             cursor: 0,
             pass_busy: 0,
             pass_cursor: 0,
-            scrub_gen: 0,
+            scrub_gen: 1,
             stats: SlotStats::default(),
             scrub: Arc::new(ScrubState::new(), GFP_KERNEL)?,
+            compute_waiters: ComputeWaiters::new()?,
             compute: KBox::init(
                 init!(ComputeOwners {
                     lifetime: Lifetime::new(true),
@@ -1012,6 +1211,9 @@ impl Slots {
                     pending_uma: [const { None }; sizes::COMPUTE_UNITS],
                     scrub_full: [true; sizes::COMPUTE_UNITS],
                     last_full: [true; sizes::COMPUTE_UNITS],
+                    dirty: [const { None }; sizes::COMPUTE_UNITS],
+                    pending_dirty: [const { None }; sizes::COMPUTE_UNITS],
+                    pipe0_reserved: INITIAL_PIPE0_RESERVED,
                 }),
                 GFP_KERNEL,
             )?,
@@ -1025,6 +1227,8 @@ impl Slots {
                     pending_arena: [const { None }; sizes::RENDER_SLOTS],
                     scrub_full: [true; sizes::RENDER_SLOTS],
                     last_full: [true; sizes::RENDER_SLOTS],
+                    dirty: [const { None }; sizes::RENDER_SLOTS],
+                    pending_dirty: [const { None }; sizes::RENDER_SLOTS],
                     staged: ScrubBatch::new(),
                     scrub_pending: false,
                 }),
@@ -1076,6 +1280,7 @@ impl Slots {
         self.render.lifetime.exhausted_within(n)
     }
     /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) is permanently quarantined.
+    #[allow(dead_code)]
     pub(crate) fn base_compute_quarantined(&self) -> bool {
         self.compute
             .lifetime
@@ -1107,17 +1312,297 @@ impl Slots {
         }
         false
     }
-    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
-    /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
-    /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
-    /// leases.
-    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
-        let allowed = if pipe == 0 {
+    /// Promotes clean, non-secondary-pinned replacement units into `pipe0_reserved` after a
+    /// compute quarantine so pipe 0 always retains `SCS_COMPUTE_UNITS` healthy, non-secondary-tail
+    /// units without un-reserving healthy units that earlier SCS VMs may already hold.
+    fn refresh_pipe0_reserved(&mut self) {
+        let q = self.compute.lifetime.quarantined_mask();
+        self.compute.pipe0_reserved &= !q;
+        let tail = self.compute.lifetime.secondary_tail_mask();
+        let mut usable = self.compute.pipe0_reserved & !tail;
+        if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+            return;
+        }
+        let pinned = self.compute.lifetime.secondary_pinned_mask();
+        // Tier 1: prefer units completely clear of secondary pipes so fresh SCS VMs can claim
+        // immediately without waiting on any secondary-pipe retirement.
+        for k in 0..sizes::COMPUTE_UNITS {
+            let bit = 1u32 << k;
+            if (self.compute.pipe0_reserved & bit) == 0 && ((q | pinned) & bit) == 0 {
+                self.compute.pipe0_reserved |= bit;
+                usable |= bit;
+                if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+                    return;
+                }
+            }
+        }
+        // Tier 2: if all non-reserved units are simultaneously active on secondary pipes, promote
+        // a non-tail unit that will be displaced as soon as its secondary pipe's newer in-flight
+        // publication retires.
+        for k in 0..sizes::COMPUTE_UNITS {
+            let bit = 1u32 << k;
+            if (self.compute.pipe0_reserved & bit) == 0 && ((q | tail) & bit) == 0 {
+                self.compute.pipe0_reserved |= bit;
+                usable |= bit;
+                if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+                    return;
+                }
+            }
+        }
+    }
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0
+    /// (`0..PIPE1_COMPUTE_START` = `[0, 1]` when healthy, sliding past quarantined units and any
+    /// unit pinned by a secondary pipe).
+    pub(crate) fn pipe0_exclusive_mask(&self) -> u32 {
+        self.compute.pipe0_reserved
+    }
+    /// Bitmask of up to `SCS_COMPUTE_UNITS` healthy, non-secondary-tail units in
+    /// [`Self::pipe0_exclusive_mask`] for fresh SCS compute VMs to bind.
+    pub(crate) fn scs_compute_mask(&self) -> u32 {
+        let reserved = self.compute.pipe0_reserved;
+        if reserved == INITIAL_PIPE0_RESERVED {
+            return reserved;
+        }
+        let q = self.compute.lifetime.quarantined_mask();
+        let tail = self.compute.lifetime.secondary_tail_mask();
+        let mut out = 0u32;
+        let mut found = 0usize;
+        for pass in [reserved & !q & !tail, reserved & !q] {
+            let mut rem = pass & !out;
+            while rem != 0 && found < sizes::SCS_COMPUTE_UNITS {
+                let k = rem.trailing_zeros();
+                rem &= rem - 1;
+                out |= 1u32 << k;
+                found += 1;
+            }
+        }
+        out
+    }
+    /// Submask of `mask` eligible for `pipe` (pipe 0 may use any unit; secondary pipes exclude
+    /// [`Self::pipe0_exclusive_mask`]).
+    pub(crate) fn compute_allowed_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+        if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
-        self.compute_available_in_mask(allowed)
+            mask & !self.pipe0_exclusive_mask()
+        }
+    }
+    /// Bitmask of compute units that are currently the newest non-quarantined (`Published` or
+    /// `Retired`) publication on any compute pipe (`0..COMPUTE_PIPES`).
+    pub(crate) fn compute_tail_mask(&self) -> u32 {
+        self.compute.lifetime.pipe_tails_mask(usize::MAX)
+    }
+    /// Bitmask of compute pipes whose newest non-quarantined (`Published` or `Retired`)
+    /// publication is currently an owner inside `mask`.
+    pub(crate) fn compute_tail_pipes_in_mask(&self, mask: u32) -> u32 {
+        self.compute.lifetime.tail_pipes_in_mask(mask)
+    }
+    /// Whether `pipe`'s allowed submask of `mask` retains at least two healthy units clear of
+    /// other pipes' undisplaced tails (or the sole healthy unit when `<= 1` healthy unit exists
+    /// in `mask`), so running on `pipe` cannot strand a sparse VM's remaining units across two
+    /// different pipes.
+    pub(crate) fn compute_pipe_has_safe_pair(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let q = self.compute.lifetime.quarantined_mask();
+        let healthy_allowed = allowed & !q;
+        if healthy_allowed == 0 {
+            return false;
+        }
+        if (mask & !q).count_ones() <= 1 {
+            return true;
+        }
+        let other_tails = self.compute.lifetime.pipe_tails_mask(pipe);
+        (healthy_allowed & !other_tails).count_ones() >= 2
+    }
+    /// Whether `mask` has at least one compute pipe (`0..COMPUTE_PIPES`) retaining at least two
+    /// healthy units clear of every other pipe's tail in `tails`.
+    fn mask_has_safe_pipe_with_tails(
+        mask: u32,
+        q: u32,
+        p0_mask: u32,
+        tails: &[u8; 32],
+    ) -> bool {
+        let mut all_tails = 0u32;
+        for &k in &tails[..sizes::COMPUTE_PIPES] {
+            if k != u8::MAX {
+                all_tails |= 1u32 << k;
+            }
+        }
+        let healthy_p0 = mask & !q;
+        let healthy_sec = (mask & !p0_mask) & !q;
+        for p in 0..sizes::COMPUTE_PIPES {
+            let healthy_allowed = if p == 0 { healthy_p0 } else { healthy_sec };
+            if healthy_allowed == 0 {
+                continue;
+            }
+            let own_tail = if tails[p] != u8::MAX {
+                1u32 << tails[p]
+            } else {
+                0
+            };
+            let other_tails = all_tails & !own_tail;
+            if (healthy_allowed & !other_tails).count_ones() >= 2 {
+                return true;
+            }
+        }
+        false
+    }
+    /// Whether claiming `candidate` onto `pipe` (making it `pipe`'s new tail) would transition
+    /// any currently registered unpublished compute waiter from having a safe pipe to having none.
+    fn claim_strands_waiter_with_tails(
+        &self,
+        candidate: usize,
+        pipe: usize,
+        q: u32,
+        p0_mask: u32,
+        tails: &[u8; 32],
+    ) -> bool {
+        if q == 0 {
+            if self.compute_waiters.non_full_count.load(Ordering::Acquire) == 0 {
+                return false;
+            }
+        } else if self.compute_waiters.total_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let bit = 1u32 << candidate;
+        let mut tails_after = *tails;
+        tails_after[pipe] = candidate as u8;
+        let limit = self
+            .compute_waiters
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.compute_waiters.slots.entries[..limit] {
+            let entry = slot.load(Ordering::Acquire);
+            if (entry as u32) == 0 {
+                continue;
+            }
+            let waiter_mask = (entry >> 32) as u32;
+            if (waiter_mask & bit) == 0 {
+                continue;
+            }
+            if (waiter_mask & !q).count_ones() >= FULL_SAFE_COMPUTE_UNITS {
+                continue;
+            }
+            if Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, tails)
+                && !Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, &tails_after)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    /// Submask of `candidates` whose claim onto `pipe` would strand a queued/pending compute job.
+    pub(crate) fn compute_stranding_mask_for_pipe(&self, pipe: usize, candidates: u32) -> u32 {
+        if candidates == 0 {
+            return 0;
+        }
+        let q = self.compute.lifetime.quarantined_mask();
+        if q == 0 {
+            if self.compute_waiters.non_full_count.load(Ordering::Acquire) == 0 {
+                return 0;
+            }
+        } else if self.compute_waiters.total_count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let limit = self
+            .compute_waiters
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        let mut waiter_union = 0u32;
+        for slot in &self.compute_waiters.slots.entries[..limit] {
+            let entry = slot.load(Ordering::Acquire);
+            if (entry as u32) == 0 {
+                continue;
+            }
+            let waiter_mask = (entry >> 32) as u32;
+            if (waiter_mask & !q).count_ones() < FULL_SAFE_COMPUTE_UNITS {
+                waiter_union |= waiter_mask;
+            }
+        }
+        let mut rem = candidates & waiter_union;
+        if rem == 0 {
+            return 0;
+        }
+        let p0_mask = self.pipe0_exclusive_mask();
+        let tails = self.compute.lifetime.pipe_tails();
+        let mut blocked = 0u32;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS
+                && self.compute.lifetime.available(k)
+                && self.claim_strands_waiter_with_tails(k, pipe, q, p0_mask, &tails)
+            {
+                blocked |= 1u32 << k;
+            }
+        }
+        blocked
+    }
+    /// Verifies under `Shared::state` that `mask` currently has a safe compute pipe with at least
+    /// one non-stranding displacing unit, and atomically registers `mask` in `compute_waiters`.
+    /// Returns `Ok(Some(waiters))` when admitted, `Ok(None)` when a lost `prepare -> submit` race
+    /// left `mask` without a safe pipe (caller must drop `Shared::state`, refresh hints, and grow
+    /// `mask` with a non-tail unit), or `Err(EBUSY)` if the waiter table is full.
+    pub(crate) fn admit_compute_mask(&self, mask: u32) -> Result<Option<Arc<ComputeWaiters>>> {
+        let q = self.compute.lifetime.quarantined_mask();
+        let p0_mask = self.pipe0_exclusive_mask();
+        let tails = self.compute.lifetime.pipe_tails();
+        let mut all_tails = 0u32;
+        for &k in &tails[..sizes::COMPUTE_PIPES] {
+            if k != u8::MAX {
+                all_tails |= 1u32 << k;
+            }
+        }
+        let healthy_p0 = mask & !q;
+        let healthy_sec = (mask & !p0_mask) & !q;
+        let mut ok = false;
+        'pipes: for p in 0..sizes::COMPUTE_PIPES {
+            let healthy_allowed = if p == 0 { healthy_p0 } else { healthy_sec };
+            if healthy_allowed == 0 {
+                continue;
+            }
+            let own_tail = if tails[p] != u8::MAX {
+                1u32 << tails[p]
+            } else {
+                0
+            };
+            let other_tails = all_tails & !own_tail;
+            let safe_units = healthy_allowed & !other_tails;
+            if safe_units.count_ones() < 2 {
+                continue;
+            }
+            let mut displacing = safe_units & !own_tail;
+            while displacing != 0 {
+                let k = displacing.trailing_zeros() as usize;
+                displacing &= displacing - 1;
+                if !self.claim_strands_waiter_with_tails(k, p, q, p0_mask, &tails) {
+                    ok = true;
+                    break 'pipes;
+                }
+            }
+        }
+        if !ok {
+            return Ok(None);
+        }
+        self.compute_waiters.acquire(mask)?;
+        Ok(Some(self.compute_waiters.clone()))
+    }
+    /// Whether `pipe` currently has an available non-stranding unit in `mask` and satisfies
+    /// [`Self::compute_pipe_has_safe_pair`].
+    pub(crate) fn compute_pipe_safe_for_mask(&self, mask: u32, pipe: usize) -> bool {
+        self.compute_available_in_mask_for_pipe(mask, pipe)
+            && self.compute_pipe_has_safe_pair(mask, pipe)
+    }
+    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now without stranding
+    /// a queued/pending compute job. Pipe 0 may claim any bit in `mask`; secondary pipes exclude
+    /// [`Self::pipe0_exclusive_mask`] so base-only and SCS VMs never contend with undisplaced
+    /// secondary-pipe leases.
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let blocked = self.compute_stranding_mask_for_pipe(pipe, allowed);
+        self.compute_available_in_mask(allowed & !blocked)
     }
     /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
     #[allow(dead_code)]
@@ -1269,9 +1754,11 @@ impl Slots {
                 && self.compute.pending_owner[k].is_none()
                 && self.compute.pending_arena[k].is_none()
                 && self.compute.pending_uma[k].is_none()
+                && self.compute.pending_dirty[k].is_none()
             {
                 self.compute.owner[k] = None;
                 self.compute.arena[k] = None;
+                self.compute.dirty[k] = None;
                 self.compute.scrub_full[k] = true;
                 self.compute.last_full[k] = true;
             } else {
@@ -1297,6 +1784,7 @@ impl Slots {
                 && self.render.lifetime.available(k)
                 && self.render.pending_owner[k].is_none()
                 && self.render.pending_arena[k].is_none()
+                && self.render.pending_dirty[k].is_none()
             {
                 if self.scrub.is_scrubbing(k) {
                     self.scrub.waiter.store(true, Ordering::SeqCst);
@@ -1304,6 +1792,7 @@ impl Slots {
                 if !self.scrub.is_scrubbing(k) {
                     self.render.owner[k] = None;
                     self.render.arena[k] = None;
+                    self.render.dirty[k] = None;
                     self.render.scrub_full[k] = true;
                     self.render.last_full[k] = true;
                     self.scrub.clear_clean(k);
@@ -1334,13 +1823,11 @@ impl Slots {
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
         self.free_compute_in_for_pipe(n, 0)
     }
-    /// Available compute units in `mask` eligible for `pipe`.
+    /// Available compute units in `mask` eligible for `pipe` without stranding queued waiters.
     pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
-        let mut rem = if pipe == 0 {
-            mask
-        } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let blocked = self.compute_stranding_mask_for_pipe(pipe, allowed);
+        let mut rem = allowed & !blocked;
         let mut count = 0u32;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -1365,7 +1852,8 @@ impl Slots {
     /// Forces a full scrub on the next claim of every slot (after firmware recovery).
     #[allow(dead_code)]
     pub(crate) fn invalidate_scrub(&mut self) {
-        self.scrub_gen = self.scrub_gen.wrapping_add(1);
+        let next = self.scrub_gen.wrapping_add(1);
+        self.scrub_gen = if next == 0 { 1 } else { next };
         self.compute.scrub_full = [true; sizes::COMPUTE_UNITS];
         self.render.scrub_full = [true; sizes::RENDER_SLOTS];
         self.render.scrub_pending = false;
@@ -1376,8 +1864,15 @@ impl Slots {
     #[allow(dead_code)]
     pub(crate) fn mark_dirty(&mut self, f: &Claims) {
         for &k in &f.slot[..(f.slot_count as usize).min(f.slot.len())] {
-            if let Some(dirty) = self.compute.scrub_full.get_mut(k as usize) {
+            let k = k as usize;
+            if let Some(dirty) = self.compute.scrub_full.get_mut(k) {
                 *dirty = true;
+            }
+            if let Some(flag) = self.compute.dirty.get(k).and_then(|d| d.as_ref()) {
+                flag.store(true, Ordering::Release);
+            }
+            if let Some(flag) = self.compute.pending_dirty.get(k).and_then(|d| d.as_ref()) {
+                flag.store(true, Ordering::Release);
             }
         }
         let mut mask = f.pass_mask & PASS_MASK;
@@ -1385,6 +1880,12 @@ impl Slots {
             let k = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             self.render.scrub_full[k] = true;
+            if let Some(flag) = &self.render.dirty[k] {
+                flag.store(true, Ordering::Release);
+            }
+            if let Some(flag) = &self.render.pending_dirty[k] {
+                flag.store(true, Ordering::Release);
+            }
             self.scrub.clear_clean(k);
         }
     }
@@ -1428,31 +1929,39 @@ impl Slots {
         }
         // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
         // before falling back to round-robin over `allowed`: pipe 0 spans `mask`, while
-        // secondary pipes stay in `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START`
-        // only ever hold pipe-0 leases and 2-unit base/SCS VMs never split across two pipes.
+        // secondary pipes exclude `pipe0_exclusive_mask()` so base-only and SCS VMs never split
+        // across two pipes or contend with undisplaced secondary-pipe leases.
         let mask = units.compute_slot_mask()?;
-        let allowed = if pipe == 0 {
-            mask
-        } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
+        let p0_mask = self.pipe0_exclusive_mask();
+        let allowed = if pipe == 0 { mask } else { mask & !p0_mask };
+        let allowed = allowed & !self.compute_stranding_mask_for_pipe(pipe, allowed);
         if allowed == 0 {
             return Ok(None);
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
-        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
-        // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
-        // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
-        // secondary pipes keep maximum unit headroom.
-        let tiers: [u32; 2] = if pipe == 0 {
-            [allowed & p0_mask, allowed & !p0_mask]
+        // Prefer units whose pair partner (`k ^ 1`) is not currently the newest publication
+        // (tail) of another pipe `q != pipe` so deep bursts on one pipe avoid stranding another
+        // pipe's pair across two pipes; within pipe 0, prefer pipe-0-exclusive units first.
+        let other_tails = self.compute.lifetime.pipe_tails_mask(pipe);
+        let other_tail_partners =
+            ((other_tails & 0x5555_5555) << 1) | ((other_tails & 0xAAAA_AAAA) >> 1);
+        let pair_safe = allowed & !other_tail_partners;
+        let pair_borrow = allowed & other_tail_partners;
+        let tiers: [u32; 4] = if pipe == 0 {
+            [
+                pair_safe & p0_mask,
+                pair_borrow & p0_mask,
+                pair_safe & !p0_mask,
+                pair_borrow & !p0_mask,
+            ]
         } else {
-            [allowed, 0]
+            [pair_safe, pair_borrow, 0, 0]
         };
         let mut chosen = None;
         if let Some(id) = vm_id {
-            // 1. Reuse a warm unit already owned by `vm_id` (preferring pipe-0-exclusive units).
+            // 1. Reuse a warm unit already owned by `vm_id`, preferring pair-safe units
+            //    (and pipe-0-exclusive units on pipe 0).
             'warm: for tier in tiers {
                 if tier == 0 {
                     continue;
@@ -1490,7 +1999,7 @@ impl Slots {
                 }
             }
         }
-        // 3. Fall back to round-robin over any available unit (preferring pipe-0-exclusive).
+        // 3. Fall back to round-robin over any available unit (pair-safe first).
         if chosen.is_none() {
             'any: for tier in tiers {
                 if tier == 0 {
@@ -1508,22 +2017,45 @@ impl Slots {
         let Some(k) = chosen else {
             return Ok(None);
         };
+        let unit = match units.compute_unit(k) {
+            Ok(unit) => unit,
+            Err(e) => {
+                self.compute.lifetime.cancel(k);
+                return Err(e);
+            }
+        };
         let arena_changed = self.compute.arena[k]
             .as_ref()
             .zip(units.compute_arena(k).as_ref())
             .is_some_and(|(a, b)| !Arc::ptr_eq(a, b));
-        let full = self.compute.scrub_full[k]
-            || arena_changed
-            || vm_id.is_none_or(|id| {
-                self.compute.owner[k]
-                    .as_ref()
-                    .is_none_or(|prev| prev.id != id)
-            });
-        if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
+        let owner_changed = vm_id.is_none_or(|id| {
+            self.compute.owner[k]
+                .as_ref()
+                .is_none_or(|prev| prev.id != id)
+        });
+        let ugen = unit.used_gen.load(Ordering::Acquire);
+        let last_vm = unit.last_vm.load(Ordering::Acquire);
+        let slot_vm_changed = match vm_id {
+            Some(id) => ugen != 0 && last_vm != id,
+            None => true,
+        };
+        let need_private_scrub = unit.scratch_dirty.load(Ordering::Acquire)
+            || (ugen != 0 && ugen != self.scrub_gen)
+            || slot_vm_changed;
+        let need_shared_scrub = self.compute.scrub_full[k] || need_private_scrub;
+        let full_work = need_shared_scrub || arena_changed || owner_changed;
+        if let Err(e) = unit.scrub(need_shared_scrub, need_private_scrub) {
+            unit.scratch_dirty.store(true, Ordering::Release);
+            self.compute.scrub_full[k] = true;
             self.compute.lifetime.cancel(k);
             return Err(e);
         }
-        self.compute.last_full[k] = full;
+        unit.scratch_dirty
+            .store(vm_id.is_none(), Ordering::Release);
+        unit.last_vm.store(vm_id.unwrap_or(0), Ordering::Release);
+        unit.used_gen.store(self.scrub_gen, Ordering::Release);
+        self.compute.pending_dirty[k] = Some(unit.scratch_dirty.clone());
+        self.compute.last_full[k] = full_work;
         f.slot[f.slot_count as usize] = k as u32;
         f.slot_count += 1;
         f.compute_pipe = pipe as u8;
@@ -1621,12 +2153,16 @@ impl Slots {
                     continue;
                 }
                 let clean = self.scrub.is_clean(k);
-                let full_clean = clean
+                let ugen = p.used_gen.load(Ordering::Acquire);
+                let own_scratch_clean = !p.scratch_dirty.load(Ordering::Acquire)
+                    && (ugen == 0 || ugen == self.scrub_gen);
+                let own_clean = own_scratch_clean
                     && resources.render_pass_dirty(k).is_ok_and(|d| {
                         let need = d.tilemap.load(Ordering::Acquire).min(geo.tilemap_bytes);
                         need <= d.tilemap_clean.load(Ordering::Acquire)
                             && d.heap.load(Ordering::Acquire) == 0
                     });
+                let full_clean = clean && own_clean;
                 if let Some(id) = vm_id {
                     let same_vm = !self.render.scrub_full[k]
                         && self.render.owner[k].as_ref().is_some_and(|o| o.id == id);
@@ -1640,12 +2176,12 @@ impl Slots {
                             same_dirty.get_or_insert(k);
                         }
                     } else if self.render.owner[k].is_none() {
-                        if full_clean {
+                        if own_clean {
                             unowned_clean.get_or_insert(k);
                         } else {
                             unowned_dirty.get_or_insert(k);
                         }
-                    } else if full_clean {
+                    } else if own_clean {
                         other_full_clean.get_or_insert(k);
                     } else if clean {
                         other_clean_partial.get_or_insert(k);
@@ -1715,18 +2251,39 @@ impl Slots {
         }
         self.fold_scrub_stats();
         // Only a retired displaced owner may reach here; no in-flight storage is reset.
-        let full = self.render.scrub_full[k]
-            || vm_id.is_none_or(|id| {
-                self.render.owner[k]
-                    .as_ref()
-                    .is_none_or(|prev| prev.id != id)
-            });
-        let pre_cleaned = self.scrub.take_clean(k);
         let p = &arena.passes[k];
-        if full {
+        let owner_changed = vm_id.is_none_or(|id| {
+            self.render.owner[k]
+                .as_ref()
+                .is_none_or(|prev| prev.id != id)
+        });
+        let ugen = p.used_gen.load(Ordering::Acquire);
+        let last_vm = p.last_vm.load(Ordering::Acquire);
+        let slot_vm_changed = match vm_id {
+            Some(id) => ugen != 0 && last_vm != id,
+            None => true,
+        };
+        let need_private_scrub = p.scratch_dirty.load(Ordering::Acquire)
+            || (ugen != 0 && ugen != self.scrub_gen)
+            || slot_vm_changed;
+        let need_shared_scrub = self.render.scrub_full[k] || need_private_scrub;
+        let full_work = need_shared_scrub || owner_changed;
+        let pre_cleaned = self.scrub.take_clean(k);
+        if need_private_scrub {
             let prev_tpc = arena.tpc_dirty[k].load(Ordering::Acquire);
             let prev_tilemap = arena.tilemap_dirty[k].load(Ordering::Acquire);
-            if let Err(e) = p.scrub(prev_tpc, 0, prev_tilemap, 0x4000, true, &mut self.stats) {
+            if let Err(e) = p.scrub(
+                prev_tpc,
+                0,
+                prev_tilemap,
+                0x4000,
+                need_shared_scrub,
+                true,
+                true,
+                &mut self.stats,
+            ) {
+                p.scratch_dirty.store(true, Ordering::Release);
+                self.render.scrub_full[k] = true;
                 self.render.lifetime.cancel(k);
                 return Err(e);
             }
@@ -1740,8 +2297,23 @@ impl Slots {
             let already = arena.tilemap_clean[k].load(Ordering::Acquire);
             let heap = arena.heap_dirty[k].load(Ordering::Acquire);
             let delta = prev_dirty.saturating_sub(already);
-            if !(pre_cleaned && delta == 0 && heap == 0) {
-                if let Err(e) = p.scrub(0, already, delta, heap, false, &mut self.stats) {
+            let clear_its = full_work;
+            if need_shared_scrub
+                || clear_its
+                || !(pre_cleaned && !owner_changed && delta == 0 && heap == 0)
+            {
+                if let Err(e) = p.scrub(
+                    0,
+                    already,
+                    delta,
+                    heap,
+                    need_shared_scrub,
+                    false,
+                    clear_its,
+                    &mut self.stats,
+                ) {
+                    p.scratch_dirty.store(true, Ordering::Release);
+                    self.render.scrub_full[k] = true;
                     self.render.lifetime.cancel(k);
                     return Err(e);
                 }
@@ -1750,7 +2322,11 @@ impl Slots {
                 arena.tilemap_clean[k].store(0, Ordering::Relaxed);
             }
         }
-        self.render.last_full[k] = full;
+        p.scratch_dirty.store(vm_id.is_none(), Ordering::Release);
+        p.last_vm.store(vm_id.unwrap_or(0), Ordering::Release);
+        p.used_gen.store(self.scrub_gen, Ordering::Release);
+        self.render.pending_dirty[k] = Some(p.scratch_dirty.clone());
+        self.render.last_full[k] = full_work;
         self.pass_cursor = ((k + 1) % n) as u32;
         Ok(())
     }
@@ -1768,19 +2344,52 @@ impl Slots {
             return Err(EBUSY);
         }
         self.fold_scrub_stats();
-        let full = self.render.scrub_full[k]
-            || vm_id.is_none_or(|id| {
-                self.render.owner[k]
-                    .as_ref()
-                    .is_none_or(|prev| prev.id != id)
-            });
+        let p = match resources.render_pass(k) {
+            Ok(p) => p,
+            Err(e) => {
+                self.render.lifetime.cancel(k);
+                return Err(e);
+            }
+        };
+        let d = match resources.render_pass_dirty(k) {
+            Ok(d) => d,
+            Err(e) => {
+                self.render.lifetime.cancel(k);
+                return Err(e);
+            }
+        };
+        let owner_changed = vm_id.is_none_or(|id| {
+            self.render.owner[k]
+                .as_ref()
+                .is_none_or(|prev| prev.id != id)
+        });
+        let ugen = p.used_gen.load(Ordering::Acquire);
+        let last_vm = p.last_vm.load(Ordering::Acquire);
+        let slot_vm_changed = match vm_id {
+            Some(id) => ugen != 0 && last_vm != id,
+            None => true,
+        };
+        let need_private_scrub = p.scratch_dirty.load(Ordering::Acquire)
+            || (ugen != 0 && ugen != self.scrub_gen)
+            || slot_vm_changed;
+        let need_shared_scrub = self.render.scrub_full[k] || need_private_scrub;
+        let full_work = need_shared_scrub || owner_changed;
         let pre_cleaned = self.scrub.take_clean(k);
-        let p = resources.render_pass(k)?;
-        let d = resources.render_pass_dirty(k)?;
-        if full {
+        if need_private_scrub {
             let prev_tpc = d.tpc.load(Ordering::Acquire);
             let prev_tilemap = d.tilemap.load(Ordering::Acquire);
-            if let Err(e) = p.scrub(prev_tpc, 0, prev_tilemap, 0x4000, true, &mut self.stats) {
+            if let Err(e) = p.scrub(
+                prev_tpc,
+                0,
+                prev_tilemap,
+                0x4000,
+                need_shared_scrub,
+                true,
+                true,
+                &mut self.stats,
+            ) {
+                p.scratch_dirty.store(true, Ordering::Release);
+                self.render.scrub_full[k] = true;
                 self.render.lifetime.cancel(k);
                 return Err(e);
             }
@@ -1790,16 +2399,32 @@ impl Slots {
             d.tilemap_clean.store(0, Ordering::Relaxed);
             d.heap.store(0, Ordering::Relaxed);
         } else {
-            // On clean same-VM reuse, zero only the uncleaned overlap with the current pass's
-            // tilemap (`already..need`) and the active heap span; preserve the high-water mark
-            // in `d.tilemap` for cross-VM or recovery full scrubs.
+            // On clean reuse (same-VM or clean cross-VM retarget onto this VM's own pass slot),
+            // zero only the uncleaned overlap with the current pass's tilemap (`already..need`)
+            // and active heap span; preserve the high-water mark in `d.tilemap` for recovery or
+            // dirty-slot full scrubs.
             let prev_dirty = d.tilemap.load(Ordering::Acquire);
             let already = d.tilemap_clean.load(Ordering::Acquire);
             let heap = d.heap.load(Ordering::Acquire);
             let need = prev_dirty.min(tilemap_bytes);
             let delta = need.saturating_sub(already);
-            if !(pre_cleaned && delta == 0 && heap == 0) {
-                if let Err(e) = p.scrub(0, already, delta, heap, false, &mut self.stats) {
+            let clear_its = full_work;
+            if need_shared_scrub
+                || clear_its
+                || !(pre_cleaned && !owner_changed && delta == 0 && heap == 0)
+            {
+                if let Err(e) = p.scrub(
+                    0,
+                    already,
+                    delta,
+                    heap,
+                    need_shared_scrub,
+                    false,
+                    clear_its,
+                    &mut self.stats,
+                ) {
+                    p.scratch_dirty.store(true, Ordering::Release);
+                    self.render.scrub_full[k] = true;
                     self.render.lifetime.cancel(k);
                     return Err(e);
                 }
@@ -1812,7 +2437,11 @@ impl Slots {
                 }
             }
         }
-        self.render.last_full[k] = full;
+        p.scratch_dirty.store(vm_id.is_none(), Ordering::Release);
+        p.last_vm.store(vm_id.unwrap_or(0), Ordering::Release);
+        p.used_gen.store(self.scrub_gen, Ordering::Release);
+        self.render.pending_dirty[k] = Some(p.scratch_dirty.clone());
+        self.render.last_full[k] = full_work;
         self.pass_cursor = ((k + 1) % n) as u32;
         Ok(())
     }
@@ -2077,13 +2706,21 @@ impl Slots {
         self.render.lifetime = p;
         let clean_scrub = f.scrub_gen == self.scrub_gen;
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
-            self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
-            if let Some(lease) = self.compute.pending_uma[k as usize].take() {
-                self.compute.retained_uma[k as usize] = Some(lease);
+            let k = k as usize;
+            self.compute.owner[k] = self.compute.pending_owner[k].take();
+            self.compute.arena[k] = self.compute.pending_arena[k].take();
+            let pending_dirty = self.compute.pending_dirty[k].take();
+            if !clean_scrub {
+                if let Some(flag) = &pending_dirty {
+                    flag.store(true, Ordering::Release);
+                }
+            }
+            self.compute.dirty[k] = pending_dirty;
+            if let Some(lease) = self.compute.pending_uma[k].take() {
+                self.compute.retained_uma[k] = Some(lease);
             }
             if clean_scrub {
-                self.compute.scrub_full[k as usize] = false;
+                self.compute.scrub_full[k] = false;
             }
         }
         let mut mask = f.pass_mask & PASS_MASK;
@@ -2092,6 +2729,13 @@ impl Slots {
             mask &= mask - 1;
             self.render.owner[k] = self.render.pending_owner[k].take();
             self.render.arena[k] = self.render.pending_arena[k].take();
+            let pending_dirty = self.render.pending_dirty[k].take();
+            if !clean_scrub {
+                if let Some(flag) = &pending_dirty {
+                    flag.store(true, Ordering::Release);
+                }
+            }
+            self.render.dirty[k] = pending_dirty;
             if clean_scrub {
                 self.render.scrub_full[k] = false;
             }
@@ -2105,10 +2749,21 @@ impl Slots {
         Ok(())
     }
     pub(crate) fn quarantine(&mut self, f: &mut Claims) {
+        let compute_quarantined = f.slot_count != 0;
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute.lifetime.quarantine(k as usize);
-            self.compute.pending_retarget[k as usize] = None;
-            self.compute.scrub_full[k as usize] = true;
+            let k = k as usize;
+            self.compute.lifetime.quarantine(k);
+            self.compute.pending_retarget[k] = None;
+            if let Some(flag) = &self.compute.dirty[k] {
+                flag.store(true, Ordering::Release);
+            }
+            if let Some(flag) = self.compute.pending_dirty[k].take() {
+                flag.store(true, Ordering::Release);
+            }
+            self.compute.scrub_full[k] = true;
+        }
+        if compute_quarantined {
+            self.refresh_pipe0_reserved();
         }
         let mut mask = f.pass_mask & PASS_MASK;
         while mask != 0 {
@@ -2116,6 +2771,12 @@ impl Slots {
             mask &= mask - 1;
             self.render.lifetime.quarantine(k);
             self.render.pending_retarget[k] = None;
+            if let Some(flag) = &self.render.dirty[k] {
+                flag.store(true, Ordering::Release);
+            }
+            if let Some(flag) = self.render.pending_dirty[k].take() {
+                flag.store(true, Ordering::Release);
+            }
             self.render.scrub_full[k] = true;
             self.scrub.clear_clean(k);
         }
@@ -2129,12 +2790,16 @@ impl Slots {
     /// Cancels preparation only. Published units require retire() or quarantine().
     pub(crate) fn release(&mut self, f: &mut Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
-            self.compute.lifetime.cancel(k as usize);
-            self.compute.pending_retarget[k as usize] = None;
-            self.compute.pending_owner[k as usize] = None;
-            self.compute.pending_arena[k as usize] = None;
-            self.compute.pending_uma[k as usize] = None;
-            self.compute.scrub_full[k as usize] = true;
+            let k = k as usize;
+            self.compute.lifetime.cancel(k);
+            self.compute.pending_retarget[k] = None;
+            self.compute.pending_owner[k] = None;
+            self.compute.pending_arena[k] = None;
+            self.compute.pending_uma[k] = None;
+            if let Some(flag) = self.compute.pending_dirty[k].take() {
+                flag.store(true, Ordering::Release);
+            }
+            self.compute.scrub_full[k] = true;
         }
         let mut mask = f.pass_mask & PASS_MASK;
         while mask != 0 {
@@ -2144,6 +2809,9 @@ impl Slots {
             self.render.pending_retarget[k] = None;
             self.render.pending_owner[k] = None;
             self.render.pending_arena[k] = None;
+            if let Some(flag) = self.render.pending_dirty[k].take() {
+                flag.store(true, Ordering::Release);
+            }
             self.render.scrub_full[k] = true;
             self.scrub.clear_clean(k);
         }

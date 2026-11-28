@@ -255,6 +255,8 @@ impl Job {
                 self.vm.status.record(error);
             }
         }
+        self.resources.release_compute_waiter();
+        self.resources.release_active_computes();
         self.fence.signal(result);
     }
 
@@ -655,6 +657,8 @@ impl Job {
         } else if !self.progress.signaled.swap(true, Ordering::AcqRel) {
             // A refused submission's job: its fence orders nothing and was never published.
             self.origin.mark_failed();
+            self.resources.release_compute_waiter();
+            self.resources.release_active_computes();
             self.fence.signal(Err(ECANCELED));
         }
     }

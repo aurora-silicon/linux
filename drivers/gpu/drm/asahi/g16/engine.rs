@@ -2323,18 +2323,21 @@ impl Firmware {
             }
         }
         let limit = if scs { 1 } else { sizes::COMPUTE_PIPES };
+        let has_safe = (0..limit).any(|p| self.slots.compute_pipe_has_safe_pair(slot_mask, p));
         let mut best: Option<(usize, usize)> = None;
         for (p, &load) in other_load.iter().enumerate().take(limit) {
             if load == 0 {
                 continue;
             }
-            let allowed = if p == 0 {
-                slot_mask
+            if has_safe {
+                if !self.slots.compute_pipe_has_safe_pair(slot_mask, p) {
+                    continue;
+                }
             } else {
-                slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-            };
-            if allowed == 0 || self.slots.compute_exhausted_in_mask(allowed) {
-                continue;
+                let allowed = self.slots.compute_allowed_for_pipe(slot_mask, p);
+                if allowed == 0 || self.slots.compute_exhausted_in_mask(allowed) {
+                    continue;
+                }
             }
             if best.is_none_or(|(_, prev)| load < prev) {
                 best = Some((p, load));
@@ -2345,7 +2348,7 @@ impl Firmware {
 
     /// Whether `vm` can acquire a compute pipe (`0..COMPUTE_PIPES`) without sharing an active
     /// `qinfo` with another VM, exceeding `MAX_VM_COMPUTE_PIPES`, using a pipe draining for
-    /// handoff, or lacking an available unit in `slot_mask`.
+    /// handoff, or lacking a safe available unit in `slot_mask`.
     fn has_compute_pipe_for_vm(
         &self,
         vm: &Arc<super::vm::VmState>,
@@ -2367,10 +2370,17 @@ impl Firmware {
                 any_rt |= fl.rt_compute;
             }
         }
+        let limit = if any_rt { 1 } else { sizes::COMPUTE_PIPES };
+        let has_safe = (0..limit).any(|p| self.slots.compute_pipe_has_safe_pair(slot_mask, p));
+        let slot_ok = |p: usize| -> bool {
+            if has_safe {
+                self.slots.compute_pipe_safe_for_mask(slot_mask, p)
+            } else {
+                self.slots.compute_available_in_mask_for_pipe(slot_mask, p)
+            }
+        };
         if any_rt {
-            return (avoid & 1) == 0
-                && !active_other[0]
-                && self.slots.compute_available_in_mask_for_pipe(slot_mask, 0);
+            return (avoid & 1) == 0 && !active_other[0] && slot_ok(0);
         }
         let vm_active_pipes = active_same.iter().filter(|&&a| a).count();
         for p in 0..sizes::COMPUTE_PIPES {
@@ -2380,7 +2390,7 @@ impl Firmware {
             if !active_same[p] && vm_active_pipes >= sizes::MAX_VM_COMPUTE_PIPES {
                 continue;
             }
-            if self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+            if slot_ok(p) {
                 return true;
             }
         }
@@ -2408,6 +2418,8 @@ impl Firmware {
             }
         }
         let vm_active_pipes = active_same.iter().filter(|&&n| n != 0).count();
+        let has_safe = (0..sizes::COMPUTE_PIPES)
+            .any(|p| self.slots.compute_pipe_has_safe_pair(slot_mask, p));
         let mut best: Option<usize> = None;
         for p in 0..sizes::COMPUTE_PIPES {
             if p == pipe || active_other[p] {
@@ -2416,7 +2428,12 @@ impl Firmware {
             if active_same[p] == 0 && vm_active_pipes >= sizes::MAX_VM_COMPUTE_PIPES {
                 continue;
             }
-            if !self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+            let ok = if has_safe {
+                self.slots.compute_pipe_safe_for_mask(slot_mask, p)
+            } else {
+                self.slots.compute_available_in_mask_for_pipe(slot_mask, p)
+            };
+            if !ok {
                 continue;
             }
             best = Some(match best {
@@ -2435,10 +2452,14 @@ impl Firmware {
     /// - If barrier-free (`waits` all `None`), `!heavy_compute`, and `queue` already has an active
     ///   compute flight on a single pipe with free units, keep that light queue pipe-affine so
     ///   consecutive horizon submits fold onto one workqueue without splitting across pipes.
-    /// - Otherwise, lease an idle pipe (preferring `vm`'s warm-affine `pipe_last_vm`, then never-
-    ///   used, then LRU, preferring secondary pipes `1..COMPUTE_PIPES` for fresh/LRU picks so
-    ///   pipe 0 stays free for base-only/SCS VMs) up to `MAX_VM_COMPUTE_PIPES` active pipes per
-    ///   VM, or pick `vm`'s active eligible pipe with fewest commands in flight.
+    /// - Otherwise, lease an idle pipe (preferring `vm`'s warm-affine `pipe_last_vm`, then an idle
+    ///   pipe whose undisplaced tail lies inside `slot_mask`, then never-used, then LRU, preferring
+    ///   secondary pipes `1..COMPUTE_PIPES` for fresh/LRU picks so pipe 0 stays free for base-only
+    ///   and SCS VMs) up to `MAX_VM_COMPUTE_PIPES` active pipes per VM, or pick `vm`'s active
+    ///   eligible pipe with fewest commands in flight.
+    /// - When at least one pipe has a safe pair of non-other-tail units in `slot_mask`, only safe
+    ///   pipes are eligible so sparse 2-unit VMs always displace their own pair's tail on its
+    ///   owning pipe instead of stranding both units across two different pipes.
     /// - Returns `None` when every eligible pipe is currently active for another VM or has no
     ///   available compute unit.
     fn choose_compute_pipe(
@@ -2466,11 +2487,17 @@ impl Firmware {
         }
         let avoid = self.engine.handoff_avoid_pipes;
         let vm_active_pipes = active_same.iter().filter(|&&n| n != 0).count();
+        let limit = if any_rt { 1 } else { sizes::COMPUTE_PIPES };
+        let has_safe = (0..limit).any(|p| self.slots.compute_pipe_has_safe_pair(slot_mask, p));
         let pipe_ok = |p: usize| -> bool {
             (avoid & (1u32 << p)) == 0
                 && !active_other[p]
                 && (active_same[p] != 0 || vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES)
-                && self.slots.compute_available_in_mask_for_pipe(slot_mask, p)
+                && if has_safe {
+                    self.slots.compute_pipe_safe_for_mask(slot_mask, p)
+                } else {
+                    self.slots.compute_available_in_mask_for_pipe(slot_mask, p)
+                }
         };
         if any_rt {
             return pipe_ok(0).then_some(0);
@@ -2511,18 +2538,25 @@ impl Firmware {
                 }
             }
         }
+        let secondary_mask = self.slots.compute_allowed_for_pipe(slot_mask, 1);
+        let has_secondary = secondary_mask != 0;
+        let has_pipe0_exclusive = (slot_mask & !secondary_mask) != 0;
+        let active_other_any = active_other.iter().any(|&a| a);
+        let prefer_secondary = has_secondary && (!has_pipe0_exclusive || active_other_any);
+        let migrate_pipe0 = !prefer_secondary
+            && has_pipe0_exclusive
+            && !active_other_any
+            && active_same[0] == 0
+            && pipe_ok(0);
+        let displace_pipes = self.slots.compute_tail_pipes_in_mask(slot_mask);
         let pick_idle = |prefer_secondary: bool| -> Option<usize> {
-            // 1. Warm VM-affine idle pipe (keeps the same VM on the same `qinfo`).
-            for p in 0..sizes::COMPUTE_PIPES {
-                if active_same[p] == 0
-                    && pipe_ok(p)
-                    && self.engine.pipe_last_vm[p] == Some(vm.id)
-                {
-                    return Some(p);
-                }
+            // 0. When this VM is the sole active compute VM and owns pipe-0-exclusive units,
+            //    migrate onto idle pipe 0 immediately so deep single-VM bursts (e.g. clight d16
+            //    after 16 idle pipe tails) use all 16 claimable units instead of staying pinned
+            //    to a warm secondary pipe that excludes `pipe0_exclusive_mask` (15 units).
+            if migrate_pipe0 {
+                return Some(0);
             }
-            // 2. Never-used idle pipe, preferring secondary pipes for extension-capable VMs so
-            //    pipe 0 remains immediately available to base-only and SCS VMs.
             let mut order = [0usize; sizes::COMPUTE_PIPES];
             if prefer_secondary {
                 for i in 0..(sizes::COMPUTE_PIPES - 1) {
@@ -2534,12 +2568,44 @@ impl Firmware {
                     *slot = i;
                 }
             }
+            // 1. Warm VM-affine idle pipe (preferring one that displaces a tail in `slot_mask`).
+            for &p in &order {
+                if active_same[p] == 0
+                    && pipe_ok(p)
+                    && self.engine.pipe_last_vm[p] == Some(vm.id)
+                    && (displace_pipes & (1u32 << p)) != 0
+                {
+                    return Some(p);
+                }
+            }
+            for &p in &order {
+                if active_same[p] == 0
+                    && pipe_ok(p)
+                    && self.engine.pipe_last_vm[p] == Some(vm.id)
+                {
+                    return Some(p);
+                }
+            }
+            // 2. Idle pipe currently holding an undisplaced retired tail inside `slot_mask`, so
+            //    this submission immediately displaces that tail on its own pipe.
+            if displace_pipes != 0 {
+                for &p in &order {
+                    if active_same[p] == 0
+                        && pipe_ok(p)
+                        && (displace_pipes & (1u32 << p)) != 0
+                    {
+                        return Some(p);
+                    }
+                }
+            }
+            // 3. Never-used idle pipe, preferring secondary pipes for extension-capable VMs so
+            //    pipe 0 remains immediately available to base-only and SCS VMs.
             for &p in &order {
                 if active_same[p] == 0 && pipe_ok(p) && self.engine.pipe_last_vm[p].is_none() {
                     return Some(p);
                 }
             }
-            // 3. Least-recently-used idle pipe, preferring secondary pipes when `prefer_secondary`
+            // 4. Least-recently-used idle pipe, preferring secondary pipes when `prefer_secondary`
             //    is set so pipe 0 remains available to base-only and SCS VMs.
             if prefer_secondary {
                 let mut best_sec: Option<(usize, u64)> = None;
@@ -2573,8 +2639,6 @@ impl Firmware {
             }
             None
         };
-        let has_secondary = (slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)) != 0;
-        let prefer_secondary = has_secondary && active_other.iter().any(|&a| a);
         if vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES {
             if let Some(p) = pick_idle(prefer_secondary) {
                 return Some(p);
@@ -3474,6 +3538,13 @@ impl Firmware {
         job.vm.vm.mark_binding_published()?;
         self.slots.verify_held(&f.claims)?;
         self.slots.publish(&mut f.claims)?;
+        if !render {
+            if let Some(shared) = &self.engine.shared {
+                shared
+                    .compute_tail_mask
+                    .store(self.slots.compute_tail_mask(), Ordering::Release);
+            }
+        }
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
         *visible = true;
@@ -3611,11 +3682,20 @@ impl Firmware {
         for k in index..end {
             job.command_published(k);
         }
+        if !render
+            && !(end..job.progress.count())
+                .any(|k| matches!(command(job, k), Some(Command::Compute(_))))
+        {
+            job.resources.release_compute_waiter();
+        }
         for j2 in f.group.iter() {
             let n2 = j2.progress.count();
             j2.progress.set_sent(n2);
             for k in 0..n2 {
                 j2.command_published(k);
+            }
+            if !render {
+                j2.resources.release_compute_waiter();
             }
             self.engine.turn += 1;
             j2.queue.turn.store(self.engine.turn, Ordering::Relaxed);

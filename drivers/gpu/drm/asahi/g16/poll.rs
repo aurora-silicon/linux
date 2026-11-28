@@ -82,7 +82,55 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     }
 }
 
+/// Fresh device-wide compute slot masks returned when admission detects a lost `prepare -> submit`
+/// race so `Queue::submit_job()` can drop `Shared::state` and grow the VM's mask with a non-tail
+/// unit.
+#[derive(Copy, Clone)]
+pub(crate) struct ComputeHintsSnapshot {
+    pub(crate) quarantined_compute_mask: u32,
+    pub(crate) pipe0_exclusive_mask: u32,
+    pub(crate) scs_compute_mask: u32,
+    pub(crate) compute_tail_mask: u32,
+}
+
 impl Shared {
+    /// Checks under `Shared::state` that `slot_mask` has a safe non-stranding compute pipe and
+    /// atomically registers it in `Slots::compute_waiters` before the job is accepted.
+    ///
+    /// Returns `Ok(None)` when admitted, or `Ok(Some(snapshot))` with live slot masks when a
+    /// concurrent pipe publication or quarantine invalidated `slot_mask` after `Cache::prepare()`.
+    pub(crate) fn admit_compute_job(
+        &self,
+        resources: &mut super::resources::Prepared,
+        slot_mask: u32,
+    ) -> Result<Option<ComputeHintsSnapshot>> {
+        let state = self.state.lock();
+        let firmware = state.as_deref().ok_or(EIO)?;
+        match firmware.slots.admit_compute_mask(slot_mask)? {
+            Some(waiters) => {
+                resources.set_compute_waiter(slot_mask, waiters);
+                Ok(None)
+            }
+            None => {
+                let snapshot = ComputeHintsSnapshot {
+                    quarantined_compute_mask: firmware.slots.quarantined_compute_mask(),
+                    pipe0_exclusive_mask: firmware.slots.pipe0_exclusive_mask(),
+                    scs_compute_mask: firmware.slots.scs_compute_mask(),
+                    compute_tail_mask: firmware.slots.compute_tail_mask(),
+                };
+                self.quarantined_compute_mask
+                    .store(snapshot.quarantined_compute_mask, Ordering::Release);
+                self.pipe0_exclusive_mask
+                    .store(snapshot.pipe0_exclusive_mask, Ordering::Release);
+                self.scs_compute_mask
+                    .store(snapshot.scs_compute_mask, Ordering::Release);
+                self.compute_tail_mask
+                    .store(snapshot.compute_tail_mask, Ordering::Release);
+                Ok(Some(snapshot))
+            }
+        }
+    }
+
     /// Schedules a delayed poll while idle so DVFS utilization decays to S1 and a held CLPC
     /// memory/fabric floor expires cleanly after all flights drain.
     fn arm_idle_power_poll(self: &Arc<Self>, firmware: &Firmware) {
@@ -1487,9 +1535,18 @@ impl Firmware {
     /// immediately when a base or PB allocator slot has been permanently quarantined.
     pub(crate) fn sync_quarantine_hints(&self) {
         if let Some(shared) = &self.engine.shared {
+            // Publish the updated pipe-0 reservations before `quarantined_compute_mask` so
+            // lock-free `SUBMIT` readers observing a new quarantine always observe its matching
+            // non-secondary-pinned pipe-0 and SCS slots.
             shared
-                .base_compute_quarantined
-                .store(self.slots.base_compute_quarantined(), Ordering::Release);
+                .pipe0_exclusive_mask
+                .store(self.slots.pipe0_exclusive_mask(), Ordering::Release);
+            shared
+                .scs_compute_mask
+                .store(self.slots.scs_compute_mask(), Ordering::Release);
+            shared
+                .compute_tail_mask
+                .store(self.slots.compute_tail_mask(), Ordering::Release);
             shared
                 .quarantined_compute_mask
                 .store(self.slots.quarantined_compute_mask(), Ordering::Release);
@@ -1548,6 +1605,11 @@ impl Firmware {
                 return;
             }
             if f.computes != 0 {
+                if let Some(shared) = &self.engine.shared {
+                    shared
+                        .compute_tail_mask
+                        .store(self.slots.compute_tail_mask(), Ordering::Release);
+                }
                 let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
                 for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
                     self.recovery.last_retired.push(p, stamp);

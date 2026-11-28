@@ -942,10 +942,10 @@ pub(crate) mod client {
 
     // Persistent compute units reused across application queues. Units 0 and 1 keep their
     // original 64 MiB placement below the render allocators; extension units (2..COMPUTE_UNITS)
-    // pack at a 40 MiB stride from 0x7080000000 up to the SCS compute records (0x70b8000000),
-    // clear of [`DYNAMIC`] and [`SCS_POOLS`] and leaving 7.25 MiB guard above each unit's
+    // pack at a 33 MiB stride from 0x7080000000 up to the SCS compute records (0x70be000000),
+    // clear of [`DYNAMIC`] and [`SCS_POOLS`] and leaving 256 KiB guard above each unit's
     // 32.75 MiB footprint (`0x20c0000`). Every alias is inside Mesa's reserved hole.
-    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02800000;
+    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02100000;
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
@@ -975,12 +975,12 @@ pub(crate) mod client {
     pub(crate) const WORK_OFF: u64 = 0;
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
-    // SCS-capable compute units (ray-query scratch), one 64 MiB interval each after the last
-    // compute unit (0x70b7000000) and below the PB heap (0x70c0000000), holding the unit's
+    // SCS-capable compute units (ray-query scratch), one 16 MiB interval each after the last
+    // compute unit (0x70bde00000) and below the PB heap (0x70c0000000), holding the unit's
     // list, preempt, auxiliary and context records at the base units' offsets from their
     // state. Its UMA pool and freelist are in its SCS pool window ([`scs_compute_pool`]).
     pub(crate) const fn scs_compute_records(k: u64) -> u64 {
-        0x70b8000000 + k * 0x04000000
+        0x70be000000 + k * 0x01000000
     }
     /// Offsets of a compute unit's records from its state.
     pub(crate) const COMPUTE_LIST_OFF: u64 = compute_list(0) - compute_state(0);
@@ -1120,10 +1120,11 @@ pub(crate) mod sizes {
     /// Each pipe owns a disjoint `ComputeGraph` (`qinfo`, work ring, `qstate`, `fw_stamp`,
     /// `notifier`, `threshold`, `job_list`) and completion event (`work::compute::EVENTS`) so
     /// concurrent compute VMs lease disjoint workqueues instead of mixing ASIDs in one active
-    /// `qinfo`. Pipe 0 exclusively owns `0..PIPE1_COMPUTE_START` for base-only and SCS VMs;
-    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (18 units
-    /// for 7 secondary pipes, leaving 11 active units beyond the 7 undisplaced retired leases).
-    pub(crate) const COMPUTE_PIPES: usize = 8;
+    /// `qinfo`. Pipe 0 exclusively owns the two lowest healthy units (`0..PIPE1_COMPUTE_START`
+    /// when healthy, sliding dynamically via `Slots::pipe0_exclusive_mask()` after quarantines)
+    /// for base-only and SCS VMs; secondary pipes `1..COMPUTE_PIPES` share the remaining 30
+    /// units (15 secondary pipes with 2 units each beyond undisplaced retired leases).
+    pub(crate) const COMPUTE_PIPES: usize = 16;
     /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
     /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
     pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
@@ -1220,12 +1221,12 @@ pub(crate) mod sizes {
     /// and recovery paths drain.
     pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
-    /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
+    /// (`COMPUTE_UMA_SLOT + index`, filling `1..RENDER_UMA_SLOT = 33`). A unit is reused
     /// only after a later publication retired (it displaced the unit), so `n` units keep up to
-    /// `n - 1` compute commands in flight (`23 * 2 = 46` entries of the 256-entry compute work
+    /// `n - 1` compute commands in flight (`31 * 3 = 93` entries of the 256-entry compute work
     /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
     /// `snapshot_entries = 448`).
-    pub(crate) const COMPUTE_UNITS: usize = 24;
+    pub(crate) const COMPUTE_UNITS: usize = 32;
     const _: () = assert!(COMPUTE_UNITS >= 2);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(
@@ -1238,14 +1239,15 @@ pub(crate) mod sizes {
         super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
             <= super::engine::RENDER_UMA_SLOT
     );
-    /// SCS-capable compute units per VM, bound dynamically to healthy compute ledger indices
-    /// (and UMA slots) preferring pipe-0-exclusive indices `0..PIPE1_COMPUTE_START`.
+    /// SCS-capable compute units per VM, bound dynamically to two healthy, non-secondary-pinned
+    /// compute ledger indices (and UMA slots) reserved exclusively for pipe 0 via
+    /// `Slots::pipe0_exclusive_mask()` / `Slots::scs_compute_mask()`.
     pub(crate) const SCS_COMPUTE_UNITS: usize = 2;
-    /// First hardware compute ledger index usable by secondary compute pipes (`pipe >= 1`).
-    /// Keeping `0..PIPE1_COMPUTE_START` exclusive to pipe 0 guarantees that pipe 1 never holds
-    /// an undisplaced lease on those units, so 2-unit base-only and SCS compute VMs always have
-    /// at least one claimable unit across up to `PIPE1_COMPUTE_START - 2` permanent quarantines.
-    pub(crate) const PIPE1_COMPUTE_START: usize = 6;
+    /// First hardware compute ledger index usable by secondary compute pipes (`pipe >= 1`) when
+    /// no base compute unit is quarantined. `Slots::pipe0_exclusive_mask()` monotonically reserves
+    /// `SCS_COMPUTE_UNITS` healthy, non-secondary-tail units for pipe 0 so secondary pipes never
+    /// hold an undisplaced lease on a base-only or fresh SCS VM's units.
+    pub(crate) const PIPE1_COMPUTE_START: usize = 2;
     const _: () = assert!(
         PIPE1_COMPUTE_START >= SCS_COMPUTE_UNITS && PIPE1_COMPUTE_START + 2 <= COMPUTE_UNITS
     );

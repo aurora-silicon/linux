@@ -13,6 +13,10 @@ job_src = (production.parent / 'job.rs').read_text()
 mod_src = (production.parent / 'mod.rs').read_text()
 hw_src = (production.parent / 'hw.rs').read_text()
 gpu_src = (production.parent.parent / 'gpu.rs').read_text()
+lifetime_src = (production.parent / 'pools/lifetime.rs').read_text()
+resources_src = (production.parent / 'resources.rs').read_text()
+slots_src = (production.parent / 'slots.rs').read_text()
+poll_src = (production.parent / 'poll.rs').read_text()
 output = output_dir()
 
 
@@ -96,6 +100,19 @@ assert 'let msaa_conflict = !self.msaa_member_allowed(&job.vm, r);' in can_queue
 assert 'self.graph.render.threshold.w32(8, prefix.draw as u32)?;' in publish_prefix_body_fn
 assert 'earliest_unfinished_ta_draw' not in source and 'rearm_ta_threshold' not in source
 assert 'let pipe_fold_cap = if heavy_compute && c_waits == [None; sizes::COMPUTE_PIPES]' in publish_prefix_body_fn, 'pipe_fold_cap must only apply to heavy barrier-free compute'
+submit_job_fn = item_in(queue_src, 'fn submit_job(')
+assert 'self.shared.admit_compute_job(&mut prepared, slot_mask)?' in submit_job_fn, 'Queue::submit_job must verify and register compute mask under Shared::state before acceptance'
+assert 'job.resources.release_compute_waiter();' in publish_prefix_body_fn, 'publish_prefix_body must release compute waiter once job compute commands are published'
+assert 'j2.resources.release_compute_waiter();' in publish_prefix_body_fn, 'publish_prefix_body must release compute waiter for folded compute horizon jobs'
+assert 'self.compute_stranding_mask_for_pipe(pipe, allowed)' in item_in(slots_src, 'pub(crate) fn claim_compute_for_pipe('), 'claim_compute_for_pipe must exclude stranding units before pair_safe/pair_borrow'
+prepare_fn = item_in(resources_src, 'pub(crate) fn prepare(')
+assert 'ComputeVmReservation::acquire(hints.compute_vm_state)' in prepare_fn, 'Cache::prepare must atomically reserve compute VM active count and home sequence before allocation'
+assert prepare_fn.index('ComputeVmReservation::acquire(hints.compute_vm_state)') < prepare_fn.index('ComputeUnitTable::with_added('), 'compute VM reservation must precede ComputeUnitTable::with_added()'
+assert 'ready.compute_vm_counter = reservation.commit();' in prepare_fn, 'Cache::prepare must commit ComputeVmReservation only after arena allocation succeeds'
+assert 'pick_compute_units_for(' in item_in(resources_src, 'pub(crate) fn prepare('), 'Cache::prepare must pass force_add_compute_non_tail to pick_compute_units_for'
+assert 'self.resources.release_compute_waiter();' in item_in(job_src, 'fn finish('), 'Job::finish must release compute waiter'
+assert 'self.resources.release_compute_waiter();' in item_in(job_src, 'fn cancel_unstarted('), 'Job::cancel_unstarted must release compute waiter'
+assert 'firmware.slots.admit_compute_mask(slot_mask)?' in item_in(poll_src, 'pub(crate) fn admit_compute_job('), 'Shared::admit_compute_job must check and register compute mask under Shared::state'
 
 
 harness = r'''
@@ -205,7 +222,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn validate_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64)->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=16; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=32; pub const PIPE1_COMPUTE_START:usize=2; pub const COMPUTE_SLOTS:usize=32; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -864,23 +881,186 @@ struct QueueBehindGraph{render:QueueBehindRenderGraph}
 impl QueueBehindGraph{fn new()->Self{Self{render:QueueBehindRenderGraph{fw_stamp:[QueueBehindStamp::new(0),QueueBehindStamp::new(0)]}}}}
 struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,compute_pipe:u8,rt_compute:bool,heavy_render:bool,published_ns:u64,target:u32,cstamp:[u32;16],r_ta_stamp:[u32;16],r_fs_stamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
 struct QueueBehindEngine{ordinal:u64,draw:u64,ta_target:u32,next_compute_pipe:u8,pipe_last_vm:[Option<u64>;hw::sizes::COMPUTE_PIPES],pipe_last_used:[u64;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:u32,flights:Vec<QueueBehindFlight>}
-struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
+mod pools_lifetime {
+__POOLS_LIFETIME__
+}
+struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool,lifetime:Option<pools_lifetime::Lifetime<{hw::sizes::COMPUTE_UNITS}>>,waiters:Vec<u32>}
 impl QueueBehindSlots{
-    fn compute_exhausted(&self)->bool{self.compute_exhausted}
-    fn compute_exhausted_in_mask(&self,mask:u32)->bool{self.compute_exhausted||mask==0}
+    fn new_with_lifetime() -> Self {
+        Self {
+            compute_exhausted: false,
+            render_exhausted: false,
+            compute_available: true,
+            pass_available: true,
+            lifetime: Some(pools_lifetime::Lifetime::new(true)),
+            waiters: vec![],
+        }
+    }
+    fn compute_exhausted(&self)->bool{
+        self.lifetime.as_ref().map_or(self.compute_exhausted, |lt| lt.exhausted())
+    }
+    fn compute_exhausted_in_mask(&self,mask:u32)->bool{
+        self.lifetime.as_ref().map_or(self.compute_exhausted||mask==0, |lt| lt.exhausted_in_mask(mask))
+    }
     fn render_exhausted(&self)->bool{self.render_exhausted}
     fn compute_available(&self,_n:usize)->bool{self.compute_available}
-    fn compute_available_in_mask(&self,_mask:u32)->bool{self.compute_available}
+    fn compute_available_in_mask(&self,mask:u32)->bool{
+        if let Some(lt) = self.lifetime.as_ref() {
+            let mut rem = mask;
+            while rem != 0 {
+                let k = rem.trailing_zeros() as usize;
+                rem &= rem - 1;
+                if k < hw::sizes::COMPUTE_UNITS && lt.available(k) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.compute_available && mask != 0
+        }
+    }
+    fn compute_allowed_for_pipe(&self,mask:u32,pipe:usize)->u32{
+        if pipe == 0 { mask } else { mask & !((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1) }
+    }
+    fn compute_tail_pipes_in_mask(&self,mask:u32)->u32{
+        self.lifetime.as_ref().map_or(0, |lt| lt.tail_pipes_in_mask(mask))
+    }
+    __MASK_HAS_SAFE_PIPE_WITH_TAILS__
+    fn claim_strands_waiter_with_tails(&self, candidate: usize, pipe: usize, q: u32, p0_mask: u32, tails: &[u8; 32]) -> bool {
+        if self.waiters.is_empty() {
+            return false;
+        }
+        let bit = 1u32 << candidate;
+        let mut tails_after = *tails;
+        tails_after[pipe] = candidate as u8;
+        for &waiter_mask in &self.waiters {
+            if (waiter_mask & bit) == 0 {
+                continue;
+            }
+            if (waiter_mask & !q).count_ones() >= (hw::sizes::COMPUTE_PIPES + 2) as u32 {
+                continue;
+            }
+            if Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, tails)
+                && !Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, &tails_after)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    fn compute_stranding_mask_for_pipe(&self, pipe: usize, candidates: u32) -> u32 {
+        let Some(lt) = self.lifetime.as_ref() else {
+            return 0;
+        };
+        if candidates == 0 || self.waiters.is_empty() {
+            return 0;
+        }
+        let q = lt.quarantined_mask();
+        let p0_mask = (1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let tails = lt.pipe_tails();
+        let mut rem = candidates;
+        let mut blocked = 0u32;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < hw::sizes::COMPUTE_UNITS
+                && lt.available(k)
+                && self.claim_strands_waiter_with_tails(k, pipe, q, p0_mask, &tails)
+            {
+                blocked |= 1u32 << k;
+            }
+        }
+        blocked
+    }
+    fn admit_compute_mask(&mut self, mask: u32) -> bool {
+        let Some(lt) = self.lifetime.as_ref() else {
+            return true;
+        };
+        let q = lt.quarantined_mask();
+        let p0_mask = (1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let tails = lt.pipe_tails();
+        let mut all_tails = 0u32;
+        for &k in &tails[..hw::sizes::COMPUTE_PIPES] {
+            if k != u8::MAX {
+                all_tails |= 1u32 << k;
+            }
+        }
+        let healthy_p0 = mask & !q;
+        let healthy_sec = (mask & !p0_mask) & !q;
+        let mut ok = false;
+        'pipes: for p in 0..hw::sizes::COMPUTE_PIPES {
+            let healthy_allowed = if p == 0 { healthy_p0 } else { healthy_sec };
+            if healthy_allowed == 0 {
+                continue;
+            }
+            let own_tail = if tails[p] != u8::MAX { 1u32 << tails[p] } else { 0 };
+            let other_tails = all_tails & !own_tail;
+            let safe_units = healthy_allowed & !other_tails;
+            if safe_units.count_ones() < 2 {
+                continue;
+            }
+            let mut displacing = safe_units & !own_tail;
+            while displacing != 0 {
+                let k = displacing.trailing_zeros() as usize;
+                displacing &= displacing - 1;
+                if !self.claim_strands_waiter_with_tails(k, p, q, p0_mask, &tails) {
+                    ok = true;
+                    break 'pipes;
+                }
+            }
+        }
+        if ok {
+            self.waiters.push(mask);
+        }
+        ok
+    }
+    fn release_compute_waiter(&mut self, mask: u32) {
+        if let Some(pos) = self.waiters.iter().position(|&m| m == mask) {
+            self.waiters.swap_remove(pos);
+        }
+    }
+    fn compute_pipe_has_safe_pair(&self,mask:u32,pipe:usize)->bool{
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        if let Some(lt) = self.lifetime.as_ref() {
+            let q = lt.quarantined_mask();
+            let healthy_allowed = allowed & !q;
+            if healthy_allowed == 0 {
+                return false;
+            }
+            if (mask & !q).count_ones() <= 1 {
+                return true;
+            }
+            let other_tails = lt.pipe_tails_mask(pipe);
+            (healthy_allowed & !other_tails).count_ones() >= 2
+        } else {
+            allowed != 0
+        }
+    }
+    fn compute_pipe_safe_for_mask(&self,mask:u32,pipe:usize)->bool{
+        self.compute_available_in_mask_for_pipe(mask, pipe) && self.compute_pipe_has_safe_pair(mask, pipe)
+    }
     fn compute_available_in_mask_for_pipe(&self,mask:u32,pipe:usize)->bool{
-        let allowed = if pipe == 0 { mask } else { mask & !((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1) };
-        self.compute_available && allowed != 0
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let blocked = self.compute_stranding_mask_for_pipe(pipe, allowed);
+        self.compute_available_in_mask(allowed & !blocked)
     }
     fn compute_available_for_pipe(&self,n:usize,pipe:usize)->bool{
         self.compute_available && (pipe == 0 || n > hw::sizes::PIPE1_COMPUTE_START)
     }
     fn pass_available(&self,_n:usize)->bool{self.pass_available}
 }
-mod resources { pub const BASE_COMPUTE_UNITS: usize = 2; }
+mod resources {
+    use crate::hw;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const BASE_COMPUTE_UNITS: usize = 2;
+    pub const COMPUTE_TOTAL_UNIT_BUDGET: usize = hw::sizes::COMPUTE_UNITS * 2;
+    __COMPUTE_UNIT_TIERS__
+    __RESERVE_COMPUTE_VM_HOME__
+    __COMPUTE_HOME_START__
+    __TARGET_COMPUTE_UNITS__
+    __PICK_COMPUTE_UNITS_FOR__
+    __PICK_COMPUTE_UNITS__
+}
 struct QueueBehindPools{exhausted:bool,can_pipeline:bool,block_pipeline_vm:Option<u32>}
 impl QueueBehindPools{
     fn exhausted(&self)->bool{self.exhausted}
@@ -958,7 +1138,7 @@ mod queue_behind_scope {
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&j2));
@@ -1007,7 +1187,7 @@ mod queue_behind_scope {
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![flight(rq.clone(),true,0)]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Behind an SCS flight only SCS compute of its own VM queues, so one ray-query
@@ -1063,7 +1243,7 @@ mod queue_behind_scope {
         let p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(!p.can_queue_behind(&query_copy));
@@ -1081,7 +1261,7 @@ mod queue_behind_scope {
         let pr=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(!pr.can_queue_behind(&mk(2,q1.clone(),true,Some(1),None)));
@@ -1105,7 +1285,7 @@ mod queue_behind_scope {
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&r2));
@@ -1155,7 +1335,7 @@ mod queue_behind_scope {
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![mk_flight(vm1_r.clone(),0,1)]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Active VM1 Render: same-VM R & C allowed; cross-VM R allowed; cross-VM C blocked + drains.
@@ -1233,7 +1413,7 @@ mod queue_behind_scope {
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![in_flight]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // The lead (command 0) is admitted; the multisampled member (command 1) is refused.
@@ -1271,7 +1451,7 @@ mod queue_behind_scope {
                 QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x500;a},fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
                 QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Same-queue FS -> CDM barrier resolves render's fs_target; CDM -> TA resolves compute's target.
@@ -1307,7 +1487,7 @@ mod queue_behind_scope {
             engine:QueueBehindEngine{ordinal:3,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![
                 QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert_eq!(pm.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
@@ -1342,7 +1522,7 @@ mod queue_behind_scope {
                 cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x900;a},fs_target:0x900,
                 initbm:true,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         let fs2c = host.cross_engine_wait(&c_after_r, 0, command::RENDER).unwrap().unwrap();
@@ -1387,7 +1567,7 @@ mod queue_behind_scope {
                 job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Queue 1 render queues directly behind Queue 0 compute on the same VM with no cross-engine barrier.
@@ -1425,7 +1605,7 @@ mod queue_behind_scope {
                 job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert_eq!(p.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
@@ -1465,7 +1645,7 @@ mod queue_behind_scope {
                 job:multi.clone(),group:vec![],first:0,count:3,computes:0,renders:3,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:r_fs,fs_target:0x300,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Lookup into published multi-pass render flight resolves interior and tail passes.
@@ -1537,7 +1717,7 @@ mod queue_behind_scope {
                 r_ta_stamp:r_ta,r_fs_stamp:r_ta,fs_target:0x800,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Below TA_WAVE_PASSES (3 < 4): zero WC fw_stamp reads.
@@ -1593,7 +1773,7 @@ mod queue_behind_scope {
                 r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x100;a},fs_target:0x100,
                 initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false,
             }]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Not blocked on slots when pass_available is true and render_flights has headroom.
@@ -1939,12 +2119,17 @@ mod queue_behind_scope {
         let mut host=QueueBehindHost{
             graph:QueueBehindGraph::new(),
             engine:QueueBehindEngine{ordinal:0,draw:0,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
-        // Empty engine starts on pipe 0.
+        // Empty engine starts on pipe 0 for pipe-0-capable VMs, and on secondary pipe 1 for
+        // secondary-only sparse VMs so pipe 0 stays clear for VM 0 and SCS compute.
         let no_w = [None; sizes::COMPUTE_PIPES];
         assert_eq!(host.choose_compute_pipe(&q1, &vm1, no_w, (1u32 << 24) - 1, false, false), Some(0));
+        assert_eq!(
+            host.choose_compute_pipe(&q2, &vm2, no_w, (1u32 << 16) | (1u32 << 17), false, false),
+            Some(1)
+        );
         host.engine.flights.push(QueueBehindFlight{
             job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:1_000_000,target:0x100,
             cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
@@ -1980,7 +2165,7 @@ mod queue_behind_scope {
         assert_eq!(host.choose_compute_pipe(&q2, &vm2, no_w, (1u32 << 24) - 1, true, true), None);
         // A 2-unit base-only or SCS same-VM stays pinned to pipe 0.
         assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b11, false, true), Some(0));
-        assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b110, false, true), Some(0));
+        assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b110, true, true), Some(0));
         assert!(host.can_queue_behind(&c2));
         // Add second concurrent flight on pipe 1 from VM2 (q2): VM1 stays on pipe 0 (or expands to
         // pipe 2 for heavy compute, capped at MAX_VM_COMPUTE_PIPES=2), VM2 stays on pipe 1.
@@ -2057,6 +2242,438 @@ mod queue_behind_scope {
         host.engine.handoff_avoid_pipes = 0;
         assert_eq!(host.choose_compute_pipe(&q2, &vm2, no_w, 0b11, false, false), Some(0));
     }
+    #[test]fn sparse_d16_to_d8_clight16_and_mdi_never_strand_or_cancel(){
+        let max_u = hw::sizes::COMPUTE_UNITS;
+        let p0_mask = (1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let no_w = [None; sizes::COMPUTE_PIPES];
+        let mut host = QueueBehindHost {
+            graph: QueueBehindGraph::new(),
+            engine: QueueBehindEngine {
+                ordinal: 0,
+                draw: 0,
+                ta_target: 0,
+                next_compute_pipe: 0,
+                pipe_last_vm: [None; hw::sizes::COMPUTE_PIPES],
+                pipe_last_used: [0; hw::sizes::COMPUTE_PIPES],
+                handoff_avoid_pipes: 0,
+                flights: vec![],
+            },
+            slots: QueueBehindSlots::new_with_lifetime(),
+            pools: QueueBehindPools { exhausted: false, can_pipeline: true, block_pipeline_vm: None },
+        };
+        let mut tick = 1u64;
+        let mut next_vm_id = 100u64;
+        let mut next_slot_seq = 0usize;
+        let claim_on_pipe = |host: &mut QueueBehindHost, mask: u32, pipe: usize| -> usize {
+            let allowed = host.slots.compute_allowed_for_pipe(mask, pipe);
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            let other_tails = lt.pipe_tails_mask(pipe);
+            let other_partners =
+                ((other_tails & 0x5555_5555) << 1) | ((other_tails & 0xAAAA_AAAA) >> 1);
+            let pair_safe = allowed & !other_partners;
+            for tier in [pair_safe, allowed & other_partners] {
+                let mut rem = tier;
+                while rem != 0 {
+                    let k = rem.trailing_zeros() as usize;
+                    rem &= rem - 1;
+                    if lt.claim(k) {
+                        assert!(lt.publish_on(k, pipe as u8));
+                        return k;
+                    }
+                }
+            }
+            panic!("no available unit in mask {mask:#x} for pipe {pipe}");
+        };
+        // Phase 1: procs d16 (16 concurrent sparse 2-unit VMs on pipes 0..15).
+        // Each VM submits 3 rounds and closes, leaving 32 retired / 16 reusable units
+        // with one undisplaced tail per pipe across all 16 pipes (exact J773g smoke state).
+        let mut d16_vms = vec![];
+        for _ in 0..16usize {
+            let id = next_vm_id;
+            next_vm_id += 1;
+            let seq = next_slot_seq;
+            next_slot_seq += 1;
+            let home = resources::compute_home_start(seq, max_u);
+            let tails = host.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+            let mask = resources::pick_compute_units(home, 0, 0, p0_mask, tails, 2, max_u);
+            assert_eq!(mask.count_ones(), 2);
+            let vm = Arc::new(Vm { id, status: Status(AtomicU32::new(0)), slot: (id % 63 + 1) as u32, msaa: AtomicBool::new(false) });
+            let q = Queue::new(0, 2);
+            d16_vms.push((vm, q, mask));
+        }
+        for _round in 0..3 {
+            let mut active = vec![];
+            for (vm, q, mask) in &d16_vms {
+                let pipe = host
+                    .choose_compute_pipe(q, vm, no_w, *mask, false, false)
+                    .expect("d16 VM must always find a safe pipe");
+                let unit = claim_on_pipe(&mut host, *mask, pipe);
+                tick += 1;
+                host.engine.pipe_last_vm[pipe] = Some(vm.id);
+                host.engine.pipe_last_used[pipe] = tick;
+                let job = Arc::new(QueueBehindJob {
+                    id: tick as u32,
+                    vm: vm.clone(),
+                    queue: q.clone(),
+                    progress: Progress { sent: AtomicU32::new(0), count: 1, pending: AtomicBool::new(true) },
+                    commands: vec![Command::Compute(ComputeCommand { query_access: false, rt: false })],
+                    order: Order { engine: command::COMPUTE, sequence: tick, wait_through: [None, None] },
+                    extra_orders: vec![],
+                    dependency: Ok(()),
+                    resources: Resources,
+                    fw_waits: vec![],
+                });
+                host.engine.flights.push(QueueBehindFlight {
+                    job, group: vec![], first: 0, count: 1, computes: 1, renders: 0,
+                    compute_pipe: pipe as u8, rt_compute: false, heavy_render: false,
+                    published_ns: tick, target: tick as u32, cstamp: [tick as u32; 16],
+                    r_ta_stamp: [0; 16], r_fs_stamp: [0; 16], fs_target: 0,
+                    initbm: false, has_timestamps: false, doomed: false, recovery_suspect: false,
+                });
+                active.push(unit);
+            }
+            host.engine.flights.clear();
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            for unit in active {
+                assert!(lt.retire(unit));
+            }
+        }
+        let counts = host.slots.lifetime.as_ref().unwrap().counts();
+        assert_eq!((counts.retired, counts.reusable), (32, 16));
+        // Scramble LRU timestamps so an unguided LRU pick would deliberately mismatch the
+        // pipe owning each pair's undisplaced tail (exact procs d8 / MDI failure trigger).
+        for p in 0..sizes::COMPUTE_PIPES {
+            host.engine.pipe_last_used[p] = (sizes::COMPUTE_PIPES - p) as u64;
+        }
+        // Phase 2: procs d8 immediately after procs d16 (8 fresh sparse 2-unit VMs, 5 rounds).
+        // Without safe-pair pipe routing, submit #1 strands the second unit on another pipe and
+        // submit #2 immediately hits compute_exhausted_in_mask -> ECANCELED!
+        let mut d8_vms = vec![];
+        for _ in 0..8usize {
+            let id = next_vm_id;
+            next_vm_id += 1;
+            let seq = next_slot_seq;
+            next_slot_seq += 1;
+            let home = resources::compute_home_start(seq, max_u);
+            let tails = host.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+            let mask = resources::pick_compute_units(home, 0, 0, p0_mask, tails, 2, max_u);
+            assert_eq!(mask.count_ones(), 2);
+            let vm = Arc::new(Vm { id, status: Status(AtomicU32::new(0)), slot: (id % 63 + 1) as u32, msaa: AtomicBool::new(false) });
+            let q = Queue::new(0, 2);
+            d8_vms.push((vm, q, mask));
+        }
+        for round in 0..5 {
+            let mut active = vec![];
+            for (idx, (vm, q, mask)) in d8_vms.iter().enumerate() {
+                assert!(
+                    !host.slots.compute_exhausted_in_mask(*mask),
+                    "d8 VM {idx} exhausted on round {round} (ECANCELED regression!)"
+                );
+                let pipe = host
+                    .choose_compute_pipe(q, vm, no_w, *mask, false, false)
+                    .expect("d8 VM must pick the displacing pipe for its pair");
+                let unit = claim_on_pipe(&mut host, *mask, pipe);
+                tick += 1;
+                host.engine.pipe_last_vm[pipe] = Some(vm.id);
+                host.engine.pipe_last_used[pipe] = tick;
+                active.push(unit);
+            }
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            for unit in active {
+                assert!(lt.retire(unit));
+            }
+        }
+        // Phase 3: single-VM clight d16 right after procs d8 (grows to 32 units, 16 simultaneous
+        // in-flight commands on one pipe with 0 slot stalls despite 15 idle pipes holding tails).
+        let cl16_vm = Arc::new(Vm { id: next_vm_id, status: Status(AtomicU32::new(0)), slot: 40, msaa: AtomicBool::new(false) });
+        next_vm_id += 1;
+        let cl16_q = Queue::new(0, 2);
+        let cl16_home = resources::compute_home_start(next_slot_seq, max_u);
+        next_slot_seq += 1;
+        let cl16_target = resources::target_compute_units(15, 1, 2, 1, max_u);
+        assert_eq!(cl16_target, max_u);
+        let tails = host.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+        let cl16_mask = resources::pick_compute_units(cl16_home, 0, 0, p0_mask, tails, cl16_target, max_u);
+        assert_eq!(cl16_mask, u32::MAX);
+        let cl16_pipe = host
+            .choose_compute_pipe(&cl16_q, &cl16_vm, no_w, cl16_mask, false, false)
+            .expect("clight d16 must acquire a pipe");
+        let mut inflight = vec![];
+        for _ in 0..16 {
+            let unit = claim_on_pipe(&mut host, cl16_mask, cl16_pipe);
+            inflight.push(unit);
+        }
+        {
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            for unit in inflight {
+                assert!(lt.retire(unit));
+            }
+        }
+        // Phase 4: MDI-style fresh single sparse 2-unit VM after clight d16 (5 rounds, 0 ECANCELED).
+        let mdi_vm = Arc::new(Vm { id: next_vm_id, status: Status(AtomicU32::new(0)), slot: 41, msaa: AtomicBool::new(false) });
+        next_vm_id += 1;
+        let mdi_q = Queue::new(0, 2);
+        let mdi_home = resources::compute_home_start(next_slot_seq, max_u);
+        let tails = host.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+        let mdi_mask = resources::pick_compute_units(mdi_home, 0, 0, p0_mask, tails, 2, max_u);
+        assert_eq!(mdi_mask.count_ones(), 2);
+        for round in 0..5 {
+            assert!(
+                !host.slots.compute_exhausted_in_mask(mdi_mask),
+                "MDI VM exhausted on round {round} (ECANCELED regression!)"
+            );
+            let pipe = host
+                .choose_compute_pipe(&mdi_q, &mdi_vm, no_w, mdi_mask, false, false)
+                .expect("MDI VM must acquire its displacing pipe");
+            let unit = claim_on_pipe(&mut host, mdi_mask, pipe);
+            tick += 1;
+            host.engine.pipe_last_vm[pipe] = Some(mdi_vm.id);
+            host.engine.pipe_last_used[pipe] = tick;
+            assert!(host.slots.lifetime.as_mut().unwrap().retire(unit));
+        }
+        // Phase 5: Busy-pipe handoff: if another VM occupies the sole safe displacing pipe for a
+        // 2-unit VM, choose_compute_pipe refuses unrelated idle pipes (never stranding the pair)
+        // and compute_handoff_pipe targets that exact occupied pipe.
+        let owner_pipe = host.slots.compute_tail_pipes_in_mask(mdi_mask).trailing_zeros() as usize;
+        let busy_vm = Arc::new(Vm { id: next_vm_id, status: Status(AtomicU32::new(0)), slot: 42, msaa: AtomicBool::new(false) });
+        let busy_q = Queue::new(0, 2);
+        let busy_job = Arc::new(QueueBehindJob {
+            id: 999, vm: busy_vm, queue: busy_q,
+            progress: Progress { sent: AtomicU32::new(0), count: 1, pending: AtomicBool::new(true) },
+            commands: vec![Command::Compute(ComputeCommand { query_access: false, rt: false })],
+            order: Order { engine: command::COMPUTE, sequence: 1, wait_through: [None, None] },
+            extra_orders: vec![], dependency: Ok(()), resources: Resources, fw_waits: vec![],
+        });
+        host.engine.flights.push(QueueBehindFlight {
+            job: busy_job, group: vec![], first: 0, count: 1, computes: 1, renders: 0,
+            compute_pipe: owner_pipe as u8, rt_compute: false, heavy_render: false,
+            published_ns: 1, target: 1, cstamp: [1; 16], r_ta_stamp: [0; 16], r_fs_stamp: [0; 16],
+            fs_target: 0, initbm: false, has_timestamps: false, doomed: false, recovery_suspect: false,
+        });
+        assert_eq!(host.choose_compute_pipe(&mdi_q, &mdi_vm, no_w, mdi_mask, false, false), None);
+        assert!(!host.has_compute_pipe_for_vm(&mdi_vm, mdi_mask, false));
+    }
+    #[test]fn sparse_compute_toctou_and_queued_pair_borrow_never_cancel(){
+        let max_u = hw::sizes::COMPUTE_UNITS;
+        let p0_mask = (1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let no_w = [None; sizes::COMPUTE_PIPES];
+        let mask_a = (1u32 << 16) | (1u32 << 17);
+        let mk_host = || QueueBehindHost {
+            graph: QueueBehindGraph::new(),
+            engine: QueueBehindEngine {
+                ordinal: 0,
+                draw: 0,
+                ta_target: 0,
+                next_compute_pipe: 0,
+                pipe_last_vm: [None; hw::sizes::COMPUTE_PIPES],
+                pipe_last_used: [0; hw::sizes::COMPUTE_PIPES],
+                handoff_avoid_pipes: 0,
+                flights: vec![],
+            },
+            slots: QueueBehindSlots::new_with_lifetime(),
+            pools: QueueBehindPools { exhausted: false, can_pipeline: true, block_pipeline_vm: None },
+        };
+        let try_claim = |host: &mut QueueBehindHost, mask: u32, pipe: usize| -> Option<usize> {
+            let allowed = host.slots.compute_allowed_for_pipe(mask, pipe);
+            let blocked = host.slots.compute_stranding_mask_for_pipe(pipe, allowed);
+            let allowed = allowed & !blocked;
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            let other_tails = lt.pipe_tails_mask(pipe);
+            let other_partners =
+                ((other_tails & 0x5555_5555) << 1) | ((other_tails & 0xAAAA_AAAA) >> 1);
+            let pair_safe = allowed & !other_partners;
+            for tier in [pair_safe, allowed & other_partners] {
+                let mut rem = tier;
+                while rem != 0 {
+                    let k = rem.trailing_zeros() as usize;
+                    rem &= rem - 1;
+                    if lt.claim(k) {
+                        assert!(lt.publish_on(k, pipe as u8));
+                        return Some(k);
+                    }
+                }
+            }
+            None
+        };
+
+        // Window 1 (prepare -> submit TOCTOU race):
+        // Pipe 1 retires unit 16; depth-1 VM A prepares {16, 17} while 17 is non-tail. Before A
+        // reaches admission, multi-unit VM B on pipe 2 != 1 borrows unit 17 and retires.
+        let mut h1 = mk_host();
+        let vm_a = Arc::new(Vm { id: 701, status: Status(AtomicU32::new(0)), slot: 11, msaa: AtomicBool::new(false) });
+        let qa = Queue::new(0, 2);
+        assert_eq!(try_claim(&mut h1, mask_a, 1), Some(16));
+        assert!(h1.slots.lifetime.as_mut().unwrap().retire(16));
+        let tails_before = h1.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+        let prepared_a = resources::pick_compute_units_for(16, 0, 0, p0_mask, tails_before, 2, max_u, false);
+        assert_eq!(prepared_a, mask_a);
+        // Race: B on pipe 2 publishes unit 17 before A reaches admission.
+        assert_eq!(try_claim(&mut h1, mask_a, 2), Some(17));
+        // While 17 is Published on pipe 2, compute_exhausted_in_mask stays false (no false ECANCELED),
+        // and admission rejects {16, 17}.
+        assert!(!h1.slots.compute_exhausted_in_mask(mask_a));
+        assert!(!h1.slots.admit_compute_mask(mask_a));
+        // After 17 retires on pipe 2, {16, 17} has zero available and zero Published -> ECANCELED
+        // if admission had not caught it!
+        assert!(h1.slots.lifetime.as_mut().unwrap().retire(17));
+        assert!(h1.slots.compute_exhausted_in_mask(mask_a));
+        assert!(!h1.slots.admit_compute_mask(mask_a));
+        // Admission retry re-prepares with fresh compute_tail_mask + force_add_non_tail = true.
+        let fresh_tails = h1.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+        let added = resources::pick_compute_units_for(16, mask_a, 0, p0_mask, fresh_tails, 2, max_u, true);
+        assert_eq!(added.count_ones(), 1);
+        let grown_a = mask_a | added;
+        assert!(h1.slots.admit_compute_mask(grown_a));
+        assert!(!h1.slots.compute_exhausted_in_mask(grown_a));
+        let pipe_a = h1
+            .choose_compute_pipe(&qa, &vm_a, no_w, grown_a, false, false)
+            .expect("rescued VM A must pick a safe displacing pipe");
+        let unit_a = try_claim(&mut h1, grown_a, pipe_a).expect("rescued VM A must claim non-tail unit");
+        h1.slots.release_compute_waiter(grown_a);
+        assert!(h1.slots.lifetime.as_mut().unwrap().retire(unit_a));
+        assert!(!h1.slots.compute_exhausted_in_mask(grown_a));
+
+        // Window 2 (queued-on-input-fence / pending race against pair_borrow):
+        // Pipe 1 holds retired tail 16; A ({16, 17}) is admitted and queued waiting on an input
+        // fence. Multi-unit VM B (u32::MAX) on pipe 2 != 1 exhausts all 28 pair_safe secondary
+        // units and attempts to fall through to pair_borrow unit 17: pair_borrow MUST be refused!
+        let mut h2 = mk_host();
+        let vm_b = Arc::new(Vm { id: 702, status: Status(AtomicU32::new(0)), slot: 12, msaa: AtomicBool::new(false) });
+        let qb = Queue::new(0, 2);
+        assert_eq!(try_claim(&mut h2, mask_a, 1), Some(16));
+        assert!(h2.slots.lifetime.as_mut().unwrap().retire(16));
+        assert!(h2.slots.admit_compute_mask(mask_a));
+        let mut b_units = vec![];
+        while let Some(u) = try_claim(&mut h2, u32::MAX, 2) {
+            assert_ne!(u, 17, "VM B on pipe 2 must NEVER pair_borrow unit 17 while queued VM A owns {{16, 17}}");
+            b_units.push(u);
+        }
+        assert_eq!(b_units.len(), 28);
+        assert!(!h2.slots.compute_available_in_mask_for_pipe(u32::MAX, 2));
+        // B retires two of its pipe-2 flights, displacing its first unit and making forward progress.
+        assert!(h2.slots.lifetime.as_mut().unwrap().retire(b_units[0]));
+        assert!(h2.slots.lifetime.as_mut().unwrap().retire(b_units[1]));
+        let b_pipe = h2.choose_compute_pipe(&qb, &vm_b, no_w, u32::MAX, false, false).unwrap();
+        let b_reuse = try_claim(&mut h2, u32::MAX, b_pipe).unwrap();
+        assert_ne!(b_reuse, 17);
+        assert!(h2.slots.lifetime.as_mut().unwrap().retire(b_reuse));
+        for &u in &b_units[2..] {
+            assert!(h2.slots.lifetime.as_mut().unwrap().retire(u));
+        }
+        // Now VM A's input fence signals: A is never exhausted, picks safe pipe 1, claims 17, retires!
+        assert!(!h2.slots.compute_exhausted_in_mask(mask_a));
+        let pipe_a2 = h2
+            .choose_compute_pipe(&qa, &vm_a, no_w, mask_a, false, false)
+            .expect("queued VM A must still acquire safe pipe 1 after VM B's burst");
+        assert_eq!(pipe_a2, 1);
+        let unit_a2 = try_claim(&mut h2, mask_a, pipe_a2).expect("VM A must claim unit 17 on pipe 1");
+        assert_eq!(unit_a2, 17);
+        h2.slots.release_compute_waiter(mask_a);
+        assert!(h2.slots.lifetime.as_mut().unwrap().retire(unit_a2));
+        assert!(!h2.slots.compute_exhausted_in_mask(mask_a));
+    }
+    #[test]fn sole_vm_clight_d16_after_16_idle_tails_lands_on_pipe0_with_zero_slot_holds(){
+        let max_u = hw::sizes::COMPUTE_UNITS;
+        let p0_mask = (1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let no_w = [None; sizes::COMPUTE_PIPES];
+        let mut host = QueueBehindHost {
+            graph: QueueBehindGraph::new(),
+            engine: QueueBehindEngine {
+                ordinal: 0,
+                draw: 0,
+                ta_target: 0,
+                next_compute_pipe: 0,
+                pipe_last_vm: [None; hw::sizes::COMPUTE_PIPES],
+                pipe_last_used: [0; hw::sizes::COMPUTE_PIPES],
+                handoff_avoid_pipes: 0,
+                flights: vec![],
+            },
+            slots: QueueBehindSlots::new_with_lifetime(),
+            pools: QueueBehindPools { exhausted: false, can_pipeline: true, block_pipeline_vm: None },
+        };
+        // Prime all 16 pipes with 1 undisplaced retired tail each (exact procs d16 + procs d8
+        // aftermath: 32 retired, 16 reusable, cursor advanced to 24, pipe 0 warm to an exited VM).
+        {
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            for p in 0..sizes::COMPUTE_PIPES {
+                let u0 = p * 2;
+                let u1 = u0 + 1;
+                assert!(lt.claim(u0) && lt.publish_on(u0, p as u8) && lt.retire(u0));
+                assert!(lt.claim(u1) && lt.publish_on(u1, p as u8) && lt.retire(u1));
+                host.engine.pipe_last_vm[p] = Some(10 + p as u64);
+                host.engine.pipe_last_used[p] = (100 + sizes::COMPUTE_PIPES - p) as u64;
+            }
+            assert_eq!(lt.counts().reusable, 16);
+        }
+        // Case 1: Fresh sole VM after procs d16 + procs d8 (cursor = 24, active = 0).
+        // reserve_compute_vm_home atomically sets active = 1, cursor = 1 and assigns seq = 0
+        // (pipe 0's [0, 1]), so submit #1 starts on pipe 0 and 16 in-flight submits incur 0 holds.
+        let vm_state = AtomicU64::new(24);
+        let (active, seq) = resources::reserve_compute_vm_home(&vm_state);
+        assert_eq!((active, seq, vm_state.load(Ordering::Acquire)), (1, 0, (1u64 << 32) | 1));
+        let home = resources::compute_home_start(seq, max_u);
+        assert_eq!(home, 0);
+        let tails = host.slots.lifetime.as_ref().unwrap().pipe_tails_mask(usize::MAX);
+        let init_mask = resources::pick_compute_units_for(home, 0, 0, p0_mask, tails, 2, max_u, false);
+        assert_eq!(init_mask, p0_mask);
+        let vm1 = Arc::new(Vm { id: 801, status: Status(AtomicU32::new(0)), slot: 21, msaa: AtomicBool::new(false) });
+        let q1 = Queue::new(0, 2);
+        assert_eq!(host.choose_compute_pipe(&q1, &vm1, no_w, init_mask, false, false), Some(0));
+
+        // Case 2: Idle pipe-0 migration for a VM that started on a secondary pipe alongside another
+        // VM (warm pipe_last_vm[1] == Some(vm2.id)) and then became the sole active compute VM
+        // owning pipe-0-exclusive units (u32::MAX): MUST migrate off warm secondary pipe 1 onto
+        // pipe 0 so all 16 simultaneous in-flight submits complete with 0 HoldCause::Slot holds!
+        let vm2 = Arc::new(Vm { id: 802, status: Status(AtomicU32::new(0)), slot: 22, msaa: AtomicBool::new(false) });
+        let q2 = Queue::new(0, 2);
+        host.engine.pipe_last_vm[1] = Some(vm2.id);
+        host.engine.pipe_last_used[1] = 999;
+        // Verify secondary pipe 1 only has 15 claimable units (cannot sustain d16 without holds).
+        let sec_avail = {
+            let lt = host.slots.lifetime.as_ref().unwrap();
+            let allowed1 = host.slots.compute_allowed_for_pipe(u32::MAX, 1);
+            (0..max_u).filter(|&k| (allowed1 & (1u32 << k)) != 0 && lt.available(k)).count()
+        };
+        assert_eq!(sec_avail, 15);
+        // Idle migration selects pipe 0 instead of staying stuck on warm secondary pipe 1!
+        let chosen = host.choose_compute_pipe(&q2, &vm2, no_w, u32::MAX, false, false);
+        assert_eq!(chosen, Some(0), "sole VM with pipe0_exclusive units must migrate to pipe 0");
+        let mut inflight = vec![];
+        for i in 0..16usize {
+            let p = host
+                .choose_compute_pipe(&q2, &vm2, no_w, u32::MAX, false, false)
+                .expect("clight d16 submit on pipe 0 must never hit HoldCause::Slot");
+            assert_eq!(p, 0);
+            let lt = host.slots.lifetime.as_mut().unwrap();
+            let unit = (0..max_u).find(|&k| lt.available(k)).expect("pipe 0 must have 16 available units");
+            assert!(lt.claim(unit) && lt.publish_on(unit, 0));
+            let j = Arc::new(QueueBehindJob {
+                id: (900 + i) as u32,
+                vm: vm2.clone(),
+                queue: q2.clone(),
+                progress: Progress { sent: AtomicU32::new(0), count: 1, pending: AtomicBool::new(true) },
+                commands: vec![Command::Compute(ComputeCommand { query_access: false, rt: false })],
+                order: Order { engine: command::COMPUTE, sequence: (i + 1) as u64, wait_through: [None, None] },
+                extra_orders: vec![],
+                dependency: Ok(()),
+                resources: Resources,
+                fw_waits: vec![],
+            });
+            host.engine.flights.push(QueueBehindFlight {
+                job: j, group: vec![], first: 0, count: 1, computes: 1, renders: 0,
+                compute_pipe: 0, rt_compute: false, heavy_render: false, published_ns: 1,
+                target: (i + 1) as u32, cstamp: [(i + 1) as u32; 16], r_ta_stamp: [0; 16],
+                r_fs_stamp: [0; 16], fs_target: 0, initbm: false, has_timestamps: false,
+                doomed: false, recovery_suspect: false,
+            });
+            inflight.push(unit);
+        }
+        assert_eq!(inflight.len(), 16);
+        host.engine.flights.clear();
+        for u in inflight {
+            assert!(host.slots.lifetime.as_mut().unwrap().retire(u));
+        }
+    }
     #[test]fn two_pipe_compute_barriers_reuse_single_pipe_and_serialize_across_both_pipes(){
         let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
@@ -2085,7 +2702,7 @@ mod queue_behind_scope {
                     initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
                 },
             ]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Barrier-free compute resolves all None.
@@ -2168,7 +2785,7 @@ mod queue_behind_scope {
                     initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
                 },
             ]},
-            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true,lifetime:None,waiters:vec![]},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         // Cross-queue compute wait resolves pipe 0 stamp 0x100 and keeps q2 on pipe 0 (zero c2c).
@@ -3145,9 +3762,11 @@ mod msaa_fold_scope {
         }
         fn verify_held(&self, _c: &Claims) -> Result { Ok(()) }
         fn publish(&mut self, _c: &mut Claims) -> Result { if self.publish_fails { Err(EIO) } else { Ok(()) } }
+        fn compute_tail_mask(&self) -> u32 { 0 }
     }
     struct Pools; impl Pools { fn hold_alloc(&mut self, _k: usize, _vm: &Arc<Vm>, _a: u32, _l: u32) -> Result { Ok(()) } }
-    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>> }
+    struct Shared { compute_tail_mask: std::sync::atomic::AtomicU32 }
+    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>>, shared: Option<Arc<Shared>> }
     struct Host { cfg: Cfg, slots: Slots, pools: Pools, engine: Engine, prefixed: Vec<(u32, u32)> }
     impl Host {
         __MSAA_MEMBER_ALLOWED__
@@ -3190,7 +3809,7 @@ mod msaa_fold_scope {
     }
     fn host(flights: Vec<Flight>, pending: Vec<Arc<Job>>) -> Host {
         Host { cfg: Cfg { num_clusters: 1, gpu_generation: 16 }, slots: Slots { pass_busy: 1, publish_fails: false }, pools: Pools,
-            engine: Engine { flights, pending }, prefixed: vec![] }
+            engine: Engine { flights, pending, shared: None }, prefixed: vec![] }
     }
     #[test] fn same_submit_fold_splits_before_a_multisampled_member_beside_another_vm() {
         let (vm1, vm2, q1, q2) = (vm(1), vm(2), Arc::new(Queue), Arc::new(Queue));
@@ -3387,6 +4006,37 @@ for token, declaration in {
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::vm::VmState", "crate::Vm").replace("super::fence::", "crate::fence::"))
+res_tiers_start = resources_src.index('pub(crate) const COMPUTE_UNIT_TIERS:')
+res_tiers_end = resources_src.index('];', res_tiers_start) + 2
+harness = harness.replace('__POOLS_LIFETIME__', lifetime_src[:lifetime_src.index('#[cfg(test)]')])
+harness = harness.replace(
+    '__MASK_HAS_SAFE_PIPE_WITH_TAILS__',
+    item_in(slots_src, 'fn mask_has_safe_pipe_with_tails(').replace('sizes::', 'hw::sizes::'),
+)
+harness = harness.replace(
+    '__COMPUTE_UNIT_TIERS__',
+    resources_src[res_tiers_start:res_tiers_end].replace('super::hw::', 'hw::'),
+)
+harness = harness.replace(
+    '__RESERVE_COMPUTE_VM_HOME__',
+    'pub(crate) ' + item_in(resources_src, 'fn reserve_compute_vm_home('),
+)
+harness = harness.replace(
+    '__COMPUTE_HOME_START__',
+    'pub(crate) ' + item_in(resources_src, 'fn compute_home_start(').replace('super::hw::', 'hw::'),
+)
+harness = harness.replace(
+    '__TARGET_COMPUTE_UNITS__',
+    'pub(crate) ' + item_in(resources_src, 'fn target_compute_units(').replace('super::hw::', 'hw::'),
+)
+harness = harness.replace(
+    '__PICK_COMPUTE_UNITS_FOR__',
+    'pub(crate) ' + item_in(resources_src, 'fn pick_compute_units_for(').replace('super::hw::', 'hw::'),
+)
+harness = harness.replace(
+    '__PICK_COMPUTE_UNITS__',
+    'pub(crate) ' + item_in(resources_src, 'fn pick_compute_units(').replace('super::hw::', 'hw::'),
+)
 unit = output / 'publication.rs'
 unit.write_text(harness)
 log = ''

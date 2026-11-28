@@ -9,7 +9,7 @@ use super::{
     command::Command,
     object::{Factory, FwObject, Objects},
     pools::{PbEpoch, PoolSet},
-    slots::{ComputeSlot, PassCmds, PassSlot, Placement, UnitCmds},
+    slots::{ComputeSlot, ComputeWaiters, PassCmds, PassSlot, Placement, UnitCmds},
     vm::VmState,
     Shared,
 };
@@ -174,16 +174,29 @@ pub(crate) struct ComputeInner {
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
 }
-/// Compute units every VM gets with its first compute command; more are added
-/// ([`Cache::prepare`]) once it submits compute back to back.
+/// Compute units every VM gets with its first compute command; more are added sparsely
+/// ([`Cache::prepare`]) only when the VM pipelines or batches multiple compute commands.
 pub(crate) const BASE_COMPUTE_UNITS: usize = 2;
+/// Demand-grown healthy compute-unit tiers per VM, bounded by [`COMPUTE_TOTAL_UNIT_BUDGET`]
+/// divided across open compute VMs so multi-process bursts stay within ~2 GiB total backing.
+pub(crate) const COMPUTE_UNIT_TIERS: [usize; 5] = [
+    BASE_COMPUTE_UNITS,
+    4,
+    8,
+    16,
+    super::hw::sizes::COMPUTE_UNITS,
+];
+/// Device-wide total compute-unit backing budget across concurrent compute VMs
+/// (`64 * 32.3 MiB ~= 2.06 GiB` worst case, `<= 1.03 GiB` for depth-1 16-process bursts).
+pub(crate) const COMPUTE_TOTAL_UNIT_BUDGET: usize = super::hw::sizes::COMPUTE_UNITS * 2;
+const _: () = assert!(COMPUTE_UNIT_TIERS[0] == BASE_COMPUTE_UNITS);
+const _: () =
+    assert!(COMPUTE_UNIT_TIERS[COMPUTE_UNIT_TIERS.len() - 1] == super::hw::sizes::COMPUTE_UNITS);
 
-/// Back-to-back compute submissions (each within [`BURST_GAP_NS`] of the previous) after
-/// which a VM gets its extension units; a single submission with [`BURST_COMMANDS`] compute
-/// commands qualifies at once.
+/// Back-to-back render submissions (each within [`BURST_GAP_NS`] of the previous) after
+/// which a VM expands render pass tiers.
 const BURST_SUBMITS: u32 = 3;
 const BURST_GAP_NS: u64 = 2_000_000;
-const BURST_COMMANDS: usize = 3;
 
 impl ComputeArena {
     /// Freelist entries of the unit's UMA pool.
@@ -225,43 +238,89 @@ impl ComputeArena {
     }
 }
 
-/// Contiguous range of independently reference-counted [`ComputeArena`] units owned by a VM.
+/// Sparse table of independently reference-counted [`ComputeArena`] units owned by a VM.
 ///
-/// Each unit `k` owns its own `Arc<ComputeArena>` so `Cache::close()` and
-/// `Slots::reclaim_closed()` release all unused or displaced units immediately even while a
-/// CDM pipe retains one undisplaced last-retired unit until displacement.
-pub(crate) struct ComputeUnitSet {
-    units: KVec<Arc<ComputeArena>>,
-    /// Device-wide compute ledger indices bound to local SCS units `0..SCS_COMPUTE_UNITS`, or
-    /// `None` for contiguous base/extension sets whose local index equals the ledger index.
-    hw_slots: Option<[usize; super::hw::sizes::SCS_COMPUTE_UNITS]>,
+/// Each allocated unit `k` (`0..COMPUTE_UNITS`) is mapped at client VA index `k`, bound to
+/// hardware compute ledger slot `k`, and recorded in `mask`. Replaced copy-on-write only when a
+/// VM adds new units so steady-state `SUBMIT` preparation clones a single `Arc`. Each unit owns
+/// its own `Arc<ComputeArena>` so `Cache::close()` and `Slots::reclaim_closed()` release unused
+/// or displaced units immediately even while a CDM pipe retains one undisplaced retired unit.
+pub(crate) struct ComputeUnitTable {
+    units: [Option<Arc<ComputeArena>>; super::hw::sizes::COMPUTE_UNITS],
+    mask: u32,
 }
-impl ComputeUnitSet {
-    /// Units `range` (each index and `placement` fix its client addresses; the index fixes its
-    /// hardware UMA slot).
-    fn new(
+impl ComputeUnitTable {
+    /// Allocates the hardware compute units named by set bits of `add_mask` not already in
+    /// `existing` and returns a new immutable table, or `Ok(None)` when no new units were added
+    /// and `min_added == 0`. Returns an error if fewer than `min_added` units could be allocated.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Sparse per-slot growth carries VM allocator context, existing table, and mask."
+    )]
+    fn with_added(
+        existing: Option<&Self>,
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
-        range: core::ops::Range<usize>,
-        placement: Placement,
-    ) -> Result<Arc<Self>> {
-        let mut units = KVec::with_capacity(range.len(), GFP_KERNEL)?;
-        for k in range {
-            units.push(
-                ComputeArena::new(factory, bind, vm, live, k, k, placement)?,
-                GFP_KERNEL,
-            )?;
+        add_mask: u32,
+        min_added: usize,
+    ) -> Result<Option<Arc<Self>>> {
+        let mut units: [Option<Arc<ComputeArena>>; super::hw::sizes::COMPUTE_UNITS] =
+            core::array::from_fn(|k| existing.and_then(|t| t.units[k].clone()));
+        let mut mask = existing.map_or(0, |t| t.mask);
+        let mut added = 0u32;
+        let mut rem = add_mask & !mask;
+        let mut first_err = None;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k >= super::hw::sizes::COMPUTE_UNITS {
+                break;
+            }
+            match ComputeArena::new(factory, bind, vm, live, k, k, Placement::Base) {
+                Ok(arena) => {
+                    units[k] = Some(arena);
+                    mask |= 1u32 << k;
+                    added |= 1u32 << k;
+                }
+                Err(err) => {
+                    first_err.get_or_insert(err);
+                    break;
+                }
+            }
         }
-        Ok(Arc::new(
-            Self {
-                units,
-                hw_slots: None,
-            },
-            GFP_KERNEL,
-        )?)
+        let added_count = added.count_ones() as usize;
+        if added_count < min_added {
+            return Err(first_err.unwrap_or(ENOMEM));
+        }
+        if added_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(Self { units, mask }, GFP_KERNEL)?))
     }
+    fn mask(&self) -> u32 {
+        self.mask
+    }
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.mask.count_ones() as usize
+    }
+    fn unit(&self, k: usize) -> Option<&ComputeSlot> {
+        self.units.get(k)?.as_deref().map(|arena| &arena.unit)
+    }
+    fn arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
+        self.units.get(k)?.clone()
+    }
+}
+
+/// SCS-capable [`ComputeArena`] pair owned by a VM, mapped at local VA indices
+/// `0..SCS_COMPUTE_UNITS` and bound to device-wide healthy pipe-0 compute ledger indices.
+pub(crate) struct ComputeUnitSet {
+    units: KVec<Arc<ComputeArena>>,
+    hw_slots: [usize; super::hw::sizes::SCS_COMPUTE_UNITS],
+}
+impl ComputeUnitSet {
     /// SCS-capable compute units mapped at local VA indices `0..SCS_COMPUTE_UNITS` and bound to
     /// device-wide healthy compute ledger indices `hw_slots`.
     fn new_scs(
@@ -287,26 +346,30 @@ impl ComputeUnitSet {
                 GFP_KERNEL,
             )?;
         }
-        Ok(Arc::new(
-            Self {
-                units,
-                hw_slots: Some(hw_slots),
-            },
-            GFP_KERNEL,
-        )?)
+        Ok(Arc::new(Self { units, hw_slots }, GFP_KERNEL)?)
     }
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.units.len()
+    }
+    fn slot_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for slot in self.hw_slots {
+            mask |= 1u32 << slot;
+        }
+        mask
     }
     /// Freelist entries of the set's UMA pools (all its units share a placement).
     pub(crate) fn seeds(&self) -> u32 {
         self.units.first().map_or(0, |arena| arena.seeds())
     }
-    fn unit(&self, idx: usize) -> Option<&ComputeSlot> {
-        self.units.get(idx).map(|arena| &arena.unit)
+    fn unit_for_hw(&self, k: usize) -> Option<&ComputeSlot> {
+        let local = self.hw_slots.iter().position(|&slot| slot == k)?;
+        self.units.get(local).map(|arena| &arena.unit)
     }
-    fn arena(&self, idx: usize) -> Option<Arc<ComputeArena>> {
-        self.units.get(idx).cloned()
+    fn arena_for_hw(&self, k: usize) -> Option<Arc<ComputeArena>> {
+        let local = self.hw_slots.iter().position(|&slot| slot == k)?;
+        self.units.get(local).cloned()
     }
 }
 
@@ -358,10 +421,19 @@ const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
 /// Device-wide hints read locklessly in `SUBMIT` to size per-VM extension backing.
 #[derive(Copy, Clone)]
 pub(crate) struct PrepareHints<'a> {
-    /// A base compute unit (`0..BASE_COMPUTE_UNITS`) is quarantined: allocate extension units.
-    pub(crate) expand_compute_ext: bool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
     pub(crate) quarantined_compute_mask: u32,
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0.
+    pub(crate) pipe0_exclusive_mask: u32,
+    /// Bitmask of healthy pipe-0-exclusive compute units reserved for fresh SCS compute VMs.
+    pub(crate) scs_compute_mask: u32,
+    /// Bitmask of compute units currently pinned as the newest publication on any compute pipe.
+    pub(crate) compute_tail_mask: u32,
+    /// Admission retry after a lost `prepare -> submit` race: add one healthy non-tail unit.
+    pub(crate) force_add_compute_non_tail: bool,
+    /// Packed non-SCS compute-VM state (`(active_vms << 32) | next_slot`) for atomic cold-start
+    /// home-pair reservation and multi-VM compute-backing budgeting.
+    pub(crate) compute_vm_state: &'a Arc<AtomicU64>,
     /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
     pub(crate) expand_render_ext: bool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -373,10 +445,11 @@ pub(crate) struct PrepareHints<'a> {
 }
 
 /// Selects `SCS_COMPUTE_UNITS` distinct hardware compute ledger indices for a VM's SCS compute
-/// set, skipping permanently quarantined units in `quarantined_mask`. Scans from `0` up so
-/// pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) are preferred before falling back to
-/// `PIPE1_COMPUTE_START..max_units`.
+/// set, preferring healthy units already reserved for pipe 0 (`reserved_mask`) so fresh SCS
+/// VMs never bind onto units carrying an undisplaced secondary-pipe lease, then falling back
+/// to any non-quarantined units in `0..max_units`.
 fn pick_scs_compute_slots(
+    reserved_mask: u32,
     quarantined_mask: u32,
     max_units: usize,
 ) -> [usize; super::hw::sizes::SCS_COMPUTE_UNITS] {
@@ -385,8 +458,18 @@ fn pick_scs_compute_slots(
         .max(super::hw::sizes::SCS_COMPUTE_UNITS);
     let mut out = [0usize; super::hw::sizes::SCS_COMPUTE_UNITS];
     let mut found = 0usize;
+    let preferred = reserved_mask & !quarantined_mask;
     for k in 0..limit {
-        if (quarantined_mask & (1u32 << k)) == 0 {
+        if (preferred & (1u32 << k)) != 0 {
+            out[found] = k;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    for k in 0..limit {
+        if (quarantined_mask & (1u32 << k)) == 0 && !out[..found].contains(&k) {
             out[found] = k;
             found += 1;
             if found == out.len() {
@@ -447,26 +530,323 @@ fn pick_base_pb_slots(start: usize, quarantined_mask: u32) -> [usize; BASE_PB_SL
     out
 }
 
-/// Updates the consecutive-compute burst counter and reports whether this submission
-/// qualifies to allocate extension compute units (`compute_ext`).
+/// Atomically reserves a live non-SCS compute VM slot and its home-pair sequence index in
+/// `state` (`(active_vms << 32) | next_slot`).
 ///
-/// If a base compute unit (`0..BASE_COMPUTE_UNITS`) has been permanently quarantined, fresh
-/// single-command VMs must expand immediately so they can claim a healthy extension unit and
-/// displace the remaining retired base unit rather than hitting `compute_exhausted_within(2)`.
-fn should_expand_compute_ext(
-    last_compute_ns: &mut u64,
-    burst: &mut u32,
-    now: u64,
-    computes: usize,
-    base_quarantined: bool,
-) -> bool {
-    *burst = if *last_compute_ns != 0 && now.wrapping_sub(*last_compute_ns) < BURST_GAP_NS {
-        burst.saturating_add(1)
+/// When `active_vms == 0`, resets `next_slot` to `1` and returns `(1, 0)` so a sole VM after
+/// idle claims pipe 0's `[0, 1]` home pair immediately (retaining all 16 claimable units even
+/// after 16 idle pipe tails from an earlier multi-process run), while any racing concurrent VM
+/// observes `active_vms >= 1` and receives distinct sequential indices (`1, 2, ...`) without
+/// resetting `next_slot`.
+fn reserve_compute_vm_home(state: &AtomicU64) -> (u32, usize) {
+    let mut cur = state.load(Ordering::Acquire);
+    loop {
+        let active = (cur >> 32) as u32;
+        let slot = cur as u32;
+        let (next_active, seq, next_slot) = if active == 0 {
+            (1u32, 0usize, 1u32)
+        } else {
+            (active + 1, slot as usize, slot.wrapping_add(1))
+        };
+        let next = (u64::from(next_active) << 32) | u64::from(next_slot);
+        match state.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return (next_active, seq),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Returns the current live non-SCS compute VM count stored in the upper 32 bits of `state`.
+fn active_compute_vm_count(state: &AtomicU64) -> u32 {
+    (state.load(Ordering::Acquire) >> 32) as u32
+}
+
+/// Decrements the live non-SCS compute VM count in the upper 32 bits of `state`, preserving the
+/// round-robin home-pair cursor in the lower 32 bits.
+fn release_compute_vm_slot(state: &AtomicU64) {
+    state.fetch_sub(1u64 << 32, Ordering::AcqRel);
+}
+
+/// RAII rollback guard for an uncommitted non-SCS compute VM reservation.
+///
+/// Rolls back the upper-32 active-VM count on drop unless [`Self::commit`] transfers ownership
+/// to [`Ready::compute_vm_counter`] after `ComputeUnitTable::with_added()` succeeds.
+struct ComputeVmReservation {
+    state: Option<Arc<AtomicU64>>,
+}
+
+impl ComputeVmReservation {
+    fn acquire(state: &Arc<AtomicU64>) -> (Self, u32, usize) {
+        let (active_vms, seq) = reserve_compute_vm_home(state);
+        (
+            Self {
+                state: Some(state.clone()),
+            },
+            active_vms,
+            seq,
+        )
+    }
+
+    fn commit(mut self) -> Option<Arc<AtomicU64>> {
+        self.state.take()
+    }
+}
+
+impl Drop for ComputeVmReservation {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            release_compute_vm_slot(&state);
+        }
+    }
+}
+
+/// Maps a VM's monotonic compute-VM index to its starting hardware compute ledger index.
+///
+/// For the standard 32-unit layout (16 pairs), 4-bit bit-reversal across the 16 pairs
+/// (`0, 16, 8, 24, 4, 20, 12, 28, ...`) keeps every power-of-two concurrency level
+/// (`1, 2, 4, 8, 16` VMs) on pairwise disjoint home ranges while preserving unit `0`
+/// (pipe 0) for the first VM.
+fn compute_home_start(seq: usize, max_units: usize) -> usize {
+    let limit = max_units
+        .min(super::hw::sizes::COMPUTE_UNITS)
+        .max(BASE_COMPUTE_UNITS);
+    let pairs = (limit / BASE_COMPUTE_UNITS).max(1);
+    if pairs == 16 && limit == super::hw::sizes::COMPUTE_UNITS {
+        let p = seq & 15;
+        let rev = ((p & 1) << 3) | ((p & 2) << 1) | ((p & 4) >> 1) | ((p & 8) >> 3);
+        rev * BASE_COMPUTE_UNITS
     } else {
-        0
+        (seq % pairs) * BASE_COMPUTE_UNITS
+    }
+}
+
+/// Counts how many units in `existing_mask` remain usable for a VM assigned `home_start`.
+/// Pipe-0-home VMs count all healthy units; secondary-home VMs count healthy secondary-eligible
+/// units while at least `BASE_COMPUTE_UNITS` exist on the device (and count pipe-0 fallback units
+/// once all secondary healthy units are already owned) so quarantine promotions never leave a
+/// secondary VM with only one secondary-eligible unit.
+fn usable_compute_units(
+    home_start: usize,
+    existing_mask: u32,
+    quarantined_mask: u32,
+    pipe0_exclusive_mask: u32,
+    max_units: usize,
+) -> usize {
+    let limit = max_units
+        .min(super::hw::sizes::COMPUTE_UNITS)
+        .max(BASE_COMPUTE_UNITS);
+    let limit_mask = if limit >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << limit) - 1
     };
-    *last_compute_ns = now;
-    base_quarantined || *burst >= BURST_SUBMITS || computes >= BURST_COMMANDS
+    let healthy = limit_mask & !quarantined_mask;
+    if home_start < super::hw::sizes::PIPE1_COMPUTE_START {
+        return (existing_mask & healthy).count_ones() as usize;
+    }
+    let sec_healthy = healthy & !pipe0_exclusive_mask;
+    if sec_healthy.count_ones() as usize >= BASE_COMPUTE_UNITS
+        && (existing_mask & sec_healthy) != sec_healthy
+    {
+        (existing_mask & sec_healthy).count_ones() as usize
+    } else {
+        (existing_mask & healthy).count_ones() as usize
+    }
+}
+
+/// Returns the target healthy compute-unit count (`BASE_COMPUTE_UNITS..=limit`) a non-SCS VM
+/// should have backed before admission.
+///
+/// Depth-1 VMs (`active_cmds == 0 && computes <= 1`), including each process of multi-process
+/// depth-1 workloads, stay at `BASE_COMPUTE_UNITS` (2 units = 64.6 MiB). Pipelined or batched
+/// VMs grow along [`COMPUTE_UNIT_TIERS`] according to `2 * (active_cmds + computes)` so a single
+/// deep queue keeps full `demand + 1` reusable units even when all 15 other idle pipes hold
+/// undisplaced retired tails from an earlier multi-process burst, while capping multi-VM backing
+/// at `COMPUTE_TOTAL_UNIT_BUDGET / active_compute_vms` (~2 GiB worst case).
+fn target_compute_units(
+    active_cmds: u32,
+    computes: usize,
+    current_usable: usize,
+    active_compute_vms: u32,
+    max_units: usize,
+) -> usize {
+    let limit = max_units
+        .min(super::hw::sizes::COMPUTE_UNITS)
+        .max(BASE_COMPUTE_UNITS);
+    let vms = (active_compute_vms as usize).max(1);
+    let vm_cap = (COMPUTE_TOTAL_UNIT_BUDGET / vms).clamp(BASE_COMPUTE_UNITS, limit);
+    let want = if active_cmds == 0 && computes <= 1 {
+        BASE_COMPUTE_UNITS
+    } else {
+        let live_need = (active_cmds as usize)
+            .saturating_add(computes)
+            .saturating_mul(2);
+        let mut tier = limit;
+        for &t in &COMPUTE_UNIT_TIERS {
+            if t >= live_need {
+                tier = t;
+                break;
+            }
+        }
+        tier.min(vm_cap)
+    };
+    want.max(current_usable).min(limit)
+}
+
+/// Returns the bitmask of new healthy compute ledger indices to allocate for a VM assigned
+/// `home_start` to reach `target_usable` usable units without duplicating `existing_mask`.
+///
+/// Uses `compute_tail_mask` (units pinned as the newest publication on any compute pipe) so:
+/// - a fresh depth-1 VM never binds onto a stranded pair where both units are pinned tails, and
+/// - an existing VM whose owned units are all pinned tails (or whose admission check lost a
+///   `prepare -> submit` race and set `force_add_non_tail`) adds one immediately available
+///   non-tail unit to restore a safe displacing pair.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure compute-unit picker takes exact per-VM and device-wide bitmask hints."
+)]
+fn pick_compute_units_for(
+    home_start: usize,
+    existing_mask: u32,
+    quarantined_mask: u32,
+    pipe0_exclusive_mask: u32,
+    compute_tail_mask: u32,
+    target_usable: usize,
+    max_units: usize,
+    force_add_non_tail: bool,
+) -> u32 {
+    let limit = max_units
+        .min(super::hw::sizes::COMPUTE_UNITS)
+        .max(BASE_COMPUTE_UNITS);
+    let limit_mask = if limit >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << limit) - 1
+    };
+    let healthy = limit_mask & !quarantined_mask;
+    let start = home_start % limit;
+    let p0_healthy = healthy & pipe0_exclusive_mask;
+    let sec_healthy = healthy & !pipe0_exclusive_mask;
+    let pipe0_home = home_start < super::hw::sizes::PIPE1_COMPUTE_START;
+    let primary_pool = if pipe0_home {
+        healthy
+    } else if sec_healthy.count_ones() as usize >= BASE_COMPUTE_UNITS
+        && (existing_mask & sec_healthy) != sec_healthy
+    {
+        sec_healthy
+    } else {
+        healthy
+    };
+    let have_primary = (existing_mask & primary_pool).count_ones() as usize;
+    let have_non_tail = (existing_mask & primary_pool & !compute_tail_mask) != 0;
+    let need_rescue = force_add_non_tail || (existing_mask != 0 && !have_non_tail);
+    let base_need = target_usable.saturating_sub(have_primary);
+    if base_need == 0 && !need_rescue {
+        return 0;
+    }
+
+    // Fresh secondary-home depth-1 VM: pick its bit-reversed home pair when at least one unit of
+    // the pair is immediately available (non-tail); if both units of that pair are pinned tails,
+    // advance to the next healthy pair that retains a non-tail unit.
+    if existing_mask == 0
+        && !pipe0_home
+        && target_usable == BASE_COMPUTE_UNITS
+        && sec_healthy.count_ones() as usize >= BASE_COMPUTE_UNITS
+    {
+        let pair_start = start & !1;
+        let pairs = limit / BASE_COMPUTE_UNITS;
+        for i in 0..pairs {
+            let k0 = (pair_start + i * BASE_COMPUTE_UNITS) % limit;
+            let k1 = k0 + 1;
+            if k1 < limit {
+                let pair_mask = (1u32 << k0) | (1u32 << k1);
+                if (pair_mask & sec_healthy) == pair_mask
+                    && (pair_mask & !compute_tail_mask) != 0
+                {
+                    return pair_mask;
+                }
+            }
+        }
+    }
+
+    let mut add = 0u32;
+    let pick_from = |add: &mut u32, pool: u32, mut count: usize| {
+        let cand = pool & !existing_mask & !*add;
+        if cand == 0 || count == 0 {
+            return;
+        }
+        for i in 0..limit {
+            let k = (start + i) % limit;
+            let bit = 1u32 << k;
+            if (cand & bit) != 0 {
+                *add |= bit;
+                count -= 1;
+                if count == 0 {
+                    break;
+                }
+            }
+        }
+    };
+
+    // Guarantee at least one non-tail unit whenever `existing_mask` currently has none or an
+    // admission retry requested a fresh non-tail rescue unit.
+    if !have_non_tail || force_add_non_tail {
+        pick_from(&mut add, primary_pool & !compute_tail_mask, 1);
+        if add == 0 {
+            pick_from(&mut add, healthy & !compute_tail_mask, 1);
+        }
+    }
+
+    let effective_target = if need_rescue && base_need == 0 {
+        have_primary.saturating_add(1).min(limit)
+    } else {
+        target_usable
+    };
+
+    if pipe0_home {
+        let have = ((existing_mask | add) & healthy).count_ones() as usize;
+        let need = effective_target.saturating_sub(have);
+        if need != 0 {
+            pick_from(&mut add, p0_healthy, need);
+            let have_after = ((existing_mask | add) & healthy).count_ones() as usize;
+            let rem = effective_target.saturating_sub(have_after);
+            pick_from(&mut add, sec_healthy, rem);
+        }
+    } else {
+        let have_sec = ((existing_mask | add) & sec_healthy).count_ones() as usize;
+        let need_sec = effective_target.saturating_sub(have_sec);
+        if need_sec != 0 {
+            pick_from(&mut add, sec_healthy, need_sec);
+        }
+        let have_all = ((existing_mask | add) & healthy).count_ones() as usize;
+        let rem = effective_target.saturating_sub(have_all);
+        if rem != 0 {
+            pick_from(&mut add, p0_healthy, rem);
+        }
+    }
+    add
+}
+
+#[allow(dead_code)]
+fn pick_compute_units(
+    home_start: usize,
+    existing_mask: u32,
+    quarantined_mask: u32,
+    pipe0_exclusive_mask: u32,
+    compute_tail_mask: u32,
+    target_usable: usize,
+    max_units: usize,
+) -> u32 {
+    pick_compute_units_for(
+        home_start,
+        existing_mask,
+        quarantined_mask,
+        pipe0_exclusive_mask,
+        compute_tail_mask,
+        target_usable,
+        max_units,
+        false,
+    )
 }
 
 /// Updates the consecutive-render burst counter and returns the target render pass slot count
@@ -889,9 +1269,12 @@ impl PassOwnerArena {
 
 #[derive(Default)]
 struct Ready {
-    compute: Option<Arc<ComputeUnitSet>>,
-    /// Units from [`BASE_COMPUTE_UNITS`] on, for a VM that keeps compute queued.
-    compute_ext: Option<Arc<ComputeUnitSet>>,
+    /// Sparse per-slot compute units owned by this VM (allocated on demand).
+    compute: Option<Arc<ComputeUnitTable>>,
+    /// Starting hardware compute ledger index assigned to this VM on its first non-SCS compute.
+    compute_home_start: Option<usize>,
+    /// Packed device-wide non-SCS compute VM state; high-32 count decremented once on close/drop.
+    compute_vm_counter: Option<Arc<AtomicU64>>,
     /// SCS-capable units, for jobs with compute scratch.
     compute_scs: Option<Arc<ComputeUnitSet>>,
     render: Option<Arc<RenderArena>>,
@@ -906,15 +1289,15 @@ struct Ready {
     single_vm_render_slots: usize,
     /// Device-wide count of open rendering VMs; decremented once on `Cache::close()` or drop.
     render_vm_counter: Option<Arc<AtomicU32>>,
-    /// Last compute submission and the back-to-back run it continues.
-    last_compute_ns: u64,
-    burst: u32,
     /// Last render submission and the back-to-back run it continues.
     last_render_ns: u64,
     render_burst: u32,
 }
 impl Drop for Ready {
     fn drop(&mut self) {
+        if let Some(counter) = self.compute_vm_counter.take() {
+            release_compute_vm_slot(&counter);
+        }
         if let Some(counter) = self.render_vm_counter.take() {
             counter.fetch_sub(1, Ordering::AcqRel);
         }
@@ -944,6 +1327,8 @@ pub(crate) struct Cache {
     standby_available: CondVar,
     /// The VM's client closed: no arena or surplus spare is kept here any more.
     closed: AtomicBool,
+    /// Non-SCS compute commands across prepared jobs on this VM not yet completed or dropped.
+    active_compute_cmds: AtomicU32,
     /// Render passes across prepared jobs on this VM that have not yet retired and dropped.
     active_render_passes: AtomicU32,
     pub(crate) factory: Factory,
@@ -973,6 +1358,7 @@ impl Cache {
             ),
             standby_available <- new_condvar!(),
             closed: AtomicBool::new(false),
+            active_compute_cmds: AtomicU32::new(0),
             active_render_passes: AtomicU32::new(0),
             factory, bind, live, budget, shared }),
             GFP_KERNEL,
@@ -1067,7 +1453,18 @@ impl Cache {
         }
     }
 
+    fn release_compute_cmds(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.active_compute_cmds.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count);
+    }
+
     fn release_render_passes(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
         let previous = self.active_render_passes.fetch_sub(count, Ordering::AcqRel);
         debug_assert!(previous >= count);
     }
@@ -1101,12 +1498,14 @@ impl Cache {
         self.standby_available.notify_all();
         let ready = {
             let mut ready = self.ready.lock();
+            if let Some(counter) = ready.compute_vm_counter.take() {
+                release_compute_vm_slot(&counter);
+            }
             if let Some(counter) = ready.render_vm_counter.take() {
                 counter.fetch_sub(1, Ordering::AcqRel);
             }
             (
                 ready.compute.take(),
-                ready.compute_ext.take(),
                 ready.compute_scs.take(),
                 ready.render.take(),
                 core::mem::take(&mut ready.render_ext),
@@ -1127,6 +1526,7 @@ impl Cache {
             .iter()
             .filter(|c| matches!(c, Command::Compute(_)))
             .count();
+        let compute_count: u32 = computes.try_into()?;
         let compute = computes != 0;
         let render_count: u32 = commands
             .iter()
@@ -1150,27 +1550,91 @@ impl Cache {
         let render_seeds = scs(|c| matches!(c, Command::Render(_)));
         let compute_scs = compute_seeds.needed != 0;
         let render_scs = render_seeds.needed != 0;
-        let (compute, compute_ext, render_arena, render_ext, pb_heap_ext, pb_ext) = {
+        let (compute_table, compute_scs_set, render_arena, render_ext, pb_heap_ext, pb_ext) = {
             // Never held by publication, completion, recovery, fence signalling or
             // standby waits, so Cache::close() and same-VM compute SUBMITs never block.
             let mut ready = self.ready.lock();
             if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
             }
-            if compute && !compute_scs && ready.compute.is_none() {
-                ready.compute = Some(ComputeUnitSet::new(
-                    &self.factory,
-                    &self.bind,
-                    &vm.vm,
-                    &self.live,
-                    0..BASE_COMPUTE_UNITS,
-                    Placement::Base,
-                )?);
+            if compute && !compute_scs {
+                let max_units = super::params::compute_units();
+                let mut compute_reservation = None;
+                let (active_vms, home_start) = if ready.compute_vm_counter.is_none() {
+                    let (reservation, active_vms, seq) =
+                        ComputeVmReservation::acquire(hints.compute_vm_state);
+                    compute_reservation = Some(reservation);
+                    (active_vms, compute_home_start(seq, max_units))
+                } else {
+                    let active_vms = active_compute_vm_count(hints.compute_vm_state).max(1);
+                    let home_start = ready.compute_home_start.unwrap_or(0);
+                    (active_vms, home_start)
+                };
+                let existing_mask = ready.compute.as_ref().map_or(0, |t| t.mask());
+                let current_usable = usable_compute_units(
+                    home_start,
+                    existing_mask,
+                    hints.quarantined_compute_mask,
+                    hints.pipe0_exclusive_mask,
+                    max_units,
+                );
+                let active_cmds = self.active_compute_cmds.load(Ordering::Acquire);
+                let target = target_compute_units(
+                    active_cmds,
+                    computes,
+                    current_usable,
+                    active_vms,
+                    max_units,
+                );
+                let add_mask = pick_compute_units_for(
+                    home_start,
+                    existing_mask,
+                    hints.quarantined_compute_mask,
+                    hints.pipe0_exclusive_mask,
+                    hints.compute_tail_mask,
+                    target,
+                    max_units,
+                    hints.force_add_compute_non_tail,
+                );
+                if add_mask != 0 {
+                    let min_added = if ready.compute.is_none() {
+                        BASE_COMPUTE_UNITS.min(add_mask.count_ones() as usize)
+                    } else if current_usable == 0
+                        || hints.force_add_compute_non_tail
+                        || (existing_mask
+                            & !hints.quarantined_compute_mask
+                            & !hints.compute_tail_mask)
+                            == 0
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    if let Some(updated) = ComputeUnitTable::with_added(
+                        ready.compute.as_deref(),
+                        &self.factory,
+                        &self.bind,
+                        &vm.vm,
+                        &self.live,
+                        add_mask,
+                        min_added,
+                    )? {
+                        ready.compute = Some(updated);
+                    }
+                }
+                if ready.compute.is_none() {
+                    return Err(EIO);
+                }
+                if let Some(reservation) = compute_reservation.take() {
+                    ready.compute_home_start = Some(home_start);
+                    ready.compute_vm_counter = reservation.commit();
+                }
             }
             if compute_scs {
                 match ready.compute_scs.as_ref().map(|set| set.seeds()) {
                     None => {
                         let hw_slots = pick_scs_compute_slots(
+                            hints.scs_compute_mask,
                             hints.quarantined_compute_mask,
                             super::params::compute_units(),
                         );
@@ -1186,32 +1650,6 @@ impl Cache {
                     // The units cannot grow once the hardware may hold them.
                     Some(seeds) if seeds < compute_seeds.needed => return Err(E2BIG),
                     Some(_) => {}
-                }
-            }
-            if compute && !compute_scs && ready.compute_ext.is_none() {
-                let units = super::params::compute_units();
-                if units > BASE_COMPUTE_UNITS {
-                    // SAFETY: ktime_get has no preconditions.
-                    let now = unsafe { kernel::bindings::ktime_get() } as u64;
-                    let state = &mut *ready;
-                    if should_expand_compute_ext(
-                        &mut state.last_compute_ns,
-                        &mut state.burst,
-                        now,
-                        computes,
-                        hints.expand_compute_ext,
-                    ) {
-                        // Best effort: without them the VM keeps the base compute units.
-                        state.compute_ext = ComputeUnitSet::new(
-                            &self.factory,
-                            &self.bind,
-                            &vm.vm,
-                            &self.live,
-                            BASE_COMPUTE_UNITS..units,
-                            Placement::Base,
-                        )
-                        .ok();
-                    }
                 }
             }
             if render && ready.render.is_none() {
@@ -1375,13 +1813,13 @@ impl Cache {
                 [const { None }; EXT_PB_SLOTS]
             };
             (
-                match (compute, compute_scs) {
-                    (true, true) => ready.compute_scs.clone(),
-                    (true, false) => ready.compute.clone(),
-                    (false, _) => None,
-                },
                 if compute && !compute_scs {
-                    ready.compute_ext.clone()
+                    ready.compute.clone()
+                } else {
+                    None
+                },
+                if compute && compute_scs {
+                    ready.compute_scs.clone()
                 } else {
                     None
                 },
@@ -1475,24 +1913,33 @@ impl Cache {
             }
             return Err(EIO);
         }
-        let cache = if render_count != 0 {
-            self.active_render_passes
-                .fetch_add(render_count, Ordering::AcqRel);
+        let active_compute_count = if !compute_scs { compute_count } else { 0 };
+        let cache = if render_count != 0 || active_compute_count != 0 {
+            if active_compute_count != 0 {
+                self.active_compute_cmds
+                    .fetch_add(active_compute_count, Ordering::AcqRel);
+            }
+            if render_count != 0 {
+                self.active_render_passes
+                    .fetch_add(render_count, Ordering::AcqRel);
+            }
             Some(self.clone())
         } else {
             None
         };
         Ok(Prepared {
-            compute,
-            compute_ext,
-            compute_scs,
+            compute: compute_table,
+            compute_scs: compute_scs_set,
             render: render_arena,
             render_scs,
             render_ext,
             pb_heap_ext,
             pb_ext,
+            active_computes: AtomicU32::new(active_compute_count),
             active_renders: AtomicU32::new(render_count),
             unpublished_renders: AtomicU32::new(render_count),
+            compute_waiter_mask: AtomicU32::new(0),
+            compute_waiters: None,
             cache,
         })
     }
@@ -1500,11 +1947,10 @@ impl Cache {
 
 /// Immutable references carried by an accepted job. No fallible lazy work in the engine.
 pub(crate) struct Prepared {
-    pub(crate) compute: Option<Arc<ComputeUnitSet>>,
-    /// The VM's extension compute units when the job was prepared.
-    pub(crate) compute_ext: Option<Arc<ComputeUnitSet>>,
-    /// The job's computes use the VM's SCS-capable compute arena (`0..SCS_COMPUTE_UNITS`).
-    compute_scs: bool,
+    /// Sparse per-slot non-SCS compute units owned by this VM when the job was prepared.
+    pub(crate) compute: Option<Arc<ComputeUnitTable>>,
+    /// SCS-capable compute unit pair when this job uses compute scratch.
+    pub(crate) compute_scs: Option<Arc<ComputeUnitSet>>,
     pub(crate) render: Option<Arc<RenderArena>>,
     /// The job's renders use the arena's SCS-capable allocators (`render.scs`).
     render_scs: bool,
@@ -1514,24 +1960,61 @@ pub(crate) struct Prepared {
     pub(crate) pb_heap_ext: [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
     /// The VM's lazily allocated recovery PB/UMA allocator slots when the job was prepared.
     pub(crate) pb_ext: [Option<Arc<PoolExtArena>>; EXT_PB_SLOTS],
+    /// Non-SCS compute commands still accounted against `Cache::active_compute_cmds`.
+    active_computes: AtomicU32,
     /// Render commands still accounted against `Cache::active_render_passes`.
     active_renders: AtomicU32,
     /// Render commands of this job whose standby reservation has not yet been committed.
     unpublished_renders: AtomicU32,
-    /// The VM cache holding the standby PB epoch pool.
+    /// Admitted non-SCS compute slot mask held in `Slots::compute_waiters` (0 when none/released).
+    compute_waiter_mask: AtomicU32,
+    /// Device-wide lock-free compute waiter registry for safe release on publish/cancel/drop.
+    compute_waiters: Option<Arc<ComputeWaiters>>,
+    /// The VM cache holding standby PB epochs and live command depth counters.
     cache: Option<Arc<Cache>>,
 }
 
 impl Drop for Prepared {
     fn drop(&mut self) {
+        self.release_compute_waiter();
         let Some(cache) = &self.cache else {
             return;
         };
+        cache.release_compute_cmds(*self.active_computes.get_mut());
         cache.release_render_passes(*self.active_renders.get_mut());
         cache.release_reserved(*self.unpublished_renders.get_mut());
     }
 }
 impl Prepared {
+    /// Attaches the admitted compute-waiter registration acquired under `Shared::state`.
+    pub(crate) fn set_compute_waiter(&mut self, mask: u32, waiters: Arc<ComputeWaiters>) {
+        self.compute_waiters = Some(waiters);
+        self.compute_waiter_mask.store(mask, Ordering::Release);
+    }
+
+    /// Releases this job's admitted compute-waiter reservation once all of its compute commands
+    /// are published, completed, cancelled, or dropped. Idempotent and `SignallingGuard`-safe.
+    pub(crate) fn release_compute_waiter(&self) {
+        let mask = self.compute_waiter_mask.swap(0, Ordering::AcqRel);
+        if mask != 0 {
+            if let Some(waiters) = &self.compute_waiters {
+                waiters.release(mask);
+            }
+        }
+    }
+
+    /// Releases this job's active compute-command accounting once completed or cancelled,
+    /// before signalling userspace so depth-1 submitters see zero active depth.
+    pub(crate) fn release_active_computes(&self) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let remaining = self.active_computes.swap(0, Ordering::AcqRel);
+        if remaining != 0 {
+            cache.release_compute_cmds(remaining);
+        }
+    }
+
     /// Returns canceled render credits even if the job stays retained for its published work.
     /// The device lock serializes suffix discard with publication.
     pub(crate) fn discard_unpublished_renders(&self) {
@@ -1546,49 +2029,34 @@ impl Prepared {
         }
     }
 
-    pub(crate) fn compute(&self) -> Result<&ComputeUnitSet> {
-        self.compute.as_deref().ok_or(EINVAL)
-    }
     /// Compute units this job can use.
     #[allow(dead_code)]
     pub(crate) fn compute_units(&self) -> Result<usize> {
-        Ok(self.compute()?.len() + self.compute_ext.as_deref().map_or(0, ComputeUnitSet::len))
+        if let Some(scs) = &self.compute_scs {
+            Ok(scs.len())
+        } else {
+            Ok(self.compute.as_deref().ok_or(EINVAL)?.len())
+        }
     }
     /// Hardware compute ledger bitmask (bit `k` -> unit `k`) this job can use.
     pub(crate) fn compute_slot_mask(&self) -> Result<u32> {
-        let base = self.compute()?;
-        if let Some(slots) = base.hw_slots {
-            let mut mask = 0u32;
-            for slot in slots {
-                mask |= 1u32 << slot;
-            }
-            return Ok(mask);
-        }
-        let total = self.compute_units()?.min(super::hw::sizes::COMPUTE_UNITS);
-        Ok(if total >= 32 {
-            u32::MAX
+        if let Some(scs) = &self.compute_scs {
+            Ok(scs.slot_mask())
         } else {
-            (1u32 << total) - 1
-        })
+            Ok(self.compute.as_deref().ok_or(EINVAL)?.mask())
+        }
     }
     /// The per-unit arena holding compute unit `k`.
     pub(crate) fn compute_arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
-        let base = self.compute.as_ref()?;
-        if let Some(slots) = base.hw_slots {
-            let local = slots.iter().position(|&slot| slot == k)?;
-            return base.arena(local);
-        }
-        if k < base.len() {
-            base.arena(k)
+        if let Some(scs) = &self.compute_scs {
+            scs.arena_for_hw(k)
         } else {
-            self.compute_ext
-                .as_ref()
-                .and_then(|ext| ext.arena(k - base.len()))
+            self.compute.as_ref()?.arena(k)
         }
     }
     /// Whether this job's computes use SCS-capable compute units.
     pub(crate) fn compute_scs(&self) -> bool {
-        self.compute_scs
+        self.compute_scs.is_some()
     }
     /// Whether this job's renders use SCS-capable render allocators.
     pub(crate) fn render_scs(&self) -> bool {
@@ -1768,20 +2236,12 @@ impl Prepared {
                 .map(|(tier, _)| PassOwnerArena::Ext(tier.clone()))
         }
     }
-    /// Compute unit `k`: the VM's base/SCS units, then its extension units.
+    /// Compute unit `k`: the VM's SCS pair or sparse per-slot compute table.
     pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
-        let base = self.compute()?;
-        if let Some(slots) = base.hw_slots {
-            let local = slots.iter().position(|&slot| slot == k).ok_or(EINVAL)?;
-            return base.unit(local).ok_or(EINVAL);
-        }
-        match base.unit(k) {
-            Some(unit) => Ok(unit),
-            None => self
-                .compute_ext
-                .as_deref()
-                .and_then(|e| e.unit(k - base.len()))
-                .ok_or(EINVAL),
+        if let Some(scs) = &self.compute_scs {
+            scs.unit_for_hw(k).ok_or(EINVAL)
+        } else {
+            self.compute.as_deref().ok_or(EINVAL)?.unit(k).ok_or(EINVAL)
         }
     }
     pub(crate) fn render(&self) -> Result<&RenderArena> {
