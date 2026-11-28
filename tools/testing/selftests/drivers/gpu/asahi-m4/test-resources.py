@@ -235,7 +235,7 @@ pub mod g16 {
                 let released = std::sync::Arc::new(AtomicBool::new(false));
                 let registry = Arc::new(Registry { live: live.clone() }, 0).unwrap();
                 let bind = mmu::VmBind { live, released: released.clone() };
-                let token = Arc::new(LiveToken { registry, bind: Some(bind), file_id: 0 }, 0).unwrap();
+                let token = Arc::new(LiveToken { registry, bind: Some(bind), file_id: 0, process: 0 }, 0).unwrap();
                 (Self { cache: Some(cache), _live: Some(token), ..Self::new() }, released)
             }
             pub fn is_closed(&self)->bool{self.closed.load(Ordering::Acquire)}
@@ -250,14 +250,14 @@ pub mod g16 {
                     || self.vm.cache.as_ref().is_some_and(|cache| cache.renders_unpublished())
             }
         }
-        struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
+        struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64,_process:usize){self.live.fetch_sub(1,Ordering::AcqRel);}}
         __LIVE_TOKEN__
         __LIVE_DROP__
         #[test]fn accounting_outlives_deferred_arenas_and_releases_binding_first(){
             use std::sync::atomic::{AtomicU32,AtomicBool};
             let count=std::sync::Arc::new(AtomicU32::new(1));let released=std::sync::Arc::new(AtomicBool::new(false));
             let registry=Arc::new(Registry{live:count.clone()},0).unwrap();
-            let token=Arc::new(LiveToken{registry,file_id:0,bind:Some(mmu::VmBind{live:count.clone(),released:released.clone()})},0).unwrap();
+            let token=Arc::new(LiveToken{registry,file_id:0,process:0,bind:Some(mmu::VmBind{live:count.clone(),released:released.clone()})},0).unwrap();
             let deferred_arena=token.clone();drop(token);
             assert_eq!(count.load(Ordering::Acquire),1);assert!(!released.load(Ordering::Acquire));
             drop(deferred_arena);assert!(released.load(Ordering::Acquire));assert_eq!(count.load(Ordering::Acquire),0);

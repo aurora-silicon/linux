@@ -913,10 +913,15 @@ impl gpu::Gpu for Gpu {
     }
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {
-        vm::new_vm(self, kernel_range, 0)
+        vm::new_vm(self, kernel_range, 0, None)
     }
-    fn new_vm_for_file(&self, kernel_range: Range<u64>, file_id: u64) -> Result<mmu::Vm> {
-        vm::new_vm(self, kernel_range, file_id)
+    fn new_vm_for_file(
+        &self,
+        kernel_range: Range<u64>,
+        file_id: u64,
+        memory: &Arc<crate::memacct::Client>,
+    ) -> Result<mmu::Vm> {
+        vm::new_vm(self, kernel_range, file_id, Some(memory.clone()))
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
         self.vms.close(vm.id());

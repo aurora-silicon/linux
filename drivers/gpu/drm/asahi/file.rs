@@ -794,7 +794,7 @@ impl File {
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
         let vm = gpu
-            .new_vm_for_file(kernel_range.clone(), file_id)?
+            .new_vm_for_file(kernel_range.clone(), file_id, &file.inner().mem)?
             .with_memory_client(file.inner().mem.clone());
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
