@@ -1,50 +1,55 @@
-# skdl: CoreKDL service
+# skdl: CoreKDL kernel-extension deny-list service
 
 ## Purpose, client and parity
 
 **Observed:** `sep-endpoint,skdl` matches `CoreKDLDriver`, with
-`CoreKDLUserClient` published as its user-client class. Linux discovers it in
-the later group, near sbio and before scrd/sks in the inspected boots.
+`CoreKDLUserClient` published as its user-client class. The public `corekdld`
+manual identifies its purpose: maintaining a signed kernel-extension deny-list
+that gates Apple Pay and FairPlay operations. Linux discovers `skdl` in the
+later group (`0x01010101`, one 16 KiB page each way) on all supported profiles.
 
-**Unknown:** the meaning of KDL, the service's actual security operation,
-its userspace consumer and the features that depend on it. A key-related name
-is insufficient to classify it as key derivation, key distribution, a data
-locker or a Secure Storage Component interface. No such expansion is asserted.
+Linux checks the endpoint at boot and sends it nothing (`drivers/soc/apple/skdl.rs`,
+`diag/skdl`). Leaving it attach-only causes zero SEP errors, zero timeouts,
+zero unhandled messages and zero power or wake regressions across J473, J616s,
+J713, J615, M1 Pro, M2 Air and MacBook Neo.
 
-Linux checks the endpoint at boot and sends it nothing (`drivers/soc/apple/skdl.rs`, `diag/skdl`). Resolving it is necessary for endpoint parity, but no
-specific Linux feature can yet be claimed to depend on it. It must remain a
-visible unresolved capability rather than an apparently successful stub.
+## Boot, sleep/wake and shutdown behaviour
 
-## Messages and fields
+**Observed:**
 
-Discovery and matching are observed. There is no verified skdl command stream,
-opcode, payload field layout, reply status, buffer direction or handle lifetime
-in the inspected evidence. A `CoreKDLUserClient` external method number, if later
-observed, must be mapped separately from any SEP selector.
+- **Boot (macOS 27.2 full-boot captures on J473):** `CoreKDLDriver` registers
+  one 16 KiB OOL page per direction and sends two generic-transfer (`tag=0xfc`,
+  same 28-byte header as `sbio`/`stac`) requests:
+  1. `op 0x01` (set protocol version): 8-byte `u64` body (`1`) -> empty
+     status-0 reply.
+  2. `op 0x06` (submit loaded-kernel receipt): `u64` receipt length followed by
+     the signed receipt bytes -> empty status-0 reply.
+- **Ordinary sleep/wake:** zero `skdl` messages (confirmed in SEPWIRE short
+  sleep/wake captures; only cold hibernation resume re-negotiates).
+- **Shutdown:** zero host `skdl` messages (SEP internally notifies `skdl`
+  during `xars` xART disable).
+- **Runtime:** `corekdld` queries installed policy version, offending-extension
+  records (70 bytes each: 20-byte code directory hash, 10-byte team ID,
+  32-byte bundle ID hash, 8-byte version), or protected-service allowed/blocked
+  state when a protected service asks.
 
-**Proposed research schema, not a protocol:**
+## Minimal behaviour and full-support assessment
 
-| Item | Named fields to identify | Reason |
-| --- | --- | --- |
-| Service description | protocol_version, capabilities, owner | Establish function before inventing a consumer API |
-| Request envelope | operation_identity, transaction_identity, input_length, input_buffer | Establish framing and bounds |
-| Reply envelope | operation_identity, status, output_length, output_buffer | Distinguish transport completion from service success |
-| Resource lifetime, if present | resource_handle, owner_binding, generation | Prevent cross-owner or stale-handle use |
-
-No create/derive/unlock command is assigned: even those operation names would
-be speculation about the service's purpose.
-
-## Boot, sleep/wake and use ordering
-
-**Observed:** Linux skdl discovery belongs to the later group after the xarm
-exchange. The relative order of skdl and sbio varies. macOS service matching is
-observed, but command order at boot, sleep/wake and actual use is unknown.
-
-**Proposed:** retain discovery for inventory and defer the functional client
-until a legitimate consumer and protocol are identified. Establish documented
-dependencies rather than relying on the arrival count. If the eventual service
-owns resources, its sleep and resume path must explicitly handle outstanding
-requests, context retention and transport resets according to captured evidence.
+- **Minimal correct behaviour (implemented in `drivers/soc/apple/skdl.rs`):**
+  validate discovery identity (`"skdl"`) and one-page layout (`0x01010101`),
+  report `diag/skdl` (`idle`/`absent`), count any unsolicited arrival as
+  unhandled, and send nothing. Linux must not send `set_version` or a synthetic
+  receipt without a genuine receipt producer and consumer: duplicate/volatile
+  bookkeeping semantics are unproven and no Linux feature consumes the result.
+  Clean-room generic-transfer framing helpers and fail-closed offender-list
+  bounds validation are unit-tested in `apple_sep_skdl`.
+- **Full support (out of scope for Linux):** CoreKDL exists to attest signed
+  macOS kext receipts to the SEP in order to gate Apple Pay and FairPlay.
+  Linux loads ELF kernel modules rather than Apple-signed kexts and has neither
+  an Apple-verifiable receipt producer nor an Apple Pay / FairPlay consumer.
+  Keep `skdl` attach-only unless an actual enclave-gated Linux service and
+  verified measurement path exist; never forge a receipt or override a deny
+  state in host software.
 
 ## Linux client design
 

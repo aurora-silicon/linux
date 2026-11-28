@@ -1,28 +1,42 @@
-# stac: trusted accessories
+# stac: trusted accessories (Magic Keyboard with Touch ID)
 
-## Purpose, client and parity
+## Purpose, client and current Linux coverage
 
-**Observed:** `sep-endpoint,stac` matches `AppleTrustedAccessoryManager`, whose
-user-client class is `AppleTrustedAccessoryManagerUserClient`. The saved
-registry has `loginwindow` and `bluetoothd` user-client creators. Linux discovers
-stac in the early group.
+`stac` (`0x18`) is the enclave's trusted-accessory service, serving
+`AppleTrustedAccessoryManager` for external biometric accessories such as the
+Magic Keyboard with Touch ID. It shares the generic-transfer carrier
+(`transfer.rs`, `tag=0xfc..0xff`, 28-byte packet header) with `sbio` over two
+16 KiB OOL pages each way (`0x02020202`).
 
-**Inference:** the service participates in trusted-accessory authentication.
-Apple documents [secure pairing for Magic Keyboard with Touch ID](https://support.apple.com/en-ca/guide/security/secf60513daa/web),
-using authenticated cryptographic communication between the keyboard and the
-Mac's Secure Enclave. This supports a candidate feature dependency, not a proven
-stac command mapping. Generic Bluetooth input, all accessory authentication,
-and built-in Touch ID must not be conflated with that candidate.
+**Current Linux coverage (`drivers/soc/apple/stac.rs`):**
 
-Linux has no stac client at the [source pin](README.md). It is needed for full
-endpoint parity and likely for external trusted-biometric accessory parity;
-that feature dependency still needs a transaction trace. An ordinary keyboard
-being usable is not evidence that trusted Touch ID is available.
+- Implements the mandatory power-state handshake: sends `OP_POWER_STATE`
+  (`0x0f`) with `POWER_STATE_ONLINE` (`1`) once after bring-up and again after
+  every enclave wake from firmware sleep, reporting `diag/stac` and
+  `diag/stac_onlines` (verified `online` across J473, J616s, J713, J615,
+  M1 Pro, M2 Air and MacBook Neo).
+
+**Known coverage gaps on `stac`:**
+
+1. **Accessory pairing, session and authorization operations:** none of the
+   accessory-management operations (host attestation, pairing query/begin/
+   finish, unpair, manifest submission, session setup, connection state,
+   paired count, or authorization) are merged on `main` yet (earlier draft
+   PR #1810 was closed because it relied on module parameters; needs a
+   per-device interface and client lifecycle integration).
+2. **USB/Bluetooth HID transport & `sbio` sensor relay:** Linux `usbhid` does
+   not yet bind the keyboard's vendor Touch ID interface or relay external
+   keyboard sensor frames into `sbio`.
+3. **Power-off / hibernation recovery:** ordinary suspend needs no pre-sleep
+   `stac` message; cold-hibernation accessory session recovery will only be
+   needed once both hibernation and the accessory client exist.
 
 ## Messages and fields
 
-No stac opcode, framing, credential schema or request/reply body is established.
-IORegistry user-client names identify consumers, not their SEP method mapping.
+Beyond the implemented `OP_POWER_STATE` (`0x0f`) online handshake in
+`drivers/soc/apple/stac.rs`, the remaining pairing, session and authorization
+wire schemas are not yet merged on `main`. IORegistry user-client names
+identify consumers, not their SEP method mapping.
 
 **Proposed operations, not recovered wire commands:**
 

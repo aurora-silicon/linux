@@ -32,17 +32,25 @@ Each assertion is classified as:
 
 ## Endpoint inventory
 
-| Endpoint | Public ioreg child in the captured SEP subtree | Linux coverage | Feature association | Specification |
-| --- | --- | --- | --- | --- |
-| xars | AppleSEPXARTService | No client | Second xART service; relationship to xarm unknown | [xars](xars.md) |
-| hibe | HibernationService | Checked at boot, nothing sent (`diag/hibe`); no Linux hibernation writer | Secure hibernation: wrapped image key and resume authorisation | [hibe](hibe.md) |
-| hdcp | AppleSEPHDCPManager | No client | Protected display links | [hdcp](hdcp.md) |
-| pnon | No child visible | No client | Nonce service, inferred from name | [pnon](pnon.md) |
-| skdl | CoreKDLDriver / CoreKDLUserClient | Checked at boot, nothing sent (`diag/skdl`); no receipt or protected-service consumer | CoreKDL: signed kernel-extension deny-list gating Apple Pay and FairPlay (public `corekdld` manual) | [skdl](skdl.md) |
-| sse | AppleSSE / AppleSSEUserClient | Checked at boot, nothing sent (`diag/sse`); events counted | Secure Enclave to Secure Element sharing state; nfcd consumer | [sse](sse.md) |
-| stac | AppleTrustedAccessoryManager / AppleTrustedAccessoryManagerUserClient | No client | Trusted accessories; bluetoothd consumer observed | [stac](stac.md) |
-| scrd | No child visible | Partial credential/context codec | Credential policy and biometric authorization | [scrd](scrd.md) |
-| sks | No child visible | Partial key-store codec | Keybags, enclave keys, storage encryption | [sks](sks.md) |
+Every supported Apple silicon SEP advertises the same 12 endpoints
+(`cntl`, `sbio`, `scrd`, `sse`, `hdcp`, `xars`, `sks`, `xarm`, `hibe`,
+`pnon`, `skdl`, `stac`) across M1 Pro (T6000), M2 (T8112), M3 (T8122),
+M4 (T8132), M4 Pro (T6040) and A18 Pro (T8140).
+
+| Ep | Endpoint | Public ioreg child | Linux coverage (`main`) | Coverage gaps / notes | Specification |
+| --- | --- | --- | --- | --- | --- |
+| `0x00` | `cntl` | (SEP manager) | Full (`sep.rs`, `control.rs`, `proto.rs`, `pm.rs`) | Discovery, OOL registration, hwrng, sleep/wake handshake complete | [transport](transport.md) |
+| `0x08` | `sbio` | (biometric) | Active (`sbio.rs`) | Built-in Touch ID enrol/match/catacomb/lockout; external Magic Keyboard Touch ID sensor relay and display-sleep `PROTECTED_CONFIG` refresh remain | — |
+| `0x0a` | `scrd` | No child visible | Active (`scrd.rs`) | 6 selectors implemented (init, tracked create, externalize, delete, verify policy, verify ACL); broader macOS policy set and multi-requirement parser remain | [scrd](scrd.md) |
+| `0x0c` | `sse` | `AppleSSE` / `AppleSSEUserClient` | Attach-only (`sse.rs`, `diag/sse`, `diag/sse_events`) | Sends nothing; unsolicited events counted. Full support out of scope (Apple Pay / Wallet SE pairing only) | [sse](sse.md) |
+| `0x0e` | `hdcp` | `AppleSEPHDCPManager` | No client | Needs SEP client + DCP HDCP relay + DRM Content Protection wiring | [hdcp](hdcp.md) |
+| `0x10` | `xars` | `AppleSEPXARTService` | No client | Host-initiated xART control: shutdown unmount/flush barrier is the main parity item | [xars](xars.md) |
+| `0x12` | `sks` | No child visible | Active (`sks.rs`, `keybag.rs`, `userbag.rs`, `refkey*.rs`) | 24 selectors implemented (keybags, class keys, ref-keys, FDE/VEK); additional macOS session/timer variants remain | [sks](sks.md) |
+| `0x13` | `xarm` | `AppleSEPXARTService` | Active (`xarm.rs`, `xart_store.rs`, `xart_guard.rs`) | Enclave-initiated root/session read/write/delete, OS UUID, xART guard complete | — |
+| `0x14` | `hibe` | `HibernationService` | Attach-only (`hibe.rs`, `diag/hibe`) | Sends nothing; prepare-reply layout typed and wiped on drop. Full support gated on Linux Apple-silicon hibernation (see plan in `hibe.md`) | [hibe](hibe.md) |
+| `0x15` | `pnon` | No child visible | Read-only digest (`pnon.rs`, `diag/pnon`) | Reads blessed LocalPolicy nonce digest (`0x0e`) on 5-7 page layout (`0x05050707`) only; 2-4 page layout (`0x02020404`, M1 Pro 13.5 / A18 Pro 26.6.2) pending in draft PR #2810; additional read queries (remote/recovery digests, boot mode, pairing verification) and mutating LocalPolicy/hibernation transactions not yet implemented | [pnon](pnon.md) |
+| `0x17` | `skdl` | `CoreKDLDriver` / `CoreKDLUserClient` | Attach-only (`skdl.rs`, `diag/skdl`) | Sends nothing; generic-transfer boot framing and offender-list bounds check typed. Full support out of scope (Apple Pay / FairPlay deny-list only) | [skdl](skdl.md) |
+| `0x18` | `stac` | `AppleTrustedAccessoryManager` / `UserClient` | Power-state online (`stac.rs`, `diag/stac`) | Sends online (`0x0f`) at bring-up and after every enclave wake; Magic Keyboard with Touch ID pairing/session/auth ops and HID transport remain (earlier draft PR #1810 closed; needs per-device interface and lifecycle wiring) | [stac](stac.md) |
 
 The IORegistry captures include the AppleSEPManager subtree on T8112, macOS
 build 25G83, and the wider T6000 registry and class queries on build 25C56.

@@ -3181,6 +3181,7 @@ impl SepData {
                 now
             );
             diag::attach(false);
+            this.finalize_failed_bringup_endpoints();
             diag::bringup_ended();
             this.finish_bringup();
             return;
@@ -3203,6 +3204,7 @@ impl SepData {
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
             );
+            this.finalize_failed_bringup_endpoints();
             diag::bringup_ended();
             this.finish_bringup();
             return;
@@ -3250,17 +3252,44 @@ impl SepData {
             this.run_bringup();
             diag::bringup_ended();
         }
+        // Attach-only endpoints: checked and sent nothing (`sse` and `hibe`
+        // send nothing at boot on macOS; `skdl` has no Linux receipt or
+        // Apple Pay/FairPlay consumer). Finalize before publishing completion
+        // so readers observing `PHASE_READY` never see `"pending"`.
+        this.attach_idle_endpoints();
         diag::log_summary(&this.dev);
         this.finish_bringup();
         // As macOS does once the enclave is up.
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
         Self::queue_pnon_digest(this.clone());
-        // As macOS does at boot, these are checked and sent nothing.
-        this.sse_attach();
-        this.hibe_attach();
-        this.skdl_attach();
         Self::arm_settle(this);
+    }
+
+    fn attach_idle_endpoints(&self) {
+        self.sse_attach();
+        self.hibe_attach();
+        self.skdl_attach();
+    }
+
+    /// Finalizes per-endpoint diagnostics when bring-up ends early (no
+    /// endpoints advertised or `xarm` OOL registration failed) so sysfs does
+    /// not stay in `"pending"` for the rest of the boot.
+    fn finalize_failed_bringup_endpoints(&self) {
+        diag::stac(if self.endpoint_present(stac::EP_STAC) {
+            diag::Stac::Failed
+        } else {
+            diag::Stac::Absent
+        });
+        diag::pnon(
+            if self.endpoint_present(pnon::EP_PNON) {
+                diag::Pnon::Failed
+            } else {
+                diag::Pnon::Absent
+            },
+            None,
+        );
+        self.attach_idle_endpoints();
     }
 
     // Publish completion under the same lock that trusted consumers wait on.
@@ -3446,33 +3475,47 @@ impl SepData {
     }
 
     fn on_discovery(&self, msg: Message, f: proto::Fields) {
-        let mut table = self.endpoints.lock();
-        match f.ty {
-            proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
-                let _ = table.slot(f.param);
-                self.stac_discovered(&f);
-                self.hdcp_discovered(&f);
-                self.pnon_discovered(&f);
-                self.sse_discovered(&f);
-                self.hibe_discovered(&f);
-                self.skdl_discovered(&f);
-                diag::endpoints(table.eps.len());
-                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
-                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+        let mut late_ep = None;
+        {
+            let mut table = self.endpoints.lock();
+            match f.ty {
+                proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
+                    let _ = table.slot(f.param);
+                    self.stac_discovered(&f);
+                    self.hdcp_discovered(&f);
+                    self.pnon_discovered(&f);
+                    self.sse_discovered(&f);
+                    self.hibe_discovered(&f);
+                    self.skdl_discovered(&f);
+                    diag::endpoints(table.eps.len());
+                    if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                        diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                    }
+                    if self.phase.load(Relaxed) == PHASE_READY {
+                        late_ep = Some(f.param);
+                    }
+                    // One summary line follows at the end of the bring-up, and
+                    // diag/endpoint_names lists them; keep the per-message trace
+                    // at debug level.
+                    dev_dbg!(
+                        self.dev,
+                        "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
+                        f.param,
+                        f.ty,
+                        msg.msg0,
+                        table.eps.len()
+                    );
                 }
-                // One summary line follows at the end of the bring-up, and
-                // diag/endpoint_names lists them; keep the per-message trace
-                // at debug level.
-                dev_dbg!(
-                    self.dev,
-                    "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
-                    f.param,
-                    f.ty,
-                    msg.msg0,
-                    table.eps.len()
-                );
+                ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
             }
-            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+        }
+        // Refresh attach-only endpoint diagnostics if discovery arrived after
+        // bring-up settled (with `self.endpoints` released).
+        match late_ep {
+            Some(sse::EP_SSE) => self.sse_attach(),
+            Some(hibe::EP_HIBE) => self.hibe_attach(),
+            Some(skdl::EP_SKDL) => self.skdl_attach(),
+            _ => {}
         }
     }
 
