@@ -1566,7 +1566,7 @@ nvkm_vmm_map_locked(struct nvkm_vmm *vmm, struct nvkm_vma *vma,
 		func = map->page->desc->func->sgl;
 	} else {
 		map->dma += map->offset >> PAGE_SHIFT;
-		map->off  = map->offset & PAGE_MASK;
+		map->off  = map->offset & ~PAGE_MASK;
 		func = map->page->desc->func->dma;
 	}
 

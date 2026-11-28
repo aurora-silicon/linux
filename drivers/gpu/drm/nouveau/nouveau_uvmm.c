@@ -507,7 +507,7 @@ select_page_shift(struct nouveau_uvmm *uvmm, struct drm_gpuva_op_map *op)
 	 */
 	drm_WARN_ONCE(op->gem.obj->dev, 1, "Could not find an appropriate page size.\n");
 
-	return PAGE_SHIFT;
+	return vmm->page_nr ? vmm->page[vmm->page_nr - 1].shift : PAGE_SHIFT;
 }
 
 static void

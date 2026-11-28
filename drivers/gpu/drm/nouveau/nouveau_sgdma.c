@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/dma-map-ops.h>
 #include <drm/ttm/ttm_tt.h>
 
 #include "nouveau_drv.h"
@@ -72,7 +73,8 @@ nouveau_sgdma_create_ttm(struct ttm_buffer_object *bo, uint32_t page_flags)
 	struct nouveau_sgdma_be *nvbe;
 	enum ttm_caching caching;
 
-	if (nvbo->force_coherent || drm->agp.bridge)
+	if (nvbo->force_coherent || drm->agp.bridge ||
+	    !dev_is_dma_coherent(drm->dev->dev))
 		caching = ttm_write_combined;
 	else
 		caching = ttm_cached;

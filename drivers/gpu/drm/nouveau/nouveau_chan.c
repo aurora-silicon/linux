@@ -179,6 +179,8 @@ nouveau_channel_prep(struct nouveau_cli *cli,
 	chan->chan.push.mem.object.client = &cli->base;
 	chan->chan.push.mem.object.name = "chanPush";
 	chan->chan.push.mem.object.map.ptr = chan->push.buffer->kmap.virtual;
+	chan->chan.push.is_iomem =
+		!!(chan->push.buffer->kmap.bo_kmap_type & TTM_BO_MAP_IOMEM_MASK);
 	chan->chan.push.wait = nouveau_channel_wait;
 	chan->chan.push.kick = nouveau_channel_kick;
 

@@ -357,7 +357,8 @@ nouveau_bo_init(struct nouveau_bo *nvbo, u64 size, int align, u32 domain,
 	INIT_LIST_HEAD(&nvbo->io_reserve_lru);
 
 	ret = ttm_bo_init_reserved(nvbo->bo.bdev, &nvbo->bo, type,
-				   &nvbo->placement, align >> PAGE_SHIFT, &ctx,
+				   &nvbo->placement,
+				   DIV_ROUND_UP(align, PAGE_SIZE), &ctx,
 				   sg, robj, nouveau_bo_del_ttm);
 	if (ret) {
 		/* ttm will call nouveau_bo_del_ttm if it fails.. */
@@ -1287,10 +1288,13 @@ retry:
 		reg->bus.offset = (reg->start << PAGE_SHIFT) +
 			device->func->resource_addr(device, NVKM_BAR1_FB);
 		reg->bus.is_iomem = true;
+		reg->bus.is_nonposted =
+			nvkm_device_bar_nonposted(device, NVKM_BAR1_FB);
 
 		/* Some BARs do not support being ioremapped WC */
-		if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA &&
-		    mmu->type[drm->ttm.type_vram].type & NVIF_MEM_UNCACHED)
+		if (reg->bus.is_nonposted ||
+		    (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA &&
+		     mmu->type[drm->ttm.type_vram].type & NVIF_MEM_UNCACHED))
 			reg->bus.caching = ttm_uncached;
 		else
 			reg->bus.caching = ttm_write_combined;
@@ -1393,17 +1397,28 @@ vm_fault_t nouveau_ttm_fault_reserve_notify(struct ttm_buffer_object *bo)
 		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_GART, 0);
 
 	} else {
-		/* make sure bo is in mappable vram */
-		if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA ||
-		    bo->resource->start + PFN_UP(bo->resource->size) < mappable)
-			return 0;
+		/*
+		 * Behind a non-posted BAR, userspace VRAM mappings use
+		 * Device-nGnRnE attributes which fault on arm64 memset(0)
+		 * (dc zva). Migrate unpinned BOs to GART when allowed.
+		 */
+		if (nvkm_device_bar_nonposted(device, NVKM_BAR1_FB) &&
+		    !bo->pin_count &&
+		    (nvbo->valid_domains & NOUVEAU_GEM_DOMAIN_GART)) {
+			nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_GART, 0);
+		} else {
+			/* make sure bo is in mappable vram */
+			if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA ||
+			    bo->resource->start + PFN_UP(bo->resource->size) < mappable)
+				return 0;
 
-		for (i = 0; i < nvbo->placement.num_placement; ++i) {
-			nvbo->placements[i].fpfn = 0;
-			nvbo->placements[i].lpfn = mappable;
+			for (i = 0; i < nvbo->placement.num_placement; ++i) {
+				nvbo->placements[i].fpfn = 0;
+				nvbo->placements[i].lpfn = mappable;
+			}
+
+			nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_VRAM, 0);
 		}
-
-		nouveau_bo_placement_set(nvbo, NOUVEAU_GEM_DOMAIN_VRAM, 0);
 	}
 
 	ret = nouveau_bo_validate(nvbo, false, false);

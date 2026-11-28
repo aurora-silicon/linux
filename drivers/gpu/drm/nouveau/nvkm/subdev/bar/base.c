@@ -146,5 +146,7 @@ nvkm_bar_ctor(const struct nvkm_bar_func *func, struct nvkm_device *device,
 {
 	nvkm_subdev_ctor(&nvkm_bar, device, type, inst, &bar->subdev);
 	bar->func = func;
+	if (nvkm_device_bar_nonposted(device, NVKM_BAR1_FB))
+		bar->iomap_uncached = true;
 	spin_lock_init(&bar->lock);
 }
