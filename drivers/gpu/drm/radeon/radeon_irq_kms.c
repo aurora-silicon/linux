@@ -338,6 +338,10 @@ int radeon_irq_kms_init(struct radeon_device *rdev)
 	r = radeon_irq_install(rdev, rdev->pdev->irq);
 	if (r) {
 		rdev->irq.installed = false;
+		if (rdev->msi_enabled) {
+			pci_disable_msi(rdev->pdev);
+			rdev->msi_enabled = 0;
+		}
 		flush_delayed_work(&rdev->hotplug_work);
 		return r;
 	}
@@ -358,8 +362,10 @@ void radeon_irq_kms_fini(struct radeon_device *rdev)
 	if (rdev->irq.installed) {
 		radeon_irq_uninstall(rdev);
 		rdev->irq.installed = false;
-		if (rdev->msi_enabled)
+		if (rdev->msi_enabled) {
 			pci_disable_msi(rdev->pdev);
+			rdev->msi_enabled = 0;
+		}
 		flush_delayed_work(&rdev->hotplug_work);
 	}
 }

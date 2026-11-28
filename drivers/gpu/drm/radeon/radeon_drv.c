@@ -349,7 +349,7 @@ static int radeon_pci_probe(struct pci_dev *pdev,
 
 	ret = drm_dev_register(ddev, flags);
 	if (ret)
-		goto err;
+		goto err_unload;
 
 	if (rdev->mc.real_vram_size <= (8 * 1024 * 1024))
 		format = drm_format_info(DRM_FORMAT_C8);
@@ -362,9 +362,20 @@ static int radeon_pci_probe(struct pci_dev *pdev,
 
 	return 0;
 
+err_unload:
+	radeon_driver_unload_kms(ddev);
 err:
 	pci_disable_device(pdev);
 	return ret;
+}
+
+static void
+radeon_pci_remove(struct pci_dev *pdev)
+{
+	struct drm_device *ddev = pci_get_drvdata(pdev);
+
+	drm_dev_unplug(ddev);
+	pci_disable_device(pdev);
 }
 
 static void
@@ -620,6 +631,7 @@ static struct pci_driver radeon_kms_pci_driver = {
 	.name = DRIVER_NAME,
 	.id_table = pciidlist,
 	.probe = radeon_pci_probe,
+	.remove = radeon_pci_remove,
 	.shutdown = radeon_pci_shutdown,
 	.driver.pm = &radeon_pm_ops,
 };
