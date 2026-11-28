@@ -2430,7 +2430,6 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 		"apple,pcie-rc-gen4-shadow-tunables",
 		"apple,pcie-rc-gen5-shadow-tunables",
 	};
-	static const u32 shadow_sel[] = { 0, BIT(24), 0 };
 	void __iomem *dbi = apple_pcie_t6050_dbi(port);
 	int cap = apple_pcie_t6050_exp_cap(dbi);
 	int speed = of_pci_get_max_link_speed(port->np);
@@ -2445,9 +2444,10 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 		speed = PCI_EXP_LNKCTL2_TLS_8_0GT;
 	apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_MISC_CONTROL_1, 0, RC_T6050_DBI_RO_WR_EN);
 	ret = apple_pcie_t6050_tune(port, dbi, "apple,pcie-rc-tunables");
+	/* RATE_SHADOW_SEL picks the bank of each rate: 0 = 8, 1 = 16, 2 = 32 GT/s */
 	for (i = 0; !ret && i < ARRAY_SIZE(shadow); i++) {
 		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_GEN3_RELATED, RC_T6050_RATE_SHADOW_SEL,
-					 shadow_sel[i]);
+					 FIELD_PREP(RC_T6050_RATE_SHADOW_SEL, i));
 		ret = apple_pcie_t6050_tune(port, dbi, shadow[i]);
 	}
 	if (!ret) {
