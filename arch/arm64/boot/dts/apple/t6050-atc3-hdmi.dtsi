@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The HDMI port of the T6050 MacBook Pros: ATC3 as a fixed four-lane DisplayPort PHY into the
+ * on-board DP-to-HDMI converter, driven by dcpext0 as a hybrid pipeline (the fixed output first,
+ * then the Type-C routes the boot loader writes from the ADT, as on the M1 Pro/Max laptops).
+ *
+ * From the ADT, the same on the J714sAP, K114sAP and K116sAP (phandles and per-machine PHY
+ * tunables aside): /arm-io/atc3-dpphy is the direct DP output of /port-hdmi0 (port-type 6,
+ * transport-tunneled 0) on crossbar output 0 of atc3-dpxbar, DPTX target 3 (dp-switch-dfp-
+ * endpoint); atc-phy3 has no usb-drd3 and no acio3; dcpext0 is crossbar source 0 (ufp endpoint
+ * 0, port 0). dp2hdmi-gpio0 gives the converter's hotplug, function-hdmi_hpd GPIO(0xe) on the
+ * AOP GPIO controller, and its two power enables, function-dp2hdmi_pwr_en and
+ * function-hdmi_pwr_en, both SMC pcIO outputs. Its force-dpfu line is left undescribed, as on the
+ * T6040 laptops.
+ *
+ * A board including this defines T6050_HDMI_PWREN_LINE and T6050_DP2HDMI_PWREN_LINE, the
+ * smc_pcio lines of its output-commands for hdmi_pwr_en and dp2hdmi_pwr_en, and exposes AOP GPIO
+ * 14. The PHY and the crossbar stay disabled: the boot loader enables them with dcpext0 when it
+ * hands the engine off, and fills the PHY's tunables from atc-phy3 (apple,port-index).
+ */
+
+#ifndef T6050_HDMI_PWREN_LINE
+#error "define T6050_HDMI_PWREN_LINE (the smc_pcio line of hdmi_pwr_en)"
+#endif
+#ifndef T6050_DP2HDMI_PWREN_LINE
+#error "define T6050_DP2HDMI_PWREN_LINE (the smc_pcio line of dp2hdmi_pwr_en)"
+#endif
+
+/* /arm-io/atc-phy3 regs [2] [39] [40] [41] [42] [43]: the core banks up to 0x29000 + 0x4000 */
+&atc3_phy {
+	compatible = "apple,t6050-dp-phy";
+	reg = <0x3 0x8b000000 0x0 0x2d000>,
+	      <0x3 0x8b200000 0x0 0x4000>,
+	      <0x3 0x8b244000 0x0 0x4000>,
+	      <0x3 0x88000000 0x0 0x8000>,
+	      <0x3 0x88020000 0x0 0x4000>,
+	      <0x3 0x8b250000 0x0 0x4000>;
+	reg-names = "core", "reset", "fabric", "axi2af", "lioa", "common-cfg";
+	#phy-cells = <0>;
+	/delete-property/ apple,guest-port-reserved;
+	/delete-property/ mode-switch;
+	/delete-property/ orientation-switch;
+	/delete-property/ mboxes;
+	power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_common>, <&ps_atc3_phymxwrap>;
+	power-domain-names = "usb-aon", "common", "wrapper";
+	status = "disabled";
+};
+
+/* ATC3 has no USB controller on these boards */
+&usb_drd3 {
+	/delete-property/ phys;
+	/delete-property/ phy-names;
+	/delete-property/ resets;
+	status = "disabled";
+};
+
+&atc3_dpxbar {
+	status = "disabled";
+};
+
+&dcpext0 {
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 14 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_pcio T6050_HDMI_PWREN_LINE GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_pcio T6050_DP2HDMI_PWREN_LINE GPIO_ACTIVE_HIGH>;
+	phys = <&atc3_phy>;
+	phy-names = "dp-phy";
+	mux-controls = <&atc3_dpxbar 0>;
+	mux-control-names = "dp-xbar";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+};
