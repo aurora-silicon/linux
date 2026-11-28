@@ -22,12 +22,24 @@
 //!    out of line: "hrPB" (reply header), result 0, 24 zero bytes, 48-byte digest
 //! ```
 //!
-//! The mailbox word carries no operation: `data` is the request length, and
-//! in the reply `type` is the status and `data` the reply length. Nothing
-//! here is reachable from userspace except the digest itself, read-only for
-//! root in `diag/local_policy_digest`. No operation that changes policy or
-//! nonce state is sent, and a message the driver did not ask for is counted
-//! as unhandled.
+//! The mailbox word carries no operation. Two mailbox formats exist, and
+//! the endpoint's discovery layout says which one the enclave expects:
+//!
+//! * five to seven pages (M4 Pro): call tag 2, `data` is the request
+//!   length; in the reply `type` is the status and `data` the reply length;
+//! * two to four pages (M1 Pro, M2, A18 Pro): call tag 1, the request
+//!   length in bits 16-31 and `data` zero; in the reply bits 16-31 are the
+//!   reply length and `data` the service result.
+//!
+//! The out-of-line request and reply are the same in both. On an A18 Pro
+//! the tag 2 word is answered with tag 2 and `data` 1 (a refusal with no
+//! reply bytes), so the format is chosen from the layout and never retried
+//! in the other one.
+//!
+//! Nothing here is reachable from userspace except the digest itself,
+//! read-only for root in `diag/local_policy_digest`. No operation that
+//! changes policy or nonce state is sent, and a message the driver did not
+//! ask for is counted as unhandled.
 
 use super::*;
 use crate::proto::*;
@@ -67,10 +79,7 @@ impl Layout {
 }
 
 /// The layout the endpoint advertises on M4 Pro: five to seven pages each
-/// way. The driver talks to the endpoint only when it advertises this one.
-/// M1 Pro, M2 and A18 Pro advertise two to four pages; the A18 Pro answers
-/// the recorded request there with a one-byte reply and writes nothing, so
-/// those SEPs speak another version of the service and are left alone.
+/// way.
 pub(crate) const LAYOUT_7: Layout = Layout {
     send_min: 5,
     receive_min: 5,
@@ -78,26 +87,61 @@ pub(crate) const LAYOUT_7: Layout = Layout {
     receive_max: 7,
 };
 
-/// The buffer sizes registered for the known layout: the largest send
-/// buffer and the smallest receive buffer it allows, which is what macOS
-/// registers on the M4 Pro (seven pages out, five back).
-pub(crate) fn ool_sizes(word: u32) -> Option<(usize, usize)> {
-    let layout = Layout::from_word(word);
-    if layout != LAYOUT_7 {
-        return None;
-    }
-    Some((
-        usize::from(layout.send_max) * SEP_PAGE,
-        usize::from(layout.receive_min) * SEP_PAGE,
-    ))
+/// The layout the endpoint advertises on M1 Pro, M2 and A18 Pro: two to
+/// four pages each way.
+pub(crate) const LAYOUT_4: Layout = Layout {
+    send_min: 2,
+    receive_min: 2,
+    send_max: 4,
+    receive_max: 4,
+};
+
+/// The mailbox format of a call and its reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Carrier {
+    /// Tag 2; lengths in `data`, the status in `type` (M4 Pro).
+    Tag2,
+    /// Tag 1; lengths in bits 16-31, the service result in `data` (M1 Pro,
+    /// M2, A18 Pro).
+    Tag1,
 }
 
-/// What the driver allocates each way: the largest size [`ool_sizes`]
-/// can return.
-pub(crate) const OOL_SIZE_PNON: usize = 7 * SEP_PAGE;
+impl Carrier {
+    const fn tag(self) -> u8 {
+        match self {
+            Carrier::Tag2 => 2,
+            Carrier::Tag1 => 1,
+        }
+    }
+}
 
-/// The call tag the host uses; the reply carries it back.
-pub(crate) const CALL_TAG: u8 = 0x02;
+/// The mailbox format and buffer sizes (send, receive) for a discovery
+/// layout word, if it is one of the two the driver knows. The sizes are
+/// what macOS registers: seven pages out and five back on the five-to-seven
+/// layout, the largest size each way (four pages) on the two-to-four one.
+/// Any other layout is left alone.
+pub(crate) fn offer(word: u32) -> Option<(Carrier, usize, usize)> {
+    let layout = Layout::from_word(word);
+    if layout == LAYOUT_7 {
+        Some((
+            Carrier::Tag2,
+            usize::from(layout.send_max) * SEP_PAGE,
+            usize::from(layout.receive_min) * SEP_PAGE,
+        ))
+    } else if layout == LAYOUT_4 {
+        Some((
+            Carrier::Tag1,
+            usize::from(layout.send_max) * SEP_PAGE,
+            usize::from(layout.receive_max) * SEP_PAGE,
+        ))
+    } else {
+        None
+    }
+}
+
+/// What the driver allocates each way: the largest size [`offer`] can
+/// return.
+pub(crate) const OOL_SIZE_PNON: usize = 7 * SEP_PAGE;
 
 /// Request and reply header signatures, as they travel: the ASCII bytes
 /// "hcPB" and "hrPB" read as little-endian words.
@@ -119,17 +163,20 @@ static_assert!(HEADER_LEN <= 2 * SEP_PAGE && DIGEST_REPLY_LEN <= 2 * SEP_PAGE);
 pub(crate) const PNON_TIMEOUT_MS: u32 = 2000;
 
 /// The request word for `len` out-of-line bytes.
-pub(crate) const fn request_message(len: u32) -> Message {
+pub(crate) const fn request_message(carrier: Carrier, len: u16) -> Message {
+    let len_bits = match carrier {
+        Carrier::Tag2 => (len as u64) << MSG_DATA_SHIFT,
+        Carrier::Tag1 => (len as u64) << MSG_TYPE_SHIFT,
+    };
     Message {
-        msg0: (EP_PNON as u64)
-            | ((CALL_TAG as u64) << MSG_TAG_SHIFT)
-            | ((len as u64) << MSG_DATA_SHIFT),
+        msg0: (EP_PNON as u64) | ((carrier.tag() as u64) << MSG_TAG_SHIFT) | len_bits,
         msg1: 0,
     }
 }
 
 // The request word in the recording.
-static_assert!(request_message(HEADER_LEN as u32).msg0 == 0x0000_0020_0000_0215);
+static_assert!(request_message(Carrier::Tag2, HEADER_LEN as u16).msg0 == 0x0000_0020_0000_0215);
+static_assert!(request_message(Carrier::Tag1, HEADER_LEN as u16).msg0 == 0x0000_0000_0020_0115);
 
 /// The out-of-line bytes of a digest read: the header alone.
 pub(crate) fn digest_request() -> [u8; HEADER_LEN] {
@@ -143,19 +190,28 @@ pub(crate) fn digest_request() -> [u8; HEADER_LEN] {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arrival {
     /// The answer to a call: its status and how many bytes it wrote.
-    Reply { status: u8, len: u32 },
+    Reply { status: u32, len: u32 },
     /// Anything else.
     Other,
 }
 
-pub(crate) fn classify(msg: &Message) -> Arrival {
+/// Reads a word that arrived on the endpoint as the answer to a call made
+/// in `carrier`.
+pub(crate) fn classify(carrier: Carrier, msg: &Message) -> Arrival {
     let f = decode(msg);
-    if f.ep != EP_PNON || f.tag != CALL_TAG || f.param != 0 {
+    if f.ep != EP_PNON || f.tag != carrier.tag() {
         return Arrival::Other;
     }
-    Arrival::Reply {
-        status: f.ty,
-        len: f.data_lo,
+    match carrier {
+        Carrier::Tag2 if f.param == 0 => Arrival::Reply {
+            status: u32::from(f.ty),
+            len: f.data_lo,
+        },
+        Carrier::Tag2 => Arrival::Other,
+        Carrier::Tag1 => Arrival::Reply {
+            status: f.data_lo,
+            len: ((msg.msg0 >> MSG_TYPE_SHIFT) & 0xffff) as u32,
+        },
     }
 }
 
@@ -174,9 +230,9 @@ pub(crate) enum Outcome {
 
 /// Checks a digest reply: `status` and `len` from the mailbox word, `bytes`
 /// the first [`DIGEST_REPLY_LEN`] bytes of the receive buffer.
-pub(crate) fn check_reply(status: u8, len: u32, bytes: &[u8]) -> Outcome {
+pub(crate) fn check_reply(status: u32, len: u32, bytes: &[u8]) -> Outcome {
     if status != 0 {
-        return Outcome::Refused(u32::from(status));
+        return Outcome::Refused(status);
     }
     let len = len as usize;
     if len < HEADER_LEN || bytes.len() < HEADER_LEN || bytes.len() < len.min(DIGEST_REPLY_LEN) {
@@ -204,6 +260,7 @@ pub(crate) fn check_reply(status: u8, len: u32, bytes: &[u8]) -> Outcome {
 pub(crate) struct Exchange {
     waiting: bool,
     generation: u64,
+    carrier: Carrier,
     outcome: Option<Outcome>,
 }
 
@@ -212,22 +269,25 @@ impl Exchange {
         Exchange {
             waiting: false,
             generation: 0,
+            carrier: Carrier::Tag2,
             outcome: None,
         }
     }
 
-    /// Starts an exchange; returns its number.
-    pub(crate) fn begin(&mut self) -> u64 {
+    /// Starts an exchange sent in `carrier`; returns its number.
+    pub(crate) fn begin(&mut self, carrier: Carrier) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.waiting = true;
+        self.carrier = carrier;
         self.outcome = None;
         self.generation
     }
 
-    /// The exchange a message arriving now can answer, if one is waiting.
-    pub(crate) fn current(&self) -> Option<u64> {
+    /// The exchange a message arriving now can answer, if one is waiting,
+    /// and the mailbox format its answer comes in.
+    pub(crate) fn current(&self) -> Option<(u64, Carrier)> {
         if self.waiting {
-            Some(self.generation)
+            Some((self.generation, self.carrier))
         } else {
             None
         }
@@ -258,13 +318,13 @@ impl Exchange {
 }
 
 impl SepData {
-    /// The buffer sizes for the endpoint, if the enclave offers it as the
-    /// driver knows it.
-    fn pnon_offered(&self) -> Option<(usize, usize)> {
+    /// The mailbox format and buffer sizes for the endpoint, if the enclave
+    /// offers it as the driver knows it.
+    fn pnon_offered(&self) -> Option<(Carrier, usize, usize)> {
         if !self.endpoint_present(EP_PNON) || !self.pnon_named.load(Relaxed) {
             return None;
         }
-        ool_sizes(self.pnon_layout.load(Relaxed))
+        offer(self.pnon_layout.load(Relaxed))
     }
 
     /// Records the discovery messages of the endpoint.
@@ -297,7 +357,7 @@ impl SepData {
         if self.pnon_done.load(Relaxed) {
             return;
         }
-        let Some(sizes) = self.pnon_offered() else {
+        let Some((carrier, send, receive)) = self.pnon_offered() else {
             if self.endpoint_present(EP_PNON) {
                 dev_dbg!(
                     self.dev,
@@ -310,7 +370,7 @@ impl SepData {
             return;
         };
         let registered = self
-            .size_ool(&self.ool_pnon, sizes)
+            .size_ool(&self.ool_pnon, (send, receive))
             .and_then(|()| self.register_ool(&self.ool_pnon));
         if let Err(e) = registered {
             dev_err_ratelimited!(
@@ -323,10 +383,14 @@ impl SepData {
             return;
         }
         self.pnon_done.store(true, Relaxed);
-        match self.pnon_read_digest() {
+        match self.pnon_read_digest(carrier) {
             Ok(Outcome::Digest(digest)) => {
                 diag::pnon(diag::Pnon::Read, Some(&digest));
-                dev_dbg!(self.dev, "pnon: read the LocalPolicy nonce digest\n");
+                dev_dbg!(
+                    self.dev,
+                    "pnon: read the LocalPolicy nonce digest ({:?})\n",
+                    carrier
+                );
             }
             Ok(outcome) => {
                 diag::pnon(diag::Pnon::Failed, None);
@@ -343,13 +407,13 @@ impl SepData {
         }
     }
 
-    fn pnon_read_digest(&self) -> Result<Outcome> {
-        self.pnon_rx.lock().begin();
+    fn pnon_read_digest(&self, carrier: Carrier) -> Result<Outcome> {
+        self.pnon_rx.lock().begin(carrier);
         // The last answer must not be taken for this one's.
         self.ool_repoison(&self.ool_pnon, 0, DIGEST_REPLY_LEN);
         let sent = self
             .ool_write(&self.ool_pnon, 0, &digest_request())
-            .and_then(|()| self.send(request_message(HEADER_LEN as u32)));
+            .and_then(|()| self.send(request_message(carrier, HEADER_LEN as u16)));
         if let Err(e) = sent {
             self.pnon_rx.lock().end();
             return Err(e);
@@ -379,13 +443,13 @@ impl SepData {
     }
 
     pub(crate) fn on_pnon(&self, msg: Message) {
-        let Arrival::Reply { status, len } = classify(&msg) else {
+        // Sampled before the buffer is read: an exchange that times out
+        // meanwhile and is followed by another must not take this answer.
+        let Some((generation, carrier)) = self.pnon_rx.lock().current() else {
             self.pnon_unexpected(&msg);
             return;
         };
-        // Sampled before the buffer is read: an exchange that times out
-        // meanwhile and is followed by another must not take this answer.
-        let Some(generation) = self.pnon_rx.lock().current() else {
+        let Arrival::Reply { status, len } = classify(carrier, &msg) else {
             self.pnon_unexpected(&msg);
             return;
         };
@@ -473,6 +537,17 @@ mod tests {
     const DISCOVER_LAYOUT_7: u64 = 0x0505_0707_1501_00fd;
     // sks, whose sizes the driver registers already.
     const SKS_LAYOUT: u32 = 0x0201_0201;
+    // The A18 Pro's answer to the tag 2 request (Linux, 11-13): tag 2,
+    // `data` 1, no reply bytes written.
+    const NEO_TAG2_ANSWER: u64 = 0x0000_0001_0000_0215;
+    // The tag 1 request, its success reply and a refusal with result 1.
+    const TAG1_TX: u64 = 0x0000_0000_0020_0115;
+    const TAG1_RX: u64 = 0x0000_0000_0050_0115;
+    const TAG1_REFUSED: u64 = 0x0000_0001_0000_0115;
+
+    fn word(msg0: u64) -> Message {
+        Message { msg0, msg1: 0 }
+    }
 
     fn reply(digest_byte: u8) -> [u8; DIGEST_REPLY_LEN] {
         let mut r = [0u8; DIGEST_REPLY_LEN];
@@ -483,18 +558,68 @@ mod tests {
 
     #[test]
     fn the_request_matches_the_recording() {
-        let msg = request_message(HEADER_LEN as u32);
+        let msg = request_message(Carrier::Tag2, HEADER_LEN as u16);
         assert_eq!(msg.msg0, TRACE_TX);
         assert_eq!(msg.msg1, 0);
         assert_eq!(digest_request(), TRACE_REQUEST);
     }
 
     #[test]
+    fn the_tag1_request_carries_the_length_in_bits_16_to_31() {
+        let msg = request_message(Carrier::Tag1, HEADER_LEN as u16);
+        assert_eq!(msg.msg0, TAG1_TX);
+        assert_eq!(msg.msg1, 0);
+        let f = decode(&msg);
+        assert_eq!((f.ep, f.tag, f.data_lo), (EP_PNON, 1, 0));
+    }
+
+    #[test]
+    fn tag1_replies_carry_the_result_in_data() {
+        assert_eq!(
+            classify(Carrier::Tag1, &word(TAG1_RX)),
+            Arrival::Reply {
+                status: 0,
+                len: DIGEST_REPLY_LEN as u32
+            }
+        );
+        assert_eq!(
+            classify(Carrier::Tag1, &word(TAG1_REFUSED)),
+            Arrival::Reply { status: 1, len: 0 }
+        );
+        assert_eq!(check_reply(1, 0, &[]), Outcome::Refused(1));
+        assert_eq!(
+            check_reply(0, DIGEST_REPLY_LEN as u32, &reply(0xcd)),
+            Outcome::Digest([0xcd; DIGEST_LEN])
+        );
+        // A tag 2 word is not the answer to a tag 1 call, and the other way.
+        assert_eq!(classify(Carrier::Tag1, &word(TRACE_RX)), Arrival::Other);
+        assert_eq!(classify(Carrier::Tag2, &word(TAG1_RX)), Arrival::Other);
+    }
+
+    #[test]
+    fn the_a18_answer_to_tag2_is_one_without_bytes() {
+        // Read in the format it was sent in, it looks like a one-byte reply
+        // (too short to be a header); the tag 1 call never sees it.
+        assert_eq!(
+            classify(Carrier::Tag2, &word(NEO_TAG2_ANSWER)),
+            Arrival::Reply { status: 0, len: 1 }
+        );
+        assert_eq!(check_reply(0, 1, &[]), Outcome::Malformed);
+        assert_eq!(
+            classify(Carrier::Tag1, &word(NEO_TAG2_ANSWER)),
+            Arrival::Other
+        );
+    }
+
+    #[test]
     fn the_recorded_answer_is_a_digest() {
-        let arrival = classify(&Message {
-            msg0: TRACE_RX,
-            msg1: 0,
-        });
+        let arrival = classify(
+            Carrier::Tag2,
+            &Message {
+                msg0: TRACE_RX,
+                msg1: 0,
+            },
+        );
         assert_eq!(
             arrival,
             Arrival::Reply {
@@ -558,7 +683,7 @@ mod tests {
             0x0000_0050_0000_0115,
             0x0000_0050_0100_0215,
         ] {
-            assert_eq!(classify(&Message { msg0: w, msg1: 0 }), Arrival::Other);
+            assert_eq!(classify(Carrier::Tag2, &word(w)), Arrival::Other);
         }
     }
 
@@ -578,15 +703,16 @@ mod tests {
         });
         assert_eq!(f.param, EP_PNON);
         assert_eq!(f.ty, DISCOVER_TYPE_CONFIG);
-        assert_eq!(ool_sizes(f.data_lo), Some((0x1c000, 0x14000)));
+        assert_eq!(offer(f.data_lo), Some((Carrier::Tag2, 0x1c000, 0x14000)));
         assert_eq!(OOL_SIZE_PNON, 0x1c000);
-        // The two-to-four-page layout of M1 Pro, M2 and A18 Pro is left alone.
+        // The two-to-four-page layout of M1 Pro, M2 and A18 Pro: tag 1, four
+        // pages each way.
         let f = decode(&Message {
             msg0: DISCOVER_LAYOUT_4,
             msg1: 0,
         });
         assert_eq!(f.param, EP_PNON);
-        assert_eq!(ool_sizes(f.data_lo), None);
+        assert_eq!(offer(f.data_lo), Some((Carrier::Tag1, 0x10000, 0x10000)));
     }
 
     #[test]
@@ -595,16 +721,18 @@ mod tests {
         assert_eq!(usize::from(l.send_max) * SEP_PAGE, 0x8000);
         assert_eq!(usize::from(l.receive_min) * SEP_PAGE, 0x4000);
         // An unknown layout is left alone.
-        assert_eq!(ool_sizes(SKS_LAYOUT), None);
-        assert_eq!(ool_sizes(0x0202_0202), None);
+        assert_eq!(offer(SKS_LAYOUT), None);
+        assert_eq!(offer(0x0202_0202), None);
+        assert_eq!(offer(0x0505_0707 + 1), None);
     }
 
     #[test]
     fn a_late_answer_does_not_complete_a_later_exchange() {
         let mut x = Exchange::new();
-        let first = x.begin();
+        let first = x.begin(Carrier::Tag1);
         x.end();
-        let second = x.begin();
+        let second = x.begin(Carrier::Tag2);
+        assert_eq!(x.current(), Some((second, Carrier::Tag2)));
         assert!(!x.answer(first, Outcome::Digest([1; DIGEST_LEN])));
         assert!(x.answer(second, Outcome::NoReply));
         assert!(!x.answer(second, Outcome::Malformed));
