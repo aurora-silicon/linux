@@ -852,7 +852,7 @@ static int dcp_desktop_shmem_setup(struct apple_dcp *dcp,
 	return 0;
 }
 
-static void disconnected_hpd_event(struct apple_connector *connector);
+VISIBLE_IF_KUNIT void disconnected_hpd_event(struct apple_connector *con);
 
 bool dcp_is_external_h17p(struct apple_dcp *dcp)
 {
@@ -4181,7 +4181,7 @@ out:
 	spin_unlock_irqrestore(&dcp->relink_lock, flags);
 }
 
-static void disconnected_hpd_event(struct apple_connector *con)
+VISIBLE_IF_KUNIT void disconnected_hpd_event(struct apple_connector *con)
 {
 	struct platform_device *pdev;
 
@@ -4192,6 +4192,14 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	if (pdev) {
 		struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+		/*
+		 * Userspace can disable the CRTC from the hotplug notification
+		 * below before the firmware finishes tearing down the link and
+		 * reports cb_hotplug(0). Invalidate the mode now so the CRTC
+		 * power-off leaves the unplugged pipe to the firmware instead
+		 * of submitting a clear swap that gets swallowed.
+		 */
+		dcp_mode_invalidate(&dcp->mode_state);
 		WRITE_ONCE(dcp->ext_backlight, false);
 		/* Nothing else reports an HDMI unplug to the firmware metadata. */
 		if (dcp_sink_metadata(dcp))

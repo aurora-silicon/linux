@@ -1444,6 +1444,7 @@ void dcp_platform_shutdown(struct platform_device *pdev);
 void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable);
 void dcp_enable_typec_work(struct apple_dcp *dcp);
 void dcp_swap_watchdog(struct work_struct *work);
+void disconnected_hpd_event(struct apple_connector *con);
 void iomfb_scanout_put_h17p(struct apple_dcp *dcp, struct iomfb_scanout_h17p *scanout);
 #endif
 

@@ -273,11 +273,45 @@ static void hotplug_coalesced_ready(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fixture->notifications, 2U);
 }
 
+static void hotplug_disconnected_hpd_invalidates_mode(struct kunit *test)
+{
+	struct hotplug_fixture *fixture = test->priv;
+
+	fixture->connector.base.status = connector_status_connected;
+	fixture->connector.connected = true;
+	fixture->dcp.mode_state.valid = true;
+	/* Hold hotplug_wq so we inspect state before userspace is notified. */
+	disable_work_sync(&fixture->connector.hotplug_wq);
+	disconnected_hpd_event(&fixture->connector);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(fixture->connector.connected));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(fixture->dcp.mode_state.valid));
+	enable_work(&fixture->connector.hotplug_wq);
+	schedule_work(&fixture->connector.hotplug_wq);
+	flush_work(&fixture->connector.hotplug_wq);
+	hotplug_expect_notification(test, connector_status_disconnected);
+}
+
+static void hotplug_disconnected_hpd_invalidates_inflight_modeset(struct kunit *test)
+{
+	struct hotplug_fixture *fixture = test->priv;
+
+	fixture->connector.base.status = connector_status_connected;
+	fixture->connector.connected = true;
+	dcp_mode_begin(&fixture->dcp.mode_state);
+	disconnected_hpd_event(&fixture->connector);
+	dcp_mode_finish(&fixture->dcp.mode_state, true, &fixture->connector.connected);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(fixture->dcp.mode_state.valid));
+	flush_work(&fixture->connector.hotplug_wq);
+	hotplug_expect_notification(test, connector_status_disconnected);
+}
+
 static struct kunit_case hotplug_test_cases[] = {
 	KUNIT_CASE(hotplug_route_failure_notify),
 	KUNIT_CASE(hotplug_coalesced_ready),
 	KUNIT_CASE(hotplug_connected),
 	KUNIT_CASE(hotplug_disconnected),
+	KUNIT_CASE(hotplug_disconnected_hpd_invalidates_mode),
+	KUNIT_CASE(hotplug_disconnected_hpd_invalidates_inflight_modeset),
 	KUNIT_CASE(hotplug_retrain),
 	KUNIT_CASE(hotplug_unrouted),
 	KUNIT_CASE(hotplug_forced_on),
