@@ -287,6 +287,18 @@ fn plan_render_barriers(
     }
 }
 
+/// Whether the FS ring's own order already holds FS(N) behind FS(N-1), so that the FS->FS
+/// `fs_dep` barrier of [`plan_render_barriers`] would only re-check a stamp the ring implies.
+///
+/// Every render's FS work goes on the one firmware FS queue, whose works the firmware runs in
+/// ring order: on Metal's FS ring, which carries only each pass's own TA barrier ahead of its
+/// FS work, consecutive passes serialize in ring order without self-event FS->FS barriers. A
+/// predecessor of another VM (`cross_vm_prev`) and any InitBM producer or consumer
+/// (`producer_initbm || init_buffer`) keep the barrier.
+fn fs_ring_orders_prev(cross_vm_prev: bool, producer_initbm: bool, init_buffer: bool) -> bool {
+    !cross_vm_prev && !producer_initbm && !init_buffer
+}
+
 /// Engine of the previous member.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Prev {
@@ -438,6 +450,9 @@ struct Prefix {
     last_ct: u32,
     last_ta: u32,
     last_fs: u32,
+    /// Staged FS->FS barrier counts committed only after TA producer publication.
+    fs_dep: u64,
+    fs_order: u64,
 }
 
 /// Error provenance must remain independent of errno: EIO can be an ordinary failed VM
@@ -523,6 +538,9 @@ pub(crate) struct Stats {
     pub(crate) job_cmds: u64,
     pub(crate) job_max: u64,
     pub(crate) early: u64,
+    /// FS->FS barriers posted, and those the FS ring's order made unnecessary.
+    pub(crate) fs_dep: u64,
+    pub(crate) fs_order: u64,
     /// Type-0 FS->compute / compute->TA waits.
     pub(crate) fs2c0: u64,
     pub(crate) c2ta0: u64,
@@ -3516,6 +3534,9 @@ impl Firmware {
                     prefix.ta_head,
                     &mut self.engine.stats.publications[1],
                 )?;
+                self.engine.stats.fs_dep = self.engine.stats.fs_dep.saturating_add(prefix.fs_dep);
+                self.engine.stats.fs_order =
+                    self.engine.stats.fs_order.saturating_add(prefix.fs_order);
                 self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
             } else {
                 publish_producer(
@@ -4149,18 +4170,24 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, p.ta_fs_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
+        let fs_ordered = fs_ring_orders_prev(cross_vm_prev, producer_initbm, init_buffer);
         if let Some(wait_fs) = plan.fs_render_wait {
-            let dep = encode::barrier(
-                r.fw_stamp[1].va,
-                wait_fs,
-                0x71,
-                target,
-                work::barrier::RENDER_WAIT_UUID,
-                render_bar,
-            );
-            p.fs_dep.write(0, &dep)?;
-            r.ring[1].w64(8 * pf.fs_head as usize, p.fs_dep.va)?;
-            pf.fs_head = (pf.fs_head + 1) % cap;
+            if fs_ordered {
+                pf.fs_order += 1;
+            } else {
+                let dep = encode::barrier(
+                    r.fw_stamp[1].va,
+                    wait_fs,
+                    0x71,
+                    target,
+                    work::barrier::RENDER_WAIT_UUID,
+                    render_bar,
+                );
+                p.fs_dep.write(0, &dep)?;
+                r.ring[1].w64(8 * pf.fs_head as usize, p.fs_dep.va)?;
+                pf.fs_head = (pf.fs_head + 1) % cap;
+                pf.fs_dep += 1;
+            }
         }
         if plan.early {
             self.engine.stats.early += 1;
