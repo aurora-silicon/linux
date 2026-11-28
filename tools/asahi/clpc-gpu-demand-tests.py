@@ -715,11 +715,16 @@ static void check_t6041_idle_burst(void) {
 }
 
 // T8132's G16 firmware keeps graphics powered while the GPU idles: the
-// M5/F3 floor follows the work the GPU driver reports, as on T6040.
+// M5/F3 floor follows the work the GPU driver reports, as on T6040, while CPU
+// clusters step through the quartile ladder after a 3-sample busy streak.
 static void check_t8132(void) {
  struct apple_clpc_gpu gpu={0};
  struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
- assert(!c.hw->gpu_demand);
+ assert(!c.hw->gpu_demand && c.hw->sustain==3);
+ assert(c.hw->map[APPLE_CLPC_DCS][0]==1 && c.hw->map[APPLE_CLPC_DCS][1]==2 &&
+        c.hw->map[APPLE_CLPC_DCS][2]==4 && c.hw->map[APPLE_CLPC_DCS][3]==5);
+ assert(c.hw->map[APPLE_CLPC_SOC][0]==0 && c.hw->map[APPLE_CLPC_SOC][1]==0 &&
+        c.hw->map[APPLE_CLPC_SOC][2]==1 && c.hw->map[APPLE_CLPC_SOC][3]==3);
  read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; jiffies=0; published=~0u;
  apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
  gpu.active=true; jiffies=100;

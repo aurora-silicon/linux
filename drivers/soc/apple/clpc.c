@@ -2193,22 +2193,28 @@ static int apple_clpc_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
 				apple_clpc_resume);
 
-/* Only the stock M5/F3 busy floor is qualified on T8132. Do not invent
- * intermediate frequency-to-memory tables; idle can still release the vote.
+/*
+ * T8132: DCS states 0-5 on rail 0, fabric states 0-3 on rail 1. Step the
+ * CPU memory floor by frequency quartile and require three busy samples in
+ * a row (12 ms), as on T6040, so brief interactive bursts and low-clocked
+ * E-core work do not hold top DCS/fabric voltage states. Top-quartile CPU
+ * work still requests DCS 5 / fabric 3 for full memory bandwidth.
  *
  * The G16 firmware keeps graphics powered while the GPU idles, so its power
  * state would hold the floor up all the time: on J713 that keeps the DCS and
  * the fabric at their top states at an idle desktop, about 0.45 W more than
  * with the floor released. The GPU driver reports its work instead, as on
- * T6040, and gets the M5/F3 floor while it has work in flight. Without that
- * floor, rendering is about 45% slower.
+ * T6040, and gets the M5/F3 floor (or DT busy-share ladder where present)
+ * while it has work in flight. Without that floor, rendering is about 45%
+ * slower.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
-		[APPLE_CLPC_DCS] = { 5, 5, 5, 5 },
-		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
+		[APPLE_CLPC_DCS] = { 1, 2, 4, 5 },
+		[APPLE_CLPC_SOC] = { 0, 0, 1, 3 },
 	},
+	.sustain = 3,
 	.gpu_demand = false,
 	.gpu_input = true,
 };
@@ -2507,6 +2513,15 @@ static void apple_clpc_t8132_gpu_input_test(struct kunit *test)
 	kref_init(&gpu->ref);
 	spin_lock_init(&gpu->lock);
 	KUNIT_EXPECT_FALSE(test, apple_clpc_hw_t8132.gpu_demand);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.sustain, 3u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_DCS][0], 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_DCS][1], 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_DCS][2], 4u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_DCS][3], 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_SOC][0], 0u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_SOC][1], 0u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_SOC][2], 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.map[APPLE_CLPC_SOC][3], 3u);
 
 	/* No input, or no work reported: no GPU floor. */
 	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t8132,
