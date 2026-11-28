@@ -1940,7 +1940,11 @@ static void gfx_v12_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 
 static int gfx_v12_0_init_csb(struct amdgpu_device *adev)
 {
-	amdgpu_gfx_rlc_setup_csb(adev);
+	int r;
+
+	r = amdgpu_gfx_rlc_setup_csb(adev);
+	if (r)
+		return r;
 
 	WREG32_SOC15(GC, 0, regRLC_CSIB_ADDR_HI,
 			adev->gfx.rlc.clear_state_gpu_addr >> 32);
@@ -2109,15 +2113,15 @@ static int gfx_v12_0_rlc_resume(struct amdgpu_device *adev)
 	int r;
 
 	if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) {
-		gfx_v12_0_init_csb(adev);
+		r = gfx_v12_0_init_csb(adev);
+		if (r)
+			return r;
 
 		if (!amdgpu_sriov_vf(adev)) /* enable RLC SRM */
 			gfx_v12_0_rlc_enable_srm(adev);
 	} else {
-		if (amdgpu_sriov_vf(adev)) {
-			gfx_v12_0_init_csb(adev);
-			return 0;
-		}
+		if (amdgpu_sriov_vf(adev))
+			return gfx_v12_0_init_csb(adev);
 
 		adev->gfx.rlc.funcs->stop(adev);
 
@@ -2134,7 +2138,9 @@ static int gfx_v12_0_rlc_resume(struct amdgpu_device *adev)
 				return r;
 		}
 
-		gfx_v12_0_init_csb(adev);
+		r = gfx_v12_0_init_csb(adev);
+		if (r)
+			return r;
 
 		adev->gfx.rlc.funcs->start(adev);
 	}

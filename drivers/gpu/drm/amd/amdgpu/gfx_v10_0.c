@@ -5457,7 +5457,11 @@ static void gfx_v10_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 
 static int gfx_v10_0_init_csb(struct amdgpu_device *adev)
 {
-	amdgpu_gfx_rlc_setup_csb(adev);
+	int r;
+
+	r = amdgpu_gfx_rlc_setup_csb(adev);
+	if (r)
+		return r;
 
 	/* csib */
 	if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(10, 1, 2)) {
@@ -5577,17 +5581,17 @@ static int gfx_v10_0_rlc_resume(struct amdgpu_device *adev)
 		if (r)
 			return r;
 
-		gfx_v10_0_init_csb(adev);
+		r = gfx_v10_0_init_csb(adev);
+		if (r)
+			return r;
 
 		gfx_v10_0_update_spm_vmid_internal(adev, 0xf);
 
 		if (!amdgpu_sriov_vf(adev)) /* enable RLC SRM */
 			gfx_v10_0_rlc_enable_srm(adev);
 	} else {
-		if (amdgpu_sriov_vf(adev)) {
-			gfx_v10_0_init_csb(adev);
-			return 0;
-		}
+		if (amdgpu_sriov_vf(adev))
+			return gfx_v10_0_init_csb(adev);
 
 		adev->gfx.rlc.funcs->stop(adev);
 
@@ -5609,7 +5613,9 @@ static int gfx_v10_0_rlc_resume(struct amdgpu_device *adev)
 				return r;
 		}
 
-		gfx_v10_0_init_csb(adev);
+		r = gfx_v10_0_init_csb(adev);
+		if (r)
+			return r;
 
 		gfx_v10_0_update_spm_vmid_internal(adev, 0xf);
 

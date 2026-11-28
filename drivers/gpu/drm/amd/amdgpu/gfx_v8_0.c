@@ -3867,9 +3867,14 @@ static void gfx_v8_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 	WREG32(mmCP_INT_CNTL_RING0, tmp);
 }
 
-static void gfx_v8_0_init_csb(struct amdgpu_device *adev)
+static int gfx_v8_0_init_csb(struct amdgpu_device *adev)
 {
-	amdgpu_gfx_rlc_setup_csb(adev);
+	int r;
+
+	r = amdgpu_gfx_rlc_setup_csb(adev);
+	if (r)
+		return r;
+
 	/* csib */
 	WREG32(mmRLC_CSIB_ADDR_HI,
 			adev->gfx.rlc.clear_state_gpu_addr >> 32);
@@ -3877,6 +3882,8 @@ static void gfx_v8_0_init_csb(struct amdgpu_device *adev)
 			adev->gfx.rlc.clear_state_gpu_addr & 0xfffffffc);
 	WREG32(mmRLC_CSIB_LENGTH,
 			adev->gfx.rlc.clear_state_size);
+
+	return 0;
 }
 
 static void gfx_v8_0_parse_ind_reg_list(int *register_list_format,
@@ -4031,11 +4038,15 @@ static void cz_enable_cp_power_gating(struct amdgpu_device *adev, bool enable)
 	WREG32_FIELD(RLC_PG_CNTL, CP_PG_DISABLE, enable ? 0 : 1);
 }
 
-static void gfx_v8_0_init_pg(struct amdgpu_device *adev)
+static int gfx_v8_0_init_pg(struct amdgpu_device *adev)
 {
+	int r;
+
 	if ((adev->asic_type == CHIP_CARRIZO) ||
 	    (adev->asic_type == CHIP_STONEY)) {
-		gfx_v8_0_init_csb(adev);
+		r = gfx_v8_0_init_csb(adev);
+		if (r)
+			return r;
 		gfx_v8_0_init_save_restore_list(adev);
 		gfx_v8_0_enable_save_restore_machine(adev);
 		WREG32(mmRLC_JUMP_TABLE_RESTORE, adev->gfx.rlc.cp_table_gpu_addr >> 8);
@@ -4044,12 +4055,15 @@ static void gfx_v8_0_init_pg(struct amdgpu_device *adev)
 	} else if ((adev->asic_type == CHIP_POLARIS11) ||
 		   (adev->asic_type == CHIP_POLARIS12) ||
 		   (adev->asic_type == CHIP_VEGAM)) {
-		gfx_v8_0_init_csb(adev);
+		r = gfx_v8_0_init_csb(adev);
+		if (r)
+			return r;
 		gfx_v8_0_init_save_restore_list(adev);
 		gfx_v8_0_enable_save_restore_machine(adev);
 		gfx_v8_0_init_power_gating(adev);
 	}
 
+	return 0;
 }
 
 static void gfx_v8_0_rlc_stop(struct amdgpu_device *adev)
@@ -4082,14 +4096,16 @@ static void gfx_v8_0_rlc_start(struct amdgpu_device *adev)
 
 static int gfx_v8_0_rlc_resume(struct amdgpu_device *adev)
 {
-	if (amdgpu_sriov_vf(adev)) {
-		gfx_v8_0_init_csb(adev);
-		return 0;
-	}
+	int r;
+
+	if (amdgpu_sriov_vf(adev))
+		return gfx_v8_0_init_csb(adev);
 
 	adev->gfx.rlc.funcs->stop(adev);
 	adev->gfx.rlc.funcs->reset(adev);
-	gfx_v8_0_init_pg(adev);
+	r = gfx_v8_0_init_pg(adev);
+	if (r)
+		return r;
 	adev->gfx.rlc.funcs->start(adev);
 
 	return 0;

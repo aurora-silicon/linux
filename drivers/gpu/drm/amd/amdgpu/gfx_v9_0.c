@@ -2771,9 +2771,14 @@ static void gfx_v9_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 	WREG32_SOC15(GC, 0, mmCP_INT_CNTL_RING0, tmp);
 }
 
-static void gfx_v9_0_init_csb(struct amdgpu_device *adev)
+static int gfx_v9_0_init_csb(struct amdgpu_device *adev)
 {
-	amdgpu_gfx_rlc_setup_csb(adev);
+	int r;
+
+	r = amdgpu_gfx_rlc_setup_csb(adev);
+	if (r)
+		return r;
+
 	/* csib */
 	WREG32_RLC(SOC15_REG_OFFSET(GC, 0, mmRLC_CSIB_ADDR_HI),
 			adev->gfx.rlc.clear_state_gpu_addr >> 32);
@@ -2781,6 +2786,8 @@ static void gfx_v9_0_init_csb(struct amdgpu_device *adev)
 			adev->gfx.rlc.clear_state_gpu_addr & 0xfffffffc);
 	WREG32_RLC(SOC15_REG_OFFSET(GC, 0, mmRLC_CSIB_LENGTH),
 			adev->gfx.rlc.clear_state_size);
+
+	return 0;
 }
 
 static void gfx_v9_1_parse_ind_reg_list(int *register_list_format,
@@ -3094,9 +3101,13 @@ static void gfx_v9_0_enable_gfx_dynamic_mg_power_gating(struct amdgpu_device *ad
 		WREG32(SOC15_REG_OFFSET(GC, 0, mmRLC_PG_CNTL), data);
 }
 
-static void gfx_v9_0_init_pg(struct amdgpu_device *adev)
+static int gfx_v9_0_init_pg(struct amdgpu_device *adev)
 {
-	gfx_v9_0_init_csb(adev);
+	int r;
+
+	r = gfx_v9_0_init_csb(adev);
+	if (r)
+		return r;
 
 	/*
 	 * Rlc save restore list is workable since v2_1.
@@ -3120,6 +3131,8 @@ static void gfx_v9_0_init_pg(struct amdgpu_device *adev)
 			     adev->gfx.rlc.cp_table_gpu_addr >> 8);
 		gfx_v9_0_init_gfx_power_gating(adev);
 	}
+
+	return 0;
 }
 
 static void gfx_v9_0_rlc_stop(struct amdgpu_device *adev)
@@ -3198,17 +3211,17 @@ static int gfx_v9_0_rlc_resume(struct amdgpu_device *adev)
 {
 	int r;
 
-	if (amdgpu_sriov_vf(adev)) {
-		gfx_v9_0_init_csb(adev);
-		return 0;
-	}
+	if (amdgpu_sriov_vf(adev))
+		return gfx_v9_0_init_csb(adev);
 
 	adev->gfx.rlc.funcs->stop(adev);
 
 	/* disable CG */
 	WREG32_SOC15(GC, 0, mmRLC_CGCG_CGLS_CTRL, 0);
 
-	gfx_v9_0_init_pg(adev);
+	r = gfx_v9_0_init_pg(adev);
+	if (r)
+		return r;
 
 	if (adev->firmware.load_type != AMDGPU_FW_LOAD_PSP) {
 		/* legacy rlc firmware loading */

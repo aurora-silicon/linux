@@ -1193,7 +1193,10 @@ static ssize_t amdgpu_debugfs_vcn_fwlog_read(struct file *f, char __user *buf,
 		header_size = plog->header_size;
 	}
 
-	if (read_pos > AMDGPU_VCNFW_LOG_SIZE || write_pos > AMDGPU_VCNFW_LOG_SIZE)
+	if (header_size < sizeof(*plog) ||
+	    header_size > AMDGPU_VCNFW_LOG_SIZE ||
+	    read_pos < header_size || read_pos > AMDGPU_VCNFW_LOG_SIZE ||
+	    write_pos < header_size || write_pos > AMDGPU_VCNFW_LOG_SIZE)
 		return -EFAULT;
 
 	if (!size || (read_pos == write_pos))

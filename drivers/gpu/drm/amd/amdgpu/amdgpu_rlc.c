@@ -152,26 +152,30 @@ int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev)
 	return 0;
 }
 
-void amdgpu_gfx_rlc_setup_csb(struct amdgpu_device *adev)
+int amdgpu_gfx_rlc_setup_csb(struct amdgpu_device *adev)
 {
 	struct amdgpu_bo *bo = adev->gfx.rlc.clear_state_obj;
 	size_t size = adev->gfx.rlc.clear_state_size * sizeof(u32);
 	u32 *tmp;
 
 	if (!bo || !adev->gfx.rlc.cs_ptr)
-		return;
+		return 0;
 
 	if (bo->tbo.resource->bus.is_nonposted) {
 		tmp = kvzalloc(size, GFP_KERNEL);
-		if (!tmp)
-			return;
+		if (!tmp) {
+			dev_err(adev->dev,
+				"failed to allocate CSB staging buffer\n");
+			return -ENOMEM;
+		}
 		adev->gfx.rlc.funcs->get_csb_buffer(adev, tmp);
 		amdgpu_bo_memcpy_to(bo, adev->gfx.rlc.cs_ptr, tmp, size);
 		kvfree(tmp);
-		return;
+		return 0;
 	}
 
 	adev->gfx.rlc.funcs->get_csb_buffer(adev, adev->gfx.rlc.cs_ptr);
+	return 0;
 }
 
 /**

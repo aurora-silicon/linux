@@ -59,6 +59,8 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'amdgpu-vcn-rlc-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('drop-vcn-header-bounds', 'drop-rlc-csb-enomem'), out()),
     'aurora-wake-output-tests.py': [(out(), PASS)],
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
