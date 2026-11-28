@@ -4,6 +4,7 @@
 / {
 	aliases {
 		nvram = &nvram;
+		pmp = &pmp;
 	};
 
 	/* J813 ADT /arm-io/qspi clock-ids [396]; rate as the T8140 QSPI. */
@@ -102,10 +103,11 @@
 		mbox-names = "mbox";
 		iommus = <&pmp_dart 0>;
 		power-domains = <&ps_pmp>;
-		/* ADT /chosen board-id, dram-vendor-id */
-		apple,board-id = <36>;
-		apple,dram-vendor-id = <1>;
-		/* ADT /arm-io/pmgr pmc, pmc-pmgr (registry-v2 boot arguments) */
+		/*
+		 * ADT /arm-io/pmgr pmc, pmc-pmgr (registry-v2 boot arguments).
+		 * The loader adds apple,board-id, apple,dram-vendor-id and the
+		 * apple,tunable-* values from this machine's ADT.
+		 */
 		apple,pmc = <1>;
 		apple,pmc-pmgr = <31>;
 	};
@@ -163,11 +165,15 @@
 		#pwm-cells = <2>;
 	};
 };
-#include "t8142-j813-pmp-tunables.dtsi"
 
 &pmp_dart {
 	apple,dma-range = /bits/ 64 <0x10000000000 0xbff00000>;
 	power-domains = <&ps_pmp>;
+	status = "okay";
+};
+
+&pmp_report {
+	power-domains = <&ps_pms_sram>;
 	status = "okay";
 };
 

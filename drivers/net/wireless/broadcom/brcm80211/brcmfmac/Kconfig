@@ -12,13 +12,14 @@ config BRCMFMAC_PROTO_BCDC
 	bool
 
 config BRCMFMAC_KUNIT_TEST
-	tristate "KUnit tests for brcmfmac scan timeout" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for brcmfmac scan timeout and PCIe TCM bounds" if !KUNIT_ALL_TESTS
 	depends on KUNIT && BRCMFMAC
 	default KUNIT_ALL_TESTS
 	help
 	  Test channel-based scan deadline calculation without Wi-Fi hardware.
 	  Covers passive and active scan budgets, all-band scans, minimum
-	  deadlines and saturation for oversized channel counts.
+	  deadlines and saturation for oversized channel counts. Also test
+	  the bounds check for firmware-supplied offsets into the PCIe TCM.
 	  These tests run under KUnit and are not needed for normal operation.
 
 config BRCMFMAC_PROTO_MSGBUF

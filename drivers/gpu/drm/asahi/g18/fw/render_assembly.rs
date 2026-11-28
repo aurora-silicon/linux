@@ -106,7 +106,13 @@ pub(crate) enum AssemblyError { Registers(regs::G18RenderError), Command(cmd::G1
 impl From<regs::G18RenderError> for AssemblyError { fn from(e: regs::G18RenderError) -> Self { Self::Registers(e) } }
 impl From<cmd::G18RenderCommandError> for AssemblyError { fn from(e: cmd::G18RenderCommandError) -> Self { Self::Command(e) } }
 
-pub(crate) struct EncodedJob { pub rce: [[M5SksmRce; 4]; 2], pub digests: [u64; 7] }
+/// FNV digests of a TA and a 3D command and of their register blocks, in
+/// [`DIGEST_NAMES`] order.
+pub(crate) fn digests(ta: &[u8], fragment: &[u8]) -> [u64; 7] {
+    [fnv64(ta), fnv64(fragment), fnv64(&ta[0x60..0x60 + 91 * 12]),
+        fnv64(&fragment[0xa0..0xa0 + 92 * 12]), fnv64(&fragment[0x7c0..0x7c0 + 17 * 12]),
+        fnv64(&fragment[0xee0..0xee0 + 24 * 12]), fnv64(&fragment[0x1600..0x1600 + 12 * 12])]
+}
 
 // Only integer fields: zero is a valid initial representation. Kept on the
 // heap by the kernel caller, including across the register-builder calls.
@@ -122,7 +128,7 @@ pub(crate) fn encode(
     ta: &mut [u8; cmd::G18_TA_COMMAND_BYTES], fragment: &mut [u8; cmd::G18_3D_COMMAND_BYTES],
     p: &G17pRenderParameters, controls: &regs::G18RenderControls,
     inputs: &cmd::G18RenderCommandInputs,
-) -> Result<EncodedJob, AssemblyError> {
+) -> Result<[[M5SksmRce; 4]; 2], AssemblyError> {
     let mut workspace = Workspace { ta: regs::G18Program::empty(), fragment: regs::G18FragmentPrograms {
         main: regs::G18Program::empty(), store: regs::G18Program::empty(),
         resume: regs::G18Program::empty(), load: regs::G18Program::empty() } };
@@ -134,7 +140,7 @@ pub(crate) fn encode_into(
     ta: &mut [u8; cmd::G18_TA_COMMAND_BYTES], fragment: &mut [u8; cmd::G18_3D_COMMAND_BYTES],
     p: &G17pRenderParameters, controls: &regs::G18RenderControls,
     inputs: &cmd::G18RenderCommandInputs, workspace: &mut Workspace,
-) -> Result<EncodedJob, AssemblyError> {
+) -> Result<[[M5SksmRce; 4]; 2], AssemblyError> {
     ta.fill(0); fragment.fill(0);
     regs::build_g18_ta_program_into(&mut workspace.ta, p, controls)?;
     regs::build_g18_fragment_programs_into(&mut workspace.fragment, p, controls)?;
@@ -147,10 +153,7 @@ pub(crate) fn encode_into(
         va::GRAPHICS_JOB_LOW + FRAGMENT_OFFSET as u64, inputs, &programs)?;
     // The linked 3D tuple in inputs is finalized before encoding TA.
     let ta_rce = cmd::encode_g18_ta_command(ta, va::GRAPHICS_JOB_LOW, inputs, &view(&t))?;
-    let digests = [fnv64(ta), fnv64(fragment), fnv64(&ta[0x60..0x60 + 91 * 12]),
-        fnv64(&fragment[0xa0..0xa0 + 92 * 12]), fnv64(&fragment[0x7c0..0x7c0 + 17 * 12]),
-        fnv64(&fragment[0xee0..0xee0 + 24 * 12]), fnv64(&fragment[0x1600..0x1600 + 12 * 12])];
-    Ok(EncodedJob { rce: [ta_rce, fr_rce], digests })
+    Ok([ta_rce, fr_rce])
 }
 
 /// Runtime variants are deliberately a closed set. H2 repeats three frames;

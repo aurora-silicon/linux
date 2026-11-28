@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The internal tandem OLED panel and its display coprocessor on the K114c, K114s, K116c and
+ * K116s, for the boot loader's display hand-off. The four ADTs have the same disp0, dart-disp0,
+ * dcp and dart-dcp (the live K114s and K116s ADTs: disp0 clock-ids 361 and 458, both DARTs
+ * vm-base 1 TiB, vm-size 3 TiB) and no I2C backlight controller: the OLED's luminance is a DCP
+ * request (ADT /backlight-override dcp-brightness-node = 1).
+ *
+ * Everything stays disabled. The loader checks the ADT and the live DCP and DART state,
+ * publishes the DCP's firmware properties, the panel's brightness scale (ADT
+ * user-accessible-max-nits) and the ADT /vram as the framebuffer, and only then enables dcp,
+ * its DARTs and mailbox and the display subsystem. A loader without the hand-off, or one whose
+ * checks fail, leaves the boot framebuffer to simpledrm.
+ *
+ * The board adds the panel's size (the ADTs carry none).
+ */
+
+/ {
+	aliases {
+		/* The loader writes apple,notch-height into the "dcp" alias */
+		dcp = &dcp;
+		disp0 = &display;
+	};
+
+	/* As on J714s, with the internal display's DART (disp0, SID 0) */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&disp0_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcp {
+	/*
+	 * ADT disp0 clock-ids. The loader adds the clock nodes, "clocks" and the
+	 * bandwidth request scratch ("apple,bw-scratch") when it hands the panel
+	 * over, as on the J714s, and refuses a tree that already has them.
+	 */
+	apple,clock-ids = <361 458>;
+
+	/*
+	 * The panel's plug takes about 2.9 ms on the K116s from the video interface's
+	 * announcement to the firmware's "ioav i/f is now closed", and the next round of
+	 * reports follows about 33 ms later. With the J714s's 2500 us the open landed 25 us
+	 * before the close. The K boards run the same 27.2 DCP image for the same panel family.
+	 */
+	apple,panel-video-open-delay-us = <10000>;
+
+	panel: panel {
+		compatible = "apple,panel";
+	};
+};
+
+/*
+ * The external display engines (dcpext0..3, die 0) on the USB-C ports. Each empty
+ * typec-routes container asks the boot loader to write the engine's routes from the ADT
+ * (dp-switch-* on the engine and on each port's direct DP output), for the ports whose PHY,
+ * crossbar and PD controller this tree describes: ATC1 (left-front) and ATC2 (right). The
+ * loader hands an engine over with its routes, or leaves it, and what its routes need,
+ * disabled. dcpext0's route through ATC2 in t6050-die0.dtsi is dropped, with the PHY,
+ * crossbar and DPTX die it names, so that its routes come from the ADT too (the loader writes
+ * no routes for an engine that already names PHYs or crossbars, and writes apple,dptx-die with
+ * the routes it adds; the binding allows none of them beside an empty typec-routes).
+ */
+&dcpext0 {
+	/delete-property/ apple,typec-dptx-phys;
+	/delete-property/ apple,typec-mux-indices;
+	/delete-property/ phys;
+	/delete-property/ phy-names;
+	/delete-property/ mux-controls;
+	/delete-property/ mux-control-names;
+	/delete-property/ apple,dptx-die;
+
+	typec-routes {
+		/delete-node/ route@0;
+	};
+};
+
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+/*
+ * DisplayPort audio of the external displays. The K boards' ADT describes the same display
+ * engines, display ADMACs and dp-audio nodes as the J714s (dcpext0..3, admac-dispext0..3,
+ * dp-audio0..4), with dcpext0..2 driving displays of their own, so they take the J714s
+ * description as is.
+ */
+#include "t6050-j714s-dpaudio.dtsi"

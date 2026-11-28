@@ -3,9 +3,9 @@
 """Actual PHY parking, failure/retry, masked context and OFF controls."""
 from pathlib import Path
 import re
-from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
+from common import (block, source_defines, atc_mux_without_pm, atc_set_mode_prototypes, ATC_POST_TUNABLE,
                     atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers, atc_common_state_helpers,
-                    atc_cio_helpers)
+                    atc_cio_helpers, atc_cfg_helpers)
 
 def parking(root):
 
@@ -16,6 +16,9 @@ def parking(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(source, re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -35,6 +38,8 @@ def parking(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -46,7 +51,7 @@ struct apple_atcphy {
     struct reset_controller_dev rcdev;
     void *dev;
     int lock, dp_link_rate;
-    bool fixed_usb2, host_active, swap_lanes, ss_tunables, dp_tunables;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, swap_lanes, ss_tunables, dp_tunables;
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;
@@ -67,6 +72,7 @@ struct apple_atcphy {
     start = atc.index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     parts.append(atc[start:atc.index('\n};', start) + 3])
     parts.append(atc_cio_helpers(atc))
+    parts.append(atc_cfg_helpers(atc))
     parts.append(r'''
 struct phy_configure_opts_dp {
     unsigned int link_rate, lanes, voltage[4], pre[4];
@@ -160,11 +166,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *);
 static int atcphy_power_off(struct apple_atcphy *);
 static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+static void __attribute__((unused)) atcphy_lanes_down_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); }
 
 
 ''')
@@ -224,7 +234,11 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)
@@ -1901,6 +1915,9 @@ static void record_debug(const char *format, ...)
 }
 #undef dev_dbg
 #define dev_dbg(dev, format, ...) record_debug(format, ##__VA_ARGS__)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 '''
     return ns["prefix"] + logger + "#define PROPOSAL\n" + production + ns["suffix"].replace("int main(", "int original_fixture_main(", 1) + controls
 
@@ -1923,6 +1940,9 @@ def pipe(root):
     def function(name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -1937,6 +1957,8 @@ def pipe(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -1948,7 +1970,7 @@ struct apple_atcphy {
     struct { unsigned char *core, *pipehandler; } regs;
     void *dev;
     int lock;
-    bool fixed_usb2, host_active, ss_tunables, dp_tunables, mode_dirty;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, ss_tunables, dp_tunables, mode_dirty;
     unsigned int dp_owned_pmas, dp_idle_pmas;
     unsigned int dp_usb_context_valid, dp_usb_context_dirty;
     u32 dp_usb_context[2][27];
@@ -1993,10 +2015,12 @@ static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p, 
 static void __attribute__((unused)) atcphy_restore_after_pd_off(struct apple_atcphy *p) { assert(!p->pd_was_off); }
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
 
 ''')
@@ -2047,7 +2071,11 @@ typedef uint16_t u16;
 #define FIELD_GET(m, v) (((v) & (m)) >> __builtin_ctz(m))
 #define field_prep FIELD_PREP
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define WARN_ON_ONCE(v) assert(!(v))
@@ -2320,6 +2348,9 @@ def unwind(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name == 'atcphy_usb3_set_mode':
+            return atc_set_mode_prototypes(source) + block(source, re.search(
+                r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
         if name in ATC_SPLIT + ATC_T8103_LIVE:
             return atc_function(source, name)
         return block(source, re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M).group())
@@ -2337,6 +2368,8 @@ def unwind(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
@@ -2348,7 +2381,7 @@ struct apple_atcphy {
     struct { unsigned char *core, *lpdptx, *lioa; } regs;
     void *dev;
     int lock, dp_link_rate;
-    bool fixed_usb2, host_active, swap_lanes, ss_tunables, dp_tunables;
+    bool fixed_usb2, fixed_usb3, cio_only, host_active, swap_lanes, ss_tunables, dp_tunables;
     bool aux_power_requested, mode_dirty, dp_spread_spectrum, dp_presets_valid[5];
     u32 dp_presets[5][16];
     unsigned int dp_idle_pmas, dp_owned_pmas;
@@ -2364,6 +2397,7 @@ struct apple_atcphy {
     start = atc.index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     parts.append(atc[start:atc.index('\n};', start) + 3])
     parts.append(atc_cio_helpers(atc))
+    parts.append(atc_cfg_helpers(atc))
     parts.append(r'''
 struct phy_configure_opts_dp {
     unsigned int link_rate, lanes, voltage[4], pre[4];
@@ -2424,11 +2458,13 @@ static bool of_machine_is_compatible(const char *name) { (void)name; return fals
 static int atcphy_power_off(struct apple_atcphy *);
 static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
+static void __attribute__((unused)) atcphy_lanes_down_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); }
 
 
 static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp)
@@ -2467,7 +2503,11 @@ typedef uint16_t u16;
 #define hweight32(v) __builtin_popcount(v)
 #define dev_info_once(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#ifndef dev_info
+#define dev_info(...) ((void)0)
+#endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)
@@ -2662,6 +2702,8 @@ typedef uint32_t u32;
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+    bool usb2_device;
     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
     struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;

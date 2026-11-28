@@ -13,10 +13,13 @@ def build(root, out, source):
         'types.h': '#pragma once\n#include <stdbool.h>\n#include <stdint.h>\n'
                    'typedef uint8_t u8; typedef uint32_t u32;\n'
                    'typedef int32_t s32; typedef int64_t s64;\n',
-        'io.h': '#pragma once\n#include <string.h>\n#define __iomem\n'
-                '#define memcpy_fromio memcpy\n',
+        'io.h': '#pragma once\n#include <stdint.h>\n#include <string.h>\n#define __iomem\n'
+                '#define memcpy_fromio memcpy\n'
+                'static inline uint32_t readl_relaxed(const void *p) {\n'
+                ' uint32_t v; memcpy(&v, p, 4); return v; }\n',
         'kernel.h': '#pragma once\n#include <errno.h>\n#include <linux/types.h>\n'
                     '#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))\n'
+                    '#define READ_ONCE(x) (*(const volatile __typeof__(x) *)&(x))\n'
                     '#define DIV_ROUND_CLOSEST(x, d) '
                     '(((x) < 0 ? (x) - (d) / 2 : (x) + (d) / 2) / (d))\n',
         'string.h': '#pragma once\n#include <string.h>\n',

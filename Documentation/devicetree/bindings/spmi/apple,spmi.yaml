@@ -13,6 +13,14 @@ description: A SPMI controller present on most Apple SoCs
 
 allOf:
   - $ref: spmi.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-spmi
+    then:
+      properties:
+        apple,response-vector: false
 
 properties:
   compatible:
@@ -41,6 +49,11 @@ properties:
               - apple,t8132-spmi
               - apple,t8140-spmi
           - const: apple,t8103-spmi
+      - description:
+          The gen-4 controller of T8152, with its FIFO registers at 0x200.
+        items:
+          - const: apple,t8152-spmi
+          - const: apple,t8142-spmi
 
   reg:
     minItems: 1
@@ -62,6 +75,19 @@ properties:
 
   "#interrupt-cells":
     const: 2
+
+  apple,response-vector:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 64
+    maximum: 256
+    multipleOf: 64
+    description:
+      Controller vector index for the RX FIFO command-response notification on
+      gen-1 controllers. Peripheral interrupts occupy vectors 0 through N-1, so
+      this also gives the peripheral interrupt count. When omitted, the driver
+      uses the compatible's default (192 for T6000, 256 for other gen-1
+      controllers). Not applicable to generation 4 controllers
+      ("apple,t8142-spmi").
 
   power-domains:
     maxItems: 1
