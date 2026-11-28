@@ -1169,6 +1169,8 @@ static ssize_t amdgpu_debugfs_vcn_fwlog_read(struct file *f, char __user *buf,
 	struct amdgpu_vcn_fwlog *plog;
 	unsigned int read_pos, write_pos, available, i, read_bytes = 0;
 	unsigned int read_num[2] = {0};
+	unsigned int header_size;
+	bool np;
 
 	vcn = file_inode(f)->i_private;
 	if (!vcn)
@@ -1178,12 +1180,23 @@ static ssize_t amdgpu_debugfs_vcn_fwlog_read(struct file *f, char __user *buf,
 		return -EFAULT;
 
 	log_buf = vcn->fw_shared.cpu_addr + vcn->fw_shared.mem_size;
+	np = vcn->vcpu_bo && vcn->vcpu_bo->tbo.resource->bus.is_nonposted;
 
 	plog = (struct amdgpu_vcn_fwlog *)log_buf;
-	read_pos = plog->rptr;
-	write_pos = plog->wptr;
+	if (np) {
+		read_pos = readl((void __iomem *)&plog->rptr);
+		write_pos = readl((void __iomem *)&plog->wptr);
+		header_size = readl((void __iomem *)&plog->header_size);
+	} else {
+		read_pos = plog->rptr;
+		write_pos = plog->wptr;
+		header_size = plog->header_size;
+	}
 
-	if (read_pos > AMDGPU_VCNFW_LOG_SIZE || write_pos > AMDGPU_VCNFW_LOG_SIZE)
+	if (header_size < sizeof(*plog) ||
+	    header_size > AMDGPU_VCNFW_LOG_SIZE ||
+	    read_pos < header_size || read_pos > AMDGPU_VCNFW_LOG_SIZE ||
+	    write_pos < header_size || write_pos > AMDGPU_VCNFW_LOG_SIZE)
 		return -EFAULT;
 
 	if (!size || (read_pos == write_pos))
@@ -1194,9 +1207,9 @@ static ssize_t amdgpu_debugfs_vcn_fwlog_read(struct file *f, char __user *buf,
 		read_num[0] = min_t(size_t, size, available);
 	} else {
 		read_num[0] = AMDGPU_VCNFW_LOG_SIZE - read_pos;
-		available = read_num[0] + write_pos - plog->header_size;
+		available = read_num[0] + write_pos - header_size;
 		if (size > available)
-			read_num[1] = write_pos - plog->header_size;
+			read_num[1] = write_pos - header_size;
 		else if (size > read_num[0])
 			read_num[1] = size - read_num[0];
 		else
@@ -1206,17 +1219,36 @@ static ssize_t amdgpu_debugfs_vcn_fwlog_read(struct file *f, char __user *buf,
 	for (i = 0; i < 2; i++) {
 		if (read_num[i]) {
 			if (read_pos == AMDGPU_VCNFW_LOG_SIZE)
-				read_pos = plog->header_size;
-			if (read_num[i] == copy_to_user((buf + read_bytes),
-							(log_buf + read_pos), read_num[i]))
+				read_pos = header_size;
+			if (np) {
+				void *tmp = kvmalloc(read_num[i], GFP_KERNEL);
+				unsigned long uncopied;
+
+				if (!tmp)
+					return -ENOMEM;
+				amdgpu_bo_memcpy_from(vcn->vcpu_bo, tmp,
+						      log_buf + read_pos,
+						      read_num[i]);
+				uncopied = copy_to_user(buf + read_bytes, tmp,
+							read_num[i]);
+				kvfree(tmp);
+				if (uncopied == read_num[i])
+					return -EFAULT;
+			} else if (read_num[i] == copy_to_user((buf + read_bytes),
+							       (log_buf + read_pos),
+							       read_num[i])) {
 				return -EFAULT;
+			}
 
 			read_bytes += read_num[i];
 			read_pos += read_num[i];
 		}
 	}
 
-	plog->rptr = read_pos;
+	if (np)
+		writel(read_pos, (void __iomem *)&plog->rptr);
+	else
+		plog->rptr = read_pos;
 	*pos += read_bytes;
 	return read_bytes;
 }

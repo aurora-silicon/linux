@@ -1164,7 +1164,7 @@ static int vcn_v4_0_3_start_sriov(struct amdgpu_device *adev)
 		/* Send init table to mmsch */
 		size = sizeof(struct mmsch_v4_0_3_init_header);
 		table_loc = (uint32_t *)table->cpu_addr;
-		memcpy((void *)table_loc, &header, size);
+		amdgpu_bo_memcpy_to(table->bo, table_loc, &header, size);
 
 		ctx_addr = table->gpu_addr;
 		WREG32_SOC15(VCN, vcn_inst, regMMSCH_VF_CTX_ADDR_LO, lower_32_bits(ctx_addr));

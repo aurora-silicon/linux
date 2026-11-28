@@ -318,7 +318,8 @@ static int vce_v4_0_sriov_start(struct amdgpu_device *adev)
 						   ~VCE_STATUS__JOB_BUSY_MASK, 0);
 
 		/* add end packet */
-		memcpy((void *)init_table, &end, sizeof(struct mmsch_v1_0_cmd_end));
+		amdgpu_bo_memcpy_to(adev->virt.mm_table.bo, init_table, &end,
+				    sizeof(struct mmsch_v1_0_cmd_end));
 		table_size += sizeof(struct mmsch_v1_0_cmd_end) / 4;
 		header->vce_table_size = table_size;
 	}

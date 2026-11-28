@@ -1208,7 +1208,7 @@ int amdgpu_gmc_vram_checking(struct amdgpu_device *adev)
 	void *vram_ptr = NULL;
 
 	int ret, size = 0x100000;
-	uint8_t cptr[10];
+	uint8_t cptr[10], rbuf[10];
 
 	ret = amdgpu_bo_create_kernel(adev, size, PAGE_SIZE,
 				AMDGPU_GEM_DOMAIN_VRAM,
@@ -1218,8 +1218,8 @@ int amdgpu_gmc_vram_checking(struct amdgpu_device *adev)
 	if (ret)
 		return ret;
 
-	memset(vram_ptr, 0x86, size);
-	memset(cptr, 0x86, 10);
+	amdgpu_bo_memset(vram_bo, vram_ptr, 0x86, size);
+	memset(cptr, 0x86, sizeof(cptr));
 
 	/**
 	 * Check the start, the mid, and the end of the memory if the content of
@@ -1229,19 +1229,23 @@ int amdgpu_gmc_vram_checking(struct amdgpu_device *adev)
 	 * Note: If check the each byte of whole 1M bo, it will cost too many
 	 * seconds, so here, we just pick up three parts for emulation.
 	 */
-	ret = memcmp(vram_ptr, cptr, 10);
+	amdgpu_bo_memcpy_from(vram_bo, rbuf, vram_ptr, sizeof(rbuf));
+	ret = memcmp(rbuf, cptr, sizeof(rbuf));
 	if (ret) {
 		ret = -EIO;
 		goto release_buffer;
 	}
 
-	ret = memcmp(vram_ptr + (size / 2), cptr, 10);
+	amdgpu_bo_memcpy_from(vram_bo, rbuf, vram_ptr + (size / 2), sizeof(rbuf));
+	ret = memcmp(rbuf, cptr, sizeof(rbuf));
 	if (ret) {
 		ret = -EIO;
 		goto release_buffer;
 	}
 
-	ret = memcmp(vram_ptr + size - 10, cptr, 10);
+	amdgpu_bo_memcpy_from(vram_bo, rbuf, vram_ptr + size - sizeof(rbuf),
+			      sizeof(rbuf));
+	ret = memcmp(rbuf, cptr, sizeof(rbuf));
 	if (ret) {
 		ret = -EIO;
 		goto release_buffer;

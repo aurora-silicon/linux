@@ -236,7 +236,7 @@ static int vce_v1_0_load_fw(struct amdgpu_device *adev)
 
 	cpu_addr += (256 - 64) / 4;
 	memcpy_toio(&cpu_addr[0], &sign->val[i].nonce[0], 16);
-	cpu_addr[4] = cpu_to_le32(le32_to_cpu(sign->length) + 64);
+	writel(le32_to_cpu(sign->length) + 64, (void __iomem *)&cpu_addr[4]);
 
 	memset_io(&cpu_addr[5], 0, 44);
 	memcpy_toio(&cpu_addr[16], &sign[1], ucode_size);

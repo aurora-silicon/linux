@@ -455,7 +455,7 @@ static int jpeg_v4_0_start_sriov(struct amdgpu_device *adev)
 
 	size = sizeof(struct mmsch_v4_0_init_header);
 	table_loc = (uint32_t *)table->cpu_addr;
-	memcpy(&header, (void *)table_loc, size);
+	amdgpu_bo_memcpy_from(table->bo, &header, table_loc, size);
 
 	header.version = MMSCH_VERSION;
 	header.total_size = RREG32_SOC15(VCN, 0, regMMSCH_VF_CTX_SIZE);
@@ -492,7 +492,7 @@ static int jpeg_v4_0_start_sriov(struct amdgpu_device *adev)
 	/* Update init table header in memory */
 	size = sizeof(struct mmsch_v4_0_init_header);
 	table_loc = (uint32_t *)table->cpu_addr;
-	memcpy((void *)table_loc, &header, size);
+	amdgpu_bo_memcpy_to(table->bo, table_loc, &header, size);
 
 	/* Perform HDP flush before writing to MMSCH registers */
 	amdgpu_device_flush_hdp(adev, NULL);

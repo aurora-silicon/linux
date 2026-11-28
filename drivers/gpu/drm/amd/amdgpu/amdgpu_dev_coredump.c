@@ -314,7 +314,8 @@ amdgpu_devcoredump_print_ibs(struct drm_printer *p,
 
 			kptr = amdgpu_bo_kptr(abo);
 			kptr += offset;
-			memcpy(ib_content, kptr, coredump->ibs[i].ib_size_dw * 4);
+			amdgpu_bo_memcpy_from(abo, ib_content, kptr,
+					      coredump->ibs[i].ib_size_dw * 4);
 
 			amdgpu_bo_kunmap(abo);
 			emit_content = true;

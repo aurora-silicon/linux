@@ -1525,7 +1525,8 @@ static int vcn_v2_5_sriov_start(struct amdgpu_device *adev)
 			SOC15_REG_OFFSET(VCN, i, mmUVD_RBC_RB_CNTL), tmp);
 
 		/* add end packet */
-		memcpy((void *)init_table, &end, sizeof(struct mmsch_v1_0_cmd_end));
+		amdgpu_bo_memcpy_to(adev->virt.mm_table.bo, init_table, &end,
+				    sizeof(struct mmsch_v1_0_cmd_end));
 		table_size += sizeof(struct mmsch_v1_0_cmd_end) / 4;
 		init_table += sizeof(struct mmsch_v1_0_cmd_end) / 4;
 
