@@ -416,6 +416,7 @@ ASAHI_TESTS = {
     'pcie-adopted-clkpm-tests.py': [([], PASS)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
+    'pmp-disp-consumer-tests.py': [([], PASS)],
     'sep-suspend-errors-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('unsupported-as-success', 'read-as-deadline', 'no-capability-check',
                                    'no-transport-check', 'lost-accept', 'nonphysical-wake',

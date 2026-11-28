@@ -214,7 +214,7 @@ pub(crate) struct Regs {
     /// GFXCAXI2AF registers (SGX +0x1000000), written only by the 27.2 start.
     axi2af: Option<Mapping>,
     /// Highest firmware performance state the board's table holds: S9 until the table is
-    /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
+    /// known (the ten-row tables), S10 on the eleven-row ones.
     top: AtomicU32,
 }
 

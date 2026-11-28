@@ -6,8 +6,8 @@
 //! Temperature decoding and regulation belong to the PMP provider and the
 //! shared C cooling policy. This module defines no temperature thresholds.
 
-/// Highest selector any M4 table can have: S9 on the ten-row J713/J604 tables, S10 on the
-/// eleven-row J773g table. The board's own top state (`top`) bounds every request.
+/// Highest selector any M4 table can have: S9 on the ten-row tables, S10 on the
+/// eleven-row ones (J604, J773g). The board's own top state (`top`) bounds every request.
 pub(crate) const PSTATE_MAX: u32 = 10;
 /// Top state of the ten-row tables, used until the board's table is known.
 pub(crate) const TOP_DEFAULT: u32 = 9;
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn the_board_table_sets_the_top_state() {
-        // J713/J604: ten rows, top S9. J773g: eleven rows, top S10 (1578 MHz on the Mac mini).
+        // Ten rows (J713): top S9. Eleven rows (J604, J773g): top S10 (1578 MHz on the Mac mini).
         assert_eq!(top_of(10), 9);
         assert_eq!(top_of(11), 10);
         assert_eq!(top_of(12), PSTATE_MAX);

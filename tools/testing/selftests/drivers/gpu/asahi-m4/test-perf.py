@@ -26,6 +26,14 @@ def node(props, children=()):
 # Minimal synthetic envelope around exact measured properties, with no unrelated machine data.
 image = node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [node({'name': b'sgx\0', **properties})])])
 blob = out / 'measured-perf.adt'
+# The Mac mini's own properties (five low states, five pairs, a top state), in the same envelope.
+j773g_fixture = HERE / 'fixtures/m4-perf-source-j773g.json'
+if sha(j773g_fixture) != '3248fe413aa6bd9206baf2f41e2eaa8154452a2ba0eda65131382e04dccbedd7':
+    raise RuntimeError('J773g original ADT performance fixture changed')
+j773g_properties = {name: bytes.fromhex(value)
+                    for name, value in json.loads(j773g_fixture.read_text())['properties_hex'].items()}
+j773g_blob = out / 'measured-perf-j773g.adt'
+j773g_blob.write_bytes(node({'name': b'device-tree\0'}, [node({'name': b'arm-io\0'}, [node({'name': b'sgx\0', **j773g_properties})])]))
 blob.write_bytes(image)
 clpc_props = {
     'cpu-avg-limiter-input-tc': struct.pack('<I', 248),
@@ -54,6 +62,7 @@ mod backend {
 }
 use backend::{adt::perf, board::data, fw::initdata as wire};
 const MEASURED: &[u8] = include_bytes!("@FIXTURE@");
+const MEASURED_J773G: &[u8] = include_bytes!("@FIXTURE_J773G@");
 const MEASURED_CLPC: &[u8] = include_bytes!("@FIXTURE_CLPC@");
 fn put32(out: &mut [u8], at: usize, value: u32) { out[at..at+4].copy_from_slice(&value.to_le_bytes()); }
 fn property_offset(data: &[u8], name: &[u8]) -> usize {
@@ -288,6 +297,18 @@ fn g15s_power_config_uses_the_encoded_ceiling_and_machine_adt_limiter() {
     let mut s=source();s.core_mv[6]=s.core_mv[5];s.sram_mv[6]=s.sram_mv[5];assert!(data::select(&s).is_err());
     let mut s=source();s.core_mv[4]-=1;s.core_mv[6]-=1;assert!(data::select(&s).is_err());
 }
+#[test] fn measured_adts_give_ten_rows_on_the_j713_and_eleven_on_the_j773g() {
+    // The two machines' own, unmodified ADT states: the count is derived from each.
+    let (p,name)=data::select_named(&perf::parse(MEASURED).unwrap()).unwrap();
+    assert_eq!((p.count,name),(10,"10-row"));
+    let s=perf::parse(MEASURED_J773G).unwrap(); assert_eq!(s.count,16);
+    let (p,name)=data::select_named(&s).unwrap();
+    assert_eq!((p.count,name),(11,"11-row"));
+    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
+    assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
+    assert_eq!(p.voltage,[125,610,640,670,715,770,815,870,900,970,1045]);
+    assert!(encode(p).is_ok());
+}
 #[test] fn eleven_row_shape_selects_all_eleven_rows_from_adt_without_board_check() {
     assert_eq!(data::select_named(&source()).unwrap().1,"10-row");
     // 11-row shape (J604/J773g): five low states, equal-voltage pairs 5/6 to 13/14, single top 15.
@@ -350,7 +371,7 @@ fn g15s_power_config_uses_the_encoded_ceiling_and_machine_adt_limiter() {
 '''
 for marker, value in {'PARSER': backend / 'adt/perf.rs', 'ENCODER': backend / 'fw/initdata.rs',
                       'SELECT': backend / 'board/data.rs', 'FIXTURE': blob,
-                      'FIXTURE_CLPC': blob_clpc}.items():
+                      'FIXTURE_CLPC': blob_clpc, 'FIXTURE_J773G': j773g_blob}.items():
     source = source.replace('@' + marker + '@', str(value))
 path = out / 'perf.rs'
 path.write_text(source)

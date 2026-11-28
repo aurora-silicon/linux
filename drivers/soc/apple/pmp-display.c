@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Retained J713 DISP/AGX votes through the existing Rust PMP owner.
- * Exactly one untagged request is in flight; invalid replies fail the epoch.
+/* Retained J713 DISP and J713/J773g AGX votes through the existing Rust PMP
+ * owner. Exactly one untagged request is in flight; invalid replies fail the
+ * epoch.
  */
 #include <linux/bits.h>
 #include <linux/completion.h>
@@ -214,6 +215,7 @@ struct apple_pmp_display {
 	struct pmp_power_vote vote;
 	struct device_link *link[PMP_POWER_COUNT];
 	bool agx_table_valid;
+	bool disp_table_valid;
 };
 
 /* One qualified supplier; published once, never freed during its epoch. */
@@ -222,7 +224,7 @@ static DEFINE_MUTEX(pmp_display_registration);
 
 bool apple_pmp_display_retained_board(void)
 {
-	return apple_pmp_j713_board();
+	return apple_pmp_t8132_retained_board();
 }
 
 /* The qualified loader publishes the existing PMP through its alias. */
@@ -238,24 +240,26 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	struct device_node *node, *qualified;
 	const void *table;
 	int size;
-	bool match, j713 = apple_pmp_j713_board();
+	bool match;
 
-	if (!j713 || !dev->of_node ||
+	if (!apple_pmp_t8132_retained_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node,
 		"apple,t8132-pmp-v2"))
 		return NULL;
 	node = pmp_bridge_node();
 	match = node == dev->of_node;
 	of_node_put(node);
-	if (j713) {
-		qualified = of_find_node_by_path("/soc/pmp@380500000");
-		match = match && qualified == dev->of_node;
-		of_node_put(qualified);
-	}
-	/* J713 has a qualified fixed table shape. */
+	qualified = of_find_node_by_path("/soc/pmp@380500000");
+	match = match && qualified == dev->of_node;
+	of_node_put(qualified);
+	/*
+	 * The tree carries the record of the consumer its PMP serves: the DISP
+	 * record, or with no display consumer the AGX record. Either will do.
+	 */
 	table = of_get_property(dev->of_node, "apple,tunable-soc-device", &size);
 	if (!match || !of_property_present(dev->of_node, "apple,tunable-soc-device") ||
-	    !cookie || !send || (j713 && !j713_disp_table(table, size)))
+	    !cookie || !send ||
+	    (!j713_agx_table(table, size) && !j713_disp_table(table, size)))
 		return NULL;
 	mutex_lock(&pmp_display_registration);
 	if (pmp_display)
@@ -267,7 +271,8 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	p->driver = dev->driver;
 	p->cookie = cookie;
 	p->send = send;
-	p->agx_table_valid = !j713 || j713_agx_table(table, size);
+	p->agx_table_valid = j713_agx_table(table, size);
+	p->disp_table_valid = j713_disp_table(table, size);
 	mutex_init(&p->request);
 	spin_lock_init(&p->lock);
 	init_completion(&p->reply);
@@ -275,8 +280,8 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	__module_get(THIS_MODULE);
 	pm_runtime_get_noresume(dev);
 	smp_store_release(&pmp_display, p);
-	dev_info(dev, "%s PMP vote bridge ready; retained existing PMP owner\n",
-		 j713 ? "J713" : "J514S");
+	dev_info(dev, "T8132 PMP vote bridge ready (%s record); retained existing PMP owner\n",
+		 !p->disp_table_valid ? "AGX" : p->agx_table_valid ? "AGX+DISP" : "DISP");
 out:
 	mutex_unlock(&pmp_display_registration);
 	return p;
@@ -312,6 +317,22 @@ bool apple_pmp_display_receive(struct apple_pmp_display *p, u8 endpoint, u64 wor
 	return true; /* This is a reply; never send an ACK for it. */
 }
 
+/*
+ * The DISP vote is the internal panel's: its consumer is the main DCP of a
+ * machine with a panel. A main DCP that is not available, or that drives a
+ * connector instead (it has apple,connector-type, as on a machine without a
+ * panel), is no DISP consumer, whatever records the PMP's table carries.
+ */
+static bool pmp_disp_consumer(void)
+{
+	struct device_node *dcp = of_find_node_by_path("dcp");
+	bool panel = dcp && of_device_is_available(dcp) &&
+		     !of_property_present(dcp, "apple,connector-type");
+
+	of_node_put(dcp);
+	return panel && apple_pmp_j713_board();
+}
+
 static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 						    enum pmp_power_kind kind)
 {
@@ -319,7 +340,7 @@ static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 	struct device_node *pmp, *supplier;
 	bool match;
 
-	if (apple_pmp_j713_board()) {
+	if (kind == PMP_POWER_AGX ? apple_pmp_t8132_retained_board() : pmp_disp_consumer()) {
 		/* Both consumers must name the exact boot-profile node. */
 		if ((kind != PMP_POWER_AGX && kind != PMP_POWER_DISP) || !consumer->of_node ||
 		    !of_device_is_compatible(consumer->of_node,
@@ -341,6 +362,8 @@ static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
 		of_node_put(supplier);
 		if (!match || (p && !p->agx_table_valid))
 			return ERR_PTR(-ENODEV);
+	} else if (p && !p->disp_table_valid) {
+		return ERR_PTR(-ENODEV);
 	}
 	return p ? p : ERR_PTR(-EPROBE_DEFER);
 }
@@ -380,7 +403,7 @@ static int pmp_power_prepare(struct device *consumer, enum pmp_power_kind kind)
 	}
 	/* Rust checks the actual drvdata type; no provider exists before full binding. */
 	p = apple_pmp_display_bound_owner(&pdev->dev);
-	if (!p || (kind == PMP_POWER_AGX && !p->agx_table_valid)) {
+	if (!p || (kind == PMP_POWER_AGX ? !p->agx_table_valid : !p->disp_table_valid)) {
 		device_link_del(link);
 		ret = -ENODEV;
 		goto out;
@@ -520,7 +543,8 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_prepare);
 
 int apple_pmp_j713_gpu_prepare(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_prepare(consumer, PMP_POWER_AGX) : -ENODEV;
+	return apple_pmp_t8132_retained_board() ?
+		pmp_power_prepare(consumer, PMP_POWER_AGX) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_prepare);
 
@@ -538,7 +562,8 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check_release);
 
 int apple_pmp_j713_gpu_check(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_AGX, false) : -ENODEV;
+	return apple_pmp_t8132_retained_board() ?
+		pmp_power_check(consumer, PMP_POWER_AGX, false) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_check);
 
@@ -556,6 +581,7 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_put);
 
 int apple_pmp_j713_gpu_get(struct device *consumer)
 {
-	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_AGX) : -ENODEV;
+	return apple_pmp_t8132_retained_board() ?
+		pmp_power_get(consumer, PMP_POWER_AGX) : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_get);
