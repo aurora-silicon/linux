@@ -10155,6 +10155,7 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.wake_last_word = GENMASK(11, 0),
 };
 
+#include "sleep-t6000.h"
 #include "sleep-t8103.h"
 #include "sleep-t8122.h"
 
@@ -10169,6 +10170,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+	{ .compatible = "apple,t6000-sleep", .data = &t6000_sleep_soc },
 	{ .compatible = "apple,t8103-sleep", .data = &t8103_sleep_soc },
 	{ .compatible = "apple,t8122-sleep", .data = &t8122_sleep_soc },
 	{ }
