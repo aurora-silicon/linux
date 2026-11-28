@@ -245,9 +245,166 @@
 	pmgr_disp: power-management@502290000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x5 0x02290000 0x0 0x4000>;
+		/* DISP_CPU's power word takes non-posted accesses (nGnRnE). */
+		nonposted-mmio;
 		#address-cells = <1>;
 		#size-cells = <1>;
 	};
+
+	t6040_sleep: sleep-controller@502888000 {
+		compatible = "apple,t6040-sleep";
+		/*
+		 * The SoC blocks the commit and wake write, all shared with
+		 * their owning drivers and touched only once no blocker remains:
+		 *   cpu-start   pmgr reg0 + 0x88000 (misc-cores): CPU start/stop
+		 *   wdt         the AON watchdog, the sleep's WD2 safety net
+		 *   cluster     0x502820000: the three CPU complexes E/P0/P1
+		 *   pwrgate     0x50282c000: wake + CPM retention voters
+		 *   spmi        0x509014000: the PMU boot-stage + NOTIFY + go-hib
+		 *   spmi-a0     0x509188000: the second SPMI NOTIFY
+		 *   mastermini  0x508900000: the S2R timer at +0x4000 (the commit)
+		 *   soc-east    0x502280000: SOC-East page, retention + east power words
+		 *   soc-ps      0x502800000: SOC page, the west axi2af power words
+		 *   wake        0x508004000: the S2R control + wake masks/status
+		 *   aop-ps      0x508304000: MiniPMGR AOP + audio island power states
+		 *   disp-dart   0x402340000: the internal display's DART
+		 *   disp-pwrgate 0x5022a1000: the internal display's power gate
+		 *   pmc-dcp     0x5048a9c14: the PMC's DCP voters
+		 *   pmc-bwr     0x5048ac020: the display pipes' bandwidth + boost enables
+		 *   keep-alive-soc, keep-alive-east: the keep-alive enables
+		 *   smc-wdt     0x508330008: the SMC's AP watchdog deadline
+		 *   agx-gate    0x508375010: MiniPMGR GPU residency gate
+		 *   s2r-count   0x508370970: MiniPMGR S2R entry counter
+		 *   gfx-ps      0x288e80100: the GPU's AFR power state
+		 *   cpu-debug   0x210010000: the cores' external debug windows
+		 *   dcs0..15    the DCS channels' power gating controls
+		 *   atc0..3-cfg the Type-C PHYs' configuration
+		 *   axi2af-*    the fabric bridges of the axi2af power domains
+		 *   apsc-*      the CPU complexes' APSC controls
+		 *   tvm-*       the voltage monitors' control and status
+		 * The handler refuses before touching any of them.
+		 */
+		reg = <0x5 0x02888000 0x0 0x20>,
+		      <0x5 0x0836c000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x20>,
+		      <0x5 0x0282c000 0x0 0x1000>,
+		      <0x5 0x09014000 0x0 0x1000>,
+		      <0x5 0x09188000 0x0 0x1000>,
+		      <0x5 0x08900000 0x0 0x8000>,
+		      <0x5 0x02280000 0x0 0xd000>,
+		      <0x5 0x02800000 0x0 0x9000>,
+		      <0x5 0x08004000 0x0 0x1000>,
+		      <0x5 0x08304000 0x0 0x160>,
+		      <0x4 0x02340000 0x0 0x1000>,
+		      <0x5 0x022a1000 0x0 0x100>,
+		      <0x5 0x048a9c14 0x0 0xc>,
+		      <0x5 0x048ac020 0x0 0x10>,
+		      <0x5 0x029dc000 0x0 0x880>,
+		      <0x5 0x022d0000 0x0 0x880>,
+		      <0x5 0x08330008 0x0 0x4>,
+		      <0x5 0x08375010 0x0 0x4>,
+		      <0x5 0x08370970 0x0 0x4>,
+		      <0x2 0x88e80100 0x0 0x4>,
+		      <0x2 0x10010000 0x0 0x3000000>,
+		      <0x2 0x20200000 0x0 0x2000>,
+		      <0x2 0x20400000 0x0 0x2000>,
+		      <0x2 0x20600000 0x0 0x2000>,
+		      <0x2 0x20800000 0x0 0x2000>,
+		      <0x2 0x22200000 0x0 0x2000>,
+		      <0x2 0x22400000 0x0 0x2000>,
+		      <0x2 0x22600000 0x0 0x2000>,
+		      <0x2 0x22800000 0x0 0x2000>,
+		      <0x2 0x24200000 0x0 0x2000>,
+		      <0x2 0x24400000 0x0 0x2000>,
+		      <0x2 0x24600000 0x0 0x2000>,
+		      <0x2 0x24800000 0x0 0x2000>,
+		      <0x2 0x26200000 0x0 0x2000>,
+		      <0x2 0x26400000 0x0 0x2000>,
+		      <0x2 0x26600000 0x0 0x2000>,
+		      <0x2 0x26800000 0x0 0x2000>,
+		      <0x3 0x83200000 0x0 0x100>,
+		      <0x3 0x8b200000 0x0 0x100>,
+		      <0x3 0x93200000 0x0 0x100>,
+		      <0x3 0x9b200000 0x0 0x100>,
+		      <0x3 0x80000000 0x0 0x200>,
+		      <0x3 0x88000000 0x0 0x200>,
+		      <0x3 0x90000000 0x0 0x200>,
+		      <0x3 0x98000000 0x0 0x200>,
+		      <0x4 0x03000000 0x0 0x200>,
+		      <0x3 0xa3000000 0x0 0x200>,
+		      <0x6 0x03000000 0x0 0x200>,
+		      <0x6 0x07000000 0x0 0x200>,
+		      <0x3 0x07000000 0x0 0x200>,
+		      <0x4 0x0b000000 0x0 0x200>,
+		      <0x2 0x80000000 0x0 0x200>,
+		      <0x2 0x82000000 0x0 0x200>,
+		      <0x2 0x84000000 0x0 0x200>,
+		      <0x4 0x86000000 0x0 0x200>,
+		      <0x4 0x16000000 0x0 0x200>,
+		      <0x2 0x10e20020 0x0 0x8>,
+		      <0x2 0x11e20020 0x0 0x8>,
+		      <0x2 0x12e20020 0x0 0x8>,
+		      <0x5 0x02920000 0x0 0x254>,
+		      <0x2 0x88e95000 0x0 0x3e4>,
+		      <0x5 0x02908000 0x0 0x254>,
+		      <0x5 0x02910000 0x0 0x254>,
+		      <0x2 0x88e94000 0x0 0x3e4>,
+		      <0x2 0x88e94400 0x0 0x3e4>,
+		      <0x5 0x02918000 0x0 0x254>,
+		      <0x5 0x02900000 0x0 0x254>;
+		reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+			    "spmi", "spmi-a0", "mastermini", "soc-east",
+			    "soc-ps", "wake", "aop-ps", "disp-dart",
+			    "disp-pwrgate", "pmc-dcp", "pmc-bwr",
+			    "keep-alive-soc", "keep-alive-east", "smc-wdt",
+			    "agx-gate", "s2r-count", "gfx-ps", "cpu-debug",
+			    "dcs0", "dcs1", "dcs2", "dcs3", "dcs4", "dcs5",
+			    "dcs6", "dcs7", "dcs8", "dcs9", "dcs10", "dcs11",
+			    "dcs12", "dcs13", "dcs14", "dcs15", "atc0-cfg",
+			    "atc1-cfg", "atc2-cfg", "atc3-cfg",
+			    "axi2af-atc0-common", "axi2af-atc1-common",
+			    "axi2af-atc2-common", "axi2af-atc3-common",
+			    "axi2af-disp-sys", "axi2af-dispext0-sys",
+			    "axi2af-dispext1-sys", "axi2af-dispext2-sys",
+			    "axi2af-dispext3-sys", "axi2af-ans",
+			    "axi2af-avd-sys", "axi2af-venc0-sys",
+			    "axi2af-venc1-sys", "axi2af-jpg",
+			    "axi2af-apcie-sys-gp", "apsc-e", "apsc-p0",
+			    "apsc-p1", "tvm-disp2", "tvm-afr", "tvm-dcs0",
+			    "tvm-dcs1", "tvm-gfx0", "tvm-gfx1", "tvm-disp",
+			    "tvm-soc";
+		/*
+		 * The power states that must be off before a sleep: per
+		 * display pipe its CPU and its last sub-block, 8 bytes apart.
+		 */
+		apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>, <&pmgr_aux 0x350 0x388>,
+					  <&pmgr_aux 0x4a0 0x4d8>, <&pmgr_aux 0x4f0 0x528>,
+					  <&pmgr_aux 0x2e8 0x320>;
+		apple,check-ps-b4-sleep-names = "disp", "dispext0", "dispext1", "dispext2",
+						"dispext3";
+		/*
+		 * apple,apcie, for the sleep of ANS's storage PCIe link (two ST lanes
+		 * and a shared PHY), comes from the boot loader. It adds
+		 * the node here and puts the axi2af, cio3pll, clkgen,
+		 * phy-block and phy-ip windows and the apple,tunable-* arrays on the
+		 * internal PCIe host (apple,t6020-pcie, the one with an "rc"
+		 * reg-name), in the single-lane T8140 shape. It leaves a node that
+		 * already has apple,apcie alone, so this tree must give neither
+		 * apple,apcie nor an apcie-storage node. Without it a sleep with ANS
+		 * stopped is refused, and suspend-to-idle stays the default. The ST
+		 * power words (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) are in
+		 * SOC-East and are driven through the soc-east window.
+		 */
+		apple,pinctrl = <&pinctrl>;
+		apple,pinctrl-skip-pins = <190 191 192>;
+		/* Only on a board whose sleep has been tested. */
+		status = "disabled";
+	};
+};
+
+&pmp {
+	/* The PMP firmware's SRAM kept over a sleep: offset, size */
+	apple,sram-keep = <0x61000 0x7d000>;
 };
 
 &pmc {
@@ -589,6 +746,60 @@
 };
 
 #include "t6040-pmgr.dtsi"
+
+/* Display power words and chains: two external pipes, not T6041's four. */
+/ {
+	dcp_power: display-power@5048a9c14 {
+		compatible = "apple,t6040-display-power", "apple,t6041-display-power";
+		reg = <0x5 0x048a9c14 0x0 0x8>,
+		      <0x5 0x022a1000 0x0 0x100>,
+		      <0x5 0x0282d000 0x0 0x1000>,
+		      <0x5 0x00578000 0x0 0x1000>,
+		      <0x4 0x03000100 0x0 0x10>;
+		reg-names = "pmc-dcp", "pwrgate", "pwrgate-aux", "gapf", "axi2af";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		chain@0 {
+			reg = <0>;
+			label = "ext1";
+			apple,pwrgate-aux;
+			apple,gapf-offset = <0xd00>;
+			apple,pwrgate-offsets = <0x6b4 0x6d8>;
+			power-domains = <&ps_dispext1_sys>, <&ps_dispext1_fe>, <&ps_dispext1_cpu>,
+					<&ps_dispext1_dbe>, <&ps_dpext1>, <&ps_dispext1_gp0>,
+					<&ps_dispext1_gp1>, <&ps_dispext1_gpl>, <&ps_dispext1_ppp>,
+					<&ps_dispext1_dsc>;
+		};
+
+		chain@1 {
+			reg = <1>;
+			label = "ext0";
+			apple,pwrgate-aux;
+			apple,gapf-offset = <0x840>;
+			apple,pwrgate-offsets = <0x234 0x258>;
+			power-domains = <&ps_dispext0_sys>, <&ps_dispext0_fe>, <&ps_dispext0_cpu>,
+					<&ps_dispext0_dbe>, <&ps_dpext0>, <&ps_dispext0_gp0>,
+					<&ps_dispext0_gp1>, <&ps_dispext0_gpl>, <&ps_dispext0_ppp>,
+					<&ps_dispext0_dsc>;
+		};
+
+		chain@2 {
+			reg = <2>;
+			label = "main";
+			apple,main-chain;
+			apple,gapf-offset = <0x540>;
+			apple,pwrgate-offsets = <0x1c 0x60>;
+			apple,fabric-domain = <&ps_fab6_soc>;
+			power-domains = <&ps_disp_sys>, <&ps_disp_fe>, <&ps_disp_cpu>,
+					<&ps_disp_spi>, <&ps_disp_spmi>, <&ps_disp_dbe>,
+					<&ps_disp_dp>, <&ps_disp_gp0>, <&ps_disp_gp1>,
+					<&ps_disp_gpl>, <&ps_disp_cmb>, <&ps_disp_ppp>,
+					<&ps_disp_brc>, <&ps_disp_blc>;
+		};
+	};
+};
+
 #include "t6040-peripherals.dtsi"
 
 /*
@@ -697,6 +908,23 @@
 				     0x226004000 0x2261d62fc
 				     0x504824000 0x504824004
 				     0x5003c0000 0x5003e4000>;
+};
+
+/ {
+	/*
+	 * disp0's first clock in the boot loader's device tree, as on T6041. The
+	 * DCP firmware checks a mode's pixel clock against it.
+	 */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "disp0";
+	};
+};
+
+&dcp {
+	clocks = <&clk_disp0>;
 };
 
 /*

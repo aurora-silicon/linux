@@ -29,6 +29,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/compiler.h>
+#include <linux/cacheflush.h>
 #include <linux/ktime.h>
 #include <linux/set_memory.h>
 
@@ -2750,6 +2751,36 @@ static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
 	return pbe->address;
 }
 
+#ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
+/*
+ * Most image pages are loaded straight into their original frames through
+ * the cacheable linear map (only conflicting pages go through restore_pblist,
+ * whose copy cleans them). Where devices read memory without snooping the CPU
+ * caches, a later eviction of a dirty line would overwrite what a device wrote
+ * since: let the architecture clean each such page once it is complete, while
+ * the loader still waits for the next one, rather than all of them in a pass
+ * after the load.
+ */
+static unsigned long nr_cleaned_pages;
+
+static void swsusp_clean_loaded_page(void *addr)
+{
+	unsigned long pfn = memory_bm_get_current(&orig_bm);
+
+	if (addr == page_address(pfn_to_page(pfn)))
+		nr_cleaned_pages += arch_hibernate_clean_image_page(pfn);
+}
+
+static void swsusp_clean_report(void)
+{
+	pr_debug("%lu image pages cleaned as they were loaded\n", nr_cleaned_pages);
+	nr_cleaned_pages = 0;
+}
+#else
+static inline void swsusp_clean_loaded_page(void *addr) {}
+static inline void swsusp_clean_report(void) {}
+#endif
+
 /**
  * snapshot_write_next - Get the address to store the next image page.
  * @handle: Snapshot handle structure to guide the writing.
@@ -2824,6 +2855,7 @@ next:
 		}
 	} else {
 		copy_last_highmem_page();
+		swsusp_clean_loaded_page(handle->buffer);
 		error = hibernate_restore_protect_page(handle->buffer);
 		if (error)
 			return error;
@@ -2854,6 +2886,7 @@ next:
  */
 int snapshot_write_finalize(struct snapshot_handle *handle)
 {
+	bool loaded;
 	int error;
 
 	/*
@@ -2867,10 +2900,15 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
 		if (error)
 			return error > 0 ? -ENODATA : error;
 	}
+	loaded = handle->cur > 1 && handle->cur > nr_meta_pages + nr_copy_pages + nr_zero_pages;
 	copy_last_highmem_page();
+	/* while orig_bm still points at the last page: recycling overwrites it */
+	if (loaded)
+		swsusp_clean_loaded_page(handle->buffer);
 	error = hibernate_restore_protect_page(handle->buffer);
 	/* Do that only if we have loaded the image entirely */
-	if (handle->cur > 1 && handle->cur > nr_meta_pages + nr_copy_pages + nr_zero_pages) {
+	if (loaded) {
+		swsusp_clean_report();
 		memory_bm_recycle(&orig_bm);
 		free_highmem_data();
 	}

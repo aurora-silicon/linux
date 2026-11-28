@@ -72,6 +72,14 @@ struct cpumask;
 
 #ifdef CONFIG_HOTPLUG_CPU
 int spin_table_set_power_ops(const struct spin_table_power_ops *ops);
+#ifdef CONFIG_HIBERNATION
+extern char spin_table_hibernate_pen[];
+extern const struct cpu_operations smp_rvbar_spin_table_ops;
+int spin_table_hibernate_pen_begin(phys_addr_t image_ttbr1, int primary);
+void spin_table_hibernate_pen_end(bool frozen);
+void spin_table_hibernate_restored(void);
+bool spin_table_hibernate_cpus_stuck(void);
+#endif
 int spin_table_hold_parked(void);
 void spin_table_unhold_parked(void);
 int spin_table_stop_parked(void);
@@ -112,6 +120,21 @@ static inline bool spin_table_cpu_tracked_off(unsigned int cpu)
 }
 
 static inline bool spin_table_cpus_stuck(void)
+{
+	return false;
+}
+#endif
+
+#if !defined(CONFIG_HOTPLUG_CPU) || !defined(CONFIG_HIBERNATION)
+static inline int spin_table_hibernate_pen_begin(phys_addr_t image_ttbr1, int primary)
+{
+	return 0;
+}
+
+static inline void spin_table_hibernate_pen_end(bool frozen) {}
+static inline void spin_table_hibernate_restored(void) {}
+
+static inline bool spin_table_hibernate_cpus_stuck(void)
 {
 	return false;
 }

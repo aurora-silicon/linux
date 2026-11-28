@@ -13,6 +13,7 @@ pre = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 typedef uint64_t dma_addr_t;
 #define DCP_FIRMWARE_H17P 1
@@ -23,10 +24,14 @@ typedef uint64_t dma_addr_t;
 #define IOMFB_ENDPOINT 0x20
 #define DCP_SHMEM_SIZE 1
 #define GFP_KERNEL 0
+#define IS_ENABLED(x) 1
+#define READ_ONCE(x) (x)
+#define wmb() ((void)0)
+enum { DCP_HIB_NONE, DCP_HIB_RESTARTING };
 struct apple_dcp { int fw_compat; struct {int iomfb_method_profile;} hw;
  struct {int lock; bool active, scanout, stopped;} iomfb;
- void *rtk, *shmem, *dev; bool ext; };
-static int alloc_calls, iomfb_calls, fail_ep;
+ void *rtk, *shmem, *dev; bool ext; int hib_phase; dma_addr_t shmem_iova; };
+static int alloc_calls, iomfb_calls, fail_ep, dma_allocs, cleans;
 /* Firmware 27 lists the endpoints it uses; whether that list has the allocator. */
 static bool alloc_advertised;
 static bool apple_rtkit_has_endpoint(void *r, int ep) {return ep!=REMOTE_ALLOC_ENDPOINT || alloc_advertised;}
@@ -40,7 +45,9 @@ static int apple_rtkit_start_ep(void *r, int ep) {
  if(ep==REMOTE_ALLOC_ENDPOINT) alloc_calls++; else iomfb_calls++;
  return 0;
 }
-static void *dma_alloc_coherent(void *d,int n,dma_addr_t *a,int flags) {*a=0; return (void *)1;}
+static char arena[DCP_SHMEM_SIZE];
+static void *dma_alloc_coherent(void *d,int n,dma_addr_t *a,int flags) {*a=0x1000; dma_allocs++; return arena;}
+static void iomfb_hib_clean_shmem(struct apple_dcp *d) {cleans++;}
 static int dcpep_set_shmem(dma_addr_t a) {return 0;}
 static void dcp_send_message(struct apple_dcp *d,int ep,int m) {}
 '''
@@ -57,6 +64,9 @@ int main(void) {
   /* The native26 map has no allocator: it must still start IOMFB. */
   if(ext) { fail_ep=REMOTE_ALLOC_ENDPOINT;assert(!iomfb_start_rtkit(&d)); }
   if(alloc) { fail_ep=REMOTE_ALLOC_ENDPOINT;assert(iomfb_start_rtkit(&d)==-EINVAL); }
+  /* A firmware restarted after a resume from disk gets the restored arena back, cleared. */
+  fail_ep=-1;dma_allocs=cleans=0;arena[0]=1;d.hib_phase=DCP_HIB_RESTARTING;d.shmem=arena;d.shmem_iova=0x1000;
+  assert(!iomfb_start_rtkit(&d));assert(!dma_allocs && cleans==1 && !arena[0] && d.shmem==arena);
  }
  return 0;
 }

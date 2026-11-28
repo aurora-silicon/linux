@@ -2689,6 +2689,10 @@ config ARCH_HIBERNATION_HEADER
 	def_bool y
 	depends on HIBERNATION
 
+config ARCH_HIBERNATION_CLEAN_IMAGE
+	def_bool y
+	depends on HIBERNATION
+
 config ARCH_SUSPEND_POSSIBLE
 	def_bool y
 

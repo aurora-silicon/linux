@@ -38,6 +38,19 @@
 #define MCC_MAX_PLANES		64
 #define MCC_FLUSH_TIMEOUT_US	100000
 
+/* What sets an SoC's cache controller apart. */
+struct apple_mcc_hw {
+	/* T8122, T8132: the enabled cache is retained until a dirty-data drain is qualified. */
+	bool retained;
+	/* A deep sleep also turns the ways off, and the wake puts the boot's way count back. */
+	bool ways_off;
+};
+
+static const struct apple_mcc_hw apple_mcc_t8132_hw = { .retained = true };
+static const struct apple_mcc_hw apple_mcc_t8140_hw = { };
+/* T8142 and T6041 have no skip-mcc-off-to-s2r: the ways go off for a deep sleep. */
+static const struct apple_mcc_hw apple_mcc_ways_off_hw = { .ways_off = true };
+
 struct apple_mcc {
 	struct device *dev;
 	void __iomem *planes[MCC_MAX_PLANES];
@@ -45,8 +58,8 @@ struct apple_mcc {
 	bool enabled;
 	bool retained;
 	/*
-	 * T8142: a deep sleep also turns the cache's ways off, as AppleT8142MCC's sleep action
-	 * does, and the wake puts the boot's way count back.
+	 * T8142 and T6041: a deep sleep also turns the cache's ways off, where no
+	 * skip-mcc-off-to-s2r is set, and the wake puts the boot's way count back.
 	 */
 	bool ways_off;
 	u32 ways;
@@ -366,6 +379,7 @@ static void apple_mcc_boot_dma_lost(struct apple_mcc_boot_dma_consumer *consumer
 static int apple_mcc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_mcc_hw *hw;
 	struct apple_mcc *mcc;
 	int ret;
 
@@ -373,13 +387,16 @@ static int apple_mcc_probe(struct platform_device *pdev)
 	if (!mcc)
 		return -ENOMEM;
 
+	hw = of_device_get_match_data(dev);
+	if (!hw)
+		return -ENODEV;
+
 	mcc->dev = dev;
 	INIT_LIST_HEAD(&mcc->boot_dma.link);
 	mcc->boot_dma.dev = dev;
 	mcc->boot_dma.lost = apple_mcc_boot_dma_lost;
-	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8122-mcc") ||
-			of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
-	mcc->ways_off = of_device_is_compatible(dev->of_node, "apple,t8142-mcc");
+	mcc->retained = hw->retained;
+	mcc->ways_off = hw->ways_off;
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
 
@@ -476,7 +493,7 @@ static int apple_mcc_suspend_locked(struct device *dev)
 		return 0;
 	apple_mcc_quiesce(mcc);
 	/*
-	 * T8142 has no skip-mcc-off-to-s2r (only T8140's J700 does), so macOS turns the ways
+	 * T8142 and T6041 have no skip-mcc-off-to-s2r (T8140's J700 does), so the ways are turned
 	 * off before the sleep: way count 0. The flush above (the kext's own cacheFlush) has
 	 * written everything back already, so a timeout here loses nothing and only leaves
 	 * the ways as they were.
@@ -539,11 +556,12 @@ static const struct dev_pm_ops apple_mcc_pm_ops = {
 };
 
 static const struct of_device_id apple_mcc_of_match[] = {
-	{ .compatible = "apple,t8122-mcc" },
-	{ .compatible = "apple,t8132-mcc" },
-	{ .compatible = "apple,t8140-mcc" },
-	{ .compatible = "apple,t8142-mcc" },
-	{ .compatible = "apple,t6050-mcc" },
+	{ .compatible = "apple,t8122-mcc", .data = &apple_mcc_t8132_hw },
+	{ .compatible = "apple,t8132-mcc", .data = &apple_mcc_t8132_hw },
+	{ .compatible = "apple,t8142-mcc", .data = &apple_mcc_ways_off_hw },
+	{ .compatible = "apple,t6041-mcc", .data = &apple_mcc_ways_off_hw },
+	{ .compatible = "apple,t8140-mcc", .data = &apple_mcc_t8140_hw },
+	{ .compatible = "apple,t6050-mcc", .data = &apple_mcc_t8140_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_mcc_of_match);

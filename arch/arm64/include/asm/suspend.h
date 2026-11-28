@@ -48,6 +48,38 @@ int swsusp_arch_resume(void);
 int arch_hibernation_header_save(void *addr, unsigned int max_size);
 int arch_hibernation_header_restore(void *addr);
 
+/**
+ * struct arm64_hibernate_layout - What a platform adds to the boot layout check.
+ * @ex: Ranges that this boot keeps out of the image and that the layout check
+ *	leaves out of the memory it compares, in ascending order.
+ * @nex: Number of valid entries in @ex.
+ * @have_base: Whether CPU release addresses are compared as offsets from @base.
+ * @base: Base address for the release addresses, if @have_base.
+ */
+struct arm64_hibernate_layout {
+	u64 ex[2][2];
+	int nex;
+	bool have_base;
+	u64 base;
+};
+
+/**
+ * struct arm64_hibernate_platform - Platform hooks of arm64 hibernation.
+ * @pfn_nosave: Whether the platform keeps page frame @pfn out of the image.
+ * @layout: Mix the platform's boot facts into the layout cookie in @h with
+ *	arm64_hibernate_layout_mix(), fill @lay, and return the new hash. The
+ *	cookie is stored with an image and compared before it is restored: the
+ *	boot that resumes an image must give the kernel the layout of the boot
+ *	that wrote it.
+ */
+struct arm64_hibernate_platform {
+	bool (*pfn_nosave)(unsigned long pfn);
+	u64 (*layout)(u64 h, struct arm64_hibernate_layout *lay);
+};
+
+void arm64_hibernate_set_platform(const struct arm64_hibernate_platform *platform);
+u64 arm64_hibernate_layout_mix(u64 h, const void *p, size_t len);
+
 /* Used to resume on the CPU we hibernated on */
 int hibernate_resume_nonboot_cpu_disable(void);
 

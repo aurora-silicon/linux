@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6040-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6040 system sleep controls
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  The registers a kernel running directly at EL2 on an Apple SoC writes to enter
+  and return from suspend-to-RAM and to power its secondary CPUs off. They belong
+  to several hardware blocks, some of which other drivers also use, so this node
+  overlaps those drivers' register ranges and the driver does not claim them.
+
+  On the T6040 the sleep engine waits for the display pipes, so the node lists
+  the power states that have to be off before a sleep. Each entry names a PMGR
+  register block,
+  the offset of a display pipe's CPU power state and the offset of its last
+  sub-block; the states in between are 8 bytes apart. All of the T6040's
+  register blocks are needed to enter a suspend and to undo it.
+
+properties:
+  compatible:
+    const: apple,t6040-sleep
+
+  reg:
+    items:
+      - description: CPU start/stop block (pmgr + 0x88000)
+      - description: AON watchdog
+      - description: control words of the three CPU complexes
+      - description: SoC power gate, wake and retention voters
+      - description: SPMI controller of the PMU (boot stage, notify, hibernate)
+      - description: second SPMI controller's notify word
+      - description: MasterMini block with the S2R timer
+      - description: SOC-East page with retention, fabric, DCS, SIO and other power words
+      - description: SOC page with the west axi2af, ATC, fabric and DCS power words
+      - description: AOP global block, S2R control and wake masks
+      - description: MiniPMGR power states of the AOP and its audio island
+      - description: internal display's DART, for its transaction idle wait
+      - description: internal display's power gate controls
+      - description: PMC voters of the display coprocessors
+      - description: PMC bandwidth request and boost enables of the display pipes
+      - description: keep-alive enables in the SOC PMGR
+      - description: keep-alive enables in the SOC-East PMGR
+      - description: SMC's AP watchdog deadline
+      - description: MiniPMGR GPU residency gate
+      - description: MiniPMGR S2R entry counter
+      - description: GPU AFR power state
+      - description: external debug windows of the CPU cores
+      - description: power gating controls of DCS 0, channel 0
+      - description: power gating controls of DCS 0, channel 1
+      - description: power gating controls of DCS 0, channel 2
+      - description: power gating controls of DCS 0, channel 3
+      - description: power gating controls of DCS 1, channel 0
+      - description: power gating controls of DCS 1, channel 1
+      - description: power gating controls of DCS 1, channel 2
+      - description: power gating controls of DCS 1, channel 3
+      - description: power gating controls of DCS 2, channel 0
+      - description: power gating controls of DCS 2, channel 1
+      - description: power gating controls of DCS 2, channel 2
+      - description: power gating controls of DCS 2, channel 3
+      - description: power gating controls of DCS 3, channel 0
+      - description: power gating controls of DCS 3, channel 1
+      - description: power gating controls of DCS 3, channel 2
+      - description: power gating controls of DCS 3, channel 3
+      - description: configuration of Type-C PHY 0
+      - description: configuration of Type-C PHY 1
+      - description: configuration of Type-C PHY 2
+      - description: configuration of Type-C PHY 3
+      - description: fabric bridge of the atc0-common power domain
+      - description: fabric bridge of the atc1-common power domain
+      - description: fabric bridge of the atc2-common power domain
+      - description: fabric bridge of the atc3-common power domain
+      - description: fabric bridge of the disp-sys power domain
+      - description: fabric bridge of the dispext0-sys power domain
+      - description: fabric bridge of the dispext1-sys power domain
+      - description: fabric bridge of the dispext2-sys power domain
+      - description: fabric bridge of the dispext3-sys power domain
+      - description: fabric bridge of the ans power domain
+      - description: fabric bridge of the avd-sys power domain
+      - description: fabric bridge of the venc0-sys power domain
+      - description: fabric bridge of the venc1-sys power domain
+      - description: fabric bridge of the jpg power domain
+      - description: fabric bridge of the apcie-sys-gp power domain
+      - description: APSC control of the E CPU complex
+      - description: APSC control of the P0 CPU complex
+      - description: APSC control of the P1 CPU complex
+      - description: disp2 voltage monitor control and status
+      - description: afr voltage monitor control and status
+      - description: dcs0 voltage monitor control and status
+      - description: dcs1 voltage monitor control and status
+      - description: gfx0 voltage monitor control and status
+      - description: gfx1 voltage monitor control and status
+      - description: disp voltage monitor control and status
+      - description: soc voltage monitor control and status
+
+  reg-names:
+    items:
+      - const: cpu-start
+      - const: wdt
+      - const: cluster
+      - const: pwrgate
+      - const: spmi
+      - const: spmi-a0
+      - const: mastermini
+      - const: soc-east
+      - const: soc-ps
+      - const: wake
+      - const: aop-ps
+      - const: disp-dart
+      - const: disp-pwrgate
+      - const: pmc-dcp
+      - const: pmc-bwr
+      - const: keep-alive-soc
+      - const: keep-alive-east
+      - const: smc-wdt
+      - const: agx-gate
+      - const: s2r-count
+      - const: gfx-ps
+      - const: cpu-debug
+      - const: dcs0
+      - const: dcs1
+      - const: dcs2
+      - const: dcs3
+      - const: dcs4
+      - const: dcs5
+      - const: dcs6
+      - const: dcs7
+      - const: dcs8
+      - const: dcs9
+      - const: dcs10
+      - const: dcs11
+      - const: dcs12
+      - const: dcs13
+      - const: dcs14
+      - const: dcs15
+      - const: atc0-cfg
+      - const: atc1-cfg
+      - const: atc2-cfg
+      - const: atc3-cfg
+      - const: axi2af-atc0-common
+      - const: axi2af-atc1-common
+      - const: axi2af-atc2-common
+      - const: axi2af-atc3-common
+      - const: axi2af-disp-sys
+      - const: axi2af-dispext0-sys
+      - const: axi2af-dispext1-sys
+      - const: axi2af-dispext2-sys
+      - const: axi2af-dispext3-sys
+      - const: axi2af-ans
+      - const: axi2af-avd-sys
+      - const: axi2af-venc0-sys
+      - const: axi2af-venc1-sys
+      - const: axi2af-jpg
+      - const: axi2af-apcie-sys-gp
+      - const: apsc-e
+      - const: apsc-p0
+      - const: apsc-p1
+      - const: tvm-disp2
+      - const: tvm-afr
+      - const: tvm-dcs0
+      - const: tvm-dcs1
+      - const: tvm-gfx0
+      - const: tvm-gfx1
+      - const: tvm-disp
+      - const: tvm-soc
+
+  apple,apcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose shared registers and tunables the storage controller's
+      link depends on. They are needed even with that host disabled. The boot
+      loader adds it, with those registers and tunables on the host's node;
+      without it the storage controller can't be stopped for a sleep.
+
+  apple,gp-pcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The general-purpose PCIe host. Its port and PHY windows are needed even
+      with that host disabled, and the reset pins of its ports' endpoints
+      when it is enabled.
+
+  apple,check-ps-b4-sleep:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The display pipes whose power states have to be off before a sleep, one
+      entry per pipe.
+    items:
+      items:
+        - description: PMGR syscon
+        - description: offset of the pipe's CPU power state
+        - description: offset of its last sub-block's power state
+
+  apple,check-ps-b4-sleep-names:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description: One name per apple,check-ps-b4-sleep entry.
+
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The AP pin controller, whose pins a deep sleep resets.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Pins neither saved nor restored.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,check-ps-b4-sleep
+  - apple,check-ps-b4-sleep-names
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        sleep-controller@502888000 {
+            compatible = "apple,t6040-sleep";
+            reg = <0x5 0x02888000 0x0 0x20>,
+                  <0x5 0x0836c000 0x0 0x4000>,
+                  <0x5 0x02820000 0x0 0x20>,
+                  <0x5 0x0282c000 0x0 0x1000>,
+                  <0x5 0x09014000 0x0 0x1000>,
+                  <0x5 0x09188000 0x0 0x1000>,
+                  <0x5 0x08900000 0x0 0x8000>,
+                  <0x5 0x02280000 0x0 0xd000>,
+                  <0x5 0x02800000 0x0 0x9000>,
+                  <0x5 0x08004000 0x0 0x1000>,
+                  <0x5 0x08304000 0x0 0x160>,
+                  <0x4 0x02340000 0x0 0x1000>,
+                  <0x5 0x022a1000 0x0 0x100>,
+                  <0x5 0x048a9c14 0x0 0xc>,
+                  <0x5 0x048ac020 0x0 0x10>,
+                  <0x5 0x029dc000 0x0 0x880>,
+                  <0x5 0x022d0000 0x0 0x880>,
+                  <0x5 0x08330008 0x0 0x4>,
+                  <0x5 0x08375010 0x0 0x4>,
+                  <0x5 0x08370970 0x0 0x4>,
+                  <0x2 0x88e80100 0x0 0x4>,
+                  <0x2 0x10010000 0x0 0x3000000>,
+                  <0x2 0x20200000 0x0 0x2000>,
+                  <0x2 0x20400000 0x0 0x2000>,
+                  <0x2 0x20600000 0x0 0x2000>,
+                  <0x2 0x20800000 0x0 0x2000>,
+                  <0x2 0x22200000 0x0 0x2000>,
+                  <0x2 0x22400000 0x0 0x2000>,
+                  <0x2 0x22600000 0x0 0x2000>,
+                  <0x2 0x22800000 0x0 0x2000>,
+                  <0x2 0x24200000 0x0 0x2000>,
+                  <0x2 0x24400000 0x0 0x2000>,
+                  <0x2 0x24600000 0x0 0x2000>,
+                  <0x2 0x24800000 0x0 0x2000>,
+                  <0x2 0x26200000 0x0 0x2000>,
+                  <0x2 0x26400000 0x0 0x2000>,
+                  <0x2 0x26600000 0x0 0x2000>,
+                  <0x2 0x26800000 0x0 0x2000>,
+                  <0x3 0x83200000 0x0 0x100>,
+                  <0x3 0x8b200000 0x0 0x100>,
+                  <0x3 0x93200000 0x0 0x100>,
+                  <0x3 0x9b200000 0x0 0x100>,
+                  <0x3 0x80000000 0x0 0x200>,
+                  <0x3 0x88000000 0x0 0x200>,
+                  <0x3 0x90000000 0x0 0x200>,
+                  <0x3 0x98000000 0x0 0x200>,
+                  <0x4 0x03000000 0x0 0x200>,
+                  <0x3 0xa3000000 0x0 0x200>,
+                  <0x6 0x03000000 0x0 0x200>,
+                  <0x6 0x07000000 0x0 0x200>,
+                  <0x3 0x07000000 0x0 0x200>,
+                  <0x4 0x0b000000 0x0 0x200>,
+                  <0x2 0x80000000 0x0 0x200>,
+                  <0x2 0x82000000 0x0 0x200>,
+                  <0x2 0x84000000 0x0 0x200>,
+                  <0x4 0x86000000 0x0 0x200>,
+                  <0x4 0x16000000 0x0 0x200>,
+                  <0x2 0x10e20020 0x0 0x8>,
+                  <0x2 0x11e20020 0x0 0x8>,
+                  <0x2 0x12e20020 0x0 0x8>,
+                  <0x5 0x02920000 0x0 0x254>,
+                  <0x2 0x88e95000 0x0 0x3e4>,
+                  <0x5 0x02908000 0x0 0x254>,
+                  <0x5 0x02910000 0x0 0x254>,
+                  <0x2 0x88e94000 0x0 0x3e4>,
+                  <0x2 0x88e94400 0x0 0x3e4>,
+                  <0x5 0x02918000 0x0 0x254>,
+                  <0x5 0x02900000 0x0 0x254>;
+            reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+                        "spmi", "spmi-a0", "mastermini", "soc-east",
+                        "soc-ps", "wake", "aop-ps", "disp-dart",
+                        "disp-pwrgate", "pmc-dcp", "pmc-bwr",
+                        "keep-alive-soc", "keep-alive-east", "smc-wdt",
+                        "agx-gate", "s2r-count", "gfx-ps", "cpu-debug",
+                        "dcs0", "dcs1", "dcs2", "dcs3", "dcs4", "dcs5",
+                        "dcs6", "dcs7", "dcs8", "dcs9", "dcs10", "dcs11",
+                        "dcs12", "dcs13", "dcs14", "dcs15", "atc0-cfg",
+                        "atc1-cfg", "atc2-cfg", "atc3-cfg",
+                        "axi2af-atc0-common", "axi2af-atc1-common",
+                        "axi2af-atc2-common", "axi2af-atc3-common",
+                        "axi2af-disp-sys", "axi2af-dispext0-sys",
+                        "axi2af-dispext1-sys", "axi2af-dispext2-sys",
+                        "axi2af-dispext3-sys", "axi2af-ans", "axi2af-avd-sys",
+                        "axi2af-venc0-sys", "axi2af-venc1-sys", "axi2af-jpg",
+                        "axi2af-apcie-sys-gp", "apsc-e", "apsc-p0", "apsc-p1",
+                        "tvm-disp2", "tvm-afr", "tvm-dcs0", "tvm-dcs1",
+                        "tvm-gfx0", "tvm-gfx1", "tvm-disp", "tvm-soc";
+            apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
+            apple,check-ps-b4-sleep-names = "disp";
+        };
+    };

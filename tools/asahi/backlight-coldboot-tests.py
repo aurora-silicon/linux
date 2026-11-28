@@ -71,7 +71,7 @@ struct apple_dcp {
  struct desktop *desktop;
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
- bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
+ bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing,t6040_relinking;
  bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
@@ -98,6 +98,7 @@ static bool dcp_is_external_h17p(struct apple_dcp *p) { return p->external; }
 /* These fixtures exercise the internal panel and the H17P external path. */
 static bool dcp_is_ext26(struct apple_dcp *p) { (void)p;return false; }
 static bool dcp_is_retained_external(struct apple_dcp *p) { return dcp_is_external_h17p(p); }
+static bool dcp_hib_gated(const struct apple_dcp *p) { (void)p;return false; }
 static void flush_work(struct work_struct *p) { (void)p;assert(!"unexpected native26 work flush"); }
 static bool dcp_is_typec_output(struct apple_dcp *p) { return p->typec; }
 static bool dcp_h17g_panel(struct apple_dcp *p) { return p->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17G; }
@@ -184,7 +185,10 @@ int main(void)
  /* The distinct M4 path retains its original ENODATA/error behavior. */
  struct apple_dcp d=fresh(DCP_FIRMWARE_V_27_0);struct platform_device p={&d};d.m4=true;
  dcp_poweron(&p);assert(dpms_calls==1 && warnings==1 && !d.backlight.state.ready);
- puts("coldboot/late-hint/fallback, ready restore, error and M4 callback paths PASS");
+ /* A pipe whose link work after a sleep is still running stays off. */
+ d=fresh(DCP_FIRMWARE_H17P);p.data=&d;d.t6040_relinking=true;
+ dcp_poweron(&p);assert(!d.pipe_enabled_h17p && !powers && !dpms_calls && !fallbacks);
+ puts("coldboot/late-hint/fallback, ready restore, error, M4 and relinking callback paths PASS");
 }
 '''
 

@@ -67,6 +67,7 @@ bool dcp_sleep_keeps_firmware(struct device *dev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
+bool dcp_external_pipe_off(struct platform_device *pdev);
 int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		      const void *data, size_t size, void *reply, size_t reply_size);
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
@@ -174,6 +175,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev);
 int dcp_t6041_s2r_all(bool start);
+bool dcp_t6040_relinks(void);
+void dcp_t6041_hib_restore(void);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_ext26_start(struct apple_dcp *dcp);
@@ -209,6 +212,7 @@ void dcp_hdmi_disconnect(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
 void dcp_hdmi_yield_link(struct apple_dcp *dcp);
 void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+void dcp_t6040_plug_done(struct apple_dcp *dcp, bool plug);
 
 /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
 struct dptx_port;

@@ -277,6 +277,8 @@ struct dcp_t6041_chain {
 	void __iomem **domains;
 	u32 *child_saved;
 	unsigned int num_domains;
+	/* T6040: an external chain's child_saved holds what its stop found */
+	bool child_valid;
 };
 
 /*
@@ -296,6 +298,8 @@ struct dcp_t6041_power {
 	bool child_valid;
 	u32 boot_ps[3];
 	bool boot_ps_valid;
+	/* apple,t6040-display-power: the external DCPs are restarted after the wake */
+	bool t6040;
 };
 
 /*
@@ -681,6 +685,22 @@ struct apple_dcp {
 	bool ext_dead;
 	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
 	bool t6041_ext_seen;
+	/* T6040 S2R: this external DCP's link set up again once its firmware is back */
+	struct work_struct t6040_link_work;
+	/*
+	 * T6040 S2R: an external display's link work is through once the firmware reports the
+	 * display plugged again; this bounds the wait for that.
+	 */
+	struct delayed_work t6040_plug_wq;
+	/* T6040 S2R: the link work waits for the firmware's plug of the display. */
+	bool t6040_plug_wait;
+	/*
+	 * T6040 S2R: from this external DCP's stop until its link work is through, the DRM
+	 * entry points leave its firmware alone (see dcp_t6040_ext_link_down()).
+	 */
+	bool t6040_relinking;
+	/* T6040 S2R: the fixed HDMI output's DP PHY was given back for the sleep. */
+	bool t6040_fixed_phy_off;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -1021,6 +1041,11 @@ struct apple_dcp {
 	struct completion s2r_dart_done;
 	int s2r_dart_err;
 	struct completion s2r_hpd_done;
+	/* Woken when a channel's call depth or the pending ACKs fall. */
+	wait_queue_head_t channels_idle_wq;
+	/* Shown swap completions and the last one's id, for the commit after a wake. */
+	atomic_t shown_swaps;
+	u32 shown_swap_id;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
@@ -1307,6 +1332,17 @@ struct apple_dcp {
 	struct delayed_work link_recovery_wq;
 	unsigned int link_recovery_tries;
 	unsigned int link_recovery_snap;
+	/*
+	 * Kernel retrains of an active CRTC from the hotplug worker in the
+	 * current window (dcp_hotplug_retrain_allowed()): a sink that answers
+	 * every retrain with IRQ_HPD would otherwise loop forever.
+	 */
+	unsigned long hotplug_retrain_since;
+	unsigned long hotplug_disconnect_at;
+	unsigned int hotplug_retrains;
+	bool hotplug_retrain_stopped;
+	/* One retrain at the end of a stopped window, see dcp_hotplug(). */
+	struct delayed_work hotplug_retrain_retry_wq;
 	atomic_t modesets_done;
 	unsigned long hdmi_edge_jiffies;
 	bool hdmi_edge_seen;
@@ -1330,6 +1366,36 @@ struct apple_dcp {
 	unsigned int tb_hpd_count;
 	ktime_t tb_irq_hpd_last;
 
+	/*
+	 * Resume from disk (desktop 26.x panel and dcpext), see
+	 * dcp_platform_restore():
+	 * the IOMFB shared-memory iova, given again to the restarted firmware;
+	 * the restore phase; RTKit receive held since freeze; the
+	 * PM_POST_HIBERNATION notifier and the work that restarts the firmware.
+	 */
+	dma_addr_t shmem_iova;
+	int hib_phase;
+	bool hib_rx_held;
+	bool hib_poweroff_entered;
+	bool hib_nb_registered;
+	/*
+	 * External processors (dcpext): link work and the HDMI HPD interrupt
+	 * stopped, the link and DP PHYs released, from hibernation prepare
+	 * until PM_POST_HIBERNATION replays the link; this
+	 * processor still counted in the restart's firmware-start and
+	 * idle-pipe barriers (see dcp_hib_ext_restore()).
+	 */
+	bool hib_typec_disabled;
+	bool hib_irq_disabled;
+	/* The fixed (HDMI) DP PHY given back at prepare, see dcp.c. */
+	bool hib_fixed_phy_off;
+	/* Link work stopped and the link released at hibernation prepare. */
+	bool hib_link_released;
+	bool hib_ext_start_pending;
+	bool hib_ext_idle_pending;
+	struct notifier_block hib_nb;
+	struct work_struct hib_restore_work;
+
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
@@ -1349,6 +1415,44 @@ int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr);
 void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
 /* Keep a session that cannot be stopped, its DMA and this driver until reboot. */
 int dcp_retain_live_session(struct apple_dcp *dcp);
+
+/*
+ * Resume-from-disk restart of the desktop 26.x panel's firmware.
+ * QUIESCED: the old session is dropped on the host side, nothing goes to the
+ * firmware; RESTARTING: the restart work talks to the new firmware, the DRM
+ * entry points still do not; FAILED: as QUIESCED, until the reboot.
+ */
+enum dcp_hib_phase {
+	DCP_HIB_NONE = 0,
+	DCP_HIB_QUIESCED,
+	DCP_HIB_RESTARTING,
+	DCP_HIB_FAILED,
+};
+
+/* The DRM and backlight entry points leave the firmware alone. */
+static inline bool dcp_hib_gated(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       READ_ONCE(dcp->hib_phase) != DCP_HIB_NONE;
+}
+
+/* No message goes to or comes from the firmware at all. */
+static inline bool dcp_hib_tx_gated(const struct apple_dcp *dcp)
+{
+	int phase = READ_ONCE(dcp->hib_phase);
+
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_FAILED);
+}
+
+/* The restart of the last resume from disk has not finished yet. */
+static inline bool dcp_hib_busy(const struct apple_dcp *dcp)
+{
+	int phase = READ_ONCE(dcp->hib_phase);
+
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_RESTARTING);
+}
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
@@ -1422,6 +1526,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
+bool dcp_external_has_sink(struct apple_dcp *dcp);
 void dcp_external_link_fault(struct apple_dcp *dcp);
 irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp);
 
@@ -1452,6 +1557,7 @@ void dcp_backlight_stop(struct apple_dcp *dcp);
 void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 extern int fw27_panel_boot_mode;
@@ -1623,5 +1729,18 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
 void dcp_indicator_display_resumed(struct apple_dcp *dcp);
 extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
+
+/*
+ * A swap the firmware completed with shown set, recorded for the commit after a T6041 wake:
+ * the id first, so a reader that sees the new count sees that swap's id or a later one.
+ */
+static inline void dcp_note_swap_complete(struct apple_dcp *dcp, u32 swap_id, bool shown)
+{
+	if (!shown)
+		return;
+	WRITE_ONCE(dcp->shown_swap_id, swap_id);
+	smp_mb__before_atomic();	/* pairs with the smp_rmb() in dcp_wake_swap_shown() */
+	atomic_inc(&dcp->shown_swaps);
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

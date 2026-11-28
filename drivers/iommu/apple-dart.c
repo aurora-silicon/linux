@@ -406,6 +406,12 @@ struct apple_dart {
 	bool display_tlb_stale;
 	unsigned int display_writers;
 	unsigned int display_dark_writers;
+	/*
+	 * Its block was powered down by its display consumer (the DCP's power word step), which
+	 * raises it again: a hibernation .restore defers to apple_dart_display_restore().
+	 */
+	bool display_unpowered;
+	bool restore_pending;
 	DECLARE_BITMAP(display_tcr_four, DART_MAX_STREAMS);
 	/* T8020: its enabled streams and translations, saved at the display's power-down */
 	u32 display_enable;
@@ -608,6 +614,14 @@ struct apple_dart {
 	 * The first error of each stream is logged.
 	 */
 	int locked_retire_err[DART_MAX_STREAMS];
+	/* Physical address of each mapped locked root, as read from its TTBR. */
+	phys_addr_t locked_phys[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/*
+	 * Page-table configuration last published into each locked stream's
+	 * roots, for the re-import after a resume from disk (the boot loader
+	 * installs fresh firmware roots). Cleared when the stream's roots retire.
+	 */
+	struct io_pgtable_cfg *locked_cfg[DART_MAX_STREAMS];
 };
 
 #define APPLE_DART_WRITER_COUNTED	1
@@ -1577,6 +1591,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		dart->locked_owned[sid][idx] = owned;
 		dart->locked_ttbr[sid][idx] = l1_tbl;
 		dart->locked_fw[sid][idx] = fw;
+		dart->locked_phys[sid][idx] = phys;
 		if (!idx)
 			dart->locked_fw_tree[sid] = tree;
 		spin_unlock_irqrestore(&dart->lock, flags);
@@ -1625,6 +1640,8 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
 		dart->locked_ttbr[sid][idx] = NULL;
+		dart->locked_phys[sid][idx] = 0;
+		dart->locked_cfg[sid] = NULL;
 		if (!idx) {
 			tree = dart->locked_fw_tree[sid];
 			dart->locked_fw_tree[sid] = NULL;
@@ -1728,6 +1745,8 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			if (ret)
 				goto out;
 		}
+		if (dart->locked_ttbr[sid][0])
+			dart->locked_cfg[sid] = cfg;
 	}
 out:
 	spin_unlock_irqrestore(&dart->lock, flags);
@@ -8019,8 +8038,200 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * After a resume from disk through a boot, the boot loader has locked every
+ * locked DART again with fresh firmware-owned roots, while the restored kernel
+ * still describes the roots of the image (their mapping, their firmware
+ * snapshot and the slots it had published): every publication then fails
+ * (-EBUSY), and with it every DMA mapping through the DART (the PMP and every
+ * DCP fail their buffer requests with -ENOMEM). .restore re-reads the live
+ * roots whichever kernel loaded the image, re-imports them the way attach maps
+ * them, and publishes the stream's page tables into them again, as attach
+ * does. A root that did not move (the kernel that wrote the image loaded
+ * it) is still the one the image describes and is kept. Firmware-owned
+ * memory is never written: the old roots' published slots are forgotten, not
+ * retired.
+ */
+static int apple_dart_reimport_locked(struct apple_dart *dart)
+{
+	DECLARE_BITMAP(redo, DART_MAX_STREAMS) = {};
+	unsigned int sid, idx;
+	int ret = 0, done = 0;
+
+	/*
+	 * Two passes, as attach does: every stream's live roots are re-read and
+	 * snapshotted before any of them is republished, so that a root shared
+	 * by several streams is snapshotted before Linux slots enter it.
+	 */
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		bool any = false;
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u64 *live = dart->locked_ttbr[sid][idx];
+			u64 *owned = dart->locked_owned[sid][idx];
+			struct apple_dart_fw_tree *tree = NULL, *old_tree = NULL;
+			struct apple_dart_fw_root *fw, *old_fw;
+			unsigned long flags;
+			phys_addr_t phys;
+			u64 *l1;
+			u32 ttbr;
+
+			if (!live || !owned)
+				continue;
+			ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+			if (!(ttbr & dart->hw->ttbr_valid)) {
+				dev_err(dart->dev, "hibernation restore: stream %u ttbr[%u] not valid\n",
+					sid, idx);
+				ret = ret ?: -EIO;
+				continue;
+			}
+			ttbr &= ~dart->hw->ttbr_valid;
+			if (dart->hw->ttbr_addr_field_shift)
+				ttbr >>= dart->hw->ttbr_addr_field_shift;
+			phys = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+			if (dart->fw_handoff && !apple_dart_fw_table_ram(dart, phys)) {
+				ret = ret ?: -EINVAL;
+				continue;
+			}
+			/* Not replaced (the loading kernel wrote the image): as described. */
+			if (phys == dart->locked_phys[sid][idx])
+				continue;
+			l1 = devm_memremap(dart->dev, phys, dart->pgsize, MEMREMAP_WB);
+			if (IS_ERR(l1)) {
+				ret = ret ?: PTR_ERR(l1);
+				continue;
+			}
+			fw = apple_dart_snapshot_fw_root(dart, sid, l1);
+			if (IS_ERR(fw)) {
+				devm_memunmap(dart->dev, l1);
+				ret = ret ?: PTR_ERR(fw);
+				continue;
+			}
+			if (!idx)
+				tree = apple_dart_snapshot_fw_tree(dart, sid, l1);
+			spin_lock_irqsave(&dart->lock, flags);
+			old_fw = dart->locked_fw[sid][idx];
+			memset(owned, 0, dart->pgsize);
+			dart->locked_ttbr[sid][idx] = l1;
+			dart->locked_phys[sid][idx] = phys;
+			dart->locked_fw[sid][idx] = fw;
+			if (!idx) {
+				old_tree = dart->locked_fw_tree[sid];
+				dart->locked_fw_tree[sid] = tree;
+			}
+			spin_unlock_irqrestore(&dart->lock, flags);
+			apple_dart_free_fw_root(dart, old_fw);
+			apple_dart_free_fw_tree(dart, old_tree);
+			devm_memunmap(dart->dev, live);
+			any = true;
+		}
+		if (any)
+			__set_bit(sid, redo);
+	}
+
+	for_each_set_bit(sid, redo, dart->num_streams) {
+		struct apple_dart_stream_map stream = { .dart = dart };
+		struct io_pgtable_cfg *cfg = READ_ONCE(dart->locked_cfg[sid]);
+		int err;
+
+		if (!cfg)
+			continue;
+		__set_bit(sid, stream.sidmap);
+		err = apple_dart_hw_sync_locked(cfg, &stream, false);
+		if (!err)
+			err = dart->hw->invalidate_tlb(&stream);
+		if (err) {
+			dev_err(dart->dev, "hibernation restore: stream %u not republished: %d\n",
+				sid, err);
+			ret = ret ?: err;
+			continue;
+		}
+		done++;
+	}
+	dev_dbg(dart->dev, "hibernation restore: %d locked streams re-imported (%d)\n",
+		done, ret);
+	return ret;
+}
+
+static int apple_dart_restore(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret;
+
+	/* No register of a block its display consumer took down can be read before it is up. */
+	if (READ_ONCE(dart->display_unpowered)) {
+		dart->restore_pending = true;
+		dev_dbg(dev, "hibernation restore deferred to its display's power-up\n");
+		return 0;
+	}
+	ret = apple_dart_system_resume(dev);
+	if (ret || !dart->locked)
+		return ret;
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+	/* Logged per stream; a failed stream must not fail the whole restore. */
+	apple_dart_reimport_locked(dart);
+	pm_runtime_put(dev);
+	return 0;
+}
+#endif
+
+/* The display consumer powers the DART's block down: see apple_dart_restore(). */
+void apple_dart_display_unpowered(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (dart)
+		WRITE_ONCE(dart->display_unpowered, true);
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_unpowered);
+
+/*
+ * The display consumer powered the DART's block up again: a .restore deferred by
+ * apple_dart_restore() runs now, the resume and the re-import of the locked roots.
+ */
+int apple_dart_display_restore(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (!dart)
+		return -ENODEV;
+	WRITE_ONCE(dart->display_unpowered, false);
+#ifdef CONFIG_HIBERNATION
+	if (!dart->restore_pending)
+		return 0;
+	dart->restore_pending = false;
+	ret = apple_dart_system_resume(dev);
+	if (ret || !dart->locked) {
+		if (ret)
+			dev_err(dev, "deferred hibernation restore failed: %d\n", ret);
+		return ret;
+	}
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+	ret = apple_dart_reimport_locked(dart);
+	pm_runtime_put(dev);
+	dev_dbg(dev, "deferred hibernation restore at its display's power-up: %d\n", ret);
+#endif
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_restore);
+
 static const struct dev_pm_ops apple_dart_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_dart_system_suspend, apple_dart_system_resume)
+	.suspend = pm_sleep_ptr(apple_dart_system_suspend),
+	.resume = pm_sleep_ptr(apple_dart_system_resume),
+	.freeze = pm_sleep_ptr(apple_dart_system_suspend),
+	.thaw = pm_sleep_ptr(apple_dart_system_resume),
+	.poweroff = pm_sleep_ptr(apple_dart_system_suspend),
+#ifdef CONFIG_HIBERNATION
+	.restore = apple_dart_restore,
+#else
+	.restore = pm_sleep_ptr(apple_dart_system_resume),
+#endif
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
 	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
 };
@@ -8038,6 +8249,24 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_dart_of_match);
+
+/* No TLB command and no transaction outstanding on any port: -EBUSY until then. */
+static int apple_dart_drained(struct apple_dart *dart)
+{
+	u32 params = readl(dart->regs + DART_PARAMS2);
+	unsigned int rports = FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params);
+	unsigned int wports = FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params);
+	unsigned int ports = max(rports, wports);
+
+	if (!ports || ports > 4)
+		return -EIO;
+	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
+		return -EBUSY;
+	for (unsigned int port = 0; port < ports; port++)
+		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
+			return -EBUSY;
+	return 0;
+}
 
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
 /* The internal display DART of a DCP consumer (its firmware or display stream). */
@@ -8071,19 +8300,9 @@ static int apple_dart_tlb_command(struct apple_dart *dart, u32 command)
  */
 static int apple_dart_idle(struct apple_dart *dart)
 {
-	u32 params = readl(dart->regs + DART_PARAMS2);
-	unsigned int rports = FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params);
-	unsigned int wports = FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params);
-	unsigned int ports = max(rports, wports);
-
-	if (!ports || ports > 4 || apple_dart_fault_pending(dart))
+	if (apple_dart_fault_pending(dart))
 		return -EIO;
-	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
-		return -EBUSY;
-	for (unsigned int port = 0; port < ports; port++)
-		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
-			return -EBUSY;
-	return 0;
+	return apple_dart_drained(dart);
 }
 
 /* Idle, giving transactions and a command just issued time to drain. */
@@ -8778,6 +8997,27 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_display_streams);
+
+/*
+ * After apple_dart_display_streams(@streams, off): the streams read disabled, and the DART has
+ * no TLB command and no transaction outstanding on any port, so the blocks behind it can be
+ * powered down. A pending fault doesn't hold that up. -EIO if a stream is still enabled,
+ * -ETIMEDOUT if the transactions did not drain.
+ */
+int apple_dart_display_streams_idle(struct device *dev, u32 streams)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret, drained;
+
+	if (!dart)
+		return -ENODEV;
+	if (readl(dart->regs + DART_T8110_ENABLE_STREAMS) & streams)
+		return -EIO;
+	ret = read_poll_timeout_atomic(apple_dart_drained, drained, drained != -EBUSY, 1,
+				       DART_T8110_IDLE_TIMEOUT_US, false, dart);
+	return ret ?: drained;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_streams_idle);
 
 /*
  * The streams a T8110 display DART has enabled, read while its domain is up: what a DCP

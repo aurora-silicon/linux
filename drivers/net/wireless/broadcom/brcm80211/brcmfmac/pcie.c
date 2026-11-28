@@ -3667,12 +3667,47 @@ cleanup:
 }
 
 
+/*
+ * The firmware session at restore does not describe the rings in the image:
+ * it was started by the kernel that loaded the image, or continued across
+ * the image write in test_resume. The loading kernel quiesced it in D3.
+ * Tear down the saved host state without resetting a chip in that state,
+ * then probe it again, as in the resume path after a power loss.
+ */
+static int brcmf_pcie_pm_restore(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct pci_dev *pdev = devinfo->pdev;
+	int err;
+
+	err = apple_radio_sleep_endpoint_resume(dev);
+	if (err)
+		return err;
+
+	if (apple_radio_sleep_owned(dev)) {
+		/* Lost firmware/rings violate retention; reset/reprobe is not recovery. */
+		apple_radio_sleep_endpoint_resumed(dev, -EUCLEAN);
+		return -EUCLEAN;
+	}
+
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	brcmf_chip_detach(devinfo->ci);
+	devinfo->ci = NULL;
+	brcmf_pcie_remove(pdev);
+	err = brcmf_pcie_probe(pdev, NULL);
+	if (err)
+		__brcmf_err(NULL, __func__, "probe after restore failed, err=%d\n", err);
+
+	return err;
+}
+
 static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	.suspend = brcmf_pcie_pm_enter_D3,
 	.resume = brcmf_pcie_pm_leave_D3,
 	.freeze = brcmf_pcie_pm_enter_D3,
 	.thaw = brcmf_pcie_pm_leave_D3,
-	.restore = brcmf_pcie_pm_leave_D3,
+	.restore = brcmf_pcie_pm_restore,
 };
 
 

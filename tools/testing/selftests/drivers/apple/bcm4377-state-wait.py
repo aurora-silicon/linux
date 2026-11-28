@@ -25,7 +25,7 @@ struct ring_state { unsigned value; };
 struct hci_dev;
 struct bcm4377_data {
     unsigned long reset_pending, dma_window_base;struct pci_dev *pdev;struct hci_dev *hdev;
-    const struct bcm4377_hw *hw;bool needs_reset,own_reset;unsigned bootstage,rti_status;
+    const struct bcm4377_hw *hw;bool needs_reset,own_reset,power_lost;unsigned bootstage,rti_status;
     struct ring_state *ring_state;
     struct { unsigned generation,n_entries,head;unsigned long msgids[1];unsigned *events; } control_h2d_ring;
     struct { bool enabled; } control_ack_ring;
@@ -102,6 +102,10 @@ int main(void)
     reset_error=-EIO;
     assert(bcm4377_pci_reset(&b)==-EIO && b.needs_reset && !b.own_reset);
     assert(pci_resets==2 && irq_disables==2 && irq_enables==2 && boots==1);
+    /* Back from a power loss the function is in reset already: no FLR, but a boot. */
+    reset_error=0;b.power_lost=true;
+    assert(!bcm4377_pci_reset(&b) && pci_resets==2 && boots==2);
+    assert(!b.power_lost && !b.needs_reset && !b.own_reset);
     return 0;
 }
 '''

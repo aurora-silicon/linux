@@ -32,6 +32,10 @@
 };
 
 &smc {
+	apple,sleep-wake-type;
+	/* VDD_CIO: bit 8 set, bit 0 keeps port 0's CIO rail powered across sleep. */
+	apple,sleep-pmvc = <0x101>;
+
 	smc_gpio_low: gpio-low {
 		compatible = "apple,smc-low-gpio";
 		gpio-controller;
@@ -344,4 +348,13 @@
 
 &ps_uart0 {
 	status = "okay";
+};
+
+&t6040_sleep {
+	status = "okay";
+};
+
+&dcp {
+	apple,sleep-host-stop;
+	apple,display-power = <&dcp_power>;
 };

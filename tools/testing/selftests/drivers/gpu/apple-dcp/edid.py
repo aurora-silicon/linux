@@ -721,7 +721,9 @@ struct apple_dcp {
     struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
 };
 struct drm_edid { int identity; };
-'''+internal_inline(root,'dcp_is_v14_7_external')+r'''static unsigned int reads, allocations, legacy_reads, receives;
+'''+internal_inline(root,'dcp_is_v14_7_external')+r'''/* No resume from disk in this control: the host session is never rebuilt. */
+static bool dcp_hib_tx_gated(const struct apple_dcp *d) { (void)d; return false; }
+static unsigned int reads, allocations, legacy_reads, receives;
 static unsigned int event;
 static struct apple_dcp_afkep *received_ep;
 static struct apple_epic_service *hdr_bound;
@@ -994,6 +996,8 @@ struct apple_dcp {
     bool v27_j714s, v27_sleep_transport, sleep_v27_unhandled;
     struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
 };
+/* No resume from disk in this control: the host session is never rebuilt. */
+static bool dcp_hib_tx_gated(const struct apple_dcp *d) { (void)d; return false; }
 struct afk_receive_message_work { struct apple_dcp_afkep *ep; u64 message; struct work_struct work; };
 struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); void (*recv_message_timed)(void *,u8,u64,u64); };
 struct apple_rtkit { bool shutting_down, sync_syslog_ack, pmp_registry_v2; const struct apple_rtkit_ops *ops; void *cookie,*dev;

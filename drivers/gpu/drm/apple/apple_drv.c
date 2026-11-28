@@ -79,6 +79,8 @@ struct apple_drm_private {
 	struct list_head pm_node;
 	/* The notifier's output restore, run outside apple_drm_pm_lock. */
 	struct work_struct pm_resume_work;
+	/* Left down by .thaw for the image write; brought back if this kernel goes on. */
+	bool hib_thaw_skipped;
 };
 
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
@@ -544,7 +546,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		apple_crtc->fabric_held = true;
 	}
 	if (crtc_state->active &&
-	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp) ||
+	     dcp_external_pipe_off(apple_crtc->dcp))) {
 		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
 		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
@@ -2418,7 +2421,8 @@ static bool apple_drm_firmware_stopped(struct apple_drm_private *apple)
 	return stopped;
 }
 
-static int apple_platform_suspend(struct device *dev)
+/* @stop: the display firmware stopped, as for a real sleep (dcp_t6041_s2r_all()). */
+static int apple_drm_sleep(struct device *dev, bool stop)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
@@ -2426,7 +2430,7 @@ static int apple_platform_suspend(struct device *dev)
 	if (apple && apple->dark_held)
 		return 0;
 
-	if (pm_suspend_via_firmware()) {
+	if (stop) {
 		int ret = dcp_t6041_s2r_all(false);
 
 		if (ret)
@@ -2446,6 +2450,11 @@ static int apple_platform_suspend(struct device *dev)
 	}
 
 	return 0;
+}
+
+static int apple_platform_suspend(struct device *dev)
+{
+	return apple_drm_sleep(dev, pm_suspend_via_firmware());
 }
 
 /*
@@ -2508,6 +2517,47 @@ static int apple_platform_resume(struct device *dev)
 	return 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * Hibernation (Documentation/driver-api/pm/devices.rst): the display firmware is stopped at
+ * .freeze as for a real sleep, so the image holds it stopped by Linux, and stays stopped
+ * through the image write: .thaw brings it back only if the hibernation failed, or if the
+ * machine suspends instead of powering off, and PM_POST_HIBERNATION does once this kernel
+ * goes on after anything else (as amdgpu's .thaw). .restore so starts from the state of the
+ * image: a restore by the kernel that wrote it, or after a failed power-off, takes the sleep's
+ * return; one through a boot finds firmware the boot loader started anew.
+ */
+static int apple_platform_freeze(struct device *dev)
+{
+	return apple_drm_sleep(dev, true);
+}
+
+static int apple_platform_thaw(struct device *dev)
+{
+	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	if (!pm_hibernate_is_recovering() && !pm_hibernation_mode_is_suspend()) {
+		if (apple)
+			apple->hib_thaw_skipped = true;
+		return 0;
+	}
+	return apple_platform_resume(dev);
+}
+
+static int apple_platform_restore(struct device *dev)
+{
+	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	if (apple)
+		apple->hib_thaw_skipped = false;
+	dcp_t6041_hib_restore();
+	if (!apple || apple->aborted || apple->s2r_skipped)
+		return 0;
+	apple_drm_resume_outputs(apple);
+	return 0;
+}
+#endif
+
 /* The suspend after a dark wake failed before it suspended this device. */
 static void apple_platform_complete(struct device *dev)
 {
@@ -2526,6 +2576,14 @@ static void apple_drm_pm_resume_work(struct work_struct *work)
 	struct apple_drm_private *apple =
 		container_of(work, struct apple_drm_private, pm_resume_work);
 
+#ifdef CONFIG_HIBERNATION
+	/* The image was not entered, or was written and the power-off did not come. */
+	if (apple->hib_thaw_skipped) {
+		apple->hib_thaw_skipped = false;
+		apple_platform_resume(apple->drm.dev);
+		return;
+	}
+#endif
 	if (apple->dark_held) {
 		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
 		apple_drm_resume_outputs(apple);
@@ -2544,12 +2602,12 @@ static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, 
 
 	/* The T8132 external outputs' sleep handling (a no-op without them). */
 	ret = t8132_ext_drm_pm_event(action);
-	if (action != PM_POST_SUSPEND)
+	if (action != PM_POST_SUSPEND && action != PM_POST_HIBERNATION)
 		return ret;
 
 	mutex_lock(&apple_drm_pm_lock);
 	list_for_each_entry(apple, &apple_drm_pm_list, pm_node)
-		if (apple->dark_held)
+		if (action == PM_POST_SUSPEND ? apple->dark_held : apple->hib_thaw_skipped)
 			queue_work(apple_drm_pm_wq, &apple->pm_resume_work);
 	mutex_unlock(&apple_drm_pm_lock);
 
@@ -2559,6 +2617,12 @@ static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, 
 static const struct dev_pm_ops apple_platform_pm_ops = {
 	.suspend	= apple_platform_suspend,
 	.resume		= apple_platform_resume,
+#ifdef CONFIG_HIBERNATION
+	.freeze		= apple_platform_freeze,
+	.thaw		= apple_platform_thaw,
+	.poweroff	= apple_platform_freeze,
+	.restore	= apple_platform_restore,
+#endif
 	.complete	= apple_platform_complete,
 };
 #else

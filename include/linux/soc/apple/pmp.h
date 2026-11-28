@@ -49,4 +49,6 @@ struct apple_pmp_commit_stop {
 };
 
 int apple_pmp_sleep_prepare(const void *data, struct apple_pmp_commit_stop *stop);
+/* Rebuild the firmware session after a resume from disk (PM_POST_HIBERNATION). */
+int apple_pmp_restore(const void *data);
 #endif

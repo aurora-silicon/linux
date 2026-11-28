@@ -467,6 +467,13 @@ struct apple_isp {
 	void *fw_heap;
 	void *fw_heap_copy;
 	size_t fw_heap_size;
+	/*
+	 * With hw->fw_restart, across a hibernation: the CRC32 of the firmware
+	 * text segment at the freeze. The boot that resumes the image must have
+	 * loaded the same text again for the firmware to start (apple_isp_restore()).
+	 */
+	u32 fw_text_crc;
+	bool fw_text_crc_valid;
 	/* hw, as this device runs it (see apple_isp_select_hw()) */
 	struct apple_isp_hw hw_local;
 	struct isp_surf *log_surf;

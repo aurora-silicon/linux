@@ -717,12 +717,53 @@ static void apple_smc_sleep_pmvc_report(struct apple_smc *smc)
 			smc->sleep_pmvc);
 }
 
+/* The SMC endpoint started and initialised after the RTKit wake: probe, hibernation restore. */
+static int apple_smc_start(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+	if (ret)
+		return dev_err_probe(smc->dev, ret, "Failed to start SMC endpoint");
+
+	reinit_completion(&smc->init_done);
+	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
+				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
+	if (ret)
+		return dev_err_probe(smc->dev, ret, "Failed to send init message");
+
+	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
+		dev_err(smc->dev, "Timed out initializing SMC");
+		return -ETIMEDOUT;
+	}
+
+	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
+		dev_err(smc->dev, "SMC failed to boot successfully, boot stage=%d\n",
+			smc->boot_stage);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int apple_smc_read_key_count(struct apple_smc *smc)
+{
+	__be32 count;
+	int ret;
+
+	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
+	if (ret >= 0 && ret != sizeof(count))
+		ret = -EIO;
+	if (ret < 0)
+		return dev_err_probe(smc->dev, ret, "Failed to get key count");
+	smc->key_count = be32_to_cpu(count);
+	return 0;
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	const struct apple_smc_wake_reason *dt_reasons;
 	struct apple_smc *smc;
-	__be32 count = 0;
 	bool t6050;
 	int ret;
 
@@ -772,35 +813,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+	ret = apple_smc_start(smc);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
-
-	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
-				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to send init message");
-
-	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
-		dev_err(dev, "Timed out initializing SMC");
-		return -ETIMEDOUT;
-	}
-
-	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
-		dev_err(dev, "SMC failed to boot successfully, boot stage=%d\n", smc->boot_stage);
-		return -EIO;
-	}
+		return ret;
 
 	dev_set_drvdata(&pdev->dev, smc);
 
-	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
-	if (ret >= 0 && ret != sizeof(count)) {
-		count = 0;
-		ret = -EIO;
-	}
-	if (ret < 0)
-		return dev_err_probe(smc->dev, ret, "Failed to get key count");
-	smc->key_count = be32_to_cpu(count);
+	ret = apple_smc_read_key_count(smc);
+	if (ret)
+		return ret;
 
 	if (smc->sleep_pmvc_set)
 		apple_smc_sleep_pmvc_report(smc);
@@ -2072,10 +2093,95 @@ static int apple_smc_resume_noirq(struct device *dev)
 	return 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * Hibernation. The image is written with the SMC left running: the driver keeps no state that
+ * has to survive in it, and thermal and power management go on while it is written. The kernel
+ * that loads an image binds this driver like any boot and holds a live session; the firmware
+ * would never answer the restored kernel's new start (IOP power INIT) with a HELLO from there.
+ * So that kernel's .freeze, right before the jump, quiesces it, the state the teardown leaves
+ * it in and from which a wake starts a new session, and .restore always starts one: the same
+ * state whether the loading kernel is the one that wrote the image (test_resume) or one started
+ * by a boot.
+ */
+static bool apple_smc_handed_over;
+
+static int apple_smc_freeze(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!pm_hibernate_is_loading() || !smc || !apple_rtkit_is_running(smc->rtk))
+		return 0;
+
+	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
+	ret = apple_rtkit_quiesce(smc->rtk);
+	if (ret) {
+		/*
+		 * Failing here would abandon the image, whose signature is already gone, and leave
+		 * this kernel without a session: enter the image anyway, its restore tries a new
+		 * session.
+		 */
+		dev_err(dev, "could not quiesce the SMC for the image: %d\n", ret);
+		return 0;
+	}
+	apple_smc_handed_over = true;
+	dev_dbg(dev, "SMC quiesced for the restored kernel\n");
+	return 0;
+}
+
+static int apple_smc_restore(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	/*
+	 * The RTKit bookkeeping restored from the image still marks the session running, in which
+	 * state a wake is refused: back to the state probe starts from first.
+	 */
+	ret = apple_rtkit_reinit(smc->rtk);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to reinit RTKit on restore");
+
+	smc->boot_stage = APPLE_SMC_BOOTING;
+	ret = apple_rtkit_wake(smc->rtk);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to wake up SMC on restore");
+
+	ret = apple_smc_start(smc);
+	if (ret)
+		return ret;
+
+	/* A new firmware instance: nothing says its key table is the same. */
+	ret = apple_smc_read_key_count(smc);
+	if (ret)
+		return ret;
+
+	/* The notifier chain and the sub-devices on it are in the image; only the flag is not. */
+	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
+	return 0;
+}
+
+/* The hand-over above, but the image could not be entered: a new session the same way. */
+static int apple_smc_thaw(struct device *dev)
+{
+	if (!apple_smc_handed_over)
+		return 0;
+	apple_smc_handed_over = false;
+	return apple_smc_restore(dev);
+}
+#endif
+
 static const struct dev_pm_ops apple_smc_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_smc_prepare),
 	.suspend = pm_sleep_ptr(apple_smc_suspend),
 	.complete = pm_sleep_ptr(apple_smc_complete),
+#ifdef CONFIG_HIBERNATION
+	.freeze = apple_smc_freeze,
+	.thaw = apple_smc_thaw,
+	.poweroff = apple_smc_freeze,
+	.restore = apple_smc_restore,
+#endif
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_noirq, apple_smc_resume_noirq)
 };
 

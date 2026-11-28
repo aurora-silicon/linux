@@ -5,6 +5,7 @@
  * Copyright (C) 2023 The Asahi Linux Contributors
  */
 
+#include <linux/crc32.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
@@ -1647,29 +1648,55 @@ static __maybe_unused int apple_isp_runtime_resume(struct device *dev)
 	return 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/* The CRC32 of the firmware text segment, the "text" memory-region. */
+static int apple_isp_fw_text_crc(struct apple_isp *isp, u32 *crc)
+{
+	struct resource res;
+	void *mem;
+	int err;
+
+	err = of_reserved_mem_region_to_resource_byname(isp->dev->of_node, "text", &res);
+	if (err)
+		return err;
+	mem = memremap(res.start, resource_size(&res), MEMREMAP_WB);
+	if (!mem)
+		return -ENOMEM;
+	*crc = crc32_le(~0, mem, resource_size(&res));
+	memunmap(mem);
+	return 0;
+}
+#endif
+
 /*
- * Stop resident firmware. For a system sleep it starts again on resume where
- * it can; otherwise, or for hibernation, the camera is gone until the next
- * boot.
+ * Stop resident firmware. Firmware that starts again (hw->fw_restart) does so
+ * on resume, after a hibernation too if the boot that resumes the image has
+ * loaded the same text (apple_isp_restore()); its data segment and heap come
+ * from the copies kept at probe. Other resident firmware is gone until the
+ * next boot.
  */
 static void apple_isp_stop_resident(struct apple_isp *isp, bool sleep)
 {
-	bool restart = sleep && isp->hw->fw_restart;
+	bool restart = isp->hw->fw_restart;
 
 	if (!isp->hw->resident_fw)
 		return;
 
+#ifdef CONFIG_HIBERNATION
+	if (restart && !sleep)
+		isp->fw_text_crc_valid = !apple_isp_fw_text_crc(isp, &isp->fw_text_crc);
+#endif
 	mutex_lock(&isp->video_lock);
 	if (isp->fw_state == ISP_FW_RUNNING) {
 		if (restart)
-			dev_dbg(isp->dev, "stopping the firmware for system sleep\n");
+			dev_dbg(isp->dev, "stopping the firmware for %s\n",
+				sleep ? "system sleep" : "hibernation");
 		else
 			dev_warn(isp->dev, "stopping the firmware for %s, the camera is unavailable until the next boot\n",
 				 sleep ? "system sleep" : "hibernation");
 		isp->fw_sleep_stopped = restart;
 	}
 	apple_isp_firmware_halt(isp);
-	/* Hibernation resumes in another boot, where that memory isn't ours. */
 	if (!restart)
 		isp->fw_state = ISP_FW_DEAD;
 	mutex_unlock(&isp->video_lock);
@@ -1724,8 +1751,8 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 	/*
 	 * Hibernation hands the system from one kernel to another, and
 	 * firmware left running would go on using the memory of the kernel
-	 * that started it. Stop it cleanly instead; if it ran, the camera is
-	 * then unavailable until the next system boot.
+	 * that started it. Stop it cleanly instead; see apple_isp_restore()
+	 * for whether it starts again.
 	 */
 	apple_isp_stop_resident(isp, false);
 
@@ -1751,13 +1778,39 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * The image was resumed by another boot. Firmware that starts again finds its
+ * text where this kernel has it, as long as that boot's loader put the same
+ * text there: otherwise it stays down until the next boot.
+ */
+static __maybe_unused int apple_isp_restore(struct device *dev)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+	bool kept = false;
+#ifdef CONFIG_HIBERNATION
+	u32 crc;
+
+	kept = isp->fw_text_crc_valid && !apple_isp_fw_text_crc(isp, &crc) &&
+	       crc == isp->fw_text_crc;
+#endif
+	if (isp->hw->fw_restart && !kept) {
+		mutex_lock(&isp->video_lock);
+		if (isp->fw_state != ISP_FW_DEAD)
+			dev_warn(dev, "firmware text not the same after the resume from disk, the camera is unavailable until the next boot\n");
+		isp->fw_sleep_stopped = false;
+		isp->fw_state = ISP_FW_DEAD;
+		mutex_unlock(&isp->video_lock);
+	}
+	return apple_isp_resume(dev);
+}
+
 static const struct dev_pm_ops apple_isp_pm_ops = {
 	.suspend	= pm_sleep_ptr(apple_isp_suspend),
 	.resume		= pm_sleep_ptr(apple_isp_resume),
 	.freeze		= pm_sleep_ptr(apple_isp_freeze),
 	.thaw		= pm_sleep_ptr(apple_isp_resume),
 	.poweroff	= pm_sleep_ptr(apple_isp_freeze),
-	.restore	= pm_sleep_ptr(apple_isp_resume),
+	.restore	= pm_sleep_ptr(apple_isp_restore),
 	RUNTIME_PM_OPS(apple_isp_runtime_suspend, apple_isp_runtime_resume, NULL)
 };
 

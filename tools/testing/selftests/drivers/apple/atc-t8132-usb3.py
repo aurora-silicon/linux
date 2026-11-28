@@ -26,6 +26,16 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
+def hw_defs(source):
+    """The driver's struct dwc3_apple_hw and its per-SoC tables."""
+    struct = re.search(r"^struct dwc3_apple_hw \{.*?^\};\n", source, re.M | re.S)
+    assert struct, "struct dwc3_apple_hw"
+    tables = re.findall(r"^static const struct dwc3_apple_hw \w+ = \{.*?\};\n", source, re.M | re.S)
+    assert tables, "dwc3_apple_hw tables"
+    unused = "static const struct dwc3_apple_hw __attribute__((unused)) "
+    return struct[0] + "".join(t.replace("static const struct dwc3_apple_hw ", unused, 1) for t in tables)
+
+
 def enum(source, name):
     start = source.index("enum " + name + " {")
     return source[start:source.index("};", start) + 2] + "\n"
@@ -396,7 +406,8 @@ static struct task_struct glue_task, other_task, *current_task = &glue_task, *lo
 struct device { const char *of_node; bool registered, bound; };
 struct platform_device { struct device dev; };
 struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; struct platform_device *xhci; };
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy, *role_sw; int lock, state;
+''' + hw_defs(dwc) + r'''struct dwc3_apple { struct dwc3 dwc; struct device *dev;
+    const struct dwc3_apple_hw *hw; void *usb2_phy, *usb3_phy, *role_sw; int lock, state;
     bool dt_dis_u3_susphy, host_only, sleep_ddr, fixed_hub, sleep_phy_wait, sleep_phy_pending;
     struct task_struct *host_start_task; bool usb3_host_owed; int usb3_host_ret; };
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -514,9 +525,21 @@ static void dwc3_host_exit(struct dwc3 *d)
 ''' + "".join(function(dwc, name) for name in (
             "dwc3_apple_route_usb3", "dwc3_apple_set_role", "dwc3_apple_usb3_host_route",
             "dwc3_apple_host_start", "dwc3_apple_init", "dwc3_apple_start_after_sleep")) + r'''
+/* The match data of_device_get_match_data() gives the glue for each node. */
+static const struct dwc3_apple_hw *hw_of(const char *node)
+{
+    if (!strcmp(node, "apple,t8132-dwc3"))
+        return &dwc3_apple_t8132_hw;
+    if (!strcmp(node, "apple,t6040-dwc3"))
+        return &dwc3_apple_t6040_hw;
+    if (!strcmp(node, "apple,t6050-dwc3"))
+        return &dwc3_apple_t6050_hw;
+    return &dwc3_apple_t8103_hw;
+}
 static void reset(struct dwc3_apple *a, const char *node, int error)
 {
     a->dev->of_node = node;
+    a->hw = hw_of(node);
     a->state = DWC3_APPLE_NO_CABLE;
     a->dwc.dis_u3_susphy_quirk = false;
     phy_error = error;
@@ -876,8 +899,9 @@ struct dwc3 {
     struct phy *usb3_generic_phy[1],*usb2_generic_phy[1];void *usb3_phy,*usb2_phy;
     const void *glue_ops;bool dis_u3_susphy_quirk;
 };
-struct dwc3_apple {
-    struct dwc3 dwc; struct device *dev; void *mmio_resource,*reset,*usb2_phy;
+''' + hw_defs(dwc) + r'''struct dwc3_apple {
+    struct dwc3 dwc; struct device *dev; const struct dwc3_apple_hw *hw;
+    void *mmio_resource,*reset,*usb2_phy;
     int lock,state; bool core_active,core_exit_pending,reset_pending,shutting_down,fixed_hub;
     unsigned usb2_power_off_pending,usb3_power_off_pending,hub_port;
     bool host_only,idle_rpm,rpm_held,dt_dis_u3_susphy,sleep_ddr,sleep_in_place;
@@ -929,7 +953,8 @@ static void dwc3_apple_pm_notifier_remove(void *data) { (void)data; }
 static void cancel_work_sync(int *w) { (void)w;cancels++; }
 static void cancel_delayed_work_sync(int *w) { (void)w;cancels++; }
 static void apple_sleep_usb_set_wake_ports(unsigned m) { (void)m;assert(0); }
-static void apple_atcphy_sleep_finish_async(void *p,bool ok) { (void)p;(void)ok;assert(0); }
+/* No sleep was prepared in these shutdown scenarios. */
+static void dwc3_apple_sleep_finish(struct dwc3_apple *a,bool kept) { (void)a;(void)kept;assert(0); }
 static void dwc3_host_exit(struct dwc3 *d) { (void)d;atc.host_active=false;event(1); }
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
 static int atcphy_configure_t8132(struct apple_atcphy *a,int mode) {
@@ -950,21 +975,25 @@ static int dwc3_core_probe(struct dwc3_probe_data *d) {
         shutdown += r'''
 static void mutex_init(int *p) { *p=0; }
 static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;(void)port;return false; }
-static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
+static bool dwc3_apple_host_only(const struct dwc3_apple_hw *hw) { (void)hw;return false; }
 static bool dwc3_apple_idle_rpm(const char *np) { (void)np;return false; }
+static const void *of_device_get_match_data(struct device *d)
+{ return !strcmp(d->of_node,"apple,t8132-dwc3") ? &dwc3_apple_t8132_hw : &dwc3_apple_t8103_hw; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
-static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
+static void device_enable_async_suspend(struct device *d) { (void)d; }
+static int publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
 {
     struct device *dev=&pdev->dev;
 ''' + prefix + r'''
+    return 0;
 }
 static struct atcphy_hw hw={ATCPHY_GENERATION_T8132};
 static struct phy ss={0},hs={1};
 static void init(struct platform_device *p,struct dwc3_apple *a)
 {
     memset(p,0,sizeof(*p));memset(a,0,sizeof(*a));
-    p->dev.of_node="apple,t8132-dwc3";publish_owner(p,a);
+    p->dev.of_node="apple,t8132-dwc3";assert(!publish_owner(p,a));
     a->state=DWC3_APPLE_PROBE_PENDING;a->dwc.num_usb3_ports=a->dwc.num_usb2_ports=1;
     a->dwc.usb3_generic_phy[0]=&ss;a->dwc.usb2_generic_phy[0]=&hs;
     atc=(struct apple_atcphy){.hw=&hw,.t8132_ss=true,.pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY};
@@ -1011,7 +1040,7 @@ int main(void)
         atcphy_shutdown(&supplier);assert(!provider_stops && atc.t8132_common_owned);
     }
     /* Other controllers are quiesced (a6671210b88c), never torn down. */
-    init(&p,&a);p.dev.of_node="apple,t8103-dwc3";
+    init(&p,&a);p.dev.of_node="apple,t8103-dwc3";a.hw=&dwc3_apple_t8103_hw;
     dwc3_apple_shutdown(&p);assert(a.shutting_down && !count && !reset_calls);
     puts("ok 11 - consumer/provider shutdown ordering, probe-pending lifetime and retained failures");
     return 0;

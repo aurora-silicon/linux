@@ -14,6 +14,14 @@ struct phy;
 /* In D0 after the sleep, but its always-on side lost power, so xHCI's saved state is gone. */
 #define APPLE_ATCPHY_SLEEP_POWER_LOST	1
 
+/*
+ * The PHY held the controller in reset through the sleep, with its own USB2 and USB3 sides
+ * down, and has released the reset: the core's registers are gone whether or not the SoC
+ * lost power, and so is xHCI's saved state. The PHY's own sides come back with
+ * apple_t6040_atcphy_sleep_power_up(), once the core is set up again.
+ */
+#define APPLE_ATCPHY_SLEEP_RESET	2
+
 #if IS_REACHABLE(CONFIG_PHY_APPLE_ATC)
 /*
  * For a firmware-driven system sleep, before any device suspends and without the
@@ -141,5 +149,83 @@ enum apple_t6050_cio_usb {
 /* The PHY lost the controller in a firmware sleep: set it up again, xHCI starts over. */
 #define APPLE_T6050_CIO_USB_LOST	2
 int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step);
+
+#if IS_REACHABLE(CONFIG_PHY_APPLE_T6040_USB2)
+/*
+ * The T6040 Type-C PHY's side of the same sleep, for a Type-C port in host mode with nothing
+ * but USB on its lanes. It has no hibernation to take the controller through: it takes its
+ * USB3 and USB2 sides down and the controller into reset, as a stop of the host does, and
+ * brings them back the way a start does. That boots the PHY's coprocessor, so none of it
+ * runs with interrupts off: the controller's glue calls each step from process context.
+ * Each returns -EOPNOTSUPP for a PHY that isn't this driver's.
+ *
+ * apple_t6040_atcphy_sleep_prepare(): before any device suspends. 0 if the port can sleep
+ * this way now, and the PHY then holds on to that until the finish.
+ */
+int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy);
+
+/*
+ * Once xHCI has suspended, and before the controller's power domain may go off: USB3 down
+ * and its PIPE parked, USB2 off, the controller in reset. -EBUSY, with nothing touched, if
+ * the port has changed since the prepare; the sleep has to be refused then.
+ */
+int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy);
+
+/*
+ * After the sleep, with the controller's power domain on again and before anything touches
+ * its core. 0: the PHY was never taken down (the sleep was abandoned first), and all is as
+ * it was. APPLE_ATCPHY_SLEEP_RESET: the controller is out of reset again, which the first
+ * call after the sleep sees to. -ENODEV: the reset didn't release, so the core must not
+ * be touched. Any other error: the controller is out of reset, but USB2 didn't come back.
+ */
+int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy);
+
+/*
+ * After APPLE_ATCPHY_SLEEP_RESET, once the core is set up again and before its PIPE is
+ * routed: USB2 on, and USB3 up if it ran before the sleep. May sleep for the coprocessor's
+ * boot. USB3 that doesn't come up leaves the port at USB2, as at a start of the host, and
+ * is not an error. An error is USB2's, and leaves the controller out of reset for a restart
+ * of the host.
+ */
+int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy);
+
+/* For -ENODEV: tries the reset's release again. APPLE_ATCPHY_SLEEP_RESET, or -ENODEV. */
+int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy);
+
+/*
+ * Ends what the prepare took on. Without @kept, a failure of the PHY's own makes the host
+ * stop for sleeps until it has started again.
+ */
+void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
+#else
+static inline int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+{
+}
+#endif
 
 #endif

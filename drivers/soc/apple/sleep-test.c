@@ -10,6 +10,7 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8140-sleep",
 	"apple,t8132-sleep",
 	"apple,t8142-sleep",
+	"apple,t6040-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
 	"apple,t8103-sleep",
@@ -187,7 +188,8 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
-		if (soc->regions)
+		/* A profile without a "wake" block (T6040 arms its own) has no last word */
+		if (soc->regions || !soc->wake_words)
 			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
@@ -506,6 +508,23 @@ static void apple_sleep_test_wdt_handoff(struct kunit *test)
 	apple_sleep_wdt_unregister(&st->dev2);
 }
 
+static void apple_sleep_test_t6040_wdt_span(struct kunit *test)
+{
+	struct resource full = DEFINE_RES_MEM(T6040_WDT_PA, 0x4000);
+	struct resource exact = DEFINE_RES_MEM(T6040_WDT_PA, T6040_WDT_SIZE);
+	struct resource short_wd2 = DEFINE_RES_MEM(T6040_WDT_PA, WDT_WD2_CTL);
+	struct resource wd0_only = DEFINE_RES_MEM(T6040_WDT_PA, 0x10);
+	struct resource elsewhere = DEFINE_RES_MEM(0x23d2b0000ULL, 0x4000);
+
+	KUNIT_EXPECT_EQ(test, T6040_WDT_SIZE, (size_t)0x30);
+	KUNIT_EXPECT_TRUE(test, t6040_wdt_resource_ok(&full));
+	KUNIT_EXPECT_TRUE(test, t6040_wdt_resource_ok(&exact));
+	/* At the right address but short of WD2_CTL: rejected. */
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&short_wd2));
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&wd0_only));
+	KUNIT_EXPECT_FALSE(test, t6040_wdt_resource_ok(&elsewhere));
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
@@ -520,6 +539,7 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
 	KUNIT_CASE(apple_sleep_test_wdt_handoff),
+	KUNIT_CASE(apple_sleep_test_t6040_wdt_span),
 	{}
 };
 

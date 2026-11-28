@@ -2164,6 +2164,62 @@ bool apple_rtkit_v27_rx_drained(struct apple_rtkit *rtk)
 		kfifo_is_empty(&rtk->m5_saved.deferred) && !READ_ONCE(rtk->oslog_owed);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_rx_drained);
+int apple_rtkit_describe_buffers(struct apple_rtkit *rtk,
+				 struct apple_rtkit_buffer_desc *desc,
+				 unsigned int max)
+{
+	const struct apple_rtkit_shmem *bufs[APPLE_RTKIT_BUF_COUNT] = {
+		[APPLE_RTKIT_BUF_IOREPORT] = &rtk->ioreport_buffer,
+		[APPLE_RTKIT_BUF_COREANALYTICS] = &rtk->coreanalytics_buffer,
+		[APPLE_RTKIT_BUF_CRASHLOG] = &rtk->crashlog_buffer,
+		[APPLE_RTKIT_BUF_OSLOG] = &rtk->oslog_buffer,
+		[APPLE_RTKIT_BUF_KDEBUG0] = &rtk->kdebug_buffer0,
+		[APPLE_RTKIT_BUF_KDEBUG1] = &rtk->kdebug_buffer1,
+		[APPLE_RTKIT_BUF_PMP_AUX] = &rtk->pmp_aux_buffer,
+		[APPLE_RTKIT_BUF_SYSLOG] = &rtk->syslog_buffer,
+	};
+	unsigned int i, n = 0;
+
+	for (i = 0; i < APPLE_RTKIT_BUF_COUNT; i++) {
+		if (!bufs[i]->size)
+			continue;
+		if (n == max)
+			return -ENOSPC;
+		desc[n].kind = i;
+		desc[n].is_mapped = bufs[i]->is_mapped;
+		desc[n].iova = bufs[i]->iova;
+		desc[n].size = bufs[i]->size;
+		n++;
+	}
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_describe_buffers);
+
+int apple_rtkit_readopt(struct apple_rtkit *rtk)
+{
+	/*
+	 * Only a session that was running when it was left can be taken over:
+	 * its endpoint map, protocol version, syslog geometry and buffers then
+	 * describe the same firmware build and the same IOVAs as the instance
+	 * that runs now (the caller compared the buffers).
+	 */
+	if (READ_ONCE(rtk->shutting_down) || !apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	apple_mbox_hold_rx(rtk->mbox);
+	/* Acknowledgments still queued belong to the instance that is gone. */
+	cancel_work_sync(&rtk->sync_ack_work);
+	flush_workqueue(rtk->wq);
+	kfifo_reset(&rtk->sync_ack_fifo);
+
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	/* Messages the other kernel left queued in the mailbox arrive now. */
+	apple_mbox_release_rx(rtk->mbox);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_readopt);
 
 /*
  * A co-processor adopted from the bootloader has already sent its endpoint
@@ -2772,8 +2828,9 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
-static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
-					   unsigned int state)
+/* Ask the IOP for a power state and wait for its acknowledgment; the caller judges the state. */
+static int apple_rtkit_send_iop_power_state(struct apple_rtkit *rtk,
+					    unsigned int state)
 {
 	u64 msg;
 	int ret;
@@ -2786,7 +2843,15 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	return apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+}
+
+static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
+					   unsigned int state)
+{
+	int ret;
+
+	ret = apple_rtkit_send_iop_power_state(rtk, state);
 	if (ret)
 		return ret;
 
@@ -2928,10 +2993,15 @@ int apple_rtkit_idle_with(struct apple_rtkit *rtk, void (*after_ap)(void *data),
 	if (after_ap)
 		after_ap(data);
 
-	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	ret = apple_rtkit_send_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
 	if (ret) {
 		dev_err(rtk->dev, "RTKit: IOP idle not acknowledged: %d\n", ret);
 		return ret;
+	}
+	if (rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_IDLE) {
+		dev_dbg(rtk->dev, "RTKit: IOP acknowledged %#x instead of idle\n",
+			rtk->iop_power_state);
+		return APPLE_RTKIT_IDLE_RETAINED;
 	}
 
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
@@ -3466,6 +3536,40 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_sleep_idle_polled);
+
+/*
+ * For a co-processor that stays up: its client may still be owed a reply or an event on
+ * its own endpoints. Those go the usual way, to recv_message_early and, if it leaves
+ * them, to the receive work, which runs again after the wake.
+ */
+static void apple_rtkit_ap_polled_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
+				     void *cookie)
+{
+	if (msg.msg1 >= APPLE_RTKIT_APP_ENDPOINT_START)
+		apple_rtkit_rx(mbox, msg, cookie);
+	else
+		apple_rtkit_polled_rx(mbox, msg, cookie);
+}
+
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us)
+{
+	unsigned long flags;
+	int ret;
+
+	apple_rtkit_polled_begin(rtk);
+
+	/* The client's own endpoints keep their usual path while the idle is polled for. */
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_ap_polled_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_rtkit_polled_ap_idle(rtk, us);
+
+	apple_rtkit_polled_end(rtk);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_idle_polled);
 
 void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk)
 {

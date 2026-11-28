@@ -422,6 +422,7 @@ extern void hibernation_set_ops(const struct platform_hibernation_ops *ops);
 extern int hibernate(void);
 extern bool system_entering_hibernation(void);
 extern bool hibernation_available(void);
+void hibernation_set_platform_check(bool (*blocked)(void), const char *reason);
 asmlinkage int swsusp_save(void);
 extern struct pbe *restore_pblist;
 int pfn_is_nosave(unsigned long pfn);
@@ -430,6 +431,22 @@ int hibernate_quiet_exec(int (*func)(void *data), void *data);
 int hibernate_resume_nonboot_cpu_disable(void);
 int arch_hibernation_header_save(void *addr, unsigned int max_size);
 int arch_hibernation_header_restore(void *addr);
+
+#ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
+/**
+ * arch_hibernate_clean_image_page - Make a loaded image page visible to devices.
+ * @pfn: Valid page frame of the image.
+ *
+ * Provided by an architecture that sets ARCH_HIBERNATION_CLEAN_IMAGE.
+ * Called for every image page loaded straight into its original frame, once
+ * its contents are complete and before it is protected, so that the
+ * architecture can clean the caches for devices that do not snoop them.
+ *
+ * Return: 1 when the page was cleaned, 0 when it was left alone because
+ * nothing was loaded into it through the linear map.
+ */
+int arch_hibernate_clean_image_page(unsigned long pfn);
+#endif
 
 #else /* CONFIG_HIBERNATION */
 static inline void register_nosave_region(unsigned long b, unsigned long e) {}
@@ -451,6 +468,16 @@ static inline int hibernate_quiet_exec(int (*func)(void *data), void *data) {
 bool pm_hibernation_mode_is_suspend(void);
 #else
 static inline bool pm_hibernation_mode_is_suspend(void) { return false; }
+#endif
+
+#ifdef CONFIG_HIBERNATION
+bool pm_hibernate_is_restored(void);
+bool pm_hibernate_is_loading(void);
+int pm_hibernate_restored_cold(void);
+#else
+static inline bool pm_hibernate_is_restored(void) { return false; }
+static inline bool pm_hibernate_is_loading(void) { return false; }
+static inline int pm_hibernate_restored_cold(void) { return 0; }
 #endif
 
 int arch_resume_nosmt(void);

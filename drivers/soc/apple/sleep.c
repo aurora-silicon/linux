@@ -73,6 +73,7 @@
 #include <linux/panic.h>
 #include <linux/pm_domain.h>
 #include <linux/smp.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/dcp-v27-sleep.h>
@@ -722,6 +723,12 @@ struct apple_sleep_soc {
 	unsigned int ncluster_cpu;
 	/* "cpu-start": a core's bit is BIT(cpu_start_stride * cluster + core). */
 	unsigned int cpu_start_stride;
+	/*
+	 * "cpu-start", for a SoC whose clusters don't sit a fixed stride apart (T6040: E 0-3, P0
+	 * 4-9, P1 10-15): each cluster's first bit, a core's bit is then BIT(first + core) and
+	 * cpu_start_stride is not used.
+	 */
+	const u8 *cpu_start_first_bit;
 	/* In "clk-mux": parked in this order before the commit, with this value */
 	u32 clk_mux_parked[SLEEP_CLK_MUX_MAX];
 	unsigned int nclk_mux_parked;
@@ -936,6 +943,9 @@ struct apple_sleep {
 	bool matched;
 	void __iomem *dvfm[SLEEP_CLUSTERS];
 	struct aura_s2r_mailbox *mbox;
+	u64 mbox_pa;
+	/* After a resume from disk: no mailbox of this boot, so no deep sleep */
+	bool mbox_lost;
 
 	u32 wake_enable[WAKE_SOURCES_MAX];
 	int wake_enable_count;
@@ -2192,6 +2202,9 @@ static unsigned int sleep_cpu_core(u64 mpidr)
 
 static u32 sleep_cpu_start_bit(const struct apple_sleep *s, u64 mpidr)
 {
+	if (s->soc->cpu_start_first_bit)
+		return BIT(s->soc->cpu_start_first_bit[sleep_cpu_cluster(s, mpidr)] +
+			   sleep_cpu_core(mpidr));
 	return BIT(s->soc->cpu_start_stride * sleep_cpu_cluster(s, mpidr) +
 		   sleep_cpu_core(mpidr));
 }
@@ -2210,11 +2223,21 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 	int index, ret;
 
 	if (soc->cpu_cluster_affinity > 3 || !soc->cpu_clusters || !soc->cpu_cores_per_cluster ||
-	    soc->cpu_cores_per_cluster > 32 || soc->cpu_start_stride > 32 ||
-	    soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
-	    soc->cpu_start_stride * (soc->cpu_clusters - 1) +
-		    soc->cpu_cores_per_cluster > 32)
+	    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	if (soc->cpu_start_first_bit) {
+		unsigned int c;
+
+		for (c = 0; c < soc->cpu_clusters; c++)
+			if (soc->cpu_start_first_bit[c] + soc->cpu_cores_per_cluster > 32)
+				return dev_err_probe(s->dev, -EINVAL,
+						     "invalid CPU-start geometry\n");
+	} else if (soc->cpu_start_stride > 32 ||
+		   soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
+		   soc->cpu_start_stride * (soc->cpu_clusters - 1) +
+			   soc->cpu_cores_per_cluster > 32) {
+		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	}
 
 	/* The node's compatible chose the profile: its machine is where it was measured */
 	if (soc->machine && (cpu_logical_map(0) != soc->boot_mpidr ||
@@ -3576,7 +3599,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
+	if (s->soc->ndisp && !s->display[0].bound) {
 		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
 		refused = true;
 	}
@@ -6885,6 +6908,9 @@ static int apple_sleep_begin(suspend_state_t state)
 	/* Before the PM core takes the other CPUs down: the wake's burst starts only these. */
 	cpumask_copy(&sleep_cpus_awake, cpu_online_mask);
 
+	if (apple_sleep->mbox_lost)
+		return -ENODEV;
+
 	ret = apple_sleep_profile_check(apple_sleep);
 	if (ret)
 		return ret;
@@ -7678,6 +7704,7 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 	s->mbox = devm_memremap(s->dev, pa, sizeof(*s->mbox), MEMREMAP_WB);
 	if (IS_ERR(s->mbox))
 		return PTR_ERR(s->mbox);
+	s->mbox_pa = pa;
 
 	/* aura wrote it with the MMU off, so nothing of it can be in a cache. */
 	if (s->mbox->magic != AURA_S2R_MAGIC)
@@ -7691,6 +7718,61 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 
 	return 0;
 }
+
+/*
+ * aura's mailbox moves with the boot object, so after a resume from disk the
+ * one mapped at probe is the one of the boot that wrote the image, which no
+ * aura reads any more. Take this boot's from aura's tree. Without a valid one
+ * deep sleep stays off until the next boot: a wake through a mailbox aura does
+ * not read would run its boot flow again.
+ */
+static int apple_sleep_restore(struct device *dev)
+{
+	struct apple_sleep *s = dev_get_drvdata(dev);
+	struct aura_s2r_mailbox *mbox;
+	u64 pa;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_AURA_HIBERNATE))
+		return 0;
+
+	ret = aura_hibernate_boot_chosen_u64("aurora,s2r-mailbox", &pa);
+	if (ret) {
+		dev_err(dev, "no S2R mailbox of this boot (%d): deep sleep off\n", ret);
+		goto lost;
+	}
+	if (pa == s->mbox_pa)
+		return 0;
+
+	mbox = devm_memremap(dev, pa, sizeof(*mbox), MEMREMAP_WB);
+	if (IS_ERR(mbox)) {
+		ret = PTR_ERR(mbox);
+		dev_err(dev, "S2R mailbox of this boot not mapped (%d): deep sleep off\n", ret);
+		goto lost;
+	}
+	/* The boot kernel may have read it through a cacheable mapping. */
+	dcache_inval_poc((unsigned long)mbox, (unsigned long)(mbox + 1));
+	if (mbox->magic != AURA_S2R_MAGIC || mbox->boot_mpidr != cpu_logical_map(0)) {
+		dev_err(dev, "S2R mailbox of this boot not valid (magic %llx, CPU %llx): deep sleep off\n",
+			mbox->magic, mbox->boot_mpidr);
+		devm_memunmap(dev, mbox);
+		goto lost;
+	}
+
+	devm_memunmap(dev, s->mbox);
+	s->mbox = mbox;
+	s->mbox_pa = pa;
+	dev_dbg(dev, "S2R mailbox of this boot at %llx\n", pa);
+	return 0;
+
+lost:
+	s->mbox_lost = true;
+	return 0;
+}
+
+static const struct dev_pm_ops apple_sleep_pm_ops = {
+	.restore = apple_sleep_restore,
+};
 
 static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
 						       struct device_node *np,
@@ -7981,6 +8063,7 @@ static void apple_sleep_put_node(void *np)
 }
 
 #include "sleep-t6050.h"
+#include "sleep-t6040.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
 int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
@@ -8286,7 +8369,7 @@ static int apple_sleep_profile_validate(const struct apple_sleep_soc *soc)
 	    !soc->ops->deep_wfi_arm || !soc->ops->aic_mask_all || !soc->ops->aic_ack ||
 	    !soc->ops->aic_restore ||
 	    (!soc->ops->commit_regs && (!soc->ops->lower_io || !soc->ops->last_mile)) ||
-	    !soc->ndisp || soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
+	    soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
 		return -EINVAL;
 	return 0;
 }
@@ -10153,6 +10236,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
 	{ .compatible = "apple,t8132-sleep", .data = &t8132_sleep_soc },
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
+	{ .compatible = "apple,t6040-sleep", .data = &t6040_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
 	{ .compatible = "apple,t8103-sleep", .data = &t8103_sleep_soc },
@@ -10165,6 +10249,7 @@ static struct platform_driver apple_sleep_driver = {
 		.name = "apple-sleep",
 		.of_match_table = apple_sleep_of_match,
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&apple_sleep_pm_ops),
 	},
 	.probe = apple_sleep_probe,
 };

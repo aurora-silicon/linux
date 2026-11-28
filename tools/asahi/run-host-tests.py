@@ -77,6 +77,7 @@ ASAHI_TESTS = {
     'rtkit-v27-late-tests.py': [(out(), PASS), (out() + ['--consume-committed'], KILL),
                                 (out() + ['--fail-foreign'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
+    'dcp-ext-repower-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
     'dcpext26-modeset-tests.py': [([], PASS)],
     'dcpext26-parity-tests.py': [([], PASS)],

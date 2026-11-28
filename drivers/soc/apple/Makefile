@@ -24,7 +24,7 @@ apple-sleep-y = sleep.o sleep-perf-step.o
 obj-$(CONFIG_APPLE_SOC_SLEEP) += t6041-sleep.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
-apple-rtkit-y = rtkit.o rtkit-crashlog.o
+apple-rtkit-y = rtkit.o rtkit-crashlog.o rtkit-hib-handoff.o
 
 obj-$(CONFIG_APPLE_RTKIT_HELPER) += apple-rtkit-helper.o
 apple-rtkit-helper-y = rtkit-helper.o
@@ -78,3 +78,4 @@ apple-regview-y := regview.o
 obj-$(CONFIG_APPLE_REGVIEW_KUNIT_TEST) += regview-test.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
+obj-$(CONFIG_APPLE_AURA_HIBERNATE) += aura-hibernate.o
