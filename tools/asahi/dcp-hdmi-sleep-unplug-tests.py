@@ -63,6 +63,7 @@ HARNESS = r'''
 #include <stdbool.h>
 #include <stdio.h>
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, val) ((x) = (val))
 #define dev_info(...) ((void)0)
 struct device { int unused; };
 struct gpio_desc { int level; };
@@ -74,6 +75,7 @@ struct apple_dcp {
 	struct gpio_desc *hdmi_hpd;
 	int hdmi_hpd_irq;
 	bool external_native;
+	bool hdmi_crtc_off;
 };
 static unsigned hpd_events, disconnects, fabric_unplugs, irq_off;
 static int gpiod_get_value_cansleep(struct gpio_desc *g) { return g->level; }
@@ -92,6 +94,7 @@ static void release_lock(int **lock) { **lock = 0; }
 static void dcp_hdmi_disconnect(struct apple_dcp *dcp)
 {
 	assert(dcp_typec_fabric_lock);
+	WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	disconnected_hpd_event(dcp->connector);
 	dcp_dptx_disconnect(dcp, 0);
 }

@@ -3206,12 +3206,13 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 */
 
 	/*
-	 * Same for the unplug a Type-C output reports after its CRTC was
-	 * powered off with the cable still attached (see dcp_poweroff()).
+	 * Same for the synthetic unplug an external output reports after its
+	 * CRTC released DPTX with the cable still attached (see dcp_poweroff()).
 	 */
-	if (!(*connected) && READ_ONCE(dcp->typec_crtc_off) &&
-	    READ_ONCE(dcp->typec_cable_connected)) {
-		dev_dbg(dcp->dev, "cb_hotplug() ignoring unplug of powered-off Type-C output\n");
+	if (!(*connected) &&
+	    ((READ_ONCE(dcp->typec_crtc_off) && READ_ONCE(dcp->typec_cable_connected)) ||
+	     READ_ONCE(dcp->hdmi_crtc_off))) {
+		dev_dbg(dcp->dev, "cb_hotplug() ignoring unplug of powered-off output\n");
 		dcp_mode_invalidate(&dcp->mode_state);
 		schedule_work(&dcp->vblank_wq);
 		return;

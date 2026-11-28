@@ -2036,6 +2036,7 @@ void dcp_hotplug(struct work_struct *work)
 		    * again, and that wake does the same, forever.
 		    */
 		   !READ_ONCE(dcp->typec_crtc_off) &&
+		   !READ_ONCE(dcp->hdmi_crtc_off) &&
 		   /*
 		    * Nor while a Type-C CRTC enable runs: dcp_poweron() reconnects
 		    * the link, and the HPD that answers it comes before the mode

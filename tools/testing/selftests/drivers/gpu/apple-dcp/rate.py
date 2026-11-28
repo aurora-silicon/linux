@@ -1433,7 +1433,7 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     struct { bool lock,presentation_paused; } iomfb;
     struct { bool valid,changing; } mode_state;
     struct work_struct external_stop_work,vblank_wq;
-    bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
+    bool external_physically_absent,main_display,typec_crtc_off,hdmi_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
     bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
     unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready;''')
@@ -1489,7 +1489,8 @@ static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
     dcpep_cb_hotplug(&d,&connected);assert(d.rate_proof.sequence==sequence && !con.edid_invalidation_pending);
     connected=1;dcpep_cb_hotplug(&d,&connected);
     connected=0;d.typec_crtc_off=true;dcpep_cb_hotplug(&d,&connected);assert(d.rate_proof.sequence==sequence);
-    d.typec_crtc_off=false;d.iomfb.presentation_paused=true;dcpep_cb_hotplug(&d,&connected);
+    d.typec_crtc_off=false;d.hdmi_crtc_off=true;dcpep_cb_hotplug(&d,&connected);assert(d.rate_proof.sequence==sequence);
+    d.hdmi_crtc_off=false;d.iomfb.presentation_paused=true;dcpep_cb_hotplug(&d,&connected);
     assert(d.rate_proof.sequence==sequence && !con.edid_invalidation_pending);d.iomfb.lock=false;probe(true);
     assert(!d.typec_display_ready);
     dcpavserv_teardown(&av_services[0]);cleanup();

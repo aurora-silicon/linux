@@ -128,6 +128,7 @@ def main():
         ('lifecycle', 'fast-replug-bounce', lifecycle.bounce, ((),),
          ('-Wno-unused-variable', '-Wno-unused-function', '-Wno-unused-but-set-variable')),
         ('lifecycle', 'stale-crtc-poweroff', lifecycle.poweroff_replug, ((),), ()),
+        ('lifecycle', 'hdmi-crtc-off-hpd', lifecycle.hdmi_crtc_off_hpd, ((),), ()),
         ('lifecycle', 'dropped-swap-teardown', lifecycle.dropped, ((),),
          ('-Wno-unused-variable', '-Wno-unused-function', '-Wno-unused-but-set-variable')),
         ('lifecycle', 'dwc3-teardown', lifecycle.teardown, (('all',),), ()),

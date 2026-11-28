@@ -166,6 +166,7 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);
 /* DPTX operations supplied by the DCP firmware layer. */
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
+void dcp_disconnected_hpd_event(struct apple_connector *con);
 bool dcp_is_external_h17p(struct apple_dcp *dcp);
 bool dcp_is_retained_external(struct apple_dcp *dcp);
 

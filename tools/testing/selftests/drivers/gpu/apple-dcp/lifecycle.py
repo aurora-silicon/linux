@@ -843,8 +843,12 @@ struct completion { int done; };
 struct apple_connector { bool connected; };
 struct dptx_port { bool enabled, connected, available; void *service; };
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 2
 #define DCP_IOMFB_METHODS_H17G 7
 #define DRM_MODE_CONNECTOR_eDP 14
+#define PM_SUSPEND_ON 0
+#define PM_SUSPEND_TO_IDLE 1
+static int pm_suspend_target_state = PM_SUSPEND_ON;
 struct apple_dcp {
  int fw_compat, connector_type;
  struct { int iomfb_method_profile; } hw;
@@ -855,8 +859,9 @@ struct apple_dcp {
  struct dptx_port dptxport[2];
  struct apple_connector *connector;
  struct { bool active; } split;
+ struct { bool valid; } mode_state;
  bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
- bool typec_cable_connected, typec_crtc_off, external_native;
+ bool typec_cable_connected, typec_crtc_off, external_native, hdmi_crtc_off;
  u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
 };
 struct platform_device { struct apple_dcp *data; };
@@ -888,7 +893,8 @@ static int dcp_dptx_disconnect(struct apple_dcp *d, u32 port)
 { disconnects++; d->dptxport[port].connected = false; return 0; }
 static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, int delay)
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
-static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
+static bool hdmi_gpio;
+static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return hdmi_gpio; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
 ''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
@@ -900,6 +906,7 @@ static void init(u64 released, u64 claimed)
   .typec_output = true, .typec_cable_connected = true,
   .typec_unplugs = released, .crtc_unplugs = claimed,
   .connector = &connector,
+  .mode_state = { .valid = true },
  };
  dcp.dptxport[0].available = dcp.dptxport[0].connected = true;
  dcp.typec_reconnect_wq.pending = true;
@@ -924,6 +931,44 @@ int main(void)
  /* A successful replacement modeset refreshes the token before later DPMS. */
  init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+
+ /* Fixed HDMI, cable attached: firmware 27 releases the link on DPMS off. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && hpd_drops == 0 && disconnects == 1);
+ assert(!dcp.dptxport[0].connected && dcp.hdmi_crtc_off);
+ /* A CRTC disabled for a system sleep keeps the link: the resume finds it trained. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* ...unless the cable is gone. */
+ hdmi_gpio = false; init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 1 && !dcp.hdmi_crtc_off);
+ pm_suspend_target_state = PM_SUSPEND_ON; hdmi_gpio = true;
+ /* The desktop turns the CRTC off after the firmware's unplug at sleep: keep the link. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; connector.connected = false;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* Firmware republishing after hotplug (mode_state invalid): keep the link. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp.mode_state.valid = false;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* Other firmware keeps it while the cable is attached... */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* ...and every firmware releases it once the cable is gone. */
+ hdmi_gpio = false; init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 1 && !dcp.hdmi_crtc_off);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }
@@ -2292,3 +2337,177 @@ int main(void)
     checker = block(desktop, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     alias = '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
     return prefix + checker + alias + source[start:end] + suffix
+
+
+def hdmi_crtc_off_hpd(root):
+    """Verify fixed-HDMI HPD IRQ and poweron handling while hdmi_crtc_off is set."""
+    fabric = (root / 'drivers/gpu/drm/apple/dcp-fabric.c').read_text()
+    effects = (root / 'drivers/gpu/drm/apple/dcp-fabric-effects.h').read_text()
+    dcp_src = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    observed = block(fabric, 'static void dcp_hdmi_observed(')
+    connect_fixed = block(fabric, 'static void dcp_hdmi_connect_fixed(')
+    run_hdmi = effects[effects.index('struct dcp_fabric_hdmi_ops {'):
+                       effects.index('struct dcp_fabric_deactivate_ops {')]
+    poweron = block(dcp_src, 'void dcp_poweron(')
+    prefix = r"""#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define dev_info(...) ((void)0)
+#define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define WARN_ONCE(...) ((void)0)
+#define guard(x) fake_guard
+#define scoped_guard(x, y) if (fake_scoped_guard(y))
+#define spin_lock_irqsave(l, f) ((void)(l), (void)(f))
+#define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
+#define atomic_read(p) (*(p))
+#define atomic_set(p, v) (*(p) = (v))
+#define cancel_delayed_work(w) ((void)(w))
+#define cancel_delayed_work_sync(w) ((void)(w))
+#define cancel_work_sync(w) ((void)(w))
+#define queue_delayed_work(q, w, d) ((void)(q), (void)(w), (void)(d))
+#define msecs_to_jiffies(ms) (ms)
+#define jiffies 1UL
+#define system_freezable_wq 0
+#define DCP_BL_FALLBACK_DELAY 1
+#define DPTX_RECONNECT_DELAY 1
+#define DCP_FIRMWARE_V_12_3 1
+#define DCP_FIRMWARE_V_13_5 2
+#define DCP_FIRMWARE_V_14_7_TEMPLATE 3
+#define DCP_FIRMWARE_V_26_6_DESKTOP 4
+#define DCP_FIRMWARE_V_26_6 5
+#define DCP_FIRMWARE_V_14_7 6
+#define DCP_FIRMWARE_H17P 7
+#define DCP_FIRMWARE_V_27_0 8
+#define DCP_IOMFB_METHODS_H17G 9
+struct apple_connector { bool connected; };
+struct delayed_work { int unused; };
+struct work_struct { int unused; };
+struct desktop { bool trial_powered, ext_pipe_off; };
+struct apple_dcp {
+    void *dev, *hdmi_hpd, *avep;
+    struct apple_connector *connector;
+    struct desktop *desktop;
+    int fw_compat, connector_type;
+    struct { int iomfb_method_profile; } hw;
+    struct { bool update; u32 maximum; } brightness;
+    bool external_native, hdmi_crtc_off, hdmi_yielded;
+    bool typec_output, typec_crtc_off, typec_cable_connected;
+    bool typec_follow_start, typec_poweron_hpd, pipe_enabled_h17p;
+    bool crashed, quiescing, external;
+    unsigned crtc_unplugs, typec_unplugs, typec_generation, typec_reconnect_tries;
+    unsigned external_generation, external_crtc_generation;
+    int external_lock, hpd_mutex, relink_lock, relink, typec_iomfb_hpd_ready;
+    int external_held, external_retries;
+    struct delayed_work external_retry_wq, typec_reconnect_wq, placeholder_edid_wq;
+    struct delayed_work external_stop_retry_wq, bl_fallback_wq;
+    struct work_struct external_stop_work, ext26_blank_work;
+};
+struct platform_device { struct apple_dcp *data; };
+static bool fake_scoped_guard(int *p) { (void)p; return true; }
+static void fake_guard(int *p) { (void)p; }
+static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
+static int hpd_level, disconnects, connects, selects;
+static bool dcp_has_panel(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
+static bool dcp_is_ext26(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_is_retained_external(struct apple_dcp *d) { (void)d; return false; }
+static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_h17g_panel(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_backlight_active(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_uses_soft_dpms(struct apple_dcp *d) { (void)d; return false; }
+static int dcp_backlight_dpms(struct apple_dcp *d, bool on) { (void)d; (void)on; return 0; }
+static void dcp_dpms_power_on(struct apple_dcp *d) { (void)d; }
+static int dcp_external_start_locked(struct apple_dcp *d) { (void)d; return 0; }
+static int dcp_fixed_output_select(struct apple_dcp *d) { (void)d; selects++; return 0; }
+static int dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; connects++; return 0; }
+static void dcp_hdmi_connect_failed(struct apple_dcp *d, int ret) { (void)d; (void)ret; }
+static void disconnected_hpd_event(struct apple_connector *c)
+{ assert(c); disconnects++; c->connected = false; }
+static void dcp_disconnected_hpd_event(struct apple_connector *c)
+{ disconnected_hpd_event(c); }
+static int gpiod_get_value_cansleep(void *g) { assert(g); return hpd_level; }
+static void dcp_relink_wake(int *r, unsigned g, unsigned long j) { (void)r; (void)g; (void)j; }
+static void dcp_relink_link_up(int *r, unsigned g, unsigned long j) { (void)r; (void)g; (void)j; }
+static void dcp_queue_typec_reconnect(struct apple_dcp *d, int delay) { (void)d; (void)delay; }
+static unsigned long wait_for_completion_timeout(int *c, unsigned long t) { (void)c; return t; }
+static void iomfb_poweron_v12_3(struct apple_dcp *d) { (void)d; }
+static void iomfb_poweron_v13_3(struct apple_dcp *d) { (void)d; }
+static void iomfb_poweron_v14_7_0(struct apple_dcp *d) { (void)d; }
+static void iomfb_poweron_v26_6_desktop(struct apple_dcp *d) { (void)d; }
+static void iomfb_v26_6_poweron(struct apple_dcp *d) { (void)d; }
+static void iomfb_v14_7_poweron(struct apple_dcp *d) { (void)d; }
+static void iomfb_poweron_v27(struct apple_dcp *d) { (void)d; }
+static void iomfb_poweron_h17p(struct apple_dcp *d) { (void)d; }
+static void av_service_connect(struct apple_dcp *d) { (void)d; }
+static bool stub_false(void *ctx) { (void)ctx; return false; }
+static int stub_read_hpd(void *ctx) { (void)ctx; return hpd_level; }
+static void stub_wait(void *ctx, unsigned int ms) { (void)ctx; (void)ms; }
+static void stub_noop(void *ctx) { (void)ctx; }
+"""
+    suffix = r"""
+static const struct dcp_fabric_hdmi_ops test_hdmi_ops = {
+    .borrowed = stub_false,
+    .keep_order = stub_false,
+    .dual_stream = stub_false,
+    .read_hpd = stub_read_hpd,
+    .wait = stub_wait,
+    .rebalance = stub_noop,
+    .waiting = stub_noop,
+    .observed = dcp_hdmi_observed,
+    .connect_fixed = dcp_hdmi_connect_fixed,
+};
+
+int main(void)
+{
+    struct apple_connector con = { .connected = true };
+    struct apple_dcp d = {
+        .hdmi_hpd = &con,
+        .connector = &con,
+        .fw_compat = DCP_FIRMWARE_V_27_0,
+    };
+    struct platform_device pdev = { .data = &d };
+
+    /* 1. HPD high / blink while DPMS-off stays parked and does not retrain. */
+    d.hdmi_crtc_off = true;
+    hpd_level = 1;
+    connects = disconnects = selects = 0;
+    dcp_fabric_run_hdmi(&test_hdmi_ops, &d);
+    assert(d.hdmi_crtc_off && con.connected && connects == 0 && disconnects == 0 && selects == 0);
+
+    /* 2. Physical unplug while DPMS-off clears hdmi_crtc_off and reports disconnect. */
+    hpd_level = 0;
+    dcp_fabric_run_hdmi(&test_hdmi_ops, &d);
+    assert(!d.hdmi_crtc_off && !con.connected && disconnects == 1 && connects == 0);
+
+    /* 3. Subsequent plug after unplug-while-DPMS-off connects normally. */
+    hpd_level = 1;
+    dcp_fabric_run_hdmi(&test_hdmi_ops, &d);
+    assert(!d.hdmi_crtc_off && connects == 1 && selects == 1 && disconnects == 1);
+
+    /* 4. dcp_poweron() waking from hdmi_crtc_off with cable gone reports disconnect. */
+    d.hdmi_crtc_off = true;
+    con.connected = true;
+    hpd_level = 0;
+    connects = disconnects = 0;
+    dcp_poweron(&pdev);
+    assert(!d.hdmi_crtc_off && !con.connected && disconnects == 1 && connects == 0);
+
+    /* 5. dcp_poweron() waking from hdmi_crtc_off with cable present retrains. */
+    d.hdmi_crtc_off = true;
+    con.connected = true;
+    hpd_level = 1;
+    connects = disconnects = 0;
+    dcp_poweron(&pdev);
+    assert(!d.hdmi_crtc_off && con.connected && connects == 1 && disconnects == 0);
+
+    puts("hdmi_crtc_off HPD and poweron transitions passed");
+    return 0;
+}
+"""
+    return prefix + run_hdmi + '\n' + observed + '\n' + connect_fixed + '\n' + poweron + suffix

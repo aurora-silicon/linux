@@ -3499,6 +3499,7 @@ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 	msleep(500);
 	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 	dev_dbg(dcp->dev, "DP2HDMI HPD irq, connected:%d after 500 ms\n", connected);
+	WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	if (!connected) {
 		/*
 		 * A yield outlasts HDMI blinks (a monitor reconfiguring its
@@ -4204,6 +4205,11 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	schedule_work(&con->hotplug_wq);
 	/* Drop the display's backlight, outside the caller's locks. */
 	schedule_work(&con->bl_sync_wq);
+}
+
+void dcp_disconnected_hpd_event(struct apple_connector *con)
+{
+	disconnected_hpd_event(con);
 }
 
 /*
@@ -5659,10 +5665,15 @@ void dcp_poweron(struct platform_device *pdev)
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
-		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+		bool was_crtc_off = READ_ONCE(dcp->hdmi_crtc_off);
 
+		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+		WRITE_ONCE(dcp->hdmi_crtc_off, false);
+
+		if (!connected && was_crtc_off)
+			disconnected_hpd_event(dcp->connector);
 		/* A yielded hybrid is about to take a Type-C display. */
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
+		else if (connected && !READ_ONCE(dcp->hdmi_yielded))
 			dcp_dptx_connect(dcp, 0);
 	}
 
@@ -5836,10 +5847,38 @@ void dcp_poweroff(struct platform_device *pdev)
 		}
 	} else if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		/*
+		 * With the firmware-27 interface (DCP_FIRMWARE_V_27_0), DCP keeps
+		 * a fixed HDMI port's DPTX link trained after the pipe is
+		 * blanked, so the PHY stays powered while the display is off.
+		 * Release it; dcp_poweron() retrains the link before it enables
+		 * the pipe again. Earlier interfaces keep the old rule: release
+		 * the link only once the cable is gone.
+		 * The firmware then reports an unplug although the cable is still
+		 * attached; dcpep_cb_hotplug() ignores it while hdmi_crtc_off is
+		 * set. A real removal still arrives through the HPD GPIO.
+		 *
+		 * Only a DPMS off of a display whose mode is still valid and
+		 * described as connected: a CRTC disabled for a system sleep,
+		 * by the desktop after the firmware's unplug at sleep, or while
+		 * firmware is republishing the display after hotplug (when
+		 * iomfb_poweroff() skipped stopping an external H17P pipe)
+		 * keeps the link as before, so the firmware reports the display
+		 * again once it is retrained.
+		 */
+		bool release = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			       pm_suspend_target_state == PM_SUSPEND_ON &&
+			       dcp->connector && READ_ONCE(dcp->connector->connected) &&
+			       READ_ONCE(dcp->mode_state.valid);
+
 		if (!connected) {
+			WRITE_ONCE(dcp->hdmi_crtc_off, false);
 			disconnected_hpd_event(dcp->connector);
-			dcp_dptx_disconnect(dcp, 0);
+		} else if (release) {
+			WRITE_ONCE(dcp->hdmi_crtc_off, true);
 		}
+		if (!connected || release)
+			dcp_dptx_disconnect(dcp, 0);
 	}
 }
 
@@ -11505,13 +11544,17 @@ static int dcp_platform_suspend(struct device *dev)
 		 * that stays attached reports it unplugged, and nothing
 		 * connects it again after the wake: its HPD stays high, so no
 		 * edge comes, and a CRTC userspace turned off for the unplug
-		 * never runs dcp_poweron(). A T6030 native output's resume sets
-		 * its PHY and crossbar up again (dcp_fabric_hdmi_reinit()),
-		 * which needs the link down, so it is still released.
+		 * never runs dcp_poweron(). A display whose link was already
+		 * released by DPMS off (hdmi_crtc_off) stays connected through
+		 * the sleep the same way, and the next dcp_poweron() retrains
+		 * it. A T6030 native output's resume sets its PHY and crossbar
+		 * up again (dcp_fabric_hdmi_reinit()), which needs the link
+		 * down, so it is still released.
 		 */
 		if (!dcp->active_typec_route &&
 		    (dcp->external_native ||
 		     gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)) {
+			WRITE_ONCE(dcp->hdmi_crtc_off, false);
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
@@ -11532,6 +11575,7 @@ static int dcp_platform_suspend(struct device *dev)
 
 void dcp_hdmi_disconnect(struct apple_dcp *dcp)
 {
+	WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	disconnected_hpd_event(dcp->connector);
 	dcp_dptx_disconnect(dcp, 0);
 }

@@ -5422,6 +5422,15 @@ static void dcp_hdmi_observed(void *ctx, bool high, bool debounced)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", high);
 	else
 		dev_info(dcp->dev, "DP2HDMI HPD irq, connected:%d\n", high);
+
+	/*
+	 * If DPMS off already released DPTX while the cable stayed attached,
+	 * firmware will not emit a disconnect when the cable is removed.
+	 */
+	if (!high && READ_ONCE(dcp->hdmi_crtc_off)) {
+		WRITE_ONCE(dcp->hdmi_crtc_off, false);
+		dcp_disconnected_hpd_event(dcp->connector);
+	}
 }
 
 /* A failed HDMI connect that a retry may fix; see dcp_fabric_hdmi_retry(). */
@@ -5435,7 +5444,13 @@ static void dcp_hdmi_connect_failed(struct apple_dcp *dcp, int ret)
 static void dcp_hdmi_connect_fixed(void *ctx)
 {
 	struct apple_dcp *dcp = ctx;
-	int ret = dcp_fixed_output_select(dcp);
+	int ret;
+
+	/* Stay parked while DPMS off holds the link released; dcp_poweron() retrains. */
+	if (READ_ONCE(dcp->hdmi_crtc_off))
+		return;
+
+	ret = dcp_fixed_output_select(dcp);
 
 	/*
 	 * A new HDMI attach gets its own retries. The converter's HPD pulses
