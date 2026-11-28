@@ -297,7 +297,8 @@ static int apple_dart_dcp_read_adt(struct apple_dart *dart, struct dcp_adt_table
 		ret = dcp_adt_parse_common(data, resource_size(&res), dart->dcp_instance, tables,
 					   frontend);
 	else
-		ret = frontend ? dcp_adt_parse_frontend(data, resource_size(&res), tables,
+		ret = frontend ? dcp_adt_parse_frontend(data, resource_size(&res),
+							dart->dcp_instance, tables,
 							frontend) :
 			dcp_adt_parse_instance(data, resource_size(&res), dart->dcp_instance,
 					       tables);
@@ -401,16 +402,29 @@ static int apple_dart_dcp_arena(struct apple_dart_dcp *dcp)
 	return slots >= DCP_DART_SCANOUT_SLOTS ? 0 : -ENOSPC;
 }
 
+/* Legacy firmware trees use an underscore in the SID16 alias. */
+static struct device_node *apple_dart_frontend_node(bool piodma)
+{
+	struct device_node *node;
+
+	if (!piodma)
+		return of_find_node_by_path("disp0");
+
+	node = of_find_node_by_path("disp0-piodma");
+	return node ? node : of_find_node_by_path("disp0_piodma");
+}
+
 /* Snapshot only this consumer's real no-map reservations, before table admission. */
 static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 {
 	struct device_node *consumer, *node;
-	/* An external display DART's SID16 serves its dcpext's memory. */
-	const char *alias = dcp->sid == 23 || dcp->dart->dispext ?
-		dcp->dart->dcp_instance->dcp : dcp->sid == 0 ? "disp0" : "disp0_piodma";
 	int count, ret = 0;
 
-	consumer = of_find_node_by_path(alias);
+	/* An external display DART's SID16 serves its dcpext's memory. */
+	if (dcp->sid == 23 || dcp->dart->dispext)
+		consumer = of_find_node_by_path(dcp->dart->dcp_instance->dcp);
+	else
+		consumer = apple_dart_frontend_node(dcp->sid != 0);
 	if (!consumer)
 		return -ENODEV;
 	count = of_property_count_u32_elems(consumer, "memory-region");
@@ -741,7 +755,9 @@ static int apple_dart_frontend_validate(struct apple_dart_dcp *dcp,
 {
 	struct device_node *alias;
 	struct of_phandle_args spec;
-	u32 wanted = dcp->sid == 0 ? BIT(4) | BIT(6) : BIT(5);
+	bool main_external = dcp->dart->dcp_instance == &dcp_adt_main_external;
+	u32 wanted = dcp->sid == 0 ?
+		(main_external ? BIT(4) : BIT(4) | BIT(6)) : BIT(5);
 	u32 seen = 0;
 	unsigned long flags;
 	int nr, ret;
@@ -773,9 +789,11 @@ snapshot_done:
 	if (ret)
 		return ret;
 
-	alias = of_find_node_by_path(dcp->sid == 0 ? "disp0" : "disp0_piodma");
+	alias = apple_dart_frontend_node(dcp->sid != 0);
 	ret = alias && consumer == alias && of_device_is_available(alias) &&
-		of_property_read_bool(alias, "apple,j713-inherited-mappings") ? 0 : -ENODEV;
+		(main_external ||
+		 of_property_read_bool(alias, "apple,j713-inherited-mappings")) ?
+		0 : -ENODEV;
 	of_node_put(alias);
 	if (ret)
 		return ret;
@@ -800,6 +818,9 @@ snapshot_done:
 		struct resource res;
 		const __be32 *maps;
 		unsigned int matches = 0;
+		bool retained_framebuffer = main_external && dcp->sid == 0 &&
+			of_property_match_string(consumer, "memory-region-names",
+						 "framebuffer") == i;
 		int bytes;
 
 		if (!node)
@@ -813,6 +834,15 @@ snapshot_done:
 		    rmem->base != res.start || rmem->size != resource_size(&res))
 			goto put_node;
 		maps = of_get_property(node, "iommu-addresses", &bytes);
+		/*
+		 * The retained scanout framebuffer is a physical handoff, not a
+		 * frontend-DART segment.  Keep requiring the reserved no-map region,
+		 * but only region94 participates in SID0's inherited table contract.
+		 */
+		if (retained_framebuffer) {
+			ret = maps ? -EINVAL : 0;
+			goto put_node;
+		}
 		if (!maps || bytes <= 0 || bytes % (5 * sizeof(*maps)))
 			goto put_node;
 		for (int j = 0; j < bytes / sizeof(*maps); j += 5) {
@@ -990,7 +1020,7 @@ static int apple_dart_frontend_prepare(struct apple_dart *dart)
 					    frontend.end[i], &borrowed[i]);
 		if (ret)
 			return ret;
-		node = of_find_node_by_path(i ? "disp0_piodma" : "disp0");
+		node = apple_dart_frontend_node(i);
 		ret = node ? apple_dart_frontend_validate(borrowed[i], node) : -ENODEV;
 		of_node_put(node);
 		if (ret)
@@ -1016,7 +1046,7 @@ static ssize_t j713_display_state_show(struct device *dev,
 	if (!dart->frontend[0] || !dart->frontend[1] || !READ_ONCE(dart->iommu.ready))
 		return -ENODEV;
 	for (unsigned int i = 0; i < 2; i++) {
-		struct device_node *node = of_find_node_by_path(i ? "disp0_piodma" : "disp0");
+		struct device_node *node = apple_dart_frontend_node(i);
 
 		status[i] = node ? apple_dart_frontend_validate(dart->frontend[i], node) : -ENODEV;
 		of_node_put(node);
@@ -1069,7 +1099,8 @@ static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *de
 	}
 
 	if (!of_device_is_compatible(dev->of_node,
-				     dcp->dart->dcp_instance == &dcp_adt_internal ?
+				     (dcp->dart->dcp_instance == &dcp_adt_internal ||
+				      dcp->dart->dcp_instance == &dcp_adt_main_external) ?
 				     "apple,t8132-dcp" : "apple,t8132-dcpext") ||
 	    !apple_dart_dcp_firmware(dev->of_node) ||
 	    (dcp->owner && dcp->owner != dev))

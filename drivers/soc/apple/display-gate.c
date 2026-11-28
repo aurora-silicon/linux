@@ -3738,7 +3738,7 @@ static void __init gate_t8132_put_nodes(struct device_node *nodes[T8132_HDMI_NR]
 }
 
 /*
- * Derive a fixed-DP T8132 dcpext's chain from its own DT phandles: the dp-phy
+ * Derive a fixed-DP T8132 DCP's chain from its own DT phandles: the dp-phy
  * PHY, firmware DART (iommus), display DART (piodma's iommus), mailbox
  * (mboxes), piodma child, then the dcpext node itself.
  */
@@ -3777,6 +3777,64 @@ static int __init gate_t8132_resolve_fixed_dp(struct device_node *dcp,
 fail:
 	gate_t8132_put_nodes(nodes);
 	return -EINVAL;
+}
+
+/* The M4 firmware uses the main DCP and the PHY's legacy operations. */
+static void __init gate_t8132_main_hdmi(void)
+{
+	struct device_node *dcp __free(device_node) = of_find_node_by_path("dcp");
+	struct device_node *display __free(device_node) = NULL;
+	struct device_node *phy_domain __free(device_node) = NULL;
+	struct device_node *nodes[T8132_HDMI_NR];
+	const char *connector;
+	struct of_changeset *cs;
+	int i, phy_idx, ret;
+
+	if (!apple_t8132_qualified_firmware() ||
+	    !of_device_is_compatible(dcp, "apple,t8132-dcp") ||
+	    of_property_read_string(dcp, "apple,connector-type", &connector) ||
+	    strcmp(connector, "HDMI-A") ||
+	    (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()))
+		return;
+
+	phy_idx = of_property_match_string(dcp, "phy-names", "dp-phy");
+	if (phy_idx < 0 || gate_t8132_resolve_fixed_dp(dcp, phy_idx, nodes))
+		return;
+
+	staged_prefix = gate_t8132.prefix;
+	display = of_find_node_by_path("disp0");
+	phy_domain = of_parse_phandle(nodes[T8132_HDMI_PHY], "power-domains", 0);
+	if (!display || !of_device_is_compatible(display, gate_t8132.display_compat) ||
+	    !of_device_is_compatible(nodes[T8132_HDMI_PHY], "apple,t8132-dptx-phy") ||
+	    !of_device_is_available(phy_domain) ||
+	    !staged_node_firmware_memory(dcp) ||
+	    !staged_node_firmware_memory(display) ||
+	    !staged_node_firmware_memory(nodes[T8132_HDMI_PIODMA]))
+		goto put_nodes;
+
+	cs = gate_cs_alloc();
+	if (!cs)
+		goto put_nodes;
+	/* The legacy driver cannot restore the PHY state lost across power-off. */
+	ret = 0;
+	if (!of_property_present(phy_domain, "apple,always-on"))
+		ret = of_changeset_add_prop_bool(cs, phy_domain, "apple,always-on");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, nodes[T8132_HDMI_PHY],
+						      "compatible", "apple,t8122-dptx-phy");
+	for (i = 0; !ret && i < T8132_HDMI_NR; i++)
+		ret = of_changeset_update_prop_string(cs, nodes[i], "status", "okay");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, display, "status", "okay");
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret) {
+		gate_cs_free(cs);
+		staged_err("%pOF: could not enable the inherited HDMI chain: %d\n", dcp, ret);
+	}
+
+put_nodes:
+	gate_t8132_put_nodes(nodes);
 }
 
 /* Every node of @nodes is distinct and still disabled, and its processor has firmware memory. */
@@ -4001,6 +4059,7 @@ static int __init apple_display_gate(void)
 	int i;
 
 	if (apple_t8132_firmware_path()) {
+		gate_t8132_main_hdmi();
 		gate_j713_dcpext_routes();
 		return 0;
 	}

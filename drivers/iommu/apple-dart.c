@@ -497,6 +497,7 @@ struct apple_dart {
 	/* The display coprocessor whose firmware DART (SID23) this is. */
 	const struct dcp_adt_instance *dcp_instance;
 	bool preserve_display;
+	bool t8132_main_external;
 	/* A J713 external display DART, borrowed from its external DCP */
 	bool dispext;
 	/*
@@ -928,6 +929,21 @@ static const char *apple_dart_board(void)
 		of_node_put(root);
 	}
 	return board ?: "unknown board";
+}
+
+/* A fixed HDMI connector makes the T8132 main DCP an external pipeline. */
+static bool apple_dart_t8132_main_external(void)
+{
+	struct device_node *dcp;
+	const char *connector;
+	bool qualified;
+
+	dcp = of_find_compatible_node(NULL, NULL, "apple,t8132-dcp");
+	qualified = dcp && of_device_is_available(dcp) &&
+		!of_property_read_string(dcp, "apple,connector-type", &connector) &&
+		!strcmp(connector, "HDMI-A");
+	of_node_put(dcp);
+	return qualified;
 }
 
 static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map *stream_map);
@@ -5976,6 +5992,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 					     "usb4-pcie-tunnel-");
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio, t8132_dcp = false;
 	bool cold_avd = of_device_is_compatible(dev->of_node, "apple,t8152-avd-dart");
+	bool t8132_main_external;
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
@@ -6000,6 +6017,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		apple_dart_serves_t8132_dcp(dev->of_node);
 	if (t8132_dcp)
 		j713_display = false;
+	t8132_main_external = j713_display && apple_dart_t8132_main_external();
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
 	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
@@ -6137,6 +6155,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
+	dart->t8132_main_external = t8132_main_external;
 	dart->dispext = j713_dispext;
 	dart->power_gated = j713_dispext;
 	if (j713_display && of_property_present(dev->of_node, "apple,clock-protection")) {
@@ -6158,7 +6177,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	else if (j713_dispext)
 		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a300000ULL];
 	else if (j713_display)
-		dart->dcp_instance = &dcp_adt_internal;
+		dart->dcp_instance = t8132_main_external ?
+			&dcp_adt_main_external : &dcp_adt_internal;
 	if (tunneled) {
 		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
 		if (pd_np) {
@@ -8402,7 +8422,17 @@ int apple_dart_dcp_dispext_state(struct device_node *consumer)
 	if (!device_is_bound(&pdev->dev) || pdev->dev.driver != &apple_dart_driver.driver)
 		goto out;
 	dart = platform_get_drvdata(pdev);
-	if (!dart || !dart->dispext || !dart->frontend[1])
+	if (!dart || !dart->frontend[1])
+		goto out;
+	if (!dart->dispext && dart->t8132_main_external) {
+		if (!dart->frontend[0] || !apple_dart_dcp_registers(dart->frontend[0]) ||
+		    !apple_dart_dcp_registers(dart->frontend[1]) || apple_dart_fault_pending(dart))
+			ret = -EIO;
+		else
+			ret = 0;
+		goto out;
+	}
+	if (!dart->dispext)
 		goto out;
 	ret = apple_dart_dispext_verify(dart, "after power-up");
 out:

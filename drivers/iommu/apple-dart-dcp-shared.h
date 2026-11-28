@@ -280,7 +280,8 @@ static int __apple_dart_dcp_dispext_map(struct device *piodma, unsigned int sid,
 	if (ret)
 		return ret;
 	pio = to_dart_domain(iommu_get_domain_for_dev(piodma))->dcp;
-	if (pio->sid != 16 || !pio->dart->dispext)
+	if (pio->sid != 16 ||
+	    (!pio->dart->dispext && !pio->dart->t8132_main_external))
 		return -ENODEV;
 	dcp = sid ? pio : pio->dart->frontend[0];
 	if (!dcp)
@@ -369,7 +370,8 @@ int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid)
 	if (!domain || domain->owner != &apple_dart_iommu_ops || (sid != 0 && sid != 16))
 		return -ENODEV;
 	pio = to_dart_domain(domain)->dcp;
-	if (!pio || pio->sid != 16 || !pio->dart->dispext)
+	if (!pio || pio->sid != 16 ||
+	    (!pio->dart->dispext && !pio->dart->t8132_main_external))
 		return -ENODEV;
 	dcp = sid ? pio : pio->dart->frontend[0];
 	if (!dcp)
@@ -403,7 +405,8 @@ static void *__apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_
 	if (ret)
 		return ERR_PTR(ret);
 	pio = to_dart_domain(iommu_get_domain_for_dev(piodma))->dcp;
-	if (pio->sid != 16 || !pio->dart->dispext)
+	if (pio->sid != 16 ||
+	    (!pio->dart->dispext && !pio->dart->t8132_main_external))
 		return ERR_PTR(-ENODEV);
 	dcp = pio->dart->frontend[0];
 	if (!dcp)
@@ -515,7 +518,8 @@ static struct apple_dart_dcp *apple_dart_dcp_dispext_pio(struct device *piodma)
 	if (!domain || domain->owner != &apple_dart_iommu_ops)
 		return NULL;
 	pio = to_dart_domain(domain)->dcp;
-	if (!pio || pio->sid != 16 || !pio->dart->dispext)
+	if (!pio || pio->sid != 16 ||
+	    (!pio->dart->dispext && !pio->dart->t8132_main_external))
 		return NULL;
 	return pio;
 }
