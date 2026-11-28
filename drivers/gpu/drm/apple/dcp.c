@@ -6519,6 +6519,12 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+/*
+ * The native 26.x protocol of the T8122 external processor is admitted by
+ * the owner's opt-in, the boot loader's handoff and firmware-ready markers
+ * on the node, and the exact firmware image (version and UUID) that
+ * protocol was written for. The board does not enter into it.
+ */
 static bool dcp_ext26_admitted(struct device_node *np)
 {
 	struct device_node *chosen = of_find_node_by_path("/chosen");
@@ -6529,7 +6535,6 @@ static bool dcp_ext26_admitted(struct device_node *np)
 
 	opt = chosen ? of_get_property(chosen, "asahi,j613-25g83-dcpext", &length) : NULL;
 	ok = opt && length == 2 && opt[0] == '1' && !opt[1] &&
-		of_machine_is_compatible("apple,j613") &&
 		!of_property_read_u32(np, "apple,j613-25g83-dcpext-handoff", &marker) && marker == 1 &&
 		!of_property_read_u32(np, "apple,t8122-dcpext-firmware-ready", &marker) && marker == 1 &&
 		of_property_count_u32_elems(np, "apple,firmware-compat") == 3 &&

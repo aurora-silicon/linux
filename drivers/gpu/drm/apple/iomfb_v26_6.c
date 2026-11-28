@@ -104,8 +104,11 @@ struct dcp_v26_board {
 	/* In log messages. */
 	const char *name;
 	const char *dcp_compatible;
-	/* The machine compatible; NULL for any machine with this DCP. */
-	const char *machine;
+	/*
+	 * The compatible of the panel node the board device tree puts under
+	 * the DCP; NULL for any panel on this DCP.
+	 */
+	const char *panel;
 	/* The firmware image whose layouts were checked for this board. */
 	const char *firmware_uuid;
 	/* Set to 1 by the boot loader on the DCP, display and PIODMA nodes. */
@@ -123,7 +126,7 @@ struct dcp_v26_board {
 static const struct dcp_v26_board dcp_v26_board_j613 = {
 	.name = "J613/25G83",
 	.dcp_compatible = "apple,t8122-dcp",
-	.machine = "apple,j613",
+	.panel = "apple,panel-j613",
 	.firmware_uuid = DCP_V26_J613_FIRMWARE_UUID,
 	.handoff = "apple,j613-25g83-mapping-handoff",
 	.max_nits = 525,
@@ -134,7 +137,7 @@ static const struct dcp_v26_board dcp_v26_board_j613 = {
 static const struct dcp_v26_board dcp_v26_board_j615 = {
 	.name = "J615/25G83 (experimental)",
 	.dcp_compatible = "apple,t8122-dcp",
-	.machine = "apple,j615",
+	.panel = "apple,panel-j615",
 	.firmware_uuid = DCP_V26_J613_FIRMWARE_UUID,
 	.handoff = "apple,j613-25g83-mapping-handoff",
 	.max_nits = 525,
@@ -933,9 +936,18 @@ static int dcp_v26_cpu_running(struct device *dev, const char *name)
 	return 0;
 }
 
+/* The panel the board device tree puts under the DCP node. */
+static bool dcp_v26_panel_is(struct device_node *np, const char *compat)
+{
+	struct device_node *panel __free(device_node) =
+		of_get_child_by_name(np, "panel");
+
+	return panel && of_device_is_compatible(panel, compat);
+}
+
 /*
  * The board of a 14.x IOMFB DCP node: NULL if the node is not one, an error
- * if it is but the machine is not a board this file knows.
+ * if it is but no board record is for its panel.
  */
 const struct dcp_v26_board *iomfb_v26_6_board(struct device *dev)
 {
@@ -946,14 +958,14 @@ const struct dcp_v26_board *iomfb_v26_6_board(struct device *dev)
 		board = dcp_v26_boards[i];
 		if (!of_device_is_compatible(dev->of_node, board->dcp_compatible))
 			continue;
-		if (board->machine && !of_machine_is_compatible(board->machine)) {
+		if (board->panel && !dcp_v26_panel_is(dev->of_node, board->panel)) {
 			known = board;
 			continue;
 		}
 		return board;
 	}
 	if (known) {
-		dev_err(dev, "25G83 display not started: this machine is none of the 25G83 boards\n");
+		dev_err(dev, "25G83 display not started: no 25G83 board record for this panel\n");
 		return ERR_PTR(-ENODEV);
 	}
 	return NULL;
