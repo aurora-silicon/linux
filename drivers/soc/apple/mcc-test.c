@@ -103,10 +103,60 @@ static void apple_mcc_test_not_ready(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->flushed, 0UL);
 }
 
+static void apple_mcc_test_t8103_dcs_lp(struct kunit *test)
+{
+	struct apple_mcc *mcc;
+	u32 *bcast, *dcs;
+	unsigned int ch;
+
+	mcc = kunit_kzalloc(test, sizeof(*mcc), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, mcc);
+	bcast = kunit_kzalloc(test, 0x100, GFP_KERNEL);
+	dcs = kunit_kzalloc(test, T8103_DCS_NCHAN * 0x100, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bcast);
+	KUNIT_ASSERT_NOT_NULL(test, dcs);
+
+	mcc->bcast = (__force void __iomem *)bcast;
+	mcc->dcs = (__force void __iomem *)dcs;
+	mcc->dcs_stride = 0x100;
+	mcc->dcs_lp = true;
+
+	writel(0x00c8000a, mcc->bcast + T8103_MCC_BCAST_LP);
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++)
+		writel(0x070a0100 + ch, mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL);
+
+	apple_mcc_t8103_enable_lp(mcc, true);
+	KUNIT_EXPECT_EQ(test, readl(mcc->bcast + T8103_MCC_BCAST_LP),
+			0x00c8000aU | T8103_MCC_BCAST_LP_EN);
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++)
+		KUNIT_EXPECT_EQ(test, readl(mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL),
+				(0x070a0100U + ch) | T8103_DCS_CTL_LP);
+
+	/* Simulate a firmware-driven sleep clearing the gating bits; resume re-applies them. */
+	writel(0x00c8000a, mcc->bcast + T8103_MCC_BCAST_LP);
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++)
+		writel(0x070a0000 + ch, mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL);
+
+	apple_mcc_t8103_enable_lp(mcc, false);
+	KUNIT_EXPECT_EQ(test, readl(mcc->bcast + T8103_MCC_BCAST_LP),
+			0x00c8000aU | T8103_MCC_BCAST_LP_EN);
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++)
+		KUNIT_EXPECT_EQ(test, readl(mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL),
+				(0x070a0000U + ch) | T8103_DCS_CTL_LP);
+
+	/* Teardown restores the pre-probe register values saved at probe. */
+	apple_mcc_t8103_restore_lp(mcc);
+	KUNIT_EXPECT_EQ(test, readl(mcc->bcast + T8103_MCC_BCAST_LP), 0x00c8000aU);
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++)
+		KUNIT_EXPECT_EQ(test, readl(mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL),
+				0x070a0100U + ch);
+}
+
 static struct kunit_case apple_mcc_test_cases[] = {
 	KUNIT_CASE(apple_mcc_test_partial_enable),
 	KUNIT_CASE(apple_mcc_test_quiesce),
 	KUNIT_CASE(apple_mcc_test_not_ready),
+	KUNIT_CASE(apple_mcc_test_t8103_dcs_lp),
 	{}
 };
 

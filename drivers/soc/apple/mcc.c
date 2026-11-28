@@ -34,6 +34,20 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
+/*
+ * T8103 MCC broadcast and per-channel DCS low-power gating controls.
+ * Boot firmware leaves DCS_CTL_PWR_GATE clear on all eight channels, keeping
+ * the ps_dcs0..7 PMGR domains permanently active at idle.
+ */
+#define T8103_MCC_BCAST_LP	0x004
+#define T8103_MCC_BCAST_LP_EN	(BIT(29) | BIT(28))
+#define T8103_DCS_NCHAN		8
+#define T8103_DCS_STRIDE	0x40000
+#define T8103_DCS_CTL		0x00c
+#define T8103_DCS_CTL_CLK_GATE	BIT(8)
+#define T8103_DCS_CTL_PWR_GATE	BIT(12)
+#define T8103_DCS_CTL_LP	(T8103_DCS_CTL_PWR_GATE | T8103_DCS_CTL_CLK_GATE)
+
 /* T6050: eight AMCCs of four planes on each die, 64 planes on two dies. */
 #define MCC_MAX_PLANES		64
 #define MCC_FLUSH_TIMEOUT_US	100000
@@ -42,6 +56,12 @@ struct apple_mcc {
 	struct device *dev;
 	void __iomem *planes[MCC_MAX_PLANES];
 	unsigned int nr_planes;
+	void __iomem *bcast;
+	void __iomem *dcs;
+	resource_size_t dcs_stride;
+	u32 bcast_lp_saved;
+	u32 dcs_ctl_saved[T8103_DCS_NCHAN];
+	bool dcs_lp;
 	bool enabled;
 	bool retained;
 	/*
@@ -363,6 +383,74 @@ static void apple_mcc_boot_dma_lost(struct apple_mcc_boot_dma_consumer *consumer
 	mcc->sleep_disabled = false;
 }
 
+static void apple_mcc_t8103_enable_lp(struct apple_mcc *mcc, bool save)
+{
+	unsigned int ch;
+	u32 val;
+
+	val = readl(mcc->bcast + T8103_MCC_BCAST_LP);
+	if (save)
+		mcc->bcast_lp_saved = val;
+	writel(val | T8103_MCC_BCAST_LP_EN, mcc->bcast + T8103_MCC_BCAST_LP);
+
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++) {
+		void __iomem *reg = mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL;
+
+		val = readl(reg);
+		if (save)
+			mcc->dcs_ctl_saved[ch] = val;
+		writel(val | T8103_DCS_CTL_LP, reg);
+	}
+	/* Ensure broadcast and per-channel low-power writes complete before returning. */
+	wmb();
+}
+
+static void apple_mcc_t8103_restore_lp(struct apple_mcc *mcc)
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < T8103_DCS_NCHAN; ch++) {
+		void __iomem *reg = mcc->dcs + ch * mcc->dcs_stride + T8103_DCS_CTL;
+
+		writel(mcc->dcs_ctl_saved[ch], reg);
+	}
+	writel(mcc->bcast_lp_saved, mcc->bcast + T8103_MCC_BCAST_LP);
+	/* Ensure restored DCS and broadcast control writes complete before unbind/shutdown. */
+	wmb();
+}
+
+static int apple_mcc_probe_t8103(struct platform_device *pdev,
+				 struct apple_mcc *mcc)
+{
+	struct device *dev = &pdev->dev;
+	struct resource *bcast_res, *dcs_res;
+	resource_size_t min_dcs_size;
+
+	bcast_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	dcs_res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+	min_dcs_size = (resource_size_t)(T8103_DCS_NCHAN - 1) * T8103_DCS_STRIDE +
+		       T8103_DCS_CTL + sizeof(u32);
+	if (!bcast_res || resource_size(bcast_res) < T8103_MCC_BCAST_LP + sizeof(u32))
+		return dev_err_probe(dev, -EINVAL, "MCC broadcast aperture too small\n");
+	if (!dcs_res || resource_size(dcs_res) < min_dcs_size)
+		return dev_err_probe(dev, -EINVAL, "DCS channel aperture too small\n");
+
+	mcc->bcast = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(mcc->bcast))
+		return PTR_ERR(mcc->bcast);
+	mcc->dcs = devm_platform_ioremap_resource(pdev, 2);
+	if (IS_ERR(mcc->dcs))
+		return PTR_ERR(mcc->dcs);
+
+	mcc->dcs_stride = T8103_DCS_STRIDE;
+	mcc->dcs_lp = true;
+	platform_set_drvdata(pdev, mcc);
+	apple_mcc_t8103_enable_lp(mcc, true);
+	dev_info(dev, "DCS dynamic clock and power gating enabled on %u channels\n",
+		 T8103_DCS_NCHAN);
+	return 0;
+}
+
 static int apple_mcc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -374,6 +462,9 @@ static int apple_mcc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mcc->dev = dev;
+	if (of_device_is_compatible(dev->of_node, "apple,t8103-mcc"))
+		return apple_mcc_probe_t8103(pdev, mcc);
+
 	INIT_LIST_HEAD(&mcc->boot_dma.link);
 	mcc->boot_dma.dev = dev;
 	mcc->boot_dma.lost = apple_mcc_boot_dma_lost;
@@ -436,6 +527,10 @@ static void apple_mcc_remove(struct platform_device *pdev)
 {
 	struct apple_mcc *mcc = platform_get_drvdata(pdev);
 
+	if (mcc->dcs_lp) {
+		apple_mcc_t8103_restore_lp(mcc);
+		return;
+	}
 	/* After this, the detach notifier no longer reaches this controller. */
 	apple_mcc_boot_dma_unregister(&mcc->boot_dma);
 	apple_mcc_turn_off(mcc);
@@ -447,6 +542,10 @@ static void apple_mcc_shutdown(struct platform_device *pdev)
 
 	if (!mcc)
 		return;
+	if (mcc->dcs_lp) {
+		apple_mcc_t8103_restore_lp(mcc);
+		return;
+	}
 	apple_mcc_boot_dma_lock();
 	apple_mcc_quiesce(mcc);
 	apple_mcc_boot_dma_unlock();
@@ -461,6 +560,8 @@ static int apple_mcc_suspend_locked(struct device *dev)
 	struct apple_mcc *mcc = dev_get_drvdata(dev);
 	int ret;
 
+	if (mcc->dcs_lp)
+		return 0;
 	if (!pm_suspend_via_firmware())
 		return 0;
 	/* T8132's cache is written back even if probe left it alone: nothing else does. */
@@ -493,6 +594,11 @@ static int apple_mcc_resume_locked(struct device *dev)
 	struct apple_mcc *mcc = dev_get_drvdata(dev);
 	int ret;
 
+	if (mcc->dcs_lp) {
+		if (pm_suspend_via_firmware())
+			apple_mcc_t8103_enable_lp(mcc, false);
+		return 0;
+	}
 	if (!mcc->sleep_disabled)
 		return 0;
 	mcc->sleep_disabled = false;
@@ -539,6 +645,7 @@ static const struct dev_pm_ops apple_mcc_pm_ops = {
 };
 
 static const struct of_device_id apple_mcc_of_match[] = {
+	{ .compatible = "apple,t8103-mcc" },
 	{ .compatible = "apple,t8122-mcc" },
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
