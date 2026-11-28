@@ -100,6 +100,7 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 	};
 	struct macaudio_snd_data *ma;
 	struct snd_card *card;
+	struct device *dev;
 	unsigned int i;
 	int ret;
 
@@ -107,12 +108,15 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 	card = kunit_kzalloc(test, sizeof(*card), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ma);
 	KUNIT_ASSERT_NOT_NULL(test, card);
+	dev = kunit_device_register(test, "macaudio-pmt-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(dev));
 
 	INIT_LIST_HEAD(&card->controls);
 	INIT_LIST_HEAD(&card->ctl_files);
 	init_rwsem(&card->controls_rwsem);
 	rwlock_init(&card->controls_rwlock);
 	ma->card.snd_card = card;
+	ma->card.dev = dev;
 	snd_soc_card_set_drvdata(&ma->card, ma);
 	ma->cfg = &macaudio_j493_cfg;
 	ma->has_speakers = true;
@@ -147,6 +151,9 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 
 	ret = kunit_add_action_or_reset(test, macaudio_pmt_pm_cleanup, ma);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+	/* As macaudio_late_probe() does, before userspace sees the card */
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(ma), 0);
+	KUNIT_ASSERT_EQ(test, ma->spk_nr_vols, MACAUDIO_PMT_NR_VOLS - 1);
 }
 
 /* A daemon takes the lock and every speaker volume, as speakersafetyd does */
@@ -254,10 +261,111 @@ static void macaudio_pm_volumes_new_owner(struct kunit *test)
 	macaudio_pmt_expect_vols(test, &t, true);
 }
 
+static int macaudio_pmt_user_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *uval)
+{
+	uval->value.integer.value[0] = *(long *)kctl->private_data;
+	return 0;
+}
+
+static int macaudio_pmt_user_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *uval)
+{
+	*(long *)kctl->private_data = uval->value.integer.value[0];
+	return 1;
+}
+
+/*
+ * A user-defined element (SNDRV_CTL_IOCTL_ELEM_ADD) named like a speaker
+ * volume, added after the card registered: no private_value, not the
+ * driver's, never locked, kept or set.
+ */
+static struct snd_kcontrol *macaudio_pmt_add_user_kctl(struct kunit *test,
+							struct macaudio_pmt_pm *t,
+							long *value)
+{
+	struct snd_kcontrol_new tmpl = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "User Speaker Volume",
+		.info = macaudio_pmt_vol_info,
+		.get = macaudio_pmt_user_get,
+		.put = macaudio_pmt_user_put,
+	};
+	struct snd_kcontrol *kctl;
+
+	kctl = macaudio_pmt_add_kctl(test, t->ma->card.snd_card, &tmpl, value);
+	/* As snd_ctl_elem_add() marks it; snd_ctl_new1() filters the flag out */
+	kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_USER;
+	return kctl;
+}
+
+static void macaudio_pm_volumes_ignore_user_elements(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+	struct snd_kcontrol *user;
+	long value = 33;
+
+	macaudio_pmt_pm_card(test, &t);
+	user = macaudio_pmt_add_user_kctl(test, &t, &value);
+	KUNIT_EXPECT_FALSE(test, snd_soc_control_matches(user, "* Speaker Volume"));
+
+	/* Not the lock owner's, and still not in the way of the unlock */
+	macaudio_pmt_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, false);
+
+	/* The lock clips the driver's volumes and keeps only those */
+	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, t.ma->pm_nr_volumes, MACAUDIO_PMT_NR_VOLS - 1);
+	KUNIT_EXPECT_EQ(test, value, 33);
+
+	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, false);
+	KUNIT_EXPECT_EQ(test, value, 33);
+}
+
+/*
+ * A card bound again (a codec unbound and bound) takes its volumes afresh:
+ * the kept set is the new binding's, never the old one's plus the new.
+ */
+static void macaudio_pm_volumes_taken_again(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+	unsigned int i;
+
+	macaudio_pmt_pm_card(test, &t);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(t.ma), 0);
+	KUNIT_ASSERT_EQ(test, t.ma->spk_nr_vols, MACAUDIO_PMT_NR_VOLS - 1);
+	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
+		KUNIT_EXPECT_PTR_EQ(test, t.ma->spk_vols[i], t.vols[i]);
+
+	/* As macaudio_card_remove() leaves them for the next late_probe */
+	macaudio_spk_drop_controls(t.ma);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_vols, 0);
+	KUNIT_EXPECT_NULL(test, t.ma->spk_vols);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(t.ma), 0);
+	KUNIT_ASSERT_EQ(test, t.ma->spk_nr_vols, MACAUDIO_PMT_NR_VOLS - 1);
+
+	/* The lock still covers exactly the speaker volumes */
+	macaudio_pmt_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, t.ma->pm_nr_volumes, MACAUDIO_PMT_NR_VOLS - 1);
+	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	macaudio_pmt_expect_vols(test, &t, false);
+}
+
 static struct kunit_case macaudio_pm_volumes_cases[] = {
+	KUNIT_CASE(macaudio_pm_volumes_ignore_user_elements),
 	KUNIT_CASE(macaudio_pm_volumes_restored_after_sleep),
 	KUNIT_CASE(macaudio_pm_volumes_second_sleep_before_ping),
 	KUNIT_CASE(macaudio_pm_volumes_new_owner),
+	KUNIT_CASE(macaudio_pm_volumes_taken_again),
 	{}
 };
 
