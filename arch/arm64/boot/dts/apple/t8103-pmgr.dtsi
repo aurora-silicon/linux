@@ -243,6 +243,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm0";
+		power-domains = <&ps_sio>;
 	};
 
 	ps_fpwm1: power-controller@1e0 {
@@ -251,6 +252,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm1";
+		power-domains = <&ps_sio>;
 	};
 
 	ps_fpwm2: power-controller@1e8 {
@@ -259,6 +261,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm2";
+		power-domains = <&ps_sio>;
 	};
 
 	ps_i2c0: power-controller@1f0 {

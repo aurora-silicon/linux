@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Included by apple-sio.c: exercise protocol-9 publication and ACK failures. */
+#include <kunit/device.h>
 #include <kunit/test.h>
 
 struct sio_boot_test {
@@ -196,6 +197,7 @@ static void sio_sleep_busy_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, chan);
 	KUNIT_ASSERT_NOT_NULL(test, tx);
 	spin_lock_init(&chan->vc.lock);
+	INIT_LIST_HEAD(&chan->vc.desc_issued);
 
 	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
 	chan->current_tx = tx;
@@ -207,7 +209,102 @@ static void sio_sleep_busy_test(struct kunit *test)
 	chan->ring = true;
 	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
 	chan->ring = false;
+	chan->tx_rpm_held = true;
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	chan->tx_rpm_held = false;
+	list_add_tail(&tx->vd.node, &chan->vc.desc_issued);
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	list_del_init(&tx->vd.node);
 	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
+}
+
+static void sio_test_noop_desc_free(struct virt_dma_desc *vd)
+{
+}
+
+static void sio_test_pm_runtime_disable(void *dev)
+{
+	pm_runtime_disable(dev);
+}
+
+/*
+ * Issuing a descriptor after SIO runtime-suspends must not publish to stopped
+ * firmware; it stays queued until resume, and terminate/synchronize drains it
+ * and releases any held transfer runtime PM reference.
+ */
+static void sio_issue_pending_after_autosuspend_test(struct kunit *test)
+{
+	struct device *dev = kunit_device_register(test, "apple-sio-rpm-test");
+	struct sio_data *sio;
+	struct sio_chan *chan;
+	struct sio_tx *tx, *idle_tx;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	sio = kunit_kzalloc(test, struct_size(sio, channels, 1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sio);
+	tx = kunit_kzalloc(test, sizeof(*tx), GFP_KERNEL);
+	idle_tx = kunit_kzalloc(test, sizeof(*idle_tx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tx);
+	KUNIT_ASSERT_NOT_NULL(test, idle_tx);
+
+	sio->dev = dev;
+	sio->nchannels = 1;
+	WRITE_ONCE(sio->rpm_stopped, true);
+	INIT_LIST_HEAD(&sio->dma.channels);
+
+	chan = &sio->channels[0];
+	chan->host = sio;
+	chan->no = 0;
+	chan->configured = true;
+	chan->vc.desc_free = sio_test_noop_desc_free;
+	tx->vd.tx.chan = &chan->vc.chan;
+	idle_tx->vd.tx.chan = &chan->vc.chan;
+	INIT_WORK(&chan->issue_wq, sio_issue_work);
+	INIT_WORK(&chan->terminate_wq, sio_terminate_work);
+	INIT_LIST_HEAD(&chan->retired);
+	INIT_LIST_HEAD(&chan->dead);
+	init_waitqueue_head(&chan->drained);
+	vchan_init(&chan->vc, &sio->dma);
+
+	pm_runtime_set_suspended(dev);
+	pm_runtime_enable(dev);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, sio_test_pm_runtime_disable, dev),
+			0);
+
+	/* Queue a submitted descriptor and issue while firmware is stopped. */
+	list_add_tail(&tx->vd.node, &chan->vc.desc_submitted);
+	sio_issue_pending(&chan->vc.chan);
+	flush_work(&chan->issue_wq);
+
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, chan->tx_rpm_held);
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+	KUNIT_EXPECT_TRUE(test, bitmap_empty(sio->tags.allocated, SIO_NTAGS));
+	KUNIT_EXPECT_EQ(test, atomic_read(&dev->power.usage_count), 0);
+
+	/* Terminating drains the deferred descriptor cleanly. */
+	KUNIT_EXPECT_EQ(test, sio_terminate_all(&chan->vc.chan), 0);
+	sio_synchronize(&chan->vc.chan);
+	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
+	KUNIT_EXPECT_EQ(test, atomic_read(&dev->power.usage_count), 0);
+
+	/* Ring handover to an idle transfer releases the active transfer PM ref. */
+	pm_runtime_get_noresume(dev);
+	chan->ring = true;
+	chan->idle = idle_tx;
+	chan->current_tx = tx;
+	chan->tx_rpm_held = true;
+	tx->vd.tx.cookie = DMA_MIN_COOKIE;
+	tx->terminated = false;
+	KUNIT_EXPECT_EQ(test, sio_terminate_all(&chan->vc.chan), 0);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, chan->tx_rpm_held);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dev->power.usage_count), 0);
+	chan->idle = NULL;
+	chan->ring = false;
+	INIT_LIST_HEAD(&chan->dead);
+	INIT_LIST_HEAD(&chan->retired);
 }
 
 static struct kunit_case sio_boot_test_cases[] = {
@@ -217,6 +314,7 @@ static struct kunit_case sio_boot_test_cases[] = {
 	KUNIT_CASE(sio_boot_control_ack_failure_test),
 	KUNIT_CASE(sio_boot_dma_arrays_test),
 	KUNIT_CASE(sio_sleep_busy_test),
+	KUNIT_CASE(sio_issue_pending_after_autosuspend_test),
 	{}
 };
 

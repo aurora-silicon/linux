@@ -33,6 +33,7 @@
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
@@ -137,7 +138,6 @@ struct mca_cluster {
 	struct mca_data *host;
 	struct device *pd_dev;
 	struct clk *clk_parent;
-	struct dma_chan *dma_chans[SNDRV_PCM_STREAM_LAST + 1];
 
 	bool clk_provider;
 
@@ -152,8 +152,10 @@ struct mca_cluster {
 
 	unsigned int bclk_ratio;
 
-	/* RX bit start of the DAI format, once set_fmt has run */
+	/* DAI format state cached from set_fmt and applied in hw_params */
 	bool fmt_set;
+	u32 serdes_bclk_pol;
+	u32 tx_bitstart;
 	u32 rx_bitstart;
 	/* BCLKs by which data received on this cluster's port arrives late */
 	u32 rx_delay;
@@ -472,6 +474,11 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 		goto err;
 	}
 
+	if (cl->fmt_set) {
+		serdes_conf_mask |= SERDES_CONF_BCLK_POL;
+		serdes_conf |= cl->serdes_bclk_pol;
+	}
+
 	serdes_conf_mask |= SERDES_CONF_SYNC_SEL;
 	serdes_conf |= FIELD_PREP(SERDES_CONF_SYNC_SEL, cl->no + 1);
 
@@ -606,14 +613,8 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	if (!fpol_inv)
 		goto err;
 
-	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	cl->serdes_bclk_pol = serdes_conf;
+	cl->tx_bitstart = bitstart;
 	cl->rx_bitstart = bitstart;
 	cl->fmt_set = true;
 
@@ -718,10 +719,15 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 	if (ret)
 		return ret;
 
-	/* Sample late data as late as the slowest port it comes from */
-	if (!is_tx && cl->fmt_set)
-		writel_relaxed(cl->rx_bitstart + mca_ports_rx_delay(mca, portmask),
-			       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	if (cl->fmt_set) {
+		if (is_tx)
+			writel_relaxed(cl->tx_bitstart,
+				       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
+		else
+			/* Sample late data as late as the slowest port it comes from */
+			writel_relaxed(cl->rx_bitstart + mca_ports_rx_delay(mca, portmask),
+				       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	}
 
 	pad = 32 - params_width(params);
 
@@ -870,10 +876,23 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
 	struct mca_cluster *fe_cl;
 	struct mca_data *mca = cl->host;
+	int ret;
 
 	if (!fe)
 		return -EINVAL;
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
+
+	/*
+	 * If the port is already started in the other direction, make sure
+	 * there isn't a conflict with another cluster driving the port clocks.
+	 */
+	if (fe_cl->clk_provider && mca_be_clk_started(cl) &&
+	    cl->port_clk_driver != fe_cl->no)
+		return -EINVAL;
+
+	ret = pm_runtime_resume_and_get(mca->dev);
+	if (ret < 0)
+		return ret;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		writel_relaxed(PORT_DATA_SEL_TXA(fe_cl->no),
@@ -886,14 +905,6 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 		return 0;
 
 	if (mca_be_clk_started(cl)) {
-		/*
-		 * Port is already started in the other direction.
-		 * Make sure there isn't a conflict with another cluster
-		 * driving the port clocks.
-		 */
-		if (cl->port_clk_driver != fe_cl->no)
-			return -EINVAL;
-
 		cl->port_clk_started[substream->stream] = true;
 		return 0;
 	}
@@ -940,7 +951,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 	}
 
 	if (!fe)
-		return;
+		goto out;
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -949,7 +960,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 	}
 
 	if (!fe_cl->clk_provider)
-		return;
+		goto out;
 
 	cl->port_clk_started[substream->stream] = false;
 	if (!mca_be_clk_started(cl)) {
@@ -961,8 +972,11 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 		writel_relaxed(0, cl->base + REG_PORT_CLOCK_SEL);
 		scoped_guard(mutex, &mca->port_mutex)
 			cl->port_clk_driver = -1;
-
 	}
+
+out:
+	pm_runtime_mark_last_busy(mca->dev);
+	pm_runtime_put_autosuspend(mca->dev);
 }
 
 static const struct snd_soc_dai_ops mca_be_ops = {
@@ -1020,22 +1034,58 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 	return snd_soc_set_runtime_hwparams(substream, &hw);
 }
 
+static struct dma_chan *mca_request_dma_channel(struct mca_cluster *cl,
+						unsigned int stream)
+{
+	bool is_tx = (stream == SNDRV_PCM_STREAM_PLAYBACK);
+	char name[16];
+
+#ifndef USE_RXB_FOR_CAPTURE
+	snprintf(name, sizeof(name), is_tx ? "tx%da" : "rx%da", cl->no);
+#else
+	snprintf(name, sizeof(name), is_tx ? "tx%da" : "rx%db", cl->no);
+#endif
+	return of_dma_request_slave_channel(cl->host->dev->of_node, name);
+}
+
 static int mca_pcm_open(struct snd_soc_component *component,
 			struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct mca_cluster *cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0));
-	struct dma_chan *chan = cl->dma_chans[substream->stream];
+	struct mca_data *mca = cl->host;
+	struct dma_chan *chan;
 	int ret;
 
 	if (rtd->dai_link->no_pcm)
 		return 0;
 
-	ret = mca_set_runtime_hwparams(component, substream, chan);
-	if (ret)
+	ret = pm_runtime_resume_and_get(mca->dev);
+	if (ret < 0)
 		return ret;
 
-	return snd_dmaengine_pcm_open(substream, chan);
+	chan = mca_request_dma_channel(cl, substream->stream);
+	if (IS_ERR_OR_NULL(chan)) {
+		ret = chan ? PTR_ERR(chan) : -EINVAL;
+		goto err_rpm_put;
+	}
+
+	ret = mca_set_runtime_hwparams(component, substream, chan);
+	if (ret)
+		goto err_release_chan;
+
+	ret = snd_dmaengine_pcm_open(substream, chan);
+	if (ret)
+		goto err_release_chan;
+
+	return 0;
+
+err_release_chan:
+	dma_release_channel(chan);
+err_rpm_put:
+	pm_runtime_mark_last_busy(mca->dev);
+	pm_runtime_put_autosuspend(mca->dev);
+	return ret;
 }
 
 static int mca_hw_params(struct snd_soc_component *component,
@@ -1070,11 +1120,18 @@ static int mca_close(struct snd_soc_component *component,
 		     struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct mca_cluster *cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0));
+	struct mca_data *mca = cl->host;
+	int ret;
 
 	if (rtd->dai_link->no_pcm)
 		return 0;
 
-	return snd_dmaengine_pcm_close(substream);
+	ret = snd_dmaengine_pcm_close_release_chan(substream);
+	pm_runtime_mark_last_busy(mca->dev);
+	pm_runtime_put_autosuspend(mca->dev);
+
+	return ret;
 }
 
 /*
@@ -1210,43 +1267,6 @@ static snd_pcm_uframes_t mca_pointer(struct snd_soc_component *component,
 	return pos;
 }
 
-static struct dma_chan *mca_request_dma_channel(struct mca_cluster *cl, unsigned int stream)
-{
-	bool is_tx = (stream == SNDRV_PCM_STREAM_PLAYBACK);
-#ifndef USE_RXB_FOR_CAPTURE
-	char *name = devm_kasprintf(cl->host->dev, GFP_KERNEL,
-				    is_tx ? "tx%da" : "rx%da", cl->no);
-#else
-	char *name = devm_kasprintf(cl->host->dev, GFP_KERNEL,
-				    is_tx ? "tx%da" : "rx%db", cl->no);
-#endif
-	return of_dma_request_slave_channel(cl->host->dev->of_node, name);
-
-}
-
-static void mca_pcm_free(struct snd_soc_component *component,
-			 struct snd_pcm *pcm)
-{
-	struct snd_soc_pcm_runtime *rtd = snd_pcm_chip(pcm);
-	struct mca_cluster *cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0));
-	unsigned int i;
-
-	if (rtd->dai_link->no_pcm)
-		return;
-
-	for_each_pcm_streams(i) {
-		struct snd_pcm_substream *substream =
-			rtd->pcm->streams[i].substream;
-
-		if (!substream || !cl->dma_chans[i])
-			continue;
-
-		dma_release_channel(cl->dma_chans[i]);
-		cl->dma_chans[i] = NULL;
-	}
-}
-
-
 static int mca_pcm_new(struct snd_soc_component *component,
 		       struct snd_soc_pcm_runtime *rtd)
 {
@@ -1265,10 +1285,7 @@ static int mca_pcm_new(struct snd_soc_component *component,
 			continue;
 
 		chan = mca_request_dma_channel(cl, i);
-
 		if (IS_ERR_OR_NULL(chan)) {
-			mca_pcm_free(component, rtd->pcm);
-
 			if (chan && PTR_ERR(chan) == -EPROBE_DEFER)
 				return PTR_ERR(chan);
 
@@ -1280,7 +1297,6 @@ static int mca_pcm_new(struct snd_soc_component *component,
 			return PTR_ERR(chan);
 		}
 
-		cl->dma_chans[i] = chan;
 		/*
 		 * Capture is read by the CPU: cacheable, synced in mca_pointer().
 		 * Allocated at hw_params to the buffer's own size, as ALSA syncs
@@ -1293,6 +1309,7 @@ static int mca_pcm_new(struct snd_soc_component *component,
 			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
 						   chan->device->dev, MCA_BUFFER_BYTES_MAX,
 						   SIZE_MAX);
+		dma_release_channel(chan);
 	}
 
 	return 0;
@@ -1306,7 +1323,6 @@ static const struct snd_soc_component_driver mca_component = {
 	.trigger = mca_trigger,
 	.pointer = mca_pointer,
 	.pcm_new = mca_pcm_new,
-	.pcm_free = mca_pcm_free,
 };
 
 static void apple_mca_release(struct mca_data *mca)
@@ -1376,9 +1392,24 @@ static int apple_mca_probe(struct platform_device *pdev)
 	if (!dai_drivers)
 		return -ENOMEM;
 
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 200);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	ret = devm_pm_runtime_enable(&pdev->dev);
+	if (ret) {
+		pm_runtime_dont_use_autosuspend(&pdev->dev);
+		pm_runtime_put_noidle(&pdev->dev);
+		return ret;
+	}
+
 	mca->pd_dev = dev_pm_domain_attach_by_id(&pdev->dev, 0);
-	if (IS_ERR(mca->pd_dev))
-		return -EINVAL;
+	if (IS_ERR(mca->pd_dev)) {
+		ret = -EINVAL;
+		/* Prevent an unbalanced reset rearm */
+		mca->rstc = NULL;
+		goto err_release;
+	}
 
 	mca->pd_link = device_link_add(&pdev->dev, mca->pd_dev,
 				       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME |
@@ -1487,10 +1518,15 @@ static int apple_mca_probe(struct platform_device *pdev)
 		goto err_release;
 	}
 
+	pm_runtime_mark_last_busy(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);
+
 	return 0;
 
 err_release:
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	apple_mca_release(mca);
+	pm_runtime_put_noidle(&pdev->dev);
 	return ret;
 }
 
@@ -1499,6 +1535,8 @@ static void apple_mca_remove(struct platform_device *pdev)
 	struct mca_data *mca = platform_get_drvdata(pdev);
 
 	snd_soc_unregister_component(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_barrier(&pdev->dev);
 	apple_mca_release(mca);
 }
 
@@ -1570,7 +1608,7 @@ static int __maybe_unused apple_mca_suspend_late(struct device *dev)
 	struct mca_data *mca = dev_get_drvdata(dev);
 	int i, j, n = 0;
 
-	if (!pm_suspend_via_firmware())
+	if (!pm_suspend_via_firmware() || pm_runtime_status_suspended(dev))
 		return 0;
 
 	for (i = 0; i < mca->nclusters; i++) {
@@ -1603,7 +1641,7 @@ static int __maybe_unused apple_mca_resume_early(struct device *dev)
 	struct mca_data *mca = dev_get_drvdata(dev);
 	int i, j, n = 0;
 
-	if (!pm_resume_via_firmware())
+	if (!pm_resume_via_firmware() || pm_runtime_status_suspended(dev))
 		return 0;
 
 	for (i = 0; i < mca->nclusters; i++) {

@@ -221,6 +221,15 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('bound-only', 'stopped-holds', 'invert-runs', 'no-lock',
                                      'leak-device', 'leak-node', 'ignore-dcp'), out())
         + [(out() + ['--ref', 'a7638d51880ce077cfb3edfa7ff638de2be74c85'], KILL)],
+    'sio-rpm-issue-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('publish-while-suspended', 'skip-rpm-get',
+                                     'drop-tx-pm-early', 'skip-issue-flush',
+                                     'skip-remove-cancel', 'strand-on-resume-fail',
+                                     'late-issue-rearms-tasklet',
+                                     'clear-errors-on-start',
+                                     'skip-remove-mailbox-off',
+                                     'skip-remove-shutdown'), out())
+        + [(out() + ['--ref', 'a8d2f37caf8953f54470eb4d54bfb21e903846d3'], KILL)],
     # A DCP whose firmware runs through the sleep holds its DP PHYs' domains.
     'dcp-sleep-phy-hold-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-route', 'no-own-phy', 'class-device', 'no-err-check'), []),
