@@ -25,6 +25,14 @@ log() {
     echo "aurora-sep-greeter-fingerprint: $*" >&2
 }
 
+if [ "${1:-}" = refresh ]; then
+    # aurora-sep-greeter-refresh.service, which passed "refresh", is gone. A manual
+    # install from before may still have it enabled. Do nothing, so that it never
+    # removes and rebuilds the overlay of a login screen that is already running.
+    log "'refresh' is no longer used; disable and remove aurora-sep-greeter-refresh.service (see README)"
+    exit 0
+fi
+
 rm -rf "$out" "$dropin"
 [ "${1:-}" != stop ] || exit 0
 

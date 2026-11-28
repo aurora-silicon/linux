@@ -148,6 +148,7 @@ config APPLE_CLUSTER_PWRGATE
 
 config APPLE_SOC_SLEEP
 	bool "Apple SoC system sleep at EL2"
+	default APPLE_T8140_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
 	select APPLE_TUNABLE
@@ -585,3 +586,10 @@ config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
 endmenu
 
 endif
+
+# Kept: configs that still set APPLE_T8140_SLEEP=y keep APPLE_SOC_SLEEP after olddefconfig.
+config APPLE_T8140_SLEEP
+	bool
+	transitional
+	help
+	  Transitional config for APPLE_T8140_SLEEP to APPLE_SOC_SLEEP migration.

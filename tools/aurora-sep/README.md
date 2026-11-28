@@ -383,6 +383,17 @@ install -Dm644 aurora-sep-greeter-fingerprint.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable aurora-sep-greeter-fingerprint.service
 ```
+Upgrading an install from before 11-29 (manual or packaged): the old
+`aurora-sep-greeter-refresh.service` is gone, and `refresh` is now a no-op that
+only logs. Remove what is left of it once:
+
+```
+sudo systemctl disable aurora-sep-greeter-refresh.service 2>/dev/null
+sudo rm -f /etc/systemd/system/aurora-sep-greeter-refresh.service \
+  /etc/systemd/system/gdm.service.wants/aurora-sep-greeter-refresh.service
+sudo systemctl daemon-reload
+```
+
 
 Disabling it and rebooting returns the login screen to GNOME's behaviour.
 
