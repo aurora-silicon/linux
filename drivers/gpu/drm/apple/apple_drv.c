@@ -323,6 +323,17 @@ static struct drm_gem_object *apple_drm_gem_create_object(struct drm_device *drm
 }
 
 #ifdef CONFIG_DRM_FBDEV_EMULATION
+static bool apple_primary_supports_xrgb8888(struct drm_plane *plane)
+{
+	unsigned int i;
+
+	for (i = 0; i < plane->format_count; i++)
+		if (plane->format_types[i] == DRM_FORMAT_XRGB8888)
+			return true;
+
+	return false;
+}
+
 static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
 {
@@ -333,14 +344,24 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 
 		if (t8132_ext_crtc(crtc))
 			continue;
+
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+
+		/*
+		 * A console on a primary plane without XRGB8888 has to be
+		 * ARGB: either the firmware blends the X byte as straight
+		 * alpha and an XRGB console with X = 0 stays black (H17G,
+		 * firmware 27 on the T8142, 14.7), or the plane cannot scan
+		 * out XRGB at all.
+		 *
+		 * H17P and firmware 27 also need ARGB for fbcon when the
+		 * primary advertises XRGB8888. On those paths the stored
+		 * X byte can be blended as alpha, and fbcon does not set
+		 * the opaque-X property.
+		 */
+		if (!apple_primary_supports_xrgb8888(crtc->primary) ||
+		    dcp->fw_compat == DCP_FIRMWARE_H17P ||
 		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-			/*
-			 * H17P and firmware 27 apply the stored fourth byte as
-			 * straight alpha: an XRGB console with X = 0 stays black.
-			 * ARGB makes fbcon write it opaque.
-			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
