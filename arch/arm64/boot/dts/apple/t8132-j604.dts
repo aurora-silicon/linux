@@ -645,3 +645,7 @@
 &apr {
 	status = "okay";
 };
+
+&aop_spmi1 {
+	status = "okay";
+};

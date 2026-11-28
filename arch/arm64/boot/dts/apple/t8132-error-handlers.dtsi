@@ -62,7 +62,6 @@
 		             <AIC_IRQ 142 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	soc_events: event-log-handler@380700000 {
@@ -135,7 +134,6 @@
 		             <AIC_IRQ 268 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 77 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 932 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 };

@@ -119,8 +119,14 @@
 /* The ISP companion DARTs sit in the ISP block, as the ISP DARTs do. */
 &dart_isp_companion3 {
 	power-domains = <&ps_isp_sys>;
+	status = "okay";
 };
 
 &dart_isp_companion4 {
 	power-domains = <&ps_isp_sys>;
+	status = "okay";
+};
+
+&dart_isp_companion5 {
+	status = "okay";
 };
