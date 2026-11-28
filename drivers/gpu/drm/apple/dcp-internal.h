@@ -207,6 +207,11 @@ struct dcp_brightness {
 	struct delayed_work fade_work;
 	unsigned long fade_start;
 	u32 level;
+	/*
+	 * Level 0 was requested: the swap switches the backlight off (bl_power
+	 * 0), as the poweroff swap does.
+	 */
+	bool off;
 	u32 fade_from;
 	u32 fade_to;
 	bool fading;
