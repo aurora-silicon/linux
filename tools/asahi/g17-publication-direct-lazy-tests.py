@@ -85,6 +85,10 @@ def build_harness(mutation=None):
         )
     elif mutation == 'drop-chain-link':
         build_fn = build_fn.replace('chain.link(&predecessors, &mut chained)?;', '', 2)
+    elif mutation == 'retry-failed-pred':
+        is_pending_fn = is_pending_fn.replace('.position(|(pred, _)| pred.failed_after_release())', '.position(|_| false)', 1)
+    elif mutation == 'keep-attached-successors':
+        is_pending_fn = is_pending_fn.replace('Probe::Settled(old, state.successors.take())', 'Probe::Settled(old, None)', 1)
     elif mutation == 'skip-fast-check':
         attach_fn = attach_fn.replace(
             'if predecessor.settled_clean.load(Ordering::Acquire) {',
@@ -105,6 +109,10 @@ def build_harness(mutation=None):
         'finish_takes_deferred': 'core::mem::take(&mut state.deferred_links)' in finish_fn,
         'is_pending_settles': 'state.upstream_released = true;' in is_pending_fn,
         'bounded_probe': 'pred.pending_within(depth - 1)' in is_pending_fn,
+        'consume_failed': '.position(|(pred, _)| pred.failed_after_release())' in is_pending_fn
+            and 'Probe::Consumed(state.deferred_links.swap_remove(index))' in is_pending_fn,
+        'release_attached': 'Probe::Settled(old, state.successors.take())' in is_pending_fn
+            and 'Self::drain(Self::released_ok(successors));' in is_pending_fn,
         'covers_field': 'pub(crate) covers: Option<u64>,' in job_src,
         'chain_links': build_fn.count('chain.link(&predecessors, &mut chained)?;') == 2
             and 'Order::contains(covered, *sequence)' in chain_fn,
@@ -118,6 +126,8 @@ def build_harness(mutation=None):
     skip_err_clear = mutation == 'skip-error-clear-settled'
     skip_fast = mutation == 'skip-fast-check'
     drop_chain = mutation == 'drop-chain-link'
+    retry_failed = mutation == 'retry-failed-pred'
+    keep_attached = mutation == 'keep-attached-successors'
 
     return f'''
 use std::sync::{{Arc, Mutex, Weak, atomic::{{AtomicBool, AtomicI32, AtomicUsize, Ordering}}}};
@@ -127,6 +137,12 @@ const EIO: i32 = -5;
 const PENDING_PROBE_DEPTH: usize = 4;
 
 type Links = Option<Box<Link>>;
+
+enum Probe {{
+    Consumed((Arc<Publication>, Box<Link>)),
+    Settled(Vec<(Arc<Publication>, Box<Link>)>, Links),
+    Next(Arc<Publication>),
+}}
 
 struct Link {{
     target: Option<Arc<Publication>>,
@@ -204,7 +220,7 @@ impl Publication {{
             return true;
         }}
         loop {{
-            let (probe, dropped) = {{
+            let step = {{
                 let mut state = self.state.lock().unwrap();
                 if !self.pending.load(Ordering::Acquire) {{
                     return false;
@@ -212,33 +228,64 @@ impl Publication {{
                 if state.published.is_some() || state.claimed || state.deferred_links.is_empty() {{
                     return self.pending.load(Ordering::Acquire);
                 }}
-                let unsettled = state
-                    .deferred_links
-                    .iter()
-                    .find(|(p, _)| !p.settled_clean.load(Ordering::Acquire))
-                    .map(|(p, _)| p.clone());
-                match unsettled {{
-                    None => {{
-                        let old = std::mem::take(&mut state.deferred_links);
-                        state.upstream_released = true;
-                        self.settled_clean.store(true, Ordering::Release);
-                        self.pending.store(false, Ordering::Release);
-                        (None, old)
+                let failed = if {str(retry_failed).lower()} {{
+                    None
+                }} else {{
+                    state.deferred_links.iter().position(|(p, _)| p.failed_after_release())
+                }};
+                if let Some(index) = failed {{
+                    if state.predecessor_error.is_none() {{
+                        state.predecessor_error = Some(PRODUCER_FAILED);
                     }}
-                    Some(p) if !p.has_outputs => (Some(p), Vec::new()),
-                    Some(_) => return true,
+                    Probe::Consumed(state.deferred_links.swap_remove(index))
+                }} else {{
+                    let unsettled = state
+                        .deferred_links
+                        .iter()
+                        .find(|(p, _)| !p.settled_clean.load(Ordering::Acquire))
+                        .map(|(p, _)| p.clone());
+                    match unsettled {{
+                        None if state.predecessor_error.is_none() => {{
+                            let old = std::mem::take(&mut state.deferred_links);
+                            state.upstream_released = true;
+                            self.settled_clean.store(true, Ordering::Release);
+                            self.pending.store(false, Ordering::Release);
+                            let succ = if {str(keep_attached).lower()} {{ None }} else {{ state.successors.take() }};
+                            Probe::Settled(old, succ)
+                        }}
+                        None => return true,
+                        Some(p) if !p.has_outputs => Probe::Next(p),
+                        Some(_) => return true,
+                    }}
                 }}
             }};
-            drop(dropped);
-            match probe {{
-                Some(p) => {{
+            match step {{
+                Probe::Consumed(link) => drop(link),
+                Probe::Settled(old, successors) => {{
+                    drop(old);
+                    Self::drain(Self::released_ok(successors));
+                    return false;
+                }}
+                Probe::Next(p) => {{
                     if depth == 0 || p.pending_within(depth - 1) {{
                         return true;
                     }}
                 }}
-                None => return false,
             }}
         }}
+    }}
+
+    fn failed_after_release(&self) -> bool {{
+        !self.pending.load(Ordering::Acquire) && !self.settled_clean.load(Ordering::Acquire)
+    }}
+
+    fn released_ok(mut links: Links) -> Links {{
+        let mut next = links.as_mut();
+        while let Some(link) = next {{
+            link.result = Ok(());
+            next = link.next.as_mut();
+        }}
+        links
     }}
 
     fn finish(self: &Arc<Self>, result: Result<(), i32>) {{
@@ -501,6 +548,8 @@ fn main() {{
     assert!({str(src_checks['finish_takes_deferred']).lower()}, "finish() must take deferred_links before attaching");
     assert!({str(src_checks['is_pending_settles']).lower()}, "is_pending() must settle clean deferred chains");
     assert!({str(src_checks['bounded_probe']).lower()}, "is_pending() must bound its predecessor probe");
+    assert!({str(src_checks['consume_failed']).lower()}, "is_pending() must consume a predecessor that failed after releasing");
+    assert!({str(src_checks['release_attached']).lower()}, "early settlement must release attached successors");
     assert!({str(src_checks['covers_field']).lower()}, "Fences must record the prefix it covers");
     assert!({str(src_checks['chain_links']).lower()}, "EnqueueOrdering::build must chain both covered prefixes");
 
@@ -609,7 +658,49 @@ fn main() {{
             "covering successor must inherit B's failure (fail_before={{}})", fail_before);
     }}
 
+    // 9. B released its successors early (writer A clean) and then failed. P, still deferred on B,
+    // must end its probe (not retry B forever) and publish B's failure.
+    {{
+        let a = Publication::new(true);
+        activate(&a, &[]);
+        let b = Publication::new(false);
+        activate(&b, &[a.clone()]);
+        let p = Publication::new(false);
+        activate(&p, &[b.clone()]);
+        a.finish(Ok(()));
+        assert!(!b.is_pending(), "B settles once A published cleanly");
+        b.finish(Err(EIO));
+        assert!(b.failed_after_release());
+        let probe = p.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {{ let _ = tx.send(probe.is_pending()); }});
+        let pending = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("probe of a predecessor that failed after releasing never ended");
+        assert!(pending, "a consumed failure keeps P pending until finish()");
+        p.finish(Ok(()));
+        assert_eq!(p.fence_status.load(Ordering::Acquire), PRODUCER_FAILED);
+    }}
+
+    // 10. S finished and attached to B before B settled. B settling through is_pending() must
+    // release S then, not when some unrelated completion finishes B.
+    {{
+        let a = Publication::new(true);
+        activate(&a, &[]);
+        let b = Publication::new(false);
+        activate(&b, &[a.clone()]);
+        let s = Publication::new(true);
+        activate(&s, &[b.clone()]);
+        s.finish(Ok(()));
+        a.finish(Ok(()));
+        assert_eq!(s.fence_status.load(Ordering::Acquire), 0);
+        assert!(!b.is_pending());
+        assert_eq!(s.fence_status.load(Ordering::Acquire), 1,
+            "successor attached before an early settlement must be released by it");
+    }}
+
     println!("PASS g17-publication-direct-lazy-tests");
+    std::process::exit(0);
 }}
 '''
 
@@ -624,6 +715,8 @@ def main():
         'skip-error-clear-settled',
         'skip-fast-check',
         'drop-chain-link',
+        'retry-failed-pred',
+        'keep-attached-successors',
     ])
     args = parser.parse_args()
     src = build_harness(args.mutation)

@@ -14,6 +14,16 @@ use kernel::{new_mutex, prelude::*, sync::{Arc, Mutex}};
 
 type Links = Option<KBox<Link>>;
 
+/// One step of `Publication::pending_within()`, taken under the state lock and finished off it.
+enum Probe {
+    /// A failed predecessor's link, consumed.
+    Consumed((Arc<Publication>, KBox<Link>)),
+    /// Settled clean: the dropped predecessor links and the successors to release.
+    Settled(KVec<(Arc<Publication>, KBox<Link>)>, Links),
+    /// Ask this unsettled timestamp-free predecessor.
+    Next(Arc<Publication>),
+}
+
 /// How many unsettled timestamp-free predecessors deep `Publication::is_pending()` follows
 /// before it answers pending. Commands link the newest pending entry of their prefixes, so an
 /// unretired pipeline is a chain of such links; the bound keeps the probe off the stack, and a
@@ -130,7 +140,7 @@ impl Publication {
             return true;
         }
         loop {
-            let (probe, dropped) = {
+            let step = {
                 let mut state = self.state.lock();
                 if !self.pending.load(Ordering::Acquire) {
                     return false;
@@ -141,33 +151,69 @@ impl Publication {
                 {
                     return self.pending.load(Ordering::Acquire);
                 }
-                let unsettled = state
+                let failed = state
                     .deferred_links
                     .iter()
-                    .find(|(pred, _)| !pred.settled_clean.load(Ordering::Acquire))
-                    .map(|(pred, _)| pred.clone());
-                match unsettled {
-                    None => {
-                        let old = core::mem::take(&mut state.deferred_links);
-                        state.upstream_released = true;
-                        self.settled_clean.store(true, Ordering::Release);
-                        self.pending.store(false, Ordering::Release);
-                        (None, old)
+                    .position(|(pred, _)| pred.failed_after_release());
+                if let Some(index) = failed {
+                    // Terminal and settles nothing: consume the link and keep the failure for
+                    // `finish()`, so the probe never retries this predecessor.
+                    if state.predecessor_error.is_none() {
+                        state.predecessor_error = Some(PRODUCER_FAILED);
                     }
-                    Some(pred) if !pred.has_outputs => (Some(pred), KVec::new()),
-                    Some(_) => return true,
+                    Probe::Consumed(state.deferred_links.swap_remove(index))
+                } else {
+                    let unsettled = state
+                        .deferred_links
+                        .iter()
+                        .find(|(pred, _)| !pred.settled_clean.load(Ordering::Acquire))
+                        .map(|(pred, _)| pred.clone());
+                    match unsettled {
+                        None if state.predecessor_error.is_none() => {
+                            let old = core::mem::take(&mut state.deferred_links);
+                            state.upstream_released = true;
+                            self.settled_clean.store(true, Ordering::Release);
+                            self.pending.store(false, Ordering::Release);
+                            Probe::Settled(old, state.successors.take())
+                        }
+                        // Pending until `finish()` publishes the consumed failure.
+                        None => return true,
+                        Some(pred) if !pred.has_outputs => Probe::Next(pred),
+                        Some(_) => return true,
+                    }
                 }
             };
-            drop(dropped);
-            match probe {
-                Some(pred) => {
+            match step {
+                Probe::Consumed(link) => drop(link),
+                Probe::Settled(old, successors) => {
+                    drop(old);
+                    // Successors that attached before this settlement are released here, as
+                    // `predecessors_done_ok()` releases them.
+                    Self::drain(Self::released_ok(successors));
+                    return false;
+                }
+                Probe::Next(pred) => {
                     if depth == 0 || pred.pending_within(depth - 1) {
                         return true;
                     }
                 }
-                None => return false,
             }
         }
+    }
+
+    /// Released its successors as upstream-clean, and then published a failure.
+    fn failed_after_release(&self) -> bool {
+        !self.pending.load(Ordering::Acquire) && !self.settled_clean.load(Ordering::Acquire)
+    }
+
+    /// Mark successor links released by a clean upstream settlement.
+    fn released_ok(mut links: Links) -> Links {
+        let mut next = links.as_mut();
+        while let Some(link) = next {
+            link.result = Ok(());
+            next = link.next.as_mut();
+        }
+        links
     }
 
     /// One terminal result, offered separately from its physical-retirement proof.
@@ -268,13 +314,7 @@ impl Publication {
         if let Some(result) = ready {
             return self.publish(result);
         }
-        let mut links = settled;
-        let mut next = links.as_mut();
-        while let Some(link) = next {
-            link.result = Ok(());
-            next = link.next.as_mut();
-        }
-        links
+        Self::released_ok(settled)
     }
 
     fn predecessor_done(&self, result: Result) -> Links {
