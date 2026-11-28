@@ -812,8 +812,8 @@ struct Firmware {
     bridge: Bridge,
     /// Publication state shared with publishers that do not hold the device mutex.
     port: Arc<port::Port>,
-    /// Fast-path submissions already accounted by the idle check.
-    seen_submissions: u64,
+    /// Fast-path submission admissions and exits already accounted by the idle check.
+    direct_idle: power::DirectIdle,
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
@@ -1054,13 +1054,20 @@ impl Firmware {
         );
     }
 
-    fn idle_check(&mut self, now_ns: u64, in_flight: bool) -> Result<Option<u64>> {
-        let submissions = self.port.submissions();
-        let submitted = submissions != self.seen_submissions;
-        self.seen_submissions = submissions;
-        if submitted {
-            self.effort.submit();
-        }
+    fn idle_check(
+        &mut self,
+        now_ns: u64,
+        in_flight: bool,
+        direct: port::DirectSnapshot,
+    ) -> Result<Option<u64>> {
+        let direct_publishing = direct.publishing || self.port.direct_publishing();
+        let active = self.direct_idle.observe(
+            &mut self.effort,
+            direct.submissions,
+            direct.exits,
+            in_flight,
+            direct_publishing,
+        );
         // A waiter or a busy run that began or ended since the last note moves the effort while
         // work streams. Skip a redundant Region C drop right before Effort::idle clears it to 0.
         if self.effort.streaming() {
@@ -1072,17 +1079,24 @@ impl Firmware {
             if self.effort.bound() {
                 self.port.lift_busy_if_below_top(now_ns);
             }
-            let active = in_flight || submitted;
             if (waiters || compute_waiters || bound) && !self.effort.will_clear(now_ns, active) {
                 self.apply_effort(power::FULL_EFFORT)?;
             }
         }
-        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
+        let effort = match self.effort.idle(now_ns, active) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
-                self.port.set_effort_full(false);
-                if self.port.submissions() != submissions {
-                    self.port.set_effort_full(true);
+                // Close direct admission before checking for late publishers so a failed
+                // validation never drops CLPC demand, discards the busy-share window, or
+                // opens admission when effort was already off.
+                let was_open = self.port.direct_admission_open();
+                if was_open {
+                    self.port.close_direct_admission();
+                }
+                if self.port.submissions() != direct.submissions || self.port.direct_publishing() {
+                    if was_open {
+                        self.port.reopen_direct_admission();
+                    }
                     self.effort.submit();
                     return Ok(Some(power::IDLE_HOLD_NS));
                 }
@@ -1098,13 +1112,17 @@ impl Firmware {
         } else {
             None
         };
-        let hold = self.idle_hold(now_ns, in_flight || submitted);
-        Ok([effort, hold, busy_recheck].into_iter().flatten().min())
+        let hold = self.idle_hold(now_ns, active, direct.submissions);
+        let direct_recheck = power::DirectIdle::recheck_delay(direct_publishing);
+        Ok([effort, hold, busy_recheck, direct_recheck]
+            .into_iter()
+            .flatten()
+            .min())
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
     /// refused control (recovery in progress) is retried on a later check.
-    fn idle_hold(&mut self, now_ns: u64, in_flight: bool) -> Option<u64> {
+    fn idle_hold(&mut self, now_ns: u64, active: bool, submissions: u64) -> Option<u64> {
         const RETRY_NS: u64 = 1_000_000;
         // The M5 firmware powers the cores for work by its own policy, and under a host
         // hold J775D's core-power witness reads unpowered until the hold is released. M5
@@ -1116,7 +1134,7 @@ impl Firmware {
         for _ in 0..2 {
             match self
                 .hold
-                .step(now_ns, in_flight, self.effort.submissions(), hold_ms)
+                .step(now_ns, active, self.effort.submissions(), hold_ms)
             {
                 power::HoldAction::None => return None,
                 power::HoldAction::Recheck(delay) => return Some(delay),
@@ -1127,7 +1145,28 @@ impl Firmware {
                     self.hold.asserted();
                 }
                 power::HoldAction::Release => {
-                    if self.set_idle_control(true).is_err() {
+                    // Close direct admission through validation and control publication so a
+                    // lockless publisher cannot enter while AllowPowerOff is issued, even when
+                    // the hold delay was lowered back to the native firmware delay.
+                    let was_open = self.port.direct_admission_open();
+                    if was_open {
+                        self.port.close_direct_admission();
+                    }
+                    if self.port.submissions() != submissions || self.port.direct_publishing() {
+                        if was_open {
+                            self.port.reopen_direct_admission();
+                        }
+                        return Some(if hold_ms > power::FIRMWARE_IDLE_OFF_MS {
+                            u64::from(hold_ms) * 1_000_000
+                        } else {
+                            RETRY_NS
+                        });
+                    }
+                    let res = self.set_idle_control(true);
+                    if was_open {
+                        self.port.reopen_direct_admission();
+                    }
+                    if res.is_err() {
                         return Some(RETRY_NS);
                     }
                     self.hold.released();
@@ -2536,7 +2575,7 @@ impl Gpu {
                     power::Demand::new(pdev.as_ref().as_raw())?,
                     shared.feed.clone(),
                 )?,
-                seen_submissions: 0,
+                direct_idle: power::DirectIdle::new(),
                 rings: channel::Rings::new(
                     shared.variant.graph,
                     shared.variant.telemetry_protocol,
@@ -2743,7 +2782,7 @@ impl Gpu {
                     power::Demand::new(pdev.as_ref().as_raw())?,
                     shared.feed.clone(),
                 )?,
-                seen_submissions: 0,
+                direct_idle: power::DirectIdle::new(),
                 rings: channel::Rings::new(
                     shared.variant.graph,
                     shared.variant.telemetry_protocol,

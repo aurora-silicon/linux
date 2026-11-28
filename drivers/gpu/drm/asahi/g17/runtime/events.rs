@@ -590,6 +590,9 @@ impl crate::g17::Shared {
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
             };
+            // Snapshot direct-submission state before scanning queues so a publisher
+            // that exposes work and drops its guard cannot slip between the two.
+            let direct = firmware.port.direct_snapshot();
             let (pending, masks, compute_scan) = firmware.service_runtime_events_scan(deferred)?;
             let recover = pending.recovery || firmware.recovery.pending();
             if recover {
@@ -677,12 +680,15 @@ impl crate::g17::Shared {
                     let no_outer_or_grow =
                         !firmware.init.outer_waiting() && !firmware.render_grow_ready();
                     if no_replay && no_housekeeping && no_outer_or_grow {
-                        if let Some(delay) = firmware.idle_check(now, in_flight)? {
+                        if let Some(delay) = firmware.idle_check(now, in_flight, direct)? {
                             self.queue_idle(delay);
                         }
-                        if let Some(delay) =
-                            deferred_housekeeping_delay(in_flight, false, now, last_hk)
-                        {
+                        if let Some(delay) = deferred_housekeeping_delay(
+                            in_flight || direct.publishing,
+                            false,
+                            now,
+                            last_hk,
+                        ) {
                             self.queue_housekeeping(delay);
                         }
                         let polling =
@@ -774,6 +780,7 @@ impl crate::g17::Shared {
             return Ok(());
         };
         let now = super::now_ns();
+        let direct = firmware.port.direct_snapshot();
         let compute = firmware
             .queues
             .compute
@@ -782,7 +789,7 @@ impl crate::g17::Shared {
             .filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
-        let idle = firmware.idle_check(now, in_flight)?;
+        let idle = firmware.idle_check(now, in_flight, direct)?;
         // Expiries, drained pairs, exits, pool and heap trimming, teardown and M5 report
         // drains give back what retirement freed; a completion needs none of them to retire
         // or to signal. While nothing waits for capacity and `HOUSEKEEPING_NS` has not elapsed,
@@ -868,7 +875,9 @@ impl crate::g17::Shared {
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }
-        if let Some(delay) = deferred_housekeeping_delay(in_flight, housekeeping, now, last_hk) {
+        if let Some(delay) =
+            deferred_housekeeping_delay(in_flight || direct.publishing, housekeeping, now, last_hk)
+        {
             self.queue_housekeeping(delay);
         }
         if firmware.recovery.pending() {

@@ -390,6 +390,52 @@ impl Hold {
     }
 }
 
+/// Tracks lockless direct-submission admissions and exits across `idle_check`
+/// passes so `Effort` and `Hold` neither leak unarmed after an already-retired
+/// direct submission nor clear while a direct publisher is still between
+/// admission and publication.
+pub(super) struct DirectIdle {
+    seen_submissions: u64,
+    seen_exits: u64,
+}
+
+impl DirectIdle {
+    pub(super) const fn new() -> Self {
+        Self {
+            seen_submissions: 0,
+            seen_exits: 0,
+        }
+    }
+
+    /// Consumes `submissions` and `exits` into `effort`, returning whether
+    /// `Effort::idle` and `Hold::step` should treat the GPU as actively busy.
+    /// Already-retired direct submissions (`!in_flight && !direct_publishing`)
+    /// clear `idle_since` via `effort.submit()` but return `false` so both
+    /// state machines still arm their recheck timers.
+    pub(super) fn observe(
+        &mut self,
+        effort: &mut Effort,
+        submissions: u64,
+        exits: u64,
+        in_flight: bool,
+        direct_publishing: bool,
+    ) -> bool {
+        let progressed = submissions != self.seen_submissions || exits != self.seen_exits;
+        self.seen_submissions = submissions;
+        self.seen_exits = exits;
+        if progressed {
+            effort.submit();
+        }
+        in_flight || direct_publishing
+    }
+
+    /// Bounded recheck delay while a direct publisher is between admission and
+    /// publication/abort, in case it aborts or retires without another wake.
+    pub(super) fn recheck_delay(direct_publishing: bool) -> Option<u64> {
+        direct_publishing.then_some(IDLE_HOLD_NS)
+    }
+}
+
 /// Single-producer control path under the device mutex. Event draining must not publish another
 /// control between `set_idle` and the exact three-counter retirement witness.
 pub(super) trait Control {
@@ -783,6 +829,70 @@ mod tests {
         assert_eq!(hold.step(0, true, 2, 10), HoldAction::Assert);
         hold.asserted();
         assert_eq!(hold.step(1, false, 2, FIRMWARE_IDLE_OFF_MS), HoldAction::Release);
+    }
+
+    #[test]
+    fn direct_idle_arms_recheck_for_retired_submission_and_guards_paused_publisher() {
+        const NS_MS: u64 = 1_000_000;
+        let mut direct = DirectIdle::new();
+        let mut effort = Effort::new();
+        let mut hold = Hold::new();
+
+        // 1. Direct submission starts and retires before idle_check() runs:
+        //    submissions=1, exits=1, in_flight=false, direct_publishing=false.
+        let active = direct.observe(&mut effort, 1, 1, false, false);
+        assert!(!active);
+        assert!(!effort.will_clear(10 * NS_MS, active));
+        assert_eq!(effort.idle(10 * NS_MS, active), IdleAction::Recheck(IDLE_HOLD_NS));
+        assert_eq!(DirectIdle::recheck_delay(false), None);
+        // On non-M5 Macs with hold_ms > 2, Hold asserts and immediately arms its recheck.
+        assert_eq!(hold.step(10 * NS_MS, active, effort.submissions(), 10), HoldAction::Assert);
+        hold.asserted();
+        assert_eq!(
+            hold.step(10 * NS_MS, active, effort.submissions(), 10),
+            HoldAction::Recheck(10 * NS_MS)
+        );
+        // After hold_ms (10 ms) Hold releases; after IDLE_HOLD_NS (16 ms) Effort clears.
+        let active = direct.observe(&mut effort, 1, 1, false, false);
+        assert_eq!(hold.step(20 * NS_MS, active, effort.submissions(), 10), HoldAction::Release);
+        hold.released();
+        assert!(!hold.active());
+        assert_eq!(effort.idle(20 * NS_MS, active), IdleAction::Recheck(6 * NS_MS));
+        assert_eq!(effort.idle(26 * NS_MS, active), IdleAction::Clear);
+        assert!(!effort.streaming());
+
+        // 2. Direct publisher is admitted (submissions=2, exits=1) and pauses before
+        //    publishing (in_flight=false, direct_publishing=true). Neither Effort nor
+        //    Hold may clear/release even far past the 16 ms deadline, and a bounded
+        //    recheck remains armed in case the publisher aborts without waking events.
+        let active = direct.observe(&mut effort, 2, 1, false, true);
+        assert!(active);
+        assert_eq!(effort.idle(30 * NS_MS, active), IdleAction::None);
+        assert_eq!(DirectIdle::recheck_delay(true), Some(IDLE_HOLD_NS));
+        assert_eq!(hold.step(30 * NS_MS, active, effort.submissions(), 10), HoldAction::Assert);
+        hold.asserted();
+        assert_eq!(hold.step(30 * NS_MS, active, effort.submissions(), 10), HoldAction::None);
+        // 100 ms later, still paused: still active, never clears or releases.
+        let active = direct.observe(&mut effort, 2, 1, false, true);
+        assert!(active);
+        assert_eq!(effort.idle(130 * NS_MS, active), IdleAction::None);
+        assert_eq!(hold.step(130 * NS_MS, active, effort.submissions(), 10), HoldAction::None);
+
+        // 3. Publisher finishes and retires (exits=2, direct_publishing=false):
+        //    exit progression restarts both hold windows cleanly from now_ns.
+        let active = direct.observe(&mut effort, 2, 2, false, false);
+        assert!(!active);
+        assert!(!effort.will_clear(140 * NS_MS, active));
+        assert_eq!(effort.idle(140 * NS_MS, active), IdleAction::Recheck(IDLE_HOLD_NS));
+        assert_eq!(
+            hold.step(140 * NS_MS, active, effort.submissions(), 10),
+            HoldAction::Recheck(10 * NS_MS)
+        );
+        let active = direct.observe(&mut effort, 2, 2, false, false);
+        assert_eq!(hold.step(150 * NS_MS, active, effort.submissions(), 10), HoldAction::Release);
+        hold.released();
+        assert_eq!(effort.idle(156 * NS_MS, active), IdleAction::Clear);
+        assert!(!effort.streaming());
     }
 
     #[test]

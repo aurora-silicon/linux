@@ -138,6 +138,33 @@ pub(super) struct Port {
     statistics_epoch: AtomicU64,
     last_submission_ns: AtomicU64,
     submissions: AtomicU64,
+    /// Lockless direct publishers admitted past `effort_full` that have not yet
+    /// exposed their work to queue scans (or aborted).
+    direct_publishers: AtomicU32,
+    /// Completed or aborted direct publications; bumped before `direct_publishers`
+    /// decrements so an idle pass never misses the handoff.
+    direct_exits: AtomicU64,
+}
+
+/// Keeps [`Port::direct_publishers`] elevated while a lockless direct publisher
+/// is between admission and publication (or abort).
+pub(super) struct DirectSubmissionGuard<'a> {
+    port: &'a Port,
+}
+
+/// Snapshot of lockless direct-submission state taken before scanning queues.
+#[derive(Clone, Copy)]
+pub(super) struct DirectSnapshot {
+    pub(super) submissions: u64,
+    pub(super) publishing: bool,
+    pub(super) exits: u64,
+}
+
+impl Drop for DirectSubmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.port.direct_exits.fetch_add(1, Ordering::SeqCst);
+        self.port.direct_publishers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Room in both render work rings of one priority, observed under the render publication
@@ -233,6 +260,8 @@ impl Port {
                 statistics_epoch: AtomicU64::new(0),
                 last_submission_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
+                direct_publishers: AtomicU32::new(0),
+                direct_exits: AtomicU64::new(0),
             }),
             GFP_KERNEL,
         )
@@ -921,17 +950,64 @@ impl Port {
         self.publications.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// A publisher without the device mutex counts itself before it checks that full effort is
-    /// applied. The idle clear withdraws the flag before it rechecks the count, so either the
-    /// clear sees this submission or this submission sees the flag withdrawn.
-    pub(super) fn note_submission(&self) -> bool {
+    /// A publisher without the device mutex registers itself before checking that full effort is
+    /// applied. The idle clear withdraws the flag before rechecking `submissions` and
+    /// `direct_publishers`, so either the clear sees this publisher or this publisher sees the
+    /// flag withdrawn and falls back to the device-mutex path.
+    pub(super) fn begin_direct_submission(&self) -> Option<DirectSubmissionGuard<'_>> {
+        self.direct_publishers.fetch_add(1, Ordering::SeqCst);
         self.submissions.fetch_add(1, Ordering::SeqCst);
-        self.note_gpu_activity();
-        self.effort_full.load(Ordering::SeqCst)
+        if self.effort_full.load(Ordering::SeqCst) {
+            self.note_gpu_activity();
+            Some(DirectSubmissionGuard { port: self })
+        } else {
+            self.direct_publishers.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
     }
 
     pub(super) fn submissions(&self) -> u64 {
         self.submissions.load(Ordering::SeqCst)
+    }
+
+    /// Whether any lockless direct publisher is between admission and publication/abort.
+    pub(super) fn direct_publishing(&self) -> bool {
+        self.direct_publishers.load(Ordering::SeqCst) != 0
+    }
+
+    /// Pre-scan snapshot of lockless direct-submission state for `idle_check`.
+    /// Load order (`submissions`, `direct_publishers`, `direct_exits`, all SeqCst)
+    /// pairs with `begin_direct_submission` (`direct_publishers += 1`,
+    /// `submissions += 1`) and `DirectSubmissionGuard::drop` (`direct_exits += 1`,
+    /// `direct_publishers -= 1`) so every publisher either (a) advances
+    /// `submissions` past the snapshot, (b) is seen in `publishing`, or
+    /// (c) finished publishing before the subsequent queue scan.
+    pub(super) fn direct_snapshot(&self) -> DirectSnapshot {
+        let submissions = self.submissions.load(Ordering::SeqCst);
+        let publishing = self.direct_publishers.load(Ordering::SeqCst) != 0;
+        let exits = self.direct_exits.load(Ordering::SeqCst);
+        DirectSnapshot {
+            submissions,
+            publishing,
+            exits,
+        }
+    }
+
+    pub(super) fn direct_admission_open(&self) -> bool {
+        self.effort_full.load(Ordering::SeqCst)
+    }
+
+    /// Closes lockless direct admission without altering CLPC demand or the busy-share
+    /// window, so idle clear and hold release can validate against concurrent publishers
+    /// before committing any power-state transition.
+    pub(super) fn close_direct_admission(&self) {
+        self.effort_full.store(false, Ordering::SeqCst);
+    }
+
+    /// Reopens lockless direct admission after a deferred clear or hold release without
+    /// touching CLPC demand.
+    pub(super) fn reopen_direct_admission(&self) {
+        self.effort_full.store(true, Ordering::SeqCst);
     }
 
     pub(super) fn set_effort_full(&self, full: bool) {

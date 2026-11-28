@@ -3354,9 +3354,7 @@ impl Backend {
         };
         let target_cell = cells[target_idx].as_ref()?;
         // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
-            return None;
-        }
+        let direct = port.begin_direct_submission()?;
         self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
@@ -3423,6 +3421,7 @@ impl Backend {
                 &mut |event| deferred.push(event),
             ))
         })();
+        drop(direct);
         if packet.is_published() {
             if let Some(sources) = packet.completion.sources() {
                 if cross_qid_mask != 0 {

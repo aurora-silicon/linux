@@ -203,7 +203,7 @@ def build(mutation=None):
         # in flight; renders wait on every compute channel of the owner.
         'idle housekeeping sees sibling work': ordered_ok(
             events, '.compute', '.iter()', '.flatten()', '.filter_map(|entry| entry.queue.as_deref())',
-            '.any(|queue| queue.in_flight())', 'firmware.idle_check(now, in_flight)?'),
+            '.any(|queue| queue.in_flight())', 'firmware.idle_check(now, in_flight, direct)?'),
         'renders wait on every compute channel': ordered_ok(
             render_deps, '.filter(|queue| queue.owner() == Some(owner))', '.compute_count',
             'dependencies.compute_count += 1;'),

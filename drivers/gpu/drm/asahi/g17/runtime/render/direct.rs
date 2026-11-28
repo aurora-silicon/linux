@@ -376,9 +376,7 @@ impl Backend {
             return None;
         }
         // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
-            return None;
-        }
+        let mut direct = Some(port.begin_direct_submission()?);
         self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Render) {
@@ -476,6 +474,9 @@ impl Backend {
             match (*state).as_deref_mut() {
                 Some(firmware) => {
                     let returned = firmware.return_render(slot, &mut loan, activation, packet);
+                    // `return_render` restored `entry.pair` under the device mutex, so any
+                    // subsequent event pass sees the published work in `render_in_flight()`.
+                    direct.take();
                     let returned = match returned {
                         // A completion arrived while the pair was lent. The event pass it would
                         // request takes the device mutex from another CPU after this owner's
@@ -497,7 +498,15 @@ impl Backend {
                                 // Retired by the next pass's observation, like any completion.
                                 FastRenderOutcome::Fallback => self.shared.queue_event_records(),
                                 FastRenderOutcome::Rescan => self.shared.queue_poll(),
-                                FastRenderOutcome::Done | FastRenderOutcome::Idle => {}
+                                // If this synchronous retirement left no renders in flight,
+                                // wake an idle check in case an earlier event pass saw the
+                                // pair lent as active and left IDLE_WORK unarmed.
+                                FastRenderOutcome::Done => {
+                                    if !firmware.queues.render_in_flight() {
+                                        self.shared.queue_idle(0);
+                                    }
+                                }
+                                FastRenderOutcome::Idle => {}
                             })
                         }
                         Ok(false) => Ok(()),
@@ -521,6 +530,7 @@ impl Backend {
             }
         };
         self.shared.note_changed();
+        drop(direct);
         drop(lease);
         if recovery_started {
             self.shared.queue_events();

@@ -66,8 +66,8 @@ def build_harness(mutation=None):
         )
     elif mutation == 'hardcode-in-flight-true':
         turn = turn.replace(
-            'firmware.idle_check(now, in_flight)?',
-            'firmware.idle_check(now, true)?',
+            'firmware.idle_check(now, in_flight, direct)?',
+            'firmware.idle_check(now, true, direct)?',
             1,
         )
     elif mutation == 'skip-cadence-expiry':
@@ -78,8 +78,8 @@ def build_harness(mutation=None):
         )
 
     fast_idle_ok = (
-        'firmware.idle_check(now, in_flight)?' in turn
-        and 'firmware.idle_check(now, true)?' not in turn
+        'firmware.idle_check(now, in_flight, direct)?' in turn
+        and 'firmware.idle_check(now, true, direct)?' not in turn
     )
     fast_timer_ok = turn.count('self.queue_housekeeping(delay);') == 2
     no_idle_force_ok = (

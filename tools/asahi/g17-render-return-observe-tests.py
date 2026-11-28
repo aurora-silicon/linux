@@ -168,7 +168,7 @@ def build(mutation=None):
             'None => Ok(FastRenderOutcome::Fallback),',
             'FastRenderOutcome::Fallback => self.shared.queue_event_records(),',
             'FastRenderOutcome::Rescan => self.shared.queue_poll(),',
-            'FastRenderOutcome::Done | FastRenderOutcome::Idle => {}', 'Ok(false) => Ok(()),',
+            'FastRenderOutcome::Done => {', 'if !firmware.queues.render_in_flight() {', 'self.shared.queue_idle(0);', 'FastRenderOutcome::Idle => {}', 'Ok(false) => Ok(()),',
             'Err(error) => Err(error),', 'drop(state);', 'batch.finish();', 'drop(collector);',
             'self.shared.note_changed();', 'drop(lease);', 'if let Err(error) = returned {',
             'self.shared.lose_device_quietly();'),
