@@ -122,11 +122,14 @@ impl Cell32 {
     }
 }
 
+mod notifier_page {
+    pub const FS_STAMP: usize = 0x630;
+}
 struct ComputeGraph {
     fw_stamp: Cell32,
 }
 struct RenderGraph {
-    fw_stamp: [Cell32; 2],
+    notifier: Cell32,
 }
 struct Graph {
     compute: [ComputeGraph; hw::sizes::COMPUTE_PIPES],
@@ -353,7 +356,7 @@ impl Firmware {
                     fw_stamp: Cell32::new(0),
                 }),
                 render: RenderGraph {
-                    fw_stamp: [Cell32::new(0), Cell32::new(0)],
+                    notifier: Cell32::new(0),
                 },
             },
             engine: Engine {
@@ -866,11 +869,11 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     fw.engine.fs_target = 0x200;
     fw.engine.target[0] = 0x100;
     // Render still running, compute reached its stamp.
-    fw.graph.render.fw_stamp[1].set(0x100);
+    fw.graph.render.notifier.set(0x100);
     fw.graph.compute[0].fw_stamp.set(0x100);
     assert!(fw.oldest_stamp_reached());
     assert_eq!(fw.graph.compute[0].fw_stamp.reads.get(), 1);
-    assert_eq!(fw.graph.render.fw_stamp[1].reads.get(), 0);
+    assert_eq!(fw.graph.render.notifier.reads.get(), 0);
     assert_eq!(fw.oldest_terminal_events(), Some((Some(0), Some(0))));
 
     // Pipe 1 reaching its stamp behind a pending pipe 0 flight also wakes inline retirement.
@@ -896,12 +899,12 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     assert!(fw2.oldest_stamp_reached());
     assert_eq!(fw2.graph.compute[0].fw_stamp.reads.get(), 1);
     assert_eq!(fw2.graph.compute[1].fw_stamp.reads.get(), 1);
-    assert_eq!(fw2.graph.render.fw_stamp[1].reads.get(), 0);
+    assert_eq!(fw2.graph.render.notifier.reads.get(), 0);
 }
 
 #[test]
 fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
-    // Compute-only workload never reads render fw_stamp or idle compute pipe 1.
+    // Compute-only workload never reads render notifier or idle compute pipe 1.
     let mut fc = Firmware::new();
     fc.engine.flights.push(Flight {
         computes: 1,
@@ -915,8 +918,7 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
     assert!(!fc.oldest_stamp_reached());
     assert_eq!(fc.graph.compute[0].fw_stamp.reads.get(), 1);
     assert_eq!(fc.graph.compute[1].fw_stamp.reads.get(), 0);
-    assert_eq!(fc.graph.render.fw_stamp[0].reads.get(), 0);
-    assert_eq!(fc.graph.render.fw_stamp[1].reads.get(), 0);
+    assert_eq!(fc.graph.render.notifier.reads.get(), 0);
 
     // Render-only workload never reads compute fw_stamp.
     let mut fr = Firmware::new();
@@ -928,12 +930,11 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
         fs_target: 0x200,
     });
     fr.engine.fs_target = 0x200;
-    fr.graph.render.fw_stamp[1].set(0x100);
+    fr.graph.render.notifier.set(0x100);
     assert!(!fr.oldest_stamp_reached());
     assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(), 0);
     assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(), 0);
-    assert_eq!(fr.graph.render.fw_stamp[0].reads.get(), 0);
-    assert_eq!(fr.graph.render.fw_stamp[1].reads.get(), 1);
+    assert_eq!(fr.graph.render.notifier.reads.get(), 1);
 }
 
 #[test]

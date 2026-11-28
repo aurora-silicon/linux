@@ -22,7 +22,7 @@ use super::channel::Channel;
 use super::command::{Command, ComputeCommand, RenderCommand};
 use super::encode::{self, ComputeRefs, ComputeRt, Geometry, RenderRefs, StageRt};
 use super::fw::channels::{SubmitRecord, RING_SLOTS};
-use super::fw::graph::{notifier_page, qstate};
+use super::fw::graph::{notifier_page, qstate, sched_ctx};
 use super::fw::work::{self, BarrierType};
 use super::hw::{engine as engine_ids, sizes};
 use super::job::{Completions, Job};
@@ -835,6 +835,7 @@ impl Firmware {
         bytes[12..20].copy_from_slice(&zero.to_le_bytes());
         bytes[0x20..0x24].copy_from_slice(&0x80u32.to_le_bytes());
         barrier.write(0, &bytes)?;
+        r.sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;
         if r.qstate[0].r32(qstate::READ)? != 0
             || r.qstate[0].r32(qstate::WRITE)? != 0
             || r.sched_ctx.r32(0)? & 0xffffff != 0x00ffff
@@ -867,6 +868,7 @@ impl Firmware {
             if now >= deadline {
                 return Err(ETIMEDOUT);
             }
+            self.graph.render.sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;
             let context = self.graph.render.sched_ctx.r32(0)?;
             let registered = context & 0xff != 0xff
                 && (context >> 8) & 0xff != 0xff
@@ -906,7 +908,7 @@ impl Firmware {
     pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 2 + sizes::COMPUTE_PIPES]> {
         let mut stage = [0u32; 2 + sizes::COMPUTE_PIPES];
         stage[0] = self.graph.render.fw_stamp[0].r32(0)?;
-        stage[1] = self.graph.render.fw_stamp[1].r32(0)?;
+        stage[1] = self.graph.render.notifier.r32(notifier_page::FS_STAMP)?;
         for (p, compute) in self.graph.compute.iter().enumerate() {
             stage[2 + p] = compute.fw_stamp.r32(0)?;
         }
@@ -2635,7 +2637,7 @@ impl Firmware {
                 if engine_behind {
                     return Err(EAGAIN);
                 }
-                let e = job.resources.take_pb()?;
+                let e = job.resources.take_pb_for(heap_blocks)?;
                 if let Err(err) = e.prepare_with_scs_for(
                     self.init.abi.pb_manager(),
                     alloc_slot,
@@ -2651,7 +2653,7 @@ impl Firmware {
             }
         };
         let binding = self.pools.bind(alloc_slot, reused);
-        a.pb_mgr = epoch.manager.va;
+        a.pb_mgr = epoch.manager_va()?;
         a.mgr_misc = epoch.misc.va;
         let r = &self.graph.render;
         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
@@ -2712,7 +2714,7 @@ impl Firmware {
             uma_mgr: a.uma_mgr,
             uma_aux: a.uma_aux,
             uma_gpu: a.uma_gpu,
-            pb_mgr: epoch.manager.va,
+            pb_mgr: epoch.manager_va()?,
             scene_list: 0,
             mgr_misc: epoch.misc.va,
             pb_init_blocks: epoch.heap_blocks(),
@@ -3483,7 +3485,9 @@ impl Firmware {
         let publication = (|| -> Result {
             if render {
                 let a = f.pb_slot as usize;
-                f.pb.as_ref().ok_or(EINVAL)?.expose();
+                let pb = f.pb.as_ref().ok_or(EINVAL)?;
+                pb.expose();
+                pb.publish_flight();
                 job.resources.commit_render(f.count as u32);
                 for j2 in f.group.iter() {
                     j2.resources.commit_render(j2.progress.count());

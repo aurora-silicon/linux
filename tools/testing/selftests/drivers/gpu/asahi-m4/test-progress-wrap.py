@@ -31,7 +31,10 @@ fn set_now_ns(v:u64){CLOCK.with(|c|c.set(v));}
 macro_rules! dev_warn{($($tt:tt)*)=>{};}
 macro_rules! dev_err{($($tt:tt)*)=>{};}
 struct Object(Cell<u32>);impl Object{fn r32(&self,_off:usize)->core::result::Result<u32,()>{Ok(self.0.get())}}
-struct Compute{fw_stamp:Object}struct Render{fw_stamp:[Object;2]}struct Graph{compute:[Compute;hw::sizes::COMPUTE_PIPES],render:Render}
+mod notifier_page{pub const FS_STAMP:usize=0x630;}
+struct RenderNotifier(Cell<u32>);
+impl RenderNotifier{fn r32(&self,_off:usize)->core::result::Result<u32,()>{Ok(self.0.get())}}
+struct Compute{fw_stamp:Object}struct Render{fw_stamp:[Object;2],notifier:RenderNotifier}struct Graph{compute:[Compute;hw::sizes::COMPUTE_PIPES],render:Render}
 struct Job{long:bool}
 impl Job{fn long(&self)->bool{self.long}}
 struct Flight{job:Job,computes:u32,compute_pipe:u8,renders:u32,target:u32,ta_target:u32,fs_target:u32,published_ns:u64}
@@ -75,7 +78,7 @@ type Completions=();
 fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     set_now_ns(1_000_000_000);
     let mut t=[0u32;hw::sizes::COMPUTE_PIPES];t[0]=target;
-    let mut f=Firmware{graph:Graph{compute:core::array::from_fn(|_|Compute{fw_stamp:Object(Cell::new(previous))}),render:Render{fw_stamp:[Object(Cell::new(previous)),Object(Cell::new(previous))]}},
+    let mut f=Firmware{graph:Graph{compute:core::array::from_fn(|_|Compute{fw_stamp:Object(Cell::new(previous))}),render:Render{fw_stamp:[Object(Cell::new(previous)),Object(Cell::new(previous))],notifier:RenderNotifier(Cell::new(previous))}},
         engine:Engine{flights:vec![Flight{job:Job{long:false},computes:u32::from(!render),compute_pipe:0,renders:u32::from(render),target,ta_target:target,fs_target:target,published_ns:1}],target:t,ta_target:target,fs_target:target,progress_flight:[0;hw::sizes::COMPUTE_PIPES+1],progress:[__ZERO__;hw::sizes::COMPUTE_PIPES+2]},
         recovery:Recovery{deadlines:logic::Deadlines::EXPIRED,compute_deadlines:[logic::Deadlines::EXPIRED;hw::sizes::COMPUTE_PIPES],warning_deadline_ns:[u64::MAX;2],compute_warning_deadline_ns:[u64::MAX;hw::sizes::COMPUTE_PIPES],long_commands:0,receipt_fault:false,failed:None},
         render_renewed:0,compute_renewed:0,pipe_renewed:[0;hw::sizes::COMPUTE_PIPES],fail_stops:vec![]};
@@ -91,7 +94,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     let mut f=firmware(true,0x100,0);f.progress();
     f.graph.compute[0].fw_stamp.0.set(0x100);f.progress();assert_eq!(f.render_renewed,0);assert_eq!(f.compute_renewed,0);
     f.graph.render.fw_stamp[0].0.set(0x100);f.progress();assert_eq!(f.render_renewed,1);assert_eq!(f.compute_renewed,0);
-    f.graph.render.fw_stamp[1].0.set(0x100);f.progress();assert_eq!(f.render_renewed,2);assert_eq!(f.compute_renewed,0);
+    f.graph.render.notifier.0.set(0x100);f.progress();assert_eq!(f.render_renewed,2);assert_eq!(f.compute_renewed,0);
     f.progress();assert_eq!(f.render_renewed,2);
 }
 #[test]fn before_at_and_after_zero_completions_have_the_same_progress_contract(){
@@ -158,7 +161,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
         set_now_ns(1_000_000_000 + step * 2_000_000_000);
         let next_target = 0x300 + (step as u32) * 0x100;
         f.graph.render.fw_stamp[0].0.set(next_target - 0x100);
-        f.graph.render.fw_stamp[1].0.set(next_target - 0x100);
+        f.graph.render.notifier.0.set(next_target - 0x100);
         f.engine.flights[1].ta_target = next_target;
         f.engine.flights[1].fs_target = next_target;
         f.engine.flights[1].published_ns = 2 + step;

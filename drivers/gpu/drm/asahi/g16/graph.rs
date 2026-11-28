@@ -134,22 +134,33 @@ struct QueueSession {
     qinfo: Arc<FwObject>,
     qstate: Arc<FwObject>,
     user_stamp: Arc<FwObject>,
-    fw_stamp: Arc<FwObject>,
+    fw_stamp: Option<Arc<FwObject>>,
 }
 impl QueueSession {
     fn new(o: &mut Objects) -> Result<Self> {
+        Self::new_with(o, Some(Class::Shared))
+    }
+    fn new_with(o: &mut Objects, fw_stamp_class: Option<Class>) -> Result<Self> {
         Ok(Self {
             qinfo: alloc(o, qinfo::SIZE, graph_fw(), None, 0, false)?,
             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
-            fw_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
+            fw_stamp: match fw_stamp_class {
+                Some(class) => Some(alloc(o, 8, class, None, 0, false)?),
+                None => None,
+            },
         })
     }
-    /// Completes the queue with its firmware-cached work ring from a device-lifetime
-    /// [`Factory::persistent_objects`] allocator. The host only writes 64-bit work/barrier VAs
-    /// into the ring before advancing the uncached `qstate::WRITE` producer and never reads
-    /// back firmware writes, matching macOS 26B123's `0x443` command-ring mapping.
+    /// Completes the queue with its firmware-cached work ring (and, when deferred from
+    /// [`Self::new_with`], its firmware-cached `fw_stamp`) from a device-lifetime
+    /// [`Factory::persistent_objects`] allocator. The host writes 64-bit work/barrier VAs into
+    /// the ring before advancing the uncached `qstate::WRITE` producer and never reads back
+    /// firmware writes to the ring, matching macOS 26B123's `0x443` command-ring mapping.
     fn finish(self, rings: &mut Objects) -> Result<QueueObjects> {
+        let fw_stamp = match self.fw_stamp {
+            Some(stamp) => stamp,
+            None => alloc(rings, 8, Class::FwCoherent, None, 0, false)?,
+        };
         Ok(QueueObjects {
             qinfo: self.qinfo,
             qstate: self.qstate,
@@ -162,7 +173,7 @@ impl QueueSession {
                 false,
             )?,
             user_stamp: self.user_stamp,
-            fw_stamp: self.fw_stamp,
+            fw_stamp,
         })
     }
 }
@@ -211,26 +222,24 @@ fn init_notifier(page: &FwObject, threshold: &FwObject) -> Result {
 }
 
 struct ComputeGraphSession {
-    sched_ctx: Arc<FwObject>,
     notifier: Arc<FwObject>,
     threshold: Arc<FwObject>,
     job_list: Arc<FwObject>,
     q: QueueSession,
 }
 impl ComputeGraphSession {
-    fn new(o: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<Self> {
+    fn new(o: &mut Objects) -> Result<Self> {
         Ok(Self {
-            sched_ctx,
             notifier: alloc(o, 0x1000, Class::FwCached, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             q: QueueSession::new(o)?,
         })
     }
-    fn finish(self, rings: &mut Objects) -> Result<ComputeGraph> {
+    fn finish(self, rings: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<ComputeGraph> {
         let q = self.q.finish(rings)?;
         Ok(ComputeGraph {
-            sched_ctx: self.sched_ctx,
+            sched_ctx,
             notifier: self.notifier,
             threshold: self.threshold,
             job_list: self.job_list,
@@ -247,7 +256,7 @@ impl ComputeGraphSession {
 impl ComputeGraph {
     #[allow(dead_code)]
     fn new(o: &mut Objects, rings: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<Self> {
-        ComputeGraphSession::new(o, sched_ctx)?.finish(rings)
+        ComputeGraphSession::new(o)?.finish(rings, sched_ctx)
     }
     fn init(&self, abi: FwAbi, init_ctx: bool) -> Result {
         if init_ctx {
@@ -289,7 +298,6 @@ pub(crate) struct RenderGraph {
 struct RenderGraphSession {
     ta: QueueSession,
     fs: QueueSession,
-    sched_ctx: Arc<FwObject>,
     notifier: Arc<FwObject>,
     threshold: Arc<FwObject>,
     job_list: [Arc<FwObject>; 2],
@@ -297,11 +305,10 @@ struct RenderGraphSession {
     registration_barrier: Arc<FwObject>,
 }
 impl RenderGraphSession {
-    fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+    fn new(o: &mut Objects) -> Result<Self> {
         Ok(Self {
             ta: QueueSession::new(o)?,
-            fs: QueueSession::new(o)?,
-            sched_ctx: context,
+            fs: QueueSession::new_with(o, None)?,
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [
@@ -319,7 +326,7 @@ impl RenderGraphSession {
             )?,
         })
     }
-    fn finish(self, rings: &mut Objects) -> Result<RenderGraph> {
+    fn finish(self, rings: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<RenderGraph> {
         let [ta, fs] = [self.ta.finish(rings)?, self.fs.finish(rings)?];
         Ok(RenderGraph {
             qscratch: [ta.qinfo.clone(), fs.qinfo.clone()],
@@ -328,7 +335,7 @@ impl RenderGraphSession {
             ring: [ta.ring, fs.ring],
             user_stamp: [ta.user_stamp, fs.user_stamp],
             fw_stamp: [ta.fw_stamp, fs.fw_stamp],
-            sched_ctx: self.sched_ctx,
+            sched_ctx,
             notifier: self.notifier,
             threshold: self.threshold,
             job_list: self.job_list,
@@ -341,7 +348,7 @@ impl RenderGraphSession {
 impl RenderGraph {
     #[allow(dead_code)]
     fn new(o: &mut Objects, rings: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
-        RenderGraphSession::new(o, context)?.finish(rings)
+        RenderGraphSession::new(o)?.finish(rings, context)
     }
     fn init(&self, abi: FwAbi) -> Result {
         init_notifier(&self.notifier, &self.threshold)?;
@@ -373,20 +380,18 @@ pub(crate) struct Graphs {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) compute: KVec<ComputeGraph>,
     pub(crate) render: RenderGraph,
-    /// Owns the firmware-cached work rings for the device lifetime (never dropped).
+    /// Owns the firmware-cached work rings and shared scheduling context for the device lifetime
+    /// (never dropped).
     _ring_objects: core::mem::ManuallyDrop<Objects>,
 }
 impl Graphs {
     #[inline(never)]
     pub(crate) fn prepare(o: &mut Objects) -> Result<GraphSession> {
-        // Host polls sched_ctx from WC during register_context(); keep uncached and share one
-        // scheduling context across all compute pipes and the render graph.
-        let sched_ctx = alloc(o, sched_ctx::SIZE, Class::Fw, None, 0, false)?;
         let mut compute = KVec::with_capacity(sizes::COMPUTE_PIPES, GFP_KERNEL)?;
         for _ in 0..sizes::COMPUTE_PIPES {
-            compute.push(ComputeGraphSession::new(o, sched_ctx.clone())?, GFP_KERNEL)?;
+            compute.push(ComputeGraphSession::new(o)?, GFP_KERNEL)?;
         }
-        let render = RenderGraphSession::new(o, sched_ctx)?;
+        let render = RenderGraphSession::new(o)?;
         Ok(GraphSession { compute, render })
     }
 
@@ -398,11 +403,23 @@ impl Graphs {
     ) -> Result<Self> {
         // Never dropped even on partial failure: ASC-cached mappings have no qualified teardown.
         let mut ring_objects = core::mem::ManuallyDrop::new(factory.persistent_objects_probe());
+        // Share one ASC-cached scheduling context across all compute pipes and the render graph,
+        // matching macOS 26B123 (`0x443`). `register_context()` syncs the cacheable host view
+        // before polling registration once at boot; firmware reads and writes it on every kick
+        // and completion.
+        let sched_ctx = alloc(
+            &mut ring_objects,
+            sched_ctx::SIZE,
+            Class::FwCoherent,
+            None,
+            0,
+            false,
+        )?;
         let mut compute = KVec::with_capacity(sizes::COMPUTE_PIPES, GFP_KERNEL)?;
         for c in session.compute {
-            compute.push(c.finish(&mut ring_objects)?, GFP_KERNEL)?;
+            compute.push(c.finish(&mut ring_objects, sched_ctx.clone())?, GFP_KERNEL)?;
         }
-        let render = session.render.finish(&mut ring_objects)?;
+        let render = session.render.finish(&mut ring_objects, sched_ctx)?;
         ring_objects.finish_private()?;
         Ok(Self {
             dev: dev.as_ref().as_ref().into(),

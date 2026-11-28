@@ -47,7 +47,13 @@ pub const GFP_KERNEL:u32=0;
 pub type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! init { ($($tt:tt)*) => { $($tt)* }; }
 pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ENOMEM,ETIMEDOUT,ERESTARTSYS};}
-std::thread_local!{pub static FAIL_KBOX_UNINIT:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
+std::thread_local!{
+    pub static FAIL_KBOX_UNINIT:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};
+    pub static FAIL_KVEC_RESERVE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};
+    pub static FAIL_UNIQUE_ARC_UNINIT:std::cell::Cell<u32>=const{std::cell::Cell::new(0)};
+    pub static FAIL_ARC_NEW:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};
+    pub static ON_ARC_NEW_OOM:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};
+}
 pub struct KBox<T>(Box<T>);
 impl<T>KBox<T>{
     pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}
@@ -65,7 +71,21 @@ impl<T>KBox<T>{
 impl<T>std::ops::Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl<T>std::ops::DerefMut for KBox<T>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 pub struct KVec<T>(Vec<T>);
-impl<T>KVec<T>{pub fn new()->Self{Self(Vec::new())} pub fn with_capacity(n:usize,_:u32)->Result<Self>{Ok(Self(Vec::with_capacity(n)))} pub fn push(&mut self,x:T,_:u32)->Result{self.0.push(x);Ok(())}}
+impl<T>KVec<T>{
+    pub fn new()->Self{Self(Vec::new())}
+    pub fn with_capacity(n:usize,_:u32)->Result<Self>{Ok(Self(Vec::with_capacity(n)))}
+    pub fn reserve(&mut self,n:usize,_:u32)->Result{
+        if FAIL_KVEC_RESERVE.with(|f|f.replace(false)){return Err(ENOMEM);}
+        self.0.reserve(n);
+        Ok(())
+    }
+    pub fn push(&mut self,x:T,_:u32)->Result{self.0.push(x);Ok(())}
+    pub fn push_within_capacity(&mut self,x:T)->std::result::Result<(),T>{
+        if self.0.len()==self.0.capacity(){return Err(x);}
+        self.0.push(x);
+        Ok(())
+    }
+}
 impl<T>std::ops::Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
 impl<T>std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut Vec<T>{&mut self.0}}
 pub mod time {pub fn msecs_to_jiffies(n:u32)->u64{n as u64}}
@@ -87,9 +107,36 @@ pub mod sync {
     }
 
     pub struct Arc<T>{inner:std::sync::Arc<T>}
-    impl<T>Arc<T>{pub fn new(v:T,_:u32)->crate::Result<Self>{Ok(Self{inner:std::sync::Arc::new(v)})}pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}pub fn ptr_eq(a:&Self,b:&Self)->bool{std::sync::Arc::ptr_eq(&a.inner,&b.inner)}}
+    impl<T>Arc<T>{
+        pub fn new(v:T,_:u32)->crate::Result<Self>{
+            if crate::FAIL_ARC_NEW.with(|f|f.replace(false)){
+                drop(v);
+                if let Some(hook)=crate::ON_ARC_NEW_OOM.with(|h|h.borrow_mut().take()){
+                    hook();
+                }
+                return Err(crate::ENOMEM);
+            }
+            Ok(Self{inner:std::sync::Arc::new(v)})
+        }
+        pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}
+        pub fn ptr_eq(a:&Self,b:&Self)->bool{std::sync::Arc::ptr_eq(&a.inner,&b.inner)}
+    }
     impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self{inner:self.inner.clone()}}}
     impl<T>std::ops::Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.inner}}
+    pub struct UniqueArc<T>(core::mem::MaybeUninit<T>);
+    pub struct InitUniqueArc<T>(T);
+    impl<T>UniqueArc<T>{
+        pub fn new_uninit(_:u32)->crate::Result<Self>{
+            let fail=crate::FAIL_UNIQUE_ARC_UNINIT.with(|c|{
+                let n=c.get();
+                if n==1{c.set(0);true}else if n>1{c.set(n-1);false}else{false}
+            });
+            if fail{return Err(crate::ENOMEM);}
+            Ok(Self(core::mem::MaybeUninit::uninit()))
+        }
+        pub fn write(self,v:T)->InitUniqueArc<T>{InitUniqueArc(v)}
+    }
+    impl<T>From<InitUniqueArc<T>>for Arc<T>{fn from(v:InitUniqueArc<T>)->Self{Self{inner:std::sync::Arc::new(v.0)}}}
     pub mod aref {pub struct ARef<T>(T);impl From<&crate::device::Device>for ARef<crate::device::Device>{fn from(v:&crate::device::Device)->Self{Self(v.clone())}}}
 }
 pub mod mmu {
@@ -111,14 +158,15 @@ pub mod g16 {
         #[derive(Copy,Clone,Debug,Eq,PartialEq)]pub enum Class{Shared,Fw,FwCached,SharedCached,FwCoherent,Mmio}
         pub enum Placement{Anywhere}
         pub struct Request{pub size:usize,pub class:Class,pub placement:Placement,pub offset:usize,pub client:Option<(u64,u64)>,pub lower:Option<u64>,pub cpu:bool}
-        pub struct FwObject{pub class:Class,pub client_leaf:Option<u64>,pub va:u64,pub gva:Option<u64>,pub lower_gva:Option<u64>,pub lower_leaf:Option<u64>,pub size:usize,pub mapped:usize,pub offset:usize,pub data:std::sync::Arc<std::sync::Mutex<Vec<u8>>>,pub fills:std::sync::Mutex<Vec<(usize,usize)>>,pub fail_fill:std::sync::atomic::AtomicBool,pub write_bytes:std::sync::atomic::AtomicUsize}
+        pub struct FwObject{pub class:Class,pub client_leaf:Option<u64>,pub va:u64,pub gva:Option<u64>,pub lower_gva:Option<u64>,pub lower_leaf:Option<u64>,pub size:usize,pub mapped:usize,pub offset:usize,pub data:std::sync::Arc<std::sync::Mutex<Vec<u8>>>,pub fills:std::sync::Mutex<Vec<(usize,usize)>>,pub fail_fill:std::sync::atomic::AtomicBool,pub write_bytes:std::sync::atomic::AtomicUsize,pub reads:std::sync::atomic::AtomicUsize}
         impl FwObject{
-            pub fn view(o:&Arc<Self>,offset:usize,size:usize)->Result<Arc<Self>>{Arc::new(Self{class:o.class,client_leaf:None,va:o.va+offset as u64,gva:None,lower_gva:None,lower_leaf:None,size,mapped:o.mapped,offset:o.offset+offset,data:o.data.clone(),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)}
+            pub fn view(o:&Arc<Self>,offset:usize,size:usize)->Result<Arc<Self>>{Arc::new(Self{class:o.class,client_leaf:None,va:o.va+offset as u64,gva:None,lower_gva:None,lower_leaf:None,size,mapped:o.mapped,offset:o.offset+offset,data:o.data.clone(),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0),reads:std::sync::atomic::AtomicUsize::new(0)},0)}
             pub fn write(&self,o:usize,b:&[u8])->Result{self.write_bytes.fetch_add(b.len(),std::sync::atomic::Ordering::Relaxed);let mut d=self.data.lock().unwrap();d[self.offset+o..self.offset+o+b.len()].copy_from_slice(b);Ok(())}
             pub fn fill(&self,o:usize,v:u8,n:usize)->Result{if self.fail_fill.swap(false,std::sync::atomic::Ordering::Relaxed){return Err(EIO);}self.fills.lock().unwrap().push((o,n));let mut d=self.data.lock().unwrap();d[self.offset+o..self.offset+o+n].fill(v);Ok(())}
             pub fn w32(&self,o:usize,v:u32)->Result{self.write(o,&v.to_le_bytes())}
             pub fn w64(&self,o:usize,v:u64)->Result{self.write(o,&v.to_le_bytes())}
-            pub fn r32(&self,o:usize)->Result<u32>{let d=self.data.lock().unwrap();Ok(u32::from_le_bytes(d[self.offset+o..self.offset+o+4].try_into().unwrap()))}
+            pub fn r32(&self,o:usize)->Result<u32>{self.reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let d=self.data.lock().unwrap();Ok(u32::from_le_bytes(d[self.offset+o..self.offset+o+4].try_into().unwrap()))}
+            pub fn r64(&self,o:usize)->Result<u64>{self.reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed);let d=self.data.lock().unwrap();Ok(u64::from_le_bytes(d[self.offset+o..self.offset+o+8].try_into().unwrap()))}
             pub fn snapshot(&self)->Vec<u8>{self.data.lock().unwrap().clone()}
         }
         pub struct FwLease(pub crate::cleanup::Deferred<Objects>);
@@ -129,11 +177,35 @@ pub mod g16 {
             }
         }
         pub struct Factory;
+        std::thread_local!{
+            pub static RENDER_UMA_POOL: std::cell::RefCell<Option<Arc<super::resources::RenderUmaPool>>> = const { std::cell::RefCell::new(None) };
+            pub static PB_RECORD_POOL: std::cell::RefCell<Option<Arc<super::resources::PbRecordPool>>> = const { std::cell::RefCell::new(None) };
+            pub static NEXT_PERSISTENT_WINDOW: std::cell::RefCell<Option<Arc<crate::sync::Mutex<Window>>>> = const { std::cell::RefCell::new(None) };
+            pub static FAIL_FW_ALLOC: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
         impl Factory{
             pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
             pub fn fw_objects(&self)->Objects{Objects::new()}
-            pub fn persistent_objects(&self)->Objects{Objects::persistent()}
+            pub fn persistent_objects(&self)->Objects{
+                if let Some(w)=NEXT_PERSISTENT_WINDOW.with(|nw|nw.borrow_mut().take()){
+                    Objects::with_window(true,w)
+                }else{
+                    Objects::persistent()
+                }
+            }
             pub fn persistent_objects_probe(&self)->Objects{Objects::persistent()}
+            pub fn render_uma_pool(&self)->Arc<super::resources::RenderUmaPool>{
+                RENDER_UMA_POOL.with(|p|{
+                    let mut p = p.borrow_mut();
+                    p.get_or_insert_with(||super::resources::RenderUmaPool::new().unwrap()).clone()
+                })
+            }
+            pub fn pb_record_pool(&self)->Arc<super::resources::PbRecordPool>{
+                PB_RECORD_POOL.with(|p|{
+                    let mut p = p.borrow_mut();
+                    p.get_or_insert_with(||super::resources::PbRecordPool::new().unwrap()).clone()
+                })
+            }
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
@@ -162,7 +234,7 @@ pub mod g16 {
         pub struct Private {
             pub pending: Option<core::ops::Range<u64>>,
         }
-        pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub persistent:bool,pub uat:(),pub window:Arc<crate::sync::Mutex<Window>>,pub private:Option<Private>}
+        pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub client_maps:Vec<u64>,pub persistent:bool,pub uat:(),pub window:Arc<crate::sync::Mutex<Window>>,pub private:Option<Private>}
         // Device-lifetime render and compute command records, per test thread (the production
         // tables are resources::RenderCmds and resources::ComputeCmds): one never-dropped
         // allocator owns them.
@@ -170,6 +242,27 @@ pub mod g16 {
             pub static PERSISTENT:std::cell::RefCell<Option<Objects>>=const{std::cell::RefCell::new(None)};
             pub static PASS_CMDS:std::cell::RefCell<Vec<(u64,crate::g16::slots::PassCmds)>>=const{std::cell::RefCell::new(Vec::new())};
             pub static UNIT_CMDS:std::cell::RefCell<Vec<(u64,crate::g16::slots::UnitCmds)>>=const{std::cell::RefCell::new(Vec::new())};
+            pub static ACTIVE_CLIENT_MAPS:std::cell::RefCell<Vec<u64>>=const{std::cell::RefCell::new(Vec::new())};
+            pub static ON_OBJECTS_DROP:std::cell::RefCell<Option<Box<dyn FnMut(&[u64])>>>=const{std::cell::RefCell::new(None)};
+            pub static FAIL_CLIENT_MAP:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};
+        }
+        impl Drop for Objects{
+            fn drop(&mut self){
+                if !self.client_maps.is_empty(){
+                    ACTIVE_CLIENT_MAPS.with(|m|{
+                        let mut m=m.borrow_mut();
+                        for gva in &self.client_maps{
+                            let pos=m.iter().position(|x|x==gva).expect("client_map must be active at drop");
+                            m.swap_remove(pos);
+                        }
+                    });
+                    ON_OBJECTS_DROP.with(|h|{
+                        if let Some(cb)=h.borrow_mut().as_mut(){
+                            cb(&self.client_maps);
+                        }
+                    });
+                }
+            }
         }
         pub fn test_cmds(k:u64)->crate::g16::slots::PassCmds{
             if let Some(c)=PASS_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
@@ -184,10 +277,25 @@ pub mod g16 {
         impl Objects{
             pub fn new()->Self{Self::with_window(false,Arc::new(crate::sync::Mutex::new(Window::new()),0).unwrap())}
             pub fn persistent()->Self{Self::with_window(true,Arc::new(crate::sync::Mutex::new(Window::new()),0).unwrap())}
-            pub fn with_window(persistent:bool,window:Arc<crate::sync::Mutex<Window>>)->Self{Self{objects:vec![],persistent,uat:(),window,private:Some(Private{pending:None})}}
+            pub fn with_window(persistent:bool,window:Arc<crate::sync::Mutex<Window>>)->Self{Self{objects:vec![],client_maps:vec![],persistent,uat:(),window,private:Some(Private{pending:None})}}
             __FINISH_PRIVATE__
+            pub fn map_client_at(&mut self,object:&Arc<FwObject>,gva:u64)->Result{
+                if FAIL_CLIENT_MAP.with(|f|f.replace(false)){return Err(ENOMEM);}
+                if object.class==Class::FwCoherent||object.offset!=0{return Err(EINVAL);}
+                let bytes=object.mapped;
+                if bytes==0||bytes&0x3fff!=0||gva&0x3fff!=0{return Err(EINVAL);}
+                let end=gva.checked_add(bytes as u64).and_then(|e|e.checked_add(super::hw::PAGE)).ok_or(EOVERFLOW)?;
+                if gva<super::hw::client::DYNAMIC.start||end>super::hw::client::DYNAMIC.end{return Err(EINVAL);}
+                ACTIVE_CLIENT_MAPS.with(|m|{
+                    let mut m=m.borrow_mut();
+                    assert!(!m.contains(&gva),"duplicate live client mapping at {gva:#x}");
+                    m.push(gva);
+                });
+                self.client_maps.push(gva);
+                Ok(())
+            }
             pub fn alloc_dynamic_client(&mut self,size:usize)->Result<Arc<FwObject>>{self.alloc(Request{size,class:Class::Shared,placement:Placement::Anywhere,offset:0,client:Some((0x7040000000,super::hw::pte::LEAF_NC)),lower:None,cpu:true})}
-            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;if let Some(p)=self.private.as_mut(){let end=va+bytes as u64;p.pending=Some(match p.pending.take(){Some(range)=>range.start.min(va)..range.end.max(end),None=>va..end});}self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
+            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{let fail=FAIL_FW_ALLOC.with(|c|{let n=c.get();if n==1{c.set(0);true}else if n>1{c.set(n-1);false}else{false}});if fail{return Err(ENOMEM);}if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0),reads:std::sync::atomic::AtomicUsize::new(0)},0)?;if let Some(p)=self.private.as_mut(){let end=va+bytes as u64;p.pending=Some(match p.pending.take(){Some(range)=>range.start.min(va)..range.end.max(end),None=>va..end});}self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
         }
     }
     pub mod graph {
@@ -264,7 +372,10 @@ pub mod g16 {
         }
     }
     pub mod resources {
-        use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
+        use core::sync::atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering};use crate::*;
+        use crate::sync::{Arc,UniqueArc};
+        use super::object::{Factory,FwObject,Objects};
+        __RENDER_PB_POOLS__
         pub struct PassDirty<'a>{pub tpc:&'a AtomicU64,pub tilemap:&'a AtomicU64,pub tilemap_last:&'a AtomicU64,pub tilemap_clean:&'a AtomicU64,pub heap:&'a AtomicU64}
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>,pub hw_slots:Option<[usize;super::hw::sizes::SCS_COMPUTE_UNITS]>}
         // A job's compute units; here one arena.
@@ -334,7 +445,7 @@ pub mod g16 {
                 driver::AsahiDrmDevice,
                 g16::{budget::Budget, object::Factory, pools::{PbEpoch, Pools}, slots::Slots, vm::{MockVm, VmState}},
                 sync::{Arc, CondVar, Mutex},
-                KVec,
+                EINVAL, KVec, Result,
             };
             use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -355,7 +466,9 @@ pub mod g16 {
                 }
             }
 
+            __MAX_PB_HEAP_SIZES__
             __STANDBY__
+            __STANDBY_IMPL__
             __SPARE_EPOCHS__
             struct RenderExtArena;
             struct PbHeapExtArena;
@@ -370,7 +483,30 @@ pub mod g16 {
                 active_render_passes: AtomicU32,
                 shared: Arc<Shared>,
             }
+            impl Standby {
+                pub(crate) fn push_epoch(&mut self, epoch: Arc<PbEpoch>) {
+                    self.epochs.push(epoch, 0).unwrap();
+                }
+            }
             impl Cache {
+                pub(crate) fn test_new(shared: Arc<Shared>) -> Self {
+                    Self {
+                        standby: Mutex::new(Standby {
+                            epochs: KVec::new(),
+                            reserved: 0,
+                            reserved_sizes: [(0, 0); MAX_PB_HEAP_SIZES],
+                            waiters: 0,
+                        }),
+                        standby_available: CondVar::new(),
+                        closed: AtomicBool::new(false),
+                        active_render_passes: AtomicU32::new(0),
+                        shared,
+                    }
+                }
+                pub(crate) fn standby_mut(&self) -> crate::sync::Guard<'_, Standby> {
+                    self.standby.lock()
+                }
+                __TAKE_STANDBY_FOR__
                 __RELEASE_RESERVED__
                 __RELEASE_RENDER_PASSES__
                 __RENDERS_UNPUBLISHED__
@@ -407,7 +543,12 @@ pub mod g16 {
                 let shared = Arc::new(Shared::default(), 0).unwrap();
                 shared.started.store(true, Ordering::Release);
                 let cache = Arc::new(Cache {
-                    standby: Mutex::new(Standby { epochs: KVec::new(), reserved: credits, waiters: 0 }),
+                    standby: Mutex::new(Standby {
+                        epochs: KVec::new(),
+                        reserved: credits,
+                        reserved_sizes: [(512, credits), (0, 0), (0, 0), (0, 0)],
+                        waiters: 0,
+                    }),
                     standby_available: CondVar::new(),
                     closed: AtomicBool::new(false),
                     active_render_passes: AtomicU32::new(credits),
@@ -438,6 +579,7 @@ pub mod g16 {
                 let prepared = Prepared {
                     active_renders: AtomicU32::new(credits),
                     unpublished_renders: AtomicU32::new(credits),
+                    pb_heap_blocks: 512,
                     cache: Some(cache.clone()),
                     compute: None,
                     compute_ext: None,
@@ -755,13 +897,20 @@ pub mod g16 {
         let cg0 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
         let cg1 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
         let rg = RenderGraph::new(&mut session, &mut rings, ctx).unwrap();
-        let all_rings = [&cg0.ring, &cg1.ring, &rg.ring[0], &rg.ring[1]];
-        assert_eq!(rings.objects.len(), 4);
-        for ring in all_rings {
-            assert_eq!(ring.class, Class::FwCoherent);
-            assert_eq!((ring.gva, ring.client_leaf, ring.lower_gva), (None, None, None));
-            assert!(rings.objects.iter().any(|o| crate::sync::Arc::ptr_eq(o, ring)));
-            assert!(session.objects.iter().all(|o| !crate::sync::Arc::ptr_eq(o, ring)));
+        let all_persistent = [
+            &cg0.ring,
+            &cg1.ring,
+            &rg.ring[0],
+            &rg.ring[1],
+            &rg.fw_stamp[1],
+        ];
+        assert_eq!(rings.objects.len(), 5);
+        assert_eq!(rg.fw_stamp[0].class, Class::Shared);
+        for obj in all_persistent {
+            assert_eq!(obj.class, Class::FwCoherent);
+            assert_eq!((obj.gva, obj.client_leaf, obj.lower_gva), (None, None, None));
+            assert!(rings.objects.iter().any(|o| crate::sync::Arc::ptr_eq(o, obj)));
+            assert!(session.objects.iter().all(|o| !crate::sync::Arc::ptr_eq(o, obj)));
         }
         drop(cb);
         drop(cc);
@@ -812,7 +961,7 @@ pub mod g16 {
             let refs=pools.allocator_refs_for(k).unwrap();
             let descriptor=find_va(refs.uma_mgr[0]);
             let auxiliary=o.objects.iter().find(|obj|obj.va+0x100==refs.uma_aux[0]).unwrap();
-            assert_eq!(descriptor.class,g16::object::Class::Fw);
+            assert_eq!(descriptor.class,g16::object::Class::FwCoherent);
             assert_eq!(descriptor.gva,None);assert_eq!(descriptor.client_leaf,None);
             assert_eq!(descriptor.size,g16::fw::graph::manager::SIZE);
             assert_eq!(auxiliary.class,g16::object::Class::Shared);
@@ -860,13 +1009,14 @@ pub mod g16 {
         s.publish(&mut c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
     }
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
-        let mut o=Objects::new();let mut pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
+        let mut o=Objects::new();let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         let a=pools.prepare(0,1).unwrap();assert!(a.init_buffer);assert_eq!(a.uma_submitted,2);
         assert!(!pools.retired(0).unwrap());pools.publish_batch(0,2,1).unwrap();
         assert!(pools.publish_batch(0,2,1).is_err());assert!(pools.prepare(0,2).is_err());
         let d=find_va(a.uma_mgr[0]);
-        d.w64(0x54,2).unwrap();d.w64(0x60,0x5a5aa5a5).unwrap();
-        let original=d.snapshot();assert!(pools.retired(0).unwrap());
+        d.w64(0x60,0x5a5aa5a5).unwrap();
+        let original=d.snapshot();
+        pools.note_retired(0,2,1).unwrap();assert!(pools.retired(0).unwrap());
         let next=pools.prepare(0,2).unwrap();assert!(next.init_buffer);assert_eq!(next.uma_submitted,4);
         assert_eq!(original,d.snapshot());assert_eq!(pools.prepare(1,3).unwrap().parameter_id,1);
     }
@@ -929,11 +1079,12 @@ pub mod g16 {
         let vm=vm(1);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
         let a=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
         a.prepare(0,0x70c0000000,2048).unwrap();a.check_assignment(0).unwrap();a.expose();
-        a.manager.w64(0xb0,0x123456789abcdef0).unwrap();let saved=a.manager.snapshot();
-        assert_eq!(a.prepare(0,0x70c0000000,2048),Err(EINVAL));assert_eq!(saved,a.manager.snapshot());
+        a.records_lease().cached_records.w64(0xb0,0x123456789abcdef0).unwrap();let saved=a.records_lease().cached_records.snapshot();
+        assert_eq!(a.prepare(0,0x70c0000000,2048),Err(EINVAL));assert_eq!(saved,a.records_lease().cached_records.snapshot());
         let b=g16::pools::PbEpoch::new(&factory,&vm,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();b.prepare(0,0x70c0000000,2048).unwrap();
-        assert!(!std::ptr::eq(&a.manager.data,&b.manager.data));
-        assert_eq!(b.manager.class,g16::object::Class::Fw);assert_eq!(b.manager.gva,None);
+        assert!(!std::ptr::eq(&a.records_lease().cached_records.data,&b.records_lease().cached_records.data));
+        assert_eq!(b.records_lease().cached_records.class,g16::object::Class::FwCoherent);assert_eq!(b.records_lease().cached_records.gva,None);
+        assert_ne!(a.manager_va().unwrap(),b.manager_va().unwrap());
         let mut slots=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
         slots.retire_binding(0,&a).unwrap();assert_eq!(sync::Arc::strong_count(&a),2);
         b.check_assignment(0).unwrap();b.expose();assert_eq!(sync::Arc::strong_count(&a),2);
@@ -1170,11 +1321,15 @@ pub mod g16 {
         assert_eq!(a1.uma_submitted,2);
         pools.publish_batch(0,2,1).unwrap();p.publish_flight(0);
         let d0=find_va(a1.uma_mgr[0]);
-        d0.w64(0x54,2).unwrap();
+        assert_eq!(d0.class,g16::object::Class::FwCoherent);
+        assert!(pools.flight_retired(0,2,1,true).unwrap());
+        pools.note_retired(0,2,1).unwrap();
+        assert!(pools.retired(0).unwrap());
         p.retire_flight(0,&e1,b1,true).unwrap();
         // Same-VM pipelining: 3 concurrent renders share slot 0 with cumulative uma_submitted (4, 6, 8).
         assert!(p.can_pipeline(&vm1));
         assert!(!p.can_pipeline(&vm2));
+        let desc_reads_before=d0.reads.load(std::sync::atomic::Ordering::Relaxed);
         for draw in 2..=4u64 {
             assert_eq!(p.pick_slot(&vm1,draw>2),Some(0));
             let refs=pools.prepare_in_flight(0,draw,draw>2).unwrap();
@@ -1182,16 +1337,20 @@ pub mod g16 {
             pools.publish_batch(0,refs.uma_submitted,1).unwrap();
             p.publish_flight(0);
         }
-        assert!(!pools.retired_at(0,4).unwrap());
-        d0.w64(0x54,4).unwrap();
-        assert!(pools.retired_at(0,4).unwrap());
-        assert!(!pools.retired_at(0,6).unwrap());
+        assert_eq!(d0.reads.load(std::sync::atomic::Ordering::Relaxed),desc_reads_before,"post-publication render never snoops ASC-cached descriptor");
+        assert!(!pools.retired(0).unwrap());
+        assert!(pools.flight_retired(0,4,1,false).unwrap());
+        assert!(!pools.flight_retired(0,4,1,true).unwrap());
+        assert!(!pools.flight_retired(0,6,1,false).unwrap());
+        pools.note_retired(0,4,1).unwrap();
         p.retire_flight(0,&e1,b1,true).unwrap();
-        d0.w64(0x54,6).unwrap();
-        assert!(pools.retired_at(0,6).unwrap());
+        assert!(pools.flight_retired(0,6,1,false).unwrap());
+        pools.note_retired(0,6,1).unwrap();
         p.retire_flight(0,&e1,b1,true).unwrap();
-        d0.w64(0x54,8).unwrap();
+        assert!(pools.flight_retired(0,8,1,true).unwrap());
+        pools.note_retired(0,8,1).unwrap();
         assert!(pools.retired(0).unwrap());
+        assert_eq!(d0.reads.load(std::sync::atomic::Ordering::Relaxed),desc_reads_before);
         p.retire_flight(0,&e1,b1,true).unwrap();
         // Cross-VM switch drains and switches to slot 1 (displacing slot 0 upon clean retirement).
         assert_eq!(p.pick_slot(&vm2,false),Some(1));
@@ -1797,7 +1956,13 @@ pub mod g16 {
         assert_eq!(pools.publish_batch(0,6,3),Ok(()));
         assert_eq!(pools.publish_batch(0,10,3),Err(EINVAL));
         assert_eq!(pools.publish_batch(0,12,3),Ok(()));
-        assert!(!pools.retired_at(0,6).unwrap());
+        assert!(!pools.retired(0).unwrap());
+        assert!(pools.flight_retired(0,6,3,false).unwrap());
+        assert!(!pools.flight_retired(0,6,3,true).unwrap());
+        pools.note_retired(0,6,3).unwrap();
+        assert!(pools.flight_retired(0,12,3,true).unwrap());
+        pools.note_retired(0,12,3).unwrap();
+        assert!(pools.retired(0).unwrap());
     }
 
     #[test]fn per_unit_hold_and_verify_held_match_batch_and_reject_unheld_slots(){
@@ -2331,9 +2496,9 @@ pub mod g16 {
         assert_eq!(cmd_shared(), Class::Shared);
         let mut o = Objects::new();
         let mut rings = Objects::persistent();
-        let ctx = o.alloc(g16::object::Request {
-            size: 0x40,
-            class: Class::Fw,
+        let ctx = rings.alloc(g16::object::Request {
+            size: g16::fw::graph::sched_ctx::SIZE,
+            class: Class::FwCoherent,
             placement: g16::object::Placement::Anywhere,
             offset: 0,
             client: None,
@@ -2356,7 +2521,7 @@ pub mod g16 {
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
         assert_eq!(c.job_list.class, Class::FwCached);
-        assert_eq!(c.sched_ctx.class, Class::Fw);
+        assert_eq!(c.sched_ctx.class, Class::FwCoherent);
         assert_eq!(c.qstate.class, Class::Fw);
         assert_eq!(c.notifier.class, Class::FwCached);
         assert_eq!(c.threshold.class, Class::Fw);
@@ -2370,9 +2535,12 @@ pub mod g16 {
             assert_eq!(r.qstate[stage].class, Class::Fw);
             assert_eq!(r.ring[stage].class, Class::FwCoherent);
             assert_eq!(r.user_stamp[stage].class, Class::Shared);
-            assert_eq!(r.fw_stamp[stage].class, Class::Shared);
+            assert_eq!(
+                r.fw_stamp[stage].class,
+                if stage == 0 { Class::Shared } else { Class::FwCoherent }
+            );
         }
-        assert_eq!(r.sched_ctx.class, Class::Fw);
+        assert_eq!(r.sched_ctx.class, Class::FwCoherent);
         assert_eq!(r.notifier.class, Class::Fw);
         assert_eq!(r.threshold.class, Class::Fw);
         assert_eq!(r.legacy_empty.class, Class::Shared);
@@ -2656,13 +2824,8 @@ pub mod g16 {
             &v,
             g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
         ).unwrap();
-        let (page_obj, block_obj) = g16::object::ALL_OBJECTS.with(|a| {
-            let objs = a.borrow();
-            (
-                objs.iter().find(|o| o.gva.is_some() && o.size == buffer::PAGE_LIST_SIZE).unwrap().clone(),
-                objs.iter().find(|o| o.gva.is_none() && o.size == buffer::BLOCK_LIST_SIZE).unwrap().clone(),
-            )
-        });
+        let page_obj = e.records_lease().pages.clone();
+        let block_obj = e.records_lease().blocks.clone();
         let heap = g16::hw::client::pb_heap(0);
         // First prepare for 512 blocks writes ONLY 512*4*4 = 8192 page bytes and 512*8 = 4096 block bytes.
         e.prepare(0, heap, 512).unwrap();
@@ -3361,6 +3524,579 @@ pub mod g16 {
         assert!(!p.reclaim_closed());
     }
 
+    #[test]fn render_uma_and_pb_record_pools_cache_and_recycle_only_settled_leases(){
+        use g16::object::Class;
+        use g16::pools::{Allocator, PbEpoch, PoolSet, Pools};
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let mut o = Objects::new();
+        let vm1 = vm(301);
+        let vm2 = vm(302);
+
+        // Fresh allocator & PB epoch: descriptor/cached_records(pb_mgr+initbm)/blocks = FwCoherent,
+        // pages = Shared (unique DYNAMIC pages_gpu), submitted/ring/counter/misc = Fw.
+        let pools1 = PoolSet::new_with_slots(&mut o, &factory, [0, 1]).unwrap();
+        let u1 = pools1.unit(0).unwrap();
+        let uma1 = u1.uma_lease();
+        assert_eq!(uma1.descriptor.class, Class::FwCoherent);
+        assert_eq!(uma1.submitted.class, Class::Fw);
+        let e1 = PbEpoch::new_for(
+            &factory,
+            &vm1,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        let pb1 = e1.records_lease();
+        assert_eq!(pb1.cached_records.class, Class::FwCoherent);
+        assert_eq!(e1.initbm.class, Class::FwCoherent);
+        assert_eq!(pb1.blocks.class, Class::FwCoherent);
+        assert_eq!(pb1.pages.class, Class::Shared);
+        assert!(pb1.pages_gpu >= g16::hw::client::DYNAMIC.start);
+        assert!(pb1.pages_gpu + g16::fw::buffer::PAGE_LIST_SIZE as u64 + g16::hw::PAGE <= g16::hw::client::DYNAMIC.end);
+        assert_eq!(e1.misc.class, Class::Fw);
+        assert_eq!(pb1.ring.class, Class::Fw);
+        assert_eq!(pb1.counter.class, Class::Fw);
+
+        // Publish and cleanly retire a render on slot 0 -> both leases settle.
+        e1.prepare(0, g16::hw::client::pb_heap(0), 512).unwrap();
+        assert_eq!(e1.manager_va().unwrap(), pb1.cached_records.va);
+        assert_eq!(pb1.counter.r64(0).unwrap(), 1, "freshly prepared PB counter stays 1");
+        e1.expose();
+        e1.publish_flight();
+        assert_eq!(pb1.counter.r64(0).unwrap(), 1, "publish preserves PB counter 1 without per-flight unload");
+        let b1 = p.bind(0, false);
+        p.hold_alloc(0, &vm1, None, Some(uma1.clone())).unwrap();
+        u1.publish_batch(2, 1).unwrap();
+        p.publish_flight(0);
+        assert!(!uma1.settled(), "in-flight UMA lease must not settle");
+        assert!(!pb1.settled(), "in-flight PB lease must not settle");
+        u1.note_retired(2, 1).unwrap();
+        e1.retire_flight();
+        p.retire_flight(0, &e1, b1, true).unwrap();
+        assert!(uma1.settled());
+        assert!(pb1.settled());
+
+        // Publish an aborted render on slot 1 -> quarantined UMA and PB leases never settle.
+        let u_bad = pools1.unit(1).unwrap();
+        let uma_bad = u_bad.uma_lease();
+        let e_bad = PbEpoch::new_for(
+            &factory,
+            &vm1,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        let pb_bad = e_bad.records_lease();
+        e_bad.prepare(1, g16::hw::client::pb_heap(0), 512).unwrap();
+        e_bad.expose();
+        e_bad.publish_flight();
+        let _b_bad = p.bind(1, false);
+        p.hold_alloc(1, &vm1, None, Some(uma_bad.clone())).unwrap();
+        u_bad.publish_batch(2, 1).unwrap();
+        p.publish_flight(1);
+        p.quarantine_flight(1, Some(e_bad.clone()));
+        assert!(!uma_bad.settled(), "quarantined UMA lease must never recycle");
+        assert!(!pb_bad.settled(), "quarantined PB lease must never recycle");
+
+        // Record VAs before displacing slot 0 with VM2 and dropping VM1's handles.
+        let uma1_va = uma1.descriptor.va;
+        let pb1_va = pb1.cached_records.va;
+        let uma_bad_va = uma_bad.descriptor.va;
+        let pb_bad_va = pb_bad.cached_records.va;
+
+        // Displace slot 0 with VM2 so retained_uma[0], retained_pb[0], owners[0] release VM1.
+        let pools2 = PoolSet::new_with_slots(&mut o, &factory, [0, 2]).unwrap();
+        let u2 = pools2.unit(0).unwrap();
+        let e2 = PbEpoch::new_for(
+            &factory,
+            &vm2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        e2.prepare(0, g16::hw::client::pb_heap(0), 512).unwrap();
+        e2.expose();
+        e2.publish_flight();
+        let b2 = p.bind(0, false);
+        p.hold_alloc(0, &vm2, None, Some(u2.uma_lease())).unwrap();
+        u2.publish_batch(2, 1).unwrap();
+        p.publish_flight(0);
+        u2.note_retired(2, 1).unwrap();
+        e2.retire_flight();
+        p.retire_flight(0, &e2, b2, true).unwrap();
+
+        // Drop VM1's handles and clear vm_last via closed-VM reclaim.
+        let heap = pools2.heap().clone();
+        drop(uma1);
+        drop(pb1);
+        drop(uma_bad);
+        drop(pb_bad);
+        drop(e1);
+        drop(e_bad);
+        drop(pools1);
+        vm1.vm.close();
+        p.reclaim_closed();
+
+        // Next allocations recycle the cleanly settled slot-0 record sets with zeroed uncached state,
+        // and never recycle the quarantined slot-1 record sets.
+        let u_recycled = Allocator::new_at(&mut o, &factory, 0, 0, &heap, g16::slots::Placement::Base).unwrap();
+        let e_recycled = PbEpoch::new_for(
+            &factory,
+            &vm2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        assert_eq!(u_recycled.uma_lease().descriptor.va, uma1_va, "settled RenderUmaLease recycled");
+        assert_eq!(u_recycled.uma_lease().submitted.r32(0).unwrap(), 0, "recycled submitted zeroed");
+        assert_eq!(e_recycled.records_lease().cached_records.va, pb1_va, "settled PbRecordLease recycled");
+        assert_eq!(e_recycled.records_lease().ring.r32(0).unwrap(), 0, "recycled ring zeroed");
+        assert_eq!(e_recycled.records_lease().counter.r32(0).unwrap(), 0, "recycled counter zeroed");
+        assert_ne!(u_recycled.uma_lease().descriptor.va, uma_bad_va);
+        assert_ne!(e_recycled.records_lease().cached_records.va, pb_bad_va);
+        // Drop Pools (which still holds quarantined slot 1): quarantined records STILL never recycle.
+        drop(p);
+        let u_fresh = Allocator::new_at(&mut o, &factory, 1, 2, &heap, g16::slots::Placement::Base).unwrap();
+        let e_fresh = PbEpoch::new_for(
+            &factory,
+            &vm2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        assert_ne!(u_fresh.uma_lease().descriptor.va, uma_bad_va);
+        assert_ne!(e_fresh.records_lease().cached_records.va, pb_bad_va);
+    }
+
+    #[test]fn pb_epoch_immutable_cached_pb_mgr_recycles_without_host_overwrite_and_isolates_slots(){
+        use g16::object::Class;
+        use g16::pools::PbEpoch;
+        use std::sync::atomic::Ordering;
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let v1 = vm(310);
+        let v2 = vm(311);
+        let heap = g16::hw::client::pb_heap(0);
+
+        let e1 = PbEpoch::new_for(
+            &factory,
+            &v1,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        let lease = e1.records_lease();
+        let cached_va = lease.cached_records.va;
+        let pages_gpu = lease.pages_gpu;
+        assert_eq!(lease.cached_records.class, Class::FwCoherent);
+        assert_eq!(lease.initbm.class, Class::FwCoherent);
+        assert_eq!(lease.blocks.class, Class::FwCoherent);
+        assert_eq!(lease.pages.class, Class::Shared);
+        assert_eq!(lease.misc.class, Class::Fw);
+
+        e1.prepare(0, heap, 512).unwrap();
+        assert_eq!(e1.manager_va().unwrap(), cached_va);
+        assert_eq!(lease.counter.r64(0).unwrap(), 1);
+        assert!(lease.settled());
+
+        // Expose on slot 0 and run multiple flights; counter stays 1 and firmware mutates slot 0.
+        e1.expose();
+        assert_eq!(e1.bound_blocks(), 512);
+        assert!(lease.slot_is_exposed(0));
+        assert!(!lease.slot_is_exposed(3));
+        // Simulate firmware updating completed_passes/cur_passes in ASC-cached managers[0].
+        {
+            let mut d = lease.cached_records.data.lock().unwrap();
+            d[0..4].copy_from_slice(&7u32.to_le_bytes());
+            d[0x14..0x18].copy_from_slice(&7u32.to_le_bytes());
+        }
+        let slot0_bytes = lease.cached_records.snapshot()[0..g16::resources::PB_MANAGER_STRIDE].to_vec();
+        let blocks_bytes = lease.blocks.snapshot();
+        let cached_writes_after_e1 = lease.cached_records.write_bytes.load(Ordering::Relaxed);
+        let blocks_writes_after_e1 = lease.blocks.write_bytes.load(Ordering::Relaxed);
+
+        e1.publish_flight();
+        e1.publish_flight();
+        assert_eq!(lease.counter.r64(0).unwrap(), 1);
+        assert!(!lease.settled());
+        e1.retire_flight();
+        e1.retire_flight();
+        assert!(lease.settled());
+        drop(lease);
+        drop(e1);
+
+        // A different heap_blocks target (1024) must NOT recycle the 512-bound entry.
+        let e_other = PbEpoch::new_for(
+            &factory,
+            &v2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(1024),
+        ).unwrap();
+        assert_ne!(e_other.records_lease().cached_records.va, cached_va);
+        assert_ne!(e_other.records_lease().pages_gpu, pages_gpu);
+        drop(e_other);
+
+        // Matching heap_blocks (512) recycles the entry onto VM2 without touching managers[0] or blocks.
+        let e2 = PbEpoch::new_for(
+            &factory,
+            &v2,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        let lease2 = e2.records_lease();
+        assert_eq!(lease2.cached_records.va, cached_va);
+        assert_eq!(lease2.pages_gpu, pages_gpu);
+        assert_eq!(lease2.counter.r64(0).unwrap(), 0, "uncached counter zeroed on recycle");
+        assert_eq!(lease2.cached_records.write_bytes.load(Ordering::Relaxed), cached_writes_after_e1, "recycle wrote 0 bytes to cached_records");
+        assert_eq!(lease2.blocks.write_bytes.load(Ordering::Relaxed), blocks_writes_after_e1, "recycle wrote 0 bytes to blocks");
+
+        // Mismatched heap_blocks / heap_gva / layout must be rejected cleanly.
+        assert_eq!(e2.prepare(0, heap, 1024), Err(EINVAL));
+        assert_eq!(e2.prepare(0, heap + 0x10000000, 512), Err(EINVAL));
+        assert_eq!(e2.prepare_with_scs_for(&g16::fw::buffer::pb_manager::V26B123_G15S, 0, heap, 512, false), Err(EINVAL));
+
+        // Preparing already-exposed slot 0 writes 0 bytes to cached_records and 0 bytes to blocks.
+        e2.prepare(0, heap, 512).unwrap();
+        assert_eq!(e2.manager_va().unwrap(), cached_va);
+        assert_eq!(lease2.cached_records.write_bytes.load(Ordering::Relaxed), cached_writes_after_e1);
+        assert_eq!(lease2.blocks.write_bytes.load(Ordering::Relaxed), blocks_writes_after_e1);
+        assert_eq!(&lease2.cached_records.snapshot()[0..g16::resources::PB_MANAGER_STRIDE], slot0_bytes.as_slice());
+        assert_eq!(lease2.blocks.snapshot(), blocks_bytes);
+
+        // Retrying unexposed e2 on never-exposed slot 3 initializes ONLY managers[3] without touching managers[0].
+        e2.prepare(3, heap, 512).unwrap();
+        assert_eq!(e2.manager_va().unwrap(), cached_va + (3 * g16::resources::PB_MANAGER_STRIDE) as u64);
+        assert_eq!(&lease2.cached_records.snapshot()[0..g16::resources::PB_MANAGER_STRIDE], slot0_bytes.as_slice());
+        assert_eq!(lease2.blocks.write_bytes.load(Ordering::Relaxed), blocks_writes_after_e1);
+        let slot3_off = 3 * g16::resources::PB_MANAGER_STRIDE;
+        let slot3_id = u32::from_le_bytes(lease2.cached_records.snapshot()[slot3_off + 0xc..slot3_off + 0x10].try_into().unwrap());
+        assert_eq!(slot3_id, 3, "managers[3] encoded with parameter_id 3");
+        e2.expose();
+        assert!(lease2.slot_is_exposed(0) && lease2.slot_is_exposed(3));
+        let writes_after_slot3 = lease2.cached_records.write_bytes.load(Ordering::Relaxed);
+        drop(lease2);
+        drop(e2);
+
+        // Next recycle onto slot 3 writes 0 bytes to cached_records as well.
+        let e3 = PbEpoch::new_for(
+            &factory,
+            &v1,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        assert_eq!(e3.records_lease().cached_records.va, cached_va);
+        e3.prepare(3, heap, 512).unwrap();
+        assert_eq!(e3.records_lease().cached_records.write_bytes.load(Ordering::Relaxed), writes_after_slot3);
+    }
+
+    #[test]fn pb_epoch_drop_unmaps_client_pages_before_releasing_record_lease(){
+        use g16::object::{ACTIVE_CLIENT_MAPS, FAIL_CLIENT_MAP, ON_OBJECTS_DROP};
+        use g16::pools::PbEpoch;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let v = vm(320);
+
+        let e1 = PbEpoch::new_for(
+            &factory,
+            &v,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        e1.prepare(0, g16::hw::client::pb_heap(0), 512).unwrap();
+        e1.expose();
+        let gva1 = e1.records_lease().pages_gpu;
+        let cached1 = e1.records_lease().cached_records.va;
+        assert!(ACTIVE_CLIENT_MAPS.with(|m| m.borrow().contains(&gva1)));
+
+        // While PbEpochInner::_objects is dropping, gva1 must ALREADY be unmapped from the VM
+        // and records_lease must NOT yet have marked the entry idle in PbRecordPool.
+        let hook_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let hook_flag = hook_ran.clone();
+        ON_OBJECTS_DROP.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |unmapped: &[u64]| {
+                if unmapped.contains(&gva1) {
+                    assert!(!ACTIVE_CLIENT_MAPS.with(|m| m.borrow().contains(&gva1)));
+                    let (probe, reused) = g16::object::Factory.pb_record_pool().take_for(&g16::object::Factory, Some(512)).unwrap();
+                    assert!(!reused, "entry must remain in_use while _objects is unmapping client pages");
+                    assert_ne!(probe.pages_gpu, gva1);
+                    drop(probe);
+                    hook_flag.store(true, Ordering::Release);
+                }
+            }));
+        });
+        drop(e1);
+        ON_OBJECTS_DROP.with(|h| *h.borrow_mut() = None);
+        assert!(hook_ran.load(Ordering::Acquire), "Objects::drop hook must fire on PbEpoch drop");
+
+        // A map_client_at failure during recycle must release in_use without touching bound cached_records.
+        FAIL_CLIENT_MAP.with(|f| f.set(true));
+        assert_eq!(
+            PbEpoch::new_for(
+                &factory,
+                &v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+                Some(512),
+            ).err(),
+            Some(ENOMEM),
+        );
+
+        // Immediately creating a new epoch on the SAME VM recycles gva1 cleanly with no mapping collision.
+        let e2 = PbEpoch::new_for(
+            &factory,
+            &v,
+            g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            Some(512),
+        ).unwrap();
+        assert_eq!(e2.records_lease().cached_records.va, cached1);
+        assert_eq!(e2.records_lease().pages_gpu, gva1);
+        assert!(ACTIVE_CLIENT_MAPS.with(|m| m.borrow().contains(&gva1)));
+    }
+
+    #[test]fn pb_record_pool_dynamic_exhaustion_returns_enomem_without_wrapping(){
+        use g16::object::ALL_OBJECTS;
+        use g16::resources::PbRecordPool;
+
+        let factory = g16::object::Factory;
+        let pb_pool = PbRecordPool::new().unwrap();
+        let stride = g16::fw::buffer::PAGE_LIST_SIZE as u64 + g16::hw::PAGE;
+        let max_slots = (g16::hw::client::DYNAMIC.end - g16::hw::client::DYNAMIC.start) / stride;
+        pb_pool.inner.lock().next_pages_slot = max_slots - 1;
+
+        let (last, used) = pb_pool.take(&factory).unwrap();
+        assert!(!used);
+        assert_eq!(last.pages_gpu, g16::hw::client::DYNAMIC.start + (max_slots - 1) * stride);
+        assert!(last.pages_gpu + stride <= g16::hw::client::DYNAMIC.end);
+
+        let before = ALL_OBJECTS.with(|a| a.borrow().len());
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before, "DYNAMIC overflow must map nothing");
+        assert_eq!(pb_pool.inner.lock().next_pages_slot, max_slots);
+    }
+
+    #[test]fn standby_growth_preserves_older_reservations_and_evicts_only_unreserved_stale(){
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let v = vm(330);
+        let make_bound = |blocks: u32| {
+            let e = g16::pools::PbEpoch::new_for(
+                &factory,
+                &v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+                Some(blocks),
+            ).unwrap();
+            e.prepare(0, g16::hw::client::pb_heap(0), blocks).unwrap();
+            e.expose();
+            drop(e);
+            g16::pools::PbEpoch::new_for(
+                &factory,
+                &v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+                Some(blocks),
+            ).unwrap()
+        };
+        let e512_a = make_bound(512);
+        let e512_b = make_bound(512);
+        let e1024 = make_bound(1024);
+        assert_eq!(e512_a.bound_blocks(), 512);
+        assert_eq!(e512_b.bound_blocks(), 512);
+        assert_eq!(e1024.bound_blocks(), 1024);
+
+        let shared = sync::Arc::new(g16::resources::reservations::Shared::default(), 0).unwrap();
+        let cache = sync::Arc::new(g16::resources::reservations::Cache::test_new(shared), 0).unwrap();
+        {
+            let mut s = cache.standby_mut();
+            s.push_epoch(e512_a);
+            s.push_epoch(e512_b);
+            s.add_reserved(512, 1);
+            // 1 reserved 512 + 1 unreserved 512 spare -> growing to 1024 evicts ONLY the spare.
+            assert_eq!(s.compat_deficit(1024, 1), 1);
+            let stale = s.pop_evictable(Some(1024)).expect("unreserved 512 spare evicted");
+            assert_eq!(stale.bound_blocks(), 512);
+            assert!(s.pop_evictable(Some(1024)).is_none(), "reserved 512 epoch must not be evicted");
+            s.push_epoch(e1024);
+            assert_eq!(s.compat_deficit(1024, 1), 0);
+            s.add_reserved(1024, 1);
+        }
+        // Both concurrent reservations (512 and 1024) take matching epochs cleanly.
+        let taken_1024 = cache.take_standby_for(1024).unwrap();
+        assert_eq!(taken_1024.bound_blocks(), 1024);
+        let taken_512 = cache.take_standby_for(512).unwrap();
+        assert_eq!(taken_512.bound_blocks(), 512);
+    }
+
+    #[test]fn render_uma_and_pb_pools_never_strand_mappings_on_alloc_or_sync_failure(){
+        use g16::object::{ALL_OBJECTS, FAIL_FW_ALLOC, NEXT_PERSISTENT_WINDOW, Window};
+        use g16::resources::{PbRecordPool, RenderUmaPool};
+        use std::sync::atomic::Ordering;
+
+        let factory = g16::object::Factory;
+
+        // 1) RenderUmaPool: OOM before mapping creates 0 objects; mid-set alloc OOM and
+        // finish_private() failure retain the pending set so retry reuses it without stranding.
+        let uma_pool = RenderUmaPool::new().unwrap();
+        let before = ALL_OBJECTS.with(|a| a.borrow().len());
+        crate::FAIL_KVEC_RESERVE.with(|f| f.set(true));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before, "reserve OOM maps nothing");
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(1));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before, "entry slot OOM maps nothing");
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(2));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before, "lease slot OOM maps nothing");
+
+        // Fail second FwObject allocation (descriptor) after submitted mapped -> retry maps only 1 more.
+        let win_u = sync::Arc::new(sync::Mutex::new(Window::new()), GFP_KERNEL).unwrap();
+        win_u.lock().fail_once.store(true, Ordering::Release);
+        NEXT_PERSISTENT_WINDOW.with(|nw| *nw.borrow_mut() = Some(win_u.clone()));
+        FAIL_FW_ALLOC.with(|c| c.set(2));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before, 1);
+        // Next take maps descriptor (total 2), then fails finish_private() once.
+        assert_eq!(uma_pool.take(&factory).err(), Some(EIO));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before, 2);
+        assert_eq!(win_u.lock().calls.load(Ordering::Relaxed), 1);
+        // Even an OOM while pending is populated cannot strand the mapped set.
+        crate::FAIL_KVEC_RESERVE.with(|f| f.set(true));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        // Retry succeeds with 0 additional FwObjects mapped and retries sync_range on same range.
+        let (u_lease, u_used) = uma_pool.take(&factory).unwrap();
+        assert!(!u_used);
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before, 2);
+        assert_eq!(win_u.lock().calls.load(Ordering::Relaxed), 2);
+        let u_va = u_lease.descriptor.va;
+        drop(u_lease);
+        let (u_recycled, u_used2) = uma_pool.take(&factory).unwrap();
+        assert!(u_used2);
+        assert_eq!(u_recycled.descriptor.va, u_va);
+
+        // 2) PbRecordPool: same guarantees for reserve/UniqueArc OOM, partial alloc, sync_range,
+        // and preserving next_pages_slot across retries.
+        let pb_pool = PbRecordPool::new().unwrap();
+        let before_pb = ALL_OBJECTS.with(|a| a.borrow().len());
+        crate::FAIL_KVEC_RESERVE.with(|f| f.set(true));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before_pb);
+        assert_eq!(pb_pool.inner.lock().next_pages_slot, 0);
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(1));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before_pb);
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(2));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()), before_pb);
+
+        let win_p = sync::Arc::new(sync::Mutex::new(Window::new()), GFP_KERNEL).unwrap();
+        win_p.lock().fail_once.store(true, Ordering::Release);
+        NEXT_PERSISTENT_WINDOW.with(|nw| *nw.borrow_mut() = Some(win_p.clone()));
+        FAIL_FW_ALLOC.with(|c| c.set(4));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before_pb, 3);
+        assert_eq!(pb_pool.inner.lock().next_pages_slot, 0, "failed mid-set alloc must not burn DYNAMIC slot");
+        assert_eq!(pb_pool.take(&factory).err(), Some(EIO));
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before_pb, 4);
+        assert_eq!(win_p.lock().calls.load(Ordering::Relaxed), 1);
+        assert_eq!(pb_pool.inner.lock().next_pages_slot, 0, "failed finish_private must not burn DYNAMIC slot");
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(1));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        let (p_lease, p_used) = pb_pool.take(&factory).unwrap();
+        assert!(!p_used);
+        assert_eq!(ALL_OBJECTS.with(|a| a.borrow().len()) - before_pb, 4);
+        assert_eq!(win_p.lock().calls.load(Ordering::Relaxed), 2);
+        assert_eq!(pb_pool.inner.lock().next_pages_slot, 1);
+        assert_eq!(p_lease.pages_gpu, g16::hw::client::DYNAMIC.start);
+        let p_va = p_lease.cached_records.va;
+        drop(p_lease);
+        let (p_recycled, p_used2) = pb_pool.take(&factory).unwrap();
+        assert!(p_used2);
+        assert_eq!(p_recycled.cached_records.va, p_va);
+    }
+
+    #[test]fn render_uma_and_pb_pools_idle_lease_oom_never_double_releases(){
+        use g16::resources::{PbRecordPool, RenderUmaPool};
+
+        let factory = g16::object::Factory;
+
+        // 1) RenderUmaPool: OOM while taking an idle entry must never release the entry twice
+        // or clobber a concurrent caller's claim on the same firmware record set.
+        let uma_pool = RenderUmaPool::new().unwrap();
+        let (u0, used0) = uma_pool.take(&factory).unwrap();
+        assert!(!used0);
+        let u0_va = u0.descriptor.va;
+        drop(u0);
+
+        let concurrent_u: std::sync::Arc<std::sync::Mutex<Option<sync::Arc<g16::resources::RenderUmaLease>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let pool_hook = uma_pool.clone();
+            let slot_hook = concurrent_u.clone();
+            crate::ON_ARC_NEW_OOM.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let (lease, reused) = pool_hook.take(&g16::object::Factory).unwrap();
+                    assert!(reused);
+                    *slot_hook.lock().unwrap() = Some(lease);
+                }));
+            });
+        }
+        crate::FAIL_ARC_NEW.with(|f| f.set(true));
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(1));
+        assert_eq!(uma_pool.take(&factory).err(), Some(ENOMEM));
+        crate::FAIL_ARC_NEW.with(|f| f.set(false));
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(0));
+        crate::ON_ARC_NEW_OOM.with(|h| *h.borrow_mut() = None);
+
+        // If the OOM dropped a live Lease and the hook claimed u0, a second take must NEVER
+        // receive u0_va again; if OOM failed before claiming, the next take gets u0_va once
+        // and a concurrent second take gets a distinct VA.
+        let live_u = concurrent_u.lock().unwrap().take().unwrap_or_else(|| {
+            let (lease, reused) = uma_pool.take(&factory).unwrap();
+            assert!(reused);
+            lease
+        });
+        assert_eq!(live_u.descriptor.va, u0_va);
+        let (other_u, other_used) = uma_pool.take(&factory).unwrap();
+        assert!(!other_used);
+        assert_ne!(other_u.descriptor.va, live_u.descriptor.va, "idle OOM must never allow two live owners of the same RenderUmaRecordSet");
+        drop(other_u);
+        drop(live_u);
+
+        // 2) PbRecordPool: same double-release race test on idle entry reuse OOM.
+        let pb_pool = PbRecordPool::new().unwrap();
+        let (p0, pused0) = pb_pool.take(&factory).unwrap();
+        assert!(!pused0);
+        let p0_va = p0.cached_records.va;
+        drop(p0);
+
+        let concurrent_p: std::sync::Arc<std::sync::Mutex<Option<sync::Arc<g16::resources::PbRecordLease>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let pool_hook = pb_pool.clone();
+            let slot_hook = concurrent_p.clone();
+            crate::ON_ARC_NEW_OOM.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let (lease, reused) = pool_hook.take(&g16::object::Factory).unwrap();
+                    assert!(reused);
+                    *slot_hook.lock().unwrap() = Some(lease);
+                }));
+            });
+        }
+        crate::FAIL_ARC_NEW.with(|f| f.set(true));
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(1));
+        assert_eq!(pb_pool.take(&factory).err(), Some(ENOMEM));
+        crate::FAIL_ARC_NEW.with(|f| f.set(false));
+        crate::FAIL_UNIQUE_ARC_UNINIT.with(|c| c.set(0));
+        crate::ON_ARC_NEW_OOM.with(|h| *h.borrow_mut() = None);
+
+        let live_p = concurrent_p.lock().unwrap().take().unwrap_or_else(|| {
+            let (lease, reused) = pb_pool.take(&factory).unwrap();
+            assert!(reused);
+            lease
+        });
+        assert_eq!(live_p.cached_records.va, p0_va);
+        let (other_p, other_pused) = pb_pool.take(&factory).unwrap();
+        assert!(!other_pused);
+        assert_ne!(other_p.cached_records.va, live_p.cached_records.va, "idle OOM must never allow two live owners of the same PbRecordSet");
+    }
+
     mod compute_cmds_retry {
         use crate::*;
         use crate::sync::{Arc, Mutex};
@@ -3487,6 +4223,8 @@ for placeholder, source_text, declaration in (
     ('__WAKE_PUBLISH__', mod_source, 'pub(crate) fn wake_publish('),
     ('__WAKE_CLOSED_VM_RECLAIM__', mod_source, 'pub(crate) fn wake_closed_vm_reclaim('),
     ('__STANDBY__', resources_source, 'struct Standby {'),
+    ('__STANDBY_IMPL__', resources_source, 'impl Standby {'),
+    ('__TAKE_STANDBY_FOR__', resources_source, 'fn take_standby_for('),
     ('__RELEASE_RESERVED__', resources_source, 'fn release_reserved('),
     ('__RELEASE_RENDER_PASSES__', resources_source, 'fn release_render_passes('),
     ('__RENDERS_UNPUBLISHED__', resources_source, 'pub(crate) fn renders_unpublished('),
@@ -3497,8 +4235,16 @@ for placeholder, source_text, declaration in (
     ('__RECLAIM_CLOSED_VM_SLOTS__', poll_source, 'pub(crate) fn reclaim_closed_vm_slots('),
 ):
     method = item(source_text, declaration)
+    if placeholder == '__STANDBY__':
+        method = method.replace('struct Standby {', 'pub(crate) struct Standby {', 1)
+    elif placeholder == '__STANDBY_IMPL__':
+        method = method.replace('    fn ', '    pub(crate) fn ')
+    elif placeholder == '__TAKE_STANDBY_FOR__':
+        method = method.replace('fn take_standby_for(', 'pub(crate) fn take_standby_for(', 1)
     # The host Arc wrapper uses Deref without the kernel's arbitrary self types.
     source = source.replace(placeholder, method.replace('self: &Arc<Self>', '&self'))
+source = source.replace('__MAX_PB_HEAP_SIZES__', next(
+    line for line in resources_source.splitlines() if line.startswith('const MAX_PB_HEAP_SIZES:')))
 source = source.replace('__SPARE_EPOCHS__', next(
     line for line in resources_source.splitlines() if line.startswith('const SPARE_EPOCHS:')))
 object_source = (production/'object.rs').read_text()
@@ -3523,14 +4269,91 @@ assert 's.seq.write(0, q)?;' in prefix_compute_fn, 'prefix_compute must write en
 assert '&w[work::compute::BODY_ACTIVE_START..work::compute::SEQ_EMBEDDED]' in prefix_compute_fn, 'clean compute reuse must skip embedded sequence copy into WC work'
 graphs_finish_fn = item(graph_source, 'pub(crate) fn finish(')
 assert 'core::mem::ManuallyDrop::new(factory.persistent_objects_probe())' in graphs_finish_fn, 'Graphs::finish must keep probe-time FwCoherent ring allocator in ManuallyDrop'
+assert 'Class::FwCoherent' in graphs_finish_fn and 'sched_ctx::SIZE' in graphs_finish_fn, 'Graphs::finish must allocate shared sched_ctx as FwCoherent'
 assert 'ring_objects.finish_private()?;' in graphs_finish_fn, 'Graphs::finish must publish persistent ring mappings'
+register_ctx_fn = item(engine_source, 'pub(crate) fn register_context(')
+assert register_ctx_fn.count('sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;') == 2, 'register_context must sync FwCoherent sched_ctx before pre-post check and in poll loop'
 alloc_private_in_fn = item(object_source, 'fn alloc_private_in(')
 assert 'pub(crate) fn persistent_objects_probe(&self) -> Objects' in object_source, 'Factory must expose persistent_objects_probe for probe-time work rings'
 assert 'if self.probe {' in alloc_private_in_fn and 'self.dev.registration_guard().ok_or(ENODEV)?' in alloc_private_in_fn, 'alloc_private_in must gate as_bound() on self.probe and keep registration_guard() otherwise'
 assert alloc_private_in_fn.index('UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must pre-allocate UniqueArc before mapping firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_lower_vm().map_in_range(') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must map uncached aliases before firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range(') < alloc_private_in_fn.index('self.mappings.push_within_capacity(firmware)'), 'alloc_private_in must commit mappings infallibly after firmware map'
+map_client_at_fn = item(object_source, 'pub(crate) fn map_client_at(')
+assert 'object.cached_cpu' in map_client_at_fn and 'hw::client::DYNAMIC' in map_client_at_fn, 'map_client_at must reject cached CPU objects and bound gva inside DYNAMIC'
+assert map_client_at_fn.index('self.mappings.reserve(1, GFP_KERNEL)?;') < map_client_at_fn.index('vm.map_at('), 'map_client_at must reserve mapping storage before mapping'
+pools_source = (production/'pools.rs').read_text()
+pb_epoch_inner = item(pools_source, 'pub(crate) struct PbEpochInner {')
+assert pb_epoch_inner.index('_objects: Objects,') < pb_epoch_inner.index('records_lease: Arc<PbRecordLease>,'), 'PbEpochInner must drop _objects (unmap pages_gpu) before records_lease (release entry.in_use)'
+assert pb_epoch_inner.index('records_lease: Arc<PbRecordLease>,') < pb_epoch_inner.index('_vm: Arc<'), 'PbEpochInner must drop records_lease before _vm'
+pb_record_consts = '\n'.join(
+    line for line in resources_source.splitlines()
+    if line.startswith(('pub(crate) const PB_MANAGER_STRIDE:', 'const PB_INITBM_OFF:', 'const PB_CACHED_SIZE:', 'const PB_PAGES_GPU_STRIDE:'))
+)
+pb_pool_inner_struct = item(resources_source, 'struct PbRecordPoolInner {').replace('struct PbRecordPoolInner {', 'pub(crate) struct PbRecordPoolInner {', 1).replace('next_pages_slot:', 'pub(crate) next_pages_slot:', 1)
+render_pb_pools = (
+    item(resources_source, 'pub(crate) struct RenderUmaRecordSet {')
+    + '\n'
+    + item(resources_source, 'struct RenderUmaEntry {')
+    + '\n'
+    + item(resources_source, 'struct PendingRenderUma {')
+    + '\n'
+    + item(resources_source, 'struct RenderUmaPoolInner {')
+    + '\n'
+    + 'pub(crate) struct RenderUmaPool { inner: crate::sync::Mutex<RenderUmaPoolInner> }\n'
+    + 'impl RenderUmaPool {\n'
+    + '    pub(crate) fn new() -> Result<crate::sync::Arc<Self>> {\n'
+    + '        crate::sync::Arc::new(Self { inner: crate::sync::Mutex::new(RenderUmaPoolInner { entries: KVec::new(), pending: None }) }, 0)\n'
+    + '    }\n'
+    + item(resources_source, 'pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<RenderUmaLease>, bool)> {')
+    + '\n}\n'
+    + item(resources_source, 'pub(crate) struct RenderUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl RenderUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl core::ops::Deref for RenderUmaLease {')
+    + '\n'
+    + item(resources_source, 'impl Drop for RenderUmaLease {')
+    + '\n'
+    + pb_record_consts
+    + '\n'
+    + item(resources_source, 'pub(crate) struct PbRecordSet {')
+    + '\n'
+    + item(resources_source, 'impl PbRecordSet {')
+    + '\n'
+    + item(resources_source, 'struct PbRecordEntry {')
+    + '\n'
+    + item(resources_source, 'struct PendingPbRecord {')
+    + '\n'
+    + pb_pool_inner_struct
+    + '\n'
+    + 'pub(crate) struct PbRecordPool { pub(crate) inner: crate::sync::Mutex<PbRecordPoolInner> }\n'
+    + 'impl PbRecordPool {\n'
+    + '    pub(crate) fn new() -> Result<crate::sync::Arc<Self>> {\n'
+    + '        crate::sync::Arc::new(Self { inner: crate::sync::Mutex::new(PbRecordPoolInner { entries: KVec::new(), pending: None, next_pages_slot: 0 }) }, 0)\n'
+    + '    }\n'
+    + item(resources_source, 'pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<PbRecordLease>, bool)> {')
+    + '\n'
+    + item(resources_source, 'pub(crate) fn take_for(')
+    + '\n}\n'
+    + item(resources_source, 'pub(crate) struct PbRecordLease {')
+    + '\n'
+    + item(resources_source, 'impl PbRecordLease {')
+    + '\n'
+    + item(resources_source, 'impl core::ops::Deref for PbRecordLease {')
+    + '\n'
+    + item(resources_source, 'impl Drop for PbRecordLease {')
+)
+assert 'pb.publish_flight();' in engine_source, 'render publication must track PB lease flight lifetime'
+uma_take_fn = item(resources_source, 'pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<RenderUmaLease>, bool)> {')
+pb_take_fn = item(resources_source, 'pub(crate) fn take_for(')
+for name, fn_src in (('RenderUmaPool::take', uma_take_fn), ('PbRecordPool::take_for', pb_take_fn)):
+    assert fn_src.index('UniqueArc::<') < fn_src.index('self.inner.lock()'), name + ' must pre-allocate lease UniqueArc before claiming an idle entry'
+    assert fn_src.index('inner.entries.reserve(1, GFP_KERNEL)?;') < fn_src.index('factory.persistent_objects()'), name + ' must reserve tracking storage before creating persistent mappings'
+    assert fn_src.index('UniqueArc::<') < fn_src.index('factory.persistent_objects()'), name + ' must pre-allocate UniqueArc slots before creating persistent mappings'
+    assert 'push_within_capacity(' in fn_src, name + ' must commit entries infallibly via push_within_capacity'
 source = (source
+    .replace('__RENDER_PB_POOLS__', render_pb_pools)
     .replace('__FINISH_PRIVATE__', item(object_source, 'pub(crate) fn finish_private('))
     .replace('__PERSISTENT_UNIT_CMDS__', item(resources_source, 'struct PersistentUnitCmds {'))
     .replace('__COMPUTE_CMDS_STRUCT__', item(resources_source, 'pub(crate) struct ComputeCmds {').replace('#[pin]\n', '').replace('super::hw::', 'hw::'))

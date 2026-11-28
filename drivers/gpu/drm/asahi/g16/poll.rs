@@ -938,7 +938,7 @@ impl Firmware {
             }
         }
         if let Some(f) = oldest_render {
-            if let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) {
+            if let Ok(obs) = self.graph.render.notifier.r32(notifier_page::FS_STAMP) {
                 let reached = if render_behind {
                     stamp_reached(obs, f.fs_target, self.engine.fs_target)
                 } else {
@@ -1353,59 +1353,109 @@ impl Firmware {
                 .is_some();
             let g = &self.graph.render;
             let a = f.pb_slot as usize;
+            // Render `fw_stamp[1]` (FS) is ASC-cached (`FwCoherent`), while `fw_stamp[0]` (TA)
+            // stays uncached (`Class::Shared`) so `ta_pending_passes()` observes per-pass TA
+            // progress across multi-pass batches. Normal flights fail fast on the uncached TA/FS
+            // service stamps written by the notifier service after firmware descriptor and PB
+            // bookkeeping, with zero `fw_stamp` reads. Suspect post-recovery flights with a stale
+            // notifier sync and check `fw_stamp[1]` (plus uncached `fw_stamp[0]`) as independent
+            // stage-completion witnesses alongside uncached TA/FS queue receipts so a still-running
+            // suspect render never enters abort grace before both stages pass, while keeping both
+            // notifier stamps required for `Retirement::Full`.
             if render_behind {
                 let e = &self.engine;
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
-                if !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
-                    || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
-                    || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+                let fs_reached = stamp_reached(fs_stamp, f.fs_target, e.fs_target);
+                if !f.recovery_suspect && !fs_reached {
+                    return Ok(Retirement::Pending);
+                }
+                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+                let ta_reached = stamp_reached(ta_stamp, f.ta_target, e.ta_target);
+                if !f.recovery_suspect && !ta_reached {
+                    return Ok(Retirement::Pending);
+                }
+                if f.recovery_suspect {
+                    let fs_stage = fs_reached || {
+                        g.fw_stamp[1].sync_for_cpu(0, 4)?;
+                        stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                    };
+                    if !fs_stage {
+                        return Ok(Retirement::Pending);
+                    }
+                    let ta_stage = ta_reached
+                        || stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target);
+                    if !ta_stage {
+                        return Ok(Retirement::Pending);
+                    }
+                }
+                if !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
                     || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
-                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                full &= fs_reached
+                    && ta_reached
                     && (fs_stamp != f.fs_target
                         || g.notifier
                             .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                             == f.job.vm.slot)
-                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
                     && (ta_stamp != f.ta_target
                         || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
                     && f.job
                         .resources
-                        .pb_retired_at(a, f.uma_submitted)?;
+                        .pb_flight_retired(a, f.uma_submitted, f.renders, false)?;
             } else {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
-                if g.fw_stamp[1].r32(0)? != f.fs_target
-                    || g.fw_stamp[0].r32(0)? != f.ta_target
-                    || !self.queue_receipt(
-                        Channel::Ta,
-                        &g.qstate[0],
-                        &g.qinfo[0],
-                        f.ta_head,
-                        f.rec[0],
-                    )?
-                    || !self.queue_receipt(
-                        Channel::Fs,
-                        &g.qstate[1],
-                        &g.qinfo[1],
-                        f.fs_head,
-                        f.rec[1],
-                    )?
-                {
+                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+                let fs_reached = fs_stamp == f.fs_target;
+                if !f.recovery_suspect && !fs_reached {
+                    return Ok(Retirement::Pending);
+                }
+                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+                let ta_reached = ta_stamp == f.ta_target;
+                if !f.recovery_suspect && !ta_reached {
+                    return Ok(Retirement::Pending);
+                }
+                if f.recovery_suspect {
+                    let fs_stage = fs_reached || {
+                        g.fw_stamp[1].sync_for_cpu(0, 4)?;
+                        g.fw_stamp[1].r32(0)? == f.fs_target
+                    };
+                    if !fs_stage {
+                        return Ok(Retirement::Pending);
+                    }
+                    let ta_stage = ta_reached || g.fw_stamp[0].r32(0)? == f.ta_target;
+                    if !ta_stage {
+                        return Ok(Retirement::Pending);
+                    }
+                }
+                if !self.queue_receipt(
+                    Channel::Ta,
+                    &g.qstate[0],
+                    &g.qinfo[0],
+                    f.ta_head,
+                    f.rec[0],
+                )? || !self.queue_receipt(
+                    Channel::Fs,
+                    &g.qstate[1],
+                    &g.qinfo[1],
+                    f.fs_head,
+                    f.rec[1],
+                )? {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                full &= fs_reached
+                    && ta_reached
                     && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
                     && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                         == f.job.vm.slot
-                    && f.job.resources.pb_retired(a)?;
+                    && f.job
+                        .resources
+                        .pb_flight_retired(a, f.uma_submitted, f.renders, true)?;
             }
             if full {
                 let count = (f.renders as usize).min(f.claims.pass.len());
@@ -1563,6 +1613,12 @@ impl Firmware {
                         .push(super::hw::sizes::COMPUTE_PIPES + 1, f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
+                    f.job.resources.note_pb_retired(
+                        f.pb_slot as usize,
+                        f.uma_submitted,
+                        f.renders,
+                    )?;
+                    epoch.retire_flight();
                     self.pools.retire_flight(
                         f.pb_slot as usize,
                         epoch,
@@ -1842,8 +1898,11 @@ impl Firmware {
                 fr.ta_target,
                 e.ta_target,
             );
-            next_progress[CP + 1] =
-                pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
+            next_progress[CP + 1] = pending(
+                r.notifier.r32(notifier_page::FS_STAMP).unwrap_or(0),
+                fr.fs_target,
+                e.fs_target,
+            );
             published[CP] = fr.published_ns;
         }
         let mut compute_moved = [false; CP];
@@ -2140,7 +2199,7 @@ impl Firmware {
         if f.is_some_and(|f| f.renders != 0) {
             dev_info!(
                 self.graph.dev.as_ref(),
-                "G16:   render: draw={} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch0={}/{}; fs {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch1={}/{}; stage events={}/{}\n",
+                "G16:   render: draw={} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch0={}/{}; fs {:#x}/{:#x} done={} read={} write={} head={} ch1={}/{}; stage events={}/{}\n",
                 e.draw,
                 e.ta_target,
                 rd(&r.user_stamp[0], 0),
@@ -2152,8 +2211,7 @@ impl Firmware {
                 ch.read(Channel::Ta).unwrap_or(0xdeadbeef),
                 ch.write_cell(Channel::Ta).unwrap_or(0xdeadbeef),
                 e.fs_target,
-                rd(&r.user_stamp[1], 0),
-                rd(&r.fw_stamp[1], 0),
+                rd(&r.notifier, notifier_page::FS_STAMP),
                 rd(&r.qstate[1], qstate::DONE),
                 rd(&r.qstate[1], qstate::READ),
                 rd(&r.qstate[1], qstate::WRITE),

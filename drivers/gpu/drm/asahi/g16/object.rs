@@ -396,6 +396,8 @@ pub(crate) struct Factory {
     firmware: core::ops::Range<u64>,
     render_cmds: Arc<super::resources::RenderCmds>,
     compute_cmds: Arc<super::resources::ComputeCmds>,
+    render_uma_pool: Arc<super::resources::RenderUmaPool>,
+    pb_record_pool: Arc<super::resources::PbRecordPool>,
 }
 
 impl Factory {
@@ -489,6 +491,14 @@ impl Factory {
     pub(crate) fn compute_cmds(&self, k: usize) -> Result<super::slots::UnitCmds> {
         self.compute_cmds.get(self, k)
     }
+
+    pub(crate) fn render_uma_pool(&self) -> &Arc<super::resources::RenderUmaPool> {
+        &self.render_uma_pool
+    }
+
+    pub(crate) fn pb_record_pool(&self) -> &Arc<super::resources::PbRecordPool> {
+        &self.pb_record_pool
+    }
 }
 
 /// The firmware object allocator and the set of retained objects.
@@ -547,6 +557,8 @@ impl Objects {
         &mut self,
         render_cmds: Arc<super::resources::RenderCmds>,
         compute_cmds: Arc<super::resources::ComputeCmds>,
+        render_uma_pool: Arc<super::resources::RenderUmaPool>,
+        pb_record_pool: Arc<super::resources::PbRecordPool>,
     ) -> Factory {
         self.sealed = true;
         Factory {
@@ -556,6 +568,8 @@ impl Objects {
             firmware: self.fw_next..hw::va::FW_ALLOC.end,
             render_cmds,
             compute_cmds,
+            render_uma_pool,
+            pb_record_pool,
         }
     }
 
@@ -567,6 +581,7 @@ impl Objects {
         self.alloc_private_in(req, None)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn alloc_dynamic_client(&mut self, size: usize) -> Result<Arc<FwObject>> {
         self.alloc_private_in(
             Request {
@@ -580,6 +595,46 @@ impl Objects {
             },
             Some(hw::client::DYNAMIC),
         )
+    }
+
+    /// Maps an existing uncached firmware object into this arena's user VM at fixed `gva` inside
+    /// [`hw::client::DYNAMIC`] with a trailing guard page.
+    ///
+    /// Used by [`super::pools::PbEpoch`] to alias a persistent context-0 `Class::Shared` PB page
+    /// list at its record set's immutable `pages_gpu` address while the epoch owns the record set;
+    /// dropping this `Objects` unmaps the client alias before the record lease can be recycled.
+    pub(crate) fn map_client_at(&mut self, object: &Arc<FwObject>, gva: u64) -> Result {
+        if object.cached_cpu || object.offset != 0 {
+            return Err(EINVAL);
+        }
+        let bytes = object.bytes;
+        if bytes == 0 || bytes & (hw::PAGE as usize - 1) != 0 || gva & (hw::PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let end = gva
+            .checked_add(bytes as u64)
+            .and_then(|end| end.checked_add(hw::PAGE))
+            .ok_or(EOVERFLOW)?;
+        if gva < hw::client::DYNAMIC.start || end > hw::client::DYNAMIC.end {
+            return Err(EINVAL);
+        }
+        let vm = self
+            .private
+            .as_ref()
+            .and_then(|private| private.vm.as_ref())
+            .ok_or(EINVAL)?
+            .clone();
+        self.mappings.reserve(1, GFP_KERNEL)?;
+        let mapping = vm.map_at(
+            gva,
+            bytes,
+            &object.gem(),
+            mmu::Prot::from_pte(pte::LEAF_NC),
+            true,
+        )?;
+        let _ = self.mappings.push_within_capacity(mapping);
+        wmb();
+        Ok(())
     }
 
     fn alloc_private_in(

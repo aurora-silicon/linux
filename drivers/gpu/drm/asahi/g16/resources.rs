@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_condvar, new_mutex, new_spinlock_irq,
     prelude::*,
-    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SetOnce, SpinLockIrq},
+    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SetOnce, SpinLockIrq, UniqueArc},
 };
 
 /// One pass slot index's device-lifetime render command records and the allocator that maps
@@ -157,6 +157,600 @@ impl ComputeCmds {
 /// shared per-VM standby pool instead of attaching one epoch per queued job
 /// avoids allocating and mapping fresh epochs whenever submission depth rises.
 const SPARE_EPOCHS: usize = 32;
+
+/// Firmware-cached descriptor and uncached submission counter of one render UMA allocator slot
+/// ([`super::pools::Allocator`]), kept for the device lifetime because ASC-cached mappings have
+/// no qualified teardown.
+pub(crate) struct RenderUmaRecordSet {
+    pub(crate) descriptor: Arc<FwObject>,
+    /// Uncached submission counter written by the host at every render publication.
+    pub(crate) submitted: Arc<FwObject>,
+}
+
+struct RenderUmaEntry {
+    set: RenderUmaRecordSet,
+    in_use: AtomicBool,
+}
+
+/// Partially constructed or unsynced render UMA record set retained inside [`RenderUmaPool`] so
+/// neither mid-set allocation failure nor `finish_private()` failure can strand mapped
+/// `FwCoherent` records.
+struct PendingRenderUma {
+    objects: core::mem::ManuallyDrop<Objects>,
+    submitted: Option<Arc<FwObject>>,
+    descriptor: Option<Arc<FwObject>>,
+    finished: bool,
+}
+
+struct RenderUmaPoolInner {
+    entries: KVec<Arc<RenderUmaEntry>>,
+    pending: Option<PendingRenderUma>,
+}
+
+/// Device-lifetime pool of ASC-cached render UMA descriptor/counter record sets.
+///
+/// A set returns to the pool only when every flight published on it retired normally (firmware
+/// advances `COMPLETED` strictly before storing the flight's uncached `FS_STAMP`), it was never
+/// quarantined, and the last holder (the VM's [`super::pools::Allocator`] and
+/// [`super::pools::Pools`]'s hardware-slot retention lease) drops. A set that carried an aborted
+/// or quarantined flight stays out of the pool forever.
+#[pin_data]
+pub(crate) struct RenderUmaPool {
+    #[pin]
+    inner: Mutex<RenderUmaPoolInner>,
+}
+
+impl RenderUmaPool {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                inner <- new_mutex!(
+                    RenderUmaPoolInner {
+                        entries: KVec::new(),
+                        pending: None,
+                    },
+                    "g16::RenderUmaPool"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<RenderUmaLease>, bool)> {
+        // Pre-allocate the lease wrapper before claiming any idle entry so reuse is
+        // infallible after taking ownership and can never double-release on OOM.
+        let lease_slot = UniqueArc::<RenderUmaLease>::new_uninit(GFP_KERNEL)?;
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .in_use
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .cloned()
+        {
+            drop(inner);
+            let lease = Arc::from(lease_slot.write(RenderUmaLease {
+                entry,
+                published_flights: AtomicU64::new(0),
+                retired_flights: AtomicU64::new(0),
+                quarantined: AtomicBool::new(false),
+            }));
+            return Ok((lease, true));
+        }
+        // Reserve tracking storage and pre-allocate the entry wrapper before creating or
+        // publishing any permanent ASC-cached mapping so insertion is infallible afterwards.
+        inner.entries.reserve(1, GFP_KERNEL)?;
+        let entry_slot = UniqueArc::<RenderUmaEntry>::new_uninit(GFP_KERNEL)?;
+        let pending = inner.pending.get_or_insert_with(|| PendingRenderUma {
+            objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
+            submitted: None,
+            descriptor: None,
+            finished: false,
+        });
+        if pending.submitted.is_none() {
+            pending.submitted = Some(super::graph::alloc(
+                &mut pending.objects,
+                0x40,
+                super::object::Class::Fw,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if pending.descriptor.is_none() {
+            pending.descriptor = Some(super::graph::alloc(
+                &mut pending.objects,
+                super::fw::buffer::uma_manager::SIZE,
+                super::object::Class::FwCoherent,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if !pending.finished {
+            pending.objects.finish_private()?;
+            pending.finished = true;
+        }
+        let Some(pending) = inner.pending.take() else {
+            return Err(EINVAL);
+        };
+        let (Some(submitted), Some(descriptor)) = (pending.submitted, pending.descriptor) else {
+            return Err(EINVAL);
+        };
+        let _ = pending.objects;
+        let entry = Arc::from(entry_slot.write(RenderUmaEntry {
+            set: RenderUmaRecordSet {
+                descriptor,
+                submitted,
+            },
+            in_use: AtomicBool::new(true),
+        }));
+        let _ = inner.entries.push_within_capacity(entry.clone());
+        let lease = Arc::from(lease_slot.write(RenderUmaLease {
+            entry,
+            published_flights: AtomicU64::new(0),
+            retired_flights: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
+        }));
+        Ok((lease, false))
+    }
+}
+
+/// Lease on one [`RenderUmaPool`] record set, shared by [`super::pools::Allocator`] and
+/// [`super::pools::Pools`] until firmware's hardware UMA slot is overwritten by another owner.
+pub(crate) struct RenderUmaLease {
+    entry: Arc<RenderUmaEntry>,
+    published_flights: AtomicU64,
+    retired_flights: AtomicU64,
+    quarantined: AtomicBool,
+}
+
+impl RenderUmaLease {
+    /// Records a published render flight using this descriptor.
+    pub(crate) fn publish(&self) {
+        self.published_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a normal full retirement of a render flight using this descriptor.
+    pub(crate) fn retire(&self) {
+        self.retired_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Permanently prevents this record set from returning to [`RenderUmaPool`].
+    pub(crate) fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::Release);
+    }
+
+    /// Whether every flight published on this descriptor retired normally and it was never
+    /// quarantined.
+    pub(crate) fn settled(&self) -> bool {
+        !self.quarantined.load(Ordering::Acquire)
+            && self.published_flights.load(Ordering::Acquire)
+                == self.retired_flights.load(Ordering::Acquire)
+    }
+}
+
+impl core::ops::Deref for RenderUmaLease {
+    type Target = RenderUmaRecordSet;
+    fn deref(&self) -> &Self::Target {
+        &self.entry.set
+    }
+}
+
+impl Drop for RenderUmaLease {
+    fn drop(&mut self) {
+        if self.settled() {
+            self.entry.in_use.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Stride between per-slot ASC-cached `pb_mgr` records inside [`PbRecordSet::cached_records`].
+/// 256 bytes keeps every hardware PB slot (`0..PB_SLOTS`) on disjoint 128-byte M4 cache lines.
+pub(crate) const PB_MANAGER_STRIDE: usize = 0x100;
+const PB_INITBM_OFF: usize = super::hw::sizes::PB_SLOTS * PB_MANAGER_STRIDE;
+const PB_CACHED_SIZE: usize = PB_INITBM_OFF + 0x100;
+const PB_PAGES_GPU_STRIDE: u64 = super::fw::buffer::PAGE_LIST_SIZE as u64 + super::hw::PAGE;
+const _: () = assert!(PB_MANAGER_STRIDE >= super::fw::buffer::pb_manager::SIZE);
+const _: () = assert!(PB_MANAGER_STRIDE % 128 == 0);
+const _: () = assert!(PB_CACHED_SIZE <= super::hw::PAGE as usize);
+
+/// Device-lifetime PB record set of one [`super::pools::PbEpoch`], kept for the device lifetime
+/// because ASC-cached mappings have no qualified teardown.
+///
+/// `cached_records` (`Class::FwCoherent`, `0x443`) packs one immutable-after-first-exposure
+/// `pb_mgr` slot per hardware PB slot (`0..PB_SLOTS`, 256-byte stride) plus firmware-read-only
+/// `initbm`. `blocks` (`Class::FwCoherent`) is firmware-read-only; `pages` (`Class::Shared`) has
+/// a permanent context-0 firmware alias and a globally unique client `pages_gpu` address in
+/// [`super::hw::client::DYNAMIC`] mapped only into the owning VM while the epoch is live;
+/// `nc_records` (`Class::Fw`, `0x44b`) holds `ring`, `counter`, and `misc`.
+pub(crate) struct PbRecordSet {
+    pub(crate) cached_records: Arc<FwObject>,
+    pub(crate) nc_records: Arc<FwObject>,
+    pub(crate) pages: Arc<FwObject>,
+    pub(crate) pages_gpu: u64,
+    pub(crate) blocks: Arc<FwObject>,
+    pub(crate) ring: Arc<FwObject>,
+    pub(crate) counter: Arc<FwObject>,
+    pub(crate) misc: Arc<FwObject>,
+    pub(crate) initbm: Arc<FwObject>,
+}
+
+impl PbRecordSet {
+    /// Byte offset of hardware PB slot `k`'s `pb_mgr` record inside [`Self::cached_records`].
+    pub(crate) fn manager_offset(k: usize) -> Result<usize> {
+        if k >= super::hw::sizes::PB_SLOTS {
+            return Err(EINVAL);
+        }
+        Ok(k * PB_MANAGER_STRIDE)
+    }
+
+    /// Firmware VA of hardware PB slot `k`'s ASC-cached `pb_mgr` record.
+    pub(crate) fn manager_va(&self, k: usize) -> Result<u64> {
+        Ok(self.cached_records.va + Self::manager_offset(k)? as u64)
+    }
+}
+
+struct PbRecordEntry {
+    set: PbRecordSet,
+    in_use: AtomicBool,
+    /// Bit `k` is set once hardware PB slot `k`'s `pb_mgr` in `cached_records` has been exposed
+    /// to firmware; after that, the host never writes to slot `k`'s `pb_mgr` again.
+    slot_exposed: AtomicU32,
+    /// Permanent `heap_blocks` binding once any slot has been exposed (`0` while unbound).
+    bound_blocks: AtomicU32,
+    /// Permanent `heap_gva` binding once any slot has been exposed (`0` while unbound).
+    bound_heap_gva: AtomicU64,
+    /// Permanent `pb_manager::Layout::id_a` binding once any slot has been exposed.
+    bound_layout_id_a: AtomicU32,
+}
+
+/// Partially constructed or unsynced PB record set retained inside [`PbRecordPool`] so neither
+/// mid-set allocation, sub-view allocation, nor `finish_private()` failure can strand mapped
+/// `FwCoherent` records or burn a `DYNAMIC` slot.
+struct PendingPbRecord {
+    objects: core::mem::ManuallyDrop<Objects>,
+    nc_records: Option<Arc<FwObject>>,
+    pages: Option<Arc<FwObject>>,
+    cached_records: Option<Arc<FwObject>>,
+    blocks: Option<Arc<FwObject>>,
+    pages_gpu: u64,
+    set: Option<PbRecordSet>,
+    finished: bool,
+}
+
+struct PbRecordPoolInner {
+    entries: KVec<Arc<PbRecordEntry>>,
+    pending: Option<PendingPbRecord>,
+    next_pages_slot: u64,
+}
+
+/// Device-lifetime pool of PB record sets (ASC-cached per-slot `pb_mgr`, `initbm`, and `blocks`
+/// paired with persistent `Class::Shared` `pages` and uncached `ring`/`counter`/`misc`).
+///
+/// A set returns to the pool only when every flight published on it retired normally, it was
+/// never quarantined, and every owner ([`super::pools::PbEpoch`], `Pools::owners`,
+/// `Pools::retained_pb`, and `Pools::vm_last`) has dropped after a newer epoch replaced the
+/// hardware slot.
+#[pin_data]
+pub(crate) struct PbRecordPool {
+    #[pin]
+    inner: Mutex<PbRecordPoolInner>,
+}
+
+impl PbRecordPool {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                inner <- new_mutex!(
+                    PbRecordPoolInner {
+                        entries: KVec::new(),
+                        pending: None,
+                        next_pages_slot: 0,
+                    },
+                    "g16::PbRecordPool"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take(&self, factory: &Factory) -> Result<(Arc<PbRecordLease>, bool)> {
+        self.take_for(factory, None)
+    }
+
+    pub(crate) fn take_for(
+        &self,
+        factory: &Factory,
+        target_heap_blocks: Option<u32>,
+    ) -> Result<(Arc<PbRecordLease>, bool)> {
+        // Pre-allocate the lease wrapper before claiming any idle entry so reuse is
+        // infallible after taking ownership and can never double-release on OOM.
+        let lease_slot = UniqueArc::<PbRecordLease>::new_uninit(GFP_KERNEL)?;
+        let mut inner = self.inner.lock();
+        let try_claim = |entry: &PbRecordEntry, expected: u32| -> bool {
+            if entry.bound_blocks.load(Ordering::Acquire) != expected {
+                return false;
+            }
+            if entry
+                .in_use
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return false;
+            }
+            let actual = entry.bound_blocks.load(Ordering::Acquire);
+            if actual == expected || (expected == 0 && target_heap_blocks == Some(actual)) {
+                true
+            } else {
+                entry.in_use.store(false, Ordering::Release);
+                false
+            }
+        };
+        let idle = target_heap_blocks
+            .filter(|&blocks| blocks != 0)
+            .and_then(|blocks| {
+                inner
+                    .entries
+                    .iter()
+                    .find(|entry| try_claim(entry, blocks))
+                    .cloned()
+            })
+            .or_else(|| {
+                inner
+                    .entries
+                    .iter()
+                    .find(|entry| try_claim(entry, 0))
+                    .cloned()
+            });
+        if let Some(entry) = idle {
+            drop(inner);
+            let lease = Arc::from(lease_slot.write(PbRecordLease {
+                entry,
+                published_flights: AtomicU64::new(0),
+                retired_flights: AtomicU64::new(0),
+                quarantined: AtomicBool::new(false),
+            }));
+            return Ok((lease, true));
+        }
+        let pages_gpu = match inner.pending.as_ref() {
+            Some(pending) => pending.pages_gpu,
+            None => {
+                let offset = inner
+                    .next_pages_slot
+                    .checked_mul(PB_PAGES_GPU_STRIDE)
+                    .ok_or(ENOMEM)?;
+                let gva = super::hw::client::DYNAMIC
+                    .start
+                    .checked_add(offset)
+                    .ok_or(ENOMEM)?;
+                let end = gva.checked_add(PB_PAGES_GPU_STRIDE).ok_or(ENOMEM)?;
+                if end > super::hw::client::DYNAMIC.end {
+                    return Err(ENOMEM);
+                }
+                gva
+            }
+        };
+        // Reserve tracking storage and pre-allocate the entry wrapper before creating or
+        // publishing any permanent ASC-cached mapping so insertion is infallible afterwards.
+        inner.entries.reserve(1, GFP_KERNEL)?;
+        let entry_slot = UniqueArc::<PbRecordEntry>::new_uninit(GFP_KERNEL)?;
+        let pending = inner.pending.get_or_insert_with(|| PendingPbRecord {
+            objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
+            nc_records: None,
+            pages: None,
+            cached_records: None,
+            blocks: None,
+            pages_gpu,
+            set: None,
+            finished: false,
+        });
+        // Keep `pb_mgr` (per-slot array, immutable to the host after first exposure), `initbm`,
+        // and `blocks` ASC-cached (`0x443`) while keeping `ring` (`BLOCK_CTL`), `counter`, `misc`
+        // (`Class::Fw`, `0x44b`) and `pages` (`Class::Shared`) uncached. Because every static
+        // `pb_mgr` field (`parameter_id`, `pages_fw`, `pages_gpu`, `blocks_fw`, `ring_fw`,
+        // `counter_fw`, `heap_blocks`) stays invariant per set and slot, firmware's `InitBM`
+        // resets live cursors on the ASC-cached line itself without host overwrites or per-flight
+        // PB unloads.
+        if pending.nc_records.is_none() {
+            pending.nc_records = Some(super::graph::alloc(
+                &mut pending.objects,
+                0x300,
+                super::object::Class::Fw,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if pending.pages.is_none() {
+            pending.pages = Some(super::graph::alloc(
+                &mut pending.objects,
+                super::fw::buffer::PAGE_LIST_SIZE,
+                super::object::Class::Shared,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if pending.cached_records.is_none() {
+            pending.cached_records = Some(super::graph::alloc(
+                &mut pending.objects,
+                PB_CACHED_SIZE,
+                super::object::Class::FwCoherent,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if pending.blocks.is_none() {
+            pending.blocks = Some(super::graph::alloc(
+                &mut pending.objects,
+                super::fw::buffer::BLOCK_LIST_SIZE,
+                super::object::Class::FwCoherent,
+                None,
+                0,
+                false,
+            )?);
+        }
+        if pending.set.is_none() {
+            let nc_records = pending.nc_records.as_ref().ok_or(EINVAL)?;
+            let pages = pending.pages.as_ref().ok_or(EINVAL)?;
+            let cached_records = pending.cached_records.as_ref().ok_or(EINVAL)?;
+            let blocks = pending.blocks.as_ref().ok_or(EINVAL)?;
+            pending.set = Some(PbRecordSet {
+                initbm: FwObject::view(cached_records, PB_INITBM_OFF, 0x20)?,
+                ring: FwObject::view(nc_records, 0, 8)?,
+                counter: FwObject::view(nc_records, 0x100, 0x40)?,
+                misc: FwObject::view(nc_records, 0x200, 0x40)?,
+                cached_records: cached_records.clone(),
+                nc_records: nc_records.clone(),
+                pages: pages.clone(),
+                pages_gpu: pending.pages_gpu,
+                blocks: blocks.clone(),
+            });
+        }
+        if !pending.finished {
+            pending.objects.finish_private()?;
+            pending.finished = true;
+        }
+        let Some(pending) = inner.pending.take() else {
+            return Err(EINVAL);
+        };
+        let Some(set) = pending.set else {
+            return Err(EINVAL);
+        };
+        let _ = pending.objects;
+        inner.next_pages_slot = inner.next_pages_slot.saturating_add(1);
+        let entry = Arc::from(entry_slot.write(PbRecordEntry {
+            set,
+            in_use: AtomicBool::new(true),
+            slot_exposed: AtomicU32::new(0),
+            bound_blocks: AtomicU32::new(0),
+            bound_heap_gva: AtomicU64::new(0),
+            bound_layout_id_a: AtomicU32::new(0),
+        }));
+        let _ = inner.entries.push_within_capacity(entry.clone());
+        let lease = Arc::from(lease_slot.write(PbRecordLease {
+            entry,
+            published_flights: AtomicU64::new(0),
+            retired_flights: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
+        }));
+        Ok((lease, false))
+    }
+}
+
+/// Lease on one [`PbRecordPool`] record set, shared by [`super::pools::PbEpoch`] and
+/// [`super::pools::Pools`] until a newer `InitBM` overwrites `pb_mgr_table[parameter_id]`.
+pub(crate) struct PbRecordLease {
+    entry: Arc<PbRecordEntry>,
+    published_flights: AtomicU64,
+    retired_flights: AtomicU64,
+    quarantined: AtomicBool,
+}
+
+impl PbRecordLease {
+    /// Permanent heap-block binding of the underlying record set (`0` while unbound).
+    pub(crate) fn bound_blocks(&self) -> u32 {
+        self.entry.bound_blocks.load(Ordering::Acquire)
+    }
+
+    /// Whether any hardware PB slot of this record set has ever been exposed to firmware.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound_blocks() != 0
+    }
+
+    /// Whether this record set can legally serve `(layout_id_a, heap_gva, heap_blocks)`.
+    pub(crate) fn matches_binding(
+        &self,
+        layout_id_a: u32,
+        heap_gva: u64,
+        heap_blocks: u32,
+    ) -> bool {
+        let bound = self.bound_blocks();
+        bound == 0
+            || (bound == heap_blocks
+                && self.entry.bound_heap_gva.load(Ordering::Acquire) == heap_gva
+                && self.entry.bound_layout_id_a.load(Ordering::Acquire) == layout_id_a)
+    }
+
+    /// Whether hardware PB slot `k`'s `pb_mgr` in `cached_records` has already been exposed.
+    pub(crate) fn slot_is_exposed(&self, k: usize) -> bool {
+        k < super::hw::sizes::PB_SLOTS
+            && (self.entry.slot_exposed.load(Ordering::Acquire) & (1u32 << k)) != 0
+    }
+
+    /// Permanently binds this record set to `(layout_id_a, heap_gva, heap_blocks)` and marks
+    /// hardware PB slot `k`'s ASC-cached `pb_mgr` immutable to host writes.
+    pub(crate) fn mark_slot_exposed(
+        &self,
+        k: usize,
+        layout_id_a: u32,
+        heap_gva: u64,
+        heap_blocks: u32,
+    ) {
+        if k >= super::hw::sizes::PB_SLOTS || heap_blocks == 0 {
+            return;
+        }
+        if self.entry.bound_blocks.load(Ordering::Acquire) == 0 {
+            self.entry
+                .bound_heap_gva
+                .store(heap_gva, Ordering::Relaxed);
+            self.entry
+                .bound_layout_id_a
+                .store(layout_id_a, Ordering::Relaxed);
+            self.entry
+                .bound_blocks
+                .store(heap_blocks, Ordering::Release);
+        }
+        self.entry
+            .slot_exposed
+            .fetch_or(1u32 << k, Ordering::AcqRel);
+    }
+
+    /// Records a published render flight using this PB record set.
+    pub(crate) fn publish(&self) {
+        self.published_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a normal full retirement of a render flight using this PB record set.
+    pub(crate) fn retire(&self) {
+        self.retired_flights.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Permanently prevents this record set from returning to [`PbRecordPool`].
+    pub(crate) fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::Release);
+    }
+
+    /// Whether every flight published on this record set retired normally and it was never
+    /// quarantined.
+    pub(crate) fn settled(&self) -> bool {
+        !self.quarantined.load(Ordering::Acquire)
+            && self.published_flights.load(Ordering::Acquire)
+                == self.retired_flights.load(Ordering::Acquire)
+    }
+}
+
+impl core::ops::Deref for PbRecordLease {
+    type Target = PbRecordSet;
+    fn deref(&self) -> &Self::Target {
+        &self.entry.set
+    }
+}
+
+impl Drop for PbRecordLease {
+    fn drop(&mut self) {
+        if self.settled() {
+            self.entry.in_use.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// Backing for one physical compute unit (`k`) of a VM, deferred-dropped independently so an
 /// undisplaced last-retired owner lease on one CDM pipe never pins the VM's other compute units.
@@ -920,14 +1514,115 @@ impl Drop for Ready {
         }
     }
 }
+const MAX_PB_HEAP_SIZES: usize = 4;
+const _: () = assert!(1 + PB_HEAP_EXT_TIERS.len() <= MAX_PB_HEAP_SIZES);
+
 struct Standby {
     /// Never-exposed epochs kept on standby for this VM's queued renders.
-    /// Invariant: while open or while `reserved > 0`, `epochs.len() >= reserved as usize`.
+    /// Invariant: while open or while `reserved > 0`, `epochs.len() >= reserved as usize`,
+    /// and every reserved heap size is satisfied by matching bound or unbound epochs.
     epochs: KVec<Arc<PbEpoch>>,
     /// Accepted, not-yet-published render commands of this VM.
     reserved: u32,
+    /// Per-`pb_heap_blocks` breakdown of `reserved` across the VM's monotonic heap-growth tiers.
+    reserved_sizes: [(u32, u32); MAX_PB_HEAP_SIZES],
     /// `SUBMIT` callers currently sleeping on `standby_available`.
     waiters: u32,
+}
+
+impl Standby {
+    fn reserved_for(&self, heap_blocks: u32) -> u32 {
+        self.reserved_sizes
+            .iter()
+            .find_map(|&(sz, count)| (sz == heap_blocks && heap_blocks != 0).then_some(count))
+            .unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    fn add_reserved(&mut self, heap_blocks: u32, count: u32) {
+        self.reserved += count;
+        if heap_blocks == 0 || count == 0 {
+            return;
+        }
+        if let Some(slot) = self
+            .reserved_sizes
+            .iter_mut()
+            .find(|(sz, _)| *sz == heap_blocks)
+        {
+            slot.1 += count;
+        } else if let Some(slot) = self.reserved_sizes.iter_mut().find(|(_, c)| *c == 0) {
+            *slot = (heap_blocks, count);
+        }
+    }
+
+    fn sub_reserved(&mut self, heap_blocks: u32, count: u32) {
+        self.reserved = self.reserved.saturating_sub(count);
+        if heap_blocks == 0 || count == 0 {
+            return;
+        }
+        if let Some(slot) = self
+            .reserved_sizes
+            .iter_mut()
+            .find(|(sz, _)| *sz == heap_blocks)
+        {
+            slot.1 = slot.1.saturating_sub(count);
+            if slot.1 == 0 {
+                slot.0 = 0;
+            }
+        }
+    }
+
+    fn bound_count(&self, heap_blocks: u32) -> usize {
+        self.epochs
+            .iter()
+            .filter(|e| e.unexposed() && e.bound_blocks() == heap_blocks)
+            .count()
+    }
+
+    fn unbound_deficit(&self, exclude: u32) -> usize {
+        let mut need = 0usize;
+        for &(sz, count) in &self.reserved_sizes {
+            if sz != 0 && sz != exclude && count != 0 {
+                need += (count as usize).saturating_sub(self.bound_count(sz));
+            }
+        }
+        need
+    }
+
+    #[allow(dead_code)]
+    fn compat_deficit(&self, target_heap_blocks: u32, add_count: u32) -> usize {
+        let b_target = self.bound_count(target_heap_blocks);
+        let r_target = self.reserved_for(target_heap_blocks) as usize;
+        let unbound = self.bound_count(0);
+        let other_unbound_need = self.unbound_deficit(target_heap_blocks);
+        let free_unbound = unbound.saturating_sub(other_unbound_need);
+        (r_target + add_count as usize).saturating_sub(b_target + free_unbound)
+    }
+
+    fn pop_evictable(&mut self, only_incompatible_with: Option<u32>) -> Option<Arc<PbEpoch>> {
+        if let Some(target) = only_incompatible_with {
+            let idx = self.epochs.iter().position(|e| {
+                let b = e.bound_blocks();
+                b != 0 && b != target && self.bound_count(b) > self.reserved_for(b) as usize
+            })?;
+            return Some(self.epochs.swap_remove(idx));
+        }
+        if let Some(idx) = self.epochs.iter().position(|e| !e.unexposed()) {
+            return Some(self.epochs.swap_remove(idx));
+        }
+        if let Some(idx) = self.epochs.iter().position(|e| {
+            let b = e.bound_blocks();
+            b != 0 && self.bound_count(b) > self.reserved_for(b) as usize
+        }) {
+            return Some(self.epochs.swap_remove(idx));
+        }
+        if self.bound_count(0) > self.unbound_deficit(0) {
+            if let Some(idx) = self.epochs.iter().position(|e| e.bound_blocks() == 0) {
+                return Some(self.epochs.swap_remove(idx));
+            }
+        }
+        None
+    }
 }
 
 #[pin_data]
@@ -967,6 +1662,7 @@ impl Cache {
                 Standby {
                     epochs,
                     reserved: 0,
+                    reserved_sizes: [(0, 0); MAX_PB_HEAP_SIZES],
                     waiters: 0,
                 },
                 "g16::spare_epochs"
@@ -979,13 +1675,23 @@ impl Cache {
         )
     }
 
-    /// Pops one never-exposed standby epoch for a fresh InitBM publication.
-    fn take_standby(&self) -> Result<Arc<PbEpoch>> {
+    /// Pops one never-exposed standby epoch compatible with `heap_blocks` for a fresh InitBM
+    /// publication, preferring an exact bound match before taking an unbound epoch.
+    fn take_standby_for(&self, heap_blocks: u32) -> Result<Arc<PbEpoch>> {
         let mut standby = self.standby.lock();
-        while let Some(epoch) = standby.epochs.pop() {
-            if epoch.unexposed() {
-                return Ok(epoch);
-            }
+        if let Some(idx) = standby
+            .epochs
+            .iter()
+            .rposition(|e| e.unexposed() && e.bound_blocks() == heap_blocks)
+        {
+            return Ok(standby.epochs.swap_remove(idx));
+        }
+        if let Some(idx) = standby
+            .epochs
+            .iter()
+            .rposition(|e| e.unexposed() && e.bound_blocks() == 0)
+        {
+            return Ok(standby.epochs.swap_remove(idx));
         }
         Err(EINVAL)
     }
@@ -1013,13 +1719,13 @@ impl Cache {
 
     /// Releases `count` reserved render credits and trims any surplus standby epochs outside
     /// the spinlock (each `PbEpoch` defers its own unmap, so dropping here never sleeps).
-    fn release_reserved(&self, count: u32) {
+    fn release_reserved(&self, count: u32, heap_blocks: u32) {
         if count == 0 {
             return;
         }
         let (mut wake, reclaim, excess) = {
             let mut standby = self.standby.lock();
-            standby.reserved = standby.reserved.saturating_sub(count);
+            standby.sub_reserved(heap_blocks, count);
             let wake = standby.waiters != 0;
             let closed = self.closed.load(Ordering::Acquire);
             let reclaim = closed && standby.reserved == 0;
@@ -1029,7 +1735,7 @@ impl Cache {
                 (standby.reserved as usize).max(SPARE_EPOCHS)
             };
             let excess = if standby.epochs.len() > keep {
-                standby.epochs.pop()
+                standby.pop_evictable(None)
             } else {
                 None
             };
@@ -1048,7 +1754,7 @@ impl Cache {
                         (standby.reserved as usize).max(SPARE_EPOCHS)
                     };
                     if standby.epochs.len() > keep {
-                        standby.epochs.pop()
+                        standby.pop_evictable(None)
                     } else {
                         None
                     }
@@ -1088,7 +1794,7 @@ impl Cache {
                 let mut standby = self.standby.lock();
                 let keep = standby.reserved as usize;
                 if standby.epochs.len() > keep {
-                    standby.epochs.pop()
+                    standby.pop_evictable(None)
                 } else {
                     None
                 }
@@ -1391,13 +2097,32 @@ impl Cache {
                 pb_ext,
             )
         };
+        let target_heap_blocks = if let Some(base) = render_arena.as_ref() {
+            let ext: u32 = pb_heap_ext
+                .iter()
+                .take_while(|tier| tier.is_some())
+                .flatten()
+                .map(|tier| tier.blocks)
+                .sum();
+            base.pools
+                .heap_blocks()
+                .saturating_add(ext)
+                .min(super::fw::buffer::MAX_BLOCKS)
+        } else {
+            0
+        };
         if render {
             if render_count > super::budget::LIMIT {
                 return Err(E2BIG);
             }
+            enum StandbyStep {
+                Done,
+                Evict(Arc<PbEpoch>),
+                Alloc(u32),
+            }
             let mut remaining = kernel::time::msecs_to_jiffies(10_000);
             loop {
-                let deficit = {
+                let step = {
                     let mut standby = self.standby.lock();
                     if vm.status.get() != 0
                         || vm.vm.is_closed()
@@ -1405,73 +2130,94 @@ impl Cache {
                     {
                         return Err(EIO);
                     }
-                    if let Some(needed) = standby
+                    let needed = match standby
                         .reserved
                         .checked_add(render_count)
                         .filter(|&n| n <= super::budget::LIMIT)
                     {
-                        if standby.epochs.len() >= needed as usize {
-                            standby.reserved = needed;
-                            break;
+                        Some(n) => n,
+                        None => {
+                            standby.waiters += 1;
+                            let waited = self
+                                .standby_available
+                                .wait_interruptible_timeout(&mut standby, remaining);
+                            standby.waiters -= 1;
+                            match waited {
+                                CondVarTimeoutResult::Woken { jiffies } => {
+                                    remaining = jiffies;
+                                    continue;
+                                }
+                                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                                CondVarTimeoutResult::Timeout => {
+                                    if vm.status.get() != 0
+                                        || vm.vm.is_closed()
+                                        || self.closed.load(Ordering::Acquire)
+                                    {
+                                        return Err(EIO);
+                                    }
+                                    standby
+                                        .reserved
+                                        .checked_add(render_count)
+                                        .filter(|&n| n <= super::budget::LIMIT)
+                                        .ok_or(EBUSY)?
+                                }
+                            }
                         }
-                        needed - standby.epochs.len() as u32
+                    };
+                    let deficit = standby
+                        .compat_deficit(target_heap_blocks, render_count)
+                        .max((needed as usize).saturating_sub(standby.epochs.len()));
+                    if deficit == 0 {
+                        standby.add_reserved(target_heap_blocks, render_count);
+                        StandbyStep::Done
+                    } else if let Some(stale) = standby.pop_evictable(Some(target_heap_blocks)) {
+                        StandbyStep::Evict(stale)
                     } else {
-                        standby.waiters += 1;
-                        let waited = self
-                            .standby_available
-                            .wait_interruptible_timeout(&mut standby, remaining);
-                        standby.waiters -= 1;
-                        match waited {
-                            CondVarTimeoutResult::Woken { jiffies } => {
-                                remaining = jiffies;
-                                continue;
-                            }
-                            CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
-                            CondVarTimeoutResult::Timeout => {
-                                if vm.status.get() != 0
-                                    || vm.vm.is_closed()
-                                    || self.closed.load(Ordering::Acquire)
-                                {
-                                    return Err(EIO);
-                                }
-                                let needed = standby
-                                    .reserved
-                                    .checked_add(render_count)
-                                    .filter(|&n| n <= super::budget::LIMIT)
-                                    .ok_or(EBUSY)?;
-                                if standby.epochs.len() >= needed as usize {
-                                    standby.reserved = needed;
-                                    break;
-                                }
-                                needed - standby.epochs.len() as u32
-                            }
-                        }
+                        StandbyStep::Alloc(deficit as u32)
                     }
                 };
-                let mut epochs = super::budget::Budget::reserve(&self.budget, deficit)?;
-                let mut fresh = KVec::with_capacity(deficit as usize, GFP_KERNEL)?;
-                for _ in 0..deficit {
-                    fresh.push(PbEpoch::new(&self.factory, vm, epochs.take()?)?, GFP_KERNEL)?;
-                }
-                let mut overflow = KVec::with_capacity(fresh.len(), GFP_KERNEL)?;
-                {
-                    let mut standby = self.standby.lock();
-                    let closed = self.closed.load(Ordering::Acquire);
-                    for epoch in fresh {
-                        if closed {
-                            let _ = overflow.push_within_capacity(epoch);
-                        } else if let Err(err) = standby.epochs.push_within_capacity(epoch) {
-                            let _ = overflow.push_within_capacity(err.0);
+                match step {
+                    StandbyStep::Done => break,
+                    StandbyStep::Evict(stale) => {
+                        drop(stale);
+                        continue;
+                    }
+                    StandbyStep::Alloc(deficit) => {
+                        let mut epochs = super::budget::Budget::reserve(&self.budget, deficit)?;
+                        let mut fresh = KVec::with_capacity(deficit as usize, GFP_KERNEL)?;
+                        for _ in 0..deficit {
+                            fresh.push(
+                                PbEpoch::new_for(
+                                    &self.factory,
+                                    vm,
+                                    epochs.take()?,
+                                    Some(target_heap_blocks),
+                                )?,
+                                GFP_KERNEL,
+                            )?;
                         }
+                        let mut overflow = KVec::with_capacity(fresh.len(), GFP_KERNEL)?;
+                        {
+                            let mut standby = self.standby.lock();
+                            let closed = self.closed.load(Ordering::Acquire);
+                            for epoch in fresh {
+                                if closed {
+                                    let _ = overflow.push_within_capacity(epoch);
+                                } else if let Err(err) = standby.epochs.push_within_capacity(epoch)
+                                {
+                                    let _ = overflow.push_within_capacity(err.0);
+                                }
+                            }
+                        }
+                        drop(overflow);
                     }
                 }
-                drop(overflow);
             }
         }
         // A concurrent fault or close retains even newly constructed backing in this VM cache.
         if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
             if render {
-                self.release_reserved(render_count);
+                self.release_reserved(render_count, target_heap_blocks);
             }
             return Err(EIO);
         }
@@ -1493,6 +2239,7 @@ impl Cache {
             pb_ext,
             active_renders: AtomicU32::new(render_count),
             unpublished_renders: AtomicU32::new(render_count),
+            pb_heap_blocks: target_heap_blocks,
             cache,
         })
     }
@@ -1518,6 +2265,8 @@ pub(crate) struct Prepared {
     active_renders: AtomicU32,
     /// Render commands of this job whose standby reservation has not yet been committed.
     unpublished_renders: AtomicU32,
+    /// Backed PB heap block count reserved for this job's standby epochs.
+    pb_heap_blocks: u32,
     /// The VM cache holding the standby PB epoch pool.
     cache: Option<Arc<Cache>>,
 }
@@ -1528,7 +2277,7 @@ impl Drop for Prepared {
             return;
         };
         cache.release_render_passes(*self.active_renders.get_mut());
-        cache.release_reserved(*self.unpublished_renders.get_mut());
+        cache.release_reserved(*self.unpublished_renders.get_mut(), self.pb_heap_blocks);
     }
 }
 impl Prepared {
@@ -1542,7 +2291,7 @@ impl Prepared {
         if remaining != 0 {
             self.active_renders.fetch_sub(remaining, Ordering::AcqRel);
             cache.release_render_passes(remaining);
-            cache.release_reserved(remaining);
+            cache.release_reserved(remaining, self.pb_heap_blocks);
         }
     }
 
@@ -1646,11 +2395,17 @@ impl Prepared {
     pub(crate) fn publish_pb_batch(&self, k: usize, submitted: u64, renders: u32) -> Result {
         self.pb_allocator(k)?.publish_batch(submitted, renders)
     }
-    pub(crate) fn pb_retired(&self, k: usize) -> Result<bool> {
-        self.pb_allocator(k)?.retired()
+    pub(crate) fn pb_flight_retired(
+        &self,
+        k: usize,
+        target: u64,
+        renders: u32,
+        idle: bool,
+    ) -> Result<bool> {
+        self.pb_allocator(k)?.flight_retired(target, renders, idle)
     }
-    pub(crate) fn pb_retired_at(&self, k: usize, target: u64) -> Result<bool> {
-        self.pb_allocator(k)?.retired_at(target)
+    pub(crate) fn note_pb_retired(&self, k: usize, target: u64, renders: u32) -> Result {
+        self.pb_allocator(k)?.note_retired(target, renders)
     }
     pub(crate) fn pb_heap_gva(&self, k: usize) -> Result<u64> {
         self.pb_allocator(k)?.heap_gva()
@@ -1680,9 +2435,9 @@ impl Prepared {
                 .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone(), heap_ext))
         }
     }
-    /// VM-free firmware lease keeping PB/UMA allocator slot `k`'s `descriptor` + `submitted`
-    /// pages mapped in context-0 UAT across closed-VM reclaim.
-    pub(crate) fn pb_uma_lease(&self, k: usize) -> Option<Arc<super::object::FwLease>> {
+    /// Device-lifetime firmware lease keeping PB/UMA allocator slot `k`'s `descriptor` +
+    /// `submitted` pages mapped in context-0 UAT across closed-VM reclaim.
+    pub(crate) fn pb_uma_lease(&self, k: usize) -> Option<Arc<RenderUmaLease>> {
         self.pb_allocator(k)
             .ok()
             .map(super::pools::Allocator::uma_lease)
@@ -1787,8 +2542,11 @@ impl Prepared {
     pub(crate) fn render(&self) -> Result<&RenderArena> {
         self.render.as_deref().ok_or(EINVAL)
     }
-    pub(crate) fn take_pb(&self) -> Result<Arc<PbEpoch>> {
-        self.cache.as_ref().ok_or(EINVAL)?.take_standby()
+    pub(crate) fn take_pb_for(&self, heap_blocks: u32) -> Result<Arc<PbEpoch>> {
+        self.cache
+            .as_ref()
+            .ok_or(EINVAL)?
+            .take_standby_for(heap_blocks)
     }
     pub(crate) fn return_pb(&self, epoch: Arc<PbEpoch>) {
         if let Some(cache) = &self.cache {
@@ -1808,7 +2566,7 @@ impl Prepared {
             ) {
                 let released = prev.min(count);
                 if released != 0 {
-                    cache.release_reserved(released);
+                    cache.release_reserved(released, self.pb_heap_blocks);
                 }
             }
         }
