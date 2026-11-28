@@ -28,6 +28,7 @@
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/usb.h>
+#include <linux/usb/gadget.h>
 #include <linux/usb/hcd.h>
 #include <linux/usb/phy.h>
 #include <linux/workqueue.h>
@@ -230,6 +231,8 @@ struct dwc3_apple {
 	bool sleep_pm_online;
 	bool sleep_role_pending;
 	enum dwc3_apple_state sleep_role;
+	/* A device role left its host for a suspend-to-idle and connects again after it. */
+	bool sleep_gadget_off;
 	struct work_struct sleep_stop_work;
 	struct completion sleep_stop_done;
 	int sleep_stop_ret;
@@ -1536,6 +1539,8 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 	case DWC3_APPLE_NO_CABLE:
 		break;
 	case DWC3_APPLE_DEVICE:
+		/* A gadget set up again connects when its function driver binds. */
+		appledwc->sleep_gadget_off = false;
 		dwc3_gadget_exit(&appledwc->dwc);
 		appledwc->state = DWC3_APPLE_NO_CABLE;
 		break;
@@ -1875,9 +1880,64 @@ static int dwc3_apple_sleep_kept(struct dwc3_apple *appledwc, bool *kept)
 /* The notifier never waits. This existing bound belongs after the chain and freezer. */
 #define DWC3_APPLE_SLEEP_STOP_PREPARE_MS	5000
 
+/*
+ * A device role stays started through suspend-to-idle, but with the system frozen nothing
+ * services its endpoints: the host's OUT transfers pile up behind it and the link need not
+ * recover after the wake. Leave the bus for the sleep, as dwc3's own system suspend does
+ * (dwc3_gadget_suspend()), and connect again after it. A deep sleep stops the controller.
+ * The gadget stays registered meanwhile: role changes are deferred from the moment a sleep
+ * is admitted until its start work has connected the gadget again and published IDLE, and
+ * the teardown paths cancel both works before they exit the role.
+ */
+static struct usb_gadget *dwc3_apple_sleep_gadget(struct dwc3_apple *appledwc)
+{
+	lockdep_assert_held(&appledwc->lock);
+	if (!IS_ENABLED(CONFIG_USB_DWC3_GADGET) && !IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE))
+		return NULL;
+	if (appledwc->state != DWC3_APPLE_DEVICE || !appledwc->core_active ||
+	    !appledwc->dwc.gadget_driver)
+		return NULL;
+	return appledwc->dwc.gadget;
+}
+
+/*
+ * Called without the glue lock: dwc3_gadget_exit() takes the gadget's device lock under it.
+ * The PM core prepares the gadget, a child of the controller, only after the controller's
+ * prepare has waited for this work, so its device lock is not held by the sleep here.
+ */
+static void dwc3_apple_sleep_gadget_off(struct dwc3_apple *appledwc, struct usb_gadget *gadget)
+{
+	bool off = false;
+
+	/* Soft-connect writes and function driver (un)binding hold the gadget's device lock. */
+	device_lock(&gadget->dev);
+	if (gadget->connected)
+		off = !usb_gadget_disconnect(gadget);
+	device_unlock(&gadget->dev);
+	if (!off)
+		return;
+	scoped_guard(mutex, &appledwc->lock)
+		appledwc->sleep_gadget_off = true;
+	dev_dbg(appledwc->dev, "USB device off its host for suspend-to-idle\n");
+}
+
+/* The gadget this sleep took off its host, if the role it ran in is still there. */
+static struct usb_gadget *dwc3_apple_sleep_gadget_back(struct dwc3_apple *appledwc)
+{
+	lockdep_assert_held(&appledwc->lock);
+	if (!appledwc->sleep_gadget_off)
+		return NULL;
+	appledwc->sleep_gadget_off = false;
+	if (appledwc->shutting_down || appledwc->state != DWC3_APPLE_DEVICE ||
+	    !appledwc->core_active || !appledwc->dwc.gadget_driver)
+		return NULL;
+	return appledwc->dwc.gadget;
+}
+
 static int dwc3_apple_sleep_prepare_work(struct dwc3_apple *appledwc)
 {
-	bool in_place;
+	struct usb_gadget *gadget = NULL;
+	bool in_place = false, s2idle;
 	int ret;
 
 	/* A restart left to the work after the last router sleep ends first. */
@@ -1894,12 +1954,22 @@ static int dwc3_apple_sleep_prepare_work(struct dwc3_apple *appledwc)
 		ret = dwc3_apple_sleep_start(appledwc);
 		if (ret)
 			return ret;
-		if (!appledwc->sleep_deep)
-			return 0;
-		in_place = appledwc->fixed_hub && appledwc->state == DWC3_APPLE_HOST;
-		/* A J714s host on a USB4 router's USB3 tunnel stays up for its router's sleep. */
-		if (!in_place && appledwc->state == DWC3_APPLE_HOST && dwc3_apple_tunnel_keep(appledwc))
-			return 0;
+		/* Suspend-to-idle keeps the controller started: only a gadget leaves its host. */
+		s2idle = !appledwc->sleep_deep;
+		if (s2idle) {
+			gadget = dwc3_apple_sleep_gadget(appledwc);
+		} else {
+			in_place = appledwc->fixed_hub && appledwc->state == DWC3_APPLE_HOST;
+			/* A J714s host on a USB4 router's USB3 tunnel stays up for its sleep. */
+			if (!in_place && appledwc->state == DWC3_APPLE_HOST &&
+			    dwc3_apple_tunnel_keep(appledwc))
+				return 0;
+		}
+	}
+	if (s2idle) {
+		if (gadget)
+			dwc3_apple_sleep_gadget_off(appledwc, gadget);
+		return 0;
 	}
 	/* This only records a PHY sleep token; its hardware work runs at noirq. */
 	in_place = in_place && !apple_atcphy_sleep_prepare(appledwc->usb2_phy);
@@ -1928,12 +1998,51 @@ static void dwc3_apple_sleep_stop_work(struct work_struct *work)
 	complete(&appledwc->sleep_stop_done);
 }
 
+/* A role change deferred by the sleep, applied once the controller is back. */
+static int dwc3_apple_sleep_role(struct dwc3_apple *appledwc)
+{
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+	if (appledwc->shutting_down || !appledwc->sleep_role_pending)
+		return 0;
+	if (appledwc->sleep_role == appledwc->state && appledwc->core_active &&
+	    !appledwc->core_exit_pending && !appledwc->sleep_stopped && !appledwc->sleep_dead) {
+		/* The latest request still matches the live role. */
+		appledwc->sleep_role_pending = false;
+		return 0;
+	}
+	ret = dwc3_apple_sleep_stop(appledwc);
+	dwc3_apple_sleep_take_role(appledwc);
+	if (!ret)
+		ret = dwc3_apple_sleep_start(appledwc);
+	return ret;
+}
+
+/* Ends the sleep's epoch: role changes apply directly again once IDLE is published. */
+static void dwc3_apple_sleep_idle(struct dwc3_apple *appledwc, bool finish, bool kept)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&appledwc->lock);
+	/* A failed exit must retain power for all remaining PHY/reset ownership. */
+	dwc3_apple_syscore(appledwc, appledwc->core_active || appledwc->reset_pending);
+	/* Publish IDLE with the role lock held, after queuing the PHY's finish. */
+	if (finish)
+		apple_atcphy_sleep_finish_async(appledwc->usb2_phy, kept);
+	spin_lock_irqsave(&appledwc->sleep_pm_lock, flags);
+	if (appledwc->sleep_phase != DWC3_APPLE_SLEEP_REMOVING)
+		appledwc->sleep_phase = DWC3_APPLE_SLEEP_IDLE;
+	spin_unlock_irqrestore(&appledwc->sleep_pm_lock, flags);
+	dwc3_apple_check_hub_later(appledwc);
+}
+
 static void dwc3_apple_sleep_start_work(struct work_struct *work)
 {
 	struct dwc3_apple *appledwc = container_of(to_delayed_work(work), struct dwc3_apple,
 						   sleep_start_work);
+	struct usb_gadget *gadget;
 	bool finish = false, kept = false;
-	unsigned long flags;
 	int ret = 0;
 
 	/* May still need notifier unregister: never joined by a notifier callback. */
@@ -1956,29 +2065,25 @@ static void dwc3_apple_sleep_start_work(struct work_struct *work)
 			else
 				ret = dwc3_apple_sleep_start(appledwc);
 		}
-		if (!ret && !appledwc->shutting_down && appledwc->sleep_role_pending) {
-			if (appledwc->sleep_role == appledwc->state && appledwc->core_active &&
-			    !appledwc->core_exit_pending && !appledwc->sleep_stopped &&
-			    !appledwc->sleep_dead) {
-				/* The latest request still matches the live role. */
-				appledwc->sleep_role_pending = false;
-			} else {
-				ret = dwc3_apple_sleep_stop(appledwc);
-				dwc3_apple_sleep_take_role(appledwc);
-				if (!ret)
-					ret = dwc3_apple_sleep_start(appledwc);
-			}
-		}
-		/* A failed exit must retain power for all remaining PHY/reset ownership. */
-		dwc3_apple_syscore(appledwc, appledwc->core_active || appledwc->reset_pending);
-		/* Publish IDLE with the role lock held, after queuing the PHY's finish. */
-		if (finish)
-			apple_atcphy_sleep_finish_async(appledwc->usb2_phy, kept);
-		spin_lock_irqsave(&appledwc->sleep_pm_lock, flags);
-		if (appledwc->sleep_phase != DWC3_APPLE_SLEEP_REMOVING)
-			appledwc->sleep_phase = DWC3_APPLE_SLEEP_IDLE;
-		spin_unlock_irqrestore(&appledwc->sleep_pm_lock, flags);
-		dwc3_apple_check_hub_later(appledwc);
+		if (!ret)
+			ret = dwc3_apple_sleep_role(appledwc);
+		/*
+		 * Connect a gadget again before IDLE is published: until then role changes stay
+		 * deferred, so it is not torn down under the connect, and no new sleep is admitted
+		 * before it is back on the bus.
+		 */
+		gadget = dwc3_apple_sleep_gadget_back(appledwc);
+		if (!gadget)
+			dwc3_apple_sleep_idle(appledwc, finish, kept);
+	}
+	if (gadget) {
+		if (usb_gadget_connect(gadget))
+			dev_warn(appledwc->dev, "USB device not connected again after suspend-to-idle\n");
+		guard(mutex)(&appledwc->lock);
+		/* A role change requested during the connect. */
+		if (!ret)
+			ret = dwc3_apple_sleep_role(appledwc);
+		dwc3_apple_sleep_idle(appledwc, finish, kept);
 	}
 	if (ret)
 		dev_err(appledwc->dev, "USB host recovery failed: %d\n", ret);

@@ -880,7 +880,7 @@ struct dwc3_apple {
     struct dwc3 dwc; struct device *dev; void *mmio_resource,*reset,*usb2_phy;
     int lock,state; bool core_active,core_exit_pending,reset_pending,shutting_down,fixed_hub;
     unsigned usb2_power_off_pending,usb3_power_off_pending,hub_port;
-    bool host_only,idle_rpm,rpm_held,dt_dis_u3_susphy,sleep_ddr,sleep_in_place;
+    bool host_only,idle_rpm,rpm_held,dt_dis_u3_susphy,sleep_ddr,sleep_in_place,sleep_gadget_off;
     int sleep_pm_lock,sleep_start_work,sleep_stop_work,hub_check;
 };
 #define to_dwc3_apple(d) ((struct dwc3_apple *)(d))

@@ -508,7 +508,7 @@ SUITES = [
 APPLE_TESTS = ['aop-las.py', 'aop-motion.py', 'atc-t8132-usb3.py', 'bcm4377-dma-window.py',
                'bcm4377-radio-sids.py', 'bcm4377-rti-address.py', 'bcm4377-state-wait.py',
                'centauri-t6050-probe.py', 'dart-s2idle-retention.py', 'dwc3-initial-role.py',
-               'macsmc-j713.py', 'pmgr-inherited.py', 'sn201202x-transport.py']
+               'dwc3-sleep-gadget.py', 'macsmc-j713.py', 'pmgr-inherited.py', 'sn201202x-transport.py']
 APPLE_HARDWARE = ['j616s-parity.py', 'sep-ioctl-fuzz.py']
 
 
