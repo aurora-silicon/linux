@@ -61,7 +61,8 @@ enum brcmf_bus_state { BRCMF_BUS_DOWN, BRCMF_BUS_UP };
 /* STOP_REASONS */
 struct net_device { bool stopped; unsigned drains, wakes; };
 struct brcmf_pub;
-struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg80211_vif *next; };
+struct wireless_dev { int iftype; };
+struct brcmf_cfg80211_vif { unsigned long sme_state; struct wireless_dev wdev; struct brcmf_cfg80211_vif *next; };
 struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct net_device *ndev;
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
@@ -189,7 +190,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev);
 CALLBACK_STUBS = r'''
 #define BRCMF_FEAT_WOWL_ARP_ND 1
 #define BRCMF_FEAT_PNO 2
-#define BRCMF_C_SET_PM 1
+#define NL80211_IFTYPE_STATION 2
+#define NL80211_IFTYPE_AP 3
+enum { BRCMF_C_GET_PM, BRCMF_C_DOWN, BRCMF_C_UP, BRCMF_C_SET_PM };
 #define BRCMF_E_PFN_NET_FOUND 1
 #define BRCMF_SCAN_STATUS_BUSY 1
 #define BRCMF_VIF_STATUS_READY 2
@@ -201,7 +204,7 @@ struct cfg80211_wowlan {bool any, magic_pkt;};
 #define BRCMF_FEAT_LPAS 4
 #define GFP_KERNEL 0
 static unsigned lpas_restores, wake_reports;
-static void cfg80211_report_wowlan_wakeup(int *w,void *i,int g) {(void)w;(void)i;(void)g;wake_reports++;}
+static void cfg80211_report_wowlan_wakeup(struct wireless_dev *w,void *i,int g) {(void)w;(void)i;(void)g;wake_reports++;}
 static int brcmf_configure_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
 static int brcmf_restore_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i) {
  (void)i;assert(bus.state==BRCMF_BUS_UP);lpas_restores++;c->wowl.lpas=c->wowl.active=false;return failure==4?-EIO:0;
@@ -216,7 +219,25 @@ static void brcmf_report_wowl_wakeind(struct wiphy *w,struct brcmf_if *i) {(void
 static void brcmf_fil_iovar_int_set(struct brcmf_if *i,const char *s,int n) {(void)i;(void)s;(void)n;can_command();}
 static void brcmf_config_wowl_pattern(struct brcmf_if *i,const char *s,void *p,int n,void *q,int t) {(void)i;(void)s;(void)p;(void)n;(void)q;(void)t;can_command();}
 static void brcmf_configure_arp_nd_offload(struct brcmf_if *i,bool b) {(void)i;(void)b;can_command();}
-static void brcmf_fil_cmd_int_set(struct brcmf_if *i,int c,int n) {(void)i;(void)c;(void)n;can_command();}
+static int reinit_step, fail_step, configured_pm;
+static int observe_reinit(struct brcmf_if *ifp_arg, int cmd) {
+ assert(ifp_arg == &ifp[0] && bus.state == BRCMF_BUS_UP);
+ assert(devinfo.ready && devinfo.intr && cfg.suspended);
+ assert(cmd == reinit_step);
+ return ++reinit_step == fail_step ? -EIO : 0;
+}
+static int brcmf_fil_cmd_int_get(struct brcmf_if *i, int cmd, u32 *value) {
+ *value = configured_pm;
+ return observe_reinit(i, cmd);
+}
+static int brcmf_fil_cmd_int_set(struct brcmf_if *i, int cmd, int value) {
+ if (cfg.wowl.active) {
+  can_command();
+  return 0;
+ }
+ assert(value == (cmd == BRCMF_C_SET_PM ? configured_pm : 1));
+ return observe_reinit(i, cmd);
+}
 static void brcmf_cfg80211_sched_scan_stop(struct wiphy *w,struct net_device *n,int i) {(void)w;(void)n;(void)i;can_command();}
 static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 #define brcmf_fweh_register(p,e,f) ((void)(p),(void)(e))
@@ -251,6 +272,35 @@ static void hint(const char *a) {
 }
 int main(void) {
  unsigned cases=0;
+ /* Non-WoW station resume reinitializes wireless state while preserving PM. */
+ for (int fail = 0; fail <= 4; fail++) {
+  struct brcmf_cfg80211_vif vif = {
+   .sme_state = BIT(BRCMF_VIF_STATUS_READY),
+   .wdev.iftype = NL80211_IFTYPE_STATION,
+  };
+  reset();
+  ifp[0].vif = &vif;
+  reinit_step = 0;
+  fail_step = fail;
+  configured_pm = 2;
+  cfg.suspended = true;
+  assert(brcmf_cfg80211_resume(&wiphy) == (fail ? -EIO : 0));
+  assert(reinit_step == (fail ? fail : 4) && !cfg.suspended);
+  cases++;
+ }
+ /* Non-station or not-ready VIF skips non-WoW resume reinitialization. */
+ for (int ap = 0; ap < 2; ap++) {
+  struct brcmf_cfg80211_vif vif = {
+   .sme_state = ap ? BIT(BRCMF_VIF_STATUS_READY) : 0,
+   .wdev.iftype = ap ? NL80211_IFTYPE_AP : NL80211_IFTYPE_STATION,
+  };
+  reset();
+  ifp[0].vif = &vif;
+  reinit_step = fail_step = 0;
+  cfg.suspended = true;
+  assert(!brcmf_cfg80211_resume(&wiphy) && !reinit_step && !cfg.suspended);
+  cases++;
+ }
 for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
  reset();vif_up=up;
  assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended);
@@ -394,7 +444,7 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=['country-gate', 'queue-reasons', 'worker-gate',
                                               'resume-order', 'tx-drain', 'lpas-resume',
-                                              's2idle-d3', 'wowl-s2idle-only'])
+                                              's2idle-d3', 'wowl-s2idle-only', 'restore-pm'])
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text()
                for name in ('cfg80211', 'core', 'pcie', 'msgbuf')}
@@ -425,6 +475,8 @@ def main():
     elif args.mutation == 'lpas-resume':
         body = body.replace('err = brcmf_restore_lpas(cfg, ifp);\n\t\t\tgoto out;',
                             'return brcmf_restore_lpas(cfg, ifp);')
+    elif args.mutation == 'restore-pm':
+        body = body.replace('BRCMF_C_SET_PM, pm_mode)', 'BRCMF_C_SET_PM, 0)')
     elif args.mutation == 's2idle-d3':
         body = body.replace('if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)',
                             'if (false)')

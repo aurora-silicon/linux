@@ -5178,6 +5178,24 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 					    brcmf_notify_sched_scan_results);
 			cfg->wowl.nd_enabled = false;
 		}
+	} else if (ifp->vif &&
+		   ifp->vif->wdev.iftype == NL80211_IFTYPE_STATION &&
+		   test_bit(BRCMF_VIF_STATUS_READY, &ifp->vif->sme_state)) {
+		u32 pm_mode;
+
+		/* Keep the configured power mode across wireless reinitialization. */
+		err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM, &pm_mode);
+		if (err)
+			goto out;
+		err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_DOWN, 1);
+		if (err)
+			goto out;
+		err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_UP, 1);
+		if (err)
+			goto out;
+		err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, pm_mode);
+		brcmf_dbg(CONN, "wireless reinit pm=%u result=%d\n", pm_mode,
+			  err);
 	}
 out:
 	cfg->suspended = false;
