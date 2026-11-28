@@ -350,6 +350,8 @@ typedef uint32_t u32;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define SCAN_PASSIVE_DWELL_MS 110
+#define SCAN_LISTEN_MS 110
+#define SCAN_STATUS_INVALID_HANDLE 342
 #define msecs_to_jiffies(x) ((unsigned long)(x))
 #define time_before(a, b) ((long)((a) - (b)) < 0)
 #define time_after(a, b) time_before(b, a)
@@ -357,11 +359,11 @@ typedef uint32_t u32;
 #define min_t(type, x, y) ((type)(x) < (type)(y) ? (type)(x) : (type)(y))
 #define container_of(ptr, type, member) \
 	((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
-static void dev_warn(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
-static void dev_info(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
+static inline void put_unaligned_le16(u16 v, void *p) { memcpy(p, &v, 2); }
 static void dev_dbg(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
 
-static const u8 five_ghz[25] = { 0 };
+struct centauri_board { bool scan_tlvs; };
+static const struct centauri_board *centauri_board(void) { return NULL; }
 
 struct device { int dummy; };
 struct pci_dev { struct device dev; };
@@ -376,10 +378,16 @@ struct centauri_wifi {
 	struct cfg80211_scan_request *scan_request;
 	bool scan_abort;
 	int lock;
+	u8 scan_sequence;
 	u16 reply_status;
 	u32 channels_seen, scans_done, beacons_seen;
 	bool stopping, transport_paused;
 };
+static int run_scan_tlvs(struct centauri_wifi *w, struct cfg80211_scan_request *r)
+{
+	(void)w; (void)r;
+	return 0;
+}
 
 static unsigned long jiffies;
 static unsigned int scan_commands, stop_commands, sleep_calls, drains_seen;
@@ -398,11 +406,6 @@ static unsigned int recovery_requests;
 static void centauri_recovery_request(struct centauri *c, const char *why)
 {
 	(void)c; (void)why; recovery_requests++;
-}
-static size_t build_scan(struct centauri_wifi *w, unsigned int c, u8 *b)
-{
-	(void)w; (void)c; (void)b;
-	return 14;
 }
 static void cfg80211_scan_done(struct cfg80211_scan_request *r,
 			       struct cfg80211_scan_info *info)
@@ -746,6 +749,7 @@ def main():
             "scan_transport_stopped",
             "scan_wait_stop",
             "scan_stop_chunk",
+            "run_scan_legacy",
             "scan_worker",
         )
     )
