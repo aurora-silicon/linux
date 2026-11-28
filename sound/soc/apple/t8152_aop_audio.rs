@@ -898,7 +898,7 @@ impl T8152AopAudio {
     fn set_power(&self, svc: &Service, state: u32) -> Result<()> {
         let req = PowerRequest {
             dev_id: svc.dev_id,
-            sequence: svc.sequence.fetch_add(1, Relaxed) + 1,
+            sequence: svc.sequence.fetch_add(1, Relaxed).wrapping_add(1),
             timestamp: aop_timestamp(),
             state,
             ..Default::default()
