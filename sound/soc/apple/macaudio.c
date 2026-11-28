@@ -300,6 +300,12 @@ struct macaudio_snd_data {
 	 * without spk_mutex (macaudio_pm_notify()), cleared under it.
 	 */
 	bool pm_quiesced;
+	/*
+	 * System sleeps begun since bind ("Speaker Protection Sleeps"): bumped
+	 * at PM_SUSPEND_PREPARE / PM_HIBERNATION_PREPARE, before any task
+	 * freezes, aborted sleeps included. READ_ONCE/WRITE_ONCE, no lock.
+	 */
+	unsigned int pm_sleeps;
 	/* The card is being removed: no grant, no amp access */
 	bool spk_dead;
 	/*
@@ -1584,7 +1590,9 @@ static int macaudio_spk_init(struct macaudio_snd_data *ma)
  *
  * The owner was frozen with the rest of userspace, so the state of its
  * engine is unknown: its first write after the resume fails with
- * -ETIMEDOUT, as after any stall, and the one after it grants.
+ * -ETIMEDOUT, as after any stall, and the one after it grants. The sleep
+ * is counted first ("Speaker Protection Sleeps"), so the owner can tell
+ * this lapse from a stall.
  */
 static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 			      void *data)
@@ -1600,6 +1608,12 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		/*
+		 * Counted first: the owner reads the count after the thaw and
+		 * must see this sleep whatever else the chain does (see
+		 * macaudio_spk_sleeps_get()).
+		 */
+		WRITE_ONCE(ma->pm_sleeps, READ_ONCE(ma->pm_sleeps) + 1);
 		/*
 		 * Before anything that can wait, spk_mutex included: a writer
 		 * that holds it may be stuck behind the sleep itself. No grant
@@ -3984,6 +3998,39 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 /* The speaker controls go last: a card without speakers drops them. */
 #define MACAUDIO_NUM_SPEAKER_CONTROLS 4
 
+/*
+ * "Speaker Protection Sleeps": how many system sleeps have begun since the
+ * card bound, read-only, wrapping at INT_MAX.
+ *
+ * A lease that a sleep ends and one whose owner stalled both fail the
+ * owner's next write with -ETIMEDOUT, and the suspend counters userspace
+ * can read move only after the thaw and the PM_POST_SUSPEND chain, with no
+ * bound on how long after. This count moves at PM_SUSPEND_PREPARE, before
+ * the freezer, so by the time the owner runs again it has moved for every
+ * sleep that began, an aborted one too. An owner that reads it before a
+ * renewal and again at a lapse knows the lapse was a stall when it has not
+ * changed. Only equality is meaningful.
+ */
+static int macaudio_spk_sleeps_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = INT_MAX;
+	return 0;
+}
+
+static int macaudio_spk_sleeps_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	uvalue->value.integer.value[0] = READ_ONCE(ma->pm_sleeps) & INT_MAX;
+	return 0;
+}
+
 static const struct snd_kcontrol_new macaudio_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Speaker"),
 	SOC_DAPM_PIN_SWITCH("Headphone"),
@@ -4019,6 +4066,14 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.name = "Speaker Protection Interface",
 		.info = macaudio_spk_iface_info,
 		.put = macaudio_spk_iface_put, .get = macaudio_spk_iface_get,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = SNDRV_CTL_ELEM_ACCESS_READ |
+			SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.name = "Speaker Protection Sleeps",
+		.info = macaudio_spk_sleeps_info,
+		.get = macaudio_spk_sleeps_get,
 	},
 };
 
