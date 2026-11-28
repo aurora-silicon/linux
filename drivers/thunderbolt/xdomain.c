@@ -17,6 +17,7 @@
 #include <linux/utsname.h>
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
+#include <kunit/visibility.h>
 
 #include "tb.h"
 
@@ -759,6 +760,26 @@ static void stop_handshake(struct tb_xdomain *xd)
 	__stop_handshake(xd);
 }
 
+/*
+ * The XDomain discovery requests answered while the control channel is kept
+ * through s2idle (tb->noirq_ctl_retained). They change no state: UUID and
+ * properties are answered from memory, and LINK_STATE_STATUS_REQUEST reads
+ * the downstream port's registers, under tb->lock, from a host router that
+ * stays powered (QUIRK_NO_SYSTEM_SLEEP).
+ */
+VISIBLE_IF_KUNIT bool tb_xdp_noirq_request(enum tb_xdp_type type)
+{
+	switch (type) {
+	case UUID_REQUEST_OLD:
+	case UUID_REQUEST:
+	case PROPERTIES_REQUEST:
+	case LINK_STATE_STATUS_REQUEST:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void tb_xdp_handle_request(struct work_struct *work)
 {
 	struct xdomain_request_work *xw = container_of(work, typeof(*xw), work);
@@ -777,19 +798,28 @@ static void tb_xdp_handle_request(struct work_struct *work)
 	sequence = xhdr->length_sn & TB_XDOMAIN_SN_MASK;
 	sequence >>= TB_XDOMAIN_SN_SHIFT;
 
+	/*
+	 * Handle the request under tb->lock. tb_domain_suspend_noirq() and
+	 * tb_domain_resume_noirq() set and clear noirq_ctl_retained under it,
+	 * so a request queued before the control channel was retained cannot
+	 * run a non-discovery request (or touch a port) during noirq, and the
+	 * port read below cannot overlap the domain's suspend or resume.
+	 */
 	mutex_lock(&tb->lock);
 	if (tb->root_switch)
 		uuid = kmemdup(tb->root_switch->uuid, sizeof(*uuid), GFP_KERNEL);
 	else
 		uuid = NULL;
-	mutex_unlock(&tb->lock);
 
-	if (!uuid) {
+	if (!uuid || (READ_ONCE(tb->noirq_ctl_retained) &&
+		      !tb_xdp_noirq_request(pkg->type))) {
 		tb_xdp_error_response(ctl, route, sequence, ERROR_NOT_READY);
+		mutex_unlock(&tb->lock);
 		goto out;
 	}
 
-	xd = tb_xdomain_find_by_route_locked(tb, route);
+	/* tb->lock is held: the _locked helper would take it again. */
+	xd = tb_xdomain_find_by_route(tb, route);
 	if (xd)
 		update_property_block(xd);
 
@@ -831,7 +861,8 @@ static void tb_xdp_handle_request(struct work_struct *work)
 		 * timing out, we will restart the handshake now that we
 		 * received UUID request from the remote host.
 		 */
-		if (!ret && xd && xd->state == XDOMAIN_STATE_ERROR) {
+		if (!READ_ONCE(tb->noirq_ctl_retained) && !ret && xd &&
+		    xd->state == XDOMAIN_STATE_ERROR) {
 			mutex_lock(&xd->lock);
 			if (!xd->removing) {
 				dev_dbg(&xd->dev, "restarting handshake\n");
@@ -925,6 +956,7 @@ static void tb_xdp_handle_request(struct work_struct *work)
 	}
 
 	tb_xdomain_put(xd);
+	mutex_unlock(&tb->lock);
 
 	if (ret) {
 		tb_warn(tb, "failed to send XDomain response for %#x\n",
@@ -2665,6 +2697,14 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
 		return true;
 	if (length < sizeof(*hdr) / 4 - sizeof(hdr->xd_hdr) / 4)
 		return true;
+
+	if (READ_ONCE(tb->noirq_ctl_retained)) {
+		if (type != TB_CFG_PKG_XDOMAIN_REQ || !uuid_equal(&hdr->uuid, &tb_xdp_uuid))
+			return true;
+		if (!tb_xdp_noirq_request(hdr->type))
+			return true;
+		tb_dbg(tb, "XDomain discovery request %#x during s2idle\n", hdr->type);
+	}
 
 	/*
 	 * Handle XDomain discovery protocol packets directly here. For

@@ -24,9 +24,7 @@ static ssize_t peer_setup_test_store(struct device *dev,
 				    struct device_attribute *attr,
 				    const char *buf, size_t count)
 {
-	static const struct dcp_method_entry method = {
-		.name = "setup_peer_dcp", .tag = {'A', '3', '6', '6'},
-	};
+	struct dcp_method_entry method = { .name = "setup_peer_dcp" };
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct dcp_peer_probe_wait *wait;
 	__le32 enabled = cpu_to_le32(1);
@@ -54,6 +52,11 @@ static ssize_t peer_setup_test_store(struct device *dev,
 		    dcp->ch_oobasync.depth) {
 			kref_put(&wait->refs, dcp_peer_probe_free);
 			return -EBUSY;
+		}
+		ret = iomfb_v27_tag(dcp->v27_methods, "A366", method.tag);
+		if (ret) {
+			kref_put(&wait->refs, dcp_peer_probe_free);
+			return ret;
 		}
 		kref_get(&wait->refs);
 		/* Peer-DCP setup (one bool argument): four input

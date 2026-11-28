@@ -4,12 +4,14 @@
  * unrouted DCP; it never replaces a physical route.
  */
 /*
- * The platform limit on merged modes (dcp_fabric_merged_fits()) holds on the
- * board it has run on, for the J714s's T6050 external display processors.
+ * The platform limit on merged modes (dcp_fabric_merged_fits()) holds for the
+ * external display processors whose node says so (apple,merged-mode-limit).
  */
 static bool dcp_peer_limit_applies(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp_j714s_ext(dcp->dev);
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	       of_property_read_bool(dcp->dev->of_node, "apple,merged-mode-limit");
 }
 
 /*
@@ -64,8 +66,7 @@ void dcp_peer_limit_update_v27(struct drm_device *drm)
 	unsigned int n = 0, i;
 	struct drm_crtc *crtc;
 
-	/* Neither a board without the limit nor a device without CRTCs. */
-	if (!of_machine_is_compatible("apple,j714s") || !drm->mode_config.num_crtc)
+	if (!drm->mode_config.num_crtc)
 		return;
 	scoped_guard(mutex, &dcp_peer_lock) {
 		drm_for_each_crtc(crtc, drm) {

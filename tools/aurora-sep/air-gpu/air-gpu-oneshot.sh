@@ -91,8 +91,11 @@ BLI_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 UBOOT_GUID=b2ac5fc9-92b7-4acd-aeac-11e818c3130c
 GLOBAL_GUID=8be4df61-93ca-11d2-aa0d-00e098032b8c
 # Omarchy's Limine tools take one of these before they touch the EFI partition (newer ones the
-# first, older ones the second); maclab takes both in this order, and so does this script.
-LOCKS="/run/lock/boot-partition.lock /tmp/limine-global.lock"
+# first, older ones the second); maclab takes both in this order, and so does this script. The
+# second is in world-writable /tmp, where any user could make or hold it first: it is created if
+# missing, and anything there that is not root's own regular file makes the script refuse.
+LOCKS="/run/lock/boot-partition.lock"
+COMPAT_LOCKS="/tmp/limine-global.lock"
 STATE_DIR=/var/lib/air-gpu
 # limine-entry-tool's settings; ENABLE_ENROLL_LIMINE_CONFIG=yes there makes Limine check a hash
 # of limine.conf enrolled into its EFI binary, so an edited limine.conf would not boot.
@@ -303,6 +306,42 @@ take_locks() {
     fi
     LOCK_FDS+=("$fd")
   done
+  for l in $COMPAT_LOCKS; do
+    if ! open_compat_lock "$l"; then
+      release_locks
+      refuse "$l is not root's own lock file (a link, another user's file or not a regular file); remove it and retry."
+    fi
+    fd=$COMPAT_FD
+    if ! flock -w 5 "$fd"; then
+      release_locks
+      refuse "$l is held by another tool (limine-snapper-sync?); try again in a moment."
+    fi
+    LOCK_FDS+=("$fd")
+  done
+}
+# Open the compatibility lock into COMPAT_FD; fails (and the caller refuses) unless it ends up
+# a regular file owned by this user (root) at that very path. A missing one is created with
+# noclobber, which opens with O_EXCL and so never follows a link. The test before the open
+# keeps a FIFO or another user's file from being opened at all; in sticky /tmp nobody else can
+# replace root's own file afterwards. The open descriptor is checked again (owner, type, and
+# the path's own inode, so not a link's target).
+COMPAT_FD=
+open_compat_lock() {
+  local l=$1 fd owner inode type
+  COMPAT_FD=
+  [[ -e $l || -L $l ]] || (umask 077; set -C; : >"$l") 2>/dev/null || true
+  [[ -f $l && ! -L $l && -O $l ]] || return 1
+  # In braces: a redirection on exec itself would stay on the script's stderr.
+  { exec {fd}<"$l"; } 2>/dev/null || return 1
+  # stat inherits the descriptor: /proc/self/fd/N is the file that was opened.
+  read -r owner inode type < <(stat -L -c '%u %d:%i %F' "/proc/self/fd/$fd" 2>/dev/null) || true
+  if [[ $owner == "$EUID" && $type == regular* &&
+        $inode == "$(stat -c '%d:%i' "$l" 2>/dev/null)" ]]; then
+    COMPAT_FD=$fd
+    return 0
+  fi
+  exec {fd}<&-
+  return 1
 }
 LOCK_FDS=()
 release_locks() {

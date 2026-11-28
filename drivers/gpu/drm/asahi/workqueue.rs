@@ -117,20 +117,23 @@ pub(crate) type RetainedObject = KBox<dyn Any + Send>;
 /// queues of the owning queue.
 const CONTEXT_RETAINED_OBJECTS: usize = 4;
 
-/// A dropped GPU context waiting for the firmware to invalidate it.
+/// A dropped GPU context waiting for invalidation. Its queue structures are then kept until the
+/// following firmware power-off boundary.
 pub(crate) struct RetiredContext {
     /// The context data named in the invalidation request.
     pub(crate) data: KBox<GpuObject<fw::workqueue::GpuContextData>>,
     /// Firmware structures of the context's queues. They must not be freed, and so must not be
-    /// reused, until the invalidation has completed.
+    /// reused, until firmware has powered off after the invalidation completed.
     pub(crate) retained: KVec<RetainedObject>,
 }
 
 /// A GPU context tracking structure, which must be explicitly invalidated when dropped.
 ///
-/// The firmware learns about the work queues of a context as they are run, and only forgets them
-/// when the context is invalidated. Their firmware structures are therefore handed to the context
-/// when their owner drops them, and freed after the invalidation.
+/// The firmware learns about the work queues of a context as they are run. Invalidation removes the
+/// context from firmware lookup, but data masters may retain queue references until they power off.
+/// The queue structures are therefore handed to the context when their owner drops them, and freed
+/// only after invalidation and a following firmware power-off report. The context data itself is
+/// freed right after the invalidation.
 pub(crate) struct GpuContext {
     dev: driver::AsahiDevice,
     data: Option<KBox<GpuObject<fw::workqueue::GpuContextData>>>,
@@ -557,6 +560,23 @@ impl Job::ver {
             return Err(EBUSY);
         }
 
+        // The done pointer is written by the firmware. One inside the slots this job is about to
+        // fill does not match our own count of pending commands: refuse the job rather than
+        // overwrite entries the firmware may still read.
+        // A done pointer outside the ring is no position at all: refuse it as well.
+        let doneptr = inner.doneptr();
+        if doneptr >= inner.size || ring_reaches_done(wptr, command_count, inner.size, doneptr) {
+            // Every refused job would log again; the first report is the useful one.
+            kernel::pr_err_once!(
+                "WorkQueue: firmware done pointer {} out of range or inside the {} slots after {} (ring size {})\n",
+                doneptr,
+                command_count,
+                wptr,
+                inner.size
+            );
+            return Err(EIO);
+        }
+
         inner.pending.reserve(command_count, GFP_KERNEL)?;
 
         inner.last_submitted = Some(self.event_info.value);
@@ -575,7 +595,6 @@ impl Job::ver {
             command.as_mut().inner_mut().set_wptr(wptr);
 
             let next_wptr = (wptr + 1) % inner.size;
-            assert!(inner.doneptr() != next_wptr);
             inner.info_mut().ring[wptr as usize] = command.inner.gpu_va().get();
             wptr = next_wptr;
 
@@ -1187,9 +1206,36 @@ impl WorkQueue for WorkQueue::ver {
     }
 }
 
+/// Returns whether writing `count` ring entries from `wptr` would move the write pointer onto
+/// `doneptr`, the firmware's done pointer, in a ring of `size` entries.
+fn ring_reaches_done(wptr: u32, count: usize, size: u32, doneptr: u32) -> bool {
+    let mut wptr = wptr;
+    for _ in 0..count {
+        wptr = (wptr + 1) % size;
+        if wptr == doneptr {
+            return true;
+        }
+    }
+    false
+}
+
 #[kunit_tests(asahi_legacy_inline_workqueue)]
 mod tests {
-    use super::can_submit_inline;
+    use super::{can_submit_inline, ring_reaches_done};
+
+    #[test]
+    fn done_pointer_inside_the_new_entries_is_refused() {
+        // Firmware caught up: done == wptr, the next entries are free.
+        assert!(!ring_reaches_done(5, 3, 8, 5));
+        // Done pointer in the slots the job would fill, including after the wrap.
+        assert!(ring_reaches_done(5, 3, 8, 6));
+        assert!(ring_reaches_done(5, 3, 8, 0));
+        assert!(!ring_reaches_done(5, 3, 8, 1));
+        // A done pointer outside the ring never matches here; submit() refuses it on its own
+        // (`doneptr >= size`) before asking.
+        assert!(!ring_reaches_done(5, 3, 8, 8));
+        assert!(!ring_reaches_done(5, 3, 8, u32::MAX));
+    }
 
     #[test]
     fn depth_192_stops_at_the_first_inflight_command() {

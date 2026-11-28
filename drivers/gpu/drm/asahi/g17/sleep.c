@@ -46,14 +46,13 @@
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 
-/* Only the M5 boards with a deep sleep need a wrapped provider translation here: the J714s
- * and the J716c. Other G17 clients retain their established direct-domain methods below.
+/* Only the M5 boards with a deep sleep need a wrapped provider translation here: those whose
+ * device tree describes it. Other G17 clients retain their established direct-domain methods
+ * below.
  */
 static bool asahi_g17_m5_provider(struct device *dev)
 {
-	return (of_machine_is_compatible("apple,j714s") ||
-		of_machine_is_compatible("apple,j716c")) &&
-	       of_machine_is_compatible("apple,t6050") &&
+	return apple_t6050_sleep_described() &&
 	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
 }
 
@@ -194,6 +193,24 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
+/*
+ * The node of the GPU's power state word. Where the GPU's first power domain is its PMP
+ * report entry (a small index for a reg, under the PMP), as in the J616C device tree the
+ * bring-up runs, the word is that entry's own domain.
+ */
+static struct device_node *asahi_g17_ps_node(struct device *dev)
+{
+	struct device_node *np, *next;
+
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry")) {
+		next = of_parse_phandle(np, "power-domains", 0);
+		of_node_put(np);
+		np = next;
+	}
+	return np;
+}
+
 static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 {
 	struct device_node *np;
@@ -213,7 +230,7 @@ static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 		of_node_put(np);
 		return ret;
 	}
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	np = asahi_g17_ps_node(dev);
 	if (!np)
 		return -EINVAL;
 	ret = of_property_read_u32(np, "reg", offset);
@@ -363,7 +380,23 @@ struct asahi_g17_commit {
 	/* The domain at the start of the stop, and the raise to full power before any ASC access */
 	u32 entry;
 	int raise_ret;
+	/* Whether the stop raises the domain first (asahi_g17_commit_raises()) */
+	bool raise;
 };
+
+/*
+ * Whether the commit's stop raises the GPU's domain before it touches the coprocessor: on the
+ * SoCs the raise was made for, the T8142 (J815: the GPU gates itself between frames and its
+ * registers may not answer below full power). Elsewhere the stop goes straight
+ * to the idle poll, as before the raise. On the T8140 (J700) the domain reads its target on
+ * and nothing powered under automatic power at the commit (0x1000230f); a raise from there
+ * times out with BUSY latched, the PMP's AP IDLE then goes unanswered, the sleep takes the
+ * deep path and the PMP and GPU firmware don't come back from it.
+ */
+static bool asahi_g17_commit_raises(struct device *dev)
+{
+	return of_device_is_compatible(dev->of_node, "apple,agx-t8142");
+}
 
 /*
  * down() at the commit, every refusal behind it: both instances idled by polling, mailboxes
@@ -384,15 +417,18 @@ static int asahi_g17_commit_stop(void *data)
 	 * domain read 0x244 (actual 4, J815 boot 12505746): its coprocessor's and mailbox's
 	 * registers may not answer there, and with interrupts off a stalled read ends at WD2 (J815
 	 * boot 3c93d5a2: PMU note 0x44, the first commit stop). Bring it to full power first, as
-	 * asahi_g17_power_raise() does, and keep the word from before for the resume.
+	 * asahi_g17_power_raise() does, and keep the word from before for the resume. Only where
+	 * asahi_g17_commit_raises() says so.
 	 */
-	c->entry = readl(c->ps);
-	c->saved = c->entry;
-	if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
-		writel(asahi_g17_ps_on(c->dev, c->entry, c->entry), c->ps);
-		c->raise_ret = readl_poll_timeout_atomic(c->ps, val,
-							 FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
-							 10, PS_TIMEOUT_US);
+	if (c->raise) {
+		c->entry = readl(c->ps);
+		c->saved = c->entry;
+		if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
+			writel(asahi_g17_ps_on(c->dev, c->entry, c->entry), c->ps);
+			c->raise_ret = readl_poll_timeout_atomic(c->ps, val,
+								 FIELD_GET(PS_ACTUAL, val) ==
+								 PS_ACTIVE, 10, PS_TIMEOUT_US);
+		}
 	}
 	apple_sleep_note_sub(2);
 	if (c->raise_ret) {
@@ -417,8 +453,14 @@ static int asahi_g17_commit_stop(void *data)
 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
 	apple_sleep_note_sub(5);
 
-	/* Off automatic management, still at full power, for the bridge. */
-	writel(readl(c->ps) & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	/*
+	 * Off automatic management, for the bridge (still at full power after a raise). Without
+	 * the raise, the word for the resume is the one found here, after the idle.
+	 */
+	val = readl(c->ps);
+	if (!c->raise)
+		c->saved = val;
+	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
 	if (c->bridge) {
 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
 			c->words[i] = readl(c->bridge + 4 * i);
@@ -574,6 +616,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 	c->rtk[1] = secondary_rtk;
 	c->mbox[1] = secondary_mbox;
 	c->count = secondary_rtk ? 2 : 1;
+	c->raise = asahi_g17_commit_raises(dev);
 
 	ret = -EOPNOTSUPP;
 	for (i = 0; i < c->count; i++) {
@@ -597,7 +640,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 		of_node_put(parent);
 		of_node_put(np);
 	} else {
-		np = of_parse_phandle(dev->of_node, "power-domains", 0);
+		np = asahi_g17_ps_node(dev);
 		if (!np)
 			goto err;
 		if (!of_property_read_u32(np, "reg", &offset) && np->parent)
@@ -663,6 +706,7 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 	c->dev = dev;
 	c->rtk[0] = rtk;
 	c->count = 1;
+	c->raise = asahi_g17_commit_raises(dev);
 
 	ret = -ENODEV;
 	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
@@ -704,8 +748,9 @@ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved)
 			c->idle_us[0], c->idle_us[1], c->status[0], c->status[1]);
 		dev_dbg(c->dev, "GPU at the commit: bridge %#x %#x gating %#x, domain %#x now %#x\n",
 			c->words[0], c->words[1], c->words[2], c->saved, c->lowered);
-		dev_info(c->dev, "GPU domain at the commit stop: %#x, raise to full %d\n",
-			 c->entry, c->raise_ret);
+		if (c->raise)
+			dev_info(c->dev, "GPU domain at the commit stop: %#x, raise to full %d\n",
+				 c->entry, c->raise_ret);
 		*saved = c->saved;
 	}
 	asahi_g17_commit_free(c);

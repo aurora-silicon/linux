@@ -61,6 +61,13 @@ static bool of_property_read_bool(const struct device_node *np, const char *name
 	return np && !strcmp(name, "apple,dp-alt-mode") && np->dp_alt_mode;
 }
 
+/* No J773g firmware-27.2 dcpext here: every T8132 dcpext is the M4 backend's. */
+static bool apple_t8132_dcpext_v27_2(const struct device_node *np)
+{
+	(void)np;
+	return false;
+}
+
 #define IS_ERR_OR_NULL(ptr) (!(ptr))
 struct phy { struct device dev; };
 struct mux_chip;

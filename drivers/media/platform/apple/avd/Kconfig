@@ -14,7 +14,9 @@ config VIDEO_APPLE_AVD
 	help
 	  Support the Apple Silicon stateless video decoder.
 
-	  Build the decoder firmware from https://github.com/aurora-silicon/avd-fw
+	  T8152 uses host submission and does not need a firmware image.
+
+	  For earlier SoCs, build the decoder firmware from https://github.com/aurora-silicon/avd-fw
 	  and install it under /lib/firmware/apple/. J700/T8140 uses the
 	  avd-fw-v5-t0.bin image. Firmware is supplied separately from this driver.
 

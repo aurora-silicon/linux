@@ -705,6 +705,309 @@ static void isp_test_call_size_capabilities(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->presets[8].output_dim.y, 1536);
 }
 
+static void isp_test_sensor_names(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	struct isp_format *fmt = isp_get_current_format(isp);
+
+	mutex_init(&isp->video_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(isp_setfiles); i++) {
+		KUNIT_ASSERT_NOT_NULL_MSG(test, isp_setfiles[i].sensor,
+					  "setfile %u", i);
+		KUNIT_EXPECT_NE_MSG(test, isp_setfiles[i].sensor[0], '\0',
+				    "setfile %u", i);
+	}
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX248_1820_01].sensor,
+			   "imx248");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX558_1925_03].sensor,
+			   "imx558");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_IMX958_2224_01].sensor,
+			   "imx958-uw");
+	KUNIT_EXPECT_STREQ(test, isp_setfiles[ISP_VD56G0_6221_01].sensor,
+			   "vd56g0");
+
+	KUNIT_EXPECT_NULL(test, apple_isp_sensor_name(isp));
+	fmt->id = ISP_IMX958_2224_01;
+	isp->camera_detected = true;
+	KUNIT_EXPECT_STREQ(test, apple_isp_sensor_name(isp), "imx958-uw");
+}
+
+static void isp_test_snf_flatten(u8 *snf)
+{
+	int k;
+
+	for (k = 0; k < SNF_POINTS; k++)
+		put_unaligned_le16(SNF_ONE, snf + 6 + 2 * k);
+}
+
+/*
+ * A synthetic setfile: a 1024x1024 shading frame of four 3x3 tables at
+ * 256-pixel steps, table t at (t + 1) x unity and twice that at the
+ * centre point, then the SNF section. Expected gains from a port of the
+ * computation: 16 / sum of the 16 interpolated gains, in Q12.
+ */
+static void isp_test_snf_radial(struct kunit *test)
+{
+	enum { GW = 3, GH = 3, LSC = 0x54 + 4 * GW * GH * 2,
+	       SNF = 6 + 2 * SNF_POINTS };
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	size_t len = 0x14 + 12 + LSC + 12 + SNF;
+	u8 *data = kunit_kzalloc(test, len, GFP_KERNEL);
+	u8 *lsc, *snf;
+	int t, k;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	lsc = data + 0x14 + 12;
+	snf = lsc + LSC + 12;
+	put_unaligned_le32(8 + LSC, lsc - 12);
+	put_unaligned_le32(0xc003, lsc - 4);
+	put_unaligned_le32(8 + SNF, snf - 12);
+	put_unaligned_le32(0xc404, snf - 4);
+	put_unaligned_le16(1024, lsc + 6);
+	put_unaligned_le16(1024, lsc + 8);
+	for (t = 0; t < 4; t++) {
+		u8 *rec = lsc + 0xa + 18 * t;
+
+		put_unaligned_le16(256, rec + 2);
+		put_unaligned_le16(256, rec + 4);
+		put_unaligned_le16(t * GW * GH, rec + 6);
+		put_unaligned_le16(GW, rec + 14);
+		put_unaligned_le16(GH, rec + 16);
+		for (k = 0; k < GW * GH; k++)
+			put_unaligned_le16(SNF_ONE * (t + 1) * (k == GW + 1 ? 2 : 1),
+					   lsc + 0x54 + 2 * (t * GW * GH + k));
+	}
+
+	/* The corners are 724 pixels out: 4-pixel radius steps reach them. */
+	put_unaligned_le16(7, snf + 4);
+	isp_test_snf_flatten(snf);
+	isp_setfile_snf_radial(isp, data, len, 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 4), 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6), 819);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6 + 2 * 128), 1509);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6 + 2 * 256), 1638);
+	for (k = 1; k < SNF_POINTS; k++)
+		KUNIT_EXPECT_LE(test, get_unaligned_le16(snf + 6 + 2 * (k - 1)),
+				get_unaligned_le16(snf + 6 + 2 * k));
+
+	/* A table that does not ship flat is the setfile's own: kept. */
+	isp_setfile_snf_radial(isp, data, len, -128);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6), 819);
+
+	/* A centre 128 pixels up moves the peak off the frame's centre. */
+	isp_test_snf_flatten(snf);
+	isp_setfile_snf_radial(isp, data, len, -128);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6), 936);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6 + 2 * 256), 1591);
+
+	/*
+	 * Tables whose size wraps 32 bits to 4 bytes (2 x 33025 x 65026),
+	 * which fits the section, or that do not cover the frame, keep the
+	 * gains there.
+	 */
+	isp_test_snf_flatten(snf);
+	put_unaligned_le16(33025, lsc + 0xa + 18 * 3 + 14);
+	put_unaligned_le16(65026, lsc + 0xa + 18 * 3 + 16);
+	isp_setfile_snf_radial(isp, data, len, 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6), SNF_ONE);
+	put_unaligned_le16(GW, lsc + 0xa + 18 * 3 + 14);
+	put_unaligned_le16(GH, lsc + 0xa + 18 * 3 + 16);
+	put_unaligned_le16(128, lsc + 0xa + 18 * 3 + 2);
+	isp_setfile_snf_radial(isp, data, len, 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(snf + 6), SNF_ONE);
+}
+
+/*
+ * Camera indicator, best-effort: the DCP set(true) is requested before the
+ * firmware stream, set(false) follows the stream and the watchdog, and the
+ * camera streams whether or not the indicator came up. The DCP set wrapper
+ * and the channel commands are stubbed; the real ones are never called.
+ */
+struct isp_test_indicator_trace {
+	unsigned int order;
+	unsigned int fw_start_at;
+	unsigned int fw_stop_at;
+	unsigned int set_on_at;
+	unsigned int set_off_at;
+	int fw_start_result;
+	int set_on_result;
+	struct platform_device *dcp_pdev;
+	unsigned int lookup_calls;
+};
+
+static int isp_test_indicator_set(struct device *dcp, bool on)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	if (on) {
+		trace->set_on_at = ++trace->order;
+		return trace->set_on_result;
+	}
+	trace->set_off_at = ++trace->order;
+	return 0;
+}
+
+static struct platform_device *isp_test_dcp_lookup(struct device_node *np)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	trace->lookup_calls++;
+	return trace->dcp_pdev;
+}
+
+static int isp_test_fw_start(struct apple_isp *isp, u32 chan)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	trace->fw_start_at = ++trace->order;
+	return trace->fw_start_result;
+}
+
+static int isp_test_fw_stop(struct apple_isp *isp, u32 chan)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	trace->fw_stop_at = ++trace->order;
+	return 0;
+}
+
+static int isp_test_fw_bufret(struct apple_isp *isp, u32 chan)
+{
+	return 0;
+}
+
+static struct apple_isp *isp_test_indicator_alloc(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+
+	isp->dcp = isp->dev;
+	return isp;
+}
+
+static void isp_test_indicator_set_fails_still_streams(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = { .set_on_result = -EIO };
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 0);
+}
+
+/*
+ * The DCP may probe after the ISP: it is looked up when a stream starts. A DCP
+ * that is not there yet means no indicator for that stream, and the next stream
+ * finds it. A bound DCP is not looked up again.
+ */
+static void isp_test_dcp_bound_at_stream_start(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+	struct device_node np = {};
+
+	isp->dcp = NULL;
+	isp->dcp_np = &np;
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_lookup, isp_test_dcp_lookup);
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+
+	/* The DCP has not probed: the stream runs without a dot. */
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.lookup_calls, 1);
+	KUNIT_EXPECT_NULL(test, isp->dcp);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 0);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 1);
+
+	/* It probed since: the next stream binds it and asks for the dot first. */
+	trace.dcp_pdev = kunit_kzalloc(test, sizeof(*trace.dcp_pdev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, trace.dcp_pdev);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.lookup_calls, 2);
+	KUNIT_EXPECT_PTR_EQ(test, isp->dcp, &trace.dcp_pdev->dev);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 3);
+
+	/* Bound: no further lookup. */
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.lookup_calls, 2);
+}
+
+static void isp_test_no_indicator_still_streams(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	isp->dcp = NULL;
+	test->priv = &trace;
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 0);
+}
+
+static void isp_test_indicator_on_precedes_stream(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+
+	kunit_activate_static_stub(test, isp_cmd_ch_stop, isp_test_fw_stop);
+	kunit_activate_static_stub(test, isp_cmd_ch_buffer_return,
+				   isp_test_fw_bufret);
+	isp->fw_state = ISP_FW_RUNNING;
+	apple_isp_stop_capture(isp);
+	KUNIT_EXPECT_EQ(test, trace.fw_stop_at, 3);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 4);
+}
+
+static void isp_test_stream_failure_lights_off(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = { .fw_start_result = -ETIME };
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), -ETIME);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 3);
+}
+
+static void isp_test_failed_fw_stop_lights_off(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	isp->ipc_failed = true;
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_stop, isp_test_fw_stop);
+	apple_isp_stop_capture(isp);
+	KUNIT_EXPECT_EQ(test, trace.fw_stop_at, 0);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 1);
+}
+
 static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_call_crop),
 	KUNIT_CASE(isp_test_call_crop_bounds),
@@ -715,6 +1018,7 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_command_ack_failures),
 	KUNIT_CASE(isp_test_stop_key_on_debug),
 	KUNIT_CASE(isp_test_sensor_geometry),
+	KUNIT_CASE(isp_test_sensor_names),
 	KUNIT_CASE(isp_test_sensor_config_list),
 	KUNIT_CASE(isp_test_sensor_config_failure),
 	KUNIT_CASE(isp_test_preview_stream),
@@ -722,6 +1026,13 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_temporal_filter_band0),
 	KUNIT_CASE(isp_test_temporal_filter_off),
 	KUNIT_CASE(isp_test_power_line_frequency),
+	KUNIT_CASE(isp_test_snf_radial),
+	KUNIT_CASE(isp_test_indicator_set_fails_still_streams),
+	KUNIT_CASE(isp_test_dcp_bound_at_stream_start),
+	KUNIT_CASE(isp_test_no_indicator_still_streams),
+	KUNIT_CASE(isp_test_indicator_on_precedes_stream),
+	KUNIT_CASE(isp_test_stream_failure_lights_off),
+	KUNIT_CASE(isp_test_failed_fw_stop_lights_off),
 	{}
 };
 

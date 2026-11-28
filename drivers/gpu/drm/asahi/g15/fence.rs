@@ -179,12 +179,12 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 /// accepted, a signalled error fence when the submission is refused (the shared `file.rs`
 /// contract of `tracked_submission`).
 pub(crate) struct Syncs {
-    syncs: KVec<SyncItem>,
+    syncs: KVVec<SyncItem>,
     input_count: usize,
 }
 
 impl Syncs {
-    pub(crate) fn new(syncs: KVec<SyncItem>, input_count: usize) -> Self {
+    pub(crate) fn new(syncs: KVVec<SyncItem>, input_count: usize) -> Self {
         Self { syncs, input_count }
     }
 

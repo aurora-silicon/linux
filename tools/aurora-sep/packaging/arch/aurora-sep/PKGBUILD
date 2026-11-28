@@ -7,7 +7,7 @@
 
 pkgname=aurora-sep
 pkgver=1
-pkgrel=17
+pkgrel=19
 pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
 url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
 arch=(any)
@@ -95,7 +95,7 @@ package() {
   sed 's|@FPRINTD@|/usr/lib/fprintd|' fprintd-no-timeout.conf.in \
     >"$pkgdir/usr/lib/systemd/system/fprintd.service.d/50-aurora-sep-no-timeout.conf"
   install -Dm644 logind-aurora-sep.conf \
-    "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
+    "$pkgdir/usr/lib/systemd/logind.conf.d/05-aurora-sep.conf"
   install -Dm755 sep-bio-identities "$pkgdir/usr/bin/sep-bio-identities"
   install -Dm755 aurora-sep "$pkgdir/usr/bin/aurora-sep"
   sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" \

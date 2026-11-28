@@ -66,7 +66,7 @@ static void dcp_peer_finish_v27(struct apple_dcp *dcp, struct apple_dcp *peer)
 	if (!dcp_peer_both_v27(dcp, peer, "A449", config, sizeof(config), NULL, 0x7c, false) &&
 	    !dcp_peer_param_v27(dcp, peer, 3, 1, 0x10000) &&
 	    !dcp_peer_both_v27(dcp, peer, "A453", &zero, sizeof(zero), tile, sizeof(tile), false) &&
-	    !dcp_peer_param_v27(dcp, peer, 6, 1, dcp->output_pq ? 0x20000 : 0x10000))
+	    !dcp_peer_param_v27(dcp, peer, 6, 1, dcp->output_hdr ? 0x20000 : 0x10000))
 		dev_info(dcp->dev, "paired engines report %ux%u each\n",
 			 le32_to_cpu(tile[0]), le32_to_cpu(tile[1]));
 }
@@ -109,15 +109,20 @@ static int dcp_peer_limited_stop_v27(struct apple_dcp *dcp, struct apple_dcp *pe
 int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr)
 {
 	struct apple_dcp *peer;
-	bool limited, prepared;
+	bool limited, prepared, vrr_only;
 	int ret = -EOPNOTSUPP;
 
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return ret;
 	if (timing > U32_MAX - 10000 || color > U32_MAX - 10000)
 		return -EINVAL;
-	/* No paired call, nor wait for one, for a display the limit leaves no pair. */
+	/*
+	 * No paired call, nor wait for one, for a display without a peer or one
+	 * the limit leaves no pair. The device lock below may be the probe's.
+	 */
 	scoped_guard(mutex, &dcp_peer_lock) {
+		if (!dcp->peer_reserved)
+			return ret;
 		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
 		if (limited && !prepared)
 			return ret;
@@ -141,10 +146,51 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 			ret = -EBUSY;
 			goto unlock;
 		}
+		vrr_only = dcp->peer_tiling.modeset_complete &&
+			   peer->peer_tiling.modeset_complete &&
+			   dcp_peer_vrr_only_v27(&dcp->peer_frames, timing, color,
+						 min_vrr, dcp->output_hdr);
 	}
 	if (limited) {
 		ret = dcp_peer_limited_stop_v27(dcp, peer);
 		goto peer_unlock;
+	}
+	/*
+	 * Adaptive sync uses parameter 15 on both engines. Leave a running
+	 * pair installed when its timing and color are still current. If
+	 * either engine refuses the update, rebuild both with the new rate.
+	 */
+	if (vrr_only) {
+		bool still_owned, updated = false;
+
+		ret = dcp_peer_param_v27(dcp, peer, 15, 3, min_vrr);
+		scoped_guard(mutex, &dcp_peer_lock) {
+			still_owned = dcp->peer_reserved == peer &&
+				      peer->peer_owner == dcp;
+			limited = still_owned &&
+				  dcp_peer_limited_pair_locked(dcp, &prepared);
+			if (!ret && !limited && still_owned &&
+			    dcp->peer_tiling.modeset_complete &&
+			    peer->peer_tiling.modeset_complete &&
+			    dcp_peer_vrr_only_v27(&dcp->peer_frames, timing,
+						  color, min_vrr,
+						  dcp->output_hdr)) {
+				dcp->peer_frames.min_vrr = min_vrr;
+				dev_dbg(dcp->dev, "paired adaptive sync minimum %#x\n", min_vrr);
+				updated = true;
+			}
+		}
+		if (updated)
+			goto peer_unlock;
+		if (!still_owned) {
+			ret = -EBUSY;
+			goto peer_unlock;
+		}
+		if (limited) {
+			ret = prepared ? dcp_peer_limited_stop_v27(dcp, peer)
+				       : -EOPNOTSUPP;
+			goto peer_unlock;
+		}
 	}
 	ret = dcp_peer_prepare_v27(dcp, peer, min_vrr);
 	if (ret)
@@ -154,7 +200,13 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		dcp_peer_finish_v27(dcp, peer);
 	if (!ret) {
 		guard(mutex)(&dcp_peer_lock);
-		dcp->peer_frames = (struct dcp_peer_frames_v27){ .active = true };
+		dcp->peer_frames = (struct dcp_peer_frames_v27){
+			.timing = timing,
+			.color = color,
+			.min_vrr = min_vrr,
+			.output_hdr = dcp->output_hdr,
+			.active = true,
+		};
 		dev_info(dcp->dev, "paired DRM mode ready: timing=%u color=%u min_vrr=%#x\n",
 			 timing, color, min_vrr);
 	}
@@ -319,11 +371,12 @@ void dcp_peer_swap_failed_v27(struct apple_dcp *dcp)
 	dcp_mode_invalidate(&dcp->mode_state);
 }
 
-bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
-		void (*report)(struct apple_dcp *, u32, ktime_t))
+bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
+		void (*report)(struct apple_dcp *, u32, ktime_t, bool))
 {
 	struct apple_dcp *owner;
 	u32 watermark;
+	bool both_shown;
 
 	/* Independent CRTCs must not serialize through the pair's mutex. */
 	if (!READ_ONCE(dcp->peer_frames.active) && !READ_ONCE(dcp->peer_owner))
@@ -332,9 +385,10 @@ bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
 	owner = dcp->peer_owner ?: dcp;
 	if (!owner->peer_frames.active)
 		return false;
-	if (dcp_peer_frame_complete_v27(&owner->peer_frames, dcp != owner, id, &watermark))
+	if (dcp_peer_frame_complete_v27(&owner->peer_frames, dcp != owner, id, shown,
+					&watermark, &both_shown))
 		/* Queue the combined watermark to the primary IOMFB owner. */
-		report(owner, watermark, now);
+		report(owner, watermark, now, both_shown);
 	return true;
 }
 

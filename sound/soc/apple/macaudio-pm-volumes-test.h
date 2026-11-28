@@ -122,6 +122,8 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 	INIT_DELAYED_WORK(&ma->lock_timeout_work, macaudio_vlimit_timeout_work);
 	/* The volume lock is the interface, as at every bind */
 	mutex_init(&ma->spk_mutex);
+	/* As after an administrator's write of "Speaker Volume Unlock" */
+	ma->spk_legacy_selected = true;
 	KUNIT_ASSERT_EQ(test, macaudio_spk_init(ma), 0);
 
 	t->ma = ma;
