@@ -299,6 +299,15 @@ struct apple_nvme {
 	ktime_t sleep_run_time;
 	bool sleep_registered;
 	bool t8122_warm_sleep;
+	/* A refused warm sleep: the session's buffers are still mapped in the SART. */
+	bool t8122_warm_refused;
+	/*
+	 * After a refused warm sleep ANS comes back on its old session's buffers and
+	 * asks for none: they are kept, allocated and in the SART, until ANS has been
+	 * shut down cleanly (apple_nvme_rtkit_shutdown()).
+	 */
+	bool shmem_defer;
+	struct list_head kept_shmem;
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -682,14 +691,17 @@ unmap_buffer:
 		bfr->buffer = NULL;
 		return -ENOMEM;
 	}
-
 	return 0;
 }
 
-static void apple_nvme_sart_dma_destroy(void *cookie,
-					struct apple_rtkit_shmem *bfr)
+struct apple_nvme_kept_shmem {
+	struct list_head node;
+	struct apple_rtkit_shmem bfr;
+};
+
+static void apple_nvme_shmem_free(struct apple_nvme *anv,
+				  struct apple_rtkit_shmem *bfr)
 {
-	struct apple_nvme *anv = cookie;
 	struct apple_nvme_rtkit_mapping *mapping = bfr->private;
 
 	if (mapping) {
@@ -701,6 +713,45 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 	}
 	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
+}
+
+static void apple_nvme_sart_dma_destroy(void *cookie,
+					struct apple_rtkit_shmem *bfr)
+{
+	struct apple_nvme *anv = cookie;
+
+	struct apple_nvme_kept_shmem *kept;
+
+	if (!anv->shmem_defer) {
+		apple_nvme_shmem_free(anv, bfr);
+		return;
+	}
+	/* Small, and a kept buffer must stay tracked. */
+	kept = kmalloc(sizeof(*kept), GFP_KERNEL | __GFP_NOFAIL);
+	kept->bfr = *bfr;
+	list_add(&kept->node, &anv->kept_shmem);
+	dev_dbg(anv->dev, "keeping RTKit buffer %pad+%#zx while ANS uses it\n",
+		&bfr->iova, bfr->size);
+}
+
+/*
+ * Shut ANS down and free the buffers kept for it: once it acknowledges the shutdown it
+ * no longer uses them, the same point at which its session's own buffers are freed.
+ */
+static int apple_nvme_rtkit_shutdown(struct apple_nvme *anv)
+{
+	struct apple_nvme_kept_shmem *kept, *tmp;
+	int ret;
+
+	ret = apple_rtkit_shutdown(anv->rtk);
+	if (ret)
+		return ret;
+	list_for_each_entry_safe(kept, tmp, &anv->kept_shmem, node) {
+		list_del(&kept->node);
+		apple_nvme_shmem_free(anv, &kept->bfr);
+		kfree(kept);
+	}
+	return 0;
 }
 
 static const struct apple_rtkit_ops apple_nvme_rtkit_ops = {
@@ -2241,7 +2292,7 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
 			apple_nvme_disable_legacy(anv, false);
 		dev_dbg(anv->dev, "Trying to shut down RTKit before reset.");
-		ret = apple_rtkit_shutdown(anv->rtk);
+		ret = apple_nvme_rtkit_shutdown(anv);
 		if (ret)
 			goto out;
 
@@ -2273,6 +2324,15 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 
 		fw_sleep = READ_ONCE(anv->fw_sleep_restart);
 		WRITE_ONCE(anv->fw_sleep_restart, false);
+
+		/*
+		 * A refused warm sleep idled ANS but kept its session. ANS comes back
+		 * from this start on that session's buffers and asks for none, so they
+		 * stay allocated and in the SART (shmem_defer). Freeing them here would
+		 * also read the SART in the reset below: T8122 shares ANS's reset.
+		 */
+		if (xchg(&anv->t8122_warm_refused, false))
+			anv->shmem_defer = true;
 
 		ret = reset_control_assert(anv->reset);
 		if (ret)
@@ -2341,6 +2401,8 @@ rtkit_ready:
 	}
 
 	dev_dbg(anv->dev, "ANS booted successfully.");
+
+	anv->shmem_defer = false;
 
 	/*
 	 * Pre-M4 ANS keeps running across a kexec, and a crashed kernel hands
@@ -2605,6 +2667,8 @@ out:
 	}
 	if (phase_locked)
 		mutex_unlock(&anv->disable_lock);
+	/* ANS's state is unknown: buffers kept for it stay kept (see kept_shmem). */
+	anv->shmem_defer = false;
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	if (apple_nvme_disable(anv, false))
@@ -2990,6 +3054,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	mutex_init(&anv->disable_lock);
 	spin_lock_init(&anv->event_lock);
 	INIT_LIST_HEAD(&anv->quarantine_node);
+	INIT_LIST_HEAD(&anv->kept_shmem);
 	anv->controller_start = resource->start;
 	ret = devm_add_action_or_reset(dev, apple_nvme_put_resource_owner, anv);
 	if (ret)
@@ -3353,7 +3418,7 @@ static void apple_nvme_remove(struct platform_device *pdev)
 
 	/* Post-M4 firmware stays live; see apple_nvme_shutdown(). */
 	if (!anv->hw->needs_ioq_registers && apple_rtkit_is_running(anv->rtk)) {
-		apple_rtkit_shutdown(anv->rtk);
+		apple_nvme_rtkit_shutdown(anv);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
@@ -3393,7 +3458,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		apple_rtkit_shutdown(anv->rtk);
+		apple_nvme_rtkit_shutdown(anv);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
@@ -3432,8 +3497,11 @@ static void apple_nvme_t8122_warm_resume(struct apple_nvme *anv)
 	 * restart without a power cycle can hang; fall back to the cold PMGR
 	 * reset path in apple_nvme_reset_work_impl().
 	 */
-	if (!pm_resume_via_firmware())
+	if (!pm_resume_via_firmware()) {
+		WRITE_ONCE(anv->t8122_warm_refused, true);
+		WRITE_ONCE(anv->fw_sleep_restart, true);
 		return;
+	}
 
 	apple_sleep_restore_pins();
 	if (anv->sart)
@@ -3733,9 +3801,20 @@ static int apple_nvme_suspend(struct device *dev)
 		    !apple_sleep_dry_run()) {
 			anv->sleep_failed = false;
 			anv->sleep_restarted = false;
+			/*
+			 * In IDLE, ANS gates its SART. A sleep refused after this
+			 * restarts it cold, as after a firmware sleep: keep the
+			 * SART's entries and the word that gates it for that.
+			 */
+			anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			if (anv->sart)
+				apple_sart_save_now(anv->sart);
 			ret = apple_rtkit_idle(anv->rtk);
 			if (ret) {
 				dev_err(dev, "ANS warm idle failed: %d\n", ret);
+				/* No resume follows: drop the snapshot, it's still live. */
+				if (anv->sart)
+					apple_sart_restore_early(anv->sart);
 				return ret;
 			}
 			writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -3760,7 +3839,7 @@ static int apple_nvme_suspend(struct device *dev)
 			if (!ret)
 				ret = apple_rtkit_reinit(anv->rtk);
 		} else {
-			ret = apple_rtkit_shutdown(anv->rtk);
+			ret = apple_nvme_rtkit_shutdown(anv);
 		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);

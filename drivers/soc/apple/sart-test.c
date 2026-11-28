@@ -776,6 +776,68 @@ static void sart_test_replay(struct kunit *test)
 	sart_test_check(test, t);
 }
 
+/*
+ * A region removed after a wake, as a driver reclaiming a buffer does, is not brought back
+ * by a later replay; the bootloader's entry and the regions still in use are. One removed
+ * while the snapshot still waits for its wake stays in it: that wake writes it back as found.
+ */
+static void sart_test_replay_after_remove(struct kunit *test)
+{
+	struct sart_test *t = sart_test_new(test, test->param_value);
+	struct apple_sart *sart = &t->sart;
+	bool v3 = t->ver->size_reg;
+
+	sart_test_preload(t, 0, t->ver->allow, 0x800000, 0x400);
+	sart->protected_entries = BIT(0);
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_add_allowed_region(sart, SART_TEST_PG(0x4000),
+						      SART_TEST_PG(4)));
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_add_allowed_region(sart, SART_TEST_PG(0x812345),
+						      SART_TEST_PG(0x40)));
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_add_allowed_region(sart, SART_TEST_PG(0x9000),
+						      SART_TEST_PG(8)));
+	sart_test_model(t, 1, t->ver->allow, 0x4000, 4);
+	sart_test_model(t, 2, t->ver->allow, 0x812345, 0x40);
+
+	sart_test_snapshot(test, t);
+	/* Before the wake: the snapshot keeps it */
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_remove_allowed_region(sart, SART_TEST_PG(0x9000),
+							 SART_TEST_PG(8)));
+	KUNIT_EXPECT_EQ(test, sart->saved[3].size, (size_t)SART_TEST_PG(8));
+
+	sart_test_power_loss(t);
+	pm_set_resume_via_firmware();
+	KUNIT_ASSERT_EQ(test, 0, apple_sart_resume_noirq(sart->dev));
+	KUNIT_ASSERT_TRUE(test, sart->replay_valid);
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_remove_allowed_region(sart, SART_TEST_PG(0x9000),
+							 SART_TEST_PG(8)));
+
+	/* After it: gone from the snapshot, and the protected entry can't be removed */
+	KUNIT_ASSERT_EQ(test, 0,
+			apple_sart_remove_allowed_region(sart, SART_TEST_PG(0x4000),
+							 SART_TEST_PG(4)));
+	sart_test_model(t, 1, 0, 0, 0);
+	KUNIT_EXPECT_EQ(test, sart->saved[1].size, (size_t)0);
+	KUNIT_EXPECT_EQ(test, sart->saved[1].flags, 0);
+	KUNIT_EXPECT_EQ(test, sart->saved[3].size, (size_t)0);
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			apple_sart_remove_allowed_region(sart, SART_TEST_PG(0x800000),
+							 SART_TEST_PG(0x400)));
+	KUNIT_EXPECT_EQ(test, sart->saved[0].size, (size_t)SART_TEST_PG(0x400));
+
+	sart_test_power_loss(t);
+	if (!v3) {
+		KUNIT_EXPECT_EQ(test, -EOPNOTSUPP, apple_sart_replay(sart));
+		return;
+	}
+	KUNIT_EXPECT_EQ(test, 0, apple_sart_replay(sart));
+	sart_test_check(test, t);
+}
+
 /* The check before a sleep exists on SARTv4 only, and needs the snapshot */
 static void sart_test_sleep_validate_unsupported(struct kunit *test)
 {
@@ -936,6 +998,7 @@ static struct kunit_case sart_test_cases[] = {
 	KUNIT_CASE_PARAM(sart_test_resume_idle_entries, sart_test_ver_gen_params),
 	KUNIT_CASE_PARAM(sart_test_resume_last_in_use, sart_test_ver_gen_params),
 	KUNIT_CASE_PARAM(sart_test_replay, sart_test_ver_gen_params),
+	KUNIT_CASE_PARAM(sart_test_replay_after_remove, sart_test_ver_gen_params),
 	KUNIT_CASE_PARAM(sart_test_sleep_validate_unsupported, sart_test_ver_gen_params),
 	KUNIT_CASE(sart_test_sleep_validate_changed),
 	KUNIT_CASE(sart_test_sleep_validate_flags_only),

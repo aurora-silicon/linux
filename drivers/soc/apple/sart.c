@@ -363,6 +363,26 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 }
 EXPORT_SYMBOL_GPL(apple_sart_add_allowed_region);
 
+/*
+ * A region its driver removes after a wake must not come back with a replay: drop it from
+ * the snapshot kept for apple_sart_replay(). The bootloader's entries stay.
+ */
+static void apple_sart_forget_replay(struct apple_sart *sart, phys_addr_t paddr, size_t size)
+{
+	int i;
+
+	if (!sart->replay_valid)
+		return;
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		if (test_bit(i, &sart->protected_entries) ||
+		    sart->saved[i].paddr != paddr || sart->saved[i].size != size)
+			continue;
+		sart->saved[i].flags = 0;
+		sart->saved[i].paddr = 0;
+		sart->saved[i].size = 0;
+	}
+}
+
 int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 				     size_t size)
 {
@@ -388,6 +408,7 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 		sart->ops->set_entry(sart, i, 0, 0, 0);
 
 		clear_bit(i, &sart->used_entries);
+		apple_sart_forget_replay(sart, paddr, size);
 		dev_dbg(sart->dev, "cleared entry %d\n", i);
 		return 0;
 	}
@@ -461,6 +482,9 @@ static unsigned int apple_sart_write_saved(struct apple_sart *sart)
 		sart->ops->set_entry(sart, i, sart->saved[i].flags,
 				     sart->saved[i].paddr >> sart->ops->paddr_shift,
 				     sart->saved[i].size >> sart->ops->size_shift);
+		dev_dbg(sart->dev, "wrote back entry %d: flags %#x [%pa + %#zx]%s\n", i,
+			sart->saved[i].flags, &sart->saved[i].paddr, sart->saved[i].size,
+			test_bit(i, &sart->protected_entries) ? " (boot)" : "");
 		restored++;
 	}
 	return restored;
