@@ -1148,9 +1148,15 @@ static int centauri_t6050_suspend(struct device *dev)
 	c->firmware_kept = false;
 	c->control_sleep_sent = false;
 	c->keep_alive_pme = false;
+	/*
+	 * The N1 stays up only for a WoWLAN-armed sleep, which cfg80211 arms only while
+	 * associated. Kept up without an association it has nothing to keep, and can wake
+	 * the AP about half a second into the sleep and again after every re-entry.
+	 */
 	if (!beta_fallback && c->boot_phase == CEN_BOOT_READY && c->ipc && c->wifi &&
 	    !centauri_t6050_wifi_pm_error(c) &&
 	    !centauri_t6050_wifi_pm_disconnected(c) &&
+	    centauri_t6050_wifi_wowlan_armed(c) &&
 	    readl(c->bar + 0x8000) == 2 && readl(c->bar + 0x8050) == 2) {
 		bool wifi_sleep_sent = false;
 		int unwind_err = 0, wake_ret;
@@ -1182,7 +1188,7 @@ static int centauri_t6050_suspend(struct device *dev)
 			centauri_t6050_save_memswap(pdev, c->saved_memswap[0]);
 			centauri_t6050_save_memswap(fn1, c->saved_memswap[1]);
 			apple_pcie_t6050_sleep_keep_alive(pdev->bus->self);
-			c->keep_alive_pme = centauri_t6050_wifi_wowlan_armed(c);
+			c->keep_alive_pme = true;
 			c->firmware_kept = true;
 			dev_dbg(dev, "N1 kept alive for firmware sleep\n");
 			return 0;
