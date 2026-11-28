@@ -18,6 +18,7 @@
 #define T6050_K_N1_FIRMWARE	"apple/centauri/k114s-ftab.bin"
 #define T6050_K_BOARD_ID	0x14
 #include "t6050-k114-k116.dtsi"
+#include <dt-bindings/pinctrl/apple.h>
 
 / {
 	compatible = "apple,k114s", "apple,t6050", "apple,arm-platform";
@@ -60,3 +61,44 @@
  */
 #include "t6050-k114-k116-usb.dtsi"
 #include "t6050-k114-usb.dtsi"
+
+/*
+ * The touchscreen (kiwi), as on the K114c: the ADT kiwi node names the same
+ * lines on this board (power nub-gpio0 0x1a, reset 0x19, 24 MHz clock 0x16,
+ * display_sync gpio0 0xb). Power method 2 with its own reset and supply.
+ * The panel is 3024x1986 (302 x 199 mm), as the DCP reports it.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+
+	kiwi_clk24_pins: kiwi-clk24-pins {
+		pinmux = <APPLE_PINMUX(22, 1)>;
+	};
+};
+
+&pinctrl_ap {
+	kiwi_dsync_pins: kiwi-dsync-pins {
+		pinmux = <APPLE_PINMUX(11, 1)>;
+	};
+};
+
+&mtp_hid {
+	pinctrl-0 = <&kiwi_clk24_pins>, <&kiwi_dsync_pins>;
+	pinctrl-names = "default";
+};
+
+&kiwi {
+	firmware-name = "apple/tpkiwifw-k114s.bin";
+	apple,power-method = <2>;
+	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_LOW>;
+	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
+	touchscreen-size-x = <3024>;
+	touchscreen-size-y = <1986>;
+	touchscreen-x-mm = <302>;
+	touchscreen-y-mm = <199>;
+	status = "okay";
+};
