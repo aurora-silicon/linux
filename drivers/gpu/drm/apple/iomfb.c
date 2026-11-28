@@ -3653,6 +3653,42 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	return true;
 }
 
+/*
+ * Firmware 27 compares a mode's video clock, half its pixel clock (it logs
+ * "getClockFrequency(0) (C) < videoClock V" with V = pixel clock / 2 at every
+ * rate), with the provider clock it asks for by index 0.  When the clock is
+ * below the video clock it gives up scaling ("Giving up on frequencies") and
+ * relies on the SoC's power manager to raise the display clock from the
+ * pipe's bandwidth vote.  Linux runs no power manager that acts on that vote,
+ * so the pipe stays at the provider clock.  On an M2 mini (T8112) an external
+ * 2560x1440 display then shows only a strip at the top of the frame at 240 and
+ * 280 Hz (video clock 485/565 MHz, provider clock 360 MHz), while 144 Hz
+ * (292 MHz) is whole.
+ *
+ * Offer an external display only the modes the provider clock scans.  The
+ * provider clock is the one the boot loader published for this processor and
+ * that the driver already answers the firmware with; a processor without a
+ * provider clock table, and internal panels, are not limited here.
+ */
+static bool dcp_mode_beyond_provider_clock(struct apple_dcp *dcp,
+					   struct drm_connector *connector,
+					   const struct drm_display_mode *mode)
+{
+	unsigned long rate;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->num_firmware_clocks ||
+	    !dcp->firmware_clocks || !dcp->firmware_clocks[0].clk ||
+	    connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		return false;
+
+	rate = clk_get_rate(dcp->firmware_clocks[0].clk);
+	if (!rate)
+		return false;
+
+	/* mode->clock is in kHz; the video clock is half the pixel clock. */
+	return (u64)mode->clock * 1000 > 2 * (u64)rate;
+}
+
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode)
 {
@@ -3679,6 +3715,8 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	 * connector probed again when that changes.
 	 */
 	if (dcp_peer_mode_limited_v27(dcp, mode->clock))
+		return MODE_CLOCK_HIGH;
+	if (dcp_mode_beyond_provider_clock(dcp, connector, mode))
 		return MODE_CLOCK_HIGH;
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
