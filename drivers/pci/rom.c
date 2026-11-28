@@ -255,7 +255,10 @@ void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size)
 	if (pci_enable_rom(pdev))
 		return NULL;
 
-	rom = ioremap(start, *size);
+	if (res->flags & IORESOURCE_MEM_NONPOSTED)
+		rom = ioremap_np(start, *size);
+	else
+		rom = ioremap(start, *size);
 	if (!rom)
 		goto err_ioremap;
 

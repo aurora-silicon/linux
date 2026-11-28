@@ -184,8 +184,12 @@ static int smu_v15_0_0_get_metrics_table_dram_addr(struct smu_context *smu,
 	metrics_info->addr = ((uint64_t)args.out_args[1] << 32) | args.out_args[0];
 	metrics_info->table_size = args.out_args[2];
 
-	metrics_info->cpu_addr = ioremap_wc(metrics_info->addr,
-					    metrics_info->table_size);
+	if (pci_resource_flags(smu->adev->pdev, 0) & IORESOURCE_MEM_NONPOSTED)
+		metrics_info->cpu_addr = ioremap_np(metrics_info->addr,
+						    metrics_info->table_size);
+	else
+		metrics_info->cpu_addr = ioremap_wc(metrics_info->addr,
+						    metrics_info->table_size);
 	if (!metrics_info->cpu_addr)
 		return -ENOMEM;
 
@@ -310,7 +314,8 @@ static int smu_v15_0_0_update_table(struct smu_context *smu,
 	table_size = smu_table->tables[table_index].size;
 
 	if (drv2smu) {
-		memcpy(table->cpu_addr, table_data, table_size);
+		amdgpu_bo_memcpy_to(table->bo, table->cpu_addr, table_data,
+				    table_size);
 		/*
 		 * Flush hdp cache: to guard the content seen by
 		 * GPU is consitent with CPU.
@@ -334,7 +339,8 @@ static int smu_v15_0_0_update_table(struct smu_context *smu,
 
 	if (!drv2smu) {
 		amdgpu_hdp_invalidate(adev, NULL);
-		memcpy(table_data, table->cpu_addr, table_size);
+		amdgpu_bo_memcpy_from(table->bo, table_data, table->cpu_addr,
+				      table_size);
 	}
 
 	return 0;
