@@ -667,6 +667,10 @@ def run_all(args, work):
     print(f'{len(todo) - len(failed)}/{len(todo)} passed in {time.monotonic() - start:.0f}s')
     for label, log in failed:
         text = log.read_text(errors='replace').splitlines()
+        not_ok = [line for line in text if line.startswith('not ok ')]
+        if not_ok:
+            print(f'\n=== {label}: failing TAP cases ({len(not_ok)})')
+            print('\n'.join(not_ok[:40]))
         print(f'\n=== {label}: last lines of {log}')
         print('\n'.join(text[-40:]))
     return failed

@@ -96,8 +96,11 @@ jobs:
             printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
               sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
-          sudo apt-get update -o APT::Update::Error-Mode=any
-          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rust-src --no-self-update
           echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
@@ -177,8 +180,11 @@ jobs:
             printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
               sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
-          sudo apt-get update -o APT::Update::Error-Mode=any
-          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl qemu-system-arm
       - name: Pin the Rust toolchain and prepare bindgen
         if: ${{ matrix.rust }}

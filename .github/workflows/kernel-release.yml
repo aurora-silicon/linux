@@ -159,8 +159,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
             bc bison flex libelf-dev libssl-dev libdw-dev zlib1g-dev cmake \
             cpio kmod rsync zstd xz-utils python3 \
             fakeroot libarchive-tools
@@ -168,7 +171,7 @@ jobs:
       - name: Install makepkg (for make pacman-pkg)
         continue-on-error: true
         # makepkg looks pacman up at start and exits without it.
-        run: sudo apt-get install -y --no-install-recommends makepkg pacman-package-manager
+        run: sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 makepkg pacman-package-manager
 
       - name: Install Rust
         run: |
@@ -245,8 +248,11 @@ jobs:
 
       - name: Install QEMU
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm busybox-static zstd cpio
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 qemu-system-arm busybox-static zstd cpio
           qemu-system-aarch64 --version
 
       - name: Boot under QEMU and load every module

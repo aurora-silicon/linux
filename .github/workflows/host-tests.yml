@@ -62,14 +62,18 @@ jobs:
           command -v fdtget >/dev/null || need="$need device-tree-compiler"
           dpkg -s "libclang-rt-$CLANG_VERSION-dev" >/dev/null 2>&1 || need="$need libclang-rt-$CLANG_VERSION-dev"
           if [ -n "$need" ]; then
-            # Avoid the hosted runner's Azure mirror after repeated DNS failures.
-            # Keep signed Ubuntu archive/security suites and fail on update errors.
+            # Avoid the hosted runner's Azure mirror after repeated DNS failures,
+            # and drop third-party apt sources (e.g. packages.microsoft.com) so
+            # their transient 403/5xx errors do not abort APT::Update::Error-Mode=any.
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
                 sudo tee /etc/apt/apt-mirrors.txt >/dev/null
             fi
-            sudo apt-get update -q -o APT::Update::Error-Mode=any
-            sudo apt-get install -y -q $need
+            if [ -d /etc/apt/sources.list.d ]; then
+              sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+            fi
+            sudo apt-get update -q -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+            sudo apt-get install -y -q -o Acquire::Retries=3 $need
           fi
           # The tests call clang, ld.lld, cc and gcc by name.
           bin="$RUNNER_TEMP/toolchain"

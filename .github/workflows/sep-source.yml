@@ -101,8 +101,11 @@ jobs:
             printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
               sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
-          sudo apt-get update -o APT::Update::Error-Mode=any
-          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           rustup component add rust-src
       - name: Prepare the layout-corrected bindgen
@@ -138,8 +141,11 @@ jobs:
             printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
               sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
-          sudo apt-get update -o APT::Update::Error-Mode=any
-          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl qemu-system-arm
           rustup component add rust-src
       - name: Prepare the layout-corrected bindgen
@@ -182,8 +188,15 @@ jobs:
           fetch-depth: 1
       - name: Install arm64 C build dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q clang-18 lld-18 llvm-18 libelf-dev libssl-dev \
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          if [ -d /etc/apt/sources.list.d ]; then
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f ! -name 'ubuntu.sources' -delete
+          fi
+          sudo apt-get update -q -o APT::Update::Error-Mode=any -o Acquire::Retries=3
+          sudo apt-get install -y -q -o Acquire::Retries=3 clang-18 lld-18 llvm-18 libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       - name: Compile the Apple DWC3 object with the resolved PHY profile
