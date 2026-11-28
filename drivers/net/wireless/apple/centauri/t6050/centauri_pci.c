@@ -1138,8 +1138,18 @@ static int centauri_t6050_suspend(struct device *dev)
 	bool beta_fallback;
 	int ret;
 
-	if (!apple_centauri_sleep_reboot(pdev))
-		return c->boot_phase == CEN_BOOT_READY ? pci_save_state(pdev) : -EBUSY;
+	if (!apple_centauri_sleep_reboot(pdev)) {
+		switch (READ_ONCE(c->boot_phase)) {
+		case CEN_BOOT_ROM:
+		case CEN_BOOT_CYCLE:
+		case CEN_BOOT_IPC:
+			/* A boot in flight; let it finish before the sleep. */
+			return -EBUSY;
+		default:
+			/* Ready, or failed or stopped: nothing is in flight. */
+			return pci_save_state(pdev);
+		}
+	}
 
 	mutex_lock(&cen_recovery_lock);
 	beta_fallback = c->recovery && c->recovery->beta_fallback;
