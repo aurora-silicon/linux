@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
 
+# The Rust DRM scheduler bindings are part of the built-in kernel crate,
+# so DRM_SCHED must be built in, not modular like DRM_ASAHI.
 config RUST_DRM_SCHED
 	bool
 	select DRM_SCHED
-
-config RUST_DRM_GPUVM
-	bool
-	select DRM_GPUVM
 
 config DRM_ASAHI
 	tristate "Aurora (DRM support for Apple AGX GPUs)"

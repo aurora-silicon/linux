@@ -3,10 +3,6 @@
 /* Logical peer allocation for a merged mode. This only reserves an otherwise
  * unrouted DCP; it never replaces a physical route.
  */
-static bool peer_allocation_probe = true;
-module_param(peer_allocation_probe, bool, 0444);
-MODULE_PARM_DESC(peer_allocation_probe, "Firmware27 logical peer allocation for merged modes (default: on)");
-
 /*
  * The platform limit on merged modes (dcp_fabric_merged_fits()) holds for the
  * external display processors whose node says so (apple,merged-mode-limit).
@@ -113,7 +109,7 @@ bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 	struct apple_dcp *peer;
 
 	guard(mutex)(&dcp_peer_lock);
-	if (!peer_allocation_probe || dcp->peer_unbinding || dcp->crashed)
+	if (dcp->peer_unbinding || dcp->crashed)
 		return false;
 	peer = dcp->peer_reserved ?: dcp->peer_owner;
 	if (!peer || peer->peer_unbinding || peer->crashed)
@@ -183,8 +179,6 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 	 * status has a field of its own, leaving the request hints unchanged.
 	 */
 	r->status = 0;
-	if (!peer_allocation_probe)
-		return 0;
 	if (!of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") ||
 	    port->unit || !dcp->crtc)
 		return 0;

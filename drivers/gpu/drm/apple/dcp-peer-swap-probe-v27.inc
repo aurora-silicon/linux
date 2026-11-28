@@ -339,7 +339,7 @@ static ssize_t peer_swap_test_store(struct device *dev,
 
 	if (kstrtobool(buf, &enabled) || !enabled)
 		return -EINVAL;
-	if (!peer_allocation_probe || !device_trylock(dev))
+	if (!device_trylock(dev))
 		return -EBUSY;
 	dcp = dev_get_drvdata(dev);
 	{
@@ -385,7 +385,7 @@ static ssize_t peer_stop_test_store(struct device *dev,
 
 	if (kstrtobool(buf, &enabled) || !enabled)
 		return -EINVAL;
-	if (!peer_allocation_probe || !device_trylock(dev))
+	if (!device_trylock(dev))
 		return -EBUSY;
 	dcp = dev_get_drvdata(dev);
 	{

@@ -272,20 +272,10 @@ struct apple_dcp_v26 {
 /* One DCP session per boot: RTKit is never started twice. */
 static bool dcp_v26_session;
 
-static bool j613_25g83_swap_timestamps = true;
-module_param(j613_25g83_swap_timestamps, bool, 0644);
-MODULE_PARM_DESC(j613_25g83_swap_timestamps,
-		 "J613/25G83: time-stamp swaps on a 120 Hz variable-refresh panel so they are shown at 120 Hz, not 60 Hz (default: on)");
-
 static unsigned int j613_25g83_refresh = 120;
 module_param(j613_25g83_refresh, uint, 0444);
 MODULE_PARM_DESC(j613_25g83_refresh,
 		 "J613/25G83: preferred refresh of the built-in display: 120 (variable refresh, ProMotion) or 60 (locked); both modes stay available (default: 120)");
-
-static bool j613_25g83_flip_timestamp = true;
-module_param(j613_25g83_flip_timestamp, bool, 0644);
-MODULE_PARM_DESC(j613_25g83_flip_timestamp,
-		 "J613/25G83: stamp page-flip events with the arrival of the firmware's swap-complete message; off: when the flush ends, less 1 ms (default: on)");
 
 static int dcp_v26_callback(void *cookie, u32 tag, const void *input, u32 in_size,
 			    void *output, u32 out_size);
@@ -1301,9 +1291,9 @@ static int dcp_v26_present_show(struct seq_file *m, void *unused)
 	snap->vrr = v26->vrr;
 	mutex_unlock(&v26->lock);
 
-	seq_printf(m, "vrr %d\nrefresh %u\ntimed %d\ntimestamps %d\nflip_timestamp %d\nswaps %llu\n",
+	/* timestamps and flip_timestamp are always on; the lines stay for readers. */
+	seq_printf(m, "vrr %d\nrefresh %u\ntimed %d\ntimestamps 1\nflip_timestamp 1\nswaps %llu\n",
 		   snap->vrr, READ_ONCE(v26->refresh), READ_ONCE(v26->timed),
-		   READ_ONCE(j613_25g83_swap_timestamps), READ_ONCE(j613_25g83_flip_timestamp),
 		   snap->history_count);
 	seq_puts(m, "# id surface timed start_ns submitted_ns replied_ns completed_ns\n");
 	first = snap->history_count > DCP_V26_HISTORY ? snap->history_count - DCP_V26_HISTORY : 0;
@@ -1621,7 +1611,7 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 		dcp_v26_encode_swap(swap, id, DCP_V26_BLACK, surface, iova, width, height,
 				    dst_y, DCP_V26_LAYER);
 		/* A target long past: show it at the next refresh, as on M1/M2. */
-		if (surface && READ_ONCE(v26->timed) && READ_ONCE(j613_25g83_swap_timestamps)) {
+		if (surface && READ_ONCE(v26->timed)) {
 			dcp_v26_swap_set_timing(swap, 120);
 			rec.timed = 1;
 		}
@@ -1798,17 +1788,13 @@ void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		dcp_v26_cancel_event(dcp);
 		return;
 	}
-	if (READ_ONCE(j613_25g83_flip_timestamp)) {
-		/*
-		 * The flip completed when the firmware's swap-complete message
-		 * came in, not when this worker got to run: stamp the event with
-		 * that time as it is (no swap_start correction).
-		 */
-		dcp->swap_start = KTIME_MIN;
-		dcp_drm_crtc_page_flip(dcp, presented);
-	} else {
-		dcp_drm_crtc_page_flip(dcp, ktime_get());
-	}
+	/*
+	 * The flip completed when the firmware's swap-complete message
+	 * came in, not when this worker got to run: stamp the event with
+	 * that time as it is (no swap_start correction).
+	 */
+	dcp->swap_start = KTIME_MIN;
+	dcp_drm_crtc_page_flip(dcp, presented);
 }
 
 /*

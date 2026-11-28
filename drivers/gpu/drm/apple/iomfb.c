@@ -3072,11 +3072,6 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 	return iomfb_modeset_v26_6_desktop(dcp, crtc_state);
 }
 
-static bool takeover_adopt = true;
-module_param(takeover_adopt, bool, 0444);
-MODULE_PARM_DESC(takeover_adopt,
-		 "Desktop 26.x panel takeover: present on the loader's live mode instead of setting it again (default: on)");
-
 /*
  * The loader leaves the panel running, and the firmware keeps that pipe when
  * it restarts.  Setting the same mode again blanks the panel for ~200 ms, so
@@ -3192,7 +3187,7 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		goto out;
 	}
 
-	for (k = 0; takeover_adopt && k < n; k++) {
+	for (k = 0; k < n; k++) {
 		if (!dcp_takeover_adopt(dcp, &cand[k])) {
 			win = k;
 			break;

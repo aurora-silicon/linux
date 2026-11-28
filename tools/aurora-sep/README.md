@@ -368,21 +368,32 @@ and serves the copy to the login screen's shell alone through a GResource
 overlay. When the check is not exactly as expected, for example after a
 GNOME update, it changes nothing. The enable key above still applies.
 
-The login screen asks fprintd for the reader once, as it comes up, and the
-enclave can take most of a minute after boot. The login screen does not wait
-for it: `aurora-sep-greeter-refresh.service` runs once both are up, and when
-Touch ID came up later and nobody has logged in, it shows the login screen
-again so it offers fingerprint. With automatic login, or once someone has
-logged in, it changes nothing. Both are one switch, off by default. It needs
-`gresource` from glib2-devel. With the packages, or after installing it by
-hand, turn it on with `systemctl enable`:
+The login screen does not wait for Touch ID, which can take most of a minute
+after boot. The login screen right after boot takes the password anyway: as on
+macOS, where Touch ID is offered only after one password login since the
+restart, `require_password_after_boot = yes` holds the reader until then.
+Later login screens (after a log out) and the lock screen find the reader once
+it is up. It is one switch, off by default. It needs `gresource` from
+glib2-devel. With the packages, or after installing it by hand, turn it on
+with `systemctl enable`:
 
 ```sh
 install -Dm755 aurora-sep-greeter-fingerprint /usr/local/sbin/aurora-sep-greeter-fingerprint
-install -Dm644 aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service /etc/systemd/system/
+install -Dm644 aurora-sep-greeter-fingerprint.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable aurora-sep-greeter-fingerprint.service
 ```
+Upgrading an install from before 11-29 (manual or packaged): the old
+`aurora-sep-greeter-refresh.service` is gone, and `refresh` is now a no-op that
+only logs. Remove what is left of it once:
+
+```
+sudo systemctl disable aurora-sep-greeter-refresh.service 2>/dev/null
+sudo rm -f /etc/systemd/system/aurora-sep-greeter-refresh.service \
+  /etc/systemd/system/gdm.service.wants/aurora-sep-greeter-refresh.service
+sudo systemctl daemon-reload
+```
+
 
 Disabling it and rebooting returns the login screen to GNOME's behaviour.
 

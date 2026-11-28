@@ -587,6 +587,7 @@ endmenu
 
 endif
 
+# Kept: configs that still set APPLE_T8140_SLEEP=y keep APPLE_SOC_SLEEP after olddefconfig.
 config APPLE_T8140_SLEEP
 	bool
 	transitional

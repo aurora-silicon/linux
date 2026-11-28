@@ -190,8 +190,6 @@ static ssize_t peer_video_test_store(struct device *dev,
 	if (sscanf(buf, "%u %u %u %c", &timing, &color, &install, &extra) != 3 ||
 	    install > 3 || timing > U32_MAX - 10000 || color > U32_MAX - 10000)
 		return -EINVAL;
-	if (!peer_allocation_probe)
-		return -EOPNOTSUPP;
 	/* Trylocks avoid the sysfs-removal/device-lock inversion. Hold both
 	 * devices across RPC waits so neither devm-backed DCP can be unbound.
 	 */
@@ -239,7 +237,7 @@ static ssize_t peer_link_test_store(struct device *dev,
 
 	if (kstrtobool(buf, &enabled))
 		return -EINVAL;
-	if (!peer_allocation_probe || !device_trylock(dev))
+	if (!device_trylock(dev))
 		return -EBUSY;
 	dcp = dev_get_drvdata(dev);
 	if (!dcp || !dcp->active || dcp->crashed || !dcp->fixed_phy ||

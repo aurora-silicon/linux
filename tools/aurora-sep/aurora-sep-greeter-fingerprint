@@ -26,16 +26,11 @@ log() {
 }
 
 if [ "${1:-}" = refresh ]; then
-    # Touch ID came up after the login screen asked fprintd for the reader,
-    # so the login screen has no fingerprint option. Show it again, but only
-    # while nobody is logged in: restarting gdm ends graphical sessions.
-    systemctl -q is-active gdm.service || exit 0
-    for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
-        [ "$(loginctl show-session "$s" -p Class --value)" != user ] || exit 0
-    done
-    [ -f "$out/authServicesLegacy.js" ] || exit 0
-    log "Touch ID is ready; showing the login screen again so it offers fingerprint"
-    exec systemctl restart gdm.service
+    # aurora-sep-greeter-refresh.service, which passed "refresh", is gone. A manual
+    # install from before may still have it enabled. Do nothing, so that it never
+    # removes and rebuilds the overlay of a login screen that is already running.
+    log "'refresh' is no longer used; disable and remove aurora-sep-greeter-refresh.service (see README)"
+    exit 0
 fi
 
 rm -rf "$out" "$dropin"

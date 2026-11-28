@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /* Paired DRM scanout of a mode one firmware-27 pipe cannot drive alone. */
-static bool peer_scanout = true;
-module_param(peer_scanout, bool, 0444);
-MODULE_PARM_DESC(peer_scanout, "Firmware27 paired DRM scanout (default: on)");
 
 static bool dcp_peer_transport_idle(struct apple_dcp *dcp)
 {
@@ -115,8 +112,7 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	bool limited, prepared, vrr_only;
 	int ret = -EOPNOTSUPP;
 
-	if (!peer_scanout || !peer_allocation_probe ||
-	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return ret;
 	if (timing > U32_MAX - 10000 || color > U32_MAX - 10000)
 		return -EINVAL;
@@ -265,8 +261,6 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		 pair ? "needs the pair" : "one engine");
 	if (!pair)
 		return 0;
-	if (!peer_scanout || !peer_allocation_probe)
-		return -EINVAL;
 	scoped_guard(mutex, &dcp_peer_lock) {
 		struct apple_dcp *peer = dcp->peer_reserved;
 		unsigned int displays, engines;
@@ -301,7 +295,7 @@ int dcp_peer_stop_v27(struct apple_dcp *dcp)
 	struct apple_dcp *peer;
 	int ret = 0;
 
-	if (!peer_scanout || !READ_ONCE(dcp->peer_frames.active))
+	if (!READ_ONCE(dcp->peer_frames.active))
 		return 0;
 	if (!device_trylock(dcp->dev))
 		return -EBUSY;
@@ -351,7 +345,7 @@ struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp)
 {
 	struct apple_dcp *peer;
 
-	if (!peer_scanout || !READ_ONCE(dcp->peer_frames.active))
+	if (!READ_ONCE(dcp->peer_frames.active))
 		return NULL;
 	guard(mutex)(&dcp_peer_lock);
 	if (!dcp->peer_frames.active)
@@ -385,12 +379,11 @@ bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool
 	bool both_shown;
 
 	/* Independent CRTCs must not serialize through the pair's mutex. */
-	if (!peer_scanout || (!READ_ONCE(dcp->peer_frames.active) &&
-			     !READ_ONCE(dcp->peer_owner)))
+	if (!READ_ONCE(dcp->peer_frames.active) && !READ_ONCE(dcp->peer_owner))
 		return false;
 	guard(mutex)(&dcp_peer_lock);
 	owner = dcp->peer_owner ?: dcp;
-	if (!peer_scanout || !owner->peer_frames.active)
+	if (!owner->peer_frames.active)
 		return false;
 	if (dcp_peer_frame_complete_v27(&owner->peer_frames, dcp != owner, id, shown,
 					&watermark, &both_shown))
