@@ -46,6 +46,21 @@ impl Grow {
     }
 }
 
+impl Grow {
+    /// Pending growth work for a timeout report: queued requests, one in progress, the reply
+    /// still to publish (whether it grew, its attempts), unconsumed channel-error
+    /// acknowledgements and free-list release attempts.
+    pub(super) fn report(&self) -> (usize, bool, Option<(bool, u16)>, usize, u16) {
+        (
+            self.requests.len(),
+            self.active.is_some(),
+            self.reply.as_ref().map(|(_, grew, attempts)| (*grew, *attempts)),
+            self.acks.len(),
+            self.release_attempts,
+        )
+    }
+}
+
 impl RenderState {
     pub(in crate::g17::runtime) fn control_backpressured(&self) -> bool {
         self.grow.reply.is_some() || self.pools.pending() || !self.grow.acks.is_empty()

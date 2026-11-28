@@ -178,6 +178,95 @@ struct Active {
     /// result, but the firmware may still store the stamps through its descriptor: the
     /// descriptor slot stays held until stamps cover the group.
     stamps_owed: bool,
+    diag: PublicationDiag,
+}
+
+/// Dependency words a timeout report keeps per kick; a longer list is counted, not kept.
+const DIAG_WORDS: usize = 16;
+
+/// The dependency list of one kick entry as it was built: explicit barriers, then the implicit
+/// parent and, where present, the ancestor, each with its completion class (0 where the
+/// interface has no typed dependencies). Only a timeout report reads it.
+#[derive(Clone, Copy)]
+struct KickDiag {
+    words: [u64; DIAG_WORDS],
+    types: [u8; DIAG_WORDS],
+    count: u8,
+}
+
+impl KickDiag {
+    fn of(args: &crate::g17::fw::kick::KickArgs<'_>) -> Self {
+        let mut diag = Self { words: [0; DIAG_WORDS], types: [0; DIAG_WORDS], count: 0 };
+        let implicit = [Some(args.parent), args.ancestor]
+            .into_iter()
+            .flatten()
+            .map(|timestamp| KickDependency::new(args.qid, timestamp).map_or(u64::MAX, KickDependency::word));
+        let words = Iterator::chain(args.barriers.iter().map(|barrier| barrier.word()), implicit);
+        for (index, word) in words.enumerate() {
+            if index < DIAG_WORDS {
+                diag.words[index] = word;
+                diag.types[index] = args
+                    .dependency_types
+                    .and_then(|types| types.get(index).copied())
+                    .unwrap_or(0);
+            }
+            diag.count = diag.count.saturating_add(1);
+        }
+        diag
+    }
+
+    fn kept(&self) -> usize {
+        usize::from(self.count).min(DIAG_WORDS)
+    }
+}
+
+/// A kick's dependency list for a timeout report: each word as `class:qid:timestamp`, with the
+/// named queue's completion stamp as it now reads.
+struct DependencyList<'a> {
+    diag: &'a KickDiag,
+    stamp_of: &'a dyn Fn(u8) -> Option<u32>,
+}
+
+impl kernel::fmt::Display for DependencyList<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const TIMESTAMP_MASK: u64 = (1 << 40) - 1;
+        write!(f, "[")?;
+        for index in 0..self.diag.kept() {
+            let word = self.diag.words[index];
+            let qid = ((word >> 40) & 0x7f) as u8;
+            if index != 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}:{}:{:#x}", self.diag.types[index], qid, word & TIMESTAMP_MASK)?;
+            match (self.stamp_of)(qid) {
+                Some(stamp) => write!(f, " stamp {:#x}", stamp)?,
+                None => write!(f, " stamp ?")?,
+            }
+        }
+        if usize::from(self.diag.count) > self.diag.kept() {
+            write!(f, ", +{}", usize::from(self.diag.count) - self.diag.kept())?;
+        }
+        write!(f, "]")
+    }
+}
+
+/// Publication inputs of a render that only a timeout report reads: the dependency lists of
+/// both kicks, and the configuration and completion-link state the pair published them with.
+#[derive(Clone, Copy)]
+struct PublicationDiag {
+    kicks: [KickDiag; 2],
+    /// Whether the previous ordinal's stamps covered each stage at publication.
+    covered: [bool; 2],
+    /// The render channel payload (pass byte) of the completion links.
+    payload: u8,
+    /// The `fragment_busy` flag the tiling command was linked with.
+    fragment_busy: bool,
+    context_update: bool,
+    identity_update: bool,
+    /// Each stage's configuration record was published with the kick.
+    config_present: [bool; 2],
+    /// Each stage's configuration carried a completion seed, and its value.
+    seed: [Option<u64>; 2],
 }
 
 /// A firmware-retired, unexecuted group must hold on two observations this far
@@ -1164,6 +1253,19 @@ impl Pair {
             },
             mcache,
         );
+        let diag = PublicationDiag {
+            kicks: [KickDiag::of(&ta_args), KickDiag::of(&fragment_args)],
+            covered,
+            payload,
+            fragment_busy: self.variant.fragment_busy && !covered[1],
+            context_update: self.context_update,
+            identity_update: self.identity_update,
+            config_present: present,
+            seed: configs.map(|config| {
+                let (valid, seed) = (config.completion_seed_valid, config.completion_seed);
+                (valid != 0).then_some(seed)
+            }),
+        };
         let registration = if m5 {
             Registration::M5(crate::g17::fw::m5::queue::HardwareSubmission::new(
                 (qids[1], self.kicks[1].low_va()),
@@ -1280,6 +1382,7 @@ impl Pair {
                 abandoned_since: None,
                 stamp_wait_since: None,
                 stamps_owed: false,
+                diag,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -1758,16 +1861,20 @@ impl Pair {
     /// fragment processing write). It separates work the firmware never picked up from work it
     /// started and never finished, which the error alone does not say. The first few groups of a
     /// boot report; the rest would repeat them.
-    pub(crate) fn report_timeout(&self, stamps: [u32; 2], state: u32) {
+    pub(crate) fn report_timeout(
+        &self,
+        stamps: [u32; 2],
+        state: u32,
+        stamp_of: &dyn Fn(u8) -> Option<u32>,
+    ) -> Option<u32> {
         /// Timeouts reported per boot: enough for every client of a parallel batch; the rest repeat them.
         const REPORTS: u32 = 8;
         static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= REPORTS {
-            return;
+        let index = REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if index >= REPORTS {
+            return None;
         }
-        let Some(front) = self.active.front() else {
-            return;
-        };
+        let front = self.active.front()?;
         let ordinal = front.ticket.ordinal;
         // M5: tiling start and end, fragment start and end; which of them were written says
         // which half of the render stopped.
@@ -1778,7 +1885,7 @@ impl Pair {
                 self.slot,
                 ordinal
             );
-            return;
+            return None;
         };
         pr_warn!(
             "G17: render timeout slot {} ordinal {} qids {:?}: stamps [{:#x}, {:#x}], recovery state {}, pass [{:#x}, {:#x}], stages [{:#x}, {:#x}, {:#x}, {:#x}], tiler {:?}, fragment {:?}, job list {}\n",
@@ -1798,6 +1905,83 @@ impl Pair {
             snapshot.cursors[1],
             if snapshot.job_list_empty { "empty" } else { "not empty" }
         );
+        self.report_timeout_publication(front, stamp_of);
+        Some(index)
+    }
+
+    /// The second line of a timeout report, and what a later sample repeats: what each kick
+    /// was published to wait for, each named queue's completion stamp now, the completion
+    /// links and configuration the pair published, and the ioctl's work-state node.
+    fn report_timeout_publication(&self, front: &Active, stamp_of: &dyn Fn(u8) -> Option<u32>) {
+        let ordinal = front.ticket.ordinal;
+        let diag = &front.diag;
+        let deps = |stage: usize| DependencyList { diag: &diag.kicks[stage], stamp_of };
+        let links = self.memory.m5_link_words(ordinal).ok();
+        let node = front
+            .packet
+            .completion
+            .work_state()
+            .ok()
+            .map(|work| (work.progress().ok(), work.older_node()));
+        pr_warn!(
+            "G17: render timeout slot {} ordinal {} kicks [{:#x}, {:#x}]: tiling waits {}; fragment waits {}; covered {:?}, payload {:#x}, fragment busy {}, context update {}, identity update {}, configurations {:?} seeds [{:x?}, {:x?}]; links (hex) {:x?}; node {:?}\n",
+            self.slot,
+            ordinal,
+            front.kicks[0].get(),
+            front.kicks[1].get(),
+            deps(0),
+            deps(1),
+            diag.covered,
+            diag.payload,
+            diag.fragment_busy,
+            diag.context_update,
+            diag.identity_update,
+            diag.config_present,
+            diag.seed[0],
+            diag.seed[1],
+            links,
+            node
+        );
+    }
+
+    /// A later sample of a group a timeout report described: whether anything moved since.
+    pub(crate) fn report_timeout_resample(
+        &self,
+        ordinal: u64,
+        after_ms: u32,
+        stamps: [u32; 2],
+        stamp_of: &dyn Fn(u8) -> Option<u32>,
+    ) {
+        let Some(front) = self.active.front().filter(|front| front.ticket.ordinal == ordinal) else {
+            pr_warn!(
+                "G17: render timeout slot {} ordinal {} {} ms later: no longer the front\n",
+                self.slot,
+                ordinal,
+                after_ms
+            );
+            return;
+        };
+        let stages = self.memory.stage_timestamps(ordinal).unwrap_or_default();
+        let cursors = self.memory.graph.cursors().ok();
+        pr_warn!(
+            "G17: render timeout slot {} ordinal {} {} ms later: stamps [{:#x}, {:#x}], stages [{:#x}, {:#x}, {:#x}, {:#x}], cursors {:?}\n",
+            self.slot,
+            ordinal,
+            after_ms,
+            stamps[0],
+            stamps[1],
+            stages[0],
+            stages[1],
+            stages[2],
+            stages[3],
+            cursors
+        );
+        self.report_timeout_publication(front, stamp_of);
+    }
+
+    /// The ordinal of the front group, for a timeout report's later sample.
+    pub(crate) fn front_ordinal(&self) -> Option<u64> {
+        self.active.front().map(|front| front.ticket.ordinal)
     }
 
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
@@ -3553,6 +3737,7 @@ impl Pair {
         // The pair is reused in place: the collateral mark of a previous owner, which may have
         // closed without retiring anything, must not make the next owner's first blame its second.
         self.collateral_at = rebound_collateral(self.collateral_at, self.owner == Some(binding.owner));
+        note_rebind(self.slot, self.owner, binding.owner, same_context, foreign, self.ordinal);
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
         if foreign {
@@ -3568,6 +3753,27 @@ impl Pair {
         }
         Ok(())
     }
+}
+
+/// Logs a pair's move to another owner or context, the first [`REBINDS_LOGGED`] of a boot:
+/// a timeout report then shows whether its group ran under a fresh binding, whose
+/// configurations carry the identity updates and completion seeds.
+fn note_rebind(slot: u8, from: Option<u64>, to: u64, same_context: bool, foreign: bool, ordinal: u64) {
+    /// Rebinds logged per boot.
+    const REBINDS_LOGGED: u32 = 32;
+    static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= REBINDS_LOGGED {
+        return;
+    }
+    pr_info!(
+        "G17: render pair slot {} rebound from owner {:?} to owner {} ({} context, {}) at ordinal {}\n",
+        slot,
+        from,
+        to,
+        if same_context { "same" } else { "new" },
+        if foreign { "new pair memory" } else { "pair memory kept" },
+        ordinal
+    );
 }
 
 /// Whether `masks`, the stamp notifications collected for a pair whose tiling and fragment

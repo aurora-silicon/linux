@@ -56,6 +56,11 @@ impl Backend {
     }
 }
 
+/// Timeout reports per boot that take a second sample.
+const TIMEOUT_RESAMPLES: u32 = 2;
+/// How long after a timeout report its second sample is taken.
+const TIMEOUT_RESAMPLE_MS: u32 = 100;
+
 impl crate::g17::Firmware {
     pub(super) fn fail_render_packet(
         &mut self,
@@ -88,15 +93,11 @@ impl crate::g17::Firmware {
                     self.init.stamp(qids[1])?.load(core::sync::atomic::Ordering::Relaxed),
                 ];
                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                self.report_render_timeout(slot, packet, stamps, state);
                 if let Some(pair) = self.queues.render.entries[slot]
                     .as_mut()
                     .and_then(|entry| entry.pair.as_mut())
                 {
-                    if !packet.completion.status().unobserved_teardown(ETIMEDOUT)
-                        || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults)
-                    {
-                        pair.report_timeout(stamps, state);
-                    }
                     pair.expire_stamp_wait(packet, stamps, state)?;
                 }
             }
@@ -128,6 +129,87 @@ impl crate::g17::Firmware {
             self.queues.fail_compute_vm(&status, error, deferred)?;
         }
         Ok(())
+    }
+
+    /// The timeout report of the front group of render slot `slot`: the pair's lines, then
+    /// the firmware-wide state; for the first reports of a boot, a second sample of both after
+    /// [`TIMEOUT_RESAMPLE_MS`], which shows whether anything still moves. Only host reads of
+    /// shared memory and one register; the delay is the only effect on the failure it reports.
+    fn report_render_timeout(
+        &self,
+        slot: usize,
+        packet: &Arc<Packet>,
+        stamps: [u32; 2],
+        state: u32,
+    ) {
+        if packet.completion.status().unobserved_teardown(ETIMEDOUT)
+            && !crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults)
+        {
+            return;
+        }
+        let init = &self.init;
+        let stamp_of = |qid: u8| {
+            init.stamp(qid)
+                .ok()
+                .map(|stamp| stamp.load(core::sync::atomic::Ordering::Relaxed))
+        };
+        let pair = || {
+            self.queues
+                .render
+                .entries
+                .get(slot)
+                .and_then(Option::as_ref)
+                .and_then(|entry| entry.pair.as_ref())
+        };
+        let Some(index) = pair().and_then(|pair| pair.report_timeout(stamps, state, &stamp_of))
+        else {
+            return;
+        };
+        self.report_timeout_firmware(slot, 0);
+        if index >= TIMEOUT_RESAMPLES {
+            return;
+        }
+        let Some(ordinal) = pair().and_then(|pair| pair.front_ordinal()) else {
+            return;
+        };
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+            TIMEOUT_RESAMPLE_MS,
+        )));
+        let Some(pair) = pair() else {
+            return;
+        };
+        let qids = pair.qids();
+        let now = [stamp_of(qids[0]).unwrap_or(0), stamp_of(qids[1]).unwrap_or(0)];
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        pair.report_timeout_resample(ordinal, TIMEOUT_RESAMPLE_MS, now, &stamp_of);
+        self.report_timeout_firmware(slot, TIMEOUT_RESAMPLE_MS);
+    }
+
+    /// Firmware-wide state beside a render timeout: both event rings, the control ring, pending
+    /// growth and release work, the work rings of every priority, and the GPU's power and
+    /// progress words.
+    fn report_timeout_firmware(&self, slot: usize, after_ms: u32) {
+        use crate::g17::{channel::Events, fw::queue::Policy};
+        let mut events = [None; 2];
+        for (cursors, &role) in events.iter_mut().zip(self.roles()) {
+            *cursors = Events::cursors(&self.init, role).ok();
+        }
+        let when = if after_ms == 0 { "" } else { " later" };
+        let rings: [Option<[u32; 3]>; Policy::PRIORITIES as usize] =
+            core::array::from_fn(|priority| self.port.work_ring_cursors(priority as u8).ok());
+        pr_warn!(
+            "G17: render timeout slot {} firmware{}: events {:?}, control {:?}, growth {:?}, work rings {:?}, core power {:#x}, progress {:?}, power hold {}, effort {}\n",
+            slot,
+            when,
+            events,
+            self.init.control_counters().ok(),
+            self.queues.render.grow.report(),
+            rings,
+            self.bridge.regs.g17_core_power(),
+            self.init.m5_progress().ok(),
+            self.hold.active(),
+            self.effort.applied()
+        );
     }
 
     pub(in crate::g17) fn settle_blamed_render(
