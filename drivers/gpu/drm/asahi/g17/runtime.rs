@@ -4145,8 +4145,9 @@ impl Backend {
     }
 
     /// Warns about a compute publication whose admission budget ran out, so that the lost
-    /// device it causes can be attributed: the time spent in each wait, the owner's queue
-    /// installation state and the recovery state. Rate-limited to the first few per boot.
+    /// device it causes can be attributed: the owning process, the time spent in each wait,
+    /// the owner's queue installation state and the recovery state. Rate-limited to the first
+    /// few per boot.
     fn report_admission_expiry(&self, admission: &Admission<'_>) {
         static REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         const ADMISSION_REPORTS: u32 = 8;
@@ -4172,8 +4173,8 @@ impl Backend {
             return;
         }
         pr_warn!(
-            "asahi: G17: compute publication of owner {} gave up after {} ms; ms by wait: {}={} {}={} {}={} {}={} {}={} {}={} {}={}; queue {:?}; recovery pending {}, state {:?}\n",
-            self.owner, total,
+            "asahi: G17: compute publication of owner {} (pid {}) gave up after {} ms; ms by wait: {}={} {}={} {}={} {}={} {}={} {}={} {}={}; queue {:?}; recovery pending {}, state {:?}\n",
+            self.owner, self.context.owner_pid(), total,
             NAMES[0], spent[0], NAMES[1], spent[1], NAMES[2], spent[2], NAMES[3], spent[3],
             NAMES[4], spent[4], NAMES[5], spent[5], NAMES[6], spent[6],
             queue, pending, recovery_state,
