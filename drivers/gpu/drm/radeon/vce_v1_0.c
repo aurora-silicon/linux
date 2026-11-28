@@ -155,7 +155,7 @@ static void vce_v1_0_init_cg(struct radeon_device *rdev)
 	WREG32(VCE_UENC_REG_CLOCK_GATING, tmp);
 }
 
-int vce_v1_0_load_fw(struct radeon_device *rdev, uint32_t *data)
+int vce_v1_0_load_fw(struct radeon_device *rdev, void __iomem *data)
 {
 	struct vce_v1_0_fw_signature *sign = (void*)rdev->vce_fw->data;
 	uint32_t chip_id;
@@ -186,21 +186,22 @@ int vce_v1_0_load_fw(struct radeon_device *rdev, uint32_t *data)
 	if (i == le32_to_cpu(sign->num))
 		return -EINVAL;
 
-	data += (256 - 64) / 4;
-	data[0] = sign->val[i].nonce[0];
-	data[1] = sign->val[i].nonce[1];
-	data[2] = sign->val[i].nonce[2];
-	data[3] = sign->val[i].nonce[3];
-	data[4] = cpu_to_le32(le32_to_cpu(sign->len) + 64);
+	/* data points into the VRAM BO: only access it through the I/O helpers. */
+	data += 256 - 64;
+	writel(le32_to_cpu(sign->val[i].nonce[0]), data);
+	writel(le32_to_cpu(sign->val[i].nonce[1]), data + 4);
+	writel(le32_to_cpu(sign->val[i].nonce[2]), data + 8);
+	writel(le32_to_cpu(sign->val[i].nonce[3]), data + 12);
+	writel(le32_to_cpu(sign->len) + 64, data + 16);
 
-	memset(&data[5], 0, 44);
-	memcpy(&data[16], &sign[1], rdev->vce_fw->size - sizeof(*sign));
+	memset_io(data + 20, 0, 44);
+	memcpy_toio(data + 64, &sign[1], rdev->vce_fw->size - sizeof(*sign));
 
-	data += (le32_to_cpu(sign->len) + 64) / 4;
-	data[0] = sign->val[i].sigval[0];
-	data[1] = sign->val[i].sigval[1];
-	data[2] = sign->val[i].sigval[2];
-	data[3] = sign->val[i].sigval[3];
+	data += le32_to_cpu(sign->len) + 64;
+	writel(le32_to_cpu(sign->val[i].sigval[0]), data);
+	writel(le32_to_cpu(sign->val[i].sigval[1]), data + 4);
+	writel(le32_to_cpu(sign->val[i].sigval[2]), data + 8);
+	writel(le32_to_cpu(sign->val[i].sigval[3]), data + 12);
 
 	rdev->vce.keyselect = le32_to_cpu(sign->val[i].keyselect);
 
