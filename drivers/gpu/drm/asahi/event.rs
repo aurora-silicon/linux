@@ -143,6 +143,12 @@ impl slotalloc::SlotItem for EventInner {
     }
 }
 
+/// Returns the owner registered for `slot`. Slot numbers come from firmware messages, so one
+/// outside the table is treated like an empty slot instead of being trusted as an index.
+pub(crate) fn slot_owner<T: Clone>(owners: &[Option<T>], slot: u32) -> Option<T> {
+    owners.get(slot as usize).and_then(|owner| owner.as_ref().cloned())
+}
+
 /// Inner data for the event manager, to be protected by the SlotAllocator lock.
 pub(crate) struct EventManagerInner {
     stamps: GpuArray<Stamp>,
@@ -234,7 +240,7 @@ impl EventManager {
     pub(crate) fn signal(&self, slot: u32) {
         match self
             .alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 owner.signal();
@@ -249,7 +255,7 @@ impl EventManager {
     pub(crate) fn mark_error(&self, slot: u32, wait_value: u32, error: workqueue::WorkError) {
         match self
             .alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 owner.mark_error(EventValue(wait_value), error);
@@ -266,7 +272,7 @@ impl EventManager {
         slot: u32,
     ) -> Option<Arc<dyn workqueue::WorkQueue + Send + Sync>> {
         self.alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
     }
 
     /// Fail all commands, used when the GPU crashes.
@@ -284,5 +290,19 @@ impl EventManager {
         for wq in owners {
             wq.fail_all(error);
         }
+    }
+}
+
+#[kunit_tests(asahi_event_slot_owner)]
+mod tests {
+    use super::slot_owner;
+
+    #[test]
+    fn firmware_slot_outside_the_table_has_no_owner() {
+        let owners = [Some(7u32), None];
+        assert_eq!(slot_owner(&owners, 0), Some(7));
+        assert_eq!(slot_owner(&owners, 1), None);
+        assert_eq!(slot_owner(&owners, 2), None);
+        assert_eq!(slot_owner(&owners, u32::MAX), None);
     }
 }

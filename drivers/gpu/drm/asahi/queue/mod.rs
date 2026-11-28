@@ -851,13 +851,27 @@ unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
 // SAFETY: This UAPI record consists of integer fields and nested integer records.
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 
-fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {
+/// Returns the number of attachment records in a `SET_*_ATTACHMENTS` payload of `size` bytes.
+///
+/// The payload must hold whole records: both passes over the command buffer advance by the
+/// header's size, so a remainder would be skipped by one and parsed as a header by the other.
+fn attachment_count(size: usize) -> Result<usize> {
     const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_attachment>();
-    let count = size / STRIDE;
 
+    if size % STRIDE != 0 {
+        return Err(EINVAL);
+    }
+
+    let count = size / STRIDE;
     if count > microseq::MAX_ATTACHMENTS {
         return Err(EINVAL);
     }
+
+    Ok(count)
+}
+
+fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {
+    let count = attachment_count(size)?;
 
     let mut attachments = microseq::Attachments {
         count: count as u32,
@@ -1080,6 +1094,12 @@ impl Queue for Queue::ver {
                     {
                         return Err(EINVAL);
                     }
+                }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
+                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS
+                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS => {
+                    attachment_count(payload_size)?;
+                    cmdbuf.skip(payload_size);
                 }
                 _ => cmdbuf.skip(payload_size),
             }
@@ -1480,8 +1500,13 @@ impl Queue for Queue::ver {
 
 #[kunit_tests(asahi_legacy_inline_queue)]
 mod tests {
-    use super::{can_submit_inline, init_was_lost, prune_tvb_uses, TvbUse};
+    use super::{
+        attachment_count, build_attachments, can_submit_inline, init_was_lost, prune_tvb_uses,
+        TvbUse,
+    };
+    use crate::util::Reader;
     use kernel::prelude::*;
+    use kernel::uapi;
 
     use TvbUse::{Done, FailedPublished as FailPub, FailedUnpublished as FailUnpub, Pending};
 
@@ -1492,6 +1517,35 @@ mod tests {
         }
         prune_tvb_uses(&mut v, |u| *u);
         v
+    }
+
+    const ATTACHMENT: usize = core::mem::size_of::<uapi::drm_asahi_attachment>();
+
+    #[test]
+    fn attachment_payload_must_hold_whole_records() {
+        assert_eq!(attachment_count(0).ok(), Some(0));
+        assert_eq!(attachment_count(2 * ATTACHMENT).ok(), Some(2));
+        assert!(attachment_count(8).is_err());
+        assert!(attachment_count(ATTACHMENT + 8).is_err());
+        assert!(attachment_count(17 * ATTACHMENT).is_err());
+    }
+
+    #[test]
+    fn attachment_parse_consumes_the_declared_size() {
+        let raw = [0u8; 3 * ATTACHMENT];
+
+        // A remainder after the last record is refused, not left for the next header.
+        let mut reader = Reader::new(&raw);
+        assert!(build_attachments(&mut reader, ATTACHMENT + 8).is_err());
+        let mut reader = Reader::new(&raw);
+        assert!(build_attachments(&mut reader, 8).is_err());
+
+        // Whole records are consumed exactly, so the next header starts after them.
+        let mut reader = Reader::new(&raw);
+        let list = build_attachments(&mut reader, 2 * ATTACHMENT).expect("two records");
+        assert_eq!(list.count, 2);
+        reader.skip(ATTACHMENT);
+        assert!(reader.is_empty());
     }
 
     #[test]
