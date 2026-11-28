@@ -197,7 +197,8 @@ int vce_v1_0_load_fw(struct radeon_device *rdev, void __iomem *data)
 	memset_io(data + 20, 0, 44);
 	memcpy_toio(data + 64, &sign[1], rdev->vce_fw->size - sizeof(*sign));
 
-	data += le32_to_cpu(sign->len) + 64;
+	/* Keep the original word offset: (len + 64) / 4 dwords. */
+	data += round_down(le32_to_cpu(sign->len) + 64, 4);
 	writel(le32_to_cpu(sign->val[i].sigval[0]), data);
 	writel(le32_to_cpu(sign->val[i].sigval[1]), data + 4);
 	writel(le32_to_cpu(sign->val[i].sigval[2]), data + 8);
