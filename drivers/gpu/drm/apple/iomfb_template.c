@@ -329,6 +329,7 @@ DCP_THUNK_OUT(dcp_finish_wake, dcpep_pipe_query_474, u32);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 #endif
 
+extern int dcp_lab_pq_xfer, dcp_lab_pq_cs, dcp_lab_pad_off, dcp_lab_pad_val;
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 static u64 __maybe_unused dcp_swap_time(void);
 
@@ -472,6 +473,10 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
 		dcp_external_stamp_submit(dcp, &dcp->present_v27.swap);
+		if (dcp->output_edr && dcp_lab_pad_off >= 0 && dcp_lab_pad_off < 47)
+			for (int i = 0; i < SWAP_SURFACES; i++)
+				if (!request->surf_null[i])
+					dcp->present_v27.surf[i].padding[dcp_lab_pad_off] = dcp_lab_pad_val;
 		/* A swap with no surface of its own carries no EDR step either. */
 		if (dcp_has_panel(dcp) && iomfb_present_has_surface_h17p(request))
 			dcp_edr_prepare_v27(dcp, &dcp->present_v27.swap,
@@ -4687,6 +4692,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			if (dcp->output_pq || dcp->output_edr) {
 				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
 				req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
+				if (dcp_lab_pq_xfer >= 0)
+					req->surf[l].base.xfer_func = dcp_lab_pq_xfer;
+				if (dcp_lab_pq_cs >= 0)
+					req->surf[l].base.colorspace = dcp_lab_pq_cs;
 			} else if (dcp->output_hdr &&
 				   dcp->active_color.eotf == DCP_EOTF_BT_2100) {
 				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;

@@ -985,6 +985,16 @@ static bool v27_sleep_power_oob;
 module_param(v27_sleep_power_oob, bool, 0644);
 MODULE_PARM_DESC(v27_sleep_power_oob, "V27 sleep: the power state calls on the out-of-band context (0, default: the command context)");
 
+/* LAB ONLY (K114S-DISPLAY, never for a PR): PQ surface tag sweep on firmware 27. */
+int dcp_lab_pq_xfer = -1, dcp_lab_pq_cs = -1, dcp_lab_pad_off = -1, dcp_lab_pad_val;
+module_param_named(lab_pq_xfer, dcp_lab_pq_xfer, int, 0644);
+module_param_named(lab_pq_cs, dcp_lab_pq_cs, int, 0644);
+module_param_named(lab_pad_off, dcp_lab_pad_off, int, 0644);
+module_param_named(lab_pad_val, dcp_lab_pad_val, int, 0644);
+static int dcp_lab_rate;
+module_param_named(lab_rate, dcp_lab_rate, int, 0644);
+EXPORT_SYMBOL_GPL(dcp_lab_pq_xfer);
+
 /* macOS's A442 (key 0x41) on the out-of-band context alongside the display's power-on. */
 static bool v27_a442 = true;
 module_param(v27_a442, bool, 0644);
@@ -3647,6 +3657,8 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	 * other 60 Hz timings it lists.  Only the 120 Hz timing is known to
 	 * survive a modeset, so refuse the rest until they are understood.
 	 */
+	if (dcp_lab_rate > 0)
+		return drm_mode_vrefresh(mode) == dcp_lab_rate;
 	if (dcp->hw.only_120hz_modes && drm_mode_vrefresh(mode) != 120)
 		return false;
 
