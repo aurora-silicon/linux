@@ -41,7 +41,7 @@ config PHY_APPLE_T6040_USB2
 	help
 	  Build the PHY provider for the T6040 generation's Type-C ports and
 	  fixed DisplayPort PHYs. It implements the USB2 host sequence and the
-	  USB3 host attach decoded from the paired AppleT6040TypeCPhy driver,
+	  USB3 host attach described by the PHY registers and ADT properties,
 	  including the start of the PHY coprocessor, and the DisplayPort mode
 	  (all four lanes, RBR to HBR3) a Type-C controller selects through the
 	  PHY's mode switch or that an HDMI converter's PHY runs permanently. The

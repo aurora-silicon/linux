@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * USB3 on the J575c's four back Type-C ports (typec0-3), as on the J616s
- * (t6040-j616s-usb3.dtsi): the atc-phyN tables AppleT6040TypeCPhy applies at
- * every USB3 power-on, from this machine's ADT /arm-io/atc-phyN, relative to
+ * (t6040-j616s-usb3.dtsi): the atc-phyN tables applied at every USB3 power-on,
+ * from this machine's ADT /arm-io/atc-phyN, relative to
  * the PHY region each one targets, and the /arm-io/usb-drdN controller and
  * pipehandler tables (the same on the four ports, and the J616s's). Entries
  * are <offset mask value>: new = (old & ~mask) | value. The PHYs differ in
  * their per-port calibration (axi2af, aus40cmn-shm, and auspll on ATC2).
- * Generated from the redacted ADT (macOS 27.0.1).
+ * Generated from the redacted ADT.
  */
 
 &atcphy0 {
@@ -222,7 +222,7 @@
 	};
 };
 
-/* GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it, after DRD_USB31_GBL_DEFAULT */
+/* Apply GCTL.PWRDNSCALE = 0xd after the ADT global defaults. */
 &dwc3_0 {
 	/delete-property/ maximum-speed;
 	phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
@@ -453,7 +453,7 @@
 	};
 };
 
-/* GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it, after DRD_USB31_GBL_DEFAULT */
+/* Apply GCTL.PWRDNSCALE = 0xd after the ADT global defaults. */
 &dwc3_1 {
 	/delete-property/ maximum-speed;
 	phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
@@ -684,7 +684,7 @@
 	};
 };
 
-/* GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it, after DRD_USB31_GBL_DEFAULT */
+/* Apply GCTL.PWRDNSCALE = 0xd after the ADT global defaults. */
 &dwc3_2 {
 	/delete-property/ maximum-speed;
 	phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
@@ -915,7 +915,7 @@
 	};
 };
 
-/* GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it, after DRD_USB31_GBL_DEFAULT */
+/* Apply GCTL.PWRDNSCALE = 0xd after the ADT global defaults. */
 &dwc3_3 {
 	/delete-property/ maximum-speed;
 	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;

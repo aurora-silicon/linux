@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-/* avd-fw v5/tier2 table, Copyright The Asahi Linux Contributors. */
-static const struct avd_kopsia_tunable kopsia_tunables[] = {
+/* avd-fw v5/tier2 register initialization, Copyright The Asahi Linux Contributors. */
+static const struct avd_kopsia_reg_init kopsia_reg_init[] = {
 	{0x0008, 0x80000000, 0x80000000}, /* MCTL_MODE */
 	{0x1000, 0x80000000, 0x80000000}, /* HEVC_MODE */
 	{0x1100, 0x80000000, 0x80000000}, /* HEVC_MODE */

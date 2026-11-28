@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * USB3 tunables of the J616s Type-C ports, from this machine's ADT (macOS 26.6.2, 2026-10-16):
- * the atc-phyN tables AppleT6040TypeCPhy applies at every USB3 power-on, relative to the PHY
- * region each one targets, and the usb-drdN controller tables (identical on the three ports).
+ * USB3 tunables of the J616s Type-C ports, from this machine's ADT: the
+ * atc-phyN tables applied at every USB3 power-on, relative to the PHY region
+ * each one targets, and the usb-drdN controller tables (identical on the three ports).
  * Entries are <offset mask value>: new = (old & ~mask) | value.
  */
 
@@ -544,7 +544,7 @@
 };
 
 &dwc3_0 {
-	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
+	/* ADT global defaults followed by GCTL.PWRDNSCALE = 0xd. */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
 		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
@@ -558,7 +558,7 @@
 };
 
 &dwc3_1 {
-	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
+	/* ADT global defaults followed by GCTL.PWRDNSCALE = 0xd. */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
 		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
@@ -572,7 +572,7 @@
 };
 
 &dwc3_2 {
-	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
+	/* ADT global defaults followed by GCTL.PWRDNSCALE = 0xd. */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
 		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,

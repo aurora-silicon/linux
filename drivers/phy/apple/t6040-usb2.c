@@ -5,7 +5,7 @@
  * This deliberately does not share the T8103/T8122 ATC PHY compatible. T6040
  * has CIO4/TB5-era resources and a different event-bank layout. The
  * implemented operations are the USB2 host sequence and the USB3 host attach
- * (mode 4) decoded from the paired AppleT6040TypeCPhy driver.
+ * (mode 4) described by the PHY registers and ADT properties.
  *
  * USB3: the Type-C orientation switch records the plug orientation; power_on
  * of the USB3 PHY wakes the PHY, applies the tunables and the crossbar for
@@ -14,7 +14,7 @@
  * the dummy PHY to this one, which dwc3-apple does after the core init and
  * before xHCI starts. power_off parks the PIPE again, powers the lanes down,
  * stops the coprocessor and resets its RTKit state, and puts the PHY to
- * sleep, as macOS does on every detach: every attach boots the firmware again.
+ * sleep. Every attach therefore boots the firmware again.
  * Without a plug orientation, or when the coprocessor does not come up, the
  * PIPE stays on the dummy PHY and the port keeps working at USB2.
  *
@@ -111,14 +111,14 @@
 #define T6040_PIPEHANDLER_DUMMY_PHY_READY	BIT(15)
 
 /*
- * DisplayPort (four-lane mode 3 and two-lane mode 4). Offsets are into the "core" and "cfg" windows
- * the USB3 path uses; names follow the paired AppleT6040TypeCPhy driver.
+ * DisplayPort (four-lane mode 3 and two-lane mode 4). Offsets are into the
+ * "core" and "cfg" windows shared with the USB3 path.
  */
-#define T6040_CORE_AUX_CTRL		0x28000	/* ACIOPHY_AUX_TOP_BLK_AUX_CTRL */
-#define T6040_CORE_AUX_PWR		0x28400	/* ACIOPHY_AUX_SHM_BLK_AUX_PWR_REG */
+#define T6040_CORE_AUX_CTRL		0x28000	/* DP AUX control */
+#define T6040_CORE_AUX_PWR		0x28400	/* DP AUX power control */
 
-#define T6040_CFG_DP_CLKSWITCH_CTRL	0x14	/* ATCPHY_DP_CLKSWITCH_CONTROL_REGS */
-#define T6040_CFG_DP_CLKSWITCH_STAT	0x18	/* ATCPHY_DP_CLKSWITCH_STATUS_REGS */
+#define T6040_CFG_DP_CLKSWITCH_CTRL	0x14	/* DP clock-switch control */
+#define T6040_CFG_DP_CLKSWITCH_STAT	0x18	/* DP clock-switch status */
 
 /* PHY core ("core"), atc-phy reg[2] and the blocks behind it */
 #define T6040_CORE_CMN_OVRD		0x0c	/* CFG0_TOP */
@@ -129,13 +129,13 @@
 #define T6040_CORE_SLP_CTRL		0x120	/* CFG_SLP_CTRL */
 #define T6040_CORE_LN0_RX_TOP_CIO	0x935c
 #define T6040_CORE_LN1_RX_TOP_CIO	0x1935c
-#define T6040_CORE_CMN_BIAS		0xa00	/* AUS40CMN_SHM CMN_BIAS_REG */
+#define T6040_CORE_CMN_BIAS		0xa00	/* common bias control */
 #define T6040_CORE_CMN_BIAS_BGBIAS_EN_OV	BIT(1)
-#define T6040_CORE_UC_CTRL		0x260	/* ACIOPHY_TOP_BLK_UC_CTRL_REG */
+#define T6040_CORE_UC_CTRL		0x260	/* PHY coprocessor control */
 #define T6040_CORE_UC_CTRL_TNBL_DONE	BIT(10)	/* the coprocessor has tuned the PHY */
 #define T6040_CORE_XBAR			0x6c
 #define T6040_CORE_XBAR_LANES		0x78
-#define T6040_CORE_BIST			0x29000	/* ACIOPHY_BIST_BLK, atc-phy reg[35] */
+#define T6040_CORE_BIST			0x29000	/* BIST block, atc-phy reg[35] */
 #define T6040_BIST_CFG0			0x004
 #define T6040_BIST_CFG1			0x008
 #define T6040_BIST_STATUS		0x104
@@ -171,7 +171,7 @@
 
 /* ADT acio-phy-cpuN segment-ranges: the coprocessor sees its __DATA SRAM ("cpu-data") here */
 #define T6040_CPU_DATA_IOVA		0x10000000
-/* The coprocessor's application endpoint, and the one message macOS sends it */
+/* The coprocessor's application endpoint and power-down message. */
 #define T6040_CPU_EP_APP		32
 #define T6040_CPU_MSG_POWER_DOWN	0x0100000000000000ULL
 
@@ -237,8 +237,8 @@ static const char * const t6040_usb3_region_names[T6040_USB3_NR_REGIONS] = {
 };
 
 /*
- * The ADT tables AppleT6040TypeCPhy applies at every USB3 power-on (mode 4),
- * in its order; the device tree carries them per port, as calibration.
+ * The ADT carries these per-port calibration tables in the order required at
+ * every USB3 power-on (mode 4).
  */
 static const struct {
 	const char *prop;
@@ -493,7 +493,7 @@ static int t6040_usb2_power_off(struct phy *phy)
 			 T6040_USB2_MISCTUNE_APBCLK_GATE_OFF);
 	t6040_usb2_set32(tphy->usb2 + T6040_USB2_MISCTUNE,
 			 T6040_USB2_MISCTUNE_REFCLK_GATE_OFF);
-	/* The vendor driver waits 500 ns after gating the clocks. */
+	/* Allow 500 ns for the clocks to gate. */
 	ndelay(500);
 
 	/*
@@ -681,9 +681,9 @@ static int t6040_usb3_cpu_start(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * C: runFirmware. macOS starts the coprocessor on every attach and stops it on
- * every detach; each start makes the firmware tune the PHY. Then release the
- * PHY reset (D).
+ * C: start the coprocessor on every attach and stop it on every detach.
+ * Each start makes the firmware tune the PHY. Then release the PHY reset
+ * (D).
  */
 static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool swap)
 {
@@ -727,8 +727,8 @@ static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool s
  * Detach (RTKit power state 0): Power Down, RTKit AP then IOP to idle,
  * wait up to 10 ms for the CPU to idle, STOP. The RTKit transport stays stopped
  * so the next attach can either restart it normally or first power-cycle the
- * domains. The mailbox outbox enable that macOS clears here is left as iBoot
- * set it: Linux never clears it.
+ * domains. Linux leaves the mailbox outbox enable in its boot-firmware
+ * state.
  */
 static void t6040_usb3_firmware_power_down(struct t6040_usb2_phy *tphy)
 {
@@ -779,9 +779,9 @@ static void t6040_usb3_firmware_power_down(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * aciophy_phy_shutdown_partB: the CFG block back to its boot state (ctrl 0x4:
- * clamped, asleep, in reset; AHB clock not requested), so the next attach
- * runs A from the start.
+ * Return the CFG block to its boot state (ctrl 0x4: clamped, asleep, in
+ * reset; AHB clock not requested), so the next attach runs A from the
+ * start.
  */
 static void t6040_usb3_sleep(struct t6040_usb2_phy *tphy)
 {
@@ -876,7 +876,7 @@ resume_phy:
 	return ret;
 }
 
-/* Sets PHY_STATUS(_2) handshake bits in the BIST block and waits as macOS does, without failing. */
+/* Pulse the PHY status handshakes in the BIST block; status timeouts are diagnostic. */
 static void t6040_usb3_bist_pulse(struct t6040_usb2_phy *tphy, u32 reg, u32 bit)
 {
 	t6040_usb2_set32(t6040_bist(tphy) + reg, bit);
@@ -919,10 +919,10 @@ static void t6040_usb3_bist_off(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * aciophy_phy_shutdown_partA: the PHY's USB link side down (the same BIST
- * handshake as the PIPE switch), both TX lanes, then the common block.
+ * Shut down the PHY's USB link side (the same BIST handshake as the PIPE
+ * switch), both TX lanes, then the common block.
  */
-/* aciophy_tx_powerdown(0), (1), then aciophy_cmn_shutdown: USB and CIO alike. */
+/* Power down both transmit lanes, then the common block, for USB and CIO. */
 static void t6040_phy_tx_cmn_down(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
@@ -937,7 +937,7 @@ static void t6040_phy_tx_cmn_down(struct t6040_usb2_phy *tphy)
 		udelay(1);
 	}
 
-	/* aciophy_cmn_shutdown */
+	/* Power down the common block. */
 	t6040_usb2_clear32(core + T6040_CORE_CMN_BIAS, T6040_CORE_CMN_BIAS_BGBIAS_EN_OV);
 	udelay(1);
 	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_CLAMP);
@@ -1001,8 +1001,8 @@ static void t6040_usb3_pipe_mux(struct t6040_usb2_phy *tphy, u32 clk, u32 data)
 }
 
 /*
- * E: move the PIPE from the dummy PHY to this one, inside macOS's BIST
- * bracket. The lock is never acknowledged on T6040 (the dummy PHY clocks the
+ * E: move the PIPE from the dummy PHY to this one inside the BIST handshake.
+ * The lock is never acknowledged on T6040 (the dummy PHY clocks the
  * handshake, and so far it has not answered); the switch works without it.
  */
 static void t6040_usb3_pipe_switch(struct t6040_usb2_phy *tphy)
@@ -1010,7 +1010,7 @@ static void t6040_usb3_pipe_switch(struct t6040_usb2_phy *tphy)
 	void __iomem *ph = tphy->pipehandler;
 	u32 val;
 
-	/* macOS's controller reset() sets DUMMY_PHY_READY once; Linux's dwc3 does not. */
+	/* The pipehandler requires DUMMY_PHY_READY before leaving the dummy PHY. */
 	if (!(readl(ph + T6040_PIPEHANDLER_NONSELECTED_OVERRIDE) &
 	      T6040_PIPEHANDLER_DUMMY_PHY_READY)) {
 		t6040_usb2_set32(ph + T6040_PIPEHANDLER_NONSELECTED_OVERRIDE,
@@ -1037,7 +1037,7 @@ static void t6040_usb3_pipe_switch(struct t6040_usb2_phy *tphy)
 	t6040_usb3_pipe_unlock(tphy);
 }
 
-/* macOS setUSB3Mode(0) from 2: the PIPE back on the dummy PHY. */
+/* Move the PIPE from the USB3 PHY back to the dummy PHY. */
 static void t6040_usb3_pipe_park(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *ph = tphy->pipehandler;
@@ -1145,7 +1145,7 @@ static int t6040_usb3_power_on(struct phy *phy)
 	return 0;
 }
 
-/* aciophy_phy_shutdown with the lock held: lanes, coprocessor, then the CFG block. */
+/* With the lock held, stop the lanes, coprocessor, and then the CFG block. */
 static void t6040_usb3_down_locked(struct t6040_usb2_phy *tphy)
 {
 	if (tphy->pipe_switched) {
@@ -1228,9 +1228,9 @@ static void t6040_usb3_switch_unregister(void *sw)
  *
  * The fixed DP PHY of an HDMI converter (no USB controller, no pipehandler)
  * and a Type-C PHY whose port the Type-C controller has put into DP alt mode
- * with pin assignment C or E are brought up the same way, as the paired
- * AppleT6040TypeCPhy driver does for its mode 3: wake the CFG block, apply the
- * generic ADT tunables and the DPTX tunables, set the lane crossbar to DP on
+ * with pin assignment C or E use the same mode 3 sequence: wake the CFG
+ * block, apply the generic ADT tunables and the DPTX tunables, set the lane
+ * crossbar to DP on
  * all lanes, hold the common block and both TX lanes on (the PHY coprocessor
  * does not run in this mode) and release the PHY reset. The DCP then sets the
  * link rate through phy_configure(): the per-rate link sequence is the T6050
@@ -1260,7 +1260,7 @@ static void t6040_dp_fixed_tunables(void __iomem *core)
 		t6040_usb2_mask32(core + dptx[i].off, dptx[i].clear, dptx[i].set);
 }
 
-/* aciophy_xbar_config for PHY mode 3 (DP on all four lanes). */
+/* Configure the lane crossbar for PHY mode 3 (DP on all four lanes). */
 static void t6040_dp_xbar_config(struct t6040_usb2_phy *tphy, bool flip)
 {
 	void __iomem *core = t6040_core(tphy);
@@ -1275,15 +1275,15 @@ static void t6040_dp_xbar_config(struct t6040_usb2_phy *tphy, bool flip)
 }
 
 /*
- * aciophy_dptx_adjust_lane_mode: the core+0x6c lane fields [4:2] and [7:5]
- * are 7 for every DP 1.x link rate (UHBR rates would use 2).
+ * The core+0x6c lane fields [4:2] and [7:5] are 7 for every DP 1.x link rate
+ * (UHBR rates would use 2).
  */
 static void t6040_dp_adjust_lane_mode(struct t6040_usb2_phy *tphy)
 {
 	t6040_usb2_set32(t6040_core(tphy) + T6040_CORE_XBAR, 0x1c | 0xe0);
 }
 
-/* aciophy_aux_init: the DP AUX block. */
+/* Initialize the DP AUX block. */
 static void t6040_dp_aux_init(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
@@ -1295,8 +1295,8 @@ static void t6040_dp_aux_init(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * aciophy_configure_dp_clks: the two DP clock switches of the "cfg" window
- * (control at 0x14, status at 0x18). Each switch enables its pixel clock,
+ * Configure the two DP clock switches of the "cfg" window (control at 0x14,
+ * status at 0x18). Each switch enables its pixel clock,
  * requests the two PMGR DP clocks and releases the requests one by one once
  * they are acknowledged. On the J616s the pixel-clock enable is acknowledged
  * with the enable bit alone and the PMGR acknowledgements arrive with the
@@ -1387,7 +1387,7 @@ static bool t6040_dp_only(struct t6040_usb2_phy *tphy)
  * t6040_usb3_lanes for lane 0 and lane 1 (USB3 releases only the plug's lane).
  * Without the PHY coprocessor nothing powers the common block and the TX lanes
  * once their overrides are released, so they are held on by override: the
- * reverse of aciophy_cmn_shutdown / aciophy_tx_powerdown, with the override
+ * reverse of the common-block and transmit-lane shutdown, with the override
  * enables (0x2a; 0x4/0x40/0x400 per lane) set.
  */
 static void t6040_dp_slpctrl(struct t6040_usb2_phy *tphy)
@@ -1418,9 +1418,9 @@ static void t6040_dp_slpctrl(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * aciophy_phy_init for mode 3: wake the CFG block (shared with USB3), apply
- * the generic ADT tables and the DPTX tunables, xbar_config, slpctrl_init and
- * the reset deassert of partC (no coprocessor firmware in this mode).
+ * For mode 3, wake the CFG block (shared with USB3), apply the generic ADT
+ * tables and DPTX tunables, configure the crossbar and lane power controls,
+ * and release reset (no coprocessor firmware in this mode).
  */
 static int t6040_dp_phy_init(struct t6040_usb2_phy *tphy, bool flip)
 {
@@ -1444,7 +1444,7 @@ static int t6040_dp_phy_init(struct t6040_usb2_phy *tphy, bool flip)
 	return 0;
 }
 
-/* aciophy_dptx_main_init up to the link rate, which .configure sets. */
+/* Set up the DPTX blocks except for the link rate, which .configure sets. */
 static void t6040_dp_mode_setup(struct t6040_usb2_phy *tphy, bool flip)
 {
 	t6040_dp_fixed_tunables(t6040_core(tphy));
@@ -1458,8 +1458,8 @@ static void t6040_dp_mode_setup(struct t6040_usb2_phy *tphy, bool flip)
  * ATC PHY core with the T6040. Bank numbers are the atc-phy "reg" indices of
  * the T6050/T6040 ADT; banks 2..34 are offsets into "core". Bank 39 is the
  * T6050 clock shim; on the T6040 the DP clock switch of the "cfg" window
- * stands in for it and runs after the lane program, as AppleT6040TypeCPhy
- * does. The sequences hold no power-domain or tunable steps that apply here.
+ * stands in for it and runs after the lane program. The sequences hold no
+ * power-domain or tunable steps that apply here.
  */
 enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER };
 struct atc_op {
@@ -1635,7 +1635,7 @@ static void t6040_cio_tunables(struct t6040_usb2_phy *tphy)
 	t6040_usb2_clear32(core + T6040_CORE_LN1_RX_TOP_CIO, 0xe00);
 }
 
-/* aciophy_xbar_config, mode 2: orientation is one crossbar bit. */
+/* Configure the mode 2 crossbar; orientation is one crossbar bit. */
 static void t6040_cio_xbar(struct t6040_usb2_phy *tphy, bool flip)
 {
 	void __iomem *core = t6040_core(tphy);
@@ -1645,7 +1645,7 @@ static void t6040_cio_xbar(struct t6040_usb2_phy *tphy, bool flip)
 	t6040_usb2_mask32(core + T6040_CORE_XBAR, 0x3, 0x2);
 }
 
-/* aciophy_slpctrl_init, mode 2: both lanes, whatever the orientation. */
+/* Enable both mode 2 lanes, whatever the orientation. */
 static void t6040_cio_lanes_on(struct t6040_usb2_phy *tphy)
 {
 	static const struct { u32 off, bit; bool set; } steps[] = {
@@ -1674,7 +1674,7 @@ static void t6040_cio_lanes_on(struct t6040_usb2_phy *tphy)
 	}
 }
 
-/* aciophy_rx_powerdown(0), (1): CIO powers the receivers down, USB does not. */
+/* Power down both receivers for CIO; USB does not use this step. */
 static void t6040_cio_rx_down(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);

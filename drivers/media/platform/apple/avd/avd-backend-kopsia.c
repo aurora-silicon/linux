@@ -16,7 +16,8 @@
 #define KOPSIA_DONE BIT(2)
 #define KOPSIA_PP 13
 
-struct avd_kopsia_tunable { u32 off, mask, val; };
+/* Per-engine controller register initialization. */
+struct avd_kopsia_reg_init { u32 off, mask, val; };
 #include "avd-kopsia-tunables.h"
 
 struct avd_kopsia {
@@ -51,8 +52,8 @@ static int avd_kopsia_boot(struct avd_dev *avd)
 	writel(U32_MAX, avd->ctrl + 0xe6d4);
 	writel(U32_MAX, avd->ctrl + 0xe710);
 	writel(U32_MAX, avd->ctrl + 0xe714);
-	for (i = 0; i < ARRAY_SIZE(kopsia_tunables); i++) {
-		const struct avd_kopsia_tunable *t = &kopsia_tunables[i];
+	for (i = 0; i < ARRAY_SIZE(kopsia_reg_init); i++) {
+		const struct avd_kopsia_reg_init *t = &kopsia_reg_init[i];
 
 		kopsia_update(avd->ctrl + t->off, t->mask, t->val);
 	}
