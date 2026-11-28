@@ -850,6 +850,8 @@ struct apple_sleep_soc {
 struct apple_sleep {
 	struct device *dev;
 	const struct apple_sleep_soc *soc;
+	/* The machine has fewer cores than its profile was measured on (a binned part) */
+	bool fewer_cpus;
 	struct apple_sleep_region_state *region;
 	void __iomem *ps;
 	void __iomem *pwrgate;
@@ -2216,10 +2218,25 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 		    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
 
-	/* The node's compatible chose the profile: its machine is where it was measured */
-	if (soc->machine && (cpu_logical_map(0) != soc->boot_mpidr ||
-			     num_possible_cpus() != soc->cpu_count))
-		return dev_err_probe(s->dev, -EINVAL, "unsupported CPU inventory\n");
+	/*
+	 * The node's compatible chose the profile: its machine is where it was measured. A binned
+	 * part of that machine has fewer cores (the 15-core M5 Pro J714s against the 18-core one
+	 * the J714s profile was measured on), so the inventory is the DT's CPU nodes, every one
+	 * of which the boot loader started. The kernel must be able to bring each of them down:
+	 * a possible mask clipped by nr_cpus or NR_CPUS would leave started cores out of the
+	 * sleep, so it is refused. The loop below checks every core.
+	 */
+	if (soc->machine) {
+		struct device_node *cpu_np;
+		unsigned int dt_cpus = 0;
+
+		for_each_of_cpu_node(cpu_np)
+			dt_cpus++;
+		if (cpu_logical_map(0) != soc->boot_mpidr || dt_cpus > soc->cpu_count ||
+		    num_possible_cpus() != dt_cpus)
+			return dev_err_probe(s->dev, -EINVAL, "unsupported CPU inventory\n");
+		s->fewer_cpus = dt_cpus < soc->cpu_count;
+	}
 
 	index = of_property_match_string(np, "reg-names", "cpu-start");
 	if (index < 0)
@@ -8419,6 +8436,15 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	apple_sleep = s;
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(s->soc->early_context ? &apple_sleep_early_ops : &apple_sleep_ops);
+	/*
+	 * Not the default on a binned part either: there a wake has been seen to leave the PMP
+	 * down, so deep sleep is asked for by name until that resumes.
+	 */
+	if (s->fewer_cpus && mem_sleep_current == PM_SUSPEND_MEM) {
+		mem_sleep_current = PM_SUSPEND_TO_IDLE;
+		dev_info(dev, "%u of the profile's %u CPUs: deep sleep is offered, s2idle stays the default\n",
+			 num_possible_cpus(), s->soc->cpu_count);
+	}
 	/* Not on a SoC whose data is derived: there it is asked for by name. */
 	if (s->soc->untested) {
 		if (mem_sleep_current == PM_SUSPEND_MEM)
