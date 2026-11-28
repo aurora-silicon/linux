@@ -4247,6 +4247,7 @@ impl Firmware {
         s.starve_from_ns = 0;
         let now = s.pub_ns;
         self.power.utilization.busy(now);
+        self.power.note_clpc_busy(now);
     }
 }
 

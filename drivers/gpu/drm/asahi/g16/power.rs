@@ -38,6 +38,8 @@ static_assert!(initdata::V26B123.pstate_selectors[2] == 0x9c);
 extern "C" {
     fn asahi_g16_clpc_gpu_get(dev: *mut c_void, out: *mut *mut c_void) -> core::ffi::c_int;
     fn asahi_g16_clpc_gpu_set_active(gpu: *mut c_void, active: bool);
+    fn asahi_g16_clpc_gpu_set_busy(gpu: *mut c_void, permille: core::ffi::c_uint);
+    fn asahi_g16_clpc_gpu_clear_busy(gpu: *mut c_void);
     fn asahi_g16_clpc_gpu_put(gpu: *mut c_void);
     fn asahi_g16_cooling_register(dev: *mut c_void) -> *mut c_void;
     fn asahi_g16_cooling_unregister(cooling: *mut c_void);
@@ -171,6 +173,16 @@ impl Demand {
         // SAFETY: the retained reference is live; NULL denotes no provider.
         unsafe { asahi_g16_clpc_gpu_set_active(self.0, active) };
     }
+
+    fn set_busy(&self, permille: u32) {
+        // SAFETY: the retained reference is live; NULL denotes no provider.
+        unsafe { asahi_g16_clpc_gpu_set_busy(self.0, permille.min(1000) as core::ffi::c_uint) };
+    }
+
+    fn clear_busy(&self) {
+        // SAFETY: the retained reference is live; NULL denotes no provider.
+        unsafe { asahi_g16_clpc_gpu_clear_busy(self.0) };
+    }
 }
 
 impl Drop for Demand {
@@ -187,6 +199,8 @@ pub(crate) struct Power {
     clpc: Demand,
     /// Work-in-flight state and 2 ms idle-hold hysteresis reported to `clpc`.
     clpc_hold: policy::ClpcHold,
+    /// Per-window GPU busy share reported to `clpc` for DT memory-state ladders.
+    clpc_busy: policy::ClpcBusyShare,
     cooling: Cooling,
     /// Fail-closed thermal-zone backstop used when the GPU DT node has no `apple,pmp`.
     zone_backstop: policy::ZoneBackstop,
@@ -220,6 +234,7 @@ impl Power {
         Ok(Self {
             clpc,
             clpc_hold: policy::ClpcHold::new(),
+            clpc_busy: policy::ClpcBusyShare::new(),
             cooling,
             zone_backstop: policy::ZoneBackstop::new(),
             sample: Sample {
@@ -258,19 +273,63 @@ impl Power {
         self.utilization.top = top;
     }
 
+    fn apply_clpc_busy(&self, action: policy::ClpcBusyAction) {
+        match action {
+            policy::ClpcBusyAction::Set(permille) => self.clpc.set_busy(permille),
+            policy::ClpcBusyAction::Clear => self.clpc.clear_busy(),
+        }
+    }
+
+    fn resume_clpc_busy(&mut self, now: u64) {
+        if self.clpc_busy.resume(now) {
+            if self.clpc_hold.release_now() {
+                self.clpc.set_active(false);
+            }
+            self.clpc.clear_busy();
+        }
+    }
+
+    /// Records GPU publication at `now` for CLPC busy-share tracking.
+    pub(crate) fn note_clpc_busy(&mut self, now: u64) {
+        self.resume_clpc_busy(now);
+        if let Some(permille) = self.clpc_busy.busy(now) {
+            self.clpc.set_busy(permille);
+        }
+        if let Some(action) = self.clpc_busy.sample(now, true) {
+            self.apply_clpc_busy(action);
+        }
+    }
+
+    /// Records GPU drain at `now` for CLPC busy-share tracking.
+    pub(crate) fn note_clpc_idle(&mut self, now: u64) {
+        self.clpc_busy.idle(now);
+    }
+
     /// Reports a change of work in flight to the CLPC: the memory and fabric
     /// floor follows it, held for [`policy::CLPC_IDLE_HOLD_NS`] after drain.
     pub(crate) fn report_work(&mut self, in_flight: bool) {
-        if let Some(active) = self.clpc_hold.report(in_flight, now_ns()) {
+        let now = now_ns();
+        if in_flight {
+            self.resume_clpc_busy(now);
+            if let Some(action) = self.clpc_busy.sample(now, true) {
+                self.apply_clpc_busy(action);
+            }
+        }
+        if let Some(active) = self.clpc_hold.report(in_flight, now) {
             self.clpc.set_active(active);
+            if !active {
+                self.clpc_busy.note_inactive(now);
+            }
         }
     }
 
     /// Immediately drops the CLPC memory and fabric floor (fail-stop or sleep).
     pub(crate) fn release_clpc_now(&mut self) {
+        self.clpc_busy.clear_active();
         if self.clpc_hold.release_now() {
             self.clpc.set_active(false);
         }
+        self.clpc.clear_busy();
     }
 
     /// Whether the CLPC floor is held across an idle gap awaiting expiry.
@@ -341,6 +400,10 @@ impl Firmware {
         let idle = self.engine.flights.is_empty();
         if idle && self.power.clpc_hold.expire(now) {
             self.power.clpc.set_active(false);
+            self.power.clpc_busy.note_inactive(now);
+        }
+        if let Some(action) = self.power.clpc_busy.sample(now, !idle) {
+            self.power.apply_clpc_busy(action);
         }
         let (limit, decision) = self.power.ceiling(now, idle);
         let target = self

@@ -1676,6 +1676,7 @@ impl Firmware {
             // Drained: a gap until the next publication.
             self.engine.stats.idle_from_ns = now_ns();
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
+            self.power.note_clpc_idle(self.engine.stats.idle_from_ns);
             self.power.report_work(false);
         }
         // The next prefix on the retired flight's pipe/class starts executing about now.

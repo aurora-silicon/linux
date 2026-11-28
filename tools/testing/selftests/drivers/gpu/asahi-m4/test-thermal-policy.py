@@ -197,8 +197,11 @@ print(unit)
 G16 = ROOT/'drivers/gpu/drm/asahi/g16'
 for path, call in [
         ('engine.rs', 'self.power.utilization.busy(now);'),
+        ('engine.rs', 'self.power.note_clpc_busy(now);'),
         ('poll.rs', 'self.power.utilization.idle(self.engine.stats.idle_from_ns);'),
+        ('poll.rs', 'self.power.note_clpc_idle(self.engine.stats.idle_from_ns);'),
         ('power.rs', '.govern(now, limit, !self.engine.flights.is_empty());'),
+        ('power.rs', 'if let Some(action) = self.power.clpc_busy.sample(now, !idle) {'),
         ('poll.rs', 'fn arm_idle_power_poll(self: &Arc<Self>, firmware: &Firmware)'),
         ('poll.rs', 'if firmware.power.clpc_holding() {'),
         ('poll.rs', 'else if firmware.power.utilization.decaying() {'),
