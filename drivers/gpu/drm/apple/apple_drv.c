@@ -2337,7 +2337,8 @@ static int add_dcp_components(struct device *dev,
 				 * ignore it here.
 				 */
 				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				    of_device_is_compatible(port, "apple,t8122-atcphy") ||
+				    of_device_is_compatible(port, "apple,t8142-atcphy")) {
 					of_node_put(port);
 					continue;
 				}

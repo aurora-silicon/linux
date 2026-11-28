@@ -98,7 +98,13 @@
 	};
 };
 
+/*
+ * Scanout and PIODMA share the first register window (as in the J813 tree).
+ * The boot loader's T8142 display handoff admits a stream only on a DART
+ * with a single register window and refuses the whole display otherwise.
+ */
 &disp0_dart {
+	reg = <2 0x86300000 0 0xc000>;
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
 	status = "disabled";
 };
