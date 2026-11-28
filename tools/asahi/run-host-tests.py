@@ -298,6 +298,13 @@ ASAHI_TESTS = {
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
+    'g17-publication-direct-lazy-tests.py': [([], PASS)]
+        + mutations('--mutation', ('clique-chain', 'skip-failed-status-direct',
+                                   'eager-activate', 'cycle-target-some',
+                                   'skip-error-clear-settled', 'skip-fast-check',
+                                   'drop-chain-link', 'retry-failed-pred',
+                                   'keep-attached-successors', 'no-subscribe',
+                                   'bounded-subscribe'), []),
     'g17-m5-multiqueue-contention-tests.py': [([], PASS)]
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',

@@ -14,8 +14,26 @@ use kernel::{new_mutex, prelude::*, sync::{Arc, Mutex}};
 
 type Links = Option<KBox<Link>>;
 
+/// One step of `Publication::pending_within()`, taken under the state lock and finished off it.
+enum Probe {
+    /// A failed predecessor's link, consumed.
+    Consumed((Arc<Publication>, KBox<Link>)),
+    /// Settled clean: the dropped predecessor links and the successors to release.
+    Settled(KVec<(Arc<Publication>, KBox<Link>)>, Links),
+    /// Ask this unsettled timestamp-free predecessor.
+    Next(Arc<Publication>),
+}
+
+/// How many unsettled timestamp-free predecessors deep `Publication::is_pending()` follows
+/// before it answers pending. Commands link the newest pending entry of their prefixes, so an
+/// unretired pipeline is a chain of such links; the bound keeps the probe off the stack, and a
+/// probe that stops early only leaves the settlement to the links.
+const PENDING_PROBE_DEPTH: usize = 4;
+
 struct Link {
-    target: Arc<Publication>,
+    // Populated only when attached to a predecessor's successor list so
+    // `deferred_links` held on the target itself never forms a self-Arc cycle.
+    target: Option<Arc<Publication>>,
     result: Result,
     next: Links,
     // Reuse an already-consumed link as a traversal frame instead of recursing
@@ -24,6 +42,10 @@ struct Link {
 }
 
 struct State {
+    // Pre-allocated predecessor links kept on the successor until `finish()`
+    // runs (or `is_pending()` observes all predecessors settled cleanly).
+    // Always drained before attaching to any predecessor so no Arc cycle forms.
+    deferred_links: KVec<(Arc<Publication>, KBox<Link>)>,
     remaining: usize,
     result: Option<Result<[u64; 4]>>,
     predecessor_error: Option<Error>,
@@ -33,6 +55,9 @@ struct State {
     // still has no result of its own; successors have already been released.
     upstream_released: bool,
     successors: Links,
+    // Queued once for `Publication::subscribe()`, and the next publication on that stack.
+    subscribe_queued: bool,
+    subscribe_next: Option<Arc<Publication>>,
 }
 
 impl State {
@@ -58,6 +83,10 @@ pub(crate) struct Publication {
     // deferred predecessor error. Cleared only once no host write or error
     // remains, and never set again.
     pending: AtomicBool,
+    // True once this publication published Ok (timestamps written and fence
+    // signalled) or settled cleanly without outputs and has not since failed.
+    // Lets in-order successors bypass locking the predecessor in `finish()`.
+    settled_clean: AtomicBool,
     #[pin]
     state: Mutex<State>,
 }
@@ -74,8 +103,10 @@ impl Publication {
                 status,
                 has_outputs,
                 pending: AtomicBool::new(true),
+                settled_clean: AtomicBool::new(false),
                 state <- new_mutex!(State {
-                    // Acceptance installs all links before releasing this sentinel.
+                    deferred_links: KVec::new(),
+                    // Acceptance installs deferred links before releasing this sentinel.
                     remaining: 1,
                     result: None,
                     predecessor_error: None,
@@ -83,6 +114,8 @@ impl Publication {
                     published: None,
                     upstream_released: false,
                     successors: None,
+                    subscribe_queued: false,
+                    subscribe_next: None,
                 }, "G17 host timestamp publication"),
             }),
             GFP_KERNEL,
@@ -93,24 +126,182 @@ impl Publication {
         &self.output
     }
 
+    /// Whether this command itself writes host timestamps.
+    pub(crate) fn has_outputs(&self) -> bool {
+        self.has_outputs
+    }
+
     /// Whether this publication still has an unpublished host timestamp write
     /// or an unresolved or failed predecessor chain.
     pub(crate) fn is_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        self.pending_within(PENDING_PROBE_DEPTH)
+    }
+
+    fn pending_within(&self, depth: usize) -> bool {
+        if !self.pending.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.has_outputs {
+            return true;
+        }
+        loop {
+            let step = {
+                let mut state = self.state.lock();
+                if !self.pending.load(Ordering::Acquire) {
+                    return false;
+                }
+                if state.published.is_some()
+                    || state.claimed
+                    || state.deferred_links.is_empty()
+                {
+                    return self.pending.load(Ordering::Acquire);
+                }
+                let failed = state
+                    .deferred_links
+                    .iter()
+                    .position(|(pred, _)| pred.failed_after_release());
+                if let Some(index) = failed {
+                    // Terminal and settles nothing: consume the link and keep the failure for
+                    // `finish()`, so the probe never retries this predecessor.
+                    if state.predecessor_error.is_none() {
+                        state.predecessor_error = Some(PRODUCER_FAILED);
+                    }
+                    Probe::Consumed(state.deferred_links.swap_remove(index))
+                } else {
+                    let unsettled = state
+                        .deferred_links
+                        .iter()
+                        .find(|(pred, _)| !pred.settled_clean.load(Ordering::Acquire))
+                        .map(|(pred, _)| pred.clone());
+                    match unsettled {
+                        None if state.predecessor_error.is_none() => {
+                            let old = core::mem::take(&mut state.deferred_links);
+                            state.upstream_released = true;
+                            self.settled_clean.store(true, Ordering::Release);
+                            self.pending.store(false, Ordering::Release);
+                            Probe::Settled(old, state.successors.take())
+                        }
+                        // Pending until `finish()` publishes the consumed failure.
+                        None => return true,
+                        Some(pred) if !pred.has_outputs => Probe::Next(pred),
+                        Some(_) => return true,
+                    }
+                }
+            };
+            match step {
+                Probe::Consumed(link) => drop(link),
+                Probe::Settled(old, successors) => {
+                    drop(old);
+                    // Successors that attached before this settlement are released here, as
+                    // `predecessors_done_ok()` releases them.
+                    Self::drain(Self::released_ok(successors));
+                    return false;
+                }
+                Probe::Next(pred) => {
+                    if depth == 0 || pred.pending_within(depth - 1) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Released its successors as upstream-clean, and then published a failure.
+    fn failed_after_release(&self) -> bool {
+        !self.pending.load(Ordering::Acquire) && !self.settled_clean.load(Ordering::Acquire)
+    }
+
+    /// Mark successor links released by a clean upstream settlement.
+    fn released_ok(mut links: Links) -> Links {
+        let mut next = links.as_mut();
+        while let Some(link) = next {
+            link.result = Ok(());
+            next = link.next.as_mut();
+        }
+        links
     }
 
     /// One terminal result, offered separately from its physical-retirement proof.
-    pub(crate) fn finish(&self, result: Result<[u64; 4]>) {
-        let ready = {
+    pub(crate) fn finish(self: &Arc<Self>, result: Result<[u64; 4]>) {
+        let (ready, to_attach) = {
             let mut state = self.state.lock();
             if state.claimed || state.result.is_some() {
                 return;
             }
             state.result = Some(result);
-            state.claim()
+            let deferred = core::mem::take(&mut state.deferred_links);
+            if deferred.is_empty() {
+                (state.claim(), deferred)
+            } else {
+                // Hold a sentinel (+1) while checking/attaching predecessors
+                // off-lock so `remaining` cannot reach 0 prematurely.
+                state.remaining += 1 + deferred.len();
+                (None, deferred)
+            }
         };
         if let Some(result) = ready {
             Self::drain(self.publish(result));
+            return;
+        }
+        if !to_attach.is_empty() {
+            self.attach_deferred(to_attach);
+        }
+    }
+
+    /// Link this publication to its deferred predecessors; the caller holds one sentinel in
+    /// `remaining` for this.
+    fn attach_deferred(self: &Arc<Self>, deferred: KVec<(Arc<Publication>, KBox<Link>)>) {
+        let mut stack = None;
+        self.link_deferred(deferred, &mut stack);
+        Self::subscribe(stack);
+    }
+
+    /// [`Self::attach_deferred`], pushing each deferred predecessor that a link now waits on
+    /// onto `stack` for [`Self::subscribe`].
+    fn link_deferred(
+        self: &Arc<Self>,
+        deferred: KVec<(Arc<Publication>, KBox<Link>)>,
+        stack: &mut Option<Arc<Publication>>,
+    ) {
+        let mut fast_ok = 0usize;
+        for (predecessor, mut link) in deferred {
+            if predecessor.settled_clean.load(Ordering::Acquire) {
+                fast_ok += 1;
+                drop(link);
+            } else {
+                link.target = Some(self.clone());
+                if predecessor.add_successor(link) {
+                    predecessor.state.lock().subscribe_next = stack.take();
+                    *stack = Some(predecessor);
+                }
+            }
+        }
+        Self::drain(self.predecessors_done_ok(1 + fast_ok));
+    }
+
+    /// Link every publication on `stack`, and every deferred one it reaches in turn, to its
+    /// predecessors, so the writer's completion alone settles a waiter's whole chain however
+    /// deep the unretired pipeline is. The stack is threaded through `State::subscribe_next`,
+    /// so this neither recurses nor allocates.
+    fn subscribe(mut stack: Option<Arc<Publication>>) {
+        while let Some(node) = stack.take() {
+            let deferred = {
+                let mut state = node.state.lock();
+                stack = state.subscribe_next.take();
+                if state.result.is_some()
+                    || state.published.is_some()
+                    || state.upstream_released
+                    || state.deferred_links.is_empty()
+                {
+                    // `finish()` or a probe linked or settled it meanwhile.
+                    continue;
+                }
+                let deferred = core::mem::take(&mut state.deferred_links);
+                // Hold a sentinel (+1) while linking off-lock, as `finish()` does.
+                state.remaining += 1 + deferred.len();
+                deferred
+            };
+            node.link_deferred(deferred, &mut stack);
         }
     }
 
@@ -130,7 +321,10 @@ impl Publication {
             // fence and aggregate membership have all been published off this lock.
             state.published = Some(result);
             if result.is_ok() {
+                self.settled_clean.store(true, Ordering::Release);
                 self.pending.store(false, Ordering::Release);
+            } else {
+                self.settled_clean.store(false, Ordering::Release);
             }
             state.successors.take()
         };
@@ -142,14 +336,11 @@ impl Publication {
         links
     }
 
-    fn predecessor_done(&self, result: Result) -> Links {
+    fn predecessors_done_ok(&self, count: usize) -> Links {
         let (ready, settled) = {
             let mut state = self.state.lock();
-            debug_assert!(state.remaining != 0);
-            if result.is_err() && state.predecessor_error.is_none() {
-                state.predecessor_error = Some(PRODUCER_FAILED);
-            }
-            state.remaining -= 1;
+            debug_assert!(state.remaining >= count);
+            state.remaining -= count;
             if let Some(ready) = state.claim() {
                 (Some(ready), None)
             } else if state.remaining == 0
@@ -161,6 +352,7 @@ impl Publication {
                 // no host timestamps, so downstream commands need not wait on
                 // or chain behind its GPU execution.
                 state.upstream_released = true;
+                self.settled_clean.store(true, Ordering::Release);
                 self.pending.store(false, Ordering::Release);
                 (None, state.successors.take())
             } else {
@@ -170,29 +362,57 @@ impl Publication {
         if let Some(result) = ready {
             return self.publish(result);
         }
-        let mut links = settled;
-        let mut next = links.as_mut();
-        while let Some(link) = next {
-            link.result = Ok(());
-            next = link.next.as_mut();
-        }
-        links
+        Self::released_ok(settled)
     }
 
-    fn add_successor(&self, mut link: KBox<Link>) {
-        let immediate = {
+    fn predecessor_done(&self, result: Result) -> Links {
+        if result.is_ok() {
+            return self.predecessors_done_ok(1);
+        }
+        let ready = {
             let mut state = self.state.lock();
-            if let Some(result) = state.published {
-                result
-            } else if state.upstream_released {
-                Ok(())
-            } else {
-                link.next = state.successors.take();
-                state.successors = Some(link);
-                return;
+            debug_assert!(state.remaining != 0);
+            if state.predecessor_error.is_none() {
+                state.predecessor_error = Some(PRODUCER_FAILED);
             }
+            state.remaining -= 1;
+            state.claim()
         };
-        Self::drain(link.target.predecessor_done(immediate));
+        if let Some(result) = ready {
+            return self.publish(result);
+        }
+        None
+    }
+
+    /// Deliver `link` now if this publication has settled, or queue it until it does.
+    ///
+    /// Returns whether this publication must now be subscribed to its predecessors
+    /// ([`Self::subscribe`]): an unfinished timestamp-free publication keeps them deferred
+    /// until its own `finish()`, and the queued waiter must not wait for that.
+    fn add_successor(&self, mut link: KBox<Link>) -> bool {
+        let mut state = self.state.lock();
+        let immediate = if let Some(result) = state.published {
+            Some(result)
+        } else if state.upstream_released {
+            Some(Ok(()))
+        } else {
+            None
+        };
+        if let Some(result) = immediate {
+            drop(state);
+            if let Some(target) = link.target.take() {
+                Self::drain(target.predecessor_done(result));
+            }
+            return false;
+        }
+        link.next = state.successors.take();
+        state.successors = Some(link);
+        let subscribe = !self.has_outputs
+            && !state.subscribe_queued
+            && state.result.is_none()
+            && !state.deferred_links.is_empty();
+        state.subscribe_queued |= subscribe;
+        subscribe
     }
 
     /// Iterative depth-first notification, O(nodes + links), with no stack growth.
@@ -201,7 +421,10 @@ impl Publication {
         loop {
             if let Some(mut link) = pending.take() {
                 pending = link.next.take();
-                let children = link.target.predecessor_done(link.result);
+                let children = link
+                    .target
+                    .take()
+                    .map_or(None, |target| target.predecessor_done(link.result));
                 if children.is_some() {
                     link.resume = pending.take();
                     link.next = frames.take();
@@ -218,8 +441,10 @@ impl Publication {
     }
 }
 
-/// Temporary backwards references exist only during fallible setup. Installed
-/// links retain the successor only, so closing a queue cannot form an Arc cycle.
+/// Pre-allocated predecessor links held until acceptance. While deferred on the
+/// successor, each link keeps `target: None` so no Arc cycle can form; once
+/// attached to a predecessor on out-of-order completion, the predecessor owns
+/// the link and the successor has already dropped its predecessor references.
 pub(crate) struct Prepared {
     target: Arc<Publication>,
     links: KVec<(Arc<Publication>, KBox<Link>)>,
@@ -233,7 +458,7 @@ impl Prepared {
         let mut links = KVec::with_capacity(predecessors.clone().count(), GFP_KERNEL)?;
         for predecessor in predecessors {
             let link = KBox::new(Link {
-                target: target.clone(),
+                target: None,
                 result: Ok(()),
                 next: None,
                 resume: None,
@@ -245,16 +470,35 @@ impl Prepared {
 
     /// Called after all fallible scheduler setup and before any GPU publication.
     pub(crate) fn activate(self) {
-        {
+        let attach_now = {
             let mut state = self.target.state.lock();
             debug_assert!(state.remaining == 1 && !state.claimed);
-            // The fully allocated link vector bounds this count below usize::MAX.
-            state.remaining += self.links.len();
+            state.remaining -= 1;
+            if state.result.is_some() {
+                if self.links.is_empty() {
+                    let ready = state.claim();
+                    drop(state);
+                    if let Some(result) = ready {
+                        Publication::drain(self.target.publish(result));
+                    }
+                    return;
+                }
+                state.remaining += 1 + self.links.len();
+                Some(self.links)
+            } else {
+                if self.links.is_empty() && !self.target.has_outputs {
+                    state.upstream_released = true;
+                    self.target.settled_clean.store(true, Ordering::Release);
+                    self.target.pending.store(false, Ordering::Release);
+                } else {
+                    state.deferred_links = self.links;
+                }
+                None
+            }
+        };
+        if let Some(links) = attach_now {
+            self.target.attach_deferred(links);
         }
-        for (predecessor, link) in self.links {
-            predecessor.add_successor(link);
-        }
-        Publication::drain(self.target.predecessor_done(Ok(())));
     }
 }
 
@@ -397,5 +641,33 @@ mod tests {
         Prepared::new(late.clone(), core::iter::once(&consumer)).unwrap().activate();
         late.finish(Ok([5, 6, 0, 0]));
         assert_eq!(fence_status(&late_fence), PRODUCER_FAILED.to_errno());
+    }
+
+    #[test]
+    fn in_order_writer_finish_drains_zero_deferred_links() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_pub_lazy"), KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let (producer, prod_fence) = make_pub(&contexts, &status, true);
+        Prepared::new(producer.clone(), core::iter::empty()).unwrap().activate();
+
+        let mut consumers = KVec::with_capacity(16, GFP_KERNEL).unwrap();
+        for _ in 0..16 {
+            let (cons, fence) = make_pub(&contexts, &status, false);
+            Prepared::new(cons.clone(), core::iter::once(&producer))
+                .unwrap()
+                .activate();
+            consumers.push((cons, fence), GFP_KERNEL).unwrap();
+        }
+        // Deferred links stay on each successor; producer has zero eager successors.
+        assert!(producer.state.lock().successors.is_none());
+
+        producer.finish(Ok([1, 2, 0, 0]));
+        assert!(fence_status(&prod_fence) > 0);
+        assert!(producer.settled_clean.load(Ordering::Acquire));
+
+        for (cons, fence) in consumers {
+            cons.finish(Ok([3, 4, 0, 0]));
+            assert!(fence_status(&fence) > 0);
+        }
     }
 }
