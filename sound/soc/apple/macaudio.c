@@ -371,6 +371,14 @@ struct macaudio_snd_data {
 	struct snd_kcontrol *speaker_sample_rate_kctl;
 
 	struct mutex volume_lock_mutex;
+	/*
+	 * A CAP_SYS_ADMIN process wrote "Speaker Volume Unlock" to "Speaker
+	 * Protection Interface" since the card bound, and no write of "Speaker
+	 * Protection" came after it: only then may a daemon take the volume
+	 * lock (see macaudio_slk_selected()). Never set by the kernel itself.
+	 * Written under spk_mutex and volume_lock_mutex.
+	 */
+	bool spk_legacy_selected;
 	bool speaker_volume_unlocked;
 	bool speaker_volume_was_locked;
 	struct snd_kcontrol *speaker_lock_kctl;
@@ -543,6 +551,11 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
  * speakers play. While it does, the volumes may go up to the amps' 0 dB;
  * otherwise they are held at the lock's ceiling. The daemon governs them
  * from its thermal model.
+ *
+ * Only once an administrator has selected it, though: a CAP_SYS_ADMIN write
+ * of "Speaker Volume Unlock" to "Speaker Protection Interface" since the
+ * card bound. Until then, and after a write of "Speaker Protection", the
+ * lock and the ping fail with -EPERM (see macaudio_slk_refused()).
  */
 
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
@@ -800,6 +813,12 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	/* No protection daemon can hold these speakers: nothing to unlock */
 	if (macaudio_spk_lease_only(ma->cfg))
 		return;
+
+	/* Only after an explicit selection of the volume lock */
+	if (!ma->spk_legacy_selected) {
+		reason = "Speaker Volume Unlock not selected";
+		unlock = false;
+	}
 
 	/* Check that someone is holding the main lock */
 	if (!ma->speaker_lock_owner) {
@@ -1663,6 +1682,11 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
  * only once a daemon holds the lock and pings it, as after a cold bind. Its
  * first ping after the switch fails with -ETIMEDOUT: the lock was lost.
  *
+ * A daemon may hold the lock at all only after an explicit CAP_SYS_ADMIN
+ * write of "Speaker Volume Unlock" during this bind, also where it is the
+ * interface already. The kernel's own returns to it (no owner of the lease)
+ * select nothing, and a write of "Speaker Protection" deselects it.
+ *
  * While leased the lock's ping fails with -EBUSY, and the speaker volumes
  * and amp gains are the driver's: userspace writes fail with -EPERM.
  *
@@ -1883,6 +1907,26 @@ static void macaudio_spk_unowned_work(struct work_struct *work)
 	up_write(&ma->card.snd_card->controls_rwsem);
 }
 
+/*
+ * Select or deselect the volume lock for daemons (spk_legacy_selected). A
+ * deselection relocks whatever a daemon had unlocked.
+ *
+ * Context: the card's controls_rwsem and spk_mutex held.
+ */
+static void macaudio_slk_select(struct macaudio_snd_data *ma, bool selected)
+{
+	lockdep_assert_held(&ma->spk_mutex);
+
+	mutex_lock(&ma->volume_lock_mutex);
+	if (ma->spk_legacy_selected != selected) {
+		ma->spk_legacy_selected = selected;
+		dev_info(ma->card.dev, "Speaker Volume Unlock %s by the administrator\n",
+			 selected ? "selected" : "deselected");
+		macaudio_vlimit_update(ma);
+	}
+	mutex_unlock(&ma->volume_lock_mutex);
+}
+
 static int macaudio_spk_iface_info(struct snd_kcontrol *kcontrol,
 				   struct snd_ctl_elem_info *uinfo)
 {
@@ -1915,6 +1959,9 @@ static int macaudio_spk_iface_put(struct snd_kcontrol *kcontrol,
 		return -EPERM;
 
 	mutex_lock(&ma->spk_mutex);
+	/* A write of "Speaker Protection" deselects the volume lock, at once */
+	if (item == MACAUDIO_SPK_IFACE_LEASE)
+		macaudio_slk_select(ma, false);
 	if (item == READ_ONCE(ma->spk_iface)) {
 		ret = 0;
 	} else if (item == MACAUDIO_SPK_IFACE_LEASE) {
@@ -1925,6 +1972,12 @@ static int macaudio_spk_iface_put(struct snd_kcontrol *kcontrol,
 		macaudio_spk_leave_lease(ma, "switched by the administrator");
 		ret = 1;
 	}
+	/*
+	 * An explicit write of "Speaker Volume Unlock", even where it is the
+	 * interface already (as from the bind), selects the volume lock.
+	 */
+	if (item == MACAUDIO_SPK_IFACE_UNLOCK)
+		macaudio_slk_select(ma, true);
 	mutex_unlock(&ma->spk_mutex);
 	return ret;
 }
@@ -3564,6 +3617,8 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 			return dev_err_probe(card->dev, ret, "software gain ceiling not set\n");
 
 		mutex_lock(&ma->volume_lock_mutex);
+		/* Every bind starts unselected: only an administrator selects it */
+		ma->spk_legacy_selected = false;
 		macaudio_vlimit_unlock(ma, false);
 		ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
 		mutex_unlock(&ma->volume_lock_mutex);
@@ -3866,6 +3921,19 @@ static int macaudio_sss_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	return 0;
 }
 
+/*
+ * The volume lock lifts the speakers only for a daemon an administrator
+ * chose: a CAP_SYS_ADMIN write of "Speaker Volume Unlock" to "Speaker
+ * Protection Interface" since the card bound (spk_legacy_selected). Without
+ * it the lock and the ping are refused, so a daemon started on its own fails
+ * at once instead of believing it guards the speakers.
+ */
+static void macaudio_slk_refused(struct macaudio_snd_data *ma)
+{
+	dev_info_once(ma->card.dev,
+		      "Speaker Volume Unlock refused: not selected on Speaker Protection Interface\n");
+}
+
 static int macaudio_slk_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
@@ -3905,6 +3973,13 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	if (macaudio_spk_leased(ma)) {
 		mutex_unlock(&ma->volume_lock_mutex);
 		return -EBUSY;
+	}
+
+	/* Deselected since the daemon took the lock */
+	if (!ma->spk_legacy_selected) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		macaudio_slk_refused(ma);
+		return -EPERM;
 	}
 
 	/* Serves as a notification that the lock was lost at some point */
@@ -3953,6 +4028,12 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	mutex_lock(&ma->volume_lock_mutex);
+
+	if (!ma->spk_legacy_selected) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		macaudio_slk_refused(ma);
+		return -EPERM;
+	}
 
 	/*
 	 * A lease belongs to the owner that pinged for it. Whatever the
