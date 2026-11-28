@@ -3275,7 +3275,9 @@
 		             <AIC_IRQ 0 2793 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2796 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2795 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ave1_dart 0>, <&ave1_dart1 0>;
+		/* dart-ave1 has the same SIDs as dart-ave0: 0 and 12 (the temporal filter). */
+		iommus = <&ave1_dart 0>, <&ave1_dart 12>,
+			 <&ave1_dart1 0>, <&ave1_dart1 12>;
 		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
 				<&ps_venc1_me0>, <&ps_venc1_me1>;
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
@@ -3328,6 +3330,25 @@
 		power-domains = <&ps_scodec>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The second ProRes engine (ADT apr1, "apr,n1"). The ADT has it only in the children for
+	 * the M5 Max and Ultra die variants (:sotra_h17c, h17cr1, h17cr2, h17d), not for the M5
+	 * Pro (h17s); its DART, dart-apr1, is described above for every T6050 the same way. The
+	 * node stays disabled: unlike apr0 it has no SCODEC windows (aux, ctrl), which the T6050
+	 * ProRes variant needs.
+	 */
+	apr1: prores@230b000000 {
+		compatible = "apple,t6050-prores", "apple,prores";
+		reg = <0x23 0xb000000 0x0 0x4000>,
+		      <0x23 0xa000000 0x0 0x1000000>;
+		reg-names = "core", "wrapper";
+		interrupts = <AIC_IRQ 0 1763 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1762 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apr1_dart 0>;
+		power-domains = <&ps_prores>;
 		status = "disabled";
 	};
 
@@ -3690,25 +3711,6 @@
 		status = "disabled";
 	};
 #endif
-
-
-
-#if defined(T6050_J873S)
-	apr1: prores@230b000000 {
-		compatible = "apple,t6050-prores", "apple,prores";
-		reg = <0x23 0xb000000 0x0 0x4000>,
-		      <0x23 0xa000000 0x0 0x1000000>;
-		interrupts = <AIC_IRQ 0 1763 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 1762 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apr1_dart 0>;
-		power-domains = <&ps_prores>;
-		status = "disabled";
-	};
-#endif
-
-
-
-
 };
 
 /*
