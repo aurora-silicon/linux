@@ -1239,8 +1239,8 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct iommu_domain *domain;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j700") ||
-	    !of_machine_is_compatible("apple,t8140") || pdev->devfn != 0 ||
+	/* The radio's DT node, behind a T8140 PCIe host. */
+	if (pdev->devfn != 0 ||
 	    !of_device_is_compatible(pdev->dev.of_node, "pci14c3,7932") ||
 	    !bridge->dev.parent ||
 	    !of_device_is_compatible(bridge->dev.parent->of_node,

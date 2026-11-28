@@ -207,6 +207,17 @@ impl Ledger {
     /// Reserves the bytes against both limits; the returned [`Commit`] gives
     /// them back when it is dropped.
     pub(crate) fn admit(&'static self, client: &Arc<Client>, bytes: u64) -> Result<Commit> {
+        self.reserve(client, bytes)?;
+        Ok(Commit {
+            ledger: self,
+            client: client.clone(),
+            bytes,
+        })
+    }
+
+    /// Adds `bytes` to `client`'s and the device's committed totals if both stay within their
+    /// limits; otherwise counts a refusal and fails with `ENOMEM`, adding nothing.
+    fn reserve(&self, client: &Client, bytes: u64) -> Result {
         let client_limit = self.client_limit.load(Ordering::Relaxed);
         if !try_add_within(&client.committed, bytes, client_limit, 0) {
             self.refused.fetch_add(1, Ordering::Relaxed);
@@ -224,11 +235,74 @@ impl Ledger {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return Err(ENOMEM);
         }
-        Ok(Commit {
-            ledger: self,
-            client: client.clone(),
-            bytes,
-        })
+        Ok(())
+    }
+}
+
+/// Kernel memory that grows with a client's requests and is freed with one of the client's
+/// objects, such as the page tables of a VM: charged to the client as held user memory of the
+/// same size would be, and released in full when this is dropped.
+pub(crate) struct Usage {
+    ledger: &'static Ledger,
+    client: Arc<Client>,
+    bytes: u64,
+}
+
+impl Usage {
+    pub(crate) fn new(ledger: &'static Ledger, client: Arc<Client>) -> Self {
+        Self {
+            ledger,
+            client,
+            bytes: 0,
+        }
+    }
+
+    /// Charges `bytes` more if the client and the device stay within their limits, as a new
+    /// user object of that size would be admitted; otherwise fails with `ENOMEM` and charges
+    /// nothing.
+    pub(crate) fn try_add(&mut self, bytes: u64) -> Result {
+        self.ledger.reserve(&self.client, bytes)?;
+        self.hold(bytes);
+        Ok(())
+    }
+
+    /// Charges `bytes` more whatever the limits, for memory that already exists.
+    pub(crate) fn add(&mut self, bytes: u64) {
+        self.client.committed.fetch_add(bytes, Ordering::AcqRel);
+        self.ledger.user_committed.fetch_add(bytes, Ordering::AcqRel);
+        self.hold(bytes);
+    }
+
+    /// Creates a new [`Usage`] on the same ledger and client holding the same number of bytes,
+    /// without checking limits: used to hand a removed record's charge to a surviving piece right
+    /// before the removed record is dropped.
+    pub(crate) fn transfer_copy(&self) -> Self {
+        let mut copy = Self::new(self.ledger, self.client.clone());
+        copy.add(self.bytes);
+        copy
+    }
+
+    /// Creates a new [`Usage`] on the same ledger and client charged `bytes` if both limits
+    /// admit it; otherwise fails with `ENOMEM` and charges nothing.
+    pub(crate) fn try_fork(&self, bytes: u64) -> Result<Self> {
+        let mut copy = Self::new(self.ledger, self.client.clone());
+        copy.try_add(bytes)?;
+        Ok(copy)
+    }
+
+    fn hold(&mut self, bytes: u64) {
+        self.client.resident.fetch_add(bytes, Ordering::AcqRel);
+        self.ledger.user_resident.fetch_add(bytes, Ordering::AcqRel);
+        self.bytes += bytes;
+    }
+}
+
+impl Drop for Usage {
+    fn drop(&mut self) {
+        sub(&self.client.resident, self.bytes);
+        sub(&self.ledger.user_resident, self.bytes);
+        sub(&self.client.committed, self.bytes);
+        sub(&self.ledger.user_committed, self.bytes);
     }
 }
 
@@ -238,6 +312,8 @@ pub(crate) struct Client {
     committed: AtomicU64,
     /// Size of those whose backing the GPU currently holds.
     resident: AtomicU64,
+    /// Bytes of the device's firmware timestamp window this client's bound buffers hold.
+    timestamp_window: AtomicU64,
 }
 
 impl Client {
@@ -246,6 +322,7 @@ impl Client {
             Self {
                 committed: AtomicU64::new(0),
                 resident: AtomicU64::new(0),
+                timestamp_window: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
@@ -257,6 +334,37 @@ impl Client {
 
     pub(crate) fn resident(&self) -> u64 {
         self.resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the firmware timestamp window this client holds.
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(crate) fn timestamp_window(&self) -> u64 {
+        self.timestamp_window.load(Ordering::Relaxed)
+    }
+
+    /// Takes `bytes` of the firmware timestamp window for `client` if its share stays within
+    /// `limit` (which must not be 0); the returned [`WindowShare`] gives them back when dropped.
+    /// Concurrent callers cannot overshoot.
+    pub(crate) fn take_window(client: &Arc<Self>, bytes: u64, limit: u64) -> Option<WindowShare> {
+        if limit == 0 || !try_add_within(&client.timestamp_window, bytes, limit, 0) {
+            return None;
+        }
+        Some(WindowShare {
+            client: client.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Bytes of the firmware timestamp window held by one bound buffer of a client.
+pub(crate) struct WindowShare {
+    client: Arc<Client>,
+    bytes: u64,
+}
+
+impl Drop for WindowShare {
+    fn drop(&mut self) {
+        sub(&self.client.timestamp_window, self.bytes);
     }
 }
 
@@ -620,6 +728,35 @@ mod tests {
         let i = Charge::none();
         i.set_kept(true);
         assert_eq!(KEPT.user_kept.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static USAGE: Ledger = Ledger::new();
+
+    #[test]
+    fn usage_grows_within_the_limits_and_is_released_whole() -> Result {
+        USAGE.set_limits(Limits { device: 100 * MIB, client: 60 * MIB });
+        let a = Client::new()?;
+        let mut usage = Usage::new(&USAGE, a.clone());
+        // Memory that already exists is counted whatever the limits.
+        usage.add(16 * MIB);
+        usage.try_add(40 * MIB)?;
+        // 4 MiB are left under a's limit: refused, and nothing more is counted.
+        assert_eq!(usage.try_add(8 * MIB), Err(ENOMEM));
+        assert_eq!((a.committed(), a.resident()), (56 * MIB, 56 * MIB));
+        assert_eq!(USAGE.refused.load(Ordering::Relaxed), 1);
+        assert_eq!(USAGE.user_resident.load(Ordering::Relaxed), 56 * MIB);
+        // The bytes count against the device limit for other clients as well.
+        let b = Client::new()?;
+        assert!(USAGE.admit(&b, 50 * MIB).is_err());
+        let b1 = USAGE.admit(&b, 44 * MIB)?;
+        // Dropping releases everything it charged.
+        drop(usage);
+        assert_eq!((a.committed(), a.resident()), (0, 0));
+        assert_eq!(USAGE.user_committed.load(Ordering::Relaxed), 44 * MIB);
+        assert_eq!(USAGE.user_resident.load(Ordering::Relaxed), 0);
+        drop(b1);
+        assert_eq!(USAGE.user_committed.load(Ordering::Relaxed), 0);
         Ok(())
     }
 

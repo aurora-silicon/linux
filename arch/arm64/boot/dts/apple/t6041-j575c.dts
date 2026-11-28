@@ -36,10 +36,21 @@
 		dcp = &dcp;
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
+		nvram = &nvram;
 	};
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
 	};
 
 	reserved-memory {
@@ -177,6 +188,12 @@
 						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-dcs {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -993,6 +1010,18 @@
 	status = "okay";
 };
 
+&pmc {
+	/*
+	 * System power above DCS state 0 at each DCS state, measured on a
+	 * J575c with all 32 DCS channels enabled (ADT mcc: 8 AMCCs, 4 DCS
+	 * each, dcs-channel-enable-mask 0xffffffff) under 256 MiB GPU copies:
+	 * 233 GB/s at state 5, 85 GB/s at states 0 and 1. States 1 and 2 draw
+	 * no more than state 0, so the power allocator never asks for a limit
+	 * below DCS state 2 (cooling state 3).
+	 */
+	apple,dcs-power-microwatt = <0 0 0 5508000 8559000 10966000>;
+};
+
 /* The J616c's CPU keys and two fans, all read back on a J575c */
 &smc_hwmon {
 	temperature-TCMz {
@@ -1088,6 +1117,24 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+&smc_hwmon {
+	/*
+	 * This SMC spells the fan mode keys F0md/F1md, as the T6050 one does
+	 * (it has no F0Md/F1Md and no Ftst unlock key). It accepts a manual
+	 * speed for both fans from userspace and returns them to firmware
+	 * control when the request is dropped.
+	 */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
+};
 
 &pinctrl {
 	status = "okay";
@@ -1221,6 +1268,7 @@
 			#size-cells = <2>;
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
+			supports-clkreq;
 			device_type = "pci";
 
 			bluetooth@0,1 {
@@ -1250,6 +1298,7 @@
 			reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
 			bus-range = <2 2>;
 			pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+			supports-clkreq;
 			#address-cells = <3>;
 			#size-cells = <2>;
 			ranges;
@@ -1329,6 +1378,27 @@
 	status = "okay";
 };
 
+/*
+ * The Neural Engine and its three DARTs, as on the J614c/J616c. The J575c's
+ * ADT has ane0 with pre-loaded firmware (__TEXT;__DATA); the loader fills the
+ * reservations of t6041-j616c-ane.dtsi and the firmware IOVAs from it.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
 /* Both JPEG engines; they have no board wiring. */
 &ps_jpg {
 	status = "okay";
@@ -1347,6 +1417,32 @@
 };
 
 &jpeg1 {
+	status = "okay";
+};
+
+/*
+ * First ProRes encoder (apr0) and its DART, as on the J616c. The J575c's ADT
+ * has apr0 and dart-apr0 at the t6041.dtsi addresses and interrupts. apr0
+ * runs with SCODEC_STREAMING (and SCODEC) powered and uses the driver's
+ * built-in T6041 power-up rows.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
 	status = "okay";
 };
 
@@ -1400,6 +1496,7 @@
 		apple,event-irq-in-sleep;
 		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
 		apple,reset-inherited-usb2-connection;
+		apple,debug-lock-key = "575J";
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1432,6 +1529,7 @@
 		apple,event-irq-in-sleep;
 		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
 		apple,reset-inherited-usb2-connection;
+		apple,debug-lock-key = "575J";
 
 		typec2: connector {
 			compatible = "usb-c-connector";
@@ -1788,6 +1886,8 @@
 		operating-points-v2 = <&gpu_opp>;
 		apple,cs-opp = <&gpu_cs_opp>;
 		apple,afr-opp = <&gpu_afr_opp>;
+		/* Avoid a core power cycle between interactive submissions, then release. */
+		apple,idle-off-delay-ms = <16>;
 		apple,firmware-version = <26 5 2>;
 };
 
@@ -1985,6 +2085,7 @@
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
 #include "t6041-j575c-usbc-dcpext2.dtsi"
+#include "t6041-j575c-usbc-dcpext3.dtsi"
 #include "t6041-j575c-hdmi.dtsi"
 
 /* Not described: the SEP (no Touch ID sensor). */
@@ -2014,4 +2115,80 @@
 
 &gpu {
 	power-domains = <&pmp_gfx>;
+};
+
+/*
+ * Boot NOR, as on the J614c/J616c. ADT /arm-io/qspi ("qspi,qspimc",
+ * 0x229118000, IRQ 1573) is the t604x.dtsi qspi node, and the partition is
+ * /arm-io/qspi/spinor/anvram (0x700000, 0x100000), flash-relative;
+ * asahi-bless and asahi-nvram find it by its label.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+		vcc-supply = <&nor_flash_vcc>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0x100000>;
+			};
+		};
+	};
+};
+
+/* The QSPI controller cannot probe while its power state is disabled. */
+&ps_qspi {
+	status = "okay";
+};
+
+/*
+ * Both MSR scalers (scaler0, scaler1) and their DARTs, as on the J616c. The
+ * J575c's ADT has them at the addresses, interrupts and PMGR offsets of
+ * t6041-j614-j616-j575-scaler.dtsi.
+ */
+&ps_fab5_soc {
+	status = "okay";
+};
+
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+&ps_msr1 {
+	status = "okay";
+};
+
+&ps_msr1_ase_core {
+	status = "okay";
+};
+
+&scaler1_dart {
+	status = "okay";
+};
+
+&scaler1 {
+	status = "okay";
 };

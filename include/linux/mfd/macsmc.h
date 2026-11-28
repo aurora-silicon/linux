@@ -123,6 +123,8 @@ struct apple_smc {
 	const struct apple_sleep_smc_policy *sleep_policy;
 	u64 sleep_warn_ack;
 	bool sleep_pmvc_info;
+	/* WKTP (1-byte writable) supported: notify SMC on full wake. */
+	bool has_wktp;
 	/* The saved scope's pmVC after ANS, and when it was answered. */
 	bool saved_pmvc_sent;
 	u64 saved_pmvc_at;
@@ -131,6 +133,7 @@ struct apple_smc {
 	 * resolve only the matching pending ID; timeout never cancels SRAM use.
 	 */
 	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool port_dark_wake;
 	bool saved_pending, saved_recovery, saved_wake;
 	int saved_fault, saved_notice_error, saved_restore_error;
 	/*
@@ -144,6 +147,13 @@ struct apple_smc {
 	u8 wake_lid;
 	int wake_lid_ret;
 	u64 saved_unexpected;
+	/* WKTP left at its sleep value: written back once a wake is a full one. */
+	bool wake_silent;
+	/* apple,sleep-wake-type: WKTP written at the sleep commit. */
+	bool sleep_wake_type;
+	/* apple,sleep-pmvc: when set, the pmVC value written at the sleep commit. */
+	bool sleep_pmvc_set;
+	u32 sleep_pmvc;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
@@ -212,6 +222,55 @@ int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t 
  * Return: Zero on success, negative errno on error
  */
 int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
+
+struct device_node;
+struct platform_device;
+
+#define APPLE_SMC_WARM_RESET_WRITES	4
+
+/**
+ * struct apple_smc_warm_reset - a PCIe endpoint's reset through an SMC key
+ * @smc: the SMC's device (a reference, dropped by apple_smc_warm_reset_put())
+ * @key: the key to write
+ * @count: how many writes
+ * @writes: per write, the key's value (its bytes from the cell's most significant down)
+ *	and the wait after it in microseconds
+ *
+ * Read from a PCIe root port's "apple,function-warm-reset" and "apple,warm-reset-writes"
+ * (bindings/pci/apple,pcie.yaml).
+ */
+struct apple_smc_warm_reset {
+	struct platform_device *smc;
+	smc_key key;
+	unsigned int count;
+	u32 writes[2 * APPLE_SMC_WARM_RESET_WRITES];
+};
+
+/**
+ * apple_smc_warm_reset_parse - read a root port's warm reset
+ * @np: the root port's node
+ * @wr: filled in on success
+ *
+ * Return: Zero on success, -ENODEV when the port describes none or its SMC has no device,
+ * -EINVAL when the writes are malformed.
+ */
+int apple_smc_warm_reset_parse(struct device_node *np, struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset_put - drop the reference apple_smc_warm_reset_parse() took
+ * @wr: the parsed reset; cleared
+ */
+void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset - give a parsed warm reset
+ * @wr: the parsed reset
+ * @noirq: from another device's noirq callbacks: the replies are polled for and the waits
+ *	busy-wait, as for apple_smc_write_noirq()
+ *
+ * Return: Zero on success, -ENODEV when the SMC isn't bound, or the first write's error.
+ */
+int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq);
 
 /**
  * apple_smc_enter_atomic - Enter atomic mode to be able to use apple_smc_write_atomic
@@ -331,15 +390,45 @@ APPLE_SMC_TYPE_OPS(s8)
 struct device;
 
 /*
+ * Hotspot fan-assistance thresholds read from the machine's SMC hwmon device
+ * tree node (macsmc_soc_die active trip temperature, hysteresis-derived
+ * release temperature, and minimum hold time).
+ */
+struct macsmc_hwmon_fan_assist {
+	int trigger_mc;
+	int release_mc;
+	unsigned int hold_ms;
+};
+
+/*
  * The SMC hwmon cell's fan control for a kernel thermal policy (a GPU
  * governor): see drivers/hwmon/macsmc-hwmon.c.
  */
 #if IS_REACHABLE(CONFIG_SENSORS_MACSMC_HWMON)
 int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			      unsigned int min_step_rpm);
+int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+				     unsigned int min_step_rpm);
+bool macsmc_hwmon_hotspot_assist_available(void);
+int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+				       struct macsmc_hwmon_fan_assist *policy);
 #else
 static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+						   unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline bool macsmc_hwmon_hotspot_assist_available(void)
+{
+	return false;
+}
+static inline int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+						     struct macsmc_hwmon_fan_assist *policy)
 {
 	return -ENODEV;
 }

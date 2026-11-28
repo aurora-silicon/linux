@@ -33,6 +33,7 @@ struct centauri_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
 	void __iomem *bar[3];
+	bool enabled[3];
 	struct cen_context control, alpha;
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
 	struct cen_buffer *alpha_log;
@@ -169,7 +170,13 @@ static int secondary_init(struct centauri *c)
 	pci_write_config_dword(c->pdev, 0xf8c, upper_32_bits(c->ipc->secondary->dma));
 	pci_write_config_dword(c->pdev, 0xf90, required);
 	dev_info(&c->pdev->dev, "secondary memory: seed=%u required=%u\n", length, required);
-	debugfs_create_file("firmware_crash", 0400, c->debug, c, &firmware_crash_fops);
+	/*
+	 * Created once and kept across restarts: its reader looks up c->ipc under boot_lock,
+	 * and removing it here, under boot_lock, would wait for a reader blocked on that lock.
+	 */
+	if (!c->crash_file)
+		c->crash_file = debugfs_create_file("firmware_crash", 0400, c->debug, c,
+						    &firmware_crash_fops);
 	return 0;
 }
 
@@ -420,7 +427,7 @@ static int enumerate_functions(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
 	u16 control;
-	int i, cap;
+	int i, cap, ret;
 	dma_addr_t msi;
 
 	pci_lock_rescan_remove();
@@ -436,6 +443,14 @@ static int enumerate_functions(struct centauri *c)
 			return -ENODEV;
 		if (!(pci_resource_flags(ipc->function[i], 0) & IORESOURCE_MEM))
 			return -ENODEV;
+		if (i) {
+			device_lock(&ipc->function[i]->dev);
+			ret = pci_enable_device_mem(ipc->function[i]);
+			device_unlock(&ipc->function[i]->dev);
+			if (ret)
+				return ret;
+			ipc->enabled[i] = true;
+		}
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
 		if (!ipc->bar[i])
 			return -ENOMEM;
@@ -546,15 +561,49 @@ failed:
 	return ret;
 }
 
-void centauri_free_ipc(struct centauri *c)
+/*
+ * Whether Beta's (Bluetooth's) firmware runs with its IPC still unowned: the state
+ * btcentauri needs to take function 2. Called with the boot lock held.
+ */
+bool centauri_beta_running(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
-	struct cen_buffer *buffer, *next;
+
+	if (!ipc || !ipc->enabled[2] || !ipc->bar[2])
+		return false;
+	return readl(ipc->bar[2] + 0x18) == 2 && !readl(ipc->bar[2]);
+}
+
+/*
+ * Clearing Bus Master stops new requests only. The read back of the command
+ * register returns after the function's earlier posted writes, and the wait
+ * covers its requests still in flight.
+ */
+bool centauri_stop_dma(struct pci_dev *pdev)
+{
+	u16 command;
+
+	pci_clear_master(pdev);
+	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
+	    (command & PCI_COMMAND_MASTER))
+		return false;
+	return pci_wait_for_pending_transaction(pdev);
+}
+
+/*
+ * Stop the IPC's interrupts and every function's DMA. Returns false if a
+ * function's DMA could not be stopped; a later call (a retried restart, or
+ * removal) tries again.
+ */
+bool centauri_stop_ipc(struct centauri *c)
+{
+	struct centauri_ipc *ipc = c->ipc;
+	bool stopped = true;
 	int i, cap;
 	u16 control;
 
 	if (!ipc)
-		return;
+		return true;
 	for (i = 0; i < 3; i++)
 		if (ipc->vectors[i])
 			free_vectors(c, i);
@@ -570,6 +619,21 @@ void centauri_free_ipc(struct centauri *c)
 		}
 		pci_clear_master(ipc->function[i]);
 	}
+	for (i = 0; i < 3; i++)
+		if (ipc->function[i] && !centauri_stop_dma(ipc->function[i]))
+			stopped = false;
+	return stopped;
+}
+
+/* Only after centauri_stop_ipc() and the boot DMA's stop both succeeded. */
+void centauri_free_ipc(struct centauri *c)
+{
+	struct centauri_ipc *ipc = c->ipc;
+	struct cen_buffer *buffer, *next;
+	int i;
+
+	if (!ipc)
+		return;
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		dma_free_coherent(buffer->dev, buffer->size, buffer->cpu, buffer->dma);
 		list_del(&buffer->list);
@@ -578,6 +642,11 @@ void centauri_free_ipc(struct centauri *c)
 	for (i = 0; i < 3; i++) {
 		if (ipc->bar[i])
 			pci_iounmap(ipc->function[i], ipc->bar[i]);
+		if (ipc->enabled[i]) {
+			device_lock(&ipc->function[i]->dev);
+			pci_disable_device(ipc->function[i]);
+			device_unlock(&ipc->function[i]->dev);
+		}
 		pci_dev_put(ipc->function[i]);
 	}
 	kfree(ipc);
@@ -604,7 +673,7 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 }
 
 /* Called once under the Wi-Fi lock. Published logging memory stays owned by
- * IPC until every function has bus mastering disabled in centauri_free_ipc.
+ * IPC until every function's DMA has stopped in centauri_stop_ipc.
  */
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size)
 {

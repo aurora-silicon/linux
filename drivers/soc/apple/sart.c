@@ -98,6 +98,10 @@ struct apple_sart {
 		size_t size;
 	} saved[APPLE_SART_MAX_ENTRIES];
 	bool saved_valid;
+	/* saved[] filled by apple_sart_save_now() for this sleep */
+	bool saved_early;
+	/* ... and not written back yet: apple_sart_restore_early() */
+	bool early_pending;
 	/* saved[] still holds the last sleep's entries, for apple_sart_replay() */
 	bool replay_valid;
 };
@@ -431,6 +435,54 @@ static bool apple_sart_wake_writes(struct apple_sart *sart, int i)
 }
 
 /*
+ * For a coprocessor that gates its SART itself as it powers down for the sleep: its
+ * driver saves the entries before that, and the late suspend keeps them.
+ */
+void apple_sart_save_now(struct apple_sart *sart)
+{
+	int i;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++)
+		sart->ops->get_entry(sart, i, &sart->saved[i].flags,
+				     &sart->saved[i].paddr, &sart->saved[i].size);
+	sart->saved_early = true;
+	sart->early_pending = true;
+}
+EXPORT_SYMBOL_GPL(apple_sart_save_now);
+
+static unsigned int apple_sart_write_saved(struct apple_sart *sart)
+{
+	unsigned int restored = 0;
+	int i;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		if (!apple_sart_wake_writes(sart, i))
+			continue;
+		sart->ops->set_entry(sart, i, sart->saved[i].flags,
+				     sart->saved[i].paddr >> sart->ops->paddr_shift,
+				     sart->saved[i].size >> sart->ops->size_shift);
+		restored++;
+	}
+	return restored;
+}
+
+/*
+ * After apple_sart_save_now(), when the sleep didn't happen: its coprocessor gated the SART
+ * all the same, so its driver writes the entries back once the SART answers again. Nothing
+ * to do when the wake has written them already.
+ */
+void apple_sart_restore_early(struct apple_sart *sart)
+{
+	sart->saved_early = false;
+	if (!sart->early_pending)
+		return;
+	sart->early_pending = false;
+	dev_info(sart->dev, "%u entries written back after a sleep that didn't happen\n",
+		 apple_sart_write_saved(sart));
+}
+EXPORT_SYMBOL_GPL(apple_sart_restore_early);
+
+/*
  * A SART in a domain that a firmware-driven suspend powers off comes back empty,
  * and its coprocessor can't reach its firmware or buffers until the entries are
  * back. This includes the bootloader's, which Linux otherwise never writes.
@@ -440,6 +492,13 @@ static int apple_sart_suspend_late(struct device *dev)
 	struct apple_sart *sart = dev_get_drvdata(dev);
 	int i;
 
+	if (sart->saved_early) {
+		sart->saved_early = false;
+		sart->replay_valid = false;
+		sart->saved_valid = pm_suspend_target_state == PM_SUSPEND_MEM &&
+				    pm_suspend_via_firmware();
+		return 0;
+	}
 	sart->saved_valid = false;
 	sart->replay_valid = false;
 	if (pm_suspend_target_state != PM_SUSPEND_MEM || !pm_suspend_via_firmware())
@@ -456,21 +515,14 @@ static int apple_sart_suspend_late(struct device *dev)
 static int apple_sart_resume_noirq(struct device *dev)
 {
 	struct apple_sart *sart = dev_get_drvdata(dev);
-	unsigned int restored = 0;
-	int i;
+	unsigned int restored;
 
 	if (!sart->saved_valid || !pm_resume_via_firmware())
 		return 0;
 	sart->saved_valid = false;
+	sart->early_pending = false;
 
-	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
-		if (!apple_sart_wake_writes(sart, i))
-			continue;
-		sart->ops->set_entry(sart, i, sart->saved[i].flags,
-				     sart->saved[i].paddr >> sart->ops->paddr_shift,
-				     sart->saved[i].size >> sart->ops->size_shift);
-		restored++;
-	}
+	restored = apple_sart_write_saved(sart);
 	dev_dbg(dev, "%u entries restored after sleep\n", restored);
 	sart->replay_valid = true;
 
@@ -609,3 +661,7 @@ module_platform_driver(apple_sart_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple SART driver");
+
+#if IS_ENABLED(CONFIG_APPLE_SART_KUNIT_TEST)
+#include "sart-test.c"
+#endif

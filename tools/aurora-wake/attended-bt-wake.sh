@@ -15,13 +15,17 @@ addr=${1:-}
 [[ $addr =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] ||
 	{ echo "usage: $0 <bdaddr>" >&2; exit 2; }
 here=$(dirname "$(readlink -f "$0")")
-out=/var/tmp/bt-wake/attended-$(date +%H%M%S)
-mkdir -p "$out"
+# A fresh private directory, worked in with noclobber set, so that a planted
+# or swapped path cannot redirect what root writes (as in bt-wake-cycle.sh).
+out=$(mktemp -d /var/tmp/bt-wake-attended.XXXXXXXX) ||
+	{ echo "cannot create an output directory" >&2; exit 2; }
+cd -- "$out" || exit 2
+set -C
 
-bluetoothctl info "$addr" > "$out/device.txt" 2>&1 ||
+bluetoothctl info "$addr" > device.txt 2>&1 ||
 	{ echo "$addr is not known to BlueZ" >&2; exit 2; }
-grep -E "Name|Paired|WakeAllowed|Connected" "$out/device.txt"
-grep -q "WakeAllowed: yes" "$out/device.txt" ||
+grep -E "Name|Paired|WakeAllowed|Connected" device.txt
+grep -q "WakeAllowed: yes" device.txt ||
 	{ echo "wake is not allowed: bluetoothctl wake $addr on" >&2; exit 2; }
 
 echo ">>> Press a key on the Bluetooth keyboard so that it connects (60 s)."

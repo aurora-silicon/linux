@@ -35,37 +35,48 @@ static int apple_spmi_nvmem_write(void *priv, unsigned int offset, void *val,
 	return regmap_bulk_write(map, offset, val, bytes);
 }
 
-static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
+/*
+ * The PMIC's register file. Its kernel consumers (the RTC, the reboot and boot
+ * state) write the cells the device tree declares; through sysfs, only root may
+ * read the registers, and nobody may write them.
+ */
+static struct nvmem_device *apple_spmi_nvmem_register(struct device *dev, struct regmap *regmap)
 {
-	struct regmap *regmap;
-	struct nvmem_device *provider;
 	struct nvmem_config nvmem_cfg = {
-		.dev = &sdev->dev,
+		.dev = dev,
 		.name = "spmi_nvmem",
 		.id = NVMEM_DEVID_AUTO,
 		.word_size = 1,
 		.stride = 1,
 		.size = 0xffff,
-		/* PMIC registers: only root may read them through sysfs. */
 		.root_only = true,
+		.sysfs_read_only = true,
 		.reg_read = apple_spmi_nvmem_read,
 		.reg_write = apple_spmi_nvmem_write,
+		.priv = regmap,
 	};
+
+	return devm_nvmem_register(dev, &nvmem_cfg);
+}
+
+static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
+{
+	struct regmap *regmap;
+	struct nvmem_device *provider;
 
 	regmap = devm_regmap_init_spmi_ext(sdev, &apple_spmi_regmap_config);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	nvmem_cfg.priv = regmap;
-
-	provider = devm_nvmem_register(&sdev->dev, &nvmem_cfg);
+	provider = apple_spmi_nvmem_register(&sdev->dev, regmap);
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
 	if (!of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic") &&
 	    !of_device_is_compatible(sdev->dev.of_node, "apple,abbey-pmic") &&
 	    !of_device_is_compatible(sdev->dev.of_node, "apple,chapel-pmic") &&
 	    !of_device_is_compatible(sdev->dev.of_node, "apple,maverick-pmic") &&
-	    !of_device_is_compatible(sdev->dev.of_node, "apple,stowe-pmic"))
+	    !of_device_is_compatible(sdev->dev.of_node, "apple,stowe-pmic") &&
+	    !of_device_is_compatible(sdev->dev.of_node, "apple,sera-pmic"))
 		return 0;
 
 	return devm_of_platform_populate(&sdev->dev);
@@ -90,3 +101,7 @@ module_spmi_driver(apple_spmi_nvmem_driver);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("Apple SPMI NVMEM driver");
+
+#if IS_ENABLED(CONFIG_NVMEM_APPLE_SPMI_KUNIT_TEST)
+#include "apple-spmi-nvmem-test.c"
+#endif

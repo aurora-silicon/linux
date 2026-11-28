@@ -1318,6 +1318,26 @@ static void ane_h16_no_xl_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
 }
 
+/* H15 (T8122): no CE block, no tunables, five DAPF records, DART rev 0x200. */
+static void ane_h16_t8122_no_ce_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->build = ane_h15_build_t8122_26b123;
+	s->mmio = ane_h15_mmio_t8122[0];
+	s->dart_params = 0x2a2a0200;
+	s->soc.h16_mmio = ane_h15_mmio_t8122;
+	s->soc.h16_mmio_count = ARRAY_SIZE(ane_h15_mmio_t8122);
+	s->soc.dapf_count = 5;
+	s->soc.has_xl = false;
+	s->ce_timeout = true;
+	s->expect_tuning = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->ce_ack, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+}
+
 /* The T8132 boots with its own engine writes only: no XL or C1PPT. */
 static void ane_h16_t8132_tunables_test(struct kunit *test)
 {
@@ -1402,6 +1422,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_dapf_five_test),
 	KUNIT_CASE(ane_h16_dapf_five_readback_test),
 	KUNIT_CASE(ane_h16_no_xl_test),
+	KUNIT_CASE(ane_h16_t8122_no_ce_test),
 	KUNIT_CASE(ane_h16_t8132_tunables_test),
 	KUNIT_CASE(ane_h16_t8132_locked_test),
 	KUNIT_CASE(ane_h16_t8132_locked_strobe_test),

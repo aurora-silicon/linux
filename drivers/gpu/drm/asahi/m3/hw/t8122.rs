@@ -76,7 +76,7 @@ pub(crate) const HWCONFIG_T8122: super::HwConfig = HwConfig {
 
     // The 24 MHz reference clock (HwDataB base_clock_khz = 24000).
     base_clock_hz: 24_000_000,
-    // 42-bit UAT roots and output addresses, as on every AGX3 part (hw::agx3::T8122).
+    // 42-bit UAT roots and output addresses, as on every AGX3 part.
     uat_ias: 42,
     uat_oas: 42,
     num_dies: 1,         // ID_COUNTS_1[19:16]

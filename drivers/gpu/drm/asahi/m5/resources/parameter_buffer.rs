@@ -90,9 +90,18 @@ impl M5ParameterBuffer {
     /// Map the retained pool into another application VM at the same compact
     /// addresses with the original two-page guard reservations, so the
     /// firmware's parameter-manager records keep naming valid pages after a
-    /// render client handoff.
+    /// render client handoff. The caller has verified that all work using
+    /// the pool has retired.
     pub(super) fn alias_into(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
         let range = vm_layout::compact_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        // Blocks, scene scratch and the discard page released by the previous
+        // VM may still hold its scene data; clear them before another VM maps
+        // them. The page list and metrics are parameter-manager state named
+        // by the retained firmware records and are kept.
+        for object in Iterator::chain(self.blocks.iter_mut(),
+            [&mut self.scene_scratch, &mut self.discard]) {
+            object.with_bytes_mut(|out| { out.fill(0); Ok(()) })?;
+        }
         let mut aliases = KVec::new();
         let alias = |object: &mut MappedObject, aliases: &mut KVec<mmu::KernelMapping>| -> Result {
             let end = object.iova()

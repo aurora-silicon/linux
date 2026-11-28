@@ -9,9 +9,11 @@
 #include <kunit/test.h>
 #include <linux/array_size.h>
 #include <linux/math.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "apple-scaler-hw.h"
+#include "apple-scaler-msr23.h"
 #include "apple-scaler-regs.h"
 
 struct asc_csc_case {
@@ -638,6 +640,312 @@ static void asc_test_job_rejects(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), -EINVAL);
 }
 
+/* ---- MSR23 job builder ---- */
+
+static u32 msr23_word(const u32 *img, u32 off)
+{
+	return img[off / 4];
+}
+
+static void msr23_pic(struct msr23_pic *p, u32 fourcc, u32 w, u32 h, u32 bpp, u32 cstride_mul)
+{
+	*p = (struct msr23_pic){ fourcc, w, h, { w * bpp, cstride_mul * w } };
+}
+
+/*
+ * BGRA -> NV12 BT.709 at 1080p: sizes, plane codes and the matrix of block 3
+ * as asc_csc_compute() gives it.
+ */
+static void asc_test_msr23_csc(struct kunit *test)
+{
+	u32 *img = kunit_kzalloc(test, MSR23_IMG_LEN, GFP_KERNEL);
+	struct msr23_job job = { .enc = V4L2_YCBCR_ENC_709 };
+	struct msr23_built out;
+	struct asc_csc csc;
+	unsigned int r, c;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x70), 1079 << 16 | 1919);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x58), 7680);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x7c), 1920);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x4), 0x8001);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x8), 0x8006);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x8c), 960);	/* chroma width */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x98), 540);	/* chroma height */
+	KUNIT_ASSERT_EQ(test, asc_csc_compute(V4L2_YCBCR_ENC_709, V4L2_QUANTIZATION_LIM_RANGE,
+					      false, &csc), 0);
+	for (r = 0; r < 3; r++)
+		for (c = 0; c < 3; c++)
+			KUNIT_EXPECT_EQ(test, msr23_word(img, 0x1e00 + 0x34 + 12 * r + 4 * c),
+					(u16)csc.coef[r][c]);
+	/* the output offsets: limited-range black and the chroma midpoint */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x1e00 + 0x58), 0x1010);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x1e00 + 0x5c), 0x8020);
+	KUNIT_EXPECT_EQ(test, out.planes[0], 1);
+	KUNIT_EXPECT_EQ(test, out.planes[1], 2);
+	/* no scaling: both filter axes at unit step */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x8c), BIT(22));
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x40c), BIT(22));
+}
+
+/*
+ * BGRA 4K -> 1080p: Q22 steps and inverses per axis; 1080p -> 4K: the centre
+ * initial phase -1/4.
+ */
+static void asc_test_msr23_scale(struct kunit *test)
+{
+	u32 *img = kunit_kzalloc(test, MSR23_IMG_LEN, GFP_KERNEL);
+	struct msr23_job job = {};
+	struct msr23_built out;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 3840, 2160, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x8c), 2 << 22);	/* vertical step */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x94), 1 << 21);	/* its inverse */
+	/* horizontal step */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x40c), 2 << 22);
+	/* no initial phase when downscaling */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x84), 0);
+	KUNIT_EXPECT_GE(test, out.nc0, 43);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0xec), out.nc1 << 16 | out.nc0);
+
+	memset(img, 0, MSR23_IMG_LEN);
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 3840, 2160, 4, 0);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x8c), 1 << 21);
+	/* -1/4 in 24-bit Q22 */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x84), 0xf00000);
+	/* one axis only: the other stays at a unit step */
+	memset(img, 0, MSR23_IMG_LEN);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 960, 1080, 4, 0);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x8c), BIT(22));
+	KUNIT_EXPECT_EQ(test, msr23_word(img, 0x9080 + 0x40c), 2 << 22);
+}
+
+/* What the builder does not cover. */
+static void asc_test_msr23_rejects(struct kunit *test)
+{
+	u32 *img = kunit_kzalloc(test, MSR23_IMG_LEN, GFP_KERNEL);
+	struct msr23_job job = {};
+	struct msr23_built out;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	msr23_pic(&job.src, V4L2_PIX_FMT_GREY, 1920, 1080, 1, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	/* grey only to grey */
+	KUNIT_EXPECT_EQ(test, msr23_build(&job, img, &out), -EINVAL);
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 3840, 2160, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 480, 270, 4, 0);
+	KUNIT_EXPECT_EQ(test, msr23_build(&job, img, &out), -EINVAL);		/* 8x down */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1919, 1080, 4, 0);
+	KUNIT_EXPECT_EQ(test, msr23_build(&job, img, &out), -EINVAL);		/* odd width */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ARGB2101010, 1920, 1080, 4, 0);
+	KUNIT_EXPECT_EQ(test, msr23_build(&job, img, &out), -EINVAL);		/* no 2:10:10:10 */
+	KUNIT_EXPECT_FALSE(test, msr23_format_ok(V4L2_PIX_FMT_ARGB2101010));
+	KUNIT_EXPECT_TRUE(test, msr23_format_ok(V4L2_PIX_FMT_P010));
+	/* above 4K UHD in area, and 4x up per axis (allowed) */
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 4096, 2304, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 480, 270 * 2, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), 0);
+
+	/* geometry: odd, outside, too small; rotations other than quarter turns */
+	msr23_pic(&job.src, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 960, 540, 1, 1);
+	job.crop = (struct v4l2_rect){ 101, 50, 960, 540 };
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.crop = (struct v4l2_rect){ 1000, 50, 960, 540 };
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.crop = (struct v4l2_rect){ -2, 0, 960, 540 };
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.crop = (struct v4l2_rect){};
+	job.compose = (struct v4l2_rect){ 0, 0, 960, 32 };
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.compose = (struct v4l2_rect){};
+	job.rotate = 45;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	/* the ratio is the rotated source's: 1080 -> 256 is beyond 4x */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 256, 1920, 1, 1);
+	job.rotate = 0;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.rotate = 90;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 540, 960, 1, 1);
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), 0);
+	/* 4:2:2 turns only by half turns */
+	msr23_pic(&job.src, V4L2_PIX_FMT_NV16, 1920, 1080, 1, 1);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV16, 1080, 1920, 1, 1);
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV16, 1920, 1080, 1, 1);
+	job.rotate = 180;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), 0);
+}
+
+/* Crop, compose, rotation and mirrors: region sizes, origins and the pipe word's orientation. */
+static void asc_test_msr23_geometry(struct kunit *test)
+{
+	static const struct {
+		u16 rotate;
+		bool hflip, vflip;
+		u32 code;
+	} orient[] = {
+		{ 0, false, false, 0 },		{ 0, true, false, 0x20 },
+		{ 0, false, true, 0x40 },	{ 0, true, true, 0x10 },
+		{ 90, false, false, 0x08 },	{ 90, true, false, 0x28 },
+		{ 90, false, true, 0x48 },	{ 90, true, true, 0x18 },
+		{ 180, false, false, 0x10 },	{ 180, true, false, 0x40 },
+		{ 180, false, true, 0x20 },	{ 270, false, false, 0x18 },
+		{ 270, true, false, 0x38 },	{ 270, false, true, 0x58 },
+	};
+	u32 *img = kunit_kzalloc(test, MSR23_IMG_LEN, GFP_KERNEL);
+	u32 *ref = kunit_kzalloc(test, MSR23_IMG_LEN, GFP_KERNEL);
+	struct msr23_job job = {};
+	struct msr23_built out;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, img);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+
+	/* 960x540 at (100, 50) of an NV12 1080p source: origins per plane, planes whole */
+	msr23_pic(&job.src, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 960, 540, 1, 1);
+	job.crop = (struct v4l2_rect){ 100, 50, 960, 540 };
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x68), 50 << 16 | 100);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x6c), 25 << 16 | 50);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x7c), 960);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x80), 540);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0xb4), 1920);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0xb8), 960);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0xc4), 1080);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x68), 0);	/* no scaling */
+
+	/* 1920x1080 into 1280x720 at (0, 280) of 1280x1280: the scaler of 1280x720 */
+	job = (struct msr23_job){};
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1280, 720, 4, 0);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, ref, &out), 0);
+	memset(img, 0, MSR23_IMG_LEN);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1280, 1280, 4, 0);
+	job.compose = (struct v4l2_rect){ 0, 280, 1280, 720 };
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	/* written as a 1280x720 picture 280 rows into the planes */
+	KUNIT_EXPECT_EQ(test, out.dst_off[0], 280 * 1280 * 4);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x4c), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x40), 1280 * 4);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x5c), 1280);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x60), 720);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x94), 720);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x70), 719 << 16 | 1279);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x68), msr23_word(ref, MSR23_B0 + 0x68));
+	KUNIT_EXPECT_MEMEQ(test, img + 0x9080 / 4, ref + 0x9080 / 4, 0x500);
+	/* NV12: the chroma plane's offset is in CbCr pairs and chroma rows */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1280, 1280, 1, 1);
+	job.compose = (struct v4l2_rect){ 64, 280, 1152, 720 };
+	job.enc = V4L2_YCBCR_ENC_709;
+	memset(img, 0, MSR23_IMG_LEN);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, out.dst_off[0], 280 * 1280 + 64);
+	KUNIT_EXPECT_EQ(test, out.dst_off[1], 140 * 1280 + 64);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B14 + 0x8c), 576);	/* chroma width */
+
+	/* the source side of the channel map: 0x30 for a conversion at 1:1 only */
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x78) & 0xffff, 8);
+	job = (struct msr23_job){};
+	msr23_pic(&job.src, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	memset(img, 0, MSR23_IMG_LEN);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x78) & 0xffff, 8);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x7c) & 0xffff, 0x28);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	job.enc = V4L2_YCBCR_ENC_709;
+	memset(img, 0, MSR23_IMG_LEN);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x78) & 0xffff, 0x30);
+
+	/* a quarter turn: the source keeps its own size, the pipe the destination's */
+	job = (struct msr23_job){};
+	msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1080, 1920, 4, 0);
+	job.rotate = 90;
+	memset(img, 0, MSR23_IMG_LEN);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x7c), 1920);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B1 + 0x58), 7680);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x68), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x70), 1919 << 16 | 1079);
+
+	/* a conversion at 1:1 with a quarter turn: the matrix where a scaled job has it */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1080, 1920, 1, 1);
+	job.enc = V4L2_YCBCR_ENC_709;
+	memset(img, 0, MSR23_IMG_LEN);
+	KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x64) & BIT(16), 0);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x6c) & 3, 3);
+	KUNIT_EXPECT_EQ(test, msr23_word(img, MSR23_B0 + 0x78) & 0xffff, 8);
+	/* ... and with a mirror or half turn it is refused, unless the job scales */
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1920, 1080, 1, 1);
+	job.rotate = 0;
+	job.hflip = true;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	job.hflip = false;
+	job.rotate = 180;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), -EINVAL);
+	msr23_pic(&job.dst, V4L2_PIX_FMT_NV12, 1280, 720, 1, 1);
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), 0);
+	job.rotate = 0;
+	msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+	job.hflip = true;
+	KUNIT_EXPECT_EQ(test, msr23_check(&job), 0);	/* same format */
+
+	/* the orientation codes */
+	for (i = 0; i < ARRAY_SIZE(orient); i++) {
+		bool quarter = orient[i].rotate % 180;
+
+		job = (struct msr23_job){ .rotate = orient[i].rotate, .hflip = orient[i].hflip,
+					  .vflip = orient[i].vflip };
+		msr23_pic(&job.src, V4L2_PIX_FMT_ABGR32, 1920, 1080, 4, 0);
+		msr23_pic(&job.dst, V4L2_PIX_FMT_ABGR32, quarter ? 1080 : 1920,
+			  quarter ? 1920 : 1080, 4, 0);
+		memset(img, 0, MSR23_IMG_LEN);
+		KUNIT_ASSERT_EQ(test, msr23_build(&job, img, &out), 0);
+		KUNIT_EXPECT_EQ_MSG(test, msr23_word(img, MSR23_B0 + 0x64) & 0x78, orient[i].code,
+				    "rotate %u hflip %d vflip %d", orient[i].rotate,
+				    orient[i].hflip, orient[i].vflip);
+	}
+}
+
+/*
+ * The block list: each block inside the image, at a 128-byte boundary (block
+ * words hold offset >> 7), and no two overlapping.
+ */
+static void asc_test_msr23_blocks(struct kunit *test)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < MSR23_NBLOCKS; i++) {
+		u32 a = msr23_blocks[i].off, end = a + (msr23_blocks[i].size >> 20) * 32;
+
+		KUNIT_EXPECT_LE(test, end, MSR23_IMG_LEN);
+		KUNIT_EXPECT_EQ(test, a % 0x80, 0);
+		for (j = 0; j < i; j++) {
+			u32 b = msr23_blocks[j].off, bend = b + (msr23_blocks[j].size >> 20) * 32;
+
+			KUNIT_EXPECT_TRUE(test, end <= b || bend <= a);
+		}
+	}
+}
+
 static struct kunit_case asc_test_cases[] = {
 	KUNIT_CASE_PARAM(asc_test_csc, asc_csc_gen_params),
 	KUNIT_CASE(asc_test_csc_rejects),
@@ -648,6 +956,11 @@ static struct kunit_case asc_test_cases[] = {
 	KUNIT_CASE(asc_test_job_rejects),
 	KUNIT_CASE(asc_test_lossless_geom),
 	KUNIT_CASE(asc_test_job_lossless),
+	KUNIT_CASE(asc_test_msr23_csc),
+	KUNIT_CASE(asc_test_msr23_scale),
+	KUNIT_CASE(asc_test_msr23_rejects),
+	KUNIT_CASE(asc_test_msr23_geometry),
+	KUNIT_CASE(asc_test_msr23_blocks),
 	{}
 };
 

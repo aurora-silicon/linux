@@ -141,7 +141,7 @@ static int sleep_v27_final_check(unsigned int i)
 	if (!sleep_v27_held || i >= ARRAY_SIZE(sleep_v27) ||
 	    !sleep_v27[i].armed || !READ_ONCE(sleep_v27[i].prepared))
 		return -EBUSY;
-	return sleep_v27[i].ops->check(sleep_v27[i].data);
+	return sleep_v27[i].ops->check(sleep_v27[i].data, apple_sleep->entry_committed);
 }
 
 static bool sleep_v27_gate_prepared(const struct device_node *np)

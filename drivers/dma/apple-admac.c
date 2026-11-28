@@ -822,7 +822,8 @@ static void admac_reset_rings(struct admac_chan *adchan)
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, adchan->no));
 }
 
-static int admac_device_config(struct dma_chan *chan, struct dma_slave_config *config);
+static int admac_program_config(struct admac_chan *adchan,
+				const struct dma_slave_config *config);
 
 /* Registers can't be reached before a client powers the fabric, so this waits for it. */
 static void admac_restore_chan(struct admac_chan *adchan)
@@ -836,8 +837,9 @@ static void admac_restore_chan(struct admac_chan *adchan)
 	if (ad->split_channels || ad->display)
 		writel_relaxed(T8132_CTL_VAL, ad->base + REG_CTL);
 	writel_relaxed(adchan->carveout, ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
+	/* The registers only: realign_bytes was taken when the client configured. */
 	if (adchan->cfg_valid)
-		admac_device_config(&adchan->chan, &adchan->cfg);
+		admac_program_config(adchan, &adchan->cfg);
 }
 
 /*
@@ -1465,10 +1467,10 @@ out:
 	return 0;
 }
 
-static int admac_device_config(struct dma_chan *chan,
-			       struct dma_slave_config *config)
+/* Program a channel's registers from @config, a client's or the saved copy. */
+static int admac_program_config(struct admac_chan *adchan,
+				const struct dma_slave_config *config)
 {
-	struct admac_chan *adchan = to_admac_chan(chan);
 	struct admac_data *ad = adchan->host;
 	bool is_tx = admac_chan_direction(adchan->no) == DMA_MEM_TO_DEV;
 	int wordsize = 0;
@@ -1520,17 +1522,6 @@ static int admac_device_config(struct dma_chan *chan,
 
 	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
 
-	adchan->realign_bytes = admac_config_realign_bytes(config);
-
-	/*
-	 * Optional: a u32 frame size in bytes, which a paused capture is
-	 * restarted aligned to on resume (see admac_cyclic_realign()).
-	 */
-	if (config->peripheral_config && config->peripheral_size == sizeof(u32))
-		adchan->realign_bytes = *(u32 *)config->peripheral_config;
-	else
-		adchan->realign_bytes = 0;
-
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
 	 * held in controller's per-channel FIFO. Transfers seem to be triggered
@@ -1549,7 +1540,28 @@ static int admac_device_config(struct dma_chan *chan,
 			       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
 	}
 
+	return 0;
+}
+
+static int admac_device_config(struct dma_chan *chan,
+			       struct dma_slave_config *config)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	int ret;
+
+	ret = admac_program_config(adchan, config);
+	if (ret)
+		return ret;
+
+	/*
+	 * The peripheral config is the client's memory and only valid during
+	 * this call: take the frame size from it now and keep no pointer to it
+	 * in the copy a restore programs the channel from.
+	 */
+	adchan->realign_bytes = admac_config_realign_bytes(config);
 	adchan->cfg = *config;
+	adchan->cfg.peripheral_config = NULL;
+	adchan->cfg.peripheral_size = 0;
 	adchan->cfg_valid = true;
 
 	return 0;

@@ -45,6 +45,14 @@ properties:
         const: apple,t8152-ascwrap-v8-mailbox
 
       - description:
+          T8152 ACIO mailbox of a USB4 router's coprocessor, a 0x80 window
+          with the counted FIFOs of the SMC mailbox, described with its
+          send-empty and recv-not-empty interrupts.
+        items:
+          - const: apple,t8152-cio-mailbox
+          - const: apple,t8152-smc-mailbox
+
+      - description:
           ASC mailboxes are the most common variant found on the M1 used
           for example for the display controller, the system management
           controller and the NVMe coprocessor.
@@ -98,6 +106,7 @@ properties:
           iop,secure-rtbuddy-proxy. It is polled, with no interrupts described.
         items:
           - enum:
+              - apple,t6050-secure-rtbuddy-proxy
               - apple,t8140-secure-rtbuddy-proxy
           - const: apple,secure-rtbuddy-proxy
 

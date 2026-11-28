@@ -275,6 +275,11 @@
 					piodma {
 						iommus = <&t8122_dispext0_dart 4>;
 					};
+
+					fbdma {
+						iommus = <&t8122_dispext0_dart 0>;
+						apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+					};
 				};
 
 				display-subsystem {

@@ -54,6 +54,9 @@ pub(crate) struct Config {
     io_descriptors: Option<KVec<u8>>,
     _iomaps: KVec<mmu::KernelMapping>,
     pub(crate) completed_events: u64,
+    pending_recovery_event: Option<(u32, u32)>,
+    pending_recovery_stats: bool,
+    last_recovery_gen: Option<u64>,
     pstates: crate::m3::m3_adt_config::PstateWatch,
     thermal: crate::m3::m3_thermal::Governor,
     request_top: u32,
@@ -74,6 +77,7 @@ impl Config {
             let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
             return Ok(Self { objects: owners.objects, _iomaps: owners.iomaps,
                 profile: firmware.profile(), control_generation: 0, completed_events: 0,
+                pending_recovery_event: None, pending_recovery_stats: false, last_recovery_gen: None,
                 io_descriptors: Some(owners.descriptors),
                 pstates: crate::m3::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
                 request_top: 8, request_value: 0, request_checked: false, request_check_at: None,
@@ -156,6 +160,7 @@ impl Config {
         let thermal = crate::m3::m3_thermal::Governor::new(dev.as_ref().as_ref(), &contents.pstates)?;
         Ok(Self { objects, profile: firmware.profile(), control_generation: 0, io_descriptors: None,
             _iomaps: iomaps, completed_events: 0,
+            pending_recovery_event: None, pending_recovery_stats: false, last_recovery_gen: None,
             pstates: crate::m3::m3_adt_config::PstateWatch::new(contents.pstates), thermal,
             request_top:contents.table.0,request_value:0,request_checked:false,
             request_check_at:None,request_writes:0,request_observed:0 })
@@ -299,12 +304,9 @@ impl Config {
         let state=kind*2;let ring=state+1;
         let w=self.objects[state].read_u32(0x20)?;
         if w>=256 || self.objects[state].read_u32(0)?!=w { return Err(EBUSY); }
-        let mut message=[0u8;0x18];
-        message[8..16].copy_from_slice(&queue.to_le_bytes());
-        message[16..20].copy_from_slice(&(kind as u32).to_le_bytes());
-        message[20..22].copy_from_slice(&head.to_le_bytes());
-        message[22]=event;message[23]=u8::from(new); // New queue; caller selected the event slot.
-        self.objects[ring].write(w as usize*0x18,&message)?;
+        let message = super::m3_channel_format::submission_entry(kind as u32, queue, head, event, new)
+            .map_err(|_| EINVAL)?;
+        self.objects[ring].write(w as usize * message.len(), &message)?;
         agx_memory::publish();
         self.objects[state].u32(0x20,(w+1)%256)?;
         agx_memory::publish();
@@ -373,8 +375,13 @@ impl Config {
     /// Nothing is acknowledged, cleared or resumed here.
     pub(crate) fn log_recovery_state(&mut self, dev: &driver::AsahiDrmDevice, events: u64) -> Result {
         if self.profile == super::m3_profile::Profile::Extended {
+            let control_start = 0x4ebc + super::m3_init_26::control_shift();
+            let control_size = self.objects[CONTROL_REGION].size();
             for (owner, start, length) in [(super::m3_init_26::RECOVERY_ACTIVITY, 0, 0x60),
-                (CONTROL_REGION, 0x4ebc, 0x100)] {
+                (CONTROL_REGION, control_start, 0x100)] {
+                if owner == CONTROL_REGION && start.saturating_add(length) > control_size {
+                    continue;
+                }
                 for offset in (start..start + length).step_by(32) {
                     let mut bytes = [0; 32];
                     self.objects[owner].read(offset, &mut bytes)?;
@@ -538,14 +545,27 @@ impl Config {
                                 core::str::from_utf8(&text[..len]).unwrap_or("<non-UTF8>"));
                         }
                     } else if channel == storage::EVENT {
-                        if kind != 1 {
+                        if kind == 1 {
+                            let flags = u32::from_le_bytes(record[4..8].try_into().map_err(|_| EIO)?);
+                            self.completed_events = self.completed_events.saturating_add((flags & 7).count_ones().into());
+                        } else if kind == 0 || kind == 4 {
+                            let word3 = u32::from_le_bytes(record[12..16].try_into().map_err(|_| EIO)?);
+                            dev_err!(dev.as_ref(), "M3 firmware event {}: {:02x?}\n", kind, record);
+                            if self.recovery_offsets().is_none() {
+                                return Err(EIO);
+                            }
+                            self.pending_recovery_event.get_or_insert((kind, word3));
+                        } else {
                             dev_err!(dev.as_ref(), "M3 firmware event {}: {:02x?}\n", kind, record);
                             return Err(EIO);
                         }
-                        let flags = u32::from_le_bytes(record[4..8].try_into().map_err(|_| EIO)?);
-                        self.completed_events = self.completed_events.saturating_add((flags & 7).count_ones().into());
-                    } else if (channel == storage::TRACE && kind != 5)
-                        || (channel == storage::STATS && kind == 0x16) {
+                    } else if channel == storage::STATS && kind == 0x16 {
+                        dev_err!(dev.as_ref(), "M3 firmware channel {} record {}: {:02x?}\n", channel, kind, record);
+                        if self.recovery_offsets().is_none() {
+                            return Err(EIO);
+                        }
+                        self.pending_recovery_stats = true;
+                    } else if channel == storage::TRACE && kind != 5 {
                         dev_err!(dev.as_ref(), "M3 firmware channel {} record {}: {:02x?}\n", channel, kind, record);
                         return Err(EIO);
                     }
@@ -556,6 +576,90 @@ impl Config {
         }
         agx_memory::publish();
         Ok(())
+    }
+
+    pub(crate) fn recovery_offsets(&self) -> Option<super::m3_recovery::RecoveryOffsets> {
+        if self.profile != super::m3_profile::Profile::Extended {
+            return None;
+        }
+        let offsets = super::m3_recovery::RecoveryOffsets::extended(
+            super::m3_init_26::control_shift(),
+            super::m3_init_26::control_region_bytes(),
+        );
+        offsets
+            .valid_for(self.objects[CONTROL_REGION].size())
+            .then_some(offsets)
+    }
+
+    pub(crate) fn recovery_phase(&mut self) -> Result<u32> {
+        let offsets = self.recovery_offsets().ok_or(EOPNOTSUPP)?;
+        self.objects[CONTROL_REGION].read_u32(offsets.phase)
+    }
+
+    pub(crate) fn recovery_generation(&mut self) -> Result<u64> {
+        let offsets = self.recovery_offsets().ok_or(EOPNOTSUPP)?;
+        let lo = self.objects[CONTROL_REGION].read_u32(offsets.generation)?;
+        let hi = self.objects[CONTROL_REGION].read_u32(offsets.generation + 4)?;
+        Ok(u64::from(lo) | (u64::from(hi) << 32))
+    }
+
+    pub(crate) fn write_recovery_phase(&mut self, phase: u32) -> Result {
+        let offsets = self.recovery_offsets().ok_or(EOPNOTSUPP)?;
+        agx_memory::publish();
+        self.objects[CONTROL_REGION].u32(offsets.phase, phase)?;
+        agx_memory::publish();
+        Ok(())
+    }
+
+    pub(crate) fn read_recovery_snapshot(&mut self, index: usize) -> Result<(u32, u32)> {
+        let offsets = self.recovery_offsets().ok_or(EOPNOTSUPP)?;
+        if index >= offsets.snapshot_entries {
+            return Err(ERANGE);
+        }
+        let at = offsets.snapshot + index * 8;
+        let flags = self.objects[CONTROL_REGION].read_u32(at)?;
+        let target = self.objects[CONTROL_REGION].read_u32(at + 4)?;
+        Ok((flags, target))
+    }
+
+    pub(crate) fn note_recovered(&mut self, generation: u64) {
+        self.last_recovery_gen = Some(generation);
+        self.pending_recovery_event = None;
+        self.pending_recovery_stats = false;
+    }
+
+    /// Returns a recovery trigger error if the firmware reported a fault/timeout
+    /// or entered recovery phase != 0, ignoring trailing `EVENT 0`/`4` or
+    /// `STATS 0x16` notifications from the already-completed recovery generation.
+    pub(crate) fn take_recovery_trigger(&mut self) -> Result<Option<Error>> {
+        if self.recovery_offsets().is_none() {
+            if let Some((kind, _word3)) = self.pending_recovery_event.take() {
+                self.pending_recovery_stats = false;
+                return Ok(Some(if kind == 4 { ETIMEDOUT } else { EIO }));
+            }
+            if core::mem::take(&mut self.pending_recovery_stats) {
+                return Ok(Some(EIO));
+            }
+            return Ok(None);
+        }
+        let phase = self.recovery_phase()?;
+        if let Some((kind, _word3)) = self.pending_recovery_event.take() {
+            self.pending_recovery_stats = false;
+            let gen = self.recovery_generation()?;
+            if !super::m3_recovery::is_trailing_stats(phase, gen, self.last_recovery_gen) {
+                return Ok(Some(if kind == 4 { ETIMEDOUT } else { EIO }));
+            }
+        }
+        if core::mem::take(&mut self.pending_recovery_stats) {
+            let gen = self.recovery_generation()?;
+            if !super::m3_recovery::is_trailing_stats(phase, gen, self.last_recovery_gen) {
+                return Ok(Some(EIO));
+            }
+        }
+        if phase != 0 {
+            return Ok(Some(EIO));
+        }
+        Ok(None)
     }
 
 }

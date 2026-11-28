@@ -281,9 +281,11 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 /*
  * The macOS 27.0 (26A428) command layout. The macOS 27.2 (26B123) build
  * keeps every field where 26A428 has it; only the Process commands grow
- * (ave_layout_26b123).
+ * (ave_layout_26b123). rate_copy is the Start's second integer frame rate
+ * and hevc_low_delay the HEVC Process low-delay word, 0 where a build's
+ * sessions have not been run with them.
  */
-#define AVE_LAYOUT_26A428_FIELDS \
+#define AVE_LAYOUT_26A428_FIELDS(rate_copy, hevc_low_delay) \
 	.abi = &ave_abi_9003, \
 	.kind = AVE_LAYOUT_26A428, \
 	.encode_ready = true, \
@@ -335,6 +337,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 			.const_214 = 0x35f4, \
 			.const_218 = 0x35f8, \
 			.fps = { .numerator = 0x3600 }, \
+			.fps_int_copy = rate_copy, \
 			.rc_mode = 0x3614, \
 			.bitrate = 0x3618, \
 			.init_qp = 0x3620, \
@@ -423,6 +426,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 			.const_214 = 0x35f4, \
 			.const_218 = 0x35f8, \
 			.fps = { .numerator = 0x3600 }, \
+			.fps_int_copy = rate_copy, \
 			.rc_mode = 0x3614, \
 			.bitrate = 0x3618, \
 			.init_qp = 0x3620, \
@@ -524,6 +528,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 			.meta_size = 0x6060, \
 			.extra = 0x6068, \
 			.crop = 0x3190, \
+			.low_delay = hevc_low_delay, \
 		}, \
 	}, \
 	.result = { \
@@ -541,7 +546,14 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 const struct ave_fw_layout ave_layout_26a428 = {
 	.name = "26A428",
 	.bytes = { { 0x3b40, 0x6df8 }, { 0x13ee0, 0x78b8 } },
-	AVE_LAYOUT_26A428_FIELDS
+	/*
+	 * macOS 27.2.1 on the M5 writes the rate a second time at Start
+	 * +0x320c (60 at 60 fps), and 3 at Process +0xce4 for HEVC without
+	 * B-frames.
+	 */
+	AVE_LAYOUT_26A428_FIELDS(0x320c, 0xce4)
+	/* 60 fps and sessions without B-frames encode on the M5 (J815). */
+	.any_gop = true,
 };
 
 /*
@@ -553,7 +565,7 @@ const struct ave_fw_layout ave_layout_26a428 = {
 const struct ave_fw_layout ave_layout_26b123 = {
 	.name = "26B123",
 	.bytes = { { 0x3b40, 0x6e08 }, { 0x13ee0, 0x78c8 } },
-	AVE_LAYOUT_26A428_FIELDS
+	AVE_LAYOUT_26A428_FIELDS(0, 0)
 	.any_gop = true,
 };
 
@@ -995,7 +1007,8 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
 	if (crc == AVE_FW_TEXT_CRC_T8132_26B123 ||
-	    crc == AVE_FW_TEXT_CRC_T8122_26B123)
+	    crc == AVE_FW_TEXT_CRC_T8122_26B123 ||
+	    crc == AVE_FW_TEXT_CRC_T8112_26B123)
 		return &ave_layout_26b123;
 	/*
 	 * The M5's macOS 27.2 build (9013.55.1), between 26A428 and the 27.3

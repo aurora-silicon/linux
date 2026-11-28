@@ -194,6 +194,58 @@ fn main() {
     return events, idle_events
 
 
+def strip_dts_comments(text):
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+        lambda m: m.group(0) if m.group(0).startswith('"') else ' ',
+        text,
+        flags=re.S,
+    )
+
+
+def dt_cells(node_text, name):
+    match = re.search(r'(?:^|[\s;])' + re.escape(name) + r'\s*=\s*([^;]*);', node_text)
+    if not match:
+        return None
+    return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
+
+
+def parse_clpc_dt_gpu_busy(dts_text, node_sig):
+    clpc_node = item(strip_dts_comments(dts_text), node_sig)
+    return (
+        dt_cells(clpc_node, 'apple,gpu-busy-memory-states'),
+        dt_cells(clpc_node, 'apple,gpu-busy-permille'),
+    )
+
+
+def parse_t6050_gpu_busy(dts_text):
+    states, busy = parse_clpc_dt_gpu_busy(dts_text, 'clpc: performance-controller@1 {')
+    assert states and busy, \
+        't6050-die0.dtsi clpc node must define both gpu-busy DT properties'
+    return states, busy
+
+
+def test_t6050_dt_negative_controls(t6050_dts):
+    for prop, short in [
+        ('apple,gpu-busy-memory-states', 'states'),
+        ('apple,gpu-busy-permille', 'permille'),
+    ]:
+        pat = re.compile(r'^([ \t]*)(' + re.escape(prop) + r'\s*=[^;]*;)', re.M)
+        for kind, repl in [
+            ('delete', ''),
+            ('block-comment', r'\1/* \2 */'),
+            ('line-comment', r'\1// \2'),
+        ]:
+            mutated, count = pat.subn(repl, t6050_dts, count=1)
+            assert count == 1 and mutated != t6050_dts, f'stale mutation: {kind}-{short}'
+            try:
+                parse_t6050_gpu_busy(mutated)
+            except AssertionError:
+                print(f'PASS negative control: t6050-dt-{kind}-{short}')
+            else:
+                raise AssertionError(f'negative control passed unexpectedly: t6050-dt-{kind}-{short}')
+
+
 def main():
     g17_events, g17_idle_events = test_g17_busy_share()
     source = (ROOT / 'drivers/soc/apple/clpc.c').read_text()
@@ -208,25 +260,25 @@ def main():
                        for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140',
                                  'apple_clpc_hw_t6040', 'apple_clpc_hw_t6041',
                                  'apple_clpc_hw_t6050'])
+
     # When t6041.dtsi supplies the GPU busy-share properties, parse and test them directly;
     # otherwise exercise the DT parsers and ladder against the reference values.
     dts = (ROOT / 'arch/arm64/boot/dts/apple/t6041.dtsi').read_text()
-    clpc_node = item(dts, '&clpc {')
-
-    def cells(name):
-        match = re.search(r'\s' + re.escape(name) + r'\s*=\s*([^;]*);', clpc_node)
-        if not match:
-            return None
-        return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
-
-    dt_states = cells('apple,gpu-busy-memory-states')
-    dt_busy = cells('apple,gpu-busy-permille')
+    dt_states, dt_busy = parse_clpc_dt_gpu_busy(dts, '&clpc {')
     assert (dt_states is None) == (dt_busy is None)
     gpu_states = dt_states or [1, 2, 4, 5, 0, 0, 0, 3]
     gpu_busy = dt_busy or [160, 500, 800]
+
+    # Parse T6050's shared CLPC node directly; both DT properties are required.
+    t6050_dts = (ROOT / 'arch/arm64/boot/dts/apple/t6050-die0.dtsi').read_text()
+    t6050_states, t6050_busy = parse_t6050_gpu_busy(t6050_dts)
+    test_t6050_dt_negative_controls(t6050_dts)
+
     t6041_dt = (
         'static const u32 t6041_gpu_states[] = {' + ', '.join(str(x) for x in gpu_states) + '};\n'
         'static const u32 t6041_gpu_busy[] = {' + ', '.join(str(x) for x in gpu_busy) + '};\n'
+        'static const u32 t6050_gpu_states[] = {' + ', '.join(str(x) for x in t6050_states) + '};\n'
+        'static const u32 t6050_gpu_busy[] = {' + ', '.join(str(x) for x in t6050_busy) + '};\n'
         'static const struct { unsigned long ms; unsigned int permille; } g17_long_events[] = {'
         + ', '.join(f'{{{t}, {p}}}' for t, p in g17_events) + '};\n'
         'static const struct { unsigned long ms; int permille; } g17_idle_events[] = {'
@@ -256,6 +308,8 @@ def main():
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int atomic_t;
+static void atomic_set(atomic_t *v, int i) { *v = i; }
 struct device;
 #define APPLE_CLPC_LEVELS 4
 #define APPLE_CLPC_HOLD_MS 32
@@ -322,8 +376,11 @@ struct apple_clpc {
  struct freq_qos_request ane_qos;
  unsigned int ane_qos_khz;
  unsigned long ane_until;
+ bool has_pmc;
  bool low_power;
  unsigned int low_power_khz;
+ unsigned int low_power_mw;
+ atomic_t idle_armed;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -413,7 +470,7 @@ static void t6041_from_dt(void) {
  // Falling back keeps the compatible's full GPU floor even when a low busy share arrives.
  {
   struct apple_clpc_gpu g = {.active = true, .busy_valid = true, .busy = 100};
-  struct apple_clpc c = {.hw = &out, .agent = 1, .mask = 3, .gpu = &g};
+  struct apple_clpc c = {.hw = &out, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &g};
   read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; jiffies = 2900; published = ~0u;
   apple_clpc_sample(&c);
   assert(published == 0x35 && c.last_reason == 2);
@@ -424,11 +481,51 @@ static void t6041_from_dt(void) {
  assert(apple_clpc_dt_busy(&bad, busy, 3) == -EINVAL);
  assert(apple_clpc_dt_busy(&bad, busy, 2) == -EINVAL);
 }
+
+static struct apple_clpc_hw t6050_dt_hw;
+static void t6050_from_dt(void) {
+ static const u8 cpu[2][4] = {{2, 4, 5, 5}, {1, 2, 2, 2}}, gpu[2][4] = {{1, 2, 4, 6}, {0, 0, 0, 2}};
+ int prev = dt_warned;
+
+ dt_warned = 0;
+ assert(apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6050, &t6050_dt_hw,
+                            t6050_gpu_states, ARRAY_SIZE(t6050_gpu_states),
+                            t6050_gpu_busy, ARRAY_SIZE(t6050_gpu_busy)));
+ assert(dt_warned == 0);
+ for (int r = 0; r < 2; r++)
+  for (int l = 0; l < 4; l++)
+   assert(t6050_dt_hw.map[r][l] == cpu[r][l] && t6050_dt_hw.gpu_busy[r][l] == gpu[r][l]);
+ dt_warned = prev;
+}
+
+static void check_t6050_busy(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t6050_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ assert(c.hw->gpu_busy_mid == 160 && c.hw->gpu_busy_high == 500 && c.hw->gpu_busy_top == 800);
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ gpu.active = true; jiffies = 6000; apple_clpc_sample(&c);
+ assert(published == 0x26 && c.last_reason == 2 && gpu.level == 3);
+ gpu.active = false; jiffies = 6100; apple_clpc_sample(&c); assert(published == 0);
+ gpu.active = true; gpu.busy_valid = true; gpu.busy = 159; jiffies = 6500;
+ apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
+ gpu.busy = 160; jiffies = 6504; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 499; jiffies = 6508; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 500; jiffies = 6512; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 799; jiffies = 6516; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 800; jiffies = 6520; apple_clpc_sample(&c); assert(published == 0x26 && gpu.level == 3);
+ gpu.busy = 100;
+ for (jiffies = 6524; jiffies < 6920; jiffies += 4) {
+  apple_clpc_sample(&c); assert(published == 0x26 && gpu.level == 3);
+ }
+ jiffies = 6920; apple_clpc_sample(&c); assert(published == 0x21 && gpu.level == 0);
+ jiffies = 6952; apple_clpc_sample(&c); assert(published == 0x01 && c.last_reason == 2);
+ gpu.active = false; jiffies = 7000; apple_clpc_sample(&c); assert(published == 0 && queued_idle);
+}
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.
 static void check_t8140_ane(void) {
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.ane=&ane};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=1000; published=~0u;
@@ -441,11 +538,29 @@ static void check_t8140_ane(void) {
  jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
 }
 
+// T6050 ANE work holds DCS 6 and fabric 2 while it runs (and keeps on-time
+// idle sampling), sees a sub-sample request once, and releases after HOLD_MS.
+static void check_t6050_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6050,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ assert(c.hw->ane[APPLE_CLPC_DCS]==6 && c.hw->ane[APPLE_CLPC_SOC]==2 && c.hw->idle_on_time);
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=3000; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && c.last_reason==0);
+ ane.active=true; jiffies=3004; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32);
+ ane.active=false; ane.pending=true; jiffies=3008; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32 && !ane.pending);
+ jiffies=3012; apple_clpc_sample(&c); assert(published==0x26 && c.last_reason==16);
+ jiffies=3040; apple_clpc_sample(&c); assert(published==0 && c.last_reason==0 && queued_idle);
+}
+
 // T6040 ANE work also holds the second P cluster at its qualified frequency,
 // added on first use, for the vote hold after the last request, then drops it.
 static void check_t6040_ane(void) {
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.ane=&ane};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  c.ane_cpu=9; c.ane_cluster_khz=c.hw->ane_cluster_khz;
@@ -466,7 +581,7 @@ static void check_t6040_ane(void) {
 // level or more. A table without a non-zero top DCS state falls back to @map.
 static void check_t6041_busy(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&t6041_dt_hw,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&t6041_dt_hw,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
  struct apple_clpc_hw no_top = t6041_dt_hw;
  assert(c.hw->gpu_busy_mid==160 && c.hw->gpu_busy_high==500 && c.hw->gpu_busy_top==800);
  read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; published=~0u;
@@ -516,7 +631,7 @@ static void check_t6041_busy(void) {
 // 0x35 while it runs, and drops back to 0x01 after it finishes + 400 ms hold.
 static void check_t6041_long_in_flight(void) {
  struct apple_clpc_gpu gpu = {0};
- struct apple_clpc c = {.hw = &t6041_dt_hw, .agent = 1, .mask = 3, .gpu = &gpu};
+ struct apple_clpc c = {.hw = &t6041_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
  read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
  gpu.active = true;
  // Initial burst starts at top (no share yet).
@@ -562,7 +677,7 @@ static void check_t6041_long_in_flight(void) {
 // diluted 85 permille a stale window would report drops it to 0x01 at once.
 static void check_t6041_idle_burst(void) {
  struct apple_clpc_gpu gpu = {0};
- struct apple_clpc c = {.hw = &t6041_dt_hw, .agent = 1, .mask = 3, .gpu = &gpu};
+ struct apple_clpc c = {.hw = &t6041_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
  size_t i = 0, n = ARRAY_SIZE(g17_idle_events);
  read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
  assert(n == 8 && g17_idle_events[0].ms == 1100 && g17_idle_events[2].ms == 2000);
@@ -603,7 +718,7 @@ static void check_t6041_idle_burst(void) {
 // M5/F3 floor follows the work the GPU driver reports, as on T6040.
 static void check_t8132(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
  assert(!c.hw->gpu_demand);
  read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; jiffies=0; published=~0u;
  apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
@@ -620,7 +735,7 @@ static void check_t8132(void) {
 static void check_t6041(const struct apple_clpc_hw *hw) {
  struct apple_clpc_gpu gpu={0};
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=hw,.agent=1,.mask=3,.gpu=&gpu,.ane=&ane};
+ struct apple_clpc c={.hw=hw,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  assert(!c.hw->gpu_demand && c.hw->gpu_input && c.hw->sustain==0 && c.hw->idle_on_time);
@@ -646,7 +761,7 @@ static void check_t6041(const struct apple_clpc_hw *hw) {
 
 // A failed power-state read still protects an active graphics consumer.
 static void check_read_error(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0; warned=0;
  for (jiffies=100; jiffies<=164; jiffies+=4) apple_clpc_sample(&c);
  assert(published==0x34 && c.last_reason==4);
@@ -661,7 +776,7 @@ static void check_read_error(void) {
 }
 
 static void check_t8140(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0;
  for (jiffies=100; jiffies<=164; jiffies+=4) {
   apple_clpc_sample(&c);
@@ -684,7 +799,7 @@ static void check_t8140(void) {
 // streams, but 2+ submissions in each of 4 periods earn the GPU floor.
 static void check_t8140_dense(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1,.gpu=&gpu};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0; published=~0u;
  jiffies=100; apple_clpc_sample(&c); assert(published==0 && queued_idle);
  for (jiffies=104; jiffies<=116; jiffies+=4) {
@@ -703,25 +818,27 @@ static void check_t8140_dense(void) {
  assert(c.last_reason==16);
 }
 
-// Low power samples on time only where it has a CPU ceiling to keep
-// (clpc->low_power_khz: the DT ceiling, else the table one); a High Power-only
-// profile stays deferrable when idle.
+// Low power samples on time only when a package power target (low_power_mw)
+// is active; a static ceiling alone or High Power-only profile stays
+// deferrable when idle.
 static void check_low_power(void) {
  struct apple_clpc_gpu gpu={0};
  struct apple_clpc_hw lp=apple_clpc_hw_t6040;
- struct apple_clpc c={.hw=&lp,.agent=1,.mask=3,.gpu=&gpu,.low_power=true};
+ struct apple_clpc c={.hw=&lp,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu,.low_power=true};
  read_error=vote_error=0; pmgr_status=0xf0; published=~0u;
  jiffies=3000; apple_clpc_sample(&c); assert(published==0 && queued_idle);
  c.low_power_khz=2808000;
- jiffies=3004; apple_clpc_sample(&c); assert(published==0 && !queued_idle);
+ jiffies=3004; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ c.low_power_mw=15000;
+ jiffies=3008; apple_clpc_sample(&c); assert(published==0 && !queued_idle);
  c.low_power=false;
- jiffies=3008; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ jiffies=3012; apple_clpc_sample(&c); assert(published==0 && queued_idle);
 }
 
 int main(void) {
  // T6040's supplier is always powered: it must NEVER substitute for work.
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
  assert(!c.hw->gpu_demand);
  jiffies=0; read_error=vote_error=0; pmgr_status=0xf0; published=~0u;
  apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
@@ -743,6 +860,8 @@ int main(void) {
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
  t6041_from_dt();
  check_t6041_busy();
+ t6050_from_dt();
+ check_t6050_busy();
  check_t6041_long_in_flight();
  check_t6041_idle_burst();
  check_t8132();
@@ -752,6 +871,7 @@ int main(void) {
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
+ check_t6050_ane();
  check_low_power();
  check_t6040_ane();
  puts("PASS: T6040, T6041 and T8132 host demand; DT GPU busy share and down-step hold; T8140/T604x ANE, streaming, dense work, read errors and PMP backoff; idle release");

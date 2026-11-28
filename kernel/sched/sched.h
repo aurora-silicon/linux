@@ -3691,6 +3691,14 @@ static inline void sched_uclamp_enable(void)
 		static_branch_enable(&sched_uclamp_used);
 }
 
+static inline void sched_uclamp_enable_cpuslocked(void)
+{
+	if (!uclamp_is_used())
+		static_branch_enable_cpuslocked(&sched_uclamp_used);
+}
+
+void uclamp_update_background_cap(unsigned int cap);
+
 static inline unsigned long uclamp_rq_get(struct rq *rq,
 					  enum uclamp_id clamp_id)
 {
@@ -3771,6 +3779,8 @@ static inline bool uclamp_is_used(void)
 }
 
 static inline void sched_uclamp_enable(void) {}
+static inline void sched_uclamp_enable_cpuslocked(void) {}
+static inline void uclamp_update_background_cap(unsigned int cap) {}
 
 static inline unsigned long
 uclamp_rq_get(struct rq *rq, enum uclamp_id clamp_id)

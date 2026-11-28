@@ -65,6 +65,7 @@ struct centauri_t6050 {
 	/* Kept alive across a firmware sleep via ACIPC host-sleep */
 	bool firmware_kept;
 	bool control_sleep_sent;
+	bool keep_alive_pme;
 	u32 saved_pci_id[2];
 	u32 saved_memswap[2][3];
 	struct centauri_t6050_ipc *ipc;
@@ -75,7 +76,8 @@ int centauri_t6050_request_irqs(struct centauri_t6050_irqs *irqs, struct pci_dev
 			 unsigned int count, irq_handler_t handler, void *data);
 void centauri_t6050_free_irqs(struct centauri_t6050_irqs *irqs);
 
-int centauri_t6050_start_ipc(struct centauri_t6050 *c);
+int centauri_t6050_start_ipc(struct centauri_t6050 *c, struct pci_dev **beta);
+void centauri_t6050_attach_beta(struct centauri_t6050 *c, struct pci_dev *beta);
 void centauri_t6050_free_ipc(struct centauri_t6050 *c);
 void centauri_t6050_release_ipc(struct centauri_t6050_ipc *ipc);
 bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc);
@@ -92,6 +94,9 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c);
 void centauri_t6050_wifi_unregister(struct centauri_t6050 *c);
 void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c);
 int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c);
+bool centauri_t6050_wifi_pm_disconnected(struct centauri_t6050 *c);
+bool centauri_t6050_wifi_wowlan_armed(struct centauri_t6050 *c);
+void centauri_t6050_wifi_mark_failed(struct centauri_t6050 *c);
 void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c);
 int centauri_t6050_wifi_suspend(struct centauri_t6050 *c);
 int centauri_t6050_wifi_resume(struct centauri_t6050 *c);
@@ -115,6 +120,20 @@ static inline void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)
 static inline int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c)
 {
 	return 0;
+}
+
+static inline bool centauri_t6050_wifi_pm_disconnected(struct centauri_t6050 *c)
+{
+	return false;
+}
+
+static inline bool centauri_t6050_wifi_wowlan_armed(struct centauri_t6050 *c)
+{
+	return false;
+}
+
+static inline void centauri_t6050_wifi_mark_failed(struct centauri_t6050 *c)
+{
 }
 
 static inline void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)

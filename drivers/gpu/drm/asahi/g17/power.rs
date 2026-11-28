@@ -49,6 +49,13 @@ pub(super) struct Effort {
     seen_waits: u64,
     /// When a waiter was last seen.
     last_wait_ns: u64,
+    /// A host thread waits, or waited within [`IDLE_HOLD_NS`], for a pure-compute submission
+    /// ([`Self::note_compute_waiters`]).
+    compute_waited: bool,
+    /// Pure-compute waits begun when compute waiters were last noted.
+    seen_compute_waits: u64,
+    /// When a pure-compute waiter was last seen.
+    last_compute_wait_ns: u64,
     /// The GPU has run longer than [`IDLE_HOLD_NS`] without an idle gap ([`BusyRun`]).
     bound: bool,
 }
@@ -64,6 +71,9 @@ impl Effort {
             waited: false,
             seen_waits: 0,
             last_wait_ns: 0,
+            compute_waited: false,
+            seen_compute_waits: 0,
+            last_compute_wait_ns: 0,
             bound: false,
         }
     }
@@ -90,6 +100,40 @@ impl Effort {
         let changed = waited != self.waited;
         self.waited = waited;
         changed
+    }
+
+    /// Whether a host thread waits for a pure-compute submission ([`Self::note_compute_waiters`]).
+    pub(super) fn compute_waited(&self) -> bool {
+        self.compute_waited
+    }
+
+    /// Notes host waiters on pure-compute submissions at `now_ns`
+    /// ([`super::fence::compute_waiters`]). Holds for [`IDLE_HOLD_NS`] after the last compute
+    /// wait so depth-1 compute loops stay at full effort across host turnarounds and resume at
+    /// full effort immediately after CPU gaps without affecting paced render compositors.
+    pub(super) fn note_compute_waiters(
+        &mut self,
+        now_ns: u64,
+        (waiters, waits): (u32, u64),
+    ) -> bool {
+        if waiters > 0 || waits != self.seen_compute_waits {
+            self.last_compute_wait_ns = now_ns.max(1);
+        }
+        self.seen_compute_waits = waits;
+        let compute_waited = self.last_compute_wait_ns != 0
+            && now_ns.saturating_sub(self.last_compute_wait_ns) < IDLE_HOLD_NS;
+        let changed = compute_waited != self.compute_waited;
+        self.compute_waited = compute_waited;
+        changed
+    }
+
+    /// Whether [`Self::idle`] at `now_ns` with `in_flight` will clear the effort state.
+    pub(super) fn will_clear(&self, now_ns: u64, in_flight: bool) -> bool {
+        self.streaming
+            && !in_flight
+            && self
+                .idle_since
+                .is_some_and(|since| now_ns.saturating_sub(since) >= IDLE_HOLD_NS)
     }
 
     /// Whether the GPU has run without an idle gap for longer than the effort is held after
@@ -145,8 +189,10 @@ impl Effort {
         if idle >= IDLE_HOLD_NS {
             self.streaming = false;
             self.waited = false;
+            self.compute_waited = false;
             self.bound = false;
             self.last_wait_ns = 0;
+            self.last_compute_wait_ns = 0;
             self.idle_since = None;
             IdleAction::Clear
         } else {
@@ -472,6 +518,33 @@ impl BusyShare {
 
     pub(super) fn below_top(&self) -> bool {
         self.below_top
+    }
+
+    /// Immediately lifts the reported share to 1000 permille when a sustained busy run
+    /// ([`BusyRuns::bound`]) begins while below the top CLPC column, and re-baselines the
+    /// measurement window at `now_ns` so short back-to-back commands are neither trapped
+    /// at a low memory/fabric floor for up to [`BUSY_WINDOW_NS`] nor diluted by prior
+    /// light activity.
+    pub(super) fn lift_saturated(
+        &mut self,
+        now_ns: u64,
+        retired_ns: [u64; crate::usage::NUM_ENGINES],
+        oldest_in_flight: [u64; crate::usage::NUM_ENGINES],
+    ) -> Option<u32> {
+        if !self.below_top {
+            return None;
+        }
+        self.start_ns = Some(now_ns);
+        self.retired_ns = retired_ns;
+        for (slot, &since) in self.in_flight_ns.iter_mut().zip(oldest_in_flight.iter()) {
+            *slot = if since != 0 {
+                now_ns.saturating_sub(since)
+            } else {
+                0
+            };
+        }
+        self.below_top = false;
+        Some(1000)
     }
 
     pub(super) fn window_start(&self) -> Option<u64> {
@@ -847,6 +920,68 @@ mod tests {
         // No report until a fresh 200 ms window of the new burst completes.
         assert_eq!(share.sample(2190 * NS_MS, [0, 414 * NS_MS, 0], [0, 0, 0]), None);
         assert_eq!(share.sample(2200 * NS_MS, [0, 420 * NS_MS, 0], [0, 0, 0]), Some(600));
+    }
+
+    #[test]
+    fn sustained_busy_run_lifts_short_dispatches_mid_window() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        // Light compositor establishes a 50 permille floor (below top).
+        assert_eq!(share.sample(1000 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        assert_eq!(share.sample(1200 * NS_MS, [0, 10 * NS_MS, 0], [0, 0, 0]), Some(50));
+        assert!(share.below_top());
+        // Short (<50 ms) compute dispatches saturate the GPU starting at t=1300 ms.
+        // At t=1316 ms BusyRuns::bound triggers lift_saturated(), lifting immediately.
+        assert_eq!(
+            share.lift_saturated(1316 * NS_MS, [0, 14 * NS_MS, 16 * NS_MS], [0, 0, 0]),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Repeated calls while already at top are a no-op.
+        assert_eq!(
+            share.lift_saturated(1332 * NS_MS, [0, 14 * NS_MS, 32 * NS_MS], [0, 0, 0]),
+            None
+        );
+        // The re-baselined 200 ms window [1316, 1516] measures the burst cleanly (1000 permille).
+        assert_eq!(
+            share.sample(1516 * NS_MS, [0, 14 * NS_MS, 216 * NS_MS], [0, 0, 0]),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Once the burst ends, the next window returns cleanly to the light compositor share.
+        assert_eq!(
+            share.sample(1716 * NS_MS, [0, 24 * NS_MS, 216 * NS_MS], [0, 0, 0]),
+            Some(50)
+        );
+        assert!(share.below_top());
+    }
+
+    #[test]
+    fn compute_waiters_lift_immediately_and_expire_while_streaming() {
+        const NS_MS: u64 = 1_000_000;
+        let mut effort = Effort::new();
+        effort.submit();
+        assert!(!effort.compute_waited());
+        // Render waiter alone never marks compute_waited.
+        assert!(effort.note_waiters(10 * NS_MS, (1, 1)));
+        assert!(!effort.note_compute_waiters(10 * NS_MS, (0, 0)));
+        assert!(!effort.compute_waited());
+        // A pure-compute waiter lifts immediately.
+        assert!(effort.note_compute_waiters(11 * NS_MS, (1, 1)));
+        assert!(effort.compute_waited());
+        // Holds across a short host turnaround between depth-1 dispatches.
+        assert!(!effort.note_compute_waiters(15 * NS_MS, (0, 1)));
+        assert!(effort.compute_waited());
+        // Expires cleanly after IDLE_HOLD_NS even while a compositor keeps streaming.
+        assert!(effort.note_compute_waiters(11 * NS_MS + IDLE_HOLD_NS, (0, 1)));
+        assert!(!effort.compute_waited());
+        // Idle clear also resets compute_waited.
+        assert!(effort.note_compute_waiters(40 * NS_MS, (1, 2)));
+        assert!(effort.compute_waited());
+        assert_eq!(effort.idle(40 * NS_MS, false), IdleAction::Recheck(IDLE_HOLD_NS));
+        assert!(effort.will_clear(40 * NS_MS + IDLE_HOLD_NS, false));
+        assert_eq!(effort.idle(40 * NS_MS + IDLE_HOLD_NS, false), IdleAction::Clear);
+        assert!(!effort.compute_waited());
     }
 }
 

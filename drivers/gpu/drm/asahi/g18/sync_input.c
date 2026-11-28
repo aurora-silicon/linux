@@ -37,7 +37,11 @@ int asahi_g18_wait_foreign_fences(struct dma_fence *head,
  * too, or 0. A container does not carry its fences' errors: a
  * dma_fence_chain (a timeline point) never copies them, and a
  * dma_fence_array whose signalling was never enabled clears its pending
- * error when it is found signalled. So each fence is checked itself.
+ * error when it is found signalled. So each fence the walk reaches is
+ * checked itself. Of a timeline, the walk reaches only the head point:
+ * dma_fence_chain_walk() unlinks the earlier points that have signalled, and
+ * a job's inputs have all signalled when it runs, so an error on an earlier
+ * point is not seen.
  */
 int asahi_g18_fence_error(struct dma_fence *head)
 {

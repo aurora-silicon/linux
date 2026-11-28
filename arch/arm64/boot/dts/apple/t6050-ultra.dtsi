@@ -37,11 +37,11 @@
 		T6050_M_CPU(cpu8, 40102, cpufreq_mc1, l2_cache_mc1);
 		T6050_M_CPU(cpu9, 40103, cpufreq_mc1, l2_cache_mc1);
 		T6050_M_CPU(cpu10, 40104, cpufreq_mc1, l2_cache_mc1);
-		T6050_P_CPU(cpu12, 10200, cpufreq_pc, l2_cache_pc);
-		T6050_P_CPU(cpu13, 10201, cpufreq_pc, l2_cache_pc);
-		T6050_P_CPU(cpu14, 10202, cpufreq_pc, l2_cache_pc);
-		T6050_P_CPU(cpu15, 10203, cpufreq_pc, l2_cache_pc);
-		T6050_P_CPU(cpu16, 10204, cpufreq_pc, l2_cache_pc);
+		T6050_P_CPU(cpu12, 10200, cpufreq_pc, l2_cache_p0);
+		T6050_P_CPU(cpu13, 10201, cpufreq_pc, l2_cache_p1);
+		T6050_P_CPU(cpu14, 10202, cpufreq_pc, l2_cache_p2);
+		T6050_P_CPU(cpu15, 10203, cpufreq_pc, l2_cache_p3);
+		T6050_P_CPU(cpu16, 10204, cpufreq_pc, l2_cache_p4);
 		T6050_M_CPU(cpu18, 41000, cpufreq_mc0_die1, l2_cache_mc0_die1);
 		T6050_M_CPU(cpu19, 41001, cpufreq_mc0_die1, l2_cache_mc0_die1);
 		T6050_M_CPU(cpu20, 41002, cpufreq_mc0_die1, l2_cache_mc0_die1);
@@ -52,20 +52,145 @@
 		T6050_M_CPU(cpu26, 41102, cpufreq_mc1_die1, l2_cache_mc1_die1);
 		T6050_M_CPU(cpu27, 41103, cpufreq_mc1_die1, l2_cache_mc1_die1);
 		T6050_M_CPU(cpu28, 41104, cpufreq_mc1_die1, l2_cache_mc1_die1);
-		T6050_P_CPU(cpu30, 11200, cpufreq_pc_die1, l2_cache_pc_die1);
-		T6050_P_CPU(cpu31, 11201, cpufreq_pc_die1, l2_cache_pc_die1);
-		T6050_P_CPU(cpu32, 11202, cpufreq_pc_die1, l2_cache_pc_die1);
-		T6050_P_CPU(cpu33, 11203, cpufreq_pc_die1, l2_cache_pc_die1);
-		T6050_P_CPU(cpu34, 11204, cpufreq_pc_die1, l2_cache_pc_die1);
+		T6050_P_CPU(cpu30, 11200, cpufreq_pc_die1, l2_cache_p0_die1);
+		T6050_P_CPU(cpu31, 11201, cpufreq_pc_die1, l2_cache_p1_die1);
+		T6050_P_CPU(cpu32, 11202, cpufreq_pc_die1, l2_cache_p2_die1);
+		T6050_P_CPU(cpu33, 11203, cpufreq_pc_die1, l2_cache_p3_die1);
+		T6050_P_CPU(cpu34, 11204, cpufreq_pc_die1, l2_cache_p4_die1);
+
+		/*
+		 * The clusters are MPIDR Aff1 (die 0's M0, M1 and P, then die 1's), each with its
+		 * own L2. They are listed flat, as on the other two-die parts. The boot loader
+		 * prunes the entries of cores it did not start.
+		 */
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+				core1 {
+					cpu = <&cpu1>;
+				};
+				core2 {
+					cpu = <&cpu2>;
+				};
+				core3 {
+					cpu = <&cpu3>;
+				};
+				core4 {
+					cpu = <&cpu4>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu6>;
+				};
+				core1 {
+					cpu = <&cpu7>;
+				};
+				core2 {
+					cpu = <&cpu8>;
+				};
+				core3 {
+					cpu = <&cpu9>;
+				};
+				core4 {
+					cpu = <&cpu10>;
+				};
+			};
+
+			cluster2 {
+				core0 {
+					cpu = <&cpu12>;
+				};
+				core1 {
+					cpu = <&cpu13>;
+				};
+				core2 {
+					cpu = <&cpu14>;
+				};
+				core3 {
+					cpu = <&cpu15>;
+				};
+				core4 {
+					cpu = <&cpu16>;
+				};
+			};
+
+			cluster3 {
+				core0 {
+					cpu = <&cpu18>;
+				};
+				core1 {
+					cpu = <&cpu19>;
+				};
+				core2 {
+					cpu = <&cpu20>;
+				};
+				core3 {
+					cpu = <&cpu21>;
+				};
+				core4 {
+					cpu = <&cpu22>;
+				};
+			};
+
+			cluster4 {
+				core0 {
+					cpu = <&cpu24>;
+				};
+				core1 {
+					cpu = <&cpu25>;
+				};
+				core2 {
+					cpu = <&cpu26>;
+				};
+				core3 {
+					cpu = <&cpu27>;
+				};
+				core4 {
+					cpu = <&cpu28>;
+				};
+			};
+
+			cluster5 {
+				core0 {
+					cpu = <&cpu30>;
+				};
+				core1 {
+					cpu = <&cpu31>;
+				};
+				core2 {
+					cpu = <&cpu32>;
+				};
+				core3 {
+					cpu = <&cpu33>;
+				};
+				core4 {
+					cpu = <&cpu34>;
+				};
+			};
+		};
 	};
 
-	/* One L2 per cluster (t6050-base.dtsi, "Caches"). */
+	/* L2 per M cluster, L2 per P core, L3 per P cluster (t6050-base.dtsi, "Caches"). */
 	T6050_M_L2(l2_cache_mc0, l2-cache-mcluster0);
 	T6050_M_L2(l2_cache_mc1, l2-cache-mcluster1);
-	T6050_P_L2(l2_cache_pc, l2-cache-pcluster);
+	T6050_P_L3(l3_cache_pc, l3-cache-pcluster);
+	T6050_P_L2(l2_cache_p0, l2-cache-pcore0, l3_cache_pc);
+	T6050_P_L2(l2_cache_p1, l2-cache-pcore1, l3_cache_pc);
+	T6050_P_L2(l2_cache_p2, l2-cache-pcore2, l3_cache_pc);
+	T6050_P_L2(l2_cache_p3, l2-cache-pcore3, l3_cache_pc);
+	T6050_P_L2(l2_cache_p4, l2-cache-pcore4, l3_cache_pc);
 	T6050_M_L2(l2_cache_mc0_die1, l2-cache-mcluster0-die1);
 	T6050_M_L2(l2_cache_mc1_die1, l2-cache-mcluster1-die1);
-	T6050_P_L2(l2_cache_pc_die1, l2-cache-pcluster-die1);
+	T6050_P_L3(l3_cache_pc_die1, l3-cache-pcluster-die1);
+	T6050_P_L2(l2_cache_p0_die1, l2-cache-pcore0-die1, l3_cache_pc_die1);
+	T6050_P_L2(l2_cache_p1_die1, l2-cache-pcore1-die1, l3_cache_pc_die1);
+	T6050_P_L2(l2_cache_p2_die1, l2-cache-pcore2-die1, l3_cache_pc_die1);
+	T6050_P_L2(l2_cache_p3_die1, l2-cache-pcore3-die1, l3_cache_pc_die1);
+	T6050_P_L2(l2_cache_p4_die1, l2-cache-pcore4-die1, l3_cache_pc_die1);
 
 	/* Die 1 MMIO. The boot loader needs each die's bus. */
 	die1: soc@4200000000 {

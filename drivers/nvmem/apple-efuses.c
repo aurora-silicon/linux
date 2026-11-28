@@ -79,3 +79,7 @@ module_platform_driver(apple_efuses_driver);
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple SoC eFuse driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_NVMEM_APPLE_EFUSES_KUNIT_TEST)
+#include "apple-efuses-test.c"
+#endif
