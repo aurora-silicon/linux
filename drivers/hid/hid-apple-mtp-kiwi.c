@@ -55,8 +55,17 @@
 #define KIWI_GLITCH		64
 /* counts: two ordinary frames differ less than this in every cell */
 #define KIWI_SAME		200
-/* skipped frames in a row before the baseline is retaken */
-#define KIWI_GLITCH_MAX		10
+/* shifted frames in a row (2 s) before the baseline is retaken, only
+ * while no contact is on: a finger down is the shift
+ */
+#define KIWI_GLITCH_MAX		240
+/*
+ * Reference frames arrive one at a time (at most 3 in a row in 6 min of
+ * idle K114s frames). A shift that outlasts that is the touch's own
+ * common mode, not a reference frame: take the frame, the per-row mean
+ * removal below cancels the shift.
+ */
+#define KIWI_SKIP_RUN		3
 #define KIWI_MISS_MAX		2
 /* the static periphery outliers all live inside this ring */
 #define KIWI_GATE_RING		3
@@ -107,6 +116,8 @@ struct kiwi {
 	u64 skip_frames, base_retakes;	/* frame gate counters, debugfs */
 	struct dentry *dbg;
 	int bad;
+	s32 shift_level;	/* common mode of a lasting shift, 1/256 count */
+	int row_level;		/* worst row shift of a lasting row shift, counts */
 	int agree;		/* agreeing pairs chained toward a baseline */
 	u32 now;		/* accepted-frame counter, for the hold rule */
 	bool sup;
@@ -279,11 +290,23 @@ static s32 kiwi_common(const s32 *fp, int n, int stride)
 	return kept > n / 2 ? div_s64(sum2, kept) : m0;
 }
 
+static bool kiwi_any_on(const struct kiwi *k)
+{
+	int j;
+
+	for (j = 0; j < KIWI_MAX_SLOTS; j++)
+		if (k->cont[j].on)
+			return true;
+	return false;
+}
+
 static bool kiwi_load(struct kiwi *k, const u8 *data)
 {
 	s32 common;
 	int rowmax;
 	int i, r, c;
+	bool lasting = false;
+	s32 whole;
 
 	if (!k->have_base) {
 		kiwi_take_base(k, data);
@@ -292,15 +315,29 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 	for (i = 0; i < KIWI_CELLS; i++)
 		k->fp[i] = k->base[i] - (get_unaligned_le16(data + KIWI_HDR_LEN + 2 * i) << 8);
 	common = kiwi_common(k->fp, KIWI_CELLS, 1);
+	whole = common;
 	if (abs(common >> 8) > KIWI_GLITCH) {
-		k->skip_frames++;
-		if (++k->bad >= KIWI_GLITCH_MAX) {
+		if (k->bad > KIWI_SKIP_RUN &&
+		    abs((common - k->shift_level) >> 8) > KIWI_GLITCH) {
+			/* a reference frame on top of a lasting shift */
+			k->skip_frames++;
+			return false;
+		}
+		if (++k->bad >= KIWI_GLITCH_MAX && !kiwi_any_on(k)) {
+			k->skip_frames++;
 			k->have_base = false;
 			k->base_retakes++;
+			return false;
 		}
-		return false;
+		if (k->bad <= KIWI_SKIP_RUN) {
+			k->shift_level = common;
+			k->skip_frames++;
+			return false;
+		}
+		/* a lasting shift is the touch's own common mode: keep the frame */
+		k->shift_level += (common - k->shift_level) / 8;
+		lasting = true;
 	}
-	k->bad = 0;
 	/* the shift differs a little from row to row, so remove it per row */
 	rowmax = 0;
 	for (r = 0; r < KIWI_ROWS; r++) {
@@ -314,7 +351,7 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 			k->sig[i] = clamp(k->fp[i] >> 8, -32768, 32767);
 		}
 	}
-	if (rowmax > KIWI_ROW_SHIFT) {
+	if (rowmax > KIWI_ROW_SHIFT && !lasting) {
 		/* a frame we cannot trust for contacts. A touch also leaves its rows
 		 * a few tens of counts off (the slow adapt integrates the touch's row
 		 * pressure); if skipped frames never healed, a lift would strand the
@@ -344,12 +381,32 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 			for (c = 0; c < KIWI_COLS; c++)
 				k->base[r * KIWI_COLS + c] -= step;
 		}
-		k->skip_frames++;
-		if (++k->bad >= KIWI_GLITCH_MAX) {
+		if (++k->bad >= KIWI_GLITCH_MAX && !kiwi_any_on(k)) {
+			k->skip_frames++;
 			k->have_base = false;
 			k->base_retakes++;
+			return false;
 		}
-		return false;
+		if (k->bad <= KIWI_SKIP_RUN) {
+			k->shift_level = whole;
+			k->row_level = rowmax;
+			k->skip_frames++;
+			return false;
+		}
+		/* a reference frame inside a lasting row shift moves the frame or
+		 * its worst row away from the lasting level: skip it
+		 */
+		if (abs((whole - k->shift_level) >> 8) > KIWI_GLITCH / 2 ||
+		    rowmax > k->row_level + KIWI_ROW_SHIFT / 2) {
+			k->bad--;	/* not part of the run */
+			k->skip_frames++;
+			return false;
+		}
+		k->shift_level += (whole - k->shift_level) / 8;
+		k->row_level += (rowmax - k->row_level) / 8;
+		/* a lasting row shift: keep the frame, its row means are removed */
+	} else if (!lasting) {
+		k->bad = 0;
 	}
 	return true;
 }
