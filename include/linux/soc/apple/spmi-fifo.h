@@ -8,6 +8,7 @@
 
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/types.h>
 
 struct device;
 
@@ -18,6 +19,7 @@ struct device;
  */
 int apple_spmi_fifo_trylock(struct device *dev);
 void apple_spmi_fifo_unlock(struct device *dev);
+bool apple_spmi_irq_wake_armed(struct device *dev, unsigned int hwirq);
 #else
 static inline int apple_spmi_fifo_trylock(struct device *dev)
 {
@@ -26,6 +28,11 @@ static inline int apple_spmi_fifo_trylock(struct device *dev)
 
 static inline void apple_spmi_fifo_unlock(struct device *dev)
 {
+}
+
+static inline bool apple_spmi_irq_wake_armed(struct device *dev, unsigned int hwirq)
+{
+	return false;
 }
 #endif
 

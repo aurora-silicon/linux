@@ -506,6 +506,36 @@ static void apple_sleep_test_wdt_handoff(struct kunit *test)
 	apple_sleep_wdt_unregister(&st->dev2);
 }
 
+static bool apple_sleep_test_spmi_wake_armed(struct device *dev, unsigned int hwirq)
+{
+	const unsigned long *armed = dev_get_drvdata(dev);
+
+	return test_bit(hwirq, armed);
+}
+
+static void apple_sleep_test_t6050_spmi_ack(struct kunit *test)
+{
+	DECLARE_BITMAP(armed, 32 * T6050_SPMI_SRC_WORDS) = {};
+	struct device bus = { .driver_data = armed };
+	u32 first = BIT(2) | BIT(11) | BIT(15);
+	u32 later = BIT(4) | BIT(31);
+
+	set_bit(2, armed);
+	set_bit(15, armed);
+	set_bit(127, armed);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(first, 0, &bus,
+						apple_sleep_test_spmi_wake_armed), (u32)BIT(11));
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(later, 3, &bus,
+						apple_sleep_test_spmi_wake_armed), (u32)BIT(4));
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(later, 2, &bus,
+						apple_sleep_test_spmi_wake_armed), later);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(first, 0, NULL,
+						apple_sleep_test_spmi_wake_armed), first);
+	bitmap_zero(armed, 32 * T6050_SPMI_SRC_WORDS);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(first, 0, &bus,
+						apple_sleep_test_spmi_wake_armed), first);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
@@ -520,6 +550,7 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
 	KUNIT_CASE(apple_sleep_test_wdt_handoff),
+	KUNIT_CASE(apple_sleep_test_t6050_spmi_ack),
 	{}
 };
 
