@@ -70,7 +70,7 @@ struct apple_dart {
 	bool cio_active;
 	/* A J714s display sleep's and its firmware 27 provider's, never set here. */
 	struct device *m5_sleep_owner;
-	bool v27_provider, v27_lost;
+	bool v27_provider, v27_lost, isp_host;
 };
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};

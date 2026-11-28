@@ -144,6 +144,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-fw-harness-tests.py': [([], PASS)],
+    'apple-dart-isp-host-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
     # every-dart mutation waits it out on every locked DART, not just the display's.

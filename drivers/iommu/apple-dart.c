@@ -2843,7 +2843,9 @@ static int apple_dart_isp_host_reset(struct apple_dart *dart)
 	apple_dart_hw_disable_dma(&map);
 	apple_dart_hw_clear_all_ttbrs(&map);
 	apple_dart_hw_apply_remaps(dart);
-	apple_dart_writel(dart, host, DART_T8110_ENABLE_STREAMS);
+	apple_dart_writel(dart,
+			  apple_dart_readl(dart, DART_T8110_ENABLE_STREAMS) | host,
+			  DART_T8110_ENABLE_STREAMS);
 	for (sid = 0; sid < 16; sid++) {
 		if (!(host & BIT(sid)))
 			continue;
@@ -4146,15 +4148,21 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 	/*
 	 * ISP host DARTs rely on their runtime-PM-enabled consumer rather than
 	 * DL_FLAG_RPM_ACTIVE at IOMMU probe so a failed link cannot pin
-	 * ps_isp_sys. Return -ENODEV on link failure so a supplier registration
-	 * scan never rolls back DART registration; apple-isp defers probe if
-	 * its IOMMU domain is missing.
+	 * ps_isp_sys. Use persistent managed DL_FLAG_PM_RUNTIME links (without
+	 * DL_FLAG_STATELESS or DL_FLAG_AUTOREMOVE_*) so the driver core
+	 * enforces consumer-before-supplier unbind ordering across all ISP
+	 * DARTs and keeps the link dormant if a secondary DART unbinds; driver
+	 * core owns managed link lifetime on registered consumers (calling
+	 * device_link_del()/device_link_remove() WARNs in device_link_put_kref),
+	 * so return -ENODEV on link failure and let driver core purge links on
+	 * device unregistration while apple-isp defers probe if its IOMMU
+	 * domain is missing.
 	 */
 	for_each_stream_map(i, cfg, stream_map) {
-		u32 flags = DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER;
+		u32 flags = DL_FLAG_PM_RUNTIME;
 
 		if (!stream_map->dart->isp_host)
-			flags |= DL_FLAG_RPM_ACTIVE;
+			flags |= DL_FLAG_AUTOREMOVE_SUPPLIER | DL_FLAG_RPM_ACTIVE;
 		if (!device_link_add(dev, stream_map->dart->dev, flags) &&
 		    stream_map->dart->isp_host) {
 			ret = -ENODEV;
