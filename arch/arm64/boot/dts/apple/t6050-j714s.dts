@@ -578,16 +578,15 @@
  * name. A key this SMC lacks only drops its channel.
  *
  * Discovery refuses to run once any temperature channel exists, so the shared
- * temperature nodes go (their keys are discovered anyway), and so does
- * apple,soc-die-keys, whose channel would also count. Only the macsmc_soc_die
- * thermal zone is lost.
+ * temperature nodes go (their keys are discovered anyway). apple,soc-die-keys
+ * ("TCMb") stays from t6050-die0.dtsi: the discovered TCMb channel supplies the
+ * macsmc_soc_die thermal zone, the GPU thermal governor's hotspot input.
  */
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
 
 &smc_hwmon {
-	/delete-property/ apple,soc-die-keys;
 	/delete-node/ temperature-TH0x;
 	/delete-node/ temperature-TB0T;
 	/delete-node/ temperature-TCHP;
