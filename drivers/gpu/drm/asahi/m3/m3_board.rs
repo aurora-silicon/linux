@@ -26,7 +26,7 @@ pub(crate) fn board_is(compatible: &[u8]) -> bool {
 /// Whether the boot loader handed this GPU over: the GPU node carries the boot loader's
 /// description of the firmware it loaded (`SEGMENT_PROPS`). A boot loader publishes it only on
 /// a Mac where it runs that firmware for Linux, so this follows what the machine describes,
-/// not a list of boards. `asahi.m3_expose=auto` registers the render node, and the runtime
+/// not a list of boards. `aurora.m3_expose=auto` registers the render node, and the runtime
 /// starts by default, only then; resource admission ([`admit`]) checks the rest of the handoff.
 pub(crate) fn handed_over(dev: &device::Device) -> bool {
     dev.of_node()
@@ -548,7 +548,7 @@ pub(crate) fn region_is_nomap(node: &of::Node, name: &CStr) -> bool {
     region.get_property::<KVec<u8>>(c_str!("no-map")).is_ok()
 }
 
-/// Whether the M3 render node is registered (`asahi.m3_expose`).
+/// Whether the M3 render node is registered (`aurora.m3_expose`).
 ///
 /// Userspace drivers pick up any registered render node. Without a boot loader that handed the
 /// GPU over, a render node would let a stock userspace driver submit work nothing can run.
