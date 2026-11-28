@@ -225,6 +225,7 @@
 		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave_2: iommu@267020000 {
 		compatible = "apple,t8112-dart", "apple,t8110-dart";
 		reg = <0x2 0x67020000 0x0 0x4000>;
@@ -232,8 +233,10 @@
 		interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave_3: iommu@267044000 {
 		compatible = "apple,t8112-dart", "apple,t8110-dart";
 		reg = <0x2 0x67044000 0x0 0x4000>;
@@ -241,8 +244,10 @@
 		interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_dispext0_1: iommu@271300000 {
 		compatible = "apple,t8112-dart", "apple,t8110-dart";
 		reg = <0x2 0x71300000 0x0 0x4000>;
@@ -250,6 +255,7 @@
 		interrupts = <AIC_IRQ 593 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext_cpu0>;
+		status = "disabled";
 	};
 
 	m2_apr: video-codec@27d000000 {
