@@ -6,6 +6,10 @@
 //! quaternion. The service has several versioned report layouts; the current
 //! layouts all carry four little-endian IEEE-754 singles in X, Y, Z, W order.
 //! IIO exposes them in its standard W, X, Y, Z order as signed Q30 values.
+//!
+//! The report client is open only while someone reads the orientation: while
+//! a buffer is enabled, or until direct reads go quiet for a short idle
+//! window.
 
 use core::{
     arch::asm,
@@ -26,7 +30,7 @@ use kernel::{
         atomic::{Acquire, Atomic, Relaxed, Release},
         Arc, Mutex, SpinLock,
     },
-    time::{self, delay::fsleep, Delta},
+    time::{self, delay::fsleep, Delta, Instant, Monotonic},
     types::{ForeignOwnable, Opaque},
     workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
     ThisModule,
@@ -55,6 +59,13 @@ const MAX_HZ: u32 = 200;
 /// How long a direct read waits for the first sample of a new client.
 const FIRST_SAMPLE_MS: i64 = 500;
 const FIRST_SAMPLE_POLL_MS: i64 = 5;
+/// How long the client stays open after the last direct read without a
+/// buffer, so polling callers share one running client instead of opening and
+/// closing it on every sysfs read.
+const DIRECT_IDLE_MS: i64 = 2_000;
+/// The work item that closes a direct-read client once reads go quiet. The
+/// polling work keeps the default id 0.
+const IDLE_WORK: u64 = 1;
 const FASTPATH_COMMAND_LEN: usize = 84;
 const FASTPATH_HEADER_LEN: usize = 64;
 const FASTPATH_PAGE_SIZE: usize = 4096;
@@ -153,6 +164,94 @@ fn decode(report: &[u8]) -> Option<[i32; 4]> {
     Some([w?, x?, y?, z?])
 }
 
+/// What a stream state change requires from the service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncAction {
+    None,
+    /// Open the client and start the reports.
+    Start,
+    /// Stop the reports and close the client.
+    Stop,
+}
+
+/// Outcome of checking the direct-read idle deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleStep {
+    /// No direct-read hold to expire.
+    Ignore,
+    /// More reads extended the deadline; re-arm the work for this many ms.
+    RearmMs(u32),
+    /// The deadline passed; close the client if nothing else wants it.
+    Expire,
+}
+
+/// Who wants the report client.
+struct Stream<T> {
+    /// A buffer is enabled.
+    buffer_on: bool,
+    /// The client is held open for recent direct reads until this deadline.
+    direct_until: Option<T>,
+    /// Opening the client for a direct read failed with this error; direct
+    /// reads return it without another try until this deadline.
+    failed_until: Option<(T, Error)>,
+    /// Set across system sleep and after unbind: no client may be open.
+    parked: bool,
+    /// The client was opened and the reports started.
+    active: bool,
+}
+
+impl<T> Stream<T> {
+    const fn new() -> Self {
+        Self {
+            buffer_on: false,
+            direct_until: None,
+            failed_until: None,
+            parked: false,
+            active: false,
+        }
+    }
+
+    fn want(&self) -> bool {
+        !self.parked && (self.buffer_on || self.direct_until.is_some())
+    }
+
+    fn next_action(&self) -> SyncAction {
+        match (self.want(), self.active) {
+            (true, false) => SyncAction::Start,
+            (false, true) => SyncAction::Stop,
+            _ => SyncAction::None,
+        }
+    }
+
+    /// Evaluates the direct-read idle deadline given the milliseconds left
+    /// until it expires (`<= 0` once expired).
+    fn check_idle(&mut self, remaining_ms: i64) -> IdleStep {
+        if self.direct_until.is_none() {
+            return IdleStep::Ignore;
+        }
+        if self.parked || self.buffer_on {
+            self.direct_until = None;
+            return IdleStep::Ignore;
+        }
+        if remaining_ms > 0 {
+            IdleStep::RearmMs(remaining_ms.clamp(1, DIRECT_IDLE_MS) as u32)
+        } else {
+            self.direct_until = None;
+            IdleStep::Expire
+        }
+    }
+
+    /// Returns the error of a failed open for as long as direct reads back
+    /// off from it, given the milliseconds left until they may try again
+    /// (`<= 0` once they may).
+    fn check_backoff(&mut self, remaining_ms: i64) -> Option<Error> {
+        if remaining_ms <= 0 {
+            self.failed_until = None;
+        }
+        self.failed_until.as_ref().map(|(_, e)| *e)
+    }
+}
+
 struct Control {
     dev: ARef<device::Device>,
     aop: Arc<dyn AOP>,
@@ -234,6 +333,8 @@ struct State {
     ring: Mutex<Option<Coherent<[u8]>>>,
     #[pin]
     sample: SpinLock<Sample>,
+    /// The polling work may run. Follows `Stream::active`; the work reads it
+    /// without the stream lock.
     active: Atomic<bool>,
     opened: Atomic<bool>,
     retain_ring: Atomic<bool>,
@@ -241,14 +342,14 @@ struct State {
     next_client_id: Atomic<u64>,
     last_aop_timestamp: Atomic<u64>,
     hz: Atomic<u32>,
-    buffer_on: Atomic<bool>,
-    /// Set across system sleep and after unbind: no client may be open.
-    parked: Atomic<bool>,
     /// Serializes opening and closing the client.
     #[pin]
-    stream: Mutex<()>,
+    stream: Mutex<Stream<Instant<Monotonic>>>,
     #[pin]
     poll_work: DelayedWork<State>,
+    /// Closes a direct-read client once reads go quiet.
+    #[pin]
+    idle_work: DelayedWork<State, IDLE_WORK>,
 }
 
 struct IioPtr(*mut bindings::iio_dev);
@@ -261,6 +362,7 @@ unsafe impl Sync for IioPtr {}
 
 impl_has_delayed_work! {
     impl HasDelayedWork<Self> for State { self.poll_work }
+    impl HasDelayedWork<Self, IDLE_WORK> for State { self.idle_work }
 }
 
 impl State {
@@ -377,54 +479,134 @@ impl State {
 
     /// Opens or closes the client to match its consumers. The caller holds
     /// the stream lock.
-    fn sync_locked(self: &Arc<Self>) -> Result {
-        let want = self.buffer_on.load(Acquire) && !self.parked.load(Acquire);
-        match (want, self.active.load(Acquire)) {
-            (true, false) => self.start(),
-            (false, true) => self.stop(),
-            _ => Ok(()),
+    fn sync_locked(self: &Arc<Self>, s: &mut Stream<Instant<Monotonic>>) -> Result {
+        match s.next_action() {
+            SyncAction::Start => {
+                self.start()?;
+                s.active = true;
+                Ok(())
+            }
+            SyncAction::Stop => {
+                s.active = false;
+                self.stop()
+            }
+            SyncAction::None => Ok(()),
+        }
+    }
+
+    fn schedule_idle(self: &Arc<Self>, delay_ms: u32) {
+        let _ = workqueue::system_dfl().enqueue_delayed::<Arc<Self>, IDLE_WORK>(
+            self.clone(),
+            time::msecs_to_jiffies(delay_ms),
+        );
+    }
+
+    fn stop_idle_sync(self: &Arc<Self>, disable: bool) {
+        // SAFETY: `idle_work` is initialized and pinned in this `Arc`. Both
+        // helpers cancel pending work and join a running callback; the disable
+        // variant also prevents any later requeue.
+        let cancelled = unsafe {
+            let work = Work::raw_get(DelayedWork::raw_as_work(ptr::addr_of!(self.idle_work)));
+            let delayed = kernel::container_of!(work, bindings::delayed_work, work);
+            if disable {
+                bindings::disable_delayed_work_sync(delayed)
+            } else {
+                bindings::cancel_delayed_work_sync(delayed)
+            }
+        };
+        if cancelled {
+            // SAFETY: A cancelled pending callback owned exactly one `Arc`
+            // transferred by `enqueue_delayed`.
+            drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
         }
     }
 
     fn set_buffer(self: &Arc<Self>, on: bool) -> Result {
-        let _guard = self.stream.lock();
-        self.buffer_on.store(on, Release);
-        let ret = self.sync_locked();
+        let mut s = self.stream.lock();
+        s.buffer_on = on;
+        if on {
+            // The buffer takes over a client that direct reads opened.
+            s.direct_until = None;
+            s.failed_until = None;
+        }
+        let ret = self.sync_locked(&mut s);
         if on && ret.is_err() {
             // The IIO core does not call predisable after a failed enable.
-            self.buffer_on.store(false, Release);
+            s.buffer_on = false;
         }
         ret
     }
 
     fn set_parked(self: &Arc<Self>, parked: bool) -> Result {
-        let _guard = self.stream.lock();
-        self.parked.store(parked, Release);
-        self.sync_locked()
+        let ret = {
+            let mut s = self.stream.lock();
+            s.parked = parked;
+            s.failed_until = None;
+            if parked {
+                s.direct_until = None;
+            }
+            self.sync_locked(&mut s)
+        };
+        if parked {
+            // The idle work takes the stream lock, so join it without it.
+            self.stop_idle_sync(false);
+        }
+        ret
+    }
+
+    fn shutdown(self: &Arc<Self>) -> Result {
+        let ret = {
+            let mut s = self.stream.lock();
+            s.parked = true;
+            s.direct_until = None;
+            self.sync_locked(&mut s)
+        };
+        self.stop_idle_sync(true);
+        ret
     }
 
     /// Returns the current orientation. Without a buffer consumer the client
-    /// is opened only for this read.
+    /// is opened on demand and kept open until direct reads go quiet for
+    /// `DIRECT_IDLE_MS`. The stream lock is held across the wait for the first
+    /// sample, so the idle work cannot close the client under a reader. A
+    /// failed open is not tried again for as long as the idle window; reads in
+    /// between return its error.
     fn read_now(self: &Arc<Self>) -> Result<[i32; 4]> {
-        let _guard = self.stream.lock();
-        if !self.active.load(Acquire) {
-            if self.parked.load(Acquire) {
-                return Err(EBUSY);
+        let mut s = self.stream.lock();
+        if s.parked {
+            return Err(EBUSY);
+        }
+        if let Some((until, _)) = s.failed_until {
+            let remaining_ms = (until - Instant::<Monotonic>::now()).as_millis_ceil();
+            if let Some(e) = s.check_backoff(remaining_ms) {
+                return Err(e);
             }
-            self.start()?;
+        }
+        let started = !s.active;
+        if !s.buffer_on {
+            s.direct_until = Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
+        }
+        if let Err(e) = self.sync_locked(&mut s) {
+            s.direct_until = None;
+            // Polling readers must not repeat a failing open at their rate.
+            let until = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+            s.failed_until = Some((until, e));
+            return Err(e);
+        }
+        if started {
             let mut waited = 0;
             while waited < FIRST_SAMPLE_MS && !self.sample.lock().valid {
                 fsleep(Delta::from_millis(FIRST_SAMPLE_POLL_MS));
                 waited += FIRST_SAMPLE_POLL_MS;
                 self.poll();
             }
-            let sample = *self.sample.lock();
-            self.stop()?;
-            return if sample.valid {
-                Ok(sample.quat)
-            } else {
-                Err(ENODATA)
-            };
+            if !s.buffer_on {
+                s.direct_until =
+                    Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
+            }
+        }
+        if !s.buffer_on {
+            self.schedule_idle(DIRECT_IDLE_MS as u32);
         }
         let sample = *self.sample.lock();
         if sample.valid {
@@ -437,7 +619,7 @@ impl State {
     fn queue_poll(self: &Arc<Self>) {
         let period_ms = 1000 / self.hz.load(Relaxed);
         let _ = workqueue::system_dfl()
-            .enqueue_delayed(self.clone(), time::msecs_to_jiffies(period_ms));
+            .enqueue_delayed::<Arc<Self>, 0>(self.clone(), time::msecs_to_jiffies(period_ms));
     }
 
     fn poll(&self) {
@@ -514,6 +696,27 @@ impl WorkItem for State {
         this.poll();
         if this.active.load(Acquire) {
             this.queue_poll();
+        }
+    }
+}
+
+impl WorkItem<IDLE_WORK> for State {
+    type Pointer = Arc<State>;
+
+    fn run(this: Arc<State>) {
+        let mut s = this.stream.lock();
+        let Some(deadline) = s.direct_until else {
+            return;
+        };
+        let remaining_ms = (deadline - Instant::<Monotonic>::now()).as_millis_ceil();
+        match s.check_idle(remaining_ms) {
+            IdleStep::Ignore => {}
+            IdleStep::RearmMs(delay_ms) => this.schedule_idle(delay_ms),
+            IdleStep::Expire => {
+                if let Err(e) = this.sync_locked(&mut s) {
+                    dev_warn!(this.control.dev, "client not closed after idle: {:?}\n", e);
+                }
+            }
         }
     }
 }
@@ -755,10 +958,9 @@ impl MotionIio {
                 next_client_id: Atomic::new(1),
                 last_aop_timestamp: Atomic::new(0),
                 hz: Atomic::new(DEFAULT_HZ),
-                buffer_on: Atomic::new(false),
-                parked: Atomic::new(false),
-                stream <- new_mutex!(()),
+                stream <- new_mutex!(Stream::new()),
                 poll_work <- new_delayed_work!("State::poll_work"),
+                idle_work <- new_delayed_work!("State::idle_work"),
             }),
             GFP_KERNEL,
         ) {
@@ -855,10 +1057,12 @@ unsafe extern "C" fn pm_event(
     // SAFETY: By the callback contract above.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
-        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
-            hook.state.set_parked(true)
+        bindings::PM_SUSPEND_PREPARE
+        | bindings::PM_HIBERNATION_PREPARE
+        | bindings::PM_RESTORE_PREPARE => hook.state.set_parked(true),
+        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION | bindings::PM_POST_RESTORE => {
+            hook.state.set_parked(false)
         }
-        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.state.set_parked(false),
         _ => return bindings::NOTIFY_DONE as c_int,
     };
     if let Err(e) = ret {
@@ -998,7 +1202,7 @@ impl platform::Driver for IIOAopDevMotionDriver {
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.pm.unregister();
-        let _ = this.state.set_parked(true);
+        let _ = this.state.shutdown();
         this.state.disable_poll();
     }
 }

@@ -58,8 +58,12 @@ sysfs reads start them on demand and stop them again once reads go quiet. A
 failed direct-read start backs off for the same idle window so polling clients
 cannot hammer a failing service. The calibration packets are sent once at probe
 and conservatively again after firmware suspend, hibernation or restore, rather
-than on every start or s2idle resume. Around system sleep any active stream is
-stopped and restored on wake only if a buffer is still enabled.
+than on every start or s2idle resume. Some firmware, such as the M1 Pro's,
+applies every packet it receives on top of the calibration it already holds, so
+the driver first reads the service's calibration state (property 61) and skips
+the packets when it is set, as after a rebind; after sending them it sets the
+state to 2. Around system sleep any active stream is stopped and restored on
+wake only if a buffer is still enabled.
 
 If both devices bind but every raw read returns ``ENODATA``, check the AOP
 core's ``nCal`` boot argument for the SoC. The T6040 firmware accepts the
@@ -96,8 +100,12 @@ therefore paces itself: ``sampling_frequency`` (default 50 Hz, 1 to 200 Hz)
 sets how often it polls the buffer, and the client is open only while samples
 are consumed. Enabling the buffer opens the client and disabling it closes it
 with command 26 after writing a zero interval. A direct read without an
-enabled buffer opens the client, waits up to 500 ms for the first sample and
-closes it again. After the AOP starts the fusion engine, the service publishes
+enabled buffer opens the client and waits up to 500 ms for the first sample.
+The client then stays open, so later direct reads return the latest polled
+sample without any EPIC call, and it is closed once direct reads have been
+quiet for two seconds. A buffer enabled in that time takes the open client
+over. Around system sleep the client is closed, and it is reopened on wake
+only if a buffer is still enabled. After the AOP starts the fusion engine, the service publishes
 the exact identity quaternion until the filter has its first estimate (about
 140 ms on the M4 Pro); the driver does not report those placeholders. Around system sleep an open client is closed and reopened
 after resume. A failed or timed-out close retains the DMA mapping because the

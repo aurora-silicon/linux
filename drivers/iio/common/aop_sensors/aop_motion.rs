@@ -38,6 +38,13 @@ use kernel::{
 
 /// The EPIC notification that writes a property of a sensor service.
 const SUBTYPE_SET_PROPERTY: u16 = 4;
+/// The EPIC call that reads a property of a sensor service.
+const SUBTYPE_GET_PROPERTY: u16 = 10;
+/// The calibration state of a service. It keeps the value a host sets until
+/// the AOP restarts; on the M1 Pro it reads 0 before that.
+const PROP_CALIBRATION_STATE: u32 = 61;
+/// The calibration state that says the calibration packets were sent.
+const CALIBRATION_LOADED: u32 = 2;
 /// The report interval property, in microseconds. Zero stops the reports.
 const PROP_INTERVAL: u32 = 0;
 /// 50 Hz.
@@ -123,6 +130,14 @@ fn decode(report: &[u8]) -> Option<[i32; 3]> {
 
 fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Returns whether the answer to a calibration-state read says that the
+/// packets were already sent in this AOP boot. Only the state this driver
+/// sets after them counts; a refused read, a short value or any other state
+/// (such as the firmware's default) means the packets are sent.
+fn calibration_state_set(status: u32, value: &[u8]) -> bool {
+    status == 0 && le_u32(value, 0) == Some(CALIBRATION_LOADED)
 }
 
 /// Returns the packet for location 0 of a calibration property.
@@ -323,10 +338,32 @@ impl Control {
         }
     }
 
+    /// Returns whether the service reports a calibration state set by an
+    /// earlier calibration in this AOP boot, as after a rebind of the driver.
+    fn holds_calibration(&self) -> Result<bool> {
+        let mut msg = KVec::with_capacity(8, GFP_KERNEL)?;
+        msg.extend_from_slice(&[0; 4], GFP_KERNEL)?;
+        msg.extend_from_slice(&PROP_CALIBRATION_STATE.to_le_bytes(), GFP_KERNEL)?;
+        let (status, value) =
+            self.aop
+                .epic_call_ret(&self.service, SUBTYPE_GET_PROPERTY, &msg, 4)?;
+        Ok(calibration_state_set(status, &value))
+    }
+
     /// Sends the three calibration packets. The firmware keeps calibration for
     /// the whole AOP boot, so this runs once at probe and conservatively again
     /// after firmware suspend, hibernation or restore.
+    ///
+    /// Some firmware takes every packet it is sent and applies it on top of
+    /// the calibration it already holds, so a second set rescales and rotates
+    /// the samples again; on the M1 Pro, X, Y and Z end up at 0 after a few.
+    /// The packets are therefore sent only while the service's calibration
+    /// state is still unset, and the state is set after them.
     fn calibrate(&self) -> Result {
+        if self.holds_calibration()? {
+            dev_dbg!(self.dev, "calibration kept from an earlier bind\n");
+            return Ok(());
+        }
         let mut held = 0;
         for ((prop, _), packet) in CALIBRATION.iter().zip(self.packets.iter()) {
             let status = self.write(*prop, packet)?;
@@ -343,6 +380,17 @@ impl Control {
                 held,
                 CALIBRATION.len()
             );
+        }
+        // The packets are already applied. Keep this bind calibrated even
+        // if updating the firmware's state marker fails.
+        match self.write(PROP_CALIBRATION_STATE, &CALIBRATION_LOADED.to_le_bytes()) {
+            Ok(0 | STATUS_UNSUPPORTED) => {}
+            Ok(status) => dev_warn!(
+                self.dev,
+                "calibration state update refused: status {:#x}\n",
+                status
+            ),
+            Err(e) => dev_warn!(self.dev, "calibration state update failed: {:?}\n", e),
         }
         Ok(())
     }

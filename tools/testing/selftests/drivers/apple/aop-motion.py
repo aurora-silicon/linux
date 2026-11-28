@@ -32,6 +32,8 @@ def main():
              const(motion, "DIRECT_IDLE_MS"),
              block(motion, "fn decode("), block(motion, "fn le_u32("),
              block(motion, "fn location0_packet("),
+             const(motion, "CALIBRATION_LOADED"),
+             block(motion, "fn calibration_state_set("),
              const(motion, "STATUS_UNSUPPORTED"),
              block(motion, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum CalStatus"), block(motion, "fn cal_status("),
              block(motion, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum SyncAction"),
@@ -76,6 +78,18 @@ fn container(entries: &[(u32, &[u8])]) -> Vec<u8> {
     }
     c
 }
+#[test]
+fn calibration_state() {
+    assert!(!calibration_state_set(0, &0u32.to_le_bytes()));
+    // The firmware's default state is not a calibration this driver sent.
+    assert!(!calibration_state_set(0, &1u32.to_le_bytes()));
+    assert!(calibration_state_set(0, &2u32.to_le_bytes()));
+    assert!(!calibration_state_set(0, &3u32.to_le_bytes()));
+    assert!(!calibration_state_set(0xe000_02c7, &2u32.to_le_bytes()));
+    assert!(!calibration_state_set(0, &[2, 0]));
+    assert!(!calibration_state_set(0, &[]));
+}
+
 #[test]
 fn calibration_status() {
     assert_eq!(cal_status(0), CalStatus::Taken);
