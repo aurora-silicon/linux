@@ -2085,6 +2085,7 @@
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
 #include "t6041-j575c-usbc-dcpext2.dtsi"
+#include "t6041-j575c-usbc-dcpext3.dtsi"
 #include "t6041-j575c-hdmi.dtsi"
 
 /* Not described: the SEP (no Touch ID sensor). */

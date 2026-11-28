@@ -566,11 +566,17 @@ impl SgSegments {
     }
 }
 
+/// Kernel memory one GPUVA takes: the node that records one mapping in a VM.
+const GPUVA_BYTES: u64 = size_of::<gpuvm::GpuVa<VmInner>>() as u64;
+
 /// Preallocated resources needed to execute a VM operation.
 ///
 /// VM operations may require allocating new GPUVA objects to track mappings.
 /// To avoid allocation failures during the operation, preallocate the
-/// maximum number of GPUVAs that might be needed.
+/// maximum number of GPUVAs that might be needed. They are charged to the
+/// memory cgroup of the task that asks for the operation and, in a VM charged
+/// to a client, to that client's memory limit: a GPUVA lasts as long as the
+/// mapping it records.
 struct VmOpResources {
     /// Preallocated GPUVA objects for remap operations.
     ///
@@ -579,22 +585,106 @@ struct VmOpResources {
     /// objects (one for the new mapping, and two for the previous and next
     /// mappings).
     preallocated_gpuvas: [Option<GpuVaAlloc<VmInner>>; 3],
+    /// Preallocated charge for the new mapping inserted by `sm_step_map`, taken
+    /// before the operation starts so that the map step cannot fail on memory
+    /// limits after modifying page tables. A recorded mapping keeps its charge
+    /// in its [`VmGpuVa`]; an unused charge goes back with this.
+    ///
+    /// Kept separate from `split_charge` so a map strictly inside an existing
+    /// mapping cannot have its remap step consume the new mapping's charge.
+    gpuva_charge: Option<crate::memacct::Usage>,
+    /// Preallocated charge for a deferred hole-punch unmap split, reserved before
+    /// accepting the unmap into quarantine so `drain_mappings()` cannot fail with
+    /// `ENOMEM` and quarantined splits cannot bypass limits.
+    split_charge: Option<crate::memacct::Usage>,
 }
 
 impl VmOpResources {
+    /// Three preallocated GPUVAs plus one charge for a new mapping, charged to `client` if the
+    /// VM has one. Fails with ENOMEM before anything changes if the client's or the device's
+    /// limit refuses it.
+    fn with_gpuvas(client: Option<&Arc<crate::memacct::Client>>) -> Result<Self> {
+        Self::with_gpuvas_on(&crate::memacct::LEDGER, client)
+    }
+
+    fn with_gpuvas_on(
+        ledger: &'static crate::memacct::Ledger,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result<Self> {
+        let gpuva_charge = client
+            .map(|client| {
+                let mut usage = crate::memacct::Usage::new(ledger, client.clone());
+                usage.try_add(GPUVA_BYTES)?;
+                Ok::<_, Error>(usage)
+            })
+            .transpose()?;
+        Ok(Self {
+            preallocated_gpuvas: [
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+            ],
+            gpuva_charge,
+            split_charge: None,
+        })
+    }
+
+    /// No GPUVAs, for operations that only remove whole mappings.
+    fn without_gpuvas() -> Self {
+        Self {
+            preallocated_gpuvas: [None, None, None],
+            gpuva_charge: None,
+            split_charge: None,
+        }
+    }
+
     /// Resources for unmapping a range.
     ///
     /// An unmap splits at most the two mappings that straddle its ends. Each split takes two
     /// GPUVAs before it knows which pieces survive and returns the unused one, so cutting the tail
     /// of one mapping and the head of the next needs three GPUVAs at the second split.
+    ///
+    /// No memory-limit charge is reserved here: whole-mapping and truncating unmaps never
+    /// increase the node count and always succeed at the limit; an immediate hole-punch split
+    /// checks limits in `sm_step_remap` before changing any page table, while a deferred
+    /// hole-punch unmap reserves `split_charge` before acceptance via `reserve_split_charge()`.
     fn for_unmap() -> Result<Self> {
         Ok(Self {
             preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
+                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL_ACCOUNT)?),
             ],
+            gpuva_charge: None,
+            split_charge: None,
         })
+    }
+
+    /// Reserves one GPUVA charge for a deferred hole-punch unmap before it is accepted into
+    /// quarantine, failing with `ENOMEM` if the client or device limit refuses it. Idempotent.
+    pub(super) fn reserve_split_charge(
+        &mut self,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result {
+        self.reserve_split_charge_on(&crate::memacct::LEDGER, client)
+    }
+
+    fn reserve_split_charge_on(
+        &mut self,
+        ledger: &'static crate::memacct::Ledger,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result {
+        if self.split_charge.is_some() {
+            return Ok(());
+        }
+        self.split_charge = client
+            .map(|client| {
+                let mut usage = crate::memacct::Usage::new(ledger, client.clone());
+                usage.try_add(GPUVA_BYTES)?;
+                Ok::<_, Error>(usage)
+            })
+            .transpose()?;
+        Ok(())
     }
 }
 
@@ -632,6 +722,16 @@ impl<'ctx> StepContext<'ctx> {
             .ok_or(EINVAL)
     }
 
+    /// Takes the preallocated charge for the mapping `sm_step_map` is about to record.
+    fn preallocated_charge(&mut self) -> Option<crate::memacct::Usage> {
+        self.resources.gpuva_charge.take()
+    }
+
+    /// Takes the preallocated split charge reserved for a deferred hole-punch unmap.
+    fn preallocated_split_charge(&mut self) -> Option<crate::memacct::Usage> {
+        self.resources.split_charge.take()
+    }
+
     /// Returns an unused GPUVA object to the preallocated pool.
     /// If the pool is already full, the unused allocation is simply dropped.
     fn return_preallocated_gpuva(&mut self, gpuva: GpuVaAlloc<VmInner>) {
@@ -647,10 +747,23 @@ impl<'ctx> StepContext<'ctx> {
 }
 
 /// Per-mapping metadata that survives backing eviction and GPUVA splits.
-#[derive(Default, Clone)]
 struct VmGpuVa {
     prot: Option<Prot>,
     bind_sequence: u64,
+    /// The GPUVA's charge against the VM's client, given back with the GPUVA.
+    _charge: Option<crate::memacct::Usage>,
+}
+
+impl Clone for VmGpuVa {
+    /// Copies the mapping metadata for a snapshot (`next_private_mapping`). The live GPUVA in
+    /// the tree keeps the memory charge, so the snapshot carries none.
+    fn clone(&self) -> Self {
+        Self {
+            prot: self.prot,
+            bind_sequence: self.bind_sequence,
+            _charge: None,
+        }
+    }
 }
 
 impl gpuvm::DriverGpuVm for VmInner {
@@ -752,6 +865,7 @@ impl gpuvm::DriverGpuVm for VmInner {
             VmGpuVa {
                 prot: Some(ctx.prot),
                 bind_sequence,
+                _charge: ctx.preallocated_charge(),
             },
         );
         ctx.bind_sequence = bind_sequence;
@@ -782,6 +896,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         let orig_prot = op.va_to_unmap().data().prot.ok_or(EINVAL)?;
         let orig_bind_sequence = op.va_to_unmap().data().bind_sequence;
         let orig_invalidated = op.va_to_unmap().flags().contains(GpuVaFlag::INVALIDATED);
+        let has_prev = op.prev().is_some();
+        let has_next = op.next().is_some();
 
         // Only unmap the hole between prev/next, if they exist
         let unmap_start = if let Some(op) = op.prev() {
@@ -819,6 +935,29 @@ impl gpuvm::DriverGpuVm for VmInner {
             }
         };
 
+        // Splitting one mapping into two adds a net GPUVA node. Such a mapping strictly
+        // contains the operation's range, so it is the sole overlapping GPUVA and no page
+        // tables have changed yet: use a split charge already reserved when a quarantined
+        // unmap was accepted, or check memory limits here before unmapping anything.
+        let extra_charge = if has_prev && has_next {
+            match op.va_to_unmap().data()._charge.as_ref() {
+                Some(charge) => match ctx.preallocated_split_charge() {
+                    Some(preallocated) => Some(preallocated),
+                    None => match charge.try_fork(GPUVA_BYTES) {
+                        Ok(forked) => Some(forked),
+                        Err(error) => {
+                            ctx.return_preallocated_gpuva(prev_gpuva);
+                            ctx.return_preallocated_gpuva(next_gpuva);
+                            return Err(error);
+                        }
+                    },
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let _mutation = self.mapping_mutation();
         if orig_invalidated {
             self.page_table
@@ -842,21 +981,42 @@ impl gpuvm::DriverGpuVm for VmInner {
 
         self.tlbi_contexts_naming_root(unmap_start, unmap_range as usize);
 
+        // One surviving piece inherits the removed node's charge (net zero once
+        // `remap_ret.unmapped_va` drops below); if both pieces survive, the second
+        // takes the extra charge admitted above.
+        let inherited_charge = (has_prev || has_next)
+            .then(|| {
+                op.va_to_unmap()
+                    .data()
+                    ._charge
+                    .as_ref()
+                    .map(crate::memacct::Usage::transfer_copy)
+            })
+            .flatten();
+        let (prev_charge, next_charge) = match (has_prev, has_next) {
+            (true, true) => (inherited_charge, extra_charge),
+            (true, false) => (inherited_charge, None),
+            (false, true) => (None, inherited_charge),
+            (false, false) => (None, None),
+        };
         let (op_remapped, remap_ret) = op.remap(
             [prev_gpuva, next_gpuva],
             VmGpuVa {
                 prot: Some(orig_prot),
                 bind_sequence: orig_bind_sequence,
+                _charge: prev_charge,
             },
             VmGpuVa {
                 prot: Some(orig_prot),
                 bind_sequence: orig_bind_sequence,
+                _charge: next_charge,
             },
         );
 
         if let Some(unused_va) = remap_ret.unused_va {
             ctx.return_preallocated_gpuva(unused_va);
         }
+        drop(remap_ret.unmapped_va);
 
         Ok(op_remapped)
     }
@@ -2620,8 +2780,13 @@ impl Vm {
     }
 
     /// Status shared by every queue using this VM, if enabled by its GPU.
-    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]).
+    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]),
+    /// starting with the VM's page tables.
     pub(crate) fn with_memory_client(mut self, client: Arc<crate::memacct::Client>) -> Self {
+        self.gpuvm.lock_inner().page_table.charge_to(crate::memacct::Usage::new(
+            &crate::memacct::LEDGER,
+            client.clone(),
+        ));
         self.memory = Some(client);
         self
     }
@@ -3016,13 +3181,7 @@ impl Vm {
             }))?;
         prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-            ],
-        };
+        let mut resources = VmOpResources::with_gpuvas(self.memory_client())?;
 
         // Mapping needs a complete context
         let mut ctx = StepContext::new(Some(device.as_ref().as_ref()), prot, &mut resources)?;
@@ -3243,9 +3402,7 @@ impl Vm {
     fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
         let _residency = self.enter_retirement_residency();
         // Removing whole mappings only does unmaps, so no preallocated VAs
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [None, None, None],
-        };
+        let mut resources = VmOpResources::without_gpuvas();
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
         // SAFETY: See `lock_vm()`.
@@ -3280,9 +3437,7 @@ impl Vm {
         let _residency = self.enter_retirement_residency();
         // Removing whole mappings only does unmaps, so no preallocated VAs
         // are needed for the indexed path.
-        let mut resources = VmOpResources {
-            preallocated_gpuvas: [None, None, None],
-        };
+        let mut resources = VmOpResources::without_gpuvas();
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
         // The BO's newest sequence is checked under the same lock as binds. If
@@ -4626,5 +4781,204 @@ impl FirmwareWindow {
         root[2].load(Ordering::Acquire) & self.pa_mask == self.shared_l2.base
             && context.ttb0.load(Ordering::Acquire) == self.lower_root | TTBR_VALID
             && context.ttb1.load(Ordering::Acquire) == self.tables.base | TTBR_VALID
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_gpuva_charge)]
+mod gpuva_charge_tests {
+    use super::*;
+    use crate::memacct::{
+        Client,
+        Ledger,
+        Limits, //
+    };
+
+    static GPUVA_TABLES: Ledger = Ledger::new();
+
+    #[test]
+    fn preallocated_gpuvas_are_charged_to_the_vms_client() -> Result {
+        assert!(GPUVA_BYTES as usize >= size_of::<VmGpuVa>());
+        GPUVA_TABLES.set_limits(Limits { device: 0, client: 0 });
+        let client = Client::new()?;
+        let mut resources = VmOpResources::with_gpuvas_on(&GPUVA_TABLES, Some(&client))?;
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        {
+            let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
+            // A recorded mapping keeps its charge with its metadata.
+            let kept = VmGpuVa {
+                prot: None,
+                bind_sequence: 0,
+                _charge: ctx.preallocated_charge(),
+            };
+            drop(ctx);
+            drop(resources);
+            assert_eq!(
+                (client.committed(), client.resident()),
+                (GPUVA_BYTES, GPUVA_BYTES)
+            );
+            // Cloning metadata for a mapping snapshot carries no charge.
+            let snapshot = kept.clone();
+            drop(snapshot);
+            assert_eq!(
+                (client.committed(), client.resident()),
+                (GPUVA_BYTES, GPUVA_BYTES)
+            );
+            // Removing the mapping gives the charge back.
+            drop(kept);
+        }
+        assert_eq!((client.committed(), client.resident()), (0, 0));
+        assert_eq!(GPUVA_TABLES.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(GPUVA_TABLES.user_resident.load(Ordering::Relaxed), 0);
+        // A VM charged to no client takes no charge.
+        let unaccounted = VmOpResources::with_gpuvas_on(&GPUVA_TABLES, None)?;
+        assert!(unaccounted.gpuva_charge.is_none());
+        Ok(())
+    }
+
+    static GPUVA_REFUSE: Ledger = Ledger::new();
+
+    #[test]
+    fn a_gpuva_past_the_client_limit_is_refused() -> Result {
+        GPUVA_REFUSE.set_limits(Limits {
+            device: 0,
+            client: GPUVA_BYTES,
+        });
+        let client = Client::new()?;
+        let first = VmOpResources::with_gpuvas_on(&GPUVA_REFUSE, Some(&client))?;
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(
+            VmOpResources::with_gpuvas_on(&GPUVA_REFUSE, Some(&client)).err(),
+            Some(ENOMEM)
+        );
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(GPUVA_REFUSE.user_committed.load(Ordering::Relaxed), GPUVA_BYTES);
+        assert_eq!(GPUVA_REFUSE.user_resident.load(Ordering::Relaxed), GPUVA_BYTES);
+        assert_eq!(GPUVA_REFUSE.refused.load(Ordering::Relaxed), 1);
+        drop(first);
+        assert_eq!((client.committed(), client.resident()), (0, 0));
+        assert_eq!(GPUVA_REFUSE.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(GPUVA_REFUSE.user_resident.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static GPUVA_UNMAP: Ledger = Ledger::new();
+
+    #[test]
+    fn unmap_and_truncating_remap_succeed_at_the_client_limit() -> Result {
+        GPUVA_UNMAP.set_limits(Limits {
+            device: 0,
+            client: GPUVA_BYTES,
+        });
+        let client = Client::new()?;
+        let mut resources = VmOpResources::with_gpuvas_on(&GPUVA_UNMAP, Some(&client))?;
+        let orig = resources.gpuva_charge.take().ok_or(EINVAL)?;
+        drop(resources);
+
+        // Unmap preparation takes no charge and succeeds at the exact client limit.
+        let unmap = VmOpResources::for_unmap()?;
+        assert!(unmap.gpuva_charge.is_none());
+        drop(unmap);
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(GPUVA_UNMAP.refused.load(Ordering::Relaxed), 0);
+
+        // Truncating remap hands the removed node's charge to the surviving piece (net zero).
+        let transferred = orig.transfer_copy();
+        drop(orig);
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(GPUVA_UNMAP.user_committed.load(Ordering::Relaxed), GPUVA_BYTES);
+        assert_eq!(GPUVA_UNMAP.user_resident.load(Ordering::Relaxed), GPUVA_BYTES);
+        assert_eq!(GPUVA_UNMAP.refused.load(Ordering::Relaxed), 0);
+
+        // Splitting one mapping into two (net +1 node) refuses past the client limit.
+        assert_eq!(transferred.try_fork(GPUVA_BYTES).err(), Some(ENOMEM));
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(GPUVA_UNMAP.user_committed.load(Ordering::Relaxed), GPUVA_BYTES);
+        assert_eq!(GPUVA_UNMAP.refused.load(Ordering::Relaxed), 1);
+
+        // A deferred hole-punch unmap reserves its split charge before acceptance: refused
+        // with ENOMEM at the limit, admitted once headroom exists, idempotent on retry, and
+        // returned cleanly if unused at drain time.
+        let mut unmap_res = VmOpResources::for_unmap()?;
+        assert_eq!(
+            unmap_res
+                .reserve_split_charge_on(&GPUVA_UNMAP, Some(&client))
+                .err(),
+            Some(ENOMEM)
+        );
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+        assert_eq!(GPUVA_UNMAP.refused.load(Ordering::Relaxed), 2);
+
+        // Once headroom exists, reserving the deferred split charge fills split_charge only
+        // (never gpuva_charge), is idempotent, and drops cleanly if unused.
+        GPUVA_UNMAP.set_limits(Limits {
+            device: 0,
+            client: 3 * GPUVA_BYTES,
+        });
+        unmap_res.reserve_split_charge_on(&GPUVA_UNMAP, Some(&client))?;
+        unmap_res.reserve_split_charge_on(&GPUVA_UNMAP, Some(&client))?;
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (2 * GPUVA_BYTES, 2 * GPUVA_BYTES)
+        );
+        {
+            let mut ctx = StepContext::new(None, Prot::default(), &mut unmap_res)?;
+            assert!(ctx.preallocated_charge().is_none());
+            let split = ctx.preallocated_split_charge();
+            assert!(split.is_some());
+            assert!(ctx.preallocated_split_charge().is_none());
+            drop(split);
+        }
+        drop(unmap_res);
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (GPUVA_BYTES, GPUVA_BYTES)
+        );
+
+        // A map strictly inside an existing charged mapping runs remap before map on the same
+        // StepContext: preallocated_split_charge() must be None so remap forks its own split
+        // charge instead of stealing gpuva_charge from sm_step_map(), leaving all 3 nodes charged.
+        let mut map_res = VmOpResources::with_gpuvas_on(&GPUVA_UNMAP, Some(&client))?;
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (2 * GPUVA_BYTES, 2 * GPUVA_BYTES)
+        );
+        let (extra, map_charge) = {
+            let mut ctx = StepContext::new(None, Prot::default(), &mut map_res)?;
+            assert!(ctx.preallocated_split_charge().is_none());
+            let extra = transferred.try_fork(GPUVA_BYTES)?;
+            let map_charge = ctx.preallocated_charge();
+            assert!(map_charge.is_some());
+            (extra, map_charge)
+        };
+        assert_eq!(
+            (client.committed(), client.resident()),
+            (3 * GPUVA_BYTES, 3 * GPUVA_BYTES)
+        );
+        drop((map_res, map_charge, extra, transferred));
+        assert_eq!((client.committed(), client.resident()), (0, 0));
+        assert_eq!(GPUVA_UNMAP.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(GPUVA_UNMAP.user_resident.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 }

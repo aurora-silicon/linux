@@ -508,8 +508,14 @@ pub(crate) trait Gpu: Send + Sync {
     }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
-    /// Create a VM charged to a DRM file when the backend bounds retained bindings.
-    fn new_vm_for_file(&self, kernel_range: Range<u64>, _file_id: u64) -> Result<mmu::Vm> {
+    /// Create a VM charged to a DRM file when the backend bounds retained bindings; kernel
+    /// memory the backend sizes by the VM's client is charged to `_memory`.
+    fn new_vm_for_file(
+        &self,
+        kernel_range: Range<u64>,
+        _file_id: u64,
+        _memory: &Arc<crate::memacct::Client>,
+    ) -> Result<mmu::Vm> {
         self.new_vm(kernel_range)
     }
     /// Release the backend's handle owner after closing user mapping admission.

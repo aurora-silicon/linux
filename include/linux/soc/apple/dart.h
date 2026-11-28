@@ -221,12 +221,14 @@ int apple_dart_sleep_prepare(struct device *dev);
 void apple_dart_sleep_restore(struct device *dev);
 /* A display DART's streams around a display power cycle, see the DART driver. */
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush);
+/* The streams 0 to 31 a display DART has enabled; 0 if any stream above 31 is on. */
+u32 apple_dart_enabled_streams(struct device *dev);
 /* A locked display DART's TCR and TTBR words kept across a real sleep (T6041). */
 int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
 /* A GAPF slice released before its coprocessor's CPU domain comes up after a wake. */
 int apple_dart_gapf_ready(struct device *dev);
 /* A display DART whose domain goes off at runtime while others still map into it. */
-void apple_dart_power_dark(struct device *dev, bool dark);
+int apple_dart_power_dark(struct device *dev, bool dark);
 /* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
 int apple_dart_m5_restore(struct device *dev, struct device *owner);
 /* T6050: a display coprocessor's DART around its restart, the display pipe's around its domain's. */
@@ -257,6 +259,11 @@ static inline int apple_dart_display_streams(struct device *dev, u32 streams, bo
 	return -ENODEV;
 }
 
+static inline u32 apple_dart_enabled_streams(struct device *dev)
+{
+	return 0;
+}
+
 static inline int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
 {
 	return -ENODEV;
@@ -267,8 +274,9 @@ static inline int apple_dart_gapf_ready(struct device *dev)
 	return 0;
 }
 
-static inline void apple_dart_power_dark(struct device *dev, bool dark)
+static inline int apple_dart_power_dark(struct device *dev, bool dark)
 {
+	return 0;
 }
 
 static inline int apple_dart_m5_restore(struct device *dev, struct device *owner)

@@ -731,6 +731,43 @@ pub struct GpuVmInnerGuard<'a, T: DriverGpuVm> {
 }
 
 impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
+    /// Whether `addr..addr + range` lies strictly inside a single driver GPUVA satisfying
+    /// `matches` (so unmapping it would split that GPUVA into two surviving pieces, net +1 node).
+    pub fn range_strictly_inside_va(
+        &self,
+        addr: u64,
+        range: u64,
+        matches: impl FnOnce(&GpuVa<T>) -> bool,
+    ) -> bool {
+        let Some(end) = addr.checked_add(range) else {
+            return false;
+        };
+        if range == 0 {
+            return false;
+        }
+        // SAFETY: This guard owns the VM's shared reservation, serializing VA tree mutation.
+        let raw = unsafe { bindings::drm_gpuva_find_first(self.gpuvm.as_raw(), addr, range) };
+        if raw.is_null() {
+            return false;
+        }
+        // SAFETY: `raw` stays linked and alive while this guard is held.
+        let va = unsafe { &*raw };
+        if va.gem.obj.is_null() || va.vm_bo.is_null() {
+            return false;
+        }
+        if !va
+            .va
+            .addr
+            .checked_add(va.va.range)
+            .is_some_and(|va_end| va.va.addr < addr && end < va_end)
+        {
+            return false;
+        }
+        // SAFETY: Driver-owned mappings are `GpuVa<T>`; the kernel cutout has no GEM object
+        // and was skipped above.
+        matches(unsafe { GpuVa::<T>::from_raw(raw) })
+    }
+
     /// Run immediate-mode unmap steps without allocating an exec context.
     ///
     /// # Safety

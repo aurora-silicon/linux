@@ -15,6 +15,10 @@
 /dts-v1/;
 
 #define T6050_J714C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 #include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
@@ -530,3 +534,6 @@
 &avd {
 	status = "okay";
 };
+
+/* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0x73). */
+#include "t6050-isp.dtsi"

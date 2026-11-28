@@ -714,6 +714,11 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 
 	if (vb2_plane_size(vb, 0) < f->plane_fmt[0].sizeimage)
 		return -EINVAL;
+	/* MCTF copies a whole picture from data_offset on. */
+	if (ctx->mctf && V4L2_TYPE_IS_OUTPUT(vb->type) &&
+	    !ave_mctf_input_fits(vb2_plane_size(vb, 0), vb->planes[0].data_offset,
+				 ave_mctf_input_bytes(f)))
+		return -EINVAL;
 	/* Keep what the client filled in, so its layout can be checked. */
 	if (V4L2_TYPE_IS_OUTPUT(vb->type) && !vb2_get_plane_payload(vb, 0))
 		vb2_set_plane_payload(vb, 0, f->plane_fmt[0].sizeimage);

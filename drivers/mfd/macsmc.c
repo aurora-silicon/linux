@@ -641,6 +641,20 @@ static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
 	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/*
+ * The state the RTKit callbacks use. A message can arrive as soon as the
+ * RTKit is initialised, so this is set up before that.
+ */
+static void apple_smc_init_state(struct apple_smc *smc)
+{
+	mutex_init(&smc->mutex);
+	spin_lock_init(&smc->lock);
+	init_completion(&smc->init_done);
+	init_completion(&smc->cmd_done);
+	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
+	smc->boot_stage = APPLE_SMC_BOOTING;
+}
+
 /* A board's own numbering, from its device tree (apple,wake-reasons and their names) */
 static const struct apple_smc_wake_reason *apple_smc_dt_wake_reasons(struct device *dev)
 {
@@ -724,8 +738,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->sleep_pmvc_set = !of_property_read_u32(dev->of_node, "apple,sleep-pmvc",
 						    &smc->sleep_pmvc);
 
-	mutex_init(&smc->mutex);
-	spin_lock_init(&smc->lock);
+	apple_smc_init_state(smc);
 	smc->dev = &pdev->dev;
 	smc->saved_enabled = apple_t6050_sleep_described() &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
@@ -751,7 +764,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->rtk))
 		return dev_err_probe(dev, PTR_ERR(smc->rtk), "Failed to initialize RTKit");
 
-	smc->boot_stage = APPLE_SMC_BOOTING;
 	ret = apple_rtkit_wake(smc->rtk);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to wake up SMC");
@@ -763,9 +775,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
-
-	init_completion(&smc->init_done);
-	init_completion(&smc->cmd_done);
 
 	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
 				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
@@ -783,7 +792,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	}
 
 	dev_set_drvdata(&pdev->dev, smc);
-	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
 	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
 	if (ret >= 0 && ret != sizeof(count)) {

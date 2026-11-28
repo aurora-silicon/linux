@@ -83,6 +83,17 @@ impl Prep {
     pub(crate) fn slot(&self) -> u32 {
         self.scene.slot()
     }
+
+    /// Clears the tiler's TPC storage after a firmware recovery stopped the tiler.
+    /// Zeroes the scene's TPC after a firmware recovery stopped its tiler.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::buffer::Scene::clear_tpc`].
+    pub(crate) unsafe fn clear_tpc(&self) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.scene.clear_tpc(self.tile.tpc_size) }
+    }
 }
 
 fn to_cmdbuf(r: &UapiRenderCommand) -> kernel::uapi::drm_asahi_cmd_render {
@@ -457,6 +468,9 @@ pub(crate) fn encode_vertex(
     put32(cmd, 0x564, u32::from(r.sampler_count));
     // Allow a synchronous parameter-buffer request.
     put32(cmd, 0x570, 1);
+    // Vertex shader scratch flag: 13.5 uses_scratch is 8 bytes past sync_grow (0x570 -> 0x578).
+    const _: () = assert!(offset_of!(Rv, uses_scratch) - offset_of!(Rv, sync_grow) == 8);
+    put32(cmd, 0x578, u32::from(r.flags & 1 != 0));
     // Job meta at 0x580.
     put64(cmd, 0x584, q.stamp);
     put64(cmd, 0x58c, q.fw_stamp);

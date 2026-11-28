@@ -819,6 +819,10 @@ int main(void)
 	mock_sleep_restore(mock_sleep_data);
 	mock_sleep_active = false;
 	assert(mmio_regs[0x2c / 4] == 0);
+	/* Stopped WD2: a counter below the bark is no time left */
+	mmio_regs[0x20 / 4] = 5u * 24000000u;
+	assert(wdd->ops->get_timeleft(wdd) == 0);
+	mmio_regs[0x20 / 4] = 0;
 
 	/* 7. Restart uses clock-derived bark delay (40 ms) and WD2, never WD1 */
 	reconfig_reg = 0;

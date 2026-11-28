@@ -1597,6 +1597,8 @@ static bool __attribute__((unused)) apple_t8132_firmware_path(void)
 { assert(!"T8132 DCP in a J700 scenario"); return false; }
 static bool __attribute__((unused)) apple_t8132_dcpext_v27_2(const struct device_node *n)
 { (void)n; assert(!"T8132 dcpext in a J700 scenario"); return false; }
+static bool __attribute__((unused)) apple_t8132_dcp_v27_2(const struct device_node *n)
+{ (void)n; assert(!"T8132 DCP in a J700 scenario"); return false; }
 static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp *d, const char *why)
 { (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };

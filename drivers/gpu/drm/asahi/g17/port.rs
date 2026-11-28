@@ -28,13 +28,6 @@ use kernel::{
 
 const PRIORITIES: usize = Policy::PRIORITIES as usize;
 
-/// Minimum utilization of the primary coprocessor's receive thread, which handles every
-/// completion, while the GPU itself is the bottleneck (see `Feed::gpu_bound`). Otherwise the
-/// thread keeps the scheduler's RT default, which takes its CPU cluster to the top frequency for
-/// each completion: the completion may be on the critical path, of a waiter, of an idle GPU or of
-/// work bound by host refills. While the GPU is the bottleneck the burst gains nothing, and at the
-/// SoC's thermal limit the power it takes comes out of the GPU's clock.
-const RX_UTIL_MIN_GPU_BOUND: u32 = 256;
 const RX_STATE_UNSET: u8 = 0;
 const RX_STATE_DEFAULT: u8 = 1;
 const RX_STATE_GPU_BOUND: u8 = 2;
@@ -251,16 +244,13 @@ impl Port {
         views: Views,
         regs: crate::regs::G17Resources,
         registration: super::fw::variant::QueueRegistration,
-        clamp_rx: bool,
     ) -> Result {
         // SAFETY: The session owns the mailbox and outlives every port user.
         let rx = unsafe { (*views.mailbox).rx_util_min_handle() };
-        // Without `clamp_rx` (M5) no handle is attached and the receive thread keeps its
-        // default; rx_update() then returns at once.
         if self.views.populate(views)
             && self.regs.populate(regs)
             && self.registration.populate(registration)
-            && (!clamp_rx || self.rx.populate(rx))
+            && self.rx.populate(rx)
         {
             Ok(())
         } else {
@@ -852,11 +842,18 @@ impl Port {
     }
 
     /// Requests the receive thread's minimum utilization for the feed's current view of the GPU,
-    /// where the port clamps it (not on M5, see attach()). Called at every publication and
-    /// completion: the feed's state lingers for a few milliseconds, so after a pause the
-    /// publication that ends it restores the default before its completion arrives.
+    /// on generations whose feed policy sets one (`feed::Policy::gpu_bound_rx_util_min`).
+    /// The primary coprocessor's receive thread handles every completion. Otherwise it keeps the
+    /// scheduler's RT default, which takes its CPU cluster to the top frequency for each
+    /// completion: the completion may be on the critical path, of a waiter, of an idle GPU or of
+    /// work bound by host refills. While the GPU is the bottleneck the burst gains nothing, and at
+    /// the SoC's thermal limit the power it takes comes out of the GPU's clock.
+    /// Called at every publication and completion: the feed's state lingers for a few
+    /// milliseconds, so after a pause the publication that ends it restores the default before
+    /// its completion arrives.
     fn rx_update(&self) {
-        let Some(rx) = self.rx.as_ref() else {
+        let (Some(rx), Some(util_min)) = (self.rx.as_ref(), self.feed.gpu_bound_rx_util_min())
+        else {
             return;
         };
         let want_state = if self.feed.gpu_bound() {
@@ -873,7 +870,7 @@ impl Port {
         // early against the stale mirrored value while this update is in flight.
         self.rx_state.store(RX_STATE_UNSET, Ordering::SeqCst);
         let gpu_bound = self.feed.gpu_bound();
-        let want = gpu_bound.then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want = gpu_bound.then_some(util_min);
         let want_state = if gpu_bound {
             RX_STATE_GPU_BOUND
         } else {

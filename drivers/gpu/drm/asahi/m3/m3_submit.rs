@@ -365,8 +365,15 @@ impl Queue {
     }
 }
 impl queue::Queue for Queue {
-    fn submit(&mut self,_reg_data:&crate::driver::AsahiRegData<'_>,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
-        raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
+    fn submit(
+        &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
+        _id: u64,
+        mut syncs: KVVec<file::SyncItem>,
+        in_sync_count: usize,
+        raw: &[u8],
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
@@ -482,7 +489,8 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
     #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
     let stage_scope = { let _ = early_tiling; 0 };
-    if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
+    let vertex_scratch = if samplers_and_helpers { 1 } else { 0 };
+    if r.flags & !(vertex_scratch | 2 | 16 | (1 << 18) | stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || (!samplers_and_helpers && (r.sampler_count != 0 || r.sampler_heap != 0
             || r.vertex_helper != empty || r.fragment_helper != empty))
         || (!zls_compression_all_layouts

@@ -165,3 +165,32 @@
 	spi-cs-hold-delay-ns = <20>;
 	status = "okay";
 };
+
+/*
+ * The MagSafe 3 port's PD controller, on nub-spmi-a0 next to ATC0 and ATC1's
+ * (SID 8, port-type 0x11, the same in each laptop's ADT). It has no USB data
+ * path, so it gets no connector node; tipd registers a Type-C port and a power
+ * supply for it. Its event, sleep and wake interrupts are 63, 69 and 71 in the
+ * same order as hpm0's. Its ADT features-supported is <3>, "Power In" only: no
+ * liquid detection.
+ */
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "sleep", "wake";
+		apple,no-liquid-detection;
+	};
+};
+
+/*
+ * ADT /arm-io/spi4/dp855: the panel timing controller. Chip select from the
+ * spi4 function-spi_cs0, the same pin on the J604, J713 and J715.
+ */
+&spi4 {
+	cs-gpios = <&pinctrl_ap 76 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};

@@ -306,6 +306,9 @@ const struct ane_fw_platform ane_h17_platform = {
 	.boot_qualified = true,						\
 	.firmware_preloaded = true,					\
 	.safe_reset = false,						\
+	/* Exclave mode at boot, cold sleep cycle and parked start. */	\
+	.exclave_mode_stop = true,					\
+	.macos_sleep = true,						\
 	.sleep_warm = false,						\
 	.pmgr_sys = 0x3a8,						\
 	.pmgr_cpu = 0x3c8,						\

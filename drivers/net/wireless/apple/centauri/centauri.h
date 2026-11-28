@@ -105,6 +105,8 @@ int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret);
 bool centauri_warm_reset_described(struct pci_dev *pdev);
 int centauri_start_ipc(struct centauri *c);
 bool centauri_beta_running(struct centauri *c);
+bool centauri_stop_dma(struct pci_dev *pdev);
+bool centauri_stop_ipc(struct centauri *c);
 void centauri_free_ipc(struct centauri *c);
 int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *resources);
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size);

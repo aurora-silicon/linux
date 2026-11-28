@@ -2384,7 +2384,26 @@ struct gate_staged {
 	const char *dart;		/* display DART of this stage */
 	const char *const *nodes;
 	unsigned int nr;
+	/*
+	 * If set, the processor (the last of @nodes) whose typec-routes children
+	 * belong to the chain too: one per Type-C port of the board, as its
+	 * device tree describes them.
+	 */
+	bool dt_routes;
 };
+
+/* The typec-routes node of the processor that ends @st, or NULL. */
+static struct device_node *staged_routes(const struct gate_staged *st)
+{
+	struct device_node *dcp, *routes;
+
+	if (!st->dt_routes)
+		return NULL;
+	dcp = of_find_node_by_path(st->nodes[st->nr - 1]);
+	routes = dcp ? of_get_child_by_name(dcp, "typec-routes") : NULL;
+	of_node_put(dcp);
+	return routes;
+}
 
 static const char *const t6041_hdmi_nodes[] = {
 	/* ATC3 power, PMP DISPEXT0 request, DISPEXT0, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext0 */
@@ -2579,6 +2598,32 @@ static bool staged_ready(const struct gate_staged *st)
 			return false;
 		}
 		of_node_put(np);
+	}
+	if (st->dt_routes) {
+		struct device_node *route;
+		unsigned int nr_routes = 0;
+
+		np = staged_routes(st);
+		if (!np) {
+			staged_err("%s/typec-routes: no such node, nothing enabled\n",
+				   st->nodes[st->nr - 1]);
+			return false;
+		}
+		for_each_child_of_node(np, route) {
+			if (of_device_is_available(route)) {
+				staged_err("%pOF: already enabled, nothing changed\n", route);
+				of_node_put(route);
+				of_node_put(np);
+				return false;
+			}
+			nr_routes++;
+		}
+		of_node_put(np);
+		if (!nr_routes) {
+			staged_err("%s/typec-routes: no routes, nothing enabled\n",
+				   st->nodes[st->nr - 1]);
+			return false;
+		}
 	}
 	return true;
 }
@@ -3274,14 +3319,15 @@ static const char *const t6041_max_usbc2_nodes[] = {
 	"/dcp@606e00000",
 };
 
-/* The third USB-C processor of the J614c/J616c, dcpext3, as dcpext2's chain. */
+/*
+ * The third USB-C processor of the M4 Max boards, dcpext3, as dcpext2's chain.
+ * Its routes are the ones the device tree gives it, one per Type-C port: three
+ * on the J614c/J616c, four on the J575c.
+ */
 static const char *const t6041_max_usbc3_nodes[] = {
 	"/iommu@306340000",
 	"/iommu@306300000",
 	"/mailbox@306e08000",
-	"/dcp@306e00000/typec-routes/route@0",
-	"/dcp@306e00000/typec-routes/route@1",
-	"/dcp@306e00000/typec-routes/route@2",
 	"/dcp@306e00000",
 };
 
@@ -3289,7 +3335,7 @@ static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
-	{ "/iommu@306300000", t6041_max_usbc3_nodes, ARRAY_SIZE(t6041_max_usbc3_nodes) },
+	{ "/iommu@306300000", t6041_max_usbc3_nodes, ARRAY_SIZE(t6041_max_usbc3_nodes), true },
 };
 
 /*
@@ -3394,6 +3440,32 @@ static bool __init t6041_max_needs_off_domain(const struct gate_staged *st, stru
 	return off;
 }
 
+/* Enable each typec-routes child of @st's processor in @cs, if @st takes its routes from the DT. */
+static int __init t6041_max_enable_routes(struct of_changeset *cs, const struct gate_staged *st)
+{
+	struct device_node *routes, *route;
+	unsigned int nr_routes = 0;
+	int ret = 0;
+
+	if (!st->dt_routes)
+		return 0;
+	routes = staged_routes(st);
+	if (!routes)
+		return -ENODEV;
+	for_each_child_of_node(routes, route) {
+		ret = of_changeset_update_prop_string(cs, route, "status", "okay");
+		if (ret) {
+			of_node_put(route);
+			break;
+		}
+		nr_routes++;
+	}
+	of_node_put(routes);
+	if (!ret && !nr_routes)
+		return -ENODEV;
+	return ret;
+}
+
 /*
  * Enable every node of stage @i and put its display DART into the display subsystem's iommus.
  * The in-tree trees give the chains no DISPEXT power domain: they are on as iBoot left them. A
@@ -3415,6 +3487,11 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 	ret = np ? gate_iommus_append(cs, display, np) : -ENODEV;
 	of_node_put(np);
 	for (n = 0; !ret && n < st->nr; n++) {
+		/* The routes go in just before their processor, the last node. */
+		if (n == st->nr - 1)
+			ret = t6041_max_enable_routes(cs, st);
+		if (ret)
+			break;
 		np = of_find_node_by_path(st->nodes[n]);
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		if (!ret && t6041_max_needs_off_domain(st, np))

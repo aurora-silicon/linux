@@ -814,6 +814,8 @@ EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_create);
  * section list or resource IDs can substitute for this original container.
  * Callers supply an empty destination and retain it until all firmware
  * references end; importing alone grants no process or execution authority.
+ * The copy is charged to the caller's memory cgroup for as long as it lives,
+ * a loaded program's lifetime included.
  */
 int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
 				   struct ane_h16_hwx_snapshot *snapshot)
@@ -824,9 +826,13 @@ int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
 		return -EINVAL;
 	if (snapshot->bytes)
 		return -EBUSY;
-	copy.bytes = vmemdup_user(bytes, size);
-	if (IS_ERR(copy.bytes))
-		return PTR_ERR(copy.bytes);
+	copy.bytes = kvmalloc(size, GFP_USER | __GFP_ACCOUNT | __GFP_NOWARN);
+	if (!copy.bytes)
+		return -ENOMEM;
+	if (copy_from_user(copy.bytes, bytes, size)) {
+		kvfree(copy.bytes);
+		return -EFAULT;
+	}
 	copy.size = size;
 	return hwx_snapshot_finish(&copy, snapshot);
 }

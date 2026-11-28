@@ -10,7 +10,7 @@
 
 use super::*;
 use kernel::device;
-use crate::g14_v27_2_abi::{self, GrowRequest, QueueError};
+use crate::g14_v27_2_abi::{self, EventKind, GrowRequest, QueueError};
 use crate::g17::fw::m5::initdata as abi;
 use crate::hw::{RegisterBaseV27_2, RegisterV27_2};
 use crate::m3::m3_init_26 as directory26;
@@ -40,6 +40,11 @@ const STATISTICS_RING: usize = 16;
 /// Ring geometries: the trace ring has 512 records of 0x48 bytes, the others 256.
 const TRACE_RECORDS: u32 = 512;
 const RING_RECORDS: u32 = 256;
+use crate::g14_v27_2_abi::{
+    RECOVERY_GENERATION as CONTROL_RECOVERY_GENERATION, RECOVERY_PHASE as CONTROL_RECOVERY_PHASE,
+    RECOVERY_SNAPSHOT as CONTROL_RECOVERY_SNAPSHOT,
+};
+pub(crate) use crate::g14_v27_2_abi::{stopped_tiler, RECOVERY_SNAPSHOT_ENTRIES};
 /// Queue capacity at position block +0x50 (16 x the 0x50 channels).
 const QUEUE_CAPACITY: u32 = 0x500;
 /// Globals offsets of the 13.5 shared power tables (HwDataShared1 and HwDataShared2): the 27.2
@@ -48,8 +53,10 @@ const GLOBALS_SHARED1: usize = 0xec;
 const GLOBALS_SHARED2: usize = 0x1b4;
 const SHARED1_BYTES: usize = 0xa8;
 const SHARED2_BYTES: usize = 0x510;
-/// Power-record offset of the 13.5 HwDataShared3 (0x50 bytes).
+/// Offsets of the 13.5 HwDataShared3 in the 27.2 power and controller records.
 const POWER_SHARED3: usize = 0x4f0;
+const CONTROLLER_SHARED3: usize = 0x62ac;
+const CONTROLLER_BYTES: usize = 0x6c48;
 const _: () = {
     assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared1>() == SHARED1_BYTES);
     assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared2>() == SHARED2_BYTES);
@@ -72,7 +79,9 @@ const _: () = {
     assert!(offset_of!(B13, num_frags) + offset_of!(B27, chip_id) - offset_of!(B13, chip_id) == 0x10a4);
     use fw::initdata::raw::HwDataShared3 as S3;
     assert!(core::mem::size_of::<S3>() == 0x50 && offset_of!(S3, table) == 0xc && offset_of!(S3, unk_4c) == 0x4c);
-    assert!(POWER_SHARED3 + 0x50 <= 0x6a0);
+    assert!(POWER_SHARED3 + core::mem::size_of::<S3>() <= 0x6a0);
+    assert!(CONTROLLER_SHARED3 + offset_of!(S3, table) == 0x62b8);
+    assert!(CONTROLLER_SHARED3 + core::mem::size_of::<S3>() <= CONTROLLER_BYTES);
 };
 
 /// Board facts the root needs, read from the device tree at probe.
@@ -604,6 +613,11 @@ impl CommandPool {
 }
 
 pub(crate) enum FirmwareEvent {
+    /// Kind 0: the firmware stopped on a GPU fault and halted for recovery.
+    Fault,
+    /// Kind 4: the firmware timed out a command (the slot it names at +0xc) and halted for
+    /// recovery.
+    Timeout { slot: i32 },
     Grow(GrowRequest),
     ChannelError,
     Notification,
@@ -695,6 +709,15 @@ impl RootV27_2 {
         (queue.info(self.render_states[dm]), queue.event.current_noncoherent())
     }
 
+    /// Whether the render queue's retired position reached `target`, stamp or not: a command
+    /// the firmware stopped for recovery leaves the queue without writing its stamp.
+    pub(crate) fn render_retired(&self, dm: usize, target: u32) -> Result<bool> {
+        let queue = &self.render_queues[dm];
+        crate::pgtable::clean_invalidate_poc(queue.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok(Self::word(&queue.positions, 0)? == target)
+    }
+
     pub(crate) fn render_done(&self, dm: usize, target: u32, stamp: event::EventValue) -> Result<bool> {
         let queue = &self.render_queues[dm];
         crate::pgtable::clean_invalidate_poc(queue.positions.as_slice().as_ptr(), 0x60);
@@ -719,6 +742,27 @@ impl RootV27_2 {
         for (name, queue) in ["tiler", "fragment"].into_iter().zip(&self.render_queues) {
             Self::log_queue(dev, name, &queue.positions, &queue.queue, &queue.event);
         }
+        let (generation, phase) = (self.halt_count(), self.recovery_phase());
+        let (snapshot, entries) = self.recovery_snapshot();
+        dev_err!(dev, "GPU: recovery generation={:?} phase={:?} snapshot ({} entries) {:x?}\n",
+                 generation, phase, entries, &snapshot[..entries.min(snapshot.len())]);
+    }
+
+    /// The first valid recovery snapshot entries, {flags, target} in hex, and how many valid
+    /// entries there are in all (the first invalid entry ends the snapshot). Logging only.
+    pub(crate) fn recovery_snapshot(&self) -> ([(u32, u32); 4], usize) {
+        let mut first = [(0, 0); 4];
+        let mut entries = 0;
+        for i in 0..RECOVERY_SNAPSHOT_ENTRIES {
+            match self.recovery_entry(i) {
+                Ok((flags, target)) if flags & 1 != 0 => {
+                    if let Some(slot) = first.get_mut(entries) { *slot = (flags, target); }
+                    entries += 1;
+                }
+                _ => break,
+            }
+        }
+        (first, entries)
     }
 
     pub(crate) fn render_kick(dm: usize) -> u64 {
@@ -831,7 +875,8 @@ impl RootV27_2 {
             && job.event.current_noncoherent().raw() == job.expected_stamp)
     }
 
-    pub(crate) fn peek_event(&self) -> Result<Option<(u32, FirmwareEvent)>> {
+    /// The record at the head of the event ring: its cursor, its raw kind word and its decoding.
+    pub(crate) fn peek_event(&self) -> Result<Option<(u32, u32, FirmwareEvent)>> {
         use crate::m3::m3_channel_format::RECEIVE_BYTES;
         let state = &self.channels[2 * EVENT_RING];
         let ring = &self.channels[2 * EVENT_RING + 1];
@@ -844,14 +889,48 @@ impl RootV27_2 {
         crate::pgtable::clean_invalidate_poc(ring.as_slice()[at..].as_ptr(), RECEIVE_BYTES);
         crate::pgtable::poc_barrier();
         let word = |offset| Self::word(ring, at + offset);
-        let event = match word(0)? {
-            6 => FirmwareEvent::Grow(GrowRequest::decode([
+        let kind = word(0)?;
+        let event = match g14_v27_2_abi::event_kind(kind) {
+            EventKind::Grow => FirmwareEvent::Grow(GrowRequest::decode([
                 word(4)?, word(8)?, word(0x0c)?, word(0x10)?, word(0x14)?, word(0x18)?,
             ])),
-            7 => FirmwareEvent::ChannelError,
-            _ => FirmwareEvent::Notification,
+            EventKind::Fault => FirmwareEvent::Fault,
+            EventKind::Timeout => FirmwareEvent::Timeout {
+                slot: word(g14_v27_2_abi::TIMEOUT_SLOT_OFFSET)? as i32,
+            },
+            EventKind::ChannelError => FirmwareEvent::ChannelError,
+            EventKind::Notification => FirmwareEvent::Notification,
         };
-        Ok(Some((read, event)))
+        Ok(Some((read, kind, event)))
+    }
+
+    /// Validates a byte range of the control object before it is sliced or cache-maintained.
+    fn control_range(control: &fw::types::GpuArray<u8>, from: usize, bytes: usize) -> Result {
+        match from.checked_add(bytes) {
+            Some(end) if end <= control.as_slice().len() && from % 4 == 0 => Ok(()),
+            _ => Err(EINVAL),
+        }
+    }
+
+    /// Reads control words from `from` into `out`.
+    pub(crate) fn control_snapshot(&self, from: usize, out: &mut [u32]) -> Result {
+        Self::control_range(&self.control, from, out.len() * 4)?;
+        let at = self.control.as_slice()[from..].as_ptr();
+        crate::pgtable::clean_invalidate_poc(at, out.len() * 4);
+        crate::pgtable::poc_barrier();
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = Self::word(&self.control, from + 4 * i)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one control word and makes it visible to the firmware.
+    pub(crate) fn control_store(&self, at: usize, value: u32) -> Result {
+        Self::control_range(&self.control, at, 4)?;
+        self.control.shared_index(at)?.store(value, Ordering::Release);
+        crate::pgtable::clean_poc(self.control.as_slice()[at..].as_ptr(), 4);
+        crate::pgtable::poc_barrier();
+        Ok(())
     }
 
     pub(crate) fn consume_event(&self, cursor: u32) -> Result {
@@ -862,8 +941,31 @@ impl RootV27_2 {
         Ok(())
     }
 
+    /// The recovery phase. The firmware publishes 1 after it reported a fault or a command
+    /// timeout and stopped every queue; it runs nothing until the host's answers.
+    pub(crate) fn recovery_phase(&self) -> Result<u32> {
+        let mut word = [0u32];
+        self.control_snapshot(CONTROL_RECOVERY_PHASE, &mut word)?;
+        Ok(word[0])
+    }
+
+    /// Answers a recovery phase (2 at phase 1, 0 at phase 3).
+    pub(crate) fn answer_recovery(&self, phase: u32) -> Result {
+        self.control_store(CONTROL_RECOVERY_PHASE, phase)
+    }
+
+    /// Snapshot entry `i` of the stopped work: (flags, target). Bit 0 of flags marks a valid
+    /// entry; the first invalid one ends the snapshot.
+    pub(crate) fn recovery_entry(&self, i: usize) -> Result<(u32, u32)> {
+        if i >= RECOVERY_SNAPSHOT_ENTRIES { return Err(EINVAL); }
+        let mut words = [0u32; 2];
+        self.control_snapshot(CONTROL_RECOVERY_SNAPSHOT + 8 * i, &mut words)?;
+        Ok((words[0], words[1]))
+    }
+
+    /// The recovery generation (u64). Growth requests carry the value current when sent.
     pub(crate) fn halt_count(&self) -> Result<u64> {
-        const OFFSET: usize = 0x4bf0;
+        const OFFSET: usize = CONTROL_RECOVERY_GENERATION;
         crate::pgtable::clean_invalidate_poc(self.control.as_slice()[OFFSET..].as_ptr(), 8);
         crate::pgtable::poc_barrier();
         Ok(u64::from(Self::word(&self.control, OFFSET)?)
@@ -1221,7 +1323,7 @@ impl RootV27_2 {
         let mut compute_state = 0;
         let mut render_states = [0; 2];
         for (offset, size) in [(0x10, 0x88), (0x254, 0x678), (0x25c, 0x760),
-                               (0x264, 0x6d0), (0x26c, 0x60), (0x485, 0x6c48)] {
+                               (0x264, 0x6d0), (0x26c, 0x60), (0x485, CONTROLLER_BYTES)] {
             let mut owner = alloc.private.array_empty::<u8>(size)?;
             if offset == 0x485 {
                 Self::controller(owner.as_mut_slice(), graph, &extra, sensors)?;
@@ -1505,9 +1607,9 @@ impl RootV27_2 {
         }
         put64(policy, 0x2f28, sensors);
         put32(policy, 0x3ba8, 1);
-        for (word, value) in policy[0x62b8..0x62f8].chunks_exact_mut(4).zip(cfg.shared3_tab) {
-            word.copy_from_slice(&value.to_le_bytes());
-        }
+        // Keep the controller's per-state table and the words that control its use
+        // together, as in the power record.
+        base.hwdata_a.with(|a, _| put_shared3(policy, CONTROLLER_SHARED3, &a.hws3));
         // Warm-restart operands: base operating point and wake flags.
         for (at, value) in [
             (0x9c, 1),

@@ -139,7 +139,11 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *out,
 { (void)rtk; assert(off + len <= b->size); copies++; memcpy(out, b->buffer+off, len); }
 static int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 msg, void *c, bool atomic)
 { (void)rtk; assert(ep==2 && msg==0 && c==NULL && !atomic); acks++; return 0; }
-''' + helper + '\n' + block(dcp, 'static bool dcp_rtk_syslog_is_debug(') + r'''
+typedef uint32_t u32;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+struct apple_dcp { struct { bool only_120hz_modes; } hw; u32 boot_rate; };
+''' + helper + '\n' + block(dcp, 'static void dcp_rtk_syslog_boot_rate(') + '\n' + block(dcp, 'static bool dcp_rtk_syslog_is_debug(') + r'''
 static bool policy(void *cookie, const char *context, const char *message)
 { calls++; return dcp_rtk_syslog_is_debug(cookie, context, message); }
 ''' + block(source, 'static bool should_crop_syslog_char(') + '\n' + block(source, 'static void apple_rtkit_syslog_rx_log(') + r'''
@@ -154,7 +158,8 @@ int main(void)
 {
     unsigned char ring[288]; char decoded[256];
     struct apple_rtkit_ops ops={.syslog_is_debug=policy};
-    struct apple_rtkit rtk={.ops=&ops, .syslog_msg_buffer=decoded,
+    struct apple_dcp dcp={.hw={.only_120hz_modes=true}};
+    struct apple_rtkit rtk={.ops=&ops, .cookie=&dcp, .syslog_msg_buffer=decoded,
         .syslog_msg_size=256, .syslog_n_entries=1,
         .syslog_buffer={.size=sizeof(ring),.buffer=ring}};
     const char *messages[]={
@@ -191,6 +196,22 @@ int main(void)
     reset(); apple_rtkit_syslog_rx_log(&rtk,0);
     assert(warnings==1 && !calls && !copies && acks==1);
     puts("PASS default info, trimming, inherited and invalid records retain transport behavior");
+    rtk.syslog_n_entries=1;
+    /* The rate iBoot left the T6050 panel at: the first one counts, the line stays at info. */
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 60");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==60 && infos==1 && !debugs && acks==1);
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 120");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==60 && infos==1);
+    dcp.boot_rate=0; dcp.hw.only_120hz_modes=false;
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==0 && infos==1);
+    dcp.hw.only_120hz_modes=true;
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 7");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==0 && infos==1);
+    puts("PASS T6050 boot rate: first rate latched, later and out-of-range rates ignored, other panels untouched");
     return 0;
 }
 '''
@@ -205,6 +226,7 @@ def _v27_prelude(root):
                                         '#define APPLE_T8132_DCP_26B123_UUID '))]
     assert len(uuid_defines) == 3
     helpers = ('static inline bool apple_dcp_image_v27_2(',
+               'static inline bool apple_t8132_dcp_v27_2(',
                'static inline bool apple_t6041_dcp_any_v27_2(',
                'static inline bool apple_t6041_dcp_v27_2(',
                'static inline bool apple_t6041_dcpext_v27_2(',
@@ -259,6 +281,7 @@ struct device_node {
     int fw_cells;
     u32 compat[DCP_FW_VERSION_MAX_LEN];
     int compat_cells;
+    bool clock_ids;
 };
 struct device {
     struct device_node *of_node;
@@ -350,9 +373,11 @@ static const struct apple_dcp_hw_data *of_device_get_match_data(struct device *d
 {
     return dev->hw;
 }
-/* No internal board profile is present in these fixtures. */
-static bool of_property_present(struct device_node *np, const char *name)
+/* No internal board profile is present in these fixtures; apple,clock-ids is the handoff flag. */
+static bool of_property_present(const struct device_node *np, const char *name)
 {
+    if (!strcmp(name, "apple,clock-ids"))
+        return np && np->clock_ids;
     assert(!strcmp(name, "apple,j613-25g83-profile"));
     return false;
 }
@@ -625,10 +650,47 @@ int main(void)
     node.compat[1] = 2; node.fw[2] = 1; assert(!apple_t8132_dcpext_v27_2(&node));
     node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
 
+    /*
+     * The internal DCP handed over with the T8132 27.2 image and its
+     * firmware-27 clocks (the M4 Air's on the 27.2 stub) runs the 27.2
+     * table on any board and either firmware path; without the clocks it is
+     * the M4 backend's on its path and nobody's off it, as above.
+     */
+    reset_t6041_26b123(false);
+    node.compatible = "apple,t8132-dcp";
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.clock_ids = true;
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        assert(apple_t8132_dcp_v27_2(&node));
+        assert(!apple_t8132_dcpext_v27_2(&node));
+        assert(!apple_t6041_dcp_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        node.clock_ids = false;
+        assert(!apple_t8132_dcp_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
+        node.clock_ids = true;
+    }
+    t8132_firmware_path = true;
+    /* Not on a dcpext, nor with the T6041 image, a missing UUID or another release. */
+    node.compatible = "apple,t8132-dcpext"; assert(!apple_t8132_dcp_v27_2(&node));
+    node.compatible = "apple,t8132-dcp";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID; assert(!apple_t8132_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8132_dcp_v27_2(&node));
+    node.uuid_count = 1;
+    node.compat[1] = 0; assert(!apple_t8132_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+    node.compat[1] = 2; assert(apple_t8132_dcp_v27_2(&node));
+    node.clock_ids = false;
+
     dev.hw = &hw;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
     puts("PASS T8122 internal DCP needs its 27.2 image for the 27.2 table");
     puts("PASS T8132 M4 backend only on its firmware path; a T8132 dcpext on the 27.2 image runs the 27.2 table on any board");
+    puts("PASS T8132 internal DCP with the 27.2 image and its firmware-27 clocks runs the 27.2 table; without them nothing changes");
+    puts("PASS T8132 internal DCP on the 27.2 image joins the DRM device on any board; off the M4 path nothing else does");
     return 0;
 }
 '''

@@ -418,6 +418,7 @@ impl Factory {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         }
     }
 
@@ -441,6 +442,7 @@ impl Factory {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         }
     }
 
@@ -466,6 +468,7 @@ impl Factory {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         }
     }
 
@@ -517,6 +520,8 @@ pub(crate) struct Objects {
     error: Option<Error>,
     /// Host-window pages backed by objects.
     pages: usize,
+    /// The charges of private objects sized by the VM's client, held as long as their backing.
+    charges: KVec<crate::memacct::Charge>,
 }
 
 impl Objects {
@@ -539,6 +544,7 @@ impl Objects {
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         })
     }
 
@@ -628,8 +634,25 @@ impl Objects {
         // A firmware-cached record needs a cacheable host view of the same pages (the host and
         // firmware caches are coherent, as for G13-G15 private objects); every other private
         // class keeps its write-combined view.
+        // A client VM's arena is client memory: admitted against, and counted for, its client
+        // instead of the device's kernel total.
+        let client = self
+            .private
+            .as_ref()
+            .and_then(|private| private.vm.as_ref())
+            .and_then(|vm| vm.memory_client());
+        let charge = match client {
+            Some(client) => {
+                self.charges.reserve(1, GFP_KERNEL)?;
+                let commit = crate::memacct::LEDGER.admit(client, bytes as u64)?;
+                Some(crate::memacct::Charge::user(commit, None))
+            }
+            None => None,
+        };
         let mut backing = if req.class == Class::FwCoherent {
             gem::new_kernel_object(&self.dev, bytes)?
+        } else if charge.is_some() {
+            gem::new_kernel_object_wc_user_charged(&self.dev, bytes)?
         } else {
             gem::new_kernel_object_wc(&self.dev, bytes)?
         };
@@ -743,6 +766,13 @@ impl Objects {
             cached_cpu,
         }));
         let _ = self.retained.push_within_capacity(object.clone());
+        // Held only once nothing can fail any more: an earlier error frees the backing, and a
+        // held charge left behind in a container that lives on would count memory that is gone.
+        // `charges` has room reserved; a charge that could not be kept uncharges on drop.
+        if let Some(charge) = charge {
+            charge.set_held(true);
+            let _ = self.charges.push_within_capacity(charge);
+        }
         self.pages += bytes / hw::PAGE as usize;
         Ok(object)
     }

@@ -1845,11 +1845,13 @@ static bool apple_dcp_usable(struct device_node *np)
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
 		dcp_t6041_ext_enabled()) &&
 	       /*
-		* The T8132 main DCP is the M4 backend's, on its 26.6.2
-		* firmware path only (see dcp_check_firmware_version()).
+		* The T8132 main DCP is the M4 backend's on its 26.6.2
+		* firmware path, and the firmware-27 backend's wherever the
+		* boot loader handed it over with the 27.2 image and its
+		* clocks, on any board (see dcp_check_firmware_version()).
 		*/
 	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
-		apple_t8132_firmware_path()) &&
+		apple_t8132_firmware_path() || apple_t8132_dcp_v27_2(np)) &&
 	       /*
 		* A T8132 dcpext the M4 backend adopts is no component: its
 		* outputs are t8132_ext_drm.c's. One on the 27.2 image is a pipe.
@@ -2335,7 +2337,8 @@ static int add_dcp_components(struct device *dev,
 				 * ignore it here.
 				 */
 				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				    of_device_is_compatible(port, "apple,t8122-atcphy") ||
+				    of_device_is_compatible(port, "apple,t8142-atcphy")) {
 					of_node_put(port);
 					continue;
 				}

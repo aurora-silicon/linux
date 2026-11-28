@@ -1,0 +1,38 @@
+name: Apple speaker interlock KUnit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'sound/soc/apple/**'
+      - 'sound/core/control.c'
+      - '.github/workflows/apple-macaudio-kunit.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sound/soc/apple/**'
+      - 'sound/core/control.c'
+      - '.github/workflows/apple-macaudio-kunit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-macaudio-kunit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kunit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          sudo apt-get update -o APT::Update::Error-Mode=any
+          sudo apt-get install -y clang lld llvm libelf-dev libssl-dev flex bison bc qemu-system-arm
+      - name: Run the macaudio suites on arm64 QEMU
+        run: |
+          tools/testing/kunit/kunit.py run --arch=arm64 --make_options LLVM=1 \
+            --kunitconfig=sound/soc/apple/macaudio.kunitconfig \
+            --jobs="$(nproc)" --timeout=180 'apple-speaker-*'

@@ -46,20 +46,26 @@ static int centauri_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(centauri_status);
 
-static void centauri_free_boot(struct centauri *c)
+/* Returns false, with the buffers kept, if the N1's DMA could not be stopped. */
+static bool centauri_free_boot(struct centauri *c)
 {
 	struct device *dev = &c->pdev->dev;
+	bool stopped;
 
 	if (!c->link_ready && c->boot_attempted) {
 		dev_warn(dev, "retaining DMA buffers after failed link transition; reboot required\n");
-		return;
+		return false;
 	}
-	/* Stop device writes before any DMA storage is released. */
-	centauri_free_ipc(c);
+	/* Stop all device writes before any DMA storage is released. */
+	stopped = centauri_stop_ipc(c);
 	if (c->msi_cap)
 		pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
 				      c->msi_original & ~PCI_MSI_FLAGS_ENABLE);
-	pci_clear_master(c->pdev);
+	if (!centauri_stop_dma(c->pdev) || !stopped) {
+		dev_err(dev, "retaining DMA buffers: the N1's DMA did not stop\n");
+		return false;
+	}
+	centauri_free_ipc(c);
 	if (c->firmware)
 		dma_free_coherent(dev, c->firmware_size, c->firmware, c->firmware_dma);
 	if (c->descriptor)
@@ -67,6 +73,7 @@ static void centauri_free_boot(struct centauri *c)
 	if (c->msi_page)
 		dma_free_coherent(dev, SZ_16K, c->msi_page, c->msi_dma);
 	c->firmware = c->descriptor = c->msi_page = NULL;
+	return true;
 }
 
 static int centauri_rom_boot(struct centauri *c)
@@ -187,7 +194,9 @@ static int centauri_recover(struct centauri *c)
 	if (beta)
 		device_release_driver(&beta->dev);
 	pci_dev_put(beta);
-	centauri_free_boot(c);
+	/* Nothing is reset while the firmware's buffers are still its own. */
+	if (!centauri_free_boot(c))
+		return -EBUSY;
 	/*
 	 * The warm reset puts the chip back in its single-function ROM personality and wipes
 	 * functions 1 and 2. Remove them now; the IPC start's rescan adds them again, as at
@@ -488,9 +497,10 @@ static int centauri_resume(struct device *dev)
 
 static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, centauri_resume);
 
-/* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver needs functions
- * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and reaches function 2 only
- * through config space and its struct device for DMA.
+/* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver binds functions
+ * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and enables function 2's
+ * memory space during IPC bootstrap so centauri_beta_running() can poll Beta's BAR0 safely
+ * even when btcentauri has not probed yet.
  */
 static const struct pci_device_id centauri_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900), .driver_data = 0x8000 },

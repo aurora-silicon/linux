@@ -239,7 +239,6 @@
 		/* No DART gate in the ADT: powered with its engine. */
 		power-domains = <&ps_msr>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	/*
@@ -649,7 +648,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "msr";
-		status = "disabled";
 	};
 	ps_msr_ase_core: power-controller@320 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -658,7 +656,6 @@
 		#reset-cells = <0>;
 		label = "msr-ase-core";
 		power-domains = <&ps_msr>;
-		status = "disabled";
 	};
 
 	/*
@@ -864,7 +861,6 @@
 		clocks = <&peripheral_clocks 399>;
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
 		resets = <&ps_msr>;
-		status = "disabled";
 	};
 };
 

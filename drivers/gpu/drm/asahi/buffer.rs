@@ -294,6 +294,18 @@ impl SceneG14V13_5 {
     pub(crate) fn render_addresses(&self) -> (u64, u64) {
         self.object.with(|raw, _| (raw.user_buffer.or(0).into(), raw.stats.into()))
     }
+
+    /// Zeroes the first `bytes` of the Tail Pointer Cache, so that a fragment pass run after
+    /// a firmware recovery stopped its tiler finds no tiles.
+    ///
+    /// # Safety
+    ///
+    /// The GPU must not access the TPC during the call (its tiler is stopped and no other
+    /// render using this buffer is in flight), and no CPU reference into it may be live.
+    pub(crate) unsafe fn clear_tpc(&self, bytes: usize) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.object.tpc.zero_prefix(bytes) }
+    }
 }
 
 /// Host-owned parameter-buffer inputs that persist across firmware submissions.
@@ -882,7 +894,7 @@ impl BufferManager::ver {
     pub(crate) fn grow(&self, slot: u32) {
         match self
             .0
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| crate::event::slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 pr_err!(

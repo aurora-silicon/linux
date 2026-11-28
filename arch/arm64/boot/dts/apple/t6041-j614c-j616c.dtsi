@@ -1689,6 +1689,10 @@
 
 	multi-touch {
 		apple,power-method = <2>;
+		/* Fingers reach a tool area of about 1010 (J616c records). */
+		apple,palm-classes;
+		apple,palm-class-tool-major = <1400>;
+		apple,palm-tool-major = <2200>;
 	};
 
 	keyboard: keyboard {
@@ -1891,6 +1895,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec0: connector {
 			compatible = "usb-c-connector";
@@ -1929,6 +1934,7 @@
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 	};
 
 	hpm1: usb-pd@a {
@@ -1940,6 +1946,7 @@
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1981,6 +1988,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec2: connector {
 			compatible = "usb-c-connector";
