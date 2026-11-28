@@ -2299,8 +2299,30 @@ static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const cha
 	return false;
 }
 
+/*
+ * The T6050 internal DCP (hw.only_120hz_modes) can't survive a mode set away
+ * from the timing iBoot left the panel at: 120 -> 60 Hz crashes it, and so does
+ * 60 -> 120 Hz when macOS left the panel at 60 Hz.  The firmware names that
+ * rate when it starts, "IOMFB update_rr_index syncrate 60", before any mode set
+ * of ours: keep the first one (dcp_mode_settable()).
+ */
+static void dcp_rtk_syslog_boot_rate(struct apple_dcp *dcp, const char *message)
+{
+	const char *p;
+	u32 rate;
+
+	if (!dcp->hw.only_120hz_modes || READ_ONCE(dcp->boot_rate))
+		return;
+	p = strstr(message, "update_rr_index syncrate ");
+	if (!p || sscanf(p, "update_rr_index syncrate %u", &rate) != 1)
+		return;
+	if (rate >= 24 && rate <= 240)
+		WRITE_ONCE(dcp->boot_rate, rate);
+}
+
 static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
 {
+	dcp_rtk_syslog_boot_rate(cookie, message);
 	return dcp_h17p_syslog_is_debug(context, message);
 }
 
