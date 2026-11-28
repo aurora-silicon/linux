@@ -152,11 +152,13 @@ int main(void) {
     puts("PASS enabled output pins power; repeated apply/get_state do not leak");
     state.duty_cycle = 0;
     assert(!apple_pwm_apply(&chip, &pwm, &state));
-    assert(pdev.dev.active && pdev.dev.refs == 1);
+    assert(!pdev.dev.active && !pdev.dev.refs && !clock_model.refs);
     assert(!apple_pwm_get_state(&chip, &pwm, &got) && got.enabled && !got.duty_cycle);
+    assert(!pdev.dev.active && !pdev.dev.refs && !clock_model.refs);
     state.duty_cycle = 10000;
     assert(!apple_pwm_apply(&chip, &pwm, &state));
-    puts("PASS enabled zero-duty output remains powered");
+    assert(pdev.dev.active && pdev.dev.refs == 1 && clock_model.refs == 1);
+    puts("PASS enabled zero-duty output suspends and resumes cleanly");
     state.enabled = false;
     assert(!apple_pwm_apply(&chip, &pwm, &state));
     assert(!pdev.dev.active && !pdev.dev.refs && !clock_model.refs);
@@ -216,9 +218,9 @@ def main():
     args = parser.parse_args()
     source = (ROOT / 'drivers/pwm/pwm-apple.c').read_text()
     if args.negative_control:
-        old = '\tif (state->enabled && !fpwm->enabled)\n\t\tpm_runtime_get_noresume(dev);'
+        old = '\tif (driving && !fpwm->enabled)\n\t\tpm_runtime_get_noresume(dev);'
         assert old in source
-        source = source.replace(old, '\tif (state->enabled && !fpwm->enabled)\n\t\t; /* missing output reference */', 1)
+        source = source.replace(old, '\tif (driving && !fpwm->enabled)\n\t\t; /* missing output reference */', 1)
     defines = '\n'.join(re.findall(r'^#define APPLE_PWM_.*$', source, re.M))
     struct = re.search(r'struct apple_pwm \{.*?\n\};', source, re.S).group()
     callbacks = '\n'.join(function(source, name) for name in (
