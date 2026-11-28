@@ -434,12 +434,13 @@ impl BootJob {
             for off in (0..size).step_by(8) { map.try_write64(0, off)?; }
             // CDM control stream: one Stream Terminate block (block type 2 in bits 31:29).
             map.try_write32(0x4000_0000, preempt1 + 0x2000)?;
+            crate::pgtable::clean_poc(map.addr.cast(), size);
         }
         let mapping = object.map_at(uat.kernel_lower_vm(), client_va, mmu::PROT_GPU_SHARED_RW, false)?;
         let timestamps = alloc.shared.array_empty::<u8>(0x80)?;
 
         let mut owners = KVec::new();
-        for owner in [&queue_stamps, &pointers, &scheduler] {
+        for owner in [&positions, &queue_stamps, &pointers, &scheduler, &cursor, &timestamps] {
             crate::pgtable::clean_poc(owner.as_slice().as_ptr(), owner.as_slice().len());
         }
         for owner in [queue_stamps, scheduler, cursor] {
@@ -686,6 +687,14 @@ impl RootV27_2 {
         Ok(a.shared_index(at)?.load(Ordering::Acquire))
     }
 
+    /// Fetches a firmware-written word through the CPU-cached mapping.
+    fn firmware_word(a: &fw::types::GpuArray<u8>, at: usize) -> Result<u32> {
+        let word = a.shared_index(at)?;
+        crate::pgtable::clean_invalidate_poc(core::ptr::from_ref(word).cast(), 4);
+        crate::pgtable::poc_barrier();
+        Ok(word.load(Ordering::Acquire))
+    }
+
     /// The queue's identity for client commands, and the stamp value it last reached.
     pub(crate) fn queue(&self) -> (QueueInfo, event::EventValue) {
         (self.boot.info(self.compute_state), self.boot.event.current_noncoherent())
@@ -851,16 +860,22 @@ impl RootV27_2 {
             || !self.commands_installed()? {
             return Err(EAGAIN);
         }
-        let producer = self.channels[2 * SUBMISSION_RING].shared_index(0x20)?;
+        let indices = &self.channels[2 * SUBMISSION_RING];
+        crate::pgtable::clean_invalidate_poc(indices.as_slice().as_ptr(), 0x30);
+        crate::pgtable::clean_invalidate_poc(job.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        let producer = indices.shared_index(0x20)?;
         let head = job.positions.shared_index(0x40)?;
-        if Self::word(&self.status, 0x14)? != 1 || producer.load(Ordering::Acquire) != 0
+        if !self.initialized()? || producer.load(Ordering::Acquire) != 0
             || head.load(Ordering::Acquire) != 0 {
             return Err(EAGAIN);
         }
         crate::pgtable::poc_barrier();
         head.store(1, Ordering::Release);
+        crate::pgtable::clean_poc(job.positions.as_slice()[0x40..].as_ptr(), 4);
         crate::pgtable::poc_barrier();
         producer.store(1, Ordering::Release);
+        crate::pgtable::clean_poc(indices.as_slice()[0x20..].as_ptr(), 4);
         crate::pgtable::poc_barrier();
         Ok(())
     }
@@ -869,7 +884,9 @@ impl RootV27_2 {
     pub(crate) fn boot_job_complete(&self) -> Result<bool> {
         self.drain()?;
         let job = &self.boot;
-        Ok(Self::word(&self.channels[2 * SUBMISSION_RING], 0)? == 1
+        crate::pgtable::clean_invalidate_poc(job.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok(Self::firmware_word(&self.channels[2 * SUBMISSION_RING], 0)? == 1
             && Self::word(&job.positions, 0x30)? == 1
             && Self::word(&job.positions, 0)? == 1
             && job.event.current_noncoherent().raw() == job.expected_stamp)
@@ -990,10 +1007,13 @@ impl RootV27_2 {
     /// Drain the telemetry rings. The event ring is consumed separately after servicing each event.
     pub(crate) fn drain(&self) -> Result {
         let consume = |state: &fw::types::GpuArray<u8>, base: usize, records: u32| -> Result {
+            crate::pgtable::clean_invalidate_poc(state.as_slice()[base..].as_ptr(), 0x30);
+            crate::pgtable::poc_barrier();
             let write = Self::word(state, base + 0x20)?;
             let read = state.shared_index(base)?;
             if write < records && read.load(Ordering::Acquire) != write {
                 read.store(write, Ordering::Release);
+                crate::pgtable::clean_poc(state.as_slice()[base..].as_ptr(), 4);
                 crate::pgtable::poc_barrier();
             }
             Ok(())
@@ -1008,12 +1028,12 @@ impl RootV27_2 {
 
     /// Shared status +0x14: the firmware sets it to 1 once it has initialized.
     pub(crate) fn initialized(&self) -> Result<bool> {
-        Ok(Self::word(&self.status, 0x14)? == 1)
+        Ok(Self::firmware_word(&self.status, 0x14)? == 1)
     }
 
     /// Shared status +0x10: nonzero while the firmware reports itself running.
     pub(crate) fn firmware_running(&self) -> Result<u32> {
-        Self::word(&self.status, 0x10)
+        Self::firmware_word(&self.status, 0x10)
     }
 
     /// Whether the machine's DT/ADT supplied the GPU power-controller tuning parameters.
@@ -1025,17 +1045,19 @@ impl RootV27_2 {
     /// request (+0x4c24), which the root sets, once powered initialization has copied them.
     /// Engine entries may be published only after that.
     pub(crate) fn commands_installed(&self) -> Result<bool> {
-        Ok(Self::word(&self.control, 0x4c24)? == 0)
+        Ok(Self::firmware_word(&self.control, 0x4c24)? == 0)
     }
 
     pub(crate) fn idle_acknowledgement(&self) -> Result<u32> {
-        Self::word(&self.control, 0xe838)
+        Self::firmware_word(&self.control, 0xe838)
     }
 
     /// Device-control ring consumer, target and producer.
     pub(crate) fn idle_progress(&self) -> Result<[u32; 3]> {
         self.drain()?;
         let ring = &self.channels[2 * crate::m3::DEVICE_CONTROL];
+        crate::pgtable::clean_invalidate_poc(ring.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
         Ok([Self::word(ring, 0)?, Self::word(ring, 0x10)?, Self::word(ring, 0x20)?])
     }
 
@@ -1043,8 +1065,9 @@ impl RootV27_2 {
     pub(crate) fn publish_idle_policy(&self, allow_off: bool) -> Result<(u32, u32)> {
         let host = self.globals.shared_index(0xe40)?;
         let firmware = self.idle_acknowledgement()?;
-        let producer = self.channels[2 * crate::m3::DEVICE_CONTROL].shared_index(0x20)?;
-        if Self::word(&self.status, 0x14)? != 1 { return Err(EAGAIN); }
+        let state = &self.channels[2 * crate::m3::DEVICE_CONTROL];
+        let producer = state.shared_index(0x20)?;
+        if !self.initialized()? { return Err(EAGAIN); }
         let cursor = crate::m3::idle_cursor(self.idle_progress()?).map_err(|_| EBUSY)?;
         let action = crate::m3::Action::Idle { enabled: allow_off };
         let generation = action.generation(host.load(Ordering::Acquire), firmware).map_err(|_| EOVERFLOW)?;
@@ -1058,9 +1081,11 @@ impl RootV27_2 {
         }
         crate::pgtable::clean_poc(ring.as_slice()[at..].as_ptr(), record.len());
         host.store(generation, Ordering::Release);
+        crate::pgtable::clean_poc(self.globals.as_slice()[0xe40..].as_ptr(), 4);
         crate::pgtable::poc_barrier();
         let next = (cursor + 1) % RING_RECORDS;
         producer.store(next, Ordering::Release);
+        crate::pgtable::clean_poc(state.as_slice()[0x20..].as_ptr(), 4);
         crate::pgtable::poc_barrier();
         Ok((next, generation))
     }
@@ -1354,6 +1379,10 @@ impl RootV27_2 {
         let low = base.buffer_mgr_ctl_low_mapping.as_ref().ok_or(EINVAL)?;
         let high = base.buffer_mgr_ctl_high_mapping.as_ref().ok_or(EINVAL)?;
         if low.translate_offset(0)? != high.translate_offset(0)? { return Err(EINVAL); }
+        // The legacy graph zeroed this shared backing through a CPU-cached GEM mapping.
+        // Both directory aliases must see those zeros before the parameter manager starts.
+        let buffer_control = base.buffer_mgr_ctl.gem.vmap::<0>()?;
+        crate::pgtable::clean_poc(buffer_control.addr.cast(), base.buffer_mgr_ctl.size());
         put64(bytes, 0x2e0, low.iova());
         put64(bytes, 0x2e8, high.iova());
         bytes[0x3e4] = 0xff;
@@ -1526,6 +1555,15 @@ impl RootV27_2 {
             },
         )?;
         root.with(|r, _| crate::pgtable::clean_poc(core::ptr::from_ref(r).cast(), core::mem::size_of_val(r)));
+        // Publish all initialized and zero-filled children before the coprocessor starts.
+        // Cleaning only the root pointers leaves dirty CPU lines hiding their contents.
+        for owner in [&root.control, &root.status, &root.boot_page, &root.extra] {
+            crate::pgtable::clean_poc(owner.as_slice().as_ptr(), owner.as_slice().len());
+        }
+        for owner in Iterator::chain(root.channels.iter(), root._owners.iter()) {
+            crate::pgtable::clean_poc(owner.as_slice().as_ptr(), owner.as_slice().len());
+        }
+        crate::pgtable::poc_barrier();
         Ok(root)
     }
 
