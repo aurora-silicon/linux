@@ -7,6 +7,8 @@ struct device;
 
 int asahi_sleep_pd_init(struct device *dev);
 int asahi_sleep_pd_suspend_noirq(struct device *dev);
+int asahi_sleep_pd_suspend_noirq_hold(struct device *dev, bool hold_firmware);
 int asahi_sleep_pd_resume_noirq(struct device *dev);
+int asahi_sleep_pd_domain_set(struct device *dev, bool on);
 
 #endif

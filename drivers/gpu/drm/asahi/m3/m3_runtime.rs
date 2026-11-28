@@ -98,6 +98,8 @@ struct Inner {
     pass_cost: policy::PassCosts,
     /// Latched only after the isolated InitBM draw fully retired.
     render_initialized: bool,
+    /// Blocks new publication while a system sleep is preparing or active.
+    asleep: bool,
     config: Config,
     uat: mmu::Uat,
     /// The firmware's view of the host window (the shared L2 the firmware walks), kept in step
@@ -613,6 +615,7 @@ impl Inner {
     /// Publish pending batches while allowed: one when none is active, more behind it with
     /// asahi.m3_pipeline_depth > 1. Returns whether anything was published or failed.
     fn publish_next(&mut self)->bool {
+        if self.asleep { return false; }
         let mut progress=false;
         while !self.pending.is_empty() && self.state.healthy() {
             while let Some((packet,_))=self.pending.first() {
@@ -1441,7 +1444,7 @@ impl Runtime {
             quarantined_packets:KVec::new(),quarantine_budget:crate::m3::m3_recovery::QuarantineBudget::new(crate::m3::m3_recovery::QUARANTINE_LIMIT),
             recovery_window_ns:0,recovery_window_count:0,recoveries:0,
             gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,asleep:false,t8122_verdict:false,
             boot_step:crate::m3::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }
@@ -1516,6 +1519,10 @@ impl Runtime {
     /// the next one. The worker drops the runtime lock between steps.
     pub(crate) fn service_job(&mut self)->Service {
         let chip=self.inner.device.soc().chip_id;
+        if self.inner.asleep && self.inner.active.is_empty() {
+            let _=self.inner.config.performance_request(chip,false);
+            return Service::Idle;
+        }
         let busy=self.inner.state.healthy() &&
             (!self.inner.active.is_empty() || !self.inner.pending.is_empty());
         if let Err(error)=self.inner.config.performance_request(chip,busy) {
@@ -1528,6 +1535,144 @@ impl Runtime {
             let _=self.inner.config.performance_request(chip,false);
         }
         result
+    }
+
+    pub(crate) fn completion(&self) -> Option<Arc<crate::m3::m3_completion::Completion>> {
+        self.inner.state.completion.as_ref().cloned()
+    }
+
+    pub(crate) fn completion_paused(&self) -> bool {
+        self.inner.state.completion_paused()
+    }
+
+    pub(crate) fn set_completion_paused(&self, paused: bool) {
+        self.inner.state.set_completion_paused(paused);
+    }
+
+    pub(crate) fn sleep_hold(&mut self) -> Result {
+        if self.inner.fault_captured || !self.inner.state.healthy() {
+            return Err(EIO);
+        }
+        self.inner.asleep = true;
+        Ok(())
+    }
+
+    pub(crate) fn sleep_unhold(&mut self) {
+        self.inner.asleep = false;
+        self.inner.state.set_completion_paused(false);
+        crate::m3::m3_completion::queue(&self.inner.state);
+    }
+
+    pub(crate) fn sleep_is_quiet(&mut self) -> Result<bool> {
+        let inner: &mut Inner = &mut *self.inner;
+        if inner.fault_captured || !inner.state.healthy() {
+            return Err(EIO);
+        }
+        if !inner.active.is_empty() {
+            return Ok(false);
+        }
+        inner.config.drain(&inner.drm)?;
+        if let Some(error) = inner.config.take_recovery_trigger()? {
+            inner.capture_fault(error);
+            inner.fail_pending(EIO);
+            return Err(EIO);
+        }
+        if inner.device.firmware().profile() == super::m3_profile::Profile::Extended {
+            if inner.config.recovery_phase()? != 0 {
+                return Ok(false);
+            }
+        }
+        if !inner.device.asc_running()? {
+            return Err(EIO);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn sleep_rtkit_raw(&self) -> *mut kernel::bindings::apple_rtkit {
+        self.inner.transport.as_raw()
+    }
+
+    pub(crate) fn sleep_suspend(&mut self) -> Result {
+        let inner: &mut Inner = &mut *self.inner;
+        let started = Instant::<Monotonic>::now();
+        let _ = inner.config.performance_request(inner.device.soc().chip_id, false);
+        let idle_start = Instant::<Monotonic>::now();
+        let idle_res = Pin::new(&mut inner.transport).idle();
+        let idle_us = idle_start.elapsed().as_micros_ceil();
+        if let Err(error) = idle_res {
+            dev_warn!(
+                inner.drm.as_ref(),
+                "M3 GPU: RTKit idle failed ({:?}) after {} us; stopping ASC directly\n",
+                error,
+                idle_us
+            );
+        } else {
+            let status = inner.device.wait_asc_idle().unwrap_or(0);
+            dev_info!(
+                inner.drm.as_ref(),
+                "M3 GPU: RTKit idle acknowledged in {} us (status={:#x})\n",
+                idle_us,
+                status
+            );
+        }
+        // SAFETY: `transport` is live; detaches RX and drains its workqueue before stopping ASC.
+        unsafe { kernel::bindings::apple_rtkit_mailbox_off(inner.transport.as_raw()) };
+        inner.device.stop_asc()?;
+        // SAFETY: PMP is still live during `.suspend()` because probe linked PMP as supplier.
+        kernel::error::to_result(unsafe {
+            kernel::bindings::apple_pmp_set_device_power(0x0f, 5, 0)
+        })?;
+        dev_info!(
+            inner.drm.as_ref(),
+            "M3 GPU: stopped and released PMP GPU device 5 in {} us\n",
+            started.elapsed().as_micros_ceil()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn sleep_warm_restart(&mut self) -> Result {
+        let inner: &mut Inner = &mut *self.inner;
+        inner.device.restore_sgx_setup().inspect_err(|e| {
+            dev_err!(inner.drm.as_ref(), "M3 GPU: restore_sgx_setup failed: {:?}\n", e);
+        })?;
+        Pin::new(&mut inner.transport).warm_restart().inspect_err(|e| {
+            dev_err!(inner.drm.as_ref(), "M3 GPU: warm_restart failed: {:?}\n", e);
+        })?;
+        if let Ok((ctrl, status)) = inner.device.asc_regs() {
+            dev_info!(
+                inner.drm.as_ref(),
+                "M3 GPU: ASC before restart: ctrl={:#x} status={:#x}\n",
+                ctrl,
+                status
+            );
+        }
+        inner.device.restart_asc().inspect_err(|e| {
+            dev_err!(inner.drm.as_ref(), "M3 GPU: restart_asc failed: {:?}\n", e);
+        })?;
+        Pin::new(&mut inner.transport).boot().inspect_err(|e| {
+            dev_err!(inner.drm.as_ref(), "M3 GPU: RTKit boot after warm restart failed: {:?}\n", e);
+        })?;
+        inner.config.reset_recovery_gen();
+        let healthy = inner.state.healthy();
+        let running = Pin::new(&inner.transport).is_running();
+        if !healthy || !running {
+            dev_err!(
+                inner.drm.as_ref(),
+                "M3 GPU: post-restart state unhealthy (healthy={} running={})\n",
+                healthy,
+                running
+            );
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sleep_fail(&mut self, error: Error) {
+        self.inner.asleep = false;
+        self.inner.state.set_completion_paused(false);
+        self.inner.state.health.mark_failed();
+        self.inner.fail_active(error);
+        self.inner.fail_pending(error);
     }
     fn service_job_inner(&mut self)->Service {
         let inner: &mut Inner=&mut *self.inner;

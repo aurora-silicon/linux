@@ -273,14 +273,17 @@ unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverD
 unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
     // SAFETY: Called by the PM core.
     let data = unsafe { sleep_data(dev) };
+    // SAFETY: Reads a global flag word.
+    let deep = unsafe { bindings::pm_suspend_via_firmware() };
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     if let Some(backend) = data.g14_v27_2.as_ref() {
-        // SAFETY: Reads a global flag word.
-        let deep = unsafe { bindings::pm_suspend_via_firmware() };
         return kernel::error::from_result(|| backend.sleep_prepare(deep).map(|_| 0));
     }
-    // SAFETY: Reads a global flag word.
-    if !unsafe { bindings::pm_suspend_via_firmware() } {
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    if let Some(backend) = data.m3.as_ref() {
+        return kernel::error::from_result(|| backend.sleep_prepare(deep).map(|_| 0));
+    }
+    if !deep {
         return 0;
     }
     match data.g17.as_ref() {
@@ -289,9 +292,24 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
     }
 }
 
+/// Suspends backends that stop their coprocessor before platform power suppliers suspend.
+unsafe extern "C" fn sleep_suspend(dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core.
+    let data = unsafe { sleep_data(dev) };
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    if let Some(backend) = data.m3.as_ref() {
+        return kernel::error::from_result(|| backend.sleep_suspend().map(|_| 0));
+    }
+    0
+}
+
 extern "C" {
     fn asahi_sleep_pd_init(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_sleep_pd_suspend_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_sleep_pd_suspend_noirq_hold(
+        dev: *mut core::ffi::c_void,
+        hold_firmware: bool,
+    ) -> core::ffi::c_int;
     fn asahi_sleep_pd_resume_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
 }
 
@@ -301,12 +319,31 @@ fn sleep_pd_init(dev: &kernel::device::Device<Core<'_>>) -> Result {
     kernel::error::to_result(unsafe { asahi_sleep_pd_init(dev.as_raw().cast()) })
 }
 
-/// Holds the GPU's attached power domain across suspend-to-idle while its firmware stays live.
+/// Holds the GPU's attached power domain across suspend_noirq while its firmware stays live.
 pub(crate) unsafe extern "C" fn sleep_suspend_noirq(
     dev: *mut bindings::device,
 ) -> core::ffi::c_int {
     // SAFETY: Called by the PM core with a bound GPU device.
     unsafe { asahi_sleep_pd_suspend_noirq(dev.cast()) }
+}
+
+/// Holds the GPU's attached power domain across suspend_noirq, including firmware-driven sleep
+/// when a backend stops its coprocessor at commit time rather than in `prepare`.
+unsafe extern "C" fn sleep_suspend_noirq_driver(
+    dev: *mut bindings::device,
+) -> core::ffi::c_int {
+    #[allow(unused_mut)]
+    let mut hold_firmware = false;
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    {
+        // SAFETY: Called by the PM core with a bound GPU device.
+        let data = unsafe { sleep_data(dev) };
+        if let Some(backend) = data.m3.as_ref() {
+            hold_firmware = backend.holds_pd_in_firmware_sleep();
+        }
+    }
+    // SAFETY: Called by the PM core with a bound GPU device.
+    unsafe { asahi_sleep_pd_suspend_noirq_hold(dev.cast(), hold_firmware) }
 }
 
 /// Releases any suspend-to-idle power-domain hold taken by [`sleep_suspend_noirq`].
@@ -325,6 +362,10 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
     if let Some(backend) = data.g14_v27_2.as_ref() {
         backend.sleep_complete();
     }
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    if let Some(backend) = data.m3.as_ref() {
+        backend.sleep_complete();
+    }
     if let Some(gpu) = data.g17.as_ref() {
         gpu.sleep_complete();
     }
@@ -333,7 +374,8 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
-    suspend_noirq: Some(sleep_suspend_noirq),
+    suspend: Some(sleep_suspend),
+    suspend_noirq: Some(sleep_suspend_noirq_driver),
     resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
