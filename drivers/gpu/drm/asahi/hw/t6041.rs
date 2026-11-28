@@ -96,18 +96,35 @@ const BUILDS: [fw::variant::Build; 5] = [
 pub(super) const BUILD_26B123: fw::variant::Build = fw::variant::Build {
     os_version: [27, 2, 0],
     name: "macOS 27.2 (26B123, iBoot mBoot-20457.41.3)",
-    images: &[crate::fwid::FirmwareBuild {
-        name: "Apple GFX 26B123 for T6041 (normalized loaded image)",
-        text_size: 0x64000,
-        data_size: 0xcc000,
-        entropy: &[[0x5d88c, 0x5d96f]],
-        boot_filled: &[],
-        text_sha256: [
-            0xcc, 0x4c, 0xb8, 0x28, 0x54, 0x6d, 0x5e, 0xc6, 0x39, 0xfa, 0x14, 0xc1, 0xcc, 0x6c,
-            0xef, 0xc7, 0x27, 0x40, 0x40, 0xfd, 0xbd, 0x5c, 0xb5, 0xa6, 0xec, 0xc4, 0x38, 0xb0,
-            0x3c, 0x84, 0x90, 0x3b,
-        ],
-    }],
+    // iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
+    // measurement: the 40-core J616C's, and the 32-core J616C's (Mac16,5), measured on
+    // two boots of a 26B123 stub under system firmware 27.2.
+    images: &[
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 26B123 for T6041 (normalized loaded image)",
+            text_size: 0x64000,
+            data_size: 0xcc000,
+            entropy: &[[0x5d88c, 0x5d96f]],
+            boot_filled: &[],
+            text_sha256: [
+                0xcc, 0x4c, 0xb8, 0x28, 0x54, 0x6d, 0x5e, 0xc6, 0x39, 0xfa, 0x14, 0xc1, 0xcc, 0x6c,
+                0xef, 0xc7, 0x27, 0x40, 0x40, 0xfd, 0xbd, 0x5c, 0xb5, 0xa6, 0xec, 0xc4, 0x38, 0xb0,
+                0x3c, 0x84, 0x90, 0x3b,
+            ],
+        },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 26B123 for T6041 (normalized loaded image, 32-core J616C)",
+            text_size: 0x64000,
+            data_size: 0xcc000,
+            entropy: &[[0x5d88c, 0x5d96f]],
+            boot_filled: &[],
+            text_sha256: [
+                0xc6, 0x5e, 0x9d, 0x34, 0xde, 0x7f, 0xa3, 0x30, 0x1a, 0x7e, 0x22, 0x44, 0xe5, 0x5a,
+                0x96, 0xba, 0x79, 0x50, 0x84, 0x0c, 0x1f, 0x38, 0xdb, 0x7c, 0x2f, 0xa5, 0x00, 0x8e,
+                0x91, 0x6e, 0x29, 0xdd,
+            ],
+        },
+    ],
     variant: &fw::variant::Variant {
         ta_mode_1: true,
         render_id_at_create: true,
