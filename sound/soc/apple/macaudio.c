@@ -3995,8 +3995,13 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	mutex_unlock(&ma->volume_lock_mutex);
 }
 
-/* The speaker controls go last: a card without speakers drops them. */
-#define MACAUDIO_NUM_SPEAKER_CONTROLS 4
+/*
+ * The speaker controls go last: a card without speakers drops them. The
+ * controls before them are the ones every card has; the platform probe
+ * checks at build time that the two counts add up to the array.
+ */
+#define MACAUDIO_NUM_COMMON_CONTROLS 3
+#define MACAUDIO_NUM_SPEAKER_CONTROLS 5
 
 /*
  * "Speaker Protection Sleeps": how many system sleeps have begun since the
@@ -4035,6 +4040,7 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Speaker"),
 	SOC_DAPM_PIN_SWITCH("Headphone"),
 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
+	/* Speaker-only from here (MACAUDIO_NUM_SPEAKER_CONTROLS) */
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.access = SNDRV_CTL_ELEM_ACCESS_READ |
@@ -4698,6 +4704,9 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		card->num_dapm_routes--;
 
 	/* Admitted speakers always have a safe level (macaudio_speakers_allowed()) */
+	/* A speaker control added or removed without its count fails here */
+	BUILD_BUG_ON(ARRAY_SIZE(macaudio_controls) !=
+		     MACAUDIO_NUM_COMMON_CONTROLS + MACAUDIO_NUM_SPEAKER_CONTROLS);
 	if (!data->has_speakers) {
 		card->num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
 	} else {
