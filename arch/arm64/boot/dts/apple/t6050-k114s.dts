@@ -60,3 +60,51 @@
  */
 #include "t6050-k114-k116-usb.dtsi"
 #include "t6050-k114-usb.dtsi"
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the K116s and the J714s: iBoot loads its
+ * firmware and the driver starts it with these boot arguments and the firmware properties in
+ * the tunables file. Its report tells it which devices are on; the PMC honours its votes next
+ * to the CLPC.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* ADT /chosen board-id, dram-vendor-id */
+	apple,board-id = <20>;
+	apple,dram-vendor-id = <1>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+#include "t6050-k114s-pmp-tunables.dtsi"
