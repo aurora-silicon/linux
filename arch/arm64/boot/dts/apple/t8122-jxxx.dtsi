@@ -14,6 +14,7 @@
 		atcphy0 = &atcphy0;
 		atcphy1 = &atcphy1;
 		bluetooth0 = &bluetooth0;
+		dcpext = &dcpext;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 
@@ -257,11 +258,92 @@
 
 #include "spi1-nvram.dtsi"
 
-/* Panel control remains firmware-owned until the host transport is supported. */
+/*
+ * The DP855 panel timing controller. i2c-dp855 reads the panel management
+ * devices behind it and shares its I2C engine with the display firmware
+ * through the controller's lock. Every T8122 board's ADT has the controller
+ * at /arm-io/spi4/dp855, with the chip select at /arm-io/spi4
+ * function-spi_cs0: GPIO 136 on gpio0 (J613, J615, J504, J433 and J434).
+ */
 &spi4 {
+	cs-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
 	tcon: panel-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;
-		status = "disabled";
+		spi-max-frequency = <1000000>;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+	};
+};
+
+/*
+ * One external display on either USB-C port: dcpext is crossbar state 2 of
+ * each ATC and its DPTX target is the ATC index. The display gate enables it
+ * and the routes once the boot loader has readied its firmware.
+ */
+&dcpext {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
+	mux-control-names = "typec0", "typec1";
+	apple,typec-mux-indices = <2 2>;
+	apple,typec-dptx-phys = <0 1>;
+	/* RTKit quirks of AsahiLinux/linux#607 (syslog/ioreport acks, kdebug). */
+	apple,sync-syslog-ack;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec0_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec1_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec1>;
+			};
+		};
 	};
 };

@@ -54,6 +54,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_disp_cpu>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		status = "disabled";
 	};
@@ -64,6 +65,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_disp_cpu>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		status = "disabled";
 	};
@@ -85,6 +87,8 @@
 		      <0x2 0x8e850000 0x0 0x4000>;
 		power-domains = <&ps_disp_cpu>;
 		clocks = <&clk_disp0>;
+		/* Display bandwidth request slot in the disp-5 window. */
+		apple,bw-scratch = <&pmgr_dcp 0 5 0x988>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
@@ -93,6 +97,12 @@
 		disp0_piodma: piodma {
 			iommus = <&disp0_dart 4>;
 		};
+	};
+
+	pmgr_dcp: power-management@3503d0000 {
+		reg = <0x3 0x503d0000 0x0 0x4000>;
+		reg-names = "dcp-fw-pmgr";
+		#apple,bw-scratch-cells = <3>;
 	};
 
 	dcpext_dart: iommu@2d130c000 {

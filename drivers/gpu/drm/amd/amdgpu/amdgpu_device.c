@@ -2561,7 +2561,8 @@ init_failed:
  */
 static void amdgpu_device_fill_reset_magic(struct amdgpu_device *adev)
 {
-	memcpy(adev->reset_magic, adev->gart.ptr, AMDGPU_RESET_MAGIC_NUM);
+	amdgpu_bo_memcpy_from(adev->gart.bo, adev->reset_magic, adev->gart.ptr,
+			      AMDGPU_RESET_MAGIC_NUM);
 }
 
 /**
@@ -2576,8 +2577,11 @@ static void amdgpu_device_fill_reset_magic(struct amdgpu_device *adev)
  */
 static bool amdgpu_device_check_vram_lost(struct amdgpu_device *adev)
 {
-	if (memcmp(adev->gart.ptr, adev->reset_magic,
-			AMDGPU_RESET_MAGIC_NUM))
+	u8 magic[AMDGPU_RESET_MAGIC_NUM];
+
+	amdgpu_bo_memcpy_from(adev->gart.bo, magic, adev->gart.ptr,
+			      AMDGPU_RESET_MAGIC_NUM);
+	if (memcmp(magic, adev->reset_magic, AMDGPU_RESET_MAGIC_NUM))
 		return true;
 
 	if (!amdgpu_in_reset(adev))

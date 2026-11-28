@@ -397,7 +397,8 @@ static bool apple_dart_cio_atc_port(struct apple_dart *dart)
 {
 	struct device_node *parent = dart->dev->of_node->parent;
 
-	return parent && of_machine_is_compatible("apple,j714s") &&
+	return parent && (of_machine_is_compatible("apple,j714s") ||
+			  of_machine_is_compatible("apple,j716c")) &&
 	       (of_device_is_compatible(parent, "apple,t6050-usb4-acio") ||
 		of_node_name_prefix(parent, "pcie-tunnel-"));
 }

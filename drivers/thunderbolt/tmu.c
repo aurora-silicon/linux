@@ -720,6 +720,15 @@ static int tb_switch_tmu_enable_bidirectional(struct tb_switch *sw)
 	up = tb_upstream_port(sw);
 	down = tb_switch_downstream_port(sw);
 
+	/* The host's way: time sync off, on again below (see tb_switch_tmu_enable_enhanced()). */
+	if (tb_switch_tmu_host_managed(sw)) {
+		ret = tb_port_tmu_time_sync_disable(up);
+		if (!ret)
+			ret = tb_port_tmu_time_sync_disable(down);
+		if (ret)
+			goto out;
+	}
+
 	ret = tb_port_tmu_unidirectional_disable(up);
 	if (ret)
 		return ret;

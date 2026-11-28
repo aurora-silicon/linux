@@ -25,7 +25,7 @@
 //! Reading returns up to 24 records from the cursor and advances it.
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use kernel::{bindings, module_param::KernelParam};
+use kernel::bindings;
 
 pub(crate) const OPT_BASE: u32 = 1 << 0;
 pub(crate) const OPT_MAILBOX: u32 = 1 << 1;
@@ -209,7 +209,9 @@ const PAGE: u64 = crate::pgtable::UAT_PGSZ as u64;
 fn map_power_sources() -> bool {
     let map_page = |slot: &AtomicPtr<u8>, link: u64| -> bool {
         if !slot.load(Ordering::Acquire).is_null() { return true; }
-        let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link);
+        let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link) else {
+            return false;
+        };
         // SAFETY: same page as the existing bounded diag_knobs probe; WB
         // read-only use; retained until module unload.
         let ptr = unsafe { bindings::memremap(physical & !(PAGE - 1), PAGE as usize,
@@ -232,7 +234,7 @@ fn map_power_sources() -> bool {
 fn read_firmware_word(page: &AtomicPtr<u8>, link: u64) -> Option<u64> {
     let base = page.load(Ordering::Acquire);
     if base.is_null() { return None; }
-    let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link);
+    let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link)?;
     let offset = (physical & (PAGE - 1)) as usize;
     // SAFETY: `base` maps the whole containing page for the module lifetime;
     // `offset` is 8-aligned (both links are) and below the page size. The
@@ -357,16 +359,10 @@ unsafe extern "C" fn e2e_get(buf: *mut core::ffi::c_char, _: *const bindings::ke
 static E2E_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(e2e_set), get: Some(e2e_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static E2E_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_e2e"
-    } else { c"aurora.g17p_e2e" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&E2E_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    E2E_PARAM,
+    "g17p_e2e",
+    ops: core::ptr::from_ref(&E2E_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);

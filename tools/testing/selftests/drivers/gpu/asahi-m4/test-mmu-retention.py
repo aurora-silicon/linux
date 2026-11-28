@@ -24,12 +24,12 @@ type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i
 static TRIP_LOAD:AtomicUsize=AtomicUsize::new(0);
 struct AtomicBool(StdAtomicBool);impl AtomicBool{fn new(v:bool)->Self{Self(StdAtomicBool::new(v))}fn store(&self,v:bool,o:Ordering){self.0.store(v,o);}fn load(&self,o:Ordering)->bool{let n=TRIP_LOAD.load(Ordering::Relaxed);if n!=0&&TRIP_LOAD.fetch_sub(1,Ordering::Relaxed)==1{self.0.store(true,Ordering::Release);}self.0.load(o)}}
 const UAT_NUM_CTX:usize=64;const UAT_USER_CTX_START:usize=1;const TTBR_VALID:u64=1;const TTBR_ASID_SHIFT:usize=48;const UAT_PGSZ:usize=0x4000;
-static NODE_DROPS:AtomicUsize=AtomicUsize::new(0);static MUTATIONS:AtomicUsize=AtomicUsize::new(0);static ROOT_FREES:AtomicUsize=AtomicUsize::new(0);static TREE_FREES:AtomicUsize=AtomicUsize::new(0);static FWCTL:AtomicUsize=AtomicUsize::new(0);static LEAF_CLEARS:AtomicUsize=AtomicUsize::new(0);static BARRIERS:AtomicUsize=AtomicUsize::new(0);
+static NODE_DROPS:AtomicUsize=AtomicUsize::new(0);static MUTATIONS:AtomicUsize=AtomicUsize::new(0);static ROOT_FREES:AtomicUsize=AtomicUsize::new(0);static TREE_FREES:AtomicUsize=AtomicUsize::new(0);static FWCTL:AtomicUsize=AtomicUsize::new(0);static LEAF_CLEARS:AtomicUsize=AtomicUsize::new(0);static BARRIERS:AtomicUsize=AtomicUsize::new(0);static CLEANS:StdMutex<Vec<(usize,usize)>>=StdMutex::new(Vec::new());
 macro_rules! pr_err{($($t:tt)*)=>{()};}macro_rules! mod_pr_debug{($($t:tt)*)=>{()};}macro_rules! mod_dev_dbg{($($t:tt)*)=>{()};}macro_rules! dev_err{($($t:tt)*)=>{()};}
 struct MutexBackend;struct Mutex<T>(StdMutex<T>);impl<T>Mutex<T>{fn new(v:T)->Self{Self(StdMutex::new(v))}fn lock(&self)->Guard<'_,T,MutexBackend>{Guard(self.0.lock().unwrap(),std::marker::PhantomData)}}
 struct Guard<'a,T,M>(std::sync::MutexGuard<'a,T>,std::marker::PhantomData<M>);impl<T,M>Deref for Guard<'_,T,M>{type Target=T;fn deref(&self)->&T{&self.0}}impl<T,M>DerefMut for Guard<'_,T,M>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 struct Monotonic;struct Delta;impl Delta{fn from_millis(n:u64)->u64{n}}struct Instant<T>{n:std::cell::Cell<u64>,p:std::marker::PhantomData<T>}impl<T>Instant<T>{fn now()->Self{Self{n:std::cell::Cell::new(0),p:std::marker::PhantomData}}fn elapsed(&self)->u64{let n=self.n.get();self.n.set(n+1);n}}
-mod pgtable{pub fn clean_poc(_p:*const u8,_n:usize){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub fn poc_barrier(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}}
+mod pgtable{pub fn clean_poc(p:*const u8,n:usize){super::CLEANS.lock().unwrap().push((p as usize,n));super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub fn poc_barrier(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}}
 mod mem{pub fn sync(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub fn tlbi_asid(_:u8){}}
 #[derive(Clone,Copy,PartialEq,Eq)]enum UatFirmware{Handoff,PublishedRoots}
 struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU32}impl Handoff{fn new()->Self{Self{lock_ap:AtomicU8::new(0),lock_fw:AtomicU8::new(0),turn:AtomicU32::new(0),cur_slot:AtomicU32::new(0xffff)}}
@@ -40,9 +40,9 @@ handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap',
 mid=r'''
 }
 struct Quirks{handoff_lock:bool,clean_tables:bool}
-struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],quirks:Quirks}
+struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],clean_poc:bool,quirks:Quirks}
 impl UatShared{fn handoff(&self)->&Handoff{&self.handoff}fn ttbs(&self)->&[SlotTTBS;64]{&self.ttbs}}
-struct UatInner{firmware:UatFirmware,m4_adopted:bool,failed:AtomicBool,shared:Mutex<UatShared>}
+struct UatInner{firmware:UatFirmware,m4_adopted:bool,clean_poc:bool,failed:AtomicBool,shared:Mutex<UatShared>}
 '''
 mid=mid.replace('impl UatShared{','impl UatShared{'+''.join(body(mm,m) for m in ['fn handoff_lock(', 'fn handoff_unlock(', 'fn publish_slot(']))
 raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'.join(body(mm,m) for m in [
@@ -51,7 +51,8 @@ raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'
 ])
 inner='impl UatInner{\n'+'\n'.join(body(mm,m) for m in ['fn lock(&self) -> Guard', 'fn check_m4(', 'fn lock_handoff(', 'fn lock_m4_upper('])+'\n}\n'
 models=r'''
-fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],quirks:Quirks{handoff_lock:true,clean_tables:false}})})}
+fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{uat_with(m4,firmware,false,false)}
+fn uat_with(m4:bool,firmware:UatFirmware,clean_poc:bool,clean_tables:bool)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,clean_poc,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],clean_poc,quirks:Quirks{handoff_lock:true,clean_tables}})})}
 #[derive(Clone,Copy)]struct Prot{cached:bool}impl Prot{fn is_cached_noncoherent(&self)->bool{self.cached}}
 struct Mutation;impl Drop for Mutation{fn drop(&mut self){MUTATIONS.fetch_sub(1,Ordering::Relaxed);}}
 struct MapTable{fail:bool}impl MapTable{fn unmap_pages(&mut self,_r:Range<u64>)->Result{LEAF_CLEARS.fetch_add(1,Ordering::Relaxed);if self.fail{Err(EIO)}else{Ok(())}}}
@@ -87,7 +88,7 @@ struct VmInner{id:u64,binding:Rc<Mutex<VmBinding>>,uat_inner:Rc<UatInner>,page_t
 impl VmInner{fn ttb(&self)->u64{self.page_table.ttb}}
 '''+body(mm,'impl Drop for VmInner {')
 main=r'''
-fn reset(){TRIP_LOAD.store(0,Ordering::Relaxed);for c in [&NODE_DROPS,&MUTATIONS,&ROOT_FREES,&TREE_FREES,&FWCTL,&LEAF_CLEARS,&BARRIERS]{c.store(0,Ordering::Relaxed);}}
+fn reset(){TRIP_LOAD.store(0,Ordering::Relaxed);CLEANS.lock().unwrap().clear();for c in [&NODE_DROPS,&MUTATIONS,&ROOT_FREES,&TREE_FREES,&FWCTL,&LEAF_CLEARS,&BARRIERS]{c.store(0,Ordering::Relaxed);}}
 fn mapping(u:Rc<UatInner>,cached:bool,fail_unmap:bool)->(KernelMapping,Rc<PinBo>){let bo=Rc::new(PinBo);let n=Node{va:0xfffffc2000000000,inner:KernelMappingInner{owner:Rc::new(Owner(RefCell::new(OwnerState{dev:(),is_kernel:true,page_table:MapTable{fail:fail_unmap}}))),uat_inner:u,prot:Prot{cached},mapped_size:0x4000,_bo:bo.clone(),private:None}};(KernelMapping(ManuallyDrop::new(n)),bo)}
 fn mapping_tests(){
  for (m4,firmware,cached,node_free,fwctl) in [(false,UatFirmware::Handoff,false,1,0),(false,UatFirmware::Handoff,true,1,1),(false,UatFirmware::PublishedRoots,true,1,0),(true,UatFirmware::Handoff,false,1,0),(true,UatFirmware::Handoff,true,0,0)]{reset();let u=uat(m4,firmware);let (m,bo)=mapping(u.clone(),cached,false);drop(m);assert_eq!(NODE_DROPS.load(Ordering::Relaxed),node_free);assert_eq!(FWCTL.load(Ordering::Relaxed),fwctl);assert_eq!(Rc::strong_count(&bo),if node_free==0{2}else{1});assert_eq!(u.failed.load(Ordering::Acquire),m4&&cached);assert_eq!(u.shared.lock().handoff.lock_ap.load(Ordering::Relaxed),0);}
@@ -107,6 +108,35 @@ fn bind_tests(){for m4 in [false,true]{for blocked in [false,true]{if blocked&&!
  // A previously faulted M4 is refused before any new lock or TTBAT generation mutation.
  let u=uat(true,UatFirmware::Handoff);u.failed.store(true,Ordering::Release);let backend=Uat{inner:u.clone(),slots:Allocator};assert!(backend.bind(&Vm{id:9,binding:new_binding()}).is_err());assert_eq!(u.shared.lock().binding_generations[4],0);
 }
+// A non-snooping walker sees the TTBAT slot written back exactly once on both bind and
+// VmInner::drop through UatShared::publish_slot: for an adopted UAT without the clean_tables
+// quirk (clean_poc only) and with the quirk. A coherent walker (neither) gets no clean.
+fn ttbat_clean_tests(){
+ for (clean_poc,clean_tables,cleaned) in [(false,false,false),(true,false,true),(false,true,true),(true,true,true)]{
+  reset();
+  let u=uat_with(false,UatFirmware::Handoff,clean_poc,clean_tables);
+  let backend=Uat{inner:u.clone(),slots:Allocator};
+  let binding=new_binding();
+  let bound=backend.bind(&Vm{id:9,binding:binding.clone()}).unwrap();
+  assert_eq!(bound.1,4);
+  let slot={
+   let s=u.shared.lock();
+   let slot=(core::ptr::from_ref(&s.ttbs[4]) as usize,size_of::<SlotTTBS>());
+   assert_eq!(CLEANS.lock().unwrap().iter().filter(|c|**c==slot).count(),usize::from(cleaned));
+   assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),0x804000001|(4<<48));
+   slot
+  };
+  CLEANS.lock().unwrap().clear();
+  binding.lock().active_users=0;
+  drop(bound);
+  drop(VmInner{id:9,binding,uat_inner:u.clone(),page_table:UatPageTable::new()});
+  let s=u.shared.lock();
+  assert_eq!(CLEANS.lock().unwrap().iter().filter(|c|**c==slot).count(),usize::from(cleaned));
+  assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),0);
+  assert_eq!(s.ttbs[4].ttb1.load(Ordering::Relaxed),0);
+  assert_eq!(s.owned_user_roots[4],0);
+ }
+}
 fn generation_churn_test(){
  let u=uat(true,UatFirmware::Handoff);let backend=Uat{inner:u.clone(),slots:Allocator};
  let published=backend.bind(&Vm{id:1,binding:new_binding()}).unwrap();assert_eq!(published.0.binding.lock().generation,1);
@@ -116,7 +146,7 @@ fn generation_churn_test(){
  let next=backend.bind(&Vm{id:999,binding:new_binding()}).unwrap();assert_eq!(next.0.binding.lock().generation,3);
 }
 fn vm_drop_tests(){for (m4,blocked,pre_failed) in [(false,false,false),(true,false,false),(true,true,false),(true,false,true)]{reset();let u=uat(m4,UatFirmware::Handoff);let binding=new_binding();binding.lock().bind_token=Some(Token(3));let low=0x804000001|(4<<48);{let mut s=u.shared.lock();s.ttbs[4].ttb0.store(low,Ordering::Release);s.owned_user_roots[4]=low;s.handoff.lock_fw.store(u8::from(blocked),Ordering::Release);}u.failed.store(pre_failed,Ordering::Release);drop(VmInner{id:9,binding,uat_inner:u.clone(),page_table:UatPageTable::new()});let uncertain=blocked||pre_failed;assert_eq!(ROOT_FREES.load(Ordering::Relaxed),usize::from(!uncertain));assert_eq!(TREE_FREES.load(Ordering::Relaxed),usize::from(!uncertain));let s=u.shared.lock();assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),if uncertain{low}else{0});assert_eq!(s.owned_user_roots[4],if uncertain{low}else{0});assert_eq!(s.handoff.lock_ap.load(Ordering::Relaxed),0);assert_eq!(u.failed.load(Ordering::Acquire),uncertain);}}
-fn main(){generation_churn_test();mapping_tests();page_tests();bind_tests();vm_drop_tests();fail_stop_race_tests();println!("Shared Rust fault injection passed: G15/Neo normal and cached frees exactly once; M4 cached/timeout/partial-unmap retains node+backing+VA; guards released before free; M4 bind timeout changes no TTBAT/generation; VM-drop timeout retains physical tables/root; faulted M4 admission rejects before and after lock acquisition (mock hardware)");}
+fn main(){ttbat_clean_tests();generation_churn_test();mapping_tests();page_tests();bind_tests();vm_drop_tests();fail_stop_race_tests();println!("Shared Rust fault injection passed: G15/Neo normal and cached frees exactly once; M4 cached/timeout/partial-unmap retains node+backing+VA; guards released before free; M4 bind timeout changes no TTBAT/generation; VM-drop timeout retains physical tables/root; faulted M4 admission rejects before and after lock acquisition; a non-snooping adopted UAT writes back the TTBAT slot once on bind and once on VM teardown (mock hardware)");}
 '''
 source=pre+handoff+mid+raii+inner+models+map_drop+pages+bindings+helpers+bind+vm+main
 (OUT/'check-mmu-retention.rs').write_text(source)

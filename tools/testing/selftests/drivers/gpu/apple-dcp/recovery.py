@@ -7,6 +7,7 @@ They document an unresolved peer contract, not successful replay protection.
 """
 from pathlib import Path
 import json, hashlib, subprocess
+from common import classic_unit
 
 def check(root, output):
     import edid
@@ -50,7 +51,7 @@ def check(root, output):
     static void *dma_pool[2];static bool dma_busy[2];static unsigned int dma_cursor;
     static bool reuse_dma,ack_current,inject_late;
     static u8 current_reply[128],saved_reply[128];static size_t current_size,saved_size;
-    static u16 current_channel;static u8 current_tag;
+    static u16 current_channel __attribute__((unused));static u8 current_tag __attribute__((unused));
     static void afk_v2_receive(struct apple_dcp_afkep *,u32,u32,const void *,size_t);
     static void *dma_alloc_coherent(void *dev,size_t n,dma_addr_t *address,int flags) {
         (void)dev;(void)flags;assert(n==32);void *p;
@@ -276,6 +277,7 @@ def check(root, output):
     includes=[root/'drivers/gpu/drm/apple',root/'tools/testing/selftests/drivers/gpu/apple-afkv2/host-include']
     results=[]
     def run(name,text,cases):
+        text=classic_unit(text)
         area=out/name;area.mkdir(exist_ok=True);(area/'host.c').write_text(text)
         cmd=['clang','-std=gnu11','-Wall','-Werror','-Wno-unused-function','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer']+['-I'+str(p) for p in includes]+[str(area/'host.c'),'-o',str(area/'host')]
         (area/'command.json').write_text(json.dumps(cmd,indent=2)+'\n')
@@ -310,6 +312,9 @@ def check(root, output):
     static void destroy_workqueue(void *wq) { assert(wq && !destroyed);while(fifo_head) run_one_work();destroyed=true; }
     #define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
     #define debugfs_remove_recursive(p) ((void)(p))
+    #define cmpxchg(p,old,new) ({ __typeof__(*(p)) expected=(old); \
+        __atomic_compare_exchange_n((p),&expected,(new),false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); \
+        expected; })
     #define kzalloc(n,g) calloc(1,n)
     #define kvfree(p) free(p)
     #define ESHUTDOWN 108
@@ -355,6 +360,8 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    if 'mutex_lock(&afkep->tx_lock);' in af:
+        queued=queued.replace('bool lock,stopping;','bool lock,tx_lock,stopping;',1)
     if 'atomic_inc(&ep->sleep_jobs);' in af:
         # The receive jobs a firmware sleep waits for; nothing here waits.
         anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'
@@ -413,8 +420,16 @@ def check(root, output):
             afk_service_put(old);assert(!fifo_head && !old->users);
             assert(afk_receive_message(&ep,RBEP_RECV)==-ESHUTDOWN);assert(!fifo_head);
             afk_quiesce(&ep);assert(!fifo_head);
-            struct apple_dcp_afkep *empty=calloc(1,sizeof(*empty));assert(empty);empty->dcp=&d;
+            struct apple_dcp_afkep *empty=calloc(1,sizeof(*empty));assert(empty);
+            struct apple_dcp_afkep *replacement=calloc(1,sizeof(*replacement));assert(replacement);
+            empty->dcp=replacement->dcp=&d;
+            empty->endpoint=replacement->endpoint=0x20;
+            d.v27_sleep_transport=true;
+            d.sleep_v27_ep[0]=replacement;
             afk_release_context(empty);
+            assert(d.sleep_v27_ep[0]==replacement && "retired endpoint cannot clear its replacement");
+            afk_release_context(replacement);
+            assert(!d.sleep_v27_ep[0] && "owned endpoint clears its own route");
             cleanup();
         }
         assert(!drain_warnings);

@@ -365,7 +365,234 @@ static void ane_cold_no_clpc_test(struct kunit *test)
 #endif
 }
 
+/*
+ * Recovery of a hung engine reuses its memory only with the whole proof: our
+ * power-down began, ANE_SYS then went off as PMGR reads it, nothing is held
+ * again, and the ANE CPU and sub-block read off now.
+ */
+static void ane_cold_hung_gone_test(struct kunit *test)
+{
+	const struct ane_fw_hung_proof proven = { .down = true, .sys_off = true };
+	struct ane_fw_cold_state off = ane_cold_fixture(), s;
+	struct ane_fw_hung_proof p;
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_sys_off(0x200));
+	KUNIT_EXPECT_TRUE(test, ane_fw_sys_off(0x20f));
+	KUNIT_EXPECT_FALSE(test, ane_fw_sys_off(0x23ff));
+	KUNIT_EXPECT_FALSE(test, ane_fw_sys_off(0x10));
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_hung_gone(&proven, &off));
+	/* No power-down of ours, so an OFF proves nothing about the hung firmware. */
+	p = proven;
+	p.down = false;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* ANE_SYS never reported off (runtime DARTs held it, or no genpd notifier). */
+	p = proven;
+	p.sys_off = false;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* Powered again, or a reference still held. */
+	p = proven;
+	p.held = true;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* The ANE CPU power state targets or reads on. */
+	s = off;
+	s.cpu |= 0xf;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	s = off;
+	s.cpu |= 0xf0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	/* A sub-block word left on, or BUSY latched as a stuck power-down leaves it. */
+	s = off;
+	s.subblock = 0x3ff;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	s = off;
+	s.subblock = 0x300 | BIT(11);
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+}
+
+#define REC_S(x) ((u64)(x) * NSEC_PER_SEC)
+#define REC_MS(x) ((u64)(x) * NSEC_PER_MSEC)
+
+/* Ask at @now and, when admitted, start the attempt then (as the recover work does). */
+static enum ane_fw_recover_verdict rec_try(struct ane_fw_recover_limit *l,
+					   const struct ane_fw_recover_policy *p,
+					   u64 now, u64 *wait)
+{
+	enum ane_fw_recover_verdict v = ane_fw_recover_admit(l, p, now, wait);
+
+	if (v == ANE_FW_RECOVER_NOW)
+		ane_fw_recover_note(l, now);
+	return v;
+}
+
+/*
+ * A storm of hangs (0.6 s after each recovery): with the policy (5 in 60 s,
+ * 1 s backoff) the recoveries spread out to 0, 1, 3, 7 and 15 s, and the
+ * sixth hang stops them until a system sleep resets the limit.
+ */
+static void ane_cold_recover_storm_test(struct kunit *test)
+{
+	const struct ane_fw_recover_policy p = {
+		.burst = 5, .window_ns = REC_S(60), .backoff_ns = REC_S(1),
+	};
+	static const u64 expect[] = { 0, 1, 3, 7, 15 };
+	struct ane_fw_recover_limit l = {};
+	u64 now = REC_S(100), wait, started[ARRAY_SIZE(expect)];
+	unsigned int done = 0, refused = 0;
+
+	/* Hang 0.6 s after each recovery; a refused one is asked again when told. */
+	while (done < ARRAY_SIZE(expect)) {
+		enum ane_fw_recover_verdict v = rec_try(&l, &p, now, &wait);
+
+		KUNIT_ASSERT_NE(test, v, ANE_FW_RECOVER_STOP);
+		if (v == ANE_FW_RECOVER_LATER) {
+			KUNIT_ASSERT_GT(test, wait, 0ULL);
+			refused++;
+			now += wait;
+			continue;
+		}
+		started[done++] = now;
+		now += REC_MS(600);
+	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(expect); i++)
+		KUNIT_EXPECT_EQ(test, started[i] - started[0], REC_S(expect[i]));
+	KUNIT_EXPECT_EQ(test, refused, 4U);
+	/* The sixth hang within the minute trips the limit, and it stays tripped. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_STOP);
+	KUNIT_EXPECT_TRUE(test, l.tripped);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3600), &wait), ANE_FW_RECOVER_STOP);
+	KUNIT_EXPECT_EQ(test, wait, 0ULL);
+	/* A system sleep clears it: the next one runs at once. */
+	ane_fw_recover_reset(&l);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3601), &wait), ANE_FW_RECOVER_NOW);
+}
+
+/* Backoff doubling, its cap, the sliding window and the burst bounds. */
+static void ane_cold_recover_backoff_test(struct kunit *test)
+{
+	struct ane_fw_recover_policy p = {
+		.burst = 16, .window_ns = REC_S(10), .backoff_ns = REC_S(1),
+	};
+	struct ane_fw_recover_limit l = {};
+	u64 now = REC_S(1), wait;
+
+	/* First in the window: at once. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, wait, 0ULL);
+	/* Second: 1 s after the first; asked 0.25 s after it, wait 0.75 s. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_MS(250), &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_MS(750));
+	now += REC_S(1);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	/* Third: 2 s after the second; fourth: 4 s; fifth: capped at the window. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(2));
+	now += REC_S(2);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(4));
+	now += REC_S(4);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	/* Started at 0, 1, 3 and 7 s; at 7 s all four are in the 10 s window. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(8));
+	/* At 10 s the first has left the window: three recent, 4 s after the latest. */
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + REC_S(3), &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(1));
+	/* At 11 s the first two have: two recent, 2 s after the latest, due. */
+	now += REC_S(4);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_FALSE(test, l.tripped);
+	/* Quiet for a whole window: no backoff at all. */
+	now += REC_S(10);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+
+	/* Delays never exceed the window, whatever the backoff. */
+	ane_fw_recover_reset(&l);
+	p.backoff_ns = REC_S(60);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_LATER);
+	KUNIT_EXPECT_EQ(test, wait, REC_S(10));
+
+	/* No backoff: only the burst limits. A burst of 0 counts as 1. */
+	ane_fw_recover_reset(&l);
+	p.backoff_ns = 0;
+	p.burst = 0;
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + 1, &wait), ANE_FW_RECOVER_STOP);
+
+	/* A burst above the ring is the ring: 16 at once, the 17th stops. */
+	ane_fw_recover_reset(&l);
+	p.burst = 100;
+	for (unsigned int i = 0; i < ANE_FW_RECOVER_BURST_MAX; i++)
+		KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + i, &wait), ANE_FW_RECOVER_NOW);
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now + 16, &wait), ANE_FW_RECOVER_STOP);
+
+	/* A clock that went back (a stamp after now) is not counted as recent. */
+	ane_fw_recover_reset(&l);
+	p.burst = 2;
+	p.backoff_ns = REC_S(1);
+	ane_fw_recover_note(&l, now + REC_S(5));
+	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
+}
+
+/* A recovery keeps ANE_SYS off for its minimum, counted from genpd's OFF. */
+static void ane_cold_recover_off_test(struct kunit *test)
+{
+	const u64 min = 100 * NSEC_PER_MSEC, off = 5 * NSEC_PER_SEC;
+
+	/* The storm's recoveries powered up again within about a millisecond. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + NSEC_PER_MSEC, min),
+			99 * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off, min), min);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + min, min), 0ULL);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + NSEC_PER_SEC, min), 0ULL);
+	/* No OFF recorded, or one in the future: wait the whole minimum. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(0, off, min), min);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off - 1, min), min);
+	/* No minimum: never wait. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off, 0), 0ULL);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(0, off, 0), 0ULL);
+}
+
+/* A recovered engine takes requests only with everything reading healthy. */
+static void ane_cold_recover_settled_test(struct kunit *test)
+{
+	const struct ane_fw_settled up = { .sys = 0x23ff, .cpu = 0x0f0003ff };
+	struct ane_fw_settled s;
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_recover_settled(&up));
+	/* ANE_SYS or the CPU not (yet) on, in target or actual state. */
+	s = up;
+	s.sys = 0x230f;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.sys = 0x23f0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.cpu = 0x0f0003f0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.cpu = 0x0f000300;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	/* A DART fault on any of the three. */
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		s = up;
+		s.dart_error[i] = 0x80000001;
+		KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	}
+	/* The transport failed while serving the new firmware's posts. */
+	s = up;
+	s.transport_error = -ENOSPC;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_recover_settled_test),
+	KUNIT_CASE(ane_cold_recover_off_test),
+	KUNIT_CASE(ane_cold_recover_storm_test),
+	KUNIT_CASE(ane_cold_recover_backoff_test),
+	KUNIT_CASE(ane_cold_hung_gone_test),
 	KUNIT_CASE(ane_cold_no_clpc_test),
 	KUNIT_CASE(ane_cold_restartable_test),
 	KUNIT_CASE(ane_cold_rvbar_test),

@@ -492,3 +492,7 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 	dev_warn(rtk->dev,
 		 "RTKit: End of crashlog reached but no footer present");
 }
+
+#ifdef CONFIG_APPLE_RTKIT_KUNIT_TEST
+#include "rtkit-crashlog-test.c"
+#endif

@@ -74,6 +74,7 @@ enum tb_security_level {
  * @remote_activity: Successful stock remote discovery exchanges
  * @nhi: Pointer to the NHI structure
  * @ctl: Control channel for this domain
+ * @noirq_ctl_retained: Control rings stayed active during noirq suspend
  * @wq: Ordered workqueue for all domain specific work
  * @root_switch: Root switch of this domain
  * @cm_ops: Connection manager specific operations vector
@@ -88,6 +89,7 @@ struct tb {
 	atomic64_t remote_activity;
 	struct tb_nhi *nhi;
 	struct tb_ctl *ctl;
+	bool noirq_ctl_retained;
 	struct workqueue_struct *wq;
 	struct tb_switch *root_switch;
 	const struct tb_cm_ops *cm_ops;
@@ -517,6 +519,7 @@ void tb_service_properties_changed(struct tb_service *svc);
  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
  * @interrupt_work: Work scheduled to handle ring interrupt when no
  *		    MSI-X is used.
+ * @use_dma_credit_preferences: Use the router preferred DMA credit allocation
  * @hop_count: Number of rings (end point hops) supported by NHI.
  * @quirks: NHI specific quirks if any
  * @host_dp_policy: Host display tunnel policies supplied by the NHI glue
@@ -540,6 +543,7 @@ struct tb_nhi {
 	bool iommu_dma_protection;
 	struct work_struct interrupt_work;
 	u32 hop_count;
+	bool use_dma_credit_preferences;
 	unsigned long quirks;
 	unsigned long host_dp_policy;
 	bool host_dp_dual_stream;

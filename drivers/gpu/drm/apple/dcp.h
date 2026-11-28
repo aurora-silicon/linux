@@ -63,6 +63,7 @@ struct apple_encoder {
 #define to_apple_encoder(x) container_of(x, struct apple_encoder, base)
 
 void dcp_poweroff(struct platform_device *pdev);
+bool dcp_sleep_keeps_firmware(struct device *dev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
@@ -82,16 +83,30 @@ int dcp_peer_stop_v27(struct apple_dcp *dcp);
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
 void dcp_peer_swap_armed_v27(struct apple_dcp *dcp, u32 id);
 void dcp_peer_swap_failed_v27(struct apple_dcp *dcp);
-bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
-		void (*report)(struct apple_dcp *, u32, ktime_t));
+bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
+				void (*report)(struct apple_dcp *, u32, ktime_t, bool));
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
-bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
+bool dcp_panel_edr(struct platform_device *pdev);
+bool dcp_ext_color_props_supported(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
+/* Whether a DCP reporting firmware-compat @compat runs the firmware-27 instance. */
+enum dcp_v27_admission {
+	DCP_V27_NOT_V27,	/* older than 27: the older interfaces decide */
+	DCP_V27_NO_TABLE,	/* 27 or later, no method table for the build */
+	DCP_V27_INCOMPLETE,	/* 27 or later, a method has no known ID */
+	DCP_V27_ADMITTED,
+};
+
+struct dcp_method_entry;
+enum dcp_v27_admission dcp_v27_admission(const char *compat,
+					 const struct dcp_method_entry **methods,
+					 const char **missing,
+					 unsigned int *num_missing);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);
 void dcp_backlight_takeover_registered(struct platform_device *pdev);
@@ -101,14 +116,20 @@ bool dcp_ext_unusable(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 int dcp_start(struct platform_device *pdev);
 int dcp_activate(struct platform_device *pdev);
+void dcp_ext26_open_services(struct apple_dcp *dcp);
+int dcp_ext26_layout_stop(struct apple_dcp *dcp);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+bool dcp_boot_surface_pending(struct platform_device *pdev);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
 bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+int dcp_fb_mirror(struct apple_dcp *dcp, struct drm_framebuffer *fb);
+struct drm_gem_dma_object;
+void dcp_fb_unmirror(struct platform_device *pdev, struct drm_gem_dma_object *obj);
 void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
 bool dcp_is_initialized(struct platform_device *pdev);
@@ -135,6 +156,7 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
+/* Must be called from sleepable context; may sleep on 14.7/ext26 mailboxes. */
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
@@ -151,8 +173,10 @@ int dcp_dptx_park(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev);
+int dcp_t6041_s2r_all(bool start);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
+void iomfb_ext26_start(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
@@ -180,6 +204,8 @@ bool apple_t8122_25g83_board(void);
 
 void dcp_typec_hybrid_first_dt(void);
 void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
+void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp);
+void dcp_hdmi_disconnect(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
 void dcp_hdmi_yield_link(struct apple_dcp *dcp);
 void dcp_link_recovery_schedule(struct apple_dcp *dcp);

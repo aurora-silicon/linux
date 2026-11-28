@@ -7,6 +7,8 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/of_platform.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
+#include <linux/kref.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -21,6 +23,167 @@
 #include <linux/unaligned.h>
 
 #include "centauri_t6050.h"
+
+/* Registry owns one reference, registrations and queued work own additional ones. */
+struct centauri_t6050_rewake {
+	struct list_head node;
+	struct kref ref;
+	struct work_struct work;
+	struct pci_dev *bridge;
+	unsigned int slot;
+	bool active, rerun;
+	unsigned int generation, work_generation;
+	int error;
+	struct pci_dev *control;
+	bool control_lease;
+	struct centauri_t6050_ipc *ipc;
+	void *firmware, *descriptor;
+	dma_addr_t firmware_dma, descriptor_dma;
+	size_t firmware_size;
+	struct pci_dev *beta;
+	const struct apple_centauri_sleep_ops *ops;
+	void *data, *arena;
+	dma_addr_t arena_dma;
+	size_t arena_size;
+	bool beta_lease;
+	bool beta_fallback;
+};
+
+static LIST_HEAD(cen_recovery_owners);
+static DEFINE_MUTEX(cen_recovery_lock);
+static struct workqueue_struct *cen_rewake_wq;
+static bool cen_exiting;
+static void centauri_t6050_rewake_worker(struct work_struct *work);
+static int centauri_t6050_quiesce(struct centauri_t6050 *c);
+
+static void centauri_t6050_owner_free(struct kref *ref)
+{
+	struct centauri_t6050_rewake *rw = container_of(ref, struct centauri_t6050_rewake, ref);
+
+	pci_dev_put(rw->bridge);
+	kfree(rw);
+}
+
+/* Called before address publication; never allocated by a recovery request. */
+static struct centauri_t6050_rewake *centauri_t6050_owner_get(struct pci_dev *fn)
+{
+	struct centauri_t6050_rewake *rw;
+
+	if (!fn->bus->self)
+		return ERR_PTR(-ENODEV);
+	guard(mutex)(&cen_recovery_lock);
+	if (cen_exiting)
+		return ERR_PTR(-ESHUTDOWN);
+	list_for_each_entry(rw, &cen_recovery_owners, node) {
+		if (rw->bridge == fn->bus->self && rw->slot == PCI_SLOT(fn->devfn)) {
+			kref_get(&rw->ref);
+			return rw;
+		}
+	}
+	rw = kzalloc(sizeof(*rw), GFP_KERNEL);
+	if (!rw)
+		return ERR_PTR(-ENOMEM);
+	kref_init(&rw->ref);
+	INIT_WORK(&rw->work, centauri_t6050_rewake_worker);
+	rw->bridge = pci_dev_get(fn->bus->self);
+	rw->slot = PCI_SLOT(fn->devfn);
+	list_add_tail(&rw->node, &cen_recovery_owners);
+	kref_get(&rw->ref);
+	return rw;
+}
+
+int apple_centauri_sleep_register(struct pci_dev *fn,
+				  const struct apple_centauri_sleep_ops *ops, void *data,
+				  void *arena, dma_addr_t dma, size_t size)
+{
+	struct centauri_t6050_rewake *rw;
+	int ret;
+
+	if (IS_ENABLED(CONFIG_ARCH_HAS_TEARDOWN_DMA_OPS))
+		return -EOPNOTSUPP;
+	if (PCI_FUNC(fn->devfn) != 2 || !ops || !ops->quiesce ||
+	    !ops->release || !ops->retained || !arena || !size)
+		return -EINVAL;
+	rw = centauri_t6050_owner_get(fn);
+	if (IS_ERR(rw))
+		return PTR_ERR(rw);
+	/* fn's device lock also serializes the worker and unregister. */
+	if (rw->beta) {
+		ret = -EBUSY;
+		goto put;
+	}
+	ret = iommu_device_use_default_domain(&fn->dev);
+	if (ret)
+		goto put;
+	rw->beta = pci_dev_get(fn);
+	rw->beta_lease = true;
+	rw->ops = ops;
+	rw->data = data;
+	rw->arena = arena;
+	rw->arena_dma = dma;
+	rw->arena_size = size;
+	return 0;
+put:
+	kref_put(&rw->ref, centauri_t6050_owner_free);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_register);
+
+void apple_centauri_sleep_unregister(struct pci_dev *fn)
+{
+	struct centauri_t6050_rewake *rw, *found = NULL;
+
+	mutex_lock(&cen_recovery_lock);
+	list_for_each_entry(rw, &cen_recovery_owners, node) {
+		if (rw->bridge == fn->bus->self && rw->slot == PCI_SLOT(fn->devfn)) {
+			found = rw;
+			break;
+		}
+	}
+	mutex_unlock(&cen_recovery_lock);
+	if (!found || found->beta != fn || !found->ops)
+		return;
+	rw = found;
+	if (!rw->ops->retained(rw->data)) {
+		rw->arena = NULL;
+		if (rw->beta_lease)
+			iommu_device_unuse_default_domain(&fn->dev);
+		rw->beta_lease = false;
+		pci_dev_put(rw->beta);
+		rw->beta = NULL;
+	}
+	/* No callback or devm data survives driver unbind. A retained tuple does. */
+	rw->ops = NULL;
+	rw->data = NULL;
+	kref_put(&rw->ref, centauri_t6050_owner_free);
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_unregister);
+
+void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
+{
+	struct centauri_t6050_rewake *rw;
+
+	guard(mutex)(&cen_recovery_lock);
+	if (cen_exiting || !fn->bus->self)
+		return;
+	list_for_each_entry(rw, &cen_recovery_owners, node) {
+		if (rw->bridge != fn->bus->self || rw->slot != PCI_SLOT(fn->devfn))
+			continue;
+		if (error && !rw->error)
+			rw->error = error;
+		/* One owner and one work reference even while the work is running. */
+		if (rw->active && rw->generation != rw->work_generation)
+			rw->rerun = true;
+		if (!rw->active) {
+			rw->active = true;
+			rw->work_generation = rw->generation;
+			kref_get(&rw->ref);
+			queue_work(cen_rewake_wq, &rw->work);
+		}
+		return;
+	}
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_recovery_needed);
 
 static struct pci_driver centauri_t6050_driver;
 
@@ -238,7 +401,8 @@ static int centauri_t6050_port_cycle(struct pci_dev *endpoint)
 	if (ret)
 		goto stopped;
 	ret = pcibios_err_to_errno(pci_write_config_word(endpoint, pm + PCI_PM_CTRL,
-		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | PCI_D3hot | PCI_PM_CTRL_PME_ENABLE));
+		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | (__force u16)PCI_D3hot |
+		PCI_PM_CTRL_PME_ENABLE));
 	if (ret)
 		goto stopped;
 	usleep_range(10000, 11000);
@@ -291,6 +455,7 @@ static int centauri_t6050_cycle(struct centauri_t6050 *c)
 static void centauri_t6050_boot_worker(struct work_struct *work)
 {
 	struct centauri_t6050 *c = container_of(to_delayed_work(work), struct centauri_t6050, boot_work);
+	struct pci_dev *beta = NULL;
 	bool retry = false;
 	int ret;
 
@@ -309,7 +474,7 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 				c->boot_phase = CEN_BOOT_IPC;
 			break;
 		case CEN_BOOT_IPC:
-			ret = centauri_t6050_start_ipc(c);
+			ret = centauri_t6050_start_ipc(c, &beta);
 			if (!ret)
 				c->boot_phase = CEN_BOOT_READY;
 			break;
@@ -332,6 +497,8 @@ out:
 	if (READ_ONCE(c->removing))
 		c->boot_phase = CEN_BOOT_STOPPED;
 	mutex_unlock(&c->boot_lock);
+	if (beta)
+		centauri_t6050_attach_beta(c, beta);
 	if (retry && !READ_ONCE(c->removing))
 		queue_delayed_work(system_long_wq, &c->boot_work, msecs_to_jiffies(20));
 }
@@ -347,6 +514,9 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 		return -ENODEV;
 	if (PCI_FUNC(pdev->devfn) != 0)
 		return -ENODEV;
+	/* Retention across driver unbind requires the DMA ops to survive it. */
+	if (IS_ENABLED(CONFIG_ARCH_HAS_TEARDOWN_DMA_OPS))
+		return -EOPNOTSUPP;
 	c = devm_kzalloc(&pdev->dev, sizeof(*c), GFP_KERNEL);
 	if (!c)
 		return -ENOMEM;
@@ -379,6 +549,23 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "40-bit DMA unavailable\n");
 
+	c->recovery = centauri_t6050_owner_get(pdev);
+	if (IS_ERR(c->recovery))
+		return PTR_ERR(c->recovery);
+	if (c->recovery->control) {
+		kref_put(&c->recovery->ref, centauri_t6050_owner_free);
+		return -EBUSY;
+	}
+	ret = iommu_device_use_default_domain(&pdev->dev);
+	if (ret) {
+		kref_put(&c->recovery->ref, centauri_t6050_owner_free);
+		return ret;
+	}
+	c->recovery->control = pci_dev_get(pdev);
+	c->recovery->control_lease = true;
+	mutex_lock(&cen_recovery_lock);
+	c->recovery->generation++;
+	mutex_unlock(&cen_recovery_lock);
 	pci_clear_master(pdev);
 	pci_set_drvdata(pdev, c);
 	queue_delayed_work(system_long_wq, &c->boot_work, 0);
@@ -388,42 +575,54 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 static void centauri_t6050_remove(struct pci_dev *pdev)
 {
 	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	struct centauri_t6050_rewake *rw = c->recovery;
+	int ret;
 
-	WRITE_ONCE(c->removing, true);
-	cancel_delayed_work_sync(&c->boot_work);
-	mutex_lock(&c->boot_lock);
-	centauri_t6050_wifi_unregister(c);
-	centauri_t6050_free_boot(c);
-	c->boot_phase = CEN_BOOT_STOPPED;
-	mutex_unlock(&c->boot_lock);
+	ret = centauri_t6050_quiesce(c);
+	/* Independent ownership before devm c is destroyed, including failed fences. */
+	centauri_t6050_detach_ipc(c->ipc);
+	rw->ipc = c->ipc;
+	rw->firmware = c->firmware;
+	rw->firmware_dma = c->firmware_dma;
+	rw->firmware_size = c->firmware_size;
+	rw->descriptor = c->descriptor;
+	rw->descriptor_dma = c->descriptor_dma;
+	c->ipc = NULL;
+	c->firmware = NULL;
+	c->descriptor = NULL;
+	if (!rw->ipc && !rw->firmware && !rw->descriptor) {
+		iommu_device_unuse_default_domain(&pdev->dev);
+		rw->control_lease = false;
+		pci_dev_put(rw->control);
+		rw->control = NULL;
+	}
+	if (ret)
+		apple_centauri_sleep_recovery_needed(pdev, ret);
+	kref_put(&rw->ref, centauri_t6050_owner_free);
 }
 
 /*
- * A firmware sleep takes the N1's power state with it, and its firmware does not survive one:
- * the N1 is reset after the wake and boots from its ROM again, as at power-on.
- * - Before the sleep, Bluetooth tears itself down in its own suspend, then this function
- *   tears Wi-Fi and the IPC/boot resources down. DMA buffers are retained if DMA shutdown
- *   cannot be verified. No firmware sleep handover is implemented. The root port's
- *   "apple,endpoint-sleep-smc-writes", if any, are written after that.
- * - Neither function arms a wake for the sleep: Wi-Fi has no wake-on-WLAN, and Bluetooth's HCI
- *   device is gone. Request a replay of the N1 warm-reset sequence after link shutdown to
- *   avoid leaving its firmware running without its host. Selective WoWLAN and paired-device
- *   Bluetooth wake require a firmware handover that is not implemented here.
- * - The host gives the warm reset in its noirq resume, while the port is still down (see
- *   pcie-apple). This resume writes the port's "apple,endpoint-wake-smc-writes", if any; once
- *   tasks run again, a work item removes the three functions and enumerates them again.
- * - After a suspend that was abandoned before the host's shutdown the link never went down. The
- *   work item then has the host take the port down and up around the reset.
+ * On a healthy firmware sleep (WoWLAN-armed or unassociated), Beta (fn 2), Alpha (fn 1),
+ * and Control (fn 0) enter ACIPC host-sleep, save PCI config state, enter D3hot (with
+ * PME_En only when wake is armed), and ask pcie-apple to skip the wake warm reset so the
+ * N1 firmware, Bluetooth, and (when armed) Wi-Fi association survive across PERST#.
+ *
+ * If any function fails host-sleep or wake, or firmware is unhealthy, the driver falls back
+ * to teardown and warm-reset recovery:
+ * - Bluetooth tears itself down, then Control tears Wi-Fi and IPC/boot resources down. DMA
+ *   buffers are retained if DMA shutdown cannot be verified. The root port's
+ *   "apple,endpoint-sleep-smc-writes", if any, are written after that, and pcie-apple
+ *   replays the warm-reset sequence after link shutdown and again before the link trains on
+ *   wake.
+ * - On resume after a teardown sleep, Control writes "apple,endpoint-wake-smc-writes", if
+ *   any, and queues a work item to remove the three functions and re-enumerate from ROM.
+ * - After a suspend that was abandoned before the host's shutdown the link never went down;
+ *   the work item has the host take the port down and up around the reset instead.
  * Only when the root port names the warm reset ("apple,function-warm-reset") and the SMC is
  * bound. Each SMC write is four cells: the key, the eight value bytes as two cells, each from
  * its most significant byte down, and the wait after the write in microseconds.
  */
 #define CEN_SMC_WRITES_MAX 4
-
-/* Freezable and ordered: rewakes run once tasks run again, one at a time; drained on unload */
-static struct workqueue_struct *cen_rewake_wq;
-/* One N1 per machine: a dark wake resumes and suspends again before tasks run */
-static atomic_t cen_rewake_queued = ATOMIC_INIT(0);
 
 /*
  * The root port's "apple,function-warm-reset" names the SMC: the SMC, if bound (a reference on
@@ -496,12 +695,6 @@ bool apple_centauri_sleep_reboot(struct pci_dev *fn)
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_reboot);
 
-struct centauri_t6050_rewake {
-	struct work_struct work;
-	struct pci_dev *bridge;
-	unsigned int slot;
-};
-
 static bool centauri_t6050_link_active(struct pci_dev *bridge)
 {
 	u16 lnksta;
@@ -509,8 +702,6 @@ static bool centauri_t6050_link_active(struct pci_dev *bridge)
 	return !pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta) &&
 	       (lnksta & PCI_EXP_LNKSTA_DLLLA);
 }
-
-static struct pci_driver centauri_t6050_driver;
 
 /*
  * A suspend given up after Bluetooth's teardown and before this function's own suspend leaves
@@ -521,32 +712,178 @@ static struct pci_driver centauri_t6050_driver;
  * without end. So function 0 is taken down here first, as its suspend takes it down, while all
  * three functions exist; its removal then finds nothing left, as after a completed suspend.
  */
-static void centauri_t6050_rewake_teardown(struct pci_bus *bus, unsigned int slot)
+/* Stop producers while Beta is still bound, then fence the complete DMA domain. */
+static int centauri_t6050_beta_call(struct centauri_t6050_rewake *rw, bool release)
 {
-	struct pci_dev *fn = pci_get_slot(bus, PCI_DEVFN(slot, 0));
-	struct centauri_t6050 *c;
+	struct pci_dev *fn = pci_get_slot(rw->bridge->subordinate, PCI_DEVFN(rw->slot, 2));
+	const struct apple_centauri_sleep_ops *ops;
+	int ret = 0;
 
 	if (!fn)
-		return;
+		return rw->arena ? -ENODEV : 0;
 	device_lock(&fn->dev);
-	c = fn->dev.driver == &centauri_t6050_driver.driver ? pci_get_drvdata(fn) : NULL;
-	if (c && !c->firmware_sleep) {
-		/* No boot step runs from here on: the functions are removed next */
-		WRITE_ONCE(c->removing, true);
-		cancel_delayed_work_sync(&c->boot_work);
-		mutex_lock(&c->boot_lock);
-		c->firmware_sleep = true;
-		/* Pairs with the readers of ready: nothing of the boot is used from here on */
-		smp_store_release(&c->ready, false);
-		centauri_t6050_wifi_unregister(c);
-		centauri_t6050_free_boot(c);
-		c->boot_phase = CEN_BOOT_STOPPED;
-		mutex_unlock(&c->boot_lock);
-		pci_info(fn, "N1 after a suspend given up before its own: Wi-Fi and IPC released before the functions are removed%s\n",
-			 c->ipc || c->firmware || c->descriptor ? "; DMA still held" : "");
+	if (rw->beta && rw->beta != fn) {
+		ret = -ENODEV;
+		goto unlock;
 	}
+	ops = rw->ops;
+	if (ops) {
+		if (!try_module_get(ops->owner)) {
+			ret = -ENODEV;
+		} else {
+			ret = release ? ops->release(rw->data) : ops->quiesce(rw->data);
+			if (release && !ops->retained(rw->data))
+				rw->arena = NULL;
+			module_put(ops->owner);
+		}
+	} else if (release && rw->arena && rw->beta == fn) {
+		/* Original DMA setup is held by the explicit default-domain lease. */
+		memzero_explicit(rw->arena, rw->arena_size);
+		dma_free_coherent(&fn->dev, rw->arena_size, rw->arena, rw->arena_dma);
+		rw->arena = NULL;
+		iommu_device_unuse_default_domain(&fn->dev);
+		rw->beta_lease = false;
+		pci_dev_put(rw->beta);
+		rw->beta = NULL;
+	}
+unlock:
 	device_unlock(&fn->dev);
 	pci_dev_put(fn);
+	return ret;
+}
+
+static bool centauri_t6050_domain_fence(struct centauri_t6050_rewake *rw)
+{
+	struct pci_dev *fn[3];
+	bool stopped = true;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		fn[i] = pci_get_slot(rw->bridge->subordinate, PCI_DEVFN(rw->slot, i));
+		if ((i == 0 && rw->control && fn[i] != rw->control) ||
+		    (i == 2 && rw->beta && fn[i] != rw->beta))
+			stopped = false;
+		if (fn[i])
+			pci_clear_master(fn[i]);
+	}
+	for (i = 0; i < 3; i++) {
+		bool fn_stopped = !fn[i] || centauri_t6050_stop_dma(fn[i]);
+
+		if (!fn_stopped)
+			stopped = false;
+		/*
+		 * Refresh any keep-alive PCI state saved before Control fell
+		 * back to teardown so an aborted suspend cannot restore Bus
+		 * Master or the old header onto a quiesced function whose DMA
+		 * arena was freed. Never save an unreadable/gone function
+		 * (which would snapshot 0xffff); clearing state_saved hands
+		 * suspend_noirq state save and power-state selection back to
+		 * the PCI core.
+		 */
+		if (fn[i] && i > 0 && fn[i]->state_saved &&
+		    (!fn_stopped || pci_save_state(fn[i])))
+			fn[i]->state_saved = false;
+		pci_dev_put(fn[i]);
+	}
+	return stopped;
+}
+
+static int centauri_t6050_quiesce(struct centauri_t6050 *c)
+{
+	int ret;
+
+	WRITE_ONCE(c->removing, true);
+	/* Pairs with control_ready: no new consumer can attach. */
+	smp_store_release(&c->ready, false);
+	cancel_delayed_work_sync(&c->boot_work);
+	/* Never hold boot_lock over an HCI close or Bluetooth work cancellation. */
+	ret = centauri_t6050_beta_call(c->recovery, false);
+	mutex_lock(&c->boot_lock);
+	centauri_t6050_wifi_unregister(c);
+	centauri_t6050_free_irqs(&c->alpha_irqs);
+	centauri_t6050_free_irqs(&c->irqs);
+	c->firmware_sleep = true;
+	c->boot_phase = CEN_BOOT_STOPPED;
+	/*
+	 * A completed teardown already released every published DMA tuple. After
+	 * the host resets N1, the old Alpha/Beta PCI devices can still exist in
+	 * software while only Control is visible in ROM. Do not fence those
+	 * retired functions again unless there is backing left to release.
+	 */
+	if (!ret && (c->ipc || c->firmware || c->descriptor || c->recovery->arena) &&
+	    (!centauri_t6050_domain_fence(c->recovery) ||
+	     !centauri_t6050_ipc_fenced(c->ipc)))
+		ret = -EBUSY;
+	mutex_unlock(&c->boot_lock);
+	if (!ret)
+		ret = centauri_t6050_beta_call(c->recovery, true);
+	if (!ret) {
+		mutex_lock(&c->boot_lock);
+		centauri_t6050_free_boot(c);
+		if (c->ipc || c->firmware || c->descriptor)
+			ret = -EBUSY;
+		mutex_unlock(&c->boot_lock);
+	}
+	return ret;
+}
+
+static int centauri_t6050_rewake_teardown(struct centauri_t6050_rewake *rw)
+{
+	struct pci_dev *fn = pci_get_slot(rw->bridge->subordinate, PCI_DEVFN(rw->slot, 0));
+	struct centauri_t6050 *c;
+	int ret = 0;
+
+	if (!fn)
+		return -ENODEV;
+	/*
+	 * sysfs unbind does not take the rescan lock. Keep the original F0
+	 * locked through tuple fencing and release: .remove transfers these
+	 * same tuples before its devm data and DMA setup can disappear.
+	 */
+	device_lock(&fn->dev);
+	if (rw->control && rw->control != fn) {
+		ret = -ENODEV;
+		goto out;
+	}
+	c = fn->dev.driver == &centauri_t6050_driver.driver ? pci_get_drvdata(fn) : NULL;
+	if (c)
+		ret = centauri_t6050_quiesce(c);
+	/* F0 may have unbound already; the independent owner holds its resources. */
+	if (!ret)
+		ret = centauri_t6050_beta_call(rw, false);
+	/* The independent owner needs a fence only for tuples it still holds. */
+	if (!ret && (rw->ipc || rw->firmware || rw->descriptor || rw->arena) &&
+	    (!centauri_t6050_domain_fence(rw) ||
+	     !centauri_t6050_ipc_fenced(rw->ipc)))
+		ret = -EBUSY;
+	if (!ret)
+		ret = centauri_t6050_beta_call(rw, true);
+	if (ret)
+		goto out;
+	centauri_t6050_release_ipc(rw->ipc);
+	rw->ipc = NULL;
+	if (rw->control) {
+		if (rw->firmware)
+			dma_free_coherent(&fn->dev, rw->firmware_size,
+					  rw->firmware, rw->firmware_dma);
+		if (rw->descriptor)
+			dma_free_coherent(&fn->dev, SZ_16K,
+					  rw->descriptor, rw->descriptor_dma);
+		rw->firmware = NULL;
+		rw->descriptor = NULL;
+		/* A still-bound control registration keeps its lease until remove. */
+		if (fn->dev.driver != &centauri_t6050_driver.driver) {
+			iommu_device_unuse_default_domain(&fn->dev);
+			rw->control_lease = false;
+			pci_dev_put(rw->control);
+			rw->control = NULL;
+		}
+	}
+	ret = rw->arena ? -EBUSY : 0;
+out:
+	device_unlock(&fn->dev);
+	pci_dev_put(fn);
+	return ret;
 }
 
 /*
@@ -574,7 +911,12 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 	 */
 	pm_runtime_get_sync(&bridge->dev);
 	pci_lock_rescan_remove();
-	centauri_t6050_rewake_teardown(bus, rw->slot);
+	ret = centauri_t6050_rewake_teardown(rw);
+	if (ret) {
+		pci_err(bridge, "N1 recovery refused: DMA resources retained (%d, original %d)\n",
+			ret, READ_ONCE(rw->error));
+		goto unlock;
+	}
 	for (i = 2; i >= 0; i--) {
 		fn = pci_get_slot(bus, PCI_DEVFN(rw->slot, i));
 		if (fn)
@@ -654,26 +996,24 @@ unlock:
 	pci_unlock_rescan_remove();
 	pm_runtime_put(&bridge->dev);
 out:
-	pci_dev_put(bridge);
-	kfree(rw);
-	atomic_set(&cen_rewake_queued, 0);
+	mutex_lock(&cen_recovery_lock);
+	if (rw->rerun && !cen_exiting) {
+		rw->rerun = false;
+		rw->work_generation = rw->generation;
+		/* Requeue transfers this work reference to the next generation. */
+		queue_work(cen_rewake_wq, &rw->work);
+		mutex_unlock(&cen_recovery_lock);
+		return;
+	}
+	rw->active = false;
+	rw->error = 0;
+	mutex_unlock(&cen_recovery_lock);
+	kref_put(&rw->ref, centauri_t6050_owner_free);
 }
 
 static void centauri_t6050_queue_rewake(struct pci_dev *fn)
 {
-	struct centauri_t6050_rewake *rw;
-
-	if (!fn->bus->self || atomic_cmpxchg(&cen_rewake_queued, 0, 1))
-		return;
-	rw = kzalloc_obj(*rw, GFP_KERNEL);
-	if (!rw) {
-		atomic_set(&cen_rewake_queued, 0);
-		return;
-	}
-	INIT_WORK(&rw->work, centauri_t6050_rewake_worker);
-	rw->bridge = pci_dev_get(fn->bus->self);
-	rw->slot = PCI_SLOT(fn->devfn);
-	queue_work(cen_rewake_wq, &rw->work);
+	apple_centauri_sleep_recovery_needed(fn, 0);
 }
 
 /* Bluetooth's resume: a suspend stopped after Bluetooth's teardown, before this function's */
@@ -683,48 +1023,302 @@ void apple_centauri_sleep_rewake(struct pci_dev *fn)
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_rewake);
 
+void apple_centauri_sleep_mark_fallback(struct pci_dev *fn)
+{
+	struct centauri_t6050_rewake *rw;
+
+	guard(mutex)(&cen_recovery_lock);
+	if (cen_exiting || !fn->bus->self)
+		return;
+	list_for_each_entry(rw, &cen_recovery_owners, node) {
+		if (rw->bridge == fn->bus->self && rw->slot == PCI_SLOT(fn->devfn)) {
+			rw->beta_fallback = true;
+			return;
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_mark_fallback);
+
+static void centauri_t6050_set_d3hot(struct pci_dev *pdev, bool pme_enable)
+{
+	u16 pmctrl;
+
+	if (!pdev || !pdev->pm_cap)
+		return;
+	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl)) {
+		pmctrl &= ~(PCI_PM_CTRL_STATE_MASK | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl |= (__force u16)PCI_D3hot;
+		if (pme_enable)
+			pmctrl |= PCI_PM_CTRL_PME_ENABLE;
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, pmctrl);
+		mdelay(pdev->d3hot_delay);
+	}
+}
+
+static void centauri_t6050_ensure_d0(struct pci_dev *pdev)
+{
+	u16 pmctrl;
+
+	if (!pdev || !pdev->pm_cap)
+		return;
+	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl) &&
+	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != (__force u16)PCI_D0) {
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
+				      pmctrl & ~PCI_PM_CTRL_STATE_MASK);
+		mdelay(pdev->d3hot_delay);
+	}
+}
+
+static void centauri_t6050_save_memswap(struct pci_dev *pdev, u32 saved[3])
+{
+	pci_read_config_dword(pdev, 0xf88, &saved[0]);
+	pci_read_config_dword(pdev, 0xf8c, &saved[1]);
+	pci_read_config_dword(pdev, 0xf90, &saved[2]);
+}
+
+static void centauri_t6050_verify_memswap(struct pci_dev *pdev, const u32 saved[3])
+{
+	u32 cur[3];
+
+	pci_read_config_dword(pdev, 0xf88, &cur[0]);
+	pci_read_config_dword(pdev, 0xf8c, &cur[1]);
+	pci_read_config_dword(pdev, 0xf90, &cur[2]);
+	if (cur[0] != saved[0] || cur[1] != saved[1] || cur[2] != saved[2]) {
+		pci_info(pdev, "restoring memswap after sleep (%#x/%#x/%#x -> %#x/%#x/%#x)\n",
+			 cur[0], cur[1], cur[2], saved[0], saved[1], saved[2]);
+		pci_write_config_dword(pdev, 0xf88, saved[0]);
+		pci_write_config_dword(pdev, 0xf8c, saved[1]);
+		pci_write_config_dword(pdev, 0xf90, saved[2]);
+	}
+}
+
+static int centauri_t6050_prepare(struct device *dev)
+{
+	struct centauri_t6050 *c = pci_get_drvdata(to_pci_dev(dev));
+
+	if (!apple_centauri_sleep_reboot(c->pdev))
+		return 0;
+	/* No destructive progress unless the independent owner already exists. */
+	if (!c->recovery)
+		return -ENODEV;
+	mutex_lock(&cen_recovery_lock);
+	c->recovery->beta_fallback = false;
+	mutex_unlock(&cen_recovery_lock);
+	mutex_lock(&c->boot_lock);
+	centauri_t6050_wifi_pm_prepare(c);
+	c->pm_prepared = true;
+	mutex_unlock(&c->boot_lock);
+	return 0;
+}
+
+static void centauri_t6050_complete(struct device *dev)
+{
+	struct centauri_t6050 *c = pci_get_drvdata(to_pci_dev(dev));
+	int error;
+
+	mutex_lock(&c->boot_lock);
+	if (!c->pm_prepared) {
+		mutex_unlock(&c->boot_lock);
+		return;
+	}
+	error = centauri_t6050_wifi_pm_error(c);
+	centauri_t6050_wifi_pm_complete(c);
+	c->pm_prepared = false;
+	mutex_unlock(&c->boot_lock);
+	/* Complete also runs if cfg80211 refused suspend before F0 suspend ran. */
+	if (error || c->firmware_sleep)
+		apple_centauri_sleep_recovery_needed(c->pdev, error);
+}
+
 static int centauri_t6050_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	struct pci_dev *fn1;
+	bool beta_fallback;
 	int ret;
 
-	guard(mutex)(&c->boot_lock);
-	/* Down since an earlier suspend (a dark wake, or a warm reset not run yet or failed) */
-	if (c->firmware_sleep) {
-		centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
-		apple_pcie_t6050_sleep_reset(pdev->bus->self);
-		return pci_save_state(pdev);
-	}
-	/* A boot that failed is taken down too: the warm reset after the wake boots the N1 again */
-	if (c->boot_phase != CEN_BOOT_READY && c->boot_phase != CEN_BOOT_FAILED)
-		return -EBUSY;
 	if (!apple_centauri_sleep_reboot(pdev))
 		return c->boot_phase == CEN_BOOT_READY ? pci_save_state(pdev) : -EBUSY;
 
-	/* Bluetooth (Function 2, a consumer of this one) has already stopped itself */
-	c->firmware_sleep = true;
-	/* Pairs with the readers of ready: nothing of the boot is used from here on */
-	smp_store_release(&c->ready, false);
-	centauri_t6050_wifi_unregister(c);
-	centauri_t6050_free_boot(c);
-	if (c->ipc || c->firmware || c->descriptor)
-		dev_warn(dev, "N1 before the sleep: DMA still held\n");
-	c->boot_phase = CEN_BOOT_STOPPED;
+	mutex_lock(&cen_recovery_lock);
+	beta_fallback = c->recovery && c->recovery->beta_fallback;
+	mutex_unlock(&cen_recovery_lock);
+
+	c->firmware_kept = false;
+	c->control_sleep_sent = false;
+	c->keep_alive_pme = false;
+	if (!beta_fallback && c->boot_phase == CEN_BOOT_READY && c->ipc && c->wifi &&
+	    !centauri_t6050_wifi_pm_error(c) &&
+	    !centauri_t6050_wifi_pm_disconnected(c) &&
+	    readl(c->bar + 0x8000) == 2 && readl(c->bar + 0x8050) == 2) {
+		bool wifi_sleep_sent = false;
+		int unwind_err = 0, wake_ret;
+		u32 id0 = 0, id1 = 0;
+
+		fn1 = centauri_t6050_ipc_alpha_dev(c);
+		if (!fn1 || pci_read_config_dword(pdev, PCI_VENDOR_ID, &id0) ||
+		    pci_read_config_dword(fn1, PCI_VENDOR_ID, &id1) ||
+		    (id0 & 0xffff) != pdev->vendor || (id1 & 0xffff) != fn1->vendor ||
+		    id0 == ~0U || id1 == ~0U) {
+			ret = -ENODEV;
+		} else {
+			ret = centauri_t6050_wifi_suspend(c);
+			if (!ret)
+				wifi_sleep_sent = true;
+		}
+		if (!ret) {
+			ret = centauri_t6050_ipc_control_sleep(c, true);
+			if (!ret)
+				c->control_sleep_sent = true;
+		}
+		if (!ret)
+			ret = pci_save_state(fn1);
+		if (!ret)
+			ret = pci_save_state(pdev);
+		if (!ret) {
+			c->saved_pci_id[0] = id0;
+			c->saved_pci_id[1] = id1;
+			centauri_t6050_save_memswap(pdev, c->saved_memswap[0]);
+			centauri_t6050_save_memswap(fn1, c->saved_memswap[1]);
+			apple_pcie_t6050_sleep_keep_alive(pdev->bus->self);
+			c->keep_alive_pme = centauri_t6050_wifi_wowlan_armed(c);
+			c->firmware_kept = true;
+			dev_dbg(dev, "N1 kept alive for firmware sleep\n");
+			return 0;
+		}
+		dev_warn(dev, "N1 keep-alive suspend failed (%d); falling back to warm-reset sleep\n",
+			 ret);
+		if (c->control_sleep_sent) {
+			wake_ret = centauri_t6050_ipc_control_sleep(c, false);
+			if (wake_ret) {
+				dev_warn(dev,
+					 "Control ACIPC host wake failed during fallback (%d)\n",
+					 wake_ret);
+				unwind_err = wake_ret;
+			}
+			c->control_sleep_sent = false;
+		}
+		if (wifi_sleep_sent) {
+			wake_ret = centauri_t6050_wifi_resume(c);
+			if (wake_ret) {
+				dev_warn(dev,
+					 "Alpha host wake failed during fallback (%d)\n",
+					 wake_ret);
+				if (!unwind_err)
+					unwind_err = wake_ret;
+			}
+		}
+		if (unwind_err) {
+			centauri_t6050_wifi_mark_failed(c);
+			/* Also covers an aborted suspend where resume/rewake may not run. */
+			apple_centauri_sleep_recovery_needed(pdev, unwind_err);
+		}
+	}
+
+	ret = centauri_t6050_quiesce(c);
+	if (ret)
+		goto recover;
 	ret = centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
 	if (ret)
-		dev_warn(dev, "N1 before the sleep: SMC writes: %d\n", ret);
-	/* No wake armed: request a warm-reset replay after host link shutdown. */
+		goto recover;
 	apple_pcie_t6050_sleep_reset(pdev->bus->self);
-	dev_dbg(dev, "N1 down for the sleep: Wi-Fi and IPC released\n");
-	return pci_save_state(pdev);
+	ret = pci_save_state(pdev);
+	if (!ret)
+		return 0;
+recover:
+	apple_centauri_sleep_recovery_needed(pdev, ret);
+	return ret;
+}
+
+static int centauri_t6050_suspend_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	struct pci_dev *fn1;
+
+	if (!c->firmware_kept || !pm_suspend_via_firmware())
+		return 0;
+	fn1 = centauri_t6050_ipc_alpha_dev(c);
+	centauri_t6050_set_d3hot(fn1, c->keep_alive_pme);
+	centauri_t6050_set_d3hot(pdev, c->keep_alive_pme);
+	return 0;
+}
+
+static int centauri_t6050_resume_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	struct pci_dev *fn1;
+	u32 id0 = 0, id1 = 0;
+	u16 cmd0 = 0, cmd1 = 0, pm0 = 0, pm1 = 0;
+
+	if (!c->firmware_kept)
+		return 0;
+	fn1 = centauri_t6050_ipc_alpha_dev(c);
+	pci_read_config_dword(pdev, PCI_VENDOR_ID, &id0);
+	if (fn1)
+		pci_read_config_dword(fn1, PCI_VENDOR_ID, &id1);
+	if (!fn1 || id0 != c->saved_pci_id[0] || id1 != c->saved_pci_id[1]) {
+		dev_err(dev, "N1 noirq wake: unexpected ids fn0=%#x fn1=%#x\n", id0, id1);
+		return 0;
+	}
+	centauri_t6050_ensure_d0(pdev);
+	pci_set_master(pdev);
+	centauri_t6050_verify_memswap(pdev, c->saved_memswap[0]);
+
+	centauri_t6050_ensure_d0(fn1);
+	pci_restore_state(fn1);
+	pci_set_master(fn1);
+	centauri_t6050_verify_memswap(fn1, c->saved_memswap[1]);
+
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd0);
+	pci_read_config_word(fn1, PCI_COMMAND, &cmd1);
+	if (pdev->pm_cap)
+		pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pm0);
+	if (fn1->pm_cap)
+		pci_read_config_word(fn1, fn1->pm_cap + PCI_PM_CTRL, &pm1);
+	dev_dbg(dev, "N1 noirq wake: fn0=%#x(cmd=%#x pm=%#x exec=%u ipc=%u) fn1=%#x(cmd=%#x pm=%#x msi=%d)\n",
+		id0, cmd0, pm0, readl(c->bar + 0x8000), readl(c->bar + 0x8050),
+		id1, cmd1, pm1, fn1->msi_enabled);
+	return 0;
 }
 
 static int centauri_t6050_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct centauri_t6050 *c = pci_get_drvdata(pdev);
-	int ret;
+	int ret = 0;
+
+	if (c->firmware_kept) {
+		struct pci_dev *fn1 = centauri_t6050_ipc_alpha_dev(c);
+		u32 id0 = 0, id1 = 0;
+		bool ctrl_sleep = c->control_sleep_sent;
+
+		c->firmware_kept = false;
+		c->control_sleep_sent = false;
+		pci_read_config_dword(pdev, PCI_VENDOR_ID, &id0);
+		if (fn1)
+			pci_read_config_dword(fn1, PCI_VENDOR_ID, &id1);
+		if (!fn1 || id0 != c->saved_pci_id[0] || id1 != c->saved_pci_id[1])
+			ret = -ENODEV;
+		else if (ctrl_sleep)
+			ret = centauri_t6050_ipc_control_sleep(c, false);
+		else if (readl(c->bar + 0x8000) != 2 || readl(c->bar + 0x8050) != 2)
+			ret = -EIO;
+		if (!ret)
+			ret = centauri_t6050_wifi_resume(c);
+		if (!ret) {
+			dev_dbg(dev, "N1 resumed alive after firmware sleep\n");
+			return 0;
+		}
+		dev_err(dev, "N1 keep-alive wake failed (%d, fn0=%#x fn1=%#x ctrl exec=%#x ipc=%#x); scheduling warm-reset recovery\n",
+			ret, id0, id1,
+			id0 == c->saved_pci_id[0] ? readl(c->bar + 0x8000) : ~0U,
+			id0 == c->saved_pci_id[0] ? readl(c->bar + 0x8050) : ~0U);
+		apple_centauri_sleep_recovery_needed(pdev, ret);
+		return 0;
+	}
 
 	if (!c->firmware_sleep)
 		return 0;
@@ -736,7 +1330,12 @@ static int centauri_t6050_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(centauri_t6050_pm_ops, centauri_t6050_suspend, centauri_t6050_resume);
+static const struct dev_pm_ops centauri_t6050_pm_ops = {
+	.prepare = centauri_t6050_prepare,
+	.complete = centauri_t6050_complete,
+	SYSTEM_SLEEP_PM_OPS(centauri_t6050_suspend, centauri_t6050_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(centauri_t6050_suspend_noirq, centauri_t6050_resume_noirq)
+};
 
 static const struct pci_device_id centauri_t6050_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900) },
@@ -770,9 +1369,25 @@ module_init(centauri_t6050_init);
 
 static void __exit centauri_t6050_exit(void)
 {
+	struct centauri_t6050_rewake *rw, *next;
+
+	mutex_lock(&cen_recovery_lock);
+	cen_exiting = true;
+	mutex_unlock(&cen_recovery_lock);
+	/* Drain before unregister: no worker can race callback data destruction. */
+	flush_workqueue(cen_rewake_wq);
 	pci_unregister_driver(&centauri_t6050_driver);
 	/* Drains a pending rewake before the module's code goes */
 	destroy_workqueue(cen_rewake_wq);
+	list_for_each_entry_safe(rw, next, &cen_recovery_owners, node) {
+		list_del(&rw->node);
+		/* Retained DMA must keep its device/domain ownership even at unload. */
+		if (rw->arena || rw->ipc || rw->firmware || rw->descriptor) {
+			pci_warn(rw->bridge, "N1 unload retaining unfenced DMA; reboot required\n");
+			continue;
+		}
+		kref_put(&rw->ref, centauri_t6050_owner_free);
+	}
 }
 module_exit(centauri_t6050_exit);
 MODULE_LICENSE("GPL");
