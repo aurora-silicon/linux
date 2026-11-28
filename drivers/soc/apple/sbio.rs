@@ -5720,8 +5720,11 @@ impl SepData {
                      PRIVATE_TYPE_CATACOMB_MASTER];
         let readable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
             || crate::catacomb::is_saved(kind));
-        let writable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
-            || crate::catacomb::writable(kind));
+        let writable = kinds.map(|kind| if catacomb_needed_for_enrol(kind, live_count) {
+            crate::catacomb::writable(kind)
+        } else {
+            crate::catacomb::publishable(kind)
+        });
         let index = self.bio_index.lock();
         let preconditions = EnrolPrerequisites {
             lane,
@@ -5807,8 +5810,13 @@ impl SepData {
         }
         drop(index);
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
-        // The host must be able to create and sync the owner file before a
-        // system-context write. A pre-existing invalid file is left intact.
+        // open_fresh_context() saves MASTER as well as OWNER after SYSTEM
+        // SELECT_CONTEXT; refuse before reserving OWNER if MASTER cannot publish.
+        if !crate::catacomb::publishable(PRIVATE_TYPE_CATACOMB_MASTER) {
+            return Err(EROFS);
+        }
+        // The host must be able to publish, create and sync the owner file
+        // before a system-context write. A pre-existing invalid file is left intact.
         crate::catacomb::prepare_missing_owner()?;
         loop {
             self.wait_until_awake()?;

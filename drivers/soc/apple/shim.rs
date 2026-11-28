@@ -10,6 +10,10 @@ extern "C" {
     fn sep_store_open_host(path: *const c_char, created: *mut bool) -> *mut c_void;
     fn sep_store_open_trunc(path: *const c_char) -> *mut c_void;
     fn sep_store_open_writable_existing(path: *const c_char) -> *mut c_void;
+    fn sep_store_replaceable(path: *const c_char) -> c_int;
+    fn sep_store_publishable(path: *const c_char) -> c_int;
+    fn sep_store_replace(path: *const c_char, head: *const c_void, head_len: usize,
+                         body: *const c_void, body_len: usize) -> c_int;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_open_internal_block(path: *const c_char, writable: c_int) -> *mut c_void;
@@ -27,6 +31,31 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
     // the duration of the call, and `sep_random_bytes` writes exactly that many
     // bytes (via `get_random_bytes`) and retains no reference to the buffer.
     let ret = unsafe { sep_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
+    kernel::error::to_result(ret)
+}
+
+/// Whether `replace_file()` can publish over an existing `path`. Checked before
+/// changes the enclave cannot undo; later races, I/O or policy errors can still fail.
+pub(crate) fn replaceable(path: &CStr) -> Result<()> {
+    // SAFETY: path is NUL-terminated and the shim retains no pointer to it.
+    kernel::error::to_result(unsafe { sep_store_replaceable(path.as_char_ptr()) })
+}
+
+/// Whether `replace_file()` can publish at `path` when the file may not exist yet.
+pub(crate) fn publishable(path: &CStr) -> Result<()> {
+    // SAFETY: path is NUL-terminated and the shim retains no pointer to it.
+    kernel::error::to_result(unsafe { sep_store_publishable(path.as_char_ptr()) })
+}
+
+/// Atomically replaces a complete file and synchronises its parent directory.
+/// On an error after rename the complete new file can already be visible.
+pub(crate) fn replace_file(path: &CStr, head: &[u8], body: &[u8]) -> Result<()> {
+    // SAFETY: path is NUL-terminated and both slices remain valid for the whole
+    // call. The shim consumes these bytes synchronously and retains no pointer.
+    let ret = unsafe {
+        sep_store_replace(path.as_char_ptr(), head.as_ptr().cast(), head.len(),
+                          body.as_ptr().cast(), body.len())
+    };
     kernel::error::to_result(ret)
 }
 
