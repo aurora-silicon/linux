@@ -66,9 +66,10 @@
  * (dp-switch-* on the engine and on each port's direct DP output), for the ports whose PHY,
  * crossbar and PD controller this tree describes: ATC1 (left-front) and ATC2 (right). The
  * loader hands an engine over with its routes, or leaves it, and what its routes need,
- * disabled. dcpext0's route through ATC2 in t6050-die0.dtsi is dropped, with the PHY and
- * crossbar it names, so that its routes come from the ADT too (the loader writes no routes for
- * an engine that already names PHYs or crossbars).
+ * disabled. dcpext0's route through ATC2 in t6050-die0.dtsi is dropped, with the PHY,
+ * crossbar and DPTX die it names, so that its routes come from the ADT too (the loader writes
+ * no routes for an engine that already names PHYs or crossbars, and writes apple,dptx-die with
+ * the routes it adds; the binding allows none of them beside an empty typec-routes).
  */
 &dcpext0 {
 	/delete-property/ apple,typec-dptx-phys;
@@ -77,6 +78,7 @@
 	/delete-property/ phy-names;
 	/delete-property/ mux-controls;
 	/delete-property/ mux-control-names;
+	/delete-property/ apple,dptx-die;
 
 	typec-routes {
 		/delete-node/ route@0;
