@@ -219,9 +219,18 @@ struct sep_bio_lockout {
 #define SEP_BIO_REARM_SECRET_MAX 1024
 struct sep_bio_rearm {
 	__u32 secret_len;
-	__u32 reserved;
+	__u32 flags;     /* SEP_BIO_REARM_FLAG_*; older kernels: -EINVAL if set */
 	__u8  secret[SEP_BIO_REARM_SECRET_MAX];
 };
+
+/*
+ * End only the wait for the first password since boot
+ * (SEP_BIO_REQUIRE_PASSWORD), for a verified password of an account that has
+ * no enrolled finger yet. A lockout, the failed attempts and the lockout
+ * record stay as they are and still need SEP_BIO_REARM without this flag.
+ * Returns 0 also when the wait was already over.
+ */
+#define SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY 1
 
 #define SEP_BIO_REARM _IOW(SEP_BIO_IOC_MAGIC, 0x0f, struct sep_bio_rearm)
 

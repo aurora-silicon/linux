@@ -5397,7 +5397,13 @@ impl SepData {
             bio::IOC_LOCKOUT_STATE => self.write_lockout_state(arg),
             bio::IOC_REARM => {
                 bio::require_admin()?;
-                self.rearm_after_password(bio::read_rearm(arg)?)
+                let request = bio::read_rearm(arg)?;
+                if request.boot_wait_only {
+                    self.end_boot_wait_after_password(request.password);
+                    Ok(())
+                } else {
+                    self.rearm_after_password(request.password)
+                }
             }
             bio::IOC_REQUIRE_PASSWORD => {
                 bio::require_admin()?;
@@ -5412,6 +5418,28 @@ impl SepData {
             }
             _ => Err(ENOTTY),
         }
+    }
+
+    /// `REARM` with `REARM_FLAG_BOOT_WAIT_ONLY`: ends only the wait for the
+    /// first password since boot. Userspace asks for this after verifying the
+    /// password of an account that has not enrolled a finger yet, at this
+    /// machine's own login screen: the wait belongs to the machine, so that
+    /// password ends it, as on macOS, where the login password enables Touch
+    /// ID for fingers added later in that boot. It is no enrolled user's
+    /// password, though, so a lockout, the failed matches and the lockout
+    /// record are left as they are: the saved record is handed to the enclave
+    /// as after any first password, and whatever it holds still needs a
+    /// password through the plain `REARM`. The check and the change are this
+    /// one exchange, so nothing userspace read before can go stale.
+    fn end_boot_wait_after_password(&self, _password: crate::Secret) {
+        if self.bio_after_boot.xchg(false, Relaxed) {
+            self.bio_lockout_logged.store(false, Relaxed);
+            dev_info_ratelimited!(
+                self.dev,
+                "Touch ID: armed by the first password since this boot (an account with no fingerprints yet; a lockout, if any, stays)\n"
+            );
+        }
+        self.import_lockout_after_password();
     }
 
     /// Userspace calls this only after the user's password was verified. The

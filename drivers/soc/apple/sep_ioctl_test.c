@@ -437,7 +437,7 @@ static void sep_bio_session_rules(struct kunit *test)
 	sep_kunit_bio_free(bio);
 }
 
-/* REARM: the password length and reserved word, from user memory. */
+/* REARM: the password length and flags word, from user memory. */
 static void sep_rearm_request(struct kunit *test)
 {
 	static const u32 bad_len[] = { 0, 1025, 0x7fffffff, 0xffffffff };
@@ -455,9 +455,15 @@ static void sep_rearm_request(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, sep_kunit_rearm_read(m.base + 5), -EINVAL);
 	}
 	put_unaligned_le32(1024, req);
-	put_unaligned_le32(1, req + 4);
+	for (i = 1; i < 32; i++) {
+		/* Only SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY is known. */
+		put_unaligned_le32(BIT(i), req + 4);
+		put(test, &m, 5, req, 1032);
+		KUNIT_EXPECT_EQ(test, sep_kunit_rearm_read(m.base + 5), -EINVAL);
+	}
+	put_unaligned_le32(1, req + 4);	/* SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY */
 	put(test, &m, 5, req, 1032);
-	KUNIT_EXPECT_EQ(test, sep_kunit_rearm_read(m.base + 5), -EINVAL);
+	KUNIT_EXPECT_EQ(test, sep_kunit_rearm_read(m.base + 5), 0);
 	put_unaligned_le32(0, req + 4);
 	put(test, &m, 5, req, 1032);
 	KUNIT_EXPECT_EQ(test, sep_kunit_rearm_read(m.base + 5), 0);
