@@ -35,7 +35,17 @@ impl InitData {
     ) -> Result {
         self.status_a = v::private::STATUS_A;
         self.status_b = v::private::STATUS_B;
-        self.map_register_windows(env, cfg.windows)?;
+        let calibration = if cfg.requires_calibration() {
+            Some(Calibration::read(env.dev, env.clusters)?)
+        } else {
+            Calibration::read_opt(env.dev, env.clusters)?
+        };
+        let mut windows = KVec::with_capacity(cfg.windows.len(), GFP_KERNEL)?;
+        windows.extend_from_slice(cfg.windows, GFP_KERNEL)?;
+        if let Some(ref cal) = calibration {
+            cal.apply_mcc(&mut windows)?;
+        }
+        self.map_register_windows(env, &windows)?;
         let tables = self.build_descriptor_tables(env, v::private::SIZE)?;
         self.build_render_free_lists(env)?;
         let first_block = self.build_render_pool(env)?;
@@ -43,17 +53,30 @@ impl InitData {
         let bundle = self.build_bundle(env, cfg, metrics)?;
         let objects = self.build_25g83_objects(env, variant.split_firmware_area)?;
         self.views = Some(objects.views);
-        self.initialize_25g83(env, cfg, active_cores, &tables, &bundle, &objects, variant)?;
+        let max_power_mw = self.initialize_25g83(
+            env,
+            cfg,
+            &windows,
+            active_cores,
+            &tables,
+            &bundle,
+            &objects,
+            variant,
+            calibration.as_ref(),
+        )?;
         if variant.v26b123 {
             self.upgrade_26b123(
                 env,
                 cfg,
+                &windows,
                 active_cores,
+                max_power_mw,
                 &bundle,
                 objects.aon,
                 objects.power_state,
                 objects.firmware_area,
                 objects.views,
+                calibration.as_ref(),
             )?;
         }
         if cfg.uat_quirks.clean_tables {
@@ -93,24 +116,40 @@ impl InitData {
     }
 
     /// Writes the 25G83 firmware objects using the chip calibration, then
-    /// stages the opening control-ring state.
+    /// stages the opening control-ring state. Returns the resolved `max_power_mw`.
+    #[expect(clippy::too_many_arguments, reason = "Explicit retained graph objects")]
     fn initialize_25g83(
         &mut self,
         env: &BuildEnv<'_>,
         cfg: &Config,
+        windows: &[abi::RegisterWindow],
         active_cores: u32,
         tables: &DescriptorTables,
         bundle: &BundleObjects,
         objects: &Objects,
         variant: &crate::g17::fw::Variant,
-    ) -> Result {
+        calibration: Option<&Calibration>,
+    ) -> Result<u32> {
         let bundle_va = self.object(self.bundle)?.gpu_va();
         let cluster_va = self.object(self.cluster)?.gpu_va();
         let config_va = cluster_va + v::private::CONFIG as u64;
         let status_a_va = cluster_va + v::private::STATUS_A as u64;
         let status_b_va = cluster_va + v::private::STATUS_B as u64;
         let chip = cfg.chip;
-        let aon_table = chip.map_or(v::AON_TABLE.as_slice(), |chip| chip.aon_table);
+        let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
+        let cs_opps = Self::opp_table(env.dev, c_str!("apple,cs-opp"))?;
+        let afr_opps = Self::opp_table(env.dev, c_str!("apple,afr-opp"))?;
+        if let Some(cal) = calibration {
+            cal.check_opps(&opps)?;
+        }
+        let aon_table: &[u32] = match (chip, calibration) {
+            (None, _) => v::AON_TABLE.as_slice(),
+            (Some(chip), Some(cal)) if chip.aon_table => {
+                cal.aon_table.as_ref().ok_or(EINVAL)?.as_slice()
+            }
+            (Some(chip), None) if chip.aon_table => return Err(EINVAL),
+            (Some(_), _) => &[],
+        };
         let aon_va = match aon_table.is_empty() {
             true => 0,
             false => self.object(objects.aon)?.gpu_va(),
@@ -126,29 +165,19 @@ impl InitData {
             *va = self.object(index)?.gpu_va();
         }
 
-        let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
-        let cs_opps = Self::opp_table(env.dev, c_str!("apple,cs-opp"))?;
-        let afr_opps = Self::opp_table(env.dev, c_str!("apple,afr-opp"))?;
-        let calibration = if chip.is_none() {
-            let calibration = Calibration::read(env.dev)?;
-            calibration.check_opps(&opps)?;
-            Some(calibration)
-        } else {
-            None
-        };
-        let (perf, max_power_mw, leakage) = match (calibration.as_ref(), chip) {
-            (Some(calibration), None) => (
-                &calibration.perf,
-                calibration.max_power_mw,
-                &calibration.leakage,
+        let (perf, max_power_mw, leakage) = match (calibration, chip) {
+            (Some(cal), _) => (&cal.perf, cal.max_power_mw, &cal.leakage),
+            (None, Some(chip)) => (
+                cfg.perf()?,
+                chip.max_power_mw.ok_or(EINVAL)?,
+                chip.leakage.as_ref().ok_or(EINVAL)?,
             ),
-            (None, Some(chip)) => (cfg.perf()?, chip.max_power_mw, &chip.leakage),
-            _ => return Err(EINVAL),
+            (None, None) => return Err(EINVAL),
         };
         self.active_effort = super::active_effort(&opps, perf)?;
         let hw_args = abi::HwDataArgs {
             chip_id: cfg.chip_id,
-            windows: cfg.windows,
+            windows,
             reserved_slots: cfg.reserved_slots,
             opps: &opps,
             perf,
@@ -267,6 +296,6 @@ impl InitData {
                 .store(value, Ordering::Relaxed);
         }
         fence(Ordering::SeqCst);
-        Ok(())
+        Ok(max_power_mw)
     }
 }

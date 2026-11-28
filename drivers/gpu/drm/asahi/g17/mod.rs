@@ -197,6 +197,15 @@ impl Config {
     pub(crate) fn region_c(&self) -> Result<&'static fw::initdata::RegionCConfig> {
         self.region_c.ok_or(EINVAL)
     }
+
+    /// Whether a 25G83-graph configuration requires loader calibration from DT
+    /// (no static power ceiling or leakage fallback).
+    pub(crate) const fn requires_calibration(&self) -> bool {
+        match self.chip {
+            Some(chip) => !chip.has_static_power(),
+            None => true,
+        }
+    }
 }
 
 impl FirmwareProfile {
@@ -1997,26 +2006,49 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
-        let calibration = if cfg.chip_id == crate::hw::t6040::CHIP_ID {
-            Some(calibration::Calibration::read(dev).inspect_err(|_| {
-                dev_err!(
-                    dev.as_ref(),
-                    "Missing or invalid T6040 GPU calibration handoff\n"
-                );
-            })?)
-        } else {
-            None
-        };
         let id = regs.get_g17_id()?;
         let active_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let (variant, build_cfg) =
             Self::firmware_variant(dev, &cfg.firmware, (id.num_clusters, active_cores))?;
         // A build with its own configuration of the SoC runs with that one.
         let cfg = build_cfg.unwrap_or(cfg);
-        if let Some(calibration) = calibration {
-            calibration.check_cores(&id.core_masks)?;
-            calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
-        }
+        let calibration = if variant.graph == fw::variant::InitGraph::V25G83 {
+            let calibration = if cfg.requires_calibration() {
+                Some(
+                    calibration::Calibration::read(dev, id.num_clusters).inspect_err(|_| {
+                        dev_err!(
+                            dev.as_ref(),
+                            "Missing or invalid v2 GPU calibration ({} clusters, {:#x})\n",
+                            id.num_clusters,
+                            cfg.chip_id
+                        );
+                    })?,
+                )
+            } else {
+                calibration::Calibration::read_opt(dev, id.num_clusters).inspect_err(|_| {
+                    dev_err!(
+                        dev.as_ref(),
+                        "Invalid GPU calibration handoff for {}-cluster chip {:#x}\n",
+                        id.num_clusters,
+                        cfg.chip_id
+                    );
+                })?
+            };
+            if let Some(ref calibration) = calibration {
+                calibration.check_cores(&id.core_masks)?;
+                let mut windows = KVec::with_capacity(cfg.windows.len(), GFP_KERNEL)?;
+                windows.extend_from_slice(cfg.windows, GFP_KERNEL)?;
+                calibration.apply_mcc(&mut windows)?;
+                calibration.check_opps(&initdata::InitData::opps(
+                    dev,
+                    cfg.opps,
+                    id.num_clusters,
+                )?)?;
+            }
+            calibration
+        } else {
+            None
+        };
         if id.family != cfg.identity.family
             || id.variant != cfg.identity.variant
             || id.num_dies != cfg.identity.num_dies
@@ -2151,7 +2183,8 @@ impl Gpu {
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
         let events = Arc::new(Shared::new_events_queue(m5)?, GFP_KERNEL)?;
-        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
+        let frequencies =
+            Self::state_frequencies(dev, cfg, variant, id.num_clusters, calibration.as_ref())?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
@@ -2411,6 +2444,7 @@ impl Gpu {
         cfg: &'static Config,
         variant: &fw::variant::Variant,
         clusters: u32,
+        calibration: Option<&calibration::Calibration>,
     ) -> Result<Option<stats::StateFrequencies>> {
         if !stats::reports_pstate(variant.telemetry_protocol) {
             return Ok(None);
@@ -2420,7 +2454,10 @@ impl Gpu {
                 board.perf_states.iter().map(|state| state.0),
             ));
         }
-        let perf = cfg.perf()?;
+        let perf = match calibration {
+            Some(calibration) => &calibration.perf,
+            None => cfg.perf()?,
+        };
         let opps = initdata::InitData::opps(dev, cfg.opps, clusters)?;
         let mut mhz = [0u32; fw::initdata::PERF_STATES];
         for (slot, &index) in mhz.iter_mut().zip(perf.states_a.iter()) {

@@ -118,10 +118,7 @@ T6041_ITEMS = SOC_ITEMS + [
 
 J616C_ITEMS = [
     "const REGISTER_WINDOWS: [",
-    "const PERF: PerfConfig",
-    "const MAX_POWER_MW",
     "const REGION_C",
-    "const AON_TABLE",
     "const CHIP: ",
     "const POWER_CONFIG_WORDS",
 ]
@@ -181,6 +178,8 @@ fn build(
     aux: &[Opp],
     chip: &v25g83::Chip,
     region_c: &RegionCConfig,
+    max_power_mw: u32,
+    leakage: &[u32; 56],
     cores: u32,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let args = HwDataArgs {
@@ -199,11 +198,11 @@ fn build(
     let mut hw: Box<v25g83::HwData25G83> = unsafe { Box::new(core::mem::zeroed()) };
     hw.init(&args, &ext).unwrap();
     let mut power: Box<v25g83::PowerConfig25G83> = unsafe { Box::new(core::mem::zeroed()) };
-    power.init(0xffff_fc20_000d_3440, 0, 0, chip.max_power_mw, &chip.leakage);
+    power.init(0xffff_fc20_000d_3440, 0, 0, max_power_mw, leakage);
     power.apply_chip(chip).unwrap();
     let mut region: Box<RegionC> = unsafe { Box::new(core::mem::zeroed()) };
     region.init(region_c);
-    region.max_power_mw = region_c.max_power_mw;
+    region.max_power_mw = max_power_mw;
     let hw_bytes = unsafe {
         core::slice::from_raw_parts((&*hw as *const v25g83::HwData25G83).cast::<u8>(),
                                     size_of::<v25g83::HwData25G83>())
@@ -216,16 +215,26 @@ fn build(
 
 fn main() {
     let out = std::env::args().nth(1).unwrap();
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+
+    // 40-core T6041 retains its measured static capture data and computes 0x9ec dynamically.
+    let t6041_mw = t6041::CHIP.max_power_mw.unwrap();
+    let t6041_leakage = t6041::CHIP.leakage.as_ref().unwrap();
+    assert!(!t6041::CHIP.aon_table);
+    assert!(!t6041::POWER_CONFIG_WORDS.iter().any(|&(off, _, _)| off == 0x9ec));
     let (hw, power, region) = build(t6041::CHIP_ID, &t6041::REGISTER_WINDOWS,
         &t6041::RESERVED_SLOTS, &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP,
-        &t6041::REGION_C, 40);
+        &t6041::REGION_C, t6041_mw, t6041_leakage, 40);
+    assert_eq!(word(&power, 0x9ec), 0xbbfc_a403, "40-core dynamic 0x9ec must match 129702 mW");
     println!("T6041 initialization objects built");
     std::fs::write(format!("{}/t6041-hwdata.bin", out), &hw).unwrap();
     std::fs::write(format!("{}/t6041-power-config.bin", out), &power).unwrap();
     std::fs::write(format!("{}/t6041-region-c.bin", out), &region).unwrap();
+
     // 25G83: the same configuration with its own register map, and 0 at +0x2610.
     let (hw_g83, power_g83, region_g83) = build(t6041::CHIP_ID, &t6041::REGISTER_WINDOWS_25G83,
-        &[], &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP_25G83, &t6041::REGION_C, 40);
+        &[], &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP_25G83, &t6041::REGION_C,
+        t6041_mw, t6041_leakage, 40);
     println!("T6041 25G83 initialization objects built");
     // The power configuration keeps the 25G83 starting values of the performance limiter.
     let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
@@ -244,11 +253,65 @@ fn main() {
                "the 25G83 hardware data differs only in its register map and +0x2610");
     assert_eq!((hw[0x2610], hw_g83[0x2610]), (1, 0), "+0x2610: 1 on 25F84, 0 on 25G83");
     std::fs::write(format!("{}/t6041-25g83-hwdata.bin", out), &hw_g83).unwrap();
-    // The 32-core J616C on 25G83, from its operating points. What it ran with since October
-    // 2026, hashed without the runtime words (FNV-1a 64), from a dump of 25 Oct 2026.
+
+    // 32-core J616C (t6041_25g83) has NO static power, leakage, or 0x9ec fallback.
+    assert!(t6041_25g83::CHIP.max_power_mw.is_none());
+    assert!(t6041_25g83::CHIP.leakage.is_none());
+    assert!(t6041_25g83::CHIP.aon_table);
+    assert_eq!(t6041_25g83::REGION_C.max_power_mw, 0);
+    assert_eq!(
+        t6041_25g83::POWER_CONFIG_WORDS.iter().map(|&(off, _, _)| off).collect::<Vec<_>>(),
+        vec![0x3b5c, 0x6328, 0x632c, 0x6360],
+        "t6041_25g83 must carry only the four 4-cluster T6041 words"
+    );
+
+    // Build 32-core J616C from synthetic v2 DT calibration inputs and verify every dynamic word.
+    let v2_perf = PerfConfig {
+        states_a: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
+        states_b: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
+        relative_a: [0, 10, 18, 25, 31, 40, 50, 62, 70, 78, 100],
+        relative_b: [0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100],
+        sram_min_mv: 810,
+    };
+    let v2_mw = 95_432u32;
+    let mut v2_leakage = [0u32; 56];
+    v2_leakage[0..4].copy_from_slice(&[0x44f1_0000, 0x44f2_0000, 0x44f3_0000, 0x44f4_0000]);
+    v2_leakage[32..36].copy_from_slice(&[0x4381_0000, 0x4382_0000, 0x4383_0000, 0x4384_0000]);
+    v2_leakage[52] = 0x4390_0000;
+    v2_leakage[54] = 0x43c0_0000;
+    let (hw32_v2, power32_v2, region32_v2) = build(t6041::CHIP_ID, &t6041_25g83::REGISTER_WINDOWS, &[],
+        &v2_perf, &J616C_OPPS, &J616C_AUX, &t6041_25g83::CHIP,
+        &t6041_25g83::REGION_C, v2_mw, &v2_leakage, 32);
+    assert_eq!(word(&power32_v2, 0xa04), v2_mw);
+    assert_eq!(word(&power32_v2, 0x9e0), (v2_mw as f32).to_bits());
+    assert_eq!(word(&power32_v2, 0x9ec), (-1000.0f32 / v2_mw as f32).to_bits());
+    assert_eq!(word(&power32_v2, 0x3b5c), 0x2a22_2aa2);
+    assert_eq!(word(&power32_v2, 0x6328), u32::from_be_bytes(*b"g2TR"));
+    assert_eq!(word(&power32_v2, 0x632c), u32::from_be_bytes(*b"g3TR"));
+    assert_eq!(word(&power32_v2, 0x6360), 0x5);
+    for (i, &val) in v2_leakage.iter().enumerate() {
+        assert_eq!(word(&power32_v2, 0x642c + 4 * i), val);
+    }
+    assert_eq!(word(&region32_v2, core::mem::offset_of!(RegionC, max_power_mw)), v2_mw);
+
+    // Regression check: feeding the historical Oct 2026 calibration fixture reproduces the
+    // exact J616C object hashes without keeping any static fallback constants in the driver.
+    let hist_perf = PerfConfig {
+        states_a: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
+        states_b: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
+        relative_a: [0, 9, 16, 23, 29, 38, 49, 60, 69, 79, 100],
+        relative_b: [0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100],
+        sram_min_mv: 810,
+    };
+    let hist_mw = 110_586u32;
+    let mut hist_leakage = [0u32; 56];
+    hist_leakage[0..4].copy_from_slice(&[0x44f0_3000, 0x44f3_0000, 0x44f0_3000, 0x44f3_0000]);
+    hist_leakage[32..36].copy_from_slice(&[0x4373_0000; 4]);
+    hist_leakage[52] = 0x437b_0000;
+    hist_leakage[54] = 0x43bd_c000;
     let (hw32, power32, region32) = build(t6041::CHIP_ID, &t6041_25g83::REGISTER_WINDOWS, &[],
-        &t6041_25g83::PERF, &J616C_OPPS, &J616C_AUX, &t6041_25g83::CHIP,
-        &t6041_25g83::REGION_C, 32);
+        &hist_perf, &J616C_OPPS, &J616C_AUX, &t6041_25g83::CHIP,
+        &t6041_25g83::REGION_C, hist_mw, &hist_leakage, 32);
     println!("T6041 25G83 32-core initialization objects built");
     let fnv = |bytes: &[u8], skip: &[(usize, usize)]| {
         bytes.iter().enumerate().filter(|(i, _)| !skip.iter().any(|&(at, n)| (at..at + n).contains(i)))
@@ -259,11 +322,11 @@ fn main() {
     assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0xc36d_7dba_a597_aac4,
                "the J616C power configuration");
     assert_eq!(fnv(&region32, &[]), 0x91a4_c670_17e3_0a24, "the J616C region C");
-    let word = |at: usize| u32::from_le_bytes(power32[at..at + 4].try_into().unwrap());
-    assert_eq!(word(0x9ec), (-1000.0 / t6041_25g83::MAX_POWER_MW as f32).to_bits());
-    println!("T6041 25G83 32-core objects match the J616C's");
-    std::fs::write(format!("{}/t6041-25g83-32-hwdata.bin", out), &hw32).unwrap();
-    std::fs::write(format!("{}/t6041-25g83-32-power-config.bin", out), &power32).unwrap();
+    assert_eq!(word(&power32, 0x9ec), (-1000.0 / hist_mw as f32).to_bits());
+    assert!(t604x::laid_out_25g83(&t6041_25g83::REGISTER_WINDOWS));
+    println!("T6041 25G83 32-core v2 calibrated objects verified");
+    std::fs::write(format!("{}/t6041-25g83-32-hwdata.bin", out), &hw32_v2).unwrap();
+    std::fs::write(format!("{}/t6041-25g83-32-power-config.bin", out), &power32_v2).unwrap();
 }
 """
 
