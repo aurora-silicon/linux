@@ -131,7 +131,6 @@
 };
 
 &usb4_0_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -167,7 +166,6 @@
 };
 
 &usb4_1_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -203,7 +201,6 @@
 };
 
 &usb4_2_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 

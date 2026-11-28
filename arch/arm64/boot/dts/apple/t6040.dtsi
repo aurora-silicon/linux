@@ -746,6 +746,7 @@
 };
 
 #include "t6040-usb4.dtsi"
+#include "t6040-pciec.dtsi"
 
 /*
  * The SIO coprocessor is part of every T6040 and has no board wiring: iBoot
