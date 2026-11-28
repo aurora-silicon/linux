@@ -164,6 +164,7 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 	ma->has_speakers = true;
 	mutex_init(&ma->spk_mutex);
 	mutex_init(&ma->volume_lock_mutex);
+	INIT_DELAYED_WORK(&ma->lock_timeout_work, macaudio_vlimit_timeout_work);
 	INIT_WORK(&ma->lock_fail_work, macaudio_lock_fail_work);
 	INIT_WORK(&ma->sw_gain_stop_work, macaudio_sw_gain_stop_work);
 	/* The lease is the interface, as after "Speaker Protection Interface" */
