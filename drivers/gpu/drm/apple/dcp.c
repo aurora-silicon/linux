@@ -649,8 +649,9 @@ static bool dcp_j714s_ext(struct device *dev)
 
 /*
  * The firmware stop on a SoC whose display power words were derived from its macOS device
- * tree instead of measured (T8142). J813 supports DPMS off and system sleep with this
- * opt-in. Off by default: such a DCP keeps its firmware running.
+ * tree instead of measured (T8142). DPMS off and system sleep use it with this opt-in, on
+ * a device tree that gives the DCP apple,display-power. Off by default: such a DCP keeps its
+ * firmware running.
  */
 static bool s2r_untested;
 module_param(s2r_untested, bool, 0444);

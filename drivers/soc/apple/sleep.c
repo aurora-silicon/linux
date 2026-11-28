@@ -672,6 +672,11 @@ struct apple_sleep_soc {
 	u8 display_order[SLEEP_DISPLAYS_MAX];
 	const struct apple_sleep_region_profile *regions;
 	const struct apple_sleep_smc_policy *smc_policy;
+	/*
+	 * Without an smc_policy: the SMC's final MBSE/AP IDLE notice waits until ANS and the other
+	 * peers have stopped (apple_sleep_smc_defer_notice()), as the native trace orders it.
+	 */
+	bool smc_notice_after_peers;
 	bool early_context;
 	/* The SoC's operations arm and read its wake sources: none of the common wake words */
 	bool own_wake;
@@ -1969,8 +1974,13 @@ EXPORT_SYMBOL_GPL(apple_sleep_smc_policy);
 static bool sleep_j813_smc_late = true;
 module_param_named(j813_smc_late, sleep_j813_smc_late, bool, 0444);
 MODULE_PARM_DESC(j813_smc_late,
-		 "TEST ONLY: J813 final SMC sleep notice after peer stops");
+		 "TEST ONLY: final SMC sleep notice after peer stops (SoCs with smc_notice_after_peers)");
 
+/*
+ * The SoC's sleep profile says whether the final SMC notice follows the peer stops: on T8142
+ * ANS fails its IOP IDLE handshake if the SMC is told first. A property of the SoC's sleep
+ * sequence, so every board with that sleep controller gets it.
+ */
 bool apple_sleep_smc_defer_notice(void)
 {
 	if (!apple_sleep || !pm_suspend_via_firmware())
@@ -1978,7 +1988,7 @@ bool apple_sleep_smc_defer_notice(void)
 	/* Gen 1 (T8103): SEP sleeps before the SMC is told, as on macOS and t6000. */
 	if (apple_sleep->soc->smc_gen1_keys)
 		return true;
-	return READ_ONCE(sleep_j813_smc_late) && of_machine_is_compatible("apple,j813");
+	return READ_ONCE(sleep_j813_smc_late) && apple_sleep->soc->smc_notice_after_peers;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
 
@@ -10043,6 +10053,8 @@ static const struct apple_sleep_extra_off t8142_extra_off[] = {
 static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ops = &t8142_sleep_ops,
 	.untested = true,
+	/* J813 battery lid wake: ANS failed IOP IDLE when the SMC's notice came first. */
+	.smc_notice_after_peers = true,
 	.regs_absent = t8142_regs_absent,
 	.spmi_gen4 = true,
 	.boot_wfi_delay_ms = 3,
@@ -10159,6 +10171,26 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8122-sleep", .data = &t8122_sleep_soc },
 	{ }
 };
+
+/*
+ * Whether this device tree's sleep controller defers the final SMC notice, read from the DT so
+ * macsmc can pick its bounded transport at probe, before this driver binds.
+ */
+bool apple_sleep_smc_defer_notice_hw(void)
+{
+	const struct of_device_id *match;
+	struct device_node *np;
+	bool ret = false;
+
+	for_each_matching_node_and_match(np, apple_sleep_of_match, &match) {
+		const struct apple_sleep_soc *soc = match->data;
+
+		if (of_device_is_available(np) && soc && soc->smc_notice_after_peers)
+			ret = true;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice_hw);
 
 static struct platform_driver apple_sleep_driver = {
 	.driver = {
