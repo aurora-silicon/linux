@@ -655,6 +655,7 @@ struct apple_pcie {
 	unsigned long		*bitmap;
 	struct list_head	ports;
 	struct list_head	hib_fns;
+	struct list_head	hib_aspm;
 	bool			hib_saved;
 	struct completion	event;
 	struct irq_fwspec	fwspec;
@@ -6010,6 +6011,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	mutex_init(&pcie->lock);
 	INIT_LIST_HEAD(&pcie->ports);
 	INIT_LIST_HEAD(&pcie->hib_fns);
+	INIT_LIST_HEAD(&pcie->hib_aspm);
 
 	/* Resolve PM dependencies before publishing the PCI hierarchy. */
 	if (pcie->hw->tunneled) {
@@ -7731,6 +7733,195 @@ struct apple_pcie_hib_fn {
 	struct pci_saved_state	*state;
 };
 
+/*
+ * Saved ASPM/ClockPM/L1SS state for one link of a conventional reinit host across
+ * a firmware-driven sleep. Endpoints entering D3hot with L1/L1SS enabled can drop
+ * CLKREQ# before the sleep commit quiesces the APCIe bridge and hang the suspend.
+ */
+struct apple_pcie_hib_aspm {
+	struct list_head	entry;
+	struct pci_dev		*parent;
+	struct pci_dev		*child;
+	bool			has_l1ss;
+	u32			pl_ctl2;
+	u32			pl_ctl1;
+	u32			cl_ctl2;
+	u32			cl_ctl1;
+	u16			pl_lnkctl;
+	u16			fn_lnkctl[8];
+	u8			fn_devfn[8];
+	unsigned int		nfn;
+};
+
+struct apple_pcie_aspm_walk {
+	struct apple_pcie	*pcie;
+	int			err;
+};
+
+static int apple_pcie_hib_disable_aspm_cb(struct pci_dev *parent, void *data)
+{
+	struct apple_pcie_aspm_walk *walk = data;
+	struct apple_pcie *pcie = walk->pcie;
+	struct apple_pcie_hib_aspm *saved;
+	struct pci_dev *fn, *child = NULL;
+	u32 id;
+	u16 mask = PCI_EXP_LNKCTL_ASPMC | PCI_EXP_LNKCTL_CLKREQ_EN;
+	unsigned int i;
+
+	if (!pcie_downstream_port(parent) || !parent->subordinate)
+		return 0;
+	if (pci_read_config_dword(parent, PCI_VENDOR_ID, &id) || id == U32_MAX)
+		return 0;
+
+	saved = kzalloc_obj(*saved);
+	if (!saved) {
+		walk->err = -ENOMEM;
+		return 1;
+	}
+	saved->parent = pci_dev_get(parent);
+
+	if (pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &saved->pl_lnkctl))
+		goto err_free;
+
+	list_for_each_entry(fn, &parent->subordinate->devices, bus_list) {
+		if (saved->nfn >= ARRAY_SIZE(saved->fn_lnkctl))
+			break;
+		if (pci_read_config_dword(fn, PCI_VENDOR_ID, &id) || id == U32_MAX)
+			continue;
+		if (pcie_capability_read_word(fn, PCI_EXP_LNKCTL,
+					      &saved->fn_lnkctl[saved->nfn]))
+			continue;
+		saved->fn_devfn[saved->nfn++] = fn->devfn;
+		if (!child && fn->l1ss)
+			child = fn;
+	}
+
+	if (!saved->nfn)
+		goto err_free;
+
+	if (parent->l1ss && child) {
+		if (!pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2,
+					   &saved->pl_ctl2) &&
+		    !pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+					   &saved->pl_ctl1) &&
+		    !pci_read_config_dword(child, child->l1ss + PCI_L1SS_CTL2,
+					   &saved->cl_ctl2) &&
+		    !pci_read_config_dword(child, child->l1ss + PCI_L1SS_CTL1,
+					   &saved->cl_ctl1) &&
+		    saved->pl_ctl1 != U32_MAX && saved->cl_ctl1 != U32_MAX) {
+			saved->child = pci_dev_get(child);
+			saved->has_l1ss = true;
+		}
+	}
+
+	pci_dbg(parent, "S2R: clearing ASPM/L1SS (rp LnkCtl=%#x L1SS=%#x, ep LnkCtl=%#x L1SS=%#x)\n",
+		saved->pl_lnkctl, saved->has_l1ss ? saved->pl_ctl1 : 0,
+		saved->fn_lnkctl[0], saved->has_l1ss ? saved->cl_ctl1 : 0);
+
+	/* Clear ASPM and ClockPM downstream before upstream, then clear L1SS. */
+	list_for_each_entry(fn, &parent->subordinate->devices, bus_list) {
+		for (i = 0; i < saved->nfn; i++) {
+			if (saved->fn_devfn[i] == fn->devfn && (saved->fn_lnkctl[i] & mask)) {
+				pcie_capability_write_word(fn, PCI_EXP_LNKCTL,
+							   saved->fn_lnkctl[i] & ~mask);
+				break;
+			}
+		}
+	}
+	if (saved->pl_lnkctl & mask)
+		pcie_capability_write_word(parent, PCI_EXP_LNKCTL, saved->pl_lnkctl & ~mask);
+
+	if (saved->has_l1ss && ((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK)) {
+		pci_write_config_dword(saved->child, saved->child->l1ss + PCI_L1SS_CTL1,
+				       saved->cl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);
+		pci_write_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+				       saved->pl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);
+	}
+
+	list_add_tail(&saved->entry, &pcie->hib_aspm);
+	return 0;
+
+err_free:
+	pci_dev_put(saved->parent);
+	kfree(saved);
+	return 0;
+}
+
+static void apple_pcie_hib_restore_aspm(struct apple_pcie *pcie)
+{
+	struct apple_pcie_hib_aspm *saved, *tmp;
+	struct pci_dev *fn;
+	u32 id;
+	u16 cur, mask = PCI_EXP_LNKCTL_ASPMC | PCI_EXP_LNKCTL_CLKREQ_EN;
+	unsigned int i;
+
+	list_for_each_entry_safe(saved, tmp, &pcie->hib_aspm, entry) {
+		struct pci_dev *parent = saved->parent;
+
+		list_del(&saved->entry);
+		if (parent->subordinate &&
+		    !pci_read_config_dword(parent, PCI_VENDOR_ID, &id) && id != U32_MAX) {
+			if (saved->has_l1ss &&
+			    !pci_read_config_dword(saved->child, PCI_VENDOR_ID, &id) &&
+			    id != U32_MAX &&
+			    ((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK)) {
+				/* Keep ASPM clear while programming L1SS timing and enables. */
+				list_for_each_entry(fn, &parent->subordinate->devices, bus_list) {
+					if (!pcie_capability_read_word(fn, PCI_EXP_LNKCTL, &cur) &&
+					    (cur & PCI_EXP_LNKCTL_ASPMC))
+						pcie_capability_write_word(fn, PCI_EXP_LNKCTL,
+									   cur &
+									   ~PCI_EXP_LNKCTL_ASPMC);
+				}
+				if (!pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &cur) &&
+				    (cur & PCI_EXP_LNKCTL_ASPMC))
+					pcie_capability_write_word(parent, PCI_EXP_LNKCTL,
+								   cur & ~PCI_EXP_LNKCTL_ASPMC);
+				pci_write_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2,
+						       saved->pl_ctl2);
+				pci_write_config_dword(saved->child,
+						       saved->child->l1ss + PCI_L1SS_CTL2,
+						       saved->cl_ctl2);
+				pci_write_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+						       saved->pl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
+				pci_write_config_dword(saved->child,
+						       saved->child->l1ss + PCI_L1SS_CTL1,
+						       saved->cl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
+				if ((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1_2_MASK) {
+					pci_write_config_dword(parent,
+							       parent->l1ss + PCI_L1SS_CTL1,
+							       saved->pl_ctl1);
+					pci_write_config_dword(saved->child,
+							       saved->child->l1ss + PCI_L1SS_CTL1,
+							       saved->cl_ctl1);
+				}
+			}
+			if ((saved->pl_lnkctl & mask) &&
+			    !pcie_capability_read_word(parent, PCI_EXP_LNKCTL, &cur))
+				pcie_capability_write_word(parent, PCI_EXP_LNKCTL,
+							   (cur & ~mask) |
+							   (saved->pl_lnkctl & mask));
+			list_for_each_entry(fn, &parent->subordinate->devices, bus_list) {
+				for (i = 0; i < saved->nfn; i++) {
+					if (saved->fn_devfn[i] == fn->devfn &&
+					    (saved->fn_lnkctl[i] & mask) &&
+					    !pcie_capability_read_word(fn, PCI_EXP_LNKCTL, &cur)) {
+						pcie_capability_write_word(fn, PCI_EXP_LNKCTL,
+									   (cur & ~mask) |
+									   (saved->fn_lnkctl[i] &
+									    mask));
+						break;
+					}
+				}
+			}
+		}
+		if (saved->child)
+			pci_dev_put(saved->child);
+		pci_dev_put(parent);
+		kfree(saved);
+	}
+}
+
 /* A real sleep takes a conventional host's power: its ports are set up again as at probe. */
 static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie)
 {
@@ -7940,9 +8131,29 @@ static int apple_pcie_resume(struct device *dev)
 	return 0;
 }
 
+static int apple_pcie_hib_prepare_aspm(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge;
+	struct apple_pcie_aspm_walk walk = { .pcie = pcie };
+
+	if (!pcie || !apple_pcie_s2r_reinit(pcie) || !pm_suspend_via_firmware() ||
+	    pm_suspend_target_state == PM_SUSPEND_ON)
+		return 0;
+
+	bridge = pci_host_bridge_from_priv(pcie);
+	if (!bridge || !bridge->bus)
+		return 0;
+
+	pci_walk_bus(bridge->bus, apple_pcie_hib_disable_aspm_cb, &walk);
+	if (walk.err)
+		apple_pcie_hib_restore_aspm(pcie);
+	return walk.err;
+}
+
 static int apple_pcie_prepare(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+	int ret;
 
 	/*
 	 * A host-owned PCIe-C DART sleeps only inside the NHI's deep-sleep
@@ -7964,8 +8175,6 @@ static int apple_pcie_prepare(struct device *dev)
 	 */
 	if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&
 	    apple_pcie_adopted_sleep_host(pcie)) {
-		int ret;
-
 		/* A firmware suspend: the port and DART apple_pcie_t6050_sleep_down() takes down */
 		if (pm_suspend_via_firmware())
 			ret = pcie->t6050_port && pcie->t6050_dart ? 0 : -EBUSY;
@@ -7978,12 +8187,29 @@ static int apple_pcie_prepare(struct device *dev)
 			return ret;
 		}
 	}
-	return apple_radio_prepare(dev);
+	ret = apple_radio_prepare(dev);
+	if (ret)
+		return ret;
+	ret = apple_pcie_hib_prepare_aspm(pcie);
+	if (ret) {
+		apple_radio_complete(dev);
+		return ret;
+	}
+	return 0;
+}
+
+static void apple_pcie_complete(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (pcie && !list_empty(&pcie->hib_aspm))
+		apple_pcie_hib_restore_aspm(pcie);
+	apple_radio_complete(dev);
 }
 
 static const struct dev_pm_ops apple_pcie_pm_ops = {
 	.prepare = apple_pcie_prepare,
-	.complete = apple_radio_complete,
+	.complete = apple_pcie_complete,
 	.suspend_noirq = apple_pcie_suspend_noirq,
 	.resume_noirq = apple_pcie_resume_noirq,
 	.resume = apple_pcie_resume,
