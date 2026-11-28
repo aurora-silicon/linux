@@ -833,19 +833,21 @@ pub(crate) struct Governor {
     target_offset_mc: i32,
     target_offset_ns: u64,
     was_clamped: bool,
+    /// The last budget write failed: the budget word may still hold an earlier budget.
+    unpublished: bool,
 }
 
 impl Governor {
     pub(crate) const fn new() -> Self {
         Self { maximum_mw: 0, budget_mw: 0, integral_mw: 0, ceiling_mw: 0, converged_mw: 0, active: false,
             last_tick_ns: 0, last_activity_ns: 0, last_active_ns: 0, last_temp_mc: None, target_offset_mc: 0,
-            target_offset_ns: 0, was_clamped: false }
+            target_offset_ns: 0, was_clamped: false, unpublished: false }
     }
 
     /// The firmware accepted a submission; returns whether the control loop should run.
     pub(crate) fn note_activity(&mut self, now_ns: u64) -> bool {
         self.last_activity_ns = now_ns;
-        requested() || self.budget_mw != self.maximum_mw
+        requested() || self.pending()
     }
 
     /// Learn the calibrated maximum from the budget word before the first change.
@@ -856,17 +858,31 @@ impl Governor {
         }
     }
 
-    /// The budget to publish while stopping, if it differs from the maximum.
+    /// The calibrated maximum to publish while the controller may not govern (stopping, or the
+    /// target gone), if the budget word may differ from it.
     pub(crate) fn restore(&mut self) -> Option<u32> {
         self.active = false;
         self.integral_mw = 0;
         self.converged_mw = 0;
         self.target_offset_mc = 0;
-        if self.maximum_mw == 0 || self.budget_mw == self.maximum_mw {
+        if self.maximum_mw == 0 || (self.budget_mw == self.maximum_mw && !self.unpublished) {
             return None;
         }
         self.budget_mw = self.maximum_mw;
+        self.unpublished = false;
         Some(self.budget_mw)
+    }
+
+    /// The budget last returned for publishing did not reach the firmware: the next step or
+    /// restore publishes again.
+    pub(crate) fn publish_failed(&mut self) {
+        self.unpublished = true;
+    }
+
+    /// Whether the budget word is still owed a write: a budget below the calibrated maximum, or
+    /// a failed write. The work runs again until it is not.
+    pub(crate) fn pending(&self) -> bool {
+        self.unpublished || self.budget_mw != self.maximum_mw
     }
 
     /// Integral to engage with: the converged one while it is fresh, decaying to the cold-start
@@ -1025,11 +1041,12 @@ impl Governor {
             }
         };
         let desired = if desired >= maximum { maximum } else { desired - desired % STEP_MW };
-        let publish = (desired != i64::from(self.budget_mw)).then(|| {
+        let publish = (desired != i64::from(self.budget_mw) || self.unpublished).then(|| {
             self.budget_mw = desired as u32;
+            self.unpublished = false;
             self.budget_mw
         });
-        let again = (!idle && requested()) || self.budget_mw != self.maximum_mw;
+        let again = (!idle && requested()) || self.pending();
         (publish, again)
     }
 }
