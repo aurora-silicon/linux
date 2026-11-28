@@ -3158,10 +3158,8 @@ static bool dcp_tb_has_connector(void *data)
 static void dcp_tb_queue_reconnect(void *data)
 {
 	struct dcp_tb_attach_context *ctx = data;
-	struct apple_dcp *dcp = ctx->best->dcp;
 
-	dcp->typec_reconnect_tries = 0;
-	dcp_queue_typec_reconnect(dcp, 0);
+	dcp_typec_attach_reconnect(ctx->best->dcp);
 }
 
 static void dcp_tb_connect_oob(void *data)
@@ -3453,13 +3451,12 @@ static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 	dcp_tb_events_retire(dcp);
 	/*
 	 * A refused display release keeps the route and its binding owned.
-	 * port->hpd is the port's, and stays set while the other DP IN
-	 * still has an owner. A T8132 dcpext releases what it connected itself:
-	 * its cable, or a port left connected by a release that failed.
+	 * Port HPD may already be low when the provider withdraws a tunnel.
+	 * Release any display still held by the owner of this DP IN.
 	 */
-	if (dcp_is_t8132_ext(dcp) ?
-	    READ_ONCE(dcp->typec_cable_connected) || READ_ONCE(dcp->dptxport[0].connected) :
-	    port->hpd || dcp->typec_cable_connected) {
+	if (READ_ONCE(dcp->dptxport[0].connected) ||
+	    READ_ONCE(dcp->typec_cable_connected) ||
+	    (!dcp_is_t8132_ext(dcp) && port->hpd)) {
 		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		if (ret)
 			return ret;
@@ -5534,8 +5531,6 @@ static void dcp_reclaim_publish(void *data, bool restore)
 
 	/* Connected on a fresh attachment; no CRTC is on yet. */
 	scoped_guard(mutex, &to->hpd_mutex) {
-		WRITE_ONCE(to->typec_cable_connected, true);
-		to->typec_generation++;
 		to->typec_follow_start = false;
 		WRITE_ONCE(to->typec_crtc_off, false);
 	}
