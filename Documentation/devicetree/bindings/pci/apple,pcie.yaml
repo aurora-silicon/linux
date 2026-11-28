@@ -669,7 +669,7 @@ allOf:
                   properties:
                     reg:
                       minItems: 4
-                      maxItems: 9
+                      maxItems: 11
                     reg-names:
                       oneOf:
                         - minItems: 4
@@ -683,7 +683,9 @@ allOf:
                             - const: clkgen
                             - const: phy-block
                             - const: phy-ip
-                        # A board that uses the third port lists it instead.
+                            - const: port2
+                            - const: phy2
+                        # A board that uses the third port without the shared windows.
                         - items:
                             - const: config
                             - const: rc
