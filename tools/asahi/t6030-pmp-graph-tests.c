@@ -20,6 +20,7 @@ typedef uint8_t u8;
 #define BIT(n) (1U << (n))
 #define IS_ENABLED(x) (x)
 #define CONFIG_APPLE_T6030_GPU_PMP_LINK 1
+#define CONFIG_APPLE_T8122_GPU_PMP_LINK 0
 #define PMP_REPORT_READY 1
 #define GFP_KERNEL 0
 #define GENPD_FLAG_ACTIVE_WAKEUP 1
@@ -470,17 +471,6 @@ static bool of_device_is_compatible(const struct device_node *n, const char *s)
 static bool of_machine_is_compatible(const char *s)
 {
 	return !strcmp(s, "apple,t6030");
-}
-/* As in <linux/soc/apple/t8132.h>. */
-static inline bool apple_t8132_air(void)
-{
-	return of_machine_is_compatible("apple,j713") ||
-	       of_machine_is_compatible("apple,j715");
-}
-/* The qualified-firmware term: these harnesses model no /chosen. */
-static inline bool apple_t8132_firmware_path(void)
-{
-	return apple_t8132_air();
 }
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {

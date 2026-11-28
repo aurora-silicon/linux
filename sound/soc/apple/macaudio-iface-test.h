@@ -61,6 +61,13 @@ static int macaudio_test_iface_write(struct kunit *test, struct macaudio_test_if
 	return macaudio_spk_iface_put(f->iface, uval);
 }
 
+/* The opt-out: an administrator selects the volume lock before its daemon starts */
+static void macaudio_test_select_legacy(struct kunit *test, struct macaudio_test_iface *f)
+{
+	KUNIT_EXPECT_GE(test, macaudio_test_iface_write(test, f, MACAUDIO_SPK_IFACE_UNLOCK), 0);
+	KUNIT_EXPECT_TRUE(test, f->t.ma->spk_legacy_selected);
+}
+
 /* The legacy daemon takes the lock and every speaker volume */
 static void macaudio_test_daemon_take(struct kunit *test, struct macaudio_test_iface *f)
 {
@@ -114,7 +121,14 @@ static void macaudio_iface_volume_lock_from_binding(struct kunit *test)
 	/* Speaker volumes are the daemon's to write */
 	KUNIT_EXPECT_EQ(test, f.t.vols[0]->write_check(f.t.vols[0], NULL), 0);
 
-	/* The daemon unlocks them as on a lock-only kernel */
+	/* A daemon started on its own is refused */
+	KUNIT_EXPECT_FALSE(test, f.t.ma->spk_legacy_selected);
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(f.slk, f.daemon), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
+	macaudio_test_expect_limit(test, &f, 1, 1);
+
+	/* Once selected, the daemon unlocks them as on a lock-only kernel */
+	macaudio_test_select_legacy(test, &f);
 	macaudio_test_daemon_take(test, &f);
 	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
 	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
@@ -128,6 +142,7 @@ static void macaudio_iface_switch_goes_through_the_floor(struct kunit *test)
 	unsigned int i;
 
 	macaudio_test_iface_card(test, &f);
+	macaudio_test_select_legacy(test, &f);
 	macaudio_test_daemon_take(test, &f);
 	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
 	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
@@ -135,6 +150,7 @@ static void macaudio_iface_switch_goes_through_the_floor(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
 	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, f.t.ma->spk_legacy_selected);
 	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	/* At the lease's floor, below a ceiling that no longer applies */
 	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
@@ -164,14 +180,17 @@ static void macaudio_iface_revert_starts_at_the_floor(struct kunit *test)
 	struct macaudio_test_iface f;
 
 	macaudio_test_iface_card(test, &f);
+	macaudio_test_select_legacy(test, &f);
 	macaudio_test_daemon_take(test, &f);
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
 	macaudio_test_take(test, &f.t);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), 0);
 	macaudio_test_expect_limit(test, &f, SN012776_0DB, SN012776_0DB);
 
+	/* The administrator's revert selects the volume lock again */
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_UNLOCK), 1);
 	macaudio_test_settle(f.t.ma);
+	KUNIT_EXPECT_TRUE(test, f.t.ma->spk_legacy_selected);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
 	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
@@ -222,6 +241,38 @@ static void macaudio_iface_unowned_lease_reverts(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
 	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	macaudio_test_expect_limit(test, &f, 0, 1);
+	/* The kernel's own revert selects nothing: a daemon is still refused */
+	KUNIT_EXPECT_FALSE(test, f.t.ma->spk_legacy_selected);
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(f.slk, f.daemon), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
+	macaudio_test_expect_limit(test, &f, 0, 1);
+}
+
+/*
+ * A write of "Speaker Protection" deselects the volume lock at once, even
+ * where it cannot enter the lease, and relocks what the daemon had lifted.
+ */
+static void macaudio_iface_protection_write_deselects(struct kunit *test)
+{
+	struct macaudio_test_iface f;
+
+	macaudio_test_iface_card(test, &f);
+	macaudio_test_select_legacy(test, &f);
+	macaudio_test_daemon_take(test, &f);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
+	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
+
+	/* The lease refused during a system sleep: still deselected */
+	WRITE_ONCE(f.t.ma->pm_quiesced, true);
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE),
+			-EBUSY);
+	WRITE_ONCE(f.t.ma->pm_quiesced, false);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, f.t.ma->spk_legacy_selected);
+	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	macaudio_test_expect_limit(test, &f, 1, 1);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
+	macaudio_test_expect_limit(test, &f, 1, 1);
 }
 
 /* Only a CAP_SYS_ADMIN process hands the speakers over */
@@ -238,6 +289,10 @@ static void macaudio_iface_needs_cap_sys_admin(struct kunit *test)
 	old = override_creds(cred);
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE),
 			-EPERM);
+	/* Nor does such a process select the volume lock */
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_UNLOCK),
+			-EPERM);
+	KUNIT_EXPECT_FALSE(test, f.t.ma->spk_legacy_selected);
 	revert_creds(old);
 	put_cred(cred);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
@@ -263,6 +318,7 @@ static void macaudio_iface_j813_speakers_protected(struct kunit *test)
 	macaudio_test_expect_limit(test, &f, 1, 1);
 
 	/* A daemon that holds the lock but has not pinged lifts nothing */
+	macaudio_test_select_legacy(test, &f);
 	macaudio_test_daemon_take(test, &f);
 	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	macaudio_test_expect_limit(test, &f, 1, 1);
@@ -304,6 +360,7 @@ static struct kunit_case macaudio_iface_cases[] = {
 	KUNIT_CASE(macaudio_iface_switch_goes_through_the_floor),
 	KUNIT_CASE(macaudio_iface_revert_starts_at_the_floor),
 	KUNIT_CASE(macaudio_iface_unowned_lease_reverts),
+	KUNIT_CASE(macaudio_iface_protection_write_deselects),
 	KUNIT_CASE(macaudio_iface_needs_cap_sys_admin),
 	KUNIT_CASE(macaudio_iface_control_is_inactive),
 	KUNIT_CASE(macaudio_iface_j813_speakers_protected),

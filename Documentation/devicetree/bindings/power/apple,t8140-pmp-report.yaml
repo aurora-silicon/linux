@@ -54,6 +54,7 @@ properties:
           - apple,t8112-pmp-v2-report
           - apple,t8122-pmp-v2-report
           - apple,t8140-pmp-v2-report
+          - apple,t8142-pmp-v2-report
       - items:
           - const: apple,t6031-pmp-v2-report
           - const: apple,t6020-pmp-v2-report
@@ -166,10 +167,16 @@ patternProperties:
                   - apple,t8112-pmp-v2-report-entry
                   - apple,t8122-pmp-v2-report-entry
               - const: apple,t6000-pmp-v2-report-entry
+          - items:
+              - const: apple,t8142-pmp-v2-report-entry
+              - const: apple,t8140-pmp-v2-report-entry
 
       reg:
         maxItems: 1
-        description: PMP soc-device index of the device.
+        description:
+          PMP soc-device index of the device. On T8142 this is the index of
+          the soc-device record (apple,tunable-soc-device on the PMP) that
+          holds the device.
 
       label:
         description: Name of the power domain.

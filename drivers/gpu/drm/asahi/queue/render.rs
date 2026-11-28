@@ -47,7 +47,7 @@ impl super::QueueInner::ver {
     /// This validates the flags and dimensions of the command first, so that every caller,
     /// including the submission-wide TVB sizing pass that runs before [`Self::submit_render`],
     /// rejects a malformed command with `EINVAL` before any arithmetic on its dimensions.
-    fn get_tiling_params(
+    pub(crate) fn get_tiling_params(
         cmdbuf: &uapi::drm_asahi_cmd_render,
         num_clusters: u32,
     ) -> Result<buffer::TileInfo> {
@@ -55,7 +55,8 @@ impl super::QueueInner::ver {
             & !(uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
-                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT)
+                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT
+                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS)
             != 0
         {
             cls_pr_debug!(Errors, "Invalid flags ({:#x})\n", cmdbuf.flags);

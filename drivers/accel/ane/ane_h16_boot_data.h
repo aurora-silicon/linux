@@ -600,4 +600,89 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	},
 };
 
+/*
+ * T8122 (M3) ANE DARTs, revision 2.0 (PARAMS3 0x2a2a0200). Same fault/protect/
+ * lock and DAPF record layout as T6041/T8132, with the DAPF bank at DART0
+ * + 0x4000.
+ */
+static const struct ane_h16_mmio ane_h15_mmio_t8122[] __maybe_unused = {
+	{
+		.dart_revision = 0x0200,
+		.dart_fault = 0x100,
+		.dart_address_lo = 0x170,
+		.dart_address_hi = 0x174,
+		.dart_protect = 0x200,
+		.dart_lock = 0x208,
+		.dapf_records = 0,
+		.dapf_stride = 0x40,
+		.dapf_end_mask = ~3ULL,
+		.dapf_r0 = 0x31,
+		.dapf_r4 = 0,
+		.dapf_r20 = 1,
+	},
+};
+
+/* T8122 (M3) H15 27.2 (26B123): no CE block and no pre-RUN engine tunables. */
+static const struct ane_h16_build ane_h15_build_t8122_26b123 = {
+	.cpu_control = 0x1400044,
+	.rvbar = 0x1050000,
+	.ready = 0x08042006,
+	.run = 0x10,
+	.scratch_polls = 1000,
+	.scratch_delay_us = 1000,
+	.command_timeout_ns = 3000000000ULL,
+	.pool_dva = 0x10000384000,
+	.ipc_dva = 0x100003d0000,
+	.heap_dva = 0x100003e4000,
+	.shared_dva = 0x10001300000,
+	.expected_rvbar = 0x10000000001,
+	.pool_size = 0x40000,
+	.init_offset = 0x180,
+	.init_size = 0x174,
+	.config_span = 0x380000,
+	.config_window = 0x10000000,
+	.template_count = 64,
+	.template_word = 0x12c,
+	.template_value = 4,
+	.max_channels = 0x21,
+	.max_heap = SZ_16M,
+	.native_free = true,
+	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+/*
+ * M3 Air (J615) 27.2 (26B123) preload: TEXT 0xc8000, DATA 0x2a4000.
+ * Patchbay cells in DATA order (GKTS, ECAP, ARcM mutable; ABOI, ZSOI fixed).
+ */
+static const struct ane_h16_preload_cell ane_h15_patchbay_26b123_t8122[] = {
+	{ "GKTS", 0x6850, 8, true },
+	{ "ECAP", 0x6943, 8, true },
+	{ "ARcM", 0x6a18, 4, true },
+	{ "ABOI", 0x6a75, 8, false },
+	{ "ZSOI", 0x6a85, 4, false },
+};
+
+static const struct ane_h16_preload_rule ane_h15_preload_26b123_j615 = {
+	.cells = ane_h15_patchbay_26b123_t8122,
+	.cell_count = ARRAY_SIZE(ane_h15_patchbay_26b123_t8122),
+	.zero_start = 0x2a4000,
+	.zero_end = 0x2a4000,
+	.text_size = 0xc8000,
+	.data_size = 0x2a4000,
+	.digest = {
+		0xed, 0x4a, 0x5a, 0xcf, 0x99, 0x53, 0x21, 0xd1,
+		0x51, 0xca, 0xc8, 0xec, 0x2d, 0x2b, 0xf1, 0x1a,
+		0x0f, 0xb7, 0x34, 0x4c, 0x43, 0xc0, 0xec, 0x24,
+		0x01, 0x6b, 0x59, 0x09, 0x37, 0xee, 0x29, 0x17,
+	},
+};
+
+static const struct ane_h16_profile ane_t8122_profiles_26b123[] __maybe_unused = {
+	{
+		.identity = "H15 T8122 27.2 26B123 J615",
+		.preload = &ane_h15_preload_26b123_j615,
+		.build = &ane_h15_build_t8122_26b123,
+	},
+};
+
 #endif /* __ANE_H16_BOOT_DATA_H__ */

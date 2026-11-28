@@ -407,6 +407,7 @@ bool dcp_backlight_desktop_prepare(struct apple_dcp *dcp, u32 id,
 				   bool have_surface, u32 *nits);
 void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 				  bool reply, bool accepted);
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
 
 /*
  * kick only queues work; it must not submit a top-level RPC from the caller.

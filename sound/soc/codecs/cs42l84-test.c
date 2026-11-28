@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// KUnit tests for the clock switching in cs42l84_mute_stream().
+// KUnit tests for the clock switching in cs42l84_mute_stream(), and for
+// writing the registers back after a firmware sleep.
 //
 // This file is included at the end of cs42l84.c when
 // CONFIG_SND_SOC_CS42L84_TEST is enabled, so the tests can reach the
-// driver's static DAI ops and PLL configuration.
+// driver's static DAI ops, PLL configuration and register write-back.
 //
 // The codec runs from its internal oscillator (RCO) while no stream is
 // active. Unmuting the first stream moves it onto BCLK, through the PLL
@@ -517,4 +518,261 @@ static struct kunit_suite cs42l84_test_suite = {
 	.test_cases = cs42l84_test_cases,
 };
 
-kunit_test_suite(cs42l84_test_suite);
+/*
+ * Writing the registers back after a firmware sleep, in
+ * cs42l84_restore_regs(), runs on the driver's own regmap configuration:
+ * its cache and its volatile registers. Every bus access is logged, reads
+ * too, so the order of writes and status reads can be checked.
+ */
+
+#define CS42L84_TEST_MAX_ACCESSES	128
+
+struct cs42l84_test_access {
+	bool write;
+	unsigned int reg;
+};
+
+struct cs42l84_sleep_test_priv {
+	struct kunit *test;
+
+	struct cs42l84_private cs42l84;
+
+	/* Register contents seen by the driver */
+	u8 *regs;
+
+	/* Every bus access made by the driver, in order */
+	struct cs42l84_test_access accesses[CS42L84_TEST_MAX_ACCESSES];
+	unsigned int num_accesses;
+
+	/* The codec stops answering at the first write to fail_reg */
+	unsigned int fail_reg;
+	bool dead;
+	unsigned int num_dead_accesses;
+};
+
+static int cs42l84_sleep_test_access(struct cs42l84_sleep_test_priv *priv,
+				     bool write, unsigned int reg)
+{
+	if (reg >= CS42L84_TEST_NUM_REGS)
+		return -EINVAL;
+
+	if (priv->dead) {
+		priv->num_dead_accesses++;
+		return -ETIME;
+	}
+	if (write && reg == priv->fail_reg) {
+		priv->dead = true;
+		return -ETIME;
+	}
+
+	if (priv->num_accesses < ARRAY_SIZE(priv->accesses)) {
+		priv->accesses[priv->num_accesses].write = write;
+		priv->accesses[priv->num_accesses].reg = reg;
+		priv->num_accesses++;
+	} else {
+		KUNIT_FAIL(priv->test, "access log full at reg %#x", reg);
+	}
+
+	return 0;
+}
+
+static int cs42l84_sleep_test_reg_read(void *context, unsigned int reg, unsigned int *val)
+{
+	struct cs42l84_sleep_test_priv *priv = context;
+	int ret;
+
+	ret = cs42l84_sleep_test_access(priv, false, reg);
+	if (ret)
+		return ret;
+
+	*val = priv->regs[reg];
+
+	return 0;
+}
+
+static int cs42l84_sleep_test_reg_write(void *context, unsigned int reg, unsigned int val)
+{
+	struct cs42l84_sleep_test_priv *priv = context;
+	int ret;
+
+	ret = cs42l84_sleep_test_access(priv, true, reg);
+	if (ret)
+		return ret;
+
+	priv->regs[reg] = val;
+
+	return 0;
+}
+
+/* Set the codec up as the probe does, and some registers around plug detection */
+static void cs42l84_sleep_test_probe(struct cs42l84_sleep_test_priv *priv)
+{
+	struct cs42l84_private *cs42l84 = &priv->cs42l84;
+
+	cs42l84_setup_plug_detect(cs42l84);
+	cs42l84_set_interrupt_masks(cs42l84, CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+
+	/* HSBIAS on, as a headset with a mic leaves it */
+	regmap_write(cs42l84->regmap, CS42L84_MISC_DET_CTL,
+		     FIELD_PREP(CS42L84_MISC_DET_CTL_HSBIAS_CTL, 3) |
+		     FIELD_PREP(CS42L84_MISC_DET_CTL_DETECT_MODE, 3) |
+		     CS42L84_MISC_DET_CTL_PDN_MIC_LVL_DET);
+	regmap_write(cs42l84->regmap, CS42L84_DAC_CTL1, CS42L84_DAC_CTL1_UNMUTE);
+}
+
+/* The suspend before a firmware sleep, then the reset the codec wakes up from */
+static void cs42l84_sleep_test_sleep(struct cs42l84_sleep_test_priv *priv)
+{
+	struct regmap *regmap = priv->cs42l84.regmap;
+
+	regcache_cache_only(regmap, true);
+	regcache_mark_dirty(regmap);
+
+	memset(priv->regs, 0, CS42L84_TEST_NUM_REGS);
+
+	regcache_cache_only(regmap, false);
+	priv->num_accesses = 0;
+}
+
+static void cs42l84_sleep_test_expect_status_read(struct kunit *test, unsigned int i)
+{
+	struct cs42l84_sleep_test_priv *priv = test->priv;
+
+	KUNIT_ASSERT_LT(test, i, priv->num_accesses);
+	KUNIT_EXPECT_FALSE(test, priv->accesses[i].write);
+	KUNIT_EXPECT_EQ(test, priv->accesses[i].reg, CS42L84_TSRS_PLUG_INT_STATUS);
+}
+
+/*
+ * Plug detection goes back first, in the order cs42l84_setup_plug_detect()
+ * turns it on, then the remote button status is read once, then every other
+ * register the cache holds is written once, in address order. Each write is
+ * followed by a read of the plug interrupt status, and the codec ends up with
+ * the registers it had before the sleep.
+ */
+static void cs42l84_test_restore_order(struct kunit *test)
+{
+	struct cs42l84_sleep_test_priv *priv = test->priv;
+	const unsigned int n = ARRAY_SIZE(cs42l84_plug_detect_regs);
+	unsigned int i, reg, num_setup = 0, mismatches = 0;
+	u8 *before;
+
+	cs42l84_sleep_test_probe(priv);
+
+	/* The list is what the probe writes before it reads the tip sense */
+	for (i = 0; i < priv->num_accesses; i++) {
+		if (!priv->accesses[i].write &&
+		    priv->accesses[i].reg == CS42L84_TSRS_PLUG_STATUS)
+			break;
+		if (!priv->accesses[i].write)
+			continue;
+		KUNIT_ASSERT_LT(test, num_setup, n);
+		KUNIT_EXPECT_EQ(test, priv->accesses[i].reg,
+				cs42l84_plug_detect_regs[num_setup]);
+		num_setup++;
+	}
+	KUNIT_EXPECT_EQ(test, num_setup, n);
+
+	before = kunit_kmalloc(test, CS42L84_TEST_NUM_REGS, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, before);
+	memcpy(before, priv->regs, CS42L84_TEST_NUM_REGS);
+
+	cs42l84_sleep_test_sleep(priv);
+	KUNIT_ASSERT_EQ(test, cs42l84_restore_regs(&priv->cs42l84), 0);
+
+	for (i = 0; i < n; i++) {
+		KUNIT_ASSERT_LT(test, 2 * i, priv->num_accesses);
+		KUNIT_EXPECT_TRUE(test, priv->accesses[2 * i].write);
+		KUNIT_EXPECT_EQ(test, priv->accesses[2 * i].reg, cs42l84_plug_detect_regs[i]);
+		cs42l84_sleep_test_expect_status_read(test, 2 * i + 1);
+	}
+
+	KUNIT_ASSERT_LT(test, 2 * n, priv->num_accesses);
+	KUNIT_EXPECT_FALSE(test, priv->accesses[2 * n].write);
+	KUNIT_EXPECT_EQ(test, priv->accesses[2 * n].reg, CS42L84_REMOTE_BUTTON_STATUS1);
+
+	/* Registers below the plug detection ones too */
+	KUNIT_ASSERT_LT(test, 2 * n + 1, priv->num_accesses);
+	KUNIT_EXPECT_LT(test, priv->accesses[2 * n + 1].reg, CS42L84_RING_SENSE_CTL);
+
+	for (i = 2 * n + 1; i < priv->num_accesses; i += 2) {
+		reg = priv->accesses[i].reg;
+		KUNIT_EXPECT_TRUE(test, priv->accesses[i].write);
+		KUNIT_EXPECT_FALSE(test, cs42l84_is_plug_detect_reg(reg));
+		KUNIT_EXPECT_FALSE(test, cs42l84_volatile_register(NULL, reg));
+		if (i > 2 * n + 1)
+			KUNIT_EXPECT_GT(test, reg, priv->accesses[i - 2].reg);
+		cs42l84_sleep_test_expect_status_read(test, i + 1);
+	}
+
+	for (reg = 0; reg < CS42L84_TEST_NUM_REGS; reg++) {
+		if (!cs42l84_volatile_register(NULL, reg) && priv->regs[reg] != before[reg])
+			mismatches++;
+	}
+	KUNIT_EXPECT_EQ(test, mismatches, 0);
+}
+
+/* A codec that stops answering ends the write-back with the bus error */
+static void cs42l84_test_restore_stops_at_error(struct kunit *test)
+{
+	struct cs42l84_sleep_test_priv *priv = test->priv;
+
+	cs42l84_sleep_test_probe(priv);
+	cs42l84_sleep_test_sleep(priv);
+
+	priv->fail_reg = CS42L84_HS_SWITCH_CTL;
+	KUNIT_EXPECT_EQ(test, cs42l84_restore_regs(&priv->cs42l84), -ETIME);
+	KUNIT_EXPECT_TRUE(test, priv->dead);
+	KUNIT_EXPECT_EQ(test, priv->num_dead_accesses, 0);
+}
+
+static int cs42l84_sleep_test_case_init(struct kunit *test)
+{
+	/* The driver's cache and volatile registers, on the logging bus */
+	const struct regmap_config config = {
+		.reg_bits = cs42l84_regmap.reg_bits,
+		.val_bits = cs42l84_regmap.val_bits,
+		.volatile_reg = cs42l84_regmap.volatile_reg,
+		.max_register = cs42l84_regmap.max_register,
+		.cache_type = cs42l84_regmap.cache_type,
+		.reg_read = cs42l84_sleep_test_reg_read,
+		.reg_write = cs42l84_sleep_test_reg_write,
+	};
+	struct cs42l84_sleep_test_priv *priv;
+	struct regmap *regmap;
+	struct device *dev;
+
+	priv = kunit_kzalloc(test, sizeof(*priv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, priv);
+	priv->test = test;
+	priv->fail_reg = UINT_MAX;
+	test->priv = priv;
+
+	priv->regs = kunit_kzalloc(test, CS42L84_TEST_NUM_REGS, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, priv->regs);
+
+	dev = kunit_device_register(test, "cs42l84_sleep_test_drv");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+
+	regmap = devm_regmap_init(dev, NULL, priv, &config);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, regmap);
+
+	priv->cs42l84.dev = dev;
+	priv->cs42l84.regmap = regmap;
+
+	return 0;
+}
+
+static struct kunit_case cs42l84_sleep_test_cases[] = {
+	KUNIT_CASE(cs42l84_test_restore_order),
+	KUNIT_CASE(cs42l84_test_restore_stops_at_error),
+	{ } /* terminator */
+};
+
+static struct kunit_suite cs42l84_sleep_test_suite = {
+	.name = "snd-soc-cs42l84-sleep-test",
+	.init = cs42l84_sleep_test_case_init,
+	.test_cases = cs42l84_sleep_test_cases,
+};
+
+kunit_test_suites(&cs42l84_test_suite, &cs42l84_sleep_test_suite);

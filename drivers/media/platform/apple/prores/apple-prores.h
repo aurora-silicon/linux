@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Apple ProRes (APR) encoder: register map and job descriptor.
+ * Apple ProRes (APR) codec: register map and job descriptors.
  *
- * The APR is a register-driven engine with no firmware. Jobs are fixed-size
- * descriptors placed in a DMA ring; the driver installs the ring, advances a
- * producer head and the engine reports completion through a status register
- * and a consumer tail.
+ * The APR is a register-driven engine with no firmware. Jobs are typed,
+ * variable-size descriptors placed in a DMA ring; the driver installs the
+ * ring, advances a producer head and the engine reports completion through a
+ * status register and a consumer tail.
  *
  * Register names and descriptor fields follow the m1n1 proxyclient ProRes
  * experiment (MIT), proxyclient/m1n1/hw/prores.py and
@@ -29,12 +29,23 @@
 #define APR_IRQ_ERROR		BIT(1)
 #define APR_REG_ST0		0x0014
 #define APR_REG_ST1		0x0018
+/* Job id of the last descriptor the engine has finished (decode command 31:16). */
+#define APR_ST1_DONE_ID		GENMASK(31, 16)
+#define APR_REG_ST2		0x001c
+#define APR_REG_DETAIL0		0x003c
+#define APR_REG_DETAIL1_LO	0x0040
+#define APR_REG_DETAIL1_HI	0x0044
+#define APR_REG_DETAIL2_LO	0x0048
+#define APR_REG_DETAIL2_HI	0x0050
+#define APR_REG_DETAIL3		0x0054
 #define APR_REG_RING_SIZE	0x0100
 #define APR_REG_RING_LO		0x0104
 #define APR_REG_RING_HI		0x0108
 #define APR_REG_RING_HEAD	0x010c
 #define APR_REG_RING_TAIL	0x0110
-#define APR_RING_PTR_MASK	GENMASK(23, 0)
+#define APR_RING_OFFSET_MASK	GENMASK(23, 0)
+#define APR_RING_GENERATION	BIT(24)
+#define APR_RING_PTR_MASK	GENMASK(24, 0)
 /* One statistics area, given to two consumers; their capacity reads back. */
 #define APR_REG_STATS0_LO	0x038c
 #define APR_REG_STATS0_HI	0x0390
@@ -51,18 +62,40 @@
 #define APR_DC_SCALE_ENTRIES	112
 
 #define APR_RING_BYTES		SZ_128K
-#define APR_DESC_BYTES		0x180
+#define APR_ENCODE_DESC_BYTES	0x180
+#define APR_DECODE_DESC_BYTES	0x100
+/* Kept for the encode descriptor tests and callers. */
+#define APR_DESC_BYTES		APR_ENCODE_DESC_BYTES
+
+/*
+ * Jobs the driver keeps in the ring at once. The ring itself holds hundreds
+ * of descriptors; the limit bounds the buffers and runtime-PM references a
+ * timeout has to fail and the latency of a stream-off. Eight covers the
+ * decode gap to VideoToolbox (several frames outstanding) with slack for the
+ * scheduling delay between jobs.
+ */
+#define APR_MAX_INFLIGHT	8
+/*
+ * Encode stays at one job in the ring: every encode job uses the one shared
+ * statistics area, and nothing public shows that two encodes may overlap in
+ * it. Encode already runs at macOS speed with one job outstanding.
+ */
+#define APR_ENCODE_MAX_INFLIGHT	1
 
 #define APRI_T6041_FIRMWARE_NAME	"apple/prores-t6041-init.bin"
 #define APRI_T6041_FIRMWARE_SIZE	2728
 #define APRI_T6050_FIRMWARE_NAME	"apple/prores-t6050-init.bin"
 #define APRI_T6050_FIRMWARE_SIZE	2880
+#define APRI_T8132_FIRMWARE_NAME	"apple/prores-t8132-init.bin"
+#define APRI_T8132_FIRMWARE_SIZE	2560
 #define APRI_T8142_FIRMWARE_NAME	"apple/prores-t8142-init.bin"
 #define APRI_T8142_FIRMWARE_SIZE	2592
 #define APRI_SYSTEM_COUNT	82
 #define APRI_CORE_COUNT		80
 #define APRI_WRAPPER_COUNT	62
 #define APRI_CONTROL_COUNT	12
+/* T8132 brings up its AXI wrapper with fewer rows than T6041 */
+#define APRI_T8132_WRAPPER_COUNT	48
 /* T8142's AXI-to-fabric wrapper takes 38 rows where T6041 and T6050 take 62. */
 #define APRI_T8142_WRAPPER_COUNT	38
 #define APRI_MAX_COUNT		APRI_SYSTEM_COUNT
@@ -154,6 +187,35 @@ struct apr_frame {
 	u8 matrix;
 };
 
+struct apr_decode_frame {
+	u32 width;
+	u32 height;
+	enum apr_input output;
+	u32 luma_stride;	/* bytes, multiple of 64 */
+	u32 chroma_stride;	/* bytes, multiple of 64 */
+	u64 input;
+	u64 luma;
+	u64 chroma;
+	u16 job_id;
+	bool bottom_field_first;
+};
+
+struct apr_prores_info {
+	u32 frame_size;
+	u32 width;
+	u32 height;
+	u32 slices[2];
+	u32 picture_offset[2];
+	u32 picture_size[2];
+	u8 pictures;
+	u8 chroma;
+	u8 frame_type;
+	u8 alpha;
+	u8 primaries;
+	u8 transfer;
+	u8 matrix;
+};
+
 /* Matrices are 8x8 in raster order, as carried in the ProRes frame header. */
 extern const u8 *const apr_qmat_luma[APR_QTABLES];
 extern const u8 *const apr_qmat_chroma[APR_QTABLES];
@@ -168,9 +230,12 @@ void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
 u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
 int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
+int apr_build_decode_desc(const struct apr_decode_frame *f, u8 *desc);
+int apr_parse_frame(const u8 *data, size_t bytes, struct apr_prores_info *info);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
 extern const struct apri_layout apri_t6041;
 extern const struct apri_layout apri_t6050;
+extern const struct apri_layout apri_t8132;
 extern const struct apri_layout apri_t8142;
 int apr_parse_init(const struct apri_layout *layout, const u8 *data,
 		   size_t size, struct apr_init_data *init);
@@ -180,5 +245,23 @@ static inline int apr_parse_t6041_init(const u8 *data, size_t size,
 {
 	return apr_parse_init(&apri_t6041, data, size, init);
 }
+u32 apr_ring_advance(u32 ptr, u32 bytes, u32 ring_bytes);
+u32 apr_ring_distance(u32 from, u32 to, u32 ring_bytes);
+u32 apr_ring_free(u32 done, u32 head, u32 ring_bytes);
+bool apr_ring_passed(u32 done, u32 end, u32 tail, u32 ring_bytes);
+bool apr_ring_tail_valid(u32 done, u32 tail, u32 head, u32 ring_bytes);
+u16 apr_next_job_id(u16 id);
+bool apr_job_id_done(u16 done_id, u16 id);
+
+enum apr_done_id {
+	APR_DONE_ID_NONE,	/* nothing finished since the reset */
+	APR_DONE_ID_ISSUED,	/* an id the driver issued */
+	APR_DONE_ID_FUTURE,	/* an id not issued yet: the ring is hung */
+};
+
+enum apr_done_id apr_job_id_check(u16 done_id, u16 next_id);
+bool apr_jobs_full(unsigned int jobs, unsigned int encodes);
+void apr_ring_write(u8 *ring, u32 ring_bytes, u32 ptr, const u8 *desc,
+		    u32 desc_bytes);
 
 #endif

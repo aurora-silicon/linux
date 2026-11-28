@@ -102,6 +102,19 @@ def tree(tc):
     return out
 
 
+WORK_TO_ROOT = re.compile(r'sudo (mktemp -d|sh -c umask 022 && cat >"\$1" _ <tmp>/\S+|'
+                         r'sha256sum -- <tmp>/\S+|chmod 0755 <tmp>|rm -rf <tmp>)$')
+
+
+# work_write: what 12.2 wrote with "sudo tee" now gets its mode set in root's shell.
+WORK_WRITE = re.compile(r'^sudo sh -c umask 022 && cat >"\$1" _ (<tmp>/(?:migrate-pro-session\.py|'
+                        r'frozen-dependencies\.py|dependency-result\.json|dependency-files|aurora-m3-gpu-check))$')
+
+# root_put: what 12.2 installed from a temporary file is now passed to root's shell.
+ROOT_PUT = re.compile(r'^sudo sh -c umask 022 && mkdir -p "\$\(dirname "\$1"\)" && t=\$\(mktemp "\$1\.XXXXXX"\) && '
+                      r'\{ cat >"\$t" && chmod 0644 "\$t" && mv -f "\$t" "\$1" \|\| \{ rm -f "\$t"; exit 1; \}; \} _ (\S+)$')
+
+
 def package_check_log(tc, text):
     lines = text.splitlines()
     queries = [i for i, line in enumerate(lines) if line == 'pacman -Qu --color never']
@@ -115,6 +128,12 @@ def package_check_log(tc, text):
     out = []
     for line in lines:
         if line in ('pacman -Qu --color never', 'pacman -Sy --noconfirm', 'sudo pacman -Sy --noconfirm'): continue
+        line = WORK_WRITE.sub(r'sudo tee \1', line)
+        line = ROOT_PUT.sub(r'sudo install -m 644 <tmp> \1', line)
+        # work_to_root: root's own checked copy of the downloads (not in 12.2).
+        if WORK_TO_ROOT.match(line): continue
+        # Root's Python runs isolated (-I) since 12.2.
+        line = line.replace('sudo python3 -I ', 'sudo python3 ')
         line = line.replace('pacman -Sy --noconfirm --ask 4 ', 'pacman -S --noconfirm --ask 4 ')
         out.append(line)
     return out
@@ -1683,8 +1702,8 @@ class ReleaseAssetTest(unittest.TestCase):
             'rm -rf "$dir"',
             'if $sudo gpasswd -a "$user" "$g" >/dev/null && m3_pro_mesa_in_group "$user" "$g"; then',
             'if $sudo gpasswd -d "$u" "$g" >/dev/null; then',
-            'mkdir -p "$work/m3-pro"',
-            'mv "$work/$file" "$work/m3-pro/"',
+            '$sudo mkdir -p "$work/m3-pro"',
+            '$sudo mv -- "$work/$file" "$work/m3-pro/"',
         }
         # Commands in command position (line start, after a pipe, a list operator, if, then or $( ),
         # and redirections into a variable's path.

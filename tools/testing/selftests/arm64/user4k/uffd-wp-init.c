@@ -466,6 +466,8 @@ static void marker_window(size_t ps, size_t native)
 		CHECK(physical(a + i, ps) == start + i);
 		CHECK(((pagemap(a + i, ps) >> 57) & 1) == (i != ps));
 	}
+	/* The neighbours the write populated read zero; a read keeps their WP bit. */
+	CHECK(!a[2 * ps] && !a[3 * ps]);
 	/* An async WP fault on a populated neighbour only clears its own bit. */
 	a[0] = 0xa5;
 	for (size_t i = 0; i < native; i += ps) {

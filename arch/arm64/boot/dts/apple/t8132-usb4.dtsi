@@ -77,13 +77,18 @@
 		nonposted-mmio;
 		status = "disabled";
 
+		/*
+		 * No power-domains: the router populates its DART after it has powered
+		 * its own states, and the native CIO sleep powers them off with the DART
+		 * saved. A DART in ps_atc0_cio would hold that state on through the
+		 * NHI's noirq suspend (it suspends after the NHI), and the sleep fails.
+		 */
 		usb4_0_dart: iommu@a80000 {
 			compatible = "apple,t8132-dart", "apple,t8110-dart";
 			reg = <0xa80000 0x20000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1314 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <5>;
-			power-domains = <&ps_atc0_cio>;
 		};
 
 		usb4_0_nhi: nhi@f00000 {
@@ -194,13 +199,18 @@
 		nonposted-mmio;
 		status = "disabled";
 
+		/*
+		 * No power-domains: the router populates its DART after it has powered
+		 * its own states, and the native CIO sleep powers them off with the DART
+		 * saved. A DART in ps_atc1_cio would hold that state on through the
+		 * NHI's noirq suspend (it suspends after the NHI), and the sleep fails.
+		 */
 		usb4_1_dart: iommu@a80000 {
 			compatible = "apple,t8132-dart", "apple,t8110-dart";
 			reg = <0xa80000 0x20000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1376 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <5>;
-			power-domains = <&ps_atc1_cio>;
 		};
 
 		usb4_1_nhi: nhi@f00000 {

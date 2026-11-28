@@ -14,7 +14,6 @@
 #include <linux/timex.h>
 
 #include <clocksource/arm_arch_timer.h>
-#include <asm/cputype.h>
 
 #define USECS_TO_CYCLES(time_usecs)			\
 	xloops_to_cycles((time_usecs) * 0x10C7UL)
@@ -43,19 +42,6 @@ void __delay(unsigned long cycles)
 {
 	cycles_t start = __delay_cycles();
 
-	/*
-	 * T8142 and T6050 can clear registers on WFIT just as it does on WFI. A delay
-	 * may run with live kernel SIMD state, so the idle task's save/flush
-	 * path is not applicable here. Keep the core awake for short delays.
-	 */
-	if (IS_ENABLED(CONFIG_ARCH_APPLE)) {
-		u32 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
-
-		if (midr == MIDR_APPLE_T8142_E || midr == MIDR_APPLE_T8142_P ||
-		    midr == MIDR_APPLE_T6050_064 || midr == MIDR_APPLE_T6050_065)
-			goto counter_delay;
-	}
-
 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
 		u64 end = start + cycles;
 
@@ -74,7 +60,6 @@ void __delay(unsigned long cycles)
 			wfe();
 	}
 
-counter_delay:
 	while ((__delay_cycles() - start) < cycles)
 		cpu_relax();
 }

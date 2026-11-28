@@ -17,6 +17,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
+#include <linux/platform_device.h>
 #include <linux/sched.h>
 #include <linux/types.h>
 
@@ -112,6 +113,47 @@ void *sep_store_open_block(const char *path, int writable)
 	return f;
 }
 
+/* The platform driver of the SoC's embedded (ANS) NVMe controller. */
+#define SEP_STORE_ANS_DRIVER "nvme-apple"
+
+/*
+ * Whether @dev, a disk's device, sits below the embedded NVMe controller. The
+ * first platform-bus ancestor must be bound to the ANS driver: an NVMe
+ * namespace's parent is its controller, whose parent is the ANS platform
+ * device. A disk behind USB, PCIe/Thunderbolt or a loop device reaches a
+ * different platform device, or none, and is refused.
+ */
+static bool sep_store_dev_is_internal(const struct device *dev)
+{
+	for (dev = dev->parent; dev; dev = dev->parent) {
+		const struct device_driver *drv;
+
+		if (!dev_is_platform(dev))
+			continue;
+		drv = READ_ONCE(dev->driver);
+		return drv && !strcmp(drv->name, SEP_STORE_ANS_DRIVER);
+	}
+	return false;
+}
+
+/*
+ * As sep_store_open_block(), for the enclave's own store: the path is only a
+ * name for the partition, so the device it resolves to must also be on the
+ * internal NVMe disk.
+ */
+void *sep_store_open_internal_block(const char *path, int writable)
+{
+	struct file *f = sep_store_open_block(path, writable);
+
+	if (f && !sep_store_dev_is_internal(disk_to_dev(file_bdev(f)->bd_disk))) {
+		pr_warn_ratelimited("apple-sep: %s is not on the internal NVMe disk; not used\n",
+				    path);
+		filp_close(f, NULL);
+		return NULL;
+	}
+	return f;
+}
+
 void sep_store_close(void *handle)
 {
 	if (handle)
@@ -180,3 +222,8 @@ int sep_store_sync_parent(void *handle)
 	fput(dir);
 	return ret;
 }
+
+/* Like the module's Rust tests, which need KUnit built in. */
+#if IS_ENABLED(CONFIG_APPLE_SEP_KUNIT_TEST) && IS_BUILTIN(CONFIG_KUNIT)
+#include "store_shim_test.c"
+#endif

@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The 14-inch K boards' chassis (K114c, M5 Max, and K114s, M5 Pro): what their ADTs describe
+ * alike beyond what t6050-k114-k116.dtsi shares with the 16-inch boards. The live K114s ADT
+ * (27.2) and the K114c's have the same nodes and values here, phandles aside.
+ *
+ * The six speaker amps and the card's "Speaker" link are the J714s's
+ * (t6050-sn012776-speakers.dtsi): the K114s and K114c ADTs describe the same amps,
+ * wiring and slots.
+ *
+ * Included after t6050-peripherals.dtsi.
+ */
+
+/*
+ * The Neural Engine (ADT ane0, "ane,t8132exclave", firmware pre-loaded by iBoot), started only
+ * after the boot loader's preload hand-off
+ */
+#include "t6050-j714s-ane.dtsi"
+
+/*
+ * ANE_SYS's declared suppliers are the fabric domains: enabled the way
+ * the J714s enables them (t6050-j714s.dts for fab8/fab0,
+ * t6050-isp.dtsi for fab9). Left disabled they never register a
+ * provider and the enabled ps_ane_sys defers forever, taking ane0 and its
+ * three DARTs with it.
+ */
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab9_soc {
+	/delete-property/ power-domains;
+	apple,no-auto-pm;
+	apple,firmware-owned;
+	status = "okay";
+};
+
+/*
+ * Pin 112's register takes an SError when read, so only the pins a node names are
+ * exposed: 80 and 81 (PCIe ports 0 and 1's PERST#); 106 and 107, the speaker amps'
+ * interrupt and shutdown line (ADT audio-speaker); 134 and 139, the jack codec's
+ * interrupt and reset; 136 and 137, the speaker ID; 138, the Touch ID sensor's
+ * data-ready line (t6050-touchid.dtsi).
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output): its reset line
+ * is AP pin 139, driven high to run the codec, and its interrupt AP pin 134, level
+ * low.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/ {
+	sound: sound {
+		compatible = "apple,k114-macaudio", "apple,macaudio";
+		model = "MacBook Pro K114";
+		/* ADT audio-speaker function-speaker-id0 and -id1 */
+		speaker-id-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl_ap 137 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+#include "t6050-sn012776-speakers.dtsi"
+
+/* The AOP, booted through its setup port, with its sensor and audio services. */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+/*
+ * The microphone array: ADT audio-hp-mic, three microphones on leap-s RX0 through the
+ * proxy ADMAC (Linux channel 1, as on J813), captured by the AOP audio service's own card.
+ */
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_ec_proxy {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "K114";
+	apple,machine-kind = "MacBook Pro";
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
+};

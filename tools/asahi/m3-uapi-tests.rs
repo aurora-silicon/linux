@@ -751,6 +751,63 @@ fn attachment_validation_rejects_readonly_zero_and_wrapped_ranges() {
 }
 
 #[test]
+fn helpers_are_empty_or_a_mapped_program_with_a_writable_argument_block() {
+    let queue = QueueUscWindow {
+        base: USC_WINDOW_SIZE,
+        user_start: 0x4000,
+        user_end: 2 * USC_WINDOW_SIZE,
+    };
+    let mut region = Region {
+        start: queue.base + 8,
+        end: queue.base + 0x100,
+        writable: true,
+    };
+    let none = UapiHelperProgram {
+        binary: 0,
+        config: 0,
+        data: 0,
+    };
+    let helper = UapiHelperProgram {
+        binary: 9,
+        config: 0x40,
+        data: queue.base + 0x40,
+    };
+    assert_eq!(validate_helper(queue, &region, none), Ok(()));
+    assert_eq!(validate_helper(queue, &region, helper), Ok(()));
+    // A configuration or argument block without a program.
+    for stray in [
+        UapiHelperProgram { config: 0x40, ..none },
+        UapiHelperProgram { data: helper.data, ..none },
+    ] {
+        assert_eq!(
+            validate_helper(queue, &region, stray),
+            Err(UapiTranslateError::ProgramOffset)
+        );
+    }
+    // A program outside the mapping, a misaligned, unmapped or missing argument block.
+    assert_eq!(
+        validate_helper(queue, &region, UapiHelperProgram { binary: 0x200, ..helper }),
+        Err(UapiTranslateError::AddressRange)
+    );
+    assert_eq!(
+        validate_helper(queue, &region, UapiHelperProgram { data: helper.data + 4, ..helper }),
+        Err(UapiTranslateError::AddressAlignment)
+    );
+    for data in [0, queue.base + 0x100, u64::MAX & !7] {
+        assert_eq!(
+            validate_helper(queue, &region, UapiHelperProgram { data, ..helper }),
+            Err(UapiTranslateError::AddressRange)
+        );
+    }
+    // The argument block must be writable.
+    region.writable = false;
+    assert_eq!(
+        validate_helper(queue, &region, helper),
+        Err(UapiTranslateError::AddressRange)
+    );
+}
+
+#[test]
 fn usc_windows_reject_misalignment_overflow_and_unmapped_programs() {
     let queue = QueueUscWindow {
         base: USC_WINDOW_SIZE,
