@@ -458,10 +458,11 @@
 
 /*
  * Pin 112 takes an SError when read (as on the J716c), so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#).
+ * here names are exposed: 80 (PCIe port 0's PERST#) and 138 (the Touch ID
+ * sensor's data-ready line).
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 57>, <139 82>;
 };
 
 /*
@@ -490,15 +491,19 @@
 	/delete-node/ temperature-TW0P;
 
 	/*
-	 * The T6050 SMC spells the fan mode keys F0md/F1md, as on the J775D. No
-	 * apple,fan-manual-control: the SMC drives the fans.
+	 * The T6050 SMC spells the fan mode keys F0md/F1md, as on the J775D. The
+	 * SMC drives the fans; as on the J714s, it also accepts a manual speed for
+	 * either from userspace, within the fan's own minimum and maximum, and
+	 * takes the fan back when the target is set to 0.
 	 */
 	fan-F0Ac {
 		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
 	};
 
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
 	};
 };
 
@@ -587,3 +592,74 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/*
+ * Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel. The J716sAP ADT's
+ * /arm-io/acio1, acio-cpu1, dart-acio1, apciec1 and dart-apciec1 have the J714s's addresses,
+ * interrupts, LSTX pin (AOP 79) and tunables, and the same host DROM (UID 1), so the J714s's
+ * description is taken as it is, except for the PHY's CIO80 RX_TOP tunables below.
+ */
+#include "t6050-j714s-left-usb4.dtsi"
+
+/*
+ * The apple,pcie binding names interrupts only on apple,t6040-pciec; the PCIe-C driver takes
+ * the port interrupt by index. Leave the shared description's "port0" name out on this board.
+ */
+&apciec1 {
+	/delete-property/ interrupt-names;
+};
+
+/*
+ * The PHY's CIO80 RX_TOP tunables are this board's own (ADT atc-phy1
+ * tunable_LN0/LN1_RX_TOP_CIO_DFLT), not the J714s's: drop the J714s's from the shared
+ * description. The boot loader is to copy this board's from the ADT; until it does, the
+ * PHY driver skips the RX_TOP CIO step, as it does for any CIO80 tunable that is absent.
+ */
+&atc1_phy {
+	/delete-property/ apple,tunable-lane0-rx-top-cio;
+	/delete-property/ apple,tunable-lane1-rx-top-cio;
+};
+
+/*
+ * The SEP (ADT sep, dart-sep): the same hand-off as the J716c's and the J714s's. The boot
+ * loader reserves its firmware and adds its manifests through the "sep" alias; its mailbox
+ * and power domain are on, with the two fabric parents left to the firmware.
+ */
+#include "t6050-j716c-sep.dtsi"
+
+/*
+ * Touch ID (ADT spi2/mesa), wired as on the J714s and the J716c: the Mesa sensor
+ * (sensor-id 0x3356) at 8 MHz on chip select 0, powered by NUB GPIO 21
+ * (function-mesa_pwr), data ready on AP GPIO 138. The controller's clock is the
+ * 24 MHz reference.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-j716s.bin", "apple/msrk-j716s.bin";
+	};
+};

@@ -72,7 +72,7 @@
 /arm-io/i2c8 0x505030000 -> /soc/i2c@505030000
 /arm-io/i2c8/pcon0 /arm-io/i2c8@0x8 -> MISSING
 /arm-io/spi2 0x505108000 -> /soc/spi@505108000
-/arm-io/spi2/mesa /arm-io/spi2@0x0 -> MISSING
+/arm-io/spi2/mesa /arm-io/spi2@0x0 -> /soc/spi@505108000/fingerprint@0
 /arm-io/spi4 0x505110000 -> /soc/spi@505110000
 /arm-io/spi4/dp855 /arm-io/spi4@0x0 -> MISSING
 /arm-io/spi4/dp855/lcd-pmicwp /arm-io/spi4/dp855@0x4f -> MISSING
@@ -186,13 +186,13 @@
 /arm-io/dart-acio0/mapper-acio0-rx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/acio-cpu0 0x2a1108000 -> MISSING
 /arm-io/acio-cpu0/iop-acio0-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
-/arm-io/apciec1 0x1c60000000 -> MISSING
+/arm-io/apciec1 0x1c60000000 -> /pcie-tunnel-1/pcie@1c60000000
 /arm-io/apciec1/pcic1-bridge - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
-/arm-io/dart-apciec1 0x2ac000000 -> /soc/iommu@2ac000000
-/arm-io/dart-apciec1/mapper-apciec1-piodma - -> /soc/iommu@2ac000000
+/arm-io/dart-apciec1 0x2ac000000 -> /pcie-tunnel-1/iommu@2ac000000
+/arm-io/dart-apciec1/mapper-apciec1-piodma - -> /pcie-tunnel-1/iommu@2ac000000
 /arm-io/apciec1-piodma 0x2ac068000 -> /soc/dma-controller@2ac068000
-/arm-io/acio1 0x2a9f00000 -> MISSING
-/arm-io/dart-acio1 0x2a9a80000 -> MISSING
+/arm-io/acio1 0x2a9f00000 -> /soc@200000000/acio@2a9ac0000/nhi@f00000
+/arm-io/dart-acio1 0x2a9a80000 -> /soc@200000000/acio@2a9ac0000/iommu@a80000
 /arm-io/dart-acio1/mapper-acio1-tx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/dart-acio1/mapper-acio1-tx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/dart-acio1/mapper-acio1-tx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
@@ -217,7 +217,7 @@
 /arm-io/dart-acio1/mapper-acio1-rx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/dart-acio1/mapper-acio1-rx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/dart-acio1/mapper-acio1-rx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/acio-cpu1 0x2a9108000 -> MISSING
+/arm-io/acio-cpu1 0x2a9108000 -> /soc@200000000/mailbox@2a9108000
 /arm-io/acio-cpu1/iop-acio1-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
 /arm-io/apciec2 0x1c70000000 -> MISSING
 /arm-io/apciec2/pcic2-bridge - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
