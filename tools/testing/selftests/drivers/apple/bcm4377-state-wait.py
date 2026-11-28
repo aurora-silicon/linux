@@ -27,7 +27,7 @@ struct bcm4377_data {
     unsigned long reset_pending, dma_window_base;struct pci_dev *pdev;struct hci_dev *hdev;
     const struct bcm4377_hw *hw;bool needs_reset,own_reset;unsigned bootstage,rti_status;
     struct ring_state *ring_state;
-    struct { unsigned generation,n_entries;unsigned long msgids[1];unsigned *events; } control_h2d_ring;
+    struct { unsigned generation,n_entries,head;unsigned long msgids[1];unsigned *events; } control_h2d_ring;
     struct { bool enabled; } control_ack_ring;
 };
 struct hci_dev { struct bcm4377_data *data; bool setup; };
@@ -94,7 +94,9 @@ int main(void)
     assert(errors==1 && !pci_resets && !irq_disables && !irq_enables && !boots);
     assert(b.needs_reset && ring.value==99);
     b.dma_window_base=0;b.control_h2d_ring.n_entries=4;
+    b.control_h2d_ring.head=3;
     assert(!bcm4377_pci_reset(&b) && pci_resets==1 && irq_disables==1 && irq_enables==1);
+    assert(b.control_h2d_ring.head==0);
     assert(!b.own_reset);
     assert(!b.needs_reset && !ring.value && boots==1);
     reset_error=-EIO;

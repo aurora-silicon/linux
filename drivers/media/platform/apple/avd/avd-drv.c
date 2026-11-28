@@ -100,9 +100,11 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
+	job->overflow = false;
 	/* A table that was built but never submitted still belongs to us. */
 	kvfree(job->segments);
 	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
+	job->max = job->segments ? segments : 0;
 	if (!job->segments)
 		ret = -ENOMEM;
 	return ret;
@@ -188,10 +190,6 @@ static int avd_open(struct file *filp)
 
 	ctx->dev = avd;
 
-	ret = avd_buf_alloc(avd, &ctx->inst, fifo_size());
-	if (ret)
-		goto err_free_ctx;
-
 	INIT_LIST_HEAD(&ctx->queue_node);
 	ctx->next_dep = AVD_DEP_PREV_DONE;
 
@@ -219,7 +217,6 @@ err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 
 err_free_ctx:
-	avd_buf_free(avd, &ctx->inst);
 	kfree(ctx);
 	return ret;
 }
@@ -280,7 +277,6 @@ static int avd_v4l2_init(struct avd_dev *avd)
 
 	avd->mdev.dev = avd->dev;
 	strscpy(avd->mdev.model, "avd", sizeof(avd->mdev.model));
-	strscpy(avd->mdev.bus_info, "platform:avd", sizeof(avd->mdev.bus_info));
 	media_device_init(&avd->mdev);
 	avd->mdev.ops = &avd_media_ops;
 	avd->v4l2_dev.mdev = &avd->mdev;
@@ -468,7 +464,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
-	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_V5_QUEUE_PACING,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -671,6 +667,57 @@ static void avd_release_open_firmware(void *data)
 	release_firmware(avd->fw);
 }
 
+static int avd_attach_power_domains(struct avd_dev *avd)
+{
+	static const char *const core_pd_names[] = { "core" };
+	static const struct dev_pm_domain_attach_data core_pd_data = {
+		.pd_names = core_pd_names,
+		.num_pd_names = ARRAY_SIZE(core_pd_names),
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	static const struct dev_pm_domain_attach_data all_pd_data = {
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	struct device_node *np = avd->dev->of_node;
+	int num_pds, perf_idx, ret;
+
+	/*
+	 * A node may list a second power domain, "perf": a PMC or PMP
+	 * performance floor that raises the SoC rail while the decoder works.
+	 * With more than one domain the core attaches none. Link only "core"
+	 * to avd->dev's runtime PM so light streams do not hold the floor on
+	 * every frame, and manage "perf" separately on demand in avd-pm.c.
+	 */
+	num_pds = of_count_phandle_with_args(np, "power-domains",
+					     "#power-domain-cells");
+	if (num_pds <= 1)
+		return 0;
+
+	perf_idx = of_property_match_string(np, "power-domain-names", "perf");
+	if (perf_idx >= 0 &&
+	    of_property_match_string(np, "power-domain-names", "core") >= 0) {
+		ret = devm_pm_domain_attach_list(avd->dev, &core_pd_data,
+						 &avd->pd_list);
+		if (ret < 0)
+			return dev_err_probe(avd->dev, ret,
+					     "failed to attach core power domain\n");
+
+		ret = avd_pm_attach_perf(avd, perf_idx);
+		if (ret)
+			return dev_err_probe(avd->dev, ret,
+					     "failed to attach perf power domain\n");
+
+		return 0;
+	}
+
+	ret = devm_pm_domain_attach_list(avd->dev, &all_pd_data, &avd->pd_list);
+	if (ret < 0)
+		return dev_err_probe(avd->dev, ret,
+				     "failed to attach power domains\n");
+
+	return 0;
+}
+
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
@@ -699,25 +746,9 @@ static int avd_probe(struct platform_device *pdev)
 	if (IS_ERR(avd->rstc))
 		return PTR_ERR(avd->rstc);
 
-	/*
-	 * A node may list a second power domain, "perf": the PMC floor that
-	 * holds the SoC rail at its performance level while the decoder works
-	 * (decode runs at about half speed on the M4 Pro without it). With more
-	 * than one domain the core attaches none, so attach them all with
-	 * runtime PM device links: the floor is then held exactly while the
-	 * decoder is runtime-active (frames in flight plus the autosuspend
-	 * delay) and released when it idles, rests or is retired.
-	 */
-	if (of_count_phandle_with_args(pdev->dev.of_node, "power-domains",
-				       "#power-domain-cells") > 1) {
-		static const struct dev_pm_domain_attach_data pd_data = {
-			.pd_flags = PD_FLAG_DEV_LINK_ON,
-		};
-
-		ret = devm_pm_domain_attach_list(avd->dev, &pd_data, &avd->pd_list);
-		if (ret < 0)
-			return dev_err_probe(avd->dev, ret, "failed to attach power domains\n");
-	}
+	ret = avd_attach_power_domains(avd);
+	if (ret)
+		return ret;
 
 	avd->code = devm_platform_ioremap_resource_byname(pdev, "code");
 	if (IS_ERR(avd->code))
@@ -741,6 +772,12 @@ static int avd_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Neither width has a named source: the LSR encodings would allow 39
+	 * bits (compressed-plane addresses, addr >> 7 in one word) and 42 is
+	 * unexplained for the Apple backend. See
+	 * https://github.com/aurora-silicon/linux/issues/2451.
+	 */
 	ret = dma_set_mask_and_coherent(avd->dev,
 			DMA_BIT_MASK(avd_backend_is_apple(avd) ? 42 :
 			     (avd->variant->quirks & AVD_QUIRK_LSR) ? 38 : 64));
@@ -767,8 +804,8 @@ static int avd_probe(struct platform_device *pdev)
 
 	/*
 	 * The domain links were added active, but the decoder starts
-	 * suspended: settle that before enabling runtime PM, so the floor is
-	 * not held until the first decode has come and gone.
+	 * suspended: settle that before enabling runtime PM, so the attached
+	 * domains are not held until the first decode has come and gone.
 	 */
 	if (avd->pd_list) {
 		ret = pm_runtime_set_suspended(avd->dev);
@@ -843,6 +880,9 @@ static struct platform_driver avd_driver = {
 	},
 };
 module_platform_driver(avd_driver);
+#if IS_REACHABLE(CONFIG_VIDEO_APPLE_AVD_KUNIT_TEST)
+#include "avd-variant-test.c"
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Apple avd v4l2 sl m2m");

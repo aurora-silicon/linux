@@ -278,6 +278,8 @@
 };
 
 #include "hwmon-mini.dtsi"
+#include "t8112-hwmon-rails.dtsi"
+#include "t8112-hwmon.dtsi"
 
 
 #include "t8112-j473-peripherals.dtsi"

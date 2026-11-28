@@ -571,23 +571,45 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 	return 0;
 }
 
+static u8 color_wire_bpp(enum dcp_color_format fmt, u8 depth)
+{
+	if (fmt == DCP_COLOR_FORMAT_YCBCR420)
+		return (depth * 3) / 2;
+	if (fmt == DCP_COLOR_FORMAT_YCBCR422 ||
+	    fmt == DCP_COLOR_FORMAT_YCBCR422_DP ||
+	    fmt == DCP_COLOR_FORMAT_YCBCR422_HDMI)
+		return depth * 2;
+	return depth * 3;
+}
+
 /*
  * An HDR output scans out through a PQ BT.2020 element.  Prefer RGB, which
  * needs no conversion, then 10 bits per component, which is what an HDR
  * framebuffer carries; a timing without link bandwidth for PQ RGB may still
  * offer YCbCr 4:4:4, which the processor converts the RGB surfaces to.
  */
-static unsigned int pq_mode_rank(const struct color_mode *cmode)
+static unsigned int pq_mode_rank(const struct color_mode *cmode,
+				 bool downstream_420)
 {
+	enum dcp_color_format fmt = downstream_420 ?
+		DCP_COLOR_FORMAT_YCBCR420 : cmode->pixel_encoding;
 	unsigned int rank;
 
 	if (cmode->eotf != DCP_EOTF_ST_2084)
 		return 0;
-	if (cmode->pixel_encoding == DCP_COLOR_FORMAT_RGB &&
+	if (fmt == DCP_COLOR_FORMAT_RGB &&
 	    cmode->colorimetry == DCP_COLORIMETRY_BT2020_RGB &&
 	    cmode->dynamic_range == DCP_COLOR_YCBCR_RANGE_FULL)
+		rank = 7;
+	else if (fmt == DCP_COLOR_FORMAT_YCBCR444 &&
+		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
+		rank = 5;
+	else if ((fmt == DCP_COLOR_FORMAT_YCBCR422 ||
+		  fmt == DCP_COLOR_FORMAT_YCBCR422_DP ||
+		  fmt == DCP_COLOR_FORMAT_YCBCR422_HDMI) &&
+		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
 		rank = 3;
-	else if (cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR444 &&
+	else if (fmt == DCP_COLOR_FORMAT_YCBCR420 &&
 		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
 		rank = 1;
 	else
@@ -595,31 +617,112 @@ static unsigned int pq_mode_rank(const struct color_mode *cmode)
 	return rank + (cmode->depth == 10);
 }
 
-/* A PQ element that needs DSC ranks below every one that does not. */
-#define PQ_RANK_NO_DSC 4
+static void record_color_entry(struct dcp_display_mode *out,
+			       s64 *scores,
+			       const struct color_mode *cmode,
+			       const struct timing_color_restrictions *limits,
+			       bool limits_known, bool downstream_420)
+{
+	struct dcp_color_entry entry = {};
+	unsigned int pos, end;
+
+	static_assert(DCP_EOTF_COUNT <= 8);
+	static_assert(DCP_COLOR_FORMAT_COUNT <= 16);
+	static_assert(DCP_COLOR_YCBCR_RANGE_COUNT <= 2);
+	static_assert(DCP_COLORIMETRY_COUNT <= 32);
+
+	if (cmode->colorimetry < 0 || cmode->colorimetry >= DCP_COLORIMETRY_COUNT ||
+	    cmode->depth < 8 || cmode->depth > 12 ||
+	    cmode->dynamic_range < 0 || cmode->dynamic_range >= DCP_COLOR_YCBCR_RANGE_COUNT ||
+	    cmode->eotf < 0 || cmode->eotf >= DCP_EOTF_COUNT ||
+	    cmode->pixel_encoding < 0 || cmode->pixel_encoding >= DCP_COLOR_FORMAT_COUNT)
+		return;
+
+	entry.id = cmode->id;
+	entry.eotf = cmode->eotf;
+	entry.format = cmode->pixel_encoding;
+	entry.range = cmode->dynamic_range;
+	entry.colorimetry = cmode->colorimetry;
+	entry.depth = cmode->depth;
+	if (downstream_420)
+		entry.flags |= DCP_COLOR_FLAG_DOWNSTREAM_420;
+	if (limits_known) {
+		if (timing_color_contains(&limits->unsafe, cmode->id))
+			entry.flags |= DCP_COLOR_FLAG_UNSAFE;
+		if (timing_color_contains(&limits->dsc_required, cmode->id))
+			entry.flags |= DCP_COLOR_FLAG_DSC;
+	}
+
+	pos = out->nr_colors;
+	while (pos > 0 && scores[pos - 1] < cmode->score)
+		pos--;
+	if (pos >= DCP_MAX_COLOR_ENTRIES)
+		return;
+	end = out->nr_colors < DCP_MAX_COLOR_ENTRIES ? out->nr_colors : DCP_MAX_COLOR_ENTRIES - 1;
+	if (end > pos) {
+		memmove(&out->colors[pos + 1], &out->colors[pos],
+			(end - pos) * sizeof(out->colors[0]));
+		memmove(&scores[pos + 1], &scores[pos],
+			(end - pos) * sizeof(scores[0]));
+	}
+	out->colors[pos] = entry;
+	scores[pos] = cmode->score;
+	if (out->nr_colors < DCP_MAX_COLOR_ENTRIES)
+		out->nr_colors++;
+}
 
 /*
- * @dsc: firmware 27, whose processor compresses an element the timing lists
- * as needing DSC itself, as for SDR: such a PQ element is usable too.
+ * @dsc: the modeset delegates compression of DSC-required elements to DCP.
  */
 static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 			    struct color_mode *cmode,
-			    const struct timing_color_restrictions *limits, bool dsc)
+			    const struct timing_color_restrictions *limits,
+			    bool dsc, bool downstream_420)
 {
-	unsigned int rank = pq_mode_rank(cmode);
+	unsigned int rank = pq_mode_rank(cmode, downstream_420);
+	bool needs_dsc = timing_color_contains(&limits->dsc_required, cmode->id);
 
-	if (!rank || timing_color_contains(&limits->unsafe, cmode->id))
+	if (!rank || (needs_dsc && !dsc) ||
+	    timing_color_contains(&limits->unsafe, cmode->id))
 		return;
-	if (!timing_color_contains(&limits->dsc_required, cmode->id))
-		rank += PQ_RANK_NO_DSC;
-	else if (!dsc)
-		return;
+
+	/* Break equal format and depth ranks in favour of no compression. */
+	rank = 2 * rank + !needs_dsc;
 	if (rank < *best_rank)
 		return;
 	if (rank > *best_rank)
 		pq->score = -1;
-	fill_color_mode(pq, cmode);
+	if (!fill_color_mode(pq, cmode) && downstream_420 && pq->id == cmode->id)
+		pq->format = DCP_COLOR_FORMAT_YCBCR420;
 	*best_rank = rank;
+}
+
+static int parse_downstream_pixel_encoding(struct dcp_parse_ctx *handle,
+					   s64 *encoding)
+{
+	struct iterator it;
+	int ret;
+
+	*encoding = -1;
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
+		char *key = parse_string(it.handle);
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "PixelEncoding"))
+			ret = parse_int(it.handle, encoding);
+		else
+			ret = skip(it.handle);
+		kfree(key);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int parse_color_modes(struct dcp_parse_ctx *handle,
@@ -630,26 +733,37 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 {
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
+	s64 *color_scores;
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
-	unsigned int best_rgb_rank = 0;
+	unsigned int best_unsafe_pq_rank = 0, best_rgb_rank = 0;
 	int ret = 0;
+
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
 	out->pq.score = -1;
+	out->nr_colors = 0;
+	out->sdr_unsafe_max_bpp = 0;
 	out->sdr_usable = false;
+	out->sdr_unsafe = false;
 	out->has_bootstrap = false;
 
 	ret = iterator_begin(handle, &outer_it, false);
 	if (ret)
 		return ret;
 
+	color_scores = kcalloc(DCP_MAX_COLOR_ENTRIES, sizeof(*color_scores),
+			       GFP_KERNEL);
+	if (!color_scores)
+		return -ENOMEM;
+
 	for (; outer_it.idx < outer_it.len; ++outer_it.idx) {
 		struct iterator it;
 		static const char * const fields[] = { "Colorimetry", "Depth", "DynamicRange", "EOTF", "ID", "PixelEncoding", "Score", "IsVirtual" };
 		unsigned int seen = 0;
-		bool is_virtual = true;
+		bool is_virtual = true, downstream_420;
+		s64 downstream_encoding = -1;
 		struct color_mode cmode = {
 			.colorimetry = -1,
 			.depth = -1,
@@ -662,7 +776,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 		ret = iterator_begin(handle, &it, true);
 		if (ret)
-			return ret;
+			goto out_free;
 
 		for (; it.idx < it.len; ++it.idx) {
 			char *key = parse_string(it.handle);
@@ -681,6 +795,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				ret = parse_int(it.handle, &cmode.colorimetry);
 			else if (!strcmp(key, "Depth"))
 				ret = parse_int(it.handle, &cmode.depth);
+			else if (!strcmp(key, "DownstreamFormat"))
+				ret = parse_downstream_pixel_encoding(it.handle,
+								      &downstream_encoding);
 			else if (!strcmp(key, "DynamicRange"))
 				ret = parse_int(it.handle, &cmode.dynamic_range);
 			else if (!strcmp(key, "EOTF"))
@@ -700,7 +817,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				kfree(key);
 
 			if (ret)
-				return ret;
+				goto out_free;
 		}
 
 		/*
@@ -717,19 +834,43 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		    cmode.id > U32_MAX)
 			continue;
 
+		/*
+		 * DP-to-HDMI bridges downsample 4K60 YCbCr 4:4:4/4:2:2 to
+		 * YCbCr 4:2:0 on the downstream link.  Preserve cmode.pixel_encoding
+		 * as the upstream encoding and flag the downstream wire format.
+		 */
+		downstream_420 = downstream_encoding == DCP_COLOR_FORMAT_YCBCR420;
+
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
 				       cmode.depth, cmode.colorimetry,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
+		record_color_entry(out, color_scores, &cmode, limits,
+				   limits_known, downstream_420);
 
 		if (limits_known)
 			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits,
-					handle->pq_dsc);
+					handle->pq_dsc, downstream_420);
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA &&
 		    (!limits_known ||
 		     (!timing_color_contains(&limits->unsafe, cmode.id) &&
-		      !timing_color_contains(&limits->dsc_required, cmode.id))))
+		      !timing_color_contains(&limits->dsc_required, cmode.id)))) {
 			out->sdr_usable = true;
+		} else if (!external_sdr && cmode.eotf == DCP_EOTF_SDR_GAMMA &&
+			   !timing_color_contains(&limits->dsc_required, cmode.id)) {
+			out->sdr_unsafe = true;
+			if (cmode.depth >= 8 && cmode.depth <= 12 &&
+			    cmode.pixel_encoding >= 0 &&
+			    cmode.pixel_encoding < DCP_COLOR_FORMAT_COUNT) {
+				enum dcp_color_format wire_fmt = downstream_420 ?
+					DCP_COLOR_FORMAT_YCBCR420 :
+					cmode.pixel_encoding;
+				u8 bpp = color_wire_bpp(wire_fmt, cmode.depth);
+
+				if (bpp > out->sdr_unsafe_max_bpp)
+					out->sdr_unsafe_max_bpp = bpp;
+			}
+		}
 
 		if (external_sdr) {
 			unsigned int rank;
@@ -786,7 +927,58 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		fill_color_mode(&out->best, &cmode);
 	}
 
-	return 0;
+	/*
+	 * Timings above HDMI 1.4's 340 MHz clock behind DP-to-HDMI 2.0 bridges
+	 * list every element in UnsafeColorElementIDs even though SDR already
+	 * drives them through those unsafe elements.  DCP firmware omits
+	 * over-budget non-DSC modes from ColorModes (e.g. 12-bit RGB on
+	 * 1080p180 and 10/12-bit RGB on 1440p144); as an additional link-budget
+	 * guard, bound the fallback to the wire bpp of the timing's non-DSC
+	 * unsafe SDR elements, and keep UnsafeColorElementIDs strict whenever
+	 * any safe SDR element exists.
+	 */
+	if (!external_sdr && limits_known && out->pq.score < 0 &&
+	    !out->sdr_usable && out->sdr_unsafe) {
+		unsigned int i;
+
+		for (i = 0; i < out->nr_colors; i++) {
+			const struct dcp_color_entry *e = &out->colors[i];
+			bool ds420 = !!(e->flags & DCP_COLOR_FLAG_DOWNSTREAM_420);
+			enum dcp_color_format wire_fmt = ds420 ?
+				DCP_COLOR_FORMAT_YCBCR420 : e->format;
+			struct color_mode c = {
+				.id = e->id,
+				.depth = e->depth,
+				.dynamic_range = e->range,
+				.eotf = e->eotf,
+				.pixel_encoding = e->format,
+				.colorimetry = e->colorimetry,
+				.score = color_scores[i],
+			};
+			unsigned int rank;
+
+			if (e->flags & DCP_COLOR_FLAG_DSC)
+				continue;
+			if (out->sdr_unsafe_max_bpp &&
+			    color_wire_bpp(wire_fmt, e->depth) > out->sdr_unsafe_max_bpp)
+				continue;
+			rank = pq_mode_rank(&c, ds420);
+			if (!rank)
+				continue;
+			rank = 2 * rank + 1;
+			if (rank < best_unsafe_pq_rank)
+				continue;
+			if (rank > best_unsafe_pq_rank)
+				out->pq.score = -1;
+			if (!fill_color_mode(&out->pq, &c) && ds420 && out->pq.id == e->id)
+				out->pq.format = DCP_COLOR_FORMAT_YCBCR420;
+			best_unsafe_pq_rank = rank;
+		}
+	}
+
+out_free:
+	kfree(color_scores);
+	return ret;
 }
 
 /*
@@ -865,13 +1057,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool limits_known;
 	struct drm_display_mode *mode = &out->mode;
 
-	*out = (struct dcp_display_mode) {
-		.sdr_rgb.score = -1,
-		.sdr_444.score = -1,
-		.sdr.score = -1,
-		.best.score = -1,
-		.pq.score = -1,
-	};
+	memset(out, 0, sizeof(*out));
+	out->sdr_rgb.score = -1;
+	out->sdr_444.score = -1;
+	out->sdr.score = -1;
+	out->best.score = -1;
+	out->pq.score = -1;
 	*score = -1;
 	handle->ambiguous_180hz = false;
 
@@ -1186,9 +1377,9 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
 /*
  * An external display defaults to its native resolution at the highest
  * refresh rate it can take, as other systems pick it, rather than to the
- * timing its EDID lists first.  Among the timings of that resolution with a
- * usable SDR element, the higher refresh rate ranks first, then IsPreferred,
- * then the firmware score.
+ * timing its EDID lists first.  Among the default candidates of that
+ * resolution, the higher refresh rate ranks first, then IsPreferred, then the
+ * firmware score.
  */
 VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode,
 					     s64 score,
@@ -1207,20 +1398,53 @@ VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode
 }
 
 /*
+ * A timing the default may be.  Firmware lists a color element as unsafe
+ * when the timing needs a faster link than it can vouch for: behind a USB-C
+ * to HDMI cable (a Parade PS176) a Dell S2725QS gets every 3840x2160 60 Hz
+ * element listed, the timings above the 340 MHz of its EDID's HDMI 1.4 block
+ * being unsafe though its HDMI 2.x block takes 600 MHz.  The firmware still
+ * marks that timing IsPreferred and scores it highest, and macOS drives it
+ * at 60 Hz (DPTimingModeId 50, an HBR2 x4 link) from the same list.  So a
+ * timing the firmware prefers stays a candidate when its SDR elements are
+ * unsafe; one only DSC can carry does not, and neither does an unsafe timing
+ * the firmware does not prefer.  dcp_external_default() still passes it over
+ * when the firmware also prefers a usable timing of the same resolution.
+ */
+VISIBLE_IF_KUNIT bool dcp_mode_default_candidate(const struct dcp_display_mode *m)
+{
+	if (m->automatic_rgb8_quirk)
+		return false;
+	return m->sdr_usable || (m->sdr_unsafe && m->firmware_preferred);
+}
+
+static bool dcp_mode_same_size(const struct dcp_display_mode *a,
+			       const struct dcp_display_mode *b)
+{
+	return a->mode.hdisplay == b->mode.hdisplay &&
+	       a->mode.vdisplay == b->mode.vdisplay;
+}
+
+/*
  * The native resolution: the largest the firmware marks IsPreferred, or the
  * largest of all when it marks none.
+ *
+ * Nothing falls back to another timing when the default fails to light up,
+ * so a timing with only unsafe SDR elements is the default only when the
+ * firmware prefers no usable timing of the native resolution.  With one, the
+ * unsafe timings are left out and the usable ones rank among themselves.
  */
 static struct dcp_display_mode *dcp_external_default(struct dcp_display_mode *modes,
 						     unsigned int count)
 {
 	struct dcp_display_mode *native = NULL, *best = NULL;
+	bool usable_preferred = false;
 	unsigned int i;
 
 	for (i = 0; i < count; i++) {
 		const struct dcp_display_mode *m = &modes[i];
 		u64 area = (u64)m->mode.hdisplay * m->mode.vdisplay;
 
-		if (m->automatic_rgb8_quirk || !m->sdr_usable)
+		if (!dcp_mode_default_candidate(m))
 			continue;
 		if (!native ||
 		    (m->firmware_preferred && !native->firmware_preferred) ||
@@ -1231,11 +1455,17 @@ static struct dcp_display_mode *dcp_external_default(struct dcp_display_mode *mo
 	if (!native)
 		return NULL;
 	for (i = 0; i < count; i++) {
+		const struct dcp_display_mode *m = &modes[i];
+
+		if (dcp_mode_default_candidate(m) && dcp_mode_same_size(m, native) &&
+		    m->sdr_usable && m->firmware_preferred)
+			usable_preferred = true;
+	}
+	for (i = 0; i < count; i++) {
 		struct dcp_display_mode *m = &modes[i];
 
-		if (m->automatic_rgb8_quirk || !m->sdr_usable ||
-		    m->mode.hdisplay != native->mode.hdisplay ||
-		    m->mode.vdisplay != native->mode.vdisplay)
+		if (!dcp_mode_default_candidate(m) || !dcp_mode_same_size(m, native) ||
+		    (usable_preferred && !m->sdr_usable))
 			continue;
 		if (!best || dcp_mode_default_above(m, m->score, best, best->score))
 			best = m;
@@ -2189,8 +2419,9 @@ static int parse_chan_layout_element(struct dcp_parse_ctx *handle,
 			return ret;
 	}
 
+	/* A count no u32 holds is no channel count: U32_MAX matches nothing */
 	if (nchans_out)
-		*nchans_out = nchans;
+		*nchans_out = nchans >= 0 && nchans <= U32_MAX ? nchans : U32_MAX;
 
 	return 0;
 }
@@ -2207,12 +2438,14 @@ static int parse_nchans_mask(struct dcp_parse_ctx *handle, unsigned int *mask)
 		return ret;
 
 	for (; it.idx < it.len; ++it.idx) {
-		int nchans;
+		unsigned int nchans;
 
 		ret = parse_chan_layout_element(it.handle, &nchans, NULL);
 		if (ret)
 			return ret;
-		*mask |= 1 << nchans;
+		/* The firmware's count: one the mask has no bit for matches no sieve */
+		if (nchans < BITS_PER_TYPE(*mask))
+			*mask |= BIT(nchans);
 	}
 
 	return 0;
@@ -2275,7 +2508,7 @@ static int parse_mode_in_avep_element(struct dcp_parse_ctx *handle,
 	for (; it.idx < it.len; ++it.idx) {
 		if (consume_string(it.handle, "AudioChannelLayoutElements")) {
 			struct iterator inner_it;
-			int nchans;
+			unsigned int nchans;
 
 			ret = iterator_begin(it.handle, &inner_it, false);
 			if (ret)

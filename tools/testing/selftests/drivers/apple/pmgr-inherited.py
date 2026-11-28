@@ -71,7 +71,7 @@ typedef uint32_t u32;
 struct device_node {
     struct device_node *parent;
     const char *name, *conflict;
-    bool inherited, firmware;
+    bool inherited, firmware, status;
 };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; };
@@ -101,7 +101,10 @@ static bool initialized_off;
 static int apple_pmgr_reset_ops;
 static int (*apple_pmgr_genpd_runtime_suspend)(struct device *dev);
 static unsigned parent_attach_count;
-static bool apple_t8132_firmware_path(void) { return true; }
+static bool platform_handoff, firmware_path;
+#define CONFIG_APPLE_T8132_PLATFORM_HANDOFF platform_handoff
+#define IS_ENABLED(option) (option)
+static bool apple_t8132_firmware_path(void) { return firmware_path; }
 static bool apple_sleep_domain_is_down(struct device_node *n) { (void)n; return false; }
 static struct device_node *of_parse_phandle(struct device_node *n, const char *p, int i)
 { (void)n; (void)p; (void)i; return NULL; }
@@ -109,7 +112,7 @@ static bool of_device_is_compatible(struct device_node *n, const char *p)
 { return n && !strcmp(p,"apple,t8132-pmgr-pwrstate"); }
 static bool of_machine_is_compatible(const char *p) { (void)p; return false; }
 static bool of_property_present(struct device_node *n, const char *p)
-{ return !strcmp(p,"status") || (n->conflict && !strcmp(n->conflict,p)) ||
+{ return (n->status && !strcmp(p,"status")) || (n->conflict && !strcmp(n->conflict,p)) ||
     (n->inherited && !strcmp(p,"apple,inherited-on")) ||
     (n->firmware && !strcmp(p,"apple,firmware-owned")); }
 static bool of_property_read_bool(struct device_node *n, const char *p)
@@ -183,7 +186,21 @@ static int probe(struct device_node *node, u32 value, int error)
 { clean(value,error); struct platform_device p={ .dev.of_node=node }; return apple_pmgr_ps_probe(&p); }
 int main(void)
 {
-    struct device_node n={ .name="power-controller@428", .inherited=true };
+    struct device_node n={ .name="power-controller@428", .inherited=true, .status=true };
+    struct device_node missing=n; missing.status=false;
+    for (int handoff=0; handoff<=1; handoff++) {
+        for (int qualified=0; qualified<=1; qualified++) {
+            platform_handoff=handoff;
+            firmware_path=qualified;
+            if (handoff || qualified) {
+                assert(probe(&missing,0xff,0)==-ENODEV);
+                assert(!map.reads && !map.writes && !provider_count && !reset_count);
+            } else {
+                assert(!probe(&missing,0xff,0));
+                assert(map.reads==1 && !map.writes && provider_count==1);
+            }
+        }
+    }
     assert(!probe(&n,0xff,0));
     struct apple_pmgr_ps *ps=driver_data;
     assert(map.reads==1 && !map.writes && init_count==1 && provider_count==1 && reset_count==1);
@@ -223,7 +240,7 @@ int main(void)
     assert(apple_pmgr_ps_power_off(&ps->genpd)==-EBUSY && !map.writes);
     puts("ok 3 - read errors and lost inherited activity never request a transition");
     const char *conflicts[]={"apple,firmware-owned","apple,sleep-retained","apple,always-on","apple,min-state",
-        "apple,force-disable","apple,force-reset","apple,externally-clocked"};
+        "apple,force-disable","apple,force-reset","apple,externally-clocked","apple,auto-managed"};
     for(unsigned i=0;i<sizeof(conflicts)/sizeof(*conflicts);i++) {
         n.conflict=conflicts[i];
         assert(probe(&n,0xff,0)==-EINVAL);

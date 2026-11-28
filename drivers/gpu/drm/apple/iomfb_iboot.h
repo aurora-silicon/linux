@@ -94,9 +94,9 @@ struct dcp_iboot {
 	bool mode_set;
 	/* SET_MODE of cur_mode failed; the next plug sets it again */
 	bool mode_failed;
-	/* USB-C: re-enter DP alt mode when the sink stopped answering */
-	struct work_struct pd_reset_work;
-	unsigned long pd_reset_time;
+	/* USB-C: connect the sink anew when it stopped answering */
+	struct work_struct relink_work;
+	unsigned long relink_time;
 	/*
 	 * The DPAV video interface started: SET_MODE again, or the
 	 * firmware's idle power off timer takes the link down 30 s later.
@@ -116,6 +116,10 @@ static inline struct dcp_iboot *to_dcp_iboot(struct drm_device *drm)
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+/* t8152_typec.c */
+void t8152_typec_register(struct device *dev);
+void t8152_typec_unregister(void);
+
 /* iomfb_iboot.c */
 int dcp_iboot_probe(struct apple_dcp *dcp);
 void dcp_iboot_remove(struct apple_dcp *dcp);
@@ -131,7 +135,10 @@ int dcp_iboot_set_boot_mode(struct dcp_iboot *ib);
 void dcp_iboot_update_edid(struct dcp_iboot *ib);
 void dcp_iboot_reset_mode(struct dcp_iboot *ib);
 void dcp_iboot_av_started(struct dcp_iboot *ib);
+void dcp_iboot_hpd_event(struct dcp_iboot *ib);
 #else
+static inline void t8152_typec_register(struct device *dev) { }
+static inline void t8152_typec_unregister(void) { }
 static inline int dcp_iboot_probe(struct apple_dcp *dcp) { return -ENODEV; }
 static inline void dcp_iboot_remove(struct apple_dcp *dcp) { }
 #endif

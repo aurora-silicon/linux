@@ -11,6 +11,7 @@
 #include <linux/types.h>
 
 struct apple_dcp;
+struct apple_rtkit;
 struct apple_dcp_v26;
 struct dcp_v26_board;
 struct device;
@@ -51,5 +52,8 @@ void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *state);
 void iomfb_v26_6_poweron(struct apple_dcp *dcp);
 void iomfb_v26_6_poweroff(struct apple_dcp *dcp);
+/* Pre-sleep shutdown calls and the session's RTKit for firmware-driven sleep. */
+int dcp_v26_sleep_calls(struct apple_dcp *dcp, int groups);
+struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp);
 
 #endif /* __APPLE_IOMFB_V26_6_H__ */

@@ -78,7 +78,7 @@ config DRM_APPLE_DCP_T8132
 config DRM_APPLE_DCP_T8152
 	bool "Mac mini M6 (J873g) displays"
 	depends on DRM_APPLE
-	depends on SPMI=y || SPMI=DRM_APPLE
+	depends on TYPEC
 	depends on MFD_MACSMC=y || MFD_MACSMC=DRM_APPLE
 	select APERTURE_HELPERS
 	help
@@ -86,7 +86,8 @@ config DRM_APPLE_DCP_T8152
 	  coprocessors of the T8152 Mac mini (J873g) through their firmware's
 	  iBoot interface: the HDMI port, whose DisplayPort-to-HDMI converter
 	  is powered through the SMC, and displays on the rear USB-C ports,
-	  whose PD controllers are polled over SPMI.
+	  whose DisplayPort alt mode the USB Type-C port driver of their PD
+	  controllers reports (TYPEC_SN201202X).
 
 	  The boot loader hands each coprocessor over, running or quiesced,
 	  with the AFK endpoints it left running. The adopted sessions cannot
@@ -127,6 +128,9 @@ config DRM_APPLE_PARSER_KUNIT_TEST
 	help
 	  Build tests for AFKv2 lengths, DMA ownership and reply correlation,
 	  legacy EPIC replies, and H17P IOMFB callback envelopes and sizes.
+	  Also check that the DCP dictionary parsers (display metadata,
+	  DPTX capabilities, log events, timing catalogs, EDID properties
+	  and audio elements) reject truncated and malformed blobs.
 	  The tests use allocated buffers and fake devices and do not require
 	  an Apple display controller or any firmware.
 

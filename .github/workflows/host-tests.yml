@@ -8,9 +8,9 @@ name: Host tests
 
 on:
   push:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

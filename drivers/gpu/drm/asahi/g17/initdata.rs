@@ -179,6 +179,10 @@ pub(super) struct InitData {
     active_effort: u32,
     /// The M5 firmware build's layout, where [`Self::m5`].
     graph: &'static super::fw::m5::initdata::Graph,
+    /// Power-policy layout of the M5 firmware build.
+    m5_policy: &'static crate::g17::fw::m5::initdata::M5PolicyMap,
+    /// Status-config layout of the M5 firmware build.
+    m5_status_config: &'static crate::g17::fw::m5::initdata::M5StatusConfigMap,
     outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
@@ -300,6 +304,8 @@ impl InitData {
             v26b123: false,
             active_effort: 0,
             graph: &super::fw::m5::initdata::M5_GRAPH,
+            m5_policy: &crate::g17::fw::m5::initdata::M5_26A428_POLICY,
+            m5_status_config: &crate::g17::fw::m5::initdata::M5_26A428_STATUS_CONFIG,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
@@ -675,15 +681,17 @@ impl InitData {
     }
 
     /// M5 TA, fragment and compute share the compute outer ring per priority.
-    /// The physical queue claim prevents reassignment while this credit lives.
+    /// The caller must hold `Port::m5_outer`; the physical queue claim prevents
+    /// reassignment while this credit lives.
     pub(crate) fn reserve_outer(&self, priority: u8, count: u32) -> Result<OuterClaim> {
         if !self.m5 { return Err(EINVAL); }
         let cursors = self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?;
         self.outer_credits.as_ref().ok_or(EIO)?.reserve(priority, count, cursors)
     }
 
-    /// Hold the device mutex for this scope, including its Drop. The result
-    /// borrows only the claim, allowing the caller to publish through Firmware.
+    /// Hold the device mutex for this scope, including its Drop, and serialize entry
+    /// and Drop under `Port::m5_outer` via `Port::outer_scope`. The result borrows
+    /// only the claim, allowing the caller to publish through Firmware.
     pub(crate) fn outer_scope<'a>(&self, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
         self.outer_credits.as_ref().ok_or(EINVAL)?.scope(claim)
     }
@@ -853,16 +861,8 @@ impl InitData {
         Ok(values)
     }
 
-    /// Publishes an M5 compute record on the shared compute ring under the device mutex.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        self.publish_work_at(priority, record, None)
-    }
-
-    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// Publishes an M5 compute record on the shared compute ring under the device mutex,
+    /// against the cursors of a room check made earlier under the same
     /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
     pub(super) fn publish_work_at(
         &self,
@@ -1076,6 +1076,8 @@ impl InitData {
             // The word recovery_state() reads: the status block moves with the firmware build.
             recovery: self.object(self.cluster)?.word(self.recovery_state_offset())?,
             mailbox,
+            m5_credits: self.outer_credits.clone(),
+            m5_history: self.m5_history_view()?,
         })
     }
 
@@ -1681,24 +1683,39 @@ impl InitData {
     /// (16.16); without one, its own controller raises the state for work that queues up behind
     /// the running command and otherwise lets it fall to the base state.
     ///
-    /// M5 publishes none while work streams, except while a host thread waits for it (`waited`):
-    /// then the full effort, so a submit-and-wait loop runs at the top state.
-    ///
-    /// The other G17 SoCs publish the full effort while a client has kept the GPU running
+    /// M5 publishes none while paced work streams, and publishes the full effort while either a
+    /// host thread waits for submitted work (`waited`) or a client has kept the GPU running
     /// without going idle for longer than the effort hold (`bound`, [`super::power::BusyRuns`]):
-    /// a submit-and-wait loop queues nothing behind its command, so the firmware alone keeps it
-    /// at the bottom state however busy the GPU is. Other work streams with the lowest effort
-    /// that keeps it above the base performance state ([`active_effort`]), and leaves the rest
-    /// to the firmware: work that the firmware let fall to the base state stalled the GPU under
-    /// concurrent load (a firmware recovery with no fault), and a full effort on every
-    /// submission held the top state whatever the load. A waiter doesn't tell paced work from a
-    /// submit-and-wait loop, because paced work has one too (the compositor, or the next frame's
-    /// fence).
-    pub(super) fn submission_effort(&self, effort: u32, waited: bool, bound: bool) -> u32 {
+    /// pipelined compute and render loops that keep the GPU continuously busy without blocking on
+    /// an unsignalled fence would otherwise fall to the base performance state.
+    ///
+    /// The other G17 SoCs publish the full effort while `bound` or while a host thread is waiting
+    /// on a pure-compute submission (`compute_waited`): a submit-and-wait loop queues nothing
+    /// behind its command, so the firmware alone keeps it at the bottom state however busy the GPU
+    /// is, and a compute burst resuming after a CPU gap longer than the 2 ms firmware idle-off
+    /// delay would otherwise run at [`active_effort`] for 16 ms before `BusyRuns::bound` fires.
+    /// Other work streams with the lowest effort that keeps it above the base performance state
+    /// ([`active_effort`]), leaving the rest to the firmware: work that the firmware let fall to
+    /// the base state stalled the GPU under concurrent load (a firmware recovery with no fault),
+    /// and a full effort on every submission held the top state whatever the load. A generic
+    /// render waiter doesn't tell paced work from a submit-and-wait loop, because paced work has
+    /// one too (the compositor, or the next frame's fence); pure-compute waiters exclude paced
+    /// render compositors.
+    pub(super) fn submission_effort(
+        &self,
+        effort: u32,
+        waited: bool,
+        bound: bool,
+        compute_waited: bool,
+    ) -> u32 {
         if self.m5 {
-            return if waited { effort } else { 0 };
+            return if waited || bound { effort } else { 0 };
         }
-        if bound { effort } else { effort.min(self.active_effort) }
+        if bound || compute_waited {
+            effort
+        } else {
+            effort.min(self.active_effort)
+        }
     }
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.

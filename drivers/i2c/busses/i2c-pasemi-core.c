@@ -196,22 +196,27 @@ static int pasemi_smb_waitready(struct pasemi_smbus *smbus)
 		return -ETIME;
 	}
 
-	/* Still stuck in a transaction? */
-	if (status & SMSTA_XIP) {
-		dev_err(smbus->dev, "Bus stuck, status 0x%08x\n", status);
-		return -EIO;
-	}
-
 	/* Arbitration loss? */
 	if (status & SMSTA_MTA) {
 		dev_err(smbus->dev, "Arbitration loss, status 0x%08x\n", status);
 		return -EBUSY;
 	}
 
-	/* Got NACK? */
+	/*
+	 * Got NACK? The interrupt comes with the NACK, before the controller
+	 * has put the STOP on the bus, so XIP is usually still set here: this
+	 * is checked before XIP, and the transfer is over once the STOP is out
+	 * (the next transfer waits for that).
+	 */
 	if (status & SMSTA_MTN) {
 		dev_err(smbus->dev, "NACK, status 0x%08x\n", status);
 		return -ENXIO;
+	}
+
+	/* Still stuck in a transaction? */
+	if (status & SMSTA_XIP) {
+		dev_err(smbus->dev, "Bus stuck, status 0x%08x\n", status);
+		return -EIO;
 	}
 
 	/* Clear XEN */

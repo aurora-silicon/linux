@@ -443,6 +443,29 @@ static void cen_fixup_scan_response(u8 *event, size_t length)
 	}
 }
 
+static bool cen_rx_pending(struct cen_bt *bt)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++) {
+		if (!bt->aux[i].opened || !cen_aux_specs[i].receive)
+			continue;
+		if (bt->aux[i].head != cen_tail(bt, cen_aux_specs[i].id))
+			return true;
+	}
+	if (bt->le_rx_head != cen_tail(bt, 10))
+		return true;
+	return bt->rx_head != cen_tail(bt, 7);
+}
+
+static bool cen_tx_ready(struct cen_bt *bt, struct sk_buff_head *queue,
+			 u16 ring, u16 slots, u16 head)
+{
+	if (skb_queue_empty(queue))
+		return false;
+	return (head + 1) % slots != cen_tail(bt, ring);
+}
+
 static void cen_io_work(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(work, struct cen_bt, io_work);
@@ -536,6 +559,12 @@ static void cen_io_work(struct work_struct *work)
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
 			  CEN_LE_FOOTER, &bt->le_tx_head)))
 		goto protocol_error;
+	if (cen_rx_pending(bt) ||
+	    cen_tx_ready(bt, &bt->txq, 1, CEN_TX_SLOTS, bt->tx_head) ||
+	    cen_tx_ready(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
+			 bt->acl_tx_head) ||
+	    cen_tx_ready(bt, &bt->le_txq, 4, CEN_LE_SLOTS, bt->le_tx_head))
+		schedule_work(&bt->io_work);
 	goto unlock;
 protocol_error:
 	bt->running = false;
@@ -815,6 +844,8 @@ static int cen_request_irqs(struct cen_bt *bt)
 	return 0;
 }
 
+static int cen_transport_state(struct cen_bt *bt, bool asleep);
+
 /*
  * Called with the participant device locked, outside Control's boot_lock. Keep
  * the transport alive through HCI unregister: its close may send final commands.
@@ -824,11 +855,23 @@ static int cen_request_irqs(struct cen_bt *bt)
 static int cen_quiesce(void *data)
 {
 	struct cen_bt *bt = data;
+	int wake_ret = 0;
 
 	if (bt->host_quiesced)
 		return 0;
+	if (bt->transport_sleep_sent) {
+		bt->transport_sleep_sent = false;
+		wake_ret = cen_transport_state(bt, false);
+		if (wake_ret)
+			dev_warn(&bt->pdev->dev,
+				 "Beta ACIPC host wake failed during teardown (%d)\n",
+				 wake_ret);
+	}
 	mutex_lock(&bt->lock);
 	bt->quiescing = true;
+	if (wake_ret)
+		bt->running = false;
+	WRITE_ONCE(bt->transport_paused, false);
 	mutex_unlock(&bt->lock);
 	if (bt->hci_registered) {
 		hci_unregister_dev(bt->hdev);
@@ -1153,9 +1196,11 @@ static int cen_suspend_noirq(struct device *dev)
 	if (!bt->transport_sleep_sent || !pm_suspend_via_firmware() || !pdev->pm_cap)
 		return 0;
 	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl)) {
-		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
-				      (pmctrl & ~PCI_PM_CTRL_STATE_MASK) |
-				      PCI_D3hot | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl &= ~(PCI_PM_CTRL_STATE_MASK | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl |= (__force u16)PCI_D3hot;
+		if (device_may_wakeup(dev) && READ_ONCE(bt->running))
+			pmctrl |= PCI_PM_CTRL_PME_ENABLE;
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, pmctrl);
 		mdelay(pdev->d3hot_delay);
 	}
 	return 0;
@@ -1181,7 +1226,7 @@ static int cen_resume_noirq(struct device *dev)
 	}
 	if (pdev->pm_cap &&
 	    !pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl) &&
-	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != PCI_D0) {
+	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != (__force u16)PCI_D0) {
 		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
 				      pmctrl & ~PCI_PM_CTRL_STATE_MASK);
 		mdelay(pdev->d3hot_delay);

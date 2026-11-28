@@ -594,3 +594,32 @@ Description:
 		power domains stay on across sleep, so every other attribute
 		keeps its value over a suspend; a reader checking that the
 		enclave still answers after a resume reads the hwrng.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/trusted
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Erik Bourget <erik@ebourget.net>
+Description:
+		(RO) What the next trusted-key seal or unseal can expect of
+		the enclave, from the latest one this bind sent.
+
+		============== ==============================================
+		unknown	       No trusted-key unseal has worked and the
+			       enclave has refused no identity unlock yet.
+		ready	       The latest trusted-key unseal worked. A seal
+			       unseals its new blob before returning it, so
+			       a working seal also reads "ready".
+		refused <n>    The enclave answered the identity key-bag
+			       unlock, which every seal and unseal on the
+			       13.5 key store needs first, with status <n>
+			       (a signed decimal). Trusted keys fail until
+			       an unlock works.
+		============== ==============================================
+
+		A refusal is the enclave's answer for this key bag, not a
+		lost reply, and a test or loader stops on it rather than
+		asking again. An xART guard refusal (xart_guard_refusals)
+		can cause one: check that first. A later identity unlock that
+		works clears a stale refusal back to "unknown", and a later
+		unseal that works changes the value to "ready". The value
+		resets to "unknown" when the driver binds.

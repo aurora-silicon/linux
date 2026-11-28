@@ -11,6 +11,7 @@
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/visibility.h>
 #include <linux/pm_runtime.h>
 
 #include <media/v4l2-event.h>
@@ -18,6 +19,7 @@
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
+#include "avd-inst.h"
 
 static bool avd_image_fmt_match(enum avd_image_fmt fmt1,
 				enum avd_image_fmt fmt2)
@@ -65,6 +67,41 @@ static bool avd_image_fmt_fits_capture(struct avd_ctx *ctx,
 	       !memcmp(comp.offsets, ctx->comp.offsets, sizeof(comp.offsets));
 }
 
+/*
+ * Whether a job may program @image_fmt, the picture format that the current
+ * value of the codec's format control describes. The CAPTURE buffers and the
+ * per-context scratch were sized for ctx->image_fmt (ANY sizes them as 8-bit
+ * 4:2:0), and the control's value can differ from it: it may have been set
+ * while another codec was selected, or kept over an OUTPUT format change, and
+ * an unchanged value never reaches s_ctrl. Refuse the job unless both are the
+ * same and the CAPTURE buffers fit it, and unless the scratch a codec sized at
+ * STREAMON has the bit depth of the picture (s_ctrl only refuses a change
+ * while CAPTURE buffers are allocated, not while OUTPUT streams).
+ */
+static bool avd_image_fmt_10bit(enum avd_image_fmt fmt)
+{
+	return fmt == AVD_IMG_FMT_420_10BIT || fmt == AVD_IMG_FMT_422_10BIT;
+}
+
+int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt)
+{
+	enum avd_image_fmt sized = ctx->image_fmt;
+
+	if (sized == AVD_IMG_FMT_ANY)
+		sized = AVD_IMG_FMT_420_8BIT;
+	if (image_fmt == AVD_IMG_FMT_ANY)
+		image_fmt = AVD_IMG_FMT_420_8BIT;
+	if (image_fmt != sized || !avd_image_fmt_fits_capture(ctx, image_fmt) ||
+	    (ctx->scratch_sized &&
+	     avd_image_fmt_10bit(ctx->scratch_fmt) != avd_image_fmt_10bit(image_fmt))) {
+		dev_dbg_ratelimited(ctx->dev->dev,
+				    "picture format %d does not fit the buffers (%d)\n",
+				    image_fmt, ctx->image_fmt);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
 				enum avd_image_fmt image_fmt)
 {
@@ -103,15 +140,21 @@ static bool avd_is_valid_fmt(struct avd_ctx *ctx, u32 fourcc,
 	return false;
 }
 
+/*
+ * Lay out a decoded buffer: the picture, then the compressed reference area
+ * described by @comp, then any codec specific tail. Only @pix_mp and @comp
+ * are written, so TRY_FMT can use it on a context that is streaming.
+ */
 static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
-				    struct v4l2_pix_format_mplane *pix_mp)
+				    struct v4l2_pix_format_mplane *pix_mp,
+				    struct avd_comp *comp)
 {
 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
 			    pix_mp->height);
 
-	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
-	fill_comp(&ctx->comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
-	pix_mp->plane_fmt[0].sizeimage += ctx->comp.size;
+	comp->start_offset = pix_mp->plane_fmt[0].sizeimage;
+	fill_comp(comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
+	pix_mp->plane_fmt[0].sizeimage += comp->size;
 	if (ctx->coded_fmt_desc->ops->adjust_decoded_fmt)
 		ctx->coded_fmt_desc->ops->adjust_decoded_fmt(ctx, pix_mp);
 }
@@ -138,7 +181,7 @@ void avd_reset_decoded_fmt(struct avd_ctx *ctx)
 	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	f->fmt.pix_mp.width = ctx->coded_fmt.fmt.pix_mp.width;
 	f->fmt.pix_mp.height = ctx->coded_fmt.fmt.pix_mp.height;
-	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
+	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp, &ctx->comp);
 }
 
 static int avd_try_ctrl(struct v4l2_ctrl *ctrl)
@@ -289,13 +332,13 @@ static const struct avd_ctrl_desc avd_h264_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
 		.cfg.min = V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
-		.cfg.max = V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
+		.cfg.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
 		.cfg.def = V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_H264_START_CODE,
 		.cfg.min = V4L2_STATELESS_H264_START_CODE_NONE,
-		.cfg.max = V4L2_STATELESS_H264_START_CODE_NONE,
+		.cfg.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
 		.cfg.def = V4L2_STATELESS_H264_START_CODE_NONE,
 	},
 	{
@@ -396,6 +439,7 @@ static const struct avd_ctrl_desc avd_av1_ctrl_descs[] = {
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_AV1_FRAME,
+		.cfg.ops = &avd_ctrl_ops,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_AV1_FILM_GRAIN,
@@ -561,16 +605,13 @@ static int avd_querycap(struct file *file, void *priv,
 
 	strscpy(cap->driver, avd->dev->driver->name, sizeof(cap->driver));
 	strscpy(cap->card, vdev->name, sizeof(cap->card));
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
-		 avd->dev->driver->name);
 	return 0;
 }
 
-static int avd_try_capture_fmt(struct file *file, void *priv,
-			       struct v4l2_format *f)
+static int avd_try_decoded_fmt(struct avd_ctx *ctx, struct v4l2_format *f,
+			       struct avd_comp *comp)
 {
 	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
-	struct avd_ctx *ctx = file_to_ctx(file);
 	const struct avd_coded_fmt_desc *coded_desc;
 
 	/*
@@ -594,11 +635,20 @@ static int avd_try_capture_fmt(struct file *file, void *priv,
 	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
 				       &coded_desc->frmsize);
 
-	avd_fill_decoded_pixfmt(ctx, pix_mp);
+	avd_fill_decoded_pixfmt(ctx, pix_mp, comp);
 	pix_mp->field = V4L2_FIELD_NONE;
 
 	return 0;
 }
+
+VISIBLE_IF_KUNIT int avd_try_capture_fmt(struct file *file, void *priv,
+					 struct v4l2_format *f)
+{
+	struct avd_comp comp;
+
+	return avd_try_decoded_fmt(file_to_ctx(file), f, &comp);
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_try_capture_fmt);
 
 static int avd_try_output_fmt(struct file *file, void *priv,
 			      struct v4l2_format *f)
@@ -627,10 +677,11 @@ static int avd_try_output_fmt(struct file *file, void *priv,
 	return 0;
 }
 
-static int avd_s_capture_fmt(struct file *file, void *priv,
-			     struct v4l2_format *f)
+VISIBLE_IF_KUNIT int avd_s_capture_fmt(struct file *file, void *priv,
+				       struct v4l2_format *f)
 {
 	struct avd_ctx *ctx = file_to_ctx(file);
+	struct avd_comp comp;
 	struct vb2_queue *vq;
 	int ret;
 
@@ -640,13 +691,15 @@ static int avd_s_capture_fmt(struct file *file, void *priv,
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 
-	ret = avd_try_capture_fmt(file, priv, f);
+	ret = avd_try_decoded_fmt(ctx, f, &comp);
 	if (ret)
 		return ret;
 
 	ctx->decoded_fmt = *f;
+	ctx->comp = comp;
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_s_capture_fmt);
 
 static int avd_s_output_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)
@@ -928,14 +981,21 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_return_buffers;
 	}
 
+	/* The context's instruction FIFO is only used while OUTPUT streams. */
+	ret = avd_buf_alloc(ctx->dev, &ctx->inst, fifo_size());
+	if (ret)
+		goto err_return_buffers;
+
 	if (desc->ops->start) {
 		ret = desc->ops->start(ctx);
 		if (ret)
-			goto err_return_buffers;
+			goto err_free_inst;
 	}
 
 	return 0;
 
+err_free_inst:
+	avd_buf_free(ctx->dev, &ctx->inst);
 err_return_buffers:
 	/* Keep requests queued for a later STREAMON retry. */
 	while ((vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx)))
@@ -977,6 +1037,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 
 		if (desc->ops->stop)
 			desc->ops->stop(ctx);
+		avd_buf_free(ctx->dev, &ctx->inst);
 
 		/* Drop a job table left over from a frame that never finished. */
 		kvfree(ctx->job.segments);
@@ -1052,6 +1113,40 @@ void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run)
 
 	if (src_req)
 		v4l2_ctrl_request_complete(src_req, &ctx->ctrl_hdl);
+}
+
+/*
+ * Copy the current value of a fixed-size control for a run. Requests are
+ * applied to the controls before a run reads them, but a control can also be
+ * set directly at any time, which rewrites its value under the control lock
+ * only. A run that checks a value and then reads it again from the control
+ * may see two different values. Take one copy under the lock; the run checks
+ * and uses that copy. @size must be the size of the control's value.
+ */
+VISIBLE_IF_KUNIT int avd_ctrl_copy_value(struct v4l2_ctrl *ctrl, void *dst,
+					 size_t size)
+{
+	int ret = -EINVAL;
+
+	v4l2_ctrl_lock(ctrl);
+	if ((size_t)ctrl->elems * ctrl->elem_size == size) {
+		memcpy(dst, ctrl->p_cur.p, size);
+		ret = 0;
+	}
+	v4l2_ctrl_unlock(ctrl);
+
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_ctrl_copy_value);
+
+/* v4l2_ctrl_find() takes the control lock itself, so look up before copying. */
+int avd_ctrl_copy(struct avd_ctx *ctx, u32 id, void *dst, size_t size)
+{
+	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, id);
+
+	if (!ctrl)
+		return -EINVAL;
+	return avd_ctrl_copy_value(ctrl, dst, size);
 }
 
 static int avd_add_ctrls(struct avd_ctx *ctx, const struct avd_ctrls *ctrls)

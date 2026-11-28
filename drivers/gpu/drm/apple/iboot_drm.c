@@ -35,6 +35,8 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
 
 #include "dcp-internal.h"
 #include "ibootep.h"
@@ -369,10 +371,10 @@ iboot_connector_detect(struct drm_connector *connector, bool force)
 		dev_info(dcp->dev, "sink %s\n", hpd ? "plugged" : "unplugged");
 		disp->hpd = hpd;
 		/*
-		 * USB-C: the DPTX port's HPD follows the PD controller, and a
-		 * new plug may come the other way round.
+		 * USB-C: the DPTX port's HPD follows the port's Type-C state,
+		 * and a new plug may come the other way round.
 		 */
-		if (disp->pd) {
+		if (disp->usbc) {
 			if (!hpd || ib->powered) {
 				iboot_cancel_swap_locked(ib);
 				if (t8152_dptx_disconnect(disp, 0))
@@ -408,11 +410,11 @@ iboot_connector_detect(struct drm_connector *connector, bool force)
 			dev_err(dcp->dev, "no modes from the new sink\n");
 			ib->nr_tmodes = 0;
 			ib->nr_cmodes = 0;
-			/* A sleeping EIZO may need a fresh DP alt mode entry. */
-			if (disp->pd && !disp->on_hdmi &&
-			    time_after(jiffies, ib->pd_reset_time + 60 * HZ)) {
-				ib->pd_reset_time = jiffies;
-				schedule_work(&ib->pd_reset_work);
+			/* A sleeping EIZO may need its link started anew. */
+			if (disp->usbc && !disp->on_hdmi &&
+			    time_after(jiffies, ib->relink_time + 60 * HZ)) {
+				ib->relink_time = jiffies;
+				schedule_work(&ib->relink_work);
 			}
 		}
 		/*
@@ -689,8 +691,15 @@ static int iboot_crtc_atomic_check(struct drm_crtc *crtc,
 	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
 	struct dcp_iboot *ib = to_dcp_iboot(crtc->dev);
 
-	/* No vblank interrupt: the helpers complete events after the flush. */
-	new->no_vblank = true;
+	/*
+	 * No vblank interrupt: page-flip events come from a timer at the
+	 * mode's refresh rate (drm_vblank_helper), so a compositor and its
+	 * clients render once per refresh instead of as fast as commits
+	 * complete. A commit that leaves the CRTC off gets no flush
+	 * (commit_tail_rpm flushes active CRTCs only), so its event goes out
+	 * at once, as before.
+	 */
+	new->no_vblank = !new->active;
 	if (new->enable && !iboot_find_mode(ib, &new->mode))
 		return -EINVAL;
 	return 0;
@@ -724,16 +733,17 @@ static int iboot_set_mode_locked(struct dcp_iboot *ib,
 		dev_err(ib->dcp->dev, "set_mode failed: %d\n", ret);
 		/*
 		 * USB-C: a sink that no longer answers AUX (seen after the
-		 * monitor's deep sleep) comes back with a fresh DP alt mode
-		 * entry; the plug that follows sets the mode again. At most
-		 * once a minute, so a dead sink does not loop.
+		 * monitor's deep sleep) is connected anew: its link is
+		 * released, and the plug that follows starts the PHY cold
+		 * and sets the mode again. At most once a minute, so a dead
+		 * sink does not loop.
 		 */
-		if (ib->disp.pd && !ib->disp.on_hdmi &&
-		    time_after(jiffies, ib->pd_reset_time + 60 * HZ)) {
+		if (ib->disp.usbc && !ib->disp.on_hdmi &&
+		    time_after(jiffies, ib->relink_time + 60 * HZ)) {
 			ib->cur_mode = *t;
 			ib->mode_failed = true;
-			ib->pd_reset_time = jiffies;
-			schedule_work(&ib->pd_reset_work);
+			ib->relink_time = jiffies;
+			schedule_work(&ib->relink_work);
 		}
 		return ret;
 	}
@@ -871,6 +881,7 @@ static void iboot_crtc_atomic_enable(struct drm_crtc *crtc,
 	iboot_set_mode_locked(ib, t, c);
 out:
 	mutex_unlock(&ib->lock);
+	drm_crtc_vblank_on(crtc);
 }
 
 static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -880,6 +891,7 @@ static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct dcp_iboot *ib = to_dcp_iboot(crtc->dev);
 	int ret, idx;
 
+	drm_crtc_vblank_off(crtc);
 	/* A mode change: SET_MODE alone switches, as before. */
 	if (new->active)
 		return;
@@ -915,6 +927,7 @@ static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
 
 static const struct drm_crtc_helper_funcs iboot_crtc_helper = {
 	.atomic_check = iboot_crtc_atomic_check,
+	.atomic_flush = drm_crtc_vblank_atomic_flush,
 	.atomic_enable = iboot_crtc_atomic_enable,
 	.atomic_disable = iboot_crtc_atomic_disable,
 };
@@ -926,6 +939,7 @@ static const struct drm_crtc_funcs iboot_crtc_funcs = {
 	.page_flip = drm_atomic_helper_page_flip,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	DRM_CRTC_VBLANK_TIMER_FUNCS,
 };
 
 static const struct drm_encoder_funcs iboot_encoder_funcs = {
@@ -944,14 +958,18 @@ static const struct drm_mode_config_funcs iboot_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
-static void iboot_pd_reset_work(struct work_struct *work)
+/*
+ * Release the link of a USB-C sink that does not answer, and have the port's
+ * sink plugged again: the port's Type-C state still shows it, so the next
+ * look at the ports connects it as a new one.
+ */
+static void iboot_relink_work(struct work_struct *work)
 {
-	struct dcp_iboot *ib = container_of(work, struct dcp_iboot, pd_reset_work);
+	struct dcp_iboot *ib = container_of(work, struct dcp_iboot, relink_work);
 	struct t8152_display *disp = &ib->disp;
 	int ret;
 
-	dev_info(ib->dcp->dev, "USB-C sink does not answer, entering DP alt mode again\n");
-	/* The reset may finish between polls. Release the old link explicitly. */
+	dev_info(ib->dcp->dev, "USB-C sink does not answer, connecting it again\n");
 	mutex_lock(&ib->lock);
 	iboot_cancel_swap_locked(ib);
 	ret = t8152_dptx_disconnect(disp, 0);
@@ -968,13 +986,9 @@ static void iboot_pd_reset_work(struct work_struct *work)
 		return;
 	}
 	disp->hpd = 0;
-	ret = t8152_pd_reconnect(disp);
 	mutex_unlock(&ib->lock);
-	if (ret) {
-		dev_err(ib->dcp->dev, "DP alt mode entry failed: %d\n", ret);
-		return;
-	}
 	drm_kms_helper_hotplug_event(&ib->drm);
+	dcp_iboot_hpd_event(ib);
 }
 
 static void iboot_hpd_work(struct work_struct *work)
@@ -985,9 +999,25 @@ static void iboot_hpd_work(struct work_struct *work)
 	if (!READ_ONCE(ib->ready))
 		return;
 	drm_helper_hpd_irq_event(&ib->drm);
-	if (READ_ONCE(ib->ready))
+	/*
+	 * USB-C changes come from the ports' display switches. The HDMI port's
+	 * HPD line has no interrupt: poll it while this DCP can take the port.
+	 */
+	if (READ_ONCE(ib->ready) && ib->disp.hdmi_port)
 		queue_delayed_work(system_freezable_wq, &ib->hpd_work,
 				   msecs_to_jiffies(250));
+}
+
+/*
+ * A USB-C port's Type-C state changed: look at the ports shortly. A HPD pulse
+ * the port driver learns of after the fact comes as HPD low and high at once;
+ * the delay takes both together.
+ */
+void dcp_iboot_hpd_event(struct dcp_iboot *ib)
+{
+	if (READ_ONCE(ib->ready))
+		mod_delayed_work(system_freezable_wq, &ib->hpd_work,
+				 msecs_to_jiffies(100));
 }
 
 void dcp_iboot_kms_stop(struct dcp_iboot *ib)
@@ -998,7 +1028,7 @@ void dcp_iboot_kms_stop(struct dcp_iboot *ib)
 	cancel_delayed_work_sync(&ib->hpd_work);
 	hrtimer_cancel(&ib->swap_timer);
 	cancel_work_sync(&ib->swap_work);
-	cancel_work_sync(&ib->pd_reset_work);
+	cancel_work_sync(&ib->relink_work);
 }
 
 static void iboot_swap_stop(void *data)
@@ -1014,7 +1044,7 @@ int dcp_iboot_kms_init(struct dcp_iboot *ib)
 
 	ib->pending = -1;
 	INIT_WORK(&ib->swap_work, iboot_swap_work);
-	INIT_WORK(&ib->pd_reset_work, iboot_pd_reset_work);
+	INIT_WORK(&ib->relink_work, iboot_relink_work);
 	INIT_DELAYED_WORK(&ib->hpd_work, iboot_hpd_work);
 	hrtimer_setup(&ib->swap_timer, iboot_swap_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_ABS);
@@ -1031,7 +1061,7 @@ int dcp_iboot_kms_init(struct dcp_iboot *ib)
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
-	ib->pd_reset_time = jiffies - 61 * HZ;
+	ib->relink_time = jiffies - 61 * HZ;
 
 	drm->mode_config.min_width = 320;
 	drm->mode_config.min_height = 240;
@@ -1055,6 +1085,10 @@ int dcp_iboot_kms_init(struct dcp_iboot *ib)
 		return ret;
 	drm_crtc_helper_add(&ib->crtc, &iboot_crtc_helper);
 
+	ret = drm_vblank_init(drm, 1);
+	if (ret)
+		return ret;
+
 	ret = drm_encoder_init(drm, &ib->encoder, &iboot_encoder_funcs,
 			       DRM_MODE_ENCODER_TMDS, NULL);
 	if (ret)
@@ -1067,10 +1101,10 @@ int dcp_iboot_kms_init(struct dcp_iboot *ib)
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&ib->connector, &iboot_connector_helper);
-	if (ib->disp.hpd_gpio || ib->disp.pd)
+	if (ib->disp.hpd_gpio || ib->disp.usbc)
 		ib->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
 				       DRM_CONNECTOR_POLL_DISCONNECT;
-	if (ib->disp.pd)
+	if (ib->disp.usbc)
 		ib->connector.polled = DRM_CONNECTOR_POLL_HPD;
 	ret = drm_connector_attach_encoder(&ib->connector, &ib->encoder);
 	if (ret)

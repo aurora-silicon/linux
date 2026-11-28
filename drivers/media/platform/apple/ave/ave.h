@@ -54,6 +54,8 @@ struct ave_mctf_layout;
 #define AVE_IPC_BYTES (20 * SZ_1M)
 #define AVE_IPC_CHANNEL_OFF 0x4000
 #define AVE_IPC_HANDSHAKE_OFF 0x24000
+/* Most channel descriptors any firmware publishes (the 6070 one: 7). */
+#define AVE_IPC_MAX_CHANNELS 8
 #define AVE_IPC_SHARED_OFF 0x28000
 #define AVE_IPC_SHARED_BYTES SZ_64K
 #define AVE_IPC_CMD_OFF 0x40000
@@ -211,15 +213,20 @@ struct ave_fw_build {
 	const char *name;
 	u32 text_size;
 	u32 data_size;
+	/* 0: any build in the known list */
 	u32 text_crc;
+	/*
+	 * TEXT offset of a 32-bit word this build's loader sets differently on
+	 * every boot; a TEXT CRC that is not a known build is retried with it
+	 * zeroed. 0 when there is none, and the CRC must match as it is.
+	 */
+	u32 text_boot_word;
 };
 
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
 	u32 fw_data_size;
-	/* A second DATA size the variant accepts (the M4 Max build), or 0 */
-	u32 fw_data_size_alt;
 	/*
 	 * When set, the builds the variant admits. They replace fw_text_size,
 	 * fw_data_size and text_crc: the segment sizes select the build, and
@@ -241,12 +248,6 @@ struct ave_variant {
 	 */
 	u32 text_link_cell;
 	/*
-	 * TEXT offset of a 32-bit word the loader sets differently on every
-	 * boot; a TEXT CRC that is not a known build is retried with it zeroed.
-	 * 0 when there is none.
-	 */
-	u32 text_boot_word;
-	/*
 	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
 	 * before the firmware starts, or 0 when the variant has none.
 	 */
@@ -257,7 +258,10 @@ struct ave_variant {
 	 * The same encoder running another firmware build that a newer
 	 * bootloader preloads, with a start and command protocol of its own.
 	 * The firmware segment sizes the bootloader reserved select it.
-	 * NULL when there is none.
+	 * NULL when there is none. Use builds[] when the builds differ only
+	 * in TEXT CRC, boot word (and command layout) but start the same way;
+	 * use next_build when a build needs other start fields (boot device,
+	 * handshake type, DATA handling) and has sizes of its own.
 	 */
 	const struct ave_variant *next_build;
 
@@ -436,6 +440,7 @@ struct ave_slot {
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */
+	bool bframe; /* the delivered picture is a B picture (its slice type) */
 };
 
 struct ave_frame_result {
@@ -463,6 +468,7 @@ struct ave_frame_result {
 struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
+	u8 hevc_extra_bits; /* PPS num_extra_slice_header_bits, for the B flag */
 	struct ave_buf hdr;
 	struct ave_buf client_mem;
 	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
@@ -572,12 +578,13 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8132,
-	ave_m3;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t6050, ave_t8112,
+	ave_t8132, ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
 const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
 					      size_t text, size_t data);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
@@ -637,6 +644,7 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key, bool last);
 int ave_init_codec_state(struct ave_session *sess);
+bool ave_au_bframe(const u8 *p, size_t len, bool hevc, bool key, u8 *extra_bits);
 
 /* ave-cmd.c */
 int ave_cmd_config(struct ave_dev *ave);

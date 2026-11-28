@@ -2725,7 +2725,12 @@ int iomfb_m4_init(struct apple_dcp *owner)
 		return -ENOMEM;
 	dcp->owner = owner;
 	dcp->dev = dev;
-	dcp->bw_mailbox = dcp_m4_bw_mailbox(dev);
+	/*
+	 * The 26.6.2 panel path runs without the realtime bandwidth mailbox;
+	 * the slot the DT gives the internal DCP is the firmware-27 backend's.
+	 */
+	if (external)
+		dcp->bw_mailbox = dcp_m4_bw_mailbox(dev);
 	mutex_init(&dcp->lock);
 	mutex_init(&dcp->ext_modes_lock);
 	spin_lock_init(&dcp->state_lock);
@@ -5832,6 +5837,23 @@ bool iomfb_m4_ext_stopped(struct apple_dcp *owner)
 		return false;
 	mutex_lock(&dcp->lock);
 	stopped = dcp->ext_stopped;
+	mutex_unlock(&dcp->lock);
+	return stopped;
+}
+
+/*
+ * Its CPU is down for the sleep: an external DCP stopped for a deep sleep, or
+ * an internal one powered down with its domains (iomfb_m4_power_gate()).
+ */
+bool iomfb_m4_sleep_stopped(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool stopped;
+
+	if (!dcp)
+		return false;
+	mutex_lock(&dcp->lock);
+	stopped = dcp->ext_stopped || dcp->gated;
 	mutex_unlock(&dcp->lock);
 	return stopped;
 }

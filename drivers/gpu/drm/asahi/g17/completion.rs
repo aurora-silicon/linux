@@ -35,7 +35,7 @@ pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
     // The buffer keeps its GPU alias and its CPU mapping alive.
-    buffer: Arc<crate::timestamp::Buffer>,
+    buffer: Arc<crate::timestamp::Bound>,
     offset: usize,
     /// The destination's address in the firmware timestamp window, if its buffer is mapped there.
     window_va: Option<u64>,
@@ -128,9 +128,12 @@ const fn window_slot(index: usize) -> bool {
 /// one releases only a buffer reference; the buffer defers its own mapping release.
 pub(crate) struct Destinations {
     stamps: [Option<Destination>; 4],
-    /// A render: the firmware gets its fragment end destination through the window. A compute
-    /// command's only stamp pair stays kernel-private (recovery trusts it).
-    render: bool,
+    /// A render whose fragment end destination may be written directly by
+    /// firmware through the timestamp window. Cleared when ordered behind
+    /// pending host timestamp predecessors so firmware cannot race with their
+    /// deferred host writes or bypass an inherited error. A compute command's
+    /// only stamp pair stays kernel-private (recovery trusts it).
+    allow_window: bool,
     /// The firmware was handed window destinations ([`Self::window_vas`]).
     handed: AtomicBool,
 }
@@ -150,15 +153,19 @@ impl Destinations {
         }
         Ok(Self {
             stamps: destinations,
-            render: timestamps.len() == 2,
+            allow_window: timestamps.len() == 2,
             handed: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn disable_window(&mut self) {
+        self.allow_window = false;
     }
 
     /// Window addresses for a render's vertex and fragment start/end destinations: the fragment
     /// end's if it is mapped in the window, 0 for the others.
     fn window_vas(&self) -> [u64; 4] {
-        if !self.render || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
+        if !self.allow_window || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
             return [0; 4];
         }
         let vas: [u64; 4] = core::array::from_fn(|i| {
@@ -173,6 +180,20 @@ impl Destinations {
 
     pub(crate) fn has_outputs(&self) -> bool {
         self.stamps.iter().any(Option::is_some)
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn empty() -> Self {
+        Self {
+            stamps: core::array::from_fn(|_| None),
+            allow_window: false,
+            handed: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn allows_window(&self) -> bool {
+        self.allow_window
     }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
@@ -201,34 +222,91 @@ struct Output {
 }
 
 impl Output {
-    fn publish(&self, result: Result<[u64; 4]>) {
+    /// `status` is the command's VM status.
+    fn publish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match result {
-            Ok(ticks) => self.destinations.write(ticks),
-            Err(error) => self.fence.set_error(error),
+            Ok(ticks) => {
+                self.destinations.write(ticks);
+                self.fence.signal();
+            }
+            Err(error) => status.signal_failure(|| {
+                self.fence.set_error(error);
+                self.fence.signal();
+            }),
         }
-        self.fence.signal();
         self.member.complete(result.map(|_| ()));
     }
 }
 
-enum HostOutput {
+enum HostOutputKind {
     Immediate(Output),
     Ordered(Arc<Publication>),
 }
 
+pub(super) struct HostOutput(HostOutputKind);
+
 impl HostOutput {
-    fn output(&self) -> &Output {
-        match self {
-            Self::Immediate(output) => output,
-            Self::Ordered(publication) => publication.output(),
+    /// Both render and compute commands use an ordered [`Publication`] when
+    /// they write host timestamps or inherit ordered host predecessors:
+    /// timestamp-writing compute must expose a [`Publication`] so overlapping
+    /// cross-engine consumers can chain behind it, and compute consumers with
+    /// host predecessors must chain behind theirs. When `host_predecessors` is
+    /// false, activation clears the sentinel immediately so `finish()`
+    /// publishes synchronously with no extra delay.
+    fn new(
+        output: Output,
+        status: Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<Self> {
+        if host_predecessors || has_outputs {
+            Ok(Self(HostOutputKind::Ordered(Publication::new(
+                output, status, has_outputs,
+            )?)))
+        } else {
+            Ok(Self(HostOutputKind::Immediate(output)))
         }
     }
 
-    fn finish(&self, result: Result<[u64; 4]>) {
-        match self {
-            Self::Immediate(output) => output.publish(result),
-            Self::Ordered(publication) => publication.finish(result),
+    fn output(&self) -> &Output {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output,
+            HostOutputKind::Ordered(publication) => publication.output(),
         }
+    }
+
+    pub(super) fn publication(&self) -> Option<Arc<Publication>> {
+        match &self.0 {
+            HostOutputKind::Ordered(publication) => Some(publication.clone()),
+            HostOutputKind::Immediate(_) => None,
+        }
+    }
+
+    pub(super) fn finish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output.publish(result, status),
+            HostOutputKind::Ordered(publication) => publication.finish(result),
+        }
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_pair(
+        contexts: &FenceContexts,
+        status: &Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<(Self, Fence)> {
+        let fence = fence::independent(contexts)?;
+        let handle = Fence::from_fence(&fence);
+        let output = Output {
+            fence,
+            member: fence::Aggregate::test_member(contexts)?,
+            destinations: Destinations::empty(),
+        };
+        Ok((
+            Self::new(output, status.clone(), host_predecessors, has_outputs)?,
+            handle,
+        ))
     }
 }
 
@@ -370,7 +448,7 @@ impl M5ComputeTimestamps {
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
     output: HostOutput,
-    // Present only when this command's public result may wait for a render
+    // Present only when this command's public result may wait for a
     // predecessor's host writes. DRM credits must follow the terminal result.
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
@@ -416,7 +494,7 @@ impl Completion {
         context: &Arc<Context>,
         member: Member,
         vm_job: mmu::VmJobGuard,
-        destinations: Destinations,
+        mut destinations: Destinations,
         compute: bool,
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
@@ -424,7 +502,10 @@ impl Completion {
         usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
+        let has_outputs = destinations.has_outputs();
+        if host_predecessors {
+            destinations.disable_window();
+        }
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
@@ -435,11 +516,12 @@ impl Completion {
             member,
             destinations,
         };
-        let output = if ordered {
-            HostOutput::Ordered(Publication::new(output, context.status().clone())?)
-        } else {
-            HostOutput::Immediate(output)
-        };
+        let output = HostOutput::new(
+            output,
+            context.status().clone(),
+            host_predecessors,
+            has_outputs,
+        )?;
         // M5 compute binds its timestamp pair in its physical queue's page at publication.
         let is_compute = compute;
         let compute = if compute && !context.is_m5() {
@@ -485,10 +567,7 @@ impl Completion {
             .map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
     }
     pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
-        match &self.output {
-            HostOutput::Ordered(publication) => Some(publication.clone()),
-            HostOutput::Immediate(_) => None,
-        }
+        self.output.publication()
     }
     fn signal_terminal(&self, result: Result<[u64; 4]>) {
         if let Some(fence) = &self.terminal {
@@ -511,6 +590,12 @@ impl Completion {
     }
     pub(super) fn is_input_source(&self, source: &Arc<super::fence::Submission>) -> bool {
         self.output.output().member.is_source(source)
+    }
+    pub(crate) fn note_source_published(&self, published: super::fence::PublishedSource) {
+        self.output.output().member.note_published(published);
+    }
+    pub(crate) fn clear_source_published(&self) {
+        self.output.output().member.clear_published();
     }
     pub(super) fn set_source_ready(&self, ready: Fence) {
         self.output.output().member.set_source_ready(ready);
@@ -609,6 +694,7 @@ impl Completion {
             })
             .is_ok();
         if accepted {
+            self.clear_source_published();
             self.replay_timeout.store(true, Ordering::Release);
             // Callers replay only work proven not to have started; the new
             // publication runs from the beginning and reports its own result.
@@ -627,6 +713,7 @@ impl Completion {
 
     pub(crate) fn has_firmware_consumer(&self) -> bool {
         self.firmware_consumer.load(Ordering::Acquire)
+            || self.output.output().member.has_firmware_consumer()
     }
 
     pub(crate) fn take_replay_timeout(&self) -> bool {
@@ -813,14 +900,17 @@ impl Completion {
         if let Some(sources) = &self.sources {
             sources.release();
         }
-        drop(self.render.lock().take());
+        if !self.is_compute {
+            drop(self.render.lock().take());
+        }
         drop(self.vm_job.lock().take());
     }
 
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
+    /// Returns true if this call claimed signalling and released healthy pins.
     #[track_caller]
-    pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+    pub(crate) fn complete(&self, result: Result<[u64; 4]>) -> bool {
         // M5 compute feeds the refill detector only from its exact execution record
         // (RetiredCompute); M5 compute is the compute without pooled timestamps.
         let execution = if self.is_compute && self.compute.is_none() {
@@ -828,20 +918,24 @@ impl Completion {
         } else {
             result.as_ref().ok().map(|ticks| [ticks[0], ticks[1]])
         };
-        self.complete_with_compute(result, execution);
+        self.complete_with_compute(result, execution)
     }
 
     /// Compute feedback is separate from public timestamps, which may contain
     /// a synthesized retirement envelope when the execution record is absent.
     #[track_caller]
-    fn complete_with_compute(&self, mut result: Result<[u64; 4]>, compute: Option<[u64; 2]>) {
+    fn complete_with_compute(
+        &self,
+        mut result: Result<[u64; 4]>,
+        compute: Option<[u64; 2]>,
+    ) -> bool {
         if result.is_ok() {
             if let Err(error) = self.check_source_inputs() {
                 result = Err(error);
             }
         }
         if self.signalled.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         if result.is_ok() && self.interrupted() {
             result = Err(ECANCELED);
@@ -856,6 +950,15 @@ impl Completion {
                 self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
             }
         }
+        if let Err(error) = result {
+            // Spared work cancelled after another VM's recovery is not this client's device loss.
+            self.report(error);
+        }
+        self.release_healthy();
+        self.signal_terminal(result);
+        self.output.finish(result, &self.status);
+        // Feed detector and busy-run tracking are internal host heuristics: update them
+        // after signalling the fence so their spinlocks stay off the wakeup critical path.
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             // Compute reports its dispatch envelope in the first pair, a
             // render its fragment pass in the second.
@@ -871,13 +974,7 @@ impl Completion {
                 feed.note_work(self.context_id, start.unwrap_or(0), ticks[1].max(ticks[3]));
             }
         }
-        if let Err(error) = result {
-            // Spared work cancelled after another VM's recovery is not this client's device loss.
-            self.report(error);
-        }
-        self.release_healthy();
-        self.signal_terminal(result);
-        self.output.finish(result);
+        true
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
@@ -894,7 +991,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
@@ -915,7 +1012,7 @@ impl Completion {
             self.report(error);
         }
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 }
 
@@ -941,18 +1038,20 @@ impl Deferred {
     pub(crate) fn finish(self) {
         match self {
             Self::RetiredCompute(completion, ticks, execution) => {
-                completion.complete_with_compute(Ok(ticks), execution);
-                completion.release_after_retirement();
+                if !completion.complete_with_compute(Ok(ticks), execution) {
+                    completion.release_after_retirement();
+                }
             }
             Self::Retired(completion, result) => {
-                completion.complete(result);
                 // An earlier failure may already have signalled this fence while
                 // retaining the pin. Retirement is a separate release witness.
-                completion.release_after_retirement();
+                if !completion.complete(result) {
+                    completion.release_after_retirement();
+                }
             }
             Self::Drained(completion, result) => {
                 completion.release_after_retirement();
-                completion.complete(result);
+                let _ = completion.complete(result);
             }
             Self::FailedOwned(completion, error) => completion.fail_while_owned(error),
             Self::Unpublished(completion, error) => completion.fail_unpublished(error),
@@ -975,5 +1074,19 @@ mod window_tests {
         assert_eq!(ticks_to_ns(24_000_000), 1_000_000_000);
         assert_eq!(ticks_to_ns(24), 1_000);
         assert_eq!(ticks_to_ns(24_000_025), 1_000_001_041);
+    }
+
+    #[test]
+    fn disable_window_clears_allow_window_and_leaves_handed_false() {
+        let mut dest = Destinations {
+            stamps: core::array::from_fn(|_| None),
+            allow_window: true,
+            handed: AtomicBool::new(false),
+        };
+        assert!(dest.allows_window());
+        dest.disable_window();
+        assert!(!dest.allows_window());
+        assert_eq!(dest.window_vas(), [0; 4]);
+        assert!(!dest.handed.load(Ordering::Acquire));
     }
 }

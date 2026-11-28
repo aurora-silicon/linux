@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J873g USB2 host bring-up: usb-drd1 (back-left port) and usb-drd2
- * (front ports via the on-board hub).
+ * J873g USB host bring-up: usb-drd1 (back-left port, USB2) and usb-drd2
+ * (front ports via the on-board hub, USB2 and USB3).
  * The loader powers the controllers and sets up the USB2 side of their ATC
- * PHYs for host mode before Linux starts (there is no T8152 ATC PHY or Type-C
+ * PHYs for host mode before Linux starts (there is no T8152 USB2 PHY or Type-C
  * support yet).
  * The controllers are described by their DWC3 core region, as hosts behind
  * their two DARTs (apple,t8152-dwc3); their PHY reset, and on the Type-C port
  * the role switch, exist but are left to the loader.
+ * usb-drd2's hub is wired to ATC2's PHY without a Type-C mux, so Linux brings
+ * that PHY up in USB3 mode (atc2_phy).
+ * The rear ports' ATC PHYs (atc0_phy, atc1_phy, atc3_phy) run CIO mode for
+ * USB4 alone: their DisplayPort alt mode is the display controllers', which
+ * take a PHY through its DP PHY, and their USB2 side stays with the loader.
  * Resources are from the 26A434 ADT: dart-usb1/2, usb-drd1/2 (on atc-phy1 and
- * atc-phy2) and the pmgr devices ATC1_USB_AON/USB and ATC2_USB_AON/USB.
+ * atc-phy2), atc-phy0-3 and the pmgr devices ATCn_USB_AON, ATC1/2_USB and
+ * ATCn_COMMON_DP_0/1.
  *
  * dart-usb1 and dart-usb2 each have two DART instances (ADT reg[0] and
  * reg[1], 0xc000 each, sharing one interrupt). t8152-peripherals.dtsi lists
@@ -18,6 +24,8 @@
  * DAPF or auxiliary registers. Keep instance 0 on the shared node, with its
  * own window only, and describe instance 1 as a node of its own.
  */
+
+#include <dt-bindings/phy/phy.h>
 
 &dwc3_1_dart {
 	reg = <0x4 0x0b020000 0x0 0xc000>;
@@ -32,71 +40,15 @@
 };
 
 / {
+	aliases {
+		/* aura copies each ATC PHY's tunables from ADT atc-phyN here. */
+		atcphy0 = &atc0_phy;
+		atcphy1 = &atc1_phy;
+		atcphy2 = &atc2_phy;
+		atcphy3 = &atc3_phy;
+	};
+
 	soc {
-		/*
-		 * The ATCs' PMGR power states (ADT pmgr devices ATCn_USB_AON and
-		 * ATCn_USB from 0x308290100, 0x40 apart per ATC). The ADT gives
-		 * usb-drd1/2 service-gates 175/176, but those PSD service blocks
-		 * (0x303a1af00, 0x303a1b000) take a bus error from the CPU.
-		 *
-		 * The loader leaves them on; they hold the controllers' reset and
-		 * the USB2 PHY setup it did, which Linux cannot redo yet. So they
-		 * stay on, without automatic power management.
-		 */
-		pmgr_atc: power-management@308290000 {
-			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
-				     "syscon", "simple-mfd";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			reg = <0x3 0x08290000 0x0 0x1000>;
-
-			ps_atc1_usb_aon: power-controller@140 {
-				compatible = "apple,t8152-pmgr-pwrstate",
-					     "apple,t8103-pmgr-pwrstate";
-				reg = <0x140 4>;
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				label = "atc1_usb_aon";
-				apple,no-auto-pm;
-				apple,always-on;
-			};
-
-			ps_atc1_usb: power-controller@160 {
-				compatible = "apple,t8152-pmgr-pwrstate",
-					     "apple,t8103-pmgr-pwrstate";
-				reg = <0x160 4>;
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				label = "atc1_usb";
-				power-domains = <&ps_atc1_usb_aon>;
-				apple,no-auto-pm;
-				apple,always-on;
-			};
-
-			ps_atc2_usb_aon: power-controller@180 {
-				compatible = "apple,t8152-pmgr-pwrstate",
-					     "apple,t8103-pmgr-pwrstate";
-				reg = <0x180 4>;
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				label = "atc2_usb_aon";
-				apple,no-auto-pm;
-				apple,always-on;
-			};
-
-			ps_atc2_usb: power-controller@1a0 {
-				compatible = "apple,t8152-pmgr-pwrstate",
-					     "apple,t8103-pmgr-pwrstate";
-				reg = <0x1a0 4>;
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				label = "atc2_usb";
-				power-domains = <&ps_atc2_usb_aon>;
-				apple,no-auto-pm;
-				apple,always-on;
-			};
-		};
-
 		dwc3_1_dart_1: iommu@40b040000 {
 			compatible = "apple,t8152-dart", "apple,t8110-dart";
 			reg = <0x4 0x0b040000 0x0 0xc000>;
@@ -125,13 +77,342 @@
 			power-domains = <&ps_atc2_usb>;
 		};
 
+		/*
+		 * The ATCs' PMGR power states (ADT pmgr devices ATCn_COMMON_DP_0/1
+		 * from 0x308290000 and ATCn_USB_AON/USB from 0x308290100, 0x40
+		 * apart per ATC). Each ATC's three are those its PHY needs, and
+		 * ATC1_USB and ATC2_USB are the USB controllers' states. The
+		 * T8152 USB3 and CIO bring-ups run them without automatic power
+		 * management.
+		 *
+		 * The ADT also gives usb-drd1/2 service-gates 175/176, but those
+		 * PSD service blocks (0x303a1af00, 0x303a1b000) take a bus error
+		 * from the CPU. The loader leaves ATC1/2_USB on; with USB_AON
+		 * they hold the controllers' reset and the USB2 PHY setup it
+		 * did, which Linux cannot redo yet, so they stay on.
+		 */
+		pmgr_atc: power-management@308290000 {
+			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
+				     "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x08290000 0x0 0x1000>;
+
+			ps_atc0_common_dp_0: power-controller@0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc0_common_dp_0";
+				apple,no-auto-pm;
+			};
+
+			ps_atc0_common_dp_1: power-controller@20 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x20 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc0_common_dp_1";
+				apple,no-auto-pm;
+			};
+
+			ps_atc1_common_dp_0: power-controller@40 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x40 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_common_dp_0";
+				apple,no-auto-pm;
+			};
+
+			ps_atc1_common_dp_1: power-controller@60 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x60 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_common_dp_1";
+				apple,no-auto-pm;
+			};
+
+			ps_atc2_common_dp_0: power-controller@80 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x80 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_common_dp_0";
+				apple,no-auto-pm;
+			};
+
+			ps_atc2_common_dp_1: power-controller@a0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0xa0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_common_dp_1";
+				apple,no-auto-pm;
+			};
+
+			ps_atc3_common_dp_0: power-controller@c0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0xc0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc3_common_dp_0";
+				apple,no-auto-pm;
+			};
+
+			ps_atc3_common_dp_1: power-controller@e0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0xe0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc3_common_dp_1";
+				apple,no-auto-pm;
+			};
+
+			/*
+			 * The USB_AON states are kept on: each holds its USB
+			 * controller's reset and PIPE handler state, and the
+			 * rear ports' controllers stay with the loader.
+			 */
+			ps_atc0_usb_aon: power-controller@100 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x100 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc0_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc1_usb_aon: power-controller@140 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x140 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc1_usb: power-controller@160 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x160 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_usb";
+				power-domains = <&ps_atc1_usb_aon>;
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			/*
+			 * Kept on: it holds the USB controller's reset and the
+			 * PIPE handler state the loader set up. Switched off, the
+			 * controller stays in reset until the next boot.
+			 */
+			ps_atc2_usb_aon: power-controller@180 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x180 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc2_usb: power-controller@1a0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x1a0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_usb";
+				power-domains = <&ps_atc2_usb_aon>;
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc3_usb_aon: power-controller@1c0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x1c0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc3_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+		};
+
+		/*
+		 * The rear ports' ATCs' common domains: PSD services 55, 56 and 58
+		 * (ADT atc-phy0/1/3 clock-gates).
+		 */
+		ps_atc0_common: power-controller@303a13700 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a13700 0x0 0x100>;
+			#power-domain-cells = <0>;
+			label = "atc0_common";
+		};
+
+		ps_atc1_common: power-controller@303a13800 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a13800 0x0 0x100>;
+			#power-domain-cells = <0>;
+			label = "atc1_common";
+		};
+
+		ps_atc3_common: power-controller@303a13a00 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a13a00 0x0 0x100>;
+			#power-domain-cells = <0>;
+			label = "atc3_common";
+		};
+
+		/* ATC2's common domain: PSD service 57 (ADT atc-phy2 clock-gates). */
+		ps_atc2_common: power-controller@303a13900 {
+			compatible = "apple,t8152-psd";
+			reg = <0x3 0x03a13900 0x0 0x100>;
+			#power-domain-cells = <0>;
+			label = "atc2_common";
+		};
+
+		/*
+		 * ADT atc-phy2 as usb-drd2's USB3 PHY: the hub is wired to its
+		 * lanes directly. The power domains are listed in the order the
+		 * PHY needs them powered up. Its tunables are the atc-phy2
+		 * tunable_* groups that apply to USB3 on lane 0, applied as
+		 * common-a before lane 0 is powered up and the crossbar set, then
+		 * common-b and lane0-usb. Some of them differ between the four
+		 * ATCs of the same Mac (calibration), so the bootloader copies
+		 * them from the Mac's own ADT, through the atcphy2 alias. Without
+		 * them the PHY runs USB2 only.
+		 */
+		atc2_phy: phy@383000000 {
+			compatible = "apple,t8152-atcphy";
+			reg = <0x3 0x83000000 0x0 0x84000>,
+			      <0x3 0x82414000 0x0 0x4000>;
+			reg-names = "core", "pipehandler";
+			#phy-cells = <1>;
+			apple,fixed-usb3;
+			power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_common>,
+					<&ps_atc2_common_dp_0>, <&ps_atc2_common_dp_1>;
+		};
+
+		/*
+		 * USB-C Back-middle: ADT atc-phy0 in CIO mode, see atc2_phy for the
+		 * layout. The bootloader copies the atc-phy0 groups the CIO mode
+		 * applies, through the atcphy0 alias: the common and PLL defaults
+		 * as common-a, the fabric, PLL and the other common groups as
+		 * common-b, and each lane's groups.
+		 */
+		atc0_phy: phy@403000000 {
+			compatible = "apple,t8152-atcphy";
+			reg = <0x4 0x03000000 0x0 0x84000>;
+			reg-names = "core";
+			#phy-cells = <1>;
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>,
+					<&ps_atc0_common_dp_0>, <&ps_atc0_common_dp_1>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					atc0_phy_typec: endpoint {
+						remote-endpoint = <&typec0_ss>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * USB-C Back-left: ADT atc-phy1 in CIO mode, see atc2_phy for the
+		 * layout. The bootloader copies the atc-phy1 groups the CIO mode
+		 * applies, through the atcphy1 alias: the common and PLL defaults
+		 * as common-a, the fabric, PLL and the other common groups as
+		 * common-b, and each lane's groups.
+		 */
+		atc1_phy: phy@40b000000 {
+			compatible = "apple,t8152-atcphy";
+			reg = <0x4 0x0b000000 0x0 0x84000>;
+			reg-names = "core";
+			#phy-cells = <1>;
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>,
+					<&ps_atc1_common_dp_0>, <&ps_atc1_common_dp_1>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					atc1_phy_typec: endpoint {
+						remote-endpoint = <&typec1_ss>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * USB-C Back-right: ADT atc-phy3 in CIO mode, see atc2_phy for the
+		 * layout. The bootloader copies the atc-phy3 groups the CIO mode
+		 * applies, through the atcphy3 alias: the common and PLL defaults
+		 * as common-a, the fabric, PLL and the other common groups as
+		 * common-b, and each lane's groups.
+		 */
+		atc3_phy: phy@413000000 {
+			compatible = "apple,t8152-atcphy";
+			reg = <0x4 0x13000000 0x0 0x84000>;
+			reg-names = "core";
+			#phy-cells = <1>;
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_common>,
+					<&ps_atc3_common_dp_0>, <&ps_atc3_common_dp_1>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					atc3_phy_typec: endpoint {
+						remote-endpoint = <&typec3_ss>;
+					};
+				};
+			};
+		};
+
 		/* usb-drd2: on-board VL822 hub behind the two front USB-C ports. */
 		usb2: usb@382430000 {
 			compatible = "apple,t8152-dwc3";
 			reg = <0x3 0x82430000 0x0 0xcd00>;
 			interrupts = <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>;
 			dr_mode = "host";
-			maximum-speed = "high-speed";
+			phys = <&atc2_phy PHY_TYPE_USB3>;
+			phy-names = "usb3-phy";
 			iommus = <&dwc3_2_dart 0>, <&dwc3_2_dart_1 1>;
 			power-domains = <&ps_atc2_usb>;
 			snps,dis_u2_susphy_quirk;

@@ -100,29 +100,151 @@
 		/*
 		 * ADT /arm-io/nub-spmi-a0 (gen 4): the USB-C PD controllers of
 		 * the three rear ports, each of which can carry the USB-C display.
+		 * Their event, sleep and wake sources are interrupts of this
+		 * controller (the ADT's), its own line is AIC 682. A connector's
+		 * display port leads to the port's display switch, which all
+		 * DCPs share.
 		 */
 		nub_spmi_a0: spmi@308908000 {
 			compatible = "apple,t8152-spmi", "apple,t8142-spmi";
 			reg = <0x3 0x08908000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
 			#address-cells = <2>;
 			#size-cells = <0>;
 
 			/* back-middle */
 			hpm0: usb-pd@c {
-				compatible = "apple,sn201202x";
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
 				reg = <0xc SPMI_USID>;
+				interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+					     <17 IRQ_TYPE_EDGE_RISING>,
+					     <19 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec0: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-middle";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec0_ss: endpoint {
+								remote-endpoint = <&atc0_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec0_display: endpoint {
+								remote-endpoint = <&display_typec0>;
+							};
+						};
+					};
+				};
 			};
 
 			/* back-left */
 			hpm1: usb-pd@a {
-				compatible = "apple,sn201202x";
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
 				reg = <0xa SPMI_USID>;
+				interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+					     <43 IRQ_TYPE_EDGE_RISING>,
+					     <45 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec1: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-left";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec1_ss: endpoint {
+								remote-endpoint = <&atc1_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec1_display: endpoint {
+								remote-endpoint = <&display_typec1>;
+							};
+						};
+					};
+				};
 			};
 
 			/* back-right */
 			hpm3: usb-pd@8 {
-				compatible = "apple,sn201202x";
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
 				reg = <0x8 SPMI_USID>;
+				interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+					     <69 IRQ_TYPE_EDGE_RISING>,
+					     <71 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec3: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-right";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec3_ss: endpoint {
+								remote-endpoint = <&atc3_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec3_display: endpoint {
+								remote-endpoint = <&display_typec3>;
+							};
+						};
+					};
+				};
 			};
 		};
 
@@ -181,7 +303,10 @@
 			/*
 			 * USB-C back-middle: ADT atc-phy0. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@403000000 {
 				reg = <0x4 0x03000000 0x0 0x84000>,
@@ -189,7 +314,10 @@
 				      <0x3 0x03a13700 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <0>;
-				apple,usb-pd = <&hpm0>;
+				/* Powered while a DCP drives it */
+				phys = <&atc0_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
 				apple,tunable-pre =
 					/* ACIOPHY_CMN_DFLT */
 					<0x00800 0x00fc0000 0x00fc0000>,
@@ -279,12 +407,21 @@
 					<0x00ebc 0x0000007f 0x0000005a>,
 					/* ASDC_AUX_SHM_DFLT */
 					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec0: endpoint {
+						remote-endpoint = <&typec0_display>;
+					};
+				};
 			};
 
 			/*
 			 * USB-C back-left: ADT atc-phy1. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@40b000000 {
 				reg = <0x4 0x0b000000 0x0 0x84000>,
@@ -292,7 +429,10 @@
 				      <0x3 0x03a13800 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <1>;
-				apple,usb-pd = <&hpm1>;
+				/* Powered while a DCP drives it */
+				phys = <&atc1_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
 				apple,tunable-pre =
 					/* ACIOPHY_CMN_DFLT */
 					<0x00800 0x00fc0000 0x00fc0000>,
@@ -382,12 +522,21 @@
 					<0x00ebc 0x0000007f 0x0000005a>,
 					/* ASDC_AUX_SHM_DFLT */
 					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec1: endpoint {
+						remote-endpoint = <&typec1_display>;
+					};
+				};
 			};
 
 			/*
 			 * USB-C back-right: ADT atc-phy3. PS: the ATC's DP_0, DP_1 and
 			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
-			 * domain. Tunables before and after the lane crossbar setup.
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
 			 */
 			usb-c@413000000 {
 				reg = <0x4 0x13000000 0x0 0x84000>,
@@ -395,7 +544,10 @@
 				      <0x3 0x03a13a00 0x0 0xc0>;
 				reg-names = "atc", "atc-ps", "atc-psd";
 				apple,dfp-endpoint = <3>;
-				apple,usb-pd = <&hpm3>;
+				/* Powered while a DCP drives it */
+				phys = <&atc3_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
 				apple,tunable-pre =
 					/* ACIOPHY_CMN_DFLT */
 					<0x00800 0x00fc0000 0x00fc0000>,
@@ -485,7 +637,14 @@
 					<0x00ebc 0x0000007f 0x0000005a>,
 					/* ASDC_AUX_SHM_DFLT */
 					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec3: endpoint {
+						remote-endpoint = <&typec3_display>;
+					};
+				};
 			};
+
 		};
 
 		/*
@@ -563,6 +722,7 @@
 				iommus = <&dispext0_dart 0>;
 				dma-coherent;
 			};
+
 		};
 
 		dcpext1_mbox: mailbox@316020700 {
@@ -591,6 +751,7 @@
 				iommus = <&dispext1_dart 0>;
 				dma-coherent;
 			};
+
 		};
 
 	};
