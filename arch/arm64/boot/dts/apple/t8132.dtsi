@@ -409,10 +409,16 @@
 			status = "disabled";
 		};
 
+		/*
+		 * The PMP holds the clusters' die-temperature sensors at its
+		 * fast-die-ctrl-loop targets by publishing an effort per cluster,
+		 * which cpufreq enforces: EACC on lane 0, PACC on lane 1.
+		 */
 		cpufreq_e: performance-controller@210e20000 {
 			compatible = "apple,t8132-cluster-cpufreq", "apple,cluster-cpufreq";
 			reg = <0x2 0x10e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+			apple,fast-die-effort = <&pmp_report 0>;
 			status = "disabled";
 		};
 
@@ -420,6 +426,7 @@
 			compatible = "apple,t8132-cluster-cpufreq", "apple,cluster-cpufreq";
 			reg = <0x2 0x11e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+			apple,fast-die-effort = <&pmp_report 1>;
 			status = "disabled";
 		};
 

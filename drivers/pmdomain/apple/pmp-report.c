@@ -86,6 +86,7 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	bool fast_die_wide;
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
@@ -2677,12 +2678,22 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.defer_requests = true,
 };
 
+/*
+ * T8132 (M4): the PMP node's ptd-range table names PTD entries 1 (PMP-STATUS),
+ * 392 (SOC-DEV-PS-REQ), 400 (SOC-DEV-PS-ACK) and 465 (FAST-DIE-CE, two
+ * lanes). Its fast-die-ctrl-ce-map puts the EACC loop on lane 0 and the PACC
+ * and ANE loops on lane 1, and the clpc node's ptd-ranges include it. A boot
+ * trace of macOS under the hypervisor reads FAST-DIE-CE as one 128-bit access
+ * and no PTD word 32 bits wide, so the effort is read as a 64-bit word.
+ */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
 	.tgt_read = 0x1880,
 	.tgt_write = 0x10c40,
 	.actual = 0x1900,
 	.status = 0x10,
-	/* No qualified fast-die effort on this generation. */
+	.fast_die = 0x1d10,
+	.fast_die_lanes = 2,
+	.fast_die_wide = true,
 };
 
 /*
