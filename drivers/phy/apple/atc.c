@@ -6870,6 +6870,8 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		.fwnode = atcphy->dev->fwnode,
 		.set = atcphy->cio_only ? atcphy_cio_mux_set : atcphy_mux_set,
 		.safe_after_role = !atcphy->fixed_usb2,
+		.usb2_tunnel_fallback = atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
+					!atcphy->cio_tunables,
 		/* A CIO-only PHY times out while the display driver has it. */
 		.transient_timeouts = atcphy->cio_only || atcphy_mux_transient_timeouts(atcphy),
 	};

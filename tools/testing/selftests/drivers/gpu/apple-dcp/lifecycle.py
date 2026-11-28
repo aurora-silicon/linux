@@ -107,7 +107,8 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define TPS_STATUS_TO_UPSIDE_DOWN(x) ((x)&TPS_STATUS_PLUG_UPSIDE_DOWN)
 #define TPS_STATUS_TO_TYPEC_PORTROLE(x) 0
 #define TPS_STATUS_TO_TYPEC_VCONN(x) 0
-#define TPS_STATUS_TO_TYPEC_DATAROLE(x) 0
+#define TPS_STATUS_DATAROLE (1U << 6)
+#define TPS_STATUS_TO_TYPEC_DATAROLE(x) (!!((x) & TPS_STATUS_DATAROLE))
 #define TYPEC_STATE_SAFE 0
 #define TYPEC_STATE_USB 1
 #define TYPEC_THUNDERBOLT_SWITCH_OFF 0
@@ -196,6 +197,7 @@ enum drm_connector_status { connector_status_disconnected, connector_status_conn
 enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
 enum typec_pwr_opmode { TYPEC_PWR_MODE_USB, TYPEC_PWR_MODE_PD };
 enum typec_orientation { TYPEC_ORIENTATION_NONE, TYPEC_ORIENTATION_NORMAL, TYPEC_ORIENTATION_REVERSE };
+enum typec_data_role { TYPEC_DEVICE, TYPEC_HOST };
 struct usb_pd_identity { int id; };
 static void * __attribute__((unused)) memchr_inv(const void *p, int c, size_t n)
 { const unsigned char *b = p; for (size_t i = 0; i < n; i++) if (b[i] != (unsigned char)c) return (void *)(b + i); return NULL; }
@@ -213,7 +215,7 @@ struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
  /* A wake's first port state, applied without the debounce until a retry clears it */
  bool sleep_plug, wake_apply;
- bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
+ bool dp_irq_hpd, dp_sink_reported,dp_sid_valid, tbt_router_present;
  u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
 /* The disconnect/transaction fixtures use the native H17 machine. */
@@ -246,6 +248,7 @@ static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s,
 static int __attribute__((unused)) typec_mux_set(void *m, struct typec_mux_state *s)
 { (void)m; return typec_set_mode(NULL, s->mode); }
 static int typec_mux_begin(void *m, struct typec_mux_state *s) { (void)m;(void)s;return 0; }
+static bool typec_mux_usb2_tunnel_fallback(void *m) { return m != NULL; }
 static bool typec_mux_safe_after_role(void *m) { (void)m;return false; }
 static int typec_mux_apply(void *m) { struct typec_mux_state s={.mode=TYPEC_STATE_SAFE};return typec_mux_set(m,&s); }
 static void typec_mux_abort(void *m) { (void)m; }
@@ -310,6 +313,23 @@ static void callback(bool connected)
 }
 int main(void)
 {
+ /* A tunnel partner with no USB bits gets a role only on a fallback PHY
+  * with no router, and only after a successful mux update. */
+ for (int which = 0; which < 7; which++) {
+  init(); port.display_route_active = false; role = USB_ROLE_NONE;
+  port.update_status.status = TPS_STATUS_PLUG_PRESENT;
+  port.update_status.data_status = which == 1 ? CD321X_DATA_STATUS_USB4_CONNECTION :
+                                                  TPS_DATA_STATUS_TBT_CONNECTION;
+  port.mux = which == 2 ? NULL : (void *)1;
+  port.tbt_switch = which == 3 ? (void *)1 : NULL;
+  port.tbt_router_present = which == 3 || which == 5;
+  mode_error = which == 4 ? -EIO : 0;
+  if (which == 6)
+   port.update_status.status |= TPS_STATUS_DATAROLE;
+  cd321x_update_work(&port.update_work.work);
+  CHECK(role == (which == 6 ? USB_ROLE_HOST :
+                 which < 2 ? USB_ROLE_DEVICE : USB_ROLE_NONE));
+ }
  /* Unplug at each fallible transition with failing DCP power teardown. */
  for (int which = 0; which < 3; which++) {
   init(); power_error = -ETIMEDOUT;

@@ -506,6 +506,7 @@ struct cd321x {
  struct fwnode_handle *connector_fwnode;
  struct typec_mux_state state;
  struct notifier_block tbt_notifier;
+ bool tbt_router_present;
  bool state_valid,tbt_notifier_registered;
 };
 static struct fwnode_handle connector;
@@ -745,20 +746,24 @@ int main(void) {
         assert controls.count(optional) == 1
         controls = controls.replace(optional, r''' assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
  /* ...and the port keeps watching for a router that binds later. */
+ assert(c.tbt_router_present);
  assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
  cd321x_unregister_port(&c.tps);balanced();
  /* A watch that cannot start leaves the port probed without it. */
  reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;watch_error=-ENOMEM;
  assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
+ assert(c.tbt_router_present);
  assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
  cd321x_unregister_port(&c.tps);balanced();
  /* A router present at probe is watched too: it can unbind and bind again with a new switch. */
  reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(c.tbt_router_present);
  assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
  cd321x_unregister_port(&c.tps);balanced();
  /* Without that watch the port still probes with the router it has. */
  reset(&c);watch_error=-ENOMEM;
  assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(c.tbt_router_present);
  assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
  cd321x_unregister_port(&c.tps);balanced();
 ''', 1)

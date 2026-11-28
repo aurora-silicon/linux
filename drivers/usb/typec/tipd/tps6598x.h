@@ -467,6 +467,8 @@ struct cd321x {
 	/* SN201202x: the partner's DP status is current for this DP connection */
 	bool dp_sid_valid;
 	struct typec_thunderbolt_switch *tbt_switch;
+	/* A router connection exists even when its driver has not bound. */
+	bool tbt_router_present;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
 	/* Router that had not bound at probe: look it up when a switch registers */

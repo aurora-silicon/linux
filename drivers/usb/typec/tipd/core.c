@@ -1237,6 +1237,20 @@ static void cd321x_update_work(struct work_struct *work)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
+	} else if (new_connected && !cd321x->tbt_router_present &&
+		   typec_mux_usb2_tunnel_fallback(cd321x->mux) &&
+		   (st.data_status & (TPS_DATA_STATUS_TBT_CONNECTION |
+				      CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		/*
+		 * In Thunderbolt 3 alt mode the controller reports neither a
+		 * USB2 nor a USB3 connection. With a USB4/Thunderbolt router,
+		 * the partner's USB is tunnelled through it. Without a router,
+		 * a PHY that advertises fallback serves the partner's USB2
+		 * on D+/D- instead of the link. Give the port the USB role of
+		 * its Type-C data role, or its USB controller never starts.
+		 */
+		new_role = TPS_STATUS_TO_TYPEC_DATAROLE(st.status) == TYPEC_HOST ?
+			   USB_ROLE_HOST : USB_ROLE_DEVICE;
 	}
 
 	if (new_connected) {
@@ -3037,6 +3051,8 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		ret = PTR_ERR(cd321x->tbt_switch);
 		goto err_put_mux;
 	}
+
+	cd321x->tbt_router_present = tbt_late || cd321x->tbt_switch;
 
 	/*
 	 * A fixed host can register its SuperSpeed root after the mux provider.
