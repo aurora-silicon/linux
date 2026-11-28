@@ -7,7 +7,7 @@
 #include "tas2764.h"
 
 /* Bitmask of enabled Apple quirks */
-#define ENABLED_APPLE_QUIRKS	0x3f
+#define ENABLED_APPLE_QUIRKS	0x13f
 
 /*
  * Disable noise gate and flip down reserved bit in NS_CFG0
@@ -79,12 +79,14 @@ static const struct reg_sequence tas2764_unk_seq2[] = {
 };
 
 /*
- * Disable 'Thermal Threshold 1'
+ * Disable 'Thermal Threshold 1': TG_EN keeps threshold 2 only. The TAS2764
+ * data sheet names the two enables but not the thresholds or what crossing
+ * them does, so this stays out of the defaults.
  */
 #define TAS2764_THERMAL_TH1_DISABLE	BIT(6)
 
 static const struct reg_sequence tas2764_thermal_th1_dis_seq[] = {
-	REG_SEQ0(TAS2764_REG(0x1, 0x47), 0x2),
+	REG_SEQ0(TAS2764_TG_EN, TAS2764_TG_EN_TH2),
 };
 
 /*
@@ -101,8 +103,17 @@ static const struct reg_sequence tas2764_shutdown_dance_init_seq[] = {
 	 * the shutdown is immediate and there's no grace period
 	 * followed by the codec part.
 	 */
-	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x60),
+	REG_SEQ0(TAS2764_MISC_CFG2, TAS2764_MISC_CFG2_SDZ_MODE_IMMEDIATE |
+					  TAS2764_MISC_CFG2_SDZ_TIMEOUT_6MS),
 };
+
+/*
+ * macOS writes 0x68 to MISC_CFG2 at initialisation: immediate SDZ as the
+ * shutdown dance sets it, the 6 ms SDZ timeout, and DVC_RAMP_RATE=10b
+ * (volume ramps 0.5 dB per 8 samples instead of per sample). Only the
+ * ramp rate field is written here; SDZ_MODE stays with the dance quirk.
+ */
+#define TAS2764_DVC_RAMP_INIT		BIT(8)
 
 static const struct reg_sequence tas2764_pre_shutdown_seq[] = {
 	REG_SEQ0(TAS2764_REG(0xfd, 0x0d), 0xd), /* switch hidden page */
@@ -156,11 +167,6 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
  *  - switch from spread spectrum to class-D switching
  *  - disable edge control
  *  - set BOP settings (the BOP config bits *and* BOP_SRC)
- */
-
-/*
- * Other setup TODOs:
- *  - DVC ramp rate
  */
 
 static const struct tas2764_quirk_init_sequence {
