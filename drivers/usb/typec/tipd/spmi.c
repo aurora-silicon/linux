@@ -39,7 +39,6 @@
 #define SN201202X_LDCM_STATE		GENMASK(3, 1)
 #define SN201202X_LDCM_STATE_IDLE	0
 #define SN201202X_LDCM_RESULT		GENMASK(5, 4)
-#define SN201202X_LDCM_RETRY_MS		500
 
 static int sn201202x_select_reg(struct spmi_device *sdev, u8 reg,
 				unsigned int timeout_us)
@@ -333,6 +332,7 @@ static int sn201202x_ldcm_read(void *ctx,
 			      enum typec_contaminant *contaminant)
 {
 	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
 	u8 status[SN201202X_LDCM_STATUS_LEN];
 	int ret;
 
@@ -340,10 +340,21 @@ static int sn201202x_ldcm_read(void *ctx,
 				  sizeof(status));
 	*contaminant = ret ? TYPEC_CONTAMINANT_UNKNOWN :
 			     sn201202x_ldcm_decode(status);
+	if (!ret)
+		sn->ldcm_read_failures = 0;
+	else if (sn->ldcm_read_failures < UINT_MAX)
+		sn->ldcm_read_failures++;
 	return ret;
 }
 
-static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
+static unsigned int sn201202x_ldcm_read_failures(void *ctx)
+{
+	struct tps6598x *tps = ctx;
+
+	return tps_to_sn(tps)->ldcm_read_failures;
+}
+
+VISIBLE_IF_KUNIT int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 {
 	struct tps6598x *tps = ctx;
 	struct sn201202x *sn = tps_to_sn(tps);
@@ -357,6 +368,14 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 	 */
 	if (sn->ldcm_mitigation_known && sn->ldcm_mitigated == enable)
 		return 0;
+	/*
+	 * Not from the busy-wait of suspend-to-idle (sn201202x_sleep_event()):
+	 * removing mitigation can start a measurement, and the command can
+	 * take up to five seconds. Refused, the event wakes the
+	 * system, and the update after the resume sends it.
+	 */
+	if (!enable && READ_ONCE(sn->atomic))
+		return -EAGAIN;
 
 	/*
 	 * As macOS, which reads a dry port's status but sends it no LDCM
@@ -385,6 +404,7 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 		sn->ldcm_requested = false;
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_set_mitigation);
 
 static void sn201202x_ldcm_publish(void *ctx,
 				   enum typec_contaminant contaminant)
@@ -395,6 +415,206 @@ static void sn201202x_ldcm_publish(void *ctx,
 	tps->contaminant = contaminant;
 }
 
+/* Only what the controller reported counts, not what was published. */
+static void sn201202x_ldcm_result(void *ctx, enum typec_contaminant contaminant)
+{
+	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	if (sn->ldcm_wait.holds)
+		dev_info(tps->dev, "liquid detection reported %s, after %u holds without a result\n",
+			 contaminant == TYPEC_CONTAMINANT_LIQUID ? "liquid" : "dry",
+			 sn->ldcm_wait.holds);
+	sn->ldcm_wet = contaminant == TYPEC_CONTAMINANT_LIQUID;
+	sn->ldcm_wait = (struct sn201202x_ldcm_wait){};
+}
+
+static bool sn201202x_ldcm_wet(void *ctx)
+{
+	struct tps6598x *tps = ctx;
+
+	return tps_to_sn(tps)->ldcm_wet;
+}
+
+/* How long the @holds-th hold since the last result lasts (from 1) */
+VISIBLE_IF_KUNIT unsigned int sn201202x_ldcm_hold_ms(unsigned int holds)
+{
+	unsigned int shift = min(holds ? holds - 1 : 0, 5U);
+
+	return min_t(unsigned int, SN201202X_LDCM_HOLD_MS << shift,
+		     SN201202X_LDCM_HOLD_MAX_MS);
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_hold_ms);
+
+/*
+ * The first call starts the wait of the first measurement; it is overdue
+ * SN201202X_LDCM_STUCK_MS later, and the measurement is then to be started
+ * again: until sn201202x_ldcm_wait_rerun() says it was, every call returns 1.
+ * The measurement started again gets a whole wait too. Overdue, the port is
+ * to be held mitigated (2): the hold lasts sn201202x_ldcm_hold_ms() from the
+ * mitigation that went through (sn201202x_ldcm_wait_held()), and then the
+ * measurement is to be started again (1), and so on, until a result resets
+ * the wait. Until the mitigation went through, it stays 2.
+ */
+VISIBLE_IF_KUNIT unsigned int
+sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
+{
+	if (!wait->waiting) {
+		wait->waiting = true;
+		wait->since = now;
+		return 0;
+	}
+	if (wait->rerun_due)
+		return 1;
+	if (wait->overdue == 2) {
+		if (!wait->held ||
+		    time_before(now, wait->since +
+				msecs_to_jiffies(sn201202x_ldcm_hold_ms(wait->holds))))
+			return 2;
+		wait->held = false;
+		wait->overdue = 1;
+		wait->rerun_due = true;
+		wait->since = now;
+		return 1;
+	}
+	if (time_before(now, wait->since + msecs_to_jiffies(SN201202X_LDCM_STUCK_MS)))
+		return 0;
+	wait->since = now;
+	if (!wait->overdue) {
+		wait->overdue = 1;
+		wait->rerun_due = true;
+		return 1;
+	}
+	wait->overdue = 2;
+	wait->held = false;
+	if (wait->holds < UINT_MAX)
+		wait->holds++;
+	return 2;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_overdue);
+
+/*
+ * The hold's mitigation command went through (@mitigated) or failed. The
+ * hold runs from the first that went through; a failed one, even in a hold
+ * that runs, starts it again from the next that goes through, as the
+ * controller may then be unmitigated.
+ */
+VISIBLE_IF_KUNIT void
+sn201202x_ldcm_wait_held(struct sn201202x_ldcm_wait *wait, bool mitigated,
+			 unsigned long now)
+{
+	if (wait->overdue != 2)
+		return;
+	if (!mitigated) {
+		wait->held = false;
+		return;
+	}
+	if (!wait->held) {
+		wait->held = true;
+		wait->since = now;
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_held);
+
+/* The measurement was started again: it gets a whole wait from now. */
+VISIBLE_IF_KUNIT void
+sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait, unsigned long now)
+{
+	wait->rerun_due = false;
+	wait->since = now;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_rerun);
+
+/*
+ * Retried every 500 ms while it measures, but every 2 s once a wait has
+ * been overrun, as the measurement may never end, and after a failed read,
+ * which a busy bus may follow with more. A hold is not polled: the next
+ * update is at its end, unless a controller event comes first. A hold whose
+ * mitigation did not go through is no hold yet: its command is retried every
+ * 2 s, as a failed restart.
+ */
+VISIBLE_IF_KUNIT unsigned int
+sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
+			unsigned int read_failures, unsigned long now)
+{
+	if (wait->overdue == 2 && !wait->rerun_due && wait->held) {
+		unsigned long end = wait->since +
+				    msecs_to_jiffies(sn201202x_ldcm_hold_ms(wait->holds));
+		unsigned int left = time_before(now, end) ?
+				    jiffies_to_msecs(end - now) : 0;
+
+		return max_t(unsigned int, left, SN201202X_LDCM_SLOW_RETRY_MS);
+	}
+	return wait->overdue || read_failures ?
+	       SN201202X_LDCM_SLOW_RETRY_MS : SN201202X_LDCM_RETRY_MS;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_retry_ms);
+
+/* Not in the busy-wait of suspend-to-idle: the update after the resume decides. */
+VISIBLE_IF_KUNIT unsigned int sn201202x_ldcm_overdue(void *ctx)
+{
+	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
+	struct sn201202x_ldcm_wait *wait = &sn->ldcm_wait;
+	unsigned int before = wait->overdue;
+	unsigned int overdue;
+
+	if (READ_ONCE(sn->atomic))
+		return 0;
+	overdue = sn201202x_ldcm_wait_overdue(wait, jiffies);
+	if (overdue == before)
+		return overdue;
+	/* Two warnings per port without a result, the rest at debug level */
+	if (overdue == 1 && !wait->holds)
+		dev_warn(tps->dev, "liquid detection gave no result in %u ms, measuring again\n",
+			 SN201202X_LDCM_STUCK_MS);
+	else if (overdue == 1)
+		dev_dbg(tps->dev, "liquid detection: measuring again after hold %u\n",
+			wait->holds);
+	else if (wait->holds == 1)
+		dev_warn(tps->dev, "liquid detection still gave no result; port disabled until it does, measuring again %u ms after mitigation\n",
+			 sn201202x_ldcm_hold_ms(wait->holds));
+	else
+		dev_dbg(tps->dev, "liquid detection: no result, hold %u of %u ms\n",
+			wait->holds, sn201202x_ldcm_hold_ms(wait->holds));
+	return overdue;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_overdue);
+
+static void sn201202x_ldcm_held(void *ctx, bool mitigated)
+{
+	struct tps6598x *tps = ctx;
+
+	sn201202x_ldcm_wait_held(&tps_to_sn(tps)->ldcm_wait, mitigated, jiffies);
+}
+
+VISIBLE_IF_KUNIT int sn201202x_ldcm_rerun(void *ctx)
+{
+	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
+	int ret;
+
+	if (READ_ONCE(sn->atomic))
+		return -EAGAIN;
+	/*
+	 * Sent even if the controller is taken to be unmitigated already, and
+	 * even if this driver never requested a mitigation since the reset:
+	 * the command is what ends the stuck measurement.
+	 */
+	sn->ldcm_mitigation_known = false;
+	sn->ldcm_requested = true;
+	ret = sn201202x_ldcm_set_mitigation(ctx, false);
+	/*
+	 * Failed (a bus error, a busy controller, no completion): the
+	 * measurement may not have started again, so the next update sends
+	 * the command again instead of letting the restart's wait run.
+	 */
+	if (!ret)
+		sn201202x_ldcm_wait_rerun(&sn->ldcm_wait, jiffies);
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_rerun);
+
 VISIBLE_IF_KUNIT int
 sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 			    enum typec_contaminant last)
@@ -403,24 +623,87 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 	int read_ret, ret;
 
 	read_ret = ops->read(ctx, &contaminant);
+	if (!read_ret && contaminant != TYPEC_CONTAMINANT_UNKNOWN)
+		ops->result(ctx, contaminant);
+	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN) {
+		/*
+		 * A measurement in progress is not a result. Keep the last
+		 * result and its mitigation; the controller reports the new one
+		 * when it is done.
+		 */
+		if (last != TYPEC_CONTAMINANT_UNKNOWN)
+			return -EINPROGRESS;
+		/*
+		 * Liquid was reported, and no dry result or reset came since:
+		 * only a failed command lost it. Mitigate and report it again;
+		 * a wet port is never enabled by the waits below.
+		 */
+		if (ops->wet(ctx)) {
+			ret = ops->set_mitigation(ctx, true);
+			if (ret)
+				return ret;
+			ops->publish(ctx, TYPEC_CONTAMINANT_LIQUID);
+			return -EINPROGRESS;
+		}
+		/*
+		 * Without an earlier result (at probe, after a reset) the port
+		 * stays down until there is one: the cable state is applied
+		 * only for a dry connector. Mitigation is not forced on at
+		 * once, as it once was here: a J716s port mitigated in the
+		 * middle of a measurement stayed in it (LDCM state 3) for good,
+		 * across rebinds, with the port disabled and every plug ignored.
+		 *
+		 * A measurement that overruns its wait is made to start again
+		 * by removing mitigation, which is what got that controller out
+		 * of it, with the port still down. If the measurement run again
+		 * overruns its own wait too, the port is held mitigated, still
+		 * down and "unknown", and the controller is made to measure
+		 * again after each hold (10 s, doubled up to 5 min). A hold
+		 * starts only once its mitigation went through: a failed
+		 * command is sent again, never followed by a restart. No time
+		 * makes a port without a result dry: only a dry result read
+		 * from the controller, during a wait or a hold, enables it.
+		 */
+		switch (ops->overdue(ctx)) {
+		case 0:
+			return -EINPROGRESS;
+		case 1:
+			ret = ops->rerun(ctx);
+			return ret ?: -EINPROGRESS;
+		default:
+			ret = ops->set_mitigation(ctx, true);
+			ops->held(ctx, !ret);
+			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			return ret ?: -EAGAIN;
+		}
+	}
 	/*
-	 * A measurement in progress is not a result. Keep the last result and
-	 * its mitigation; the controller reports the new one when it is done.
+	 * A bus error is no evidence of liquid. A port reported dry, which may
+	 * carry a dock or a display, is not mitigated (and its data paths torn
+	 * down) for one failed read: the read is retried, every 2 s, and only
+	 * SN201202X_LDCM_READ_TRIES failures in a row mitigate it. A port
+	 * without a result, or reported wet, is mitigated at once as before.
 	 */
-	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN &&
-	    last != TYPEC_CONTAMINANT_UNKNOWN)
-		return -EINPROGRESS;
+	if (read_ret && last == TYPEC_CONTAMINANT_NONE &&
+	    ops->read_failures(ctx) < SN201202X_LDCM_READ_TRIES)
+		return read_ret;
 	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
+		/* A failed read or command is no result: liquid stays reported. */
+		enum typec_contaminant unread =
+			last == TYPEC_CONTAMINANT_LIQUID ? TYPEC_CONTAMINANT_LIQUID :
+							   TYPEC_CONTAMINANT_UNKNOWN;
+
 		ret = ops->set_mitigation(ctx, true);
 		if (ret) {
-			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			ops->publish(ctx, unread);
 			return ret;
 		}
-
-		ops->publish(ctx, contaminant);
-		if (read_ret)
+		if (read_ret) {
+			ops->publish(ctx, unread);
 			return read_ret;
-		return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+		}
+		ops->publish(ctx, contaminant);
+		return 0;
 	}
 
 	ret = ops->set_mitigation(ctx, false);
@@ -431,6 +714,8 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 
 	/* Do not report dry if liquid appeared while mitigation was removed. */
 	read_ret = ops->read(ctx, &contaminant);
+	if (!read_ret && contaminant != TYPEC_CONTAMINANT_UNKNOWN)
+		ops->result(ctx, contaminant);
 	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN) {
 		/*
 		 * Removing mitigation can start another measurement. The dry
@@ -460,6 +745,12 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
 	.read = sn201202x_ldcm_read,
 	.set_mitigation = sn201202x_ldcm_set_mitigation,
 	.publish = sn201202x_ldcm_publish,
+	.result = sn201202x_ldcm_result,
+	.wet = sn201202x_ldcm_wet,
+	.overdue = sn201202x_ldcm_overdue,
+	.held = sn201202x_ldcm_held,
+	.rerun = sn201202x_ldcm_rerun,
+	.read_failures = sn201202x_ldcm_read_failures,
 };
 
 static int sn201202x_ldcm_update(struct tps6598x *tps)
@@ -487,12 +778,15 @@ static void sn201202x_ldcm_event(struct tps6598x *tps)
 static void sn201202x_ldcm_retry(struct tps6598x *tps, int ret)
 {
 	struct sn201202x *sn = tps_to_sn(tps);
+	unsigned int delay;
 
+	lockdep_assert_held(&tps->lock);
 	if (!sn201202x_ldcm_pending(ret))
 		dev_err_ratelimited(tps->dev,
 				    "liquid-detection status unavailable: %d\n", ret);
-	mod_delayed_work(system_freezable_wq, &sn->ldcm_work,
-			 msecs_to_jiffies(SN201202X_LDCM_RETRY_MS));
+	delay = sn201202x_ldcm_retry_ms(&sn->ldcm_wait, sn->ldcm_read_failures,
+					jiffies);
+	mod_delayed_work(system_freezable_wq, &sn->ldcm_work, msecs_to_jiffies(delay));
 }
 
 static void sn201202x_ldcm_work(struct work_struct *work)
@@ -506,13 +800,17 @@ static void sn201202x_ldcm_work(struct work_struct *work)
 	mutex_lock(&tps->lock);
 	last = tps->contaminant;
 	ret = sn201202x_ldcm_update(tps);
-	/* Apply the cable state again only if the published state changed. */
+	/*
+	 * Apply the cable state again only if the published state changed.
+	 * No controller event need come with it: a result read by a retry, at
+	 * the end of a hold for one, enables the port on its own.
+	 */
 	if (tps->contaminant != last)
-		mod_delayed_work(system_freezable_wq, &sn->cd.resume_work, 0);
-	mutex_unlock(&tps->lock);
-
+		cd321x_revalidate(tps);
+	/* Its delay is taken from the wait, which the lock protects. */
 	if (ret)
 		sn201202x_ldcm_retry(tps, ret);
+	mutex_unlock(&tps->lock);
 }
 
 /*
@@ -539,6 +837,10 @@ static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
 	sn->ldcm_mitigated = false;
 	sn->ldcm_mitigation_known = false;
 	sn->ldcm_requested = false;
+	/* Its first measurement gets whole waits, and a reset liquid result is gone */
+	sn->ldcm_wait = (struct sn201202x_ldcm_wait){};
+	sn->ldcm_wet = false;
+	sn->ldcm_read_failures = 0;
 	sn201202x_ldcm_event(tps);
 }
 
@@ -1382,6 +1684,23 @@ static int sn201202x_prepare(struct device *dev)
 	}
 	mutex_lock(&tps->lock);
 	ret = sn201202x_ldcm_update(tps);
+	/*
+	 * A measurement without an earlier result leaves the port down but
+	 * unmitigated. Enter sleep mitigated, as before, also right after the
+	 * controller was made to measure again. Suspend-to-idle never removes
+	 * the mitigation itself; the waits go on after the resume.
+	 */
+	if (ret == -EINPROGRESS &&
+	    tps->contaminant == TYPEC_CONTAMINANT_UNKNOWN)
+		ret = sn201202x_ldcm_set_mitigation(tps, true) ?: -EAGAIN;
+	/*
+	 * A failed read that left a port reported dry (fewer than
+	 * SN201202X_LDCM_READ_TRIES in a row) keeps that dry snapshot, which
+	 * the sleep may be entered with.
+	 */
+	if (ret && ret != -EINPROGRESS &&
+	    tps->contaminant == TYPEC_CONTAMINANT_NONE)
+		ret = 0;
 	mutex_unlock(&tps->lock);
 	/* A measurement in progress keeps the last result; its event wakes us. */
 	if (ret == -EINPROGRESS)

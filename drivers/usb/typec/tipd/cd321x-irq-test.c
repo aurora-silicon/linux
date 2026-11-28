@@ -390,6 +390,152 @@ static void cd321x_resume_acknowledges_events_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->ctrl.interrupts, 2U);
 }
 
+/* A polled controller whose plug event never reached the driver */
+static void cd321x_poll_finds_lost_plug_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	KUNIT_EXPECT_EQ(test, cd321x_test_interrupt(t), IRQ_NONE);
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_TRUE(test, t->cd.tps.status & TPS_STATUS_PLUG_PRESENT);
+	KUNIT_EXPECT_TRUE(test, t->cd.update_status.status_changed & TPS_STATUS_PLUG_PRESENT);
+
+	/* Applied: the next poll finds nothing to do. */
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+}
+
+static void cd321x_poll_finds_lost_unplug_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	t->cd.tps.status = TPS_STATUS_PLUG_PRESENT;
+	t->cd.update_status.status = TPS_STATUS_PLUG_PRESENT;
+	cd321x_test_interrupt(t);
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_FALSE(test, t->cd.tps.status & TPS_STATUS_PLUG_PRESENT);
+	KUNIT_EXPECT_TRUE(test, t->cd.update_status.status_changed & TPS_STATUS_PLUG_PRESENT);
+}
+
+static void cd321x_poll_same_plug_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	/* Other status bits change without an event too: only the plug counts. */
+	t->ctrl.status = TPS_STATUS_PLUG_UPSIDE_DOWN;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_EQ(test, t->cd.pm.phase, CD321X_PM_RUNNING);
+}
+
+static const struct tipd_contaminant_ops cd321x_test_contaminant_ops = {};
+
+static void cd321x_poll_plug_not_dry_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	/* A plug on a connector not known to be dry is kept down, as connect does. */
+	t->cd.tps.contaminant_ops = &cd321x_test_contaminant_ops;
+	t->cd.tps.contaminant = TYPEC_CONTAMINANT_UNKNOWN;
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+
+	/* Found dry with no event of its own: the plug is applied. */
+	t->cd.tps.contaminant = TYPEC_CONTAMINANT_NONE;
+	cd321x_test_interrupt(t);
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_TRUE(test, t->cd.tps.status & TPS_STATUS_PLUG_PRESENT);
+}
+
+static void cd321x_poll_plug_during_revalidation_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	/* A revalidation under way is not requeued, which would delay it. */
+	t->cd.pm.phase = CD321X_PM_REVALIDATE;
+	t->cd.pm.attempts_left = CD321X_RESUME_ATTEMPTS;
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+
+	/* One that gave up is restarted by the plug it missed. */
+	t->cd.pm.phase = CD321X_PM_STALE;
+	t->cd.pm.attempts_left = 0;
+	cd321x_test_interrupt(t);
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_TRUE(test, t->cd.tps.status & TPS_STATUS_PLUG_PRESENT);
+}
+
+/* Snapshot taken, but the update that registers the partner gave up */
+static void cd321x_poll_plug_without_partner_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	t->cd.tps.status = TPS_STATUS_PLUG_PRESENT;
+	t->cd.update_status.status = TPS_STATUS_PLUG_PRESENT;
+
+	/* Not while the update is still to run */
+	mod_delayed_work(system_freezable_wq, &t->cd.update_work, 60 * HZ);
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	cancel_delayed_work_sync(&t->cd.update_work);
+
+	cd321x_test_interrupt(t);
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_TRUE(test, t->cd.tps.status & TPS_STATUS_PLUG_PRESENT);
+}
+
+/* One poll-requested read per plug state that is not applied */
+static void cd321x_poll_revalidates_once_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	t->cd.pm.phase = CD321X_PM_STALE;
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	t->cd.tps.status = TPS_STATUS_PLUG_PRESENT;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+
+	/* That read applied the snapshot, but the update gave up again. */
+	cancel_delayed_work_sync(&t->cd.resume_work);
+	t->cd.pm.phase = CD321X_PM_STALE;
+	t->cd.pm.attempts_left = 0;
+	cd321x_test_interrupt(t);
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_EQ(test, t->cd.pm.phase, CD321X_PM_STALE);
+
+	/* A different plug state gets its own read. */
+	t->ctrl.status = 0;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+	cancel_delayed_work_sync(&t->cd.resume_work);
+
+	/* Once the state is applied, a later loss is recovered again. */
+	t->cd.pm.phase = CD321X_PM_STALE;
+	t->cd.tps.status = 0;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_FALSE(test, t->cd.poll_revalidated);
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	cd321x_test_interrupt(t);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+}
+
+static void cd321x_poll_status_read_fails_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+
+	t->cd.tps.status = TPS_STATUS_PLUG_PRESENT;
+	t->ctrl.failing_status_reads = 1;
+	cd321x_test_interrupt(t);
+	/* Not taken for an unplug */
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_EQ(test, t->cd.pm.phase, CD321X_PM_RUNNING);
+}
+
 static struct kunit_case cd321x_irq_cases[] = {
 	KUNIT_CASE(cd321x_irq_acknowledges_events_test),
 	KUNIT_CASE(cd321x_failed_event_read_recovers_test),
@@ -402,6 +548,14 @@ static struct kunit_case cd321x_irq_cases[] = {
 	KUNIT_CASE(cd321x_ack_retry_across_sleep_test),
 	KUNIT_CASE(cd321x_ack_retry_ends_on_removal_test),
 	KUNIT_CASE(cd321x_resume_acknowledges_events_test),
+	KUNIT_CASE(cd321x_poll_finds_lost_plug_test),
+	KUNIT_CASE(cd321x_poll_finds_lost_unplug_test),
+	KUNIT_CASE(cd321x_poll_same_plug_test),
+	KUNIT_CASE(cd321x_poll_plug_not_dry_test),
+	KUNIT_CASE(cd321x_poll_plug_during_revalidation_test),
+	KUNIT_CASE(cd321x_poll_plug_without_partner_test),
+	KUNIT_CASE(cd321x_poll_revalidates_once_test),
+	KUNIT_CASE(cd321x_poll_status_read_fails_test),
 	{}
 };
 

@@ -437,7 +437,12 @@ static int __attribute__((unused)) tipd_boot_power_on(struct tps6598x *t,u32 *s)
 """
     helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
+    helpers += ''.join(line + '\n' for line in core.splitlines() if line.startswith('#define TIPD_PROBE_READ_'))
+    helpers += block(core, 'static int tipd_read_plug_state(') + '\n'
     unit += helpers + block(core, 'int tipd_init(') + r"""
+static int power_reads_failing;
+static bool flaky_power_status(struct tps6598x *t) { (void)t;return !(power_reads_failing&&power_reads_failing--); }
+static void ready(struct tps6598x *t) { (void)t; }
 static void probe_initial(struct cd321x *c) {
  initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.read_power_status=tps6598x_read_power_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;
@@ -461,6 +466,14 @@ int main(void) {
  assert(tipd_init(&c.tps)==-ENODEV&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0&&node_puts==1);
  probe_initial(&c);register_error=-EIO;
  assert(tipd_init(&c.tps)==-EIO&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0);
+ /* A plug present at probe whose status reads fail: retried, then left to ->ready() where there is one */
+ probe_initial(&c);data.read_power_status=flaky_power_status;power_reads_failing=2;data.ready=NULL;
+ assert(!tipd_init(&c.tps)&&!power_reads_failing);
+ probe_initial(&c);data.read_power_status=flaky_power_status;power_reads_failing=100;data.ready=NULL;
+ assert(tipd_init(&c.tps)==-EINVAL);
+ probe_initial(&c);data.read_power_status=flaky_power_status;power_reads_failing=100;data.ready=ready;
+ assert(!tipd_init(&c.tps)&&!(c.tps.status&TPS_STATUS_PLUG_PRESENT));
+ data.ready=NULL;power_reads_failing=0;
  puts("PASS actual probe rollback preserves primary errors, blocks reset after SAFE/role/registration errors and resets only a patched controller");
 }
 """

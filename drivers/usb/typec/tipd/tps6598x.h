@@ -156,6 +156,24 @@
 #define SN201202X_INT_LDCM_UPDATE			BIT_ULL(61)
 
 #define SN201202X_LDCM_STATUS_LEN	55
+/*
+ * How long a measurement without an earlier result may run before the
+ * controller is made to measure again, and then before the port is held
+ * mitigated, see sn201202x_ldcm_update_state(): ten of its 500 ms retries.
+ */
+#define SN201202X_LDCM_STUCK_MS		5000
+#define SN201202X_LDCM_RETRY_MS		500
+/* The retry once a measurement has overrun its wait, until a result */
+#define SN201202X_LDCM_SLOW_RETRY_MS	2000
+/*
+ * How long a port without a result is held mitigated before the controller is
+ * made to measure again: doubled after each measurement that gives none, up
+ * to the maximum, until a result.
+ */
+#define SN201202X_LDCM_HOLD_MS		10000
+#define SN201202X_LDCM_HOLD_MAX_MS	300000
+/* Failed status reads in a row that a port reported dry takes before mitigation */
+#define SN201202X_LDCM_READ_TRIES	3
 
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
@@ -330,6 +348,43 @@ struct sn201202x_ldcm_ops {
 	int (*read)(void *ctx, enum typec_contaminant *contaminant);
 	int (*set_mitigation)(void *ctx, bool enable);
 	void (*publish)(void *ctx, enum typec_contaminant contaminant);
+	/* The controller reported a result (dry or liquid), not a measurement */
+	void (*result)(void *ctx, enum typec_contaminant contaminant);
+	/* Liquid was reported since the last dry result or reset */
+	bool (*wet)(void *ctx);
+	/*
+	 * For a measurement without an earlier result: 0 while it may run on,
+	 * 1 when the controller is to measure again (until ->rerun() succeeded),
+	 * 2 while the port is to be held mitigated, see struct sn201202x_ldcm_wait
+	 */
+	unsigned int (*overdue)(void *ctx);
+	/*
+	 * The hold's mitigation command went through, or failed: the hold runs
+	 * from its first success, and a failure waits for the next one.
+	 */
+	void (*held)(void *ctx, bool mitigated);
+	/* Remove mitigation even if removed already: the controller measures again */
+	int (*rerun)(void *ctx);
+	/* Status reads that failed in a row, the last read included */
+	unsigned int (*read_failures)(void *ctx);
+};
+
+/*
+ * A port without a result: its first measurement's wait (overdue 0), the
+ * wait of a measurement the controller was made to start again (1), or a hold
+ * with mitigation until the next restart (2). Reset by a result or a reset.
+ */
+struct sn201202x_ldcm_wait {
+	bool waiting;
+	/* When the current wait or hold began */
+	unsigned long since;
+	unsigned int overdue;
+	/* The measurement is to be started again, and was not yet */
+	bool rerun_due;
+	/* The hold's mitigation went through: its time runs, from then */
+	bool held;
+	/* Holds since the last result, which set the next hold's length */
+	unsigned int holds;
 };
 
 struct tipd_data {
@@ -497,6 +552,9 @@ struct cd321x {
 	bool macos_usbw_due;
 	/* ... and the controller is in macOS's no-partner state 0x02 since a detach */
 	bool macos_detached;
+	/* A poll asked for a read for a plug state not applied, and which state */
+	bool poll_revalidated;
+	bool poll_revalidated_plug;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -532,6 +590,11 @@ struct sn201202x {
 	bool ldcm_mitigation_known;
 	/* A mitigation was requested since the controller's last reset */
 	bool ldcm_requested;
+	struct sn201202x_ldcm_wait ldcm_wait;
+	/* Liquid reported since the last dry result or reset */
+	bool ldcm_wet;
+	/* Liquid-detection status reads that failed in a row */
+	unsigned int ldcm_read_failures;
 	/* J714s: this sleep is entered and left as macOS does, see sn201202x_prepare() */
 	bool macos_sleep;
 	/* ... and the controller has been sent SLEEP at the prepare and not woken since */
@@ -583,6 +646,7 @@ int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
 #define CD321X_WAKE_EVENT_LEN	13
 int cd321x_wake_events(struct tps6598x *tps, u8 event[CD321X_WAKE_EVENT_LEN], u32 *status,
 		       u32 *data_status);
+void cd321x_revalidate(struct tps6598x *tps);
 void tipd_usb_wake(struct tps6598x *tps, bool asleep);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
@@ -637,6 +701,18 @@ sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);
 int sn201202x_ldcm_update_state(void *ctx,
 				const struct sn201202x_ldcm_ops *ops,
 				enum typec_contaminant last);
+unsigned int sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait,
+					 unsigned long now);
+void sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait,
+			       unsigned long now);
+void sn201202x_ldcm_wait_held(struct sn201202x_ldcm_wait *wait,
+			      bool mitigated, unsigned long now);
+unsigned int sn201202x_ldcm_hold_ms(unsigned int holds);
+unsigned int sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
+				     unsigned int read_failures, unsigned long now);
+int sn201202x_ldcm_set_mitigation(void *ctx, bool enable);
+unsigned int sn201202x_ldcm_overdue(void *ctx);
+int sn201202x_ldcm_rerun(void *ctx);
 #endif
 
 #endif /* __TPS6598X_H__ */

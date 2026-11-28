@@ -55,7 +55,10 @@ config TYPEC_TIPD_KUNIT_TEST
 	  shared with the driver, including aborted and repeated sleep cycles.
 	  Also test that interrupt events which could not be read or cleared
 	  are still acknowledged, however long that keeps failing, so that the
-	  controller keeps raising its interrupt.
+	  controller keeps raising its interrupt. Also test that a polled
+	  controller whose plug changed without an event, or whose plug was
+	  never applied, has its port state read again, once for each plug
+	  state.
 	  Also test that a USB4/Thunderbolt router which has not registered its
 	  switch does not keep the port from probing.
 	  Also test that a Type-C state which a mux provider with transient
@@ -79,6 +82,11 @@ config TYPEC_SN201202X_KUNIT_TEST
 	  for system suspend. Also test which data status and status count as
 	  a link that wakes the system from suspend-to-idle. Liquid-detection
 	  coverage includes status decode and the ordering of controller
-	  mitigation, dry revalidation and connector-state reporting. These tests
-	  run on a simulated SPMI bus, without accessing a physical Type-C
-	  controller.
+	  mitigation, dry revalidation and connector-state reporting, and that
+	  a measurement without an earlier result does not force mitigation
+	  on, is made to start again after one bounded wait and enables the
+	  port only after a second one, never for a port known to be wet, and
+	  that mitigation is never removed from the suspend-to-idle busy-wait,
+	  nor put on a port reported dry for a single failed status read.
+	  These tests run on a simulated SPMI bus, without accessing a
+	  physical Type-C controller.

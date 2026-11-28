@@ -1755,6 +1755,26 @@ static void cd321x_event_lost(struct cd321x *cd321x)
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 }
 
+/**
+ * cd321x_revalidate - Read the cable state afresh and apply it
+ * @tps: The controller
+ *
+ * For a change that the controller signals with no event of its own, such as
+ * a new liquid-detection result read on a retry. The resume work alone does
+ * nothing while the port is running: it reads only in a revalidation.
+ *
+ * Context: tps->lock held.
+ */
+void cd321x_revalidate(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	lockdep_assert_held(&tps->lock);
+	if (cd321x_pm_event_lost(&cd321x->pm))
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+}
+EXPORT_SYMBOL_GPL(cd321x_revalidate);
+
 /*
  * An attached cable need not generate an IRQ after sleep. Read a fresh
  * snapshot and reapply it with the mode cache invalidated, allowing the
@@ -2276,6 +2296,55 @@ int cd321x_wake_events(struct tps6598x *tps, u8 event[CD321X_WAKE_EVENT_LEN], u3
 }
 EXPORT_SYMBOL_GPL(cd321x_wake_events);
 
+/*
+ * The plug event is an edge: one that never reaches the driver, or that is
+ * acknowledged while the cable state behind it is not applied, leaves the
+ * port without a partner (or with a stale one) until the next replug. A
+ * polled controller has no interrupt line to latch it, so on every poll
+ * without an event compare the plug state, masked as cd321x_connect() masks
+ * it, with both the last snapshot and whether a partner is registered: the
+ * snapshot is taken before the update applies it, and an update that gave
+ * up leaves the two apart. If either differs, read the whole state again.
+ *
+ * Not while a revalidation or an update is already under way: its read
+ * settles the state, and requeueing it every poll would keep pushing it
+ * back. And only once for each plug state not applied: a revalidation that
+ * gives up again waits for the next event or plug change, as before, rather
+ * than being restarted every 500 ms.
+ *
+ * Context: tps->lock held.
+ */
+static void cd321x_poll_plug_level(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	bool plug;
+	u32 status;
+
+	lockdep_assert_held(&tps->lock);
+	if ((cd321x->pm.phase != CD321X_PM_RUNNING &&
+	     cd321x->pm.phase != CD321X_PM_STALE) ||
+	    delayed_work_pending(&cd321x->update_work))
+		return;
+	/* A failed read here is only a missed comparison; the next poll tries again. */
+	if (tps6598x_read32(tps, TPS_REG_STATUS, &status))
+		return;
+	if (tps->contaminant_ops && tps->contaminant != TYPEC_CONTAMINANT_NONE)
+		status &= ~TPS_STATUS_PLUG_PRESENT;
+	plug = status & TPS_STATUS_PLUG_PRESENT;
+	if (plug == !!(tps->status & TPS_STATUS_PLUG_PRESENT) && plug == !!tps->partner) {
+		cd321x->poll_revalidated = false;
+		return;
+	}
+	if (cd321x->poll_revalidated && cd321x->poll_revalidated_plug == plug)
+		return;
+
+	cd321x->poll_revalidated = true;
+	cd321x->poll_revalidated_plug = plug;
+	dev_info_ratelimited(tps->dev, "plug %s without an event, reading the port again\n",
+			     plug ? "present" : "gone");
+	cd321x_event_lost(cd321x);
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -2296,8 +2365,11 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 	trace_cd321x_irq(event);
 
-	if (!event)
+	if (!event) {
+		if (!irq)
+			cd321x_poll_plug_level(cd321x);
 		goto err_unlock;
+	}
 	/* A cable came or went: a wake's first read is no longer a quiet one, see cd321x_connect() */
 	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
 		cd321x->wake_apply = false;
@@ -3632,6 +3704,7 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps, const u8 ke
 	u8 delay = 5, result;
 	unsigned long timeout;
 	int ret, lock_ret, mode;
+	u32 fresh;
 
 	mode = tps6598x_check_mode(tps);
 	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
@@ -3671,9 +3744,11 @@ relock:
 				       5000, 0);
 	if (ret || lock_ret)
 		return ret ?: lock_ret;
-	if (!tps6598x_read_status(tps, status))
+	/* Into a copy: a failed read must not replace the status read before. */
+	if (!tps6598x_read_status(tps, &fresh))
 		return -EIO;
-	tps->status = *status;
+	*status = fresh;
+	tps->status = fresh;
 	dev_info(tps->dev, "reinitialized inherited connection\n");
 	return 0;
 }
@@ -3682,6 +3757,7 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 {
 	const struct cd321x_inherited_board *board;
 	bool best_effort = true;
+	u32 fresh;
 	u8 key[4];
 	int ret;
 
@@ -3706,9 +3782,37 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 		return ret;
 
 	dev_warn(tps->dev, "inherited connection not reinitialized: %d\n", ret);
-	if (!tps6598x_read_status(tps, status))
-		return -EIO;
-	tps->status = *status;
+	/*
+	 * Keep the status read before on a bus error: the port's ->ready()
+	 * reads the cable state again anyway, and best effort must not turn
+	 * one failed read into a failed probe. Read into a copy: the Apple
+	 * SPMI controller stores a frame before it checks its parity, so a
+	 * failed read leaves garbage in its buffer.
+	 */
+	if (tps6598x_read_status(tps, &fresh)) {
+		*status = fresh;
+		tps->status = fresh;
+	}
+	return 0;
+}
+
+/*
+ * The power and data status of a plug present at probe. A transient bus error
+ * (on SPMI, a frame that fails its parity check) is retried a few times.
+ */
+#define TIPD_PROBE_READ_TRIES		3
+#define TIPD_PROBE_READ_RETRY_MS	20
+
+static int tipd_read_plug_state(struct tps6598x *tps)
+{
+	unsigned int tries = TIPD_PROBE_READ_TRIES;
+
+	while (!tps->data->read_power_status(tps) ||
+	       !tps->data->read_data_status(tps)) {
+		if (!--tries)
+			return -EIO;
+		msleep(TIPD_PROBE_READ_RETRY_MS);
+	}
 	return 0;
 }
 
@@ -4162,15 +4266,34 @@ int tipd_init(struct tps6598x *tps)
 		goto err_disconnect;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
-		ret = -EINVAL;
-		if (!tps->data->read_power_status(tps))
+		ret = tipd_read_plug_state(tps);
+		if (ret && tps->data->ready) {
+			/*
+			 * ->ready() reads the whole cable state again and applies
+			 * it, with its own retries, so this read only delays the
+			 * partner. Failing the probe for it left the port without
+			 * a driver until the next boot: on a J716s, one SPMI parity
+			 * error with a hub plugged in at boot.
+			 */
+			dev_warn(tps->dev,
+				 "port state unreadable at probe: %d, reading it again once ready\n",
+				 ret);
+			/*
+			 * Not applied: if that revalidation gives up too, a
+			 * later read still finds the plug new.
+			 */
+			tps->status &= ~TPS_STATUS_PLUG_PRESENT;
+			/* Not a probe error: the polled path below keeps ret */
+			ret = 0;
+		} else if (ret) {
+			ret = -EINVAL;
 			goto err_disconnect;
-		if (!tps->data->read_data_status(tps))
-			goto err_disconnect;
-		ret = tps->data->connect(tps, status);
-		if (ret) {
-			dev_err(tps->dev, "failed to register partner\n");
-			goto err_disconnect;
+		} else {
+			ret = tps->data->connect(tps, status);
+			if (ret) {
+				dev_err(tps->dev, "failed to register partner\n");
+				goto err_disconnect;
+			}
 		}
 	}
 
