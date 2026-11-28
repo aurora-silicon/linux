@@ -1039,7 +1039,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_nub_spmi1>;
-			status = "disabled";
 		};
 
 		/* The AOP's SPMI bus (NFC controller). */

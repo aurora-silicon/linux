@@ -141,7 +141,6 @@
 		             <AIC_IRQ 615 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 616 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 617 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/scaler0. */
@@ -170,12 +169,11 @@
 		      <0x3 0x1162c000 0x0 0x3c008>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 399 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 401 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 400 IRQ_TYPE_LEVEL_HIGH>;
+			     <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 401 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 400 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aop2_cpu>;
 		iommus = <&aop_dart 16>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/aop2-exclave-mailbox. */
@@ -184,9 +182,8 @@
 		reg = <0x3 0x5167c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 405 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 402 IRQ_TYPE_LEVEL_HIGH>;
+			     <AIC_IRQ 402 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&aop_dart 17>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/esm. */
@@ -195,9 +192,8 @@
 		reg = <0x4 0xd267c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
+			     <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&sep_dart 2>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/rsm. */
@@ -208,7 +204,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&rsm_dart 0>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/admac-leap-s; the existing AP proxy is separate. */
@@ -221,7 +216,6 @@
 		interrupts = <AIC_IRQ 451 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&aop_dart 11>;
 		power-domains = <&ps_audio_leap_s_a>;
-		status = "disabled";
 	};
 
 
@@ -241,7 +235,6 @@
 		reg = <0x4 0x50000000 0x0 0xafc000>,
 		      <0x4 0x51000000 0x0 0xafc000>,
 		      <0x4 0x523b0000 0x0 0x8000>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/isp-exclave-s-proxy. */
@@ -250,21 +243,18 @@
 		reg = <0x3 0x61800000 0x0 0x480000>,
 		      <0x3 0x628ac000 0x0 0x4000>,
 		      <0x3 0x62780000 0x0 0x10000>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/siri-exclave-timebase. */
 	siri_timebase: secure-timebase@3482a8000 {
 		compatible = "apple,t8140-secure-timebase", "apple,secure-timebase";
 		reg = <0x3 0x482a8000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/hib-exclave-watchdog. */
 	hib_watchdog: secure-watchdog@3482b0000 {
 		compatible = "apple,t8140-secure-watchdog", "apple,secure-watchdog";
 		reg = <0x3 0x482b0000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	/* Clock IDs are SoC hardware selectors, not ADT phandles. */
@@ -525,14 +515,12 @@
 		      <0x3 0x482a8000 0x0 0x4000>,
 		      <0x3 0x482b0000 0x0 0x4000>;
 		reg-names = "ps", "wd-isp", "gpio", "fpwm", "gltb", "wd-e";
-		status = "disabled";
 	};
 
 	xspmi_controller: spmi-proxy-controller@348614000 {
 		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
 		reg = <0x3 0x48614000 0x0 0x4000>;
 		apple,response-vector = <256>;
-		status = "disabled";
 	};
 };
 
@@ -547,7 +535,6 @@
 		compatible = "apple,t8140-battery-monitor", "apple,battery-monitor";
 		interrupt-parent = <&nub_spmi0>;
 		interrupts = <12 IRQ_TYPE_EDGE_RISING>;
-		status = "disabled";
 	};
 };
 
@@ -555,7 +542,6 @@
 	xspmi_proxy: proxy@d {
 		compatible = "apple,t8140-xspmi-proxy", "apple,xspmi-proxy";
 		reg = <0xd SPMI_USID>;
-		status = "disabled";
 	};
 };
 
@@ -563,6 +549,5 @@
 	spmi_all_ace: controller@e {
 		compatible = "apple,t8140-spmi-all-ace", "apple,spmi-all-ace";
 		reg = <0xe SPMI_USID>;
-		status = "disabled";
 	};
 };
