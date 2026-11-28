@@ -25,6 +25,8 @@
 #   ... | bash -s -- --esp-history          Read-only EFI history inventory
 #   ... | bash -s -- --desktop-fixes  Optional matched stable desktop fixes; unsupported versions are preserved.
 #   ... | bash -s -- --no-m3-mesa     M3 Pro: leave out the M3 Pro's Mesa (installed by default)
+#   ... | bash -s -- --yes            agree to the SEP writes on the command line, where
+#                                     there is no terminal to ask on (an install only)
 #
 # Kernel: iconidentify/aurora-linux custom/sep (dbbfb92908ba), aurora-silicon/linux aurora-wip plus the
 # Secure Enclave (Touch ID) driver, Thunderbolt (#8), the Apple video
@@ -307,6 +309,8 @@ MODPROBE_CONF=/etc/modprobe.d/aurora-sep.conf
 # What --read-only wrote there: this first line, comments and the options line.
 READ_ONLY_CONF_HEADER="# aurora-sep --read-only:"
 READ_ONLY_CONF_OPTIONS="options apple_sep xart_writes=0 provision_keybag=0"
+# --yes with an install: the owner agrees to the SEP writes on the command line.
+SEP_WRITES_YES=0
 DESKTOP_FIXES=0
 DESKTOP_FIXES_DATA=""
 DESKTOP_FIXES_PACKAGES=""
@@ -3741,11 +3745,22 @@ sep_policy() {
 }
 
 sep_write_notice() {
+  local answer=""
   [[ -n $(sep_block_line) ]] && return 0
   warn "on the first boot of a Mac with a Touch ID profile, the SEP driver creates
     an identity keybag and writes to the enclave's anti-replay store (xART).
     SEP writes are always on. Use a Mac you can DFU-restore; if you cannot,
-    press Ctrl-C now."
+    do not go on."
+  if ((SEP_WRITES_YES || M3MAX_KIT_YES)); then
+    say "--yes: going on"
+    return 0
+  fi
+  # Piped from curl, stdin is the script; ask on the terminal, if there is one.
+  { : </dev/tty; } 2>/dev/null ||
+    die "no terminal to confirm the SEP writes on. Nothing was installed. Run the command in a terminal, or add --yes (bash -s -- --yes) to agree on the command line."
+  printf 'Type yes to go on (anything else stops, with nothing installed): ' >/dev/tty
+  read -r answer </dev/tty || answer=""
+  [[ $answer == yes ]] || die "stopped: nothing was installed."
   return 0
 }
 
@@ -6592,6 +6607,10 @@ fingerprint.
    handed, so you get the current one automatically:
 
      curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/install-aurora-sep.sh | bash
+
+   The install asks for a "yes" to the SEP writes on the terminal. Where you
+   have no terminal, add --yes (| bash -s -- --yes), and only once the owner
+   has agreed to them in writing.
 
    State the tag you installed in your report. If you were given a specific
    older tag on purpose, say so and say why.
@@ -11150,9 +11169,19 @@ for a in "$@"; do
     --m3-profile=j615-25g83) M3_GPU_EXPLICIT_PROFILE=1; M3_GPU_PROFILE=j613-25g83; M3_GPU_PERSISTENT=1; M3_TRY=1; M3_25_J615=1 ;;
     --no-m3-mesa) M3_PRO_MESA=0 ;;
     --desktop-fixes) DESKTOP_FIXES=1 ;;
+    --yes) SEP_WRITES_YES=1 ;;
     *) args+=("$a") ;;
   esac
 done
+# --yes anywhere on the line: with --reset-touchid or --m3max-kit it is that
+# command's own, and with an install it agrees to the SEP writes.
+if ((SEP_WRITES_YES)); then
+  case ${args[0]:-} in
+    --reset-touchid | --m3max-kit) args+=(--yes); SEP_WRITES_YES=0 ;;
+    "") ;;
+    *) die "--yes goes with an install, --reset-touchid or --m3max-kit; not with ${args[0]}" ;;
+  esac
+fi
 set -- "${args[@]}"
 if ((ESP_ARCHIVE_HISTORY)) && [[ -n ${1:-} ]]; then
   die "--archive-esp-history goes with an install; use --esp-history for a read-only inventory"
@@ -11195,5 +11224,5 @@ case ${1:-} in
   --m3max-kit-stop) m3max_kit_from_release --stop ;;
   --m3max-kit-restore) m3max_kit_from_release --restore ;;
   --agent-prompt) release_source >&2; prompt_notice; agent_prompt ;;
-  *) die "unknown option $1 (--uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --neo-gpu, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --m3-profile=j615-25g83, --no-m3-mesa, --archive-esp-history, --esp-history, --desktop-fixes, --m3max-kit or --m3max-kit-status, -stop, -restore)" ;;
+  *) die "unknown option $1 (--uninstall, --reset-touchid, --agent-prompt, --m3-report, --m3-power-survey, --neo-gpu, --m3-handoff, --m3-gpu, --m3-gpu-check, --m3-gpu-experiment, --m3-gpu-persistent, --m3-profile=j613-25g83, --m3-profile=j615-25g83, --no-m3-mesa, --archive-esp-history, --esp-history, --desktop-fixes, --yes, --m3max-kit or --m3max-kit-status, -stop, -restore)" ;;
 esac
