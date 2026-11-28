@@ -36,7 +36,6 @@
 #include "afk.h"
 #include "dcp.h"
 #include "dcp-internal.h"
-#include "dcpext_scanout.h"
 #include "dcp-lifecycle.h"
 #include "iomfb_internal.h"
 #include "iomfb_v14_7.h"
@@ -1500,8 +1499,6 @@ static void dcp_v14_crashed(void *cookie, const void *crashlog, size_t crashlog_
 		struct apple_connector *connector = READ_ONCE(dcp->connector);
 
 		WRITE_ONCE(dcp->crashed, true);
-		if (dcp->external)
-			dcpext_scanout_fault(dcp, -EIO);
 		/* The display it drove is gone until reboot. */
 		if (v14->external && connector && !READ_ONCE(dcp->external_detached)) {
 			WRITE_ONCE(connector->connected, false);

@@ -29,7 +29,6 @@
 #include "dcp-fabric.h"
 #include "dcp-fabric-effects.h"
 #include "dcp-hdmi.h"
-#include "dcpext_scanout.h"
 #include "ibootep.h"
 #include "dcp-internal.h"
 #include "dptx-service.h"
@@ -1504,7 +1503,6 @@ static void dcp_fabric_snapshot_port(struct apple_dcp_typec_port *port,
 				  dcp_typec_safe_held(dcp);
 		pipeline->tunnel_held = dcp_typec_tunnel_held(dcp);
 		pipeline->presence = dcp_hdmi_presence(dcp);
-		pipeline->terminal = tunnel && dcpext_scanout_terminal(dcp);
 		pipeline->services_ready = !tunnel ||
 					   dcp_tb_services_ready(dcp);
 		pipeline->external = dcp->external;
