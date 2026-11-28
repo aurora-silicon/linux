@@ -11,7 +11,6 @@
 		#size-cells = <0>;
 		interrupt-controller;
 		#interrupt-cells = <2>;
-		status = "disabled";
 
 		nfc@8 {
 			compatible = "apple,t6022-spmi-nfc",
@@ -25,14 +24,12 @@
 				<180 IRQ_TYPE_LEVEL_HIGH>,
 				<181 IRQ_TYPE_LEVEL_HIGH>,
 				<182 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
 		};
 
 		peripheral@e {
 			compatible = "apple,t6022-spmi-peripheral",
 				"apple,spmi-peripheral";
 			reg = <0xe SPMI_USID>;
-			status = "disabled";
 		};
 	};
 
