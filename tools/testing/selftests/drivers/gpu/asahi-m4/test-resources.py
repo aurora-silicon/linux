@@ -264,7 +264,7 @@ pub mod g16 {
         }
     }
     pub mod resources {
-        use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
+        use core::sync::atomic::{AtomicU32,AtomicU64,Ordering};use crate::*;
         pub struct PassDirty<'a>{pub tpc:&'a AtomicU64,pub tilemap:&'a AtomicU64,pub tilemap_last:&'a AtomicU64,pub tilemap_clean:&'a AtomicU64,pub heap:&'a AtomicU64}
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>,pub hw_slots:Option<[usize;super::hw::sizes::SCS_COMPUTE_UNITS]>}
         // A job's compute units; here one arena.
@@ -328,11 +328,11 @@ pub mod g16 {
         __RENDER_BURST__
 
         pub(crate) mod reservations {
-            use super::{ComputeArena as ComputeUnitSet, PoolExtArena, RenderArena};
+            use super::{ComputeArena as ComputeUnitSet, ComputeArena as ComputeUnitTable, PoolExtArena, RenderArena};
             use crate::{
                 device::Device,
                 driver::AsahiDrmDevice,
-                g16::{budget::Budget, object::Factory, pools::{PbEpoch, Pools}, slots::Slots, vm::{MockVm, VmState}},
+                g16::{budget::Budget, object::Factory, pools::{PbEpoch, Pools}, slots::{ComputeWaiters, Slots}, vm::{MockVm, VmState}},
                 sync::{Arc, CondVar, Mutex},
                 KVec,
             };
@@ -369,9 +369,11 @@ pub mod g16 {
                 closed: AtomicBool,
                 active_render_passes: AtomicU32,
                 shared: Arc<Shared>,
+                active_compute_cmds: AtomicU32,
             }
             impl Cache {
                 __RELEASE_RESERVED__
+                __RELEASE_COMPUTE_CMDS__
                 __RELEASE_RENDER_PASSES__
                 __RENDERS_UNPUBLISHED__
             }
@@ -379,6 +381,9 @@ pub mod g16 {
             __PREPARED__
             __DROP_PREPARED__
             impl Prepared {
+                __SET_COMPUTE_WAITER__
+                __RELEASE_COMPUTE_WAITER__
+                __RELEASE_ACTIVE_COMPUTES__
                 __COMMIT_RENDER__
                 __DISCARD_UNPUBLISHED__
             }
@@ -412,6 +417,7 @@ pub mod g16 {
                     closed: AtomicBool::new(false),
                     active_render_passes: AtomicU32::new(credits),
                     shared: shared.clone(),
+                    active_compute_cmds: AtomicU32::new(0),
                 }, 0).unwrap();
                 let (vm, released) = MockVm::tracked(cache.clone());
                 let vm = Arc::new(VmState { id: 1, slot: 1, generation: 1, vm }, 0).unwrap();
@@ -436,12 +442,14 @@ pub mod g16 {
                     slots: Slots::new().unwrap(),
                 };
                 let prepared = Prepared {
+                    active_computes: AtomicU32::new(0),
                     active_renders: AtomicU32::new(credits),
                     unpublished_renders: AtomicU32::new(credits),
+                    compute_waiter_mask: AtomicU32::new(0),
+                    compute_waiters: None,
                     cache: Some(cache.clone()),
                     compute: None,
-                    compute_ext: None,
-                    compute_scs: false,
+                    compute_scs: None,
                     render: None,
                     render_scs: false,
                     render_ext: [],
@@ -457,6 +465,32 @@ pub mod g16 {
                 e.prepare(slot, crate::g16::hw::client::pb_heap(0), 512).unwrap();
                 e.expose();
                 e
+            }
+
+            #[test]
+            fn release_active_computes_is_idempotent_before_drop() {
+                let (_fw, cache, _vm, _epoch, _released, mut job) = displaced_vm(0);
+                cache.active_compute_cmds.store(3, Ordering::Release);
+                job.active_computes.store(3, Ordering::Release);
+                job.release_active_computes();
+                assert_eq!(cache.active_compute_cmds.load(Ordering::Acquire), 0);
+                // Second call and subsequent Drop must not underflow active_compute_cmds.
+                job.release_active_computes();
+                drop(job);
+                assert_eq!(cache.active_compute_cmds.load(Ordering::Acquire), 0);
+            }
+
+            #[test]
+            fn release_compute_waiter_is_idempotent_before_drop() {
+                let (fw, _cache, _vm, _epoch, _released, mut job) = displaced_vm(0);
+                let mask = (1u32 << 16) | (1u32 << 17);
+                let waiters = fw.slots.admit_compute_mask(mask).unwrap().unwrap();
+                job.set_compute_waiter(mask, waiters);
+                job.release_compute_waiter();
+                // Second call and subsequent Drop must not double-release or corrupt waiter state.
+                job.release_compute_waiter();
+                drop(job);
+                assert_eq!(fw.slots.compute_stranding_mask_for_pipe(2, u32::MAX), 0);
             }
 
             #[test]
@@ -2115,7 +2149,9 @@ pub mod g16 {
     }
 
     #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){
-        use crate::g16::resources::should_expand_compute_ext;
+        use crate::g16::resources::{
+            compute_home_start, pick_compute_units, target_compute_units, usable_compute_units,
+        };
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut units=KVec::new();
         for k in 0..4u64 {
@@ -2133,11 +2169,21 @@ pub mod g16 {
         assert!(s.base_compute_quarantined());
         assert!(s.compute_exhausted_within(2));
         assert!(!s.compute_exhausted_within(4));
-        // Fresh single-command VM expands extension units immediately because a base unit is quarantined.
-        let mut last=0u64;let mut burst=0u32;
-        assert!(!should_expand_compute_ext(&mut last,&mut burst,10_000_000,1,false));
-        let mut last=0u64;let mut burst=0u32;
-        assert!(should_expand_compute_ext(&mut last,&mut burst,10_000_000,1,s.base_compute_quarantined()));
+        // Fresh single-command pipe-0 VM skips quarantined unit 1 and selects healthy [0, 2]
+        // (matching dynamic pipe0_exclusive_mask), while an existing [0, 1] VM replaces unit 1
+        // with unit 2 immediately without allocating all 30 extension units.
+        let home = compute_home_start(0, g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(home, 0);
+        let q = s.quarantined_compute_mask();
+        let p0 = s.pipe0_exclusive_mask();
+        let fresh_mask = pick_compute_units(home, 0, q, p0, 0, 2, g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(fresh_mask, (1u32 << 0) | (1u32 << 2));
+        let usable = usable_compute_units(home, 0b11, q, p0, g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(usable, 1);
+        let target = target_compute_units(0, 1, usable, 1, g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(target, 2);
+        let add = pick_compute_units(home, 0b11, q, p0, 0, target, g16::hw::sizes::COMPUTE_UNITS);
+        assert_eq!(add, 1u32 << 2);
         // Expanded fresh VM claims unit 2, retires cleanly, and displaces base unit 0 back to reusable.
         assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(b.id)).unwrap(),Some(2));
         s.hold_vm(&c,&b).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
@@ -2151,6 +2197,345 @@ pub mod g16 {
         let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
         assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
         s.release(&mut c);
+    }
+
+    #[test]fn sparse_compute_alloc_disjoint_multi_vm_and_quarantine_promotion(){
+        use crate::g16::resources::{
+            compute_home_start, pick_compute_units, target_compute_units, usable_compute_units,
+            BASE_COMPUTE_UNITS, COMPUTE_TOTAL_UNIT_BUDGET,
+        };
+        let max_u = g16::hw::sizes::COMPUTE_UNITS;
+        let p0 = (1u32 << g16::hw::sizes::PIPE1_COMPUTE_START) - 1;
+        // 16 concurrent depth-1 VMs (compute.light procs d16): pairwise-disjoint 2-unit pairs,
+        // 32 total units (~1.03 GiB instead of 16 * 32 = 512 units / 16.5 GiB).
+        let mut union = 0u32;
+        let mut total_d1 = 0u32;
+        for seq in 0..16usize {
+            let home = compute_home_start(seq, max_u);
+            let target = target_compute_units(0, 1, 0, 16, max_u);
+            assert_eq!(target, BASE_COMPUTE_UNITS);
+            let mask = pick_compute_units(home, 0, 0, p0, 0, target, max_u);
+            assert_eq!(mask.count_ones() as usize, BASE_COMPUTE_UNITS);
+            assert_eq!(union & mask, 0, "VM {seq} collided with earlier VM pair");
+            if seq == 0 {
+                assert_eq!(mask, p0);
+            } else {
+                assert_eq!(mask & p0, 0, "secondary VM {seq} must stay outside pipe0_exclusive");
+            }
+            union |= mask;
+            total_d1 += mask.count_ones();
+        }
+        assert_eq!(union, u32::MAX);
+        assert_eq!(total_d1 as usize, max_u);
+        // 16 concurrent deep-pipelined VMs (16 x d16 worst case) stay within 64 units (~2.06 GiB).
+        let mut total_deep16 = 0usize;
+        for seq in 0..16usize {
+            let home = compute_home_start(seq, max_u);
+            let base = pick_compute_units(home, 0, 0, p0, 0, BASE_COMPUTE_UNITS, max_u);
+            let usable = usable_compute_units(home, base, 0, p0, max_u);
+            let target = target_compute_units(15, 1, usable, 16, max_u);
+            assert_eq!(target, 4);
+            let add = pick_compute_units(home, base, 0, p0, 0, target, max_u);
+            let full = base | add;
+            assert_eq!(full.count_ones() as usize, 4);
+            total_deep16 += full.count_ones() as usize;
+        }
+        assert!(total_deep16 <= COMPUTE_TOTAL_UNIT_BUDGET);
+        // Power-of-two concurrency (2, 4, 8 VMs) stays pairwise-disjoint even when grown to
+        // full per-VM hardware share (16, 8, 4 units respectively).
+        for (n_vms, each) in [(2usize, 16usize), (4, 8), (8, 4)] {
+            let mut seen = 0u32;
+            for seq in 0..n_vms {
+                let home = compute_home_start(seq, max_u);
+                let mask = pick_compute_units(home, 0, 0, p0, 0, each, max_u);
+                assert_eq!(mask.count_ones() as usize, each);
+                assert_eq!(seen & mask, 0, "{n_vms} VMs overlap at seq={seq}");
+                seen |= mask;
+            }
+            assert_eq!(seen, u32::MAX);
+        }
+        // Single VM scales on demand with 2x headroom so single-pipe d16 keeps >= 17 reusable
+        // units even when 15 other idle pipes hold retired tails: d1=2, d4=8, d16=32 (21 with 3 VMs).
+        assert_eq!(target_compute_units(0, 1, 2, 1, max_u), 2);
+        assert_eq!(target_compute_units(3, 1, 2, 1, max_u), 8);
+        assert_eq!(target_compute_units(15, 1, 8, 1, max_u), 32);
+        assert_eq!(target_compute_units(15, 1, 8, 3, max_u), 21);
+        // Secondary VM self-heals if one of its units is promoted into pipe0_exclusive_mask.
+        let home_u2 = compute_home_start(8, max_u);
+        assert_eq!(home_u2, 2);
+        let init_u2 = pick_compute_units(home_u2, 0, 0, p0, 0, 2, max_u);
+        assert_eq!(init_u2, (1u32 << 2) | (1u32 << 3));
+        let q_u0 = 1u32 << 0;
+        let p0_promoted = (1u32 << 1) | (1u32 << 2);
+        let usable_after = usable_compute_units(home_u2, init_u2, q_u0, p0_promoted, max_u);
+        assert_eq!(usable_after, 1);
+        let target_after = target_compute_units(0, 1, usable_after, 16, max_u);
+        assert_eq!(target_after, 2);
+        let add_after = pick_compute_units(home_u2, init_u2, q_u0, p0_promoted, 0, target_after, max_u);
+        assert_eq!(add_after, 1u32 << 4);
+        assert_eq!(
+            usable_compute_units(home_u2, init_u2 | add_after, q_u0, p0_promoted, max_u),
+            2
+        );
+        // Fresh VM skips a stranded pair where both units are pinned tails, and an existing VM
+        // whose owned pair became stranded adds one immediately available non-tail unit.
+        let stranded_pair = (1u32 << 16) | (1u32 << 17);
+        let fresh_skip = pick_compute_units(16, 0, 0, p0, stranded_pair, 2, max_u);
+        assert_eq!(fresh_skip, (1u32 << 18) | (1u32 << 19));
+        let heal_add = pick_compute_units(16, stranded_pair, 0, p0, stranded_pair, 2, max_u);
+        assert_eq!(heal_add.count_ones(), 1);
+        assert_eq!(heal_add & stranded_pair, 0);
+        assert_eq!(heal_add & p0, 0);
+        // Sole active compute VM resets the home cursor back to pipe 0 ([0, 1]) after multi-VM
+        // traffic (procs d16 + procs d8) so clight d16 starts on pipe 0 with all 16 units.
+        let state = std::sync::atomic::AtomicU64::new(24);
+        assert_eq!(g16::resources::reserve_compute_vm_home(&state), (1, 0));
+        assert_eq!(state.load(std::sync::atomic::Ordering::Acquire), (1u64 << 32) | 1);
+        assert_eq!(compute_home_start(0, max_u), 0);
+        assert_eq!(g16::resources::reserve_compute_vm_home(&state), (2, 1));
+        assert_eq!(compute_home_start(1, max_u), 16);
+    }
+
+    #[test]fn concurrent_cold_start_compute_vms_reserve_disjoint_home_pairs_and_rollback(){
+        use std::sync::{Arc as StdArc, Barrier};
+        use g16::resources::{
+            ComputeVmReservation, active_compute_vm_count, compute_home_start,
+            release_compute_vm_slot, reserve_compute_vm_home,
+        };
+
+        let max_u = g16::hw::sizes::COMPUTE_UNITS;
+
+        // 1. Sixteen VMs racing from idle (cursor = 24 left by earlier multi-proc traffic) before
+        // any ComputeUnitTable::with_added() finishes must reserve distinct home sequences 0..16
+        // across all 16 pairs without collapsing onto pipe 0 or resetting next_slot back to 1.
+        let shared = StdArc::new(std::sync::atomic::AtomicU64::new(24));
+        let barrier = StdArc::new(Barrier::new(16));
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let st = shared.clone();
+            let bar = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                let (active, seq) = reserve_compute_vm_home(&st);
+                (active, seq, compute_home_start(seq, max_u))
+            }));
+        }
+        let mut seqs = Vec::with_capacity(16);
+        let mut homes = Vec::with_capacity(16);
+        for h in handles {
+            let (active, seq, home) = h.join().unwrap();
+            assert!((1..=16).contains(&active));
+            seqs.push(seq);
+            homes.push(home);
+        }
+        seqs.sort_unstable();
+        homes.sort_unstable();
+        assert_eq!(seqs, (0..16).collect::<Vec<_>>());
+        assert_eq!(homes, (0..16).map(|p| p * 2).collect::<Vec<_>>());
+        assert_eq!(active_compute_vm_count(&shared), 16);
+        assert_eq!(shared.load(std::sync::atomic::Ordering::Acquire) as u32, 16);
+        for _ in 0..16 {
+            release_compute_vm_slot(&shared);
+        }
+        assert_eq!(active_compute_vm_count(&shared), 0);
+        assert_eq!(shared.load(std::sync::atomic::Ordering::Acquire) as u32, 16);
+        // Next sole VM after idle resets cursor cleanly back to pipe 0 (seq = 0, cursor = 1).
+        assert_eq!(reserve_compute_vm_home(&shared), (1, 0));
+        assert_eq!(shared.load(std::sync::atomic::Ordering::Acquire), (1u64 << 32) | 1);
+        release_compute_vm_slot(&shared);
+        assert_eq!(active_compute_vm_count(&shared), 0);
+
+        // 2. Rollback on allocation failure: dropping an uncommitted ComputeVmReservation
+        // decrements active_vms back to 0 so the next VM sees active == 0 -> seq = 0, and a
+        // mid-burst failure decrements active_vms without clobbering the cursor or live VMs.
+        let state = crate::sync::Arc::new(std::sync::atomic::AtomicU64::new(24), 0).unwrap();
+        {
+            let (res_fail, active, seq) = ComputeVmReservation::acquire(&state);
+            assert_eq!((active, seq), (1, 0));
+            assert_eq!(active_compute_vm_count(&state), 1);
+            drop(res_fail);
+        }
+        assert_eq!(active_compute_vm_count(&state), 0);
+        let (res_a, active_a, seq_a) = ComputeVmReservation::acquire(&state);
+        assert_eq!((active_a, seq_a), (1, 0));
+        let counter_a = res_a.commit().unwrap();
+        {
+            let (res_b_fail, active_b, seq_b) = ComputeVmReservation::acquire(&state);
+            assert_eq!((active_b, seq_b), (2, 1));
+            assert_eq!(active_compute_vm_count(&state), 2);
+            drop(res_b_fail);
+        }
+        assert_eq!(active_compute_vm_count(&state), 1);
+        assert_eq!(state.load(std::sync::atomic::Ordering::Acquire) as u32, 2);
+        let (res_c, active_c, seq_c) = ComputeVmReservation::acquire(&state);
+        assert_eq!((active_c, seq_c), (2, 2));
+        let counter_c = res_c.commit().unwrap();
+        release_compute_vm_slot(&counter_a);
+        release_compute_vm_slot(&counter_c);
+        assert_eq!(active_compute_vm_count(&state), 0);
+
+        // 3. Low-32 cursor wrap must not carry into or borrow from high-32 active_vms.
+        let wrap = std::sync::atomic::AtomicU64::new((1u64 << 32) | u64::from(u32::MAX));
+        assert_eq!(reserve_compute_vm_home(&wrap), (2, u32::MAX as usize));
+        assert_eq!(wrap.load(std::sync::atomic::Ordering::Acquire), 2u64 << 32);
+        release_compute_vm_slot(&wrap);
+        assert_eq!(wrap.load(std::sync::atomic::Ordering::Acquire), 1u64 << 32);
+    }
+
+    #[test]fn sparse_compute_admission_and_queued_waiter_prevent_pair_borrow_stranding(){
+        use g16::resources::{ComputeArena, pick_compute_units_for};
+        use g16::slots::ComputeSlot;
+
+        let mut o = Objects::new();
+        let max_u = g16::hw::sizes::COMPUTE_UNITS;
+        let p0 = (1u32 << g16::hw::sizes::PIPE1_COMPUTE_START) - 1;
+        let mut full_units = KVec::new();
+        for k in 0..max_u as u64 {
+            full_units
+                .push(
+                    ComputeSlot::new(&mut o, &g16::object::Factory, k, &crate::g16::object::test_unit_cmds(k))
+                        .unwrap(),
+                    0,
+                )
+                .unwrap();
+        }
+        let prep_b = ComputeArena { compute: full_units, render: None, hw_slots: None };
+        let make_pair = |o: &mut Objects, slots_pair: [usize; 2]| -> ComputeArena {
+            let mut u = KVec::new();
+            for &hw in &slots_pair {
+                u.push(
+                    ComputeSlot::new(o, &g16::object::Factory, hw as u64, &crate::g16::object::test_unit_cmds(hw as u64))
+                        .unwrap(),
+                    0,
+                )
+                .unwrap();
+            }
+            ComputeArena { compute: u, render: None, hw_slots: Some(slots_pair) }
+        };
+        let vm_a = vm(501);
+        let vm_b = vm(502);
+        let mask_a = (1u32 << 16) | (1u32 << 17);
+
+        // Window 1 (prepare -> submit TOCTOU race):
+        // Pipe 1 retires unit 16; VM A prepares {16, 17} while 17 is non-tail. Before A reaches
+        // admission, VM B on pipe 2 != 1 borrows unit 17. Verify admission rejects {16, 17} both
+        // while 17 is Published and after 17 retires, while compute_exhausted_in_mask stays false
+        // during Published, and A cleanly re-prepares {16, 17, 18} to admit without ECANCELED.
+        let mut s = Slots::new().unwrap();
+        let pair_a = make_pair(&mut o, [16, 17]);
+        let mut c1 = Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&pair_a, &mut c1, Some(vm_b.id), 1).unwrap(), Some(16));
+        s.hold_vm(&c1, &vm_b).unwrap();
+        s.publish(&mut c1).unwrap();
+        s.retire(&mut c1).unwrap();
+        // VM A prepares {16, 17} locklessly against tails={16}.
+        let prep_mask = pick_compute_units_for(16, 0, 0, p0, s.compute_tail_mask(), 2, max_u, false);
+        assert_eq!(prep_mask, mask_a);
+        // Race: VM B claims & publishes 17 on pipe 2 before A calls admit_compute_mask.
+        let mut c2 = Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&pair_a, &mut c2, Some(vm_b.id), 2).unwrap(), Some(17));
+        s.hold_vm(&c2, &vm_b).unwrap();
+        s.publish(&mut c2).unwrap();
+        // Even with 17 Published on pipe 2 (and 16 Retired on pipe 1), compute_exhausted_in_mask
+        // must stay false while any pipe has Published work, while admission rejects {16, 17}.
+        assert!(!s.compute_exhausted_in_mask(mask_a));
+        assert!(s.admit_compute_mask(mask_a).unwrap().is_none());
+        // After 17 retires on pipe 2, {16, 17} is stranded (both undisplaced tails on p1 != p2).
+        s.retire(&mut c2).unwrap();
+        assert!(s.compute_exhausted_in_mask(mask_a));
+        assert!(s.admit_compute_mask(mask_a).unwrap().is_none());
+        // Retry with fresh compute_tail_mask + force_add_non_tail adds non-tail unit 18 and admits.
+        let rescue = pick_compute_units_for(16, mask_a, 0, p0, s.compute_tail_mask(), 2, max_u, true);
+        assert_eq!(rescue.count_ones(), 1);
+        assert_eq!(rescue & s.compute_tail_mask(), 0);
+        let rescued_mask = mask_a | rescue;
+        assert!(!s.compute_exhausted_in_mask(rescued_mask));
+        let waiters = s.admit_compute_mask(rescued_mask).unwrap().expect("rescued mask must admit");
+        waiters.release(rescued_mask);
+
+        // Window 2 (queued-on-input-fence / pending race against pair_borrow):
+        // Pipe 1 retires unit 16; sparse VM A ({16, 17}) is admitted and waits on an input fence.
+        // Multi-unit VM B (u32::MAX) on pipe 2 != 1 exhausts ALL pair_safe units on pipe 2 and
+        // attempts to fall through to pair_borrow unit 17: claim_compute_for_pipe MUST refuse 17,
+        // B must still make forward progress once its own pipe-2 flight retires, and A must later
+        // claim 17 on pipe 1 with zero ECANCELED!
+        let mut s2 = Slots::new().unwrap();
+        let mut init1 = Claims::new();
+        assert_eq!(s2.claim_compute_for_pipe(&pair_a, &mut init1, Some(vm_b.id), 1).unwrap(), Some(16));
+        s2.hold_vm(&init1, &vm_b).unwrap();
+        s2.publish(&mut init1).unwrap();
+        s2.retire(&mut init1).unwrap();
+        let waiters_a = s2.admit_compute_mask(mask_a).unwrap().expect("A must admit on safe pipe 1");
+        assert_ne!(s2.compute_stranding_mask_for_pipe(2, u32::MAX) & (1u32 << 17), 0);
+        assert_eq!(s2.compute_stranding_mask_for_pipe(1, mask_a) & (1u32 << 17), 0);
+        // Drain every secondary unit except 16 (p1 tail) and 17 (guarded by waiter A) onto pipe 2.
+        let mut b_flights: Vec<Claims> = Vec::new();
+        loop {
+            let mut cb = Claims::new();
+            match s2.claim_compute_for_pipe(&prep_b, &mut cb, Some(vm_b.id), 2).unwrap() {
+                Some(k) => {
+                    assert_ne!(k, 17, "pipe 2 must NEVER pair_borrow unit 17 while waiter A needs {{16, 17}}");
+                    s2.hold_vm(&cb, &vm_b).unwrap();
+                    s2.publish(&mut cb).unwrap();
+                    b_flights.push(cb);
+                }
+                None => break,
+            }
+        }
+        // Exactly 28 secondary units (2..32 minus 16 and 17) were claimed on pipe 2; 17 stayed free!
+        assert_eq!(b_flights.len(), 28);
+        assert!(!s2.compute_available_in_mask_for_pipe(u32::MAX, 2));
+        assert_eq!(s2.free_compute_in_mask_for_pipe(u32::MAX, 2), 0);
+        // B retires its two oldest pipe-2 flights so the first is displaced and B keeps moving.
+        s2.retire(&mut b_flights[0]).unwrap();
+        s2.retire(&mut b_flights[1]).unwrap();
+        let mut b_next = Claims::new();
+        let b_reused = s2
+            .claim_compute_for_pipe(&prep_b, &mut b_next, Some(vm_b.id), 2)
+            .unwrap()
+            .expect("B must make forward progress on pipe 2 after retiring its own flights");
+        assert_ne!(b_reused, 17);
+        s2.release(&mut b_next);
+        for cb in &mut b_flights[2..] {
+            s2.retire(cb).unwrap();
+        }
+        // Now A wakes from its input fence: never exhausted, claims 17 on pipe 1, publishes & retires.
+        assert!(!s2.compute_exhausted_in_mask(mask_a));
+        assert!(s2.compute_pipe_safe_for_mask(mask_a, 1));
+        let mut ca = Claims::new();
+        assert_eq!(s2.claim_compute_for_pipe(&pair_a, &mut ca, Some(vm_a.id), 1).unwrap(), Some(17));
+        s2.hold_vm(&ca, &vm_a).unwrap();
+        s2.publish(&mut ca).unwrap();
+        waiters_a.release(mask_a);
+        s2.retire(&mut ca).unwrap();
+        assert!(!s2.compute_exhausted_in_mask(mask_a));
+
+        // Post-quarantine non-adjacent mask {16, 19} (17 & 18 quarantined, 16 = pipe 1 tail):
+        // unit 19 is not 16 ^ 1, yet pipe 2 must still be blocked from stranding waiter {16, 19}.
+        let mut s3 = Slots::new().unwrap();
+        let pair_1718 = make_pair(&mut o, [17, 18]);
+        for _ in 0..2 {
+            let mut cq = Claims::new();
+            assert!(s3.claim_compute_for_pipe(&pair_1718, &mut cq, Some(vm_b.id), 3).unwrap().is_some());
+            s3.hold_vm(&cq, &vm_b).unwrap();
+            s3.publish(&mut cq).unwrap();
+            s3.quarantine(&mut cq);
+        }
+        let pair_1619 = make_pair(&mut o, [16, 19]);
+        let mask_1619 = (1u32 << 16) | (1u32 << 19);
+        let mut cp1 = Claims::new();
+        let tail_u = s3.claim_compute_for_pipe(&pair_1619, &mut cp1, Some(vm_b.id), 1).unwrap().unwrap();
+        let other_u = if tail_u == 16 { 19 } else { 16 };
+        s3.hold_vm(&cp1, &vm_b).unwrap();
+        s3.publish(&mut cp1).unwrap();
+        s3.retire(&mut cp1).unwrap();
+        let w1619 = s3.admit_compute_mask(mask_1619).unwrap().expect("{16, 19} must admit on pipe 1");
+        assert_ne!(s3.compute_stranding_mask_for_pipe(2, mask_1619) & (1u32 << other_u), 0);
+        let mut cp2 = Claims::new();
+        assert_eq!(s3.claim_compute_for_pipe(&pair_1619, &mut cp2, Some(vm_b.id), 2).unwrap(), None);
+        w1619.release(mask_1619);
+        assert_eq!(s3.claim_compute_for_pipe(&pair_1619, &mut cp2, Some(vm_b.id), 2).unwrap(), Some(other_u));
+        s3.release(&mut cp2);
     }
 
     #[test]fn two_pipe_compute_out_of_order_retire_and_base_unit_isolation(){
@@ -2401,16 +2786,29 @@ pub mod g16 {
         }
         // Ordering E: multiple sequential quarantines across secondary-pipe retired leases on
         // units 2, 4, 5, 6 slide scs_compute_mask() cleanly across [1, 3] -> [3, 7] -> [3, 8].
+        // Pin exact units {2, 4, 5, 6} onto secondary pipes 1..=4 (pair-safe full-mask claiming
+        // normally keeps pipes on disjoint even pairs so {4, 5} would not split across pipes).
         let mut s_multi = Slots::new().unwrap();
-        for (p, expected_u) in [(1usize, 2usize), (2, 3), (3, 4), (4, 5)] {
+        for (p, target_u) in [(1usize, 2usize), (2, 3), (3, 4), (4, 5), (2, 6)] {
+            let pin_arena = make_scs_arena(&mut o, [target_u, target_u]);
             let mut cp = Claims::new();
-            assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cp, Some(other.id), p).unwrap(), Some(expected_u));
+            assert_eq!(s_multi.claim_compute_for_pipe(&pin_arena, &mut cp, Some(other.id), p).unwrap(), Some(target_u));
             s_multi.hold_vm(&cp, &other).unwrap(); s_multi.publish(&mut cp).unwrap(); s_multi.retire(&mut cp).unwrap();
         }
-        // Displace unit 3 on pipe 2 so secondary tails are {2, 4, 5, 6}, leaving 3 and 7 clean.
-        let mut cp2_disp = Claims::new();
-        assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cp2_disp, Some(other.id), 2).unwrap(), Some(6));
-        s_multi.hold_vm(&cp2_disp, &other).unwrap(); s_multi.publish(&mut cp2_disp).unwrap(); s_multi.retire(&mut cp2_disp).unwrap();
+        // Pair-safe full-mask claiming keeps distinct secondary pipes on disjoint pairs (pipe 1 -> 2,
+        // pipe 2 -> 4, skipping 3 because 2 is pipe 1's tail) before borrowing a partner only when
+        // no pair-safe unit remains.
+        let mut s_pair = Slots::new().unwrap();
+        let mut cp_a = Claims::new();
+        assert_eq!(s_pair.claim_compute_for_pipe(&prep_full, &mut cp_a, Some(other.id), 1).unwrap(), Some(2));
+        s_pair.hold_vm(&cp_a, &other).unwrap(); s_pair.publish(&mut cp_a).unwrap(); s_pair.retire(&mut cp_a).unwrap();
+        let mut cp_b = Claims::new();
+        assert_eq!(s_pair.claim_compute_for_pipe(&prep_full, &mut cp_b, Some(other.id), 2).unwrap(), Some(4));
+        s_pair.release(&mut cp_b);
+        let pair_23 = make_scs_arena(&mut o, [2, 3]);
+        let mut cp_borrow = Claims::new();
+        assert_eq!(s_pair.claim_compute_for_pipe(&pair_23, &mut cp_borrow, Some(other.id), 2).unwrap(), Some(3));
+        s_pair.release(&mut cp_borrow);
         for (q_unit, expected_pair) in [(0usize, [1usize, 3]), (1, [3, 7]), (7, [3, 8])] {
             let mut cq = Claims::new();
             assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cq, Some(bad.id), 0).unwrap(), Some(q_unit));
@@ -3847,10 +4245,14 @@ for placeholder, source_text, declaration in (
     ('__WAKE_CLOSED_VM_RECLAIM__', mod_source, 'pub(crate) fn wake_closed_vm_reclaim('),
     ('__STANDBY__', resources_source, 'struct Standby {'),
     ('__RELEASE_RESERVED__', resources_source, 'fn release_reserved('),
+    ('__RELEASE_COMPUTE_CMDS__', resources_source, 'fn release_compute_cmds('),
     ('__RELEASE_RENDER_PASSES__', resources_source, 'fn release_render_passes('),
     ('__RENDERS_UNPUBLISHED__', resources_source, 'pub(crate) fn renders_unpublished('),
     ('__PREPARED__', resources_source, 'pub(crate) struct Prepared {'),
     ('__DROP_PREPARED__', resources_source, 'impl Drop for Prepared'),
+    ('__SET_COMPUTE_WAITER__', resources_source, 'pub(crate) fn set_compute_waiter('),
+    ('__RELEASE_COMPUTE_WAITER__', resources_source, 'pub(crate) fn release_compute_waiter('),
+    ('__RELEASE_ACTIVE_COMPUTES__', resources_source, 'pub(crate) fn release_active_computes('),
     ('__COMMIT_RENDER__', resources_source, 'pub(crate) fn commit_render('),
     ('__DISCARD_UNPUBLISHED__', resources_source, 'pub(crate) fn discard_unpublished_renders('),
     ('__RECLAIM_CLOSED_VM_SLOTS__', poll_source, 'pub(crate) fn reclaim_closed_vm_slots('),
@@ -3868,13 +4270,14 @@ assert 'crate::pgtable::clean_poc(' in stored_fn and 'crate::pgtable::poc_barrie
 for store in ('pub(crate) fn write(', 'pub(crate) fn fill(', 'pub(crate) fn w32(', 'pub(crate) fn w64('):
     assert 'self.stored(' in item(object_source, store), store + ' must clean firmware-cached GPU-aliased stores'
 assert object_source.count('let clean = req.class == Class::FwCoherent && req.lower.is_some();') == 1, 'only FwCoherent work with a lower alias cleans its stores'
-assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
+assert 'pub(crate) struct ComputeUnitTable {' in resources_source, 'resources.rs must store sparse per-slot ComputeArenas'
+assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must retain ComputeUnitSet for SCS compute units'
 assert 'pub(crate) struct ComputeCmds {' in resources_source, 'resources.rs must retain device-lifetime ComputeCmds'
 assert 'let cmds = factory.compute_cmds(hw_slot)?;' in resources_source, 'ComputeArena::new must fetch hardware-slot UnitCmds'
-assert 'ComputeArena::new(factory, bind, vm, live, k, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'ComputeArena::new(factory, bind, vm, live, k, k, Placement::Base)' in resources_source, 'ComputeUnitTable::with_added must allocate one ComputeArena per sparse slot'
 assert 'for (local, &hw_slot) in hw_slots.iter().enumerate()' in resources_source, 'ComputeUnitSet::new_scs must bind UnitCmds by hw_slot'
-assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
-assert 'base.arena(k)' in resources_source and 'ext.arena(k - base.len())' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'
+assert 'compute: Option<Arc<ComputeUnitTable>>' in resources_source, 'Prepared must carry sparse ComputeUnitTable so undisplaced slots pin only one unit'
+assert 'self.compute.as_ref()?.arena(k)' in resources_source and 'scs.arena_for_hw(k)' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'
 engine_source = (production/'engine.rs').read_text()
 prefix_compute_fn = item(engine_source, 'fn prefix_compute(')
 assert 'seq: s.seq.va,' in prefix_compute_fn, 'prefix_compute must point ComputeRefs::seq at firmware-cached s.seq'
@@ -3894,18 +4297,37 @@ source = (source
     .replace('__PERSISTENT_UNIT_CMDS__', item(resources_source, 'struct PersistentUnitCmds {'))
     .replace('__COMPUTE_CMDS_STRUCT__', item(resources_source, 'pub(crate) struct ComputeCmds {').replace('#[pin]\n', '').replace('super::hw::', 'hw::'))
     .replace('__COMPUTE_CMDS_GET__', item(resources_source, 'pub(crate) fn get(&self, factory: &Factory, k: usize) -> Result<UnitCmds> {')))
+compute_tiers_start = resources_source.index('pub(crate) const COMPUTE_UNIT_TIERS:')
+compute_tiers_end = resources_source.index('];\n', compute_tiers_start) + 3
 ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')
 ext_tiers_end = resources_source.index('];\n', ext_tiers_start) + 3
 render_burst_lines = (
-    resources_source[ext_tiers_start:ext_tiers_end]
+    resources_source[compute_tiers_start:compute_tiers_end]
+    + '\n'
+    + next(
+        line for line in resources_source.splitlines()
+        if line.startswith('pub(crate) const COMPUTE_TOTAL_UNIT_BUDGET:')
+    )
+    + '\n'
+    + resources_source[ext_tiers_start:ext_tiers_end]
     + '\n'
     + '\n'.join(
         line for line in resources_source.splitlines()
-        if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
+        if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const RENDER_BURST_COMMANDS:'))
     )
     + '\npub(crate) ' + item(resources_source, 'fn pick_scs_compute_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn pick_base_pb_slots(')
-    + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')
+    + '\npub(crate) ' + item(resources_source, 'fn reserve_compute_vm_home(')
+    + '\npub(crate) ' + item(resources_source, 'fn active_compute_vm_count(')
+    + '\npub(crate) ' + item(resources_source, 'fn release_compute_vm_slot(')
+    + '\npub(crate) ' + item(resources_source, 'struct ComputeVmReservation {').replace('Arc<', 'crate::sync::Arc<')
+    + '\n' + item(resources_source, 'impl ComputeVmReservation {').replace('Arc<', 'crate::sync::Arc<').replace('fn acquire(', 'pub(crate) fn acquire(').replace('fn commit(', 'pub(crate) fn commit(')
+    + '\n' + item(resources_source, 'impl Drop for ComputeVmReservation {')
+    + '\npub(crate) ' + item(resources_source, 'fn compute_home_start(')
+    + '\npub(crate) ' + item(resources_source, 'fn usable_compute_units(')
+    + '\npub(crate) ' + item(resources_source, 'fn target_compute_units(')
+    + '\npub(crate) ' + item(resources_source, 'fn pick_compute_units_for(')
+    + '\npub(crate) ' + item(resources_source, 'fn pick_compute_units(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots_for(')
 )

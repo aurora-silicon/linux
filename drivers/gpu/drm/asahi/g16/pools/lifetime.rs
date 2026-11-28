@@ -159,28 +159,54 @@ impl<const N: usize> Lifetime<N> {
         }
         mask
     }
+    /// Per-pipe index of the newest non-quarantined (`Published` or `Retired`) owner on each
+    /// pipe (`0..32`), or `u8::MAX` when a pipe has no non-quarantined publication.
+    pub(crate) fn pipe_tails(&self) -> [u8; 32] {
+        let mut best_k = [u8::MAX; 32];
+        let mut best_pub = [0u64; 32];
+        for k in 0..N.min(32) {
+            let u = &self.units[k];
+            let p = usize::from(u.pipe);
+            if p >= 32 || !matches!(u.state, State::Published | State::Retired) {
+                continue;
+            }
+            if best_k[p] == u8::MAX || u.publication > best_pub[p] {
+                best_k[p] = k as u8;
+                best_pub[p] = u.publication;
+            }
+        }
+        best_k
+    }
+    /// Bitmask of owners in `0..N.min(32)` that are the newest non-quarantined (`Published` or
+    /// `Retired`) publication on any pipe `p != exclude_pipe` (pass `usize::MAX` for all pipes).
+    pub(crate) fn pipe_tails_mask(&self, exclude_pipe: usize) -> u32 {
+        let best_k = self.pipe_tails();
+        let mut mask = 0u32;
+        for (p, &k) in best_k.iter().enumerate() {
+            if p != exclude_pipe && k != u8::MAX {
+                mask |= 1u32 << k;
+            }
+        }
+        mask
+    }
+    /// Bitmask of pipes `p` (`0..32`) whose newest non-quarantined (`Published` or `Retired`)
+    /// publication is currently an owner inside `mask`.
+    pub(crate) fn tail_pipes_in_mask(&self, mask: u32) -> u32 {
+        let best_k = self.pipe_tails();
+        let mut pipes = 0u32;
+        for (p, &k) in best_k.iter().enumerate() {
+            if k != u8::MAX && (mask & (1u32 << k)) != 0 {
+                pipes |= 1u32 << p;
+            }
+        }
+        pipes
+    }
     /// Bitmask of owners in `0..N.min(32)` that are the newest non-quarantined (`Published` or
     /// `Retired`) publication on any secondary pipe (`pipe != 0`): an idle secondary pipe's
     /// undisplaced `Retired` unit, or an active secondary pipe's newest in-flight `Published`
     /// unit (which becomes undisplaced once that pipe drains).
     pub(crate) fn secondary_tail_mask(&self) -> u32 {
-        let mut mask = 0u32;
-        for k in 0..N.min(32) {
-            let u = &self.units[k];
-            if u.pipe == 0 || !matches!(u.state, State::Published | State::Retired) {
-                continue;
-            }
-            let has_newer = self.units.iter().enumerate().any(|(b, other)| {
-                b != k
-                    && other.pipe == u.pipe
-                    && matches!(other.state, State::Published | State::Retired)
-                    && other.publication > u.publication
-            });
-            if !has_newer {
-                mask |= 1u32 << k;
-            }
-        }
-        mask
+        self.pipe_tails_mask(0)
     }
     /// Whether any owner in `0..n` is permanently quarantined.
     pub(crate) fn any_quarantined_within(&self, n: usize) -> bool {

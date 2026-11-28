@@ -295,12 +295,19 @@ pub(crate) struct Shared {
     pub(crate) sleeping: AtomicBool,
     /// Firmware recovery is active under `Shared::state` (may sleep up to 1000 ms).
     pub(crate) recovering: AtomicBool,
-    /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) has been quarantined.
-    pub(crate) base_compute_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
     pub(crate) quarantined_compute_mask: AtomicU32,
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0.
+    pub(crate) pipe0_exclusive_mask: AtomicU32,
     /// Bitmask of healthy pipe-0-exclusive compute units reserved for fresh SCS compute VMs.
     pub(crate) scs_compute_mask: AtomicU32,
+    /// Bitmask of compute units currently pinned as the newest publication on any compute pipe.
+    pub(crate) compute_tail_mask: AtomicU32,
+    /// Packed non-SCS compute-VM admission state: high 32 bits = live open VMs owning non-SCS
+    /// compute arenas, low 32 bits = round-robin home-pair cursor. Packed into one atomic so
+    /// concurrent cold-starting VMs atomically reserve their active-VM count and disjoint home
+    /// sequence before arena allocation.
+    pub(crate) compute_vm_state: Arc<AtomicU64>,
     /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
     pub(crate) base_render_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -651,6 +658,7 @@ impl Gpu {
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
         let feed = feed::Feed::new()?;
         let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
+        let compute_vm_state = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
         let active_render_vms = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
         let scrub_queue = slots::ScrubQueue::new_boxed()?;
         let shared = Arc::pin_init(
@@ -680,9 +688,11 @@ impl Gpu {
                 orphaned: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
-                base_compute_quarantined: AtomicBool::new(false),
                 quarantined_compute_mask: AtomicU32::new(0),
+                pipe0_exclusive_mask: AtomicU32::new((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1),
                 scs_compute_mask: AtomicU32::new((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1),
+                compute_tail_mask: AtomicU32::new(0),
+                compute_vm_state,
                 base_render_quarantined: AtomicBool::new(false),
                 quarantined_pb_mask: AtomicU32::new(0),
                 next_pb_slot: AtomicU32::new(0),

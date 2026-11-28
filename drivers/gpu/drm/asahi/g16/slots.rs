@@ -8,7 +8,7 @@
 //! Private backing and old VM leases survive until a distinct replacement fully retires.
 //! Aborted storage remains mapped and quarantined. Pool cursors are never scrubbed.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
@@ -1041,6 +1041,138 @@ pub(crate) struct RenderOwners {
     scrub_pending: bool,
 }
 
+/// Maximum distinct unpublished compute `slot_mask`s tracked simultaneously across all VMs.
+/// At most 63 user VMs exist on G16, each with at most a few sparse growth tiers before sharing
+/// the full `u32::MAX` mask, so 256 entries cover all concurrent VMs without heap resizing.
+const COMPUTE_WAITER_SLOTS: usize = 256;
+/// Any healthy compute mask with at least `COMPUTE_PIPES + 2` units always retains at least two
+/// non-other-tail units on pipe 0 regardless of the `COMPUTE_PIPES - 1` secondary tails.
+const FULL_SAFE_COMPUTE_UNITS: u32 = (sizes::COMPUTE_PIPES + 2) as u32;
+
+struct ComputeWaiterSlots {
+    entries: [AtomicU64; COMPUTE_WAITER_SLOTS],
+}
+
+/// Lock-free reference-counted registry of unpublished compute `slot_mask`s for accepted
+/// (`drm_sched`-queued) and `engine.pending` jobs.
+///
+/// [`Self::acquire`] is called exclusively under `Shared::state`, while [`Self::release`] may
+/// run concurrently from any thread (`Job::finish`, `Job::cancel_unstarted`, `Prepared::drop`,
+/// or publication) without locks, sleeping, or allocation. Each entry packs `(mask << 32) | count`.
+pub(crate) struct ComputeWaiters {
+    slots: KBox<ComputeWaiterSlots>,
+    scan_limit: AtomicUsize,
+    non_full_count: AtomicU32,
+    total_count: AtomicU32,
+}
+
+impl ComputeWaiters {
+    #[inline(never)]
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        let slots = KBox::init(
+            init!(ComputeWaiterSlots {
+                entries: [const { AtomicU64::new(0) }; COMPUTE_WAITER_SLOTS],
+            }),
+            GFP_KERNEL,
+        )?;
+        Ok(Arc::new(
+            Self {
+                slots,
+                scan_limit: AtomicUsize::new(0),
+                non_full_count: AtomicU32::new(0),
+                total_count: AtomicU32::new(0),
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    /// Registers one unpublished compute job with `mask`. Must be called under `Shared::state`.
+    fn acquire(&self, mask: u32) -> Result {
+        if mask == 0 {
+            return Ok(());
+        }
+        let non_full = mask.count_ones() < FULL_SAFE_COMPUTE_UNITS;
+        let limit = self
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.slots.entries[..limit] {
+            let mut cur = slot.load(Ordering::Acquire);
+            while (cur >> 32) as u32 == mask {
+                let count = cur as u32;
+                if count == 0 {
+                    break;
+                }
+                if count == u32::MAX {
+                    return Err(EBUSY);
+                }
+                let next = ((mask as u64) << 32) | u64::from(count + 1);
+                match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        if non_full {
+                            self.non_full_count.fetch_add(1, Ordering::AcqRel);
+                        }
+                        self.total_count.fetch_add(1, Ordering::AcqRel);
+                        return Ok(());
+                    }
+                    Err(obs) => cur = obs,
+                }
+            }
+        }
+        for (i, slot) in self.slots.entries.iter().enumerate() {
+            let next = ((mask as u64) << 32) | 1u64;
+            if slot
+                .compare_exchange(0, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.scan_limit.fetch_max(i + 1, Ordering::Release);
+                if non_full {
+                    self.non_full_count.fetch_add(1, Ordering::AcqRel);
+                }
+                self.total_count.fetch_add(1, Ordering::AcqRel);
+                return Ok(());
+            }
+        }
+        Err(EBUSY)
+    }
+
+    /// Releases one unpublished compute job reservation for `mask` (`SignallingGuard`-safe).
+    pub(crate) fn release(&self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        let non_full = mask.count_ones() < FULL_SAFE_COMPUTE_UNITS;
+        let limit = self
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.slots.entries[..limit] {
+            let mut cur = slot.load(Ordering::Acquire);
+            while (cur >> 32) as u32 == mask {
+                let count = cur as u32;
+                if count == 0 {
+                    break;
+                }
+                let next = if count == 1 {
+                    0u64
+                } else {
+                    ((mask as u64) << 32) | u64::from(count - 1)
+                };
+                match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        if non_full {
+                            self.non_full_count.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        self.total_count.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
+                    Err(obs) => cur = obs,
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct Slots {
     pub(crate) cursor: u32,
     pub(crate) pass_busy: u64,
@@ -1049,6 +1181,8 @@ pub(crate) struct Slots {
     pub(crate) stats: SlotStats,
     /// Shared atomic state for off-lock pre-scrubbing of displaced render pass slots.
     scrub: Arc<ScrubState>,
+    /// Unpublished compute job masks across `drm_sched` and `engine.pending`.
+    compute_waiters: Arc<ComputeWaiters>,
     /// The compute and render owners, on the heap: `Firmware` (and so `Slots`) is built on the
     /// probe's stack, which has no room for them.
     compute: KBox<ComputeOwners>,
@@ -1064,6 +1198,7 @@ impl Slots {
             scrub_gen: 1,
             stats: SlotStats::default(),
             scrub: Arc::new(ScrubState::new(), GFP_KERNEL)?,
+            compute_waiters: ComputeWaiters::new()?,
             compute: KBox::init(
                 init!(ComputeOwners {
                     lifetime: Lifetime::new(true),
@@ -1145,6 +1280,7 @@ impl Slots {
         self.render.lifetime.exhausted_within(n)
     }
     /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) is permanently quarantined.
+    #[allow(dead_code)]
     pub(crate) fn base_compute_quarantined(&self) -> bool {
         self.compute
             .lifetime
@@ -1251,12 +1387,222 @@ impl Slots {
             mask & !self.pipe0_exclusive_mask()
         }
     }
-    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
-    /// Pipe 0 may claim any bit in `mask`; secondary pipes exclude [`Self::pipe0_exclusive_mask`]
-    /// so base-only and SCS VMs never contend with undisplaced secondary-pipe leases.
+    /// Bitmask of compute units that are currently the newest non-quarantined (`Published` or
+    /// `Retired`) publication on any compute pipe (`0..COMPUTE_PIPES`).
+    pub(crate) fn compute_tail_mask(&self) -> u32 {
+        self.compute.lifetime.pipe_tails_mask(usize::MAX)
+    }
+    /// Bitmask of compute pipes whose newest non-quarantined (`Published` or `Retired`)
+    /// publication is currently an owner inside `mask`.
+    pub(crate) fn compute_tail_pipes_in_mask(&self, mask: u32) -> u32 {
+        self.compute.lifetime.tail_pipes_in_mask(mask)
+    }
+    /// Whether `pipe`'s allowed submask of `mask` retains at least two healthy units clear of
+    /// other pipes' undisplaced tails (or the sole healthy unit when `<= 1` healthy unit exists
+    /// in `mask`), so running on `pipe` cannot strand a sparse VM's remaining units across two
+    /// different pipes.
+    pub(crate) fn compute_pipe_has_safe_pair(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let q = self.compute.lifetime.quarantined_mask();
+        let healthy_allowed = allowed & !q;
+        if healthy_allowed == 0 {
+            return false;
+        }
+        if (mask & !q).count_ones() <= 1 {
+            return true;
+        }
+        let other_tails = self.compute.lifetime.pipe_tails_mask(pipe);
+        (healthy_allowed & !other_tails).count_ones() >= 2
+    }
+    /// Whether `mask` has at least one compute pipe (`0..COMPUTE_PIPES`) retaining at least two
+    /// healthy units clear of every other pipe's tail in `tails`.
+    fn mask_has_safe_pipe_with_tails(
+        mask: u32,
+        q: u32,
+        p0_mask: u32,
+        tails: &[u8; 32],
+    ) -> bool {
+        let mut all_tails = 0u32;
+        for &k in &tails[..sizes::COMPUTE_PIPES] {
+            if k != u8::MAX {
+                all_tails |= 1u32 << k;
+            }
+        }
+        let healthy_p0 = mask & !q;
+        let healthy_sec = (mask & !p0_mask) & !q;
+        for p in 0..sizes::COMPUTE_PIPES {
+            let healthy_allowed = if p == 0 { healthy_p0 } else { healthy_sec };
+            if healthy_allowed == 0 {
+                continue;
+            }
+            let own_tail = if tails[p] != u8::MAX {
+                1u32 << tails[p]
+            } else {
+                0
+            };
+            let other_tails = all_tails & !own_tail;
+            if (healthy_allowed & !other_tails).count_ones() >= 2 {
+                return true;
+            }
+        }
+        false
+    }
+    /// Whether claiming `candidate` onto `pipe` (making it `pipe`'s new tail) would transition
+    /// any currently registered unpublished compute waiter from having a safe pipe to having none.
+    fn claim_strands_waiter_with_tails(
+        &self,
+        candidate: usize,
+        pipe: usize,
+        q: u32,
+        p0_mask: u32,
+        tails: &[u8; 32],
+    ) -> bool {
+        if q == 0 {
+            if self.compute_waiters.non_full_count.load(Ordering::Acquire) == 0 {
+                return false;
+            }
+        } else if self.compute_waiters.total_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let bit = 1u32 << candidate;
+        let mut tails_after = *tails;
+        tails_after[pipe] = candidate as u8;
+        let limit = self
+            .compute_waiters
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        for slot in &self.compute_waiters.slots.entries[..limit] {
+            let entry = slot.load(Ordering::Acquire);
+            if (entry as u32) == 0 {
+                continue;
+            }
+            let waiter_mask = (entry >> 32) as u32;
+            if (waiter_mask & bit) == 0 {
+                continue;
+            }
+            if (waiter_mask & !q).count_ones() >= FULL_SAFE_COMPUTE_UNITS {
+                continue;
+            }
+            if Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, tails)
+                && !Self::mask_has_safe_pipe_with_tails(waiter_mask, q, p0_mask, &tails_after)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    /// Submask of `candidates` whose claim onto `pipe` would strand a queued/pending compute job.
+    pub(crate) fn compute_stranding_mask_for_pipe(&self, pipe: usize, candidates: u32) -> u32 {
+        if candidates == 0 {
+            return 0;
+        }
+        let q = self.compute.lifetime.quarantined_mask();
+        if q == 0 {
+            if self.compute_waiters.non_full_count.load(Ordering::Acquire) == 0 {
+                return 0;
+            }
+        } else if self.compute_waiters.total_count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let limit = self
+            .compute_waiters
+            .scan_limit
+            .load(Ordering::Acquire)
+            .min(COMPUTE_WAITER_SLOTS);
+        let mut waiter_union = 0u32;
+        for slot in &self.compute_waiters.slots.entries[..limit] {
+            let entry = slot.load(Ordering::Acquire);
+            if (entry as u32) == 0 {
+                continue;
+            }
+            let waiter_mask = (entry >> 32) as u32;
+            if (waiter_mask & !q).count_ones() < FULL_SAFE_COMPUTE_UNITS {
+                waiter_union |= waiter_mask;
+            }
+        }
+        let mut rem = candidates & waiter_union;
+        if rem == 0 {
+            return 0;
+        }
+        let p0_mask = self.pipe0_exclusive_mask();
+        let tails = self.compute.lifetime.pipe_tails();
+        let mut blocked = 0u32;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS
+                && self.compute.lifetime.available(k)
+                && self.claim_strands_waiter_with_tails(k, pipe, q, p0_mask, &tails)
+            {
+                blocked |= 1u32 << k;
+            }
+        }
+        blocked
+    }
+    /// Verifies under `Shared::state` that `mask` currently has a safe compute pipe with at least
+    /// one non-stranding displacing unit, and atomically registers `mask` in `compute_waiters`.
+    /// Returns `Ok(Some(waiters))` when admitted, `Ok(None)` when a lost `prepare -> submit` race
+    /// left `mask` without a safe pipe (caller must drop `Shared::state`, refresh hints, and grow
+    /// `mask` with a non-tail unit), or `Err(EBUSY)` if the waiter table is full.
+    pub(crate) fn admit_compute_mask(&self, mask: u32) -> Result<Option<Arc<ComputeWaiters>>> {
+        let q = self.compute.lifetime.quarantined_mask();
+        let p0_mask = self.pipe0_exclusive_mask();
+        let tails = self.compute.lifetime.pipe_tails();
+        let mut all_tails = 0u32;
+        for &k in &tails[..sizes::COMPUTE_PIPES] {
+            if k != u8::MAX {
+                all_tails |= 1u32 << k;
+            }
+        }
+        let healthy_p0 = mask & !q;
+        let healthy_sec = (mask & !p0_mask) & !q;
+        let mut ok = false;
+        'pipes: for p in 0..sizes::COMPUTE_PIPES {
+            let healthy_allowed = if p == 0 { healthy_p0 } else { healthy_sec };
+            if healthy_allowed == 0 {
+                continue;
+            }
+            let own_tail = if tails[p] != u8::MAX {
+                1u32 << tails[p]
+            } else {
+                0
+            };
+            let other_tails = all_tails & !own_tail;
+            let safe_units = healthy_allowed & !other_tails;
+            if safe_units.count_ones() < 2 {
+                continue;
+            }
+            let mut displacing = safe_units & !own_tail;
+            while displacing != 0 {
+                let k = displacing.trailing_zeros() as usize;
+                displacing &= displacing - 1;
+                if !self.claim_strands_waiter_with_tails(k, p, q, p0_mask, &tails) {
+                    ok = true;
+                    break 'pipes;
+                }
+            }
+        }
+        if !ok {
+            return Ok(None);
+        }
+        self.compute_waiters.acquire(mask)?;
+        Ok(Some(self.compute_waiters.clone()))
+    }
+    /// Whether `pipe` currently has an available non-stranding unit in `mask` and satisfies
+    /// [`Self::compute_pipe_has_safe_pair`].
+    pub(crate) fn compute_pipe_safe_for_mask(&self, mask: u32, pipe: usize) -> bool {
+        self.compute_available_in_mask_for_pipe(mask, pipe)
+            && self.compute_pipe_has_safe_pair(mask, pipe)
+    }
+    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now without stranding
+    /// a queued/pending compute job. Pipe 0 may claim any bit in `mask`; secondary pipes exclude
+    /// [`Self::pipe0_exclusive_mask`] so base-only and SCS VMs never contend with undisplaced
+    /// secondary-pipe leases.
     pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
         let allowed = self.compute_allowed_for_pipe(mask, pipe);
-        self.compute_available_in_mask(allowed)
+        let blocked = self.compute_stranding_mask_for_pipe(pipe, allowed);
+        self.compute_available_in_mask(allowed & !blocked)
     }
     /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
     #[allow(dead_code)]
@@ -1477,9 +1823,11 @@ impl Slots {
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
         self.free_compute_in_for_pipe(n, 0)
     }
-    /// Available compute units in `mask` eligible for `pipe`.
+    /// Available compute units in `mask` eligible for `pipe` without stranding queued waiters.
     pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
-        let mut rem = self.compute_allowed_for_pipe(mask, pipe);
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
+        let blocked = self.compute_stranding_mask_for_pipe(pipe, allowed);
+        let mut rem = allowed & !blocked;
         let mut count = 0u32;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -1586,21 +1934,34 @@ impl Slots {
         let mask = units.compute_slot_mask()?;
         let p0_mask = self.pipe0_exclusive_mask();
         let allowed = if pipe == 0 { mask } else { mask & !p0_mask };
+        let allowed = allowed & !self.compute_stranding_mask_for_pipe(pipe, allowed);
         if allowed == 0 {
             return Ok(None);
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
-        // On pipe 0, prefer pipe-0-exclusive units before spilling into secondary-pipe units so
-        // concurrent secondary pipes keep maximum unit headroom.
-        let tiers: [u32; 2] = if pipe == 0 {
-            [allowed & p0_mask, allowed & !p0_mask]
+        // Prefer units whose pair partner (`k ^ 1`) is not currently the newest publication
+        // (tail) of another pipe `q != pipe` so deep bursts on one pipe avoid stranding another
+        // pipe's pair across two pipes; within pipe 0, prefer pipe-0-exclusive units first.
+        let other_tails = self.compute.lifetime.pipe_tails_mask(pipe);
+        let other_tail_partners =
+            ((other_tails & 0x5555_5555) << 1) | ((other_tails & 0xAAAA_AAAA) >> 1);
+        let pair_safe = allowed & !other_tail_partners;
+        let pair_borrow = allowed & other_tail_partners;
+        let tiers: [u32; 4] = if pipe == 0 {
+            [
+                pair_safe & p0_mask,
+                pair_borrow & p0_mask,
+                pair_safe & !p0_mask,
+                pair_borrow & !p0_mask,
+            ]
         } else {
-            [allowed, 0]
+            [pair_safe, pair_borrow, 0, 0]
         };
         let mut chosen = None;
         if let Some(id) = vm_id {
-            // 1. Reuse a warm unit already owned by `vm_id` (preferring pipe-0-exclusive units).
+            // 1. Reuse a warm unit already owned by `vm_id`, preferring pair-safe units
+            //    (and pipe-0-exclusive units on pipe 0).
             'warm: for tier in tiers {
                 if tier == 0 {
                     continue;
@@ -1638,7 +1999,7 @@ impl Slots {
                 }
             }
         }
-        // 3. Fall back to round-robin over any available unit (preferring pipe-0-exclusive).
+        // 3. Fall back to round-robin over any available unit (pair-safe first).
         if chosen.is_none() {
             'any: for tier in tiers {
                 if tier == 0 {

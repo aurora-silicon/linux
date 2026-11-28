@@ -108,7 +108,9 @@ impl FenceOrigin {
     fn mark_failed(&self) { self.failed.store(true,Ordering::Release); }
     fn is_failed(&self)->bool { self.failed.load(Ordering::Acquire) }
 }
-struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,origin:Arc<FenceOrigin>,fw_waits:Vec<Arc<FenceOrigin>>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
+struct Resources;
+impl Resources { fn release_active_computes(&self) {} fn release_compute_waiter(&self) {} }
+struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,resources:Resources,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,origin:Arc<FenceOrigin>,fw_waits:Vec<Arc<FenceOrigin>>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
 struct Shared { crashed:AtomicBool,sleeping:AtomicBool,recovering:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
 impl Shared {
     fn new()->Arc<Self> {
@@ -191,7 +193,7 @@ fn job_with_inputs(id:u64,status:Arc<Status>,inputs:Vec<InputFence>)->Arc<Job> {
 fn job_with_orders(id:u64,status:Arc<Status>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>)->Arc<Job> {
     let origin=FenceOrigin::new(queue.clone(),[None,Some(orders.len() as u64)]);
     Arc::new(Job{id,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
-        progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},started:AtomicBool::new(false),accepted:AtomicBool::new(true),
+        progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},started:AtomicBool::new(false),accepted:AtomicBool::new(true),resources:Resources,
         fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![();orders.len()],inputs,origin,fw_waits:vec![],orders,queue,
         full_retired:AtomicU64::new(0),terminal_retired:AtomicBool::new(false)})
 }
@@ -599,7 +601,7 @@ fn fw_wait_defers_until_producer_queue_publishes_and_propagates_failure() {
     let cons=Arc::new(Job{
         id:2,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
         progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},
-        started:AtomicBool::new(false),accepted:AtomicBool::new(true),
+        started:AtomicBool::new(false),accepted:AtomicBool::new(true),resources:Resources,
         fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![()],inputs:vec![],
         origin:FenceOrigin::new(q2.clone(),[None,Some(1)]),
         fw_waits:vec![prod.origin.clone()],orders:c_orders,queue:q2.clone(),
@@ -628,7 +630,7 @@ fn fw_wait_cancels_when_producer_queue_cancels_ordinal() {
     let cons=Arc::new(Job{
         id:2,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
         progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},
-        started:AtomicBool::new(false),accepted:AtomicBool::new(true),
+        started:AtomicBool::new(false),accepted:AtomicBool::new(true),resources:Resources,
         fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![()],inputs:vec![],
         origin:FenceOrigin::new(q2.clone(),[None,Some(1)]),
         fw_waits:vec![prod.origin.clone()],orders:c_orders,queue:q2,
