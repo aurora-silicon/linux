@@ -20,9 +20,13 @@ static void dcpaud_no_sio_put(void *data)
 
 static void dcpaud_no_sio_test(struct kunit *test)
 {
-	struct dcp_audio *dcpaud = kunit_kzalloc(test, sizeof(*dcpaud), GFP_KERNEL);
+	struct dcp_audio *dcpaud;
 	struct device *dev;
 
+	if (!IS_ENABLED(CONFIG_DMA_OF))
+		kunit_skip(test, "requires CONFIG_DMA_OF for DMA provider lookup");
+
+	dcpaud = kunit_kzalloc(test, sizeof(*dcpaud), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dcpaud);
 	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, audio_no_sio_test));
 	dev = kunit_device_register(test, "dcpaud-no-sio");
