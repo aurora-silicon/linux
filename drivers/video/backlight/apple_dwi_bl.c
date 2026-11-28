@@ -121,3 +121,7 @@ module_platform_driver(dwi_bl_driver);
 MODULE_DESCRIPTION("Apple DWI Backlight Driver");
 MODULE_AUTHOR("Nick Chan <towinchenmi@gmail.com>");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_BACKLIGHT_APPLE_DWI_KUNIT_TEST)
+#include "apple_dwi_bl-test.c"
+#endif

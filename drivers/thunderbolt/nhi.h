@@ -256,6 +256,10 @@ struct tb_nhi_ops {
  * and routers are enumerated with a 10 ms notification timeout.
  */
 #define QUIRK_CIO_MACOS_FRAMES				BIT(14)
+/* Reinitialize device-router TMUs in bi-directional HiFi mode. */
+#define QUIRK_TMU_HIFI_BI				BIT(15)
+/* Do not send USB4 retimer sideband scans on this domain's links. */
+#define QUIRK_NO_RETIMER_SCAN				BIT(16)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)

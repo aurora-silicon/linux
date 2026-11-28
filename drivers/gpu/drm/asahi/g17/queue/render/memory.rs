@@ -5,7 +5,7 @@
 
 use super::retirement::Cursors;
 use crate::g17::{
-    buffer::{self, target},
+    buffer::{self, compact::PairObject, target},
     context::Context,
     fw::{
         self, queue,
@@ -145,11 +145,14 @@ impl Graph {
             context.vm(),
             TA_BYTES..TA_BYTES + FRAGMENT_BYTES,
         )?) };
+        // Both firmware and host write queue records (in-place retargeting and
+        // work-slot binding on G17P, and zeroing on pool reuse everywhere). Keep
+        // the whole queue-state object uncached while retaining it in the pool.
         let mut queues = pool.allocate(
             alloc,
             Family::QueueState,
             GRAPH_SIZE,
-            0x8000,
+            0,
             prot,
             CpuMap::WriteCombined,
         )?;
@@ -319,23 +322,19 @@ struct Compact {
     address: u64,
     _backing: KernelObject,
 }
-/// The mesh storage chunk: chunk bases are 64 KiB aligned and the storage
-/// register counts 64 KiB chunks.
-const MESH_STORAGE_CHUNK: usize = 0x10000;
 
 impl Compact {
-    /// M5 shared-RW object in the compact window with an explicit VA alignment.
-    fn new_aligned(alloc: &Allocator<'_>, vm: &mmu::Vm, size: usize, align: u64) -> Result<Self> {
-        let size = size.checked_add(mmu::UAT_PGSZ - 1).ok_or(EOVERFLOW)? & !(mmu::UAT_PGSZ - 1);
+    /// M5: a shared-RW object of `size` bytes mapped in the client's compact window as `object`.
+    fn m5(alloc: &Allocator<'_>, vm: &mmu::Vm, object: PairObject, size: usize) -> Result<Self> {
+        let size = size.checked_next_multiple_of(mmu::UAT_PGSZ).ok_or(EOVERFLOW)?;
         let backing = KernelObject::backing(alloc.dev, size, CpuMap::WriteCombined)?;
-        let mapping = backing.map_range(vm, 0..size, buffer::BlockGeometry::M5_COMPACT,
-            align, mmu::PROT_GPU_SHARED_RW, mmu::UAT_PGSZ)?;
-        if mapping.iova() % align != 0 { return Err(EINVAL); }
+        let mapping = object.map(&backing, vm, 0..size, mmu::PROT_GPU_SHARED_RW)?;
         Ok(Self { address: mapping.iova(), mapping: Some(mapping), _backing: backing })
     }
+    /// Off M5: a shared-RW object of `size` bytes in a compact alias range.
     fn new(alloc: &Allocator<'_>, vm: &mmu::Vm, size: usize) -> Result<Self> {
         if alloc.uat.is_m5() {
-            return Self::new_aligned(alloc, vm, size, cfg::TVB_PAGE);
+            return Err(EINVAL);
         }
         let backing = KernelObject::backing(alloc.dev, size, CpuMap::WriteCombined)?;
         let mapping = buffer::compact_alias(
@@ -560,12 +559,10 @@ impl Memory {
         let state = Generation::allocate_state(alloc, vm, board)?;
         let (tvb, mappings, scratch, discard) = if m5 {
             let geometry = super::m5_render_submission::parameter_geometry(layout.tvb_blocks)?;
-            let bytes = fw::m5::pool::parameter_scratch_stride(geometry.capacity, 0)
-                .map_err(|_| EINVAL)?.checked_mul(fw::m5::pool::SCENE_TABLE_ENTRIES)
-                .ok_or(EOVERFLOW)?;
+            let bytes = buffer::compact::scratch_bytes(geometry)?;
             let (tvb, mappings) = buffer::Tvb::with_geometry(alloc.dev, vm, layout.tvb_blocks, geometry)?;
-            let scratch = Compact::new(alloc, vm, bytes)?;
-            let discard = Compact::new(alloc, vm, 0x8000)?;
+            let scratch = Compact::m5(alloc, vm, PairObject::Scratch, bytes)?;
+            let discard = Compact::m5(alloc, vm, PairObject::Discard, fw::m5::pool::DISCARD_BYTES)?;
             (tvb, mappings, scratch, discard)
         } else {
             let scratch = Compact::new(alloc, vm, cfg::SCENE_SIZE as usize)?;
@@ -603,6 +600,7 @@ impl Memory {
                 buffer_id: buffer_id.0,
                 generation: pm_generation,
                 first_ordinal: ordinal,
+                normal_blocks: variant.tvb_normal_blocks,
             },
         )?;
         let predecessor = crate::g17::ids::OBJECTS.object()?;
@@ -666,18 +664,17 @@ impl Memory {
         ))
     }
     /// The mesh storage register value of a task-stage kick. The buffer is
-    /// allocated on the queue's first such kick and kept for the queue's lifetime,
+    /// allocated on the pair's first such kick and kept for the pair's lifetime,
     /// so other contexts pay nothing. A failed allocation leaves no partial state.
-    /// A zero chunk parameter disables the binding.
+    /// A zero chunk parameter disables the binding. SUBMIT's compact-window bound
+    /// counts this buffer in every pair while the binding is enabled, since a pair
+    /// keeps it for the passes that follow.
     pub(super) fn mesh_storage_register(&mut self, alloc: &Allocator<'_>) -> Result<u64> {
         if self.mesh_storage.is_none() {
-            let chunks = crate::module_parameters::m5_mesh_storage_chunks.value();
-            if chunks == 0 { return Ok(0); }
-            if chunks > 0xffff { return Err(EINVAL); }
-            let bytes = (chunks as usize).checked_mul(MESH_STORAGE_CHUNK).ok_or(EOVERFLOW)?;
-            let storage = Compact::new_aligned(alloc, self.context.vm(), bytes,
-                MESH_STORAGE_CHUNK as u64)?;
-            self.mesh_storage = Some(storage);
+            let Some((chunks, bytes)) = buffer::compact::mesh_storage()? else { return Ok(0); };
+            let vm = self.context.vm();
+            PairObject::MeshStorage.check_room(vm, bytes, 1)?;
+            self.mesh_storage = Some(Compact::m5(alloc, vm, PairObject::MeshStorage, bytes)?);
             self.mesh_storage_chunks = chunks;
         }
         let storage = self.mesh_storage.as_ref().ok_or(ENOMEM)?;
@@ -1061,6 +1058,7 @@ impl Memory {
                     pointer.write_unaligned(value);
                 }
             }
+            core::sync::atomic::fence(Ordering::Release);
             return Ok(());
         }
         let offsets = qids.map(|qid| usize::from(qid) * size_of::<queue::QueueRecord>());
@@ -1105,6 +1103,7 @@ impl Memory {
                 }
             }
         }
+        core::sync::atomic::fence(Ordering::Release);
         Ok(())
     }
 }

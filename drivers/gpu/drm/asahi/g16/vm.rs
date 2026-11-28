@@ -28,7 +28,7 @@
 //! alike.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{
     drm::gem::BaseObject,
     new_mutex,
@@ -134,8 +134,31 @@ pub(crate) struct VmStateInner {
     /// Private mappings are kept outside generic close's user GPUVA teardown.
     context_mappings: KVec<mmu::KernelMapping>,
     pub(crate) resources: Option<Arc<super::resources::Cache>>,
+    /// Set once a multisampled render pass of this VM becomes visible ([`Self::renders_msaa`]).
+    renders_msaa: AtomicBool,
     #[allow(dead_code)]
     pub(crate) live: Arc<LiveToken>,
+}
+
+impl VmStateInner {
+    /// Whether renders this VM's SUBMITs accepted are not yet published.
+    pub(crate) fn renders_unpublished(&self) -> bool {
+        self.resources
+            .as_ref()
+            .is_some_and(|cache| cache.renders_unpublished())
+    }
+
+    /// Whether this VM has published a multisampled render pass. Its later passes can still
+    /// read multisampled images (an attachmentless pass reading them as input attachments is
+    /// single-sampled), so the property is the VM's from then on.
+    pub(crate) fn renders_msaa(&self) -> bool {
+        self.renders_msaa.load(Ordering::Relaxed)
+    }
+
+    /// Records that a multisampled render pass of this VM became visible to the firmware.
+    pub(crate) fn note_msaa_render(&self) {
+        self.renders_msaa.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for VmStateInner {
@@ -254,6 +277,11 @@ impl Registry {
             let index = vms.iter().position(|state| state.id == id);
             index.and_then(|index| vms.remove(index).ok())
         };
+        // Arenas still reachable by firmware stay with the slot leases and jobs that hold
+        // them; the rest (and the spare epochs, which hold the VM) go now.
+        if let Some(cache) = state.as_ref().and_then(|state| state.resources.as_ref()) {
+            cache.close();
+        }
         drop(state);
     }
 
@@ -268,8 +296,12 @@ impl Registry {
             let Some(closed) = closed else {
                 break;
             };
-            // No allocation while holding the registry lock, which fail_all() also needs.
-            // Final VM destruction is deferred independently of this caller's locks.
+            // Break the spare-epoch cycle before releasing the registry reference, matching
+            // close(). No allocation while holding the registry lock, which fail_all() also
+            // needs. Final VM destruction is deferred independently of this caller's locks.
+            if let Some(cache) = closed.resources.as_ref() {
+                cache.close();
+            }
             drop(closed);
         }
     }
@@ -330,6 +362,15 @@ impl Registry {
             .find(|state| state.id == id)
             .cloned()
             .ok_or(ENOENT)
+    }
+
+    /// The VM id of a live VM currently bound to TTBAT `slot`, if any.
+    pub(crate) fn find_by_slot(&self, slot: u32) -> Option<u64> {
+        self.vms
+            .lock()
+            .iter()
+            .find(|state| state.slot == slot)
+            .map(|state| state.id)
     }
 
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
@@ -397,6 +438,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         factory,
         live.bind.as_ref().ok_or(EIO)?.clone(),
         live.clone(),
+        gpu.shared.clone(),
     )?;
     let inner = VmStateInner {
         id,
@@ -406,6 +448,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         vm: vm.clone(),
         context_mappings: mappings,
         resources: Some(resources),
+        renders_msaa: AtomicBool::new(false),
         live,
     };
     let state = Arc::new(VmState(crate::cleanup::Deferred::new(inner)?), GFP_KERNEL)?;

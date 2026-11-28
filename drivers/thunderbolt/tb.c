@@ -247,6 +247,10 @@ static int tb_enable_clx(struct tb_switch *sw)
 	if (tb_switch_depth(sw) != 1)
 		return 0;
 
+	/* Bi-directional HiFi (non-USB4 routers, see tb_enable_tmu()) does not support CL states. */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && !tb_switch_is_usb4(sw))
+		return 0;
+
 	/*
 	 * If we are re-enabling then check if there is an active DMA
 	 * tunnel and in that case bail out.
@@ -363,6 +367,21 @@ static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
 
+	/*
+	 * Not for USB4 routers: a host router whose firmware runs its TMU applies a mode only
+	 * on the enhanced uni-directional path below, and a dock's DP OUT has no clock without it.
+	 */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && tb_route(sw) &&
+	    !tb_switch_is_usb4(sw)) {
+		ret = tb_switch_clx_disable(sw);
+		if (ret < 0)
+			return ret;
+		ret = tb_switch_tmu_configure(sw, TB_SWITCH_TMU_MODE_HIFI_BI);
+		if (ret)
+			return ret;
+		goto reenable;
+	}
+
 	/* The host router's firmware runs its TMU on these hosts. */
 	if (!tb_route(sw) && tb_switch_tmu_host_managed(sw))
 		return 0;
@@ -409,6 +428,7 @@ static int tb_enable_tmu(struct tb_switch *sw)
 	if (tb_switch_tmu_is_enabled(sw))
 		return 0;
 
+reenable:
 	ret = tb_switch_tmu_disable(sw);
 	if (ret)
 		return ret;

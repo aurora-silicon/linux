@@ -63,6 +63,10 @@ mod keybag {
 mod attach {
 ALLOW
 }
+mod diag {
+    pub enum Trusted { Ready }
+    pub fn trusted(_: Trusted) {}
+}
 struct SepData {
     identity_keybag: Cache,
     keystore_only: AtomicBool,

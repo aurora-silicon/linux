@@ -22,9 +22,12 @@ SEP = "/soc/sep@29e400000"
 BUS = "/soc/spi@2a1108000"
 SENSOR = BUS + "/fingerprint@0"
 PINCTRL_NUB = "/soc/pinctrl@2e41f0000"
+PINCTRL_AP = "/soc/pinctrl@2c7100000"
 MBOX = "/soc/mbox@29e408000"
 # AIC_IRQ cells: <type irq flags>, IRQ_TYPE_LEVEL_HIGH = 4.
 LEVEL_HIGH = 4
+# GPIO interrupt cells: <pin flags>, IRQ_TYPE_EDGE_RISING = 1.
+EDGE_RISING = 1
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in ("cpp", DTC, "fdtget")),
@@ -82,8 +85,10 @@ class T8122SepTest(unittest.TestCase):
                 properties = self.props(dtb, SENSOR)
                 self.assertIn("spi-cpha", properties)
                 self.assertNotIn("spi-cpol", properties)
-                self.assertNotIn("interrupts", properties)
-                self.assertNotIn("interrupts-extended", properties)
+                # Data-ready on AP GPIO 199, rising edge, as on J713 and J616s.
+                ap = int(self.prop(dtb, PINCTRL_AP, "phandle")[0], 16)
+                self.assertEqual(self.cells(dtb, SENSOR, "interrupt-parent"), [ap])
+                self.assertEqual(self.cells(dtb, SENSOR, "interrupts"), [199, EDGE_RISING])
                 self.assertNotIn("cs-gpios", self.props(dtb, BUS))
 
     def cells(self, dtb, node, name):

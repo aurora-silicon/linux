@@ -939,6 +939,7 @@ static int watchdog_release(struct inode *inode, struct file *file)
 	struct watchdog_core_data *wd_data = file->private_data;
 	struct watchdog_device *wdd;
 	int err = -EBUSY;
+	bool allow_release;
 	bool running;
 
 	mutex_lock(&wd_data->lock);
@@ -951,11 +952,16 @@ static int watchdog_release(struct inode *inode, struct file *file)
 	 * We only stop the watchdog if we received the magic character
 	 * or if WDIOF_MAGICCLOSE is not set. If nowayout was set then
 	 * watchdog_stop will fail.
+	 *
+	 * The magic character only allows this release. Consume it even
+	 * if the watchdog was already stopped (WDIOS_DISABLECARD before
+	 * the magic close), so that it cannot stop the watchdog when the
+	 * next opener closes the device without it.
 	 */
+	allow_release = test_and_clear_bit(_WDOG_ALLOW_RELEASE, &wd_data->status);
 	if (!watchdog_active(wdd))
 		err = 0;
-	else if (test_and_clear_bit(_WDOG_ALLOW_RELEASE, &wd_data->status) ||
-		 !(wdd->info->options & WDIOF_MAGICCLOSE))
+	else if (allow_release || !(wdd->info->options & WDIOF_MAGICCLOSE))
 		err = watchdog_stop(wdd);
 
 	/* If the watchdog was not stopped, send a keepalive ping */

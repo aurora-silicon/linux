@@ -6,8 +6,8 @@
  * runs the MCA serializers: "cout"/"cin" (CS42L84 headphone jack) on
  * admac-base-ns TX2/RX2 and "spkr" (four SN012776) on TX0, their V/I sense
  * on RX0 (ADT iop-audio-controller; RX1 is the firmware's speaker tap).
- * The AOP itself is laid out like T8140's (ascwrap-v6, asc-mailbox-v4),
- * including the setup port.
+ * The AOP core, its mailboxes and dart-aop are shared by every T8142 board
+ * (t8142-peripherals.dtsi); this file adds only its audio service.
  * Addresses are from the J813 ADT (arm-io offset 0x210000000).
  */
 
@@ -172,52 +172,6 @@
 		};
 	};
 
-	aop_mbox: mailbox@390608000 {
-		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x3 0x90608000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 490 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 491 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 493 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-				  "recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-	};
-
-	/*
-	 * The ADT's aop-exclave-mailbox, flagged exclave-assigned as on T8140,
-	 * is the AOP setup port the host drives. Its ADT reg (0x3d067c000) is
-	 * not behind the arm-io translation: AOP ASC + 0x4007c000, as on
-	 * T8140. ADT interrupts [497, 494], T8140's +100.
-	 */
-	aop_setup_mbox: mailbox@3d067c000 {
-		compatible = "apple,t8142-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
-		reg = <0x3 0xd067c000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 497 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "recv-not-empty";
-		/* dart-aop stream 1: ADT vm-base-1 0x20000000000, as on T8140. */
-		iommus = <&aop_dart 1>;
-		apple,dma-range = <0x200 0x0 0x10 0x0>;
-		#mbox-cells = <0>;
-	};
-
-	/*
-	 * dart-aop: streams 0 (AOP), 3, 8 (admac-base-ns), 10 and 16 are the
-	 * AP's; 1, 9 and 11 are exclave streams, of which the host drives 1
-	 * (setup port) and 11 (admac-leap-s) on the raw boot. As on T8140, the
-	 * firmware's own mappings own the first slot, host buffers go above it.
-	 */
-	aop_dart: iommu@390fc0000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x3 0x90fc0000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
-	};
-
 	admac_base_ns: dma-controller@393800000 {
 		compatible = "apple,t8140-admac";
 		reg = <0x3 0x93800000 0x0 0x34000>;
@@ -337,37 +291,28 @@
 			ti,bclk-ratio = <250>;
 		};
 	};
+};
 
-	aop: aop@390c00000 {
-		compatible = "apple,t8142-aop", "apple,t8152-aop";
-		reg = <0x3 0x90c00000 0x0 0x1e0000>,
-		      <0x3 0x90600000 0x0 0x4000>;
-		reg-names = "mmio", "asc";
-		mboxes = <&aop_mbox>, <&aop_setup_mbox>;
-		mbox-names = "mbox", "setup";
-		iommus = <&aop_dart 0>;
-		apple,dma-range = <0x110 0x0 0x10 0x0>;
-
-		aop_audio: audio {
-			compatible = "apple,t8142-aop-audio", "apple,t8152-aop-audio";
-			/* The microphone card's name: AppleJ813HPAI. */
-			apple,chassis-name = "J813";
-			apple,machine-kind = "MacBook Air";
-			/* hpai: leap-s RX0 (Linux channel 1, odd = DEV_TO_MEM). */
-			dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
-			       <&admac_base_ns 0>, <&admac_base_ns 1>,
-			       <&admac_leap_s 1>;
-			dma-names = "cout", "cin", "spkr", "sense", "hpai";
-			power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
-					<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
-					<&ps_audio_mca4_m>, <&ps_audio_mca5_m>,
-					<&ps_audio_leap_s_a>, <&ps_audio_leap_rx0>,
-					<&ps_audio_leap_mca>;
-			power-domain-names = "mca0", "mca1", "mca2",
-					     "mca3", "mca4", "mca5",
-					     "leap_s_a", "leap_rx0", "leap_mca";
-			#sound-dai-cells = <1>;
-		};
+&aop {
+	aop_audio: audio {
+		compatible = "apple,t8142-aop-audio", "apple,t8152-aop-audio";
+		/* The microphone card's name: AppleJ813HPAI. */
+		apple,chassis-name = "J813";
+		apple,machine-kind = "MacBook Air";
+		/* hpai: leap-s RX0 (Linux channel 1, odd = DEV_TO_MEM). */
+		dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+		       <&admac_base_ns 0>, <&admac_base_ns 1>,
+		       <&admac_leap_s 1>;
+		dma-names = "cout", "cin", "spkr", "sense", "hpai";
+		power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
+				<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
+				<&ps_audio_mca4_m>, <&ps_audio_mca5_m>,
+				<&ps_audio_leap_s_a>, <&ps_audio_leap_rx0>,
+				<&ps_audio_leap_mca>;
+		power-domain-names = "mca0", "mca1", "mca2",
+				     "mca3", "mca4", "mca5",
+				     "leap_s_a", "leap_rx0", "leap_mca";
+		#sound-dai-cells = <1>;
 	};
 };
 

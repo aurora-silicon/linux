@@ -51,7 +51,14 @@ case "$(cat /sys/module/apple_sep/parameters/keystore_only 2>/dev/null || true)"
             exit 1
         fi
         ;;
-    *) modprobe apple_sep xart_writes=1 provision_keybag=1 ;;
+    *)
+        # No options: SEP writes are always on, so there is nothing to set
+        # (xart_writes and provision_keybag were removed,
+        # aurora-silicon/linux#2591). Passing them here also gave each one
+        # twice next to a stale apple_sep.xart_writes= on the kernel command
+        # line, and kernels before #2591 then refused to load the driver.
+        modprobe apple_sep
+        ;;
 esac
 
 work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
@@ -78,6 +85,31 @@ guard_refused() {
     [ -n "$refusals" ] && [ "$refusals" != 0 ]
 }
 
+guard_exit() {
+    log "the xART guard refused a record the enclave needs to unlock Linux's keybag. After a boot policy change (a new Stage 1 or boot object) the driver lets that one update through by itself; this one it could not. Touch ID and its fingerprints are intact. To allow it on the next boot, run aurora-sep-policy-change and reboot; see XART-SAFETY.md"
+    exit 1
+}
+
+# The driver's diag/trusted reads "refused <status>" once the enclave has
+# answered the identity key-bag unlock that every seal and unseal needs with a
+# refusal. That is the enclave's decision on this bag, not a slow bring-up:
+# asking again at 10 Hz until the deadline only repeats it (about 1200 refused
+# seals and kernel warnings per run). Kernels without the attribute read empty
+# here and keep the old behaviour.
+trusted_refused() {
+    [ -n "$diag" ] || return 1
+    trusted=$(cat "$diag/trusted" 2>/dev/null || true)
+    case "$trusted" in
+        refused*) return 0 ;;
+    esac
+    return 1
+}
+
+refused_exit() {
+    log "the enclave refused to unlock the identity key bag that trusted keys need (diag/trusted: $trusted). Asking again gets the same answer, so this run stops here; trusted keys are unavailable this boot. The key bag and ref-key are left as they are: do not replace them to get past this"
+    exit 1
+}
+
 start=$(uptime_s)
 deadline=$((start + ready_timeout))
 
@@ -96,6 +128,16 @@ for keystore in /sys/bus/platform/drivers/apple_sep/*/diag/keystore; do
     done
 done
 
+# A run started again this boot (fprintd's dependency starts this unit on
+# every activation) needs no probe to learn the answer. When the xART guard
+# refused too, its message names the way out, so it comes first, as below.
+if trusted_refused; then
+    if guard_refused; then
+        guard_exit
+    fi
+    refused_exit
+fi
+
 verified=false
 while :; do
     key_id=$(printf 'new 32' | keyctl padd trusted aurora-sep-check @s 2>/dev/null || true)
@@ -112,8 +154,10 @@ while :; do
     fi
     [ "$verified" = true ] && break
     if guard_refused; then
-        log "the xART guard refused a record the enclave needs to unlock Linux's keybag. After a boot policy change (a new Stage 1 or boot object) the driver lets that one update through by itself; this one it could not. Touch ID and its fingerprints are intact. To allow it on the next boot, run aurora-sep-policy-change and reboot; see XART-SAFETY.md"
-        exit 1
+        guard_exit
+    fi
+    if trusted_refused; then
+        refused_exit
     fi
     [ "$(uptime_s)" -lt "$deadline" ] || break
     sleep 0.1

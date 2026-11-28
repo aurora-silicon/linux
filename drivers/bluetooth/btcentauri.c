@@ -49,9 +49,13 @@ static bool arm_le_data_rings = true;
 module_param(arm_le_data_rings, bool, 0444);
 MODULE_PARM_DESC(arm_le_data_rings, "Arm native Beta LE rings for radio bring-up");
 
-static bool arm_auxiliary_rings;
+static bool arm_auxiliary_rings = true;
 module_param(arm_auxiliary_rings, bool, 0444);
-MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta resources and capture received frames privately");
+MODULE_PARM_DESC(arm_auxiliary_rings, "Arm Beta's ACL data rings");
+
+static bool diagnostic_capture;
+module_param(diagnostic_capture, bool, 0444);
+MODULE_PARM_DESC(diagnostic_capture, "Diagnostic: arm every auxiliary ring and capture received frames privately; requires the auxiliary rings");
 
 static bool native_startup;
 module_param(native_startup, bool, 0444);
@@ -73,7 +77,7 @@ static bool accept_list;
 module_param(accept_list, bool, 0444);
 MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
 
-static bool enable_acl;
+static bool enable_acl = true;
 module_param(enable_acl, bool, 0444);
 MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
 
@@ -90,8 +94,8 @@ struct cen_aux_spec {
 	bool receive;
 };
 
-/* Host native Beta inventory; each resource is opt-in until target-qualified.
- * HCI and LE rings remain in their existing, separately qualified arenas.
+/* Beta's auxiliary rings. Only the ACL rings (2 and 8) are armed by default; the
+ * others only with diagnostic_capture. HCI and LE rings have their own arenas.
  */
 static const struct cen_aux_spec cen_aux_specs[] = {
 	{ 2, 9, 2592, false }, /* ACL TX */
@@ -110,6 +114,7 @@ static const struct cen_aux_spec cen_aux_specs[] = {
 struct cen_aux_state {
 	u32 offset, packets;
 	u16 head, post;
+	bool opened;
 };
 
 struct cen_bt {
@@ -137,6 +142,14 @@ struct cen_bt {
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
 	u32 scan_dup_rewritten, accept_list_hidden;
+	bool transport_paused, transport_sleep_sent;
+	/* MSI backed by a DMA buffer, outside the PCI core's IRQ allocation. */
+	struct {
+		u32 lo, hi;
+		u16 flags, data;
+		u8 cap;
+		bool saved;
+	} sleep_msi;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -310,11 +323,14 @@ static int cen_aux_start(struct cen_bt *bt)
 			return -ENOSPC;
 		state->offset = offset;
 		offset = ALIGN(offset + length, SZ_4K);
+		if (!diagnostic_capture && spec->id != 2 && spec->id != 8)
+			continue;
 		ret = cen_open_ring(bt, spec->id, spec->slots, state->offset, spec->footer);
 		if (ret) {
 			dev_err(&bt->pdev->dev, "Auxiliary ring %u open failed: %d\n", spec->id, ret);
 			return ret;
 		}
+		state->opened = true;
 		if (!spec->receive)
 			continue;
 		for (slot = 0; slot < spec->slots - 1; slot++)
@@ -335,7 +351,7 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 		u16 tail;
 		int budget = spec->slots;
 
-		if (!spec->receive)
+		if (!state->opened || !spec->receive)
 			continue;
 		tail = cen_tail(bt, spec->id);
 		if (tail >= spec->slots)
@@ -539,7 +555,7 @@ static void cen_poll(struct work_struct *work)
 	int budget = CEN_RX_SLOTS;
 
 	mutex_lock(&bt->lock);
-	if (!bt->running)
+	if (!bt->running || bt->transport_paused)
 		goto unlock;
 	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2) {
 		/* Preserve already completed diagnostics after abort, without posting
@@ -913,6 +929,11 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   readl(bt->bar + 0x18), readl(bt->bar), bt->running,
 		   bt->tx_head, cen_tail(bt, 1), bt->rx_head, cen_tail(bt, 7),
 		   skb_queue_len(&bt->txq));
+	seq_printf(s, "peripheral_exec=%u peripheral_ipc=%u sleep_status=%u transport_paused=%u\n",
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x68))),
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x6c))),
+		   le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x70))),
+		   bt->transport_paused);
 	seq_printf(s, "commands=%u events=%u tx_bytes=%u rx_bytes=%u tx_errors=%u rx_errors=%u\n",
 		   bt->hdev->stat.cmd_tx, bt->hdev->stat.evt_rx,
 		   bt->hdev->stat.byte_tx, bt->hdev->stat.byte_rx,
@@ -938,7 +959,7 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);
 	if (arm_auxiliary_rings)
 		for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++)
-			if (cen_aux_specs[i].receive)
+			if (cen_aux_specs[i].receive && bt->aux[i].opened)
 				seq_printf(s, "aux_rx ring=%u packets=%u consumed=%u device_tail=%u\n",
 					   cen_aux_specs[i].id, bt->aux[i].packets,
 					   bt->aux[i].head, cen_tail(bt, cen_aux_specs[i].id));
@@ -994,9 +1015,15 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct cen_bt *bt;
 	struct hci_dev *hdev;
 	int ret;
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
 
-	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j815") ||
-	      of_machine_is_compatible("apple,j873g")) ||
+	/*
+	 * The T6050 transport (btcentauri_t6050.c) owns every N1 function behind
+	 * an "apple,t6050-pcie" host, as in centauri_pci.c. Any other host is
+	 * ours; the firmware and IPC state are checked below.
+	 */
+	if ((bridge && bridge->dev.parent &&
+	     of_device_is_compatible(bridge->dev.parent->of_node, "apple,t6050-pcie")) ||
 	    PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
@@ -1008,6 +1035,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->acl_txq);
 	skb_queue_head_init(&bt->le_txq);
 	if (enable_acl && (!arm_le_data_rings || !arm_auxiliary_rings))
+		return -EINVAL;
+	if (diagnostic_capture && !arm_auxiliary_rings)
 		return -EINVAL;
 	if (native_hrb && (!native_startup || !enable_acl))
 		return -EINVAL;
@@ -1021,10 +1050,15 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 	bt->bar = pcim_iomap_table(pdev)[0];
-	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0)
-		return dev_err_probe(&pdev->dev, -EBUSY,
-				     "Beta requires running firmware and unowned IPC (exec=%u ipc=%u)\n",
-				     readl(bt->bar + 0x18), readl(bt->bar));
+	/*
+	 * The function appears with the N1's IPC start, before Beta's firmware runs.
+	 * apple_centauri attaches it again once that firmware is up.
+	 */
+	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0) {
+		dev_info(&pdev->dev, "waiting for Beta's firmware (exec=%u ipc=%u)\n",
+			 readl(bt->bar + 0x18), readl(bt->bar));
+		return -ENXIO;
+	}
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
@@ -1032,7 +1066,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!bt->arena)
 		return -ENOMEM;
 	memset(bt->arena, 0, CEN_ARENA_SIZE);
-	if (arm_auxiliary_rings) {
+	if (diagnostic_capture) {
 		bt->capture = kvzalloc(CEN_CAPTURE_SIZE, GFP_KERNEL);
 		if (!bt->capture) {
 			ret = -ENOMEM;
@@ -1104,27 +1138,135 @@ static void cen_remove(struct pci_dev *pdev)
  * bus mastering off, and the next poll stopped the transport for good) and
  * the PCIe host powered. Polling pauses across the sleep.
  */
+/*
+ * 26B123 AirshipDK: Beta sleep_control is BAR0 + 0x1078. Host sleep
+ * writes 3 and waits for peripheral_info.sleep_status == 3; wake writes
+ * 0 and waits for status 0 (active) or 1 (device sleep). The peripheral
+ * info block is at context + 0x68, with sleep_status at +8.
+ *
+ * Qualified on J813 with the installed Linux firmware.
+ * All ring doorbells must stay paused until the wake acknowledgment.
+ */
+static u32 cen_sleep_status(struct cen_bt *bt)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(bt->arena + 0x70)));
+}
+
+static int cen_transport_state(struct cen_bt *bt, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, bt->bar + 0x1078);
+	ret = read_poll_timeout(cen_sleep_status, status,
+				asleep ? status == 3 : status <= 1,
+				100, 2000000, false, bt);
+	dma_rmb();
+	dev_dbg(&bt->pdev->dev,
+		"ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(bt->bar + 0x18), readl(bt->bar));
+	return ret;
+}
+
+static int cen_resume(struct device *dev);
+
 static int cen_suspend(struct device *dev)
 {
 	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	struct pci_dev *pdev = bt->pdev;
+	u16 flags;
+	int cap, ret;
 
+	mutex_lock(&bt->lock);
+	bt->transport_paused = true;
+	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
+	/*
+	 * Tell Beta's firmware the host is going to sleep on every N1 board, as
+	 * Alpha does. Only a running firmware can take the request; one that
+	 * isn't running has nothing to quiesce.
+	 */
+	if (bt->ipc_requested && readl(bt->bar + 0x18) == 2 &&
+	    readl(bt->bar) == 2) {
+		bt->transport_sleep_sent = true;
+		ret = cen_transport_state(bt, true);
+		if (ret)
+			goto undo;
+	}
+	bt->sleep_msi.saved = false;
+	cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
+	if (cap && !pdev->msi_enabled &&
+	    !pci_read_config_word(pdev, cap + PCI_MSI_FLAGS, &flags) &&
+	    (flags & PCI_MSI_FLAGS_ENABLE) && (flags & PCI_MSI_FLAGS_64BIT)) {
+		bt->sleep_msi.cap = cap;
+		bt->sleep_msi.flags = flags;
+		bt->sleep_msi.saved =
+			!pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_LO, &bt->sleep_msi.lo) &&
+			!pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_HI, &bt->sleep_msi.hi) &&
+			!pci_read_config_word(pdev, cap + PCI_MSI_DATA_64, &bt->sleep_msi.data);
+	}
+	dev_dbg(dev, "Beta suspend exec=%x ipc=%x fallback MSI saved=%d\n",
+		readl(bt->bar + 0x18), readl(bt->bar), bt->sleep_msi.saved);
 	device_set_awake_path(dev);
-	return pci_save_state(to_pci_dev(dev));
+	ret = pci_save_state(pdev);
+	if (!ret)
+		return 0;
+undo:
+	cen_resume(dev);
+	return ret;
+}
+
+static int cen_resume_noirq(struct device *dev)
+{
+	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	struct pci_dev *pdev = bt->pdev;
+	int cap = bt->sleep_msi.cap;
+
+	dev_dbg(dev, "Beta noirq exec=%x ipc=%x fallback MSI saved=%d\n",
+		readl(bt->bar + 0x18), readl(bt->bar), bt->sleep_msi.saved);
+	/*
+	 * PERST clears MSI. The PCI core only restores vectors it allocated;
+	 * Centauri's DMA-backed MSI mailbox is programmed directly by the
+	 * Control driver. Restore it before interrupts and polling resume.
+	 */
+	if (bt->sleep_msi.saved && !pdev->msi_enabled) {
+		pci_write_config_word(pdev, cap + PCI_MSI_FLAGS,
+				      bt->sleep_msi.flags & ~PCI_MSI_FLAGS_ENABLE);
+		pci_write_config_dword(pdev, cap + PCI_MSI_ADDRESS_LO, bt->sleep_msi.lo);
+		pci_write_config_dword(pdev, cap + PCI_MSI_ADDRESS_HI, bt->sleep_msi.hi);
+		pci_write_config_word(pdev, cap + PCI_MSI_DATA_64, bt->sleep_msi.data);
+		pci_write_config_word(pdev, cap + PCI_MSI_FLAGS, bt->sleep_msi.flags);
+	}
+	return 0;
 }
 
 static int cen_resume(struct device *dev)
 {
 	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+	int ret;
 
+	if (bt->transport_sleep_sent) {
+		ret = cen_transport_state(bt, false);
+		if (ret)
+			return ret;
+		bt->transport_sleep_sent = false;
+	}
 	mutex_lock(&bt->lock);
+	bt->transport_paused = false;
 	if (bt->running)
 		schedule_delayed_work(&bt->poll, 0);
 	mutex_unlock(&bt->lock);
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(cen_pm_ops, cen_suspend, cen_resume);
+static const struct dev_pm_ops cen_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(cen_suspend, cen_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, cen_resume_noirq)
+};
 
 static const struct pci_device_id cen_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903) },

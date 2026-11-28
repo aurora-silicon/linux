@@ -131,9 +131,11 @@ static void panelav_open_worker(struct work_struct *work)
 	if (ret)
 		dev_warn(service->ep->dcp->dev, "panel AV: video interface %u OPEN failed: %d\n",
 			 service->channel, ret);
-	else
+	else {
+		complete(&service->ep->dcp->v27_wake_video);
 		dev_info(service->ep->dcp->dev, "panel AV: video interface %u opened\n",
 			 service->channel);
+	}
 	afk_service_put(service);
 	kfree(w);
 }
