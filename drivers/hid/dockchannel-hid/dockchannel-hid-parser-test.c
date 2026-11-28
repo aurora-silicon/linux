@@ -99,6 +99,58 @@ static void dchid_ack_copy_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, response, ((u8[]){ 0xa5, 1, 2, 0xa5 }), sizeof(response));
 }
 
+static void dchid_ack_retired_cmd_test(struct kunit *test)
+{
+	struct dchid_iface *iface = test->priv;
+	struct dchid_hdr hdr = { .length = sizeof(struct dchid_subhdr) + 2, .seq = 7 };
+	struct {
+		struct dchid_subhdr sub;
+		u8 data[2];
+	} __packed ack = {
+		.sub = { .flags = 0x80, .length = 2, .retcode = 3 },
+		.data = { 0x10, 0x42 },
+	};
+	u8 response = 0xa5;
+
+	iface->resp_buf = &response;
+	iface->resp_size = sizeof(response);
+	dchid_retire_cmd(iface);
+
+	/* A reply after timeout cannot complete or write to the retired buffer. */
+	dchid_handle_ack(iface, &hdr, &ack);
+	KUNIT_EXPECT_FALSE(test, completion_done(&iface->out_complete));
+	KUNIT_EXPECT_EQ(test, response, 0xa5);
+	KUNIT_EXPECT_PTR_EQ(test, iface->resp_buf, NULL);
+	KUNIT_EXPECT_EQ(test, iface->resp_size, 0U);
+	KUNIT_EXPECT_EQ(test, iface->out_report, -1);
+	KUNIT_EXPECT_EQ(test, iface->out_flags, 0U);
+	KUNIT_EXPECT_EQ(test, iface->tx_seq, 8);
+	KUNIT_EXPECT_EQ(test, iface->retcode, 0U);
+
+	/* The next command reuses the report ID and buffer, but not the sequence. */
+	spin_lock(&iface->resp_lock);
+	iface->out_report = ack.data[0];
+	iface->out_flags = ack.sub.flags;
+	iface->resp_buf = &response;
+	iface->resp_size = sizeof(response);
+	reinit_completion(&iface->out_complete);
+	spin_unlock(&iface->resp_lock);
+	dchid_handle_ack(iface, &hdr, &ack);
+	KUNIT_EXPECT_FALSE(test, completion_done(&iface->out_complete));
+	KUNIT_EXPECT_EQ(test, response, 0xa5);
+	KUNIT_EXPECT_EQ(test, iface->out_report, 0x10);
+	KUNIT_EXPECT_EQ(test, iface->resp_size, sizeof(response));
+	KUNIT_EXPECT_EQ(test, iface->retcode, 0U);
+
+	hdr.seq = iface->tx_seq;
+	dchid_handle_ack(iface, &hdr, &ack);
+	KUNIT_EXPECT_TRUE(test, completion_done(&iface->out_complete));
+	KUNIT_EXPECT_EQ(test, response, 0x42);
+	KUNIT_EXPECT_EQ(test, iface->out_report, -1);
+	KUNIT_EXPECT_EQ(test, iface->resp_size, 2U);
+	KUNIT_EXPECT_EQ(test, iface->retcode, 3U);
+}
+
 static void dchid_init_bounds_test(struct kunit *test)
 {
 	struct dchid_iface *iface = test->priv;
@@ -450,6 +502,7 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_ack_length_test),
 	KUNIT_CASE(dchid_ack_identity_test),
 	KUNIT_CASE(dchid_ack_copy_test),
+	KUNIT_CASE(dchid_ack_retired_cmd_test),
 	KUNIT_CASE(dchid_init_bounds_test),
 	KUNIT_CASE(dchid_short_input_test),
 	KUNIT_CASE(dchid_init_descriptor_test),
