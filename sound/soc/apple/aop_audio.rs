@@ -61,6 +61,7 @@ use pin_init::Zeroable;
 mod aop_lid;
 mod aop_lpai;
 mod aop_spkr;
+mod aop_spkr_ring;
 mod aop_t8140;
 
 /// An unaligned u32 type.
