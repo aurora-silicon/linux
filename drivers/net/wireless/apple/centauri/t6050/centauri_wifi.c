@@ -1605,17 +1605,41 @@ static int select_rsn(const u8 *body, size_t size, u32 akm, u8 *selected)
 #define CONNECT_CIPHER_CCMP 4
 
 /*
- * Whether the request is for a network without security: no RSN element, no
- * ciphers, no AKM and no privacy (static WEP sets privacy and a WEP cipher,
- * and stays refused).
+ * Classify a connect request: 1 for a network without security, 0 for a
+ * request that asks for security, -EINVAL for a request that contradicts
+ * itself. A network without security is an allow-list: open-system or
+ * automatic authentication and nothing else, no privacy, no key, no WPA
+ * versions, ciphers, AKMs, passphrase or RSN element. Static WEP (privacy,
+ * a key or shared key authentication) is never rewritten as open.
  */
-static bool connect_is_open(const struct cfg80211_connect_params *params)
+static int connect_classify(const struct cfg80211_connect_params *params)
 {
-	return !params->privacy && !params->crypto.n_ciphers_pairwise &&
-	       !params->crypto.cipher_group && !params->crypto.n_akm_suites &&
-	       !params->crypto.psk && !params->crypto.sae_pwd_len &&
-	       params->auth_type != NL80211_AUTHTYPE_SHARED_KEY &&
-	       !cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
+	const struct cfg80211_crypto_settings *crypto = &params->crypto;
+	bool security = crypto->wpa_versions || crypto->cipher_group ||
+			crypto->n_ciphers_pairwise || crypto->n_akm_suites ||
+			crypto->psk || crypto->sae_pwd_len ||
+			cfg80211_find_ie(WLAN_EID_RSN, params->ie,
+					 params->ie_len);
+	bool key = params->key || params->key_len;
+
+	if (key || params->auth_type == NL80211_AUTHTYPE_SHARED_KEY)
+		return -EINVAL;
+	if (security)
+		return 0;
+	if (params->privacy ||
+	    (params->auth_type != NL80211_AUTHTYPE_OPEN_SYSTEM &&
+	     params->auth_type != NL80211_AUTHTYPE_AUTOMATIC))
+		return -EINVAL;
+	return 1;
+}
+
+/*
+ * 6 GHz admits WPA3-Personal only with management frame protection, so never
+ * a network without security (@sae is false for it).
+ */
+static bool connect_band_allowed(enum nl80211_band band, bool sae, bool mfpc)
+{
+	return band != NL80211_BAND_6GHZ || (sae && mfpc);
 }
 
 /* The AKMs the connect command can name, in order of preference. */
@@ -1736,10 +1760,18 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size = 0, rsn_prefix, rsn_tail;
 	int ret = 0, offset, band;
-	bool sae = false, mfpc = false, open = connect_is_open(params);
+	bool sae = false, mfpc = false, open;
 	u8 password[2 + SAE_PASSWORD_MAX_LEN];
 	u32 akm = 0;
 
+	ret = connect_classify(params);
+	if (ret < 0) {
+		dev_dbg(dev, "connect refused: contradictory request, privacy %d, auth type %d, key %zu bytes\n",
+			params->privacy, params->auth_type, (size_t)params->key_len);
+		return ret;
+	}
+	open = ret;
+	ret = 0;
 	if (!params->ssid_len || params->ssid_len > 32 ||
 	    params->ie_len > sizeof(wifi->request_ie) ||
 	    (!open &&
@@ -1818,11 +1850,7 @@ security_done:
 		goto out;
 	band = ret;
 	ret = 0;
-	/*
-	 * 6 GHz admits WPA3-Personal only with management frame protection
-	 * (and no network without security).
-	 */
-	if (channel->band == NL80211_BAND_6GHZ && (!sae || !mfpc)) {
+	if (!connect_band_allowed(channel->band, sae, mfpc)) {
 		dev_dbg(dev, "connect refused: 6 GHz with AKM %08x, MFPC %d\n",
 			akm, mfpc);
 		ret = -EOPNOTSUPP;
@@ -3207,3 +3235,7 @@ void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
 	memzero_explicit(wifi, sizeof(*wifi));
 	kfree(wifi);
 }
+
+#if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_KUNIT_TEST)
+#include "centauri_wifi_test.c"
+#endif
