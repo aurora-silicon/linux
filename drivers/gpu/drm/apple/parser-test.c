@@ -587,26 +587,27 @@ static void parser_vrr_empty_range(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, modes[0].max_vrr, 0U);
 	kfree(modes);
 	/*
-	 * The catalog owner takes zero placeholders as no range on every
-	 * firmware, so an internal ProMotion timing gets its range either way.
+	 * The catalog owner takes zero placeholders as no range on desktop 26.x
+	 * and firmware 27, where an internal ProMotion timing gets its range;
+	 * older firmware keeps them as given.
 	 */
-	for (desktop = 0; desktop < 2; desktop++) {
+	for (desktop = 0; desktop < 3; desktop++) {
 		struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 		u64 generation;
 
 		KUNIT_ASSERT_NOT_NULL(test, dcp);
 		parser_modes_init(dcp);
-		dcp->fw_compat = desktop ? DCP_FIRMWARE_V_26_6_DESKTOP :
-			DCP_FIRMWARE_V_13_5;
+		dcp->fw_compat = desktop == 2 ? DCP_FIRMWARE_V_27_0 :
+			desktop ? DCP_FIRMWARE_V_26_6_DESKTOP : DCP_FIRMWARE_V_13_5;
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 		ctx.dcp = &parser_dcp;
 		generation = dcp_modes_transfer_begin(dcp);
 		KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, generation), 0);
 		KUNIT_ASSERT_EQ(test, dcp->nr_modes, 1U);
-		KUNIT_EXPECT_TRUE(test, dcp->modes[0].vrr);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, 24U << 16);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, 120U << 16);
+		KUNIT_EXPECT_EQ(test, dcp->modes[0].vrr, !!desktop);
+		KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, desktop ? 24U << 16 : 0U);
+		KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, desktop ? 120U << 16 : 0U);
 		kfree(dcp->modes);
 	}
 }
