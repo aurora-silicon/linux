@@ -7,6 +7,7 @@
 #define dev_err_ratelimited(...) test_log(__VA_ARGS__)
 #define lockdep_assert_held(p) assert((p)->held)
 #define MEMREMAP_WC 0
+#define __iomem
 /* Host memory is coherent; the production write barrier is simulated. */
 #define wmb() ((void)0)
 #define msecs_to_jiffies(x) (x)
@@ -86,6 +87,9 @@ struct ave_dev {
 	const struct ave_fw_layout *layout;
 	u32 data_crc;
 	struct ave_fw_segment text, data;
+	u64 data_alias;
+	void *dapf;
+	phys_addr_t dapf_phys;
 	void *data_pristine;
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
@@ -156,6 +160,11 @@ static void writel(u32 v, void *p)
 		if (p == test_ctrl_addr)
 			stop_seen = !v;
 	}
+}
+
+static void writeq(u64 v, void *p)
+{
+	*(u64 *)p = v;
 }
 
 static void *memremap(phys_addr_t p, size_t size, unsigned int mode)

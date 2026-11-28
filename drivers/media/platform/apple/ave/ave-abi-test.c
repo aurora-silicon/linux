@@ -1657,6 +1657,206 @@ static void ave_hevc_bframe_extra_bits(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
 }
 
+/*
+ * The M1 with the 27.2 stub: its encoder's own variant pins the 27.2 build
+ * (device 7, handshake type 7) and selects the 26B123 layout. Other segment
+ * sizes, the M2's 27.2 build among them, are refused.
+ */
+static void ave_t8103_26b123_build(struct kunit *test)
+{
+	const struct ave_variant *v = &ave_t8103;
+
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(v, 0x114000, 0x128000), v);
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(v, 0x114000, 0x128000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(v, 0x11c000, 0x128000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(v, 0x114000, 0x12c000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(v, 0xd0000, 0x128000));
+	KUNIT_EXPECT_NULL(test, v->next_build);
+	KUNIT_EXPECT_EQ(test, v->build_count, 0U);
+	KUNIT_EXPECT_TRUE(test, v->boot_qualified);
+	KUNIT_EXPECT_PTR_EQ(test, v->regs, ave_t8112.regs);
+	KUNIT_EXPECT_EQ(test, v->boot_device_id, 7U);
+	KUNIT_EXPECT_EQ(test, v->device_type, 7U);
+	KUNIT_EXPECT_EQ(test, v->boot_arg_value, 0x10000U);
+	/* The M1's timebase frequency register is in MHz, as on the M1 Pro. */
+	KUNIT_EXPECT_EQ(test, v->timebase_multiplier, 1000000U);
+	KUNIT_EXPECT_EQ(test, v->mbox_idle, 0x38U);
+	KUNIT_EXPECT_TRUE(test, v->restore_data_first);
+	/* The loader fills the DATA link cell, as for the 6070 builds; no build list. */
+	KUNIT_EXPECT_EQ(test, v->text_link_cell, 0x423cU);
+	KUNIT_EXPECT_NULL(test, v->builds);
+	KUNIT_EXPECT_EQ(test, v->lfs_ref_scale, 2U);
+	KUNIT_EXPECT_EQ(test, v->extra0_size, 0U);
+	/* The J313's loader code base for TEXT at 0x800a20000. */
+	KUNIT_EXPECT_TRUE(test, v->vcbar_text_phys);
+	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(v, 0x800a20000ULL), 0x102000800a20001ULL);
+	KUNIT_EXPECT_FALSE(test, ave_t8112.vcbar_text_phys);
+	KUNIT_EXPECT_EQ(test, v->text_crc, AVE_FW_TEXT_CRC_T8103_26B123);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(v->text_crc), &ave_layout_26b123);
+	{
+		const u32 off = v->text_link_cell, size = off + 0x40;
+		u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+		u32 zeroed, filled;
+
+		KUNIT_ASSERT_NOT_NULL(test, text);
+		zeroed = crc32_le(~0U, text, size) ^ ~0U;
+		/* DATA follows TEXT at 0x114000; the loader's alias keeps those low bits. */
+		put_unaligned_le64(0xf00114000ULL, text + off);
+		KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x114000, &filled), 0);
+		KUNIT_EXPECT_EQ(test, filled, zeroed);
+		/* A cell that names another DATA address is refused. */
+		KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x118000, &filled),
+				-ENODEV);
+	}
+}
+
+static void ave_t8103_write_dapf(void __iomem *dapf,
+				 const struct ave_dapf_entry *e,
+				 unsigned int n)
+{
+	memset_io(dapf, 0, AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE);
+	for (unsigned int i = 0; i < n; i++) {
+		void __iomem *r = dapf + i * AVE_DAPF_STRIDE;
+
+		writel(e[i].ctrl, r + AVE_DAPF_CTRL);
+		writeq(e[i].start, r + AVE_DAPF_START);
+		writeq(e[i].end, r + AVE_DAPF_END);
+	}
+}
+
+/*
+ * The J313's encoder CPU DART filter as its ADT describes it: TEXT at its
+ * physical address, and the window the firmware reaches DART space through.
+ * The driver starts the coprocessor only when the filter admits TEXT and
+ * the firmware's nonzero DATA alias (the link cell); an unprogrammed filter
+ * reads zero and admits nothing.
+ */
+static void ave_t8103_cpu_dart_filter(struct kunit *test)
+{
+	const u64 text = 0x800a20000ULL, text_last = text + 0x114000 - 1;
+	const u64 alias = 0xf00114000ULL, alias_last = alias + 0x128000 - 1;
+	struct ave_dapf_entry e[AVE_DAPF_ENTRIES] = {
+		{ .ctrl = 0x11, .start = text, .end = text_last },
+		{ .ctrl = 0x33, .start = 0xf00000000ULL, .end = 0xfffffffffULL },
+	};
+	struct ave_dapf_entry none[AVE_DAPF_ENTRIES] = {};
+	struct ave_dapf_entry text_only[AVE_DAPF_ENTRIES] = {
+		{ .ctrl = 0x11, .start = text, .end = text_last },
+	};
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	void __iomem *dapf;
+	u64 first = 0, last = 0;
+	const char *gap;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	dapf = (void __iomem __force *)kunit_kzalloc(test,
+						    AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE,
+						    GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dapf);
+	ave->dev = kunit_device_register(test, "apple-ave-dapf-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	ave->variant = &ave_t8103;
+	ave->text.phys = text;
+	ave->text.size = 0x114000;
+	ave->data.size = 0x128000;
+	ave->data_alias = alias;
+	ave->dapf = dapf;
+	ave->dapf_phys = 0x267044000ULL;
+
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
+	/* A filter nothing programmed reads zero. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(none, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(none, AVE_DAPF_ENTRIES, alias, alias_last));
+	/* The raw DART address is outside both entries. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, 0x114000, 0x23bfff));
+	/* One byte past an entry, or a range across two, is not admitted. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last + 1));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text - SZ_16K, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text_last, 0xf00000000ULL));
+	/* An end whose low two bits do not read back still covers its range. */
+	e[0].end = text_last & ~3ULL;
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+
+	/* Valid filter with a nonzero DATA alias passes the pre-start guard. */
+	ave_t8103_write_dapf(dapf, e, 2);
+	KUNIT_EXPECT_NULL(test, ave_fw_filter_gap(ave, e, &first, &last));
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), 0);
+
+	/* A required filter that is unavailable or unmapped is refused separately. */
+	ave->dapf = NULL;
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+	ave->variant = &ave_t8112;
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), 0);
+	ave->variant = &ave_t8103;
+	ave->dapf = dapf;
+
+	/* A mapped, unprogrammed filter (all-zero entries) is refused. */
+	ave_t8103_write_dapf(dapf, none, 0);
+	gap = ave_fw_filter_gap(ave, none, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "TEXT");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	/* An unlinked handoff (zero DATA alias) is refused even on a TEXT-only filter. */
+	ave->data_alias = 0;
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+	ave_t8103_write_dapf(dapf, text_only, 1);
+	gap = ave_fw_filter_gap(ave, text_only, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	/* An excluded or wrapping DATA alias is refused. */
+	ave->data_alias = 0x114000ULL;
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	ave->data_alias = U64_MAX - 0x1000ULL;
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	ave->data_alias = alias;
+	gap = ave_fw_filter_gap(ave, text_only, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	ave_t8103_write_dapf(dapf, text_only, 1);
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	/* After a deep sleep the range stays but the enable bits are clear. */
+	e[0].ctrl = 0x10;
+	e[1].ctrl = 0x30;
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
+	e[0].ctrl = 0x11;
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	e[1].ctrl = 0x33;
+	/* A range with no control word is not programmed. */
+	e[0].ctrl = 0;
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text_last, text));
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "TEXT");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+	/* Only the entries counted are looked at. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, 1, alias, alias_last));
+}
+
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
 	const struct ave_fw_build *m4 = ave_t6041.builds;
@@ -1750,6 +1950,8 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_26b123_layout),
 	KUNIT_CASE(ave_t8112_26b123_build),
 	KUNIT_CASE(ave_hevc_bframe_extra_bits),
+	KUNIT_CASE(ave_t8103_26b123_build),
+	KUNIT_CASE(ave_t8103_cpu_dart_filter),
 	{}
 };
 

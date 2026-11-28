@@ -46,6 +46,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T8142_26A428, /* encoder firmware 9013.45.1, macOS 27.0 26A428 / T8142 */
 	AVE_FW_TEXT_CRC_T8122_26B123, /* encoder firmware macOS 27.2 26B123 / T8122 */
 	AVE_FW_TEXT_CRC_T8112_26B123, /* encoder firmware macOS 27.2 26B123 / T8112 */
+	AVE_FW_TEXT_CRC_T8103_26B123, /* encoder firmware 9013.55.1, macOS 27.2 / T8103 */
 	AVE_FW_TEXT_CRC_T8132_26B123, /* encoder firmware macOS 27.2 26B123 / T8132 */
 	AVE_FW_TEXT_CRC_T8142_26B123, /* encoder firmware 9013.55.1, macOS 27.2 26B123 / T8142 */
 	0x460c7a7c, /* encoder firmware 6070.11.1 / T6000 */
@@ -203,6 +204,11 @@ static int ave_fw_text_boot_id(struct ave_dev *ave, u32 word_off, u32 *crc)
 	return ret;
 }
 
+static bool ave_fw_range_valid(u64 start, size_t size)
+{
+	return start && size && start <= U64_MAX - (size - 1);
+}
+
 static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
 			  u32 *crc)
 {
@@ -218,6 +224,9 @@ static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
 	ret = ave_fw_text_id_crc(va, ave->text.size,
 				 ave->variant->text_link_cell, ave->data.iova,
 				 crc);
+	/* The cell is in bounds once the identity accepted it. */
+	if (!ret)
+		ave->data_alias = get_unaligned_le64(va + ave->variant->text_link_cell);
 	memunmap(va);
 	return ret;
 }
@@ -340,6 +349,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
+	if ((ave->dapf || ave->variant->vcbar_text_phys) &&
+	    !ave_fw_range_valid(ave->data_alias, ave->data.size))
+		return dev_err_probe(dev, -ENODEV,
+				     "firmware DATA alias is missing or invalid\n");
 	known |= ave_fw_known_crc(text_crc);
 	if (build) {
 		const struct ave_fw_build *same_size =
@@ -539,10 +552,110 @@ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova)
 	return (text_iova & variant->vcbar_mask) | variant->vcbar_flags;
 }
 
+/* The code base the loader left: TEXT's DART or, on the M1, physical address. */
+static u64 ave_fw_code_base(struct ave_dev *ave)
+{
+	return ave_fw_vcbar(ave->variant, ave->variant->vcbar_text_phys ?
+						  ave->text.phys : ave->text.iova);
+}
+
+/*
+ * Whether one programmed entry of the filter admits all of [first, last].
+ * An entry the loader never wrote reads zero. A deep sleep clears the low
+ * control bits and keeps the range: the J313 reads 0x11 and 0x33 after boot,
+ * 0x10 and 0x30 after a wake, and a coprocessor started then reset the SoC.
+ * The low two bits of an end may not read back as written, so the end is
+ * compared with them set.
+ */
+bool ave_dapf_admits(const struct ave_dapf_entry *e, unsigned int n, u64 first,
+		     u64 last)
+{
+	if (last < first)
+		return false;
+	for (unsigned int i = 0; i < n; i++)
+		if ((e[i].ctrl & AVE_DAPF_CTRL_ENABLE) && e[i].start <= first &&
+		    (e[i].end | 3) >= last)
+			return true;
+	return false;
+}
+
+static void ave_fw_read_dapf(struct ave_dev *ave, struct ave_dapf_entry *e)
+{
+	for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++) {
+		void __iomem *r = ave->dapf + i * AVE_DAPF_STRIDE;
+
+		e[i].ctrl = readl(r + AVE_DAPF_CTRL);
+		e[i].start = readq(r + AVE_DAPF_START);
+		e[i].end = readq(r + AVE_DAPF_END);
+	}
+}
+
+static bool ave_fw_filter_admits(const struct ave_dapf_entry *e, u64 start,
+				 size_t size, u64 *first, u64 *last)
+{
+	*first = start;
+	if (!ave_fw_range_valid(start, size)) {
+		*last = start;
+		return false;
+	}
+	*last = start + size - 1;
+	return ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last);
+}
+
+/* The firmware range the filter leaves out, with its bounds, or NULL. */
+const char *ave_fw_filter_gap(struct ave_dev *ave,
+			      const struct ave_dapf_entry *e, u64 *first,
+			      u64 *last)
+{
+	if (ave->variant->vcbar_text_phys &&
+	    !ave_fw_filter_admits(e, ave->text.phys, ave->text.size, first, last))
+		return "TEXT";
+	if (!ave_fw_filter_admits(e, ave->data_alias, ave->data.size, first, last))
+		return "DATA";
+	return NULL;
+}
+
+/*
+ * The coprocessor's CPU reaches memory through its DART's address filter:
+ * on the M1 the loader points the code base at TEXT's physical address, and
+ * the firmware's own alias of DATA is in the window the filter passes on to
+ * the DART. Only the bootloader programs that filter, from the ADT. A core
+ * started behind a filter that does not admit its code cannot fetch its
+ * first instruction. Check the filter, read-only, before anything is
+ * written to start the coprocessor.
+ */
+int ave_fw_check_filter(struct ave_dev *ave)
+{
+	struct ave_dapf_entry e[AVE_DAPF_ENTRIES];
+	const char *missing;
+	u64 first = 0, last = 0;
+
+	if (!ave->dapf) {
+		if (ave->variant->vcbar_text_phys) {
+			dev_err(ave->dev,
+				"CPU DART filter is unavailable; not starting the coprocessor\n");
+			return -ENODEV;
+		}
+		return 0;
+	}
+	ave_fw_read_dapf(ave, e);
+	missing = ave_fw_filter_gap(ave, e, &first, &last);
+	if (!missing)
+		return 0;
+	dev_err(ave->dev,
+		"CPU DART filter at %pa does not admit the firmware's %s (%#llx-%#llx); not starting the coprocessor\n",
+		&ave->dapf_phys, missing, first, last);
+	for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++)
+		if (e[i].ctrl || e[i].start || e[i].end)
+			dev_err(ave->dev, "  filter %2u: ctrl %#x %#llx-%#llx\n",
+				i, e[i].ctrl, e[i].start, e[i].end);
+	return -ENODEV;
+}
+
 static bool ave_fw_idle(struct ave_dev *ave)
 {
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-	    ave_fw_vcbar(ave->variant, ave->text.iova))
+	    ave_fw_code_base(ave))
 		return false;
 	if (readl(ave->coproc + ave->variant->regs->ctrl) ||
 	    readl(ave->mbox + AVE_MBOX_STATUS))
@@ -586,7 +699,7 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 		return 0;
 	}
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-	    ave_fw_vcbar(ave->variant, ave->text.iova)) {
+	    ave_fw_code_base(ave)) {
 		dev_err(ave->dev,
 			"coprocessor lost its code base (vcbar %#llx)\n",
 			readq(ave->coproc + ave->variant->regs->vcbar));
@@ -714,6 +827,24 @@ void ave_dart_dump(struct ave_dev *ave, struct seq_file *m)
 	seq_printf(m, "coprocessor ctrl %#x boot_arg %#x fw_state %d\n",
 		   readl(ave->coproc + ave->variant->regs->ctrl),
 		   readl(ave->coproc + ave->variant->regs->boot_arg), ave->fw_state);
+	if (ave->dapf) {
+		struct ave_dapf_entry e[AVE_DAPF_ENTRIES];
+		const char *missing;
+		u64 first = 0, last = 0;
+
+		ave_fw_read_dapf(ave, e);
+		missing = ave_fw_filter_gap(ave, e, &first, &last);
+		if (missing)
+			seq_printf(m, "CPU DART filter %pa: does NOT admit the firmware's %s (%#llx-%#llx)\n",
+				   &ave->dapf_phys, missing, first, last);
+		else
+			seq_printf(m, "CPU DART filter %pa: admits the firmware\n",
+				   &ave->dapf_phys);
+		for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++)
+			if (e[i].ctrl || e[i].start || e[i].end)
+				seq_printf(m, "  filter %2u: ctrl %#x %#llx-%#llx\n",
+					   i, e[i].ctrl, e[i].start, e[i].end);
+	}
 	for (unsigned int d = 0; d < ave->n_darts; d++) {
 		void __iomem *r = ave->dart_regs[d];
 		u32 own = ave->dart_sid[d];
@@ -773,6 +904,11 @@ static int ave_fw_boot(struct ave_dev *ave)
 		dev_err(ave->dev, "firmware segments are no longer mapped\n");
 		return -EIO;
 	}
+
+	/* Before any coprocessor or mailbox write. */
+	ret = ave_fw_check_filter(ave);
+	if (ret)
+		return ret;
 
 	ret = ave_fw_prepare_restart(ave);
 	if (ret)

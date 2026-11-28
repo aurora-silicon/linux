@@ -563,8 +563,102 @@ static void unconfirmed_close(void)
 	free(ctx[1].sess);
 }
 
+static void set_dapf(u8 *regs, unsigned int idx, u32 ctrl, u64 start, u64 end)
+{
+	u8 *r = regs + idx * AVE_DAPF_STRIDE;
+
+	writel(ctrl, r + AVE_DAPF_CTRL);
+	writeq(start, r + AVE_DAPF_START);
+	writeq(end, r + AVE_DAPF_END);
+}
+
+/*
+ * Pre-start CPU DART filter guard rejects unmapped filters and zero, wrapping,
+ * excluded, or disabled ranges.
+ */
+static void cpu_dart_filter(void)
+{
+	static const struct ave_variant t8103_v = {
+		.regs = &regs,
+		.vcbar_mask = GENMASK_ULL(41, 11),
+		.vcbar_flags = AVE_COPROC_VCBAR_VALID | AVE_COPROC_VCBAR_M1_LOADER,
+		.vcbar_text_phys = true,
+	};
+	const u64 text = 0x800a20000ULL, text_last = text + 0x114000 - 1;
+	const u64 alias = 0xf00114000ULL;
+	u8 dapf_regs[AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE] = {};
+	struct ave_dapf_entry e[AVE_DAPF_ENTRIES] = {};
+	u64 first = 0, last = 0;
+
+	init();
+	ave.variant = &t8103_v;
+	ave.text.phys = text;
+	ave.text.size = 0x114000;
+	ave.data.size = 0x128000;
+	ave.data_alias = alias;
+	ave.dapf = dapf_regs;
+	ave.dapf_phys = 0x267044000ULL;
+
+	set_dapf(dapf_regs, 0, 0x11, text, text_last);
+	set_dapf(dapf_regs, 1, 0x33, 0xf00000000ULL, 0xfffffffffULL);
+	ave_fw_read_dapf(&ave, e);
+	assert(!ave_fw_filter_gap(&ave, e, &first, &last));
+	assert(ave_fw_check_filter(&ave) == 0);
+
+	/* Required filter missing or unmapped is refused despite valid handoff. */
+	ave.dapf = NULL;
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+	ave.variant = &variant;
+	assert(ave_fw_check_filter(&ave) == 0);
+	ave.variant = &t8103_v;
+	ave.dapf = dapf_regs;
+
+	/* Mapped, unprogrammed filter (all-zero entries) is refused as TEXT. */
+	memset(dapf_regs, 0, sizeof(dapf_regs));
+	ave_fw_read_dapf(&ave, e);
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "TEXT"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+
+	set_dapf(dapf_regs, 0, 0x11, text, text_last);
+	set_dapf(dapf_regs, 1, 0x33, 0xf00000000ULL, 0xfffffffffULL);
+	ave_fw_read_dapf(&ave, e);
+
+	/* Unlinked handoff (zero DATA alias) is refused even with a TEXT-only filter. */
+	ave.data_alias = 0;
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "DATA"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+	set_dapf(dapf_regs, 1, 0, 0, 0);
+	ave_fw_read_dapf(&ave, e);
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "DATA"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+
+	/* Wrapping and excluded DATA alias (raw DART address, unprogrammed, sleep-cleared). */
+	ave.data_alias = U64_MAX - 0x1000ULL;
+	set_dapf(dapf_regs, 1, 0x33, 0xf00000000ULL, 0xfffffffffULL);
+	ave_fw_read_dapf(&ave, e);
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "DATA"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+
+	ave.data_alias = 0x114000ULL;
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "DATA"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+	ave.data_alias = alias;
+	set_dapf(dapf_regs, 1, 0, 0, 0);
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+	set_dapf(dapf_regs, 1, 0x30, 0xf00000000ULL, 0xfffffffffULL);
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+
+	/* Sleep-cleared TEXT entry is refused as TEXT. */
+	set_dapf(dapf_regs, 1, 0x33, 0xf00000000ULL, 0xfffffffffULL);
+	set_dapf(dapf_regs, 0, 0x10, text, text_last);
+	ave_fw_read_dapf(&ave, e);
+	assert(!strcmp(ave_fw_filter_gap(&ave, e, &first, &last), "TEXT"));
+	assert(ave_fw_check_filter(&ave) == -ENODEV);
+}
+
 int main(void)
 {
+	cpu_dart_filter();
 	session_lifetime();
 	unconfirmed_close();
 	unusable_witness();

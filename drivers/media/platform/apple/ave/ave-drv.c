@@ -119,6 +119,43 @@ const struct ave_variant ave_t8112 = {
 };
 
 /*
+ * The M1 (T8103) with the macOS 27.2 stub, as on the MacBook Air (J313): the
+ * bootloader preloads TEXT 0x114000 and DATA 0x128000 and, as it does for the
+ * M1 Pro's and M2's 6070 builds, fills the 64-bit cell at TEXT 0x423c with
+ * the firmware's alias of DATA (the low 32 bits are DATA's DART address); the
+ * cell is zero in the image, and with it zeroed the TEXT CRC is b6616340. It
+ * is the M1 encoder's build of the firmware the M2 and M3 run on 27.2
+ * (9013.55.1), and it starts the way theirs do:
+ * the boot configuration handshake as device 7 with handshake type 7, the
+ * 26B123 command layout, codec clocks ungated by clearing the mailbox idle
+ * word, the bootloader's code base (marked valid) left as it is, and DATA
+ * restored from the boot snapshot before every start. The coprocessor and
+ * mailbox registers are the M2's. As on every M1-family encoder, the DART
+ * window starts at address 0: TEXT is at 0 and DATA follows it. The code base
+ * the loader sets is TEXT's physical address, its ADT remap address, with
+ * VALID and two more bits of its own. Unlike the M2's, its timebase
+ * frequency register counts in MHz, as the M1 Pro's does.
+ */
+const struct ave_variant ave_t8103 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0x114000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 7,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1000000,
+	.vcbar_mask = GENMASK_ULL(41, 11),
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID | AVE_COPROC_VCBAR_M1_LOADER,
+	.vcbar_text_phys = true,
+	.device_type = 7,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8103_26B123,
+	.text_link_cell = 0x423c,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.boot_qualified = true,
+};
+
+/*
  * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
  * like the A18 Pro: same coprocessor registers and boot sequence, its own
  * device ID and type. The M4 Max (J575c) runs its first encoder, ADT ave0
@@ -504,10 +541,37 @@ static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
 					    "me1", "perf" };
 
 /*
- * Map the encoder's T8110-layout DARTs for the read-only stream audit
- * (ave_dart_audit()). The DART driver owns them; nothing here writes.
+ * Map the address filter a DART of the encoder names ("dapf"), read-only,
+ * for ave_fw_check_filter(). The loader programs it; the DART driver leaves
+ * a filter it has no ranges for untouched.
  */
-static void ave_map_darts(struct ave_dev *ave)
+static int ave_map_dapf(struct ave_dev *ave, struct device_node *dart)
+{
+	int idx = of_property_match_string(dart, "reg-names", "dapf");
+	struct resource res;
+
+	if (idx < 0)
+		return 0;
+	if (ave->dapf) {
+		dev_warn(ave->dev, "%pOF: a second DART filter; keeping the first\n", dart);
+		return 0;
+	}
+	if (of_address_to_resource(dart, idx, &res) ||
+	    resource_size(&res) < AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE)
+		return dev_err_probe(ave->dev, -EINVAL, "%pOF: bad DART filter window\n", dart);
+	ave->dapf = devm_ioremap(ave->dev, res.start, resource_size(&res));
+	if (!ave->dapf)
+		return -ENOMEM;
+	ave->dapf_phys = res.start;
+	return 0;
+}
+
+/*
+ * Map the encoder's T8110-layout DARTs for the read-only stream audit
+ * (ave_dart_audit()), and the address filter of any of its DARTs that has
+ * one. The DART driver owns them; nothing here writes.
+ */
+static int ave_map_darts(struct ave_dev *ave)
 {
 	struct device_node *np = ave->dev->of_node;
 	int n = of_count_phandle_with_args(np, "iommus", "#iommu-cells");
@@ -517,9 +581,15 @@ static void ave_map_darts(struct ave_dev *ave)
 		struct resource res;
 		void __iomem *r;
 		unsigned int d;
+		int ret;
 
 		if (of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args))
 			break;
+		ret = ave_map_dapf(ave, args.np);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
 		if (!of_device_is_compatible(args.np, "apple,t8110-dart") ||
 		    args.args_count != 1 || args.args[0] >= 32 ||
 		    of_address_to_resource(args.np, 0, &res)) {
@@ -547,6 +617,7 @@ static void ave_map_darts(struct ave_dev *ave)
 		ave->n_darts++;
 	}
 	dev_dbg(ave->dev, "%u DARTs for the stream audit\n", ave->n_darts);
+	return 0;
 }
 
 static int ave_probe(struct platform_device *pdev)
@@ -585,7 +656,9 @@ static int ave_probe(struct platform_device *pdev)
 	ave->domain = iommu_get_domain_for_dev(dev);
 	if (!ave->domain || !(ave->domain->type & __IOMMU_DOMAIN_PAGING))
 		return dev_err_probe(dev, -ENODEV, "needs a translating IOMMU\n");
-	ave_map_darts(ave);
+	ret = ave_map_darts(ave);
+	if (ret)
+		return ret;
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;
@@ -740,6 +813,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6032-ave", .data = &ave_m3 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
+	{ .compatible = "apple,t8103-ave", .data = &ave_t8103 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8122-ave", .data = &ave_t8122 },
 	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },

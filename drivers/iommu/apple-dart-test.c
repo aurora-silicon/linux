@@ -3,6 +3,7 @@
 #include <kunit/device.h>
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 struct apple_dart_test_window {
@@ -1481,6 +1482,104 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 }
 #endif
 
+/*
+ * The J313 encoder CPU DART's filter as its loader programs it: TEXT at its physical
+ * address (control 0x11) and the window into the DART (0x33). After a deep sleep the
+ * ranges read back unchanged and the control words as 0x10 and 0x30.
+ */
+static const struct apple_dart_dapf_entry apple_dart_test_m1_dapf[] = {
+	{ .ctrl = 0x11, .r4 = 1, .start = 0x800a20000ULL, .end = 0x800b33ffcULL },
+	{ .ctrl = 0x33, .r4 = 1, .start = 0xf00000000ULL, .end = 0xffffffffcULL },
+};
+
+static void apple_dart_test_dapf_t8020_used(struct kunit *test)
+{
+	struct apple_dart_dapf_entry e[DART_T8020_DAPF_ENTRIES] = {};
+
+	KUNIT_EXPECT_EQ(test, apple_dart_dapf_t8020_used(e, ARRAY_SIZE(e)), 0U);
+	memcpy(e, apple_dart_test_m1_dapf, sizeof(apple_dart_test_m1_dapf));
+	KUNIT_EXPECT_EQ(test, apple_dart_dapf_t8020_used(e, ARRAY_SIZE(e)), 2U);
+	/* A sleep's leftovers: ranges without enable bits keep nothing. */
+	e[0].ctrl = 0x10;
+	e[1].ctrl = 0x30;
+	KUNIT_EXPECT_EQ(test, apple_dart_dapf_t8020_used(e, ARRAY_SIZE(e)), 0U);
+	/* A hole before the last enabled entry is kept, so slots stay where they were. */
+	e[3] = apple_dart_test_m1_dapf[1];
+	KUNIT_EXPECT_EQ(test, apple_dart_dapf_t8020_used(e, ARRAY_SIZE(e)), 4U);
+}
+
+static void apple_dart_test_dapf_t8020_same(struct kunit *test)
+{
+	struct apple_dart_dapf_entry live[2];
+
+	memcpy(live, apple_dart_test_m1_dapf, sizeof(live));
+	KUNIT_EXPECT_TRUE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	/* Ends whose low two bits read back set are the same end. */
+	live[0].end |= 3;
+	KUNIT_EXPECT_TRUE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	/* Control bits above the low byte do not read back. */
+	live[1].ctrl |= 0x100;
+	KUNIT_EXPECT_TRUE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	/* After a sleep: the same ranges, the enable bits gone. Not the same filter. */
+	live[0].ctrl = 0x10;
+	KUNIT_EXPECT_FALSE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	memcpy(live, apple_dart_test_m1_dapf, sizeof(live));
+	live[1].start = 0;
+	KUNIT_EXPECT_FALSE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	memcpy(live, apple_dart_test_m1_dapf, sizeof(live));
+	live[0].r4 = 0;
+	KUNIT_EXPECT_FALSE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+}
+
+/* The write-back on a memory-backed filter window, as a sleep leaves it. */
+static void apple_dart_test_dapf_t8020_replay(struct kunit *test)
+{
+	struct apple_dart_dapf_entry live[2];
+	struct apple_dart *dart;
+	u8 *win;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	win = kunit_kzalloc(test, DART_T8020_DAPF_ENTRIES * DART_DAPF_STRIDE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	KUNIT_ASSERT_NOT_NULL(test, win);
+	dart->dev = kunit_device_register(test, "apple-dart-dapf-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dart->dapf = (__force void __iomem *)win;
+
+	for (unsigned int i = 0; i < 2; i++) {
+		u8 *entry = win + i * DART_DAPF_STRIDE;
+
+		put_unaligned_le32(apple_dart_test_m1_dapf[i].ctrl & 0xf0, entry + 0x00);
+		put_unaligned_le32(apple_dart_test_m1_dapf[i].r4, entry + 0x04);
+		put_unaligned_le64(apple_dart_test_m1_dapf[i].start, entry + 0x08);
+		put_unaligned_le64(apple_dart_test_m1_dapf[i].end, entry + 0x10);
+	}
+	/* Nothing kept: the filter stays as it is. */
+	apple_dart_dapf_replay(dart, false);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(win), 0x10U);
+
+	dart->dapf_saved = kunit_kzalloc(test, sizeof(apple_dart_test_m1_dapf), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->dapf_saved);
+	memcpy(dart->dapf_saved, apple_dart_test_m1_dapf, sizeof(apple_dart_test_m1_dapf));
+	dart->dapf_saved_count = ARRAY_SIZE(apple_dart_test_m1_dapf);
+	apple_dart_dapf_replay(dart, false);
+	apple_dart_dapf_t8020_read(dart, live, 2);
+	KUNIT_EXPECT_TRUE(test, apple_dart_dapf_t8020_same(apple_dart_test_m1_dapf, live, 2));
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(win), 0x11U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(win + DART_DAPF_STRIDE), 0x33U);
+
+	/*
+	 * An intact filter is left alone. Control bits above the low byte are not compared,
+	 * so a write would show as them gone.
+	 */
+	put_unaligned_le32(0x111, win);
+	apple_dart_dapf_replay(dart, false);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(win), 0x111U);
+	/* Unless asked to always write it. */
+	apple_dart_dapf_replay(dart, true);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(win), 0x11U);
+}
+
 /* A zeroed 16 KiB page marked reserved, as the firmware's tables are. */
 static void apple_dart_test_free_reserved(void *data)
 {
@@ -1700,6 +1799,9 @@ static void apple_dart_test_display_keep(struct kunit *test)
 }
 
 static struct kunit_case apple_dart_test_cases[] = {
+	KUNIT_CASE(apple_dart_test_dapf_t8020_used),
+	KUNIT_CASE(apple_dart_test_dapf_t8020_same),
+	KUNIT_CASE(apple_dart_test_dapf_t8020_replay),
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),

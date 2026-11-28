@@ -361,6 +361,14 @@ struct apple_dart_fw_tree {
  */
 #define APPLE_DART_GAPF_PROTECT BIT(4)
 
+/* One address filter entry as a T8020-layout DART reads it back */
+struct apple_dart_dapf_entry {
+	u32 ctrl;
+	u32 r4;
+	u64 start;
+	u64 end; /* inclusive */
+};
+
 struct apple_dart {
 	bool cold_gen3;
 	u32 cold_gen3_sids;
@@ -415,6 +423,12 @@ struct apple_dart {
 	u64 *dapf_ranges;
 	u32 *dapf_r20;
 	unsigned int dapf_count;
+	/*
+	 * T8020 layout: the entries the loader left programmed, read back at probe, and how
+	 * many of them, through the last enabled one. Written back after a sleep.
+	 */
+	struct apple_dart_dapf_entry *dapf_saved;
+	unsigned int dapf_saved_count;
 
 	int irq;
 	struct clk_bulk_data *clks;
@@ -5716,6 +5730,108 @@ static void apple_dart_sleep_cfg_read(struct apple_dart *dart, u32 *cfg)
 #define DART_DAPF_STRIDE	0x40
 #define DART_DAPF_CONFIG	0x31
 
+/*
+ * A T8020-layout address filter (the M1 family's) has 16 entries, 0x40 apart: a control
+ * word at 0x00 whose low four bits enable the entry, a word at 0x04 and an inclusive range
+ * at 0x08 and 0x10. The loader writes them from the ADT's filter-data-instance-0. A deep
+ * sleep clears the enable bits and keeps the rest, so a filter that only compares its
+ * ranges looks intact while it admits nothing.
+ */
+#define DART_T8020_DAPF_ENTRIES	16
+#define DART_T8020_DAPF_ENABLE	GENMASK(3, 0)
+
+/* How many leading entries to keep: through the last enabled one, 0 with none. */
+static unsigned int apple_dart_dapf_t8020_used(const struct apple_dart_dapf_entry *e,
+					       unsigned int n)
+{
+	unsigned int used = 0;
+
+	for (unsigned int i = 0; i < n; i++)
+		if (e[i].ctrl & DART_T8020_DAPF_ENABLE)
+			used = i + 1;
+	return used;
+}
+
+/*
+ * Whether the live entries are the saved ones, enable bits included. Only the low byte
+ * of a control word and all but the low two bits of an end are compared: those are what
+ * read back as written.
+ */
+static bool apple_dart_dapf_t8020_same(const struct apple_dart_dapf_entry *saved,
+				       const struct apple_dart_dapf_entry *live,
+				       unsigned int n)
+{
+	for (unsigned int i = 0; i < n; i++)
+		if ((saved[i].ctrl ^ live[i].ctrl) & 0xff || saved[i].r4 != live[i].r4 ||
+		    saved[i].start != live[i].start || (saved[i].end | 3) != (live[i].end | 3))
+			return false;
+	return true;
+}
+
+static void apple_dart_dapf_t8020_read(struct apple_dart *dart,
+				       struct apple_dart_dapf_entry *e, unsigned int n)
+{
+	for (unsigned int i = 0; i < n; i++) {
+		void __iomem *entry = dart->dapf + i * DART_DAPF_STRIDE;
+
+		e[i].ctrl = readl(entry + 0x00);
+		e[i].r4 = readl(entry + 0x04);
+		e[i].start = readq(entry + 0x08);
+		e[i].end = readq(entry + 0x10);
+	}
+}
+
+/*
+ * A T8020-layout DART that names its filter window ("dapf") without apple,dapf-ranges:
+ * keep what the loader programmed, read back while the DART is powered at probe, to write
+ * it back after a sleep. A filter nothing programmed keeps nothing.
+ */
+static int apple_dart_dapf_t8020_save(struct apple_dart *dart)
+{
+	struct apple_dart_dapf_entry live[DART_T8020_DAPF_ENTRIES];
+	unsigned int used;
+
+	apple_dart_dapf_t8020_read(dart, live, ARRAY_SIZE(live));
+	used = apple_dart_dapf_t8020_used(live, ARRAY_SIZE(live));
+	if (!used) {
+		dev_info(dart->dev, "address filter not programmed: nothing to keep across sleep\n");
+		return 0;
+	}
+	dart->dapf_saved = devm_kmemdup(dart->dev, live, used * sizeof(*live), GFP_KERNEL);
+	if (!dart->dapf_saved)
+		return -ENOMEM;
+	dart->dapf_saved_count = used;
+	dev_dbg(dart->dev, "address filter: %u entries kept for write-back after sleep\n", used);
+	return 0;
+}
+
+/* After a power-off: write the kept entries back unless they still read as kept. */
+static void apple_dart_dapf_t8020_replay(struct apple_dart *dart, bool always)
+{
+	struct apple_dart_dapf_entry live[DART_T8020_DAPF_ENTRIES];
+	unsigned int n = dart->dapf_saved_count;
+
+	apple_dart_dapf_t8020_read(dart, live, n);
+	if (!always && apple_dart_dapf_t8020_same(dart->dapf_saved, live, n))
+		return;
+	/* In the loader's order: each entry's control word last. */
+	for (unsigned int i = 0; i < n; i++) {
+		void __iomem *entry = dart->dapf + i * DART_DAPF_STRIDE;
+
+		writel(dart->dapf_saved[i].r4, entry + 0x04);
+		writeq(dart->dapf_saved[i].start, entry + 0x08);
+		writeq(dart->dapf_saved[i].end, entry + 0x10);
+		writel(dart->dapf_saved[i].ctrl, entry + 0x00);
+	}
+	apple_dart_dapf_t8020_read(dart, live, n);
+	if (!apple_dart_dapf_t8020_same(dart->dapf_saved, live, n)) {
+		dev_err(dart->dev, "address filter write-back didn't take: entry 0 reads %#x %#llx..%#llx\n",
+			live[0].ctrl, live[0].start, live[0].end);
+		return;
+	}
+	dev_dbg(dart->dev, "address filter: %u entries written back after the sleep\n", n);
+}
+
 static int apple_dart_dapf_parse(struct platform_device *pdev, struct apple_dart *dart)
 {
 	struct device *dev = &pdev->dev;
@@ -5774,6 +5890,10 @@ static void apple_dart_dapf_replay(struct apple_dart *dart, bool always)
 {
 	unsigned int i;
 
+	if (dart->dapf_saved_count) {
+		apple_dart_dapf_t8020_replay(dart, always);
+		return;
+	}
 	if (!dart->dapf_count)
 		return;
 	if (!always && apple_dart_dapf_holds(dart))
@@ -6229,6 +6349,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		ret = apple_dart_dapf_parse(pdev, dart);
 		if (ret)
 			return ret;
+	} else if (dart->hw->type == DART_T8020 &&
+		   platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf")) {
+		/* Read back once the DART is powered, below. */
+		dart->dapf = devm_platform_ioremap_resource_byname(pdev, "dapf");
+		if (IS_ERR(dart->dapf))
+			return PTR_ERR(dart->dapf);
 	}
 	dart->restore_on_power_up = of_property_read_bool(dev->of_node,
 							  "apple,restore-on-power-up");
@@ -6397,6 +6523,12 @@ params_done:
 				    dart_params[3], dart->pgsize, dart->ias,
 				    dart->oas, dart->num_streams);
 		goto err_clk_disable;
+	}
+
+	if (dart->dapf && !dart->dapf_count) {
+		ret = apple_dart_dapf_t8020_save(dart);
+		if (ret)
+			goto err_clk_disable;
 	}
 
 	if (!tunneled && dart->hw->type == DART_T8110) {

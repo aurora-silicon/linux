@@ -112,6 +112,13 @@ struct ave_fw_segment {
 	size_t size;
 };
 
+/* One entry of the CPU DART's address filter, as read back */
+struct ave_dapf_entry {
+	u32 ctrl;
+	u64 start;
+	u64 end; /* inclusive */
+};
+
 struct ave_ring {
 	char name[16];
 	u32 mode;
@@ -195,6 +202,11 @@ enum ave_opcode {
  */
 #define AVE_FW_TEXT_CRC_T8112_26B123 0x077a3444
 /*
+ * The M1 (T8103) build preloaded by the macOS 27.2 stub (encoder firmware
+ * 9013.55.1), with the DATA link cell at TEXT 0x423c zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T8103_26B123 0xb6616340
+/*
  * The M5 build of macOS 27.2 (26B123; 27.2.1 26B131 ships it unchanged),
  * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
  */
@@ -248,6 +260,11 @@ struct ave_variant {
 	u64 vcbar_mask;
 	u64 vcbar_flags;
 	/*
+	 * The loader points the code base at TEXT's physical address (the
+	 * M1's TEXT remap address) instead of its DART address.
+	 */
+	bool vcbar_text_phys;
+	/*
 	 * TEXT offset of the 64-bit cell the loader fills with the DATA
 	 * address; it is zero in the firmware image. 0 when there is none.
 	 */
@@ -296,6 +313,11 @@ struct ave_dev {
 
 	struct ave_fw_segment text;
 	struct ave_fw_segment data;
+	/*
+	 * The firmware's own address of DATA, from the TEXT link cell the
+	 * loader filled; 0 where there is no cell or it was left zero.
+	 */
+	u64 data_alias;
 	u32 text_crc;
 	u32 data_crc;
 	void *data_pristine;
@@ -377,6 +399,12 @@ struct ave_dev {
 	/* every stream the device tree attaches on that DART, bit per SID */
 	u32 dart_sid_mask[2];
 	unsigned int n_darts;
+	/*
+	 * The address filter of the DART the coprocessor's CPU goes through,
+	 * where the device tree names one ("dapf"); read-only, NULL otherwise.
+	 */
+	void __iomem *dapf;
+	phys_addr_t dapf_phys;
 	bool witness_unusable;
 	/* Times the MCTF pool CRC changed while no session held it */
 	u32 mctf_pool_changed;
@@ -583,8 +611,8 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t6050, ave_t8112,
-	ave_t8132, ave_m3;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t6050, ave_t8103,
+	ave_t8112, ave_t8132, ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
@@ -596,6 +624,12 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
 int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 			 u32 *crc);
+bool ave_dapf_admits(const struct ave_dapf_entry *e, unsigned int n, u64 first,
+		     u64 last);
+const char *ave_fw_filter_gap(struct ave_dev *ave,
+			      const struct ave_dapf_entry *e, u64 *first,
+			      u64 *last);
+int ave_fw_check_filter(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 int ave_dart_audit(struct ave_dev *ave, const char *when);
