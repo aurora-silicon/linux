@@ -1417,7 +1417,8 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
-	bus->wowl_s2idle_only = false;
+	if (bus)
+		bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -3400,12 +3401,14 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_detach(&pdev->dev);
 	brcmf_free(&pdev->dev);
 
+	brcmf_pcie_release_irq(devinfo);
+
+	dev_set_drvdata(&pdev->dev, NULL);
 	kfree(bus->bus_priv.pcie);
 	kfree(bus->msgbuf->flowrings);
 	kfree(bus->msgbuf);
 	kfree(bus);
 
-	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
 	brcmf_pcie_release_resource(devinfo);
@@ -3418,7 +3421,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 		brcmf_release_module_param(devinfo->settings);
 
 	kfree(devinfo);
-	dev_set_drvdata(&pdev->dev, NULL);
 }
 
 
