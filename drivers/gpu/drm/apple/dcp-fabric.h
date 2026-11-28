@@ -128,7 +128,12 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
-/* An adopted T8132 dcpext. */
+/*
+ * A T8132 dcpext adopted through the M4 26.6.2 backend (iomfb_m4.c,
+ * t8132_ext_drm.c). A J773g dcpext on firmware 27.2 is an ordinary
+ * firmware-27 pipe instead and is neither of these.
+ */
+bool dcp_t8132_ext_m4_node(const struct device_node *np);
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */

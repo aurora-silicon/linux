@@ -21,7 +21,8 @@ FUNCTIONS = {
     'drivers/gpu/drm/apple/dcp-fabric-session.h': ['dcp_fabric_binding_request'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_slot'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
-        'dcp_typec_route_no_dp_alt', 'dcp_is_t8132_ext', 'dcp_typec_port_untileable',
+        'dcp_t8132_ext_m4_node', 'dcp_is_t8132_ext', 'dcp_typec_route_no_dp_alt',
+        'dcp_typec_port_untileable',
         'dcp_tb_slot', 'dcp_tb_split_locked', 'dcp_tb_dispatch_request'],
 }
 CASES = ['t6030-dpin1-alone', 't6030-dpin1-alone-before-services',

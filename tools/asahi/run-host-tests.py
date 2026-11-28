@@ -26,6 +26,7 @@ import concurrent.futures
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -58,6 +59,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'aurora-wake-output-tests.py': [(out(), PASS)],
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
@@ -183,8 +185,13 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
-                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
+                                   'rate-limit', 'stall-reset', 'ring-full', 'trap-bound'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-shared-tcm-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',
+                                   'flowring-idx', 'dma-counts', 'rptr-depth', 'wptr-depth',
+                                   'console-desc', 'console-none',
+                                   'console-buf', 'console-widx', 'console-reinit'), out()),
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
@@ -265,10 +272,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
                                    'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
                                    'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
-                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'held-blocks-owner', 'released-owner-retakes', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake', 'spare-detach-reassigns'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'close-twice', 'latch-before-close',
+                                   'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -286,7 +294,8 @@ ASAHI_TESTS = {
                                    'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
-                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+                                   'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
+                                   'open-owed-skipped', 'post-latch-swallowed', 'reserve-fails-pass'), []),
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
@@ -344,6 +353,8 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-highpri-sched-wq-tests.py': [([], PASS)]
+        + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
@@ -352,7 +363,9 @@ ASAHI_TESTS = {
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
-                                   'node-unmarked', 'no-release'), []),
+                                   'node-unmarked', 'no-release', 'm5-cached-nodes',
+                                   'm5-cached-descriptors', 'cached-queue-records',
+                                   'uncached-g17p-nodes'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.
@@ -365,6 +378,10 @@ ASAHI_TESTS = {
                                    'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
                                    'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
                                    'owed-slow-path'), []),
+    'g17-rescan-poll-tests.py': [([], PASS)]
+        + mutations('--mutation', ('starve-fast-pending', 'starve-slow-pending', 'jiffy-poll',
+                                   'skip-backpressure-poll', 'skip-sleep-cancel',
+                                   'skip-shutdown-disable'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),
@@ -446,6 +463,7 @@ ASAHI_TESTS = {
     't6040-calibration-tests.py': [([], PASS)],
     't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't6050-combo-join-tests.py': [([], PASS)],
+    't8132-display-gate-tests.py': [([], PASS)],
     't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
     'tb-dock-pm-tests.py': [(out('--output'), PASS)],
@@ -464,6 +482,8 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 ASAHI_RUST.append('m3-firmware-tests.rs')
+# G14 firmware 27.2 queue, event and recovery records (its KUnit suite, run on the host).
+ASAHI_RUST.append('g14-v27-2-abi-tests.rs')
 ASAHI_RUST.append('pmp-alloc-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
@@ -586,16 +606,42 @@ def run(job, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
-    ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory)')
+    ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory, '
+                    'removed at the end but for the failed runs\' logs)')
     ap.add_argument('--conf', type=Path, help='a built scripts/kconfig/conf (default: build one)')
     ap.add_argument('--dtc', type=Path, help='a built scripts/dtc/dtc (default: build one)')
     ap.add_argument('--only', help='run only jobs whose name contains this text')
     ap.add_argument('--timeout', type=int, default=900)
     args = ap.parse_args()
 
-    work = args.work or Path(tempfile.mkdtemp(prefix='aurora-host-tests-'))
-    work = work.resolve()
-    work.mkdir(parents=True, exist_ok=True)
+    if args.work:
+        work = args.work.resolve()
+        work.mkdir(parents=True, exist_ok=True)
+        return 1 if run_all(args, work) else 0
+    # A run leaves several GB of build products, so a temporary work directory goes when it ends: all of it after a
+    # pass or an interrupted run, all but the failed runs' logs after a failure.
+    work = Path(tempfile.mkdtemp(prefix='aurora-host-tests-')).resolve()
+    failed = []
+    try:
+        failed = run_all(args, work)
+    finally:
+        keep = {log.parent for _, log in failed}
+        for d in work.iterdir():
+            for path in (d.iterdir() if d in keep else [d]):
+                if path.name == 'log' and d in keep:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+        if not keep:
+            work.rmdir()
+    if failed:
+        print(f'\nthe failed runs\' logs are kept in {work}')
+    return 1 if failed else 0
+
+
+def run_all(args, work):
     conf, dtc = args.conf, args.dtc
     build = work / 'kconfig'
     if conf is None or dtc is None:
@@ -623,7 +669,7 @@ def main():
         text = log.read_text(errors='replace').splitlines()
         print(f'\n=== {label}: last lines of {log}')
         print('\n'.join(text[-40:]))
-    return 1 if failed else 0
+    return failed
 
 
 if __name__ == '__main__':

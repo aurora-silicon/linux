@@ -235,11 +235,50 @@ static void ane_h16_accel_user_bounce_test(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, u.pages);
 }
 
+/*
+ * ane_stats and wedged land on the device with the format of the other ANE
+ * drivers and follow the session: its counters and its quarantine.
+ */
+static void ane_h16_accel_sysfs_test(struct kunit *test)
+{
+	struct device *dev = drm_kunit_helper_alloc_device(test);
+	struct ane_h16_session *s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	struct kernfs_node *kn;
+	struct ane_h16_sysfs *sys;
+	u64 ticket;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	ane_stats_counters_init(&s->sysfs_ctrs, &s->sysfs_ring, 0);
+	s->sysfs_ring.slots = &s->sysfs_slot;
+	sys = ane_h16_sysfs_add(dev, s);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, sys);
+	kn = sysfs_get_dirent(dev->kobj.sd, "ane_stats");
+	KUNIT_EXPECT_NOT_NULL(test, kn);
+	sysfs_put(kn);
+	kn = sysfs_get_dirent(dev->kobj.sd, "wedged");
+	KUNIT_EXPECT_NOT_NULL(test, kn);
+	sysfs_put(kn);
+
+	ticket = ane_stats_begin(&s->sysfs_ctrs, &s->sysfs_ring, 1000, 1);
+	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, 3000, -ETIMEDOUT, 0);
+	KUNIT_EXPECT_GT(test, ane_h16_stats_show(dev, &sys->stats, buf), 0);
+	KUNIT_EXPECT_STREQ(test, buf, "busy_ns 2000\njobs 1\n");
+	KUNIT_EXPECT_EQ(test, ane_h16_wedged_show(dev, &sys->wedged, buf), 2);
+	KUNIT_EXPECT_STREQ(test, buf, "0\n");
+	s->quarantined = true;
+	ane_h16_wedged_show(dev, &sys->wedged, buf);
+	KUNIT_EXPECT_STREQ(test, buf, "1\n");
+}
+
 static struct kunit_case ane_h16_accel_cases[] = {
 	KUNIT_CASE(ane_h16_accel_fops_test),
 	KUNIT_CASE(ane_h16_accel_open_test),
 	KUNIT_CASE(ane_h16_accel_user_pages_test),
 	KUNIT_CASE(ane_h16_accel_user_bounce_test),
+	KUNIT_CASE(ane_h16_accel_sysfs_test),
 	{}
 };
 

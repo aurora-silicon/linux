@@ -265,13 +265,13 @@ pub(crate) fn by_chip(chip_id: u32) -> Option<&'static Soc> {
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
 ///
-/// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is
-/// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
-/// core slots in the first core-mask word only), with the die count of the AGX3 identification
-/// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
-/// comes from the boot loader. Startup uses the guarded `t8122_start` path, which selects this
-/// table's values by default on admitted Air boards and adds a performance-state cap. Explicit
-/// `asahi.t8122_start=0` disables startup; firmware, board and resource admission still apply.
+/// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is the
+/// one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20, core
+/// slots in the first core-mask word only), with one die. The hardware configuration is
+/// `hw::t8122`; power configuration comes from the boot loader. Startup uses the guarded
+/// `t8122_start` path, which selects this table's values by default on admitted Air boards and adds
+/// a performance-state cap. Explicit `asahi.t8122_start=0` disables startup; firmware, board and
+/// resource admission still apply.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",

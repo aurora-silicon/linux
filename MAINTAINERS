@@ -2812,9 +2812,13 @@ F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
 F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
+F:	drivers/nvme/host/apple-kunit.c
 F:	drivers/nvme/host/apple.c
+F:	drivers/nvme/host/apple.kunitconfig
 F:	drivers/nvmem/apple-efuses.c
+F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
+F:	drivers/nvmem/apple-spmi-nvmem.kunitconfig
 F:	drivers/phy/apple/
 F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
@@ -2892,6 +2896,7 @@ S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
 F:	drivers/media/platform/apple/scaler/
+F:	tools/media/apple-scaler/
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>

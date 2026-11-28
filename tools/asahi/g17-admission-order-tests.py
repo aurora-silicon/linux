@@ -160,7 +160,7 @@ def held_fixture():
     at = pairs.index('const SIBLING_BACKLOG')
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
-        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
+        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn owner_released(', 'fn refusal(', 'fn advance(',
         'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
         'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
         'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
@@ -288,6 +288,11 @@ fn own_owner() {
     assert_eq!(state.acquire(8, 1), Some(13));
     assert_eq!(state.refusal(9), Err(ENOSPC));
     assert_eq!(state.acquire(9, 1), None, "a closed owner's held pair goes to no other owner");
+    // The closed owner itself is refused too: the kernel may have closed it for a client whose
+    // early publication still asks (`try_render_early`). Retaking its idle pair would clear
+    // `released`, and nothing would release it again.
+    assert!(state.owner_released(7), "a released owner takes no pair back");
+    assert!(!state.owner_released(8), "an owner that took a released pair is not closed");
 }
 
 fn holds_and_stop() {
@@ -333,6 +338,8 @@ HELD_MUTATIONS = {
     'no-held-wake': ('if cleared {\n            self.returned();', 'if false {\n            self.returned();'),
     'wake-on-every-clear': ('was && !held', '!held'),
     'no-held-stop': ('state.held = 0;', ''),
+    'released-owner-retakes': ('.any(|slot| self.owners[slot] == owner && self.released & (1u64 << slot) != 0)',
+                               '.any(|_| false)'),
     'held-blocks-owner': ('&& (self.quarantined | self.kill_hold) & (1u64 << slot) == 0\n            && self.refs[slot] < cfg::RENDER_DEPTH',
                           '&& (self.quarantined | self.kill_hold | self.held) & (1u64 << slot) == 0\n            && self.refs[slot] < cfg::RENDER_DEPTH'),
 }
@@ -402,16 +409,25 @@ const ENOSPC: i32 = -28;
 const EIO: i32 = -5;
 const EBUSY: i32 = -16;
 const EINVAL: i32 = -22;
+const ENOMEM: i32 = -12;
 #[derive(Clone, Copy)]
 struct Flags;
 const GFP_KERNEL: Flags = Flags;
+/// The next `KVec::push` fails as an allocation would.
+static FAIL_PUSH: AtomicBool = AtomicBool::new(false);
 /// The kernel vector's fallible push and remove.
 #[derive(Clone)]
 struct KVec<T>(Vec<T>);
 impl<T> KVec<T> {
     const fn new() -> Self { KVec(Vec::new()) }
     fn with_capacity(capacity: usize, _: Flags) -> Result<Self> { Ok(KVec(Vec::with_capacity(capacity))) }
-    fn push(&mut self, value: T, _: Flags) -> Result { self.0.push(value); Ok(()) }
+    fn push(&mut self, value: T, _: Flags) -> Result {
+        if FAIL_PUSH.swap(false, SeqCst) {
+            return Err(ENOMEM);
+        }
+        self.0.push(value);
+        Ok(())
+    }
     fn remove(&mut self, index: usize) -> std::result::Result<T, ()> {
         if index < self.0.len() { Ok(self.0.remove(index)) } else { Err(()) }
     }
@@ -430,10 +446,15 @@ mod g17 {
 """ + backlog + r"""
     }
     pub mod context {
-        pub struct Context { pub published: bool, pub scheduler: u64 }
+        pub struct Context { pub published: bool, pub scheduler: u64, pub closed: std::sync::atomic::AtomicBool }
         impl Context {
             pub fn is_published(&self) -> bool { self.published }
             pub fn scheduler_va(&self) -> u64 { self.scheduler }
+            pub fn note_closed(&self, _generation: u64) {
+                self.closed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            pub fn is_closed(&self) -> bool { self.closed.load(std::sync::atomic::Ordering::Acquire) }
+            pub fn note_open_client(&self, _open: bool) {}
         }
     }
     pub mod teardown {
@@ -530,7 +551,9 @@ mod g17 {
 """ + item(render_teardown, 'pub(in crate::g17::runtime) fn release_render(') + '\n' + runtime + r"""
         }
 """ + item(render, 'fn render_hold(') + r"""
-        pub struct Firmware { pub queues: Registry }
+        pub struct Recovery;
+        impl Recovery { pub fn generation(&self) -> u64 { 0 } }
+        pub struct Firmware { pub queues: Registry, pub recovery: Recovery }
         pub struct Host<'a> {
             firmware: &'a mut Firmware,
             registration_powered: bool,
@@ -591,13 +614,15 @@ impl Pool {
 }
 
 use g17::context::Context;
-use g17::runtime::{Active, Buffers, Entry, Firmware, Pair, Qid, Qids, Registry, RenderState, Reservation};
+use g17::runtime::{Active, Buffers, Entry, Firmware, Pair, Qid, Qids, Recovery, Registry, RenderState, Reservation};
 use g17::runtime::backend::{Backend, Channels, Lock as DeviceLock, Shared};
 const SLOTS: usize = cfg::RENDER_SLOTS;
 const NEW: u64 = 5000;
 fn bit(slot: usize) -> u64 { 1u64 << slot }
 fn owner(slot: usize) -> u64 { 1000 + slot as u64 }
-fn context(scheduler: u64) -> Arc<Context> { Arc::new(Context { published: true, scheduler }) }
+fn context(scheduler: u64) -> Arc<Context> {
+    Arc::new(Context { published: true, scheduler, closed: std::sync::atomic::AtomicBool::new(false) })
+}
 /// Every slot is retained by an open owner and no new graph fits; `pairs` are installed.
 fn device(pairs: &[(usize, &Arc<Context>)]) -> Arc<Shared> {
     let mut state = State::new();
@@ -642,7 +667,7 @@ fn device(pairs: &[(usize, &Arc<Context>)]) -> Arc<Shared> {
         qids: Qids,
         buffers: Buffers,
     };
-    Arc::new(Shared { state: DeviceLock(Mutex::new(Some(Box::new(Firmware { queues })))), channels: Channels })
+    Arc::new(Shared { state: DeviceLock(Mutex::new(Some(Box::new(Firmware { queues, recovery: Recovery })))), channels: Channels })
 }
 fn backend(shared: &Arc<Shared>, slot: usize, context: &Arc<Context>) -> Backend {
     Backend { closed: AtomicBool::new(false), shared: shared.clone(), context: context.clone(), owner: owner(slot) }
@@ -753,6 +778,12 @@ fn closed_owner_release() {
     assert_eq!(state.held & bit(31), 0, "a consumed release returns its parked pair's slot");
     assert!(wakes(&shared) > before, "and wakes the publications waiting for render capacity");
     assert_eq!(state.clone().acquire(NEW, 1), Some(31), "a new owner takes the parked pair, not the one whose release is pending");
+    // A queue the kernel closed for its client (`Firmware::close_failed_owners`) is closed by that
+    // client later: its released scheduler gets no second teardown entry, its slot no new hold.
+    backend(&shared, 31, &healthy).release_queue().unwrap();
+    with(&shared, |firmware| assert!(!firmware.queues.teardown.releasing(&healthy),
+                                     "a second close of a released context arms no second scheduler release"));
+    assert_eq!(admission(&shared).held & bit(31), 0, "and holds its parked pair's slot no more");
     assert_ne!(state.held & bit(30), 0);
     // Once the stuck release is consumed too, its slot returns, as the older one.
     consume(&shared, &stuck, 9);
@@ -762,6 +793,22 @@ fn closed_owner_release() {
     assert_eq!(state.clone().acquire(NEW, 1), Some(30), "a slot whose release was consumed goes to a new owner again");
     let raced = with(&shared, |firmware| firmware.queues.admission.raced.lock().unwrap().clone());
     assert!(!raced.iter().take(2).any(|got| *got == Some(30)));
+}
+
+/// A close that cannot reserve its teardown entry does not count as the first close: the
+/// next close (the client's, or `Firmware::close_failed_owners` again) does all of it.
+fn failed_close_is_redone() {
+    let failed = context(0x14);
+    let shared = device(&[(14, &failed)]);
+    FAIL_PUSH.store(true, SeqCst);
+    assert_eq!(backend(&shared, 14, &failed).release_queue(), Err(ENOMEM));
+    assert!(!failed.is_closed(), "a close that failed to reserve its teardown entry is not noted");
+    assert_eq!(admission(&shared).released & bit(14), 0, "and releases nothing");
+    backend(&shared, 14, &failed).release_queue().unwrap();
+    assert!(failed.is_closed());
+    with(&shared, |firmware| assert!(firmware.queues.teardown.releasing(&failed),
+                                     "the next close reserves the teardown entry"));
+    assert_ne!(admission(&shared).released & bit(14), 0, "and releases the owner");
 }
 
 /// Quarantined and owed pairs are held by the same rule; a lent pair keeps its bit.
@@ -864,6 +911,7 @@ fn spare_detach_keeps_exit_kill_ownership() {
 
 fn main() {
     closed_owner_release();
+    failed_close_is_redone();
     work_and_lent_pairs();
     spare_detach_keeps_exit_kill_ownership();
     println!("PASS release holds: a closed owner's idle pair is held from its close, before admission releases its slot, through retirement passes and resyncs, until its scheduler release is consumed and the pair parked; no new owner is given it meanwhile; quarantined and owed pairs are held by the same rule and their own owner keeps them; a lent pair keeps its bit and is held when its owner closes meanwhile; a missing or parked pair is never held; detaching a published spare preserves exit-kill ownership");
@@ -877,10 +925,15 @@ RELEASE_MUTATIONS = {
                                'let claimed = self.admission.reassign_unused_spare(slot as u8, expected, owner);'),
     'hold-ignores-release': ('pair.unreusable_work() || teardown.releasing(pair.context())', 'pair.unreusable_work()'),
     'hold-ignores-work': ('pair.unreusable_work() || teardown.releasing(pair.context())', 'teardown.releasing(pair.context())'),
-    'close-unheld': ('firmware.queues.sync_render_holds();\n        firmware.queues.admission.release_owner(self.owner);',
+    'close-unheld': ('firmware.queues.sync_render_holds();\n            firmware.queues.admission.release_owner(self.owner);',
                      'firmware.queues.admission.release_owner(self.owner);'),
-    'hold-after-release': ('firmware.queues.sync_render_holds();\n        firmware.queues.admission.release_owner(self.owner);',
-                           'firmware.queues.admission.release_owner(self.owner);\n        firmware.queues.sync_render_holds();'),
+    # The client's close after the kernel's repeats the firmware side.
+    'close-twice': ('if !self.context.is_closed() {', 'if true {'),
+    # A close that fails to reserve its teardown entry still counts as the first.
+    'latch-before-close': ('if !self.context.is_closed() {',
+                           'if !self.context.is_closed() && { self.context.note_closed(firmware.recovery.generation()); true } {'),
+    'hold-after-release': ('firmware.queues.sync_render_holds();\n            firmware.queues.admission.release_owner(self.owner);',
+                           'firmware.queues.admission.release_owner(self.owner);\n            firmware.queues.sync_render_holds();'),
     'put-back-own-work': ('self.queues.hold_render_slot(slot);\n        result',
                           'let held = self.queues.render.entries[slot].as_ref().and_then(|entry| entry.pair.as_ref())'
                           '.is_some_and(|pair| pair.unreusable_work());\n        self.queues.admission.set_held(slot, held);\n        result'),

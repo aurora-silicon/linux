@@ -549,6 +549,11 @@ pub(crate) struct Fences {
     pub(crate) scheduled: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    /// Pending host-timestamp writer completion fences inherited through
+    /// timestamp-free publication chaining. `None` for commands that write their
+    /// own timestamps (covered by `completed`) or have no pending timestamp
+    /// ancestors.
+    pub(crate) timestamp_waits: Option<Arc<KVec<Fence>>>,
     pub(crate) owner: Arc<Completion>,
 }
 
@@ -591,21 +596,21 @@ impl<B: Backend> Scheduler<B> {
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let device = dev.as_ref().as_ref();
-        let submit = if backend.creator_cluster_scheduling() {
+        // Run drm_sched's submit worker at WQ_HIGHPRI so host-waited jobs (such as
+        // query-access computes unblocked by completion events) are not delayed in
+        // CFS behind busy game/render threads.
+        let queue = workqueue::OwnedQueue::new_ordered_highpri_reclaim(name)?;
+        if backend.creator_cluster_scheduling() {
             // The run and free work stays in the creating CPU's cluster, as the event work
             // follows the submitter, instead of wherever an unbound worker last ran.
-            let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
             let cluster = Cpumask::cluster_of(CpuId::current());
             // Without a cpu-map in the device tree each CPU is its own cluster: the queue then
             // stays unrestricted rather than tied to the one CPU that created it.
             if cluster.weight() > 1 {
                 queue.restrict(cluster)?;
             }
-            Some(queue)
-        } else {
-            // drm_sched allocates its own ordered reclaim-safe queue.
-            None
-        };
+        }
+        let submit = Some(queue);
         let scheduler = sched::Scheduler::new_with_queues(
             device, 1, credits, 0, TIMEOUT_MS, name, submit, Some(backend.fence_queue()),
         )?;
@@ -680,7 +685,14 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, scheduled, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences {
+            ready,
+            scheduled,
+            completed,
+            publication: host_publication,
+            timestamp_waits: None,
+            owner: packet.completion.clone(),
+        })
     }
 }
 

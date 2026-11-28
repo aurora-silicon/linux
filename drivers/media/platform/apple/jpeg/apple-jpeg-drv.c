@@ -55,6 +55,7 @@ struct apple_jpeg {
 	struct apple_jpeg_ctx *active;
 	bool broken;
 	u32 status, int_status, bytes;
+	unsigned long deadline;	/* when the active job times out, in jiffies */
 	struct delayed_work watchdog;
 	struct apple_jpeg_write writes[APPLE_JPEG_MAX_WRITES];
 };
@@ -215,7 +216,11 @@ static void aj_watchdog(struct work_struct *work)
 
 	spin_lock_irqsave(&jpeg->hw_lock, flags);
 	ctx = jpeg->active;
-	jpeg->active = NULL;
+	/* An expiry from an earlier job that was already running: not this job's. */
+	if (ctx && time_before(jiffies, jpeg->deadline))
+		ctx = NULL;
+	else
+		jpeg->active = NULL;
 	if (ctx) {
 		aj_write(jpeg, AJ_MAIN_RUN, 0);
 		aj_write(jpeg, AJ_IRQ_MASK, 0);
@@ -301,12 +306,19 @@ static void aj_device_run(void *priv)
 		return;
 	}
 	jpeg->active = ctx;
+	/*
+	 * Arm the watchdog before the start command, so that the completion
+	 * cannot precede it, and give this job its full timeout even if an
+	 * earlier job's expiry is still pending.
+	 */
+	jpeg->deadline = jiffies + msecs_to_jiffies(AJ_JOB_TIMEOUT_MS);
+	mod_delayed_work(system_percpu_wq, &jpeg->watchdog,
+			 msecs_to_jiffies(AJ_JOB_TIMEOUT_MS));
 	/* Buffers must be visible before the start command, the last write. */
 	dma_wmb();
 	for (int i = 0; i < n; i++)
 		writel(jpeg->writes[i].value, jpeg->regs + jpeg->writes[i].offset);
 	spin_unlock_irqrestore(&jpeg->hw_lock, flags);
-	schedule_delayed_work(&jpeg->watchdog, msecs_to_jiffies(AJ_JOB_TIMEOUT_MS));
 }
 
 static const struct v4l2_m2m_ops aj_m2m_ops = {

@@ -276,11 +276,15 @@ static void dcp_firmware_27_pin_precedence(struct kunit *test)
 	fx->props[0].value = compat_27_2;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
-	/* T8132 keeps its M4 match-data pin on 27.2. */
+	/*
+	 * T8132 keeps its M4 match-data pin on 27.2, never generic firmware
+	 * 27: the M4 backend's on its 26.6.2 firmware path, nobody's off it.
+	 */
 	fx->props[3].length = sizeof(t8132);
 	fx->props[3].value = (void *)t8132;
 	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
-			DCP_FIRMWARE_M4);
+			apple_t8132_firmware_path() ? DCP_FIRMWARE_M4 :
+						      DCP_FIRMWARE_UNKNOWN);
 #endif
 }
 

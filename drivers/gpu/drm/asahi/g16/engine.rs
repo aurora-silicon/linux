@@ -175,6 +175,22 @@ fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> 
     f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
 }
 
+/// Whether a render of `vm`, multisampled when `msaa`, must wait for render flight `f` to
+/// retire before it is published.
+///
+/// Every VM's render passes share the one firmware TA/FS queue pair. While passes of two VMs
+/// are both published there and one of the VMs renders multisampled
+/// (`VmStateInner::renders_msaa`), that VM's passes can lose coverage (uncovered or zero
+/// pixels and samples, also in single-sampled passes that read its multisampled images) and
+/// its fragment shaders can read VA 0. Ordering the two passes' TA and FS with ring barriers
+/// does not prevent it; publishing one only after the other retired does. Passes of one VM,
+/// and passes of VMs that never render multisampled, still share the queues.
+fn msaa_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, msaa: bool) -> bool {
+    f.renders != 0
+        && !Arc::ptr_eq(&f.job.vm, vm)
+        && (msaa || vm.renders_msaa() || f.job.vm.renders_msaa())
+}
+
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
 /// `DRM_ASAHI_RENDER_STAGE_PREFIXES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -349,6 +365,9 @@ pub(crate) struct Flight {
     pub(crate) rt_compute: bool,
     /// Whether this flight includes any heavy-TA render pass (multi-layer or large tilemap).
     pub(crate) heavy_render: bool,
+    /// Whether this flight includes a multisampled render pass; its VM is marked
+    /// (`VmStateInner::note_msaa_render`) once the flight becomes visible.
+    pub(crate) msaa: bool,
 }
 
 impl Flight {
@@ -393,6 +412,7 @@ impl Flight {
             has_timestamps: false,
             rt_compute: false,
             heavy_render: false,
+            msaa: false,
         }
     }
 }
@@ -438,8 +458,9 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute behind render of another VM, render behind compute of another VM, or an
-    /// SCS compute conflict.
+    /// Compute behind render of another VM, render behind compute of another VM, an SCS
+    /// compute conflict, or a render beside another VM's render while one of the two VMs
+    /// renders multisampled.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
     DrainPb,
@@ -1414,6 +1435,16 @@ impl Firmware {
         Ok(())
     }
 
+    /// Whether render `r` of `vm` may be published beside the flights in flight
+    /// ([`msaa_render_conflict`]). Every member of a prefix is checked, not only its first.
+    fn msaa_member_allowed(&self, vm: &Arc<super::vm::VmState>, r: &RenderCommand) -> bool {
+        !self
+            .engine
+            .flights
+            .iter()
+            .any(|f| msaa_render_conflict(f, vm, r.is_multisampled()))
+    }
+
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
@@ -1423,12 +1454,14 @@ impl Firmware {
         let is_rt_compute = is_compute
             && (job.resources.compute_scs()
                 || matches!(cmd, Some(Command::Compute(c)) if c.is_rt()));
+        let is_msaa_render = matches!(cmd, Some(Command::Render(r)) if r.is_multisampled());
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
                 f.doomed
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
+                    || (is_render && msaa_render_conflict(f, &job.vm, is_msaa_render))
                     || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
@@ -1731,9 +1764,11 @@ impl Firmware {
                     .flights
                     .iter()
                     .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
+                let msaa_conflict = !self.msaa_member_allowed(&job.vm, r);
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
                 let ta_cap = self.ta_wave_cap_for(r.is_heavy_ta());
                 !cross_vm_compute
+                    && !msaa_conflict
                     && render_count < params::render_flights()
                     && *ta_pending.get_or_insert_with(|| self.ta_pending_passes()) < ta_cap
                     && !self.slots.render_exhausted()
@@ -3135,6 +3170,9 @@ impl Firmware {
                         let Some(Command::Render(r2)) = command(job, end) else {
                             break;
                         };
+                        if !self.msaa_member_allowed(&job.vm, r2) {
+                            break;
+                        }
                         if r2.is_heavy_ta() && !wave_heavy {
                             if ta_pending_before + prefix.renders as usize + 1
                                 > sizes::TA_WAVE_PASSES
@@ -3289,6 +3327,10 @@ impl Firmware {
                                     precheck_ok = false;
                                     break;
                                 };
+                                if !self.msaa_member_allowed(&job.vm, r2) {
+                                    precheck_ok = false;
+                                    break;
+                                }
                                 if r2.is_heavy_ta() {
                                     job_heavy = true;
                                 }
@@ -3435,6 +3477,9 @@ impl Firmware {
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
         *visible = true;
+        if f.msaa {
+            job.vm.note_msaa_render();
+        }
         let publication = (|| -> Result {
             if render {
                 let a = f.pb_slot as usize;
@@ -3646,7 +3691,7 @@ impl Firmware {
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             qinfo: g.qinfo.va,
-            user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+            user_stamp: g.user_stamp.va,
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
@@ -3960,6 +4005,7 @@ impl Firmware {
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         f.heavy_render |= cmd.is_heavy_ta();
+        f.msaa |= cmd.is_multisampled();
         let p = resources.render_pass(k)?;
         let pass = p.refs();
         let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };

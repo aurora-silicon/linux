@@ -649,6 +649,8 @@ static int h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *
 	INIT_LIST_HEAD(&s->programs);
 	INIT_LIST_HEAD(&s->held);
 	spin_lock_init(&s->stats_lock);
+	ane_stats_counters_init(&s->sysfs_ctrs, &s->sysfs_ring, 0);
+	s->sysfs_ring.slots = &s->sysfs_slot;
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
 	spin_lock_init(&s->export_lock);
 	INIT_LIST_HEAD(&s->exports_done);
@@ -680,7 +682,7 @@ static int h16_fail(struct ane_h16_session *s, int error)
 	if (!s->error)
 		s->error = error;
 	if (!s->quarantined) {
-		s->quarantined = true;
+		WRITE_ONCE(s->quarantined, true);
 		ane_h16_pending_fail_all(&s->pending, s->error);
 		wake_up_all(&s->wake);
 		s->ops->log(s->ctx, "program quarantine", (u64)-s->error, 0);
@@ -746,6 +748,36 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 		used += lengths[i];
 	}
 	return 0;
+}
+
+/*
+ * Every CREATE makes the firmware ask for a 2 MiB EXPP process pool by
+ * SHAREDMALLOC and wait for it before it answers; a pool it could not get
+ * leaves the CREATE stalled and the engine quarantined, and with it every
+ * other program of the session. Take the pool before LOAD instead
+ * (ane_fw_transport_shared_reserve()), so that without memory or quota the
+ * LOAD fails cleanly, before any traffic. A FREE of a torn-down program's
+ * pool may still be posted (it can come after the post-UNLOAD settle):
+ * serve it and try once more before giving up.
+ */
+static int h16_process_pool(struct ane_h16_session *s)
+{
+	int ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M, ANE_FW_SHARED_EXPP);
+
+	if (ret == -ENOSPC) {
+		ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+					      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+		if (ret < 0)
+			return h16_fail(s, ret);
+		ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M,
+						      ANE_FW_SHARED_EXPP);
+	}
+	if (ret && s->transport->error)
+		return h16_fail(s, ret);
+	if (ret)
+		s->ops->log(s->ctx, "LOAD: no process pool", (u64)-ret,
+			    s->transport->shared_bytes);
+	return ret;
 }
 
 /*
@@ -1228,6 +1260,9 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	ret = h16_load_room(s);
 	if (ret)
 		return ret;
+	ret = h16_process_pool(s);
+	if (ret)
+		return ret;
 	p = kzalloc_obj(*p);
 	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
 	if (!p || !command) {
@@ -1604,6 +1639,19 @@ static int h16_execute_room(struct ane_h16_session *s, struct ane_h16_program *p
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
+/*
+ * A request counts in ane_stats from its first firmware traffic (the opening
+ * gate, or the EXECUTE itself when the gate is already open) until it ends
+ * either way. A refusal or local failure before that point reached nothing.
+ */
+static void h16_count_begin(struct ane_h16_session *s, bool *counted, u64 *ticket)
+{
+	if (*counted)
+		return;
+	*ticket = ane_stats_begin(&s->sysfs_ctrs, &s->sysfs_ring, ktime_get_ns(), 1);
+	*counted = true;
+}
+
 static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
@@ -1618,6 +1666,8 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	unsigned int i;
 	u64 deadline, polls, t0, gate_open, t1 = 0, t2 = 0, t3, end;
 	u64 entry = h16_now(s);
+	bool counted = false;
+	u64 ticket = 0;
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -1664,6 +1714,7 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	trace->step = H16_STEP_GATE_OPEN;
 	t0 = h16_now(s);
 	if (!s->gate_held) {
+		h16_count_begin(s, &counted, &ticket);
 		ret = h16_gate(s, 0);
 		if (ret)
 			goto fail;
@@ -1698,6 +1749,8 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 					      ANE_FW_DATA_CHAIN);
 	if (!ret) {
 		trace->step = H16_STEP_SEND;
+		/* With the gate already open, the request itself is the first traffic. */
+		h16_count_begin(s, &counted, &ticket);
 		t1 = h16_now(s);
 		ret = h16_send(s, ANE_FW_DATA_CHAIN, command, length, &reply);
 	}
@@ -1739,8 +1792,11 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	x->polls = s->transport->polls - polls;
 	kfree(command);
 	x->ns[ANE_H16_T_FINISH] = h16_now(s) - end;
+	ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), 0, 0);
 	return 0;
 fail:
+	if (counted)
+		ane_stats_complete(&s->sysfs_ctrs, &s->sysfs_ring, ticket, ktime_get_ns(), ret, 0);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request->key.uuid);
 	/*
 	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
@@ -2170,7 +2226,7 @@ void ane_h16_session_recovered(struct ane_h16_session *s)
 {
 	struct ane_h16_program *p, *n;
 
-	s->quarantined = false;
+	WRITE_ONCE(s->quarantined, false);
 	s->pending.quarantined = false;
 	s->pending.error = 0;
 	s->error = 0;
@@ -2199,6 +2255,9 @@ static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 	unsigned int i;
 	int ret;
 
+	ret = h16_process_pool(s);
+	if (ret)
+		return ret;
 	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
 	if (!command)
 		return -ENOMEM;
@@ -2262,7 +2321,7 @@ int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
 		ret = h16_replay(s, p);
 		if (ret) {
 			s->ops->log(s->ctx, "PROGRAM REPLAY FAILED", p->key.program, (u64)-ret);
-			return ret;
+			return h16_fail(s, ret);
 		}
 		if (!(*replayed)++)
 			*first_ns = h16_now(s);
