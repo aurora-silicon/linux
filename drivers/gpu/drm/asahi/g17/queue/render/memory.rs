@@ -431,10 +431,13 @@ impl NeoGeneration {
             mmu::PROT_GPU_FW_SHARED_RW,
             mmu::UAT_PGSZ,
         )?;
+        // The fragment status page's kernel mapping, in the upper half every execution context
+        // includes, is the firmware's alone: the firmware reads the status there, and the GPU
+        // writes it through the client alias below.
         let fragment = alloc.kernel(
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let fragment_client = buffer::compact_alias(

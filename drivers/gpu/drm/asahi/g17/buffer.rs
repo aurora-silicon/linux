@@ -818,10 +818,13 @@ impl Manager {
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
         }
+        // The parameter-buffer graph's kernel mapping, in the upper half every execution context
+        // includes, is the firmware's alone. The GPU reaches its page list only through the
+        // client alias below.
         let mut graph = alloc.kernel(
             layout.bytes,
             cfg::TVB_PAGE,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let source = layout.pages..layout.pages + layout.page_bytes;
