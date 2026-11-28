@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! GPU thermal management for M5: opt-in host power budget governor (J714) and
-//! DT-configured hotspot fan assistance.
+//! GPU thermal management for M5: the host power budget governor (J714), on by default with its
+//! fan boost, and DT-configured hotspot fan assistance where the governor is turned off.
 //!
 //! The firmware limits the GPU to the host power budget word in Region C within about a second
 //! (the calibrated maximum is written there at initialization). Left at that maximum under
@@ -152,9 +152,13 @@ fn fan_curve_enabled() -> bool {
 pub(super) fn requested() -> bool {
     enabled() || hotspot_fans_only()
 }
+/// The hotspot the governor settles at: 100 C by default, the die temperature the PMP's fast
+/// die control holds on T6050 (the ADT's `fast-die-ctrl-ts-avg-temp`), and below the hotspot
+/// at which the GPU firmware's own limiter, after holding the GPU dies at their limit for
+/// about a minute, pins the GPU to its base performance state.
 fn target_mc() -> i32 {
     let parameter = crate::module_parameters::m5_thermal_target_mc.value();
-    i32::try_from(parameter).unwrap_or(90_000).clamp(70_000, 104_000)
+    i32::try_from(parameter).unwrap_or(100_000).clamp(70_000, 104_000)
 }
 
 /// Whether the firmware's primary limiter words describe the emergency clamp.
