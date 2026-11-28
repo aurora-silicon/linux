@@ -484,9 +484,6 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 				if (delay)
 					mod_delayed_work(system_dfl_wq, &dcp->iomfb.backlight_retry,
 							 msecs_to_jiffies(delay));
-				else
-					dev_warn_ratelimited(dcp->dev,
-							     "backlight retry limit reached\n");
 			}
 		}
 		transaction->release(transaction);

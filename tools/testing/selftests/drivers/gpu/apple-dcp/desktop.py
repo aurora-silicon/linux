@@ -912,7 +912,8 @@ def brightness_notifications(root):
     source=(root/'drivers/gpu/drm/apple/dcp_backlight.c').read_text()
     functions='\n'.join(block(source,name) for name in (
         'static void dcp_backlight_notify_work(', 'static void dcp_backlight_notify_release(', 'static void dcp_backlight_notify(',
-        'static bool dcp_backlight_desktop(', 'void dcp_backlight_desktop_finish(',
+        'static bool dcp_backlight_desktop(', 'static unsigned int dcp_backlight_retry_delay_locked(',
+        'void dcp_backlight_desktop_finish(',
         'void dcp_backlight_stop('))
     return prefix+r'''
 #include <stddef.h>
@@ -926,15 +927,18 @@ def brightness_notifications(root):
 #define KOBJ_CHANGE 1
 #define system_dfl_wq NULL
 #define msecs_to_jiffies(x) (x)
+#define lockdep_assert_held(p) assert(*(p))
+static unsigned warned;
+#define dev_warn_ratelimited(dev,...) do {(void)(dev);warned++;} while(0)
 struct work_struct {int unused;};
 struct backlight_device {struct {int kobj;} dev;struct {u32 brightness;} props;};
 struct apple_dcp {
-    int fw_compat;bool quiescing,crashed;
+    int fw_compat;bool quiescing,crashed;void *dev;
     struct {struct backlight_device *bl_dev;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;struct work_struct notify_work;int fade_work,retry_work;} backlight;
     struct {struct dcp_backlight_swap backlight;} *desktop;
 };
-static unsigned events,brightness,actual,kicks,cancelled,delayed_cancelled;
+static unsigned events,brightness,actual,kicks,cancelled,delayed_cancelled,scheduled,retry_delay;
 static void cancel_delayed_work_sync(int *work) {(void)work;delayed_cancelled++;}
 static void cancel_work_sync(struct work_struct *w) {(void)w;cancelled++;}
 static void kobject_uevent_env(int *k,int action,char **env)
@@ -944,7 +948,7 @@ static void sysfs_notify(int *k,void *dir,const char *name)
 static void dcp_backlight_notify_work(struct work_struct *);
 static void schedule_work(struct work_struct *w) {dcp_backlight_notify_work(w);}
 static void dcp_backlight_kick(struct apple_dcp *d) {assert(!d->backlight.lock);kicks++;}
-static void mod_delayed_work(void *q,int *w,unsigned delay) {(void)q;(void)w;assert(delay);}
+static void mod_delayed_work(void *q,int *w,unsigned delay) {(void)q;(void)w;assert(delay);retry_delay=delay;scheduled++;}
 '''+functions+r'''
 int main(void)
 {
@@ -964,6 +968,25 @@ int main(void)
     assert(!dcp_bl_request(&d.backlight.state,250,false,false));
     assert(!dcp_bl_swap_prepare(&d.backlight.state,&desktop.backlight,9,true));
     dcp_backlight_desktop_finish(&d,9,true,false);assert(events==1);
+    /* A refused present is presented again after the base delay, without a warning. */
+    assert(scheduled==1 && retry_delay==DCP_BL_RETRY_BASE_MS && !warned && !kicks);
+    /* Each refusal doubles the delay. The one that ends the budget warns; later ones do not. */
+    for(unsigned n=1;n<=DCP_BL_RETRY_MAX+2;n++) {
+        assert(!dcp_bl_swap_prepare(&d.backlight.state,&desktop.backlight,9+n,true));
+        retry_delay=0;dcp_backlight_desktop_finish(&d,9+n,true,false);
+        assert(retry_delay==(n<DCP_BL_RETRY_MAX?DCP_BL_RETRY_BASE_MS<<n:0));
+        assert(warned==(n>=DCP_BL_RETRY_MAX));
+    }
+    assert(scheduled==DCP_BL_RETRY_MAX && d.backlight.state.refused==DCP_BL_RETRY_MAX+3);
+    assert(events==1 && !kicks && d.backlight.state.dirty);
+    /* A new request has its own budget and its own warning. */
+    assert(!dcp_bl_request(&d.backlight.state,300,false,false));
+    for(unsigned n=0;n<=DCP_BL_RETRY_MAX;n++) {
+        assert(warned==1);
+        assert(!dcp_bl_swap_prepare(&d.backlight.state,&desktop.backlight,20+n,true));
+        dcp_backlight_desktop_finish(&d,20+n,true,false);
+    }
+    assert(warned==2 && scheduled==2*DCP_BL_RETRY_MAX && events==1);
     d.quiescing=true;dcp_backlight_notify(&d);assert(events==1);
     d.quiescing=false;d.fw_compat=1;dcp_backlight_notify(&d);assert(events==1);
     dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==3);
