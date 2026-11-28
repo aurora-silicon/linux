@@ -6,17 +6,29 @@
 use kernel::{bindings, dma_fence::{Fence, RawDmaFence}, prelude::*};
 
 #[repr(C)]
-pub(super) struct Leaf {
-    pub(super) fence: *mut bindings::dma_fence,
-    pub(super) status: i32,
+pub(crate) struct Leaf {
+    pub(crate) fence: *mut bindings::dma_fence,
+    pub(crate) status: i32,
 }
 
 unsafe extern "C" {
-    fn asahi_g17_collect_fences(head: *mut bindings::dma_fence,
+    fn asahi_g17_collect_fences_coalesced(head: *mut bindings::dma_fence,
         out: *mut Leaf, capacity: usize) -> i32;
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
+    fn asahi_g17_fence_order(a: *mut bindings::dma_fence, b: *mut bindings::dma_fence) -> i32;
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
+}
+
+impl super::dependency::FenceOrder for Fence {
+    fn order(&self, earlier: &Self) -> super::dependency::FenceOrdering {
+        // SAFETY: Both fences are live references; the helper only reads them.
+        match unsafe { asahi_g17_fence_order(self.raw(), earlier.raw()) } {
+            1 => super::dependency::FenceOrdering::Later,
+            0 => super::dependency::FenceOrdering::NotLater,
+            _ => super::dependency::FenceOrdering::OtherContext,
+        }
+    }
 }
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
@@ -42,25 +54,34 @@ impl Drop for Leaf {
     }
 }
 
-/// Allocation, unsupported containers, or a large prefix retain normal waits.
-pub(super) fn collect(input: &Fence) -> Option<KVec<Leaf>> {
+fn collect_with(
+    input: &Fence,
+    collector: unsafe extern "C" fn(*mut bindings::dma_fence, *mut Leaf, usize) -> i32,
+) -> Option<KVec<Leaf>> {
     let mut capacity = 4;
     loop {
         let mut leaves = KVec::with_capacity(capacity, GFP_KERNEL).ok()?;
         // SAFETY: The input owns its fence. The C helper writes at most capacity
         // fully initialized records and releases every reference on failure.
-        let count = unsafe {
-            asahi_g17_collect_fences(input.raw(), leaves.as_mut_ptr(), capacity)
-        };
+        let count = unsafe { collector(input.raw(), leaves.as_mut_ptr(), capacity) };
         if count == ENOSPC.to_errno() && capacity < 128 {
             capacity = (capacity * 4).min(128);
             continue;
         }
-        if count < 0 { return None; }
+        if count < 0 {
+            return None;
+        }
         // SAFETY: The helper returned this many initialized, owned records.
         unsafe { leaves.set_len(count as usize) };
         return Some(leaves);
     }
+}
+
+/// The leaves of `input`, coalescing unsignalled non-error leaves sharing a `dma_fence` context
+/// to their latest sequence number so deep timeline chains stay bounded by distinct contexts.
+/// Allocation, unsupported containers, or a large prefix retain normal waits.
+pub(crate) fn collect_coalesced(input: &Fence) -> Option<KVec<Leaf>> {
+    collect_with(input, asahi_g17_collect_fences_coalesced)
 }
 
 
@@ -76,7 +97,7 @@ pub(super) struct Source {
 /// processor stop until the last consumer releases its binding loan.
 pub(super) struct Hold(Arc<AtomicU32>);
 impl Hold {
-    fn new(readers: &Arc<AtomicU32>) -> Result<Self> {
+    pub(super) fn new(readers: &Arc<AtomicU32>) -> Result<Self> {
         readers.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |count| count.checked_add(1)).map_err(|_| EOVERFLOW)?;
         Ok(Self(readers.clone()))
@@ -86,9 +107,8 @@ impl Drop for Hold {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
-/// A new owner starts with no loans. Acquiring a loan requires exclusive access
-/// and arms the hint; eligibility queries stay read-only. A validated owner
-/// transition can clear the hint after all independent loans have been released.
+/// Checks a physical queue's independent source-reader counter directly so lock-free
+/// direct-path loans (`Hold::new`) are always observed by ownership, rearm, and share checks.
 #[repr(transparent)]
 pub(super) struct ReaderHint {
     possible: bool,
@@ -103,7 +123,7 @@ impl ReaderHint {
         Ok(hold)
     }
     pub(super) fn has_readers(&self, count: &AtomicU32) -> bool {
-        self.possible && count.load(Ordering::Acquire) != 0
+        count.load(Ordering::Acquire) != 0
     }
     pub(super) fn reset_for_owner(&mut self, count: &AtomicU32) -> Result {
         if self.has_readers(count) { return Err(EBUSY); }

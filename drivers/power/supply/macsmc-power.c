@@ -105,7 +105,11 @@ struct macsmc_power {
 	/*
 	 * Where neither CHTE nor CH0C exists, inhibit-charge holds the charge
 	 * at the current level with CHLS_HOLD; the user's own CHLS limit is
-	 * kept here meanwhile and restored when the hold ends.
+	 * kept here meanwhile and restored when the hold ends. It is kept in
+	 * RAM only: the SMC has no spare key for it. If the driver binds while
+	 * a hold from an earlier boot or binding is still set, the earlier
+	 * limit is unknown, so the end threshold reads 100 and ending the hold
+	 * leaves no limit. Userspace that sets both should set the limit again.
 	 */
 	u8 chls_user_limit;
 	/* Battery critical key (BCF0) is 1 byte (Modern firmware) */
@@ -563,7 +567,7 @@ static int macsmc_battery_set_charge_behaviour(struct macsmc_power *power, int v
 static int macsmc_battery_get_date(const char *s, int *out)
 {
 	if (!isdigit(s[0]) || !isdigit(s[1]))
-		return -EOPNOTSUPP;
+		return -ENODATA;
 
 	*out = (s[0] - '0') * 10 + s[1] - '0';
 	return 0;
@@ -763,7 +767,8 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_MANUFACTURE_YEAR:
 		ret = macsmc_battery_get_date(&power->mfg_date[0], &val->intval);
 		/* The SMC reports the manufacture year as an offset from 1992. */
-		val->intval += 1992;
+		if (!ret)
+			val->intval += 1992;
 		break;
 	case POWER_SUPPLY_PROP_MANUFACTURE_MONTH:
 		ret = macsmc_battery_get_date(&power->mfg_date[2], &val->intval);
@@ -898,6 +903,16 @@ static const struct power_supply_desc macsmc_battery_desc_template = {
 	.property_is_writeable	= macsmc_battery_property_is_writeable,
 };
 
+/*
+ * PDTR is the power the system takes from the adapter (DC in) now, in watts.
+ * With ACPW (what the adapter may deliver) it tells how much of the adapter is
+ * in use; the battery's own power_now tells how much of that goes to charging.
+ */
+static int macsmc_ac_read_power_now(struct macsmc_power *power, int *uw)
+{
+	return apple_smc_read_f32_scaled(power->smc, SMC_KEY(PDTR), uw, 1000000);
+}
+
 static int macsmc_ac_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
 				  union power_supply_propval *val)
@@ -923,6 +938,9 @@ static int macsmc_ac_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_POWER_LIMIT:
 		ret = apple_smc_read_u32(power->smc, SMC_KEY(ACPW), &vu32);
 		val->intval = vu32 * 1000;
+		break;
+	case POWER_SUPPLY_PROP_POWER_NOW:
+		ret = macsmc_ac_read_power_now(power, &val->intval);
 		break;
 	default:
 		return -EINVAL;
@@ -1105,10 +1123,10 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		return ret;
 	dev_set_drvdata(dev, power);
 
-	INIT_WORK(&power->critical_work, macsmc_power_critical_work);
 	ret = devm_work_autocancel(dev, &power->critical_work, macsmc_power_critical_work);
 	if (ret)
 		return ret;
+	INIT_DELAYED_WORK(&power->dbg_log_work, macsmc_dbg_work);
 
 	/*
 	 * Check for battery presence.
@@ -1230,7 +1248,11 @@ static int macsmc_power_probe(struct platform_device *pdev)
 			info.type_code == __SMC_KEY('s', 'i', '1', '6') &&
 			info.size == sizeof(s16);
 
-		/* Preserve firmware charge policy until userspace changes it. */
+		/*
+		 * Preserve firmware charge policy until userspace changes it:
+		 * the inhibitors (CHTE, CH0C, CH0I) and CH0K/CH0B persist in the
+		 * SMC, and binding the driver is not a request to reset them.
+		 */
 		/* Detect charge limit method (CHWA vs CHLS) */
 		if (apple_smc_read_flag(power->smc, SMC_KEY(CHWA), &flag) == 0)
 			power->has_chwa = true;
@@ -1240,6 +1262,8 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		if (power->has_chls && (vu16 & CHLS_FORCE_DISCHARGE) &&
 		    !macsmc_chls_has_limit(vu16))
 			dev_warn(dev, "CHLS force-discharge without a limit; select charge_behaviour=auto to clear\n");
+		if (power->has_chls && macsmc_chls_holds(power, vu16))
+			dev_info(dev, "CHLS holds the charge from an earlier boot; the charge limit before it is not known\n");
 
 		/*
 		 * CHLS carries auto-discharge, so a CHLS-only Mac can select auto
@@ -1302,6 +1326,9 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		if (apple_smc_key_exists(power->smc, SMC_KEY(ACPW)))
 			props[nprops++] = POWER_SUPPLY_PROP_INPUT_POWER_LIMIT;
 
+		if (apple_smc_key_exists(power->smc, SMC_KEY(PDTR)))
+			props[nprops++] = POWER_SUPPLY_PROP_POWER_NOW;
+
 		/* macOS 15.4+ firmware dropped legacy AC keys (AC-n, AC-i) */
 		if (apple_smc_read_u16(power->smc, SMC_KEY(AC-n), &vu16) >= 0) {
 			props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_NOW;
@@ -1327,11 +1354,9 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	if (!power->batt && !power->ac)
 		return -ENODEV;
 
+	/* Both work items were set up above, before anything can queue them. */
 	power->nb.notifier_call = macsmc_power_event;
 	blocking_notifier_chain_register(&smc->event_handlers, &power->nb);
-
-	INIT_WORK(&power->critical_work, macsmc_power_critical_work);
-	INIT_DELAYED_WORK(&power->dbg_log_work, macsmc_dbg_work);
 
 	g_power = power;
 
@@ -1345,12 +1370,16 @@ static void macsmc_power_remove(struct platform_device *pdev)
 {
 	struct macsmc_power *power = dev_get_drvdata(&pdev->dev);
 
-	cancel_work(&power->critical_work);
-	cancel_delayed_work(&power->dbg_log_work);
-
+	/*
+	 * Stop new work first: the notifier queues the critical work and the
+	 * log_power parameter queues the log through g_power. The debug work
+	 * re-arms itself, so disable it and wait, as devm frees power next.
+	 */
+	blocking_notifier_chain_unregister(&power->smc->event_handlers, &power->nb);
 	g_power = NULL;
 
-	blocking_notifier_chain_unregister(&power->smc->event_handlers, &power->nb);
+	disable_delayed_work_sync(&power->dbg_log_work);
+	cancel_work_sync(&power->critical_work);
 }
 
 /*

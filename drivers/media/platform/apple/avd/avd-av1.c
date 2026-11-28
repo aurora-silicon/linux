@@ -16,6 +16,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
+#include <kunit/visibility.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
@@ -220,13 +221,19 @@ struct avd_av1_run {
 
 	const struct v4l2_ctrl_av1_sequence *seq;
 	const struct v4l2_ctrl_av1_frame *frame;
-	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	/* Private copy of the tile-group control, freed by avd_av1_run(). */
+	struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	unsigned int tile_group_entries;
+	/* The tile grid tile_group was checked against */
+	unsigned int tile_rows;
+	unsigned int tile_cols;
 	const struct v4l2_ctrl_av1_film_grain *grain;
 };
 
 struct avd_av1_ctx {
 	struct avd_av1_stream *stream;
-	u8 submit_num;
+	/* PP kicks for the frame: one per tile, up to V4L2_AV1_MAX_TILE_COUNT */
+	u32 submit_num;
 	struct {
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
@@ -267,6 +274,13 @@ struct avd_av1_stream {
 	unsigned int nbanks;
 	struct avd_av1_bank bank[AVD_AV1_BANKS];
 	struct avd_av1_bank *b;
+
+	/* What the run being built took from the controls, see avd_ctrl_copy(). */
+	struct {
+		struct v4l2_ctrl_av1_sequence seq;
+		struct v4l2_ctrl_av1_frame frame;
+		struct v4l2_ctrl_av1_film_grain grain;
+	} params;
 };
 
 /*
@@ -1138,12 +1152,12 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 		seq->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK ? 5 :
 									     4;
 
-	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
+	av1_ctx->submit_num = run->tile_cols * run->tile_rows;
 
-	for (row = 0; row < tile_info->tile_rows; row++) {
-		for (col = 0; col < tile_info->tile_cols; col++) {
+	for (row = 0; row < run->tile_rows; row++) {
+		for (col = 0; col < run->tile_cols; col++) {
 			ctx->job.num++;
-			tile_id = row * tile_info->tile_cols + col;
+			tile_id = row * run->tile_cols + col;
 			tile_group = &run->tile_group[tile_id];
 
 			push(AVD_OP_CODED_DATA |
@@ -1396,34 +1410,67 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 		buf->av1.ref_frame_idx[i] = frame->ref_frame_idx[i];
 }
 
-/* The engine fetches each tile from these: bad values make it read wild addresses. */
-static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
-			       unsigned int entries)
+/*
+ * The engine fetches each tile from these: bad values make it read wild
+ * addresses. set_tiles() also looks each entry's tile_row and tile_col up in
+ * the frame's tile_info arrays; in a conformant stream they are below
+ * TileRows and TileCols (AV1 5.11.1, tile_group_obu()), and TileRows and
+ * TileCols are at most MAX_TILE_ROWS and MAX_TILE_COLS (AV1 section 3).
+ */
+VISIBLE_IF_KUNIT int
+avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
+		    unsigned int tile_cols,
+		    const struct v4l2_ctrl_av1_tile_group_entry *tile_group,
+		    unsigned int entries, size_t payload)
 {
-	unsigned int tiles = run->frame->tile_info.tile_cols *
-			     run->frame->tile_info.tile_rows;
+	unsigned int tiles = tile_cols * tile_rows;
 	unsigned int t;
-	size_t payload;
 
+	if (tile_rows > V4L2_AV1_MAX_TILE_ROWS ||
+	    tile_cols > V4L2_AV1_MAX_TILE_COLS)
+		return -EINVAL;
 	if (entries < tiles) {
-		dev_err_ratelimited(ctx->dev->dev, "AV1: %u tiles but %u tile entries\n",
+		dev_err_ratelimited(dev, "AV1: %u tiles but %u tile entries\n",
 				    tiles, entries);
 		return -EINVAL;
 	}
-	if (!tiles)
-		return 0;
-	payload = vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0);
 	for (t = 0; t < tiles; t++) {
-		const struct v4l2_ctrl_av1_tile_group_entry *e = &run->tile_group[t];
+		const struct v4l2_ctrl_av1_tile_group_entry *e = &tile_group[t];
 
 		if ((u64)e->tile_offset + e->tile_size > payload) {
-			dev_err_ratelimited(ctx->dev->dev, "AV1: tile %u at %u+%u past %zu bytes\n",
+			dev_err_ratelimited(dev, "AV1: tile %u at %u+%u past %zu bytes\n",
 					    t, e->tile_offset, e->tile_size, payload);
+			return -EINVAL;
+		}
+		if (e->tile_row >= tile_rows || e->tile_col >= tile_cols) {
+			dev_err_ratelimited(dev, "AV1: tile %u at row %u col %u of %ux%u\n",
+					    t, e->tile_row, e->tile_col,
+					    tile_rows, tile_cols);
 			return -EINVAL;
 		}
 	}
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tiles);
+
+/*
+ * Setting a larger tile-group array reallocates the control's storage and
+ * frees the old one under the control lock, which the run does not otherwise
+ * hold. Copy the entries under that lock; the run checks and uses the copy.
+ */
+VISIBLE_IF_KUNIT struct v4l2_ctrl_av1_tile_group_entry *
+avd_av1_copy_tile_group(struct v4l2_ctrl *ctrl, unsigned int *entries)
+{
+	struct v4l2_ctrl_av1_tile_group_entry *copy;
+
+	v4l2_ctrl_lock(ctrl);
+	*entries = ctrl->elems;
+	copy = kmemdup_array(ctrl->p_cur.p, ctrl->elems, ctrl->elem_size,
+			     GFP_KERNEL);
+	v4l2_ctrl_unlock(ctrl);
+	return copy;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_copy_tile_group);
 
 /*
  * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
@@ -1433,6 +1480,14 @@ static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
  * when the sequence is set and again when a frame runs, so it never
  * reaches the decoder.
  */
+static enum avd_image_fmt
+avd_av1_seq_image_fmt(const struct v4l2_ctrl_av1_sequence *seq)
+{
+	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
+	return seq->bit_depth == 8 ? AVD_IMG_FMT_420_8BIT :
+				     AVD_IMG_FMT_420_10BIT;
+}
+
 static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 				     const struct v4l2_ctrl_av1_sequence *seq)
 {
@@ -1451,8 +1506,46 @@ static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 	return 0;
 }
 
+/*
+ * The map, CDFs and color data sit at the end of the CAPTURE buffer, sized by
+ * the frame, so the frame must fit the CAPTURE format. So must the width it
+ * is upscaled to, which goes into the header as it is and divides the scale
+ * factors: superres only widens the frame, from frame_width to upscaled_width
+ * (AV1 7.16), and without it the two are equal (AV1 5.9.8, superres_params()).
+ */
+VISIBLE_IF_KUNIT int
+avd_av1_check_frame_size(const struct v4l2_ctrl_av1_frame *frame, u32 width,
+			 u32 height)
+{
+	u32 frame_width;
+
+	if (frame->frame_width_minus_1 >= width ||
+	    frame->frame_height_minus_1 >= height)
+		return -EINVAL;
+
+	frame_width = frame->frame_width_minus_1 + 1;
+	if (frame->upscaled_width < frame_width ||
+	    frame->upscaled_width > width)
+		return -EINVAL;
+	if (!(frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) &&
+	    frame->upscaled_width != frame_width)
+		return -EINVAL;
+	/*
+	 * With superres the denominator goes into the header less one; the
+	 * stream codes it as 9 to 16 (AV1 5.9.8), the control core only
+	 * bounds it from above.
+	 */
+	if ((frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) &&
+	    frame->superres_denom < 9)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_frame_size);
+
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
+	struct avd_av1_stream *av1_ctx = ((struct avd_av1_ctx *)ctx->priv)->stream;
 	struct v4l2_ctrl *ctrl;
 	int dst_len, ret, tlb_len;
 
@@ -1460,25 +1553,39 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (run->base.setup_err)
 		return run->base.setup_err;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_SEQUENCE);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->seq = ctrl->p_cur.p;
+	/*
+	 * The checks below and the builders must see the same parameters, and
+	 * the controls can be set again at any time: use copies.
+	 */
+	ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_SEQUENCE,
+			    &av1_ctx->params.seq, sizeof(av1_ctx->params.seq));
+	if (!ret)
+		ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_FRAME,
+				    &av1_ctx->params.frame,
+				    sizeof(av1_ctx->params.frame));
+	if (!ret)
+		ret = avd_ctrl_copy(ctx, V4L2_CID_STATELESS_AV1_FILM_GRAIN,
+				    &av1_ctx->params.grain,
+				    sizeof(av1_ctx->params.grain));
+	if (WARN_ON(ret))
+		return ret;
+	run->seq = &av1_ctx->params.seq;
+	run->frame = &av1_ctx->params.frame;
+	run->grain = &av1_ctx->params.grain;
 
 	/* The sequence may have been set, unchecked, while another codec was selected. */
 	ret = avd_av1_validate_sequence(ctx, run->seq);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_av1_seq_image_fmt(run->seq));
 	if (ret)
 		return ret;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_FRAME);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->frame = ctrl->p_cur.p;
-
-	/* The map, CDFs and color data sit at the buffer's end, sized by the frame. */
-	if (run->frame->frame_width_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.width ||
-	    run->frame->frame_height_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.height)
-		return -EINVAL;
+	ret = avd_av1_check_frame_size(run->frame,
+				       ctx->decoded_fmt.fmt.pix_mp.width,
+				       ctx->decoded_fmt.fmt.pix_mp.height);
+	if (ret)
+		return ret;
 
 	/*
 	 * The CDF and segmentation map loads index the reference arrays with
@@ -1497,16 +1604,16 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 			      V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY);
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
-	run->tile_group = ctrl->p_cur.p;
-	ret = avd_av1_check_tiles(ctx, run, ctrl->elems);
+	run->tile_group = avd_av1_copy_tile_group(ctrl, &run->tile_group_entries);
+	if (!run->tile_group)
+		return -ENOMEM;
+	run->tile_rows = run->frame->tile_info.tile_rows;
+	run->tile_cols = run->frame->tile_info.tile_cols;
+	ret = avd_av1_check_tiles(ctx->dev->dev, run->tile_rows, run->tile_cols,
+				  run->tile_group, run->tile_group_entries,
+				  vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0));
 	if (ret)
 		return ret;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_AV1_FILM_GRAIN);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->grain = ctrl->p_cur.p;
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 	tlb_len = avd_color_size(run->frame->frame_width_minus_1 + 1,
@@ -1665,7 +1772,7 @@ static int avd_av1_alloc_work_bufs(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 static int avd_av1_run(struct avd_ctx *ctx)
 {
-	struct avd_av1_run run;
+	struct avd_av1_run run = {};
 	struct avd_av1_stream *av1_ctx = ((struct avd_av1_ctx *)ctx->priv)->stream;
 	struct avd_decoded_buffer *dst, *ref;
 	int ret;
@@ -1673,7 +1780,7 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	ret = avd_av1_run_preamble(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	/* The CDF and segmentation map copies need the CPU mappings. */
@@ -1687,7 +1794,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	if (!vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) ||
 	    !vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0)) {
 		avd_run_postamble(ctx, &run.base);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 	if (av1_ctx->nbanks > 1) {
 		struct avd_av1_bank *bank = NULL;
@@ -1699,7 +1807,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 			}
 		if (!bank) {
 			avd_run_postamble(ctx, &run.base);
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 		av1_ctx->b = bank;
 		smp_store_release(&ctx->priv, &bank->codec);
@@ -1714,18 +1823,16 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	}
 
 	ret = avd_init_job(ctx, AVD_CODEC_AV1,
-			   run.frame->tile_info.tile_cols *
-					   run.frame->tile_info.tile_rows +
-				   1);
+			   run.tile_cols * run.tile_rows + 1);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	ret = avd_av1_alloc_work_bufs(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	update_dec_buf_info(dst, run.seq, run.frame);
@@ -1742,7 +1849,10 @@ static int avd_av1_run(struct avd_ctx *ctx)
 
 	avd_run_postamble(ctx, &run.base);
 
-	return avd_submit_job(ctx);
+	ret = avd_submit_job(ctx);
+out:
+	kfree(run.tile_group);
+	return ret;
 }
 
 
@@ -1881,25 +1991,17 @@ err_free_ctx:
 static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
 						struct v4l2_ctrl *ctrl)
 {
-#define BIT_DEPTH(chroma)                                    \
-	(seq->bit_depth == 8 ? AVD_IMG_FMT_##chroma##_8BIT : \
-			       AVD_IMG_FMT_##chroma##_10BIT)
-
-	const struct v4l2_ctrl_av1_sequence *seq = ctrl->p_new.p_av1_sequence;
-
 	if (ctrl->id != V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return AVD_IMG_FMT_ANY;
 
-	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
-	return BIT_DEPTH(420);
-#undef BIT_DEPTH
+	return avd_av1_seq_image_fmt(ctrl->p_new.p_av1_sequence);
 }
 
 static unsigned int avd_av1_pp_kicks(struct avd_ctx *ctx)
 {
 	struct avd_av1_ctx *priv = ctx->priv;
 
-	return max_t(int, priv->submit_num, 1);
+	return max_t(u32, priv->submit_num, 1);
 }
 
 static void avd_av1_submit(struct avd_ctx *ctx)
@@ -1913,7 +2015,7 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < av1_ctx->submit_num - 1; i++) {
+	for (u32 i = 1; i < av1_ctx->submit_num; i++) {
 		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 		       avd->ctrl + avd->variant->submit_offset);
@@ -1935,10 +2037,25 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 
 static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
+	struct vb2_queue *vq;
+
 	if (ctrl->id == V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return avd_av1_validate_sequence(ctx,
 						 ctrl->p_new.p_av1_sequence);
 	/* width should also be > 8 */
+	if (ctrl->id != V4L2_CID_STATELESS_AV1_FRAME)
+		return 0;
+
+	/*
+	 * The CAPTURE format is fixed while its buffers are allocated: a frame
+	 * that does not fit them cannot be decoded, as the run finds too.
+	 * Before that the format may still be set to the stream's.
+	 */
+	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	if (vb2_is_busy(vq))
+		return avd_av1_check_frame_size(ctrl->p_new.p_av1_frame,
+						ctx->decoded_fmt.fmt.pix_mp.width,
+						ctx->decoded_fmt.fmt.pix_mp.height);
 	return 0;
 }
 

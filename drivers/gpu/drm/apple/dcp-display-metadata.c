@@ -199,6 +199,19 @@ const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut g
 }
 
 /*
+ * An internal panel's colour target: the standard space its ADT names, or
+ * else Display P3. Every untagged RGB surface on an internal panel is tagged
+ * P3-D65 (see iomfb_template.c), so a panel whose ADT names no space known
+ * here (the K114s says "Rec2020") is described in the space it is driven in.
+ * Zero primaries are no description: compositors build a singular
+ * conversion matrix from them.
+ */
+const struct dcp_color_space *dcp_panel_color_target(enum dcp_panel_gamut gamut)
+{
+	return dcp_panel_gamut_color_space(gamut) ?: dcp_color_space_lookup("display-p3");
+}
+
+/*
  * Firmware chromaticities win. Without a complete, valid set, use the panel's
  * named target. Without either the block keeps its nominal white only.
  */

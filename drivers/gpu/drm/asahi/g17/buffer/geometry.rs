@@ -20,6 +20,9 @@ impl BlockGeometry {
     pub(crate) const PAGE: usize = 0x8000;
     /// M5 parameter resources use 32-bit offsets from this compact base.
     pub(crate) const M5_COMPACT: core::ops::Range<u64> = 0x10_0000_0000..0x11_0000_0000;
+    /// An M5 parameter block, and the stride it is mapped at, its guard included.
+    pub(crate) const M5_BLOCK_BYTES: usize = 0x80000;
+    pub(crate) const M5_BLOCK_STRIDE: usize = 0x88000;
     pub(crate) const NEO: Self = Self {
         base: cfg::USER_BASE,
         end: cfg::USER_END,
@@ -40,9 +43,9 @@ impl BlockGeometry {
         Ok(Self {
             base: Self::M5_COMPACT.start,
             end: Self::M5_COMPACT.end,
-            block_bytes: 0x80000,
-            backing_stride: 0x80000,
-            stride: 0x88000,
+            block_bytes: Self::M5_BLOCK_BYTES,
+            backing_stride: Self::M5_BLOCK_BYTES,
+            stride: Self::M5_BLOCK_STRIDE,
             capacity,
         })
     }

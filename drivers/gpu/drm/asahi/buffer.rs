@@ -289,6 +289,71 @@ impl Drop for Scene::ver {
     }
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl SceneG14V13_5 {
+    pub(crate) fn render_addresses(&self) -> (u64, u64) {
+        self.object.with(|raw, _| (raw.user_buffer.or(0).into(), raw.stats.into()))
+    }
+
+    /// Zeroes the first `bytes` of the Tail Pointer Cache, so that a fragment pass run after
+    /// a firmware recovery stopped its tiler finds no tiles.
+    ///
+    /// # Safety
+    ///
+    /// The GPU must not access the TPC during the call (its tiler is stopped and no other
+    /// render using this buffer is in flight), and no CPU reference into it may be live.
+    pub(crate) unsafe fn clear_tpc(&self, bytes: usize) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.object.tpc.zero_prefix(bytes) }
+    }
+}
+
+/// Host-owned parameter-buffer inputs that persist across firmware submissions.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) struct ParameterBufferInfo {
+    pub(crate) page_list: u64,
+    pub(crate) page_list_size: u32,
+    pub(crate) max_blocks: u32,
+    pub(crate) block_list: u64,
+    pub(crate) block_control: u64,
+    pub(crate) block_size: u32,
+    pub(crate) counter: u64,
+    pub(crate) max_pages: u32,
+    pub(crate) max_linear_pages: u32,
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl BufferG14V13_5 {
+    pub(crate) fn parameter_info(&self) -> ParameterBufferInfo {
+        self.inner.lock().info.with(|raw, inner| ParameterBufferInfo {
+            page_list: inner.page_list.gpu_va().get(),
+            page_list_size: raw.page_list_size,
+            max_blocks: raw.max_blocks,
+            block_list: inner.block_list.gpu_va().get(),
+            block_control: inner.block_ctl.gpu_va().get(),
+            block_size: raw.block_size,
+            counter: inner.counter.gpu_va().get(),
+            max_pages: raw.max_pages,
+            max_linear_pages: raw.max_pages_nomemless,
+        })
+    }
+
+    pub(crate) fn increment_parameter_counter(&self) {
+        self.increment();
+        let inner = self.inner.lock();
+        inner.info.counter.with(|raw, _| {
+            crate::pgtable::clean_poc(core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+        });
+        crate::pgtable::poc_barrier();
+    }
+
+    /// The 27.2 firmware owns the page list once bound. Publish only new block descriptors
+    /// and the block-control producer, using the legacy manager for backing allocation.
+    pub(crate) fn ensure_parameter_blocks(&self, count: usize) -> Result<bool> {
+        self.ensure_blocks_inner(count, false, true)
+    }
+}
+
 /// Inner data for a single TVB buffer object.
 #[versions(AGX)]
 struct BufferInner {
@@ -318,6 +383,13 @@ pub(crate) struct Buffer {
     inner: Arc<Mutex<BufferInner::ver>>,
 }
 
+/// Address space in which the parameter-buffer lists are visible to their consumers.
+pub(crate) enum ParameterListPlacement {
+    VmPrivate,
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    KernelGpu,
+}
+
 #[versions(AGX)]
 impl Buffer::ver {
     /// Create a new Buffer for a given VM, given the per-VM allocators.
@@ -327,6 +399,7 @@ impl Buffer::ver {
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         mgr: &BufferManager::ver,
+        list_placement: ParameterListPlacement,
     ) -> Result<Buffer::ver> {
         // These are the typical max numbers on macOS.
         // 8GB machines have this halved.
@@ -349,19 +422,33 @@ impl Buffer::ver {
         let preempt2_size = num_clusters_adj * gpu.get_cfg().preempt2_size;
         let preempt3_size = num_clusters_adj * gpu.get_cfg().preempt3_size;
 
+        let (page_list, block_list) = {
+            let mut vm_private;
+            let lists = match list_placement {
+                ParameterListPlacement::VmPrivate => {
+                    vm_private = ualloc_priv.lock();
+                    &mut *vm_private
+                }
+                // The lists live in the kernel half of the UAT so the firmware can rebuild them.
+                // The parameter manager writes them while the render engines run, so the GPU
+                // mapping must be writable: a read-only mapping leaves a stalled write fault
+                // that blocks the context flush after the render and every later completion.
+                #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+                ParameterListPlacement::KernelGpu => &mut alloc.gpu,
+            };
+            (
+                lists.array_empty_tagged(max_pages, b"PLST")?,
+                lists.array_empty_tagged(max_blocks * 2, b"BLST")?,
+            )
+        };
         let shared = &mut alloc.shared;
         let info = alloc.private.new_init(
-            {
-                let ualloc_priv = &ualloc_priv;
-                try_init!(buffer::Info::ver {
-                    block_ctl: shared.new_default::<buffer::BlockControl>()?,
-                    counter: shared.new_default::<buffer::Counter>()?,
-                    page_list: ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
-                    block_list: ualloc_priv
-                        .lock()
-                        .array_empty_tagged(max_blocks * 2, b"BLST")?,
-                })
-            },
+            try_init!(buffer::Info::ver {
+                block_ctl: shared.new_default::<buffer::BlockControl>()?,
+                counter: shared.new_default::<buffer::Counter>()?,
+                page_list,
+                block_list,
+            }),
             |inner, _p| {
                 try_init!(buffer::raw::Info::ver {
                     gpu_counter: 0x0,
@@ -442,15 +529,17 @@ impl Buffer::ver {
         self.inner.lock().blocks.len() as u32
     }
 
-    /// Automatically grow the Buffer based on feedback from the statistics.
-    pub(crate) fn auto_grow(&self) -> Result<bool> {
+    /// Size the overflow statistics ask for, in blocks, or `None` if the buffer is big enough.
+    ///
+    /// This only reads the statistics: the firmware keeps accumulating them until
+    /// [`Self::reset_stats`], so a caller that cannot grow the buffer yet sees the same request
+    /// again on its next submission. If the buffer needs more than twice the pages it peaked at,
+    /// this asks for three times that (same logic as macOS).
+    pub(crate) fn stats_target_blocks(&self) -> Option<usize> {
         let inner = self.inner.lock();
 
-        let used_pages = inner.stats.with(|raw, _inner| {
-            let used = raw.max_pages.load(Ordering::Relaxed);
-            raw.reset.store(1, Ordering::Release);
-            used as usize
-        });
+        let used_pages =
+            inner.stats.with(|raw, _inner| raw.max_pages.load(Ordering::Relaxed) as usize);
 
         let need_blocks = (used_pages * 2)
             .div_ceil(PAGES_PER_BLOCK)
@@ -459,16 +548,13 @@ impl Buffer::ver {
             .div_ceil(PAGES_PER_BLOCK)
             .min(inner.max_blocks_nomemless);
 
-        let cur_count = inner.blocks.len();
+        (need_blocks > inner.blocks.len()).then_some(want_blocks)
+    }
 
-        if need_blocks <= cur_count {
-            Ok(false)
-        } else {
-            // Grow to 3x requested size (same logic as macOS)
-            core::mem::drop(inner);
-            self.ensure_blocks(want_blocks)?;
-            Ok(true)
-        }
+    /// Asks the firmware to restart the overflow statistics, after the buffer grew for them.
+    pub(crate) fn reset_stats(&self) {
+        let inner = self.inner.lock();
+        inner.stats.with(|raw, _inner| raw.reset.store(1, Ordering::Release));
     }
 
     /// Synchronously grow the Buffer.
@@ -483,7 +569,22 @@ impl Buffer::ver {
     }
 
     /// Ensure that the buffer has at least a certain minimum size in blocks.
+    ///
+    /// The buffer manager owns the buffer while scenes on it are in flight, so the new size is only
+    /// published if no scene is active.
     pub(crate) fn ensure_blocks(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, false, false)
+    }
+
+    /// [`Self::ensure_blocks`] for a caller that guarantees all work that used this buffer has
+    /// completed: the new size is published although scenes of completed jobs may still be held.
+    pub(crate) fn ensure_blocks_idle(&self, min_blocks: usize) -> Result<bool> {
+        self.ensure_blocks_inner(min_blocks, true, false)
+    }
+
+    fn ensure_blocks_inner(
+        &self, min_blocks: usize, fw_idle: bool, firmware_pages: bool,
+    ) -> Result<bool> {
         let mut inner = self.inner.lock();
 
         let cur_count = inner.blocks.len();
@@ -517,18 +618,29 @@ impl Buffer::ver {
                 .push(block, GFP_KERNEL)
                 .expect("push() failed after reserve()");
             inner.info.block_list[2 * (cur_count + i)] = page_num;
-            for j in 0..PAGES_PER_BLOCK {
-                inner.info.page_list[(cur_count + i) * PAGES_PER_BLOCK + j] = page_num + j as u32;
+            if !firmware_pages {
+                for j in 0..PAGES_PER_BLOCK {
+                    inner.info.page_list[(cur_count + i) * PAGES_PER_BLOCK + j] = page_num + j as u32;
+                }
             }
         }
 
+        if firmware_pages {
+            let added = &inner.info.block_list.as_slice()[2 * cur_count..2 * new_count];
+            crate::pgtable::clean_poc(added.as_ptr().cast(), core::mem::size_of_val(added));
+            crate::pgtable::poc_barrier();
+        }
         inner.info.block_ctl.with(|raw, _inner| {
             raw.total.store(new_count as u32, Ordering::SeqCst);
             raw.wptr.store(new_count as u32, Ordering::SeqCst);
+            if firmware_pages {
+                crate::pgtable::clean_poc(core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+                crate::pgtable::poc_barrier();
+            }
         });
 
         /* Only do this update if the buffer manager is idle (which means we own it) */
-        if inner.active_scenes == 0 {
+        if !firmware_pages && (inner.active_scenes == 0 || fw_idle) {
             let page_count = (new_count * PAGES_PER_BLOCK) as u32;
             inner.info.with(|raw, _inner| {
                 raw.page_count.store(page_count, Ordering::Relaxed);
@@ -782,7 +894,7 @@ impl BufferManager::ver {
     pub(crate) fn grow(&self, slot: u32) {
         match self
             .0
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| crate::event::slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 pr_err!(

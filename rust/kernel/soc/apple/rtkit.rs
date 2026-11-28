@@ -368,6 +368,14 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Starts a coprocessor whose firmware may acknowledge IOP power on by itself once it has
+    /// reported in: takes that acknowledgment if it comes within `self_ack_ms`, and asks for IOP
+    /// power as [`Self::wake`] does otherwise.
+    pub fn boot_or_wake(self: Pin<&mut Self>, self_ack_ms: u32) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_boot_or_wake(self.rtk, self_ack_ms) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
@@ -378,13 +386,6 @@ impl<T: Operations> RtKit<T> {
     pub fn idle(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
-    }
-
-    /// Turns the mailbox off for a coprocessor that has acknowledged idle, before its run bit and
-    /// power state go. Only [`Self::warm_restart`] follows this.
-    pub fn mailbox_off(self: Pin<&mut Self>) {
-        // SAFETY: `rtk` is valid per the type invariant.
-        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
     }
 
     /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings. The

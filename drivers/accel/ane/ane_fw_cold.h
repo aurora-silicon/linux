@@ -86,6 +86,175 @@ static inline bool ane_fw_cold_engine_restartable(const struct ane_fw_cold_state
 	return true;
 }
 
+/* ANE_SYS's actual power state (PMGR bits 7:4) reads off. */
+static inline bool ane_fw_sys_off(u32 sys)
+{
+	return !(sys & 0xf0);
+}
+
+/*
+ * A session quarantined by a hung request, powered off under its firmware
+ * without a stop. down: our power-down of the quarantined engine began
+ * (ANE_SYS was still held by us then, so no earlier OFF counts); sys_off:
+ * genpd then reported ANE_SYS off with its PMGR actual state off; held: we
+ * hold ANE_SYS or the child power states again.
+ */
+struct ane_fw_hung_proof {
+	bool down, sys_off, held;
+};
+
+/*
+ * The old firmware is gone, and the memory it could reach (pool, IPC, heap,
+ * heap tail, DATA, programs closed while quarantined) may be reused, only
+ * when ANE_SYS really went off after our power-down and the ANE CPU and
+ * sub-block power states read off now (@pmgr, read from PMGR, which is
+ * readable in any power state). Anything less keeps the quarantine.
+ */
+static inline bool ane_fw_hung_gone(const struct ane_fw_hung_proof *p,
+				    const struct ane_fw_cold_state *pmgr)
+{
+	return p->down && p->sys_off && !p->held && ane_fw_cold_pmgr_valid(pmgr, true);
+}
+
+/*
+ * How long a recovery still keeps ANE_SYS off, @min_ns from the OFF at
+ * @off_at (boot time) given @now: the whole of it when the OFF time is
+ * unknown or lies ahead.
+ */
+static inline u64 ane_fw_recover_off_wait(u64 off_at, u64 now, u64 min_ns)
+{
+	if (!off_at || now < off_at)
+		return min_ns;
+	return now - off_at >= min_ns ? 0 : min_ns - (now - off_at);
+}
+
+/*
+ * After a recovery's cold boot, before any request (the replay of open
+ * programs included) reaches the new firmware: ANE_SYS and the ANE CPU power
+ * state still target and read on, no DART reports a fault, and the
+ * transport, after serving what the firmware posted while it went quiet, has
+ * not failed. Anything less fails the recovery. The sub-block power state and
+ * CE are left to the firmware once it runs (it gates the engine itself), so
+ * they are not judged.
+ */
+struct ane_fw_settled {
+	u32 sys, cpu;
+	u32 dart_error[ANE_FW_DARTS];
+	int transport_error;
+};
+
+static inline bool ane_fw_recover_settled(const struct ane_fw_settled *s)
+{
+	unsigned int i;
+
+	if ((s->sys & 0xff) != 0xff || (s->cpu & 0xff) != 0xff || s->transport_error)
+		return false;
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		if (s->dart_error[i])
+			return false;
+	return true;
+}
+
+/*
+ * Runtime recoveries of a hung engine are limited. Each one powers the
+ * engine off under its firmware and boots it again; a client that hangs it
+ * again right away turns that into a storm of power cycles, and eight of them
+ * within six seconds locked the whole SoC up on a J700. So:
+ *
+ * - the first recovery in @window_ns runs at once; each later one in the
+ *   window waits @backoff_ns after the one before it, twice as long for each
+ *   recovery already in the window, at most @window_ns;
+ * - a recovery that would be the (@burst + 1)th within @window_ns trips the
+ *   limit: no more runtime recoveries, the engine stays quarantined until a
+ *   system sleep powers it off and boots it again.
+ *
+ * Every attempt counts, failed or not, from when it starts.
+ */
+#define ANE_FW_RECOVER_BURST_MAX 16
+
+struct ane_fw_recover_policy {
+	unsigned int burst;
+	u64 window_ns, backoff_ns;
+};
+
+struct ane_fw_recover_limit {
+	/* Start times of the latest attempts, a ring of count entries before next. */
+	u64 at[ANE_FW_RECOVER_BURST_MAX];
+	unsigned int next, count;
+	bool tripped;
+};
+
+enum ane_fw_recover_verdict {
+	ANE_FW_RECOVER_NOW,
+	ANE_FW_RECOVER_LATER,
+	ANE_FW_RECOVER_STOP,
+};
+
+/* Attempts that started less than @window_ns before @now, and the latest start. */
+static inline unsigned int ane_fw_recover_recent(const struct ane_fw_recover_limit *l,
+						 u64 now, u64 window_ns, u64 *last)
+{
+	unsigned int i, recent = 0;
+
+	*last = 0;
+	for (i = 0; i < l->count; i++) {
+		u64 at = l->at[(l->next + ANE_FW_RECOVER_BURST_MAX - 1 - i) %
+			       ANE_FW_RECOVER_BURST_MAX];
+
+		if (at > now || now - at >= window_ns)
+			break;
+		if (!recent++)
+			*last = at;
+	}
+	return recent;
+}
+
+/*
+ * May a recovery start at @now? LATER sets *@wait_ns, after which to ask
+ * again; STOP trips the limit, which stays tripped until
+ * ane_fw_recover_reset().
+ */
+static inline enum ane_fw_recover_verdict
+ane_fw_recover_admit(struct ane_fw_recover_limit *l, const struct ane_fw_recover_policy *p,
+		     u64 now, u64 *wait_ns)
+{
+	unsigned int burst = clamp(p->burst, 1U, (unsigned int)ANE_FW_RECOVER_BURST_MAX);
+	u64 last, delay = p->backoff_ns;
+	unsigned int recent, i;
+
+	*wait_ns = 0;
+	if (l->tripped)
+		return ANE_FW_RECOVER_STOP;
+	recent = ane_fw_recover_recent(l, now, p->window_ns, &last);
+	if (recent >= burst) {
+		l->tripped = true;
+		return ANE_FW_RECOVER_STOP;
+	}
+	if (!recent)
+		return ANE_FW_RECOVER_NOW;
+	for (i = 1; i < recent && delay < p->window_ns; i++)
+		delay *= 2;
+	delay = min(delay, p->window_ns);
+	if (now - last >= delay)
+		return ANE_FW_RECOVER_NOW;
+	*wait_ns = last + delay - now;
+	return ANE_FW_RECOVER_LATER;
+}
+
+/* A recovery attempt starts at @now. */
+static inline void ane_fw_recover_note(struct ane_fw_recover_limit *l, u64 now)
+{
+	l->at[l->next] = now;
+	l->next = (l->next + 1) % ANE_FW_RECOVER_BURST_MAX;
+	if (l->count < ANE_FW_RECOVER_BURST_MAX)
+		l->count++;
+}
+
+static inline void ane_fw_recover_reset(struct ane_fw_recover_limit *l)
+{
+	memset(l, 0, sizeof(*l));
+}
+
 /*
  * RVBAR (engine +0x1050000) and the TEXT entry: latched at TEXT (bit 0 set)
  * is ready; with bit 0 clear the entry may be written; latched at any other
@@ -184,6 +353,8 @@ int ane_fw_staged_bind(struct platform_device *pdev);
 bool ane_fw_staged_bound(struct device *dev);
 void ane_fw_staged_unbind(struct platform_device *pdev);
 int ane_fw_staged_suspend(struct device *dev);
+int ane_fw_staged_runtime_suspend(struct device *dev);
+int ane_fw_staged_runtime_resume(struct device *dev);
 void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 

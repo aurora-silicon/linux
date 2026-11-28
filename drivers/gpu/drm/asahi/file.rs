@@ -94,6 +94,9 @@ pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
     uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Render commands accept tile buffers of up to 48 KiB.
+pub(crate) const DRM_ASAHI_FEATURE_TILE_BUFFER_48K: u64 =
+    uapi::DRM_ASAHI_FEATURE_TILE_BUFFER_48K as u64;
 /// Compute commands may declare a stream that ends with a memory-scoped flush
 /// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
@@ -106,6 +109,10 @@ pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
 /// (`drm_asahi_queue_create::compute_timeout_ms`).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: u64 =
     uapi::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT as u64;
+/// The kernel spreads one compute queue's independent commands over several firmware compute
+/// queues itself.
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL as u64;
 /// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
 /// fields, its fragment half on the whole ones.
 #[allow(dead_code)]
@@ -134,10 +141,11 @@ pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = uapi::DRM_ASAHI_RENDER_PRO
 #[allow(dead_code)]
 pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_USES_MATRIX as u32;
-/// The compute command neither copies nor resets queries, so it cannot observe
-/// timestamps the host publishes after earlier commands complete
-/// (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). Accepted, and reported with
-/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS by the M5 command set.
+/// The compute command reads and writes no timestamp or availability word whose
+/// host publication is still pending for an earlier command, so it need not wait
+/// for that publication (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). It may copy or reset
+/// queries whose words are already published. Accepted, and reported with
+/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS, by the G17 command sets.
 pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
 
@@ -166,41 +174,20 @@ impl Drop for Vm {
             // object must not outlive the client's VM handle.
             status.release_mirror();
         }
-        if self.vm.status().is_some() {
-            // Tracked jobs can outlive their file's VM handle. Their last guard performs
-            // these unmaps once no accepted work can still dereference the mappings.
-            if let Err(error) = self
-                .vm
-                .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
-            {
-                pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
-            }
-            self.vm.bo_deferred_cleanup();
-            self.gpu.vm_closed(&self.vm);
-            return;
-        }
-        // When the user Vm is dropped, verify that no user mappings exists.
-        let left_range = self.user_range.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..self.user_range.end;
-
-        if !left_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, left_range.start, left_range.range())
-                .is_err()
+        // Tracked jobs can outlive their file's VM handle: their last guard runs the
+        // teardown once no accepted work can still dereference the mappings. On
+        // untracked VMs this unmaps every user GPUVA at once without allocating or
+        // charging split nodes, so teardown succeeds even at the client's memory limit.
+        if let Err(error) = self
+            .vm
+            .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
         {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+            pr_err!("Vm::Drop: user unmap failed: {:?}\n", error);
         }
-        if !right_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, right_range.start, right_range.range())
-                .is_err()
-        {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
-        }
-
         self.vm.bo_deferred_cleanup();
+        if self.vm.status().is_some() {
+            self.gpu.vm_closed(&self.vm);
+        }
     }
 }
 
@@ -290,38 +277,51 @@ impl SyncItem {
         in_count: u32,
         out_count: u32,
         allow_cumulative: bool,
-    ) -> Result<KVec<SyncItem>> {
+    ) -> Result<KVVec<SyncItem>> {
         let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
+        const CHUNK: usize = 8;
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        // Userspace sets the count. Charge the allocation to the caller and
+        // allow noncontiguous backing pages.
+        let mut vec = KVVec::with_capacity(count as usize, GFP_KERNEL_ACCOUNT)?;
         let mut anchor = None;
 
-        // Read each record once so validation and use see the same retained bytes.
+        // Read each record once in small stack chunks so validation and use see the
+        // same retained bytes without a per-entry copy_from_user.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
+        let mut buf = MaybeUninit::<[uapi::drm_asahi_sync; CHUNK]>::uninit();
 
-        for i in 0..count {
-            let mut sync: MaybeUninit<uapi::drm_asahi_sync> = MaybeUninit::uninit();
+        let mut base = 0u32;
+        while base < count {
+            let chunk = ((count - base) as usize).min(CHUNK);
+            let raw = buf.as_mut_ptr().cast::<uapi::drm_asahi_sync>();
 
-            // SAFETY: The size of `sync` is STRIDE
+            // SAFETY: `buf` holds `CHUNK` contiguous `drm_asahi_sync` entries and
+            // `chunk <= CHUNK`, so `chunk * STRIDE` bytes are writable.
             reader.read_raw(unsafe {
-                core::slice::from_raw_parts_mut(sync.as_mut_ptr().cast::<MaybeUninit<u8>>(), STRIDE)
+                core::slice::from_raw_parts_mut(raw.cast::<MaybeUninit<u8>>(), chunk * STRIDE)
             })?;
 
-            // SAFETY: All bit patterns in the struct are valid
-            let sync = unsafe { sync.assume_init() };
+            for offset in 0..chunk {
+                let i = base + offset as u32;
+                // SAFETY: `read_raw` initialized `chunk` contiguous entries starting at `raw`,
+                // `offset < chunk`, and all bit patterns in the struct are valid.
+                let sync = unsafe { raw.add(offset).read() };
 
-            if sync.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
-                if !allow_cumulative || i < in_count || anchor.is_some() {
-                    return Err(EINVAL);
+                if sync.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
+                    if !allow_cumulative || i < in_count || anchor.is_some() {
+                        return Err(EINVAL);
+                    }
+                    anchor = Some(i as usize);
                 }
-                anchor = Some(i as usize);
+                vec.push(
+                    Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
+                    GFP_KERNEL_ACCOUNT,
+                )?;
             }
-            vec.push(
-                Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
-                GFP_KERNEL,
-            )?;
+            base += chunk as u32;
         }
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
@@ -343,14 +343,77 @@ impl SyncItem {
 
 #[derive(Clone)]
 pub(crate) enum Object {
-    TimestampBuffer(Arc<crate::timestamp::Buffer>),
+    TimestampBuffer(Arc<crate::timestamp::Bound>),
+}
+
+/// Kernel memory one `GEM_BIND_OBJECT` bind keeps that no GEM object accounts for: its table entry
+/// and the bound buffer's records (an `Arc` count, the [`crate::timestamp::Bound`] and the
+/// buffer's heap records). The object's pages and its CPU mapping, which the shmem helper shares
+/// between every vmap of one object, belong to the object and are charged when it is created.
+/// Each bind is charged this much against the client's and the device's memory limits, as a user
+/// object of that size would be, so a file's binds are bounded by those limits.
+const BOUND_OBJECT_BYTES: u64 = (core::mem::size_of::<Object>()
+    + core::mem::size_of::<usize>()
+    + core::mem::size_of::<crate::timestamp::Bound>()
+    + crate::timestamp::Buffer::HEAP_BYTES) as u64;
+
+/// The firmware timestamp window is one fixed range per device that every file's firmware-aliased
+/// timestamp buffers share. A file may hold at most this fraction of it (4 MiB of a 64 MiB
+/// window), so one client cannot fill it for every other: Mesa binds one small buffer per GL
+/// context, one per timestamped query pool and one debug buffer.
+const TIMESTAMP_WINDOW_SHARE_PER_FILE: u64 = 16;
+
+/// A file's limit on window bytes for a window of `window_size` bytes (0: no window).
+fn window_limit(window_size: u64) -> u64 {
+    window_size / TIMESTAMP_WINDOW_SHARE_PER_FILE
+}
+
+/// Charges one bind to `client`, or fails with `ENOMEM` and charges nothing.
+fn admit_bind(
+    ledger: &'static memacct::Ledger,
+    client: &Arc<memacct::Client>,
+) -> Result<memacct::Commit> {
+    ledger.admit(client, BOUND_OBJECT_BYTES)
 }
 
 /// A queue in a file's table. Its count in the creating process's share of the device's
 /// queues is given back once the queue itself is gone.
 pub(crate) struct TableQueue {
     queue: KBox<dyn queue::Queue>,
+    /// Reusable staging buffer for `SUBMIT` command buffers, avoiding per-submit heap
+    /// allocations and keeping large command buffers off the kernel stack.
+    cmdbuf: KVVec<u8>,
     _share: Option<queue_share::Share>,
+}
+
+impl TableQueue {
+    /// Maximum command-buffer capacity retained on a queue between submissions.
+    const REUSE_CMDBUF_CAP: usize = 4096;
+
+    /// Takes the cached command-buffer staging allocation so userspace copies run outside the
+    /// queue mutex (preventing `queue.lock()` -> `mmap_lock` lock-order inversion).
+    fn take_cmdbuf(&mut self) -> KVVec<u8> {
+        core::mem::take(&mut self.cmdbuf)
+    }
+
+    /// Returns a cleared command-buffer allocation to the per-queue cache when within the
+    /// reuse capacity cap; oversized buffers are dropped.
+    fn return_cmdbuf(&mut self, mut buf: KVVec<u8>) {
+        buf.clear();
+        if buf.capacity() > 0
+            && buf.capacity() <= Self::REUSE_CMDBUF_CAP
+            && buf.capacity() >= self.cmdbuf.capacity()
+        {
+            self.cmdbuf = buf;
+        }
+    }
+}
+
+fn copy_cmdbuf_from_user(buf: &mut KVVec<u8>, addr: u64, size: usize) -> Result {
+    buf.clear();
+    UserSlice::new(UserPtr::from_addr(addr as usize), size)
+        .reader()
+        .read_all(buf, GFP_KERNEL_ACCOUNT)
 }
 
 impl Deref for TableQueue {
@@ -399,6 +462,18 @@ pub(crate) type DrmFile = drm::File<File>;
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
+
+/// Most VMs one file may hold at a time. Mesa creates one per file. Each VM holds kernel memory
+/// that is not charged to the client (its GPUVM, allocators and per-VM objects).
+const MAX_VMS_PER_FILE: u32 = 64;
+
+/// Takes a slot for a new VM in a file's VM table, or fails with EBUSY past
+/// [`MAX_VMS_PER_FILE`], as the ID allocator reports a full range.
+fn reserve_vm_slot<'a>(
+    vms: &'a xarray::XArray<KBox<Vm>>,
+) -> Result<xarray::Reservation<'a, KBox<Vm>>> {
+    vms.lock().reserve_limit(1..=MAX_VMS_PER_FILE, GFP_KERNEL)
+}
 
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
@@ -585,8 +660,13 @@ impl File {
         gpu.get_params(&mut params)?;
 
         params.features |= gpu.feature_flags();
+        // Every backend admits the USC cache invalidate in the VDM root barrier.
+        params.features |= uapi::DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE as u64;
         if Self::supports_user_memory(reg_data) {
-            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+            // GEM_USERPTR pins are bounded by the GPU memory ledger only, not by
+            // RLIMIT_MEMLOCK (UserPages::pin()).
+            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64
+                | uapi::DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK as u64;
         }
         if Self::supports_residency_control(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
@@ -677,6 +757,11 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        // Take the table slot first, so that a VM past the cap is refused before anything of it
+        // is built.
+        let vm_xa = file.inner().vms();
+        let resv = reserve_vm_slot(vm_xa.get_ref())?;
+        let id: u32 = resv.index().try_into()?;
         reg_data.gpu.admit_vm(
             device.as_ref().as_ref(),
             file.inner()
@@ -709,7 +794,7 @@ impl File {
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
         let vm = gpu
-            .new_vm_for_file(kernel_range.clone(), file_id)?
+            .new_vm_for_file(kernel_range.clone(), file_id, &file.inner().mem)?
             .with_memory_client(file.inner().mem.clone());
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
@@ -726,10 +811,6 @@ impl File {
                 }
             },
         );
-
-        let vm_xa = file.inner().vms();
-        let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
-        let id: u32 = resv.index().try_into()?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM Create\n", file_id, id);
         mod_dev_dbg!(
@@ -1166,7 +1247,7 @@ impl File {
                 entry.kernel_range.clone(),
             )
         };
-        let mut batch = mmu::PreparedUserBindBatch::new(count)?;
+        let mut batch = mmu::PreparedUserBindBatch::new(&vm, count)?;
         let mut unmaps = 0;
         // A fresh reader per declared stride also skips extension bytes in longer records.
         for bytes in bytes.chunks_exact(stride) {
@@ -1234,7 +1315,6 @@ impl File {
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;
         vm.commit_prepared_user_bind_batch(&mut batch)?;
-        vm.bo_deferred_cleanup();
         Ok(0)
     }
 
@@ -1584,21 +1664,43 @@ impl File {
             .try_into()?;
         let bo = gem::ObjectRef::new(gem::Object::lookup_handle(file, data.handle)?);
 
-        let mapping = Arc::new(
-            reg_data.gpu.map_timestamp_buffer(bo, offset..end_offset)?,
-            GFP_KERNEL,
-        )?;
-        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL)?;
-        let handle = file
-            .inner()
-            .objects()
+        // Charge the bind and take its table slot first, so that a bind past the client's memory
+        // limit is refused (ENOMEM, as an object creation would be) before the buffer gets a
+        // window alias or a CPU mapping. A later failure drops the charge and the slot.
+        let charge = admit_bind(&memacct::LEDGER, &file.inner().mem)?;
+        let objects = file.inner().objects();
+        let resv = objects
             .lock()
-            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL);
-        // StoreError owns the rejected object. Convert it only after the
-        // temporary XArray guard is gone: dropping a mapping may sleep.
-        let handle = handle? as u64;
+            .reserve_limit(1..=u32::MAX, GFP_KERNEL_ACCOUNT)?;
+        let handle: u32 = resv.index().try_into()?;
+        // Take the bound range from the file's share of the firmware timestamp window before
+        // mapping. Past its share the buffer may not go in the window: the backend maps it
+        // without one if it can, or fails with ENOSPC as for a full window. A buffer mapped
+        // without the window gives the share back at once.
+        let limit = window_limit(reg_data.gpu.timestamp_window_size());
+        let window = if limit == 0 {
+            crate::timestamp::WindowPermit::Unrestricted
+        } else {
+            match memacct::Client::take_window(&file.inner().mem, data.range, limit) {
+                Some(share) => crate::timestamp::WindowPermit::Share(share),
+                None => crate::timestamp::WindowPermit::Denied,
+            }
+        };
+        let buffer = reg_data.gpu.map_timestamp_buffer(
+            bo,
+            offset..end_offset,
+            window,
+        )?;
+        let mapping = Arc::new(
+            crate::timestamp::Bound::new(buffer, charge),
+            GFP_KERNEL_ACCOUNT,
+        )?;
+        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL_ACCOUNT)?;
+        // fill() takes and releases the XArray lock itself, so a rejected object, which
+        // StoreError owns, is dropped outside it: dropping a mapping may sleep.
+        resv.fill(obj)?;
 
-        data.object_handle = handle as u32;
+        data.object_handle = handle;
         Ok(0)
     }
 
@@ -1665,7 +1767,9 @@ impl File {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
         }
-        if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
+        if data.flags & !uapi::drm_asahi_queue_create_flags_DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT != 0
+            || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME
+        {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
         }
@@ -1739,11 +1843,15 @@ impl File {
         if data.compute_timeout_ms != 0 {
             data.compute_timeout_ms = queue.set_compute_timeout(data.compute_timeout_ms)?;
         }
+        if data.flags & uapi::drm_asahi_queue_create_flags_DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT != 0 {
+            queue.set_async_submit()?;
+        }
 
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(
             new_mutex!(TableQueue {
                 queue,
+                cmdbuf: KVVec::new(),
                 _share: share,
             }),
             GFP_KERNEL,
@@ -1815,28 +1923,47 @@ impl File {
             data.queue_id,
             id
         );
-        let mut vec = KVec::new();
-        let copy_commands = |bytes: &mut KVec<u8>| {
-            UserSlice::new(
-                UserPtr::from_addr(data.cmdbuf as usize),
-                data.cmdbuf_size as usize,
-            )
-            .reader()
-            .read_all(bytes, GFP_KERNEL)
-        };
+        let cmdbuf_size = data.cmdbuf_size as usize;
         let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence
-        // on every failure. Take the fallible userspace snapshot before that point.
-        if guarded {
-            copy_commands(&mut vec)?;
-        }
-        let syncs = SyncItem::parse_array(
+        // on every failure. Take the fallible userspace snapshot before that point,
+        // staging into a buffer taken from the queue's reusable cache so user
+        // copies never execute under `queue.lock()`.
+        let mut cmdbuf = if guarded {
+            let mut buf = queue.lock().take_cmdbuf();
+            if let Err(e) = copy_cmdbuf_from_user(&mut buf, data.cmdbuf, cmdbuf_size) {
+                queue.lock().return_cmdbuf(buf);
+                return Err(e);
+            }
+            Some(buf)
+        } else {
+            None
+        };
+        let cumulative_sync = gpu.as_any().is::<crate::g17::Gpu>() || {
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            {
+                gpu.as_any().is::<crate::g16::Gpu>()
+            }
+            #[cfg(not(CONFIG_DRM_ASAHI_G16))]
+            {
+                false
+            }
+        };
+        let syncs = match SyncItem::parse_array(
             file,
             data.syncs,
             data.in_sync_count,
             data.out_sync_count,
-            gpu.as_any().is::<crate::g17::Gpu>(),
-        )?;
+            cumulative_sync,
+        ) {
+            Ok(syncs) => syncs,
+            Err(e) => {
+                if let Some(buf) = cmdbuf {
+                    queue.lock().return_cmdbuf(buf);
+                }
+                return Err(e);
+            }
+        };
 
         mod_dev_dbg!(
             device,
@@ -1846,22 +1973,33 @@ impl File {
             id
         );
 
-        // Copy the command buffer into the kernel. Because we need to iterate
-        // the command buffer twice, we do this in one big copy_from_user to
-        // avoid TOCTOU issues.
-        if !guarded {
-            copy_commands(&mut vec)?;
-        }
+        // Copy the command buffer into the kernel outside `queue.lock()`. Because we
+        // need to iterate the command buffer twice, we do this in one big copy_from_user
+        // to avoid TOCTOU issues.
+        let cmdbuf = match cmdbuf.take() {
+            Some(buf) => buf,
+            None => {
+                let mut buf = queue.lock().take_cmdbuf();
+                if let Err(e) = copy_cmdbuf_from_user(&mut buf, data.cmdbuf, cmdbuf_size) {
+                    queue.lock().return_cmdbuf(buf);
+                    return Err(e);
+                }
+                buf
+            }
+        };
 
         let objects = file.inner().objects();
-        let ret = queue.lock().submit(
+        let mut guard = queue.lock();
+        let ret = guard.queue.submit(
             reg_data,
             id,
             syncs,
             data.in_sync_count as usize,
-            &vec,
+            cmdbuf.as_slice(),
             objects,
         );
+        guard.return_cmdbuf(cmdbuf);
+        drop(guard);
 
         if ret.is_ok() {
             if let Some((util_min, duration_ms)) = gpu.syncobj_wait_hint() {
@@ -1931,5 +2069,103 @@ impl Drop for File {
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
         Self::mark_clients_closed(this, |_| true);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_vm_table)]
+mod vm_table_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_holds_at_most_max_vms_per_file() -> Result {
+        let vms = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let mut held = KVec::new();
+        for _ in 0..MAX_VMS_PER_FILE {
+            held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        }
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // A destroyed VM frees its slot for the next.
+        held.pop();
+        held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // Another file's VM table has its own budget while the first is full.
+        let other = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let _other_slot = reserve_vm_slot(&other)?;
+        // Closing the first file releases every slot for reuse.
+        held.clear();
+        let _reused = reserve_vm_slot(&vms)?;
+        Ok(())
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_bound_object_charge)]
+mod bound_object_charge_tests {
+    use super::*;
+    use crate::memacct::{Ledger, Limits};
+
+    static BINDS: Ledger = Ledger::new();
+
+    #[test]
+    fn a_bind_is_charged_its_records_and_refused_past_the_client_limit() -> Result {
+        // The charge covers the table entry, the bound record and the buffer's heap records.
+        assert!(
+            BOUND_OBJECT_BYTES as usize
+                >= core::mem::size_of::<Object>()
+                    + core::mem::size_of::<crate::timestamp::Bound>()
+                    + crate::timestamp::Buffer::HEAP_BYTES
+        );
+        BINDS.set_limits(Limits { device: 0, client: 4 * BOUND_OBJECT_BYTES });
+        let client = memacct::Client::new()?;
+        let mut held = KVec::new();
+        for _ in 0..4 {
+            held.push(admit_bind(&BINDS, &client)?, GFP_KERNEL)?;
+        }
+        assert_eq!(client.committed(), 4 * BOUND_OBJECT_BYTES);
+        // The fifth is refused with ENOMEM, as an object creation past the limit is, and
+        // charges nothing.
+        assert_eq!(admit_bind(&BINDS, &client).err(), Some(ENOMEM));
+        assert_eq!(client.committed(), 4 * BOUND_OBJECT_BYTES);
+        // An unbind gives its charge back, and the next bind fits again.
+        held.pop();
+        assert_eq!(client.committed(), 3 * BOUND_OBJECT_BYTES);
+        held.push(admit_bind(&BINDS, &client)?, GFP_KERNEL)?;
+        drop(held);
+        assert_eq!(client.committed(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_holds_at_most_its_share_of_the_timestamp_window() -> Result {
+        const MIB: u64 = 1 << 20;
+        let limit = window_limit(64 * MIB);
+        assert_eq!(limit, 4 * MIB);
+        assert_eq!(window_limit(0), 0);
+        let a = memacct::Client::new()?;
+        let b = memacct::Client::new()?;
+        // One file binds up to its share and no further, whatever the buffer sizes.
+        let first = memacct::Client::take_window(&a, 3 * MIB, limit);
+        assert!(first.is_some());
+        assert!(memacct::Client::take_window(&a, 2 * MIB, limit).is_none());
+        let second = memacct::Client::take_window(&a, MIB, limit);
+        assert!(second.is_some());
+        assert_eq!(a.timestamp_window(), 4 * MIB);
+        assert!(memacct::Client::take_window(&a, 16 * 1024, limit).is_none());
+        // Another file has its own share.
+        let other = memacct::Client::take_window(&b, 4 * MIB, limit);
+        assert!(other.is_some());
+        // An unbind gives the share back; a limit of 0 (no window) takes nothing.
+        drop(first);
+        assert_eq!(a.timestamp_window(), MIB);
+        assert!(memacct::Client::take_window(&a, MIB, 0).is_none());
+        drop((second, other));
+        assert_eq!(a.timestamp_window(), 0);
+        assert_eq!(b.timestamp_window(), 0);
+        Ok(())
     }
 }
