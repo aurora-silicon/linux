@@ -22,6 +22,7 @@ struct pf_test {
 	bool cpus_min;
 	bool published;
 	unsigned int saved_idle_pstate;
+	bool saved_idle_pstate_explicit;
 };
 
 static const struct regmap_config pf_vote_regmap_config = {
@@ -57,7 +58,9 @@ static int pf_test_init(struct kunit *test)
 		return -ENOMEM;
 	misc = &f->misc;
 	f->saved_idle_pstate = READ_ONCE(idle_fabric_pstate);
+	f->saved_idle_pstate_explicit = READ_ONCE(idle_fabric_pstate_explicit);
 	WRITE_ONCE(idle_fabric_pstate, 0);
+	WRITE_ONCE(idle_fabric_pstate_explicit, false);
 	f->fabric = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->dcs = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->votes = kunit_kzalloc(test, 8 * sizeof(u32), GFP_KERNEL);
@@ -82,6 +85,7 @@ static int pf_test_init(struct kunit *test)
 	misc->devices[DEV_DCS].suspend_state = SYS_DEV_PSTATE_SUSPEND;
 	mutex_init(&misc->lock);
 	misc->fabric_now = 7;
+	misc->dcs_now = 9;
 	INIT_DEFERRABLE_WORK(&misc->idle_work, apple_pmgr_idle_work);
 	INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 	for (i = 0; i < ARRAY_SIZE(misc->votes); i++) {
@@ -106,6 +110,7 @@ static void pf_test_exit(struct kunit *test)
 	cancel_delayed_work_sync(&f->misc.idle_work);
 	cancel_delayed_work_sync(&f->misc.idle_work_prompt);
 	WRITE_ONCE(idle_fabric_pstate, f->saved_idle_pstate);
+	WRITE_ONCE(idle_fabric_pstate_explicit, f->saved_idle_pstate_explicit);
 	if (f->published) {
 		/* Pairs with the acquire in the driver's readers. */
 		smp_store_release(&apple_pmgr_misc_inst, NULL);
@@ -452,17 +457,24 @@ static void pf_prepare_complete_test(struct kunit *test)
 
 static void pf_match_data_test(struct kunit *test)
 {
-	const struct apple_pmgr_misc_hw *t600x = NULL, *t602x = NULL;
+	const struct apple_pmgr_misc_hw *t8103 = NULL, *t600x = NULL, *t602x = NULL;
 	const struct of_device_id *id;
 
 	for (id = apple_pmgr_misc_of_match; id->compatible[0]; id++) {
-		if (!strcmp(id->compatible, "apple,t6000-pmgr-misc"))
+		if (!strcmp(id->compatible, "apple,t8103-pmgr-misc"))
+			t8103 = id->data;
+		else if (!strcmp(id->compatible, "apple,t6000-pmgr-misc"))
 			t600x = id->data;
 		else if (!strcmp(id->compatible, "apple,t6020-pmgr-misc"))
 			t602x = id->data;
 	}
+	KUNIT_ASSERT_NOT_NULL(test, t8103);
 	KUNIT_ASSERT_NOT_NULL(test, t600x);
 	KUNIT_ASSERT_NOT_NULL(test, t602x);
+	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_FABRIC], 0U);
+	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_DCS], 0U);
+	KUNIT_EXPECT_EQ(test, t8103->dcs_valid_states, (u32)DCS_VALID_STATES_T8103);
+	KUNIT_EXPECT_TRUE(test, t8103->single_step);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_FABRIC], 1U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_DCS], 7U);
 	KUNIT_EXPECT_EQ(test, t600x->dcs_valid_states, (u32)DCS_VALID_STATES_T600X);
@@ -470,6 +482,233 @@ static void pf_match_data_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t602x->dev_min_ps[DEV_DCS], 1U);
 	/* No DCS state list: suspend uses the plain read-modify-write. */
 	KUNIT_EXPECT_EQ(test, t602x->dcs_valid_states, 0U);
+}
+
+static u32 pf_step_log[16];
+static unsigned int pf_step_cnt;
+static bool pf_step_inject_busy;
+static bool pf_step_inject_bad_desired;
+
+static u32 pf_fake_perf_step(void __iomem *reg, u32 state)
+{
+	u32 val = readl_relaxed(reg);
+
+	if (pf_step_cnt < ARRAY_SIZE(pf_step_log))
+		pf_step_log[pf_step_cnt++] = state;
+	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val,
+		     pf_step_inject_bad_desired ? (state ^ 1U) : state);
+	if (pf_step_inject_busy) {
+		val |= APPLE_CLKGEN_PSTATE_BUSY;
+	} else {
+		val &= ~APPLE_CLKGEN_PSTATE_BUSY;
+		FIELD_MODIFY(APPLE_CLKGEN_PSTATE_ACTUAL, &val, state);
+	}
+	writel_relaxed(val, reg);
+	return val;
+}
+
+static void pf_t8103_gpu_tracking_and_step_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+	u32 last = 0;
+
+	pf_step_cnt = 0;
+	pf_step_inject_busy = false;
+	pf_step_inject_bad_desired = false;
+	kunit_activate_static_stub(test, apple_pmgr_perf_step, pf_fake_perf_step);
+
+	misc->single_step = true;
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->devices[DEV_FABRIC].active_state = 4;
+	misc->devices[DEV_DCS].active_state = 6;
+	/* Without DT floors, both fabric and DCS retain boot states untouched. */
+	misc->devices[DEV_FABRIC].suspend_state = 4;
+	misc->devices[DEV_DCS].suspend_state = 6;
+	misc->idle_dcs_pstate = 0;
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	writel(0x00000444, f->fabric);
+	writel(0x00000666, f->dcs);
+	pf_publish(f);
+
+	/* Parameter writes below the board fabric floor are rejected, and eval enforces it too. */
+	KUNIT_EXPECT_EQ(test, idle_fabric_pstate_set("1", NULL), -EINVAL);
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	pf_step_cnt = 0;
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
+	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0x00000444U);
+	cancel_delayed_work_sync(&misc->idle_work);
+	WRITE_ONCE(idle_fabric_pstate, 0);
+
+	/* Live probe/resume verification rejects BUSY or ACTUAL!=DESIRED as unknown (U32_MAX). */
+	writel(0x00000656, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_verify_active(misc, DEV_DCS), U32_MAX);
+	misc->dcs_now = U32_MAX;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atomic_read(&apple_pmgr_gpu_busy), 0);
+	writel(0x00000666, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_verify_active(misc, DEV_DCS), 6U);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	apple_pmgr_gpu_busy_put();
+	writel(APPLE_CLKGEN_PSTATE_BUSY | 0x00000666, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_verify_active(misc, DEV_DCS), U32_MAX);
+	writel(0x00000666, f->dcs);
+	pf_step_cnt = 0;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_suspend_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
+	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0x00000444U);
+	KUNIT_EXPECT_EQ(test, readl(f->dcs), 0x00000666U);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_resume_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+
+	/* With a fabric floor of 1 and no DCS floor, only fabric scales. */
+	misc->devices[DEV_FABRIC].suspend_state = 1;
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	pf_step_cnt = 0;
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	KUNIT_EXPECT_EQ(test, readl(f->dcs), 0x00000666U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 3U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	/* Prepare propagates a failed raise and clears sleeping before aborting sleep. */
+	pf_step_inject_busy = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_misc_prepare(misc->dev), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, misc->sleeping);
+	cancel_delayed_work_sync(&misc->idle_work);
+	pf_step_inject_busy = false;
+	writel(0x00000411, f->fabric);
+	misc->fabric_now = 1;
+
+	/* Restore fabric and verify s2idle with no DCS floor leaves dcs-ps untouched. */
+	scoped_guard(mutex, &misc->lock)
+		KUNIT_EXPECT_EQ(test, apple_pmgr_raise_fabric(misc), 0);
+	pf_step_cnt = 0;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_suspend_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0x00000411U);
+	KUNIT_EXPECT_EQ(test, readl(f->dcs), 0x00000666U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 3U);
+	/* Even when s2idle resume skips MMIO on an unfloored rail, it verifies live state. */
+	writel(0x00000656, f->dcs);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_resume_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0x00000444U);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, U32_MAX);
+	writel(0x00000666, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+	apple_pmgr_gpu_busy_put();
+
+	/* Rollback on a failed DCS step also verifies an unfloored, unsettled fabric rail. */
+	misc->devices[DEV_FABRIC].suspend_state = 4;
+	misc->devices[DEV_DCS].suspend_state = 4;
+	misc->dcs_valid_states = BIT(4) | BIT(5) | BIT(6);
+	writel(0x00000434, f->fabric);
+	writel(0x00000666, f->dcs);
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	pf_step_inject_busy = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_misc_suspend_noirq_target(misc, PM_SUSPEND_TO_IDLE),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, U32_MAX);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, U32_MAX);
+	pf_step_inject_busy = false;
+	writel(0x00000444, f->fabric);
+	writel(0x00000666, f->dcs);
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	misc->devices[DEV_FABRIC].suspend_state = 1;
+	misc->devices[DEV_DCS].suspend_state = 6;
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+
+	/* Deep sleep leaves stepping to the sleep engine and detects post-wake mismatch. */
+	pf_step_cnt = 0;
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_suspend_noirq_target(misc, PM_SUSPEND_MEM), 0);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
+	writel(0x00000411, f->fabric);
+	KUNIT_ASSERT_EQ(test, apple_pmgr_misc_resume_noirq_target(misc, PM_SUSPEND_MEM), 0);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, U32_MAX);
+	/* While PMGR owns the sleep transition, GPU busy acquisition defers (-EAGAIN). */
+	misc->sleeping = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, atomic_read(&apple_pmgr_gpu_busy), 0);
+	/* Once complete clears sleeping, GPU acquisition raises and confirms fabric. */
+	misc->sleeping = false;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0x00000444U);
+	apple_pmgr_gpu_busy_put();
+
+	/*
+	 * With a board floor of 4 and GPU tracking active, an always-on gfx
+	 * PMGR voter does not block idle while gpu_busy == 0, and single-step
+	 * walks 4->3->2->1 on fabric and 6->5->4 on DCS.
+	 */
+	misc->devices[DEV_DCS].suspend_state = 4;
+	misc->idle_dcs_pstate = 4;
+	misc->dcs_valid_states = BIT(4) | BIT(5) | BIT(6);
+	f->votes[0] = PF_VOTE_BUSY;
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+
+	apple_pmgr_gpu_tracking_start();
+	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
+
+	pf_step_cnt = 0;
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 1U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[4], 4U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	/* Busy timeout on raise unwinds gpu_busy and returns error. */
+	pf_step_inject_busy = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atomic_read(&apple_pmgr_gpu_busy), 0);
+	/* Subsequent write while BUSY is still set fails -EBUSY without stepping. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->fabric, 4, 0, &last), -EBUSY);
+	/* Clear injected busy and verify mismatched DESIRED after step fails -ETIMEDOUT. */
+	pf_step_inject_busy = false;
+	writel(0x00000111, f->fabric);
+	writel(0x00000444, f->dcs);
+	misc->fabric_now = 1;
+	misc->dcs_now = 4;
+	pf_step_inject_bad_desired = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->fabric, 2, 0, &last), -ETIMEDOUT);
+	pf_step_inject_bad_desired = false;
+	writel(0x00000111, f->fabric);
+
+	/* Normal raise succeeds and lifts both fabric and DCS synchronously. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+
+	/* Missing voter regmap counts as busy (no NULL deref on tracking stop). */
+	misc->votes[2].regmap = NULL;
+	apple_pmgr_gpu_busy_put();
+	apple_pmgr_gpu_tracking_stop();
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+
+	/* Path validation rejects unsettled ACTUAL!=DESIRED, off-range start, and bad steps. */
+	pf_step_cnt = 0;
+	writel(0x00000046, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 4, BIT(4) | BIT(5) | BIT(6), &last),
+			-EBUSY);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
+	writel(0x00000777, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 6, BIT(4) | BIT(5) | BIT(6), &last),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
+	writel(0x00000666, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 4, BIT(4) | BIT(6), &last), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 0U);
 }
 
 /*
@@ -508,7 +747,8 @@ static bool pf_dt_foreign(const char *compatible)
 static void pf_dt_require_fixture_only(struct kunit *test)
 {
 	if (pf_dt_foreign("apple,pmgr-pwrstate") ||
-	    pf_dt_foreign("apple,t6000-pmp-v2"))
+	    pf_dt_foreign("apple,t6000-pmp-v2") ||
+	    pf_dt_foreign("apple,t8103-pmp"))
 		kunit_skip(test, "the system devicetree describes PMGR or PMP nodes");
 }
 static u32 pf_dt_regs[0x50];
@@ -688,6 +928,128 @@ static void pf_dt_pmp_unbound_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, readl(f->dcs), 0xa5000099U);
 }
 
+static int pf_dt_floor_run(struct kunit *test, struct apple_pmgr_misc *misc,
+			   const char *prop, const u32 *vals, size_t nvals, bool fabric)
+{
+	struct of_changeset cs;
+	struct device_node *np;
+	struct device_node *saved = misc->dev->of_node;
+	int ret;
+
+	of_changeset_init(&cs);
+	np = of_changeset_create_node(&cs, pf_dt_pmgr, "pmgr-misc-floor");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	if (vals)
+		KUNIT_ASSERT_EQ(test,
+				of_changeset_add_prop_u32_array(&cs, np, prop, vals, nvals),
+				0);
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&cs), 0);
+	misc->dev->of_node = np;
+	ret = fabric ? apple_pmgr_fabric_floor_init(misc) : apple_pmgr_dcs_floor_init(misc);
+	misc->dev->of_node = saved;
+	pf_dt_revert(&cs);
+	return ret;
+}
+
+static int pf_dt_fab_floor(struct kunit *test, struct apple_pmgr_misc *misc,
+			   const u32 *vals, size_t nvals)
+{
+	return pf_dt_floor_run(test, misc, "apple,fabric-min-pstate", vals, nvals, true);
+}
+
+static int pf_dt_dcs_floor(struct kunit *test, struct apple_pmgr_misc *misc,
+			   const u32 *vals, size_t nvals)
+{
+	return pf_dt_floor_run(test, misc, "apple,dcs-min-pstate", vals, nvals, false);
+}
+
+static void pf_dt_floors_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+	static const u32 v0[] = { 0 };
+	static const u32 v1[] = { 1 };
+	static const u32 v2[] = { 2 };
+	static const u32 v4[] = { 4 };
+	static const u32 v5[] = { 5 };
+	static const u32 v6[] = { 6 };
+	static const u32 v7[] = { 7 };
+	static const u32 v16[] = { 16 };
+	static const u32 vpair[] = { 4, 5 };
+
+	misc->single_step = true;
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->devices[DEV_FABRIC].active_state = 4;
+	misc->devices[DEV_FABRIC].suspend_state = 4;
+	misc->idle_fabric_default = 0;
+	misc->devices[DEV_DCS].active_state = 6;
+	misc->devices[DEV_DCS].suspend_state = 6;
+	misc->idle_dcs_pstate = 0;
+
+	/* Absent fabric/DCS properties retain boot states for idle and s2idle. */
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, NULL, 0), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_FABRIC].suspend_state, 4U);
+	KUNIT_EXPECT_EQ(test, misc->idle_fabric_default, 0U);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, NULL, 0), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_DCS].suspend_state, 6U);
+	KUNIT_EXPECT_EQ(test, misc->idle_dcs_pstate, 0U);
+
+	/* Invalid fabric floor values fail; valid floor enables idle and s2idle fabric scaling. */
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v0, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v5, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v16, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, vpair, 2), -EINVAL);
+	misc->pmp_owned = true;
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v1, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_FABRIC].suspend_state, 4U);
+	KUNIT_EXPECT_EQ(test, misc->idle_fabric_default, 0U);
+	misc->pmp_owned = false;
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v4, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_FABRIC].suspend_state, 4U);
+	KUNIT_EXPECT_EQ(test, misc->idle_fabric_default, 0U);
+	KUNIT_EXPECT_EQ(test, pf_dt_fab_floor(test, misc, v1, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_FABRIC].suspend_state, 1U);
+	KUNIT_EXPECT_EQ(test, misc->idle_fabric_default, 1U);
+
+	/* Out-of-range, invalid-mask, above-boot, or multi-cell DCS properties fail. */
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v0, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v2, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v7, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v16, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, vpair, 2), -EINVAL);
+	KUNIT_EXPECT_EQ(test, misc->idle_dcs_pstate, 0U);
+
+	/* Non-contiguous intermediate states and OPP-table conflicts fail. */
+	misc->dcs_valid_states = BIT(4) | BIT(6);
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v4, 1), -EINVAL);
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->dcs_data = (struct icc_onecell_data *)1;
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v4, 1), -EINVAL);
+	misc->dcs_data = NULL;
+
+	/* Floor equal to boot state is valid and keeps idle DCS scaling off. */
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v6, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_DCS].suspend_state, 6U);
+	KUNIT_EXPECT_EQ(test, misc->idle_dcs_pstate, 0U);
+
+	/* PMP-owned boards ignore the property without enabling host DCS scaling. */
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->pmp_owned = true;
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v4, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_DCS].suspend_state, 6U);
+	KUNIT_EXPECT_EQ(test, misc->idle_dcs_pstate, 0U);
+	misc->pmp_owned = false;
+
+	/* Valid floor enables idle and s2idle DCS scaling and masks lower states. */
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	KUNIT_EXPECT_EQ(test, pf_dt_dcs_floor(test, misc, v4, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_DCS].suspend_state, 4U);
+	KUNIT_EXPECT_EQ(test, misc->idle_dcs_pstate, 4U);
+	KUNIT_EXPECT_FALSE(test, apple_pmgr_dcs_state_valid(misc, 3));
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_dcs_state_valid(misc, 4));
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_dcs_state_valid(misc, 6));
+}
+
 static int pf_suite_init(struct kunit_suite *suite)
 {
 	struct of_changeset cs;
@@ -742,6 +1104,8 @@ static struct kunit_case apple_pmgr_fabric_test_cases[] = {
 	KUNIT_CASE(pf_param_test),
 	KUNIT_CASE(pf_prepare_complete_test),
 	KUNIT_CASE(pf_match_data_test),
+	KUNIT_CASE(pf_t8103_gpu_tracking_and_step_test),
+	KUNIT_CASE(pf_dt_floors_test),
 	KUNIT_CASE(pf_dt_voters_test),
 	KUNIT_CASE(pf_dt_voters_missing_test),
 	KUNIT_CASE(pf_dt_voters_duplicate_test),
