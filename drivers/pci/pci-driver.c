@@ -595,6 +595,7 @@ static int pci_restore_standard_config(struct pci_dev *pci_dev)
 
 	pci_restore_state(pci_dev);
 	pci_pme_restore(pci_dev);
+	pci_pm_notify_resume(pci_dev);
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
@@ -614,6 +615,7 @@ static void pci_pm_default_resume_early(struct pci_dev *pci_dev)
 	pci_pm_power_up_and_verify_state(pci_dev);
 	pci_restore_state(pci_dev);
 	pci_pme_restore(pci_dev);
+	pci_pm_notify_resume(pci_dev);
 }
 
 static void pci_pm_bridge_power_up_actions(struct pci_dev *pci_dev)
