@@ -324,7 +324,7 @@ int tb_drom_read_uid_only(struct tb_switch *sw, u64 *uid)
 }
 
 static int tb_drom_parse_entry_generic(struct tb_switch *sw,
-		struct tb_drom_entry_header *header)
+		const struct tb_drom_entry_header *header)
 {
 	const struct tb_drom_entry_generic *entry =
 		(const struct tb_drom_entry_generic *)header;
@@ -348,6 +348,13 @@ static int tb_drom_parse_entry_generic(struct tb_switch *sw,
 		const struct tb_drom_entry_desc *desc =
 			(const struct tb_drom_entry_desc *)entry;
 
+		/* Only the IDs are read; sizeof() would count the padding */
+		if (header->len < offsetofend(struct tb_drom_entry_desc, idProduct)) {
+			tb_sw_warn(sw, "product descriptor entry too short (%u bytes), ignoring\n",
+				   header->len);
+			break;
+		}
+
 		if (!sw->vendor && !sw->device) {
 			sw->vendor = desc->idVendor;
 			sw->device = desc->idProduct;
@@ -360,7 +367,7 @@ static int tb_drom_parse_entry_generic(struct tb_switch *sw,
 }
 
 static int tb_drom_parse_entry_port(struct tb_switch *sw,
-				    struct tb_drom_entry_header *header)
+				    const struct tb_drom_entry_header *header)
 {
 	struct tb_port *port;
 	int res;
@@ -392,11 +399,13 @@ static int tb_drom_parse_entry_port(struct tb_switch *sw,
 	type &= 0xffffff;
 
 	if (type == TB_TYPE_PORT) {
-		struct tb_drom_entry_port *entry = (void *) header;
+		const struct tb_drom_entry_port *entry =
+			(const struct tb_drom_entry_port *)header;
+
 		if (header->len != sizeof(*entry)) {
 			tb_sw_warn(sw,
 				"port entry has size %#x (expected %#zx)\n",
-				header->len, sizeof(struct tb_drom_entry_port));
+				header->len, sizeof(*entry));
 			return -EIO;
 		}
 		port->link_nr = entry->link_nr;
@@ -427,9 +436,16 @@ static int tb_drom_parse_entries(struct tb_switch *sw, size_t header_size)
 	int res;
 
 	while (pos < drom_size) {
-		struct tb_drom_entry_header *entry = (void *) (sw->drom + pos);
-		if (pos + 1 == drom_size || pos + entry->len > drom_size
-				|| !entry->len) {
+		const struct tb_drom_entry_header *entry;
+
+		if (drom_size - pos < sizeof(*entry)) {
+			tb_sw_warn(sw, "DROM buffer overrun\n");
+			return -EIO;
+		}
+
+		entry = (const struct tb_drom_entry_header *)(sw->drom + pos);
+		if (entry->len < sizeof(*entry) ||
+		    entry->len > drom_size - pos) {
 			tb_sw_warn(sw, "DROM buffer overrun\n");
 			return -EIO;
 		}
@@ -659,6 +675,13 @@ static int tb_drom_parse(struct tb_switch *sw, u16 size)
 	const struct tb_drom_header *header = (const void *)sw->drom;
 	int ret;
 
+	/* The USB4 header is the shorter one, and holds the revision and length */
+	if (size < USB4_DROM_HEADER_SIZE) {
+		tb_sw_warn(sw, "DROM too small (%u bytes)\n", size);
+		ret = -EIO;
+		goto err;
+	}
+
 	if (header->data_len + TB_DROM_DATA_START != size) {
 		tb_sw_warn(sw, "DROM size mismatch\n");
 		ret = -EIO;
@@ -676,6 +699,11 @@ static int tb_drom_parse(struct tb_switch *sw, u16 size)
 			   header->device_rom_revision);
 		fallthrough;
 	case 1:
+		if (size < TB_DROM_HEADER_SIZE) {
+			tb_sw_warn(sw, "DROM too small for its header (%u bytes)\n", size);
+			ret = -EIO;
+			break;
+		}
 		ret = tb_drom_parse_v1(sw);
 		break;
 	}

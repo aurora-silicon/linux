@@ -31,20 +31,35 @@ static void tb_dump_hop(const struct tb_path_hop *hop, const struct tb_regs_hop 
 		    regs->unknown1, regs->unknown2, regs->unknown3);
 }
 
+/*
+ * The adapter that @hop, read from @port, sends the path out of: the router
+ * reports it, so it is NULL if the router has no such adapter.
+ */
+static struct tb_port *tb_path_hop_out_port(struct tb_port *port,
+					    const struct tb_regs_hop *hop)
+{
+	struct tb_switch *sw = port->sw;
+
+	if (hop->out_port > sw->config.max_port_number) {
+		tb_port_warn_ratelimited(port, "path goes out of non-existent adapter %u\n",
+					 hop->out_port);
+		return NULL;
+	}
+
+	return &sw->ports[hop->out_port];
+}
+
 static struct tb_port *tb_path_find_dst_port(struct tb_port *src, int src_hopid,
 					     int dst_hopid)
 {
 	struct tb_port *port, *out_port = NULL;
 	struct tb_regs_hop hop;
-	struct tb_switch *sw;
 	int i, ret, hopid;
 
 	hopid = src_hopid;
 	port = src;
 
 	for (i = 0; port && i < TB_PATH_MAX_HOPS; i++) {
-		sw = port->sw;
-
 		ret = tb_port_read(port, &hop, TB_CFG_HOPS, 2 * hopid, 2);
 		if (ret) {
 			tb_port_warn(port, "failed to read path at %d\n", hopid);
@@ -54,7 +69,9 @@ static struct tb_port *tb_path_find_dst_port(struct tb_port *src, int src_hopid,
 		if (!hop.enable)
 			return NULL;
 
-		out_port = &sw->ports[hop.out_port];
+		out_port = tb_path_hop_out_port(port, &hop);
+		if (!out_port)
+			return NULL;
 		hopid = hop.next_hop;
 		port = out_port->remote;
 	}
@@ -106,7 +123,6 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 	struct tb_port *out_port;
 	struct tb_regs_hop hop;
 	struct tb_path *path;
-	struct tb_switch *sw;
 	struct tb_port *p;
 	size_t num_hops;
 	int ret, i, h;
@@ -129,8 +145,6 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 	num_hops = 0;
 
 	for (i = 0; p && i < TB_PATH_MAX_HOPS; i++) {
-		sw = p->sw;
-
 		ret = tb_port_read(p, &hop, TB_CFG_HOPS, 2 * h, 2);
 		if (ret) {
 			tb_port_warn(p, "failed to read path at %d\n", h);
@@ -141,7 +155,9 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 		if (!hop.enable)
 			break;
 
-		out_port = &sw->ports[hop.out_port];
+		out_port = tb_path_hop_out_port(p, &hop);
+		if (!out_port)
+			return NULL;
 		if (last)
 			*last = out_port;
 
@@ -170,7 +186,9 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 	for (i = 0; i < num_hops; i++) {
 		int next_hop;
 
-		sw = p->sw;
+		/* Ended early: a router reported an adapter without a link this time */
+		if (!p)
+			goto err;
 
 		ret = tb_port_read(p, &hop, TB_CFG_HOPS, 2 * h, 2);
 		if (ret) {
@@ -178,10 +196,14 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 			goto err;
 		}
 
+		/* Read again: the router may report another adapter this time */
+		out_port = tb_path_hop_out_port(p, &hop);
+		if (!out_port)
+			goto err;
+
 		if (alloc_hopid && tb_port_alloc_in_hopid(p, h, h) < 0)
 			goto err;
 
-		out_port = &sw->ports[hop.out_port];
 		next_hop = hop.next_hop;
 
 		if (alloc_hopid &&

@@ -329,7 +329,7 @@ static int tb_xdp_error_response(struct tb_ctl *ctl, u64 route, u8 sequence,
 				     TB_CFG_PKG_XDOMAIN_RESP);
 }
 
-static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+VISIBLE_IF_KUNIT int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
 	const uuid_t *src_uuid, const uuid_t *dst_uuid, int retry,
 	u32 **block, u32 *generation)
 {
@@ -394,6 +394,11 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
 		 */
 		if (!data) {
 			data_len = res->data_length;
+			/* Nothing would be copied, and the request repeated */
+			if (!data_len) {
+				ret = -EINVAL;
+				goto err;
+			}
 			if (data_len > TB_XDP_PROPERTIES_MAX_LENGTH) {
 				ret = -E2BIG;
 				goto err;
@@ -410,7 +415,7 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
 			len = data_len - req.offset;
 		memcpy(data + req.offset, res->data, len * 4);
 		req.offset += len;
-	} while (!data_len || req.offset < data_len);
+	} while (req.offset < data_len);
 
 	*block = data;
 	*generation = res->generation;

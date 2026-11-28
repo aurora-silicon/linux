@@ -965,6 +965,9 @@ struct tb_cfg_result tb_cfg_request_sync(struct tb_ctl *ctl,
 	DECLARE_COMPLETION_ONSTACK(done);
 	int ret;
 
+	/* The KUnit tests answer requests without hardware */
+	KUNIT_STATIC_STUB_REDIRECT(tb_cfg_request_sync, ctl, req, timeout_msec);
+
 	ret = tb_cfg_request(ctl, req, tb_cfg_request_complete, &done);
 	if (ret) {
 		res.err = ret;
