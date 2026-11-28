@@ -326,7 +326,7 @@
 	};
 
 	ave1_dart1: iommu@507030000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x5 0x07030000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1038 IRQ_TYPE_LEVEL_HIGH>;
@@ -336,7 +336,7 @@
 	};
 
 	ave1_dart0: iommu@507040000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x5 0x07040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1038 IRQ_TYPE_LEVEL_HIGH>;
@@ -350,7 +350,7 @@
 		reg = <0x5 0x07100000 0x0 0x45c000>,
 		      <0x5 0x07050000 0x0 0x8000>,
 		      <0x5 0x07800000 0x0 0x800000>,
-		      <0x2 0x8e680260 0x0 0x7dc4>,
+		      <0x2 0x8e688000 0x0 0x24>,
 		      <0x5 0x06000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1041 IRQ_TYPE_LEVEL_HIGH>,
@@ -836,7 +836,7 @@
 	};
 
 	ave2_dart1: iommu@40d030000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x4 0x0d030000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1028 IRQ_TYPE_LEVEL_HIGH>;
@@ -846,7 +846,7 @@
 	};
 
 	ave2_dart0: iommu@40d040000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x4 0x0d040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1028 IRQ_TYPE_LEVEL_HIGH>;
@@ -934,7 +934,7 @@
 	};
 
 	ave3_dart1: iommu@507030000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x5 0x07030000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1038 IRQ_TYPE_LEVEL_HIGH>;
@@ -944,7 +944,7 @@
 	};
 
 	ave3_dart0: iommu@507040000 {
-		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		compatible = "apple,t6000-dart";
 		reg = <0x5 0x07040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1038 IRQ_TYPE_LEVEL_HIGH>;
@@ -958,7 +958,7 @@
 		reg = <0x5 0x07100000 0x0 0x45c000>,
 		      <0x5 0x07050000 0x0 0x8000>,
 		      <0x5 0x07800000 0x0 0x800000>,
-		      <0x2 0x8e680260 0x0 0x7dc4>,
+		      <0x2 0x8e688000 0x0 0x24>,
 		      <0x5 0x06000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1041 IRQ_TYPE_LEVEL_HIGH>,
