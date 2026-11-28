@@ -276,6 +276,13 @@ impl Submission {
     }
     fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
         let vm_status = work.as_ref().map(|work| work.status().clone());
+        Self::with_work_and_status(work, vm_status, firmware_source)
+    }
+    fn with_work_and_status(
+        work: Option<Arc<WorkStateLease>>,
+        vm_status: Option<Arc<super::status::VmStatus>>,
+        firmware_source: bool,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(
@@ -406,6 +413,61 @@ impl Submission {
     }
 }
 
+#[pin_data]
+pub(crate) struct ChunkWork {
+    #[pin]
+    work: Mutex<Option<Arc<WorkStateLease>>>,
+    remaining: AtomicU32,
+    owners: AtomicU32,
+    error: AtomicBool,
+}
+impl ChunkWork {
+    pub(crate) fn new(work: Arc<WorkStateLease>) -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                work <- new_mutex!(Some(work), "G17 chunk work state"),
+                // Initial enqueue guard matching Submission's lifecycle so an
+                // early-retiring or dropped member cannot release the work
+                // state before later commands in the same chunk attach.
+                remaining: AtomicU32::new(1),
+                owners: AtomicU32::new(1),
+                error: AtomicBool::new(false),
+            }),
+            GFP_KERNEL,
+        )
+    }
+    fn attach(&self) {
+        self.remaining.fetch_add(1, Ordering::Relaxed);
+        self.owners.fetch_add(1, Ordering::Relaxed);
+    }
+    fn work_state(&self) -> Result<Arc<WorkStateLease>> {
+        self.work.lock().clone().ok_or(ECANCELED)
+    }
+    fn release(&self) {
+        let old = self.work.lock().take();
+        drop(old);
+    }
+    fn member_done(&self, result: Result) {
+        if result.is_err() {
+            self.error.store(true, Ordering::Release);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && !self.error.load(Ordering::Acquire)
+        {
+            self.release();
+        }
+    }
+    fn owner_done(&self) {
+        if self.owners.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.release();
+        }
+    }
+    pub(crate) fn finish_enqueue(&self, result: Result) {
+        self.member_done(result);
+        self.owner_done();
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Aggregate(UserFence<ExportFence>);
 impl Aggregate {
@@ -420,10 +482,18 @@ impl Aggregate {
         Fence::from_fence(&self.0)
     }
     pub(crate) fn member(&self) -> Member {
+        self.member_inner(None)
+    }
+    pub(crate) fn member_with_work(&self, work: Arc<ChunkWork>) -> Member {
+        work.attach();
+        self.member_inner(Some(work))
+    }
+    fn member_inner(&self, work: Option<Arc<ChunkWork>>) -> Member {
         self.source().remaining.fetch_add(1, Ordering::Relaxed);
         self.source().owners.fetch_add(1, Ordering::Relaxed);
         Member {
             aggregate: self.clone(),
+            work,
             complete: AtomicBool::new(false),
         }
     }
@@ -449,6 +519,7 @@ impl Aggregate {
 
 pub(crate) struct Member {
     aggregate: Aggregate,
+    work: Option<Arc<ChunkWork>>,
     complete: AtomicBool,
 }
 impl Member {
@@ -456,6 +527,9 @@ impl Member {
         self.aggregate.source().firmware_source
     }
     pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
+        if let Some(work) = &self.work {
+            return work.work_state();
+        }
         self.aggregate
             .source()
             .state
@@ -491,6 +565,9 @@ impl Member {
     }
     pub(crate) fn complete(&self, result: Result) {
         if !self.complete.swap(true, Ordering::AcqRel) {
+            if let Some(work) = &self.work {
+                work.member_done(result);
+            }
             self.aggregate
                 .source()
                 .member_done(&self.aggregate.0, result);
@@ -591,6 +668,9 @@ mod tests {
 impl Drop for Member {
     fn drop(&mut self) {
         self.complete(Err(ECANCELED));
+        if let Some(work) = &self.work {
+            work.owner_done();
+        }
         self.aggregate.source().owner_done();
     }
 }
@@ -610,6 +690,7 @@ pub(crate) struct Outputs {
     syncs: KVVec<SyncItem>,
     input_count: usize,
     submission: Option<Aggregate>,
+    chunks: KVec<Arc<ChunkWork>>,
     result: Result,
     cumulative: Option<super::sync_output::SignalBundle>,
 }
@@ -640,6 +721,7 @@ impl Outputs {
             syncs,
             input_count,
             submission: None,
+            chunks: KVec::new(),
             result: Err(ECANCELED),
             cumulative,
         })
@@ -661,6 +743,19 @@ impl Outputs {
         compute_only: bool,
     ) -> Result<Aggregate> {
         let source = Submission::new(context, firmware_source)?;
+        self.publish_source(source, compute_only)
+    }
+    pub(crate) fn publish_with_status(
+        &mut self,
+        vm_status: Arc<super::status::VmStatus>,
+        chunks: KVec<Arc<ChunkWork>>,
+        compute_only: bool,
+    ) -> Result<Aggregate> {
+        self.chunks = chunks;
+        let source = Submission::with_work_and_status(None, Some(vm_status), false)?;
+        self.publish_source(source, compute_only)
+    }
+    fn publish_source(&mut self, source: Arc<Submission>, compute_only: bool) -> Result<Aggregate> {
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
@@ -682,6 +777,9 @@ impl Outputs {
 }
 impl Drop for Outputs {
     fn drop(&mut self) {
+        for chunk in &self.chunks {
+            chunk.finish_enqueue(self.result);
+        }
         if let Some(submission) = self.submission.take() {
             if let Some(bundle) = &mut self.cumulative {
                 bundle.fail(&submission.fence());

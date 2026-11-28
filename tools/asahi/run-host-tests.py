@@ -278,6 +278,8 @@ ASAHI_TESTS = {
                                    'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
+    'g17-chunk-work-guard-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-guard', 'no-finish-enqueue'), []),
     'g17-compute-constructor-tests.py': [([], PASS)],
     'g17-compute-owed-stamp-tests.py': [([], PASS)]
         + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',

@@ -739,6 +739,17 @@ impl WorkStateLease {
             ordinal,
         })
     }
+    /// An additional lease for splitting a multi-command ioctl, returning `None` once
+    /// `identity::Order` reaches its split cap so new ioctls keep full headroom.
+    pub(crate) fn deferred_split(context: Arc<Context>) -> Option<Self> {
+        let ordinal = context.order.lock().assign_split()?;
+        Some(Self {
+            context,
+            word: AtomicU32::new(FREE),
+            engine: AtomicU8::new(0),
+            ordinal,
+        })
+    }
     /// The ioctl's node, taking one for `engine`'s admission if it has none yet. EBUSY: an older
     /// ioctl still waits for its node (see `identity::Order`), or no node may be taken now
     /// (see `identity::may_take`); an older ioctl's admission or a return lets it try again.

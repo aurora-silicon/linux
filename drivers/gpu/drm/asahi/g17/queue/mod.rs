@@ -9,9 +9,9 @@ pub(crate) mod render;
 use super::{
     command::{Parser, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication, Publication},
-    context::Context,
+    context::{Context, WorkStateLease},
     dependency::FailureRecord,
-    fence::Outputs,
+    fence::{ChunkWork, Outputs},
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
 };
@@ -27,6 +27,19 @@ use kernel::{
     sync::{Arc, LockClassKey},
     xarray,
 };
+
+/// Maximum commands sharing one work-state node inside a multi-command submit ioctl.
+/// Keeps eight independent retirement waves inside a full `RENDER_DEPTH` ring so the
+/// firmware flushes completion stamps before the ring can fill and stall publication.
+const WORK_STATE_BATCH_LIMIT: usize = (crate::hw::t8140::queues::RENDER_DEPTH as usize) / 8;
+
+fn work_state_split_before(
+    chunk_len: usize,
+    prev_has_outputs: bool,
+    query_access: bool,
+) -> bool {
+    chunk_len > 0 && (chunk_len >= WORK_STATE_BATCH_LIMIT || prev_has_outputs || query_access)
+}
 
 static FENCE_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
@@ -222,6 +235,7 @@ impl<B: Backend> Queue<B> {
         order: Order,
         guard: mmu::VmJobGuard,
         aggregate: &super::fence::Aggregate,
+        work: Option<Arc<ChunkWork>>,
         inputs: &[file::SyncItem],
         destinations: Destinations,
     ) -> Result {
@@ -298,11 +312,15 @@ impl<B: Backend> Queue<B> {
                 host_waits,
                 query_access,
             )?;
+            let member = match work {
+                Some(work) => aggregate.member_with_work(work),
+                None => aggregate.member(),
+            };
             let completion = Completion::new(
                 &self.dev,
                 &self.fences,
                 &self.context,
-                aggregate.member(),
+                member,
                 guard,
                 destinations,
                 engine == Engine::Compute,
@@ -589,15 +607,55 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 publishers.reserve(room)?;
             }
             let mut guards = guards.into_iter();
-            // Where a firmware wait reports completion before a weak stream tail's writes are
-            // visible, only a command that declares a visible completion is waited for there.
-            let visible_required = self.backend.firmware_sources_need_visible_completion();
-            let firmware_source = pending.len() == 1
-                && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
-                    if *visible_completion || !visible_required)
-                && !pending[0].2.has_outputs()
-                && !self.has_pending_publication(&pending[0].1);
-            let aggregate = outputs.publish(self.context.clone(), firmware_source, compute_only)?;
+            let mut work_states = KVec::new();
+            let aggregate = if pending.len() > 1 {
+                work_states.reserve(pending.len(), GFP_KERNEL)?;
+                let mut chunks = KVec::new();
+                chunks.reserve(pending.len(), GFP_KERNEL)?;
+                let mut current: Option<Arc<ChunkWork>> = None;
+                let mut chunk_len = 0usize;
+                let mut prev_has_outputs = false;
+                for (command, _, destinations) in pending.iter() {
+                    let query_access =
+                        matches!(command, Validated::Compute { query_access: true, .. });
+                    if current.is_none() {
+                        let lease = Arc::new(
+                            WorkStateLease::deferred(self.context.clone())?,
+                            GFP_KERNEL,
+                        )?;
+                        let chunk = ChunkWork::new(lease)?;
+                        chunks.push(chunk.clone(), GFP_KERNEL)?;
+                        current = Some(chunk);
+                        chunk_len = 0;
+                    } else if work_state_split_before(chunk_len, prev_has_outputs, query_access) {
+                        if let Some(lease) = WorkStateLease::deferred_split(self.context.clone()) {
+                            let lease = Arc::new(lease, GFP_KERNEL)?;
+                            let chunk = ChunkWork::new(lease)?;
+                            chunks.push(chunk.clone(), GFP_KERNEL)?;
+                            current = Some(chunk);
+                            chunk_len = 0;
+                        }
+                    }
+                    work_states.push(current.as_ref().ok_or(EIO)?.clone(), GFP_KERNEL)?;
+                    chunk_len += 1;
+                    prev_has_outputs = destinations.has_outputs();
+                }
+                outputs.publish_with_status(
+                    self.context.status().clone(),
+                    chunks,
+                    compute_only,
+                )?
+            } else {
+                // Where a firmware wait reports completion before a weak stream tail's writes are
+                // visible, only a command that declares a visible completion is waited for there.
+                let visible_required = self.backend.firmware_sources_need_visible_completion();
+                let firmware_source = pending.len() == 1
+                    && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
+                        if *visible_completion || !visible_required)
+                    && !pending[0].2.has_outputs()
+                    && !self.has_pending_publication(&pending[0].1);
+                outputs.publish(self.context.clone(), firmware_source, compute_only)?
+            };
             let output_fence = aggregate.fence();
             super::trace::submit(
                 1,
@@ -608,6 +666,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 0,
                 Some(&output_fence),
             );
+            let mut work_states = work_states.into_iter();
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
@@ -616,6 +675,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     order,
                     guard,
                     &aggregate,
+                    work_states.next(),
                     outputs.inputs(),
                     destinations,
                 )?;
@@ -1346,5 +1406,14 @@ mod tests {
 
         pub_a.finish(Ok([1, 2, 0, 0]));
         assert!(fence_status(&comp_b_completed) > 0);
+    }
+
+    #[test]
+    fn multi_command_work_state_splits_on_limit_timestamps_and_query_access() {
+        assert!(!work_state_split_before(0, true, true));
+        assert!(!work_state_split_before(WORK_STATE_BATCH_LIMIT - 1, false, false));
+        assert!(work_state_split_before(WORK_STATE_BATCH_LIMIT, false, false));
+        assert!(work_state_split_before(1, true, false));
+        assert!(work_state_split_before(1, false, true));
     }
 }

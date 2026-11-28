@@ -1109,7 +1109,10 @@ impl Queue {
     /// A completion hint can require a second visibility/recordless pass even
     /// when firmware has no more events to send. Do not poll idle or failed queues.
     pub(crate) fn retirement_polling(&self) -> bool {
-        self.configuration.is_some() || (!self.quarantined && self.retire_pending)
+        self.configuration.is_some()
+            || (!self.quarantined
+                && (self.retire_pending
+                    || self.active.front().is_some_and(|a| a.observed.is_some())))
     }
 
     /// A release has no completion event: keep observing the control consumer
@@ -1140,6 +1143,7 @@ impl Queue {
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         self.retired_by_teardown
             || self.retire_pending
+            || self.active.front().is_some_and(|a| a.observed.is_some())
             || masks.is_none_or(|m| m[self.qid() as usize / 64] & (1 << (self.qid() % 64)) != 0)
     }
 
