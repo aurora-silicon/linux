@@ -57,6 +57,10 @@
 	brcm,board-type = "apple,shikoku";
 };
 
+&port00 {
+	supports-clkreq;
+};
+
 &fpwm1 {
 	status = "okay";
 };
