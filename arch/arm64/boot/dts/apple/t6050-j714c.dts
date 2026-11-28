@@ -329,6 +329,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s. iBoot loads its firmware and the
@@ -512,25 +513,4 @@
 			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
 			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
-};
-
-/* The video decoder, its DART and power states. */
-&pmgr4 {
-	status = "okay";
-};
-
-&ps_fab1_soc {
-	status = "okay";
-};
-
-&ps_avd_sys {
-	status = "okay";
-};
-
-&avd_dart {
-	status = "okay";
-};
-
-&avd {
-	status = "okay";
 };
