@@ -3925,21 +3925,21 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
-        // T8152 uses the module-1134 M5 execution-context leases (`mmu::t8152`); the slot
-        // allocator would claim contexts the leases own.
-        if self.inner.firmware.is_no_peer() {
-            return Err(ENOTSUPP);
-        }
         self.bind_inner(vm, true)
     }
 
     /// Binds a VM without waiting for another slot owner to retire.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G14_V27_2))]
     pub(crate) fn try_bind(&self, vm: &Vm) -> Result<VmBind> {
         self.bind_inner(vm, false)
     }
 
     fn bind_inner(&self, vm: &Vm, wait: bool) -> Result<VmBind> {
+        // T8152 uses the module-1134 M5 execution-context leases (`mmu::t8152`); the slot
+        // allocator would claim contexts the leases own.
+        if self.inner.firmware.is_no_peer() {
+            return Err(ENOTSUPP);
+        }
         self.inner.check_m4()?;
         let mut binding = vm.binding.lock();
         self.inner.check_m4()?;
