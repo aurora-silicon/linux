@@ -115,8 +115,8 @@ pub(crate) struct Variant {
     /// A context takes its render pool identity when it is created, not at its first render,
     /// so that identities held by render graphs kept until the firmware stops refuse new
     /// contexts with an error instead of failing a context's first render. Set for the A18
-    /// Pro and M4 Max (`25G83`/`26B123`); M4 Pro and M4 Max `25F84` keep the first-render
-    /// claim until tested on that hardware.
+    /// Pro, M4 Pro and M4 Max `25G83` and M4 Max `26B123`; `25F84` keeps the first-render
+    /// claim until tested on that firmware.
     pub(crate) render_id_at_create: bool,
     /// Cached descriptor storage, queue records and queue configuration that come back
     /// after their owner's release was consumed are reused once the firmware has consumed
@@ -228,7 +228,9 @@ pub(crate) const V25G83: Variant = Variant {
     m5_commands: false,
     registration_power_hold: true,
     m5_layouts: None,
-    render_id_at_create: false,
+    // Host policy: take the render pool identity at context creation. On for the M4 Max
+    // 25G83 build since ec3ced95 and measured on the M4 Pro (J616s).
+    render_id_at_create: true,
     objects_after_release: false,
     telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
 };
@@ -262,6 +264,7 @@ pub(crate) const V25F84: Variant = Variant {
     split_firmware_area: true,
     // Not measured on 25F84 or on 26B123, which inherits this.
     render_stage_prefixes: false,
+    render_id_at_create: false,
     ..V25G83
 };
 
