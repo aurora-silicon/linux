@@ -21,6 +21,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
+#include <linux/soc/apple/pmc.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
@@ -1306,28 +1307,107 @@ fail:
 static int apple_pmgr_ps_consumer_chain(struct device *consumer,
 					struct apple_pmgr_ps **chain)
 {
-	struct device_node *np = of_parse_phandle(consumer->of_node, "power-domains", 0);
-	int n = 0;
+	struct device_node *seen[APPLE_PMGR_PS_MAX_CHAIN + 1];
+	struct device_node *seen_pmc[APPLE_PMGR_PS_MAX_CHAIN];
+	struct device_node *cur, *next = NULL, *hop_pmc = NULL;
+	int n = 0, seen_nr = 0, pmc_nr = 0, err = 0;
 
-	while (np) {
-		struct platform_device *pdev = of_find_device_by_node(np);
-		struct apple_pmgr_ps *ps = NULL;
-		struct device_node *parent;
+	if (!consumer->of_node)
+		return -ENODEV;
 
-		if (pdev && pdev->dev.driver == &apple_pmgr_ps_driver.driver)
-			ps = platform_get_drvdata(pdev);
-		if (pdev)
-			put_device(&pdev->dev);
-		if (!ps || !ps->consumer_switched || n == APPLE_PMGR_PS_MAX_CHAIN) {
-			of_node_put(np);
-			break;
+	cur = of_node_get(consumer->of_node);
+	while (cur) {
+		struct of_phandle_iterator it;
+		struct apple_pmgr_ps *next_ps = NULL;
+		const struct property *prop;
+		int j, len, rc;
+
+		for (j = 0; j < seen_nr; j++) {
+			if (seen[j] == cur) {
+				err = -ELOOP;
+				goto out;
+			}
 		}
-		chain[n++] = ps;
-		parent = of_parse_phandle(np, "power-domains", 0);
-		of_node_put(np);
-		np = parent;
+		seen[seen_nr++] = cur;
+		cur = NULL;
+		next = NULL;
+		hop_pmc = NULL;
+
+		prop = of_find_property(seen[seen_nr - 1], "power-domains", &len);
+		if (prop && (!len || (len % sizeof(__be32)))) {
+			err = -EINVAL;
+			goto out;
+		}
+		of_for_each_phandle(&it, rc, seen[seen_nr - 1], "power-domains",
+				    "#power-domain-cells", -1) {
+			struct platform_device *pdev;
+			struct apple_pmgr_ps *ps = NULL;
+
+			if (!it.node)
+				continue;
+			if (seen_nr > 1 &&
+			    (of_property_present(it.node, "apple,bwr-bit") ||
+			     of_property_present(it.node, "apple,boost-bit"))) {
+				int k;
+
+				if (hop_pmc && hop_pmc != it.node) {
+					of_node_put(it.node);
+					err = -EINVAL;
+					goto out;
+				}
+				for (k = 0; k < pmc_nr; k++) {
+					if (seen_pmc[k] == it.node) {
+						of_node_put(it.node);
+						err = -EINVAL;
+						goto out;
+					}
+				}
+				if (!hop_pmc)
+					hop_pmc = of_node_get(it.node);
+			}
+			pdev = of_find_device_by_node(it.node);
+			if (pdev && pdev->dev.driver == &apple_pmgr_ps_driver.driver)
+				ps = platform_get_drvdata(pdev);
+			if (pdev)
+				put_device(&pdev->dev);
+			if (!ps || !ps->consumer_switched)
+				continue;
+			if (next) {
+				of_node_put(it.node);
+				err = -EINVAL;
+				goto out;
+			}
+			next = of_node_get(it.node);
+			next_ps = ps;
+		}
+		if (rc != -ENOENT) {
+			err = rc;
+			goto out;
+		}
+		if (hop_pmc) {
+			seen_pmc[pmc_nr++] = hop_pmc;
+			hop_pmc = NULL;
+		}
+		if (!next)
+			break;
+		if (n == APPLE_PMGR_PS_MAX_CHAIN) {
+			err = -ELOOP;
+			goto out;
+		}
+		chain[n++] = next_ps;
+		cur = next;
+		next = NULL;
 	}
-	return n ?: -ENODEV;
+
+out:
+	of_node_put(cur);
+	of_node_put(next);
+	of_node_put(hop_pmc);
+	while (pmc_nr--)
+		of_node_put(seen_pmc[pmc_nr]);
+	while (seen_nr--)
+		of_node_put(seen[seen_nr]);
+	return err ?: (n ?: -ENODEV);
 }
 
 static int apple_pmgr_ps_consumer_switch(struct apple_pmgr_ps *ps, bool on)
@@ -1339,6 +1419,42 @@ static int apple_pmgr_ps_consumer_switch(struct apple_pmgr_ps *ps, bool on)
 	ret = on ? apple_pmgr_ps_consumer_state_on(ps) : apple_pmgr_ps_consumer_state_off(ps);
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 	return ret;
+}
+
+/*
+ * Whether a PMGR hop has no direct PMC interface parent configured. On
+ * -EOPNOTSUPP (CONFIG_APPLE_PMC=n), inspect the node's direct power-domains
+ * strictly so hops without a PMC interface keep working while configured or
+ * malformed ones propagate -EOPNOTSUPP.
+ */
+static bool apple_pmgr_ps_pmc_absent(struct device *dev, int ret)
+{
+	struct of_phandle_iterator it;
+	const struct property *prop;
+	int len, rc;
+
+	if (ret == -ENODEV)
+		return true;
+	if (ret != -EOPNOTSUPP)
+		return false;
+	if (!dev || !dev->of_node)
+		return true;
+
+	prop = of_find_property(dev->of_node, "power-domains", &len);
+	if (prop && (!len || (len % sizeof(__be32))))
+		return false;
+
+	of_for_each_phandle(&it, rc, dev->of_node, "power-domains",
+			    "#power-domain-cells", -1) {
+		if (!it.node)
+			continue;
+		if (of_property_present(it.node, "apple,bwr-bit") ||
+		    of_property_present(it.node, "apple,boost-bit")) {
+			of_node_put(it.node);
+			return false;
+		}
+	}
+	return rc == -ENOENT;
 }
 
 /*
@@ -1358,6 +1474,7 @@ int apple_pmgr_ps_consumer_check(struct device *consumer)
 	for (int i = 0; i < n && !ret; i++) {
 		struct apple_pmgr_ps *ps = chain[i];
 		unsigned long flags;
+		int pmc_ret;
 
 		spin_lock_irqsave(&ps->genpd.slock, flags);
 		if (ps->consumer_failed)
@@ -1365,6 +1482,11 @@ int apple_pmgr_ps_consumer_check(struct device *consumer)
 		else if (ps->consumer_off)
 			ret = -EALREADY;
 		spin_unlock_irqrestore(&ps->genpd.slock, flags);
+		if (!ret) {
+			pmc_ret = apple_pmc_interface_pmgr_check(ps->dev);
+			if (pmc_ret && !apple_pmgr_ps_pmc_absent(ps->dev, pmc_ret))
+				ret = pmc_ret;
+		}
 	}
 	return ret;
 }
@@ -1381,6 +1503,10 @@ int apple_pmgr_ps_consumer_off(struct device *consumer)
 		ret = apple_pmgr_ps_consumer_switch(chain[i], false);
 		if (ret)
 			return ret;
+		/* Clear a direct PMC interface parent after its child domain goes off. */
+		ret = apple_pmc_interface_pmgr_off(chain[i]->dev);
+		if (ret && !apple_pmgr_ps_pmc_absent(chain[i]->dev, ret))
+			return ret;
 	}
 	return 0;
 }
@@ -1394,6 +1520,11 @@ int apple_pmgr_ps_consumer_on(struct device *consumer)
 	if (n < 0)
 		return n;
 	for (int i = n - 1; i >= 0; i--) {
+		/* Restore any direct PMC parent after parent PMGR is up, before child. */
+		ret = apple_pmc_interface_pmgr_on(chain[i]->dev);
+		if (ret && ret != -EALREADY &&
+		    !apple_pmgr_ps_pmc_absent(chain[i]->dev, ret))
+			return ret;
 		ret = apple_pmgr_ps_consumer_switch(chain[i], true);
 		/* Also a rollback after a power-off that stopped partway: skip what stayed on. */
 		if (ret && ret != -EALREADY)
