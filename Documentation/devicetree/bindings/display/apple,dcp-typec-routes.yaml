@@ -34,7 +34,9 @@ description: |
   crossbar controls, crossbar states, DPTX targets and route nodes below,
   and the matching endpoints on each connector's display port (port@2 on
   T6050, port@3 on earlier SoCs). Without a boot loader that does, the
-  processor has no Type-C route.
+  processor has no Type-C route. A processor with a fixed output names only
+  that (dp-phy, dp-xbar) beside the empty container; the loader appends the
+  Type-C PHYs and crossbar controls after it.
 
   Legacy typecN-usb4 names describe cell 1 on old j414/j416 DTBs. With two
   port@3 endpoints they retain the existing dual-stream wiring; cell 2 is
