@@ -60,6 +60,10 @@ def mutations(flag, names, base, expect=KILL):
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
     'aurora-wake-output-tests.py': [(out(), PASS)],
+    'xe-16k-nonposted-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('ring-ctl-page-size', 'guc-page-shift',
+                                   'emit-pte-page-size', 'query-min-align-4k',
+                                   'drop-xe-nonposted-io', 'drop-xe-fault-migrate'), out()),
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),

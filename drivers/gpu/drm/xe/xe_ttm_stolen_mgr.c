@@ -198,6 +198,11 @@ static void xe_ttm_stolen_mgr_fini(struct drm_device *dev, void *arg)
 	ttm_range_man_fini_nocheck(&xe->ttm, XE_PL_STOLEN);
 }
 
+static void xe_stolen_unmap_np(void *mapping)
+{
+	iounmap((void __force __iomem *)mapping);
+}
+
 int xe_ttm_stolen_mgr_init(struct xe_device *xe)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
@@ -242,8 +247,17 @@ int xe_ttm_stolen_mgr_init(struct xe_device *xe)
 	drm_dbg_kms(&xe->drm, "Initialized stolen memory support with %llu bytes\n",
 		    stolen_size);
 
-	if (io_size)
-		mgr->mapping = devm_ioremap_wc(&pdev->dev, mgr->io_base, io_size);
+	if (io_size) {
+		if (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED) {
+			mgr->mapping = ioremap_np(mgr->io_base, io_size);
+			if (mgr->mapping &&
+			    devm_add_action_or_reset(&pdev->dev, xe_stolen_unmap_np,
+						     (void __force *)mgr->mapping))
+				mgr->mapping = NULL;
+		} else {
+			mgr->mapping = devm_ioremap_wc(&pdev->dev, mgr->io_base, io_size);
+		}
+	}
 
 	return drmm_add_action_or_reset(&xe->drm, xe_ttm_stolen_mgr_fini, mgr);
 }
@@ -279,7 +293,13 @@ static int __xe_ttm_stolen_io_mem_reserve_lmembar(struct xe_device *xe,
 
 	mem->bus.offset += mgr->io_base;
 	mem->bus.is_iomem = true;
-	mem->bus.caching = ttm_write_combined;
+	if (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+	    IORESOURCE_MEM_NONPOSTED) {
+		mem->bus.is_nonposted = true;
+		mem->bus.caching = ttm_uncached;
+	} else {
+		mem->bus.caching = ttm_write_combined;
+	}
 
 	return 0;
 }
