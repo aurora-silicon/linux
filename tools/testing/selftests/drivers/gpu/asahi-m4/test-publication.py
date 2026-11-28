@@ -3,6 +3,7 @@
 """Execute production M4 publication/error isolation with a CPU-only transport recorder."""
 from common import kernel_root, output_dir, rustc, sha
 import json
+import re
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/engine.rs'
@@ -41,6 +42,8 @@ assert 'Some(params::queue_limits())' in gpu_limits_fn, gpu_limits_fn
 assert 'DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES' in gpu_src
 max_queues_line = next(line for line in hw_src.splitlines() if 'const MAX_QUEUES:' in line)
 flights_line = next(line for line in hw_src.splitlines() if 'const FLIGHTS:' in line)
+heavy_limits = [line.strip() for line in hw_src.splitlines() if 'const COMPUTE_HEAVY_' in line]
+assert len(heavy_limits) == 2, heavy_limits
 assert 'const COMPUTE_SLOTS: usize = COMPUTE_UNITS;' in hw_src
 assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
 prefix_render_fn = item('fn prefix_render(')
@@ -53,6 +56,18 @@ assert (
 ), 'render_bar must be hoisted ahead of barrier emission'
 assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
 assert 'p.prev_barrier.write(0, &prev)?;' in prefix_render_fn
+# The TA->TA barrier is posted exactly when the plan asks for it and the TA ring's order
+# does not already imply it, decided after every InitBM producer is known.
+assert 'if plan.ta_prev_wait && !ta_ordered {' in prefix_render_fn
+assert (
+    prefix_render_fn.index('let producer_initbm = pf.initbm')
+    < prefix_render_fn.index('let ta_ordered = ta_ring_orders_prev(cross_vm_prev, producer_initbm);')
+    < prefix_render_fn.index('if plan.ta_prev_wait && !ta_ordered {')
+    < prefix_render_fn.index('p.prev_barrier.write(0, &prev)?;')
+), 'prev_barrier must follow the ring-order decision'
+# Barrier stats are staged on `Prefix` and committed only on TA producer publication.
+assert 'stats.ta_prev' not in prefix_render_fn and 'stats.ta_order' not in prefix_render_fn
+assert 'pf.ta_order += 1;' in prefix_render_fn and 'pf.ta_prev += 1;' in prefix_render_fn
 # The VM mark waits for visibility: an unpublished prefix never marks its VM.
 assert 'note_msaa_render' not in prefix_render_fn
 assert 'f.msaa |= cmd.is_multisampled();' in prefix_render_fn
@@ -205,7 +220,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn validate_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64)->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; __HEAVY_LIMITS__ } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -921,6 +936,7 @@ mod queue_behind_scope {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
+    __TA_RING_ORDERS_PREV__
     __SCS_COMPUTE_CONFLICT__
     __MSAA_RENDER_CONFLICT__
     impl QueueBehindHost {
@@ -1920,6 +1936,15 @@ mod queue_behind_scope {
             }
         );
     }
+    #[test]fn ta_ring_order_replaces_only_the_same_vm_ta_barrier(){
+        // A same-VM predecessor with no InitBM on either side: the plan's TA->TA wait is
+        // left to the TA ring's order (case 2 above still plans it).
+        assert!(ta_ring_orders_prev(false, false));
+        // Another VM's predecessor, or an InitBM producer or consumer, keeps prev_barrier.
+        assert!(!ta_ring_orders_prev(true, false));
+        assert!(!ta_ring_orders_prev(false, true));
+        assert!(!ta_ring_orders_prev(true, true));
+    }
     #[test]fn two_pipe_concurrent_compute_dispatch_and_fw_timestamp_safety(){
         let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
@@ -1950,17 +1975,23 @@ mod queue_behind_scope {
             cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
             has_timestamps:false,doomed:false,recovery_suspect:false,
         });
-        // Cold-start heavy probe: sole single-command compute flight becomes heavy at >= 180 us.
-        assert!(!host.compute_queue_is_heavy(&q1, 1_179_999));
-        assert!(host.compute_queue_is_heavy(&q1, 1_180_000));
+        // Cold-start heavy probe: sole single-command compute flight becomes heavy at >= 140 us.
+        assert!(!host.compute_queue_is_heavy(&q1, 1_139_999));
+        assert!(host.compute_queue_is_heavy(&q1, 1_140_000));
         // Folded multi-command light flight does not trigger the cold-start probe.
         host.engine.flights[0].computes = 3;
         assert!(!host.compute_queue_is_heavy(&q1, 2_000_000));
         host.engine.flights[0].computes = 1;
-        // Per-queue retired hardware CDM EWMA transitions cleanly at 200 us.
+        // The retired EWMA crosses over at the probe's 140 us, after the probe has expired.
+        q1.note_compute_us(139);
+        assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
+        q1.note_compute_us(141);
+        assert!(host.compute_queue_is_heavy(&q1, 1_050_000));
+        q1.compute_ewma_us.store(0, Ordering::Relaxed);
+        // The EWMA follows subsequent changes in the stream.
         q1.note_compute_us(30);
         assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
-        q1.note_compute_us(500);
+        q1.note_compute_us(300);
         assert!(host.compute_queue_is_heavy(&q1, 1_050_000));
         q1.note_compute_us(20);
         assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
@@ -3031,7 +3062,7 @@ mod busy_coalesce_scope {
         h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, Some(2)])];
         assert_eq!(h.defer_busy_coalesce(400_000), None);
 
-        // Heavy compute queue (EWMA >= 200 us) bypasses busy coalescing so 2-pipe fanout runs immediately.
+        // Heavy compute queue (EWMA >= 140 us) bypasses busy coalescing so 2-pipe fanout runs immediately.
         h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, None])];
         q1.note_compute_us(500);
         assert_eq!(h.defer_busy_coalesce(420_000), None);
@@ -3136,7 +3167,7 @@ mod msaa_fold_scope {
             group: Group(vec![]), msaa: false, pb: Some(Pb), pb_slot: 0 }
     }
     __MSAA_RENDER_CONFLICT__
-    struct Prefix { draw: u64, ta_head: u32, fs_head: u32, renders: u32 }
+    struct Prefix { draw: u64, ta_head: u32, fs_head: u32, renders: u32, ta_prev: u64, ta_order: u64 }
     struct Cfg { num_clusters: u32, gpu_generation: u32 }
     struct Slots { pass_busy: u64, publish_fails: bool }
     impl Slots {
@@ -3147,11 +3178,27 @@ mod msaa_fold_scope {
         fn publish(&mut self, _c: &mut Claims) -> Result { if self.publish_fails { Err(EIO) } else { Ok(()) } }
     }
     struct Pools; impl Pools { fn hold_alloc(&mut self, _k: usize, _vm: &Arc<Vm>, _a: u32, _l: u32) -> Result { Ok(()) } }
-    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>> }
-    struct Host { cfg: Cfg, slots: Slots, pools: Pools, engine: Engine, prefixed: Vec<(u32, u32)> }
+    mod qstate { pub const WRITE: usize = 0; }
+    struct QState { fail: bool }
+    impl QState {
+        fn w32(&self, _off: usize, _v: u32) -> Result {
+            if self.fail { Err(EIO) } else { Ok(()) }
+        }
+    }
+    struct RenderGraph { qstate: [QState; 2] }
+    struct Graph { render: RenderGraph }
+    #[derive(Default)]
+    struct RenderStats { publications: [u64; 2], ta_prev: u64, ta_order: u64 }
+    fn publish_producer(q: &QState, head: u32, count: &mut u64) -> Result {
+        q.w32(qstate::WRITE, head)?;
+        *count += 1;
+        Ok(())
+    }
+    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>>, stats: RenderStats }
+    struct Host { cfg: Cfg, slots: Slots, pools: Pools, graph: Graph, engine: Engine, prefixed: Vec<(u32, u32)>, recovery: bool }
     impl Host {
         __MSAA_MEMBER_ALLOWED__
-        fn recovery_pending(&self) -> Result<bool> { Ok(false) }
+        fn recovery_pending(&self) -> Result<bool> { Ok(self.recovery) }
         fn wait_compute_stamps_for(&self, _j: &Arc<Job>, _t: Option<u64>) -> Result { Ok(()) }
         fn wait_stamp_for_with(&self, _j: &Arc<Job>, _c: usize, _t: Option<u64>, _f: Option<&Flight>) -> Result { Ok(()) }
         #[allow(clippy::too_many_arguments)]
@@ -3168,7 +3215,7 @@ mod msaa_fold_scope {
         fn fold(&mut self, job: &Arc<Job>, f: &mut Flight, more: usize) -> Result<u32> {
             let index = 0u32;
             let mut end = 1u32;
-            let mut prefix = Prefix { draw: 1, ta_head: 0, fs_head: 0, renders: 1 };
+            let mut prefix = Prefix { draw: 1, ta_head: 0, fs_head: 0, renders: 1, ta_prev: 0, ta_order: 0 };
             let (ta_read, fs_read) = (0u32, 0u32);
             let (behind, class_behind) = (true, true);
             let stage_prefix = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
@@ -3187,10 +3234,23 @@ mod msaa_fold_scope {
             if fail_after { return Err(EIO); }
             Ok(())
         }
+        fn publish_render_producers(&mut self, job: &Arc<Job>, f: &mut Flight, prefix: &Prefix, visible: &mut bool) -> Result {
+            let render = true;
+            __PUBLICATION_PROLOGUE__
+            __RENDER_PRODUCER_PUBLICATION__
+            Ok(())
+        }
     }
     fn host(flights: Vec<Flight>, pending: Vec<Arc<Job>>) -> Host {
-        Host { cfg: Cfg { num_clusters: 1, gpu_generation: 16 }, slots: Slots { pass_busy: 1, publish_fails: false }, pools: Pools,
-            engine: Engine { flights, pending }, prefixed: vec![] }
+        Host {
+            cfg: Cfg { num_clusters: 1, gpu_generation: 16 },
+            slots: Slots { pass_busy: 1, publish_fails: false },
+            pools: Pools,
+            graph: Graph { render: RenderGraph { qstate: [QState { fail: false }, QState { fail: false }] } },
+            engine: Engine { flights, pending, stats: RenderStats::default() },
+            prefixed: vec![],
+            recovery: false,
+        }
     }
     #[test] fn same_submit_fold_splits_before_a_multisampled_member_beside_another_vm() {
         let (vm1, vm2, q1, q2) = (vm(1), vm(2), Arc::new(Queue), Arc::new(Queue));
@@ -3271,6 +3331,30 @@ mod msaa_fold_scope {
         assert!(visible && !v3.renders_msaa());
         let _ = (EAGAIN, EINVAL);
     }
+    #[test] fn ta_prev_barrier_stats_commit_only_on_ta_producer_publication() {
+        let q = Arc::new(Queue);
+        let v = vm(1);
+        let j = job(1, &v, &q, 1, &[LIGHT]);
+        let prefix = Prefix { draw: 1, ta_head: 4, fs_head: 5, renders: 1, ta_prev: 2, ta_order: 3 };
+        // Rejected by recovery_pending (-EAGAIN) before visibility: staged counts are discarded.
+        let mut h = host(vec![], vec![]);
+        h.recovery = true;
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Err(EAGAIN));
+        assert!(!visible && h.engine.stats.ta_prev == 0 && h.engine.stats.ta_order == 0);
+        // TA producer publication fails: counts do not advance.
+        let mut h = host(vec![], vec![]);
+        h.graph.render.qstate[0].fail = true;
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Err(EIO));
+        assert!(visible && h.engine.stats.ta_prev == 0 && h.engine.stats.ta_order == 0);
+        // TA producer publishes cleanly: staged counts commit alongside publications[1].
+        let mut h = host(vec![], vec![]);
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Ok(()));
+        assert!(visible && h.engine.stats.publications[1] == 1);
+        assert_eq!((h.engine.stats.ta_prev, h.engine.stats.ta_order), (2, 3));
+    }
 }
 
 '''
@@ -3284,12 +3368,18 @@ _prologue_start = source.index('        if self.recovery_pending()? {\n         
 _prologue_end = source.index('        let publication = (|| -> Result {', _prologue_start)
 _prologue = source[_prologue_start:_prologue_end]
 assert '*visible = true;' in _prologue and 'job.vm.note_msaa_render();' in _prologue
+_ta_pub_start = source.index('                publish_producer(\n                    &self.graph.render.qstate[0],', _prologue_end)
+_ta_pub_end = source.index('            } else {', _ta_pub_start)
+_ta_pub = source[_ta_pub_start:_ta_pub_end]
+assert 'self.engine.stats.ta_prev += prefix.ta_prev;' in _ta_pub
+assert 'self.engine.stats.ta_order += prefix.ta_order;' in _ta_pub
 _scope_start = harness.index('mod msaa_fold_scope {')
 _scope = harness[_scope_start:]
 for token, text in {
     '__SAME_SUBMIT_FOLD__': _same_fold,
     '__HORIZON_FOLD__': _horizon_fold,
     '__PUBLICATION_PROLOGUE__': _prologue,
+    '__RENDER_PRODUCER_PUBLICATION__': _ta_pub,
     '__IS_MULTISAMPLED__': item_in(command_src, 'pub(crate) fn is_multisampled('),
     '__RENDERS_MSAA__': item_in(vm_src, 'pub(crate) fn renders_msaa('),
     '__NOTE_MSAA_RENDER__': item_in(vm_src, 'pub(crate) fn note_msaa_render('),
@@ -3305,6 +3395,7 @@ harness = harness[:_scope_start] + _scope
 harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
 harness = harness.replace('__FLIGHTS_LINE__', flights_line.strip())
 harness = harness.replace('__MAX_QUEUES_LINE__', max_queues_line.strip())
+harness = harness.replace('__HEAVY_LIMITS__', ' '.join(heavy_limits))
 harness = harness.replace('__QUEUE_LIMITS_FN__', item_in(params_src, 'pub(crate) fn queue_limits()'))
 harness = harness.replace('__GPU_QUEUE_LIMITS_FN__', gpu_limits_fn)
 harness = harness.replace('__QUEUE_CREDIT_STRUCT__', item_in(queue_src, 'struct QueueCredit {'))
@@ -3385,6 +3476,7 @@ for token, declaration in {
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
+    '__TA_RING_ORDERS_PREV__': 'fn ta_ring_orders_prev(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::vm::VmState", "crate::Vm").replace("super::fence::", "crate::fence::"))
 unit = output / 'publication.rs'
@@ -3398,8 +3490,10 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     (output/'publication.log').write_text(log)
     if result.returncode:
         raise SystemExit(result.returncode)
+passed_match = re.search(r'test result: ok\. (\d+) passed; 0 failed;', log)
+assert passed_match, f'could not parse test count from:\n{log}'
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 70, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': int(passed_match.group(1)), 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

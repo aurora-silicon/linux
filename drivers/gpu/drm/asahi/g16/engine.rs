@@ -287,6 +287,19 @@ fn plan_render_barriers(
     }
 }
 
+/// Whether the TA ring's own order already holds TA(N) behind TA(N-1), so that the TA->TA
+/// `prev_barrier` of [`plan_render_barriers`] would only re-check a stamp the ring implies.
+///
+/// Every render's TA work goes on the one firmware TA queue, whose works the firmware runs in
+/// ring order: on Metal's TA ring, which carries no barriers, each pass's tiling starts after
+/// the previous pass's tiling has ended. A same-VM predecessor shares this render's parameter
+/// buffer and UMA slot only through that order. A predecessor of another VM
+/// (`cross_vm_prev`, its own UMA slot and the conflict of [`msaa_render_conflict`]) and any
+/// InitBM producer or consumer (`producer_initbm`) keep the barrier.
+fn ta_ring_orders_prev(cross_vm_prev: bool, producer_initbm: bool) -> bool {
+    !cross_vm_prev && !producer_initbm
+}
+
 /// Engine of the previous member.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Prev {
@@ -438,6 +451,8 @@ struct Prefix {
     last_ct: u32,
     last_ta: u32,
     last_fs: u32,
+    ta_prev: u64,
+    ta_order: u64,
 }
 
 /// Error provenance must remain independent of errno: EIO can be an ordinary failed VM
@@ -523,6 +538,9 @@ pub(crate) struct Stats {
     pub(crate) job_cmds: u64,
     pub(crate) job_max: u64,
     pub(crate) early: u64,
+    /// TA->TA barriers posted, and those the TA ring's order made unnecessary.
+    pub(crate) ta_prev: u64,
+    pub(crate) ta_order: u64,
     /// Type-0 FS->compute / compute->TA waits.
     pub(crate) fs2c0: u64,
     pub(crate) c2ta0: u64,
@@ -3516,6 +3534,8 @@ impl Firmware {
                     prefix.ta_head,
                     &mut self.engine.stats.publications[1],
                 )?;
+                self.engine.stats.ta_prev += prefix.ta_prev;
+                self.engine.stats.ta_order += prefix.ta_order;
                 self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
             } else {
                 publish_producer(
@@ -4118,12 +4138,18 @@ impl Firmware {
             || fs_wait_render.is_some_and(|w| w.initbm)
             || ta_wait_fs.is_some_and(|w| w.initbm);
         let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
-        // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights, so keep
-        // the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not
-        // already serialize behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait`
-        // names an in-flight FS stamp, and `fs_dep` when `plan.fs_render_wait` names an
-        // in-flight FS dependency (or cross-VM `prev_fs`) not already dominated by TA.
-        if plan.ta_prev_wait {
+        // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights. The plan
+        // asks for the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait`
+        // does not already serialize behind `prev_fs`; it is posted unless the TA ring's own
+        // order already holds TA(N) behind TA(N-1) (`ta_ring_orders_prev`). Emit
+        // `ta_fs_barrier` only when `plan.ta_fs_wait` names an in-flight FS stamp, and `fs_dep`
+        // when `plan.fs_render_wait` names an in-flight FS dependency (or cross-VM `prev_fs`)
+        // not already dominated by TA.
+        let ta_ordered = ta_ring_orders_prev(cross_vm_prev, producer_initbm);
+        if plan.ta_prev_wait && ta_ordered {
+            pf.ta_order += 1;
+        }
+        if plan.ta_prev_wait && !ta_ordered {
             let prev = encode::barrier(
                 r.fw_stamp[0].va,
                 prev_ta,
@@ -4135,6 +4161,7 @@ impl Firmware {
             p.prev_barrier.write(0, &prev)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
+            pf.ta_prev += 1;
         }
         if let Some(wait_fs) = plan.ta_fs_wait {
             let ta_fs = encode::barrier(
