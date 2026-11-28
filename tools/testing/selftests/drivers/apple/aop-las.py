@@ -19,6 +19,11 @@ def block(source, marker):
     return source[start:end]
 
 
+def const(source, name):
+    start = source.index(f"const {name}")
+    return source[start:source.index(";", start) + 1]
+
+
 def main():
     root = Path(__file__).resolve().parents[5]
     common = (root / "rust/kernel/iio/common/aop_sensors.rs").read_text()
@@ -28,12 +33,14 @@ def main():
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 const MICRO: u64 = 1_000_000;
 const MAX_MICRO: u64 = i32::MAX as u64 * MICRO + MICRO - 1;
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Error(i32);
 impl Error { fn to_errno(&self) -> i32 { self.0 } }
 const EINVAL: Error = Error(-22);
 const ENODATA: Error = Error(-61);
-type Result<T> = std::result::Result<T, Error>;
+const EIO: Error = Error(-5);
+const ETIMEDOUT: Error = Error(-110);
+type Result<T = ()> = std::result::Result<T, Error>;
 mod bindings {
     pub const BINDINGS_IIO_CHAN_INFO_RAW: u32 = 0;
     pub const BINDINGS_IIO_CHAN_INFO_PROCESSED: u32 = 1;
@@ -64,7 +71,17 @@ struct AopSensorData<T: MessageProcessor, const N: usize = 1> {
     ty: [u32; N], value: [Atomic<u64>; N], valid: [Atomic<bool>; N], msg_proc: T,
 }
 struct MsgProc;
-''', block(common, "pub trait MessageProcessor"),
+''', const(las, "MAX_ONDEMAND_INTERVAL_US"),
+        const(las, "DIRECT_IDLE_MS"),
+        block(las, "fn first_sample_wait_ms("),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum SyncAction"),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum IdleStep"),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum RunState"),
+        block(las, "trait IntervalIo"),
+        block(las, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum ProbeEvent"),
+        block(las, "struct Stream<T>"),
+        block(las, "impl<T> Stream<T>"),
+        block(common, "pub trait MessageProcessor"),
         block(las, "impl MessageProcessor for MsgProc"),
         block(common, "impl<T: MessageProcessor, const N: usize> FakehidListener"),
         block(common, 'unsafe extern "C" fn aop_read_raw'), r'''
@@ -141,6 +158,203 @@ fn processed_channel_unchanged() {
     assert_eq!(read(&data, BINDINGS_IIO_CHAN_INFO_PROCESSED), (2, 12, 345_678));
     assert_eq!(read(&data, BINDINGS_IIO_CHAN_INFO_SCALE).0, -22);
     assert_eq!(read(&data, 999).0, -22);
+}
+#[test]
+fn on_demand_stream_lifecycle_and_passive_fallback() {
+    assert_eq!(first_sample_wait_ms(100_000), 600);
+    assert_eq!(first_sample_wait_ms(1_000_000), 1_500);
+    assert_eq!(first_sample_wait_ms(2_000_000), 2_500);
+
+    // Passive fallback (interval unreadable): never emits start/stop actions.
+    let mut passive = Stream::<u64>::new();
+    passive.direct_until = Some(5_000);
+    assert_eq!(passive.next_action(), SyncAction::None);
+    assert_eq!(passive.check_idle(0), IdleStep::Ignore);
+
+    // On-demand lifecycle: idle off -> in-flight read starts -> idle rearms while reading -> expires -> stops.
+    let mut s = Stream::<u64>::new();
+    s.interval_us = Some(1_000_000);
+    s.restore_interval = Some(1_000_000);
+    assert_eq!(s.restore_interval, Some(1_000_000));
+    assert_eq!(s.next_action(), SyncAction::None);
+    s.direct_readers = 1;
+    assert_eq!(s.next_action(), SyncAction::Start(1_000_000));
+    s.run_state = RunState::Running;
+    s.direct_until = Some(5_000);
+    assert_eq!(s.check_idle(0), IdleStep::RearmMs(DIRECT_IDLE_MS as u32));
+    s.direct_readers = 0;
+    assert_eq!(s.check_idle(2_000), IdleStep::RearmMs(2_000));
+    assert_eq!(s.check_idle(0), IdleStep::Expire);
+    assert_eq!(s.next_action(), SyncAction::Stop);
+    s.run_state = RunState::Stopped;
+    assert_eq!(s.next_action(), SyncAction::None);
+
+    // Firmware reset on wake or unacknowledged stop marks Unknown:
+    // idle reasserts Stop, while a new reader reasserts Start.
+    s.parked = false;
+    s.run_state = RunState::Unknown;
+    assert_eq!(s.next_action(), SyncAction::Stop);
+    s.direct_readers = 1;
+    assert_eq!(s.next_action(), SyncAction::Start(1_000_000));
+    s.direct_readers = 0;
+    s.run_state = RunState::Stopped;
+
+    // Failed start backoff.
+    s.failed_until = Some((5_000, Error(-5)));
+    assert_eq!(s.check_backoff(500), Some(Error(-5)));
+    assert_eq!(s.check_backoff(0), None);
+}
+
+struct MockAop {
+    fw_interval: std::cell::Cell<u32>,
+    reads: std::cell::RefCell<std::collections::VecDeque<Result<Option<u32>>>>,
+    writes: std::cell::RefCell<std::collections::VecDeque<(bool, Result<u32>)>>,
+    write_log: std::cell::RefCell<Vec<u32>>,
+}
+
+impl MockAop {
+    fn new(
+        initial: u32,
+        reads: Vec<Result<Option<u32>>>,
+        writes: Vec<(bool, Result<u32>)>,
+    ) -> Self {
+        Self {
+            fw_interval: std::cell::Cell::new(initial),
+            reads: std::cell::RefCell::new(reads.into()),
+            writes: std::cell::RefCell::new(writes.into()),
+            write_log: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl IntervalIo for MockAop {
+    fn get_interval(&self) -> Result<Option<u32>> {
+        if let Some(res) = self.reads.borrow_mut().pop_front() {
+            return res;
+        }
+        Ok(Some(self.fw_interval.get()))
+    }
+
+    fn set_interval_status(&self, interval: u32) -> Result<u32> {
+        self.write_log.borrow_mut().push(interval);
+        if let Some((apply, res)) = self.writes.borrow_mut().pop_front() {
+            if apply {
+                self.fw_interval.set(interval);
+            }
+            return res;
+        }
+        self.fw_interval.set(interval);
+        Ok(0)
+    }
+
+    fn set_interval(&self, interval: u32) -> Result {
+        match self.set_interval_status(interval)? {
+            0 => Ok(()),
+            _ => Err(EIO),
+        }
+    }
+}
+
+#[test]
+fn probe_applied_stop_failed_readback_and_failed_restore_recovers_on_read() {
+    // 1) Probe reads 1_000_000 us.
+    // 2) Stop write applies 0 in firmware, but its reply times out.
+    // 3) Readback also times out.
+    // 4) First restore write fails (timeout).
+    let aop = MockAop::new(
+        1_000_000,
+        vec![Ok(Some(1_000_000)), Err(ETIMEDOUT)],
+        vec![(true, Err(ETIMEDOUT)), (false, Err(ETIMEDOUT))],
+    );
+    let mut s = Stream::<u64>::new();
+    let (event, retry) = s.probe_with(&aop, 5_000);
+    assert_eq!(event, ProbeEvent::StopAmbiguousRecoverable(ETIMEDOUT, 1_000_000));
+    assert!(retry);
+    assert_eq!(s.interval_us, Some(1_000_000));
+    assert_eq!(s.restore_interval, Some(1_000_000));
+    assert_eq!(s.run_state, RunState::Unknown);
+    assert_eq!(aop.fw_interval.get(), 0);
+    assert_eq!(s.direct_until, Some(5_000));
+
+    // A direct read must NOT stay passive; it restarts firmware reports and
+    // transitions cleanly to Running -> Stopped -> restored on shutdown.
+    s.direct_readers = 1;
+    assert_eq!(s.sync_with(&aop), Ok(()));
+    assert_eq!(s.run_state, RunState::Running);
+    assert_eq!(aop.fw_interval.get(), 1_000_000);
+
+    s.direct_readers = 0;
+    s.direct_until = Some(10_000);
+    assert_eq!(s.check_idle(0), IdleStep::Expire);
+    assert_eq!(s.sync_with(&aop), Ok(()));
+    assert_eq!(s.run_state, RunState::Stopped);
+    assert_eq!(aop.fw_interval.get(), 0);
+
+    assert_eq!(s.shutdown_with(&aop), Ok(()));
+    assert_eq!(aop.fw_interval.get(), 1_000_000);
+    assert_eq!(s.restore_interval, None);
+    assert_eq!(s.interval_us, None);
+}
+
+#[test]
+fn probe_applied_stop_failed_readback_and_refused_restore_recovers_on_idle_retry() {
+    let aop = MockAop::new(
+        1_000_000,
+        vec![Ok(Some(1_000_000)), Ok(None)],
+        vec![(true, Err(ETIMEDOUT)), (false, Ok(0xe000_02bc))],
+    );
+    let mut s = Stream::<u64>::new();
+    let (event, retry) = s.probe_with(&aop, 5_000);
+    assert_eq!(event, ProbeEvent::StopAmbiguousRecoverable(ETIMEDOUT, 1_000_000));
+    assert!(retry);
+    assert_eq!(s.interval_us, Some(1_000_000));
+    assert_eq!(s.run_state, RunState::Unknown);
+    assert_eq!(aop.fw_interval.get(), 0);
+
+    // Without any direct read, the armed idle retry reasserts Stop.
+    assert_eq!(s.check_idle(0), IdleStep::Expire);
+    assert_eq!(s.sync_with(&aop), Ok(()));
+    assert_eq!(s.run_state, RunState::Stopped);
+    assert_eq!(aop.fw_interval.get(), 0);
+
+    // A later direct read starts reports again and shutdown restores 1_000_000.
+    s.direct_readers = 1;
+    assert_eq!(s.sync_with(&aop), Ok(()));
+    assert_eq!(aop.fw_interval.get(), 1_000_000);
+    s.direct_readers = 0;
+    assert_eq!(s.shutdown_with(&aop), Ok(()));
+    assert_eq!(aop.fw_interval.get(), 1_000_000);
+}
+
+#[test]
+fn probe_reconciliation_variants() {
+    // Timed-out stop that did apply 0, confirmed by readback -> on-demand Stopped.
+    let aop = MockAop::new(
+        1_000_000,
+        vec![Ok(Some(1_000_000)), Ok(Some(0))],
+        vec![(true, Err(ETIMEDOUT))],
+    );
+    let mut s = Stream::<u64>::new();
+    let (event, retry) = s.probe_with(&aop, 5_000);
+    assert_eq!(event, ProbeEvent::StopTimedOutStopped(ETIMEDOUT));
+    assert!(!retry);
+    assert_eq!(s.interval_us, Some(1_000_000));
+    assert_eq!(s.restore_interval, Some(1_000_000));
+    assert_eq!(s.run_state, RunState::Stopped);
+
+    // Ambiguous stop/readback where first restore succeeds -> passive, untouched on shutdown.
+    let aop2 = MockAop::new(
+        1_000_000,
+        vec![Ok(Some(1_000_000)), Err(ETIMEDOUT)],
+        vec![(true, Err(ETIMEDOUT)), (true, Ok(0))],
+    );
+    let mut s2 = Stream::<u64>::new();
+    let (event2, retry2) = s2.probe_with(&aop2, 5_000);
+    assert_eq!(event2, ProbeEvent::StopAmbiguousRestored(ETIMEDOUT, 1_000_000));
+    assert!(!retry2);
+    assert_eq!(s2.interval_us, None);
+    assert_eq!(s2.restore_interval, None);
+    assert_eq!(aop2.fw_interval.get(), 1_000_000);
 }
 ''']
     with tempfile.TemporaryDirectory(prefix="aop-las-") as tmp:
