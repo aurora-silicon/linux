@@ -251,11 +251,15 @@ impl Lockout {
 
 pub(crate) const REARM_SECRET_MAX: usize = 1024;
 
+/// `Rearm::flags`: end only the wait for the first password since boot.
+pub(crate) const REARM_FLAG_BOOT_WAIT_ONLY: u32 = 1;
+
 /// A password which userspace has already verified for the requesting user.
 #[repr(C)]
 pub(crate) struct Rearm {
     pub(crate) secret_len: u32,
-    pub(crate) reserved: u32,
+    /// `REARM_FLAG_*`; older kernels refuse any bit with EINVAL.
+    pub(crate) flags: u32,
     pub(crate) secret: [u8; REARM_SECRET_MAX],
 }
 
@@ -265,18 +269,28 @@ impl Drop for Rearm {
     }
 }
 
+/// A checked `REARM` request.
+pub(crate) struct RearmRequest {
+    pub(crate) password: crate::Secret,
+    /// `REARM_FLAG_BOOT_WAIT_ONLY` was set.
+    pub(crate) boot_wait_only: bool,
+}
+
 /// Copies in and checks a `REARM` request: the password it carries, in a
 /// buffer that wipes itself, and nothing left behind on the stack or in the
 /// request, whatever is refused.
-pub(crate) fn read_rearm(arg: usize) -> Result<crate::Secret> {
+pub(crate) fn read_rearm(arg: usize) -> Result<RearmRequest> {
     let request = crate::key::read_user_boxed::<Rearm>(UserPtr::from_addr(arg))?;
     let len = request.secret_len as usize;
-    if request.reserved != 0 || len == 0 || len > request.secret.len() {
+    if request.flags & !REARM_FLAG_BOOT_WAIT_ONLY != 0 || len == 0 || len > request.secret.len() {
         return Err(EINVAL);
     }
     let mut bytes = KVec::with_capacity(len, GFP_KERNEL)?;
     bytes.extend_from_slice(&request.secret[..len], GFP_KERNEL)?;
-    Ok(crate::Secret(bytes))
+    Ok(RearmRequest {
+        password: crate::Secret(bytes),
+        boot_wait_only: request.flags & REARM_FLAG_BOOT_WAIT_ONLY != 0,
+    })
 }
 
 // Sizes are baked into the ioctl numbers.
