@@ -1014,8 +1014,20 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	int ret;
 
 	guard(mutex)(&c->lock);
-	if (!apple_dpin_token_access(&c->tokens, binding->generation))
+	if (!apple_dpin_token_access(&c->tokens, binding->generation)) {
+		const char *why = apple_dpin_stale_binding(&c->tokens, binding->generation);
+
+		/* A Deactivate after the tunnel went is routine; an Activate is not. */
+		if (active)
+			dev_info(c->acio->dev, "dpin%u: display Activate refused: tunnel %llu %s (requested %llu, admitted %llu)\n",
+				 c->idx, binding->generation, why, c->tokens.requested,
+				 c->tokens.admitted);
+		else
+			dev_dbg(c->acio->dev, "dpin%u: display Deactivate for tunnel %llu %s (requested %llu, admitted %llu)\n",
+				c->idx, binding->generation, why, c->tokens.requested,
+				c->tokens.admitted);
 		return -ESTALE;
+	}
 	/* the tunnel is being torn down: the block may already be off */
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;
@@ -2630,6 +2642,54 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 }
 
 /*
+ * The tunnel @generation waits for a display pipeline and no attempt to hand
+ * it to a display is admitted: none can be reading its DPRX. An attempt may
+ * be admitted right after; apple_nhi_dp_tunnel_retire_waiting() decides.
+ */
+static bool apple_nhi_dp_tunnel_retirable(struct tb_nhi *nhi, struct tb_port *in,
+					  u64 generation)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_dpin_ctx *c;
+	int idx;
+
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (!apple_dpin_valid(anhi->acio, idx))
+		return true;
+	c = &anhi->acio->dpin[idx];
+	guard(mutex)(&c->lock);
+	return apple_dpin_retirable(&c->state, &c->tokens, c->acio->dp, generation);
+}
+
+/*
+ * A re-link takes the tunnel @generation that waits for a display pipeline:
+ * retire its request now, under the lock that admits an attempt to hand it
+ * to a display, unless one is admitted already. Retired, the request's
+ * pending retry finds it gone and starts none.
+ */
+static bool apple_nhi_dp_tunnel_retire_waiting(struct tb_nhi *nhi,
+					       struct tb_port *in, u64 generation)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_dpin_ctx *c;
+	int idx;
+
+	idx = apple_dpin_index_for_port(anhi, in);
+	if (!apple_dpin_valid(anhi->acio, idx))
+		return true;
+	c = &anhi->acio->dpin[idx];
+	scoped_guard(mutex, &c->lock) {
+		if (!apple_dpin_retirable(&c->state, &c->tokens, c->acio->dp, generation))
+			return false;
+		/* Not the current request: nothing of it is left to retire. */
+		if (!apple_dpin_request(c, generation, false))
+			return true;
+	}
+	queue_work(c->acio->dp_wq, &c->work);
+	return true;
+}
+
+/*
  * There are no firmware tables naming the tunneled ports: PCIe-C, when the
  * port has one, is linked to the NHI as it is populated (see
  * apple_cio_link_pcie_tunnel()). A port without PCIe-C tunnels no native port.
@@ -2781,9 +2841,14 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	if (dp_hooks == APPLE_DPIN_CHANGED) {
 		anhi->ops.dp_tunnel_changed = apple_nhi_dp_tunnel_changed;
 		anhi->nhi.host_dp_policy = acio->dp->host_policy;
-		if (acio->dp->capacity_retry)
+		if (acio->dp->capacity_retry) {
 			anhi->ops.dp_tunnel_awaits_display =
 				apple_nhi_dp_tunnel_awaits_display;
+			anhi->ops.dp_tunnel_retirable =
+				apple_nhi_dp_tunnel_retirable;
+			anhi->ops.dp_tunnel_retire_waiting =
+				apple_nhi_dp_tunnel_retire_waiting;
+		}
 	}
 	if (dp_hooks == APPLE_DPIN_PRE_POST) {
 		anhi->ops.dp_tunnel_pre_activate = apple_nhi_dp_tunnel_pre_activate;

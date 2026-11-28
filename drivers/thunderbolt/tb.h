@@ -771,7 +771,7 @@ struct tb *tb_probe(struct tb_nhi *nhi);
 int tb_consumed_dp_bandwidth(struct tb *tb, struct tb_port *src_port,
 			     struct tb_port *dst_port, struct tb_port *port,
 			     int *consumed_up, int *consumed_down);
-u32 tb_dp_host_rate_limit(struct tb *tb);
+u32 tb_dp_host_rate_limit(struct tb *tb, bool *relinking);
 void tb_dp_host_tunnel_gone(struct tb *tb, unsigned int before);
 bool tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
 			const void *buf, size_t size);
@@ -779,12 +779,18 @@ bool tb_domain_retain_noirq_control(struct tb *tb);
 bool tb_xdp_noirq_request(enum tb_xdp_type type);
 #endif
 #if IS_ENABLED(CONFIG_USB4_KUNIT_TEST)
+struct tb_tunnel;
+
 size_t tb_test_cm_size(void);
 void tb_test_cm_init(struct tb *tb);
 struct list_head *tb_test_cm_tunnels(struct tb *tb);
 struct list_head *tb_test_cm_dp_resources(struct tb *tb);
 void tb_test_cm_set_relink_deferred(struct tb *tb, bool deferred);
 bool tb_test_cm_relink_armed(struct tb *tb);
+bool tb_test_cm_relink_held(struct tb *tb);
+bool tb_test_cm_dp_pending(struct tb *tb);
+void tb_test_cm_set_state(struct tb *tb, bool active, bool stopping);
+void tb_test_cm_dp_callbacks(struct tb_tunnel *tunnel);
 void tb_test_cm_stop(struct tb *tb);
 #endif
 

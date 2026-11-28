@@ -52,7 +52,7 @@ _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private stora
 struct kref {int count;};
 struct tb_path {bool reserved;};
 enum {TB_TUNNEL_DP,TB_TUNNEL_USB3};
-struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled,host_relinked_up;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
+struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled,host_relinked_up,host_relink_kept;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
 static int tb_tunnel_lock,occupied,alloc_calls,alloc_failures,alloc_successes,freed;
 static int domain_refs,pm_refs,pm_calls,pm_error,stop_during_pm,requeue_once,lock_depth;
 static int restore_calls,scan_calls,unplugged_xdomains;
@@ -123,6 +123,12 @@ static void tb_dp_relink_run(struct work_struct*w){CHECK(0);}
 enum tb_dp_relink {TB_DP_RELINK_NONE,TB_DP_RELINK_WAIT,TB_DP_RELINK_NOW};
 static enum tb_dp_relink tb_dp_relink_activation(bool relinked_up,bool active){CHECK(!relinked_up);return TB_DP_RELINK_NONE;}
 static void tb_dp_relink_replay(struct tb*t){CHECK(lock_depth==1);}
+/* No re-link is held for a display reading its DPRX in these cases. */
+static void tb_dp_relink_unhold(struct tb*t){CHECK(lock_depth==1);}
+static bool tb_dp_relink_wanted(struct tb_tunnel*t){CHECK(lock_depth==1);return false;}
+static void tb_dp_relink_kept(struct tb*t,bool release){CHECK(lock_depth==1);}
+static void tb_dp_relink_pair_again(struct tb*t){CHECK(0);}
+static struct tb_tunnel*tb_dp_host_relink(struct tb*t,struct tb_tunnel*x,unsigned r,const char*w){CHECK(0);return NULL;}
 static void tb_tunnel_dp(struct tb*t){
  CHECK(lock_depth==1 && domain.cm.hotplug_active && t->root_switch);
  alloc_calls++;if(occupied)alloc_failures++;else alloc_successes++;
@@ -291,7 +297,8 @@ def main():
     names = ['tb_tunnel_get', 'tb_tunnel_destroy', 'tb_tunnel_put']
     parts = {n: function(tunnel, n) for n in names}
     for name in ['tb_deactivate_and_free_tunnel', 'tb_dp_tunnel_work',
-                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable', 'tb_dp_tunnel_active',
+                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable', 'tb_dp_tunnel_inactive',
+                 'tb_dp_tunnel_active',
                  'tb_freeze_noirq', 'tb_thaw_noirq', 'tb_complete']:
         parts[name] = function(tb, name)
     if args.complete_ref:

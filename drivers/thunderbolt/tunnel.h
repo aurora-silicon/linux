@@ -73,6 +73,11 @@ enum tb_tunnel_state {
  * @dprx_timeout: If set DPRX capabilities read poll work will timeout after this passes
  * @dprx_work: Worker that is scheduled to poll completion of DPRX capabilities read
  * @callback: Callback called when DP tunnel is fully activated
+ * @await_callback: Optional, called with @callback_data and the domain lock
+ *		    held each time the DPRX work finds the host waiting for a
+ *		    display pipeline for the tunnel (tb_dp_host_awaits_display()),
+ *		    an attempt to hand it to a display under way or not
+ *		    (tb_dp_tunnel_retirable())
  * @callback_data: Data for @callback
  * @paths: All paths required by the tunnel
  */
@@ -115,13 +120,15 @@ struct tb_tunnel {
 	 * one both adapters take without the policy. @host_relink: to be set
 	 * up again at a higher rate once the debounce is over (alone now);
 	 * @host_relinked_up: set up so, and set up at HBR2 again if it does
-	 * not come up.
+	 * not come up. @host_relink_kept: its DPRX read timed out while a
+	 * re-link of it was wanted, and it is kept for that re-link.
 	 */
 	u32 host_rate_limit;
 	u32 host_rate;
 	u32 host_max_rate;
 	bool host_relink;
 	bool host_relinked_up;
+	bool host_relink_kept;
 	bool dprx_started;
 	bool dprx_canceled;
 	bool sleep_paused, sleep_replay, sleep_changed;
@@ -134,6 +141,7 @@ struct tb_tunnel {
 	ktime_t dprx_timeout;
 	struct delayed_work dprx_work;
 	void (*callback)(struct tb_tunnel *tunnel, void *data);
+	void (*await_callback)(struct tb_tunnel *tunnel, void *data);
 	void *callback_data;
 
 	struct tb_path *paths[] __counted_by(npaths);
@@ -175,11 +183,15 @@ u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel);
  * @TB_DP_RELINK_NONE: It is not
  * @TB_DP_RELINK_WAIT: Not now, it is decided again later
  * @TB_DP_RELINK_NOW: It is, now
+ * @TB_DP_RELINK_HOLD: Once the display the tunnel was handed to has read its
+ *		       DPRX through it, or no display is being handed it any
+ *		       more, when it is decided again (tb_dp_relink_settle())
  */
 enum tb_dp_relink {
 	TB_DP_RELINK_NONE,
 	TB_DP_RELINK_WAIT,
 	TB_DP_RELINK_NOW,
+	TB_DP_RELINK_HOLD,
 };
 
 /*
@@ -224,6 +236,10 @@ enum tb_dp_relink tb_dp_relink_up(bool marked, unsigned int tunnels, u32 rate, u
 				  unsigned long due);
 unsigned int tb_dp_relink_backoff(unsigned int delay_ms, bool flapping);
 enum tb_dp_relink tb_dp_relink_activation(bool relinked_up, bool active);
+enum tb_dp_relink tb_dp_relink_settle(enum tb_dp_relink action, bool dprx_pending);
+bool tb_dp_tunnel_dprx_pending(struct tb_tunnel *tunnel);
+bool tb_dp_tunnel_release_display(struct tb_tunnel *tunnel);
+bool tb_dp_tunnel_retirable(struct tb_tunnel *tunnel);
 bool tb_dp_host_drop_relink_up(struct tb_tunnel *tunnel);
 
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,

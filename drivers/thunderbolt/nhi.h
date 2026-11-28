@@ -100,6 +100,20 @@ struct tb_nhi_ring_layout {
  *			      meanwhile, so the tunnel is kept instead of being
  *			      torn down at the DPRX timeout. Called with the
  *			      domain lock held.
+ * @dp_tunnel_retirable: Whether the host waits for a display pipeline for the
+ *			  DP tunnel @generation from host DP IN adapter @in
+ *			  with no attempt to hand it to a display under way,
+ *			  so that a re-link held for a display reading its
+ *			  DPRX may be decided again. Only a hint: the re-link
+ *			  itself goes through @dp_tunnel_retire_waiting.
+ *			  Called with the domain lock held.
+ * @dp_tunnel_retire_waiting: For a re-link of the DP tunnel @generation from
+ *			       host DP IN adapter @in: if the host waits for a
+ *			       display pipeline for it and no attempt to hand
+ *			       it to a display is under way, retire its display
+ *			       handoff, as dp_tunnel_changed() does when it
+ *			       goes, so that none starts. %false if a display
+ *			       may be using it. Called with the domain lock held.
  * @add_links: NHI specific hook that makes the native ports tunneled
  *	       through this host (PCIe) resume after the NHI, like the device
  *	       links tb_acpi_add_links() creates from firmware tables. Returns
@@ -143,6 +157,8 @@ struct tb_nhi_ops {
 	void (*link_lost)(struct tb_nhi *nhi);
 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
+	bool (*dp_tunnel_retirable)(struct tb_nhi *nhi, struct tb_port *in, u64 generation);
+	bool (*dp_tunnel_retire_waiting)(struct tb_nhi *nhi, struct tb_port *in, u64 generation);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 	void (*reset_interface)(struct tb_nhi *nhi);
 	int (*router_sleep)(struct tb_nhi *nhi);
