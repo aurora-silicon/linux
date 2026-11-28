@@ -123,6 +123,8 @@ mod m3_resources;
 mod m3_rtkit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 mod m3_runtime;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+pub(crate) mod m3_stats;
 #[cfg(any(CONFIG_DRM_ASAHI_M3_T8122, CONFIG_DRM_ASAHI_G14_V27_2))]
 pub(crate) mod m3_submit;
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
