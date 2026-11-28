@@ -3,26 +3,38 @@
 //! Apple AOP ambient light sensor driver
 //!
 //! Copyright (C) The Asahi Linux Contributors
+//!
+//! Reports run on demand when sysfs reads arrive and stop again once reads go
+//! quiet for a short idle window, so the AOP does not wake the application
+//! processor at 5 Hz while nothing reads illuminance or colour temperature.
+//! Calibration data for the VD6286 and CT720 is loaded once at probe and sent
+//! once per AOP boot (and conservatively again after firmware sleep,
+//! hibernation, or restore). The CT817 arms through its full configuration
+//! sequence on every start.
 
 use core::{
     ffi::{c_int, c_void},
+    marker::PhantomPinned,
     ptr,
 };
 
 use kernel::{
     bindings, c_str,
-    device::{self, Core},
+    device::{self, Bound, Core},
+    devres,
     firmware::Firmware,
-    iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
-    module_platform_driver, of, platform,
+    iio::common::aop_sensors::{MessageProcessor, MAX_MICRO, MICRO},
+    module_platform_driver, new_delayed_work, new_mutex, new_spinlock, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, FakehidRegistration, AOP},
+    soc::apple::aop::{EPICService, FakehidListener, FakehidRegistration, AOP},
     sync::{
         aref::ARef,
         atomic::{Atomic, Relaxed},
-        Arc,
+        Arc, Mutex, SpinLock,
     },
-    types::Opaque,
+    time::{self, delay::fsleep, Delta, Instant, Monotonic},
+    types::{ForeignOwnable, Opaque},
+    workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -47,8 +59,15 @@ const ALS_PROP_VERBOSITY: u32 = 0xe1;
 const ALS_BATCH_INTERVAL: u32 = 1;
 const ALS_RAW_INTERVAL: u32 = 0;
 const ALS_VERBOSITY: u32 = 6;
-/// The reporting interval in microseconds.
-const ALS_INTERVAL_US: u32 = 200000;
+/// The reporting interval in microseconds (5 Hz).
+const ALS_INTERVAL_US: u32 = 200_000;
+/// How long a direct read waits for the first 5 Hz report of a fresh start.
+const FIRST_SAMPLE_MS: i64 = 1_000;
+const FIRST_SAMPLE_POLL_MS: i64 = 20;
+/// How long reports stay on after the last direct read.
+const DIRECT_IDLE_MS: i64 = 5_000;
+const MAX_CHANNELS: usize = 2;
+
 const LUX_OFFSET_CT720: usize = 0x1d;
 // These offsets address the fake-HID EPIC payload, not a host HID event.
 const LUX_OFFSET_VD6286: usize = 0x28;
@@ -81,35 +100,6 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(
-    aop: &dyn AOP,
-    dev: &platform::Device,
-    svc: &EPICService,
-    offset: usize,
-) -> Result<()> {
-    if offset != LUX_OFFSET_CT817 {
-        // The installer collects the calibration blob from macOS, so it is
-        // not present on every system. Without it the VD6286 of the M4 Pro
-        // never reports and its channel reads ENODATA. The warning below
-        // reports the missing file once, so the firmware loader is asked not
-        // to report it too.
-        match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
-            Ok(fw) => {
-                set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
-            }
-            Err(e) => dev_warn!(
-                dev.as_ref(),
-                "no apple/aop-als-cal.bin ({:?}); the sensor may not report\n",
-                e
-            ),
-        }
-        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
-        return Ok(());
-    }
-
-    arm_ct817(aop, dev.as_ref(), svc)
-}
-
 /// Arms the CT817: interval zero, its configuration, then the interval that
 /// starts the reports.
 fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<()> {
@@ -139,33 +129,473 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
-/// Stops the reports for system sleep and starts them again after it.
-///
-/// The sensor reports on its own every `ALS_INTERVAL_US`, and each report is
-/// an AOP mailbox interrupt. In suspend-to-idle those interrupts go on and
-/// wake a CPU for a reading nobody takes, so the reports stop before the
-/// sleep, as the lid angle driver's do.
-///
-/// The CT817 needs more after the sleep: the firmware stops its reports for
-/// system sleep and does not start them again. On the J700 every read after
-/// the first wake of a boot returned the last sample from before that sleep,
-/// while the room's light changed. The sensor starts reporting only on a zero
-/// to non-zero transition of its interval, so the wake repeats the arming of
-/// the probe, which starts with an interval of zero. The other parts need only
-/// their interval back.
+/// What a stream state change requires from the service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncAction {
+    None,
+    /// Enable reports; send calibration first when `calibrate` is true.
+    Start {
+        calibrate: bool,
+    },
+    Stop,
+}
+
+/// Outcome of checking the direct-read idle deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleStep {
+    /// No direct-read hold to expire.
+    Ignore,
+    /// More reads extended the deadline; re-arm the work for this many ms.
+    RearmMs(u32),
+    /// The deadline passed; stop the reports if nothing else wants them.
+    Expire,
+}
+
+/// Observed firmware reporting state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunState {
+    Stopped,
+    Running,
+    /// A start or stop write was not acknowledged; the next transition
+    /// reasserts the desired state in either direction.
+    Unknown,
+}
+
+/// Firmware transport operations needed by stream lifecycle transitions.
+trait AlsIo {
+    fn calibrate(&self) -> Result;
+    fn start_reports(&self) -> Result;
+    fn stop_reports(&self) -> Result;
+}
+
+/// On-demand stream state for ambient light reports.
+struct Stream<T> {
+    /// Calibration has been sent in this AOP boot (or is not needed, as on CT817).
+    calibrated: bool,
+    /// Number of direct reads currently waiting for a sample.
+    direct_readers: u32,
+    /// Reports are held on for recent direct reads until this deadline.
+    direct_until: Option<T>,
+    /// A start for a direct read failed with this error; direct reads return
+    /// it without another try until this deadline.
+    failed_until: Option<(T, Error)>,
+    /// Set across system sleep and after unbind: no reports.
+    parked: bool,
+    /// Current knowledge of whether firmware reports are running.
+    run_state: RunState,
+}
+
+impl<T> Stream<T> {
+    const fn new() -> Self {
+        Self {
+            calibrated: false,
+            direct_readers: 0,
+            direct_until: None,
+            failed_until: None,
+            parked: false,
+            run_state: RunState::Stopped,
+        }
+    }
+
+    fn want(&self) -> bool {
+        !self.parked && (self.direct_readers > 0 || self.direct_until.is_some())
+    }
+
+    fn next_action(&self) -> SyncAction {
+        match (self.want(), self.run_state) {
+            (true, RunState::Stopped | RunState::Unknown) => SyncAction::Start {
+                calibrate: !self.calibrated,
+            },
+            (false, RunState::Running | RunState::Unknown) => SyncAction::Stop,
+            _ => SyncAction::None,
+        }
+    }
+
+    /// Evaluates the direct-read idle deadline given the milliseconds left
+    /// until it expires (`<= 0` once expired).
+    fn check_idle(&mut self, remaining_ms: i64) -> IdleStep {
+        if self.direct_until.is_none() {
+            return IdleStep::Ignore;
+        }
+        if self.parked {
+            self.direct_until = None;
+            return IdleStep::Ignore;
+        }
+        if self.direct_readers > 0 {
+            return IdleStep::RearmMs(DIRECT_IDLE_MS as u32);
+        }
+        if remaining_ms > 0 {
+            IdleStep::RearmMs(remaining_ms.clamp(1, DIRECT_IDLE_MS) as u32)
+        } else {
+            self.direct_until = None;
+            IdleStep::Expire
+        }
+    }
+
+    /// Returns the error of a failed start for as long as direct reads back
+    /// off from it, given the milliseconds left until they may try again
+    /// (`<= 0` once they may).
+    fn check_backoff(&mut self, remaining_ms: i64) -> Option<Error> {
+        if remaining_ms <= 0 {
+            self.failed_until = None;
+        }
+        self.failed_until.as_ref().map(|(_, e)| *e)
+    }
+
+    /// Arms a rate-limited idle-stop retry whenever an unacknowledged start or
+    /// stop leaves an idle stream potentially running.
+    fn arm_stop_retry(&mut self, deadline: T) -> bool {
+        if !self.want() && self.run_state != RunState::Stopped {
+            self.direct_until = Some(deadline);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Verifies calibration, arming, and stopping once at probe, leaving the
+    /// sensor idle-stopped until the first direct read.
+    fn probe_with(&mut self, io: &dyn AlsIo) -> Result {
+        io.calibrate()?;
+        self.calibrated = true;
+        match io.start_reports() {
+            Ok(()) => {
+                self.run_state = RunState::Running;
+            }
+            Err(e) => {
+                // An unacknowledged start may still have taken effect in
+                // firmware; mark unknown and attempt one best-effort stop.
+                self.run_state = RunState::Unknown;
+                if io.stop_reports().is_ok() {
+                    self.run_state = RunState::Stopped;
+                }
+                return Err(e);
+            }
+        }
+        match io.stop_reports() {
+            Ok(()) => {
+                self.run_state = RunState::Stopped;
+            }
+            Err(_) => {
+                self.run_state = RunState::Unknown;
+                if io.stop_reports().is_ok() {
+                    self.run_state = RunState::Stopped;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts or stops the reports to match active readers. `before_start`
+    /// runs right before enabling reports so any cached sample from an earlier
+    /// run is invalidated before new reports arrive.
+    fn sync_with(&mut self, io: &dyn AlsIo, before_start: impl FnOnce()) -> Result {
+        match self.next_action() {
+            SyncAction::Start { calibrate } => {
+                if calibrate {
+                    io.calibrate()?;
+                    self.calibrated = true;
+                }
+                before_start();
+                match io.start_reports() {
+                    Ok(()) => {
+                        self.run_state = RunState::Running;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.run_state = RunState::Unknown;
+                        Err(e)
+                    }
+                }
+            }
+            SyncAction::Stop => match io.stop_reports() {
+                Ok(()) => {
+                    self.run_state = RunState::Stopped;
+                    Ok(())
+                }
+                Err(e) => {
+                    self.run_state = RunState::Unknown;
+                    Err(e)
+                }
+            },
+            SyncAction::None => Ok(()),
+        }
+    }
+
+    /// Parks reports across system sleep and restores them on wake only if a
+    /// reader still wants them. Idle sensors stay stopped across sleep/wake.
+    fn set_parked_with(
+        &mut self,
+        io: &dyn AlsIo,
+        parked: bool,
+        reset_cal: bool,
+        ct817: bool,
+        retry_deadline: T,
+        before_start: impl FnOnce(),
+    ) -> (Result, bool) {
+        self.parked = parked;
+        self.failed_until = None;
+        if parked {
+            self.direct_until = None;
+        } else if reset_cal {
+            self.calibrated = false;
+        } else if ct817 && self.run_state == RunState::Running {
+            // Defensive: firmware stops the CT817 for system sleep even if the
+            // host did not park it first.
+            self.run_state = RunState::Stopped;
+        }
+        let ret = self.sync_with(io, before_start);
+        let retry = !parked && ret.is_err() && self.arm_stop_retry(retry_deadline);
+        (ret, retry)
+    }
+
+    fn shutdown_with(&mut self, io: &dyn AlsIo) -> Result {
+        self.parked = true;
+        self.direct_until = None;
+        self.failed_until = None;
+        self.sync_with(io, || {})
+    }
+}
+
+#[pin_data]
+struct Control {
+    dev: ARef<device::Device>,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    /// The part arms only through the full CT817 sequence.
+    ct817: bool,
+    /// Calibration blob loaded once at probe for non-CT817 sensors.
+    calibration: Option<KVec<u8>>,
+    /// Avoids spamming dmesg on repeated idle-stop retries if AOP stalls.
+    stop_warned: Atomic<bool>,
+    /// Serializes starting and stopping the reports.
+    #[pin]
+    stream: Mutex<Stream<Instant<Monotonic>>>,
+    /// Stops direct-read reports once reads go quiet.
+    #[pin]
+    idle_work: DelayedWork<Control>,
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<Self> for Control { self.idle_work }
+}
+
+impl AlsIo for Control {
+    fn calibrate(&self) -> Result {
+        if self.ct817 {
+            return Ok(());
+        }
+        if let Some(ref cal) = self.calibration {
+            let status =
+                set_als_property(self.aop.as_ref(), &self.service, ALS_PROP_CALIBRATION, cal)?;
+            dev_dbg!(self.dev, "calibration: status {:#x}\n", status);
+        }
+        Ok(())
+    }
+
+    fn start_reports(&self) -> Result {
+        if self.ct817 {
+            return arm_ct817(self.aop.as_ref(), &self.dev, &self.service);
+        }
+        let status = set_als_property(
+            self.aop.as_ref(),
+            &self.service,
+            ALS_PROP_INTERVAL,
+            &ALS_INTERVAL_US.to_le_bytes(),
+        )?;
+        dev_dbg!(
+            self.dev,
+            "interval = {:#x}: status {:#x}\n",
+            ALS_INTERVAL_US,
+            status
+        );
+        Ok(())
+    }
+
+    fn stop_reports(&self) -> Result {
+        let status = set_als_property(
+            self.aop.as_ref(),
+            &self.service,
+            ALS_PROP_INTERVAL,
+            &0u32.to_le_bytes(),
+        )?;
+        dev_dbg!(self.dev, "interval = 0: status {:#x}\n", status);
+        Ok(())
+    }
+}
+
+impl Control {
+    fn new(
+        dev: &device::Device,
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        ct817: bool,
+    ) -> Result<Arc<Self>> {
+        let calibration = if ct817 {
+            None
+        } else {
+            // The installer collects the calibration blob from macOS, so it is
+            // not present on every system. Without it the VD6286 of the M4 Pro
+            // never reports and its channel reads ENODATA. Load it once at
+            // probe so wake and resume paths never touch the filesystem, and
+            // warn once if missing.
+            match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev) {
+                Ok(fw) => {
+                    let mut owned = KVec::new();
+                    owned.extend_from_slice(fw.data(), GFP_KERNEL)?;
+                    Some(owned)
+                }
+                Err(e) => {
+                    dev_warn!(
+                        dev,
+                        "no apple/aop-als-cal.bin ({:?}); the sensor may not report\n",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        Arc::pin_init(
+            pin_init!(Self {
+                dev: dev.into(),
+                aop,
+                service,
+                ct817,
+                calibration,
+                stop_warned: Atomic::new(false),
+                stream <- new_mutex!(Stream::new()),
+                idle_work <- new_delayed_work!("Control::idle_work"),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn probe_init(self: &Arc<Self>) -> Result {
+        let retry = {
+            let mut s = self.stream.lock();
+            s.probe_with(self.as_ref())?;
+            if s.run_state == RunState::Unknown {
+                let retry_deadline =
+                    Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+                s.arm_stop_retry(retry_deadline)
+            } else {
+                false
+            }
+        };
+        if retry {
+            dev_warn!(
+                self.dev,
+                "reports not stopped after probe; will retry after idle\n"
+            );
+            self.schedule_idle(DIRECT_IDLE_MS as u32);
+        }
+        Ok(())
+    }
+
+    fn schedule_idle(self: &Arc<Self>, delay_ms: u32) {
+        let _ =
+            workqueue::system_dfl().enqueue_delayed(self.clone(), time::msecs_to_jiffies(delay_ms));
+    }
+
+    fn stop_idle_sync(self: &Arc<Self>, disable: bool) {
+        // SAFETY: `idle_work` is initialized and pinned in this `Arc`. Both
+        // helpers cancel pending work and join a running callback; the disable
+        // variant also prevents any later requeue.
+        let cancelled = unsafe {
+            let work = Work::raw_get(DelayedWork::raw_as_work(ptr::addr_of!(self.idle_work)));
+            let delayed = kernel::container_of!(work, bindings::delayed_work, work);
+            if disable {
+                bindings::disable_delayed_work_sync(delayed)
+            } else {
+                bindings::cancel_delayed_work_sync(delayed)
+            }
+        };
+        if cancelled {
+            // SAFETY: A cancelled pending callback owned exactly one `Arc`
+            // transferred by `enqueue_delayed`.
+            drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
+        }
+    }
+
+    fn set_parked(
+        self: &Arc<Self>,
+        parked: bool,
+        reset_cal: bool,
+        before_start: impl FnOnce(),
+    ) -> Result {
+        let (ret, retry) = {
+            let mut s = self.stream.lock();
+            let retry_deadline = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+            s.set_parked_with(
+                self.as_ref(),
+                parked,
+                reset_cal,
+                self.ct817,
+                retry_deadline,
+                before_start,
+            )
+        };
+        if parked {
+            self.stop_idle_sync(false);
+        } else if retry {
+            self.schedule_idle(DIRECT_IDLE_MS as u32);
+        }
+        ret
+    }
+
+    fn shutdown(self: &Arc<Self>) -> Result {
+        self.stop_idle_sync(true);
+        let mut s = self.stream.lock();
+        s.shutdown_with(self.as_ref())
+    }
+}
+
+impl WorkItem for Control {
+    type Pointer = Arc<Control>;
+
+    fn run(this: Arc<Control>) {
+        let retry = {
+            let mut s = this.stream.lock();
+            let Some(deadline) = s.direct_until else {
+                return;
+            };
+            let remaining_ms = (deadline - Instant::<Monotonic>::now()).as_millis_ceil();
+            match s.check_idle(remaining_ms) {
+                IdleStep::Ignore => None,
+                IdleStep::RearmMs(delay_ms) => Some(delay_ms),
+                IdleStep::Expire => match s.sync_with(this.as_ref(), || {}) {
+                    Ok(()) => {
+                        this.stop_warned.store(false, Relaxed);
+                        None
+                    }
+                    Err(e) => {
+                        if !this.stop_warned.xchg(true, Relaxed) {
+                            dev_warn!(this.dev, "reports not stopped after idle: {:?}\n", e);
+                        }
+                        let retry_deadline =
+                            Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+                        if s.arm_stop_retry(retry_deadline) {
+                            Some(DIRECT_IDLE_MS as u32)
+                        } else {
+                            None
+                        }
+                    }
+                },
+            }
+        };
+        if let Some(delay_ms) = retry {
+            this.schedule_idle(delay_ms);
+        }
+    }
+}
+
+/// Stops any active reports around system sleep and keeps them off on wake
+/// while nothing is reading the sensor.
 #[repr(C)]
 struct PmHook {
     /// First, so that the callback finds the hook from it.
     nb: Opaque<bindings::notifier_block>,
-    dev: ARef<device::Device>,
-    aop: Arc<dyn AOP>,
-    service: EPICService,
-    /// The part arms only through the whole CT817 sequence.
-    ct817: bool,
-    /// A stop was tried for the sleep in progress. It is set before the
-    /// command goes out: a stop whose reply was lost may still have been
-    /// applied, so the wake restores the interval after every attempt.
-    stop_attempted: Atomic<bool>,
+    state: Arc<State>,
     registered: Atomic<bool>,
 }
 
@@ -173,7 +603,7 @@ struct PmHook {
 ///
 /// # Safety
 ///
-/// `nb` is the notifier block of a registered [`PmHook`].
+/// `nb` is the first field of a registered [`PmHook`].
 unsafe extern "C" fn pm_event(
     nb: *mut bindings::notifier_block,
     action: usize,
@@ -181,43 +611,30 @@ unsafe extern "C" fn pm_event(
 ) -> c_int {
     // SAFETY: `nb` is the first field of a registered `PmHook`.
     let hook = unsafe { &*nb.cast::<PmHook>() };
-    let aop = hook.aop.as_ref();
-    match action as u32 {
-        bindings::PM_SUSPEND_PREPARE => {
-            // A sensor that keeps reporting only costs wakeups: never refuse
-            // the sleep over it.
-            hook.stop_attempted.store(true, Relaxed);
-            match set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes()) {
-                Ok(_) => dev_dbg!(hook.dev, "reports off for sleep\n"),
-                Err(e) => dev_warn!(hook.dev, "reports may be left on for sleep: {:?}\n", e),
-            }
-        }
+    let invalidate = || hook.state.invalidate_samples();
+    let ret = match action as u32 {
+        // A sensor that keeps reporting only costs wakeups: never refuse
+        // the sleep over it.
+        bindings::PM_SUSPEND_PREPARE
+        | bindings::PM_HIBERNATION_PREPARE
+        | bindings::PM_RESTORE_PREPARE => hook.state.control.set_parked(true, false, || {}),
         bindings::PM_POST_SUSPEND => {
-            let attempted = hook.stop_attempted.xchg(false, Relaxed);
-            // The CT817 is stopped by the firmware even when the host did not
-            // stop it, so it is armed again after every sleep. The other parts
-            // get their interval back after every attempted stop, whether or
-            // not the stop's reply arrived; writing the active interval to a
-            // sensor that kept reporting changes nothing.
-            let rearm = if hook.ct817 {
-                arm_ct817(aop, &hook.dev, &hook.service)
-            } else if attempted {
-                set_als_property(
-                    aop,
-                    &hook.service,
-                    ALS_PROP_INTERVAL,
-                    &ALS_INTERVAL_US.to_le_bytes(),
-                )
-                .map(|_| ())
-            } else {
-                Ok(())
-            };
-            match rearm {
-                Ok(()) => dev_dbg!(hook.dev, "reports back after sleep\n"),
-                Err(e) => dev_warn!(hook.dev, "reports not back after sleep: {:?}\n", e),
-            }
+            // SAFETY: Reads the PM core's sleep-transition flag, which stays
+            // set until the next suspend entry.
+            let fw_sleep = unsafe { bindings::pm_suspend_via_firmware() };
+            hook.state.control.set_parked(false, fw_sleep, invalidate)
+        }
+        bindings::PM_POST_HIBERNATION | bindings::PM_POST_RESTORE => {
+            hook.state.control.set_parked(false, true, invalidate)
         }
         _ => return bindings::NOTIFY_DONE as c_int,
+    };
+    if let Err(e) = ret {
+        dev_warn!(
+            hook.state.control.dev,
+            "reports not switched for sleep: {:?}\n",
+            e
+        );
     }
     bindings::NOTIFY_OK as c_int
 }
@@ -240,7 +657,7 @@ unsafe fn pm_unregister(nb: *mut bindings::notifier_block) {
     unsafe { bindings::unregister_pm_notifier(nb) };
 }
 
-/// Without system sleep there is nothing to arm again.
+/// Without system sleep there is nothing to switch.
 ///
 /// # Safety
 ///
@@ -263,12 +680,7 @@ unsafe impl Send for PmHook {}
 unsafe impl Sync for PmHook {}
 
 impl PmHook {
-    fn new(
-        dev: &device::Device,
-        aop: Arc<dyn AOP>,
-        service: EPICService,
-        ct817: bool,
-    ) -> Result<Pin<KBox<Self>>> {
+    fn new(state: Arc<State>) -> Result<Pin<KBox<Self>>> {
         let hook = KBox::pin(
             Self {
                 nb: Opaque::new(bindings::notifier_block {
@@ -276,11 +688,7 @@ impl PmHook {
                     next: ptr::null_mut(),
                     priority: 0,
                 }),
-                dev: dev.into(),
-                aop,
-                service,
-                ct817,
-                stop_attempted: Atomic::new(false),
+                state,
                 registered: Atomic::new(false),
             },
             GFP_KERNEL,
@@ -382,43 +790,354 @@ impl MessageProcessor for MsgProc {
 }
 
 enum AlsIio {
-    Light {
-        _registration: IIORegistration<MsgProc>,
-    },
-    Color {
-        _registration: IIORegistration<MsgProc, 2>,
-    },
+    Light(AlsIioDev),
+    Color(AlsIioDev),
 }
+
+impl AlsIio {
+    fn register(&self) -> Result {
+        match self {
+            Self::Light(dev) | Self::Color(dev) => dev.register(),
+        }
+    }
+
+    fn unregister(&self) {
+        match self {
+            Self::Light(dev) | Self::Color(dev) => dev.unregister(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Sample {
+    value: [u64; MAX_CHANNELS],
+    valid: [bool; MAX_CHANNELS],
+    seen_report: bool,
+}
+
+#[pin_data]
+struct State {
+    control: Arc<Control>,
+    msg_proc: MsgProc,
+    ty: [u32; MAX_CHANNELS],
+    num_channels: usize,
+    #[pin]
+    sample: SpinLock<Sample>,
+}
+
+/// Keeps `direct_readers` accounted for across `read_now()`, and arms the
+/// idle-stop deadline once the reader finishes.
+struct DirectReadGuard<'a>(&'a Arc<Control>);
+
+impl Drop for DirectReadGuard<'_> {
+    fn drop(&mut self) {
+        let schedule = {
+            let mut s = self.0.stream.lock();
+            s.direct_readers = s.direct_readers.saturating_sub(1);
+            if !s.parked {
+                s.direct_until =
+                    Some(Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS));
+                true
+            } else {
+                false
+            }
+        };
+        if schedule {
+            self.0.schedule_idle(DIRECT_IDLE_MS as u32);
+        }
+    }
+}
+
+impl State {
+    fn invalidate_samples(&self) {
+        *self.sample.lock() = Sample::default();
+    }
+
+    /// Returns the latest reading in micro-units for `channel`. Reports are
+    /// started on demand and kept running until direct reads go quiet for
+    /// `DIRECT_IDLE_MS`.
+    fn read_now(&self, channel: usize) -> Result<u64> {
+        let (already_seen, guard) = {
+            let mut s = self.control.stream.lock();
+            if s.parked {
+                return Err(EBUSY);
+            }
+            if let Some((until, _)) = s.failed_until {
+                let remaining_ms = (until - Instant::<Monotonic>::now()).as_millis_ceil();
+                if let Some(e) = s.check_backoff(remaining_ms) {
+                    return Err(e);
+                }
+            }
+            let was_running = s.run_state == RunState::Running;
+            s.direct_readers += 1;
+            if let Err(e) = s.sync_with(self.control.as_ref(), || self.invalidate_samples()) {
+                s.direct_readers = s.direct_readers.saturating_sub(1);
+                let until = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+                s.failed_until = Some((until, e));
+                let retry = s.arm_stop_retry(until);
+                drop(s);
+                if retry {
+                    self.control.schedule_idle(DIRECT_IDLE_MS as u32);
+                }
+                return Err(e);
+            }
+            let already_seen = was_running && self.sample.lock().seen_report;
+            (already_seen, DirectReadGuard(&self.control))
+        };
+
+        let mut waited = 0;
+        while waited < FIRST_SAMPLE_MS {
+            let sample = *self.sample.lock();
+            if sample.valid[channel] || (already_seen && sample.seen_report) {
+                break;
+            }
+            if self.control.stream.lock().parked {
+                return Err(EBUSY);
+            }
+            fsleep(Delta::from_millis(FIRST_SAMPLE_POLL_MS));
+            waited += FIRST_SAMPLE_POLL_MS;
+        }
+        let sample = *self.sample.lock();
+        drop(guard);
+        if sample.valid[channel] {
+            Ok(sample.value[channel])
+        } else {
+            Err(ENODATA)
+        }
+    }
+}
+
+impl FakehidListener for State {
+    fn process_fakehid_report(&self, data: &[u8]) -> Result<()> {
+        let mut decoded = [None; MAX_CHANNELS];
+        let mut any = false;
+        for (channel, slot) in decoded.iter_mut().enumerate().take(self.num_channels) {
+            if let Some(value) = self.msg_proc.process_channel(data, channel) {
+                *slot = Some(value.min(MAX_MICRO));
+                any = true;
+            }
+        }
+        if any {
+            let mut sample = self.sample.lock();
+            for (channel, slot) in decoded.iter().enumerate().take(self.num_channels) {
+                if let Some(value) = *slot {
+                    sample.value[channel] = value;
+                    sample.valid[channel] = true;
+                }
+            }
+            sample.seen_report = true;
+        }
+        Ok(())
+    }
+}
+
+/// # Safety
+///
+/// The IIO core supplies the registered device, channel, and output pointers.
+unsafe extern "C" fn als_read_raw(
+    indio_dev: *mut bindings::iio_dev,
+    chan: *const bindings::iio_chan_spec,
+    val: *mut i32,
+    val2: *mut i32,
+    mask: isize,
+) -> i32 {
+    // SAFETY: `priv_` is the `Arc<State>` installed by `AlsIioDev::new()`.
+    let state = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) };
+    // SAFETY: `chan` is one of the registered channel specs.
+    let (ty, channel) = unsafe { ((*chan).type_, (*chan).address as usize) };
+    if channel >= state.num_channels || state.ty[channel] != ty {
+        return EINVAL.to_errno();
+    }
+    if mask != bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED as isize {
+        return EINVAL.to_errno();
+    }
+    let micro = match state.read_now(channel) {
+        Ok(value) => value,
+        Err(e) => return e.to_errno(),
+    };
+    // Both parts fit an `i32` because stored readings never exceed `MAX_MICRO`.
+    let (int, frac) = ((micro / MICRO) as i32, (micro % MICRO) as i32);
+    // SAFETY: The pointers are the caller's result variables.
+    unsafe {
+        *val = int;
+        *val2 = frac;
+    }
+    bindings::IIO_VAL_INT_PLUS_MICRO as i32
+}
+
+struct Spec<const N: usize> {
+    channels: [bindings::iio_chan_spec; N],
+    info: bindings::iio_info,
+    _p: PhantomPinned,
+}
+
+struct IioAlloc<const N: usize> {
+    dev: *mut bindings::iio_dev,
+    _spec: Pin<KBox<Spec<N>>>,
+}
+
+impl<const N: usize> Drop for IioAlloc<N> {
+    fn drop(&mut self) {
+        // SAFETY: `self.dev` was allocated in `AlsIioDev::new()` with an
+        // `Arc<State>` as its private data and has been unregistered.
+        unsafe {
+            drop(Arc::<State>::from_foreign((*self.dev).priv_.cast()));
+            bindings::iio_device_free(self.dev);
+        }
+    }
+}
+
+// SAFETY: The IIO device may be freed from any thread, and the channel
+// table is only read.
+unsafe impl<const N: usize> Send for IioAlloc<N> {}
+
+struct AlsIioDev {
+    dev: *mut bindings::iio_dev,
+    registered: Atomic<bool>,
+}
+
+impl AlsIioDev {
+    fn new<const N: usize>(
+        dev: &device::Device<Bound>,
+        control: Arc<Control>,
+        offset: usize,
+        types: [u32; N],
+    ) -> Result<(Self, Arc<State>)> {
+        if N == 0 || N > MAX_CHANNELS {
+            return Err(EINVAL);
+        }
+        let info_mask = 1usize << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
+        let spec = KBox::pin(
+            Spec::<N> {
+                channels: core::array::from_fn(|channel| bindings::iio_chan_spec {
+                    type_: types[channel],
+                    address: channel as _,
+                    __bindgen_anon_1: bindings::iio_chan_spec__bindgen_ty_1 {
+                        scan_type: bindings::iio_scan_type {
+                            __bindgen_anon_1: bindings::iio_scan_type__bindgen_ty_1 {
+                                format: b'u' as _,
+                            },
+                            realbits: 32,
+                            storagebits: 32,
+                            ..Default::default()
+                        },
+                    },
+                    info_mask_separate: info_mask,
+                    ..Default::default()
+                }),
+                info: bindings::iio_info {
+                    read_raw: Some(als_read_raw),
+                    ..Default::default()
+                },
+                _p: PhantomPinned,
+            },
+            GFP_KERNEL,
+        )?;
+        // SAFETY: `dev` is valid.
+        let indio_dev = unsafe { bindings::iio_device_alloc(dev.as_raw(), 0) };
+        if indio_dev.is_null() {
+            return Err(ENOMEM);
+        }
+        let mut ty = [0u32; MAX_CHANNELS];
+        ty[..N].copy_from_slice(&types);
+        let state = match Arc::pin_init(
+            pin_init!(State {
+                control,
+                msg_proc: MsgProc(offset),
+                ty,
+                num_channels: N,
+                sample <- new_spinlock!(Sample::default()),
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(state) => state,
+            Err(e) => {
+                // SAFETY: Allocated above and not registered.
+                unsafe { bindings::iio_device_free(indio_dev) };
+                return Err(e);
+            }
+        };
+        // SAFETY: The IIO device is unregistered and `spec` is pinned.
+        unsafe {
+            (*indio_dev).priv_ = state.clone().into_foreign().cast();
+            (*indio_dev).name = c"aop-sensors-als".as_char_ptr();
+            (*indio_dev).channels = spec.channels.as_ptr();
+            (*indio_dev).num_channels = spec.channels.len() as i32;
+            (*indio_dev).info = &spec.info;
+        }
+        devres::register(
+            dev,
+            IioAlloc {
+                dev: indio_dev,
+                _spec: spec,
+            },
+            GFP_KERNEL,
+        )?;
+        Ok((
+            Self {
+                dev: indio_dev,
+                registered: Atomic::new(false),
+            },
+            state,
+        ))
+    }
+
+    fn register(&self) -> Result {
+        let module = kernel::module::this_module::<crate::LocalModule>();
+        // SAFETY: The device is fully initialized and unregistered.
+        let ret = unsafe { bindings::__iio_device_register(self.dev, module.as_ptr()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        self.registered.store(true, Relaxed);
+        Ok(())
+    }
+
+    fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            // SAFETY: `self.dev` was registered by `register()` and is freed
+            // with the platform device's resources.
+            unsafe { bindings::iio_device_unregister(self.dev) };
+        }
+    }
+}
+
+impl Drop for AlsIioDev {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+// SAFETY: The IIO core serializes registration and removal.
+unsafe impl Send for AlsIioDev {}
+// SAFETY: As above.
+unsafe impl Sync for AlsIioDev {}
 
 struct IIOAopAlsDriver {
-    /// Fields are declared in teardown order: the sleep hook first, then the
-    /// subscription, which ends before the IIO device goes.
+    iio: AlsIio,
     pm: Pin<KBox<PmHook>>,
+    control: Arc<Control>,
     listener: FakehidRegistration,
-    _iio: AlsIio,
-    aop: Arc<dyn AOP>,
-    service: EPICService,
 }
 
-fn register_channels<const N: usize>(
-    pdev: &platform::Device,
-    aop: &Arc<dyn AOP>,
-    service: EPICService,
-    offset: usize,
-    types: [u32; N],
-) -> Result<(FakehidRegistration, IIORegistration<MsgProc, N>)> {
-    let data = AopSensorData::new_channels(pdev.as_ref().into(), types, MsgProc(offset))?;
-    let listener = FakehidRegistration::new(aop.clone(), service, data.clone())?;
-    enable_als(aop.as_ref(), pdev, &service, offset)?;
-    let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
-    let iio = IIORegistration::new_channels(
-        data,
-        c"aop-sensors-als",
-        types,
-        info_mask,
-        kernel::module::this_module::<crate::LocalModule>(),
-    )?;
-    Ok((listener, iio))
+impl IIOAopAlsDriver {
+    fn teardown(&self) {
+        // Unregister IIO first so no new read_raw can start, then unregister
+        // PM, drain delayed work and stop reports, and finally remove the
+        // fake-HID listener.
+        self.iio.unregister();
+        self.pm.unregister();
+        if let Err(e) = self.control.shutdown() {
+            dev_warn!(self.control.dev, "reports not stopped at unbind: {:?}\n", e);
+        }
+        self.listener.unregister();
+    }
+}
+
+impl Drop for IIOAopAlsDriver {
+    fn drop(&mut self) {
+        self.teardown();
+    }
 }
 
 kernel::of_device_table!(
@@ -438,7 +1157,7 @@ impl platform::Driver for IIOAopAlsDriver {
         _info: Option<&'bound ()>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = pdev.as_ref();
-        // SAFETY: This driver binds only to the service devices the AOP core
+        // SAFETY: This binds only to the service devices the AOP core
         // registers, and `pdev` is being probed.
         let adata = unsafe { <dyn AOP>::from_child(dev) }?;
         // SAFETY: `dev` is a valid device; the AOP core attached its service
@@ -451,53 +1170,38 @@ impl platform::Driver for IIOAopAlsDriver {
         let service = unsafe { *service };
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
-        let (listener, iio) = if offset == LUX_OFFSET_VD6286 {
-            let (listener, registration) = register_channels(
-                pdev,
-                &adata,
-                service,
+        let control = Control::new(dev, adata.clone(), service, offset == LUX_OFFSET_CT817)?;
+        let (iio, state) = if offset == LUX_OFFSET_VD6286 {
+            let (iio_dev, state) = AlsIioDev::new(
+                dev,
+                control.clone(),
                 offset,
                 [ty, bindings::BINDINGS_IIO_COLORTEMP],
             )?;
-            (
-                listener,
-                AlsIio::Color {
-                    _registration: registration,
-                },
-            )
+            (AlsIio::Color(iio_dev), state)
         } else {
-            let (listener, registration) = register_channels(pdev, &adata, service, offset, [ty])?;
-            (
-                listener,
-                AlsIio::Light {
-                    _registration: registration,
-                },
-            )
+            let (iio_dev, state) = AlsIioDev::new(dev, control.clone(), offset, [ty])?;
+            (AlsIio::Light(iio_dev), state)
         };
-        let pm = PmHook::new(dev, adata.clone(), service, offset == LUX_OFFSET_CT817)?;
-        Ok(IIOAopAlsDriver {
+        let listener = FakehidRegistration::new(adata, service, state.clone())?;
+        let pm = PmHook::new(state)?;
+        if let Err(e) = control.probe_init() {
+            pm.unregister();
+            let _ = control.shutdown();
+            return Err(e);
+        }
+        let drv = IIOAopAlsDriver {
+            iio,
             pm,
+            control,
             listener,
-            _iio: iio,
-            aop: adata,
-            service,
-        })
+        };
+        drv.iio.register()?;
+        Ok(drv)
     }
 
-    fn unbind(dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
-        this.pm.unregister();
-        // The sensor keeps reporting until its interval is zero, and every
-        // report is an AOP mailbox interrupt. Stop it before the listener
-        // goes; a failure only costs those interrupts, so unbind goes on.
-        if let Err(e) = set_als_property(
-            this.aop.as_ref(),
-            &this.service,
-            ALS_PROP_INTERVAL,
-            &0u32.to_le_bytes(),
-        ) {
-            dev_warn!(dev.as_ref(), "reports not stopped at unbind: {:?}\n", e);
-        }
-        this.listener.unregister();
+    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        this.teardown();
     }
 }
 
