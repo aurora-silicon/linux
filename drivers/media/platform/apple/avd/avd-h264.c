@@ -740,9 +740,6 @@ avd_h264_validate_sps_fmt(struct avd_ctx *ctx,
 	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
 		/* Only 8 and 10 bit have capture formats */
 		return -EINVAL;
-	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
-		/* 4:2:2 10 bit would need P210; P010 is too small for its chroma */
-		return -EINVAL;
 
 	return 0;
 }

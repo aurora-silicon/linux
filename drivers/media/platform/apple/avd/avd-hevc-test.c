@@ -87,13 +87,17 @@ static void avd_hevc_sps_fmt_init_test(struct kunit *test)
 	sps.bit_depth_chroma_minus8 = 2;
 	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), 0);
 
+	/* 10-bit 4:2:2 is admitted through the P210 capture path. */
+	sps.chroma_format_idc = 2;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_sps_geometry(&sps), -EINVAL);
+	sps.chroma_format_idc = 1;
+
 	/* Oversized or unsupported formats remain rejected pre-streaming */
 	sps.pic_width_in_luma_samples = 1920;
 	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
 	sps.pic_width_in_luma_samples = 1280;
 	sps.chroma_format_idc = 3;
-	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
-	sps.chroma_format_idc = 2;
 	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
 	sps.chroma_format_idc = 1;
 	sps.bit_depth_luma_minus8 = 4;

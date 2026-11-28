@@ -198,6 +198,13 @@ static void avd_sps_fmt_init_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), -EINVAL);
 
+	/* 10-bit 4:2:2 is admitted through the P210 capture path. */
+	sps.chroma_format_idc = 2;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
+	sps.chroma_format_idc = 1;
+
 	/* Populated interlaced SPS must still be rejected pre-streaming */
 	sps = (struct v4l2_ctrl_h264_sps) {
 		.chroma_format_idc = 1,
@@ -218,8 +225,6 @@ static void avd_sps_fmt_init_test(struct kunit *test)
 	};
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
-	sps.chroma_format_idc = 2;
-	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
 	sps.chroma_format_idc = 1;
 	sps.bit_depth_luma_minus8 = 4;
 	sps.bit_depth_chroma_minus8 = 4;
