@@ -3622,29 +3622,25 @@ impl SepData {
             );
             return false;
         }
+        // The key is in memory before the nonce goes out, so that reading it
+        // never delays the exchange.
+        let key = if self.sensor_key_loaded.load(Relaxed) {
+            None
+        } else {
+            match self.sensor_root_key() {
+                Some(key) => Some(key),
+                None => return false,
+            }
+        };
         if !self.sensor_session_request(0x81, c"SENSOR_NONCE", nonce) {
             self.sensor_step_failed(c"SENSOR_NONCE");
             return false;
         }
         self.sensor_trace(c"SENSOR_NONCE");
 
-        if !self.sensor_key_loaded.load(Relaxed) {
-            // Per-device data, so the board names it; J700 predates that.
-            let name = sensor::root_key_firmware_name().unwrap_or(ROOT_KEY_FIRMWARE);
-            let firmware = match kernel::firmware::Firmware::request(name, &self.dev) {
-                Ok(firmware) => firmware,
-                Err(error) => {
-                    dev_err_ratelimited!(
-                        self.dev,
-                        "sensor: signed root-key container {} unavailable: {:?}\n",
-                        name,
-                        error
-                    );
-                    return false;
-                }
-            };
-            if firmware.data().is_empty()
-                || !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", firmware.data())
+        if let Some(key) = key {
+            if key.bytes().is_empty()
+                || !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", key.bytes())
             {
                 self.sensor_step_failed(c"SENSOR_ROOT_KEY");
                 return false;
@@ -3655,6 +3651,27 @@ impl SepData {
         // Each identification starts a new sensor-side exchange, even though
         // the signed key remains loaded for the lifetime of the enclave.
         self.establish_session()
+    }
+
+    /// The signed root key: the packaged file, or without it this Mac's own
+    /// factory record. `None` after the log line that says why neither is
+    /// available.
+    fn sensor_root_key(&self) -> Option<SensorRecord> {
+        // Per-device data, so the board names it; J700 predates that.
+        let name = sensor::root_key_firmware_name().unwrap_or(ROOT_KEY_FIRMWARE);
+        match kernel::firmware::Firmware::request(name, &self.dev) {
+            Ok(firmware) => Some(SensorRecord::Packaged(firmware)),
+            Err(error) if error == ENOENT => self.factory_root_key(name).map(SensorRecord::Factory),
+            Err(error) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "sensor: signed root-key container {} unavailable: {:?}\n",
+                    name,
+                    error
+                );
+                None
+            }
+        }
     }
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
@@ -3772,12 +3789,93 @@ impl SepData {
         None
     }
 
+    /// Runs `f` on this Mac's factory records, reading them on first use. A
+    /// container that is not there yet is looked for again the next time.
+    fn with_factory_records<R>(&self, f: impl FnOnce(&FactoryRecords) -> R) -> R {
+        let mut records = self.factory_records.lock();
+        if let Some(read) = records.as_ref() {
+            return f(read);
+        }
+        let read = read_factory_records(self.profile.nonce_session);
+        if matches!(read, Err(apfs_read::Refusal::Unavailable)) {
+            return f(&read);
+        }
+        f(records.insert(read))
+    }
+
+    /// A copy of this Mac's factory calibration, or `None` after the one log
+    /// line that says why it cannot be used.
+    fn factory_calibration(&self, name: &CStr) -> Option<KVVec<u8>> {
+        self.with_factory_records(|records| {
+            let found = records
+                .as_ref()
+                .map_err(|refusal| *refusal)
+                .and_then(|r| r.calibration.as_ref().map(|c| (c, r.resealed)).map_err(|e| *e));
+            match found.and_then(|(bytes, resealed)| Ok((copy_record(bytes)?, resealed))) {
+                Ok((copy, resealed)) => {
+                    dev_info_ratelimited!(
+                        self.dev,
+                        "sensor: {} is not packaged; using this Mac's factory calibration from its iBoot System Container{}\n",
+                        name,
+                        if resealed { ", rebuilt with its seal and trust bundle" } else { "" }
+                    );
+                    Some(copy)
+                }
+                Err(refusal) => {
+                    dev_err_ratelimited!(
+                        self.dev,
+                        "sensor: calibration {} is not packaged and this Mac's factory calibration cannot be used ({}); Touch ID is unavailable\n",
+                        name,
+                        refusal.reason()
+                    );
+                    None
+                }
+            }
+        })
+    }
+
+    /// A copy of this Mac's factory root key, or `None` after the one log line
+    /// that says why it cannot be used.
+    fn factory_root_key(&self, name: &CStr) -> Option<KVVec<u8>> {
+        self.with_factory_records(|records| {
+            let found = match records {
+                Ok(sensor_factory::Records { root_key: Some(key), .. }) => key.as_ref().map_err(|e| *e),
+                Ok(_) => Err(apfs_read::Refusal::Absent),
+                Err(refusal) => Err(*refusal),
+            };
+            match found.and_then(|bytes| copy_record(bytes)) {
+                Ok(copy) => {
+                    dev_info_ratelimited!(
+                        self.dev,
+                        "sensor: {} is not packaged; using this Mac's factory root key from its iBoot System Container, rebuilt with its seal and trust bundle\n",
+                        name
+                    );
+                    Some(copy)
+                }
+                Err(refusal) => {
+                    dev_err_ratelimited!(
+                        self.dev,
+                        "sensor: signed root-key container {} is not packaged and this Mac's factory root key cannot be used ({}); Touch ID is unavailable\n",
+                        name,
+                        refusal.reason()
+                    );
+                    None
+                }
+            }
+        })
+    }
+
     fn calibrate_sensor(&self) -> bool {
         // The blob is per-device factory data, so its name is board data: take
         // it from the sensor node's firmware-name, falling back to the default.
+        // Without the packaged file, this Mac's own factory record.
         let name = sensor::firmware_name().unwrap_or(CALIBRATION_FIRMWARE);
         let blob = match kernel::firmware::Firmware::request(name, &self.dev) {
-            Ok(fw) => CalibrationBlob::new(fw),
+            Ok(fw) => SensorRecord::Packaged(fw),
+            Err(e) if e == ENOENT => match self.factory_calibration(name) {
+                Some(bytes) => SensorRecord::Factory(bytes),
+                None => return false,
+            },
             Err(e) => {
                 dev_err_ratelimited!(
                     self.dev,
@@ -6884,7 +6982,7 @@ pub(crate) const SBIO_CALIBRATION_SOURCE: u32 = 3;
 pub(crate) struct SbioCalibration(KVec<u8>);
 
 impl SbioCalibration {
-    pub(crate) fn new(blob: &crate::CalibrationBlob, source: u32) -> Result<SbioCalibration> {
+    pub(crate) fn new(blob: &crate::SensorRecord, source: u32) -> Result<SbioCalibration> {
         let bytes = blob.bytes();
         let mut body = KVec::new();
         body.extend_from_slice(&source.to_le_bytes(), GFP_KERNEL)?;

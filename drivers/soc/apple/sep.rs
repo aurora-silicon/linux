@@ -11,6 +11,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
 
 #[macro_use]
 mod ratelimit;
+mod apfs_read;
 mod attach;
 mod bio;
 mod catacomb;
@@ -38,6 +39,7 @@ mod rxring;
 mod sbio;
 mod scrd;
 mod sensor;
+mod sensor_factory;
 mod shim;
 mod shmem;
 mod skdl;
@@ -326,16 +328,66 @@ pub(crate) struct PatchLoaded(());
 
 pub(crate) struct ParametersApplied(());
 
-pub(crate) struct CalibrationBlob(kernel::firmware::Firmware);
+/// A per-device sensor record (the calibration or the signed root key): the
+/// packaged file, or this Mac's own factory record.
+pub(crate) enum SensorRecord {
+    Packaged(kernel::firmware::Firmware),
+    Factory(KVVec<u8>),
+}
 
-impl CalibrationBlob {
-    fn new(fw: kernel::firmware::Firmware) -> CalibrationBlob {
-        CalibrationBlob(fw)
-    }
-
+impl SensorRecord {
     pub(crate) fn bytes(&self) -> &[u8] {
-        self.0.data()
+        match self {
+            SensorRecord::Packaged(fw) => fw.data(),
+            SensorRecord::Factory(bytes) => bytes,
+        }
     }
+}
+
+/// This Mac's factory sensor records, or why they cannot be used.
+type FactoryRecords = core::result::Result<sensor_factory::Records<KVVec<u8>>, apfs_read::Refusal>;
+
+/// The iBoot System Container's block device, opened read-only.
+struct FactoryDisk(shim::StoreFile);
+
+impl apfs_read::Media for FactoryDisk {
+    type Buf = KVVec<u8>;
+
+    fn size(&self) -> apfs_read::Read<u64> {
+        self.0.size().map_err(|_| apfs_read::Refusal::Io)
+    }
+
+    fn buffer(&self, len: usize) -> apfs_read::Read<KVVec<u8>> {
+        let mut buf = KVVec::new();
+        buf.resize(len, 0, GFP_KERNEL)
+            .map_err(|_| apfs_read::Refusal::NoMemory)?;
+        Ok(buf)
+    }
+
+    fn read(&self, offset: u64, buf: &mut [u8]) -> apfs_read::Read<()> {
+        self.0
+            .read_exact(offset, buf)
+            .map_err(|_| apfs_read::Refusal::Io)
+    }
+}
+
+/// A kernel-owned copy of one factory record, for a single sensor request.
+fn copy_record(bytes: &[u8]) -> apfs_read::Read<KVVec<u8>> {
+    let mut copy = KVVec::new();
+    copy.extend_from_slice(bytes, GFP_KERNEL)
+        .map_err(|_| apfs_read::Refusal::NoMemory)?;
+    Ok(copy)
+}
+
+/// Reads this Mac's factory sensor records from the container the xART
+/// store also uses, never writing to it. The container must hold this
+/// boot's volume group; `root_key` adds the signed root key.
+fn read_factory_records(root_key: bool) -> FactoryRecords {
+    let group = dt::preboot_uuid().ok_or(apfs_read::Refusal::Unbound)?;
+    let file = shim::StoreFile::open_block(xart_store::OWNER_PATH, false)
+        .map_err(|_| apfs_read::Refusal::Unavailable)?;
+    let sha256 = |bytes: &[u8]| image::sha256(bytes).map_err(|_| apfs_read::Refusal::NoMemory);
+    sensor_factory::read(&FactoryDisk(file), &group, root_key, &sha256)
 }
 
 struct EnrolMaterial {
@@ -718,6 +770,11 @@ struct SepData {
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
+
+    // This Mac's factory sensor records, read at most once per boot and only
+    // when a packaged file is missing.
+    #[pin]
+    factory_records: Mutex<Option<FactoryRecords>>,
 
     enrol_open: Atomic<bool>,
 
@@ -1238,6 +1295,7 @@ impl SepData {
                 capture_refusal_logged: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 sensor_key_loaded: Atomic::new(false),
+                factory_records <- new_mutex!(None),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),

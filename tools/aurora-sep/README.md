@@ -156,8 +156,18 @@ master at completion; it has not been finger- or reboot-persistence-tested.
 Login must stay password-based until a live post-reboot identity and
 successful match are independently verified.
 
-On each Linux machine, extract its own calibration from its local iBoot System
-Container (the input partition is discovered automatically):
+The driver no longer needs this file. When the calibration the sensor node
+names is not installed, it reads this Mac's own factory record, read-only, from
+the factory-data cache on the Hardware volume of its iBoot System Container,
+once per boot (`drivers/soc/apple/sensor_factory.rs`). On Macs whose enclave
+also takes a signed root key, it reads that the same way. It uses the container
+only when the container holds this boot's volume group, and it refuses any
+APFS layout or record it does not handle, with one log line. An installed file
+still takes precedence.
+
+To install the file anyway, extract this machine's own calibration from its
+local iBoot System Container (the input partition is discovered
+automatically):
 
 ```sh
 sudo install -d -m 0755 /usr/lib/firmware/apple

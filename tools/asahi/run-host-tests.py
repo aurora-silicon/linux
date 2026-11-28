@@ -473,6 +473,14 @@ ASAHI_TESTS = {
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
     'tiled-split-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'tunnel-route-tests.py': [(out(), PASS)],
+    # Touch ID factory records read from the iBoot System Container: every
+    # mutant of the APFS reader or of the record admission fails a test.
+    'sep-factory-records-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-checksum', 'incomplete-checkpoint', 'oldest-version',
+                                   'future-version', 'hashed-nodes', 'encrypted-volume',
+                                   'encrypted-extent', 'compressed', 'hole', 'gap', 'no-size-limit',
+                                   'no-binding', 'first-calibration', 'no-pairing', 'trust-bytes',
+                                   'trust-name', 'no-reseal', 'standalone-fscl'), out()),
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
