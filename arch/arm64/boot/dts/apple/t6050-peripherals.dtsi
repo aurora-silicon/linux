@@ -1598,7 +1598,8 @@
 		status = "disabled";
 	};
 
-#if !defined(T6050_J714S) && !defined(T6050_J716C)
+/* Boards describing ATC1's USB4 router describe this DART with its PCIe tunnel instead. */
+#if !defined(T6050_J714S) && !defined(T6050_J716C) && !defined(T6050_ATC1_USB4_ROUTER)
 	apciec1_dart: iommu@2ac000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x2 0xac000000 0x0 0x20000>;
