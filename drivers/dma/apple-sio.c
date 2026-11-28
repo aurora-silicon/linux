@@ -718,6 +718,12 @@ static const struct of_device_id sio_of_match[] = {
 	 * its DisplayPort audio channels alike ([2, 0, 0x800, 0x800, 0x800, 0]).
 	 */
 	{ .compatible = "apple,t8132-sio", .data = &sio_hw_t8140 },
+	/*
+	 * T8122 (M3): the J615 ADT describes the SIO tables as T8140's (firmware
+	 * remapped at 1 TiB, 36-byte DMA shim records); its DisplayPort audio
+	 * channel refills at 0x800 too (ADT dp-audio1: [2, 0, 0x800, 0x800, 0, 0]).
+	 */
+	{ .compatible = "apple,t8122-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
