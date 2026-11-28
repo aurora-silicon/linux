@@ -24,10 +24,11 @@ enum Probe {
     Next(Arc<Publication>),
 }
 
-/// How many unsettled timestamp-free predecessors deep `Publication::is_pending()` follows
-/// before it answers pending. Commands link the newest pending entry of their prefixes, so an
-/// unretired pipeline is a chain of such links; the bound keeps the probe off the stack, and a
-/// probe that stops early only leaves the settlement to `finish()`.
+/// How many unsettled timestamp-free predecessors deep `Publication::is_pending()` probes, and
+/// how many deferred predecessors in turn one waiter subscribes (`Publication::add_successor()`).
+/// Commands link the newest pending entry of their prefixes, so an unretired pipeline is a chain
+/// of such links; the bound keeps both off the stack. A probe that stops early answers pending,
+/// and a publication past the bound links itself at its own `finish()`.
 const PENDING_PROBE_DEPTH: usize = 4;
 
 struct Link {
@@ -239,11 +240,17 @@ impl Publication {
             return;
         }
         if !to_attach.is_empty() {
-            self.attach_deferred(to_attach);
+            self.attach_deferred(to_attach, PENDING_PROBE_DEPTH);
         }
     }
 
-    fn attach_deferred(self: &Arc<Self>, deferred: KVec<(Arc<Publication>, KBox<Link>)>) {
+    /// Link this publication to its deferred predecessors; the caller holds one sentinel in
+    /// `remaining` for this.
+    fn attach_deferred(
+        self: &Arc<Self>,
+        deferred: KVec<(Arc<Publication>, KBox<Link>)>,
+        depth: usize,
+    ) {
         let mut fast_ok = 0usize;
         for (predecessor, mut link) in deferred {
             if predecessor.settled_clean.load(Ordering::Acquire) {
@@ -251,7 +258,7 @@ impl Publication {
                 drop(link);
             } else {
                 link.target = Some(self.clone());
-                predecessor.add_successor(link);
+                predecessor.add_successor(link, depth);
             }
         }
         Self::drain(self.predecessors_done_ok(1 + fast_ok));
@@ -336,22 +343,44 @@ impl Publication {
         None
     }
 
-    fn add_successor(&self, mut link: KBox<Link>) {
-        let immediate = {
+    /// Deliver `link` now if this publication has settled, or queue it until it does.
+    ///
+    /// An unfinished timestamp-free publication keeps its predecessor links deferred until its
+    /// own `finish()`. Once a waiter queues on it, subscribe it to those predecessors (at most
+    /// `depth` deferred publications deep), so their completion settles it and releases the
+    /// waiter without waiting for this command's own completion.
+    fn add_successor(self: &Arc<Self>, mut link: KBox<Link>, depth: usize) {
+        let deferred = {
             let mut state = self.state.lock();
-            if let Some(result) = state.published {
-                result
+            let immediate = if let Some(result) = state.published {
+                Some(result)
             } else if state.upstream_released {
-                Ok(())
+                Some(Ok(()))
             } else {
-                link.next = state.successors.take();
-                state.successors = Some(link);
+                None
+            };
+            if let Some(result) = immediate {
+                drop(state);
+                if let Some(target) = link.target.take() {
+                    Self::drain(target.predecessor_done(result));
+                }
                 return;
             }
+            link.next = state.successors.take();
+            state.successors = Some(link);
+            if depth == 0
+                || self.has_outputs
+                || state.result.is_some()
+                || state.deferred_links.is_empty()
+            {
+                return;
+            }
+            let deferred = core::mem::take(&mut state.deferred_links);
+            // Hold a sentinel (+1) while attaching off-lock, as `finish()` does.
+            state.remaining += 1 + deferred.len();
+            deferred
         };
-        if let Some(target) = link.target.take() {
-            Self::drain(target.predecessor_done(immediate));
-        }
+        self.attach_deferred(deferred, depth - 1);
     }
 
     /// Iterative depth-first notification, O(nodes + links), with no stack growth.
@@ -436,7 +465,7 @@ impl Prepared {
             }
         };
         if let Some(links) = attach_now {
-            self.target.attach_deferred(links);
+            self.target.attach_deferred(links, PENDING_PROBE_DEPTH);
         }
     }
 }

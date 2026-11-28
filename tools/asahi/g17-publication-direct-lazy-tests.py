@@ -48,10 +48,11 @@ def build_harness(mutation=None):
     activate_fn = item(pub_src, 'pub(crate) fn activate(self)')
     new_prep_fn = item(pub_src, 'pub(crate) fn new<\'a>(')
     finish_fn = item(pub_src, 'pub(crate) fn finish(self: &Arc<Self>,')
-    attach_fn = item(pub_src, 'fn attach_deferred(self: &Arc<Self>,')
+    attach_fn = item(pub_src, 'fn attach_deferred(')
     publish_fn = item(pub_src, 'fn publish(&self, result: Result<[u64; 4]>) -> Links')
     is_pending_fn = item(pub_src, 'fn pending_within(&self, depth: usize) -> bool')
     chain_fn = item(q_src, 'fn link(self, direct: &[Arc<Publication>], out: &mut KVec<Arc<Publication>>)')
+    add_succ_fn = item(pub_src, 'fn add_successor(self: &Arc<Self>, mut link: KBox<Link>, depth: usize)')
 
     if mutation == 'clique-chain':
         collect_fn = collect_fn.replace(
@@ -89,6 +90,8 @@ def build_harness(mutation=None):
         is_pending_fn = is_pending_fn.replace('.position(|(pred, _)| pred.failed_after_release())', '.position(|_| false)', 1)
     elif mutation == 'keep-attached-successors':
         is_pending_fn = is_pending_fn.replace('Probe::Settled(old, state.successors.take())', 'Probe::Settled(old, None)', 1)
+    elif mutation == 'no-subscribe':
+        add_succ_fn = add_succ_fn.replace('let deferred = core::mem::take(&mut state.deferred_links);', 'let deferred = KVec::new();', 1)
     elif mutation == 'skip-fast-check':
         attach_fn = attach_fn.replace(
             'if predecessor.settled_clean.load(Ordering::Acquire) {',
@@ -111,6 +114,8 @@ def build_harness(mutation=None):
         'bounded_probe': 'pred.pending_within(depth - 1)' in is_pending_fn,
         'consume_failed': '.position(|(pred, _)| pred.failed_after_release())' in is_pending_fn
             and 'Probe::Consumed(state.deferred_links.swap_remove(index))' in is_pending_fn,
+        'subscribe_deferred': 'let deferred = core::mem::take(&mut state.deferred_links);' in add_succ_fn
+            and 'self.attach_deferred(deferred, depth - 1);' in add_succ_fn,
         'release_attached': 'Probe::Settled(old, state.successors.take())' in is_pending_fn
             and 'Self::drain(Self::released_ok(successors));' in is_pending_fn,
         'covers_field': 'pub(crate) covers: Option<u64>,' in job_src,
@@ -127,6 +132,7 @@ def build_harness(mutation=None):
     skip_fast = mutation == 'skip-fast-check'
     drop_chain = mutation == 'drop-chain-link'
     retry_failed = mutation == 'retry-failed-pred'
+    no_subscribe = mutation == 'no-subscribe'
     keep_attached = mutation == 'keep-attached-successors'
 
     return f'''
@@ -308,11 +314,11 @@ impl Publication {{
             return;
         }}
         if !to_attach.is_empty() {{
-            self.attach_deferred(to_attach);
+            self.attach_deferred(to_attach, PENDING_PROBE_DEPTH);
         }}
     }}
 
-    fn attach_deferred(self: &Arc<Self>, deferred: Vec<(Arc<Publication>, Box<Link>)>) {{
+    fn attach_deferred(self: &Arc<Self>, deferred: Vec<(Arc<Publication>, Box<Link>)>, depth: usize) {{
         let mut fast_ok = 0usize;
         for (pred, mut link) in deferred {{
             if !{str(skip_fast).lower()} && pred.settled_clean.load(Ordering::Acquire) {{
@@ -320,7 +326,7 @@ impl Publication {{
                 drop(link);
             }} else {{
                 link.target = Some(self.clone());
-                pred.add_successor(link);
+                pred.add_successor(link, depth);
             }}
         }}
         Self::drain(self.predecessors_done_ok(1 + fast_ok));
@@ -396,23 +402,39 @@ impl Publication {{
         None
     }}
 
-    fn add_successor(&self, mut link: Box<Link>) {{
+    fn add_successor(self: &Arc<Self>, mut link: Box<Link>, depth: usize) {{
         self.add_succ_calls.fetch_add(1, Ordering::Relaxed);
-        let immediate = {{
+        let deferred = {{
             let mut state = self.state.lock().unwrap();
-            if let Some(res) = state.published {{
-                res
+            let immediate = if let Some(res) = state.published {{
+                Some(res)
             }} else if state.upstream_released {{
-                Ok(())
+                Some(Ok(()))
             }} else {{
-                link.next = state.successors.take();
-                state.successors = Some(link);
+                None
+            }};
+            if let Some(res) = immediate {{
+                drop(state);
+                if let Some(target) = link.target.take() {{
+                    Self::drain(target.predecessor_done(res));
+                }}
                 return;
             }}
+            link.next = state.successors.take();
+            state.successors = Some(link);
+            if {str(no_subscribe).lower()}
+                || depth == 0
+                || self.has_outputs
+                || state.result.is_some()
+                || state.deferred_links.is_empty()
+            {{
+                return;
+            }}
+            let deferred = std::mem::take(&mut state.deferred_links);
+            state.remaining += 1 + deferred.len();
+            deferred
         }};
-        if let Some(target) = link.target.take() {{
-            Self::drain(target.predecessor_done(immediate));
-        }}
+        self.attach_deferred(deferred, depth - 1);
     }}
 
     fn drain(mut pending: Links) {{
@@ -454,7 +476,7 @@ fn activate(target: &Arc<Publication>, preds: &[Arc<Publication>]) {{
         target.state.lock().unwrap().remaining += links.len();
         for (p, mut l) in links {{
             l.target = Some(target.clone());
-            p.add_successor(l);
+            p.add_successor(l, PENDING_PROBE_DEPTH);
         }}
         Publication::drain(target.predecessors_done_ok(1));
         return;
@@ -550,6 +572,7 @@ fn main() {{
     assert!({str(src_checks['bounded_probe']).lower()}, "is_pending() must bound its predecessor probe");
     assert!({str(src_checks['consume_failed']).lower()}, "is_pending() must consume a predecessor that failed after releasing");
     assert!({str(src_checks['release_attached']).lower()}, "early settlement must release attached successors");
+    assert!({str(src_checks['subscribe_deferred']).lower()}, "a queued waiter must subscribe a deferred publication to its predecessors");
     assert!({str(src_checks['covers_field']).lower()}, "Fences must record the prefix it covers");
     assert!({str(src_checks['chain_links']).lower()}, "EnqueueOrdering::build must chain both covered prefixes");
 
@@ -682,8 +705,8 @@ fn main() {{
         assert_eq!(p.fence_status.load(Ordering::Acquire), PRODUCER_FAILED);
     }}
 
-    // 10. S finished and attached to B before B settled. B settling through is_pending() must
-    // release S then, not when some unrelated completion finishes B.
+    // 10. S finished and attached to deferred B while B's writer A was pending. A's completion
+    // alone must settle B and release S: no probe of B and no completion of B in between.
     {{
         let a = Publication::new(true);
         activate(&a, &[]);
@@ -692,11 +715,48 @@ fn main() {{
         let s = Publication::new(true);
         activate(&s, &[b.clone()]);
         s.finish(Ok(()));
-        a.finish(Ok(()));
         assert_eq!(s.fence_status.load(Ordering::Acquire), 0);
-        assert!(!b.is_pending());
+        a.finish(Ok(()));
         assert_eq!(s.fence_status.load(Ordering::Acquire), 1,
-            "successor attached before an early settlement must be released by it");
+            "a waiter on a deferred publication must be released by its writer's completion");
+        b.finish(Ok(()));
+    }}
+
+    // 11. A successor attached before a probe settles B is released by that settlement too.
+    {{
+        let a = Publication::new(true);
+        activate(&a, &[]);
+        let b = Publication::new(false);
+        activate(&b, &[a.clone()]);
+        a.finish(Ok(()));
+        let s = Publication::new(true);
+        activate(&s, &[b.clone()]);
+        s.finish(Ok(()));
+        assert_eq!(s.fence_status.load(Ordering::Acquire), 1,
+            "a waiter on a deferred publication whose writer already published must not wait");
+        assert!(!b.is_pending());
+    }}
+
+    // 12. A waiter subscribes at most PENDING_PROBE_DEPTH deferred publications deep. Past that,
+    // the deepest subscribed node stays queued on a deferred one; a probe that settles it must
+    // release that queued link, and the chain above it, up to the waiter.
+    {{
+        let w = Publication::new(true);
+        activate(&w, &[]);
+        let mut chain = vec![w.clone()];
+        for _ in 0..PENDING_PROBE_DEPTH + 2 {{
+            let n = Publication::new(false);
+            activate(&n, &[chain.last().unwrap().clone()]);
+            chain.push(n);
+        }}
+        let s = Publication::new(true);
+        activate(&s, &[chain.last().unwrap().clone()]);
+        s.finish(Ok(()));
+        w.finish(Ok(()));
+        let deep = chain[2].clone();
+        assert!(!deep.is_pending());
+        assert_eq!(s.fence_status.load(Ordering::Acquire), 1,
+            "settling past the subscription bound must release the queued chain up to the waiter");
     }}
 
     println!("PASS g17-publication-direct-lazy-tests");
@@ -717,6 +777,7 @@ def main():
         'drop-chain-link',
         'retry-failed-pred',
         'keep-attached-successors',
+        'no-subscribe',
     ])
     args = parser.parse_args()
     src = build_harness(args.mutation)
