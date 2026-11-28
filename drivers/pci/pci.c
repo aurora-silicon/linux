@@ -1405,6 +1405,49 @@ end:
 	return 0;
 }
 
+static void pci_pm_notify_host(struct pci_dev *dev)
+{
+	struct pci_host_bridge *bridge;
+
+	/* Order dev->current_state = PCI_D0 before host pending checks. */
+	smp_mb();
+	bridge = dev->bus ? pci_find_host_bridge(dev->bus) : NULL;
+	if (bridge && bridge->pm_state_change)
+		bridge->pm_state_change(bridge, dev);
+}
+
+/*
+ * Tell ASPM and the host bridge that @dev reached D0. @locked is true when
+ * the caller holds pci_bus_sem.
+ */
+void pci_pm_notify_state_change(struct pci_dev *dev, bool locked)
+{
+	if (dev->current_state != PCI_D0)
+		return;
+
+	if (dev->bus && dev->bus->self)
+		pcie_aspm_pm_state_change(dev->bus->self, locked);
+	pcie_aspm_pm_state_change(dev, locked);
+	pci_pm_notify_host(dev);
+}
+
+/*
+ * Same notification for resume paths that may run with pci_bus_sem held for
+ * read (runtime resume from pci_walk_bus() in error recovery). The ASPM update
+ * needs pci_bus_sem, so it is deferred to a freezable work item when a link
+ * has deferred PCI-PM L1SS; the host bridge hook takes no PCI core lock.
+ */
+void pci_pm_notify_resume(struct pci_dev *dev)
+{
+	if (dev->current_state != PCI_D0)
+		return;
+
+	if (dev->bus && dev->bus->self)
+		pcie_aspm_pm_state_change_deferred(dev->bus->self);
+	pcie_aspm_pm_state_change_deferred(dev);
+	pci_pm_notify_host(dev);
+}
+
 /**
  * pci_set_full_power_state - Put a PCI device into D0 and update its state
  * @dev: PCI device to power up
@@ -1432,7 +1475,7 @@ static int pci_set_full_power_state(struct pci_dev *dev, bool locked)
 	}
 
 	pci_read_config_word(dev, dev->pm_cap + PCI_PM_CTRL, &pmcsr);
-	dev->current_state = pmcsr & PCI_PM_CTRL_STATE_MASK;
+	WRITE_ONCE(dev->current_state, pmcsr & PCI_PM_CTRL_STATE_MASK);
 	if (dev->current_state != PCI_D0) {
 		pci_info_ratelimited(dev, "Refused to change power state from %s to D0\n",
 				     pci_power_name(dev->current_state));
@@ -1453,7 +1496,9 @@ static int pci_set_full_power_state(struct pci_dev *dev, bool locked)
 		pci_restore_bars(dev);
 	}
 
-	if (dev->bus->self)
+	if (dev->current_state == PCI_D0)
+		pci_pm_notify_state_change(dev, locked);
+	else if (dev->bus->self)
 		pcie_aspm_pm_state_change(dev->bus->self, locked);
 
 	return 0;
@@ -1511,6 +1556,7 @@ static void __pci_bus_set_current_state(struct pci_bus *bus, pci_power_t state, 
  */
 static int pci_set_low_power_state(struct pci_dev *dev, pci_power_t state, bool locked)
 {
+	unsigned long flags;
 	u16 pmcsr;
 
 	if (!dev->pm_cap)
@@ -1549,8 +1595,15 @@ static int pci_set_low_power_state(struct pci_dev *dev, pci_power_t state, bool 
 	pmcsr &= ~PCI_PM_CTRL_STATE_MASK;
 	pmcsr |= state;
 
-	/* Enter specified state */
+	/*
+	 * Mark the device out of D0 and write PMCSR under aspm_l1ss_hw_lock so
+	 * concurrent L1SS / PCI-PM enable sequences cannot see D0 while the
+	 * device enters a low-power state.
+	 */
+	flags = pcie_aspm_l1ss_hw_lock_irqsave();
+	WRITE_ONCE(dev->current_state, state);
 	pci_write_config_word(dev, dev->pm_cap + PCI_PM_CTRL, pmcsr);
+	pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
 
 	/* Mandatory power management transition delays; see PCI PM 1.2. */
 	if (state == PCI_D3hot)
@@ -1559,11 +1612,14 @@ static int pci_set_low_power_state(struct pci_dev *dev, pci_power_t state, bool 
 		udelay(PCI_PM_D2_DELAY);
 
 	pci_read_config_word(dev, dev->pm_cap + PCI_PM_CTRL, &pmcsr);
-	dev->current_state = pmcsr & PCI_PM_CTRL_STATE_MASK;
-	if (dev->current_state != state)
+	WRITE_ONCE(dev->current_state, pmcsr & PCI_PM_CTRL_STATE_MASK);
+	if (dev->current_state != state) {
 		pci_info_ratelimited(dev, "Refused to change power state from %s to %s\n",
 				     pci_power_name(dev->current_state),
 				     pci_power_name(state));
+		if (dev->current_state == PCI_D0)
+			pci_pm_notify_state_change(dev, locked);
+	}
 
 	return 0;
 }
@@ -1683,6 +1739,7 @@ static int pci_save_pcie_state(struct pci_dev *dev)
 {
 	int i = 0;
 	struct pci_cap_saved_state *save_state;
+	unsigned long flags;
 	u16 *cap;
 
 	if (!pci_is_pcie(dev))
@@ -1696,14 +1753,21 @@ static int pci_save_pcie_state(struct pci_dev *dev)
 
 	cap = (u16 *)&save_state->cap.data[0];
 	pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &cap[i++]);
+	/*
+	 * Snapshot LNKCTL and L1SS together under aspm_l1ss_hw_lock so a
+	 * concurrent L1SS programming sequence cannot expose transient
+	 * ASPM-disabled LNKCTL bits.
+	 */
+	flags = pcie_aspm_l1ss_hw_lock_irqsave();
 	pcie_capability_read_word(dev, PCI_EXP_LNKCTL, &cap[i++]);
+	pci_save_aspm_l1ss_state_locked(dev);
+	pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
 	pcie_capability_read_word(dev, PCI_EXP_SLTCTL, &cap[i++]);
 	pcie_capability_read_word(dev, PCI_EXP_RTCTL,  &cap[i++]);
 	pcie_capability_read_word(dev, PCI_EXP_DEVCTL2, &cap[i++]);
 	pcie_capability_read_word(dev, PCI_EXP_LNKCTL2, &cap[i++]);
 	pcie_capability_read_word(dev, PCI_EXP_SLTCTL2, &cap[i++]);
 
-	pci_save_aspm_l1ss_state(dev);
 	pci_save_ltr_state(dev);
 
 	return 0;
@@ -1713,6 +1777,7 @@ static void pci_restore_pcie_state(struct pci_dev *dev)
 {
 	int i = 0;
 	struct pci_cap_saved_state *save_state;
+	unsigned long flags;
 	u16 *cap;
 
 	/*
@@ -1720,11 +1785,19 @@ static void pci_restore_pcie_state(struct pci_dev *dev)
 	 * LTR itself in PCI_EXP_DEVCTL2.
 	 */
 	pci_restore_ltr_state(dev);
-	pci_restore_aspm_l1ss_state(dev);
+
+	/*
+	 * Serialize the complete L1SS + LNKCTL restore sequence against
+	 * concurrent ASPM / L1SS programming in both CONFIG_PCIEASPM=y and =n.
+	 */
+	flags = pcie_aspm_l1ss_hw_lock_irqsave();
+	pci_restore_aspm_l1ss_state_locked(dev);
 
 	save_state = pci_find_saved_cap(dev, PCI_CAP_ID_EXP);
-	if (!save_state)
+	if (!save_state) {
+		pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
 		return;
+	}
 
 	/*
 	 * Downstream ports reset the LTR enable bit when link goes down.
@@ -1736,6 +1809,7 @@ static void pci_restore_pcie_state(struct pci_dev *dev)
 	cap = (u16 *)&save_state->cap.data[0];
 	pcie_capability_write_word(dev, PCI_EXP_DEVCTL, cap[i++]);
 	pcie_capability_write_word(dev, PCI_EXP_LNKCTL, cap[i++]);
+	pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
 	pcie_capability_write_word(dev, PCI_EXP_SLTCTL, cap[i++]);
 	pcie_capability_write_word(dev, PCI_EXP_RTCTL, cap[i++]);
 	pcie_capability_write_word(dev, PCI_EXP_DEVCTL2, cap[i++]);
@@ -4542,6 +4616,7 @@ done:
  */
 static int pci_pm_reset(struct pci_dev *dev, bool probe)
 {
+	unsigned long flags;
 	u16 csr;
 	int ret;
 
@@ -4564,9 +4639,16 @@ static int pci_pm_reset(struct pci_dev *dev, bool probe)
 		return ret;
 	}
 
+	/*
+	 * Serialize D3hot entry with aspm_l1ss_hw_lock so concurrent L1SS
+	 * restores cannot enable PCI-PM substates while the device is in D3hot.
+	 */
+	flags = pcie_aspm_l1ss_hw_lock_irqsave();
+	WRITE_ONCE(dev->current_state, PCI_D3hot);
 	csr &= ~PCI_PM_CTRL_STATE_MASK;
 	csr |= PCI_D3hot;
 	pci_write_config_word(dev, dev->pm_cap + PCI_PM_CTRL, csr);
+	pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
 	pci_dev_d3_sleep(dev);
 
 	csr &= ~PCI_PM_CTRL_STATE_MASK;
@@ -4576,6 +4658,12 @@ static int pci_pm_reset(struct pci_dev *dev, bool probe)
 
 	ret = pci_dev_wait(dev, "PM D3hot->D0", PCIE_RESET_READY_POLL_MS);
 	pci_dev_reset_iommu_done(dev);
+	if (!ret) {
+		flags = pcie_aspm_l1ss_hw_lock_irqsave();
+		WRITE_ONCE(dev->current_state, PCI_D0);
+		pcie_aspm_l1ss_hw_unlock_irqrestore(flags);
+		pci_pm_notify_resume(dev);
+	}
 	return ret;
 }
 

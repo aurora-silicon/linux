@@ -23,7 +23,9 @@
 #include <linux/init.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/time.h>
+#include <linux/workqueue.h>
 
 #include "../pci.h"
 
@@ -80,10 +82,53 @@ void pci_configure_aspm_l1ss(struct pci_dev *pdev)
 			ERR_PTR(rc));
 }
 
-void pci_save_aspm_l1ss_state(struct pci_dev *pdev)
+/*
+ * Atomic-safe leaf lock serializing L1SS/LNKCTL/PMCSR hardware transactions
+ * and saved-state updates across CONFIG_PCIEASPM=y and CONFIG_PCIEASPM=n,
+ * including callers such as pci_save_state()/pci_restore_state() that may run
+ * with interrupts disabled.
+ *
+ * Lock order: pci_rescan_remove_lock -> pci_bus_sem -> aspm_lock ->
+ *             driver lock -> aspm_l1ss_hw_lock -> pci_lock.
+ */
+static DEFINE_SPINLOCK(aspm_l1ss_hw_lock);
+
+unsigned long pcie_aspm_l1ss_hw_lock_irqsave(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	return flags;
+}
+
+void pcie_aspm_l1ss_hw_unlock_irqrestore(unsigned long flags)
+{
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+}
+
+#ifdef CONFIG_PCIEASPM
+static DEFINE_MUTEX(aspm_lock);
+
+static void pcie_aspm_restore_l1ss_mask(struct pci_dev *parent,
+					struct pci_dev *pdev,
+					u32 *pl_ctl1, u32 *cl_ctl1);
+static void pcie_aspm_restore_l1ss_sync(struct pci_dev *parent,
+					struct pci_dev *pdev,
+					u32 pl_ctl1, u32 cl_ctl1);
+#else
+static inline void pcie_aspm_restore_l1ss_mask(struct pci_dev *parent,
+					       struct pci_dev *pdev,
+					       u32 *pl_ctl1, u32 *cl_ctl1) { }
+static inline void pcie_aspm_restore_l1ss_sync(struct pci_dev *parent,
+					       struct pci_dev *pdev,
+					       u32 pl_ctl1, u32 cl_ctl1) { }
+#endif
+
+void pci_save_aspm_l1ss_state_locked(struct pci_dev *pdev)
 {
 	struct pci_dev *parent = pdev->bus->self;
-	struct pci_cap_saved_state *save_state;
+	struct pci_cap_saved_state *cl_save_state, *pl_save_state;
+	u32 cl_ctl2, cl_ctl1, pl_ctl2, pl_ctl1;
 	u32 *cap;
 
 	/*
@@ -101,28 +146,51 @@ void pci_save_aspm_l1ss_state(struct pci_dev *pdev)
 	 * Save L1 substate configuration. The ASPM L0s/L1 configuration
 	 * in PCI_EXP_LNKCTL_ASPMC is saved by pci_save_pcie_state().
 	 */
-	save_state = pci_find_saved_ext_cap(pdev, PCI_EXT_CAP_ID_L1SS);
-	if (!save_state)
+	cl_save_state = pci_find_saved_ext_cap(pdev, PCI_EXT_CAP_ID_L1SS);
+	pl_save_state = pci_find_saved_ext_cap(parent, PCI_EXT_CAP_ID_L1SS);
+	if (!cl_save_state || !pl_save_state)
 		return;
 
-	cap = &save_state->cap.data[0];
-	pci_read_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL2, cap++);
-	pci_read_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL1, cap++);
+	/*
+	 * Validate all four reads before committing so an inaccessible D3cold
+	 * or failing link cannot overwrite valid timing with 0xffffffff.
+	 */
+	if (pci_read_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL2, &cl_ctl2) ||
+	    pci_read_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL1, &cl_ctl1) ||
+	    pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2, &pl_ctl2) ||
+	    pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1, &pl_ctl1) ||
+	    PCI_POSSIBLE_ERROR(cl_ctl2) || PCI_POSSIBLE_ERROR(cl_ctl1) ||
+	    PCI_POSSIBLE_ERROR(pl_ctl2) || PCI_POSSIBLE_ERROR(pl_ctl1))
+		return;
+
+	cap = &cl_save_state->cap.data[0];
+	*cap++ = cl_ctl2;
+	*cap = cl_ctl1;
 
 	/*
 	 * Save parent's L1 substate configuration so we have it for
 	 * pci_restore_aspm_l1ss_state(pdev) to restore.
 	 */
-	save_state = pci_find_saved_ext_cap(parent, PCI_EXT_CAP_ID_L1SS);
-	if (!save_state)
-		return;
-
-	cap = &save_state->cap.data[0];
-	pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2, cap++);
-	pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1, cap++);
+	cap = &pl_save_state->cap.data[0];
+	*cap++ = pl_ctl2;
+	*cap = pl_ctl1;
 }
 
-void pci_restore_aspm_l1ss_state(struct pci_dev *pdev)
+void pci_save_aspm_l1ss_state(struct pci_dev *pdev)
+{
+	struct pci_dev *parent = pdev->bus->self;
+	unsigned long flags;
+
+	if (pcie_downstream_port(pdev) || !parent || !pdev->l1ss || !parent->l1ss)
+		return;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	pci_save_aspm_l1ss_state_locked(pdev);
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+}
+EXPORT_SYMBOL_GPL(pci_save_aspm_l1ss_state);
+
+void pci_restore_aspm_l1ss_state_locked(struct pci_dev *pdev)
 {
 	struct pci_cap_saved_state *pl_save_state, *cl_save_state;
 	struct pci_dev *parent = pdev->bus->self;
@@ -152,6 +220,8 @@ void pci_restore_aspm_l1ss_state(struct pci_dev *pdev)
 	cap = &pl_save_state->cap.data[0];
 	pl_ctl2 = *cap++;
 	pl_ctl1 = *cap;
+
+	pcie_aspm_restore_l1ss_mask(parent, pdev, &pl_ctl1, &cl_ctl1);
 
 	/* Make sure L0s/L1 are disabled before updating L1SS config */
 	pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &clnkctl);
@@ -203,6 +273,22 @@ void pci_restore_aspm_l1ss_state(struct pci_dev *pdev)
 		pcie_capability_write_word(parent, PCI_EXP_LNKCTL, plnkctl);
 		pcie_capability_write_word(pdev, PCI_EXP_LNKCTL, clnkctl);
 	}
+
+	pcie_aspm_restore_l1ss_sync(parent, pdev, pl_ctl1 | pl_l1_2_enable,
+				    cl_ctl1 | cl_l1_2_enable);
+}
+
+void pci_restore_aspm_l1ss_state(struct pci_dev *pdev)
+{
+	struct pci_dev *parent = pdev->bus->self;
+	unsigned long flags;
+
+	if (pcie_downstream_port(pdev) || !parent || !pdev->l1ss || !parent->l1ss)
+		return;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	pci_restore_aspm_l1ss_state_locked(pdev);
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
 }
 
 #ifdef CONFIG_PCIEASPM
@@ -245,11 +331,17 @@ struct pcie_link_state {
 	u32 clkpm_enabled:1;		/* Current Clock PM state */
 	u32 clkpm_default:1;		/* Default Clock PM state by BIOS */
 	u32 clkpm_disable:1;		/* Clock PM disabled */
+
+	/*
+	 * Separate bytes outside the aspm_lock bitfield word so atomic restore
+	 * under aspm_l1ss_hw_lock never shares RMW storage with aspm_capable.
+	 */
+	u8 aspm_sleep_disable;		/* Temporarily disabled during sleep */
+	u8 aspm_hw_l1ss;		/* Policy-programmed L1SS shadow */
 };
 
 static bool aspm_disabled, aspm_force;
 static bool aspm_support_enabled = true;
-static DEFINE_MUTEX(aspm_lock);
 static LIST_HEAD(link_list);
 
 #define POLICY_DEFAULT 0	/* BIOS default setting */
@@ -839,11 +931,30 @@ static void aspm_l1ss_init(struct pcie_link_state *link)
 
 #define FLAG(x, y, d)	(((x) & (PCIE_LINK_STATE_##y)) ? d : "")
 
+static int pcie_l1ss_ctl1_update(struct pci_dev *pdev, u32 clear, u32 set)
+{
+	u32 val;
+	int ret;
+
+	ret = pcibios_err_to_errno(pci_read_config_dword(pdev,
+							 pdev->l1ss + PCI_L1SS_CTL1,
+							 &val));
+	if (ret)
+		return ret;
+	if (PCI_POSSIBLE_ERROR(val))
+		return -EIO;
+	val = (val & ~clear) | set;
+	return pcibios_err_to_errno(pci_write_config_dword(pdev,
+							   pdev->l1ss + PCI_L1SS_CTL1,
+							   val));
+}
+
 /* Configure the ASPM L1 substates. Caller must disable L1 first. */
-static void pcie_config_aspm_l1ss(struct pcie_link_state *link, u32 state)
+static int pcie_config_aspm_l1ss(struct pcie_link_state *link, u32 state)
 {
 	u32 val = 0;
 	struct pci_dev *child = link->downstream, *parent = link->pdev;
+	int ret;
 
 	if (state & PCIE_LINK_STATE_L1_1)
 		val |= PCI_L1SS_CTL1_ASPM_L1_1;
@@ -863,16 +974,28 @@ static void pcie_config_aspm_l1ss(struct pcie_link_state *link, u32 state)
 	 */
 
 	/* Disable all L1 substates */
-	pci_clear_and_set_config_dword(child, child->l1ss + PCI_L1SS_CTL1,
-				       PCI_L1SS_CTL1_L1SS_MASK, 0);
-	pci_clear_and_set_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
-				       PCI_L1SS_CTL1_L1SS_MASK, 0);
+	ret = pcie_l1ss_ctl1_update(child, PCI_L1SS_CTL1_L1SS_MASK, 0);
+	if (ret)
+		goto unwind;
+	ret = pcie_l1ss_ctl1_update(parent, PCI_L1SS_CTL1_L1SS_MASK, 0);
+	if (ret)
+		goto unwind;
 
 	/* Enable what we need to enable */
-	pci_clear_and_set_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
-				       PCI_L1SS_CTL1_L1SS_MASK, val);
-	pci_clear_and_set_config_dword(child, child->l1ss + PCI_L1SS_CTL1,
-				       PCI_L1SS_CTL1_L1SS_MASK, val);
+	ret = pcie_l1ss_ctl1_update(parent, PCI_L1SS_CTL1_L1SS_MASK, val);
+	if (ret)
+		goto unwind;
+	ret = pcie_l1ss_ctl1_update(child, PCI_L1SS_CTL1_L1SS_MASK, val);
+	if (ret)
+		goto unwind;
+
+	return 0;
+
+unwind:
+	/* Keep both ends symmetrically disabled child-first on partial failure. */
+	pcie_l1ss_ctl1_update(child, PCI_L1SS_CTL1_L1SS_MASK, 0);
+	pcie_l1ss_ctl1_update(parent, PCI_L1SS_CTL1_L1SS_MASK, 0);
+	return ret;
 }
 
 static bool pcie_link_has_aspm_override(const struct pcie_link_state *link,
@@ -1030,6 +1153,7 @@ static void pcie_aspm_cap_init(struct pcie_link_state *link, int blacklist)
 	link->aspm_default = link->aspm_enabled;
 
 	pcie_aspm_override_default_link_state(link);
+	WRITE_ONCE(link->aspm_hw_l1ss, link->aspm_enabled & PCIE_LINK_STATE_L1SS);
 
 	/*
 	 * Restore L0s/L1 if they were enabled, but don't restore any
@@ -1067,34 +1191,144 @@ static void pcie_aspm_cap_init(struct pcie_link_state *link, int blacklist)
 	}
 }
 
-static void pcie_config_aspm_dev(struct pci_dev *pdev, u32 val)
+static int pcie_config_aspm_dev(struct pci_dev *pdev, u32 val)
 {
-	pcie_capability_clear_and_set_word(pdev, PCI_EXP_LNKCTL,
-					   PCI_EXP_LNKCTL_ASPMC, val);
+	return pcibios_err_to_errno(pcie_capability_clear_and_set_word(pdev,
+					PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_ASPMC,
+					val));
 }
 
-static void pcie_config_aspm_link(struct pcie_link_state *link, u32 state)
+static u32 pcie_aspm_l1ss_ctl1_to_state(u32 ctl1)
 {
-	u32 upstream = 0, dwstream = 0;
+	u32 state = 0;
+
+	if (ctl1 & PCI_L1SS_CTL1_ASPM_L1_1)
+		state |= PCIE_LINK_STATE_L1_1;
+	if (ctl1 & PCI_L1SS_CTL1_ASPM_L1_2)
+		state |= PCIE_LINK_STATE_L1_2;
+	if (ctl1 & PCI_L1SS_CTL1_PCIPM_L1_1)
+		state |= PCIE_LINK_STATE_L1_1_PCIPM;
+	if (ctl1 & PCI_L1SS_CTL1_PCIPM_L1_2)
+		state |= PCIE_LINK_STATE_L1_2_PCIPM;
+	return state;
+}
+
+static void pcie_aspm_restore_l1ss_mask(struct pci_dev *parent,
+					struct pci_dev *pdev,
+					u32 *pl_ctl1, u32 *cl_ctl1)
+{
+	struct pcie_link_state *link = parent->link_state;
+
+	if (aspm_disabled || !link || link->downstream != pdev)
+		return;
+
+	if (READ_ONCE(link->aspm_sleep_disable) & PCIE_LINK_STATE_L1SS) {
+		*pl_ctl1 &= ~PCI_L1SS_CTL1_L1SS_MASK;
+		*cl_ctl1 &= ~PCI_L1SS_CTL1_L1SS_MASK;
+		return;
+	}
+
+	if (READ_ONCE(parent->current_state) != PCI_D0 ||
+	    READ_ONCE(pdev->current_state) != PCI_D0) {
+		*pl_ctl1 &= ~(PCI_L1SS_CTL1_PCIPM_L1_1 | PCI_L1SS_CTL1_PCIPM_L1_2);
+		*cl_ctl1 &= ~(PCI_L1SS_CTL1_PCIPM_L1_1 | PCI_L1SS_CTL1_PCIPM_L1_2);
+	}
+}
+
+static void pcie_aspm_restore_l1ss_sync(struct pci_dev *parent,
+					struct pci_dev *pdev,
+					u32 pl_ctl1, u32 cl_ctl1)
+{
+	struct pcie_link_state *link = parent->link_state;
+	u8 pl_en, cl_en, expected;
+
+	if (aspm_disabled || !link || link->downstream != pdev)
+		return;
+
+	/*
+	 * Defer cache/policy reconciliation out of the atomic restore path so
+	 * link->aspm_enabled (which shares bitfield storage with aspm_capable
+	 * under aspm_lock) is never mutated without aspm_lock. Compare both
+	 * ends against the policy-programmed shadow byte so both missing and
+	 * stale-enabled substates trigger forced reprogramming.
+	 */
+	pl_en = pcie_aspm_l1ss_ctl1_to_state(pl_ctl1);
+	cl_en = pcie_aspm_l1ss_ctl1_to_state(cl_ctl1);
+	expected = READ_ONCE(link->aspm_hw_l1ss);
+	if (pl_en != expected || cl_en != expected) {
+		WRITE_ONCE(parent->aspm_l1ss_resync, 1);
+		if (!(READ_ONCE(link->aspm_sleep_disable) &
+		      PCIE_LINK_STATE_L1SS)) {
+			WRITE_ONCE(parent->aspm_pcipm_deferred, 1);
+			/*
+			 * Pairs with smp_mb() in
+			 * pcie_aspm_pm_state_change_deferred().
+			 */
+			smp_mb();
+			if (READ_ONCE(parent->current_state) == PCI_D0 &&
+			    READ_ONCE(pdev->current_state) == PCI_D0)
+				pcie_aspm_pm_state_change_deferred(parent);
+		}
+	}
+}
+
+static int pcie_config_aspm_link_locked(struct pcie_link_state *link, u32 state)
+{
+	u32 upstream = 0, dwstream = 0, wanted;
 	struct pci_dev *child = link->downstream, *parent = link->pdev;
 	struct pci_bus *linkbus = parent->subordinate;
+	bool resync = READ_ONCE(parent->aspm_l1ss_resync);
+	bool l1ss_programmed = false;
+	int ret = 0, r;
+
+	if (resync)
+		WRITE_ONCE(parent->aspm_l1ss_resync, 0);
 
 	/* Enable only the states that were not explicitly disabled */
-	state &= (link->aspm_capable & ~link->aspm_disable);
+	state &= (link->aspm_capable & ~link->aspm_disable &
+		  ~READ_ONCE(link->aspm_sleep_disable));
 
 	/* Can't enable any substates if L1 is not enabled */
 	if (!(state & PCIE_LINK_STATE_L1))
 		state &= ~PCIE_LINK_STATE_L1SS;
 
+	wanted = state;
+
 	/* Spec says both ports must be in D0 before enabling PCI PM substates*/
-	if (parent->current_state != PCI_D0 || child->current_state != PCI_D0) {
-		state &= ~PCIE_LINK_STATE_L1_SS_PCIPM;
-		state |= (link->aspm_enabled & PCIE_LINK_STATE_L1_SS_PCIPM);
+	if (READ_ONCE(parent->current_state) != PCI_D0 ||
+	    READ_ONCE(child->current_state) != PCI_D0) {
+		u32 deferred_state;
+
+		if (!resync && link->aspm_enabled == state) {
+			WRITE_ONCE(parent->aspm_pcipm_deferred, 0);
+			return 0;
+		}
+		deferred_state = state & ~PCIE_LINK_STATE_L1_SS_PCIPM;
+		if (wanted & PCIE_LINK_STATE_L1_SS_PCIPM) {
+			WRITE_ONCE(parent->aspm_pcipm_deferred, 1);
+			/*
+			 * Order publishing aspm_pcipm_deferred before re-checking
+			 * current_state; pairs with smp_mb() in
+			 * pcie_aspm_pm_state_change_deferred().
+			 */
+			smp_mb();
+			if (READ_ONCE(parent->current_state) == PCI_D0 &&
+			    READ_ONCE(child->current_state) == PCI_D0) {
+				WRITE_ONCE(parent->aspm_pcipm_deferred, 0);
+			} else {
+				state = deferred_state;
+			}
+		} else {
+			WRITE_ONCE(parent->aspm_pcipm_deferred, 0);
+			state = deferred_state;
+		}
+	} else {
+		WRITE_ONCE(parent->aspm_pcipm_deferred, 0);
 	}
 
-	/* Nothing to do if the link is already in the requested state */
-	if (link->aspm_enabled == state)
-		return;
+	/* Nothing to do if hardware and cache already match the requested state */
+	if (!resync && link->aspm_enabled == state)
+		return 0;
 	/* Convert ASPM state to upstream/downstream ASPM register state */
 	if (state & PCIE_LINK_STATE_L0S_UP)
 		dwstream |= PCI_EXP_LNKCTL_ASPM_L0S;
@@ -1119,24 +1353,74 @@ static void pcie_config_aspm_link(struct pcie_link_state *link, u32 state)
 	 * Sec 7.5.3.7 also recommends programming the same ASPM Control
 	 * value for all functions of a multi-function device.
 	 */
-	list_for_each_entry(child, &linkbus->devices, bus_list)
-		pcie_config_aspm_dev(child, 0);
-	pcie_config_aspm_dev(parent, 0);
+	list_for_each_entry(child, &linkbus->devices, bus_list) {
+		r = pcie_config_aspm_dev(child, 0);
+		if (!ret)
+			ret = r;
+	}
+	r = pcie_config_aspm_dev(parent, 0);
+	if (!ret)
+		ret = r;
 
-	if (link->aspm_capable & PCIE_LINK_STATE_L1SS)
-		pcie_config_aspm_l1ss(link, state);
+	if (!ret && (link->aspm_capable & PCIE_LINK_STATE_L1SS)) {
+		ret = pcie_config_aspm_l1ss(link, state);
+		if (!ret && (state & PCIE_LINK_STATE_L1SS))
+			l1ss_programmed = true;
+	}
 
-	pcie_config_aspm_dev(parent, upstream);
-	list_for_each_entry(child, &linkbus->devices, bus_list)
-		pcie_config_aspm_dev(child, dwstream);
+	r = pcie_config_aspm_dev(parent, upstream);
+	if (r)
+		r = pcie_config_aspm_dev(parent, upstream);
+	if (!ret)
+		ret = r;
+	list_for_each_entry(child, &linkbus->devices, bus_list) {
+		r = pcie_config_aspm_dev(child, dwstream);
+		if (r)
+			r = pcie_config_aspm_dev(child, dwstream);
+		if (!ret)
+			ret = r;
+	}
+
+	if (ret) {
+		if (l1ss_programmed) {
+			list_for_each_entry(child, &linkbus->devices, bus_list)
+				pcie_config_aspm_dev(child, 0);
+			pcie_config_aspm_dev(parent, 0);
+			pcie_l1ss_ctl1_update(link->downstream,
+					      PCI_L1SS_CTL1_L1SS_MASK, 0);
+			pcie_l1ss_ctl1_update(parent,
+					      PCI_L1SS_CTL1_L1SS_MASK, 0);
+			pcie_config_aspm_dev(parent, upstream);
+			list_for_each_entry(child, &linkbus->devices, bus_list)
+				pcie_config_aspm_dev(child, dwstream);
+		}
+		link->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;
+		WRITE_ONCE(link->aspm_hw_l1ss, 0);
+		WRITE_ONCE(parent->aspm_l1ss_resync, 1);
+		if (!(READ_ONCE(link->aspm_sleep_disable) &
+		      PCIE_LINK_STATE_L1SS))
+			WRITE_ONCE(parent->aspm_pcipm_deferred, 1);
+		return ret;
+	}
 
 	link->aspm_enabled = state;
+	WRITE_ONCE(link->aspm_hw_l1ss, state & PCIE_LINK_STATE_L1SS);
 
 	/* Update latest ASPM configuration in saved context */
-	pci_save_aspm_l1ss_state(link->downstream);
+	pci_save_aspm_l1ss_state_locked(link->downstream);
 	pci_update_aspm_saved_state(link->downstream);
-	pci_save_aspm_l1ss_state(parent);
+	pci_save_aspm_l1ss_state_locked(parent);
 	pci_update_aspm_saved_state(parent);
+	return 0;
+}
+
+static void pcie_config_aspm_link(struct pcie_link_state *link, u32 state)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	pcie_config_aspm_link_locked(link, state);
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
 }
 
 static void pcie_config_aspm_path(struct pcie_link_state *link)
@@ -1149,7 +1433,13 @@ static void pcie_config_aspm_path(struct pcie_link_state *link)
 
 static void free_link_state(struct pcie_link_state *link)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	WRITE_ONCE(link->pdev->aspm_l1ss_resync, 0);
+	WRITE_ONCE(link->pdev->aspm_pcipm_deferred, 0);
 	link->pdev->link_state = NULL;
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
 	kfree(link);
 }
 
@@ -1451,9 +1741,10 @@ void pcie_aspm_exit_link_state(struct pci_dev *pdev)
  */
 void pcie_aspm_pm_state_change(struct pci_dev *pdev, bool locked)
 {
-	struct pcie_link_state *link = pdev->link_state;
+	struct pcie_link_state *link;
 
-	if (aspm_disabled || !link)
+	/* Unlocked hint only; pdev->link_state is validated under aspm_lock. */
+	if (aspm_disabled || !READ_ONCE(pdev->link_state))
 		return;
 	/*
 	 * Devices changed PM state, we should recheck if latency
@@ -1462,11 +1753,55 @@ void pcie_aspm_pm_state_change(struct pci_dev *pdev, bool locked)
 	if (!locked)
 		down_read(&pci_bus_sem);
 	mutex_lock(&aspm_lock);
-	pcie_update_aspm_capable(link->root);
-	pcie_config_aspm_path(link);
+	/* free_link_state() clears pdev->link_state under aspm_lock. */
+	link = pdev->link_state;
+	if (link) {
+		pcie_update_aspm_capable(link->root);
+		pcie_config_aspm_path(link);
+	}
 	mutex_unlock(&aspm_lock);
 	if (!locked)
 		up_read(&pci_bus_sem);
+}
+
+static void pcie_aspm_pm_work_fn(struct work_struct *work)
+{
+	struct pci_dev *pdev = container_of(work, struct pci_dev, aspm_pm_work);
+
+	/*
+	 * Runs on system_freezable_wq with no PCI lock held. @pdev is pinned by
+	 * the queueing caller and pcie_aspm_pm_state_change() revalidates
+	 * pdev->link_state under aspm_lock, so a link freed meanwhile is
+	 * skipped safely without cancel_work_sync() under PCI locks.
+	 */
+	pcie_aspm_pm_state_change(pdev, false);
+	pci_dev_put(pdev);
+}
+
+void pcie_aspm_init_dev(struct pci_dev *pdev)
+{
+	INIT_WORK(&pdev->aspm_pm_work, pcie_aspm_pm_work_fn);
+}
+
+/**
+ * pcie_aspm_pm_state_change_deferred - Recheck ASPM from a freezable work item
+ * @pdev: the root port or switch downstream port
+ *
+ * For callers that may run with pci_bus_sem held for read, such as runtime
+ * resume reached from pci_walk_bus() in error recovery. Only queues work when
+ * the port has deferred PCI-PM L1SS waiting for D0; work is preallocated in
+ * struct pci_dev and coalesced per port on system_freezable_wq.
+ */
+void pcie_aspm_pm_state_change_deferred(struct pci_dev *pdev)
+{
+	/* Order dev->current_state = PCI_D0 before checking aspm_pcipm_deferred. */
+	smp_mb();
+	if (aspm_disabled || !READ_ONCE(pdev->aspm_pcipm_deferred))
+		return;
+
+	pci_dev_get(pdev);
+	if (!queue_work(system_freezable_wq, &pdev->aspm_pm_work))
+		pci_dev_put(pdev);
 }
 
 void pcie_aspm_powersave_config_link(struct pci_dev *pdev)
@@ -1908,3 +2243,191 @@ bool pcie_aspm_support_enabled(void)
 }
 
 #endif /* CONFIG_PCIEASPM */
+
+int pcie_aspm_l1ss_hw_exec(struct pci_dev *child, bool save_state,
+			   int (*fn)(void *data), void *data)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+	ret = fn(data);
+	if (!ret && save_state && child)
+		pci_save_aspm_l1ss_state_locked(child);
+	spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcie_aspm_l1ss_hw_exec);
+
+/**
+ * pcie_aspm_l1ss_sleep_begin_locked - Serialize sleep L1SS teardown with ASPM
+ * @pdev: Upstream port (Root Port or Switch Downstream Port) of the link
+ * @child: Downstream function holding the link's L1SS capability, or NULL
+ * @disable_fn: Driver callback that clears hardware L1SS enables
+ * @data: Opaque argument passed to @disable_fn
+ *
+ * Serializes hardware L1SS teardown with aspm_lock (when CONFIG_PCIEASPM is
+ * enabled), records temporary sleep suppression without altering
+ * link->aspm_disable or link->aspm_default, and keeps link->aspm_enabled and
+ * saved L1SS state in sync across suspend/resume in both CONFIG_PCIEASPM=y
+ * and CONFIG_PCIEASPM=n builds.
+ *
+ * Context: Caller holds pci_bus_sem read lock.
+ */
+int pcie_aspm_l1ss_sleep_begin_locked(struct pci_dev *pdev,
+				      struct pci_dev *child,
+				      int (*disable_fn)(void *data,
+							bool core_managed),
+				      void *data)
+{
+	bool core_managed = false;
+	unsigned long flags;
+	int ret;
+#ifdef CONFIG_PCIEASPM
+	struct pcie_link_state *link;
+	bool was_suppressed = false;
+#endif
+
+	lockdep_assert_held_read(&pci_bus_sem);
+
+#ifdef CONFIG_PCIEASPM
+	mutex_lock(&aspm_lock);
+	link = pdev->link_state;
+	core_managed = !aspm_disabled && link && link->downstream;
+	if (core_managed) {
+		spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+		was_suppressed = !!(READ_ONCE(link->aspm_sleep_disable) &
+				    PCIE_LINK_STATE_L1SS);
+		WRITE_ONCE(link->aspm_sleep_disable,
+			   READ_ONCE(link->aspm_sleep_disable) |
+			   PCIE_LINK_STATE_L1SS);
+		spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+	}
+#endif
+	ret = disable_fn(data, core_managed);
+	if (!ret) {
+		spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+#ifdef CONFIG_PCIEASPM
+		if (core_managed) {
+			link->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;
+			WRITE_ONCE(link->aspm_hw_l1ss, 0);
+			WRITE_ONCE(pdev->aspm_l1ss_resync, 0);
+			WRITE_ONCE(pdev->aspm_pcipm_deferred, 0);
+			pci_save_aspm_l1ss_state_locked(link->downstream);
+			pci_save_aspm_l1ss_state_locked(link->pdev);
+		} else if (child) {
+			pci_save_aspm_l1ss_state_locked(child);
+		}
+#else
+		if (child)
+			pci_save_aspm_l1ss_state_locked(child);
+#endif
+		spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+	} else {
+#ifdef CONFIG_PCIEASPM
+		if (core_managed && !was_suppressed) {
+			spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+			WRITE_ONCE(link->aspm_sleep_disable,
+				   READ_ONCE(link->aspm_sleep_disable) &
+				   ~PCIE_LINK_STATE_L1SS);
+			spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+		}
+#endif
+	}
+#ifdef CONFIG_PCIEASPM
+	mutex_unlock(&aspm_lock);
+#endif
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcie_aspm_l1ss_sleep_begin_locked);
+
+/**
+ * pcie_aspm_l1ss_sleep_end - Restore L1SS after sleep via the PCI core ASPM path
+ * @pdev: Upstream port (Root Port or Switch Downstream Port) of the link
+ * @child: Downstream function holding the link's L1SS capability, or NULL
+ * @restore_fn: Driver callback restoring L1SS timing (and enables if unmanaged)
+ * @data: Opaque argument passed to @restore_fn
+ *
+ * Serializes restoration with pci_bus_sem and aspm_lock (in both
+ * CONFIG_PCIEASPM=y and CONFIG_PCIEASPM=n). When the link is managed by the
+ * ASPM core and @restore_fn succeeds, clears temporary sleep suppression and
+ * lets pcie_config_aspm_link() re-apply policy-permitted L1SS enables,
+ * deferring PCI-PM L1.1/L1.2 until both ends of the link are in PCI_D0. If
+ * @restore_fn fails transiently (ret != 0 && ret != -ENODEV), keeps
+ * link->aspm_sleep_disable armed so policy rechecks cannot enable L1.2
+ * against incomplete timing.
+ */
+int pcie_aspm_l1ss_sleep_end(struct pci_dev *pdev, struct pci_dev *child,
+			     int (*restore_fn)(void *data, bool core_managed),
+			     void *data)
+{
+	bool core_managed = false;
+	unsigned long flags;
+	int ret;
+#ifdef CONFIG_PCIEASPM
+	struct pcie_link_state *link;
+#endif
+
+	down_read(&pci_bus_sem);
+#ifdef CONFIG_PCIEASPM
+	mutex_lock(&aspm_lock);
+	link = pdev->link_state;
+	core_managed = !aspm_disabled && link && link->downstream;
+#endif
+	ret = restore_fn(data, core_managed);
+#ifdef CONFIG_PCIEASPM
+	if (core_managed) {
+		spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+		link->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;
+		WRITE_ONCE(link->aspm_hw_l1ss, 0);
+		if (!ret) {
+			WRITE_ONCE(link->aspm_sleep_disable,
+				   READ_ONCE(link->aspm_sleep_disable) &
+				   ~PCIE_LINK_STATE_L1SS);
+			ret = pcie_config_aspm_link_locked(link,
+							   policy_to_aspm_state(link));
+			if (ret) {
+				if (ret == -ENODEV)
+					ret = -EIO;
+				WRITE_ONCE(link->aspm_sleep_disable,
+					   READ_ONCE(link->aspm_sleep_disable) |
+					   PCIE_LINK_STATE_L1SS);
+				WRITE_ONCE(pdev->aspm_pcipm_deferred, 0);
+			}
+			pci_save_aspm_l1ss_state_locked(link->downstream);
+			pci_save_aspm_l1ss_state_locked(link->pdev);
+		} else if (ret == -ENODEV) {
+			WRITE_ONCE(link->aspm_sleep_disable,
+				   READ_ONCE(link->aspm_sleep_disable) &
+				   ~PCIE_LINK_STATE_L1SS);
+			WRITE_ONCE(pdev->aspm_l1ss_resync, 0);
+			WRITE_ONCE(pdev->aspm_pcipm_deferred, 0);
+		} else {
+			WRITE_ONCE(link->aspm_sleep_disable,
+				   READ_ONCE(link->aspm_sleep_disable) |
+				   PCIE_LINK_STATE_L1SS);
+			WRITE_ONCE(pdev->aspm_pcipm_deferred, 0);
+			pci_save_aspm_l1ss_state_locked(link->downstream);
+			pci_save_aspm_l1ss_state_locked(link->pdev);
+		}
+		spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+	} else if (!ret && child) {
+		spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+		pci_save_aspm_l1ss_state_locked(child);
+		spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+	}
+	mutex_unlock(&aspm_lock);
+#else
+	if (!ret && child) {
+		spin_lock_irqsave(&aspm_l1ss_hw_lock, flags);
+		pci_save_aspm_l1ss_state_locked(child);
+		spin_unlock_irqrestore(&aspm_l1ss_hw_lock, flags);
+	}
+#endif
+	up_read(&pci_bus_sem);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcie_aspm_l1ss_sleep_end);
