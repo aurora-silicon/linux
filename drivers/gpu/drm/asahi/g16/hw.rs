@@ -1295,10 +1295,14 @@ pub(crate) mod sizes {
     pub(crate) const COALESCE_WINDOW_NS: u64 = (COALESCE_WINDOW_US as u64) * 1000;
     /// Per-queue retired CDM execution EWMA threshold (microseconds) at or above which
     /// barrier-free compute fans out across both CDM pipes instead of staying 1-pipe affine.
-    pub(crate) const COMPUTE_HEAVY_EMA_US: u32 = 200;
+    /// Light dispatches, a few tens of microseconds each, stay well below it and keep folding
+    /// on one pipe; heavy dispatches of about 185 us clear it with room to get faster.
+    pub(crate) const COMPUTE_HEAVY_EMA_US: u32 = 140;
     /// Elapsed wall-clock time (nanoseconds) on a sole active single-command compute flight
     /// that immediately classifies the queue as heavy before its first retirement updates EWMA.
-    pub(crate) const COMPUTE_HEAVY_INFLIGHT_NS: u64 = 180_000;
+    /// It is the same crossover as [`COMPUTE_HEAVY_EMA_US`], so a queue the probe promotes
+    /// stays heavy once its retired dispatches feed the EWMA.
+    pub(crate) const COMPUTE_HEAVY_INFLIGHT_NS: u64 = COMPUTE_HEAVY_EMA_US as u64 * 1000;
     /// Jobs admitted to the engine per logical queue: enough to keep deep queues (`d=64`)
     /// queued back to back without scheduler backpressure stalls; exact prior-command
     /// dependencies still gate each one.

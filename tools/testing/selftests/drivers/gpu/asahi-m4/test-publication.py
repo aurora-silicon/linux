@@ -41,6 +41,8 @@ assert 'Some(params::queue_limits())' in gpu_limits_fn, gpu_limits_fn
 assert 'DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES' in gpu_src
 max_queues_line = next(line for line in hw_src.splitlines() if 'const MAX_QUEUES:' in line)
 flights_line = next(line for line in hw_src.splitlines() if 'const FLIGHTS:' in line)
+heavy_limits = [line.strip() for line in hw_src.splitlines() if 'const COMPUTE_HEAVY_' in line]
+assert len(heavy_limits) == 2, heavy_limits
 assert 'const COMPUTE_SLOTS: usize = COMPUTE_UNITS;' in hw_src
 assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
 prefix_render_fn = item('fn prefix_render(')
@@ -214,7 +216,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn validate_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64)->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; __HEAVY_LIMITS__ } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -1969,17 +1971,23 @@ mod queue_behind_scope {
             cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
             has_timestamps:false,doomed:false,recovery_suspect:false,
         });
-        // Cold-start heavy probe: sole single-command compute flight becomes heavy at >= 180 us.
-        assert!(!host.compute_queue_is_heavy(&q1, 1_179_999));
-        assert!(host.compute_queue_is_heavy(&q1, 1_180_000));
+        // Cold-start heavy probe: sole single-command compute flight becomes heavy at >= 140 us.
+        assert!(!host.compute_queue_is_heavy(&q1, 1_139_999));
+        assert!(host.compute_queue_is_heavy(&q1, 1_140_000));
         // Folded multi-command light flight does not trigger the cold-start probe.
         host.engine.flights[0].computes = 3;
         assert!(!host.compute_queue_is_heavy(&q1, 2_000_000));
         host.engine.flights[0].computes = 1;
-        // Per-queue retired hardware CDM EWMA transitions cleanly at 200 us.
+        // The retired EWMA crosses over at the probe's 140 us, after the probe has expired.
+        q1.note_compute_us(139);
+        assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
+        q1.note_compute_us(141);
+        assert!(host.compute_queue_is_heavy(&q1, 1_050_000));
+        q1.compute_ewma_us.store(0, Ordering::Relaxed);
+        // The EWMA follows subsequent changes in the stream.
         q1.note_compute_us(30);
         assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
-        q1.note_compute_us(500);
+        q1.note_compute_us(300);
         assert!(host.compute_queue_is_heavy(&q1, 1_050_000));
         q1.note_compute_us(20);
         assert!(!host.compute_queue_is_heavy(&q1, 1_050_000));
@@ -3050,7 +3058,7 @@ mod busy_coalesce_scope {
         h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, Some(2)])];
         assert_eq!(h.defer_busy_coalesce(400_000), None);
 
-        // Heavy compute queue (EWMA >= 200 us) bypasses busy coalescing so 2-pipe fanout runs immediately.
+        // Heavy compute queue (EWMA >= 140 us) bypasses busy coalescing so 2-pipe fanout runs immediately.
         h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, None])];
         q1.note_compute_us(500);
         assert_eq!(h.defer_busy_coalesce(420_000), None);
@@ -3324,6 +3332,7 @@ harness = harness[:_scope_start] + _scope
 harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
 harness = harness.replace('__FLIGHTS_LINE__', flights_line.strip())
 harness = harness.replace('__MAX_QUEUES_LINE__', max_queues_line.strip())
+harness = harness.replace('__HEAVY_LIMITS__', ' '.join(heavy_limits))
 harness = harness.replace('__QUEUE_LIMITS_FN__', item_in(params_src, 'pub(crate) fn queue_limits()'))
 harness = harness.replace('__GPU_QUEUE_LIMITS_FN__', gpu_limits_fn)
 harness = harness.replace('__QUEUE_CREDIT_STRUCT__', item_in(queue_src, 'struct QueueCredit {'))
