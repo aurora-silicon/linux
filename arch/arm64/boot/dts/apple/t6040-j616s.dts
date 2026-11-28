@@ -195,8 +195,8 @@
 /*
  * USB4/Thunderbolt on all three Type-C ports: typec0 (left back, ACIO0),
  * typec1 (left front, ACIO1) and typec2 (right, ACIO2). The loader hands
- * each router its router, adapter and NHI tuning and its DROM over. No PCIe
- * tunnels yet: host-to-host (XDomain, thunderbolt-net) and USB4 links only.
+ * each router its router, adapter and NHI tuning and its DROM over. Each
+ * router carries its PCIe-C tunnel (t6040-pciec.dtsi).
  */
 &pmgr_cio {
 	status = "okay";
@@ -223,7 +223,6 @@
 };
 
 &usb4_0_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -259,7 +258,6 @@
 };
 
 &usb4_1_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 
@@ -295,7 +293,6 @@
 };
 
 &usb4_2_acio {
-	/delete-property/ apple,pcie-tunnel;
 	status = "okay";
 };
 

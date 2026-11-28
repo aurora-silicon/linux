@@ -215,42 +215,4 @@
 	status = "okay";
 };
 
-/* PCIe-C (tunneled PCIe) on all three Thunderbolt ports: t6040-pciec.dtsi */
-
-&usb4_0_pcie_tunnel {
-	status = "okay";
-};
-
-&apciec0_dart {
-	status = "okay";
-};
-
-&usb4_0_pcie {
-	status = "okay";
-};
-
-&usb4_1_pcie_tunnel {
-	status = "okay";
-};
-
-&apciec1_dart {
-	status = "okay";
-};
-
-&usb4_1_pcie {
-	status = "okay";
-};
-
-&usb4_2_pcie_tunnel {
-	status = "okay";
-};
-
-&apciec2_dart {
-	status = "okay";
-};
-
-&usb4_2_pcie {
-	status = "okay";
-};
-
 #include "t6040-j614s-extdisp-hdmi.dtsi"

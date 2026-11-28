@@ -2,8 +2,10 @@
 /*
  * T6040 PCIe-C (tunneled PCIe) on the three Thunderbolt ports, e.g. a
  * Studio Display's xHCI. No boot loader hands the ports over: the kernel
- * cold-initializes them. Boards enable the tunnel, DART and controller of
- * each port they wire up.
+ * cold-initializes them. The tunnels are part of the SoC and have no board
+ * wiring, so they are enabled on every T6040 (the ADT of every T6040 Mac
+ * lists apciec0-2 and dart-apciec0-2). The controller only comes up when its
+ * USB4 router, which the board enables, asks for a PCIe tunnel.
  *
  * From the ADT (macOS 26 IODeviceTree), identical for apciec0-2 and
  * dart-apciec0-2 and between the J614s and J616s:
@@ -18,6 +20,10 @@
  */
 
 #define T6040_PCIEC(n)								\
+&usb4_##n##_pcie_tunnel {							\
+	status = "okay";							\
+};										\
+										\
 &apciec##n##_dart {								\
 	apple,dma-range = <0x100 0x80004000 0x0 0x7fefc000>;			\
 	power-domains = <&ps_atc##n##_pcie>;					\
@@ -30,6 +36,7 @@
 			<0x300 0x1f31 0x1>,					\
 			<0x308 0x3ffffffc 0x10000000>,				\
 			<0x310 0x3ffffffc 0x3ffffffc>;				\
+	status = "okay";							\
 };										\
 										\
 &usb4_##n##_pcie {								\
@@ -74,6 +81,7 @@
 			       <0xb4 0x801f 0x4>,				\
 			       <0xbc 0x801f 0x4>,				\
 			       <0xc4 0x801f 0x4>;				\
+	status = "okay";							\
 };										\
 										\
 &usb4_##n##_pcie_port {								\
