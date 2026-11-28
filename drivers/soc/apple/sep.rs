@@ -3181,8 +3181,7 @@ impl SepData {
                 now
             );
             diag::attach(false);
-            diag::bringup_ended();
-            this.finish_bringup();
+            this.finish_bringup(false, false);
             return;
         }
         dev_info_ratelimited!(
@@ -3203,8 +3202,7 @@ impl SepData {
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
             );
-            diag::bringup_ended();
-            this.finish_bringup();
+            this.finish_bringup(false, false);
             return;
         }
 
@@ -3243,15 +3241,14 @@ impl SepData {
             }
         }
 
-        if this.keystore_only.load(Relaxed) {
-            this.run_keystore_bringup();
-            diag::keystore_ended();
+        let keystore_only = this.keystore_only.load(Relaxed);
+        let keystore_open = if keystore_only {
+            this.run_keystore_bringup()
         } else {
-            this.run_bringup();
-            diag::bringup_ended();
-        }
+            this.run_bringup()
+        };
+        this.finish_bringup(keystore_open, keystore_only);
         diag::log_summary(&this.dev);
-        this.finish_bringup();
         // As macOS does once the enclave is up.
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
@@ -3263,11 +3260,23 @@ impl SepData {
         Self::arm_settle(this);
     }
 
-    // Publish completion under the same lock that trusted consumers wait on.
+    // Publish completion under the same lock that trusted consumers inspect.
     // PHASE_READY ends discovery/initialisation; it is not proof of success.
-    fn finish_bringup(&self) {
+    // Store PHASE_READY before diag/keystore leaves "unknown" (and wakes
+    // poll() waiters) and before waking wait_for_trusted_ready() callers so
+    // userspace that waits on diag/keystore immediately sees the finished
+    // bring-up instead of racing into -EAGAIN.
+    fn finish_bringup(&self, keystore_open: bool, keystore_only: bool) {
         let _guard = self.endpoints.lock();
-        self.phase.store(PHASE_READY, Relaxed);
+        self.phase.store(PHASE_READY, Release);
+        if keystore_open {
+            diag::keystore_open();
+        }
+        if keystore_only {
+            diag::keystore_ended();
+        } else {
+            diag::bringup_ended();
+        }
         self.trusted_ready.notify_all();
     }
 
@@ -3335,9 +3344,26 @@ impl SepData {
         Ok(())
     }
 
-    /// Trusted-key callbacks can run as soon as probe publishes the source,
-    /// while endpoint discovery and key-store initialisation are still running.
-    /// Wait only in those consumers, leaving bringup free to establish the key.
+    /// Non-blocking readiness check for trusted-key callbacks (`tk_get_random`,
+    /// `tk_seal`, `tk_unseal`). Those run under the keyring core's global
+    /// `key_construction_mutex`, so they must fail fast with `EAGAIN` while
+    /// bring-up is still running (or the enclave is transiently gated for
+    /// sleep) instead of stalling every other key instantiation on the machine.
+    pub(crate) fn check_trusted_ready(&self) -> Result<()> {
+        let guard = self.endpoints.lock();
+        trusted::ready_state(
+            self.shutting_down.load(Relaxed),
+            self.phase.load(Acquire),
+            guard.eps.iter().any(|e| e.id == proto::EP_SKS),
+            self.sks_initialized.load(Acquire),
+            self.sleep_gate(),
+        )
+    }
+
+    /// Waits for endpoint discovery and key-store initialisation to finish.
+    /// Only for callers outside `key_construction_mutex` (sysfs
+    /// `complete_attach` and `/dev/sep-key` ioctls); trusted-key callbacks
+    /// must use [`Self::check_trusted_ready`].
     pub(crate) fn wait_for_trusted_ready(&self) -> Result<()> {
         let mut remaining = time::msecs_to_jiffies(EXCHANGE_TIMEOUT_MS);
         let mut guard = self.endpoints.lock();
@@ -3345,12 +3371,12 @@ impl SepData {
             if self.shutting_down.load(Relaxed) {
                 return Err(ENODEV);
             }
-            if self.phase.load(Relaxed) == PHASE_READY {
+            if self.phase.load(Acquire) == PHASE_READY {
                 // A completed but failed attach must not look ready.
                 if !guard.eps.iter().any(|e| e.id == proto::EP_SKS) {
                     return Err(ENODEV);
                 }
-                if !self.sks_initialized.load(Relaxed) {
+                if !self.sks_initialized.load(Acquire) {
                     return Err(EIO);
                 }
                 return Ok(());

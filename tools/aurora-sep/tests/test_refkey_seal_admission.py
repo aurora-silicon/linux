@@ -71,7 +71,7 @@ struct SepData {
     calls: Cell<usize>,
 }
 impl SepData {
-    fn wait_for_trusted_ready(&self) -> Result<()> { self.attached }
+    fn check_trusted_ready(&self) -> Result<()> { self.attached }
     fn ensure_machine_refkey(&self) -> Result<()> { self.ready }
     fn refkey_unseal_trusted(&self, blob: &[u8]) -> Result<Vec<u8>> {
         // The real unseal path takes the cache lock; mutable borrowing here
@@ -92,8 +92,10 @@ fn device(private_error: Option<u8>, bad_plaintext: Option<Vec<u8>>) -> SepData 
 #[test] fn readiness_failure_precedes_encryption_and_private_key_use() {
     ENCRYPT_ERROR.with(|v| v.set(true));
     let mut d = device(None, None);
-    d.attached = Err(110);
-    assert_eq!(d.refkey_seal_trusted(&[0x5a; 32]), Err(110));
+    for err in [11, 19, 5] {
+        d.attached = Err(err);
+        assert_eq!(d.refkey_seal_trusted(&[0x5a; 32]), Err(err));
+    }
     assert_eq!(d.calls.get(), 0);
 }
 #[test] fn usable_private_key_returns_original_ciphertext() {

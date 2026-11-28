@@ -2296,14 +2296,15 @@ impl SepData {
         ok
     }
 
-    pub(crate) fn run_bringup(&self) {
+    pub(crate) fn run_bringup(&self) -> bool {
         if self.bringup_started.xchg(true, Relaxed) {
-            return;
+            return false;
         }
         if !self.run_keystore_bringup() {
-            return;
+            return false;
         }
         self.finish_keystore_bringup();
+        true
     }
 
     pub(crate) fn run_keystore_bringup(&self) -> bool {
@@ -2331,7 +2332,6 @@ impl SepData {
                 );
             }
         }
-        diag::keystore_open();
         true
     }
 

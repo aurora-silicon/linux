@@ -334,7 +334,7 @@ impl SepData {
     }
 
     pub(crate) fn refkey_seal_trusted(&self, key: &[u8]) -> Result<KVec<u8>> {
-        self.wait_for_trusted_ready()?;
+        self.check_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let sealed = {
             let guard = self.machine_refkey.lock();
@@ -367,7 +367,7 @@ impl SepData {
     }
 
     fn refkey_unseal_cached(&self, sealed: &[u8]) -> Result<KVec<u8>> {
-        self.wait_for_trusted_ready()?;
+        self.check_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let blob = {
             let guard = self.machine_refkey.lock();
@@ -500,6 +500,8 @@ impl SepData {
 
     /// Runs `op` with the identity key bag loaded and unlocked, as a trusted
     /// key unseal does, and unloads the bag afterwards whatever `op` returns.
+    /// Called only from `/dev/sep-key` ioctls (outside `key_construction_mutex`),
+    /// so waiting for bring-up completion is safe here.
     fn with_identity_bag<T>(
         &self,
         op: impl FnOnce(crate::sks::KeyBagHandle, &[u8]) -> Result<T>,

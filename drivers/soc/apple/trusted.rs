@@ -22,6 +22,62 @@ use crate::{Secret, SepData};
 /// Rust error set, hence the literal.
 const EBADMSG: c_int = -74;
 
+/// Non-blocking readiness decision for trusted-key callbacks (`tk_get_random`,
+/// `tk_seal`, `tk_unseal`), which run under the keyring core's global
+/// `key_construction_mutex` and must not sleep waiting for SEP bring-up.
+///
+/// - `Ok(())`: bring-up finished with an initialised SKS endpoint and the
+///   enclave is awake and accepting requests.
+/// - `Err(EAGAIN)`: bring-up is still running (`phase != PHASE_READY`) or the
+///   enclave is transiently gated for system sleep (`Draining` / `Told`).
+/// - `Err(ENODEV)`: the driver is shutting down, or bring-up finished without
+///   an SKS endpoint.
+/// - `Err(EIO)`: bring-up finished with an SKS endpoint whose initialisation
+///   failed, or the enclave did not come back from sleep (`Lost`).
+pub(crate) fn ready_state(
+    shutting_down: bool,
+    phase: u32,
+    has_sks: bool,
+    sks_initialized: bool,
+    sleep_gate: crate::pm::SleepGate,
+) -> Result<()> {
+    if shutting_down {
+        return Err(ENODEV);
+    }
+    if phase != crate::PHASE_READY {
+        return Err(EAGAIN);
+    }
+    // A completed but failed attach must not look ready.
+    if !has_sks {
+        return Err(ENODEV);
+    }
+    if !sks_initialized {
+        return Err(EIO);
+    }
+    match sleep_gate {
+        crate::pm::SleepGate::Open => Ok(()),
+        crate::pm::SleepGate::Draining | crate::pm::SleepGate::Told => Err(EAGAIN),
+        crate::pm::SleepGate::Lost => Err(EIO),
+    }
+}
+
+/// Maps a post-readiness unseal error to a trusted-key errno: preserve a
+/// transient `-EAGAIN` if the enclave entered sleep after the initial check,
+/// and collapse every other rejection to one opaque `EBADMSG`.
+fn unseal_failure_errno(err: Error) -> c_int {
+    if err == EAGAIN {
+        err.to_errno()
+    } else {
+        EBADMSG
+    }
+}
+
+/// Expected early retries (`-EAGAIN`) must not warn or spend the one-shot
+/// warning budget reserved for real sealing failures.
+fn seal_should_warn(err: Error) -> bool {
+    err != EAGAIN
+}
+
 /// The framework dispatches the ops with no context pointer, so `SepData` is
 /// reached through this global. Holds the [`ForeignOwnable::into_foreign`]
 /// pointer while registered; `null` otherwise, and the cmpxchg once-guard.
@@ -106,14 +162,16 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
         let blob = match sep.refkey_seal_trusted(key) {
             Ok(blob) => blob,
             Err(e) => {
-                // Callers retry until the ref-key is up: warn once, and keep
-                // each failure for debugging.
-                kernel::do_once_lite! {
-                    dev_warn_ratelimited!(
-                        sep.dev,
-                        "trusted-keys: seal failed ({:?}); the machine ref-key may not be established yet\n",
-                        e
-                    );
+                if seal_should_warn(e) {
+                    // Callers retry until the ref-key is up: warn once, and keep
+                    // each failure for debugging.
+                    kernel::do_once_lite! {
+                        dev_warn_ratelimited!(
+                            sep.dev,
+                            "trusted-keys: seal failed ({:?}); the machine ref-key may not be established yet\n",
+                            e
+                        );
+                    }
                 }
                 dev_dbg!(sep.dev, "trusted-keys: seal failed ({:?})\n", e);
                 return e.to_errno();
@@ -156,6 +214,13 @@ unsafe extern "C" fn tk_seal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
 /// Called by the framework with a live `struct trusted_key_payload *p`.
 unsafe extern "C" fn tk_unseal(p: *mut c_void, _datablob: *mut c_char) -> c_int {
     let rc = with_sep(|sep| {
+        // Fail fast before inspecting the blob when the enclave is not yet
+        // ready, shutting down, or permanently unavailable: none of those
+        // states depend on the blob, so they are not an unseal oracle.
+        if let Err(e) = sep.check_trusted_ready() {
+            return e.to_errno();
+        }
+
         // SAFETY: `p` is a live payload; blob_len <= MAX_BLOB_SIZE bytes at p->blob.
         let blob_len = unsafe { sep_tk_blob_len(p.cast_const()) } as usize;
         // SAFETY: `p` is a live payload.
@@ -163,11 +228,12 @@ unsafe extern "C" fn tk_unseal(p: *mut c_void, _datablob: *mut c_char) -> c_int 
         // SAFETY: `blob_ptr`/`blob_len` describe `p->blob`; read-only.
         let blob = unsafe { core::slice::from_raw_parts(blob_ptr.cast_const(), blob_len) };
 
-        // Every failure past here is one opaque EBADMSG.
-        let Ok(plain) = sep.refkey_unseal_trusted(blob) else {
-            return EBADMSG;
+        // Every failure past readiness is one opaque EBADMSG, except a
+        // transient retry if the enclave entered sleep right after the check.
+        let plain = match sep.refkey_unseal_trusted(blob) {
+            Ok(plain) => Secret(plain),
+            Err(e) => return unseal_failure_errno(e),
         };
-        let plain = Secret(plain);
 
         // SAFETY: no preconditions.
         let max_key = unsafe { sep_tk_max_key_size() };
@@ -204,7 +270,7 @@ unsafe extern "C" fn tk_get_random(key: *mut u8, key_len: usize) -> c_int {
         if key_len == 0 {
             return 0;
         }
-        if let Err(e) = sep.wait_for_trusted_ready() {
+        if let Err(e) = sep.check_trusted_ready() {
             return e.to_errno();
         }
         // SAFETY: the framework guarantees `key` is writable for `key_len` bytes.
@@ -272,5 +338,104 @@ pub(crate) fn unregister() {
     if !ptr.is_null() {
         // SAFETY: `ptr` came from `into_foreign` in `register`, and no op runs now.
         drop(unsafe { <Arc<SepData> as ForeignOwnable>::from_foreign(ptr) });
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_trusted)]
+mod tests {
+    use super::*;
+    use crate::pm::SleepGate;
+    use crate::{PHASE_ATTACH, PHASE_EXCHANGE, PHASE_READY};
+
+    #[test]
+    fn not_ready_phases_return_eagain() {
+        for phase in [PHASE_ATTACH, PHASE_EXCHANGE] {
+            for has_sks in [false, true] {
+                for sks_init in [false, true] {
+                    for gate in [
+                        SleepGate::Open,
+                        SleepGate::Draining,
+                        SleepGate::Told,
+                        SleepGate::Lost,
+                    ] {
+                        assert_eq!(
+                            ready_state(false, phase, has_sks, sks_init, gate),
+                            Err(EAGAIN)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ready_and_awake_succeeds() {
+        assert_eq!(
+            ready_state(false, PHASE_READY, true, true, SleepGate::Open),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn shutting_down_returns_enodev_in_every_phase() {
+        for phase in [PHASE_ATTACH, PHASE_EXCHANGE, PHASE_READY] {
+            assert_eq!(
+                ready_state(true, phase, true, true, SleepGate::Open),
+                Err(ENODEV)
+            );
+            assert_eq!(
+                ready_state(true, phase, false, false, SleepGate::Lost),
+                Err(ENODEV)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_bringup_returns_terminal_errors() {
+        assert_eq!(
+            ready_state(false, PHASE_READY, false, false, SleepGate::Open),
+            Err(ENODEV)
+        );
+        assert_eq!(
+            ready_state(false, PHASE_READY, false, true, SleepGate::Open),
+            Err(ENODEV)
+        );
+        assert_eq!(
+            ready_state(false, PHASE_READY, true, false, SleepGate::Open),
+            Err(EIO)
+        );
+    }
+
+    #[test]
+    fn sleep_gate_distinguishes_transient_sleep_from_lost_enclave() {
+        assert_eq!(
+            ready_state(false, PHASE_READY, true, true, SleepGate::Draining),
+            Err(EAGAIN)
+        );
+        assert_eq!(
+            ready_state(false, PHASE_READY, true, true, SleepGate::Told),
+            Err(EAGAIN)
+        );
+        assert_eq!(
+            ready_state(false, PHASE_READY, true, true, SleepGate::Lost),
+            Err(EIO)
+        );
+    }
+
+    #[test]
+    fn unseal_failure_preserves_eagain_and_masks_rejections() {
+        assert_eq!(unseal_failure_errno(EAGAIN), EAGAIN.to_errno());
+        for err in [EIO, EINVAL, ENODEV, EKEYREJECTED, ENOMEM] {
+            assert_eq!(unseal_failure_errno(err), EBADMSG);
+        }
+    }
+
+    #[test]
+    fn seal_warning_suppressed_only_for_eagain() {
+        assert!(!seal_should_warn(EAGAIN));
+        for err in [EIO, ENODEV, EINVAL, ENOMEM, ETIMEDOUT] {
+            assert!(seal_should_warn(err));
+        }
     }
 }
