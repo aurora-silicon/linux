@@ -207,8 +207,9 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
-    // Not measured on this firmware.
-    render_stage_prefixes: false,
+    // Tiling and fragment kicks wait on their own prefixes, as on the A18 Pro. Measured on the
+    // M4 Max 25G83 build (ec3ced95) and on the M4 Pro (J616s).
+    render_stage_prefixes: true,
     ray_traversal: true,
     // Not measured on this firmware.
     traversal_exclusion: false,
@@ -259,6 +260,8 @@ pub(crate) const V25F84: Variant = Variant {
     compute: super::compute::ComputeProgram::V25F84,
     opening_record: false,
     split_firmware_area: true,
+    // Not measured on 25F84 or on 26B123, which inherits this.
+    render_stage_prefixes: false,
     ..V25G83
 };
 
