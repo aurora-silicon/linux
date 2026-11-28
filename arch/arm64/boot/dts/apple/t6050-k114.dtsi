@@ -20,7 +20,7 @@
 /*
  * ANE_SYS's declared suppliers are the fabric domains: enabled the way
  * the J714s enables them (t6050-j714s.dts for fab8/fab0,
- * t6050-j716c-isp.dtsi for fab9). Left disabled they never register a
+ * t6050-isp.dtsi for fab9). Left disabled they never register a
  * provider and the enabled ps_ane_sys defers forever, taking ane0 and its
  * three DARTs with it.
  */
