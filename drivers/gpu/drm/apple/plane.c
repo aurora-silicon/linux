@@ -280,9 +280,12 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
 
+	struct apple_plane_state *apple_state = to_apple_plane_state(new_plane_state);
+	struct platform_device *pdev = to_apple_crtc(new_plane_state->crtc)->dcp;
+	struct apple_dcp *target = pdev ? platform_get_drvdata(pdev) : NULL;
+	int min_scale = FRAC_16_16(1, 2);
+
 	{
-		struct platform_device *pdev = to_apple_crtc(new_plane_state->crtc)->dcp;
-		struct apple_dcp *target = pdev ? platform_get_drvdata(pdev) : NULL;
 		struct drm_framebuffer *fb = new_plane_state->fb;
 
 		if (target && dcp_is_ext26(target) && fb && !iomfb_ext26_backing_fresh(target, fb))
@@ -301,6 +304,19 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 			return -EINVAL;
 	}
 
+	if (target && dcp_mode_panel_view(target, &crtc_state->mode, &apple_state->panel_view)) {
+		const struct dcp_panel_view *v = &apple_state->panel_view;
+		u64 sx = DIV_ROUND_UP_ULL((u64)v->dst_w << 15, v->mode_w);
+		u64 sy = DIV_ROUND_UP_ULL((u64)v->dst_h << 15, v->mode_h);
+
+		min_scale = (int)max_t(u64, sx, sy);
+		apple_state->has_panel_view =
+			v->dst_x || v->dst_y || v->dst_w != v->mode_w || v->dst_h != v->mode_h;
+	} else {
+		memset(&apple_state->panel_view, 0, sizeof(apple_state->panel_view));
+		apple_state->has_panel_view = false;
+	}
+
 	/*
 	 * DCP limits downscaling to 2x and upscaling to 4x. Attempting to
 	 * scale outside these bounds errors out when swapping.
@@ -314,7 +330,7 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	 * hardware will fill in zeroes (black).
 	 */
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
-						  FRAC_16_16(1, 2),
+						  min_scale,
 						  FRAC_16_16(4, 1),
 						  true, true);
 	if (ret < 0)
@@ -508,6 +524,20 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 
 	new_state->src_rect = drm_to_dcp_rect_fp(&base->src);
 	new_state->dst_rect = drm_to_dcp_rect(&base->dst);
+	if (new_state->has_panel_view) {
+		const struct dcp_panel_view *v = &new_state->panel_view;
+		u32 x1 = DIV_ROUND_CLOSEST_ULL((u64)base->dst.x1 * v->dst_w, v->mode_w);
+		u32 x2 = DIV_ROUND_CLOSEST_ULL((u64)base->dst.x2 * v->dst_w, v->mode_w);
+		u32 y1 = DIV_ROUND_CLOSEST_ULL((u64)base->dst.y1 * v->dst_h, v->mode_h);
+		u32 y2 = DIV_ROUND_CLOSEST_ULL((u64)base->dst.y2 * v->dst_h, v->mode_h);
+
+		new_state->dst_rect = (struct dcp_rect){
+			.x = v->dst_x + x1,
+			.y = v->dst_y + y1,
+			.w = x2 - x1,
+			.h = y2 - y1,
+		};
+	}
 
 	new_state->surf = (struct dcp_surface){
 		.is_premultiplied = is_premultiplied,
@@ -687,6 +717,8 @@ apple_plane_duplicate_state(struct drm_plane *plane)
 	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
 	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
 	apple_plane_state->iova = old_apple_plane_state->iova;
+	apple_plane_state->panel_view = old_apple_plane_state->panel_view;
+	apple_plane_state->has_panel_view = old_apple_plane_state->has_panel_view;
 
 	return &apple_plane_state->base;
 }

@@ -1018,6 +1018,8 @@ static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_conne
 { (void)c;assert(d->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP); }
 '''+firmware_lineage(root)+internal_inline(root,'dcp_fw_is_14_7')+r'''/* Off T6030 machines the direct crossbar output is not clocked separately. */
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
+static unsigned int __attribute__((unused)) dcp_panel_view_add_modes(struct apple_dcp *d,struct drm_connector *c,const struct dcp_display_mode *m,unsigned int n) { (void)d;(void)c;(void)m;(void)n;return 0; }
+static const struct dcp_display_mode * __attribute__((unused)) dcp_panel_view_find(struct apple_dcp *d,const struct dcp_display_mode *m,unsigned int n,const struct drm_display_mode *mode) { (void)d;(void)m;(void)n;(void)mode;return NULL; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [
         'static void dcpavserv_notify_edid(', 'static bool dcpavserv_hdr_class(',

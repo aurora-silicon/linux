@@ -32,6 +32,8 @@ struct apple_plane_state {
 	struct dcp_rect dst_rect;
 	u64 iova;
 	struct dcp_fb_reference *retirement;
+	struct dcp_panel_view panel_view;
+	bool has_panel_view;
 };
 
 #define to_apple_plane_state(x) container_of(x, struct apple_plane_state, base)

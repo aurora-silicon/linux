@@ -179,4 +179,14 @@ struct dcp_surface {
 	u32 unk_denom;
 } __packed;
 
+/* Scaled sub-rectangle on an internal panel backing a smaller DRM mode. */
+struct dcp_panel_view {
+	u32 mode_w;
+	u32 mode_h;
+	u32 dst_x;
+	u32 dst_y;
+	u32 dst_w;
+	u32 dst_h;
+};
+
 #endif /* __APPLE_IOMFB_PLANE_H__ */

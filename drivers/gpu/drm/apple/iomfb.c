@@ -13,6 +13,7 @@
 #include <linux/iommu.h>
 #include <linux/kref.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/ratelimit.h>
@@ -2352,6 +2353,246 @@ bool dcp_modes_for_connector(struct apple_dcp *dcp,
 	return dcp->modes_admitted && READ_ONCE(dcp->connector) == connector;
 }
 
+static bool panel_views = true;
+module_param(panel_views, bool, 0444);
+MODULE_PARM_DESC(panel_views,
+		 "Offer modes smaller than the internal panel, shown on a part of it (default: on)");
+
+#define DCP_PANEL_VIEW_MAX_SIZES 8
+
+struct dcp_panel_view_size {
+	u32 w;
+	u32 h;
+};
+
+static bool dcp_is_j716c(void)
+{
+	static int j716c = -1;
+
+	if (j716c < 0) {
+		static const char *const match[] = { "apple,j716c", NULL };
+
+		j716c = of_machine_compatible_match(match) ? 1 : 0;
+	}
+	return j716c == 1;
+}
+
+static bool dcp_panel_views_enabled(struct apple_dcp *dcp)
+{
+	return panel_views &&
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP &&
+	       !dcp->notch_height &&
+	       dcp_is_j716c();
+}
+
+static u32 dcp_panel_view_notch(struct apple_dcp *dcp)
+{
+	if (dcp->notch_height)
+		return dcp->notch_height;
+	return dcp_is_j716c() ? 74 : 0;
+}
+
+static bool dcp_panel_view_fit(u32 panel_w, u32 panel_h, u32 notch,
+			       u32 mode_w, u32 mode_h,
+			       struct dcp_panel_view *view)
+{
+	u32 avail_h, dst_w, dst_h;
+	u64 a, b;
+
+	if (!panel_w || !panel_h || panel_h <= notch || !mode_w || !mode_h)
+		return false;
+	if (mode_w == panel_w && mode_h == panel_h)
+		return false;
+
+	avail_h = panel_h - notch;
+	if (mode_w > panel_w || mode_h > avail_h)
+		return false;
+
+	a = (u64)mode_w * avail_h;
+	b = (u64)mode_h * panel_w;
+	if (a < b) {
+		dst_w = min_t(u64, DIV_ROUND_CLOSEST_ULL(a, mode_h), panel_w);
+		dst_h = avail_h;
+	} else {
+		dst_w = panel_w;
+		dst_h = min_t(u64, DIV_ROUND_CLOSEST_ULL(b, mode_w), avail_h);
+	}
+
+	if (dst_w > 2 * mode_w || dst_h > 2 * mode_h)
+		return false;
+
+	if (view) {
+		view->mode_w = mode_w;
+		view->mode_h = mode_h;
+		view->dst_x = (panel_w - dst_w) / 2;
+		view->dst_y = max(notch, (panel_h - dst_h) / 2);
+		view->dst_w = dst_w;
+		view->dst_h = dst_h;
+	}
+	return true;
+}
+
+static unsigned int dcp_panel_view_sizes(u32 panel_w, u32 panel_h, u32 notch,
+					 struct dcp_panel_view_size out[DCP_PANEL_VIEW_MAX_SIZES])
+{
+	static const struct dcp_panel_view_size common[] = {
+		{ 2560, 1600 },
+		{ 2560, 1440 },
+		{ 1920, 1200 },
+		{ 1920, 1080 },
+		{ 1728, 1080 },
+	};
+	struct dcp_panel_view_size cand[DCP_PANEL_VIEW_MAX_SIZES];
+	unsigned int ncand = 0, nout = 0, i, j;
+
+	if (notch && panel_h > notch) {
+		cand[ncand].w = panel_w;
+		cand[ncand].h = panel_h - notch;
+		ncand++;
+	}
+	if ((panel_w & 0xf) == 0) {
+		cand[ncand].w = panel_w;
+		cand[ncand].h = (panel_w >> 1) + (panel_w >> 4);
+		ncand++;
+	}
+	for (i = 0; i < ARRAY_SIZE(common) && ncand < ARRAY_SIZE(cand); i++)
+		cand[ncand++] = common[i];
+
+	for (i = 0; i < ncand && nout < DCP_PANEL_VIEW_MAX_SIZES; i++) {
+		if (!dcp_panel_view_fit(panel_w, panel_h, notch,
+					cand[i].w, cand[i].h, NULL))
+			continue;
+		for (j = 0; j < nout; j++) {
+			if (out[j].w == cand[i].w && out[j].h == cand[i].h)
+				break;
+		}
+		if (j == nout)
+			out[nout++] = cand[i];
+	}
+	return nout;
+}
+
+static bool dcp_panel_view_offered(u32 panel_w, u32 panel_h, u32 notch,
+				   u32 mode_w, u32 mode_h)
+{
+	struct dcp_panel_view_size sizes[DCP_PANEL_VIEW_MAX_SIZES];
+	unsigned int n, i;
+
+	n = dcp_panel_view_sizes(panel_w, panel_h, notch, sizes);
+	for (i = 0; i < n; i++) {
+		if (sizes[i].w == mode_w && sizes[i].h == mode_h)
+			return true;
+	}
+	return false;
+}
+
+static int dcp_panel_view_native(struct apple_dcp *dcp,
+				 const struct dcp_display_mode *modes,
+				 unsigned int count)
+{
+	int best = -1;
+	u64 best_area = 0;
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		const struct drm_display_mode *m = &modes[i].mode;
+		u64 area;
+
+		if (modes[i].automatic_rgb8_quirk)
+			continue;
+		if (dcp->hw.only_120hz_modes && drm_mode_vrefresh(m) != 120)
+			continue;
+		area = (u64)m->hdisplay * m->vdisplay;
+		if (best < 0 || area > best_area) {
+			best = i;
+			best_area = area;
+		}
+	}
+	return best;
+}
+
+static int dcp_panel_view_lookup(struct apple_dcp *dcp,
+				 const struct dcp_display_mode *modes,
+				 unsigned int count,
+				 const struct drm_display_mode *mode)
+{
+	const struct drm_display_mode *base;
+	int best;
+
+	if (!dcp_panel_views_enabled(dcp) || !count)
+		return -1;
+
+	best = dcp_panel_view_native(dcp, modes, count);
+	if (best < 0)
+		return -1;
+
+	base = &modes[best].mode;
+	if (mode->clock != base->clock ||
+	    mode->hsync_start != base->hsync_start ||
+	    mode->hsync_end != base->hsync_end ||
+	    mode->htotal != base->htotal ||
+	    mode->hskew != base->hskew ||
+	    mode->vsync_start != base->vsync_start ||
+	    mode->vsync_end != base->vsync_end ||
+	    mode->vtotal != base->vtotal ||
+	    mode->vscan != base->vscan)
+		return -1;
+
+	if (!dcp_panel_view_offered(base->hdisplay, base->vdisplay,
+				    dcp_panel_view_notch(dcp),
+				    mode->hdisplay, mode->vdisplay))
+		return -1;
+
+	return best;
+}
+
+static unsigned int dcp_panel_view_add_modes(struct apple_dcp *dcp,
+					     struct drm_connector *connector,
+					     const struct dcp_display_mode *modes,
+					     unsigned int nr_modes)
+{
+	const struct drm_display_mode *base;
+	struct dcp_panel_view_size views[DCP_PANEL_VIEW_MAX_SIZES];
+	unsigned int n_views, added = 0, j;
+	int base_idx;
+
+	if (!dcp_panel_views_enabled(dcp))
+		return 0;
+
+	base_idx = dcp_panel_view_native(dcp, modes, nr_modes);
+	if (base_idx < 0)
+		return 0;
+
+	base = &modes[base_idx].mode;
+	n_views = dcp_panel_view_sizes(base->hdisplay, base->vdisplay,
+				       dcp_panel_view_notch(dcp), views);
+	for (j = 0; j < n_views; j++) {
+		struct drm_display_mode *mode = drm_mode_duplicate(connector->dev, base);
+
+		if (!mode)
+			break;
+		mode->hdisplay = views[j].w;
+		mode->vdisplay = views[j].h;
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+		added++;
+	}
+	return added;
+}
+
+static const struct dcp_display_mode *
+dcp_panel_view_find(struct apple_dcp *dcp,
+		    const struct dcp_display_mode *modes,
+		    unsigned int count,
+		    const struct drm_display_mode *mode)
+{
+	int pv = dcp_panel_view_lookup(dcp, modes, count, mode);
+
+	return pv >= 0 ? &modes[pv] : NULL;
+}
+
 /*
  * Retained arrays are not freed while mode readers can still refer to them.
  * With @connector, only the connector that owns the admitted catalog sees it.
@@ -3013,6 +3254,8 @@ edid_done:
 		}
 		vrr_capable |= modes[i].vrr;
 	}
+	if (published)
+		published += dcp_panel_view_add_modes(dcp, connector, modes, nr_modes);
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 modes_done:
 	mutex_unlock(&dcp->dcpavserv.lock);
@@ -3606,7 +3849,7 @@ dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 		}
 	}
 
-	return NULL;
+	return dcp_panel_view_find(dcp, modes, count, mode);
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
@@ -3621,6 +3864,27 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 	if (out)
 		*out = *found;
 	return true;
+}
+
+bool dcp_mode_panel_view(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+			 struct dcp_panel_view *view)
+{
+	struct dcp_display_mode *modes;
+	unsigned int count;
+	int best;
+
+	if (!dcp_panel_views_enabled(dcp))
+		return false;
+
+	modes = dcp_modes_snapshot(dcp, NULL, &count);
+	best = dcp_panel_view_lookup(dcp, modes, count, mode);
+	if (best < 0)
+		return false;
+
+	return dcp_panel_view_fit(modes[best].mode.hdisplay,
+				  modes[best].mode.vdisplay,
+				  dcp_panel_view_notch(dcp),
+				  mode->hdisplay, mode->vdisplay, view);
 }
 
 /*

@@ -149,6 +149,8 @@ bool dcp_crtc_needs_route_start(struct apple_dcp *dcp);
 bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_commit *commit,
 			  bool fresh);
 bool dcp_has_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+bool dcp_mode_panel_view(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+			 struct dcp_panel_view *view);
 bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
