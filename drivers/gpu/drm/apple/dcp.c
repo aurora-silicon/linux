@@ -9550,6 +9550,9 @@ static int dcp_platform_prepare(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
 
+	if (READ_ONCE(dcp->sleep_cold_stopped))
+		return 0;
+
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
 		dcp_v27_sleep_invalidate(dcp);
 		return 0;
@@ -9605,7 +9608,7 @@ static void dcp_platform_complete(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	/* The iBoot interface's display stays powered across system sleep. */
-	if (dcp_is_iboot(dcp))
+	if (dcp_is_iboot(dcp) || READ_ONCE(dcp->sleep_cold_stopped))
 		return;
 	if (dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->ext26_pm_preparing, false);
@@ -11218,10 +11221,9 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 }
 
 /*
- * Internal 26.6 DCP firmware stops cold when firmware-driven deep sleep will
- * cut display power, because there is no cold-restart path for it yet. In a
- * sleep dry run the coprocessor is left running and takes the ordinary suspend
- * path instead.
+ * Internal 26.6 DCP firmware stops and restarts warm across firmware-driven
+ * deep sleep. In a sleep dry run the coprocessor is left running and takes
+ * the ordinary suspend path instead.
  */
 static bool dcp_sleep_owned(struct apple_dcp *dcp)
 {
@@ -11234,8 +11236,7 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	/* Whichever of this and the display subsystem suspends first: nothing commits to it. */
-	return READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->sleep_cold_stopped) ||
-	       (pm_suspend_via_firmware() && dcp_sleep_owned(dcp));
+	return READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->sleep_cold_stopped);
 }
 
 #include "dcp-v27-sleep.inc"
@@ -11356,26 +11357,44 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (READ_ONCE(dcp->sleep_cold_stopped))
 		return 0;
-	if (pm_suspend_via_firmware() && dcp_sleep_owned(dcp)) {
-		u32 control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-		struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
+	if (pm_suspend_via_firmware() && dcp_sleep_owned(dcp))
+		return dcp_v26_sleep_suspend(dcp);
+	if (pm_suspend_via_firmware() && dcp_is_ext26(dcp) &&
+	    IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run()) {
+		u32 ctrl;
 
-		dev_warn(dev, "display coprocessor stopped cold for sleep (control %#x); panel stays off until reboot\n",
-			 control);
 		WRITE_ONCE(dcp->quiescing, true);
-		/*
-		 * Run the 26.6 firmware's panel-off and sleep-entry calls, then
-		 * request RTKit AP and IOP idle before halting the coprocessor.
-		 */
-		dcp_v26_sleep_calls(dcp, 2);
-		if (!IS_ERR_OR_NULL(rtk)) {
-			int ret = apple_rtkit_idle_with(rtk, dcp_secure_port_idle, dcp);
-
-			if (ret)
-				dev_warn(dev, "RTKit idle before cold stop failed: %d\n", ret);
-		}
+		WRITE_ONCE(dcp->ext26_blocked, true);
+		dcp_drain_for_sleep(dcp);
+		cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+		iomfb_pause_presentation(dcp, true);
+		iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+		if (!IS_ERR_OR_NULL(dcp->rtk))
+			apple_rtkit_mailbox_off(dcp->rtk);
+		WRITE_ONCE(dcp->crashed, true);
+		WRITE_ONCE(dcp->s2r_fw_down, true);
 		WRITE_ONCE(dcp->sleep_cold_stopped, true);
 		dcp_s2r_cpu_stop(dcp);
+		readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL, ctrl,
+				   !(ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN), 100, 10000);
+		dcp_s2r_find_darts(dcp);
+		if (dcp->s2r_disp_dart) {
+			u32 mask = apple_dart_enabled_streams(dcp->s2r_disp_dart);
+
+			if (mask)
+				apple_dart_display_streams(dcp->s2r_disp_dart, mask, false, true);
+			apple_dart_power_dark(dcp->s2r_disp_dart, true);
+		}
+		if (dcp->s2r_dcp_dart) {
+			u32 mask = apple_dart_enabled_streams(dcp->s2r_dcp_dart);
+
+			if (mask)
+				apple_dart_display_streams(dcp->s2r_dcp_dart, mask, false, true);
+			apple_dart_power_dark(dcp->s2r_dcp_dart, true);
+		}
+		dcp_s2r_put_darts(dcp);
+		dev_info(dev, "external display coprocessor stopped for sleep (ctrl=%#x)\n", ctrl);
 		return 0;
 	}
 
@@ -11420,7 +11439,9 @@ static int dcp_platform_suspend(struct device *dev)
 			dcp_sleep_hold_phys(dcp);
 		return 0;
 	}
-	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&
+	    !(IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && pm_suspend_via_firmware() &&
+	      apple_sleep_dry_run())) {
 		dev_warn(dev, "native26 refuses non-s2idle target %d\n", pm_suspend_target_state);
 		return -EBUSY;
 	}
@@ -11548,6 +11569,9 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
 		return dcp_v27_sleep_resume(dcp);
+
+	if (dcp_v26_sleep_stopped(dcp))
+		return dcp_v26_sleep_resume(dcp);
 
 	/* Stopped cold, with no restart path until reboot. */
 	if (READ_ONCE(dcp->sleep_cold_stopped))

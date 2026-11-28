@@ -117,6 +117,25 @@ void dcp_v26_link_fail(struct dcp_v26_link *link)
 	complete(&link->ready);
 }
 
+/* Clears transient RPC/callback state before a warm restart; keeps the RPC mapping. */
+void dcp_v26_link_reset(struct dcp_v26_link *link)
+{
+	struct dcp_v26_event *e, *tmp;
+
+	mutex_lock(&link->lock);
+	list_for_each_entry_safe(e, tmp, &link->events, list) {
+		list_del(&e->list);
+		kfree(e);
+	}
+	link->event_count = 0;
+	link->callback_count = 0;
+	link->callback_depth = 0;
+	memset(link->calls, 0, sizeof(link->calls));
+	memset(link->callbacks, 0, sizeof(link->callbacks));
+	link->failed = false;
+	mutex_unlock(&link->lock);
+}
+
 bool dcp_v26_link_failed(struct dcp_v26_link *link)
 {
 	return READ_ONCE(link->failed);

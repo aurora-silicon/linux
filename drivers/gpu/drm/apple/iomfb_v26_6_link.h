@@ -87,6 +87,7 @@ struct dcp_v26_link {
 void dcp_v26_link_init(struct dcp_v26_link *link, struct device *dev,
 		       struct apple_rtkit *rtk);
 int dcp_v26_link_start(struct dcp_v26_link *link);
+void dcp_v26_link_reset(struct dcp_v26_link *link);
 void dcp_v26_link_receive(struct dcp_v26_link *link, u64 message);
 void dcp_v26_link_fail(struct dcp_v26_link *link);
 bool dcp_v26_link_failed(struct dcp_v26_link *link);

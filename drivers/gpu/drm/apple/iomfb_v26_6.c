@@ -37,6 +37,8 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
+#include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -47,7 +49,9 @@
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -58,12 +62,14 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "dcp-lifecycle.h"
+#include "iomfb.h"
 #include "iomfb_internal.h"
 #include "iomfb_v26_6.h"
 #include "j613-25g83.h"
@@ -78,7 +84,17 @@
 #define DCP_V26_J613_FIRMWARE_UUID "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"
 
 #define DCP_V26_CPU_CONTROL	0x44
+#define DCP_V26_CPU_CONTROL_RUN	BIT(4)
 #define DCP_V26_CPU_STATUS	0x48
+#define DCP_V26_CPU_STATUS_STOPPED BIT(1)
+#define DCP_V26_CPU_STATUS_IDLE	BIT(5)
+
+#define DCP_V26_T8122_PS_DISP_SYS	0x1d8
+#define DCP_V26_T8122_PS_DISP_FE	0x208
+#define DCP_V26_T8122_PS_DISP_CPU	0x10000
+#define DCP_V26_T8122_PWRGATE_DISP_A	0xcac
+#define DCP_V26_T8122_PWRGATE_DISP_B	0xcd0
+#define DCP_V26_T8122_PWRGATE_DISP_C	0xcf0
 #define DCP_V26_MAX_PROPERTIES	256
 #define DCP_V26_MAX_RAW		32
 #define DCP_V26_MAX_RAW_BYTES	SZ_8M
@@ -203,6 +219,14 @@ struct apple_dcp_v26 {
 	struct work_struct idle_work;
 	bool failed;
 	bool started;
+	bool paused;
+	bool s2r_stopped;
+	bool s2r_waking;
+	bool wake_plugged;
+	bool wake_d572_on;
+	bool boot_ps_valid;
+	u32 boot_ps[3];
+	u32 boot_pg[3];
 
 	/* Boot framebuffer and native panel timing (notch rows included). */
 	u32 stride;
@@ -512,6 +536,9 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	int ret;
 
 #define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	if (v26->s2r_waking)
+		dev_dbg(v26->dev, "26.6 S2R wake callback %#x (%u/%u)\n",
+			tag, in_size, out_size);
 	/* The transport zeroes output, so absent optional metadata stays absent. */
 	if (tag == D(114) && SHAPE(4164, 4100)) {
 		/* J613 CoreAnalyticsSendEvent: name[64], serialized dictionary[4096],
@@ -548,8 +575,10 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 		return 0;
 	}
 	if (tag == D(575) && SHAPE(88, 76)) {
-		if (!(in[84] & 1))
+		if (!(in[84] & 1)) {
 			memcpy(out, in + 8, 76);
+			v26->wake_plugged = true;
+		}
 		return 0;
 	}
 	if (tag == D(576) && SHAPE(4, 0))
@@ -560,11 +589,16 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	 * answer them: a no-op (D2), swap_complete_intent_gated (D592, a no-op),
 	 * powerUpDART (D572, success) and get_calendar_time_ms (D209).
 	 */
-	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(592) && SHAPE(20, 0)))
+	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(592) && SHAPE(20, 0)) ||
+	    (tag == D(594) && SHAPE(4, 0)))
 		return 0;
 	if (tag == D(572) && SHAPE(4, 4)) {
+		u32 on = get_unaligned_le32(in);
+
+		if (on)
+			v26->wake_d572_on = true;
 		if (v26->dcp)
-			dcp_s2r_dart_power(v26->dcp, get_unaligned_le32(in));
+			dcp_s2r_dart_power(v26->dcp, on);
 		memset(out, 0, 4);
 		return 0;
 	}
@@ -608,6 +642,8 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 			return ret;
 		kvfree(v26->chunk);
 		v26->chunk = NULL;
+		if (!strcmp(in, "PreferredTimingElements"))
+			v26->wake_plugged = true;
 		dev_info(v26->dev, "J613 property %.64s: %u bytes\n", in, v26->chunk_size);
 		out[0] = 1;
 		return 0;
@@ -795,7 +831,7 @@ static void dcp_v26_idle(struct work_struct *work)
 	int ret = 0;
 
 	mutex_lock(&v26->lock);
-	while (!v26->failed && !ret)
+	while (!v26->failed && !v26->paused && !ret)
 		ret = dcp_v26_link_pump(&v26->link, 0, dcp_v26_callback, v26);
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v26->failed = true;
@@ -1606,6 +1642,11 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 		return -ENOMEM;
 
 	mutex_lock(&v26->lock);
+	if (v26->paused) {
+		mutex_unlock(&v26->lock);
+		kfree(swap);
+		return -EAGAIN;
+	}
 	rec.surface = !!surface;
 	rec.start = ktime_get();
 	ret = dcp_v26_ctm_locked(v26, ctm_state);
@@ -1661,7 +1702,7 @@ static bool dcp_v26_present(struct apple_dcp_v26 *v26, struct drm_framebuffer *f
 	ktime_t completed;
 	int ret;
 
-	if (READ_ONCE(v26->failed))
+	if (READ_ONCE(v26->failed) || READ_ONCE(v26->paused))
 		return false;
 	if (fb) {
 		drm_framebuffer_get(fb);
@@ -1674,6 +1715,11 @@ static bool dcp_v26_present(struct apple_dcp_v26 *v26, struct drm_framebuffer *f
 			   fb ? fb->height : 0, dst_y, &completed, ctm_state);
 	elapsed = ktime_get_ns() - start;
 	if (ret) {
+		if (ret == -EAGAIN) {
+			if (fb)
+				drm_framebuffer_put(fb);
+			return false;
+		}
 		/* Either framebuffer may still be scanned out: keep both. */
 		dev_err(v26->dev, "native DCP flip failed %d; buffers pinned until reboot\n", ret);
 		return false;
@@ -1861,6 +1907,7 @@ out:
 static int dcp_v26_backlight_update(struct backlight_device *bd)
 {
 	struct apple_dcp_v26 *v26 = bl_get_data(bd);
+	bool paused = false;
 	int ret = 0;
 
 	mutex_lock(&v26->lock);
@@ -1871,9 +1918,10 @@ static int dcp_v26_backlight_update(struct backlight_device *bd)
 		v26->bl_nits = backlight_get_brightness(bd);
 		v26->bl_owned = true;
 		dcp_v26_brightness_changed(v26);
+		paused = v26->paused;
 	}
 	mutex_unlock(&v26->lock);
-	if (ret)
+	if (ret || paused)
 		return ret;
 
 	if (wait_event_timeout(v26->bl_wait, !READ_ONCE(v26->bl_pending), DCP_V26_BL_FLIP_WAIT))
@@ -1985,7 +2033,7 @@ int dcp_v26_sleep_calls(struct apple_dcp *dcp, int groups)
 	if (!v26 || !v26->started)
 		return -ENODEV;
 	mutex_lock(&v26->lock);
-	if (groups >= 2) {
+	if (groups == 0 || groups >= 2) {
 		ret = dcp_v26_sleep_call(v26, A(414), zero16, 8, one8, 8, &same);
 		if (!ret)
 			ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
@@ -2003,16 +2051,18 @@ int dcp_v26_sleep_calls(struct apple_dcp *dcp, int groups)
 			ret = dcp_v26_sleep_call(v26, A(500), a500_off, 4, NULL, 0, &same);
 		dev_dbg(v26->dev, "panel-off calls before sleep: %d\n", ret);
 	}
-	if (!ret)
-		ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
-	if (!ret)
-		ret = dcp_v26_sleep_call(v26, A(476), one, 4, NULL, 0, &same);
-	if (!ret)
-		ret = dcp_v26_sleep_call(v26, A(473), a473_entry, 16, zero16, 8, &same);
-	if (!ret)
-		ret = dcp_v26_sleep_call(v26, A(115), NULL, 0, zero16, 4, &same);
-	if (!ret)
-		ret = dcp_v26_sleep_call(v26, A(500), a500_entry, 4, NULL, 0, &same);
+	if (groups >= 1) {
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(476), one, 4, NULL, 0, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(473), a473_entry, 16, zero16, 8, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(115), NULL, 0, zero16, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(500), a500_entry, 4, NULL, 0, &same);
+	}
 	mutex_unlock(&v26->lock);
 	if (!ret && !same)
 		ret = -EPROTO;
@@ -2024,4 +2074,578 @@ int dcp_v26_sleep_calls(struct apple_dcp *dcp, int groups)
 struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp)
 {
 	return dcp->v26 ? dcp->v26->rtk : NULL;
+}
+
+bool dcp_v26_sleep_stopped(struct apple_dcp *dcp)
+{
+	return dcp->v26 && READ_ONCE(dcp->v26->s2r_stopped);
+}
+
+static struct device *dcp_v26_find_dart_node(struct device_node *np)
+{
+	struct device_node *dart;
+	struct platform_device *pdev;
+
+	if (!np)
+		return NULL;
+	dart = of_parse_phandle(np, "iommus", 0);
+	if (!dart)
+		return NULL;
+	pdev = of_find_device_by_node(dart);
+	of_node_put(dart);
+	return pdev ? &pdev->dev : NULL;
+}
+
+static void dcp_v26_put_darts(struct apple_dcp *dcp)
+{
+	if (dcp->s2r_dcp_dart)
+		put_device(dcp->s2r_dcp_dart);
+	if (dcp->s2r_disp_dart)
+		put_device(dcp->s2r_disp_dart);
+	dcp->s2r_dcp_dart = NULL;
+	dcp->s2r_disp_dart = NULL;
+}
+
+static void dcp_v26_find_darts(struct apple_dcp *dcp)
+{
+	struct device_node *piodma, *disp;
+
+	dcp_v26_put_darts(dcp);
+	dcp->s2r_dcp_dart = dcp_v26_find_dart_node(dcp->dev->of_node);
+	piodma = of_get_child_by_name(dcp->dev->of_node, "piodma");
+	if (piodma) {
+		dcp->s2r_disp_dart = dcp_v26_find_dart_node(piodma);
+		of_node_put(piodma);
+	}
+	if (!dcp->s2r_disp_dart) {
+		disp = of_find_node_by_path("disp0");
+		if (disp) {
+			dcp->s2r_disp_dart = dcp_v26_find_dart_node(disp);
+			of_node_put(disp);
+		}
+	}
+	if (!dcp->s2r_dt_layout_ok) {
+		if (dcp->s2r_dcp_dart)
+			dcp->s2r_dt_layout.dcp_streams =
+				apple_dart_enabled_streams(dcp->s2r_dcp_dart);
+		if (dcp->s2r_disp_dart)
+			dcp->s2r_dt_layout.disp_streams =
+				apple_dart_enabled_streams(dcp->s2r_disp_dart);
+		if (dcp->s2r_dt_layout.dcp_streams && dcp->s2r_dt_layout.disp_streams) {
+			dcp->s2r_dt_layout_ok = true;
+			dev_dbg(dcp->dev, "26.6 S2R DART streams: dcp=%#x disp=%#x\n",
+				dcp->s2r_dt_layout.dcp_streams,
+				dcp->s2r_dt_layout.disp_streams);
+		}
+	}
+}
+
+static int dcp_v26_t8122_map_power(void __iomem **ps, void __iomem **pwrgate)
+{
+	struct device_node *np;
+	int ps_idx, pg_idx;
+
+	*ps = NULL;
+	*pwrgate = NULL;
+	np = of_find_compatible_node(NULL, NULL, "apple,t8122-sleep");
+	if (!np)
+		return -ENODEV;
+	ps_idx = of_property_match_string(np, "reg-names", "ps");
+	pg_idx = of_property_match_string(np, "reg-names", "pwrgate");
+	if (ps_idx >= 0)
+		*ps = of_iomap(np, ps_idx);
+	if (pg_idx >= 0)
+		*pwrgate = of_iomap(np, pg_idx);
+	of_node_put(np);
+	if (!*ps || !*pwrgate) {
+		if (*ps)
+			iounmap(*ps);
+		if (*pwrgate)
+			iounmap(*pwrgate);
+		*ps = NULL;
+		*pwrgate = NULL;
+		return -ENODEV;
+	}
+	return 0;
+}
+
+static void dcp_v26_t8122_save_boot_ps(struct apple_dcp_v26 *v26)
+{
+	void __iomem *ps, *pwrgate;
+
+	if (v26->boot_ps_valid)
+		return;
+	if (dcp_v26_t8122_map_power(&ps, &pwrgate))
+		return;
+	v26->boot_ps[0] = readl(ps + DCP_V26_T8122_PS_DISP_SYS);
+	v26->boot_ps[1] = readl(ps + DCP_V26_T8122_PS_DISP_FE);
+	v26->boot_ps[2] = readl(ps + DCP_V26_T8122_PS_DISP_CPU);
+	v26->boot_pg[0] = readl(pwrgate + DCP_V26_T8122_PWRGATE_DISP_A);
+	v26->boot_pg[1] = readl(pwrgate + DCP_V26_T8122_PWRGATE_DISP_B);
+	v26->boot_pg[2] = readl(pwrgate + DCP_V26_T8122_PWRGATE_DISP_C);
+	v26->boot_ps_valid = true;
+	iounmap(ps);
+	iounmap(pwrgate);
+	dev_dbg(v26->dev, "26.6 S2R boot power: SYS=%#x FE=%#x CPU=%#x PG=%#x/%#x/%#x\n",
+		v26->boot_ps[0], v26->boot_ps[1], v26->boot_ps[2],
+		v26->boot_pg[0], v26->boot_pg[1], v26->boot_pg[2]);
+}
+
+static int dcp_v26_t8122_domains_on(struct apple_dcp_v26 *v26)
+{
+	void __iomem *ps, *pwrgate;
+	u32 v, cur;
+	int ret;
+
+	ret = dcp_v26_t8122_map_power(&ps, &pwrgate);
+	if (ret)
+		return ret;
+
+	/*
+	 * If DISP_CPU is already powered (either after a refused sleep or
+	 * brought back before resume runs), power-cycle DISP_CPU/FE/SYS
+	 * cleanly first so warm restart starts from reset.
+	 */
+	if (FIELD_GET(GENMASK(7, 4), readl(ps + DCP_V26_T8122_PS_DISP_CPU))) {
+		dev_dbg(v26->dev, "26.6 S2R: DISP_CPU already on at resume; power-cycling\n");
+		writel(0x0f0000ff, ps + DCP_V26_T8122_PS_DISP_CPU);
+		writel(3, pwrgate + DCP_V26_T8122_PWRGATE_DISP_A);
+		writel(0, pwrgate + DCP_V26_T8122_PWRGATE_DISP_B);
+		writel(0, pwrgate + DCP_V26_T8122_PWRGATE_DISP_C);
+		writel(0x0f0003f0, ps + DCP_V26_T8122_PS_DISP_CPU);
+		if (FIELD_GET(GENMASK(7, 4), readl(ps + DCP_V26_T8122_PS_DISP_FE)))
+			writel(0x23f0, ps + DCP_V26_T8122_PS_DISP_FE);
+		if (FIELD_GET(GENMASK(7, 4), readl(ps + DCP_V26_T8122_PS_DISP_SYS)))
+			writel(0x23f0, ps + DCP_V26_T8122_PS_DISP_SYS);
+		ret = readl_poll_timeout(ps + DCP_V26_T8122_PS_DISP_CPU, cur,
+					 !FIELD_GET(GENMASK(7, 4), cur), 100, 50000);
+		if (ret) {
+			dev_err(v26->dev, "26.6 S2R: DISP_CPU did not power off for cycle: %#x\n",
+				cur);
+			goto out;
+		}
+	}
+
+	v = readl(ps + DCP_V26_T8122_PS_DISP_SYS) & ~(0x30fU | BIT(28));
+	writel(v | 0xf, ps + DCP_V26_T8122_PS_DISP_SYS);
+	ret = readl_poll_timeout(ps + DCP_V26_T8122_PS_DISP_SYS, cur,
+				 FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+				 50, 50000);
+	if (ret) {
+		dev_err(v26->dev, "26.6 S2R: DISP_SYS did not power on: %#x\n", cur);
+		goto out;
+	}
+
+	v = readl(ps + DCP_V26_T8122_PS_DISP_FE) & ~(0x30fU | BIT(28));
+	writel(v | 0xf, ps + DCP_V26_T8122_PS_DISP_FE);
+	ret = readl_poll_timeout(ps + DCP_V26_T8122_PS_DISP_FE, cur,
+				 FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+				 50, 50000);
+	if (ret) {
+		dev_err(v26->dev, "26.6 S2R: DISP_FE did not power on: %#x\n", cur);
+		goto out;
+	}
+
+	v = readl(ps + DCP_V26_T8122_PS_DISP_CPU) & ~(0x30fU | BIT(28));
+	writel(v | 0xf, ps + DCP_V26_T8122_PS_DISP_CPU);
+	/*
+	 * Enable DISP_CPU flip-flop and SRAM retention (macOS T8122 wake
+	 * writes 0/1/0 to 0xcac/0xcd0/0xcf0 before enabling AUTO_ENABLE).
+	 * Leaving 3/0/0 discards DCP SRAM as soon as DISP_CPU auto-idles.
+	 */
+	writel(0, pwrgate + DCP_V26_T8122_PWRGATE_DISP_A);
+	writel(1, pwrgate + DCP_V26_T8122_PWRGATE_DISP_B);
+	writel(0, pwrgate + DCP_V26_T8122_PWRGATE_DISP_C);
+	mb();
+	ret = readl_poll_timeout(ps + DCP_V26_T8122_PS_DISP_CPU, cur,
+				 FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+				 50, 50000);
+	if (ret)
+		dev_err(v26->dev, "26.6 S2R: DISP_CPU did not power on: %#x\n", cur);
+out:
+	iounmap(ps);
+	iounmap(pwrgate);
+	return ret;
+}
+
+static int dcp_v26_t8122_restore_boot_ps(struct apple_dcp_v26 *v26)
+{
+	static const u32 offs[3] = {
+		DCP_V26_T8122_PS_DISP_SYS,
+		DCP_V26_T8122_PS_DISP_FE,
+		DCP_V26_T8122_PS_DISP_CPU,
+	};
+	static const char *const names[3] = { "sys", "fe", "cpu" };
+	/*
+	 * Match sleep_ps_restore(): never write hardware-owned AUTO_STATE,
+	 * PARENT_MISSING, DEV_DISABLE, W1C FLAGS, ACTUAL, or AUTO_ENABLE on
+	 * the first write. Wait for ACTUAL == TARGET, then set AUTO_ENABLE.
+	 */
+	const u32 ro_mask = BIT(28) | GENMASK(27, 24) | BIT(11) | BIT(10) |
+			    GENMASK(9, 8) | GENMASK(7, 4);
+	void __iomem *ps, *pwrgate;
+	u32 cur, final[3] = {};
+	int i, ret;
+
+	if (!v26->boot_ps_valid)
+		return 0;
+	ret = dcp_v26_t8122_map_power(&ps, &pwrgate);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 3; i++) {
+		u32 saved = v26->boot_ps[i];
+		u32 keep;
+
+		if (!saved)
+			continue;
+		keep = (saved & ~ro_mask) | (readl(ps + offs[i]) & GENMASK(27, 24));
+		writel(keep, ps + offs[i]);
+		if (readl_poll_timeout(ps + offs[i], cur,
+				       FIELD_GET(GENMASK(7, 4), cur) ==
+				       FIELD_GET(GENMASK(3, 0), saved) &&
+				       !(cur & BIT(11)), 50, 10000)) {
+			dev_warn(v26->dev, "26.6 S2R: %s power restore timeout: %#x\n",
+				 names[i], cur);
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (saved & BIT(28)) {
+			keep = (saved & ~ro_mask) | (readl(ps + offs[i]) & GENMASK(27, 24));
+			writel(keep | BIT(28), ps + offs[i]);
+		}
+		final[i] = readl(ps + offs[i]);
+	}
+	dev_dbg(v26->dev, "26.6 S2R restored power: SYS=%#x FE=%#x CPU=%#x\n",
+		final[0], final[1], final[2]);
+	iounmap(ps);
+	iounmap(pwrgate);
+	return ret;
+}
+
+static int dcp_v26_stop_poller(void *data)
+{
+	while (!kthread_should_stop()) {
+		apple_rtkit_poll(data);
+		usleep_range(500, 1000);
+	}
+	return 0;
+}
+
+static int dcp_v26_wake_calls(struct apple_dcp *dcp)
+{
+	static const u8 zero16[16], one[4] = { 1 };
+	static const u8 a473_on[16] = { [0] = 1, [13] = 0xaa, [14] = 0xaa, [15] = 0xaa };
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	u8 a414_reply[8] = {}, a473_reply[8] = {};
+	bool same = true;
+	int ret;
+
+	mutex_lock(&v26->lock);
+	v26->wake_plugged = false;
+	v26->wake_d572_on = false;
+	v26->s2r_waking = true;
+
+	/*
+	 * Display-on calls matching dcp_s2r_display_on(): A414(0), A478 x2,
+	 * A476(1), A478, A412, then A473(1). Suspend only ran the panel-off
+	 * group so hard_power_state stayed 1 and no A500/hard_on is needed.
+	 */
+	ret = dcp_v26_call(v26, A(414), zero16, 8, a414_reply, sizeof(a414_reply), 0);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(476), one, 4, NULL, 0, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(412), NULL, 0, one, 4, &same);
+	if (!ret) {
+		ret = dcp_v26_call(v26, A(473), a473_on, 16, a473_reply, sizeof(a473_reply), 0);
+		if (!ret)
+			dev_dbg(v26->dev, "26.6 S2R wake A473(soft_on) reply %*ph\n",
+				(int)sizeof(a473_reply), a473_reply);
+	}
+
+	if (!ret) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(1500);
+		int pump_ret;
+
+		while (!v26->failed && !v26->wake_plugged && time_before(jiffies, deadline)) {
+			pump_ret = dcp_v26_link_pump(&v26->link, msecs_to_jiffies(100),
+						     dcp_v26_callback, v26);
+			if (pump_ret && pump_ret != -ETIMEDOUT) {
+				ret = pump_ret;
+				break;
+			}
+		}
+		if (!ret) {
+			unsigned long settle = jiffies + msecs_to_jiffies(150);
+
+			while (!v26->failed && time_before(jiffies, settle)) {
+				pump_ret = dcp_v26_link_pump(&v26->link, msecs_to_jiffies(50),
+							     dcp_v26_callback, v26);
+				if (pump_ret == -ETIMEDOUT)
+					break;
+				if (pump_ret) {
+					ret = pump_ret;
+					break;
+				}
+			}
+		}
+		dev_dbg(v26->dev, "26.6 S2R wake after plug wait: plugged=%d d572_on=%d\n",
+			v26->wake_plugged, v26->wake_d572_on);
+	}
+
+	v26->s2r_waking = false;
+	mutex_unlock(&v26->lock);
+	dev_dbg(v26->dev, "26.6 S2R wake calls: %d (replies %s expected)\n",
+		ret, same ? "matched" : "differed from");
+	return ret;
+}
+
+static int dcp_v26_recommit(struct apple_dcp *dcp)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_commit *state;
+	struct drm_crtc *crtc;
+	int ret;
+
+	if (!dcp->crtc)
+		return 0;
+	crtc = &dcp->crtc->base;
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+	drm_modeset_acquire_init(&ctx, 0);
+	state->acquire_ctx = &ctx;
+retry:
+	ret = drm_modeset_lock(&crtc->mutex, &ctx);
+	if (ret)
+		goto out;
+	if (!crtc->state || !crtc->state->active)
+		goto out;
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out;
+	}
+	ret = drm_atomic_commit(state);
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+	drm_atomic_commit_put(state);
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+int dcp_v26_sleep_suspend(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	struct task_struct *poller;
+	bool d572_seen = false;
+	u32 ctrl, status;
+	int ret;
+
+	if (!v26 || !v26->started || IS_ERR_OR_NULL(v26->rtk))
+		return 0;
+	if (READ_ONCE(v26->failed))
+		return -EIO;
+
+	dcp_v26_t8122_save_boot_ps(v26);
+	dcp_v26_find_darts(dcp);
+
+	/* Pause new swaps and drain any in-flight swap or idle work. */
+	mutex_lock(&v26->lock);
+	WRITE_ONCE(v26->paused, true);
+	mutex_unlock(&v26->lock);
+	flush_work(&v26->idle_work);
+	WRITE_ONCE(dcp->quiescing, true);
+
+	if (dcp->s2r_dt_layout_ok) {
+		if (dcp->s2r_disp_dart)
+			apple_dart_display_keep(dcp->s2r_disp_dart,
+						dcp->s2r_dt_layout.disp_streams, true);
+		if (dcp->s2r_dcp_dart)
+			apple_dart_display_keep(dcp->s2r_dcp_dart,
+						dcp->s2r_dt_layout.dcp_streams, true);
+	}
+
+	WRITE_ONCE(dcp->s2r_dart_err, 0);
+	reinit_completion(&dcp->s2r_dart_done);
+	WRITE_ONCE(dcp->s2r_active, true);
+
+	ret = dcp_v26_sleep_calls(dcp, 0);
+	mutex_lock(&dcp->s2r_dart_lock);
+	WRITE_ONCE(dcp->s2r_active, false);
+	mutex_unlock(&dcp->s2r_dart_lock);
+	d572_seen = completion_done(&dcp->s2r_dart_done);
+	if (ret)
+		dev_warn(dcp->dev, "26.6 S2R sleep calls returned %d (D572=%d dart_err=%d)\n",
+			 ret, d572_seen, READ_ONCE(dcp->s2r_dart_err));
+
+	usleep_range(4000, 5000);
+	mutex_lock(&v26->lock);
+	while (!v26->failed && !dcp_v26_link_pump(&v26->link, 0, dcp_v26_callback, v26))
+		;
+	mutex_unlock(&v26->lock);
+
+	ret = apple_rtkit_idle(v26->rtk);
+	if (ret) {
+		poller = kthread_run(dcp_v26_stop_poller, v26->rtk, "dcp26stop");
+		ret = apple_rtkit_idle(v26->rtk);
+		if (!IS_ERR(poller))
+			kthread_stop(poller);
+	}
+	if (ret)
+		dev_warn(dcp->dev, "26.6 S2R RTKit idle failed: %d\n", ret);
+	apple_rtkit_poll(v26->rtk);
+	if (readl_poll_timeout(dcp->coproc_reg + DCP_V26_CPU_STATUS, status,
+			       status & DCP_V26_CPU_STATUS_IDLE, 100, 50000))
+		dev_warn(dcp->dev, "26.6 S2R coprocessor did not set IDLE: status %#x\n",
+			 status);
+
+	apple_rtkit_mailbox_off(v26->rtk);
+	writel(0, dcp->coproc_reg + DCP_V26_CPU_CONTROL);
+	writel(0, dcp->coproc_reg + DCP_V26_CPU_CONTROL);
+	if (readl_poll_timeout(dcp->coproc_reg + DCP_V26_CPU_CONTROL, ctrl,
+			       !(ctrl & DCP_V26_CPU_CONTROL_RUN), 100, 10000))
+		dev_warn(dcp->dev, "26.6 S2R coprocessor RUN bit did not clear: %#x\n", ctrl);
+
+	if (dcp->s2r_dt_layout_ok) {
+		if (dcp->s2r_disp_dart) {
+			apple_dart_display_streams(dcp->s2r_disp_dart,
+						   dcp->s2r_dt_layout.disp_streams,
+						   false, true);
+			apple_dart_power_dark(dcp->s2r_disp_dart, true);
+		}
+		if (dcp->s2r_dcp_dart) {
+			apple_dart_display_streams(dcp->s2r_dcp_dart,
+						   dcp->s2r_dt_layout.dcp_streams,
+						   false, true);
+			apple_dart_power_dark(dcp->s2r_dcp_dart, true);
+		}
+	}
+
+	WRITE_ONCE(dcp->s2r_fw_down, true);
+	WRITE_ONCE(v26->s2r_stopped, true);
+	device_set_wakeup_path(dcp->dev);
+	dev_info(dcp->dev, "26.6 S2R: firmware stopped (D572=%d status=%#x ctrl=%#x)\n",
+		 d572_seen, status, ctrl);
+	return 0;
+}
+
+int dcp_v26_sleep_resume(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	ktime_t start = ktime_get();
+	bool crtc_active = false;
+	int ret, ps_ret;
+
+	if (!v26 || !READ_ONCE(v26->s2r_stopped))
+		return 0;
+	WRITE_ONCE(v26->s2r_stopped, false);
+
+	ret = dcp_v26_pmp_set_device_power(0x0f, 8, 1);
+	if (ret)
+		dev_warn(dcp->dev, "26.6 S2R: PMP DISP power vote failed: %d\n", ret);
+
+	ret = dcp_v26_t8122_domains_on(v26);
+	if (ret)
+		goto fail;
+
+	if (dcp->s2r_dt_layout_ok) {
+		if (dcp->s2r_disp_dart) {
+			ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
+			if (ret)
+				goto fail;
+			apple_dart_display_keep(dcp->s2r_disp_dart,
+						dcp->s2r_dt_layout.disp_streams, false);
+			ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+							 dcp->s2r_dt_layout.disp_streams,
+							 true, false);
+			if (ret)
+				goto fail;
+		}
+		if (dcp->s2r_dcp_dart) {
+			ret = apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+			if (ret)
+				goto fail;
+			apple_dart_display_keep(dcp->s2r_dcp_dart,
+						dcp->s2r_dt_layout.dcp_streams, false);
+			ret = apple_dart_display_streams(dcp->s2r_dcp_dart,
+							 dcp->s2r_dt_layout.dcp_streams,
+							 true, false);
+			if (ret)
+				goto fail;
+		}
+	}
+
+	dcp_v26_link_reset(&v26->link);
+	ret = apple_rtkit_warm_restart(v26->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "26.6 S2R: apple_rtkit_warm_restart failed: %d\n", ret);
+		goto fail;
+	}
+	writel(DCP_V26_CPU_CONTROL_RUN, dcp->coproc_reg + DCP_V26_CPU_CONTROL);
+	ret = apple_rtkit_boot(v26->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "26.6 S2R: apple_rtkit_boot failed: %d\n", ret);
+		goto fail;
+	}
+
+	WRITE_ONCE(dcp->s2r_dart_err, 0);
+	reinit_completion(&dcp->s2r_dart_done);
+	WRITE_ONCE(dcp->s2r_active, true);
+	ret = dcp_v26_wake_calls(dcp);
+	mutex_lock(&dcp->s2r_dart_lock);
+	WRITE_ONCE(dcp->s2r_active, false);
+	mutex_unlock(&dcp->s2r_dart_lock);
+	if (ret) {
+		dev_err(dcp->dev, "26.6 S2R: panel-on calls failed: %d\n", ret);
+		goto fail;
+	}
+
+	mutex_lock(&v26->lock);
+	v26->failed = false;
+	v26->ctm_valid = false;
+	dcp_v26_brightness_changed(v26);
+	WRITE_ONCE(v26->paused, false);
+	mutex_unlock(&v26->lock);
+
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	WRITE_ONCE(dcp->quiescing, false);
+	dcp_v26_put_darts(dcp);
+
+	ps_ret = dcp_v26_t8122_restore_boot_ps(v26);
+	if (ps_ret)
+		dev_warn(dcp->dev, "26.6 S2R: boot power restore returned %d\n", ps_ret);
+
+	if (dcp->crtc && dcp->crtc->base.state)
+		crtc_active = READ_ONCE(dcp->crtc->base.state->active);
+	if (crtc_active) {
+		ret = dcp_v26_recommit(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "26.6 S2R: active CRTC recommit failed: %d\n", ret);
+	}
+
+	dev_info(dcp->dev, "26.6 S2R: internal display back in %lld ms (recommit=%d)\n",
+		 ktime_ms_delta(ktime_get(), start), crtc_active);
+	return 0;
+
+fail:
+	dcp_v26_put_darts(dcp);
+	WRITE_ONCE(v26->failed, true);
+	WRITE_ONCE(dcp->sleep_cold_stopped, true);
+	dev_err(dcp->dev, "26.6 S2R: warm restart failed (%d); internal display stays off until reboot\n",
+		ret);
+	return ret;
 }
