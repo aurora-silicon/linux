@@ -84,6 +84,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e01: cpu@1 {
@@ -98,6 +99,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e02: cpu@2 {
@@ -112,6 +114,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e03: cpu@3 {
@@ -126,6 +129,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e04: cpu@4 {
@@ -140,6 +144,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e05: cpu@5 {
@@ -154,6 +159,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <851>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p00: cpu@10100 {
@@ -168,6 +174,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p01: cpu@10101 {
@@ -182,6 +189,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p02: cpu@10102 {
@@ -196,6 +204,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p03: cpu@10103 {
@@ -210,6 +219,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p04: cpu@10104 {
@@ -224,6 +234,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p05: cpu@10105 {
@@ -238,6 +249,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
