@@ -125,3 +125,8 @@
 	enable-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
+
+/* ATC3 is HDMI-only on laptops; keep tunnel 3 PIODMA disabled. */
+&apciec3_piodma {
+	status = "disabled";
+};

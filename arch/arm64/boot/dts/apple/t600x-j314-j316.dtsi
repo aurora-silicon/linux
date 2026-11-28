@@ -748,10 +748,6 @@
 	status = "disabled";
 };
 
-&apciec3_piodma {
-	status = "disabled";
-};
-
 &dwc3_3 {
 	status = "disabled";
 };
