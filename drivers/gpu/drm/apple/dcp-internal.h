@@ -1491,19 +1491,6 @@ static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
 	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 }
 
-/*
- * Whether the firmware decodes PQ surfaces on its EDR panel path.  Firmware 27
- * does not: on the K114s (T6050) a surface tagged ST 2084 is decoded with the
- * sRGB curve and scaled by about 10000/100, and every other transfer function
- * value gives the plain sRGB decode, whatever the colour space.  A PQ desktop
- * then clips everything above a quarter of the code range to the panel's peak.
- * So firmware 27 panels don't offer PQ until the EDR path maps it some other way.
- */
-static inline bool dcp_fw_panel_decodes_pq(struct apple_dcp *dcp)
-{
-	return dcp->fw_compat != DCP_FIRMWARE_V_27_0;
-}
-
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
