@@ -24,7 +24,9 @@
  * stops the coprocessor and resets its RTKit state, and puts the PHY to
  * sleep, as macOS does on every detach: every attach boots the firmware again.
  * Without a plug orientation, or when the coprocessor does not come up, the
- * PIPE stays on the dummy PHY and the port keeps working at USB2.
+ * PIPE stays on the dummy PHY and the port keeps working at USB2. A PHY wired
+ * to an on-board hub instead of a connector has no orientation switch: its
+ * lanes have the fixed orientation of t6040_usb3_fixed_hub().
  *
  * The driver performs no ATC-register writes during probe. The power
  * sequences only cover the PHY: the host controller must be stopped before
@@ -48,6 +50,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -2668,6 +2671,28 @@ static bool t6040_map_regions(struct t6040_usb2_phy *tphy, struct platform_devic
 }
 
 /*
+ * Whether the PHY is wired to an on-board hub instead of a Type-C connector,
+ * as on the Mac mini's front ports: the board describes the hub as a child of
+ * the controller the PHY's USB3 port (graph port 1) is linked to, as it does
+ * for dwc3-apple. There is no port controller, so no orientation switch and
+ * no cable event, and the hub's SuperSpeed pair sits on the lanes of a plug
+ * in normal orientation: the ADT gives every such fixed ATC PHY plug
+ * orientation 1, as it does the laptops' HDMI converter PHYs, which run
+ * unflipped.
+ */
+static bool t6040_usb3_fixed_hub(struct device *dev)
+{
+	struct device_node *ep __free(device_node) =
+		of_graph_get_endpoint_by_regs(dev->of_node, 1, -1);
+	struct device_node *ctrl __free(device_node) =
+		ep ? of_graph_get_remote_port_parent(ep) : NULL;
+	struct device_node *hub __free(device_node) =
+		ctrl ? of_get_available_child_by_name(ctrl, "hub") : NULL;
+
+	return hub;
+}
+
+/*
  * Everything USB3 needs from the device tree. A missing piece leaves the
  * port at USB2; only a mailbox that has not probed yet defers.
  */
@@ -2690,19 +2715,23 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	phy_set_drvdata(tphy->usb3, tphy);
 	init_completion(&tphy->app_reply);
 
-	if (!of_property_present(dev->of_node, "orientation-switch"))
+	if (of_property_present(dev->of_node, "orientation-switch")) {
+		/*
+		 * Registered first: tipd waits for the switch the DT names, so the
+		 * port keeps USB2, roles and PD even if a USB3 piece below is missing.
+		 */
+		sw = typec_switch_register(dev, &sw_desc);
+		if (IS_ERR(sw))
+			return PTR_ERR(sw);
+		ret = devm_add_action_or_reset(dev, t6040_usb3_switch_unregister, sw);
+		if (ret)
+			return ret;
+	} else if (t6040_usb3_fixed_hub(dev)) {
+		/* Nothing ever sets it again: the lanes stay where the hub is. */
+		tphy->orientation = TYPEC_ORIENTATION_NORMAL;
+	} else {
 		return 0;
-
-	/*
-	 * Registered first: tipd waits for the switch the DT names, so the port
-	 * keeps USB2, roles and PD even if a USB3 piece below is missing.
-	 */
-	sw = typec_switch_register(dev, &sw_desc);
-	if (IS_ERR(sw))
-		return PTR_ERR(sw);
-	ret = devm_add_action_or_reset(dev, t6040_usb3_switch_unregister, sw);
-	if (ret)
-		return ret;
+	}
 
 	for (i = 0; i < T6040_USB3_NR_REGIONS; i++) {
 		if (!tphy->regs[i]) {
