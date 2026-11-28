@@ -1060,8 +1060,8 @@ static void cd321x_dp_send_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, false), CD321X_DP_SEND);
 	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, hpd, false), CD321X_DP_SEND);
 	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, 0, false), CD321X_DP_SEND);
-	/* An HPD pulse is sent once, as an edge if the route holds IRQ_HPD. */
-	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, true), CD321X_DP_SEND);
+	/* A coalesced HPD drop/rise replays HPD low first, then high. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, hpd, true), CD321X_DP_SEND_EDGE);
 	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, true), CD321X_DP_SEND_EDGE);
 }
 

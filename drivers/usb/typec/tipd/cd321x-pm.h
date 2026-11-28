@@ -377,7 +377,7 @@ static inline bool cd321x_display_taken(int ret)
 enum cd321x_dp_send {
 	CD321X_DP_SEND_NONE,	/* the display route holds this status */
 	CD321X_DP_SEND,		/* send the status */
-	CD321X_DP_SEND_EDGE,	/* send it without IRQ_HPD first, then with it */
+	CD321X_DP_SEND_EDGE,	/* send HPD low first, then the status */
 };
 
 /*
@@ -385,16 +385,15 @@ enum cd321x_dp_send {
  * route, which holds @applied for the same pin assignment and configuration.
  * The route drops a status equal to the one it holds, and so does this: an
  * IRQ_HPD that the partner's last status still carries is not a new request.
- * @pulse is a new request: the sink dropped HPD and raised it again since the
- * last update (@status has IRQ_HPD set for it). When the route holds IRQ_HPD
- * already, the request is sent as an edge, so that the route sees it.
+ * @pulse means the sink dropped HPD and raised it again since the last update:
+ * replay HPD low first so the display route tears down and retrains the link
+ * anew, matching an uncoalesced HPD drop.
  */
 static inline enum cd321x_dp_send cd321x_dp_send(u32 applied, u32 status,
 						 bool pulse)
 {
 	if (pulse)
-		return applied & DP_STATUS_IRQ_HPD ? CD321X_DP_SEND_EDGE :
-						     CD321X_DP_SEND;
+		return CD321X_DP_SEND_EDGE;
 	return applied == status ? CD321X_DP_SEND_NONE : CD321X_DP_SEND;
 }
 
