@@ -47,7 +47,7 @@ pub(super) const CONFIG: Config = Config {
     perf: Some(&PERF),
     region_c: Some(&REGION_C),
     chip: Some(&CHIP),
-    firmware: fw::variant::Firmware::Identified(&[t6041::BUILD_25G83, t6041::BUILD_26B123]),
+    firmware: fw::variant::Firmware::Identified(&[t6041::BUILD_25G83_32CORE, t6041::BUILD_26B123]),
     core_layout: CoreLayout {
         cores: Some((4, 32)),
         alternate_core_masks: None,
@@ -60,6 +60,8 @@ pub(super) const CONFIG: Config = Config {
         // hang this GPU's firmware on grids of more than ten workgroups.
         compute_blocks: 96,
     },
+    // The GPU is restarted after a real sleep, as on T8140.
+    sleep_restart: true,
     ..t6041::BASE
 };
 

@@ -26,7 +26,7 @@ MUTANTS = {
     # Accept a level wider than its 4-bit lane.
     'lane-wide': ('		    level > PMP_FLOOR_LEVEL_MAX || seen', '		    seen'),
     # Accept a request class twice.
-    'class-twice': ('seen & (1U << (cls - PMP_FLOOR_CLASS_FIRST)))', '0)'),
+    'class-twice': ('seen & (1U << (cls - PMP_FLOOR_CLASS_FIRST)))', '((void)seen, 0))'),
     # Drop as soon as demand stops, ignoring the hold time.
     'no-hold': ('now - g->last_demand_ns >= c->hold_ms * PMP_FLOOR_NS_PER_MS', '1'),
     # Never defer a transition.

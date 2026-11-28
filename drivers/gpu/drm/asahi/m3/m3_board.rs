@@ -23,11 +23,14 @@ pub(crate) fn board_is(compatible: &[u8]) -> bool {
     board.split(|b| *b == 0).any(|s| s == compatible)
 }
 
-/// Whether this is a board the M3 runtime is validated on (`soc.validated_boards`).
-/// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
-/// runtime only on these.
-pub(crate) fn runtime_validated_board(soc: &Soc) -> bool {
-    soc.validated_boards.iter().any(|board| board_is(board))
+/// Whether the boot loader handed this GPU over: the GPU node carries the boot loader's
+/// description of the firmware it loaded (`SEGMENT_PROPS`). A boot loader publishes it only on
+/// a Mac where it runs that firmware for Linux, so this follows what the machine describes,
+/// not a list of boards. `asahi.m3_expose=auto` registers the render node, and the runtime
+/// starts by default, only then; resource admission ([`admit`]) checks the rest of the handoff.
+pub(crate) fn handed_over(dev: &device::Device) -> bool {
+    dev.of_node()
+        .is_some_and(|node| SEGMENT_PROPS.iter().all(|p| node.get_property::<KVec<u8>>(p).is_ok()))
 }
 
 /// The number of core slots of `soc` (2 x 10 on T6030, 4 x 10 on T6031).
@@ -547,12 +550,12 @@ pub(crate) fn region_is_nomap(node: &of::Node, name: &CStr) -> bool {
 
 /// Whether the M3 render node is registered (`asahi.m3_expose`).
 ///
-/// Userspace drivers pick up any registered render node. Until the M3 runtime is validated on a
-/// board, a render node there would let a stock userspace driver submit work the board may not
-/// run correctly. `auto` (-1) registers it only on the boards the runtime was validated on.
-pub(crate) fn expose_render_node(soc: &Soc) -> bool {
+/// Userspace drivers pick up any registered render node. Without a boot loader that handed the
+/// GPU over, a render node would let a stock userspace driver submit work nothing can run.
+/// `auto` (-1) registers it only where the boot loader handed the GPU over ([`handed_over`]).
+pub(crate) fn expose_render_node(dev: &device::Device) -> bool {
     match crate::m3::m3_params::expose() {
         Some(expose) => expose,
-        None => runtime_validated_board(soc),
+        None => handed_over(dev),
     }
 }

@@ -23,6 +23,8 @@ struct nvmem_device {
 	size_t			size;
 	bool			read_only;
 	bool			root_only;
+	/* See nvmem_config.sysfs_read_only */
+	bool			sysfs_read_only;
 	int			flags;
 	enum nvmem_type		type;
 	struct bin_attribute	eeprom;

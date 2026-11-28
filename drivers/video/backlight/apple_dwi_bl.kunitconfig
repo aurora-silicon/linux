@@ -1,0 +1,8 @@
+# ./tools/testing/kunit/kunit.py run --arch=arm64 --kunitconfig=drivers/video/backlight/apple_dwi_bl.kunitconfig
+CONFIG_KUNIT=y
+CONFIG_ARCH_APPLE=y
+CONFIG_PM=y
+CONFIG_SUSPEND=y
+CONFIG_BACKLIGHT_CLASS_DEVICE=y
+CONFIG_BACKLIGHT_APPLE_DWI=y
+CONFIG_BACKLIGHT_APPLE_DWI_KUNIT_TEST=y

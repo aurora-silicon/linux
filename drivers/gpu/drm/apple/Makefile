@@ -5,6 +5,7 @@ CFLAGS_trace.o = -I$(src)
 appledrm-y := apple_drv.o apple_resume.o
 appledrm-y += afk.o dcp.o dcp-fabric.o dcp_backlight.o dptxep.o iomfb.o parser.o systemep.o
 appledrm-y += dcp-hdmi.o
+appledrm-$(CONFIG_DRM_APPLE_CEC) += cec.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += audio.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += av.o
 appledrm-y += connector.o dcp-panel-adt.o dcp-display-metadata.o dcp-180hz.o
@@ -17,8 +18,12 @@ appledrm-y += iomfb_v14_7_tpl.o
 appledrm-y += iomfb_v26_6_desktop.o
 appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
 appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += iomfb_m4.o t8132_ext_drm.o
+appledrm-$(CONFIG_DRM_APPLE_DCP_T8152) += t8152_atc.o t8152_aux.o t8152_dptx.o
+appledrm-$(CONFIG_DRM_APPLE_DCP_T8152) += t8152_hdmi.o t8152_typec.o
+appledrm-$(CONFIG_DRM_APPLE_DCP_T8152) += iomfb_iboot.o iboot_drm.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_v27_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_external_hdr_hints_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_boot_display_test.o
@@ -47,10 +52,13 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-indicator-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_cec_test.o
 
 obj-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += afkv2-test.o
+appledrm-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += parser-bounds-test.o
 
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += parser-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += hotplug-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-board-test.o
+appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-plane-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += audio-no-sio-test.dtbo.o

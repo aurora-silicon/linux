@@ -687,11 +687,6 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 	return 0;
 }
 
-/* Preview only; processing and image quality need separate qualification. */
-static bool preview_26 = true;
-module_param(preview_26, bool, 0400);
-MODULE_PARM_DESC(preview_26, "Enable J613 preview on ISP firmware 26.6.2 (default: true; false disables)");
-
 static const char * isp_fw2str(enum isp_firmware_version version)
 {
 	switch (version) {
@@ -745,6 +740,19 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 		else if (ver[0] == 14 && ver[1] == 7 && ver[2] == 0)
 			return ISP_FIRMWARE_V_14_7;
 
+		/*
+		 * 27.2.0 keeps the 26.6.2 command layout (run on T8122). Any
+		 * other newer build stays unknown until it has been run: an
+		 * unknown version selects the 12.x layout, whose 32-bit set
+		 * file load such firmware refuses, so it fails closed.
+		 */
+		if (ver[0] == 27 && ver[1] == 2 && ver[2] == 0) {
+			if (!strcmp(name, "apple,firmware-compat"))
+				dev_info(dev, "%s %d.%d.%d uses the 26.6.2 layout\n",
+					 name, ver[0], ver[1], ver[2]);
+			return ISP_FIRMWARE_V_26_6_2;
+		}
+
 		dev_warn(dev, "unknown %s: %d.%d.%d\n", name, ver[0], ver[1], ver[2]);
 		break;
 	case 4:
@@ -784,18 +792,6 @@ isp_check_firmware_version(struct apple_isp *isp)
 		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
-}
-
-static bool isp_preview26_admitted(struct device *dev,
-				   enum isp_firmware_version compat)
-{
-	if (compat != ISP_FIRMWARE_V_26_6_2 || !preview_26 ||
-	    !of_machine_is_compatible("apple,j613"))
-		return false;
-	if (!of_device_is_compatible(dev->of_node, "apple,t8122-isp"))
-		return false;
-	return isp_read_fw_version(dev, "apple,firmware-version") ==
-		ISP_FIRMWARE_V_26_6_2;
 }
 
 /* After a system sleep, see apple_isp_resume(). */
@@ -866,17 +862,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 	 * with unknown firmware.
 	 */
 	isp->fw_compat = isp_check_firmware_version(isp);
-	if (isp->hw->fw_abi != ISP_FW_ABI_H17 &&
-	    (isp->fw_compat == ISP_FIRMWARE_V_26_6_2 ||
-	     isp_read_fw_version(dev, "apple,firmware-version") ==
-						ISP_FIRMWARE_V_26_6_2)) {
-		if (!isp_preview26_admitted(dev, isp->fw_compat)) {
-			err = dev_err_probe(dev, -ENODEV,
-					    "26.6.2 preview requires J613/T8122; preview_26=0 disables it\n");
-			goto free_isp;
-		}
-		isp->preview_26 = true;
-	}
 
 	err = of_property_read_u32(dev->of_node, "apple,platform-id",
 				   &isp->platform_id);
@@ -1187,7 +1172,7 @@ static const struct apple_isp_hw apple_isp_hw_t6020 = {
 
 static const struct apple_isp_hw apple_isp_hw_t8122 = {
 	.gen = ISP_GEN_T8112,
-	.pmu_base = 0x2d07040000,
+	.pmu_base = 0x2d0704000,
 
 	.dsid_count = 1,
 	.dsid_clr_base0 = 0x2221c4000,
@@ -1206,6 +1191,7 @@ static const struct apple_isp_hw apple_isp_hw_t8122 = {
 	.scl1 = true,
 	.lpdp = true,
 	.meta_size = ISP_META_SIZE_T6031,
+	.meta_exposure = true,
 };
 
 static const struct apple_isp_hw apple_isp_hw_t6030 = {
@@ -1479,6 +1465,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.scl1 = true,
 	.lpdp = false,
 	.meta_size = ISP_META_SIZE_T8140,
+	.meta_exposure = true,
 	.dapf_from_dt = true,
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,

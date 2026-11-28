@@ -16,6 +16,12 @@
  * After the sleep: AP ON, then one element on each TX ring again, the device tree's wake message,
  * each answered by interrupt. An endpoint whose wake element was not answered stays closed and
  * gets no sleep element at the next sleep.
+ *
+ * macOS stops AOP2 before AOP, and both about 200 ms before the commit: AOP2's elements and AP
+ * IDLE first, then AOP's endpoint stops, and AOP's AP IDLE 18-25 ms after AOP2's (J714s, macOS 27
+ * under the hypervisor, five captures). AOP2 is therefore a consumer of AOP for the PM core, so
+ * that its late suspend, which stops it, runs before AOP's, which stops AOP; the commit's pass
+ * then finds it stopped. Without that link it is stopped in that pass, as before.
  */
 
 #include <linux/bitfield.h>
@@ -27,6 +33,7 @@
 #include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/soc/apple/rtkit.h>
@@ -70,8 +77,10 @@
 #define AOP_EP_COUNT		(AOP_EP_LAST - AOP_EP_FIRST + 1)
 
 struct t6050_aop_ring {
+	/* Set once, by the firmware's first GETBUF; published after its size and IOVA */
 	void *buf;
 	size_t size;
+	dma_addr_t iova;
 	u32 tx_off, tx_size;
 	u32 rx_off, rx_size;
 	bool tx_ready, rx_ready;
@@ -91,6 +100,10 @@ struct t6050_aop {
 	void __iomem *asc;
 	struct apple_rtkit *rtk;
 	bool registered;
+	/* Ordered before AOP by the PM core: stopped at its late suspend, not at the commit */
+	struct device_link *aop_link;
+	/* This sleep's stop ran at the late suspend: the commit's pass has nothing to send */
+	bool stopped_late;
 	unsigned long opened;	/* bit (ep - AOP_EP_FIRST): open as its side of the protocol needs */
 	unsigned long seen;	/* bit (ep - AOP_EP_FIRST): the firmware sent something */
 	struct t6050_aop_ring ring[AOP_EP_COUNT];
@@ -128,21 +141,61 @@ static void t6050_aop_send(struct t6050_aop *aop, u8 ep, u64 msg)
 		dev_err(aop->dev, "endpoint %#x: send %#llx: %d\n", ep, msg, ret);
 }
 
+/*
+ * What a GETBUF gets: 0 a new buffer, 1 the endpoint's own again, as it fits in it, or -EINVAL for
+ * no size or more than the endpoint's buffer holds. An endpoint has one buffer for as long as the
+ * firmware runs: its rings are read from it at a sleep and a wake, by other threads.
+ *
+ * A GETBUF that is answered starts the endpoint's rings over: they are announced again after it,
+ * so the endpoint has none, and sends nothing, until then.
+ */
+static int t6050_aop_getbuf_claim(struct t6050_aop_ring *r, size_t size)
+{
+	int ret;
+
+	if (!size)
+		return -EINVAL;
+	ret = !r->buf ? 0 : size <= r->size ? 1 : -EINVAL;
+	if (ret < 0)
+		return ret;
+
+	WRITE_ONCE(r->tx_ready, false);
+	WRITE_ONCE(r->rx_ready, false);
+	r->seq = 0;
+	r->tx_rptr = 0;
+	r->tx_wptr = 0;
+	return ret;
+}
+
 static void t6050_aop_getbuf(struct t6050_aop *aop, u8 ep, u64 msg)
 {
+	struct t6050_aop_ring *r = &aop->ring[ep - AOP_EP_FIRST];
 	size_t size = (size_t)FIELD_GET(AFK_GETBUF_SIZE, msg) << AFK_BLOCK_SHIFT;
-	dma_addr_t iova;
 	void *buf;
+	int ret;
 
-	buf = dmam_alloc_coherent(aop->dev, size, &iova, GFP_KERNEL);
-	if (!buf) {
-		dev_err(aop->dev, "endpoint %#x: no %#zx byte buffer\n", ep, size);
+	/* Only this endpoint's messages, in order, change its buffer. */
+	ret = t6050_aop_getbuf_claim(r, size);
+	if (ret < 0) {
+		dev_err_ratelimited(aop->dev, "endpoint %#x: no buffer for a %#zx byte GETBUF (has %#zx)\n",
+				    ep, size, r->buf ? r->size : 0);
 		return;
 	}
-	aop->ring[ep - AOP_EP_FIRST].buf = buf;
-	aop->ring[ep - AOP_EP_FIRST].size = size;
+	/* Open again once its rings start (AFK_START_ACK). */
+	clear_bit(ep - AOP_EP_FIRST, &aop->opened);
+	if (!ret) {
+		buf = dmam_alloc_coherent(aop->dev, size, &r->iova, GFP_KERNEL);
+		if (!buf) {
+			dev_err_ratelimited(aop->dev, "endpoint %#x: no %#zx byte buffer\n",
+					    ep, size);
+			return;
+		}
+		r->size = size;
+		/* A reader that finds the buffer finds its size. */
+		smp_store_release(&r->buf, buf);
+	}
 	t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_GETBUF_ACK) |
-				FIELD_PREP(AFK_GETBUF_IOVA, iova));
+				FIELD_PREP(AFK_GETBUF_IOVA, r->iova));
 }
 
 static int t6050_aop2_take(struct t6050_aop *aop, u8 ep, u32 old, u32 new);
@@ -167,15 +220,17 @@ static void t6050_aop_recv(void *cookie, u8 ep, u64 msg)
 	case AFK_INIT_TX:
 		r->tx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->tx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->tx_ready = true;
+		WRITE_ONCE(r->tx_ready, true);
 		break;
 	case AFK_INIT_RX:
 		r->rx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->rx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->rx_ready = true;
+		WRITE_ONCE(r->rx_ready, true);
 		t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_START));
 		break;
 	case AFK_START_ACK:
+		/* Started again from a GETBUF: no sleep element of the last setup is pending. */
+		r->closed = false;
 		set_bit(ep - AOP_EP_FIRST, &aop->opened);
 		break;
 	case AFK_RING:
@@ -210,9 +265,12 @@ static const struct apple_rtkit_ops t6050_aop2_rtkit_ops = {
 static int t6050_aop2_view(struct t6050_aop_ring *r, u32 off, u32 size, bool ready,
 			   struct t6050_aop_view *v)
 {
-	if (!ready || !r->buf || size < sizeof(__le32) || off > r->size || size > r->size - off)
+	/* Pairs with t6050_aop_getbuf(): a buffer found here comes with its size. */
+	u8 *buf = smp_load_acquire(&r->buf);
+
+	if (!ready || !buf || size < sizeof(__le32) || off > r->size || size > r->size - off)
 		return -EINVAL;
-	v->hdr = (u8 *)r->buf + off;
+	v->hdr = buf + off;
 	v->bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)v->hdr));
 	if (v->bufsz >= size || (size - v->bufsz) % 3 || v->bufsz < 2 * AFK_QE_SLOT ||
 	    v->bufsz > AFK_RING_MAX)
@@ -248,7 +306,7 @@ static int t6050_aop2_put(struct t6050_aop *aop, u8 ep, const u32 *msg, unsigned
 	__le32 *qe;
 	int ret;
 
-	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, r->tx_ready, &v);
+	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, READ_ONCE(r->tx_ready), &v);
 	if (ret)
 		return ret;
 	dma_rmb();
@@ -305,7 +363,7 @@ static int t6050_aop2_rx_wptr(struct t6050_aop *aop, u8 ep)
 	struct t6050_aop_view v;
 	u32 wptr;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v))
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v))
 		return -EINVAL;
 	dma_rmb();
 	wptr = t6050_aop2_ptr(&v, AFK_PTR_WRITE);
@@ -340,8 +398,8 @@ static int t6050_aop2_take(struct t6050_aop *aop, u8 ep, u32 old, u32 new)
 	struct t6050_aop_view v;
 	int code;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v) || old >= v.bufsz ||
-	    new >= v.bufsz)
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v) ||
+	    old >= v.bufsz || new >= v.bufsz)
 		return -EINVAL;
 	if (old == new)
 		return -ENOMSG;
@@ -382,7 +440,10 @@ static int t6050_aop2_element(struct t6050_aop *aop, u8 ep)
 	return 0;
 }
 
-/* The sleep's first pass, interrupts off: the CPU keeps running. */
+/*
+ * At the late suspend, before AOP's, or else in the sleep's first pass with interrupts off: the
+ * CPU keeps running.
+ */
 static int t6050_aop_sleep_stop(void *data)
 {
 	struct t6050_aop *aop = data;
@@ -447,13 +508,42 @@ static int t6050_aop_sleep_stop(void *data)
 	return aop->stop_errors || aop->idle_ret;
 }
 
+/* The commit's first pass: nothing more once the late suspend has stopped it. */
+static int t6050_aop_commit_stop(void *data)
+{
+	struct t6050_aop *aop = data;
+
+	if (aop->stopped_late)
+		return aop->stop_errors || aop->idle_ret;
+
+	return t6050_aop_sleep_stop(aop);
+}
+
 static int t6050_aop_suspend(struct device *dev)
 {
 	struct t6050_aop *aop = dev_get_drvdata(dev);
 
 	if (!pm_suspend_via_firmware() || !aop->registered)
 		return 0;
+	aop->stopped_late = false;
+	/* Ready for the commit either way: a registered coprocessor that isn't refuses the sleep. */
 	apple_sleep_coproc_set_ready(dev, true);
+
+	return 0;
+}
+
+/*
+ * Before AOP's late suspend stops AOP, as macOS stops AOP2 first. A stop that fails leaves the
+ * sleep to go on, as at the commit; the resume restarts what it closed.
+ */
+static int t6050_aop_suspend_late(struct device *dev)
+{
+	struct t6050_aop *aop = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || !aop->registered || !aop->aop_link)
+		return 0;
+	t6050_aop_sleep_stop(aop);
+	aop->stopped_late = true;
 
 	return 0;
 }
@@ -538,6 +628,7 @@ static int t6050_aop_resume(struct device *dev)
 	/* Read before the ready flag goes: clearing that clears the stopped flag with it. */
 	stopped = apple_sleep_coproc_stopped(dev);
 	apple_sleep_coproc_set_ready(dev, false);
+	aop->stopped_late = false;
 	if (!stopped && !aop->asleep)
 		return 0;
 	t6050_aop_restart(aop);
@@ -545,7 +636,36 @@ static int t6050_aop_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(t6050_aop_pm_ops, t6050_aop_suspend, t6050_aop_resume);
+static const struct dev_pm_ops t6050_aop_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(t6050_aop_suspend, t6050_aop_resume)
+	.suspend_late = pm_sleep_ptr(t6050_aop_suspend_late),
+};
+
+/* AOP2 becomes a consumer of AOP (the Rust apple_aop driver's device) for the PM core's order. */
+static void t6050_aop_order_before_aop(struct t6050_aop *aop)
+{
+	struct device_node *np;
+	struct platform_device *aop_pdev = NULL;
+
+	for_each_compatible_node(np, NULL, "apple,t6050-aop") {
+		if (!of_device_is_available(np))
+			continue;
+		aop_pdev = of_find_device_by_node(np);
+		of_node_put(np);
+		break;
+	}
+	if (!aop_pdev) {
+		dev_info(aop->dev, "no AOP to stop before: stopped at the commit\n");
+		return;
+	}
+	aop->aop_link = device_link_add(aop->dev, &aop_pdev->dev, DL_FLAG_STATELESS);
+	if (aop->aop_link)
+		dev_info(aop->dev, "stopped before %s for a sleep, as macOS\n", dev_name(&aop_pdev->dev));
+	else
+		dev_warn(aop->dev, "not ordered before %s: stopped at the commit\n",
+			 dev_name(&aop_pdev->dev));
+	put_device(&aop_pdev->dev);
+}
 
 /*
  * An endpoint order from the device tree. Without the property, or with one that is not a list
@@ -644,11 +764,13 @@ static int t6050_aop_probe(struct platform_device *pdev)
 		t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_INIT) | aop->init_arg);
 	}
 
-	ret = apple_sleep_coproc_register_first(dev, t6050_aop_sleep_stop, aop);
+	ret = apple_sleep_coproc_register_first(dev, t6050_aop_commit_stop, aop);
 	if (ret)
 		dev_warn(dev, "not told of a system sleep: %d\n", ret);
 	else
 		aop->registered = true;
+	if (aop->registered)
+		t6050_aop_order_before_aop(aop);
 	dev_info(dev, "firmware started (control %#x), %u endpoints started\n",
 		 readl(aop->asc + AOP_CPU_CONTROL), started);
 
@@ -671,3 +793,7 @@ static struct platform_driver t6050_aop_driver = {
 	.probe = t6050_aop_probe,
 };
 builtin_platform_driver(t6050_aop_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_T6050_AOP_KUNIT_TEST)
+#include "t6050-aop-test.c"
+#endif

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Supply missing platform descriptions for the original J713 loader ABI,
- * which the J715 shares, and the M4 PMGR ownership policy on the qualified
- * firmware for every M4 Mac.
+ * which the J715 shares, and apply the M4 PMGR ownership policy wherever
+ * the T8132 PMGR is described.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -314,18 +314,33 @@ static struct device_node *__init t8132_find_gfx(void)
 static int __init t8132_platform_handoff(void)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
-	struct device_node *soc, *pmp = NULL, *gpu = NULL, *gfx = NULL;
+	struct device_node *soc = NULL, *pmp = NULL, *gpu = NULL, *gfx = NULL;
 	struct of_changeset *cs;
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!apple_t8132_firmware_path())
-		return 0;
-	if (fdt_check_header(data))
-		return -EINVAL;
+	/*
+	 * The memory descriptions follow the PMP provider. PMGR ownership
+	 * also applies to trees which describe the PMGR without a PMP.
+	 */
+	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
+	if (!pmp) {
+		struct device_node *pmgr;
+
+		pmgr = of_find_compatible_node(NULL, NULL, "apple,t8132-pmgr");
+		if (!pmgr)
+			return 0;
+		of_node_put(pmgr);
+	}
+	if (fdt_check_header(data)) {
+		ret = -EINVAL;
+		goto out;
+	}
 	soc = of_find_node_by_path("/soc");
-	if (!soc)
-		return -ENODEV;
+	if (!soc) {
+		ret = -ENODEV;
+		goto out;
+	}
 	cs = kzalloc_obj(*cs);
 	if (!cs) {
 		ret = -ENOMEM;
@@ -336,12 +351,14 @@ static int __init t8132_platform_handoff(void)
 	if (ret)
 		goto destroy;
 
-	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
+	if (!pmp)
+		goto apply;
+
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8132");
 	gfx = gpu ? of_parse_phandle(gpu, "power-domains", 0) : NULL;
 	if (!gfx)
 		gfx = t8132_find_gfx();
-	if (!pmp || !gfx || !pmp->phandle || !gfx->phandle) {
+	if (!gfx || !pmp->phandle || !gfx->phandle) {
 		pr_warn("t8132-platform-handoff: memory compatibility requires PMP/GFX providers\n");
 		goto apply;
 	}

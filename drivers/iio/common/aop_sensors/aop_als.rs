@@ -4,15 +4,25 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+use core::{
+    ffi::{c_int, c_void},
+    ptr,
+};
+
 use kernel::{
     bindings, c_str,
-    device::Core,
+    device::{self, Core},
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        atomic::{Atomic, Relaxed},
+        Arc,
+    },
+    types::Opaque,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -97,6 +107,12 @@ fn enable_als(
         return Ok(());
     }
 
+    arm_ct817(aop, dev.as_ref(), svc)
+}
+
+/// Arms the CT817: interval zero, its configuration, then the interval that
+/// starts the reports.
+fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<()> {
     // The CT817 gets its calibration from the AOP driver over the setup port,
     // not as an ALS property. Only the transport can fail here; the sensor's
     // status words are logged, see the property comments above. Do not fetch
@@ -105,15 +121,13 @@ fn enable_als(
     // wedges the AOP for the rest of the boot.
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
-            dev.as_ref(),
-            "{} = {:#x}: status {:#x}\n",
-            what,
-            val,
-            status
-        );
+        dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
+    // The sensor arms only on a zero to non-zero transition of the interval.
+    // It is zero at boot and stopped after a sleep, but a previous driver
+    // instance may have left it running, so write zero first every time.
+    set(ALS_PROP_INTERVAL, 0, "interval")?;
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
     set(
         ALS_PROP_BATCH_INTERVAL,
@@ -121,9 +135,180 @@ fn enable_als(
         "batch interval",
     )?;
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
-    // The interval is zero at probe, so this is the transition that arms the
-    // sensor.
+    // The transition that arms the sensor.
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
+}
+
+/// Stops the reports for system sleep and starts them again after it.
+///
+/// The sensor reports on its own every `ALS_INTERVAL_US`, and each report is
+/// an AOP mailbox interrupt. In suspend-to-idle those interrupts go on and
+/// wake a CPU for a reading nobody takes, so the reports stop before the
+/// sleep, as the lid angle driver's do.
+///
+/// The CT817 needs more after the sleep: the firmware stops its reports for
+/// system sleep and does not start them again. On the J700 every read after
+/// the first wake of a boot returned the last sample from before that sleep,
+/// while the room's light changed. The sensor starts reporting only on a zero
+/// to non-zero transition of its interval, so the wake repeats the arming of
+/// the probe, which starts with an interval of zero. The other parts need only
+/// their interval back.
+#[repr(C)]
+struct PmHook {
+    /// First, so that the callback finds the hook from it.
+    nb: Opaque<bindings::notifier_block>,
+    dev: ARef<device::Device>,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    /// The part arms only through the whole CT817 sequence.
+    ct817: bool,
+    /// A stop was tried for the sleep in progress. It is set before the
+    /// command goes out: a stop whose reply was lost may still have been
+    /// applied, so the wake restores the interval after every attempt.
+    stop_attempted: Atomic<bool>,
+    registered: Atomic<bool>,
+}
+
+/// The PM notifier callback.
+///
+/// # Safety
+///
+/// `nb` is the notifier block of a registered [`PmHook`].
+unsafe extern "C" fn pm_event(
+    nb: *mut bindings::notifier_block,
+    action: usize,
+    _data: *mut c_void,
+) -> c_int {
+    // SAFETY: `nb` is the first field of a registered `PmHook`.
+    let hook = unsafe { &*nb.cast::<PmHook>() };
+    let aop = hook.aop.as_ref();
+    match action as u32 {
+        bindings::PM_SUSPEND_PREPARE => {
+            // A sensor that keeps reporting only costs wakeups: never refuse
+            // the sleep over it.
+            hook.stop_attempted.store(true, Relaxed);
+            match set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes()) {
+                Ok(_) => dev_dbg!(hook.dev, "reports off for sleep\n"),
+                Err(e) => dev_warn!(hook.dev, "reports may be left on for sleep: {:?}\n", e),
+            }
+        }
+        bindings::PM_POST_SUSPEND => {
+            let attempted = hook.stop_attempted.xchg(false, Relaxed);
+            // The CT817 is stopped by the firmware even when the host did not
+            // stop it, so it is armed again after every sleep. The other parts
+            // get their interval back after every attempted stop, whether or
+            // not the stop's reply arrived; writing the active interval to a
+            // sensor that kept reporting changes nothing.
+            let rearm = if hook.ct817 {
+                arm_ct817(aop, &hook.dev, &hook.service)
+            } else if attempted {
+                set_als_property(
+                    aop,
+                    &hook.service,
+                    ALS_PROP_INTERVAL,
+                    &ALS_INTERVAL_US.to_le_bytes(),
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            match rearm {
+                Ok(()) => dev_dbg!(hook.dev, "reports back after sleep\n"),
+                Err(e) => dev_warn!(hook.dev, "reports not back after sleep: {:?}\n", e),
+            }
+        }
+        _ => return bindings::NOTIFY_DONE as c_int,
+    }
+    bindings::NOTIFY_OK as c_int
+}
+
+/// # Safety
+///
+/// `nb` stays valid and pinned until [`pm_unregister`] is called on it.
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe fn pm_register(nb: *mut bindings::notifier_block) -> c_int {
+    // SAFETY: By the caller's contract.
+    unsafe { bindings::register_pm_notifier(nb) }
+}
+
+/// # Safety
+///
+/// `nb` was registered by [`pm_register`].
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe fn pm_unregister(nb: *mut bindings::notifier_block) {
+    // SAFETY: By the caller's contract.
+    unsafe { bindings::unregister_pm_notifier(nb) };
+}
+
+/// Without system sleep there is nothing to arm again.
+///
+/// # Safety
+///
+/// None; the signature matches the one with system sleep.
+#[cfg(not(CONFIG_PM_SLEEP))]
+unsafe fn pm_register(_nb: *mut bindings::notifier_block) -> c_int {
+    0
+}
+
+/// # Safety
+///
+/// None; the signature matches the one with system sleep.
+#[cfg(not(CONFIG_PM_SLEEP))]
+unsafe fn pm_unregister(_nb: *mut bindings::notifier_block) {}
+
+// SAFETY: The notifier block is only touched by the PM core, which
+// serializes registration, removal and the callbacks itself.
+unsafe impl Send for PmHook {}
+// SAFETY: See above; the other fields are `Sync`.
+unsafe impl Sync for PmHook {}
+
+impl PmHook {
+    fn new(
+        dev: &device::Device,
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        ct817: bool,
+    ) -> Result<Pin<KBox<Self>>> {
+        let hook = KBox::pin(
+            Self {
+                nb: Opaque::new(bindings::notifier_block {
+                    notifier_call: Some(pm_event),
+                    next: ptr::null_mut(),
+                    priority: 0,
+                }),
+                dev: dev.into(),
+                aop,
+                service,
+                ct817,
+                stop_attempted: Atomic::new(false),
+                registered: Atomic::new(false),
+            },
+            GFP_KERNEL,
+        )?;
+        // SAFETY: The block is pinned inside the hook, which unregisters it
+        // before it goes.
+        let ret = unsafe { pm_register(hook.nb.get()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        hook.registered.store(true, Relaxed);
+        Ok(hook)
+    }
+
+    /// Returns once no callback is running any more; repeated calls do
+    /// nothing.
+    fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            // SAFETY: `nb` was registered by `new()`.
+            unsafe { pm_unregister(self.nb.get()) };
+        }
+    }
+}
+
+impl Drop for PmHook {
+    fn drop(&mut self) {
+        self.unregister();
+    }
 }
 
 fn get_aop_property(
@@ -206,9 +391,13 @@ enum AlsIio {
 }
 
 struct IIOAopAlsDriver {
-    /// Declared first: the subscription ends before the IIO device goes.
+    /// Fields are declared in teardown order: the sleep hook first, then the
+    /// subscription, which ends before the IIO device goes.
+    pm: Pin<KBox<PmHook>>,
     listener: FakehidRegistration,
     _iio: AlsIio,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
 }
 
 fn register_channels<const N: usize>(
@@ -285,13 +474,29 @@ impl platform::Driver for IIOAopAlsDriver {
                 },
             )
         };
+        let pm = PmHook::new(dev, adata.clone(), service, offset == LUX_OFFSET_CT817)?;
         Ok(IIOAopAlsDriver {
+            pm,
             listener,
             _iio: iio,
+            aop: adata,
+            service,
         })
     }
 
-    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+    fn unbind(dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        this.pm.unregister();
+        // The sensor keeps reporting until its interval is zero, and every
+        // report is an AOP mailbox interrupt. Stop it before the listener
+        // goes; a failure only costs those interrupts, so unbind goes on.
+        if let Err(e) = set_als_property(
+            this.aop.as_ref(),
+            &this.service,
+            ALS_PROP_INTERVAL,
+            &0u32.to_le_bytes(),
+        ) {
+            dev_warn!(dev.as_ref(), "reports not stopped at unbind: {:?}\n", e);
+        }
         this.listener.unregister();
     }
 }

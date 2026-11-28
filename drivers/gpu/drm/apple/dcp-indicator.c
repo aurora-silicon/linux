@@ -44,6 +44,7 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 {
 	struct dcp_camera_indicator *ci = &dcp->camera_ind;
 	u32 surf;
+	unsigned long top_surf = find_last_bit(dcp->iomfb_surfaces, SWAP_SURFACES);
 
 	spin_lock_init(&ci->lock);
 	mutex_init(&ci->ctl);
@@ -58,9 +59,11 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "no camera indicator: this DCP profile has no swap_done hook\n");
 		return 0;
 	}
-	if (surf >= SWAP_SURFACES || test_bit(surf, dcp->iomfb_surfaces))
+	/* find_last_bit is the bitmap size when no userspace slot is enabled. */
+	if (surf >= SWAP_SURFACES || (top_surf != SWAP_SURFACES && surf <= top_surf))
 		return dev_err_probe(dcp->dev, -EINVAL,
-				     "camera indicator surface %u is not free\n", surf);
+				     "camera indicator surface %u is not free above surface %lu\n",
+				     surf, top_surf);
 	ci->surf = surf;
 	ci->has_surf = true;
 	return 0;

@@ -179,6 +179,13 @@ pub(crate) trait Queue: Send + Sync {
         Err(EINVAL)
     }
 
+    /// Lets submissions with output syncs return once accepted
+    /// (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT). Only queues of GPUs that advertise
+    /// DRM_ASAHI_FEATURE_ASYNC_SUBMIT take it.
+    fn set_async_submit(&mut self) -> Result {
+        Err(EINVAL)
+    }
+
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         if layouts != [0; 2] {
             return Err(EINVAL);
@@ -190,7 +197,7 @@ pub(crate) trait Queue: Send + Sync {
         &mut self,
         reg_data: &AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
@@ -717,7 +724,9 @@ impl Queue::ver {
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
-        let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+        let buffer = buffer::Buffer::ver::new(
+            gpu, alloc, ualloc.clone(), ualloc_priv, mgr, buffer::ParameterListPlacement::VmPrivate,
+        )?;
 
         let gpu_context = Arc::new(
             workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
@@ -900,6 +909,38 @@ fn wait_fence(fence: &Fence, interruptible: bool, timeout: kernel::ffi::c_long) 
 
 #[versions(AGX)]
 impl Queue::ver {
+    /// Add a barrier to `queue_job` that waits for `event`.
+    fn add_explicit_barrier(
+        dev: &AsahiDevRef,
+        gpu: &gpu::GpuManager::ver,
+        queue_job: &mut workqueue::Job::ver,
+        event: &workqueue::QueueEventInfo::ver,
+        vm_slot: u32,
+        id: u64,
+    ) -> Result {
+        let mut alloc = gpu.alloc();
+        mod_dev_dbg!(dev, "[Submission {}] Create Explicit Barrier\n", id);
+        let barrier = alloc.private.new_init(
+            pin_init::zeroed::<fw::workqueue::Barrier>(),
+            |_inner, _p| {
+                let queue_job = &*queue_job;
+                try_init!(fw::workqueue::raw::Barrier {
+                    tag: fw::workqueue::CommandType::Barrier,
+                    wait_stamp: event.fw_stamp_pointer,
+                    wait_value: event.value,
+                    wait_slot: event.slot,
+                    stamp_self: queue_job.event_info().value.next(),
+                    uuid: 0xffffbbbb,
+                    external_barrier: 0,
+                    internal_barrier_type: 1,
+                    padding: Default::default(),
+                })
+            },
+        )?;
+        mod_dev_dbg!(dev, "[Submission {}] Add Explicit Barrier\n", id);
+        queue_job.add(barrier, vm_slot)
+    }
+
     /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for the last submitted job to finish. The
     /// jobs of one queue complete in order, so its finished fence covers all of them.
     fn wait_submitted(&self) {
@@ -969,7 +1010,7 @@ impl Queue for Queue::ver {
         &mut self,
         reg_data: &AsahiRegData<'drm>,
         id: u64,
-        mut syncs: KVec<file::SyncItem>,
+        mut syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
@@ -1237,6 +1278,14 @@ impl Queue for Queue::ver {
             // Pre-increment command index to match last_compute/last_render
             command_index += 1;
 
+            // A render's wait for earlier renders is added once its flags are
+            // known: without DRM_ASAHI_RENDER_FRAGMENT_BARRIERS it goes on the
+            // vertex queue; with it, it goes on the fragment queue, so the
+            // vertex half can run beside the earlier fragment work. Each
+            // fragment half also waits for its own vertex half.
+            let is_render =
+                u32::from(header.cmd_type) == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER;
+            let mut render_wait = None;
             for (queue_idx, index) in [header.vdm_barrier, header.cdm_barrier].iter().enumerate() {
                 if *index == uapi::DRM_ASAHI_BARRIER_NONE as u16 {
                     continue;
@@ -1245,32 +1294,16 @@ impl Queue for Queue::ver {
                     cls_pr_debug!(Errors, "Invalid barrier #{}: {}\n", queue_idx, index);
                     EINVAL
                 })? {
-                    let mut alloc = gpu.alloc();
+                    if is_render && queue_idx == SQ_RENDER {
+                        render_wait = Some(*event);
+                        continue;
+                    }
                     let queue_job = match u32::from(header.cmd_type) {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => job.get_comp()?,
                         _ => return Err(EINVAL),
                     };
-                    mod_dev_dbg!(self.dev, "[Submission {}] Create Explicit Barrier\n", id);
-                    let barrier = alloc.private.new_init(
-                        pin_init::zeroed::<fw::workqueue::Barrier>(),
-                        |_inner, _p| {
-                            let queue_job = &queue_job;
-                            try_init!(fw::workqueue::raw::Barrier {
-                                tag: fw::workqueue::CommandType::Barrier,
-                                wait_stamp: event.fw_stamp_pointer,
-                                wait_value: event.value,
-                                wait_slot: event.slot,
-                                stamp_self: queue_job.event_info().value.next(),
-                                uuid: 0xffffbbbb,
-                                external_barrier: 0,
-                                internal_barrier_type: 1,
-                                padding: Default::default(),
-                            })
-                        },
-                    )?;
-                    mod_dev_dbg!(self.dev, "[Submission {}] Add Explicit Barrier\n", id);
-                    queue_job.add(barrier, vm_slot)?;
+                    Self::add_explicit_barrier(&self.dev, &gpu, queue_job, event, vm_slot, id)?;
                 } else {
                     assert!(*index == 0);
                 }
@@ -1283,6 +1316,25 @@ impl Queue for Queue::ver {
                         .inspect_err(|_| {
                             cls_pr_debug!(Errors, "Unsupported render command fields\n")
                         })?;
+
+                    // The wait names earlier fragment work of this queue (index 0 is its
+                    // last fragment event, later indices are renders of this
+                    // submission). The fragment workqueue runs that work first, but queue
+                    // order alone does not make it finish first, so with FRAGMENT_BARRIERS
+                    // the wait moves to the fragment half instead of being dropped.
+                    let fragment_only = render.flags
+                        & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
+                        != 0;
+                    if let Some(event) = render_wait.take() {
+                        let queue_job = if fragment_only {
+                            job.get_frag()?
+                        } else {
+                            job.get_vtx()?
+                        };
+                        Self::add_explicit_barrier(
+                            &self.dev, &gpu, queue_job, &event, vm_slot, id,
+                        )?;
+                    }
 
                     self.inner.submit_render(
                         &gpu,

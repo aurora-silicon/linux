@@ -345,6 +345,19 @@ config BT_HCIBCM4377
 	  Say Y here to compile support for HCI BCM4377 family devices into the
 	  kernel or say M to compile it as module (hci_bcm4377).
 
+config BT_HCIBCM4377_KUNIT_TEST
+	bool "KUnit tests for the HCI BCM4377 PCIe driver" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && BT_HCIBCM4377
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests into the BCM4377 family PCIe driver. They check,
+	  without radio hardware, that a transfer ring is filled at the
+	  host's own producer index whatever the shared ring state holds,
+	  and that an event longer than its completion entry's footer is
+	  dropped.
+
+	  If unsure, say N.
+
 config BT_HCIBPA10X
 	tristate "HCI BPA10x USB driver"
 	depends on BT_HCIUART

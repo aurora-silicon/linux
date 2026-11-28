@@ -4,11 +4,19 @@
  *
  * target-type: K114s (Mac17,13)
  *
- * Preliminary: described from the ADT only, not yet booted on the hardware.
+ * Preliminary: described from the ADT. Only the NVRAM partition (t6050-k114-k116.dtsi) has been run
+ * on a K114s, from the boot loader's tree; this file as a whole has not been booted.
  *
  * Copyright The Asahi Linux Contributors
  */
 
+/* Defined before the includes, which select this board's blocks on it. */
+#define T6050_K114S
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
+/* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
+#define T6050_K_N1_FIRMWARE	"apple/centauri/k114s-ftab.bin"
+#define T6050_K_BOARD_ID	0x14
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -20,5 +28,35 @@
 	firmware-name = "apple/tpmtfw-k114s.bin";
 };
 
-#define T6050_K114S
 #include "t6050-peripherals.dtsi"
+
+/* The 14-inch chassis: the Neural Engine, pins, the jack, the card and the AOP; no speakers */
+#include "t6050-k114.dtsi"
+
+/* The GPU, handed over by the boot loader */
+#include "t6050-k114-k116-gpu.dtsi"
+
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/*
+ * The 14.2-inch 3024x1986 panel's active area (254 dpi, the notch rows included), for the
+ * DPI only (the ADT carries none)
+ */
+&panel {
+	compatible = "apple,panel-k114", "apple,panel";
+	width-mm = <302>;
+	height-mm = <199>;
+};
+
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k114s.bin", "apple/msrk-k114s.bin"
+#include "t6050-touchid.dtsi"
+
+/*
+ * The USB-C ports ATC1 and ATC2, as on the other K boards (t6050-k114-k116-usb.dtsi), then the
+ * 14-inch chassis' MagSafe 3 PD controller and the right port's USB4/Thunderbolt router
+ * (t6050-k114-usb.dtsi).
+ */
+#include "t6050-k114-k116-usb.dtsi"
+#include "t6050-k114-usb.dtsi"
