@@ -1267,9 +1267,10 @@ static void apple_dpin_retry_fn(struct work_struct *work)
 }
 
 /*
- * Only where both the display allocator and the connection manager can hold
- * a tunnel for a pipeline (capacity-retry hosts, see
- * apple_nhi_dp_tunnel_awaits_display()) does a refused tunnel wait for one.
+ * Only where the policy has capacity_retry does a refused tunnel wait for a
+ * pipeline. The connection manager keeps it meanwhile: through
+ * apple_nhi_dp_tunnel_awaits_display() on the APPLE_DPIN_CHANGED flow, and
+ * through TB_HOST_DP_KEEP_DPRX_TIMEOUT on the APPLE_DPIN_PRE_POST one.
  */
 static void apple_dpin_work_fn(struct work_struct *work)
 {
@@ -2929,9 +2930,20 @@ err:
 
 static void apple_dpin_end_pm_gate(struct apple_cio *acio)
 {
-	if (!acio->dp_wq || !acio->dp->defer_new_bringup)
+	if (!acio->dp_wq || !apple_dpin_pm_gated(acio->dp))
 		return;
-	/* Domain removal stopped producers. No DP-IN/domain/fabric lock held. */
+	/*
+	 * Domain removal stopped producers. No DP-IN/domain/fabric lock held.
+	 * Pause first, as apple_dpin_pause_retries() does, so that work still
+	 * in flight cannot rearm the retry once it is cancelled.
+	 */
+	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+
+		scoped_guard(mutex, &c->lock)
+			apple_dpin_step(&c->state, acio->dp, APPLE_DPIN_PAUSE,
+					!!c->regs, 0);
+	}
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
 
@@ -2967,13 +2979,14 @@ static void apple_nhi_remove(struct platform_device *pdev)
  * seconds.  Not while devices suspend and resume: stop asking before any of
  * them suspends, let an attempt in flight finish (a wait for appledrm to
  * load gives way, see apple_dpin_connect()), and ask again once all of them
- * have resumed. The tunnel keeps waiting meanwhile. Suspend-gated handoffs
- * are deferred until complete, including after an aborted suspend. Established
- * handed callbacks and synchronous tunnel teardown remain permitted.
+ * have resumed. The tunnel keeps waiting meanwhile. Where the policy has
+ * defer_new_bringup, new handoffs are deferred until complete, including
+ * after an aborted suspend. Established handed callbacks and synchronous
+ * tunnel teardown remain permitted.
  */
 static void apple_dpin_pause_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq || !acio->dp->defer_new_bringup)
+	if (!acio->dp_wq || !apple_dpin_pm_gated(acio->dp))
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
@@ -2991,7 +3004,7 @@ static void apple_dpin_pause_retries(struct apple_cio *acio)
 
 static void apple_dpin_resume_retries(struct apple_cio *acio)
 {
-	if (!acio->dp_wq || !acio->dp->defer_new_bringup)
+	if (!acio->dp_wq || !apple_dpin_pm_gated(acio->dp))
 		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		struct apple_dpin_ctx *c = &acio->dpin[i];
@@ -3171,12 +3184,18 @@ static void apple_nhi_complete(struct device *dev)
 	struct apple_cio *acio = anhi->acio;
 
 	apple_nhi_cio_complete(anhi);
-	tb_domain_complete(anhi->tb);
 	/*
+	 * Every device has resumed. Without deferred handoffs, a tunnel that
+	 * the domain's complete brings up makes its first attempt right away;
+	 * let its retries run from then on too.
+	 *
 	 * A dark wake sleeps again at once and lights no display: DP IN admission, paused again by
 	 * the next .prepare, stays paused through the gap and reopens at the final wake.
 	 */
-	if (!pm_dark_wake())
+	if (!acio->dp->defer_new_bringup && !pm_dark_wake())
+		apple_dpin_resume_retries(acio);
+	tb_domain_complete(anhi->tb);
+	if (acio->dp->defer_new_bringup && !pm_dark_wake())
 		apple_dpin_resume_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
