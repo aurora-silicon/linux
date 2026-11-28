@@ -4334,6 +4334,8 @@ struct macaudio_platform_cfg macaudio_j604_cfg = {
 	.secondary_bclk_ratio = 250,
 	.fe_cpu_is_platform = true,
 	.route_only_fes = BIT(0),
+	/* Granted, the tweeters restore their DT corner, as on the J614s */
+	.tweeter_hpf_granted = true,
 };
 
 /*
