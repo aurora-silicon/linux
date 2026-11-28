@@ -205,11 +205,8 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     ],
     // 40-core T6041 parts (J614C, J575C) stay on TA mode 1 until clustered tiling is tested on
     // 40-core hardware; 32-core parts run [`BUILD_25G83_32CORE`] below.
-    // T6041's 25G83 firmware emits pstate reports (tags 0x19/0x1b) and 8 ms
-    // timestamped utilisation records (tag 0x13).
     variant: &fw::variant::Variant {
         ta_mode_1: true,
-        telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
         ..fw::variant::V25G83
     },
     config: None,
