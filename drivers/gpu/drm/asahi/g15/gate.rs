@@ -75,7 +75,7 @@ struct Window {
 impl Window {
     /// The `count` words at `va`, reading whole spans of up to 256 bytes (not past the page
     /// unless the record crosses it). Unreadable memory: EFAULT.
-    fn words(&mut self, vm: &mut mmu::VmReadGuard, va: u64, count: usize) -> Result<[u32; 10]> {
+    fn words(&mut self, vm: &mut mmu::VmReadGuard<'_>, va: u64, count: usize) -> Result<[u32; 10]> {
         let n = count * 4;
         let cached = self.len != 0
             && va >= self.va
@@ -112,7 +112,7 @@ struct Checked {
 
 /// One page check of `[start, end)` under the walk's page budget: ENOSPC once the budget is
 /// spent.
-fn check(vm: &mut mmu::VmReadGuard, start: u64, end: u64, count: &mut u32) -> Result {
+fn check(vm: &mut mmu::VmReadGuard<'_>, start: u64, end: u64, count: &mut u32) -> Result {
     if *count >= CDM_MAX_PAGE_CHECKS {
         return Err(ENOSPC);
     }
@@ -122,7 +122,7 @@ fn check(vm: &mut mmu::VmReadGuard, start: u64, end: u64, count: &mut u32) -> Re
 
 /// A launch's program: inside the queue's 4 GiB USC window, 64-aligned, first block readable.
 /// The last proven program page is not checked again.
-fn program(vm: &mut mmu::VmReadGuard, usc: u64, address: u64, checked: &mut Checked) -> Result {
+fn program(vm: &mut mmu::VmReadGuard<'_>, usc: u64, address: u64, checked: &mut Checked) -> Result {
     if address < usc || address - usc >= USC_WINDOW || address & 63 != 0 {
         return Err(EINVAL);
     }
@@ -138,7 +138,7 @@ fn program(vm: &mut mmu::VmReadGuard, usc: u64, address: u64, checked: &mut Chec
 
 /// An indirect launch's 12 argument bytes: readable. The last proven argument page is not
 /// checked again; arguments that cross a page are checked each time.
-fn arguments(vm: &mut mmu::VmReadGuard, address: u64, checked: &mut Checked) -> Result {
+fn arguments(vm: &mut mmu::VmReadGuard<'_>, address: u64, checked: &mut Checked) -> Result {
     let end = address.checked_add(12).ok_or(EINVAL)?;
     let page = address & !(mmu::UAT_PGMSK as u64);
     let within = (end - 1) & !(mmu::UAT_PGMSK as u64) == page;
@@ -154,7 +154,7 @@ fn arguments(vm: &mut mmu::VmReadGuard, address: u64, checked: &mut Checked) -> 
 
 /// VDM admission: a normal root stream opens with the G15 barrier, with or
 /// without the USC cache invalidate.
-pub(crate) fn vdm(vm: &mut mmu::VmReadGuard, va: u64) -> Result {
+pub(crate) fn vdm(vm: &mut mmu::VmReadGuard<'_>, va: u64) -> Result {
     if !params::stream_gate() {
         return Ok(());
     }
@@ -170,7 +170,7 @@ pub(crate) fn vdm(vm: &mut mmu::VmReadGuard, va: u64) -> Result {
 /// CDM admission: walks the stream from its base through no-return links until TERMINATE,
 /// admitting only the known G15S records: direct launch (40), indirect launch (36/24), barriers
 /// (4), link (8).
-pub(crate) fn cdm(vm: &mut mmu::VmReadGuard, usc: u64, base: u64) -> Result {
+pub(crate) fn cdm(vm: &mut mmu::VmReadGuard<'_>, usc: u64, base: u64) -> Result {
     if !params::stream_gate() {
         return Ok(());
     }

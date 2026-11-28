@@ -96,6 +96,8 @@ struct apple_mbox {
 };
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index);
+/* As apple_mbox_get(), for a mailbox named by a property other than mboxes */
+struct apple_mbox *apple_mbox_get_prop(struct device *dev, const char *prop, int index);
 struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);

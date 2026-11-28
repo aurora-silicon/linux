@@ -164,6 +164,11 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
 
+/* As apple_rtkit_init(), with the mailbox named by @mbox_prop instead of mboxes. */
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops);
+
 /*
  * Initialize an instance for a co-processor that the bootloader left running
  * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
@@ -300,6 +305,7 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
  */
 
 int apple_rtkit_poweroff(struct apple_rtkit *rtk);
+int apple_rtkit_mbox_restore(struct apple_rtkit *rtk);
 
 /*
  * After poweroff and a power cycle: start a fresh session, let @start start the
@@ -315,6 +321,7 @@ int apple_rtkit_idle(struct apple_rtkit *rtk);
 /* The mailbox's receive-enable bit (I2A_CONTROL bit 0): off once a slept firmware has answered its idle. */
 void apple_rtkit_set_recv_enabled(struct apple_rtkit *rtk, bool enabled);
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk);
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, int (*after_ap)(void *data), void *data);
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk);
 int apple_rtkit_warm_restart_stopped(struct apple_rtkit *rtk);
 

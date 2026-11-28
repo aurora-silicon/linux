@@ -415,3 +415,7 @@ module_platform_driver(macsmc_reboot_driver);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC reboot/poweroff driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
+
+#if IS_ENABLED(CONFIG_POWER_RESET_MACSMC_KUNIT_TEST)
+#include "macsmc-reboot-test.c"
+#endif

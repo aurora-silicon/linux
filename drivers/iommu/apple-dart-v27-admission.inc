@@ -10,9 +10,7 @@ static bool apple_dart_v27_provider(struct device *dev, resource_size_t base)
 	unsigned int i;
 
 	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
-	    !(of_machine_is_compatible("apple,j714s") ||
-	      (of_machine_is_compatible("apple,j716c") &&
-	       of_machine_is_compatible("apple,t6050"))) ||
+	    !apple_t6050_sleep_described() ||
 	    !of_device_is_compatible(dev->of_node, "apple,t6050-dart"))
 		return false;
 	for (i = 0; i < ARRAY_SIZE(ids); i++)

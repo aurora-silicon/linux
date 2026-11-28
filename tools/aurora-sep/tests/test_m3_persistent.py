@@ -255,6 +255,8 @@ class Persistent(test_m3_handoff.M3PathTest):
         return self.selection()+f'''
 chain=limine
 work="{work}"
+# What install_all checked (m3_install_packages installs these by name).
+INSTALL_ARCHIVES=("$work/matched.pkg.tar.zst")
 M3_LIMINE_DEFAULTS="{defaults}"
 M3_GRUB_DEFAULTS="{self.etc}/default/grub"
 M3_PROFILE_HOOK="{self.etc}/hooks/profile.hook"

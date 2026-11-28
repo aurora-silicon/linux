@@ -17,7 +17,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::prelude::*;
 
-use super::{command::cover, command::USC_WINDOW, params};
+use super::{
+    command::{cover_locked, SpanProof, USC_WINDOW},
+    params,
+};
 use crate::mmu;
 
 const VDM_ROOT: u32 = 0x21000960;
@@ -59,20 +62,33 @@ struct Window {
 
 impl Window {
     /// The `count` words at `va`, reading whole spans of up to 256 bytes (not past the page
-    /// unless the record crosses it). Unreadable memory: EFAULT.
-    fn words(&mut self, vm: &mmu::Vm, va: u64, count: usize) -> Result<[u32; 10]> {
+    /// or an optional root-stream `limit` unless the record crosses it) under an already-held
+    /// VM read lock. Unreadable memory: EFAULT.
+    fn words(
+        &mut self,
+        guard: &mut mmu::VmReadGuard<'_>,
+        epoch: Option<u64>,
+        proof: Option<&mut SpanProof>,
+        va: u64,
+        count: usize,
+        limit: Option<u64>,
+    ) -> Result<[u32; 10]> {
         let n = count.checked_mul(4).filter(|&n| n <= 40).ok_or(EINVAL)?;
-        cover(vm, va, va.checked_add(n as u64).ok_or(EINVAL)?, true, false)?;
-        let cached = self.len != 0
-            && va >= self.va
-            && va
-                .checked_add(n as u64)
-                .is_some_and(|end| end <= self.va + self.len as u64);
+        let end = va.checked_add(n as u64).ok_or(EINVAL)?;
+        let cached = self.len != 0 && va >= self.va && end <= self.va + self.len as u64;
         if !cached {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
-            let len = n.max(self.bytes.len().min(in_page));
+            let mut max_len = self.bytes.len().min(in_page);
+            if let Some(limit_va) = limit {
+                let rem = usize::try_from(limit_va.saturating_sub(va)).unwrap_or(usize::MAX);
+                max_len = max_len.min(rem);
+            }
+            let len = n.max(max_len);
+            let cover_end = va.checked_add(len as u64).ok_or(EINVAL)?;
+            cover_locked(guard, epoch, proof, va, cover_end, true, false)?;
             self.len = 0;
-            vm.read_user(va, &mut self.bytes[..len])
+            guard
+                .read_user(va, &mut self.bytes[..len])
                 .map_err(|_| EFAULT)?;
             self.va = va;
             self.len = len;
@@ -91,7 +107,14 @@ impl Window {
 
 /// A launch's program: inside the queue's 4 GiB USC window, 64-aligned, first block readable.
 /// `checked` caches the last proven program page.
-fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> Result {
+fn program(
+    guard: &mut mmu::VmReadGuard<'_>,
+    epoch: Option<u64>,
+    proof: Option<&mut SpanProof>,
+    usc: u64,
+    address: u64,
+    checked: &mut Option<u64>,
+) -> Result {
     if address < usc || address - usc >= USC_WINDOW || address & 63 != 0 {
         return Err(EINVAL);
     }
@@ -100,32 +123,62 @@ fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> R
     if *checked == Some(page) {
         return Ok(());
     }
-    cover(vm, address, address + 64, true, false)?;
+    cover_locked(guard, epoch, proof, address, address + 64, true, false)?;
     *checked = Some(page);
     Ok(())
 }
 
-/// VDM admission: a normal root stream opens with the G16 barrier, with or
-/// without the USC cache invalidate.
-pub(crate) fn vdm(vm: &mmu::Vm, va: u64) -> Result {
-    if !params::stream_gate() {
+/// VDM admission for a batch of root streams under an already-held VM read lock.
+/// Each root stream opens with the G16 barrier, with or without the USC cache invalidate.
+/// Reads only the 4-byte root word for a single pass to minimize PoC cache maintenance,
+/// and caches up to 256 intra-page bytes across multi-pass batches. Each normal root stream
+/// opens with the G16 barrier, with or without the USC cache invalidate.
+pub(crate) fn vdm_batch_locked(guard: &mut mmu::VmReadGuard<'_>, vas: &[u64]) -> Result {
+    if vas.is_empty() || !params::stream_gate() {
         return Ok(());
     }
-    let mut bytes = [0u8; 4];
-    vm.read_user(va, &mut bytes).map_err(|_| EFAULT)?;
-    let word = u32::from_le_bytes(bytes);
-    if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
-        return Err(reject("VDM root", va, &[word]));
+    let mut win_va = 0u64;
+    let mut win_len = 0usize;
+    let mut buf = [0u8; 256];
+    let max_read = if vas.len() == 1 { 4 } else { buf.len() };
+    for &va in vas {
+        let end = va.checked_add(4).ok_or(EINVAL)?;
+        let cached = win_len != 0 && va >= win_va && end <= win_va + win_len as u64;
+        if !cached {
+            let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
+            let len = max_read.min(in_page);
+            if len < 4 {
+                return Err(EINVAL);
+            }
+            guard.read_user(va, &mut buf[..len]).map_err(|_| EFAULT)?;
+            win_va = va;
+            win_len = len;
+        }
+        let off = (va - win_va) as usize;
+        let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
+            return Err(reject("VDM root", va, &[word]));
+        }
     }
     Ok(())
 }
 
-/// CDM admission: walks the root and no-return linked streams to TERMINATE.
+/// CDM admission: walks the root and no-return linked streams to TERMINATE under an optional
+/// caller-held VM read lock, sharing both the lock and epoch-validated [`SpanProof`] across
+/// span checks and stream gates.
 /// All requested bytes are proven readable; the root cannot end inside a record.
 /// Mode 0 has six inline grid words, mode 1 three inline local-size words and
 /// an indirect global grid, mode 2 an indirect six-word grid. The remaining
 /// launch-template payload words stay opaque, as in Mesa's raw AGX3 decoder.
-pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
+pub(crate) fn cdm_locked<'a>(
+    vm: &'a mmu::Vm,
+    guard: &mut Option<mmu::VmReadGuard<'a>>,
+    epoch: &mut Option<u64>,
+    usc: u64,
+    base: u64,
+    end: u64,
+    mut proof: Option<&mut SpanProof>,
+) -> Result {
     if !params::stream_gate() {
         return Ok(());
     }
@@ -147,7 +200,13 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
     let mut distance = 0u64;
     let mut power = 1u64;
     let mut first = true;
-    let mut resched = 0;
+    // A caller that already holds `guard` checked signals before locking; reuse the
+    // held guard for the first window of records instead of dropping it on record 0.
+    let mut resched = if guard.is_some() {
+        CDM_RESCHED_RECORDS
+    } else {
+        0
+    };
     loop {
         if first {
             first = false;
@@ -163,10 +222,13 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             }
         }
         if resched == 0 {
-            // No VM lock is held between reads. Keep a long userspace stream
-            // preemptible and allow its submitting task to be interrupted.
+            // Release the VM lock and clear cached window/program proofs before
+            // rescheduling so any mapping change while unlocked is re-verified.
             // might_sleep() includes might_resched() (cond_resched on voluntary kernels).
             // It is a real scheduling point, not only a debug assertion.
+            *guard = None;
+            window.len = 0;
+            checked = None;
             kernel::task::might_sleep();
             if kernel::current!().signal_pending() {
                 return Err(ERESTARTSYS);
@@ -174,14 +236,23 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             resched = CDM_RESCHED_RECORDS;
         }
         resched -= 1;
+        let active_guard = match guard.as_mut() {
+            Some(active) => active,
+            None => {
+                let active = guard.insert(vm.read_lock().map_err(|_| EFAULT)?);
+                *epoch = active.epoch();
+                active
+            }
+        };
         let root_bytes = |va: u64, bytes: u64| -> Result {
             if !linked && (va < base || va.checked_add(bytes).is_none_or(|at| at > end)) {
                 return Err(EINVAL);
             }
             Ok(())
         };
+        let limit = (!linked).then_some(end);
         root_bytes(va, 4)?;
-        let w = window.words(vm, va, 1)?;
+        let w = window.words(active_guard, *epoch, proof.as_deref_mut(), va, 1, limit)?;
         if w[0] == CDM_TERMINATE {
             return Ok(());
         }
@@ -201,7 +272,7 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
         }
         if w[0] & 0xffff0000 == CDM_LINK {
             root_bytes(va, 8)?;
-            let w = window.words(vm, va, 2)?;
+            let w = window.words(active_guard, *epoch, proof.as_deref_mut(), va, 2, limit)?;
             let target = (u64::from(w[0] & 0xffff) << 32) | u64::from(w[1]);
             if target & 3 != 0 || target == va {
                 return Err(reject("CDM link", va, &w));
@@ -221,9 +292,23 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             _ => return Err(reject("CDM launch mode", va, &w)),
         };
         root_bytes(va, (words * 4) as u64)?;
-        let w = window.words(vm, va, words)?;
+        let w = window.words(
+            active_guard,
+            *epoch,
+            proof.as_deref_mut(),
+            va,
+            words,
+            limit,
+        )?;
         let address = (u64::from(w[1] >> 22) << 38) | (u64::from(w[2]) << 6);
-        match program(vm, usc, address, &mut checked) {
+        match program(
+            active_guard,
+            *epoch,
+            proof.as_deref_mut(),
+            usc,
+            address,
+            &mut checked,
+        ) {
             Err(error) if error == EINVAL => return Err(reject("CDM program", va, &w)),
             result => result?,
         }
@@ -243,8 +328,10 @@ pub(crate) fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> Result {
             if indirect & 3 != 0 {
                 return Err(reject("CDM indirect parameters", va, &w));
             }
-            cover(
-                vm,
+            cover_locked(
+                active_guard,
+                *epoch,
+                proof.as_deref_mut(),
                 indirect,
                 indirect.checked_add(bytes).ok_or(EINVAL)?,
                 true,

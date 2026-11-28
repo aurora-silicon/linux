@@ -78,7 +78,24 @@ impl Pair {
     }
 
     fn can_park_backing(&self, context: &Arc<Context>) -> Result<bool> {
-        Ok(Arc::ptr_eq(context, self.context())
+        Ok(self.backing_detachable(context) && self.idle_for_context(context)?)
+    }
+
+    /// A killed guilty pair whose groups went on the guilty proof (`guilty_released`) but whose
+    /// rings the firmware has not consumed: the entries of the groups the kill unlinked may
+    /// never be read. It cannot park, since a parked pair's rings go to the next owner with
+    /// those entries naming freed descriptors, so `detach_context` keeps it, and its slot, out of
+    /// service until the processors stop.
+    pub(crate) fn can_keep(&self, context: &Arc<Context>) -> bool {
+        self.guilty_released
+            && self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() == 0
+            && self.backing_detachable(context)
+    }
+
+    fn backing_detachable(&self, context: &Arc<Context>) -> bool {
+        Arc::ptr_eq(context, self.context())
             && self
                 .previous
                 .as_ref()
@@ -86,7 +103,11 @@ impl Pair {
             && self.displaced.is_none()
             && self.pending_aliases.is_none()
             && self.kick_aliases.is_none()
-            && self.idle_for_context(context)?)
+    }
+
+    /// The pair's two ring cursors (`done`, `read`, `write`), for the detach log line.
+    pub(crate) fn ring_cursors(&self) -> Result<[crate::g17::queue::render::retirement::Cursors; 2]> {
+        self.memory.graph.cursors()
     }
 
     /// Consumes the pair only after can_park and all collector capacity checks succeeded
@@ -220,6 +241,7 @@ impl ParkedPair {
             &first.command,
             self.clusters,
             self.variant.programs,
+            self.board,
         )?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,
@@ -329,6 +351,8 @@ impl ParkedPair {
             registered: self.registered,
             outer_started: self.outer_started,
             quarantined: false,
+            guilty_released: false,
+            collateral_at: None,
             terminal: None,
             previous: self.previous.take(),
             displaced: None,

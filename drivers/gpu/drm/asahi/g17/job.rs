@@ -37,6 +37,13 @@ pub(crate) enum Engine {
 }
 
 impl Engine {
+    pub(crate) fn of(command: &Validated) -> Self {
+        match command {
+            Validated::Render { .. } => Self::Render,
+            Validated::Compute { .. } => Self::Compute,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Render => 0,
@@ -176,10 +183,7 @@ impl Packet {
     }
 
     pub(crate) fn engine(&self) -> Engine {
-        match &self.command {
-            Validated::Render { .. } => Engine::Render,
-            Validated::Compute { .. } => Engine::Compute,
-        }
+        Engine::of(&self.command)
     }
 
     /// Replay holds the device mutex. Its original inputs were satisfied before
@@ -270,6 +274,7 @@ impl Packet {
     }
     pub(crate) fn request_cancel(&self) -> bool {
         self.cancelled.store(true, Ordering::Release);
+        self.completion.clear_source_published();
         self.publication
             .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -323,7 +328,7 @@ pub(crate) trait Backend: Send + Sync {
     /// The device accepts command submission (an M5 GPU before its queues take submission
     /// does not).
     fn supports_submission(&self) -> bool { true }
-    /// Whether this backend's scheduler workers run in their queue creator's cluster (M5).
+    /// Whether this backend's scheduler workers run in their queue creator's cluster.
     fn creator_cluster_scheduling(&self) -> bool { false }
     /// Whether to keep compute input completion waits and wait on the host for other-engine
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
@@ -554,6 +559,13 @@ impl super::dependency::Retention for Fences {
 }
 
 impl Fences {
+    /// The command has an ordered host publication, or writes host timestamps and so is ready
+    /// only once it has completed and the host has written them (see `Scheduler::enqueue`).
+    /// Only such a command can be a same-engine predecessor or host wait of a later one.
+    pub(crate) fn publishes(&self) -> bool {
+        self.publication.is_some() || self.ready.raw() == self.completed.raw()
+    }
+
     /// Scheduler::enqueue always supplies our explicit completion fence here.
     /// It has no polling callback, so pending frontier checks need no lock.
     pub(crate) fn status(&self) -> i32 {
@@ -579,16 +591,21 @@ impl<B: Backend> Scheduler<B> {
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let device = dev.as_ref().as_ref();
-        let submit = if backend.creator_cluster_scheduling() {
+        // Run drm_sched's submit worker at WQ_HIGHPRI so host-waited jobs (such as
+        // query-access computes unblocked by completion events) are not delayed in
+        // CFS behind busy game/render threads.
+        let queue = workqueue::OwnedQueue::new_ordered_highpri_reclaim(name)?;
+        if backend.creator_cluster_scheduling() {
             // The run and free work stays in the creating CPU's cluster, as the event work
             // follows the submitter, instead of wherever an unbound worker last ran.
-            let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
-            queue.restrict(Cpumask::cluster_of(CpuId::current()))?;
-            Some(queue)
-        } else {
-            // drm_sched allocates its own ordered reclaim-safe queue.
-            None
-        };
+            let cluster = Cpumask::cluster_of(CpuId::current());
+            // Without a cpu-map in the device tree each CPU is its own cluster: the queue then
+            // stays unrestricted rather than tied to the one CPU that created it.
+            if cluster.weight() > 1 {
+                queue.restrict(cluster)?;
+            }
+        }
+        let submit = Some(queue);
         let scheduler = sched::Scheduler::new_with_queues(
             device, 1, credits, 0, TIMEOUT_MS, name, submit, Some(backend.fence_queue()),
         )?;

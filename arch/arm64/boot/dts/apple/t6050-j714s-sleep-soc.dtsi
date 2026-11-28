@@ -4576,7 +4576,11 @@
  * taking that DART down and back to the live value before using it again. The router's host
  * also needs the port's PHY, which it stops after the router and starts before it. The left
  * port's router was never up in a trace: it has none of this and is powered off for a sleep.
+ *
+ * A board that includes these SoC values without that router (no acio2) defines
+ * T6050_SLEEP_SOC_NO_CIO first.
  */
+#ifndef T6050_SLEEP_SOC_NO_CIO
 &die0 {
 	ps_prot: syscon@2803f0000 {
 		compatible = "apple,t6050-ps-prot", "syscon";
@@ -4595,3 +4599,4 @@
 &apciec2_dart {
 	apple,clock-protection = <&ps_prot 31>;
 };
+#endif /* T6050_SLEEP_SOC_NO_CIO */

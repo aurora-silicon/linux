@@ -548,6 +548,72 @@ static void apple_pmc_test_interface_boot_state(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
 }
 
+/*
+ * The AP's DCS vote waits for the PMC to take the previous vote, as other
+ * floor writes do, instead of writing over it.
+ */
+static void apple_pmc_test_dcs_floor_pending(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain *dom;
+	void __iomem *reg;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t8132;
+	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
+	writel(BIT(pmc->hw->ap_agent), reg + 4);
+	dom = apple_pmc_test_floor(test, pmc, pmc->hw->dcs_rail, 2);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_set(dom, true), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, dom->on);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), 0U);
+	writel(0, reg + 4);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_set(dom, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), 2U);
+}
+
+/*
+ * Leaving a DCS limit when the AP's vote is still pending rolls back the
+ * rail enable so dcs_state and hardware stay in sync until a retry clears it.
+ */
+static void apple_pmc_test_dcs_limit_release_pending(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct thermal_cooling_device cdev = { .devdata = pmc };
+	void __iomem *reg;
+
+	pmc->hw = hw;
+	INIT_DELAYED_WORK(&pmc->dcs_work, apple_pmc_dcs_work);
+	apple_pmc_test_set_dcs_vote(pmc, hw->ap_agent, 1);
+	apple_pmc_test_set_dcs_vote(pmc, 0, hw->dcs_max);
+	pmc->ap_dcs_vote = apple_pmc_ap_dcs_read(pmc);
+	pmc->enable[hw->dcs_rail] = BIT(0) | BIT(hw->ap_agent);
+	writel(pmc->enable[hw->dcs_rail],
+	       pmc->rails + hw->rail_enable + 4 * hw->dcs_rail);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_dcs_set_cur_state(&cdev, 2), 0);
+	KUNIT_EXPECT_EQ(test, pmc->dcs_state, 2UL);
+	KUNIT_EXPECT_EQ(test, apple_pmc_enable_read(pmc, hw->dcs_rail),
+			BIT(hw->ap_agent));
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max - 2);
+
+	reg = pmc->voters + hw->ap_agent * hw->agent_stride;
+	writel(BIT(hw->ap_agent), reg + 4);
+	KUNIT_EXPECT_EQ(test, apple_pmc_dcs_set_cur_state(&cdev, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, pmc->dcs_state, 2UL);
+	KUNIT_EXPECT_EQ(test, apple_pmc_enable_read(pmc, hw->dcs_rail),
+			BIT(hw->ap_agent));
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max - 2);
+
+	writel(0, reg + 4);
+	KUNIT_EXPECT_EQ(test, apple_pmc_dcs_set_cur_state(&cdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, pmc->dcs_state, 0UL);
+	KUNIT_EXPECT_EQ(test, apple_pmc_enable_read(pmc, hw->dcs_rail),
+			BIT(0) | BIT(hw->ap_agent));
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), 1U);
+	cancel_delayed_work_sync(&pmc->dcs_work);
+}
+
 static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_dcs_floor),
 	KUNIT_CASE(apple_pmc_test_partial_enable),
@@ -558,6 +624,8 @@ static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
 	KUNIT_CASE(apple_pmc_test_floor_aggregate),
 	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
+	KUNIT_CASE(apple_pmc_test_dcs_floor_pending),
+	KUNIT_CASE(apple_pmc_test_dcs_limit_release_pending),
 	KUNIT_CASE(apple_pmc_test_interface),
 	KUNIT_CASE(apple_pmc_test_interface_stuck),
 	KUNIT_CASE(apple_pmc_test_interface_consumer),

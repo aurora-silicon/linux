@@ -49,7 +49,7 @@ typedef uint16_t u16;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 struct device { int dummy; };
-struct pci_dev { struct device dev; void *data; };
+struct pci_dev { struct device dev; void *data; bool state_saved; };
 struct hci_dev { int dummy; };
 struct cen_bt {
     struct pci_dev *pdev;
@@ -67,7 +67,7 @@ static struct cen_bt *active;
 static int config_error, pending, command, saves, save_error, requests, recovery_error;
 static int unregisters, closes, hci_frees, arena_frees, irq_frees;
 static int owner_unregisters, handoffs, fallbacks, transport_sleeps, transport_wakes;
-static int transport_sleep_error;
+static int transport_sleep_error, transport_wake_error;
 static unsigned int bar_exec, bar_ipc;
 static void *handed_arena;
 static uintptr_t handed_dma;
@@ -93,7 +93,7 @@ static int cen_transport_state(struct cen_bt *bt, bool asleep) {
         return transport_sleep_error;
     }
     transport_wakes++;
-    return 0;
+    return transport_wake_error;
 }
 static void apple_centauri_sleep_mark_fallback(struct pci_dev *p) {
     assert(p == active->pdev);
@@ -102,6 +102,7 @@ static void apple_centauri_sleep_mark_fallback(struct pci_dev *p) {
 static void *hci_get_drvdata(struct hci_dev *p) { assert(p); return active; }
 static void hci_unregister_dev(struct hci_dev *p) {
     assert(p && active->arena && active->quiescing);
+    assert(!active->transport_sleep_sent && !active->transport_paused);
     /* The arena must remain available through HCI's close barrier. */
     unregisters++;
 }
@@ -159,7 +160,7 @@ static void apple_centauri_sleep_unregister(struct pci_dev *p) {
         handoffs++;
     }
 }
-static int pci_save_state(struct pci_dev *p) { (void)p; saves++; return save_error; }
+static int pci_save_state(struct pci_dev *p) { saves++; if (!save_error) p->state_saved = true; return save_error; }
 #define dev_warn(...) ((void)0)
 '''
 
@@ -169,6 +170,7 @@ static struct hci_dev hdev;
 static struct cen_bt bt;
 static void reset(void) {
     memset(&bt, 0, sizeof(bt));
+    dev.state_saved = false;
     active = &bt;
     bt.pdev = &dev; dev.data = &bt;
     bt.hdev = &hdev; bt.hci_registered = true;
@@ -180,7 +182,7 @@ static void reset(void) {
     config_error = saves = save_error = requests = recovery_error = 0;
     unregisters = closes = hci_frees = arena_frees = irq_frees = 0;
     owner_unregisters = handoffs = fallbacks = transport_sleeps = transport_wakes = 0;
-    transport_sleep_error = 0;
+    transport_sleep_error = transport_wake_error = 0;
     bar_exec = bar_ipc = 2;
     handed_arena = NULL; handed_dma = 0;
     sleep_reboot = true;
@@ -258,7 +260,19 @@ int main(void) {
     assert(cen_suspend(&dev.dev) == 0);
     assert(bt.transport_sleep_sent && !bt.asleep && bt.hdev == &hdev);
     assert(bt.arena && arena_frees == 0 && transport_sleeps == 1 && fallbacks == 0);
-    assert(saves == 1 && requests == 0);
+    assert(saves == 1 && requests == 0 && dev.state_saved && (command & PCI_COMMAND_MASTER));
+    /* Control fallback quiesce after Beta keep-alive wakes Beta ACIPC first. */
+    assert(cen_quiesce(&bt) == 0);
+    assert(!bt.transport_sleep_sent && !bt.transport_paused && bt.asleep && !bt.hdev);
+    assert(transport_wakes == 1 && unregisters == 1 && hci_frees == 1);
+    /* Fallback quiesce with failed Beta ACIPC wake clears running before unregister. */
+    reset(); bt.bar = (void *)0x3000;
+    assert(cen_suspend(&dev.dev) == 0);
+    assert(bt.transport_sleep_sent && bt.transport_paused && bt.running);
+    transport_wake_error = -EIO;
+    assert(cen_quiesce(&bt) == 0);
+    assert(!bt.transport_sleep_sent && !bt.transport_paused && !bt.running && bt.asleep);
+    assert(transport_wakes == 1 && unregisters == 1 && hci_frees == 1);
     /* Keep-alive save failure unwinds ACIPC sleep and falls back to teardown. */
     reset(); bt.bar = (void *)0x3000; save_error = -ENOMEM;
     assert(cen_suspend(&dev.dev) == -ENOMEM);
@@ -270,7 +284,7 @@ int main(void) {
     assert(cen_suspend(&dev.dev) == 0);
     assert(!bt.transport_sleep_sent && bt.asleep && bt.arena && !bt.hdev);
     assert(transport_sleeps == 1 && transport_wakes == 0 && fallbacks == 1);
-    assert(saves == 1 && requests == 0);
+    assert(saves == 1 && requests == 0 && dev.state_saved && !(command & PCI_COMMAND_MASTER));
     /* A published arena cannot be reclaimed by a local-only detach. */
     reset();
     assert(cen_stop(&bt) == -EBUSY && bt.arena && arena_frees == 0);
@@ -400,9 +414,9 @@ int main(void) {
 def probe_stubs():
     stubs = STUBS.replace('struct device { int dummy; };',
                          'struct device { struct device *parent; void *of_node; };')
-    stubs = stubs.replace('struct pci_dev { struct device dev; void *data; };',
+    stubs = stubs.replace('struct pci_dev { struct device dev; void *data; bool state_saved; };',
                          'struct pci_bus { int number; };\n'
-                         'struct pci_dev { struct device dev; void *data; struct pci_bus *bus; int devfn; };')
+                         'struct pci_dev { struct device dev; void *data; bool state_saved; struct pci_bus *bus; int devfn; };')
     stubs = stubs.replace('struct hci_dev { int dummy; };', 'struct sk_buff;\nstruct hci_dev {\n    int bus;\n    int (*open)(struct hci_dev *), (*close)(struct hci_dev *);\n    int (*flush)(struct hci_dev *), (*setup)(struct hci_dev *);\n    int (*post_init)(struct hci_dev *), (*reset_dup_filter)(struct hci_dev *);\n    int (*send)(struct hci_dev *, struct sk_buff *);\n};')
     stubs = stubs.replace('static struct cen_bt *active;',
                          'static struct cen_bt *active;\nstatic bool probe_hci_registered;')
@@ -472,12 +486,16 @@ def main():
                 "missing-final-work-drain": (
                     "cancel_work_sync(&bt->io_work);\n\tskb_queue_purge(&bt->txq);",
                     "if (false) cancel_work_sync(&bt->io_work);\n\tskb_queue_purge(&bt->txq);"),
+                "missing-quiesce-acipc-wake": (
+                    "if (bt->transport_sleep_sent) {",
+                    "if (false && bt->transport_sleep_sent) {"),
             }
             failures = {
                 'lost-retained-tuple': 'bt.asleep && bt.arena && arena_frees == 0 && requests == 0',
                 'missing-pending-fence': 'cen_release(&bt) == -EBUSY',
                 'missing-save-recovery': 'bt.asleep && bt.arena && requests == 1 && recovery_error == -ENOMEM',
                 'missing-final-work-drain': 'p && !active->running && !active->io_work && !active->irq_count',
+                'missing-quiesce-acipc-wake': '!active->transport_sleep_sent && !active->transport_paused',
             }
             for name, (old, new) in controls.items():
                 assert helpers.count(old) == 1, name

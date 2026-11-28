@@ -176,20 +176,25 @@ ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_p
 
 
 def atc_cio_helpers(source):
-    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one, and
-    whether a T8132 port is wired for DP alt mode.
+    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one,
+    whether a T8132 port is wired for DP alt mode, and the T8132 device-role
+    mode mapping.
 
     The mux and PIPE functions call these; older sources have none: ''.
     """
     result = ''
     for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
-                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on'):
+                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on',
+                 'atcphy_t8132_device_mode'):
         marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
         if marker:
             helper = block(source, marker.start())
             if name == 'atcphy_usb2_sig_host':
                 helper = helper.replace('static u32',
                                         'static __attribute__((unused)) u32', 1)
+            elif name == 'atcphy_t8132_device_mode':
+                helper = helper.replace('static enum atcphy_mode',
+                                        'static __attribute__((unused)) enum atcphy_mode', 1)
             result += helper + '\n'
     return result
 
@@ -233,6 +238,18 @@ def atc_mux_noop(source):
     if 'atcphy_mux_is_noop(' not in block(source, 'static int atcphy_mux_set_locked('):
         return ''
     return ''.join(atc_function(source, name) for name in ('atcphy_mux_in_mode', 'atcphy_mux_is_noop'))
+
+
+def atc_set_mode_prototypes(source):
+    """Prototype atcphy_usb3_set_mode() needs ahead of the mux.
+
+    It moves a T8132 device role to USB2 and restores SuperSpeed on a host swap
+    through atcphy_mux_switch(), which atc_mux_without_pm() emits with the mux,
+    after the role functions in some fixtures.
+    """
+    if 'atcphy_mux_switch(' not in block(source, 'static int atcphy_usb3_set_mode('):
+        return ''
+    return 'static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode);\n'
 
 
 def atc_mux_without_pm(source):

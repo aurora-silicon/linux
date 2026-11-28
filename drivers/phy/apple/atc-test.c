@@ -104,6 +104,49 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
 }
 
+/*
+ * SuperSpeed device mode is not supported by this driver on T8132: a device
+ * role keeps the lanes on USB2 while preserving the partner's requested mode.
+ */
+static void atcphy_test_t8132_device_role_usb2(struct kunit *test)
+{
+	struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
+	struct typec_mux_state state = { .mode = TYPEC_STATE_USB };
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	atcphy->t8132_dp_alt = true;
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(APPLE_ATCPHY_MODE_USB3),
+			APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(APPLE_ATCPHY_MODE_USB3_DP),
+			APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(APPLE_ATCPHY_MODE_DP),
+			APPLE_ATCPHY_MODE_DP);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(APPLE_ATCPHY_MODE_USB2),
+			APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_EQ(test, atcphy_t8132_device_mode(APPLE_ATCPHY_MODE_OFF),
+			APPLE_ATCPHY_MODE_OFF);
+
+	/* Target mode preserves the partner's request so a host swap can restore SuperSpeed. */
+	atcphy->t8132_device = true;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB3);
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	KUNIT_EXPECT_TRUE(test, atcphy_mux_in_mode(atcphy, APPLE_ATCPHY_MODE_USB3));
+	KUNIT_EXPECT_TRUE(test, atcphy_mux_in_mode(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_in_mode(atcphy, APPLE_ATCPHY_MODE_OFF));
+	atcphy->t8132_device = false;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_in_mode(atcphy, APPLE_ATCPHY_MODE_USB3));
+
+	state.alt = &dp;
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_DP);
+	state.alt = NULL;
+	state.mode = TYPEC_STATE_SAFE;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
+}
+
 /* Without the CIO calibration, a T8132 port serves a USB4 or TBT partner's USB2 */
 static void atcphy_test_target_mode_t8132_cio(struct kunit *test)
 {
@@ -1425,6 +1468,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_target_mode_t8132),
+	KUNIT_CASE(atcphy_test_t8132_device_role_usb2),
 	KUNIT_CASE(atcphy_test_target_mode_t8132_cio),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),

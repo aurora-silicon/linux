@@ -101,13 +101,18 @@ static int ane_tm_collect_events(struct ane_device *ane, struct ane_request *req
 static void ane_dart_mask(struct ane_device *ane) { (void)ane; }
 static void ane_dart_unmask(struct ane_device *ane) { (void)ane; }
 static void ane_tm_push_tq(struct ane_device *ane, struct ane_request *req) { (void)ane; (void)req; }
-static int ane_dart_drain_fault(struct ane_device *ane, u64 iova, struct ane_dart_scratch *s, int *pages)
+#ifdef ANE_DRAIN_TAKES_SCRATCH
+static int ane_dart_drain_fault(struct ane_device *ane, u64 iova,
+                               struct ane_dart_scratch *scratch, int *pages)
+#else
+static int ane_dart_drain_fault(struct ane_device *ane, u64 iova)
+#endif
 {
-	(void)iova; (void)s;
+	(void)iova;
 	drains++;
 	if (scenario == 4 && drains == 2)
 		return -ENOMEM;
-	ane->scratch_pages = ++*pages;
+	ane->scratch_pages++;
 	return 0;
 }
 static void ane_dart_release_scratch(struct ane_device *ane, struct ane_dart_scratch *s, int pages)
@@ -254,7 +259,11 @@ def build(text, header, work):
     else:
         start = min(start, text.index('static int ane_tm_poll_step('))
     end = text.index('\n/*\n * Recovery runs', start)
-    (work / 'tm.c').write_text(HARNESS + helper(header) + text[start:end] + MAIN)
+    execute = text[start:end]
+    signature = ''
+    if 'ane_dart_drain_fault(ane, fault_iova,' in execute:
+        signature = '#define ANE_DRAIN_TAKES_SCRATCH\n'
+    (work / 'tm.c').write_text(signature + HARNESS + helper(header) + execute + MAIN)
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror', str(work / 'tm.c'), '-o', str(work / 'tm')], check=True)
     return subprocess.run([str(work / 'tm')], capture_output=True, text=True)
 

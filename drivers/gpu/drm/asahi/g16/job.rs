@@ -29,19 +29,23 @@
 //! [`mmu::VmJobGuard`] keeps the VM's mappings and its VM state keeps the VM's TTBAT slot until
 //! the last `Arc<Job>` drops.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
-    c_str, device,
+    c_str,
+    cpu::CpuId,
+    cpumask::Cpumask,
+    device,
     dma_fence::Fence,
     drm::sched,
     new_mutex,
     prelude::*,
     sync::{Arc, Mutex},
+    workqueue,
 };
 
 use super::{
-    command::{Command, Order},
-    fence::JobFence,
+    command::{Command, Commands, Order, Orders},
+    fence::{FenceOrigin, FwWaits, InputFences, JobFence},
     hw,
     queue::QueueState,
     vm::VmState,
@@ -93,18 +97,26 @@ pub(crate) struct Job {
     /// The job's VM (TTBAT slot, status).
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
-    pub(crate) commands: KVec<Command>,
+    pub(crate) commands: Commands,
+    /// Any command traces rays or builds acceleration structures (`Command::long`).
+    long: bool,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.
-    orders: KVec<Order>,
+    orders: Orders,
     /// The job's hardware fence.
     pub(crate) fence: JobFence,
     /// The engine's bookkeeping; `progress.signaled` makes [`Job::complete`] act once.
     pub(crate) progress: super::engine::Progress,
     /// Inputs and resolved historical-prefix dependencies, held through every command.
-    inputs: KVec<Fence>,
-    /// Consecutive commands with full owner-retirement proof; an aborted receipt never counts.
-    full_retired: AtomicU32,
+    inputs: InputFences,
+    /// Exported fence identity for same-GPU, same-VM cross-queue firmware handoff.
+    pub(crate) origin: Arc<FenceOrigin>,
+    /// Same-GPU, same-VM cross-queue waits resolved into firmware ring barriers.
+    pub(crate) fw_waits: FwWaits,
+    /// Bitmask of commands (`0..MAX_COMMANDS`) with full owner-retirement proof; an aborted
+    /// receipt never sets its bit. Tracks per-command bits so concurrent compute/render
+    /// commands within one job may retire in either hardware completion order.
+    full_retired: AtomicU64,
     /// No future publication and every previously published owner fully retired. This proof
     /// is separate from an error result: an affected full receipt may still fail the job.
     terminal_retired: AtomicBool,
@@ -129,16 +141,19 @@ impl Job {
         id: u64,
         queue: Arc<QueueState>,
         vm: Arc<VmState>,
-        commands: KVec<Command>,
-        orders: KVec<Order>,
+        commands: Commands,
+        orders: Orders,
         resources: super::resources::Prepared,
         fence: JobFence,
         guard: mmu::VmJobGuard,
-        inputs: KVec<Fence>,
+        inputs: InputFences,
+        origin: Arc<FenceOrigin>,
+        fw_waits: FwWaits,
     ) -> Result<Arc<Self>> {
         if commands.len() != orders.len() {
             return Err(EINVAL);
         }
+        let long = commands.iter().any(Command::long);
         let progress = super::engine::Progress::new(commands.len());
         let guard = MappingGuard {
             guard,
@@ -150,12 +165,15 @@ impl Job {
                 queue,
                 vm,
                 commands,
+                long,
                 orders,
                 resources,
                 fence,
                 progress,
                 inputs,
-                full_retired: AtomicU32::new(0),
+                origin,
+                fw_waits,
+                full_retired: AtomicU64::new(0),
                 terminal_retired: AtomicBool::new(false),
                 // Scheduler free can race the final off-lock completion reference.
                 // Prepare destruction work before acceptance; dropping a completed job
@@ -169,9 +187,16 @@ impl Job {
         )
     }
 
+    /// The job gets the long execution allowance (ray traversal or acceleration-structure
+    /// builds, `recovery::logic::LONG_DEADLINE_MS`).
+    pub(crate) fn long(&self) -> bool {
+        self.long
+    }
+
     /// Latches a hardware/publication failure before any later work can be published.
     /// Called under the device lock; it deliberately does not signal the fence.
     pub(crate) fn latch_failure(&self, error: Error) {
+        self.origin.mark_failed();
         if error == ECANCELED
             || (self.terminal_retired.load(Ordering::Acquire)
                 && error != EIO
@@ -211,6 +236,7 @@ impl Job {
             return;
         }
         if let Err(error) = result {
+            self.origin.mark_failed();
             if error == ECANCELED
                 || ((!engine || self.terminal_retired.load(Ordering::Acquire))
                     && error != EIO
@@ -232,10 +258,48 @@ impl Job {
         self.fence.signal(result);
     }
 
+    /// Whether this job has already been handed to the engine (inline or by drm_sched).
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Attempts to submit a ready job directly from SUBMIT ioctl context, bypassing `drm_sched`.
+    /// Only runs when all input fences are already signalled, the device and VM are healthy,
+    /// and the GPU is neither sleeping nor recovering; returns `true` when the job was started
+    /// inline (accepted or already finished with error), or `false` to fall back to `drm_sched`.
+    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) -> bool {
+        if shared.crashed.load(Ordering::Acquire)
+            || shared.sleeping.load(Ordering::Acquire)
+            || shared.recovering.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
+            return false;
+        }
+        if let Some(order) = self.orders.first() {
+            if self.queue.check(order).is_err() {
+                return false;
+            }
+        }
+        if super::fence::check_dependencies(&self.inputs).is_err() {
+            return false;
+        }
+        if let Some(result) = shared.try_submit_inline(self.clone()) {
+            self.started.store(true, Ordering::Release);
+            if let Err(error) = result {
+                self.finish(Err(if error == ENODEV { EIO } else { error }), false);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Hands the job to the engine, or refuses a failed GPU or VM. A queued
     /// job may have been accepted before another command made its VM sticky.
     fn start(self: &Arc<Self>, shared: &Arc<Shared>) {
-        self.started.store(true, Ordering::Release);
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if shared.crashed.load(Ordering::Acquire) {
             self.finish(Err(EIO), false);
             return;
@@ -258,6 +322,7 @@ impl Job {
             // before signalling; later accepted ordinals must not jump this hole.
             self.queue.cancel(&self.orders, self.progress.sent());
             self.finish(Err(ECANCELED), false);
+            shared.wake_publish();
             return;
         }
         // `Shared::submit`: enqueue, publish and rearm under the device lock,
@@ -266,6 +331,155 @@ impl Job {
             // An engine that refuses work is a device failure for the job's VM.
             self.finish(Err(if error == ENODEV { EIO } else { error }), false);
         }
+    }
+
+    /// Returns the immutable dependency order for command `index`.
+    pub(crate) fn command_order(&self, index: u32) -> Option<Order> {
+        self.orders.get(index as usize).copied()
+    }
+
+    /// Whether command `index` is a ready, barrier-free compute command continuing a compute
+    /// horizon at queue-local compute ordinal `expected`.
+    pub(crate) fn can_fold_horizon_cmd(&self, index: u32, expected: u64) -> bool {
+        if !self.fw_waits.is_empty()
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
+            return false;
+        }
+        let Some(Command::Compute(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        order.engine == super::command::COMPUTE
+            && order.sequence == expected
+            && order.wait_through == [None, None]
+            && self.queue.check(order).is_ok()
+            && super::fence::check_dependencies(&self.inputs).is_ok()
+    }
+
+    /// Whether every command of this job is a ready, barrier-free compute command continuing
+    /// sequentially from `first_expected`.
+    pub(crate) fn can_fold_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || !self.fw_waits.is_empty()
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Compute(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::COMPUTE
+                || order.sequence != expected
+                || order.wait_through != [None, None]
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether command `index` is a ready render command continuing a same-SUBMIT render batch
+    /// at queue-local render ordinal `expected` (treating `expected - 1` as already published
+    /// within the in-progress render flight).
+    pub(crate) fn can_fold_render_cmd(&self, index: u32, expected: u64) -> bool {
+        if !self.fw_waits.is_empty()
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
+            return false;
+        }
+        let Some(Command::Render(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        if order.engine != super::command::RENDER
+            || order.sequence != expected
+            || self.queue.check(order).is_err()
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let mut published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        published[super::command::RENDER] =
+            published[super::command::RENDER].max(expected.saturating_sub(1));
+        order.ready(completed, published)
+    }
+
+    /// Whether every command of this job is a ready render command continuing a render
+    /// horizon sequentially from `first_expected` (treating earlier passes in the in-progress
+    /// render flight as already published).
+    pub(crate) fn can_fold_render_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || !self.fw_waits.is_empty()
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let base_published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Render(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::RENDER
+                || order.sequence != expected
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+            let mut published = base_published;
+            published[super::command::RENDER] =
+                published[super::command::RENDER].max(expected.saturating_sub(1));
+            if !order.ready(completed, published) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks the retained dependency set for each command immediately before publication.
@@ -285,6 +499,19 @@ impl Job {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         self.queue.check(order)?;
         super::fence::check_dependencies(&self.inputs)?;
+        for wait in self.fw_waits.iter() {
+            if wait.is_failed() {
+                return Err(ECANCELED);
+            }
+            for engine in 0..2 {
+                if let Some(seq) = wait.last_ordinal[engine] {
+                    wait.queue.cancelled_through(engine, seq)?;
+                    if wait.queue.published[engine].load(Ordering::Acquire) < seq {
+                        return Err(EAGAIN);
+                    }
+                }
+            }
+        }
         let completed = self
             .queue
             .completed
@@ -315,28 +542,81 @@ impl Job {
     pub(crate) fn command_retired(&self, index: u32) -> Result {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         let previous = order.sequence.checked_sub(1).ok_or(EINVAL)?;
-        self.queue.completed[order.engine]
-            .compare_exchange(
-                previous,
-                order.sequence,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| EIO)?;
+        if order.engine != super::command::COMPUTE {
+            self.queue.completed[order.engine]
+                .compare_exchange(
+                    previous,
+                    order.sequence,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        // Concurrent 2-pipe compute commands on the same logical queue may retire out of
+        // sequence order. Record published out-of-order full receipts above `completed + 1`
+        // in `compute_ooo` and advance `completed[COMPUTE]` across contiguous retired runs.
+        let completed = self.queue.completed[super::command::COMPUTE].load(Ordering::Acquire);
+        if order.sequence <= completed {
+            return Err(EIO);
+        }
+        if order.sequence == completed + 1 {
+            let mut next = order.sequence;
+            let mut ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+            while ooo & 1 != 0 {
+                next += 1;
+                ooo >>= 1;
+            }
+            // Re-anchor remaining OOO bits above `next + 1` (since `next` advanced by at least 1
+            // and bit 0 of `ooo` is now `next + 1`, which is 0).
+            ooo >>= 1;
+            self.queue.compute_ooo.store(ooo, Ordering::Release);
+            self.queue.completed[super::command::COMPUTE]
+                .compare_exchange(completed, next, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        let published = self.queue.published[super::command::COMPUTE].load(Ordering::Acquire);
+        let shift = order.sequence - completed - 2;
+        if order.sequence > published || shift >= 64 {
+            return Err(EIO);
+        }
+        let bit = 1u64 << shift;
+        let ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+        if ooo & bit != 0 {
+            return Err(EIO);
+        }
+        self.queue.compute_ooo.store(ooo | bit, Ordering::Release);
         Ok(())
     }
 
-    /// Records a consecutive full owner receipt independently of success/error attribution.
+    /// Records a unique full owner receipt independently of success/error attribution.
     /// Only the receipt owner may call this after successful resource-ledger retirement.
     pub(crate) fn note_full_retirement(&self, first: u32, count: u32) -> Result {
         let end = first.checked_add(count).ok_or(EOVERFLOW)?;
-        if count == 0 || end > self.progress.sent() {
+        if count == 0 || end > self.progress.sent() || end > 64 {
             return Err(EINVAL);
         }
-        self.full_retired
-            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| EIO)?;
-        Ok(())
+        let bits = if count == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << count) - 1) << first
+        };
+        let mut current = self.full_retired.load(Ordering::Acquire);
+        loop {
+            if current & bits != 0 {
+                return Err(EIO);
+            }
+            match self.full_retired.compare_exchange_weak(
+                current,
+                current | bits,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Certifies a terminal job before publishing its error. The caller first removes it
@@ -345,14 +625,24 @@ impl Job {
     /// A never-published job has the same proof with all three counters equal to zero.
     pub(crate) fn mark_terminal_retired(&self) -> Result {
         let sent = self.progress.sent();
+        let expected = if sent >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << sent) - 1
+        };
         if self.progress.is_pending()
             || self.progress.next() != sent
-            || self.full_retired.load(Ordering::Acquire) != sent
+            || self.full_retired.load(Ordering::Acquire) != expected
         {
             return Err(EIO);
         }
         self.terminal_retired.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Whether this job holds a cross-queue firmware wait on `queue`.
+    pub(crate) fn waits_on_queue(&self, queue: &Arc<QueueState>) -> bool {
+        self.fw_waits.iter().any(|w| Arc::ptr_eq(&w.queue, queue))
     }
 
     /// Cancels a job the scheduler never ran (queue teardown, or a failed submission).
@@ -364,6 +654,7 @@ impl Job {
             self.finish(Err(ECANCELED), false);
         } else if !self.progress.signaled.swap(true, Ordering::AcqRel) {
             // A refused submission's job: its fence orders nothing and was never published.
+            self.origin.mark_failed();
             self.fence.signal(Err(ECANCELED));
         }
     }
@@ -387,6 +678,10 @@ impl Completions {
             head: None,
             tail: None,
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
     }
 
     /// Queues the first completion of `job`; subsequent attempts have no effect.
@@ -435,6 +730,20 @@ pub(crate) fn complete_all(mut done: Completions) {
 struct SchedJob {
     job: Arc<Job>,
     shared: Arc<Shared>,
+    /// Count of queued (unstarted) `drm_sched` jobs on this queue. Decremented once when
+    /// `run()`, `cancel()`, or `drop()` completes so inline submission preserves queue order
+    /// without retaining `Arc<Job>` in [`Scheduler`].
+    pending_sched: Arc<core::sync::atomic::AtomicUsize>,
+    counted: bool,
+}
+
+impl SchedJob {
+    fn finish_pending(&mut self) {
+        if self.counted {
+            self.counted = false;
+            self.pending_sched.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl sched::JobImpl for SchedJob {
@@ -448,6 +757,7 @@ impl sched::JobImpl for SchedJob {
     fn run(job: &mut Self) -> Result<Option<Fence>> {
         let fence = job.job.fence.fence();
         job.job.start(&job.shared);
+        job.finish_pending();
         Ok(Some(fence))
     }
 
@@ -458,6 +768,7 @@ impl sched::JobImpl for SchedJob {
 
     fn cancel(job: &mut Self) {
         job.job.cancel_unstarted();
+        job.finish_pending();
     }
 }
 
@@ -465,6 +776,7 @@ impl Drop for SchedJob {
     fn drop(&mut self) {
         // Entity teardown frees jobs it never ran without calling `cancel`.
         self.job.cancel_unstarted();
+        self.finish_pending();
     }
 }
 
@@ -474,31 +786,65 @@ pub(crate) struct Scheduler {
     // drains), and only then the scheduler is finalized.
     entity: sched::Entity<SchedJob>,
     _scheduler: sched::Scheduler<SchedJob>,
+    /// Number of jobs currently queued in `drm_sched` that have not yet started or cancelled.
+    /// Inline submit is permitted only when zero, preserving strict queue order without
+    /// retaining any `Arc<Job>` (or its `VmJobGuard` / prepared arenas).
+    pending_sched: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl Scheduler {
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
-        let scheduler = sched::Scheduler::new(
+        // Keep drm_sched run/free work in the creating CPU's cluster (matching g17/job.rs).
+        // Completion work still follows the per-submit submitter_cpu, not queue creation, and
+        // an unbound workqueue restricted via apply_workqueue_attrs() falls back to
+        // wq_unbound_cpumask if the cluster goes offline (failing soft if restrict() errors).
+        let submit = workqueue::OwnedQueue::new_ordered_reclaim(c_str!("aurora_g16"))?;
+        let _ = submit.restrict(Cpumask::cluster_of(CpuId::current()));
+        let scheduler = sched::Scheduler::new_with_queues(
             dev,
             1,
             hw::sizes::SCHEDULER_CREDITS,
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
             c_str!("aurora_g16"),
+            Some(submit),
+            None,
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        let pending_sched = Arc::new(core::sync::atomic::AtomicUsize::new(0), GFP_KERNEL)?;
         Ok(Self {
             entity,
             _scheduler: scheduler,
+            pending_sched,
         })
     }
 
-    /// Pushes a job that waits for its retained inputs. On failure the job is cancelled (not counted as
-    /// submitted work of its VM) and the error is returned.
+    /// Pushes a job that waits for its retained inputs. When the predecessor has already
+    /// started and all inputs are signalled, submits directly inline and bypasses `drm_sched`
+    /// allocation and kworker wakeup. On failure the job is cancelled (not counted as submitted
+    /// work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
+        shared.note_submitter();
+        let prev_started = self.pending_sched.load(Ordering::Acquire) == 0;
         let handle = job.clone();
-        let mut pending = self.entity.new_job(1, SchedJob { job, shared })?;
+        if prev_started {
+            handle.accepted.store(true, Ordering::Release);
+            if handle.try_start_inline(&shared) {
+                return Ok(());
+            }
+            handle.accepted.store(false, Ordering::Release);
+        }
+        self.pending_sched.fetch_add(1, Ordering::AcqRel);
+        let mut pending = self.entity.new_job(
+            1,
+            SchedJob {
+                job,
+                shared,
+                pending_sched: self.pending_sched.clone(),
+                counted: true,
+            },
+        )?;
         for fence in handle.inputs.iter() {
             pending.add_dependency(fence.clone())?;
         }

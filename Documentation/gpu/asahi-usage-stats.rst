@@ -48,10 +48,13 @@ start and end operations. The shared G17 backend runs several commands of one
 queue at once, so their stages overlap. It charges each engine of a queue the
 union of that queue's stage intervals (exact, because a queue's stages retire in
 the order they started), so a queue never counts more than the wall time on one
-engine. Queues of one file still add up. The other backends sum their intervals
-without merging overlapping commands on the same engine. Missing, zero-start or
-reversed intervals are ignored. Failed or cancelled commands do not contribute
-incomplete intervals;
+engine. Queues of one file still add up on G17. Native G16 executes pipelined
+commands and dual-pipe compute across sibling queues of one DRM file, so it
+unions overlapping stage intervals per file (``Client::add_union``) to keep each
+engine bounded by wall time. The other backends sum their intervals without
+merging overlapping commands on the same engine. Missing, zero-start or reversed
+intervals are ignored. Failed or cancelled commands do not contribute incomplete
+intervals;
 successful stages that retired before a later failure remain counted. An
 unexecuted G17 replay contributes only when it eventually retires successfully.
 There is no submit-to-completion wall-time fallback in the current backends.
@@ -162,11 +165,17 @@ run on the same backend and decoder and carry more in their statistics ring.
   ALU benchmark.
 * ``busy_ns``: the utilisation records carry their own timestamps (words 1 and
   2, 24 MHz ticks), one every 8 ms on the M5 and T6041 and every 16 ms on the
-  A18 Pro, so each record closes a window of known length, which is credited at
-  the record's device utilisation. A record that follows the previous one by
-  more than two periods, or whose timestamp went back, only starts a new
-  window: time the GPU spent gated is never credited, and a load sparser than
-  one period reads low. The total keeps counting across power epochs.
+  A18 Pro, so each record closes a window of known length, which is credited at the
+  record's device utilisation. Records are credited in timestamp order, from
+  both roles and across power epochs: the driver keeps the timestamp up to
+  which it has counted, and a record at or before it adds nothing. A record
+  within two periods of that mark closes the window since it; after a longer
+  gap it closes only its own period, so time the GPU spent gated is never
+  credited. Under a frame-paced load the cores gate many times a second, often
+  with one record per power epoch, so the records a power boundary keeps out of
+  the utilisation average still count here. Suspend, recovery and quarantine
+  keep them out, and ``busy_ns`` reads ``stale`` once a statistics ring is
+  quarantined.
 
 The driver asks for full performance while work is in flight, which the
 firmware takes as a floor for its state. An A18 Pro at work therefore normally

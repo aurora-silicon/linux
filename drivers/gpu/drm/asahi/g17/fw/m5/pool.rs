@@ -54,6 +54,8 @@ pub(crate) const SAVED_FIELDS: [usize; 8] = [0x28, 0x20, 0x24, 0x2c, 0x3c, 0x48,
 const GPU_PAGE: usize = 0x4000;
 const PRIVATE_TOP: u64 = 1 << 42;
 pub(crate) const SCENE_TABLE_ENTRIES: usize = 0x50;
+/// Bytes of a render pair's parameter-buffer discard object.
+pub(crate) const DISCARD_BYTES: usize = 0x8000;
 pub(crate) const SCENE_STRIDE: usize = 0x80;
 pub(crate) const SCENE_TRAILER_SIZE: usize = 0x40;
 

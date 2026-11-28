@@ -475,7 +475,7 @@ static unsigned long jiffies;
 struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
-    int fw_compat;bool vrr_enabled,typec;
+    int fw_compat;bool vrr_enabled,typec,panel;
     struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
@@ -494,12 +494,13 @@ static void dcp_mode_invalidate(__typeof__(((struct apple_dcp *)0)->mode_state) 
 static void dcp_drm_crtc_vblank(void *c) {vblanks++;}
 static void dcp_queue_hotplug(void *c) {hotplugs++;}
 static bool dcp_is_typec_output(struct apple_dcp *d) {return d->typec;}
+static bool dcp_has_panel(struct apple_dcp *d) {return d->panel;}
 static void mod_delayed_work(void *q,struct delayed_work *w,unsigned long delay)
 {assert(delay==1000);scheduled++;}
 static void cancel_delayed_work(struct delayed_work *w) {cancelled++;}
 ''' + definitions + '\n' + helpers + '\n' + production + r'''
 int main(void) {
-    struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.mode_state={true},.connector=(void *)1};
+    struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.panel=true,.mode_state={true},.connector=(void *)1};
     __typeof__(*d.desktop) state={.present_id=42,.present_pending=true};d.desktop=&state;
     dcp_swap_watchdog_arm(&d);assert(scheduled==1 && d.swap_watchdog_deadline==1000);
     jiffies=999;dcp_swap_watchdog(&d.swap_watchdog_wq.work);
@@ -535,6 +536,11 @@ int main(void) {
     jiffies=d.swap_watchdog_deadline;unsigned hp=hotplugs;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);
     assert(!state.takeover_adopted && !state.mode_live && !d.mode_state.valid && hotplugs==hp+1);
+    /* Any external pipe is watched, not only Type-C: a fixed HDMI port
+     * (no panel, no Type-C route, no watched desktop swap) arms too. */
+    d.fw_compat=1;d.typec=false;d.vrr_enabled=false;state.takeover_adopted=false;
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    d.panel=false;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     return 0;
 }
 '''

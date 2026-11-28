@@ -15,6 +15,11 @@
 /dts-v1/;
 
 #define T6050_J714C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
+#include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
 / {
@@ -209,9 +214,56 @@
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/*
+ * The keyboard backlight, as on J714s: ADT arm-io/pwm0/kbd-backlight, the
+ * fpwm s5l8920x at 0x3_05040000 (0x5_05040000 here), default-hz 25000, so a
+ * 40000 ns period on channel 0.
+ */
+/ {
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/*
+ * SMC sensors, as on J714s: the J714cAP SMC has the same two fans (F0Ac/F1Ac,
+ * 2317..7826 rpm, mode keys F0md/F1md), power, voltage and current keys, plus
+ * every readable float T* key through apple,discover-temperatures in
+ * t6050-die0.dtsi. Discovery refuses to run once any temperature channel
+ * exists, so the shared temperature nodes and apple,soc-die-keys go.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
 &smc_hwmon {
-	status = "disabled";
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+
+	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
 };
 
 /*
@@ -238,8 +290,8 @@
 
 /*
  * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO.
- * The J714c's MTP firmware owns the trackpad AFE reset, so there is no reset
- * GPIO here, unlike the J716c.
+ * The J714c's MTP firmware does not reset the trackpad AFE, so the host does
+ * it through an SMC GPIO, as on the J714s.
  */
 &mtp_dockchannel {
 	status = "okay";
@@ -256,10 +308,15 @@
 		interrupt-names = "tx", "rx";
 		apple,fifo-size = <0x800>;
 		apple,helper-cpu = <&mtp>;
+		/*
+		 * ADT mtp function-afe-reset is the SMC pcIO template (0x10000, 0x11c0000),
+		 * the same line as SMC GPIO gp1c, active low, which gpio-macsmc drives, as
+		 * on the J714s.
+		 */
+		apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
 
 		multi-touch {
 			apple,power-method = <2>;
-			apple,firmware-managed-reset;
 			firmware-name = "apple/tpmtfw-j714c.bin";
 		};
 

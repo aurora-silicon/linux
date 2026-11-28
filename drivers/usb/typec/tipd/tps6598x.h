@@ -467,6 +467,8 @@ struct cd321x {
 	/* SN201202x: the partner's DP status is current for this DP connection */
 	bool dp_sid_valid;
 	struct typec_thunderbolt_switch *tbt_switch;
+	/* A router connection exists even when its driver has not bound. */
+	bool tbt_router_present;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
 	/* Router that had not bound at probe: look it up when a switch registers */
@@ -619,7 +621,6 @@ void cd321x_stop_work(struct cd321x *cd321x);
 int cd321x_reboot_close(struct cd321x *cd321x);
 int cd321x_reboot_notify(struct notifier_block *nb, unsigned long action,
 			 void *data);
-bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 		      bool *late);

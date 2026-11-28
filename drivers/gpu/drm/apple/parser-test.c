@@ -1655,6 +1655,28 @@ static void parser_panel_adt_color_target(struct kunit *test)
 	for (unsigned int i = 0; i < ARRAY_SIZE(srgb); i++)
 		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), srgb[i]);
 
+	/*
+	 * A gamut not known here (the K114s ADT says "Rec2020") gives no
+	 * target of its own: the panel is described as Display P3, the space
+	 * its surfaces are tagged with, never with zero primaries.
+	 */
+	parser_adt_synthetic_matrix(matrix, 1 << 20);
+	size = parser_adt_color_fixture(adt, sizeof(adt), "Rec2020", sizeof("Rec2020"),
+					matrix, sizeof(matrix));
+	panel = (struct dcp_panel_adt) {};
+	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
+	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
+	KUNIT_EXPECT_NULL(test, dcp_panel_gamut_color_space(panel.gamut));
+	target = dcp_panel_color_target(panel.gamut);
+	KUNIT_EXPECT_PTR_EQ(test, target, dcp_color_space_lookup("display-p3"));
+	raw = panel_color_edid(test, &metadata, target);
+	for (unsigned int i = 0; i < ARRAY_SIZE(p3); i++)
+		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), p3[i]);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 120);
+	/* A known gamut keeps its own space. */
+	KUNIT_EXPECT_PTR_EQ(test, dcp_panel_color_target(DCP_PANEL_GAMUT_SRGB),
+			    dcp_color_space_lookup("srgb"));
+
 	/* Unknown, malformed, short, wrong-version, unbounded, non-neutral or singular. */
 	for (unsigned int fault = 0; fault < 7; fault++) {
 		const char *name = fault == 0 ? "AdobeRGB" : "P3";
@@ -1791,6 +1813,7 @@ static void parser_panel_of_dimensions(struct kunit *test)
 static void parser_panel_publication(struct kunit *test,
 				     enum dcp_firmware_version fw_compat, bool desktop_state)
 {
+	const size_t adt_capacity = 512;
 	const char *gamut = fw_compat == DCP_FIRMWARE_H17P ? "sRGB" : "P3";
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct dcp_desktop_state *desktop = kunit_kzalloc(test, sizeof(*desktop), GFP_KERNEL);
@@ -1803,7 +1826,7 @@ static void parser_panel_publication(struct kunit *test,
 	};
 	struct dcp_panel_adt before = panel;
 	__le32 matrix[10];
-	u8 adt[512];
+	u8 *adt = kunit_kmalloc(test, adt_capacity, GFP_KERNEL);
 	size_t adt_size;
 	struct device *dev = drm_kunit_helper_alloc_device(test);
 	struct drm_device *drm;
@@ -1821,11 +1844,12 @@ static void parser_panel_publication(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, id);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, adt);
 	ret = drmm_connector_init(drm, &connector->base, &parser_route_connector_funcs,
 				  DRM_MODE_CONNECTOR_eDP, NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
-	adt_size = parser_adt_color_fixture(adt, sizeof(adt), gamut, strlen(gamut) + 1,
+	adt_size = parser_adt_color_fixture(adt, adt_capacity, gamut, strlen(gamut) + 1,
 					    matrix, sizeof(matrix));
 	KUNIT_ASSERT_GT(test, adt_size, (size_t)0);
 	ret = dcp_panel_adt_parse(adt, adt_size, &panel);
@@ -1844,7 +1868,7 @@ static void parser_panel_publication(struct kunit *test,
 	dcp->fw_compat = fw_compat;
 	dcp->panel.width_mm = panel.width_mm;
 	dcp->panel.height_mm = panel.height_mm;
-	dcp->panel.color_target = dcp_panel_gamut_color_space(panel.gamut);
+	dcp->panel.color_target = dcp_panel_color_target(panel.gamut);
 	id->adt = panel.identity;
 	dcp->connector = connector;
 	dcp->modes = &mode;
@@ -2029,12 +2053,13 @@ static void parser_desktop_metadata_timing(struct kunit *test)
  */
 static void parser_internal_v27_only_120hz(struct kunit *test)
 {
-	struct dcp_display_mode catalog[2] = {};
+	struct dcp_display_mode *catalog = kunit_kcalloc(test, 2, sizeof(*catalog), GFP_KERNEL);
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
 	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
 	unsigned int i;
 
+	KUNIT_ASSERT_NOT_NULL(test, catalog);
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
@@ -2063,6 +2088,12 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
+
+	/* iBoot left the panel at 60 Hz: only the 60 Hz timing, no mode set away from it. */
+	dcp->boot_rate = 60;
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_BAD);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
+	dcp->boot_rate = 0;
 
 	/* The T8142 Air internal DCP (60 Hz panel, firmware 27.0) and the T6050 dcpext keep every mode. */
 	dcp->hw.only_120hz_modes = false;

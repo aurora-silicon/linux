@@ -24,7 +24,7 @@ typedef uint64_t __le64;
 #define GFP_KERNEL 0
 static void free_buffer(void *p) {free(*(void **)p);}
 #define __free(x) __attribute__((cleanup(free_buffer)))
-static void *kzalloc(size_t n, int flags) {(void)flags;return calloc(1,n);}
+static void *kvzalloc(size_t n, int flags) {(void)flags;return calloc(1,n);}
 #define cpu_to_le64(x) (x)
 #define le64_to_cpu(x) (x)
 struct apple_dcp_afkep {bool compact;};

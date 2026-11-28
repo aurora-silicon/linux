@@ -91,6 +91,9 @@ struct nvmem_cell_info {
  * @type:	Type of the nvmem storage
  * @read_only:	Device is read-only.
  * @root_only:	Device is accessibly to root only.
+ * @sysfs_read_only: The device's whole-device sysfs file is read-only for
+ *		good: force_ro cannot make it writable. Kernel consumers still
+ *		write its cells.
  * @of_node:	If given, this will be used instead of the parent's of_node.
  * @reg_read:	Callback to read data; return zero if successful.
  * @reg_write:	Callback to write data; return zero if successful.
@@ -123,6 +126,7 @@ struct nvmem_config {
 	enum nvmem_type		type;
 	bool			read_only;
 	bool			root_only;
+	bool			sysfs_read_only;
 	bool			ignore_wp;
 	struct nvmem_layout	*layout;
 	struct device_node	*of_node;

@@ -42,6 +42,7 @@ static inline int
 mt7932_connect_auth(const struct cfg80211_connect_params *p)
 {
 	u32 versions = p->crypto.wpa_versions;
+	bool tkip_group = p->crypto.cipher_group == WLAN_CIPHER_SUITE_TKIP;
 
 	/* SAE offload clients use VERSION_3; older clients use VERSION_2.
 	 * A transition request can carry both. The selected AKM still owns
@@ -51,13 +52,20 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 	    (versions & ~(NL80211_WPA_VERSION_2 | NL80211_WPA_VERSION_3)) ||
 	    p->crypto.n_ciphers_pairwise != 1 ||
 	    p->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    p->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
+	    (p->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP && !tkip_group) ||
 	    p->crypto.n_akm_suites < 1)
 		return -EOPNOTSUPP;
 
 	if (p->channel && !mt7932_connect_band_allowed(p->channel->band,
 						       p->crypto.akm_suites[0], p->mfp,
 						       p->crypto.sae_pwe))
+		return -EOPNOTSUPP;
+
+	/* WPA/WPA2 mixed-mode APs pair a CCMP unicast key with a TKIP group
+	 * key. The firmware owns the handshake and both keys. Only plain
+	 * WPA2-PSK may do this; pairwise TKIP stays refused.
+	 */
+	if (tkip_group && p->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK)
 		return -EOPNOTSUPP;
 
 	switch (p->crypto.akm_suites[0]) {
@@ -119,6 +127,9 @@ static inline int mt7932_connect_psk_akm(u8 *body, size_t length, u32 akm)
 /* Validate the entire RSN payload before using capabilities for admission.
  * The group management suite defaults to BIP-CMAC-128 when omitted. Reject
  * unsupported explicit suites rather than letting firmware choose one.
+ * A WPA/WPA2 mixed-mode AP advertises a TKIP group cipher. Admit it for
+ * WPA2-PSK (AKM 2) only, as mt7932_connect_auth() does; the pairwise list
+ * must still offer CCMP.
  */
 static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
 				   enum nl80211_mfp mfp, bool *pmf)
@@ -126,11 +137,15 @@ static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
 	unsigned int count, i;
 	u16 caps = 0;
 	bool selected = false, ccmp = false;
+	u32 group;
 
 	*pmf = false;
 	if (mfp > NL80211_MFP_OPTIONAL || length < 8 ||
-	    get_unaligned_le16(rsn) != 1 ||
-	    get_unaligned_be32(rsn + 2) != WLAN_CIPHER_SUITE_CCMP)
+	    get_unaligned_le16(rsn) != 1)
+		return -EINVAL;
+	group = get_unaligned_be32(rsn + 2);
+	if (group != WLAN_CIPHER_SUITE_CCMP &&
+	    (group != WLAN_CIPHER_SUITE_TKIP || akm != WLAN_AKM_SUITE_PSK))
 		return -EINVAL;
 	rsn += 6;
 	length -= 6;

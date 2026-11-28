@@ -38,6 +38,19 @@ int main(void)
 	u32 w = 0;
 	bool shown = true;
 
+	/* A new adaptive-sync minimum can reuse only the installed mode. */
+	s = (struct dcp_peer_frames_v27){ .timing = 81, .color = 86, .active = true };
+	assert(dcp_peer_vrr_only_v27(&s, 81, 86, 0x300000, false));
+	assert(!dcp_peer_vrr_only_v27(&s, 81, 86, 0, false));
+	assert(!dcp_peer_vrr_only_v27(&s, 80, 86, 0x300000, false));
+	assert(!dcp_peer_vrr_only_v27(&s, 81, 85, 0x300000, false));
+	assert(!dcp_peer_vrr_only_v27(&s, 81, 86, 0x300000, true));
+	s.failed = true;
+	assert(!dcp_peer_vrr_only_v27(&s, 81, 86, 0x300000, false));
+	s.failed = false;
+	s.active = false;
+	assert(!dcp_peer_vrr_only_v27(&s, 81, 86, 0x300000, false));
+
 	/* First modeset of a pair: both engines display swap 5. */
 	s = paired(5, 5);
 	assert(!dcp_peer_frame_complete_v27(&s, 0, 5, true, &w, &shown));

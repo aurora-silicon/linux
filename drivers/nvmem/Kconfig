@@ -174,6 +174,16 @@ config NVMEM_APPLE_SPMI
 	  This driver can also be built as a module. If so, the module
 	  will be called apple-nvmem-spmi.
 
+config NVMEM_APPLE_SPMI_KUNIT_TEST
+	bool "KUnit tests for the Apple SPMI NVMEM driver" if !KUNIT_ALL_TESTS
+	depends on NVMEM_APPLE_SPMI=y && NVMEM_SYSFS && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check, on a register map in memory, that the PMIC's whole-device
+	  sysfs file cannot be written, even with force_ro cleared, while
+	  the kernel still writes its byte and bit-field cells. No Apple
+	  hardware is needed.
+
 config NVMEM_BCM_OCOTP
 	tristate "Broadcom On-Chip OTP Controller support"
 	depends on ARCH_BCM_IPROC || COMPILE_TEST

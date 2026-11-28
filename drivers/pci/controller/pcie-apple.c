@@ -99,7 +99,6 @@ static int t6050_sd_port_wake = 2;
 module_param(t6050_sd_port_wake, int, 0644);
 MODULE_PARM_DESC(t6050_sd_port_wake,
 		 "T6050: the SD card reader's port after a firmware sleep: back once the resume is over (2, default), back in the early resume (1), or parked until a restart (0)");
-
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -155,6 +154,11 @@ MODULE_PARM_DESC(t6050_sd_port_wake,
 #define   PORT_INT_LINK_DOWN		14
 #define   PORT_INT_LINK_UP		12
 #define   PORT_INT_LINK_BWMGMT		11
+/*
+ * The root port received a PME message (it sets its Root Status PME bit too).
+ * The root port does not raise its own MSI for a PME (measured on T8132).
+ */
+#define   PORT_INT_PME			8
 #define   PORT_INT_AER_MASK		(15 << 4)
 #define   PORT_INT_PORT_ERR		4
 #define   PORT_INT_INTx(i)		i
@@ -561,7 +565,6 @@ struct apple_pcie_pd {
 
 struct apple_radio_sleep;
 
-#define APPLE_PCIE_T6050_WARM_WRITES	4
 
 struct apple_pcie {
 	struct mutex		lock;
@@ -584,10 +587,7 @@ struct apple_pcie {
 	/* Those ports back, and their functions looked for, once the resume is over */
 	struct work_struct	t6050_unpark_work;
 	/* The endpoint's warm reset, given by this host while the port is down */
-	struct platform_device	*t6050_smc;
-	u32			t6050_warm_key;
-	u32			t6050_warm_writes[2 * APPLE_PCIE_T6050_WARM_WRITES];
-	unsigned int		t6050_warm_count;
+	struct apple_smc_warm_reset t6050_warm;
 	bool			t6050_warm_done;
 	/* When this wake's bring-up of that port had the link up and its 100 ms over; 0 before */
 	ktime_t			t6050_link_up;
@@ -654,6 +654,8 @@ struct apple_pcie {
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
+	struct list_head	hib_fns;
+	bool			hib_saved;
 	struct completion	event;
 	struct irq_fwspec	fwspec;
 	struct irq_domain	*msi_domain;
@@ -677,11 +679,16 @@ struct apple_pcie_port {
 	struct apple_tunable	*tunable;
 	unsigned int		irq;
 	unsigned int		link_irqs[2];
+	/* PORT_INT_PME's interrupt (0: none), see apple_pcie_port_pme_thread() */
+	unsigned int		pme_irq;
 	u32			saved_intmask;
 	int			sid_map_sz;
 	struct gpio_desc	*perst_gpio;
 	struct gpio_desc	*pwren_gpio;
 	int			idx;
+	/* Conventional port: link up when the sleep began, and found down after it */
+	bool			hib_link_up;
+	bool			hib_cold;
 	bool			started;
 	bool			needs_stop;
 	bool			link_failed;
@@ -1135,6 +1142,59 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * A PME message reached the root port. Because the root port does not raise
+ * its own PCIe port services MSI for a PME (measured on T8132), forward the
+ * port's PME interrupt to that vector by hand: the PME service reads Root
+ * Status, resumes or wakes the requester, and while the system sleeps the wake
+ * that interrupt is armed for (enable_irq_wake() at the PME service's suspend)
+ * takes place. This is how a Wake-on-LAN packet ends suspend-to-idle.
+ */
+static irqreturn_t apple_pcie_port_pme_thread(int irq, void *data)
+{
+	struct apple_pcie_port *port = data;
+	struct pci_host_bridge *bridge = dev_get_drvdata(port->pcie->dev);
+	struct pci_dev *rp;
+	int vector;
+
+	if (!bridge || !bridge->bus)
+		return IRQ_NONE;
+	rp = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
+	if (!rp)
+		return IRQ_NONE;
+	vector = rp->msi_enabled || rp->msix_enabled ? pci_irq_vector(rp, 0) : rp->irq;
+	if (vector > 0)
+		generic_handle_irq_safe(vector);
+	else
+		dev_warn_ratelimited(port->pcie->dev, "%pOF: PME, but %s has no interrupt\n",
+				     port->np, pci_name(rp));
+	pci_dev_put(rp);
+	return IRQ_HANDLED;
+}
+
+static int apple_pcie_port_register_pme(struct apple_pcie_port *port)
+{
+	struct irq_fwspec fwspec = {
+		.fwnode		= &port->np->fwnode,
+		.param_count	= 1,
+		.param		= { [0] = PORT_INT_PME, },
+	};
+	int irq, ret;
+
+	irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE, &fwspec);
+	if (irq <= 0)
+		return irq ?: -ENOMEM;
+	/* Runs through suspend: it is what ends a suspend-to-idle for a PME. */
+	ret = request_threaded_irq(irq, NULL, apple_pcie_port_pme_thread,
+				   IRQF_ONESHOT | IRQF_NO_SUSPEND, "PME", port);
+	if (ret) {
+		irq_domain_free_irqs(irq, 1);
+		return ret;
+	}
+	port->pme_irq = irq;
+	return 0;
+}
+
 static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 {
 	static struct {
@@ -1144,7 +1204,7 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		{ PORT_INT_LINK_UP,	"Link up",	},
 		{ PORT_INT_LINK_DOWN,	"Link down",	},
 	};
-	int i;
+	int i, ret;
 
 	for (i = 0; i < ARRAY_SIZE(port_irqs); i++) {
 		struct irq_fwspec fwspec = {
@@ -1154,7 +1214,7 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 				[0]	= port_irqs[i].hwirq,
 			},
 		};
-		int irq, ret;
+		int irq;
 
 		irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE,
 					    &fwspec);
@@ -1171,6 +1231,10 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		port->link_irqs[i] = irq;
 	}
 
+	ret = apple_pcie_port_register_pme(port);
+	if (ret)
+		dev_warn(port->pcie->dev, "%pOF: no PME interrupt: %d\n", port->np, ret);
+
 	return 0;
 }
 
@@ -1185,6 +1249,11 @@ static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *port)
 		free_irq(port->link_irqs[i], port);
 		irq_domain_free_irqs(port->link_irqs[i], 1);
 		port->link_irqs[i] = 0;
+	}
+	if (port->pme_irq) {
+		free_irq(port->pme_irq, port);
+		irq_domain_free_irqs(port->pme_irq, 1);
+		port->pme_irq = 0;
 	}
 }
 
@@ -4090,7 +4159,7 @@ static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 	if (pcie->hw->mps_timers && where == PCIEC_RP_DEVCTL)
 		apple_pcie_update_mps_timers(pcie,
 					     FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, val));
-	if (!pcie->kernel_init)
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
 		return ret;
 	/* Root-port prefetchable window. The port block has to be told too. */
 	if (where < 0x24 || where >= 0x30)
@@ -5474,35 +5543,14 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 static void apple_pcie_t6050_warm_reset_probe(struct platform_device *pdev, struct apple_pcie *pcie,
 					      struct apple_pcie_port *port)
 {
-	struct of_phandle_args fn;
-	int count, i;
-
 	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) ||
-	    of_parse_phandle_with_fixed_args(port->np, "apple,function-warm-reset", 2, 0, &fn))
+	    apple_smc_warm_reset_parse(port->np, &pcie->t6050_warm))
 		return;
-	pcie->t6050_smc = of_find_device_by_node(fn.np);
-	of_node_put(fn.np);
-	if (!pcie->t6050_smc)
-		return;
-	count = of_property_count_u32_elems(port->np, "apple,warm-reset-writes");
-	if (count < 2 || count % 2 || count > ARRAY_SIZE(pcie->t6050_warm_writes) ||
-	    of_property_read_u32_array(port->np, "apple,warm-reset-writes",
-				       pcie->t6050_warm_writes, count))
-		goto drop;
-	for (i = 1; i < count; i += 2)
-		if (pcie->t6050_warm_writes[i] > 100 * USEC_PER_MSEC)
-			goto drop;
 	/* The SMC's noirq resume comes before this host's: the reset is written from there */
-	if (!device_link_add(&pdev->dev, &pcie->t6050_smc->dev, DL_FLAG_STATELESS)) {
+	if (!device_link_add(&pdev->dev, &pcie->t6050_warm.smc->dev, DL_FLAG_STATELESS)) {
 		dev_warn(&pdev->dev, "no warm reset after a sleep: no link to the SMC\n");
-		goto drop;
+		apple_smc_warm_reset_put(&pcie->t6050_warm);
 	}
-	pcie->t6050_warm_key = fn.args[0];
-	pcie->t6050_warm_count = count / 2;
-	return;
-drop:
-	put_device(&pcie->t6050_smc->dev);
-	pcie->t6050_smc = NULL;
 }
 
 /*
@@ -5513,34 +5561,15 @@ drop:
  */
 static int apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 {
-	struct apple_smc *smc;
-	unsigned int i;
-	int ret = 0;
+	int ret;
 
 	pcie->t6050_warm_done = false;
-	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm_count)
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm.count)
 		return -ENODEV;
-	smc = platform_get_drvdata(pcie->t6050_smc);
-	if (!smc) {
+	ret = apple_smc_warm_reset(&pcie->t6050_warm, noirq);
+	if (ret == -ENODEV) {
 		dev_warn(pcie->dev, "no warm reset: the SMC isn't bound\n");
-		return -ENODEV;
-	}
-	for (i = 0; i < pcie->t6050_warm_count && !ret; i++) {
-		__be32 value = cpu_to_be32(pcie->t6050_warm_writes[2 * i]);
-		u32 wait = pcie->t6050_warm_writes[2 * i + 1];
-		smc_key key = pcie->t6050_warm_key;
-
-		if (noirq) {
-			ret = apple_smc_write_noirq(smc, key, &value, sizeof(value));
-			if (!ret) {
-				mdelay(wait / USEC_PER_MSEC);
-				udelay(wait % USEC_PER_MSEC);
-			}
-		} else {
-			ret = apple_smc_write(smc, key, &value, sizeof(value));
-			if (!ret)
-				fsleep(wait);
-		}
+		return ret;
 	}
 	pcie->t6050_warm_done = !ret;
 	if (ret)
@@ -5559,8 +5588,7 @@ static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct ap
 {
 	struct apple_pcie_port *port;
 
-	if (pcie->managed_sids || !(of_machine_is_compatible("apple,j714s") ||
-				    of_machine_is_compatible("apple,j716c")))
+	if (pcie->managed_sids || !apple_t6050_sleep_described())
 		return;
 	/* The one port a boot loader trained; an endpoint Linux powers is parked instead. */
 	list_for_each_entry(port, &pcie->ports, entry)
@@ -5740,7 +5768,7 @@ void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
 {
 	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
 
-	if (pcie && pcie->t6050_warm_count) {
+	if (pcie && pcie->t6050_warm.count) {
 		pcie->t6050_keep_alive = false;
 		pcie->t6050_reset_before_sleep = true;
 	}
@@ -5805,7 +5833,7 @@ int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 
 	if (!pcie)
 		return -ENODEV;
-	if (!pcie->t6050_warm_count || pcie->t6050_lost || READ_ONCE(pcie->t6050_down))
+	if (!pcie->t6050_warm.count || pcie->t6050_lost || READ_ONCE(pcie->t6050_down))
 		return -EBUSY;
 	pci_save_state(bridge);
 	ret = apple_pcie_t6050_sleep_down(pcie);
@@ -5854,6 +5882,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	struct apple_pcie *pcie;
 	struct device *piodma_supplier = NULL;
 	int ret;
+
+	/* Setting the ports up again after a real sleep takes ~0.75 s: resume in parallel. */
+	device_enable_async_suspend(&pdev->dev);
 
 	hw = of_device_get_match_data(dev);
 	if (!hw)
@@ -5978,6 +6009,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	mutex_init(&pcie->lock);
 	INIT_LIST_HEAD(&pcie->ports);
+	INIT_LIST_HEAD(&pcie->hib_fns);
 
 	/* Resolve PM dependencies before publishing the PCI hierarchy. */
 	if (pcie->hw->tunneled) {
@@ -6210,7 +6242,8 @@ static int apple_pcie_tunnel_other_driver(struct pci_dev *pdev, void *data)
 {
 	struct device_driver *drv = READ_ONCE(pdev->dev.driver);
 
-	if (!drv || !strcmp(drv->name, "nvme") || !strcmp(drv->name, "pcieport"))
+	if (!drv || !strcmp(drv->name, "nvme") || !strcmp(drv->name, "pcieport") ||
+	    !strcmp(drv->name, "igc"))
 		return 0;
 	*(const char **)data = drv->name;
 	return 1;
@@ -6224,13 +6257,14 @@ static int apple_pcie_tunnel_other_driver(struct pci_dev *pdev, void *data)
  * For a sleep that takes the tunnel's router down. Unlike apple_pcie_tunnel_quiesce(), which
  * marks the functions disconnected first (their drivers then treat them as gone), the
  * functions are removed while they still answer: an NVMe controller's driver stops its
- * queues and gives the controller its normal shutdown, as at a power-off. Nothing is written
+ * queues and gives the controller its normal shutdown, as at a power-off, and igc
+ * unregisters its netdev cleanly without touching PM notifiers. Nothing is written
  * to a disk that has no opener. apple_pcie_tunnel_quiesce() then takes the ports down and
  * apple_pcie_tunnel_restore() enumerates the hierarchy again.
  *
  * Returns 0 when the hierarchy is removed (or was already), -EBUSY when a disk is open and
- * @in_use_too is false, -EOPNOTSUPP when a function has a driver other than nvme or the PCIe
- * port driver. Nothing is removed on an error.
+ * @in_use_too is false, -EOPNOTSUPP when a function has a driver other than nvme, igc, or
+ * the PCIe port driver. Nothing is removed on an error.
  */
 int apple_pcie_tunnel_remove_orderly(struct device *dev, bool in_use_too)
 {
@@ -6898,6 +6932,9 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 
+static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie);
+static void apple_pcie_hib_save(struct apple_pcie *pcie);
+static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what);
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -7062,7 +7099,18 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (pm_suspend_no_platform() && pcie->num_pds)
+		bool s2r_reinit = apple_pcie_s2r_reinit(pcie) && pm_suspend_via_firmware();
+
+		if (s2r_reinit)
+			apple_pcie_hib_save(pcie);
+		/*
+		 * Keep the host's power domains on across genpd noirq suspend
+		 * for s2idle and firmware sleeps: on an abandoned or dry-run
+		 * firmware sleep the commit never runs, so gating the domain
+		 * here would leave the controller unprogrammed with no wake
+		 * sequence to reinitialize it. A real commit powers it down.
+		 */
+		if ((pm_suspend_no_platform() || s2r_reinit) && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
 		return 0;
 	}
@@ -7565,7 +7613,7 @@ static int apple_pcie_resume_noirq(struct device *dev)
 			/* Up, and reset unless kept alive: nothing takes it down again */
 			pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
 					   (!warm_reset || pcie->t6050_warm_done ||
-					    !pcie->t6050_warm_count);
+					    !pcie->t6050_warm.count);
 			list_for_each_entry(port, &pcie->ports, entry)
 				if (pcie->t6050_parked & BIT(port->idx))
 					dev_dbg(dev, "port %d at the wake: parked since before the sleep, power off, PERST# low, no functions, root port %s, DART %s; %s\n",
@@ -7593,8 +7641,19 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		}
 		return ret;
 	}
-	if (!pcie->hw->tunneled)
+	if (!pcie->hw->tunneled) {
+		if (pcie->hib_saved) {
+			if (pm_resume_via_firmware()) {
+				apple_pcie_hib_restore_noirq(pcie, "S2R");
+			} else {
+				/* Refused before commit: registers are intact. */
+				pcie->hib_saved = false;
+				list_for_each_entry(port, &pcie->ports, entry)
+					apple_pcie_port_enable_irq(port);
+			}
+		}
 		return 0;
+	}
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
@@ -7661,6 +7720,220 @@ failed:
 	return ret;
 }
 
+/*
+ * A conventional host (the internal ports with the radio and the SD reader) loses its power
+ * in a real sleep: the endpoints sit unpowered or in reset behind a link that is down. The
+ * resume then does what probe did. From aurora-silicon/linux#1477 (0ab1a6603).
+ */
+struct apple_pcie_hib_fn {
+	struct list_head	entry;
+	struct pci_dev		*pdev;
+	struct pci_saved_state	*state;
+};
+
+/* A real sleep takes a conventional host's power: its ports are set up again as at probe. */
+static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie)
+{
+	return !pcie->hw->tunneled && !pcie->managed_sids && !pcie->piodma_supplier &&
+	       !pcie->hw->root_bus_only;
+}
+
+/* What only the port registers hold. */
+static void apple_pcie_hib_save(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	mutex_lock(&pcie->lock);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		/*
+		 * A chained port interrupt stays unmasked across suspend_device_irqs().
+		 * Mask and gate it before firmware sleep so a complex whose boot-time
+		 * reinit leaves PORT_INTMSK clear cannot storm at AIC resume before
+		 * apple_pcie_resume() masks and restores the port.
+		 */
+		apple_pcie_port_disable_irq(port);
+		port->hib_link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+		port->hib_cold = false;
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+	pcie->hib_saved = true;
+	mutex_unlock(&pcie->lock);
+}
+
+static void apple_pcie_hib_free_fns(struct apple_pcie *pcie)
+{
+	struct apple_pcie_hib_fn *fn, *tmp;
+
+	list_for_each_entry_safe(fn, tmp, &pcie->hib_fns, entry) {
+		list_del(&fn->entry);
+		kfree(fn->state);
+		pci_dev_put(fn->pdev);
+		kfree(fn);
+	}
+}
+
+/*
+ * The PCI core's noirq resume spends the functions' saved state on a link that is down
+ * ("device inaccessible"). A copy taken first goes back once the link is.
+ */
+static int apple_pcie_hib_keep_fn(struct pci_dev *pdev, void *data)
+{
+	struct apple_pcie *pcie = data;
+	struct apple_pcie_port *port;
+	struct apple_pcie_hib_fn *fn;
+
+	if (pci_is_root_bus(pdev->bus) || !pdev->state_saved)
+		return 0;
+	port = apple_pcie_get_port(pdev);
+	if (!port || !port->hib_cold)
+		return 0;
+	fn = kzalloc(sizeof(*fn), GFP_ATOMIC);
+	if (!fn)
+		return 0;
+	fn->state = pci_store_saved_state(pdev);
+	if (!fn->state) {
+		kfree(fn);
+		return 0;
+	}
+	fn->pdev = pci_dev_get(pdev);
+	list_add_tail(&fn->entry, &pcie->hib_fns);
+	return 0;
+}
+
+/* Before the PCI core restores the functions; nothing is written to a port in this phase. */
+static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	bool cold = false;
+
+	apple_pcie_hib_free_fns(pcie);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->hib_link_up)
+			continue;
+		if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)
+			continue;
+		port->hib_cold = true;
+		cold = true;
+		dev_info(pcie->dev, "%s: %pOF lost its link, setting it up again\n",
+			 what, port->np);
+	}
+	if (cold && bridge->bus)
+		pci_walk_bus(bridge->bus, apple_pcie_hib_keep_fn, pcie);
+}
+
+static void apple_pcie_hib_rid2sid(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	int i;
+
+	mutex_lock(&pcie->lock);
+	for (i = 0; i < port->sid_map_sz; i++)
+		apple_pcie_rid2sid_write(port, i, test_bit(i, port->sid_map) ?
+					 port->saved_rid2sid[i] : 0);
+	mutex_unlock(&pcie->lock);
+}
+
+/* Probe's bring-up of a conventional port, with the state this kernel had programmed. */
+static int apple_pcie_hib_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	ret = apple_pcie_setup_link(pcie, port, port->np);
+	if (ret)
+		return ret;
+	if (!pcie->hw->retain_clocks) {
+		if (pcie->hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+		else if (port->phy)
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	}
+	/* All port interrupts masked and cleared, MSI routing as at probe. */
+	apple_pcie_tunnel_restore_irq_hw(port);
+	apple_pcie_hib_rid2sid(pcie, port);
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+					 stat & PORT_LINKSTS_UP, 100, link_up_timeout * 1000);
+	if (ret) {
+		dev_err(pcie->dev, "S2R: %pOF status %#x link %#x after training\n", port->np,
+			apple_pcie_port_readl(port, PORT_STATUS), stat);
+		return ret;
+	}
+	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	/* 100 ms after the link before configuration requests (PCIe r5.0, 6.6.1). */
+	msleep(100);
+	return 0;
+}
+
+/* The normal phase, after the SMC (the PWREN GPIOs are its) and before the functions. */
+static int apple_pcie_resume(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+	struct apple_pcie_port *port;
+	struct apple_pcie_hib_fn *fn;
+	int ret;
+
+	if (!pcie->hib_saved)
+		return 0;
+	pcie->hib_saved = false;
+	if (!apple_pcie_s2r_reinit(pcie) || !pm_resume_via_firmware()) {
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_port_enable_irq(port);
+		return 0;
+	}
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->hib_link_up) {
+			apple_pcie_port_writel(port, ~0, PORT_INTMSK);
+			apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+			apple_pcie_port_enable_irq(port);
+			continue;
+		}
+		if (!port->hib_cold) {
+			apple_pcie_hib_rid2sid(pcie, port);
+			apple_pcie_port_enable_irq(port);
+			continue;
+		}
+		ret = apple_pcie_hib_port_up(pcie, port);
+		if (ret) {
+			dev_err(dev, "S2R: %pOF link not back (%d), its functions stay unreachable\n",
+				port->np, ret);
+			apple_pcie_port_writel(port, ~0, PORT_INTMSK);
+			apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+			port->hib_cold = false;
+			apple_pcie_port_enable_irq(port);
+			continue;
+		}
+		apple_pcie_port_enable_irq(port);
+		dev_info(dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n",
+			 port->np);
+	}
+	list_for_each_entry(fn, &pcie->hib_fns, entry) {
+		port = apple_pcie_get_port(fn->pdev);
+		if (!port || !port->hib_cold)
+			continue;
+		/*
+		 * The PCI core's noirq power-up ran with the link down and left the function
+		 * marked D3: the reset brought it up in D0, so record that before the
+		 * restore, or its driver's resume can't enable MSI again (-EINVAL).
+		 */
+		pci_set_power_state(fn->pdev, PCI_D0);
+		if (pci_load_saved_state(fn->pdev, fn->state))
+			pci_warn(fn->pdev, "S2R: saved configuration not taken back\n");
+		else
+			pci_restore_state(fn->pdev);
+	}
+	apple_pcie_hib_free_fns(pcie);
+	list_for_each_entry(port, &pcie->ports, entry)
+		port->hib_cold = false;
+	return 0;
+}
+
 static int apple_pcie_prepare(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -7707,6 +7980,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 	.complete = apple_radio_complete,
 	.suspend_noirq = apple_pcie_suspend_noirq,
 	.resume_noirq = apple_pcie_resume_noirq,
+	.resume = apple_pcie_resume,
 	.resume_early = apple_pcie_resume_early,
 };
 

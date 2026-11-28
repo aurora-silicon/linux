@@ -11,7 +11,7 @@
 //! notifier unregistration joins callbacks without holding that mutex.
 //! M5 requests full CPU capacity only while refill pressure keeps the detector
 //! active. Sustained demand can renew its deadline indefinitely; withdrawal
-//! occurs on a later worker poll, not at an exact eight-millisecond boundary.
+//! occurs on a later worker poll, not at an exact twenty-millisecond boundary.
 
 use crate::hw::t8140::qos::CLOCK_HZ;
 use core::{
@@ -40,12 +40,12 @@ const MAX_REFILL_TICKS: u64 = CLOCK_HZ / 500;
 const _: () = assert!(CLOCK_HZ == crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ);
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
-const LINGER_NS: u64 = 8_000_000;
+const LINGER_NS: u64 = 20_000_000;
 const POLL_MS: i64 = 2;
 #[cfg(CONFIG_CPU_FREQ)]
 const FLOOR_PERCENT: u64 = 50;
 const WAIT_UTIL_MIN: u32 = 512;
-const WAIT_HINT_MS: u32 = 8;
+const WAIT_HINT_MS: u32 = 20;
 #[cfg(CONFIG_CPU_FREQ)]
 const MAX_POLICIES: usize = 8;
 
@@ -526,10 +526,18 @@ impl Feed {
         }
     }
 
+    /// Temporary capacity hint for blocking syncobj waits on active GPU streams.
+    ///
+    /// Host-refill-bound streams (`wanted`) require an applied cpufreq floor,
+    /// while GPU-bound streams (`bound`) return the hint without raising the
+    /// cpufreq floor so EAS keeps the waiter on a P-core across long passes.
     pub(crate) fn wait_hint(&self) -> Option<(u32, u32)> {
-        if cfg!(CONFIG_UCLAMP_TASK)
-            && self.detector.wanted(Self::now())
-            && self.applied.load(Ordering::Relaxed)
+        if !cfg!(CONFIG_UCLAMP_TASK) {
+            return None;
+        }
+        let now = Self::now();
+        if (self.detector.wanted(now) && self.applied.load(Ordering::Relaxed))
+            || self.detector.bound(now)
         {
             Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
         } else {
@@ -595,7 +603,32 @@ mod detector_tests {
         let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ / 25_000);
         assert!(detector.bound(now));
         assert!(!detector.wanted(now));
+        // Still bound across an 8-16 ms pass, then expires at the 20 ms linger boundary.
+        assert!(detector.bound(now + 15_000_000));
         assert!(!detector.bound(now + LINGER_NS));
+    }
+
+    #[test]
+    fn gpu_bound_long_pass_lingers_for_full_frame() {
+        let detector = Detector::new();
+        // 8 ms GPU passes with 1.7 ms host gaps stay GPU-bound without requesting a CPU floor,
+        // and linger across a 16 ms frame until the 20 ms boundary.
+        let busy = CLOCK_HZ / 125;
+        let gap = CLOCK_HZ * 17 / 10_000;
+        let step_ns = 9_700_000;
+        let mut start = 1000;
+        let mut now = 1_000_000;
+        for _ in 0..16 {
+            detector.note(start, start + busy, now);
+            start += busy + gap;
+            now += step_ns;
+        }
+        let last = now - step_ns;
+        assert!(detector.bound(last));
+        assert!(!detector.wanted(last));
+        assert!(detector.bound(last + 16_000_000));
+        assert!(detector.bound(last + LINGER_NS - 1));
+        assert!(!detector.bound(last + LINGER_NS));
     }
 
     #[test]
@@ -612,6 +645,10 @@ mod detector_tests {
         let detector = Detector::new();
         // Each pass starts after a pause of at least the refill limit.
         let now = run(&detector, 16, CLOCK_HZ / 500, MAX_REFILL_TICKS);
+        assert!(!detector.bound(now) && !detector.wanted(now));
+        // 60 Hz paced frames (16.6 ms gap) keep resetting the streak.
+        let detector = Detector::new();
+        let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ * 166 / 10_000);
         assert!(!detector.bound(now) && !detector.wanted(now));
         // Fewer back-to-back passes than the streak needs.
         let detector = Detector::new();

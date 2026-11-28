@@ -234,7 +234,12 @@
 		reg = <0x3 0x90fc0000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		/*
+		 * No power-domains: AOP_DART is in the AOP's own power tree
+		 * (pmgr AOP_FILTER), which runs from before the handoff and
+		 * which the AP never switches off; the ADT gives dart-aop and
+		 * aop no power-gates.
+		 */
 	};
 
 	pmp_dart: iommu@380300000 {

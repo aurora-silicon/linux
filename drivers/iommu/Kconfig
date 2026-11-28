@@ -81,6 +81,19 @@ config IOMMU_IO_PGTABLE_DART
 
 	  If unsure, say N here.
 
+config IOMMU_IO_PGTABLE_DART_KUNIT_TEST
+	bool "KUnit tests for Apple DART page tables" if !KUNIT_ALL_TESTS
+	depends on IOMMU_IO_PGTABLE_DART && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Enable KUnit tests for the Apple DART page table allocator. They
+	  check the table layout chosen for each format, granule and input
+	  size, the DART and DART2 PTE encodings, map/unmap/iova_to_phys
+	  across table boundaries, rejection of invalid requests and that
+	  teardown frees every table page.
+
+	  If unsure, say N here.
+
 endmenu
 
 config IOMMU_DEBUGFS

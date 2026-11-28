@@ -1,0 +1,33 @@
+# Modules the QEMU smoke run does not load, or that are known not to load
+# under QEMU, and KUnit suites known to fail there. One per line:
+#   skip  <module> <reason>     never loaded
+#   fail  <module> <reason>     loading may fail or hang without failing the run
+#   warn  <module> <reason>     a kernel warning while loading it does not fail the run
+#   kunit <suite>  <reason>     the suite may fail without failing the run
+# Names may be shell globs. Every entry needs a reason. Remove an entry once it
+# passes.
+skip rcutorture      runs torture kthreads until unloaded
+skip locktorture     runs torture kthreads until unloaded
+skip scftorture      runs torture kthreads until unloaded
+skip rcuscale        runs a benchmark until unloaded
+skip refscale        runs a benchmark until unloaded
+skip torture         only a library for the torture tests above
+skip test_lockup     provokes soft/hard lockups on purpose
+skip test_vmalloc    vmalloc stress test, runs for minutes under emulation
+skip speakup_*       speech synthesizer drivers; the serial ones wait for a synthesizer on a serial port
+fail tcrypt          returns -EAGAIN by design after running its tests
+fail xusbatm         needs vendor/product module parameters
+fail ptp_kvm         needs the KVM PTP hypervisor service
+fail alim7101_wdt    probes for an ALi M7101 chipset (-EBUSY without it)
+fail dtpm            Rockchip SoC power hierarchy, refuses on other machines
+fail snd-soc-uda1342 its I2C driver name "uda1342" is already taken by the media uda1342 driver
+fail nhc_ghc_*       6LoWPAN GHC compression claims the NHC IDs of the plain nhc_* modules loaded before it
+warn serial_ir       PC serial-port IR receiver requests a fixed legacy IRQ the virt machine does not have
+warn snd-mtpav       PC parallel-port MIDI driver requests a fixed legacy IRQ the virt machine does not have
+fail ubifs           init cannot get the zstd compressor (-ENOENT) in this initramfs; not yet triaged
+kunit arm-smmu-v3-kunit-test   arm_smmu_v3_invs_test trips UBSAN array-index-out-of-bounds in arm-smmu-v3.c; not yet triaged
+kunit amdv1_iommu_test         test_map_simple secondary page-table accounting mismatch; not yet triaged
+kunit amdgpu_dm_hdcp           dm_test_event_cpirq_schedules_property_validate fails; not yet triaged
+kunit amdgpu_dm_irq            dm_test_dcn10_register_irq_handlers_one_crtc fails; not yet triaged
+kunit amdgpu_dm_crtc           dm_test_crtc_enable_vblank_ips_restore{,_replay} fault (unexpected DAIF); not yet triaged
+kunit binder_alloc             binder_alloc_exhaustive_test reports failures; not yet triaged

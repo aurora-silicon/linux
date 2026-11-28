@@ -936,6 +936,7 @@ static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock
 static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
 /* Native audio is out of scope: reject entry instead of silently queueing it. */
 static void dcp_external_audio_start(struct apple_dcp *d) { assert(!d->external_native); }
+static void av_audio_sink_changed(struct apple_dcp *d) { (void)d; }
 /* The stubbed read always carries an EDID: nothing asks for a re-probe. */
 static bool dcpavserv_edid_retry(struct apple_dcp *d,u64 e) { (void)d;(void)e;assert(0);return false; }
 static void dcpavserv_edid_retry_reset(struct apple_dcp *d) { assert(d->dcpavserv.lock); }

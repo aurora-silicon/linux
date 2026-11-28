@@ -168,7 +168,7 @@ pub(crate) fn mapped_sg_table<'a>(
 /// VM-private BOs share their assigned VM's reservation object. Validate this
 /// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
 pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
-    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 && vm.is_extobj(gem) {
+    if gem.is_vm_private() && vm.is_extobj(gem) {
         return Err(EINVAL);
     }
     Ok(())
@@ -289,6 +289,13 @@ pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<Obj
 /// issued a barrier, without cache maintenance.
 pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
     new_kernel_object_mapped(dev, size, true, true)
+}
+
+/// Create a new kernel-owned GEM object that is not counted as kernel memory: its owner holds a
+/// user charge for it ([`memacct::Charge::user`]), and counting both would take its size twice
+/// from the device limit.
+pub(crate) fn new_kernel_object_user_charged(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, false, false)
 }
 
 /// Create a new kernel-owned write-combined GEM object that is not counted as kernel memory:
@@ -699,6 +706,12 @@ impl AsahiObject {
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
+    }
+
+    /// Whether the backing belongs to the VM that created the object, so that only that VM may
+    /// map it.
+    pub(crate) fn is_vm_private(&self) -> bool {
+        self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
     }
 
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2026 Joshua Warren */
 
+#include <kunit/visibility.h>
 #include <linux/interrupt.h>
 #include <linux/gfp.h>
 #include <linux/io.h>
@@ -171,6 +172,71 @@ bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
 }
 
 /*
+ * The scratch page is mapped read-write for the job that faulted, and
+ * the job's output can carry what it reads from there: hand it out
+ * zeroed.
+ */
+VISIBLE_IF_KUNIT struct page *ane_dart_alloc_scratch_page(void)
+{
+	return alloc_page(GFP_KERNEL | __GFP_ZERO);
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_dart_alloc_scratch_page);
+
+/*
+ * Where may a fault-drain page go? A fault is a missing PTE in one of two
+ * places. In a hole of the allocator (a wild address), the drain reserves
+ * a node for the page (@host stays NULL). Or in the range of a BO that is
+ * not in the DART: ane_submit() takes every BO that the job does not name
+ * out of the DART, so an access past the end of a job's buffer, or a
+ * descriptor that points at another buffer of this or another file, lands
+ * there; the ranges are packed, so this is the common case. The page then
+ * goes into that BO's range and @host is the BO's node. That BO cannot get
+ * its pages back into the DART, nor its range back to the allocator, while
+ * the page is there (ane_dart_scratch_in()), so no scratch PTE outlives
+ * the drain into a mapped BO. Anything else (a mapped BO, a scratch page,
+ * a wedge-preserved range) has PTEs and cannot fault: refuse it.
+ *
+ * Callers hold iommu_lock.
+ */
+VISIBLE_IF_KUNIT int ane_dart_scratch_slot(struct ane_device *ane, u64 iova,
+					   u64 size, struct drm_mm_node **host)
+{
+	struct drm_mm *mm = &ane->mm;
+	struct drm_mm_node *node;
+
+	*host = NULL;
+	if (iova + size < iova)
+		return -EINVAL;
+	/* A drain in an unmapped BO has no separate drm_mm node. */
+	for (int i = 0; i < ane->scratch_pages; i++)
+		if (ane->scratch[i].iova == iova)
+			return -EBUSY;
+	drm_mm_for_each_node_in_range(node, mm, iova, iova + size) {
+		/* Past the end of the range that the allocator manages. */
+		if (node == &mm->head_node)
+			return -ERANGE;
+		if (node->color != ANE_MM_BO_UNMAPPED ||
+		    node->start > iova ||
+		    node->start + node->size < iova + size)
+			return -EBUSY;
+		*host = node;
+		return 0;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_dart_scratch_slot);
+
+/* Does a drain page sit in the range of the BO that owns @host? */
+bool ane_dart_scratch_in(struct ane_device *ane, struct drm_mm_node *host)
+{
+	for (int i = 0; i < ane->scratch_pages; i++)
+		if (host && ane->scratch[i].host == host)
+			return true;
+	return false;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_dart_scratch_in);
+
+/*
  * A fault is a missing PTE, nothing more: the page tables are provider
  * owned and unchanged, so the stream-restore apple-dart uses at reset
  * time is the wrong tool mid-job (register surgery while the faulting
@@ -179,68 +245,76 @@ bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
  * completes and the engine drains on its own; the scratch pages are
  * unmapped once the request has been failed cleanly.
  *
- * The throwaway page is mapped at the faulting address, which is
- * allocator-free by definition of a translation fault - but the drm_mm
- * allocator knows nothing about a raw iommu_map. A scratch PTE that
- * outlives its release path (any future bug on the wedge side) would
- * then sit, untracked, in a range the allocator considers free: the
- * next BO_INIT maps onto it and fails with dart_init_pte's "we require
- * an unmap first" WARN. So the scratch range is RESERVED in the
- * allocator first: a node-tracked mapping can never collide with a
- * later BO_INIT, and a scratch whose release is skipped degrades into
- * a bounded, benign leak instead of a poisoned address space. Reserve
- * failure means a live BO node already owns the faulting page (a wild
- * descriptor, not a hole): refuse and let the caller wedge, fail
- * closed.
+ * The drm_mm allocator knows nothing about a raw iommu_map, so a scratch
+ * PTE is always inside a node: one the drain reserves in a hole, or the
+ * node of the unmapped BO it landed in (ane_dart_scratch_slot()). A
+ * node-tracked mapping can never collide with a later BO_INIT, and a
+ * scratch whose release is skipped degrades into a bounded, benign leak
+ * instead of a poisoned address space. A page that no drain may take
+ * is refused, and the caller wedges and recovers, fail closed.
+ *
+ * Callers hold engine_lock, which keeps the BOs' DART state still.
  */
-int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
-			 struct ane_dart_scratch *scratch, int *pages)
+int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova)
 {
-	struct drm_mm_node *node;
+	struct ane_dart_scratch *scratch;
+	struct drm_mm_node *node = NULL, *host;
 	struct page *page;
 	u64 iova;
 	int ret, i;
 
-	page = alloc_page(GFP_KERNEL);
+	lockdep_assert_held(&ane->engine_lock);
+	page = ane_dart_alloc_scratch_page();
 	if (!page)
 		return -ENOMEM;
 	iova = fault_iova & ~((1ULL << ane->shift) - 1);
 
-	node = kzalloc_obj(*node);
-	if (!node) {
-		__free_page(page);
-		return -ENOMEM;
-	}
-	node->start = iova;
-	node->size = BIT(ane->shift);
-
 	mutex_lock(&ane->iommu_lock);
-	ret = drm_mm_reserve_node(&ane->mm, node);
-	if (ret) {
-		mutex_unlock(&ane->iommu_lock);
-		kfree(node);
-		__free_page(page);
-		return ret;
+	ret = ane_dart_scratch_slot(ane, iova, BIT(ane->shift), &host);
+	if (ret)
+		goto refuse;
+	if (!host) {
+		node = kzalloc_obj(*node);
+		if (!node) {
+			ret = -ENOMEM;
+			goto refuse;
+		}
+		node->start = iova;
+		node->size = BIT(ane->shift);
+		node->color = ANE_MM_SCRATCH;
+		ret = drm_mm_reserve_node(&ane->mm, node);
+		if (ret) {
+			kfree(node);
+			goto refuse;
+		}
 	}
 
 	ret = iommu_map(ane->domain, iova, page_to_phys(page),
 			BIT(ane->shift), IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
-	mutex_unlock(&ane->iommu_lock);
 	if (ret) {
-		mutex_lock(&ane->iommu_lock);
-		drm_mm_remove_node(node);
-		mutex_unlock(&ane->iommu_lock);
-		kfree(node);
-		__free_page(page);
-		return ret;
+		if (node) {
+			drm_mm_remove_node(node);
+			kfree(node);
+		}
+		goto refuse;
 	}
-	scratch[*pages].iova = iova;
-	scratch[*pages].page = page;
-	scratch[*pages].node = node;
-	(*pages)++;
+	mutex_unlock(&ane->iommu_lock);
+	dev_dbg(ane->dev, "fault drain: page at %#llx in %s\n", iova,
+		host ? "an unmapped buffer's range" : "a hole");
+	scratch = &ane->scratch[ane->scratch_pages++];
+	scratch->iova = iova;
+	scratch->page = page;
+	scratch->node = node;
+	scratch->host = host;
 	for (i = 0; i < ane->dart_count; i++)
 		ane_dart_invalidate(ane, &ane->darts[i]);
 	return 0;
+
+refuse:
+	mutex_unlock(&ane->iommu_lock);
+	__free_page(page);
+	dev_dbg(ane->dev, "fault drain refused at %#llx: %d\n", iova, ret);
+	return ret;
 }
 
 void ane_dart_release_scratch(struct ane_device *ane,
@@ -258,9 +332,12 @@ void ane_dart_release_scratch(struct ane_device *ane,
 			dev_err(ane->dev,
 				"scratch unmap short at %#llx: %zu\n",
 				scratch[i].iova, unmapped);
-		drm_mm_remove_node(scratch[i].node);
-		kfree(scratch[i].node);
+		if (scratch[i].node) {
+			drm_mm_remove_node(scratch[i].node);
+			kfree(scratch[i].node);
+		}
 		scratch[i].node = NULL;
+		scratch[i].host = NULL;
 		__free_page(scratch[i].page);
 		scratch[i].page = NULL;
 	}
