@@ -2406,7 +2406,7 @@ static struct device_node *staged_routes(const struct gate_staged *st)
 }
 
 static const char *const t6041_hdmi_nodes[] = {
-	/* ATC3 power, PMP DISPEXT0 request, DISPEXT0, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext0 */
+	/* ATC3 power, PMP DISPEXT0 request, DISPEXT0, PHY, crossbar, DARTs, mailbox, dcpext0 */
 	"/power-management@502800000/power-controller@408",
 	"/power-management@508300000/power-controller@e0",
 	"/power-management@508300000/power-controller@168",
@@ -2415,7 +2415,6 @@ static const char *const t6041_hdmi_nodes[] = {
 	"/pmp-report@5003c0000/report@11",
 	"/power-management@502800000/power-controller@340",
 	"/power-management@502800000/power-controller@348",
-	"/pinctrl@510824000",
 	"/mailbox@39b148000",
 	"/phy@39aa90000",
 	"/mux@39b24c000",
@@ -2460,7 +2459,10 @@ static bool staged_is_route_path(const char *path)
  * dcpext1 and dcpext2.
  */
 static const char *const t6041_j614s_hdmi_nodes[] = {
-	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, routes, dcpext2 */
+	/*
+	 * ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, PHY, crossbar,
+	 * DARTs, mailbox, routes, dcpext2
+	 */
 	"/power-management@502800000/power-controller@408",
 	"/power-management@508300000/power-controller@e0",
 	"/power-management@508300000/power-controller@168",
@@ -2470,7 +2472,6 @@ static const char *const t6041_j614s_hdmi_nodes[] = {
 	"/power-management@502800000/power-controller@488",
 	"/power-management@502800000/power-controller@4e0",
 	"/power-management@502800000/power-controller@4e8",
-	"/pinctrl@510824000",
 	"/mailbox@39b148000",
 	"/phy@39aa90000",
 	"/mux@39b24c000",
@@ -2628,6 +2629,30 @@ static bool staged_ready(const struct gate_staged *st)
 	return true;
 }
 
+/*
+ * The pin controller of the HDMI converter's hotplug input (the processor's
+ * hdmi-hpd-gpios; the processor is the stage's last node) is a supplier the
+ * chain shares, not part of the handover: on the T6040 the AOP pin controller
+ * also has the USB4 routers' LSTX pins, and a board that enables the routers
+ * enables it in its device tree. Its probe writes no pin register; each
+ * consumer configures only its own pins. So it is not in the chain's
+ * must-be-disabled check: already enabled it stays as it is, disabled it is
+ * enabled in the chain's changeset.
+ */
+static int staged_enable_hpd_supplier(struct of_changeset *cs, const struct gate_staged *st)
+{
+	struct device_node *dcp, *np;
+	int ret = 0;
+
+	dcp = of_find_node_by_path(st->nodes[st->nr - 1]);
+	np = dcp ? of_parse_phandle(dcp, "hdmi-hpd-gpios", 0) : NULL;
+	of_node_put(dcp);
+	if (np && !of_device_is_available(np))
+		ret = of_changeset_update_prop_string(cs, np, "status", "okay");
+	of_node_put(np);
+	return ret;
+}
+
 /* Enable @st's nodes and put its display DART into the display subsystem's iommus. */
 static int staged_apply(const struct gate_staged *st, struct device_node *display)
 {
@@ -2644,6 +2669,8 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 	np = of_find_node_by_path(st->dart);
 	ret = np ? gate_iommus_append(cs, display, np) : -ENODEV;
 	of_node_put(np);
+	if (!ret)
+		ret = staged_enable_hpd_supplier(cs, st);
 	for (i = 0; !ret && i < st->nr; i++) {
 		if (staged_is_dcp(st->nodes[i]) || staged_is_route(st->nodes[i]))
 			continue;
@@ -3270,13 +3297,12 @@ static void __init gate_t6041_run(void)
  * nothing is requested or waited for: the domains are on as iBoot left them.
  */
 static const char *const t6041_max_hdmi_nodes[] = {
-	/* ATC3 power, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext0 */
+	/* ATC3 power, PHY, crossbar, DARTs, mailbox, dcpext0 */
 	"/power-management@502800000/power-controller@408",
 	"/power-management@508300000/power-controller@e0",
 	"/power-management@508300000/power-controller@168",
 	"/power-management@508300000/power-controller@b8",
 	"/power-management@508300000/power-controller@148",
-	"/pinctrl@510824000",
 	"/mailbox@39b148000",
 	"/phy@39aa90000",
 	"/mux@39b24c000",
@@ -3385,11 +3411,10 @@ static const struct gate_staged t6041_j575c_usbc2 = {
 /*
  * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
  * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
- * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
+ * the PHY, then dcpext0's chain.
  */
 static const char *const t6041_j575c_hdmi_nodes[] = {
 	"/power-management@502280000/power-controller@360",
-	"/pinctrl@510824000",
 	"/phy@51c200000",
 	"/iommu@3a2340000",
 	"/iommu@3a2300000",
@@ -3486,6 +3511,8 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 	np = of_find_node_by_path(st->dart);
 	ret = np ? gate_iommus_append(cs, display, np) : -ENODEV;
 	of_node_put(np);
+	if (!ret)
+		ret = staged_enable_hpd_supplier(cs, st);
 	for (n = 0; !ret && n < st->nr; n++) {
 		/* The routes go in just before their processor, the last node. */
 		if (n == st->nr - 1)

@@ -205,6 +205,11 @@
 	status = "okay";
 };
 
+/* The routers' LSTX pins (pinctrl-0) are in the AOP bank. */
+&pinctrl_aop {
+	status = "okay";
+};
+
 &ps_atc0_cio {
 	status = "okay";
 };

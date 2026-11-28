@@ -1855,7 +1855,12 @@
 			     <AIC_IRQ 704 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 705 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>;
-		/* Coprocessor pins and interrupt groups need an ownership handoff. */
+		/*
+		 * Enabled by a board for the devices that use its pins (the
+		 * T6040 USB4 routers' LSTX pins), and by the display gate for
+		 * the HDMI converter's hotplug input. Its probe writes no pin
+		 * register: each consumer configures only its own pins.
+		 */
 		status = "disabled";
 	};
 
