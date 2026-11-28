@@ -160,12 +160,34 @@ static void scope_defer_list(struct llist_node *nodes)
 	}
 }
 
-void asahi_g17_signal_fence(struct dma_fence *fence)
+/* Set @error, if any, and signal @fence in one step under its lock, unless it
+ * has already signalled: its waiters have seen that result, and
+ * dma_fence_set_error() must neither follow nor race the signal.
+ * Returns whether this call signalled @fence.
+ */
+static bool signal_with_error(struct dma_fence *fence, int error)
+{
+	unsigned long flags;
+	bool cookie, first;
+
+	cookie = dma_fence_begin_signalling();
+	dma_fence_lock_irqsave(fence, flags);
+	first = !dma_fence_test_signaled_flag(fence);
+	if (first && error)
+		dma_fence_set_error(fence, error);
+	dma_fence_signal_locked(fence);
+	dma_fence_unlock_irqrestore(fence, flags);
+	dma_fence_end_signalling(cookie);
+	return first;
+}
+
+static bool signal_draining_scopes(struct dma_fence *fence, int error)
 {
 	struct llist_head ready = LLIST_HEAD_INIT(ready);
 	struct llist_node *nodes, *node, *next;
 	unsigned long flags;
 	unsigned int completed = 0;
+	bool first;
 
 	/* Fence callbacks are atomic. Keep the local ready list pinned while
 	 * signaling, then finish ready scopes after the source fence is unlocked.
@@ -173,12 +195,12 @@ void asahi_g17_signal_fence(struct dma_fence *fence)
 	 */
 	preempt_disable();
 	if (__this_cpu_read(active_scopes)) {
-		dma_fence_signal(fence);
+		first = signal_with_error(fence, error);
 		preempt_enable();
-		return;
+		return first;
 	}
 	__this_cpu_write(active_scopes, &ready);
-	dma_fence_signal(fence);
+	first = signal_with_error(fence, error);
 	for (;;) {
 		/* An interrupt must not append after the final empty test. */
 		local_irq_save(flags);
@@ -198,13 +220,26 @@ void asahi_g17_signal_fence(struct dma_fence *fence)
 				preempt_enable();
 				scope_defer_list(node);
 				scope_defer_list(more);
-				return;
+				return first;
 			}
 			scope_complete(container_of(node, struct asahi_g17_scope, ready));
 			++completed;
 		}
 	}
 	preempt_enable();
+	return first;
+}
+
+void asahi_g17_signal_fence(struct dma_fence *fence)
+{
+	signal_draining_scopes(fence, 0);
+}
+
+bool asahi_g17_finish_fence(struct dma_fence *fence, int error, bool scoped)
+{
+	if (scoped)
+		return signal_draining_scopes(fence, error);
+	return signal_with_error(fence, error);
 }
 
 static void scope_arrived(struct asahi_g17_scope *scope, int error)

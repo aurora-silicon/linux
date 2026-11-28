@@ -366,6 +366,9 @@ ASAHI_TESTS = {
                                    'node-unmarked', 'no-release', 'm5-cached-nodes',
                                    'm5-cached-descriptors', 'cached-queue-records',
                                    'uncached-g17p-nodes'), []),
+    'g17-output-fence-tests.py': [([], PASS)]
+        + mutations('--mutation', ('unlocked-member-done', 'set-error-when-signalled',
+                                   'check-outside-lock'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.
