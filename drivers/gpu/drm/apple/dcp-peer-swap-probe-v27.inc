@@ -403,7 +403,7 @@ static ssize_t peer_stop_test_store(struct device *dev,
 		}
 		peer_dev = peer->dev;
 	}
-	ret = dcp_peer_probe_quiesce(dcp, peer);
+	ret = dcp_peer_probe_quiesce(dcp, peer, true);
 	dev_info(dev, "peer stop test result=%d\n", ret);
 out:
 	if (peer_dev)

@@ -582,6 +582,68 @@ static void takeover_adopt_watched_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_desktop_swap_watched(dcp));
 }
 
+static void stalled_present_retired_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_external(test);
+	struct apple_dcp *dcp = &t->dcp;
+	struct apple_dcp *desktop_dcp;
+
+	dcp->swap_watchdog_retrains = 2;
+	dropped_test_present(test, t, 0, &t->fb[1]);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+
+	/* Channels must be idle before retiring a stalled present. */
+	atomic_set(&dcp->pending_acks, 1);
+	KUNIT_EXPECT_FALSE(test, iomfb_retire_stalled_present_h17p(dcp));
+	KUNIT_EXPECT_TRUE(test, dcp->present_state_h17p.pending);
+	atomic_set(&dcp->pending_acks, 0);
+
+	/*
+	 * Retiring a stalled present before the watchdog deadline cancels the
+	 * watchdog without resetting retrain tracking, and settles the queue.
+	 */
+	KUNIT_EXPECT_TRUE(test, iomfb_retire_stalled_present_h17p(dcp));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+	KUNIT_EXPECT_EQ(test, dcp->swap_watchdog_retrains, 2U);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
+	KUNIT_EXPECT_TRUE(test, t->present[0].released);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->iomfb.timeout));
+	KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&dcp->present_state_h17p,
+							     DROPPED_SWAP_ID));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&dcp->present_state_h17p,
+							      DROPPED_SWAP_ID));
+	KUNIT_EXPECT_FALSE(test, list_empty(&dcp->iomfb.dropped));
+	KUNIT_EXPECT_EQ(test, iomfb_queue_settle(dcp, msecs_to_jiffies(100)), 0);
+
+	/* A late completion of the retired present is ignored safely. */
+	KUNIT_ASSERT_EQ(test, dropped_test_deliver(t, DROPPED_SWAP_ID), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
+
+	/* Cancelling the watchdog does not prove an adopted loader mode. */
+	desktop_dcp = kunit_kzalloc(test, sizeof(*desktop_dcp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, desktop_dcp);
+	desktop_dcp->desktop = kunit_kzalloc(test, sizeof(*desktop_dcp->desktop), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, desktop_dcp->desktop);
+	desktop_dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+	desktop_dcp->fixed_connector_type = DRM_MODE_CONNECTOR_USB;
+	desktop_dcp->swap_watchdog_retrains = 2;
+	desktop_dcp->desktop->takeover_adopted = true;
+	INIT_DELAYED_WORK(&desktop_dcp->swap_watchdog_wq, dropped_test_noop_delayed);
+	dcp_swap_watchdog_arm(desktop_dcp);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&desktop_dcp->swap_watchdog_wq));
+	dcp_swap_watchdog_cancel(desktop_dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&desktop_dcp->swap_watchdog_wq));
+	cancel_delayed_work_sync(&desktop_dcp->swap_watchdog_wq);
+	KUNIT_EXPECT_EQ(test, desktop_dcp->swap_watchdog_retrains, 2U);
+	KUNIT_EXPECT_TRUE(test, desktop_dcp->desktop->takeover_adopted);
+	KUNIT_EXPECT_TRUE(test, dcp_desktop_swap_watched(desktop_dcp));
+	dcp_swap_watchdog_complete(desktop_dcp);
+	KUNIT_EXPECT_EQ(test, desktop_dcp->swap_watchdog_retrains, 0U);
+	KUNIT_EXPECT_FALSE(test, desktop_dcp->desktop->takeover_adopted);
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_swap_watched(desktop_dcp));
+}
+
 static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(desktop_present_completion_test),
 	KUNIT_CASE(takeover_adopt_watched_test),
@@ -596,6 +658,7 @@ static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(h17g_watchdog_test),
 	KUNIT_CASE(older_retired_completion_test),
 	KUNIT_CASE(retired_completion_in_flight_test),
+	KUNIT_CASE(stalled_present_retired_test),
 	{}
 };
 

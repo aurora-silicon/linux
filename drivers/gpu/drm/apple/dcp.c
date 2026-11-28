@@ -37,6 +37,7 @@
 #include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/property.h>
 #include <linux/random.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
@@ -47,6 +48,7 @@
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_color_mgmt.h>
@@ -1904,9 +1906,19 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 	}
 }
 
-void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
+/*
+ * Cancel a pending swap watchdog without crediting a completed swap.
+ * Retiring an uncompleted present must preserve retrain tracking and
+ * unproved takeover state.
+ */
+void dcp_swap_watchdog_cancel(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
+}
+
+void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
+{
+	dcp_swap_watchdog_cancel(dcp);
 	dcp->swap_watchdog_retrains = 0;
 	/* A completed swap on the adopted mode proves it. */
 	dcp_takeover_adopt_proven(dcp);
@@ -7700,6 +7712,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		apple_sleep_v27_unregister(dev);
 	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
+	dcp_peer_retire_sync();
 	/*
 	 * Stop the native initializer before looking up its owner, including
 	 * the dead-session path. Owner allocation may have landed in an open
@@ -9343,6 +9356,10 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		return;
 	}
 	component_del(&pdev->dev, &dcp_comp_ops);
+	if (dcp) {
+		dcp_peer_forget(dcp);
+		dcp_peer_retire_sync();
+	}
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
 	/* Unbind does not wait for RTKit callbacks, or run if bind failed late. */
@@ -9408,6 +9425,10 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	if (dcp_t8132_ext_m4_node(pdev->dev.of_node))
 		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
+	if (dcp) {
+		dcp_peer_forget(dcp);
+		dcp_peer_retire_sync();
+	}
 }
 
 /*

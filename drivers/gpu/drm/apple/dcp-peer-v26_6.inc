@@ -14,6 +14,12 @@
  */
 
 static DEFINE_MUTEX(dcp_peer_lock);
+/*
+ * Held for read across dcp_peer_record_retired_v27() after dropping
+ * dcp_peer_lock so unbind/remove cannot devm-free the peer under it.
+ */
+static DECLARE_RWSEM(dcp_peer_retire_rwsem);
+static DECLARE_WAIT_QUEUE_HEAD(dcp_peer_stop_wq);
 
 /* ---- tiling state (D114/D115 callbacks) ---- */
 
@@ -183,6 +189,12 @@ static void dcp_peer_forget(struct apple_dcp *dcp)
 		dcp->peer_owner->peer_reserved = NULL;
 		dcp->peer_owner = NULL;
 	}
+}
+
+static void dcp_peer_retire_sync(void)
+{
+	down_write(&dcp_peer_retire_rwsem);
+	up_write(&dcp_peer_retire_rwsem);
 }
 
 /* ---- display IDs from D575 hotplug ---- */

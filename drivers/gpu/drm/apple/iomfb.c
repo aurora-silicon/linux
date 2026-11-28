@@ -796,6 +796,16 @@ void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause)
 	}
 }
 
+/*
+ * Pause presentation independently of sleep/DPMS presentation_paused while a
+ * firmware-27 paired stop or modeset quiesces both engines.
+ */
+void iomfb_pause_peer(struct apple_dcp *dcp, bool pause)
+{
+	guard(mutex)(&dcp->iomfb.lock);
+	WRITE_ONCE(dcp->iomfb.peer_paused, pause);
+}
+
 /* A dead transport is not proof that DMA or a pending present has stopped. */
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
 {
@@ -811,7 +821,7 @@ int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
 		idle = !dcp->iomfb.active && !dcp->iomfb.queued &&
 		       list_empty(&dcp->iomfb.pending) &&
 		       !dcp->present_state_h17p.pending && iomfb_channels_idle(dcp) &&
-		       (!READ_ONCE(dcp->sleep_v27_closed) ||
+		       ((!READ_ONCE(dcp->sleep_v27_closed) && !dcp->iomfb.peer_paused) ||
 			!READ_ONCE(dcp->iomfb.callback_count));
 		mutex_unlock(&dcp->iomfb.lock);
 		if (idle)
@@ -835,7 +845,8 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	} else if (READ_ONCE(dcp->sleep_v27_closed) &&
 		   transaction->start != iomfb_v27_sleep_start) {
 		ret = -EBUSY;
-	} else if (transaction->presentation && dcp->iomfb.presentation_paused) {
+	} else if (transaction->presentation &&
+		   (dcp->iomfb.presentation_paused || dcp->iomfb.peer_paused)) {
 		ret = -EAGAIN;
 	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
 		ret = -EALREADY;
@@ -1192,7 +1203,8 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id)
 
 	lockdep_assert_held(&dcp->iomfb.lock);
 	if (!READ_ONCE(dcp->crc_enabled) || READ_ONCE(dcp->crashed) ||
-	    dcp->iomfb.stopped || dcp->iomfb.presentation_paused || dcp->iomfb.queued >= 32)
+	    dcp->iomfb.stopped || dcp->iomfb.presentation_paused ||
+	    dcp->iomfb.peer_paused || dcp->iomfb.queued >= 32)
 		return;
 	crc = kzalloc_obj(*crc);
 	if (!crc)
@@ -4224,22 +4236,32 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
  * false if the present ended or a newer one re-armed the watchdog in the
  * meantime.  Other firmware has no present state.
  */
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+static bool iomfb_retire_present_locked_h17p(struct apple_dcp *dcp,
+					     bool check_deadline,
+					     bool cancel_watchdog,
+					     bool *recorded_id,
+					     u32 *retired_swap_id)
 {
 	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
 	u32 swap_id;
 
-	if (!iomfb_uses_queue(dcp))
-		return true;
-
-	guard(mutex)(&dcp->iomfb.lock);
+	lockdep_assert_held(&dcp->iomfb.lock);
+	*recorded_id = false;
 	swap_id = state->swap_id;
-	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped ||
 	    !state->pending || !state->accepted)
+		return false;
+	if (check_deadline && time_before(jiffies, dcp->swap_watchdog_deadline))
+		return false;
+	if (!check_deadline && !iomfb_channels_idle(dcp))
 		return false;
 	if (!dcp_present_retire_h17p(state, swap_id))
 		return true;
 
+	*recorded_id = true;
+	*retired_swap_id = swap_id;
+	if (cancel_watchdog)
+		dcp_swap_watchdog_cancel(dcp);
 	iomfb_present_failed_h17p(dcp);
 	if (!iomfb_present_brightness_only_h17p(dcp)) {
 		dcp_unarm_retained_framebuffers(dcp, swap_id);
@@ -4251,6 +4273,46 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	}
 	iomfb_queue_advance(dcp);
 	return true;
+}
+
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+{
+	bool retired, recorded_id = false;
+	u32 swap_id = 0;
+
+	if (!iomfb_uses_queue(dcp))
+		return true;
+
+	scoped_guard(mutex, &dcp->iomfb.lock)
+		retired = iomfb_retire_present_locked_h17p(dcp, true, false,
+							   &recorded_id, &swap_id);
+	if (recorded_id)
+		dcp_peer_record_retired_v27(dcp, swap_id);
+	return retired;
+}
+
+/*
+ * Retire an accepted present whose completion was lost after a sink went away
+ * while the swap watchdog was already cancelled (for example during CRTC
+ * power-off). Scanout DMA references stay pinned on dcp->iomfb.dropped until
+ * the pair stops and the pipe is shut down.
+ */
+bool iomfb_retire_stalled_present_h17p(struct apple_dcp *dcp)
+{
+	bool retired, recorded_id = false;
+	u32 swap_id = 0;
+
+	if (!iomfb_uses_queue(dcp))
+		return false;
+
+	scoped_guard(mutex, &dcp->iomfb.lock)
+		retired = iomfb_retire_present_locked_h17p(dcp, false, true,
+							   &recorded_id, &swap_id);
+	if (recorded_id)
+		dcp_peer_record_retired_v27(dcp, swap_id);
+	if (retired)
+		dcp_drm_crtc_vblank(dcp->crtc);
+	return retired;
 }
 
 /* Release a present's scanout unless it is displayed or was dropped. */
@@ -4462,7 +4524,8 @@ static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	struct iomfb_atomic_transaction *atomic;
 	int ret;
 
-	if (READ_ONCE(dcp->iomfb.presentation_paused)) {
+	if (READ_ONCE(dcp->iomfb.presentation_paused) ||
+	    READ_ONCE(dcp->iomfb.peer_paused)) {
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}

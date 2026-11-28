@@ -2916,7 +2916,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * does not use H17G's single-pipe methods, so stop an active pair
 	 * before applying the guard for the single-pipe path below.
 	 */
-	ret = dcp_peer_stop_v27(dcp);
+	ret = dcp_peer_stop_wait_v27(dcp, 1000);
 	if (ret < 0) {
 		dev_err(dcp->dev, "paired power-off failed: %d\n", ret);
 		return;
