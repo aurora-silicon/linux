@@ -260,6 +260,8 @@ void sep_diag_set_offer(u8 endpoint, int state);
 unsigned int sep_diag_sse_event(void);
 unsigned int sep_diag_xarm_failed(void);
 unsigned int sep_diag_unhandled(void);
+unsigned int sep_diag_sensor_bringup_failed(void);
+unsigned int sep_diag_capture_frame_error(void);
 void sep_diag_sleep(bool entering);
 void sep_diag_log_summary(struct device *dev);
 

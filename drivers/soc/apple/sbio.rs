@@ -2057,8 +2057,8 @@ impl SepData {
             wanted,
             began_ns: shim::boottime_ns(),
             attach: kind == Bringup::Attach,
-            // The late round follows the failed attach-time one.
-            retry: u32::from(kind == Bringup::Late),
+            // The late and the restore rounds follow a failed attach-time one.
+            retry: u32::from(matches!(kind, Bringup::Late | Bringup::Restore)),
         };
         registration::bring_up(retry, &mut attempts)
     }
@@ -2523,6 +2523,12 @@ impl SepData {
     // undone and every verify refused until reboot. The restore itself is
     // still a valid candidate, so bring the sensor up once more and let
     // complete_bringup() finish the proof before refusing.
+    //
+    // After a failed first patch, the enclave can refuse the serial
+    // re-registration that follows CLEAR_STATE, while a reboot's fresh
+    // registration works: registration::RESTORE makes the second attempt
+    // from a fresh registration, as registration::retry_stage decides for
+    // every other round.
     fn retry_restore_proof(&self) {
         if self.templates_restored.load(Relaxed)
             || !self.cold_restore_candidate.load(Relaxed)
@@ -2534,18 +2540,14 @@ impl SepData {
             self.dev,
             "verify: attach-time bring-up left the device-view proof undone; retrying the sensor bring-up\n"
         );
-        if !self.bring_sensor_online() {
-            // After a failed first patch, the enclave can refuse the serial
-            // re-registration that follows CLEAR_STATE, while a reboot's
-            // fresh registration works. Retry once from the fresh stage.
-            dev_warn_ratelimited!(
-                self.dev,
-                "verify: retrying the sensor bring-up from a fresh registration\n"
-            );
-            self.bringup.store(BRINGUP_FRESH, Relaxed);
-            if !self.bring_sensor_online() {
-                dev_err_ratelimited!(self.dev, "verify: the retried sensor bring-up failed\n");
-            }
+        let outcome = self.bring_sensor_online_retrying(
+            c"restore",
+            Bringup::Restore,
+            &registration::RESTORE,
+            || self.verify_wanted(),
+        );
+        if !outcome.online() {
+            dev_err_ratelimited!(self.dev, "verify: the retried sensor bring-up failed\n");
         }
         let _ = sensor::idle();
         self.refresh_match_credential();
@@ -3089,6 +3091,7 @@ impl SepData {
                 advertised: sent,
                 computed,
             }) => {
+                diag::capture_frame_error();
                 dev_warn_ratelimited!(
                     self.dev,
                     "verify: frame checksum mismatch (sensor sent {:#06x}, computed {:#06x})\n",
@@ -3099,6 +3102,7 @@ impl SepData {
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             Err(sensor::CaptureError::Length(n)) => {
+                diag::capture_frame_error();
                 dev_warn_ratelimited!(
                     self.dev,
                     "verify: the sensor advertised an unusable frame length {}\n",
@@ -4197,9 +4201,10 @@ impl SepData {
                 advertised: sent,
                 computed,
             }) => {
+                diag::capture_frame_error();
                 dev_warn_ratelimited!(
                     self.dev,
-                    "enrol: capture {} frame checksum mismatch (sensor sent {:#06x}, computed {:#06x}); retrying\n",
+                    "enrol: capture {} frame checksum mismatch (sensor sent {:#06x}, computed {:#06x}); asking for another touch\n",
                     counter,
                     sent,
                     computed
@@ -4207,9 +4212,10 @@ impl SepData {
                 return ImageOutcome::Retry(bio::Guidance::LiftAndMove);
             }
             Err(sensor::CaptureError::Length(n)) => {
+                diag::capture_frame_error();
                 dev_warn_ratelimited!(
                     self.dev,
-                    "enrol: capture {} advertised an unusable frame length {}; retrying\n",
+                    "enrol: capture {} advertised an unusable frame length {}; asking for another touch\n",
                     counter,
                     n
                 );
@@ -6402,6 +6408,9 @@ enum Bringup {
     Late,
     /// Before a verify.
     Verify,
+    /// Before a verify, when the attach left the restored enrolment
+    /// unproven.
+    Restore,
 }
 
 /// A sensor bring-up with retries, as [`registration::bring_up`] drives it.
@@ -6428,11 +6437,17 @@ impl<W: Fn() -> bool> registration::Attempts for BringupAttempts<'_, W> {
             self.sep.bringup.store(stage, Relaxed);
         }
         self.retry += 1;
-        if self.attach {
+        let online = if self.attach {
             self.sep.attach_bring_sensor_online()
         } else {
             self.sep.bring_sensor_online()
+        };
+        if !online {
+            // Each failure is logged at the step that failed; the count
+            // shows how often the sensor needs another attempt (#2322).
+            diag::sensor_bringup_failed();
         }
+        online
     }
 
     fn wanted(&self) -> bool {

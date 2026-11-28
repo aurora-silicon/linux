@@ -75,6 +75,11 @@ pub(crate) fn patch_loaded(nonce_session: bool, accepted: bool, needs_patch: boo
 /// a reboot does and as a verify's second try does: after a failed sequence
 /// counter init a J314s refused the CLEAR_STATE re-registration for the
 /// rest of the boot, while a fresh one recovered.
+///
+/// The alternation is not a step the enclave protocol defines. It covers
+/// two enclave behaviours each seen on one machine, and neither recovery
+/// works for both. Why the attempt before it failed is still open:
+/// <https://github.com/aurora-silicon/linux/issues/2322>.
 pub(crate) fn retry_stage(stage: u32, nonce_session: bool, retry: u32) -> u32 {
     if nonce_session || retry % 2 == 1 {
         stage
@@ -187,10 +192,18 @@ pub(crate) struct Retry {
     budget_ms: u64,
 }
 
-/// At attach, on a profile with a nonce session. Across 29 J700 boots, 7
-/// needed a second attempt and one failed three attempts made back to back.
-/// Pauses of 0.5, 1, 2 and 4 s give a sensor or an enclave that is still
-/// settling time to do so, and five attempts end within about 10 s.
+/// At attach, on every profile. Across 29 J700 boots, 7 needed a second
+/// attempt and one failed three attempts made back to back; an M1 Pro lost
+/// the sensor on 2 boots in 4 with a single attempt. Pauses of 0.5, 1, 2 and
+/// 4 s give a sensor or an enclave that is still settling time to do so,
+/// and five attempts end within about 10 s.
+///
+/// What the failed attempts wait for is not known: the sensor answers its
+/// first status reads and then falls silent part-way through the sequence,
+/// after the SBIO endpoint is up and INIT_SBIO_COMMUNICATION was accepted.
+/// The sensor has no power-good line to wait on. Every failed attempt is
+/// counted in `diag/sensor_bringup_failures`; the cause is tracked in
+/// <https://github.com/aurora-silicon/linux/issues/2322>.
 pub(crate) const ATTACH: Retry = Retry {
     attempts: 5,
     first_pause_ms: 500,
@@ -201,6 +214,17 @@ pub(crate) const ATTACH: Retry = Retry {
 /// back.
 pub(crate) const VERIFY: Retry = Retry {
     attempts: 3,
+    first_pause_ms: 0,
+    budget_ms: u64::MAX,
+};
+
+/// Before a verify on a boot whose attach-time bring-up left the restored
+/// enrolment unproven: the attempt the attach did not finish, then one from
+/// a fresh registration on a profile without a nonce session (see
+/// [`retry_stage`]; the round counts on from the failed attach), back to
+/// back.
+pub(crate) const RESTORE: Retry = Retry {
+    attempts: 2,
     first_pause_ms: 0,
     budget_ms: u64::MAX,
 };
@@ -654,6 +678,26 @@ mod tests {
         assert_eq!(bring_up(&VERIFY, &mut m), Outcome::GaveUp(3));
         assert_eq!(m.paused, 0);
         assert_eq!(m.failed, 2);
+    }
+
+    #[test]
+    fn a_restore_makes_two_attempts_the_second_from_a_fresh_registration() {
+        assert_eq!(RESTORE.pause_before(2, 0), Some(0));
+        assert_eq!(RESTORE.pause_before(3, 0), None);
+
+        let mut m = Model::new();
+        m.nonce = [false; 8];
+        assert_eq!(bring_up(&RESTORE, &mut m), Outcome::GaveUp(2));
+        assert_eq!(m.paused, 0);
+        assert_eq!(m.failed, 1);
+
+        // The round counts on from the failed attach: its first attempt
+        // keeps the stage the attach left, its second starts fresh on a
+        // profile without a nonce session, and a nonce-session profile
+        // keeps clearing.
+        assert_eq!(retry_stage(ESTABLISHED, false, 1), ESTABLISHED);
+        assert_eq!(retry_stage(ESTABLISHED, false, 2), FRESH);
+        assert_eq!(retry_stage(ESTABLISHED, true, 2), ESTABLISHED);
     }
 
     #[test]

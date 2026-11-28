@@ -118,6 +118,8 @@ static struct {
 	atomic_t skdl;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
+	atomic_t sensor_bringup_failures;
+	atomic_t capture_frame_errors;
 	atomic_t sleeps;
 	atomic_t sleeping;
 	/* SEP_DIAG_TRUSTED_*, with the refusal status above it. */
@@ -704,6 +706,24 @@ static ssize_t unhandled_messages_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(unhandled_messages);
 
+static ssize_t sensor_bringup_failures_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.sensor_bringup_failures));
+}
+static DEVICE_ATTR_RO(sensor_bringup_failures);
+
+static ssize_t capture_frame_errors_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.capture_frame_errors));
+}
+static DEVICE_ATTR_RO(capture_frame_errors);
+
 static ssize_t sleeps_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -770,6 +790,8 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_skdl.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
+	&dev_attr_sensor_bringup_failures.attr,
+	&dev_attr_capture_frame_errors.attr,
 	&dev_attr_sleeps.attr,
 	&dev_attr_sleep.attr,
 	&dev_attr_trusted.attr,
@@ -901,6 +923,16 @@ unsigned int sep_diag_sse_event(void)
 unsigned int sep_diag_unhandled(void)
 {
 	return (unsigned int)atomic_inc_return(&sep_diag.unhandled);
+}
+
+unsigned int sep_diag_sensor_bringup_failed(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.sensor_bringup_failures);
+}
+
+unsigned int sep_diag_capture_frame_error(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.capture_frame_errors);
 }
 
 /* From the PM notifier (pm_shim.c), which runs its calls one at a time. */

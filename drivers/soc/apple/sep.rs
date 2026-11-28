@@ -144,9 +144,16 @@ const LATE_ATTACH_DEFERS: u32 = 3;
 // result is still wanted.
 const BRINGUP_PAUSE_STEP_MS: u32 = 100;
 
-// J700 traces show the key-store endpoint arriving around 43 s after boot,
-// well after the first infrastructure endpoints. The wait exits promptly on
-// other machines when their key store becomes ready.
+// How long the bring-up waits for the key store to be advertised, and a
+// trusted-key caller for the bring-up to end. Both waits end on the event
+// itself (the EP_SKS advertisement, `trusted_ready`), so a healthy boot never
+// waits this long; on expiry the key store counts as absent and callers get
+// an error. The bound covers a J700 that advertised the key store about 43 s
+// after boot (commit fdcf9537f07b), about twice that. Regular-root boots now
+// see it within 2 s of attach on every Mac; why the J700 was that slow, and
+// whether an early (initrd) load still is, is open:
+// https://github.com/aurora-silicon/linux/issues/2323. A trusted-key caller
+// waits inside key_construction_mutex: see issue 2313.
 const EXCHANGE_TIMEOUT_MS: time::Msecs = 90000;
 
 const PHASE_ATTACH: u32 = 0;
