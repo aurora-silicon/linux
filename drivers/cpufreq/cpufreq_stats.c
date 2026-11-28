@@ -287,3 +287,4 @@ void cpufreq_stats_record_transition(struct cpufreq_policy *policy,
 	stats->trans_table[old_index * stats->max_state + new_index]++;
 	stats->total_trans++;
 }
+EXPORT_SYMBOL_GPL(cpufreq_stats_record_transition);
