@@ -243,4 +243,8 @@
 	apple,platform-id = <1>;
 };
 
+&mcc {
+	status = "okay";
+};
+
 #include "t8103-j313-control.dtsi"
