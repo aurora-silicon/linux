@@ -288,6 +288,9 @@ ASAHI_TESTS = {
                                    'count-owed-twice'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-render-template-tests.py': [([], PASS)]
+        + mutations('--mutation', ('skip_render_mcache_clear', 'skip_ta_vdm_patch',
+                                   'skip_frag_eot_patch', 'skip_key_width_check'), []),
     'g17-compute-retired-tests.py': [([], PASS)]
         + mutations('--mutation', ('queue-under-lock', 'binding-under-lock', 'drain-under-lock',
                                    'drain-local-on-eagain', 'finish-stops-at-error',

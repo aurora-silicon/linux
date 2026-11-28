@@ -22,6 +22,8 @@ use kernel::{prelude::*, sync::Arc};
 use crate::g17::fw::m5::initdata::Board;
 
 pub(super) const RECORDS: usize = 32;
+// The render template tracks each descriptor slot by `ordinal % RING_SLOTS`.
+const _: () = assert!(fw::render_template::RING_SLOTS == RECORDS);
 pub(super) const TA_BYTES: usize = 0x14000;
 pub(super) const FRAGMENT_BYTES: usize = 0x48000;
 pub(super) const GRAPH_SIZE: usize = 0x1c000;
@@ -404,6 +406,10 @@ impl Generation {
     }
 }
 
+/// G17P fragment status page holds a single 64-bit status word at +0;
+/// clear the first 64-byte cache line rather than all 16 KiB of WC storage.
+const FRAGMENT_STATUS_CLEAR_BYTES: usize = 64;
+
 pub(super) struct NeoGeneration {
     deflake: mmu::KernelMapping,
     fragment_client: mmu::KernelMapping,
@@ -487,7 +493,7 @@ impl NeoGeneration {
             // and unpublished; no prior command can access it until reassigned.
             unsafe { viewport.apply(&mut *destination) };
         }
-        self.fragment.bytes_mut().fill(0);
+        self.fragment.bytes_mut()[..FRAGMENT_STATUS_CLEAR_BYTES].fill(0);
         self.ordinal = Some(ordinal);
         Ok(())
     }
@@ -524,6 +530,7 @@ pub(super) struct Memory {
     // kick entries consume the register arrays embedded in the descriptors.
     registers: Option<KernelObject>,
     m5_workspace: Option<KBox<fw::m5::render_registers::Workspace>>,
+    render_template: Option<KBox<fw::render_template::TemplateSlot>>,
     pub(super) context: Arc<Context>,
     pub(super) installed_pool: Option<u8>,
     /// The M5 board ([`crate::g17::Shared::m5_board`]); `None` off M5.
@@ -632,6 +639,11 @@ impl Memory {
             // SAFETY: The entire value was initialized above.
             Some(unsafe { workspace.assume_init() })
         } else { None };
+        let render_template = if m5 {
+            None
+        } else {
+            Some(fw::render_template::TemplateSlot::new_box()?)
+        };
         let fragment_view = if m5 { None } else { Some(graph.descriptors.map_range(
             vm,
             TA_BYTES..TA_BYTES + mmu::UAT_PGSZ,
@@ -656,6 +668,7 @@ impl Memory {
                 _fragment_view: fragment_view,
                 registers: registers,
                 m5_workspace,
+                render_template,
                 context,
                 installed_pool: None,
                 board,
@@ -846,25 +859,28 @@ impl Memory {
         {
             return Err(EINVAL);
         }
+        let template = self.render_template.as_deref_mut().ok_or(EIO)?;
         // SAFETY: Both complete integer-only views lie in the retained mapping,
         // are aligned and disjoint. The full ordinal has an exclusive slot
         // claim and no producer refers to this command yet.
-        unsafe {
-            (&mut *tiling).write(args)?;
-            let fragment = &mut *fragment;
-            fragment.write(args)?;
-            // Kick entries bind the arrays embedded in this descriptor
-            // (register_bindings); the client register page is never read.
-            for array in &fragment.descriptor.arrays {
-                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
-            }
-            fragment.set_mcache(
-                args.fragment.descriptor_va,
-                args.resources.aux_fb_va,
+        let (mcache, path) = unsafe {
+            fw::render_template::encode(
+                &mut *tiling,
+                &mut *fragment,
+                args,
                 attachments,
                 context,
-            )
+                template,
+            )?
+        };
+        if let fw::render_template::Path::Mismatch { stage, offset } = path {
+            kernel::pr_warn_once!(
+                "G17: a render descriptor template differed from the full encoding (stage {}, byte {:#x}); such renders encode in full\n",
+                stage,
+                offset
+            );
         }
+        Ok(mcache)
     }
 }
 
