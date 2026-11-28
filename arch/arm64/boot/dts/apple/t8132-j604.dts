@@ -301,10 +301,22 @@
 
 /*
  * The SD card reader, a GL9755 (ADT pci-bridge2/pcie-sdreader), powered by
- * the SMC's gP19 (function-sd_pwr_en).
+ * the SMC's gP19 (function-sd_pwr_en). Its stream is SID 1 on dart-apcie2
+ * (ADT pcie-sdreader iommu-parent mapper-apcie2, reg 1); the port runs
+ * ordinary RID-to-SID routing next to the managed radio port.
  */
 &port02 {
 	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&pcie0 {
+	iommu-map = <0x100 &dart_apcie0 1 2>,
+		    <0x200 &dart_apcie2 1 1>;
 };
 
 /*

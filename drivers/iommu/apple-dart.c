@@ -7895,6 +7895,16 @@ int apple_dart_set_host_resumes(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_dart_set_host_resumes);
 
+/* Undoes apple_dart_set_host_resumes() when the host drops this DART. */
+void apple_dart_clear_host_resumes(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (dart)
+		dart->host_resumes = false;
+}
+EXPORT_SYMBOL_GPL(apple_dart_clear_host_resumes);
+
 /* The host's port is up again: ungate the DART and restore what it saved. */
 int apple_dart_host_resume(struct device *dev)
 {

@@ -330,7 +330,7 @@ struct apple_pcie_port {
     int sid_map_sz;
     u32 entries[16];
     void *base, *domain, *np;
-    bool started, needs_stop;
+    bool started, needs_stop, managed;
     unsigned long adopted_slots;
     unsigned irq;
     u32 status, link;
@@ -691,7 +691,8 @@ int main(void)
     ids[1]=16; assert(apple_pcie_managed_sid_mask(ids,2,&mask)==-EINVAL);
     struct apple_pcie_hw pci_hw={0};
     struct apple_pcie pci={.managed_sids=BIT(1)|BIT(2),.hw=&pci_hw};
-    struct apple_pcie_port port={.pcie=&pci};
+    /* The radio's port: its bus maps to the DART that carries the managed SIDs. */
+    struct apple_pcie_port port={.pcie=&pci,.managed=true};
     port.entries[3]=0x80030300; /* foreign association */
     u32 entries[16]; memcpy(entries,port.entries,sizeof(entries));
     assert(apple_pcie_managed_admit(&port)==0 && port.sid_map_sz==16);
@@ -708,6 +709,15 @@ int main(void)
     port.domain=&port; port.irq=1;
     apple_pcie_port_teardown(&port);
     assert(pci_irq_writes==1 && !port.domain && !port.irq);
+    /*
+     * Another port of the same managed host whose bus maps to a DART without
+     * managed SIDs (the J604's SD reader on port 2) runs ordinary routing and
+     * owns its IRQ block: teardown masks it even before a domain exists.
+     */
+    struct apple_pcie_port other={.pcie=&pci};
+    other.base=&other; other.np=&other;
+    apple_pcie_port_teardown(&other);
+    assert(pci_irq_writes==2 && !pci_tunnel_stops && !other.np);
     const struct apple_dart_hw hw={.type=DART_T8110,.tcr_disabled=0,.tcr_bypass=6,
         .ttbr_count=1,.ttbr_valid=BIT(0),.enable_streams=0xc00,.tcr_enabled=1,
         .tcr_4level=BIT(3),.ttbr_shift=14,.ttbr_addr_field_shift=2,.invalidate_tlb=test_invalidate_tlb};

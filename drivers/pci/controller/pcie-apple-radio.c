@@ -29,11 +29,21 @@ struct apple_radio_function {
 	void (*finish)(struct device *dev);
 };
 
+/* Another port of the host: ordinary routing, behind a DART of its own */
+struct apple_radio_port {
+	struct apple_pcie_port *port;
+	struct device *dart;
+	bool up;
+	u32 msi[32], msicfg, msibase, msiaddr, msiaddr_hi;
+};
+
 struct apple_radio_sleep {
 	struct apple_pcie *pcie;
 	struct apple_pcie_port *port;
 	struct apple_dart_sleep dart;
 	struct apple_radio_function fn[2];
+	/* Each function's SID, in RID order, from the host's apple,managed-sids */
+	unsigned int sid[2];
 	struct task_struct *owner;
 	u64 generation;
 	enum apple_radio_phase phase;
@@ -46,6 +56,11 @@ struct apple_radio_sleep {
 	u32 rid[16], msi[32], msicfg, msibase, msiaddr, msiaddr_hi;
 	DECLARE_BITMAP(vectors, 32);
 	DECLARE_BITMAP(sids, 16);
+	struct apple_radio_port other[2];
+	unsigned int nothers;
+	/* A DART of another port had not probed at bind: bound before a sleep */
+	bool ports_pending;
+	struct notifier_block pm_nb;
 };
 
 /* A single exact board/controller may own this publication during system PM. */
@@ -255,10 +270,10 @@ static int apple_radio_snapshot(struct apple_radio_sleep *s, bool verify)
 	}
 	for (i = 0; i < ARRAY_SIZE(s->fn); i++) {
 		expected = 0;
-		if (apple_pcie_managed_word(pcie->managed_sids, 0x100 + i, 1 + i, &expected) ||
-		    s->rid[1 + i] != expected)
-			return apple_radio_snapshot_error(s, "rid-admission", 1 + i, s->rid[1 + i],
-							  expected);
+		if (apple_pcie_managed_word(pcie->managed_sids, 0x100 + i, s->sid[i], &expected) ||
+		    s->rid[s->sid[i]] != expected)
+			return apple_radio_snapshot_error(s, "rid-admission", s->sid[i],
+							  s->rid[s->sid[i]], expected);
 	}
 	for (i = 0; i < pcie->nvecs; i++) {
 		value = apple_pcie_port_readl(port, pcie->hw->port_msimap + 4 * i);
@@ -631,6 +646,231 @@ static int apple_radio_recovery_gpio(struct apple_radio_sleep *s)
 	return 0;
 }
 
+/*
+ * The host's other ports run ordinary routing behind DARTs of their own (the
+ * J604's SD card reader on port 2, behind dart-apcie2). The firmware suspend
+ * powers the whole block down, so each of those DARTs waits gated after the
+ * wake until its port is clocked again (apple_dart_set_host_resumes()), and
+ * the port comes back after the radio's own recovery: brought up as probe
+ * does it, with its MSI and RID-to-SID routes as they were. A port that does
+ * not come back keeps its DART gated and its interrupt off; the radio's
+ * transaction does not depend on it.
+ */
+static void apple_radio_unbind_ports(struct apple_radio_sleep *s)
+{
+	while (s->nothers) {
+		struct apple_radio_port *o = &s->other[--s->nothers];
+
+		device_link_remove(s->pcie->dev, o->dart);
+		apple_dart_clear_host_resumes(o->dart);
+		put_device(o->dart);
+		o->dart = NULL;
+		o->port = NULL;
+	}
+}
+
+static int __apple_radio_bind_ports(struct apple_radio_sleep *s)
+{
+	struct apple_pcie *pcie = s->pcie;
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		struct of_phandle_args map = {};
+		struct platform_device *dart = NULL;
+		struct apple_radio_port *o;
+		u32 bus;
+		int ret;
+
+		if (port == s->port)
+			continue;
+		if (port->managed || !port->phy || s->nothers == ARRAY_SIZE(s->other))
+			return -EINVAL;
+		ret = of_property_read_u32_index(port->np, "bus-range", 0, &bus);
+		if (!ret)
+			ret = of_map_iommu_id(pcie->dev->of_node, bus << 8, &map);
+		if (!ret && (!map.np || map.np == s->dart.provider->of_node))
+			ret = -EINVAL;
+		if (!ret)
+			dart = of_find_device_by_node(map.np);
+		of_node_put(map.np);
+		if (ret)
+			return ret;
+		if (!dart)
+			return -EPROBE_DEFER;
+		ret = apple_dart_set_host_resumes(&dart->dev);
+		/* The DART resumes, and gates itself, before this host. */
+		if (!ret && !device_link_add(pcie->dev, &dart->dev, DL_FLAG_STATELESS)) {
+			apple_dart_clear_host_resumes(&dart->dev);
+			ret = -EINVAL;
+		}
+		if (ret) {
+			put_device(&dart->dev);
+			return ret;
+		}
+		o = &s->other[s->nothers++];
+		o->port = port;
+		/* Dropped by apple_radio_unbind_ports(). */
+		o->dart = &dart->dev;
+	}
+	return 0;
+}
+
+/* All of the other ports or none: a failure undoes the ports already bound. */
+static int apple_radio_bind_ports(struct apple_radio_sleep *s)
+{
+	int ret = __apple_radio_bind_ports(s);
+
+	if (ret)
+		apple_radio_unbind_ports(s);
+	return ret;
+}
+
+/*
+ * A DART of another port that had not probed when the host bound the radio
+ * is bound here, before devices are prepared, so the device link orders this
+ * sleep. Until then, prepare refuses a firmware suspend.
+ */
+static int apple_radio_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct apple_radio_sleep *s = container_of(nb, struct apple_radio_sleep, pm_nb);
+	int ret;
+
+	if (action != PM_SUSPEND_PREPARE || !s->ports_pending)
+		return NOTIFY_DONE;
+	ret = apple_radio_bind_ports(s);
+	if (ret == -EPROBE_DEFER)
+		dev_dbg(s->pcie->dev, "radio sleep: another port's DART is not bound yet\n");
+	else if (ret)
+		dev_warn(s->pcie->dev, "radio sleep: other ports not admitted: %d\n", ret);
+	else
+		s->ports_pending = false;
+	return NOTIFY_DONE;
+}
+
+static void apple_radio_ports_irq(struct apple_radio_sleep *s, bool enable)
+{
+	for (unsigned int i = 0; i < s->nothers; i++) {
+		if (!enable)
+			apple_pcie_port_disable_irq(s->other[i].port);
+		else if (!READ_ONCE(s->other[i].port->link_failed))
+			apple_pcie_port_enable_irq(s->other[i].port);
+	}
+}
+
+/* Each other port's link state and routes, as the wake gives them back. */
+static void apple_radio_ports_save(struct apple_radio_sleep *s)
+{
+	const struct hw_info *hw = s->pcie->hw;
+
+	for (unsigned int i = 0; i < s->nothers; i++) {
+		struct apple_radio_port *o = &s->other[i];
+		struct apple_pcie_port *port = o->port;
+		int idx;
+
+		o->up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(idx, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[idx] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, idx));
+		for (unsigned int v = 0; v < ARRAY_SIZE(o->msi); v++)
+			o->msi[v] = apple_pcie_port_readl(port, hw->port_msimap + 4 * v);
+		o->msicfg = apple_pcie_port_readl(port, PORT_MSICFG);
+		o->msibase = apple_pcie_port_readl(port, PORT_MSIBASE);
+		o->msiaddr = apple_pcie_port_readl(port, hw->port_msiaddr);
+		o->msiaddr_hi = apple_pcie_port_readl(port, hw->port_msiaddr_hi);
+	}
+}
+
+static int apple_radio_port_routes(struct apple_radio_port *o)
+{
+	struct apple_pcie_port *port = o->port;
+	const struct hw_info *hw = port->pcie->hw;
+	int idx;
+
+	apple_pcie_port_writel(port, o->msicfg & ~PORT_MSICFG_EN, PORT_MSICFG);
+	for_each_set_bit(idx, port->sid_map, port->sid_map_sz)
+		if (apple_pcie_rid2sid_write(port, idx, port->saved_rid2sid[idx]) !=
+		    port->saved_rid2sid[idx])
+			return -EIO;
+	for (unsigned int v = 0; v < ARRAY_SIZE(o->msi); v++) {
+		apple_pcie_port_writel(port, o->msi[v], hw->port_msimap + 4 * v);
+		if (apple_pcie_port_readl(port, hw->port_msimap + 4 * v) != o->msi[v])
+			return -EIO;
+	}
+	apple_pcie_port_writel(port, o->msibase, PORT_MSIBASE);
+	apple_pcie_port_writel(port, o->msiaddr, hw->port_msiaddr);
+	apple_pcie_port_writel(port, o->msiaddr_hi, hw->port_msiaddr_hi);
+	apple_pcie_port_writel(port, o->msicfg, PORT_MSICFG);
+	if (apple_pcie_port_readl(port, PORT_MSIBASE) != o->msibase ||
+	    apple_pcie_port_readl(port, hw->port_msiaddr) != o->msiaddr ||
+	    apple_pcie_port_readl(port, hw->port_msiaddr_hi) != o->msiaddr_hi ||
+	    apple_pcie_port_readl(port, PORT_MSICFG) != o->msicfg)
+		return -EIO;
+	return 0;
+}
+
+/*
+ * The commit leaves the reference buffer off on the port's PHY glue, which
+ * the loader clears at boot and probe relies on. A port that was down (an
+ * empty reader's) is only clocked again, for its DART.
+ */
+static int apple_radio_port_relink(struct apple_radio_port *o)
+{
+	struct apple_pcie_port *port = o->port;
+	struct apple_pcie *pcie = port->pcie;
+	u32 stat;
+	int ret;
+
+	if (!o->up) {
+		rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+		rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+		udelay(1);
+		return apple_pcie_setup_refclk(pcie, port);
+	}
+	rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+	udelay(1);
+	ret = apple_pcie_setup_link(pcie, port, port->np);
+	if (ret)
+		return ret;
+	if (!pcie->hw->retain_clocks) {
+		if (pcie->hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+		else
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	}
+	ret = apple_radio_port_routes(o);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat, stat & PORT_LINKSTS_UP,
+					 1000, link_up_timeout * USEC_PER_MSEC);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	return 0;
+}
+
+/* After the radio's recovery is published: each other port, then its DART. */
+static void apple_radio_ports_restore(struct apple_radio_sleep *s)
+{
+	for (unsigned int i = 0; i < s->nothers; i++) {
+		struct apple_radio_port *o = &s->other[i];
+		int ret = apple_radio_port_relink(o);
+
+		/* A DART whose port is not clocked again stays gated, unread. */
+		if (!ret)
+			ret = apple_dart_host_resume(o->dart);
+		if (ret) {
+			dev_err(s->pcie->dev, "port %pOF not back after the deep sleep: %d\n",
+				o->port->np, ret);
+			WRITE_ONCE(o->port->link_failed, true);
+		}
+	}
+	apple_radio_ports_irq(s, true);
+}
+
 /* The retained hierarchy cannot be removed while these references are held. */
 static void apple_radio_put_devices(void *data)
 {
@@ -640,6 +880,9 @@ static void apple_radio_put_devices(void *data)
 		apple_radio_terminal();
 	for (unsigned int i = 0; i < ARRAY_SIZE(s->fn); i++)
 		pci_dev_put(s->fn[i].pdev);
+	if (s->pm_nb.notifier_call)
+		unregister_pm_notifier(&s->pm_nb);
+	apple_radio_unbind_ports(s);
 	pci_dev_put(s->root);
 }
 
@@ -689,7 +932,7 @@ static int apple_radio_bind(struct platform_device *pdev, struct apple_radio_sle
 		if (ret)
 			break;
 		if (map[i].np != s->dart.provider->of_node || map[i].args_count != 1 ||
-		    map[i].args[0] != 1 + i) {
+		    map[i].args[0] != s->sid[i]) {
 			ret = -EINVAL;
 			break;
 		}
@@ -698,29 +941,59 @@ static int apple_radio_bind(struct platform_device *pdev, struct apple_radio_sle
 		of_node_put(map[i].np);
 	if (ret)
 		return ret;
+	ret = apple_radio_bind_ports(s);
+	if (ret == -EPROBE_DEFER) {
+		s->pm_nb.notifier_call = apple_radio_pm_notify;
+		ret = register_pm_notifier(&s->pm_nb);
+		if (ret) {
+			s->pm_nb.notifier_call = NULL;
+			return ret;
+		}
+		s->ports_pending = true;
+		dev_dbg(s->pcie->dev, "radio sleep: other ports wait for their DARTs\n");
+	} else if (ret) {
+		return ret;
+	}
 	s->bound = s->recovery_ready = true;
 	return 0;
 }
 
 static void apple_radio_register(struct platform_device *pdev, struct apple_pcie *pcie)
 {
+	struct apple_pcie_port *port;
 	struct apple_radio_sleep *s;
 	int ret;
 
 	if (!pcie->managed_sids)
 		return;
+	/*
+	 * A T8132 host whose apple,managed-sids names the radio's two functions,
+	 * with port 0 and its PHY glue as its one managed port, and the MSI
+	 * routing the transaction restores. The bind checks the endpoints and the
+	 * host's iommu-map against the same SIDs. The host's other ports, with
+	 * ordinary routing behind DARTs of their own, are taken down and brought
+	 * back with it. The firmware suspend itself has run only on the J713, so
+	 * it stays there until another T8132 host has a deep-sleep row.
+	 */
 	if (!of_machine_is_compatible("apple,j713") ||
 	    !of_device_is_compatible(pcie->dev->of_node, "apple,t8132-pcie") ||
-	    pcie->managed_sids != (BIT(1) | BIT(2)) || pcie->piodma_supplier ||
-	    !list_is_singular(&pcie->ports) || pcie->nvecs != 32 || !pcie->hw->port_msiaddr_hi ||
-	    !pcie->hw->port_msimap)
+	    hweight16(pcie->managed_sids) != ARRAY_SIZE(s->sid) || pcie->piodma_supplier ||
+	    pcie->nvecs != 32 || !pcie->hw->port_msiaddr_hi || !pcie->hw->port_msimap)
 		return;
 	s = devm_kzalloc(pcie->dev, sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return;
 	s->pcie = pcie;
-	s->port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
-	if (s->port->idx || !s->port->phy || s->port->sid_map_sz != 16)
+	s->sid[0] = __ffs(pcie->managed_sids);
+	s->sid[1] = __fls(pcie->managed_sids);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->managed)
+			continue;
+		if (s->port)
+			return;
+		s->port = port;
+	}
+	if (!s->port || s->port->idx || !s->port->phy || s->port->sid_map_sz != 16)
 		return;
 	ret = apple_radio_bind(pdev, s);
 	if (ret) {
@@ -743,6 +1016,9 @@ static int apple_radio_prepare(struct device *dev)
 		return 0;
 	if (!s || !s->bound || s->generation == U64_MAX)
 		return -EBUSY;
+	/* Without its DART held, another port would not come back. */
+	if (s->ports_pending)
+		return -EBUSY;
 	for (unsigned int i = 0; i < ARRAY_SIZE(s->fn); i++) {
 		struct device *ep = &s->fn[i].pdev->dev;
 
@@ -762,11 +1038,14 @@ static int apple_radio_suspend_noirq(struct apple_pcie *pcie)
 	if (!s || READ_ONCE(apple_radio_active) != s || s->phase != APPLE_RADIO_OPEN)
 		return -EBUSY;
 	apple_pcie_port_disable_irq(s->port);
+	apple_radio_ports_irq(s, false);
 	s->host_suspended = true;
 	ret = apple_radio_seal(s, s->generation);
 	if (!ret &&
 	    (!s->root->state_saved || !s->fn[0].pdev->state_saved || !s->fn[1].pdev->state_saved))
 		ret = -EUCLEAN;
+	if (!ret)
+		apple_radio_ports_save(s);
 	if (!ret)
 		ret = apple_dart_sleep_power_off(&s->dart);
 	if (ret) {
@@ -774,6 +1053,7 @@ static int apple_radio_suspend_noirq(struct apple_pcie *pcie)
 		if (apple_radio_abort(s, s->generation))
 			apple_radio_terminal();
 		apple_pcie_port_enable_irq(s->port);
+		apple_radio_ports_irq(s, true);
 		return ret;
 	}
 	/* The final SoC commit owns PERST and the port clocks. A refusal leaves them on. */
@@ -792,6 +1072,7 @@ static int apple_radio_resume_noirq(struct apple_pcie *pcie)
 		return 0;
 	if (s->phase == APPLE_RADIO_OPEN || s->phase == APPLE_RADIO_ABORTED) {
 		apple_pcie_port_enable_irq(s->port);
+		apple_radio_ports_irq(s, true);
 		return 0;
 	}
 	if (s->phase != APPLE_RADIO_STOPPED || current != s->owner)
@@ -818,8 +1099,12 @@ static int apple_radio_resume_noirq(struct apple_pcie *pcie)
 	/* Host writers must observe that same restored state. */
 	smp_store_release(&pcie->radio_closed, false);
 	apple_pcie_port_enable_irq(s->port);
-	if (pm_resume_via_firmware())
+	if (pm_resume_via_firmware()) {
 		apple_sleep_radio_port_up();
+		apple_radio_ports_restore(s);
+	} else {
+		apple_radio_ports_irq(s, true);
+	}
 	dev_info(pcie->dev, "native radio %s recovery complete\n",
 		 pm_resume_via_firmware() ? "power-loss" : "retained");
 	return 0;

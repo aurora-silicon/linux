@@ -177,6 +177,7 @@ int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write, phys_a
  * set the port up and calls apple_dart_host_resume().
  */
 int apple_dart_set_host_resumes(struct device *dev);
+void apple_dart_clear_host_resumes(struct device *dev);
 int apple_dart_host_resume(struct device *dev);
 /* The same after a sleep entry that stopped its streams: always the whole reset and restore. */
 int apple_dart_host_restart(struct device *dev);
@@ -192,6 +193,7 @@ static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool
 	return -EOPNOTSUPP;
 }
 static inline int apple_dart_set_host_resumes(struct device *dev) { return -EOPNOTSUPP; }
+static inline void apple_dart_clear_host_resumes(struct device *dev) { }
 static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_host_restart(struct device *dev) { return -EOPNOTSUPP; }
 #endif

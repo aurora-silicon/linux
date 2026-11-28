@@ -693,6 +693,8 @@ struct apple_pcie_port {
 	bool			needs_stop;
 	bool			link_failed;
 	bool			irq_disabled;
+	/* Under the host's managed contract: its DART carries apple,managed-sids */
+	bool			managed;
 	void __iomem		*intr2axi;	/* adopt_link: this port's */
 	u8			adopted_bus;	/* adopt_link: the secondary bus */
 	unsigned long		adopted_slots;	/* adopt_link: RID2SID slots routed (slot == SID) */
@@ -1910,7 +1912,7 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 	/* Busy managed admission has not acquired or programmed this IRQ block. */
 	if (port->base &&
 	    (port->domain ||
-	     (!port->pcie->managed_sids && !port->pcie->hw->adopt_link)))
+	     (!port->managed && !port->pcie->hw->adopt_link)))
 		apple_pcie_port_writel(port, ~0, PORT_INTMSK);
 
 	if (port->pcie->hw->adopt_link && port->domain)
@@ -3124,6 +3126,29 @@ static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
 					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
+/*
+ * A port of a managed host runs the managed contract when the DART its bus
+ * maps to through the host's iommu-map carries apple,managed-sids, as the
+ * radio's does. Any other port (the J604's SD card reader, behind a DART of
+ * its own) uses the ordinary RID-to-SID routing. A port whose DART cannot be
+ * told keeps the managed contract.
+ */
+static bool apple_pcie_port_is_managed(struct apple_pcie_port *port)
+{
+	struct of_phandle_args dart = {};
+	bool managed = true;
+	u32 bus;
+
+	if (!port->pcie->managed_sids)
+		return false;
+	if (of_property_read_u32_index(port->np, "bus-range", 0, &bus) ||
+	    of_map_iommu_id(port->pcie->dev->of_node, bus << 8, &dart) || !dart.np)
+		return true;
+	managed = of_property_present(dart.np, "apple,managed-sids");
+	of_node_put(dart.np);
+	return managed;
+}
+
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				 struct device_node *np)
 {
@@ -3182,7 +3207,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		port->base = NULL;
 		goto err_teardown;
 	}
-	if (pcie->managed_sids) {
+	port->managed = apple_pcie_port_is_managed(port);
+	if (port->managed) {
 		ret = apple_pcie_managed_admit(port);
 		if (ret)
 			goto err_teardown;
@@ -3278,7 +3304,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		/* U-Boot may already have brought up a conventional root port. */
 		link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 		if (!(link_stat & PORT_LINKSTS_UP)) {
-			if (pcie->managed_sids) {
+			if (port->managed) {
 				ret = apple_pcie_radio_check_cold(port);
 				if (ret)
 					goto err_teardown;
@@ -3306,7 +3332,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		goto err_teardown;
 
-	if (pcie->managed_sids || pcie->hw->adopt_link)
+	if (port->managed || pcie->hw->adopt_link)
 		goto rid2sid_ready;
 
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
@@ -3395,7 +3421,7 @@ rid2sid_ready:
 		if (left)
 			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
 				 (timeout - left) * 1000 / HZ);
-		else if (pcie->managed_sids) {
+		else if (port->managed) {
 			ret = -ETIMEDOUT;
 			goto err_teardown;
 		}
@@ -3916,10 +3942,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		return -EBUSY;
 	}
 
-	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
+	if (port->managed || port->pcie->hw->sid_indexed_rid2sid) {
 		if (sid >= port->sid_map_sz ||
-		    (pcie->managed_sids && (!rid || !sid || sid >= 16 ||
-					  !(pcie->managed_sids & BIT(sid)))))
+		    (port->managed && (!rid || !sid || sid >= 16 ||
+				       !(pcie->managed_sids & BIT(sid)))))
 			idx = -EINVAL;
 		else if (test_and_set_bit(sid, port->sid_map))
 			idx = -EBUSY;
@@ -3930,7 +3956,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		if (idx < 0)
 			idx = -ENOSPC;
 	}
-	if (idx >= 0 && pcie->managed_sids) {
+	if (idx >= 0 && port->managed) {
 		unsigned int other;
 
 		for (other = 0; other < 16; other++) {
@@ -3945,7 +3971,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		}
 	}
 	if (idx >= 0) {
-		if (pcie->managed_sids) {
+		if (port->managed) {
 			err = apple_pcie_managed_word(pcie->managed_sids, rid, sid, &val);
 			if (err) {
 				bitmap_release_region(port->sid_map, idx, 0);
@@ -3956,7 +3982,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 			val = PORT_RID2SID_VALID | (sid << PORT_RID2SID_SID_SHIFT) | rid;
 		}
 		readback = apple_pcie_rid2sid_write(port, idx, val);
-		if ((pcie->managed_sids || pcie->hw->sid_indexed_rid2sid) && readback != val) {
+		if ((port->managed || pcie->hw->sid_indexed_rid2sid) && readback != val) {
 			dev_err(&pdev->dev, "RID-to-SID readback %#x expected %#x\n",
 				readback, val);
 			/* Reserve the failed slot; do not enable or recycle it. */
@@ -3994,7 +4020,7 @@ static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci
 					    port_rid2sid_offset(port, idx));
 		if ((val & 0xffff) == rid) {
 			val = apple_pcie_rid2sid_write(port, idx, 0);
-			if (port->pcie->managed_sids && val) {
+			if (port->managed && val) {
 				dev_err(&pdev->dev,
 					"RID invalidation failed; retaining SID slot %d\n", idx);
 				break;
@@ -5956,12 +5982,14 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
 
+		/*
+		 * The node names the managed SIDs. The radio's bind checks
+		 * them against each function's iommu-map entry and IDs.
+		 */
 		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
-		    !apple_t8132_managed_radio() || count <= 0 || count > 15)
+		    count <= 0 || count > 15)
 			return -EINVAL;
 		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
-		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))
-			ret = -EINVAL;
 		if (!ret)
 			ret = apple_pcie_managed_sid_mask(ids, count, &pcie->managed_sids);
 		if (ret)

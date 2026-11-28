@@ -199,6 +199,33 @@ static void apple_sleep_radio_port_up(void)
 {
 	port_up++;
 }
+
+/* The host's other ports: held with the radio port, back only after its recovery. */
+static int ports_off, ports_on, ports_saved, ports_restored;
+
+static void apple_radio_ports_irq(struct apple_radio_sleep *rs, bool enable)
+{
+	(void)rs;
+	if (enable)
+		ports_on++;
+	else
+		ports_off++;
+}
+
+static void apple_radio_ports_save(struct apple_radio_sleep *rs)
+{
+	assert(rs->phase == APPLE_RADIO_SEALED && rs->pcie->radio_closed &&
+	       ports_off && irq_disabled && !off_calls);
+	ports_saved++;
+}
+
+static void apple_radio_ports_restore(struct apple_radio_sleep *rs)
+{
+	assert(rs->phase == APPLE_RADIO_VERIFIED && !rs->pcie->radio_closed &&
+	       !irq_disabled && port_up);
+	ports_restored++;
+}
+
 /* ACTUAL_FUNCTIONS */
 static struct apple_radio_sleep s;
 static struct apple_pcie host;
@@ -233,6 +260,10 @@ static void fresh(void)
 		recover_error = 0;
 	snapshot_reads = finish_calls = config_reads = off_calls =
 		restore_calls = recover_calls = port_up = 0;
+	ports_off = 0;
+	ports_on = 0;
+	ports_saved = 0;
+	ports_restored = 0;
 }
 int main(void)
 {
@@ -244,6 +275,7 @@ int main(void)
 	assert(apple_radio_suspend_noirq(&host) == -EBUSY);
 	assert(!wifi.writes && !host.radio_closed && !off_calls &&
 	       !irq_disabled);
+	assert(ports_off == 1 && ports_on == 1 && !ports_saved);
 	fresh();
 	host.radio_writers = 1;
 	assert(apple_radio_suspend_noirq(&host) == -EBUSY);
@@ -260,15 +292,18 @@ int main(void)
 	root.state_saved = false;
 	assert(apple_radio_suspend_noirq(&host) == -EUCLEAN);
 	assert(!off_calls && wifi.command == 7);
+	assert(!ports_saved && ports_on == 1);
 	fresh();
 	assert(!apple_radio_suspend_noirq(&host));
 	assert(s.phase == APPLE_RADIO_STOPPED && host.radio_closed &&
 	       off_calls == 1 && irq_disabled);
+	assert(ports_off == 1 && ports_saved == 1 && !ports_on);
 	assert(!apple_radio_config_allowed(&host));
 	assert(wifi.command == 3 && bt.command == 3);
 	/* Refusal/pm_test: no port reset or retrain, but translations and BME must return. */
 	assert(!apple_radio_resume_noirq(&host));
 	assert(restore_calls == 1 && !recover_calls && !port_up);
+	assert(!ports_restored && ports_on == 1);
 	assert(wifi.command == 7 && bt.command == 7 &&
 	       s.phase == APPLE_RADIO_VERIFIED && !host.radio_closed &&
 	       !irq_disabled);
@@ -283,6 +318,7 @@ int main(void)
 	fw_resume = true;
 	assert(!apple_radio_resume_noirq(&host));
 	assert(recover_calls == 1 && !restore_calls && port_up == 1);
+	assert(ports_restored == 1 && !ports_on);
 	assert(apple_radio_config_allowed(&host) && !host.radio_closed &&
 	       !irq_disabled);
 	assert(apple_radio_finish(&s, 9) ==
@@ -301,6 +337,7 @@ int main(void)
 			apple_radio_resume_noirq(&host);
 			assert(!"failed restore released endpoints");
 		}
+		assert(!ports_restored && !ports_on);
 		assert(host.radio_closed && irq_disabled &&
 		       s.phase == APPLE_RADIO_FAILED &&
 		       !apple_radio_config_allowed(&host));

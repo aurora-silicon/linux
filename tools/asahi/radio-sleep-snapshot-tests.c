@@ -30,6 +30,7 @@ struct apple_radio_sleep {
 	struct apple_pcie *pcie;
 	struct apple_pcie_port *port;
 	int fn[2];
+	unsigned int sid[2];
 	u32 rid[16], msi[32], msicfg, msibase, msiaddr, msiaddr_hi, intmask,
 		appclk;
 	unsigned long vectors[1], sids[1];
@@ -83,7 +84,7 @@ int main(void)
 		.bitmap = &vectors, .hw = &hw, .managed_sids = 6, .nvecs = 32
 	};
 	struct apple_pcie_port port = { .sid_map_sz = 16, .sid_map = { 6 } };
-	struct apple_radio_sleep s = { .pcie = &host, .port = &port };
+	struct apple_radio_sleep s = { .pcie = &host, .port = &port, .sid = { 1, 2 } };
 
 	regs[PORT_STATUS / 4] = PORT_STATUS_READY;
 	/* An operating radio link may assert both UP and BUSY. */
@@ -129,5 +130,26 @@ int main(void)
 	regs[0x3004 / 4] ^= 1;
 	regs[PORT_MSICFG / 4] = 0;
 	assert(apple_radio_snapshot(&s, false) == -EUCLEAN);
-	puts("PASS: live-link status and RID/MSI snapshot validation");
+	regs[PORT_MSICFG / 4] = PORT_MSICFG_EN;
+	/* The admitted SIDs are the host's apple,managed-sids, not fixed ones. */
+	regs[0x3004 / 4] = 0;
+	regs[0x3008 / 4] = 0;
+	regs[0x300c / 4] = 0x80030100;
+	regs[0x3014 / 4] = 0x80050101;
+	host.managed_sids = BIT(3) | BIT(5);
+	port.sid_map[0] = BIT(3) | BIT(5);
+	s.sid[0] = 3;
+	s.sid[1] = 5;
+	assert(apple_radio_snapshot(&s, false) == 0);
+	assert(apple_radio_snapshot(&s, true) == 0);
+	/* A function routed to the other admitted SID is not its admission. */
+	regs[0x300c / 4] = 0x80030101;
+	regs[0x3014 / 4] = 0x80050100;
+	assert(apple_radio_snapshot(&s, false) == -EUCLEAN);
+	/* Nor is a SID outside apple,managed-sids. */
+	regs[0x300c / 4] = 0x80030100;
+	regs[0x3014 / 4] = 0x80050101;
+	host.managed_sids = BIT(3);
+	assert(apple_radio_snapshot(&s, false) == -EUCLEAN);
+	puts("PASS: live-link status, RID/MSI snapshot, managed SIDs");
 }
