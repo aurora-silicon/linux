@@ -358,6 +358,11 @@ struct sn201202x_ldcm_ops {
 	 * 2 while the port is to be held mitigated, see struct sn201202x_ldcm_wait
 	 */
 	unsigned int (*overdue)(void *ctx);
+	/*
+	 * The hold's mitigation command went through, or failed: the hold runs
+	 * from its first success, and a failure waits for the next one.
+	 */
+	void (*held)(void *ctx, bool mitigated);
 	/* Remove mitigation even if removed already: the controller measures again */
 	int (*rerun)(void *ctx);
 	/* Status reads that failed in a row, the last read included */
@@ -376,6 +381,8 @@ struct sn201202x_ldcm_wait {
 	unsigned int overdue;
 	/* The measurement is to be started again, and was not yet */
 	bool rerun_due;
+	/* The hold's mitigation went through: its time runs, from then */
+	bool held;
 	/* Holds since the last result, which set the next hold's length */
 	unsigned int holds;
 };
@@ -698,6 +705,8 @@ unsigned int sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait,
 					 unsigned long now);
 void sn201202x_ldcm_wait_rerun(struct sn201202x_ldcm_wait *wait,
 			       unsigned long now);
+void sn201202x_ldcm_wait_held(struct sn201202x_ldcm_wait *wait,
+			      bool mitigated, unsigned long now);
 unsigned int sn201202x_ldcm_hold_ms(unsigned int holds);
 unsigned int sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
 				     unsigned int read_failures, unsigned long now);

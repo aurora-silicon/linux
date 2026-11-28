@@ -451,8 +451,10 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_hold_ms);
  * SN201202X_LDCM_STUCK_MS later, and the measurement is then to be started
  * again: until sn201202x_ldcm_wait_rerun() says it was, every call returns 1.
  * The measurement started again gets a whole wait too. Overdue, the port is
- * held mitigated (2) for sn201202x_ldcm_hold_ms(), and then the measurement
- * is to be started again (1), and so on, until a result resets the wait.
+ * to be held mitigated (2): the hold lasts sn201202x_ldcm_hold_ms() from the
+ * mitigation that went through (sn201202x_ldcm_wait_held()), and then the
+ * measurement is to be started again (1), and so on, until a result resets
+ * the wait. Until the mitigation went through, it stays 2.
  */
 VISIBLE_IF_KUNIT unsigned int
 sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
@@ -465,9 +467,11 @@ sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
 	if (wait->rerun_due)
 		return 1;
 	if (wait->overdue == 2) {
-		if (time_before(now, wait->since +
+		if (!wait->held ||
+		    time_before(now, wait->since +
 				msecs_to_jiffies(sn201202x_ldcm_hold_ms(wait->holds))))
 			return 2;
+		wait->held = false;
 		wait->overdue = 1;
 		wait->rerun_due = true;
 		wait->since = now;
@@ -482,11 +486,35 @@ sn201202x_ldcm_wait_overdue(struct sn201202x_ldcm_wait *wait, unsigned long now)
 		return 1;
 	}
 	wait->overdue = 2;
+	wait->held = false;
 	if (wait->holds < UINT_MAX)
 		wait->holds++;
 	return 2;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_overdue);
+
+/*
+ * The hold's mitigation command went through (@mitigated) or failed. The
+ * hold runs from the first that went through; a failed one, even in a hold
+ * that runs, starts it again from the next that goes through, as the
+ * controller may then be unmitigated.
+ */
+VISIBLE_IF_KUNIT void
+sn201202x_ldcm_wait_held(struct sn201202x_ldcm_wait *wait, bool mitigated,
+			 unsigned long now)
+{
+	if (wait->overdue != 2)
+		return;
+	if (!mitigated) {
+		wait->held = false;
+		return;
+	}
+	if (!wait->held) {
+		wait->held = true;
+		wait->since = now;
+	}
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_held);
 
 /* The measurement was started again: it gets a whole wait from now. */
 VISIBLE_IF_KUNIT void
@@ -501,13 +529,15 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_wait_rerun);
  * Retried every 500 ms while it measures, but every 2 s once a wait has
  * been overrun, as the measurement may never end, and after a failed read,
  * which a busy bus may follow with more. A hold is not polled: the next
- * update is at its end, unless a controller event comes first.
+ * update is at its end, unless a controller event comes first. A hold whose
+ * mitigation did not go through is no hold yet: its command is retried every
+ * 2 s, as a failed restart.
  */
 VISIBLE_IF_KUNIT unsigned int
 sn201202x_ldcm_retry_ms(const struct sn201202x_ldcm_wait *wait,
 			unsigned int read_failures, unsigned long now)
 {
-	if (wait->overdue == 2 && !wait->rerun_due) {
+	if (wait->overdue == 2 && !wait->rerun_due && wait->held) {
 		unsigned long end = wait->since +
 				    msecs_to_jiffies(sn201202x_ldcm_hold_ms(wait->holds));
 		unsigned int left = time_before(now, end) ?
@@ -542,7 +572,7 @@ VISIBLE_IF_KUNIT unsigned int sn201202x_ldcm_overdue(void *ctx)
 		dev_dbg(tps->dev, "liquid detection: measuring again after hold %u\n",
 			wait->holds);
 	else if (wait->holds == 1)
-		dev_warn(tps->dev, "liquid detection still gave no result; port disabled until it does, measuring again in %u ms\n",
+		dev_warn(tps->dev, "liquid detection still gave no result; port disabled until it does, measuring again %u ms after mitigation\n",
 			 sn201202x_ldcm_hold_ms(wait->holds));
 	else
 		dev_dbg(tps->dev, "liquid detection: no result, hold %u of %u ms\n",
@@ -550,6 +580,13 @@ VISIBLE_IF_KUNIT unsigned int sn201202x_ldcm_overdue(void *ctx)
 	return overdue;
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_overdue);
+
+static void sn201202x_ldcm_held(void *ctx, bool mitigated)
+{
+	struct tps6598x *tps = ctx;
+
+	sn201202x_ldcm_wait_held(&tps_to_sn(tps)->ldcm_wait, mitigated, jiffies);
+}
 
 VISIBLE_IF_KUNIT int sn201202x_ldcm_rerun(void *ctx)
 {
@@ -621,7 +658,9 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 		 * of it, with the port still down. If the measurement run again
 		 * overruns its own wait too, the port is held mitigated, still
 		 * down and "unknown", and the controller is made to measure
-		 * again after each hold (10 s, doubled up to 5 min). No time
+		 * again after each hold (10 s, doubled up to 5 min). A hold
+		 * starts only once its mitigation went through: a failed
+		 * command is sent again, never followed by a restart. No time
 		 * makes a port without a result dry: only a dry result read
 		 * from the controller, during a wait or a hold, enables it.
 		 */
@@ -633,6 +672,7 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 			return ret ?: -EINPROGRESS;
 		default:
 			ret = ops->set_mitigation(ctx, true);
+			ops->held(ctx, !ret);
 			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
 			return ret ?: -EAGAIN;
 		}
@@ -708,6 +748,7 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
 	.result = sn201202x_ldcm_result,
 	.wet = sn201202x_ldcm_wet,
 	.overdue = sn201202x_ldcm_overdue,
+	.held = sn201202x_ldcm_held,
 	.rerun = sn201202x_ldcm_rerun,
 	.read_failures = sn201202x_ldcm_read_failures,
 };

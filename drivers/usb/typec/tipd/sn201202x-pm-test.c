@@ -691,6 +691,8 @@ enum sn201202x_ldcm_test_action {
 	LDCM_TEST_PUBLISH_LIQUID,
 	LDCM_TEST_OVERDUE,
 	LDCM_TEST_RERUN,
+	LDCM_TEST_HELD,
+	LDCM_TEST_NOT_HELD,
 };
 
 struct sn201202x_ldcm_test {
@@ -774,6 +776,14 @@ static unsigned int sn201202x_ldcm_test_overdue(void *ctx)
 	return t->overdue;
 }
 
+static void sn201202x_ldcm_test_held(void *ctx, bool mitigated)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	t->actions[t->action_count++] = mitigated ? LDCM_TEST_HELD :
+						    LDCM_TEST_NOT_HELD;
+}
+
 static int sn201202x_ldcm_test_rerun(void *ctx)
 {
 	struct sn201202x_ldcm_test *t = ctx;
@@ -796,6 +806,7 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_test_ops = {
 	.result = sn201202x_ldcm_test_result,
 	.wet = sn201202x_ldcm_test_wet,
 	.overdue = sn201202x_ldcm_test_overdue,
+	.held = sn201202x_ldcm_test_held,
 	.rerun = sn201202x_ldcm_test_rerun,
 	.read_failures = sn201202x_ldcm_test_read_failures,
 };
@@ -1077,7 +1088,8 @@ static void sn201202x_ldcm_overdue_once_rerun_failure_test(struct kunit *test)
 
 /*
  * The measurement run again overran too: the port is held mitigated and
- * stays "unknown", never taken for dry. Nothing else is read or sent.
+ * stays "unknown", never taken for dry. Nothing else is read or sent. The
+ * hold starts with the mitigation that went through.
  */
 static void sn201202x_ldcm_overdue_twice_holds_test(struct kunit *test)
 {
@@ -1085,6 +1097,7 @@ static void sn201202x_ldcm_overdue_twice_holds_test(struct kunit *test)
 		LDCM_TEST_READ,
 		LDCM_TEST_OVERDUE,
 		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_HELD,
 		LDCM_TEST_PUBLISH_UNKNOWN,
 	};
 	struct sn201202x_ldcm_test t = {
@@ -1148,6 +1161,7 @@ static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
 		LDCM_TEST_READ,
 		LDCM_TEST_OVERDUE,
 		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_NOT_HELD,
 		LDCM_TEST_PUBLISH_UNKNOWN,
 	};
 	struct sn201202x_ldcm_test t = {
@@ -1156,7 +1170,7 @@ static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
 		.overdue = 2,
 	};
 
-	/* A hold whose command fails keeps the port down, and is retried. */
+	/* A hold whose command fails keeps the port down, and is no hold yet. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN),
@@ -1293,6 +1307,8 @@ static void sn201202x_ldcm_wait_test(struct kunit *test)
 	/* Overrun again: held, and the hold lasts, it does not end in dry. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 2U);
 	KUNIT_EXPECT_EQ(test, wait.holds, 1U);
+	KUNIT_EXPECT_FALSE(test, wait.held);
+	sn201202x_ldcm_wait_held(&wait, true, start + 2 * stuck);
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 3 * stuck), 2U);
 
 	/* A result ends the wait; the next measurement starts another. */
@@ -1362,6 +1378,15 @@ static void sn201202x_ldcm_wait_hold_backoff_test(struct kunit *test)
 		now += stuck;
 		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now), 2U);
 		KUNIT_EXPECT_EQ(test, wait.holds, i + 1);
+		/* Its mitigation fails first: retried as a failed command, no hold yet. */
+		sn201202x_ldcm_wait_held(&wait, false, now);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, now),
+				SN201202X_LDCM_SLOW_RETRY_MS);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, now + stuck), 2U);
+		now += stuck;
+		sn201202x_ldcm_wait_held(&wait, true, now);
+		/* Further mitigations that go through do not stretch the hold. */
+		sn201202x_ldcm_wait_held(&wait, true, now + hold / 2);
 		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0, now),
 				jiffies_to_msecs(hold));
 		/* Not even a failed read polls a hold. */
@@ -1402,6 +1427,10 @@ struct sn201202x_ldcm_sim {
 	enum typec_contaminant published;
 	unsigned int reruns;
 	unsigned int updates;
+	/* Mitigation commands that fail before the first one goes through */
+	unsigned int mitigation_failures;
+	int mitigation_err;
+	unsigned int mitigations;
 };
 
 static int sn201202x_ldcm_sim_read(void *ctx, enum typec_contaminant *contaminant)
@@ -1417,6 +1446,11 @@ static int sn201202x_ldcm_sim_mitigate(void *ctx, bool enable)
 {
 	struct sn201202x_ldcm_sim *sim = ctx;
 
+	sim->mitigations++;
+	if (sim->mitigation_failures) {
+		sim->mitigation_failures--;
+		return sim->mitigation_err;
+	}
 	sim->mitigated = enable;
 	return 0;
 }
@@ -1450,6 +1484,13 @@ static unsigned int sn201202x_ldcm_sim_overdue(void *ctx)
 	return sn201202x_ldcm_wait_overdue(&sim->wait, sim->now);
 }
 
+static void sn201202x_ldcm_sim_held(void *ctx, bool mitigated)
+{
+	struct sn201202x_ldcm_sim *sim = ctx;
+
+	sn201202x_ldcm_wait_held(&sim->wait, mitigated, sim->now);
+}
+
 static int sn201202x_ldcm_sim_rerun(void *ctx)
 {
 	struct sn201202x_ldcm_sim *sim = ctx;
@@ -1472,6 +1513,7 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_sim_ops = {
 	.result = sn201202x_ldcm_sim_result,
 	.wet = sn201202x_ldcm_sim_wet,
 	.overdue = sn201202x_ldcm_sim_overdue,
+	.held = sn201202x_ldcm_sim_held,
 	.rerun = sn201202x_ldcm_sim_rerun,
 	.read_failures = sn201202x_ldcm_sim_read_failures,
 };
@@ -1570,6 +1612,97 @@ static void sn201202x_ldcm_slow_result_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, sim.mitigated);
 		KUNIT_EXPECT_EQ(test, sim.reruns, cases[i].reruns);
 		KUNIT_EXPECT_LE(test, jiffies_to_msecs(sim.now - start), cases[i].by_ms);
+	}
+}
+
+static int sn201202x_ldcm_sim_step(struct sn201202x_ldcm_sim *sim)
+{
+	sim->updates++;
+	return sn201202x_ldcm_update_state(sim, &sn201202x_ldcm_sim_ops,
+					   sim->published);
+}
+
+/*
+ * A hold starts only once its mitigation went through. A failed command is
+ * retried after SN201202X_LDCM_SLOW_RETRY_MS, as a failed restart is, and the
+ * update that follows, however late it comes, sends the mitigation again: the
+ * measurement is never started again from a hold that was not mitigated. The
+ * hold runs whole from the mitigation that went through, and then ends in a
+ * restart.
+ */
+static void sn201202x_ldcm_hold_mitigation_failure_retried_test(struct kunit *test)
+{
+	static const struct {
+		unsigned int failures;
+		int err;
+		/* Each retry comes only after the longest hold */
+		bool late;
+	} cases[] = {
+		{ 0, 0, false },
+		{ 1, -ETIMEDOUT, false },
+		{ 3, -EIO, false },
+		{ 3, -ETIMEDOUT, true },
+	};
+	unsigned long stuck = msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+	unsigned long hold = msecs_to_jiffies(SN201202X_LDCM_HOLD_MS);
+	unsigned long hold_max = msecs_to_jiffies(SN201202X_LDCM_HOLD_MAX_MS);
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long start = -stuck;	/* across a jiffies wrap */
+		struct sn201202x_ldcm_sim sim = {
+			.now = start,
+			.published = TYPEC_CONTAMINANT_UNKNOWN,
+			.mitigation_failures = cases[i].failures,
+			.mitigation_err = cases[i].err,
+		};
+		unsigned int delay;
+
+		/* The first wait and the restart's wait run out: the hold is due. */
+		KUNIT_ASSERT_EQ(test, sn201202x_ldcm_sim_step(&sim), -EINPROGRESS);
+		sim.now += stuck;
+		KUNIT_ASSERT_EQ(test, sn201202x_ldcm_sim_step(&sim), -EINPROGRESS);
+		KUNIT_ASSERT_EQ(test, sim.reruns, 1U);
+		sim.now += stuck;
+
+		for (j = 0; j < cases[i].failures; j++) {
+			KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_step(&sim), cases[i].err);
+			KUNIT_EXPECT_EQ(test, sim.mitigations, j + 1);
+			KUNIT_EXPECT_FALSE(test, sim.mitigated);
+			KUNIT_EXPECT_FALSE(test, sim.wait.held);
+			KUNIT_EXPECT_EQ(test, sim.published, TYPEC_CONTAMINANT_UNKNOWN);
+			KUNIT_EXPECT_EQ(test, sim.reruns, 1U);
+			delay = sn201202x_ldcm_retry_ms(&sim.wait, 0, sim.now);
+			KUNIT_EXPECT_EQ(test, delay, SN201202X_LDCM_SLOW_RETRY_MS);
+			if (cases[i].late)
+				sim.now += hold_max;
+			else
+				sim.now += msecs_to_jiffies(delay);
+		}
+
+		/* The command goes through: the hold runs whole from now. */
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_step(&sim), -EAGAIN);
+		KUNIT_EXPECT_EQ(test, sim.mitigations, cases[i].failures + 1);
+		KUNIT_EXPECT_TRUE(test, sim.mitigated);
+		KUNIT_EXPECT_TRUE(test, sim.wait.held);
+		KUNIT_EXPECT_EQ(test, sim.published, TYPEC_CONTAMINANT_UNKNOWN);
+		KUNIT_EXPECT_EQ(test, sim.reruns, 1U);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&sim.wait, 0, sim.now),
+				jiffies_to_msecs(hold));
+
+		/* Just before its end nothing is restarted, nor is the hold stretched. */
+		sim.now += hold - 1;
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_step(&sim), -EAGAIN);
+		KUNIT_EXPECT_EQ(test, sim.reruns, 1U);
+		KUNIT_EXPECT_TRUE(test, sim.mitigated);
+
+		/* At its end the measurement is started again, retried as a restart. */
+		sim.now += 1;
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_sim_step(&sim), -EINPROGRESS);
+		KUNIT_EXPECT_EQ(test, sim.reruns, 2U);
+		KUNIT_EXPECT_FALSE(test, sim.mitigated);
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&sim.wait, 0, sim.now),
+				SN201202X_LDCM_SLOW_RETRY_MS);
 	}
 }
 
@@ -1789,6 +1922,7 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_wait_hold_backoff_test),
 	KUNIT_CASE(sn201202x_ldcm_never_a_result_test),
 	KUNIT_CASE(sn201202x_ldcm_slow_result_test),
+	KUNIT_CASE(sn201202x_ldcm_hold_mitigation_failure_retried_test),
 	KUNIT_CASE(sn201202x_ldcm_atomic_test),
 	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_read_failure_retried_test),
