@@ -2,16 +2,16 @@
 /* Populated board control clients. Transport ownership is not transferred. */
 
 &i2c2 {
+	status = "okay";
+
 	atcrt0: retimer@18 {
 		compatible = "apple,t8103-atcrt", "apple,atcrt";
 		reg = <0x18>;
-		status = "disabled";
 	};
 
 	atcrt1: retimer@19 {
 		compatible = "apple,t8103-atcrt", "apple,atcrt";
 		reg = <0x19>;
-		status = "disabled";
 	};
 };
 

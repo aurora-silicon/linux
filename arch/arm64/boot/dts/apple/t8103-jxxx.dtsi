@@ -222,6 +222,10 @@
 	};
 };
 
+&dpaudio0 {
+	status = "okay";
+};
+
 &dpaudio1 {
 	status = "okay";
 };

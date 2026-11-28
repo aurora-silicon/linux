@@ -13,6 +13,5 @@
 	hcpm: hcpm@8 {
 		compatible = "apple,t8103-hcpm", "apple,hcpm";
 		reg = <0x8>;
-		status = "disabled";
 	};
 };

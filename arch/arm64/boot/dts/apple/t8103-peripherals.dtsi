@@ -7,7 +7,6 @@
 		reg = <0x2 0x00100000 0x0 0x100000>,
 		      <0x2 0x00000000 0x0 0x100000>,
 		      <0x2 0x00200000 0x0 0x200000>;
-		status = "disabled";
 	};
 
 
@@ -29,7 +28,6 @@
 		      <0x2 0x10ee100c 0x0 0x4>,
 		      <0x2 0x10ee1008 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor9: temperature-sensor@210ee4600 {
@@ -50,7 +48,6 @@
 		      <0x2 0x10ee160c 0x0 0x4>,
 		      <0x2 0x10ee1608 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor10: temperature-sensor@211ee4400 {
@@ -71,7 +68,6 @@
 		      <0x2 0x11ee140c 0x0 0x4>,
 		      <0x2 0x11ee1408 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor11: temperature-sensor@211ee4600 {
@@ -92,7 +88,6 @@
 		      <0x2 0x11ee160c 0x0 0x4>,
 		      <0x2 0x11ee1608 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor12: temperature-sensor@211ee4800 {
@@ -113,7 +108,6 @@
 		      <0x2 0x11ee180c 0x0 0x4>,
 		      <0x2 0x11ee1808 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor13: temperature-sensor@211eec000 {
@@ -134,7 +128,6 @@
 		      <0x2 0x11ee900c 0x0 0x4>,
 		      <0x2 0x11ee9008 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor14: temperature-sensor@211ef4200 {
@@ -155,7 +148,6 @@
 		      <0x2 0x11ef120c 0x0 0x4>,
 		      <0x2 0x11ef1208 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor15: temperature-sensor@211ef4400 {
@@ -176,7 +168,6 @@
 		      <0x2 0x11ef140c 0x0 0x4>,
 		      <0x2 0x11ef1408 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor16: temperature-sensor@211ef4600 {
@@ -197,7 +188,6 @@
 		      <0x2 0x11ef160c 0x0 0x4>,
 		      <0x2 0x11ef1608 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	aes: crypto@23500c000 {
@@ -208,7 +198,6 @@
 		interrupts = <AIC_IRQ 625 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
 		iommus = <&sio_dart 1>;
-		status = "disabled";
 	};
 
 	pwm0: pwm@235040000 {
@@ -217,7 +206,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 632 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm0>;
-		status = "disabled";
 	};
 
 	spi4: spi@235110000 {
@@ -235,7 +223,6 @@
 	aic_timebase: timer@23b108000 {
 		compatible = "apple,t8103-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x3b108000 0x0 0x1000>;
-		status = "disabled";
 	};
 
 	dwi: bus-controller@23b200000 {
@@ -244,7 +231,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	mtrtempsensor3: temperature-sensor@23b284000 {
@@ -265,7 +251,6 @@
 		      <0x2 0x3b28100c 0x0 0x4>,
 		      <0x2 0x3b281008 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor4: temperature-sensor@23b284200 {
@@ -286,7 +271,6 @@
 		      <0x2 0x3b28120c 0x0 0x4>,
 		      <0x2 0x3b281208 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor5: temperature-sensor@23b284400 {
@@ -307,7 +291,6 @@
 		      <0x2 0x3b28140c 0x0 0x4>,
 		      <0x2 0x3b281408 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor6: temperature-sensor@23b29c200 {
@@ -328,7 +311,6 @@
 		      <0x2 0x3b29920c 0x0 0x4>,
 		      <0x2 0x3b299208 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor7: temperature-sensor@23b2a4000 {
@@ -349,7 +331,6 @@
 		      <0x2 0x3b2a100c 0x0 0x4>,
 		      <0x2 0x3b2a1008 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	mtrtempsensor17: temperature-sensor@23b2e0200 {
@@ -357,7 +338,6 @@
 		reg = <0x2 0x3b2e0200 0x0 0x4>,
 		      <0x2 0x3b2e0204 0x0 0x4>;
 		reg-names = "readbk", "readbk1";
-		status = "disabled";
 	};
 
 	mtrtempsensor18: temperature-sensor@23b2e0c00 {
@@ -365,7 +345,6 @@
 		reg = <0x2 0x3b2e0c00 0x0 0x4>,
 		      <0x2 0x3b2e0c04 0x0 0x4>;
 		reg-names = "readbk", "readbk1";
-		status = "disabled";
 	};
 
 	tempsensor0: temperature-sensor@23b2e4000 {
@@ -388,7 +367,6 @@
 		      <0x2 0x3b2c4054 0x0 0x4>,
 		      <0x2 0x3b2c4010 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	tempsensor1: temperature-sensor@23b2e8000 {
@@ -411,7 +389,6 @@
 		      <0x2 0x3b2c8054 0x0 0x4>,
 		      <0x2 0x3b2c8010 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	tempsensor2: temperature-sensor@23b2ec000 {
@@ -434,7 +411,6 @@
 		      <0x2 0x3b2cc054 0x0 0x4>,
 		      <0x2 0x3b2cc010 0x0 0x4>;
 		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
-		status = "disabled";
 	};
 
 	pmp_dart: iommu@23b300000 {
@@ -518,9 +494,9 @@
 		#size-cells = <0>;
 		interrupt-controller;
 		#interrupt-cells = <2>;
-		status = "disabled";
 	};
 
+	/* Keep disabled: debug UART ownership hazard. */
 	dockchannel_uart: fifo@23d10c000 {
 		compatible = "apple,t8103-dockchannel", "apple,dockchannel";
 		reg = <0x2 0x3d10c000 0x0 0x18>;
@@ -546,7 +522,6 @@
 		#size-cells = <0>;
 		interrupt-controller;
 		#interrupt-cells = <2>;
-		status = "disabled";
 	};
 
 	scaler0: scaler@263000000 {
@@ -581,7 +556,6 @@
 		power-domains = <&ps_jpg>;
 		clocks = <&peripheral_clocks 363>, <&peripheral_clocks 364>;
 		iommus = <&jpeg0_dart 0>;
-		status = "disabled";
 	};
 
 	jpeg0_dart: iommu@265004000 {
@@ -591,7 +565,6 @@
 		interrupts = <AIC_IRQ 592 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	jpeg1: jpeg@265008000 {
@@ -602,7 +575,6 @@
 		power-domains = <&ps_jpg>;
 		clocks = <&peripheral_clocks 363>, <&peripheral_clocks 364>;
 		iommus = <&jpeg1_dart 0>;
-		status = "disabled";
 	};
 
 	jpeg1_dart: iommu@26500c000 {
@@ -612,17 +584,15 @@
 		interrupts = <AIC_IRQ 595 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
-	ave_dma: dma-controller@267020000 {
+	ave_dma: dma@267020000 {
 		compatible = "apple,t8103-ave-dma", "apple,ave-dma";
 		reg = <0x2 0x67020000 0x0 0x4000>,
 		      <0x2 0x67044000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
 	};
 
 	ave_dart1: iommu@267030000 {
@@ -671,7 +641,6 @@
 		reg = <0x3 0x81e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 807 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc0_dpin1: displayport@381e58000 {
@@ -679,19 +648,6 @@
 		reg = <0x3 0x81e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 808 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec0_piodma: dma-controller@3a2000000 {
-		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x3 0xa2000000 0x0 0x4000>,
-		      <0x3 0xa2004000 0x0 0x4000>,
-		      <0x3 0xa2008000 0x0 0x4000>,
-		      <0x3 0xa0008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 772 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec0_dart 15>;
-		status = "disabled";
 	};
 
 	atc1_dpin0: displayport@501e50000 {
@@ -699,7 +655,6 @@
 		reg = <0x5 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 887 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc1_dpin1: displayport@501e58000 {
@@ -707,20 +662,8 @@
 		reg = <0x5 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 888 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
-	apciec1_piodma: dma-controller@522000000 {
-		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x5 0x22000000 0x0 0x4000>,
-		      <0x5 0x22004000 0x0 0x4000>,
-		      <0x5 0x22008000 0x0 0x4000>,
-		      <0x5 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 852 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec1_dart 15>;
-		status = "disabled";
-	};
 };
 
 &{/soc} {
@@ -756,7 +699,6 @@
 			     <AIC_IRQ 225 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 228 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 231 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	soc_events: event-log@23b700000 {
@@ -794,12 +736,12 @@
 			     <AIC_IRQ 47 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 48 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 410 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 };
 
 &nub_spmi1 {
+	/* Keep disabled until apple,spmi-nvmem bounds are validated on T8103. */
 	simetra: pmic@f {
 		compatible = "apple,simetra-pmic", "apple,spmi-nvmem";
 		reg = <0xf SPMI_USID>;
@@ -808,6 +750,7 @@
 };
 
 &{/soc} {
+	/* Keep disabled: unbacked interrupt-controller referenced by pmic1. */
 	primary_spmi_monitor: spmi-monitor@23d0d8e00 {
 		compatible = "apple,t8103-spmi-monitor", "apple,spmi-monitor";
 		reg = <0x2 0x3d0d8e00 0x0 0x100>,
@@ -827,7 +770,6 @@
 		compatible = "apple,t8103-battery-monitor", "apple,battery-monitor";
 		interrupt-parent = <&primary_spmi_monitor>;
 		interrupts = <62 IRQ_TYPE_NONE>;
-		status = "disabled";
 	};
 };
 
@@ -843,11 +785,11 @@
 			     <164 IRQ_TYPE_NONE>,
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
-		status = "disabled";
 	};
 };
 
 / {
+	/* Keep disabled: no clock driver yet; consumers like scaler0 would defer. */
 	peripheral_clocks: clock-controller {
 		compatible = "apple,t8103-pmgr-clocks", "apple,pmgr-clocks";
 		#clock-cells = <1>;
@@ -859,4 +801,30 @@
 &pmic1 {
 	interrupt-parent = <&primary_spmi_monitor>;
 	interrupts = <2 IRQ_TYPE_NONE>;
+};
+
+&usb4_0_pcie_tunnel {
+	apciec0_piodma: dma@3a2000000 {
+		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x3 0xa2000000 0x0 0x4000>,
+		      <0x3 0xa2004000 0x0 0x4000>,
+		      <0x3 0xa2008000 0x0 0x4000>,
+		      <0x3 0xa0008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 772 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec0_dart 15>;
+	};
+};
+
+&usb4_1_pcie_tunnel {
+	apciec1_piodma: dma@522000000 {
+		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x5 0x22000000 0x0 0x4000>,
+		      <0x5 0x22004000 0x0 0x4000>,
+		      <0x5 0x22008000 0x0 0x4000>,
+		      <0x5 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 852 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec1_dart 15>;
+	};
 };
