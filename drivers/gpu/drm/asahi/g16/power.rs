@@ -205,6 +205,8 @@ pub(crate) struct Power {
     pub(crate) sensor_errors: u64,
     pub(crate) decisions: u64,
     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+    /// The ceiling was below the top state at the last decision (startup holds it low).
+    throttled: bool,
     pub(crate) utilization: policy::Governor,
 }
 
@@ -243,6 +245,7 @@ impl Power {
             sensor_errors: 0,
             decisions: 0,
             last_decision: None,
+            throttled: true,
             utilization: policy::Governor::new(),
         })
     }
@@ -348,7 +351,31 @@ impl Firmware {
             .utilization
             .govern(now, limit, !self.engine.flights.is_empty());
         if decision {
-            dev_info!(
+            // Each decision goes to the debug log: under sustained heat the governor, budget and
+            // backstop move several times a second. The info log gets only the edges: the
+            // ceiling leaving the top state and coming back to it.
+            let throttled = limit < self.power.top;
+            if self.power.throttled != throttled {
+                self.power.throttled = throttled;
+                if throttled {
+                    dev_info!(
+                        self.dev(),
+                        "M4 cooling: ceiling S{} below the top S{} at {} mC\n",
+                        limit,
+                        self.power.top,
+                        self.power.temperature_mc
+                    );
+                } else {
+                    dev_info!(
+                        self.dev(),
+                        "M4 cooling: back at the top S{} at {} mC after {} decisions\n",
+                        limit,
+                        self.power.temperature_mc,
+                        self.power.decisions
+                    );
+                }
+            }
+            dev_dbg!(
                 self.dev(),
                 "M4 cooling: sample_ns={:?} mc={} sensor={:?} governor={} power={} backstop={} limit=S{}\n",
                 self.power.last_sample_ns,
