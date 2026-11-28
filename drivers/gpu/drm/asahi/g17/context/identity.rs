@@ -30,6 +30,13 @@ pub(super) const fn may_take(free: usize, held: u32) -> bool {
 pub(super) struct WorkStates {
     next: AtomicU32,
     live: [AtomicU32; 64],
+    /// Slots retired without post-maintenance completion stamps (for example
+    /// stampless render groups released via pair-wide drain or recovery-dropped
+    /// groups). A pinned slot stays out of `allocate` for the rest of this
+    /// context's life so the host never rewrites a cached work node the firmware
+    /// may still hold dirty; `live[index]` returns to `FREE` so `older_live`
+    /// never stalls behind it.
+    pinned: AtomicU64,
     /// Nodes taken by each engine's admissions and not yet released.
     held: [AtomicU32; ENGINES],
     /// Indices claimed by every context sharing this one's execution context
@@ -43,6 +50,7 @@ impl WorkStates {
             // 0x17c8.. 0x17ea on the J813).
             next: AtomicU32::new(0x40),
             live: [const { AtomicU32::new(FREE) }; 64],
+            pinned: AtomicU64::new(0),
             held: [const { AtomicU32::new(0) }; ENGINES],
             claims: None,
         }
@@ -51,6 +59,12 @@ impl WorkStates {
     pub(super) fn shared(claims: Arc<AtomicU64>) -> Self {
         Self { claims: Some(claims), ..Self::new() }
     }
+    /// Every slot of this context is pinned out of reuse, so no future release
+    /// can ever free one.
+    pub(super) fn exhausted(&self) -> bool {
+        let mask = (1u64 << STATE_COUNT) - 1;
+        (self.pinned.load(Ordering::Acquire) & mask).count_ones() as usize >= STATE_COUNT
+    }
     /// Takes a node for `engine`, or none when [`may_take`] refuses. Callers serialize
     /// allocations of one context; releases may run concurrently.
     pub(super) fn allocate(&self, engine: usize) -> Option<u32> {
@@ -58,14 +72,20 @@ impl WorkStates {
         if !may_take(STATE_COUNT.saturating_sub(self.used()), held.load(Ordering::Acquire)) {
             return None;
         }
+        let pinned = self.pinned.load(Ordering::Acquire);
         for _ in 0..64 {
             let word = self.next.fetch_add(1, Ordering::Relaxed);
             let index = (word & 63) as usize;
             if index != STATE_COUNT
+                && (pinned & (1u64 << index)) == 0
                 && self.live[index]
                     .compare_exchange(FREE, word, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
+                if (self.pinned.load(Ordering::Acquire) & (1u64 << index)) != 0 {
+                    self.live[index].store(FREE, Ordering::Release);
+                    continue;
+                }
                 if let Some(claims) = &self.claims {
                     if claims.fetch_or(1 << index, Ordering::AcqRel) & (1 << index) != 0 {
                         self.live[index].store(FREE, Ordering::Release);
@@ -93,6 +113,31 @@ impl WorkStates {
             }
         }
         released
+    }
+    /// Retires `word` while keeping its slot index out of reuse for the rest of
+    /// this context's life (cross-context pool reuse is separately prevented by
+    /// `Context::retain_linked_work`).
+    pub(super) fn pin(&self, word: u32, engine: usize) -> bool {
+        let index = (word & 63) as usize;
+        if index == STATE_COUNT || self.live[index].load(Ordering::Acquire) != word {
+            return false;
+        }
+        let mask = 1u64 << index;
+        // Set `pinned` before clearing `live[index]` so a concurrent `allocate`
+        // cannot observe `FREE` without also observing the pin bit.
+        self.pinned.fetch_or(mask, Ordering::AcqRel);
+        let pinned = self.live[index]
+            .compare_exchange(word, FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if pinned {
+            if let Some(claims) = &self.claims {
+                claims.fetch_and(!mask, Ordering::AcqRel);
+            }
+            if let Some(held) = self.held.get(engine) {
+                held.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        pinned
     }
 }
 
@@ -283,10 +328,18 @@ impl WorkStates {
     }
 
     pub(super) fn used(&self) -> usize {
+        let pinned = self.pinned.load(Ordering::Acquire);
         if let Some(claims) = &self.claims {
-            return claims.load(Ordering::Acquire).count_ones() as usize;
+            return (claims.load(Ordering::Acquire) | pinned).count_ones() as usize;
         }
-        self.live.iter().filter(|word| word.load(Ordering::Acquire) != FREE).count()
+        self.live
+            .iter()
+            .enumerate()
+            .filter(|&(i, word)| {
+                i != STATE_COUNT
+                    && (word.load(Ordering::Acquire) != FREE || (pinned & (1u64 << i)) != 0)
+            })
+            .count()
     }
 }
 impl RenderSlots {
@@ -410,5 +463,38 @@ mod tests {
         assert_eq!(states.held[1].load(Ordering::Acquire), 0);
         // An engine outside the table takes nothing.
         assert!(states.allocate(ENGINES).is_none());
+    }
+
+    #[test]
+    fn pinned_slot_is_never_reused_and_never_stalls_older_live() {
+        let states = WorkStates::new();
+        let first = states.allocate(0).unwrap();
+        let pinned_index = first & 63;
+        let second = states.allocate(0).unwrap();
+        assert_eq!(states.older_live(second), Some(first));
+        assert!(states.pin(first, 0));
+        assert!(!states.pin(first, 0));
+        assert_eq!(states.older_live(second), None);
+        assert_eq!(states.used(), 2);
+        assert_eq!(states.held[0].load(Ordering::Acquire), 1);
+        assert!(states.release(second, 0));
+        assert_eq!(states.used(), 1);
+        assert_eq!(states.held[0].load(Ordering::Acquire), 0);
+        // Cycling well past STATE_COUNT never hands back the pinned slot.
+        for _ in 0..(STATE_COUNT * 3) {
+            let word = states.allocate(0).unwrap();
+            assert_ne!(word & 63, pinned_index);
+            assert!(states.release(word, 0));
+        }
+        assert!(!states.exhausted());
+        // Pinning the remaining slots exhausts the context cleanly.
+        for _ in 1..STATE_COUNT {
+            let word = states.allocate(0).unwrap();
+            assert!(states.pin(word, 0));
+        }
+        assert!(states.exhausted());
+        assert_eq!(states.used(), STATE_COUNT);
+        assert!(states.allocate(0).is_none());
+        assert!(states.allocate(1).is_none());
     }
 }

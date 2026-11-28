@@ -4259,8 +4259,9 @@ impl super::Firmware {
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
             let busy = !queue.channel_free();
-            queue.recycle_killed()?;
-            queue.recycle_quarantined_idle()?;
+            if queue.recycle_killed()? || queue.recycle_quarantined_idle()? {
+                queue.retain_ring_until_stop(&self.pool);
+            }
             if deferred.vacated_room() {
                 if let Some(vacated) = queue.take_recycled_ring() {
                     deferred.defer_vacated(vacated);

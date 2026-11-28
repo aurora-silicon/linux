@@ -108,22 +108,24 @@ pub(crate) struct DescriptorRing {
 impl DescriptorRing {
     /// Both firmware and host write compute descriptors: the firmware updates
     /// an accounting word near the end of each descriptor (`+0xfac` on M5),
-    /// and the host rewrites each slot every 32 kicks. M5 keeps them uncached
-    /// against the dirty-line writeback hazard of linux#3170, while retaining
-    /// their VA and fence in the pool. G17P maps them firmware-cached, as it
-    /// does render descriptors: the host rewrites a slot only after the kick
-    /// that last used it retired (at most `DESCRIPTORS` kicks are in flight),
-    /// by when that kick's accounting store is in memory. The hardware reads
-    /// the same pages through an uncached canonical low alias; on M5 the
-    /// kernel mapping, in the upper half every execution context includes, is
-    /// firmware-only.
+    /// and the host rewrites each slot every 32 kicks. Map the ring
+    /// firmware-cached on all G17 (G17P and M5), as for render descriptors:
+    /// within a healthy queue the host rewrites a slot only after the kick that
+    /// last used it retired (`IN_FLIGHT <= DESCRIPTORS`, with post-maintenance
+    /// completion stamps mandatory on M5). Across queues, `Pool::allocate`
+    /// never overruns a pool fence for firmware-cached objects, and any queue
+    /// recycled after a kill or quarantine retains its descriptor ring until
+    /// firmware stop (`Queue::retain_ring_until_stop`) instead of returning it
+    /// to the reuse pool. The hardware reads the same pages through an uncached
+    /// canonical low alias; on M5 the kernel mapping, in the upper half every
+    /// execution context includes, is firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
             alloc,
             Family::Descriptor,
             size,
-            if alloc.uat.is_m5() { 0 } else { size },
+            size,
             if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
             CpuMap::WriteCombined,
         )?;
@@ -2276,6 +2278,14 @@ impl Queue {
         }
         self.recycle_settled()?;
         Ok(true)
+    }
+    /// Keeps this queue's descriptor ring mapped and out of pool reuse until
+    /// firmware stop, for queues recycled after a kill or quarantine where
+    /// aborted commands did not complete with post-maintenance stamps.
+    pub(crate) fn retain_ring_until_stop(&mut self, pool: &Arc<Pool>) {
+        if let Some(ring) = self.graph.ring.as_mut() {
+            ring.object.retain_until_stop(pool);
+        }
     }
     fn recycle_settled(&mut self) -> Result {
         self.graph.reset_items()?;

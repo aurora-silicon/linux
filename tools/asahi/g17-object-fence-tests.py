@@ -10,17 +10,21 @@ this is not GPU execution. Checks:
 - A18 Pro (`after_release`): a work state its context never exposed comes back
   with fence 0; one whose owner's release was consumed with an empty work list
   comes back with that witness; one a record or command may name, or that a
-  retained queue record named, keeps `control_fence()`. A full work-state
-  family with only waiting entries hands out an uncached object instead of
-  reusing one, and counts it.
-- Without `after_release` (M4, M5) every decision, and the snapshot counts,
+  retained queue record named, keeps `control_fence()`.
+- Firmware-cached families (`prefix != 0`, work states and descriptors on every
+  G17) never overrun a waiting pool fence when full: they hand out a fresh
+  unpooled/uncached object instead and count it.
+- Uncached pooled objects (`prefix == 0`) without `after_release` (M4, M5)
   match the pool before linux#1978 (BASE) on the same random operations.
-- Source rules: every accessor that hands the address to the firmware marks it,
-  and only the release path of `retain_linked_work` marks it released.
-- Cache policy (linux#3170 and its G17P follow-up): records the host rewrites
+- Source & recovery rules: every accessor that hands the address to the
+  firmware marks it; only the clean release path of `retain_linked_work` marks
+  it released; a killed context or failed VM retains its work state until
+  firmware stop even with an empty work list; a compute queue recycled after a
+  kill or quarantine retains its descriptor ring until firmware stop.
+- Cache policy (linux#3170 and follow-ups): records the host rewrites
   in place (render queue records, the compute graph, M5 scheduler pages) stay
-  uncached on every G17; work nodes and compute descriptors are uncached on M5
-  and keep their firmware-cached prefix on G17P.
+  uncached on every G17; work nodes and compute descriptors keep their
+  firmware-cached prefix on every G17 (G17P and M5).
 
 `--mutation` applies one known-bad change to the compiled copy; the run must
 then fail.
@@ -39,8 +43,10 @@ DRIVER = ROOT / 'drivers/gpu/drm/asahi'
 BASE = 'fc050503ffcd1032cd1590fb30252eb5a722a5a5'
 
 MUTATIONS = {
-    # Work states may overrun a fence again when their family is full.
-    'overrun-work-states': ('object', 'if ready || (!room && !marked) => {', 'if ready || !room => {'),
+    # Work states and cached objects may overrun a fence again when their family is full.
+    'overrun-work-states': ('object', 'if ready || (!room && !no_overrun) => {', 'if ready || !room => {'),
+    # Firmware-cached objects on non-after_release GPUs (M5) overrun their fence again.
+    'overrun-cached-prefix': ('object', 'let no_overrun = marked || prefix != 0;', 'let no_overrun = marked;'),
     # An unseen work state keeps the strict fence.
     'unseen-strict': ('object', 'Self::UNSEEN => (RETURN_UNSEEN, 0),',
                       'Self::UNSEEN => (RETURN_UNSEEN, super::channel::control_fence()),'),
@@ -51,14 +57,57 @@ MUTATIONS = {
     'node-unmarked': ('context', '        self.context.expose_work();\n', ''),
     # A consumed release with an empty list does not mark the work state.
     'no-release': ('context', 'mark.released(super::channel::control_witnessed());', 'let _ = mark;'),
-    # M5 work nodes are firmware-cached again.
-    'm5-cached-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', 'UAT_PGSZ'),
-    # M5 compute descriptors are firmware-cached again.
-    'm5-cached-descriptors': ('policy-compute', 'if alloc.uat.is_m5() { 0 } else { size }', 'size'),
+    # A killed context with an empty list returns its cached work state to the pool.
+    'reuse-killed-work-state': ('context',
+                                '            || self.kill_published()\n', ''),
+    # A stampless-drained context with an empty list returns its cached work state to the pool.
+    'reuse-stampless-drained-work-state': ('context',
+                                           '            || self.stampless_drained()\n', ''),
+    # A failed VM with an empty list returns its cached work state to the pool.
+    'reuse-failed-work-state': ('context',
+                                '            || self.status.get() != 0\n', ''),
+    # Stampless render drops its WorkStateLease before completion stamps arrive.
+    'drop-stampless-work-lease': (
+        'policy-render',
+        '            front.stamps_owed_work = Some(front.packet.completion.work_state()?);\n',
+        '',
+    ),
+    # Pair-wide drain of a stampless render group fails to pin its work-state lease.
+    'drop-stampless-drain-pin': (
+        'policy-render',
+        '                if let Some(work) = &active.stamps_owed_work {\n'
+        '                    work.pin_until_stop();\n'
+        '                } else {\n'
+        '                    active.packet.context.note_stampless_drain();\n'
+        '                }\n',
+        '                active.packet.context.note_stampless_drain();\n',
+    ),
+    # WorkStates::pin forgets to record the pin bit, allowing same-context reuse after unstamped drain.
+    'same-context-reuse-pinned-slot': (
+        'identity',
+        '        self.pinned.fetch_or(mask, Ordering::AcqRel);\n',
+        '',
+    ),
+    # A compute queue recycled after kill/quarantine returns its cached descriptor ring to the pool.
+    'reuse-recycled-descriptor-ring': (
+        'policy-runtime',
+        '            if queue.recycle_killed()? || queue.recycle_quarantined_idle()? {\n'
+        '                queue.retain_ring_until_stop(&self.pool);\n'
+        '            }',
+        '            queue.recycle_killed()?;\n'
+        '            queue.recycle_quarantined_idle()?;',
+    ),
+    # Work nodes lose their firmware-cached prefix (the linux#3170 light-submission cost).
+    'uncached-nodes': ('policy-context', 'Family::WorkState,\n            2 * UAT_PGSZ,\n            UAT_PGSZ,',
+                       'Family::WorkState,\n            2 * UAT_PGSZ,\n            0,'),
+    # Compute descriptors lose their firmware-cached prefix.
+    'uncached-descriptors': ('policy-compute', 'Family::Descriptor,\n            size,\n            size,',
+                             'Family::Descriptor,\n            size,\n            0,'),
     # Render queue records, which the host retargets in place, are firmware-cached again.
     'cached-queue-records': ('policy-memory', 'GRAPH_SIZE,\n            0,\n', 'GRAPH_SIZE,\n            0x8000,\n'),
-    # G17P work nodes lose their cached prefix (the linux#3170 light-submission cost).
-    'uncached-g17p-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', '0'),
+    # M5 scheduler pages, which are zeroed and reinitialised on reuse, are firmware-cached again.
+    'cached-scheduler': ('policy-context', 'Family::Scheduler,\n                UAT_PGSZ,\n                0,',
+                         'Family::Scheduler,\n                UAT_PGSZ,\n                UAT_PGSZ,'),
 }
 
 
@@ -101,6 +150,17 @@ def context_source(text):
         '    pub(crate) fn work_head_va(', '    pub(crate) fn work_head_address(', '    fn expose_work('])
     node = block(text, '    pub(crate) fn node_va(&self) -> Result<u64> {')
     return pages, methods, node
+
+
+def identity_source(text):
+    """Extract the real WorkStates allocator, pin, older_live, used, and may_take from context/identity.rs."""
+    consts = '\n'.join(re.search(r'^pub\(super\) const ' + name + r': [^;]+;', text, re.M).group(0)
+                        for name in ['FREE', 'STATE_COUNT', 'ENGINES'])
+    may_take = block(text, 'pub(super) const fn may_take(')
+    struct = block(text, 'pub(super) struct WorkStates {')
+    impl1 = block(text, 'impl WorkStates {')
+    impl2 = block(text, 'impl WorkStates {', text.index('impl WorkStates {') + 1)
+    return '\n'.join([consts, may_take, struct, impl1, impl2])
 
 
 PRELUDE = r'''
@@ -155,13 +215,19 @@ impl<T> core::ops::Deref for KVec<T> { type Target = Vec<T>; fn deref(&self) -> 
 impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self) -> &mut Vec<T> { &mut self.0 } }
 
 pub mod mmu {
+    use std::cell::Cell;
     pub type Prot = u8;
     pub const UAT_PGSZ: usize = 0x4000;
+    thread_local! {
+        pub static ZERO_PREFIX_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
     pub struct KernelMapping { pub iova: u64 }
     impl KernelMapping {
         pub fn iova(&self) -> u64 { self.iova }
         pub unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (crate::Result<[u64; 2]>, bool) {
-            assert!(prefix > 0, "set_fw_cached_prefix must not be called for prefix == 0");
+            if prefix == 0 {
+                ZERO_PREFIX_CALLS.with(|c| c.set(c.get() + 1));
+            }
             (Ok([0; 2]), true)
         }
     }
@@ -195,7 +261,12 @@ impl Allocator<'_> {
     }
 }
 
-pub mod channel {
+pub mod identity {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+@IDENTITY@
+}
+mod channel {
     use core::sync::atomic::{AtomicU64, Ordering};
 @CHANNEL@
     /// Sets the published and consumed control-record counts.
@@ -246,13 +317,13 @@ pub fn ops(seed: u64, steps: usize) -> Vec<Op> {
     ops
 }
 
-/// Size and cached prefix per family; `variant` 3 gives descriptors a second size.
+/// Size and uncached prefix per family for BASE parity; `variant` 3 gives descriptors a second size.
 pub fn geometry(family: usize, variant: usize) -> (usize, usize) {
     let page = mmu::UAT_PGSZ;
     match family {
-        0 if variant == 3 => (2 * page, page),
-        1 => (2 * page, page),
-        _ => (page, page),
+        0 if variant == 3 => (2 * page, 0),
+        1 => (2 * page, 0),
+        _ => (page, 0),
     }
 }
 
@@ -416,6 +487,8 @@ pub mod now {
             pool.stop_after_firmware();
             assert!(unmapped(kept_id));
             assert!(unmapped(ws_id));
+            assert_eq!(mmu::ZERO_PREFIX_CALLS.with(|c| c.get()), 0,
+                       "set_fw_cached_prefix must not be called for prefix == 0");
         }
         println!("uncached pooled: prefix == 0 skips firmware caching while keeping fencing, reuse and retention");
     }
@@ -503,8 +576,10 @@ pub mod now {
         println!("return classes: unseen 0, released at its witness, exposed or retained control_fence()");
     }
 
-    /// A full work-state family whose returned entries all wait leaves a new one uncached on
-    /// the A18 Pro, and overruns the oldest without after_release, as before.
+    /// A full cached work-state or descriptor family (`prefix > 0`) whose returned entries
+    /// all wait leaves a new one unpooled/uncached on every G17 (`after_release` true or false),
+    /// never overrunning a fence. Uncached pooled families (`prefix == 0`) still overrun without
+    /// `after_release`, matching BASE.
     pub fn full_family() {
         for after_release in [true, false] {
             let next = Cell::new(1);
@@ -518,24 +593,24 @@ pub mod now {
                 if let Some(mark) = object.return_mark() { mark.expose(); }
             }
             let waiting: Vec<_> = live.drain(..POOL_SLOTS / 2).collect();
-            let oldest = waiting[0].id;
             drop(waiting);
             let s = snapshot(&pool);
             assert_eq!(crate::count(&s, "cached_objects_1 ", "waiting="), 32, "{s}");
             assert_eq!(crate::count(&s, "cached_objects_1 ", "used="), 64, "{s}");
             let object = work_state(&pool, &alloc);
             let s = snapshot(&pool);
+            assert!(object.lease.is_none(),
+                    "a cached work state is never reused before its fence (after_release={after_release})");
+            assert_eq!(object.id, 65);
+            assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 0, "{s}");
+            assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), 1, "{s}");
+            assert_eq!(crate::count(&s, "cached_objects_1 ", "returned="), 32, "{s}");
+            assert!(object.return_mark().is_none(), "an uncached work state has no mark");
+            let id = object.id;
+            drop(object);
+            assert!(unmapped(id), "an uncached object is unmapped when dropped");
+            assert_eq!(crate::count(&snapshot(&pool), "cached_objects_1 ", "returned="), 32);
             if after_release {
-                assert!(object.lease.is_none(), "an A18 Pro work state is not reused before its fence");
-                assert_eq!(object.id, 65);
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 0, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), 1, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "returned="), 32, "{s}");
-                assert!(object.return_mark().is_none(), "an uncached work state has no mark");
-                let id = object.id;
-                drop(object);
-                assert!(unmapped(id), "an uncached object is unmapped when dropped");
-                assert_eq!(crate::count(&snapshot(&pool), "cached_objects_1 ", "returned="), 32);
                 // An entry whose fence is met is still reused when the family is full.
                 let ready = live.pop().unwrap();
                 ready.return_mark().unwrap().released(7);
@@ -543,26 +618,44 @@ pub mod now {
                 drop(ready);
                 assert_eq!(work_state(&pool, &alloc).id, id, "a met fence is reused in a full family");
             } else {
-                assert!(object.lease.is_some());
-                assert_eq!(object.id, oldest, "without after_release the oldest waiting object is overrun");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "overruns="), 1, "{s}");
-                assert_eq!(crate::count(&s, "cached_objects_1 ", "uncached="), 0, "{s}");
                 assert_eq!(returns(&pool), [0, 0, 0], "work-state classes are counted on the A18 Pro only");
+                // Cached descriptors never overrun their fence either.
+                let mut desc_live: Vec<_> = (0..POOL_SLOTS).map(|_| descriptor(&pool, &alloc)).collect();
+                let desc_waiting: Vec<_> = desc_live.drain(..POOL_SLOTS / 2).collect();
+                drop(desc_waiting);
+                let fresh_desc = descriptor(&pool, &alloc);
+                let s = snapshot(&pool);
+                assert!(fresh_desc.lease.is_none(), "a cached descriptor is never reused before its fence");
+                assert_eq!(crate::count(&s, "cached_objects_0 ", "overruns="), 0, "{s}");
+                assert_eq!(crate::count(&s, "cached_objects_0 ", "uncached="), 1, "{s}");
+                // Uncached pooled objects (prefix == 0) still overrun when full without after_release.
+                let mut qs_live: Vec<_> = (0..POOL_SLOTS).map(|_| {
+                    pool.allocate(&alloc, Family::QueueState, mmu::UAT_PGSZ, 0, 0, CpuMap::WriteCombined).unwrap()
+                }).collect();
+                let qs_waiting: Vec<_> = qs_live.drain(..POOL_SLOTS / 2).collect();
+                let oldest = qs_waiting[0].id;
+                drop(qs_waiting);
+                let overrun = pool.allocate(&alloc, Family::QueueState, mmu::UAT_PGSZ, 0, 0, CpuMap::WriteCombined).unwrap();
+                assert!(overrun.lease.is_some());
+                assert_eq!(overrun.id, oldest, "uncached pooled objects still overrun when full without after_release");
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "cached_objects_2 ", "overruns="), 1, "{s}");
             }
         }
-        // Descriptors on the A18 Pro still overrun in a full family, as #1978 left them.
+        // Cached descriptors on the A18 Pro never overrun in a full family either.
         let next = Cell::new(1);
         let alloc = Allocator { next: &next };
         let pool = Pool::new(true).unwrap();
         crate::channel::set(10, 7);
         let mut live: Vec<_> = (0..POOL_SLOTS).map(|_| descriptor(&pool, &alloc)).collect();
         let returned: Vec<_> = live.drain(..POOL_SLOTS / 2).collect();
-        let oldest = returned[0].id;
         drop(returned);
-        assert_eq!(descriptor(&pool, &alloc).id, oldest, "a full descriptor family overruns its oldest entry");
+        let fresh = descriptor(&pool, &alloc);
+        assert!(fresh.lease.is_none(), "a full cached descriptor family stays uncached instead of overrunning");
         let s = snapshot(&pool);
-        assert_eq!(crate::count(&s, "cached_objects_0 ", "overruns="), 1, "{s}");
-        println!("full family: A18 Pro work states are left uncached and counted, never overrun; others unchanged");
+        assert_eq!(crate::count(&s, "cached_objects_0 ", "overruns="), 0, "{s}");
+        assert_eq!(crate::count(&s, "cached_objects_0 ", "uncached="), 1, "{s}");
+        println!("full family: firmware-cached work states and descriptors never overrun on any G17; uncached pooled unchanged");
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -674,6 +767,12 @@ pub mod now {
         pub struct SchedulerStorage;
         pub mod mmu { pub struct ContextHold; }
         pub struct QosLease;
+        pub struct VmStatus(core::sync::atomic::AtomicI32);
+        impl VmStatus {
+            fn new() -> Self { Self(core::sync::atomic::AtomicI32::new(0)) }
+            fn get(&self) -> i32 { self.0.load(Ordering::Acquire) }
+            fn fail(&self, err: i32) { self.0.store(err, Ordering::Release); }
+        }
         pub struct WorkStorage { pub object: PooledObject }
 @PAGES@
         pub struct Context {
@@ -683,11 +782,16 @@ pub mod now {
             scheduler: Arc<SchedulerStorage>,
             hold: Arc<mmu::ContextHold>,
             qos: Arc<QosLease>,
+            kill_published: core::sync::atomic::AtomicBool,
+            stampless_drained: core::sync::atomic::AtomicBool,
+            status: Arc<VmStatus>,
             /// The work-list head the firmware left.
             head: Cell<[u64; 2]>,
         }
         impl Context {
             fn work_head(&self) -> Result<[u64; 2]> { Ok(self.head.get()) }
+            fn kill_published(&self) -> bool { self.kill_published.load(Ordering::Acquire) }
+            fn stampless_drained(&self) -> bool { self.stampless_drained.load(Ordering::Acquire) }
 @METHODS@
         }
         pub struct WorkStateLease { context: Arc<Context>, word: core::sync::atomic::AtomicU32 }
@@ -702,6 +806,9 @@ pub mod now {
             let context = Arc::new(Context {
                 work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark,
                 scheduler: Arc::new(SchedulerStorage), hold: Arc::new(mmu::ContextHold), qos: Arc::new(QosLease),
+                kill_published: core::sync::atomic::AtomicBool::new(false),
+                stampless_drained: core::sync::atomic::AtomicBool::new(false),
+                status: Arc::new(VmStatus::new()),
                 head: Cell::new([0, work_base + (UAT_PGSZ + 0x400) as u64]),
             });
             (context, id)
@@ -764,13 +871,109 @@ pub mod now {
                 drop(context);
                 assert_eq!(super::fence(&pool, Family::WorkState, id), None, "linked work is kept");
                 assert!(!unmapped(id));
+
+                // A killed context with an empty list keeps its cached work state until stop.
+                let (context, killed_id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                context.kill_published.store(true, Ordering::Release);
+                assert!(!context.retain_linked_work(&pool));
+                drop(context);
+                assert_eq!(super::fence(&pool, Family::WorkState, killed_id), None,
+                           "a killed context's work state is kept out of reuse until stop");
+                assert!(!unmapped(killed_id));
+
+                // A stampless-drained render context with an empty list keeps its cached work state until stop.
+                let (context, stampless_id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                context.stampless_drained.store(true, Ordering::Release);
+                assert!(!context.retain_linked_work(&pool));
+                drop(context);
+                assert_eq!(super::fence(&pool, Family::WorkState, stampless_id), None,
+                           "a stampless-drained context's work state is kept out of reuse until stop");
+                assert!(!unmapped(stampless_id));
+
+                // A failed VM (recovery/fault) with an empty list keeps its cached work state until stop.
+                let (context, failed_id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                context.status.fail(-5);
+                assert!(!context.retain_linked_work(&pool));
+                drop(context);
+                assert_eq!(super::fence(&pool, Family::WorkState, failed_id), None,
+                           "a failed VM's work state is kept out of reuse until stop");
+                assert!(!unmapped(failed_id));
+
+                // Even after advancing the control fence, a fresh allocation never reuses kept work states.
+                crate::channel::set(100, 100);
+                let next_ws = super::work_state(&pool, &alloc);
+                assert_ne!(next_ws.id, id);
+                assert_ne!(next_ws.id, killed_id);
+                assert_ne!(next_ws.id, stampless_id);
+                assert_ne!(next_ws.id, failed_id);
+                drop(next_ws);
+
+                pool.stop_after_firmware();
+                assert!(unmapped(id) && unmapped(killed_id) && unmapped(failed_id),
+                        "kept work states are unmapped once firmware stops");
             }
-            println!("context: records, commands and retained records mark the work state; a consumed release with an empty list releases it");
+            println!("context: records, commands and retained records mark the work state; killed/failed/linked contexts retain until stop");
         }
     }
 }
 
+fn work_states_pin_prevents_same_context_reuse() {
+    use crate::identity::{WorkStates, STATE_COUNT};
+    let states = WorkStates::new();
+    let drained = states.allocate(0).expect("initial render slot");
+    let drained_slot = drained & 63;
+    let newer = states.allocate(0).expect("newer slot");
+    assert_eq!(states.older_live(newer), Some(drained));
+    assert!(states.pin(drained, 0), "pinning a live slot succeeds once");
+    assert!(!states.pin(drained, 0), "double pin is a no-op");
+    assert_eq!(states.older_live(newer), None, "pinned slot must not stall older_live");
+    assert_eq!(states.used(), 2, "pinned slot stays counted in used()");
+    assert!(states.release(newer, 0));
+    assert_eq!(states.used(), 1);
+    for _ in 0..(STATE_COUNT * 4) {
+        let w = states.allocate(0).expect("same-context submission");
+        assert_ne!(w & 63, drained_slot, "same-context submission re-acquired pinned slot");
+        assert!(states.release(w, 0));
+    }
+    for _ in 1..(STATE_COUNT - 2) {
+        let w = states.allocate(0).expect("slot to pin");
+        assert!(states.pin(w, 0));
+    }
+    let r = states.allocate(0).expect("render takes 1 of 2 remaining");
+    let c = states.allocate(1).expect("compute takes last remaining");
+    assert!(states.release(r, 0));
+    assert!(states.release(c, 1));
+    for _ in 0..2 {
+        let w = states.allocate(0).expect("final slot to pin");
+        assert!(states.pin(w, 0));
+    }
+    assert!(states.exhausted(), "all 63 slots pinned must report exhausted()");
+    assert!(states.allocate(0).is_none());
+    assert!(states.allocate(1).is_none());
+    let claims = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ctx_a = WorkStates::shared(claims.clone());
+    let ctx_b = WorkStates::shared(claims.clone());
+    let wa = ctx_a.allocate(0).expect("shared ctx_a slot");
+    let sa = wa & 63;
+    assert!(ctx_a.pin(wa, 0));
+    assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire) & (1u64 << sa), 0,
+               "pinned slot releases shared work-key claim for sibling context");
+    assert_eq!(ctx_a.used(), 1, "pinning context still accounts for its pinned slot");
+    for _ in 0..(STATE_COUNT * 2) {
+        let w = ctx_a.allocate(0).expect("shared ctx_a retry");
+        assert_ne!(w & 63, sa, "shared context re-acquired its own pinned slot");
+        assert!(ctx_a.release(w, 0));
+    }
+    let wb = ctx_b.allocate(0).expect("sibling ctx_b slot");
+    assert!(ctx_b.release(wb, 0));
+    println!("same-context WorkStates pin: pinned slot never re-acquired, older_live unblocked, exhaustion clean");
+}
+
 fn main() {
+    work_states_pin_prevents_same_context_reuse();
     now::uncached_pooled();
     now::return_classes();
     now::full_family();
@@ -810,9 +1013,10 @@ def source_rules(context, observation, tree):
     assert context.count('object.gpu_va()') == 2
     assert 'let work_base = object.gpu_va();' in context
     assert 'fw::WorkNode::new(self.object.gpu_va() + counter as u64, word)' in context
-    # A release is marked only where retain_linked_work found the list empty.
+    # A release is marked only where retain_linked_work found a clean, unkilled, empty-list context.
     linked = block(context, '    pub(crate) fn retain_linked_work(')
-    assert re.search(r'if linked \{\n\s+self\.work\.lock\(\)\.object\.retain_until_stop\(pool\);\n'
+    assert re.search(r'if linked\s+\|\| self\.kill_published\(\)\s+\|\| self\.stampless_drained\(\)\s+\|\| self\.status\.get\(\) != 0\s+\{\n'
+                     r'\s+self\.work\.lock\(\)\.object\.retain_until_stop\(pool\);\n'
                      r'\s+\} else if let Some\(mark\) = &self\.work_mark \{\n'
                      r'\s+mark\.released\(super::channel::control_witnessed\(\)\);', linked), linked
     assert context.count('.released(') == 1 and context.count('.retain()') == 1
@@ -831,22 +1035,27 @@ def source_rules(context, observation, tree):
     print('source: records and commands mark the work state; only a consumed empty-list release releases it')
 
 
-def cache_policy(context, compute, memory):
-    """The firmware-cached prefix each pooled G17 object family gets. Returns the failures."""
+def cache_policy(context, compute, memory, runtime, render):
+    """The firmware-cached prefix and recovery retention policy each pooled G17 object family gets."""
     failures = []
 
     def need(text, pattern, what):
         if not re.search(pattern, text):
             failures.append(what)
 
-    # Work nodes: uncached on M5, the node page cached on G17P; the counter page stays uncached.
-    need(context, r'pool\.allocate\(\s*alloc,\s*Family::WorkState,\s*2 \* UAT_PGSZ,\s*'
-         r'if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ UAT_PGSZ \},', 'work nodes: M5 uncached, G17P node page cached')
+    # Work nodes: the node page is cached on every G17; the counter page stays uncached.
+    need(context, r'pool\.allocate\(\s*alloc,\s*Family::WorkState,\s*2 \* UAT_PGSZ,\s*UAT_PGSZ,',
+         'work nodes: node page cached')
     # M5 scheduler pages, which are zeroed and reinitialised on reuse, stay uncached.
     need(context, r'Family::Scheduler,\s*UAT_PGSZ,\s*0,', 'M5 scheduler pages uncached')
-    # Compute descriptors: uncached on M5, cached on G17P.
-    need(compute, r'Family::Descriptor,\s*size,\s*if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ size \},',
-         'compute descriptors: M5 uncached, G17P cached')
+    # Compute descriptors: cached on every G17.
+    need(compute, r'Family::Descriptor,\s*size,\s*size,', 'compute descriptors cached')
+    # A compute queue recycled after kill or quarantine retains its descriptor ring until stop.
+    need(compute, r'pub\(crate\) fn retain_ring_until_stop\(&mut self, pool: &Arc<Pool>\) \{\s*'
+         r'if let Some\(ring\) = self\.graph\.ring\.as_mut\(\) \{\s*'
+         r'ring\.object\.retain_until_stop\(pool\);', 'compute retain_ring_until_stop helper')
+    need(runtime, r'if queue\.recycle_killed\(\)\? \|\| queue\.recycle_quarantined_idle\(\)\? \{\s*'
+         r'queue\.retain_ring_until_stop\(&self\.pool\);', 'recycled compute queues retain descriptor ring until stop')
     # The compute graph, whose queue record is rebound in place, is an ordinary uncached allocation.
     need(compute, r'let mut graph = alloc\.kernel\(GRAPH_SIZE \+ mmu::UAT_PGSZ, page, prot, cpu\)\?;',
          'compute graph uncached')
@@ -854,6 +1063,24 @@ def cache_policy(context, compute, memory):
         failures.append('compute graph not pooled')
     # Render queue records, retargeted and bound to work slots in place, stay uncached.
     need(memory, r'Family::QueueState,\s*GRAPH_SIZE,\s*0,\s*prot,', 'render queue records uncached')
+    # Stampless render retains its WorkStateLease until post-maintenance stamps arrive,
+    # and every unstamped drain path pins the slot via pin_until_stop() (same-context + cross-context).
+    need(render, r'if stampless \{[^}]*front\.stamps_owed_work = Some\(front\.packet\.completion\.work_state\(\)\?\);[^}]*\}\s*defer\(Deferred::Retired\(',
+         'stampless render retains WorkStateLease across stamps_owed')
+    need(render, r'if active\.stamps_owed \{\s*if let Some\(work\) = &active\.stamps_owed_work \{\s*work\.pin_until_stop\(\);',
+         'stampless render drain pins WorkStateLease until stop')
+    need(render, r'fn fail_dropped\([\s\S]*?work\.pin_until_stop\(\);',
+         'fail_dropped pins WorkStateLease until stop')
+    need(render, r'fn settle_interrupted_front\([\s\S]*?work\.pin_until_stop\(\);',
+         'settle_interrupted_front pins WorkStateLease until stop')
+    need(render, r'fn fail_after_observation\([\s\S]*?work\.pin_until_stop\(\);',
+         'fail_after_observation pins WorkStateLease until stop')
+    need(context, r'pub\(crate\) fn pin_until_stop\(&self\) \{\s*self\.pinned\.store\(true, Ordering::Release\);\s*self\.context\.note_stampless_drain\(\);\s*\}',
+         'WorkStateLease::pin_until_stop sets pinned and stampless_drained')
+    need(context, r'if self\.pinned\.load\(Ordering::Acquire\) \{\s*self\.context\.pin_state\(word, engine\);',
+         'WorkStateLease::drop pins slot on unstamped drain')
+    need(context, r'if self\.context\.states\.exhausted\(\) \{\s*return Err\(EIO\);\s*\}',
+         'WorkStateLease::acquire fails cleanly when all slots are pinned')
     return failures
 
 
@@ -871,33 +1098,39 @@ def main():
     source_rules(ctx, observation, DRIVER)
 
     policy = {'context': ctx, 'compute': (DRIVER / 'g17/queue/compute.rs').read_text(),
-              'memory': (DRIVER / 'g17/queue/render/memory.rs').read_text()}
+              'memory': (DRIVER / 'g17/queue/render/memory.rs').read_text(),
+              'runtime': (DRIVER / 'g17/runtime.rs').read_text(),
+              'render': (DRIVER / 'g17/queue/render.rs').read_text()}
     if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
         where, old, new = MUTATIONS[args.mutation]
         policy[where[len('policy-'):]] = replace(policy[where[len('policy-'):]], old, new)
-    failures = cache_policy(policy['context'], policy['compute'], policy['memory'])
+    failures = cache_policy(policy['context'], policy['compute'], policy['memory'],
+                            policy['runtime'], policy['render'])
     for failure in failures:
         print(f'FAIL line 0: cache policy: {failure}')
     if failures:
         return 1
     print('cache policy: in-place rewritten records uncached everywhere; work nodes and compute descriptors '
-          'uncached on M5 and cached on G17P')
+          'cached on every G17')
     if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
         return 0
 
     now = pool_source(obj)
     pages, methods, node = context_source(ctx)
+    ident = identity_source((DRIVER / 'g17/context/identity.rs').read_text())
     if args.mutation:
         where, old, new = MUTATIONS[args.mutation]
         if where == 'object':
             now = replace(now, old, new)
+        elif where == 'identity':
+            ident = replace(ident, old, new)
         else:
             methods, node = (replace(methods, old, new), node) if old in methods else (methods, replace(node, old, new))
     channel = '\n'.join(re.search(r'(?ms)^(?:///[^\n]*\n)*static ' + name + r': AtomicU64 = AtomicU64::new\(0\);', chan).group(0)
                         for name in ['CONTROL_PUBLISHED', 'CONTROL_CONSUMED'])
     channel += '\n' + '\n'.join(block(chan, 'pub(crate) fn ' + name + '()')
                                 for name in ['control_fence', 'control_published', 'control_witnessed'])
-    code = (PRELUDE.replace('@CHANNEL@', channel).replace('@BASE@', pool_source(base)).replace('@NOW@', now)
+    code = (PRELUDE.replace('@CHANNEL@', channel).replace('@IDENTITY@', ident).replace('@BASE@', pool_source(base)).replace('@NOW@', now)
             .replace('@PAGES@', pages).replace('@METHODS@', methods).replace('@NODE@', node))
 
     with tempfile.TemporaryDirectory() as work:

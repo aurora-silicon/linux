@@ -362,10 +362,14 @@ ASAHI_TESTS = {
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
-        + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
-                                   'node-unmarked', 'no-release', 'm5-cached-nodes',
-                                   'm5-cached-descriptors', 'cached-queue-records',
-                                   'uncached-g17p-nodes'), []),
+        + mutations('--mutation', ('overrun-work-states', 'overrun-cached-prefix', 'unseen-strict',
+                                   'retain-not-sticky', 'node-unmarked', 'no-release',
+                                   'reuse-killed-work-state', 'reuse-stampless-drained-work-state',
+                                   'reuse-failed-work-state', 'drop-stampless-work-lease',
+                                   'drop-stampless-drain-pin', 'same-context-reuse-pinned-slot',
+                                   'reuse-recycled-descriptor-ring', 'uncached-nodes',
+                                   'uncached-descriptors', 'cached-queue-records',
+                                   'cached-scheduler'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.

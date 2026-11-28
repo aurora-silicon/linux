@@ -214,6 +214,9 @@ pub(crate) struct Context {
     /// A kill of this context was published, through a compute queue or on its render pairs'
     /// behalf. A context is killed at most once.
     kill_published: AtomicBool,
+    /// A stampless-retired render group of this context was later released through pair-wide
+    /// drain instead of observing post-maintenance completion stamps.
+    stampless_drained: AtomicBool,
     /// The host's recovery generation when it first saw the kill of this context done (its
     /// scheduler page's killed state), `u64::MAX` before ([`Self::restarted_since_kill`]).
     kill_seen: AtomicU64,
@@ -313,18 +316,23 @@ impl Context {
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
         // Both firmware and host write work nodes (reused every 63 submissions
-        // and zeroed on pool reuse). M5 keeps the whole work-state object
-        // uncached. G17P maps the node page firmware-cached: the host rewrites
-        // a node only after `WorkStorage::drained` has read the firmware's
-        // final `completed` count from memory, and zeroes a returned object
-        // only once its pool fence is met, so it never rewrites a node the
-        // firmware is still updating. The counter page, which the host writes
-        // on every kick, stays uncached.
+        // and zeroed on pool reuse). Map the node page firmware-cached on all
+        // G17 (G17P and M5): within a context a node slot is rewritten only
+        // after every command holding its `WorkStateLease` has retired with
+        // post-maintenance completion stamps (including stampless render, where
+        // `Active` retains `WorkStateLease` until those stamps arrive; any
+        // unstamped drain pins the slot via `WorkStateLease::pin_until_stop` so
+        // later submissions in the same context never acquire it). Across
+        // contexts, `Pool::allocate` never overruns a pool fence for
+        // firmware-cached objects, and `retain_linked_work` keeps a killed,
+        // failed, stampless-drained, or still-linked context's work storage
+        // out of pool reuse until firmware stop. The counter page, which the
+        // host writes on every kick, stays uncached.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            if alloc.uat.is_m5() { 0 } else { UAT_PGSZ },
+            UAT_PGSZ,
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
@@ -366,6 +374,7 @@ impl Context {
             scheduler_generation,
             published: AtomicBool::new(false),
             kill_published: AtomicBool::new(false),
+            stampless_drained: AtomicBool::new(false),
             kill_seen: AtomicU64::new(u64::MAX),
             closed_generation: AtomicU64::new(u64::MAX),
             closed_for_open_client: AtomicBool::new(false),
@@ -530,8 +539,16 @@ impl Context {
     /// cursor snapshot that proved the release consumed, so the witness already covers it.
     pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
         // An unreadable head counts as linked: retaining is the safe side.
+        // A killed context, stampless-drained render context, or failed VM may
+        // leave firmware-cached work nodes dirty without a normal stamped
+        // completion: keep the storage out of reuse until firmware stop even if
+        // the list head is empty.
         let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_address()]);
-        if linked {
+        if linked
+            || self.kill_published()
+            || self.stampless_drained()
+            || self.status.get() != 0
+        {
             self.work.lock().object.retain_until_stop(pool);
         } else if let Some(mark) = &self.work_mark {
             mark.released(super::channel::control_witnessed());
@@ -581,6 +598,16 @@ impl Context {
     /// A kill of this context was published.
     pub(crate) fn kill_published(&self) -> bool {
         self.kill_published.load(Ordering::Acquire)
+    }
+
+    /// Record that a stampless-retired render group was released via pair-wide drain.
+    pub(crate) fn note_stampless_drain(&self) {
+        self.stampless_drained.store(true, Ordering::Release);
+    }
+
+    /// A stampless-retired render group of this context was released via pair-wide drain.
+    pub(crate) fn stampless_drained(&self) -> bool {
+        self.stampless_drained.load(Ordering::Acquire)
     }
 
     /// This context's queue closed at the host's recovery `generation`, under the device mutex:
@@ -722,6 +749,9 @@ pub(crate) struct WorkStateLease {
     word: AtomicU32,
     /// Index of the engine whose admission took the node, valid once `word` is set.
     engine: AtomicU8,
+    /// Retired through an unstamped drain: keep the slot out of same-context
+    /// reuse when this lease drops instead of returning it to `WorkStates`.
+    pinned: AtomicBool,
     /// The ioctl's place in its context's submission order.
     ordinal: u64,
 }
@@ -736,6 +766,7 @@ impl WorkStateLease {
             context,
             word: AtomicU32::new(FREE),
             engine: AtomicU8::new(0),
+            pinned: AtomicBool::new(false),
             ordinal,
         })
     }
@@ -757,6 +788,9 @@ impl WorkStateLease {
         let mut order = self.context.order.lock();
         if !order.admits(self.ordinal) {
             return Err(EBUSY);
+        }
+        if self.context.states.exhausted() {
+            return Err(EIO);
         }
         let engine = engine.index();
         let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
@@ -860,12 +894,25 @@ impl WorkStateLease {
             .payload(pair, ordinal)
             .ok_or(EINVAL)
     }
+    /// Keeps this lease's work-state slot out of reuse within its context and
+    /// retains the context's work storage out of pool reuse until firmware stop.
+    /// Used on unstamped drain paths whose cached work node may still hold dirty
+    /// firmware cache lines.
+    pub(crate) fn pin_until_stop(&self) {
+        self.pinned.store(true, Ordering::Release);
+        self.context.note_stampless_drain();
+    }
 }
 impl Drop for WorkStateLease {
     fn drop(&mut self) {
         let word = self.word();
         if word != FREE {
-            self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
+            let engine = usize::from(self.engine.load(Ordering::Relaxed));
+            if self.pinned.load(Ordering::Acquire) {
+                self.context.pin_state(word, engine);
+            } else {
+                self.context.release_state(word, engine);
+            }
         } else if self.context.order.lock().leave(self.ordinal) {
             self.context.pass_turn();
         }
@@ -877,6 +924,13 @@ impl Context {
     /// failed acquire() then never sleeps through this node.
     fn release_state(&self, word: u32, engine: usize) {
         if self.states.release(word, engine) {
+            self.state_returns.notify();
+        }
+    }
+    /// Retires a slot without returning its index to `allocate`: decrementing
+    /// `held[engine]` may still satisfy `may_take(1, 0)` for a waiting engine.
+    fn pin_state(&self, word: u32, engine: usize) {
+        if self.states.pin(word, engine) {
             self.state_returns.notify();
         }
     }

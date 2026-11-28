@@ -183,6 +183,7 @@ pub struct Completion {
     signalled: AtomicBool,
     accepted: AtomicBool,
     spared: AtomicBool,
+    work: Arc<WorkStateLease>,
     result: Mutex<Option<Result<[u64; 4]>>>,
 }
 fn discarded(error: Error) -> bool { error == ECANCELED || error == ENODATA }
@@ -192,6 +193,7 @@ impl Completion {
     fn status(&self) -> &Arc<Status> { &self.status }
     fn report(&self, _: Error) {}
     fn signal_terminal(&self, result: Result<[u64; 4]>) { *self.result.lock() = Some(result); }
+    fn work_state(&self) -> Result<Arc<WorkStateLease>> { Ok(self.work.clone()) }
     /// The lease handling of the real complete_with_compute (checked against it above).
     fn complete(&self, result: Result<[u64; 4]>) -> bool { self.complete_with_compute(result, None) }
     fn complete_with_compute(&self, result: Result<[u64; 4]>, _: Option<[u64; 2]>) -> bool {
@@ -204,12 +206,27 @@ impl Completion {
     }
 ''' + command + '\n}\n' + item(completion, 'pub(crate) enum Deferred {') + '\n' + item(completion, 'impl Deferred {') + r'''
 
-pub struct Packet { completion: Arc<Completion> }
+pub struct Context { stampless_drained: AtomicBool }
+impl Context {
+    fn note_stampless_drain(&self) { self.stampless_drained.store(true, Ordering::Release); }
+}
+pub struct WorkStateLease {
+    context: Arc<Context>,
+    pinned: AtomicBool,
+}
+impl WorkStateLease {
+    fn pin_until_stop(&self) {
+        self.pinned.store(true, Ordering::Release);
+        self.context.note_stampless_drain();
+    }
+}
+pub struct Packet { completion: Arc<Completion>, context: Arc<Context> }
 pub struct Ticket { ordinal: u64 }
 pub struct Active {
     packet: Arc<Packet>,
     ticket: Ticket,
     stamps_owed: bool,
+    stamps_owed_work: Option<Arc<WorkStateLease>>,
     failed: bool,
     flist_completed: bool,
     drained_result: Option<Result<[u64; 4]>>,
@@ -301,20 +318,23 @@ fn command(pool: &Arc<Pool>, lease: RenderLease) -> Command {
     let pin = Arc::new(Mutex::new(None));
     let vm = Arc::new(AtomicBool::new(false));
     let guard = VmJobGuard { pool: pool.clone(), slot: lease.slot(), quarantined: pin.clone(), vm: vm.clone() };
+    let context = Arc::new(Context { stampless_drained: AtomicBool::new(false) });
+    let work = Arc::new(WorkStateLease { context, pinned: AtomicBool::new(false) });
     let completion = Arc::new(Completion {
         status: Arc::new(Status), output: Output, sources: Some(Arc::new(Sources)),
         vm_job: Mutex::new(Some(guard)), render: Mutex::new(Some(lease)),
         is_compute: false,
         signalled: AtomicBool::new(false), accepted: AtomicBool::new(true), spared: AtomicBool::new(false),
+        work,
         result: Mutex::new(None),
     });
     Command { completion, pin, vm }
 }
 fn firmware(pool: &Arc<Pool>, commands: &[(&Command, u64)]) -> Firmware {
     let active = commands.iter().map(|(command, ordinal)| Active {
-        packet: Arc::new(Packet { completion: command.completion.clone() }),
+        packet: Arc::new(Packet { completion: command.completion.clone(), context: command.completion.work.context.clone() }),
         ticket: Ticket { ordinal: *ordinal },
-        stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
+        stamps_owed: false, stamps_owed_work: None, failed: false, flist_completed: false, drained_result: None,
     }).collect();
     let pair = Pair { quarantined: false, active: Ring(active), terminal: None, memory: Memory { retired: Vec::new() },
                       drain_failures: 0, drain_retry_at: 0, guilty_released: false,
@@ -326,6 +346,7 @@ fn batch() -> DeferredBatch { DeferredBatch { values: Vec::new() } }
 fn stampless_retirement(firmware: &mut Firmware, deferred: &mut DeferredBatch) {
     let front = firmware.pair.as_mut().unwrap().active.front_mut().unwrap();
     front.flist_completed = true;
+    front.stamps_owed_work = Some(front.packet.completion.work_state().unwrap());
     deferred.push(Deferred::Retired(front.packet.completion.clone(), Ok(TICKS))).unwrap();
     front.stamps_owed = true;
 }
@@ -412,6 +433,10 @@ fn witness_before_the_retirement() {
     pool.release_owner(OWNER);
     firmware.host.drained = true;
     firmware.release_drained_render(usize::from(slot), &mut deferred).unwrap();
+    assert!(command.completion.work.pinned.load(Ordering::Acquire),
+            "pair-wide drain pins the stampless work-state lease against same-context reuse");
+    assert!(command.completion.work.context.stampless_drained.load(Ordering::Acquire),
+            "pair-wide drain marks the context stampless-drained for cross-context retention");
     assert!(quarantined(&pool, slot), "a lease of the slot is still held");
     assert_ne!(pool.state.lock().drained & bit(slot), 0);
     deferred.finish();

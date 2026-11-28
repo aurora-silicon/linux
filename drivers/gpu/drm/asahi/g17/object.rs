@@ -735,9 +735,10 @@ impl Pool {
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
     /// returned longest ago once its fence is met (see `return_object`); a younger one is
-    /// reused only when the family has no room for a fresh pooled object, because an
-    /// unpooled one is unmapped as soon as its owner drops it. On the A18 Pro a work state is
-    /// never reused before its fence: with no room, a fresh one stays unpooled instead.
+    /// reused only when the family has no room for a fresh pooled object and the object
+    /// is uncached, because an unpooled one is unmapped as soon as its owner drops it.
+    /// Firmware-cached objects (`prefix != 0`), and A18 Pro work states, are never reused
+    /// before their fence: with no room, a fresh one stays unpooled (and uncached) instead.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -751,8 +752,11 @@ impl Pool {
         let begin = family_index * POOL_SLOTS;
         let witnessed = super::channel::control_witnessed();
         // On the A18 Pro a cached work state carries a ReturnMark, allocated before an entry is
-        // taken so that a failure loses no returned object, and is never reused before its fence.
+        // taken so that a failure loses no returned object. Firmware-cached objects (`prefix != 0`)
+        // are also never reused before their fence: zeroing one while a previous owner's release
+        // is unconsumed risks a delayed firmware writeback reverting host writes.
         let marked = self.after_release && family == Family::WorkState;
+        let no_overrun = marked || prefix != 0;
         let mark = if marked {
             Some(kernel::sync::Arc::new(ReturnMark::new(), GFP_KERNEL)?)
         } else {
@@ -783,7 +787,7 @@ impl Pool {
                 }
             }
             match oldest {
-                Some((index, _, ready)) if ready || (!room && !marked) => {
+                Some((index, _, ready)) if ready || (!room && !no_overrun) => {
                     if !ready {
                         inner.fence_overruns[family_index] += 1;
                     }
