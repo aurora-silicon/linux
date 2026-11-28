@@ -105,7 +105,11 @@ struct macsmc_power {
 	/*
 	 * Where neither CHTE nor CH0C exists, inhibit-charge holds the charge
 	 * at the current level with CHLS_HOLD; the user's own CHLS limit is
-	 * kept here meanwhile and restored when the hold ends.
+	 * kept here meanwhile and restored when the hold ends. It is kept in
+	 * RAM only: the SMC has no spare key for it. If the driver binds while
+	 * a hold from an earlier boot or binding is still set, the earlier
+	 * limit is unknown, so the end threshold reads 100 and ending the hold
+	 * leaves no limit. Userspace that sets both should set the limit again.
 	 */
 	u8 chls_user_limit;
 	/* Battery critical key (BCF0) is 1 byte (Modern firmware) */
@@ -1116,10 +1120,10 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		return ret;
 	dev_set_drvdata(dev, power);
 
-	INIT_WORK(&power->critical_work, macsmc_power_critical_work);
 	ret = devm_work_autocancel(dev, &power->critical_work, macsmc_power_critical_work);
 	if (ret)
 		return ret;
+	INIT_DELAYED_WORK(&power->dbg_log_work, macsmc_dbg_work);
 
 	/*
 	 * Check for battery presence.
@@ -1225,7 +1229,11 @@ static int macsmc_power_probe(struct platform_device *pdev)
 				     of_machine_is_compatible("apple,j700");
 		power->status_from_current = of_machine_is_compatible("apple,j700");
 
-		/* Preserve firmware charge policy until userspace changes it. */
+		/*
+		 * Preserve firmware charge policy until userspace changes it:
+		 * the inhibitors (CHTE, CH0C, CH0I) and CH0K/CH0B persist in the
+		 * SMC, and binding the driver is not a request to reset them.
+		 */
 		/* Detect charge limit method (CHWA vs CHLS) */
 		if (apple_smc_read_flag(power->smc, SMC_KEY(CHWA), &flag) == 0)
 			power->has_chwa = true;
@@ -1235,6 +1243,8 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		if (power->has_chls && (vu16 & CHLS_FORCE_DISCHARGE) &&
 		    !macsmc_chls_has_limit(vu16))
 			dev_warn(dev, "CHLS force-discharge without a limit; select charge_behaviour=auto to clear\n");
+		if (power->has_chls && macsmc_chls_holds(power, vu16))
+			dev_info(dev, "CHLS holds the charge from an earlier boot; the charge limit before it is not known\n");
 
 		/*
 		 * CHLS carries auto-discharge, so a CHLS-only Mac can select auto
@@ -1325,11 +1335,9 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	if (!power->batt && !power->ac)
 		return -ENODEV;
 
+	/* Both work items were set up above, before anything can queue them. */
 	power->nb.notifier_call = macsmc_power_event;
 	blocking_notifier_chain_register(&smc->event_handlers, &power->nb);
-
-	INIT_WORK(&power->critical_work, macsmc_power_critical_work);
-	INIT_DELAYED_WORK(&power->dbg_log_work, macsmc_dbg_work);
 
 	g_power = power;
 
@@ -1343,12 +1351,16 @@ static void macsmc_power_remove(struct platform_device *pdev)
 {
 	struct macsmc_power *power = dev_get_drvdata(&pdev->dev);
 
-	cancel_work(&power->critical_work);
-	cancel_delayed_work(&power->dbg_log_work);
-
+	/*
+	 * Stop new work first: the notifier queues the critical work and the
+	 * log_power parameter queues the log through g_power. The debug work
+	 * re-arms itself, so disable it and wait, as devm frees power next.
+	 */
+	blocking_notifier_chain_unregister(&power->smc->event_handlers, &power->nb);
 	g_power = NULL;
 
-	blocking_notifier_chain_unregister(&power->smc->event_handlers, &power->nb);
+	disable_delayed_work_sync(&power->dbg_log_work);
+	cancel_work_sync(&power->critical_work);
 }
 
 /*

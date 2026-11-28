@@ -108,6 +108,14 @@ struct dcp_audio {
 	struct delayed_work void_work;
 	/* The stream holds a runtime PM reference, put in sync_stop; stream lock */
 	bool pm_held;
+	/* The service instance the stream's link started on; stream lock */
+	u64 start_gen;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* Ends a stream on a replaced instance, see dcpaud_replaced_work() */
+	struct work_struct replaced_work;
+	/* replaced_work is enabled: the card is bound, see dcpaud_comp_unbind() */
+	bool replaced_enabled;
+#endif
 	void *elements;
 	void *productattrs;
 
@@ -738,7 +746,7 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			dcpaud->pm_held = true;
 		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
-					     &dcpaud->selected_cookie);
+					     &dcpaud->selected_cookie, &dcpaud->start_gen);
 		if (ret < 0)
 			return ret;
 		break;
@@ -1905,6 +1913,36 @@ err_free_card:
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * The firmware publishes a successor of the audio service while the display
+ * link is set up again, also with the sink connected throughout (after a
+ * wake, the monitor's HPD pulse). The successor comes up plugged, so the card
+ * sees no unplug; the link a running stream started on went with the old
+ * instance, its DMA stops and the stream would wait forever. It ends as an
+ * xrun instead, and userspace prepares it again on the successor.
+ */
+static void dcpaud_replaced_work(struct work_struct *work)
+{
+	struct dcp_audio *dcpaud = container_of(work, struct dcp_audio, replaced_work);
+	struct snd_pcm_substream *substream = dcpaud->substream;
+
+	if (!substream || !dcpaud->dcp_dev)
+		return;
+	/*
+	 * Under the stream lock (a mutex: the PCM is nonatomic), as START
+	 * takes the instance under it: no START completes in between.
+	 */
+	snd_pcm_stream_lock_irq(substream);
+	if (substream->runtime && snd_pcm_running(substream) && !dcpaud->void_running &&
+	    dcpaud->start_gen != dcp_audiosrv_instance(dcpaud->dcp_dev)) {
+		dev_dbg(dcpaud->dev, "stream's link went with its service\n");
+		snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+	}
+	snd_pcm_stream_unlock_irq(substream);
+}
+#endif
+
 void dcpaud_connect(struct platform_device *pdev, bool connected)
 {
 	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
@@ -1918,6 +1956,11 @@ void dcpaud_connect(struct platform_device *pdev, bool connected)
 	mutex_lock(&dcpaud->data_lock);
 
 	dcpaud_report_hotplug(dcpaud, connected, eld);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* A connect follows each newly opened instance; see dcpaud_replaced_work() */
+	if (connected && !dcpaud->native_link && dcpaud->card)
+		schedule_work(&dcpaud->replaced_work);
+#endif
 }
 
 /*
@@ -2056,6 +2099,11 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = dcpaud_init_snd_card(dcpaud);
 
 	if (!ret) {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		/* Connects may queue it from now on, with a card to act on. */
+		enable_work(&dcpaud->replaced_work);
+		dcpaud->replaced_enabled = true;
+#endif
 		dcpaud_expose_debugfs_blob(dcpaud, "selected_cookie", &dcpaud->selected_cookie,
 					sizeof(dcpaud->selected_cookie));
 		dcpaud_expose_debugfs_blob(dcpaud, "elements", dcpaud->elements,
@@ -2075,6 +2123,17 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 {
 	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/*
+	 * The DCP unbinds after its audio and may still connect: a connect
+	 * from now on queues nothing, and a queued or running work ends
+	 * before the card goes.
+	 */
+	if (dcpaud->replaced_enabled) {
+		disable_work_sync(&dcpaud->replaced_work);
+		dcpaud->replaced_enabled = false;
+	}
+#endif
 	/* snd_card_free_when_closed() checks for NULL */
 	snd_card_free_when_closed(dcpaud->card);
 
@@ -2143,6 +2202,9 @@ static int dcpaud_probe(struct platform_device *pdev)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	mutex_init(&dcpaud->link_lock);
 	INIT_WORK(&dcpaud->stale_work, dcpaud_stale_work);
+	INIT_WORK(&dcpaud->replaced_work, dcpaud_replaced_work);
+	/* Enabled once the card is bound, see dcpaud_comp_bind() */
+	disable_work(&dcpaud->replaced_work);
 #endif
 	INIT_DELAYED_WORK(&dcpaud->void_work, dcpaud_void_work);
 	platform_set_drvdata(pdev, dcpaud);

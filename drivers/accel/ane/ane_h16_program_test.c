@@ -16,6 +16,8 @@
 #define FW_IPC_DVA 0x100003d0000ULL
 #define FW_POOL_DVA 0x10000384000ULL
 #define FW_MAP_DVA 0x10001f00000ULL
+/* Shared (SHAREDMALLOC) allocations, far above the program mappings. */
+#define FW_SHARED_DVA 0x10010000000ULL
 #define FW_RING_SLOTS 8
 #define FW_REPORTS 0x8000
 
@@ -90,6 +92,22 @@ struct prog_fw {
 	 */
 	u64 live, window;
 	unsigned int unmaps, map_fail_at;
+	/*
+	 * SHAREDMALLOC: with expp, CREATE asks for a 2 MiB EXPP pool and is
+	 * answered only once the host served it, and UNLOAD frees the pool
+	 * again, as the H16/H17 firmware does. irq holds the pending
+	 * notification bits; allocs counts ops->alloc calls, alloc_fail
+	 * makes them fail with -ENOMEM.
+	 */
+	bool expp, alloc_fail;
+	u32 irq;
+	u64 shared_dva;
+	unsigned int allocs;
+	/* The CREATE waiting for its pool, by IO slot; its program ID. */
+	u8 *create_slot;
+	u64 create_length, create_dva;
+	u32 create_program;
+	u64 expp_dva[32];
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -108,7 +126,9 @@ static void fw_barrier(void *ctx)
 
 static u32 fw_read32(void *ctx, u32 reg)
 {
-	return 0;
+	struct prog_fw *f = ctx;
+
+	return reg == f->soc.irq_status ? f->irq : 0;
 }
 
 static u8 *fw_slot(struct prog_fw *f, unsigned int ch)
@@ -119,6 +139,17 @@ static u8 *fw_slot(struct prog_fw *f, unsigned int ch)
 static void fw_advance(struct prog_fw *f, unsigned int ch)
 {
 	f->head[ch] = (f->head[ch] + 1) % f->t.channels[ch].slots;
+}
+
+/* A SHAREDMALLOC request in the firmware's next slot, notified. */
+static void fw_shared_post(struct prog_fw *f, u64 word0, u64 bytes, u64 tag)
+{
+	u8 *slot = fw_slot(f, ANE_FW_SHAREDMALLOC);
+
+	put_unaligned_le64(bytes, slot + 8);
+	put_unaligned_le64(tag, slot + 16);
+	put_unaligned_le64(word0, slot);
+	f->irq |= BIT(ANE_FW_SHAREDMALLOC);
 }
 
 static void fw_report(struct prog_fw *f, u64 uuid, u32 program, u32 process, u32 state)
@@ -235,8 +266,16 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 					   cmd + ANE_H16_LOAD_ID_OFFSET);
 		break;
 	case ANE_H16_UNLOAD_PROGRAM:
-		if (get_unaligned_le32(cmd + 8) - f->program < 32)
-			f->programs_live &= ~BIT(get_unaligned_le32(cmd + 8) - f->program);
+		if (get_unaligned_le32(cmd + 8) - f->program < 32) {
+			u32 i = get_unaligned_le32(cmd + 8) - f->program;
+
+			f->programs_live &= ~BIT(i);
+			/* The pool comes back by FREE, after the UNLOAD reply. */
+			if (f->expp && f->expp_dva[i]) {
+				fw_shared_post(f, f->expp_dva[i], 0, 0);
+				f->expp_dva[i] = 0;
+			}
+		}
 		break;
 	case ANE_H16_TERMINATE_PROCESS:
 		if (get_unaligned_le32(cmd + 0xc) - f->process < 32)
@@ -247,6 +286,16 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 		put_unaligned_le32(fw_take_id(&f->processes_live, f->process), cmd + 0xc);
 		if (f->mode == FW_CREATE_BODY)
 			cmd[0x100] = 1;
+		if (f->expp) {
+			/* No reply until the host served the process pool. */
+			f->create_slot = slot;
+			f->create_length = length;
+			f->create_dva = dva;
+			f->create_program = get_unaligned_le32(cmd + 8);
+			fw_shared_post(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+			fw_advance(f, ch);
+			return;
+		}
 		break;
 	case ANE_H16_EXECUTE:
 		f->exec_length = min_t(size_t, length, sizeof(f->exec));
@@ -261,12 +310,35 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 		fw_execute(f, cmd);
 }
 
+/* The host answered the SHAREDMALLOC slot; a CREATE waiting for it completes. */
+static void fw_shared_answered(struct prog_fw *f)
+{
+	u8 *slot = fw_slot(f, ANE_FW_SHAREDMALLOC);
+	u64 word0 = get_unaligned_le64(slot);
+
+	if (!(word0 & 1))
+		return;
+	fw_advance(f, ANE_FW_SHAREDMALLOC);
+	if (word0 == 1 || !f->create_slot)
+		return;
+	if (f->create_program - f->program < 32)
+		f->expp_dva[f->create_program - f->program] = word0 & ~1ULL;
+	put_unaligned_le64(f->create_length, f->create_slot + 8);
+	put_unaligned_le64(0, f->create_slot + 16);
+	put_unaligned_le64(f->create_dva | 1, f->create_slot);
+	f->create_slot = NULL;
+}
+
 static void fw_write32(void *ctx, u32 reg, u32 value)
 {
 	struct prog_fw *f = ctx;
 
+	if (reg == f->soc.irq_ack)
+		f->irq &= ~value;
 	if (reg != f->soc.doorbell)
 		return;
+	if (value & BIT(ANE_FW_SHAREDMALLOC))
+		fw_shared_answered(f);
 	/* Commands take doorbell_ns to answer; returning report slots is free. */
 	if (value & (BIT(ANE_FW_IO) | BIT(ANE_FW_DATA_CHAIN)))
 		f->now += f->doorbell_ns;
@@ -297,9 +369,22 @@ static void fw_relax(void *ctx, u64 waited_ns)
 	}
 }
 
+static void *fw_zalloc(struct kunit *test, size_t size);
+
 static int fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
 {
-	return -ENOMEM;
+	struct prog_fw *f = ctx;
+
+	f->allocs++;
+	if (f->alloc_fail)
+		return -ENOMEM;
+	*s = (struct ane_fw_surface) {
+		.cpu = fw_zalloc(f->test, size), .dva = f->shared_dva, .size = size,
+	};
+	if (!s->cpu)
+		return -ENOMEM;
+	f->shared_dva += size;
+	return 0;
 }
 
 static void fw_refused(void *ctx, u64 w0, u64 w1, u64 w2, int error)
@@ -484,6 +569,7 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 		put_unaligned_le64(f->ipc.dva + 0x800 + i * 0x200, p + 0x50);
 	}
 	f->next_dva = FW_MAP_DVA;
+	f->shared_dva = FW_SHARED_DVA;
 	f->program = 0x11;
 	f->process = 0;
 	if (ane_fw_transport_init(&f->t, &f->soc, &fw_ops, f, f->ipc, f->pool, SZ_16K,
@@ -592,6 +678,15 @@ static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410, 0x38, 0x28 };
 
 #define TEST_GENERIC_BASE 8
 
+/* The procedure and text-properties sections a host builder writes for hwx. */
+static void fixed_fill(const struct ane_h16_hwx *hwx)
+{
+	ane_h16_fixed_sections(hwx, test_aux[ANE_H16_AUX_PROCEDURE],
+			       test_aux[ANE_H16_AUX_TEXT_PROPERTIES]);
+	test_aux_size[ANE_H16_AUX_PROCEDURE] = ANE_H16_PROCEDURE_SIZE;
+	test_aux_size[ANE_H16_AUX_TEXT_PROPERTIES] = ANE_H16_PROPERTIES_SIZE;
+}
+
 static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snapshot,
 			    struct ane_h16_program **p)
 {
@@ -604,6 +699,7 @@ static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snap
 	test_aux_size[ANE_H16_AUX_OPERATION] =
 		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
 			       TEST_GENERIC_BASE);
+	fixed_fill(&hwx);
 	return ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size, p);
 }
 
@@ -1248,6 +1344,7 @@ static void program_scratch_test(struct kunit *test)
 	put_unaligned_le32(TEST_GENERIC_BASE + 2, e + 4);
 
 	test_aux_size[ANE_H16_AUX_GENERIC] = size;
+	fixed_fill(hwx);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size,
 						   &p), 0);
 	KUNIT_ASSERT_TRUE(test, p->has_scratch);
@@ -1328,6 +1425,7 @@ static void program_bad_operation_test(struct kunit *test)
 	test_aux_size[ANE_H16_AUX_OPERATION] =
 		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
 			       TEST_GENERIC_BASE);
+	fixed_fill(&hwx);
 	/* One record more than the section carries. */
 	put_unaligned_le32(get_unaligned_le32(test_aux[ANE_H16_AUX_OPERATION]) + 1,
 			   test_aux[ANE_H16_AUX_OPERATION]);
@@ -1401,6 +1499,68 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fail_reports, 0);
 	KUNIT_EXPECT_EQ(test, f->fail_state, U32_MAX);
 	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
+}
+
+/*
+ * The sysfs ane_stats counters take every request that reached the firmware,
+ * a failed one too, but not one refused before it: a client retrying on a
+ * quarantined engine does not inflate them. Resetting the debugfs statistics
+ * leaves them alone, and nothing stays in flight after either outcome.
+ */
+static void program_sysfs_stats_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	u64 busy;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 0LL);
+	KUNIT_EXPECT_EQ(test, ane_stats_snapshot(&f->s.sysfs_ctrs), 0ULL);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+	busy = ane_stats_snapshot(&f->s.sysfs_ctrs);
+	ane_h16_session_stats(&f->s, NULL, true);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 2LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+	KUNIT_EXPECT_GE(test, ane_stats_snapshot(&f->s.sysfs_ctrs), busy);
+
+	f->mode = FW_OK;
+	KUNIT_EXPECT_LT(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 2LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
+}
+
+/*
+ * With the gate held open by earlier requests, the EXECUTE is the request's
+ * first firmware traffic: a request that fails locally before it went out
+ * (here no UUID is left for its pending entry) sent nothing and does not
+ * count in ane_stats.
+ */
+static void program_sysfs_stats_held_gate_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	unsigned int sent;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.gate_hold_ns = 1000;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_ASSERT_TRUE(test, f->s.gate_held);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	f->s.pending.next_uuid = U64_MAX;
+	sent = f->count;
+	KUNIT_EXPECT_LT(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&f->s.sysfs_ctrs.jobs), 1LL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->s.sysfs_ctrs.inflight), 0);
 }
 
 /* The phases of one EXECUTE add up, and only successful ones are accounted. */
@@ -1613,6 +1773,68 @@ static void program_pool_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->count, sent + 2);
 }
 
+/* The add-128 source 1 base record: [0x4d10, 0x4d14], relocated on BAR slot 6. */
+#define ADD128_SRC1 (0x4d10 / 4 | 1 << 15 | BIT(29) | 6 << 23)
+
+/*
+ * Run the LOAD checks of the add-128 program with its source 1 base record
+ * header and offset replaced. The operation section binds x, y, z to slots
+ * 6, 7, 8; source 1 reads 128 rows of 0x100 bytes, all 32 KiB of x.
+ */
+static int add128_dma_load(struct kunit *test, u32 header, u64 offset)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	u8 *hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs),
+			       ADD128_HWX_SIZE);
+	u8 *generic = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+				   ADD128_GENERIC_SIZE);
+	u8 *operation = sparse_bytes(test, add128_operation_runs,
+				     ARRAY_SIZE(add128_operation_runs), ADD128_OPERATION_SIZE);
+	unsigned int count;
+	size_t at;
+	int ret;
+
+	if (!snapshot || !hwx || !generic || !operation)
+		return -ENOMEM;
+	for (at = 0; at + 12 <= ADD128_HWX_SIZE; at += 4)
+		if (get_unaligned_le32(hwx + at) == ADD128_SRC1)
+			break;
+	if (at + 12 > ADD128_HWX_SIZE)
+		return -ENOENT;
+	put_unaligned_le32(header, hwx + at);
+	put_unaligned_le64(offset, hwx + at + 4);
+	ret = ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot);
+	if (ret)
+		return ret;
+	ret = kunit_add_action_or_reset(test, snapshot_free, snapshot);
+	if (ret)
+		return ret;
+	ret = ane_h16_process_bindings(&snapshot->info, generic, ADD128_GENERIC_SIZE, bindings,
+				       &count, &scratch);
+	if (!ret)
+		ret = ane_h16_operation_validate(snapshot, &snapshot->info, operation,
+						 ADD128_OPERATION_SIZE, bindings, count, &scratch);
+	return ret;
+}
+
+/* Each DMA base stays inside the buffer its slot binds, at LOAD and before any mapping. */
+static void program_add128_dma_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0), 0);
+	/* One 64-byte line past the end of x, into z's place, and before x. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x40), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, 0x10000), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1, -0x8000), -ENOEXEC);
+	/* Slot 9, which the operation section does not bind. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, (ADD128_SRC1 & ~(0x3f << 23)) | 9 << 23, 0),
+			-ENOEXEC);
+	/* The base without its relocation: an absolute DVA. */
+	KUNIT_EXPECT_EQ(test, add128_dma_load(test, ADD128_SRC1 & ~(BIT(29) | 0x3f << 23), 0),
+			-ENOEXEC);
+}
+
 static u8 *fw_sparse_large(struct kunit *test, const struct ane_h16_sparse_run *runs,
 			   unsigned int count, size_t size)
 {
@@ -1658,6 +1880,147 @@ static void mobilenet_sections(struct kunit *test, const void *aux[ANE_H16_AUX_C
 			      ARRAY_SIZE(mobilenet_procedure_runs), aux_size[2]);
 	aux[3] = sparse_bytes(test, mobilenet_properties_runs,
 			      ARRAY_SIZE(mobilenet_properties_runs), aux_size[3]);
+}
+
+/*
+ * Every byte of the four host-built sections has its one value. The add128
+ * and mobilenet fixtures' sections from h16-sections.py are the kernel's
+ * procedure and text properties, and any other procedure, text framing or
+ * nonzero reserved byte is refused at LOAD, before anything is mapped or sent.
+ */
+static void program_sections_exact_test(struct kunit *test)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	size_t aux_size[ANE_H16_AUX_COUNT] = {
+		ADD128_GENERIC_SIZE, ADD128_OPERATION_SIZE,
+		ADD128_PROCEDURE_SIZE, ADD128_PROPERTIES_SIZE,
+	};
+	static const size_t generic_bytes[] = { 0x8, 0x100, 0x203 };
+	static const size_t entry_bytes[] = { 0xc, 0x14, 0x1f, 0x28, 0x2c };
+	const void *mobilenet[ANE_H16_AUX_COUNT];
+	size_t mobilenet_size[ANE_H16_AUX_COUNT];
+	struct ane_h16_hwx_snapshot *m = mobilenet_snapshot(test);
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	void *aux[ANE_H16_AUX_COUNT];
+	u8 *hwx, *g, *o, *pr, *tp;
+	unsigned int i, count;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs), ADD128_HWX_SIZE);
+	g = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+			 ADD128_GENERIC_SIZE);
+	o = sparse_bytes(test, add128_operation_runs, ARRAY_SIZE(add128_operation_runs),
+			 ADD128_OPERATION_SIZE);
+	pr = sparse_bytes(test, add128_procedure_runs, ARRAY_SIZE(add128_procedure_runs),
+			  ADD128_PROCEDURE_SIZE);
+	tp = sparse_bytes(test, add128_properties_runs, ARRAY_SIZE(add128_properties_runs),
+			  ADD128_PROPERTIES_SIZE);
+	aux[0] = g;
+	aux[1] = o;
+	aux[2] = pr;
+	aux[3] = tp;
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		KUNIT_ASSERT_NOT_NULL(test, aux[i]);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, snapshot_free, snapshot), 0);
+
+	/* What the builder wrote is the kernel's form, for one task and for 28. */
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), 0);
+	mobilenet_sections(test, mobilenet, mobilenet_size);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&m->info, mobilenet,
+							      mobilenet_size), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&m->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+
+	/* Another task count, segment offset or size, or a longer section. */
+	put_unaligned_le32(2, tp + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le32(1, tp + 0xc);
+	put_unaligned_le64(0x10, tp + 0x10);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le64(0, tp + 0x10);
+	put_unaligned_le64(0x120, tp + 0x20);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le64(0x130, tp + 0x20);
+	aux_size[3] = ADD128_PROPERTIES_SIZE + 4;
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	aux_size[3] = ADD128_PROPERTIES_SIZE;
+	/* A second procedure, or another word of the one there is. */
+	put_unaligned_le32(2, pr);
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	put_unaligned_le32(1, pr);
+	pr[0x34] = 5;
+	KUNIT_EXPECT_EQ(test, ane_h16_fixed_sections_validate(&snapshot->info,
+							      (const void *const *)aux,
+							      aux_size), -ENOEXEC);
+	pr[0x34] = 4;
+
+	/* Reserved generic bytes: in the header and in every field of an entry. */
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(&snapshot->info, g, ADD128_GENERIC_SIZE,
+						       bindings, &count, &scratch), 0);
+	for (i = 0; i < ARRAY_SIZE(generic_bytes); i++) {
+		g[generic_bytes[i]] ^= 1;
+		KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(&snapshot->info, g,
+							       ADD128_GENERIC_SIZE, bindings,
+							       &count, &scratch), -ENOEXEC);
+		g[generic_bytes[i]] ^= 1;
+	}
+	for (i = 0; i < ARRAY_SIZE(entry_bytes); i++) {
+		u8 *e = g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + entry_bytes[i];
+
+		*e ^= 1;
+		KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(&snapshot->info, g,
+							       ADD128_GENERIC_SIZE, bindings,
+							       &count, &scratch), -ENOEXEC);
+		*e ^= 1;
+	}
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(&snapshot->info, g, ADD128_GENERIC_SIZE,
+						       bindings, &count, &scratch), 0);
+	/* An operation record's bytes after its last reference. */
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), 0);
+	o[4 + 0xc + 3 * 8] = 7;
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), -ENOEXEC);
+	o[4 + 0xc + 3 * 8] = 0;
+	o[ADD128_OPERATION_SIZE - 1] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, &snapshot->info, o,
+							 ADD128_OPERATION_SIZE, bindings, count,
+							 &scratch), -ENOEXEC);
+	o[ADD128_OPERATION_SIZE - 1] = 0;
+
+	/* At LOAD: refused before any mapping or firmware traffic, then loads. */
+	put_unaligned_le32(2, tp + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&f->s, snapshot, (const void *const *)aux,
+						   aux_size, &p), -ENOEXEC);
+	KUNIT_EXPECT_PTR_EQ(test, p, NULL);
+	KUNIT_EXPECT_EQ(test, f->count, 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	put_unaligned_le32(1, tp + 0xc);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, (const void *const *)aux,
+						   aux_size, &p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 }
 
 /*
@@ -3568,6 +3931,169 @@ static void program_recover_gate_test(struct kunit *test)
 	ane_h16_session_put(&f->s, p);
 }
 
+/* As the firmware does at boot: a small shared allocation of its own. */
+static void fw_boot_allocations(struct kunit *test, struct prog_fw *f)
+{
+	fw_shared_post(f, 0, SZ_16K, 0x43434d44);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_irq(&f->t, &(u32){ 0 }), 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+}
+
+/*
+ * Every live program holds a 2 MiB EXPP process pool, which the firmware
+ * asks for during CREATE and waits for. Six programs at once on the Neo
+ * went past the 12 MiB shared quota: the pool was refused, the CREATE
+ * stalled, and the quarantine took the five other programs with it. Now
+ * the LOAD past the quota fails with -ENOSPC before any traffic, the
+ * engine stays up, the other programs keep running, and a closed
+ * program's pool serves the next LOAD.
+ */
+static void program_process_pool_quota_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p[ANE_FW_SHARED_TOTAL / SZ_2M + 1] = {}, *q = NULL;
+	unsigned int i, n = 0, count, allocs;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.ops = &fw_session_ops_hung;
+	f->t.native_free = true;
+	f->expp = true;
+	fw_boot_allocations(test, f);
+	while (n < ARRAY_SIZE(p)) {
+		count = f->count;
+		ret = fw_load_program(f, &p[n]);
+		if (ret)
+			break;
+		KUNIT_EXPECT_EQ(test, f->count, count + 2);
+		n++;
+	}
+	/* 16 KiB of the quota is the firmware's: room for one pool less. */
+	KUNIT_EXPECT_EQ(test, n, (unsigned int)(ANE_FW_SHARED_TOTAL / SZ_2M - 1));
+	KUNIT_EXPECT_EQ(test, ret, -ENOSPC);
+	KUNIT_EXPECT_PTR_EQ(test, p[n], NULL);
+	KUNIT_EXPECT_EQ(test, f->count, count);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+	for (i = 0; i < n; i++)
+		KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p[i]), 0);
+
+	/* The FREE after UNLOAD makes the pool serve the next LOAD. */
+	allocs = f->allocs;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p[0]), 0);
+	ane_h16_session_put(&f->s, p[0]);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, allocs);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, q), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, q), 0);
+	ane_h16_session_put(&f->s, q);
+	for (i = 1; i < n; i++) {
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p[i]), 0);
+		ane_h16_session_put(&f->s, p[i]);
+	}
+	/* Load and close cycles take no new pool. */
+	for (i = 0; i < 20; i++)
+		KUNIT_ASSERT_EQ(test, fw_cycle(f), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, allocs);
+	KUNIT_EXPECT_EQ(test, f->hung, 0U);
+}
+
+/* No memory for the pool: -ENOMEM before any traffic, and the next LOAD works. */
+static void program_process_pool_nomem_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *a = NULL, *b = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.ops = &fw_session_ops_hung;
+	f->t.native_free = true;
+	f->expp = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &a), 0);
+	KUNIT_EXPECT_EQ(test, f->count, 2U);
+	f->alloc_fail = true;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &b), -ENOMEM);
+	KUNIT_EXPECT_PTR_EQ(test, b, NULL);
+	KUNIT_EXPECT_EQ(test, f->count, 2U);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 0U);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	f->alloc_fail = false;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &b), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, b), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
+	KUNIT_EXPECT_EQ(test, f->hung, 0U);
+}
+
+/*
+ * A FREE the firmware posts only after the post-UNLOAD settle: at the quota
+ * the LOAD serves it and takes that pool instead of failing.
+ */
+static void program_process_pool_late_free_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p[ANE_FW_SHARED_TOTAL / SZ_2M] = {}, *q = NULL;
+	unsigned int i, allocs;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.ops = &fw_session_ops_hung;
+	f->t.native_free = true;
+	f->expp = true;
+	for (i = 0; i < ARRAY_SIZE(p); i++)
+		KUNIT_ASSERT_EQ(test, fw_load_program(f, &p[i]), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)ANE_FW_SHARED_TOTAL);
+	/* Torn down, with the FREE held back past the settle. */
+	f->expp = false;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p[0]), 0);
+	ane_h16_session_put(&f->s, p[0]);
+	f->expp = true;
+	fw_shared_post(f, f->expp_dva[0], 0, 0);
+	f->expp_dva[0] = 0;
+	allocs = f->allocs;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, allocs);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, q), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 0U);
+}
+
+/*
+ * A replay that cannot take its process pool (no memory) fails, and the
+ * session is quarantined as for any other failed replay.
+ */
+static void program_process_pool_replay_nomem_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.ops = &fw_session_ops_hung;
+	f->t.native_free = true;
+	f->expp = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+
+	f->s.lock = lock;
+	ane_h16_session_sleep(&f->s, true);
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_recovered(&f->s);
+	f->alloc_fail = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, replayed, 0U);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	f->alloc_fail = false;
+	ane_h16_session_sleep(&f->s, false);
+	f->s.lock = NULL;
+	cancel_delayed_work_sync(&f->s.gate_work);
+}
+
 static void fw_cold_boot(struct prog_fw *f);
 
 static int fw_rpm_wake(void *ctx)
@@ -3764,6 +4290,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
+	KUNIT_CASE(program_add128_dma_test),
+	KUNIT_CASE(program_sections_exact_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),
@@ -3775,6 +4303,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_timing_test),
+	KUNIT_CASE(program_sysfs_stats_test),
+	KUNIT_CASE(program_sysfs_stats_held_gate_test),
 	KUNIT_CASE(program_fwlog_line_test),
 	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
@@ -3784,6 +4314,10 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_h17_sections_test),
 	KUNIT_CASE(program_h17_mobilenet_test),
 	KUNIT_CASE(program_h17_switch_test),
+	KUNIT_CASE(program_process_pool_quota_test),
+	KUNIT_CASE(program_process_pool_nomem_test),
+	KUNIT_CASE(program_process_pool_late_free_test),
+	KUNIT_CASE(program_process_pool_replay_nomem_test),
 	{}
 };
 

@@ -4641,9 +4641,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		l = apl_plane->iomfb_surf;
 		req->swap.swap_enabled |= BIT(l);
 
-		if (!new_state->fb || !new_state->visible) {
+		if (!new_state->fb || !new_state->visible)
 			continue;
-		}
+		/* Never submit a surface with no translation in the scanout DART. */
+		if (dcp_fb_mirror(dcp, new_state->fb))
+			continue;
 		req->surf_null[l] = false;
 		has_surface = 1;
 

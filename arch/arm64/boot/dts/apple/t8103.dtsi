@@ -1653,6 +1653,7 @@
 
 		dcpext: dcp@271c00000 {
 			compatible = "apple,t8103-dcpext", "apple,dcpext";
+			apple,display-power = <&dcp_power>;
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcpext_dart 0 0x0 0x0 0x0 0xfc000000>;
@@ -1752,6 +1753,11 @@
 
 			mboxes = <&usb4_0_mbox>;
 			resets = <&cio_reset 0>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 807 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 808 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dpin0", "dpin1";
 
 			power-domains = <&ps_atc0_cio>,
 					<&ps_atc0_cio_pcie>,
@@ -1980,6 +1986,11 @@
 
 			mboxes = <&usb4_1_mbox>;
 			resets = <&cio_reset 1>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 887 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 888 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dpin0", "dpin1";
 
 			power-domains = <&ps_atc1_cio>,
 					<&ps_atc1_cio_pcie>,

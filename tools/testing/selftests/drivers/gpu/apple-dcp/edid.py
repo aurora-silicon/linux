@@ -301,6 +301,22 @@ static void repeated_announcements(void)
         const char *forged[]={"DCPDP13ServiceExtra","dcpdp13service","AppleDCPDP2HDMIExtra","unrelated-provider"};
         announce(13,name,forged[variant],13);assert(opens==before && !d.dcpavserv.service);
     }
+    /*
+     * AFKV2 on the classic DPAV endpoint: the M3/M4 Air external DCPs announce
+     * DCPDP13Service with EPICUnit 0 and a dynamic interface-id. Only that
+     * generic class (and the MCDP29xx converters) is admitted there.
+     */
+    ep.endpoint=0x28;
+    assert(!prepare(1,1,name,native_class));assert(!prepare(5,5,name,native_class));
+    assert(!prepare(0,0,name,native_class));assert(!prepare(65536,0,name,native_class));
+    assert(!prepare(5,0,"dcpdp-service-epic",native_class));assert(!prepare(5,0,name,"unrelated-provider"));
+    for(u32 channel=1;channel<=13;channel+=4) {
+        struct apple_epic_service *s=prepare(channel,0,name,native_class);
+        assert(s && "EPICUnit-0 DCPDP13Service must be admitted");afk_service_discard(s);
+        assert(!prepare(channel,0,name,class) && "AppleDCPDP2HDMI stays refused on 0x28");
+    }
+    ep.endpoint=0x2c;assert(!prepare(5,0,name,native_class));ep.endpoint=0x2a;
+    assert(!prepare(5,0,name,native_class)); /* H17P keeps unit == interface-id. */
     assert(!prepare(13,13,name,NULL));
     open_error=-EIO;announce(13,name,native_class,13);assert(opens==++before && !d.dcpavserv.service);open_error=0;
     for(unsigned int window=0;window<5;window++) {

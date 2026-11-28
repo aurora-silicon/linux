@@ -53,6 +53,9 @@ assert (
 ), 'render_bar must be hoisted ahead of barrier emission'
 assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
 assert 'p.prev_barrier.write(0, &prev)?;' in prefix_render_fn
+# The VM mark waits for visibility: an unpublished prefix never marks its VM.
+assert 'note_msaa_render' not in prefix_render_fn
+assert 'f.msaa |= cmd.is_multisampled();' in prefix_render_fn
 assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
 assert 'p.fs_dep.write(0, &dep)?;' in prefix_render_fn
 assert 'p.compute_barrier.write(off, &cbar)?;' in prefix_render_fn
@@ -78,6 +81,18 @@ assert 'let waits_for_timestamps = c.query_access' in can_queue_behind_fn
 assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
 publish_prefix_body_fn = item('fn publish_prefix_body(')
 assert 'self.graph.render.threshold.w32(0, prefix.draw as u32)?;' in publish_prefix_body_fn
+_visible = publish_prefix_body_fn.index('*visible = true;')
+assert publish_prefix_body_fn.count('job.vm.note_msaa_render();') == 1
+assert publish_prefix_body_fn.index('job.vm.note_msaa_render();') > _visible
+# Both render fold paths check each member before claiming its pass slot.
+_same = publish_prefix_body_fn.index('while more_renders > 0 && end < job.progress.count()')
+_horizon = publish_prefix_body_fn.index('// Cross-job render horizon')
+assert publish_prefix_body_fn.count('self.msaa_member_allowed(&job.vm, r2)') == 2
+_m1 = publish_prefix_body_fn.index('self.msaa_member_allowed(&job.vm, r2)', _same)
+assert _m1 < publish_prefix_body_fn.index('pick_pass_in_for(', _same) < _horizon
+_m2 = publish_prefix_body_fn.index('self.msaa_member_allowed(&job.vm, r2)', _horizon)
+assert _m2 < publish_prefix_body_fn.index('pick_pass_in_for(', _horizon)
+assert 'let msaa_conflict = !self.msaa_member_allowed(&job.vm, r);' in can_queue_behind_fn
 assert 'self.graph.render.threshold.w32(8, prefix.draw as u32)?;' in publish_prefix_body_fn
 assert 'earliest_unfinished_ta_draw' not in source and 'rearm_ta_threshold' not in source
 assert 'let pipe_fold_cap = if heavy_compute && c_waits == [None; sizes::COMPUTE_PIPES]' in publish_prefix_body_fn, 'pipe_fold_cap must only apply to heavy barrier-free compute'
@@ -97,13 +112,15 @@ __PUBLICATION_ERROR__
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]enum Channel { Ta = 0, Fs = 1, Compute = 2 }
 #[derive(Copy,Clone)]struct ComputeCommand { query_access: bool, rt: bool }
 impl ComputeCommand { fn is_rt(&self) -> bool { self.rt } }
-#[derive(Copy,Clone)]struct RenderCommand { heavy_ta: bool }
-impl RenderCommand { fn is_heavy_ta(&self) -> bool { self.heavy_ta } }
-const R_LIGHT: RenderCommand = RenderCommand { heavy_ta: false };
-const R_HEAVY: RenderCommand = RenderCommand { heavy_ta: true };
+#[derive(Copy,Clone)]struct RenderCommand { heavy_ta: bool, msaa: bool }
+impl RenderCommand { fn is_heavy_ta(&self) -> bool { self.heavy_ta } fn is_multisampled(&self) -> bool { self.msaa } }
+const R_LIGHT: RenderCommand = RenderCommand { heavy_ta: false, msaa: false };
+const R_HEAVY: RenderCommand = RenderCommand { heavy_ta: true, msaa: false };
+const R_MSAA: RenderCommand = RenderCommand { heavy_ta: false, msaa: true };
 #[derive(Copy,Clone)]enum Command { Compute(ComputeCommand), Render(RenderCommand) }
 struct Status(AtomicU32);impl Status{fn get(&self)->u32{self.0.load(Ordering::Relaxed)}}
-struct Vm { id:u64, status:Status, slot:u32 }
+struct Vm { id:u64, status:Status, slot:u32, msaa:AtomicBool }
+impl Vm { fn renders_msaa(&self)->bool{self.msaa.load(Ordering::Relaxed)} fn note_msaa_render(&self){self.msaa.store(true,Ordering::Relaxed)} }
 struct Queue { turn:AtomicU64, priority:u32, completed:[AtomicU64;2], compute_ooo:AtomicU64, compute_ewma_us:AtomicU32 }
 impl Queue {
     fn new(turn:u64, priority:u32)->Arc<Self>{
@@ -141,6 +158,7 @@ struct Claims;
 struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,compute_pipe:u8,rt_compute:bool,doomed:bool,recovery_suspect:bool,initbm:bool,heavy_render:bool}
 impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,compute_pipe:0,rt_compute:false,doomed:false,recovery_suspect:false,initbm:false,heavy_render:false}}}
 __SCS_COMPUTE_CONFLICT__
+__MSAA_RENDER_CONFLICT__
 struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool,ta_wave_wait:bool,held_wait:bool,handoff_avoid_pipes:u32,coalesce_deadline_ns:u64}
 impl Engine {
     __PICK__
@@ -302,12 +320,12 @@ impl Firmware {
     __PUBLISH__
     __PUBLISH_CHECKED__
 }
-fn mk_vm(slot:u32)->Arc<Vm>{Arc::new(Vm{id:u64::from(slot),status:Status(AtomicU32::new(0)),slot})}
+fn mk_vm(slot:u32)->Arc<Vm>{Arc::new(Vm{id:u64::from(slot),status:Status(AtomicU32::new(0)),slot,msaa:AtomicBool::new(false)})}
 fn job_on_vm_mode(id:u32,vm:Arc<Vm>,render:bool,heavy:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm,
         queue:Queue::new(0,0),
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
-        commands:vec![if render{Command::Render(RenderCommand{heavy_ta:heavy})}else{Command::Compute(ComputeCommand{query_access:true,rt:false})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
+        commands:vec![if render{Command::Render(RenderCommand{heavy_ta:heavy,msaa:false})}else{Command::Compute(ComputeCommand{query_access:true,rt:false})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn job_on_vm(id:u32,vm:Arc<Vm>,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     job_on_vm_mode(id,vm,render,false,sent,dependency)
@@ -904,6 +922,7 @@ mod queue_behind_scope {
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
     __SCS_COMPUTE_CONFLICT__
+    __MSAA_RENDER_CONFLICT__
     impl QueueBehindHost {
         __NEEDS_ENGINE_DRAIN__
         __RENDER_CAN_PIPELINE__
@@ -912,6 +931,7 @@ mod queue_behind_scope {
         __TA_WAVE_CAP_FOR__
         __CAN_QUEUE_BEHIND__
         __CAN_QUEUE_BEHIND_WITH_TA__
+        __MSAA_MEMBER_ALLOWED__
         __WAIT_STAMP_FOR_WITH__
         __WAIT_STAMP_FOR__
         __CROSS_ENGINE_WAIT__
@@ -922,8 +942,8 @@ mod queue_behind_scope {
         __CHOOSE_COMPUTE_PIPE__
     }
     #[test]fn timed_compute_queues_behind_same_vm_and_coexists_with_render(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -968,8 +988,8 @@ mod queue_behind_scope {
         // gpubench compute.long: a ray-query lane (vm1) beside a long-ALU lane (vm2). The
         // ray-query dispatch was reported complete with its results unwritten whenever the
         // other lane's compute ran with it, and its stores then faulted in its closed VM.
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let q2=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,rt:bool|Arc::new(QueueBehindJob{
@@ -1025,7 +1045,7 @@ mod queue_behind_scope {
         assert!(!p.needs_engine_drain(&alu));
     }
     #[test]fn compute_query_access_waits_for_timed_predecessor_unless_no_query_access(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let q2=Queue::new(0,0);
         let mk=|id:u32,queue:Arc<Queue>,query_access:bool,wait_vdm:Option<u64>,wait_cdm:Option<u64>|Arc::new(QueueBehindJob{
@@ -1069,8 +1089,8 @@ mod queue_behind_scope {
         assert!(pr.can_queue_behind(&mk(2,q1.clone(),true,None,None)));
     }
     #[test]fn render_queues_behind_same_vm_and_coexists_with_compute_while_blocking_initbm(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1113,8 +1133,8 @@ mod queue_behind_scope {
         assert!(!p.can_queue_behind(&c1));
     }
     #[test]fn cross_vm_render_compute_overlap_matrix(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let q2=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
@@ -1154,9 +1174,83 @@ mod queue_behind_scope {
         p.engine.flights=vec![mk_flight(vm1_r.clone(),0,1),mk_flight(vm1_c.clone(),1,0)];
         assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
         assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
+        // Once a VM renders multisampled, none of its renders shares the TA/FS queues with
+        // another VM's render, in either order; its own renders still queue behind each other.
+        let mk_msaa=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>|Arc::new(QueueBehindJob{
+            id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(R_MSAA)],
+            order:Order{engine:command::RENDER,sequence:u64::from(id),wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let vm2_ms=mk_msaa(6,vm2.clone(),q2.clone());
+        // Neither VM has rendered multisampled: only a multisampled render is held.
+        p.engine.flights=vec![mk_flight(vm1_r.clone(),0,1)];
+        assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
+        assert!(!p.can_queue_behind(&vm2_ms) && p.needs_engine_drain(&vm2_ms));
+        // VM1 has rendered multisampled: VM2's single-sampled render is held behind any VM1
+        // render flight, VM1's own renders are not.
+        vm1.note_msaa_render();
+        let vm1_ms=mk_msaa(5,vm1.clone(),q1.clone());
+        assert!(p.can_queue_behind(&vm1_r) && !p.needs_engine_drain(&vm1_r));
+        assert!(p.can_queue_behind(&vm1_ms) && !p.needs_engine_drain(&vm1_ms));
+        assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
+        assert!(!p.can_queue_behind(&vm2_ms) && p.needs_engine_drain(&vm2_ms));
+        // ...and VM1's single-sampled render is held behind any VM2 render flight.
+        p.engine.flights=vec![mk_flight(vm2_r.clone(),0,1)];
+        assert!(!p.can_queue_behind(&vm1_r) && p.needs_engine_drain(&vm1_r));
+        assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
+        // Compute flights carry no render: the existing cross-VM compute rule applies.
+        p.engine.flights=vec![mk_flight(vm2_c.clone(),1,0)];
+        assert!(!p.can_queue_behind(&vm1_ms) && p.needs_engine_drain(&vm1_ms));
+        assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
+        assert!(p.msaa_member_allowed(&vm1,&R_MSAA));
+    }
+    #[test]fn render_fold_members_obey_cross_vm_msaa_rule(){
+        // The same-submit fold and the cross-job horizon fold ask msaa_member_allowed() for
+        // every candidate member (source-order asserts above): a single-sampled lead of an
+        // unmarked VM may be admitted beside another VM's render, but a multisampled member
+        // after it splits the same-submit fold and declines the horizon fold.
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
+        let q2=Queue::new(0,0);
+        let lead=Arc::new(QueueBehindJob{
+            id:1,vm:vm1.clone(),queue:Queue::new(0,0),progress:Progress{sent:AtomicU32::new(0),count:2,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(R_LIGHT),Command::Render(R_MSAA)],
+            order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let other=Arc::new(QueueBehindJob{
+            id:2,vm:vm2.clone(),queue:q2,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(R_LIGHT)],
+            order:Order{engine:command::RENDER,sequence:2,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let in_flight=QueueBehindFlight{
+            job:other,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,rt_compute:false,heavy_render:false,published_ns:0,
+            target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},
+            fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+        };
+        let mut p=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,pipe_last_vm:[None;hw::sizes::COMPUTE_PIPES],pipe_last_used:[0;hw::sizes::COMPUTE_PIPES],handoff_avoid_pipes:0,flights:vec![in_flight]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // The lead (command 0) is admitted; the multisampled member (command 1) is refused.
+        assert!(p.can_queue_behind(&lead) && !p.needs_engine_drain(&lead));
+        assert!(p.msaa_member_allowed(&vm1,&R_LIGHT));
+        assert!(!p.msaa_member_allowed(&vm1,&R_MSAA));
+        // Once VM2 is marked, no member of VM1 may join beside it.
+        vm2.note_msaa_render();
+        assert!(!p.msaa_member_allowed(&vm1,&R_LIGHT));
+        assert!(!p.can_queue_behind(&lead) && p.needs_engine_drain(&lead));
+        // With nothing of another VM in flight every member may join.
+        p.engine.flights.clear();
+        assert!(p.msaa_member_allowed(&vm1,&R_MSAA));
+        assert!(!vm1.renders_msaa());
     }
     #[test]fn cross_engine_wait_resolves_barriers_and_skips_no_barrier_or_retired(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let q2=Queue::new(0,0);
         let mk=|id:u32,queue:Arc<Queue>,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
@@ -1229,7 +1323,7 @@ mod queue_behind_scope {
         assert_eq!(cross_engine_barrier_type(true, true), BarrierType::Hold);
 
         // Verify wait_stamp_for_with / cross_engine_wait propagate producer flight.initbm.
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
@@ -1270,7 +1364,7 @@ mod queue_behind_scope {
         assert_eq!(fw2.session.transports.load(Ordering::Relaxed),1);
     }
     #[test]fn multi_queue_concurrent_compute_and_render_on_same_vm(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q_comp=Queue::new(0,2);
         let q_rend=Queue::new(0,2);
         let c_job=Arc::new(QueueBehindJob{
@@ -1308,7 +1402,7 @@ mod queue_behind_scope {
         assert_eq!(p.cross_engine_wait(&c_job,0,command::RENDER),Ok(None));
     }
     #[test]fn cross_engine_wait_and_compute_flight_cap_account_for_batched_horizon_members(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
@@ -1342,7 +1436,7 @@ mod queue_behind_scope {
         assert!(!p.can_queue_behind(&c4));
     }
     #[test]fn multi_pass_render_flight_wait_stamp_and_render_cap(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let multi=Arc::new(QueueBehindJob{
             id:1,vm:vm1.clone(),queue:q1.clone(),
@@ -1420,12 +1514,12 @@ mod queue_behind_scope {
         assert!(!p.can_queue_behind(&next_r));
     }
     #[test]fn ta_pending_passes_paces_unfinished_ta_waves_without_throttling_finished_ta(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let mk=|id:u32,heavy:bool|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Render(RenderCommand{heavy_ta:heavy})],
+            commands:vec![Command::Render(RenderCommand{heavy_ta:heavy,msaa:false})],
             order:Order{engine:command::RENDER,sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1477,8 +1571,8 @@ mod queue_behind_scope {
         assert!(p.can_queue_behind(&next_heavy));
     }
     #[test]fn slot_wait_arms_only_for_same_vm_slot_or_flight_headroom_blocks(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,render:bool,dep:Result,query_access:bool,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),
@@ -1827,8 +1921,8 @@ mod queue_behind_scope {
         );
     }
     #[test]fn two_pipe_concurrent_compute_dispatch_and_fw_timestamp_safety(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
-        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
+        let vm2=Arc::new(Vm{id:2,status:Status(AtomicU32::new(0)),slot:2,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let q2=Queue::new(0,2);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,seq:u64|Arc::new(QueueBehindJob{
@@ -1964,7 +2058,7 @@ mod queue_behind_scope {
         assert_eq!(host.choose_compute_pipe(&q2, &vm2, no_w, 0b11, false, false), Some(0));
     }
     #[test]fn two_pipe_compute_barriers_reuse_single_pipe_and_serialize_across_both_pipes(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let mk=|id:u32,seq:u64,wait_c:Option<u64>|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
@@ -2027,7 +2121,7 @@ mod queue_behind_scope {
         assert_eq!(host.wait_compute_stamps_for(&c4, Some(2)), Ok([None; sizes::COMPUTE_PIPES]));
     }
     #[test]fn cross_queue_fw_waits_resolve_stamps_reuse_compute_pipe_and_guard_timestamps(){
-        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1});
+        let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
         let q1=Queue::new(0,2);
         let q2=Queue::new(0,2);
         let c1=Arc::new(QueueBehindJob{
@@ -2865,7 +2959,7 @@ mod busy_coalesce_scope {
             vm: vm.clone(),
             queue: q.clone(),
             progress: Progress { sent: AtomicU32::new(0), count: 1, pending: AtomicBool::new(true) },
-            commands: vec![if render { Command::Render(RenderCommand { heavy_ta: heavy }) } else { Command::Compute(ComputeCommand { query_access: false, rt: false }) }],
+            commands: vec![if render { Command::Render(RenderCommand { heavy_ta: heavy, msaa: false }) } else { Command::Compute(ComputeCommand { query_access: false, rt: false }) }],
             orders: vec![Order { engine: if render { crate::command::RENDER } else { crate::command::COMPUTE }, sequence: seq, wait_through: wait }],
             fw_waits: vec![],
             resources: Resources { units: 24, scs: false },
@@ -2878,7 +2972,7 @@ mod busy_coalesce_scope {
     }
     #[test]
     fn busy_coalesce_holds_deep_single_queue_bursts_and_never_delays_shallow_or_other_queues() {
-        let vm1 = Arc::new(Vm { id: 1, status: Status(AtomicU32::new(0)), slot: 1 });
+        let vm1 = Arc::new(Vm { id: 1, status: Status(AtomicU32::new(0)), slot: 1, msaa: AtomicBool::new(false) });
         let q1 = Queue::new(0, 2);
         let q2 = Queue::new(0, 2);
         let c1 = mk_job(&vm1, &q1, false, 1, [None, None]);
@@ -2971,8 +3065,243 @@ mod busy_coalesce_scope {
         assert_eq!(h.defer_busy_coalesce(605_000), None);
     }
 }
+// Production fold loops and publication prologue of publish_prefix_body, verbatim, around mock
+// slots, waits and prefix_render: what they accept, refuse and mark is production behaviour.
+mod msaa_fold_scope {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    #[derive(Copy,Clone,Debug,PartialEq,Eq)] struct Error(i32);
+    const EINVAL: Error = Error(22); const EAGAIN: Error = Error(11); const EIO: Error = Error(5);
+    type Result<T = ()> = std::result::Result<T, Error>;
+    #[derive(Copy,Clone)] struct Gfp; const GFP_NOWAIT: Gfp = Gfp;
+    mod sizes {
+        pub const QUEUE_CAP: u32 = 256; pub const TA_WAVE_PASSES: usize = 4; pub const TA_WAVE_PASSES_LIGHT: usize = 8;
+        pub const HORIZON_JOBS: u32 = 8; pub const MAX_RENDER_RING_ENTRIES: usize = 5;
+    }
+    mod params { pub fn early_tiling() -> bool { true } }
+    #[allow(non_upper_case_globals)]
+    mod kernel { pub mod uapi { pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: u32 = 1 << 23; } }
+    mod super_vm { pub(super) type VmState = super::Vm; }
+    #[derive(Copy,Clone)] struct RenderCmd { flags: u32, samples: u16 }
+    #[derive(Copy,Clone)] struct RenderCommand { cmd: RenderCmd, heavy_ta: bool }
+    impl RenderCommand {
+        fn is_heavy_ta(&self) -> bool { self.heavy_ta }
+        __IS_MULTISAMPLED__
+    }
+    const LIGHT: RenderCommand = RenderCommand { cmd: RenderCmd { flags: 0, samples: 1 }, heavy_ta: false };
+    const MSAA: RenderCommand = RenderCommand { cmd: RenderCmd { flags: 0, samples: 4 }, heavy_ta: false };
+    #[derive(Copy,Clone)] enum Command { Render(RenderCommand), #[allow(dead_code)] Compute }
+    struct Geometry;
+    impl Geometry { fn new_for(_c: &RenderCmd, _heap: u64, _clusters: u32, _generation: u32) -> Self { Geometry } }
+    struct Binding; impl Binding { fn mark_binding_published(&self) -> Result { Ok(()) } }
+    struct Vm { id: u64, renders_msaa: AtomicBool, vm: Binding }
+    impl Vm {
+        __RENDERS_MSAA__
+        __NOTE_MSAA_RENDER__
+    }
+    fn vm(id: u64) -> Arc<Vm> { Arc::new(Vm { id, renders_msaa: AtomicBool::new(false), vm: Binding }) }
+    struct Queue;
+    #[derive(Copy,Clone)] struct Order { sequence: u64, wait_through: [Option<u64>; 2], ta_wait_through: [Option<u64>; 2] }
+    struct Progress { count: u32 } impl Progress { fn count(&self) -> u32 { self.count } }
+    struct Resources;
+    impl Resources {
+        fn render_scs(&self) -> bool { false }
+        fn pb_owner_arena(&self, _k: usize) -> u32 { 0 }
+        fn pb_uma_lease(&self, _k: usize) -> u32 { 0 }
+    }
+    struct Job { id: u32, vm: Arc<Vm>, queue: Arc<Queue>, commands: Vec<Command>, first_seq: u64, progress: Progress, resources: Resources }
+    impl Job {
+        fn long(&self) -> bool { false }
+        fn command_order(&self, k: u32) -> Option<Order> {
+            Some(Order { sequence: self.first_seq + u64::from(k), wait_through: [None, None], ta_wait_through: [None, None] })
+        }
+        fn can_fold_render_cmd(&self, k: u32, seq: u64) -> bool { seq == self.first_seq + u64::from(k) }
+        fn can_fold_render_horizon_job(&self, first: u64) -> bool { first == self.first_seq }
+    }
+    fn job(id: u32, vm: &Arc<Vm>, queue: &Arc<Queue>, first_seq: u64, commands: &[RenderCommand]) -> Arc<Job> {
+        Arc::new(Job { id, vm: vm.clone(), queue: queue.clone(), commands: commands.iter().map(|r| Command::Render(*r)).collect(),
+            first_seq, progress: Progress { count: commands.len() as u32 }, resources: Resources })
+    }
+    fn command(job: &Job, k: u32) -> Option<&Command> { job.commands.get(k as usize) }
+    struct Claims { pass: [u32; 48], pass_count: u32, pass_mask: u64 }
+    struct Group(Vec<Arc<Job>>);
+    impl Group {
+        fn len(&self) -> usize { self.0.len() }
+        fn reserve(&mut self, n: usize, _g: Gfp) -> std::result::Result<(), ()> { self.0.reserve(n); Ok(()) }
+        fn push_within_capacity(&mut self, j: Arc<Job>) -> std::result::Result<(), Arc<Job>> { self.0.push(j); Ok(()) }
+    }
+    struct Pb; impl Pb { fn check_assignment(&self, _k: usize) -> Result { Ok(()) } }
+    struct Flight { job: Arc<Job>, renders: u32, claims: Claims, count: usize, group: Group, msaa: bool, pb: Option<Pb>, pb_slot: u32 }
+    fn flight(job: &Arc<Job>, renders: u32) -> Flight {
+        Flight { job: job.clone(), renders, claims: Claims { pass: [0; 48], pass_count: 1, pass_mask: 1 }, count: 1,
+            group: Group(vec![]), msaa: false, pb: Some(Pb), pb_slot: 0 }
+    }
+    __MSAA_RENDER_CONFLICT__
+    struct Prefix { draw: u64, ta_head: u32, fs_head: u32, renders: u32 }
+    struct Cfg { num_clusters: u32, gpu_generation: u32 }
+    struct Slots { pass_busy: u64, publish_fails: bool }
+    impl Slots {
+        fn pick_pass_in_for(&self, _r: &Resources, _g: &Geometry, picked: u64, _vm: Option<u64>) -> Option<usize> {
+            (0..48).find(|k| (self.pass_busy | picked) & (1u64 << k) == 0)
+        }
+        fn verify_held(&self, _c: &Claims) -> Result { Ok(()) }
+        fn publish(&mut self, _c: &mut Claims) -> Result { if self.publish_fails { Err(EIO) } else { Ok(()) } }
+    }
+    struct Pools; impl Pools { fn hold_alloc(&mut self, _k: usize, _vm: &Arc<Vm>, _a: u32, _l: u32) -> Result { Ok(()) } }
+    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>> }
+    struct Host { cfg: Cfg, slots: Slots, pools: Pools, engine: Engine, prefixed: Vec<(u32, u32)> }
+    impl Host {
+        __MSAA_MEMBER_ALLOWED__
+        fn recovery_pending(&self) -> Result<bool> { Ok(false) }
+        fn wait_compute_stamps_for(&self, _j: &Arc<Job>, _t: Option<u64>) -> Result { Ok(()) }
+        fn wait_stamp_for_with(&self, _j: &Arc<Job>, _c: usize, _t: Option<u64>, _f: Option<&Flight>) -> Result { Ok(()) }
+        #[allow(clippy::too_many_arguments)]
+        fn prefix_render(&mut self, job: &Arc<Job>, _r: &Resources, k: u32, cmd: &RenderCommand, _g: Geometry,
+            prefix: &mut Prefix, f: &mut Flight, _behind: bool, _class_behind: bool) -> Result {
+            self.prefixed.push((job.id, k));
+            prefix.renders += 1;
+            prefix.draw += 1;
+            f.msaa |= cmd.is_multisampled();
+            Ok(())
+        }
+        /// The lead (command 0 of `job`) is already prefixed; returns the prefix's end command.
+        #[allow(unused_assignments, unused_variables, unused_mut)]
+        fn fold(&mut self, job: &Arc<Job>, f: &mut Flight, more: usize) -> Result<u32> {
+            let index = 0u32;
+            let mut end = 1u32;
+            let mut prefix = Prefix { draw: 1, ta_head: 0, fs_head: 0, renders: 1 };
+            let (ta_read, fs_read) = (0u32, 0u32);
+            let (behind, class_behind) = (true, true);
+            let stage_prefix = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
+            let mut last_seq = job.command_order(index).map(|o| o.sequence);
+            let ta_pending_before = 0usize;
+            let mut wave_heavy = false;
+            let mut more_renders = more;
+            __SAME_SUBMIT_FOLD__
+            __HORIZON_FOLD__
+            f.renders = prefix.renders;
+            Ok(end)
+        }
+        fn publish_prologue(&mut self, job: &Arc<Job>, f: &mut Flight, visible: &mut bool, fail_after: bool) -> Result {
+            let render = true;
+            __PUBLICATION_PROLOGUE__
+            if fail_after { return Err(EIO); }
+            Ok(())
+        }
+    }
+    fn host(flights: Vec<Flight>, pending: Vec<Arc<Job>>) -> Host {
+        Host { cfg: Cfg { num_clusters: 1, gpu_generation: 16 }, slots: Slots { pass_busy: 1, publish_fails: false }, pools: Pools,
+            engine: Engine { flights, pending }, prefixed: vec![] }
+    }
+    #[test] fn same_submit_fold_splits_before_a_multisampled_member_beside_another_vm() {
+        let (vm1, vm2, q1, q2) = (vm(1), vm(2), Arc::new(Queue), Arc::new(Queue));
+        let lead = job(1, &vm1, &q1, 10, &[LIGHT, LIGHT, MSAA, LIGHT]);
+        let other = job(2, &vm2, &q2, 1, &[LIGHT]);
+        // Beside another VM's render: the single-sampled member joins, the prefix ends at the
+        // multisampled one (command 2), which waits for its own publication.
+        let mut h = host(vec![flight(&other, 1)], vec![]);
+        let mut f = flight(&lead, 1);
+        assert_eq!(h.fold(&lead, &mut f, 8), Ok(2));
+        assert_eq!(h.prefixed, [(1, 1)]);
+        assert!(!f.msaa);
+        // Nothing of another VM in flight: the whole submit folds.
+        let mut h = host(vec![], vec![]);
+        let mut f = flight(&lead, 1);
+        assert_eq!(h.fold(&lead, &mut f, 8), Ok(4));
+        assert_eq!(h.prefixed, [(1, 1), (1, 2), (1, 3)]);
+        assert!(f.msaa);
+    }
+    #[test] fn cross_job_fold_takes_a_whole_job_or_none_of_it_beside_another_vm() {
+        let (vm1, vm2, q1, q2) = (vm(1), vm(2), Arc::new(Queue), Arc::new(Queue));
+        let lead = job(1, &vm1, &q1, 10, &[LIGHT]);
+        let other = job(2, &vm2, &q2, 1, &[LIGHT]);
+        // A single-sampled job folds beside another VM's render.
+        let light = job(3, &vm1, &q1, 11, &[LIGHT, LIGHT]);
+        let mut h = host(vec![flight(&other, 1)], vec![lead.clone(), light.clone()]);
+        let mut f = flight(&lead, 1);
+        assert_eq!(h.fold(&lead, &mut f, 8), Ok(1));
+        assert_eq!(h.prefixed, [(3, 0), (3, 1)]);
+        assert_eq!(f.group.len(), 1);
+        assert_eq!(f.renders, 3);
+        // A job with a multisampled member is declined whole: none of its members is prefixed.
+        let mixed = job(4, &vm1, &q1, 11, &[LIGHT, MSAA]);
+        let mut h = host(vec![flight(&other, 1)], vec![lead.clone(), mixed.clone()]);
+        let mut f = flight(&lead, 1);
+        assert_eq!(h.fold(&lead, &mut f, 8), Ok(1));
+        assert!(h.prefixed.is_empty());
+        assert_eq!(f.group.len(), 0);
+        assert_eq!(f.renders, 1);
+        // Without another VM in flight the same job folds.
+        let mut h = host(vec![], vec![lead.clone(), mixed.clone()]);
+        let mut f = flight(&lead, 1);
+        assert_eq!(h.fold(&lead, &mut f, 8), Ok(1));
+        assert_eq!(h.prefixed, [(4, 0), (4, 1)]);
+        assert!(f.msaa);
+    }
+    #[test] fn only_a_visible_multisampled_prefix_marks_its_vm() {
+        let q = Arc::new(Queue);
+        // Refused before visibility: unpublished, the VM stays unmarked.
+        let v = vm(1);
+        let j = job(1, &v, &q, 1, &[MSAA]);
+        let mut h = host(vec![], vec![]);
+        h.slots.publish_fails = true;
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        f.msaa = true;
+        assert_eq!(h.publish_prologue(&j, &mut f, &mut visible, false), Err(EIO));
+        assert!(!visible && !v.renders_msaa());
+        // Published: marked.
+        let mut h = host(vec![], vec![]);
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        f.msaa = true;
+        assert_eq!(h.publish_prologue(&j, &mut f, &mut visible, false), Ok(()));
+        assert!(visible && v.renders_msaa());
+        // Visible, then failed (uncertain, may run): marked.
+        let v2 = vm(2);
+        let j2 = job(2, &v2, &q, 1, &[MSAA]);
+        let mut h = host(vec![], vec![]);
+        let (mut f, mut visible) = (flight(&j2, 1), false);
+        f.msaa = true;
+        assert_eq!(h.publish_prologue(&j2, &mut f, &mut visible, true), Err(EIO));
+        assert!(visible && v2.renders_msaa());
+        // A published single-sampled prefix does not mark.
+        let v3 = vm(3);
+        let j3 = job(3, &v3, &q, 1, &[LIGHT]);
+        let mut h = host(vec![], vec![]);
+        let (mut f, mut visible) = (flight(&j3, 1), false);
+        assert_eq!(h.publish_prologue(&j3, &mut f, &mut visible, false), Ok(()));
+        assert!(visible && !v3.renders_msaa());
+        let _ = (EAGAIN, EINVAL);
+    }
+}
+
 '''
 harness = harness.replace('__LOGIC__', str(production.parent / 'recovery/logic.rs'))
+
+vm_src = (production.parent / 'vm.rs').read_text()
+command_src = (production.parent / 'command.rs').read_text()
+_same_fold = item('while more_renders > 0 && end < job.progress.count() {')
+_horizon_fold = item('if end == job.progress.count() && more_renders > 0 {')
+_prologue_start = source.index('        if self.recovery_pending()? {\n            return Err(EAGAIN);\n        }\n        if render {\n            f.pb.as_ref()')
+_prologue_end = source.index('        let publication = (|| -> Result {', _prologue_start)
+_prologue = source[_prologue_start:_prologue_end]
+assert '*visible = true;' in _prologue and 'job.vm.note_msaa_render();' in _prologue
+_scope_start = harness.index('mod msaa_fold_scope {')
+_scope = harness[_scope_start:]
+for token, text in {
+    '__SAME_SUBMIT_FOLD__': _same_fold,
+    '__HORIZON_FOLD__': _horizon_fold,
+    '__PUBLICATION_PROLOGUE__': _prologue,
+    '__IS_MULTISAMPLED__': item_in(command_src, 'pub(crate) fn is_multisampled('),
+    '__RENDERS_MSAA__': item_in(vm_src, 'pub(crate) fn renders_msaa('),
+    '__NOTE_MSAA_RENDER__': item_in(vm_src, 'pub(crate) fn note_msaa_render('),
+    '__MSAA_RENDER_CONFLICT__': item('fn msaa_render_conflict('),
+    '__MSAA_MEMBER_ALLOWED__': item('fn msaa_member_allowed('),
+}.items():
+    assert token in _scope, token
+    _scope = _scope.replace(token, text
+        .replace('super::recovery::', 'crate::recovery::')
+        .replace('super::command::', 'crate::command::')
+        .replace('super::vm::VmState', 'super_vm::VmState'))
+harness = harness[:_scope_start] + _scope
 harness = harness.replace('__USAGE__', str(production.parent.parent / 'usage.rs'))
 harness = harness.replace('__FLIGHTS_LINE__', flights_line.strip())
 harness = harness.replace('__MAX_QUEUES_LINE__', max_queues_line.strip())
@@ -3050,6 +3379,8 @@ for token, declaration in {
     '__HAS_COMPUTE_PIPE_FOR_VM__': 'fn has_compute_pipe_for_vm(',
     '__CHOOSE_COMPUTE_PIPE__': 'fn choose_compute_pipe(',
     '__SCS_COMPUTE_CONFLICT__': 'fn scs_compute_conflict(',
+    '__MSAA_RENDER_CONFLICT__': 'fn msaa_render_conflict(',
+    '__MSAA_MEMBER_ALLOWED__': 'fn msaa_member_allowed(',
     '__WAIT_TARGET__': 'struct WaitTarget {',
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',

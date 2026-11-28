@@ -6242,7 +6242,8 @@ static int apple_pcie_tunnel_other_driver(struct pci_dev *pdev, void *data)
 {
 	struct device_driver *drv = READ_ONCE(pdev->dev.driver);
 
-	if (!drv || !strcmp(drv->name, "nvme") || !strcmp(drv->name, "pcieport"))
+	if (!drv || !strcmp(drv->name, "nvme") || !strcmp(drv->name, "pcieport") ||
+	    !strcmp(drv->name, "igc"))
 		return 0;
 	*(const char **)data = drv->name;
 	return 1;
@@ -6256,13 +6257,14 @@ static int apple_pcie_tunnel_other_driver(struct pci_dev *pdev, void *data)
  * For a sleep that takes the tunnel's router down. Unlike apple_pcie_tunnel_quiesce(), which
  * marks the functions disconnected first (their drivers then treat them as gone), the
  * functions are removed while they still answer: an NVMe controller's driver stops its
- * queues and gives the controller its normal shutdown, as at a power-off. Nothing is written
+ * queues and gives the controller its normal shutdown, as at a power-off, and igc
+ * unregisters its netdev cleanly without touching PM notifiers. Nothing is written
  * to a disk that has no opener. apple_pcie_tunnel_quiesce() then takes the ports down and
  * apple_pcie_tunnel_restore() enumerates the hierarchy again.
  *
  * Returns 0 when the hierarchy is removed (or was already), -EBUSY when a disk is open and
- * @in_use_too is false, -EOPNOTSUPP when a function has a driver other than nvme or the PCIe
- * port driver. Nothing is removed on an error.
+ * @in_use_too is false, -EOPNOTSUPP when a function has a driver other than nvme, igc, or
+ * the PCIe port driver. Nothing is removed on an error.
  */
 int apple_pcie_tunnel_remove_orderly(struct device *dev, bool in_use_too)
 {

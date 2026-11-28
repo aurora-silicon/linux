@@ -20,7 +20,21 @@
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
+/* The loader supplies the ANE firmware and reservations. */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
 &ane {
+	status = "okay";
 	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
 			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
@@ -1025,3 +1039,32 @@
 
 #include "t6041-pmgr.dtsi"
 #include "t6041-sleep-pmgr.dtsi"
+
+/* The loader uses this alias to enable SIO after placing its firmware. */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};

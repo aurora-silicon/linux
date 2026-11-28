@@ -209,6 +209,14 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_PNON_FAILED		3
 #define SEP_DIAG_PNON_DIGEST_LEN	48
 
+/*
+ * Mirrored by diag.rs (Trusted). The word keeps the state in its low byte and,
+ * for SEP_DIAG_TRUSTED_REFUSED, the enclave's status in the next one.
+ */
+#define SEP_DIAG_TRUSTED_UNKNOWN	0
+#define SEP_DIAG_TRUSTED_READY		1
+#define SEP_DIAG_TRUSTED_REFUSED	2
+
 /* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
 #define SEP_DIAG_OFFER_PENDING		0
 #define SEP_DIAG_OFFER_IDLE		1
@@ -238,6 +246,10 @@ void sep_diag_set_restore(int state);
 void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching);
 void sep_diag_xart_guard_refused(int matching);
+void sep_diag_set_trusted(int state, int status);
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status);
+void sep_diag_clear_trusted_refusal(void);
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word);
 void sep_diag_bringup_ended(void);
 void sep_diag_set_endpoint(u8 id, u32 name);
 void sep_diag_set_os_identity(int source);
@@ -306,6 +318,33 @@ unsigned char *sep_tk_blob_ptr(struct trusted_key_payload *p);
 unsigned int sep_tk_blob_len(const struct trusted_key_payload *p);
 void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 
+
+/* -- hdcp_shim.c ------------------------------------------------------- */
+
+enum sep_hdcp_step {
+	SEP_HDCP_STEP_OPEN = 0,
+	SEP_HDCP_STEP_AKE_CERT = 1,
+	SEP_HDCP_STEP_H_PRIME = 2,
+	SEP_HDCP_STEP_PAIRING = 3,
+	SEP_HDCP_STEP_LC_INIT = 4,
+	SEP_HDCP_STEP_L_PRIME = 5,
+	SEP_HDCP_STEP_SKE = 6,
+	SEP_HDCP_STEP_RECEIVER_LIST = 7,
+	SEP_HDCP_STEP_STREAM = 8,
+	SEP_HDCP_STEP_FINISH = 9,
+	SEP_HDCP_STEP_ENCRYPTION_ON = 10,
+	SEP_HDCP_STEP_ENCRYPTION_OFF = 11,
+};
+
+struct sep_hdcp_ops {
+	bool (*available)(void *context);
+	int (*step)(void *context, u32 channel, u32 step, const u8 *in,
+		    size_t in_len, u8 *out, size_t out_len);
+	void (*close)(void *context, u32 channel);
+};
+
+int sep_hdcp_register(void *context, const struct sep_hdcp_ops *ops);
+void sep_hdcp_unregister(void *context);
 
 /* Initrd attach and completion; sysfs removal drains the callback. */
 bool sep_keystore_only(void);

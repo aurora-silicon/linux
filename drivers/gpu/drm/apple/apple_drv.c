@@ -25,6 +25,7 @@
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
+#include <linux/soc/apple/t8132.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -285,6 +286,42 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+/*
+ * A T8122 dcpext mirrors framebuffers into its own display DART domain.
+ * Remove a buffer's mirror before its pages and its DVA are released.
+ */
+static void apple_drm_gem_free(struct drm_gem_object *gem)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, gem->dev) {
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp_fb_unmirror(to_apple_crtc(crtc)->dcp, to_drm_gem_dma_obj(gem));
+	}
+	drm_gem_dma_object_free(gem);
+}
+
+static const struct drm_gem_object_funcs apple_drm_gem_funcs = {
+	.free		= apple_drm_gem_free,
+	.print_info	= drm_gem_dma_object_print_info,
+	.get_sg_table	= drm_gem_dma_object_get_sg_table,
+	.vmap		= drm_gem_dma_object_vmap,
+	.mmap		= drm_gem_dma_object_mmap,
+	.vm_ops		= &drm_gem_dma_vm_ops,
+};
+
+static struct drm_gem_object *apple_drm_gem_create_object(struct drm_device *drm,
+							  size_t size)
+{
+	struct drm_gem_dma_object *obj = kzalloc_obj(*obj);
+
+	if (!obj)
+		return ERR_PTR(-ENOMEM);
+	obj->base.funcs = &apple_drm_gem_funcs;
+	return &obj->base;
+}
+
 #ifdef CONFIG_DRM_FBDEV_EMULATION
 static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
@@ -413,6 +450,7 @@ static const struct drm_driver apple_drm_driver = {
 	DRM_FBDEV_DMA_DRIVER_OPS,
 #endif
 	.postclose		= apple_drm_postclose,
+	.gem_create_object	= apple_drm_gem_create_object,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -1785,6 +1823,8 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
+	/* apple_dcp_usable(): only one on firmware 27.2 (apple_t8132_dcpext_v27_2()). */
+	{ .compatible = "apple,t8132-dcpext" },
 	{},
 };
 
@@ -1803,7 +1843,21 @@ static bool apple_dcp_usable(struct device_node *np)
 		dcp_h17p_external_supported(np)) &&
 	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
-		dcp_t6041_ext_enabled());
+		dcp_t6041_ext_enabled()) &&
+	       /*
+		* The T8132 main DCP is the M4 backend's on its 26.6.2
+		* firmware path, and the firmware-27 backend's wherever the
+		* boot loader handed it over with the 27.2 image and its
+		* clocks, on any board (see dcp_check_firmware_version()).
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
+		apple_t8132_firmware_path() || apple_t8132_dcp_v27_2(np)) &&
+	       /*
+		* A T8132 dcpext the M4 backend adopts is no component: its
+		* outputs are t8132_ext_drm.c's. One on the 27.2 image is a pipe.
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcpext") ||
+		apple_t8132_dcpext_v27_2(np));
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
@@ -2283,7 +2337,8 @@ static int add_dcp_components(struct device *dev,
 				 * ignore it here.
 				 */
 				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				    of_device_is_compatible(port, "apple,t8122-atcphy") ||
+				    of_device_is_compatible(port, "apple,t8142-atcphy")) {
 					of_node_put(port);
 					continue;
 				}

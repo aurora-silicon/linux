@@ -106,20 +106,24 @@ pub(crate) struct DescriptorRing {
 }
 
 impl DescriptorRing {
-    /// Keep compute descriptors uncached while retaining their VA and fence in
-    /// the pool: M5 common firmware clears the descriptor's accounting counter
-    /// at `+0xfac`, and the host rewrites each slot every 32 kicks, so a
-    /// firmware-cached mapping carries the same dirty-line writeback hazard.
-    /// The hardware reads the same pages through an uncached canonical low
-    /// alias; on M5 the kernel mapping, in the upper half every execution
-    /// context includes, is firmware-only.
+    /// Both firmware and host write compute descriptors: the firmware updates
+    /// an accounting word near the end of each descriptor (`+0xfac` on M5),
+    /// and the host rewrites each slot every 32 kicks. M5 keeps them uncached
+    /// against the dirty-line writeback hazard of linux#3170, while retaining
+    /// their VA and fence in the pool. G17P maps them firmware-cached, as it
+    /// does render descriptors: the host rewrites a slot only after the kick
+    /// that last used it retired (at most `DESCRIPTORS` kicks are in flight),
+    /// by when that kick's accounting store is in memory. The hardware reads
+    /// the same pages through an uncached canonical low alias; on M5 the
+    /// kernel mapping, in the upper half every execution context includes, is
+    /// firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
             alloc,
             Family::Descriptor,
             size,
-            0,
+            if alloc.uat.is_m5() { 0 } else { size },
             if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
             CpuMap::WriteCombined,
         )?;

@@ -4,7 +4,8 @@
  *
  * target-type: J773g
  *
- * Wired from the J773g ADT (macOS 26.6.2).
+ * Wired from the J773g ADT (macOS 26.6.2; the HDMI port on dcpext0 from the
+ * macOS 27.2 one).
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -41,6 +42,117 @@
  */
 &framebuffer0 {
 	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
+};
+
+/*
+ * The HDMI port as macOS 27.2 drives it: from dispext0 alone (4K60, and
+ * 4K120 with DSC; the main DCP started and then parked), through the LPDPTX
+ * PHY and the PS190 DP-to-HDMI converter. It is the M4 Max Mac Studio's HDMI
+ * port (t6041-j575c-hdmi.dtsi): the same PHY block, converter and rails, and
+ * it is handed over the same way, on the firmware-27 backend.
+ *
+ * Every node is disabled. On macOS 27.2 the boot loader (aura) fills
+ * dcpext0's firmware memory and firmware clocks, leaves the main DCP running
+ * idle, and enables the display subsystem on iBoot's framebuffer; the display
+ * gate (drivers/soc/apple/display-gate.c) then enables this chain and points
+ * the display subsystem at dispext0's DART. On the M4 26.6.2 firmware path
+ * none of it is enabled from here.
+ */
+/ {
+	reserved-memory {
+		/* Filled by the boot loader on macOS 27.2, as the J575c's. */
+		dcpext0_text: dcpext0-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_data: dcpext0-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_heap: dcpext0-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	/*
+	 * ADT /arm-io/dptx-phy (dptx-phy,t8132, as the J575c's lpdptx-phy0):
+	 * the T6050 layout, a core bank and a dptx bank, and the ADT's PLL
+	 * calibration (FD0FD1SWAP unset). The display crossbar's dfp-endpoint 4
+	 * (lpdptx); dispext0 is its ufp-endpoint 0, which the PHY's source
+	 * select takes as 1, dcpext0's apple,dcp-index.
+	 */
+	lpdptx_phy: phy@39a700000 {
+		compatible = "apple,t8132-dptx-phy", "apple,t6050-dptx-phy";
+		reg = <0x3 0x9a700000 0x0 0x4000>,
+		      <0x3 0x9a740000 0x0 0x10000>;
+		reg-names = "core", "dptx";
+		power-domains = <&ps_dptx_phy>;
+		#phy-cells = <0>;
+		#reset-cells = <0>;
+		apple,ufp-endpoint = <0>;
+		apple,pll-dcocfg = <0x4>;
+		apple,pll-dtcvreg = <0xf>;
+		apple,pll-dtccal = <0x2>;
+		apple,pll-dcdadj = <0x10>;
+		apple,pll-dlfcfg = <0x3>;
+		apple,pll-rodcoroleakcomp = <0x0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * No PMP runs off the M4 firmware path, and iBoot leaves DISPEXT0 powered
+ * with its CPU domain under hardware control: as on the J575c, the pipe has
+ * no power domain here, and Linux never switches it. Its front end (and
+ * through it DISPEXT0_SYS) is held by the boot framebuffer only: keep it on
+ * once the display driver has taken over, or the domain would be powered off
+ * under the running processor.
+ */
+&ps_dispext0_fe {
+	apple,always-on;
+};
+
+&dcpext0_mbox {
+	/delete-property/ power-domains;
+};
+
+&dcpext0_dart {
+	/delete-property/ power-domains;
+};
+
+&dispext0_dart {
+	/delete-property/ power-domains;
+};
+
+/*
+ * ADT /arm-io/dp2hdmi-gpio0: hdmi_hpd on AOP GPIO 41, hdmi_pwr_en on SMC
+ * gP0f and dp2hdmi_pwr_en on SMC gP1a (the J575c's rails). No Type-C route:
+ * dcpext0 drives only this port.
+ */
+&dcpext0 {
+	/delete-property/ power-domains;
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	phys = <&lpdptx_phy>;
+	phy-names = "dp-phy";
+	/* the crossbar's output 4 (ADT dptx-phy dp-switch-dfp-endpoint) */
+	apple,dptx-phy = <4>;
+	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
 };
 
 /*
@@ -313,4 +425,9 @@
 
 &avd {
 	status = "okay";
+};
+
+/* The J773g ADT has no DP855 on spi4. */
+&spi4 {
+	/delete-node/ panel-timing-controller@0;
 };

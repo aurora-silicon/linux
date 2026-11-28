@@ -3066,7 +3066,9 @@ struct AopHwConfig {
     required_endpoints: &'static [u8],
     /// The firmware runs segments from DRAM, which the bootloader reserves
     /// and lists in `memory-region`; check their IOMMU mappings before
-    /// starting it (T6040).
+    /// starting it (T6040). Other SoCs check them when the bootloader lists
+    /// them (`AopData::has_fw_regions`), as it does for the macOS 27.2
+    /// firmware on T8112.
     fw_regions: bool,
     bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
@@ -3431,7 +3433,7 @@ impl platform::Driver for AopDriver {
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
         let aop_mmio = aop_mmio.as_view();
-        let ed0p = if cfg.fw_regions {
+        let ed0p = if cfg.fw_regions || AopData::has_fw_regions(pdev.as_ref()) {
             // Before anything is written to the AOP: no mapping, no start.
             let allow_ed0p = cfg.patch_bootargs
                 && AopData::bootargs_has_ed0p(&aop_mmio, cfg.bootargs_word_access)?;

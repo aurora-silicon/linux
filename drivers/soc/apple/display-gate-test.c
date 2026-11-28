@@ -184,6 +184,13 @@ static void __init gt_remove(struct kunit *test, const char *path, const char *n
 	KUNIT_ASSERT_EQ(test, of_changeset_remove_property(&t->cs, np, prop), 0);
 }
 
+static void __init gt_add_bool(struct kunit *test, const char *path, const char *name)
+{
+	struct gate_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, gt_node(test, path), name), 0);
+}
+
 static void __init gt_add_u32(struct kunit *test, const char *path, const char *name, u32 val)
 {
 	struct gate_test *t = test->priv;
@@ -990,10 +997,13 @@ static void __init gt_expect_window(struct kunit *test, const char *path, const 
 
 /*
  * The panel as gt_expect_enabled() checks it, and the dcpext enabled or not
- * with all it needs. @window: the window both dcpext DARTs must have, NULL
- * for the device tree's own.
+ * with all it needs. When enabled, @shared says whether its scanout DART joins
+ * the display subsystem's domain (disabling fbdma) or stays out (leaving fbdma
+ * available for framebuffer mirroring). @window: the window both dcpext DARTs
+ * must have, NULL for the device tree's own.
  */
-static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 *window)
+static void __init gt_expect_dcpext_mode(struct kunit *test, bool enabled, bool shared,
+					 const u64 *window)
 {
 	struct device_node *display = gt_node(test, gt_t8122.display);
 	struct device_node *entry = gt_node(test, GT_T8122_DCPEXT_ENTRY);
@@ -1009,19 +1019,27 @@ static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 
 	KUNIT_EXPECT_EQ(test, of_property_read_bool(entry, "apple,defer-startup-ack"), enabled);
 	KUNIT_EXPECT_EQ(test, gt_u32(test, GT_T8122_DCPEXT_PS, "apple,min-state"),
 			enabled ? PMGR_PS_ACTIVE : 4);
-	/* Its scanout DART joins the display subsystem's, after the panel's. */
 	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"),
-			enabled ? 2 : 1);
+			(enabled && shared) ? 2 : 1);
 	if (enabled) {
-		KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus",
-								 "#iommu-cells", 1, &args), 0);
-		KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, GT_T8122_DISPEXT_DART));
-		of_node_put(args.np);
+		if (shared) {
+			KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus",
+									 "#iommu-cells", 1, &args),
+					0);
+			KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, GT_T8122_DISPEXT_DART));
+			of_node_put(args.np);
+		}
+		KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DCPEXT "/fbdma"), !shared);
 	}
 	gt_expect_window(test, GT_T8122_DCPEXT_DART, window ?: gt_t8122_dcpext_window);
 	gt_expect_window(test, GT_T8122_DISPEXT_DART, window ?: gt_t8122_dispext_window);
 	/* The panel's own window stays as it is. */
 	gt_expect_window(test, "/t8122-soc/iommu@28d30c000", gt_t8122_panel_window);
+}
+
+static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 *window)
+{
+	gt_expect_dcpext_mode(test, enabled, enabled, window);
 }
 
 static void __init gt_require_display_driver(struct kunit *test)
@@ -1046,6 +1064,58 @@ static void __init gate_t8122_dcpext_v14_7(struct kunit *test)
 	gt_run(test);
 	gt_expect_dcpext(test, true, NULL);
 	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+}
+
+/* The boot loader's default marker (<2>) is accepted alongside <1>. */
+static void __init gate_t8122_dcpext_loader_default_marker(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_add_u32(test, GT_T8122_DCPEXT, "apple,t8122-dcpext-firmware-ready", 2);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-version", gt_v14_7, 3);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", gt_v14_7, 3);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, NULL);
+}
+
+/* Any marker value other than 1 or 2 is refused. */
+static void __init gate_t8122_dcpext_other_marker(struct kunit *test)
+{
+	gt_add_u32(test, GT_T8122_DCPEXT, "apple,t8122-dcpext-firmware-ready", 3);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", gt_v14_7, 3);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* apple,no-shared-display-dart keeps dispext0_dart out and leaves fbdma on. */
+static void __init gate_t8122_dcpext_board_mirrors(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, NULL);
+}
+
+/* apple,no-shared-display-dart without an fbdma child is refused. */
+static void __init gate_t8122_dcpext_board_no_fbdma(struct kunit *test)
+{
+	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_detach(test, GT_T8122_DCPEXT "/fbdma");
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* On 27.2 with apple,no-shared-display-dart, DARTs get the panel window and fbdma stays on. */
+static void __init gate_t8122_dcpext_v27_2_mirrors(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_2, gt_v27_2);
+	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
+	gt_run(test);
+	gt_expect_dcpext_mode(test, true, false, gt_t8122_panel_window);
 }
 
 /*
@@ -1227,7 +1297,12 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_not_inherited_on),
 	KUNIT_CASE(gate_t8122_dcpext_not_ready),
 	KUNIT_CASE(gate_t8122_dcpext_v14_7),
+	KUNIT_CASE(gate_t8122_dcpext_loader_default_marker),
+	KUNIT_CASE(gate_t8122_dcpext_other_marker),
+	KUNIT_CASE(gate_t8122_dcpext_board_mirrors),
+	KUNIT_CASE(gate_t8122_dcpext_board_no_fbdma),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_mirrors),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_internal_v14),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_other_version),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_no_version),
@@ -1365,10 +1440,22 @@ static void __init gt_max_fill(struct kunit *test, unsigned int i)
 static void __init gt_max_expect_chain(struct kunit *test, unsigned int i, bool enabled)
 {
 	const struct gate_staged *st = &t6041_max_stages[i];
-	unsigned int n;
+	struct device_node *routes, *route;
+	unsigned int n, nr_routes = 0;
 
 	for (n = 0; n < st->nr; n++)
 		KUNIT_EXPECT_EQ_MSG(test, gt_okay(test, st->nodes[n]), enabled, "%s", st->nodes[n]);
+	if (!st->dt_routes)
+		return;
+	/* A chain that takes its routes from the tree has every one of them. */
+	routes = staged_routes(st);
+	KUNIT_ASSERT_NOT_NULL(test, routes);
+	for_each_child_of_node(routes, route) {
+		KUNIT_EXPECT_EQ_MSG(test, of_device_is_available(route), enabled, "%pOF", route);
+		nr_routes++;
+	}
+	of_node_put(routes);
+	KUNIT_EXPECT_GT(test, nr_routes, 0);
 }
 
 /*
@@ -1448,6 +1535,67 @@ static void __init gate_t6041_max_all_externals(struct kunit *test)
 	for (i = 0; i < 4; i++)
 		gt_max_expect_chain(test, i, true);
 	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2) | BIT(3));
+}
+
+/*
+ * dcpext3 takes its routes from the tree: with a route to a fourth Type-C port,
+ * as the J575c has, that route comes up with the chain too.
+ */
+static void __init gate_t6041_max_dt_routes(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+	struct device_node *route;
+
+	route = of_changeset_create_node(&t->cs, gt_node(test, "/dcp@306e00000/typec-routes"),
+					 "route@3");
+	KUNIT_ASSERT_NOT_NULL(test, route);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&t->cs, route, "reg", 3), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string(&t->cs, route, "status", "disabled"), 0);
+	gt_max_fill(test, 3);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 3, true);
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, "/dcp@306e00000/typec-routes/route@3"));
+	gt_max_expect_display(test, BIT(3));
+}
+
+static void __init gt_max_expect_dt_routes_refused(struct kunit *test)
+{
+	const struct gate_staged *st = &t6041_max_stages[3];
+	struct device_node *display = gt_node(test, "/display-subsystem");
+	unsigned int n;
+
+	gt_max_fill(test, 3);
+	gt_max_run(test);
+	for (n = 0; n < st->nr; n++)
+		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, st->nodes[n]), "%s", st->nodes[n]);
+	gt_max_expect_display(test, 0);
+
+	/* Direct application refuses it too and leaves the changeset untouched. */
+	if (gt_okay(test, st->nodes[st->nr - 1]))
+		return;
+	KUNIT_EXPECT_EQ(test, t6041_max_apply(3, display), -ENODEV);
+	for (n = 0; n < st->nr; n++)
+		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, st->nodes[n]), "%s", st->nodes[n]);
+	gt_max_expect_display(test, 0);
+}
+
+/* A dt_routes stage whose typec-routes container is missing stays off whole. */
+static void __init gate_t6041_max_dt_routes_missing(struct kunit *test)
+{
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@0");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@1");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@2");
+	gt_detach(test, "/dcp@306e00000/typec-routes");
+	gt_max_expect_dt_routes_refused(test);
+}
+
+/* A dt_routes stage whose typec-routes container has no routes stays off whole. */
+static void __init gate_t6041_max_dt_routes_empty(struct kunit *test)
+{
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@0");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@1");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@2");
+	gt_max_expect_dt_routes_refused(test);
 }
 
 /* The other processor's chain does not wait for one that was refused. */
@@ -1571,6 +1719,9 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_no_memory),
 	KUNIT_CASE(gate_t6041_max_second_usbc),
 	KUNIT_CASE(gate_t6041_max_all_externals),
+	KUNIT_CASE(gate_t6041_max_dt_routes),
+	KUNIT_CASE(gate_t6041_max_dt_routes_missing),
+	KUNIT_CASE(gate_t6041_max_dt_routes_empty),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
