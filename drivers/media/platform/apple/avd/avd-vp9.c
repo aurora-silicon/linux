@@ -198,7 +198,7 @@ struct avd_vp9_bank {
 	} bufs;
 	struct avd_vp9_frame_info cur;
 	struct avd_vp9_frame_info last;
-	u8 submit_num;
+	u32 submit_num;
 };
 
 struct avd_vp9_ctx {
@@ -1396,7 +1396,7 @@ static unsigned int avd_vp9_pp_kicks(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *priv = ctx->priv;
 
-	return max_t(int, priv->b->submit_num, 1);
+	return max_t(u32, priv->b->submit_num, 1);
 }
 
 static void avd_vp9_submit(struct avd_ctx *ctx)
@@ -1415,7 +1415,7 @@ static void avd_vp9_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < vp9_ctx->b->submit_num - 1; i++)
+	for (u32 i = 1; i < vp9_ctx->b->submit_num; i++)
 		writel(AVD_OP_EXEC | submit_mask |
 			       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),

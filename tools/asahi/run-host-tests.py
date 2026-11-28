@@ -164,6 +164,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('round-up', 'cpu-unaligned', 'seg-cpu-unaligned',
                                    'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'), out()),
     'avd-codec-tail-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    # The old revision wraps the PP kick count of 256 and more tiles.
+    'avd-pp-count-tests.py': [([], PASS),
+                              (['--ref', '255761f1d55f8dcf3e2c24d17095439237ad6f72'], KILL)],
     'bcm4377-completion-tests.py': [([], PASS)],
     # The old revision is the one before the J493 hardware-table ID match.
     'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
