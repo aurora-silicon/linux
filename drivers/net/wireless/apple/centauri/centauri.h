@@ -24,7 +24,11 @@ struct centauri {
 	void __iomem *bar;
 	resource_size_t size;
 	u32 stage_offset;
-	struct dentry *debug, *crash_file;
+	struct dentry *debug, *crash_file, *crash_saved_file;
+	/* The crash region and the firmware log as a restart found them, kept for debugfs */
+	void *crash_saved, *log_saved;
+	u32 crash_saved_len, log_saved_len;
+	struct dentry *log_saved_file;
 	struct mutex boot_lock;
 	void *firmware, *descriptor, *msi_page;
 	dma_addr_t firmware_dma, descriptor_dma, msi_dma;
@@ -46,27 +50,16 @@ struct centauri {
 	bool inject_stall;	/* debugfs test: the next check finds the firmware stopped */
 };
 
-/* One row per machine with an N1: the FTAB file name, the word written to BAR+0x807c,
- * (board-id << 16) | chip-id from the machine's ADT /chosen, and the physical addresses and
- * the one differing register value of the port cycle (centauri_port.c).
- * J813: board 0x24, chip 0x8142 (measured); port, PHY lane and PERST pad from the live ADT.
- * J815 (MacBook Air 15" M5): board 0x26, chip 0x8142 from its ADT /chosen; same T8142 port 0
- * config/lane and PERST# (pci-bridge0 function-perst = gpio0 pin 0xc0 -> 0x39a000300) as J813,
- * and the same N1 image (t2026macG1 ftab in the J813 and J815 restore identities). Its stub is
- * macOS 27.0, so it takes the 27.0 adapter's link TLV 386 and scan TLVs.
- * J873 (Mac mini M6): board 0x24, chip 0x8152 from its ADT, the composition taken from the J813
- * word; port 0 config 0x388028000, lane 0x38f010000 and PERST# gpio0 pin 3 (0x31a000000 + 4 * 3)
- * from its ADT; config +0x130 is 0x208 as in the m1n1 T8152 bring-up that links the port.
- * keep_port_tables: the J813 sequence zeroes the 16 words at port+0x3000 and the 256 words at
- * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
- * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and
- * its DMA arrives as SID 0 (DART "BPF reject"). Such a board gets its RID2SID table written
- * back; the MSI map and the MSI address/config are restored on every board.
- * link_tlv, scan_tlvs: the macOS 27.0 WLAN adapter differs from the 26.6.1 one the J813 recipe
- * came from. startInterface carries the three link addresses in TLV 386 (was 385), and the scan
- * request (command 0x1000f) carries a channel-list TLV 0x104 and an OCE TLV 0x165 after the fixed
- * 14 bytes. The J873 scan crash in SCHED_Req_Add came from a zero passive dwell in those 14 bytes
- * (see build_scan), not from the missing TLVs; whether the TLVs are required is untested.
+/* Per-board hardware descriptors: FTAB firmware path, ROM board word
+ * ((board-id << 16) | chip-id written to BAR+0x807c), PCIe root-port
+ * addresses and link-tuning parameters (centauri_port.c), plus firmware
+ * protocol feature flags (link_tlv for startInterface link-address TLV
+ * and scan_tlvs for explicit channel-list/OCE scan TLVs).
+ *
+ * keep_port_tables: on platforms where port+0x3000/0x3800 hold the
+ * PCIe RID2SID and MSIMAP tables programmed by pcie-apple, save and
+ * restore RID2SID across the port reset cycle so function 0 retains
+ * its IOMMU stream mapping.
  */
 struct centauri_board {
 	const char *compatible;
@@ -92,6 +85,9 @@ static inline const struct centauri_board *centauri_board(void)
 		{ "apple,j873g", "apple/centauri/j873-ftab.bin", 0x00248152,
 		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
 		  386, true },
+		{ "apple,j804", "apple/centauri/j804-ftab.bin", 0x00228152,
+		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
+		  386, true },
 	};
 	int i;
 
@@ -104,6 +100,7 @@ static inline const struct centauri_board *centauri_board(void)
 int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret);
 bool centauri_warm_reset_described(struct pci_dev *pdev);
 int centauri_start_ipc(struct centauri *c);
+void centauri_save_crash(struct centauri *c);
 bool centauri_beta_running(struct centauri *c);
 bool centauri_stop_dma(struct pci_dev *pdev);
 bool centauri_stop_ipc(struct centauri *c);

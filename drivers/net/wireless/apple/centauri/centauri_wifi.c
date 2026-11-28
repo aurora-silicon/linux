@@ -1,35 +1,49 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* cfg80211 connection to the measured Alpha command/management rings.
- * Control queues recycle across hardware-validated wraps. Packet data uses
- * a separate protocol; never report transmit success before implementing it.
- */
+/* cfg80211 driver for the Apple N1 Alpha Wi-Fi ACIPC transport. */
+#include <linux/bitfield.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
+#include <linux/hex.h>
 #include <linux/debugfs.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
+#include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
 #include <net/regulatory.h>
+#include <net/sock.h>
 #include "centauri.h"
+#include "centauri_awdl.h"
 
 #define CR_BASE 0x100000
 #define TR_BASE 0x400000
 #define RING_SPAN 0x20000
 #define TX_BUFFER 0x600000
 #define BUFFER_SIZE 2048
+#define REPLY_SIZE (BUFFER_SIZE - 24)
+/* The band plan: 2.4 GHz 1-14, 5 GHz 36-64, 100-144 and 149-177, 6 GHz 1-233. */
+#define CEN_CHANNELS (14 + 28 + 59)
 #define DATA_TX_BUFFER 0xd00000
 #define DATA_RX_BUFFER 0xe00000
 #define DATA_TX_SLOTS 128
 #define DATA_TX_QUEUE_LIMIT 64
+#define DATA_TX_INFLIGHT_MAX 64
+#define DATA_TX_PACING_SHIFT 7
 
 /* The firmware owns window +8 MiB through +13 MiB as scratch memory. */
 static_assert(DATA_TX_BUFFER >= CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
-static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= DATA_RX_BUFFER);
+static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <= CEN_AWDL_TX_BUF_BASE);
+static_assert(CEN_AWDL_TX_BUF_BASE +
+	      CEN_AWDL_TOTAL_TX_RINGS * CEN_AWDL_TX_RING_BUF_SPAN <=
+	      DATA_RX_BUFFER);
+static_assert(CEN_AWDL_TR_BASE + CEN_AWDL_TOTAL_TX_RINGS * CEN_AWDL_TR_STRIDE <= TX_BUFFER);
 
 static bool auto_rings = true;
 module_param(auto_rings, bool, 0644);
@@ -107,7 +121,8 @@ struct centauri_wifi {
 	struct work_struct connect_work;
 	struct delayed_work link_work;
 	struct cfg80211_scan_request *scan_request;
-	bool scan_abort;
+	bool scan_abort, connect_abort;
+	u8 scan_sequence;
 	struct mutex lock;
 	/* The logger has its own coherent allocation. Reads/acknowledgements
 	 * must remain possible while scan/connect hold the command mutex.
@@ -117,17 +132,24 @@ struct centauri_wifi {
 	u16 main_head, command_head, sequence;
 	u32 rx_seen[5];
 	u16 rx_next[5], rx_head[5];
-	u16 reply_sequence, reply_status;
+	u16 reply_sequence, reply_status, reply_capture;
 	u32 reply_command, channels_seen, scans_done, beacons_seen;
 	bool reply_valid, registered, configured;
+	u8 *reply_buffer;
+	size_t reply_capacity, reply_size;
 	bool stopping;
 	bool transport_paused, transport_sleep_sent, host_sleep_sent;
+	bool host_events_fallback_logged;
 	bool connecting, connected, connect_event, disconnect_event;
+	bool connect_privacy;
 	bool associated, pmk_seen, pmk_matches;
 	u8 expected_pmk[32];
-	u16 connect_status;
+	u16 connect_status, disconnect_reason;
+	bool disconnect_local;
+	struct ieee80211_channel *connect_channel;
 	u8 bssid[ETH_ALEN], connect_payload[1024], request_ie[256];
-	size_t connect_size, request_ie_size;
+	u8 ssid[IEEE80211_MAX_SSID_LEN];
+	size_t connect_size, request_ie_size, ssid_len;
 	struct dentry *data_probe_file;
 	struct dentry *data_status_file;
 	struct dentry *data_rx_snapshot_file;
@@ -138,6 +160,36 @@ struct centauri_wifi {
 	bool data_tx_busy[DATA_TX_SLOTS];
 	u32 data_tx_submitted, data_tx_completed, data_tx_failed;
 	u32 data_tx_coalesced, data_tx_bad;
+	u32 data_tx_capped, data_tx_cap_bypassed;
+	unsigned long data_tx_completed_at;
+	struct napi_struct rx_napi;
+	struct sk_buff_head rx_gro_queue;
+	s8 station_signal, station_noise;
+	bool station_signal_valid, station_noise_valid;
+	s8 station_chain_signal[2], station_phy_noise;
+	u8 station_chains;
+	bool station_phy_noise_valid;
+	u32 station_tx_retrans, station_tx_retrans_base;
+	bool station_tx_retrans_valid, station_tx_retrans_base_valid;
+	u32 station_tx_fail, station_tx_fail_base;
+	bool station_tx_fail_valid, station_tx_fail_base_valid;
+	u32 station_rx_rate_kbps, station_chip_tx_rate_kbps;
+	bool station_rx_rate_valid, station_chip_tx_rate_valid;
+	u32 station_beacon_rx, station_beacon_rx_base;
+	u32 station_beacon_loss, station_beacon_loss_base;
+	bool station_beacon_valid, station_beacon_base_valid;
+	u64 station_cca_active_ms, station_cca_busy_ms, station_cca_tx_ms;
+	bool station_cca_valid;
+	struct rate_info station_tx_rate;
+	int station_tx_power_dbm;
+	bool station_tx_rate_valid, station_tx_power_valid;
+	struct cfg80211_chan_def station_chandef;
+	u8 station_bw_primary;
+	bool station_chandef_valid;
+	unsigned long station_signal_at, station_noise_at, station_counters_at;
+	unsigned long station_cca_at, station_tx_info_at, station_beacon_at;
+	unsigned long station_phy_dump_at, connected_at;
+	struct net_device_stats station_start;
 	struct dentry *station_stats_file;
 	struct dentry *eapol_start_file;
 	struct dentry *country_file;
@@ -173,8 +225,15 @@ struct centauri_wifi {
 	struct dentry *tx_power_report_file;
 	u16 stats_reply_size, stats_tag, stats_length;
 	u32 data_probe_done;
-	struct ieee80211_supported_band bands[2];
-	struct ieee80211_channel channels[39];
+	u32 data_rx_awdl_ring;	/* completions taken from ring 18 */
+	u32 data_awdl_txc, data_awdl_cr79;	/* entries taken from 78 / 79 */
+	struct ieee80211_supported_band bands[3];
+	struct ieee80211_channel channels[CEN_CHANNELS];
+	struct ieee80211_sband_iftype_data iftype_data[3];
+	u8 hw_channels[REPLY_SIZE], system_caps[REPLY_SIZE];
+	u8 stats_reply[REPLY_SIZE];
+	struct debugfs_blob_wrapper hw_channels_blob, system_caps_blob;
+	struct centauri_awdl *awdl;
 };
 
 /* These helpers require wifi->lock, including from the connect worker. */
@@ -184,18 +243,49 @@ static int query_link_status(struct centauri_wifi *wifi);
 
 static const u32 rx_buffer[5] = { 0, 0, 0x620000, 0x680000, 0x700000 };
 static const u16 ring_size[5] = { 0, 64, 192, 96, 192 };
-static const u16 five_ghz[] = {
-	36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112,
-	116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+static const struct {
+	enum nl80211_band band;
+	u8 first, last, step;
+} band_plan[] = {
+	{ NL80211_BAND_2GHZ, 1, 14, 1 },
+	{ NL80211_BAND_5GHZ, 36, 64, 4 },
+	{ NL80211_BAND_5GHZ, 100, 144, 4 },
+	{ NL80211_BAND_5GHZ, 149, 177, 4 },
+	{ NL80211_BAND_6GHZ, 1, 233, 4 },
 };
 static struct ieee80211_rate rates[] = {
 	{ .bitrate = 10 }, { .bitrate = 20 }, { .bitrate = 55 }, { .bitrate = 110 },
 	{ .bitrate = 60 }, { .bitrate = 90 }, { .bitrate = 120 }, { .bitrate = 180 },
 	{ .bitrate = 240 }, { .bitrate = 360 }, { .bitrate = 480 }, { .bitrate = 540 },
 };
-static const u32 cipher_suites[] = {
-	WLAN_CIPHER_SUITE_CCMP, WLAN_CIPHER_SUITE_AES_CMAC,
+
+static const u32 akm_suites[] = {
+	WLAN_AKM_SUITE_PSK,
+	WLAN_AKM_SUITE_PSK_SHA256,
+	WLAN_AKM_SUITE_SAE,
 };
+static const u32 cipher_suites[] = {
+	WLAN_CIPHER_SUITE_TKIP,
+	WLAN_CIPHER_SUITE_CCMP,
+	WLAN_CIPHER_SUITE_GCMP,
+	WLAN_CIPHER_SUITE_GCMP_256,
+	WLAN_CIPHER_SUITE_AES_CMAC,
+};
+
+/* The firmware's band numbers: 0 is 2.4 GHz, 1 is 5 GHz, 2 is 6 GHz. */
+static int firmware_band(enum nl80211_band band)
+{
+	switch (band) {
+	case NL80211_BAND_2GHZ:
+		return 0;
+	case NL80211_BAND_5GHZ:
+		return 1;
+	case NL80211_BAND_6GHZ:
+		return 2;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
 
 static u16 index_read(struct centauri_wifi *wifi, unsigned int array, unsigned int index)
 {
@@ -219,29 +309,30 @@ static void completions(struct centauri_wifi *wifi)
 
 static int alpha_message(struct centauri_wifi *wifi, const void *message, size_t size)
 {
-	u16 head = wifi->main_head;
+	u16 head = wifi->main_head % 16;
+	u16 next = (head + 1) % 16;
 	u8 *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
 
 	if (READ_ONCE(wifi->transport_paused))
 		return -EBUSY;
-	if (head >= 15 || size > 512)
+	if (size > 512)
 		return -ENOSPC;
 	memcpy(wifi->a.messages + (head + 1) * 512, message, size);
 	descriptor = wifi->a.context + wifi->a.mtr + 16 * head;
 	put_unaligned_le32(1 | (size << 8), descriptor);
 	put_unaligned_le64(wifi->a.messages_dma + (head + 1) * 512, descriptor + 4);
 	put_unaligned_le32(head + 1, descriptor + 12);
-	index_write(wifi, 3, 0, head + 1);
-	if (head)
-		index_write(wifi, 3, 8, head + 1);
+	index_write(wifi, 3, 0, next);
+	if (wifi->main_head)
+		index_write(wifi, 3, 8, next);
 	dma_wmb();
 	wifi->main_head++;
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		if (readl(wifi->a.bar + 8) != 2)
 			return -EIO;
-		if (index_read(wifi, 1, 0) >= head + 1) {
+		if (index_read(wifi, 1, 0) == next) {
 			dma_rmb();
 			completions(wifi);
 			return 0;
@@ -281,29 +372,41 @@ static void report_beacon(struct centauri_wifi *wifi, const u8 *payload, size_t 
 	struct cfg80211_bss *bss;
 	u16 frame_size;
 	int number = 0, frequency, signal;
-	enum nl80211_band band;
+	enum nl80211_band band = NL80211_BAND_2GHZ;
 
 	if (!wifi->registered || size < 0x60 + 36)
 		return;
-	/* The ACIPC packet length is authoritative; the vendor descriptor's
-	 * separate 802.11 length can include a stripped FCS. The measured parser
-	 * consumes the frame bytes that were actually returned.
-	 */
 	frame_size = size - 0x60;
 	frame = payload + 0x60;
-	if (!ieee80211_is_beacon(*(__le16 *)frame) && !ieee80211_is_probe_resp(*(__le16 *)frame))
+	if (!ieee80211_is_beacon(*(__le16 *)frame) && !ieee80211_is_probe_resp(*(__le16 *)frame)) {
+		if (ieee80211_is_action(*(__le16 *)frame) &&
+		    centauri_awdl_is_active(wifi->awdl))
+			centauri_awdl_rx_mgmt(wifi->awdl, payload, size);
 		return;
+	}
 	end = frame + frame_size;
 	for (ie = frame + 36; ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
-		if ((ie[0] == WLAN_EID_DS_PARAMS || ie[0] == WLAN_EID_HT_OPERATION) && ie[1])
+		if ((ie[0] == WLAN_EID_DS_PARAMS || ie[0] == WLAN_EID_HT_OPERATION) && ie[1]) {
 			number = ie[2];
+			band = number <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ;
+		} else if (ie[0] == WLAN_EID_EXTENSION && ie[1] > 1 &&
+			   ie[2] == WLAN_EID_EXT_HE_OPERATION &&
+			   ie[1] - 1 >= sizeof(struct ieee80211_he_operation) &&
+			   ie[1] >= ieee80211_he_oper_size(ie + 3)) {
+			const struct ieee80211_he_6ghz_oper *oper =
+				ieee80211_he_6ghz_oper((const void *)(ie + 3));
+
+			if (oper && !number) {
+				number = oper->primary;
+				band = NL80211_BAND_6GHZ;
+			}
+		}
 	}
 	if (!number)
 		return;
-	band = number <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ;
 	frequency = ieee80211_channel_to_frequency(number, band);
 	channel = ieee80211_get_channel(wifi->wiphy, frequency);
-	if (!channel)
+	if (!channel || channel->flags & IEEE80211_CHAN_DISABLED)
 		return;
 	signal = max((s8)payload[0x16], (s8)payload[0x17]);
 	if (signal >= 0 || signal < -127)
@@ -327,45 +430,109 @@ static void post_receive(struct centauri_wifi *wifi, unsigned int ring, u16 slot
 	put_unaligned_le32(slot + 1, descriptor + 12);
 }
 
-/* Host-owned RX buffer cookies and completion length are the ACIPC fields
- * validated in probe 28. Probe 29 validates the footer's prefix length and
- * Ethernet framing with IPv4 header checksums and IPv6 payload lengths.
- * Called with wifi->lock, including during connect/command polling.
- */
-static void drain_data_rx(struct centauri_wifi *wifi)
+static bool data_rx_frame(const u8 *packet, unsigned int capacity,
+			  unsigned int length, u32 footer, unsigned int *offset,
+			  unsigned int *frame_length)
 {
-	u16 head, tail, post;
-	unsigned int processed = 0;
+	unsigned int padding = (footer >> 12) & 15;
 
-	if (!(wifi->data_probe_done & BIT(4)) || readl(wifi->a.bar + 8) != 2)
-		return;
-	head = index_read(wifi, 0, 207);
-	tail = index_read(wifi, 2, 207);
-	post = index_read(wifi, 3, 12);
-	if (head >= 128 || tail >= 128 || post >= 128) {
+	if (!(footer & BIT(7)))
+		return false;
+	if (length < padding + ETH_HLEN || length > capacity)
+		return false;
+	if (footer & BIT(24)) {
+		if (capacity < 4)
+			return false;
+		*offset = get_unaligned_le16(packet + 2);
+	} else {
+		*offset = padding;
+	}
+	*frame_length = length - padding;
+	return *offset <= capacity && *frame_length <= capacity - *offset;
+}
+
+static int rx_poll(struct napi_struct *napi, int budget)
+{
+	struct centauri_wifi *wifi =
+		container_of(napi, struct centauri_wifi, rx_napi);
+	struct sk_buff *skb;
+	int done = 0;
+
+	while (done < budget && (skb = skb_dequeue(&wifi->rx_gro_queue))) {
+		napi_gro_receive(napi, skb);
+		done++;
+	}
+	if (done < budget && napi_complete_done(napi, done) &&
+	    !skb_queue_empty(&wifi->rx_gro_queue))
+		napi_schedule(napi);
+	return done;
+}
+
+/*
+ * Take the completions of one receive ring (15 or 18 on buffer ring 12, 12 on
+ * buffer ring 13) and give their buffers back on the pool from *postp. Called
+ * with wifi->lock.
+ */
+static bool drain_rx_ring(struct centauri_wifi *wifi, u16 vec, u32 off,
+			  u16 pool, u32 desc_off, u32 buf_base,
+			  u16 *postp, unsigned int *processedp, bool *repostedp,
+			  struct sk_buff_head *frames)
+{
+	u16 head, tail, post = *postp;
+	unsigned int processed = *processedp;
+	bool consumed = false, reposted = *repostedp;
+
+	head = index_read(wifi, 0, vec);
+	tail = index_read(wifi, 2, vec);
+	if (head >= 128 || tail >= 128) {
 		wifi->data_rx_bad++;
-		return;
+		return false;
 	}
 	dma_rmb();
 	while (tail != head && processed < 127) {
-		u8 *completion = wifi->a.window + 0x240000 + tail * 32;
+		u8 *completion = wifi->a.window + off + tail * 32;
 		u32 header = get_unaligned_le32(completion);
 		u32 info = get_unaligned_le32(completion + 4);
+		u32 status = get_unaligned_le32(completion + 8);
 		u16 cookie = info & 0xffff, length = info >> 16;
 		u16 next = (post + 1) % 128;
+		bool valid_cookie = cookie >= 1 && cookie <= 127;
 		u32 count = le32_to_cpu(wifi->rx_snapshot.count);
 		u8 *packet, *descriptor;
 		u32 buffer;
 
-		if ((header >> 16) != 12 || !cookie || cookie > 127 ||
-		    length > 4096 || get_unaligned_le32(completion + 8)) {
+		if ((header >> 16) != pool || !valid_cookie || length > 4096 ||
+		    status) {
+			if ((header >> 16) == pool && valid_cookie &&
+			    next == index_read(wifi, 1, pool))
+				break;
 			wifi->data_rx_bad++;
-			break;
+			wifi->netdev->stats.rx_errors++;
+			dev_warn_ratelimited(&wifi->control->pdev->dev,
+					     "Wi-Fi data RX bad completion: ring=%u cookie=%u len=%u status=%#x\n",
+					     header >> 16, cookie, length,
+					     status);
+			if ((header >> 16) == pool && valid_cookie) {
+				buffer = buf_base + (cookie - 1) * 4096;
+				descriptor = wifi->a.window + desc_off +
+					     post * 16;
+				put_unaligned_le32(1 | (4096 << 8), descriptor);
+				put_unaligned_le64(wifi->a.window_dma + buffer,
+						   descriptor + 4);
+				put_unaligned_le32(cookie, descriptor + 12);
+				wifi->data_rx_reposted++;
+				post = next;
+				reposted = true;
+			}
+			tail = (tail + 1) % 128;
+			consumed = true;
+			processed++;
+			continue;
 		}
 		/* Do not overwrite a descriptor the receive engine still owns. */
-		if (next == index_read(wifi, 1, 12))
+		if (next == index_read(wifi, 1, pool))
 			break;
-		buffer = DATA_RX_BUFFER + (cookie - 1) * 4096;
+		buffer = buf_base + (cookie - 1) * 4096;
 		packet = wifi->a.window + buffer;
 		if (count < ARRAY_SIZE(wifi->rx_snapshot.sample)) {
 			memcpy(wifi->rx_snapshot.sample[count].completion, completion, 32);
@@ -374,43 +541,174 @@ static void drain_data_rx(struct centauri_wifi *wifi)
 			wifi->rx_snapshot.count = cpu_to_le32(count + 1);
 		}
 		wifi->data_rx_received++;
-		if (wifi->connected && netif_running(wifi->netdev)) {
+		{
 			u32 footer = get_unaligned_le32(completion + 12);
-			unsigned int padding = (footer >> 12) & 15;
-			struct sk_buff *skb = NULL;
+			u8 if_id = cen_rx_footer_if_id(footer);
+			unsigned int offset, frame_length;
 
-			/* Extended prefix headers are not decoded yet. */
-			if (!(footer & BIT(24)) && length >= padding + ETH_HLEN)
-				skb = netdev_alloc_skb_ip_align(wifi->netdev, length - padding);
-			if (skb) {
-				skb_put_data(skb, packet + padding, length - padding);
-				skb->protocol = eth_type_trans(skb, wifi->netdev);
-				skb->ip_summed = CHECKSUM_NONE;
-				wifi->netdev->stats.rx_packets++;
-				wifi->netdev->stats.rx_bytes += length - padding;
-				netif_rx(skb);
+			if (!data_rx_frame(packet, 4096, length, footer,
+					   &offset, &frame_length)) {
+				if (if_id == CEN_IF_AWDL)
+					centauri_awdl_rx_frame(wifi->awdl, NULL, 0);
+				else
+					wifi->netdev->stats.rx_dropped++;
+			} else if (if_id == CEN_IF_AWDL) {
+				centauri_awdl_rx_frame(wifi->awdl,
+						       packet + offset,
+						       frame_length);
+			} else if (wifi->connected && netif_running(wifi->netdev)) {
+				struct sk_buff *skb =
+					netdev_alloc_skb_ip_align(wifi->netdev,
+								  frame_length);
+
+				if (skb) {
+					skb_put_data(skb, packet + offset,
+						     frame_length);
+					skb->protocol = eth_type_trans(skb, wifi->netdev);
+					skb->ip_summed = CHECKSUM_NONE;
+					wifi->netdev->stats.rx_packets++;
+					wifi->netdev->stats.rx_bytes += frame_length;
+					__skb_queue_tail(frames, skb);
+				} else {
+					wifi->netdev->stats.rx_dropped++;
+				}
 			} else {
 				wifi->netdev->stats.rx_dropped++;
 			}
-		} else {
-			wifi->netdev->stats.rx_dropped++;
 		}
-		descriptor = wifi->a.window + 0x520000 + post * 16;
+		descriptor = wifi->a.window + desc_off + post * 16;
 		put_unaligned_le32(1 | (4096 << 8), descriptor);
 		put_unaligned_le64(wifi->a.window_dma + buffer, descriptor + 4);
 		put_unaligned_le32(cookie, descriptor + 12);
 		wifi->data_rx_reposted++;
 		tail = (tail + 1) % 128;
 		post = next;
+		consumed = true;
+		reposted = true;
 		processed++;
 	}
-	if (processed) {
+	*postp = post;
+	*processedp = processed;
+	*repostedp = reposted;
+	if (consumed) {
 		dma_wmb();
-		index_write(wifi, 2, 207, tail);
-		index_write(wifi, 3, 12, post);
+		index_write(wifi, 2, vec, tail);
+	}
+	return consumed;
+}
+
+/*
+ * Rings 78 (interface 1 TX completions, same entry layout as ring 76) and
+ * 79 (type 7, layout unknown: its entries are counted and released). Called
+ * with wifi->lock.
+ */
+static void drain_awdl_crs(struct centauri_wifi *wifi)
+{
+	unsigned int r;
+
+	if (READ_ONCE(wifi->transport_paused) || readl(wifi->a.bar + 8) != 2)
+		return;
+	for (r = 0; r < 2; r++) {
+		u16 vec = r ? 195 : 194, head, tail;
+		u32 off = r ? 0x2a0000 : 0x280000;
+		bool done = false;
+
+		if (!(wifi->data_probe_done & BIT(7 + r)))
+			continue;
+		head = index_read(wifi, 0, vec);
+		tail = index_read(wifi, 2, vec);
+		if (head >= 1024 || tail >= 1024) {
+			wifi->data_tx_bad++;
+			continue;
+		}
+		dma_rmb();
+		while (tail != head) {
+			u8 *entry = wifi->a.window + off + tail * 32;
+
+			if (r) {
+				wifi->data_awdl_cr79++;
+			} else {
+				wifi->data_awdl_txc++;
+				centauri_awdl_tx_complete(wifi->awdl,
+							  get_unaligned_le32(entry) >> 16,
+							  get_unaligned_le16(entry + 4),
+							  get_unaligned_le16(entry + 9),
+							  entry[1], entry[12]);
+			}
+			tail = (tail + 1) % 1024;
+			done = true;
+		}
+		if (done) {
+			dma_wmb();
+			index_write(wifi, 2, vec, tail);
+		}
+	}
+}
+
+/* Called with wifi->lock, including during connect/command polling. */
+static void drain_data_rx(struct centauri_wifi *wifi)
+{
+	u16 post;
+	unsigned int processed = 0;
+	bool any_consumed = false, reposted = false;
+	struct sk_buff_head frames;
+
+	__skb_queue_head_init(&frames);
+
+	if (READ_ONCE(wifi->transport_paused) ||
+	    !(wifi->data_probe_done & BIT(4)) || readl(wifi->a.bar + 8) != 2)
+		return;
+	post = index_read(wifi, 3, 12);
+	if (post >= 128) {
+		wifi->data_rx_bad++;
+		return;
+	}
+	/* Ring 15 completes interface 0, ring 18 (when open) interface 1. */
+	if (drain_rx_ring(wifi, 207, 0x240000, 12, 0x520000, DATA_RX_BUFFER,
+			  &post, &processed, &reposted, &frames))
+		any_consumed = true;
+	if ((wifi->data_probe_done & BIT(6)) &&
+	    drain_rx_ring(wifi, 210, 0x260000, 12, 0x520000, DATA_RX_BUFFER,
+			  &post, &processed, &reposted, &frames)) {
+		any_consumed = true;
+		wifi->data_rx_awdl_ring++;
+	}
+	if (any_consumed || reposted) {
+		dma_wmb();
+		if (reposted)
+			index_write(wifi, 3, 12, post);
 		dma_wmb();
 		writel(1, wifi->a.bar + 0x1050);
 	}
+	if (!skb_queue_empty(&frames)) {
+		spin_lock_bh(&wifi->rx_gro_queue.lock);
+		skb_queue_splice_tail_init(&frames, &wifi->rx_gro_queue);
+		spin_unlock_bh(&wifi->rx_gro_queue.lock);
+		local_bh_disable();
+		napi_schedule(&wifi->rx_napi);
+		local_bh_enable();
+	}
+}
+
+bool centauri_wifi_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
+				      u16 ring_slots, unsigned int *first,
+				      u16 *count)
+{
+	bool counted = (flags & BIT(0)) || (flags & 0x0e) == 8;
+
+	if (!cookie || cookie > ring_slots || counted != !!wire_count ||
+	    wire_count >= ring_slots)
+		return false;
+	*count = counted ? wire_count : 1;
+	*first = (cookie + ring_slots - *count) % ring_slots;
+	return true;
+}
+
+static bool data_tx_completion_span(u16 cookie, u16 wire_count, u8 flags,
+				    unsigned int *first, u16 *count)
+{
+	return centauri_wifi_tx_completion_span(cookie, wire_count, flags,
+						DATA_TX_SLOTS, first, count);
 }
 
 /* Serialized with the firmware poller. Payload slots remain owned until a
@@ -418,17 +716,24 @@ static void drain_data_rx(struct centauri_wifi *wifi)
  */
 static void drain_data_tx(struct centauri_wifi *wifi)
 {
-	u16 head, tail, post;
+	u16 head, tail, post = 0;
 	unsigned int budget = 256;
 	bool posted = false, completed = false;
+	bool sta_ring = !!(wifi->data_probe_done & BIT(5));
+	bool awdl_active = centauri_awdl_is_active(wifi->awdl);
 
-	if (!(wifi->data_probe_done & BIT(5)) || readl(wifi->a.bar + 8) != 2)
+	if (READ_ONCE(wifi->transport_paused) ||
+	    !(wifi->data_probe_done & BIT(0)) ||
+	    (!sta_ring && !awdl_active) || readl(wifi->a.bar + 8) != 2)
 		return;
 	head = index_read(wifi, 0, 192);
 	tail = index_read(wifi, 2, 192);
-	post = index_read(wifi, 3, 25);
-	if (head >= 2048 || tail >= 2048 || post >= DATA_TX_SLOTS)
+	if (sta_ring)
+		post = index_read(wifi, 3, 25);
+	if (head >= 2048 || tail >= 2048 || (sta_ring && post >= DATA_TX_SLOTS)) {
+		wifi->data_tx_bad++;
 		return;
+	}
 	dma_rmb();
 	while (tail != head && budget--) {
 		u8 *entry = wifi->a.window + 0x200000 + tail * 32;
@@ -437,30 +742,46 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		u16 count = get_unaligned_le16(entry + 9);
 		u8 status = entry[12];
 
-		if (ring == 25) {
+		if (ring == 25 && sta_ring) {
 			unsigned int first, i;
 
-			/* Airship cr_controller::sync maps CD bytes 9:10 to the
-			 * transfer count. With the multicomp flag (CD byte 1 bit 0),
-			 * the cookie names the LAST transfer; prior transfers share
-			 * its completion status. We submit one contiguous DMA buffer
-			 * per slot, so those preceding cookies must all still be busy.
-			 */
-			if (!cookie || cookie > DATA_TX_SLOTS || !count ||
-			    count >= DATA_TX_SLOTS || !(entry[1] & 1)) {
+			if (!data_tx_completion_span(cookie, count, entry[1],
+						     &first, &count)) {
 				wifi->data_tx_bad++;
-				break;
+				dev_warn_ratelimited(&wifi->control->pdev->dev,
+						     "Wi-Fi data TX bad completion: cookie=%u count=%u flags=%#x status=%#x\n",
+						     cookie, count, entry[1],
+						     status);
+				tail = (tail + 1) % 2048;
+				completed = true;
+				continue;
 			}
-			first = (cookie + DATA_TX_SLOTS - count) % DATA_TX_SLOTS;
 			for (i = 0; i < count; i++)
 				if (!wifi->data_tx_busy[(first + i) % DATA_TX_SLOTS])
 					break;
 			if (i != count) {
 				wifi->data_tx_bad++;
-				break;
+				dev_warn_ratelimited(&wifi->control->pdev->dev,
+						     "Wi-Fi data TX unexpected slot state: first=%u count=%u status=%#x\n",
+						     first, count, status);
+				for (i = 0; i < count; i++) {
+					unsigned int slot = (first + i) %
+							    DATA_TX_SLOTS;
+
+					if (!wifi->data_tx_busy[slot])
+						continue;
+					wifi->data_tx_busy[slot] = false;
+					wifi->data_tx_completed++;
+					wifi->data_tx_failed++;
+					wifi->netdev->stats.tx_errors++;
+				}
+				tail = (tail + 1) % 2048;
+				completed = true;
+				continue;
 			}
 			if (count > 1)
 				wifi->data_tx_coalesced++;
+			wifi->data_tx_completed_at = jiffies;
 			for (i = 0; i < count; i++) {
 				unsigned int slot = (first + i) % DATA_TX_SLOTS;
 
@@ -474,14 +795,18 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 				}
 				wifi->data_tx_busy[slot] = false;
 			}
+		} else {
+			centauri_awdl_tx_complete(wifi->awdl, ring, cookie,
+						  count, entry[1], status);
 		}
 		tail = (tail + 1) % 2048;
 		completed = true;
 	}
 	if (completed)
 		index_write(wifi, 2, 192, tail);
-	budget = DATA_TX_SLOTS - 1;
+	budget = sta_ring ? DATA_TX_SLOTS - 1 : 0;
 	while (wifi->connected && !READ_ONCE(wifi->stopping) &&
+	       !READ_ONCE(wifi->transport_paused) &&
 	       netif_running(wifi->netdev) && budget--) {
 		u16 next = (post + 1) % DATA_TX_SLOTS;
 		u32 buffer = DATA_TX_BUFFER + post * BUFFER_SIZE;
@@ -489,9 +814,22 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		struct sk_buff *skb;
 		u8 destination[ETH_ALEN];
 		u64 metadata = 6ULL << 27;
+		u32 inflight = wifi->data_tx_submitted - wifi->data_tx_completed;
 
 		if (wifi->data_tx_busy[post] || next == index_read(wifi, 1, 25))
 			break;
+		if (inflight >= DATA_TX_INFLIGHT_MAX &&
+		    !skb_queue_empty(&wifi->data_tx_queue)) {
+			if (time_before(jiffies,
+					wifi->data_tx_completed_at + HZ / 2)) {
+				wifi->data_tx_capped++;
+				break;
+			}
+			if (!wifi->data_tx_cap_bypassed++)
+				dev_warn(&wifi->control->pdev->dev,
+					 "Wi-Fi TX: no completion for %u in-flight frames; posting past the cap\n",
+					 inflight);
+		}
 		skb = skb_dequeue(&wifi->data_tx_queue);
 		if (!skb)
 			break;
@@ -514,27 +852,21 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		put_unaligned_le32(3 | (skb->len << 8), descriptor);
 		put_unaligned_le64(wifi->a.window_dma + buffer, descriptor + 4);
 		put_unaligned_le16(post + 1, descriptor + 12);
-		/* AirshipDataPacket type 1 supplies this 16-byte TX header inline.
-		 * setTxPolicyId(1), 0x1809ed27c, sets validity bit 60 and ID bit 48.
-		 * Keep normal policy zero by default; the switch permits a bounded
-		 * comparison with the existing, read-back-verified control profile.
-		 */
+		/* Optional TX policy ID 1 (validity bit 60 and ID bit 48). */
 		if (READ_ONCE(data_tx_control_profile) &&
 		    (wifi->tx_defaults_applied & BIT(1)))
 			metadata |= BIT_ULL(60) | BIT_ULL(48);
-		/* Bits 17:15 carry a 3-bit packet class. A DHCP Discover
-		 * captured from the native stack has value 4 (0x20000). The same-connection Linux A/B changes
-		 * zero DHCP offers into three offers by setting only this field.
-		 * The opt-out retains the old value for diagnostic reproduction.
-		 */
+		/* Bits 17:15 carry the 3-bit packet class (4 for normal data). */
 		if (READ_ONCE(data_tx_native_prepare))
 			metadata |= 4ULL << 15;
 		put_unaligned_le64(metadata, descriptor + 16);
 		put_unaligned_le64(2000000, descriptor + 24);
+		if (wifi->data_tx_submitted == wifi->data_tx_completed)
+			wifi->data_tx_completed_at = jiffies;
 		wifi->data_tx_length[post] = skb->len;
 		wifi->data_tx_busy[post] = true;
 		wifi->data_tx_submitted++;
-		dev_kfree_skb_any(skb);
+		dev_consume_skb_any(skb);
 		post = next;
 		posted = true;
 	}
@@ -545,9 +877,12 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		dma_wmb();
 		writel(1, wifi->a.bar + 0x1030);
 	}
-	if (wifi->connected && !READ_ONCE(wifi->stopping) && netif_running(wifi->netdev) &&
+	if (wifi->connected && !READ_ONCE(wifi->stopping) &&
+	    !READ_ONCE(wifi->transport_paused) && netif_running(wifi->netdev) &&
 	    skb_queue_len(&wifi->data_tx_queue) < DATA_TX_QUEUE_LIMIT)
 		netif_wake_queue(wifi->netdev);
+	if (awdl_active)
+		centauri_awdl_drain_tx(wifi->awdl);
 }
 
 /* Record a reply to the statistics command 0xb0001. */
@@ -587,6 +922,615 @@ static void record_stats_reply(struct centauri_wifi *wifi, const u8 *packet,
 	}
 }
 
+struct cen_tlv_hdr {
+	__le16 tag;
+	__le16 length;
+} __packed;
+
+struct cen_sta_info_report {
+	u8 reserved[2];
+	s8 noise_dbm;
+} __packed;
+static_assert(sizeof(struct cen_sta_info_report) == 3);
+
+struct cen_chip_sta_counters {
+	__le32 reserved0[2];
+	__le32 tx_retrans;
+	__le32 tx_fail_retry;
+	__le32 tx_fail_drop;
+	__le32 reserved1[4];
+	__le32 tx_rate_kbps;
+	__le32 reserved2[34];
+	__le32 rx_rate_kbps;
+} __packed;
+static_assert(offsetof(struct cen_chip_sta_counters, tx_retrans) == 0x08);
+static_assert(offsetof(struct cen_chip_sta_counters, tx_fail_retry) == 0x0c);
+static_assert(offsetof(struct cen_chip_sta_counters, tx_fail_drop) == 0x10);
+static_assert(offsetof(struct cen_chip_sta_counters, tx_rate_kbps) == 0x24);
+static_assert(offsetof(struct cen_chip_sta_counters, rx_rate_kbps) == 0xb0);
+static_assert(sizeof(struct cen_chip_sta_counters) == 0xb4);
+
+struct cen_cca_chan_slot {
+	u8 channel;
+	u8 band_flags;
+	u8 bw_primary;
+	u8 reserved;
+} __packed;
+static_assert(sizeof(struct cen_cca_chan_slot) == 4);
+
+#define CEN_CCA_SLOTS 12
+
+struct cen_cca_report {
+	__le32 reserved0[CEN_CCA_SLOTS];
+	__le32 obss_us[CEN_CCA_SLOTS];
+	__le32 interference_us[CEN_CCA_SLOTS];
+	__le32 tx_primary_us[CEN_CCA_SLOTS];
+	__le32 reserved1[CEN_CCA_SLOTS];
+	__le32 rx_self_us[CEN_CCA_SLOTS];
+	__le32 rx_other_us[CEN_CCA_SLOTS];
+	__le32 tx_secondary_us[CEN_CCA_SLOTS];
+	__le32 reserved2[3];
+	struct cen_cca_chan_slot channels[CEN_CCA_SLOTS];
+	__le64 dur_awake_us;
+	__le64 dur_sleep_us;
+} __packed;
+static_assert(sizeof(struct cen_cca_report) == 0x1cc);
+
+struct cen_tx_power_record {
+	u8 reserved0[14];
+	u8 flags[2];
+	u8 power_qdbm;
+	u8 preamble;
+	u8 reserved1[2];
+	u8 mcs;
+	u8 nss_minus1;
+	u8 reserved2[2];
+	u8 bw;
+	u8 reserved3[2];
+	u8 gi;
+} __packed;
+static_assert(sizeof(struct cen_tx_power_record) == 28);
+
+struct cen_beacon_stats_report {
+	__le32 reserved0[46];
+	__le32 missed_beacons;
+	__le32 reserved1[32];
+	__le32 rx_beacons;
+} __packed;
+static_assert(offsetof(struct cen_beacon_stats_report, missed_beacons) == 0xb8);
+static_assert(offsetof(struct cen_beacon_stats_report, rx_beacons) == 0x13c);
+static_assert(sizeof(struct cen_beacon_stats_report) == 0x140);
+
+struct cen_phy_dump_record {
+	__le32 reserved0[2];
+	__le32 noise_chain[2];
+	__le32 reserved1[2];
+	__le32 rssi_chain[2];
+	__le32 reserved2;
+	__le32 valid;
+} __packed;
+static_assert(sizeof(struct cen_phy_dump_record) == 40);
+
+#define CEN_PHY_DUMP_RECORDS_PER_CORE 10
+
+struct cen_fw_version_hdr {
+	__le32 reserved;
+	__le16 api_major;
+	__le16 api_minor;
+} __packed;
+static_assert(sizeof(struct cen_fw_version_hdr) == 8);
+
+static const void *cen_find_tlv(const u8 *payload, size_t size, u16 wanted_tag,
+				u16 *out_len)
+{
+	size_t pos = 0;
+
+	while (pos + sizeof(struct cen_tlv_hdr) <= size) {
+		const struct cen_tlv_hdr *hdr = (const void *)(payload + pos);
+		u16 tag = le16_to_cpu(hdr->tag);
+		u16 length = le16_to_cpu(hdr->length);
+
+		if (length > size - pos - sizeof(*hdr))
+			break;
+		if (tag == wanted_tag) {
+			*out_len = length;
+			return payload + pos + sizeof(*hdr);
+		}
+		pos += sizeof(*hdr) + length;
+	}
+	return NULL;
+}
+
+static bool sta_info_noise_read(const u8 *payload, size_t size, s8 *noise)
+{
+	const struct cen_sta_info_report *rep;
+	u16 length;
+
+	rep = cen_find_tlv(payload, size, 0xf908, &length);
+	if (!rep || length < sizeof(*rep))
+		return false;
+	if (rep->noise_dbm < -120 || rep->noise_dbm > -40)
+		return false;
+	*noise = rep->noise_dbm;
+	return true;
+}
+
+static bool chip_sta_counters_read(const u8 *payload, size_t size, u32 *retrans,
+				   u32 *tx_fail, bool *tx_fail_valid,
+				   u32 *tx_rate_kbps, u32 *rx_rate_kbps)
+{
+	const struct cen_chip_sta_counters *cnt;
+	u16 length;
+
+	*tx_fail = 0;
+	*tx_fail_valid = false;
+	*tx_rate_kbps = 0;
+	*rx_rate_kbps = 0;
+	cnt = cen_find_tlv(payload, size, 0xf901, &length);
+	if (!cnt || length < offsetofend(struct cen_chip_sta_counters, tx_retrans))
+		return false;
+	*retrans = le32_to_cpu(cnt->tx_retrans);
+	if (length >= offsetofend(struct cen_chip_sta_counters, tx_fail_drop)) {
+		*tx_fail = le32_to_cpu(cnt->tx_fail_retry) +
+			   le32_to_cpu(cnt->tx_fail_drop);
+		*tx_fail_valid = true;
+	}
+	if (length >= offsetofend(struct cen_chip_sta_counters, tx_rate_kbps))
+		*tx_rate_kbps = le32_to_cpu(cnt->tx_rate_kbps);
+	if (length >= offsetofend(struct cen_chip_sta_counters, rx_rate_kbps))
+		*rx_rate_kbps = le32_to_cpu(cnt->rx_rate_kbps);
+	return true;
+}
+
+static bool cca_survey_read(const u8 *payload, size_t size, u8 primary_chan,
+			    u8 fw_band, u8 bw_primary, bool bw_valid,
+			    u64 *active_ms, u64 *busy_ms, u64 *tx_ms)
+{
+	const struct cen_cca_report *cca;
+	u64 dur0, dur1, active_us, busy_us, tx_us, act_ms;
+	unsigned int i;
+	int slot = -1;
+	u16 length;
+
+	cca = cen_find_tlv(payload, size, 0xf903, &length);
+	if (!cca || length < sizeof(*cca))
+		return false;
+	for (i = 0; i < CEN_CCA_SLOTS; i++) {
+		const struct cen_cca_chan_slot *ch = &cca->channels[i];
+
+		if (ch->channel != primary_chan ||
+		    (ch->band_flags & 3) != fw_band)
+			continue;
+		if (bw_valid && ch->bw_primary == bw_primary) {
+			slot = i;
+			break;
+		}
+		if (slot < 0)
+			slot = i;
+	}
+	if (slot < 0)
+		return false;
+	dur0 = le64_to_cpu(cca->dur_awake_us);
+	dur1 = le64_to_cpu(cca->dur_sleep_us);
+	active_us = dur0 + dur1;
+	if (active_us < dur0)
+		return false;
+	act_ms = div_u64(active_us, 1000);
+	if (!act_ms)
+		return false;
+	tx_us = (u64)le32_to_cpu(cca->tx_primary_us[slot]) +
+		le32_to_cpu(cca->tx_secondary_us[slot]);
+	busy_us = (u64)le32_to_cpu(cca->obss_us[slot]) +
+		  le32_to_cpu(cca->interference_us[slot]) +
+		  le32_to_cpu(cca->rx_self_us[slot]) +
+		  le32_to_cpu(cca->rx_other_us[slot]) +
+		  tx_us;
+	*active_ms = act_ms;
+	*busy_ms = min(div_u64(busy_us, 1000), act_ms);
+	*tx_ms = min(div_u64(tx_us, 1000), *busy_ms);
+	return true;
+}
+
+static bool tx_power_rate_read(const u8 *payload, size_t size,
+			       struct rate_info *rate, bool *rate_valid,
+			       int *tx_power_dbm, bool *tx_power_valid)
+{
+	static const u8 preamble_mode[13] = {
+		0, 1, 2, 3, 4, 5, 5, 5, 5, 4, 4, 6, 6,
+	};
+	static const u16 legacy_rates[16] = {
+		[0] = 10,   [1] = 20,   [2] = 55,   [3] = 110,
+		[8] = 480,  [9] = 240,  [10] = 120, [11] = 60,
+		[12] = 540, [13] = 360, [14] = 180, [15] = 90,
+	};
+	static const u8 bw_map[4] = {
+		RATE_INFO_BW_20,
+		RATE_INFO_BW_40,
+		RATE_INFO_BW_80,
+		RATE_INFO_BW_160,
+	};
+	const u8 *v;
+	size_t stride;
+	int best_mode = -1;
+	unsigned int i;
+	u16 length;
+
+	*rate_valid = false;
+	*tx_power_valid = false;
+	v = cen_find_tlv(payload, size, 0xf920, &length);
+	if (!v || (length != 280 && length != 320))
+		return false;
+	stride = length / 10;
+
+	for (i = 0; i < 5; i++) {
+		const struct cen_tx_power_record *rec = (const void *)(v + i * stride);
+		u8 qdb = rec->power_qdbm;
+		u8 pre = rec->preamble;
+		u8 raw_mcs = rec->mcs;
+		u8 nss = rec->nss_minus1 + 1;
+		u8 hw_bw = rec->bw;
+		u8 hw_gi = rec->gi;
+		struct rate_info cand = {};
+		u8 mode;
+
+		if (!(rec->flags[0] | rec->flags[1] | qdb | pre | raw_mcs |
+		      rec->nss_minus1 | hw_bw | hw_gi))
+			continue;
+		if (qdb && qdb < 128 && !*tx_power_valid) {
+			*tx_power_dbm = qdb / 4;
+			*tx_power_valid = true;
+		}
+		if (pre >= ARRAY_SIZE(preamble_mode))
+			continue;
+		mode = preamble_mode[pre];
+		if ((int)mode <= best_mode)
+			continue;
+		if (mode <= 2) {
+			if (raw_mcs >= ARRAY_SIZE(legacy_rates) ||
+			    !legacy_rates[raw_mcs])
+				continue;
+			cand.legacy = legacy_rates[raw_mcs];
+		} else if (hw_bw >= ARRAY_SIZE(bw_map)) {
+			continue;
+		} else if (mode == 3) {
+			if (hw_bw > 1)
+				continue;
+			if (raw_mcs <= 7 && nss >= 1 && nss <= 4)
+				cand.mcs = (nss - 1) * 8 + raw_mcs;
+			else if (raw_mcs <= 31)
+				cand.mcs = raw_mcs;
+			else
+				continue;
+			cand.bw = bw_map[hw_bw];
+			cand.flags = RATE_INFO_FLAGS_MCS;
+			if (hw_gi)
+				cand.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		} else if (mode == 4) {
+			if (raw_mcs > 11 || nss < 1 || nss > 4)
+				continue;
+			cand.bw = bw_map[hw_bw];
+			cand.flags = RATE_INFO_FLAGS_VHT_MCS;
+			cand.mcs = raw_mcs;
+			cand.nss = nss;
+			if (hw_gi)
+				cand.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		} else if (mode == 5) {
+			if (raw_mcs > 11 || nss < 1 || nss > 4 ||
+			    hw_gi > NL80211_RATE_INFO_HE_GI_3_2)
+				continue;
+			cand.bw = bw_map[hw_bw];
+			cand.flags = RATE_INFO_FLAGS_HE_MCS;
+			cand.mcs = raw_mcs;
+			cand.nss = nss;
+			cand.he_gi = hw_gi;
+		} else {
+			if (raw_mcs > 13 || nss < 1 || nss > 4 ||
+			    hw_gi > NL80211_RATE_INFO_EHT_GI_3_2)
+				continue;
+			cand.bw = bw_map[hw_bw];
+			cand.flags = RATE_INFO_FLAGS_EHT_MCS;
+			cand.mcs = raw_mcs;
+			cand.nss = nss;
+			cand.eht_gi = hw_gi;
+		}
+		best_mode = mode;
+		*rate = cand;
+		*rate_valid = true;
+		if (qdb && qdb < 128) {
+			*tx_power_dbm = qdb / 4;
+			*tx_power_valid = true;
+		}
+	}
+	return *rate_valid || *tx_power_valid;
+}
+
+static bool beacon_stats_read(const u8 *payload, size_t size,
+			      u32 *rx_beacons, u32 *missed_beacons)
+{
+	const struct cen_beacon_stats_report *bcn;
+	u16 length;
+
+	bcn = cen_find_tlv(payload, size, 0xf915, &length);
+	if (!bcn || length < sizeof(*bcn))
+		return false;
+	*missed_beacons = le32_to_cpu(bcn->missed_beacons);
+	*rx_beacons = le32_to_cpu(bcn->rx_beacons);
+	return true;
+}
+
+static bool phy_dump_read(const u8 *payload, size_t size, u8 fw_band,
+			  s8 chain_rssi[2], u8 *chains,
+			  s8 *noise, bool *noise_valid)
+{
+	const struct cen_phy_dump_record *records;
+	unsigned int core;
+	u16 length;
+
+	*chains = 0;
+	*noise_valid = false;
+	records = cen_find_tlv(payload, size, 0xf923, &length);
+	if (!records || length < 2 * CEN_PHY_DUMP_RECORDS_PER_CORE * sizeof(*records))
+		return false;
+
+	core = fw_band == 0 ? 0 : 1;
+	for (;;) {
+		const struct cen_phy_dump_record *base =
+			records + core * CEN_PHY_DUMP_RECORDS_PER_CORE;
+		u64 sum0 = 0, sum1 = 0, nsum0 = 0, nsum1 = 0;
+		u32 cnt0 = 0, cnt1 = 0, ncnt0 = 0, ncnt1 = 0;
+		s32 ntotal = 0;
+		u32 nvalid = 0;
+		unsigned int i;
+
+		for (i = 0; i < CEN_PHY_DUMP_RECORDS_PER_CORE; i++) {
+			const struct cen_phy_dump_record *rec = &base[i];
+			u32 n0, n1, r0, r1;
+
+			if (!le32_to_cpu(rec->valid))
+				continue;
+			n0 = le32_to_cpu(rec->noise_chain[0]);
+			n1 = le32_to_cpu(rec->noise_chain[1]);
+			r0 = le32_to_cpu(rec->rssi_chain[0]);
+			r1 = le32_to_cpu(rec->rssi_chain[1]);
+			if (n0) {
+				nsum0 += n0;
+				ncnt0++;
+			}
+			if (n1) {
+				nsum1 += n1;
+				ncnt1++;
+			}
+			if (r0) {
+				sum0 += r0;
+				cnt0++;
+			}
+			if (r1) {
+				sum1 += r1;
+				cnt1++;
+			}
+		}
+		if (cnt0) {
+			s64 val = -(s64)div_u64(sum0, cnt0 * 2);
+
+			if (val >= -120 && val <= -1) {
+				chain_rssi[0] = val;
+				*chains |= BIT(0);
+			}
+		}
+		if (cnt1) {
+			s64 val = -(s64)div_u64(sum1, cnt1 * 2);
+
+			if (val >= -120 && val <= -1) {
+				chain_rssi[1] = val;
+				*chains |= BIT(1);
+			}
+		}
+		if (ncnt0) {
+			s64 val = -(s64)div_u64(nsum0, ncnt0 * 2);
+
+			if (val >= -120 && val <= -40) {
+				ntotal += val;
+				nvalid++;
+			}
+		}
+		if (ncnt1) {
+			s64 val = -(s64)div_u64(nsum1, ncnt1 * 2);
+
+			if (val >= -120 && val <= -40) {
+				ntotal += val;
+				nvalid++;
+			}
+		}
+		if (nvalid) {
+			*noise = ntotal / (s32)nvalid;
+			*noise_valid = true;
+		}
+		if (*chains || *noise_valid || !core)
+			break;
+		core = 0;
+	}
+	return *chains != 0 || *noise_valid;
+}
+
+static bool fw_version_read(const u8 *payload, size_t size,
+			    char *out, size_t out_size)
+{
+	const struct cen_fw_version_hdr *hdr = (const void *)payload;
+	u16 api_major, api_minor;
+	size_t i, len = 0;
+	char fw[40];
+
+	if (!out_size || size < sizeof(*hdr))
+		return false;
+	api_major = le16_to_cpu(hdr->api_major);
+	api_minor = le16_to_cpu(hdr->api_minor);
+	if (size > sizeof(*hdr)) {
+		size_t max_len = min_t(size_t, size - sizeof(*hdr), sizeof(fw) - 1);
+
+		for (i = 0; i < max_len && payload[sizeof(*hdr) + i]; i++) {
+			u8 c = payload[sizeof(*hdr) + i];
+
+			if (c < 0x20 || c > 0x7e)
+				continue;
+			if (!len && c == ' ')
+				continue;
+			fw[len++] = c;
+		}
+		while (len && fw[len - 1] == ' ')
+			len--;
+		fw[len] = '\0';
+	}
+	if (len) {
+		snprintf(out, out_size, "%s", fw);
+		return true;
+	}
+	if (!api_major && !api_minor)
+		return false;
+	snprintf(out, out_size, "api %u.%u", api_major, api_minor);
+	return true;
+}
+
+static bool country_code_valid(const u8 *code, size_t size)
+{
+	if (size < 2)
+		return false;
+	if (code[0] < 'A' || code[0] > 'Z' || code[1] < 'A' || code[1] > 'Z')
+		return false;
+	if ((code[0] == 'X' && (code[1] == 'Z' || code[1] == 'X')) ||
+	    (code[0] == 'Z' && code[1] == 'Z'))
+		return false;
+	return true;
+}
+
+static void disconnect_reason_decode(const u8 *packet, size_t size,
+				     u16 *reason, bool *local)
+{
+	if (size >= 31) {
+		u8 code = packet[24];
+
+		if (code) {
+			*reason = code;
+			*local = false;
+		} else {
+			*reason = WLAN_REASON_UNSPECIFIED;
+			*local = true;
+		}
+	} else {
+		*reason = WLAN_REASON_UNSPECIFIED;
+		*local = false;
+	}
+}
+
+static bool link_channel_decode(struct wiphy *wiphy, u8 center_chan,
+				u8 band_flags, u8 bw_primary,
+				struct cfg80211_chan_def *chandef)
+{
+	static const s8 primary_offset[15] = {
+		0,
+		2, -2,
+		6, 2, -2, -6,
+		14, 10, 6, 2, -2, -6, -10, -14,
+	};
+	enum nl80211_chan_width width;
+	enum nl80211_band band;
+	int primary, primary_freq, center_freq;
+	struct ieee80211_channel *chan;
+
+	if (!center_chan || bw_primary >= ARRAY_SIZE(primary_offset))
+		return false;
+	switch (band_flags & 3) {
+	case 0:
+		band = NL80211_BAND_2GHZ;
+		break;
+	case 1:
+		band = NL80211_BAND_5GHZ;
+		break;
+	case 2:
+		band = NL80211_BAND_6GHZ;
+		break;
+	default:
+		return false;
+	}
+	if (bw_primary == 0)
+		width = NL80211_CHAN_WIDTH_20;
+	else if (bw_primary <= 2)
+		width = NL80211_CHAN_WIDTH_40;
+	else if (bw_primary <= 6)
+		width = NL80211_CHAN_WIDTH_80;
+	else
+		width = NL80211_CHAN_WIDTH_160;
+
+	primary = (int)center_chan + primary_offset[bw_primary];
+	if (primary <= 0 || primary > 255)
+		return false;
+	primary_freq = ieee80211_channel_to_frequency(primary, band);
+	center_freq = ieee80211_channel_to_frequency(center_chan, band);
+	if (!primary_freq || !center_freq)
+		return false;
+	chan = ieee80211_get_channel(wiphy, primary_freq);
+	if (!chan)
+		return false;
+
+	memset(chandef, 0, sizeof(*chandef));
+	chandef->chan = chan;
+	chandef->width = width;
+	chandef->center_freq1 = center_freq;
+	return cfg80211_chandef_valid(chandef);
+}
+
+static void record_link_status_reply(struct centauri_wifi *wifi,
+				     const u8 *packet, u16 size)
+{
+	/* Interface status reply has 8 fixed bytes after the 24-byte header. */
+	unsigned int pos = 32;
+
+	wifi->link_status_size = size;
+	while (pos + 4 <= size) {
+		u16 tag = get_unaligned_le16(packet + pos);
+		u16 length = get_unaligned_le16(packet + pos + 2);
+		const u8 *value = packet + pos + 4;
+		unsigned int i;
+
+		if (length > size - pos - 4)
+			break;
+		if (wifi->link_tlv_count < ARRAY_SIZE(wifi->link_tags)) {
+			wifi->link_tags[wifi->link_tlv_count] = tag;
+			wifi->link_lengths[wifi->link_tlv_count++] = length;
+		}
+		if (tag == 268 && length >= 115) {
+			s8 signal = (s8)value[1];
+
+			if (signal) {
+				wifi->station_signal = signal;
+				wifi->station_signal_valid = true;
+			}
+			wifi->station_chandef_valid =
+				link_channel_decode(wifi->wiphy, value[16],
+						    value[17], value[18],
+						    &wifi->station_chandef);
+			if (wifi->station_chandef_valid)
+				wifi->station_bw_primary = value[18];
+		}
+		/* MLO status report, TLVs 377/378: keep link count/channel/role only. */
+		if (tag == 377 && length >= 64 && value[0] <= 3) {
+			wifi->link_count = value[0];
+			wifi->link_status_valid = true;
+			for (i = 0; i < value[0]; i++) {
+				u16 chanspec = get_unaligned_le16(value + 26 + 17 * i);
+
+				wifi->link_prime[i] = value[25 + 17 * i];
+				wifi->link_channel[i] = chanspec & 0xff;
+				wifi->link_band[i] = (chanspec >> 14) & 3;
+			}
+		}
+		if (tag == 378 && length >= 9) {
+			wifi->emlsr_valid = true;
+			wifi->emlsr_mode = value[0];
+		}
+		pos += 4 + length;
+	}
+}
+
 static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 {
 	unsigned int ring;
@@ -615,8 +1559,21 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 			if (size < 24 || size > BUFFER_SIZE)
 				goto refill;
 			if (ring == 4) {
-				report_beacon(wifi, packet + 24, size - 24);
+				if (packet[0x0d] == CEN_IF_AWDL)
+					centauri_awdl_rx_mgmt(wifi->awdl,
+							      packet + 24,
+							      size - 24);
+				else
+					report_beacon(wifi, packet + 24,
+						      size - 24);
 			} else if (command & BIT(31)) {
+				if (packet[0x0d] == CEN_IF_AWDL) {
+					centauri_awdl_handle_event(wifi->awdl,
+								   command,
+								   status,
+								   packet, size);
+					goto refill;
+				}
 				if (command == 0x80000030)
 					wifi->channels_seen++;
 				if (command == 0x80000005)
@@ -650,7 +1607,13 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 						 get_unaligned_le32(packet + 0x2c),
 						 get_unaligned_le32(packet + 0x30),
 						 get_unaligned_le32(packet + 0x34));
-				if (command == 0x80000003 || command == 0x80000004)
+				if (command == 0x80000003) {
+					disconnect_reason_decode(packet, size,
+								 &wifi->disconnect_reason,
+								 &wifi->disconnect_local);
+					wifi->disconnect_event = true;
+				}
+				if (command == 0x80000004)
 					wifi->disconnect_event = true;
 				if (wifi->connecting && command != 0x80000000 &&
 				    command != 0x80000001 && command != 0x80000030 &&
@@ -663,6 +1626,11 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 				wifi->reply_sequence = sequence;
 				wifi->reply_status = status;
 				wifi->reply_command = command;
+				if (wifi->reply_buffer && sequence == wifi->reply_capture) {
+					wifi->reply_size = size - 24;
+					memcpy(wifi->reply_buffer, packet + 24,
+					       min(wifi->reply_size, wifi->reply_capacity));
+				}
 				if (command == 10) {
 					wifi->country_valid = !status && size >= 27;
 					if (wifi->country_valid)
@@ -673,44 +1641,8 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 					if (wifi->tx_profile_valid)
 						memcpy(wifi->tx_profile, packet + 24, sizeof(wifi->tx_profile));
 				}
-				if (command == 20 && !status) {
-					/* getInterfaceStatus skips its 32-byte fixed response. */
-					unsigned int pos = 32;
-
-					wifi->link_status_size = size;
-					while (pos + 4 <= size) {
-						u16 tag = get_unaligned_le16(packet + pos);
-						u16 length = get_unaligned_le16(packet + pos + 2);
-						u8 *value = packet + pos + 4;
-						unsigned int i;
-
-						if (length > size - pos - 4)
-							break;
-						if (wifi->link_tlv_count < ARRAY_SIZE(wifi->link_tags)) {
-							wifi->link_tags[wifi->link_tlv_count] = tag;
-							wifi->link_lengths[wifi->link_tlv_count++] = length;
-						}
-						/* MLO status report, TLVs 377/378.
-						 * Keep only link count/channel/role. Do not retain MACs.
-						 */
-						if (tag == 377 && length >= 64 && value[0] <= 3) {
-							wifi->link_count = value[0];
-							wifi->link_status_valid = true;
-							for (i = 0; i < value[0]; i++) {
-								u16 chanspec = get_unaligned_le16(value + 26 + 17 * i);
-
-								wifi->link_prime[i] = value[25 + 17 * i];
-								wifi->link_channel[i] = chanspec & 0xff;
-								wifi->link_band[i] = (chanspec >> 14) & 3;
-							}
-						}
-						if (tag == 378 && length >= 9) {
-							wifi->emlsr_valid = true;
-							wifi->emlsr_mode = value[0];
-						}
-						pos += 4 + length;
-					}
-				}
+				if (command == 20 && !status)
+					record_link_status_reply(wifi, packet, size);
 				if (command == 0xb0001)
 					record_stats_reply(wifi, packet, size, status);
 				if (command == 0xf0025) {
@@ -735,6 +1667,7 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 	if (!READ_ONCE(wifi->transport_paused)) {
 		drain_data_rx(wifi);
 		drain_data_tx(wifi);
+		drain_awdl_crs(wifi);
 	}
 }
 
@@ -743,12 +1676,14 @@ static void drain(struct centauri_wifi *wifi)
 	drain_control(wifi, false);
 }
 
-static int command_control(struct centauri_wifi *wifi, u32 id, const void *payload,
-			   size_t size, bool pm_command)
+static int command_reply_iface(struct centauri_wifi *wifi, u8 if_id, u32 id,
+			       const void *payload, size_t size, void *reply,
+			       size_t *reply_size, bool pm_command)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
 	u8 *packet, *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
+	int ret;
 
 	if (READ_ONCE(wifi->transport_paused) && !pm_command)
 		return -EBUSY;
@@ -760,6 +1695,7 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
+	packet[0x0d] = if_id;
 	put_unaligned_le16(24 + size, packet + 0x10);
 	put_unaligned_le16(sequence, packet + 0x12);
 	put_unaligned_le32(id, packet + 0x14);
@@ -773,13 +1709,21 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 	wifi->command_head = (slot + 1) % ring_size[1];
 	index_write(wifi, 3, 1, wifi->command_head);
 	wifi->reply_valid = false;
+	wifi->reply_buffer = reply;
+	wifi->reply_capacity = reply ? *reply_size : 0;
+	wifi->reply_capture = sequence;
+	wifi->reply_size = 0;
 	dma_wmb();
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		drain_control(wifi, pm_command);
 		if (readl(wifi->a.bar + 8) != 2) {
+			dev_warn_ratelimited(&wifi->control->pdev->dev,
+					     "Alpha execution stage %#x\n",
+					     readl(wifi->a.bar + 8));
 			centauri_recovery_request(wifi->control, "command: Alpha stage");
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 		/* Bit 30 is more-data-pending, not part of the command identity.
 		 * Scan/connect replies set it before their later completion event.
@@ -787,16 +1731,43 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 		if (wifi->reply_valid && wifi->reply_sequence == sequence &&
 		    (wifi->reply_command & ~BIT(30)) == id) {
 			if (wifi->reply_status)
-				dev_info(&wifi->control->pdev->dev,
-					 "Wi-Fi command %#x rejected: firmware_status=%u\n",
-					 id, wifi->reply_status);
-			return wifi->reply_status ? -EREMOTEIO : 0;
+				dev_dbg(&wifi->control->pdev->dev,
+					"Wi-Fi command %#x (if=%u) rejected: firmware_status=%u\n",
+					id, if_id, wifi->reply_status);
+			if (reply)
+				*reply_size = wifi->reply_size;
+			ret = wifi->reply_status ? -EREMOTEIO : 0;
+			goto out;
 		}
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
-	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
+	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x (if=%u) timed out (rx=%u)\n",
+		id, if_id, wifi->rx_seen[2]);
 	centauri_recovery_request(wifi->control, "command timeout");
-	return -ETIMEDOUT;
+	ret = -ETIMEDOUT;
+out:
+	wifi->reply_buffer = NULL;
+	return ret;
+}
+
+static int command_reply_control(struct centauri_wifi *wifi, u32 id, const void *payload,
+				 size_t size, void *reply, size_t *reply_size,
+				 bool pm_command)
+{
+	return command_reply_iface(wifi, CEN_IF_STA, id, payload, size,
+				   reply, reply_size, pm_command);
+}
+
+static int command_control(struct centauri_wifi *wifi, u32 id, const void *payload,
+			   size_t size, bool pm_command)
+{
+	return command_reply_control(wifi, id, payload, size, NULL, NULL, pm_command);
+}
+
+static int command_reply(struct centauri_wifi *wifi, u32 id, const void *payload,
+			 size_t size, void *reply, size_t *reply_size)
+{
+	return command_reply_control(wifi, id, payload, size, reply, reply_size, false);
 }
 
 /*
@@ -820,27 +1791,299 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size
 	return command_control(wifi, id, payload, size, false);
 }
 
-static int radio_start(struct centauri_wifi *wifi)
+static int station_configure(struct centauri_wifi *wifi, const u8 *address)
 {
 	u8 start[5 + 4 + 3 * ETH_ALEN] = { 0, 0x0b, 0, 0, 0 };
 	size_t start_size = 5;
-	unsigned int ring, slot;
+	unsigned int slot;
 	int ret;
 
-	/* The stock 26.x startInterface supplies TLV 385, length 18; the macOS 27.0
-	 * adapter uses 386 (board table). Firmware 0x5736c0 otherwise generates three unrelated
-	 * random addresses. This diagnostic keeps the sole active link equal
-	 * to the netdev identity; it does not enable multi-link association.
-	 */
+	/* Optional diagnostic: bind all three firmware link slots to the station address. */
 	if (station_link_addresses) {
 		const struct centauri_board *board = centauri_board();
 
 		put_unaligned_le16(board ? board->link_tlv : 385, start + 5);
 		put_unaligned_le16(3 * ETH_ALEN, start + 7);
 		for (slot = 0; slot < 3; slot++)
-			ether_addr_copy(start + 9 + slot * ETH_ALEN, wifi->netdev->dev_addr);
+			ether_addr_copy(start + 9 + slot * ETH_ALEN, address);
 		start_size = sizeof(start);
 	}
+	ret = command(wifi, 1, address, ETH_ALEN);
+	if (!ret)
+		ret = command(wifi, 2, start, start_size);
+	return ret;
+}
+
+static void firmware_report(struct centauri_wifi *wifi, u32 id, u8 *buffer,
+			    struct debugfs_blob_wrapper *blob)
+{
+	size_t size = REPLY_SIZE;
+	int ret;
+
+	ret = command_reply(wifi, id, NULL, 0, buffer, &size);
+	if (ret) {
+		dev_dbg(&wifi->control->pdev->dev,
+			"Wi-Fi firmware report %u unavailable: %d (status=%u)\n",
+			id, ret, wifi->reply_status);
+		size = 0;
+	} else if (size > REPLY_SIZE) {
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi command %u reply of %zu bytes truncated\n",
+			 id, size);
+		size = REPLY_SIZE;
+	}
+	blob->data = buffer;
+	blob->size = size;
+}
+
+#define CHANNEL_PASSIVE BIT(4)
+#define CHANNEL_RADAR BIT(6)
+
+static const u8 *channel_entry(const u8 *list, size_t size, int band,
+			       unsigned int width, unsigned int number)
+{
+	unsigned int count = size ? list[0] : 0, i, span = 2 * (1 << width) - 2;
+
+	if (1 + 4 * count > size)
+		count = size ? (size - 1) / 4 : 0;
+	for (i = 0; i < count; i++) {
+		const u8 *entry = list + 1 + 4 * i;
+
+		if ((entry[1] & 3) != band || ((entry[1] >> 2) & 3) != width)
+			continue;
+		if (number + span >= entry[0] && number <= entry[0] + span)
+			return entry;
+	}
+	return NULL;
+}
+
+/* Whether the list describes channels of this width in the band at all. */
+static bool channel_width_listed(const u8 *list, size_t size, int band,
+				 unsigned int width)
+{
+	unsigned int count = size ? list[0] : 0, i;
+
+	if (1 + 4 * count > size)
+		count = size ? (size - 1) / 4 : 0;
+	for (i = 0; i < count; i++) {
+		const u8 *entry = list + 1 + 4 * i;
+
+		if ((entry[1] & 3) == band && ((entry[1] >> 2) & 3) == width)
+			return true;
+	}
+	return false;
+}
+
+static void channels_apply(struct centauri_wifi *wifi)
+{
+	const u8 *list = wifi->hw_channels;
+	size_t size = wifi->hw_channels_blob.size;
+	unsigned int counted[3] = {}, i;
+
+	if (!size)
+		return;
+	for (i = 0; i < CEN_CHANNELS; i++) {
+		struct ieee80211_channel *channel = &wifi->channels[i];
+		int band = firmware_band(channel->band);
+		const u8 *entry = channel_entry(list, size, band, 0,
+						channel->hw_value);
+
+		if (!entry) {
+			channel->flags |= IEEE80211_CHAN_DISABLED;
+			continue;
+		}
+		if (entry[1] & CHANNEL_PASSIVE)
+			channel->flags |= IEEE80211_CHAN_NO_IR;
+		if (entry[1] & CHANNEL_RADAR)
+			channel->flags |= IEEE80211_CHAN_RADAR;
+		/*
+		 * A list of 20 MHz entries only says nothing about wider
+		 * channels; restrict a width only where the list covers it.
+		 */
+		if (channel_width_listed(list, size, band, 1) &&
+		    !channel_entry(list, size, band, 1, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_HT40;
+		if (channel_width_listed(list, size, band, 2) &&
+		    !channel_entry(list, size, band, 2, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_80MHZ;
+		if (channel_width_listed(list, size, band, 3) &&
+		    !channel_entry(list, size, band, 3, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_160MHZ;
+		if (!(channel->flags & IEEE80211_CHAN_DISABLED))
+			counted[band]++;
+	}
+	dev_info(&wifi->control->pdev->dev,
+		 "Wi-Fi firmware channels: 2.4 GHz %u, 5 GHz %u, 6 GHz %u (%u entries)\n",
+		 counted[0], counted[1], counted[2], list[0]);
+}
+
+static bool band_caps_from_firmware(struct centauri_wifi *wifi)
+{
+	const u8 *caps = wifi->system_caps;
+	const u8 *ht_elem = NULL, *vht_elem = NULL, *he_elem = NULL;
+	size_t size = wifi->system_caps_blob.size, pos = 0, mcs;
+	u32 vht_cap = 0;
+
+	while (pos + 4 <= size) {
+		u16 tag = get_unaligned_le16(caps + pos);
+		u16 length = get_unaligned_le16(caps + pos + 2);
+		const u8 *value = caps + pos + 4;
+
+		if (length > size - pos - 4)
+			break;
+		if (tag == 262 &&
+		    length >= 87 + 2 + sizeof(struct ieee80211_ht_cap) &&
+		    value[87] == WLAN_EID_HT_CAPABILITY &&
+		    value[88] == sizeof(struct ieee80211_ht_cap))
+			ht_elem = value + 87;
+		if (tag == WLAN_EID_VHT_CAPABILITY &&
+		    length >= 2 + sizeof(struct ieee80211_vht_cap) &&
+		    value[0] == WLAN_EID_VHT_CAPABILITY &&
+		    value[1] == sizeof(struct ieee80211_vht_cap))
+			vht_elem = value;
+		if (tag == WLAN_EID_EXTENSION && length >= 3 + 6 + 11 + 4 &&
+		    value[0] == WLAN_EID_EXTENSION && value[1] == length - 2 &&
+		    value[2] == WLAN_EID_EXT_HE_CAPABILITY)
+			he_elem = value;
+		pos += 4 + length;
+	}
+
+	if (ht_elem) {
+		struct ieee80211_sta_ht_cap ht_cap = {};
+		const struct ieee80211_ht_cap *ht =
+			(const struct ieee80211_ht_cap *)(ht_elem + 2);
+
+		ht_cap.ht_supported = true;
+		ht_cap.cap = le16_to_cpu(ht->cap_info);
+		ht_cap.ampdu_factor =
+			ht->ampdu_params_info & IEEE80211_HT_AMPDU_PARM_FACTOR;
+		ht_cap.ampdu_density =
+			FIELD_GET(IEEE80211_HT_AMPDU_PARM_DENSITY,
+				  ht->ampdu_params_info);
+		ht_cap.mcs = ht->mcs;
+		wifi->bands[0].ht_cap = ht_cap;
+		wifi->bands[1].ht_cap = ht_cap;
+	}
+
+	if (vht_elem) {
+		struct ieee80211_sta_vht_cap *vht = &wifi->bands[1].vht_cap;
+
+		vht_cap = get_unaligned_le32(vht_elem + 2);
+		vht->vht_supported = true;
+		vht->cap = vht_cap;
+		memcpy(&vht->vht_mcs, vht_elem + 6, sizeof(vht->vht_mcs));
+	}
+
+	if (!he_elem)
+		return false;
+
+	{
+		struct ieee80211_sta_he_cap base_he = {};
+		unsigned int band;
+
+		memcpy(&base_he.he_cap_elem, he_elem + 3,
+		       sizeof(base_he.he_cap_elem));
+		mcs = he_elem[1] - 1 - sizeof(base_he.he_cap_elem);
+		memcpy(&base_he.he_mcs_nss_supp,
+		       he_elem + 3 + sizeof(base_he.he_cap_elem),
+		       min(mcs, sizeof(base_he.he_mcs_nss_supp)));
+		if (mcs > sizeof(base_he.he_mcs_nss_supp))
+			memcpy(base_he.ppe_thres,
+			       he_elem + 3 + sizeof(base_he.he_cap_elem) +
+				       sizeof(base_he.he_mcs_nss_supp),
+			       min(mcs - sizeof(base_he.he_mcs_nss_supp),
+				   sizeof(base_he.ppe_thres)));
+		base_he.has_he = true;
+
+		for (band = 0; band < 3; band++) {
+			struct ieee80211_sband_iftype_data *data =
+				&wifi->iftype_data[band];
+
+			memset(data, 0, sizeof(*data));
+			data->types_mask = BIT(NL80211_IFTYPE_STATION);
+			data->he_cap = base_he;
+			if (band == 0) {
+				data->he_cap.he_cap_elem.phy_cap_info[0] &=
+					IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+				data->he_cap.he_mcs_nss_supp.rx_mcs_160 =
+					cpu_to_le16(0xffff);
+				data->he_cap.he_mcs_nss_supp.tx_mcs_160 =
+					cpu_to_le16(0xffff);
+				data->he_cap.he_mcs_nss_supp.rx_mcs_80p80 =
+					cpu_to_le16(0xffff);
+				data->he_cap.he_mcs_nss_supp.tx_mcs_80p80 =
+					cpu_to_le16(0xffff);
+			} else {
+				data->he_cap.he_cap_elem.phy_cap_info[0] &=
+					~IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+			}
+			if (band == 2) {
+				u32 ampdu_exp = u32_get_bits(vht_cap,
+					IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK);
+				u16 capa;
+
+				capa = u16_encode_bits(ampdu_exp,
+						       IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP) |
+				       u16_encode_bits(vht_cap & IEEE80211_VHT_CAP_MAX_MPDU_MASK,
+						       IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN) |
+				       u16_encode_bits(WLAN_HT_CAP_SM_PS_DISABLED,
+						       IEEE80211_HE_6GHZ_CAP_SM_PS);
+				if (vht_cap & IEEE80211_VHT_CAP_RX_ANTENNA_PATTERN)
+					capa |= IEEE80211_HE_6GHZ_CAP_RX_ANTPAT_CONS;
+				if (vht_cap & IEEE80211_VHT_CAP_TX_ANTENNA_PATTERN)
+					capa |= IEEE80211_HE_6GHZ_CAP_TX_ANTPAT_CONS;
+				data->he_6ghz_capa.capa = cpu_to_le16(capa);
+			}
+			_ieee80211_set_sband_iftype_data(&wifi->bands[band],
+							 data, 1);
+		}
+	}
+	return true;
+}
+
+static void bands_init(struct centauri_wifi *wifi)
+{
+	unsigned int i, n = 0, c;
+
+	for (i = 0; i < ARRAY_SIZE(band_plan); i++) {
+		enum nl80211_band band = band_plan[i].band;
+		struct ieee80211_supported_band *sband =
+			&wifi->bands[firmware_band(band)];
+
+		if (!sband->channels)
+			sband->channels = wifi->channels + n;
+		for (c = band_plan[i].first; c <= band_plan[i].last;
+		     c += band_plan[i].step) {
+			wifi->channels[n].band = band;
+			wifi->channels[n].hw_value = c;
+			wifi->channels[n].center_freq =
+				ieee80211_channel_to_frequency(c, band);
+			wifi->channels[n].max_power = 20;
+			sband->n_channels++;
+			n++;
+		}
+		sband->band = band;
+		sband->bitrates = band == NL80211_BAND_2GHZ ? rates : rates + 4;
+		sband->n_bitrates = band == NL80211_BAND_2GHZ ?
+					    ARRAY_SIZE(rates) :
+					    ARRAY_SIZE(rates) - 4;
+	}
+	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &wifi->bands[0];
+	wifi->wiphy->bands[NL80211_BAND_5GHZ] = &wifi->bands[1];
+	if (band_caps_from_firmware(wifi)) {
+		wifi->wiphy->bands[NL80211_BAND_6GHZ] = &wifi->bands[2];
+	} else {
+		dev_info(&wifi->control->pdev->dev,
+			 "Wi-Fi: no HE capabilities from firmware; 6 GHz band disabled\n");
+	}
+}
+
+static int radio_start(struct centauri_wifi *wifi)
+{
+	size_t size = sizeof(wifi->stats_reply);
+	unsigned int ring, slot;
+	int ret;
+
 	for (ring = 1; ring <= 4; ring++) {
 		ret = open_pair(wifi, ring);
 		if (ret)
@@ -856,92 +2099,37 @@ static int radio_start(struct centauri_wifi *wifi)
 	dma_wmb();
 	writel(1, wifi->a.bar + 0x1004);
 	msleep(400);
-	ret = command(wifi, 0, NULL, 0);
-	if (!ret)
-		ret = command(wifi, 1, wifi->netdev->dev_addr, ETH_ALEN);
-	if (!ret)
-		ret = command(wifi, 2, start, start_size);
+	ret = command_reply(wifi, 0, NULL, 0, wifi->stats_reply, &size);
+	if (!ret) {
+		fw_version_read(wifi->stats_reply,
+				min(size, sizeof(wifi->stats_reply)),
+				wifi->wiphy->fw_version,
+				sizeof(wifi->wiphy->fw_version));
+		ret = station_configure(wifi, wifi->netdev->dev_addr);
+	}
 	if (ret)
 		return ret;
 	msleep(1000);
+	firmware_report(wifi, 19, wifi->hw_channels, &wifi->hw_channels_blob);
+	firmware_report(wifi, 8, wifi->system_caps, &wifi->system_caps_blob);
 	wifi->configured = true;
-	dev_info(&wifi->control->pdev->dev, "Wi-Fi command rings ready; interface started\n");
+	if (wifi->wiphy->fw_version[0])
+		dev_info(&wifi->control->pdev->dev,
+			 "Wi-Fi command rings ready; interface started (firmware %s)\n",
+			 wifi->wiphy->fw_version);
+	else
+		dev_info(&wifi->control->pdev->dev,
+			 "Wi-Fi command rings ready; interface started\n");
 	return 0;
-}
-
-/* The station's RSN element (body) with PSK as its only AKM, written to selected; returns its size. */
-static int select_rsn(const u8 *body, size_t size, u8 *selected)
-{
-	size_t offset, tail;
-	u16 count;
-	unsigned int i;
-
-	if (size < 8 || get_unaligned_le16(body) != 1)
-		return -EINVAL;
-	count = get_unaligned_le16(body + 6);
-	offset = 8 + 4 * count;
-	if (!count || offset + 2 > size)
-		return -EINVAL;
-	count = get_unaligned_le16(body + offset);
-	tail = offset + 2 + 4 * count;
-	if (!count || tail > size)
-		return -EINVAL;
-	for (i = 0; i < count; i++)
-		if (get_unaligned_be32(body + offset + 2 + 4 * i) == WLAN_AKM_SUITE_PSK)
-			break;
-	if (i == count)
-		return -EOPNOTSUPP;
-	memcpy(selected, body, offset);
-	put_unaligned_le16(1, selected + offset);
-	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
-	memcpy(selected + offset + 6, body + tail, size - tail);
-	return offset + 6 + size - tail;
 }
 
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
 
-/* Dwell times in ms for the scan request. The macOS 27 scan adapter copies
- * the first request dwell field into frame +0x20 and +0x22 and the second into +0x24 and logs
- * "dwelltime active[%d, %d] passive %d". A zero passive dwell makes the J873 scan state machine
- * assert in SCHED_Req_Add (the dwell it selects must not be zero) and the whole firmware traps.
- */
-#define SCAN_ACTIVE_DWELL_MS	110
-#define SCAN_PASSIVE_DWELL_MS	110
-
-/* Fixed scan request (command 0x1000f), 14 bytes, chunk number first. */
-static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf)
-{
-	u8 fixed[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10 };
-	const struct centauri_board *board = centauri_board();
-	u8 list[1 + 4 * 13], oce[5] = { 0, 0, 1, 0, 0 };
-	unsigned int first = chunk * 13, n, i;
-	size_t size = sizeof(fixed);
-
-	put_unaligned_le16(SCAN_ACTIVE_DWELL_MS, fixed + 8);
-	put_unaligned_le16(SCAN_ACTIVE_DWELL_MS, fixed + 10);
-	put_unaligned_le16(SCAN_PASSIVE_DWELL_MS, fixed + 12);
-	memcpy(buf, fixed, sizeof(fixed));
-	buf[0] = chunk + 1;
-	if (!board || !board->scan_tlvs)
-		return size;
-	/* The macOS 27.0 scan request appends TLV 0x104, a count and then
-	 * {channel, band (0 = 2.4 GHz, 1 = 5 GHz), 0, 0} per channel, and TLV 0x165, an OCE block
-	 * whose flags byte always has bit 0 set. One chunk covers 13 entries of the wiphy table.
-	 */
-	n = min_t(unsigned int, 13, 13 + ARRAY_SIZE(five_ghz) - first);
-	list[0] = n;
-	for (i = 0; i < n; i++) {
-		const struct ieee80211_channel *channel = &wifi->channels[first + i];
-
-		list[1 + 4 * i] = channel->hw_value;
-		list[2 + 4 * i] = channel->band == NL80211_BAND_5GHZ;
-		list[3 + 4 * i] = 0;
-		list[4 + 4 * i] = 0;
-	}
-	append_tlv(buf, &size, 0x104, list, 1 + 4 * n);
-	append_tlv(buf, &size, 0x165, oce, sizeof(oce));
-	return size;
-}
+#define CEN_SCAN_CHANNELS_MAX 59
+#define CEN_SCAN_SSIDS_MAX 4
+#define SCAN_STATUS_INVALID_HANDLE 342
+#define SCAN_ACTIVE_MIN_MS 40
+#define SCAN_LISTEN_MS 110
 
 static bool scan_transport_stopped(struct centauri_wifi *wifi)
 {
@@ -970,6 +2158,23 @@ static int scan_wait_stop(struct centauri_wifi *wifi, u32 done)
 	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
 }
 
+static int scan_stop_chunk_id(struct centauri_wifi *wifi, u8 scan_id, u32 done)
+{
+	int ret;
+
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	ret = scan_id ? command(wifi, 65537, &scan_id, sizeof(scan_id)) :
+			command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == SCAN_STATUS_INVALID_HANDLE)
+		return 0;
+	if (ret)
+		return ret;
+	return scan_wait_stop(wifi, done);
+}
+
 static int scan_stop_chunk(struct centauri_wifi *wifi, u32 done)
 {
 	int ret;
@@ -979,33 +2184,148 @@ static int scan_stop_chunk(struct centauri_wifi *wifi, u32 done)
 	ret = command(wifi, 65537, NULL, 0);
 	if (wifi->scans_done != done)
 		return 0;
-	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+	if (ret == -EREMOTEIO && wifi->reply_status == SCAN_STATUS_INVALID_HANDLE)
 		return 0;
 	if (ret)
 		return ret;
 	return scan_wait_stop(wifi, done);
 }
 
-static void scan_worker(struct work_struct *work)
+static int run_scan_tlvs(struct centauri_wifi *wifi,
+			 struct cfg80211_scan_request *request)
 {
-	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
-	struct cfg80211_scan_info info = {};
-	struct cfg80211_scan_request *request;
-	u8 scan[14 + 4 + 1 + 4 * 13 + 4 + 5];
-	size_t scan_size;
-	unsigned int chunk, chunks = DIV_ROUND_UP(13 + ARRAY_SIZE(five_ghz), 13);
-	u32 channels_start, beacons_start;
+	u8 scan[14 + 5 + 4 * CEN_SCAN_CHANNELS_MAX + 9 +
+		CEN_SCAN_SSIDS_MAX * (4 + 2 + IEEE80211_MAX_SSID_LEN)];
+	unsigned int next = 0;
+
+	if (!request || !request->n_channels ||
+	    request->n_ssids > CEN_SCAN_SSIDS_MAX)
+		return -EINVAL;
+	while (next < request->n_channels) {
+		u8 channels[1 + 4 * CEN_SCAN_CHANNELS_MAX] = {};
+		u8 options[5] = { 0, 0, 1, 0, 0 };
+		unsigned int count = 0, s;
+		u32 done = wifi->scans_done;
+		size_t size = 14;
+		unsigned long deadline;
+		u8 scan_id;
+		int ret;
+
+		if (scan_transport_stopped(wifi))
+			return -EIO;
+		if (READ_ONCE(wifi->scan_abort))
+			return -ECANCELED;
+		memset(scan, 0, sizeof(scan));
+		wifi->scan_sequence = (wifi->scan_sequence % 31) + 1;
+		scan_id = wifi->scan_sequence;
+		scan[0] = scan_id;
+		scan[3] = 0x80;
+		scan[5] = 2;
+		scan[7] = 0x10;
+		put_unaligned_le16(SCAN_ACTIVE_MIN_MS, scan + 8);
+		put_unaligned_le16(SCAN_LISTEN_MS, scan + 10);
+		put_unaligned_le16(SCAN_LISTEN_MS, scan + 12);
+
+		while (next < request->n_channels && count < CEN_SCAN_CHANNELS_MAX) {
+			struct ieee80211_channel *channel = request->channels[next++];
+			unsigned int number;
+			int band;
+
+			if (channel->flags & IEEE80211_CHAN_DISABLED)
+				continue;
+			band = firmware_band(channel->band);
+			if (band < 0)
+				return band;
+			number = ieee80211_frequency_to_channel(channel->center_freq);
+			if (!number || number > 255)
+				return -EINVAL;
+			channels[1 + 4 * count] = number;
+			channels[2 + 4 * count] = band;
+			if (channel->flags &
+			    (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR))
+				channels[2 + 4 * count] |= CHANNEL_PASSIVE;
+			if (channel->flags & IEEE80211_CHAN_RADAR)
+				channels[2 + 4 * count] |= CHANNEL_RADAR;
+			count++;
+		}
+		if (!count)
+			continue;
+		channels[0] = count;
+		append_tlv(scan, &size, 260, channels, 1 + 4 * count);
+		append_tlv(scan, &size, 357, options, sizeof(options));
+		for (s = 0; s < request->n_ssids; s++) {
+			const struct cfg80211_ssid *ssid = &request->ssids[s];
+			u8 entry[2 + IEEE80211_MAX_SSID_LEN];
+
+			if (ssid->ssid_len > IEEE80211_MAX_SSID_LEN)
+				return -EINVAL;
+			if (ssid->ssid_len)
+				scan[2] = 1;
+			entry[0] = ssid->ssid_len ? 5 : 4;
+			entry[1] = ssid->ssid_len;
+			memcpy(entry + 2, ssid->ssid, ssid->ssid_len);
+			append_tlv(scan, &size, 258, entry, 2 + ssid->ssid_len);
+		}
+		ret = command(wifi, 65551, scan, size);
+		if (ret)
+			return ret;
+		deadline = jiffies + msecs_to_jiffies(max(8000U, count * 220 + 2000));
+		do {
+			if (scan_transport_stopped(wifi)) {
+				if (!READ_ONCE(wifi->stopping) &&
+				    !READ_ONCE(wifi->transport_paused) &&
+				    readl(wifi->a.bar + 8) != 2)
+					centauri_recovery_request(wifi->control,
+								  "scan: Alpha stage");
+				return -EIO;
+			}
+			drain(wifi);
+			if (wifi->scans_done != done)
+				break;
+			if (READ_ONCE(wifi->scan_abort)) {
+				int stop_ret = scan_stop_chunk_id(wifi, scan_id, done);
+
+				return stop_ret == -EIO ? -EIO : -ECANCELED;
+			}
+			mutex_unlock(&wifi->lock);
+			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
+		} while (time_before(jiffies, deadline));
+		if (wifi->scans_done == done) {
+			if (scan_transport_stopped(wifi))
+				return -EIO;
+			drain(wifi);
+			if (wifi->scans_done == done) {
+				int stop_ret;
+
+				dev_warn(&wifi->control->pdev->dev,
+					 "Wi-Fi scan of %u channels: no completion event\n",
+					 count);
+				stop_ret = scan_stop_chunk_id(wifi, scan_id, done);
+				return stop_ret == -EIO ? -EIO : -ETIMEDOUT;
+			}
+		}
+		if (READ_ONCE(wifi->scan_abort))
+			return -ECANCELED;
+	}
+	return 0;
+}
+
+static int run_scan_legacy(struct centauri_wifi *wifi)
+{
+	u8 scan[14] = { 0, 0, 0, 0x80, 0, 2, 0, 0x10 };
+	unsigned int chunk;
 	int ret = 0;
 
-	mutex_lock(&wifi->lock);
-	channels_start = wifi->channels_seen;
-	beacons_start = wifi->beacons_seen;
-	for (chunk = 0; chunk < chunks && !ret; chunk++) {
-		u32 channels = wifi->channels_seen, done = wifi->scans_done, seen = channels;
-		unsigned int count = min_t(unsigned int, 13,
-					   13 + ARRAY_SIZE(five_ghz) - chunk * 13);
+	put_unaligned_le16(SCAN_LISTEN_MS, scan + 8);
+	put_unaligned_le16(SCAN_LISTEN_MS, scan + 10);
+	put_unaligned_le16(SCAN_LISTEN_MS, scan + 12);
+	for (chunk = 0; chunk < 3 && !ret; chunk++) {
+		u32 channels = wifi->channels_seen, done = wifi->scans_done;
+		u32 seen = channels;
 		unsigned long deadline, progress;
 		bool stopped = false, refused = false;
+		u8 scan_id;
 
 		if (scan_transport_stopped(wifi)) {
 			ret = -EIO;
@@ -1015,29 +2335,21 @@ static void scan_worker(struct work_struct *work)
 			ret = -ECANCELED;
 			break;
 		}
-		scan_size = build_scan(wifi, chunk, scan);
-		ret = command(wifi, 65551, scan, scan_size);
+		wifi->scan_sequence = (wifi->scan_sequence % 31) + 1;
+		scan_id = wifi->scan_sequence;
+		scan[0] = scan_id;
+		ret = command(wifi, 65551, scan, sizeof(scan));
 		if (ret)
 			break;
-		/*
-		 * The firmware reports every channel it finishes (event 0x30) and then the scan
-		 * (event 0x05). This loop used to stop each chunk after its 8th channel, so a scan
-		 * covered 24 of the 38 channels (J815 boot 2d103457: "channels=24"): 2.4 GHz 9-13,
-		 * 5 GHz 100-116 and 153-165 were never scanned and 149 was the last one kept. A
-		 * 5 GHz BSS there came and went between scans, and the supplicant joined 2.4 GHz.
-		 * The chunk now runs to its own end. It's stopped only once all of its channels
-		 * have reported without a scan event, when it goes quiet for a second after some
-		 * progress (a channel the firmware skips under the country rules), at its
-		 * deadline, or on an abort. A chunk that ends early keeps what it found.
-		 */
-		deadline = jiffies +
-			   msecs_to_jiffies(max(8000U, count * 2 * SCAN_PASSIVE_DWELL_MS + 2000));
+		deadline = jiffies + msecs_to_jiffies(8000);
 		progress = jiffies;
 		do {
 			if (scan_transport_stopped(wifi)) {
-				if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused) &&
+				if (!READ_ONCE(wifi->stopping) &&
+				    !READ_ONCE(wifi->transport_paused) &&
 				    readl(wifi->a.bar + 8) != 2)
-					centauri_recovery_request(wifi->control, "scan: Alpha stage");
+					centauri_recovery_request(wifi->control,
+								  "scan: Alpha stage");
 				ret = -EIO;
 				break;
 			}
@@ -1056,22 +2368,14 @@ static void scan_worker(struct work_struct *work)
 				progress = jiffies;
 			}
 			if (!stopped &&
-			    (seen - channels >= count ||
+			    (seen - channels >= 13 ||
 			     (seen != channels &&
 			      time_after(jiffies, progress + msecs_to_jiffies(1000))))) {
 				stopped = true;
-				/*
-				 * A refused stop (firmware status 342 on J815) means the chunk
-				 * had ended already: keep its results and go on.
-				 */
 				if (command(wifi, 65537, NULL, 0)) {
-					dev_dbg(&wifi->control->pdev->dev,
-						"Wi-Fi scan chunk %u: stop refused (status %u), chunk over\n",
-						chunk, wifi->reply_status);
 					refused = true;
 					break;
 				}
-				/* The stop's own scan event ends the wait. */
 				deadline = jiffies + msecs_to_jiffies(1000);
 			}
 			mutex_unlock(&wifi->lock);
@@ -1084,24 +2388,49 @@ static void scan_worker(struct work_struct *work)
 			} else {
 				drain(wifi);
 				if (wifi->scans_done == done) {
-					dev_warn(&wifi->control->pdev->dev,
-						 "Wi-Fi scan chunk %u: %u of %u channels, no scan event%s\n",
-						 chunk, wifi->channels_seen - channels, count,
-						 stopped ? " after the stop" : "");
 					ret = stopped ? -ETIMEDOUT :
 					      scan_stop_chunk(wifi, done);
 				}
 			}
 		}
 	}
+	return ret;
+}
+
+static void scan_worker(struct work_struct *work)
+{
+	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
+	const struct centauri_board *board = centauri_board();
+	struct cfg80211_scan_info info = {};
+	struct cfg80211_scan_request *request;
+	u32 channels_start, beacons_start;
+	bool alpha_halted = false;
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	channels_start = wifi->channels_seen;
+	beacons_start = wifi->beacons_seen;
+	if (scan_transport_stopped(wifi))
+		ret = -EIO;
+	else if (READ_ONCE(wifi->scan_abort))
+		ret = -ECANCELED;
+	else if (board && board->scan_tlvs)
+		ret = run_scan_tlvs(wifi, wifi->scan_request);
+	else
+		ret = run_scan_legacy(wifi);
+	alpha_halted = !READ_ONCE(wifi->stopping) && !wifi->transport_paused &&
+		       readl(wifi->a.bar + 8) != 2;
 	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) ||
-		       READ_ONCE(wifi->stopping);
+		       scan_transport_stopped(wifi);
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
-	dev_info(&wifi->control->pdev->dev, "Wi-Fi scan finished: rc=%d channels=%u of %zu beacons=%u\n",
-		 ret, wifi->channels_seen - channels_start, 13 + ARRAY_SIZE(five_ghz),
-		 wifi->beacons_seen - beacons_start);
+	if (alpha_halted)
+		centauri_recovery_request(wifi->control, "scan: Alpha stage");
+	dev_dbg(&wifi->control->pdev->dev,
+		"Wi-Fi scan finished: rc=%d channels=%u beacons=%u\n",
+		ret, wifi->channels_seen - channels_start,
+		wifi->beacons_seen - beacons_start);
 	if (request)
 		cfg80211_scan_done(request, &info);
 }
@@ -1112,16 +2441,54 @@ static int wifi_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	if (!wifi->configured)
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+	} else if (!wifi->configured) {
 		ret = -ENETDOWN;
-	else if (wifi->scan_request || wifi->connecting)
+	} else if (wifi->scan_request || wifi->connecting) {
 		ret = -EBUSY;
-	else {
+	} else {
+		WRITE_ONCE(wifi->scan_abort, false);
 		wifi->scan_request = request;
 		schedule_work(&wifi->scan_work);
 	}
 	mutex_unlock(&wifi->lock);
 	return ret;
+}
+
+static void wifi_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+
+	if (wdev == &wifi->wdev)
+		WRITE_ONCE(wifi->scan_abort, true);
+}
+
+static void cancel_scan(struct centauri_wifi *wifi)
+{
+	struct cfg80211_scan_info info = { .aborted = true };
+	struct cfg80211_scan_request *request;
+
+	WRITE_ONCE(wifi->scan_abort, true);
+	cancel_work_sync(&wifi->scan_work);
+	mutex_lock(&wifi->lock);
+	request = wifi->scan_request;
+	wifi->scan_request = NULL;
+	mutex_unlock(&wifi->lock);
+	if (request)
+		cfg80211_scan_done(request, &info);
+}
+
+static void cancel_connect_locked(struct centauri_wifi *wifi)
+{
+	if (!wifi->connecting)
+		return;
+	wifi->connecting = false;
+	wifi->connected = false;
+	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
+	cfg80211_connect_timeout(wifi->netdev, wifi->bssid, wifi->request_ie,
+				 wifi->request_ie_size, GFP_KERNEL,
+				 NL80211_TIMEOUT_UNSPECIFIED);
 }
 
 static int rsn_caps_offset(const u8 *body, size_t size)
@@ -1149,142 +2516,378 @@ static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16
 	*size += 4 + length;
 }
 
+static int rsn_akm_offset(const u8 *body, size_t size)
+{
+	size_t offset;
+	u16 count;
+
+	if (size < 8 || get_unaligned_le16(body) != 1)
+		return -EINVAL;
+	count = get_unaligned_le16(body + 6);
+	offset = 8 + 4 * count;
+	if (!count || offset + 2 > size)
+		return -EINVAL;
+	count = get_unaligned_le16(body + offset);
+	if (!count || offset + 2 + 4 * count > size)
+		return -EINVAL;
+	return offset;
+}
+
+static bool rsn_lists_akm(const u8 *body, size_t size, u32 akm)
+{
+	int offset = rsn_akm_offset(body, size);
+	unsigned int i;
+
+	if (offset < 0)
+		return false;
+	for (i = 0; i < get_unaligned_le16(body + offset); i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == akm)
+			return true;
+	return false;
+}
+
+#define CONNECT_AUTH_OPEN 0
+#define CONNECT_AUTH_SAE 3
+#define CONNECT_AKM_NONE 0
+#define CONNECT_AKM_PSK 4
+#define CONNECT_AKM_PSK_SHA256 6
+#define CONNECT_AKM_SAE 8
+#define CONNECT_CIPHER_NONE 0
+#define CONNECT_CIPHER_CCMP 4
+#define CONNECT_CIPHER_GCMP 7
+#define CONNECT_CIPHER_GCMP_256 8
+
+static int firmware_pairwise_cipher(u32 suite)
+{
+	switch (suite) {
+	case WLAN_CIPHER_SUITE_CCMP:
+		return CONNECT_CIPHER_CCMP;
+	case WLAN_CIPHER_SUITE_GCMP:
+		return CONNECT_CIPHER_GCMP;
+	case WLAN_CIPHER_SUITE_GCMP_256:
+		return CONNECT_CIPHER_GCMP_256;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static u8 firmware_akm(u32 akm)
+{
+	switch (akm) {
+	case WLAN_AKM_SUITE_PSK:
+		return CONNECT_AKM_PSK;
+	case WLAN_AKM_SUITE_PSK_SHA256:
+		return CONNECT_AKM_PSK_SHA256;
+	case WLAN_AKM_SUITE_SAE:
+		return CONNECT_AKM_SAE;
+	default:
+		return CONNECT_AKM_NONE;
+	}
+}
+
+static bool cipher_pair_supported(u32 pairwise, u32 group, u32 akm)
+{
+	if (firmware_pairwise_cipher(pairwise) < 0)
+		return false;
+	if (group == pairwise)
+		return true;
+	if (group == WLAN_CIPHER_SUITE_TKIP)
+		return akm != WLAN_AKM_SUITE_SAE &&
+		       pairwise == WLAN_CIPHER_SUITE_CCMP;
+	if (group == WLAN_CIPHER_SUITE_CCMP || group == WLAN_CIPHER_SUITE_GCMP)
+		return pairwise == WLAN_CIPHER_SUITE_GCMP ||
+		       pairwise == WLAN_CIPHER_SUITE_GCMP_256;
+	return false;
+}
+
+static int select_rsn(const u8 *body, size_t size, u32 akm, u32 pairwise,
+		      u32 group, u8 *selected)
+{
+	size_t tail;
+	int offset;
+
+	offset = rsn_akm_offset(body, size);
+	if (offset < 0)
+		return offset;
+	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
+	if (tail + 2 > size)
+		return -EINVAL;
+	if (!cipher_pair_supported(pairwise, group, akm))
+		return -EOPNOTSUPP;
+	if (get_unaligned_be32(body + 2) != group ||
+	    get_unaligned_le16(body + 6) != 1 ||
+	    get_unaligned_be32(body + 8) != pairwise)
+		return -EOPNOTSUPP;
+	if (!rsn_lists_akm(body, size, akm) && tail + 4 <= size &&
+	    get_unaligned_le16(body + tail + 2))
+		return -EOPNOTSUPP;
+	memcpy(selected, body, offset);
+	put_unaligned_le16(1, selected + offset);
+	put_unaligned_be32(akm, selected + offset + 2);
+	memcpy(selected + offset + 6, body + tail, size - tail);
+	return offset + 6 + size - tail;
+}
+
+static const u32 connect_akms[] = {
+	WLAN_AKM_SUITE_SAE,
+	WLAN_AKM_SUITE_PSK_SHA256,
+	WLAN_AKM_SUITE_PSK,
+};
+
+static bool akm_usable(const struct cfg80211_crypto_settings *crypto, u32 akm)
+{
+	unsigned int i;
+
+	for (i = 0; i < crypto->n_akm_suites; i++)
+		if (crypto->akm_suites[i] == akm)
+			return akm == WLAN_AKM_SUITE_SAE ? crypto->sae_pwd_len :
+							   !!crypto->psk;
+	return false;
+}
+
+static u32 connect_akm(const struct cfg80211_crypto_settings *crypto,
+		       const u8 *own, size_t own_size, const u8 *target,
+		       size_t target_size, bool mfpc, u32 pairwise, u32 group)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(connect_akms); i++)
+		if (akm_usable(crypto, connect_akms[i]) &&
+		    cipher_pair_supported(pairwise, group, connect_akms[i]) &&
+		    rsn_lists_akm(own, own_size, connect_akms[i]))
+			return connect_akms[i];
+	for (i = 0; i < ARRAY_SIZE(connect_akms); i++) {
+		if (!akm_usable(crypto, connect_akms[i]) ||
+		    !cipher_pair_supported(pairwise, group, connect_akms[i]))
+			continue;
+		if (connect_akms[i] == WLAN_AKM_SUITE_SAE && !mfpc)
+			continue;
+		if (!target_size ||
+		    rsn_lists_akm(target, target_size, connect_akms[i]))
+			return connect_akms[i];
+	}
+	return 0;
+}
+
+static size_t target_rsn(struct wiphy *wiphy,
+			 const struct cfg80211_connect_params *params, u8 *body)
+{
+	const struct element *element;
+	struct cfg80211_bss *bss;
+	size_t size = 0;
+
+	bss = cfg80211_get_bss(wiphy, params->channel ?: params->channel_hint,
+			       params->bssid ?: params->bssid_hint, params->ssid,
+			       params->ssid_len, IEEE80211_BSS_TYPE_ESS,
+			       IEEE80211_PRIVACY_ON);
+	if (!bss)
+		return 0;
+	rcu_read_lock();
+	element = ieee80211_bss_get_elem(bss, WLAN_EID_RSN);
+	if (element) {
+		size = element->datalen;
+		memcpy(body, element->data, size);
+	}
+	rcu_read_unlock();
+	cfg80211_put_bss(wiphy, bss);
+	return size;
+}
+
 static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			struct cfg80211_connect_params *params)
 {
-	/* The stock 26.x join emits a 12-byte TLV 376. The macOS 27.0.1
-	 * adapter writes tag 0x178 with length 14: the MLD configuration bytes
-	 * that its default initialisation fills with the defaults below, bytes
-	 * 12 and 13 being 0 and the flags byte (bits from the connection parameters, 0 by default).
-	 * Preserve the unspecified-link masks; all-zero is not the non-MLO default.
-	 */
 	static const u8 mld_defaults[14] = {
 		1, 0, 1, 0xff, 0xff, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 3, 0, 0,
 	};
-	/* Firmware connection-context defaults (aciw 0x511ee8). TLV 0xf913
-	 * replaces all five values. Sending zeros arms Supp_AddTimer with a
-	 * zero duration and aborts WPA before message 2 can be transmitted.
-	 */
+	/* Firmware connection timer budgets (ms): probe, auth, assoc, EAPOL, retry. */
 	static const __le32 connection_timeouts[] = {
 		cpu_to_le32(260), cpu_to_le32(6000), cpu_to_le32(2000),
 		cpu_to_le32(15000), cpu_to_le32(300),
 	};
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
-	struct cfg80211_bss *bss;
-	const struct cfg80211_bss_ies *ies;
-	const u8 *rsn, *ap_rsn;
-	u8 rsn_body[255], ssid[35], zero[20] = {}, pmf;
+	const struct centauri_board *board = centauri_board();
+	const u8 *bssid = params->bssid ?: params->bssid_hint;
+	struct ieee80211_channel *channel = params->channel ?: params->channel_hint;
+	struct cfg80211_bss *bss = NULL;
+	const u8 *rsn = NULL;
+	u8 rsn_body[255], target[255], ssid[35];
 	u8 *payload = wifi->connect_payload;
-	size_t size = 130, rsn_size;
-	u16 caps = 0;
-	int ret = 0, offset, i;
+	size_t size = 130, rsn_size = 0, rsn_prefix, rsn_tail;
+	u8 join_mode = (board && board->scan_tlvs) ? 5 : 0;
+	u8 roaming = 0;
+	u8 password[2 + SAE_PASSWORD_MAX_LEN];
+	int ret = 0, offset, band, fw_cipher = CONNECT_CIPHER_NONE;
+	bool open_net, sae = false, mfpc = false;
+	u32 akm = 0, pairwise = 0, group = 0;
 
-	/*
-	 * wpa_supplicant without SME lists every AKM the network allows
-	 * (NetworkManager's "WPA-PSK WPA-PSK-SHA256" gives PSK and PSK-SHA256).
-	 * Accept any list that offers PSK and send the firmware PSK alone, as
-	 * the T6050 driver does (select_rsn).
-	 */
-	for (i = 0; i < params->crypto.n_akm_suites; i++)
-		if (params->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
-			break;
-	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
-	    i == params->crypto.n_akm_suites ||
-	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie)) {
-		dev_info(&wifi->control->pdev->dev,
-			 "connect refused: ssid_len=%zu psk=%d akms=%d [%08x %08x] pairwise=%d [%08x] group=%08x ie_len=%zu\n",
-			 params->ssid_len, !!params->crypto.psk, params->crypto.n_akm_suites,
-			 params->crypto.n_akm_suites > 0 ? params->crypto.akm_suites[0] : 0,
-			 params->crypto.n_akm_suites > 1 ? params->crypto.akm_suites[1] : 0,
-			 params->crypto.n_ciphers_pairwise,
-			 params->crypto.n_ciphers_pairwise ? params->crypto.ciphers_pairwise[0] : 0,
-			 params->crypto.cipher_group, params->ie_len);
+	if (!params->ssid_len || params->ssid_len > IEEE80211_MAX_SSID_LEN ||
+	    params->crypto.sae_pwd_len > SAE_PASSWORD_MAX_LEN ||
+	    params->ie_len > sizeof(wifi->request_ie)) {
+		dev_dbg(&wifi->control->pdev->dev,
+			"connect refused: ssid_len=%zu sae_pwd_len=%u ie_len=%zu\n",
+			params->ssid_len, params->crypto.sae_pwd_len,
+			params->ie_len);
 		return -EOPNOTSUPP;
 	}
-	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn) {
-		dev_info(&wifi->control->pdev->dev, "connect refused: no RSN element in the request\n");
-		return -EINVAL;
+	open_net = !params->privacy && !params->crypto.wpa_versions &&
+		   !params->crypto.n_akm_suites &&
+		   !params->crypto.n_ciphers_pairwise &&
+		   !params->crypto.cipher_group;
+	if (open_net) {
+		if (params->auth_type != NL80211_AUTHTYPE_OPEN_SYSTEM &&
+		    params->auth_type != NL80211_AUTHTYPE_AUTOMATIC)
+			return -EOPNOTSUPP;
+	} else {
+		if (params->crypto.n_ciphers_pairwise != 1)
+			return -EOPNOTSUPP;
+		pairwise = params->crypto.ciphers_pairwise[0];
+		group = params->crypto.cipher_group;
+		fw_cipher = firmware_pairwise_cipher(pairwise);
+		if (fw_cipher < 0)
+			return -EOPNOTSUPP;
+		rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
+		if (!rsn)
+			return -EINVAL;
+		offset = rsn_caps_offset(rsn + 2, rsn[1]);
+		if (offset < 0)
+			return -EINVAL;
+		mfpc = get_unaligned_le16(rsn + 2 + offset) & BIT(7);
+		akm = connect_akm(&params->crypto, rsn + 2, rsn[1], target,
+				  target_rsn(wiphy, params, target), mfpc,
+				  pairwise, group);
+		ret = akm ? select_rsn(rsn + 2, rsn[1], akm, pairwise, group,
+				       rsn_body) :
+			    -EOPNOTSUPP;
+		if (ret < 0)
+			return ret;
+		rsn_size = ret;
+		sae = akm == WLAN_AKM_SUITE_SAE;
+		ret = 0;
 	}
-	ret = select_rsn(rsn + 2, rsn[1], rsn_body);
-	if (ret < 0 || rsn_caps_offset(rsn_body, ret) < 0) {
-		dev_info(&wifi->control->pdev->dev, "connect refused: RSN element %*ph not usable (%d)\n",
-			 rsn[1] + 2, rsn, ret);
-		return ret < 0 ? ret : -EINVAL;
-	}
-	rsn_size = ret;
-	ret = 0;
 	mutex_lock(&wifi->lock);
-	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!wifi->configured || wifi->connecting || wifi->connected ||
+	    wifi->scan_request) {
 		ret = -EBUSY;
 		goto out;
 	}
-	bss = cfg80211_get_bss(wiphy, params->channel, params->bssid,
-		params->ssid, params->ssid_len, IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ON);
-	if (!bss) {
-		ret = -ENOENT;
+	if (bssid && channel) {
+		memcpy(wifi->bssid, bssid, ETH_ALEN);
+	} else {
+		bss = cfg80211_get_bss(wiphy, channel, bssid,
+				       params->ssid, params->ssid_len,
+				       IEEE80211_BSS_TYPE_ESS,
+				       open_net ? IEEE80211_PRIVACY_OFF :
+						  IEEE80211_PRIVACY_ON);
+		if (!bss) {
+			ret = -ENOENT;
+			goto out;
+		}
+		memcpy(wifi->bssid, bss->bssid, ETH_ALEN);
+		channel = bss->channel;
+		cfg80211_put_bss(wiphy, bss);
+	}
+	ret = firmware_band(channel->band);
+	if (ret < 0)
+		goto out;
+	band = ret;
+	ret = 0;
+	if (channel->band == NL80211_BAND_6GHZ && (open_net || !sae || !mfpc)) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
-	/* Match the measured successful J813 association shape. The firmware
-	 * expects the AP RSN capability bits even with the legal single-AKM STA IE.
-	 */
-	rcu_read_lock();
-	ies = rcu_dereference(bss->ies);
-	ap_rsn = ies ? cfg80211_find_ie(WLAN_EID_RSN, ies->data, ies->len) : NULL;
-	if (ap_rsn) {
-		offset = rsn_caps_offset(ap_rsn + 2, ap_rsn[1]);
-		if (offset >= 0)
-			caps = get_unaligned_le16(ap_rsn + 2 + offset);
-	}
-	rcu_read_unlock();
-	offset = rsn_caps_offset(rsn_body, rsn_size);
-	put_unaligned_le16(caps, rsn_body + offset);
-	pmf = !!(caps & BIT(7));
+	wifi->connect_channel = channel;
+	wifi->connect_privacy = !open_net;
+	memcpy(wifi->ssid, params->ssid, params->ssid_len);
+	wifi->ssid_len = params->ssid_len;
 	memset(payload, 0, sizeof(wifi->connect_payload));
 	payload[0] = 1;
-	memcpy(payload + 1, bss->bssid, ETH_ALEN);
-	memcpy(wifi->bssid, bss->bssid, ETH_ALEN);
-	payload[7] = ieee80211_frequency_to_channel(bss->channel->center_freq);
-	/* Firmware band field: chanspec 0xc000 (5 GHz) is band 1 and
-	 * 0x4000 (6 GHz) is band 2.
-	 */
-	payload[8] = bss->channel->band == NL80211_BAND_2GHZ ? 0 : 1;
-	payload[0x47] = 4;
-	/* The firmware's fixed security field is 4 for CCMP.
-	 * The RSN IE does not replace this fixed cipher field.
-	 */
-	put_unaligned_le16(4, payload + 0x48);
-	put_unaligned_le16(32, payload + 0x4a);
-	memcpy(payload + 0x4c, params->crypto.psk, 32);
-	if (verify_pmk)
-		memcpy(wifi->expected_pmk, params->crypto.psk, 32);
-	append_tlv(payload, &size, 304, zero, 1);
+	memcpy(payload + 1, wifi->bssid, ETH_ALEN);
+	payload[7] = ieee80211_frequency_to_channel(channel->center_freq);
+	payload[8] = band;
+	payload[0x46] = sae ? CONNECT_AUTH_SAE : CONNECT_AUTH_OPEN;
+	payload[0x47] = open_net ? CONNECT_AKM_NONE : firmware_akm(akm);
+	put_unaligned_le16(fw_cipher, payload + 0x48);
+	if (!open_net && !sae) {
+		put_unaligned_le16(32, payload + 0x4a);
+		memcpy(payload + 0x4c, params->crypto.psk, 32);
+		if (verify_pmk)
+			memcpy(wifi->expected_pmk, params->crypto.psk, 32);
+	}
+	append_tlv(payload, &size, 304, &join_mode, 1);
 	append_tlv(payload, &size, 63763, connection_timeouts, sizeof(connection_timeouts));
 	ssid[0] = 1;
 	ssid[1] = 4;
 	ssid[2] = params->ssid_len;
 	memcpy(ssid + 3, params->ssid, params->ssid_len);
 	append_tlv(payload, &size, 342, ssid, 3 + params->ssid_len);
-	append_tlv(payload, &size, WLAN_EID_RSN, rsn_body, rsn_size);
-	/* The fixed field carries the PMK. The firmware accepts a join with the PMK alone (measured); the macOS TLV 313 carries the
-	 * passphrase and is not sent.
-	 */
-	append_tlv(payload, &size, 316, &pmf, 1);
+	if (!open_net) {
+		append_tlv(payload, &size, WLAN_EID_RSN, rsn_body, rsn_size);
+		if (sae) {
+			put_unaligned_le16(params->crypto.sae_pwd_len, password);
+			memcpy(password + 2, params->crypto.sae_pwd,
+			       params->crypto.sae_pwd_len);
+			append_tlv(payload, &size, 313, password,
+				   2 + params->crypto.sae_pwd_len);
+			memzero_explicit(password, sizeof(password));
+		}
+		append_tlv(payload, &size, 316, &roaming, 1);
+	}
 	append_tlv(payload, &size, 376, mld_defaults, sizeof(mld_defaults));
 	wifi->connect_size = size;
-	memcpy(wifi->request_ie, params->ie, params->ie_len);
-	wifi->request_ie_size = params->ie_len;
+	if (open_net) {
+		if (params->ie_len)
+			memcpy(wifi->request_ie, params->ie, params->ie_len);
+		wifi->request_ie_size = params->ie_len;
+	} else {
+		rsn_prefix = rsn - params->ie;
+		rsn_tail = rsn_prefix + 2 + rsn[1];
+		memcpy(wifi->request_ie, params->ie, rsn_prefix);
+		wifi->request_ie[rsn_prefix] = WLAN_EID_RSN;
+		wifi->request_ie[rsn_prefix + 1] = rsn_size;
+		memcpy(wifi->request_ie + rsn_prefix + 2, rsn_body, rsn_size);
+		memcpy(wifi->request_ie + rsn_prefix + 2 + rsn_size,
+		       params->ie + rsn_tail, params->ie_len - rsn_tail);
+		wifi->request_ie_size = params->ie_len - rsn[1] + rsn_size;
+	}
+	WRITE_ONCE(wifi->connect_abort, false);
 	wifi->connecting = true;
 	wifi->connect_status = 0;
+	wifi->disconnect_reason = 0;
+	wifi->disconnect_local = false;
 	wifi->associated = wifi->pmk_seen = wifi->pmk_matches = false;
 	wifi->connect_event = wifi->disconnect_event = false;
-	cfg80211_put_bss(wiphy, bss);
 	schedule_work(&wifi->connect_work);
 out:
 	mutex_unlock(&wifi->lock);
 	return ret;
+}
+
+static struct cfg80211_bss *connected_bss(struct centauri_wifi *wifi)
+{
+	struct cfg80211_bss *bss;
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+
+	bss = cfg80211_get_bss(wifi->wiphy, wifi->connect_channel, wifi->bssid,
+			       NULL, 0, IEEE80211_BSS_TYPE_ESS,
+			       IEEE80211_PRIVACY_ANY);
+	if (bss)
+		return bss;
+	ie[0] = WLAN_EID_SSID;
+	ie[1] = wifi->ssid_len;
+	memcpy(ie + 2, wifi->ssid, wifi->ssid_len);
+	return cfg80211_inform_bss(wifi->wiphy, wifi->connect_channel,
+				   CFG80211_BSS_FTYPE_UNKNOWN, wifi->bssid, 0,
+				   WLAN_CAPABILITY_ESS |
+					   (wifi->connect_privacy ?
+						    WLAN_CAPABILITY_PRIVACY :
+						    0),
+				   100, ie, 2 + wifi->ssid_len, -95 * 100,
+				   GFP_KERNEL);
 }
 
 /* Without the host power state the firmware treats the host as asleep, powers the PHYs down and traps about 15 s after the
@@ -1329,11 +2932,19 @@ static void connect_worker(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping)) {
+		cancel_connect_locked(wifi);
+		mutex_unlock(&wifi->lock);
+		return;
+	}
 	if (auto_rings) {
-		static const unsigned int ring_ids[] = { 76, 24, 15, 12 };
-		unsigned int n;
+		unsigned int ring_ids[5], count = 0, n;
 
-		for (n = 0; n < ARRAY_SIZE(ring_ids); n++) {
+		ring_ids[count++] = 76;
+		ring_ids[count++] = 24;
+		ring_ids[count++] = 15;
+		ring_ids[count++] = 12;
+		for (n = 0; n < count; n++) {
 			int ring_ret = data_probe_locked(wifi, ring_ids[n], true);
 
 			if (ring_ret && ring_ret != -EBUSY)
@@ -1349,8 +2960,12 @@ static void connect_worker(struct work_struct *work)
 	command_status = wifi->reply_status;
 	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
 	deadline = jiffies + msecs_to_jiffies(15000);
-	while (!ret && !wifi->connect_event && time_before(jiffies, deadline)) {
+	while (!ret && !wifi->connect_event &&
+	       !READ_ONCE(wifi->connect_abort) && !READ_ONCE(wifi->stopping) &&
+	       time_before(jiffies, deadline)) {
 		drain(wifi);
+		if (wifi->disconnect_event)
+			ret = -ENOTCONN;
 		if (link_diagnostics && wifi->associated && !queried_link) {
 			unsigned int i;
 			int link_ret;
@@ -1401,50 +3016,90 @@ static void connect_worker(struct work_struct *work)
 			ret = -EIO;
 		usleep_range(1000, 2000);
 	}
-	if (!ret && !wifi->connect_event)
+	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping))
+		ret = -ECANCELED;
+	else if (!ret && !wifi->connect_event)
 		ret = -ETIMEDOUT;
 	status = !ret && wifi->connect_status == 0 ? WLAN_STATUS_SUCCESS : WLAN_STATUS_UNSPECIFIED_FAILURE;
 	wifi->connecting = false;
 	wifi->connected = status == WLAN_STATUS_SUCCESS;
+	wifi->station_signal_valid = false;
+	wifi->station_noise_valid = false;
+	wifi->station_tx_retrans_valid = false;
+	wifi->station_tx_retrans_base_valid = false;
+	wifi->station_tx_fail_valid = false;
+	wifi->station_tx_fail_base_valid = false;
+	wifi->station_beacon_valid = false;
+	wifi->station_beacon_base_valid = false;
+	wifi->station_cca_valid = false;
+	wifi->station_tx_rate_valid = false;
+	wifi->station_tx_power_valid = false;
+	wifi->station_rx_rate_valid = false;
+	wifi->station_chip_tx_rate_valid = false;
+	wifi->station_chains = 0;
+	wifi->station_phy_noise_valid = false;
+	wifi->station_chandef_valid = false;
+	wifi->station_signal_at = jiffies - HZ;
+	wifi->station_noise_at = jiffies - HZ;
+	wifi->station_counters_at = jiffies - HZ;
+	wifi->station_cca_at = jiffies - HZ;
+	wifi->station_tx_info_at = jiffies - HZ;
+	wifi->station_beacon_at = jiffies - HZ;
+	wifi->station_phy_dump_at = jiffies - HZ;
+	if (wifi->connected) {
+		wifi->connected_at = jiffies;
+		wifi->station_start = wifi->netdev->stats;
+	}
 	if (wifi->connected && !roam_scan) {
 		int roam_ret = command(wifi, 0x20016, NULL, 0);
 
-		dev_info(&wifi->control->pdev->dev, "roam scan off: rc=%d status=%u\n", roam_ret, wifi->reply_status);
+		dev_dbg(&wifi->control->pdev->dev, "roam scan off: rc=%d status=%u\n",
+			roam_ret, wifi->reply_status);
 	}
 	memzero_explicit(wifi->expected_pmk, sizeof(wifi->expected_pmk));
-	/* The command and connection completion have consumed the PMK buffer. */
+	/* The command and connection completion have consumed the credential buffer. */
 	if (slot < ring_size[1])
 		memzero_explicit(wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE, BUFFER_SIZE);
-	mutex_unlock(&wifi->lock);
-	dev_info(&wifi->control->pdev->dev,
-		 "Wi-Fi authentication result: rc=%d command_status=%u event_status=%u complete_event=%d\n",
-		 ret, command_status, wifi->connect_status, wifi->connect_event);
-	cfg80211_connect_result(wifi->netdev, wifi->bssid,
-		wifi->request_ie, wifi->request_ie_size, NULL, 0, status, GFP_KERNEL);
+	dev_dbg(&wifi->control->pdev->dev,
+		"Wi-Fi authentication result: rc=%d command_status=%u event_status=%u complete_event=%d\n",
+		ret, command_status, wifi->connect_status, wifi->connect_event);
+	if (ret == -ECANCELED || ret == -ETIMEDOUT)
+		cfg80211_connect_timeout(wifi->netdev, wifi->bssid,
+					 wifi->request_ie,
+					 wifi->request_ie_size, GFP_KERNEL,
+					 NL80211_TIMEOUT_UNSPECIFIED);
+	else
+		cfg80211_connect_bss(wifi->netdev, wifi->bssid,
+				     status == WLAN_STATUS_SUCCESS ?
+					     connected_bss(wifi) :
+					     NULL,
+				     wifi->request_ie, wifi->request_ie_size,
+				     NULL, 0, status, GFP_KERNEL,
+				     NL80211_TIMEOUT_UNSPECIFIED);
 	if (status == WLAN_STATUS_SUCCESS && auto_rings && !READ_ONCE(wifi->stopping)) {
-		/* The normal TX ring is opened after the connection result, as in the manual recipe (data_probe 25 after wpa completed);
-		 * doing it after cfg80211_connect_result keeps the join inside the supplicant's timeout.
-		 */
-		int ring_ret;
+		int ring_ret = data_probe_locked(wifi, 25, true);
 
-		mutex_lock(&wifi->lock);
-		ring_ret = data_probe_locked(wifi, 25, true);
-		mutex_unlock(&wifi->lock);
 		if (ring_ret && ring_ret != -EBUSY)
 			dev_warn(&wifi->control->pdev->dev, "data ring 25 setup failed: %d\n", ring_ret);
 	}
 	if (status == WLAN_STATUS_SUCCESS && !READ_ONCE(wifi->stopping)) {
+		if (wifi->connect_privacy)
+			cfg80211_port_authorized(wifi->netdev, wifi->bssid,
+						 NULL, 0, GFP_KERNEL);
 		netif_carrier_on(wifi->netdev);
 		if (wifi->data_probe_done & BIT(5))
 			netif_wake_queue(wifi->netdev);
-		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
+		mod_delayed_work(system_percpu_wq, &wifi->link_work,
+				 msecs_to_jiffies(20));
 	}
+	mutex_unlock(&wifi->lock);
 }
 
 static void link_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(to_delayed_work(work), struct centauri_wifi, link_work);
-	bool disconnected;
+	bool was_connected, disconnected, awdl_active, alpha_halted, local = false;
+	u16 reason = WLAN_REASON_UNSPECIFIED;
 
 	mutex_lock(&wifi->lock);
 	if (wifi->transport_paused) {
@@ -1452,19 +3107,57 @@ static void link_worker(struct work_struct *work)
 		return;
 	}
 	drain(wifi);
-	disconnected = wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
-		readl(wifi->a.bar + 8) != 2;
-	if (disconnected)
+	was_connected = wifi->connected;
+	awdl_active = centauri_awdl_is_active(wifi->awdl);
+	alpha_halted = !READ_ONCE(wifi->stopping) && readl(wifi->a.bar + 8) != 2;
+	disconnected = was_connected &&
+		(wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
+		 alpha_halted);
+	if (disconnected) {
+		reason = wifi->disconnect_reason ?: WLAN_REASON_UNSPECIFIED;
+		local = wifi->disconnect_local;
 		wifi->connected = false;
+		wifi->station_signal_valid = false;
+		wifi->station_noise_valid = false;
+		wifi->station_tx_retrans_valid = false;
+		wifi->station_tx_retrans_base_valid = false;
+		wifi->station_tx_fail_valid = false;
+		wifi->station_tx_fail_base_valid = false;
+		wifi->station_beacon_valid = false;
+		wifi->station_beacon_base_valid = false;
+		wifi->station_cca_valid = false;
+		wifi->station_tx_rate_valid = false;
+		wifi->station_tx_power_valid = false;
+		wifi->station_rx_rate_valid = false;
+		wifi->station_chip_tx_rate_valid = false;
+		wifi->station_chains = 0;
+		wifi->station_phy_noise_valid = false;
+		wifi->station_chandef_valid = false;
+		wifi->station_signal_at = jiffies - HZ;
+		wifi->station_noise_at = jiffies - HZ;
+		wifi->station_counters_at = jiffies - HZ;
+		wifi->station_cca_at = jiffies - HZ;
+		wifi->station_tx_info_at = jiffies - HZ;
+		wifi->station_beacon_at = jiffies - HZ;
+		wifi->station_phy_dump_at = jiffies - HZ;
+	}
 	mutex_unlock(&wifi->lock);
 	if (disconnected) {
 		netif_stop_queue(wifi->netdev);
 		skb_queue_purge(&wifi->data_tx_queue);
 		netif_carrier_off(wifi->netdev);
-		cfg80211_disconnected(wifi->netdev, WLAN_REASON_UNSPECIFIED, NULL, 0, false, GFP_KERNEL);
-	} else {
-		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
+		cfg80211_disconnected(wifi->netdev, reason, NULL, 0, local, GFP_KERNEL);
 	}
+	if (alpha_halted) {
+		dev_warn_ratelimited(&wifi->control->pdev->dev,
+				     "Alpha execution stage %#x\n",
+				     readl(wifi->a.bar + 8));
+		centauri_recovery_request(wifi->control, "link: Alpha stage");
+		return;
+	}
+	if ((!disconnected && was_connected) ||
+	    (awdl_active && !READ_ONCE(wifi->stopping)))
+		schedule_delayed_work(&wifi->link_work, msecs_to_jiffies(20));
 }
 
 /* MSI from Control or Alpha: service the data rings now instead of at the next poll. */
@@ -1472,7 +3165,9 @@ void centauri_wifi_kick(struct centauri *c)
 {
 	struct centauri_wifi *wifi = READ_ONCE(c->wifi);
 
-	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping) &&
+	if (wifi &&
+	    (READ_ONCE(wifi->connected) || centauri_awdl_is_active(wifi->awdl)) &&
+	    !READ_ONCE(wifi->stopping) &&
 	    !READ_ONCE(wifi->transport_paused))
 		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
 }
@@ -1482,21 +3177,46 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
 	u8 payload[16] = {};
 	bool connected;
+	u16 reply_status;
 	int ret;
 
+	WRITE_ONCE(wifi->connect_abort, true);
+	cancel_scan(wifi);
+	cancel_work_sync(&wifi->connect_work);
 	mutex_lock(&wifi->lock);
-	if (wifi->connecting) {
-		mutex_unlock(&wifi->lock);
-		return -EBUSY;
-	}
+	cancel_connect_locked(wifi);
 	put_unaligned_le16(reason, payload);
 	put_unaligned_le16(328, payload + 8);
 	put_unaligned_le16(4, payload + 10);
 	/* Preserve the firmware's default disconnect budget. */
 	put_unaligned_le32(500, payload + 12);
 	ret = command(wifi, 131073, payload, sizeof(payload));
+	reply_status = wifi->reply_status;
 	connected = wifi->connected;
 	wifi->connected = false;
+	wifi->station_signal_valid = false;
+	wifi->station_noise_valid = false;
+	wifi->station_tx_retrans_valid = false;
+	wifi->station_tx_retrans_base_valid = false;
+	wifi->station_tx_fail_valid = false;
+	wifi->station_tx_fail_base_valid = false;
+	wifi->station_beacon_valid = false;
+	wifi->station_beacon_base_valid = false;
+	wifi->station_cca_valid = false;
+	wifi->station_tx_rate_valid = false;
+	wifi->station_tx_power_valid = false;
+	wifi->station_rx_rate_valid = false;
+	wifi->station_chip_tx_rate_valid = false;
+	wifi->station_chains = 0;
+	wifi->station_phy_noise_valid = false;
+	wifi->station_chandef_valid = false;
+	wifi->station_signal_at = jiffies - HZ;
+	wifi->station_noise_at = jiffies - HZ;
+	wifi->station_counters_at = jiffies - HZ;
+	wifi->station_cca_at = jiffies - HZ;
+	wifi->station_tx_info_at = jiffies - HZ;
+	wifi->station_beacon_at = jiffies - HZ;
+	wifi->station_phy_dump_at = jiffies - HZ;
 	mutex_unlock(&wifi->lock);
 	cancel_delayed_work_sync(&wifi->link_work);
 	netif_stop_queue(netdev);
@@ -1504,7 +3224,7 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	netif_carrier_off(netdev);
 	if (connected)
 		cfg80211_disconnected(netdev, reason, NULL, 0, true, GFP_KERNEL);
-	return ret == -EREMOTEIO && wifi->reply_status == 326 ? 0 : ret;
+	return ret == -EREMOTEIO && reply_status == 326 ? 0 : ret;
 }
 
 static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
@@ -1516,7 +3236,11 @@ static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 
 	/* Power-save mode, command 7. */
 	mutex_lock(&wifi->lock);
-	ret = wifi->configured ? command(wifi, 7, &mode, sizeof(mode)) : -ENETDOWN;
+	if (READ_ONCE(wifi->transport_paused))
+		ret = -EBUSY;
+	else
+		ret = wifi->configured ? command(wifi, 7, &mode, sizeof(mode)) :
+					 -ENETDOWN;
 	mutex_unlock(&wifi->lock);
 	return ret;
 }
@@ -1525,67 +3249,363 @@ static void wifi_regulatory(struct wiphy *wiphy, struct regulatory_request *requ
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
+	bool named = country[0] >= 'A' && country[0] <= 'Z' &&
+		     country[1] >= 'A' && country[1] <= 'Z';
 	int ret;
 
-	/* Country code, command 9. Leave world-domain
-	 * handling to cfg80211; do not invent a device country or bypass SAR.
-	 */
-	if (country[0] < 'A' || country[0] > 'Z' || country[1] < 'A' || country[1] > 'Z')
-		return;
 	mutex_lock(&wifi->lock);
-	if (wifi->configured) {
+	if (wifi->configured && named && !READ_ONCE(wifi->transport_paused) &&
+	    request->initiator != NL80211_REGDOM_SET_BY_DRIVER) {
 		ret = command(wifi, 9, country, sizeof(country));
-		dev_info(&wifi->control->pdev->dev,
-			 "Wi-Fi country %c%c: rc=%d\n", country[0], country[1], ret);
+		if (ret)
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi country %c%c update failed: %d\n",
+				country[0], country[1], ret);
+		else
+			firmware_report(wifi, 19, wifi->hw_channels,
+					&wifi->hw_channels_blob);
 	}
+	channels_apply(wifi);
 	mutex_unlock(&wifi->lock);
 }
 
-/*
- * The joined BSS as cfg80211 knows it from the last scan. No firmware query
- * for live link statistics is known yet, so its signal is the scan's.
- */
 static struct cfg80211_bss *wifi_joined_bss(struct centauri_wifi *wifi)
 {
 	if (!wifi->connected)
 		return NULL;
-	return cfg80211_get_bss(wifi->wiphy, NULL, wifi->bssid, NULL, 0,
-				IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY);
+	return cfg80211_get_bss(wifi->wiphy, wifi->connect_channel, wifi->bssid,
+				NULL, 0, IEEE80211_BSS_TYPE_ESS,
+				IEEE80211_PRIVACY_ANY);
+}
+
+static int query_sta_counters(struct centauri_wifi *wifi)
+{
+	u8 payload[22] = {};
+	size_t size = sizeof(wifi->stats_reply);
+	u32 retrans, tx_fail, tx_rate_kbps, rx_rate_kbps;
+	bool tx_fail_valid;
+	int ret;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_tx_retrans_valid = false;
+	wifi->station_tx_fail_valid = false;
+	wifi->station_rx_rate_valid = false;
+	wifi->station_chip_tx_rate_valid = false;
+	wifi->station_counters_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	/* Statistics bit 1 (chip counters), TLV 363 scope 2, reply TLV 0xf901. */
+	put_unaligned_le64(BIT_ULL(1), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	payload[21] = 2;
+	ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+			    wifi->stats_reply, &size);
+	if (!ret && chip_sta_counters_read(wifi->stats_reply,
+					   min(size, sizeof(wifi->stats_reply)),
+					   &retrans, &tx_fail, &tx_fail_valid,
+					   &tx_rate_kbps, &rx_rate_kbps)) {
+		if (!wifi->station_tx_retrans_base_valid) {
+			wifi->station_tx_retrans_base = retrans;
+			wifi->station_tx_retrans_base_valid = true;
+		}
+		wifi->station_tx_retrans = retrans;
+		wifi->station_tx_retrans_valid = true;
+		if (tx_fail_valid) {
+			if (!wifi->station_tx_fail_base_valid) {
+				wifi->station_tx_fail_base = tx_fail;
+				wifi->station_tx_fail_base_valid = true;
+			}
+			wifi->station_tx_fail = tx_fail;
+			wifi->station_tx_fail_valid = true;
+		}
+		if (tx_rate_kbps >= 1000 && tx_rate_kbps <= 6500000) {
+			wifi->station_chip_tx_rate_kbps = tx_rate_kbps;
+			wifi->station_chip_tx_rate_valid = true;
+		}
+		if (rx_rate_kbps >= 1000 && rx_rate_kbps <= 6500000) {
+			wifi->station_rx_rate_kbps = rx_rate_kbps;
+			wifi->station_rx_rate_valid = true;
+		}
+	}
+	return ret;
+}
+
+static int query_tx_info(struct centauri_wifi *wifi,
+			 const struct ieee80211_channel *chan)
+{
+	u8 payload[22] = {};
+	struct rate_info rate = {};
+	bool rate_valid = false, power_valid = false;
+	int fw_band, dbm = 0, ret;
+	u64 slice;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_tx_rate_valid = false;
+	wifi->station_tx_power_valid = false;
+	wifi->station_tx_info_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	fw_band = firmware_band(chan->band);
+	if (fw_band < 0)
+		return fw_band;
+	/* Statistics bit 29 (TX power/rate report), TLV 363 scope 1, reply TLV 0xf920. */
+	put_unaligned_le64(BIT_ULL(29), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	payload[21] = 1;
+	slice = fw_band == 0 ? 1 : 2;
+	for (;;) {
+		size_t size = sizeof(wifi->stats_reply);
+
+		put_unaligned_le64(slice, payload + 13);
+		ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+				    wifi->stats_reply, &size);
+		if (!ret && tx_power_rate_read(wifi->stats_reply,
+					       min(size, sizeof(wifi->stats_reply)),
+					       &rate, &rate_valid, &dbm,
+					       &power_valid)) {
+			if (rate_valid) {
+				wifi->station_tx_rate = rate;
+				wifi->station_tx_rate_valid = true;
+			}
+			if (power_valid) {
+				wifi->station_tx_power_dbm = dbm;
+				wifi->station_tx_power_valid = true;
+			}
+			return 0;
+		}
+		if (slice == 1)
+			break;
+		slice = 1;
+	}
+	return ret;
+}
+
+static int query_beacon_stats(struct centauri_wifi *wifi)
+{
+	u8 payload[22] = {};
+	size_t size = sizeof(wifi->stats_reply);
+	u32 rx_beacons, missed_beacons;
+	int ret;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_beacon_valid = false;
+	wifi->station_beacon_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	/* Statistics bit 19 (frame counters), TLV 363 scope 0, reply TLV 0xf915. */
+	put_unaligned_le64(BIT_ULL(19), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+			    wifi->stats_reply, &size);
+	if (!ret && beacon_stats_read(wifi->stats_reply,
+				      min(size, sizeof(wifi->stats_reply)),
+				      &rx_beacons, &missed_beacons)) {
+		if (!wifi->station_beacon_base_valid) {
+			wifi->station_beacon_rx_base = rx_beacons;
+			wifi->station_beacon_loss_base = missed_beacons;
+			wifi->station_beacon_base_valid = true;
+		}
+		wifi->station_beacon_rx = rx_beacons;
+		wifi->station_beacon_loss = missed_beacons;
+		wifi->station_beacon_valid = true;
+	}
+	return ret;
+}
+
+static int query_phy_dump(struct centauri_wifi *wifi,
+			  const struct ieee80211_channel *chan)
+{
+	u8 payload[22] = {};
+	size_t size = sizeof(wifi->stats_reply);
+	s8 chain_rssi[2] = {}, noise = 0;
+	bool noise_valid = false;
+	u8 chains = 0;
+	int fw_band, ret;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_chains = 0;
+	wifi->station_phy_noise_valid = false;
+	wifi->station_phy_dump_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	fw_band = firmware_band(chan->band);
+	if (fw_band < 0)
+		return fw_band;
+	/* Statistics bit 32 (PHY dump), TLV 363 scope 0, reply TLV 0xf923. */
+	put_unaligned_le64(BIT_ULL(32), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+			    wifi->stats_reply, &size);
+	if (!ret && phy_dump_read(wifi->stats_reply,
+				  min(size, sizeof(wifi->stats_reply)),
+				  fw_band, chain_rssi, &chains,
+				  &noise, &noise_valid)) {
+		wifi->station_chain_signal[0] = chain_rssi[0];
+		wifi->station_chain_signal[1] = chain_rssi[1];
+		wifi->station_chains = chains;
+		if (noise_valid) {
+			wifi->station_phy_noise = noise;
+			wifi->station_phy_noise_valid = true;
+		}
+	}
+	return ret;
+}
+
+static void fill_station(struct centauri_wifi *wifi, struct station_info *sinfo)
+{
+	const struct net_device_stats *stats = &wifi->netdev->stats;
+	struct ieee80211_channel *chan;
+	struct cfg80211_bss *bss;
+
+	if (time_after_eq(jiffies, wifi->station_signal_at + HZ))
+		query_link_status(wifi);
+	if (time_after_eq(jiffies, wifi->station_counters_at + HZ))
+		query_sta_counters(wifi);
+	if (time_after_eq(jiffies, wifi->station_beacon_at + HZ))
+		query_beacon_stats(wifi);
+	chan = wifi->station_chandef_valid ? wifi->station_chandef.chan :
+					     wifi->connect_channel;
+	if (chan && time_after_eq(jiffies, wifi->station_tx_info_at + HZ))
+		query_tx_info(wifi, chan);
+	if (chan && time_after_eq(jiffies, wifi->station_phy_dump_at + HZ))
+		query_phy_dump(wifi, chan);
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
+			 BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_RX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
+			 BIT_ULL(NL80211_STA_INFO_RX_DROP_MISC);
+	sinfo->connected_time = (jiffies - wifi->connected_at) / HZ;
+	sinfo->rx_packets = stats->rx_packets - wifi->station_start.rx_packets;
+	sinfo->tx_packets = stats->tx_packets - wifi->station_start.tx_packets;
+	sinfo->rx_bytes = stats->rx_bytes - wifi->station_start.rx_bytes;
+	sinfo->tx_bytes = stats->tx_bytes - wifi->station_start.tx_bytes;
+	sinfo->tx_failed = stats->tx_errors - wifi->station_start.tx_errors;
+	if (wifi->station_tx_fail_valid && wifi->station_tx_fail_base_valid)
+		sinfo->tx_failed +=
+			wifi->station_tx_fail - wifi->station_tx_fail_base;
+	sinfo->rx_dropped_misc = stats->rx_dropped - wifi->station_start.rx_dropped;
+	if (wifi->station_tx_retrans_valid &&
+	    wifi->station_tx_retrans_base_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
+		sinfo->tx_retries =
+			wifi->station_tx_retrans - wifi->station_tx_retrans_base;
+	}
+	if (wifi->station_beacon_valid && wifi->station_beacon_base_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_RX) |
+				 BIT_ULL(NL80211_STA_INFO_BEACON_LOSS);
+		sinfo->rx_beacon =
+			wifi->station_beacon_rx - wifi->station_beacon_rx_base;
+		sinfo->beacon_loss_count =
+			wifi->station_beacon_loss -
+			wifi->station_beacon_loss_base;
+	}
+	if (wifi->station_tx_rate_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+		sinfo->txrate = wifi->station_tx_rate;
+	} else if (wifi->station_chip_tx_rate_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+		sinfo->txrate = (struct rate_info){
+			.legacy = DIV_ROUND_CLOSEST(wifi->station_chip_tx_rate_kbps,
+						    100),
+		};
+	}
+	if (wifi->station_rx_rate_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+		sinfo->rxrate = (struct rate_info){
+			.legacy = DIV_ROUND_CLOSEST(wifi->station_rx_rate_kbps,
+						    100),
+		};
+	}
+	if (wifi->station_signal_valid) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+		sinfo->signal = wifi->station_signal;
+	} else {
+		bss = wifi_joined_bss(wifi);
+		if (bss) {
+			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+			sinfo->signal = bss->signal / 100;
+			cfg80211_put_bss(wifi->wiphy, bss);
+		}
+	}
+	if (wifi->station_chains) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL);
+		sinfo->chains = wifi->station_chains;
+		sinfo->chain_signal[0] = wifi->station_chain_signal[0];
+		sinfo->chain_signal[1] = wifi->station_chain_signal[1];
+	}
+}
+
+static int wifi_get_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev,
+			     int radio_idx, unsigned int link_id, int *dbm)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	struct ieee80211_channel *chan;
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	if (wdev != &wifi->wdev || !wifi->connected ||
+	    READ_ONCE(wifi->stopping) || !wifi->connect_channel) {
+		ret = -ENODATA;
+		goto out;
+	}
+	chan = wifi->station_chandef_valid ? wifi->station_chandef.chan :
+					     wifi->connect_channel;
+	if (time_after_eq(jiffies, wifi->station_tx_info_at + HZ))
+		query_tx_info(wifi, chan);
+	if (!wifi->station_tx_power_valid) {
+		ret = -ENODATA;
+		goto out;
+	}
+	*dbm = wifi->station_tx_power_dbm;
+out:
+	mutex_unlock(&wifi->lock);
+	return ret;
 }
 
 static int wifi_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 			    const u8 *mac, struct station_info *sinfo)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
-	struct net_device_stats *stats = &wifi->netdev->stats;
-	struct cfg80211_bss *bss;
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	if (!wifi->connected || !ether_addr_equal(mac, wifi->bssid)) {
+	if (wdev != &wifi->wdev || !wifi->connected ||
+	    READ_ONCE(wifi->stopping) || !ether_addr_equal(mac, wifi->bssid))
 		ret = -ENOENT;
-		goto out;
-	}
-	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
-			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
-			 BIT_ULL(NL80211_STA_INFO_RX_BYTES64) |
-			 BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
-			 BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
-			 BIT_ULL(NL80211_STA_INFO_RX_DROP_MISC);
-	sinfo->rx_packets = stats->rx_packets;
-	sinfo->tx_packets = stats->tx_packets;
-	sinfo->rx_bytes = stats->rx_bytes;
-	sinfo->tx_bytes = stats->tx_bytes;
-	sinfo->tx_failed = stats->tx_errors;
-	sinfo->rx_dropped_misc = stats->rx_dropped;
+	else
+		fill_station(wifi, sinfo);
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
 
-	bss = wifi_joined_bss(wifi);
-	if (bss) {
-		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
-		sinfo->signal = bss->signal / 100;	/* mBm */
-		cfg80211_put_bss(wiphy, bss);
+static int wifi_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+			     int index, u8 *mac, struct station_info *sinfo)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	if (index || wdev != &wifi->wdev || !wifi->connected ||
+	    READ_ONCE(wifi->stopping)) {
+		ret = -ENOENT;
+	} else {
+		ether_addr_copy(mac, wifi->bssid);
+		fill_station(wifi, sinfo);
 	}
-out:
 	mutex_unlock(&wifi->lock);
 	return ret;
 }
@@ -1594,28 +3614,32 @@ static int wifi_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
 			    unsigned int link_id, struct cfg80211_chan_def *chandef)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
-	struct cfg80211_bss *bss;
-	int ret = -ENODATA;
+	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	bss = wifi_joined_bss(wifi);
-	if (bss) {
-		/* The join asks the firmware for a 20 MHz channel. */
-		cfg80211_chandef_create(chandef, bss->channel, NL80211_CHAN_NO_HT);
-		cfg80211_put_bss(wiphy, bss);
-		ret = 0;
+	if (wdev != &wifi->wdev || !wifi->connected ||
+	    READ_ONCE(wifi->stopping) || !wifi->connect_channel) {
+		ret = -ENODATA;
+		goto out;
 	}
+	if (time_after_eq(jiffies, wifi->station_signal_at + HZ))
+		query_link_status(wifi);
+	if (wifi->station_chandef_valid)
+		*chandef = wifi->station_chandef;
+	else
+		cfg80211_chandef_create(chandef, wifi->connect_channel,
+					NL80211_CHAN_HT20);
+out:
 	mutex_unlock(&wifi->lock);
 	return ret;
 }
 
 /*
  * The factory address, which the loader copies from ADT /chosen
- * mac-address-wifi0 into the wifi0 alias target's local-mac-address (as on
- * T6050). A board without that node, or a loader that left the placeholder,
- * keeps the old per-boot random address.
+ * mac-address-wifi0 into the wifi0 alias target's local-mac-address.
+ * A board without that node keeps a random address.
  */
-static void centauri_wifi_set_address(struct net_device *netdev)
+static void centauri_wifi_set_address(struct centauri_wifi *wifi)
 {
 	struct device_node *np = of_find_node_by_path("wifi0");
 	u8 addr[ETH_ALEN];
@@ -1623,25 +3647,160 @@ static void centauri_wifi_set_address(struct net_device *netdev)
 
 	of_node_put(np);
 	if (!ret && is_valid_ether_addr(addr)) {
-		eth_hw_addr_set(netdev, addr);
+		eth_hw_addr_set(wifi->netdev, addr);
+		ether_addr_copy(wifi->wiphy->perm_addr, addr);
 		return;
 	}
-	eth_hw_addr_random(netdev);
+	eth_hw_addr_random(wifi->netdev);
+}
+
+static int query_sta_noise(struct centauri_wifi *wifi)
+{
+	u8 payload[22] = {};
+	size_t size = sizeof(wifi->stats_reply);
+	s8 noise;
+	int ret;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_noise_valid = false;
+	wifi->station_noise_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	/* Statistics bit 7 (station info), TLV 363 scope 2, reply TLV 0xf908. */
+	put_unaligned_le64(BIT_ULL(7), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	payload[21] = 2;
+	ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+			    wifi->stats_reply, &size);
+	if (!ret && sta_info_noise_read(wifi->stats_reply,
+					min(size, sizeof(wifi->stats_reply)),
+					&noise)) {
+		wifi->station_noise = noise;
+		wifi->station_noise_valid = true;
+	}
+	return ret;
+}
+
+static int query_cca_survey(struct centauri_wifi *wifi,
+			    const struct ieee80211_channel *chan)
+{
+	u8 payload[22] = {};
+	u64 active_ms, busy_ms, tx_ms, slice;
+	int fw_band, ret;
+
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
+	wifi->station_cca_valid = false;
+	wifi->station_cca_at = jiffies;
+	if (!wifi->configured)
+		return -ENETDOWN;
+	fw_band = firmware_band(chan->band);
+	if (fw_band < 0)
+		return fw_band;
+	/* Statistics bit 3 (CCA report), TLV 363 slice/scope 1, reply TLV 0xf903. */
+	put_unaligned_le64(BIT_ULL(3), payload);
+	payload[8] = 1;
+	put_unaligned_le16(363, payload + 9);
+	put_unaligned_le16(9, payload + 11);
+	payload[21] = 1;
+	slice = fw_band == 0 ? 1 : 2;
+	for (;;) {
+		size_t size = sizeof(wifi->stats_reply);
+
+		put_unaligned_le64(slice, payload + 13);
+		ret = command_reply(wifi, 0xb0001, payload, sizeof(payload),
+				    wifi->stats_reply, &size);
+		if (!ret && cca_survey_read(wifi->stats_reply,
+					    min(size, sizeof(wifi->stats_reply)),
+					    chan->hw_value, fw_band,
+					    wifi->station_bw_primary,
+					    wifi->station_chandef_valid,
+					    &active_ms, &busy_ms, &tx_ms)) {
+			wifi->station_cca_active_ms = active_ms;
+			wifi->station_cca_busy_ms = busy_ms;
+			wifi->station_cca_tx_ms = tx_ms;
+			wifi->station_cca_valid = true;
+			return 0;
+		}
+		if (slice == 1)
+			break;
+		slice = 1;
+	}
+	return ret;
+}
+
+static int wifi_dump_survey(struct wiphy *wiphy, struct net_device *netdev,
+			    int idx, struct survey_info *survey)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	struct ieee80211_channel *chan;
+	int ret = 0;
+
+	if (idx)
+		return -ENOENT;
+	mutex_lock(&wifi->lock);
+	if (!wifi->connected || READ_ONCE(wifi->stopping) ||
+	    !wifi->connect_channel) {
+		ret = -ENOENT;
+		goto out;
+	}
+	if (!wifi->station_chandef_valid &&
+	    time_after_eq(jiffies, wifi->station_signal_at + HZ))
+		query_link_status(wifi);
+	if (time_after_eq(jiffies, wifi->station_noise_at + HZ))
+		query_sta_noise(wifi);
+	chan = wifi->station_chandef_valid ? wifi->station_chandef.chan :
+					     wifi->connect_channel;
+	if (time_after_eq(jiffies, wifi->station_cca_at + HZ))
+		query_cca_survey(wifi, chan);
+	if (!wifi->station_noise_valid &&
+	    time_after_eq(jiffies, wifi->station_phy_dump_at + HZ))
+		query_phy_dump(wifi, chan);
+	survey->channel = chan;
+	survey->filled = SURVEY_INFO_IN_USE;
+	if (wifi->station_noise_valid) {
+		survey->filled |= SURVEY_INFO_NOISE_DBM;
+		survey->noise = wifi->station_noise;
+	} else if (wifi->station_phy_noise_valid) {
+		survey->filled |= SURVEY_INFO_NOISE_DBM;
+		survey->noise = wifi->station_phy_noise;
+	}
+	if (wifi->station_cca_valid) {
+		survey->filled |= SURVEY_INFO_TIME | SURVEY_INFO_TIME_BUSY |
+				  SURVEY_INFO_TIME_TX;
+		survey->time = wifi->station_cca_active_ms;
+		survey->time_busy = wifi->station_cca_busy_ms;
+		survey->time_tx = wifi->station_cca_tx_ms;
+	}
+out:
+	mutex_unlock(&wifi->lock);
+	return ret;
 }
 
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
+	.abort_scan = wifi_abort_scan,
 	.connect = wifi_connect,
 	.disconnect = wifi_disconnect,
 	.set_power_mgmt = wifi_power_mgmt,
+	.get_tx_power = wifi_get_tx_power,
 	.get_station = wifi_get_station,
+	.dump_station = wifi_dump_station,
 	.get_channel = wifi_get_channel,
+	.dump_survey = wifi_dump_survey,
 };
 
 static int net_open(struct net_device *netdev)
 {
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
+
 	netif_carrier_off(netdev);
 	netif_stop_queue(netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
+	napi_enable(&wifi->rx_napi);
 	return 0;
 }
 
@@ -1649,16 +3808,11 @@ static int net_stop(struct net_device *netdev)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
 
+	cancel_scan(wifi);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
-	/*
-	 * Finish a running scan before cfg80211's NETDEV_DOWN. Otherwise
-	 * cfg80211 completes it as driver-owned and stale, keeps its scan
-	 * message, and refuses every later scan with -EBUSY.
-	 */
-	WRITE_ONCE(wifi->scan_abort, true);
-	flush_work(&wifi->scan_work);
-	WRITE_ONCE(wifi->scan_abort, false);
+	napi_disable(&wifi->rx_napi);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	return 0;
 }
 
@@ -1680,6 +3834,7 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 		netif_stop_queue(netdev);
 		return NETDEV_TX_BUSY;
 	}
+	sk_pacing_shift_update(skb->sk, DATA_TX_PACING_SHIFT);
 	skb_queue_tail(&wifi->data_tx_queue, skb);
 	if (skb_queue_len(&wifi->data_tx_queue) >= DATA_TX_QUEUE_LIMIT)
 		netif_stop_queue(netdev);
@@ -1687,19 +3842,75 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 	return NETDEV_TX_OK;
 }
 
+static int station_reconfigure(struct centauri_wifi *wifi, const u8 *address)
+{
+	const u8 stop[5] = {};
+	int ret;
+
+	wifi->configured = false;
+	ret = command(wifi, 3, stop, sizeof(stop));
+	if (!ret)
+		ret = station_configure(wifi, address);
+	if (!ret)
+		wifi->configured = true;
+	return ret;
+}
+
+static int net_set_mac_address(struct net_device *netdev, void *data)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
+	struct sockaddr *address = data;
+	int ret, restore;
+
+	ret = eth_prepare_mac_addr_change(netdev, data);
+	if (ret)
+		return ret;
+	mutex_lock(&wifi->lock);
+	if (READ_ONCE(wifi->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!wifi->configured) {
+		ret = -ENETDOWN;
+		goto out;
+	}
+	if (wifi->connecting || wifi->connected || wifi->scan_request) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (ether_addr_equal(netdev->dev_addr, address->sa_data))
+		goto out;
+
+	ret = station_reconfigure(wifi, (const u8 *)address->sa_data);
+	if (!ret) {
+		eth_commit_mac_addr_change(netdev, data);
+	} else {
+		restore = station_reconfigure(wifi, netdev->dev_addr);
+		if (restore)
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi MAC restore failed: %d (change: %d)\n",
+				restore, ret);
+	}
+out:
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+static const struct ethtool_ops centauri_ethtool_ops = {
+	.get_drvinfo = cfg80211_get_drvinfo,
+};
+
 static const struct net_device_ops net_ops = {
 	.ndo_open = net_open,
 	.ndo_stop = net_stop,
 	.ndo_start_xmit = net_transmit,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_set_mac_address = net_set_mac_address,
 };
 
-/* Airship direct_memregion::map (0x1802864e0) sends opcode 8, a region ID,
- * byte size and a 64-bit DVA in a 24-byte header. Alpha's region-debug is ID 1.
- * Firmware 0x175340 passes those fields to DramPhyService_handle_buffer;
- * InitDramLoggerMgr writes a 0x158-byte control header to the supplied buffer.
- * This is distinct from the fw_debug transfer ring. Never print log payloads:
- * firmware diagnostics may contain private connection material.
+/* Direct memory region map (opcode 8, region ID 1) attaches a coherent
+ * diagnostic DRAM log ring buffer. Firmware writes a control header at the
+ * start of the buffer; log contents stay root-only via debugfs.
  */
 static ssize_t fwlog_start_write(struct file *file, const char __user *input,
 				size_t count, loff_t *position)
@@ -1797,11 +4008,8 @@ static const struct file_operations fwlog_status_ops = {
 	.llseek = default_llseek,
 };
 
-/* The exact firmware's 0x144cfc compares header +0xb0 (producer) against
- * +0x10 (host consumer). InitDramLoggerMgr registers a GDMA read of +0x10.
- * Only acknowledge records after a private snapshot has been verified.
- * Leave three entries reserved for the firmware's three DMA descriptors
- * until completion/record sequencing is independently decoded.
+/* Advance the host consumer index (+0x10) against the firmware producer
+ * (+0xb0), keeping three descriptors reserved for in-flight DMA writes.
  */
 static ssize_t fwlog_ack_write(struct file *file, const char __user *input,
 			       size_t count, loff_t *position)
@@ -1877,12 +4085,9 @@ static const struct file_operations fwlog_buffer_ops = {
 	.llseek = default_llseek,
 };
 
-/* The hardware data-ring callback requires the ten-byte WLAN clientdata
- * extension after the 44-byte ACIPC header. Without it UMAC asserts at
- * 0x11760e. Keep these empty-ring probes explicit until packet DMA is proven.
- * The reserved regions below do not overlap control rings or scan buffers.
+/* Data-ring open messages append a 10-byte client extension after the
+ * ACIPC ring header. Called with wifi->lock held.
  */
-/* Called with wifi->lock held. From the connect path (internal) the "connecting" flag is expected to be set. */
 static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool internal)
 {
 	u8 message[0x34 + 10] = { 0 };
@@ -1911,6 +4116,22 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		bit = 2;
 		doorbell = 11;
 		irq = 8;
+	} else if (id == 18) {
+		/* Interface 1 (AWDL) receive completions, same buffer ring. */
+		vector = 210;
+		offset = 0x260000;
+		size = 128;
+		bit = 6;
+		doorbell = 11;
+		irq = 8;
+	} else if (id == 78 || id == 79) {
+		/* Interface 1 TX completions (78) and type 7 events (79). */
+		vector = id == 78 ? 194 : 195;
+		offset = id == 78 ? 0x280000 : 0x2a0000;
+		size = 1024;
+		bit = id == 78 ? 7 : 8;
+		doorbell = 18;
+		irq = id == 78 ? 4 : 7;
 	} else if (id == 24 || id == 25 || id == 12) {
 		transfer = true;
 		vector = id;
@@ -1943,16 +4164,23 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 	if (transfer) {
 		put_unaligned_le64(~0ULL, message + 0x10);
 		put_unaligned_le16(size, message + 0x18);
-		put_unaligned_le16(id == 12 ? 12 : 76, message + 0x1a);
+		put_unaligned_le16(id == 12 ? id : 76, message + 0x1a);
 		put_unaligned_le16(doorbell, message + 0x1c);
 		put_unaligned_le16(id == 12 ? 0x220 : 0, message + 0x1e);
 		put_unaligned_le32(16, message + 0x20);
 		put_unaligned_le16(irq, message + 0x24);
 	} else {
 		put_unaligned_le16(size, message + 0x10);
-		put_unaligned_le16(id == 15 ? 12 : 0xffff, message + 0x12);
+		put_unaligned_le16(id == 15 || id == 18 ? 12 : 0xffff,
+				   message + 0x12);
 		put_unaligned_le16(doorbell, message + 0x14);
-		put_unaligned_le32(1, message + 0x18);
+		/* The interface 1 rings follow the traced open byte for byte:
+		 * nothing at 0x18, extension version 0 then interface 1.
+		 */
+		if (id == 18 || id == 78 || id == 79)
+			message[0x2c + 1] = CEN_IF_AWDL;
+		else
+			put_unaligned_le32(1, message + 0x18);
 		put_unaligned_le16(irq, message + 0x1c);
 	}
 	/* The host MCBC transfer ring takes version 0, hardware
@@ -1974,6 +4202,7 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 	if (!ret && readl(wifi->a.bar + 8) != 2)
 		ret = -EIO;
 	if (!ret && transfer && id == 12) {
+		u32 base = DATA_RX_BUFFER;
 		unsigned int slot;
 
 		/* Give the receive engine bounded, individually identifiable buffers.
@@ -1981,7 +4210,7 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		 */
 		for (slot = 0; slot < size - 1; slot++) {
 			u8 *descriptor = wifi->a.window + offset + slot * 16;
-			u32 buffer = DATA_RX_BUFFER + slot * 4096;
+			u32 buffer = base + slot * 4096;
 
 			memset(wifi->a.window + buffer, 0, 4096);
 			put_unaligned_le32(1 | (4096 << 8), descriptor);
@@ -1994,8 +4223,9 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		writel(1, wifi->a.bar + 0x1050);
 		msleep(100);
 		dev_info(&wifi->control->pdev->dev,
-			 "data RX buffers posted=%u stage=%u tr_tail=%u cr_head=%u\n",
-			 size - 1, readl(wifi->a.bar + 8), index_read(wifi, 1, 12),
+			 "data RX buffers ring=%u posted=%u stage=%u tr_tail=%u cr_head=%u\n",
+			 id, size - 1, readl(wifi->a.bar + 8),
+			 index_read(wifi, 1, vector),
 			 index_read(wifi, 0, 207));
 	}
 	return ret;
@@ -2114,12 +4344,15 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 			       size_t count, loff_t *position)
 {
 	struct centauri_wifi *wifi = file->private_data;
-	char status[1536];
+	const size_t size = 3072;
 	unsigned int i, length;
+	char *status __free(kfree) = kmalloc(size, GFP_KERNEL);
 
+	if (!status)
+		return -ENOMEM;
 	mutex_lock(&wifi->lock);
 	dma_rmb();
-	length = scnprintf(status, sizeof(status),
+	length = scnprintf(status, size,
 			   "stage=%u tx_cr=%u tx_tr=%u/%u rx_cr=%u rx_tr=%u/%u received=%u reposted=%u bad=%u samples=%u normal_tx_tr=%u/%u submitted=%u completed=%u failed=%u queued=%u coalesced=%u tx_bad=%u\n",
 			   readl(wifi->a.bar + 8), index_read(wifi, 0, 192),
 			   index_read(wifi, 1, 24), index_read(wifi, 3, 24),
@@ -2131,10 +4364,19 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 			   wifi->data_tx_submitted, wifi->data_tx_completed,
 			   wifi->data_tx_failed, skb_queue_len(&wifi->data_tx_queue),
 			   wifi->data_tx_coalesced, wifi->data_tx_bad);
+	length += scnprintf(status + length, size - length,
+			    "awdl_rings=%#x cr18=%u/%u taken=%u cr78=%u/%u taken=%u cr79=%u/%u taken=%u\n",
+			    wifi->data_probe_done,
+			    index_read(wifi, 0, 210), index_read(wifi, 2, 210),
+			    wifi->data_rx_awdl_ring,
+			    index_read(wifi, 0, 194), index_read(wifi, 2, 194),
+			    wifi->data_awdl_txc,
+			    index_read(wifi, 0, 195), index_read(wifi, 2, 195),
+			    wifi->data_awdl_cr79);
 	for (i = 0; i < 8; i++) {
 		u8 *entry = wifi->a.window + 0x240000 + i * 32;
 
-		length += scnprintf(status + length, sizeof(status) - length,
+		length += scnprintf(status + length, size - length,
 			"rx_completion[%u]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			i, get_unaligned_le32(entry), get_unaligned_le32(entry + 4),
 			get_unaligned_le32(entry + 8), get_unaligned_le32(entry + 12),
@@ -2144,7 +4386,7 @@ static ssize_t data_status_read(struct file *file, char __user *output,
 	for (i = 0; i < 8; i++) {
 		u8 *entry = wifi->a.window + 0x200000 + i * 32;
 
-		length += scnprintf(status + length, sizeof(status) - length,
+		length += scnprintf(status + length, size - length,
 			"tx_completion[%u]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			i, get_unaligned_le32(entry), get_unaligned_le32(entry + 4),
 			get_unaligned_le32(entry + 8), get_unaligned_le32(entry + 12),
@@ -2209,9 +4451,14 @@ static const struct file_operations country_ops = {
 
 static int query_link_status(struct centauri_wifi *wifi)
 {
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
 	wifi->link_status_valid = wifi->emlsr_valid = false;
 	wifi->link_count = wifi->link_status_size = 0;
 	wifi->link_tlv_count = 0;
+	wifi->station_signal_valid = false;
+	wifi->station_chandef_valid = false;
+	wifi->station_signal_at = jiffies;
 	return wifi->configured ? command(wifi, 20, NULL, 0) : -ENETDOWN;
 }
 
@@ -2592,10 +4839,49 @@ static const struct file_operations tx_power_report_ops = {
 	.release = single_release,
 };
 
+static int data_stats_show(struct seq_file *m, void *unused)
+{
+	struct centauri_wifi *wifi = m->private;
+
+	mutex_lock(&wifi->lock);
+	seq_printf(m,
+		   "rx received %u reposted %u bad %u\n"
+		   "tx submitted %u completed %u in_flight %u failed %u bad %u coalesced %u\n"
+		   "tx queued %u capped %u cap_bypassed %u\n",
+		   wifi->data_rx_received, wifi->data_rx_reposted,
+		   wifi->data_rx_bad, wifi->data_tx_submitted,
+		   wifi->data_tx_completed,
+		   wifi->data_tx_submitted - wifi->data_tx_completed,
+		   wifi->data_tx_failed, wifi->data_tx_bad,
+		   wifi->data_tx_coalesced, skb_queue_len(&wifi->data_tx_queue),
+		   wifi->data_tx_capped, wifi->data_tx_cap_bypassed);
+	mutex_unlock(&wifi->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(data_stats);
+
+static void wifi_hint_country(struct centauri_wifi *wifi)
+{
+	char alpha2[3] = {};
+	bool have_country = false;
+
+	mutex_lock(&wifi->lock);
+	wifi->country_valid = false;
+	if (wifi->configured && !command(wifi, 10, NULL, 0) &&
+	    wifi->country_valid &&
+	    country_code_valid(wifi->country, sizeof(wifi->country))) {
+		alpha2[0] = wifi->country[0];
+		alpha2[1] = wifi->country[1];
+		have_country = true;
+	}
+	mutex_unlock(&wifi->lock);
+	if (have_country)
+		regulatory_hint(wifi->wiphy, alpha2);
+}
+
 int centauri_wifi_register(struct centauri *c)
 {
 	struct centauri_wifi *wifi;
-	unsigned int i;
 	int ret;
 
 	wifi = kzalloc(sizeof(*wifi), GFP_KERNEL);
@@ -2606,6 +4892,7 @@ int centauri_wifi_register(struct centauri *c)
 	mutex_init(&wifi->lock);
 	mutex_init(&wifi->fwlog_lock);
 	skb_queue_head_init(&wifi->data_tx_queue);
+	skb_queue_head_init(&wifi->rx_gro_queue);
 	INIT_WORK(&wifi->scan_work, scan_worker);
 	INIT_WORK(&wifi->connect_work, connect_worker);
 	INIT_DELAYED_WORK(&wifi->link_work, link_worker);
@@ -2620,66 +4907,56 @@ int centauri_wifi_register(struct centauri *c)
 	}
 	*(struct centauri_wifi **)wiphy_priv(wifi->wiphy) = wifi;
 	*(struct centauri_wifi **)netdev_priv(wifi->netdev) = wifi;
+	netif_napi_add(wifi->netdev, &wifi->rx_napi, rx_poll);
 	set_wiphy_dev(wifi->wiphy, &c->pdev->dev);
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
-	wifi->wiphy->max_scan_ssids = 1;
-	/*
-	 * cfg80211 refuses a scan whose IEs exceed this. wpa_supplicant 2.11
-	 * adds 15 bytes to every scan (Extended Capabilities and an empty
-	 * Mesh ID); 512, wl1251's limit for the same reason, leaves room for
-	 * optional ones such as WPS or Interworking. build_scan() follows the
-	 * macOS request, which carries no IEs, so they are dropped.
-	 */
+	wifi->wiphy->max_scan_ssids = CEN_SCAN_SSIDS_MAX;
 	wifi->wiphy->max_scan_ie_len = 512;
+	wifi->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
+	wifi->wiphy->support_mbssid = true;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;
 	wifi->wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
+	wifi->wiphy->akm_suites = akm_suites;
+	wifi->wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
+	wifi->wiphy->max_num_akm_suites = CFG80211_MAX_NUM_AKM_SUITES;
 	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
-	for (i = 0; i < 13; i++) {
-		wifi->channels[i].band = NL80211_BAND_2GHZ;
-		wifi->channels[i].hw_value = i + 1;
-		wifi->channels[i].center_freq = ieee80211_channel_to_frequency(i + 1, NL80211_BAND_2GHZ);
-		wifi->channels[i].max_power = 20;
-	}
-	for (i = 0; i < ARRAY_SIZE(five_ghz); i++) {
-		wifi->channels[13 + i].band = NL80211_BAND_5GHZ;
-		wifi->channels[13 + i].hw_value = five_ghz[i];
-		wifi->channels[13 + i].center_freq = ieee80211_channel_to_frequency(five_ghz[i], NL80211_BAND_5GHZ);
-		wifi->channels[13 + i].max_power = 20;
-	}
-	wifi->bands[0].channels = wifi->channels;
-	wifi->bands[0].n_channels = 13;
-	wifi->bands[0].bitrates = rates;
-	wifi->bands[0].n_bitrates = ARRAY_SIZE(rates);
-	wifi->bands[1].channels = wifi->channels + 13;
-	wifi->bands[1].n_channels = ARRAY_SIZE(five_ghz);
-	wifi->bands[1].bitrates = rates + 4;
-	wifi->bands[1].n_bitrates = ARRAY_SIZE(rates) - 4;
-	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &wifi->bands[0];
-	wifi->wiphy->bands[NL80211_BAND_5GHZ] = &wifi->bands[1];
-	ret = wiphy_register(wifi->wiphy);
-	if (ret)
-		goto failed;
-	wifi->registered = true;
-	wifi->wdev.wiphy = wifi->wiphy;
-	wifi->wdev.iftype = NL80211_IFTYPE_STATION;
-	wifi->wdev.netdev = wifi->netdev;
-	wifi->netdev->ieee80211_ptr = &wifi->wdev;
-	wifi->netdev->netdev_ops = &net_ops;
-	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
-	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
-	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	centauri_wifi_set_address(wifi->netdev);
-	ret = register_netdev(wifi->netdev);
-	if (ret)
-		goto failed;
+	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
+	centauri_wifi_set_address(wifi);
 	ret = radio_start(wifi);
 	if (ret) {
 		dev_err(&c->pdev->dev, "Wi-Fi ring/interface setup failed: %d\n", ret);
 		goto failed;
 	}
-	dev_info(&c->pdev->dev, "cfg80211 interface %s ready for scan tests; packet data unavailable\n",
+	bands_init(wifi);
+	ret = wiphy_register(wifi->wiphy);
+	if (ret)
+		goto failed;
+	wifi->registered = true;
+	debugfs_create_blob("hw_channels", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->hw_channels_blob);
+	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->system_caps_blob);
+	debugfs_create_file("data_stats", 0400, wifi->wiphy->debugfsdir, wifi,
+			    &data_stats_fops);
+	rtnl_lock();
+	channels_apply(wifi);
+	rtnl_unlock();
+	wifi_hint_country(wifi);
+	wifi->wdev.wiphy = wifi->wiphy;
+	wifi->wdev.iftype = NL80211_IFTYPE_STATION;
+	wifi->wdev.netdev = wifi->netdev;
+	wifi->netdev->ieee80211_ptr = &wifi->wdev;
+	wifi->netdev->netdev_ops = &net_ops;
+	wifi->netdev->ethtool_ops = &centauri_ethtool_ops;
+	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
+	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
+	wifi->netdev->max_mtu = ETH_DATA_LEN;
+	ret = register_netdev(wifi->netdev);
+	if (ret)
+		goto failed;
+	dev_info(&c->pdev->dev, "cfg80211 interface %s registered\n",
 		 wifi->netdev->name);
 	wifi->data_probe_file = debugfs_create_file("data_probe", 0200, c->debug, wifi, &data_probe_ops);
 	wifi->data_status_file = debugfs_create_file("data_status", 0400, c->debug, wifi, &data_status_ops);
@@ -2701,6 +4978,10 @@ int centauri_wifi_register(struct centauri *c)
 	wifi->fwlog_status_file = debugfs_create_file("fwlog_status", 0400, c->debug, wifi, &fwlog_status_ops);
 	wifi->fwlog_buffer_file = debugfs_create_file("fwlog_buffer", 0400, c->debug, wifi, &fwlog_buffer_ops);
 	wifi->fwlog_ack_file = debugfs_create_file("fwlog_ack", 0200, c->debug, wifi, &fwlog_ack_ops);
+	ret = centauri_awdl_register(wifi, &wifi->awdl);
+	if (ret)
+		dev_warn(&c->pdev->dev,
+			 "AWDL interface registration failed: %d\n", ret);
 	return 0;
 failed:
 	centauri_wifi_unregister(c);
@@ -2708,12 +4989,9 @@ failed:
 }
 
 /*
- * 26B123 t2026-CentauriAlpha uses BAR0 + 0x1024 for sleep_control.
- * AirshipDK's ACIPC host-sleep handshake writes 3 and waits for status 3;
- * wake writes 0 and waits for status 0 or 1. The peripheral-info block
- * starts at context + 0x68, with sleep_status at +8, as on Beta.
- * Stop every ring producer before requesting host sleep. Keep them stopped
- * until the wake acknowledgment, including when suspend entry is refused.
+ * Alpha ACIPC host-sleep handshake uses BAR0 + 0x1024 for sleep_control
+ * (3 = sleep, 0 = wake) and polls peripheral_info.sleep_status at context + 0x70
+ * (3 = asleep, <= 1 = awake). Keep ring producers paused across the transition.
  */
 static u32 alpha_sleep_status(struct centauri_wifi *wifi)
 {
@@ -2737,29 +5015,26 @@ static int alpha_transport_state(struct centauri_wifi *wifi, bool asleep)
 	dma_rmb();
 	if (readl(wifi->a.bar + 8) != 2)
 		ret = -EIO;
-	dev_info(&wifi->control->pdev->dev,
-		 "TEST: Alpha ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
-		 asleep ? "sleep" : "wake", ret, status,
-		 readl(wifi->a.bar + 8), readl(wifi->a.bar + 0xc));
+	dev_dbg(&wifi->control->pdev->dev,
+		"Alpha ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(wifi->a.bar + 8), readl(wifi->a.bar + 0xc));
 	return ret;
 }
 
-/*
- * WLANACIAdapter sends command 6 before ACIPC host sleep. For an interface
- * already disconnected by cfg80211, its LPNA mode is firmware state 3.
- * The first fields are le16 state and u8 hint. Native sleep also includes
- * TLV 303 (value 1) and TLV 280 (the filtered event list); wake restores all
- * events. Installed Alpha 48ef6696 rejects TLV 280 lengths >= 87 and
- * event counts >= 86, so use its 85 events rather than 26B123's 91.
- * The data-ring producers stay paused while this control command
- * and its response use the command/management rings.
- */
-static int alpha_host_power(struct centauri_wifi *wifi, bool asleep)
+#define CEN_HOST_EVENTS_LEGACY	85
+#define CEN_HOST_EVENTS_FULL	91
+
+static int alpha_host_power_send(struct centauri_wifi *wifi, bool asleep,
+				 u8 event_count)
 {
 	static const u8 sleep_events[] = { 24, 26, 27, 15, 51, 8, 9, 10, 84 };
-	u8 payload[98] = {}, events[86] = {}, sleep_option = 1;
+	u8 payload[3 + 5 + 4 + 1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 events[1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 sleep_option = 1;
 	size_t size = 3;
-	int i, ret;
+	unsigned int i;
+	int ret;
 
 	lockdep_assert_held(&wifi->lock);
 	if (readl(wifi->a.bar + 8) != 2)
@@ -2771,16 +5046,39 @@ static int alpha_host_power(struct centauri_wifi *wifi, bool asleep)
 		events[0] = ARRAY_SIZE(sleep_events);
 		memcpy(events + 1, sleep_events, sizeof(sleep_events));
 	} else {
-		events[0] = sizeof(events) - 1;
-		for (i = 0; i < events[0]; i++)
+		events[0] = event_count;
+		for (i = 0; i < event_count; i++)
 			events[i + 1] = i;
 	}
-	append_tlv(payload, &size, 280, events, sizeof(events));
+	append_tlv(payload, &size, 280, events, 1 + event_count);
 	ret = command_control(wifi, 6, payload, size, true);
-	dev_info(&wifi->control->pdev->dev,
-		 "TEST: Alpha firmware host %s: ret=%d status=%u exec=%u\n",
-		 asleep ? "LPNA" : "awake", ret, wifi->reply_status,
-		 readl(wifi->a.bar + 8));
+	dev_dbg(&wifi->control->pdev->dev,
+		"Alpha firmware host %s (events=%u tlv280=%u): ret=%d status=%u exec=%u\n",
+		asleep ? "sleep" : "awake", events[0], 1 + event_count, ret,
+		wifi->reply_status, readl(wifi->a.bar + 8));
+	return ret;
+}
+
+static int alpha_host_power(struct centauri_wifi *wifi, bool asleep)
+{
+	u16 full_status;
+	int ret;
+
+	if (asleep)
+		return alpha_host_power_send(wifi, true, CEN_HOST_EVENTS_LEGACY);
+
+	ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_FULL);
+	if (ret == -EREMOTEIO && readl(wifi->a.bar + 8) == 2) {
+		full_status = wifi->reply_status;
+		ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_LEGACY);
+		if (!ret && !wifi->host_events_fallback_logged) {
+			wifi->host_events_fallback_logged = true;
+			dev_info(&wifi->control->pdev->dev,
+				 "Alpha host wake fell back from %u to %u events (status=%u)\n",
+				 CEN_HOST_EVENTS_FULL, CEN_HOST_EVENTS_LEGACY,
+				 full_status);
+		}
+	}
 	return ret;
 }
 
@@ -2806,6 +5104,26 @@ static int alpha_resume_locked(struct centauri_wifi *wifi)
 	mutex_lock(&wifi->fwlog_lock);
 	WRITE_ONCE(wifi->transport_paused, false);
 	mutex_unlock(&wifi->fwlog_lock);
+	wifi->station_signal_valid = false;
+	wifi->station_noise_valid = false;
+	wifi->station_tx_retrans_valid = false;
+	wifi->station_tx_fail_valid = false;
+	wifi->station_beacon_valid = false;
+	wifi->station_cca_valid = false;
+	wifi->station_tx_rate_valid = false;
+	wifi->station_tx_power_valid = false;
+	wifi->station_rx_rate_valid = false;
+	wifi->station_chip_tx_rate_valid = false;
+	wifi->station_chains = 0;
+	wifi->station_phy_noise_valid = false;
+	wifi->station_chandef_valid = false;
+	wifi->station_signal_at = jiffies - HZ;
+	wifi->station_noise_at = jiffies - HZ;
+	wifi->station_counters_at = jiffies - HZ;
+	wifi->station_cca_at = jiffies - HZ;
+	wifi->station_tx_info_at = jiffies - HZ;
+	wifi->station_beacon_at = jiffies - HZ;
+	wifi->station_phy_dump_at = jiffies - HZ;
 	if (wifi->connected && !READ_ONCE(wifi->stopping)) {
 		if (netif_running(wifi->netdev))
 			netif_wake_queue(wifi->netdev);
@@ -2827,6 +5145,155 @@ int centauri_wifi_resume(struct centauri *c)
 	return ret;
 }
 
+struct mutex *centauri_wifi_lock_ptr(struct centauri_wifi *wifi)
+{
+	return &wifi->lock;
+}
+
+struct device *centauri_wifi_dev(struct centauri_wifi *wifi)
+{
+	return &wifi->control->pdev->dev;
+}
+
+struct dentry *centauri_wifi_debugfs(struct centauri_wifi *wifi)
+{
+	return wifi->control->debug;
+}
+
+struct cen_alpha_resources *centauri_wifi_alpha(struct centauri_wifi *wifi)
+{
+	return &wifi->a;
+}
+
+bool centauri_wifi_is_stopping(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping);
+}
+
+bool centauri_wifi_is_paused(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->transport_paused);
+}
+
+void centauri_wifi_schedule_poll(struct centauri_wifi *wifi)
+{
+	if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused))
+		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
+}
+
+int centauri_wifi_cmd_iface(struct centauri_wifi *wifi, u8 if_id, u32 id,
+			    const void *payload, size_t size,
+			    void *reply, size_t *reply_size)
+{
+	return command_reply_iface(wifi, if_id, id, payload, size,
+				   reply, reply_size, false);
+}
+
+int centauri_wifi_ensure_shared_data_rings(struct centauri_wifi *wifi)
+{
+	/*
+	 * The shared rings, then interface 1's (AWDL) in the traced order:
+	 * 18 for its receive completions (buffers from ring 12), 78 for its
+	 * transmit completions and 79 (type 7). Without 18 the firmware
+	 * faults as soon as a peer sends AWDL data.
+	 */
+	static const unsigned int ring_ids[] = { 76, 15, 18, 12, 78, 79 };
+	unsigned int i;
+
+	lockdep_assert_held(&wifi->lock);
+	for (i = 0; i < ARRAY_SIZE(ring_ids); i++) {
+		int ret = data_probe_locked(wifi, ring_ids[i], true);
+
+		if (ret && ret != -EBUSY)
+			return ret;
+	}
+	return 0;
+}
+
+int centauri_wifi_open_awdl_tx_ring(struct centauri_wifi *wifi, u16 tr_id,
+				    u32 ring_offset, u16 slots,
+				    const struct cen_awdl_tx_clientdata *cd)
+{
+	u8 message[0x34 + sizeof(*cd)] = { 0 };
+	bool on_78 = !!(wifi->data_probe_done & BIT(7));
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (readl(wifi->a.bar + 8) != 2)
+		return -EIO;
+	memset(wifi->a.window + ring_offset, 0, slots * 32U);
+	index_write(wifi, 1, tr_id, 0);
+	index_write(wifi, 3, tr_id, 0);
+	message[0] = 1;
+	message[2] = 4;
+	put_unaligned_le16(tr_id, message + 4);
+	put_unaligned_le16(tr_id, message + 6);
+	put_unaligned_le64(wifi->a.window_dma + ring_offset, message + 8);
+	put_unaligned_le64(~0ULL, message + 0x10);
+	put_unaligned_le16(slots, message + 0x18);
+	put_unaligned_le16(on_78 ? 78 : 76, message + 0x1a);
+	put_unaligned_le16(18, message + 0x1c);
+	put_unaligned_le32(16, message + 0x20);
+	put_unaligned_le16(on_78 ? 4 : 3, message + 0x24);
+	memcpy(message + 0x34, cd, sizeof(*cd));
+	ret = alpha_message(wifi, message, sizeof(message));
+	if (!ret && readl(wifi->a.bar + 8) != 2)
+		ret = -EIO;
+	return ret;
+}
+
+int centauri_wifi_close_awdl_tx_ring(struct centauri_wifi *wifi, u16 tr_id)
+{
+	u8 message[4];
+	int ret = 0;
+
+	lockdep_assert_held(&wifi->lock);
+	if (!READ_ONCE(wifi->transport_paused) && readl(wifi->a.bar + 8) == 2) {
+		cen_awdl_build_tr_close_msg(message, tr_id);
+		ret = alpha_message(wifi, message, sizeof(message));
+	}
+	index_write(wifi, 1, tr_id, 0);
+	index_write(wifi, 3, tr_id, 0);
+	return ret;
+}
+
+void centauri_wifi_get_country(const struct centauri_wifi *wifi, u8 out[3])
+{
+	if (wifi && wifi->country_valid &&
+	    country_code_valid(wifi->country, sizeof(wifi->country))) {
+		out[0] = wifi->country[0];
+		out[1] = wifi->country[1];
+		out[2] = 0;
+		return;
+	}
+	out[0] = 'U';
+	out[1] = 'S';
+	out[2] = 0;
+}
+
+/* The station's channel number while it is connected, else 0. */
+unsigned int centauri_wifi_station_channel(const struct centauri_wifi *wifi)
+{
+	const struct ieee80211_channel *chan;
+
+	if (!wifi || !READ_ONCE(wifi->connected))
+		return 0;
+	chan = READ_ONCE(wifi->connect_channel);
+	return chan ? ieee80211_frequency_to_channel(chan->center_freq) : 0;
+}
+
+u16 centauri_wifi_index_read(struct centauri_wifi *wifi, unsigned int array,
+			     unsigned int index)
+{
+	return index_read(wifi, array, index);
+}
+
+void centauri_wifi_index_write(struct centauri_wifi *wifi, unsigned int array,
+			       unsigned int index, u16 value)
+{
+	index_write(wifi, array, index, value);
+}
+
 int centauri_wifi_suspend(struct centauri *c)
 {
 	struct centauri_wifi *wifi = c->wifi;
@@ -2835,6 +5302,7 @@ int centauri_wifi_suspend(struct centauri *c)
 	if (!wifi || !of_machine_is_compatible("apple,j813") ||
 	    !READ_ONCE(alpha_sleep_untested))
 		return 0;
+	centauri_awdl_suspend(wifi->awdl);
 	mutex_lock(&wifi->lock);
 	if (wifi->transport_paused || wifi->connected || wifi->connecting || wifi->scan_request ||
 	    READ_ONCE(wifi->stopping)) {
@@ -2874,7 +5342,11 @@ void centauri_wifi_unregister(struct centauri *c)
 
 	if (!wifi)
 		return;
+	centauri_awdl_unregister(wifi->awdl);
+	wifi->awdl = NULL;
 	WRITE_ONCE(wifi->stopping, true);
+	WRITE_ONCE(wifi->connect_abort, true);
+	WRITE_ONCE(wifi->scan_abort, true);
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		netif_tx_disable(wifi->netdev);
 	debugfs_remove(wifi->data_probe_file);
@@ -2893,18 +5365,16 @@ void centauri_wifi_unregister(struct centauri *c)
 	debugfs_remove(wifi->fwlog_status_file);
 	debugfs_remove(wifi->fwlog_buffer_file);
 	debugfs_remove(wifi->fwlog_ack_file);
-	cancel_work_sync(&wifi->scan_work);
+	cancel_scan(wifi);
 	cancel_work_sync(&wifi->connect_work);
 	cancel_delayed_work_sync(&wifi->link_work);
+	mutex_lock(&wifi->lock);
+	cancel_connect_locked(wifi);
+	mutex_unlock(&wifi->lock);
 	skb_queue_purge(&wifi->data_tx_queue);
-	if (wifi->scan_request) {
-		struct cfg80211_scan_info info = { .aborted = true };
-
-		cfg80211_scan_done(wifi->scan_request, &info);
-		wifi->scan_request = NULL;
-	}
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(wifi->netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	if (wifi->registered)
 		wiphy_unregister(wifi->wiphy);
 	if (wifi->wiphy)

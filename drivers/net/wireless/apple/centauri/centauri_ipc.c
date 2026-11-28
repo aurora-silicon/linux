@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Native DMA implementation of the measured J813 Control/Alpha bootstrap.
- * Wire layout source: AppleCentauriCommon/scripts/alpha_wifi_scan.py v259.
- * Polling and bounded bootstrap rings are deliberate bring-up restrictions.
- */
+/* Apple N1 Control and Alpha ACIPC bootstrap and DMA resource management. */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -137,6 +134,93 @@ static const struct file_operations firmware_crash_fops = {
 	.llseek = default_llseek,
 };
 
+/* Replace *@saved with a copy of @len bytes at @src; false without memory. */
+static bool centauri_keep(void **saved, u32 *saved_len, const void *src, u32 len)
+{
+	void *copy = kvmalloc(len, GFP_KERNEL);
+
+	if (!copy)
+		return false;
+	dma_rmb();
+	memcpy(copy, src, len);
+	kvfree(*saved);
+	*saved = copy;
+	*saved_len = len;
+	return true;
+}
+
+/*
+ * A restart frees the secondary memory and the Alpha DRAM log, and with them
+ * the crash region and the log of the firmware that stopped. Keep copies,
+ * read through "firmware_crash_saved" and "firmware_log_saved". Called with
+ * boot_lock held, before the restart frees anything.
+ */
+void centauri_save_crash(struct centauri *c)
+{
+	struct cen_buffer *secondary, *log;
+	u32 offset, length;
+
+	lockdep_assert_held(&c->boot_lock);
+	if (!c->ipc)
+		return;
+	secondary = c->ipc->secondary;
+	if (secondary &&
+	    !ftab_entry(secondary->cpu, secondary->size, "cras", &offset, &length, false) &&
+	    centauri_keep(&c->crash_saved, &c->crash_saved_len, secondary->cpu + offset, length))
+		dev_info(&c->pdev->dev, "recovery: kept the firmware crash region (%u bytes%s)\n",
+			 length, memchr_inv(c->crash_saved, 0, length) ? "" : ", all zero");
+	/* Only a log the firmware set up: its header starts with version 0x201 */
+	log = c->ipc->alpha_log;
+	if (log && get_unaligned_le16(log->cpu) == 0x201 &&
+	    centauri_keep(&c->log_saved, &c->log_saved_len, log->cpu, log->size))
+		dev_info(&c->pdev->dev,
+			 "recovery: kept the firmware log (%u bytes, consumer %u producer %u)\n",
+			 c->log_saved_len, get_unaligned_le32(c->log_saved + 0x10),
+			 get_unaligned_le32(c->log_saved + 0xb0));
+}
+
+static ssize_t firmware_crash_saved_read(struct file *file, char __user *buffer,
+					 size_t count, loff_t *pos)
+{
+	struct centauri *c = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&c->boot_lock);
+	ret = c->crash_saved ?
+	      simple_read_from_buffer(buffer, count, pos, c->crash_saved,
+				      c->crash_saved_len) : -ENODATA;
+	mutex_unlock(&c->boot_lock);
+	return ret;
+}
+
+static const struct file_operations firmware_crash_saved_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = firmware_crash_saved_read,
+	.llseek = default_llseek,
+};
+
+static ssize_t firmware_log_saved_read(struct file *file, char __user *buffer,
+				       size_t count, loff_t *pos)
+{
+	struct centauri *c = file->private_data;
+	ssize_t ret;
+
+	mutex_lock(&c->boot_lock);
+	ret = c->log_saved ?
+	      simple_read_from_buffer(buffer, count, pos, c->log_saved,
+				      c->log_saved_len) : -ENODATA;
+	mutex_unlock(&c->boot_lock);
+	return ret;
+}
+
+static const struct file_operations firmware_log_saved_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = firmware_log_saved_read,
+	.llseek = default_llseek,
+};
+
 static int secondary_init(struct centauri *c)
 {
 	u32 offset, length, count, i, required;
@@ -177,6 +261,14 @@ static int secondary_init(struct centauri *c)
 	if (!c->crash_file)
 		c->crash_file = debugfs_create_file("firmware_crash", 0400, c->debug, c,
 						    &firmware_crash_fops);
+	if (!c->crash_saved_file)
+		c->crash_saved_file = debugfs_create_file("firmware_crash_saved", 0400,
+							  c->debug, c,
+							  &firmware_crash_saved_fops);
+	if (!c->log_saved_file)
+		c->log_saved_file = debugfs_create_file("firmware_log_saved", 0400,
+							c->debug, c,
+							&firmware_log_saved_fops);
 	return 0;
 }
 

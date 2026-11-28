@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Initial real-hardware N1 PCI/ACIPC backend for J813.
- * Register offsets are from AppleCentauriCommon/PROTOCOL.md and its measured
- * J813 prototype. Firmware execution and radio operations are separate gates.
- */
+/* Apple N1 PCI/ACIPC transport backend. */
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -14,6 +11,7 @@
 #include <linux/pci.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
@@ -190,6 +188,7 @@ static int centauri_recover(struct centauri *c)
 	if (!c->link_ready || PCI_FUNC(c->pdev->devfn))
 		return -EBUSY;
 	dev_info(dev, "recovery: stage %#x, releasing the firmware's buffers\n", stage);
+	centauri_save_crash(c);
 	beta = pci_get_slot(c->pdev->bus, PCI_DEVFN(PCI_SLOT(c->pdev->devfn), 2));
 	if (beta)
 		device_release_driver(&beta->dev);
@@ -464,6 +463,8 @@ static void centauri_remove(struct pci_dev *pdev)
 	centauri_wifi_unregister(c);
 	debugfs_remove_recursive(c->debug);
 	centauri_free_boot(c);
+	kvfree(c->crash_saved);
+	kvfree(c->log_saved);
 }
 
 /*
@@ -547,3 +548,4 @@ MODULE_DESCRIPTION("Apple N1 Centauri native PCI and ACIPC bring-up backend");
 MODULE_FIRMWARE("apple/centauri/j813-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j815-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j873-ftab.bin");
+MODULE_FIRMWARE("apple/centauri/j804-ftab.bin");
