@@ -489,7 +489,8 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
     #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
     let stage_scope = { let _ = early_tiling; 0 };
-    if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
+    let vertex_scratch = if samplers_and_helpers { 1 } else { 0 };
+    if r.flags & !(vertex_scratch | 2 | 16 | (1 << 18) | stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || (!samplers_and_helpers && (r.sampler_count != 0 || r.sampler_heap != 0
             || r.vertex_helper != empty || r.fragment_helper != empty))
         || (!zls_compression_all_layouts
