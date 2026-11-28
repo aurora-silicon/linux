@@ -24,6 +24,8 @@
 		#ifdef APPLE_USE_PMP
 		pmp = &pmp;
 		#endif
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 	};
 
 	cpus {
@@ -1230,7 +1232,7 @@
 					"boot_error_count", "panic_count";
 			};
 
-			rtc {
+			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;
 				nvmem-cell-names = "rtc_offset";

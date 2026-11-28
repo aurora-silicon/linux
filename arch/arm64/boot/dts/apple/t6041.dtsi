@@ -1043,6 +1043,8 @@
 /* The loader uses this alias to enable SIO after placing its firmware. */
 / {
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sio = &sio;
 	};
 };

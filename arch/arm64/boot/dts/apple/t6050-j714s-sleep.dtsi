@@ -7,6 +7,8 @@
 
 / {
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		/* The boot loader finds the SIO by this alias and gives it its firmware and tables. */
 		sio = &sio;
 	};
