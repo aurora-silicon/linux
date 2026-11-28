@@ -470,10 +470,12 @@ struct apple_dart {
 	/* A locked DART a display subsystem scans out through: apple_dart_display_scanout(). */
 	bool display_scanout;
 	/*
-	 * A real sleep took the ISP host streams' registers: the next runtime resume, its
-	 * consumer's next power-up, resets them and writes back what the last suspend saved.
+	 * System sleep or a failed restore left the ISP host streams' registers
+	 * lost: the next runtime resume resets them and writes back what the
+	 * last suspend saved.
 	 */
 	bool isp_sleep_lost;
+	u32 save_err_irq_enable;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
 	struct apple_tunable *tunables;
@@ -916,6 +918,7 @@ struct apple_dart_master_cfg {
 static struct platform_driver apple_dart_driver;
 static const struct iommu_ops apple_dart_iommu_ops;
 static bool apple_dart_fault_pending(struct apple_dart *dart);
+static bool apple_dart_is_locked(struct apple_dart *dart);
 
 /* The machine's first compatible string, for log lines that name the board. */
 static const char *apple_dart_board(void)
@@ -2807,6 +2810,32 @@ static void apple_dart_managed_quarantine(struct apple_dart *dart)
 #define DART_T6050_ISP_HOST_SIDS (BIT(0) | BIT(1) | BIT(6) | BIT(7) | \
 				  BIT(10) | BIT(11) | BIT(12))
 
+static void apple_dart_isp_host_enable_errors(struct apple_dart *dart)
+{
+	if (dart->version >= 0x0202) {
+		bool v24 = dart->version >= 0x0204;
+		u32 sid_en_reg = v24 ? DART_T8110_V24_ERR_SID_ENABLE(0) :
+				 DART_T8110_ERR_SID_ENABLE(0);
+		u32 sid_en;
+
+		apple_dart_writel(dart, 0, DART_T8110_V2_ERROR_MASK);
+		apple_dart_readl(dart, DART_T8110_V2_ERROR_MASK);
+		if (dart->full_errors) {
+			apple_dart_writel(dart, U32_MAX,
+					  v24 ? DART_T8110_V24_ERR_IRQ_STATUS :
+					  DART_T8110_ERR_IRQ_STATUS);
+			apple_dart_writel(dart, U32_MAX,
+					  v24 ? DART_T8110_V24_ERR_IRQ_ENABLE :
+					  DART_T8110_ERR_IRQ_ENABLE);
+		}
+		sid_en = apple_dart_readl(dart, sid_en_reg);
+		apple_dart_writel(dart, sid_en | DART_T6050_ISP_HOST_SIDS,
+				  sid_en_reg);
+	} else {
+		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+	}
+}
+
 static int apple_dart_isp_host_reset(struct apple_dart *dart)
 {
 	const u32 host = DART_T6050_ISP_HOST_SIDS;
@@ -2815,7 +2844,8 @@ static int apple_dart_isp_host_reset(struct apple_dart *dart)
 	int ret;
 
 	if (dart->hw->type != DART_T8110 || dart->num_streams != 16 ||
-	    dart->locked || (apple_dart_readl(dart, DART_T8110_ERROR) & DART_T8110_ERROR_FLAG))
+	    dart->locked || apple_dart_is_locked(dart) ||
+	    apple_dart_fault_pending(dart))
 		return -EBUSY;
 	for (sid = 0; sid < 16; sid++)
 		if (host & BIT(sid))
@@ -2823,7 +2853,9 @@ static int apple_dart_isp_host_reset(struct apple_dart *dart)
 	apple_dart_hw_disable_dma(&map);
 	apple_dart_hw_clear_all_ttbrs(&map);
 	apple_dart_hw_apply_remaps(dart);
-	apple_dart_writel(dart, host, DART_T8110_ENABLE_STREAMS);
+	apple_dart_writel(dart,
+			  apple_dart_readl(dart, DART_T8110_ENABLE_STREAMS) | host,
+			  DART_T8110_ENABLE_STREAMS);
 	for (sid = 0; sid < 16; sid++) {
 		if (!(host & BIT(sid)))
 			continue;
@@ -2833,7 +2865,7 @@ static int apple_dart_isp_host_reset(struct apple_dart *dart)
 		if (ret)
 			return ret;
 	}
-	apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+	apple_dart_isp_host_enable_errors(dart);
 	return 0;
 }
 
@@ -3858,6 +3890,31 @@ static int apple_dart_domain_add_streams(struct apple_dart_domain *domain,
 				      true);
 }
 
+static int apple_dart_cfg_pm_get(struct apple_dart_master_cfg *cfg)
+{
+	struct apple_dart_stream_map *stream_map;
+	int i, ret;
+
+	for_each_stream_map(i, cfg, stream_map) {
+		ret = pm_runtime_resume_and_get(stream_map->dart->dev);
+		if (ret < 0) {
+			while (--i >= 0)
+				pm_runtime_put(cfg->stream_maps[i].dart->dev);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static void apple_dart_cfg_pm_put(struct apple_dart_master_cfg *cfg)
+{
+	struct apple_dart_stream_map *stream_map;
+	int i;
+
+	for_each_stream_map(i, cfg, stream_map)
+		pm_runtime_put(stream_map->dart->dev);
+}
+
 static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 					struct device *dev,
 					struct iommu_domain *old)
@@ -3872,8 +3929,9 @@ static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 		if (stream_map->dart->live_mtp)
 			return -EBUSY;
 
-	for_each_stream_map(i, cfg, stream_map)
-		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+	ret = apple_dart_cfg_pm_get(cfg);
+	if (ret)
+		return ret;
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
 	if (ret)
@@ -3917,8 +3975,7 @@ static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 err:
 	if (ret && streams_added && cfg->stream_maps[0].dart->managed_sids)
 		apple_dart_mod_streams(dart_domain->stream_maps, cfg->stream_maps, false);
-	for_each_stream_map(i, cfg, stream_map)
-		pm_runtime_put(stream_map->dart->dev);
+	apple_dart_cfg_pm_put(cfg);
 	return ret;
 }
 
@@ -3963,7 +4020,7 @@ static int apple_dart_attach_dev_identity_unguarded(struct iommu_domain *domain,
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
 
 	if (!cfg->supports_bypass || cfg->stream_maps[0].dart->managed_sids)
 		return -EINVAL;
@@ -3971,15 +4028,15 @@ static int apple_dart_attach_dev_identity_unguarded(struct iommu_domain *domain,
 	if (cfg->locked)
 		return -EINVAL;
 
-	for_each_stream_map(i, cfg, stream_map)
-		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+	ret = apple_dart_cfg_pm_get(cfg);
+	if (ret)
+		return ret;
 
 	for_each_stream_map(i, cfg, stream_map)
 		if (!stream_map->dart->retained_mtp)
 			apple_dart_hw_enable_bypass(stream_map);
 
-	for_each_stream_map(i, cfg, stream_map)
-		pm_runtime_put(stream_map->dart->dev);
+	apple_dart_cfg_pm_put(cfg);
 	return 0;
 }
 
@@ -4033,7 +4090,7 @@ static int apple_dart_attach_dev_blocked_unguarded(struct iommu_domain *domain,
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
 
 	for_each_stream_map(i, cfg, stream_map)
 		if (stream_map->dart->live_mtp)
@@ -4042,14 +4099,14 @@ static int apple_dart_attach_dev_blocked_unguarded(struct iommu_domain *domain,
 	if (cfg->locked)
 		return -EINVAL;
 
-	for_each_stream_map(i, cfg, stream_map)
-		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+	ret = apple_dart_cfg_pm_get(cfg);
+	if (ret)
+		return ret;
 
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_disable_dma(stream_map);
 
-	for_each_stream_map(i, cfg, stream_map)
-		pm_runtime_put(stream_map->dart->dev);
+	apple_dart_cfg_pm_put(cfg);
 	return 0;
 }
 
@@ -4101,15 +4158,15 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
-	int i;
+	int i, ret;
 
 	if (!dev_iommu_fwspec_get(dev) || !cfg)
 		return ERR_PTR(-ENODEV);
 
 	if (apple_dart_has_borrowed(cfg->stream_maps[0].dart)) {
 		struct apple_dart_dcp *borrowed = apple_dart_borrowed_cfg(cfg);
-		int ret = -EINVAL;
 
+		ret = -EINVAL;
 		/* An external display DART's registers only inside a use. */
 		if (borrowed && !apple_dart_pm_get(borrowed->dart)) {
 			ret = -EAGAIN;
@@ -4118,15 +4175,42 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 			apple_dart_pm_put(borrowed->dart);
 		}
 		if (ret)
-			return ERR_PTR(ret);
+			goto err_free_cfg;
 	}
 
-	for_each_stream_map(i, cfg, stream_map)
-		device_link_add(dev, stream_map->dart->dev,
-			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER |
-			DL_FLAG_RPM_ACTIVE);
+	/*
+	 * ISP host DARTs rely on their runtime-PM-enabled consumer rather than
+	 * DL_FLAG_RPM_ACTIVE at IOMMU probe so a failed link cannot pin
+	 * ps_isp_sys. Use persistent managed DL_FLAG_PM_RUNTIME links (without
+	 * DL_FLAG_STATELESS or DL_FLAG_AUTOREMOVE_*) so the driver core
+	 * enforces consumer-before-supplier unbind ordering across all ISP
+	 * DARTs and keeps the link dormant if a secondary DART unbinds; driver
+	 * core owns managed link lifetime on registered consumers (calling
+	 * device_link_del()/device_link_remove() WARNs in device_link_put_kref),
+	 * so return -ENODEV on link failure and let driver core purge links on
+	 * device unregistration while apple-isp defers probe if its IOMMU
+	 * domain is missing.
+	 */
+	for_each_stream_map(i, cfg, stream_map) {
+		u32 flags = DL_FLAG_PM_RUNTIME;
+
+		if (!stream_map->dart->isp_host)
+			flags |= DL_FLAG_AUTOREMOVE_SUPPLIER | DL_FLAG_RPM_ACTIVE;
+		if (!device_link_add(dev, stream_map->dart->dev, flags) &&
+		    stream_map->dart->isp_host) {
+			ret = -ENODEV;
+			goto err_free_cfg;
+		}
+	}
 
 	return &cfg->stream_maps[0].dart->iommu;
+
+err_free_cfg:
+	for_each_stream_map(i, cfg, stream_map)
+		apple_dart_v27_client_remove(stream_map);
+	dev_iommu_priv_set(dev, NULL);
+	kfree(cfg);
+	return ERR_PTR(ret);
 }
 
 static void apple_dart_release_device(struct device *dev)
@@ -4165,9 +4249,8 @@ static void apple_dart_release_device(struct device *dev)
 		apple_dart_sleep_writer_put(stream_map->dart, gate);
 	}
 
-	for_each_stream_map(j, cfg, stream_map) {
+	for_each_stream_map(j, cfg, stream_map)
 		apple_dart_v27_client_remove(stream_map);
-	}
 	kfree(cfg);
 }
 
@@ -6109,7 +6192,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return -EOPNOTSUPP;
 	dart->isp_host = of_device_is_compatible(dev->of_node, "apple,t6050-isp-dart");
 	dart->isp_sleep = dart->isp_host && apple_t6050_sleep_described();
-	dart->power_retained = dart->isp_host;
 	dart->per_stream = dart->isp_host ||
 			   of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
@@ -7001,8 +7083,12 @@ static void apple_dart_remove(struct platform_device *pdev)
 	 * block after that clock is running again.
 	 */
 	if (!dart->locked && !dart->retained_mtp && !dart->live_mtp &&
-	    !READ_ONCE(dart->commands_gated))
-		apple_dart_hw_reset(dart);
+	    !READ_ONCE(dart->commands_gated)) {
+		if (pm_runtime_resume_and_get(&pdev->dev) >= 0) {
+			apple_dart_hw_reset(dart);
+			pm_runtime_put_sync(&pdev->dev);
+		}
+	}
 
 	/* Its streams are off: its clock protection goes before its domain can. */
 	apple_dart_cio_release(dart);
@@ -7428,13 +7514,23 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 		return 0;
 	}
 	/*
-	 * The ISP's domain stays on at runtime, but a real sleep takes the registers: keep
-	 * what they hold now for apple_dart_isp_host_restore(). Not while they are still
-	 * lost.
+	 * Save the ISP's host stream registers on runtime suspend so
+	 * apple_dart_isp_host_restore() can write them back after either
+	 * runtime ps_isp_sys power-off or system sleep. Do not overwrite
+	 * saved state while the registers are still known lost.
 	 */
 	if (dart->isp_host) {
-		if (dart->isp_sleep && !dart->isp_sleep_lost)
+		if (!dart->isp_sleep_lost) {
 			apple_dart_save_state(dart);
+			if (dart->version >= 0x0202) {
+				u32 irq_en_reg = dart->version >= 0x0204 ?
+						 DART_T8110_V24_ERR_IRQ_ENABLE :
+						 DART_T8110_ERR_IRQ_ENABLE;
+
+				dart->save_err_irq_enable =
+					apple_dart_readl(dart, irq_en_reg);
+			}
+		}
 		return 0;
 	}
 	/* The tunneled DART has no state to save when its domain stays on. */
@@ -7639,23 +7735,78 @@ static int apple_dart_resume_retained(struct apple_dart *dart)
 }
 
 /*
- * The ISP's DARTs at their consumer's first power-up after a real sleep. Their domain
- * stays on at runtime and they keep their state between streams, but the sleep resets
- * them: stream 0's table and the remaps of the firmware's streams onto it are gone, and
- * the firmware's first access faults. Nothing is written at the wake itself: the block
- * is next needed when the ISP is powered up. Do the probe's reset of the host streams
- * again then, and write back what the last runtime suspend saved of them. The secure
- * core's streams are left alone, as at probe.
+ * The T6050 ISP DARTs lose their host stream registers when ps_isp_sys powers
+ * off at runtime or during system sleep. Nothing is written at system wake:
+ * the block is next needed when the ISP powers up. Check host stream and error
+ * reporting retention on runtime resume, and on loss repeat the probe's host
+ * stream reset and write back what the last runtime suspend saved. The secure
+ * core's streams stay untouched, and apple-isp owns and reprograms the DAPF on
+ * every firmware boot.
  */
+static bool apple_dart_isp_host_retained(struct apple_dart *dart)
+{
+	unsigned int sid, idx;
+
+	if ((apple_dart_readl(dart, DART_T8110_ENABLE_STREAMS) &
+	     DART_T6050_ISP_HOST_SIDS) != DART_T6050_ISP_HOST_SIDS)
+		return false;
+
+	if (dart->version >= 0x0202) {
+		bool v24 = dart->version >= 0x0204;
+		u32 sid_en_reg = v24 ? DART_T8110_V24_ERR_SID_ENABLE(0) :
+				 DART_T8110_ERR_SID_ENABLE(0);
+		u32 irq_en_reg = v24 ? DART_T8110_V24_ERR_IRQ_ENABLE :
+				 DART_T8110_ERR_IRQ_ENABLE;
+
+		if (apple_dart_readl(dart, DART_T8110_V2_ERROR_MASK))
+			return false;
+		if ((apple_dart_readl(dart, sid_en_reg) &
+		     DART_T6050_ISP_HOST_SIDS) != DART_T6050_ISP_HOST_SIDS)
+			return false;
+		if (!dart->full_errors && dart->save_err_irq_enable &&
+		    (apple_dart_readl(dart, irq_en_reg) &
+		     dart->save_err_irq_enable) != dart->save_err_irq_enable)
+			return false;
+	}
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (!(DART_T6050_ISP_HOST_SIDS & BIT(sid)))
+			continue;
+		if (apple_dart_readl(dart, DART_TCR(dart, sid)) != dart->save_tcr[sid])
+			return false;
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+
+			if (ttbr != dart->save_ttbr[sid][idx] &&
+			    ((ttbr | dart->save_ttbr[sid][idx]) & dart->hw->ttbr_valid))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 static int apple_dart_isp_host_restore(struct apple_dart *dart)
 {
 	unsigned int sid, idx;
+	u32 enabled;
 	int ret;
 
+	dart->isp_sleep_lost = true;
 	ret = apple_dart_isp_host_reset(dart);
 	if (ret) {
-		dev_err(dart->dev, "host stream reset after sleep failed: %d\n", ret);
+		dev_err(dart->dev, "host stream reset after power loss failed: %d\n", ret);
 		return ret;
+	}
+
+	if (dart->version >= 0x0202 && !dart->full_errors && dart->save_err_irq_enable) {
+		u32 irq_en_reg = dart->version >= 0x0204 ?
+				 DART_T8110_V24_ERR_IRQ_ENABLE :
+				 DART_T8110_ERR_IRQ_ENABLE;
+
+		apple_dart_writel(dart,
+				  apple_dart_readl(dart, irq_en_reg) |
+				  dart->save_err_irq_enable, irq_en_reg);
 	}
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
@@ -7668,23 +7819,39 @@ static int apple_dart_isp_host_restore(struct apple_dart *dart)
 	}
 
 	/* A block that is off or locked keeps none of it: the firmware would fault again. */
+	enabled = apple_dart_readl(dart, DART_T8110_ENABLE_STREAMS);
+	if ((enabled & DART_T6050_ISP_HOST_SIDS) != DART_T6050_ISP_HOST_SIDS) {
+		dev_err(dart->dev,
+			"host streams not enabled after power loss: ENABLE_STREAMS %#x (need %#lx)\n",
+			enabled, DART_T6050_ISP_HOST_SIDS);
+		return -EIO;
+	}
 	for (sid = 0; sid < dart->num_streams; sid++) {
-		u32 tcr, ttbr;
+		u32 tcr;
 
 		if (!(DART_T6050_ISP_HOST_SIDS & BIT(sid)))
 			continue;
 		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
-		ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
-		if (tcr != dart->save_tcr[sid] || ttbr != dart->save_ttbr[sid][0]) {
+		if (tcr != dart->save_tcr[sid]) {
 			dev_err(dart->dev,
-				"stream %u not restored after sleep: TCR %#x (saved %#x), TTBR %#x (saved %#x)\n",
-				sid, tcr, dart->save_tcr[sid], ttbr, dart->save_ttbr[sid][0]);
+				"stream %u not restored after power loss: TCR %#x (saved %#x)\n",
+				sid, tcr, dart->save_tcr[sid]);
 			return -EIO;
+		}
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+
+			if (ttbr != dart->save_ttbr[sid][idx]) {
+				dev_err(dart->dev,
+					"stream %u TTBR%u not restored after power loss: %#x (saved %#x)\n",
+					sid, idx, ttbr, dart->save_ttbr[sid][idx]);
+				return -EIO;
+			}
 		}
 	}
 
 	dart->isp_sleep_lost = false;
-	dev_dbg(dart->dev, "host streams restored at the first use after sleep\n");
+	dev_dbg(dart->dev, "host streams restored after power loss\n");
 	return 0;
 }
 
@@ -7737,9 +7904,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return 0;
 	}
 
-	/* Kept between streams; lost only in a real sleep, see apple_dart_resume_noirq(). */
+	/* Restore host streams if system sleep or runtime ps_isp_sys power-off cleared them. */
 	if (dart->isp_host)
-		return dart->isp_sleep_lost ? apple_dart_isp_host_restore(dart) : 0;
+		return (dart->isp_sleep_lost || !apple_dart_isp_host_retained(dart)) ?
+			apple_dart_isp_host_restore(dart) : 0;
 
 	/*
 	 * PCIe-C DARTs on an apple,always-on domain retain their translation
@@ -7815,7 +7983,6 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
-	bool domain_cycled = false;
 	int ret;
 
 	if (READ_ONCE(dart->m5_sleep_owner))
@@ -7838,7 +8005,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 	 * The ISP's DARTs are written when the ISP is next powered up, not here: its
 	 * firmware only starts with a stream, through the DART's runtime resume.
 	 */
-	if (dart->isp_sleep && pm_resume_via_firmware())
+	if (dart->isp_host && pm_resume_via_firmware())
 		dart->isp_sleep_lost = true;
 	/*
 	 * A sleep refused after its entry had switched the ISP's domain off: the domain is on
@@ -7850,7 +8017,6 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 			of_parse_phandle(dev->of_node, "power-domains", 0);
 
 		if (apple_sleep_refusal_cycled(pd)) {
-			domain_cycled = true;
 			if (!dart->isp_sleep_lost)
 				dev_info(dev, "host streams lost in a refused sleep: restored at the camera's next start\n");
 			dart->isp_sleep_lost = true;
@@ -7875,7 +8041,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 		else
 			dev_dbg(dev, "restored after sleep\n");
 	}
-	if (pm_resume_via_firmware() || domain_cycled)
+	if (pm_resume_via_firmware() && !dart->isp_host)
 		apple_dart_dapf_replay(dart, false);
 
 	return ret;
