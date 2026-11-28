@@ -20,6 +20,8 @@
 #define PCI_COMMAND_MASTER 4
 #define PCI_EXP_LNKSTA 18
 #define PCI_EXP_LNKSTA_DLLLA 0x2000
+#define CONFIG_APPLE_CENTAURI_T6050_WIFI 1
+#define IS_ENABLED(option) (option)
 #define CEN_BOOT_STOPPED 5
 #define SZ_16K 16384
 #define CEN_ARENA_SIZE 65536
@@ -37,7 +39,7 @@ struct pci_dev {
  int devfn, refs, command, reads, writes;
 	bool visible, pending, state_saved;
 };
-struct work_struct { int unused; };
+struct work_struct { bool pending; };
 struct kref { int count; };
 struct centauri_t6050_ipc {
  bool owned[3]; struct pci_dev *function[3]; void *buffer;
@@ -51,7 +53,7 @@ struct centauri_t6050_rewake {
  struct work_struct work; struct kref ref;
  struct pci_dev *bridge, *control, *beta;
  unsigned int slot, generation, work_generation;
- bool active, rerun, control_lease, beta_lease;
+ bool active, rerun, force_reset, control_lease, beta_lease;
  int error;
  struct centauri_t6050_ipc *ipc;
  void *firmware, *descriptor, *arena, *data;
@@ -69,6 +71,7 @@ struct centauri_t6050 {
  size_t firmware_size;
  bool removing, ready, firmware_sleep, link_ready, boot_attempted;
  int boot_lock, boot_work, boot_phase;
+ struct work_struct transport_recover_work;
  struct centauri_t6050_irqs irqs, alpha_irqs;
 };
 struct cen_bt {
@@ -118,9 +121,11 @@ static int pcibios_err_to_errno(int x) { return x ? -EIO : 0; }
 static bool pci_wait_for_pending_transaction(struct pci_dev *p)
 { return can_config(p) && !p->pending && !force_pending; }
 static int work_busy(int *p) { return *p; }
+static void cancel_work_sync(struct work_struct *p)
+{ assert(control.removing && !control.ready && !control.boot_lock); p->pending = false; }
 static void cancel_delayed_work_sync(int *p) { *p = 0; boot_users = 0; }
 static void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
-{ assert(c->removing); wifi_users = 0; }
+{ assert(c->removing && !c->transport_recover_work.pending); wifi_users = 0; }
 static int pci_irq_vector(struct pci_dev *p, int n) { (void)p; return n; }
 static void free_irq(int n, void *c) { (void)n; (void)c; irq_users = 0; }
 static void centauri_t6050_free_irqs(struct centauri_t6050_irqs *p)
@@ -232,6 +237,7 @@ static void fixture(void)
  owner.ops = &ops; owner.data = &beta;
  control.pdev = &devs[0]; control.recovery = &owner; control.link_ready = true;
  control.boot_attempted = control.ready = true;
+ control.transport_recover_work.pending = true;
  control.irqs.pdev = &devs[0]; control.alpha_irqs.pdev = &devs[1];
  control.irqs.count = control.alpha_irqs.count = 1;
  devs[0].dev.driver = &centauri_t6050_driver.driver; devs[0].drvdata = &control;

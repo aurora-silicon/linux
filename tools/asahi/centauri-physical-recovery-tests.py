@@ -20,6 +20,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 PCI = 'drivers/net/wireless/apple/centauri/t6050/centauri_pci.c'
 IPC = 'drivers/net/wireless/apple/centauri/t6050/centauri_ipc.c'
+RECOVERY = 'drivers/net/wireless/apple/centauri/t6050/centauri_recovery.c'
 BT = 'drivers/bluetooth/btcentauri_t6050.c'
 GUARDS = {
     'bound': '(c->ipc || c->firmware || c->descriptor || c->recovery->arena) &&\n\t    ',
@@ -73,12 +74,14 @@ def generate(sources, mutation):
               function(sources[BT], 'cen_retained'),
               function(sources[BT], 'cen_stop'),
               function(sources[IPC], 'centauri_t6050_ipc_fenced'),
-              function(sources[IPC], 'centauri_t6050_free_ipc')]
+              function(sources[IPC], 'centauri_t6050_free_ipc'),
+              function(sources[RECOVERY], 'centauri_t6050_transport_recover_cancel')]
     chunks += [function(source, name) for name in (
         'centauri_t6050_free_boot', 'centauri_t6050_beta_call',
         'centauri_t6050_domain_fence', 'centauri_t6050_quiesce',
         'centauri_t6050_remove', 'centauri_t6050_rewake_teardown',
-        'centauri_t6050_link_active', 'centauri_t6050_rewake_worker')]
+        'centauri_t6050_link_active', 'centauri_t6050_rewake_already_reset',
+        'centauri_t6050_rewake_worker')]
     fixture = Path(__file__).with_suffix('.c').read_text()
     marker = '/* ACTUAL_FUNCTIONS */'
     if fixture.count(marker) != 1:
@@ -88,7 +91,7 @@ def generate(sources, mutation):
 
 def run(args, out):
     out.mkdir(parents=True, exist_ok=True)
-    sources = {path: (ROOT / path).read_text() for path in (PCI, IPC, BT)}
+    sources = {path: (ROOT / path).read_text() for path in (PCI, IPC, BT, RECOVERY)}
     c = out / 'centauri-recovery.c'
     binary = out / 'centauri-recovery'
     c.write_text(generate(sources, args.mutation))
@@ -102,7 +105,7 @@ def run(args, out):
     (out / 'model.log').write_text(result.stdout + result.stderr)
     (out / 'result.json').write_text(json.dumps({
         'mutation': args.mutation, 'exit': result.returncode,
-        'extracted_functions': 15, 'compiler_command': command,
+        'extracted_functions': 17, 'compiler_command': command,
         'sources': {path: hashlib.sha256(text.encode()).hexdigest()
                     for path, text in sources.items()},
     }, indent=2) + '\n')

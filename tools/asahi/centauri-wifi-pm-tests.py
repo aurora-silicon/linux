@@ -17,7 +17,7 @@ import tempfile
 
 
 def block(source, name):
-    match = re.search(r"^(?:static )?(?:int|void|bool) " + re.escape(name) + r"\(", source, re.M)
+    match = re.search(r"^(?:static )?(?:bool|int|void) " + re.escape(name) + r"\([^;]*?\)\n\{", source, re.M)
     if not match:
         raise RuntimeError(f"Production function {name} missing")
     brace = source.index("{", match.start())
@@ -60,7 +60,7 @@ typedef uint32_t u32;
 static unsigned long jiffies;
 struct centauri_t6050_wifi;
 struct pci_dev { int dev; };
-struct centauri_t6050 { struct pci_dev *pdev; struct centauri_t6050_wifi *wifi; bool removing; };
+struct centauri_t6050 { struct pci_dev *pdev; struct centauri_t6050_wifi *wifi; u8 *bar; bool removing; };
 struct wiphy { struct centauri_t6050_wifi *wifi; };
 struct net_device { int unused; };
 struct cfg80211_wowlan { bool any; };
@@ -73,7 +73,8 @@ struct centauri_t6050_wifi {
     struct { u8 *window, *bar; uint64_t window_dma; } a;
     int lock, connect_work, link_work, data_tx_queue;
     bool command_failed, stopping, connect_abort, disconnect_pending, connecting, connected;
-    bool reply_valid, pm_prepared, pm_wowlan_armed;
+    bool reply_valid, pm_prepared, pm_wowlan_armed, data_failed, irq_ready;
+    bool last_fw_event_valid;
     bool data_tx_busy[DATA_TX_SLOTS];
     bool host_events_fallback_logged;
     bool configured, tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
@@ -118,6 +119,15 @@ static void index_write(struct centauri_t6050_wifi *wifi, int array, int index, 
 static void put_unaligned_le16(u16 value, void *p) { memcpy(p, &value, 2); }
 static void put_unaligned_le32(u32 value, void *p) { memcpy(p, &value, 4); }
 static void put_unaligned_le64(uint64_t value, void *p) { memcpy(p, &value, 8); }
+static unsigned int recovery_requests;
+#define smp_load_acquire(p) (*(p))
+static void log_transport_fault(struct centauri_t6050_wifi *wifi, u32 id,
+                                u32 stage, const char *reason)
+{ (void)wifi; (void)id; (void)stage; (void)reason; }
+static void centauri_t6050_request_transport_recover(struct centauri_t6050 *control)
+{ (void)control; recovery_requests++; }
+static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
+                          u32 stage, const char *reason);
 static void append_tlv(u8 *buffer, size_t *size, u16 tag, const void *value, size_t len)
 {
     put_unaligned_le16(tag, buffer + *size);
@@ -137,7 +147,6 @@ static int command(struct centauri_t6050_wifi *wifi, u32 id, const void *payload
 {
     return command_reply(wifi, id, payload, size, NULL, NULL, NULL);
 }
-static void command_fault(struct centauri_t6050_wifi *wifi) { wifi->command_failed = true; }
 static void drain(struct centauri_t6050_wifi *wifi)
 {
     assert(wifi->lock);
@@ -192,7 +201,7 @@ static void firmware_report(struct centauri_t6050_wifi *wifi, u32 id, u8 *buffer
     assert(buffer == wifi->hw_channels && blob == &wifi->hw_channels_blob);
     reports++;
     if (fail_firmware_report)
-        command_fault(wifi);
+        command_fault(wifi, id, 0, "firmware report");
 }
 static void channels_apply(struct centauri_t6050_wifi *wifi)
 { assert(wifi->lock && rtnl_held); applies++; }
@@ -204,12 +213,12 @@ static struct centauri_t6050 control;
 static struct centauri_t6050_wifi wifi;
 static struct wiphy wiphy;
 static struct net_device netdev;
-static u8 window[32768], bar[8192];
+static u8 window[32768], bar[8192], control_bar[0x8004];
 static void reset(void)
 {
     memset(&wifi, 0, sizeof(wifi));
     memset(window, 0, sizeof(window));
-    control = (struct centauri_t6050) { .pdev = &pdev, .wifi = &wifi };
+    control = (struct centauri_t6050) { .pdev = &pdev, .wifi = &wifi, .bar = control_bar };
     wifi.control = &control;
     wifi.a.window = window;
     wifi.a.bar = bar;
@@ -410,6 +419,16 @@ int main(void)
     expect_error(-ENOSPC);
 
     prepare();
+    recovery_requests = 0;
+    wifi.stopping = true;
+    wifi.configured = true;
+    mutex_lock(&wifi.lock);
+    command_fault(&wifi, 0, 2, "cancel");
+    mutex_unlock(&wifi.lock);
+    assert(wifi.command_failed && wifi.data_failed && !wifi.configured);
+    assert(recovery_requests == 0);
+
+    prepare();
     transport_mode = LOST;
     assert(disconnect() == -EIO);
     assert(wifi.pm_disconnect.submitted && !wifi.pm_disconnect.replied);
@@ -455,12 +474,23 @@ int main(void)
     centauri_t6050_wifi_pm_complete(&control);
     prepare();
     bool published = false;
+    wifi.last_fw_event_valid = true;
     submission_probe = &published;
     mutex_lock(&wifi.lock);
     assert(command_reply(&wifi, 131073, NULL, 0, NULL, NULL, &published) == 0);
     mutex_unlock(&wifi.lock);
     assert(published);
     submission_probe = NULL;
+    reset();
+    unsigned int requests_before = recovery_requests;
+    wifi.last_fw_event_valid = true;
+    consumer = 1; /* Ring is not empty, but has room for another command. */
+    wifi.command_head = 2;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, &published) == -ETIMEDOUT);
+    mutex_unlock(&wifi.lock);
+    assert(!published && !doorbells && wifi.command_head == 2);
+    assert(recovery_requests == requests_before + 1);
 
     /* Failed keep-alive unwind marks Wi-Fi failed so teardown skips ACIPC. */
     prepare();
@@ -540,8 +570,8 @@ def main():
     receipt = re.search(r"struct centauri_wifi_disconnect_receipt \{.*?\n\};", source, re.S)
     if not receipt:
         raise RuntimeError("Production receipt structure missing")
-    names = ["command_reply", "wait_disconnect", "data_tx_in_flight",
-             "drain_tx_in_flight", "wifi_disconnect",
+    names = ["centauri_wait_control_idle", "command_fault", "command_reply", "wait_disconnect",
+             "data_tx_in_flight", "drain_tx_in_flight", "wifi_disconnect",
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_disconnected", "centauri_t6050_wifi_wowlan_armed",
              "centauri_t6050_wifi_mark_failed", "centauri_t6050_wifi_pm_complete",
@@ -551,6 +581,8 @@ def main():
     if has_resume:
         names.append("wifi_resume")
     production = "\n\n".join(block(source, name) for name in names)
+    recovery = (root / "drivers/net/wireless/apple/centauri/t6050/centauri_recovery.c").read_text()
+    production = block(recovery, "centauri_control_idle_ready") + "\n\n" + production
     ops = re.search(r"static const struct cfg80211_ops wifi_ops = \{(.*?)\n\};", source, re.S)
     registration = re.search(r"\.suspend\s*=\s*(\w+)", ops.group(1)) if ops else None
     suspend = registration.group(1) if registration else "NULL"

@@ -53,4 +53,12 @@ config APPLE_CENTAURI_T6050_WIFI
 	help
 	  Add scanning and station connections for the T6050 protocol profile.
 
+config APPLE_CENTAURI_T6050_RECOVERY_KUNIT
+	bool "KUnit: Centauri T6050 recovery helpers (built-in, COMPILE_TEST)"
+	depends on KUNIT && COMPILE_TEST
+	depends on !APPLE_CENTAURI_T6050
+	help
+	  Build only centauri_recovery.c into vmlinux with its KUnit suite so
+	  kunit.py can run centauri_t6050_recovery without the full T6050 driver.
+
 endif

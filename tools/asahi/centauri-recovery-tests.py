@@ -16,18 +16,20 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / 'drivers/net/wireless/apple/centauri/t6050/centauri_pci.c').read_text()
+RECOVERY = (ROOT / 'drivers/net/wireless/apple/centauri/t6050/centauri_recovery.c').read_text()
+HEADER = (ROOT / 'drivers/net/wireless/apple/centauri/t6050/centauri_t6050.h').read_text()
 
 
-def block(name):
-    match = re.search(r'^(?:static )?(?:int|void|bool) ' + name + r'\([^;]*?\)\n\{', SOURCE, re.M)
+def block(name, source=SOURCE):
+    match = re.search(r'^(?:static )?(?:int|void|bool) ' + name + r'\([^;]*?\)\n\{', source, re.M)
     if not match:
         raise RuntimeError(f'Missing production function: {name}')
-    brace = SOURCE.index('{', match.start())
+    brace = source.index('{', match.start())
     depth, end = 1, brace + 1
     while depth:
-        depth += (SOURCE[end] == '{') - (SOURCE[end] == '}')
+        depth += (source[end] == '{') - (source[end] == '}')
         end += 1
-    return SOURCE[match.start():end]
+    return source[match.start():end]
 
 
 PRELUDE = r'''
@@ -37,11 +39,14 @@ PRELUDE = r'''
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#define CONFIG_APPLE_CENTAURI_T6050_WIFI 1
+#define IS_ENABLED(option) ((option) ? 1 : 0)
 #define WRITE_ONCE(x,v) ((x)=(v))
+#define READ_ONCE(x) (x)
+#define dev_err(...) ((void)0)
 #define smp_store_release(p,v) (*(p)=(v))
 #define PCI_DEVFN(s,f) (((s)<<3)|(f))
 #define PCI_SLOT(f) ((f)>>3)
-#define CEN_BOOT_STOPPED 5
 #define guard(x) mock_guard
 #define list_for_each_entry(v,h,n) for ((v)=owner; (v); (v)=NULL)
 struct device { int lock; void *data; };
@@ -54,7 +59,7 @@ struct centauri_t6050_ipc { bool fenced; };
 struct centauri_t6050_rewake {
     struct pci_dev *bridge, *control, *beta;
     unsigned slot, generation, work_generation;
-    bool active, rerun, beta_fallback;
+    bool active, rerun, beta_fallback, force_reset;
     int error, node;
     void *arena;
     struct kref ref;
@@ -65,11 +70,23 @@ struct centauri_t6050 {
     struct pci_dev *pdev;
     struct centauri_t6050_ipc *ipc;
     bool removing, ready, firmware_sleep, pm_prepared;
+    bool boot_attempted;
+    unsigned char *bar;
     int boot_work, boot_lock, alpha_irqs, irqs, boot_phase;
+    unsigned int transport_recover_count;
     void *firmware, *descriptor;
 };
 static int cen_recovery_lock, cen_recovery_owners, cen_rewake_wq;
 static bool cen_exiting, supported_sleep=true;
+static int system_long_wq;
+static unsigned control_stage;
+static bool wake_reset_done;
+static unsigned readl(void *bar) { (void)bar; return control_stage; }
+static void queue_delayed_work(int wq, int *work, int delay)
+{ (void)wq; (void)delay; (*work)++; }
+static void centauri_t6050_free_ipc(struct centauri_t6050 *c) { c->ipc = NULL; }
+static bool apple_pcie_t6050_warm_reset_done(struct pci_dev *p)
+{ (void)p; return wake_reset_done; }
 static struct centauri_t6050_rewake *owner;
 static struct pci_dev *slots[3];
 static int events[100], nevents, stop_error, beta_error, release_error, save_error;
@@ -103,6 +120,8 @@ static int pci_save_state(struct pci_dev *p)
 static bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *p)
 { return !p || p->fenced; }
 static void cancel_delayed_work_sync(int *p) { (void)p; event(STOP_BOOT); }
+static void centauri_t6050_transport_recover_cancel(struct centauri_t6050 *c)
+{ (void)c; }
 static int centauri_t6050_beta_call(struct centauri_t6050_rewake *r, bool release)
 {
     struct centauri_t6050 *c = r->control->dev.data;
@@ -155,6 +174,33 @@ int main(void)
     struct pci_dev fn[3], bridge;
     struct pci_bus bus;
     struct centauri_t6050_ipc ipc={.fenced=true};
+    static unsigned char bar[0x8004];
+    for (unsigned stage=2; stage<=3; stage++) {
+        reset(&c,&rw,fn,&bridge,&bus);
+        c.bar=bar; c.boot_phase=CEN_BOOT_READY; c.ipc=&ipc;
+        control_stage=stage; wake_reset_done=true;
+        centauri_t6050_schedule_transport_recover(&c);
+        apple_centauri_sleep_recovery_needed(&fn[2], -EIO);
+        assert(queues==1 && c.ipc==&ipc && !c.boot_work && !c.boot_lock);
+        assert(!centauri_t6050_rewake_already_reset(&rw));
+        assert(centauri_t6050_rewake_already_reset(&rw)); /* Once per runtime request. */
+    }
+    /* Mid-suspend faults must not race PM by freeing IPC, queueing boot_work, or forcing reset. */
+    for (unsigned stage=0; stage<=4; stage++) {
+        reset(&c,&rw,fn,&bridge,&bus);
+        c.bar=bar; c.boot_phase=CEN_BOOT_READY; c.ipc=&ipc;
+        control_stage=stage; wake_reset_done=true;
+        assert(!centauri_t6050_prepare(&fn[0].dev) && c.pm_prepared);
+        centauri_t6050_schedule_transport_recover(&c);
+        assert(!queues && c.ipc==&ipc && !c.boot_work && !rw.force_reset);
+        assert(!c.transport_recover_count && !c.boot_lock);
+        assert(centauri_t6050_rewake_already_reset(&rw));
+    }
+    reset(&c,&rw,fn,&bridge,&bus);
+    c.bar=bar; c.boot_phase=CEN_BOOT_READY; c.ipc=&ipc; c.firmware_sleep=true;
+    control_stage=1;
+    centauri_t6050_schedule_transport_recover(&c);
+    assert(!queues && c.ipc==&ipc && !c.boot_work && !c.transport_recover_count);
     reset(&c,&rw,fn,&bridge,&bus);
     c.ipc=&ipc; c.firmware=&c; c.descriptor=&rw;
     assert(!centauri_t6050_quiesce(&c));
@@ -517,16 +563,29 @@ def run():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--negative-controls', action='store_true')
     args = parser.parse_args()
-    names = ['apple_centauri_sleep_recovery_needed', 'centauri_t6050_domain_fence',
+    names = ['centauri_t6050_request_rewake', 'apple_centauri_sleep_recovery_needed',
+             'centauri_t6050_rewake_already_reset', 'centauri_t6050_domain_fence',
              'centauri_t6050_quiesce', 'centauri_t6050_prepare', 'centauri_t6050_complete']
     bodies = '\n'.join(block(name) for name in names)
+    boot_phases = re.search(r'enum centauri_t6050_boot_phase \{.*?\n\};', HEADER, re.DOTALL)
+    if boot_phases is None:
+        raise RuntimeError('Production boot phase enum missing')
+    bodies = 'typedef unsigned u32;\n' + boot_phases.group() + '\n' + block(
+        'centauri_t6050_boot_phase_for_control_stage', RECOVERY) + '\n' + bodies + '\n' + block(
+        'centauri_t6050_schedule_transport_recover', RECOVERY)
     variants = [('baseline', bodies),
+                ('negative-reuse-old-wake-reset', bodies.replace('rw->force_reset |= force_reset;', '(void)force_reset;')),
                 ('negative-skip-fence', bodies.replace('!centauri_t6050_domain_fence(c->recovery)', 'false')),
                 ('negative-skip-release', bodies.replace('ret = centauri_t6050_beta_call(c->recovery, true);', 'ret = 0;')),
                 ('negative-stale-state-saved', bodies.replace('fn[i]->state_saved &&', 'false && fn[i]->state_saved &&')),
                 ('negative-save-unreadable-fn', bodies.replace('(!fn_stopped || pci_save_state(fn[i]))', 'pci_save_state(fn[i])')),
                 ('negative-lost-pm-error', bodies.replace('error = centauri_t6050_wifi_pm_error(c);', 'error = 0;')),
-                ('negative-drop-new-generation', bodies.replace('rw->rerun = true;', 'rw->rerun = false;'))]
+                ('negative-drop-new-generation', bodies.replace('rw->rerun = true;', 'rw->rerun = false;')),
+                ('negative-recover-during-pm', bodies.replace(
+                    'if (!c || READ_ONCE(c->removing) || READ_ONCE(c->pm_prepared) ||\n\t    READ_ONCE(c->firmware_sleep))',
+                    'if (!c || READ_ONCE(c->removing))').replace(
+                    'if (READ_ONCE(c->removing) || c->pm_prepared || c->firmware_sleep ||',
+                    'if (READ_ONCE(c->removing) ||'))]
     ownership = '\n'.join(block(name) for name in [
         'apple_centauri_sleep_register', 'apple_centauri_sleep_unregister',
         'centauri_t6050_beta_call'])
@@ -540,6 +599,8 @@ def run():
             '\tif (!ret)\n\t\tret = centauri_t6050_beta_call(rw, true);',
             '\tdevice_unlock(&fn->dev);\n\tif (!ret)\n\t\tret = centauri_t6050_beta_call(rw, true);'))]
     failures = {
+        'negative-reuse-old-wake-reset': '!centauri_t6050_rewake_already_reset(&rw)',
+        'negative-recover-during-pm': '!queues && c.ipc==&ipc && !c.boot_work && !rw.force_reset',
         'negative-unlock-before-tuples': '!remove_done && original->dev.locked && rw->control==original',
         'negative-skip-fence': 'first(WIFI_STOP)<first(CLEAR)',
         'negative-skip-release': 'first(RELEASE)>first(FENCE) && first(FREE)>first(RELEASE)',

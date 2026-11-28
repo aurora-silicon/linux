@@ -23,6 +23,7 @@
 #include <linux/unaligned.h>
 
 #include "centauri_t6050.h"
+#include "centauri_recovery.h"
 
 /* Registry owns one reference, registrations and queued work own additional ones. */
 struct centauri_t6050_rewake {
@@ -31,7 +32,7 @@ struct centauri_t6050_rewake {
 	struct work_struct work;
 	struct pci_dev *bridge;
 	unsigned int slot;
-	bool active, rerun;
+	bool active, rerun, force_reset;
 	unsigned int generation, work_generation;
 	int error;
 	struct pci_dev *control;
@@ -159,7 +160,7 @@ void apple_centauri_sleep_unregister(struct pci_dev *fn)
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_unregister);
 
-void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
+void centauri_t6050_request_rewake(struct pci_dev *fn, int error, bool force_reset)
 {
 	struct centauri_t6050_rewake *rw;
 
@@ -171,6 +172,7 @@ void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
 			continue;
 		if (error && !rw->error)
 			rw->error = error;
+		rw->force_reset |= force_reset;
 		/* One owner and one work reference even while the work is running. */
 		if (rw->active && rw->generation != rw->work_generation)
 			rw->rerun = true;
@@ -182,6 +184,11 @@ void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
 		}
 		return;
 	}
+}
+
+void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
+{
+	centauri_t6050_request_rewake(fn, error, false);
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_recovery_needed);
 
@@ -475,8 +482,10 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 			break;
 		case CEN_BOOT_IPC:
 			ret = centauri_t6050_start_ipc(c, &beta);
-			if (!ret)
+			if (!ret) {
 				c->boot_phase = CEN_BOOT_READY;
+				c->transport_recover_count = 0;
+			}
 			break;
 		default:
 			goto out;
@@ -524,6 +533,8 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 	c->link_ready = true;
 	mutex_init(&c->boot_lock);
 	INIT_DELAYED_WORK(&c->boot_work, centauri_t6050_boot_worker);
+	if (IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI))
+		centauri_t6050_transport_recover_init(c);
 	c->boot_phase = CEN_BOOT_ROM;
 	ret = device_property_read_string(&pdev->dev, "firmware-name", &c->firmware_name);
 	if (ret)
@@ -795,6 +806,8 @@ static int centauri_t6050_quiesce(struct centauri_t6050 *c)
 	WRITE_ONCE(c->removing, true);
 	/* Pairs with control_ready: no new consumer can attach. */
 	smp_store_release(&c->ready, false);
+	if (IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI))
+		centauri_t6050_transport_recover_cancel(c);
 	cancel_delayed_work_sync(&c->boot_work);
 	/* Never hold boot_lock over an HCI close or Bluetooth work cancellation. */
 	ret = centauri_t6050_beta_call(c->recovery, false);
@@ -802,7 +815,7 @@ static int centauri_t6050_quiesce(struct centauri_t6050 *c)
 	centauri_t6050_wifi_unregister(c);
 	centauri_t6050_free_irqs(&c->alpha_irqs);
 	centauri_t6050_free_irqs(&c->irqs);
-	c->firmware_sleep = true;
+	WRITE_ONCE(c->firmware_sleep, true);
 	c->boot_phase = CEN_BOOT_STOPPED;
 	/*
 	 * A completed teardown already released every published DMA tuple. After
@@ -886,6 +899,19 @@ out:
 	return ret;
 }
 
+static bool centauri_t6050_rewake_already_reset(struct centauri_t6050_rewake *rw)
+{
+	bool force_reset;
+
+	mutex_lock(&cen_recovery_lock);
+	force_reset = rw->force_reset;
+	rw->force_reset = false;
+	mutex_unlock(&cen_recovery_lock);
+
+	/* A prior wake's reset does not recover a subsequent runtime wedge. */
+	return !force_reset && apple_pcie_t6050_warm_reset_done(rw->bridge);
+}
+
 /*
  * The functions are removed while their link is still up, then the warm reset, then the link
  * (if it went down, until it is back), then a new enumeration, all under the rescan lock: no
@@ -928,7 +954,7 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 	 * here, on a trained link, would take the link down for good: after a suspend that kept the
 	 * link the host takes the port down and up around the reset instead.
 	 */
-	if (apple_pcie_t6050_warm_reset_done(bridge)) {
+	if (centauri_t6050_rewake_already_reset(rw)) {
 		pci_dbg(bridge, "N1 after the sleep: reset by the host before its port came up\n");
 		ret = 0;
 	} else {
@@ -1007,6 +1033,7 @@ out:
 	}
 	rw->active = false;
 	rw->error = 0;
+	rw->force_reset = false;
 	mutex_unlock(&cen_recovery_lock);
 	kref_put(&rw->ref, centauri_t6050_owner_free);
 }
@@ -1106,7 +1133,7 @@ static int centauri_t6050_prepare(struct device *dev)
 	mutex_unlock(&cen_recovery_lock);
 	mutex_lock(&c->boot_lock);
 	centauri_t6050_wifi_pm_prepare(c);
-	c->pm_prepared = true;
+	WRITE_ONCE(c->pm_prepared, true);
 	mutex_unlock(&c->boot_lock);
 	return 0;
 }
@@ -1123,7 +1150,7 @@ static void centauri_t6050_complete(struct device *dev)
 	}
 	error = centauri_t6050_wifi_pm_error(c);
 	centauri_t6050_wifi_pm_complete(c);
-	c->pm_prepared = false;
+	WRITE_ONCE(c->pm_prepared, false);
 	mutex_unlock(&c->boot_lock);
 	/* Complete also runs if cfg80211 refused suspend before F0 suspend ran. */
 	if (error || c->firmware_sleep)

@@ -2,3 +2,4 @@
 obj-$(CONFIG_APPLE_CENTAURI) += apple_centauri.o
 apple_centauri-y := centauri_pci.o centauri_port.o centauri_ipc.o centauri_wifi.o
 obj-$(CONFIG_APPLE_CENTAURI_T6050) += t6050/
+obj-$(CONFIG_APPLE_CENTAURI_T6050_RECOVERY_KUNIT) += t6050/
