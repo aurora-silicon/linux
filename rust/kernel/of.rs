@@ -536,21 +536,6 @@ pub fn stdout() -> Option<Node> {
     }
 }
 
-#[allow(unused_variables)]
-/// Looks up a node in the device tree by phandle.
-pub fn find_node_by_phandle(handle: PHandle) -> Option<Node> {
-    #[cfg(not(CONFIG_OF))]
-    {
-        None
-    }
-    #[cfg(CONFIG_OF)]
-    // SAFETY: bindings::of_find_node_by_phandle always returns a valid pointer or NULL
-    unsafe {
-        #[allow(dead_code)]
-        Node::from_raw(bindings::of_find_node_by_phandle(handle))
-    }
-}
-
 impl Clone for Node {
     fn clone(&self) -> Node {
         // SAFETY: `raw_node` is valid and non-NULL per the type invariant,

@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Internal PCIe: BCM4388 Wi-Fi/Bluetooth on apcie port 0 and the GL9755 SD
- * card reader on port 2. As on J813, the bootloader trains the links and
- * Linux uses the root ports as a generic ECAM host that owns the DARTs and
- * the endpoints. Nothing programs the ports' RID-to-SID tables, so every
- * function uses stream zero of its port's DART. Ranges, MSI maps and DART
- * IRQs are from the J704 ADT; port 0 matches J813.
+ * Internal PCIe: BCM4388 Wi-Fi/Bluetooth on apcie port 0. As on J813, the
+ * bootloader trains the link and Linux uses the root port as a generic ECAM
+ * host that owns the DART and the endpoints. Nothing programs the port's
+ * RID-to-SID table, so both functions use stream zero of the port's DART.
+ * Ranges, the MSI map and the DART IRQ are from the J704 ADT; port 0
+ * matches J813.
+ *
+ * The GL9755 SD card reader sits on port 2 (ADT pci-bridge2, bus 2, MSI map
+ * at 0x48a028000, pcie2_dart). The bootloader trains port 0 only, so the
+ * ECAM window and the MSI controller stop at port 0 until port 2 is
+ * trained too.
  */
 
 &{/} {
@@ -14,15 +19,18 @@
 		device_type = "pci";
 		#address-cells = <3>;
 		#size-cells = <2>;
-		bus-range = <0 2>;
-		reg = <0x1c 0xb0000000 0 0x300000>;
+		bus-range = <0 1>;
+		reg = <0x1c 0xb0000000 0 0x200000>;
 		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000>,
 			 <0x02000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
 		dma-coherent;
 		msi-parent = <&pcie0_msi>;
+		/*
+		 * Port 2's root port (00:02.0) still enumerates on bus 0 and has no
+		 * entry here, so "no iommu-map translation for id 0x10" is expected.
+		 */
 		iommu-map = <0x100 &pcie0_dart 0 1>,
-			    <0x101 &pcie0_dart 0 1>,
-			    <0x200 &pcie2_dart 0 1>;
+			    <0x101 &pcie0_dart 0 1>;
 
 		port00: pci@0,0 {
 			device_type = "pci";
@@ -49,43 +57,22 @@
 				local-bd-address = [00 00 00 00 00 00];
 			};
 		};
-
-		port02: pci@2,0 {
-			device_type = "pci";
-			reg = <0x1000 0x0 0x0 0x0 0x0>;
-			bus-range = <2 2>;
-			#address-cells = <3>;
-			#size-cells = <2>;
-			ranges;
-
-			sdhci0: mmc@0,0 {
-				compatible = "pci17a0,9755";
-				reg = <0x20000 0x0 0x0 0x0 0x0>;
-				cd-inverted;
-				wp-inverted;
-			};
-		};
 	};
 };
 
 &{/soc} {
 	/*
-	 * The MSI maps of ports 0 and 2. They share the root complex's AIC
-	 * range (ADT msi-vector-offset 1741); 32 vectors are enough for both.
+	 * Port 0's MSI map (ADT msi-vector-offset 1741, port 0 owns the first
+	 * 32 vectors).
 	 */
 	pcie0_msi: msi-controller@488028000 {
 		compatible = "apple,t8142-pcie-msi";
-		reg = <0x4 0x88028000 0x0 0x8000>,
-		      <0x4 0x8a028000 0x0 0x8000>;
+		reg = <0x4 0x88028000 0x0 0x8000>;
 		msi-controller;
 		msi-ranges = <&aic AIC_IRQ 1741 IRQ_TYPE_EDGE_RISING 32>;
 	};
 };
 
 &pcie0_dart {
-	status = "okay";
-};
-
-&pcie2_dart {
 	status = "okay";
 };

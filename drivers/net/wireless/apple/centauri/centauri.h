@@ -6,6 +6,7 @@
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
+#include <linux/workqueue.h>
 
 #define CEN_ALPHA_SCRATCH_OFFSET SZ_8M
 #define CEN_ALPHA_SCRATCH_SIZE (5 * SZ_1M)
@@ -23,7 +24,7 @@ struct centauri {
 	void __iomem *bar;
 	resource_size_t size;
 	u32 stage_offset;
-	struct dentry *debug;
+	struct dentry *debug, *crash_file;
 	struct mutex boot_lock;
 	void *firmware, *descriptor, *msi_page;
 	dma_addr_t firmware_dma, descriptor_dma, msi_dma;
@@ -35,6 +36,14 @@ struct centauri {
 	bool link_ready;
 	struct centauri_ipc *ipc;
 	struct centauri_wifi *wifi;
+	/* Restart of a stopped firmware: requested by the Wi-Fi code, confirmed and run here */
+	struct delayed_work recover_work;
+	unsigned long recover_at[3];
+	bool removing;
+	bool recover_gave_up;	/* restart limit reached: requests are ignored */
+	bool restart_failed;	/* the last restart failed with the link up: try again */
+	bool warm_reset;	/* the root port describes the N1's warm reset: restart on a stop */
+	bool inject_stall;	/* debugfs test: the next check finds the firmware stopped */
 };
 
 /* One row per machine with an N1: the FTAB file name, the word written to BAR+0x807c,
@@ -92,12 +101,20 @@ static inline const struct centauri_board *centauri_board(void)
 	return NULL;
 }
 
-int centauri_port_cycle(struct pci_dev *pdev);
+int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret);
+bool centauri_warm_reset_described(struct pci_dev *pdev);
 int centauri_start_ipc(struct centauri *c);
+bool centauri_beta_running(struct centauri *c);
+bool centauri_stop_dma(struct pci_dev *pdev);
+bool centauri_stop_ipc(struct centauri *c);
 void centauri_free_ipc(struct centauri *c);
 int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *resources);
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size);
 int centauri_wifi_register(struct centauri *c);
 void centauri_wifi_unregister(struct centauri *c);
+int centauri_wifi_suspend(struct centauri *c);
+int centauri_wifi_resume(struct centauri *c);
 void centauri_wifi_kick(struct centauri *c);
+bool centauri_wifi_stalled(struct centauri *c);
+void centauri_recovery_request(struct centauri *c, const char *why);
 #endif

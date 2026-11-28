@@ -16,7 +16,8 @@ struct apple_dart_v27_lease;
  */
 struct apple_sleep_v27_ops {
 	int (*arm)(void *data);
-	int (*check)(void *data);
+	/* committed: called after the sleep's commit, right before stop. */
+	int (*check)(void *data, bool committed);
 	int (*stop)(void *data);
 	int (*disarm)(void *data, bool stopped);
 };
@@ -37,8 +38,10 @@ static inline void apple_sleep_v27_prepared(struct device *dev, bool prepared) {
 
 int apple_rtkit_v27_arm(struct apple_rtkit *, struct apple_rtkit_v27_scope **);
 bool apple_rtkit_v27_live(struct apple_rtkit *);
-int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *);
+int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *, bool committed);
 int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *);
+int apple_rtkit_v27_port_ap_idle_atomic(struct apple_rtkit *rtk, unsigned int us);
+void apple_rtkit_v27_set_after_ap(struct apple_rtkit_v27_scope *s, int (*fn)(void *), void *data);
 int apple_rtkit_v27_disarm(struct apple_rtkit_v27_scope *, bool stopped);
 
 int apple_dart_v27_claim(struct device *provider, struct device *firmware,

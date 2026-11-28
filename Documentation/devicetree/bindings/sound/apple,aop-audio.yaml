@@ -14,23 +14,43 @@ description: |
   calibration handoff determine its availability. It has no independent
   application-processor register window or interrupt.
 
+# Match on the first compatible only: T6041 and T8132 also list
+# apple,t6030-aop-audio as a fallback and are validated by
+# apple,t6041-aop-audio.yaml.
 select:
   properties:
     compatible:
-      contains:
-        enum:
-          - apple,t6020-aop-audio
-          - apple,t8112-aop-audio
+      minItems: 1
+      maxItems: 2
+      items:
+        - enum:
+            - apple,t6000-aop-audio
+            - apple,t6020-aop-audio
+            - apple,t6030-aop-audio
+            - apple,t6031-aop-audio
+            - apple,t8103-aop-audio
+            - apple,t8112-aop-audio
+            - apple,t8122-aop-audio
+      additionalItems: true
   required:
     - compatible
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,t6020-aop-audio
-          - apple,t8112-aop-audio
-      - const: apple,aop-audio
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6000-aop-audio
+              - apple,t6020-aop-audio
+              - apple,t8103-aop-audio
+              - apple,t8112-aop-audio
+          - const: apple,aop-audio
+      - const: apple,t6030-aop-audio
+      - items:
+          - enum:
+              - apple,t6031-aop-audio
+              - apple,t8122-aop-audio
+          - const: apple,t6030-aop-audio
 
   dmas:
     maxItems: 1
@@ -45,6 +65,10 @@ properties:
   apple,machine-kind:
     $ref: /schemas/types.yaml#/definitions/string
     description: Machine family used for the sound card identity.
+
+  apple,no-beamforming:
+    type: boolean
+    description: Disable microphone array beamforming on boards without it.
 
 required:
   - compatible

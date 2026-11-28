@@ -1,0 +1,758 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g displays: three controllers for the rear USB-C and HDMI ports,
+ * driven through
+ * the DCP firmware's iBoot interface (apple,t8152-dcp-iboot). The
+ * bootloader hands over running or quiesced RTKit sessions. Unused
+ * controllers can claim another USB-C monitor through the shared crossbar.
+ *
+ * Resources are from the 26A434 ADT: dcp (iop,ascwrap-v8, post-office
+ * mailbox 5 with alias: 0x316020000 + 2 * 5 * 0x80), dart-dcp (SID 23),
+ * dart-disp0 (scanout SID 0), and the atc-phyN PHY windows. The Gen3
+ * display DARTs stay locked by iBoot, each with its own live root, so the
+ * scanout stream is a child device with its own domain. Linux tables are
+ * published into vacant root slots, so the DMA window is the upper half of
+ * the 64 GiB vm-base window, above the firmware's and the bootloader's
+ * mappings.
+ */
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/*
+ * The display coprocessors' PMGR power states (ADT pmgr devices DISP_CPU,
+ * DISPEXT0_CPU and DISPEXT1_CPU), which their DARTs follow. The PMGR does not
+ * switch them for the AP: the coprocessor is started through its PSD service
+ * (coproc-psd below) and its firmware runs the state, so Linux only reads
+ * DISPEXT0_CPU (coproc-ps). They are the firmware's: the OS keeps them on and
+ * never accesses them.
+ */
+&pmgr {
+	ps_dispext1_cpu: power-controller@aa0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xaa0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext1_cpu";
+		apple,firmware-owned;
+	};
+
+	ps_dispext0_cpu: power-controller@e00 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xe00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_cpu";
+		apple,firmware-owned;
+	};
+
+	ps_disp_cpu: power-controller@14000 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x14000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_cpu";
+		apple,firmware-owned;
+	};
+};
+
+&dcp_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_disp_cpu>;
+	status = "okay";
+};
+
+&disp0_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_disp_cpu>;
+	status = "okay";
+};
+
+&dcpext0_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext0_cpu>;
+	status = "okay";
+};
+
+&dispext0_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext0_cpu>;
+	status = "okay";
+};
+
+&dcpext1_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext1_cpu>;
+	status = "okay";
+};
+
+&dispext1_dart {
+	reg-names = "dart", "dapf";
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	power-domains = <&ps_dispext1_cpu>;
+	status = "okay";
+};
+
+/ {
+	soc {
+		/*
+		 * ADT /arm-io/nub-spmi-a0 (gen 4): the USB-C PD controllers of
+		 * the three rear ports, each of which can carry the USB-C display.
+		 * Their event, sleep and wake sources are interrupts of this
+		 * controller (the ADT's), its own line is AIC 682. A connector's
+		 * display port leads to the port's display switch, which all
+		 * DCPs share.
+		 */
+		nub_spmi_a0: spmi@308908000 {
+			compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+			reg = <0x3 0x08908000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			/* back-middle */
+			hpm0: usb-pd@c {
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
+				reg = <0xc SPMI_USID>;
+				interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+					     <17 IRQ_TYPE_EDGE_RISING>,
+					     <19 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec0: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-middle";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec0_ss: endpoint {
+								remote-endpoint = <&atc0_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec0_display: endpoint {
+								remote-endpoint = <&display_typec0>;
+							};
+						};
+					};
+				};
+			};
+
+			/* back-left */
+			hpm1: usb-pd@a {
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
+				reg = <0xa SPMI_USID>;
+				interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+					     <43 IRQ_TYPE_EDGE_RISING>,
+					     <45 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec1: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-left";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec1_ss: endpoint {
+								remote-endpoint = <&atc1_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec1_display: endpoint {
+								remote-endpoint = <&display_typec1>;
+							};
+						};
+					};
+				};
+			};
+
+			/* back-right */
+			hpm3: usb-pd@8 {
+				compatible = "apple,t8152-sn201202x", "apple,t8132-sn201202x",
+					     "apple,sn201202x";
+				reg = <0x8 SPMI_USID>;
+				interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+					     <69 IRQ_TYPE_EDGE_RISING>,
+					     <71 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "irq", "sleep", "wake";
+
+				typec3: connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Back-right";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						/* USB: not linked to its controller yet */
+						port@0 {
+							reg = <0>;
+						};
+
+						/* SuperSpeed: the ATC PHY */
+						port@1 {
+							reg = <1>;
+
+							typec3_ss: endpoint {
+								remote-endpoint = <&atc3_phy_typec>;
+							};
+						};
+
+						/* DisplayPort: the DCPs' display switch */
+						port@3 {
+							reg = <3>;
+
+							typec3_display: endpoint {
+								remote-endpoint = <&display_typec3>;
+							};
+						};
+					};
+				};
+			};
+		};
+
+		/*
+		 * ADT aop-gpio. Its interrupts are the AOP's, so it has no
+		 * interrupt controller here; the HDMI HPD line is polled.
+		 */
+		pinctrl_aop: pinctrl@310824000 {
+			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x10824000 0x0 0x4000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_aop 0 0 77>;
+			apple,npins = <77>;
+		};
+
+		dcp_mbox: mailbox@316020500 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16020500 0x0 0x80>;
+			interrupts = <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 264 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		dcp_iboot: display@286e00000 {
+			compatible = "apple,t8152-dcp-iboot";
+			reg = <0x2 0x86e00000 0x0 0x74000>,
+			      <0x3 0x00020044 0x0 0x1c>,
+			      <0x3 0x1a760000 0x0 0x4000>,
+			      <0x3 0x00700460 0x0 0x4>;
+			/* aux: ADT dptx0-aux, aux-ps: PMGR GLOBAL_AUX_CTRL0 */
+			reg-names = "coproc", "dp-clock", "aux", "aux-ps";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+			mboxes = <&dcp_mbox>;
+			iommus = <&dcp_dart 23>;
+			power-domains = <&ps_disp_cpu>;
+			/*
+			 * Cacheable DMA, as iBoot maps DCP buffers: the firmware
+			 * faults on entries with the DART's no-cache bit.
+			 */
+			dma-coherent;
+			apple,dp-source = <0>;
+
+			/*
+			 * The display pipe's own stream: a separate device, so
+			 * its domain imports dart-disp0's root, not dart-dcp's.
+			 */
+			scanout {
+				iommus = <&disp0_dart 0>;
+				dma-coherent;
+			};
+
+			/*
+			 * USB-C back-middle: ADT atc-phy0. PS: the ATC's DP_0, DP_1 and
+			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
+			 */
+			usb-c@403000000 {
+				reg = <0x4 0x03000000 0x0 0x84000>,
+				      <0x3 0x08290000 0x0 0x104>,
+				      <0x3 0x03a13700 0x0 0xc0>;
+				reg-names = "atc", "atc-ps", "atc-psd";
+				apple,dfp-endpoint = <0>;
+				/* Powered while a DCP drives it */
+				phys = <&atc0_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
+				apple,tunable-pre =
+					/* ACIOPHY_CMN_DFLT */
+					<0x00800 0x00fc0000 0x00fc0000>,
+					<0x0084c 0x000ff800 0x000ff800>,
+					<0x0085c 0x000000ff 0x00000080>,
+					<0x00860 0x007fffff 0x0052bca4>,
+					<0x00864 0x02c00000 0x00800000>,
+					/* CIOPLL_CORE_DFLT */
+					<0x01614 0x0003ffc0 0x0001e5c0>,
+					<0x01640 0x00000007 0x00000003>,
+					<0x01668 0x00000ffc 0x000005f0>;
+				apple,tunable-post =
+					/* ATC_FABRIC */
+					<0x6c004 0x003f003f 0x00200020>,
+					<0x6c00c 0x000000f1 0x000000a1>,
+					<0x6c010 0x0000801f 0x00000004>,
+					<0x6c018 0x003f003f 0x00200020>,
+					<0x6c020 0x000000f1 0x000000a1>,
+					<0x6c024 0x0000801f 0x00000004>,
+					<0x6c02c 0x007f007f 0x00410041>,
+					<0x6c034 0x000000f1 0x00000071>,
+					<0x6c038 0x0000801f 0x00000004>,
+					<0x6c040 0x0000001f 0x00000010>,
+					<0x6c048 0x0000801f 0x00000004>,
+					<0x6c050 0x007f007f 0x00450045>,
+					<0x6c058 0x000000f1 0x00000051>,
+					<0x6c05c 0x0000801f 0x00000004>,
+					<0x6c064 0x0000003f 0x00000020>,
+					<0x6c06c 0x0000801f 0x00000004>,
+					<0x6c074 0x00000001 0x00000001>,
+					<0x6c078 0x0000801f 0x00000004>,
+					<0x6c080 0x001f001f 0x00100010>,
+					<0x6c084 0x000000f1 0x00000011>,
+					<0x6c088 0x00000001 0x00000001>,
+					<0x6c08c 0x00000001 0x00000001>,
+					<0x6c090 0x0000801f 0x00000004>,
+					<0x6c098 0x001f001f 0x00100010>,
+					<0x6c09c 0x000000f1 0x00000011>,
+					<0x6c0a0 0x0000801f 0x00000004>,
+					<0x6c0a8 0x000000ff 0x000000a0>,
+					<0x6c0ac 0x0000801f 0x00000004>,
+					<0x6c0b4 0x0000003f 0x00000020>,
+					<0x6c0bc 0x0000801f 0x00000004>,
+					<0x6c0c4 0x0000003f 0x00000020>,
+					<0x6c0cc 0x0000801f 0x00000004>,
+					<0x6c0d4 0x0000000f 0x00000008>,
+					<0x6c0d8 0x0000801f 0x00000004>,
+					<0x6c0e0 0x001f001f 0x00180018>,
+					<0x6c0e4 0x0000801f 0x00000004>,
+					<0x6c0ec 0x001f001f 0x00180018>,
+					<0x6c0f0 0x0000801f 0x00000004>,
+					<0x6c0f8 0x001f001f 0x00180018>,
+					<0x6c0fc 0x0000801f 0x00000004>,
+					<0x6c104 0x001f001f 0x00180018>,
+					<0x6c108 0x0000801f 0x00000004>,
+					<0x6c110 0x00000001 0x00000001>,
+					<0x6c114 0x0000801f 0x00000004>,
+					<0x6c11c 0x0000801f 0x00000004>,
+					<0x6c124 0x0000801f 0x00000004>,
+					<0x6c12c 0x0000801f 0x00000004>,
+					<0x6c134 0x0000801f 0x00000004>,
+					<0x6c13c 0xffffffff 0x01010101>,
+					<0x6c140 0x0000801f 0x00000004>,
+					<0x6c148 0x0000801f 0x00000004>,
+					<0x6c150 0xffffffff 0x01010101>,
+					<0x6c154 0x0000ffff 0x00000101>,
+					<0x6c158 0x0000801f 0x00000004>,
+					<0x6c160 0x0000801f 0x00000004>,
+					<0x6c168 0x0000801f 0x00000004>,
+					<0x6c170 0x0000801f 0x00000004>,
+					<0x6c178 0x0000801f 0x00000004>,
+					<0x6c180 0xffffffff 0x01010101>,
+					<0x6c184 0x0000801f 0x00000004>,
+					<0x6c18c 0x0000801f 0x00000004>,
+					<0x6c194 0x0000801f 0x00000004>,
+					/* DPPLL_CORE_DFLT */
+					<0x01040 0x0000000c 0x00000008>,
+					<0x01060 0x0001c000 0x0000c000>,
+					<0x01098 0x00000f00 0x00000800>,
+					<0x0109c 0x000fe000 0x000fe000>,
+					<0x01108 0x07c00000 0x04000000>,
+					<0x0110c 0x0000007c 0x00000010>,
+					/* DPPLL_TOP_DFLT */
+					<0x00e8c 0x0000007f 0x0000003c>,
+					<0x00e9c 0x0000007f 0x00000032>,
+					<0x00eac 0x0000007f 0x00000032>,
+					<0x00ebc 0x0000007f 0x0000005a>,
+					/* ASDC_AUX_SHM_DFLT */
+					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec0: endpoint {
+						remote-endpoint = <&typec0_display>;
+					};
+				};
+			};
+
+			/*
+			 * USB-C back-left: ADT atc-phy1. PS: the ATC's DP_0, DP_1 and
+			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
+			 */
+			usb-c@40b000000 {
+				reg = <0x4 0x0b000000 0x0 0x84000>,
+				      <0x3 0x08290040 0x0 0x104>,
+				      <0x3 0x03a13800 0x0 0xc0>;
+				reg-names = "atc", "atc-ps", "atc-psd";
+				apple,dfp-endpoint = <1>;
+				/* Powered while a DCP drives it */
+				phys = <&atc1_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
+				apple,tunable-pre =
+					/* ACIOPHY_CMN_DFLT */
+					<0x00800 0x00fc0000 0x00fc0000>,
+					<0x0084c 0x000ff800 0x000ff800>,
+					<0x0085c 0x000000ff 0x00000080>,
+					<0x00860 0x007fffff 0x0052bc26>,
+					<0x00864 0x02c00000 0x00800000>,
+					/* CIOPLL_CORE_DFLT */
+					<0x01614 0x0003ffc0 0x0001e5c0>,
+					<0x01640 0x00000007 0x00000003>,
+					<0x01668 0x00000ffc 0x000005f0>;
+				apple,tunable-post =
+					/* ATC_FABRIC */
+					<0x6c004 0x003f003f 0x00200020>,
+					<0x6c00c 0x000000f1 0x000000a1>,
+					<0x6c010 0x0000801f 0x00000004>,
+					<0x6c018 0x003f003f 0x00200020>,
+					<0x6c020 0x000000f1 0x000000a1>,
+					<0x6c024 0x0000801f 0x00000004>,
+					<0x6c02c 0x007f007f 0x00410041>,
+					<0x6c034 0x000000f1 0x00000071>,
+					<0x6c038 0x0000801f 0x00000004>,
+					<0x6c040 0x0000001f 0x00000010>,
+					<0x6c048 0x0000801f 0x00000004>,
+					<0x6c050 0x007f007f 0x00450045>,
+					<0x6c058 0x000000f1 0x00000051>,
+					<0x6c05c 0x0000801f 0x00000004>,
+					<0x6c064 0x0000003f 0x00000020>,
+					<0x6c06c 0x0000801f 0x00000004>,
+					<0x6c074 0x00000001 0x00000001>,
+					<0x6c078 0x0000801f 0x00000004>,
+					<0x6c080 0x001f001f 0x00100010>,
+					<0x6c084 0x000000f1 0x00000011>,
+					<0x6c088 0x00000001 0x00000001>,
+					<0x6c08c 0x00000001 0x00000001>,
+					<0x6c090 0x0000801f 0x00000004>,
+					<0x6c098 0x001f001f 0x00100010>,
+					<0x6c09c 0x000000f1 0x00000011>,
+					<0x6c0a0 0x0000801f 0x00000004>,
+					<0x6c0a8 0x000000ff 0x000000a0>,
+					<0x6c0ac 0x0000801f 0x00000004>,
+					<0x6c0b4 0x0000003f 0x00000020>,
+					<0x6c0bc 0x0000801f 0x00000004>,
+					<0x6c0c4 0x0000003f 0x00000020>,
+					<0x6c0cc 0x0000801f 0x00000004>,
+					<0x6c0d4 0x0000000f 0x00000008>,
+					<0x6c0d8 0x0000801f 0x00000004>,
+					<0x6c0e0 0x001f001f 0x00180018>,
+					<0x6c0e4 0x0000801f 0x00000004>,
+					<0x6c0ec 0x001f001f 0x00180018>,
+					<0x6c0f0 0x0000801f 0x00000004>,
+					<0x6c0f8 0x001f001f 0x00180018>,
+					<0x6c0fc 0x0000801f 0x00000004>,
+					<0x6c104 0x001f001f 0x00180018>,
+					<0x6c108 0x0000801f 0x00000004>,
+					<0x6c110 0x00000001 0x00000001>,
+					<0x6c114 0x0000801f 0x00000004>,
+					<0x6c11c 0x0000801f 0x00000004>,
+					<0x6c124 0x0000801f 0x00000004>,
+					<0x6c12c 0x0000801f 0x00000004>,
+					<0x6c134 0x0000801f 0x00000004>,
+					<0x6c13c 0xffffffff 0x01010101>,
+					<0x6c140 0x0000801f 0x00000004>,
+					<0x6c148 0x0000801f 0x00000004>,
+					<0x6c150 0xffffffff 0x01010101>,
+					<0x6c154 0x0000ffff 0x00000101>,
+					<0x6c158 0x0000801f 0x00000004>,
+					<0x6c160 0x0000801f 0x00000004>,
+					<0x6c168 0x0000801f 0x00000004>,
+					<0x6c170 0x0000801f 0x00000004>,
+					<0x6c178 0x0000801f 0x00000004>,
+					<0x6c180 0xffffffff 0x01010101>,
+					<0x6c184 0x0000801f 0x00000004>,
+					<0x6c18c 0x0000801f 0x00000004>,
+					<0x6c194 0x0000801f 0x00000004>,
+					/* DPPLL_CORE_DFLT */
+					<0x01040 0x0000000c 0x00000008>,
+					<0x01060 0x0001c000 0x0000c000>,
+					<0x01098 0x00000f00 0x00000800>,
+					<0x0109c 0x000fe000 0x000fe000>,
+					<0x01108 0x07c00000 0x04000000>,
+					<0x0110c 0x0000007c 0x00000010>,
+					/* DPPLL_TOP_DFLT */
+					<0x00e8c 0x0000007f 0x0000003c>,
+					<0x00e9c 0x0000007f 0x00000032>,
+					<0x00eac 0x0000007f 0x00000032>,
+					<0x00ebc 0x0000007f 0x0000005a>,
+					/* ASDC_AUX_SHM_DFLT */
+					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec1: endpoint {
+						remote-endpoint = <&typec1_display>;
+					};
+				};
+			};
+
+			/*
+			 * USB-C back-right: ADT atc-phy3. PS: the ATC's DP_0, DP_1 and
+			 * USB_AON power states (+0, +0x20, +0x100), PSD: its common
+			 * domain, read to tell whether the PHY runs; the ATC PHY
+			 * driver powers them while the DP PHY is on. Tunables before
+			 * and after the lane crossbar setup. The node is also the
+			 * port's display switch for all DCPs.
+			 */
+			usb-c@413000000 {
+				reg = <0x4 0x13000000 0x0 0x84000>,
+				      <0x3 0x082900c0 0x0 0x104>,
+				      <0x3 0x03a13a00 0x0 0xc0>;
+				reg-names = "atc", "atc-ps", "atc-psd";
+				apple,dfp-endpoint = <3>;
+				/* Powered while a DCP drives it */
+				phys = <&atc3_phy PHY_TYPE_DP>;
+				/* The DCPs' display switch of the port */
+				mode-switch;
+				apple,tunable-pre =
+					/* ACIOPHY_CMN_DFLT */
+					<0x00800 0x00fc0000 0x00fc0000>,
+					<0x0084c 0x000ff800 0x000ff800>,
+					<0x0085c 0x000000ff 0x00000080>,
+					<0x00860 0x007fffff 0x0052bc26>,
+					<0x00864 0x02c00000 0x00800000>,
+					/* CIOPLL_CORE_DFLT */
+					<0x01614 0x0003ffc0 0x0001e5c0>,
+					<0x01640 0x00000007 0x00000003>,
+					<0x01668 0x00000ffc 0x000005f0>;
+				apple,tunable-post =
+					/* ATC_FABRIC */
+					<0x6c004 0x003f003f 0x00200020>,
+					<0x6c00c 0x000000f1 0x000000a1>,
+					<0x6c010 0x0000801f 0x00000004>,
+					<0x6c018 0x003f003f 0x00200020>,
+					<0x6c020 0x000000f1 0x000000a1>,
+					<0x6c024 0x0000801f 0x00000004>,
+					<0x6c02c 0x007f007f 0x00410041>,
+					<0x6c034 0x000000f1 0x00000071>,
+					<0x6c038 0x0000801f 0x00000004>,
+					<0x6c040 0x0000001f 0x00000010>,
+					<0x6c048 0x0000801f 0x00000004>,
+					<0x6c050 0x007f007f 0x00450045>,
+					<0x6c058 0x000000f1 0x00000051>,
+					<0x6c05c 0x0000801f 0x00000004>,
+					<0x6c064 0x0000003f 0x00000020>,
+					<0x6c06c 0x0000801f 0x00000004>,
+					<0x6c074 0x00000001 0x00000001>,
+					<0x6c078 0x0000801f 0x00000004>,
+					<0x6c080 0x001f001f 0x00100010>,
+					<0x6c084 0x000000f1 0x00000011>,
+					<0x6c088 0x00000001 0x00000001>,
+					<0x6c08c 0x00000001 0x00000001>,
+					<0x6c090 0x0000801f 0x00000004>,
+					<0x6c098 0x001f001f 0x00100010>,
+					<0x6c09c 0x000000f1 0x00000011>,
+					<0x6c0a0 0x0000801f 0x00000004>,
+					<0x6c0a8 0x000000ff 0x000000a0>,
+					<0x6c0ac 0x0000801f 0x00000004>,
+					<0x6c0b4 0x0000003f 0x00000020>,
+					<0x6c0bc 0x0000801f 0x00000004>,
+					<0x6c0c4 0x0000003f 0x00000020>,
+					<0x6c0cc 0x0000801f 0x00000004>,
+					<0x6c0d4 0x0000000f 0x00000008>,
+					<0x6c0d8 0x0000801f 0x00000004>,
+					<0x6c0e0 0x001f001f 0x00180018>,
+					<0x6c0e4 0x0000801f 0x00000004>,
+					<0x6c0ec 0x001f001f 0x00180018>,
+					<0x6c0f0 0x0000801f 0x00000004>,
+					<0x6c0f8 0x001f001f 0x00180018>,
+					<0x6c0fc 0x0000801f 0x00000004>,
+					<0x6c104 0x001f001f 0x00180018>,
+					<0x6c108 0x0000801f 0x00000004>,
+					<0x6c110 0x00000001 0x00000001>,
+					<0x6c114 0x0000801f 0x00000004>,
+					<0x6c11c 0x0000801f 0x00000004>,
+					<0x6c124 0x0000801f 0x00000004>,
+					<0x6c12c 0x0000801f 0x00000004>,
+					<0x6c134 0x0000801f 0x00000004>,
+					<0x6c13c 0xffffffff 0x01010101>,
+					<0x6c140 0x0000801f 0x00000004>,
+					<0x6c148 0x0000801f 0x00000004>,
+					<0x6c150 0xffffffff 0x01010101>,
+					<0x6c154 0x0000ffff 0x00000101>,
+					<0x6c158 0x0000801f 0x00000004>,
+					<0x6c160 0x0000801f 0x00000004>,
+					<0x6c168 0x0000801f 0x00000004>,
+					<0x6c170 0x0000801f 0x00000004>,
+					<0x6c178 0x0000801f 0x00000004>,
+					<0x6c180 0xffffffff 0x01010101>,
+					<0x6c184 0x0000801f 0x00000004>,
+					<0x6c18c 0x0000801f 0x00000004>,
+					<0x6c194 0x0000801f 0x00000004>,
+					/* DPPLL_CORE_DFLT */
+					<0x01040 0x0000000c 0x00000008>,
+					<0x01060 0x0001c000 0x0000c000>,
+					<0x01098 0x00000f00 0x00000800>,
+					<0x0109c 0x000fe000 0x000fe000>,
+					<0x01108 0x07c00000 0x04000000>,
+					<0x0110c 0x0000007c 0x00000010>,
+					/* DPPLL_TOP_DFLT */
+					<0x00e8c 0x0000007f 0x0000003c>,
+					<0x00e9c 0x0000007f 0x00000032>,
+					<0x00eac 0x0000007f 0x00000032>,
+					<0x00ebc 0x0000007f 0x0000005a>,
+					/* ASDC_AUX_SHM_DFLT */
+					<0x02308 0x000000fc 0x00000084>;
+
+				port {
+					display_typec3: endpoint {
+						remote-endpoint = <&typec3_display>;
+					};
+				};
+			};
+
+		};
+
+		/*
+		 * DCPEXT0 (post-office mailbox 6) can drive USB-C, or the dedicated
+		 * dptx-phy through the PS190 converter. ADT dcpext0,
+		 * dart-dcpext0 and dart-dispext0.
+		 */
+		dcpext_mbox: mailbox@316020600 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16020600 0x0 0x80>;
+			interrupts = <AIC_IRQ 305 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 265 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		dcpext_iboot: display@32ae00000 {
+			compatible = "apple,t8152-dcp-iboot";
+			reg = <0x3 0x2ae00000 0x0 0x74000>,
+			      <0x3 0x1a740000 0x0 0x10000>,
+			      <0x3 0x1a700000 0x0 0x4000>,
+			      <0x3 0x1a764000 0x0 0x4000>,
+			      <0x3 0x00700480 0x0 0x4>,
+			      <0x3 0x007016c0 0x0 0x4>,
+			      <0x3 0x00700e00 0x0 0x4>,
+			      <0x3 0x03a12c00 0x0 0xc0>,
+			      <0x3 0x03a10500 0x0 0xc0>;
+			/* aux: ADT dptx1-aux, aux-ps: PMGR GLOBAL_AUX_CTRL1 */
+			/* PMGR DPTX_PHY, read-only DISPEXT0_CPU, PSD service 5 (dptx-phy) */
+			reg-names = "coproc", "phy-core", "phy-apb", "aux", "aux-ps",
+				    "phy-ps", "coproc-ps", "coproc-psd", "phy-psd";
+			mboxes = <&dcpext_mbox>;
+			iommus = <&dcpext0_dart 23>;
+			power-domains = <&ps_dispext0_cpu>;
+			dma-coherent;
+			apple,dp-source = <1>;
+			apple,usb-c-ports = <&dcp_iboot>;
+			apple,hdmi;
+			/* ADT dp2hdmi-gpio0 function-hdmi_hpd */
+			hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
+			/* function-dp2hdmi_pwr_en, function-hdmi_pwr_en (SMC pcIO) */
+			apple,smc = <&smc>;
+			apple,pcon-power = <0x7063494f 0x00140000 0x00000001>,
+					   <0x7063494f 0x000f0000 0x00800001>;
+			/* ADT dptx-phy tunables, in AppleT8152DPTXPort::handleSetTunables order */
+			apple,tunable-phy = <0x5180 0x1fff000 0x723000>,
+					    <0x5184 0xffffffff 0x2bc>,
+					    <0x7980 0x1fff000 0x723000>,
+					    <0x7984 0xffffffff 0x2bc>,
+					    <0xa180 0x1fff000 0x723000>,
+					    <0xa184 0xffffffff 0x2bc>,
+					    <0xc980 0x1fff000 0x723000>,
+					    <0xc984 0xffffffff 0x2bc>,
+					    <0x4524 0x3800000 0x2800000>,
+					    <0x6d24 0x3800000 0x2800000>,
+					    <0x9524 0x3800000 0x2800000>,
+					    <0xbd24 0x3800000 0x2800000>,
+					    <0x840 0xc 0x8>,
+					    <0x860 0x1c000 0xc000>,
+					    <0x898 0xf00 0x800>,
+					    <0x89c 0xfe000 0xfe000>,
+					    <0x908 0x7c00000 0x4000000>,
+					    <0x90c 0x7c 0x10>,
+					    <0x68c 0x7f 0x3c>,
+					    <0x69c 0x7f 0x32>,
+					    <0x6ac 0x7f 0x32>,
+					    <0x6bc 0x7f 0x5a>,
+					    <0x1408 0xfc 0x84>,
+					    <0x1c4c 0xff800 0xff800>,
+					    <0x1c5c 0xff 0x80>,
+					    <0x1c60 0x7fffff 0x52bba7>,
+					    <0x1c64 0x2c00000 0x800000>;
+
+			scanout {
+				iommus = <&dispext0_dart 0>;
+				dma-coherent;
+			};
+
+		};
+
+		dcpext1_mbox: mailbox@316020700 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16020700 0x0 0x80>;
+			interrupts = <AIC_IRQ 306 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 266 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		/* ADT dcpext1: crossbar UFP2, firmware SID23, scanout SID0. */
+		dcpext1_iboot: display@502e00000 {
+			compatible = "apple,t8152-dcp-iboot";
+			reg = <0x5 0x02e00000 0x0 0x74000>,
+			      <0x3 0x03a12d00 0x0 0xc0>;
+			reg-names = "coproc", "coproc-psd";
+			mboxes = <&dcpext1_mbox>;
+			iommus = <&dcpext1_dart 23>;
+			power-domains = <&ps_dispext1_cpu>;
+			dma-coherent;
+			apple,dp-source = <2>;
+			apple,usb-c-ports = <&dcp_iboot>;
+
+			scanout {
+				iommus = <&dispext1_dart 0>;
+				dma-coherent;
+			};
+
+		};
+
+	};
+};

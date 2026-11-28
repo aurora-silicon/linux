@@ -380,15 +380,23 @@ struct DCP_FW_NAME(dcp_map_reg_resp) {
 
 
 struct apple_dcp;
+struct drm_plane_state;
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
-			       struct drm_crtc_state *crtc_state);
+			       struct drm_crtc_state *crtc_state
+#if DCP_FW_H17(DCP_FW_VER)
+			       , struct drm_plane_state *primary
+#endif
+			       );
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp);
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp);
+#endif
 #if DCP_FW_H17(DCP_FW_VER)
 int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp);
 int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_calls, bool oob);

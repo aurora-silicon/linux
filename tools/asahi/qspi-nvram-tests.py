@@ -32,11 +32,8 @@ PREFIX = r'''
 #include <stdio.h>
 #include <errno.h>
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
-typedef uint64_t resource_size_t;
-struct device_node { const char *compatible; };
-static const char *machine;
-static bool of_device_is_compatible(struct device_node *node,const char *compat){return !strcmp(node->compatible,compat);}
-static bool of_machine_is_compatible(const char *compat){return !strcmp(machine,compat);}
+#define SZ_2M 0x200000
+#define SZ_8M 0x800000
 #define EOPNOTSUPP 95
 #define GFP_KERNEL 0
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
@@ -49,6 +46,10 @@ static bool of_machine_is_compatible(const char *compat){return !strcmp(machine,
 #define SPI_MEM_OP_ADDR(n,a,w) { .val=a,.nbytes=n,.buswidth=w }
 #define SPI_MEM_OP_NO_ADDR {0}
 #define SPI_MEM_OP_NO_DUMMY {0}
+#define SPI_MEM_OP_DUMMY(n,w) { .nbytes=n,.buswidth=w }
+#define get_unaligned_le32(p) ((u32)((const u8*)(p))[0]|(u32)((const u8*)(p))[1]<<8|(u32)((const u8*)(p))[2]<<16|(u32)((const u8*)(p))[3]<<24)
+static int info_count;
+#define dev_info(device,...) (info_count++)
 #define SPI_MEM_OP_DATA_IN(n,b,w) { .nbytes=n,.buf.in=b,.buswidth=w,.dir=SPI_MEM_DATA_IN }
 #define SPI_MEM_OP_NO_DATA {0}
 #define SPI_MEM_OP(c,a,d,v) { .cmd=c,.addr=a,.dummy=d,.data=v }
@@ -68,10 +69,12 @@ static int kstrtobool(const char*s,bool*v){if(!strcmp(s,"Y"))*v=true;else if(!st
 static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->arg?'Y':'N';return 1;}
 struct apple_qspi {
  bool nvram_policy, nvram_write_candidate, write_fault, nvram_window;
- u64 window_start, window_end;
- u8 jedec[3]; u8 jedec_alt[3]; u8 bp_ok;
+ int qualified; const char *qualify_denial;
+ u64 window_start, window_end, write_start, write_end;
  int irq;
 };
+/* The flash model admits only the window, which the controls set. */
+static struct apple_qspi q;
 struct spi_controller;
 struct device { struct device *parent; struct spi_controller *controller; };
 struct spi_controller { struct apple_qspi *q; bool auto_runtime_pm; struct device dev; };
@@ -92,7 +95,18 @@ static bool spi_mem_default_supports_op(struct spi_mem*m,const struct spi_mem_op
 static bool deny_alloc;
 static void *kmalloc(size_t n,int flags){return deny_alloc?NULL:malloc(n);}
 #define kfree free
+static void *memchr_inv(const void*p,int c,size_t n){const u8*b=p;for(size_t i=0;i<n;i++)if(b[i]!=(u8)c)return (void*)(b+i);return NULL;}
 static u8 flash[0x800000], sr[3], jedec[3]={0xef,0x65,0x17};
+/* The SFDP space: header, the basic table's header, and at 0x30 its first two DWORDs. */
+static u8 sfdp[0x40];static unsigned int sfdp_reads;
+static void sfdp_set(u32 dword2){
+ memset(sfdp,0xff,sizeof(sfdp));memcpy(sfdp,"SFDP",4);sfdp[4]=6;sfdp[5]=1;sfdp[6]=0;sfdp[7]=0xff;
+ sfdp[8]=0;sfdp[9]=6;sfdp[10]=1;sfdp[11]=16;sfdp[12]=0x30;sfdp[13]=0;sfdp[14]=0;sfdp[15]=0xff;
+ sfdp[0x30]=0xe5;sfdp[0x31]=0x20;sfdp[0x32]=0xf1;sfdp[0x33]=0xff;
+ sfdp[0x34]=dword2;sfdp[0x35]=dword2>>8;sfdp[0x36]=dword2>>16;sfdp[0x37]=dword2>>24;
+}
+/* A v3 NVRAM store header at the start of a bank. */
+static void store_at(u64 at){memset(flash+at,0,24);memcpy(flash+at,"3VVN",4);flash[at+5]=0x40;flash[at+14]=1;}
 static unsigned int wire[4096],wire_count,fail_opcode;
 static bool corrupt_readback,stuck_busy,programmed;
 static unsigned int pm_refs,busy_calls,busy_wire;
@@ -105,6 +119,8 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
  if(o->cmd.opcode==fail_opcode)return -EIO;
  switch(o->cmd.opcode){
  case 0x9f:memcpy(o->data.buf.in,jedec,o->data.nbytes);break;
+ case 0x5a:assert(o->addr.nbytes==3&&o->dummy.nbytes==1&&o->addr.val+o->data.nbytes<=sizeof(sfdp));
+  memcpy(o->data.buf.in,sfdp+o->addr.val,o->data.nbytes);sfdp_reads++;break;
  case 0x05:*(u8*)o->data.buf.in=sr[0]|(stuck_busy&&programmed?1:0);break;
  case 0x35:assert(jedec[0]!=0xc2);*(u8*)o->data.buf.in=sr[1];break;
  case 0x15:*(u8*)o->data.buf.in=sr[2];break;
@@ -116,10 +132,10 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
  case 0x06:assert(!(sr[0]&3));sr[0]|=2;break;
  case 0x04:sr[0]&=~2;break;
  case 0x02:
-  assert(sr[0]&2);assert(o->addr.val>=0x700000&&o->addr.val+o->data.nbytes<=0x800000);
+  assert(sr[0]&2);assert(o->addr.val>=q.window_start&&o->addr.val+o->data.nbytes<=q.window_end);
   for(unsigned int i=0;i<o->data.nbytes;i++)flash[o->addr.val+i]&=((const u8*)o->data.buf.out)[i];
   sr[0]&=~2;programmed=true;break;
- case 0x20:assert(sr[0]&2);assert(o->addr.val>=0x700000&&o->addr.val+4096<=0x800000);
+ case 0x20:assert(sr[0]&2);assert(o->addr.val>=q.window_start&&o->addr.val+4096<=q.window_end);
   memset(flash+o->addr.val,0xff,4096);sr[0]&=~2;programmed=true;break;
  default:assert(!"forbidden opcode reached the wire");
  }return 0;
@@ -134,13 +150,15 @@ static struct spi_device spi={&ctl};
 static struct spi_mem mem={&spi};
 static struct kernel_param parameter={&read_only};
 static void reset(void){
- memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_policy=true,.nvram_write_candidate=true,.window_start=0x700000,.window_end=0x800000,.jedec={0xef,0x65,0x17}};
+ memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_policy=true,.nvram_write_candidate=true,.window_start=0x700000,.window_end=0x800000,.write_start=0x700000,.write_end=0x800000,.qualified=1};sfdp_set(0x03ffffff);sfdp_reads=0;info_count=0;
  read_only=true;runtime_ready=false;write_fault_latched=false;wire_count=0;fail_opcode=0;spi.cs=0;
  corrupt_readback=false;stuck_busy=false;programmed=false;deny_alloc=false;jiffies=0;
  jedec[0]=0xef;jedec[1]=0x65;jedec[2]=0x17;
  ctl.auto_runtime_pm=false;ctl.dev.parent=&parent;
  pm_refs=busy_calls=busy_wire=0;
 }
+/* A window already qualified with nothing protected, unless a test clears q.qualified. */
+static void window(u64 start,u64 end){q.window_start=q.write_start=start;q.window_end=q.write_end=end;}
 static struct spi_mem_op program(u64 addr,unsigned int n,const u8*b){
  struct spi_mem_op o=SPI_MEM_OP(SPI_MEM_OP_CMD(0x02,1),SPI_MEM_OP_ADDR(3,addr,1),SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  o.data.nbytes=n;o.data.dir=SPI_MEM_DATA_OUT;o.data.buswidth=1;o.data.buf.out=b;return o;
@@ -149,49 +167,48 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
- const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j616s","apple,j714"};
- const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi","apple,t6041-qspi"};
- const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0x429118000ULL,0xad118000ULL,0x3ad118004ULL,0x429118800ULL};
- for(unsigned int b=0;b<ARRAY_SIZE(boards);b++){
-  machine=boards[b];
-  for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
-   struct device_node node={controllers[c]};
-   for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
-    assert(!!apple_qspi_nvram_write_board(&node,bases[a])==(b<4&&b==c&&c==a));
-  }
+ const u8 known[][3]={{0xef,0x65,0x17},{0xc2,0x2b,0x27},{0xef,0x65,0x15},{0xc8,0x83,0x15},{0xc8,0x83,0x17}};
+ const u32 sizes[]={0x800000,0x800000,0x200000,0x200000,0x800000};
+ const u8 tolerated[]={0,0,0x1c,0x1c,0};
+ for(unsigned int i=0;i<ARRAY_SIZE(known);i++){
+  const struct apple_qspi_part *part=apple_qspi_find_part(known[i]);
+  assert(part&&part->size==sizes[i]&&part->bp_ok==tolerated[i]);
  }
- const struct apple_qspi_board *qb;
- struct device_node t6041={"apple,t6041-qspi"},t8140={"apple,t8140-qspi"};
- machine="apple,j616s";qb=apple_qspi_nvram_write_board(&t6041,0x429118000ULL);
- assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&qb->jedec[0]==0xc2&&qb->jedec[1]==0x2b&&qb->jedec[2]==0x27&&!qb->bp_ok);
- assert(qb->jedec_alt[0]==0xef&&qb->jedec_alt[1]==0x65&&qb->jedec_alt[2]==0x17);
- machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
- assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
- assert(qb->jedec_alt[0]==0xc8&&qb->jedec_alt[1]==0x83&&qb->jedec_alt[2]==0x15);
- puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
+ const u8 unknown[][3]={{0xef,0x65,0x16},{0xef,0x65,0x18},{0xc2,0x2b,0x28},{0xc8,0x60,0x15},{0xef,0x40,0x17},{0,0,0},{0xff,0xff,0xff}};
+ for(unsigned int i=0;i<ARRAY_SIZE(unknown);i++)assert(!apple_qspi_find_part(unknown[i]));
+ puts("PASS part table: W25Q64, Macronix 2B27, W25Q16, GD25UF16E and GD25UF64E with their size and tolerated BP bits; other IDs refused");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  /* T8140 (J700) shares the verified policy at its DT nvram window; its data
   * reads pass without the opt-in. This synthetic window shares the flash
   * model's range; KUnit covers the J700 partition's exact bounds. */
- q.nvram_window=true;q.bp_ok=0x1c;
+ q.nvram_window=true;
  u8 rdbuf[4];struct spi_mem_op t8140_read=SPI_MEM_OP(SPI_MEM_OP_CMD(0x03,1),SPI_MEM_OP_ADDR(3,0x10,1),SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(4,rdbuf,1));
  assert(!apple_qspi_mem_exec_op(&mem,&t8140_read) && wire_count==1);
  wire_count=0;assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
- struct spi_mem_op window_program=program(0x700000,256,data);
+ memcpy(jedec,(u8[]){0xef,0x65,0x15},3);window(0x24000,0x1f4000);
+ struct spi_mem_op window_program=program(0x24000,256,data);
  assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && !wire_count);
  arm();sr[0]=4;
  assert(!apple_qspi_mem_exec_op(&mem,&wren) && !wire_count);
  assert(!apple_qspi_mem_exec_op(&mem,&window_program) && sent(0x02) && sr[0]==4);
- assert(!memcmp(flash+0x700000,data,256));
- const u64 outside_window[]={0,0x6fffff,0x800000,0x100700000ULL};
+ assert(!memcmp(flash+0x24000,data,256));
+ const u64 outside_window[]={0,0x23fff,0x1f4000,0x100024000ULL};
  for(unsigned int i=0;i<ARRAY_SIZE(outside_window);i++)denied(program(outside_window[i],1,data));
  struct spi_mem_op status_write=wren;status_write.cmd.opcode=0x01;denied(status_write);
- q.window_start=q.window_end=0;denied(program(0x700000,1,data));
- q.window_start=0x700000;q.window_end=0x800000;q.bp_ok=0;wire_count=0;
+ window(0,0);denied(program(0x24000,1,data));
+ /* A partition past the end of a 2 MiB part would wrap around into it. */
+ window(0x700000,0x800000);sr[0]=0;wire_count=0;
+ window_program=program(0x700100,1,data);
+ assert(apple_qspi_exec_op(&mem,&window_program)==-ENODEV&&!sent(0x06));
+ window(0x1f0000,0x201000);wire_count=0;
+ window_program=program(0x1f0000,1,data);
+ assert(apple_qspi_exec_op(&mem,&window_program)==-ENODEV&&!sent(0x06));
+ /* W25Q64 tolerates no BP bits. */
+ memcpy(jedec,(u8[]){0xef,0x65,0x17},3);window(0x700000,0x800000);sr[0]=4;wire_count=0;
  window_program=program(0x700100,1,data);
  assert(apple_qspi_exec_op(&mem,&window_program)==-EACCES&&!sent(0x06));
- puts("PASS T8140 read pass-through, opt-in, verified programs, tolerated BP bits, rejected control writes and empty partition");
+ puts("PASS T8140 read pass-through, opt-in, verified programs, BP bits the part tolerates, partition within the part, rejected control writes and empty partition");
  reset();
  assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
  arm();
@@ -237,61 +254,148 @@ int main(void){
  }
  puts("PASS read-only startup, exact opcode/range/page/erase admission, WREN ordering, readback and fault latch");
  /* J616s Macronix part: 35h (EQIO there) never reaches the wire. */
- reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();memset(data,0x55,sizeof(data));
+ reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;arm();memset(data,0x55,sizeof(data));
  o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&!sent(0x35)&&sent(0x15));
  assert(!memcmp(flash+0x700000,data,256)&&!sr[0]);
  erase.addr.val=0x701000;
  wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20)&&!sent(0x35));
  struct spi_mem_op rdcr2=SPI_MEM_OP(SPI_MEM_OP_CMD(0x35,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(1,id,1));
  wire_count=0;assert(apple_qspi_exec_op(&mem,&rdcr2)<0&&!sent(0x35));
- for(unsigned int bp=0x04;bp<=0x20;bp<<=1){reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();
+ for(unsigned int bp=0x04;bp<=0x20;bp<<=1){reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;arm();
   sr[0]=bp;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x35));}
- reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);arm();wire_count=0;o=program(0x700000,1,data);
+ reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x28;arm();wire_count=0;o=program(0x700000,1,data);
  assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
- puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and JEDEC mismatch");
- /* J616s W25Q64 part: the same board entry, and 35h is its SR2 read. */
- reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);memcpy(q.jedec_alt,jedec,3);arm();memset(data,0x55,sizeof(data));
+ puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and other Macronix IDs refused");
+ /* The W25Q64 some J616s read: 35h is its SR2 read. */
+ reset();arm();memset(data,0x55,sizeof(data));
  o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35));
  assert(!memcmp(flash+0x700000,data,256)&&!sr[0]);
  wire_count=0;assert(!apple_qspi_exec_op(&mem,&rdcr2)&&sent(0x35));
- /* A second-slot match keeps the Winbond protection checks. */
+ /* The Winbond protection checks. */
  sr[1]=0x40;wire_count=0;o=program(0x700100,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
  sr[1]=0;jedec[2]^=1;wire_count=0;assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
- /* An empty second slot admits nothing, even on a bus that reads zeroes. */
+ /* A bus that reads zeroes or ones has no part. */
  reset();memset(jedec,0,3);arm();wire_count=0;o=program(0x700000,1,data);
  assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
- puts("PASS W25Q64 J616s part: second ID admitted with SR2 read and checks, third ID and empty slot refused");
- /* J700 GD25UF16E part: the second slot of the J700 entry, GigaDevice checks. */
+ reset();memset(jedec,0xff,3);arm();wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS W25Q64 part: admitted with SR2 read and checks; a nearby ID and empty buses refused");
+ /* J700 GD25UF16E part: GigaDevice checks, in the J700's partition. */
  const u8 w25q16[3]={0xef,0x65,0x15},gd25uf16e[3]={0xc8,0x83,0x15};
- reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
+ reset();memcpy(jedec,gd25uf16e,3);window(0x24000,0x1f4000);arm();
  memset(data,0x55,sizeof(data));sr[0]=0x04;sr[1]=0x02;
- o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35)&&sent(0x15));
- assert(!memcmp(flash+0x700000,data,256)&&sr[0]==0x04&&sr[1]==0x02);
- erase.addr.val=0x701000;memset(flash+0x701000,0,4096);
+ o=program(0x24000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x24000,data,256)&&sr[0]==0x04&&sr[1]==0x02);
+ erase.addr.val=0x25000;memset(flash+0x25000,0,4096);
  wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20));
- for(unsigned int i=0;i<4096;i++)assert(flash[0x701000+i]==0xff);
+ for(unsigned int i=0;i<4096;i++)assert(flash[0x25000+i]==0xff);
  wire_count=0;assert(!apple_qspi_exec_op(&mem,&rdcr2)&&sent(0x35));
  /* SRP0, SRP1, LB1-LB3 and the SR3 drive, dummy and low-power bits stay as found. */
- sr[0]=0x84;sr[1]=0x3b;sr[2]=0x67;o=program(0x700200,1,data);wire_count=0;
- assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&flash[0x700200]==0x55);
+ sr[0]=0x84;sr[1]=0x3b;sr[2]=0x67;o=program(0x24200,1,data);wire_count=0;
+ assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&flash[0x24200]==0x55);
  /* Refused before WREN: WIP, WEL, BP3, BP4, CMP, SUS1 and SUS2. */
  const u8 gd_refused[][3]={{0x01,0x02,0},{0x02,0x02,0},{0x24,0x02,0},{0x44,0x02,0},
   {0x04,0x42,0},{0x04,0x82,0},{0x04,0x06,0}};
  for(unsigned int i=0;i<ARRAY_SIZE(gd_refused);i++){
-  reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
-  memcpy(sr,gd_refused[i],3);wire_count=0;o=program(0x700000,1,data);
+  reset();memcpy(jedec,gd25uf16e,3);window(0x24000,0x1f4000);arm();
+  memcpy(sr,gd_refused[i],3);wire_count=0;o=program(0x24000,1,data);
   assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x02));
  }
- /* BP0 is refused where the board does not name it. */
- reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);arm();
- sr[0]=0x04;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
- /* The same SR1 bit 5 is Winbond TB, left as found on the W25Q16 in the first slot. */
- reset();memcpy(jedec,w25q16,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
- sr[0]=0x24;wire_count=0;o=program(0x700000,1,data);assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ /* The same SR1 bit 5 is Winbond TB, left as found on the W25Q16. */
+ reset();memcpy(jedec,w25q16,3);window(0x24000,0x1f4000);arm();
+ sr[0]=0x24;wire_count=0;o=program(0x24000,1,data);assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
  /* Other GigaDevice IDs stay refused. */
- reset();memcpy(jedec,gd25uf16e,3);jedec[1]=0x60;memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
- wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
- puts("PASS GD25UF16E J700 part: second ID admitted with GigaDevice SR1/SR2/SR3 checks; WIP, WEL, BP3, BP4, CMP, SUS1, SUS2 and other IDs refused");
+ reset();memcpy(jedec,gd25uf16e,3);jedec[1]=0x60;window(0x24000,0x1f4000);arm();
+ wire_count=0;o=program(0x24000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS GD25UF16E J700 part: GigaDevice SR1/SR2/SR3 checks; WIP, WEL, BP3, BP4, CMP, SUS1, SUS2 and other IDs refused");
+ /* J775D GD25UF64E part: GigaDevice checks in its 12-bank partition, as its loader leaves the status. */
+ const u8 gd25uf64e[3]={0xc8,0x83,0x17};
+ reset();memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);arm();
+ memset(data,0x55,sizeof(data));sr[0]=0x00;sr[1]=0x02;sr[2]=0x20;
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x700000,data,256)&&sr[0]==0x00&&sr[1]==0x02&&sr[2]==0x20);
+ erase.addr.val=0x7bf000;memset(flash+0x7bf000,0,4096);
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20));
+ for(unsigned int i=0;i<4096;i++)assert(flash[0x7bf000+i]==0xff);
+ /* The part tolerates no BP bits: BP0 is refused before WREN. */
+ reset();memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);arm();
+ sr[0]=0x04;sr[1]=0x02;sr[2]=0x20;wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x02));
+ /* First-write qualification on the J775D 12-bank GD25UF64E window (SFDP + bank header). */
+ reset();q.qualified=0;memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);
+ store_at(0x710000);arm();memset(data,0x55,sizeof(data));
+ sr[0]=0x00;sr[1]=0x02;sr[2]=0x20;wire_count=0;o=program(0x700000,256,data);
+ assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x5a)&&sent(0x02)&&q.qualified);
+ puts("PASS GD25UF64E J775D part: GigaDevice SR1/SR2/SR3 checks with SR1 0x00, SR2 0x02, SR3 0x20; qualify and BP0 refusal");
+ /* BP0 protects the top 64 KiB of a 2 MiB part, the J700 window's last 16 KiB: refused before WREN there. */
+ reset();memcpy(jedec,w25q16,3);window(0x24000,0x1f4000);arm();sr[0]=0x04;
+ wire_count=0;o=program(0x1f0000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
+ erase.addr.val=0x1f3000;wire_count=0;assert(apple_qspi_exec_op(&mem,&erase)==-EACCES&&!sent(0x06));
+ o=program(0x1effff,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ sr[0]=0x24;o=program(0x1f0000,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ sr[0]=0x24;o=program(0x24000,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ /* BP0+BP2: the top 1 MiB; TB+SEC+BP0: the bottom 4 KiB, below the window. */
+ reset();memcpy(jedec,w25q16,3);window(0x24000,0x1f4000);arm();sr[0]=0x14;
+ o=program(0x100000,1,data);wire_count=0;assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
+ o=program(0xfffff,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ sr[0]=0x64;o=program(0x1f3fff,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ puts("PASS block protection decoded against the window: BP0 refuses the J700 window's top 16 KiB, TB moves it below, BP0+BP2 the top half");
+ /* The window is checked against the flash once, before its first program or erase, and latched. */
+ #define FRESH() do{reset();q.qualified=0;arm();memset(data,0x55,sizeof(data));}while(0)
+ FRESH();store_at(0x710000);o=program(0x700000,256,data);wire_count=0;
+ assert(!apple_qspi_exec_op(&mem,&o)&&sfdp_reads==2&&q.qualified==1&&info_count==1&&!memcmp(flash+0x700000,data,256));
+ o=program(0x700100,1,data);assert(!apple_qspi_exec_op(&mem,&o)&&sfdp_reads==2);
+ /* No store in any bank: the partition is not NVRAM. */
+ FRESH();o=program(0x700000,1,data);wire_count=0;
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&q.qualified==-EACCES&&!strcmp(q.qualify_denial,"window"));
+ store_at(0x710000);wire_count=0;assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x5a));
+ /* A bank that is neither a store nor erased (firmware, a half-erased bank). */
+ FRESH();store_at(0x710000);flash[0x7a0000]=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&q.qualified==-EACCES);
+ FRESH();store_at(0x710000);flash[0x7f0017]=0xfe;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&q.qualified==-EACCES);
+ /* A wrong window over firmware, as a stale partition from 0 would be. */
+ FRESH();memset(flash,0,0x100000);store_at(0x710000);window(0,0x100000);
+ erase.addr.val=0;assert(apple_qspi_exec_op(&mem,&erase)==-EACCES&&!sent(0x06)&&!sent(0x20));
+ /* The SFDP density must be the part table's: a 16 Mbit part reading as the W25Q64 ID, no SFDP. */
+ FRESH();store_at(0x710000);sfdp_set(0x00ffffff);o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06)&&q.qualified==-ENODEV&&!strcmp(q.qualify_denial,"part-size"));
+ FRESH();store_at(0x710000);sfdp_set(0x03ffffff);sfdp[0]='X';
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06)&&!strcmp(q.qualify_denial,"sfdp"));
+ FRESH();store_at(0x710000);sfdp_set(0x80000000|26);
+ assert(!apple_qspi_exec_op(&mem,&o)&&q.qualified==1);
+ /* The J700 window on a 2 MiB part. */
+ FRESH();memcpy(jedec,w25q16,3);sfdp_set(0x00ffffff);window(0x24000,0x1f4000);store_at(0x34000);
+ o=program(0x24000,1,data);assert(!apple_qspi_exec_op(&mem,&o)&&q.qualified==1);
+ /* Blank where a header would be is not enough: padding or an image from partway into a bank. */
+ FRESH();store_at(0x710000);flash[0x7a1234]=0;o=program(0x700000,1,data);wire_count=0;
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&q.qualified==-EACCES&&!strcmp(q.qualify_denial,"window"));
+ FRESH();store_at(0x710000);flash[0x7fffff]=0x7f;
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&q.qualified==-EACCES);
+ /* BP0 on the J700 at qualification: the window's last bank [0x1e4000, 0x1f4000) is a quarter
+  * protected and dropped whole, so a bank erase there cannot stop halfway. */
+ FRESH();memcpy(jedec,w25q16,3);sfdp_set(0x00ffffff);window(0x24000,0x1f4000);store_at(0x34000);sr[0]=0x04;
+ erase.addr.val=0x1e4000;wire_count=0;
+ assert(apple_qspi_exec_op(&mem,&erase)==-EACCES&&!sent(0x06)&&q.qualified==1&&q.write_start==0x24000&&q.write_end==0x1e4000);
+ erase.addr.val=0x1ef000;wire_count=0;assert(apple_qspi_exec_op(&mem,&erase)==-EACCES&&!sent(0x06));
+ erase.addr.val=0x1e3000;wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20));
+ o=program(0x1e3fff,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ /* Winbond TB with BP0+BP1: the bottom 256 KiB drops the window's first two banks. */
+ FRESH();memcpy(jedec,w25q16,3);sfdp_set(0x00ffffff);window(0x24000,0x1f4000);store_at(0x54000);sr[0]=0x2c;
+ o=program(0x43fff,1,data);wire_count=0;
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&q.write_start==0x44000&&q.write_end==0x1f4000);
+ o=program(0x44000,1,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ /* Protection over all of the window admits nothing, latched. */
+ FRESH();memcpy(jedec,w25q16,3);sfdp_set(0x00ffffff);window(0x24000,0x1f4000);store_at(0x34000);sr[0]=0x18;
+ o=program(0x1e0000,1,data);wire_count=0;
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&q.qualified==-EACCES&&!strcmp(q.qualify_denial,"protected"));
+ sr[0]=0;wire_count=0;assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
+ puts("PASS banks: an erased bank is blank throughout; banks block protection reaches, even in part, are never written");
+ /* The device tree's partition rule. */
+ assert(apple_qspi_window_valid(1,2,0,0x700000,0x100000)&&apple_qspi_window_valid(1,2,0,0x24000,0x1d0000));
+ assert(!apple_qspi_window_valid(1,2,1,0x700000,0x100000)&&!apple_qspi_window_valid(1,2,0,0x700000,0x101000));
+ assert(!apple_qspi_window_valid(2,2,0,0x700000,0x100000)&&!apple_qspi_window_valid(1,3,0,0x700000,0x100000));
+ puts("PASS window check: SFDP density, NVRAM bank headers (store, erased, neither), latched refusal, read-only and partial-bank partitions");
  /* Model spi-mem's outer reference. Every private JEDEC/status/WREN,
   * completion poll, WRDI and readback must finish before the idle stamp.
   * Hardware tests must still prove genpd and the actual suspend timer. */
@@ -341,18 +445,15 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
     source = (ROOT / 'drivers/spi/spi-apple-qspi.c').read_text()
     policy = (ROOT / 'drivers/spi/spi-apple-qspi-policy.h').read_text()
-    boards = (''.join(m.group(0) + '\n' for m in re.finditer(r'#define APPLE_QSPI_JEDEC_\w+.*', source)) +
-              function(source, 'struct apple_qspi_board {').rstrip() + ';\n' +
-              function(source, 'static const struct apple_qspi_board apple_qspi_boards[]').rstrip() + ';\n')
     signatures = ['static int apple_qspi_set_read_only(', 'static int apple_qspi_get_read_only(',
-                  'static const struct apple_qspi_board *\napple_qspi_nvram_write_board(',
                   'static bool apple_qspi_opcode_is_read(', 'static int apple_qspi_width_mode(',
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
+                  'static int apple_qspi_read_sfdp(', 'static int apple_qspi_qualify(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
-    code = PREFIX + policy + boards + '\n'.join(function(source, s) for s in signatures) + CONTROLS
+    code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
     output = contextlib.nullcontext(str(args.output)) if args.output else tempfile.TemporaryDirectory(prefix='qspi-nvram-')
     with output as directory:
         current = run(code, Path(directory) / 'current.c')
@@ -360,18 +461,25 @@ def main():
         if current.returncode:
             raise SystemExit(current.stderr)
         for name, old, new in [
-            ('controller', 'of_device_is_compatible(node, board->controller) &&', ''),
-            ('board', 'of_machine_is_compatible(board->machine) &&', ''),
-            ('aperture', 'base == board->base', 'base != 0'),
-            ('j616s-aperture', '"apple,j616s", 0x429118000ULL', '"apple,j616s", 0x429118800ULL'),
-            ('j616s-partition', '"apple,j616s", 0x429118000ULL,\n\t  0x700000', '"apple,j616s", 0x429118000ULL,\n\t  0x680000'),
+            ('part-id', 'return &apple_qspi_parts[i];\n\treturn NULL;', 'return &apple_qspi_parts[i];\n\treturn &apple_qspi_parts[0];'),
+            ('part-size', '!part || qspi->window_end > part->size', '!part'),
+            ('part-bp', 'before[2], part->bp_ok)', 'before[2], 0x1c)'),
+            ('w25q16-size', '{ APPLE_QSPI_JEDEC_W25Q16, 0x200000, 0x1c }', '{ APPLE_QSPI_JEDEC_W25Q16, 0x800000, 0x1c }'),
+            ('protected', 'op->addr.val < pe && op->addr.val + len > ps', '0'),
+            ('bank-invalid', 'if (state < 0) {', 'if (0) {'),
+            ('bank-none', 'if (!stores) {', 'if (stores < 0) {'),
+            ('bank-latch', 'qspi->qualified = ret;', '(void)0;'),
+            ('bank-blank', 'if (memchr_inv(buf, 0xff, APPLE_QSPI_ERASE_SIZE))', 'if (0)'),
+            ('protected-bank', 'op->addr.val < qspi->write_start || op->addr.val + len > qspi->write_end', '0'),
+            ('protected-qualify', '!apple_qspi_unprotected_banks(', '0 && !apple_qspi_unprotected_banks('),
+            ('sfdp-size', '!= part->size) {', '!= part->size && 0) {'),
+            ('window-read-only', '!read_only && size &&', 'size &&'),
+            ('window-bank', '!(size % APPLE_QSPI_NVRAM_BANK) &&', ''),
             ('range', 'addr >= start &&', 'addr >= 1 &&'),
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
             ('mx-bp3', '!(sr & 0x3c & ~bp_ok)', '!(sr & 0x1c & ~bp_ok)'),
             ('mx-eqio', 'opcode = macronix;', 'opcode = winbond;'),
             ('mx-eqio-read', '!ret && id[0] == APPLE_QSPI_MFR_MACRONIX', '0'),
-            ('jedec-alt', 'memcmp(id, qspi->jedec_alt, sizeof(id))', '1'),
-            ('jedec-alt-empty', '!qspi->jedec_alt[0] || ', ''),
             ('gd-dispatch', 'return apple_qspi_gd_status_allows_write(sr1, sr2, bp_ok);',
              'return apple_qspi_status_allows_write(sr1, sr2, sr3, bp_ok);'),
             ('gd-bp34', '!(sr1 & 0x7c & ~bp_ok)', '!(sr1 & 0x1c & ~bp_ok)'),
@@ -379,6 +487,8 @@ def main():
             ('gd-cmp', '!(sr2 & 0xc4)', '!(sr2 & 0x84)'),
             ('j700-gd-id', 'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x15 }',
              'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x16 }'),
+            ('j775d-gd-id', 'APPLE_QSPI_JEDEC_GD25UF64E\t{ 0xc8, 0x83, 0x17 }',
+             'APPLE_QSPI_JEDEC_GD25UF64E\t{ 0xc8, 0x83, 0x18 }'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),
