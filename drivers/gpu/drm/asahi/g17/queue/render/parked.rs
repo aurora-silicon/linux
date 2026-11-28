@@ -18,6 +18,9 @@ use kernel::{prelude::*, sync::Arc};
 /// without retaining that scheduler's execution context or client root. A prior
 /// context awaiting an executed replacement keeps its separate retirement owner.
 pub(crate) struct ParkedPair {
+    /// The pair's views of the kick rings in `vm` ([`Pair::client_kicks`]), dropped before
+    /// `kicks`.
+    client_kicks: [Option<mmu::KernelMapping>; 2],
     kicks: Option<[kick::Queue; 2]>,
     _scheduler: Arc<crate::g17::context::SchedulerStorage>,
     ids: [kick::Id; 2],
@@ -40,6 +43,8 @@ pub(crate) struct ParkedPair {
     executed: u64,
     /// The VM of the context that last ran on these rings.
     vm: u64,
+    /// That VM's status, which tells when its client closed it ([`Self::take_closed_views`]).
+    status: Option<Arc<crate::g17::status::VmStatus>>,
 }
 
 /// All new graph ownership stays separate from the installed kick storage until commit.
@@ -49,6 +54,8 @@ pub(crate) struct Prepared {
     pool: Arc<RenderPool>,
     aliases: Option<KVec<mmu::KernelMapping>>,
     kicks: Option<[Option<mmu::KernelMapping>; 2]>,
+    /// The new views of the kick rings, once installed.
+    views: [Option<mmu::KernelMapping>; 2],
     ids: [kick::Id; 2],
     slot: u8,
     ordinal: u64,
@@ -71,7 +78,24 @@ impl Pair {
     }
 
     fn can_park_backing(&self, context: &Arc<Context>) -> Result<bool> {
-        Ok(Arc::ptr_eq(context, self.context())
+        Ok(self.backing_detachable(context) && self.idle_for_context(context)?)
+    }
+
+    /// A killed guilty pair whose groups went on the guilty proof (`guilty_released`) but whose
+    /// rings the firmware has not consumed: the entries of the groups the kill unlinked may
+    /// never be read. It cannot park, since a parked pair's rings go to the next owner with
+    /// those entries naming freed descriptors, so `detach_context` keeps it, and its slot, out of
+    /// service until the processors stop.
+    pub(crate) fn can_keep(&self, context: &Arc<Context>) -> bool {
+        self.guilty_released
+            && self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() == 0
+            && self.backing_detachable(context)
+    }
+
+    fn backing_detachable(&self, context: &Arc<Context>) -> bool {
+        Arc::ptr_eq(context, self.context())
             && self
                 .previous
                 .as_ref()
@@ -79,7 +103,11 @@ impl Pair {
             && self.displaced.is_none()
             && self.pending_aliases.is_none()
             && self.kick_aliases.is_none()
-            && self.idle_for_context(context)?)
+    }
+
+    /// The pair's two ring cursors (`done`, `read`, `write`), for the detach log line.
+    pub(crate) fn ring_cursors(&self) -> Result<[crate::g17::queue::render::retirement::Cursors; 2]> {
+        self.memory.graph.cursors()
     }
 
     /// Consumes the pair only after can_park and all collector capacity checks succeeded
@@ -87,10 +115,20 @@ impl Pair {
     pub(crate) fn park(self) -> (ParkedPair, RetiredBinding) {
         let context = self.memory.context.clone();
         let vm = context.vm().id();
+        let status = context.vm().status().cloned();
         let scheduler = context.scheduler_owner();
         let buffer_id = self.buffer_id();
+        // A pair parked after its VM's client closed it keeps no views there: they go with the
+        // retired binding, whose context holds that VM anyway, and drop with it off the device
+        // lock.
+        let (client_kicks, retired_kicks) = if closed(status.as_ref()) {
+            ([None, None], self.client_kicks)
+        } else {
+            (self.client_kicks, [None, None])
+        };
         let parked = ParkedPair {
             ids: self.kicks.each_ref().map(|queue| queue.id()),
+            client_kicks,
             kicks: Some(self.kicks),
             _scheduler: scheduler,
             slot: self.slot,
@@ -107,8 +145,10 @@ impl Pair {
             previous: self.previous,
             executed: self.executed,
             vm,
+            status,
         };
         let retired = RetiredBinding {
+            _client_kicks: retired_kicks,
             memory: Some(self.memory),
             context,
             pool: self.free_list,
@@ -121,19 +161,39 @@ impl Pair {
     }
 }
 
+/// The client of the VM with this status closed it: nothing runs there again.
+fn closed(status: Option<&Arc<crate::g17::status::VmStatus>>) -> bool {
+    status.is_some_and(|status| status.client_closed())
+}
+
 impl ParkedPair {
-    /// Clears both kick rings when the pair goes to a context of another VM than the one
-    /// that last ran on it, so the new owner cannot read the entries the previous owner's
-    /// commands left. The pair is parked, so the firmware consumed every entry.
-    pub(crate) fn clear_for_vm(&mut self, vm: u64) -> Result {
-        if self.vm == vm {
+    /// Removes the previous VM's views of both kick rings and clears the rings when the pair
+    /// goes to a context of another VM than the one that last ran on it, so neither owner can
+    /// read the entries the other's commands leave there. The pair is parked, so the firmware
+    /// consumed every entry and no longer reads the rings through those views.
+    pub(crate) fn clear_for_vm(&mut self, vm: &mmu::Vm) -> Result {
+        if self.vm == vm.id() {
             return Ok(());
         }
+        self.client_kicks = [None, None];
         for queue in self.kicks.as_mut().ok_or(EBUSY)?.iter_mut() {
             queue.clear_render_ring()?;
         }
-        self.vm = vm;
+        self.vm = vm.id();
+        self.status = vm.status().cloned();
         Ok(())
+    }
+
+    /// Takes the pair's views of the kick rings once the client of the VM they are in has
+    /// closed it, for the caller to drop off the device lock: each view holds that VM, whose
+    /// page tables would otherwise stay alive for as long as the pair stays parked. A later
+    /// context of the same VM gets new views, as one of another VM does.
+    pub(crate) fn take_closed_views(&mut self) -> [Option<mmu::KernelMapping>; 2] {
+        if closed(self.status.as_ref()) {
+            core::mem::take(&mut self.client_kicks)
+        } else {
+            [None, None]
+        }
     }
 
     /// The release of `scheduler` has been consumed: a later owner change no
@@ -181,11 +241,19 @@ impl ParkedPair {
             &first.command,
             self.clusters,
             self.variant.programs,
+            self.board,
         )?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,
             kicks[1].prepare_client_alias(context.vm())?,
         ];
+        // A view the VM already has is the one this pair holds for it (`clear_for_vm` dropped
+        // those of any other VM).
+        for (alias, view) in aliases.iter().zip(&self.client_kicks) {
+            if alias.is_none() && view.is_none() {
+                return Err(EFAULT);
+            }
+        }
         let (memory, persistent) = memory::Memory::new(
             alloc,
             pool,
@@ -206,6 +274,7 @@ impl ParkedPair {
             pool: free_list,
             aliases: Some(persistent),
             kicks: Some(aliases),
+            views: [None, None],
             ids: self.ids,
             slot: self.slot,
             ordinal: self.ordinal,
@@ -248,10 +317,18 @@ impl ParkedPair {
             self.kicks = Some(kicks);
             return Err(EIO);
         };
+        // The new views, else the ones this pair already held in the same VM.
+        let mut client_kicks = core::mem::take(&mut next.views);
+        for (view, held) in client_kicks.iter_mut().zip(self.client_kicks.iter_mut()) {
+            if view.is_none() {
+                *view = held.take();
+            }
+        }
         storage.write_init(kernel::try_init!(Pair {
             pool_pin: next.pool_pin.take(),
             graph_started: false,
             kick_aliases: None,
+            client_kicks,
             memory,
             kicks,
             free_list: next.pool.clone(),
@@ -274,6 +351,8 @@ impl ParkedPair {
             registered: self.registered,
             outer_started: self.outer_started,
             quarantined: false,
+            guilty_released: false,
+            collateral_at: None,
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
@@ -288,6 +367,8 @@ impl ParkedPair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            drain_failures: 0,
+            drain_retry_at: 0,
             channel_error: false,
         }))
     }
@@ -317,6 +398,7 @@ impl Prepared {
             self.memory.as_mut().ok_or(EIO)?,
             &mut self.aliases,
             &mut self.kicks,
+            &mut self.views,
         )?;
         self.installed = true;
         Ok(())

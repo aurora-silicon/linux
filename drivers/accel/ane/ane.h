@@ -20,10 +20,33 @@
 #define ANE_DART_MAX 3
 #define ANE_DART_SCRATCH_MAX 16
 
+/*
+ * What owns a node of ane_device.mm, kept in drm_mm_node.color (the
+ * allocator has no color_adjust, so the color only labels the node).
+ * Written under iommu_lock.
+ */
+enum ane_mm_owner {
+	ANE_MM_NONE,
+	/* A BO's range, its pages not in the DART. */
+	ANE_MM_BO_UNMAPPED,
+	/* A BO's range, its pages in the DART. */
+	ANE_MM_BO_MAPPED,
+	/* A fault-drain page in a hole, reserved by the drain. */
+	ANE_MM_SCRATCH,
+	/* The range of a BO freed while wedged (ane_preserve_bo()). */
+	ANE_MM_PRESERVED,
+};
+
+/*
+ * A fault-drain page. @node is the node the drain reserved for a page in
+ * a hole; @host is the node of an unmapped BO whose range holds the page.
+ * Exactly one of them is set.
+ */
 struct ane_dart_scratch {
 	u64 iova;
 	struct page *page;
 	struct drm_mm_node *node;
+	struct drm_mm_node *host;
 };
 
 struct ane_device {
@@ -46,6 +69,8 @@ struct ane_device {
 	void __iomem *ps;
 
 	struct drm_mm mm;
+	/* Size of the device address range that mm manages. */
+	u64 iova_span;
 	struct iommu_domain *domain;
 	unsigned long shift;
 	struct ane_dart {
@@ -67,6 +92,15 @@ struct ane_device {
 	/* Serializes runtime-PM references across a recovery cycle. */
 	struct mutex pm_lock;
 	struct list_head bo_list;
+
+	/*
+	 * BOs whose pages are in the DART now. Between jobs this is the last
+	 * job's set; ane_submit() unmaps every other BO before the engine
+	 * starts, so a job reaches only the buffers it names. job_seq tags
+	 * the BOs of the job being set up. Both under engine_lock.
+	 */
+	struct list_head mapped_list;
+	u64 job_seq;
 
 	/*
 	 * Wedge-preserved BO ranges, tied to their still-inserted drm_mm
@@ -92,6 +126,13 @@ struct ane_device {
 	 * quiescing.
 	 */
 	bool recovering;
+
+	/*
+	 * Set by system suspend for an engine that was wedged when it began:
+	 * the sleep powers its partitions off as a recovery cycle does, so
+	 * runtime suspend lets it go, and resume tries one recovery.
+	 */
+	bool sleep_wedged;
 
 	/*
 	 * TM_STATUS sampled right after the first tm_enable at probe: the
@@ -216,6 +257,11 @@ static inline bool ane_tm_failure_recoverable(bool tm_retention,
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
+u64 ane_bo_iova_size(u32 npages, unsigned int shift);
+int ane_bo_check_size(u64 size, u64 iova_span);
+struct page *ane_dart_alloc_scratch_page(void);
+int ane_dart_scratch_slot(struct ane_device *ane, u64 iova, u64 size,
+			  struct drm_mm_node **host);
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
 #endif
@@ -242,9 +288,9 @@ int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);
 void ane_dart_unmask(struct ane_device *ane);
 bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status);
-int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
-			 struct ane_dart_scratch *scratch, int *pages);
+int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova);
 void ane_dart_release_scratch(struct ane_device *ane,
 			      struct ane_dart_scratch *scratch, int pages);
+bool ane_dart_scratch_in(struct ane_device *ane, struct drm_mm_node *host);
 
 #endif /* __ANE_H__ */

@@ -44,6 +44,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
@@ -293,6 +294,9 @@ struct t6040_usb2_phy {
 	bool usb3_lent;		/* DP mode took the lanes of this Type-C port */
 	bool pipe_switched;	/* the controller's PIPE runs on this PHY */
 	bool cio_up;		/* the lanes run USB4/Thunderbolt */
+	u8 tun_rate[2];		/* DP tunnel link rate per DP IN adapter, 0 = off */
+	bool tun_pre;		/* switch 1 is held for DP IN 1 alone */
+	bool tun_pll;		/* AUSPLL programmed for DP tunnels */
 
 	/* DisplayPort; dp_ok is false when the DT lacks a DP route */
 	struct phy *dp;
@@ -1769,11 +1773,14 @@ put:
 	return ret;
 }
 
+static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy);
+
 static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 {
 	lockdep_assert_held(&tphy->lock);
 	if (!tphy->cio_up)
 		return;
+	t6040_tun_stop_all_locked(tphy);
 	t6040_phy_tx_cmn_down(tphy);
 	t6040_cio_rx_down(tphy);
 	fsleep(200);
@@ -1879,6 +1886,8 @@ static int t6040_dp_validate(struct phy *phy, enum phy_mode mode, int submode,
 	return 0;
 }
 
+static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin, u8 rate);
+
 static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
@@ -1887,6 +1896,13 @@ static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 	int ret;
 
 	guard(mutex)(&tphy->lock);
+	/* A DP tunnel's pixel clock, PHY in CIO: see "DP tunnels" below. */
+	if (opts->set_tunnel_rate) {
+		if (opts->set_rate || opts->set_lanes || opts->set_voltages ||
+		    opts->tunnel_dpin > 1)
+			return -EINVAL;
+		return t6040_tun_rate_locked(tphy, opts->tunnel_dpin, opts->tunnel_rate);
+	}
 	if (!tphy->dp_up)
 		return -EINVAL;
 	if ((opts->set_lanes || opts->set_voltages) &&
@@ -1948,6 +1964,298 @@ static const struct phy_ops t6040_dp_phy_ops = {
 	.validate = t6040_dp_validate,
 	.set_mode = t6040_dp_set_mode,
 };
+
+/* ---- DP tunnels: the pixel clocks of the router's DP IN adapters (PHY in CIO) ----
+ *
+ * The DP 1.4 tunnel's init, update and shutdown and the DP clock
+ * configuration: one fixed AUSPLL frequency feeds the DPTX pixel clocks,
+ * whose select field divides it per link rate. DP IN adapter 0 is taken to
+ * use PCLK1 and clock switch 1, adapter 1 PCLK2 and switch 2 (the PHY does
+ * not choose: the index is the display controller's). Driven only by
+ * appledrm, through phy_configure() with the DP options' set_tunnel_rate
+ * (t6040_dp_configure()), and only while the PHY is in CIO.
+ */
+#define T6040_CORE_RCAL1		0x804	/* AUS40CMN_DIG RCAL1 */
+#define T6040_CORE_RCAL1_DONE		BIT(0)
+#define T6040_CORE_AUSPLL_CMD		0x3000	/* AUSPLL_TOP_APB_CMD_CMDOVERRIDE */
+#define T6040_CORE_AUSPLL_CMD_REQ	BIT(0)
+#define T6040_CORE_AUSPLL_CMD_ACK	BIT(1)
+#define T6040_CORE_AUSPLL_FREQDESC_A	0x3080
+#define T6040_CORE_AUSPLL_FREQDESC_B	0x3084
+#define T6040_CORE_AUSPLL_FREQDESC_C	0x3088
+#define T6040_CORE_AUSPLL_CLKOUT_MASTER	0x3200
+#define T6040_CORE_AUSPLL_CLKOUT_DIV	0x3208
+#define T6040_CORE_AUSPLL_BGR		0x3218
+#define T6040_CORE_AUSPLL_FREQINIT_1	0x3234
+#define T6040_CORE_TX_DP_CTRL0		0x7000
+#define T6040_CORE_TX_DP_CTRL0_ENABLES	GENMASK(18, 16)
+#define T6040_CORE_DP_PCLK_STATUS	0x7034
+#define T6040_CORE_DP_PCLK_STATUS_LOCK	BIT(3)	/* AUSPLL_LOCK */
+
+static const struct t6040_tun_pclk {
+	u8 sel_shift;		/* TX_DP_CTRL0 select field */
+	u32 en;			/* TX_DP_CTRL0 enable */
+	u32 sw_mask, sw_gate, sw_on;	/* clock switch: cleared, set, status when on */
+	u32 req[2], req_stat[2], sw_off;	/* PMGR requests, their status, cleared at off */
+} t6040_tun_pclk[2] = {
+	{ 4, BIT(16), 0x473, 0x10, BIT(0), { 0x20, 0x40 }, { BIT(1), BIT(2) }, 0x403 },
+	{ 8, BIT(17), 0xb8c, 0x80, BIT(3), { 0x100, 0x200 }, { BIT(4), BIT(5) }, 0x80c },
+};
+
+/* The pixel clock select: RBR, HBR, HBR2, HBR3; UHBR is not tunnelled on this path. */
+static int t6040_tun_select(u8 rate)
+{
+	switch (rate) {
+	case 0x06:
+		return 4;
+	case 0x0a:
+		return 3;
+	case 0x14:
+		return 1;
+	case 0x1e:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/* DP IN 1 runs on PCLK2 and needs PCLK1 as well: without it its video stops. */
+static u32 t6040_tun_enables(struct t6040_usb2_phy *tphy)
+{
+	return ((tphy->tun_rate[0] || tphy->tun_rate[1]) ? t6040_tun_pclk[0].en : 0) |
+	       (tphy->tun_rate[1] ? t6040_tun_pclk[1].en : 0);
+}
+
+/* AUSPLL_TOP command override: request @req with the toggle protocol, then wait for @ack. */
+static int t6040_tun_pll_cmd(struct t6040_usb2_phy *tphy, u32 val, bool ack_set)
+{
+	void __iomem *cmd = t6040_core(tphy) + T6040_CORE_AUSPLL_CMD;
+	u32 v;
+
+	writel((readl(cmd) & 0xe0000006) | val, cmd);
+	return readl_poll_timeout(cmd, v, !!(v & T6040_CORE_AUSPLL_CMD_ACK) == ack_set,
+				  10, 500 * USEC_PER_MSEC);
+}
+
+/* The DP 1.4 tunnel shutdown: pixel clocks off, AUSPLL released. */
+static void t6040_tun_pll_stop(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	bool ack = readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_ACK;
+	u32 v;
+
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, T6040_CORE_TX_DP_CTRL0_ENABLES);
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, 0xc);
+	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, !ack) ||
+	    t6040_tun_pll_cmd(tphy, (ack ? T6040_CORE_AUSPLL_CMD_REQ : 0) | 0x10000018, ack) ||
+	    readl_poll_timeout(core + T6040_CORE_DP_PCLK_STATUS, v,
+			       !(v & T6040_CORE_DP_PCLK_STATUS_LOCK), 10, 500 * USEC_PER_MSEC))
+		dev_warn(tphy->dev, "DP tunnel: AUSPLL release timed out (cmd %#x, pclk status %#x)\n",
+			 readl(core + T6040_CORE_AUSPLL_CMD),
+			 readl(core + T6040_CORE_DP_PCLK_STATUS));
+	/* Both outputs the start set: a stale 0x800 reads as "in use" next time. */
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
+	tphy->tun_pll = false;
+}
+
+/* The common block's init, then the fixed AUSPLL program of the DP 1.4 tunnel init. */
+static int t6040_tun_pll_start(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	bool ack;
+	u32 v;
+
+	if ((readl(core + T6040_CORE_AUSPLL_CLKOUT_MASTER) & 0x808) ||
+	    (readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_REQ)) {
+		dev_warn(tphy->dev, "DP tunnel: AUSPLL already in use (master %#x, cmd %#x)\n",
+			 readl(core + T6040_CORE_AUSPLL_CLKOUT_MASTER),
+			 readl(core + T6040_CORE_AUSPLL_CMD));
+		return -EBUSY;
+	}
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, T6040_CORE_TX_DP_CTRL0_ENABLES);
+
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x4);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x8);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x2);
+	udelay(1);
+	t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_CLAMP);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x20);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_BIAS, T6040_CORE_CMN_BIAS_BGBIAS_EN_OV);
+	udelay(15);
+	if (readl_poll_timeout(core + T6040_CORE_RCAL1, v, v & T6040_CORE_RCAL1_DONE, 1, 100))
+		dev_dbg(tphy->dev, "DP tunnel: RCAL not done (%#x)\n", v);
+
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_FREQINIT_1, 0x3);
+	writel(0x1e0e021c, core + T6040_CORE_AUSPLL_FREQDESC_A);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_FREQDESC_B, 0x0fffffff, 0);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_FREQDESC_C, 0x007fffff, 0x644a00);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_CLKOUT_DIV, 0x001f0000, 0x10000);
+	t6040_usb2_set32(core + T6040_CORE_AUSPLL_BGR, 0x1);
+	t6040_usb2_set32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
+	tphy->tun_pll = true;
+
+	/*
+	 * Toggle protocol, as in the stop: the request flips REQ and waits for
+	 * ACK to follow, whichever level a PHY reset left it at. The pixel
+	 * clock must lock either way.
+	 */
+	ack = readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_ACK;
+	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, !ack) ||
+	    readl_poll_timeout(core + T6040_CORE_DP_PCLK_STATUS, v,
+			       v & T6040_CORE_DP_PCLK_STATUS_LOCK,
+			       10, 500 * USEC_PER_MSEC) ||
+	    t6040_tun_pll_cmd(tphy, (ack ? T6040_CORE_AUSPLL_CMD_REQ : 0) | 0x10010000, ack)) {
+		dev_err(tphy->dev, "DP tunnel: AUSPLL did not lock (cmd %#x, pclk status %#x)\n",
+			readl(core + T6040_CORE_AUSPLL_CMD),
+			readl(core + T6040_CORE_DP_PCLK_STATUS));
+		t6040_tun_pll_stop(tphy);
+		return -ETIMEDOUT;
+	}
+	t6040_usb2_set32(core + T6040_CORE_TX_DP_CTRL0, 0xc);
+	return 0;
+}
+
+static void t6040_tun_select_field(u32 *v, const struct t6040_tun_pclk *p, int sel, bool en)
+{
+	if (!!(*v & p->en) != en || ((*v >> p->sel_shift) & 0xf) != sel)
+		*v = (*v & ~(p->en | (0xf << p->sel_shift))) | (sel << p->sel_shift);
+}
+
+/* The DP 1.4 tunnel update for one pclk: select with its enable off, then the enables. */
+static void t6040_tun_select_write(struct t6040_usb2_phy *tphy, unsigned int dpin, int sel)
+{
+	void __iomem *ctrl0 = t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0;
+	u32 v = readl(ctrl0);
+
+	t6040_tun_select_field(&v, &t6040_tun_pclk[dpin], sel, !!tphy->tun_rate[dpin]);
+	/* PCLK1 is DP IN 1's prerequisite at its own rate, unless DP IN 0 runs on it. */
+	if (dpin == 1 && !tphy->tun_rate[0])
+		t6040_tun_select_field(&v, &t6040_tun_pclk[0], sel, true);
+	/* Retuning DP IN 0 must not gate PCLK1 under a running DP IN 1. */
+	if (dpin == 0 && tphy->tun_rate[1])
+		v |= t6040_tun_pclk[0].en;
+	writel(v, ctrl0);
+	writel((v & ~T6040_CORE_TX_DP_CTRL0_ENABLES) | t6040_tun_enables(tphy), ctrl0);
+}
+
+/* The DP clock configuration for one DP 1.x switch: pixel-clock gate on, or off. */
+static int t6040_tun_switch(struct t6040_usb2_phy *tphy, unsigned int dpin, bool on)
+{
+	const struct t6040_tun_pclk *p = &t6040_tun_pclk[dpin];
+	void __iomem *cfg = t6040_cfg(tphy);
+	unsigned int i;
+	u32 s;
+
+	if (on) {
+		t6040_usb2_mask32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_mask, p->sw_gate);
+		return readl_poll_timeout(cfg + T6040_CFG_DP_CLKSWITCH_STAT, s, s & p->sw_on,
+					  10, 5 * USEC_PER_MSEC);
+	}
+	t6040_usb2_set32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_gate);
+	for (i = 0; i < 2; i++) {
+		if (!(readl(cfg + T6040_CFG_DP_CLKSWITCH_CTRL) & p->req[i]))
+			continue;
+		t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->req[i]);
+		if (readl_poll_timeout(cfg + T6040_CFG_DP_CLKSWITCH_STAT, s, !(s & p->req_stat[i]),
+				       10, 5 * USEC_PER_MSEC))
+			dev_dbg(tphy->dev, "DP tunnel %u: request %#x not released (%#x)\n",
+				dpin, p->req[i], s);
+	}
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_off);
+	return 0;
+}
+
+/* All tunnel clocks down, which the PHY's shutdown of mode 2 starts with. */
+static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy)
+{
+	unsigned int dpin;
+
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->tun_pll)
+		return;
+	for (dpin = 0; dpin < 2; dpin++) {
+		if (!tphy->tun_rate[dpin])
+			continue;
+		tphy->tun_rate[dpin] = 0;
+		t6040_tun_switch(tphy, dpin, false);
+	}
+	if (tphy->tun_pre) {
+		tphy->tun_pre = false;
+		t6040_tun_switch(tphy, 0, false);
+	}
+	t6040_tun_pll_stop(tphy);
+	dev_info(tphy->dev, "DP tunnel clocks off\n");
+}
+
+static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin, u8 rate)
+{
+	int sel, ret;
+	u8 old = tphy->tun_rate[dpin];
+
+	lockdep_assert_held(&tphy->lock);
+	if (!rate) {
+		if (!old)
+			return 0;
+		tphy->tun_rate[dpin] = 0;
+		if (dpin == 0 && tphy->tun_rate[1]) {
+			/* DP IN 1 keeps PCLK1 and its switch, now at its own rate. */
+			tphy->tun_pre = true;
+			t6040_tun_select_write(tphy, 1, t6040_tun_select(tphy->tun_rate[1]));
+		} else {
+			t6040_tun_switch(tphy, dpin, false);
+			if (dpin == 1 && tphy->tun_pre) {
+				tphy->tun_pre = false;
+				t6040_tun_switch(tphy, 0, false);
+			}
+		}
+		t6040_usb2_mask32(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0,
+				  T6040_CORE_TX_DP_CTRL0_ENABLES, t6040_tun_enables(tphy));
+		if (!tphy->tun_rate[!dpin])
+			t6040_tun_pll_stop(tphy);
+		dev_dbg(tphy->dev, "DP tunnel %u off\n", dpin);
+		return 0;
+	}
+	sel = t6040_tun_select(rate);
+	if (sel < 0)
+		return sel;
+	if (!tphy->cio_up)
+		return -EBUSY;
+	if (old == rate)
+		return 0;
+	if (!tphy->tun_pll) {
+		ret = t6040_tun_pll_start(tphy);
+		if (ret)
+			return ret;
+	}
+	tphy->tun_rate[dpin] = rate;
+	t6040_tun_select_write(tphy, dpin, sel);
+	/* DP IN 1 alone: switch 1 passes PCLK1, its prerequisite. */
+	if (dpin == 1 && !tphy->tun_rate[0] && !tphy->tun_pre) {
+		/* Owned before it is gated on, so a timeout below also releases it. */
+		tphy->tun_pre = true;
+		ret = t6040_tun_switch(tphy, 0, true);
+		if (ret)
+			goto switch_failed;
+	} else if (dpin == 0) {
+		tphy->tun_pre = false;	/* DP IN 0 owns switch 1 again */
+	}
+	ret = t6040_tun_switch(tphy, dpin, true);
+switch_failed:
+	if (ret) {
+		dev_err(tphy->dev, "DP tunnel %u: clock switch timed out (ctrl %#x status %#x)\n",
+			dpin, readl(t6040_cfg(tphy) + T6040_CFG_DP_CLKSWITCH_CTRL),
+			readl(t6040_cfg(tphy) + T6040_CFG_DP_CLKSWITCH_STAT));
+		t6040_tun_rate_locked(tphy, dpin, 0);
+		return ret;
+	}
+	dev_info(tphy->dev, "DP tunnel %u: rate %#x, select %d (ctrl0 %#x, pclk status %#x)\n",
+		 dpin, rate, sel, readl(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0),
+		 readl(t6040_core(tphy) + T6040_CORE_DP_PCLK_STATUS));
+	return 0;
+}
 
 /* ---- Type-C mode switch: the Type-C controller asks for DP on a USB-C port ---- */
 
@@ -2128,6 +2436,65 @@ static void t6040_rtkit_cleanup(void *data)
 	t6040_rtkit_stop_transport(data);
 }
 
+/*
+ * Suspend-to-idle leaves the Type-C link up: the USB4/Thunderbolt router keeps
+ * its own domains out of the system transition while a cable is set up, and a
+ * running PHY coprocessor is not stopped either. genpd would still power off
+ * common_dp (and with it phymxwrap) in its noirq phase under the running
+ * coprocessor: the link then dies after resume and the next detach finds a
+ * coprocessor that no longer answers (AP idle -62). Put this device on the
+ * awake path while its coprocessor runs, so genpd keeps the domains on
+ * (common_dp carries apple,sleep-wakeup-path). The decision is taken again in
+ * every suspend pass, dark wakes included, and once more in noirq for a
+ * coprocessor started after .suspend. A sleep the platform takes part in
+ * (firmware suspend) is left as it was.
+ */
+static void t6040_keep_running_cpu_awake(struct t6040_usb2_phy *tphy, bool noirq)
+{
+	bool running;
+
+	if (!pm_suspend_no_platform())
+		return;
+
+	if (noirq) {
+		/*
+		 * An attach or detach holding the lock may wait for a coprocessor
+		 * reply that cannot arrive now. Its outcome is unknown: keep the
+		 * domains on for this sleep.
+		 */
+		if (!mutex_trylock(&tphy->lock)) {
+			device_set_awake_path(tphy->dev);
+			return;
+		}
+	} else {
+		mutex_lock(&tphy->lock);
+	}
+	running = tphy->rtk && apple_rtkit_is_running(tphy->rtk);
+	mutex_unlock(&tphy->lock);
+
+	if (running) {
+		device_set_awake_path(tphy->dev);
+		dev_dbg(tphy->dev, "PHY coprocessor running: domains kept on for s2idle\n");
+	}
+}
+
+static int t6040_usb2_suspend(struct device *dev)
+{
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), false);
+	return 0;
+}
+
+static int t6040_usb2_suspend_noirq(struct device *dev)
+{
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), true);
+	return 0;
+}
+
+static const struct dev_pm_ops t6040_usb2_pm_ops = {
+	.suspend = t6040_usb2_suspend,
+	.suspend_noirq = t6040_usb2_suspend_noirq,
+};
+
 static void t6040_mbox_dev_put(void *data)
 {
 	put_device(data);
@@ -2295,6 +2662,12 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
 	if (ret)
 		return ret;
+	/*
+	 * Stop the transport after verifying the mailbox so it drops its
+	 * runtime-PM reference while the port is idle; the first attach
+	 * starts it again in t6040_usb3_cpu_start().
+	 */
+	t6040_rtkit_stop_transport(tphy);
 
 	ret = t6040_debugfs_init(tphy);
 	if (ret)
@@ -2505,6 +2878,7 @@ static struct platform_driver t6040_usb2_driver = {
 	.driver = {
 		.name = "phy-apple-t6040-usb2",
 		.of_match_table = t6040_usb2_of_match,
+		.pm = pm_sleep_ptr(&t6040_usb2_pm_ops),
 	},
 };
 module_platform_driver(t6040_usb2_driver);

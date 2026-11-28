@@ -4,7 +4,7 @@
 from pathlib import Path
 import os, re, shlex, shutil, subprocess
 import phy
-from common import block, tipd_pm_header, atc_function, ATC_RPM
+from common import block, tipd_pm_header, atc_function, atc_mux_noop, ATC_RPM
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
@@ -424,8 +424,10 @@ int main(void)
      # delayed work functions themselves are left to the KUnit tests.
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_usb3_port_off','atcphy_usb3_port_on','atcphy_usb3_port_retry_delay',
-        'atcphy_usb3_port_retry','atcphy_mux_in_mode'))
-     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'
+        'atcphy_usb3_port_retry'))
+     # Unless the lane fixture's atcphy_mux_set_locked() already needed them.
+     if not atc_mux_noop(s):
+      helpers+=atc_function(s,'atcphy_mux_in_mode')+ns['function'](s,'atcphy_mux_is_noop')+'\n'
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
      # The mux callback's body, split out so the wake can set the mode it had.
@@ -491,7 +493,7 @@ struct fwnode_handle { int refs; };
 struct typec_mux_state { void *alt,*data; unsigned long mode; };
 struct device;
 struct tps6598x { int lock; void *port; struct device *dev; };
-struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned long,void *); };
+struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned long,void *); int priority; };
 '''
     pm = tipd_pm_header(root)
     mocks = r'''
@@ -568,6 +570,7 @@ static void cd321x_stop_work(struct cd321x *c) {
                               ' struct notifier_block tbt_watch;\n bool tbt_watch_registered;\n', 1)
         mocks = mocks.replace('static void cd321x_stop_work(struct cd321x *c) {\n', r'''#define INIT_WORK(p,fn) ((p)->pending=false)
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static int watches, watch_error;
 /* Like the real watch, hold the port fwnode until the port is unregistered. */
 static int cd321x_tbt_watch_late(struct cd321x *c,struct fwnode_handle *f) {
@@ -759,6 +762,45 @@ int main(void) {
  assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
  cd321x_unregister_port(&c.tps);balanced();
 ''', 1)
+
+    # A port that closes its USB4 session before a reboot registers a reboot notifier at probe.
+    if 'register_reboot_notifier(' in core:
+        member = ' bool state_valid,tbt_notifier_registered;\n'
+        assert mocks.count(member) == 1
+        mocks = mocks.replace(member, member + ' struct notifier_block reboot_nb;\n bool reboot_nb_registered;\n', 1)
+        mocks += r'''
+#ifndef INT_MAX
+#define INT_MAX 0x7fffffff
+#endif
+static int reboots;
+static int cd321x_reboot_notify(struct notifier_block *n,unsigned long a,void *d) { (void)n;(void)a;(void)d;return 0; }
+static int register_reboot_notifier(struct notifier_block *n) { (void)n;reboots++;return 0; }
+static void unregister_reboot_notifier(struct notifier_block *n) { (void)n;assert(reboots>0);reboots--; }
+'''
+        idle = ' assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers);\n}'
+        assert controls.count(idle) == 1
+        controls = controls.replace(idle, idle[:-2] + '\n assert(!reboots);\n}', 1)
+        probed = '  reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid);\n'
+        assert controls.count(probed) == 1
+        controls = controls.replace(probed, probed + '  assert(reboots==1&&c.reboot_nb_registered&&c.reboot_nb.notifier_call==cd321x_reboot_notify);\n', 1)
+
+    # Newer trees do not wait for the driver core to give up on a missing router.
+    if 'cd321x_tbt_switch_keep_waiting(' not in core:
+        assert late_watch
+        stub = 'static bool keep_waiting=true;\nstatic bool cd321x_tbt_switch_keep_waiting(struct device *d) { (void)d;return keep_waiting; }\n'
+        assert mocks.count(stub) == 1
+        mocks = mocks.replace(stub, '', 1)
+        wait = r''' /* Missing router defers while suppliers may still bind, then is optional. */
+ reset(&c);switch_error=-EPROBE_DEFER;
+ assert(cd321x_register_port(&c.tps,&connector)==-EPROBE_DEFER);balanced();
+ reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;
+'''
+        assert controls.count(wait) == 1
+        controls = controls.replace(wait, ''' /* A missing router is optional at once. */
+ reset(&c);switch_error=-EPROBE_DEFER;
+''', 1)
+        controls = controls.replace('keep_waiting=true;', '').replace('keep_waiting=false;', '')
+        assert 'keep_waiting' not in controls
 
     return prefix + pm + mocks + production + '\n#define TEST_DEFER 1\n#define TEST_FWNODE 1\n' + controls
 

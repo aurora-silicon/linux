@@ -34,13 +34,17 @@ PREFIX = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-typedef int32_t s32; typedef uint32_t u32; typedef uint8_t u8;
+typedef int32_t s32; typedef uint32_t u32; typedef uint8_t u8; typedef uint32_t __le32;
+#define le32_to_cpu(x) (x)
 #define BIT(n) (1U << (n))
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+#define smp_load_acquire(p) (*(p))
 #define brcmf_dbg(...) ((void)0)
 #define bphy_err(...) ((void)drvr)
+#define bphy_info_once(d, ...) ((void)(d))
+#define brcmf_info(...) ((void)0)
 #define brcmf_err(...) ((void)0)
 #define __brcmf_err(...) ((void)0)
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
@@ -62,12 +66,13 @@ struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
 struct pci_dev { struct device dev; int irq; bool state_saved; };
-struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer;
- bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping;
+struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer, sleep_reset_blocked, setup_complete;
+ bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping, fwseed, s2idle_d0;
  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
  struct { int intmask, mailboxmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr; bool wowl_transport, wowl_wake;
+ bool wowl_s2idle_only;
  struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
 struct brcmf_pub { struct brcmf_bus *bus_if; struct brcmf_if *iflist[BRCMF_MAX_IFS];
@@ -79,7 +84,7 @@ struct {struct brcmf_cfg80211_vif *first;} vif_list;
 struct {bool active, nd_enabled, lpas; int pre_pmmode;} wowl; };
 struct wiphy { struct brcmf_cfg80211_info *cfg; };
 struct regulatory_request { char alpha2[2]; int initiator; };
-struct brcmf_fil_country_le { char alpha2[2]; };
+struct brcmf_fil_country_le { char alpha2[2]; __le32 rev; char ccode[4]; };
 struct work_struct { bool queued; };
 struct brcmf_msgbuf_work_item { struct brcmf_msgbuf_work_item *next; };
 struct brcmf_msgbuf { struct brcmf_pub *drvr; bool tx_suspended;
@@ -146,11 +151,12 @@ static void cancel_work_sync(struct work_struct *w) {
 }
 static void brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *d,bool on) {d->timer=on;}
 #define PM_SUSPEND_TO_IDLE 1
+#define PM_SUSPEND_ON 0
 static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static bool device_may_wakeup(struct device *d) {(void)d;return true;}
-static int wake_error; static unsigned d3_informs, d0_informs;
+static int wake_error, save_error; static unsigned d3_informs, d0_informs;
 static int enable_irq_wake(int irq) {(void)irq;return wake_error;}
-static int pci_save_state(struct pci_dev *p) {p->state_saved=true;return 0;}
+static int pci_save_state(struct pci_dev *p) {if(save_error)return save_error;p->state_saved=true;return 0;}
 static void pci_restore_state(struct pci_dev *p) {p->state_saved=false;}
 static void brcmf_pcie_disable_irq_wake(struct brcmf_pciedev_info *d) {d->irq_wake_enabled=false;}
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
@@ -168,6 +174,16 @@ static void brcmf_pcie_hostready(struct brcmf_pciedev_info *d) {assert(d->intr);
 static void brcmf_chip_detach(void *c) {(void)c;}
 static void brcmf_pcie_remove(struct pci_dev *p) {(void)p;removes++;}
 static int brcmf_pcie_probe(struct pci_dev *p,void *id) {(void)p;(void)id;probes++;return probe_error;}
+/* Not a J713 sleep: the radio sleep hooks do nothing, as on every other board. */
+static bool apple_radio_sleep_owned(struct device *d) {(void)d;return false;}
+static int apple_radio_sleep_endpoint_prepare(struct device *d,void (*finish)(struct device *)) {(void)d;(void)finish;return 0;}
+static int apple_radio_sleep_endpoint_suspended(struct device *d) {(void)d;return 0;}
+static int apple_radio_sleep_endpoint_resume(struct device *d) {(void)d;return 0;}
+static void apple_radio_sleep_endpoint_resumed(struct device *d,int r) {(void)d;(void)r;}
+/* Only a sleep that owns the radio gets to these. */
+static void brcmf_pcie_sleep_finish(struct device *d) {(void)d;abort();}
+static void brcmf_bus_cancel_reset_work(struct brcmf_bus *b) {(void)b;abort();}
+static int brcmf_pcie_pm_leave_D3(struct device *dev);
 '''
 
 CALLBACK_STUBS = r'''
@@ -194,7 +210,8 @@ static bool vif_up;
 static struct net_device *cfg_to_ndev(struct brcmf_cfg80211_info *c) {return c->pub->iflist[0]->ndev;}
 static struct brcmf_if *netdev_priv(struct net_device *n) {return &ifp[n-ndev];}
 static bool check_vif_up(struct brcmf_cfg80211_vif *v) {(void)v;return vif_up;}
-static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;(void)f;return false;}
+static unsigned feats;
+static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;return feats&BIT(f);}
 static void brcmf_report_wowl_wakeind(struct wiphy *w,struct brcmf_if *i) {(void)w;(void)i;can_command();}
 static void brcmf_fil_iovar_int_set(struct brcmf_if *i,const char *s,int n) {(void)i;(void)s;(void)n;can_command();}
 static void brcmf_config_wowl_pattern(struct brcmf_if *i,const char *s,void *p,int n,void *q,int t) {(void)i;(void)s;(void)p;(void)n;(void)q;(void)t;can_command();}
@@ -204,11 +221,13 @@ static void brcmf_cfg80211_sched_scan_stop(struct wiphy *w,struct net_device *n,
 static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 #define brcmf_fweh_register(p,e,f) ((void)(p),(void)(e))
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
-static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;(void)e;}
-static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
+static unsigned wowl_offs;
+static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();return true;}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
-static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
+static unsigned wowl_configs;
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();wowl_configs++;return 0;}
 static void brcmf_keepalive_start(struct brcmf_if *i,int n) {(void)i;(void)n;can_command();}
 '''
 
@@ -224,7 +243,8 @@ static void reset(void) {
  static typeof(*devinfo.reginfo) regs;devinfo.reginfo=&regs;
  devinfo.state=BRCMFMAC_PCIE_STATE_UP;devinfo.intr=devinfo.ready=devinfo.timer=true;
  country_gets=sets=bands=txflows=creates=cancels=removes=probes=0;
- failure=translation=d0_error=probe_error=wake_error=0;ack=true;retain=1;d3_informs=d0_informs=0;
+ failure=translation=d0_error=probe_error=wake_error=save_error=0;ack=true;retain=1;d3_informs=d0_informs=0;
+ pm_suspend_target_state=PM_SUSPEND_TO_IDLE;feats=0;
 }
 static void hint(const char *a) {
  struct regulatory_request r={.alpha2={a[0],a[1]}};brcmf_cfg80211_reg_notifier(&wiphy,&r);
@@ -315,6 +335,47 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);
   assert(!d0_informs && !removes && !probes);cases++;
  }
+ /* Apple firmware in s2idle without WoWLAN stays in D0: no D3 inform, the
+  * PCI state is saved so PCI PM keeps the power state, TX is fenced as for
+  * D3, and the resume neither informs D0 nor reprobes. */
+ for(int fail=0;fail<2;fail++) {
+  reset();devinfo.fwseed=true;save_error=fail?-EINVAL:0;
+  int ret=brcmf_pcie_pm_enter_D3(&device);
+  assert(!d3_informs && devinfo.state==BRCMFMAC_PCIE_STATE_UP && !devinfo.wowl_sleeping);
+  if(fail) {
+   assert(ret==-EINVAL && !devinfo.s2idle_d0 && !pdev.state_saved);
+   assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer);cases++;continue;
+  }
+  assert(!ret && devinfo.s2idle_d0 && pdev.state_saved && !devinfo.irq_wake_enabled);
+  assert(bus.state==BRCMF_BUS_DOWN && msgbuf.tx_suspended && !devinfo.timer && ndev[0].stopped);
+  devinfo.intr=false;
+  assert(!brcmf_pcie_pm_leave_D3(&device));
+  assert(!devinfo.s2idle_d0 && !pdev.state_saved && devinfo.intr);
+  assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);
+  assert(msgbuf.flowring_work.queued && msgbuf.txflow_work.queued);
+  assert(!d0_informs && !removes && !probes);cases++;
+ }
+ /* WoWLAN over an in-band MSI only wakes from s2idle: a deeper target
+  * refuses WoWLAN like the other refusals (scan state cleared, return 1,
+  * nothing configured) so cfg80211 leaves every interface and suspends
+  * again without it; s2idle, and a bus with a real wake line, keep it. */
+ for(int only=0;only<2;only++)for(int deep=0;deep<2;deep++) {
+  static struct cfg80211_wowlan magic={.magic_pkt=true};
+  reset();vif_up=true;wowl_offs=wowl_configs=0;bus.wowl_s2idle_only=only;feats=BIT(BRCMF_FEAT_WOWL);
+  cfg.scan_status=BIT(BRCMF_SCAN_STATUS_BUSY);
+  pm_suspend_target_state=deep?PM_SUSPEND_ON:PM_SUSPEND_TO_IDLE;
+  int ret=brcmf_cfg80211_suspend(&wiphy,&magic);
+  assert(!cfg.scan_status);
+  if(only&&deep) {
+   assert(ret==1 && !cfg.suspended && !wowl_offs && !wowl_configs);
+   assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended && wowl_offs==1 && !wowl_configs);
+  } else assert(!ret && cfg.suspended && !wowl_offs && wowl_configs==1);
+  cases++;
+ }
+ /* Outside s2idle (hibernation) Apple firmware still gets the D3 handshake. */
+ reset();devinfo.fwseed=true;pm_suspend_target_state=PM_SUSPEND_ON;
+ assert(!brcmf_pcie_pm_enter_D3(&device) && d3_informs==1 && !devinfo.s2idle_d0);
+ assert(devinfo.state==BRCMFMAC_PCIE_STATE_DOWN && !pdev.state_saved);cases++;
  reset();ack=false;assert(brcmf_pcie_pm_enter_D3(&device)==-EIO);
  assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);cases++;
  for(int cold=0;cold<2;cold++)for(int fail=0;fail<2;fail++) {
@@ -332,7 +393,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=['country-gate', 'queue-reasons', 'worker-gate',
-                                              'resume-order', 'tx-drain', 'lpas-resume'])
+                                              'resume-order', 'tx-drain', 'lpas-resume',
+                                              's2idle-d3', 'wowl-s2idle-only'])
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text()
                for name in ('cfg80211', 'core', 'pcie', 'msgbuf')}
@@ -344,7 +406,7 @@ def main():
         'core': ['brcmf_txflowblock_if', 'brcmf_bus_change_state'],
         'msgbuf': ['brcmf_msgbuf_flowring_worker', 'brcmf_msgbuf_txflow_worker',
                    'brcmf_msgbuf_suspend', 'brcmf_msgbuf_resume'],
-        'pcie': ['brcmf_pcie_wowl_wake', 'brcmf_pcie_wowl_sleep',
+        'pcie': ['brcmf_pcie_wowl_wake', 'brcmf_pcie_wowl_sleep', 'brcmf_pcie_s2idle_sleep',
                  'brcmf_pcie_pm_enter_D3', 'brcmf_pcie_pm_leave_D3'],
     }
     body = ''.join(function(sources[group], name)
@@ -363,6 +425,12 @@ def main():
     elif args.mutation == 'lpas-resume':
         body = body.replace('err = brcmf_restore_lpas(cfg, ifp);\n\t\t\tgoto out;',
                             'return brcmf_restore_lpas(cfg, ifp);')
+    elif args.mutation == 's2idle-d3':
+        body = body.replace('if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)',
+                            'if (false)')
+    elif args.mutation == 'wowl-s2idle-only':
+        body = body.replace('if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&\n\t    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)',
+                            'if (false)')
     elif args.mutation == 'tx-drain':
         body = body.replace('netif_tx_disable(ifp->ndev);', '(void)ifp;')
     code = PREFIX.replace('/* STOP_REASONS */', reasons) + CALLBACK_STUBS + body + MAIN

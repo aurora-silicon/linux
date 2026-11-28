@@ -102,6 +102,65 @@ static void hwx_tensor_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/*
+ * fp16, int8 and uint8 surfaces, as Apple's H16 and H17 objects describe
+ * them: format code at +0x24, element bytes at +0x68 (a u64). An 8-bit
+ * surface's rows need width bytes, not 2 * width. Only the known pairs load.
+ */
+static void hwx_element_format_test(struct kunit *test)
+{
+	static const struct {
+		u32 format;
+		u64 element;
+		int ret;
+	} pairs[] = {
+		{ 5, 2, 0 }, { 2, 1, 0 }, { 3, 1, 0 },
+		{ 5, 1, -ENOEXEC }, { 2, 2, -ENOEXEC }, { 3, 2, -ENOEXEC },
+		{ 2, 0, -ENOEXEC }, { 0, 1, -ENOEXEC }, { 1, 1, -ENOEXEC },
+		{ 4, 1, -ENOEXEC }, { 4, 4, -ENOEXEC }, { 6, 2, -ENOEXEC },
+		/* fp32, int16 and uint16: seen in Apple's objects, not yet admitted */
+		{ 6, 4, -ENOEXEC }, { 4, 2, -ENOEXEC }, { 15, 2, -ENOEXEC },
+		{ 2, 1ULL << 32 | 1, -ENOEXEC }, { 5, 1ULL << 32 | 2, -ENOEXEC },
+	};
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	struct ane_h16_hwx info;
+	unsigned int i, t;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (t = 0; t < 2; t++) {
+		u8 *tensor = f->bytes + f->tensor[t];
+
+		/* 64 wide: the 256-byte rows fit even 4-byte elements. */
+		put_unaligned_le32(64, tensor + 0x34);
+		for (i = 0; i < ARRAY_SIZE(pairs); i++) {
+			put_unaligned_le32(pairs[i].format, tensor + 0x24);
+			put_unaligned_le64(pairs[i].element, tensor + 0x68);
+			KUNIT_EXPECT_EQ_MSG(test,
+					    ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    pairs[i].ret, "tensor %u format %u element %#llx",
+					    t, pairs[i].format, pairs[i].element);
+			if (!pairs[i].ret)
+				KUNIT_EXPECT_EQ(test, info.surfaces[t].span, 256ULL);
+		}
+		/* Leave this surface 8-bit: int8 in with uint8 out loads too. */
+		put_unaligned_le32(t ? 3 : 2, tensor + 0x24);
+		put_unaligned_le64(1, tensor + 0x68);
+	}
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+
+	/* A 256-byte row holds 256 int8 elements but only 128 fp16 ones. */
+	put_unaligned_le32(256, f->bytes + f->tensor[0] + 0x34);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	put_unaligned_le32(257, f->bytes + f->tensor[0] + 0x34);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(256, f->bytes + f->tensor[0] + 0x34);
+	put_unaligned_le32(5, f->bytes + f->tensor[0] + 0x24);
+	put_unaligned_le64(2, f->bytes + f->tensor[0] + 0x68);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(128, f->bytes + f->tensor[0] + 0x34);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+}
+
 static u8 *fixture_ref(struct hwx_fixture *f, unsigned int index)
 {
 	size_t pos = 32;
@@ -213,6 +272,31 @@ static void hwx_program_test(struct kunit *test)
 		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
 				    -ENOEXEC, "program field %#x", fields[i]);
 		put_unaligned_le32(saved, program + fields[i]);
+	}
+}
+
+/* The fp32 trailer word: 10000.0f or 1000.0f, in every form; nothing else. */
+static void hwx_trailer_test(struct kunit *test)
+{
+	static const u32 refused[] = { 0, 0x3f800000, 0x42c80000, 0x461c4001, 0x447a0001 };
+	unsigned int variant, i;
+
+	for (variant = 0; variant < 4; variant++) {
+		struct hwx_fixture *f = fixture_create(test, variant & 1, variant & 2);
+		struct ane_h16_hwx info;
+		u8 *word;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		word = f->bytes + f->program + ((variant & 1) ? 0x8a0 : 0x880);
+		KUNIT_ASSERT_EQ(test, get_unaligned_le32(word), 0x461c4000U);
+		put_unaligned_le32(0x447a0000, word);
+		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0,
+				    "form %u, 1000.0f", variant);
+		for (i = 0; i < ARRAY_SIZE(refused); i++) {
+			put_unaligned_le32(refused[i], word);
+			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    -ENOEXEC, "form %u, word %#x", variant, refused[i]);
+		}
 	}
 }
 
@@ -596,13 +680,243 @@ static void hwx_import_bounds_test(struct kunit *test)
 	ane_h16_hwx_snapshot_destroy(&snapshot);
 }
 
+/*
+ * Open a gap of @len bytes at @at in a fixture's link-edit data (symbols, strings, relocations
+ * after the load commands), moving every file offset that points at or past it.
+ */
+static void fixture_gap(struct hwx_fixture *f, u32 at, u32 len)
+{
+	u32 end = f->reloc + 8, off;
+
+	memmove(f->bytes + at + len, f->bytes + at, end - at);
+	memset(f->bytes + at, 0, len);
+	for (off = 8; off <= 16; off += 8) {
+		u32 v = get_unaligned_le32(f->bytes + f->symtab + off);
+
+		if (v >= at)
+			put_unaligned_le32(v + len, f->bytes + f->symtab + off);
+	}
+	if (get_unaligned_le32(f->bytes + f->text_command + 72 + 56) >= at)
+		put_unaligned_le32(f->reloc + len, f->bytes + f->text_command + 72 + 56);
+	if (f->symbols >= at)
+		f->symbols += len;
+	if (f->strings >= at)
+		f->strings += len;
+	f->reloc += len;
+}
+
+/*
+ * Apple's zin_ane_compiler 10.205 H17 output (this Mac's macOS, camera-denoise's low-light
+ * network): __TEXT flags 0 beside __DATA, surfaces + kernel from BAR slot 5, an inline
+ * LC_NOTE "rt.version", stabs type records and empty kernel objects at the section end.
+ * Each form is H17-only; H16 keeps refusing it.
+ */
+static void hwx_h17_zin_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, true, true);
+	struct ane_h16_hwx info;
+	u8 *c, *sym, *note;
+	u32 i, strsize;
+	u64 cell[3];
+
+#define H17_OK() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0)
+#define REFUSED() KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC)
+#define AS_H16(check)							\
+	do {								\
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H16, f->bytes + 8);	\
+		check;							\
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H17, f->bytes + 8);	\
+	} while (0)
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	AS_H16(KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+	H17_OK();
+
+	/* __TEXT carries relocations: flags 0 beside a scratch segment; nothing else. */
+	put_unaligned_le32(0, f->bytes + f->text_command + 68);
+	H17_OK();
+	AS_H16(REFUSED());
+	put_unaligned_le32(1, f->bytes + f->text_command + 68);
+	REFUSED();
+	put_unaligned_le32(4, f->bytes + f->text_command + 68);
+
+	/* The surfaces then the kernel from BAR slot 5 (+0x60), in order, nothing after. */
+	c = f->bytes + f->program;
+	for (i = 0; i < 3; i++)
+		cell[i] = get_unaligned_le64(c + 0x70 + i * 16);
+	put_unaligned_le64(0, c + 0x90);
+	for (i = 0; i < 3; i++)
+		put_unaligned_le64(cell[i], c + 0x60 + i * 16);
+	H17_OK();
+	AS_H16(REFUSED());
+	put_unaligned_le64(cell[2], c + 0x90);
+	REFUSED();
+	put_unaligned_le64(0, c + 0x90);
+	put_unaligned_le64(cell[1], c + 0x60);
+	put_unaligned_le64(cell[0], c + 0x70);
+	REFUSED();
+	put_unaligned_le64(0, c + 0x60);	/* back to the slot 6 form */
+	for (i = 0; i < 3; i++)
+		put_unaligned_le64(cell[i], c + 0x70 + i * 16);
+	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+
+	/* A stabs N_LSYM record: no section, value 0, a type number in n_desc. */
+	strsize = get_unaligned_le32(f->bytes + f->symtab + 20);
+	fixture_gap(f, f->strings + strsize, 16);	/* its name */
+	memcpy(f->bytes + f->strings + strsize, "void:t1=1", 10);
+	fixture_gap(f, f->strings, 16);			/* the record */
+	sym = f->bytes + f->symbols + 2 * 16;
+	put_unaligned_le32(strsize, sym);
+	sym[4] = 0x80;
+	put_unaligned_le16(1, sym + 6);
+	put_unaligned_le32(3, f->bytes + f->symtab + 12);
+	put_unaligned_le32(strsize + 16, f->bytes + f->symtab + 20);
+	H17_OK();
+	AS_H16(REFUSED());
+	put_unaligned_le64(0x1000, sym + 8);
+	REFUSED();
+	put_unaligned_le64(0, sym + 8);
+	sym[5] = 1;
+	REFUSED();
+
+	/* The same record as an empty kernel object at the end of __kern_0 (64 bytes). */
+	sym[4] = 0xf;
+	sym[5] = 6;
+	put_unaligned_le16(0, sym + 6);
+	put_unaligned_le64(cell[2] + 64, sym + 8);
+	H17_OK();
+	AS_H16(REFUSED());
+	put_unaligned_le64(cell[2] + 65, sym + 8);
+	REFUSED();
+	put_unaligned_le64(cell[2], sym + 8);	/* inside: every form takes it */
+	AS_H16(KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0));
+
+	/* LC_NOTE "rt.version", its 4 bytes inline at +40, zero padding. */
+	fixture_gap(f, f->cursor, 48);
+	note = f->bytes + f->cursor;
+	put_unaligned_le32(0x31, note);
+	put_unaligned_le32(48, note + 4);
+	strscpy(note + 8, "rt.version", 16);
+	put_unaligned_le64(40, note + 24);
+	put_unaligned_le64(4, note + 32);
+	put_unaligned_le32(0x10001, note + 40);
+	f->cursor += 48;
+	put_unaligned_le32(get_unaligned_le32(f->bytes + 16) + 1, f->bytes + 16);
+	put_unaligned_le32(f->cursor - 32, f->bytes + 20);
+	H17_OK();
+	AS_H16(REFUSED());
+	put_unaligned_le64(48, note + 24);
+	REFUSED();
+	put_unaligned_le64(40, note + 24);
+	note[44] = 1;
+	REFUSED();
+	note[44] = 0;
+	note[8] = 'R';
+	REFUSED();
+	note[8] = 'r';
+
+	/* Everything together, as the compiler writes it. */
+	put_unaligned_le32(0, f->bytes + f->text_command + 68);
+	put_unaligned_le64(0, c + 0x90);
+	for (i = 0; i < 3; i++)
+		put_unaligned_le64(cell[i], c + 0x60 + i * 16);
+	put_unaligned_le64(cell[2] + 64, sym + 8);
+	H17_OK();
+	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
+	KUNIT_EXPECT_EQ(test, info.subtype, ANE_HWX_SUBTYPE_H17);
+#undef H17_OK
+#undef REFUSED
+#undef AS_H16
+}
+
+/*
+ * H15 (M3, subtype 6): 0x890 linear / 0x8b0 mixed program descriptor (no fp32
+ * trailer record, trailer_bar 5), 8-word task header, prologue 0 or 1.
+ */
+static void hwx_h15_test(struct kunit *test)
+{
+	unsigned int form;
+
+	for (form = 0; form < 2; form++) {
+		struct hwx_fixture *f = fixture_create(test, form, false);
+		struct ane_h16_hwx info = {};
+		u32 prog_len = form ? 0x8b0 : 0x890;
+		u32 old_len = form ? 0x8c0 : 0x8a0;
+		u8 *c, *text, *section;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		/* Shrink the program descriptor command by 16 bytes (drop key=7 record). */
+		c = f->bytes + f->program;
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H15, f->bytes + 8);
+		put_unaligned_le32(prog_len, c + 4);
+		put_unaligned_le32(form ? 0x226 : 0x21e, c + 0xc);
+		put_unaligned_le32(form ? 0x8a8 : 0x888, c + 0x848);
+		put_unaligned_le32(5, c + 0x868);
+		put_unaligned_le32(form ? 3 : 1, c + 0x870);
+		if (form) {
+			/* Mixed 0x8b0: keep key=2 and key=3, move key=9 to +0x898. */
+			put_unaligned_le32(9, c + 0x898);
+			put_unaligned_le32(8, c + 0x89c);
+			put_unaligned_le32(0, c + 0x8a0);
+			put_unaligned_le32(0, c + 0x8a4);
+			memcpy(c + 0x8a8, "main", 5);
+		} else {
+			/* Linear 0x890: single key=9 record at +0x878. */
+			put_unaligned_le32(9, c + 0x878);
+			put_unaligned_le32(8, c + 0x87c);
+			put_unaligned_le32(0, c + 0x880);
+			put_unaligned_le32(0, c + 0x884);
+			memcpy(c + 0x888, "main", 5);
+		}
+		/* Shift remaining load commands + symtab/strings back by 16 bytes. */
+		memmove(c + prog_len, c + old_len, f->reloc + 8 - (f->program + old_len));
+		f->cursor -= 16;
+		f->symtab -= 16;
+		f->symbols -= 16;
+		f->strings -= 16;
+		put_unaligned_le32(f->cursor - 32, f->bytes + 20);
+		put_unaligned_le32(f->symbols, f->bytes + f->symtab + 8);
+		put_unaligned_le32(f->strings, f->bytes + f->symtab + 16);
+
+		/* H15 task stream: 8-word header + 2-word record (40 B) + 16 B prologue. */
+		text = f->bytes + SZ_16K;
+		section = f->bytes + f->text_command + 72;
+		memset(text, 0, 64);
+		put_unaligned_le32(0, text);
+		put_unaligned_le32(10 << 16, text + 16);
+		put_unaligned_le32(0x4100 / 4, text + 48);
+		put_unaligned_le64(56, section + 40);
+		put_unaligned_le32(14, c + 0x824);
+
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		KUNIT_EXPECT_EQ(test, info.subtype, ANE_HWX_SUBTYPE_H15);
+		KUNIT_EXPECT_EQ(test, info.tasks, 1U);
+		/* Prologue 1 is accepted too. */
+		put_unaligned_le32(1, text);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		/* H16 rejects an H15 layout. */
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H16, f->bytes + 8);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H15, f->bytes + 8);
+		/* A 9-word H16 task header fails H15 validation. */
+		put_unaligned_le32(11 << 16, text + 16);
+		put_unaligned_le32(0, text + 48);
+		put_unaligned_le32(0x4100 / 4, text + 52);
+		put_unaligned_le64(60, section + 40);
+		put_unaligned_le32(15, c + 0x824);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	}
+}
+
 static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_forms_test),
 	KUNIT_CASE(hwx_header_test),
 	KUNIT_CASE(hwx_command_test),
 	KUNIT_CASE(hwx_tensor_test),
+	KUNIT_CASE(hwx_element_format_test),
 	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),
+	KUNIT_CASE(hwx_trailer_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
@@ -613,6 +927,8 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_load_original_test),
 	KUNIT_CASE(hwx_load_resources_test),
 	KUNIT_CASE(hwx_import_bounds_test),
+	KUNIT_CASE(hwx_h17_zin_test),
+	KUNIT_CASE(hwx_h15_test),
 	{}
 };
 
@@ -622,4 +938,5 @@ static struct kunit_suite hwx_suite = {
 };
 
 kunit_test_suite(hwx_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple ANE HWX loading");
 MODULE_LICENSE("Dual MIT/GPL");

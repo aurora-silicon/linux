@@ -8,6 +8,8 @@
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_net.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -83,6 +85,10 @@ static bool station_link_addresses;
 module_param(station_link_addresses, bool, 0400);
 MODULE_PARM_DESC(station_link_addresses, "Diagnostic: use the netdev address for each firmware link in this single-link WPA2 client");
 
+static bool alpha_sleep_untested;
+module_param(alpha_sleep_untested, bool, 0600);
+MODULE_PARM_DESC(alpha_sleep_untested, "TEST ONLY: J813 Alpha host-power and ACIPC sleep handshake");
+
 struct centauri_rx_snapshot {
 	__le32 version, count;
 	struct {
@@ -101,6 +107,7 @@ struct centauri_wifi {
 	struct work_struct connect_work;
 	struct delayed_work link_work;
 	struct cfg80211_scan_request *scan_request;
+	bool scan_abort;
 	struct mutex lock;
 	/* The logger has its own coherent allocation. Reads/acknowledgements
 	 * must remain possible while scan/connect hold the command mutex.
@@ -114,6 +121,7 @@ struct centauri_wifi {
 	u32 reply_command, channels_seen, scans_done, beacons_seen;
 	bool reply_valid, registered, configured;
 	bool stopping;
+	bool transport_paused, transport_sleep_sent, host_sleep_sent;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool associated, pmk_seen, pmk_matches;
 	u8 expected_pmk[32];
@@ -152,6 +160,7 @@ struct centauri_wifi {
 	u8 country[3];
 	bool country_valid;
 	u8 station_stats[0x378];
+	u16 station_stats_len;
 	bool station_stats_valid;
 	u8 rx_crypto_stats[64];
 	bool rx_crypto_stats_valid;
@@ -214,6 +223,8 @@ static int alpha_message(struct centauri_wifi *wifi, const void *message, size_t
 	u8 *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
 
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
 	if (head >= 15 || size > 512)
 		return -ENOSPC;
 	memcpy(wifi->a.messages + (head + 1) * 512, message, size);
@@ -539,11 +550,50 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		netif_wake_queue(wifi->netdev);
 }
 
-static void drain(struct centauri_wifi *wifi)
+/* Record a reply to the statistics command 0xb0001. */
+static void record_stats_reply(struct centauri_wifi *wifi, const u8 *packet,
+			       u16 size, u16 status)
+{
+	wifi->stats_reply_size = size;
+	wifi->stats_tag = size >= 28 ? get_unaligned_le16(packet + 24) : 0;
+	wifi->stats_length = size >= 28 ? get_unaligned_le16(packet + 26) : 0;
+	if (!status && wifi->stats_tag == 0xf928 &&
+	    (wifi->stats_length == 752 || wifi->stats_length == 888) &&
+	    size >= 28 + wifi->stats_length) {
+		/* Native firmware returns the older 752-byte counter record. */
+		memset(wifi->station_stats, 0, sizeof(wifi->station_stats));
+		memcpy(wifi->station_stats, packet + 28, wifi->stats_length);
+		/* A later reply can change stats_length; keep this record's own. */
+		wifi->station_stats_len = wifi->stats_length;
+		wifi->station_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf921 &&
+	    wifi->stats_length == sizeof(wifi->rx_crypto_stats) &&
+	    size >= 28 + sizeof(wifi->rx_crypto_stats)) {
+		memcpy(wifi->rx_crypto_stats, packet + 28, sizeof(wifi->rx_crypto_stats));
+		wifi->rx_crypto_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf91b &&
+	    wifi->stats_length == sizeof(wifi->dot11_mib_stats) &&
+	    size >= 28 + sizeof(wifi->dot11_mib_stats)) {
+		memcpy(wifi->dot11_mib_stats, packet + 28, sizeof(wifi->dot11_mib_stats));
+		wifi->dot11_mib_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf920 &&
+	    wifi->stats_length == sizeof(wifi->tx_power_report) &&
+	    size >= 28 + sizeof(wifi->tx_power_report)) {
+		memcpy(wifi->tx_power_report, packet + 28, sizeof(wifi->tx_power_report));
+		wifi->tx_power_report_valid = true;
+	}
+}
+
+static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 {
 	unsigned int ring;
 	bool posted = false;
 
+	if (READ_ONCE(wifi->transport_paused) && !pm_command)
+		return;
 	for (ring = 2; ring <= 4; ring++) {
 		unsigned int budget = ring_size[ring];
 
@@ -661,37 +711,8 @@ static void drain(struct centauri_wifi *wifi)
 						pos += 4 + length;
 					}
 				}
-				if (command == 0xb0001) {
-					wifi->stats_reply_size = size;
-					wifi->stats_tag = size >= 28 ? get_unaligned_le16(packet + 24) : 0;
-					wifi->stats_length = size >= 28 ? get_unaligned_le16(packet + 26) : 0;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf928 &&
-				    (wifi->stats_length == 752 || wifi->stats_length == 888) &&
-				    size >= 28 + wifi->stats_length) {
-					/* Native firmware returns the older 752-byte counter record. */
-					memset(wifi->station_stats, 0, sizeof(wifi->station_stats));
-					memcpy(wifi->station_stats, packet + 28, wifi->stats_length);
-					wifi->station_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf921 &&
-				    wifi->stats_length == sizeof(wifi->rx_crypto_stats) &&
-				    size >= 28 + sizeof(wifi->rx_crypto_stats)) {
-					memcpy(wifi->rx_crypto_stats, packet + 28, sizeof(wifi->rx_crypto_stats));
-					wifi->rx_crypto_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf91b &&
-				    wifi->stats_length == sizeof(wifi->dot11_mib_stats) &&
-				    size >= 28 + sizeof(wifi->dot11_mib_stats)) {
-					memcpy(wifi->dot11_mib_stats, packet + 28, sizeof(wifi->dot11_mib_stats));
-					wifi->dot11_mib_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf920 &&
-				    wifi->stats_length == sizeof(wifi->tx_power_report) &&
-				    size >= 28 + sizeof(wifi->tx_power_report)) {
-					memcpy(wifi->tx_power_report, packet + 28, sizeof(wifi->tx_power_report));
-					wifi->tx_power_report_valid = true;
-				}
+				if (command == 0xb0001)
+					record_stats_reply(wifi, packet, size, status);
 				if (command == 0xf0025) {
 					wifi->pmk_seen = !status && size >= 60;
 					wifi->pmk_matches = wifi->pmk_seen &&
@@ -711,20 +732,32 @@ static void drain(struct centauri_wifi *wifi)
 	completions(wifi);
 	if (posted)
 		writel(1, wifi->a.bar + 0x1004);
-	drain_data_rx(wifi);
-	drain_data_tx(wifi);
+	if (!READ_ONCE(wifi->transport_paused)) {
+		drain_data_rx(wifi);
+		drain_data_tx(wifi);
+	}
 }
 
-static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size_t size)
+static void drain(struct centauri_wifi *wifi)
+{
+	drain_control(wifi, false);
+}
+
+static int command_control(struct centauri_wifi *wifi, u32 id, const void *payload,
+			   size_t size, bool pm_command)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
 	u8 *packet, *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
 
+	if (READ_ONCE(wifi->transport_paused) && !pm_command)
+		return -EBUSY;
 	if (size + 24 > BUFFER_SIZE)
 		return -EMSGSIZE;
-	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1))
+	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1)) {
+		centauri_recovery_request(wifi->control, "command ring full");
 		return -ENOSPC;
+	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
 	put_unaligned_le16(24 + size, packet + 0x10);
@@ -743,9 +776,11 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size
 	dma_wmb();
 	writel(1, wifi->a.bar + 0x1004);
 	do {
-		drain(wifi);
-		if (readl(wifi->a.bar + 8) != 2)
+		drain_control(wifi, pm_command);
+		if (readl(wifi->a.bar + 8) != 2) {
+			centauri_recovery_request(wifi->control, "command: Alpha stage");
 			return -EIO;
+		}
 		/* Bit 30 is more-data-pending, not part of the command identity.
 		 * Scan/connect replies set it before their later completion event.
 		 */
@@ -760,7 +795,29 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
 	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
+	centauri_recovery_request(wifi->control, "command timeout");
 	return -ETIMEDOUT;
+}
+
+/*
+ * The firmware has stopped: Alpha left execution stage 2, or the command ring stays full
+ * (a running firmware drains each command before the next is queued). Not while the
+ * transport is paused for a system sleep.
+ */
+bool centauri_wifi_stalled(struct centauri *c)
+{
+	struct centauri_wifi *wifi = c->wifi;
+
+	if (!wifi || READ_ONCE(wifi->transport_paused) || READ_ONCE(wifi->stopping))
+		return false;
+	if (readl(wifi->a.bar + 8) != 2)
+		return true;
+	return (READ_ONCE(wifi->command_head) + 1) % ring_size[1] == index_read(wifi, 1, 1);
+}
+
+static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size_t size)
+{
+	return command_control(wifi, id, payload, size, false);
 }
 
 static int radio_start(struct centauri_wifi *wifi)
@@ -812,6 +869,35 @@ static int radio_start(struct centauri_wifi *wifi)
 	return 0;
 }
 
+/* The station's RSN element (body) with PSK as its only AKM, written to selected; returns its size. */
+static int select_rsn(const u8 *body, size_t size, u8 *selected)
+{
+	size_t offset, tail;
+	u16 count;
+	unsigned int i;
+
+	if (size < 8 || get_unaligned_le16(body) != 1)
+		return -EINVAL;
+	count = get_unaligned_le16(body + 6);
+	offset = 8 + 4 * count;
+	if (!count || offset + 2 > size)
+		return -EINVAL;
+	count = get_unaligned_le16(body + offset);
+	tail = offset + 2 + 4 * count;
+	if (!count || tail > size)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == WLAN_AKM_SUITE_PSK)
+			break;
+	if (i == count)
+		return -EOPNOTSUPP;
+	memcpy(selected, body, offset);
+	put_unaligned_le16(1, selected + offset);
+	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
+	memcpy(selected + offset + 6, body + tail, size - tail);
+	return offset + 6 + size - tail;
+}
+
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
 
 /* Dwell times in ms for the scan request. The macOS 27 scan adapter copies
@@ -857,6 +943,49 @@ static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf
 	return size;
 }
 
+static bool scan_transport_stopped(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping) ||
+	       READ_ONCE(wifi->transport_paused) ||
+	       readl(wifi->a.bar + 8) != 2;
+}
+
+static int scan_wait_stop(struct centauri_wifi *wifi, u32 done)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
+
+	do {
+		if (scan_transport_stopped(wifi))
+			return -EIO;
+		drain(wifi);
+		if (wifi->scans_done != done)
+			return 0;
+		mutex_unlock(&wifi->lock);
+		usleep_range(1000, 2000);
+		mutex_lock(&wifi->lock);
+	} while (time_before(jiffies, deadline));
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	drain(wifi);
+	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
+}
+
+static int scan_stop_chunk(struct centauri_wifi *wifi, u32 done)
+{
+	int ret;
+
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	ret = command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+		return 0;
+	if (ret)
+		return ret;
+	return scan_wait_stop(wifi, done);
+}
+
 static void scan_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
@@ -864,45 +993,115 @@ static void scan_worker(struct work_struct *work)
 	struct cfg80211_scan_request *request;
 	u8 scan[14 + 4 + 1 + 4 * 13 + 4 + 5];
 	size_t scan_size;
-	unsigned int chunk;
+	unsigned int chunk, chunks = DIV_ROUND_UP(13 + ARRAY_SIZE(five_ghz), 13);
+	u32 channels_start, beacons_start;
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	for (chunk = 0; chunk < 3 && !ret; chunk++) {
-		u32 channels = wifi->channels_seen, done = wifi->scans_done;
-		bool stopped = false;
-		unsigned long deadline;
+	channels_start = wifi->channels_seen;
+	beacons_start = wifi->beacons_seen;
+	for (chunk = 0; chunk < chunks && !ret; chunk++) {
+		u32 channels = wifi->channels_seen, done = wifi->scans_done, seen = channels;
+		unsigned int count = min_t(unsigned int, 13,
+					   13 + ARRAY_SIZE(five_ghz) - chunk * 13);
+		unsigned long deadline, progress;
+		bool stopped = false, refused = false;
 
+		if (scan_transport_stopped(wifi)) {
+			ret = -EIO;
+			break;
+		}
+		if (READ_ONCE(wifi->scan_abort)) {
+			ret = -ECANCELED;
+			break;
+		}
 		scan_size = build_scan(wifi, chunk, scan);
 		ret = command(wifi, 65551, scan, scan_size);
 		if (ret)
 			break;
-		deadline = jiffies + msecs_to_jiffies(8000);
+		/*
+		 * The firmware reports every channel it finishes (event 0x30) and then the scan
+		 * (event 0x05). This loop used to stop each chunk after its 8th channel, so a scan
+		 * covered 24 of the 38 channels (J815 boot 2d103457: "channels=24"): 2.4 GHz 9-13,
+		 * 5 GHz 100-116 and 153-165 were never scanned and 149 was the last one kept. A
+		 * 5 GHz BSS there came and went between scans, and the supplicant joined 2.4 GHz.
+		 * The chunk now runs to its own end. It's stopped only once all of its channels
+		 * have reported without a scan event, when it goes quiet for a second after some
+		 * progress (a channel the firmware skips under the country rules), at its
+		 * deadline, or on an abort. A chunk that ends early keeps what it found.
+		 */
+		deadline = jiffies +
+			   msecs_to_jiffies(max(8000U, count * 2 * SCAN_PASSIVE_DWELL_MS + 2000));
+		progress = jiffies;
 		do {
-			drain(wifi);
-			if (readl(wifi->a.bar + 8) != 2) {
+			if (scan_transport_stopped(wifi)) {
+				if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused) &&
+				    readl(wifi->a.bar + 8) != 2)
+					centauri_recovery_request(wifi->control, "scan: Alpha stage");
 				ret = -EIO;
 				break;
 			}
-			if (!stopped && wifi->channels_seen - channels >= 8) {
-				stopped = true;
-				ret = command(wifi, 65537, NULL, 0);
-				if (ret)
-					break;
-			}
-			if (stopped && wifi->scans_done > done)
+			drain(wifi);
+			if (wifi->scans_done != done)
 				break;
+			if (READ_ONCE(wifi->scan_abort)) {
+				int stop_ret = stopped ? scan_wait_stop(wifi, done) :
+					       scan_stop_chunk(wifi, done);
+
+				ret = stop_ret == -EIO ? -EIO : -ECANCELED;
+				break;
+			}
+			if (wifi->channels_seen != seen) {
+				seen = wifi->channels_seen;
+				progress = jiffies;
+			}
+			if (!stopped &&
+			    (seen - channels >= count ||
+			     (seen != channels &&
+			      time_after(jiffies, progress + msecs_to_jiffies(1000))))) {
+				stopped = true;
+				/*
+				 * A refused stop (firmware status 342 on J815) means the chunk
+				 * had ended already: keep its results and go on.
+				 */
+				if (command(wifi, 65537, NULL, 0)) {
+					dev_dbg(&wifi->control->pdev->dev,
+						"Wi-Fi scan chunk %u: stop refused (status %u), chunk over\n",
+						chunk, wifi->reply_status);
+					refused = true;
+					break;
+				}
+				/* The stop's own scan event ends the wait. */
+				deadline = jiffies + msecs_to_jiffies(1000);
+			}
+			mutex_unlock(&wifi->lock);
 			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
-		if (!ret && wifi->scans_done == done)
-			ret = -ETIMEDOUT;
+		if (!ret && !refused && wifi->scans_done == done) {
+			if (scan_transport_stopped(wifi)) {
+				ret = -EIO;
+			} else {
+				drain(wifi);
+				if (wifi->scans_done == done) {
+					dev_warn(&wifi->control->pdev->dev,
+						 "Wi-Fi scan chunk %u: %u of %u channels, no scan event%s\n",
+						 chunk, wifi->channels_seen - channels, count,
+						 stopped ? " after the stop" : "");
+					ret = stopped ? -ETIMEDOUT :
+					      scan_stop_chunk(wifi, done);
+				}
+			}
+		}
 	}
-	info.aborted = !!ret;
+	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) ||
+		       READ_ONCE(wifi->stopping);
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
-	dev_info(&wifi->control->pdev->dev, "Wi-Fi scan finished: rc=%d channels=%u beacons=%u\n",
-		 ret, wifi->channels_seen, wifi->beacons_seen);
+	dev_info(&wifi->control->pdev->dev, "Wi-Fi scan finished: rc=%d channels=%u of %zu beacons=%u\n",
+		 ret, wifi->channels_seen - channels_start, 13 + ARRAY_SIZE(five_ghz),
+		 wifi->beacons_seen - beacons_start);
 	if (request)
 		cfg80211_scan_done(request, &info);
 }
@@ -979,16 +1178,44 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size;
 	u16 caps = 0;
-	int ret = 0, offset;
+	int ret = 0, offset, i;
 
+	/*
+	 * wpa_supplicant without SME lists every AKM the network allows
+	 * (NetworkManager's "WPA-PSK WPA-PSK-SHA256" gives PSK and PSK-SHA256).
+	 * Accept any list that offers PSK and send the firmware PSK alone, as
+	 * the T6050 driver does (select_rsn).
+	 */
+	for (i = 0; i < params->crypto.n_akm_suites; i++)
+		if (params->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			break;
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    i == params->crypto.n_akm_suites ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie))
+	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie)) {
+		dev_info(&wifi->control->pdev->dev,
+			 "connect refused: ssid_len=%zu psk=%d akms=%d [%08x %08x] pairwise=%d [%08x] group=%08x ie_len=%zu\n",
+			 params->ssid_len, !!params->crypto.psk, params->crypto.n_akm_suites,
+			 params->crypto.n_akm_suites > 0 ? params->crypto.akm_suites[0] : 0,
+			 params->crypto.n_akm_suites > 1 ? params->crypto.akm_suites[1] : 0,
+			 params->crypto.n_ciphers_pairwise,
+			 params->crypto.n_ciphers_pairwise ? params->crypto.ciphers_pairwise[0] : 0,
+			 params->crypto.cipher_group, params->ie_len);
 		return -EOPNOTSUPP;
+	}
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn || rsn_caps_offset(rsn + 2, rsn[1]) < 0)
+	if (!rsn) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: no RSN element in the request\n");
 		return -EINVAL;
+	}
+	ret = select_rsn(rsn + 2, rsn[1], rsn_body);
+	if (ret < 0 || rsn_caps_offset(rsn_body, ret) < 0) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: RSN element %*ph not usable (%d)\n",
+			 rsn[1] + 2, rsn, ret);
+		return ret < 0 ? ret : -EINVAL;
+	}
+	rsn_size = ret;
+	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
@@ -1012,8 +1239,6 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			caps = get_unaligned_le16(ap_rsn + 2 + offset);
 	}
 	rcu_read_unlock();
-	rsn_size = rsn[1];
-	memcpy(rsn_body, rsn + 2, rsn_size);
 	offset = rsn_caps_offset(rsn_body, rsn_size);
 	put_unaligned_le16(caps, rsn_body + offset);
 	pmf = !!(caps & BIT(7));
@@ -1116,6 +1341,9 @@ static void connect_worker(struct work_struct *work)
 		}
 	}
 	host_setup_commands(wifi);
+	drain(wifi);
+	wifi->connect_event = false;
+	wifi->disconnect_event = false;
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	command_status = wifi->reply_status;
@@ -1150,9 +1378,10 @@ static void connect_worker(struct work_struct *work)
 			probe_ret = query_station_stats(wifi);
 			dev_info(&wifi->control->pdev->dev,
 				 "connection counters: complete=%d rc=%d valid=%d length=%u\n",
-				 wifi->connect_event, probe_ret, wifi->station_stats_valid, wifi->stats_length);
+				 wifi->connect_event, probe_ret, wifi->station_stats_valid,
+				 wifi->station_stats_len);
 			if (!probe_ret && wifi->station_stats_valid)
-				for (i = 0; i < wifi->stats_length; i += 4) {
+				for (i = 0; i < wifi->station_stats_len; i += 4) {
 					u32 value = get_unaligned_le32(wifi->station_stats + i);
 
 					if (value)
@@ -1218,6 +1447,10 @@ static void link_worker(struct work_struct *work)
 	bool disconnected;
 
 	mutex_lock(&wifi->lock);
+	if (wifi->transport_paused) {
+		mutex_unlock(&wifi->lock);
+		return;
+	}
 	drain(wifi);
 	disconnected = wifi->disconnect_event || READ_ONCE(wifi->stopping) ||
 		readl(wifi->a.bar + 8) != 2;
@@ -1239,7 +1472,8 @@ void centauri_wifi_kick(struct centauri *c)
 {
 	struct centauri_wifi *wifi = READ_ONCE(c->wifi);
 
-	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping))
+	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping) &&
+	    !READ_ONCE(wifi->transport_paused))
 		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
 }
 
@@ -1375,6 +1609,26 @@ static int wifi_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
 	return ret;
 }
 
+/*
+ * The factory address, which the loader copies from ADT /chosen
+ * mac-address-wifi0 into the wifi0 alias target's local-mac-address (as on
+ * T6050). A board without that node, or a loader that left the placeholder,
+ * keeps the old per-boot random address.
+ */
+static void centauri_wifi_set_address(struct net_device *netdev)
+{
+	struct device_node *np = of_find_node_by_path("wifi0");
+	u8 addr[ETH_ALEN];
+	int ret = np ? of_get_mac_address(np, addr) : -ENODEV;
+
+	of_node_put(np);
+	if (!ret && is_valid_ether_addr(addr)) {
+		eth_hw_addr_set(netdev, addr);
+		return;
+	}
+	eth_hw_addr_random(netdev);
+}
+
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
 	.connect = wifi_connect,
@@ -1397,6 +1651,14 @@ static int net_stop(struct net_device *netdev)
 
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	/*
+	 * Finish a running scan before cfg80211's NETDEV_DOWN. Otherwise
+	 * cfg80211 completes it as driver-owned and stale, keeps its scan
+	 * message, and refuses every later scan with -EBUSY.
+	 */
+	WRITE_ONCE(wifi->scan_abort, true);
+	flush_work(&wifi->scan_work);
+	WRITE_ONCE(wifi->scan_abort, false);
 	return 0;
 }
 
@@ -1404,6 +1666,10 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)netdev_priv(netdev);
 
+	if (READ_ONCE(wifi->transport_paused)) {
+		netif_stop_queue(netdev);
+		return NETDEV_TX_BUSY;
+	}
 	if (READ_ONCE(wifi->stopping) || !READ_ONCE(wifi->connected) ||
 	    skb->len < ETH_HLEN || skb->len > BUFFER_SIZE) {
 		netdev->stats.tx_dropped++;
@@ -1550,6 +1816,10 @@ static ssize_t fwlog_ack_write(struct file *file, const char __user *input,
 	if (ret)
 		return ret;
 	mutex_lock(&wifi->fwlog_lock);
+	if (READ_ONCE(wifi->transport_paused)) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (!wifi->fwlog_ready || readl(wifi->a.bar + 8) != 2) {
 		ret = -ENETDOWN;
 		goto out;
@@ -1755,6 +2025,8 @@ static int transmit_eapol_start(struct centauri_wifi *wifi)
 	u64 metadata = 0;
 	unsigned int attempt;
 
+	if (READ_ONCE(wifi->transport_paused))
+		return -EBUSY;
 	if (readl(wifi->a.bar + 8) != 2 || !(wifi->data_probe_done & BIT(3)))
 		return -ENETDOWN;
 	/* Eight independent buffers bound the probe without ring reuse. */
@@ -2103,6 +2375,7 @@ static int query_station_stats(struct centauri_wifi *wifi)
 	put_unaligned_le16(363, payload + 9);
 	put_unaligned_le16(9, payload + 11);
 	wifi->station_stats_valid = false;
+	wifi->station_stats_len = 0;
 	wifi->stats_reply_size = wifi->stats_tag = wifi->stats_length = 0;
 	ret = wifi->configured ? command(wifi, 0xb0001, payload, sizeof(payload)) : -ENETDOWN;
 	if (!ret) {
@@ -2120,10 +2393,11 @@ static int station_stats_show(struct seq_file *seq, void *unused)
 
 	mutex_lock(&wifi->lock);
 	ret = query_station_stats(wifi);
-	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u\n", ret,
-		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag, wifi->stats_length);
+	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u counters=%u\n", ret,
+		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag,
+		   wifi->stats_length, wifi->station_stats_len);
 	if (!ret && wifi->station_stats_valid)
-		for (i = 0; i < wifi->stats_length; i += 4) {
+		for (i = 0; i < wifi->station_stats_len; i += 4) {
 			u32 value = get_unaligned_le32(wifi->station_stats + i);
 
 			if (value)
@@ -2349,6 +2623,14 @@ int centauri_wifi_register(struct centauri *c)
 	set_wiphy_dev(wifi->wiphy, &c->pdev->dev);
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wifi->wiphy->max_scan_ssids = 1;
+	/*
+	 * cfg80211 refuses a scan whose IEs exceed this. wpa_supplicant 2.11
+	 * adds 15 bytes to every scan (Extended Capabilities and an empty
+	 * Mesh ID); 512, wl1251's limit for the same reason, leaves room for
+	 * optional ones such as WPS or Interworking. build_scan() follows the
+	 * macOS request, which carries no IEs, so they are dropped.
+	 */
+	wifi->wiphy->max_scan_ie_len = 512;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;
@@ -2388,7 +2670,7 @@ int centauri_wifi_register(struct centauri *c)
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_random(wifi->netdev);
+	centauri_wifi_set_address(wifi->netdev);
 	ret = register_netdev(wifi->netdev);
 	if (ret)
 		goto failed;
@@ -2422,6 +2704,167 @@ int centauri_wifi_register(struct centauri *c)
 	return 0;
 failed:
 	centauri_wifi_unregister(c);
+	return ret;
+}
+
+/*
+ * 26B123 t2026-CentauriAlpha uses BAR0 + 0x1024 for sleep_control.
+ * AirshipDK's ACIPC host-sleep handshake writes 3 and waits for status 3;
+ * wake writes 0 and waits for status 0 or 1. The peripheral-info block
+ * starts at context + 0x68, with sleep_status at +8, as on Beta.
+ * Stop every ring producer before requesting host sleep. Keep them stopped
+ * until the wake acknowledgment, including when suspend entry is refused.
+ */
+static u32 alpha_sleep_status(struct centauri_wifi *wifi)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(wifi->a.context + 0x70)));
+}
+
+static int alpha_transport_state(struct centauri_wifi *wifi, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (readl(wifi->a.bar + 8) != 2 || readl(wifi->a.bar + 0xc) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, wifi->a.bar + 0x1024);
+	ret = read_poll_timeout(alpha_sleep_status, status,
+				(asleep ? status == 3 : status <= 1) ||
+				readl(wifi->a.bar + 8) != 2,
+				100, 2000000, false, wifi);
+	dma_rmb();
+	if (readl(wifi->a.bar + 8) != 2)
+		ret = -EIO;
+	dev_info(&wifi->control->pdev->dev,
+		 "TEST: Alpha ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		 asleep ? "sleep" : "wake", ret, status,
+		 readl(wifi->a.bar + 8), readl(wifi->a.bar + 0xc));
+	return ret;
+}
+
+/*
+ * WLANACIAdapter sends command 6 before ACIPC host sleep. For an interface
+ * already disconnected by cfg80211, its LPNA mode is firmware state 3.
+ * The first fields are le16 state and u8 hint. Native sleep also includes
+ * TLV 303 (value 1) and TLV 280 (the filtered event list); wake restores all
+ * events. Installed Alpha 48ef6696 rejects TLV 280 lengths >= 87 and
+ * event counts >= 86, so use its 85 events rather than 26B123's 91.
+ * The data-ring producers stay paused while this control command
+ * and its response use the command/management rings.
+ */
+static int alpha_host_power(struct centauri_wifi *wifi, bool asleep)
+{
+	static const u8 sleep_events[] = { 24, 26, 27, 15, 51, 8, 9, 10, 84 };
+	u8 payload[98] = {}, events[86] = {}, sleep_option = 1;
+	size_t size = 3;
+	int i, ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (readl(wifi->a.bar + 8) != 2)
+		return -EIO;
+	if (asleep) {
+		put_unaligned_le16(3, payload);
+		payload[2] = 3;
+		append_tlv(payload, &size, 303, &sleep_option, sizeof(sleep_option));
+		events[0] = ARRAY_SIZE(sleep_events);
+		memcpy(events + 1, sleep_events, sizeof(sleep_events));
+	} else {
+		events[0] = sizeof(events) - 1;
+		for (i = 0; i < events[0]; i++)
+			events[i + 1] = i;
+	}
+	append_tlv(payload, &size, 280, events, sizeof(events));
+	ret = command_control(wifi, 6, payload, size, true);
+	dev_info(&wifi->control->pdev->dev,
+		 "TEST: Alpha firmware host %s: ret=%d status=%u exec=%u\n",
+		 asleep ? "LPNA" : "awake", ret, wifi->reply_status,
+		 readl(wifi->a.bar + 8));
+	return ret;
+}
+
+static int alpha_resume_locked(struct centauri_wifi *wifi)
+{
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (!wifi->transport_sleep_sent && !wifi->host_sleep_sent)
+		return 0;
+	if (wifi->transport_sleep_sent) {
+		ret = alpha_transport_state(wifi, false);
+		if (ret)
+			return ret;
+		wifi->transport_sleep_sent = false;
+	}
+	if (wifi->host_sleep_sent) {
+		ret = alpha_host_power(wifi, false);
+		if (ret)
+			return ret;
+		wifi->host_sleep_sent = false;
+	}
+	mutex_lock(&wifi->fwlog_lock);
+	WRITE_ONCE(wifi->transport_paused, false);
+	mutex_unlock(&wifi->fwlog_lock);
+	if (wifi->connected && !READ_ONCE(wifi->stopping)) {
+		if (netif_running(wifi->netdev))
+			netif_wake_queue(wifi->netdev);
+		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
+	}
+	return 0;
+}
+
+int centauri_wifi_resume(struct centauri *c)
+{
+	struct centauri_wifi *wifi = c->wifi;
+	int ret;
+
+	if (!wifi || !of_machine_is_compatible("apple,j813"))
+		return 0;
+	mutex_lock(&wifi->lock);
+	ret = alpha_resume_locked(wifi);
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+int centauri_wifi_suspend(struct centauri *c)
+{
+	struct centauri_wifi *wifi = c->wifi;
+	int ret, restore;
+
+	if (!wifi || !of_machine_is_compatible("apple,j813") ||
+	    !READ_ONCE(alpha_sleep_untested))
+		return 0;
+	mutex_lock(&wifi->lock);
+	if (wifi->transport_paused || wifi->connected || wifi->connecting || wifi->scan_request ||
+	    READ_ONCE(wifi->stopping)) {
+		mutex_unlock(&wifi->lock);
+		return -EBUSY;
+	}
+	mutex_lock(&wifi->fwlog_lock);
+	WRITE_ONCE(wifi->transport_paused, true);
+	mutex_unlock(&wifi->fwlog_lock);
+	mutex_unlock(&wifi->lock);
+	netif_tx_disable(wifi->netdev);
+	cancel_work_sync(&wifi->scan_work);
+	cancel_work_sync(&wifi->connect_work);
+	cancel_delayed_work_sync(&wifi->link_work);
+
+	mutex_lock(&wifi->lock);
+	wifi->host_sleep_sent = true;
+	ret = alpha_host_power(wifi, true);
+	if (!ret) {
+		wifi->transport_sleep_sent = true;
+		ret = alpha_transport_state(wifi, true);
+	}
+	if (ret) {
+		restore = alpha_resume_locked(wifi);
+		if (restore)
+			dev_err(&c->pdev->dev,
+				"Alpha transport remains paused after refused sleep: %d\n",
+				restore);
+	}
+	mutex_unlock(&wifi->lock);
 	return ret;
 }
 
@@ -2472,3 +2915,7 @@ void centauri_wifi_unregister(struct centauri *c)
 	kfree(wifi);
 	c->wifi = NULL;
 }
+
+#if IS_ENABLED(CONFIG_APPLE_CENTAURI_KUNIT_TEST)
+#include "centauri_wifi_test.c"
+#endif

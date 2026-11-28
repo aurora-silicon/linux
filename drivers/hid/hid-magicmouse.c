@@ -28,6 +28,10 @@
 
 static bool emulate_3button = true;
 module_param(emulate_3button, bool, 0644);
+
+static bool dump_tp26_frames;
+module_param(dump_tp26_frames, bool, 0644);
+MODULE_PARM_DESC(dump_tp26_frames, "Log every Trackpad26 multi-touch frame as hex (debugging)");
 MODULE_PARM_DESC(emulate_3button, "Emulate a middle button");
 
 static int middle_button_start = -350;
@@ -59,13 +63,13 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 /*
  * Waveform shaping, writable at runtime and applied on the next effect
- * upload. Zero means "use the per-transport default": the MTP machines keep
- * the values their firmware was tuned with, the SPI actuator in a J313 needs
- * a much softer, weaker waveform. The SPI numbers were judged by feel there.
+ * upload. Zero means "use the default" (magicmouse_haptic_waveform()): on MTP
+ * the press and release follow the actuator firmware's own click, the SPI
+ * actuator in a J313 needs a much softer, weaker waveform.
  */
 static u8 haptic_softness;
 module_param(haptic_softness, byte, 0644);
-MODULE_PARM_DESC(haptic_softness, "softness of the press and release waveforms, 1-255 (0: 0xf0 on SPI, 0x90 on MTP)");
+MODULE_PARM_DESC(haptic_softness, "softness of the press and release waveforms, 1-255 (0: 0xf0 on SPI, the firmware click's on MTP)");
 
 static u8 haptic_deep_softness;
 module_param(haptic_deep_softness, byte, 0644);
@@ -73,7 +77,7 @@ MODULE_PARM_DESC(haptic_deep_softness, "softness of the deep-click waveform, 1-2
 
 static u8 haptic_strength;
 module_param(haptic_strength, byte, 0644);
-MODULE_PARM_DESC(haptic_strength, "strength at 100% intensity for press and release, 1-255 (0: 0x28 on SPI, 0xff on MTP)");
+MODULE_PARM_DESC(haptic_strength, "strength at 100% intensity for press and release, 1-255 (0: 0x28 on SPI, the firmware click's on MTP)");
 
 static u8 haptic_deep_strength;
 module_param(haptic_deep_strength, byte, 0644);
@@ -144,16 +148,18 @@ module_param(haptic_deep_gap_ms, byte, 0644);
 MODULE_PARM_DESC(haptic_deep_gap_ms, "milliseconds between deep-click pulses, 0 to use haptic_pulse_gap_ms (default 15)");
 
 /*
- * Linux has no key for a force click, so which one to send is the user's
- * choice; nothing is sent unless one is named. It is held down for as long as
+ * Linux has no key for a force click. KEY_INFO (XF86Info) stands for it: the
+ * desktop binds that keysym to what a force click does there (in GNOME Files,
+ * the preview of the item clicked), and nothing binds it by default, so the
+ * key does nothing where no one asks for it. It is held down for as long as
  * the deep stage lasts. The key comes from a separate input device: libinput
  * drives a touchpad with its own dispatcher, which drops every key that is not
  * a button, so a key on the trackpad's own device never reaches userspace. It
  * is read at probe because that device is set up there.
  */
-static u16 haptic_deep_keycode;
+static u16 haptic_deep_keycode = KEY_INFO;
 module_param(haptic_deep_keycode, ushort, 0444);
-MODULE_PARM_DESC(haptic_deep_keycode, "key code held during a deep click on a separate \"Force Click\" input device, 0 for none (default 0)");
+MODULE_PARM_DESC(haptic_deep_keycode, "key code held during a deep click on a separate \"Force Click\" input device, 0 for none (default KEY_INFO)");
 
 static u8 haptic_pulse_gap_ms = 25;
 module_param(haptic_pulse_gap_ms, byte, 0644);
@@ -171,6 +177,9 @@ MODULE_PARM_DESC(haptic_pulse_gap_ms, "milliseconds between pulses when more tha
 #define SPI_REPORT_ID      0x02
 #define SPI_RESET_REPORT_ID 0x60
 #define MTP_REPORT_ID      0x75
+#define MTP_V2_REPORT_ID   0x5a
+/* HID product of the MTP trackpad that sends Trackpad26 frames (K116s) */
+#define MTP_TP26_PRODUCT_ID 0x0362
 #define SENSOR_DIMENSIONS_REPORT_ID 0xd9
 #define USB_BATTERY_TIMEOUT_SEC 60
 
@@ -262,10 +271,25 @@ struct effect_job {
  * @input: Input device through which we report events.
  * @quirks: Currently unused.
  * @query_dimensions: Whether to query and update dimensions on first open
+ * @mtp_tp26: Whether the MTP trackpad sends the Trackpad26 frame format.
+ * @tp26_button: Button state of the last Trackpad26 frame.
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @mtp_palms: Whether the controller's contact classes are trusted for palms
- *             on the standard MTP report (T6041).
+ *             on the standard MTP report (T6041, J616s, J813, J815).
+ * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
+ * @mtp_palm_debounce: Whether two consecutive palm classes mark an MTP contact
+ *                     as a palm whatever its tool area (apple,palm-debounce).
+ * @mtp_palm_classed: MTP contact IDs the controller classed as palms in the
+ *                    previous report.
+ * @mtp_palm_large: Whether only hand classes with a palm-sized tool area, on
+ *                  two consecutive reports, or a tool area wider than any
+ *                  finger mark an MTP contact as a palm (apple,palm-tool-area).
+ * @mtp_palm_area: The two tool areas of apple,palm-tool-area: hand-class palm
+ *                 size, and the size wider than any finger.
+ * @mtp_states: Whether the standard MTP records' touch states are trusted:
+ *              only contacts on the surface are reported, each in the slot
+ *              of its firmware path ID (apple,touch-states).
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
  * @scroll_jiffies: Time of last scroll motion.
@@ -280,8 +304,13 @@ struct effect_job {
  * @haptic_deep_work: Plays the waveform of a deep click.
  * @haptic_deep_release_work: Plays the release waveform on leaving a deep click.
  * @force_input: Input device for the deep-click key, NULL if none.
+ * @haptic_lock: Serializes input queueing with system-sleep state changes.
  * @haptic_button_down: The host-derived button is pressed.
  * @haptic_deep_down: The host-derived click is in its deep stage.
+ * @haptic_suspended: The transport is suspending or suspended; send nothing.
+ * @fw_click: The MTP actuator firmware's own press and release waveforms
+ *            (apple_taptic_get_waveform()), read on first use and again after
+ *            resume; @len 0 when the firmware has none.
  * @hdev: Pointer to the underlying HID device.
  * @work: Workqueue to handle initialization retry for quirky devices.
  * @work_held: @work was pending at suspend and must run again on resume.
@@ -292,9 +321,17 @@ struct magicmouse_sc {
 	struct input_dev *input;
 	unsigned long quirks;
 	bool query_dimensions;
+	bool mtp_tp26;
+	bool tp26_button;
 	bool mtp_c1fe;
 	bool mtp_palms;
+	bool mtp_palm_size;
 	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
+	bool mtp_palm_debounce;
+	DECLARE_BITMAP(mtp_palm_classed, U8_MAX + 1);
+	bool mtp_palm_large;
+	int mtp_palm_area[2];
+	bool mtp_states;
 
 	int ntouches;
 	int scroll_accel;
@@ -320,8 +357,16 @@ struct magicmouse_sc {
 	struct work_struct haptic_deep_work;
 	struct work_struct haptic_deep_release_work;
 	struct input_dev *force_input;
+	/* PM state and input queueing; auto_trigger_mutex nests outside this. */
+	spinlock_t haptic_lock;
 	bool haptic_button_down;
 	bool haptic_deep_down;
+	bool haptic_suspended;
+	struct {
+		bool read;
+		u8 len;
+		u8 body[63];
+	} fw_click[2];
 
 	struct hid_device *hdev;
 	struct delayed_work work;
@@ -990,27 +1035,151 @@ static u8 magicmouse_mtp_contact_id(const struct tp_finger *f)
 	return le16_to_cpu(f->unknown1) & 0xff;
 }
 
+/*
+ * The high byte of a standard MTP record's first word is the contact's
+ * touch state. Decoded on a J815 (MTP firmware 6300.85.6) against macOS's
+ * own contact labels for the same frames (matched by path ID, state, finger
+ * and hand ID on every record): 1 start in range,
+ * 2 hover in range, 3 make touch, 4 touching, 5 break touch, 6 linger in
+ * range, 7 out of range. A finger approaching or leaving the pad (1, 2, 5,
+ * 6) still has a position and nonzero sizes, so the touch-size test alone
+ * reports it as a touch; only make touch and touching are on the surface.
+ * Any other state, including the zero-size records in state 0 that the J813
+ * sends between a contact's out of range and the next start under its path
+ * ID, is off the surface.
+ */
+#define MAGICMOUSE_MTP_STATE_MAKE_TOUCH		3
+#define MAGICMOUSE_MTP_STATE_TOUCHING		4
+#define MAGICMOUSE_MTP_STATE_OUT_OF_RANGE	7
+
+static u8 magicmouse_mtp_state(const struct tp_finger *f)
+{
+	return le16_to_cpu(f->unknown1) >> 8;
+}
+
+static bool magicmouse_mtp_on_surface(const struct magicmouse_sc *msc,
+				      const struct tp_finger *f)
+{
+	if (msc->mtp_states) {
+		switch (magicmouse_mtp_state(f)) {
+		case MAGICMOUSE_MTP_STATE_MAKE_TOUCH:
+		case MAGICMOUSE_MTP_STATE_TOUCHING:
+			break;
+		default:
+			return false;
+		}
+	}
+	return le16_to_int(f->touch_major) != 0;
+}
+
+/*
+ * The J813 (MacBook Air 13" M5) controller classes contacts the same way, but
+ * most of its palms stay below the classed tool area above: recorded on a J813
+ * in normal use and while typing, 221 of 370 palm-classed contacts never passed
+ * 1400, and fingers reached 1560. Its class flickers to a palm for single
+ * reports on a finger (4 of 868 finger contacts), so there a contact also
+ * counts as a palm once two consecutive reports class it as one. That caught
+ * all 370 palms by their second report, and one finger, classed a palm for its
+ * last reports while lifting.
+ *
+ * On the J815 (MacBook Air 15" M5) the controller's classes were checked
+ * against macOS's own labels on 607 contacts (10 minutes of typing with
+ * resting palms, pointing, scrolling, gestures; 34 contacts mostly classed
+ * 6, 7, 8 or 12, the hand classes). Two contacts that were mostly classed as
+ * fingers were marked as palms until they lifted by the J813 rule (966
+ * finger reports lost): a finger-sized one in the bottom-left corner,
+ * flickering between classes 10 and 12, and one whose class flipped between
+ * 3 and 7 for up to 17 reports with a tool area up to 1606. Requiring a hand
+ * class with a tool area above 1200 on two consecutive reports marked no
+ * finger-classed contact and 33 of the 34 hand contacts. With 1400, palms
+ * resting while typing on Linux peaked at 1325-1400 and were missed (4 of 25);
+ * at 1100, one finger in the macOS session would be marked.
+ *
+ * Some resting palms are never classed as hands (two in one typing run on
+ * Linux, 28 and 38 mm wide, reported as fingers for 0.6 s). On macOS no
+ * finger or thumb contact passed a tool area of 2097, while 21 of the 34
+ * hands passed 2200, 11 of them in their first report, so a contact wider
+ * than that on the surface is a palm at once, whatever its class. A finger
+ * coming into range can be wider: a thumb's start-in-range record had a tool
+ * area of 2428, and the mark would have stayed for its 35 touching reports.
+ *
+ * The two areas are the pad's own (apple,palm-tool-area = <1200 2200> on the
+ * J815); the hand classes are the controller's.
+ */
+
+static bool magicmouse_mtp_hand_class(u8 class)
+{
+	return (class >= 6 && class <= 8) || class == 12;
+}
+
+/*
+ * A hand on a pad with apple,palm-tool-area, for the host-derived click: a
+ * contact marked as a palm, or one in a hand class past the palm tool area
+ * already in its first report (the palm mark waits for a second one), or one
+ * on the surface wider than any finger.
+ */
+static bool magicmouse_mtp_hand(const struct magicmouse_sc *msc,
+				const struct tp_finger *f)
+{
+	int tool = le16_to_int(f->tool_major);
+
+	/* The same tests as magicmouse_mtp_update_palms(), without the wait. */
+	return test_bit(magicmouse_mtp_contact_id(f), msc->mtp_palm_ids) ||
+	       (tool > msc->mtp_palm_area[1] && magicmouse_mtp_on_surface(msc, f)) ||
+	       (magicmouse_mtp_hand_class(le16_to_cpu(f->unknown2) & 0xff) &&
+		tool > msc->mtp_palm_area[0]);
+}
+
 static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 					const u8 *records, int count)
 {
 	DECLARE_BITMAP(palms, U8_MAX + 1);
+	DECLARE_BITMAP(classed, U8_MAX + 1);
 	const struct tp_finger *f;
+	bool palm_class;
 	int i, tool;
 	u8 id, class;
 
 	bitmap_zero(palms, U8_MAX + 1);
+	bitmap_zero(classed, U8_MAX + 1);
 	for (i = 0; i < count; i++) {
 		f = (const struct tp_finger *)(records + i * sizeof(*f));
 		id = magicmouse_mtp_contact_id(f);
 		class = le16_to_cpu(f->unknown2) & 0xff;
 		tool = le16_to_int(f->tool_major);
-		if (tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR ||
-		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
+		/*
+		 * Out of range ends the contact; the firmware may reuse its
+		 * path ID for a new contact in the very next report (40 times
+		 * in 10 minutes on a J815), which must not inherit the palm.
+		 */
+		if (msc->mtp_states &&
+		    magicmouse_mtp_state(f) == MAGICMOUSE_MTP_STATE_OUT_OF_RANGE)
+			continue;
+		if (msc->mtp_palm_large) {
+			palm_class = magicmouse_mtp_hand_class(class) &&
+				     tool > msc->mtp_palm_area[0];
+			if (palm_class)
+				__set_bit(id, classed);
+			if ((palm_class && test_bit(id, msc->mtp_palm_classed)) ||
+			    (tool > msc->mtp_palm_area[1] &&
+			     magicmouse_mtp_on_surface(msc, f)) ||
+			    test_bit(id, msc->mtp_palm_ids))
+				__set_bit(id, palms);
+			continue;
+		}
+		palm_class = class >= MAGICMOUSE_MTP_PALM_CLASS_MIN;
+		if (palm_class)
+			__set_bit(id, classed);
+		if ((msc->mtp_palm_size && tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR) ||
+		    (palm_class &&
 		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
+		    (msc->mtp_palm_debounce && palm_class &&
+		     test_bit(id, msc->mtp_palm_classed)) ||
 		    test_bit(id, msc->mtp_palm_ids))
 			__set_bit(id, palms);
 	}
 	bitmap_copy(msc->mtp_palm_ids, palms, U8_MAX + 1);
+	bitmap_copy(msc->mtp_palm_classed, classed, U8_MAX + 1);
 }
 
 static void report_finger_data(struct input_dev *input, int slot,
@@ -1035,6 +1204,226 @@ static void report_finger_data(struct input_dev *input, int slot,
 	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
 }
 
+/*
+ * The K116s (M5 Pro) trackpad firmware ("SensingAlgsTrackpad26C") does not
+ * send the MTP report above. Its descriptor declares one unnumbered vendor
+ * report and every frame starts with the bytes 0x5a 0x01, then a frame type.
+ * Type 1 declares the streams the firmware will send (a version string and
+ * their 16-byte ids), type 2 carries data at 125 Hz while contacts are on the
+ * pad, with a 64-bit microsecond timestamp at offset 7 and 23, a 16-bit
+ * sequence number at offset 15, and from offset 31 a list of records, each
+ * 0x02, a 16-byte stream id, 0x02, two type bytes, a little-endian 16-bit
+ * length and the payload.
+ *
+ * The contact stream's payload is a 32-bit contact count, 32 bits of frame
+ * flags and one 48-byte record per contact: an id, a state (1 new, 2 and 3
+ * settling, 4 touching, 5 lifting, 7 gone), the controller's class (1 thumb,
+ * 2 and 3 fingers, 7 a palm), an unknown byte, then IEEE 754 single floats:
+ * x in micrometres from the centre, y in micrometres from the bottom edge,
+ * velocity in micrometres per second, the major and minor axes in
+ * micrometres, the orientation in radians with pi/2 along y, two unknown
+ * values near 1.0 on a finger, the force in grams, and a zero. The button
+ * stream's payload is one 32-bit word, 1 while the pad is clicked.
+ */
+static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
+				    bool firmware_button);
+
+#define MAGICMOUSE_TP26_MAGIC0		0x5a
+#define MAGICMOUSE_TP26_MAGIC1		0x01
+#define MAGICMOUSE_TP26_FRAME_DATA	2
+#define MAGICMOUSE_TP26_HEADER_SIZE	31
+#define MAGICMOUSE_TP26_RECORD_HDR	22
+#define MAGICMOUSE_TP26_STREAM_ID_LEN	16
+
+#define MAGICMOUSE_TP26_STATE_SETTLING	3
+#define MAGICMOUSE_TP26_STATE_TOUCHING	4
+#define MAGICMOUSE_TP26_STATE_LIFTING	5
+#define MAGICMOUSE_TP26_CLASS_PALM	7
+
+/* The pad is about 160 by 100 mm; positions are reported in 10 um units. */
+#define MAGICMOUSE_TP26_UM_PER_UNIT	10
+#define MAGICMOUSE_TP26_MAX_X		8000
+#define MAGICMOUSE_TP26_MAX_Y		10000
+#define MAGICMOUSE_TP26_RES		100	/* units per mm */
+#define MAGICMOUSE_TP26_MAX_SIZE	20000
+#define MAGICMOUSE_TP26_MAX_FORCE	6000
+#define MAGICMOUSE_TP26_MAX_ORIENTATION	90
+
+static const u8 magicmouse_tp26_contacts_id[MAGICMOUSE_TP26_STREAM_ID_LEN] = {
+	0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+	0x7e, 0xde, 0x54, 0xa8, 0x63, 0x1f, 0xdf, 0x17,
+};
+
+static const u8 magicmouse_tp26_button_id[MAGICMOUSE_TP26_STREAM_ID_LEN] = {
+	0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+	0xc2, 0x87, 0x93, 0x63, 0x28, 0x29, 0xc8, 0xbf,
+};
+
+struct tp26_contact {
+	u8 id;
+	u8 state;
+	u8 class;
+	u8 unknown;
+	__le32 x;
+	__le32 y;
+	__le32 vel_x;
+	__le32 vel_y;
+	__le32 major;
+	__le32 minor;
+	__le32 orientation;
+	__le32 unknown2;
+	__le32 unknown3;
+	__le32 force;
+	__le32 unknown4;
+} __packed;
+
+static bool magicmouse_tp26_frame(const u8 *data, int size)
+{
+	return size >= 2 && data[0] == MAGICMOUSE_TP26_MAGIC0 &&
+	       data[1] == MAGICMOUSE_TP26_MAGIC1;
+}
+
+/*
+ * An IEEE 754 single times @mul, truncated towards zero. The kernel does not
+ * use the FPU, so the mantissa is scaled by hand. Infinities and NaNs clamp.
+ */
+static s32 magicmouse_tp26_float(__le32 raw, u32 mul)
+{
+	u32 v = le32_to_cpu(raw);
+	int exp = ((v >> 23) & 0xff) - 127;
+	u64 r;
+
+	if (((v >> 23) & 0xff) == 0)
+		return 0;
+	if (((v >> 23) & 0xff) == 0xff || exp > 40)
+		r = S32_MAX;
+	else if (exp >= 23)
+		r = ((u64)((v & 0x7fffff) | BIT(23)) * mul) << (exp - 23);
+	else
+		r = ((u64)((v & 0x7fffff) | BIT(23)) * mul) >> (23 - exp);
+	r = min_t(u64, r, S32_MAX);
+	return v & BIT(31) ? -(s32)r : (s32)r;
+}
+
+static bool magicmouse_tp26_touching(const struct tp26_contact *c)
+{
+	return c->state >= MAGICMOUSE_TP26_STATE_SETTLING &&
+	       c->state <= MAGICMOUSE_TP26_STATE_LIFTING;
+}
+
+static void magicmouse_tp26_report_contact(struct magicmouse_sc *msc,
+					   const struct tp26_contact *c)
+{
+	struct input_dev *input = msc->input;
+	int slot, orientation;
+	s32 x, y;
+
+	slot = input_mt_get_slot_by_key(input, c->id);
+	if (slot < 0)
+		return;
+
+	x = magicmouse_tp26_float(c->x, 1) / MAGICMOUSE_TP26_UM_PER_UNIT;
+	y = magicmouse_tp26_float(c->y, 1) / MAGICMOUSE_TP26_UM_PER_UNIT;
+	/* Radians to degrees, with 0 along y. */
+	orientation = (magicmouse_tp26_float(c->orientation, 1000) - 1571) * 180 / 3142;
+
+	input_mt_slot(input, slot);
+	input_mt_report_slot_state(input,
+				   c->class == MAGICMOUSE_TP26_CLASS_PALM ?
+				   MT_TOOL_PALM : MT_TOOL_FINGER, true);
+	input_report_abs(input, ABS_MT_POSITION_X,
+			 clamp(x, -MAGICMOUSE_TP26_MAX_X, MAGICMOUSE_TP26_MAX_X));
+	/* y grows towards the top edge; the Y axis is inverted as above. */
+	input_report_abs(input, ABS_MT_POSITION_Y,
+			 clamp(-y, -MAGICMOUSE_TP26_MAX_Y, 0));
+	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
+			 magicmouse_tp26_float(c->major, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_TOUCH_MINOR,
+			 magicmouse_tp26_float(c->minor, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_WIDTH_MAJOR,
+			 magicmouse_tp26_float(c->major, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_WIDTH_MINOR,
+			 magicmouse_tp26_float(c->minor, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_ORIENTATION,
+			 clamp(orientation, -MAGICMOUSE_TP26_MAX_ORIENTATION,
+			       MAGICMOUSE_TP26_MAX_ORIENTATION));
+	input_report_abs(input, ABS_MT_PRESSURE,
+			 clamp(magicmouse_tp26_float(c->force, 1), 0,
+			       MAGICMOUSE_TP26_MAX_FORCE));
+}
+
+static int magicmouse_raw_event_tp26(struct hid_device *hdev, u8 *data, int size)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct input_dev *input = msc->input;
+	const u8 *contacts = NULL;
+	u32 ncontacts = 0, pressure = 0;
+	bool button = msc->tp26_button;
+	int pos, i;
+
+	if (dump_tp26_frames) {
+		hid_info(hdev, "tp26 frame %d bytes\n", size);
+		print_hex_dump(KERN_INFO, "tp26: ", DUMP_PREFIX_OFFSET, 32, 1,
+			       data, size, false);
+	}
+
+	if (size < MAGICMOUSE_TP26_HEADER_SIZE ||
+	    data[2] != MAGICMOUSE_TP26_FRAME_DATA)
+		return -1;
+
+	for (pos = MAGICMOUSE_TP26_HEADER_SIZE;
+	     pos + MAGICMOUSE_TP26_RECORD_HDR <= size;) {
+		const u8 *id = data + pos + 1;
+		const u8 *payload = data + pos + MAGICMOUSE_TP26_RECORD_HDR;
+		u16 len = get_unaligned_le16(data + pos + 20);
+
+		if (data[pos] != 0x02 || data[pos + 17] != 0x02 ||
+		    payload + len > data + size) {
+			hid_dbg(hdev, "malformed tp26 record at %d\n", pos);
+			break;
+		}
+		if (!memcmp(id, magicmouse_tp26_contacts_id, sizeof(magicmouse_tp26_contacts_id)) &&
+		    len >= 8) {
+			ncontacts = get_unaligned_le32(payload);
+			if (ncontacts > MAX_CONTACTS ||
+			    len < 8 + ncontacts * sizeof(struct tp26_contact)) {
+				hid_warn(hdev, "unexpected number of touches (%u) for report\n",
+					 ncontacts);
+				return -1;
+			}
+			contacts = payload + 8;
+		} else if (!memcmp(id, magicmouse_tp26_button_id,
+				   sizeof(magicmouse_tp26_button_id)) &&
+			   len >= 4) {
+			button = get_unaligned_le32(payload) & 1;
+		}
+		pos += MAGICMOUSE_TP26_RECORD_HDR + len;
+	}
+
+	if (!contacts)
+		return -1;
+
+	for (i = 0; i < ncontacts; i++) {
+		const struct tp26_contact *c = (const void *)(contacts + i * sizeof(*c));
+
+		if (!magicmouse_tp26_touching(c))
+			continue;
+		magicmouse_tp26_report_contact(msc, c);
+		pressure += max(magicmouse_tp26_float(c->force, 1), 0);
+	}
+
+	input_mt_sync_frame(input);
+	msc->tp26_button = button;
+	input_report_key(input, BTN_MOUSE,
+			 magicmouse_haptic_click(msc, pressure, button));
+	input_sync(input);
+	/*
+	 * Stop here: the descriptor's single report is far longer than any
+	 * frame, so the core would only warn that the data is too short.
+	 */
+	return -1;
+}
+
 static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
@@ -1049,9 +1438,8 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
 
-	// hid_warn(hdev, "%s\n", __func__);
-	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
-	// 		     size, false);
+	if (magicmouse_tp26_frame(data, size))
+		return magicmouse_raw_event_tp26(hdev, data, size);
 
 	if (msc->mtp_c1fe) {
 		if (!magicmouse_c1fe_report_valid(data, size))
@@ -1082,7 +1470,7 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	n = 0;
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
-		if (!msc->mtp_c1fe && le16_to_int(f->touch_major) == 0)
+		if (!msc->mtp_c1fe && !magicmouse_mtp_on_surface(msc, f))
 			continue;
 
 		hid_dbg(hdev, "ev x:%04x y:%04x\n", le16_to_int(f->abs_x),
@@ -1093,11 +1481,27 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		n++;
 	}
 
-	input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
+	if (!msc->mtp_states)
+		input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
 
 	for (i = 0; i < n; i++) {
 		int idx = map_contacs[i];
+
 		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
+		if (msc->mtp_states) {
+			/*
+			 * The firmware tracks each contact under a path ID
+			 * until it leaves the pad, so keep it in that ID's
+			 * slot: matching by distance hands a slot over when one
+			 * finger lifts as another lands in the same frame. Look
+			 * the slot up just before reporting it, so contacts
+			 * landing in the same frame get different free slots.
+			 */
+			msc->tracking_ids[i] =
+				input_mt_get_slot_by_key(input, magicmouse_mtp_contact_id(f));
+			if (msc->tracking_ids[i] < 0)
+				continue;
+		}
 		if (msc->mtp_c1fe) {
 			report_c1fe_finger_data(input, msc->tracking_ids[i], &msc->pos[i]);
 		} else {
@@ -1108,7 +1512,15 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 				tool = MT_TOOL_PALM;
 			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i],
 					   f, tool);
-			pressure += le16_to_int(f->pressure);
+			/*
+			 * J815: a resting palm presses hard enough to reach the
+			 * click threshold on its own. As on macOS, a resting
+			 * hand neither clicks nor deepens a click, while a
+			 * finger of the other hand still does: the hand's own
+			 * force never counts.
+			 */
+			if (!(msc->mtp_palm_large && magicmouse_mtp_hand(msc, f)))
+				pressure += le16_to_int(f->pressure);
 		}
 	}
 
@@ -1121,6 +1533,119 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 
 	input_sync(input);
 	return 1;
+}
+
+/*
+ * The K114c MTP firmware (personality K2C1) sends report 0x5a. Its contact
+ * section sits at a fixed offset and holds 48-byte records of IEEE 754
+ * floats, in micrometres. All offsets are bytes from the report id.
+ *
+ *   48       section tag, 0x02
+ *   49       section header size (8)
+ *   50       contact record size (48)
+ *   51       section payload size, header + count * record size
+ *   53       number of contact records
+ *   59       bit 4: physical button
+ *   52       section header, 8 bytes, then count records of 48 bytes:
+ *   record n:
+ *     +1       tracking id, rolling
+ *     +2       phase: 1 start, 2-3 approach, 4 touching, 5-7 lifting, 0 gone
+ *     +5       float x, y; velocity x, y; major, minor axis; three unnamed
+ *              floats; force
+ */
+#define MTP_V2_SECTION		48
+#define MTP_V2_SECTION_TAG	0x02
+#define MTP_V2_COUNT		53
+#define MTP_V2_BUTTONS		59
+#define MTP_V2_BUTTON_MASK	0x10
+#define MTP_V2_PAYLOAD		52
+#define MTP_V2_RECORD_SIZE	48
+#define MTP_V2_PHASE_TOUCH	3
+#define MTP_V2_PHASE_LEAVE	5
+
+enum { MTP_V2_X = 5, MTP_V2_Y = 9, MTP_V2_MAJOR = 21, MTP_V2_MINOR = 25, MTP_V2_FORCE = 41 };
+
+/* Integer part of an IEEE 754 single, without touching the FPU. */
+static int magicmouse_f32_to_int(const u8 *p)
+{
+	u32 bits = get_unaligned_le32(p);
+	int exp = (int)((bits >> 23) & 0xff) - 127;
+	u32 mant = (bits & 0x7fffff) | 0x800000;
+	u32 v;
+
+	if (exp < 0 || exp > 30)
+		return 0;
+	v = exp >= 23 ? mant << (exp - 23) : mant >> (23 - exp);
+	return (bits >> 31) ? -(int)v : (int)v;
+}
+
+static int magicmouse_raw_event_mtp_v2(struct hid_device *hdev, u8 *data, int size)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct input_dev *input = msc->input;
+	int count, i, n = 0;
+	int major[MAX_CONTACTS], minor[MAX_CONTACTS], force[MAX_CONTACTS];
+	u32 pressure = 0;
+
+	/* The button byte is the last fixed field before the records. */
+	if (size <= MTP_V2_BUTTONS || data[MTP_V2_SECTION] != MTP_V2_SECTION_TAG ||
+	    data[MTP_V2_SECTION + 2] < MTP_V2_FORCE + 4)
+		return 0;
+
+	count = data[MTP_V2_COUNT];
+	if (count > MAX_CONTACTS ||
+	    data[MTP_V2_SECTION + 3] !=
+	    data[MTP_V2_SECTION + 1] + count * data[MTP_V2_SECTION + 2] ||
+	    size < MTP_V2_SECTION + 4 + data[MTP_V2_SECTION + 3])
+		return 0;
+
+	for (i = 0; i < count; i++) {
+		const u8 *rec = data + MTP_V2_PAYLOAD + data[MTP_V2_SECTION + 1] +
+				    i * data[MTP_V2_SECTION + 2];
+
+		if (rec[2] < MTP_V2_PHASE_TOUCH || rec[2] >= MTP_V2_PHASE_LEAVE)
+			continue;
+
+		/* Micrometres to the hundredths of a millimetre of the J314 ranges. */
+		msc->pos[n].x = magicmouse_f32_to_int(rec + MTP_V2_X) / 10;
+		msc->pos[n].y = -magicmouse_f32_to_int(rec + MTP_V2_Y) / 10;
+		major[n] = magicmouse_f32_to_int(rec + MTP_V2_MAJOR) / 10;
+		minor[n] = magicmouse_f32_to_int(rec + MTP_V2_MINOR) / 10;
+		force[n] = magicmouse_f32_to_int(rec + MTP_V2_FORCE);
+		n++;
+	}
+
+	input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
+
+	for (i = 0; i < n; i++) {
+		input_mt_slot(input, msc->tracking_ids[i]);
+		input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+		input_report_abs(input, ABS_MT_TOUCH_MAJOR, major[i]);
+		input_report_abs(input, ABS_MT_TOUCH_MINOR, minor[i]);
+		input_report_abs(input, ABS_MT_PRESSURE, force[i]);
+		input_report_abs(input, ABS_MT_POSITION_X, msc->pos[i].x);
+		input_report_abs(input, ABS_MT_POSITION_Y, msc->pos[i].y);
+		pressure += force[i];
+	}
+
+	input_mt_sync_frame(input);
+	input_report_key(input, BTN_MOUSE,
+			 magicmouse_haptic_click(msc, pressure,
+						 data[MTP_V2_BUTTONS] & MTP_V2_BUTTON_MASK));
+	input_sync(input);
+	return 1;
+}
+
+static int magicmouse_raw_event_dockchannel(struct hid_device *hdev,
+		struct hid_report *report, u8 *data, int size)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+
+	/* A Trackpad26 frame also starts with 0x5a; magicmouse_raw_event_mtp() takes it. */
+	if (!msc->mtp_tp26 && size && data[0] == MTP_V2_REPORT_ID)
+		return magicmouse_raw_event_mtp_v2(hdev, data, size);
+
+	return magicmouse_raw_event_mtp(hdev, report, data, size);
 }
 
 static int magicmouse_raw_event_spi(struct hid_device *hdev,
@@ -1356,6 +1881,13 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+	/*
+	 * An MTP trackpad is a pointer, never a direct-touch surface. The K116s
+	 * firmware's descriptor makes hid-input set INPUT_PROP_DIRECT, which
+	 * udev and libinput then take for a touchscreen.
+	 */
+	__set_bit(INPUT_PROP_POINTER, input->propbit);
+	__clear_bit(INPUT_PROP_DIRECT, input->propbit);
 	/* The C1FE controller reports no force: it is not a pressure pad. */
 	if (!msc->mtp_c1fe)
 		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
@@ -1376,9 +1908,9 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 */
 	if (!msc->mtp_c1fe) {
 		/*
-		 * A palm's tool area on the T6041 trackpad exceeds 5000 once
-		 * scaled, so allow the full range of the record's 16-bit fields
-		 * there.
+		 * A palm's tool area on the T6041 and J616s trackpads exceeds
+		 * 5000 once scaled, so allow the full range of the record's
+		 * 16-bit fields on every trackpad whose palms are classed.
 		 */
 		int area_max = msc->mtp_palms ? 2 * S16_MAX : 5000;
 
@@ -1405,28 +1937,51 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
 
-	/* The T6041 controller classifies palms. */
-	if (msc->mtp_palms)
+	/* The T6041, J616s, J813, J815 and Trackpad26 controllers classify palms. */
+	if (msc->mtp_palms || msc->mtp_tp26)
 		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
 				     0, 0);
 
-	/* Note: Touch Y position from the device is inverted relative
-	 * to how pointer motion is reported (and relative to how USB
-	 * HID recommends the coordinates work).  This driver keeps
-	 * the origin at the same position, and just uses the additive
-	 * inverse of the reported Y.
-	 */
+	if (msc->mtp_tp26) {
+		/* Sizes and positions in 10 um units, orientation in degrees. */
+		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_abs_set_res(input, ABS_MT_TOUCH_MAJOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_TOUCH_MINOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_WIDTH_MAJOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_WIDTH_MINOR, MAGICMOUSE_TP26_RES);
+		input_set_abs_params(input, ABS_MT_ORIENTATION,
+				     -MAGICMOUSE_TP26_MAX_ORIENTATION,
+				     MAGICMOUSE_TP26_MAX_ORIENTATION, 0, 0);
+		input_set_abs_params(input, ABS_MT_PRESSURE, 0, MAGICMOUSE_TP26_MAX_FORCE, 0, 0);
+		input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+		input_set_abs_params(input, ABS_MT_POSITION_X, -MAGICMOUSE_TP26_MAX_X,
+				     MAGICMOUSE_TP26_MAX_X, 0, 0);
+		input_set_abs_params(input, ABS_MT_POSITION_Y, -MAGICMOUSE_TP26_MAX_Y, 0,
+				     0, 0);
+		input_abs_set_res(input, ABS_MT_POSITION_X, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_POSITION_Y, MAGICMOUSE_TP26_RES);
+	} else {
+		/* Note: Touch Y position from the device is inverted relative
+		 * to how pointer motion is reported (and relative to how USB
+		 * HID recommends the coordinates work).  This driver keeps
+		 * the origin at the same position, and just uses the additive
+		 * inverse of the reported Y.
+		 */
 
-	/* finger position */
-	input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
-			     0, 0);
-	/* Y axis is inverted */
-	input_set_abs_params(input, ABS_MT_POSITION_Y, -J314_TP_MAX_Y, -J314_TP_MIN_Y,
-			     0, 0);
+		/* finger position */
+		input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
+				     0, 0);
+		/* Y axis is inverted */
+		input_set_abs_params(input, ABS_MT_POSITION_Y, -J314_TP_MAX_Y, -J314_TP_MIN_Y,
+				     0, 0);
 
-	/* X/Y resolution */
-	input_abs_set_res(input, ABS_MT_POSITION_X, J314_TP_RES_X);
-	input_abs_set_res(input, ABS_MT_POSITION_Y, J314_TP_RES_Y);
+		/* X/Y resolution */
+		input_abs_set_res(input, ABS_MT_POSITION_X, J314_TP_RES_X);
+		input_abs_set_res(input, ABS_MT_POSITION_Y, J314_TP_RES_Y);
+	}
 
 	input_set_events_per_packet(input, 60);
 
@@ -1489,6 +2044,17 @@ static int magicmouse_input_mapping(struct hid_device *hdev,
 	if (!msc->input)
 		msc->input = hi->input;
 
+	/*
+	 * The dockchannel MTP descriptors (K114c and later) open with a GD
+	 * Mouse collection. raw_event() drives the pad, and libinput refuses
+	 * a mouse and multi-touch hybrid, so drop the Mouse usages. The
+	 * keyboard interface is a GD Keyboard, and kiwi never gets here
+	 * (type guard in magicmouse_probe()).
+	 */
+	if (hdev->bus == BUS_HOST && !strncmp(hdev->name, "Apple MTP", 9) &&
+	    field->application == HID_GD_MOUSE)
+		return -1;
+
 	/* Magic Trackpad does not give relative data after switching to MT */
 	if ((hi->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD ||
 	     hi->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
@@ -1550,8 +2116,12 @@ static int magicmouse_switch_mode(struct input_dev *trackpad_idev, int mode)
 	return apple_taptic_switch_modes(actuator, mode);
 }
 
-static u8 magicmouse_haptic_softness(struct hid_device *hdev, bool deep);
-static u8 magicmouse_haptic_strength(struct hid_device *hdev, bool deep);
+static void magicmouse_haptic_waveform(struct magicmouse_sc *msc,
+				       struct hid_device *actuator, u16 usage,
+				       u8 *strength, u8 *softness);
+static int magicmouse_taptic_play(struct magicmouse_sc *msc,
+				  struct hid_device *actuator, u16 usage,
+				  u8 strength, u8 softness);
 static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc);
 static void magicmouse_haptic_release_mode_locked(struct magicmouse_sc *msc);
 
@@ -1572,6 +2142,9 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 		return;
 
 	guard(mutex)(&msc->haptics->auto_trigger_mutex);
+	if (msc->haptic_suspended)
+		return;
+
 	actuator = magicmouse_get_actuator(msc);
 
 	if (!actuator) {
@@ -1594,13 +2167,13 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 		hid_info(msc->hdev, "host-driven click feedback active\n");
 	}
 
-	strength = magicmouse_haptic_strength(msc->hdev, deep);
-	softness = magicmouse_haptic_softness(msc->hdev, deep);
+	magicmouse_haptic_waveform(msc, actuator, usage, &strength, &softness);
 	gap = (deep && haptic_deep_gap_ms) ? haptic_deep_gap_ms
 					   : haptic_pulse_gap_ms;
 
 	for (i = 0; i < pulses; i++) {
-		ret = apple_taptic_send(actuator, usage, strength, softness);
+		ret = magicmouse_taptic_play(msc, actuator, usage, strength,
+					     softness);
 		if (ret) {
 			hid_warn(msc->hdev,
 				 "click waveform failed (%d); returning click feedback to the firmware\n",
@@ -1618,6 +2191,18 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 	}
 }
 
+static bool magicmouse_haptic_effects_loaded(struct magicmouse_sc *msc)
+{
+	unsigned int i;
+
+	if (msc->haptic_effects) {
+		for (i = 0; i < FF_MAX_EFFECTS; i++)
+			if (READ_ONCE(msc->haptic_effects[i].effect_type))
+				return true;
+	}
+	return false;
+}
+
 /*
  * Hand click feedback back to the actuator's firmware, unless userspace still
  * has effects uploaded and so still wants host-controlled mode.
@@ -1625,16 +2210,13 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 static void magicmouse_haptic_release_mode_locked(struct magicmouse_sc *msc)
 {
 	struct hid_device *actuator;
-	unsigned int i;
 
-	if (READ_ONCE(msc->haptics->mode) != HID_HAPTIC_MODE_HOST)
+	if (msc->haptic_suspended ||
+	    READ_ONCE(msc->haptics->mode) != HID_HAPTIC_MODE_HOST)
 		return;
 
-	if (msc->haptic_effects) {
-		for (i = 0; i < FF_MAX_EFFECTS; i++)
-			if (READ_ONCE(msc->haptic_effects[i].effect_type))
-				return;
-	}
+	if (magicmouse_haptic_effects_loaded(msc))
+		return;
 
 	actuator = magicmouse_get_actuator(msc);
 	if (actuator && !apple_taptic_switch_modes(actuator,
@@ -1733,6 +2315,11 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 	if (!msc->haptics || !msc->haptics->wq)
 		return firmware_button;
 
+	/* Do not leave a suspended report queued to play after resume. */
+	guard(spinlock_irqsave)(&msc->haptic_lock);
+	if (msc->haptic_suspended)
+		return firmware_button;
+
 	host_mode = READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST;
 
 	if (!haptic_press && !host_mode) {
@@ -1795,24 +2382,84 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 }
 
 /*
- * The actuator leaves system sleep in device-controlled mode whatever it was
- * in before: the transport resumes the keyboard and the trackpad, not the
- * actuator, and nothing reports the change. A cached host-controlled mode then
- * makes the next press skip the switch and play a pulse while the firmware is
- * playing its own, which is felt as two clicks. Forget it instead; the next
- * press takes the mode again if it needs it.
+ * The transport stops taking requests once its children have suspended, but
+ * keeps passing reports on, and they queue clicks. Send nothing until resume;
+ * the clicks in between are dropped.
  */
-static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
+static void magicmouse_haptic_suspend(struct magicmouse_sc *msc)
 {
-	if (!msc->haptics)
+	unsigned int i;
+
+	if (!msc->haptics || !msc->haptics->wq)
 		return;
 
-	WRITE_ONCE(msc->haptics->mode, HID_HAPTIC_MODE_DEVICE);
-	msc->haptic_button_down = false;
-	if (msc->haptic_deep_down) {
-		msc->haptic_deep_down = false;
-		magicmouse_force_key(msc, false);
+	scoped_guard(mutex, &msc->haptics->auto_trigger_mutex)
+		scoped_guard(spinlock_irqsave, &msc->haptic_lock)
+			msc->haptic_suspended = true;
+
+	/* Producers cannot queue after this flag; drain without their locks. */
+	cancel_work_sync(&msc->haptic_press_work);
+	cancel_work_sync(&msc->haptic_release_work);
+	cancel_work_sync(&msc->haptic_deep_work);
+	cancel_work_sync(&msc->haptic_deep_release_work);
+	if (msc->haptic_effects)
+		for (i = 0; i < FF_MAX_EFFECTS; i++)
+			cancel_work_sync(&msc->haptic_effects[i].work);
+}
+
+/*
+ * Nothing reports the actuator's mode after system sleep: it may come back
+ * device-controlled, or keep host-controlled mode, as the J714s one does
+ * across suspend-to-idle. Believing the wrong one either plays a pulse on top
+ * of the firmware's click, felt as two clicks, or leaves a pad whose firmware
+ * neither clicks nor reports the button. Assert the wanted mode instead. On
+ * failure, cache the mode that makes the next frames retry it: device mode
+ * makes the next press take host mode, host mode keeps the button derived
+ * and the release retried.
+ */
+static void magicmouse_haptic_resume(struct magicmouse_sc *msc)
+{
+	struct hid_device *actuator;
+	u32 mode;
+	int ret;
+
+	if (!msc->haptics || !msc->haptics->wq)
+		return;
+
+	/* The workers see the flag and the mode change together. */
+	guard(mutex)(&msc->haptics->auto_trigger_mutex);
+	scoped_guard(spinlock_irqsave, &msc->haptic_lock) {
+		msc->haptic_button_down = false;
+		if (msc->haptic_deep_down) {
+			msc->haptic_deep_down = false;
+			magicmouse_force_key(msc, false);
+		}
+		msc->haptic_suspended = false;
 	}
+	/* The firmware may have been restarted with other strengths. */
+	memset(msc->fw_click, 0, sizeof(msc->fw_click));
+
+	if (haptic_press || magicmouse_haptic_effects_loaded(msc))
+		mode = HID_HAPTIC_MODE_HOST;
+	else
+		mode = HID_HAPTIC_MODE_DEVICE;
+
+	if (mode == HID_HAPTIC_MODE_DEVICE &&
+	    READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_DEVICE)
+		return;
+
+	actuator = magicmouse_get_actuator(msc);
+	if (!actuator)
+		return;
+
+	ret = apple_taptic_switch_modes(actuator, mode);
+	if (ret && ret != -EOPNOTSUPP)
+		hid_warn(msc->hdev, "cannot restore haptic mode %u (%d)\n",
+			 mode, ret);
+	if (ret)
+		mode = mode == HID_HAPTIC_MODE_HOST ? HID_HAPTIC_MODE_DEVICE :
+						      HID_HAPTIC_MODE_HOST;
+	WRITE_ONCE(msc->haptics->mode, mode);
 }
 #else
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
@@ -1821,7 +2468,11 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 	return firmware_button;
 }
 
-static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
+static void magicmouse_haptic_suspend(struct magicmouse_sc *msc)
+{
+}
+
+static void magicmouse_haptic_resume(struct magicmouse_sc *msc)
 {
 }
 #endif
@@ -1982,34 +2633,96 @@ static void magicmouse_battery_timer_tick(struct timer_list *t)
 }
 
 #if IS_ENABLED(CONFIG_HID_APPLE_MTP_HAPTIC)
-static bool magicmouse_effect_is_deep(const struct ff_effect *effect)
+/*
+ * The firmware's own click waveform for a press or release on an MTP
+ * actuator, or NULL. A host click plays the same waveform: macOS leaves the
+ * actuator with these strengths at its default (Medium) click setting, and
+ * the shape differs between machines. Read once, and again after resume.
+ */
+static const u8 *magicmouse_fw_click(struct magicmouse_sc *msc,
+				     struct hid_device *actuator, u16 usage,
+				     u8 *len)
 {
-	return effect->u.haptic.hid_usage ==
-	       (APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE);
+	unsigned int i;
+	int ret;
+
+	if (msc->hdev->bus == BUS_SPI || !actuator ||
+	    (usage != (HID_HP_WAVEFORMPRESS & HID_USAGE) &&
+	     usage != (HID_HP_WAVEFORMRELEASE & HID_USAGE)))
+		return NULL;
+
+	i = usage == (HID_HP_WAVEFORMRELEASE & HID_USAGE);
+	if (!msc->fw_click[i].read) {
+		msc->fw_click[i].read = true;
+		ret = apple_taptic_get_waveform(actuator, usage,
+						msc->fw_click[i].body,
+						sizeof(msc->fw_click[i].body));
+		msc->fw_click[i].len = ret > 0 ? ret : 0;
+		if (ret > 0)
+			hid_dbg(msc->hdev,
+				"%s waveform from the firmware: strength 0x%02x softness 0x%02x, %d bytes\n",
+				i ? "release" : "press", msc->fw_click[i].body[1],
+				msc->fw_click[i].body[2], ret);
+		else
+			hid_dbg(msc->hdev, "no firmware %s waveform (%d)\n",
+				i ? "release" : "press", ret);
+	}
+	*len = msc->fw_click[i].len;
+	return *len ? msc->fw_click[i].body : NULL;
 }
 
-static u8 magicmouse_haptic_softness(struct hid_device *hdev, bool deep)
+/*
+ * The strength and softness a host-played waveform uses. A module parameter
+ * wins; otherwise an MTP press or release takes the firmware click's own
+ * values (magicmouse_fw_click()). A full-scale host click felt firmer than
+ * macOS on every MTP Mac. The deep click has no firmware waveform and stays
+ * at full scale, as does a press or release the firmware does not report.
+ * The SPI actuator in a J313 needs a much softer, weaker waveform; its
+ * numbers were judged by feel there.
+ */
+static void magicmouse_haptic_waveform(struct magicmouse_sc *msc,
+				       struct hid_device *actuator, u16 usage,
+				       u8 *strength, u8 *softness)
 {
-	u8 configured = deep ? haptic_deep_softness : haptic_softness;
+	bool deep = usage == (APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE);
+	u8 set_strength = deep ? haptic_deep_strength : haptic_strength;
+	u8 set_softness = deep ? haptic_deep_softness : haptic_softness;
+	bool spi = msc->hdev->bus == BUS_SPI;
+	const u8 *fw;
+	u8 len;
 
-	if (configured)
-		return configured;
-	if (hdev->bus != BUS_SPI)
-		return 0x90;
+	*strength = spi && !deep ? 0x28 : 0xff;
+	*softness = spi ? (deep ? 0xd0 : 0xf0) : 0x90;
 
-	return deep ? 0xd0 : 0xf0;
+	fw = magicmouse_fw_click(msc, actuator, usage, &len);
+	if (fw) {
+		*strength = fw[1];
+		*softness = fw[2];
+	}
+
+	if (set_strength)
+		*strength = set_strength;
+	if (set_softness)
+		*softness = set_softness;
 }
 
-static u8 magicmouse_haptic_strength(struct hid_device *hdev, bool deep)
+/* Play @usage: the firmware's own waveform where it has one, else ours. */
+static int magicmouse_taptic_play(struct magicmouse_sc *msc,
+				  struct hid_device *actuator, u16 usage,
+				  u8 strength, u8 softness)
 {
-	u8 configured = deep ? haptic_deep_strength : haptic_strength;
+	u8 body[sizeof(msc->fw_click[0].body)];
+	const u8 *fw;
+	u8 len;
 
-	if (configured)
-		return configured;
-	if (hdev->bus != BUS_SPI)
-		return 0xff;
+	fw = magicmouse_fw_click(msc, actuator, usage, &len);
+	if (!fw)
+		return apple_taptic_send(actuator, usage, strength, softness);
 
-	return deep ? 0xff : 0x28;
+	memcpy(body, fw, len);
+	body[1] = strength;
+	body[2] = softness;
+	return apple_taptic_send_waveform(actuator, body, len);
 }
 
 static int apple_upload_effects(struct input_dev *trackpad_idev,
@@ -2022,7 +2735,6 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	struct effect_job *job = &msc->haptic_effects[effect->id];
 	unsigned long flags;
 	u8 strength, softness;
-	bool deep;
 	int ret;
 
 	switch (effect->u.haptic.hid_usage) {
@@ -2035,14 +2747,15 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	}
 
 	guard(mutex)(&haptics->auto_trigger_mutex);
+	if (msc->haptic_suspended)
+		return -EBUSY;
 	actuator = magicmouse_get_actuator(msc);
 	if (!actuator)
 		return -ENODEV;
 
-	deep = magicmouse_effect_is_deep(effect);
-	strength = min_t(u16, 100, effect->u.haptic.intensity) *
-		magicmouse_haptic_strength(trackpad_hdev, deep) / 100;
-	softness = magicmouse_haptic_softness(trackpad_hdev, deep);
+	magicmouse_haptic_waveform(msc, actuator, effect->u.haptic.hid_usage,
+				   &strength, &softness);
+	strength = min_t(u16, 100, effect->u.haptic.intensity) * strength / 100;
 
 	/* The actuator may have been rebound or reset since the last upload. */
 	ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_HOST);
@@ -2083,6 +2796,8 @@ static void haptic_playback_worker(struct work_struct *ws)
 	if (!type)
 		return;
 	guard(mutex)(&job->msc->haptics->auto_trigger_mutex);
+	if (job->msc->haptic_suspended)
+		return;
 	if (READ_ONCE(job->msc->haptics->mode) != HID_HAPTIC_MODE_HOST) {
 		ret = apple_taptic_switch_modes(actuator, HID_HAPTIC_MODE_HOST);
 		if (ret) {
@@ -2091,7 +2806,7 @@ static void haptic_playback_worker(struct work_struct *ws)
 		}
 		WRITE_ONCE(job->msc->haptics->mode, HID_HAPTIC_MODE_HOST);
 	}
-	if (apple_taptic_send(actuator, type, strength, softness))
+	if (magicmouse_taptic_play(job->msc, actuator, type, strength, softness))
 		hid_warn(actuator, "cannot play the haptic effect\n");
 }
 
@@ -2100,6 +2815,9 @@ static int apple_taptic_playback(struct input_dev *trackpad_idev, int effect_id,
 	struct hid_device *trackpad_hdev = input_get_drvdata(trackpad_idev);
 	struct magicmouse_sc *msc = hid_get_drvdata(trackpad_hdev);
 
+	guard(spinlock_irqsave)(&msc->haptic_lock);
+	if (msc->haptic_suspended)
+		return 0;
 	if (value)
 		queue_work(msc->haptics->wq, &msc->haptic_effects[effect_id].work);
 
@@ -2123,6 +2841,8 @@ static int apple_taptic_erase(struct input_dev *trackpad_idev, int effect_id)
 	/* Drain workers before taking the mutex they need. */
 	flush_workqueue(msc->haptics->wq);
 	guard(mutex)(&msc->haptics->auto_trigger_mutex);
+	if (msc->haptic_suspended)
+		return 0;
 	/* Return to device-controlled mode if there are no effects left */
 	if (READ_ONCE(msc->haptics->mode) == HID_HAPTIC_MODE_HOST) {
 		ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_DEVICE);
@@ -2221,6 +2941,7 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 	haptic_dev->hdev = trackpad_hdev;
 	haptic_dev->input_dev = msc->input;
 	mutex_init(&haptic_dev->auto_trigger_mutex);
+	spin_lock_init(&msc->haptic_lock);
 
 	msc->haptic_effects = kzalloc_objs(struct effect_job, FF_MAX_EFFECTS);
 	if (!msc->haptic_effects) {
@@ -2248,9 +2969,6 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 	INIT_WORK(&msc->haptic_deep_release_work,
 		  magicmouse_deep_release_worker);
 
-	if (haptic_deep_keycode)
-		magicmouse_setup_force_input(msc);
-
 	/* FF_HAPTIC has to be in ffbit before the FF device is created. */
 	input_set_capability(msc->input, EV_FF, FF_HAPTIC);
 
@@ -2269,6 +2987,13 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 		dev_err(&trackpad_hdev->dev, "Failed to create force-feedback device.\n");
 		return ret;
 	}
+
+	/*
+	 * Only now: if the FF device could not be created there are no
+	 * haptics, and no Force Click device must be left registered.
+	 */
+	if (haptic_deep_keycode)
+		magicmouse_setup_force_input(msc);
 
 	ff = msc->input->ff;
 	ff->private = haptic_dev;
@@ -2391,15 +3116,62 @@ static int magicmouse_probe(struct hid_device *hdev,
 	// conflicts with the report ID.
 	if (id->bus == BUS_HOST) {
 		struct device_node *np;
+		u32 palm_area[2];
 
 		/* The J700 trackpad sends a different report layout. */
 		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
 		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
-		msc->mtp_palms = !msc->mtp_c1fe &&
-				 of_machine_is_compatible("apple,t6041");
+		msc->mtp_palm_size = !msc->mtp_c1fe &&
+				     of_machine_is_compatible("apple,t6041");
+		/*
+		 * The J813 and J815 controllers class contacts the same way;
+		 * the trackpad node says which palm rule its pad takes: two
+		 * consecutive palm classes (J813), or hand classes with the
+		 * pad's own tool areas (J815, checked against macOS's labels).
+		 */
+		msc->mtp_palm_debounce = !msc->mtp_c1fe &&
+					 of_property_read_bool(np, "apple,palm-debounce");
+		msc->mtp_palm_large = !msc->mtp_c1fe &&
+				      !of_property_read_u32_array(np, "apple,palm-tool-area",
+								  palm_area, 2);
+		/*
+		 * The record's tool area is a signed 16-bit field, compared
+		 * as an int: a larger value could never be passed.
+		 */
+		if (msc->mtp_palm_large &&
+		    (palm_area[0] >= palm_area[1] || palm_area[1] > S16_MAX)) {
+			hid_warn(hdev, "apple,palm-tool-area %u %u: the first must be below the second, and both at most %d, rule off\n",
+				 palm_area[0], palm_area[1], S16_MAX);
+			msc->mtp_palm_large = false;
+		} else if (msc->mtp_palm_large) {
+			msc->mtp_palm_area[0] = palm_area[0];
+			msc->mtp_palm_area[1] = palm_area[1];
+		}
+		/*
+		 * The J616s controller classes contacts the same way, but its
+		 * fingers reach a tool area of 2475, so only the class marks its
+		 * palms there.
+		 */
+		msc->mtp_palms = msc->mtp_palm_size ||
+				 msc->mtp_palm_debounce || msc->mtp_palm_large ||
+				 (!msc->mtp_c1fe &&
+				  of_machine_is_compatible("apple,j616s"));
+		/*
+		 * The record's touch state and path ID (decoded on a J815
+		 * against macOS) are a property of the trackpad's firmware.
+		 */
+		msc->mtp_states = !msc->mtp_c1fe &&
+				  of_property_read_bool(np, "apple,touch-states");
 		of_node_put(np);
 
-		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
+		/*
+		 * The Trackpad26 firmware (K116s) is told apart by its HID
+		 * product. Every other MTP trackpad keeps report 0x75.
+		 */
+		msc->mtp_tp26 = !msc->mtp_c1fe &&
+				hdev->product == MTP_TP26_PRODUCT_ID;
+
+		msc->input_ops.raw_event = magicmouse_raw_event_dockchannel;
 		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
 	} else if (id->bus == BUS_SPI) {
 		msc->input_ops.raw_event = magicmouse_raw_event_spi;
@@ -2485,7 +3257,25 @@ static int magicmouse_probe(struct hid_device *hdev,
 	default:
 		switch (id->bus) {
 		case BUS_HOST:
-			report = hid_register_report(hdev, HID_INPUT_REPORT, MTP_REPORT_ID, 0);
+			/*
+			 * The Trackpad26 descriptor declares a single
+			 * unnumbered vendor report: registering 0x75 there
+			 * would switch the HID core to numbered lookups and
+			 * drop every frame as an undefined report ID (the
+			 * first byte of the frame, 0x5a). Use the report the
+			 * descriptor declared.
+			 */
+			if (msc->mtp_tp26)
+				report = hdev->report_enum[HID_INPUT_REPORT].report_id_hash[0];
+			else {
+				report = hid_register_report(hdev, HID_INPUT_REPORT,
+							     MTP_REPORT_ID, 0);
+				if (report) {
+					report->size = 6;
+					report = hid_register_report(hdev, HID_INPUT_REPORT,
+								     MTP_V2_REPORT_ID, 0);
+				}
+			}
 			break;
 		case BUS_SPI:
 			report = hid_register_report(hdev, HID_INPUT_REPORT, SPI_REPORT_ID, 0);
@@ -2503,7 +3293,9 @@ static int magicmouse_probe(struct hid_device *hdev,
 		ret = -ENOMEM;
 		goto err_stop_hw;
 	}
-	report->size = 6;
+	/* The Trackpad26 report keeps the size its descriptor declared. */
+	if (!msc->mtp_tp26)
+		report->size = 6;
 
 	/* MTP devices do not need the MT enable, this is handled by the MTP driver */
 	if (id->bus == BUS_HOST)
@@ -2565,8 +3357,10 @@ static int magicmouse_suspend(struct hid_device *hdev, pm_message_t message)
 	 * can fire while the system is still suspending or before the
 	 * transport has resumed, so stop it here and re-arm it on resume.
 	 */
-	if (msc)
+	if (msc) {
 		msc->work_held = cancel_delayed_work_sync(&msc->work);
+		magicmouse_haptic_suspend(msc);
+	}
 	return 0;
 }
 
@@ -2582,7 +3376,7 @@ static int magicmouse_resume(struct hid_device *hdev)
 		msc->work_held = false;
 		schedule_delayed_work(&msc->work, msecs_to_jiffies(10));
 	}
-	magicmouse_haptic_forget_mode(msc);
+	magicmouse_haptic_resume(msc);
 	return 0;
 }
 
@@ -2600,7 +3394,7 @@ static int magicmouse_reset_resume(struct hid_device *hdev)
 		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
 
 	if (msc)
-		magicmouse_haptic_forget_mode(msc);
+		magicmouse_haptic_resume(msc);
 
 	return 0;
 }
@@ -2663,9 +3457,28 @@ static const struct hid_device_id magic_mice[] = {
 };
 MODULE_DEVICE_TABLE(hid, magic_mice);
 
+/*
+ * Every interface of an internal SPI or DockChannel controller carries the
+ * controller's IDs. Only the trackpad is ours; leave the others to their own
+ * driver or to hid-generic.
+ */
+static bool magicmouse_match(struct hid_device *hdev, bool ignore_special_driver)
+{
+	if (ignore_special_driver ||
+	    (hdev->quirks & HID_QUIRK_IGNORE_SPECIAL_DRIVER))
+		return false;
+
+	if ((hdev->bus == BUS_SPI || hdev->bus == BUS_HOST) &&
+	    hdev->vendor == SPI_VENDOR_ID_APPLE)
+		return hdev->type == HID_TYPE_SPI_MOUSE;
+
+	return true;
+}
+
 static struct hid_driver magicmouse_driver = {
 	.name = "magicmouse",
 	.id_table = magic_mice,
+	.match = magicmouse_match,
 	.probe = magicmouse_probe,
 	.remove = magicmouse_remove,
 	.report_fixup = magicmouse_report_fixup,

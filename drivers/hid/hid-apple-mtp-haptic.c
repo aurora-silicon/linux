@@ -99,6 +99,69 @@ EXPORT_SYMBOL_GPL(apple_taptic_switch_modes);
 #define APPLE_TAPTIC_WAVEFORM_STRENGTH	2
 #define APPLE_TAPTIC_WAVEFORM_MAX	64
 
+/*
+ * The click waveform the firmware plays itself while device-controlled,
+ * for a host that plays the same click: the host's output report 0x53 takes
+ * the body of feature report 0x22 (press) or 0x23 (release) unchanged, a
+ * version byte, the strength, the softness and then the waveform's shape,
+ * which differs between machines. Copies the body (without the report ID)
+ * into @body and returns its length.
+ */
+int apple_taptic_get_waveform(struct hid_device *haptic_hdev, u16 effect_type,
+			      u8 *body, size_t size)
+{
+	u8 *buf __free(kfree) = NULL;
+	u8 report;
+	int len;
+
+	switch (effect_type) {
+	case HID_HP_WAVEFORMPRESS & HID_USAGE:
+		report = APPLE_TAPTIC_PRESS_WAVEFORM;
+		break;
+	case HID_HP_WAVEFORMRELEASE & HID_USAGE:
+		report = APPLE_TAPTIC_RELEASE_WAVEFORM;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	buf = kzalloc(APPLE_TAPTIC_WAVEFORM_MAX, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	len = hid_hw_raw_request(haptic_hdev, report, buf,
+				 APPLE_TAPTIC_WAVEFORM_MAX, HID_FEATURE_REPORT,
+				 HID_REQ_GET_REPORT);
+	if (len < 0)
+		return len;
+	/* At least the version, the strength and the softness. */
+	if (len < 4 || buf[0] != report || !buf[APPLE_TAPTIC_WAVEFORM_STRENGTH])
+		return -EPROTO;
+	if (len - 1 > size)
+		return -EMSGSIZE;
+
+	memcpy(body, buf + 1, len - 1);
+	return len - 1;
+}
+EXPORT_SYMBOL_GPL(apple_taptic_get_waveform);
+
+/* Play a waveform body from apple_taptic_get_waveform() from the host. */
+int apple_taptic_send_waveform(struct hid_device *haptic_hdev, const u8 *body,
+			       size_t len)
+{
+	u8 msg[APPLE_TAPTIC_WAVEFORM_MAX];
+	int ret;
+
+	if (len < 3 || len + 1 > sizeof(msg))
+		return -EINVAL;
+	msg[0] = 0x53;
+	memcpy(msg + 1, body, len);
+	ret = hid_hw_raw_request(haptic_hdev, msg[0], msg, len + 1,
+				 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(apple_taptic_send_waveform);
+
 static int apple_taptic_set_strength(struct hid_device *haptic_hdev, u8 report,
 				     u8 strength)
 {

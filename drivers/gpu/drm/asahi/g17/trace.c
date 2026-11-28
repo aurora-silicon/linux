@@ -1,11 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/dma-fence.h>
 #include <asm/arch_timer.h>
+#include <linux/math64.h>
 
 #include "trace_api.h"
 
 #define CREATE_TRACE_POINTS
 #include "trace.h"
+
+void asahi_g17_trace_submit(u8 phase, u64 submit_id, u32 ctx, u32 inputs,
+			    u32 outputs, s32 result, struct dma_fence *fence)
+{
+	if (trace_asahi_g17_submit_enabled())
+		trace_asahi_g17_submit(phase, submit_id, ctx, inputs, outputs,
+				       result, fence ? fence->context : 0,
+				       fence ? fence->seqno : 0,
+				       __arch_counter_get_cntvct());
+}
+
+void asahi_g17_trace_output(s32 result, struct dma_fence *fence)
+{
+	if (trace_asahi_g17_output_enabled())
+		trace_asahi_g17_output(result, fence ? fence->context : 0,
+				       fence ? fence->seqno : 0,
+				       __arch_counter_get_cntvct());
+}
 
 bool asahi_g17_trace_publish_enabled(void)
 {
@@ -84,4 +103,14 @@ void asahi_g17_trace_schedule(u8 engine, u32 ctx, u64 seq, u8 phase, s32 detail)
     if (trace_asahi_g17_schedule_enabled())
 	trace_asahi_g17_schedule(engine, ctx, seq, phase, detail,
 				__arch_counter_get_cntvct());
+}
+
+/*
+ * The CPU's virtual counter in ticks of `hz`: the firmware stamps command
+ * execution with the same system time base at its own rate (24 MHz, while the
+ * CPU counter runs at 1 GHz on T6040 and T8140; both read the same seconds).
+ */
+u64 asahi_g17_firmware_clock(u64 hz)
+{
+	return mul_u64_u64_div_u64(__arch_counter_get_cntvct(), hz, arch_timer_get_cntfrq());
 }

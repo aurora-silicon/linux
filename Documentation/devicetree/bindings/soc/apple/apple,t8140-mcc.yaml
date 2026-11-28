@@ -34,6 +34,7 @@ select:
           - apple,t8122-mcc
           - apple,t8132-mcc
           - apple,t8140-mcc
+          - apple,t8142-mcc
   required:
     - compatible
 
@@ -92,6 +93,7 @@ allOf:
             - items:
                 - enum:
                     - apple,t6041-mcc
+                    - apple,t8142-mcc
                 - const: apple,t8140-mcc
 
         reg:
@@ -109,7 +111,10 @@ allOf:
             maxItems: 1
           description:
             Devices that take over DMA the bootloader left running. Cache allocation
-            is enabled only once each of them is bound to its driver.
+            is enabled only once each of them is bound to its driver. A supplier
+            that an enabled simple-framebuffer names as its display is scanning out
+            that boot framebuffer, enabled or not, and is waited for until a
+            displayed swap of its own has replaced it.
 
       required:
         - compatible

@@ -63,6 +63,13 @@ properties:
       - description: The microphones only
         items:
           - const: dma
+      - description:
+          The speakers and the headset jack, on a Mac without microphones
+        items:
+          - const: spkr
+          - const: sense
+          - const: cout
+          - const: cin
       - description: The microphones and the headset jack
         items:
           - const: dma
@@ -140,6 +147,17 @@ examples:
             apple,machine-kind = "Mac mini";
             dmas = <&admac1 4>, <&admac1 5>;
             dma-names = "cout", "cin";
+            #sound-dai-cells = <1>;
+        };
+    };
+  - |
+    aop {
+        audio {
+            compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+            apple,chassis-name = "J575";
+            apple,machine-kind = "Mac Studio";
+            dmas = <&admac1 0>, <&admac1 1>, <&admac1 4>, <&admac1 5>;
+            dma-names = "spkr", "sense", "cout", "cin";
             #sound-dai-cells = <1>;
         };
     };

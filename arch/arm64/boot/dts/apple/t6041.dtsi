@@ -9,7 +9,35 @@
 
 &avd {
 	compatible = "apple,t6041-max-avd", "apple,t6041-avd", "apple,t8132-avd";
-	power-domains = <&ps_avd_sys>;
+	power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
+	power-domain-names = "core", "perf";
+};
+
+&ave {
+	power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+			<&pmc_soc_max>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+};
+
+/* The loader supplies the ANE firmware and reservations. */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
+	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 };
 
 /*
@@ -337,7 +365,39 @@
 };
 
 &pmc {
+	#cooling-cells = <2>;
 	apple,static-voters = <1 3>;
+
+	/*
+	 * SoC fabric rail floor (rail 1, AP voter agent 3). T6041 has four
+	 * SOC states (0-3; ADT pmp dvfs-domain and pmgr voltage-states0/28/29):
+	 * state 2 (VMAX, 815 mV) already reaches the maximum SOC_AFC clock
+	 * (2004 MHz) and matches ADT AVD-SOC-VMAX and VENC0-SOC-VMAX; state 3
+	 * (VOVD, 820 mV) only raises SOC_AFI (975 -> 1300 MHz) and is voted by
+	 * CLPC for CPU/GPU demand.
+	 */
+	pmc_soc_max: floor-soc-max {
+		label = "soc-vmax";
+		#power-domain-cells = <0>;
+		apple,rail = <1>;
+		apple,level = <2>;
+	};
+};
+
+/*
+ * The GPU's memory states by the busy share the GPU driver reports, measured
+ * on a J616c: DCS 1, 2, 4 or 5 and fabric 0, 0, 0 or 3, split at 160, 500
+ * and 800 permille, and the top column with no share reported. The top
+ * column matches apple_clpc_hw_t6041's DCS 5 / fabric 3 floor (full memory
+ * bandwidth), so busy GPU work keeps it; light work such as scrolling a
+ * browser gets the lower columns. With a 3 GB/s copy: DCS 0 / fabric 0
+ * 5.46 W at 309 ns DRAM latency, DCS 3 6.22 W at 166 ns, DCS 4 6.92 W at
+ * 114 ns, DCS 5 7.04 W at 113 ns.
+ */
+&clpc {
+	compatible = "apple,t6041-max-clpc", "apple,t6041-clpc";
+	apple,gpu-busy-memory-states = <1 2 4 5>, <0 0 0 3>;
+	apple,gpu-busy-permille = <160 500 800>;
 };
 
 / {
@@ -352,6 +412,7 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
+		apple,clpc = <&clpc>;
 	};
 
 	agx_mbox: mailbox@28a600000 {
@@ -366,6 +427,282 @@
 		apple,firmware-role = "GFX";
 		power-domains = <&ps_gfx>;
 		#mbox-cells = <0>;
+	};
+
+	/* ADT aop-spmi0 (J575c, J616c), at the T6040's address and IRQ */
+	aop_spmi0: spmi@510914000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x10914000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 738 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aes */
+	aes: crypto@42900c000 {
+		compatible = "apple,t6041-aes", "apple,aes";
+		reg = <0x4 0x2900c000 0x0 0x4000>,
+		      <0x5 0x08340000 0x0 0x8000>,
+		      <0x5 0x08090000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1574 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aon-ptd */
+	aon_ptd: aon-ptd@50cdc0000 {
+		compatible = "apple,t6041-aon-ptd", "apple,aon-ptd";
+		reg = <0x5 0x0cdc0000 0x0 0x4000>,
+		      <0x5 0x0cdd0000 0x0 0x4000>,
+		      <0x5 0x0cdd8000 0x0 0x4000>,
+		      <0x5 0x0cde0000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1001 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1002 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1003 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1004 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1005 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1006 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1007 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1008 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1010 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1011 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1012 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1013 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1014 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1015 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1016 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1017 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1018 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1019 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1020 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1021 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1022 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1023 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1024 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1026 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1027 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1028 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1029 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1030 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1031 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1032 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		#address-cells = <0>;
+		status = "disabled";
+	};
+
+	pmgr_disp: power-management@502290000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x5 0x02290000 0x0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	/*
+	 * The CPU power-gate enables, in /arm-io/pmgr at 0x50282c000, one word
+	 * per core: E core 0 at +0x0 and P0 core 0 (the boot core) at +0x40,
+	 * matching the two wake gates t6041-sleep restores on resume. iBoot
+	 * leaves the boot core's word clear, so P0 never powers down in WFI
+	 * unless set early in boot.
+	 */
+	cluster_pwrgate: power-gate@50282c000 {
+		compatible = "apple,t6041-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x5 0x0282c000 0x0 0x4>,
+		      <0x5 0x0282c040 0x0 0x4>;
+	};
+
+	/*
+	 * Suspend-to-RAM at EL2 through aura's S2R mailbox; without the mailbox
+	 * it stays out. Stays disabled at the SoC level so boards without
+	 * qualified deep sleep (such as J575c) remain on s2idle; qualified board
+	 * trees wire apple,apcie and apple,atc-phys and enable it.
+	 */
+	t6041_sleep: sleep-controller@508304000 {
+		compatible = "apple,t6041-sleep";
+		reg = <0x5 0x08304000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x4000>,
+		      <0x5 0x0282c000 0x0 0x4000>,
+		      <0x5 0x02888000 0x0 0x4000>,
+		      <0x5 0x0836c000 0x0 0x4000>,
+		      <0x5 0x08330000 0x0 0x4000>,
+		      <0x5 0x08904000 0x0 0x4>,
+		      <0x5 0x00038000 0x0 0x4000>,
+		      <0x5 0x029dc000 0x0 0x880>,
+		      <0x5 0x022d0000 0x0 0x880>,
+		      <0x5 0x04800000 0x0 0xb0000>,
+		      <0x5 0x003c0000 0x0 0x20000>,
+		      <0x5 0x0020c000 0x0 0x800>,
+		      <0x5 0x08004000 0x0 0x58>,
+		      <0x2 0x20000000 0x0 0x200000>,
+		      <0x2 0x22000000 0x0 0x200000>,
+		      <0x2 0x24000000 0x0 0x200000>,
+		      <0x2 0x26000000 0x0 0x200000>,
+		      <0x2 0x28000000 0x0 0x200000>,
+		      <0x2 0x2a000000 0x0 0x200000>,
+		      <0x2 0x2c000000 0x0 0x200000>,
+		      <0x2 0x2e000000 0x0 0x200000>,
+		      <0x2 0x20200000 0x0 0x601000>,
+		      <0x2 0x22200000 0x0 0x601000>,
+		      <0x2 0x24200000 0x0 0x601000>,
+		      <0x2 0x26200000 0x0 0x601000>,
+		      <0x2 0x28200000 0x0 0x601000>,
+		      <0x2 0x2a200000 0x0 0x601000>,
+		      <0x2 0x2c200000 0x0 0x601000>,
+		      <0x2 0x2e200000 0x0 0x601000>,
+		      <0x4 0x03000100 0x0 0x10>,
+		      <0x3 0xa3000100 0x0 0x10>,
+		      <0x6 0x03000100 0x0 0x10>,
+		      <0x6 0x07000100 0x0 0x10>,
+		      <0x3 0x07000100 0x0 0x10>,
+		      <0x4 0x0b000100 0x0 0x10>,
+		      <0x2 0x80000100 0x0 0x10>,
+		      <0x2 0x82000100 0x0 0x10>,
+		      <0x2 0x84000100 0x0 0x10>,
+		      <0x4 0x86000100 0x0 0x10>;
+		reg-names = "ps-aop",
+			    "cluster", "pwrgate", "cpu-start", "wdt",
+			    "aon-misc", "commit", "clk-mux", "ka-pmgr",
+			    "ka-east", "pmc", "ptd", "perf", "wake",
+			    "amcc0", "amcc1", "amcc2", "amcc3",
+			    "amcc4", "amcc5", "amcc6", "amcc7",
+			    "dcs0", "dcs1", "dcs2", "dcs3",
+			    "dcs4", "dcs5", "dcs6", "dcs7",
+			    "axi2af-disp", "axi2af-dispext0",
+			    "axi2af-dispext1", "axi2af-dispext2",
+			    "axi2af-dispext3", "axi2af-ans",
+			    "axi2af-avd", "axi2af-venc0",
+			    "axi2af-venc1", "axi2af-jpg";
+		apple,pinctrl = <&pinctrl>;
+		apple,pinctrl-skip-pins = <190 191 192>;
+		apple,spmi-buses = <&nub_spmi0>, <&nub_spmi_a0>;
+		/* ADT ap-wake-sources unmasked across S2R */
+		apple,wake-enable = <13 15 25 27 28 41 44 48 50 51 52 53 55
+				     101 106 126 127 128 129 130 131 132 133
+				     155 167>;
+		apple,sleep-off-domains = <&ps_venc1_me1>, <&ps_venc0_me1>, <&ps_venc1_pipe5>,
+					  <&ps_venc1_pipe4>, <&ps_venc1_me0>, <&ps_venc0_pipe5>,
+					  <&ps_venc0_pipe4>, <&ps_venc0_me0>, <&ps_apcie_phy_sw>,
+					  <&ps_ane_base>, <&ps_venc1_dma>, <&ps_venc0_dma>,
+					  <&ps_scodec_streaming>, <&ps_msr1_ase_core>,
+					  <&ps_msr0_ase_core>, <&ps_apcie_sys_st1>,
+					  <&ps_apcie_sys_st0>, <&ps_apcie_sys_gp>, <&ps_ane_td>,
+					  <&ps_ane_mpm>, <&ps_ane_cpu>, <&ps_gfx>, <&ps_venc1_sys>,
+					  <&ps_venc0_sys>, <&ps_spi5>, <&ps_spi4>, <&ps_spi3>,
+					  <&ps_spi2>, <&ps_spi1>, <&ps_spi0>, <&ps_scodec>,
+					  <&ps_rom>, <&ps_qspi>, <&ps_prores>, <&ps_pms_fpwm4>,
+					  <&ps_pms_fpwm3>, <&ps_pms_fpwm2>, <&ps_pms_fpwm1>,
+					  <&ps_pms_fpwm0>, <&ps_pmgr_soc_ocla>, <&ps_nub_spi0>,
+					  <&ps_nub_ocla>, <&ps_msr1>, <&ps_msr0>, <&ps_msg>,
+					  <&ps_jpg>, <&ps_ispsens0>, <&ps_isp_sys>, <&ps_i2c8>,
+					  <&ps_i2c7>, <&ps_i2c6>, <&ps_i2c5>, <&ps_i2c4>,
+					  <&ps_i2c3>, <&ps_i2c2>, <&ps_i2c1>, <&ps_i2c0>,
+					  <&ps_fpwm2>, <&ps_fpwm1>, <&ps_fpwm0>, <&ps_dpa4>,
+					  <&ps_dpa3>, <&ps_dpa2>, <&ps_dpa1>, <&ps_dpa0>,
+					  <&ps_avd_sys>, <&ps_ans>, <&ps_apcie_st1>,
+					  <&ps_apcie_st0>, <&ps_apcie_gp>, <&ps_ap_tmm>,
+					  <&ps_ane_sys>, <&ps_afr>;
+		apple,atc-off-domains = <&ps_atc0_phymxwrap>, <&ps_atc1_phymxwrap>,
+					<&ps_atc2_phymxwrap>, <&ps_atc3_phymxwrap>,
+					<&ps_atc0_usb>, <&ps_atc1_usb>,
+					<&ps_atc2_usb>, <&ps_atc3_usb>,
+					<&ps_atc0_usb_aon>, <&ps_atc1_usb_aon>,
+					<&ps_atc2_usb_aon>, <&ps_atc3_usb_aon>,
+					<&ps_atc0_common_dp>, <&ps_atc1_common_dp>,
+					<&ps_atc2_common_dp>, <&ps_atc3_common_dp>,
+					<&ps_atc0_cio_usb>, <&ps_atc0_cio_pcie>,
+					<&ps_atc0_pcie>, <&ps_atc0_cio>,
+					<&ps_atc1_cio_usb>, <&ps_atc1_cio_pcie>,
+					<&ps_atc1_pcie>, <&ps_atc1_cio>,
+					<&ps_atc2_cio_usb>, <&ps_atc2_cio_pcie>,
+					<&ps_atc2_pcie>, <&ps_atc2_cio>,
+					<&ps_atc3_cio_usb>, <&ps_atc3_cio_pcie>,
+					<&ps_atc3_pcie>, <&ps_atc3_cio>,
+					<&ps_atc0_common>, <&ps_atc1_common>,
+					<&ps_atc2_common>, <&ps_atc3_common>;
+		apple,sleep-auto-domains = <&ps_fab_gw_1>, <&ps_fab_afr>, <&ps_fab4_soc>,
+					   <&ps_amcc4>, <&ps_amcc5>, <&ps_amcc6>, <&ps_amcc7>,
+					   <&ps_amcc12>, <&ps_amcc13>, <&ps_amcc14>, <&ps_amcc15>,
+					   <&ps_amcc20>, <&ps_amcc21>, <&ps_amcc22>, <&ps_amcc23>,
+					   <&ps_fab0_soc>, <&ps_amcc0>, <&ps_amcc1>, <&ps_amcc2>,
+					   <&ps_amcc3>, <&ps_amcc8>, <&ps_amcc9>, <&ps_amcc10>,
+					   <&ps_amcc11>, <&ps_amcc16>, <&ps_amcc17>, <&ps_amcc18>,
+					   <&ps_amcc19>, <&ps_fab1_soc>, <&ps_fab6_soc>,
+					   <&ps_fab7_soc>, <&ps_nub_sram>, <&ps_dcs_23>, <&ps_sep>,
+					   <&ps_dcs_19>, <&ps_amcc24>, <&ps_amcc25>, <&ps_amcc26>,
+					   <&ps_amcc27>, <&ps_amcc28>, <&ps_amcc29>, <&ps_amcc30>,
+					   <&ps_amcc31>;
+		apple,sleep-auto-clkgate-domains = <&ps_nub_spmi_a0>, <&ps_nub_spmi_a1>,
+						   <&ps_nub_spmi_a2>, <&ps_fab3_soc>, <&ps_pmc>,
+						   <&ps_nub_spmi0>, <&ps_nub_spmi1>,
+						   <&ps_nub_spmi2>, <&ps_nub_spmi3>,
+						   <&ps_nub_spmi4>, <&ps_dcs_04>, <&ps_dcs_06>,
+						   <&ps_dcs_07>, <&ps_dcs_12>, <&ps_dcs_13>,
+						   <&ps_dcs_14>, <&ps_dcs_15>, <&ps_dcs_20>,
+						   <&ps_dcs_21>, <&ps_dcs_22>, <&ps_dcs_00>,
+						   <&ps_dcs_01>, <&ps_dcs_02>, <&ps_dcs_03>,
+						   <&ps_dcs_08>, <&ps_dcs_09>, <&ps_dcs_10>,
+						   <&ps_dcs_16>, <&ps_dcs_17>, <&ps_dcs_18>,
+						   <&ps_dcs_24>, <&ps_dcs_25>, <&ps_dcs_26>,
+						   <&ps_dcs_27>, <&ps_dcs_28>, <&ps_dcs_29>,
+						   <&ps_dcs_30>, <&ps_dcs_31>;
+		apple,sleep-auto-active-domains = <&ps_gpx>, <&ps_pms>, <&ps_afi>, <&ps_afc>,
+						  <&ps_fab_gw_0>, <&ps_debug_gated>, <&ps_nub_aon>,
+						  <&ps_nub_fabric>, <&ps_debug_switch>,
+						  <&ps_fab2_soc>, <&ps_pmp>, <&ps_pms_sram>,
+						  <&ps_fab5_soc>, <&ps_dcs_05>, <&ps_dcs_11>,
+						  <&ps_sbr>;
+		apple,sleep-keep-on-domains = <&ps_dwi>, <&ps_nub_spmi_ahb>, <&ps_nub_gpio>,
+					      <&ps_aic>, <&ps_pms_c1ppt>, <&ps_soc_dpe>, <&ps_sio>,
+					      <&ps_sio_cpu>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>,
+					      <&ps_aes>, <&ps_gpio>, <&ps_uart_n>, <&ps_uart0>,
+					      <&ps_uart1>, <&ps_uart2>, <&ps_uart3>, <&ps_uart4>,
+					      <&ps_uart5>, <&ps_uart6>;
+		apple,cpu-domains = <&ps_ecpu_0>, <&ps_ecpu_1>, <&ps_ecpu_2>, <&ps_ecpu_3>,
+				    <&ps_pcpu0_0>, <&ps_pcpu0_1>, <&ps_pcpu0_2>, <&ps_pcpu0_3>,
+				    <&ps_pcpu0_4>, <&ps_pcpu0_5>, <&ps_pcpu1_0>, <&ps_pcpu1_1>,
+				    <&ps_pcpu1_2>, <&ps_pcpu1_3>, <&ps_pcpu1_4>, <&ps_pcpu1_5>;
+		apple,cpm-domains = <&ps_ecpm>, <&ps_pcpm0>, <&ps_pcpm1>;
+		apple,sep-domain = <&ps_sep>;
+		apple,spmi-a0-domain = <&ps_nub_spmi_a0>;
+		apple,atc-common-domains = <&ps_atc0_common>, <&ps_atc1_common>, <&ps_atc2_common>,
+					   <&ps_atc3_common>;
+		apple,atc-fabric-domain = <&ps_fab2_soc>;
+		apple,atc-afi-domain = <&ps_afi>;
+		apple,apcie-domains = <&ps_ans>, <&ps_apcie_gp>, <&ps_apcie_sys_gp>,
+				      <&ps_apcie_st0>, <&ps_apcie_sys_st0>, <&ps_apcie_st1>,
+				      <&ps_apcie_sys_st1>, <&ps_apcie_phy_sw>;
+		apple,commit-sio-domains = <&ps_sio>, <&ps_sio_cpu>;
+		apple,commit-periph-domains = <&ps_i2c6>, <&ps_i2c3>, <&ps_i2c2>, <&ps_i2c1>,
+					      <&ps_spi2>;
+		apple,axi2af-domains = <&ps_atc0_common>, <&ps_atc1_common>, <&ps_atc2_common>,
+				       <&ps_atc3_common>, <&ps_disp_sys>, <&ps_dispext0_sys>,
+				       <&ps_dispext1_sys>, <&ps_dispext2_sys>, <&ps_dispext3_sys>,
+				       <&ps_ans>, <&ps_avd_sys>, <&ps_venc0_sys>, <&ps_venc1_sys>,
+				       <&ps_jpg>, <&ps_apcie_sys_gp>;
+		apple,full-part-detect-domains = <&ps_amcc24>, <&ps_amcc28>;
+		status = "disabled";
+	};
+};
+
+&pmgr {
+	ps_aes: power-controller@1b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aes";
+		power-domains = <&ps_sio>;
+		status = "disabled";
 	};
 };
 
@@ -444,4 +781,290 @@
 
 &{/opp-table-e/opp07} {
 	opp-microwatt = <531000>;
+};
+
+/*
+ * What the SEP's DART gets around a sleep, as offset and value: the writes T8140's has
+ * (t8140.dtsi), which the J616C has slept with. The SEP driver saves the DART with them
+ * before it tells the enclave to sleep at suspend.
+ */
+&sep_dart {
+	apple,sleep-prepare = <0x80 0xa102>, <0x704 0xffffffff>;
+	apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+			      <0x220 0xf0f0f>, <0x224 0x80808>,
+			      <0x300 0x1>, <0x318 0x1>;
+	apple,sleep-restore-late = <0x80 0x8000>, <0x228 0x3f3f3f3f>,
+				   <0x22c 0x1010101>;
+};
+
+/*
+ * The ISP DART's address filter, from the full-die J616c ADT's dart-isp0
+ * dapf-instance-0 (its sixth reg window), in the ADT's order: the
+ * firmware's PMGR, PMP and DSID windows, with one window for each of the
+ * eight AMCCs (aura syncs apple,dapf-ranges from this boot's ADT so six-AMCC
+ * parts get their six windows). The filter goes off with the ISP system
+ * domain and is written back when the DART powers up again, so the ISP
+ * firmware can start again after the ISP has been powered down between
+ * streams, as on T6040.
+ */
+&isp_dart0 {
+	reg = <0x5 0x828c0000 0x0 0xc000>,
+	      <0x5 0x828d0000 0x0 0x4000>;
+	reg-names = "dart", "dapf";
+	apple,dapf-ranges = /bits/ 64 <0x502284000 0x50228402b
+				     0x502880000 0x502887fff
+				     0x500e3c000 0x500e3c003
+				     0x51062c000 0x510648003
+				     0x485660000 0x485660003
+				     0x504824000 0x504824004
+				     0x5003c0000 0x5003e4000
+				     0x220004000 0x2201d62fc
+				     0x222004000 0x2221d62fc
+				     0x224004000 0x2241d62fc
+				     0x226004000 0x2261d62fc
+				     0x228004000 0x2281d62fc
+				     0x22a004000 0x22a1d62fc
+				     0x22c004000 0x22c1d62fc
+				     0x22e004000 0x22e1d62fc>;
+};
+
+/*
+ * The second video encoder (ADT ave1, soc-id t6041), unique to the M4 Max.
+ * Its six PMGR power states (VENC1_SYS through VENC1_ME1) live in pmgr_aux
+ * (0x5028002a0..0x5028002c8). All nodes stay disabled until a bootloader
+ * handoff preloads and qualifies ave1's firmware.
+ */
+&pmgr_aux {
+	ps_venc1_sys: power-controller@2a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_sys";
+		power-domains = <&ps_fab0_soc>;
+		status = "disabled";
+	};
+
+	ps_venc1_dma: power-controller@2a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_dma";
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe4: power-controller@2b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe4";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe5: power-controller@2b8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe5";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me0: power-controller@2c0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me0";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me1: power-controller@2c8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me1";
+		power-domains = <&ps_venc1_me0>;
+		status = "disabled";
+	};
+};
+
+/ {
+	ave1_dart1: iommu@285080000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x85080000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1_dart0: iommu@2850a0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x850a0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1: video-codec@285100000 {
+		compatible = "apple,t6041-ave";
+		reg = <0x2 0x85100000 0x0 0x45c000>,
+		      <0x2 0x85050000 0x0 0x4000>,
+		      <0x2 0x85800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1476 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1470 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1469 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1472 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1471 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>,
+				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave1_dart0 0>, <&ave1_dart1 0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * First ProRes engine (ADT /arm-io/apr0) and its DART, from the J616c ADT.
+ * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0 in
+ * t6041-pmgr.dtsi, SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper
+ * and aux windows.
+ */
+&pmgr_aux {
+	ps_scodec: power-controller@328 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		power-domains = <&ps_fab1_soc>;
+		status = "disabled";
+	};
+
+	ps_scodec_streaming: power-controller@330 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec_streaming";
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/ {
+	apr0: video-codec@301000000 {
+		compatible = "apple,t6041-prores", "apple,prores";
+		reg = <0x3 0x01000000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x1000000>,
+		      <0x3 0x010c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec_streaming>;
+		iommus = <&apr0_dart 1>;
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	apr0_dart: iommu@301020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x01020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/*
+ * The first video encoder (ADT ave0, soc-id t6040), its DARTs and its power
+ * domains. It has no board wiring, so it is enabled on every M4 Max board.
+ * iBoot preloads its firmware; the driver refuses a firmware layout it does
+ * not know at probe. The second encoder (ave1, soc-id t6041) is not
+ * described.
+ */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+#include "t6041-pmgr.dtsi"
+#include "t6041-sleep-pmgr.dtsi"
+
+/* The loader uses this alias to enable SIO after placing its firmware. */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
 };

@@ -25,9 +25,10 @@ pub(crate) const CONFIG: Config = Config {
     uat_oas: 42,
     // The secondary coprocessor's kernel root follows the primary one's 256 KiB of page tables.
     secondary_root_offset: Some(0x40000),
-    // The coprocessors request their crash log buffers at these addresses, in this order, and
-    // expect them to be mapped before they start.
-    crash_buffers: CrashBuffers::Fixed([
+    // Each coprocessor keeps its crash log in its own data segment and asks for it there by
+    // physical address. Without the boot loader's fw-data region the driver maps its own buffers
+    // at the low bits of those addresses, in this order, before the coprocessors start.
+    crash_buffers: CrashBuffers::FirmwareDataOrFixed([
         FixedBuffer {
             va: 0x01e1_c000,
             size: 0x8000,
@@ -195,6 +196,13 @@ pub(crate) mod dynamic {
     /// Canonical low mappings shared by hardware queues and their clients.
     /// Client-private allocations start after this arena.
     pub(crate) const LOWER: core::ops::Range<u64> = 0x70_0400_0000..0x70_8000_0000;
+
+    /// The A18 Pro's split of the same span ([`crate::mmu::UatQuirks::narrow_pool_window`]):
+    /// a shared window that holds the render pools of every execution context at once, and
+    /// a smaller client-private window after it.
+    pub(crate) const WIDE_LOWER: core::ops::Range<u64> = LOWER.start..0x70_d000_0000;
+    pub(crate) const WIDE_CLIENT_LOWER: core::ops::Range<u64> =
+        WIDE_LOWER.end..CLIENT_LOWER.end;
 
     /// The firmware timestamp window (gart range 11, `HwData.unk_28`): user timestamp buffers
     /// are aliased here so that the firmware writes their stamps itself.
@@ -384,6 +392,7 @@ pub(crate) mod resources {
         // backing) stay reserved from creation too, as the fixed windows above are: an alias
         // created later is then never mapped over a user bind, and the bind check's view of the
         // reserved ranges cannot change between parsing a bind and committing it.
+        // Together these cover either split of the span (`WIDE_LOWER`, `WIDE_CLIENT_LOWER`).
         add(super::dynamic::LOWER);
         add(super::dynamic::CLIENT_LOWER);
         Some(ranges)
@@ -444,7 +453,7 @@ pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;
     // The QID budget reserves one physical pair per logical owner, which
     // leaves room for every execution context in the shared 128-QID
-    // namespace. A second pair comes only from surplus, on G17D
+    // namespace. A second pair comes only from surplus, on G17C and G17D
     // (g17::pairs). Commands queue at RENDER_DEPTH per pair, as many as a pair
     // has command records (the render memory's RECORDS).
     pub(crate) const RENDER_PAIRS_MAX: usize = 2;

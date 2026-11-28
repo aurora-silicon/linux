@@ -19,6 +19,7 @@ typedef uint64_t u64;
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define EXPORT_SYMBOL_GPL(x)
@@ -40,10 +41,33 @@ struct apple_atcphy {
 	bool tunnel_clock_on;
 	u8 tunnel_rate, tunnel_users, tunnel_dpin_rate[2];
 	unsigned tunnel_source[2];
+	bool tunnel_ack_stale;
+	struct {
+		bool prepared, changed, restored;
+	} cio_sleep;
+};
+struct device_node {
+	const char *compatible;
 };
 struct phy {
 	const void *ops;
 	struct apple_atcphy *data;
+	struct {
+		struct device_node *of_node;
+	} dev;
+};
+static bool of_device_is_compatible(const struct device_node *np, const char *s)
+{
+	return np && !strcmp(np->compatible, s);
+}
+/* include/linux/phy/phy-dp.h: the DP tunnel options only. */
+struct phy_configure_opts_dp {
+	u8 set_rate : 1, set_lanes : 1, set_voltages : 1, set_tunnel_rate : 1;
+	unsigned int tunnel_dpin;
+	u8 tunnel_rate;
+};
+union phy_configure_opts {
+	struct phy_configure_opts_dp dp;
 };
 struct apple_dcp;
 struct apple_dcp_typec_route {
@@ -134,8 +158,26 @@ static int apple_t6050_dp_tunnel_clock(struct phy *p, unsigned clock, u8 rate)
 	return t6050_error;
 }
 /*
- * Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext").
- * These are T6030 DCPs: the T8132 dcpext paths must never be taken.
+ * T6040 ATC PHY (t6040-usb2.c): one pixel clock per DP IN adapter (0 or 1),
+ * set through phy_configure() with set_tunnel_rate alone, recorded.
+ */
+static unsigned t6040_calls, t6040_dpin;
+static u8 t6040_rate;
+static int t6040_error;
+static int phy_configure(struct phy *p, union phy_configure_opts *opts)
+{
+	assert(of_device_is_compatible(p->dev.of_node, "apple,t6040-atcphy"));
+	assert(opts->dp.set_tunnel_rate && !opts->dp.set_rate &&
+	       !opts->dp.set_lanes && !opts->dp.set_voltages);
+	t6040_calls++;
+	t6040_dpin = opts->dp.tunnel_dpin;
+	t6040_rate = opts->dp.tunnel_rate;
+	return t6040_error;
+}
+/*
+ * Production: an apple,t8132-dcpext the M4 backend adopts (dcp_t8132_ext_m4_node():
+ * not a J773g one on firmware 27.2). These are T6030 DCPs: the T8132 dcpext
+ * paths must never be taken.
  */
 static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 {
@@ -270,6 +312,37 @@ int main(int argc, char **argv)
 		printf("PASS %s: DP IN n on tunnel clock n + 1, rate kept only when set\n", name);
 		return 0;
 	}
+	if (!strcmp(name, "t6040-tunnel-clock")) {
+		/*
+		 * The PHY's compatible picks the path, not the machine: a T6040
+		 * ATC PHY takes the rate through phy_configure() on T6040 and
+		 * T6041 alike, and neither the ATC nor the T6050 provider is
+		 * called. A T6030 machine with that PHY takes the same path.
+		 */
+		const char *const machines[] = { "apple,t6040", "apple,t6041", "apple,t6030" };
+		struct device_node t6040_atcphy = { .compatible = "apple,t6040-atcphy" };
+		u8 route_rate;
+		phy.dev.of_node = &t6040_atcphy;
+		for (unsigned m = 0; m < 3; m++) {
+			machine = machines[m];
+			t6040_calls = 0;
+			t6040_error = 0;
+			for (unsigned dpin = 0; dpin < 2; dpin++) {
+				assert(!t6050_clock_call(&phy, dpin, 0x1e, &route_rate));
+				assert(t6040_dpin == dpin && t6040_rate == 0x1e && route_rate == 0x1e);
+				assert(!t6050_clock_call(&phy, dpin, 0, &route_rate));
+				assert(t6040_dpin == dpin && !t6040_rate && !route_rate);
+			}
+			assert(t6040_calls == 4);
+			/* A clock that failed to start leaves the route's rate alone. */
+			t6040_error = -ETIMEDOUT;
+			assert(t6050_clock_call(&phy, 1, 0x14, &route_rate) == -ETIMEDOUT &&
+			       route_rate == 0x55);
+		}
+		assert(!t6050_calls && !writes && !polls && !crossbar_stops);
+		printf("PASS %s: T6040 ATC PHY tunnel clock through phy_configure\n", name);
+		return 0;
+	}
 	if (!strcmp(name, "wrong-generation")) {
 		hw.gen = ATCPHY_GENERATION_T8103;
 		assert(clock_call(&phy, 0, 0, 0x14) == -EOPNOTSUPP && !writes);
@@ -293,6 +366,22 @@ int main(int argc, char **argv)
 		unsigned saved = writes;
 		assert(clock_call(&phy, 0, 0, 0x14) == -EBUSY &&
 		       writes == saved);
+		return 0;
+	}
+	if (!strcmp(name, "stale-ack") || !strcmp(name, "unflagged-ack")) {
+		/* What a CIO sleep's PHY power cycle leaves: ACK, with no request. */
+		u32 ack = BIT(1);
+
+		memcpy(regs + AUSPLL_APB_CMD_OVERRIDE, &ack, 4);
+		d.tunnel_ack_stale = !strcmp(name, "stale-ack");
+		if (!d.tunnel_ack_stale) {
+			assert(clock_call(&phy, 0, 0, 0x14) == -EBUSY && !writes);
+			return 0;
+		}
+		assert(!clock_call(&phy, 0, 0, 0x14));
+		assert(d.tunnel_clock_on && !d.tunnel_ack_stale && stop_requests == 1);
+		assert(!clock_call(&phy, 0, 0, 0));
+		assert(!d.tunnel_clock_on && stop_requests == 2);
 		return 0;
 	}
 	if (!strcmp(name, "invalid-source")) {

@@ -130,6 +130,10 @@ pub struct Object<T: DriverObject> {
     sgt_lock: Mutex<()>,
     /// Counted SG leases exclude backing eviction; the high bit excludes new leases.
     sgt_access: AtomicUsize,
+    /// The device mapping of an object over driver-supplied pages ([`Self::new_external`]).
+    /// Declared before `inner`, which holds those pages, so that it is unmapped first, and
+    /// initialized after it, so that nothing is mapped before `inner` holds them.
+    external: Option<Devres<ExternalDma>>,
     #[pin]
     inner: T,
 }
@@ -169,6 +173,30 @@ impl<T: DriverObject> Object<T> {
         #[allow(unused_unsafe, reason = "Safe since Rust 1.82.0")]
         // SAFETY: `drm_gem_shmem_vm_ops` is a valid, static const on the C side.
         vm_ops: unsafe { &raw const bindings::drm_gem_shmem_vm_ops },
+        evict: None,
+    };
+
+    /// `drm_gem_object_funcs` vtable for objects over driver-supplied pages.
+    ///
+    /// They have no shmem pages for the C helpers to map, pin or export: every CPU, kernel and
+    /// dma-buf view through the DRM core fails instead (no `mmap` or `vm_ops`, no `vmap`, `pin`
+    /// or `get_sg_table`, and an `export` that refuses, since without one the core would use its
+    /// generic export).
+    const EXTERNAL_VTABLE: bindings::drm_gem_object_funcs = bindings::drm_gem_object_funcs {
+        free: Some(Self::free_callback),
+        open: Some(super::open_callback::<T>),
+        close: Some(super::close_callback::<T>),
+        print_info: None,
+        export: Some(Self::refuse_export_callback),
+        pin: None,
+        unpin: None,
+        get_sg_table: None,
+        vmap: None,
+        vunmap: None,
+        mmap: None,
+        status: None,
+        rss: None,
+        vm_ops: ptr::null(),
         evict: None,
     };
 
@@ -213,6 +241,13 @@ impl<T: DriverObject> Object<T> {
         let _ = unsafe { KBox::from_raw(this) };
     }
 
+    extern "C" fn refuse_export_callback(
+        _obj: *mut bindings::drm_gem_object,
+        _flags: i32,
+    ) -> *mut bindings::dma_buf {
+        EINVAL.to_ptr()
+    }
+
     /// Attempt to create a vmap from the gem object, and confirm the size of said vmap.
     fn make_vmap<'a, R, const SIZE: usize>(&'a self) -> Result<VMap<T, R, SIZE>>
     where
@@ -221,6 +256,10 @@ impl<T: DriverObject> Object<T> {
         // INVARIANT: We check here that the gem object is at least as large as `SIZE`.
         if self.size() < SIZE {
             return Err(ENOSPC);
+        }
+        // The C helper would allocate shmem pages for an object over driver-supplied pages.
+        if self.is_external() {
+            return Err(EINVAL);
         }
 
         let mut map: MaybeUninit<bindings::iosys_map> = MaybeUninit::uninit();
@@ -303,7 +342,10 @@ impl<T: DriverObject> Object<T> {
         let lease = SGLease { obj: self.into() };
 
         // SAFETY: Import attachment ownership is immutable after publication.
-        let sgt = if !unsafe { (*self.as_raw()).import_attach }.is_null() {
+        let sgt = if let Some(external) = &self.external {
+            // Mapped at creation and never rebuilt: once the device is unbound, there is none.
+            external.access(dev)?.sgt.get()
+        } else if !unsafe { (*self.as_raw()).import_attach }.is_null() {
             // Imports belong to the exporter. Never register them for Rust devres cleanup,
             // rebuild their tables, or release their backing.
             // SAFETY: The attachment table stays valid until this object is freed.
@@ -351,6 +393,7 @@ impl<T: DriverObject> Object<T> {
                 sgt_cleanup: ManuallyDrop::new(SetOnce::new()),
                 sgt_lock <- new_mutex!(()),
                 sgt_access: AtomicUsize::new(0),
+                external: None,
                 inner <- T::new(dev, size, args),
             }),
             GFP_KERNEL,
@@ -388,6 +431,123 @@ impl<T: DriverObject> Object<T> {
         Ok(obj)
     }
 
+    /// Create a DRM object whose backing is `pages`, which the driver data built from `args`
+    /// holds, instead of shmem pages. Its size is that of the pages.
+    ///
+    /// The object has no shmem file. Its device SG table is built and DMA-mapped here, once, for
+    /// `parent` (the DRM device's parent), and is unmapped when the object is freed or the device
+    /// is unbound. The mapping does no CPU cache maintenance, on map or unmap: the pages are the
+    /// owner's to read and write through cacheable CPU mappings, and invalidating CPU caches when
+    /// the object is freed would discard data written through them. The device must therefore be
+    /// coherent with CPU caches for this memory. `writable` selects a bidirectional mapping;
+    /// otherwise the mapping is for device reads only.
+    ///
+    /// The device must reach the pages themselves at the DMA addresses of the table: a bounce
+    /// buffer, which a mapping without CPU synchronization never updates, will not do. The pages
+    /// are therefore mapped with `DMA_ATTR_NO_BOUNCE`, and the DMA layer fails the mapping where
+    /// it would substitute other memory for a page: with `EIO` for pages it would bounce (the
+    /// device cannot address them, bouncing is forced, or the device needs unencrypted memory),
+    /// and with `EOPNOTSUPP` for a device that is mapped by DMA operations of its own. `EIO` is
+    /// the DMA layer's error for any page it cannot map, a refused bounce buffer or not.
+    ///
+    /// The driver data is initialized first, and the pages are mapped only once it holds them: if
+    /// `T::new()` or its initializer fails, nothing was mapped, and if the mapping fails, the
+    /// driver data is dropped with no mapping left. When the object is freed, the mapping is
+    /// removed before the driver data is dropped.
+    ///
+    /// The object cannot be CPU-mapped or exported through the DRM core, kernel-mapped with
+    /// [`Self::vmap`], released by idle reclaim or purged: those fail, or report that the backing
+    /// is not releasable.
+    ///
+    /// # Safety
+    ///
+    /// - From the moment the initializer `T::new()` returns for `args` has succeeded, and until
+    ///   the driver data it built is dropped, `pages` points to an array of valid pages, and the
+    ///   array and the pages stay allocated and stay that data's backing. `pages` is not
+    ///   dereferenced before that, nor if the initializer fails, so the array may be memory that
+    ///   `args` owns.
+    /// - The device accesses the pages coherently with the CPU caches, through every mapping the
+    ///   driver gives it of them at the DMA addresses of the table and for as long as the object
+    ///   exists: its next read of a location sees a store made through a cacheable CPU mapping,
+    ///   and the CPU's next load sees a store of the device, with no cache maintenance in
+    ///   between. Nothing here establishes or checks that. `DMA_ATTR_NO_BOUNCE` makes the DMA
+    ///   addresses those of the pages themselves and `DMA_ATTR_SKIP_CPU_SYNC` leaves the caches
+    ///   alone, for a device that is not coherent as for one that is, and whether or not the
+    ///   device is marked DMA-coherent: the mapping succeeds either way. The caller has to know
+    ///   it of its hardware.
+    pub unsafe fn new_external(
+        dev: &Device<T::Driver>,
+        parent: &device::Device<Bound>,
+        pages: *const [*mut bindings::page],
+        writable: bool,
+        config: ObjectConfig<'_, T>,
+        args: T::Args,
+    ) -> Result<ARef<Self>> {
+        if parent.as_raw() != dev.as_ref().as_ref().as_raw() {
+            return Err(EINVAL);
+        }
+        if config.map_wc || config.reclaimable_cpu_mappings || config.pages_bounded_reclaim {
+            return Err(EINVAL);
+        }
+        if pages.is_empty() {
+            return Err(EINVAL);
+        }
+        let size = pages
+            .len()
+            .checked_mul(crate::page::PAGE_SIZE)
+            .ok_or(EOVERFLOW)?;
+
+        let new: Pin<KBox<Self>> = KBox::try_pin_init(
+            try_pin_init!(Self {
+                obj <- Opaque::init_zeroed(),
+                parent_resv_obj: config.parent_resv_obj.map(|p| p.into()),
+                sgt_cleanup: ManuallyDrop::new(SetOnce::new()),
+                sgt_lock <- new_mutex!(()),
+                sgt_access: AtomicUsize::new(0),
+                // The driver data takes the pages over, and an initializer that fails may already
+                // have released them: map them only once it has succeeded. A failure after that
+                // drops the mapping, if it was made, and then the driver data.
+                inner <- T::new(dev, size, args),
+                external: Some(Devres::new(
+                    parent,
+                    // SAFETY: `inner` is initialized, so per the caller's contract `pages` is an
+                    // array of valid pages that stay allocated until `inner` is dropped, which
+                    // comes after this mapping is. The caller answers for the device's coherent
+                    // access to them.
+                    Ok::<_, Error>(unsafe { ExternalDma::new(parent, &*pages, size, writable) }?),
+                )?),
+            }),
+            GFP_KERNEL,
+        )?;
+
+        // SAFETY: `obj.as_raw()` is guaranteed to be valid by the initialization above.
+        unsafe { (*new.as_raw()).funcs = &Self::EXTERNAL_VTABLE };
+
+        // A private object has no shmem file, so that no helper can ever allocate pages for it.
+        // SAFETY: The arguments are all valid via the type invariants; the object is not
+        // published yet.
+        unsafe { bindings::drm_gem_private_object_init(dev.as_raw(), new.as_raw(), size) };
+
+        // SAFETY: We never move out of `self`.
+        let new = KBox::into_raw(unsafe { Pin::into_inner_unchecked(new) });
+
+        // SAFETY: We're taking over the owned refcount from `drm_gem_private_object_init`.
+        let obj = unsafe { ARef::from_raw(NonNull::new_unchecked(new)) };
+
+        if let Some(parent_resv) = config.parent_resv_obj {
+            // SAFETY: We have yet to expose the new gem object outside of this function, so it is
+            // safe to modify this field.
+            unsafe { (*obj.obj.get()).base.resv = parent_resv.raw_dma_resv() };
+        }
+
+        Ok(obj)
+    }
+
+    /// Whether the object's backing is driver-supplied pages ([`Self::new_external`]).
+    pub fn is_external(&self) -> bool {
+        self.external.is_some()
+    }
+
     /// `gem_create_object` callback, for the objects the DRM core allocates on the driver's
     /// behalf (dma-buf imports and dumb buffers) before it initializes their shmem part.
     ///
@@ -409,6 +569,7 @@ impl<T: DriverObject> Object<T> {
                     sgt_cleanup: ManuallyDrop::new(SetOnce::new()),
                     sgt_lock <- new_mutex!(()),
                     sgt_access: AtomicUsize::new(0),
+                    external: None,
                     inner <- T::new(dev, size, args),
                 }),
                 GFP_KERNEL,
@@ -459,7 +620,8 @@ impl<T: DriverObject> Object<T> {
     ///
     /// The caller holds the object's DMA reservation lock.
     pub unsafe fn sole_sg_lease_releasable_locked(&self) -> bool {
-        self.sgt_access.load(Ordering::Acquire) == 1 &&
+        !self.is_external() &&
+            self.sgt_access.load(Ordering::Acquire) == 1 &&
             // SAFETY: The caller establishes the reservation-lock contract.
             unsafe { bindings::drm_gem_shmem_idle_pages_releasable_locked(self.as_raw_shmem()) }
     }
@@ -482,7 +644,8 @@ impl<T: DriverObject> Object<T> {
     ///
     /// The caller holds the object's DMA reservation lock.
     pub unsafe fn unleased_pages_releasable_locked(&self) -> bool {
-        self.sgt_access.load(Ordering::Acquire) == 0 &&
+        !self.is_external() &&
+            self.sgt_access.load(Ordering::Acquire) == 0 &&
             // SAFETY: The caller establishes the reservation-lock contract.
             unsafe { bindings::drm_gem_shmem_idle_pages_releasable_locked(self.as_raw_shmem()) }
     }
@@ -498,6 +661,9 @@ impl<T: DriverObject> Object<T> {
     /// The caller holds this object's DMA reservation lock, has removed and invalidated every
     /// device mapping, and excludes new device access.
     pub unsafe fn release_idle_pages_locked(&self) -> Result {
+        if self.is_external() {
+            return Err(EBUSY);
+        }
         self.sgt_access
             .compare_exchange(0, SGT_RECLAIMING, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| EBUSY)?;
@@ -511,8 +677,11 @@ impl<T: DriverObject> Object<T> {
 
     /// Apply purge advice (0 = needed, >0 = may be purged) under the
     /// object's reservation lock. Returns false if the object was already
-    /// purged; the advice is then ignored.
+    /// purged; the advice is then ignored. Objects over driver-supplied pages take no advice.
     pub fn madvise(&self, madv: i32) -> bool {
+        if self.is_external() {
+            return true;
+        }
         let _guard = DmaResvGuard::new(self);
         // SAFETY: The reservation lock is held, as the C helper requires.
         unsafe { bindings::drm_gem_shmem_madvise_locked(self.as_raw_shmem(), madv) != 0 }
@@ -536,6 +705,9 @@ impl<T: DriverObject> Object<T> {
     /// The caller holds this object's DMA reservation lock, has removed and
     /// invalidated every device mapping, and no Rust SG lease remains.
     pub unsafe fn purge_locked(&self) -> Result {
+        if self.is_external() {
+            return Err(EBUSY);
+        }
         // SAFETY: The caller's contract; the exclusive state below excludes new leases.
         if !unsafe { bindings::drm_gem_shmem_is_purgeable(self.as_raw_shmem()) }
             || !unsafe { bindings::drm_gem_shmem_idle_pages_releasable_locked(self.as_raw_shmem()) }
@@ -806,6 +978,110 @@ impl<T: DriverObject> Drop for SGTableCleanup<T> {
 unsafe impl<T: DriverObject> Send for SGTableCleanup<T> {}
 // SAFETY: The NonNull is valid until cleanup, and its GEM object is thread-safe.
 unsafe impl<T: DriverObject> Sync for SGTableCleanup<T> {}
+
+/// The device mapping of an object over driver-supplied pages: an SG table over the pages,
+/// DMA-mapped without CPU cache maintenance and without bounce buffers.
+///
+/// # Invariants
+///
+/// `sgt` is an initialized table, DMA-mapped for `dev` with `dir`, over pages that stay valid
+/// while this exists.
+struct ExternalDma {
+    sgt: KBox<Opaque<bindings::sg_table>>,
+    dev: ARef<device::Device>,
+    dir: bindings::dma_data_direction,
+}
+
+/// The number of live [`ExternalDma`] mappings, for the tests of the order in which a mapping and
+/// the owner of its pages go.
+#[cfg(CONFIG_KUNIT = "y")]
+static EXTERNAL_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: The table is only read once built, and the device reference may move between threads.
+unsafe impl Send for ExternalDma {}
+// SAFETY: See above.
+unsafe impl Sync for ExternalDma {}
+
+impl ExternalDma {
+    /// The attributes of the mapping. No CPU cache maintenance, on map or unmap: the pages are
+    /// their owner's to use through cacheable CPU mappings. And no bounce buffer, which such a
+    /// mapping would never update: the DMA layer fails the mapping instead of substituting other
+    /// memory for a page.
+    const ATTRS: c_ulong =
+        (bindings::DMA_ATTR_SKIP_CPU_SYNC | bindings::DMA_ATTR_NO_BOUNCE) as c_ulong;
+
+    /// # Safety
+    ///
+    /// - `pages` are valid pages that stay allocated for the life of the returned mapping.
+    /// - `dev` accesses them coherently with the CPU caches while the mapping exists, as
+    ///   [`Object::new_external`] requires of its caller: the attributes of this mapping keep
+    ///   the DMA layer from substituting or synchronizing memory, and make no device coherent.
+    unsafe fn new(
+        dev: &device::Device<Bound>,
+        pages: &[*mut bindings::page],
+        size: usize,
+        writable: bool,
+    ) -> Result<Self> {
+        if pages.is_empty() {
+            return Err(EINVAL);
+        }
+        let sgt = KBox::new(Opaque::<bindings::sg_table>::zeroed(), GFP_KERNEL)?;
+        // SAFETY: `dev` is a valid device.
+        let max_segment = match unsafe { bindings::dma_max_mapping_size(dev.as_raw()) } {
+            0 => u32::MAX,
+            max => u32::try_from(max).unwrap_or(u32::MAX),
+        };
+        // SAFETY: `sgt` is zeroed memory for a table, `pages` holds at least one valid page and
+        // covers `size` bytes.
+        to_result(unsafe {
+            bindings::sg_alloc_table_from_pages_segment(
+                sgt.get(),
+                // The table only reads the array.
+                pages.as_ptr().cast_mut(),
+                pages.len().try_into()?,
+                0,
+                size,
+                max_segment,
+                GFP_KERNEL.as_raw(),
+            )
+        })?;
+        let dir = if writable {
+            bindings::dma_data_direction_DMA_BIDIRECTIONAL
+        } else {
+            bindings::dma_data_direction_DMA_TO_DEVICE
+        };
+        // SAFETY: The table was built above; `dev` is bound.
+        let mapped = to_result(unsafe {
+            bindings::dma_map_sgtable(dev.as_raw(), sgt.get(), dir, Self::ATTRS)
+        });
+        if let Err(e) = mapped {
+            // SAFETY: The table was allocated above and is not mapped.
+            unsafe { bindings::sg_free_table(sgt.get()) };
+            return Err(e);
+        }
+        #[cfg(CONFIG_KUNIT = "y")]
+        EXTERNAL_MAPPINGS.fetch_add(1, Ordering::AcqRel);
+        // INVARIANT: The table is built and mapped.
+        Ok(Self {
+            sgt,
+            dev: dev.into(),
+            dir,
+        })
+    }
+}
+
+impl Drop for ExternalDma {
+    fn drop(&mut self) {
+        // SAFETY: Per the type invariants the table is mapped for `dev` with `dir`; it is unmapped
+        // and freed once, here.
+        unsafe {
+            bindings::dma_unmap_sgtable(self.dev.as_raw(), self.sgt.get(), self.dir, Self::ATTRS);
+            bindings::sg_free_table(self.sgt.get());
+        }
+        #[cfg(CONFIG_KUNIT = "y")]
+        EXTERNAL_MAPPINGS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[kunit_tests(rust_drm_gem_shmem)]
 mod tests {
@@ -1151,6 +1427,543 @@ mod tests {
         assert_eq!(unleased, Err(EINVAL));
         assert_eq!(purge, Err(EBUSY));
         assert!(unchanged);
+        Ok(())
+    }
+
+    fn page_pointers<const N: usize>(
+        pages: &[crate::types::Owned<crate::page::Page>; N],
+    ) -> [*mut bindings::page; N] {
+        core::array::from_fn(|i| pages[i].as_ptr())
+    }
+
+    fn alloc_pages<const N: usize>() -> Result<[crate::types::Owned<crate::page::Page>; N]> {
+        let mut pages = KVec::with_capacity(N, GFP_KERNEL)?;
+        for _ in 0..N {
+            pages.push(
+                crate::page::Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?,
+                GFP_KERNEL,
+            )?;
+        }
+        pages.try_into().map_err(|_| EINVAL)
+    }
+
+    #[test]
+    fn external_pages_back_the_table() -> Result {
+        let (dev, drm) = create_drm_dev()?;
+        // Declared before the object, so they outlive it.
+        let pages = alloc_pages::<3>()?;
+        let raw = page_pointers(&pages);
+        // SAFETY: `pages` outlive the object.
+        let obj = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                dev.as_ref().as_ref(),
+                &raw[..],
+                true,
+                ObjectConfig::default(),
+                (),
+            )
+        }?;
+        assert!(obj.is_external());
+        assert_eq!(obj.size(), 3 * PAGE_SIZE);
+        // SAFETY: The object is live; nothing else changes these fields.
+        let (filp, shmem_pages) = unsafe { ((*obj.as_raw()).filp, (*obj.as_raw_shmem()).pages) };
+        assert!(filp.is_null());
+        assert!(shmem_pages.is_null());
+        let table = obj.sg_table(dev.as_ref().as_ref())?;
+        // The faux device maps directly: the DMA addresses are the pages' physical addresses.
+        let mut next = raw.iter();
+        let mut total = 0;
+        for segment in table.iter() {
+            let mut offset = 0;
+            while offset < u64::from(segment.dma_len()) {
+                let page = *next.next().ok_or(EINVAL)?;
+                // SAFETY: `page` is one of the live test pages.
+                assert_eq!(
+                    unsafe { bindings::page_to_phys(page) },
+                    segment.dma_address() + offset
+                );
+                offset += PAGE_SIZE as u64;
+            }
+            total += segment.dma_len() as usize;
+        }
+        assert_eq!(total, 3 * PAGE_SIZE);
+        assert!(next.next().is_none());
+        assert_eq!(obj.sgt_access.load(Ordering::Acquire), 1);
+        drop(table);
+        assert_eq!(obj.sgt_access.load(Ordering::Acquire), 0);
+        // The pages are the caller's: freeing the object leaves their contents alone.
+        let marker = 0x5au8;
+        // SAFETY: The page is live and the byte is within it.
+        unsafe { pages[1].write_raw(&marker, 7, 1)? };
+        drop(obj);
+        let mut back = 0u8;
+        // SAFETY: As above.
+        unsafe { pages[1].read_raw(&mut back, 7, 1)? };
+        assert_eq!(back, marker);
+        Ok(())
+    }
+
+    #[test]
+    fn external_objects_refuse_cpu_views_and_reclaim() -> Result {
+        let (dev, drm) = create_drm_dev()?;
+        let pages = alloc_pages::<2>()?;
+        let raw = page_pointers(&pages);
+        // SAFETY: `pages` outlive the object.
+        let obj = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                dev.as_ref().as_ref(),
+                &raw[..],
+                false,
+                ObjectConfig::default(),
+                (),
+            )
+        }?;
+        assert_eq!(obj.vmap::<4>().err(), Some(EINVAL));
+        let mut map = MaybeUninit::<bindings::iosys_map>::zeroed();
+        // SAFETY: A live object; the core fails without a vmap callback.
+        assert_eq!(
+            unsafe { bindings::drm_gem_vmap(obj.as_raw(), map.as_mut_ptr()) },
+            -(bindings::EOPNOTSUPP as i32)
+        );
+        // SAFETY: The vtable is static.
+        let funcs = unsafe { &*(*obj.as_raw()).funcs };
+        assert!(funcs.mmap.is_none() && funcs.vm_ops.is_null());
+        assert!(funcs.pin.is_none() && funcs.get_sg_table.is_none());
+        let export = funcs.export.ok_or(EINVAL)?;
+        // SAFETY: The callback refuses without touching the object.
+        let buf = unsafe { export(obj.as_raw(), 0) };
+        assert_eq!(buf as isize, -(bindings::EINVAL as isize));
+        // Advice is ignored, and leases or none, the backing is never releasable.
+        assert!(obj.madvise(1));
+        let lease = obj.sg_table(dev.as_ref().as_ref())?.into_lease();
+        {
+            let _guard = DmaResvGuard::new(&obj);
+            // SAFETY: Reservation held; no device mappings exist in this test.
+            let (madv, releasable, released) = unsafe {
+                (
+                    obj.madv_locked(),
+                    obj.sole_sg_lease_releasable_locked(),
+                    obj.release_idle_pages_locked(),
+                )
+            };
+            assert_eq!(madv, 0);
+            assert!(!releasable);
+            assert_eq!(released, Err(EBUSY));
+        }
+        drop(lease);
+        let _guard = DmaResvGuard::new(&obj);
+        // SAFETY: As above, with no lease left.
+        let (releasable, released, purged) = unsafe {
+            (
+                obj.unleased_pages_releasable_locked(),
+                obj.release_idle_pages_locked(),
+                obj.purge_locked(),
+            )
+        };
+        assert!(!releasable);
+        assert_eq!(released, Err(EBUSY));
+        assert_eq!(purged, Err(EBUSY));
+        assert_eq!(obj.sgt_access.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn external_objects_need_pages_and_their_device() -> Result {
+        let (dev, drm) = create_drm_dev()?;
+        let reg = faux::Registration::new(c"OtherKunit", None)?;
+        let pages = alloc_pages::<1>()?;
+        let raw = page_pointers(&pages);
+        let no_pages: [*mut bindings::page; 0] = [];
+        // SAFETY: No pages are referenced.
+        let empty = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                dev.as_ref().as_ref(),
+                &no_pages[..],
+                true,
+                ObjectConfig::default(),
+                (),
+            )
+        };
+        assert_eq!(empty.err(), Some(EINVAL));
+        // SAFETY: `pages` outlive the attempt.
+        let wrong = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                reg.as_ref().as_ref(),
+                &raw[..],
+                true,
+                ObjectConfig::default(),
+                (),
+            )
+        };
+        assert_eq!(wrong.err(), Some(EINVAL));
+        // SAFETY: As above.
+        let wc = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                dev.as_ref().as_ref(),
+                &raw[..],
+                true,
+                ObjectConfig {
+                    map_wc: true,
+                    ..Default::default()
+                },
+                (),
+            )
+        };
+        assert_eq!(wc.err(), Some(EINVAL));
+        Ok(())
+    }
+
+    /// The entry that ends a device's `dma_range_map`, the map that tells how the device's bus sees
+    /// CPU addresses (firmware describes it for a real device).
+    const BUS_MAP_END: bindings::bus_dma_region = bindings::bus_dma_region {
+        cpu_start: 0,
+        dma_start: 0,
+        size: 0,
+    };
+
+    /// Puts `dev` on the bus that `map`, which ends with [`BUS_MAP_END`], describes.
+    ///
+    /// # Safety
+    ///
+    /// `dev` is private to the calling test, and has no bus map and no DMA mapping yet.
+    unsafe fn set_bus_map<const N: usize>(
+        dev: &device::Device<Bound>,
+        map: [bindings::bus_dma_region; N],
+    ) -> Result {
+        let map = KBox::new(map, GFP_KERNEL)?;
+        // SAFETY: Per the safety requirements nothing else uses this field. The driver core
+        // frees the map with kfree() when the device goes.
+        unsafe {
+            (*dev.as_raw()).dma_range_map = KBox::into_raw(map).cast::<bindings::bus_dma_region>()
+        };
+        Ok(())
+    }
+
+    #[test]
+    fn external_mapping_follows_a_bus_offset() -> Result {
+        // The bus of this device sees every CPU address 1 TiB up.
+        const OFFSET: u64 = 1 << 40;
+        let (dev, drm) = create_drm_dev()?;
+        let parent: &device::Device<Bound> = dev.as_ref().as_ref();
+        // SAFETY: The faux device is private to this test and has no mapping yet.
+        unsafe {
+            set_bus_map(
+                parent,
+                [
+                    bindings::bus_dma_region {
+                        cpu_start: 0,
+                        dma_start: OFFSET,
+                        size: OFFSET,
+                    },
+                    BUS_MAP_END,
+                ],
+            )?
+        };
+        let pages = alloc_pages::<3>()?;
+        let raw = page_pointers(&pages);
+        // SAFETY: `pages` outlive the object.
+        let obj = unsafe {
+            Object::<KunitObject>::new_external(
+                &drm,
+                parent,
+                &raw[..],
+                true,
+                ObjectConfig::default(),
+                (),
+            )
+        }?;
+        // The DMA layer applied the offset: no DMA address is its page's physical address. The
+        // device reaches the pages themselves all the same, and the object was accepted.
+        let table = obj.sg_table(parent)?;
+        let mut next = raw.iter();
+        for segment in table.iter() {
+            let mut offset = 0;
+            while offset < u64::from(segment.dma_len()) {
+                let page = *next.next().ok_or(EINVAL)?;
+                // SAFETY: `page` is one of the live test pages.
+                assert_eq!(
+                    unsafe { bindings::page_to_phys(page) } + OFFSET,
+                    segment.dma_address() + offset
+                );
+                offset += PAGE_SIZE as u64;
+            }
+        }
+        assert!(next.next().is_none());
+        Ok(())
+    }
+
+    // A second fake driver, whose object data owns the pages the object is created over (as a
+    // driver that pins memory for an object does) and whose initializer can fail after taking
+    // them.
+
+    /// The number of device mappings of external objects that existed when a [`PageOwner`] last
+    /// let go of its pages.
+    static MAPPED_AT_RELEASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    struct PageOwner {
+        _pages: [crate::types::Owned<crate::page::Page>; 2],
+        fail: bool,
+    }
+
+    impl Drop for PageOwner {
+        fn drop(&mut self) {
+            MAPPED_AT_RELEASE.store(EXTERNAL_MAPPINGS.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+
+    struct OwnerDriver;
+    struct OwnerFile;
+    #[pin_data]
+    struct OwnerObject {
+        _owner: PageOwner,
+    }
+
+    impl drm::file::DriverFile for OwnerFile {
+        type Driver = OwnerDriver;
+
+        fn open(_dev: &drm::Device<OwnerDriver, drm::Registered>) -> Result<Pin<KBox<Self>>> {
+            Err(ENODEV)
+        }
+
+        fn as_raw(&self) -> *mut bindings::drm_file {
+            unreachable!("KUnit object tests do not open DRM files")
+        }
+    }
+
+    #[vtable]
+    impl gem::DriverObject for OwnerObject {
+        type Driver = OwnerDriver;
+        type Args = PageOwner;
+
+        fn new(
+            _dev: &drm::Device<OwnerDriver>,
+            _size: usize,
+            args: Self::Args,
+        ) -> impl PinInit<Self, Error> {
+            let fail = args.fail;
+            // A failure unwinds this initializer, which drops the owner it already took.
+            try_pin_init!(OwnerObject {
+                _owner: args,
+                _: {
+                    if fail {
+                        return Err(ENOMEM);
+                    }
+                },
+            })
+        }
+    }
+
+    #[vtable]
+    impl drm::Driver for OwnerDriver {
+        type Data = KunitData;
+        type RegistrationData<'a> = ();
+        type File = OwnerFile;
+        type Object = Object<OwnerObject>;
+        type ParentDevice<Ctx: device::DeviceContext> = faux::Device<Ctx>;
+
+        const INFO: drm::DriverInfo = INFO;
+        const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
+    }
+
+    // The pages go with the driver data. Whether the object is freed or its creation fails in the
+    // driver's initializer, no device mapping of them is left at that moment.
+    #[test]
+    fn external_mapping_never_outlives_the_pages() -> Result {
+        let reg = faux::Registration::new(c"OwnerKunit", None)?;
+        let fdev = reg.as_ref();
+        let dev: &device::Device<Bound> = fdev.as_ref();
+        // SAFETY: As in `create_drm_dev()`.
+        unsafe {
+            let raw = dev.as_raw();
+            (*raw).coherent_dma_mask = u64::MAX;
+            (*raw).dma_mask = &raw mut (*raw).coherent_dma_mask;
+        }
+        let drm = UnregisteredDevice::<OwnerDriver>::new(fdev, try_pin_init!(KunitData {}))?;
+        for fail in [true, false] {
+            let pages = alloc_pages::<2>()?;
+            let raw = page_pointers(&pages);
+            MAPPED_AT_RELEASE.store(usize::MAX, Ordering::Release);
+            // SAFETY: The driver data holds the pages, and `raw` outlives the call.
+            let obj = unsafe {
+                Object::<OwnerObject>::new_external(
+                    &drm,
+                    dev,
+                    &raw[..],
+                    true,
+                    ObjectConfig::default(),
+                    PageOwner {
+                        _pages: pages,
+                        fail,
+                    },
+                )
+            };
+            if fail {
+                assert_eq!(obj.err(), Some(ENOMEM));
+            } else {
+                let obj = obj?;
+                assert_eq!(EXTERNAL_MAPPINGS.load(Ordering::Acquire), 1);
+                assert_eq!(MAPPED_AT_RELEASE.load(Ordering::Acquire), usize::MAX);
+                drop(obj);
+            }
+            assert_eq!(MAPPED_AT_RELEASE.load(Ordering::Acquire), 0);
+            assert_eq!(EXTERNAL_MAPPINGS.load(Ordering::Acquire), 0);
+        }
+        Ok(())
+    }
+
+    // A device that cannot address one of an object's pages. Left to itself the DMA layer gives
+    // such a device a bounce buffer in the page's place, which the test first shows with an
+    // ordinary mapping of that page. An object over the page must fail instead, with nothing
+    // left mapped when its pages are released.
+    //
+    // Built for arm64, which always sets up bounce buffers (it bounces small kmalloc() buffers
+    // through them), so that the ordinary mapping has one to get.
+    #[cfg(CONFIG_ARM64)]
+    #[test]
+    fn external_mapping_refuses_a_bounce_buffer() -> Result {
+        let reg = faux::Registration::new(c"BounceKunit", None)?;
+        let fdev = reg.as_ref();
+        let dev: &device::Device<Bound> = fdev.as_ref();
+        let reachable = alloc_pages::<2>()?;
+        // The page the device cannot address is the lower of two, and comes second in its
+        // object: the two never form one segment, and the first is mapped before the second
+        // fails.
+        let [a, b] = alloc_pages::<2>()?;
+        let (near, hidden) = if a.phys() > b.phys() { (a, b) } else { (b, a) };
+        let start = hidden.phys();
+        let end = start + PAGE_SIZE as u64;
+        // SAFETY: As in `create_drm_dev()`.
+        unsafe {
+            let raw = dev.as_raw();
+            (*raw).coherent_dma_mask = u64::MAX;
+            (*raw).dma_mask = &raw mut (*raw).coherent_dma_mask;
+        }
+        // The bus of this device reaches all memory, at its CPU address, except `hidden`.
+        // SAFETY: The faux device is private to this test and has no mapping yet.
+        unsafe {
+            set_bus_map(
+                dev,
+                [
+                    bindings::bus_dma_region {
+                        cpu_start: end,
+                        dma_start: end,
+                        size: u64::MAX - end,
+                    },
+                    bindings::bus_dma_region {
+                        cpu_start: 0,
+                        dma_start: 0,
+                        size: start,
+                    },
+                    BUS_MAP_END,
+                ],
+            )?
+        };
+        let drm = UnregisteredDevice::<OwnerDriver>::new(fdev, try_pin_init!(KunitData {}))?;
+
+        // An ordinary mapping of `hidden` for this device succeeds, and is a bounce buffer: its
+        // DMA address, which for this bus is a CPU address, lies outside the page, the memory
+        // there holds what the page held when it was mapped, and a later store to the page
+        // does not show there.
+        let (before, after) = (0xa5u8, 0x5au8);
+        // SAFETY: The page is live and private to this test, as it is below.
+        unsafe { hidden.write_raw(&before, 0, 1)? };
+        let sgt = KBox::new(Opaque::<bindings::sg_table>::zeroed(), GFP_KERNEL)?;
+        let one = [hidden.as_ptr()];
+        // SAFETY: `sgt` is zeroed memory for a table and `one` holds one valid page.
+        to_result(unsafe {
+            bindings::sg_alloc_table_from_pages_segment(
+                sgt.get(),
+                one.as_ptr().cast_mut(),
+                1,
+                0,
+                PAGE_SIZE,
+                u32::MAX,
+                GFP_KERNEL.as_raw(),
+            )
+        })?;
+        let dir = bindings::dma_data_direction_DMA_TO_DEVICE;
+        // SAFETY: The table was built above; `dev` is bound.
+        let mapped =
+            to_result(unsafe { bindings::dma_map_sgtable(dev.as_raw(), sgt.get(), dir, 0) });
+        let mut bounce = None;
+        if mapped.is_ok() {
+            // SAFETY: The table is mapped until the unmap below.
+            let addr = unsafe { scatterlist::SGTable::from_raw(sgt.get()) }
+                .iter()
+                .next()
+                .map(|segment| segment.dma_address());
+            // SAFETY: See above.
+            let stored = unsafe { hidden.write_raw(&after, 0, 1) };
+            if let (Some(addr), Ok(())) = (addr, stored) {
+                let base = addr & !(PAGE_SIZE as u64 - 1);
+                let mut seen = 0u8;
+                // SAFETY: The memory the DMA layer mapped stays allocated until the unmap, and
+                // nothing else uses it.
+                let read = unsafe {
+                    crate::page::Page::borrow_phys(&base)
+                        .map(|page| page.read_raw(&mut seen, (addr - base) as usize, 1))
+                };
+                if let Some(Ok(())) = read {
+                    bounce = Some((addr, seen));
+                }
+            }
+            // SAFETY: The table was mapped above for `dev` with `dir`.
+            unsafe { bindings::dma_unmap_sgtable(dev.as_raw(), sgt.get(), dir, 0) };
+        }
+        // SAFETY: The table was allocated above and is not mapped.
+        unsafe { bindings::sg_free_table(sgt.get()) };
+        assert_eq!(mapped, Ok(()));
+        let (addr, seen) = bounce.ok_or(EINVAL)?;
+        assert!(addr < start || addr >= end);
+        assert_eq!(seen, before);
+
+        // The device takes an object over pages it reaches.
+        let raw = page_pointers(&reachable);
+        // SAFETY: The driver data holds the pages, and `raw` outlives the call.
+        let obj = unsafe {
+            Object::<OwnerObject>::new_external(
+                &drm,
+                dev,
+                &raw[..],
+                true,
+                ObjectConfig::default(),
+                PageOwner {
+                    _pages: reachable,
+                    fail: false,
+                },
+            )
+        }?;
+        assert_eq!(EXTERNAL_MAPPINGS.load(Ordering::Acquire), 1);
+        drop(obj);
+        assert_eq!(EXTERNAL_MAPPINGS.load(Ordering::Acquire), 0);
+
+        // An object over `hidden` fails: the DMA layer refuses the mapping instead of bouncing
+        // the page. The driver data, which had taken the pages, releases them with no mapping
+        // left, the first page's included.
+        let raw = [near.as_ptr(), hidden.as_ptr()];
+        MAPPED_AT_RELEASE.store(usize::MAX, Ordering::Release);
+        // SAFETY: As above.
+        let obj = unsafe {
+            Object::<OwnerObject>::new_external(
+                &drm,
+                dev,
+                &raw[..],
+                true,
+                ObjectConfig::default(),
+                PageOwner {
+                    _pages: [near, hidden],
+                    fail: false,
+                },
+            )
+        };
+        assert_eq!(obj.err(), Some(EIO));
+        assert_eq!(MAPPED_AT_RELEASE.load(Ordering::Acquire), 0);
+        assert_eq!(EXTERNAL_MAPPINGS.load(Ordering::Acquire), 0);
         Ok(())
     }
 

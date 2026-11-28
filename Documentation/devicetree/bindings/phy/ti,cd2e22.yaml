@@ -31,14 +31,19 @@ properties:
     description: Repeater channel connected to this PHY consumer.
 
   apple,tunable:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 4
-    maxItems: 1024
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: |
-      Packed (register, mask, value, reserved) byte tuples copied verbatim
-      from the corresponding firmware device-tree property by the bootloader.
-      The reserved byte must be zero. Each entry applies
-      (old & ~mask) | (value & mask).
+      Masked register updates copied verbatim from the corresponding firmware
+      device-tree property by the bootloader, one 32-bit cell per update. A
+      cell holds, from its most to its least significant byte, the register,
+      the mask, the value and a reserved byte that must be zero; in the
+      flattened tree that is the byte sequence (register, mask, value,
+      reserved). Each update applies (old & ~mask) | (value & mask).
+
+      The type is the one apple,tunable has in the other bindings that define
+      it, because a property name can have only one integer type across all
+      bindings. No item counts are given here for the same reason: they would
+      be merged into the three-cell row layout of those bindings.
 
 required:
   - compatible
@@ -59,7 +64,7 @@ examples:
             reg = <0x21>;
             #phy-cells = <0>;
             ti,port = <0>;
-            apple,tunable = [ 01 0f 05 00 ];
+            apple,tunable = <0x010f0500>;
         };
     };
 ...

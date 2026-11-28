@@ -166,6 +166,17 @@ impl HardwareSubmission {
         Ok(Self{writes,count})
     }
 
+    /// The configuration writes of [`Self::compute`] alone: the queue is configured and marked
+    /// valid, and no kick is announced. An installation, whose kick ring is still empty, sends
+    /// them before its doorbell.
+    pub(crate) fn configure_compute(qid:u8,va:u64,priority:u8)->Result<Self> {
+        let mut submission=Self::compute(qid,va,priority,true)?;
+        // compute() writes six configuration writes, then the advance pair last.
+        debug_assert_eq!(submission.count,8);
+        submission.count-=2;
+        Ok(submission)
+    }
+
     pub(crate) fn new(fragment:(u8,u64),tiling:(u8,u64),priority:u8,configured:bool)->Result<Self> {
         use super::super::{kick::QID_MAX,queue::{Policy,DataMaster}};
         const ADDRESS_MASK:u64=0x0000_07ff_ffff_ffe0;

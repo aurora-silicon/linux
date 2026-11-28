@@ -27,13 +27,39 @@ allOf:
         - compatible
     then:
       properties:
-        interrupts:
-          minItems: 4
         clocks:
           minItems: 2
           maxItems: 2
       required:
-        - interrupts
+        - clocks
+      if:
+        required:
+          - mboxes
+      then:
+        properties:
+          reg:
+            minItems: 3
+            maxItems: 3
+          reg-names:
+            items:
+              - const: asc
+              - const: auxiliary
+              - const: asc-tail
+          interrupts: false
+        required:
+          - dma-channels
+      else:
+        properties:
+          reg:
+            minItems: 2
+            maxItems: 2
+          interrupts:
+            minItems: 4
+          status:
+            const: disabled
+        required:
+          - interrupts
+          - status
     else:
       properties:
         interrupts: false
@@ -46,29 +72,31 @@ allOf:
         - compatible
     then:
       properties:
-        clocks:
-          minItems: 3
-          maxItems: 3
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t6050-sio
-              - apple,t8132-sio
-      required:
-        - compatible
-    then:
-      properties:
         reg:
           minItems: 2
           maxItems: 2
+        reg-names:
+          items:
+            - const: asc
+            - const: auxiliary
+        clocks:
+          minItems: 3
+          maxItems: 3
         status:
           const: disabled
       required:
+        - reg-names
         - clocks
         - status
-    else:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6050-sio
+                - apple,t8132-sio
+    then:
       required:
         - dma-channels
       allOf:
@@ -128,9 +156,11 @@ properties:
     minItems: 1
     maxItems: 3
     description: |
-      Coprocessor control registers. T8140 also publishes an auxiliary ASC
-      window and the remaining ASC registers after the mailbox window.
-      The mailbox registers are described by the mailbox provider.
+      Coprocessor control registers. T8140, and T6050 once it has its mailbox
+      provider, also publish an auxiliary ASC window and the remaining ASC
+      registers after the mailbox window. The mailbox registers are described
+      by the mailbox provider. A T6050 node without a provider has the whole
+      ASC bank and the auxiliary window, and stays disabled.
 
   clocks:
     minItems: 1
@@ -138,7 +168,9 @@ properties:
 
   interrupts:
     maxItems: 4
-    description: On T6050, the coprocessor's mailbox interrupts in ADT order.
+    description:
+      On T6050, the coprocessor's mailbox interrupts in ADT order, on a node
+      that has no mailbox provider. With one, they are the provider's.
 
   status: true
 
@@ -202,6 +234,27 @@ properties:
        - It leaves less work for the driver attaching on this binding. Instead the work
          is done upfront in the loader which can be better suited for keeping up with
          Apple's firmware changes.
+
+  apple,sio-firmware-params-v10:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Optional alternative boot parameters for the low-window SIO protocol
+      10 layout, using the same key/value format as apple,sio-firmware-params.
+      The bootloader can supply both lists when the firmware protocol is
+      only known after the coprocessor starts.
+
+  apple,channel-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The threshold word of the configuration a DMA channel is given when its
+      client configures it. Without it the SoC's built-in value is used, or,
+      for a SoC without one, the generic value. Filled in by the bootloader.
+
+  apple,channel-limit:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The limit word of the same channel configuration, with the same
+      default. Filled in by the bootloader.
 
 required:
   - compatible

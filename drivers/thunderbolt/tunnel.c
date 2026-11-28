@@ -97,20 +97,15 @@ MODULE_PARM_DESC(dprx_timeout,
 		 "DPRX capability read timeout in ms, -1 waits forever (default: "
 		 __MODULE_STRING(TB_DPRX_TIMEOUT) ")");
 
-static unsigned int dma_credits = TB_DMA_CREDITS;
+static unsigned int dma_credits;
 module_param(dma_credits, uint, 0444);
-MODULE_PARM_DESC(dma_credits, "specify custom credits for DMA tunnels (default: "
-                __MODULE_STRING(TB_DMA_CREDITS) ")");
+MODULE_PARM_DESC(dma_credits,
+		 "DMA tunnel credits (0: NHI policy, otherwise capped override)");
 
 static bool bw_alloc_mode = true;
 module_param(bw_alloc_mode, bool, 0444);
 MODULE_PARM_DESC(bw_alloc_mode,
 		 "enable bandwidth allocation mode if supported (default: true)");
-
-static bool dp_video_counter;
-module_param(dp_video_counter, bool, 0444);
-MODULE_PARM_DESC(dp_video_counter,
-		 "diagnostic: count packets on the DP video path's DP IN hop and its downstream (hub-side) hop (Apple M2 Pro/Max laptop right ACIO route only; read via debugfs port counters); default: false");
 
 static void tb_dp_dump_apple(struct tb_tunnel *tunnel);
 static int tb_apple_nhi_typec_index(struct tb_nhi *nhi);
@@ -160,6 +155,28 @@ static inline unsigned int tb_usable_credits(const struct tb_port *port)
 	return port->total_credits - port->ctl_credits;
 }
 
+/*
+ * Preserve legacy defaults unless the NHI opts into router preferences.
+ * Only apply the host NHI opt-in to the host router itself so downstream
+ * routers keep their conservative DMA reservation, and cap at TB_MAX_CREDITS
+ * so reservations match what tb_tunnel_alloc_dma() can program into a hop.
+ */
+static unsigned int tb_dma_credits(const struct tb_switch *sw)
+{
+	unsigned int credits = dma_credits;
+
+	if (!credits) {
+		if (!tb_route(sw) && sw->tb && sw->tb->nhi &&
+		    sw->tb->nhi->use_dma_credit_preferences)
+			credits = sw->max_dma_credits;
+		if (!credits)
+			credits = TB_DMA_CREDITS;
+	}
+
+	credits = min_not_zero(credits, sw->max_dma_credits);
+	return min_t(unsigned int, credits, TB_MAX_CREDITS);
+}
+
 /**
  * tb_available_credits() - Available credits for PCIe and DMA
  * @port: Lane adapter to check
@@ -179,7 +196,7 @@ static unsigned int tb_available_credits(const struct tb_port *port,
 	pcie = tb_acpi_may_tunnel_pcie() ? sw->max_pcie_credits : 0;
 
 	if (tb_acpi_is_xdomain_allowed()) {
-		spare = min_not_zero(sw->max_dma_credits, dma_credits);
+		spare = tb_dma_credits(sw);
 		/* Add some credits for potential second DMA tunnel */
 		spare += TB_MIN_DMA_CREDITS;
 	} else {
@@ -192,7 +209,8 @@ static unsigned int tb_available_credits(const struct tb_port *port,
 		 * Maximum number of DP streams possible through the
 		 * lane adapter.
 		 */
-		if (sw->min_dp_aux_credits + sw->min_dp_main_credits)
+		if (sw->min_dp_aux_credits + sw->min_dp_main_credits &&
+		    credits > usb3 + pcie + spare)
 			ndp = (credits - (usb3 + pcie + spare)) /
 			      (sw->min_dp_aux_credits + sw->min_dp_main_credits);
 		else
@@ -413,7 +431,7 @@ static int tb_pci_host_pre_activate(struct tb_tunnel *tunnel)
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
 	/* Only the tunnel starting at the host owns its native PCIe port. */
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_pre_activate)
 		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
@@ -424,7 +442,7 @@ int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_post_activate) {
 		/* Also unwind a hook that fails after partial host setup. */
@@ -440,7 +458,7 @@ int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 	int ret = 0;
 
 	/* Firmware tunnels discovered during resume do not own host state. */
-	if (!tunnel->host_pci_activated)
+	if (tunnel->sleep_replay || !tunnel->host_pci_activated)
 		return 0;
 	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->pci_tunnel_deactivate)
@@ -1258,6 +1276,9 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	for (granularity = 250; tmp / granularity > 255 && granularity <= 1000;
 	     granularity *= 2)
 		;
+	/* The host's own OS programs these adapters at 1 Gb/s. */
+	if (tb_port_dp_bw_held_ack(in))
+		granularity = 1000;
 
 	tb_tunnel_dbg(tunnel, "granularity %d Mb/s\n", granularity);
 
@@ -2026,14 +2047,6 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	return 0;
 }
 
-static bool tb_dp_video_counter_wanted(const struct tb_path *path)
-{
-	if (!dp_video_counter || !path->path_length)
-		return false;
-
-	return tb_dp_is_apple_t602x_right_dpin(path->hops[0].in_port);
-}
-
 static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)
 {
 	struct tb_path_hop *hop;
@@ -2044,27 +2057,6 @@ static int tb_dp_init_video_path(struct tb_path *path, bool pm_support)
 	path->ingress_shared_buffer = TB_PATH_NONE;
 	path->priority = TB_DP_VIDEO_PRIORITY;
 	path->weight = TB_DP_VIDEO_WEIGHT;
-
-	if (tb_dp_video_counter_wanted(path)) {
-		struct tb_path_hop *last = &path->hops[path->path_length - 1];
-
-		path->hops[0].in_counter_index = 0;
-		tb_port_dbg(path->hops[0].in_port,
-			   "dp_video_counter: enabling counter 0 on DP IN hop\n");
-
-		/*
-		 * Second checkpoint: the downstream router's ingress side of
-		 * the same path (e.g. the hub's upstream link), so comparing
-		 * its counter against the first checkpoint can show whether
-		 * DP-IN traffic actually crosses into the far end, not just
-		 * leaves the host.
-		 */
-		if (last != &path->hops[0]) {
-			last->in_counter_index = 0;
-			tb_port_dbg(last->in_port,
-				   "dp_video_counter: enabling counter 0 on downstream hop\n");
-		}
-	}
 
 	tb_path_for_each_hop(path, hop) {
 		int ret;
@@ -2546,12 +2538,7 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
 	tunnel->dst_port = dst;
 	tunnel->destroy = tb_dma_destroy;
 
-	credits = min_not_zero(dma_credits, nhi->sw->max_dma_credits);
-	if (credits > TB_MAX_CREDITS) {
-		tb_tunnel_dbg(tunnel, "%u credits do not fit a hop, using %u\n",
-			      credits, TB_MAX_CREDITS);
-		credits = TB_MAX_CREDITS;
-	}
+	credits = tb_dma_credits(nhi->sw);
 
 	if (receive_ring > 0) {
 		path = tb_path_alloc(tb, dst, receive_path, nhi, receive_ring, 0,
@@ -3039,6 +3026,84 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 err_free:
 	tb_tunnel_put(tunnel);
 	return NULL;
+}
+
+/*
+ * No host callbacks: the PCIe and USB owners stay bound. Display tunnels
+ * were released before this and are paired again after the sleep.
+ */
+int tb_tunnel_sleep_prepare(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (tunnel->sleep_paused || tb_tunnel_is_dma(tunnel) ||
+	    tb_tunnel_is_dp(tunnel) || !tb_tunnel_is_active(tunnel))
+		return -EBUSY;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep_prepare(tunnel->paths[i]);
+		if (ret) {
+			while (i--)
+				tb_path_sleep_complete(tunnel->paths[i]);
+			return ret;
+		}
+	}
+	tunnel->sleep_paused = true;
+	return 0;
+}
+
+int tb_tunnel_sleep(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	tunnel->sleep_changed = true;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep(tunnel->paths[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int tb_tunnel_wake(struct tb_tunnel *tunnel)
+{
+	int i, ret = 0;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	for (i = 0; i < tunnel->npaths; i++) {
+		if (tb_path_is_invalid(tunnel->paths[i]))
+			return -ENODEV;
+	}
+	if (!tunnel->sleep_changed)
+		return 0;
+	tunnel->sleep_replay = true;
+	if (tunnel->pre_activate)
+		ret = tunnel->pre_activate(tunnel);
+	for (i = 0; !ret && i < tunnel->npaths; i++) {
+		tunnel->paths[i]->sleep_lost = tunnel->sleep_lost;
+		ret = tb_path_wake(tunnel->paths[i]);
+	}
+	if (!ret && tunnel->activate)
+		ret = tunnel->activate(tunnel, true);
+	tunnel->sleep_replay = false;
+	if (!ret)
+		tunnel->sleep_changed = false;
+	return ret;
+}
+
+void tb_tunnel_sleep_complete(struct tb_tunnel *tunnel)
+{
+	int i;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (!tunnel->sleep_paused)
+		return;
+	for (i = 0; i < tunnel->npaths; i++)
+		tb_path_sleep_complete(tunnel->paths[i]);
+	tunnel->sleep_paused = false;
 }
 
 /**

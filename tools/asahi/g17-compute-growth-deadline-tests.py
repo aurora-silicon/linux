@@ -28,7 +28,15 @@ def fixture():
     prep = (ROOT / 'preparation.rs').read_text()
     admission = (item(prep, "pub(super) struct Admission<'a>") + '\n' +
                  item(prep, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
-    methods = '\n'.join(item(runtime, sig) for sig in ['    fn grow_compute(', '    fn finish_uninstalled_compute('])
+    # The admission's wait kinds and their count, which its struct names.
+    admission = ('#[derive(Clone,Copy,Debug,PartialEq)]\n' + item(prep, 'pub(super) enum AdmissionWait').replace('pub(super) ', '') + '\n'
+                 + next(line for line in prep.splitlines() if 'const ADMISSION_WAITS:' in line).replace('pub(super) ', '')
+                 + '\n' + admission)
+    methods = '\n'.join(item(runtime, sig) for sig in ['    fn grow_compute(', '    fn finish_uninstalled_compute(',
+                                                        '    fn finish_retired_compute('])
+    # The per-channel places growth hands drained siblings over in.
+    aliases = '\n'.join(next(line for line in runtime.splitlines() if line.startswith(prefix))
+                        for prefix in ('type Uninstalled =', 'type PerChannel<T> =')).replace('super::pairs::', '')
     methods = (methods.replace('super::object::Allocator', 'Allocator').replace('super::freelist::Pages', 'Pages')
                .replace('super::freelist::ComputeCapacity', 'ComputeCapacity'))
     return r'''
@@ -37,6 +45,7 @@ use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering,fence}};
 type Result<T=()> = std::result::Result<T,i32>;
 type KBox<T> = Box<T>;
+type KVec<T> = Vec<T>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
 const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static ALIAS:AtomicBool=AtomicBool::new(false);static PAGES:AtomicBool=AtomicBool::new(false);
@@ -70,8 +79,11 @@ impl Pages{
 impl Drop for Pages{fn drop(&mut self){PAGES.store(false,Ordering::SeqCst);}}
 impl Drop for Alias{fn drop(&mut self){ALIAS.store(false,Ordering::SeqCst);}}
 mod compute{pub(crate) use crate::Queue;}
+const COMPUTE_CHANNELS_MAX:usize=3;
+''' + aliases + r'''
 struct Queue{fresh:bool}
 impl Queue{
+ fn owner(&self)->Option<u64>{Some(1)}
  fn pool_fits(&self,_:usize)->bool{false}
  fn begin_growth(&mut self,_:&(),_:usize)->Result<bool>{Ok(false)}
  fn growth_token(&self)->Option<u64>{Some(7)}
@@ -85,6 +97,8 @@ struct Registry{compute:Vec<Option<Entry>>}
 impl Registry{
  fn compute(&self,_:u64)->Option<&Queue>{self.compute[0].as_ref().unwrap().queue.as_deref()}
  fn compute_mut(&mut self,_:u64)->Option<&mut Queue>{self.compute[0].as_mut().unwrap().queue.as_deref_mut()}
+ fn compute_primary(&mut self,owner:u64)->Option<&mut Queue>{self.compute_mut(owner)}
+ fn drain_compute_siblings(&mut self,_:u64,_:&mut PerChannel<Uninstalled>)->Result{Ok(())}
  fn cancel_compute(&mut self,_:ComputeReservation)->Result{assert!(!ALIAS.load(Ordering::SeqCst)&&!PAGES.load(Ordering::SeqCst));RESERVED.store(false,Ordering::SeqCst);Ok(())}
 }
 struct Primary;impl Primary{fn notify(&self,_:u32)->Result{Ok(())}}

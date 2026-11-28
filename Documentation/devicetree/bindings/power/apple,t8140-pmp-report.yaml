@@ -54,6 +54,7 @@ properties:
           - apple,t8112-pmp-v2-report
           - apple,t8122-pmp-v2-report
           - apple,t8140-pmp-v2-report
+          - apple,t8142-pmp-v2-report
       - items:
           - const: apple,t6031-pmp-v2-report
           - const: apple,t6020-pmp-v2-report
@@ -78,6 +79,27 @@ properties:
   '#size-cells':
     const: 0
 
+  apple,ptd-boot:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description:
+            The entry to write, or 0xfff to wait for the memory-cache channel's
+            echo of the value in the apple,ptd-echo-entry entry, or 0xffe to
+            read the entry the value names.
+        - description: Value
+    description:
+      T6050. PTD entries written once the PMP runs, in order, which no driver
+      otherwise writes. Set by the bootloader.
+
+  apple,ptd-echo-entry:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 1023
+    description:
+      T6050. The PTD entry in which the memory-cache channel echoes a value,
+      which the 0xfff steps of apple,ptd-boot wait on. Without it a sequence
+      with such a step is not written at all. Set by the bootloader.
+
   operating-points-v2: true
   apple,dram-type: true
   apple,data-bus-width: true
@@ -90,6 +112,33 @@ properties:
     description:
       The PMP that publishes this report, on SoCs where the host starts the
       PMP after a display handoff.
+
+  apple,pmp-tables:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMP node whose bootloader-filled tables (apple,tunable-soc-device,
+      apple,tunable-ptd-range) describe this report's entries, where the
+      report does not otherwise name its PMP. Only the tables are read; the
+      PMP node's status is not changed.
+
+  apple,cpu-memory-floor:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 5
+    items:
+      items:
+        - description: Request class, 0x21 to 0x25, each at most once
+          minimum: 0x21
+          maximum: 0x25
+        - description: Level in that class's four-bit lane
+          maximum: 15
+    description:
+      The host owns the CPU clients' memory-floor request (the second
+      CPU-client SOC-DEV-DVFS entry, found from the PMP's tables). While the
+      CPUs are busy it requests these levels in the request-class lanes of
+      apple,dvfs-request-levels, and the valid level 0 otherwise. At least
+      one level is nonzero. Present only where the PMP manages the DRAM and
+      fabric states.
 
 patternProperties:
   '^report@[0-9a-f]+$':
@@ -118,10 +167,16 @@ patternProperties:
                   - apple,t8112-pmp-v2-report-entry
                   - apple,t8122-pmp-v2-report-entry
               - const: apple,t6000-pmp-v2-report-entry
+          - items:
+              - const: apple,t8142-pmp-v2-report-entry
+              - const: apple,t8140-pmp-v2-report-entry
 
       reg:
         maxItems: 1
-        description: PMP soc-device index of the device.
+        description:
+          PMP soc-device index of the device. On T8142 this is the index of
+          the soc-device record (apple,tunable-soc-device on the PMP) that
+          holds the device.
 
       label:
         description: Name of the power domain.

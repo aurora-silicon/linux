@@ -10,6 +10,9 @@
 
 struct dma_fence;
 
+void asahi_g17_trace_submit(u8 phase, u64 submit_id, u32 ctx, u32 inputs,
+			    u32 outputs, s32 result, struct dma_fence *fence);
+void asahi_g17_trace_output(s32 result, struct dma_fence *fence);
 bool asahi_g17_trace_publish_enabled(void);
 void asahi_g17_trace_publish(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			     struct dma_fence *fence);
@@ -20,6 +23,7 @@ bool asahi_g17_trace_doorbell_enabled(void);
 void asahi_g17_trace_doorbell(u8 engine, u32 power);
 void asahi_g17_trace_message(u8 kind, u64 value);
 void asahi_g17_trace_event(u8 phase);
+u64 asahi_g17_firmware_clock(u64 hz);
 void asahi_g17_trace_teardown(u8 kind, u64 a, u64 b, u64 c);
 
 void asahi_g17_trace_inputs(u32 ctx, u64 seq, u8 phase, u32 inputs, u32 sources,

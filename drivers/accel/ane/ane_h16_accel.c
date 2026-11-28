@@ -7,12 +7,14 @@
  * commands. A process may map its program's surfaces (inputs and outputs
  * only) and run requests on them in place, without copies.
  */
+#include <linux/highmem.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/sizes.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
 
 #include <drm/drm_accel.h>
@@ -157,12 +159,180 @@ out:
 	return ret;
 }
 
+/*
+ * The user memory of one EXECUTE buffer, taken before any driver lock: its
+ * pages pinned, or, where they cannot be pinned (VM_PFNMAP and VM_IO
+ * mappings, such as a GEM-shmem or dma-buf heap mmap), a kernel bounce copy.
+ * Faulting user memory in can wait for as long as whoever backs it likes, and
+ * mmap() of the node takes the file and node locks under the process mmap
+ * lock, so no lock of ours is held then. Under the node lock the request
+ * copies through the kernel mapping of the pinned pages or the bounce copy,
+ * neither of which faults; a bounced output goes back to user memory after
+ * both locks are dropped.
+ */
+struct ane_h16_user_buffer {
+	struct page **pages;
+	void *bounce;
+	u64 ptr;
+	unsigned int count;
+	size_t offset;
+	size_t size;
+	bool write, dirty;
+};
+
+static int ane_h16_user_pin(struct ane_h16_user_buffer *u, u64 ptr, size_t size, bool write)
+{
+	int ret;
+
+	*u = (struct ane_h16_user_buffer) {
+		.offset = offset_in_page(ptr),
+		.size = size,
+		.write = write,
+	};
+	/* At most INT_MAX pages, checked before the page count can wrap. */
+	if (!size || ptr + size < ptr || size > (size_t)INT_MAX * PAGE_SIZE - u->offset)
+		return -EFAULT;
+	u->count = DIV_ROUND_UP(u->offset + size, PAGE_SIZE);
+	u->pages = kvmalloc_array(u->count, sizeof(*u->pages), GFP_KERNEL);
+	if (!u->pages)
+		return -ENOMEM;
+	ret = pin_user_pages_fast(ptr & PAGE_MASK, u->count, write ? FOLL_WRITE : 0, u->pages);
+	if (ret == u->count)
+		return 0;
+	if (ret > 0)
+		unpin_user_pages(u->pages, ret);
+	kvfree(u->pages);
+	u->pages = NULL;
+	return ret < 0 ? ret : -EFAULT;
+}
+
+static void ane_h16_user_unpin(struct ane_h16_user_buffer *u)
+{
+	if (!u->pages)
+		return;
+	unpin_user_pages_dirty_lock(u->pages, u->count, u->dirty);
+	kvfree(u->pages);
+	u->pages = NULL;
+}
+
+/*
+ * Whether [ptr, ptr + size) is completely mapped with the requested access
+ * and reaches a VM_PFNMAP or VM_IO mapping, whose pages cannot be pinned.
+ */
+static bool ane_h16_user_unpinnable(u64 ptr, size_t size, bool write)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long need = write ? VM_WRITE : VM_READ;
+	u64 addr = ptr, end = ptr + size;
+	bool unpinnable = false;
+
+	if (!size || end < ptr)
+		return false;
+	mmap_read_lock(mm);
+	while (addr < end) {
+		vma = find_vma(mm, addr);
+		if (!vma || vma->vm_start > addr || !(vma->vm_flags & need)) {
+			unpinnable = false;
+			break;
+		}
+		if (vma->vm_flags & (VM_PFNMAP | VM_IO))
+			unpinnable = true;
+		addr = vma->vm_end;
+	}
+	mmap_read_unlock(mm);
+	return unpinnable;
+}
+
+/* A kernel copy of the buffer; an input is read into it now. */
+static int ane_h16_user_bounce(struct ane_h16_user_buffer *u, u64 ptr, size_t size, bool write)
+{
+	*u = (struct ane_h16_user_buffer) { .size = size, .write = write };
+	u->bounce = kvmalloc(size, GFP_KERNEL_ACCOUNT);
+	if (!u->bounce)
+		return -ENOMEM;
+	u->ptr = ptr;
+	if (!write && copy_from_user(u->bounce, u64_to_user_ptr(ptr), size)) {
+		kvfree(u->bounce);
+		u->bounce = NULL;
+		return -EFAULT;
+	}
+	return 0;
+}
+
+/*
+ * Take one buffer with no lock held: pin it, or bounce it when it lies in a
+ * mapping whose pages cannot be pinned. An input is read into the bounce copy
+ * now, and fails here as copy_from_user() would; an output is written back by
+ * ane_h16_user_put(). Unmapped memory and read-only outputs still fail here.
+ */
+static int ane_h16_user_get(struct ane_h16_user_buffer *u, u64 ptr, size_t size, bool write)
+{
+	int ret = ane_h16_user_pin(u, ptr, size, write);
+
+	if (ret != -EFAULT || !ane_h16_user_unpinnable(ptr, size, write))
+		return ret;
+	return ane_h16_user_bounce(u, ptr, size, write);
+}
+
+/* Release one buffer after both locks are dropped; a bounced output goes back now. */
+static int ane_h16_user_put(struct ane_h16_user_buffer *u)
+{
+	int ret = 0;
+
+	if (!u->bounce) {
+		ane_h16_user_unpin(u);
+		return 0;
+	}
+	if (u->dirty && copy_to_user(u64_to_user_ptr(u->ptr), u->bounce, u->size))
+		ret = -EFAULT;
+	kvfree(u->bounce);
+	u->bounce = NULL;
+	return ret;
+}
+
+/*
+ * Copy between cpu and the pinned pages or the bounce copy. It cannot fault:
+ * safe under the node lock.
+ */
+static void ane_h16_user_copy(struct ane_h16_user_buffer *u, void *cpu, bool to_user)
+{
+	size_t done = 0, offset = u->offset;
+	unsigned int i;
+
+	if (u->bounce) {
+		if (to_user)
+			memcpy(u->bounce, cpu, u->size);
+		else
+			memcpy(cpu, u->bounce, u->size);
+		u->dirty |= to_user;
+		return;
+	}
+	for (i = 0; i < u->count; i++) {
+		size_t n = min_t(size_t, PAGE_SIZE - offset, u->size - done);
+		u8 *page = kmap_local_page(u->pages[i]);
+
+		if (to_user) {
+			memcpy(page + offset, (u8 *)cpu + done, n);
+			flush_dcache_page(u->pages[i]);
+		} else {
+			memcpy((u8 *)cpu + done, page + offset, n);
+		}
+		kunmap_local(page);
+		done += n;
+		offset = 0;
+	}
+	if (to_user)
+		u->dirty = true;
+}
+
 static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_h16_accel *a = to_h16_accel(drm);
 	struct ane_h16_accel_file *f = file->driver_priv;
 	struct drm_ane_h16_exec *args = data;
 	struct drm_ane_h16_buffer buffers[ANE_H16_SURFACES];
+	struct ane_h16_user_buffer user[ANE_H16_SURFACES] = {};
 	struct ane_h16_program *p;
 	u64 start, locked, copied, done;
 	unsigned int i;
@@ -177,22 +347,48 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 					array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
+	/*
+	 * Check the buffers against the loaded program, then take them (pin or
+	 * bounce) with no lock held: user memory is not touched under a lock of
+	 * ours. The program can change while unlocked, so the taken buffers are
+	 * checked against it again under the file lock, which then pins the
+	 * program through the request.
+	 */
 	mutex_lock(&f->lock);
-	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret) {
-		mutex_unlock(&f->lock);
-		return ret;
-	}
 	p = f->program;
-	if (!p || p->closed || args->count != p->resource_count) {
+	if (!p || args->count != p->resource_count)
+		ret = -EINVAL;
+	for (i = 0; i < args->count && !in_place && !ret; i++) {
+		if (buffers[i].size != p->resources[i].buffer.size)
+			ret = -EINVAL;
+		user[i].write = p->resources[i].permissions == 2;
+	}
+	mutex_unlock(&f->lock);
+	if (ret)
+		return ret;
+	for (i = 0; i < args->count && !in_place; i++) {
+		ret = ane_h16_user_get(&user[i], buffers[i].ptr, buffers[i].size,
+				       user[i].write);
+		if (ret)
+			goto unpin;
+	}
+	mutex_lock(&f->lock);
+	p = f->program;
+	if (!p || args->count != p->resource_count)
+		ret = -EINVAL;
+	for (i = 0; i < args->count && !in_place && !ret; i++) {
+		bool write = p->resources[i].permissions == 2;
+
+		if (buffers[i].size != p->resources[i].buffer.size || user[i].write != write)
+			ret = -EINVAL;
+	}
+	if (!ret)
+		ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
+	if (ret)
+		goto unlock_file;
+	if (p->closed) {
 		ret = -EINVAL;
 		goto unlock;
-	}
-	for (i = 0; i < args->count && !in_place; i++) {
-		if (buffers[i].size != p->resources[i].buffer.size) {
-			ret = -EINVAL;
-			goto unlock;
-		}
 	}
 	ret = ane_h16_session_acquire(a->session, p);
 	if (ret)
@@ -202,14 +398,10 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	for (i = 0; i < args->count && !in_place; i++) {
 		void *cpu = p->surfaces[i]->cpu;
 
-		if (p->resources[i].permissions == 1) {
-			if (copy_from_user(cpu, u64_to_user_ptr(buffers[i].ptr), buffers[i].size)) {
-				ret = -EFAULT;
-				goto release;
-			}
-		} else {
+		if (p->resources[i].permissions == 1)
+			ane_h16_user_copy(&user[i], cpu, false);
+		else
 			memset(cpu, 0xff, buffers[i].size);
-		}
 	}
 	ane_h16_session_sync(a->session, p, true);
 	copied = ktime_get_ns();
@@ -219,10 +411,8 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	done = ktime_get_ns();
 	ane_h16_session_sync(a->session, p, false);
 	for (i = 0; i < args->count && !in_place; i++)
-		if (p->resources[i].permissions == 2 &&
-		    copy_to_user(u64_to_user_ptr(buffers[i].ptr), p->surfaces[i]->cpu,
-				 buffers[i].size))
-			ret = -EFAULT;
+		if (p->resources[i].permissions == 2)
+			ane_h16_user_copy(&user[i], p->surfaces[i]->cpu, true);
 	if (!ret) {
 		u64 end = ktime_get_ns();
 		const u64 *ns = a->session->timing.ns;
@@ -248,7 +438,15 @@ release:
 	ane_h16_session_release(a->session, p);
 unlock:
 	mutex_unlock(&a->lock);
+unlock_file:
 	mutex_unlock(&f->lock);
+unpin:
+	for (i = 0; i < args->count && !in_place; i++) {
+		int put = ane_h16_user_put(&user[i]);
+
+		if (put && !ret)
+			ret = put;
+	}
 	return ret;
 }
 
@@ -421,8 +619,65 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.desc = "Apple Neural Engine (H16 and later)",
 };
 
+/*
+ * ane_stats and wedged on the ANE device, as ane.ko and ane_t6021 have them
+ * (Documentation/ABI/testing/sysfs-class-accel-ane), for the node's lifetime.
+ * Both are lock-free reads, so a hung request cannot block them.
+ */
+struct ane_h16_sysfs {
+	struct ane_h16_session *session;
+	struct device_attribute stats, wedged;
+	struct attribute *attrs[3];
+	struct attribute_group group;
+};
+
+static ssize_t ane_h16_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ane_h16_sysfs *sys = container_of(attr, struct ane_h16_sysfs, stats);
+
+	return ane_stats_emit(buf, &sys->session->sysfs_ctrs);
+}
+
+/*
+ * 1 while the session is quarantined: a request hung or failed with an
+ * uncertain outcome, and requests are refused until a recovery or a system
+ * sleep proves the old firmware gone. A parked or sleeping engine is not
+ * wedged: the next request brings it up.
+ */
+static ssize_t ane_h16_wedged_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ane_h16_sysfs *sys = container_of(attr, struct ane_h16_sysfs, wedged);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(sys->session->quarantined));
+}
+
+static struct ane_h16_sysfs *ane_h16_sysfs_add(struct device *dev,
+					       struct ane_h16_session *session)
+{
+	struct ane_h16_sysfs *sys = devm_kzalloc(dev, sizeof(*sys), GFP_KERNEL);
+	int ret;
+
+	if (!sys)
+		return ERR_PTR(-ENOMEM);
+	sys->session = session;
+	sysfs_attr_init(&sys->stats.attr);
+	sys->stats.attr.name = "ane_stats";
+	sys->stats.attr.mode = 0444;
+	sys->stats.show = ane_h16_stats_show;
+	sysfs_attr_init(&sys->wedged.attr);
+	sys->wedged.attr.name = "wedged";
+	sys->wedged.attr.mode = 0444;
+	sys->wedged.show = ane_h16_wedged_show;
+	sys->attrs[0] = &sys->stats.attr;
+	sys->attrs[1] = &sys->wedged.attr;
+	sys->group.attrs = sys->attrs;
+	ret = devm_device_add_group(dev, &sys->group);
+	return ret ? ERR_PTR(ret) : sys;
+}
+
 int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 {
+	struct ane_h16_sysfs *sys;
 	struct ane_h16_accel *a;
 	int ret;
 
@@ -438,6 +693,10 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
+	/* The node works without them: report and go on. */
+	sys = ane_h16_sysfs_add(dev, session);
+	if (IS_ERR(sys))
+		drm_warn(&a->drm, "no ane_stats or wedged in sysfs (%pe)\n", sys);
 	drm_info(&a->drm, "H%u accel node ready (ABI 3, %s)\n",
 		 session->transport->soc->chip_family,
 		 ane_fw_transport_switch_safe(session->transport) ?

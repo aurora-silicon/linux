@@ -19,47 +19,39 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t8103-sleep
+      - apple,t8122-sleep
+      - apple,t8132-sleep
       - apple,t8140-sleep
+      - apple,t8142-sleep
 
   reg:
-    maxItems: 28
+    minItems: 7
+    maxItems: 41
 
   reg-names:
-    items:
-      - const: ps
-      - const: pwrgate
-      - const: cpu-start
-      - const: cllt
-      - const: cluster
-      - const: commit
-      - const: wdt
-      - const: aon-misc
-      - const: wake
-      - const: amcc0
-      - const: amcc1
-      - const: amcc2
-      - const: amcc3
-      - const: pmc-dcp
-      - const: dvfm-e
-      - const: dvfm-p
-      - const: spmi
-      - const: pmc-voters
-      - const: dcs
-      - const: ps-aon
-      - const: spmi-a0
-      - const: clk-mux
-      - const: mcc0
-      - const: mcc1
-      - const: mcc2
-      - const: ptd
-      - const: clk-perf
-      - const: cluster-dcs
+    minItems: 7
+    maxItems: 41
 
   apple,wake-enable:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       The wake source IDs left enabled across suspend-to-RAM. Every other
       source is masked.
+
+  apple,spmi-pmu-sources:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - minimum: 0x600
+        maximum: 0x61c
+        multipleOf: 4
+      - minimum: 1
+    description: |
+      Offset of a Gen4 SPMI peripheral interrupt status word and the mask of
+      PMU sources owned by the sleep controller. Only these latched sources
+      are acknowledged at entry and wake. On T8142 they are enabled after
+      programming the RTC alarm, with their prior enable state restored on
+      return. Other peripheral interrupt sources are left unchanged.
 
   apple,apcie:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -85,17 +77,239 @@ properties:
     description:
       The USB-C port controller that carries the debug link, stopped for a sleep.
 
+  apple,radio-host:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host of the radio's link, which the boot loader trained. Its root
+      port loses its configuration in a deep sleep and is trained again after
+      the wake.
+
+  apple,radio-perst:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the radio GPIO controller.
+          - description: Pin number.
+          - description: GPIO flags.
+    description:
+      The GPIO that drives the radio's PERST#, held across that retraining.
+
   apple,display-coprocessors:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description:
-      The DCP and the external DCP, which must be off before a commit, in that
+      The DCP and the external DCPs, which must be off before a commit, in that
       order.
 
 required:
   - compatible
   - reg
   - reg-names
-  - apple,wake-enable
   - apple,display-coprocessors
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8103-sleep
+    then:
+      required:
+        - apple,wake-enable
+        - apple,pinctrl
+      properties:
+        reg:
+          minItems: 7
+          maxItems: 7
+        reg-names:
+          items:
+            - const: ps
+            - const: ps-aon
+            - const: clk-mux
+            - const: wake
+            - const: cpu-start
+            - const: wdt
+            - const: spmi
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8122-sleep
+    then:
+      required:
+        - apple,wake-enable
+      properties:
+        reg:
+          minItems: 21
+          maxItems: 21
+        reg-names:
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: spmi
+            - const: spmi-hpm
+            - const: wake
+            - const: ps-aon
+            - const: mcc-a
+            - const: mcc-b
+            - const: mcc-c
+            - const: mcc-d
+            - const: apcie-axi
+            - const: apcie-rc
+            - const: apcie-clkgen
+            - const: apcie-phy
+            - const: apcie-phy-ip
+            - const: apcie-port0
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-sleep
+    then:
+      required:
+        - apple,wake-enable
+      properties:
+        reg:
+          minItems: 28
+          maxItems: 28
+        reg-names:
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: amcc2
+            - const: amcc3
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: mcc2
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sleep
+    then:
+      properties:
+        reg:
+          minItems: 25
+          maxItems: 26
+        reg-names:
+          minItems: 25
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+            - const: ps-prot
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-sleep
+    then:
+      required:
+        - apple,wake-enable
+      properties:
+        reg:
+          minItems: 36
+          maxItems: 41
+        reg-names:
+          minItems: 36
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: spmi
+            - const: ps-aon
+            - const: spmi-a0
+            - const: pmc-voters
+            - const: clk-perf
+            - const: dcs
+            - const: acc-e
+            - const: acc-p
+            - const: amcc0
+            - const: amcc1
+            - const: amcc2
+            - const: amcc3
+            - const: socni0
+            - const: socni1
+            - const: socni2
+            - const: socni3
+            - const: socni4
+            - const: socni5
+            - const: mcc0
+            - const: mcc1
+            - const: mcc2
+            - const: mcc3
+            - const: mcc4
+            - const: mcc5
+            - const: mcc6
+            - const: mcc7
+            - const: mem-clk
+            - const: clk-slots
+            - const: amcc-cfg0
+            - const: amcc-cfg1
+            - const: amcc-cfg2
+            - const: amcc-cfg3
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8142-sleep
+    then:
+      properties:
+        apple,radio-host: false
+        apple,radio-perst: false
 
 additionalProperties: false

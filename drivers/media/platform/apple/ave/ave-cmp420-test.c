@@ -9,7 +9,6 @@
  * Copyright The Aurora Silicon Contributors
  */
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -462,6 +461,3 @@ static struct kunit_suite ave_cmp420_suite = {
 	.test_cases = ave_cmp420_cases,
 };
 kunit_test_suite(ave_cmp420_suite);
-
-MODULE_DESCRIPTION("Apple AVE compressed 4:2:0 surface tests");
-MODULE_LICENSE("GPL");

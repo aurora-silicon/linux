@@ -34,6 +34,7 @@
 			reg = <0 0x0>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@1 {
@@ -43,6 +44,7 @@
 			reg = <0 0x1>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu2: cpu@2 {
@@ -52,6 +54,7 @@
 			reg = <0 0x2>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu3: cpu@3 {
@@ -61,6 +64,7 @@
 			reg = <0 0x3>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu4: cpu@4 {
@@ -70,6 +74,7 @@
 			reg = <0 0x4>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@5 {
@@ -79,6 +84,7 @@
 			reg = <0 0x5>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu6: cpu@10100 {
@@ -88,6 +94,7 @@
 			reg = <0 0x10100>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@10101 {
@@ -97,6 +104,7 @@
 			reg = <0 0x10101>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu8: cpu@10102 {
@@ -106,6 +114,7 @@
 			reg = <0 0x10102>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 
 		cpu9: cpu@10103 {
@@ -115,6 +124,7 @@
 			reg = <0 0x10103>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+			#cooling-cells = <2>;
 		};
 	};
 
@@ -126,6 +136,14 @@
 			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+	};
+
+	cpu_pmu: pmu {
+		status = "disabled";
+		compatible = "apple,t8142-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both clusters' PMU FIQs as this one, as on T8140. */
+		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	clkref: clock-ref {
@@ -149,6 +167,23 @@
 			reg = <3 0x81000000 0 0x1cc000>,
 			      <3 0x81040000 0 0x4000>;
 			reg-names = "core", "event";
+		};
+
+		/*
+		 * System level cache planes: ADT mcc,t8142 reg[1] (amcc-reg-idx 1,
+		 * one AMCC, amcc-plane-enable-mask 0xf), four planes 0x40000 apart,
+		 * T8140's register layout (ways 0x2800, power 0x2804, allocation
+		 * disable 0x82c, flush 0x2844; m1n1/aura mcc_init_m5). aura enables
+		 * the ways and allocation before the kernel, so the driver only
+		 * checks that and flushes the cache on shutdown.
+		 */
+		mcc: memory-controller@220000000 {
+			compatible = "apple,t8142-mcc", "apple,t8140-mcc";
+			reg = <0x2 0x20000000 0x0 0x4000>,
+			      <0x2 0x20040000 0x0 0x4000>,
+			      <0x2 0x20080000 0x0 0x4000>,
+			      <0x2 0x200c0000 0x0 0x4000>;
+			status = "disabled";
 		};
 
 		serial0: serial@3a5200000 {
@@ -190,6 +225,7 @@
 		reg = <0x4 0x88000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_apcie_sys_gp>;
 		status = "disabled";
 	};
 
@@ -198,7 +234,12 @@
 		reg = <0x3 0x90fc0000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		/*
+		 * No power-domains: AOP_DART is in the AOP's own power tree
+		 * (pmgr AOP_FILTER), which runs from before the handoff and
+		 * which the AP never switches off; the ADT gives dart-aop and
+		 * aop no power-gates.
+		 */
 	};
 
 	pmp_dart: iommu@380300000 {
@@ -206,6 +247,14 @@
 		reg = <0x3 0x80300000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 1004 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	pmp_report: pmp-report@3803c0000 {
+		compatible = "apple,t8142-pmp-v2-report";
+		reg = <0x3 0x803c0000 0x0 0x20000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 

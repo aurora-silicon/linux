@@ -47,9 +47,9 @@ const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
 const POINTERS: usize = 0x100;
-/// Producer/consumer words live on their own uncached page after the graph,
-/// which the firmware reads through a cached mapping (queue record, job-list
-/// head and item ring), as native does.
+/// Producer/consumer words live on their own page after the graph. The whole
+/// graph stays uncached because both the firmware and host write the queue
+/// record (on owner rebinds) and item ring.
 const CURSORS: usize = GRAPH_SIZE;
 const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
@@ -106,18 +106,24 @@ pub(crate) struct DescriptorRing {
 }
 
 impl DescriptorRing {
-    /// Firmware reads every descriptor through a cached kernel mapping, as it
-    /// does for render. The pool keeps that mapping until processor stop; the
-    /// hardware reads the same pages through an uncached canonical low alias.
-    /// On M5 the kernel mapping, in the upper half every execution context
-    /// includes, is firmware-only.
+    /// Both firmware and host write compute descriptors: the firmware updates
+    /// an accounting word near the end of each descriptor (`+0xfac` on M5),
+    /// and the host rewrites each slot every 32 kicks. M5 keeps them uncached
+    /// against the dirty-line writeback hazard of linux#3170, while retaining
+    /// their VA and fence in the pool. G17P maps them firmware-cached, as it
+    /// does render descriptors: the host rewrites a slot only after the kick
+    /// that last used it retired (at most `DESCRIPTORS` kicks are in flight),
+    /// by when that kick's accounting store is in memory. The hardware reads
+    /// the same pages through an uncached canonical low alias; on M5 the
+    /// kernel mapping, in the upper half every execution context includes, is
+    /// firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
             alloc,
             Family::Descriptor,
             size,
-            size,
+            if alloc.uat.is_m5() { 0 } else { size },
             if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
             CpuMap::WriteCombined,
         )?;
@@ -141,7 +147,7 @@ struct Graph {
     operand: KernelObject,
     support: KernelObject,
     m5_timestamps: Option<Arc<KernelObject>>,
-    graph: PooledObject,
+    graph: KernelObject,
     context_low: Option<KernelObject>,
     context_high: Option<KernelObject>,
     /// Announcements, which stay uncached for the firmware.
@@ -158,6 +164,8 @@ struct Graph {
     /// The M5 board, whose part selects the M5 descriptor words.
     board: Option<&'static Board>,
     program: ComputeProgram,
+    /// The firmware takes MCache tables in compute kick entries.
+    mcache: bool,
 }
 
 impl Graph {
@@ -170,6 +178,7 @@ impl Graph {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -188,14 +197,14 @@ impl Graph {
             support.write(0x110, 0x50u32)?;
             support.write(mmu::UAT_PGSZ + 4, 1u32)?;
         }
-        let mut graph = objects.allocate(
-            alloc,
-            Family::QueueState,
-            GRAPH_SIZE + mmu::UAT_PGSZ,
-            GRAPH_SIZE,
-            prot,
-            cpu,
-        )?;
+        // Keep the compute graph uncached: the firmware writes runtime state
+        // into the queue record while the host rewrites its owner fields on
+        // rebind (`Graph::set_owner`) and wraps the item ring. Firmware-cached
+        // G17 mappings are non-coherent with host writes and cannot be flushed,
+        // so dirty firmware lines would revert host updates. An installed
+        // compute graph lives until firmware stop and does not need the reuse
+        // pool.
+        let mut graph = alloc.kernel(GRAPH_SIZE + mmu::UAT_PGSZ, page, prot, cpu)?;
         let graph_va = graph.gpu_va();
         graph.initialize::<GraphLayout>(0, |view| {
             view.pointers = PointerBlock::new(&pointers)?;
@@ -256,6 +265,7 @@ impl Graph {
             operand_state,
             board,
             program,
+            mcache,
         })
     }
 
@@ -264,7 +274,7 @@ impl Graph {
         &mut self,
         context: Arc<Context>,
         kick_alias: mmu::KernelMapping,
-        pool_alias: mmu::KernelMapping,
+        pool_alias: Option<mmu::KernelMapping>,
     ) -> Result<Binding> {
         if !context.is_current() {
             return Err(EFAULT);
@@ -274,7 +284,7 @@ impl Graph {
         let descriptors = self.descriptor_alias(vm)?;
         let prot = if self.m5 { mmu::PROT_GPU_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW };
         let page = mmu::UAT_PGSZ as u64;
-        let private = mmu::client_private_range(self.m5);
+        let private = vm.client_private_range();
         let preempt = self
             .preempt
             .alias_in(vm, private.clone(), page, prot)?;
@@ -286,7 +296,7 @@ impl Graph {
             .map(|context| context.alias_in(vm, private.clone(), page, prot)).transpose()?;
         Ok(Binding {
             _kick_alias: kick_alias,
-            pool_alias: Some(pool_alias),
+            pool_alias,
             descriptors: Some(descriptors),
             preempt,
             usage,
@@ -304,8 +314,16 @@ impl Graph {
                 .cast::<crate::g17::fw::m5::queue::QueueRecord>();
             // SAFETY: The checked packed record stays mapped. The device mutex
             // and idle witness exclude access by another owner during this update.
-            return unsafe { (*pointer).set_compute_owner(context.work_head_va(),
-                context.scheduler_va(), context.owner_pid(), context.policy()) };
+            unsafe {
+                (*pointer).set_compute_owner(
+                    context.work_head_va(),
+                    context.scheduler_va(),
+                    context.owner_pid(),
+                    context.policy(),
+                )
+            }?;
+            fence(Ordering::Release);
+            return Ok(());
         }
         let pointer = self
             .graph
@@ -321,6 +339,7 @@ impl Graph {
                 context.policy(),
             )
         };
+        fence(Ordering::Release);
         Ok(())
     }
 
@@ -364,12 +383,8 @@ impl Graph {
     fn vacate_ring(&mut self) -> Option<DescriptorRing> {
         self.ring.take()
     }
-    fn rearm_ring(&mut self, ring: DescriptorRing) -> Result {
-        if self.ring.is_some() {
-            return Err(EBUSY);
-        }
-        self.ring = Some(ring);
-        Ok(())
+    fn rearm_ring(&mut self, ring: DescriptorRing) -> Option<DescriptorRing> {
+        self.ring.replace(ring)
     }
     /// `cursors`: this publication's snapshot (M5), else a fresh read.
     fn ensure_record_slot(&self, slot: usize, cursors: Option<Cursors>) -> Result {
@@ -456,6 +471,19 @@ impl<T> Fifo<T> {
     fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
     }
+    /// The entry `index` places behind the front.
+    fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_ref()
+    }
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_mut()
+    }
     fn back(&self) -> Option<&T> {
         if self.len == 0 {
             None
@@ -526,7 +554,8 @@ struct Active {
     spared_as_dropped: bool,
     /// The command retired on its completion record without a completion stamp and its client
     /// has its result, but the firmware may still store the stamp through its descriptor: the
-    /// descriptor stays held, and the command at the front, until the stamp covers it.
+    /// descriptor stays held, and the command in the queue, until the stamp covers it. Also set
+    /// for a command that retired behind such commands: it leaves the queue after them.
     stamps_owed: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
@@ -615,8 +644,29 @@ pub(crate) struct Growth {
     phase: PoolPhase,
 }
 
+/// See [`Queue::admission_state`]. Its fields are read only through `Debug`, by the report.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct AdmissionState {
+    installed: bool,
+    m5_install_end: Option<u32>,
+    consumer: Option<u32>,
+    configuration: bool,
+    ordinal: u32,
+    quarantined: bool,
+    awaiting_witness: bool,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
+    /// Per-owner channel index (0 for primary, 1..COMPUTE_CHANNELS_MAX for M5 siblings).
+    channel_index: u8,
+    /// Whether this queue currently holds a `Context::note_compute_binding(true)` count.
+    binding_noted: bool,
+    /// Consecutive retired kicks of the bound owner whose firmware execution record ran at least
+    /// [`crate::g17::pairs::SIBLING_EXECUTION_NS`] ([`crate::g17::pairs::heavy_run`]); zero for a
+    /// new owner.
+    heavy_run: u8,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
@@ -707,18 +757,58 @@ impl Queue {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
+    ) -> Result<Self> {
+        Self::new_channel(
+            alloc,
+            objects,
+            backing,
+            owner,
+            context,
+            pointers,
+            operand_state,
+            board,
+            program,
+            m5,
+            mcache,
+            0,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A sibling compute queue takes the same physical graph inputs plus its channel \
+                  identity."
+    )]
+    pub(crate) fn new_channel(
+        alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
+        backing: Backing,
+        owner: u64,
+        context: Arc<Context>,
+        pointers: PointerLayout,
+        operand_state: &'static OperandState,
+        board: Option<&'static Board>,
+        program: ComputeProgram,
+        m5: bool,
+        mcache: bool,
+        channel_index: u8,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5)?;
+        let mut graph =
+            Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5, mcache)?;
         let kick_alias = kick.map_client(context.vm())?;
-        let pool_alias = pool.map_client(context.vm())?;
+        let pool_alias = Some(pool.map_client(context.vm())?);
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
         context.mark_published();
         context.note_compute_binding(true);
         crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
         Ok(Self {
             owner: Some(owner),
+            channel_index,
+            binding_noted: true,
+            heavy_run: 0,
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
             release_sent_ns: None,
@@ -837,6 +927,46 @@ impl Queue {
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
     }
+    pub(crate) fn channel_index(&self) -> u8 {
+        self.channel_index
+    }
+    pub(crate) fn is_primary(&self) -> bool {
+        self.channel_index == 0
+    }
+    pub(crate) fn active_len(&self) -> usize {
+        self.active.len
+    }
+    pub(crate) fn has_replays(&self) -> bool {
+        self.replays.len != 0
+    }
+    pub(crate) fn configuring(&self) -> bool {
+        self.configuration.is_some()
+    }
+    pub(crate) fn has_ring(&self) -> bool {
+        self.graph.ring.is_some()
+    }
+    /// The bound owner's recent kicks on this channel ran sustained heavy work
+    /// ([`crate::g17::pairs::sustained`]).
+    pub(crate) fn sustained(&self) -> bool {
+        crate::g17::pairs::sustained(self.heavy_run)
+    }
+    fn clear_binding_note(&mut self) {
+        if self.binding_noted {
+            if let Some(binding) = &self.binding {
+                binding.context.note_compute_binding(false);
+            }
+            self.binding_noted = false;
+        }
+    }
+    fn clear_owner(&mut self, stamp_released_at: bool) {
+        self.clear_binding_note();
+        self.owner = None;
+        self.channel_index = 0;
+        self.heavy_run = 0;
+        if stamp_released_at {
+            self.released_at = now_ns();
+        }
+    }
     /// The bound owner's context; `None` once an exited owner was detached.
     pub(crate) fn context(&self) -> Option<&Arc<Context>> {
         self.binding.as_ref().map(|binding| &binding.context)
@@ -892,12 +1022,14 @@ impl Queue {
     /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
     /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
     /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
-    /// within their bounded renewals instead of failing their own work at once.
+    /// within their bounded renewals instead of failing their own work at once. Commands that
+    /// already retired and only hold their descriptors (`Active::stamps_owed`) are not the head.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
-        self.active.front().map(|active| crate::g17::timeout::Head {
+        let head = self.active.iter().find(|active| !active.stamps_owed);
+        head.map(|active| crate::g17::timeout::Head {
             vm: active.packet.context.vm().id(),
             published: active.published,
             // An M5 completion record can precede the command's writes: only the stamp
@@ -909,6 +1041,7 @@ impl Queue {
                 active.observed.is_some()
             },
             failed: self.quarantined,
+            excused: active.packet.within_allowance(crate::g17::now_ns()),
         })
     }
 
@@ -924,6 +1057,12 @@ impl Queue {
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         for active in self.active.iter() {
             visit(active.packet.completion.status());
+        }
+    }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
         }
     }
     /// A recovery record names this queue and the completion stamp of the
@@ -1002,6 +1141,18 @@ impl Queue {
         self.retired_by_teardown
             || self.retire_pending
             || masks.is_none_or(|m| m[self.qid() as usize / 64] & (1 << (self.qid() % 64)) != 0)
+    }
+
+    pub(crate) fn needs_scan_retire(&self, masks: Option<[u64; 2]>) -> bool {
+        self.configuration.is_some() || (!self.quarantined && self.selected(masks))
+    }
+
+    pub(crate) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub(crate) fn awaiting_witness(&self) -> bool {
+        self.awaiting_witness
     }
     /// Stage every unlatched exact identity before the device's single shared-ring scan,
     /// whichever queues the scan's batch retires.
@@ -1130,6 +1281,8 @@ impl Queue {
 
     /// Poll only the ordered prefix; the next pass may recheck a finished front on another QID's
     /// event. A final identity-less scan allows recordless retirement without the one-pass grace.
+    /// Commands that retired without their stamp keep their place and descriptors until it
+    /// covers them; the pass steps past them to the commands behind.
     pub(crate) fn retire(
         &mut self,
         masks: Option<[u64; 2]>,
@@ -1145,7 +1298,9 @@ impl Queue {
         let finished_before = self.retire_pending;
         self.retire_pending = false;
         let mut oldest = true;
-        while let Some(front) = self.active.front() {
+        // How many retired commands at the front, still owed their stamp, this pass stepped past.
+        let mut at = 0;
+        while let Some(front) = self.active.get(at) {
             let mut restart = None;
             let mut crossed = false;
             let result = (|| {
@@ -1164,6 +1319,10 @@ impl Queue {
                     };
                 }
                 let recordless = if epoch != ticket.epoch {
+                    if at != 0 {
+                        // Only its stamp retires it now, and that covers the commands ahead.
+                        return Err(EAGAIN);
+                    }
                     crossed = true;
                     Recordless::CrossedRecovery
                 } else if masks.is_none() || (finished_before && oldest) {
@@ -1174,7 +1333,7 @@ impl Queue {
                 let next_end = self
                     .active
                     .iter()
-                    .skip(1)
+                    .skip(at + 1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
                 let stamp = self.graph.stamp()?;
                 let record_aged = !retirement::stamp_covers(stamp, ticket.kick)
@@ -1203,35 +1362,44 @@ impl Queue {
                 if timestamps.is_some() && stampless {
                     retirement::note_stampless(self.qid(), ticket.kick);
                 }
+                // After a rebind the first publication retires first, and stays the oldest
+                // command until its stamp covers it.
+                let first = self
+                    .active
+                    .front()
+                    .and_then(|first| Some((first.packet.order.sequence, first.ticket?.epoch)));
                 if timestamps.is_some()
-                    && self.previous.as_ref().is_some_and(|p| {
-                        p.publication != Some((front.packet.order.sequence, ticket.epoch))
-                    })
+                    && self.previous.as_ref().is_some_and(|p| p.publication != first)
                 {
                     return Err(EIO);
                 }
                 Ok(timestamps.map(|timestamps| (timestamps, stampless)))
             })();
             oldest = false;
+            let owed = front.stamps_owed;
             match result {
-                Ok(Some((_, _))) if self.active.front().is_some_and(|front| front.stamps_owed) => {
+                Ok(Some(_)) if owed && at == 0 => {
                     // The stamp now covers the held command: release its descriptor.
                     self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     self.active.pop().ok_or(EIO)?;
                     drop(self.previous.take());
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
-                        self.owner = None;
-                        self.released_at = now_ns();
+                        self.clear_owner(true);
                     }
                 }
+                // It was reported when it retired: step past it.
+                Ok(Some(_)) | Err(EAGAIN) if owed => at += 1,
                 Ok(Some((timestamps, stampless))) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;
-                        self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
+                        self.active.get_mut(at).ok_or(EIO)?.qos_pending = false;
                     }
-                    let front = self.active.front().ok_or(EIO)?;
+                    let front = self.active.get(at).ok_or(EIO)?;
+                    // Only an exact execution record measures the kick: a recordless retirement
+                    // carries a synthesized envelope.
+                    let execution = front.observed.map(|record| record.timestamps);
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
@@ -1255,17 +1423,22 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
-                    if stampless {
+                    if let Some([start, end]) = execution {
+                        self.heavy_run = crate::g17::pairs::heavy_run(self.heavy_run, start, end);
+                    }
+                    if stampless || at != 0 {
                         // A completion record is no witness that the firmware is done with the
                         // descriptor: it can still store the stamp through it. Keep the command
-                        // (and its descriptor) at the front until the stamp covers it.
+                        // (and its descriptor) until the stamp covers it, as well as one that
+                        // retired behind it, and go on with the next command.
                         let _ = submitted;
-                        let front = self.active.iter_mut().next().ok_or(EIO)?;
+                        let front = self.active.get_mut(at).ok_or(EIO)?;
                         front.stamps_owed = true;
                         if front.observed.is_some() {
                             self.last_end = self.last_end.max(timestamps[1]);
                         }
-                        break;
+                        at += 1;
+                        continue;
                     }
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
@@ -1275,13 +1448,12 @@ impl Queue {
                     drop(self.previous.take());
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
-                        self.owner = None;
-                        self.released_at = now_ns();
+                        self.clear_owner(true);
                     }
                 }
                 Ok(None) | Err(EAGAIN) => {
                     if restart.is_some() {
-                        self.active.iter_mut().next().ok_or(EIO)?.observed_at = restart;
+                        self.active.get_mut(at).ok_or(EIO)?.observed_at = restart;
                     }
                     self.retire_pending = self.front_finished();
                     break;
@@ -1294,6 +1466,10 @@ impl Queue {
                     return Ok(());
                 }
             }
+        }
+        if at != 0 {
+            // Owed stamps come without a completion event: keep polling for them.
+            self.retire_pending = self.front_finished();
         }
         Ok(())
     }
@@ -1310,7 +1486,8 @@ impl Queue {
         let dropped = crossed && self.fault_stamp.is_none();
         for active in self.active.iter_mut() {
             let completion = &active.packet.completion;
-            if completion.spared() || completion.guilty() {
+            // A command whose stamp is owed ran and has its result.
+            if active.stamps_owed || completion.spared() || completion.guilty() {
                 continue;
             }
             if dropped {
@@ -1444,8 +1621,7 @@ impl Queue {
             self.retire_pending = false;
             self.retirement_ready = true;
             if self.released {
-                self.owner = None;
-                self.released_at = now_ns();
+                self.clear_owner(true);
             }
         }
         Ok(())
@@ -1810,6 +1986,27 @@ impl Queue {
             && !self.source_hint.has_readers(&self.source_readers)
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
+        self.bind_owner_channel(owner, context, 0)
+    }
+    /// Binds a reusable physical queue with its own dedicated compute pool as an additional
+    /// compute channel of `owner`.
+    pub(crate) fn bind_sibling(
+        &mut self,
+        owner: u64,
+        context: Arc<Context>,
+        channel_index: u8,
+    ) -> Result {
+        if !self.graph.m5 || self.pool_phase != PoolPhase::Populated || self.graph.ring.is_none() {
+            return Err(EBUSY);
+        }
+        self.bind_owner_channel(owner, context, channel_index)
+    }
+    fn bind_owner_channel(
+        &mut self,
+        owner: u64,
+        context: Arc<Context>,
+        channel_index: u8,
+    ) -> Result {
         if !self.reusable() {
             return Err(EBUSY);
         }
@@ -1857,7 +2054,7 @@ impl Queue {
                 self.kick.clear_ring()?;
                 let kick_alias = self.kick.map_client(context.vm())?;
                 let pool_alias = self.pool.map_client(context.vm())?;
-                self.graph.bind(context.clone(), kick_alias, pool_alias)
+                self.graph.bind(context.clone(), kick_alias, Some(pool_alias))
             })();
             let binding = match moved {
                 Ok(binding) => binding,
@@ -1883,7 +2080,9 @@ impl Queue {
             self.retained_owner = None;
         }
         context.mark_published();
+        self.clear_binding_note();
         context.note_compute_binding(true);
+        self.binding_noted = true;
         crate::g17::trace::bind(
             crate::g17::trace::COMPUTE,
             self.qid(),
@@ -1891,6 +2090,8 @@ impl Queue {
             if same_vm { 2 } else { 1 },
         );
         self.owner = Some(owner);
+        self.channel_index = channel_index;
+        self.heavy_run = 0;
         self.rearm_for = None;
         self.unpublished_binding = true;
         self.released = false;
@@ -1901,10 +2102,9 @@ impl Queue {
     /// True allows the registry to cancel the never-published QID and drop this graph. An
     /// installed graph remains retained even after the logical owner exits without work.
     pub(crate) fn release_owner(&mut self) -> Result<bool> {
-        if let Some(binding) = &self.binding {
-            binding.context.note_compute_binding(false);
-        }
+        self.clear_binding_note();
         if !self.installed && self.active.len == 0 && !self.quarantined && self.previous.is_none() {
+            self.clear_owner(false);
             return Ok(true);
         }
         self.released = true;
@@ -1937,8 +2137,7 @@ impl Queue {
                 self.retirement_ready = true;
             }
             if self.retirement_ready {
-                self.owner = None;
-                self.released_at = now_ns();
+                self.clear_owner(true);
             }
         }
         Ok(false)
@@ -1965,6 +2164,27 @@ impl Queue {
         // QID pressure), not at every owner exit: releasing and re-arming the pool of each
         // exited owner's idle queue left a later command retired without a completion stamp.
         Some(binding)
+    }
+    /// A recycled vacant sibling queue whose descriptor ring still awaits off-lock release
+    /// before re-arming with fresh backing.
+    pub(crate) fn take_recycled_ring(&mut self) -> Option<Vacated> {
+        if !self.recycled_pending()
+            || self.pool_phase != PoolPhase::Vacant
+            || self.graph.ring.is_none()
+        {
+            return None;
+        }
+        let descriptors = self
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.descriptors.take());
+        let ring = self.graph.vacate_ring();
+        Some(Vacated {
+            _alias: None,
+            _pages: None,
+            _descriptors: descriptors,
+            _ring: ring,
+        })
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
@@ -2077,10 +2297,9 @@ impl Queue {
         self.replay_prepared = false;
         self.submitted = 0;
         self.kick.clear_parent_after_recovery();
-        self.owner = None;
+        self.clear_owner(true);
         self.released = true;
         self.retirement_ready = true;
-        self.released_at = now_ns();
         self.needs_fresh_backing = true;
         Ok(())
     }
@@ -2155,21 +2374,40 @@ impl Queue {
         }))
     }
     /// Installs fresh backing into a vacant pool; returns the descriptor row data
-    /// the caller writes before binding an owner.
+    /// the caller writes before binding an owner, plus any previous sibling descriptor
+    /// ring to drop off-lock.
     pub(crate) fn rearm(
         &mut self,
         pages: crate::g17::freelist::Pages,
         ring: DescriptorRing,
-    ) -> Result<PoolDescriptor> {
+    ) -> Result<(PoolDescriptor, Option<Vacated>)> {
         if !self.can_rearm() {
             return Err(EAGAIN);
         }
-        self.graph.rearm_ring(ring)?;
-        self.pool.rearm(pages)?;
+        let descriptors = self
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.descriptors.take());
+        let old_ring = self.graph.rearm_ring(ring);
+        if let Err(error) = self.pool.rearm(pages) {
+            if let Some(old) = old_ring {
+                let _ = self.graph.rearm_ring(old);
+            }
+            if let (Some(binding), Some(descriptors)) = (self.binding.as_mut(), descriptors) {
+                binding.descriptors = Some(descriptors);
+            }
+            return Err(error);
+        }
         self.pool_phase = PoolPhase::Populated;
         self.release_sent_ns = None;
         self.needs_fresh_backing = false;
-        self.pool.descriptor()
+        let vacated = (old_ring.is_some() || descriptors.is_some()).then_some(Vacated {
+            _alias: None,
+            _pages: None,
+            _descriptors: descriptors,
+            _ring: old_ring,
+        });
+        Ok((self.pool.descriptor()?, vacated))
     }
     pub(crate) fn pool_fits(&self, required: ComputeCapacity) -> bool {
         !self.growing && self.pool_phase == PoolPhase::Populated && self.pool.fits_capacity(required)
@@ -2277,6 +2515,30 @@ impl Queue {
             .any(|active| Arc::ptr_eq(&active.packet, packet))
     }
 
+    /// `packet` retired and its command only holds its descriptor (`Active::stamps_owed`).
+    pub(crate) fn retired_held(&self, packet: &Arc<Packet>) -> bool {
+        self.active
+            .iter()
+            .any(|active| active.stamps_owed && Arc::ptr_eq(&active.packet, packet))
+    }
+
+    /// The watchdog gave up on `packet`, the oldest command still to retire, and the firmware
+    /// wrote its completion record: end its stamp wait, so that the next pass retires it on the
+    /// record, its stamp owed, instead of the watchdog failing it. Not on M5, whose record can
+    /// precede the command's writes.
+    pub(crate) fn expire_stamp_wait(&mut self, packet: &Arc<Packet>) -> bool {
+        if self.quarantined || self.graph.m5 {
+            return false;
+        }
+        match self.active.iter_mut().find(|active| !active.stamps_owed) {
+            Some(head) if Arc::ptr_eq(&head.packet, packet) && head.observed.is_some() => {
+                head.observed_at = Some(retirement::STAMP_WAIT_EXPIRED);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
     ///
@@ -2380,15 +2642,42 @@ impl Queue {
         through: Option<u64>,
         recovery_state: u32,
     ) -> Result<Option<crate::g17::fw::kick::KickDependency>> {
+        self.dependency_checked(owner, status, through, recovery_state, false)
+    }
+
+    /// As [`Self::dependency`], additionally requiring every covered active kick to carry a
+    /// visible completion (`DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION`) when `require_visible` is set.
+    /// A covered kick without visible completion returns `EAGAIN` so the consumer waits for it
+    /// to retire on the host.
+    pub(crate) fn dependency_checked(
+        &self,
+        owner: u64,
+        status: &Arc<VmStatus>,
+        through: Option<u64>,
+        recovery_state: u32,
+        require_visible: bool,
+    ) -> Result<Option<crate::g17::fw::kick::KickDependency>> {
         if through.is_none() || self.owner != Some(owner) {
             return Ok(None);
         }
-        let Some(active) = self
+        let mut newest = None;
+        for active in self
             .active
             .iter()
             .filter(|a| crate::g17::job::Order::contains(through, a.packet.order.sequence))
-            .last()
-        else {
+        {
+            if require_visible {
+                let visible = matches!(
+                    &active.packet.command,
+                    crate::g17::command::Validated::Compute { visible_completion: true, .. }
+                );
+                if !visible {
+                    return Err(EAGAIN);
+                }
+            }
+            newest = Some(active);
+        }
+        let Some(active) = newest else {
             return Ok(None);
         };
         if self.quarantined && self.spared_quarantine {
@@ -2444,7 +2733,7 @@ impl Graph {
             (object, record_start(slot, offset, window, stride)?)
         } else {
             let start = record_start(0, offset, window, GRAPH_SIZE - 0x6800)?;
-            (&mut *self.graph, 0x6800 + start)
+            (&mut self.graph, 0x6800 + start)
         };
         if core::mem::size_of::<T>() > window {
             return Err(EINVAL);
@@ -2557,6 +2846,7 @@ impl Queue {
             cdm_end_va,
             sampler_heap_va,
             sampler_count,
+            attachments,
             ..
         } = &packet.command
         else {
@@ -2583,6 +2873,15 @@ impl Queue {
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
+        // The kick names the buffers the dispatch writes in an MCache table, as a fragment
+        // kick names its attachments.
+        let mcache_writes = if self.graph.mcache && !self.graph.m5 {
+            attachments.as_slice()
+        } else {
+            &[][..]
+        };
+        let mcache_context: u8 = packet.context.id().try_into()?;
+        let mcache = ComputeDescriptor::mcache_table(descriptor_low, mcache_writes.len())?;
         let first = self.ordinal == 0 && (self.graph.m5 || !self.installed);
         // The first prototype only waits on an installed consumer channel.
         // A retry without a published source falls back to completion on CPU.
@@ -2685,13 +2984,22 @@ impl Queue {
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let matrix_ops = self.graph.m5 && *requested_matrix_ops;
         let m5_board = if self.graph.m5 { Some(self.graph.board.ok_or(EINVAL)?) } else { None };
-        // Every earlier kick of this queue has retired, so the parent has completed.
+        // Each physical QID owns a single preemption/operand/usage/status/stamp set: only take the
+        // pipelined parent class once every earlier kick on this physical channel has retired.
+        // On multi-channel boards (M5 Pro), concurrency comes strictly from independent kicks
+        // running across distinct sibling QIDs because they carry no barrier on each other.
         let parent_retired = self.active.len == 0
             && self.replays.len == 0
             && !self.quarantined
             && !self.awaiting_witness;
         let parent_class = m5_board
             .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        let multi_channel = m5_board.is_some_and(crate::g17::fw::m5::compute::multi_channel);
+        let (m5_ordinal, m5_object_ids) = if multi_channel {
+            packet.context.next_compute_identity()
+        } else {
+            (self.ordinal, 0x0000_0001_0000_0001)
+        };
         let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
             let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
@@ -2703,7 +3011,7 @@ impl Queue {
                 preempt_va: addresses.preempt, cdm_va: *cdm_va, operand_va: addresses.operand,
                 usage_va: addresses.usage, free_list_slot: u32::from(self.pool.id()),
                 context_id: args.context_id, work_state: work_word,
-                object_ids: 0x0000_0001_0000_0001,
+                object_ids: m5_object_ids,
                 resource_policy: plan.map_or(0xf5_0040_0020, |p| u64::from(p.pressure) << 32 | 0x0040_0020),
                 preempt_state_offset: tuple.preempt_state_offset,
                 // The board's core layout sizes the operand state, as on G17P.
@@ -2718,13 +3026,15 @@ impl Queue {
             },
             common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
-            // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
-            submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
+            // M5 Pro's descriptors carry the shared context ordinal as both submit_sequence and
+            // completion_ordinal.
+            submit_sequence: if board.completion_inputs() { u64::from(m5_ordinal) } else { 0 },
             work_state_va: work_node,
             cdm_end_va: *cdm_end_va, stamp_va: [args.stamp_va, args.aux_stamp_va],
             stamp_value: crate::g17::fw::stamp_value(kick_timestamp.get() as u32), qid: u32::from(qid),
+            channel_index: if multi_channel { u32::from(self.channel_index) } else { 0 },
             kick_timestamp: kick_timestamp.get(),
-            completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, self.ordinal),
+            completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, m5_ordinal),
             status_va: args.status_va, timestamp_va: [timestamp_va, timestamp_va + 8],
             shared_control_va: self.pool.control_va(),
             event_metadata: crate::g17::fw::m5::compute::completion_forms(board).1,
@@ -2754,7 +3064,7 @@ impl Queue {
                 slot: identity.qos,
                 class: COMPUTE_QOS_CLASS,
             },
-            mcache: None,
+            mcache,
             event_mask: match m5_board {
                 Some(board) => crate::g17::fw::m5::compute::kick_event_mask(board, identity.context)?,
                 None => COMPUTE_KICK_EVENT_MASK,
@@ -2797,7 +3107,10 @@ impl Queue {
                 object.initialize::<crate::g17::fw::m5::compute::Descriptor>(offset,
                     |descriptor| descriptor.write_zeroed(m5_args))?;
             } else {
-                object.initialize::<ComputeDescriptor>(offset, |descriptor| descriptor.write_zeroed(&args))?;
+                object.initialize::<ComputeDescriptor>(offset, |descriptor| {
+                    descriptor.write_zeroed(&args)?;
+                    descriptor.write_mcache(mcache_writes, mcache_context)
+                })?;
             }
             if !self.graph.m5 && first {
                 self.graph.context_high.as_mut().ok_or(EINVAL)?.write(
@@ -2842,7 +3155,8 @@ impl Queue {
                 let target = self.pool.reserve_submission()?;
                 let qos = host.qos_publish(qos::Owner { qid, qos: identity.qos, data_master: 2 },
                     identity.scheduler, policy).or_else(|error| {
-                        self.pool.cancel_unpublished(target)?; Err(error)
+                        self.pool.cancel_unpublished(target)?;
+                        Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 // `cursors` is this publication's snapshot: no second read of the ring.
@@ -2960,7 +3274,9 @@ impl Queue {
                 None => self.graph.append(producer, announce_va, || {})?,
             };
             fence(Ordering::SeqCst);
-            if entry_signal && !self.graph.m5 {
+            // Only the first kick installs a predecessor record. A later kick that names another
+            // queue's kick depends on it through the kick entry alone.
+            if first && !self.graph.m5 {
                 let predecessor_va =
                     self.graph
                         .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
@@ -3016,13 +3332,34 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if self.graph.m5 {
-                // The firmware work notification must precede a deferred host
-                // doorbell: an idle-policy hold alone does not wake gated cores.
+                // macOS's order on this firmware: the host-port transaction, with core gating
+                // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
+                // doorbell can be served before the advance lands; the firmware then finds
+                // nothing new and goes idle, and the advance alone never wakes it, so the kick
+                // never runs. Held gating is what lets the advance land first: without the
+                // hold, gated cores did not take it.
                 host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
                     qid, self.kick.low_va(), policy.priority(),
                     first || notify_activation)?)?;
+            }
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            if !packet.cancel_requested() {
+                if let Some(dependency) =
+                    crate::g17::fw::kick::KickDependency::new(qid, kick_timestamp)
+                {
+                    packet.completion.note_source_published(
+                        crate::g17::fence::PublishedSource {
+                            epoch,
+                            published,
+                            dependency,
+                            readers: self.source_readers.clone(),
+                        },
+                    );
+                    if packet.cancel_requested() {
+                        packet.completion.clear_source_published();
+                    }
+                }
             }
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
@@ -3054,9 +3391,24 @@ impl Queue {
         self.configuration.take().ok_or(EIO)?.release();
         if self.ordinal == 0 && self.active.len == 0 && self.replays.len == 0 {
             self.retirement_ready = true;
-            if self.released { self.owner = None; }
+            if self.released { self.clear_owner(false); }
         }
         Ok(())
+    }
+
+    /// The installation and health state a timed-out publication reports (diagnostics):
+    /// whether the queue was installed, the item an M5 installation waits for the firmware to
+    /// consume and how far it got, an outstanding configuration, and quarantine.
+    pub(crate) fn admission_state(&self) -> AdmissionState {
+        AdmissionState {
+            installed: self.installed,
+            m5_install_end: self.m5_install,
+            consumer: self.graph.cursors().ok().map(|cursors| cursors.consumer),
+            configuration: self.configuration.is_some(),
+            ordinal: self.ordinal,
+            quarantined: self.quarantined,
+            awaiting_witness: self.awaiting_witness,
+        }
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
@@ -3096,6 +3448,21 @@ impl Queue {
             host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
                 self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
             self.outer_started = 1 << policy.priority();
+            // The queue's host-port configuration and validity go out before the installation's
+            // doorbell, so that the queue is configured when the firmware acts on it. A
+            // publication writes its host-port transaction after its doorbell, the work
+            // notification that wakes gated cores (see the publication path); as we understand
+            // it, that order matters for the advance the transaction ends with. The
+            // installation's transaction has no advance: its ring holds no kick yet, and the first
+            // publication configures the queue again with its kick. The configuration record is
+            // already visible, so a failed host-port write must not keep the doorbell back: the
+            // doorbell alone installs the queue, as it did before.
+            if let Err(error) = crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+                self.qid(), self.kick.low_va(), policy.priority(),
+            ).and_then(|submission| host.submit_m5(&submission)) {
+                pr_warn!("asahi: G17: M5 queue {} installs without its host-port configuration: {:?}\n",
+                    self.qid(), error);
+            }
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             Err(EAGAIN)
         })();
@@ -3339,6 +3706,25 @@ impl Queue {
         self.growing
     }
 
+    /// The host-port configuration of an installed M5 queue as its kicks last sent it (its kick
+    /// ring, at the priority class of its last publication), for a real wake to send again
+    /// before any doorbell: the configuration and validity only, no advance. None where the next
+    /// kick configures the queue anyway (it never kicked at any class, or was recycled since),
+    /// and off M5.
+    pub(crate) fn wake_configuration(
+        &self,
+    ) -> Result<Option<crate::g17::fw::m5::queue::HardwareSubmission>> {
+        if !self.graph.m5 || !self.installed || self.outer_started == 0 {
+            return Ok(None);
+        }
+        // On M5 a publication leaves exactly the bit of its own class (activation.rs).
+        let priority = self.outer_started.trailing_zeros() as u8;
+        crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+            self.qid(), self.kick.low_va(), priority,
+        )
+        .map(Some)
+    }
+
     /// The queue's first command has been published: its identity and configuration exist.
     pub(crate) fn installed(&self) -> bool {
         self.installed
@@ -3417,7 +3803,9 @@ impl Queue {
         {
             return Ok((false, None));
         }
+        self.clear_binding_note();
         if !self.installed {
+            self.clear_owner(false);
             return Ok((true, None));
         }
         let mut retired = None;
@@ -3439,9 +3827,14 @@ impl Queue {
         self.unpublished_binding = false;
         self.retirement_ready = true;
         self.released = true;
-        self.owner = None;
-        self.released_at = now_ns();
+        self.clear_owner(true);
         Ok((false, retired))
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.clear_binding_note();
     }
 }
 
@@ -3467,6 +3860,7 @@ impl Queue {
         source: &crate::g17::sync_input::Source,
         status: &Arc<VmStatus>,
         epoch: u64,
+        consumer: &crate::g17::context::Context,
     ) -> Result<Option<SourceDependency>> {
         for active in self.active.iter() {
             if !active.packet.completion.is_input_source(&source.submission) {
@@ -3499,6 +3893,7 @@ impl Queue {
                 self.graph.support.gpu_va() + STAMP as u64,
                 u32::from(self.qid()),
                 hold,
+                active.packet.context.shares_execution(consumer),
             )));
         }
         Ok(None)
@@ -3516,11 +3911,13 @@ impl Queue {
     }
 }
 
-/// Publication, dependency, stamp address, queue and the retained source hold.
+/// Publication, dependency, stamp address, queue, the retained source hold and whether the
+/// source shares the consumer's execution context.
 pub(crate) type SourceDependency = (
     u64,
     crate::g17::fw::kick::KickDependency,
     u64,
     u32,
     crate::g17::sync_input::Hold,
+    bool,
 );

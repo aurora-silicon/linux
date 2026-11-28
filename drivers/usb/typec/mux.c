@@ -10,6 +10,7 @@
 #include <linux/device.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
@@ -337,6 +338,34 @@ bool typec_mux_safe_after_role(struct typec_mux *mux)
 EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
 
 /**
+ * typec_mux_dp_joins_usb - Check whether DisplayPort pin D can join a running USB 3 link
+ * @mux: Mux handle
+ *
+ * The provider that owns the port's lanes says so (&typec_mux_desc.dp_joins_usb) when it
+ * adds DisplayPort pin D beside a USB 3 link it already runs and leaves that link's lanes
+ * as they are. The port's USB role then need not stop for that change. As with
+ * typec_mux_safe_after_role(), one provider's word holds for the whole port: the other
+ * providers of @mux must not touch the lanes.
+ *
+ * Return: true if a provider of @mux declared it.
+ */
+bool typec_mux_dp_joins_usb(struct typec_mux *mux)
+{
+	unsigned int i;
+
+	if (IS_ERR_OR_NULL(mux))
+		return false;
+
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		if (mux->mux_devs[i]->dp_joins_usb)
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(typec_mux_dp_joins_usb);
+
+/**
  * typec_mux_timeout_transient - Check whether a mux request timed out for now
  * @mux: Mux handle
  *
@@ -406,10 +435,14 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 	if (id && !fwnode_property_present(fwnode, id))
 		return NULL;
 
+	if (apple_j613_display_skip(fwnode, false))
+		return NULL;
+
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
 	if (!dev)
-		return typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
+		return !apple_j613_display_skip(fwnode, true) &&
+		       typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
 
 	/* Skip duplicates */
 	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)
@@ -720,6 +753,7 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	mux_dev->abort = desc->abort;
 	mux_dev->safe_after_role = desc->safe_after_role;
 	mux_dev->transient_timeouts = desc->transient_timeouts;
+	mux_dev->dp_joins_usb = desc->dp_joins_usb;
 
 	device_initialize(&mux_dev->dev);
 	mux_dev->dev.parent = parent;

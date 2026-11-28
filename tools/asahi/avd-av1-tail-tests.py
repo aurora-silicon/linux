@@ -15,7 +15,8 @@ DRIVER = Path('drivers/media/platform/apple/avd')
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:int|void|u64)\s+' + name + r'\(', source, re.M)
+    # The return type may sit on the line before the name.
+    match = re.search(r'^(?:static |VISIBLE_IF_KUNIT )?(?:int|void|u64|enum \w+|struct \w+ \*)\s+' + name + r'\(', source, re.M)
     if not match:
         raise ValueError(name)
     start = match.start()
@@ -55,6 +56,10 @@ typedef uint64_t dma_addr_t;
 #define WARN_ON(x) (x)
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 #define dev_err_ratelimited(...) ((void)0)
+#define VISIBLE_IF_KUNIT
+#define GFP_KERNEL 0
+struct device;
+enum avd_image_fmt { AVD_IMG_FMT_ANY, AVD_IMG_FMT_420_8BIT, AVD_IMG_FMT_420_10BIT };
 @ALIGNMENT@
 @CDF_HEADER@
 @CDF_DEFAULTS@
@@ -67,13 +72,25 @@ struct avd_decoded_buffer {
 struct avd_buf {void *cpu; dma_addr_t addr;};
 struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out; int setup_err;};
 @RUN_STRUCT@
+/* The preamble only uses the stream's copies of the controls. */
+struct avd_av1_stream {
+ struct {struct v4l2_ctrl_av1_sequence seq; struct v4l2_ctrl_av1_frame frame; struct v4l2_ctrl_av1_film_grain grain;} params;
+};
 @CTX_STRUCT@
-struct v4l2_ctrl {unsigned int elems; struct {void *p;} p_cur;};
+struct v4l2_ctrl {unsigned int elems, elem_size; struct {void *p;} p_cur;};
+static void v4l2_ctrl_lock(struct v4l2_ctrl *c){(void)c;}
+static void v4l2_ctrl_unlock(struct v4l2_ctrl *c){(void)c;}
+/* avd_av1_run() frees the run's copy; these tests only run the preamble. */
+static struct v4l2_ctrl_av1_tile_group_entry tile_copy[4];
+static void *kmemdup_array(const void *p,size_t n,size_t size,int f){(void)f;assert(n*size<=sizeof(tile_copy));memcpy(tile_copy,p,n*size);return tile_copy;}
+/* The run-time format check has its own KUnit suite (avd-fmt-test.c). */
+static int avd_check_run_image_fmt(void *ctx,enum avd_image_fmt f){(void)ctx;(void)f;return 0;}
+struct avd_dev {struct device *dev;};
 struct v4l2_pix_format_mplane {unsigned int width,height; struct {unsigned int sizeimage;} plane_fmt[1];};
-struct avd_ctx {void *priv; int ctrl_hdl; struct {struct {struct {unsigned int width,height;} pix_mp;} fmt;} decoded_fmt;};
+struct avd_ctx {struct avd_dev *dev; void *priv; int ctrl_hdl; struct {struct {struct {unsigned int width,height;} pix_mp;} fmt;} decoded_fmt;};
 static struct avd_decoded_buffer *reference;
 static struct v4l2_ctrl_av1_frame frame;
-static struct v4l2_ctrl_av1_sequence sequence;
+static struct v4l2_ctrl_av1_sequence sequence={.bit_depth=8,.flags=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X|V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y};
 static struct v4l2_ctrl_av1_tile_group_entry tile;
 static struct v4l2_ctrl_av1_film_grain grain;
 static struct v4l2_ctrl controls[4];
@@ -83,7 +100,9 @@ static unsigned long vb2_get_plane_payload(struct vb2_buffer *b,unsigned int p){
 static dma_addr_t vb2_dma_contig_plane_dma_addr(struct vb2_buffer *b,unsigned int p){assert(p==0);return b->dma;}
 static struct avd_decoded_buffer *vb2_to_avd_decoded_buf(struct vb2_buffer *b){return (void *)b;}
 static struct avd_decoded_buffer *avd_get_ref_buf(struct avd_ctx *ctx,struct vb2_v4l2_buffer *dst,uint64_t timestamp){(void)ctx;(void)dst;assert(timestamp==1000);lookup_calls++;return reference;}
-static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run){(void)ctx;(void)run;preamble_calls++;}
+/* Like the real one, this hands the run its OUTPUT buffer. */
+static struct vb2_v4l2_buffer fixture_src;
+static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run){(void)ctx;if(!run->bufs.src)run->bufs.src=&fixture_src;preamble_calls++;}
 static struct v4l2_ctrl *v4l2_ctrl_find(int *h,unsigned int id){
  (void)h;
  if(id==V4L2_CID_STATELESS_AV1_SEQUENCE)return &controls[0];
@@ -92,13 +111,17 @@ static struct v4l2_ctrl *v4l2_ctrl_find(int *h,unsigned int id){
  if(id==V4L2_CID_STATELESS_AV1_FILM_GRAIN)return &controls[3];
  return NULL;
 }
+static int avd_ctrl_copy(struct avd_ctx *ctx,unsigned int id,void *dst,size_t size){
+ struct v4l2_ctrl *c=v4l2_ctrl_find(&ctx->ctrl_hdl,id);if(!c)return -EINVAL;memcpy(dst,c->p_cur.p,size);return 0;}
 '''
 
 TESTS = r'''
 static size_t aligned_cdf(size_t length,size_t color){return (length&~255UL)-((color+255)&~255UL)-9216;}
 /* 3 bits per 4x4 block over 128x128 superblocks, 256-byte aligned. */
 static size_t seg_bytes(size_t w,size_t h){return ALIGN(ALIGN(w,128)*ALIGN(h,128)/128*3,256);}
-static void set_frame_ctx(struct avd_ctx *ctx){ctx->decoded_fmt.fmt.pix_mp.width=1920;ctx->decoded_fmt.fmt.pix_mp.height=1080;controls[0].p_cur.p=&sequence;controls[1].p_cur.p=&frame;controls[2].p_cur.p=&tile;controls[3].p_cur.p=&grain;}
+static struct avd_dev fixture_dev;
+static struct avd_av1_stream fixture_stream;
+static void set_frame_ctx(struct avd_ctx *ctx){ctx->dev=&fixture_dev;((struct avd_av1_ctx *)ctx->priv)->stream=&fixture_stream;ctx->decoded_fmt.fmt.pix_mp.width=1920;ctx->decoded_fmt.fmt.pix_mp.height=1080;controls[0].p_cur.p=&sequence;controls[1].p_cur.p=&frame;controls[2].p_cur.p=&tile;controls[3].p_cur.p=&grain;}
 static void read_exact(const char *path,void *data,size_t n){FILE *f=fopen(path,"rb");assert(f);assert(fread(data,1,n,f)==n);assert(fgetc(f)==EOF);assert(fclose(f)==0);}
 static void inheritance(unsigned int residue,unsigned int mode,const char *neighbors,bool check_addresses){
  const size_t ref_len=6964992+residue,dst_len=7000064+(residue?((residue+79)%256):0);
@@ -112,7 +135,7 @@ static void inheritance(unsigned int residue,unsigned int mode,const char *neigh
  avd_av1_default_coeff_probs(47,&expected);avd_av1_set_default_cdfs(&expected);
  if(neighbors){unsigned char observation[9728];read_exact(neighbors,observation,sizeof(observation));assert(residue==64);memcpy(src.base.vb.vb2_buf.memory+6817344,observation,sizeof(observation));memcpy(&expected,observation+192,sizeof(expected));}
  else {expected.intra_inter_cdf[0]^=37;expected.coeff_base_cdf[0][0][0][0]^=59;memcpy(src.base.vb.vb2_buf.memory+ref_offset,&expected,sizeof(expected));}
- memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.frame_height_minus_1=1079;frame.quantization.base_q_idx=47;
+ memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.quantization.base_q_idx=47;
  frame.frame_type=V4L2_AV1_INTER_FRAME;frame.primary_ref_frame=0;frame.ref_frame_idx[0]=0;frame.reference_frame_ts[0]=1000;
  if(mode){frame.frame_type=mode==1?V4L2_AV1_KEY_FRAME:mode==2?V4L2_AV1_INTRA_ONLY_FRAME:V4L2_AV1_INTER_FRAME;if(mode==3)frame.flags=V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE;if(mode==4)frame.primary_ref_frame=7;memset(&expected,0,sizeof(expected));avd_av1_default_coeff_probs(47,&expected);avd_av1_set_default_cdfs(&expected);}
  controls[0].p_cur.p=&sequence;controls[1].p_cur.p=&frame;controls[2].p_cur.p=&tile;controls[3].p_cur.p=&grain;
@@ -137,11 +160,11 @@ static void reservation(unsigned int width,unsigned int height,unsigned int comp
  assert(cdf%256==0&&co%256==0);assert(cdf>=compressed);assert(cdf+sizeof(struct avd_av1_cdfs)<=co);assert(co+color<=length);
  assert(cdf==aligned_cdf(length,color));assert(co==cdf+9216);
 }
-/* The preamble refuses frames larger than the format and out-of-range reference indices. */
+/* The preamble refuses frames larger than the format, out-of-range reference indices and sequences other than Main 4:2:0. */
 static int preamble(unsigned int w,unsigned int h,unsigned char primary,signed char idx){
  struct avd_decoded_buffer dst={0};struct avd_av1_ctx av1={0};struct avd_ctx ctx={.priv=&av1};struct avd_av1_run run={0};set_frame_ctx(&ctx);
  dst.base.vb.vb2_buf.planes[0].length=7000064;memset(&frame,0,sizeof(frame));
- frame.frame_width_minus_1=w-1;frame.frame_height_minus_1=h-1;frame.primary_ref_frame=primary;if(primary<7)frame.ref_frame_idx[primary]=idx;
+ frame.frame_width_minus_1=w-1;frame.upscaled_width=w;frame.frame_height_minus_1=h-1;frame.primary_ref_frame=primary;if(primary<7)frame.ref_frame_idx[primary]=idx;
  run.base.bufs.dst=&dst.base.vb;run.base.y_out=0x120000000UL;return avd_av1_run_preamble(&ctx,&run);
 }
 static void guards(void){
@@ -149,6 +172,10 @@ static void guards(void){
  assert(preamble(1921,1080,0,0)==-EINVAL);assert(preamble(1920,1081,0,0)==-EINVAL);
  assert(preamble(1920,1080,7,0)==0);assert(preamble(1920,1080,8,0)==-EINVAL);assert(preamble(1920,1080,255,0)==-EINVAL);
  assert(preamble(1920,1080,6,7)==0);assert(preamble(1920,1080,6,8)==-EINVAL);assert(preamble(1920,1080,0,-1)==-EINVAL);assert(preamble(1920,1080,3,-128)==-EINVAL);
+ /* A sequence stored while another codec was selected was never checked. */
+ sequence.seq_profile=1;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.seq_profile=0;
+ sequence.flags&=~V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+ assert(preamble(1920,1080,0,0)==0);
 }
 /* Segmentation map kept with each frame: expect 0 zeroes it, 1 copies the reference's, 2 leaves the AVD's map. */
 static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,unsigned int ref_h,bool missing,int expect){
@@ -161,7 +188,7 @@ static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,
  memset(dst.base.vb.vb2_buf.memory,0xa5,len);memset(src.base.vb.vb2_buf.memory,0x3c,ref_len);
  for(size_t i=0;i<ref_seg;i++)src.base.vb.vb2_buf.memory[roff+i]=(unsigned char)(i*7+1);
  reference=missing?&dst:&src;av1.bufs.no_prev_seg.addr=none;
- memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.frame_height_minus_1=1079;frame.frame_type=V4L2_AV1_INTER_FRAME;
+ memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.frame_type=V4L2_AV1_INTER_FRAME;
  frame.primary_ref_frame=primary;frame.ref_frame_idx[0]=0;frame.reference_frame_ts[0]=1000;frame.segmentation.flags=flags;
  run.base.bufs.dst=&dst.base.vb;run.base.y_out=dst.base.vb.vb2_buf.dma;
  assert(avd_av1_run_preamble(&ctx,&run)==0);assert(run.addresses.seg==run.base.y_out+off);
@@ -215,7 +242,7 @@ def main():
     text = {name: p.read_text() for name, p in paths.items()}
     src = text['avd-av1.c']
     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
-    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_copy_tile_group', 'avd_av1_seq_image_fmt', 'avd_av1_validate_sequence', 'avd_av1_check_frame_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.
@@ -225,7 +252,8 @@ def main():
         'seg-cpu-unaligned': ('avd_av1_set_seg', 'AVD_AV1_SEG_OFFSET(dst->', 'UNALIGNED_SEG_OFFSET(dst->'),
         'seg-any-size': ('avd_av1_set_seg', 'DIV_ROUND_UP(ref->av1.width + 1, 8)', 'DIV_ROUND_UP(frame->frame_width_minus_1 + 1, 8)'),
         'ref-index-upper': ('avd_av1_run_preamble', 'idx < 0 || idx >= V4L2_AV1_TOTAL_REFS_PER_FRAME', 'idx < 0'),
-        'frame-width-unchecked': ('avd_av1_run_preamble', 'run->frame->frame_width_minus_1 + 1 > ctx->decoded_fmt.fmt.pix_mp.width ||', '0 ||'),
+        # The upscaled width bound also covers the frame width, so drop the frame size check as a whole.
+        'frame-width-unchecked': ('avd_av1_check_frame_size', 'frame->frame_width_minus_1 >= width ||\n\t    frame->frame_height_minus_1 >= height', '0'),
     }
     if args.mutation:
         target, old, new = mutations[args.mutation]

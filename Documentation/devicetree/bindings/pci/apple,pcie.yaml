@@ -46,6 +46,18 @@ $defs:
         - description: Bits to set
     description: Register initialization tuples for one controller region.
 
+  endpoint-smc-writes:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 4
+    items:
+      items:
+        - description: The SMC key
+        - description: The first four bytes written, most significant first
+        - description: The last four bytes written, most significant first
+        - description: The wait after the write, in microseconds
+    description: SMC writes, in order.
+
   t6050-tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
@@ -89,6 +101,8 @@ properties:
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
       - const: apple,t6050-pciec
+      - const: apple,t8142-pciec
+      - const: apple,t8152-pciec
       - items:
           - const: apple,t8132-pciec
           - const: apple,t8122-pciec
@@ -242,6 +256,13 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      clkreq-gpios:
+        description:
+          The endpoint's CLKREQ# line. After a deep sleep has reset the pin
+          controller, the host returns the pin to an input before it trains
+          the link again.
+        maxItems: 1
+
       interrupt-controller: true
 
       apple,link-trained-by-bootloader:
@@ -256,6 +277,77 @@ patternProperties:
       apple,tunable:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
+
+      apple,apcie-config-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 tunables for this port's registers. The OS applies them when
+          it brings the port up itself (pwren-gpios) or restarts an adopted
+          port, before it lets the port out of reset.
+
+      apple,pcie-rc-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 tunables for this port's root complex configuration space,
+          applied right after apple,apcie-config-tunables.
+
+      apple,pcie-rc-gen3-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen3 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
+      apple,pcie-rc-gen4-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen4 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
+      apple,pcie-rc-gen5-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen5 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
+      apple,function-warm-reset:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        items:
+          - items:
+              - description: The SMC
+              - description: The SMC key that resets the endpoint
+              - description: The function's argument, as the firmware gives it
+        description:
+          The endpoint's warm reset. An endpoint whose firmware does not
+          survive a firmware sleep is reset with it after the wake, while
+          the port is still down, and boots again once the link is up.
+
+      apple,warm-reset-writes:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        minItems: 1
+        maxItems: 4
+        items:
+          items:
+            - description:
+                The four bytes written to the warm reset's key, from the
+                cell's most significant byte down
+            - description: The wait after the write, in microseconds
+              maximum: 100000
+        description:
+          The writes that give the warm reset, in order. Set by the
+          bootloader; without it the host gives no warm reset.
+
+      apple,endpoint-sleep-smc-writes:
+        $ref: '#/$defs/endpoint-smc-writes'
+        description:
+          Written by the endpoint's driver to the warm reset's SMC once the
+          endpoint is released for a firmware sleep. Set by the bootloader.
+
+      apple,endpoint-wake-smc-writes:
+        $ref: '#/$defs/endpoint-smc-writes'
+        description:
+          Written by the endpoint's driver to the warm reset's SMC after the
+          wake, before the endpoint is enumerated again. Set by the
+          bootloader.
 
     required:
       - interrupt-controller
@@ -284,6 +376,8 @@ allOf:
           contains:
             enum:
               - apple,t8132-pciec
+              - apple,t8142-pciec
+              - apple,t8152-pciec
               - apple,t6040-pciec
     then:
       required:
@@ -366,6 +460,11 @@ allOf:
         "^pci@":
           properties:
             apple,link-trained-by-bootloader: false
+            apple,apcie-config-tunables: false
+            apple,pcie-rc-tunables: false
+            apple,pcie-rc-gen3-shadow-tunables: false
+            apple,pcie-rc-gen4-shadow-tunables: false
+            apple,pcie-rc-gen5-shadow-tunables: false
   - if:
       properties:
         compatible:
@@ -406,6 +505,8 @@ allOf:
               - apple,t6000-pciec
               - apple,t6040-pciec
               - apple,t6050-pciec
+              - apple,t8142-pciec
+              - apple,t8152-pciec
     then:
       properties:
         reg:
@@ -559,22 +660,85 @@ allOf:
                   interrupts:
                     maxItems: 3
               else:
-                properties:
-                  reg:
-                    maxItems: 10
-                  reg-names:
-                    minItems: 3
-                    items:
-                      - const: config
-                      - const: rc
-                      - const: port0
-                      - const: port1
-                      - const: port2
-                      - const: port3
-                      - const: phy0
-                      - const: phy1
-                      - const: phy2
-                      - const: phy3
+                if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8132-pcie
+                then:
+                  properties:
+                    reg:
+                      minItems: 4
+                      maxItems: 9
+                    reg-names:
+                      oneOf:
+                        - minItems: 4
+                          items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: axi2af
+                            - const: cio3pll
+                            - const: clkgen
+                            - const: phy-block
+                            - const: phy-ip
+                        # A board that uses the third port lists it instead.
+                        - items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: port2
+                            - const: phy2
+                    interrupts:
+                      maxItems: 3
+                else:
+                  if:
+                    properties:
+                      compatible:
+                        contains:
+                          const: apple,t6041-pcie
+                  then:
+                    properties:
+                      reg:
+                        minItems: 10
+                        maxItems: 15
+                      reg-names:
+                        minItems: 10
+                        items:
+                          - const: config
+                          - const: rc
+                          - const: port0
+                          - const: port1
+                          - const: port2
+                          - const: port3
+                          - const: phy0
+                          - const: phy1
+                          - const: phy2
+                          - const: phy3
+                          - const: axi2af
+                          - const: cio3pll
+                          - const: clkgen
+                          - const: phy-block
+                          - const: phy-ip
+                  else:
+                    properties:
+                      reg:
+                        maxItems: 10
+                      reg-names:
+                        minItems: 3
+                        items:
+                          - const: config
+                          - const: rc
+                          - const: port0
+                          - const: port1
+                          - const: port2
+                          - const: port3
+                          - const: phy0
+                          - const: phy1
+                          - const: phy2
+                          - const: phy3
       patternProperties:
         "^pci@":
           properties:

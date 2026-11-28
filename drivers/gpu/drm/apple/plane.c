@@ -3,10 +3,14 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <drm/drm_atomic_uapi.h>
+
 #include "plane.h"
 #include "dcp.h"
 
+#include "dcp.h"
 #include "dcp-internal.h"
+#include "dcp-indicator.h"
 #include "iomfb_internal.h"
 
 #include "iomfb_plane.h"
@@ -235,12 +239,67 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 
 	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
 
+	if (to_apple_plane(plane)->indicator) {
+		struct drm_plane_state *old = drm_atomic_get_old_plane_state(commit, plane);
+		struct drm_crtc_state *old_crtc_new = old->crtc ?
+			drm_atomic_get_new_crtc_state(commit, old->crtc) : NULL;
+
+		switch (dcp_ind_plane_check(old, new_plane_state, old_crtc_new,
+					    commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
+					    &dcp_indicator_fb_funcs)) {
+		case DCP_IND_PLANE_REJECT:
+			return -EINVAL;
+		case DCP_IND_PLANE_RESTORE: {
+			int ret = drm_atomic_set_crtc_for_plane(new_plane_state, old->crtc);
+
+			if (ret)
+				return ret;
+			drm_atomic_set_fb_for_plane(new_plane_state, old->fb);
+			new_plane_state->crtc_x = old->crtc_x;
+			new_plane_state->crtc_y = old->crtc_y;
+			new_plane_state->crtc_w = old->crtc_w;
+			new_plane_state->crtc_h = old->crtc_h;
+			new_plane_state->src_x = old->src_x;
+			new_plane_state->src_y = old->src_y;
+			new_plane_state->src_w = old->src_w;
+			new_plane_state->src_h = old->src_h;
+			new_plane_state->alpha = old->alpha;
+			new_plane_state->pixel_blend_mode = old->pixel_blend_mode;
+			new_plane_state->rotation = old->rotation;
+			break;
+		}
+		case DCP_IND_PLANE_PASS:
+			break;
+		}
+	}
+
 	if (!new_plane_state->crtc)
 		return 0;
 
 	crtc_state = drm_atomic_get_crtc_state(commit, new_plane_state->crtc);
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
+
+	{
+		struct platform_device *pdev = to_apple_crtc(new_plane_state->crtc)->dcp;
+		struct apple_dcp *target = pdev ? platform_get_drvdata(pdev) : NULL;
+		struct drm_framebuffer *fb = new_plane_state->fb;
+
+		if (target && dcp_is_ext26(target) && fb && !iomfb_ext26_backing_fresh(target, fb))
+			return -EINVAL;
+		if (target && dcp_is_ext26(target) && fb &&
+		    (plane->type != DRM_PLANE_TYPE_PRIMARY || fb->format->format != DRM_FORMAT_XRGB8888 ||
+		     fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->offsets[0] ||
+		     crtc_state->vrr_enabled || new_plane_state->rotation != DRM_MODE_ROTATE_0 ||
+		     new_plane_state->src_x || new_plane_state->src_y ||
+		     new_plane_state->src_w != ((u32)crtc_state->mode.hdisplay << 16) ||
+		     new_plane_state->src_h != ((u32)crtc_state->mode.vdisplay << 16) ||
+		     new_plane_state->crtc_x || new_plane_state->crtc_y ||
+		     new_plane_state->crtc_w != crtc_state->mode.hdisplay ||
+		     new_plane_state->crtc_h != crtc_state->mode.vdisplay ||
+		     fb->width != crtc_state->mode.hdisplay || fb->height != crtc_state->mode.vdisplay))
+			return -EINVAL;
+	}
 
 	/*
 	 * DCP limits downscaling to 2x and upscaling to 4x. Attempting to
@@ -437,13 +496,13 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	/*
-	 * DCP doesn't support XBGR8 / XRGB8 / XBGR2101010 natively. Blending as
+	 * DCP doesn't support XBGR8 / XRGB8 / XRGB2101010 natively. Blending as
 	 * pre-multiplied alpha with a black background can be used as
 	 * workaround for the bottommost plane.
 	 */
 	if (fmt->format == DRM_FORMAT_XRGB8888 ||
 	    fmt->format == DRM_FORMAT_XBGR8888 ||
-	    fmt->format == DRM_FORMAT_XBGR2101010 ||
+	    fmt->format == DRM_FORMAT_XRGB2101010 ||
 	    base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
 		is_premultiplied = true;
 
@@ -596,7 +655,7 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 // Duplicate drm_atomic_helper_plane_reset but allocate struct apple_plane_state
 static void apple_plane_reset(struct drm_plane *plane)
 {
-        struct apple_plane_state *state = to_apple_plane_state(plane->state);
+	struct apple_plane_state *state = to_apple_plane_state(plane->state);
 	if (state) {
 		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
@@ -612,17 +671,17 @@ static void apple_plane_reset(struct drm_plane *plane)
 static struct drm_plane_state *
 apple_plane_duplicate_state(struct drm_plane *plane)
 {
-        struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
+	struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
 
 	if (!plane->state)
 		return NULL;
 
-        old_apple_plane_state = to_apple_plane_state(plane->state);
-        apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
-        if (!apple_plane_state)
-                return NULL;
+	old_apple_plane_state = to_apple_plane_state(plane->state);
+	apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
+	if (!apple_plane_state)
+		return NULL;
 
-        __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
+	__drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
 	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
@@ -769,8 +828,9 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool xrgb_is_alpha,
 				   enum drm_plane_type type,
 				   bool interchange,
-				   bool premultiplied)
+				   bool premultiplied, bool native26)
 {
+	static const u32 native_formats[] = { DRM_FORMAT_XRGB8888 };
 	struct apple_plane *plane;
 	unsigned int blend_modes;
 	const u32 *fmts;
@@ -779,7 +839,10 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (xrgb_is_alpha) {
+		if (native26) {
+			fmts = native_formats;
+			num_fmts = ARRAY_SIZE(native_formats);
+		} else if (xrgb_is_alpha) {
 			/*
 			 * The firmware blends the X byte as alpha and ignores the
 			 * opaque-X property: offer only formats with alpha, so that

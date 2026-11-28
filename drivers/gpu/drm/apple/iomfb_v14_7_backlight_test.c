@@ -122,41 +122,71 @@ static bool v14_bl_ctx_machine_is(const void *ctx, const char *compat)
 	return !strcmp(((const char *const *)ctx)[1], compat);
 }
 
-/* Only admitted T6030, J516C and J613 internal panels carry levels. */
+/* The DCP's panel node compatible; NULL: no panel node. */
+static bool v14_bl_ctx_panel_is(const void *ctx, const char *compat)
+{
+	const char *panel = ((const char *const *)ctx)[2];
+
+	return panel && !strcmp(panel, compat);
+}
+
+/* Only admitted T6030, J516C and J613 internal panels and the J504 panel carry levels. */
 static void v14_bl_boards(struct kunit *test)
 {
-	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s" };
-	static const char *const t6030_j514s[] = { "apple,t6030-dcp", "apple,j514s" };
-	static const char *const j613[] = { "apple,t8122-dcp", "apple,j613" };
-	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615" };
-	static const char *const j516c[] = { "apple,t6031-dcp", "apple,j516c" };
-	static const char *const other_t6030[] = { "apple,t6030-dcp", "apple,other" };
+	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s", NULL };
+	static const char *const t6030_j514s[] = { "apple,t6030-dcp", "apple,j514s", NULL };
+	static const char *const j613[] = { "apple,t8122-dcp", "apple,j613", NULL };
+	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615", "apple,panel-j615" };
+	static const char *const j615_no_panel[] = { "apple,t8122-dcp", "apple,j615", NULL };
+	static const char *const j504[] = { "apple,t8122-dcp", "apple,j504", "apple,panel-j504" };
+	static const char *const j504_no_panel[] = { "apple,t8122-dcp", "apple,j504", NULL };
+	static const char *const j516c[] = { "apple,t6031-dcp", "apple,j516c", NULL };
+	static const char *const other_t6030[] = { "apple,t6030-dcp", "apple,other", NULL };
 	const struct dcp_v14_board *board;
 	bool known;
 
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j516s, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     t6030_j516s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							 t6030_j516s));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j514s, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     t6030_j514s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							 t6030_j514s));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, other_t6030, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     other_t6030, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							  other_t6030));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j613, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j613, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j613));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j615));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j615, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j615, &known);
+	KUNIT_ASSERT_PTR_EQ(test, board, &dcp_v14_board_j615);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j615));
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j615_no_panel, &known);
+	KUNIT_EXPECT_NULL(test, board);
+	KUNIT_EXPECT_TRUE(test, known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j504, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
-	KUNIT_EXPECT_FALSE(test, board->panel_nits);
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j516c, &known);
+	KUNIT_EXPECT_TRUE(test, board->panel_nits);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j504));
+	/* The J504 record follows its panel node: without it the machine gets none. */
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j504_no_panel, &known);
+	KUNIT_EXPECT_NULL(test, board);
+	KUNIT_EXPECT_TRUE(test, known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j516c, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j516c));
@@ -348,13 +378,13 @@ static bool v14_bl_queued(struct apple_dcp_v14 *v14)
 }
 
 /*
- * The production paths on J615 and J514C: no policy is consulted, no
+ * The production paths on J514C: no policy is consulted, no
  * level is encoded, the work does nothing, sleep leaves the gate alone.
  */
 static void v14_bl_other_boards_untouched(struct kunit *test)
 {
 	const struct dcp_v14_board *boards[] = {
-		&dcp_v14_board_j615, &dcp_v14_board_j514c,
+		&dcp_v14_board_j514c,
 	};
 	struct dcp_backlight_present present;
 	unsigned int i;
@@ -472,6 +502,11 @@ static void v14_bl_t6030_swap_levels(struct kunit *test)
 	v14_bl_swap_levels(test, &dcp_v14_board_t6030);
 }
 
+static void v14_bl_j615_swap_levels(struct kunit *test)
+{
+	v14_bl_swap_levels(test, &dcp_v14_board_j615);
+}
+
 static void v14_bl_j613_swap_levels(struct kunit *test)
 {
 	v14_bl_swap_levels(test, &dcp_v14_board_j613);
@@ -554,6 +589,25 @@ static void v14_bl_t6030_work(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_backlight_pending(f.dcp));
 }
 
+/*
+ * A present without a surface cannot apply a new level: it carries the last
+ * completed one and reserves nothing, so it is still sent, and the request
+ * waits for the next present with a surface.
+ */
+static void v14_bl_surfaceless_present(struct kunit *test)
+{
+	struct v14_bl_fixture f = v14_bl_fixture(test, &dcp_v14_board_t6030, true);
+	struct dcp_backlight_present p = { .nits = U32_MAX };
+
+	v14_bl_request(test, f.dcp, 250);
+	KUNIT_EXPECT_EQ(test, dcp_backlight_prepare(f.dcp, false, &p), -EALREADY);
+	KUNIT_EXPECT_EQ(test, p.nits, DCP_V14_NITS_DEFAULT);
+	KUNIT_EXPECT_TRUE(test, f.dcp->backlight.state.dirty);
+	KUNIT_EXPECT_FALSE(test, f.dcp->backlight.state.in_flight);
+	KUNIT_ASSERT_EQ(test, dcp_backlight_prepare(f.dcp, true, &p), 0);
+	KUNIT_EXPECT_EQ(test, p.nits, 250U);
+}
+
 static struct kunit_case v14_backlight_cases[] = {
 	KUNIT_CASE(v14_bl_binary64),
 	KUNIT_CASE(v14_bl_level_block),
@@ -562,10 +616,12 @@ static struct kunit_case v14_backlight_cases[] = {
 	KUNIT_CASE(v14_bl_gate_transitions),
 	KUNIT_CASE(v14_bl_plan),
 	KUNIT_CASE(v14_bl_policy),
+	KUNIT_CASE(v14_bl_surfaceless_present),
 	KUNIT_CASE(v14_bl_other_boards_untouched),
 	KUNIT_CASE(v14_bl_external_untouched),
 	KUNIT_CASE(v14_bl_t6030_swap_levels),
 	KUNIT_CASE(v14_bl_j613_swap_levels),
+	KUNIT_CASE(v14_bl_j615_swap_levels),
 	KUNIT_CASE(v14_bl_t6030_gate),
 	KUNIT_CASE(v14_bl_t6030_work),
 	{}

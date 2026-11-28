@@ -8,6 +8,7 @@
 #include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -226,6 +227,9 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_MIN_SHARED_VERSION		5
 #define BRCMF_PCIE_MAX_SHARED_VERSION		BRCMF_PCIE_SHARED_VERSION_7
 #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
+#define BRCMF_PCIE_SHARED_ASSERT_BUILT		0x0100
+#define BRCMF_PCIE_SHARED_ASSERT		0x0200
+#define BRCMF_PCIE_SHARED_TRAP			0x0400
 #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
 #define BRCMF_PCIE_SHARED_USE_MAILBOX		0x2000000
@@ -286,6 +290,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_HOSTCAP2_DURATION_SCALE_MASK	0x3F
 
 #define BRCMF_SHARED_FLAGS_OFFSET		0
+#define BRCMF_SHARED_TRAP_ADDR_OFFSET		4
 #define BRCMF_SHARED_MAX_RXBUFPOST_OFFSET	34
 #define BRCMF_SHARED_RING_BASE_OFFSET		52
 #define BRCMF_SHARED_RX_DATAOFFSET_OFFSET	36
@@ -302,6 +307,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_SHARED_FLAGS3_OFFSET		108
 #define BRCMF_SHARED_HOST_CAP2_OFFSET		112
 #define BRCMF_SHARED_HOST_CAP3_OFFSET		116
+/* The end of the last shared RAM field the driver reads or writes */
+#define BRCMF_SHARED_SIZE			(BRCMF_SHARED_HOST_CAP2_OFFSET + 4)
 
 #define BRCMF_RING_H2D_RING_COUNT_OFFSET	0
 #define BRCMF_RING_D2H_RING_COUNT_OFFSET	1
@@ -335,6 +342,12 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 
+/* Stalled control requests in a row before a silent dongle counts as dead. */
+#define BRCMF_PCIE_CTL_STALL_MAX		3
+/* Firmware recoveries allowed per window before the driver gives up. */
+#define BRCMF_PCIE_RECOVERY_MAX			5
+#define BRCMF_PCIE_RECOVERY_WINDOW_S		600
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -362,6 +375,9 @@ struct brcmf_pcie_console {
 	u32 read_idx;
 	u8 log_str[256];
 	u8 log_idx;
+	u32 scan_idx;
+	u8 scan_line[8];
+	u8 scan_len;
 };
 
 struct brcmf_pcie_shared_info {
@@ -399,6 +415,10 @@ struct brcmf_otp_params {
 
 struct brcmf_pciedev_info {
 	enum brcmf_pcie_state state;
+	/* Published only after the asynchronous firmware setup has completed. */
+	bool setup_complete;
+	/* This binding blocked reset work for the active radio transaction. */
+	bool sleep_reset_blocked;
 	bool in_irq;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
@@ -411,6 +431,7 @@ struct brcmf_pciedev_info {
 	const struct brcmf_pcie_reginfo *reginfo;
 	void __iomem *regs;
 	void __iomem *tcm;
+	size_t tcm_size;
 	u32 fw_size;
 	bool skip_reset_vector;
 	struct brcmf_chip *ci;
@@ -425,6 +446,7 @@ struct brcmf_pciedev_info {
 	bool wowl_irq;
 	bool irq_wake_enabled;
 	bool wowl_sleeping;
+	bool s2idle_d0;
 	bool wakeup_created;
 	bool wakeup_capable;
 	u8 dma_idx_sz;
@@ -437,6 +459,11 @@ struct brcmf_pciedev_info {
 	struct brcmf_mp_device *settings;
 	struct brcmf_otp_params otp;
 	bool fwseed;
+	bool fw_dead;
+	/* A firmware death asked for a reset that has not run yet. */
+	bool reset_wanted;
+	u32 recoveries;
+	unsigned long recovery_window;
 #ifdef DEBUG
 	u32 console_interval;
 	bool console_active;
@@ -755,12 +782,36 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 		BRCMF_PCIE_CFGREG_REG_BAR2_CONFIG,
 		BRCMF_PCIE_CFGREG_REG_BAR3_CONFIG
 	};
+	bool fn_reset = false;
+	bool saved = false;
 	u32 i;
 	u32 val;
 	u32 lsc;
 
 	if (!devinfo->ci)
 		return;
+
+	/*
+	 * On chipcommon rev >= 65 the watchdog below also resets PCIe function
+	 * 0 (CC_WD_SSRESET_PCIE_F0_EN), which puts its config space back to the
+	 * chip defaults: e.g. the resizable BAR 2 drops from the size the PCI
+	 * core assigned to 8 MiB. Save what the PCI core programmed, before
+	 * ASPM is turned off for the reset, so it can be put back afterwards.
+	 * Older chips keep their config space, so save nothing there: a saved
+	 * state left behind would stand in for the live one at the next
+	 * suspend.
+	 */
+	core = brcmf_chip_get_chipcommon(devinfo->ci);
+	if (core->rev >= 65) {
+		int err = pci_save_state(devinfo->pdev);
+
+		if (err) {
+			pci_err(devinfo->pdev, "failed to save PCI state: %d\n", err);
+			devinfo->pdev->state_saved = false;
+		} else {
+			saved = true;
+		}
+	}
 
 	/* Disable ASPM */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
@@ -776,6 +827,8 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 
 	if (core->rev >= 65) {
 		u32 mask = CC_WD_SSRESET_PCIE_F0_EN;
+
+		fn_reset = true;
 
 		core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 		if (core->rev < 66)
@@ -801,6 +854,16 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 	pci_write_config_dword(devinfo->pdev, BRCMF_PCIE_REG_LINK_STATUS_CTRL,
 			       lsc);
+
+	/*
+	 * Put the PCI core's configuration back. Otherwise the function runs
+	 * with the reset defaults while the core still holds the assigned
+	 * values, and the next pci_restore_state() (system resume) rewrites
+	 * them on a live, bus-mastering function: BAR 2 changes size under
+	 * running firmware. Only a state saved above is put back.
+	 */
+	if (fn_reset && saved)
+		pci_restore_state(devinfo->pdev);
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 	if (core->rev <= 13) {
@@ -932,6 +995,127 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	return 0;
 }
 
+/*
+ * The dongle firmware is dead: a halt notice, a trap or assert recorded in
+ * shared RAM or on its console, or a control ring that stopped moving. Stop
+ * using it and reset the chip the way the debugfs "reset" entry does, which
+ * reloads the firmware and registers the interfaces again. A firmware that
+ * keeps dying is left alone after BRCMF_PCIE_RECOVERY_MAX resets in
+ * BRCMF_PCIE_RECOVERY_WINDOW_S seconds.
+ */
+static void brcmf_pcie_fw_died(struct brcmf_pciedev_info *devinfo,
+			       const char *reason)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+
+	if (xchg(&devinfo->fw_dead, true))
+		return;
+
+	if (!devinfo->recoveries ||
+	    time_after(jiffies, devinfo->recovery_window +
+				BRCMF_PCIE_RECOVERY_WINDOW_S * HZ)) {
+		devinfo->recovery_window = jiffies;
+		devinfo->recoveries = 0;
+	}
+	if (++devinfo->recoveries > BRCMF_PCIE_RECOVERY_MAX) {
+		brcmf_err(bus, "firmware died (%s), %d resets in %d s, not resetting again\n",
+			  reason, BRCMF_PCIE_RECOVERY_MAX,
+			  BRCMF_PCIE_RECOVERY_WINDOW_S);
+		return;
+	}
+
+	brcmf_err(bus, "firmware died (%s), resetting the chip (%u/%u)\n",
+		  reason, devinfo->recoveries, (u32)BRCMF_PCIE_RECOVERY_MAX);
+	/* Fail further firmware commands at once instead of timing out. */
+	if (bus)
+		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	WRITE_ONCE(devinfo->reset_wanted, true);
+	brcmf_fw_crashed(dev);
+}
+
+/*
+ * Look for a trap the firmware printed on its console since the last scan.
+ * Its trap handler starts the report with a line beginning "TRAP ".
+ */
+static bool brcmf_pcie_console_trapped(struct brcmf_pciedev_info *devinfo)
+{
+	struct brcmf_pcie_console *console = &devinfo->shared.console;
+	static const char marker[] = "TRAP ";
+	bool trapped = false;
+	u32 widx;
+	u8 ch;
+
+	if (!console->base_addr || !console->bufsize)
+		return false;
+	widx = brcmf_pcie_read_tcm32(devinfo, console->base_addr +
+				     BRCMF_CONSOLE_WRITEIDX_OFFSET);
+	if (widx >= console->bufsize || console->scan_idx >= console->bufsize)
+		return false;
+
+	while (console->scan_idx != widx) {
+		ch = brcmf_pcie_read_tcm8(devinfo,
+					  console->buf_addr + console->scan_idx);
+		if (++console->scan_idx == console->bufsize)
+			console->scan_idx = 0;
+		if (ch == '\n') {
+			console->scan_len = 0;
+			continue;
+		}
+		if (console->scan_len >= sizeof(marker) - 1)
+			continue;
+		if (ch != marker[console->scan_len]) {
+			/* Not at a line start any more: skip to the newline. */
+			console->scan_len = sizeof(marker) - 1;
+			continue;
+		}
+		if (++console->scan_len == sizeof(marker) - 1)
+			trapped = true;
+	}
+
+	return trapped;
+}
+
+static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct brcmf_pcie_shared_info *shared = &devinfo->shared;
+	const char *reason = NULL;
+	u32 flags, addr;
+
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP || READ_ONCE(devinfo->fw_dead))
+		return;
+
+	flags = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+				      BRCMF_SHARED_FLAGS_OFFSET);
+	if (flags == ~0U) {
+		reason = "device not responding";
+	} else if (flags & BRCMF_PCIE_SHARED_TRAP) {
+		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
+		/* trap type, then the exception pc */
+		if (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))
+			brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+				  brcmf_pcie_read_tcm32(devinfo, addr),
+				  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		else
+			brcmf_err(bus, "firmware trap record at 0x%08x is outside the TCM\n",
+				  addr);
+		reason = "trap in shared RAM";
+	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
+		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
+		reason = "assert in shared RAM";
+	} else if (brcmf_pcie_console_trapped(devinfo)) {
+		reason = "trap on the firmware console";
+	} else if (stalls >= BRCMF_PCIE_CTL_STALL_MAX) {
+		reason = "no response to control requests";
+	}
+
+	if (reason)
+		brcmf_pcie_fw_died(devinfo, reason);
+}
+
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
 {
 	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
@@ -949,7 +1133,7 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 	}
 	if (data & BRCMF_D2H_DEV_FWHALT) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
-		brcmf_fw_crashed(&devinfo->pdev->dev);
+		brcmf_pcie_fw_died(devinfo, "firmware halt notice");
 	}
 }
 
@@ -992,11 +1176,33 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console = &shared->console;
 	addr = shared->tcm_base_address + BRCMF_SHARED_CONSOLE_ADDR_OFFSET;
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->bufsize = 0;
+	console->read_idx = 0;
+	console->log_idx = 0;
+	console->scan_idx = 0;
+	console->scan_len = 0;
+	if (!console->base_addr ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
+					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
+		console->base_addr = 0;
+		return;
+	}
 
 	addr = console->base_addr + BRCMF_CONSOLE_BUFADDR_OFFSET;
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (!console->bufsize ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,
+					console->bufsize)) {
+		console->base_addr = 0;
+		console->bufsize = 0;
+		return;
+	}
+	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
+	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (console->scan_idx >= console->bufsize)
+		console->scan_idx = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
@@ -1026,6 +1232,8 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		return;
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	newidx = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (newidx >= console->bufsize || console->read_idx >= console->bufsize)
+		return;
 	while (newidx != console->read_idx) {
 		addr = console->buf_addr + console->read_idx;
 		ch = brcmf_pcie_read_tcm8(devinfo, addr);
@@ -1142,6 +1350,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_intr_disable(devinfo);
 	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_s2idle_only = false;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1176,6 +1385,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1207,6 +1417,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -1287,11 +1498,20 @@ static int brcmf_pcie_ring_mb_update_rptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->r_ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: r_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->r_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R r_ptr %d (%d), ring %d\n", commonring->r_ptr,
 		  commonring->w_ptr, ring->id);
@@ -1305,11 +1525,20 @@ static int brcmf_pcie_ring_mb_update_wptr(void *ctx)
 	struct brcmf_pcie_ringbuf *ring = (struct brcmf_pcie_ringbuf *)ctx;
 	struct brcmf_pciedev_info *devinfo = ring->devinfo;
 	struct brcmf_commonring *commonring = &ring->commonring;
+	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
-	commonring->w_ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	/* The dongle's index is only used inside the ring; keep the last good one */
+	ptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);
+	if (ptr >= commonring->depth) {
+		brcmf_err(dev_get_drvdata(&devinfo->pdev->dev),
+			  "ring %d: w_ptr %u outside depth %u\n", ring->id, ptr,
+			  commonring->depth);
+		return -EIO;
+	}
+	commonring->w_ptr = ptr;
 
 	brcmf_dbg(PCIE, "R w_ptr %d (%d), ring %d\n", commonring->w_ptr,
 		  commonring->r_ptr, ring->id);
@@ -1438,6 +1667,8 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 	u32 h2d_w_idx_ptr;
 	u32 h2d_r_idx_ptr;
 	u32 ring_mem_ptr;
+	u32 h2d_idx_len;
+	u32 d2h_idx_len;
 	u32 i;
 	u64 address;
 	u32 bufsz;
@@ -1463,8 +1694,24 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		brcmf_err(bus, "invalid max_flowrings(%d)\n", max_flowrings);
 		return -EIO;
 	}
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					le32_to_cpu(ringinfo.ringmem),
+					BRCMF_NROF_COMMON_MSGRINGS *
+					BRCMF_RING_MEM_SZ)) {
+		brcmf_err(bus, "ring memory outside the TCM\n");
+		return -EINVAL;
+	}
 
 	if (devinfo->dma_idx_sz != 0) {
+		/* The host index arrays hold one index per ring the driver uses */
+		if (max_submissionrings <
+		    BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings ||
+		    max_completionrings < BRCMF_NROF_D2H_COMMON_MSGRINGS) {
+			brcmf_err(bus, "invalid ring counts: %u submission, %u completion, %u flowrings\n",
+				  max_submissionrings, max_completionrings,
+				  max_flowrings);
+			return -EINVAL;
+		}
 		bufsz = (max_submissionrings + max_completionrings) *
 			devinfo->dma_idx_sz * 2;
 		devinfo->idxbuf = dma_alloc_coherent(&devinfo->pdev->dev, bufsz,
@@ -1480,6 +1727,21 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		h2d_w_idx_ptr = le32_to_cpu(ringinfo.h2d_w_idx_ptr);
 		h2d_r_idx_ptr = le32_to_cpu(ringinfo.h2d_r_idx_ptr);
 		idx_offset = sizeof(u32);
+		/* One index per common ring and flowring, each way */
+		h2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings) *
+			      idx_offset;
+		d2h_idx_len = BRCMF_NROF_D2H_COMMON_MSGRINGS * idx_offset;
+		if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_w_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_r_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_w_idx_ptr, d2h_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_r_idx_ptr, d2h_idx_len)) {
+			brcmf_err(bus, "ring indices outside the TCM\n");
+			return -EINVAL;
+		}
 		devinfo->write_ptr = brcmf_pcie_write_tcm16;
 		devinfo->read_ptr = brcmf_pcie_read_tcm16;
 		brcmf_dbg(PCIE, "Using TCM indices\n");
@@ -1768,16 +2030,42 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	if (apple_radio_sleep_owned(dev))
+		return -EBUSY;
+
+	WRITE_ONCE(devinfo->reset_wanted, false);
+	WRITE_ONCE(devinfo->setup_complete, false);
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_pcie_intr_disable(devinfo);
+	if (devinfo->irq_allocated)
+		synchronize_irq(devinfo->pdev->irq);
+
+	/*
+	 * New firmware commands fail at once on a bus that is down; let one
+	 * already waiting for its response finish before the rings go away.
+	 */
+	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
+	if (bus_if->drvr) {
+		mutex_lock(&bus_if->drvr->proto_block);
+		mutex_unlock(&bus_if->drvr->proto_block);
+	}
 
 	brcmf_pcie_bus_console_read(devinfo, true);
+
+	/*
+	 * Stop the dongle before its host buffers go away, as remove does:
+	 * firmware that is still running DMAs into the RX buffers that
+	 * brcmf_detach() unmaps.
+	 */
+	brcmf_pcie_reset_device(devinfo);
 
 	brcmf_detach(dev);
 
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
+	kfree(bus_if->msgbuf->flowrings);
+	bus_if->msgbuf->flowrings = NULL;
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
 	if (!fwreq) {
@@ -1807,6 +2095,7 @@ static const struct brcmf_bus_ops brcmf_pcie_bus_ops = {
 	.reset = brcmf_pcie_reset,
 	.debugfs_create = brcmf_pcie_debugfs_create,
 	.d2h_mb_rx = brcmf_pcie_d2h_mb_rx,
+	.ctl_stall = brcmf_pcie_ctl_stall,
 };
 
 
@@ -1843,6 +2132,12 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	u32 addr;
 
 	shared = &devinfo->shared;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, sharedram_addr,
+					BRCMF_SHARED_SIZE)) {
+		brcmf_err(bus, "shared RAM at 0x%08x is outside the TCM\n",
+			  sharedram_addr);
+		return -EINVAL;
+	}
 	shared->tcm_base_address = sharedram_addr;
 
 	shared->flags = brcmf_pcie_read_tcm32(devinfo, sharedram_addr +
@@ -1881,6 +2176,17 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 
 	addr = sharedram_addr + BRCMF_SHARED_RING_INFO_ADDR_OFFSET;
 	shared->ring_info_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->htod_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->dtoh_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->ring_info_addr,
+					sizeof(struct brcmf_pcie_dhi_ringinfo))) {
+		brcmf_err(bus, "shared RAM addresses outside the TCM\n");
+		return -EINVAL;
+	}
 
 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
 		  shared->max_rxbufpost, shared->rx_dataoffset);
@@ -2221,6 +2527,7 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 
 	devinfo->regs = ioremap(bar0_addr, BRCMF_PCIE_REG_MAP_SIZE);
 	devinfo->tcm = ioremap(bar1_addr, bar1_size);
+	devinfo->tcm_size = bar1_size;
 
 	if (!devinfo->regs || !devinfo->tcm) {
 		brcmf_err(bus, "ioremap() failed (%p,%p)\n", devinfo->regs,
@@ -2607,6 +2914,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	if (ret)
 		goto fail;
 
+	WRITE_ONCE(devinfo->fw_dead, false);
 	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
 
 	ret = brcmf_pcie_init_ringbuffers(devinfo);
@@ -2645,6 +2953,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	/* Publish completed firmware setup before suspend admission. */
+	smp_store_release(&devinfo->setup_complete, true);
 
 	return;
 
@@ -2929,22 +3239,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
 
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
-
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);
 	if (devinfo == NULL)
@@ -3095,6 +3389,14 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 	brcmf_bus_cancel_reset_work(bus);
 
+	/*
+	 * Stop the dongle before its host buffers go away. Until the chip is
+	 * reset its firmware keeps running and DMAs received frames into the
+	 * RX buffers that brcmf_detach() unmaps, which the IOMMU reports as
+	 * translation faults.
+	 */
+	brcmf_pcie_reset_device(devinfo);
+
 	brcmf_detach(&pdev->dev);
 	brcmf_free(&pdev->dev);
 
@@ -3106,7 +3408,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
 	brcmf_pcie_release_resource(devinfo);
 	release_firmware(devinfo->clm_fw);
 	release_firmware(devinfo->txcap_fw);
@@ -3122,6 +3423,33 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 
 #ifdef CONFIG_PM
+
+static struct pci_driver brcmf_pciedrvr;
+
+static void brcmf_pcie_sleep_finish(struct device *dev)
+{
+	struct brcmf_pciedev_info *devinfo;
+	struct brcmf_bus *bus;
+
+	/* Async setup failure may unbind us after suspend refused admission. */
+	device_lock(dev);
+	if (dev->driver != &brcmf_pciedrvr.driver)
+		goto unlock;
+	bus = dev_get_drvdata(dev);
+	if (!bus)
+		goto unlock;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	/* A replacement binding has no cleanup pending from this transaction. */
+	if (!devinfo->sleep_reset_blocked)
+		goto unlock;
+	devinfo->sleep_reset_blocked = false;
+	brcmf_bus_allow_reset_work(bus);
+	/* The sleep dropped the reset of a firmware that died during it. */
+	if (READ_ONCE(devinfo->reset_wanted))
+		brcmf_bus_schedule_reset(bus);
+unlock:
+	device_unlock(dev);
+}
 
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
 
@@ -3173,12 +3501,38 @@ fail:
 	return ret;
 }
 
+/*
+ * s2idle without WoWLAN on Apple firmware (fw_seed). cfg80211 has already
+ * left the network and the radio is off (mpc), so keep the function in D0
+ * and skip the HOST_D3_INFORM handshake. The BCM4387 firmware acknowledges
+ * D3 while a DMA is still in flight ("pciedev_d3_ack: dma in progress");
+ * after the next association its TX FIFO then stalls, the firmware traps in
+ * the reinit that follows and every command times out until reboot. This
+ * is the transport state of the WoWLAN sleep, without the wake IRQ.
+ */
+static int brcmf_pcie_s2idle_sleep(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	int ret;
+
+	ret = pci_save_state(devinfo->pdev);
+	if (ret) {
+		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_resume(bus->drvr);
+		brcmf_pcie_fwcon_timer(devinfo, true);
+		return ret;
+	}
+	devinfo->s2idle_d0 = true;
+	return 0;
+}
+
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
-	int ifidx;
+	int ifidx, ret;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -3191,6 +3545,18 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
 	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EOPNOTSUPP;
+
+	ret = apple_radio_sleep_endpoint_prepare(dev, brcmf_pcie_sleep_finish);
+	if (ret)
+		return ret;
+	/* Drain a recovery already running when the platform acquired its lease. */
+	if (apple_radio_sleep_owned(dev)) {
+		brcmf_bus_cancel_reset_work(bus);
+		devinfo->sleep_reset_blocked = true;
+		/* A reset can have returned while firmware loading is still async. */
+		if (!smp_load_acquire(&devinfo->setup_complete))
+			return -EBUSY;
+	}
 
 	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
 	 * The BUS reason prevents completion flow control from waking the queue.
@@ -3209,6 +3575,9 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (devinfo->wowl_irq && devinfo->wowl_enabled)
 		return brcmf_pcie_wowl_sleep(dev);
 
+	if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)
+		return brcmf_pcie_s2idle_sleep(dev);
+
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
 
@@ -3223,8 +3592,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
-
-	return 0;
+	ret = apple_radio_sleep_endpoint_suspended(dev);
+	if (ret)
+		brcmf_pcie_pm_leave_D3(dev);
+	return ret;
 }
 
 
@@ -3235,6 +3606,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	struct pci_dev *pdev;
 	int err;
 
+	err = apple_radio_sleep_endpoint_resume(dev);
+	if (err)
+		return err;
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
@@ -3244,6 +3618,13 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	if (devinfo->wowl_sleeping) {
 		pci_restore_state(devinfo->pdev);
 		brcmf_pcie_disable_irq_wake(devinfo);
+		brcmf_pcie_wowl_wake(bus, devinfo);
+		return 0;
+	}
+
+	if (devinfo->s2idle_d0) {
+		devinfo->s2idle_d0 = false;
+		pci_restore_state(devinfo->pdev);
 		brcmf_pcie_wowl_wake(bus, devinfo);
 		return 0;
 	}
@@ -3262,11 +3643,17 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
+		apple_radio_sleep_endpoint_resumed(dev, 0);
 		return 0;
 	}
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	if (apple_radio_sleep_owned(dev)) {
+		/* Lost firmware/rings violate retention; reset/reprobe is not recovery. */
+		apple_radio_sleep_endpoint_resumed(dev, -EUCLEAN);
+		return -EUCLEAN;
+	}
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;

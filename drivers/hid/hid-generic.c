@@ -31,7 +31,15 @@ static int __check_hid_generic(struct device_driver *drv, void *data)
 	if (hdrv == &hid_generic)
 		return 0;
 
-	return hid_match_device(hdev, hdrv) != NULL;
+	if (!hid_match_device(hdev, hdrv))
+		return 0;
+
+	/*
+	 * A driver with a match callback can decline a device its table
+	 * covers. Ask it, so that a device no other driver will take is not
+	 * left unbound.
+	 */
+	return !hdrv->match || hdrv->match(hdev, false);
 }
 
 static bool hid_generic_match(struct hid_device *hdev,

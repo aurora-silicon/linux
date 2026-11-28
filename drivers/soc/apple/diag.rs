@@ -31,7 +31,6 @@ extern "C" {
         xart: bool,
     ) -> c_int;
     fn sep_diag_set_policy(
-        provision_keybag: bool,
         trusted_keys: bool,
         filevault_api: bool,
         xarm_trace: bool,
@@ -53,10 +52,24 @@ extern "C" {
     fn sep_diag_set_restore(state: c_int);
     fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
     fn sep_diag_xart_guard_refused(matching: c_int);
+    fn sep_diag_set_trusted(state: c_int, status: c_int);
+    #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+    fn sep_diag_set_trusted_atomic(
+        word: *mut kernel::bindings::atomic_t,
+        state: c_int,
+        status: c_int,
+    );
+    fn sep_diag_clear_trusted_refusal();
+    #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+    fn sep_diag_clear_trusted_refusal_atomic(word: *mut kernel::bindings::atomic_t);
     fn sep_diag_bringup_ended();
     fn sep_diag_set_endpoint(id: u8, name: u32);
     fn sep_diag_set_os_identity(source: c_int);
     fn sep_diag_set_hwrng(registered: bool);
+    fn sep_diag_set_stac(state: c_int);
+    fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
+    fn sep_diag_set_offer(endpoint: u8, state: c_int);
+    fn sep_diag_sse_event() -> c_uint;
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -97,7 +110,6 @@ pub(crate) enum Restore {
 
 /// Boot-time policy, without identity values or key material.
 pub(crate) struct Policy {
-    pub provision_keybag: bool,
     pub trusted_keys: bool,
     pub filevault_api: bool,
     pub xarm_trace: bool,
@@ -152,7 +164,6 @@ pub(crate) fn register(
     // SAFETY: the facts are fixed before the attribute group is published.
     unsafe {
         sep_diag_set_policy(
-            policy.provision_keybag,
             policy.trusted_keys,
             policy.filevault_api,
             policy.xarm_trace,
@@ -286,6 +297,59 @@ pub(crate) fn xart_guard_refused() {
     unsafe { sep_diag_xart_guard_refused(matching() as c_int) };
 }
 
+/// What the next trusted-key seal or unseal can expect, as
+/// `SEP_DIAG_TRUSTED_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Trusted {
+    /// A trusted-key unseal, on its own or as a seal's round trip, worked.
+    Ready,
+    /// The enclave answered the identity key-bag unlock that every seal and
+    /// unseal needs with this status.
+    Refused(i8),
+}
+
+impl Trusted {
+    fn raw(self) -> (c_int, c_int) {
+        match self {
+            Trusted::Ready => (1, 0),
+            Trusted::Refused(status) => (2, c_int::from(status)),
+        }
+    }
+}
+
+/// The latest trusted-key outcome; it replaces the one before.
+pub(crate) fn trusted(state: Trusted) {
+    let (state, status) = state.raw();
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_trusted(state, status) };
+}
+
+/// Clears a stale refusal after a validated identity unlock, leaving `Ready`
+/// tied to a working trusted-key unseal.
+pub(crate) fn clear_trusted_refusal() {
+    // SAFETY: no preconditions; updates one atomic word.
+    unsafe { sep_diag_clear_trusted_refusal() };
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) fn set_trusted_for_test(word: &Atomic<i32>, state: Trusted) {
+    kernel::static_assert!(size_of::<Atomic<i32>>() == size_of::<kernel::bindings::atomic_t>());
+    kernel::static_assert!(align_of::<Atomic<i32>>() == align_of::<kernel::bindings::atomic_t>());
+    let (state, status) = state.raw();
+    // SAFETY: `Atomic<i32>` matches `atomic_t` in size and alignment (asserted
+    // above) and `word` is valid for atomic writes.
+    unsafe { sep_diag_set_trusted_atomic(word.as_ptr().cast(), state, status) };
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) fn clear_trusted_refusal_for_test(word: &Atomic<i32>) {
+    kernel::static_assert!(size_of::<Atomic<i32>>() == size_of::<kernel::bindings::atomic_t>());
+    kernel::static_assert!(align_of::<Atomic<i32>>() == align_of::<kernel::bindings::atomic_t>());
+    // SAFETY: `Atomic<i32>` matches `atomic_t` in size and alignment (asserted
+    // above) and `word` is valid for atomic read-modify-write.
+    unsafe { sep_diag_clear_trusted_refusal_atomic(word.as_ptr().cast()) };
+}
+
 /// The boot-time bring-up is over, however far it got.
 pub(crate) fn bringup_ended() {
     // SAFETY: no preconditions; updates two words.
@@ -308,6 +372,99 @@ pub(crate) fn os_identity(source: OsIdentity) {
 pub(crate) fn hwrng(registered: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_hwrng(registered) };
+}
+
+/// The trusted-accessory power-state report, as `SEP_DIAG_STAC_*` in
+/// `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Stac {
+    /// The service took the online state.
+    Online = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The last report was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of a trusted-accessory power-state report; an accepted one is
+/// also counted.
+pub(crate) fn stac(state: Stac) {
+    // SAFETY: no preconditions; updates two words.
+    unsafe { sep_diag_set_stac(state as c_int) };
+}
+
+/// The boot-policy digest read, as `SEP_DIAG_PNON_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Pnon {
+    /// The service returned the blessed LocalPolicy nonce digest.
+    Read = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The read was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of the boot-policy digest read, with the digest when read.
+pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) {
+    let (ptr, len) = digest.map_or((core::ptr::null(), 0), |d| (d.as_ptr(), d.len()));
+    // SAFETY: `ptr` is null or points at `len` readable bytes for the call;
+    // the shim copies them.
+    unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
+}
+
+/// An endpoint the driver checks at bring-up and sends nothing to, as
+/// `SEP_DIAG_OFFER_*` in `shim.h` spells the reported states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// Discovered with its name and the layout the driver knows.
+    Idle,
+    /// Discovered with another name or layout; left alone.
+    Unknown,
+    /// Not discovered.
+    Absent,
+}
+
+impl Offer {
+    pub(crate) fn of(present: bool, named: bool, layout_known: bool) -> Offer {
+        match (present, named && layout_known) {
+            (false, _) => Offer::Absent,
+            (true, true) => Offer::Idle,
+            (true, false) => Offer::Unknown,
+        }
+    }
+
+    fn state(self) -> c_int {
+        match self {
+            Offer::Idle => 1,
+            // Reported as absent: the driver does not use it.
+            Offer::Unknown | Offer::Absent => 2,
+        }
+    }
+}
+
+/// The secure-element sharing endpoint at bring-up (see `sse`).
+pub(crate) fn sse(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::sse::EP_SSE, offer.state()) };
+}
+
+/// The hibernation endpoint at bring-up (see `hibe`).
+pub(crate) fn hibe(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::hibe::EP_HIBE, offer.state()) };
+}
+
+/// The kernel deny-list endpoint at bring-up (see `skdl`).
+pub(crate) fn skdl(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::skdl::EP_SKDL, offer.state()) };
+}
+
+/// The secure-element sharing service announced an event. Returns how many
+/// it has announced since probe, this one included.
+pub(crate) fn sse_event() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_sse_event() }
 }
 
 /// The driver answered an xART request with the failure status. Returns how
