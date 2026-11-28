@@ -31,6 +31,10 @@ obj-y				+= idle/
 obj-y				+= char/ipmi/
 
 obj-$(CONFIG_ACPI)		+= acpi/
+# Without ACPI, of drivers/acpi/ only the platform profile class is built.
+ifndef CONFIG_ACPI
+obj-$(CONFIG_ACPI_PLATFORM_PROFILE)	+= acpi/platform_profile.o
+endif
 
 # PnP must come after ACPI since it will eventually need to check if acpi
 # was used and do nothing if so

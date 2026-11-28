@@ -459,7 +459,7 @@ config APPLE_CLPC
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on (APPLE_PMC || !APPLE_PMC) && CPU_FREQ
 	depends on MFD_MACSMC || !MFD_MACSMC
-	select ACPI_PLATFORM_PROFILE if ACPI
+	select ACPI_PLATFORM_PROFILE
 	default ARCH_APPLE
 	help
 	  Raises the DRAM controller and SoC fabric performance floors of the
