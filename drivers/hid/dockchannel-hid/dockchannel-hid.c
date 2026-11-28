@@ -1557,8 +1557,9 @@ out:
 
 /*
  * Whether a report should wake the system: any keyboard report, and a
- * multi-touch report only while the trackpad is clicked. Touches, the
- * accelerometer and the other interfaces do not wake it.
+ * multi-touch report only while the trackpad is clicked, in the MTP report or
+ * in a TP26 frame's button stream. Touches, the accelerometer and the other
+ * interfaces do not wake it.
  */
 static bool dchid_wake_report(struct dchid_iface *iface, void *data)
 {
@@ -1569,9 +1570,11 @@ static bool dchid_wake_report(struct dchid_iface *iface, void *data)
 		return false;
 	if (!strcmp(iface->name, "keyboard"))
 		return shdr->length > 0;
-	return !strcmp(iface->name, "multi-touch") &&
-	       shdr->length > MT_REPORT_BUTTON && payload[0] == MT_REPORT_ID &&
-	       (payload[MT_REPORT_BUTTON] & 1);
+	if (strcmp(iface->name, "multi-touch"))
+		return false;
+	if (shdr->length > MT_REPORT_BUTTON && payload[0] == MT_REPORT_ID)
+		return payload[MT_REPORT_BUTTON] & 1;
+	return dchid_tp26_clicked(payload, shdr->length);
 }
 
 /* Return the complete frame size, or reject a lost framing boundary. */
