@@ -168,20 +168,36 @@ static int sense_event(struct snd_soc_dapm_widget *w,
 {
 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
 	struct tas2770_priv *tas2770 = snd_soc_component_get_drvdata(component);
+	int ret;
 
 	/*
 	 * Powering up ISENSE/VSENSE requires a trip through the shutdown state.
 	 * Do that here to ensure that our changes are applied properly, otherwise
 	 * we might end up with non-functional IVSENSE if playback started earlier,
 	 * which would break software speaker protection.
+	 *
+	 * Per the TAS2770 datasheet, software shutdown turn-off takes up to
+	 * 5.9 ms and turn-on from software shutdown takes up to 5.3 ms with
+	 * volume ramping enabled. Wait for each state transition to settle so
+	 * ISNS_PD/VSNS_PD updates take effect across back-to-back toggles.
 	 */
 	switch (event) {
 	case SND_SOC_DAPM_PRE_REG:
-		return snd_soc_component_update_bits(component, TAS2770_PWR_CTRL,
+		ret = snd_soc_component_update_bits(component, TAS2770_PWR_CTRL,
 						    TAS2770_PWR_CTRL_MASK,
 						    TAS2770_PWR_CTRL_SHUTDOWN);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			usleep_range(6000, 7000);
+		return 0;
 	case SND_SOC_DAPM_POST_REG:
-		return tas2770_update_pwr_ctrl(tas2770);
+		ret = tas2770_update_pwr_ctrl(tas2770);
+		if (ret < 0)
+			return ret;
+		if (tas2770->dac_powered)
+			usleep_range(6000, 7000);
+		return 0;
 	default:
 		return 0;
 	}
