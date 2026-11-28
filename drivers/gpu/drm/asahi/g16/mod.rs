@@ -769,7 +769,14 @@ impl Firmware {
             let recovery = recovery::Recovery::new()?;
             let render_cmds = resources::RenderCmds::new()?;
             let compute_cmds = resources::ComputeCmds::new()?;
-            let private_factory = booted.objects.private_factory(render_cmds, compute_cmds);
+            let render_uma_pool = resources::RenderUmaPool::new()?;
+            let pb_record_pool = resources::PbRecordPool::new()?;
+            let private_factory = booted.objects.private_factory(
+                render_cmds,
+                compute_cmds,
+                render_uma_pool,
+                pb_record_pool,
+            );
             let graph = graph::Graphs::finish(dev, graph_session, &private_factory)?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
             Ok((graph, private_factory, slots, pools, vms, engine, recovery, slot))

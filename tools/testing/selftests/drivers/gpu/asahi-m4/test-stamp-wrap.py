@@ -47,7 +47,7 @@ struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Ob
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
-impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}}
+impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_flight_retired(&self,k:usize,target:u64,renders:u32,idle:bool)->Result<bool>{self.pools.flight_retired(k,target,renders,idle)}}
 struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
 struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],chan_settled:bool,pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
 struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
@@ -58,7 +58,7 @@ struct RUnit{scene:Object}
 struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
 struct Pools{full:bool,completed:u64}
-impl Pools{fn retired(&self,_k:usize)->Result<bool>{Ok(self.full)}fn retired_at(&self,_k:usize,target:u64)->Result<bool>{Ok(self.full && target!=0 && self.completed>=target)}}
+impl Pools{fn flight_retired(&self,_k:usize,target:u64,renders:u32,_idle:bool)->Result<bool>{Ok(self.full && target!=0 && renders!=0 && self.completed>=target)}}
 struct TopChannels{compute_producer:u32}
 impl TopChannels{fn producer(&self,ch:Channel)->u32{match ch{Channel::Compute=>self.compute_producer,_=>1}}}
 struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,channels:TopChannels,queue_passed:bool,last_chan_passed:Cell<Option<bool>>}

@@ -1405,7 +1405,7 @@ impl Firmware {
                         || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
                     && f.job
                         .resources
-                        .pb_retired_at(a, f.uma_submitted)?;
+                        .pb_flight_retired(a, f.uma_submitted, f.renders, false)?;
             } else {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
                 let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
@@ -1453,7 +1453,9 @@ impl Firmware {
                     && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                         == f.job.vm.slot
-                    && f.job.resources.pb_retired(a)?;
+                    && f.job
+                        .resources
+                        .pb_flight_retired(a, f.uma_submitted, f.renders, true)?;
             }
             if full {
                 let count = (f.renders as usize).min(f.claims.pass.len());
@@ -1611,6 +1613,12 @@ impl Firmware {
                         .push(super::hw::sizes::COMPUTE_PIPES + 1, f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
+                    f.job.resources.note_pb_retired(
+                        f.pb_slot as usize,
+                        f.uma_submitted,
+                        f.renders,
+                    )?;
+                    epoch.retire_flight();
                     self.pools.retire_flight(
                         f.pb_slot as usize,
                         epoch,

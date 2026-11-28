@@ -15,13 +15,14 @@ pub(crate) mod lifetime;
 
 use super::fw::buffer::{self, uma_manager};
 use super::hw::{client, engine, pte, sizes};
-use super::object::{Class, Factory, FwLease, FwObject, Objects, Request};
+use super::object::{Class, Factory, FwObject, Objects, Request};
+use super::resources::{PbRecordLease, RenderUmaLease};
 use super::slots::Placement;
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use kernel::{
     device,
@@ -58,10 +59,12 @@ pub(crate) struct Allocator {
     list: Arc<FwObject>,
     submitted: Arc<FwObject>,
     heap: Arc<FwObject>,
-    /// VM-free firmware lease retaining `descriptor` and `submitted` across closed-VM reclaim
-    /// until a later render overwrites this hardware UMA slot in firmware RAM.
-    uma_lease: Arc<FwLease>,
+    /// Device-lifetime firmware lease retaining ASC-cached `descriptor` (`FwCoherent`) and
+    /// uncached `submitted` (`Fw`) across closed-VM reclaim until a later render overwrites
+    /// this hardware UMA slot in firmware RAM.
+    uma_lease: Arc<RenderUmaLease>,
     published: AtomicBool,
+    retired_submitted: AtomicU64,
     id: u32,
 }
 
@@ -184,12 +187,16 @@ impl Allocator {
         };
         let nc = |va| Some((va, pte::LEAF_NC));
         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
-        // Keep descriptor + submitted in a VM-free FwLease so firmware's global UMA table
-        // stays mapped across closed-VM reclaim without pinning the VM's ASID or pools.
-        let mut fw = fw_factory.fw_objects();
-        let descriptor = alloc(&mut fw, uma_manager::SIZE, Class::Fw, None, true)?;
-        let submitted = alloc(&mut fw, 0x40, Class::Fw, None, true)?;
-        let uma_lease = FwLease::new(fw)?;
+        // Keep descriptor (FwCoherent) + submitted (Fw) in a device-lifetime RenderUmaLease so
+        // firmware caches the descriptor like macOS 26B123 (`0x443`) while keeping the global
+        // UMA table mapped across closed-VM reclaim without pinning the VM's ASID or pools.
+        let (uma_lease, used) = fw_factory.render_uma_pool().take(fw_factory)?;
+        let descriptor = uma_lease.descriptor.clone();
+        let submitted = uma_lease.submitted.clone();
+        if used {
+            submitted.fill(0, 0, submitted.size)?;
+            descriptor.fill(0, 0, uma_manager::SIZE)?;
+        }
         let auxiliary = alloc(
             o,
             0x4000,
@@ -236,11 +243,12 @@ impl Allocator {
             heap,
             uma_lease,
             published: AtomicBool::new(false),
+            retired_submitted: AtomicU64::new(0),
             id: hw_slot,
         })
     }
-    /// Firmware-only lease retaining this allocator's UMA descriptor and submitted counter.
-    pub(crate) fn uma_lease(&self) -> Arc<FwLease> {
+    /// Device-lifetime lease retaining this allocator's UMA descriptor and submitted counter.
+    pub(crate) fn uma_lease(&self) -> Arc<RenderUmaLease> {
         self.uma_lease.clone()
     }
     /// Device-wide hardware PB/UMA slot (`parameter_id`) owned by this allocator unit.
@@ -269,15 +277,19 @@ impl Allocator {
     }
     /// Prepares this UMA/PB allocator slot. When `pipelined` is true, earlier same-VM renders
     /// are still in flight on the same active descriptor and PB manager, so the submitted
-    /// counter advances cumulatively while descriptor identity is still verified.
+    /// counter advances cumulatively.
     pub(crate) fn prepare_in_flight(&self, _draw: u64, pipelined: bool) -> Result<AllocatorRefs> {
-        if !pipelined && self.published.load(Ordering::Acquire) && !self.retired()? {
+        let published = self.published.load(Ordering::Acquire);
+        if !pipelined && published && !self.retired()? {
             return Err(EBUSY);
         }
-        // Descriptor pointer/counter and slot must still identify this exact retained unit.
-        if read64(&self.descriptor, 0)? != self.descriptor.va
-            || self.descriptor.r32(8)? != engine::RENDER_UMA_SLOT + self.id
-            || read64(&self.descriptor, 0x4c)? != self.submitted.va
+        // Descriptor pointer/counter and slot must identify this retained unit before first
+        // publication; once firmware owns the ASC-cached descriptor, avoid snooping it on every
+        // render.
+        if !published
+            && (read64(&self.descriptor, 0)? != self.descriptor.va
+                || self.descriptor.r32(8)? != engine::RENDER_UMA_SLOT + self.id
+                || read64(&self.descriptor, 0x4c)? != self.submitted.va)
         {
             return Err(EINVAL);
         }
@@ -295,18 +307,50 @@ impl Allocator {
         {
             return Err(EINVAL);
         }
+        self.uma_lease.publish();
         self.submitted.w64(0, submitted)?;
         self.published.store(true, Ordering::Release);
         Ok(())
     }
     pub(crate) fn retired(&self) -> Result<bool> {
         let submitted = read64(&self.submitted, 0)?;
-        let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
-        Ok(submitted != 0 && submitted == completed)
+        Ok(submitted != 0 && submitted == self.retired_submitted.load(Ordering::Acquire))
     }
-    pub(crate) fn retired_at(&self, target: u64) -> Result<bool> {
-        let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
-        Ok(target != 0 && completed >= target)
+    /// Whether the uncached submission counter accounts for `renders` additional renders
+    /// reaching `target` beyond previously retired flights, and matches exact host conservation
+    /// when `idle` drains render flights. The descriptor itself is ASC-cached (`FwCoherent`) so
+    /// `COMPLETED` is not read by the host: firmware advances `COMPLETED` strictly before
+    /// storing the flight's uncached `FS_STAMP`.
+    pub(crate) fn flight_retired(&self, target: u64, renders: u32, idle: bool) -> Result<bool> {
+        if target == 0 || renders == 0 {
+            return Ok(false);
+        }
+        let delta = u64::from(renders).checked_mul(2).ok_or(EOVERFLOW)?;
+        let needed = self
+            .retired_submitted
+            .load(Ordering::Acquire)
+            .checked_add(delta)
+            .ok_or(EOVERFLOW)?;
+        let submitted = read64(&self.submitted, 0)?;
+        Ok(target == needed && submitted >= target && (!idle || submitted == target))
+    }
+    /// Records a normal full retirement of `renders` render passes reaching `target`.
+    pub(crate) fn note_retired(&self, target: u64, renders: u32) -> Result {
+        if target == 0 || renders == 0 {
+            return Err(EINVAL);
+        }
+        let delta = u64::from(renders).checked_mul(2).ok_or(EOVERFLOW)?;
+        let expected = self
+            .retired_submitted
+            .load(Ordering::Acquire)
+            .checked_add(delta)
+            .ok_or(EOVERFLOW)?;
+        if target != expected {
+            return Err(EINVAL);
+        }
+        self.retired_submitted.store(target, Ordering::Release);
+        self.uma_lease.retire();
+        Ok(())
     }
     pub(crate) fn heap_gva(&self) -> Result<u64> {
         gva(&self.heap)
@@ -445,8 +489,24 @@ impl PoolSet {
         self.units.get(k).ok_or(EINVAL)?.retired()
     }
     #[allow(dead_code)]
-    pub(crate) fn retired_at(&self, k: usize, target: u64) -> Result<bool> {
-        self.units.get(k).ok_or(EINVAL)?.retired_at(target)
+    pub(crate) fn flight_retired(
+        &self,
+        k: usize,
+        target: u64,
+        renders: u32,
+        idle: bool,
+    ) -> Result<bool> {
+        self.units
+            .get(k)
+            .ok_or(EINVAL)?
+            .flight_retired(target, renders, idle)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn note_retired(&self, k: usize, target: u64, renders: u32) -> Result {
+        self.units
+            .get(k)
+            .ok_or(EINVAL)?
+            .note_retired(target, renders)
     }
     #[allow(dead_code)]
     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
@@ -473,21 +533,22 @@ pub(crate) struct Pools {
     /// slot `k`, also after its VM closed: it maps the manager's page and block lists and keeps
     /// the VM's TTBAT slot bound, the context through which those lists are written.
     owners: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
-    /// VM-free firmware leases keeping each `parameter_id`'s `pb_manager` + `counter` page mapped
-    /// for firmware's global `pb_mgr_table[parameter_id]` across closed-VM reclaim until a newer
-    /// `InitBM` retires on that exact slot.
-    retained_pb: [Option<Arc<FwLease>>; sizes::PB_SLOTS],
+    /// Device-lifetime firmware leases keeping each `parameter_id`'s PB manager, misc, InitBM,
+    /// block-list, and uncached control/counter records mapped for firmware's global
+    /// `pb_mgr_table[parameter_id]` across closed-VM reclaim until a newer `InitBM` retires on
+    /// that exact slot.
+    retained_pb: [Option<Arc<PbRecordLease>>; sizes::PB_SLOTS],
     #[allow(dead_code)]
     owner_vms: [Option<Arc<super::vm::VmState>>; sizes::PB_SLOTS],
     #[allow(dead_code)]
     owner_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
-    /// VM-free firmware leases keeping each render UMA slot's `descriptor` + `submitted` page
-    /// mapped for firmware's global `uma_mgr_table[RENDER_UMA_SLOT + k]` across closed-VM reclaim
-    /// until a newer render retires on that exact slot.
-    retained_uma: [Option<Arc<FwLease>>; sizes::PB_SLOTS],
+    /// Device-lifetime firmware leases keeping each render UMA slot's `descriptor` + `submitted`
+    /// records mapped for firmware's global `uma_mgr_table[RENDER_UMA_SLOT + k]` across
+    /// closed-VM reclaim until a newer render retires on that exact slot.
+    retained_uma: [Option<Arc<RenderUmaLease>>; sizes::PB_SLOTS],
     pending_vms: [Option<Arc<super::vm::VmState>>; sizes::PB_SLOTS],
     pending_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
-    pending_uma: [Option<Arc<FwLease>>; sizes::PB_SLOTS],
+    pending_uma: [Option<Arc<RenderUmaLease>>; sizes::PB_SLOTS],
     /// Per allocator slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
     /// slot) and by a firmware recovery or sleep restart. It identifies a binding without
     /// holding the epoch.
@@ -936,7 +997,7 @@ impl Pools {
         k: usize,
         vm: &Arc<super::vm::VmState>,
         arena: Option<super::resources::PbOwnerArena>,
-        uma_lease: Option<Arc<FwLease>>,
+        uma_lease: Option<Arc<RenderUmaLease>>,
     ) -> Result {
         if k >= sizes::PB_SLOTS || self.quarantined[k] {
             return Err(EINVAL);
@@ -1037,7 +1098,20 @@ impl Pools {
             self.inflight[k] = self.inflight[k].saturating_sub(1);
             self.quarantined[k] = true;
             self.keep[k] = false;
+            if let Some(uma) = &self.pending_uma[k] {
+                uma.quarantine();
+            }
+            if let Some(uma) = &self.retained_uma[k] {
+                uma.quarantine();
+            }
+            if let Some(records) = &self.retained_pb[k] {
+                records.quarantine();
+            }
+            if let Some(owner) = &self.owners[k] {
+                owner.quarantine();
+            }
             if let Some(epoch) = pb {
+                epoch.quarantine();
                 if self.quarantined_epochs[k].is_none() {
                     self.quarantined_epochs[k] = Some(epoch);
                 } else {
@@ -1047,6 +1121,7 @@ impl Pools {
                 }
             }
         } else if let Some(epoch) = pb {
+            epoch.quarantine();
             core::mem::forget(epoch);
         }
     }
@@ -1183,8 +1258,8 @@ impl core::ops::Deref for PbEpoch {
     }
 }
 pub(crate) struct PbEpochInner {
-    pub(crate) manager: Arc<FwObject>,
     pages: Arc<FwObject>,
+    pages_gpu: u64,
     blocks: Arc<FwObject>,
     ring: Arc<FwObject>,
     counter: Arc<FwObject>,
@@ -1192,45 +1267,82 @@ pub(crate) struct PbEpochInner {
     pub(crate) initbm: Arc<FwObject>,
     assigned: AtomicU32,
     heap_blocks: AtomicU32,
+    prepared_heap_gva: AtomicU64,
+    prepared_layout_id_a: AtomicU32,
     /// High-water block count previously written into the zero-allocated `pages`/`blocks` lists,
     /// so fresh `InitBM` seeding writes only the active prefix (plus any shrink tail).
     seeded_blocks: AtomicU32,
     scs: AtomicBool,
     exposed: AtomicBool,
-    /// VM-free firmware lease keeping `records` (`manager`, `ring`, `counter`, `misc`, `initbm`)
-    /// mapped across closed-VM reclaim until a newer `InitBM` overwrites `pb_mgr_table[k]`.
-    records_lease: Arc<FwLease>,
-    // Unmap private records before releasing the VM's aliases and ASID.
+    // Unmap the private `pages_gpu` client alias BEFORE releasing `records_lease` (so no VM
+    // retains a client mapping when the record set returns to `PbRecordPool`) and BEFORE
+    // releasing the VM's aliases and ASID.
     _objects: Objects,
+    /// Device-lifetime firmware lease keeping `cached_records` (`managers[0..PB_SLOTS]`,
+    /// `initbm`), `blocks` (`FwCoherent`), `pages` (`Shared`), and `nc_records` (`ring`,
+    /// `counter`, `misc`, `Fw`) mapped across closed-VM reclaim until a newer `InitBM`
+    /// overwrites `pb_mgr_table[k]`.
+    records_lease: Arc<PbRecordLease>,
     _vm: Arc<super::vm::VmState>,
     // Return admission credit only after deferred unmap and binding release.
     _permit: super::budget::Permit,
 }
 impl PbEpoch {
+    #[allow(dead_code)]
     pub(crate) fn new(
         factory: &super::object::Factory,
         vm: &Arc<super::vm::VmState>,
         permit: super::budget::Permit,
     ) -> Result<Arc<Self>> {
-        let mut fw = factory.fw_objects();
-        let records = alloc(&mut fw, 0x500, Class::Fw, None, true)?;
-        let records_lease = FwLease::new(fw)?;
+        Self::new_for(factory, vm, permit, None)
+    }
+
+    /// Allocates or recycles a PB epoch compatible with `target_heap_blocks` (`None` accepts
+    /// only unbound record sets).
+    pub(crate) fn new_for(
+        factory: &super::object::Factory,
+        vm: &Arc<super::vm::VmState>,
+        permit: super::budget::Permit,
+        target_heap_blocks: Option<u32>,
+    ) -> Result<Arc<Self>> {
+        let (records_lease, used) = factory
+            .pb_record_pool()
+            .take_for(factory, target_heap_blocks)?;
+        if used {
+            records_lease.pages.fill(0, 0, records_lease.pages.size)?;
+            records_lease
+                .nc_records
+                .fill(0, 0, records_lease.nc_records.size)?;
+            records_lease.initbm.fill(0, 0, records_lease.initbm.size)?;
+            // Once a persistent record set has been exposed to firmware, its ASC-cached
+            // `pb_mgr` slot images and read-only `blocks` table stay untouched by the host;
+            // only never-exposed entries are cleared on reuse.
+            if !records_lease.is_bound() {
+                records_lease
+                    .cached_records
+                    .fill(0, 0, records_lease.cached_records.size)?;
+                records_lease.blocks.fill(0, 0, records_lease.blocks.size)?;
+            }
+        }
         let mut o = factory.objects(&vm.vm);
+        o.map_client_at(&records_lease.pages, records_lease.pages_gpu)?;
         let mut inner = PbEpochInner {
-            manager: FwObject::view(&records, 0, 0xc0)?,
-            pages: o.alloc_dynamic_client(buffer::PAGE_LIST_SIZE)?,
-            blocks: alloc(&mut o, buffer::BLOCK_LIST_SIZE, Class::Fw, None, true)?,
-            ring: FwObject::view(&records, 0x100, 8)?,
-            counter: FwObject::view(&records, 0x200, 0x40)?,
-            misc: FwObject::view(&records, 0x300, 0x40)?,
-            initbm: FwObject::view(&records, 0x400, 0x20)?,
+            pages: records_lease.pages.clone(),
+            pages_gpu: records_lease.pages_gpu,
+            blocks: records_lease.blocks.clone(),
+            ring: records_lease.ring.clone(),
+            counter: records_lease.counter.clone(),
+            misc: records_lease.misc.clone(),
+            initbm: records_lease.initbm.clone(),
             assigned: AtomicU32::new(u32::MAX),
             heap_blocks: AtomicU32::new(0),
+            prepared_heap_gva: AtomicU64::new(0),
+            prepared_layout_id_a: AtomicU32::new(0),
             seeded_blocks: AtomicU32::new(0),
             scs: AtomicBool::new(false),
             exposed: AtomicBool::new(false),
-            records_lease,
             _objects: o,
+            records_lease,
             _vm: vm.clone(),
             _permit: permit,
         };
@@ -1241,9 +1353,43 @@ impl PbEpoch {
         )?)
     }
 
-    /// Firmware-only lease retaining this epoch's `pb_manager` + `counter` page.
-    pub(crate) fn records_lease(&self) -> Arc<FwLease> {
+    /// Device-lifetime lease retaining this epoch's PB manager, block-list, and control records.
+    pub(crate) fn records_lease(&self) -> Arc<PbRecordLease> {
         self.records_lease.clone()
+    }
+
+    /// Permanent heap-block binding of this epoch's underlying record set (`0` if unbound).
+    pub(crate) fn bound_blocks(&self) -> u32 {
+        self.records_lease.bound_blocks()
+    }
+
+    /// Firmware VA of the assigned slot's ASC-cached `pb_mgr` record.
+    pub(crate) fn manager_va(&self) -> Result<u64> {
+        let k = self.assigned.load(Ordering::Acquire) as usize;
+        self.records_lease.manager_va(k)
+    }
+
+    /// Records a published render flight using this PB epoch's firmware records.
+    ///
+    /// Leaves the uncached PB `counter` at its initial `1` rather than advancing it per flight:
+    /// on 26B123, matching `pb_mgr->completed_passes == *counter_ptr` triggers hardware PB slot
+    /// unload (`[SGX+0x1c860]`) on every flight, forcing a costly reload on the next render.
+    /// Because exposed per-slot `pb_mgr` records in `cached_records` are never overwritten by the
+    /// host after first exposure, epoch recycling never depends on firmware write-back.
+    #[allow(dead_code)]
+    pub(crate) fn publish_flight(&self) {
+        self.records_lease.publish();
+    }
+
+    /// Records a normal full retirement of a render flight using this PB epoch's firmware records.
+    #[allow(dead_code)]
+    pub(crate) fn retire_flight(&self) {
+        self.records_lease.retire();
+    }
+
+    /// Permanently prevents this PB epoch's firmware records from recycling.
+    pub(crate) fn quarantine(&self) {
+        self.records_lease.quarantine();
     }
 
     /// Seed only unpublished storage. A retry may choose another physical slot; after
@@ -1280,6 +1426,9 @@ impl PbEpoch {
             || self.exposed.load(Ordering::Acquire)
             || heap_blocks == 0
             || heap_blocks > buffer::MAX_BLOCKS
+            || !self
+                .records_lease
+                .matches_binding(layout.id_a as u32, heap, heap_blocks)
         {
             return Err(EINVAL);
         }
@@ -1292,32 +1441,56 @@ impl PbEpoch {
         let write_pages = write_blocks * buffer::PAGES_PER_BLOCK;
         write_records(&self.pages, write_pages as usize, |i| {
             let i = i as u32;
-            (if i < pages { buffer::page_record(heap, i) } else { 0 }).to_le_bytes()
+            (if i < pages {
+                buffer::page_record(heap, i)
+            } else {
+                0
+            })
+            .to_le_bytes()
         })?;
-        write_records(&self.blocks, write_blocks as usize, |i| {
-            let b = i as u32;
-            u64::from(if b < heap_blocks { buffer::block_record(heap, b) } else { 0 }).to_le_bytes()
-        })?;
+        // Firmware never mutates the block list; once this persistent record set has been
+        // exposed for `(heap, heap_blocks)`, its `blocks` list already holds the exact table.
+        if !self.records_lease.is_bound() {
+            write_records(&self.blocks, write_blocks as usize, |i| {
+                let b = i as u32;
+                u64::from(if b < heap_blocks {
+                    buffer::block_record(heap, b)
+                } else {
+                    0
+                })
+                .to_le_bytes()
+            })?;
+        }
         let posted = super::params::pb_posted_blocks(heap_blocks);
         self.ring.w32(0, posted)?;
         self.ring.w32(4, posted)?;
         self.counter.w64(0, 1)?;
-        self.manager.write(
-            0,
-            &buffer::pb_manager_image_for(
-                layout,
-                k as u32,
-                self.pages.va,
-                gva(&self.pages)?,
-                self.blocks.va,
-                self.ring.va,
-                self.counter.va,
-                heap_blocks,
-            ),
-        )?;
+        // Once slot `k`'s ASC-cached `pb_mgr` has been exposed to firmware, the host never
+        // writes to it again: every static field (`parameter_id`, `pages_fw`, `pages_gpu`,
+        // `blocks_fw`, `ring_fw`, `counter_fw`, `heap_blocks`) is invariant for this set and
+        // slot, and firmware's `InitBM` resets the live cursors on the ASC-cached line itself.
+        if !self.records_lease.slot_is_exposed(k) {
+            let off = super::resources::PbRecordSet::manager_offset(k)?;
+            self.records_lease.cached_records.write(
+                off,
+                &buffer::pb_manager_image_for(
+                    layout,
+                    k as u32,
+                    self.pages.va,
+                    self.pages_gpu,
+                    self.blocks.va,
+                    self.ring.va,
+                    self.counter.va,
+                    heap_blocks,
+                ),
+            )?;
+        }
         self.seeded_blocks.store(heap_blocks, Ordering::Release);
         self.assigned.store(k as u32, Ordering::Release);
         self.heap_blocks.store(heap_blocks, Ordering::Release);
+        self.prepared_heap_gva.store(heap, Ordering::Release);
+        self.prepared_layout_id_a
+            .store(layout.id_a as u32, Ordering::Release);
         self.scs.store(scs, Ordering::Release);
         Ok(())
     }
@@ -1334,6 +1507,12 @@ impl PbEpoch {
         Ok(())
     }
     pub(crate) fn expose(&self) {
+        let k = self.assigned.load(Ordering::Acquire) as usize;
+        let blocks = self.heap_blocks.load(Ordering::Acquire);
+        let heap = self.prepared_heap_gva.load(Ordering::Acquire);
+        let layout_id_a = self.prepared_layout_id_a.load(Ordering::Acquire);
+        self.records_lease
+            .mark_slot_exposed(k, layout_id_a, heap, blocks);
         self.exposed.store(true, Ordering::Release);
     }
     /// Never handed to the firmware: its storage may serve another render of its VM.

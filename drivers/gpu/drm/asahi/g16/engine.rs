@@ -2637,7 +2637,7 @@ impl Firmware {
                 if engine_behind {
                     return Err(EAGAIN);
                 }
-                let e = job.resources.take_pb()?;
+                let e = job.resources.take_pb_for(heap_blocks)?;
                 if let Err(err) = e.prepare_with_scs_for(
                     self.init.abi.pb_manager(),
                     alloc_slot,
@@ -2653,7 +2653,7 @@ impl Firmware {
             }
         };
         let binding = self.pools.bind(alloc_slot, reused);
-        a.pb_mgr = epoch.manager.va;
+        a.pb_mgr = epoch.manager_va()?;
         a.mgr_misc = epoch.misc.va;
         let r = &self.graph.render;
         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
@@ -2714,7 +2714,7 @@ impl Firmware {
             uma_mgr: a.uma_mgr,
             uma_aux: a.uma_aux,
             uma_gpu: a.uma_gpu,
-            pb_mgr: epoch.manager.va,
+            pb_mgr: epoch.manager_va()?,
             scene_list: 0,
             mgr_misc: epoch.misc.va,
             pb_init_blocks: epoch.heap_blocks(),
@@ -3485,7 +3485,9 @@ impl Firmware {
         let publication = (|| -> Result {
             if render {
                 let a = f.pb_slot as usize;
-                f.pb.as_ref().ok_or(EINVAL)?.expose();
+                let pb = f.pb.as_ref().ok_or(EINVAL)?;
+                pb.expose();
+                pb.publish_flight();
                 job.resources.commit_render(f.count as u32);
                 for j2 in f.group.iter() {
                     j2.resources.commit_render(j2.progress.count());

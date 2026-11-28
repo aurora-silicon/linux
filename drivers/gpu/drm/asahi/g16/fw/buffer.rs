@@ -109,6 +109,7 @@ pub(crate) mod pb_manager {
 }
 pub(crate) mod uma_manager {
     pub(crate) const SIZE: usize = 0xa0;
+    #[allow(dead_code)]
     pub(crate) const COMPLETED: usize = 0x54;
     pub(crate) const SEEDS: u32 = 8192;
     /// Freelist records of a base pool (+0x1c), its 0x20000-byte freelist.
