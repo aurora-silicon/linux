@@ -923,7 +923,7 @@ pub(crate) fn parse_fde(req: &FdeSeal, seal: bool) -> Result<crate::sks::Designa
     let record_len = req.record_len as usize;
     let secret_len = req.secret_len as usize;
     let sealed_len = req.sealed_len as usize;
-    if req.uid < MIN_UID || req.uid > i32::MAX as u32 || record_len == 0 || record_len > FDE_RECORD_MAX {
+    if req.uid < MIN_UID || record_len == 0 || record_len > FDE_RECORD_MAX {
         return Err(EINVAL);
     }
     if seal && (secret_len == 0 || secret_len > FDE_SECRET_MAX || sealed_len != 0) {
@@ -932,7 +932,8 @@ pub(crate) fn parse_fde(req: &FdeSeal, seal: bool) -> Result<crate::sks::Designa
     if !seal && (sealed_len == 0 || sealed_len > FDE_SEALED_MAX || secret_len != 0) {
         return Err(EINVAL);
     }
-    crate::sks::DesignateUser::new(req.uid as i32).ok_or(EINVAL)
+    // The bag SEP_BIO_KEYBAG_UNLOCK opens, not the identity bag at `uid`.
+    bag_designation(req.uid)
 }
 
 pub(crate) fn is_ioctl(cmd: u32) -> bool {
@@ -1359,10 +1360,10 @@ impl crate::SepData {
                 let mut buf = KVec::<u8>::with_capacity(core::mem::size_of::<FdeKey>(), GFP_KERNEL)?;
                 reader.read_all(&mut buf, GFP_KERNEL)?;
                 let key = FdeKey::from_bytes_mut(&mut buf).ok_or(EINVAL)?;
-                if key.uid < MIN_UID || key.uid > i32::MAX as u32 {
+                if key.uid < MIN_UID {
                     return Err(EINVAL);
                 }
-                let user = crate::sks::DesignateUser::new(key.uid as i32).ok_or(EINVAL)?;
+                let user = bag_designation(key.uid)?;
                 let record = self.fde_key_create(user)?;
                 if record.len() > FDE_RECORD_MAX {
                     return Err(E2BIG);
@@ -1985,7 +1986,18 @@ mod tests {
         assert!(parse_fde(&fde_request(ok, 0, 32, 0), true).is_err());
         assert!(parse_fde(&fde_request(ok, FDE_RECORD_MAX as u32 + 1, 32, 0), true).is_err());
         assert!(parse_fde(&fde_request(MIN_UID - 1, 600, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(MAX_UID + 1, 600, 32, 0), true).is_err());
         assert!(parse_fde(&fde_request(u32::MAX, 600, 32, 0), true).is_err());
+    }
+
+    #[test]
+    fn fde_uses_the_user_bag() {
+        // The sealing key lives in the bag SEP_BIO_KEYBAG_UNLOCK opens
+        // (USER_BAG_BASE + uid), not in the identity bag designated at 1000.
+        let user = parse_fde(&fde_request(1000, 600, 32, 0), true).expect("valid request");
+        assert_eq!(user.special_handle().value(), -((USER_BAG_BASE + 1000) as i32));
+        let user = parse_fde(&fde_request(MAX_UID, 600, 0, 113), false).expect("valid request");
+        assert_eq!(user.special_handle().value(), -(i32::MAX));
     }
 
     #[test]

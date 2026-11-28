@@ -617,10 +617,10 @@ impl SepData {
     }
 
     /// Volume-key sealing: a ref-key without an access-control list under
-    /// the designated user bag `user` (outer handle `-uid`), protection
-    /// class 9, so the enclave uses it only while that bag is unlocked. The
-    /// caller has unlocked the bag with the user's password. Variant-5 key
-    /// store only.
+    /// the designated user bag `user` (outer handle `-(USER_BAG_BASE + uid)`,
+    /// from `userbag::bag_designation`), protection class 9, so the enclave
+    /// uses it only while that bag is unlocked. The caller has unlocked the
+    /// bag with the user's password. Variant-5 key store only.
     pub(crate) fn fde_key_create(&self, user: crate::sks::DesignateUser) -> Result<KVec<u8>> {
         if self.profile.key_store != profile::KeyStore::Variant5 {
             return Err(EOPNOTSUPP);
