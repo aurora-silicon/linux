@@ -25,9 +25,11 @@ pub(crate) const RAMP_WINDOW_NS: u64 = SAMPLE_NS;
 /// bridges sub-ms depth-1 inter-job gaps and avoids redundant `mod_delayed_work(..., 0)`
 /// flushes without holding across 60 Hz (16.67 ms) or 120 Hz (8.33 ms) frame periods.
 pub(crate) const CLPC_IDLE_HOLD_NS: u64 = 2_000_000;
-/// Lowest governed state. On the J713 S1-S3 draw under 0.1 W for a desktop
-/// load and S4 several times that; S3 runs at 2.4 times the clock of S1.
-pub(crate) const FLOOR: u32 = 3;
+/// Lowest governed state (S2). On J713, S2 runs at 618 MHz (vs 796 MHz at S3),
+/// saving ~115-135 mW system power at idle and during paced 1080p30/1080p60
+/// hardware-decoded video playback while keeping desktop and video compositing
+/// within the lowest CLPC busy-share rungs.
+pub(crate) const FLOOR: u32 = 2;
 
 /// Completion polling must not turn into a PMP MMIO read on every pass.
 pub(crate) fn read_due(last: Option<u64>, now: u64) -> bool {
