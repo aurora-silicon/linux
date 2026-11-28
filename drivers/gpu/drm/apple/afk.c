@@ -1888,7 +1888,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 		      ep->dcp->hw.firmware_compat == DCP_FIRMWARE_H17P) ||
 		     ep->dcp->v27_j714s ||
-		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 && ep->dcp->dcpext) ||
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		      dcp_has_external_output(ep->dcp)) ||
 		     (ep->dcp->v27_sleep_transport && !strcmp(name, "md-manager")))) {
 			/*
 			 * H17G and firmware-27 T8142 can omit EPIC identity

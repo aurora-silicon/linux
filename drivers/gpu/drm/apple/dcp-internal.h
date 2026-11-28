@@ -1558,6 +1558,16 @@ static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
 	       dcp->hw.dptx_endpoint == DPTX_ENDPOINT_V2;
 }
 
+/*
+ * A DCP that drives an external connector: an external processor, Type-C
+ * display routes, or a fixed DP/HDMI PHY in its device tree node (a primary
+ * DCP can own the fixed HDMI route, as on the M2 Mac mini).
+ */
+static inline bool dcp_has_external_output(const struct apple_dcp *dcp)
+{
+	return dcp->dcpext || dcp->nr_typec_routes || dcp->fixed_phy;
+}
+
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */
 static inline bool dcp_is_v14_7_panel(const struct apple_dcp *dcp)
 {

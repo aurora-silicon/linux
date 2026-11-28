@@ -1676,7 +1676,7 @@ int dptxep_init(struct apple_dcp *dcp)
 			 */
 			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp) ||
 			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-			     (dcp->dcpext || dcp->nr_typec_routes))) {
+			     dcp_has_external_output(dcp))) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;

@@ -5077,7 +5077,7 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
 static void dcp_v27_dptx_layout(struct apple_dcp *dcp)
 {
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
-	    (!dcp->dcpext && !dcp->nr_typec_routes) || dcp->hw.dptx_endpoint)
+	    !dcp_has_external_output(dcp) || dcp->hw.dptx_endpoint)
 		return;
 	if (!apple_rtkit_has_endpoint(dcp->rtk, DPTX_CONTROLLER_ENDPOINT) ||
 	    !apple_rtkit_has_endpoint(dcp->rtk, DPTX_ENDPOINT))
