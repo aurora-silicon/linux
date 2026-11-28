@@ -1704,6 +1704,84 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/* The process timescale the qualified 6070 image writes. */
+#define AVE_TEST_PROC_TIMESCALE 14400000ULL
+
+/* Build the Start image and the first Process image of @sess. */
+static void ave_test_6070_build(struct kunit *test, struct ave_ctx *ctx,
+				u8 *start, u8 *process, u32 bitrate)
+{
+	const struct ave_fw_layout *fw = ctx->ave->layout;
+	enum ave_codec codec = ctx->sess->p.codec;
+	size_t start_len = fw->bytes[codec - 1][AVE_IMAGE_START];
+	size_t process_len = fw->bytes[codec - 1][AVE_IMAGE_PROCESS];
+
+	memset(start, 0, start_len);
+	memset(process, 0, process_len);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, start_len), 0);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, process_len, 0,
+					  0x8f0000000ULL, bitrate, false, false),
+			0);
+}
+
+/* h264_inter: P pictures stay references, inter decisions are weighted. */
+static void ave_6070_h264_inter(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *start = kunit_kzalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *process = kunit_kzalloc(test, 0x6838, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.h264_inter);
+
+	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
+	     codec++) {
+		const struct ave_start_layout *sl;
+		const struct ave_proc_layout *pl;
+		bool h264 = codec == AVE_CODEC_H264;
+
+		ave_test_6070_session(test, ave, ctx, sess, codec, 1280, 720);
+		sl = &ave->layout->start[codec - 1];
+		pl = &ave->layout->process[codec - 1];
+		for (unsigned int on = 0; on < 2; on++) {
+			sess->p.h264_inter = on;
+			ave_test_6070_build(test, ctx, start, process, 4000000);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le64(process + pl->timescale),
+					on && h264 ? 0 : AVE_TEST_PROC_TIMESCALE);
+			if (!h264)
+				continue;
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_me_fullpel_lambda),
+					on ? 64U : 0U);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_md_inter_lambda),
+					on ? 256U : 0U);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start +
+							   sl->h264_md_intra_lambda),
+					on ? 64U : 0U);
+			/* The other H.264 inter words are not touched. */
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le16(start + sl->h264_skip_mode),
+					(u16)AVE_AVC_RECON_SKIP_MODE);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(process +
+							   pl->static_area_mask),
+					(u32)AVE_AVC_STATIC_AREA_MASK_ALL);
+		}
+	}
+}
+
 /*
  * The M3 generation binds probe-only: no build is pinned, the coprocessor
  * is never started, and nothing is encoded, whatever layout a TEXT CRC
@@ -1737,6 +1815,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
 	KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_start_process_fields),
+	KUNIT_CASE(ave_6070_h264_inter),
 	KUNIT_CASE(ave_6070_reordered_pictures),
 	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),

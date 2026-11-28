@@ -35,6 +35,13 @@ normal drain barrier; Flush is reserved for cancellation before Stop and Close.
 KUnit checks the 1080p and 4K fields directly from the clean ledgers and embeds
 no Apple command image.
 
+H.264 P pictures are kept as references on 6070.11.1: the Process timescale
+word is written as zero for H.264 (with it nonzero every P slice had
+nal_ref_idc 0 and frame_num stayed at 1, which POC type 2 does not allow), and
+the Start motion lambdas at 0xff98 (full-pel search), 0xffa4 (inter mode
+decision) and 0xffa8 (intra mode decision) are 64, 256 and 64. HEVC keeps its
+timescale.
+
 Lifecycle-only validation
 -------------------------
 

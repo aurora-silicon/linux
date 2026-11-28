@@ -126,6 +126,7 @@ u32 ave_cq_initial_qp(u32 quality)
 
 static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 {
+	const struct ave_fw_layout *layout = ctx->ave->layout;
 	bool baseline = false;
 	int level;
 
@@ -140,6 +141,7 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->fps_num = ctx->timeperframe.denominator;
 	p->fps_den = ctx->timeperframe.numerator;
 	p->fps_int = max(DIV_ROUND_CLOSEST(p->fps_num, p->fps_den), 1U);
+	p->h264_inter = layout->h264_inter;
 
 	if (p->codec == AVE_CODEC_H264) {
 		switch (ctx->h264_profile) {
