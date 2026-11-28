@@ -220,6 +220,56 @@ fn main() {
     return events, idle_events, paced_events
 
 
+def strip_dts_comments(text):
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+        lambda m: m.group(0) if m.group(0).startswith('"') else ' ',
+        text,
+        flags=re.S,
+    )
+
+
+def dt_cells(node_text, name):
+    match = re.search(r'(?:^|[\s;])' + re.escape(name) + r'\s*=\s*([^;]*);', node_text)
+    if not match:
+        return None
+    return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
+
+
+def parse_clpc_dt_gpu_busy(dts_text, node_sig):
+    clpc_node = item(strip_dts_comments(dts_text), node_sig)
+    return (
+        dt_cells(clpc_node, 'apple,gpu-busy-memory-states'),
+        dt_cells(clpc_node, 'apple,gpu-busy-permille'),
+    )
+
+
+def parse_t8132_gpu_busy(dts_text):
+    states, busy = parse_clpc_dt_gpu_busy(dts_text, 'clpc: performance-controller@3 {')
+    assert states and busy, \
+        't8132-memory.dtsi clpc node must define both gpu-busy DT properties'
+    return states, busy
+
+
+def test_dt_negative_controls(dts_text, label, parser):
+    for prop, short in [
+        ('apple,gpu-busy-memory-states', 'states'),
+        ('apple,gpu-busy-permille', 'permille'),
+    ]:
+        pat = re.compile(r'^([ \t]*)(' + re.escape(prop) + r'\s*=[^;]*;)', re.M)
+        for kind, repl in [
+            ('delete', ''),
+            ('block-comment', r'\1/* \2 */'),
+            ('line-comment', r'\1// \2'),
+        ]:
+            mutated, count = pat.subn(repl, dts_text, count=1)
+            assert count == 1 and mutated != dts_text, f'stale mutation: {label}-{kind}-{short}'
+            try:
+                parser(mutated)
+            except AssertionError:
+                print(f'PASS negative control: {label}-dt-{kind}-{short}')
+            else:
+                raise AssertionError(f'negative control passed unexpectedly: {label}-dt-{kind}-{short}')
 def main():
     g17_events, g17_idle_events, g17_paced_events = test_g17_busy_share()
     source = (ROOT / 'drivers/soc/apple/clpc.c').read_text()
@@ -250,9 +300,16 @@ def main():
     assert (dt_states is None) == (dt_busy is None)
     gpu_states = dt_states or [1, 2, 4, 5, 0, 0, 0, 3]
     gpu_busy = dt_busy or [160, 500, 800]
+    # Parse T8132's shared CLPC node directly; both DT properties are required.
+    t8132_dts = (ROOT / 'arch/arm64/boot/dts/apple/t8132-memory.dtsi').read_text()
+    t8132_states, t8132_busy = parse_t8132_gpu_busy(t8132_dts)
+    test_dt_negative_controls(t8132_dts, 't8132', parse_t8132_gpu_busy)
+
     t6041_dt = (
         'static const u32 t6041_gpu_states[] = {' + ', '.join(str(x) for x in gpu_states) + '};\n'
         'static const u32 t6041_gpu_busy[] = {' + ', '.join(str(x) for x in gpu_busy) + '};\n'
+        'static const u32 t8132_gpu_states[] = {' + ', '.join(str(x) for x in t8132_states) + '};\n'
+        'static const u32 t8132_gpu_busy[] = {' + ', '.join(str(x) for x in t8132_busy) + '};\n'
         'static const struct { unsigned long ms; unsigned int permille; } g17_long_events[] = {'
         + ', '.join(f'{{{t}, {p}}}' for t, p in g17_events) + '};\n'
         'static const struct { unsigned long ms; int permille; } g17_idle_events[] = {'
@@ -460,6 +517,45 @@ static void t6041_from_dt(void) {
  busy[0] = 160; busy[1] = 500; busy[2] = 1001;
  assert(apple_clpc_dt_busy(&bad, busy, 3) == -EINVAL);
  assert(apple_clpc_dt_busy(&bad, busy, 2) == -EINVAL);
+}
+static struct apple_clpc_hw t8132_dt_hw;
+static void t8132_from_dt(void) {
+ static const u8 cpu[2][4] = {{5, 5, 5, 5}, {3, 3, 3, 3}}, gpu[2][4] = {{1, 2, 4, 5}, {0, 0, 0, 3}};
+ int prev = dt_warned;
+
+ dt_warned = 0;
+ assert(apple_clpc_dt_apply(NULL, &apple_clpc_hw_t8132, &t8132_dt_hw,
+                            t8132_gpu_states, ARRAY_SIZE(t8132_gpu_states),
+                            t8132_gpu_busy, ARRAY_SIZE(t8132_gpu_busy)));
+ assert(dt_warned == 0);
+ for (int r = 0; r < 2; r++)
+  for (int l = 0; l < 4; l++)
+   assert(t8132_dt_hw.map[r][l] == cpu[r][l] && t8132_dt_hw.gpu_busy[r][l] == gpu[r][l]);
+ dt_warned = prev;
+}
+
+static void check_t8132_busy(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t8132_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ assert(c.hw->gpu_busy_mid == 160 && c.hw->gpu_busy_high == 500 && c.hw->gpu_busy_top == 800);
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ gpu.active = true; jiffies = 8000; apple_clpc_sample(&c);
+ assert(published == 0x35 && c.last_reason == 2 && gpu.level == 3);
+ gpu.active = false; jiffies = 8100; apple_clpc_sample(&c); assert(published == 0);
+ gpu.active = true; gpu.busy_valid = true; gpu.busy = 159; jiffies = 8500;
+ apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
+ gpu.busy = 160; jiffies = 8504; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 499; jiffies = 8508; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 500; jiffies = 8512; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 799; jiffies = 8516; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 800; jiffies = 8520; apple_clpc_sample(&c); assert(published == 0x35 && gpu.level == 3);
+ gpu.busy = 100;
+ for (jiffies = 8524; jiffies < 8920; jiffies += 4) {
+  apple_clpc_sample(&c); assert(published == 0x35 && gpu.level == 3);
+ }
+ jiffies = 8920; apple_clpc_sample(&c); assert(published == 0x31 && gpu.level == 0);
+ jiffies = 8952; apple_clpc_sample(&c); assert(published == 0x01 && c.last_reason == 2);
+ gpu.active = false; jiffies = 9000; apple_clpc_sample(&c); assert(published == 0 && queued_idle);
 }
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.
@@ -828,6 +924,8 @@ int main(void) {
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
  t6041_from_dt();
  check_t6041_busy();
+ t8132_from_dt();
+ check_t8132_busy();
  check_t6041_long_in_flight();
  check_t6041_idle_burst();
  check_t6041_paced_24fps();

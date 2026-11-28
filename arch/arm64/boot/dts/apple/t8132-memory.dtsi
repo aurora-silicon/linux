@@ -56,6 +56,8 @@
 			compatible = "apple,t8132-clpc";
 			reg = <3>;
 			apple,gpu-power-state = <&ps_gfx>;
+			apple,gpu-busy-memory-states = <1 2 4 5>, <0 0 0 3>;
+			apple,gpu-busy-permille = <160 500 800>;
 		};
 	};
 };
