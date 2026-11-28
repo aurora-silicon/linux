@@ -103,4 +103,25 @@ static inline bool dchid_tp26_clicked(const u8 *data, size_t size)
 	return false;
 }
 
+/*
+ * Whether a failed receive-ring command is to be absorbed. Only a node that
+ * has an MMIO FIFO receive path of its own (fifo_fallback) may fall back to
+ * it; the T6041 ring is its only receive path and its failure must fail the
+ * interface start.
+ */
+static inline bool dchid_ring_refused(int ret, bool fifo_fallback)
+{
+	return ret < 0 && fifo_fallback;
+}
+
+/*
+ * Whether the ring stays unused for the session. Only a refused CMD_REGISTER_RING does:
+ * when the preparation command failed, CMD_REGISTER_RING was never sent, so nothing
+ * was refused and a later interface start may register the ring.
+ */
+static inline bool dchid_ring_stays_on_fifo(bool prepared, int ret, bool fifo_fallback)
+{
+	return prepared && dchid_ring_refused(ret, fifo_fallback);
+}
+
 #endif /* _DOCKCHANNEL_HID_PROTOCOL_H */

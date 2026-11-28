@@ -398,6 +398,8 @@ static void *dchid_test_ring(struct kunit *test, u32 consumer, u32 producer)
 	dchid->ring_read = consumer;
 	dchid->ring_registered = true;
 	dchid->use_ring = true;
+	dchid->use_rx_ring = true;
+	dchid->ring_size = DCHID_RING_SIZE;
 	return dchid->ring + DCHID_RING_HEADER_SIZE;
 }
 

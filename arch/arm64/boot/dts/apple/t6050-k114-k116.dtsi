@@ -366,7 +366,7 @@
 	status = "okay";
 
 	mtp_hid: input@8000 {
-		compatible = "apple,dockchannel-hid";
+		compatible = "apple,t6050-dockchannel-hid", "apple,dockchannel-hid";
 		reg = <0x8000 0x1000>, <0xc000 0x1000>,
 		      <0x0 0x1000>, <0x4000 0x1000>;
 		reg-names = "config", "data", "rmt-config", "rmt-data";
