@@ -445,16 +445,45 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 #include "iomfb_template.c"
 
+struct dcp_v27_rt_bw_extended_reply {
+	struct apple_dcp_h17p_rt_bw_config config;
+	u32 unknown_10;
+	__le32 scratch_offset;
+	u32 unknown_18;
+	__le32 scratch_size;
+	u32 unknown_20[2];
+	__le32 status;
+} __packed;
+
+static_assert(sizeof(struct dcp_v27_rt_bw_extended_reply) == 0x2c);
+
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
 {
+	const struct dcp_packet_header *header = in - sizeof(*header);
+	const struct apple_dcp_h17p_rt_bw_request *request = in;
+	struct dcp_v27_rt_bw_extended_reply *reply = out;
+	u32 offset = dcp->disp_bw_scratch_offset;
 	u64 scratch = dcp->disp_firmware_base[dcp->disp_bw_scratch_index] +
-		      dcp->disp_bw_scratch_offset;
-	u64 clock_request = 0;
+		      offset;
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	if (apple_dcp_h17p_rt_bw_encode_reply(in, out, scratch, clock_request))
+	if (header->out_len != sizeof(*reply)) {
+		if (apple_dcp_h17p_rt_bw_encode_reply(request, out, scratch, 0))
+			dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+		return true;
+	}
+
+	if (le32_to_cpu(request->config_null) & 1) {
 		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+		return true;
+	}
+
+	/* The extended reply also locates the 8-byte slot relative to its window. */
+	apple_dcp_h17p_rt_bw_encode(&reply->config, scratch, 0);
+	reply->scratch_offset = cpu_to_le32(offset);
+	reply->scratch_size = cpu_to_le32(sizeof(u64));
+	reply->status = cpu_to_le32(0);
 	return true;
 }
 
