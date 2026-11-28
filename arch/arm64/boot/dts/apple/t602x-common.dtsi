@@ -18,6 +18,15 @@
 		#endif
 	};
 
+	/*
+	 * The boot loader adds macOS's Low Power mode CPU ceiling from the
+	 * ADT (pmgr/clpc cpu-low-power-frequency-max).
+	 */
+	clpc: performance-controller {
+		compatible = "apple,t6020-clpc", "apple,clpc";
+		apple,smc = <&smc>;
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
