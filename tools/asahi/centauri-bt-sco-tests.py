@@ -14,7 +14,7 @@ import tempfile
 
 def extract_fn(source, name):
     match = re.search(
-        r"^static (?:void|bool|int) " + re.escape(name) + r"\([^;]*?\)\n\{",
+        r"^static (?:void|bool|int|u8|u16) " + re.escape(name) + r"\([^;]*?\)\n\{",
         source,
         re.M,
     )
@@ -40,7 +40,14 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 
+#define CEN_HRB_SYNC_PKT_HDR_MASK 0x3c00
 #define CEN_MAX_HRB_CONNS 16
+#define HCI_EV_CONN_COMPLETE 0x03
+#define HCI_EV_CONN_REQUEST 0x04
+#define HCI_EV_SYNC_CONN_COMPLETE 0x2c
+#define SCO_LINK 0x00
+#define ACL_LINK 0x01
+#define ESCO_LINK 0x02
 
 struct cen_hrb_conn {
 	bool valid;
@@ -98,6 +105,21 @@ int main(void)
 	assert(!bt.hrb_status_pending);
 	assert(bt.hrb_sync_pending_wire == 0 && bt.hrb_sync_pending_orig == 0);
 
+	/* Extended SCO packet mask keeps bits 13:10 clear on standard calls. */
+	assert(cen_hrb_sync_pkt_mask(0x0380) == 0x0380);
+	assert(cen_hrb_sync_pkt_mask(0x02be) == 0x02be);
+	assert(cen_hrb_sync_pkt_mask(0x3f80) == 0x0380);
+
+	/* Vendor link types >= 0xf0 normalize to standard HCI link types. */
+	assert(cen_hrb_normalize_link_type(HCI_EV_CONN_COMPLETE, 0xf0) == ACL_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_CONN_COMPLETE, 0xf1) == ACL_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_SYNC_CONN_COMPLETE, 0xf2) == ESCO_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_SYNC_CONN_COMPLETE, 0xf0) == ESCO_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_SYNC_CONN_COMPLETE, ESCO_LINK) == ESCO_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_CONN_REQUEST, 0xf0) == ACL_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_CONN_REQUEST, 0xf2) == ESCO_LINK);
+	assert(cen_hrb_normalize_link_type(HCI_EV_CONN_REQUEST, SCO_LINK) == SCO_LINK);
+
 	puts("PASS: Centauri Bluetooth HRB SCO tracking");
 	return 0;
 }
@@ -120,6 +142,7 @@ def main():
         "CEN_OP_HRB_ACCEPT_SYNC_CONN 0xfdf8",
         "CEN_OP_WRITE_VOICE_CONFIG 0xfe10",
         "CEN_VOICE_TRANSPARENT_16BIT 0x0063",
+        "CEN_HRB_SYNC_PKT_HDR_MASK 0x3c00",
     ):
         assert sym in c_src, f"missing {sym} in btcentauri.c"
         assert sym in t6050_src, f"missing {sym} in btcentauri_t6050.c"
@@ -132,6 +155,8 @@ def main():
             "cen_hrb_track_del",
             "cen_hrb_has_handle",
             "cen_hrb_has_bdaddr",
+            "cen_hrb_sync_pkt_mask",
+            "cen_hrb_normalize_link_type",
         )
     )
 
@@ -149,6 +174,18 @@ def main():
                 "bt->hrb_sync_pending_wire = 0;",
                 "/* omit clearing pending wire opcode */",
                 "hrb_sync_pending_wire == 0",
+            ),
+            (
+                "wrong-hdr-bit-sense",
+                "return pkt_type & ~CEN_HRB_SYNC_PKT_HDR_MASK;",
+                "return pkt_type | CEN_HRB_SYNC_PKT_HDR_MASK;",
+                "cen_hrb_sync_pkt_mask(0x0380) == 0x0380",
+            ),
+            (
+                "missing-sync-link-type-norm",
+                "if (ev_code == HCI_EV_SYNC_CONN_COMPLETE && link_type >= 0xf0)\n\t\treturn ESCO_LINK;",
+                "if (ev_code == HCI_EV_SYNC_CONN_COMPLETE && link_type >= 0xf0)\n\t\treturn link_type;",
+                "cen_hrb_normalize_link_type(HCI_EV_SYNC_CONN_COMPLETE, 0xf2) == ESCO_LINK",
             ),
         ]
         for name, old, new, expected_msg in controls:

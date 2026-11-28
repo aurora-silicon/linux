@@ -92,6 +92,8 @@ MODULE_PARM_DESC(native_hrb, "Translate BR/EDR Create Connection to the firmware
 #define CEN_PROP_HRB_CREATE BIT(9)
 #define CEN_VOICE_TRANSPARENT 0x0003
 #define CEN_VOICE_TRANSPARENT_16BIT 0x0063
+/* Bits 13:10 select extended high-rate eSCO packet types; keep clear on standard calls. */
+#define CEN_HRB_SYNC_PKT_HDR_MASK 0x3c00
 #define CEN_MAX_HRB_CONNS 16
 
 struct cen_hrb_conn {
@@ -634,6 +636,26 @@ static bool cen_hrb_has_bdaddr(const struct cen_bt *bt, const u8 bdaddr[6])
 	return false;
 }
 
+static u16 cen_hrb_sync_pkt_mask(u16 pkt_type)
+{
+	return pkt_type & ~CEN_HRB_SYNC_PKT_HDR_MASK;
+}
+
+static u8 cen_hrb_normalize_link_type(u8 ev_code, u8 link_type)
+{
+	if (ev_code == HCI_EV_CONN_COMPLETE && (link_type & 0xfe) == 0xf0)
+		return ACL_LINK;
+	if (ev_code == HCI_EV_SYNC_CONN_COMPLETE && link_type >= 0xf0)
+		return ESCO_LINK;
+	if (ev_code == HCI_EV_CONN_REQUEST) {
+		if ((link_type & 0xfe) == 0xf0)
+			return ACL_LINK;
+		if ((link_type & 0xfe) == 0xf2)
+			return ESCO_LINK;
+	}
+	return link_type;
+}
+
 static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 			u16 ring, u16 slots, u32 offset, u16 footer, u16 *head)
 {
@@ -698,12 +720,16 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 						   command + HCI_COMMAND_HDR_SIZE + 12);
 			/* Extended links (0xf0/0xf1) require the 18-byte
 			 * extended synchronous setup command with 24-bit
-			 * packet type mask.
+			 * packet type mask and high-rate packet bits masked off.
 			 */
 			if (READ_ONCE(bt->hrb_supported) &&
 			    cen_hrb_has_handle(bt, handle)) {
+				u16 pkt = get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE + 15);
+
 				put_unaligned_le16(CEN_OP_HRB_SETUP_SYNC_CONN, command);
 				command[2] = 18;
+				put_unaligned_le16(cen_hrb_sync_pkt_mask(pkt),
+						   command + HCI_COMMAND_HDR_SIZE + 15);
 				command[HCI_COMMAND_HDR_SIZE + 17] = 0;
 				wire_length = HCI_COMMAND_HDR_SIZE + 18;
 				bt->hrb_sync_pending_wire = CEN_OP_HRB_SETUP_SYNC_CONN;
@@ -723,8 +749,12 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 						   command + HCI_COMMAND_HDR_SIZE + 16);
 			if (READ_ONCE(bt->hrb_supported) &&
 			    cen_hrb_has_bdaddr(bt, command + HCI_COMMAND_HDR_SIZE)) {
+				u16 pkt = get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE + 19);
+
 				put_unaligned_le16(CEN_OP_HRB_ACCEPT_SYNC_CONN, command);
 				command[2] = 22;
+				put_unaligned_le16(cen_hrb_sync_pkt_mask(pkt),
+						   command + HCI_COMMAND_HDR_SIZE + 19);
 				command[HCI_COMMAND_HDR_SIZE + 21] = 0;
 				wire_length = HCI_COMMAND_HDR_SIZE + 22;
 				bt->hrb_sync_pending_wire = CEN_OP_HRB_ACCEPT_SYNC_CONN;
@@ -791,6 +821,22 @@ static void cen_fixup_event(struct cen_bt *bt, struct sk_buff *skb)
 			    skb->data[6]);
 		skb->data[6] = 0;
 		bt->accept_list_hidden++;
+	}
+	if (skb->len >= HCI_EVENT_HDR_SIZE + 3 + sizeof(struct hci_rp_read_buffer_size) &&
+	    skb->data[0] == HCI_EV_CMD_COMPLETE &&
+	    get_unaligned_le16(skb->data + 3) == HCI_OP_READ_BUFFER_SIZE &&
+	    !skb->data[5]) {
+		struct hci_rp_read_buffer_size *rp = (void *)(skb->data + 5);
+
+		if (!rp->sco_mtu || !le16_to_cpu(rp->sco_max_pkt)) {
+			bt_dev_info(bt->hdev,
+				    "Controller reported SCO buffers %u:%u; using ring defaults 60:8",
+				    rp->sco_mtu, le16_to_cpu(rp->sco_max_pkt));
+			if (!rp->sco_mtu)
+				rp->sco_mtu = 60;
+			if (!le16_to_cpu(rp->sco_max_pkt))
+				rp->sco_max_pkt = cpu_to_le16(8);
+		}
 	}
 }
 
@@ -887,9 +933,25 @@ static void cen_poll(struct work_struct *work)
 					cen_hrb_track_add(bt,
 							  get_unaligned_le16(skb->data + 3),
 							  skb->data + 5);
-				skb->data[11] = ACL_LINK;
+				skb->data[11] = cen_hrb_normalize_link_type(HCI_EV_CONN_COMPLETE,
+									    skb->data[11]);
 				bt->hrb_connection_events++;
 			}
+			if (READ_ONCE(bt->hrb_supported) &&
+			    length == HCI_EVENT_HDR_SIZE +
+				      sizeof(struct hci_ev_sync_conn_complete) &&
+			    skb->data[0] == HCI_EV_SYNC_CONN_COMPLETE &&
+			    skb->data[11] >= 0xf0) {
+				cen_capture_frame(bt, 7, skb->data, length);
+				skb->data[11] = cen_hrb_normalize_link_type(
+					HCI_EV_SYNC_CONN_COMPLETE, skb->data[11]);
+			}
+			if (READ_ONCE(bt->hrb_supported) &&
+			    length == HCI_EVENT_HDR_SIZE + sizeof(struct hci_ev_conn_request) &&
+			    skb->data[0] == HCI_EV_CONN_REQUEST &&
+			    skb->data[11] >= 0xf0)
+				skb->data[11] = cen_hrb_normalize_link_type(HCI_EV_CONN_REQUEST,
+									    skb->data[11]);
 			if (length == HCI_EVENT_HDR_SIZE + sizeof(struct hci_ev_disconn_complete) &&
 			    skb->data[0] == HCI_EV_DISCONN_COMPLETE &&
 			    !skb->data[2])
@@ -1343,9 +1405,10 @@ static int cen_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
-	seq_printf(s, "sco_tx=%u sco_rx=%u sco_queued=%u iso_queued=%u\n",
+	seq_printf(s, "sco_tx=%u sco_rx=%u sco_queued=%u iso_queued=%u sco_mtu=%u sco_pkts=%u\n",
 		   bt->hdev->stat.sco_tx, bt->hdev->stat.sco_rx,
-		   skb_queue_len(&bt->sco_txq), skb_queue_len(&bt->iso_txq));
+		   skb_queue_len(&bt->sco_txq), skb_queue_len(&bt->iso_txq),
+		   bt->hdev->sco_mtu, bt->hdev->sco_pkts);
 	seq_printf(s, "auxiliary_rings=%u messages=%u message_head=%u capture_bytes=%u capture_records=%u capture_dropped=%u\n",
 		   arm_auxiliary_rings, bt->message_tag, bt->message_head,
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);

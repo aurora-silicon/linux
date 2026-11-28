@@ -109,14 +109,21 @@ Both Bluetooth transports expose an ``HCI_PCI`` device with:
 * **Controller Provisioning & Quirks:** Factory BD_ADDR provisioning
   from device-tree ``local-bd-address`` (``0xfc06``, ``0xff0b``,
   ``0xfe44``), runtime public address updates via ``hdev->set_bdaddr``
-  (``0xfc06``), vendor duplicate-filter flush (``0xff3f`` via
-  ``hdev->reset_dup_filter``, automatically falling back to host
-  duplicate filtering if firmware rejects the command), LE extended
-  advertising PHY and legacy scan-response normalization, wideband speech
-  HFP support (``HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED`` over SCO rings 3
-  and 9), host-side LE accept-list scan filtering (reporting accept-list
-  size 0 unless ``accept_list=1`` is set), and BR/EDR extended Create
-  Connection translation (``0xff7b`` when advertised by ``0xffa3`` bit 9).
+  (``0xfc06``), HCI voice-path routing (``0xfe10``), vendor
+  duplicate-filter flush (``0xff3f`` via ``hdev->reset_dup_filter``,
+  automatically falling back to host duplicate filtering if firmware
+  rejects the command), LE extended advertising PHY and legacy
+  scan-response normalization, wideband speech HFP support
+  (``HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED`` over SCO rings 3 and 9,
+  normalizing transparent voice setting ``0x0003`` to ``0x0063``),
+  host-side LE accept-list scan filtering (reporting accept-list size 0
+  unless ``accept_list=1`` is set), and BR/EDR extended Create Connection
+  (``0xff7b`` when advertised by ``0xffa3`` bit 9) together with extended
+  Setup/Accept Synchronous Connection translation (``0xfdc7``/``0xfdf8``
+  with 24-bit packet type masks keeping bits 13:10 clear on standard
+  calls) and vendor link-type normalization across Connection Complete,
+  Connection Request, and Synchronous Connection Complete events for
+  handles established with extended link types (``0xf0``/``0xf1``).
 * **Resilient Data RX, Timeout Diagnostics & Power Management:**
   Frame-level malformed ACL, SCO, and ISO packets are dropped with
   rate-limited diagnostics without halting the HCI transport, and unknown
@@ -145,6 +152,7 @@ live under ``tools/asahi/``:
    python3 tools/asahi/centauri-wifi-pm-tests.py --negative-controls
    python3 tools/asahi/centauri-wifi-avoid-tests.py
    python3 tools/asahi/centauri-bt-arena-tests.py --negative-controls
+   python3 tools/asahi/centauri-bt-sco-tests.py --negative-controls
    python3 tools/asahi/centauri-recovery-tests.py --negative-controls
    python3 tools/asahi/centauri-physical-recovery-tests.py
 
