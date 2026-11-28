@@ -462,6 +462,8 @@ static struct topology_rgb8 *topology_rgb8_init(struct kunit *test)
 		if (i != RGB8_NODATA)
 			platform_set_drvdata(t->pdev[i], &t->dcp[i]);
 	}
+	/* A 10-bit pipeline that is not on the default method set */
+	t->dcp[RGB8_PLAIN].hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17G;
 	t->dcp[RGB8_EXT26].hw.iomfb_method_profile = DCP_IOMFB_METHODS_J613_EXT26;
 	/* An ext26 method set that cannot be reached: no drvdata */
 	t->dcp[RGB8_NODATA].hw.iomfb_method_profile = DCP_IOMFB_METHODS_J613_EXT26;
@@ -491,6 +493,9 @@ static void topology_rgb8_only_test(struct kunit *test)
 	struct platform_device *nodata_first[] = {
 		t->pdev[RGB8_NODATA], t->pdev[RGB8_PLAIN], t->pdev[RGB8_EXT26],
 	};
+	struct platform_device *ext26_first[] = {
+		t->pdev[RGB8_EXT26], t->pdev[RGB8_PLAIN], t->pdev[RGB8_NODATA],
+	};
 	struct platform_device *plain = t->pdev[RGB8_PLAIN];
 	struct platform_device *ext26 = t->pdev[RGB8_EXT26];
 	struct platform_device *nodata = t->pdev[RGB8_NODATA];
@@ -505,6 +510,7 @@ static void topology_rgb8_only_test(struct kunit *test)
 	/* Any pipeline: an ext26 candidate after a 10-bit one */
 	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(all, 3, NULL, both));
 	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(nodata_first, 3, NULL, both));
+	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(ext26_first, 3, NULL, both));
 
 	/* One pipeline: only its own method set counts */
 	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, plain, both));

@@ -56,6 +56,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('lifecycle', 'typec-reconnect-budget', lifecycle.reconnect, ((),), ()),
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
         ('audio', 'cec-only-av-endpoint', audio.cec_only_endpoint, ((),), ()),

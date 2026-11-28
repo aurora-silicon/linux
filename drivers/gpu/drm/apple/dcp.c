@@ -2583,6 +2583,9 @@ static void dcp_queue_typec_reconnect_locked(struct apple_dcp *dcp,
 			return;
 		dcp->typec_reconnect_session = dcp_session_locked(dcp);
 	}
+	/* Each request owns its budget; retries re-arm the work directly. */
+	dcp->typec_reconnect_generation++;
+	dcp->typec_reconnect_tries = 0;
 	mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, delay);
 }
 
@@ -3188,7 +3191,6 @@ void dcp_external_ready(struct apple_dcp *dcp)
 {
 	if (READ_ONCE(dcp->typec_cable_connected)) {
 		guard(mutex)(&dcp->hpd_mutex);
-		dcp->typec_reconnect_tries = 0;
 		dcp_queue_typec_reconnect_locked(dcp, 0);
 	} else if (dcp->hdmi_hpd && dcp->active &&
 		   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
@@ -3321,7 +3323,6 @@ void dcp_external_retry_work(struct work_struct *work)
 			if (ret)
 				return;
 		}
-		dcp->typec_reconnect_tries = 0;
 	}
 	guard(mutex)(&dcp->hpd_mutex);
 	dcp_queue_typec_reconnect_locked(dcp, 0);
@@ -3921,6 +3922,8 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     typec_reconnect_wq);
 	struct dcp_fabric_session session;
+	u32 generation;
+	unsigned int tries, limit;
 	int ret;
 
 	/*
@@ -3938,12 +3941,19 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	    READ_ONCE(dcp->typec_follow_retiring))
 		return;
 
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		/* A newer request is queued; leave its deadline and budget alone. */
+		if (delayed_work_pending(&dcp->typec_reconnect_wq))
+			return;
+		generation = dcp->typec_reconnect_generation;
+		session = dcp->typec_reconnect_session;
+	}
+
 	if (dcp_typec_sessionless(dcp)) {
 		ret = dcp_dptx_connect(dcp, 0);
 	} else {
 		/* Only the session this work was queued for may connect. */
 		scoped_guard(mutex, &dcp->hpd_mutex) {
-			session = dcp->typec_reconnect_session;
 			if (!dcp_session_valid_locked(dcp, session, true))
 				return;
 		}
@@ -3957,25 +3967,28 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 				return;
 		}
 	}
-	if (!ret) {
-		dcp->typec_reconnect_tries = 0;
+	if (!ret)
 		return;
-	}
 	/* A display held for this link will not get ready. */
 	if (READ_ONCE(dcp->external_error))
 		dcp_announce_kick(dcp);
 
 	/* A T8132 dcpext connects once per tunnel. */
-	if (++dcp->typec_reconnect_tries <
-	    (dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?
-	     1 : DPTX_RECONNECT_RETRIES)) {
-		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
-				 DPTX_RECONNECT_DELAY);
-		return;
+	limit = dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?
+		1 : DPTX_RECONNECT_RETRIES;
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (generation != dcp->typec_reconnect_generation)
+			return;
+		tries = ++dcp->typec_reconnect_tries;
+		if (tries < limit) {
+			mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
+					 DPTX_RECONNECT_DELAY);
+			return;
+		}
 	}
 
-	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
-		dcp->typec_reconnect_tries, ret);
+	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u attempts: %d\n",
+		tries, ret);
 }
 
 /**
@@ -4022,7 +4035,6 @@ static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 	dcp->typec_generation++;
 	WRITE_ONCE(dcp->typec_cable_connected, true);
 	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
-	dcp->typec_reconnect_tries = 0;
 	dcp->placeholder_retried = false;
 	cancel_delayed_work(&dcp->typec_reconnect_wq);
 	/* A newly attached display gets its own retries. */
@@ -5641,7 +5653,6 @@ void dcp_poweron(struct platform_device *pdev)
 		 */
 		if (READ_ONCE(dcp->typec_cable_connected)) {
 			cancel_delayed_work(&dcp->typec_reconnect_wq);
-			dcp->typec_reconnect_tries = 0;
 			/* the modeset of this commit follows, see dcpep_cb_hotplug() */
 			WRITE_ONCE(dcp->typec_poweron_hpd, true);
 			ret = dcp_dptx_connect(dcp, 0);

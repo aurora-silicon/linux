@@ -1214,7 +1214,8 @@ struct apple_dcp {
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
-	u32 typec_reconnect_tries;
+	u32 typec_reconnect_tries; /* hpd_mutex */
+	u32 typec_reconnect_generation; /* hpd_mutex; independent of the fabric session */
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 	/* hpd_mutex: what DRM reports for the external display, and when */
 	struct dcp_announce announce;
