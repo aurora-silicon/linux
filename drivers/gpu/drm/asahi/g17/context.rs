@@ -15,16 +15,16 @@ use super::{
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
+use identity::{Order, OrderWake, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 
 /// Both of a context's render channels are bound to other pairs whose publications have not
 /// all retired: the publisher waits for that retirement.
 pub(crate) const RENDER_CHANNEL_PENDING: Error = ERECALLCONFLICT;
 use super::job::Engine;
 use kernel::{
-    new_mutex,
+    new_condvar, new_mutex,
     prelude::*,
-    sync::{Arc, Mutex},
+    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex},
 };
 
 const QOS_IDS: usize = 128;
@@ -241,6 +241,8 @@ pub(crate) struct Context {
     compute_returns: Arc<super::availability::Availability>,
     /// The order in which this context's ioctls take work-state nodes.
     order: Arc<Mutex<Order>>,
+    /// Woken when `order`'s turn moves after a submitter waited on a full order window.
+    order_wait: Arc<CondVar>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     /// How far the work storage's address reached the firmware, kept up to date by every
@@ -357,6 +359,8 @@ impl Context {
             Arc::pin_init(new_mutex!(render_id, "G17 context render pool identity"), GFP_KERNEL)?;
         let order =
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
+        let order_wait =
+            Arc::pin_init(new_condvar!("G17 context admission order wait"), GFP_KERNEL)?;
         Ok(Self {
             m5: alloc.uat.is_m5(),
             execution,
@@ -381,6 +385,7 @@ impl Context {
             state_returns,
             compute_returns,
             order,
+            order_wait,
             work,
             work_base,
             work_mark,
@@ -716,6 +721,83 @@ impl Context {
     }
 }
 
+/// Waits interruptibly for an admission ordinal while `ORDER_WINDOW` ioctls are
+/// queued ahead of the oldest waiting one, returning `EBUSY` if the turn does
+/// not move within 1 s, `EIO` on VM loss, or `ERESTARTSYS` on signals.
+fn assign_order(order: &Mutex<Order>, order_wait: &CondVar, status: &VmStatus) -> Result<u64> {
+    let mut guard = order.lock();
+    if let Some(ordinal) = guard.assign() {
+        return Ok(ordinal);
+    }
+    const ORDER_WAIT_NS: u64 = 1_000_000_000;
+    let deadline = super::now_ns().saturating_add(ORDER_WAIT_NS);
+    loop {
+        if status.get() != 0 {
+            return Err(EIO);
+        }
+        if let Some(ordinal) = guard.assign() {
+            return Ok(ordinal);
+        }
+        let remaining = deadline.saturating_sub(super::now_ns());
+        if remaining == 0 {
+            return Err(EBUSY);
+        }
+        let slice_ms = (remaining.div_ceil(1_000_000) as u32).clamp(1, 50);
+        let jiffies = kernel::time::msecs_to_jiffies(slice_ms);
+        if matches!(
+            order_wait.wait_interruptible_timeout(&mut guard, jiffies),
+            CondVarTimeoutResult::Signal { .. }
+        ) {
+            return Err(ERESTARTSYS);
+        }
+    }
+}
+
+#[cfg(CONFIG_KUNIT = "y")]
+pub(super) const ORDER_WINDOW: u64 = identity::ORDER_WINDOW;
+
+#[cfg(CONFIG_KUNIT = "y")]
+pub(super) struct TestOrderWindow {
+    order: core::pin::Pin<KBox<Mutex<Order>>>,
+    wait: core::pin::Pin<KBox<CondVar>>,
+    status: Arc<VmStatus>,
+    first: Option<u64>,
+}
+
+#[cfg(CONFIG_KUNIT = "y")]
+impl TestOrderWindow {
+    pub(super) fn new_full() -> Result<Self> {
+        let order = KBox::pin_init(new_mutex!(Order::new(), "G17 test order"), GFP_KERNEL)?;
+        let wait = KBox::pin_init(new_condvar!("G17 test order wait"), GFP_KERNEL)?;
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL)?;
+        let first = {
+            let mut guard = order.lock();
+            let first = guard.assign().ok_or(EBUSY)?;
+            for _ in 1..identity::ORDER_WINDOW {
+                let _ = guard.assign().ok_or(EBUSY)?;
+            }
+            first
+        };
+        Ok(Self {
+            order,
+            wait,
+            status,
+            first: Some(first),
+        })
+    }
+
+    pub(super) fn assign(&self) -> Result<u64> {
+        assign_order(&self.order, &self.wait, &self.status)
+    }
+
+    pub(super) fn leave_oldest(&mut self) -> bool {
+        let Some(first) = self.first.take() else {
+            return false;
+        };
+        self.order.lock().leave(first).submitters
+    }
+}
+
 /// Shared by all engines of one ioctl. Queued work initially consumes no node.
 pub(crate) struct WorkStateLease {
     context: Arc<Context>,
@@ -727,11 +809,12 @@ pub(crate) struct WorkStateLease {
 }
 impl WorkStateLease {
     pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
-    /// The lease of a new ioctl, ordered after every earlier one of its context. EBUSY while
-    /// too many of the context's ioctls are queued behind its oldest waiting one
-    /// (see `identity::Order`).
+    /// The lease of a new ioctl, ordered after every earlier one of its context. Waits
+    /// interruptibly while too many of the context's ioctls are queued behind its oldest
+    /// waiting one (see `identity::Order`), returning EBUSY only if the turn does not move
+    /// within the backpressure window.
     pub(crate) fn deferred(context: Arc<Context>) -> Result<Self> {
-        let ordinal = context.order.lock().assign().ok_or(EBUSY)?;
+        let ordinal = assign_order(&context.order, &context.order_wait, context.status())?;
         Ok(Self {
             context,
             word: AtomicU32::new(FREE),
@@ -769,9 +852,7 @@ impl WorkStateLease {
         let wake = order.admit(self.ordinal);
         drop(order);
         drop(work);
-        if wake {
-            self.context.pass_turn();
-        }
+        self.context.notify_turn(wake);
         Ok(candidate)
     }
     /// The domain a publisher samples before acquire() and waits on after EBUSY.
@@ -866,8 +947,9 @@ impl Drop for WorkStateLease {
         let word = self.word();
         if word != FREE {
             self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
-        } else if self.context.order.lock().leave(self.ordinal) {
-            self.context.pass_turn();
+        } else {
+            let wake = self.context.order.lock().leave(self.ordinal);
+            self.context.notify_turn(wake);
         }
     }
 }
@@ -885,6 +967,14 @@ impl Context {
     fn pass_turn(&self) {
         self.state_returns.notify();
         self.compute_returns.notify();
+    }
+    fn notify_turn(&self, wake: OrderWake) {
+        if wake.publishers {
+            self.pass_turn();
+        }
+        if wake.submitters {
+            self.order_wait.notify_all();
+        }
     }
 }
 

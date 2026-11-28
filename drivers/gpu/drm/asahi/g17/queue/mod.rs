@@ -580,9 +580,6 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             let has_render = pending
                 .iter()
                 .any(|(command, _, _)| matches!(command, Validated::Render { .. }));
-            if has_render {
-                self.context.note_render();
-            }
             let compute_only = !has_render && !pending.is_empty();
             if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
                 for (command, _, _) in pending.iter_mut() {
@@ -611,7 +608,14 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs()
                 && !self.has_pending_publication(&pending[0].1);
-            let aggregate = outputs.publish(self.context.clone(), firmware_source, compute_only)?;
+            let work = Arc::new(
+                super::context::WorkStateLease::deferred(self.context.clone())?,
+                GFP_KERNEL,
+            )?;
+            if has_render {
+                self.context.note_render();
+            }
+            let aggregate = outputs.publish(work, firmware_source, compute_only)?;
             let output_fence = aggregate.fence();
             super::trace::submit(
                 1,
@@ -644,6 +648,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 self.backend.fail_vm(error);
             }
         }
+        outputs.set_result(result);
         let output_fence = outputs.output_fence();
         super::trace::submit(
             2,
@@ -654,7 +659,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             result.as_ref().err().map_or(0, |error| error.to_errno()),
             output_fence.as_ref(),
         );
-        outputs.finish(result)
+        result
     }
 }
 

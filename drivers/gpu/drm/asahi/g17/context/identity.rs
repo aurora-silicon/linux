@@ -118,6 +118,13 @@ pub(super) const ORDER_WINDOW: u64 = 1024;
 /// it. Taking nodes strictly in turn keeps the words in submission order. Each engine admits
 /// from its own scheduler, so the turn costs a scheduler round trip whenever the other engine's
 /// ioctl is ready first.
+/// Which waiters to wake after [`Order::admit`] or [`Order::leave`] advances the turn.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct OrderWake {
+    pub(super) publishers: bool,
+    pub(super) submitters: bool,
+}
+
 pub(super) struct Order {
     /// The next ordinal to hand out.
     next: u64,
@@ -125,8 +132,10 @@ pub(super) struct Order {
     turn: u64,
     /// Ordinals past the turn that left, as bits at ordinal % ORDER_WINDOW.
     done: [u64; (ORDER_WINDOW / 64) as usize],
-    /// An ioctl was refused since the turn last moved: its publisher waits for the next move.
+    /// A scheduler publisher was refused since the turn last moved.
     refused: bool,
+    /// A submitter hit the full window since the turn last moved.
+    submitter_waiting: bool,
 }
 impl Order {
     pub(super) const fn new() -> Self {
@@ -135,12 +144,15 @@ impl Order {
             turn: 0,
             done: [0; (ORDER_WINDOW / 64) as usize],
             refused: false,
+            submitter_waiting: false,
         }
     }
     /// The ordinal of a new ioctl, in submission order. None while [`ORDER_WINDOW`] ioctls of
-    /// the context are past the oldest one still waiting for its node.
+    /// the context are past the oldest one still waiting for its node; remembers the refusal
+    /// so the next turn advance wakes blocked submitters.
     pub(super) fn assign(&mut self) -> Option<u64> {
         if self.next - self.turn >= ORDER_WINDOW {
+            self.submitter_waiting = true;
             return None;
         }
         let ordinal = self.next;
@@ -154,28 +166,30 @@ impl Order {
         self.refused |= !admits;
         admits
     }
-    /// The ioctl `ordinal` took its node at its turn. Returns whether a refused ioctl may now be
-    /// admitted.
-    pub(super) fn admit(&mut self, ordinal: u64) -> bool {
+    /// The ioctl `ordinal` took its node at its turn. Returns which waiters may now retry.
+    pub(super) fn admit(&mut self, ordinal: u64) -> OrderWake {
         self.finish(ordinal)
     }
     /// The ioctl `ordinal` left without taking a node (it failed or was cancelled first).
-    /// Returns whether a refused ioctl may now be admitted.
-    pub(super) fn leave(&mut self, ordinal: u64) -> bool {
+    /// Returns which waiters may now retry.
+    pub(super) fn leave(&mut self, ordinal: u64) -> OrderWake {
         self.finish(ordinal)
     }
-    fn finish(&mut self, ordinal: u64) -> bool {
+    fn finish(&mut self, ordinal: u64) -> OrderWake {
         if ordinal < self.turn {
-            return false;
+            return OrderWake::default();
         }
         if ordinal == self.turn {
             self.pass();
-            return core::mem::take(&mut self.refused);
+            return OrderWake {
+                publishers: core::mem::take(&mut self.refused),
+                submitters: core::mem::take(&mut self.submitter_waiting),
+            };
         }
         // assign() keeps every ordinal within the window past the turn.
         let bit = ordinal % ORDER_WINDOW;
         self.done[(bit / 64) as usize] |= 1 << (bit % 64);
-        false
+        OrderWake::default()
     }
     /// Moves the turn past the current ordinal and every following one already done.
     fn pass(&mut self) {
@@ -344,13 +358,13 @@ mod tests {
         }
         assert!(order.admits(ordinals[0]));
         // Its admission moves the turn and wakes the refused.
-        assert!(order.admit(ordinals[0]));
+        assert_eq!(order.admit(ordinals[0]), OrderWake { publishers: true, submitters: false });
         assert!(order.admits(ordinals[1]));
         // Nobody was refused since, so the next admission wakes nobody.
-        assert!(!order.admit(ordinals[1]));
+        assert_eq!(order.admit(ordinals[1]), OrderWake::default());
         assert!(!order.admits(ordinals[3]));
         assert!(order.admits(ordinals[2]));
-        assert!(order.admit(ordinals[2]));
+        assert_eq!(order.admit(ordinals[2]), OrderWake { publishers: true, submitters: false });
         assert!(order.admits(ordinals[3]));
     }
 
@@ -364,14 +378,14 @@ mod tests {
             order.assign().unwrap(),
         );
         // b and c fail before their turn; while a waits, d waits too.
-        assert!(!order.leave(b));
-        assert!(!order.leave(c));
+        assert_eq!(order.leave(b), OrderWake::default());
+        assert_eq!(order.leave(c), OrderWake::default());
         assert!(!order.admits(d));
         // Once a takes its node, the turn passes b and c as well, and the refused one may retry.
-        assert!(order.admit(a));
+        assert_eq!(order.admit(a), OrderWake { publishers: true, submitters: false });
         assert!(order.admits(d));
         // An ordinal already passed leaves without effect.
-        assert!(!order.leave(a));
+        assert_eq!(order.leave(a), OrderWake::default());
     }
 
     #[test]
@@ -384,9 +398,10 @@ mod tests {
         }
         assert!(order.assign().is_none());
         // An ioctl leaving far ahead is remembered within the window.
-        assert!(!order.leave(last));
+        assert_eq!(order.leave(last), OrderWake::default());
         assert!(order.admits(first));
-        assert!(!order.admit(first));
+        // Only the refused submitter waiting on the full window is woken once the turn advances.
+        assert_eq!(order.admit(first), OrderWake { publishers: false, submitters: true });
         assert!(order.assign().is_some());
     }
 
@@ -396,7 +411,7 @@ mod tests {
         for _ in 0..24 {
             let ordinal = order.assign().unwrap();
             assert!(order.admits(ordinal));
-            assert!(!order.admit(ordinal));
+            assert_eq!(order.admit(ordinal), OrderWake::default());
         }
     }
 

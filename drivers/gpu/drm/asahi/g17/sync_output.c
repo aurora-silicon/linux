@@ -137,3 +137,20 @@ void asahi_g17_signals_fail(struct asahi_g17_signal_bundle *bundle,
 		asahi_g17_signal_install(&bundle->targets[i], failure);
 	bundle->published = true;
 }
+
+#ifdef CONFIG_KUNIT
+#include <linux/sched/signal.h>
+#include <linux/signal.h>
+
+void asahi_g17_kunit_raise_sigterm(void)
+{
+	allow_signal(SIGTERM);
+	send_sig(SIGTERM, current, 1);
+}
+
+void asahi_g17_kunit_clear_sigterm(void)
+{
+	flush_signals(current);
+	disallow_signal(SIGTERM);
+}
+#endif

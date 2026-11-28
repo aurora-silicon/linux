@@ -5,7 +5,7 @@
 //! These fences can complete out of order, so each has an independent timeline.
 //! Signalling belongs outside the device lock, after timestamp and VM-status writes.
 
-use super::context::{Context, WorkStateLease};
+use super::context::WorkStateLease;
 use crate::file::SyncItem;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel::{
@@ -269,10 +269,6 @@ pub(crate) struct Submission {
 impl Submission {
     fn encode_epoch(epoch: u64) -> u64 {
         epoch.wrapping_add(1)
-    }
-    fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
-        let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
-        Self::with_work(Some(work), firmware_source)
     }
     fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
         let vm_status = work.as_ref().map(|work| work.status().clone());
@@ -587,6 +583,130 @@ mod tests {
         }
         assert_eq!(source.owners.load(Ordering::Acquire), 0);
     }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    fn timeline_item(syncobj: kernel::drm::syncobj::SyncObj, point: u64) -> Result<SyncItem> {
+        Ok(SyncItem {
+            syncobj,
+            fence: None,
+            chain_fence: Some(kernel::dma_fence::FenceChain::new()?),
+            timeline_value: point,
+            cumulative: None,
+            timeline: true,
+        })
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    fn cumulative_item(syncobj: kernel::drm::syncobj::SyncObj, point: u64) -> SyncItem {
+        SyncItem {
+            syncobj,
+            fence: None,
+            chain_fence: None,
+            timeline_value: point,
+            cumulative: None,
+            timeline: true,
+        }
+    }
+
+    #[test]
+    fn full_window_signal_leaves_timeline_untouched_for_restart() -> Result {
+        unsafe extern "C" {
+            fn asahi_g17_kunit_raise_sigterm();
+            fn asahi_g17_kunit_clear_sigterm();
+        }
+        let contexts = contexts();
+        let allocation_failure = allocation_failure(&contexts)?;
+        let syncobj = kernel::drm::syncobj::SyncObj::new_kunit()?;
+        let point1 = independent(&contexts)?;
+        syncobj.add_point(
+            kernel::dma_fence::FenceChain::new()?,
+            &Fence::from_fence(&point1),
+            1,
+        );
+        point1.signal();
+
+        let mut window = super::super::context::TestOrderWindow::new_full()?;
+        let mut syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
+        syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
+        let mut outputs = Outputs::new(&contexts, syncs, 0, &allocation_failure)?;
+
+        // SAFETY: Test-only KUnit helper raises SIGTERM on the current test kthread
+        // and clears it immediately after `assign()` observes `-ERESTARTSYS`.
+        unsafe { asahi_g17_kunit_raise_sigterm() };
+        let wait_result = window.assign();
+        // SAFETY: Always flush and disallow SIGTERM before leaving the test thread.
+        unsafe { asahi_g17_kunit_clear_sigterm() };
+        assert_eq!(wait_result, Err(ERESTARTSYS));
+
+        outputs.set_result(Err(ERESTARTSYS));
+        assert!(outputs.output_fence().is_none());
+        drop(outputs);
+
+        // A timeline waiter for point 2 must not observe an error fence after -ERESTARTSYS.
+        let head = syncobj.fence_get().unwrap();
+        assert_eq!(head.chain_find_seqno(2).err(), Some(EINVAL));
+        let p1 = syncobj.fence_get().unwrap().chain_find_seqno(1)?.unwrap();
+        assert!(super::super::job::fence_status(&p1) > 0);
+
+        // Cumulative SignalBundle outputs must likewise stay untouched on -ERESTARTSYS.
+        let anchor = kernel::drm::syncobj::SyncObj::new_kunit()?;
+        let p1_anchor = independent(&contexts)?;
+        anchor.add_point(
+            kernel::dma_fence::FenceChain::new()?,
+            &Fence::from_fence(&p1_anchor),
+            1,
+        );
+        p1_anchor.signal();
+        let mut cum_syncs = KVVec::with_capacity(2, GFP_KERNEL)?;
+        cum_syncs.push(cumulative_item(anchor.clone(), 2), GFP_KERNEL)?;
+        cum_syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
+        let bundle = super::super::sync_output::SignalBundle::new(&cum_syncs, 0)?;
+        cum_syncs[0].cumulative = Some(bundle);
+        let mut cum_outputs = Outputs::new(&contexts, cum_syncs, 0, &allocation_failure)?;
+        cum_outputs.set_result(Err(ERESTARTSYS));
+        assert!(cum_outputs.output_fence().is_none());
+        drop(cum_outputs);
+        assert_eq!(anchor.fence_get().unwrap().chain_find_seqno(2).err(), Some(EINVAL));
+        assert_eq!(syncobj.fence_get().unwrap().chain_find_seqno(2).err(), Some(EINVAL));
+
+        // Simulate kernel ioctl restart once the oldest ordinal moves: point 2 is
+        // published exactly once and a timeline waiter sees it transition pending -> done.
+        assert!(window.leave_oldest());
+        let restarted_ordinal = window.assign()?;
+        assert_eq!(restarted_ordinal, super::super::context::ORDER_WINDOW);
+
+        let mut restart_syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
+        restart_syncs.push(timeline_item(syncobj.clone(), 2)?, GFP_KERNEL)?;
+        let mut restart_outputs = Outputs::new(&contexts, restart_syncs, 0, &allocation_failure)?;
+        let aggregate = restart_outputs.publish_with(None, false, false)?;
+        let member = aggregate.member();
+        let point2 = syncobj.fence_get().unwrap().chain_find_seqno(2)?.unwrap();
+        assert_eq!(super::super::job::fence_status(&point2), 0);
+        // SAFETY: `point2` owns a live dma_fence reference for this zero-timeout poll.
+        assert_eq!(unsafe { bindings::dma_fence_wait_timeout(point2.raw(), false, 0) }, 0);
+
+        restart_outputs.set_result(Ok(()));
+        drop(restart_outputs);
+        assert_eq!(super::super::job::fence_status(&point2), 0);
+        member.complete(Ok(()));
+        assert!(super::super::job::fence_status(&point2) > 0);
+        // SAFETY: `point2` owns a live dma_fence reference for this zero-timeout poll.
+        assert!(unsafe { bindings::dma_fence_wait_timeout(point2.raw(), false, 0) } > 0);
+        drop(member);
+
+        // Non-ERESTARTSYS failures (e.g. full-window timeout -> -EBUSY) still publish
+        // an error fence.
+        let mut fail_syncs = KVVec::with_capacity(1, GFP_KERNEL)?;
+        fail_syncs.push(timeline_item(syncobj.clone(), 3)?, GFP_KERNEL)?;
+        let mut fail_outputs = Outputs::new(&contexts, fail_syncs, 0, &allocation_failure)?;
+        fail_outputs.set_result(Err(EBUSY));
+        let fail_fence = fail_outputs.output_fence().unwrap();
+        drop(fail_outputs);
+        let point3 = syncobj.fence_get().unwrap().chain_find_seqno(3)?.unwrap();
+        assert!(super::super::job::fence_status(&point3) > 0);
+        assert_eq!(super::super::job::fence_status(&fail_fence), EBUSY.to_errno());
+        Ok(())
+    }
 }
 impl Drop for Member {
     fn drop(&mut self) {
@@ -649,6 +769,9 @@ impl Outputs {
     }
     /// The fence installed, or about to be installed on error, in every output sync.
     pub(crate) fn output_fence(&self) -> Option<Fence> {
+        if self.submission.is_none() && self.result == Err(ERESTARTSYS) {
+            return None;
+        }
         self.submission
             .as_ref()
             .map(Aggregate::fence)
@@ -656,11 +779,19 @@ impl Outputs {
     }
     pub(crate) fn publish(
         &mut self,
-        context: Arc<Context>,
+        work: Arc<WorkStateLease>,
         firmware_source: bool,
         compute_only: bool,
     ) -> Result<Aggregate> {
-        let source = Submission::new(context, firmware_source)?;
+        self.publish_with(Some(work), firmware_source, compute_only)
+    }
+    fn publish_with(
+        &mut self,
+        work: Option<Arc<WorkStateLease>>,
+        firmware_source: bool,
+        compute_only: bool,
+    ) -> Result<Aggregate> {
+        let source = Submission::with_work(work, firmware_source)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
@@ -675,9 +806,8 @@ impl Outputs {
         }
         Ok(submission)
     }
-    pub(crate) fn finish(mut self, result: Result) -> Result {
+    pub(crate) fn set_result(&mut self, result: Result) {
         self.result = result;
-        result
     }
 }
 impl Drop for Outputs {
@@ -690,6 +820,11 @@ impl Drop for Outputs {
             return;
         }
         if let Some(fallback) = self.fallback.take() {
+            // No work was accepted and no fence was published; leave output
+            // syncobjs untouched so a restarted ioctl can publish them once.
+            if self.result == Err(ERESTARTSYS) {
+                return;
+            }
             if let Err(error) = self.result {
                 fallback.set_error(error);
             }
