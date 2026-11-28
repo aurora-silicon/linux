@@ -61,6 +61,8 @@ struct cs42l84_private {
 	unsigned int remote_btn1_prev;
 	unsigned int remote_short_prev;
 	struct delayed_work remote_poll_work;
+	/* The plug check after a sleep that left the codec powered */
+	struct work_struct resume_work;
 	bool sleep_reset;
 };
 
@@ -301,6 +303,8 @@ static const struct snd_soc_dapm_route cs42l84_audio_map[] = {
 	{"SDOUT1", NULL, "BCLK"},
 };
 
+static void cs42l84_sync_plug(struct cs42l84_private *cs42l84, const char *why);
+
 static int cs42l84_set_jack(struct snd_soc_component *component, struct snd_soc_jack *jk, void *d)
 {
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
@@ -308,6 +312,13 @@ static int cs42l84_set_jack(struct snd_soc_component *component, struct snd_soc_
 	/* Prevent race with interrupt handler */
 	guard(mutex)(&cs42l84->irq_lock);
 	cs42l84->jack = jk;
+	/*
+	 * A tip already plugged when the driver probed raises no plug IRQ
+	 * (the IRQ acts on a change only): detect it now, as the IRQ would
+	 * have, so the first report is the plug as it is.
+	 */
+	if (jk)
+		cs42l84_sync_plug(cs42l84, "jack attached");
 	snd_soc_jack_report(jk, cs42l84->hs_type, SND_JACK_HEADSET);
 
 	return 0;
@@ -991,6 +1002,63 @@ static void cs42l84_set_interrupt_masks(struct cs42l84_private *cs42l84,
 			val);
 }
 
+/*
+ * The tip went to unplugged. Called with irq_lock held, tip_state already
+ * set to CS42L84_UNPLUG.
+ */
+static void cs42l84_handle_unplug(struct cs42l84_private *cs42l84)
+{
+	cs42l84->ring_state = CS42L84_UNPLUG;
+
+	cs42l84_revert_hs(cs42l84);
+	cs42l84->hs_type = 0;
+	snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+
+	/* Mask ring sense interrupts */
+	cs42l84_set_interrupt_masks(cs42l84,
+				    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+}
+
+/*
+ * The tip went to plugged: detect the headset, and drop the result if the
+ * tip did not stay plugged throughout. Called with irq_lock held, tip_state
+ * already set to CS42L84_PLUG.
+ */
+static void cs42l84_handle_plug(struct cs42l84_private *cs42l84)
+{
+	unsigned int reg;
+	u8 current_tip_state;
+
+	cs42l84_detect_hs(cs42l84);
+
+	/*
+	 * Check the tip sense status again, and possibly invalidate
+	 * the detection result
+	 *
+	 * Thanks to debounce, this should reliably indicate if the tip
+	 * was disconnected at any point during the detection procedure.
+	 */
+	regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+	current_tip_state = (((char) reg) &
+	      (CS42L84_TS_PLUG | CS42L84_TS_UNPLUG)) >>
+	      CS42L84_TS_PLUG_SHIFT;
+	if (current_tip_state != CS42L84_PLUG) {
+		dev_dbg(cs42l84->dev, "Wobbly connection, detection invalidated\n");
+		/*
+		 * Undo it all, as an unplug. With tip_state unplugged, an unplug
+		 * IRQ that follows is no change, so the jack must not stay
+		 * reported, and the ring IRQs stay masked. A tip that then
+		 * settles plugged is a change: its IRQ detects again.
+		 */
+		cs42l84->tip_state = CS42L84_UNPLUG;
+		cs42l84_handle_unplug(cs42l84);
+		return;
+	}
+
+	/* Unmask ring sense interrupts */
+	cs42l84_set_interrupt_masks(cs42l84, 0);
+}
+
 static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 {
 	struct cs42l84_private *cs42l84 = (struct cs42l84_private *)data;
@@ -1065,41 +1133,11 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 			switch (current_tip_state) {
 			case CS42L84_PLUG:
 				dev_dbg(cs42l84->dev, "Plug event\n");
-
-				cs42l84_detect_hs(cs42l84);
-
-				/*
-				 * Check the tip sense status again, and possibly invalidate
-				 * the detection result
-				 *
-				 * Thanks to debounce, this should reliably indicate if the tip
-				 * was disconnected at any point during the detection procedure.
-				 */
-				regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
-				current_tip_state = (((char) reg) &
-				      (CS42L84_TS_PLUG | CS42L84_TS_UNPLUG)) >>
-				      CS42L84_TS_PLUG_SHIFT;
-				if (current_tip_state != CS42L84_PLUG) {
-					dev_dbg(cs42l84->dev, "Wobbly connection, detection invalidated\n");
-					cs42l84->tip_state = CS42L84_UNPLUG;
-					cs42l84_revert_hs(cs42l84);
-				}
-
-				/* Unmask ring sense interrupts */
-				cs42l84_set_interrupt_masks(cs42l84, 0);
+				cs42l84_handle_plug(cs42l84);
 				break;
 			case CS42L84_UNPLUG:
-				cs42l84->ring_state = CS42L84_UNPLUG;
 				dev_dbg(cs42l84->dev, "Unplug event\n");
-
-				cs42l84_revert_hs(cs42l84);
-				cs42l84->hs_type = 0;
-				snd_soc_jack_report(cs42l84->jack, 0,
-						    SND_JACK_HEADSET);
-
-				/* Mask ring sense interrupts */
-				cs42l84_set_interrupt_masks(cs42l84,
-							    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+				cs42l84_handle_unplug(cs42l84);
 				break;
 			default:
 				cs42l84->ring_state = CS42L84_TRANS;
@@ -1114,7 +1152,13 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
 		      CS42L84_RS_PLUG_SHIFT;
 
-		if (current_ring_state != cs42l84->ring_state) {
+		/*
+		 * Only with the tip plugged: with the tip unplugged or in
+		 * transition there is nothing to detect, and the tip's own IRQ
+		 * detects once it settles plugged.
+		 */
+		if (cs42l84->tip_state == CS42L84_PLUG &&
+		    current_ring_state != cs42l84->ring_state) {
 			cs42l84->ring_state = current_ring_state;
 			if (current_ring_state == CS42L84_PLUG)
 				cs42l84_detect_hs(cs42l84);
@@ -1122,6 +1166,56 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 	}
 
 	return IRQ_HANDLED;
+}
+
+/*
+ * Bring tip_state, the headset detection and the jack report in line with
+ * the tip sense as it reads now, through the IRQ's own plug and unplug
+ * paths. With the driver's state matching the tip it only reads the status.
+ * Called with irq_lock held, so it and the IRQ thread never both act on one
+ * change.
+ */
+static void cs42l84_sync_plug(struct cs42l84_private *cs42l84, const char *why)
+{
+	unsigned int reg;
+	u8 tip, was;
+
+	if (regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg))
+		return;
+	tip = (((char) reg) & (CS42L84_TS_PLUG | CS42L84_TS_UNPLUG)) >>
+	      CS42L84_TS_PLUG_SHIFT;
+	was = cs42l84->tip_state;
+
+	switch (tip) {
+	case CS42L84_PLUG:
+		/* hs_type 0 with the tip plugged: never detected */
+		if (was == CS42L84_PLUG && cs42l84->hs_type)
+			return;
+		cs42l84->tip_state = CS42L84_PLUG;
+		cs42l84_handle_plug(cs42l84);
+		break;
+	case CS42L84_UNPLUG:
+		if (was == CS42L84_UNPLUG && !cs42l84->hs_type)
+			return;
+		cs42l84->tip_state = CS42L84_UNPLUG;
+		cs42l84_handle_unplug(cs42l84);
+		break;
+	default:
+		/* In transition: the IRQ follows where it settles */
+		return;
+	}
+
+	dev_dbg(cs42l84->dev, "%s: tip state %u (was %u), headset type %#x\n",
+		why, tip, was, cs42l84->hs_type);
+}
+
+static void cs42l84_resume_work(struct work_struct *work)
+{
+	struct cs42l84_private *cs42l84 =
+		container_of(work, struct cs42l84_private, resume_work);
+
+	guard(mutex)(&cs42l84->irq_lock);
+	cs42l84_sync_plug(cs42l84, "resume");
 }
 
 static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
@@ -1257,6 +1351,11 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 	if (ret)
 		return ret;
 
+	ret = devm_work_autocancel(&i2c_client->dev, &cs42l84->resume_work,
+				   cs42l84_resume_work);
+	if (ret)
+		return ret;
+
 	/* Reset the Device */
 	cs42l84->reset_gpio = devm_gpiod_get_optional(&i2c_client->dev,
 		"reset", GPIOD_OUT_LOW);
@@ -1389,6 +1488,8 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 	if (i2c_client->irq)
 		free_irq(i2c_client->irq, cs42l84);
 
+	/* The resume check first: its detection can start the remote poll */
+	cancel_work_sync(&cs42l84->resume_work);
 	cancel_delayed_work_sync(&cs42l84->remote_poll_work);
 
 	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
@@ -1477,6 +1578,9 @@ static int cs42l84_suspend(struct device *dev)
 	struct i2c_client *i2c_client = to_i2c_client(dev);
 	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
 
+	/* A check the last resume queued does not touch the codec across this sleep */
+	cancel_work_sync(&cs42l84->resume_work);
+
 	if (!pm_suspend_via_firmware())
 		return 0;
 
@@ -1506,8 +1610,16 @@ static int cs42l84_resume(struct device *dev)
 	unsigned int reg;
 	int ret, devid;
 
-	if (!cs42l84->sleep_reset)
+	/*
+	 * The codec stayed powered, but its plug IRQ is not a wake source: a
+	 * plug or unplug while asleep may have gone unseen. Check once tasks
+	 * thaw, when the I2C controller is back, and keep the 100 ms
+	 * detection off the resume path.
+	 */
+	if (!cs42l84->sleep_reset) {
+		queue_work(system_freezable_wq, &cs42l84->resume_work);
 		return 0;
+	}
 
 	mutex_lock(&cs42l84->irq_lock);
 
