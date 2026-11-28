@@ -249,6 +249,12 @@ impl SubQueueJob::ver {
         }
     }
 
+    fn uncommit(&mut self) {
+        if let Some(job) = self.job.as_mut() {
+            job.uncommit();
+        }
+    }
+
     fn can_submit(&self) -> Option<Fence> {
         self.job.as_ref().and_then(|job| job.can_submit())
     }
@@ -360,6 +366,12 @@ pub(crate) struct QueueJob {
     inline_result: i32,
     /// For a job with a render: the TVB slot init it relies on and whether it reached the firmware.
     tvb: Option<Arc<TvbJob>>,
+    /// Highest prior-submission fragment/compute `event_seq` that an explicit
+    /// barrier in this job waits on. If that submission aborted before
+    /// publishing, `run()` cancels this job instead of hanging on a stamp that
+    /// will never be written.
+    wait_frag_seq: Option<u64>,
+    wait_comp_seq: Option<u64>,
     id: u64,
 }
 
@@ -402,11 +414,55 @@ impl QueueJob::ver {
         mod_dev_dbg!(self.dev, "QueueJob {}: Committing\n", self.id);
 
         self.sj_vtx.as_mut().map(|a| a.commit()).unwrap_or(Ok(()))?;
-        self.sj_frag
-            .as_mut()
-            .map(|a| a.commit())
-            .unwrap_or(Ok(()))?;
-        self.sj_comp.as_mut().map(|a| a.commit()).unwrap_or(Ok(()))
+        if let Err(err) = self.sj_frag.as_mut().map(|a| a.commit()).unwrap_or(Ok(())) {
+            if let Some(sj) = self.sj_vtx.as_mut() {
+                sj.uncommit();
+            }
+            return Err(err);
+        }
+        if let Err(err) = self.sj_comp.as_mut().map(|a| a.commit()).unwrap_or(Ok(())) {
+            if let Some(sj) = self.sj_frag.as_mut() {
+                sj.uncommit();
+            }
+            if let Some(sj) = self.sj_vtx.as_mut() {
+                sj.uncommit();
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn record_barrier_wait(&mut self, queue_idx: usize, event_seq: u64) {
+        let slot = match queue_idx {
+            SQ_RENDER => &mut self.wait_frag_seq,
+            SQ_COMPUTE => &mut self.wait_comp_seq,
+            _ => return,
+        };
+        *slot = Some(slot.map_or(event_seq, |cur| cur.max(event_seq)));
+    }
+
+    fn barrier_dependency_lost(&self) -> bool {
+        let frag_lost = self.wait_frag_seq.is_some_and(|seq| {
+            !self
+                .sj_frag
+                .as_ref()
+                .is_some_and(|sj| sj.wq.has_published(seq))
+        });
+        let comp_lost = self.wait_comp_seq.is_some_and(|seq| {
+            !self
+                .sj_comp
+                .as_ref()
+                .is_some_and(|sj| sj.wq.has_published(seq))
+        });
+        frag_lost || comp_lost
+    }
+
+    /// Synchronously drop every remaining subqueue job so their `submit_seq`
+    /// counters advance together when `run()` aborts before publishing.
+    fn abort_subqueues(&mut self) {
+        let _ = self.sj_comp.as_mut().and_then(|sj| sj.job.take());
+        let _ = self.sj_vtx.as_mut().and_then(|sj| sj.job.take());
+        let _ = self.sj_frag.as_mut().and_then(|sj| sj.job.take());
     }
 
     fn can_submit_inline(&self) -> bool {
@@ -491,6 +547,22 @@ impl sched::JobImpl for QueueJob::ver {
                 "QueueJob {}: Cancelled, its TVB slot init never reached the firmware\n",
                 job.id
             );
+            job.abort_subqueues();
+            return Err(ECANCELED);
+        }
+
+        // A job whose explicit barrier waits on an earlier submission that aborted before
+        // publishing would hang waiting on a firmware stamp that will never be written.
+        if job.barrier_dependency_lost() {
+            cls_pr_debug!(
+                Errors,
+                "QueueJob {}: Cancelled, an earlier command its barrier waits on never reached the firmware\n",
+                job.id
+            );
+            job.abort_subqueues();
+            if let Some(tvb) = job.tvb.as_ref() {
+                tvb.note_run_failed();
+            }
             return Err(ECANCELED);
         }
 
@@ -542,6 +614,7 @@ impl sched::JobImpl for QueueJob::ver {
         // above. Deferring the increment to submit solves the race.
         let dev = job.dev.clone();
         let Some(guard) = dev.registration_guard() else {
+            job.abort_subqueues();
             if let Some(tvb) = job.tvb.as_ref() {
                 tvb.note_run_failed();
             }
@@ -566,37 +639,34 @@ impl sched::JobImpl for QueueJob::ver {
                 job.op_guard = Some(gpu.start_op()?);
             }
 
+            // Take all subqueue jobs together before calling any fallible
+            // submit(), so an early error aborts every subqueue synchronously
+            // instead of splitting cleanup between run() and QueueJob::drop().
+            let mut frag_job = job.sj_frag.as_mut().and_then(|sj| sj.job.take());
+            let mut vtx_job = job.sj_vtx.as_mut().and_then(|sj| sj.job.take());
+            let mut comp_job = job.sj_comp.as_mut().and_then(|sj| sj.job.take());
+
             // First submit all the commands for each queue. This can fail.
+            let frag_sub = if let Some(wqjob) = frag_job.as_mut() {
+                mod_dev_dbg!(job.dev, "QueueJob {}: Submit fragment\n", job.id);
+                Some(wqjob.submit()?)
+            } else {
+                None
+            };
 
-            let mut frag_job = None;
-            let mut frag_sub = None;
-            if let Some(sj) = job.sj_frag.as_mut() {
-                frag_job = sj.job.take();
-                if let Some(wqjob) = frag_job.as_mut() {
-                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit fragment\n", job.id);
-                    frag_sub = Some(wqjob.submit()?);
-                }
-            }
+            let vtx_sub = if let Some(wqjob) = vtx_job.as_mut() {
+                mod_dev_dbg!(job.dev, "QueueJob {}: Submit vertex\n", job.id);
+                Some(wqjob.submit()?)
+            } else {
+                None
+            };
 
-            let mut vtx_job = None;
-            let mut vtx_sub = None;
-            if let Some(sj) = job.sj_vtx.as_mut() {
-                vtx_job = sj.job.take();
-                if let Some(wqjob) = vtx_job.as_mut() {
-                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit vertex\n", job.id);
-                    vtx_sub = Some(wqjob.submit()?);
-                }
-            }
-
-            let mut comp_job = None;
-            let mut comp_sub = None;
-            if let Some(sj) = job.sj_comp.as_mut() {
-                comp_job = sj.job.take();
-                if let Some(wqjob) = comp_job.as_mut() {
-                    mod_dev_dbg!(job.dev, "QueueJob {}: Submit compute\n", job.id);
-                    comp_sub = Some(wqjob.submit()?);
-                }
-            }
+            let comp_sub = if let Some(wqjob) = comp_job.as_mut() {
+                mod_dev_dbg!(job.dev, "QueueJob {}: Submit compute\n", job.id);
+                Some(wqjob.submit()?)
+            } else {
+                None
+            };
 
             // Prepared submissions still hold their workqueue locks and have not
             // published cpu_wptr. Only count them after every fallible submit()
@@ -629,6 +699,7 @@ impl sched::JobImpl for QueueJob::ver {
             Ok(Some(Fence::from_fence(&job.fence)))
         });
         if ret.is_err() {
+            job.abort_subqueues();
             if let Some(tvb) = job.tvb.as_ref() {
                 tvb.note_run_failed();
             }
@@ -1215,21 +1286,7 @@ impl Queue for Queue::ver {
             )?
             .into();
 
-        let mut init_slot = self.tvb_init_pending;
-        let tvb = if nr_render > 0 {
-            let seq = self.tvb_seq + 1;
-            Some(Arc::new(
-                TvbJob {
-                    shared: self.tvb_shared.clone(),
-                    seq,
-                    init_seq: if init_slot { seq } else { self.tvb_init_seq },
-                    published: AtomicBool::new(false),
-                },
-                GFP_KERNEL,
-            )?)
-        } else {
-            None
-        };
+        let mut carried_init = false;
 
         let mut job = self.entity.new_job(
             1,
@@ -1260,7 +1317,9 @@ impl Queue for Queue::ver {
 
                 inline_result: 0,
 
-                tvb: tvb.clone(),
+                tvb: None,
+                wait_frag_seq: None,
+                wait_comp_seq: None,
 
                 id,
             },
@@ -1315,7 +1374,7 @@ impl Queue for Queue::ver {
                     EINVAL
                 })? {
                     if is_render && queue_idx == SQ_RENDER {
-                        render_wait = Some(*event);
+                        render_wait = Some((*event, *index == 0));
                         continue;
                     }
                     let queue_job = match u32::from(header.cmd_type) {
@@ -1324,6 +1383,9 @@ impl Queue for Queue::ver {
                         _ => return Err(EINVAL),
                     };
                     Self::add_explicit_barrier(&self.dev, &gpu, queue_job, event, vm_slot, id)?;
+                    if *index == 0 {
+                        job.record_barrier_wait(queue_idx, event.event_seq);
+                    }
                 } else {
                     assert!(*index == 0);
                 }
@@ -1345,7 +1407,7 @@ impl Queue for Queue::ver {
                     let fragment_only = render.flags
                         & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
                         != 0;
-                    if let Some(event) = render_wait.take() {
+                    if let Some((event, from_prev)) = render_wait.take() {
                         let queue_job = if fragment_only {
                             job.get_frag()?
                         } else {
@@ -1354,9 +1416,13 @@ impl Queue for Queue::ver {
                         Self::add_explicit_barrier(
                             &self.dev, &gpu, queue_job, &event, vm_slot, id,
                         )?;
+                        if from_prev {
+                            job.record_barrier_wait(SQ_RENDER, event.event_seq);
+                        }
                     }
 
-                    self.inner.submit_render(
+                    let init_slot = !carried_init && self.tvb_init_pending;
+                    if self.inner.submit_render(
                         &gpu,
                         &mut job,
                         &render,
@@ -1365,8 +1431,11 @@ impl Queue for Queue::ver {
                         objects,
                         id,
                         command_index == last_render,
-                        core::mem::take(&mut init_slot),
-                    )?;
+                        init_slot,
+                        &mut self.tvb_init_pending,
+                    )? {
+                        carried_init = true;
+                    }
                     events[SQ_RENDER].push(
                         Some(
                             job.sj_frag
@@ -1424,6 +1493,23 @@ impl Queue for Queue::ver {
                 }
             }
         }
+
+        let tvb = if nr_render > 0 {
+            let seq = self.tvb_seq + 1;
+            let tvb = Arc::new(
+                TvbJob {
+                    shared: self.tvb_shared.clone(),
+                    seq,
+                    init_seq: if carried_init { seq } else { self.tvb_init_seq },
+                    published: AtomicBool::new(false),
+                },
+                GFP_KERNEL,
+            )?;
+            job.tvb = Some(tvb.clone());
+            Some(tvb)
+        } else {
+            None
+        };
 
         mod_dev_dbg!(
             self.dev,

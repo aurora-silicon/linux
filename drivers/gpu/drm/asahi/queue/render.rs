@@ -227,8 +227,9 @@ impl super::QueueInner::ver {
 
     /// Submit work to a render queue.
     ///
-    /// `init_slot` is set on the first render of a submission when the TVB grew since the last
-    /// render the queue published, so that this render re-initialises the buffer slot.
+    /// `init_slot` is set on the first render of a submission when the TVB slot must be
+    /// re-initialised before tiling. `tvb_init_pending` is latched as soon as `new_scene()` binds
+    /// a fresh slot, so a later failure in this function cannot lose `scene.rebind()`.
     #[expect(
         clippy::too_many_arguments,
         reason = "Submission inputs are retained separately by the existing queue interface."
@@ -244,7 +245,8 @@ impl super::QueueInner::ver {
         id: u64,
         flush_stamps: bool,
         init_slot: bool,
-    ) -> Result {
+        tvb_init_pending: &mut bool,
+    ) -> Result<bool> {
         mod_dev_dbg!(self.dev, "[Submission {}] Render!\n", id);
 
         let mut vtx_user_timestamps: fw::job::UserTimestamps = Default::default();
@@ -291,7 +293,14 @@ impl super::QueueInner::ver {
         let buffer = &self.buffer;
         let notifier = self.notifier.clone();
 
-        let scene = Arc::new(buffer.new_scene(kalloc, &tile_info)?, GFP_KERNEL)?;
+        let scene = buffer.new_scene(kalloc, &tile_info)?;
+        // `new_scene()` records `last_token` when binding a fresh slot, so a later failure in this
+        // function would drop the scene and hide `rebind()` from the next render. Latch the init
+        // requirement now; `Queue::submit()` clears it only once the job is pushed.
+        if scene.rebind() {
+            *tvb_init_pending = true;
+        }
+        let scene = Arc::new(scene, GFP_KERNEL)?;
 
         let vm_bind = job.vm_bind.clone();
 
@@ -944,7 +953,8 @@ impl super::QueueInner::ver {
         let fence = job.fence.clone();
         let vtx_job = job.get_vtx()?;
 
-        if scene.rebind() || init_slot {
+        let emitted_init = scene.rebind() || init_slot;
+        if emitted_init {
             mod_dev_dbg!(self.dev, "[Submission {}] Create Bind Buffer\n", id);
             let bind_buffer = kalloc.private.new_init(
                 {
@@ -1394,7 +1404,7 @@ impl super::QueueInner::ver {
         job.get_vtx()?.next_seq();
         job.get_frag()?.next_seq();
 
-        Ok(())
+        Ok(emitted_init)
     }
 }
 

@@ -105,6 +105,16 @@ ASAHI_TESTS = {
                                      (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],
     'j613-mtp-s2idle-tests.py': [([], PASS)],
+    'legacy-wq-prepub-abort-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-job-drop-rollback',
+                                   'old-submission-drop-last-submitted',
+                                   'omit-submit-seq-advance',
+                                   'omit-barrier-invalidation',
+                                   'stale-event-info-tail',
+                                   'partial-take-in-run',
+                                   'omit-rebind-tvb-init',
+                                   'late-rebind-latch',
+                                   'record-intra-ioctl-barrier'), []),
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),
                               (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
