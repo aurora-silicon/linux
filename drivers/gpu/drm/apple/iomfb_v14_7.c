@@ -104,6 +104,8 @@ static const struct dcp_v14_board dcp_v14_board_t6030 = {
 	.firmware_uuid = DCP_V14_FIRMWARE_UUID,
 	.handoff = "apple,t6030-handoff",
 	.promotion = true,
+	/* Without the swap timestamps this panel presents at 60 fps. */
+	.swap_timestamps = true,
 	.panel_nits = true,
 };
 
@@ -3413,6 +3415,25 @@ void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!dcp->external)
 		dcp_v14_configure_backlight(dcp);
 	dcp->swap_start = ktime_get();
+	/*
+	 * The internal panel's swap blocks until the firmware completes it, so
+	 * report the flip before the swap: the compositor builds its next
+	 * frame while this one is still in the firmware. The next commit
+	 * cannot overtake this swap (v14->lock and the CRTC commit
+	 * dependencies), and displaced framebuffers stay pinned until the
+	 * swap completes, so none is freed while the firmware may still scan
+	 * it. A 3-buffer swapchain renders into the buffer from two flips
+	 * back, which is already off screen.
+	 */
+	if (!dcp->external && dcp->v14 && fb && !READ_ONCE(dcp->v14->failed)) {
+		dcp_drm_crtc_page_flip(dcp, ktime_get());
+		if (dcp_v14_present(dcp->v14, fb, width, height,
+				    dcp->notch_height, cs))
+			dcp_release_all_retained_framebuffers(dcp);
+		else
+			dcp_v14_cancel_event(dcp);
+		return;
+	}
 	if (dcp->v14 && dcp_v14_present(dcp->v14, fb, width, height, dcp->notch_height, cs)) {
 		dcp_drm_crtc_page_flip(dcp, ktime_get());
 		/*
