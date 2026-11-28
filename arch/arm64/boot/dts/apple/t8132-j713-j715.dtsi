@@ -149,7 +149,20 @@
 	#size-cells = <2>;
 };
 
-/* External displays: both pipes, routed to either USB-C port. */
+/*
+ * External displays: both pipes, routed to either USB-C port. Both ports are
+ * ATC0/ATC1 with their display crossbars, wired as the J604's left ports, so
+ * their PHYs run DisplayPort alt mode as there (USB-C monitors and USB-C to
+ * HDMI/DP adapters without USB4/Thunderbolt).
+ */
+&atcphy0 {
+	apple,dp-alt-mode;
+};
+
+&atcphy1 {
+	apple,dp-alt-mode;
+};
+
 &dcpext0_mbox {
 	status = "okay";
 };
@@ -184,9 +197,8 @@
 
 /*
  * dcpext0's Type-C routes, UFP mux selector 2 on both ATC crossbars
- * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
- * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
- * routes are disabled here; the display gate enables them only for a dcpext
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1), for DP alt mode and DisplayPort
+ * tunnels. The routes are disabled here; the display gate enables them only for a dcpext
  * the boot loader handed over, since a USB-C port controller waits for every
  * available route.
  */
@@ -237,9 +249,8 @@
 
 /*
  * dcpext1's Type-C routes, UFP mux selector 4 on both ATC crossbars
- * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
- * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
- * routes are disabled here; the display gate enables them only for a dcpext
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1), for DP alt mode and DisplayPort
+ * tunnels. The routes are disabled here; the display gate enables them only for a dcpext
  * the boot loader handed over, since a USB-C port controller waits for every
  * available route.
  */
