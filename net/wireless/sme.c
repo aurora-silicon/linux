@@ -1442,6 +1442,7 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
 {
 	struct wireless_dev *wdev = dev->ieee80211_ptr;
 	int err;
+	u8 old_ssid_len = wdev->u.client.ssid_len;
 
 	lockdep_assert_wiphy(wdev->wiphy);
 
@@ -1533,9 +1534,12 @@ int cfg80211_connect(struct cfg80211_registered_device *rdev,
 		wdev->connect_keys = NULL;
 		/*
 		 * This could be reassoc getting refused, don't clear
-		 * ssid_len in that case.
+		 * ssid_len in that case. A busy driver may also still be
+		 * completing the earlier join; the SSID equality check above
+		 * guarantees this request did not change that join's SSID, so
+		 * preserve its lookup key when the replacement is refused.
 		 */
-		if (!wdev->connected)
+		if (!wdev->connected && !(err == -EBUSY && old_ssid_len))
 			wdev->u.client.ssid_len = 0;
 		return err;
 	}
