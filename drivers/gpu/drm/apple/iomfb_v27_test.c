@@ -35,26 +35,20 @@ static void v27_complete_table_admits_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_v27_admission("27.2.0", &methods, &missing,
 						&num_missing),
 			DCP_V27_ADMITTED);
-	KUNIT_EXPECT_PTR_EQ(test, methods, iomfb_v27_methods("27.2.0"));
+	KUNIT_ASSERT_NOT_NULL(test, iomfb_v27_methods("27.2.0"));
+	KUNIT_EXPECT_PTR_EQ(test, methods,
+			    iomfb_v27_methods("27.2.0")->methods);
 	KUNIT_EXPECT_PTR_EQ(test, missing, NULL);
 	KUNIT_EXPECT_EQ(test, num_missing, 0U);
 	KUNIT_EXPECT_EQ(test, admission("27.0.0"), DCP_V27_ADMITTED);
+	KUNIT_EXPECT_EQ(test, admission("27.3.0"), DCP_V27_ADMITTED);
 }
 
-/* 27 or later without a usable table is refused, never handed down. */
-static void v27_unusable_table_refuses_test(struct kunit *test)
+/* A 27.x build the table does not know is refused, never handed down. */
+static void v27_unknown_build_refuses_test(struct kunit *test)
 {
-	const struct dcp_method_entry *methods;
-	unsigned int num_missing;
-	const char *missing;
-
 	KUNIT_EXPECT_EQ(test, admission("27.1.0"), DCP_V27_NO_TABLE);
 	KUNIT_EXPECT_EQ(test, admission("28.0.0"), DCP_V27_NO_TABLE);
-	KUNIT_EXPECT_EQ(test, dcp_v27_admission("27.3.0", &methods, &missing,
-						&num_missing),
-			DCP_V27_INCOMPLETE);
-	KUNIT_EXPECT_NOT_NULL(test, missing);
-	KUNIT_EXPECT_GT(test, num_missing, 0U);
 }
 
 /* Older firmware keeps the 26.x, 14.x and 13.x selection. */
@@ -70,7 +64,7 @@ static void v27_older_firmware_not_v27_test(struct kunit *test)
 
 static struct kunit_case v27_cases[] = {
 	KUNIT_CASE(v27_complete_table_admits_test),
-	KUNIT_CASE(v27_unusable_table_refuses_test),
+	KUNIT_CASE(v27_unknown_build_refuses_test),
 	KUNIT_CASE(v27_older_firmware_not_v27_test),
 	{}
 };

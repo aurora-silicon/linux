@@ -248,6 +248,9 @@ def _v27_prelude(root):
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
     apple = root / 'drivers/gpu/drm/apple'
+    swap_h = (apple / 'iomfb_v27_3_swap.h').read_text()
+    swap_defines = '\n'.join(line for line in swap_h.splitlines()
+                             if line.startswith('#define DCP_V27'))
     dcp_c = (apple / 'dcp.c').read_text()
     version_defs = '\n'.join(line for line in dcp_c.splitlines()
                              if line.startswith('#define DCP_FW_VERSION_'))
@@ -269,8 +272,9 @@ def _v27_prelude(root):
 #include <stdio.h>
 #include <string.h>
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+typedef uint16_t u16;
 typedef uint32_t u32;
-''' + version_defs + '\n' + version_enum + '\n' + admission_enum + r'''
+''' + swap_defines + '\n' + version_defs + '\n' + version_enum + '\n' + admission_enum + r'''
 struct dcp_v14_board;
 struct apple_dcp_hw_data { enum dcp_firmware_version firmware_compat; };
 struct device_node {
@@ -784,6 +788,10 @@ def v27_tag_translation(root):
     v27_c = (root / 'drivers/gpu/drm/apple/iomfb_v27.c').read_text()
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
+    apple = root / 'drivers/gpu/drm/apple'
+    swap_h = (apple / 'iomfb_v27_3_swap.h').read_text()
+    swap_defines = '\n'.join(line for line in swap_h.splitlines()
+                             if line.startswith('#define DCP_V27'))
     dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     transport = block(dcp_c, 'static bool dcp_v27_sleep_transport_supported(')
     return r'''
@@ -794,6 +802,8 @@ def v27_tag_translation(root):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+typedef uint16_t u16;
+''' + swap_defines + r'''
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define CONFIG_APPLE_SOC_SLEEP 1
 #define IS_ENABLED(option) (option)
@@ -849,9 +859,12 @@ int main(void)
 {
     struct device_node node = { .compatible = "apple,t6050-dcp" };
     struct device dev = { .of_node = &node };
-    const struct dcp_method_entry *m27_0 = iomfb_v27_methods("27.0.0");
-    const struct dcp_method_entry *m27_2 = iomfb_v27_methods("27.2.0");
-    const struct dcp_method_entry *m27_3 = iomfb_v27_methods("27.3.0");
+    const struct iomfb_v27_build *b27_0 = iomfb_v27_methods("27.0.0");
+    const struct iomfb_v27_build *b27_2 = iomfb_v27_methods("27.2.0");
+    const struct iomfb_v27_build *b27_3 = iomfb_v27_methods("27.3.0");
+    const struct dcp_method_entry *m27_0 = b27_0 ? b27_0->methods : NULL;
+    const struct dcp_method_entry *m27_2 = b27_2 ? b27_2->methods : NULL;
+    const struct dcp_method_entry *m27_3 = b27_3 ? b27_3->methods : NULL;
     const struct dcp_method_entry *j714s = iomfb_v27_methods_j714s(&dev, m27_0);
     struct dcp_method_entry partial_27_2[dcpep_num_methods];
     unsigned int missing_count;
@@ -905,15 +918,19 @@ int main(void)
     expect_tag_fail(m27_2, "A375");
     expect_tag_fail(m27_2, "A999");
 
-    /* Incomplete renumbered table (27.3) translates recorded entries and fails closed on missing ones. */
+    /* The completed 27.3 table translates its recorded entries; the optional
+     * sleep/peer entries it still does not record fail closed. */
     expect_tag(m27_3, "A453", "A503");
+    expect_tag(m27_3, "A411", "A461");
+    expect_tag(m27_3, "A413", "A463");
+    expect_tag(m27_3, "A484", "A535");
     const char *missing_27_3[] = {
-        "A411", "A413", "A484", "A500", "A442", "A449", "A115", "A364", "A367",
+        "A500", "A442", "A449", "A115", "A364", "A367",
     };
     for (unsigned int i = 0; i < ARRAY_SIZE(missing_27_3); i++)
         expect_tag_fail(m27_3, missing_27_3[i]);
     assert(!iomfb_v27_sleep_methods_complete(m27_3));
-    assert(iomfb_v27_missing_method(m27_3, &missing_count) && missing_count > 0);
+    assert(!iomfb_v27_missing_method(m27_3, &missing_count) && missing_count == 0);
 
     /* Dropping an optional sleep/paired entry does not block basic boot admission,
      * but does mark sleep incomplete when a sleep entry is missing, and any table

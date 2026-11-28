@@ -2201,6 +2201,7 @@ typedef uint64_t u64;
 #define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_IOMFB_METHODS_H17G 3
+#define DCP_IOMFB_METHODS_J613_EXT26 4
 #define DCP_MAX_CALL_DEPTH 8
 #define IOMFB_MAX_CB 600
 #define DCP_PACKET_ALIGNMENT 64
@@ -2214,11 +2215,15 @@ struct device_node { bool external; };
 struct device { struct device_node *of_node; };
 struct dcp_packet_header { char tag[4]; u32 in_len, out_len; };
 struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; };
+struct iomfb_v27_build {
+    u16 callback_from, callback_to, callback_in_len, callback_out_len;
+};
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     struct device *dev;
     int fw_compat;
     bool crashed;
+    const struct iomfb_v27_build *v27_build;
     bool (**cb_handlers)(struct apple_dcp *, int, void *, void *);
     unsigned long unknown_callbacks[16];
     int start_done;
@@ -2237,9 +2242,8 @@ static __attribute__((unused)) bool of_device_is_compatible(struct device_node *
 { (void)s; return n->external; }
 static bool iomfb_check_callback_h17p(struct apple_dcp *d, int t, u32 i, u32 o)
 { (void)d; (void)t; (void)i; (void)o; return true; }
-/* Only handled callbacks are size-checked; this fixture registers none. */
 static bool iomfb_v27_callback_size_valid(unsigned t, u32 i, u32 o)
-{ (void)t; (void)i; (void)o; assert(false); return false; }
+{ return t == 596 && i == 0x14 && !o; }
 static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }
@@ -2248,6 +2252,9 @@ static void dcp_ack(struct apple_dcp *d, enum dcp_context_id c)
 { (void)c; acks++; d->channel.depth--; }
 """
     suffix = r"""
+static unsigned completions;
+static bool swap_complete(struct apple_dcp *d, int tag, void *out, void *in)
+{ (void)d; (void)out; (void)in; assert(tag == 596); completions++; return true; }
 int main(void)
 {
     struct device_node node;
@@ -2284,6 +2291,28 @@ int main(void)
         assert(packet.data[sizeof(*h) + in + out] == 0xa5);
         cases++;
     }
+    const struct iomfb_v27_build build = {
+        .callback_from = 590, .callback_to = 596, .callback_in_len = 0x14,
+    };
+    const struct { const struct iomfb_v27_build *build; u32 in, out; } swaps[] = {
+        { &build, 0x14, 0 }, { NULL, 0x14, 0 },
+        { &build, 0x13, 0 }, { &build, 0x14, 4 },
+    };
+    handlers[596] = swap_complete;
+    case_tag = 590;
+    for (unsigned i = 0; i < sizeof(swaps) / sizeof(*swaps); i++) {
+        struct apple_dcp d = {
+            .dev = &dev, .fw_compat = DCP_FIRMWARE_V_27_0,
+            .cb_handlers = handlers, .v27_build = swaps[i].build,
+        };
+        union { uint64_t align; unsigned char data[64]; } packet = {};
+        struct dcp_packet_header *h = (void *)packet.data;
+        h->in_len = swaps[i].in;
+        h->out_len = swaps[i].out;
+        acks = completions = 0;
+        dcpep_handle_cb(&d, DCP_CONTEXT_ASYNC, h, sizeof(*h) + h->in_len + h->out_len, 0);
+        assert(acks == 1 && completions == (i == 0) && !d.crashed);
+    }
     return cases != 15552;
 }
 """
@@ -2291,4 +2320,5 @@ int main(void)
     desktop = (root / "drivers/gpu/drm/apple/iomfb_v26_6_desktop.c").read_text()
     checker = block(desktop, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     alias = '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
-    return prefix + checker + alias + source[start:end] + suffix
+    ext26 = internal_inline(root, 'dcp_is_ext26')
+    return prefix + ext26 + checker + alias + source[start:end] + suffix

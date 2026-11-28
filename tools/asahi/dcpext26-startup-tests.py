@@ -201,6 +201,7 @@ run('native AFK announcements through deferred OPEN',identity)
 # Compile the actual command allocator and ACK dispatch with the production D121
 # callback. A peer can write one Boolean byte or all four bytes, then nest D003.
 iom=(A/'iomfb.c').read_text();native=(A/'iomfb_h17p.c').read_text();ih=(A/'iomfb.h').read_text();internal=(A/'dcp-internal.h').read_text()
+swap=re.sub(r'^#include[^\n]*\n','',(A/'iomfb_v27_3_swap.h').read_text(),flags=re.MULTILINE)
 transport=pre+r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_27_0 27
@@ -235,8 +236,18 @@ typedef int atomic_t;
 struct apple_dcp;typedef void (*dcp_callback_t)(struct apple_dcp *,void *,void *);
 struct dcp_method_entry {const char *name;char tag[4],tag_h17g[4],tag_ext26[4];};
 '''
-transport+=block(ih,'enum dcp_context_id {')+'\n'+block(ih,'struct dcp_packet_header {')+'\n'+block(internal,'struct dcp_channel {')+'\n'+block(ih,'enum dcpep_method {')+r'''
-struct apple_dcp {const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;atomic_t pending_acks;};
+transport+=block(ih,'enum dcp_context_id {')+'\n'+block(ih,'struct dcp_packet_header {')+'\n'
+transport+=block(internal,'struct dcp_channel {')+'\n'+block(ih,'enum dcpep_method {')+'\n'
+transport+=block(ih,'struct iomfb_v27_build {')+'\n'+swap+r'''
+struct apple_dcp {
+ const struct iomfb_v27_build *v27_build;
+ const struct dcp_method_entry *v27_methods;
+ const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;
+ bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;
+ u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;
+ struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;
+ atomic_t pending_acks;
+};
 static bool iomfb_uses_queue(struct apple_dcp *d){return true;}
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
