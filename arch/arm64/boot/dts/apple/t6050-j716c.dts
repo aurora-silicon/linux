@@ -269,6 +269,15 @@
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
 };
 
+&die0 {
+	/*
+	 * Cover both die 0's low (0x2..0x5_ffffffff) and upper media
+	 * (0x22..0x23_ffffffff) MMIO windows.
+	 */
+	ranges = <0x2 0x0 0x2 0x0 0x4 0x0>,
+		 <0x22 0x0 0x22 0x0 0x2 0x0>;
+};
+
 #include "t6050-peripherals.dtsi"
 
 #include "t6050-max-atc2.dtsi"
