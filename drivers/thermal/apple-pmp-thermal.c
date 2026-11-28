@@ -28,6 +28,7 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
+#include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
@@ -43,6 +44,7 @@
 /* Inside the cooling slope window (50-250 ms); used while cool and idle. */
 #define APPLE_PMP_SLOW_POLL_MS		100
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
+#define APPLE_PMP_POWER_POLL_MS		500
 
 struct apple_pmp_cluster {
 	struct cpufreq_policy *policy;
@@ -55,10 +57,14 @@ static struct {
 	struct thermal_zone_device *zone;
 	struct apple_pmp_cluster clusters[2];
 	struct mutex lock; /* Serializes sensor reads, mode changes and guard updates. */
+	struct mutex lifecycle_lock; /* Serializes setup, cleanup, prepare and complete. */
+	spinlock_t poll_lock; /* Serializes poll_armed, fast_timer_armed and scheduling. */
+	struct workqueue_struct *poll_wq;
 	struct apple_pmp_cooling cooling;
 	struct apple_pmp_power_policy power;
 	struct delayed_work setup_work;
 	struct delayed_work power_work;
+	struct delayed_work slow_poll_work;
 	struct device *power_hwmon;
 	unsigned int rail_mw[3];
 	int power_error;
@@ -78,6 +84,8 @@ static struct {
 	struct hrtimer poll_timer;
 	struct work_struct poll_work;
 	bool polling;
+	bool poll_armed;
+	bool fast_timer_armed;
 	bool fast_poll;
 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
 	bool critical_dumped;
@@ -85,6 +93,8 @@ static struct {
 	bool sleep_paused;
 } pmp_thermal = {
 	.lock = __MUTEX_INITIALIZER(pmp_thermal.lock),
+	.lifecycle_lock = __MUTEX_INITIALIZER(pmp_thermal.lifecycle_lock),
+	.poll_lock = __SPIN_LOCK_UNLOCKED(pmp_thermal.poll_lock),
 };
 
 /* Read-only cadence diagnostics: reading temperatures must not advance these. */
@@ -250,7 +260,8 @@ static void apple_pmp_power_work(struct work_struct *work)
 	if (ret)
 		pr_warn_ratelimited("apple-pmp-thermal: power telemetry error %d, retaining minimum CPU/GPU ceilings\n",
 				    ret);
-	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
+	queue_delayed_work(system_unbound_wq, &pmp_thermal.power_work,
+			   msecs_to_jiffies(APPLE_PMP_POWER_POLL_MS));
 }
 
 static umode_t apple_pmp_power_visible(const void *data,
@@ -521,6 +532,30 @@ static void apple_pmp_critical(struct thermal_zone_device *zone)
 	}
 }
 
+static void apple_pmp_poll_ensure_fast(void)
+{
+	guard(spinlock_irqsave)(&pmp_thermal.poll_lock);
+	if (!pmp_thermal.poll_armed || !READ_ONCE(pmp_thermal.fast_poll) ||
+	    pmp_thermal.fast_timer_armed)
+		return;
+	cancel_delayed_work(&pmp_thermal.slow_poll_work);
+	pmp_thermal.fast_timer_armed = true;
+	hrtimer_start(&pmp_thermal.poll_timer,
+		      ms_to_ktime(APPLE_PMP_POLL_MS),
+		      HRTIMER_MODE_REL);
+}
+
+static void apple_pmp_poll_stop(void)
+{
+	scoped_guard(spinlock_irqsave, &pmp_thermal.poll_lock)
+		pmp_thermal.poll_armed = false;
+	hrtimer_cancel(&pmp_thermal.poll_timer);
+	scoped_guard(spinlock_irqsave, &pmp_thermal.poll_lock)
+		pmp_thermal.fast_timer_armed = false;
+	cancel_delayed_work_sync(&pmp_thermal.slow_poll_work);
+	cancel_work_sync(&pmp_thermal.poll_work);
+}
+
 static void apple_pmp_poll_work(struct work_struct *work)
 {
 	u64 now;
@@ -534,6 +569,26 @@ static void apple_pmp_poll_work(struct work_struct *work)
 		pmp_thermal.governor_count++;
 		thermal_zone_device_update(pmp_thermal.zone, THERMAL_EVENT_UNSPECIFIED);
 	}
+	apple_pmp_poll_ensure_fast();
+}
+
+static void apple_pmp_slow_poll_work(struct work_struct *work)
+{
+	guard(spinlock_irqsave)(&pmp_thermal.poll_lock);
+	if (!pmp_thermal.poll_armed)
+		return;
+	queue_work(pmp_thermal.poll_wq, &pmp_thermal.poll_work);
+	if (READ_ONCE(pmp_thermal.fast_poll)) {
+		if (!pmp_thermal.fast_timer_armed) {
+			pmp_thermal.fast_timer_armed = true;
+			hrtimer_start(&pmp_thermal.poll_timer,
+				      ms_to_ktime(APPLE_PMP_POLL_MS),
+				      HRTIMER_MODE_REL);
+		}
+		return;
+	}
+	queue_delayed_work(system_unbound_wq, &pmp_thermal.slow_poll_work,
+			   msecs_to_jiffies(APPLE_PMP_SLOW_POLL_MS));
 }
 
 static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
@@ -541,22 +596,36 @@ static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
 	/* Sampling/QoS may sleep, so never perform either in timer context.
 	 * One work item coalesces missed ticks; no burst of stale confirmations.
 	 */
-	queue_work(system_highpri_wq, &pmp_thermal.poll_work);
-	hrtimer_forward_now(timer, ms_to_ktime(READ_ONCE(pmp_thermal.fast_poll) ?
-					     APPLE_PMP_POLL_MS :
-					     APPLE_PMP_SLOW_POLL_MS));
-	return HRTIMER_RESTART;
+	guard(spinlock_irqsave)(&pmp_thermal.poll_lock);
+	if (!pmp_thermal.poll_armed) {
+		pmp_thermal.fast_timer_armed = false;
+		return HRTIMER_NORESTART;
+	}
+	queue_work(pmp_thermal.poll_wq, &pmp_thermal.poll_work);
+	if (READ_ONCE(pmp_thermal.fast_poll)) {
+		hrtimer_forward_now(timer, ms_to_ktime(APPLE_PMP_POLL_MS));
+		pmp_thermal.fast_timer_armed = true;
+		return HRTIMER_RESTART;
+	}
+	pmp_thermal.fast_timer_armed = false;
+	queue_delayed_work(system_unbound_wq, &pmp_thermal.slow_poll_work,
+			   msecs_to_jiffies(APPLE_PMP_SLOW_POLL_MS));
+	return HRTIMER_NORESTART;
 }
 
 static int apple_pmp_change_mode(struct thermal_zone_device *zone,
 				 enum thermal_device_mode mode)
 {
+	int ret;
+
 	guard(mutex)(&pmp_thermal.lock);
 	pmp_thermal.enabled = mode == THERMAL_DEVICE_ENABLED;
 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	WRITE_ONCE(pmp_thermal.fast_poll, true);
-	return apple_pmp_guard(8);
+	ret = apple_pmp_guard(8);
+	apple_pmp_poll_ensure_fast();
+	return ret;
 }
 
 static bool apple_pmp_should_bind(struct thermal_zone_device *zone,
@@ -658,9 +727,12 @@ static void apple_pmp_thermal_cleanup(void)
 		pmp_thermal.power_hwmon = NULL;
 	}
 	if (pmp_thermal.polling) {
-		hrtimer_cancel(&pmp_thermal.poll_timer);
-		cancel_work_sync(&pmp_thermal.poll_work);
+		apple_pmp_poll_stop();
 		pmp_thermal.polling = false;
+	}
+	if (pmp_thermal.poll_wq) {
+		destroy_workqueue(pmp_thermal.poll_wq);
+		pmp_thermal.poll_wq = NULL;
 	}
 	/* Drain the publisher before the final invalidation. */
 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
@@ -899,19 +971,37 @@ static int apple_pmp_thermal_setup(void)
 		pmp_thermal.power_hwmon = NULL;
 		goto fail;
 	}
-	pmp_thermal.power_polling = true;
-	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
-	pmp_thermal.polling = true;
-	pmp_thermal.fast_poll = true;
-	hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
-		      HRTIMER_MODE_REL);
-	/* Both guards start at the minimum frequency: hand over the cpufreq cap. */
+	pmp_thermal.poll_wq = alloc_workqueue("apple-pmp-thermal",
+					      WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM,
+					      1);
+	if (!pmp_thermal.poll_wq) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	/* Both guards start at the minimum frequency: hand over the cpufreq cap
+	 * before publishing live polling so a handoff failure never races with
+	 * PM suspend/resume.
+	 */
 	pmp_thermal.owner = true;
 	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++) {
 		ret = apple_soc_cpufreq_set_thermal_owner(pmp_thermal.clusters[i].policy,
 							  true);
 		if (ret)
 			goto fail;
+	}
+	pmp_thermal.power_polling = true;
+	pmp_thermal.polling = true;
+	WRITE_ONCE(pmp_thermal.fast_poll, true);
+	if (!pmp_thermal.sleep_paused) {
+		queue_delayed_work(system_unbound_wq, &pmp_thermal.power_work,
+				   msecs_to_jiffies(APPLE_PMP_POWER_POLL_MS));
+		scoped_guard(spinlock_irqsave, &pmp_thermal.poll_lock) {
+			pmp_thermal.poll_armed = true;
+			pmp_thermal.fast_timer_armed = true;
+			hrtimer_start(&pmp_thermal.poll_timer,
+				      ms_to_ktime(APPLE_PMP_POLL_MS),
+				      HRTIMER_MODE_REL);
+		}
 	}
 	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, %s\n",
 		pmp_thermal.power.unbudgeted ?
@@ -926,7 +1016,10 @@ fail:
 
 static void apple_pmp_thermal_setup_work(struct work_struct *work)
 {
-	int ret = apple_pmp_thermal_setup();
+	int ret;
+
+	scoped_guard(mutex, &pmp_thermal.lifecycle_lock)
+		ret = apple_pmp_thermal_setup();
 
 	/* cpufreq policy creation is not a driver bind, so it need not retrigger
 	 * deferred platform probes. Retry only this startup dependency while
@@ -957,6 +1050,7 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	pmp_thermal.governor_ns = 0;
 	INIT_DELAYED_WORK(&pmp_thermal.setup_work, apple_pmp_thermal_setup_work);
 	INIT_DELAYED_WORK(&pmp_thermal.power_work, apple_pmp_power_work);
+	INIT_DELAYED_WORK(&pmp_thermal.slow_poll_work, apple_pmp_slow_poll_work);
 	INIT_WORK(&pmp_thermal.poll_work, apple_pmp_poll_work);
 	hrtimer_setup(&pmp_thermal.poll_timer, apple_pmp_poll_timer,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -973,10 +1067,9 @@ static int apple_pmp_thermal_prepare(struct device *dev)
 {
 	if (!pm_suspend_via_firmware())
 		return 0;
-	if (pmp_thermal.polling) {
-		hrtimer_cancel(&pmp_thermal.poll_timer);
-		cancel_work_sync(&pmp_thermal.poll_work);
-	}
+	guard(mutex)(&pmp_thermal.lifecycle_lock);
+	if (pmp_thermal.polling)
+		apple_pmp_poll_stop();
 	if (pmp_thermal.power_polling)
 		cancel_delayed_work_sync(&pmp_thermal.power_work);
 	pmp_thermal.sleep_paused = true;
@@ -987,6 +1080,7 @@ static void apple_pmp_thermal_complete(struct device *dev)
 {
 	struct apple_pmp_power_policy *p = &pmp_thermal.power;
 
+	guard(mutex)(&pmp_thermal.lifecycle_lock);
 	if (!pmp_thermal.sleep_paused)
 		return;
 	pmp_thermal.sleep_paused = false;
@@ -1001,10 +1095,17 @@ static void apple_pmp_thermal_complete(struct device *dev)
 					      p->level[2], p->last_ns);
 	}
 	if (pmp_thermal.power_polling)
-		schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
-	if (pmp_thermal.polling)
-		hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
-			      HRTIMER_MODE_REL);
+		queue_delayed_work(system_unbound_wq, &pmp_thermal.power_work,
+				   msecs_to_jiffies(APPLE_PMP_POWER_POLL_MS));
+	if (pmp_thermal.polling) {
+		scoped_guard(spinlock_irqsave, &pmp_thermal.poll_lock) {
+			pmp_thermal.poll_armed = true;
+			pmp_thermal.fast_timer_armed = true;
+			hrtimer_start(&pmp_thermal.poll_timer,
+				      ms_to_ktime(APPLE_PMP_POLL_MS),
+				      HRTIMER_MODE_REL);
+		}
+	}
 }
 
 static const struct dev_pm_ops apple_pmp_thermal_pm_ops = {
@@ -1015,6 +1116,7 @@ static const struct dev_pm_ops apple_pmp_thermal_pm_ops = {
 static void apple_pmp_thermal_remove(struct platform_device *pdev)
 {
 	cancel_delayed_work_sync(&pmp_thermal.setup_work);
+	guard(mutex)(&pmp_thermal.lifecycle_lock);
 	apple_pmp_thermal_cleanup();
 }
 
