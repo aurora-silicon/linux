@@ -256,6 +256,7 @@
 		n1_control: control@0,0 {
 			compatible = "apple,t8142-centauri-control", "pci106b,1900";
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j815-ftab.bin";
 		};
 
 		n1_alpha: wifi@0,1 {
