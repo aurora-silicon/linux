@@ -121,9 +121,9 @@ pub(crate) struct Variant {
     /// Cached descriptor storage, queue records and queue configuration that come back
     /// after their owner's release was consumed are reused once the firmware has consumed
     /// every control record published before they came back, not only after a later one.
-    /// Set for the A18 Pro. Elsewhere they keep the stricter fence of 34b438de, which fixed
-    /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
-    /// queue test on that hardware.
+    /// Set for the A18 Pro and the M4 Pro 25G83 (measured with create/destroy-heavy queue
+    /// churn on the J616s). 25F84 and 26B123 keep the stricter fence of 34b438de, which
+    /// fixed an M4 Pro crash on a recycled work state, until measured there.
     pub(crate) objects_after_release: bool,
     /// What the firmware reports in its statistics ring beyond utilisation
     /// ([`crate::g17::telemetry::Protocol`]).
@@ -231,7 +231,7 @@ pub(crate) const V25G83: Variant = Variant {
     // Host policy: take the render pool identity at context creation. On for the M4 Max
     // 25G83 build since ec3ced95 and measured on the M4 Pro (J616s).
     render_id_at_create: true,
-    objects_after_release: false,
+    objects_after_release: true,
     telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
 };
 
@@ -265,6 +265,7 @@ pub(crate) const V25F84: Variant = Variant {
     // Not measured on 25F84 or on 26B123, which inherits this.
     render_stage_prefixes: false,
     render_id_at_create: false,
+    objects_after_release: false,
     ..V25G83
 };
 
