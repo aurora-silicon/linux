@@ -356,26 +356,25 @@
 
 &dart_disp0_companion1 {
 	power-domains = <&ps_disp_cpu>;
+	status = "okay";
 };
 
 &dart_dispext0_companion1 {
 	power-domains = <&ps_dispext0_cpu>;
+	status = "okay";
 };
 
 &dart_dispext1_companion1 {
 	power-domains = <&ps_dispext1_cpu>;
+	status = "okay";
 };
 
 /*
- * t8132-j713-pmgr.dtsi disables SCODEC, and its engines with it. Their DARTs,
- * which name those states in t8132-peripherals.dtsi, would wait for them
- * forever if anything enabled them, so drop the reference here. VENC is
+ * t8132-j713-pmgr.dtsi disables SCODEC, and its engines with it. Its DART,
+ * which names that state in t8132-peripherals.dtsi, would wait for it
+ * forever if anything enabled it, so drop the reference here. VENC is
  * enabled there: the video encoder and its DARTs below.
  */
-&dart_ave2 {
-	/delete-property/ power-domains;
-};
-
 &dart_apr0 {
 	/delete-property/ power-domains;
 };

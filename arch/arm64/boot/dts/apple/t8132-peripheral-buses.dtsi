@@ -58,7 +58,6 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/nub-spmi1: the auxiliary PMU (pmu-aux) at USID 0xe. */

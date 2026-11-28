@@ -121,6 +121,10 @@
 	status = "okay";
 };
 
+&dart_mtp_companion1 {
+	status = "okay";
+};
+
 &mtp_dockchannel {
 	status = "okay";
 };
