@@ -86,6 +86,12 @@
 						<0 0 0 3 &port00 0 0 0 2>,
 						<0 0 0 4 &port00 0 0 0 3>;
 
+				n1_control: control@0,0 {
+					compatible = "apple,t8152-centauri-control", "pci106b,1900";
+					reg = <0x10000 0x0 0x0 0x0 0x0>;
+					firmware-name = "apple/centauri/j873g-ftab.bin";
+				};
+
 				n1_alpha: wifi@0,1 {
 					compatible = "pci106b,1902";
 					reg = <0x10100 0x0 0x0 0x0 0x0>;

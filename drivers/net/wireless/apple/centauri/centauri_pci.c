@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -69,11 +70,50 @@ static void centauri_free_boot(struct centauri *c)
 	c->firmware = c->descriptor = c->msi_page = NULL;
 }
 
+static int centauri_request_firmware(struct device *dev,
+				     const struct centauri_board *board,
+				     const struct firmware **fw_out,
+				     const char **name_out)
+{
+	const char *dt_fw = NULL;
+	const char *fallback = board->firmware;
+	bool has_distinct_fallback;
+	int ret;
+
+	if (!device_property_read_string(dev, "firmware-name", &dt_fw) &&
+	    dt_fw && *dt_fw) {
+		has_distinct_fallback = fallback && *fallback &&
+					strcmp(fallback, dt_fw);
+		if (has_distinct_fallback)
+			ret = firmware_request_nowarn(fw_out, dt_fw, dev);
+		else
+			ret = request_firmware(fw_out, dt_fw, dev);
+		if (!ret) {
+			*name_out = dt_fw;
+			return 0;
+		}
+		if (ret != -ENOENT || !has_distinct_fallback)
+			return ret;
+		dev_warn(dev, "firmware %s not found, falling back to %s\n",
+			 dt_fw, fallback);
+	}
+
+	if (!fallback || !*fallback) {
+		dev_err(dev, "missing firmware-name in device tree\n");
+		return -ENOENT;
+	}
+	ret = request_firmware(fw_out, fallback, dev);
+	if (!ret)
+		*name_out = fallback;
+	return ret;
+}
+
 static int centauri_rom_boot(struct centauri *c)
 {
 	const struct firmware *fw;
 	const struct centauri_board *board = centauri_board();
 	struct device *dev = &c->pdev->dev;
+	const char *fw_name = NULL;
 	u32 stage;
 	int ret;
 
@@ -84,7 +124,7 @@ static int centauri_rom_boot(struct centauri *c)
 	stage = readl(c->bar + 0x8000);
 	if (stage != 0 && stage != 4 && stage != 1)
 		return -EBUSY;
-	ret = request_firmware(&fw, board->firmware, dev);
+	ret = centauri_request_firmware(dev, board, &fw, &fw_name);
 	if (ret)
 		return ret;
 	if (fw->size < 0x30 || fw->size > SZ_64M ||
@@ -124,7 +164,7 @@ static int centauri_rom_boot(struct centauri *c)
 	pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
 		(c->msi_original & ~PCI_MSI_FLAGS_QSIZE) | PCI_MSI_FLAGS_ENABLE);
 	pci_set_master(c->pdev);
-	dev_info(dev, "ROM boot: %s, %zu bytes, board word %#x\n", board->firmware, fw->size,
+	dev_info(dev, "ROM boot: %s, %zu bytes, board word %#x\n", fw_name, fw->size,
 		 board_word ?: board->board_word);
 	writel(board_word ?: board->board_word, c->bar + 0x807c);
 	writel(0, c->bar + 0x803c);
@@ -537,4 +577,5 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Apple N1 Centauri native PCI and ACIPC bring-up backend");
 MODULE_FIRMWARE("apple/centauri/j813-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j815-ftab.bin");
+MODULE_FIRMWARE("apple/centauri/j873g-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j873-ftab.bin");

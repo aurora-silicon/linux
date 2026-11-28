@@ -17,15 +17,16 @@ description: |
   bootstrap. This binding does not authorize adopting an existing live
   firmware session or releasing another owner's retained DART streams.
 
-  The T8142 native transport uses the same PCI function IDs but is a
+  The T8142 and T8152 native transport uses the same PCI function IDs but is a
   different firmware profile. Its SoC-specific compatible identifies this
   binding profile; the generic PCI compatible is retained as the fallback.
-  Runtime driver selection continues to use the PCI ID and host SoC, and the
-  native driver selects personalized firmware and transport data from its
-  root-board match table rather than the T6050 wire-protocol properties.
+  Runtime driver selection continues to use the PCI ID and host SoC; the
+  native driver prefers firmware-name from this node when present (falling
+  back to its board table while older DTBs and firmware layouts transition)
+  rather than the T6050 wire-protocol properties.
 
-  On T8142 the root port above function zero may describe the N1's warm
-  reset with apple,function-warm-reset and apple,warm-reset-writes, as in
+  On T8142 and T8152 the root port above function zero may describe the N1's
+  warm reset with apple,function-warm-reset and apple,warm-reset-writes, as in
   pci/apple,pcie.yaml. With both, the native driver restarts a firmware
   that stopped; without them it never resets the chip.
 
@@ -36,7 +37,9 @@ properties:
           - pci106b,1900
           - pci106b,1901
       - items:
-          - const: apple,t8142-centauri-control
+          - enum:
+              - apple,t8142-centauri-control
+              - apple,t8152-centauri-control
           - const: pci106b,1900
 
   reg:
@@ -61,10 +64,11 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8142-centauri-control
+            enum:
+              - apple,t8142-centauri-control
+              - apple,t8152-centauri-control
     then:
       properties:
-        firmware-name: false
         apple,centauri-platform-id: false
         apple,centauri-protocol: false
     else:
