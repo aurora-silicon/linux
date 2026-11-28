@@ -17,7 +17,7 @@ use crate::{
 };
 use kernel::prelude::*;
 
-const DEPTH: usize = queues::RENDER_DEPTH as usize;
+const DEPTH_MAX: usize = queues::RENDER_DEPTH_MAX as usize;
 
 fn aligned(value: usize, alignment: usize) -> Result<usize> {
     value
@@ -203,11 +203,11 @@ impl Layout {
         Ok(self)
     }
     pub(crate) fn is_m5(&self) -> bool { self.m5.is_some() }
-    fn check_capacity(&self, stride: usize) -> Result {
+    fn check_capacity(&self, stride: usize, depth: usize) -> Result {
         if self.m5.is_none() && stride > cfg::TARGET_RECORD_MAX {
             return Err(ERANGE);
         }
-        stride.checked_mul(DEPTH).ok_or(EOVERFLOW)?;
+        stride.checked_mul(depth).ok_or(EOVERFLOW)?;
         Ok(())
     }
     pub(crate) fn tpc_capacity(&self) -> Result<usize> {
@@ -264,7 +264,7 @@ impl Object {
 }
 struct Retired {
     _object: Object,
-    owners: [Option<u64>; DEPTH],
+    owners: KVec<Option<u64>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -278,26 +278,40 @@ pub(crate) struct Target {
     records: Object,
     tpc: Object,
     stride: usize,
-    slots: [Option<u64>; DEPTH],
+    depth: usize,
+    slots: KVec<Option<u64>>,
     retired: KVec<Retired>,
     m5: bool,
 }
 impl Target {
     /// Keep this allocation frame separate from the rest of the render graph.
     #[inline(never)]
-    pub(crate) fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
+    pub(crate) fn new(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        layout: &Layout,
+        depth: usize,
+    ) -> Result<KBox<Self>> {
+        if depth == 0 || depth > DEPTH_MAX {
+            return Err(EINVAL);
+        }
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
-        layout.check_capacity(stride)?;
+        layout.check_capacity(stride, depth)?;
         let m5 = layout.m5.is_some();
-        let records = Object::new(dev, vm, stride * DEPTH, m5.then_some(PairObject::Records))?;
+        let records = Object::new(dev, vm, stride * depth, m5.then_some(PairObject::Records))?;
         let tpc = Object::new(dev, vm, tpc, m5.then_some(PairObject::Tpc))?;
+        let mut slots = KVec::with_capacity(depth, GFP_KERNEL)?;
+        for _ in 0..depth {
+            slots.push(None, GFP_KERNEL)?;
+        }
         KBox::new(
             Self {
                 records,
                 tpc,
                 stride,
-                slots: [None; DEPTH],
+                depth,
+                slots,
                 retired: KVec::new(),
                 m5,
             },
@@ -348,7 +362,7 @@ impl Target {
     /// Only the span consumed by this render is cleared. A small render does
     /// not clear a previous large target's complete retained record capacity.
     pub(crate) fn prepare(&mut self, ordinal: u64, layout: &Layout) -> Result<Addresses> {
-        let slot = ordinal as usize % DEPTH;
+        let slot = ordinal as usize % self.depth;
         if self.m5 != layout.m5.is_some() { return Err(EINVAL); }
         if self.slots[slot].is_some_and(|owner| owner != ordinal) {
             return Err(EBUSY);
@@ -388,12 +402,12 @@ impl Target {
         dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         layout: &Layout,
-        owners: &[Option<u64>; DEPTH],
+        owners: &[Option<u64>],
     ) -> Result<bool> {
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
         if self.m5 != layout.m5.is_some() { return Err(EINVAL); }
-        layout.check_capacity(stride)?;
+        layout.check_capacity(stride, self.depth)?;
         let mut grew = false;
         if tpc > self.tpc.backing.size() {
             Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners,
@@ -406,12 +420,12 @@ impl Target {
                 &mut self.records,
                 dev,
                 vm,
-                stride * DEPTH,
+                stride * self.depth,
                 owners,
                 self.m5.then_some(PairObject::Records),
             )?;
             self.stride = stride;
-            self.slots = [None; DEPTH];
+            self.slots.fill(None);
             grew = true;
         }
         Ok(grew)
@@ -422,28 +436,35 @@ impl Target {
         dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         size: usize,
-        owners: &[Option<u64>; DEPTH],
+        owners: &[Option<u64>],
         m5: Option<PairObject>,
     ) -> Result {
         let retain = owners.iter().any(Option::is_some);
-        if retain {
+        let retained_owners = if retain {
             retired.reserve(1, GFP_KERNEL)?;
-        }
+            let mut copy = KVec::with_capacity(owners.len(), GFP_KERNEL)?;
+            for owner in owners {
+                copy.push(*owner, GFP_KERNEL)?;
+            }
+            Some(copy)
+        } else {
+            None
+        };
         let new = Object::new(dev, vm, size, m5)?;
         let previous = core::mem::replace(old, new);
-        if retain {
+        if let Some(retained_owners) = retained_owners {
             super::append_reserved(
                 retired,
                 Retired {
                     _object: previous,
-                    owners: *owners,
+                    owners: retained_owners,
                 },
             );
         }
         Ok(())
     }
     pub(crate) fn retire(&mut self, ordinal: u64) -> Result {
-        let slot = &mut self.slots[ordinal as usize % DEPTH];
+        let slot = &mut self.slots[ordinal as usize % self.depth];
         if *slot == Some(ordinal) {
             *slot = None;
         }
@@ -465,7 +486,7 @@ impl Target {
     /// Cancels only an unpublished record; older referenced backing remains
     /// owned until normal paired retirement or the firmware-stop boundary.
     pub(crate) fn cancel(&mut self, ordinal: u64) {
-        let slot = &mut self.slots[ordinal as usize % DEPTH];
+        let slot = &mut self.slots[ordinal as usize % self.depth];
         if *slot == Some(ordinal) {
             *slot = None;
         }

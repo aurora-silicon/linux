@@ -140,7 +140,7 @@ impl<B: Backend> Queue<B> {
         frontend: Frontend,
         slot: admission::QueueSlot,
         usage: Arc<crate::usage::Client>,
-    ) -> Result<Self> {
+    ) -> Result<KBox<Self>> {
         let Frontend {
             fences,
             allocation_failure,
@@ -155,27 +155,31 @@ impl<B: Backend> Queue<B> {
             super::timeout::DEFAULT_ALLOWANCE_MS,
         )?);
         let failures = context.status().failures().finished;
-        Ok(Self {
-            dev: dev.into(),
-            context,
-            usage: Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?,
-            backend,
-            render,
-            compute: None,
-            compute_allowance_ms: super::timeout::DEFAULT_ALLOWANCE_MS,
-            fences,
-            allocation_failure,
-            range,
-            window,
-            variant,
-            proof: Proof::new(),
-            sequence: [0; 2],
-            frontiers: [Outstanding::new(failures), Outstanding::new(failures)],
-            publishers: [Outstanding::new(failures), Outstanding::new(failures)],
-            finished: KVVec::new(),
-            failures: [FailureRecord::new(), FailureRecord::new()],
-            _slot: slot,
-        })
+        let usage = Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?;
+        KBox::try_init(
+            kernel::try_init!(Self {
+                dev: dev.into(),
+                context,
+                usage,
+                backend,
+                render,
+                compute: None,
+                compute_allowance_ms: super::timeout::DEFAULT_ALLOWANCE_MS,
+                fences,
+                allocation_failure,
+                range,
+                window,
+                variant,
+                proof <- Proof::init(),
+                sequence: [0; 2],
+                frontiers: [Outstanding::new(failures), Outstanding::new(failures)],
+                publishers: [Outstanding::new(failures), Outstanding::new(failures)],
+                finished: KVVec::new(),
+                failures: [FailureRecord::new(), FailureRecord::new()],
+                _slot: slot,
+            }),
+            GFP_KERNEL,
+        )
     }
 
     fn ensure_compute(&mut self, command: &Validated) -> Result {

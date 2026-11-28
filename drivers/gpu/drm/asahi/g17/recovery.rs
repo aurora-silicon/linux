@@ -234,11 +234,14 @@ pub(super) struct ServiceResult {
 
 impl State {
     pub(super) const fn new() -> Self {
+        Self::with_forgive_limit(crate::hw::t8140::queues::RENDER_DEPTH)
+    }
+    pub(super) const fn with_forgive_limit(forgive_limit: u8) -> Self {
         Self {
             accepted: 0,
             pending: None,
             timeouts: safety::Storm::new(),
-            restarts: safety::Storm::new(),
+            restarts: safety::Storm::with_forgive_limit(forgive_limit),
         }
     }
     pub(super) fn timeout_limit(&mut self, now: u64) -> bool {

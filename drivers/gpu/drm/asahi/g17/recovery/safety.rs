@@ -6,9 +6,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 const WINDOW_NS: u64 = 30_000_000_000;
 const LIMIT: u8 = 8;
-/// Restarts forgiven per window: one per group a render pair holds. Leftover work of a failed
-/// VM ends on its own, but an unknown firmware loop must still reach the limit.
-const FORGIVE_LIMIT: u8 = crate::hw::t8140::queues::RENDER_DEPTH;
+/// Default restarts forgiven per window: one per group a default-depth render pair holds.
+/// Devices with deeper queues pass their active depth via [`Storm::with_forgive_limit`].
+/// Leftover work of a failed VM ends on its own, but an unknown firmware loop must still reach
+/// the limit.
+const DEFAULT_FORGIVE_LIMIT: u8 = crate::hw::t8140::queues::RENDER_DEPTH;
 
 /// Commands retired successfully. A watchdog storm means the GPU stopped making progress;
 /// timeouts of overloaded clients while other work keeps retiring are not one.
@@ -38,12 +40,23 @@ pub(super) struct Storm {
     start: Option<u64>,
     count: u8,
     forgiven: u8,
+    forgive_limit: u8,
     stopped: bool,
     progress: u64,
 }
 impl Storm {
     pub(super) const fn new() -> Self {
-        Self { start: None, count: 0, forgiven: 0, stopped: false, progress: 0 }
+        Self::with_forgive_limit(DEFAULT_FORGIVE_LIMIT)
+    }
+    pub(super) const fn with_forgive_limit(forgive_limit: u8) -> Self {
+        Self {
+            start: None,
+            count: 0,
+            forgiven: 0,
+            forgive_limit,
+            stopped: false,
+            progress: 0,
+        }
     }
     /// Like [`Self::note`], but work retired since the previous event starts a new window.
     pub(super) fn note_unless_progress(&mut self, now: u64, progress: u64) -> bool {
@@ -64,9 +77,9 @@ impl Storm {
         self.stopped = self.count >= LIMIT;
         self.stopped
     }
-    /// Takes back the latest event, at most [`FORGIVE_LIMIT`] times per window. A stop stays.
+    /// Takes back the latest event, at most `forgive_limit` times per window. A stop stays.
     pub(super) fn forgive(&mut self) -> bool {
-        if self.stopped || self.count == 0 || self.forgiven >= FORGIVE_LIMIT {
+        if self.stopped || self.count == 0 || self.forgiven >= self.forgive_limit {
             return false;
         }
         self.count -= 1;
@@ -132,20 +145,36 @@ mod tests {
     }
     #[test]
     fn forgiven_restarts_are_bounded_per_window() {
-        let mut storm = Storm::new();
-        for _ in 0..FORGIVE_LIMIT {
+        for limit in [
+            crate::hw::t8140::queues::RENDER_DEPTH,
+            crate::hw::t8140::queues::RENDER_DEPTH_MAX,
+        ] {
+            let mut storm = Storm::with_forgive_limit(limit);
+            for _ in 0..limit {
+                assert!(!storm.note(0));
+                assert!(storm.forgive());
+            }
+            // The (limit + 1)-th restart is un-forgiven and counts toward LIMIT.
             assert!(!storm.note(0));
+            assert!(!storm.forgive());
+            for _ in 2..LIMIT {
+                assert!(!storm.note(0));
+            }
+            // Reaching LIMIT latches the stop permanently, even past WINDOW_NS.
+            assert!(storm.note(0));
+            assert!(!storm.forgive());
+            assert!(storm.note(WINDOW_NS));
+            assert!(!storm.forgive());
+
+            // Before latching, a new window resets the forgiveness budget.
+            let mut storm = Storm::with_forgive_limit(limit);
+            for _ in 0..limit {
+                assert!(!storm.note(0));
+                assert!(storm.forgive());
+            }
+            assert!(!storm.note(WINDOW_NS));
             assert!(storm.forgive());
         }
-        assert!(!storm.note(0));
-        assert!(!storm.forgive());
-        for _ in 2..LIMIT { assert!(!storm.note(0)); }
-        assert!(storm.note(0));
-        assert!(!storm.forgive());
-        let mut storm = Storm::new();
-        for _ in 0..FORGIVE_LIMIT { storm.note(0); storm.forgive(); }
-        assert!(!storm.note(WINDOW_NS));
-        assert!(storm.forgive());
     }
     #[test]
     fn replay_dependency_checks_never_wait_for_event_service() {

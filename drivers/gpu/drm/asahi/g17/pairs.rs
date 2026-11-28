@@ -23,7 +23,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
-use crate::hw::t8140::queues::RENDER_PAIRS_MAX;
+use crate::hw::t8140::queues::{RENDER_DEPTH, RENDER_DEPTH_MAX, RENDER_PAIRS_MAX};
 
 /// Multi-pair count for large multi-cluster M5 parts (G17C/G17D).
 const MULTI_PAIRS: u8 = RENDER_PAIRS_MAX as u8;
@@ -39,6 +39,27 @@ pub(crate) const COMPUTE_CHANNELS_MAX: usize = 3;
 static PAIRS: AtomicU8 = AtomicU8::new(1);
 static COMPUTE_CHANNELS: AtomicU8 = AtomicU8::new(1);
 
+/// Render pairs per owner for a board with `clusters` GPU clusters.
+pub(crate) const fn pairs_for_clusters(clusters: u32) -> u8 {
+    if clusters >= 4 { MULTI_PAIRS } else { 1 }
+}
+
+/// Per-pair render depth derived from parameter-buffer scene scratch capacity
+/// (`scratch_slots`) and the owner's render-pair count (`pairs_per_owner`).
+///
+/// Single-pair queues whose scene table can back `RENDER_DEPTH_MAX` concurrent
+/// renders get the full 64-command in-flight window without adding a second
+/// pair's ring/PB/ray-tracing footprint or cross-pair hazard barriers. Two-pair
+/// queues already have `2 * RENDER_DEPTH = 64` total slots and stay at
+/// `RENDER_DEPTH` per pair so each pair's compact-window footprint stays unchanged.
+pub(crate) const fn render_depth_for(scratch_slots: usize, pairs_per_owner: u8) -> u8 {
+    if pairs_per_owner == 1 && scratch_slots >= RENDER_DEPTH_MAX as usize {
+        RENDER_DEPTH_MAX
+    } else {
+        RENDER_DEPTH
+    }
+}
+
 /// The counts for the probed board, set once at probe (one GPU per system).
 pub(crate) fn select_board(board: &crate::g17::fw::m5::initdata::Board) {
     PAIRS.store(
@@ -51,6 +72,16 @@ pub(crate) fn select_board(board: &crate::g17::fw::m5::initdata::Board) {
 /// Render pairs a logical render queue created now may hold.
 pub(crate) fn per_owner() -> u8 {
     PAIRS.load(Relaxed)
+}
+
+/// Per-pair render depth for a device with (`m5`) or without M5 command queues.
+pub(crate) fn render_depth_for_device(m5: bool) -> u8 {
+    let scratch_slots = if m5 {
+        crate::g17::fw::m5::pool::SCENE_TABLE_ENTRIES
+    } else {
+        crate::g17::fw::buffer::SCRATCH_SLOTS
+    };
+    render_depth_for(scratch_slots, per_owner())
 }
 
 /// Physical compute channels a logical compute queue created now may hold.
@@ -169,5 +200,24 @@ mod tests {
     fn a_one_pair_queue_and_a_render_without_footprint_are_unchanged() {
         assert_eq!(for_window(1, Some(WINDOW), WINDOW), 1);
         assert_eq!(for_window(2, None, WINDOW), 2);
+    }
+
+    #[test]
+    fn render_depth_follows_scene_capacity_and_pair_count() {
+        // G17P (36 scratch slots): keeps 32 regardless of pair count.
+        assert_eq!(
+            render_depth_for(crate::g17::fw::buffer::SCRATCH_SLOTS, 1),
+            RENDER_DEPTH
+        );
+        // Single-pair M5 (80 scene slots): expands to 64.
+        assert_eq!(
+            render_depth_for(crate::g17::fw::m5::pool::SCENE_TABLE_ENTRIES, 1),
+            RENDER_DEPTH_MAX
+        );
+        // Two-pair M5 (80 scene slots, 2 pairs * 32 = 64 total): stays 32 per pair.
+        assert_eq!(
+            render_depth_for(crate::g17::fw::m5::pool::SCENE_TABLE_ENTRIES, 2),
+            RENDER_DEPTH
+        );
     }
 }

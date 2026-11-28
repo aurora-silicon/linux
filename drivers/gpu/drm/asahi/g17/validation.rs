@@ -111,6 +111,25 @@ impl Proof {
         }
     }
 
+    /// Initializes the proof directly in place so its cached range array never sits on the stack.
+    pub(crate) fn init() -> impl Init<Self> {
+        // SAFETY: Every field is initialized in place; `slot` is valid for writes per
+        // `pin_init::init_from_closure`'s contract.
+        unsafe {
+            pin_init::init_from_closure(|slot: *mut Self| {
+                core::ptr::addr_of_mut!((*slot).epoch).write(None);
+                let requests = core::ptr::addr_of_mut!((*slot).requests);
+                let ranges = core::ptr::addr_of_mut!((*requests).ranges).cast::<Request>();
+                for index in 0..MAX_CACHED_RANGES {
+                    ranges.add(index).write((0, 0, 0));
+                }
+                core::ptr::addr_of_mut!((*requests).count).write(0);
+                core::ptr::addr_of_mut!((*requests).overflow).write(false);
+                Ok(())
+            })
+        }
+    }
+
     fn covers(&self, epoch: Option<u64>, requests: &Requests) -> bool {
         self.epoch.is_some()
             && self.epoch == epoch

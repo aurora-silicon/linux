@@ -247,7 +247,7 @@ impl Pair {
     fn published_in_flight(&self) -> bool { !self.quarantined && !self.active.is_empty() }
     fn in_flight(&self) -> bool { !self.active.is_empty() }
     fn stamp_waiting(&self) -> bool { false }
-    fn dependency_snapshot(&self) -> Dependencies { Dependencies }
+    fn snapshot_dependencies_into(&self, _out: &mut Dependencies) {}
     fn switch_in_flight(&self) -> Option<u64> { None }
     /// The front is done once both stamps cover it.
     fn observation_packet(&self, _masks: [u64; 2], stamps: [u32; 2], state: u32) -> Result<Option<u64>> {
@@ -279,6 +279,10 @@ struct Entry {
     borrowed_active: bool, borrowed_dependencies: Option<Dependencies>, borrowed_switch: Option<u64>,
     event_masks: [u64; 2], missed_event: bool, closed: bool,
     pending_error: Option<(Arc<VmStatus>, i32)>, pending_timeout: bool, growing: bool,
+}
+impl Entry {
+    fn snapshot_dependencies(&mut self) { self.borrowed_dependencies = Some(Dependencies); }
+    fn clear_dependencies(&mut self) { self.borrowed_dependencies = None; }
 }
 pub struct RenderState { entries: Vec<Option<Entry>>, replay: bool }
 impl RenderState {

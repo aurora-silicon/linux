@@ -364,6 +364,9 @@ impl Pair {
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
+        let depth = usize::from(crate::g17::pairs::render_depth_for_device(alloc.uat.is_m5()));
+        let active = Tracker::with_capacity(depth)?;
+        let replay = Tracker::with_capacity(depth)?;
         let (memory, aliases) = memory::Memory::new(
             alloc,
             pool,
@@ -377,6 +380,7 @@ impl Pair {
             word,
             variant,
             board,
+            depth,
         )?;
         storage.write_init(kernel::try_init!(Self {
             pool_pin,
@@ -387,7 +391,7 @@ impl Pair {
             free_list,
             pending_aliases: Some(aliases),
             prepared: None,
-            active: Tracker::new(),
+            active,
             slot,
             owner: Some(owner),
             ordinal: 0,
@@ -410,7 +414,7 @@ impl Pair {
             terminal: None,
             previous: None,
             displaced: None,
-            replay: Tracker::new(),
+            replay,
             executed_generation: None,
             replay_since: None,
             context_update: true,
@@ -557,7 +561,7 @@ impl Pair {
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
                 self.board)?;
         let deflake_layout = self.deflake;
-        let owners = self.memory.owners();
+        let owners = self.memory.owners()?;
         self.memory
             .target
             .ensure_capacity(alloc.dev, packet.context.vm(), &layout, &owners)?;
@@ -3447,6 +3451,7 @@ impl Pair {
                 first.completion.work_state()?.word(),
                 self.variant,
                 self.board,
+                self.memory.depth(),
             )?;
             (Some(memory), Some(persistent), Some(aliases))
         };

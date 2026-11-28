@@ -343,6 +343,8 @@ pub(crate) trait Backend: Send + Sync {
     /// Render pairs this logical queue may hold, fixed when it is created: its
     /// render scheduler's credits are fixed then too.
     fn render_pairs(&self) -> u32 { 1 }
+    /// Commands each physical render pair of this queue holds in flight.
+    fn render_depth(&self) -> u32 { RENDER_CREDITS }
     fn supports_engine(&self, _engine: Engine) -> bool { true }
     /// Device policy applied to a validated command before it is ordered (the M5 resource
     /// plan).
@@ -585,7 +587,7 @@ impl<B: Backend> Scheduler<B> {
     {
         let (credits, name) = match engine {
             Engine::Render => (
-                RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
+                backend.render_depth().checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
                 c_str!("aurora_g17_render"),
             ),
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),

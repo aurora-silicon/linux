@@ -51,6 +51,8 @@ pub(crate) struct ParkedPair {
 pub(crate) struct Prepared {
     pool_pin: Option<crate::g17::freelist::PoolPin>,
     memory: Option<KBox<memory::Memory>>,
+    active: Option<Tracker<super::Active>>,
+    replay: Option<Tracker<Arc<Packet>>>,
     pool: Arc<RenderPool>,
     aliases: Option<KVec<mmu::KernelMapping>>,
     kicks: Option<[Option<mmu::KernelMapping>; 2]>,
@@ -254,6 +256,9 @@ impl ParkedPair {
                 return Err(EFAULT);
             }
         }
+        let depth = usize::from(crate::g17::pairs::render_depth_for_device(alloc.uat.is_m5()));
+        let active = Tracker::with_capacity(depth)?;
+        let replay = Tracker::with_capacity(depth)?;
         let (memory, persistent) = memory::Memory::new(
             alloc,
             pool,
@@ -267,10 +272,13 @@ impl ParkedPair {
             word,
             self.variant,
             self.board,
+            depth,
         )?;
         Ok(Prepared {
             pool_pin,
             memory: Some(memory),
+            active: Some(active),
+            replay: Some(replay),
             pool: free_list,
             aliases: Some(persistent),
             kicks: Some(aliases),
@@ -313,7 +321,9 @@ impl ParkedPair {
             return Err(EIO);
         };
         let mut next = prepared;
-        let Some(memory) = next.memory.take() else {
+        let (Some(memory), Some(active), Some(replay)) =
+            (next.memory.take(), next.active.take(), next.replay.take())
+        else {
             self.kicks = Some(kicks);
             return Err(EIO);
         };
@@ -334,7 +344,7 @@ impl ParkedPair {
             free_list: next.pool.clone(),
             pending_aliases: None,
             prepared: None,
-            active: Tracker::new(),
+            active,
             slot: self.slot,
             owner: Some(next.owner),
             ordinal: self.ordinal,
@@ -356,7 +366,7 @@ impl ParkedPair {
             terminal: None,
             previous: self.previous.take(),
             displaced: None,
-            replay: Tracker::new(),
+            replay,
             executed_generation: None,
             replay_since: None,
             context_update: true,

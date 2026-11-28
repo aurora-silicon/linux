@@ -9,7 +9,7 @@ use crate::g17::{
     job::{self, Packet},
     status::VmStatus,
 };
-use crate::hw::t8140::queues::RENDER_DEPTH;
+use crate::hw::t8140::queues::RENDER_DEPTH_MAX;
 use kernel::{prelude::*, sync::Arc};
 
 struct Predecessor {
@@ -22,7 +22,7 @@ struct Predecessor {
 /// status remains live through the retained Packet, even while its storage is away.
 pub(crate) struct Dependencies {
     owner: Option<u64>,
-    entries: [Option<Predecessor>; RENDER_DEPTH as usize],
+    entries: KVec<Predecessor>,
 }
 
 fn include(
@@ -51,10 +51,21 @@ fn include(
 }
 
 impl Dependencies {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            owner: None,
+            entries: KVec::with_capacity(RENDER_DEPTH_MAX as usize, GFP_KERNEL)?,
+        })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.owner = None;
+        self.entries.clear();
+    }
+
     pub(crate) fn contains_packet(&self, packet: &Arc<Packet>) -> bool {
         self.entries
             .iter()
-            .flatten()
             .any(|entry| Arc::ptr_eq(&entry.packet, packet))
     }
 
@@ -69,7 +80,7 @@ impl Dependencies {
         if self.owner != Some(owner) {
             return Ok(());
         }
-        for entry in self.entries.iter().flatten() {
+        for entry in self.entries.iter() {
             include(frontier, status, prefix, &entry.packet, entry.word, compute)?;
         }
         Ok(())
@@ -84,7 +95,7 @@ impl Dependencies {
         if self.owner != Some(owner) {
             return Ok(());
         }
-        for entry in self.entries.iter().flatten() {
+        for entry in self.entries.iter() {
             include(frontier, status, prefix, &entry.packet, entry.ta_word, false)?;
         }
         Ok(())
@@ -94,20 +105,18 @@ impl Dependencies {
 impl Pair {
     /// The fixed tracker bounds this snapshot; no allocation or packet can be
     /// lost between capture and the registry moving the pair under the same lock.
-    pub(crate) fn dependency_snapshot(&self) -> Dependencies {
+    pub(crate) fn snapshot_dependencies_into(&self, out: &mut Dependencies) {
         let qid = self.qids()[1];
-        let mut active = self.active.iter();
-        Dependencies {
-            owner: self.owner,
-            entries: core::array::from_fn(|_| {
-                active.next().map(|entry| Predecessor {
-                    packet: entry.packet.clone(),
-                    ta_word: KickDependency::new(self.qids()[0], entry.kicks[0])
-                        .map_or(u64::MAX, KickDependency::word),
-                    word: KickDependency::new(qid, entry.kicks[1])
-                        .map_or(u64::MAX, KickDependency::word),
-                })
-            }),
+        out.owner = self.owner;
+        out.entries.clear();
+        for entry in self.active.iter() {
+            let _ = out.entries.push_within_capacity(Predecessor {
+                packet: entry.packet.clone(),
+                ta_word: KickDependency::new(self.qids()[0], entry.kicks[0])
+                    .map_or(u64::MAX, KickDependency::word),
+                word: KickDependency::new(qid, entry.kicks[1])
+                    .map_or(u64::MAX, KickDependency::word),
+            });
         }
     }
 

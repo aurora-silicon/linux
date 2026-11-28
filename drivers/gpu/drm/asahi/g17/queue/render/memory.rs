@@ -22,15 +22,20 @@ use kernel::{prelude::*, sync::Arc};
 use crate::g17::fw::m5::initdata::Board;
 
 pub(super) const RECORDS: usize = 32;
+pub(super) const RECORDS_MAX: usize = queues::RENDER_DEPTH_MAX as usize;
 pub(super) const TA_BYTES: usize = 0x14000;
 pub(super) const FRAGMENT_BYTES: usize = 0x48000;
 pub(super) const GRAPH_SIZE: usize = 0x1c000;
+pub(super) const GRAPH_SIZE_MAX: usize = 0x20000;
 pub(super) const POINTERS: [usize; 2] = [0x9000, 0x9080];
 pub(super) const ITEMS: [usize; 2] = [0xc000, 0x10000];
 pub(super) const ANNOUNCE_STRIDE: usize = 0x80;
 pub(super) const ANNOUNCE: [usize; 2] = [0x17000, 0x1b000];
 pub(super) const JOB_LIST: usize = 0xa000;
 pub(super) const CONFIG: [usize; 2] = [0, 0x4000];
+pub(super) const CONFIG_LARGE: [usize; 2] = [0, 0x8000];
+pub(super) const CONFIG_SIZE: usize = 0x8000;
+pub(super) const CONFIG_SIZE_LARGE: usize = 0x10000;
 pub(super) const CONFIG_STRIDE: usize = 0x180;
 /// Usage records of one M5 command, both stages.
 const M5_USAGE_BYTES: usize = 0x40;
@@ -39,6 +44,7 @@ const M5_USAGE_PAIR_BYTES: usize = 2 * M5_USAGE_BYTES;
 /// in its slot ([`crate::g17::fw::Variant::lead_commands`]).
 pub(super) const LEAD: usize = 0xc0;
 const DEPTH: usize = queues::RENDER_DEPTH as usize;
+const DEPTH_MAX: usize = queues::RENDER_DEPTH_MAX as usize;
 /// Offsets of the priority pair and the policy word in a queue record.
 const PRIORITY: usize = core::mem::offset_of!(queue::QueueRecord, priority);
 const POLICY: usize = core::mem::offset_of!(queue::QueueRecord, policy);
@@ -101,13 +107,22 @@ pub(super) struct Graph {
     pub(super) queues: PooledObject,
     pub(super) config: PooledObject,
     pub(super) support: KernelObject,
-    pub(super) owners: [Option<u64>; RECORDS],
+    pub(super) owners: KVec<Option<u64>>,
+    records: usize,
     /// Host words of the pointer blocks in this firmware build.
     pub(super) pointers: fw::variant::PointerLayout,
     m5: bool,
 }
 impl Graph {
     pub(super) fn is_m5(&self) -> bool { self.m5 }
+    pub(super) fn records(&self) -> usize { self.records }
+    pub(super) fn config_offset(&self, stage: usize, ordinal: u64) -> usize {
+        let bases = if self.records > RECORDS { CONFIG_LARGE } else { CONFIG };
+        bases[stage] + (ordinal as usize % self.records) * CONFIG_STRIDE
+    }
+    pub(super) fn announce_offset(&self, stage: usize, ordinal: u64) -> usize {
+        ANNOUNCE[stage] + (ordinal as usize % self.records) * ANNOUNCE_STRIDE
+    }
 
     /// Out of line: inlined, its temporaries stay reserved in `Memory::new`'s frame while the
     /// rest of the pair (`buffer::Manager::new` and its allocations) is built below it, which
@@ -119,14 +134,20 @@ impl Graph {
         context: &Context,
         qids: [u8; 2],
         pointers: fw::variant::PointerLayout,
+        records: usize,
     ) -> Result<Self> {
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let m5 = alloc.uat.is_m5();
+        if records < RECORDS || records > RECORDS_MAX || (!m5 && records != RECORDS) {
+            return Err(EINVAL);
+        }
         // M5 selects cached firmware attributes at initial mapping creation;
         // write-combined CPU stores also support the uncached capacity fallback.
         let cpu = if m5 { CpuMap::WriteCombined } else { CpuMap::WriteBack };
-        let bytes = if m5 { RECORDS * fw::m5::render_assembly::COMMAND_STORAGE_BYTES }
+        let bytes = if m5 { records * fw::m5::render_assembly::COMMAND_STORAGE_BYTES }
             else { TA_BYTES + FRAGMENT_BYTES };
+        let graph_size = if records > RECORDS { GRAPH_SIZE_MAX } else { GRAPH_SIZE };
+        let config_size = if records > RECORDS { CONFIG_SIZE_LARGE } else { CONFIG_SIZE };
         // The GPU reads command storage only through the read-only aliases below. On M5 the
         // kernel mapping, in the upper half every execution context includes, is firmware-only.
         let descriptors = pool.allocate(
@@ -151,7 +172,7 @@ impl Graph {
         let mut queues = pool.allocate(
             alloc,
             Family::QueueState,
-            GRAPH_SIZE,
+            graph_size,
             0,
             prot,
             CpuMap::WriteCombined,
@@ -159,8 +180,8 @@ impl Graph {
         let config = pool.allocate(
             alloc,
             Family::QueueConfig,
-            0x8000,
-            0x8000,
+            config_size,
+            config_size,
             prot,
             cpu,
         )?;
@@ -195,13 +216,18 @@ impl Graph {
             })?;
         }
         queues.write(JOB_LIST, queue::JobListHead::new(address + JOB_LIST as u64))?;
+        let mut owners = KVec::with_capacity(records, GFP_KERNEL)?;
+        for _ in 0..records {
+            owners.push(None, GFP_KERNEL)?;
+        }
         Ok(Self {
             aliases: [Some(ta), fragment],
             descriptors,
             queues,
             config,
             support,
-            owners: [None; RECORDS],
+            owners,
+            records,
             pointers,
             m5,
         })
@@ -214,7 +240,7 @@ impl Graph {
         self.queues.gpu_va() + self.queue_offset(qid) as u64
     }
     pub(super) fn offset(&self, stage: usize, ordinal: u64) -> usize {
-        let slot = ordinal as usize % RECORDS;
+        let slot = ordinal as usize % self.records;
         if self.m5 {
             slot * fw::m5::render_assembly::COMMAND_STORAGE_BYTES
                 + stage * fw::m5::render_assembly::FRAGMENT_OFFSET
@@ -238,7 +264,7 @@ impl Graph {
             abi::FRAGMENT_SLOT_SIZE
         };
         Ok(self.aliases[stage].as_ref().ok_or(EIO)?.client.iova()
-            + (ordinal as usize % RECORDS * stride) as u64)
+            + (ordinal as usize % self.records * stride) as u64)
     }
     /// The command storage of `ordinal` on M5: both stages' commands.
     pub(super) fn m5_storage(&mut self, ordinal: u64) -> Result<&mut [u8]> {
@@ -252,7 +278,7 @@ impl Graph {
     /// resident with the graph until both stages release the descriptor slot.
     pub(super) fn m5_usage(&mut self, ordinal: u64) -> Result<[u64; 2]> {
         if !self.m5 || !self.owns(ordinal) { return Err(EINVAL); }
-        let start = ordinal as usize % RECORDS * M5_USAGE_PAIR_BYTES;
+        let start = ordinal as usize % self.records * M5_USAGE_PAIR_BYTES;
         self.support.bytes_mut().get_mut(start..start + M5_USAGE_PAIR_BYTES)
             .ok_or(EINVAL)?.fill(0);
         let address = self.support.gpu_va() + start as u64;
@@ -298,7 +324,7 @@ impl Graph {
         Ok(values)
     }
     pub(super) fn claim(&mut self, ordinal: u64) -> Result {
-        let owner = &mut self.owners[ordinal as usize % RECORDS];
+        let owner = &mut self.owners[ordinal as usize % self.records];
         if owner.is_some_and(|old| old != ordinal) {
             return Err(EBUSY);
         }
@@ -306,13 +332,13 @@ impl Graph {
         Ok(())
     }
     pub(super) fn owns(&self, ordinal: u64) -> bool {
-        self.owners[ordinal as usize % RECORDS] == Some(ordinal)
+        self.owners[ordinal as usize % self.records] == Some(ordinal)
     }
     pub(super) fn release(&mut self, ordinal: u64) -> Result {
         if !self.owns(ordinal) {
             return Err(EIO);
         }
-        self.owners[ordinal as usize % RECORDS] = None;
+        self.owners[ordinal as usize % self.records] = None;
         Ok(())
     }
 }
@@ -515,7 +541,7 @@ pub(super) struct Memory {
     mesh_storage: Option<Compact>,
     mesh_storage_chunks: u32,
     pub(super) target: KBox<target::Target>,
-    generations: [Option<Generation>; DEPTH],
+    generations: KVec<Option<Generation>>,
     generation_count: usize,
     pub(super) timestamps: KernelObject,
     pub(super) manager: buffer::Manager,
@@ -548,13 +574,16 @@ impl Memory {
         word: u32,
         variant: &'static fw::Variant,
         board: Option<&'static Board>,
+        depth: usize,
     ) -> Result<(KBox<Self>, KVec<mmu::KernelMapping>)> {
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let vm = context.vm();
         let m5 = alloc.uat.is_m5();
-        if m5 != layout.is_m5() { return Err(EINVAL); }
-        let mut graph = Graph::new(alloc, pool, &context, qids, variant.pointers)?;
-        let mut target = target::Target::new(alloc.dev, vm, layout)?;
+        if m5 != layout.is_m5() || depth < DEPTH || depth > DEPTH_MAX || (!m5 && depth != DEPTH) {
+            return Err(EINVAL);
+        }
+        let mut graph = Graph::new(alloc, pool, &context, qids, variant.pointers, depth)?;
+        let mut target = target::Target::new(alloc.dev, vm, layout, depth)?;
         target.prepare(ordinal, layout)?;
         let state = Generation::allocate_state(alloc, vm, board)?;
         let (tvb, mappings, scratch, discard) = if m5 {
@@ -570,13 +599,16 @@ impl Memory {
             let (tvb, mappings) = buffer::Tvb::new(alloc.dev, vm, layout.tvb_blocks)?;
             (tvb, mappings, scratch, discard)
         };
-        let count = DEPTH;
+        let count = depth;
         let initial = if ordinal == 0 {
             0
         } else {
             (ordinal ^ 1) as usize % count
         };
-        let mut generations = core::array::from_fn(|_| None);
+        let mut generations = KVec::with_capacity(count, GFP_KERNEL)?;
+        for _ in 0..count {
+            generations.push(None, GFP_KERNEL)?;
+        }
         generations[initial] = Some(Generation::new(alloc, vm, state, board)?);
         for offset in 1..count {
             let index = (initial + offset) % count;
@@ -691,9 +723,12 @@ impl Memory {
                 .as_ref()
                 .is_some_and(|generation| generation.ordinal() == Some(ordinal))
     }
+    pub(super) fn depth(&self) -> usize {
+        self.generation_count
+    }
     /// M5 commands record four stage timestamps, G17P ones two.
     pub(super) fn timestamp_offset(&self, ordinal: u64) -> usize {
-        ordinal as usize % RECORDS * if self.graph.m5 { 32 } else { 16 }
+        ordinal as usize % self.graph.records() * if self.graph.m5 { 32 } else { 16 }
     }
     pub(super) fn clear_timestamps(&mut self, ordinal: u64) -> Result {
         let at = self.timestamp_offset(ordinal);
@@ -729,8 +764,12 @@ impl Memory {
             self.timestamps.dword(offset + 24)?.load(Ordering::Relaxed),
         ])
     }
-    pub(super) fn owners(&self) -> [Option<u64>; DEPTH] {
-        core::array::from_fn(|index| self.generations[index].as_ref().and_then(|g| g.ordinal()))
+    pub(super) fn owners(&self) -> Result<KVec<Option<u64>>> {
+        let mut owners = KVec::with_capacity(self.generation_count, GFP_KERNEL)?;
+        for generation in &self.generations {
+            owners.push(generation.as_ref().and_then(|g| g.ordinal()), GFP_KERNEL)?;
+        }
+        Ok(owners)
     }
     pub(super) fn retire(&mut self, ordinal: u64) -> Result {
         if !self.owns(ordinal) {
@@ -747,9 +786,17 @@ impl Memory {
 const _: () = {
     // Every unretired render of a pair holds its own command record.
     assert!(DEPTH <= RECORDS);
+    assert!(DEPTH_MAX <= RECORDS_MAX);
     assert!(abi::TA_DESCRIPTOR_SIZE * RECORDS <= TA_BYTES);
     assert!(abi::FRAGMENT_SLOT_SIZE * RECORDS <= FRAGMENT_BYTES);
-    assert!(RECORDS * CONFIG_STRIDE <= 0x4000);
+    assert!(RECORDS * CONFIG_STRIDE <= CONFIG[1]);
+    assert!(CONFIG[1] + RECORDS * CONFIG_STRIDE <= CONFIG_SIZE);
+    assert!(RECORDS_MAX * CONFIG_STRIDE <= CONFIG_LARGE[1]);
+    assert!(CONFIG_LARGE[1] + RECORDS_MAX * CONFIG_STRIDE <= CONFIG_SIZE_LARGE);
+    assert!(ANNOUNCE[0] + RECORDS_MAX * ANNOUNCE_STRIDE <= ANNOUNCE[1]);
+    assert!(ANNOUNCE[1] + RECORDS_MAX * ANNOUNCE_STRIDE <= GRAPH_SIZE_MAX);
+    assert!(RECORDS_MAX * M5_USAGE_PAIR_BYTES <= mmu::UAT_PGSZ);
+    assert!(RECORDS_MAX * 32 <= mmu::UAT_PGSZ);
     assert!(size_of::<queue::QueueConfig>() <= LEAD);
     assert!(LEAD + size_of::<queue::InitBufferManager>() <= CONFIG_STRIDE);
 };
@@ -761,12 +808,11 @@ impl Memory {
     /// the preparation overlaps those transfers with it instead of stalling the writes one
     /// line at a time.
     pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
-        let record = ordinal as usize % RECORDS;
         let config = size_of::<queue::QueueConfig>();
         let ranges = [
             (&self.graph.descriptors, self.graph.offset(0, ordinal), size_of::<abi::TaDescriptor>()),
-            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config),
-            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config),
+            (&self.graph.config, self.graph.config_offset(0, ordinal), config),
+            (&self.graph.config, self.graph.config_offset(1, ordinal), config),
         ];
         for (object, offset, size) in ranges {
             let Ok(base) = object.pointer(offset, size) else {
@@ -917,7 +963,7 @@ impl Memory {
         // SAFETY: The view was checked during preparation and the ordinal still owns it; only
         // integer fields are read.
         let ta = unsafe { &*ta };
-        let slot = ordinal as usize % RECORDS * CONFIG_STRIDE + LEAD;
+        let slot = self.graph.config_offset(0, ordinal) + LEAD;
         if init_manager {
             let init = queue::InitBufferManager::new(
                 ta.context_id,
@@ -925,7 +971,7 @@ impl Memory {
                 ta.pb_va,
                 ta.stamp_value,
             );
-            self.graph.config.write(CONFIG[0] + slot, init)?;
+            self.graph.config.write(slot, init)?;
         }
         Ok([init_manager, false])
     }

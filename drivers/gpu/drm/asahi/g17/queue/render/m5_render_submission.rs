@@ -165,7 +165,7 @@ fn m5_layout(layout: target::Layout, pass: &RenderPass, clusters: u32,
     // 4 GiB. A layout whose pair does not fit there on its own can never be mapped: refuse it
     // as memory that cannot be had, before any of it is allocated. SUBMIT derives the layout,
     // so the refusal is the ioctl's.
-    let reserved = pair_window_bytes(&layout, geometry, state, mesh_storage)?;
+    let reserved = pair_window_bytes(&layout, clusters, geometry, state, mesh_storage)?;
     if reserved as u64 > compact::WINDOW_BYTES {
         return Err(ENOMEM);
     }
@@ -179,14 +179,19 @@ fn m5_layout(layout: target::Layout, pass: &RenderPass, clusters: u32,
 /// list, its metrics entry, and, while the binding is enabled, the task-stage mesh storage. A
 /// pair maps that storage on its first task-stage kick and keeps it for the passes that follow,
 /// so every pair counts it, whether or not this pass has a task stage.
-fn pair_sizes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeometry,
-    state: usize, mesh_storage: Option<usize>) -> Result<compact::PairSizes> {
-    let depth = crate::hw::t8140::queues::RENDER_DEPTH as usize;
+fn pair_sizes(layout: &target::Layout, clusters: u32,
+    geometry: crate::g17::buffer::BlockGeometry, state: usize, mesh_storage: Option<usize>)
+    -> Result<compact::PairSizes> {
+    let depth = usize::from(crate::g17::pairs::render_depth_for(
+        crate::g17::fw::m5::pool::SCENE_TABLE_ENTRIES,
+        crate::g17::pairs::pairs_for_clusters(clusters),
+    ));
     Ok(compact::PairSizes {
         records: layout.record_stride()?.checked_mul(depth).ok_or(EOVERFLOW)?,
         tpc: layout.tpc_capacity()?,
         blocks: layout.tvb_blocks,
         geometry,
+        depth,
         state,
         mesh_storage,
     })
@@ -194,9 +199,10 @@ fn pair_sizes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeomet
 
 /// Bytes of the client's M5 compact window that a render pair built for `layout` reserves
 /// ([`pair_sizes`]).
-fn pair_window_bytes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeometry,
-    state: usize, mesh_storage: Option<usize>) -> Result<usize> {
-    pair_sizes(layout, geometry, state, mesh_storage)?.window_bytes()
+fn pair_window_bytes(layout: &target::Layout, clusters: u32,
+    geometry: crate::g17::buffer::BlockGeometry, state: usize, mesh_storage: Option<usize>)
+    -> Result<usize> {
+    pair_sizes(layout, clusters, geometry, state, mesh_storage)?.window_bytes()
 }
 
 pub(crate) fn controls(
@@ -381,6 +387,10 @@ mod tests {
         let geometry = BlockGeometry::m5(RAM, 32 * BlockGeometry::M5_BLOCK_BYTES as u64).unwrap();
         let sizes = compact::PairSizes {
             records: 0, tpc: 0, blocks: 0, geometry,
+            depth: usize::from(crate::g17::pairs::render_depth_for(
+                crate::g17::fw::m5::pool::SCENE_TABLE_ENTRIES,
+                crate::g17::pairs::pairs_for_clusters(8),
+            )),
             state: STATE, mesh_storage: None,
         };
         let sized = [PairObject::Records, PairObject::Tpc, PairObject::ParameterBlock]

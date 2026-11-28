@@ -99,6 +99,8 @@ struct State {
     /// Total dedicated render pairs the QID table can hold (installed plus buildable).
     /// Updated alongside `build_room` so sibling admission preserves first-pair capacity.
     render_capacity: usize,
+    /// Commands admitted in flight per physical render pair.
+    render_depth: u8,
     /// Live slots on which the current owner has published (or started) a
     /// firmware-visible render graph; unpublished siblings yield before
     /// published ones, and reclaiming a published sibling keeps its installed
@@ -128,12 +130,18 @@ impl State {
             build_room: true,
             wide: 0,
             render_capacity: cfg::RENDER_SLOTS - 1,
+            render_depth: cfg::RENDER_DEPTH,
             published: 0,
             released: 0,
             epoch: 0,
             footprints: KVec::new(),
             next_ticket: 1,
         }
+    }
+    fn with_depth(render_depth: u8) -> Self {
+        let mut state = Self::new();
+        state.render_depth = render_depth;
+        state
     }
     fn owns_live(&self, owner: u64, slot: usize) -> bool {
         self.owners.get(slot) == Some(&owner) && self.released & (1u64 << slot) == 0
@@ -306,7 +314,7 @@ impl State {
                     self.owns_live(owner, *slot)
                         && self.quarantined & (1u64 << slot) == 0
                         && self.active & (1u64 << slot) != 0
-                        && self.refs[*slot] < cfg::RENDER_DEPTH
+                        && self.refs[*slot] < self.render_depth
                 })
                 .min_by_key(|slot| (self.refs[*slot], u64::MAX - self.epochs[*slot]))?;
             self.refs[slot] += 1;
@@ -782,7 +790,7 @@ impl State {
     fn usable(&self, owner: u64, slot: usize) -> bool {
         self.owns_live(owner, slot)
             && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
-            && self.refs[slot] < cfg::RENDER_DEPTH
+            && self.refs[slot] < self.render_depth
     }
     #[cfg(CONFIG_KUNIT = "y")]
     fn join(&mut self, owner: u64, index: usize) -> Option<u8> {
@@ -943,12 +951,23 @@ impl Pool {
         waiters: Option<Arc<crate::g17::availability::Availability>>,
         renders: Option<Arc<crate::g17::availability::Availability>>,
     ) -> Result<Arc<Self>> {
-        if max_queues > MAX_EXECUTION_CONTEXTS {
+        Self::with_waiters_and_depth(max_queues, cfg::RENDER_DEPTH, waiters, renders)
+    }
+    pub(crate) fn with_waiters_and_depth(
+        max_queues: u32,
+        render_depth: u8,
+        waiters: Option<Arc<crate::g17::availability::Availability>>,
+        renders: Option<Arc<crate::g17::availability::Availability>>,
+    ) -> Result<Arc<Self>> {
+        if max_queues > MAX_EXECUTION_CONTEXTS
+            || render_depth == 0
+            || render_depth > cfg::RENDER_DEPTH_MAX
+        {
             return Err(EINVAL);
         }
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State::new(), "G17 render admission"),
+                state <- new_mutex!(State::with_depth(render_depth), "G17 render admission"),
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
                 max_queues,
@@ -2006,6 +2025,20 @@ mod shared_depth_tests {
         let mut state = State::new();
         let first = state.acquire(1, 1).unwrap();
         for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1, 1), Some(first)); }
+        assert_eq!(state.acquire(1, 1), None);
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        state.release(first);
+        assert_eq!(state.acquire(1, 1), Some(first));
+    }
+
+    #[test]
+    fn a_deeper_single_pair_admits_up_to_its_configured_depth() {
+        let mut state = State::with_depth(cfg::RENDER_DEPTH_MAX);
+        let first = state.acquire(1, 1).unwrap();
+        for _ in 1..cfg::RENDER_DEPTH_MAX {
+            assert_eq!(state.acquire(1, 1), Some(first));
+        }
+        assert_eq!(state.refs[usize::from(first)], cfg::RENDER_DEPTH_MAX);
         assert_eq!(state.acquire(1, 1), None);
         assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
         state.release(first);

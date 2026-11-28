@@ -372,6 +372,8 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-depth-tests.py': [([], PASS)]
+        + mutations('--mutation', ('global-forgive-64', 'm5-stuck-32'), []),
     'g17-render-return-observe-tests.py': [([], PASS)]
         + mutations('--mutation', ('rescan-owed', 'observe-all-slots', 'observe-ignores-gate',
                                    'rescan-in-loop-bail', 'rescan-is-fallback', 'missed-dropped',

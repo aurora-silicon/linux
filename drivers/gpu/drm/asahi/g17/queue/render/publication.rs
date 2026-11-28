@@ -76,9 +76,8 @@ impl<'a> Lane<'a> {
             u32::from(present) + u32::from(lead) + if m5 { 1 } else { 2 }
         };
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
-        let offset = ordinal as usize % memory::RECORDS;
-        let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
-        let announce_offset = memory::ANNOUNCE[stage] + offset * memory::ANNOUNCE_STRIDE;
+        let config_offset = graph.config_offset(stage, ordinal);
+        let announce_offset = graph.announce_offset(stage, ordinal);
         let config_destination = graph
             .config
             .pointer(config_offset, size_of::<QueueConfig>())?

@@ -56,7 +56,7 @@ MUTATIONS = {
     # M5 compute descriptors are firmware-cached again.
     'm5-cached-descriptors': ('policy-compute', 'if alloc.uat.is_m5() { 0 } else { size }', 'size'),
     # Render queue records, which the host retargets in place, are firmware-cached again.
-    'cached-queue-records': ('policy-memory', 'GRAPH_SIZE,\n            0,\n', 'GRAPH_SIZE,\n            0x8000,\n'),
+    'cached-queue-records': ('policy-memory', 'graph_size,\n            0,\n', 'graph_size,\n            0x8000,\n'),
     # G17P work nodes lose their cached prefix (the linux#3170 light-submission cost).
     'uncached-g17p-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', '0'),
 }
@@ -853,7 +853,7 @@ def cache_policy(context, compute, memory):
     if 'Family::QueueState' in compute:
         failures.append('compute graph not pooled')
     # Render queue records, retargeted and bound to work slots in place, stay uncached.
-    need(memory, r'Family::QueueState,\s*GRAPH_SIZE,\s*0,\s*prot,', 'render queue records uncached')
+    need(memory, r'Family::QueueState,\s*(?:GRAPH_SIZE|graph_size),\s*0,\s*prot,', 'render queue records uncached')
     return failures
 
 
