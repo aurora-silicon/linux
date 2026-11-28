@@ -92,6 +92,42 @@
 	status = "okay";
 };
 
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 /*
  * ADT /arm-io/spi4/dp855: the panel timing controller. The J623 and J624
  * ADTs give the same chip select as the M4 laptops (spi4 function-spi_cs0,

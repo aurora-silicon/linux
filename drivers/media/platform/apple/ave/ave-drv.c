@@ -173,12 +173,41 @@ static const struct ave_variant ave_t8122 = {
 };
 
 /*
+ * The M4 (T8132) with the 26.6.2 (25G83) stub: the bootloader preloads TEXT
+ * 0x148000 and DATA 0x12c000, TEXT CRC 9308d2ab (encoder firmware 9003.78.0)
+ * with the per-boot word at 0x4224 zeroed. The MacBook Air (J713) has read
+ * that CRC with the word as loaded on every boot so far; on the Mac mini
+ * (J773g) the word differs per boot. The capability table in that TEXT has
+ * device 26, type 24 as its default target: with the M4 Pro's coprocessor
+ * and start it boots as device 26, takes handshake type 24 and speaks the
+ * 9003.78.0 command layout.
+ */
+static const struct ave_fw_build ave_t8132_25g83_builds[] = {
+	{ "25G83", 0x148000, 0x12c000, AVE_FW_TEXT_CRC_T8132_25G83, 0x4224 },
+};
+
+static const struct ave_variant ave_t8132_25g83 = {
+	.regs = &ave_coproc_v40,
+	.builds = ave_t8132_25g83_builds,
+	.build_count = ARRAY_SIZE(ave_t8132_25g83_builds),
+	.boot_device_id = 26,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 24,
+	.lfs_ref_scale = 2,
+	.boot_qualified = true,
+};
+
+/*
  * The M4 (T8132) with the macOS 27.2 (26B123) stub: the bootloader preloads
  * TEXT 0x154000 and DATA 0x12c000, TEXT CRC 99fc929a with the per-boot word
  * at 0x4224 zeroed. Some loaders leave that word zero (the MacBook Air, J713),
  * others set it on every boot (the Mac mini, J773g, raw CRC f641c64b), so an
  * unknown CRC is retried with it zeroed. The coprocessor and its start are
  * the M4 Pro's; this build boots as device 23 and takes handshake type 23.
+ * The 26.6.2 stub's build, selected by its segment sizes, is ave_t8132_25g83.
  */
 static const struct ave_fw_build ave_t8132_builds[] = {
 	{ "26B123", 0x154000, 0x12c000, AVE_FW_TEXT_CRC_T8132_26B123, 0x4224 },
@@ -196,6 +225,7 @@ const struct ave_variant ave_t8132 = {
 	.device_type = 23,
 	.lfs_ref_scale = 2,
 	.boot_qualified = true,
+	.next_build = &ave_t8132_25g83,
 };
 
 static const struct ave_variant ave_t8140 = {

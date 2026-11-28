@@ -1634,6 +1634,51 @@ static void ave_t8112_26b123_build(struct kunit *test)
 }
 
 /*
+ * The M4 with the 26.6.2 stub: its segment sizes select the 9003.78.0 build
+ * (device 26, handshake type 24, the 9003.78.0 layout); the 27.2 stub's sizes
+ * keep ave_t8132 (device 23, type 23, the 26B123 layout).
+ */
+static void ave_t8132_25g83_build(struct kunit *test)
+{
+	const struct ave_variant *n = ave_t8132.next_build;
+
+	KUNIT_ASSERT_NOT_NULL(test, n);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8132, 0x154000, 0x12c000),
+			    &ave_t8132);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8132, 0x148000, 0x12c000), n);
+	/* The near misses fall back to ave_t8132 and are refused by size. */
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8132, 0x148000, 0x130000),
+			    &ave_t8132);
+	/* Each stub's sizes match its own build, so the selection is not a miss. */
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(&ave_t8132, 0x154000, 0x12c000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8132, 0x148000, 0x130000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(n, 0x154000, 0x12c000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(n, 0x148000, 0x12c000));
+	KUNIT_EXPECT_NULL(test, n->next_build);
+	KUNIT_EXPECT_TRUE(test, n->boot_qualified);
+	KUNIT_EXPECT_PTR_EQ(test, n->regs, ave_t8132.regs);
+	KUNIT_EXPECT_EQ(test, n->boot_device_id, 26U);
+	KUNIT_EXPECT_EQ(test, n->device_type, 24U);
+	KUNIT_EXPECT_EQ(test, ave_t8132.boot_device_id, 23U);
+	KUNIT_EXPECT_EQ(test, ave_t8132.device_type, 23U);
+	KUNIT_EXPECT_EQ(test, n->boot_arg_value, ave_t8132.boot_arg_value);
+	KUNIT_EXPECT_EQ(test, n->timebase_multiplier, 1U);
+	KUNIT_EXPECT_EQ(test, n->vcbar_flags, ave_t8132.vcbar_flags);
+	KUNIT_EXPECT_EQ(test, n->vcbar_mask, ave_t8132.vcbar_mask);
+	KUNIT_EXPECT_EQ(test, n->lfs_ref_scale, 2U);
+	KUNIT_EXPECT_EQ(test, n->text_link_cell, 0U);
+	/* The Mac mini's loader sets the word at TEXT 0x4224 on every boot. */
+	KUNIT_ASSERT_EQ(test, n->build_count, 1U);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_boot_word, 0x4224U);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_crc, AVE_FW_TEXT_CRC_T8132_25G83);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(n->builds[0].text_crc),
+			    &ave_layout_9003_78_0);
+	KUNIT_ASSERT_EQ(test, ave_t8132.build_count, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(ave_t8132.builds[0].text_crc),
+			    &ave_layout_26b123);
+}
+
+/*
  * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
  * comes with the IDR access unit; the B slice after it has two extra bits
  * before slice_type, and reads as an I slice if they are not skipped.
@@ -1747,6 +1792,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
 	KUNIT_CASE(ave_t8112_26b123_build),
+	KUNIT_CASE(ave_t8132_25g83_build),
 	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };

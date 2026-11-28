@@ -182,6 +182,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 /* The M4 (T8132) build preloaded by the macOS 27.2 (26B123) stub. */
 #define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
+/*
+ * The M4 (T8132) build of encoder firmware 9003.78.0, preloaded by the
+ * 26.6.2 (25G83) stub, with the per-boot word at TEXT 0x4224 zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
 /* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
 #define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
 /*
