@@ -22,7 +22,7 @@ use crate::g17::{
     freelist::RenderPool,
     fw::{
         channels::WorkSlot,
-        kick::{KickDependency, KickTimestamp, McacheTable, RenderRegistration},
+        kick::{KickDependency, KickTimestamp, RenderRegistration},
         queue::DataMaster,
         render as abi,
     },
@@ -152,7 +152,6 @@ pub(crate) trait Host {
 struct Prepared {
     packet: Arc<Packet>,
     ordinal: u64,
-    mcache: Option<McacheTable>,
     /// M5 kick register arrays and header flags, encoded with the commands.
     register_arrays: Option<[[Option<crate::g17::fw::kick::RegisterArrayBinding>; 4]; 2]>,
     kick_flags: Option<crate::g17::fw::kick::StageKickFlags>,
@@ -527,7 +526,6 @@ impl Pair {
         }
         let Validated::Render {
             pass,
-            attachments,
             ray_query,
             resources: programs,
             plan,
@@ -638,11 +636,6 @@ impl Pair {
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
-        // Without an MCache table kick-entry bit 58 stays clear.
-        let attachments = match self.variant.mcache {
-            true => attachments[1].as_slice(),
-            false => &[][..],
-        };
         let result = if self.memory.graph.is_m5() {
             self.memory
                 .write_m5_commands(
@@ -651,13 +644,11 @@ impl Pair {
                     programs.as_ref().and(*plan),
                     programs.as_ref().map_or(0, |p| p.mesh_class()),
                 )
-                .map(|(arrays, flags)| (None, Some(arrays), Some(flags)))
+                .map(|(arrays, flags)| (Some(arrays), Some(flags)))
         } else {
-            self.memory
-                .write_descriptors(&args, attachments, packet.context.id().try_into()?)
-                .map(|mcache| (mcache, None, None))
+            self.memory.write_descriptors(&args).map(|()| (None, None))
         };
-        let (mcache, register_arrays, kick_flags) = match result {
+        let (register_arrays, kick_flags) = match result {
             Ok(encoded) => encoded,
             Err(error) => {
                 self.memory.graph.release(ordinal)?;
@@ -671,7 +662,6 @@ impl Pair {
         self.prepared = Some(Prepared {
             packet: packet.clone(),
             ordinal,
-            mcache,
             register_arrays,
             kick_flags,
         });
@@ -860,7 +850,7 @@ impl Pair {
             },
         };
         use core::sync::atomic::{fence, Ordering};
-        let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
+        let (epoch, policy) = self.publication_preflight(&packet, host)?;
         let m5 = self.memory.graph.is_m5();
         let context_id = packet.context.id();
         let qos_slot = packet.context.qos_id();
@@ -1106,7 +1096,7 @@ impl Pair {
             (None, None) if !m5 => None,
             _ => return Err(EIO),
         };
-        let args = |stage: usize, barriers, arrays, mcache| KickArgs {
+        let args = |stage: usize, barriers, arrays| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
             parent: parents[stage],
@@ -1123,7 +1113,16 @@ impl Pair {
                     abi::FRAGMENT_QOS_CLASS
                 },
             },
-            mcache,
+            // Render kicks name no MCache table, so kick-entry bit 58 stays
+            // clear. The fragment attachments still order overlapping renders
+            // through their footprints (`Job::footprint`). On the A18 Pro,
+            // naming a pass's attachments made a 2048x2048 RGBA8 upload
+            // rewritten back to back cost 335 us per pass instead of 237 us,
+            // about 6 us per named MiB, while render rows that blend, resolve
+            // or sample their targets did not move. Compute kicks keep naming
+            // their write ranges (`ComputeDescriptor::write_mcache`), which
+            // speeds up fills.
+            mcache: None,
             // Common 26A428 and the host-only form use an empty tiling event mask.
             event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
                 [0, 0, 0, 1u64 << 62]
@@ -1149,7 +1148,6 @@ impl Pair {
                     self.variant.programs,
                 )?,
             },
-            None,
         );
         let fragment_args = args(
             1,
@@ -1162,7 +1160,6 @@ impl Pair {
                     self.variant.programs,
                 )?,
             },
-            mcache,
         );
         let registration = if m5 {
             Registration::M5(crate::g17::fw::m5::queue::HardwareSubmission::new(
@@ -1498,13 +1495,12 @@ impl Pair {
     /// Everything that must hold before a publication changes any state: no alias work
     /// pending, a healthy device epoch, room in the active ring, this slot's packet, the
     /// prepared descriptors for this ordinal, a clean completion status and a registration
-    /// class the pair can still take. Returns the epoch, the prepared memory-cache setting
-    /// and the owner's policy.
+    /// class the pair can still take. Returns the epoch and the owner's policy.
     fn publication_preflight(
         &self,
         packet: &Arc<Packet>,
         host: &mut impl Host,
-    ) -> Result<(u64, Option<McacheTable>, crate::g17::fw::queue::Policy)> {
+    ) -> Result<(u64, crate::g17::fw::queue::Policy)> {
         if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
             return Err(EBUSY);
         }
@@ -1537,7 +1533,7 @@ impl Pair {
         {
             return Err(EIO);
         }
-        Ok((epoch, prepared.mcache, policy))
+        Ok((epoch, policy))
     }
 
     /// Records a failed publication on the retained active entry: the terminal status

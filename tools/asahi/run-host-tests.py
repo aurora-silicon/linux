@@ -296,6 +296,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'guilty-waits-delay', 'no-guilty-input', 'owed-blocks-kill',
                                    'open-owed-skipped', 'post-latch-swallowed', 'reserve-fails-pass'), []),
+    'g17-mcache-table-tests.py': [([], PASS)]
+        + mutations('--mutation', ('render-table', 'fragment-writer', 'compute-dropped', 'compute-on-m5',
+                                   'class', 'line-end', 'inline-bound', 'kick-bit'), []),
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),

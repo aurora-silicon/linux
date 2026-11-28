@@ -2873,8 +2873,8 @@ impl Queue {
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
-        // The kick names the buffers the dispatch writes in an MCache table, as a fragment
-        // kick names its attachments.
+        // The kick names the buffers the dispatch writes in an MCache table, which speeds up
+        // fills. Render kicks name none (`render::Pair::publish`).
         let mcache_writes = if self.graph.mcache && !self.graph.m5 {
             attachments.as_slice()
         } else {

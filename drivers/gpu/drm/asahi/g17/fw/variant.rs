@@ -69,7 +69,8 @@ pub(crate) struct Variant {
     /// Host words of a queue's pointer block.
     pub(crate) pointers: PointerLayout,
     pub(crate) registration: QueueRegistration,
-    /// Render kick entries may name an MCache table.
+    /// Kick entries may name an MCache table: compute kicks name their write
+    /// ranges in it, fragment kicks none.
     pub(crate) mcache: bool,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
     pub(crate) few_primitives: bool,
