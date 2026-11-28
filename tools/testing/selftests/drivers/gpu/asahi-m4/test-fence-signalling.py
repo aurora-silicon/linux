@@ -552,11 +552,17 @@ typedef uint64_t u64;
 #define ASAHI_G17_SYNC_SCOPE_H 1
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define GFP_KERNEL 0
+#define READ_ONCE(x) (x)
+
+static inline void smp_rmb(void)
+{
+}
 
 struct dma_fence {
 	uint64_t context;
 	uint64_t seqno;
-	int status;
+	bool signaled;
+	int error;
 	int refcount;
 	bool is_chain;
 	bool is_container;
@@ -585,9 +591,9 @@ static inline void dma_fence_put(struct dma_fence *f)
 	}
 }
 
-static inline int dma_fence_get_status(struct dma_fence *f)
+static inline bool dma_fence_is_signaled(struct dma_fence *f)
 {
-	return f ? f->status : 1;
+	return f && f->signaled;
 }
 
 static inline bool dma_fence_is_later(struct dma_fence *f1, struct dma_fence *f2)
@@ -687,7 +693,8 @@ int main(void)
 	for (i = 0; i < HOPS; ++i) {
 		leaves[i].context = (i % 2 == 0) ? 10 : 20;
 		leaves[i].seqno = (uint64_t)(i / 2 + 1);
-		leaves[i].status = 0;
+		leaves[i].signaled = false;
+		leaves[i].error = 0;
 		leaves[i].refcount = 1;
 
 		chains[i].is_chain = true;
@@ -695,6 +702,11 @@ int main(void)
 		chains[i].chain_fence = &leaves[i];
 		chains[i].chain_next = (i > 0) ? &chains[i - 1] : NULL;
 	}
+
+	/* Unsignalled fence ignores pre-populated error until signaled. */
+	leaves[0].error = -5;
+	assert(asahi_g17_fence_status(&leaves[0]) == 0);
+	leaves[0].error = 0;
 
 	/* Coalesced collector fits a 256-hop 2-queue timeline chain into capacity=4 with 2 leaves. */
 	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
@@ -711,17 +723,22 @@ int main(void)
 	assert(n == -ENOSPC);
 
 	/* Already-signalled leaves (status > 0) are skipped by both collectors. */
-	for (i = 0; i < HOPS; ++i)
-		leaves[i].status = 1;
+	for (i = 0; i < HOPS; ++i) {
+		leaves[i].signaled = true;
+		leaves[i].error = 0;
+	}
+	assert(asahi_g17_fence_status(&leaves[0]) == 1);
 	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
 	assert(n == 0);
 	n = asahi_g17_collect_fences(&chains[HOPS - 1], out, 4);
 	assert(n == 0);
 
 	/* Error leaf (status < 0) is preserved even when a later same-context leaf is unsignalled. */
-	leaves[5].status = -5;
-	leaves[HOPS - 1].status = 0;
-	leaves[HOPS - 2].status = 0;
+	leaves[5].signaled = true;
+	leaves[5].error = -5;
+	assert(asahi_g17_fence_status(&leaves[5]) == -5);
+	leaves[HOPS - 1].signaled = false;
+	leaves[HOPS - 2].signaled = false;
 	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
 	assert(n == 3);
 	{
@@ -736,6 +753,35 @@ int main(void)
 			asahi_g17_put_fence(out[i].fence);
 		}
 		assert(saw_err && saw_ctx10 && saw_ctx20);
+	}
+
+	/* Distinct-context unsignalled leaves (such as independent ExportFences) are all
+	 * preserved by the C collector so Backend::input_sources() retains error dependencies. */
+	{
+		struct dma_fence pub_leaves[3];
+		struct dma_fence pub_chains[3];
+
+		memset(pub_leaves, 0, sizeof(pub_leaves));
+		memset(pub_chains, 0, sizeof(pub_chains));
+		for (i = 0; i < 3; ++i) {
+			pub_leaves[i].context = (uint64_t)(100 + i);
+			pub_leaves[i].refcount = 1;
+
+			pub_chains[i].is_chain = true;
+			pub_chains[i].refcount = 1;
+			pub_chains[i].chain_fence = &pub_leaves[i];
+			pub_chains[i].chain_next = (i > 0) ? &pub_chains[i - 1] : NULL;
+		}
+		n = asahi_g17_collect_fences_coalesced(&pub_chains[2], out, 4);
+		assert(n == 3);
+		for (i = 0; i < n; ++i) {
+			assert(out[i].status == 0);
+			asahi_g17_put_fence(out[i].fence);
+		}
+		for (i = 0; i < 3; ++i) {
+			assert(pub_leaves[i].refcount == 1);
+			assert(pub_chains[i].refcount == 1);
+		}
 	}
 
 	/* Every refcount returns cleanly to 1 (no leaks or double puts). */

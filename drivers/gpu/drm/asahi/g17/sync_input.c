@@ -6,11 +6,29 @@
 #include "sync_input.h"
 #include "sync_scope.h"
 
+/*
+ * Lock-free fence status query: avoids taking fence->lock and disabling IRQs
+ * on the common unsignaled and already-signaled paths. Once SIGNALED_BIT is
+ * observed, fence->error is immutable (dma_fence_set_error() must precede
+ * signaling, and test_and_set_bit(SIGNALED_BIT) is a full barrier).
+ */
+int asahi_g17_fence_status(struct dma_fence *fence)
+{
+	int error;
+
+	if (!dma_fence_is_signaled(fence))
+		return 0;
+	/* Pair with test_and_set_bit(SIGNALED_BIT) before reading fence->error. */
+	smp_rmb();
+	error = READ_ONCE(fence->error);
+	return error ?: 1;
+}
+
 static int collect_leaf(struct dma_fence *leaf,
 			struct asahi_g17_fence_leaf *out, size_t capacity,
 			size_t *count, bool coalesce_contexts)
 {
-	int status = dma_fence_get_status(leaf);
+	int status = asahi_g17_fence_status(leaf);
 	size_t i;
 
 	/* Already-signalled non-error leaves need no further wait or barrier. */
@@ -65,7 +83,7 @@ static int collect_fences(struct dma_fence *head,
 		if (asahi_g17_is_scope(node)) {
 			struct dma_fence *children[2];
 			unsigned int n, i;
-			int status = dma_fence_get_status(node);
+			int status = asahi_g17_fence_status(node);
 
 			if (status > 0) {
 				dma_fence_put(node);

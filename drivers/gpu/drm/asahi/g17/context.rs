@@ -494,6 +494,10 @@ impl Context {
             None => self.execution.release(),
         }
     }
+    /// Non-zero identity shared by contexts in the same `exec_share`, or `0` when unshared.
+    pub(crate) fn execution_share_id(&self) -> u64 {
+        self.share.as_ref().map_or(0, |share| share.id())
+    }
     /// `other` runs in this context's shared execution context.
     pub(crate) fn shares_execution(&self, other: &Context) -> bool {
         self.share.is_some() && core::ptr::eq(&*self.execution, &*other.execution)

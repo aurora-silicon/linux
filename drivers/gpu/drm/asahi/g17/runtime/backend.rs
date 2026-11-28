@@ -146,6 +146,8 @@ impl job::Backend for Backend {
         use crate::g17::{fence, sync_input};
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
+        let mut source_keys: KVec<Option<(u64, u64)>> = KVec::new();
+        let mut coalesced_errors: KVec<Arc<fence::Submission>> = KVec::new();
         let mut publication_waits = KVec::new();
         let mut unchecked: KVec<usize> = KVec::new();
         let lease = self.shared.preparations.try_enter().ok();
@@ -161,23 +163,32 @@ impl job::Backend for Backend {
             if status > 0 { continue; }
             if status < 0 { return None; }
             let leaves = sync_input::collect_coalesced(input)?;
-            for leaf in &leaves {
+            for leaf in &*leaves {
                 if leaf.status > 0 { continue; }
                 if leaf.status < 0 { return None; }
                 // SAFETY: Collection owns each leaf until this lookup finishes.
                 let submission = unsafe { fence::exported_source_raw(leaf.fence) }?;
                 if submission.source_status().ok()? { continue; }
                 if !submission.same_vm(self.context.status()) { return None; }
-                if sources.iter().any(|known| Arc::ptr_eq(&known.submission, &submission)) {
-                    continue;
-                }
-                if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
-                let published_fast =
-                    port_epoch.is_some_and(|epoch| submission.has_published_epoch(epoch));
-                let idx = sources.len();
-                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
-                if !published_fast {
-                    unchecked.push(idx, GFP_KERNEL).ok()?;
+                let pub_key =
+                    port_epoch.and_then(|epoch| submission.published_order_key_for(epoch));
+                let published_fast = pub_key.is_some()
+                    || port_epoch.is_some_and(|epoch| submission.has_published_epoch(epoch));
+                match sync_input::coalesce_source(
+                    &mut sources,
+                    &mut source_keys,
+                    &mut coalesced_errors,
+                    submission,
+                    pub_key,
+                )
+                .ok()?
+                {
+                    sync_input::Coalesce::Duplicate | sync_input::Coalesce::Coalesced => continue,
+                    sync_input::Coalesce::Insert => {
+                        if !published_fast {
+                            unchecked.push(sources.len() - 1, GFP_KERNEL).ok()?;
+                        }
+                    }
                 }
             }
             heads.push(input.clone(), GFP_KERNEL).ok()?;
@@ -218,7 +229,7 @@ impl job::Backend for Backend {
                 }
             }
         }
-        sync_input::Sources::new(heads, sources, publication_waits).ok()
+        sync_input::Sources::new(heads, sources, coalesced_errors, publication_waits).ok()
     }
 
     fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {

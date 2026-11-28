@@ -327,7 +327,9 @@ ASAHI_TESTS = {
                                    'hold-m5-outer-compute-host',
                                    'same-qid-emits-barrier',
                                    'lock-has-published-epoch',
-                                   'lock-same-vm'), []),
+                                   'lock-same-vm',
+                                   'drop-coalesced-error',
+                                   'skip-coalesced-error-check'), []),
     'g17-m5-sibling-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('fixed-object-ids', 'primary-before-sibling',
                                    'exit-ack-stops-first', 'direct-allows-multi-barrier',

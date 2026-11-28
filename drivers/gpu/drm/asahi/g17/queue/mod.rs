@@ -378,17 +378,17 @@ impl<B: Backend> Queue<B> {
         // either order and must each consume an input's error status before running.
         for sync in inputs {
             if let Some(fence) = &sync.fence {
+                if sources
+                    .as_ref()
+                    .is_some_and(|sources| sources.contains_input(fence))
+                {
+                    continue;
+                }
                 // An input that already signalled without error orders nothing and has no status
                 // left to consume (like a completed frontier producer above). Keeping it would
                 // send the render through the scheduler thread instead of inline publication:
                 // most compositor and client renders carry such already-signalled buffer fences.
                 if job::fence_status(fence) > 0 {
-                    continue;
-                }
-                if sources
-                    .as_ref()
-                    .is_some_and(|sources| sources.contains_input(fence))
-                {
                     continue;
                 }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;

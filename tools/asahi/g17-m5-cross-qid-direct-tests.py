@@ -78,6 +78,8 @@ def build_c_harness(mutation=None):
 #include <stdint.h>
 #include <stdio.h>
 
+typedef uint64_t u64;
+
 struct dma_fence {{
 	uint64_t context;
 	uint64_t seqno;
@@ -102,7 +104,7 @@ static void dma_fence_put(struct dma_fence *f)
 	f->refs--;
 }}
 
-static int dma_fence_get_status(struct dma_fence *f)
+static int asahi_g17_fence_status(struct dma_fence *f)
 {{
 	return f->status;
 }}
@@ -185,12 +187,29 @@ int main(void)
 	assert(collect_leaf(&z1, out, 16, &count, true) == 0);
 	assert(count == 2);
 	release_all(out, count);
+
+	/* 5. Distinct-context ExportFences are all preserved so Backend::input_sources() retains
+	 *    earlier error dependencies separately from firmware wait barriers. */
+	struct dma_fence exp[4] = {{
+		{{ .context = 101, .seqno = 0, .status = 0, .refs = 1 }},
+		{{ .context = 102, .seqno = 0, .status = 0, .refs = 1 }},
+		{{ .context = 103, .seqno = 0, .status = 0, .refs = 1 }},
+		{{ .context = 104, .seqno = 0, .status = 0, .refs = 1 }},
+	}};
+	count = 0;
+	for (int i = 0; i < 4; ++i)
+		assert(collect_leaf(&exp[i], out, 16, &count, true) == 0);
+	assert(count == 4);
+	release_all(out, count);
+	for (int i = 0; i < 4; ++i)
+		assert(exp[i].refs == 1);
 	return 0;
 }}
 '''
 
 
 def build_rust_harness(mutation=None):
+    sync_c = (G17 / 'sync_input.c').read_text()
     sync_rs = (G17 / 'sync_input.rs').read_text()
     backend_rs = (G17 / 'runtime/backend.rs').read_text()
     runtime_rs = (G17 / 'runtime.rs').read_text()
@@ -204,12 +223,18 @@ def build_rust_harness(mutation=None):
     hold_drop = item(sync_rs, 'impl Drop for Hold')
     hint_struct = item(sync_rs, 'pub(super) struct ReaderHint').replace('pub(super) ', 'pub ')
     hint_impl = item(sync_rs, 'impl ReaderHint').replace('pub(super) ', 'pub ')
+    coalesce_enum = item(sync_rs, 'pub(super) enum Coalesce').replace('pub(super) ', 'pub ')
+    coalesce_fn = item(sync_rs, 'pub(super) fn coalesce_source(').replace('pub(super) ', 'pub ')
+    sources_impl = item(sync_rs, 'impl Sources')
+    sources_check_fn = item(sources_impl, 'pub(super) fn check(').replace('pub(super) ', 'pub ')
     resolve_fn = item(runtime_rs, 'fn resolve_direct_sources(')
     input_sources_fn = item(backend_rs, 'fn input_sources(')
     compute_direct_fn = item(runtime_rs, 'fn compute_direct(')
     sources_pub_fn = item(runtime_rs, 'fn sources_published(')
     compute_host_impl = item(runtime_rs, 'impl compute::Host for ComputeHost<')
     begin_replay_fn = item(completion_rs, 'pub(crate) fn begin_replay(')
+    complete_fn = item(completion_rs, 'fn complete_with_compute(')
+    deferred_finish_fn = item(runtime_rs, 'pub(super) fn finish(&mut self)')
     submission_impl = item(fence_rs, 'impl Submission')
     note_error_fn = item(submission_impl, 'fn note_error(')
     same_vm_fn = item(submission_impl, 'pub(super) fn same_vm(')
@@ -270,31 +295,50 @@ def build_rust_harness(mutation=None):
             'self.state.lock().work',
             1,
         )
+    elif mutation == 'drop-coalesced-error':
+        coalesce_fn = coalesce_fn.replace(
+            'coalesced_errors.push(earlier, GFP_KERNEL)?;',
+            'let _ = earlier;',
+            1,
+        )
+    elif mutation == 'skip-coalesced-error-check':
+        sources_check_fn = sources_check_fn.replace(
+            'for submission in &self.coalesced_errors { submission.source_status()?; }',
+            '',
+            1,
+        )
 
     # Structural checks on production sources.
-    collect_cap_ok = 'let mut capacity = 4;' in sync_rs
-    leaf_loop_start = input_sources_fn.index('for leaf in &leaves {')
+    collect_cap_ok = 'const INLINE_LEAVES: usize = 4;' in sync_rs
+    leaf_loop_start = input_sources_fn.index('for leaf in &*leaves {')
     unchecked_block_start = input_sources_fn.index('if !unchecked.is_empty() {')
     leaf_loop = input_sources_fn[leaf_loop_start:unchecked_block_start]
     input_sources_ok = (
         'self.shared.state.lock()' not in leaf_loop
+        and 'asahi_g17_export_coalesce_key' not in sync_c
         and ordered_ok(
             input_sources_fn,
             'submission.has_published_epoch(epoch)',
+            'sync_input::coalesce_source(',
             'if !unchecked.is_empty() {',
             'let state = self.shared.state.lock();',
             'for idx in unchecked {',
+            'sync_input::Sources::new(heads, sources, coalesced_errors, publication_waits)',
         )
+        and 'self.check_source_inputs()' in complete_fn
+        and 'completion.check_source_inputs()' in deferred_finish_fn
     )
     direct_sources_ok = (
-        '(has_sources && !m5)' in compute_direct_fn
+        '(has_sources && !m5)' not in compute_direct_fn
         and ordered_ok(
             compute_direct_fn,
             'let target_qid = cells[0].as_ref()?.qid()?;',
-            'self.resolve_direct_sources(port, generation, target_qid, sources)?',
+            'self.resolve_direct_sources(port, generation, target_qid, m5, sources)?',
             'queue.qid() != target_qid',
             'queue.publish(',
             'direct_frontier.as_slice(),',
+            'queue.publish_with_native_waits(',
+            'direct_native.as_slice(),',
             'source.submission.note_firmware_consumer();',
             'sources.set_holds(direct_holds);',
             'drop(direct_holds);',
@@ -333,23 +377,35 @@ def build_rust_harness(mutation=None):
         and 'self.completion.clear_source_published();' in cancel_fn
     )
 
-    # Adapt resolve_direct_sources() for host compilation.
+    # Adapt coalesce_source() and resolve_direct_sources() for host compilation.
+    host_coalesce = coalesce_fn
+    host_coalesce = host_coalesce.replace('KVec<', 'Vec<')
+    host_coalesce = host_coalesce.replace('super::fw::kick::KICK_BARRIERS_MAX', 'KICK_BARRIERS_MAX')
+    host_coalesce = host_coalesce.replace('coalesced_errors.push(earlier, GFP_KERNEL)?;', 'coalesced_errors.push(earlier);')
+    host_coalesce = host_coalesce.replace('sources.push(Source { submission }, GFP_KERNEL)?;', 'sources.push(Source { submission });')
+    host_coalesce = host_coalesce.replace('source_keys.push(pub_key, GFP_KERNEL)?;', 'source_keys.push(pub_key);')
+
     host_resolve = resolve_fn
     host_resolve = host_resolve.replace('super::port::Port', 'Port')
     host_resolve = host_resolve.replace('super::sync_input::Sources', 'Sources')
     host_resolve = host_resolve.replace('super::dependency::Frontier', 'Frontier')
+    host_resolve = host_resolve.replace('super::sync_input::NativeWait', 'NativeWait')
     host_resolve = host_resolve.replace('super::sync_input::Hold', 'Hold')
+    host_resolve = host_resolve.replace('KVec<NativeWait>', 'Vec<NativeWait>')
     host_resolve = host_resolve.replace('KVec<Hold>', 'Vec<Hold>')
     host_resolve = host_resolve.replace('KVec::new()', 'Vec::new()')
     host_resolve = host_resolve.replace('holds.push(hold, GFP_KERNEL).ok()?;', 'holds.push(hold);')
+    host_resolve = host_resolve.replace('native.push(wait, GFP_KERNEL).ok()?;', 'native.push(wait);')
 
     return f'''
 use std::sync::{{Arc, Mutex, atomic::{{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering}}}};
 
 const EBUSY: i32 = -16;
 const EIO: i32 = -5;
+const ENOSPC: i32 = -28;
 const EOVERFLOW: i32 = -75;
 const PRODUCER_FAILED: i32 = -5;
+const KICK_BARRIERS_MAX: usize = 31;
 type Result<T = ()> = std::result::Result<T, i32>;
 
 {hold_struct}
@@ -358,6 +414,10 @@ type Result<T = ()> = std::result::Result<T, i32>;
 
 {hint_struct}
 {hint_impl}
+
+#[derive(Debug, PartialEq, Eq)]
+{coalesce_enum}
+{host_coalesce}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KickDependency {{
@@ -368,12 +428,29 @@ impl KickDependency {{
     fn qid(self) -> u8 {{ self.qid }}
 }}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeWait {{
+    sequence: u64,
+    dependency: KickDependency,
+    stamp_va: u64,
+    event_slot: u32,
+}}
+
 #[derive(Clone)]
 struct PublishedSource {{
     epoch: u64,
     published: u64,
     dependency: KickDependency,
+    stamp_va: u64,
+    execution_share: u64,
     readers: Arc<AtomicU32>,
+}}
+
+struct Context {{
+    share_id: u64,
+}}
+impl Context {{
+    fn execution_share_id(&self) -> u64 {{ self.share_id }}
 }}
 
 struct Frontier {{
@@ -456,12 +533,21 @@ impl Submission {{
 }}
 
 struct Source {{ submission: Arc<Submission> }}
-struct Sources {{ sources: Vec<Source> }}
+struct Sources {{
+    sources: Vec<Source>,
+    coalesced_errors: Vec<Arc<Submission>>,
+}}
 impl Sources {{
-    fn check(&self) -> Result {{
-        for s in &self.sources {{ s.submission.source_status()?; }}
-        Ok(())
+    {sources_check_fn}
+}}
+
+fn complete_consumer(sources: &Sources, mut result: Result) -> Result {{
+    if result.is_ok() {{
+        if let Err(error) = sources.check() {{
+            result = Err(error);
+        }}
     }}
+    result
 }}
 
 struct Port {{
@@ -479,21 +565,23 @@ impl Port {{
     }}
 }}
 
-struct Backend;
+struct Backend {{
+    context: Context,
+}}
 impl Backend {{
     {host_resolve}
 }}
 
 fn main() {{
-    assert!({str(collect_cap_ok).lower()}, "sync_input::collect must start with capacity 4");
+    assert!({str(collect_cap_ok).lower()}, "sync_input::collect must start with inline capacity 4");
     assert!({str(input_sources_ok).lower()}, "input_sources must check PublishedSource lock-free and hoist state.lock outside leaf loop");
-    assert!({str(direct_sources_ok).lower()}, "compute_direct must resolve M5 cross-QID sources lock-free and set holds + firmware_consumer");
+    assert!({str(direct_sources_ok).lower()}, "compute_direct must resolve M5 and G17P cross-QID sources lock-free and set holds + firmware_consumer");
     assert!({str(lockfree_submission_ok).lower()}, "Submission::has_published_epoch, same_vm, and empty clear_published must be lock-free");
     assert!({str(sources_published_ok).lower()}, "sources_published must check PublishedSource lock-free before state.lock");
     assert!({str(compute_host_ok).lower()}, "ComputeHost::notify must drop m5_outer before port.notify");
     assert!({str(publish_invalidation_ok).lower()}, "compute::Queue must publish after notify and invalidate on quarantine/replay/cancel");
 
-    let backend = Backend;
+    let backend = Backend {{ context: Context {{ share_id: 42 }} }};
     let port = Port {{
         gen: AtomicU64::new(7),
         rec: AtomicU32::new(0),
@@ -502,7 +590,7 @@ fn main() {{
     let readers = Arc::new(AtomicU32::new(0));
     let mut hint = ReaderHint::new();
 
-    // 1. Happy path: published cross-QID source (qid 5 -> target_qid 9) resolves lock-free,
+    // 1. Happy path (M5): published cross-QID source (qid 5 -> target_qid 9) resolves lock-free,
     //    Hold blocks ReaderHint::reset_for_owner even though ReaderHint::hold(&mut self) was never called.
     let sub = Submission::new();
     // clear_published() on unpublished submission must take 0 state locks.
@@ -512,15 +600,18 @@ fn main() {{
         epoch: 7,
         published: 42,
         dependency: KickDependency {{ qid: 5, kick: 100 }},
+        stamp_va: 0xfeed_0000,
+        execution_share: 42,
         readers: readers.clone(),
     }});
     let locks_before = sub.state_locks.load(Ordering::Relaxed);
     assert!(sub.has_published_epoch(7));
     assert!(!sub.has_published_epoch(8));
     assert_eq!(sub.state_locks.load(Ordering::Relaxed), locks_before, "has_published_epoch must be lock-free");
-    let sources = Sources {{ sources: vec![Source {{ submission: sub.clone() }}] }};
-    let (frontier, holds, mask) = backend.resolve_direct_sources(&port, 7, 9, &sources).unwrap();
+    let sources = Sources {{ sources: vec![Source {{ submission: sub.clone() }}], coalesced_errors: Vec::new() }};
+    let (frontier, native, holds, mask) = backend.resolve_direct_sources(&port, 7, 9, true, &sources).unwrap();
     assert_eq!(frontier.items, vec![(42, KickDependency {{ qid: 5, kick: 100 }})]);
+    assert!(native.is_empty());
     assert_eq!(holds.len(), 1);
     assert_eq!(mask, 1);
     assert_eq!(readers.load(Ordering::Acquire), 1);
@@ -533,43 +624,92 @@ fn main() {{
     assert!(!hint.has_readers(&readers));
     assert_eq!(hint.reset_for_owner(&readers), Ok(()));
 
-    // 1b. Same-QID source (qid 5 -> target_qid 5): skipped cleanly (empty frontier, 0 holds,
-    //     0 readers, mask == 0) because the implicit parent already orders same-QID kicks.
+    // 1a. G17P shared execution context (same share_id 42): resolves to Frontier kick barrier, no NativeWait!
+    let (f_g17p_same, n_g17p_same, h_g17p_same, m_g17p_same) =
+        backend.resolve_direct_sources(&port, 7, 9, false, &sources).unwrap();
+    assert_eq!(f_g17p_same.items, vec![(42, KickDependency {{ qid: 5, kick: 100 }})]);
+    assert!(n_g17p_same.is_empty());
+    assert_eq!(h_g17p_same.len(), 1);
+    assert_eq!(m_g17p_same, 1);
+    drop(h_g17p_same);
+    assert_eq!(readers.load(Ordering::Acquire), 0);
+
+    // 1a2. G17P cross-execution-context (different share_id): resolves to NativeWait (deduped by QID), empty Frontier!
+    let other_ctx_backend = Backend {{ context: Context {{ share_id: 99 }} }};
+    let sub_later = Submission::new();
+    sub_later.set_published(PublishedSource {{
+        epoch: 7,
+        published: 45,
+        dependency: KickDependency {{ qid: 5, kick: 103 }},
+        stamp_va: 0xfeed_0000,
+        execution_share: 42,
+        readers: readers.clone(),
+    }});
+    let two_same_qid = Sources {{
+        sources: vec![Source {{ submission: sub.clone() }}, Source {{ submission: sub_later.clone() }}],
+        coalesced_errors: Vec::new(),
+    }};
+    let (f_g17p_xctx, n_g17p_xctx, h_g17p_xctx, m_g17p_xctx) =
+        other_ctx_backend.resolve_direct_sources(&port, 7, 9, false, &two_same_qid).unwrap();
+    assert!(f_g17p_xctx.items.is_empty());
+    assert_eq!(n_g17p_xctx.len(), 1);
+    assert_eq!(n_g17p_xctx[0].sequence, 45);
+    assert_eq!(n_g17p_xctx[0].stamp_va, 0xfeed_0000);
+    assert_eq!(n_g17p_xctx[0].event_slot, 5);
+    assert_eq!(h_g17p_xctx.len(), 2);
+    assert_eq!(m_g17p_xctx, 0b11);
+    drop(h_g17p_xctx);
+    assert_eq!(readers.load(Ordering::Acquire), 0);
+
+    // 1b. Same-QID source (qid 5 -> target_qid 5): skipped cleanly on both M5 and G17P.
     let same_sub = Submission::new();
     same_sub.set_published(PublishedSource {{
         epoch: 7,
         published: 43,
         dependency: KickDependency {{ qid: 5, kick: 101 }},
+        stamp_va: 0xfeed_0000,
+        execution_share: 42,
         readers: readers.clone(),
     }});
-    let same_sources = Sources {{ sources: vec![Source {{ submission: same_sub.clone() }}] }};
-    let (f_same, h_same, m_same) = backend.resolve_direct_sources(&port, 7, 5, &same_sources).unwrap();
-    assert!(f_same.items.is_empty(), "same-QID source must not emit a duplicate explicit barrier");
-    assert!(h_same.is_empty(), "same-QID source must not take a self-reader Hold");
-    assert_eq!(m_same, 0, "same-QID source must not set cross_qid_mask");
-    assert_eq!(readers.load(Ordering::Acquire), 0);
-    assert!(!same_sub.firmware_consumer.load(Ordering::Acquire));
+    let same_sources = Sources {{ sources: vec![Source {{ submission: same_sub.clone() }}], coalesced_errors: Vec::new() }};
+    for m5 in [true, false] {{
+        let (f_same, n_same, h_same, m_same) =
+            backend.resolve_direct_sources(&port, 7, 5, m5, &same_sources).unwrap();
+        assert!(f_same.items.is_empty(), "same-QID source must not emit a duplicate explicit barrier");
+        assert!(n_same.is_empty(), "same-QID source must not emit a NativeWait");
+        assert!(h_same.is_empty(), "same-QID source must not take a self-reader Hold");
+        assert_eq!(m_same, 0, "same-QID source must not set cross_qid_mask");
+        assert_eq!(readers.load(Ordering::Acquire), 0);
+        assert!(!same_sub.firmware_consumer.load(Ordering::Acquire));
+    }}
 
     // 1c. Same-QID failed producer MUST still return None so error propagates!
     same_sub.error.store(EIO, Ordering::Release);
-    assert!(backend.resolve_direct_sources(&port, 7, 5, &same_sources).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 5, true, &same_sources).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 5, false, &same_sources).is_none());
     assert_eq!(readers.load(Ordering::Acquire), 0);
 
     // 2. Unpublished source -> clean None fallback.
     let unpub = Submission::new();
-    let s_unpub = Sources {{ sources: vec![Source {{ submission: unpub }}] }};
-    assert!(backend.resolve_direct_sources(&port, 7, 9, &s_unpub).is_none());
+    let s_unpub = Sources {{ sources: vec![Source {{ submission: unpub }}], coalesced_errors: Vec::new() }};
+    assert!(backend.resolve_direct_sources(&port, 7, 9, true, &s_unpub).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 9, false, &s_unpub).is_none());
 
     // 3. Epoch/generation mismatch (port advanced to epoch 8 while source stays at epoch 7)
     //    -> clean None fallback, zero leaked Hold.
     port.gen.store(8, Ordering::Release);
-    assert!(backend.resolve_direct_sources(&port, 8, 9, &sources).is_none());
+    assert!(backend.resolve_direct_sources(&port, 8, 9, true, &sources).is_none());
+    assert!(backend.resolve_direct_sources(&port, 8, 9, false, &sources).is_none());
     assert_eq!(readers.load(Ordering::Acquire), 0);
     port.gen.store(7, Ordering::Release);
 
     // 4. Recovery starts concurrently right after Hold -> clean None fallback, zero leaked Hold.
     port.flip_rec_on_query.store(true, Ordering::Release);
-    assert!(backend.resolve_direct_sources(&port, 7, 9, &sources).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 9, true, &sources).is_none());
+    assert_eq!(readers.load(Ordering::Acquire), 0);
+    port.rec.store(0, Ordering::Release);
+    port.flip_rec_on_query.store(true, Ordering::Release);
+    assert!(backend.resolve_direct_sources(&port, 7, 9, false, &sources).is_none());
     assert_eq!(readers.load(Ordering::Acquire), 0);
     port.rec.store(0, Ordering::Release);
 
@@ -579,11 +719,14 @@ fn main() {{
         epoch: 7,
         published: 44,
         dependency: KickDependency {{ qid: 5, kick: 102 }},
+        stamp_va: 0xfeed_0000,
+        execution_share: 42,
         readers: readers.clone(),
     }});
     cancelled.clear_published();
-    let s_can = Sources {{ sources: vec![Source {{ submission: cancelled }}] }};
-    assert!(backend.resolve_direct_sources(&port, 7, 9, &s_can).is_none());
+    let s_can = Sources {{ sources: vec![Source {{ submission: cancelled }}], coalesced_errors: Vec::new() }};
+    assert!(backend.resolve_direct_sources(&port, 7, 9, true, &s_can).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 9, false, &s_can).is_none());
 
     // 6. Failed producer -> clean None fallback (so slow path propagates PRODUCER_FAILED).
     let failed = Submission::new();
@@ -591,21 +734,114 @@ fn main() {{
         epoch: 7,
         published: 45,
         dependency: KickDependency {{ qid: 5, kick: 103 }},
+        stamp_va: 0xfeed_0000,
+        execution_share: 42,
         readers: readers.clone(),
     }});
     failed.error.store(EIO, Ordering::Release);
-    let s_fail = Sources {{ sources: vec![Source {{ submission: failed }}] }};
-    assert!(backend.resolve_direct_sources(&port, 7, 9, &s_fail).is_none());
+    let s_fail = Sources {{ sources: vec![Source {{ submission: failed }}], coalesced_errors: Vec::new() }};
+    assert!(backend.resolve_direct_sources(&port, 7, 9, true, &s_fail).is_none());
+    assert!(backend.resolve_direct_sources(&port, 7, 9, false, &s_fail).is_none());
     assert_eq!(readers.load(Ordering::Acquire), 0);
 
     // 7. Already-retired source -> skipped cleanly with empty frontier and 0 holds.
     let retired = Submission::new();
     retired.retired.store(true, Ordering::Release);
-    let s_ret = Sources {{ sources: vec![Source {{ submission: retired }}] }};
-    let (f_ret, h_ret, m_ret) = backend.resolve_direct_sources(&port, 7, 9, &s_ret).unwrap();
+    let s_ret = Sources {{ sources: vec![Source {{ submission: retired }}], coalesced_errors: Vec::new() }};
+    let (f_ret, n_ret, h_ret, m_ret) = backend.resolve_direct_sources(&port, 7, 9, false, &s_ret).unwrap();
     assert!(f_ret.items.is_empty());
+    assert!(n_ret.is_empty());
     assert!(h_ret.is_empty());
     assert_eq!(m_ret, 0);
+
+    // 8. Coalesced same-(epoch, QID) exports retain earlier error dependencies:
+    //    when an earlier initially healthy export fails AFTER collection while the retained
+    //    later export completes cleanly, the consumer outcome MUST fail with PRODUCER_FAILED.
+    for reverse_order in [false, true] {{
+        let early = Submission::new();
+        let late = Submission::new();
+        let other = Submission::new();
+        early.set_published(PublishedSource {{
+            epoch: 7,
+            published: 100,
+            dependency: KickDependency {{ qid: 5, kick: 200 }},
+            stamp_va: 0xfeed_0000,
+            execution_share: 42,
+            readers: readers.clone(),
+        }});
+        late.set_published(PublishedSource {{
+            epoch: 7,
+            published: 105,
+            dependency: KickDependency {{ qid: 5, kick: 205 }},
+            stamp_va: 0xfeed_0000,
+            execution_share: 42,
+            readers: readers.clone(),
+        }});
+        other.set_published(PublishedSource {{
+            epoch: 7,
+            published: 102,
+            dependency: KickDependency {{ qid: 6, kick: 202 }},
+            stamp_va: 0xfeed_1000,
+            execution_share: 42,
+            readers: readers.clone(),
+        }});
+        let key_q5 = (8u64 << 8) | 5;
+        let key_q6 = (8u64 << 8) | 6;
+        let mut wait_sources = Vec::new();
+        let mut keys = Vec::new();
+        let mut coalesced_errors = Vec::new();
+        let items: Vec<(Arc<Submission>, Option<(u64, u64)>)> = if reverse_order {{
+            vec![
+                (late.clone(), Some((key_q5, 105))),
+                (early.clone(), Some((key_q5, 100))),
+                (other.clone(), Some((key_q6, 102))),
+            ]
+        }} else {{
+            vec![
+                (early.clone(), Some((key_q5, 100))),
+                (late.clone(), Some((key_q5, 105))),
+                (other.clone(), Some((key_q6, 102))),
+            ]
+        }};
+        for (s, k) in items {{
+            coalesce_source(&mut wait_sources, &mut keys, &mut coalesced_errors, s, k).unwrap();
+        }}
+        // Duplicate of already-coalesced early submission is suppressed without growing error list.
+        assert_eq!(
+            coalesce_source(&mut wait_sources, &mut keys, &mut coalesced_errors, early.clone(), Some((key_q5, 100))),
+            Ok(Coalesce::Duplicate)
+        );
+        // Firmware wait list collapsed to 2 (latest on QID 5 + QID 6); earlier QID 5 kept for error checks.
+        assert_eq!(wait_sources.len(), 2);
+        assert!(Arc::ptr_eq(&wait_sources[0].submission, &late));
+        assert!(Arc::ptr_eq(&wait_sources[1].submission, &other));
+        assert_eq!(coalesced_errors.len(), 1);
+        assert!(Arc::ptr_eq(&coalesced_errors[0], &early));
+
+        let coalesced = Sources {{ sources: wait_sources, coalesced_errors }};
+        // Initially healthy: direct resolution emits only 2 barriers/holds (not 3).
+        let (f_c, n_c, h_c, m_c) = backend.resolve_direct_sources(&port, 7, 9, true, &coalesced).unwrap();
+        assert_eq!(f_c.items.len(), 2);
+        assert!(n_c.is_empty());
+        assert_eq!(h_c.len(), 2);
+        assert_eq!(m_c, 0b11);
+        drop(h_c);
+        assert_eq!(readers.load(Ordering::Acquire), 0);
+
+        // Late error after collection: retained later export and other QID succeed cleanly,
+        // while earlier coalesced export fails independently.
+        late.retired.store(true, Ordering::Release);
+        other.retired.store(true, Ordering::Release);
+        assert_eq!(complete_consumer(&coalesced, Ok(())), Ok(()));
+
+        early.error.store(EIO, Ordering::Release);
+        assert_eq!(late.source_status(), Ok(true));
+        assert_eq!(coalesced.check(), Err(PRODUCER_FAILED));
+        assert_eq!(complete_consumer(&coalesced, Ok(())), Err(PRODUCER_FAILED));
+        assert!(backend.resolve_direct_sources(&port, 7, 9, true, &coalesced).is_none());
+        assert!(backend.resolve_direct_sources(&port, 7, 9, false, &coalesced).is_none());
+        assert_eq!(readers.load(Ordering::Acquire), 0);
+    }}
 
     println!("PASS g17-m5-cross-qid-direct-tests");
 }}
@@ -623,7 +859,9 @@ def main():
                                                'hold-m5-outer-compute-host',
                                                'same-qid-emits-barrier',
                                                'lock-has-published-epoch',
-                                               'lock-same-vm'])
+                                               'lock-same-vm',
+                                               'drop-coalesced-error',
+                                               'skip-coalesced-error-check'])
     args = parser.parse_args()
     cc = os.environ.get('HOSTCC', 'cc')
     rustc = os.environ.get('HOSTRUSTC', 'rustc')

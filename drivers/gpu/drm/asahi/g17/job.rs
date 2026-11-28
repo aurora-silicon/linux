@@ -301,8 +301,7 @@ impl Packet {
 }
 
 pub(crate) fn fence_status(fence: &Fence) -> i32 {
-    // SAFETY: The owned fence keeps the raw DMA fence alive for this read.
-    unsafe { bindings::dma_fence_get_status(fence.raw()) }
+    super::sync_input::fence_status(fence)
 }
 
 fn check_status(fence: &Fence) -> Result {

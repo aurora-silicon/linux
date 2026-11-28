@@ -3,6 +3,7 @@
 //! Bounded input-fence components. Collection happens before the device mutex,
 //! because polling a container's status can signal it and run callbacks.
 
+use core::mem::MaybeUninit;
 use kernel::{bindings, dma_fence::{Fence, RawDmaFence}, prelude::*};
 
 #[repr(C)]
@@ -12,12 +13,18 @@ pub(crate) struct Leaf {
 }
 
 unsafe extern "C" {
+    fn asahi_g17_fence_status(fence: *mut bindings::dma_fence) -> i32;
     fn asahi_g17_collect_fences_coalesced(head: *mut bindings::dma_fence,
         out: *mut Leaf, capacity: usize) -> i32;
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
     fn asahi_g17_fence_order(a: *mut bindings::dma_fence, b: *mut bindings::dma_fence) -> i32;
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
+}
+
+pub(crate) fn fence_status(fence: &Fence) -> i32 {
+    // SAFETY: The owned fence keeps the raw DMA fence alive for this read.
+    unsafe { asahi_g17_fence_status(fence.raw()) }
 }
 
 impl super::dependency::FenceOrder for Fence {
@@ -54,11 +61,61 @@ impl Drop for Leaf {
     }
 }
 
+const INLINE_LEAVES: usize = 4;
+
+/// Owned collected leaves: stack-backed for the common <= 4-leaf case (zero heap allocation),
+/// spilling to a `KVec` only when an input holds more distinct leaves.
+pub(crate) enum Leaves {
+    Inline {
+        len: usize,
+        items: [MaybeUninit<Leaf>; INLINE_LEAVES],
+    },
+    Heap(KVec<Leaf>),
+}
+
+impl core::ops::Deref for Leaves {
+    type Target = [Leaf];
+
+    fn deref(&self) -> &[Leaf] {
+        match self {
+            Self::Inline { len, items } => {
+                // SAFETY: `items[..*len]` were initialized by the C collector.
+                unsafe { core::slice::from_raw_parts(items.as_ptr().cast(), *len) }
+            }
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+}
+
+impl Drop for Leaves {
+    fn drop(&mut self) {
+        if let Self::Inline { len, items } = self {
+            for slot in &mut items[..*len] {
+                // SAFETY: Each slot in `0..*len` is initialized and dropped once here.
+                unsafe { slot.assume_init_drop() };
+            }
+        }
+    }
+}
+
 fn collect_with(
     input: &Fence,
     collector: unsafe extern "C" fn(*mut bindings::dma_fence, *mut Leaf, usize) -> i32,
-) -> Option<KVec<Leaf>> {
-    let mut capacity = 4;
+) -> Option<Leaves> {
+    let mut capacity = INLINE_LEAVES;
+    let mut inline = [const { MaybeUninit::<Leaf>::uninit() }; INLINE_LEAVES];
+    // SAFETY: `input` owns its fence; the C helper initializes `count` leaves or releases all on error.
+    let count = unsafe { collector(input.raw(), inline.as_mut_ptr().cast(), capacity) };
+    if count >= 0 {
+        return Some(Leaves::Inline {
+            len: count as usize,
+            items: inline,
+        });
+    }
+    if count != ENOSPC.to_errno() {
+        return None;
+    }
+    capacity = 16;
     loop {
         let mut leaves = KVec::with_capacity(capacity, GFP_KERNEL).ok()?;
         // SAFETY: The input owns its fence. The C helper writes at most capacity
@@ -73,14 +130,16 @@ fn collect_with(
         }
         // SAFETY: The helper returned this many initialized, owned records.
         unsafe { leaves.set_len(count as usize) };
-        return Some(leaves);
+        return Some(Leaves::Heap(leaves));
     }
 }
 
 /// The leaves of `input`, coalescing unsignalled non-error leaves sharing a `dma_fence` context
 /// to their latest sequence number so deep timeline chains stay bounded by distinct contexts.
+/// Distinct-context `ExportFence`s are all returned so `Backend::input_sources()` can coalesce
+/// same-`(epoch, QID)` firmware waits while retaining earlier error dependencies separately.
 /// Allocation, unsupported containers, or a large prefix retain normal waits.
-pub(crate) fn collect_coalesced(input: &Fence) -> Option<KVec<Leaf>> {
+pub(crate) fn collect_coalesced(input: &Fence) -> Option<Leaves> {
     collect_with(input, asahi_g17_collect_fences_coalesced)
 }
 
@@ -91,6 +150,61 @@ use kernel::{new_mutex, sync::{Arc, Mutex}};
 
 pub(super) struct Source {
     pub(super) submission: Arc<Submission>,
+}
+
+pub(super) enum Coalesce {
+    Duplicate,
+    Coalesced,
+    Insert,
+}
+
+/// Deduplicates and coalesces `submission` into `(sources, source_keys, coalesced_errors)`.
+///
+/// Two healthy unsignalled published compute submissions on the same `(epoch, QID)` execute in
+/// FIFO order on that QID, so firmware only needs a barrier on the latest publication ordinal.
+/// Because an earlier submission can still fail independently after collection (for example via
+/// its own producer failure, cancellation, or recovery interrupt) while the retained later
+/// submission completes cleanly, every superseded earlier submission is retained in
+/// `coalesced_errors` so [`Sources::check`] propagates its error to the consumer.
+pub(super) fn coalesce_source(
+    sources: &mut KVec<Source>,
+    source_keys: &mut KVec<Option<(u64, u64)>>,
+    coalesced_errors: &mut KVec<Arc<Submission>>,
+    submission: Arc<Submission>,
+    pub_key: Option<(u64, u64)>,
+) -> Result<Coalesce> {
+    if sources
+        .iter()
+        .any(|known| Arc::ptr_eq(&known.submission, &submission))
+        || coalesced_errors
+            .iter()
+            .any(|known| Arc::ptr_eq(known, &submission))
+    {
+        return Ok(Coalesce::Duplicate);
+    }
+    if let Some((key, seq)) = pub_key {
+        if let Some(pos) = source_keys
+            .iter()
+            .position(|existing| existing.is_some_and(|(k, _)| k == key))
+        {
+            if let Some((_, existing_seq)) = source_keys[pos] {
+                let earlier = if seq > existing_seq {
+                    source_keys[pos] = Some((key, seq));
+                    core::mem::replace(&mut sources[pos].submission, submission)
+                } else {
+                    submission
+                };
+                coalesced_errors.push(earlier, GFP_KERNEL)?;
+                return Ok(Coalesce::Coalesced);
+            }
+        }
+    }
+    if sources.len() == super::fw::kick::KICK_BARRIERS_MAX {
+        return Err(ENOSPC);
+    }
+    sources.push(Source { submission }, GFP_KERNEL)?;
+    source_keys.push(pub_key, GFP_KERNEL)?;
+    Ok(Coalesce::Insert)
 }
 
 /// The counter is independent of a physical queue's allocation and survives
@@ -137,16 +251,21 @@ pub(super) struct Sources {
     inputs: KVec<Fence>,
     publication_waits: KVec<Fence>,
     pub(super) sources: KVec<Source>,
+    coalesced_errors: KVec<Arc<Submission>>,
     #[pin]
     holds: Mutex<KVec<Hold>>,
 }
 impl Sources {
-    pub(super) fn new(inputs: KVec<Fence>, sources: KVec<Source>,
-        publication_waits: KVec<Fence>) -> Result<Arc<Self>> {
+    pub(super) fn new(
+        inputs: KVec<Fence>,
+        sources: KVec<Source>,
+        coalesced_errors: KVec<Arc<Submission>>,
+        publication_waits: KVec<Fence>,
+    ) -> Result<Arc<Self>> {
         CONVERTED.fetch_add(1, Ordering::Relaxed);
         if !publication_waits.is_empty() { PENDING.fetch_add(1, Ordering::Relaxed); }
         Arc::pin_init(pin_init!(Self {
-            inputs, sources, publication_waits,
+            inputs, sources, coalesced_errors, publication_waits,
             holds <- new_mutex!(KVec::new(), "G17 source binding loans"),
         }), GFP_KERNEL)
     }
@@ -156,6 +275,7 @@ impl Sources {
     pub(super) fn publication_waits(&self) -> &[Fence] { &self.publication_waits }
     pub(super) fn check(&self) -> Result {
         for source in &self.sources { source.submission.source_status()?; }
+        for submission in &self.coalesced_errors { submission.source_status()?; }
         Ok(())
     }
     pub(super) fn set_holds(&self, holds: KVec<Hold>) {

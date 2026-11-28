@@ -3353,6 +3353,8 @@ impl Queue {
                             epoch,
                             published,
                             dependency,
+                            stamp_va: self.graph.support.gpu_va() + STAMP as u64,
+                            execution_share: packet.context.execution_share_id(),
                             readers: self.source_readers.clone(),
                         },
                     );

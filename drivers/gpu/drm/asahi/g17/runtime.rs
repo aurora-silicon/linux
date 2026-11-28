@@ -2662,7 +2662,7 @@ impl super::Firmware {
             let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
                 return Err(EAGAIN);
             };
-            if m5 && dependency.qid() == target_qid {
+            if dependency.qid() == target_qid {
                 // Same physical QID in this epoch: the queue's implicit parent already strictly
                 // orders earlier kicks on this QID; drop the self-reader hold and skip adding a
                 // duplicate explicit barrier.
@@ -3117,23 +3117,33 @@ impl Backend {
         }
     }
 
-    /// Resolves same-VM cross-QID M5 compute sources lock-free from each producer's
-    /// `PublishedSource` snapshot under a live preparation lease. Sources already published on
-    /// `target_qid` in `generation` are ordered by this queue's implicit parent, so they skip the
-    /// duplicate explicit barrier, `Hold`, and `firmware_consumer` mark while still checking
-    /// `source_status()` (error propagation) and epoch validity. Any unpublished, errored,
+    /// Resolves same-VM compute sources lock-free from each producer's `PublishedSource` snapshot
+    /// under a live preparation lease. Sources already published on `target_qid` in `generation`
+    /// are ordered by this queue's implicit parent, so they skip the duplicate explicit barrier,
+    /// `Hold`, and `firmware_consumer` mark while still checking `source_status()` (error
+    /// propagation) and epoch validity. On M5 and for G17P sources sharing this queue's execution
+    /// context, cross-QID sources resolve to kick dependencies in `frontier`; G17P cross-context
+    /// sources resolve to completion-wait records in `native`. Any unpublished, errored,
     /// cancelled, or epoch-mismatched source returns `None` so the device-mutex path handles it.
     fn resolve_direct_sources(
         &self,
         port: &super::port::Port,
         generation: u64,
         target_qid: u8,
+        m5: bool,
         sources: &super::sync_input::Sources,
-    ) -> Option<(super::dependency::Frontier, KVec<super::sync_input::Hold>, u64)> {
+    ) -> Option<(
+        super::dependency::Frontier,
+        KVec<super::sync_input::NativeWait>,
+        KVec<super::sync_input::Hold>,
+        u64,
+    )> {
         sources.check().ok()?;
         let mut frontier = super::dependency::Frontier::new();
+        let mut native: KVec<super::sync_input::NativeWait> = KVec::new();
         let mut holds = KVec::new();
         let mut cross_qid_mask = 0u64;
+        let consumer_share = self.context.execution_share_id();
         for (idx, source) in sources.sources.iter().enumerate() {
             if source.submission.source_status().ok()? {
                 continue;
@@ -3163,13 +3173,35 @@ impl Backend {
             if !source.submission.has_published_epoch(generation) {
                 return None;
             }
-            frontier
-                .insert(published.published, published.dependency)
-                .ok()?;
+            let same_execution =
+                consumer_share != 0 && consumer_share == published.execution_share;
+            if m5 || same_execution {
+                frontier
+                    .insert(published.published, published.dependency)
+                    .ok()?;
+            } else {
+                let wait = super::sync_input::NativeWait {
+                    sequence: published.published,
+                    dependency: published.dependency,
+                    stamp_va: published.stamp_va,
+                    event_slot: u32::from(published.dependency.qid()),
+                };
+                if let Some(old) = native
+                    .iter_mut()
+                    .find(|old| old.dependency.qid() == wait.dependency.qid())
+                {
+                    if wait.sequence > old.sequence {
+                        *old = wait;
+                    }
+                } else {
+                    native.push(wait, GFP_KERNEL).ok()?;
+                }
+            }
             holds.push(hold, GFP_KERNEL).ok()?;
             cross_qid_mask |= 1u64 << idx;
         }
-        Some((frontier, holds, cross_qid_mask))
+        sources.check().ok()?;
+        Some((frontier, native, holds, cross_qid_mask))
     }
 
     /// Whether `packet` may run on, or bring up, a sibling compute channel of this owner: only an
@@ -3191,11 +3223,11 @@ impl Backend {
 
     /// Steady-state publication into this owner's bound channel(s) without the device mutex: only
     /// one channel's own lock at a time and the port's small locks are taken, and nothing
-    /// device-wide is scanned. On M5, same-VM cross-QID compute sources whose producers have
-    /// published their kick metadata also resolve directly, always onto the primary channel.
+    /// device-wide is scanned. Same-VM compute sources whose producers have published their kick
+    /// metadata also resolve directly (kick barriers on M5 and shared-context G17P, completion-wait
+    /// records on cross-context G17P), always onto the primary channel.
     /// None leaves the packet untouched for the device-mutex path, which owns binding, first
-    /// installation, cross-channel barriers, non-M5 native-wait sources, render prefixes, replay
-    /// and recovery.
+    /// installation, cross-channel barriers, render prefixes, replay and recovery.
     fn compute_direct(
         &self,
         packet: &Arc<super::job::Packet>,
@@ -3205,8 +3237,7 @@ impl Backend {
         let m5 = self.context.is_m5();
         let has_sources = packet.completion.sources().is_some();
         let bound_count = self.context.compute_binding_count() as usize;
-        if (has_sources && !m5)
-            || self.context.render_seen()
+        if self.context.render_seen()
             || bound_count == 0
             || bound_count > super::pairs::COMPUTE_CHANNELS_MAX
             || (bound_count > 1 && packet.order.wait_through[1].is_some())
@@ -3228,11 +3259,11 @@ impl Backend {
             return None;
         }
         let generation = port.generation();
-        let (direct_frontier, direct_holds, cross_qid_mask) =
+        let (direct_frontier, direct_native, direct_holds, cross_qid_mask) =
             if let Some(sources) = packet.completion.sources() {
-                self.resolve_direct_sources(port, generation, target_qid, sources)?
+                self.resolve_direct_sources(port, generation, target_qid, m5, sources)?
             } else {
-                (super::dependency::Frontier::new(), KVec::new(), 0)
+                (super::dependency::Frontier::new(), KVec::new(), KVec::new(), 0)
             };
         // Only an independent kick without input sources of an owner whose primary channel runs
         // sustained heavy work may leave the primary ring ([`Self::fans_out`]); the primary
@@ -3350,12 +3381,22 @@ impl Backend {
                 m5,
                 generation,
             };
-            Some(queue.publish(
-                packet.clone(),
-                direct_frontier.as_slice(),
-                &mut host,
-                &mut |event| deferred.push(event),
-            ))
+            Some(if direct_native.is_empty() {
+                queue.publish(
+                    packet.clone(),
+                    direct_frontier.as_slice(),
+                    &mut host,
+                    &mut |event| deferred.push(event),
+                )
+            } else {
+                queue.publish_with_native_waits(
+                    packet.clone(),
+                    direct_frontier.as_slice(),
+                    direct_native.as_slice(),
+                    &mut host,
+                    &mut |event| deferred.push(event),
+                )
+            })
         })();
         if packet.is_published() {
             if let Some(sources) = packet.completion.sources() {
@@ -3370,7 +3411,7 @@ impl Backend {
                     drop(direct_holds);
                 }
                 super::sync_input::note_published();
-                super::sync_input::note_native(0);
+                super::sync_input::note_native(direct_native.len());
             }
         } else {
             drop(direct_holds);
@@ -3559,8 +3600,7 @@ impl Backend {
         };
         // The steady state: this owner's bound channel(s) are all cached and installed.
         let bound_count = self.context.compute_binding_count() as usize;
-        if (!sources_checked || self.context.is_m5())
-            && bound_count != 0
+        if bound_count != 0
             && bound_count <= super::pairs::COMPUTE_CHANNELS_MAX
         {
             let cells = self.direct.lock().clone();

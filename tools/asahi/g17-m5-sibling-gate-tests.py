@@ -169,13 +169,13 @@ def build(mutation=None):
         # (a, d) Direct sources still resolve lock-free from their PublishedSource snapshots with
         # binding loans before any routing, and the holds follow the publication.
         'direct sources resolve before routing, holds follow publication': ordered_ok(
-            direct, 'if (has_sources && !m5)', 'let generation = port.generation();',
-            'self.resolve_direct_sources(port, generation, target_qid, sources)?',
+            direct, 'let generation = port.generation();',
+            'self.resolve_direct_sources(port, generation, target_qid, m5, sources)?',
             'let fans_out = self.fans_out(packet, || primary.sustained());',
             'let target_cell = cells[target_idx].as_ref()?;', 'direct_frontier.as_slice()',
             'if packet.is_published() {', 'sources.set_holds(direct_holds);', 'drop(direct_holds);'),
-        'readiness claims the primary for M5 sources': ordered_ok(
-            readiness, 'let sources_checked =', '(!sources_checked || self.context.is_m5())',
+        'readiness claims the primary for sources': ordered_ok(
+            readiness, 'let sources_checked =', 'if bound_count != 0',
             'cells[1..].iter().flatten()', 'queue.claim()', 'self.hold_claim(Some(primary));'),
         # (b, c) The direct path detours to the device-mutex path for a sibling only when it may
         # add one: a busy single channel under a closed gate, or with a single kick in flight,
