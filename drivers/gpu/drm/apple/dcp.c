@@ -7215,6 +7215,24 @@ static int dcp_ext_pmp_wait_ready(struct device_node *entry,
 	return ret;
 }
 
+/*
+ * Whether a running PMP has taken this processor's display request
+ * (apple,pmp-report): then the PMP acts on the pipe's bandwidth vote and
+ * scales its display clock. Does not wait.
+ */
+bool dcp_pmp_display_ready(struct apple_dcp *dcp)
+{
+	struct device_node *entry;
+	int ret;
+
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return false;
+	ret = dcp_ext_pmp_wait_ready(entry, 0);
+	of_node_put(entry);
+	return !ret;
+}
+
 static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 {
 	struct device_node *entry;

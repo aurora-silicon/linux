@@ -1605,4 +1605,6 @@ void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot
 void dcp_indicator_display_resumed(struct apple_dcp *dcp);
 extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
 
+bool dcp_pmp_display_ready(struct apple_dcp *dcp);
+
 #endif /* __APPLE_DCP_INTERNAL_H__ */
