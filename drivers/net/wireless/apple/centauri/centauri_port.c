@@ -11,7 +11,10 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/of_platform.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 #include "centauri.h"
 
 static void update(void __iomem *base, u32 offset, u32 clear, u32 set)
@@ -26,7 +29,64 @@ static bool wait_bits(void __iomem *address, u32 mask, u32 wanted, u32 us)
 	return !readl_poll_timeout(address, value, (value & mask) == wanted, 100, us);
 }
 
-int centauri_port_cycle(struct pci_dev *pdev)
+/*
+ * The N1's warm reset, as the root port describes it (bindings/pci/apple,pcie.yaml, as on the
+ * T6050 boards): "apple,function-warm-reset" names the SMC and the key (the ADT's pci-bridge0
+ * function-warm_reset), "apple,warm-reset-writes" the writes.
+ */
+static int warm_reset_parse(struct pci_dev *pdev, struct apple_smc_warm_reset *wr)
+{
+	struct pci_dev *bridge = pdev->bus->self;
+
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !bridge)
+		return -ENODEV;
+	return apple_smc_warm_reset_parse(pci_device_to_OF_node(bridge), wr);
+}
+
+/*
+ * The root port describes a warm reset, and centauri_port_cycle() can cycle this port: only
+ * then does the driver restart a stopped N1, so a restart never tears the functions down on a
+ * board whose port cycle would refuse.
+ */
+bool centauri_warm_reset_described(struct pci_dev *pdev)
+{
+	const struct centauri_board *board = centauri_board();
+	struct pci_dev *bridge = pdev->bus->self;
+	struct apple_smc_warm_reset wr;
+
+	if (!board || !board->port || !bridge || bridge->vendor != PCI_VENDOR_ID_APPLE ||
+	    (board->bridge_id && bridge->device != board->bridge_id))
+		return false;
+	if (warm_reset_parse(pdev, &wr))
+		return false;
+	apple_smc_warm_reset_put(&wr);
+	return true;
+}
+
+/*
+ * Given while the port is down and not set up: the link then trains a chip that was just
+ * reset. PERST# alone leaves the firmware running.
+ */
+static int warm_reset(struct pci_dev *pdev)
+{
+	struct apple_smc_warm_reset wr;
+	int ret;
+
+	ret = warm_reset_parse(pdev, &wr);
+	if (!ret) {
+		ret = apple_smc_warm_reset(&wr, false);
+		apple_smc_warm_reset_put(&wr);
+	}
+	dev_info(&pdev->dev, "warm reset through the SMC: %d\n", ret);
+	return ret;
+}
+
+/*
+ * Take the N1's port down and train it again. With @reset_ret, the N1 is warm reset while
+ * the port is down and the reset's result is stored there; the link comes up either way.
+ * Returns the link's result.
+ */
+int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret)
 {
 	static const u32 reset[][2] = {
 		{0x88, 0x110}, {0x100, ~0U}, {0x148, ~0U}, {0x210, ~0U},
@@ -141,6 +201,8 @@ int centauri_port_cycle(struct pci_dev *pdev)
 		writel(0, port + 0x3800 + 4 * i);
 	for (i = 0; i < ARRAY_SIZE(tune); i++)
 		writel(tune[i][1], port + tune[i][0]);
+	if (reset_ret)
+		*reset_ret = warm_reset(pdev);
 	update(port, 0x800, 0, 1);
 	udelay(10);
 	update(phy, 0, 0, 1);

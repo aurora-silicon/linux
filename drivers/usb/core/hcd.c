@@ -2814,10 +2814,10 @@ int usb_add_hcd(struct usb_hcd *hcd,
 	struct usb_hcd *shared_hcd;
 	int skip_phy_initialization;
 
-	if (usb_hcd_is_primary_hcd(hcd))
-		skip_phy_initialization = hcd->skip_phy_initialization;
-	else
-		skip_phy_initialization = hcd->primary_hcd->skip_phy_initialization;
+	/* A shared HCD skips its PHYs when it or its primary HCD asks for it. */
+	skip_phy_initialization = hcd->skip_phy_initialization;
+	if (!usb_hcd_is_primary_hcd(hcd))
+		skip_phy_initialization |= hcd->primary_hcd->skip_phy_initialization;
 
 	if (!skip_phy_initialization) {
 		if (usb_hcd_is_primary_hcd(hcd)) {

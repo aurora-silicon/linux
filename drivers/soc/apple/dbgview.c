@@ -31,16 +31,18 @@
 
 #include <asm/arch_timer.h>
 
+#include "dbgview-internal.h"
+
+#if IS_ENABLED(CONFIG_APPLE_DBGVIEW_KUNIT_TEST)
+#include <kunit/visibility.h>
+#else
+#define VISIBLE_IF_KUNIT static
+#define EXPORT_SYMBOL_IF_KUNIT(symbol)
+#endif
+
 static unsigned int snap_bytes = 0x40;
 module_param(snap_bytes, uint, 0444);
 MODULE_PARM_DESC(snap_bytes, "Bytes of an MMIO view read by its snapshot file");
-
-struct dbgview {
-	struct device *dev;
-	void __iomem *base;
-	resource_size_t size;
-	struct dentry *dir;
-};
 
 static struct dentry *dbgview_root;
 
@@ -49,7 +51,7 @@ static u64 dbgview_cntvct(void)
 	return __arch_counter_get_cntvct_stable();
 }
 
-static ssize_t dbgview_regs_read(struct file *file, char __user *ubuf,
+VISIBLE_IF_KUNIT ssize_t dbgview_regs_read(struct file *file, char __user *ubuf,
 				 size_t count, loff_t *ppos)
 {
 	struct dbgview *dv = file->private_data;
@@ -91,18 +93,20 @@ static ssize_t dbgview_regs_read(struct file *file, char __user *ubuf,
 	*ppos = pos + len;
 	return len;
 }
+EXPORT_SYMBOL_IF_KUNIT(dbgview_regs_read);
 
-static const struct file_operations dbgview_regs_fops = {
+VISIBLE_IF_KUNIT const struct file_operations dbgview_regs_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
 	.read = dbgview_regs_read,
 	.llseek = default_llseek,
 };
+EXPORT_SYMBOL_IF_KUNIT(dbgview_regs_fops);
 
-static int dbgview_snapshot_show(struct seq_file *s, void *unused)
+VISIBLE_IF_KUNIT int dbgview_snapshot(struct seq_file *s, unsigned int bytes)
 {
 	struct dbgview *dv = s->private;
-	size_t words = min_t(size_t, snap_bytes, dv->size) / 4;
+	size_t words = min_t(size_t, bytes, dv->size) / 4;
 	unsigned long flags;
 	u64 before, after;
 	u32 *val;
@@ -138,7 +142,20 @@ static int dbgview_snapshot_show(struct seq_file *s, void *unused)
 	kfree(val);
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(dbgview_snapshot);
+static int dbgview_snapshot_show(struct seq_file *s, void *unused)
+{
+	return dbgview_snapshot(s, snap_bytes);
+}
 DEFINE_SHOW_ATTRIBUTE(dbgview_snapshot);
+
+#if IS_ENABLED(CONFIG_APPLE_DBGVIEW_KUNIT_TEST)
+const struct file_operations *dbgview_test_snapshot_fops(void)
+{
+	return &dbgview_snapshot_fops;
+}
+EXPORT_SYMBOL_IF_KUNIT(dbgview_test_snapshot_fops);
+#endif
 
 static int dbgview_probe(struct platform_device *pdev)
 {

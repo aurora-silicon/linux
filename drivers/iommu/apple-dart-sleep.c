@@ -364,8 +364,9 @@ static int apple_dart_sleep_idle(struct apple_dart_sleep_state *s)
 {
 	struct apple_dart *dart = s->dart;
 	u32 params = readl(dart->regs + DART_PARAMS2);
-	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
-				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
+	unsigned int rports = FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params);
+	unsigned int wports = FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params);
+	unsigned int ports = max(rports, wports);
 	int ret;
 
 	if (!ports || ports > 4 || dart_power_fault_pending(dart->regs, &s->power))

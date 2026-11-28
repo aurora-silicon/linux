@@ -168,7 +168,7 @@ pub(crate) fn mapped_sg_table<'a>(
 /// VM-private BOs share their assigned VM's reservation object. Validate this
 /// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
 pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
-    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 && vm.is_extobj(gem) {
+    if gem.is_vm_private() && vm.is_extobj(gem) {
         return Err(EINVAL);
     }
     Ok(())
@@ -289,6 +289,13 @@ pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<Obj
 /// issued a barrier, without cache maintenance.
 pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
     new_kernel_object_mapped(dev, size, true, true)
+}
+
+/// Create a new kernel-owned GEM object that is not counted as kernel memory: its owner holds a
+/// user charge for it ([`memacct::Charge::user`]), and counting both would take its size twice
+/// from the device limit.
+pub(crate) fn new_kernel_object_user_charged(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, false, false)
 }
 
 /// Create a new kernel-owned write-combined GEM object that is not counted as kernel memory:
@@ -451,7 +458,14 @@ pub(crate) fn new_user_memory_object(
 }
 
 /// Pages of the calling process pinned as the backing of a user-memory object, and counted in its
-/// mm's `pinned_vm` against RLIMIT_MEMLOCK.
+/// mm's `pinned_vm`.
+///
+/// RLIMIT_MEMLOCK does not bound them. The object is charged to the GPU memory limits instead
+/// (`memacct`, by `gem_userptr()`), as an object of GEM_CREATE is: both kinds of backing are
+/// unevictable pages that the GPU holds, so the limits bound one as well as the other, and an
+/// application can choose either. GPU drivers that pin user memory for buffer objects (i915,
+/// etnaviv) do not charge RLIMIT_MEMLOCK either. Its default of 8 MiB would leave
+/// VK_EXT_external_memory_host unusable for buffers of ordinary size.
 pub(crate) struct UserPages {
     pages: KVVec<*mut kernel::bindings::page>,
     writable: bool,
@@ -459,9 +473,13 @@ pub(crate) struct UserPages {
     mm: ARef<Mm>,
     /// Pages counted in `pinned_vm`: all of the range, including any not pinned yet.
     counted: i64,
+    /// The fragment pins of a process with a smaller page size, which hold `pages` (null when
+    /// `pages` are ordinary pins).
+    fragments: *mut core::ffi::c_void,
 }
 
-// SAFETY: The pinned pages may be released from any thread; the mm reference is thread-safe.
+// SAFETY: The pinned pages and fragment records may be released from any thread; the mm
+// reference is thread-safe.
 unsafe impl Send for UserPages {}
 // SAFETY: Shared access only reads the array.
 unsafe impl Sync for UserPages {}
@@ -475,9 +493,11 @@ impl UserPages {
     ///
     /// All of the range is pinned, long-term, or none of it. Fails with `EFAULT` when a page cannot
     /// be pinned: unmapped, a device or PFN mapping, or a writable pin of a mapping that is not
-    /// writable or whose filesystem tracks writes (`FOLL_LONGTERM` refuses those). Fails with
-    /// `ENOMEM` when the pages would take the process past RLIMIT_MEMLOCK without CAP_IPC_LOCK,
-    /// counting every page pinned this way or by other long-term pinners.
+    /// writable or whose filesystem tracks writes (`FOLL_LONGTERM` refuses those). In a process
+    /// whose page size is smaller than the native one, a native page is accepted only where the
+    /// process maps all of it, in order at consecutive addresses (`EFAULT` otherwise). The pages
+    /// are added to the mm's `pinned_vm`, which other long-term pinners compare with
+    /// RLIMIT_MEMLOCK; this one does not (see [`UserPages`]).
     ///
     /// Anonymous pages pinned here stay with this process across fork(): the child gets copies.
     /// Pages unmapped by the process stay pinned, and backing the object, until it is freed.
@@ -492,29 +512,40 @@ impl UserPages {
             .mm()
             .map(|mm| ARef::from(&**mm))
             .ok_or(EFAULT)?;
-        let pinned_vm = Self::pinned_vm(&mm);
         let added = i64::try_from(count).map_err(|_| ENOMEM)?;
-        let total = pinned_vm
-            .fetch_add(added, Ordering::AcqRel)
-            .saturating_add(added);
-        if !memlock_allows(total, memlock_limit_pages()) {
-            // SAFETY: `capable()` has no preconditions.
-            if !unsafe { kernel::bindings::capable(kernel::bindings::CAP_IPC_LOCK as i32) } {
-                pinned_vm.fetch_sub(added, Ordering::AcqRel);
-                return Err(ENOMEM);
-            }
-        }
+        Self::pinned_vm(&mm).fetch_add(added, Ordering::AcqRel);
         // From here on, dropping `this` unpins what it holds and uncounts all `count` pages.
         let mut this = Self {
             pages: KVVec::new(),
             writable,
             mm,
             counted: added,
+            fragments: core::ptr::null_mut(),
         };
         this.pages.reserve(count, GFP_KERNEL)?;
         let mut flags = kernel::bindings::FOLL_LONGTERM;
         if writable {
             flags |= kernel::bindings::FOLL_WRITE;
+        }
+        // SAFETY: No preconditions; it reads the current mm.
+        if unsafe { asahi_user_mm_is_subpage() } {
+            // SAFETY: The array has room for `count` entries. On success the call stored `count`
+            // pages, which the records it returned in `fragments` hold.
+            let ret = unsafe {
+                asahi_pin_user_fragments(
+                    addr as _,
+                    count as _,
+                    flags,
+                    this.pages.as_mut_ptr().cast(),
+                    &mut this.fragments,
+                )
+            };
+            if ret < 0 {
+                return Err(Error::from_errno(ret as i32));
+            }
+            // SAFETY: See above.
+            unsafe { this.pages.inc_len(count) };
+            return Ok(this);
         }
         while this.pages.len() < count {
             let done = this.pages.len();
@@ -556,7 +587,11 @@ impl UserPages {
 
 impl Drop for UserPages {
     fn drop(&mut self) {
-        if !self.pages.is_empty() {
+        if !self.fragments.is_null() {
+            // SAFETY: The records hold every page of the array and are released only here.
+            // Pages the device may have written are marked dirty.
+            unsafe { asahi_unpin_user_fragments(self.fragments, self.writable) };
+        } else if !self.pages.is_empty() {
             // SAFETY: The array holds pages pinned by `pin_user_pages_fast()` and not yet
             // unpinned. Pages the device may have written are marked dirty.
             unsafe {
@@ -569,24 +604,6 @@ impl Drop for UserPages {
         }
         Self::pinned_vm(&self.mm).fetch_sub(self.counted, Ordering::AcqRel);
     }
-}
-
-/// RLIMIT_MEMLOCK of the calling process, in pages.
-fn memlock_limit_pages() -> u64 {
-    let task = kernel::current!().as_ptr();
-    // SAFETY: The current task and its signal structure are live; the limit is read once, as
-    // `rlimit()` does.
-    let bytes = unsafe {
-        core::ptr::read_volatile(core::ptr::addr_of!(
-            (*(*task).signal).rlim[kernel::bindings::RLIMIT_MEMLOCK as usize].rlim_cur
-        ))
-    };
-    (bytes >> kernel::page::PAGE_SHIFT) as u64
-}
-
-/// Whether `pinned` pages stay within a memlock limit of `limit` pages.
-fn memlock_allows(pinned: i64, limit: u64) -> bool {
-    u64::try_from(pinned).is_ok_and(|pinned| pinned <= limit)
 }
 
 #[vtable]
@@ -689,6 +706,12 @@ impl AsahiObject {
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
+    }
+
+    /// Whether the backing belongs to the VM that created the object, so that only that VM may
+    /// map it.
+    pub(crate) fn is_vm_private(&self) -> bool {
+        self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
     }
 
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
@@ -841,15 +864,6 @@ mod user_memory_tests {
     }
 
     #[test]
-    fn memlock_limit_policy() {
-        assert!(memlock_allows(0, 0));
-        assert!(memlock_allows(512, 512));
-        assert!(!memlock_allows(513, 512));
-        assert!(!memlock_allows(-1, 512));
-        assert!(memlock_allows(i64::MAX, u64::MAX));
-    }
-
-    #[test]
     fn pins_anonymous_memory() -> Result {
         let addr = map(4 * PAGE_SIZE, PROT_READ | PROT_WRITE)?;
         let before = pinned_vm()?;
@@ -983,6 +997,19 @@ pub(crate) fn prepare_new_object_g15(gem: &Object) -> Result {
     }
     crate::pgtable::poc_barrier();
     Ok(())
+}
+
+// user_pages.c: long-term pins in a process whose page size is smaller than the native one.
+extern "C" {
+    fn asahi_user_mm_is_subpage() -> bool;
+    fn asahi_pin_user_fragments(
+        start: core::ffi::c_ulong,
+        nr_pages: core::ffi::c_ulong,
+        gup_flags: core::ffi::c_uint,
+        pages: *mut *mut core::ffi::c_void,
+        out: *mut *mut core::ffi::c_void,
+    ) -> core::ffi::c_long;
+    fn asahi_unpin_user_fragments(frags: *mut core::ffi::c_void, dirty: bool);
 }
 
 #[cfg(CONFIG_DRM_ASAHI_G15)]

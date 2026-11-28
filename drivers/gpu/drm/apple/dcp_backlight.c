@@ -252,6 +252,9 @@ static int dcp_get_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* Nothing is presented any more: there is no level to report. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		/*
@@ -269,7 +272,24 @@ static int dcp_get_brightness(struct backlight_device *bd)
 		return actual;
 	}
 
-	return dcp->brightness.nits;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	actual = dcp_bl_presented_actual(&dcp->brightness.presented,
+					 READ_ONCE(dcp->brightness.nits));
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return actual;
+}
+
+/*
+ * A present set the panel to @nits, outside the policy: every one that
+ * carries a level, and the power-off present, which carries 0.
+ */
+void dcp_backlight_presented(struct apple_dcp *dcp, u32 nits)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	dcp_bl_presented_set(&dcp->brightness.presented, nits);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 }
 
 int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
@@ -412,6 +432,34 @@ void dcp_backlight_finish_fade(struct apple_dcp *dcp)
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	if (kick)
 		dcp_backlight_kick(dcp);
+}
+
+/*
+ * After the S2R display restart: ask for the user's level again and send it, whatever the
+ * backlight core's flags say at that moment. The class device resumes on its own schedule:
+ * when it runs after the restart the panel stays dark until then (suspended and core_blank
+ * still set at the mode set, 11 Nov), and when it runs before, its request goes to a firmware
+ * that isn't up yet and nothing sends it again (the dark lid wakes).
+ */
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp)
+{
+	struct backlight_device *bd = READ_ONCE(dcp->brightness.bl_dev);
+	unsigned long flags;
+
+	if (!dcp_backlight_desktop(dcp) || !bd)
+		return;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	/*
+	 * A level sent to the firmware that the stop then took down never gets its answer: the
+	 * state stayed in_flight for good and nothing was sent again (dark lid wake of 20:30,
+	 * "sent 0 ... dirty 1 in_flight 1"). The restarted firmware knows nothing of it.
+	 */
+	dcp->backlight.state.in_flight = false;
+	dcp->backlight.state.retries = 0;
+	dcp_bl_request(&dcp->backlight.state, bd->props.brightness, false, false);
+	dcp->backlight.state.dirty = true;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	dcp_backlight_kick(dcp);
 }
 
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
@@ -647,11 +695,18 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 
 #define SCALE_FACTOR (1 << 10)
 
+/*
+ * Each table word holds two DAC values, one in each 16-bit half: the
+ * level's and the one half a step below it.  Interpolate the halves
+ * separately.  A blend of the whole word carries the upper half's fraction
+ * into the lower one: for 370 nits the lower half became 0x10a, a 4 to 5
+ * nit value, and for most levels it left the DAC range altogether.
+ */
 static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 {
-	u32 frac;
-	u64 low, high;
+	u32 frac, word = 0;
 	u32 interpolated = (tbl_size - 1) * ((val - min) * SCALE_FACTOR) / (max - min);
+	unsigned int shift;
 
 	size_t index = interpolated / SCALE_FACTOR;
 
@@ -659,10 +714,14 @@ static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 		return tbl[tbl_size / 2];
 
 	frac = interpolated & (SCALE_FACTOR - 1);
-	low = tbl[index];
-	high = tbl[index + 1];
+	for (shift = 0; shift < 32; shift += 16) {
+		u32 low = (tbl[index] >> shift) & 0xffff;
+		u32 high = (tbl[index + 1] >> shift) & 0xffff;
 
-	return ((frac * high) + ((SCALE_FACTOR - frac) * low)) / SCALE_FACTOR;
+		word |= ((frac * high + (SCALE_FACTOR - frac) * low) / SCALE_FACTOR) << shift;
+	}
+
+	return word;
 }
 
 static u32 calculate_dac(struct apple_dcp *dcp, int val)
@@ -676,7 +735,7 @@ static u32 calculate_dac(struct apple_dcp *dcp, int val)
 	else if (val == MIN_BRIGHTNESS_PART2)
 		return 16 * brightness_part2[0];
 	else if (val >= MAX_BRIGHTNESS_PART2)
-		return brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
+		return 16 * brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
 
 	if (val < MAX_BRIGHTNESS_PART1) {
 		dac = interpolate(val, MIN_BRIGHTNESS_PART1, MAX_BRIGHTNESS_PART1,
@@ -846,6 +905,9 @@ static int dcp_set_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* A crashed processor discards every present, the level with it. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		struct dcp_backlight_state *state = &dcp->backlight.state;

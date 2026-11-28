@@ -106,6 +106,17 @@ config APPLE_PIODMA
 	  through the DMA engine API. The provider uses the PIODMA-specific
 	  DART stream described by the device tree.
 
+config APPLE_PIODMA_KUNIT_TEST
+	bool "KUnit tests for the Apple PCIe PIODMA stop handling" if !KUNIT_ALL_TESTS
+	depends on APPLE_PIODMA=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check, against a register file standing in for the engine, that
+	  a terminated or failed request is held, and that synchronize does
+	  not return, until the engine is seen stopped; that the client of a
+	  failed request is told only then; and that nothing else is started
+	  on an engine that did not stop.
+
 config APPLE_SIO
 	tristate "Apple SIO support"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -127,6 +138,9 @@ config APPLE_SIO_KUNIT_TEST
 	  generic SIO of the M1 and M2, and a T6030 SIO only with validated
 	  protocol-10 boot tables. The compatible selects the firmware layout.
 	  Also check protocol-9 table order, DMA array counts and ACK failures.
+	  And check that a firmware ACK, NACK or report naming a tag that
+	  is not outstanding, or a channel the device does not have, is
+	  dropped.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS

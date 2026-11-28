@@ -42,8 +42,7 @@ struct dcp_parse_ctx {
 	 */
 	bool sdr_default_rgb;
 	/*
-	 * A firmware 27 processor: it compresses a PQ element the timing lists
-	 * as needing DSC itself, so such an element is usable for PQ.
+	 * The modeset delegates compression of DSC-required elements to DCP.
 	 */
 	bool pq_dsc;
 	/*
@@ -83,8 +82,8 @@ enum dcp_color_eotf {
 enum dcp_color_format {
 	DCP_COLOR_FORMAT_RGB                 =  0, // "RGB"
 	DCP_COLOR_FORMAT_YCBCR420            =  1, // "YUV 4:2:0"
-	DCP_COLOR_FORMAT_YCBCR422            =  3, // "YUV 4:2:2"
-	DCP_COLOR_FORMAT_YCBCR444            =  2, // "YUV 4:4:4"
+	DCP_COLOR_FORMAT_YCBCR422            =  2, // "YUV 4:2:2"
+	DCP_COLOR_FORMAT_YCBCR444            =  3, // "YUV 4:4:4"
 	DCP_COLOR_FORMAT_DV_NATIVE           =  4, // "DolbyVision (native)"
 	DCP_COLOR_FORMAT_DV_HDMI             =  5, // "DolbyVision (HDMI)"
 	DCP_COLOR_FORMAT_YCBCR422_DP         =  6, // "YCbCr 4:2:2 (DP tunnel)"
@@ -136,6 +135,23 @@ struct dcp_color_mode {
 	u8 depth;
 };
 
+#define DCP_COLOR_FLAG_UNSAFE		(1U << 0)
+#define DCP_COLOR_FLAG_DSC		(1U << 1)
+#define DCP_COLOR_FLAG_DOWNSTREAM_420	(1U << 2)
+#define DCP_MAX_COLOR_ENTRIES		64
+
+/* Compact colour element retained per timing, sorted by descending score. */
+struct dcp_color_entry {
+	u32 id;
+	u8 eotf : 3;
+	u8 format : 4;
+	u8 range : 1;
+	u8 colorimetry : 5;
+	u8 flags : 3;
+	u8 depth;
+	u8 pad;
+};
+
 /*
  * Represents a single display mode. These mode objects are populated at
  * runtime based on the TimingElements dictionary sent by the DCP.
@@ -163,6 +179,11 @@ struct dcp_display_mode {
 	bool firmware_preferred;
 	/* An SDR color element that is neither unsafe nor DSC only */
 	bool sdr_usable;
+	/*
+	 * An SDR color element the firmware lists as unsafe, but not DSC
+	 * only, outside the external SDR path
+	 */
+	bool sdr_unsafe;
 	/* The firmware score of the timing */
 	s64 score;
 	/* The sync polarity flags of the timing, if it reports them */
@@ -180,6 +201,11 @@ struct dcp_display_mode {
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;
+	/* Real colour elements reported for this timing, descending by score. */
+	struct dcp_color_entry colors[DCP_MAX_COLOR_ENTRIES];
+	u8 nr_colors;
+	/* Max wire bits/pixel among non-DSC unsafe SDR elements (0 if none). */
+	u8 sdr_unsafe_max_bpp;
 };
 
 struct dimension {
@@ -202,6 +228,7 @@ bool dcp_property_complete(const void *blob, size_t received, size_t advertised)
 #if IS_ENABLED(CONFIG_KUNIT)
 bool dcp_mode_default_above(const struct dcp_display_mode *mode, s64 score,
 			    const struct dcp_display_mode *best, s64 best_score);
+bool dcp_mode_default_candidate(const struct dcp_display_mode *m);
 bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
 			  s64 best_score);
 #endif

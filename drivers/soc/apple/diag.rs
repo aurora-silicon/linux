@@ -31,7 +31,6 @@ extern "C" {
         xart: bool,
     ) -> c_int;
     fn sep_diag_set_policy(
-        provision_keybag: bool,
         trusted_keys: bool,
         filevault_api: bool,
         xarm_trace: bool,
@@ -53,6 +52,16 @@ extern "C" {
     fn sep_diag_set_restore(state: c_int);
     fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
     fn sep_diag_xart_guard_refused(matching: c_int);
+    fn sep_diag_set_trusted(state: c_int, status: c_int);
+    #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+    fn sep_diag_set_trusted_atomic(
+        word: *mut kernel::bindings::atomic_t,
+        state: c_int,
+        status: c_int,
+    );
+    fn sep_diag_clear_trusted_refusal();
+    #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+    fn sep_diag_clear_trusted_refusal_atomic(word: *mut kernel::bindings::atomic_t);
     fn sep_diag_bringup_ended();
     fn sep_diag_set_endpoint(id: u8, name: u32);
     fn sep_diag_set_os_identity(source: c_int);
@@ -101,7 +110,6 @@ pub(crate) enum Restore {
 
 /// Boot-time policy, without identity values or key material.
 pub(crate) struct Policy {
-    pub provision_keybag: bool,
     pub trusted_keys: bool,
     pub filevault_api: bool,
     pub xarm_trace: bool,
@@ -156,7 +164,6 @@ pub(crate) fn register(
     // SAFETY: the facts are fixed before the attribute group is published.
     unsafe {
         sep_diag_set_policy(
-            policy.provision_keybag,
             policy.trusted_keys,
             policy.filevault_api,
             policy.xarm_trace,
@@ -288,6 +295,59 @@ pub(crate) fn xart_guard_refused() {
     REFUSALS.fetch_add(1, Relaxed);
     // SAFETY: no preconditions; updates two words.
     unsafe { sep_diag_xart_guard_refused(matching() as c_int) };
+}
+
+/// What the next trusted-key seal or unseal can expect, as
+/// `SEP_DIAG_TRUSTED_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Trusted {
+    /// A trusted-key unseal, on its own or as a seal's round trip, worked.
+    Ready,
+    /// The enclave answered the identity key-bag unlock that every seal and
+    /// unseal needs with this status.
+    Refused(i8),
+}
+
+impl Trusted {
+    fn raw(self) -> (c_int, c_int) {
+        match self {
+            Trusted::Ready => (1, 0),
+            Trusted::Refused(status) => (2, c_int::from(status)),
+        }
+    }
+}
+
+/// The latest trusted-key outcome; it replaces the one before.
+pub(crate) fn trusted(state: Trusted) {
+    let (state, status) = state.raw();
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_trusted(state, status) };
+}
+
+/// Clears a stale refusal after a validated identity unlock, leaving `Ready`
+/// tied to a working trusted-key unseal.
+pub(crate) fn clear_trusted_refusal() {
+    // SAFETY: no preconditions; updates one atomic word.
+    unsafe { sep_diag_clear_trusted_refusal() };
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) fn set_trusted_for_test(word: &Atomic<i32>, state: Trusted) {
+    kernel::static_assert!(size_of::<Atomic<i32>>() == size_of::<kernel::bindings::atomic_t>());
+    kernel::static_assert!(align_of::<Atomic<i32>>() == align_of::<kernel::bindings::atomic_t>());
+    let (state, status) = state.raw();
+    // SAFETY: `Atomic<i32>` matches `atomic_t` in size and alignment (asserted
+    // above) and `word` is valid for atomic writes.
+    unsafe { sep_diag_set_trusted_atomic(word.as_ptr().cast(), state, status) };
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) fn clear_trusted_refusal_for_test(word: &Atomic<i32>) {
+    kernel::static_assert!(size_of::<Atomic<i32>>() == size_of::<kernel::bindings::atomic_t>());
+    kernel::static_assert!(align_of::<Atomic<i32>>() == align_of::<kernel::bindings::atomic_t>());
+    // SAFETY: `Atomic<i32>` matches `atomic_t` in size and alignment (asserted
+    // above) and `word` is valid for atomic read-modify-write.
+    unsafe { sep_diag_clear_trusted_refusal_atomic(word.as_ptr().cast()) };
 }
 
 /// The boot-time bring-up is over, however far it got.

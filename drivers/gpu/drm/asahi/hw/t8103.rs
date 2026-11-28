@@ -91,3 +91,60 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     sram_base: None,
     sram_size: None,
 };
+
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+const fn reg(
+    slot: usize,
+    base: RegisterBaseV27_2,
+    size: u32,
+    relative: u64,
+    install: Option<u64>,
+) -> RegisterV27_2 {
+    RegisterV27_2 {
+        slot,
+        base,
+        size,
+        relative,
+        install,
+    }
+}
+
+/// The firmware 27.2 register table for T8103 (G13G). Writable windows outside SGX and the
+/// PMP/PMGR telemetry apertures (slots 2 and 5) are left unmapped.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) const REGISTERS_V27_2: &[RegisterV27_2] = {
+    use RegisterBaseV27_2::{Physical, Sgx};
+    &[
+        reg(0, Physical(0x23b104000), 0x4000, 0, None), // AIC software interrupt
+        reg(1, Physical(0x23b2e8000), 0x1000, 0, Some(0)), // Analog temperature controller
+        reg(2, Physical(0x23bc00000), 0x1000, 0, Some(0)), // PMP doorbell
+        reg(3, Physical(0x200004000), 0x50000, 0, None), // Memory cache
+        reg(5, Physical(0x23b738000), 0x1000, 0, Some(0)), // PMGR scratch / PMP telemetry
+        reg(12, Physical(0x26b45c000), 0x4000, 0, None), // ANE doorbell
+        reg(17, Sgx(0), 0x20000, 0, Some(0)), // GPU core
+        reg(31, Sgx(0xd04000), 0xc000, 0xd04000, Some(0)), // Fender configuration
+        reg(32, Sgx(0xd61000), 0x1000, 0xd61000, Some(0)), // GIFAF
+        reg(34, Sgx(0xd10000), 0x4000, 0xd10000, Some(0)), // CPMS
+        reg(37, Sgx(0xe10000), 0x1000, 0xe10000, Some(0)), // Fender scratch RAM
+        reg(38, Sgx(0xd18000), 0x4000, 0xd18000, Some(0)), // Fender clock/power
+        reg(40, Sgx(0xd00000), 0x4000, 0xd00000, Some(0)), // Fender multi-GPU configuration
+        reg(44, Sgx(0xd80000), 0x5000, 0, Some(0)), // Metrology sensors
+    ]
+};
+
+/// Slots of the T8103 27.2 register table whose stock mode is read-write (no slot 9 telemetry).
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) const WRITABLE_V27_2: u64 = {
+    let mut mask = 0u64;
+    let mut slot = 0;
+    while slot < 60 {
+        if matches!(
+            slot,
+            0 | 2 | 3 | 5..=8 | 12 | 17 | 25..=27 | 31..=40 | 42..=48 | 52..=55 | 58
+        ) {
+            mask |= 1 << slot;
+        }
+        slot += 1;
+    }
+    mask
+};

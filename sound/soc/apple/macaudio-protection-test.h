@@ -1028,7 +1028,10 @@ static void macaudio_spk_j700_does_not_ramp(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->hist[0], (long)MAX98360A_DB(-20));
 }
 
-/* A fixed ceiling: the grant runs the amps at it, the ramp starts below it */
+/*
+ * A fixed ceiling: an unlock leaves the amps at the floor, the lease's grant
+ * runs them at the ceiling, the ramp starts below it.
+ */
 static void macaudio_spk_fixed_ceiling(struct kunit *test)
 {
 	struct macaudio_platform_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
@@ -1042,6 +1045,15 @@ static void macaudio_spk_fixed_ceiling(struct kunit *test)
 	cfg->safe_vol = -15;
 	cfg->spk_fixed_ceiling = true;
 	macaudio_test_spk_card(test, &t, cfg, SN012776_0DB);
+
+	/* "Speaker Volume Unlock" lifts nothing: the limit stays at the floor */
+	mutex_lock(&t.ma->volume_lock_mutex);
+	WRITE_ONCE(t.ma->spk_iface, MACAUDIO_SPK_IFACE_UNLOCK);
+	macaudio_vlimit_unlock(t.ma, true);
+	WRITE_ONCE(t.ma->spk_iface, MACAUDIO_SPK_IFACE_LEASE);
+	mutex_unlock(&t.ma->volume_lock_mutex);
+	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
+		KUNIT_EXPECT_EQ(test, (long)macaudio_test_vol(t.vols[i])->mc.platform_max, 1L);
 
 	/* The limit the lease leaves on the volumes (macaudio_spk_enter_lease()) */
 	mutex_lock(&t.ma->volume_lock_mutex);

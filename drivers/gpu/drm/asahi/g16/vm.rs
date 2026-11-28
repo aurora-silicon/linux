@@ -12,7 +12,8 @@
 //!   (`vm.install_driver_mappings`): user binds there fail (EINVAL);
 //! - bind it to an exclusive TTBAT slot ([`mmu::Uat::bind`]) for as long as its [`VmState`]
 //!   lives; at most [`super::hw::sizes::MAX_VMS`] such VMs (ENOSPC beyond, checked before
-//!   binding so the slot allocator never blocks).
+//!   binding so the slot allocator never blocks), shared between processes as the queues are
+//!   ([`crate::queue_share::Shares`]), since a process may open the device many times.
 //!
 //! The [`VmState`] of a VM is shared by the [`Registry`] (while the client's VM handle exists),
 //! the VM's queues and its jobs. It cannot be owned by the [`mmu::Vm`] itself: the slot binding
@@ -28,7 +29,7 @@
 //! alike.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{
     drm::gem::BaseObject,
     new_mutex,
@@ -134,8 +135,31 @@ pub(crate) struct VmStateInner {
     /// Private mappings are kept outside generic close's user GPUVA teardown.
     context_mappings: KVec<mmu::KernelMapping>,
     pub(crate) resources: Option<Arc<super::resources::Cache>>,
+    /// Set once a multisampled render pass of this VM becomes visible ([`Self::renders_msaa`]).
+    renders_msaa: AtomicBool,
     #[allow(dead_code)]
     pub(crate) live: Arc<LiveToken>,
+}
+
+impl VmStateInner {
+    /// Whether renders this VM's SUBMITs accepted are not yet published.
+    pub(crate) fn renders_unpublished(&self) -> bool {
+        self.resources
+            .as_ref()
+            .is_some_and(|cache| cache.renders_unpublished())
+    }
+
+    /// Whether this VM has published a multisampled render pass. Its later passes can still
+    /// read multisampled images (an attachmentless pass reading them as input attachments is
+    /// single-sampled), so the property is the VM's from then on.
+    pub(crate) fn renders_msaa(&self) -> bool {
+        self.renders_msaa.load(Ordering::Relaxed)
+    }
+
+    /// Records that a multisampled render pass of this VM became visible to the firmware.
+    pub(crate) fn note_msaa_render(&self) {
+        self.renders_msaa.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for VmStateInner {
@@ -151,11 +175,12 @@ pub(crate) struct LiveToken {
     registry: Arc<Registry>,
     bind: Option<mmu::VmBind>,
     file_id: u64,
+    process: usize,
 }
 impl Drop for LiveToken {
     fn drop(&mut self) {
         drop(self.bind.take());
-        self.registry.release(self.file_id);
+        self.registry.release(self.file_id, self.process);
     }
 }
 
@@ -170,10 +195,13 @@ pub(crate) struct Registry {
     /// Includes deferred/retained bindings after the file handle closes.
     #[pin]
     files: Mutex<KVec<(u64, u32)>>,
+    /// The live VMs counted per creating process; taken under `files`.
+    #[pin]
+    processes: Mutex<crate::queue_share::Shares>,
 }
 
 /// A reserved place among the live VMs, released unless a [`VmState`] takes it over.
-struct Reservation<'a>(Option<&'a Registry>, u64);
+struct Reservation<'a>(Option<&'a Registry>, u64, usize);
 
 impl Reservation<'_> {
     fn into_state(mut self) {
@@ -184,7 +212,7 @@ impl Reservation<'_> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if let Some(registry) = self.0 {
-            registry.release(self.1);
+            registry.release(self.1, self.2);
         }
     }
 }
@@ -198,6 +226,8 @@ impl Registry {
                 vms <- new_mutex!(vms, "g16::Registry::vms"),
                 live: AtomicU32::new(0),
                 files <- new_mutex!(files, "g16::Registry::files"),
+                processes <- new_mutex!(crate::queue_share::Shares::new(),
+                    "g16::Registry::processes"),
             }),
             GFP_KERNEL,
         )
@@ -220,29 +250,47 @@ impl Registry {
         let rollback = kernel::types::ScopeGuard::new(|| {
             self.live.fetch_sub(1, Ordering::AcqRel);
         });
-        {
+        let process = {
             let mut files = self.files.lock();
-            if let Some((_, count)) = files.iter_mut().find(|(id, _)| *id == file_id) {
-                if *count >= MAX_VMS_PER_FILE {
-                    return Err(ENOSPC);
+            let index = match files.iter().position(|(id, _)| *id == file_id) {
+                Some(index) if files[index].1 >= MAX_VMS_PER_FILE => return Err(ENOSPC),
+                Some(index) => index,
+                None => {
+                    files.push((file_id, 0), GFP_NOWAIT)?;
+                    files.len() - 1
                 }
-                *count += 1;
-            } else {
-                files.push((file_id, 1), GFP_NOWAIT)?;
+            };
+            match self.processes.lock().take_current(limit, GFP_NOWAIT) {
+                Ok(process) => {
+                    files[index].1 += 1;
+                    process
+                }
+                Err(error) => {
+                    if files[index].1 == 0 {
+                        let _ = files.remove(index);
+                    }
+                    // The share refusing is "no room"; a failed allocation stays ENOMEM.
+                    return Err(if error == EBUSY { ENOSPC } else { error });
+                }
             }
-        }
+        };
         rollback.dismiss();
-        Ok(Reservation(Some(self), file_id))
+        Ok(Reservation(Some(self), file_id, process))
     }
 
-    fn release(&self, file_id: u64) {
-        let mut files = self.files.lock();
-        if let Some(index) = files.iter().position(|(id, _)| *id == file_id) {
-            files[index].1 -= 1;
-            if files[index].1 == 0 {
-                let _ = files.remove(index);
+    fn release(&self, file_id: u64, process: usize) {
+        let gone = {
+            let mut files = self.files.lock();
+            if let Some(index) = files.iter().position(|(id, _)| *id == file_id) {
+                files[index].1 -= 1;
+                if files[index].1 == 0 {
+                    let _ = files.remove(index);
+                }
             }
-        }
+            self.processes.lock().give_back(process)
+        };
+        // Drops the process's mm reference outside the registry locks.
+        drop(gone);
         self.live.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -254,6 +302,11 @@ impl Registry {
             let index = vms.iter().position(|state| state.id == id);
             index.and_then(|index| vms.remove(index).ok())
         };
+        // Arenas still reachable by firmware stay with the slot leases and jobs that hold
+        // them; the rest (and the spare epochs, which hold the VM) go now.
+        if let Some(cache) = state.as_ref().and_then(|state| state.resources.as_ref()) {
+            cache.close();
+        }
         drop(state);
     }
 
@@ -268,8 +321,12 @@ impl Registry {
             let Some(closed) = closed else {
                 break;
             };
-            // No allocation while holding the registry lock, which fail_all() also needs.
-            // Final VM destruction is deferred independently of this caller's locks.
+            // Break the spare-epoch cycle before releasing the registry reference, matching
+            // close(). No allocation while holding the registry lock, which fail_all() also
+            // needs. Final VM destruction is deferred independently of this caller's locks.
+            if let Some(cache) = closed.resources.as_ref() {
+                cache.close();
+            }
             drop(closed);
         }
     }
@@ -332,6 +389,15 @@ impl Registry {
             .ok_or(ENOENT)
     }
 
+    /// The VM id of a live VM currently bound to TTBAT `slot`, if any.
+    pub(crate) fn find_by_slot(&self, slot: u32) -> Option<u64> {
+        self.vms
+            .lock()
+            .iter()
+            .find(|state| state.slot == slot)
+            .map(|state| state.id)
+    }
+
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
     /// the device lock.
     pub(crate) fn fail_all(&self, error: Error) {
@@ -348,7 +414,14 @@ pub(crate) fn reserved_ranges() -> [Range<u64>; 2] {
 }
 
 /// Creates a user VM (`gpu::Gpu::new_vm`).
-pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Result<mmu::Vm> {
+///
+/// Kernel memory sized by the VM's client (its private arenas) is charged to `memory`.
+pub(crate) fn new_vm(
+    gpu: &Gpu,
+    kernel_range: Range<u64>,
+    file_id: u64,
+    memory: Option<Arc<crate::memacct::Client>>,
+) -> Result<mmu::Vm> {
     if gpu.shared.crashed.load(Ordering::Acquire) {
         return Err(EIO);
     }
@@ -363,10 +436,13 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
     };
     let reservation = registry.reserve(file_id)?;
     let id = gpu.ids.vm.next();
-    let vm = gpu
+    let mut vm = gpu
         .uat
         .new_vm(id, kernel_range.clone())?
         .with_tracked_status()?;
+    if let Some(memory) = memory {
+        vm = vm.with_memory_client(memory);
+    }
     // Driver mappings retain their VM. Break that ownership if any later step fails,
     // including binding/state allocation and registry insertion.
     let failed_vm = kernel::types::ScopeGuard::new_with_data(vm.clone(), |vm| {
@@ -390,6 +466,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
             registry: registry.clone(),
             bind: Some(bind),
             file_id,
+            process: reservation.2,
         })
         .into();
     reservation.into_state();
@@ -397,6 +474,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         factory,
         live.bind.as_ref().ok_or(EIO)?.clone(),
         live.clone(),
+        gpu.shared.clone(),
     )?;
     let inner = VmStateInner {
         id,
@@ -406,6 +484,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         vm: vm.clone(),
         context_mappings: mappings,
         resources: Some(resources),
+        renders_msaa: AtomicBool::new(false),
         live,
     };
     let state = Arc::new(VmState(crate::cleanup::Deferred::new(inner)?), GFP_KERNEL)?;

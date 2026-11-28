@@ -38,53 +38,86 @@ impl ApplicationOwner {
         let quarantined=self.quarantined.clone();
         let ticket=Arc::new(AtomicI32::new(TICKET_RUNNING),GFP_KERNEL)?;let done=ticket.clone();
         kernel::workqueue::system_long().try_spawn(GFP_KERNEL,move || {
-            let mut owner=session.lock();
-            let result=if failed.load(Ordering::Acquire) {Err(Failure::Fatal(EIO))} else {
-                owner.0.as_mut().ok_or(Failure::Fatal(EIO)).and_then(|session|task(session))
-            };
-            // A job that a recovery ended fails alone; the firmware session
-            // keeps serving other jobs. Anything else ends the session.
-            let result=match result {
-                Ok(()) => Ok(()),
-                Err(Failure::Job(failure)) => match owner.0.as_ref() {
-                    Some(session) if !session.any_crashed() => {
-                        if let JobFailure::Stranded(_,path) | JobFailure::Unbound(_,path,_)=&failure {
-                            quarantined.fetch_or(path.bit(),Ordering::AcqRel);
-                        }
-                        log_job_failure(session,&failure);
-                        Err(Failure::Job(failure))
-                    }
-                    _ => Err(Failure::Fatal(EIO)),
-                },
-                Err(fatal) => Err(fatal),
-            };
-            if let Err(Failure::Fatal(error))=result {
-                failed.store(true,Ordering::Release);
-                if let Some(session)=owner.0.as_mut() {
-                    if let Some(job)=session.application_job.as_mut() {job.quarantine();}
-                    if let Some(memory)=session.memory.as_mut() {memory.quarantine_application_compute();}
-                    dev_err!(session.device(),"G18_APP_FAIL error={:?} owners=retained no-retry\n",error);
-                    session.dump_fault_evidence("application worker");
-                    if let Some(memory)=session.memory.as_ref() {memory.log_trace_journal(&session.dev);}
-                }
-                let _=owner.stop("application fault");
-            }
-            done.store(match result {
-                Ok(())=>0,
-                Err(Failure::Fatal(error))=>error.to_errno(),
-                Err(Failure::Job(JobFailure::Recovered(_) | JobFailure::Unbound(..) | JobFailure::Released))=>JobOutcome::Recovered as i32,
-                Err(Failure::Job(JobFailure::Stranded(..) | JobFailure::Retained))=>JobOutcome::Stranded as i32,
-            },Ordering::Release);
+            done.store(Self::outcome(&session,&failed,&quarantined,task),Ordering::Release);
         })?;
         let waited=Instant::<Monotonic>::now();
         loop {
             match ticket.load(Ordering::Acquire) {
                 TICKET_RUNNING => fsleep(Delta::from_micros(recovery::poll_interval_us(waited.elapsed().as_micros_ceil()))),
-                0 => {recovery::SUBMIT_LATENCY.record(waited.elapsed().as_micros_ceil());return Ok(())}
-                code if code==JobOutcome::Recovered as i32 => return Err(Failure::Job(JobFailure::Released)),
-                code if code==JobOutcome::Stranded as i32 => return Err(Failure::Job(JobFailure::Retained)),
-                errno => return Err(Failure::Fatal(Error::from_errno(errno))),
+                code => {
+                    if code==0 {recovery::SUBMIT_LATENCY.record(waited.elapsed().as_micros_ceil());}
+                    return Self::decode(code);
+                }
             }
+        }
+    }
+
+    /// Run one job task on the calling thread, with the same outcome as
+    /// [`Self::work`]. Only the DRM adapter's job worker calls this: it
+    /// starts on a shallow stack, as the session worker does. The submit
+    /// latency histogram then counts the time from taking the session to
+    /// retirement.
+    fn run<F>(&self, task: F) -> core::result::Result<(),Failure>
+        where F: FnOnce(&mut G18Session)->core::result::Result<(),Failure> {
+        if self.failed.load(Ordering::Acquire) {return Err(Failure::Fatal(EIO));}
+        let started=Instant::<Monotonic>::now();
+        let code=Self::outcome(&self.session,&self.failed,&self.quarantined,task);
+        if code==0 {recovery::SUBMIT_LATENCY.record(started.elapsed().as_micros_ceil());}
+        Self::decode(code)
+    }
+
+    /// Run `task` on the session and reduce its result to a ticket code.
+    fn outcome<F>(session:&Mutex<Retained>,failed:&AtomicBool,quarantined:&AtomicU32,task:F)->i32
+        where F: FnOnce(&mut G18Session)->core::result::Result<(),Failure> {
+        let mut owner=session.lock();
+        let result=if failed.load(Ordering::Acquire) {Err(Failure::Fatal(EIO))} else {
+            owner.0.as_mut().ok_or(Failure::Fatal(EIO)).and_then(|session|task(session))
+        };
+        // A job that a recovery ended fails alone; the firmware session
+        // keeps serving other jobs. Anything else ends the session.
+        let result=match result {
+            Ok(()) => Ok(()),
+            Err(Failure::Job(failure)) => match owner.0.as_ref() {
+                Some(session) if !session.any_crashed() => {
+                    if let JobFailure::Stranded(_,path) | JobFailure::Unbound(_,path,_)=&failure {
+                        quarantined.fetch_or(path.bit(),Ordering::AcqRel);
+                    }
+                    log_job_failure(session,&failure);
+                    Err(Failure::Job(failure))
+                }
+                _ => Err(Failure::Fatal(EIO)),
+            },
+            Err(fatal) => Err(fatal),
+        };
+        if let Err(Failure::Fatal(error))=result {
+            failed.store(true,Ordering::Release);
+            if let Some(session)=owner.0.as_mut() {
+                if let Some(job)=session.application_job.as_mut() {job.quarantine();}
+                if let Some(memory)=session.memory.as_mut() {memory.quarantine_application_compute();}
+                dev_err!(session.device(),"G18_APP_FAIL error={:?} owners=retained no-retry\n",error);
+                session.dump_fault_evidence("application worker");
+                if let Some(memory)=session.memory.as_ref() {memory.log_trace_journal(&session.dev);}
+            }
+            let _=owner.stop("application fault");
+        }
+        match result {
+            Ok(())=>0,
+            Err(Failure::Fatal(error))=>error.to_errno(),
+            Err(Failure::Job(JobFailure::Recovered(_) | JobFailure::Unbound(..) | JobFailure::Released))=>JobOutcome::Recovered as i32,
+            Err(Failure::Job(JobFailure::Stranded(..) | JobFailure::Retained))=>JobOutcome::Stranded as i32,
+            Err(Failure::Job(JobFailure::Refused(error)))=>JobOutcome::Refused as i32-error.to_errno(),
+        }
+    }
+
+    /// The submitting side of a ticket code: the worker logged the failure.
+    fn decode(code:i32)->core::result::Result<(),Failure> {
+        match code {
+            0 => Ok(()),
+            code if code==JobOutcome::Recovered as i32 => Err(Failure::Job(JobFailure::Released)),
+            code if code==JobOutcome::Stranded as i32 => Err(Failure::Job(JobFailure::Retained)),
+            code if code>JobOutcome::Refused as i32 =>
+                Err(Failure::Job(JobFailure::Refused(Error::from_errno(JobOutcome::Refused as i32-code)))),
+            errno => Err(Failure::Fatal(Error::from_errno(errno))),
         }
     }
 
@@ -95,6 +128,8 @@ impl ApplicationOwner {
         match result {
             Ok(()) => Ok(()),
             Err(Failure::Job(JobFailure::Released)) | Err(Failure::Job(JobFailure::Recovered(_))) => Err(EIO),
+            // Nothing ran: the client's VM stays usable.
+            Err(Failure::Job(JobFailure::Refused(error))) => Err(error),
             Err(Failure::Job(_)) => {if let Some(status)=vm.status(){status.record(EIO);}Err(EIO)}
             Err(Failure::Fatal(error)) => {if let Some(status)=vm.status(){status.record(error);}Err(error)}
         }
@@ -107,6 +142,8 @@ const TICKET_RUNNING: i32 = 1;
 enum JobOutcome {
     Recovered = 2,
     Stranded = 3,
+    /// Plus the errno: [`JobFailure::Refused`].
+    Refused = 0x1000,
 }
 
 impl G18Runtime for ApplicationOwner {
@@ -118,14 +155,15 @@ impl G18Runtime for ApplicationOwner {
 impl G18DrmRuntime for ApplicationOwner {
     fn submit_compute(&self,vm:&mmu::Vm,command:&crate::g18::uapi::command::TranslatedComputeCommand)
         ->Result<G18RenderRetirement> {
-        let command=KBox::new(*command,GFP_KERNEL)?;let job_vm=vm.clone();
         self.admit(JobPath::Compute)?;
-        Self::finish(vm,self.work(move |session|session.submit_application_compute(&job_vm,&command)))?;
+        Self::finish(vm,self.run(|session|session.submit_application_compute(vm,command)))?;
         Ok(G18RenderRetirement {stage_ticks:None})
     }
+    /// Never waits for the session: while a job holds it, that job reports
+    /// a crash itself and sets `failed`.
     fn is_crashed(&self)->bool {
         self.failed.load(Ordering::Acquire)
-            || self.session.lock().0.as_ref().map_or(true,|s|s.any_crashed())
+            || self.session.try_lock().is_some_and(|owner|owner.0.as_ref().map_or(true,|s|s.any_crashed()))
     }
     fn new_user_vm(&self,id:u64,kernel_range:Range<u64>)->Result<mmu::Vm> {
         if self.failed.load(Ordering::Acquire) {return Err(EIO);}
@@ -134,9 +172,8 @@ impl G18DrmRuntime for ApplicationOwner {
 }
 impl G18RenderJobSink for ApplicationOwner {
     fn submit_render(&self,vm:&mmu::Vm,render:&G18ApplicationRender)->Result<G18RenderRetirement> {
-        let render=KBox::new(*render,GFP_KERNEL)?;let job_vm=vm.clone();
         self.admit(JobPath::Render)?;
-        Self::finish(vm,self.work(move |session|session.submit_application(&job_vm,&render)))?;
+        Self::finish(vm,self.run(|session|session.submit_application(vm,render)))?;
         // K8 uses the adapter's architectural-counter bracket until firmware
         // timestamp units and stage boundaries have hardware qualification.
         Ok(G18RenderRetirement {stage_ticks:None})
@@ -170,6 +207,9 @@ fn log_job_failure(session:&G18Session,failure:&JobFailure) {
         JobFailure::Unbound(r,path,unready) => dev_err!(session.device(),
             "G18_APP_JOB_FAILED error={:?} recovery epoch={} host={} us={} reason={:#x} slot-mask={:#x} queues=retired unbound={} path={:?} quarantined session=live recoveries={}\n",
             EIO,r.epoch,r.host,r.us,r.cause.reason,r.cause.slot_mask,unready,path,recovery::recoveries()),
+        // The submitter's own error, returned to it: not logged above debug level.
+        JobFailure::Refused(error) => dev_dbg!(session.device(),
+            "G18_APP_JOB_REFUSED error={:?} unpublished session=live\n",error),
         // Only the submitting thread's summaries; the worker logs the rest.
         JobFailure::Released | JobFailure::Retained => {}
     }
@@ -183,7 +223,11 @@ impl G18Session {
             self.application_job=Some(ApplicationJob::new(self.render_job.take().ok_or(EIO)?)?);
         }
         let job=self.application_job.as_mut().ok_or(EIO)?;
-        job.prepare(&self.dev,&self.uat,vm,render)?;
+        if let Err(error)=job.prepare(&self.dev,&self.uat,vm,render) {
+            // Nothing is published before prepare() commits the frame: a
+            // job it refused leaves the owner retired, the session serves on.
+            return Err(if job.unpublished() {Failure::Job(JobFailure::Refused(error))} else {Failure::Fatal(error)});
+        }
         if job.pool_aliases.is_empty() {
             job.pool_aliases=self.memory.as_mut().ok_or(EIO)?.application_aliases(vm)?;
         }
