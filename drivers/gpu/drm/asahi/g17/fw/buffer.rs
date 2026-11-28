@@ -138,7 +138,8 @@ pub(crate) struct GraphArgs<'a> {
     pub(crate) discard: u64,
     pub(crate) buffer_id: u32,
     pub(crate) generation: u64,
-    /// The heap's normal maximum in blocks (`Variant::tvb_normal_blocks`).
+    /// The heap's normal maximum in blocks (`BM+0x80`): `Variant::tvb_normal_blocks`, raised by
+    /// memory on NEO heaps.
     pub(crate) normal_blocks: usize,
 }
 
@@ -160,6 +161,7 @@ impl Graph {
         if args.generation == 0
             || args.blocks.len() < cfg::TVB_INITIAL_PAGES.len()
             || args.blocks.len() > cfg::TVB_MAX_BLOCKS
+            || !(NORMAL_MAX_BLOCKS..=cfg::TVB_MAX_BLOCKS).contains(&args.normal_blocks)
         {
             return Err(EINVAL);
         }
@@ -201,7 +203,7 @@ impl Graph {
         self.state.block_size = cfg::TVB_BLOCK_SIZE as u32;
         self.state.counter = offset_va(args.fw_va, COUNTER as u64)?;
         self.state.maximum_size = (cfg::TVB_BLOCK_SLOTS * 4) as u32;
-        self.state.normal_maximum_size = (args.normal_blocks * 4) as u32;
+        self.state.normal_maximum_size = (args.normal_blocks * cfg::TVB_PAGES_PER_BLOCK) as u32;
         self.state.discard = discard;
         Ok(())
     }

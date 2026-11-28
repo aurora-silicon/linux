@@ -913,7 +913,7 @@ impl super::super::Backend {
             let target = pair.host_growth_target(packet)?;
             let buffer_id = pair.buffer_id();
             let growth_target = match target {
-                Some(HostGrowth::Idle(target)) => {
+                Some(HostGrowth::Idle { required, target }) => {
                     let table = firmware.init.pb_descriptor_table()?;
                     let offset = usize::from(buffer_id) * 16;
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
@@ -923,11 +923,11 @@ impl super::super::Backend {
                             .word(offset + index * 4)?
                             .load(core::sync::atomic::Ordering::Relaxed);
                     }
-                    Some((target, Some(descriptor)))
+                    Some((target, required, Some(descriptor)))
                 }
                 // A busy pair's firmware owns its page list and PB descriptor:
                 // the growth only appends blocks to the inventory.
-                Some(HostGrowth::Busy(target)) => Some((target, None)),
+                Some(HostGrowth::Busy { required, target }) => Some((target, required, None)),
                 None => None,
             };
             let pair = firmware.queues.render.take_pair(slot, self.owner, packet)?;
@@ -938,16 +938,32 @@ impl super::super::Backend {
             uat: &uat,
         };
         let mut growth = None;
-        let busy = matches!(growth_target, Some((_, None)));
+        let busy = matches!(growth_target, Some((_, _, None)));
         let result = (|| {
-            if let Some((target, descriptor)) = growth_target {
+            if let Some((target, required, descriptor)) = growth_target {
                 let vm = pair.context().vm().clone();
-                match pair.manager().prepare_growth(&dev, &vm, target, descriptor) {
-                    Ok(prepared) => growth = prepared,
+                let manager = pair.manager();
+                match manager.host_target(&vm, target, required).and_then(|target| {
+                    manager.prepare_growth(&dev, &vm, target, if busy { 0 } else { required },
+                        descriptor)
+                }) {
+                    Ok(prepared) => {
+                        // The heap asked for growth and got none: it stopped short at no
+                        // block, or its arena share left none.
+                        if prepared.is_none() {
+                            let blocks = pair.manager().blocks();
+                            crate::g17::trace::heap(if busy {
+                                crate::g17::trace::HEAP_HOST_BUSY
+                            } else {
+                                crate::g17::trace::HEAP_HOST_IDLE
+                            }, false, blocks, blocks);
+                        }
+                        growth = prepared
+                    }
                     // A busy pair keeps its heap; firmware grow requests still serve it.
                     Err(_) if busy => {
                         let manager = pair.manager();
-                        manager.defer_busy_growth(crate::g17::now_ns());
+                        manager.defer_growth(crate::g17::now_ns());
                         let blocks = manager.blocks();
                         crate::g17::trace::heap(crate::g17::trace::HEAP_HOST_BUSY, false,
                             blocks, blocks);

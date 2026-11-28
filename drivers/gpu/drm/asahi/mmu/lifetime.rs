@@ -25,6 +25,8 @@ pub(super) struct DriverMappings {
 struct PoolMappings {
     id: u64,
     blocks: usize,
+    /// `blocks` when the pool was installed: what it holds beyond that is growth.
+    installed: usize,
     mappings: KVec<KernelMapping>,
 }
 
@@ -225,6 +227,19 @@ impl Vm {
             .map(|pool| pool.blocks)
     }
 
+    /// The render pools of this VM and the heap blocks they grew by after they were installed.
+    pub(crate) fn render_pool_growth(&self) -> (usize, usize) {
+        let Some(lifetime) = self.lifetime.as_ref() else {
+            return (0, 0);
+        };
+        let driver = lifetime.driver.lock();
+        driver.as_ref().map_or((0, 0), |driver| {
+            driver.render.iter().flatten().fold((0, 0), |(pools, grown), pool| {
+                (pools + 1, grown + pool.blocks.saturating_sub(pool.installed))
+            })
+        })
+    }
+
     /// Retains a new generation after all references to a replaced pool retire.
     pub(crate) fn install_render_pool_mappings(
         &self,
@@ -246,6 +261,7 @@ impl Vm {
         *pool = Some(PoolMappings {
             id,
             blocks,
+            installed: blocks,
             mappings,
         });
         Ok(())
@@ -367,6 +383,7 @@ impl Vm {
         driver.compute = Some(PoolMappings {
             id,
             blocks: 0,
+            installed: 0,
             mappings,
         });
         Ok(())

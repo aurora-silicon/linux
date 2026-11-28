@@ -342,16 +342,23 @@ pub(crate) mod resources {
     pub(crate) const TVB_PAIR_STRIDE: u64 = 0x2800_0000;
     pub(crate) const RESERVED_RANGES: usize = 50;
 
-    /// Compact allocations search these shared client arenas in this order.
-    pub(crate) fn compact_ranges() -> [Range<u64>; 4] {
+    /// The client arenas tiler-heap growth is placed in, so that it never takes the space of
+    /// render aliases and target records.
+    pub(crate) fn tvb_growth_ranges() -> [Range<u64>; 2] {
         let second = TVB_GROWTH + TVB_PAIR_STRIDE;
         [
-            RENDER_ALIASES,
             TVB_GROWTH
                 ..TVB_GROWTH + (TVB_MAX_BLOCKS - TVB_INITIAL_PAGES.len()) as u64 * TVB_BLOCK_STRIDE,
             second..second + TVB_MAX_BLOCKS as u64 * TVB_BLOCK_STRIDE,
-            TARGETS,
         ]
+    }
+
+    /// Compact allocations search these shared client arenas in this order. Each growth arena
+    /// holds one heap at `TVB_MAX_BLOCKS`, so they come last: a compact object there would cut
+    /// a heap short of its normal maximum.
+    pub(crate) fn compact_ranges() -> [Range<u64>; 4] {
+        let [first, second] = tvb_growth_ranges();
+        [RENDER_ALIASES, TARGETS, first, second]
     }
 
     /// All driver-owned windows reserved before the first userspace bind.

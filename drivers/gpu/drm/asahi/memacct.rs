@@ -101,7 +101,7 @@ fn pct_of(total: u64, pct: u32) -> u64 {
     }
 }
 
-fn total_ram_bytes() -> u64 {
+pub(crate) fn total_ram_bytes() -> u64 {
     // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
     let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
     // SAFETY: `si_meminfo()` only fills in the structure it is given.

@@ -337,6 +337,18 @@ fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum
     )
 }
 
+/// `target` of a host growth for a render that requires `required` blocks, of a heap with
+/// `primary` blocks of primary backing in a VM whose `heaps` heaps hold `grown` blocks of growth
+/// and leave `free` block slots in the growth arenas. Beyond `required` the heap grows to at most
+/// its primary and an equal share of that room. A heap's growth or shrink only moves slots
+/// between `free` and `grown`, so the share changes only as heaps come and go or other objects
+/// take or leave arena room.
+fn growth_target(target: usize, required: usize, primary: usize, free: usize, grown: usize,
+    heaps: usize) -> usize {
+    let share = primary.saturating_add(free.saturating_add(grown) / heaps.max(1));
+    target.min(required.max(share))
+}
+
 /// Whether `bytes` more kernel memory keeps the device's GPU memory more than an
 /// eighth below the device limit, and `client`'s committed memory more than an
 /// eighth below the per-client limit (`memacct`). A busy pair's growth is only
@@ -366,7 +378,20 @@ pub(crate) fn compact_alias(
     prot: mmu::Prot,
     guard: usize,
 ) -> Result<mmu::KernelMapping> {
-    for range in cfg::compact_ranges() {
+    alias_in(&cfg::compact_ranges(), object, vm, source, align, prot, guard)
+}
+
+/// [`compact_alias`] in the first of `ranges` with room.
+fn alias_in(
+    ranges: &[Range<u64>],
+    object: &KernelObject,
+    vm: &mmu::Vm,
+    source: Range<usize>,
+    align: u64,
+    prot: mmu::Prot,
+    guard: usize,
+) -> Result<mmu::KernelMapping> {
+    for range in ranges.iter().cloned() {
         match object.map_range(vm, source.clone(), range, align, prot, guard) {
             Ok(mapping) => return Ok(mapping),
             Err(error) if error == ENOSPC => {}
@@ -381,8 +406,15 @@ pub(crate) fn compact_alias(
 pub(crate) struct TvbGrowth {
     mappings: KVec<mmu::KernelMapping>,
     addresses: KVec<u64>,
-    extension: KernelObject,
+    extensions: KVec<KernelObject>,
+    /// Why the growth stopped short of its target: ENOMEM or ENOSPC.
+    stopped: Option<Error>,
 }
+
+/// Blocks of one growth extension at most. A shrink gives back whole trailing extensions of a
+/// NEO heap, so this is its step: 8 MiB, 16 periods of shrink credit, and 53 extensions in a
+/// full block table.
+const EXTENSION_BLOCKS: usize = 64;
 
 /// Aliases and backing of growth extensions a shrink removed from an idle
 /// heap. Field order unmaps the aliases before freeing their backing.
@@ -415,23 +447,29 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
-    /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
-    /// the compact window, which is checked for room for all of them first, and the client's
-    /// passes and geometry size them, so they are charged to the client.
-    fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
-        -> Result<KernelObject> {
+    /// Backing for `blocks` blocks to be mapped into `vm`, charged to `client` if there is one
+    /// ([`KernelObject::client_backing`]). M5 blocks are mapped one by one in the compact
+    /// window, which is checked for room for all of them first.
+    fn allocate(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        geometry: BlockGeometry,
+        blocks: usize,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result<KernelObject> {
         let bytes = Self::backing_bytes(geometry, blocks)?;
-        if geometry == BlockGeometry::NEO {
-            return KernelObject::backing(dev, bytes, CpuMap::WriteCombined);
+        if geometry != BlockGeometry::NEO {
+            compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
         }
-        compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
-        KernelObject::client_backing(dev, bytes, vm.memory_client())
+        KernelObject::client_backing(dev, bytes, client)
     }
+    /// Maps a NEO block in the first of `ranges` with room; other geometries have their own.
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
         geometry: BlockGeometry,
+        ranges: &[Range<u64>],
     ) -> Result<mmu::KernelMapping> {
         if geometry != BlockGeometry::NEO {
             let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
@@ -443,7 +481,8 @@ impl Tvb {
         }
         let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
         let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-        let mapping = compact_alias(
+        let mapping = alias_in(
+            ranges,
             object,
             vm,
             source,
@@ -470,11 +509,14 @@ impl Tvb {
         if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = Self::allocate(dev, vm, geometry, blocks)?;
+        // The client's passes and geometry size M5 blocks, so they are charged to it; a NEO
+        // heap's primary blocks are kernel memory.
+        let client = if geometry == BlockGeometry::NEO { None } else { vm.memory_client() };
+        let backing = Self::allocate(dev, vm, geometry, blocks, client)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
-            let mapping = Self::map_block(&backing, vm, index, geometry)?;
+            let mapping = Self::map_block(&backing, vm, index, geometry, &cfg::compact_ranges())?;
             addresses.push(mapping.iova(), GFP_KERNEL)?;
             mappings.push(mapping, GFP_KERNEL)?;
         }
@@ -520,20 +562,50 @@ impl Tvb {
             return Err(ERANGE);
         }
         let added = target - self.blocks();
-        self.extensions.reserve(1, GFP_KERNEL)?;
+        let count = added.div_ceil(EXTENSION_BLOCKS);
+        self.extensions.reserve(count, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = Self::allocate(dev, vm, self.geometry, added)?;
+        // Declared first, so an error drops the mappings before their backing.
+        let mut extensions = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
-        for relative in 0..added {
-            let mapping = Self::map_block(&backing, vm, relative, self.geometry)?;
-            addresses.push(mapping.iova(), GFP_KERNEL)?;
-            mappings.push(mapping, GFP_KERNEL)?;
+        let mut stopped = None;
+        let ranges = cfg::tvb_growth_ranges();
+        while addresses.len() < added {
+            let (start, made) = (addresses.len(), extensions.len());
+            let blocks = (added - start).min(EXTENSION_BLOCKS);
+            let result = (|| {
+                // The client's renders size the growth, so it is charged to the client. Each
+                // extension is admitted, and on M5 checked for room, before it is allocated.
+                extensions.push(Self::allocate(dev, vm, self.geometry, blocks,
+                    vm.memory_client())?, GFP_KERNEL)?;
+                let backing = extensions.last().ok_or(EIO)?;
+                for relative in 0..blocks {
+                    let mapping = Self::map_block(backing, vm, relative, self.geometry, &ranges)?;
+                    addresses.push(mapping.iova(), GFP_KERNEL)?;
+                    mappings.push(mapping, GFP_KERNEL)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {}
+                // Over a memory limit, or out of memory or of growth arenas: keep the whole
+                // extensions made so far.
+                Err(error) if error == ENOMEM || error == ENOSPC => {
+                    mappings.truncate(start);
+                    addresses.truncate(start);
+                    extensions.truncate(made);
+                    stopped = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(Some(TvbGrowth {
             mappings,
             addresses,
-            extension: backing,
+            extensions,
+            stopped,
         }))
     }
 }
@@ -717,7 +789,8 @@ pub(crate) struct ManagerArgs {
     pub(crate) buffer_id: u8,
     pub(crate) generation: u64,
     pub(crate) first_ordinal: u64,
-    /// The heap's normal maximum in blocks (`Variant::tvb_normal_blocks`); NEO heaps only.
+    /// The firmware variant's normal maximum in blocks (`Variant::tvb_normal_blocks`): on NEO
+    /// heaps a floor that memory may raise; unused on others.
     pub(crate) normal_blocks: usize,
 }
 
@@ -728,6 +801,8 @@ pub(crate) struct Manager {
     _page_list: mmu::KernelMapping,
     graph: KernelObject,
     layout: layout::Layout,
+    /// The firmware variant's normal maximum (`ManagerArgs::normal_blocks`), before memory raises it.
+    variant_normal_blocks: usize,
     tvb: Tvb,
     metrics: MetricsLease,
     /// Boxed: the per-scene owner table would otherwise make every `Manager` value large, and
@@ -782,9 +857,9 @@ struct Shrink {
     /// An idle shrink may return to this size: that growth only serves
     /// renders overlapping in flight.
     busy_base: usize,
-    /// Host ns before which a busy pair is not grown again after a growth
-    /// was refused or failed.
-    busy_retry: u64,
+    /// Host ns before which the host does not grow the heap beyond the blocks a render
+    /// requires, after a growth was refused, failed or stopped short.
+    retry: u64,
 }
 
 pub(crate) struct Submitted<'a> {
@@ -808,12 +883,18 @@ impl Manager {
     ) -> Result<Self> {
         let geometry = tvb.geometry;
         let neo = geometry == BlockGeometry::NEO;
-        let mut layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        let mut layout = if neo {
+            layout::Layout::neo(crate::memacct::total_ram_bytes())
+        } else {
+            layout::Layout::m5(geometry)?
+        };
         if neo {
             if args.normal_blocks == 0 || args.normal_blocks > geometry.max_blocks() {
                 return Err(EINVAL);
             }
-            layout.normal_blocks = args.normal_blocks;
+            // The firmware variant's maximum is a floor (the full table where all four
+            // clusters tile); more memory may raise it, never lower it.
+            layout.normal_blocks = layout.normal_blocks.max(args.normal_blocks);
         }
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
@@ -862,6 +943,7 @@ impl Manager {
             _page_list: page_list,
             graph,
             layout,
+            variant_normal_blocks: args.normal_blocks,
             tvb,
             metrics,
             scenes,
@@ -900,12 +982,13 @@ impl Manager {
         self.tvb.geometry.max_blocks()
     }
     /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
-    /// (`aurora.g17_mesh_tvb_floor`): the size its automatic growth reaches.
-    /// None on other heaps, or with the switch off.
+    /// (`aurora.g17_mesh_tvb_floor`): the firmware variant's normal maximum, 1,118 blocks on the
+    /// 8 GiB A18 Pro (the size its automatic growth reaches), not raised by memory. None on other
+    /// heaps, or with the switch off.
     pub(crate) fn mesh_floor(&self) -> Option<usize> {
         // SAFETY: Reads a module parameter; no other effect.
         let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
-        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.layout.normal_blocks)
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.variant_normal_blocks)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.
@@ -1004,7 +1087,10 @@ impl Manager {
         self.shrink.growth_max = self.shrink.growth_max.max(pages);
         Ok(pages)
     }
-    pub(crate) fn automatic_target(&mut self) -> Result<Option<usize>> {
+    pub(crate) fn automatic_target(&mut self, now: u64) -> Result<Option<usize>> {
+        if now < self.shrink.retry {
+            return Ok(None);
+        }
         self.sample_max_pages()?;
         let pages = core::mem::take(&mut self.shrink.growth_max);
         Ok(automatic_target_for(pages as usize, self.blocks(), self.tvb.geometry.pages(),
@@ -1027,7 +1113,7 @@ impl Manager {
         // appended blocks while the firmware uses it, the path its grow requests take. M5
         // heaps have their own geometry and are never shrunk (`shrinkable`), so growth made
         // for renders in flight together would never be given back.
-        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.busy_retry {
+        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.retry {
             return Ok(None);
         }
         let max_pages = self
@@ -1044,16 +1130,46 @@ impl Manager {
         }
         let bytes = Tvb::backing_bytes(self.tvb.geometry, target - current)? as u64;
         if !busy_growth_admitted(bytes, client) {
-            self.defer_busy_growth(now);
+            self.defer_growth(now);
             super::trace::heap(super::trace::HEAP_HOST_BUSY, false, current, current);
             return Ok(None);
         }
         Ok(Some(target))
     }
-    /// A busy pair's growth was refused or failed at `now`: retry a shrink
-    /// period later.
-    pub(crate) fn defer_busy_growth(&mut self, now: u64) {
-        self.shrink.busy_retry = now.saturating_add(SHRINK_PERIOD_NS);
+    /// `target` of a host growth for a render that requires `required` blocks, capped at this
+    /// heap's share of `vm`'s growth arenas ([`growth_target`]). The arenas hold two heaps at
+    /// their normal maximum and a VM may have any number of render pairs, so without the cap the
+    /// heaps that grow first take all of them. Required blocks are never capped. A growth the
+    /// share cuts to nothing is retried a shrink period later, as a refused one is. Called
+    /// without the device lock: it walks the arenas under the VM's.
+    pub(crate) fn host_target(
+        &mut self,
+        vm: &mmu::Vm,
+        target: usize,
+        required: usize,
+    ) -> Result<usize> {
+        if self.tvb.geometry != BlockGeometry::NEO || target <= required.max(self.blocks()) {
+            return Ok(target);
+        }
+        let mut free = 0;
+        for range in cfg::tvb_growth_ranges() {
+            let (used, _) = vm.capacity(range.clone())?;
+            let room = (range.end - range.start).saturating_sub(used);
+            free += (room / cfg::TVB_BLOCK_STRIDE) as usize;
+        }
+        // Another pair's growth mapped but not yet committed counts in neither or both: the
+        // share is off by it until the next attempt, which defers or stops short.
+        let (heaps, grown) = vm.render_pool_growth();
+        let target = growth_target(target, required, self.tvb.primary_blocks(), free, grown, heaps);
+        if target <= self.blocks() {
+            self.defer_growth(super::now_ns());
+        }
+        Ok(target)
+    }
+    /// A growth was refused, failed or stopped short at `now`: grow beyond what a render
+    /// requires only a shrink period later, as every attempt allocates and maps afresh.
+    pub(crate) fn defer_growth(&mut self, now: u64) {
+        self.shrink.retry = now.saturating_add(SHRINK_PERIOD_NS);
     }
     /// Records the blocks a pass layout requires, the floor of any shrink.
     /// A pass is being prepared at `now`; the heap counts as busy.
@@ -1184,11 +1300,16 @@ impl Manager {
     /// Allocate growth and precompute its words while the pair is exclusively
     /// borrowed. A descriptor snapshot requests idle-host growth; None leaves
     /// the firmware-owned page list and PB state untouched.
+    ///
+    /// The heap grows towards `target` as far as memory and the growth arenas allow, and fails
+    /// only if it would stay below `required`; a tiling pass partial-renders within the heap
+    /// it has.
     pub(crate) fn prepare_growth(
         &mut self,
         dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         target: usize,
+        required: usize,
         descriptor: Option<[u32; 4]>,
     ) -> Result<Option<PreparedGrowth>> {
         let previous = self.blocks();
@@ -1199,6 +1320,16 @@ impl Manager {
         let Some(growth) = self.tvb.prepare_growth(dev, vm, target)? else {
             return Ok(None);
         };
+        let target = previous + growth.addresses.len();
+        if let Some(error) = growth.stopped {
+            self.defer_growth(super::now_ns());
+            if target < required {
+                return Err(error);
+            }
+        }
+        if target == previous {
+            return Ok(None);
+        }
         let before = self.cursors()?;
         let plan = Growth::with_capacity(before, target - previous, self.tvb.geometry.capacity)?;
         let firmware_request = descriptor.is_none();
@@ -1273,7 +1404,8 @@ impl Manager {
         // Bounds, actual alignment and every reserved host entry are checked
         // before transferring aliases or consuming the caller-owned plan.
         self.graph.word(0)?;
-        if self.tvb.extensions.len() == self.tvb.extensions.capacity()
+        if candidate.growth.extensions.len()
+                > self.tvb.extensions.capacity() - self.tvb.extensions.len()
             || candidate.growth.addresses.len()
                 > self.tvb.addresses.capacity() - self.tvb.addresses.len()
         {
@@ -1305,7 +1437,7 @@ impl Manager {
         } = prepared.take().ok_or(EIO)?;
         let TvbGrowth {
             addresses,
-            extension,
+            extensions,
             ..
         } = growth;
 
@@ -1336,7 +1468,9 @@ impl Manager {
             write(core::mem::offset_of!(fw::State, consumer), before.read);
             write(core::mem::offset_of!(fw::State, last_page), pages - 1);
         }
-        append_reserved(&mut self.tvb.extensions, extension);
+        for extension in extensions.into_iter() {
+            append_reserved(&mut self.tvb.extensions, extension);
+        }
         write(self.layout.control, plan.target());
         fence(Ordering::SeqCst);
         write(self.layout.control + 4, plan.target());
@@ -1509,5 +1643,86 @@ mod capacity_tests {
             assert!(ids.entries.iter().all(|entry| entry.free()));
             assert_eq!(ids.returned_count, BUFFER_IDS);
         }
+    }
+}
+
+#[kunit_tests(asahi_g17_tvb_share)]
+mod share_tests {
+    use super::*;
+
+    /// Primary blocks of a heap for a 3456x2234 target.
+    const PRIMARY: usize = 64;
+
+    fn arena_slots() -> usize {
+        cfg::tvb_growth_ranges()
+            .iter()
+            .map(|range| ((range.end - range.start) / cfg::TVB_BLOCK_STRIDE) as usize)
+            .sum()
+    }
+
+    /// The sizes heaps of one VM settle at, each growing in turn towards its `(target,
+    /// required)` and capped at its share, as `Manager::host_target` does. A growth with no
+    /// room for all of it keeps the whole extensions that fit, as `Tvb::prepare_growth` does.
+    fn settle<const N: usize>(wants: [(usize, usize); N]) -> [usize; N] {
+        let slots = arena_slots();
+        let mut blocks = [PRIMARY; N];
+        loop {
+            let mut changed = false;
+            for (heap, &(target, required)) in wants.iter().enumerate() {
+                let grown = blocks.iter().map(|blocks| blocks - PRIMARY).sum::<usize>();
+                let free = slots - grown;
+                let target = growth_target(target, required, PRIMARY, free, grown, N);
+                let added = target.saturating_sub(blocks[heap]);
+                let added =
+                    if added <= free { added } else { free / EXTENSION_BLOCKS * EXTENSION_BLOCKS };
+                blocks[heap] += added;
+                changed |= added != 0;
+            }
+            if !changed {
+                return blocks;
+            }
+        }
+    }
+
+    #[test]
+    fn one_heap_reaches_the_normal_maximum() {
+        assert_eq!(settle([(cfg::TVB_MAX_BLOCKS, PRIMARY)]), [cfg::TVB_MAX_BLOCKS]);
+    }
+
+    #[test]
+    fn two_heavy_heaps_both_reach_the_normal_maximum() {
+        let heavy = (cfg::TVB_MAX_BLOCKS, PRIMARY);
+        assert_eq!(settle([heavy; 2]), [cfg::TVB_MAX_BLOCKS; 2]);
+    }
+
+    #[test]
+    fn three_heavy_heaps_split_the_arenas() {
+        let heavy = (cfg::TVB_MAX_BLOCKS, PRIMARY);
+        let share = PRIMARY + arena_slots() / 3;
+        assert!(share < cfg::TVB_MAX_BLOCKS);
+        assert_eq!(settle([heavy; 3]), [share; 3]);
+    }
+
+    #[test]
+    fn required_blocks_beyond_the_share_are_not_capped() {
+        let share = PRIMARY + arena_slots() / 3;
+        let required = share + 700;
+        let [first, second, third] = settle([
+            (cfg::TVB_MAX_BLOCKS, required),
+            (cfg::TVB_MAX_BLOCKS, PRIMARY),
+            (cfg::TVB_MAX_BLOCKS, PRIMARY),
+        ]);
+        assert_eq!(first, required);
+        assert_eq!(second, share);
+        assert!(third <= share);
+    }
+
+    #[test]
+    fn a_heap_growing_or_shrinking_leaves_the_share_unchanged() {
+        let share = |free, grown, heaps| growth_target(usize::MAX, 0, PRIMARY, free, grown, heaps);
+        assert_eq!(share(4000, 2000, 3), PRIMARY + 2000);
+        assert_eq!(share(3000, 3000, 3), PRIMARY + 2000);
+        assert_eq!(share(6000, 0, 3), PRIMARY + 2000);
+        assert_eq!(share(6000, 0, 0), share(6000, 0, 1));
     }
 }

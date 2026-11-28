@@ -2,7 +2,7 @@
 
 //! Wire geometry for the shared parameter-buffer owner and growth machinery.
 
-use super::{fw, BlockGeometry};
+use super::{cfg, fw, BlockGeometry};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -24,6 +24,18 @@ fn align(value: usize, alignment: usize) -> Result<usize> {
     value.checked_add(alignment - 1).map(|n| n & !(alignment - 1)).ok_or(EOVERFLOW)
 }
 
+/// The share of memory a 128 KiB-block heap may grow to ahead of a render: a 64th. On a
+/// 48 GiB M4 Pro, macOS 26.6.2 runs with `BM+0x80` at 1/60 of memory (6,579 blocks, read live).
+const NORMAL_MEMORY_SHARE: u64 = 64;
+
+/// The normal maximum of a 128 KiB-block heap in blocks (`BM+0x80`, and the cap of its
+/// pre-render growth): a 64th of `memory_bytes`, at least the fixed `NORMAL_MAX_BLOCKS` and
+/// at most what the block table holds, `TVB_MAX_BLOCKS`.
+pub(super) fn neo_normal_blocks(memory_bytes: u64) -> usize {
+    let blocks = memory_bytes / NORMAL_MEMORY_SHARE / cfg::TVB_BLOCK_SIZE as u64;
+    blocks.clamp(fw::NORMAL_MAX_BLOCKS as u64, cfg::TVB_MAX_BLOCKS as u64) as usize
+}
+
 impl Layout {
     pub(super) const NEO: Self = Self {
         pages: fw::PAGE_LIST, page_bytes: fw::PAGE_LIST_BYTES,
@@ -32,6 +44,11 @@ impl Layout {
         scratch_slots: fw::SCRATCH_SLOTS, scratch_stride: fw::SCRATCH_STRIDE as usize,
         metric_stride: 4, normal_blocks: fw::NORMAL_MAX_BLOCKS,
     };
+
+    /// The NEO layout of a device with `memory_bytes` of memory.
+    pub(super) fn neo(memory_bytes: u64) -> Self {
+        Self { normal_blocks: neo_normal_blocks(memory_bytes), ..Self::NEO }
+    }
 
     pub(super) fn m5(geometry: BlockGeometry) -> Result<Self> {
         geometry.validate()?;
@@ -62,7 +79,7 @@ impl Layout {
         if scratch_end > u32::MAX as u64 || discard > u32::MAX as u64 { return Err(EINVAL); }
         let pages = u32::try_from(args.blocks.len().checked_mul(geometry.pages()).ok_or(EOVERFLOW)?)?;
         let maximum = u32::try_from(geometry.capacity.checked_mul(geometry.pages()).ok_or(EOVERFLOW)?)?;
-        let normal = u32::try_from(self.normal_blocks.checked_mul(geometry.pages()).ok_or(EOVERFLOW)?)?;
+        let normal = u32::try_from(args.normal_blocks.checked_mul(geometry.pages()).ok_or(EOVERFLOW)?)?;
         // Every object is unpublished here. Keep all unused words zero on reuse.
         out[..self.bytes].fill(0);
         fn put<const N: usize>(out: &mut [u8], at: usize, value: [u8; N]) -> Result {
@@ -101,5 +118,33 @@ impl Layout {
             (0x64, address(self.counter)?), (0x84, discard),
         ] { put(out, at, value.to_le_bytes())?; }
         Ok(())
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_tvb_limits)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn normal_maximum_is_a_share_of_memory_within_the_block_table() {
+        // 8 GiB and less keep the fixed value: BM+0x80 stays 0x45e * 4 pages.
+        assert_eq!(neo_normal_blocks(8 * GIB), fw::NORMAL_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(7 * GIB) * cfg::TVB_PAGES_PER_BLOCK, 0x45e * 4);
+        assert_eq!(neo_normal_blocks(0), fw::NORMAL_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(9 * GIB), 1152);
+        assert_eq!(neo_normal_blocks(16 * GIB), 2048);
+        assert_eq!(neo_normal_blocks(24 * GIB), 3072);
+        // About 26.2 GiB and more fill the block table, as on a 48 GiB M4 Pro.
+        assert_eq!(neo_normal_blocks(27 * GIB), cfg::TVB_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(46 * GIB), cfg::TVB_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(u64::MAX), cfg::TVB_MAX_BLOCKS);
+    }
+
+    #[test]
+    fn compact_objects_reach_the_growth_arenas_last() {
+        let [first, second] = cfg::tvb_growth_ranges();
+        assert!(cfg::compact_ranges().ends_with(&[first, second]));
     }
 }

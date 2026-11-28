@@ -350,7 +350,7 @@ impl crate::g17::Firmware {
         match committed {
             Ok(()) if busy => manager.note_busy_growth(previous),
             // The prepared growth is dropped by the caller after the device mutex.
-            Err(_) if busy => manager.defer_busy_growth(crate::g17::now_ns()),
+            Err(_) if busy => manager.defer_growth(crate::g17::now_ns()),
             committed => committed?,
         }
         Ok(())
@@ -419,6 +419,7 @@ impl crate::g17::Shared {
                             &dev,
                             &vm,
                             manager.firmware_target(),
+                            0,
                             None,
                         )
                     }
