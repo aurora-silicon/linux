@@ -461,6 +461,9 @@ static unsigned int apple_sart_write_saved(struct apple_sart *sart)
 		sart->ops->set_entry(sart, i, sart->saved[i].flags,
 				     sart->saved[i].paddr >> sart->ops->paddr_shift,
 				     sart->saved[i].size >> sart->ops->size_shift);
+		dev_dbg(sart->dev, "wrote back entry %d: flags %#x [%pa + %#zx]%s\n", i,
+			sart->saved[i].flags, &sart->saved[i].paddr, sart->saved[i].size,
+			test_bit(i, &sart->protected_entries) ? " (boot)" : "");
 		restored++;
 	}
 	return restored;

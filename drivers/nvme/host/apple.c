@@ -291,6 +291,15 @@ struct apple_nvme {
 	bool t8122_warm_sleep;
 	/* A refused warm sleep: the session's buffers are still mapped in the SART. */
 	bool t8122_warm_refused;
+	/*
+	 * After a refused warm sleep ANS comes back on its old session's buffers and
+	 * asks for none: they are kept, allocated and in the SART, until a start in
+	 * which it asks for new ones. Still kept at removal, they are not freed.
+	 */
+	bool shmem_defer;
+	unsigned int shmem_setups;
+	unsigned int n_stale_shmem;
+	struct apple_rtkit_shmem stale_shmem[8];
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -669,14 +678,14 @@ unmap_buffer:
 		bfr->buffer = NULL;
 		return -ENOMEM;
 	}
+	anv->shmem_setups++;
 
 	return 0;
 }
 
-static void apple_nvme_sart_dma_destroy(void *cookie,
-					struct apple_rtkit_shmem *bfr)
+static void apple_nvme_shmem_free(struct apple_nvme *anv,
+				  struct apple_rtkit_shmem *bfr)
 {
-	struct apple_nvme *anv = cookie;
 	struct apple_nvme_rtkit_mapping *mapping = bfr->private;
 
 	if (mapping) {
@@ -688,6 +697,28 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 	}
 	apple_sart_remove_allowed_region(anv->sart, bfr->iova, bfr->size);
 	dma_free_coherent(anv->dev, bfr->size, bfr->buffer, bfr->iova);
+}
+
+static void apple_nvme_sart_dma_destroy(void *cookie,
+					struct apple_rtkit_shmem *bfr)
+{
+	struct apple_nvme *anv = cookie;
+
+	if (!anv->shmem_defer) {
+		apple_nvme_shmem_free(anv, bfr);
+		return;
+	}
+	if (anv->n_stale_shmem < ARRAY_SIZE(anv->stale_shmem))
+		anv->stale_shmem[anv->n_stale_shmem++] = *bfr;
+	else
+		dev_warn(anv->dev, "RTKit buffer %pad+%#zx kept for good: no room to free it later\n",
+			 &bfr->iova, bfr->size);
+}
+
+static void apple_nvme_free_stale_shmem(struct apple_nvme *anv)
+{
+	while (anv->n_stale_shmem)
+		apple_nvme_shmem_free(anv, &anv->stale_shmem[--anv->n_stale_shmem]);
 }
 
 static const struct apple_rtkit_ops apple_nvme_rtkit_ops = {
@@ -1915,6 +1946,7 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 	bool inherited = !anv->owns_rtkit;
 	bool fw_sleep;
 	bool warm_restarted = false;
+	unsigned int setups = anv->shmem_setups;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -2064,21 +2096,13 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		WRITE_ONCE(anv->fw_sleep_restart, false);
 
 		/*
-		 * A refused warm sleep idled ANS but kept its session for the
-		 * restart, so the session's buffers are still in the SART, which
-		 * the idle gated. Ungate it and free them now: the reset below
-		 * can take the SART too (T8122 shares ANS's reset with it), and
-		 * the reinit after it would then read a SART in reset. The rest
-		 * is the start after a firmware sleep (fw_sleep).
+		 * A refused warm sleep idled ANS but kept its session. ANS comes back
+		 * from this start on that session's buffers and asks for none, so they
+		 * stay allocated and in the SART (shmem_defer). Freeing them here would
+		 * also read the SART in the reset below: T8122 shares ANS's reset.
 		 */
-		if (xchg(&anv->t8122_warm_refused, false)) {
-			dev_dbg(anv->dev, "refused warm sleep: SART power %#x, saved %#x\n",
-				readl(anv->mmio_nvme + APPLE_ANS_SART_POWER), anv->sart_power);
-			writel(anv->sart_power, anv->mmio_nvme + APPLE_ANS_SART_POWER);
-			ret = apple_rtkit_reinit(anv->rtk);
-			if (ret)
-				goto out;
-		}
+		if (xchg(&anv->t8122_warm_refused, false))
+			anv->shmem_defer = true;
 
 		ret = reset_control_assert(anv->reset);
 		if (ret)
@@ -2145,6 +2169,11 @@ rtkit_ready:
 	}
 
 	dev_dbg(anv->dev, "ANS booted successfully.");
+
+	/* Kept buffers go once ANS has asked for new ones (see shmem_defer). */
+	anv->shmem_defer = false;
+	if (anv->n_stale_shmem && anv->shmem_setups != setups)
+		apple_nvme_free_stale_shmem(anv);
 
 	/*
 	 * Pre-M4 ANS keeps running across a kexec, and a crashed kernel hands
@@ -2401,6 +2430,8 @@ out:
 	}
 	if (phase_locked)
 		mutex_unlock(&anv->disable_lock);
+	/* ANS's state is unknown: buffers kept for it stay kept (see shmem_defer). */
+	anv->shmem_defer = false;
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	if (apple_nvme_disable(anv, false) || READ_ONCE(anv->removing))
