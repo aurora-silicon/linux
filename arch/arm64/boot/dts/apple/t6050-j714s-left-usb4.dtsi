@@ -6,6 +6,8 @@
  * addresses and interrupts (/arm-io/acio1, acio-cpu1, dart-acio1, apciec1, dart-apciec1). Like
  * the right port's (t6050-max-atc2.dtsi), it is powered per connection and nothing is touched at
  * boot. The router, DART and tunnel tunables are this board's, from its ADT; they equal ATC2's.
+ * The K114s ADT has the same router nodes: t6050-k114-usb.dtsi includes this for the K114s
+ * and K114c.
  */
 
 &ps_atc1_cio {
