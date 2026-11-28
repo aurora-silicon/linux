@@ -656,6 +656,40 @@ static inline struct dma_fence *__dma_fence_unwrap_merge(unsigned int n,
 	return NULL;
 }
 
+static struct dma_fence stub_fence = {
+	.status = 1,
+	.refcount = 1,
+};
+
+static struct dma_fence mock_barrier;
+static struct dma_fence *mock_barrier_children[128];
+static size_t mock_barrier_count;
+static unsigned int mock_barrier_calls;
+
+static inline struct dma_fence *dma_fence_get_stub(void)
+{
+	return dma_fence_get(&stub_fence);
+}
+
+static inline struct dma_fence *asahi_g17_barrier_create(struct dma_fence *const *fences,
+							 size_t count)
+{
+	size_t i;
+
+	if (count == 0)
+		return dma_fence_get_stub();
+	if (count == 1)
+		return dma_fence_get(fences[0]);
+	assert(count <= ARRAY_SIZE(mock_barrier_children));
+	++mock_barrier_calls;
+	mock_barrier_count = count;
+	for (i = 0; i < count; ++i)
+		mock_barrier_children[i] = fences[i];
+	mock_barrier.status = 0;
+	mock_barrier.refcount = 1;
+	return &mock_barrier;
+}
+
 static inline bool asahi_g17_is_scope(struct dma_fence *f)
 {
 	(void)f;
@@ -743,7 +777,90 @@ int main(void)
 		assert(leaves[i].refcount == 1);
 		assert(chains[i].refcount == 1);
 	}
-	printf("sync_input C coalescing tests passed (256-hop chain -> 2 leaves, error preserved)\n");
+
+	/* Exercise asahi_g17_merge_fences fast paths, dedup, and error preservation. */
+	{
+		struct dma_fence f[10];
+		struct dma_fence *in[12];
+		struct dma_fence *m;
+
+		memset(f, 0, sizeof(f));
+		for (i = 0; i < 10; ++i)
+			f[i].refcount = 1;
+
+		/* All signalled cleanly -> stub, no barrier allocated. */
+		for (i = 0; i < 4; ++i) {
+			f[i].context = 100 + i;
+			f[i].seqno = 1;
+			f[i].status = 1;
+			in[i] = &f[i];
+		}
+		mock_barrier_calls = 0;
+		m = asahi_g17_merge_fences(in, 4);
+		assert(m == &stub_fence);
+		assert(mock_barrier_calls == 0);
+		dma_fence_put(m);
+
+		/* Multiple unsignalled fences on one context coalesce to latest without barrier. */
+		f[0].context = 200; f[0].seqno = 3; f[0].status = 0;
+		f[1].context = 200; f[1].seqno = 9; f[1].status = 0;
+		f[2].context = 200; f[2].seqno = 5; f[2].status = 0;
+		f[3].context = 201; f[3].seqno = 1; f[3].status = 1;
+		in[0] = &f[0]; in[1] = &f[1]; in[2] = &f[2]; in[3] = &f[3]; in[4] = &f[1];
+		m = asahi_g17_merge_fences(in, 5);
+		assert(m == &f[1]);
+		assert(mock_barrier_calls == 0);
+		dma_fence_put(m);
+
+		/* Already-signalled error fence alone -> preserved directly, never dropped. */
+		f[4].context = 300; f[4].seqno = 1; f[4].status = -5;
+		in[0] = &f[3]; in[1] = &f[4];
+		m = asahi_g17_merge_fences(in, 2);
+		assert(m == &f[4]);
+		assert(mock_barrier_calls == 0);
+		dma_fence_put(m);
+
+		/* Already-signalled error fence + unsignalled fences -> barrier includes error + latest per context. */
+		f[5].context = 400; f[5].seqno = 2; f[5].status = 0;
+		f[6].context = 401; f[6].seqno = 7; f[6].status = 0;
+		f[7].context = 401; f[7].seqno = 4; f[7].status = 0;
+		in[0] = &f[3]; in[1] = &f[5]; in[2] = &f[4]; in[3] = &f[6]; in[4] = &f[7];
+		m = asahi_g17_merge_fences(in, 5);
+		assert(m == &mock_barrier);
+		assert(mock_barrier_calls == 1);
+		assert(mock_barrier_count == 3);
+		assert(mock_barrier_children[0] == &f[5]);
+		assert(mock_barrier_children[1] == &f[6]);
+		assert(mock_barrier_children[2] == &f[4]);
+		dma_fence_put(m);
+
+		/* Heap-allocated (>64) path with distinct contexts + adjacent duplicate. */
+		{
+			struct dma_fence many[70];
+			struct dma_fence *many_in[71];
+			int k;
+
+			memset(many, 0, sizeof(many));
+			for (k = 0; k < 70; ++k) {
+				many[k].context = 1000 + (uint64_t)k;
+				many[k].seqno = 1;
+				many[k].status = 0;
+				many[k].refcount = 1;
+				many_in[k] = &many[k];
+			}
+			many_in[70] = &many[69];
+			m = asahi_g17_merge_fences(many_in, 71);
+			assert(m == &mock_barrier);
+			assert(mock_barrier_calls == 2);
+			assert(mock_barrier_count == 70);
+			dma_fence_put(m);
+		}
+
+		for (i = 0; i < 10; ++i)
+			assert(f[i].refcount == 1);
+		assert(stub_fence.refcount == 1);
+	}
+	printf("sync_input C coalescing and merge tests passed\n");
 	return 0;
 }
 '''

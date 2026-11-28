@@ -5,6 +5,7 @@
 #include <linux/irq_work.h>
 #include <linux/irqflags.h>
 #include <linux/llist.h>
+#include <linux/overflow.h>
 #include <linux/percpu.h>
 #include <linux/preempt.h>
 #include <linux/slab.h>
@@ -23,6 +24,12 @@ int asahi_g17_completion_fence_status(struct dma_fence *fence)
 	return dma_fence_get_status(fence);
 }
 
+struct asahi_g17_deferred {
+	struct llist_node ready;
+	struct irq_work work;
+	void (*complete)(struct asahi_g17_deferred *node);
+};
+
 struct asahi_g17_scope;
 struct asahi_g17_scope_callback {
 	struct dma_fence_cb callback;
@@ -36,8 +43,7 @@ struct asahi_g17_scope {
 	bool compute_only;
 	struct dma_fence *children[2];
 	struct asahi_g17_scope_callback callbacks[2];
-	struct irq_work work;
-	struct llist_node ready;
+	struct asahi_g17_deferred deferred;
 	/* Identifies the exact anchor point this scope replaced. */
 	u64 anchor_context;
 	u64 anchor_point;
@@ -132,8 +138,10 @@ static void scope_release_completed(struct asahi_g17_scope *scope)
 	dma_fence_put(&scope->base);
 }
 
-static void scope_complete(struct asahi_g17_scope *scope)
+static void scope_complete_node(struct asahi_g17_deferred *d)
 {
+	struct asahi_g17_scope *scope =
+		container_of(d, struct asahi_g17_scope, deferred);
 	cmpxchg(&scope->base.error, 1, 0);
 	dma_fence_signal(&scope->base);
 	scope_unwait(scope);
@@ -142,7 +150,10 @@ static void scope_complete(struct asahi_g17_scope *scope)
 
 static void scope_work(struct irq_work *work)
 {
-	struct asahi_g17_scope *scope = container_of(work, struct asahi_g17_scope, work);
+	struct asahi_g17_deferred *d =
+		container_of(work, struct asahi_g17_deferred, work);
+	struct asahi_g17_scope *scope =
+		container_of(d, struct asahi_g17_scope, deferred);
 	cmpxchg(&scope->base.error, 1, 0);
 	asahi_g17_signal_fence(&scope->base);
 	scope_unwait(scope);
@@ -153,10 +164,10 @@ static void scope_defer_list(struct llist_node *nodes)
 {
 	struct llist_node *node, *next;
 	llist_for_each_safe(node, next, nodes) {
-		struct asahi_g17_scope *scope =
-			container_of(node, struct asahi_g17_scope, ready);
+		struct asahi_g17_deferred *d =
+			container_of(node, struct asahi_g17_deferred, ready);
 		/* Transfer the ready-list reference to the irq_work callback. */
-		irq_work_queue(&scope->work);
+		irq_work_queue(&d->work);
 	}
 }
 
@@ -168,8 +179,9 @@ void asahi_g17_signal_fence(struct dma_fence *fence)
 	unsigned int completed = 0;
 
 	/* Fence callbacks are atomic. Keep the local ready list pinned while
-	 * signaling, then finish ready scopes after the source fence is unlocked.
-	 * New ready scopes append to this list instead of recursing or sending IPIs.
+	 * signaling, then finish ready scopes/barriers after the source fence is
+	 * unlocked. New ready nodes append to this list instead of recursing or
+	 * sending IPIs.
 	 */
 	preempt_disable();
 	if (__this_cpu_read(active_scopes)) {
@@ -189,6 +201,7 @@ void asahi_g17_signal_fence(struct dma_fence *fence)
 		if (!nodes)
 			break;
 		llist_for_each_safe(node, next, nodes) {
+			struct asahi_g17_deferred *d;
 			if (completed == SCOPE_ATOMIC_BATCH) {
 				struct llist_node *more;
 				local_irq_save(flags);
@@ -200,7 +213,8 @@ void asahi_g17_signal_fence(struct dma_fence *fence)
 				scope_defer_list(more);
 				return;
 			}
-			scope_complete(container_of(node, struct asahi_g17_scope, ready));
+			d = container_of(node, struct asahi_g17_deferred, ready);
+			d->complete(d);
 			++completed;
 		}
 	}
@@ -217,11 +231,11 @@ static void scope_arrived(struct asahi_g17_scope *scope, int error)
 		preempt_disable();
 		ready = __this_cpu_read(active_scopes);
 		if (ready)
-			llist_add(&scope->ready, ready);
+			llist_add(&scope->deferred.ready, ready);
 		preempt_enable();
 		/* Foreign fence signalers have no driver completion pass to drain us. */
 		if (!ready)
-			irq_work_queue(&scope->work);
+			irq_work_queue(&scope->deferred.work);
 	}
 }
 
@@ -325,7 +339,8 @@ struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
 		return NULL;
 	}
 	dma_fence_init64(&scope->base, &scope_ops, NULL, context, point);
-	init_irq_work(&scope->work, scope_work);
+	init_irq_work(&scope->deferred.work, scope_work);
+	scope->deferred.complete = scope_complete_node;
 	scope->compute_only = compute_only;
 	scope->children[0] = parent;
 	scope->children[1] = dma_fence_get(submitted);
@@ -355,4 +370,220 @@ struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
 	}
 	scope_arrived(scope, 0);
 	return &scope->base;
+}
+
+/*
+ * Variable-fan-in barrier fence that signals once every child has signalled,
+ * joining the per-CPU active_scopes drain list when triggered from
+ * asahi_g17_signal_fence() so completion runs inline without queueing irq_work.
+ */
+struct asahi_g17_barrier;
+struct asahi_g17_barrier_entry {
+	struct dma_fence *child;
+	struct dma_fence_cb cb;
+	struct asahi_g17_barrier *barrier;
+};
+
+struct asahi_g17_barrier {
+	struct dma_fence base;
+	atomic_t pending;
+	struct asahi_g17_deferred deferred;
+	unsigned int num_children;
+	struct asahi_g17_barrier_entry entries[];
+};
+
+static struct asahi_g17_barrier *to_barrier(struct dma_fence *fence)
+{
+	return container_of(fence, struct asahi_g17_barrier, base);
+}
+
+static const char *barrier_driver_name(struct dma_fence *fence)
+{
+	return "aurora";
+}
+
+static const char *barrier_timeline_name(struct dma_fence *fence)
+{
+	return "g17-dep-barrier";
+}
+
+static bool barrier_signaled(struct dma_fence *fence)
+{
+	struct asahi_g17_barrier *b = to_barrier(fence);
+
+	if (atomic_read_acquire(&b->pending))
+		return false;
+	cmpxchg(&fence->error, 1, 0);
+	return true;
+}
+
+static bool barrier_enable_signaling(struct dma_fence *fence)
+{
+	return !barrier_signaled(fence);
+}
+
+static void barrier_drop_children(struct asahi_g17_barrier *b)
+{
+	struct dma_fence *batch[16];
+	unsigned long flags;
+	unsigned int i;
+
+	for (i = 0; i < b->num_children; ) {
+		unsigned int n = 0;
+
+		spin_lock_irqsave(&b->base.inline_lock, flags);
+		while (i < b->num_children && n < ARRAY_SIZE(batch)) {
+			batch[n] = b->entries[i].child;
+			b->entries[i].child = NULL;
+			if (batch[n])
+				++n;
+			++i;
+		}
+		spin_unlock_irqrestore(&b->base.inline_lock, flags);
+		while (n)
+			dma_fence_put(batch[--n]);
+	}
+}
+
+static void barrier_complete_node(struct asahi_g17_deferred *d)
+{
+	struct asahi_g17_barrier *b =
+		container_of(d, struct asahi_g17_barrier, deferred);
+	cmpxchg(&b->base.error, 1, 0);
+	dma_fence_signal(&b->base);
+	barrier_drop_children(b);
+	dma_fence_put(&b->base);
+}
+
+static void barrier_work(struct irq_work *work)
+{
+	struct asahi_g17_deferred *d =
+		container_of(work, struct asahi_g17_deferred, work);
+	struct asahi_g17_barrier *b =
+		container_of(d, struct asahi_g17_barrier, deferred);
+	cmpxchg(&b->base.error, 1, 0);
+	asahi_g17_signal_fence(&b->base);
+	barrier_drop_children(b);
+	dma_fence_put(&b->base);
+}
+
+static void barrier_arrived(struct asahi_g17_barrier *b, int error)
+{
+	if (error < 0)
+		cmpxchg(&b->base.error, 1, error);
+	if (atomic_dec_and_test(&b->pending)) {
+		struct llist_head *ready;
+		dma_fence_get(&b->base);
+		preempt_disable();
+		ready = __this_cpu_read(active_scopes);
+		if (ready)
+			llist_add(&b->deferred.ready, ready);
+		preempt_enable();
+		if (!ready)
+			irq_work_queue(&b->deferred.work);
+	}
+}
+
+static void barrier_callback(struct dma_fence *child, struct dma_fence_cb *callback)
+{
+	struct asahi_g17_barrier_entry *entry =
+		container_of(callback, typeof(*entry), cb);
+	struct asahi_g17_barrier *b = entry->barrier;
+	barrier_arrived(b, child->error);
+	dma_fence_put(&b->base);
+}
+
+static void barrier_release(struct dma_fence *fence)
+{
+	struct asahi_g17_barrier *b = to_barrier(fence);
+	unsigned int i;
+
+	for (i = 0; i < b->num_children; ++i)
+		dma_fence_put(b->entries[i].child);
+	dma_fence_free(fence);
+}
+
+static void barrier_set_deadline(struct dma_fence *fence, ktime_t deadline)
+{
+	struct asahi_g17_barrier *b = to_barrier(fence);
+	struct dma_fence *batch[16];
+	unsigned long flags;
+	unsigned int i;
+
+	if (dma_fence_is_signaled(fence))
+		return;
+	for (i = 0; i < b->num_children; ) {
+		unsigned int n = 0;
+
+		spin_lock_irqsave(&fence->inline_lock, flags);
+		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
+			spin_unlock_irqrestore(&fence->inline_lock, flags);
+			return;
+		}
+		while (i < b->num_children && n < ARRAY_SIZE(batch)) {
+			if (b->entries[i].child)
+				batch[n++] = dma_fence_get(b->entries[i].child);
+			++i;
+		}
+		spin_unlock_irqrestore(&fence->inline_lock, flags);
+		while (n) {
+			struct dma_fence *c = batch[--n];
+			dma_fence_set_deadline(c, deadline);
+			dma_fence_put(c);
+		}
+	}
+}
+
+static const struct dma_fence_ops barrier_ops = {
+	.get_driver_name = barrier_driver_name,
+	.get_timeline_name = barrier_timeline_name,
+	.enable_signaling = barrier_enable_signaling,
+	.signaled = barrier_signaled,
+	.release = barrier_release,
+	.set_deadline = barrier_set_deadline,
+};
+
+struct dma_fence *asahi_g17_barrier_create(struct dma_fence *const *fences,
+					   size_t count)
+{
+	struct asahi_g17_barrier *b;
+	unsigned int i;
+
+	if (count == 0)
+		return dma_fence_get_stub();
+	if (count == 1)
+		return dma_fence_get(fences[0]);
+	if (count > (size_t)INT_MAX - 1)
+		return NULL;
+
+	b = kzalloc(struct_size(b, entries, count), GFP_KERNEL);
+	if (!b)
+		return NULL;
+
+	b->num_children = count;
+	dma_fence_init64(&b->base, &barrier_ops, NULL,
+			 dma_fence_context_alloc(1), 1);
+	init_irq_work(&b->deferred.work, barrier_work);
+	b->deferred.complete = barrier_complete_node;
+	/* Constructor guard prevents completion while callbacks are being installed. */
+	atomic_set(&b->pending, (int)count + 1);
+	b->base.error = 1;
+
+	for (i = 0; i < count; ++i) {
+		struct dma_fence *child = dma_fence_get(fences[i]);
+		b->entries[i].child = child;
+		b->entries[i].barrier = b;
+		dma_fence_get(&b->base);
+		if (dma_fence_add_callback(child, &b->entries[i].cb, barrier_callback)) {
+			barrier_arrived(b, child->error);
+			dma_fence_put(&b->base);
+		}
+	}
+	/* Release constructor guard inline without irq_work if all arrived. */
+	if (atomic_dec_and_test(&b->pending)) {
+		cmpxchg(&b->base.error, 1, 0);
+		dma_fence_signal(&b->base);
+		barrier_drop_children(b);
+	}
+	return &b->base;
 }
