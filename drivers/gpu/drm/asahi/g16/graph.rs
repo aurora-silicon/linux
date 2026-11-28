@@ -134,22 +134,33 @@ struct QueueSession {
     qinfo: Arc<FwObject>,
     qstate: Arc<FwObject>,
     user_stamp: Arc<FwObject>,
-    fw_stamp: Arc<FwObject>,
+    fw_stamp: Option<Arc<FwObject>>,
 }
 impl QueueSession {
     fn new(o: &mut Objects) -> Result<Self> {
+        Self::new_with(o, Some(Class::Shared))
+    }
+    fn new_with(o: &mut Objects, fw_stamp_class: Option<Class>) -> Result<Self> {
         Ok(Self {
             qinfo: alloc(o, qinfo::SIZE, graph_fw(), None, 0, false)?,
             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
-            fw_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
+            fw_stamp: match fw_stamp_class {
+                Some(class) => Some(alloc(o, 8, class, None, 0, false)?),
+                None => None,
+            },
         })
     }
-    /// Completes the queue with its firmware-cached work ring from a device-lifetime
-    /// [`Factory::persistent_objects`] allocator. The host only writes 64-bit work/barrier VAs
-    /// into the ring before advancing the uncached `qstate::WRITE` producer and never reads
-    /// back firmware writes, matching macOS 26B123's `0x443` command-ring mapping.
+    /// Completes the queue with its firmware-cached work ring (and, when deferred from
+    /// [`Self::new_with`], its firmware-cached `fw_stamp`) from a device-lifetime
+    /// [`Factory::persistent_objects`] allocator. The host writes 64-bit work/barrier VAs into
+    /// the ring before advancing the uncached `qstate::WRITE` producer and never reads back
+    /// firmware writes to the ring, matching macOS 26B123's `0x443` command-ring mapping.
     fn finish(self, rings: &mut Objects) -> Result<QueueObjects> {
+        let fw_stamp = match self.fw_stamp {
+            Some(stamp) => stamp,
+            None => alloc(rings, 8, Class::FwCoherent, None, 0, false)?,
+        };
         Ok(QueueObjects {
             qinfo: self.qinfo,
             qstate: self.qstate,
@@ -162,7 +173,7 @@ impl QueueSession {
                 false,
             )?,
             user_stamp: self.user_stamp,
-            fw_stamp: self.fw_stamp,
+            fw_stamp,
         })
     }
 }
@@ -297,7 +308,7 @@ impl RenderGraphSession {
     fn new(o: &mut Objects) -> Result<Self> {
         Ok(Self {
             ta: QueueSession::new(o)?,
-            fs: QueueSession::new(o)?,
+            fs: QueueSession::new_with(o, None)?,
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [

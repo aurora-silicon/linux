@@ -908,7 +908,7 @@ impl Firmware {
     pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 2 + sizes::COMPUTE_PIPES]> {
         let mut stage = [0u32; 2 + sizes::COMPUTE_PIPES];
         stage[0] = self.graph.render.fw_stamp[0].r32(0)?;
-        stage[1] = self.graph.render.fw_stamp[1].r32(0)?;
+        stage[1] = self.graph.render.notifier.r32(notifier_page::FS_STAMP)?;
         for (p, compute) in self.graph.compute.iter().enumerate() {
             stage[2 + p] = compute.fw_stamp.r32(0)?;
         }

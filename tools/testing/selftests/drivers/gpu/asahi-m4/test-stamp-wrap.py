@@ -29,13 +29,14 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
 mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; } }
-struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
-impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
+struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>,syncs:Cell<u32>}
+impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0),syncs:Cell::new(0)}}}
 impl Object {
+    fn sync_for_cpu(&self,_off:usize,_len:usize)->Result{self.syncs.set(self.syncs.get()+1);Ok(())}
     fn r32(&self,off:usize)->Result<u32>{self.reads.set(self.reads.get()+1);Ok(*self.cells.get(&off).unwrap_or(&0) as u32)}
     fn r64(&self,off:usize)->Result<u64>{self.reads.set(self.reads.get()+1);if self.unstable{return Err(EAGAIN)}Ok(*self.cells.get(&off).unwrap_or(&0))}
     fn set(&mut self,off:usize,v:u64){self.cells.insert(off,v);}
-    fn reset_reads(&self){self.reads.set(0);}
+    fn reset_reads(&self){self.reads.set(0);self.syncs.set(0);}
 }
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
 mod notifier_page {pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
@@ -117,12 +118,14 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         f.queue_passed=true;
         if render {
-            f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(n-1)));
+            f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n-1)));
             assert_eq!(f.retired(),Ok(Retirement::Pending));
-            f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(n)));
-            f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+            f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n)));
+            f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n-1)));
             assert_eq!(f.retired(),Ok(Retirement::Pending));
-            f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+            f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n)));
+            assert_eq!(f.graph.render.fw_stamp[0].reads.get(),0);
+            assert_eq!(f.graph.render.fw_stamp[1].reads.get(),0);
             f.engine.flights[0].job.resources.pools.full=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         }else{
             f.engine.flights[0].job.resources.compute[0].its.set(8,0);
@@ -165,10 +168,13 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.engine.flights[0].job.resources.pools.completed=4;
         assert_eq!(f.retired(),Ok(Retirement::Full));
         // Unreached FS stamp keeps it pending.
-        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+        f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+        f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n)));
+        f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
         assert_eq!(f.retired(),Ok(Retirement::Full));
+        assert_eq!(f.graph.render.fw_stamp[0].reads.get(),0);
+        assert_eq!(f.graph.render.fw_stamp[1].reads.get(),0);
         // Unreached UMA completion keeps it pending.
         f.engine.flights[0].job.resources.pools.completed=1;
         assert_eq!(f.retired(),Ok(Retirement::Pending));
@@ -199,12 +205,12 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(20)));
     f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(20)));
     // Keep render FS stamp unreached so render at index 0 stays pending.
-    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(9)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
     f.engine.flights.remove(1);
     assert_eq!(f.retired_flight(),Ok(None));
     // Now finish render: render retires cleanly with exact single-class receipt.
-    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(10)));
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(10)));
     assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
     // Reverse order: Compute at index 0 (pending) + Render at index 1 (complete).
     let mut f2=firmware(false,30);
@@ -261,14 +267,15 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(fr.graph.compute[1].notifier.reads.get(),0);
     // In-progress render (TA done, FS still running) fails fast on FS stamp without reading TA or scene.
     let mut fp=firmware(true,7);
-    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(6)));
-    assert_eq!(fp.retired_flight(),Ok(None));
-    assert_eq!(fp.graph.render.fw_stamp[1].reads.get(),1);
-    assert_eq!(fp.graph.render.fw_stamp[0].reads.get(),0);
-    assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
-    // Unsettled notifier skips scene WC timestamp reads.
-    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(7)));
     fp.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
+    assert_eq!(fp.retired_flight(),Ok(None));
+    assert_eq!(fp.graph.render.notifier.reads.get(),1);
+    assert_eq!(fp.graph.render.fw_stamp[0].reads.get(),0);
+    assert_eq!(fp.graph.render.fw_stamp[1].reads.get(),0);
+    assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
+    // Unsettled notifier context skips scene WC timestamp reads.
+    fp.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(7)));
+    fp.graph.render.notifier.set(notifier::CONTEXT,99);
     assert_eq!(fp.retired_flight(),Ok(None));
     assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
     // Mixed flight pending is polled once, not twice.
@@ -277,7 +284,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fm.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(8)));
     assert_eq!(fm.retired_flight(),Ok(None));
     assert_eq!(fm.graph.compute[0].fw_stamp.reads.get(),1);
-    assert_eq!(fm.graph.render.fw_stamp[1].reads.get(),0);
+    assert_eq!(fm.graph.render.notifier.reads.get(),0);
     // Pending compute class is not re-polled while retiring a burst of render flights.
     let mut fmix=firmware(false,30);
     let r1=firmware(true,40).engine.flights.remove(0);
@@ -333,6 +340,128 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS));
     assert_eq!(f.retired(),Ok(Retirement::Aborted));
     assert!(f.engine.flights[0].doomed);
+}
+#[test]fn suspect_render_with_passed_queues_and_stale_fs_notifier_aborts_after_grace(){
+    // Single suspect render: both stage stamps and queue receipts passed, FS notifier still stale.
+    let mut f=firmware(true,23);
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=10_000_000;
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(22)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(f.retired(),Ok(Retirement::Pending));
+    assert!(!f.engine.flights[0].doomed);
+    assert_eq!(f.engine.flights[0].gate_passed_ns,Some(100_000_000));
+    assert_eq!(f.engine.flights[0].unsettled_polls,1);
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS - 1));
+    assert_eq!(f.retired(),Ok(Retirement::Pending));
+    assert!(!f.engine.flights[0].doomed);
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS));
+    assert_eq!(f.retired(),Ok(Retirement::Aborted));
+    assert!(f.engine.flights[0].doomed);
+
+    // Same suspect render when queues have NOT passed stays Pending and never starts grace timer.
+    let mut q=firmware(true,24);
+    q.engine.flights[0].recovery_suspect=true;
+    q.engine.flights[0].recovery_started_ns=10_000_000;
+    q.queue_passed=false;
+    q.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(23)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(q.retired(),Ok(Retirement::Pending));
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS * 2));
+    assert_eq!(q.retired(),Ok(Retirement::Pending));
+    assert!(!q.engine.flights[0].doomed);
+    assert_eq!(q.engine.flights[0].gate_passed_ns,None);
+    assert_eq!(q.engine.flights[0].unsettled_polls,0);
+
+    // Innocent suspect render whose stale FS notifier settles before ABORT_GRACE_NS retires Full.
+    let mut s=firmware(true,25);
+    s.engine.flights[0].recovery_suspect=true;
+    s.engine.flights[0].recovery_started_ns=10_000_000;
+    s.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(24)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(s.retired(),Ok(Retirement::Pending));
+    assert_eq!(s.engine.flights[0].gate_passed_ns,Some(100_000_000));
+    CLOCK.with(|c| c.set(100_500_000));
+    s.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(25)));
+    assert_eq!(s.retired(),Ok(Retirement::Full));
+    assert!(!s.engine.flights[0].doomed);
+
+    // Pipelined suspect render (render_behind=true) with passed queues and stale FS notifier aborts.
+    let mut b=firmware(true,26);
+    b.engine.flights[0].recovery_suspect=true;
+    b.engine.flights[0].recovery_started_ns=10_000_000;
+    let mut later=firmware(true,27).engine.flights.remove(0);
+    later.uma_submitted=4;
+    b.engine.flights.push(later);
+    b.engine.ta_target=encode::stamp(27);
+    b.engine.fs_target=encode::stamp(27);
+    b.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(26)));
+    b.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(26)));
+    b.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(26)));
+    b.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(25)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(b.retired(),Ok(Retirement::Pending));
+    assert_eq!(b.engine.flights[0].gate_passed_ns,Some(100_000_000));
+    assert!(b.graph.render.fw_stamp[1].syncs.get()>=1);
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS));
+    assert_eq!(b.retired(),Ok(Retirement::Aborted));
+    assert!(b.engine.flights[0].doomed);
+}
+#[test]fn suspect_render_with_unreached_fs_stage_and_stale_notifier_stays_pending(){
+    // Exact (!render_behind) suspect render: queues passed, BOTH FS stage and FS notifier are
+    // one target behind -> must stay Pending across 2 polls 20 ms apart without arming abort grace.
+    let mut f=firmware(true,28);
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=10_000_000;
+    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(27)));
+    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(27)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(f.retired(),Ok(Retirement::Pending));
+    assert!(!f.engine.flights[0].doomed);
+    assert_eq!(f.engine.flights[0].gate_passed_ns,None);
+    assert_eq!(f.engine.flights[0].unsettled_polls,0);
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS));
+    assert_eq!(f.retired(),Ok(Retirement::Pending));
+    assert!(!f.engine.flights[0].doomed);
+    assert_eq!(f.engine.flights[0].gate_passed_ns,None);
+    assert_eq!(f.engine.flights[0].unsettled_polls,0);
+    assert!(f.graph.render.fw_stamp[1].syncs.get()>=2);
+
+    // Pipelined (render_behind=true) counterpart: queues passed, BOTH FS stage and FS notifier
+    // one target behind -> must stay Pending across 2 polls 20 ms apart.
+    let mut b=firmware(true,29);
+    b.engine.flights[0].recovery_suspect=true;
+    b.engine.flights[0].recovery_started_ns=10_000_000;
+    let mut later=firmware(true,30).engine.flights.remove(0);
+    later.uma_submitted=4;
+    b.engine.flights.push(later);
+    b.engine.ta_target=encode::stamp(30);
+    b.engine.fs_target=encode::stamp(30);
+    b.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(29)));
+    b.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(28)));
+    b.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(29)));
+    b.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(28)));
+    CLOCK.with(|c| c.set(100_000_000));
+    assert_eq!(b.retired(),Ok(Retirement::Pending));
+    assert_eq!(b.engine.flights[0].gate_passed_ns,None);
+    CLOCK.with(|c| c.set(100_000_000 + ABORT_GRACE_NS));
+    assert_eq!(b.retired(),Ok(Retirement::Pending));
+    assert!(!b.engine.flights[0].doomed);
+    assert_eq!(b.engine.flights[0].gate_passed_ns,None);
+    assert_eq!(b.engine.flights[0].unsettled_polls,0);
+    assert!(b.graph.render.fw_stamp[1].syncs.get()>=2);
+
+    // Innocent suspect render whose uncached TA/FS notifiers already settled retires Full
+    // immediately without reading or syncing fw_stamp even if DRAM fw_stamp lags behind ASC cache.
+    let mut ok=firmware(true,31);
+    ok.engine.flights[0].recovery_suspect=true;
+    ok.engine.flights[0].recovery_started_ns=10_000_000;
+    ok.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(30)));
+    ok.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(30)));
+    assert_eq!(ok.retired(),Ok(Retirement::Full));
+    assert!(!ok.engine.flights[0].doomed);
+    assert_eq!(ok.graph.render.fw_stamp[0].syncs.get(),0);
+    assert_eq!(ok.graph.render.fw_stamp[1].syncs.get(),0);
 }
 #[test]fn same_tick_stage_timestamps_retire_full_while_zero_or_reversed_stay_pending(){
     // 24 MHz (41.67 ns) stage timestamps can legitimately record end == start on tiny draws

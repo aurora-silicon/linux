@@ -755,13 +755,20 @@ pub mod g16 {
         let cg0 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
         let cg1 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
         let rg = RenderGraph::new(&mut session, &mut rings, ctx).unwrap();
-        let all_rings = [&cg0.ring, &cg1.ring, &rg.ring[0], &rg.ring[1]];
-        assert_eq!(rings.objects.len(), 4);
-        for ring in all_rings {
-            assert_eq!(ring.class, Class::FwCoherent);
-            assert_eq!((ring.gva, ring.client_leaf, ring.lower_gva), (None, None, None));
-            assert!(rings.objects.iter().any(|o| crate::sync::Arc::ptr_eq(o, ring)));
-            assert!(session.objects.iter().all(|o| !crate::sync::Arc::ptr_eq(o, ring)));
+        let all_persistent = [
+            &cg0.ring,
+            &cg1.ring,
+            &rg.ring[0],
+            &rg.ring[1],
+            &rg.fw_stamp[1],
+        ];
+        assert_eq!(rings.objects.len(), 5);
+        assert_eq!(rg.fw_stamp[0].class, Class::Shared);
+        for obj in all_persistent {
+            assert_eq!(obj.class, Class::FwCoherent);
+            assert_eq!((obj.gva, obj.client_leaf, obj.lower_gva), (None, None, None));
+            assert!(rings.objects.iter().any(|o| crate::sync::Arc::ptr_eq(o, obj)));
+            assert!(session.objects.iter().all(|o| !crate::sync::Arc::ptr_eq(o, obj)));
         }
         drop(cb);
         drop(cc);
@@ -2370,7 +2377,10 @@ pub mod g16 {
             assert_eq!(r.qstate[stage].class, Class::Fw);
             assert_eq!(r.ring[stage].class, Class::FwCoherent);
             assert_eq!(r.user_stamp[stage].class, Class::Shared);
-            assert_eq!(r.fw_stamp[stage].class, Class::Shared);
+            assert_eq!(
+                r.fw_stamp[stage].class,
+                if stage == 0 { Class::Shared } else { Class::FwCoherent }
+            );
         }
         assert_eq!(r.sched_ctx.class, Class::FwCoherent);
         assert_eq!(r.notifier.class, Class::Fw);
