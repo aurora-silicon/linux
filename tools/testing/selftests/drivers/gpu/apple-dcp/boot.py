@@ -139,7 +139,11 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *out,
 { (void)rtk; assert(off + len <= b->size); copies++; memcpy(out, b->buffer+off, len); }
 static int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 msg, void *c, bool atomic)
 { (void)rtk; assert(ep==2 && msg==0 && c==NULL && !atomic); acks++; return 0; }
-''' + helper + '\n' + block(dcp, 'static bool dcp_rtk_syslog_is_debug(') + r'''
+typedef uint32_t u32;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+struct apple_dcp { struct { bool only_120hz_modes; } hw; u32 boot_rate; };
+''' + helper + '\n' + block(dcp, 'static void dcp_rtk_syslog_boot_rate(') + '\n' + block(dcp, 'static bool dcp_rtk_syslog_is_debug(') + r'''
 static bool policy(void *cookie, const char *context, const char *message)
 { calls++; return dcp_rtk_syslog_is_debug(cookie, context, message); }
 ''' + block(source, 'static bool should_crop_syslog_char(') + '\n' + block(source, 'static void apple_rtkit_syslog_rx_log(') + r'''
@@ -154,7 +158,8 @@ int main(void)
 {
     unsigned char ring[288]; char decoded[256];
     struct apple_rtkit_ops ops={.syslog_is_debug=policy};
-    struct apple_rtkit rtk={.ops=&ops, .syslog_msg_buffer=decoded,
+    struct apple_dcp dcp={.hw={.only_120hz_modes=true}};
+    struct apple_rtkit rtk={.ops=&ops, .cookie=&dcp, .syslog_msg_buffer=decoded,
         .syslog_msg_size=256, .syslog_n_entries=1,
         .syslog_buffer={.size=sizeof(ring),.buffer=ring}};
     const char *messages[]={
@@ -191,6 +196,22 @@ int main(void)
     reset(); apple_rtkit_syslog_rx_log(&rtk,0);
     assert(warnings==1 && !calls && !copies && acks==1);
     puts("PASS default info, trimming, inherited and invalid records retain transport behavior");
+    rtk.syslog_n_entries=1;
+    /* The rate iBoot left the T6050 panel at: the first one counts, the line stays at info. */
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 60");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==60 && infos==1 && !debugs && acks==1);
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 120");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==60 && infos==1);
+    dcp.boot_rate=0; dcp.hw.only_120hz_modes=false;
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==0 && infos==1);
+    dcp.hw.only_120hz_modes=true;
+    record(&rtk,"PBlock_PDC_v17.cpp:1954","IOMFB update_rr_index syncrate 7");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(dcp.boot_rate==0 && infos==1);
+    puts("PASS T6050 boot rate: first rate latched, later and out-of-range rates ignored, other panels untouched");
     return 0;
 }
 '''

@@ -34,13 +34,13 @@ typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64
 typedef unsigned short umode_t;
 typedef uint64_t __u64; typedef uint32_t __u32; typedef uint16_t __u16; typedef uint8_t __u8;
 typedef int64_t __s64; typedef int32_t __s32;
+typedef struct { int counter; } atomic_t;
 #define __user
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 #define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
 ''',
     'linux/atomic.h': r'''
 #include <linux/types.h>
-typedef struct { int counter; } atomic_t;
 #define atomic_read(v) __atomic_load_n(&(v)->counter, __ATOMIC_SEQ_CST)
 #define atomic_set(v, i) __atomic_store_n(&(v)->counter, (i), __ATOMIC_SEQ_CST)
 static inline int atomic_cmpxchg(atomic_t *v, int old, int new_)

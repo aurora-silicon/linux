@@ -209,6 +209,14 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_PNON_FAILED		3
 #define SEP_DIAG_PNON_DIGEST_LEN	48
 
+/*
+ * Mirrored by diag.rs (Trusted). The word keeps the state in its low byte and,
+ * for SEP_DIAG_TRUSTED_REFUSED, the enclave's status in the next one.
+ */
+#define SEP_DIAG_TRUSTED_UNKNOWN	0
+#define SEP_DIAG_TRUSTED_READY		1
+#define SEP_DIAG_TRUSTED_REFUSED	2
+
 /* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
 #define SEP_DIAG_OFFER_PENDING		0
 #define SEP_DIAG_OFFER_IDLE		1
@@ -238,6 +246,10 @@ void sep_diag_set_restore(int state);
 void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching);
 void sep_diag_xart_guard_refused(int matching);
+void sep_diag_set_trusted(int state, int status);
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status);
+void sep_diag_clear_trusted_refusal(void);
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word);
 void sep_diag_bringup_ended(void);
 void sep_diag_set_endpoint(u8 id, u32 name);
 void sep_diag_set_os_identity(int source);
