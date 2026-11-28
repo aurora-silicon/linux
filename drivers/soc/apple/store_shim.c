@@ -136,21 +136,78 @@ static bool sep_store_dev_is_internal(const struct device *dev)
 	return false;
 }
 
-/*
- * As sep_store_open_block(), for the enclave's own store: the path is only a
- * name for the partition, so the device it resolves to must also be on the
- * internal NVMe disk.
- */
-void *sep_store_open_internal_block(const char *path, int writable)
+static bool sep_store_matches_partition(struct device *dev, const char *label)
 {
-	struct file *f = sep_store_open_block(path, writable);
+	struct block_device *bdev;
 
-	if (f && !sep_store_dev_is_internal(disk_to_dev(file_bdev(f)->bd_disk))) {
-		pr_warn_ratelimited("apple-sep: %s is not on the internal NVMe disk; not used\n",
-				    path);
-		filp_close(f, NULL);
+	if (!dev->class || strcmp(dev->class->name, "block"))
+		return false;
+	bdev = dev_to_bdev(dev);
+	return bdev_is_partition(bdev) && bdev->bd_meta_info &&
+	       !strcmp(bdev->bd_meta_info->volname, label) &&
+	       sep_store_dev_is_internal(disk_to_dev(bdev->bd_disk));
+}
+
+struct sep_store_partition {
+	const char *label;
+	struct device *dev;
+};
+
+static int sep_store_find_partition(struct device *dev, void *data)
+{
+	struct sep_store_partition *part = data;
+
+	if (sep_store_matches_partition(dev, part->label)) {
+		part->dev = get_device(dev);
+		return 1;
+	}
+	return device_for_each_child(dev, data, sep_store_find_partition);
+}
+
+static int sep_store_find_on_ans(struct device *dev, void *data)
+{
+	const struct device_driver *drv = READ_ONCE(dev->driver);
+
+	if (!drv || strcmp(drv->name, SEP_STORE_ANS_DRIVER))
+		return 0;
+	return device_for_each_child(dev, data, sep_store_find_partition);
+}
+
+/*
+ * Find the GPT label below ANS, without depending on a userspace device link.
+ * Walk the controller's children because block_class is not exported to modules.
+ */
+void *sep_store_open_internal_block(const char *label, int writable)
+{
+	struct sep_store_partition part = { .label = label };
+	blk_mode_t mode = BLK_OPEN_READ | (writable ? BLK_OPEN_WRITE : 0);
+	const struct cred *old;
+	struct cred *kern;
+	struct file *f;
+
+	bus_for_each_dev(&platform_bus_type, NULL, &part, sep_store_find_on_ans);
+	if (!part.dev)
+		return NULL;
+	kern = prepare_kernel_cred(&init_task);
+	if (!kern) {
+		put_device(part.dev);
 		return NULL;
 	}
+	old = override_creds(kern);
+	f = bdev_file_open_by_dev(part.dev->devt, mode, NULL, NULL);
+	put_cred(revert_creds(old));
+	if (IS_ERR(f)) {
+		put_device(part.dev);
+		return NULL;
+	}
+	/* A removed partition's device number may have been reused during open. */
+	if (file_bdev(f) != dev_to_bdev(part.dev) ||
+	    !sep_store_matches_partition(part.dev, label) ||
+	    (writable && bdev_read_only(file_bdev(f)))) {
+		filp_close(f, NULL);
+		f = NULL;
+	}
+	put_device(part.dev);
 	return f;
 }
 

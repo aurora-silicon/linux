@@ -9,6 +9,8 @@
 static const struct device_driver sep_store_test_ans = { .name = "nvme-apple" };
 static const struct device_driver sep_store_test_usb = { .name = "xhci-hcd" };
 static const struct device_driver sep_store_test_pcie = { .name = "pcie-apple" };
+static const struct class sep_store_test_block = { .name = "block" };
+static const char sep_store_test_label[] = "iBootSystemContainer";
 
 /*
  * disk -> controller -> @host, as for an NVMe namespace, plus two spare
@@ -17,6 +19,9 @@ static const struct device_driver sep_store_test_pcie = { .name = "pcie-apple" }
  */
 struct sep_store_test_chain {
 	struct device host, ctrl, disk, extra, top;
+	struct gendisk gd;
+	struct block_device whole, part;
+	struct partition_meta_info meta;
 };
 
 static struct sep_store_test_chain *
@@ -29,6 +34,13 @@ sep_store_test_chain(struct kunit *test, const struct device_driver *drv)
 	c->host.driver = (struct device_driver *)drv;
 	c->ctrl.parent = &c->host;
 	c->disk.parent = &c->ctrl;
+	c->gd.part0 = &c->whole;
+	c->whole.bd_device.parent = &c->ctrl;
+	c->part.bd_disk = &c->gd;
+	c->part.bd_device.class = &sep_store_test_block;
+	c->part.bd_meta_info = &c->meta;
+	atomic_set(&c->part.__bd_flags, 1);
+	strscpy(c->meta.volname, sep_store_test_label);
 	return c;
 }
 
@@ -88,6 +100,47 @@ static void sep_store_checks_the_nearest_platform_device(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, sep_store_dev_is_internal(&c->disk));
 }
 
+static void sep_store_selects_internal_despite_duplicate_usb_label(struct kunit *test)
+{
+	struct sep_store_test_chain *usb = sep_store_test_chain(test, &sep_store_test_usb);
+	struct sep_store_test_chain *ans = sep_store_test_chain(test, &sep_store_test_ans);
+
+	/* The USB candidate must be skipped even when encountered first. */
+	KUNIT_EXPECT_FALSE(test, sep_store_matches_partition(&usb->part.bd_device,
+							     sep_store_test_label));
+	KUNIT_EXPECT_TRUE(test, sep_store_matches_partition(&ans->part.bd_device,
+							    sep_store_test_label));
+}
+
+static void sep_store_requires_the_partition_label(struct kunit *test)
+{
+	struct sep_store_test_chain *c = sep_store_test_chain(test, &sep_store_test_ans);
+
+	strscpy(c->meta.volname, "other");
+	KUNIT_EXPECT_FALSE(test, sep_store_matches_partition(&c->part.bd_device,
+							     sep_store_test_label));
+	c->part.bd_meta_info = NULL;
+	KUNIT_EXPECT_FALSE(test, sep_store_matches_partition(&c->part.bd_device,
+							     sep_store_test_label));
+}
+
+static void sep_store_requires_a_partition(struct kunit *test)
+{
+	struct sep_store_test_chain *c = sep_store_test_chain(test, &sep_store_test_ans);
+
+	atomic_set(&c->part.__bd_flags, 0);
+	KUNIT_EXPECT_FALSE(test, sep_store_matches_partition(&c->part.bd_device,
+							     sep_store_test_label));
+}
+
+static void sep_store_requires_a_block_device(struct kunit *test)
+{
+	struct sep_store_test_chain *c = sep_store_test_chain(test, &sep_store_test_ans);
+
+	KUNIT_EXPECT_FALSE(test, sep_store_matches_partition(&c->disk,
+							     sep_store_test_label));
+}
+
 static struct kunit_case sep_store_internal_cases[] = {
 	KUNIT_CASE(sep_store_accepts_the_embedded_nvme),
 	KUNIT_CASE(sep_store_refuses_a_usb_disk),
@@ -95,6 +148,10 @@ static struct kunit_case sep_store_internal_cases[] = {
 	KUNIT_CASE(sep_store_refuses_an_unbound_controller),
 	KUNIT_CASE(sep_store_refuses_a_disk_without_a_controller),
 	KUNIT_CASE(sep_store_checks_the_nearest_platform_device),
+	KUNIT_CASE(sep_store_selects_internal_despite_duplicate_usb_label),
+	KUNIT_CASE(sep_store_requires_the_partition_label),
+	KUNIT_CASE(sep_store_requires_a_partition),
+	KUNIT_CASE(sep_store_requires_a_block_device),
 	{}
 };
 
