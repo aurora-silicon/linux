@@ -29,6 +29,8 @@ struct dcp_m4_frame {
 	u32 height;
 	u32 stride;
 	enum dcp_m4_frame_format format;
+	/* ARGB8888 blended pre-multiplied rather than by coverage */
+	bool premultiplied;
 };
 
 static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
@@ -97,7 +99,8 @@ static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame 
 	u32 size = frame->stride * frame->height;
 
 	memset(surface, 0, DCP_M4_SURFACE_SIZE);
-	surface[2] = frame->format == DCP_M4_XRGB8888;
+	/* is_premultiplied: an opaque XRGB8888 frame is blended as one too. */
+	surface[2] = frame->format == DCP_M4_XRGB8888 || frame->premultiplied;
 	put_unaligned_le32(1, surface + 3);
 	put_unaligned_le32(1, surface + 7);
 	put_unaligned_le32(0x42475241, surface + 0x0b);

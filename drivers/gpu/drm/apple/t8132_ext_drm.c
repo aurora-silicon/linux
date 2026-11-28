@@ -70,6 +70,8 @@ static struct t8132_ext_crtc_state *to_t8132_ext_crtc_state(struct drm_crtc_stat
 
 struct t8132_ext_out {
 	struct drm_plane plane;
+	/* The cursor, an upper surface of the frame's swap */
+	struct drm_plane cursor;
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
@@ -130,6 +132,11 @@ static const u32 t8132_ext_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
+/* The DCP blends an upper surface by its alpha, pre-multiplied. */
+static const u32 t8132_ext_cursor_formats[] = {
+	DRM_FORMAT_ARGB8888,
+};
+
 static const u64 t8132_ext_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID,
@@ -159,6 +166,40 @@ static int t8132_ext_plane_check(struct drm_plane *plane, struct drm_atomic_comm
 }
 
 /*
+ * The cursor: what the DCP takes as an upper surface (dcp_m4_upper_check_on()),
+ * from its buffer's first byte, unscaled, from 32x32 to 256x256 on screen (a
+ * smaller surface crashes the firmware), a linear ARGB8888 buffer whose pitch
+ * is a multiple of 64 bytes. Its right and bottom edges may go off the output
+ * (only the part on it is shown), not its top or left one. Anything else is
+ * refused, so that the compositor draws the cursor itself.
+ */
+static int t8132_ext_cursor_check(struct drm_plane *plane, struct drm_atomic_commit *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *cs = NULL;
+	struct drm_framebuffer *fb = ps->fb;
+	int w, h, ret;
+
+	if (ps->crtc)
+		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING, true, true);
+	if (ret || !ps->visible)
+		return ret;
+	w = drm_rect_width(&ps->dst);
+	h = drm_rect_height(&ps->dst);
+	if (ps->src.x1 || ps->src.y1 || ps->dst.x1 != ps->crtc_x || ps->dst.y1 != ps->crtc_y ||
+	    w < 32 || h < 32 || w > 256 || h > 256 || fb->modifier != DRM_FORMAT_MOD_LINEAR ||
+	    fb->offsets[0] || fb->pitches[0] % 64 || fb->pitches[0] < w * 4) {
+		drm_dbg_atomic(plane->dev, "[PLANE:%d:%s] cursor %dx%d+%d+%d (fb %ux%u, pitch %u) refused\n",
+			       plane->base.id, plane->name, w, h, ps->dst.x1, ps->dst.y1,
+			       fb->width, fb->height, fb->pitches[0]);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
  * Nothing to program here: the CRTC's flush presents the frame.
  * drm_atomic_helper_commit_planes() calls this for every plane it updates
  * or disables (there is no atomic_disable).
@@ -169,6 +210,11 @@ static void t8132_ext_plane_update(struct drm_plane *plane, struct drm_atomic_co
 
 static const struct drm_plane_helper_funcs t8132_ext_plane_helpers = {
 	.atomic_check = t8132_ext_plane_check,
+	.atomic_update = t8132_ext_plane_update,
+};
+
+static const struct drm_plane_helper_funcs t8132_ext_cursor_helpers = {
+	.atomic_check = t8132_ext_cursor_check,
 	.atomic_update = t8132_ext_plane_update,
 };
 
@@ -369,7 +415,8 @@ static void t8132_ext_direct_refused(struct t8132_ext_out *out, struct drm_frame
  * the commit tail, blocking or not).
  */
 static int t8132_ext_present_direct(struct t8132_ext_out *out, struct apple_dcp *owner,
-				    struct drm_framebuffer *fb, struct drm_gem_object *obj)
+				    struct drm_framebuffer *fb, struct drm_gem_object *obj,
+				    const struct iomfb_m4_ext_cursor *cursor)
 {
 	const struct drm_display_mode *mode = &out->crtc.state->mode;
 	struct iomfb_m4_ext_fb d = {
@@ -414,25 +461,64 @@ static int t8132_ext_present_direct(struct t8132_ext_out *out, struct apple_dcp 
 		}
 		dma_sync_sgtable_for_device(obj->import_attach->dev, dma->sgt, DMA_TO_DEVICE);
 	}
-	ret = iomfb_m4_ext_present_direct(owner, &d);
+	ret = iomfb_m4_ext_present_direct(owner, &d, cursor);
 	if (ret == -EOPNOTSUPP)
 		t8132_ext_direct_refused(out, fb, t8132_ext_pages_refused);
 	return ret < 0 ? ret : ret ? 3 : 2;
 }
 
 /*
- * Present the primary plane's new frame: scanned out directly where it can
- * be, else copied into the DCP and swapped in; 2 or 3 once a direct frame's
- * swap is submitted (see t8132_ext_present_direct()), 1 if the commit has no
- * new frame (no plane state), so nothing was tried. A copied framebuffer is
- * read through its kernel mapping (dma-buf vmap for an imported one) inside
- * CPU access.
+ * The cursor plane's framebuffer as the cursor of the frame going out, into
+ * @c: none if the plane shows nothing, or if its buffer is not one the DCP
+ * can scan out (16 KiB pages; said once per framebuffer). An imported buffer
+ * is cleaned out of the CPU caches first, as a directly scanned-out frame.
+ */
+static void t8132_ext_cursor_get(struct t8132_ext_out *out, struct iomfb_m4_ext_cursor *c)
+{
+	struct drm_plane_state *ps = out->cursor.state;
+	struct drm_framebuffer *fb = ps ? ps->fb : NULL;
+	struct drm_gem_object *obj;
+
+	*c = (struct iomfb_m4_ext_cursor){};
+	if (!fb || !ps->visible || ps->crtc != &out->crtc)
+		return;
+	obj = drm_gem_fb_get_obj(fb, 0);
+	if (!obj)
+		return;
+	if (drm_gem_is_imported(obj)) {
+		struct drm_gem_dma_object *dma = to_drm_gem_dma_obj(obj);
+
+		if (!dma->sgt || !obj->import_attach ||
+		    !t8132_ext_sgt_pages_ok(dma->sgt, obj->size)) {
+			t8132_ext_direct_refused(out, fb, "cursor not shown: its pages are not 16 KiB pages each");
+			return;
+		}
+		dma_sync_sgtable_for_device(obj->import_attach->dev, dma->sgt, DMA_TO_DEVICE);
+	}
+	c->fb = (struct iomfb_m4_ext_fb){
+		.key = fb, .width = drm_rect_width(&ps->dst), .height = drm_rect_height(&ps->dst),
+		.pitch = fb->pitches[0],
+		.pages = t8132_ext_fb_pages, .get = t8132_ext_fb_get, .put = t8132_ext_fb_put,
+	};
+	c->x = ps->dst.x1;
+	c->y = ps->dst.y1;
+}
+
+/*
+ * Present the primary plane's frame with the cursor over it: scanned out
+ * directly where it can be, else copied into the DCP and swapped in; 2 or 3
+ * once a direct frame's swap is submitted (see t8132_ext_present_direct()),
+ * 1 if the commit changes neither plane (no plane state), so nothing was
+ * tried. A commit of the cursor alone presents the frame on screen again
+ * with it (no damage). A copied framebuffer is read through its kernel
+ * mapping (dma-buf vmap for an imported one) inside CPU access.
  */
 static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, &out->plane);
 	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, &out->plane);
 	struct apple_dcp *owner = t8132_ext_owner(out);
+	struct iomfb_m4_ext_cursor cursor;
 	struct drm_framebuffer *fb;
 	struct drm_gem_object *obj;
 	struct iosys_map map, data;
@@ -440,20 +526,26 @@ static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit
 	struct dma_buf *buf;
 	int ret;
 
-	if (!new || !old)
-		return 1;
-	fb = new->fb;
+	if (!new || !old) {
+		if (!drm_atomic_get_new_plane_state(state, &out->cursor))
+			return 1;
+		/* The cursor alone: the frame on screen again, nothing of it damaged. */
+		new = out->plane.state;
+		old = NULL;
+	}
+	fb = new ? new->fb : NULL;
 	if (!owner || !fb || !new->visible)
 		return -ENOLINK;
 	if (out->frame_lost)
 		damage = DRM_RECT_INIT(0, 0, fb->width, fb->height);
-	else if (!drm_atomic_helper_damage_merged(old, new, &damage))
+	else if (!old || !drm_atomic_helper_damage_merged(old, new, &damage))
 		damage = DRM_RECT_INIT(0, 0, 0, 0);
 	obj = drm_gem_fb_get_obj(fb, 0);
 	if (!obj)
 		return -EINVAL;
+	t8132_ext_cursor_get(out, &cursor);
 	/* Scanned out directly where it can be, else copied below. */
-	ret = t8132_ext_present_direct(out, owner, fb, obj);
+	ret = t8132_ext_present_direct(out, owner, fb, obj, &cursor);
 	if (ret != -ENOSPC && ret != -EOPNOTSUPP)
 		return ret;
 	if (!drm_gem_is_imported(obj)) {
@@ -462,7 +554,7 @@ static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit
 		if (!dma->vaddr)
 			return -EINVAL;
 		iosys_map_set_vaddr(&data, dma->vaddr + fb->offsets[0]);
-		return iomfb_m4_ext_present(owner, &data, fb->pitches[0], &damage);
+		return iomfb_m4_ext_present(owner, &data, fb->pitches[0], &damage, &cursor);
 	}
 	buf = obj->import_attach->dmabuf;
 	ret = dma_buf_vmap_unlocked(buf, &map);
@@ -472,7 +564,7 @@ static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit
 	if (!ret) {
 		data = map;
 		iosys_map_incr(&data, fb->offsets[0]);
-		ret = iomfb_m4_ext_present(owner, &data, fb->pitches[0], &damage);
+		ret = iomfb_m4_ext_present(owner, &data, fb->pitches[0], &damage, &cursor);
 		dma_buf_end_cpu_access(buf, DMA_FROM_DEVICE);
 	}
 	dma_buf_vunmap_unlocked(buf, &map);
@@ -1135,10 +1227,24 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
 							   BIT(DRM_MODE_BLEND_PIXEL_NONE));
 	if (ret)
 		goto err_plane;
-	ret = drm_crtc_init_with_planes(drm, &out->crtc, &out->plane, NULL,
-					&t8132_ext_crtc_funcs, "dcpext-%s", dev_name(&pdev->dev));
+	/* The cursor, over the frame (the same plane funcs: t8132_ext_plane()). */
+	ret = drm_universal_plane_init(drm, &out->cursor, BIT(drm->mode_config.num_crtc),
+				       &t8132_ext_plane_funcs, t8132_ext_cursor_formats,
+				       ARRAY_SIZE(t8132_ext_cursor_formats), t8132_ext_modifiers,
+				       DRM_PLANE_TYPE_CURSOR, NULL);
 	if (ret)
 		goto err_plane;
+	drm_plane_helper_add(&out->cursor, &t8132_ext_cursor_helpers);
+	ret = drm_plane_create_zpos_immutable_property(&out->cursor, 1);
+	if (!ret)
+		ret = drm_plane_create_blend_mode_property(&out->cursor,
+							   BIT(DRM_MODE_BLEND_PREMULTI));
+	if (ret)
+		goto err_cursor;
+	ret = drm_crtc_init_with_planes(drm, &out->crtc, &out->plane, &out->cursor,
+					&t8132_ext_crtc_funcs, "dcpext-%s", dev_name(&pdev->dev));
+	if (ret)
+		goto err_cursor;
 	drm_crtc_helper_add(&out->crtc, &t8132_ext_crtc_helpers);
 	ret = drm_simple_encoder_init(drm, &out->encoder, DRM_MODE_ENCODER_TMDS);
 	if (ret)
@@ -1169,6 +1275,8 @@ err_encoder:
 	drm_encoder_cleanup(&out->encoder);
 err_crtc:
 	drm_crtc_cleanup(&out->crtc);
+err_cursor:
+	drm_plane_cleanup(&out->cursor);
 err_plane:
 	drm_plane_cleanup(&out->plane);
 err_free:

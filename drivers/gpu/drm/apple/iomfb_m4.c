@@ -141,6 +141,8 @@ struct iomfb_m4_ext_mode {
  * compositor may draw into a buffer that is still on screen.
  */
 #define DCP_M4_EXT_INFLIGHT	2
+/* How long a direct frame waits for a free slot before it is dropped */
+#define DCP_M4_EXT_SLOT_WAIT_MS	1000
 static unsigned int t8132_ext_swap_depth = DCP_M4_EXT_INFLIGHT;
 
 static int t8132_ext_swap_depth_set(const char *val, const struct kernel_param *kp)
@@ -848,7 +850,7 @@ out:
  * confirmed swap shows it (given-up swaps that may still show it are in
  * ext_lost_swap); pinned: its unmap failed, kept until reboot.
  */
-#define DCP_M4_EXT_WINDOWS	6
+#define DCP_M4_EXT_WINDOWS	12
 struct dcp_m4_ext_window {
 	u64 dva;
 	void *key;
@@ -866,6 +868,8 @@ struct dcp_m4_ext_window {
 struct dcp_m4_ext_lost {
 	u32 id;
 	int win;
+	/* The cursor's window it may still put on screen (-1: none), as @win */
+	int cwin;
 	bool superseded;
 };
 
@@ -878,6 +882,8 @@ struct dcp_m4_ext_lost {
 struct dcp_m4_ext_inflight {
 	struct dcp_m4_swap_state swap;
 	int win;
+	/* Its cursor's window (-1: none) */
+	int cwin;
 	int gen;
 	unsigned long deadline;
 	bool flip_held;
@@ -999,6 +1005,8 @@ struct dcp_m4_runtime {
 	struct dcp_m4_ext_inflight ext_q[DCP_M4_EXT_INFLIGHT];
 	unsigned int ext_qn;
 	int ext_swap_win;
+	/* The window of the cursor of the swap going out (-1: none) */
+	int ext_swap_cwin;
 	unsigned int ext_swap_async;
 	bool ext_swap_now;
 	struct dcp_m4_ext_done ext_done;
@@ -1045,7 +1053,9 @@ struct dcp_m4_runtime {
 };
 
 static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r, int i, enum dcp_m4_ext_end end);
-static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int older,
+static int dcp_m4_ext_cursor(struct dcp_m4_runtime *r, const struct iomfb_m4_ext_cursor *c,
+			     struct dcp_m4_frame *f, struct dcp_m4_upper *u);
+static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int cwin, int older,
 			     enum dcp_m4_ext_end end);
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp)
@@ -1266,7 +1276,8 @@ static int dcp_m4_ext_lost_slot(struct dcp_m4_runtime *r, u32 id)
 static bool dcp_m4_ext_win_lost(struct dcp_m4_runtime *r, int i)
 {
 	for (unsigned int j = 0; j < ARRAY_SIZE(r->ext_lost_swap); j++)
-		if (r->ext_lost_swap[j].id && r->ext_lost_swap[j].win == i)
+		if (r->ext_lost_swap[j].id &&
+		    (r->ext_lost_swap[j].win == i || r->ext_lost_swap[j].cwin == i))
 			return true;
 	return false;
 }
@@ -1289,7 +1300,7 @@ static bool dcp_m4_ext_late_d590(struct dcp_m4_runtime *r, u32 id, bool shown)
 	if (slot < 0)
 		return false;
 	lost = r->ext_lost_swap[slot];
-	r->ext_lost_swap[slot] = (struct dcp_m4_ext_lost){ .win = -1 };
+	r->ext_lost_swap[slot] = (struct dcp_m4_ext_lost){ .win = -1, .cwin = -1 };
 	for (int i = 0; i < 2; i++) {
 		if (r->ext_buf_lost[i] != id)
 			continue;
@@ -1314,6 +1325,9 @@ static bool dcp_m4_ext_late_d590(struct dcp_m4_runtime *r, u32 id, bool shown)
 		r->ext_win[lost.win].on_screen = true;
 		front = true;
 	}
+	/* So is the window of the cursor it showed. */
+	if (shown && lost.cwin >= 0)
+		r->ext_win[lost.cwin].on_screen = true;
 	if (held) {
 		r->ext_hold_id = 0;
 		r->ext_hold_probe = false;
@@ -1398,7 +1412,7 @@ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
 	if (!ret) {
 		r->ext_swap_shown = done.shown;
 		if (r->ext_swap_async)
-			dcp_m4_ext_shown(r, id, r->ext_swap_win, r->ext_qn,
+			dcp_m4_ext_shown(r, id, r->ext_swap_win, r->ext_swap_cwin, r->ext_qn,
 					 done.shown ? DCP_M4_EXT_END_SHOWN :
 					 DCP_M4_EXT_END_UNSHOWN);
 	}
@@ -2138,7 +2152,7 @@ static int dcp_m4_ext_swap_wait(struct dcp_m4_runtime *r, int link_gen, u64 *wor
  * failure as before.
  */
 static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap_state *swap,
-				    int win, bool superseded, int error)
+				    int win, int cwin, bool superseded, int error)
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	struct dcp_m4_transaction *t = &dcp->transaction;
@@ -2161,7 +2175,7 @@ static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap
 		return false;
 	}
 	r->ext_lost_swap[slot] = (struct dcp_m4_ext_lost){
-		.id = swap->id, .win = win, .superseded = superseded,
+		.id = swap->id, .win = win, .cwin = cwin, .superseded = superseded,
 	};
 	swap->emitted = true;
 	if (r->ext_swap_surface >= 0)
@@ -2305,6 +2319,7 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 			*e = (struct dcp_m4_ext_inflight){
 				.swap = handed,
 				.win = r->ext_swap_win,
+				.cwin = r->ext_swap_cwin,
 				.gen = link_gen,
 				.deadline = jiffies + msecs_to_jiffies(5000),
 				.flip_held = r->ext_qn || r->ext_swap_async < 2,
@@ -2340,7 +2355,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	/* Only the copied host input is freed; the firmware-visible RPC stays pinned. */
 	kfree(input);
 	/* Only its D590 missing: given up, the session kept. */
-	if (ret && d590_missing && dcp_m4_ext_swap_give_up(r, &r->swap, -1, false, ret))
+	if (ret && d590_missing &&
+	    dcp_m4_ext_swap_give_up(r, &r->swap, -1, r->ext_swap_cwin, false, ret))
 		return ret;
 	if (ret) {
 		dcp_m4_swap_fail(&r->swap, ret);
@@ -2442,8 +2458,9 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	/* No surface on screen or in flight yet. */
 	r->ext_swap_surface = -1;
 	r->ext_front = -1;
-	/* No direct swap going out. */
+	/* No direct swap going out, no cursor with one. */
 	r->ext_swap_win = -1;
+	r->ext_swap_cwin = -1;
 	INIT_DELAYED_WORK(&r->ext_async_work, dcp_m4_ext_async_work);
 	init_completion(&r->received);
 	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
@@ -4372,6 +4389,28 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
 }
 
 /*
+ * A copied frame: the direct swaps in flight complete (D590) or are given up
+ * first, 1 s at most (-EBUSY then), the session lock dropped meanwhile.
+ */
+static int dcp_m4_ext_drain_direct(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(DCP_M4_EXT_SLOT_WAIT_MS);
+
+	lockdep_assert_held(&dcp->lock);
+	while (r->ext_qn) {
+		long left = (long)(end - jiffies);
+
+		if (left <= 0 || READ_ONCE(dcp->error))
+			return -EBUSY;
+		mutex_unlock(&dcp->lock);
+		wait_event_timeout(dcp->ext_settle_wq,
+				   !READ_ONCE(r->ext_qn) || READ_ONCE(dcp->error), left);
+		mutex_lock(&dcp->lock);
+	}
+	return 0;
+}
+
+/*
  * DRM: before an enable or disable, which must not be refused: the direct
  * swaps in flight complete (D590) or are given up (5 s, or at once when the
  * link goes). The session lock is dropped while waiting, so those can run;
@@ -4548,8 +4587,10 @@ static void dcp_m4_ext_retired(struct dcp_m4_runtime *r, int shown)
 	/* No window is on screen, nor may a given-up swap show one. */
 	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 		r->ext_win[i].on_screen = false;
-	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_lost_swap); i++)
+	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_lost_swap); i++) {
 		r->ext_lost_swap[i].win = -1;
+		r->ext_lost_swap[i].cwin = -1;
+	}
 }
 
 /* Rows of @rect from @src (@pitch) into @dst (@stride); its pixels. */
@@ -4580,15 +4621,16 @@ static u64 dcp_m4_ext_copy(void *dst, u32 stride, const struct iosys_map *src, u
  * swapped without a mode, a sink or the display DART (its last D572).
  */
 int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u32 pitch,
-			 const struct drm_rect *damage)
+			 const struct drm_rect *damage, const struct iomfb_m4_ext_cursor *cursor)
 {
 	struct iomfb_m4 *dcp = owner->v26_6;
 	struct dcp_m4_runtime *r;
 	struct drm_rect full, rect, cur;
-	struct dcp_m4_frame *f;
+	struct dcp_m4_frame *f, cf;
+	struct dcp_m4_upper cu;
 	unsigned int back;
 	void *cpu;
-	int ret = -ENOLINK;
+	int ret = -ENOLINK, cw = -1;
 
 	if (!dcp || !dcp->external)
 		return -ENODEV;
@@ -4622,9 +4664,23 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn || r->ext_sleeping)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_sleeping)
 		goto out;
+	/*
+	 * Direct swaps in flight complete (or are given up) first, 1 s at most,
+	 * rather than the frame being dropped; the DART is checked again after.
+	 */
+	if (r->ext_qn) {
+		ret = dcp_m4_ext_drain_direct(dcp, r);
+		if (!ret)
+			ret = dcp_m4_ext_scanout_gate(dcp);
+		if (ret)
+			goto out;
+		ret = -EBUSY;
+		if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
+		    r->ext_sleeping || READ_ONCE(dcp->error))
+			goto out;
+	}
 	r->ext_hold_probe = false;
 	/*
 	 * Never the surface on screen, nor one a given-up swap may still
@@ -4693,9 +4749,22 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	}
 	/* Only through the Normal-NC view; nothing else maps these pages. */
 	dma_wmb();
+	/*
+	 * The cursor with it, its window had now: the DART is checked again,
+	 * as callbacks may have been handled since (a surfaceless swap above).
+	 */
+	ret = cursor && cursor->fb.key ? dcp_m4_ext_scanout_gate(dcp) : 0;
+	if (!ret)
+		ret = dcp_m4_ext_cursor(r, cursor, &cf, &cu);
+	if (ret) {
+		r->ext_buf_stale[back] = true;
+		goto out;
+	}
+	cw = r->ext_swap_cwin;
 	r->ext_swap_surface = back;
-	ret = dcp_m4_runtime_swap_full(r, true, f, NULL, 0, false, 0, 0, 0);
+	ret = dcp_m4_runtime_swap_full(r, true, f, cu.frame ? &cu : NULL, 0, false, 0, 0, 0);
 	r->ext_swap_surface = -1;
+	r->ext_swap_cwin = -1;
 	if (ret) {
 		r->ext_buf_stale[back] = true;
 		goto out;
@@ -4711,6 +4780,9 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		goto out;
 	}
 	dcp_m4_ext_retired(r, back);
+	/* Its cursor is on screen with it. */
+	if (cw >= 0)
+		r->ext_win[cw].on_screen = true;
 	/* A frame shown, for the replay after a sleep. */
 	if (r->ext_restore_pending)
 		WRITE_ONCE(r->ext_restore_frame, true);
@@ -4770,10 +4842,10 @@ static bool dcp_m4_ext_win_idle(struct dcp_m4_runtime *r, int i)
 	const struct dcp_m4_ext_window *w = &r->ext_win[i];
 
 	if (!w->key || w->on_screen || w->pinned || r->ext_swap_win == i ||
-	    dcp_m4_ext_win_lost(r, i))
+	    r->ext_swap_cwin == i || dcp_m4_ext_win_lost(r, i))
 		return false;
 	for (unsigned int j = 0; j < r->ext_qn; j++)
-		if (r->ext_q[j].win == i)
+		if (r->ext_q[j].win == i || r->ext_q[j].cwin == i)
 			return false;
 	return true;
 }
@@ -4956,7 +5028,7 @@ static void dcp_m4_ext_flip_after(struct dcp_m4_runtime *r, const struct dcp_m4_
  * else is retired. UNSHOWN: what was on screen stays, and its window is free.
  * The copy surfaces go stale and a hold ends either way. Session lock held.
  */
-static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int older,
+static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int cwin, int older,
 			     enum dcp_m4_ext_end end)
 {
 	if (end == DCP_M4_EXT_END_SHOWN) {
@@ -4976,6 +5048,9 @@ static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int olde
 	if (end != DCP_M4_EXT_END_UNSHOWN) {
 		if (win >= 0)
 			r->ext_win[win].on_screen = true;
+		/* Its cursor (@cwin, -1: none) is on screen with it. */
+		if (cwin >= 0)
+			r->ext_win[cwin].on_screen = true;
 		/* A frame shown, for the replay after a sleep. */
 		if (r->ext_restore_pending)
 			WRITE_ONCE(r->ext_restore_frame, true);
@@ -5005,7 +5080,7 @@ static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r, int i, enum dcp_m4_e
 				     e.swap.id, r->ext_q[0].swap.id);
 	dcp_m4_ext_q_remove(r, i);
 	if (end != DCP_M4_EXT_END_TAKEN)
-		dcp_m4_ext_shown(r, e.swap.id, e.win, i, end);
+		dcp_m4_ext_shown(r, e.swap.id, e.win, e.cwin, i, end);
 	dcp_m4_ext_flip_after(r, &e);
 }
 
@@ -5034,7 +5109,7 @@ static void dcp_m4_ext_async_expire(struct dcp_m4_runtime *r, bool went)
 	r->ext_buf_stale[0] = true;
 	r->ext_buf_stale[1] = true;
 	if (!READ_ONCE(dcp->error) &&
-	    !dcp_m4_ext_swap_give_up(r, &e.swap, e.win, e.superseded, ret)) {
+	    !dcp_m4_ext_swap_give_up(r, &e.swap, e.win, e.cwin, e.superseded, ret)) {
 		dcp_m4_swap_fail(&r->swap, ret);
 		dcp_m4_transaction_fail(&dcp->transaction, ret);
 		dcp_m4_failed(dcp, ret);
@@ -5077,6 +5152,65 @@ static void dcp_m4_ext_async_work(struct work_struct *work)
 	mutex_unlock(&dcp->lock);
 }
 
+/* The cursor's surface in a swap: upper surface 1, under its own ID. */
+#define DCP_M4_EXT_CURSOR_SURFACE	1
+#define DCP_M4_EXT_CURSOR_ID		2
+
+/*
+ * The cursor of the swap going out, @c (NULL or no key: none), as an upper
+ * surface in @u (its frame in @f), its framebuffer mapped in a window of its
+ * own (dcp_m4_ext_win_get(), whose caller's conditions hold), which
+ * r->ext_swap_cwin names until the swap is out (-1: none). Without a window
+ * for it (-ENOSPC, or pages it cannot map), the frame goes without the
+ * cursor, said once in a while. -EAGAIN while the DART is not confirmed since
+ * a sleep, another error for a failed mapping (a hardware error): no frame.
+ */
+static int dcp_m4_ext_cursor(struct dcp_m4_runtime *r, const struct iomfb_m4_ext_cursor *c,
+			     struct dcp_m4_frame *f, struct dcp_m4_upper *u)
+{
+	struct iomfb_m4 *dcp = r->dcp;
+	int w;
+
+	*u = (struct dcp_m4_upper){
+		.index = DCP_M4_EXT_CURSOR_SURFACE, .id = DCP_M4_EXT_CURSOR_ID,
+	};
+	r->ext_swap_cwin = -1;
+	if (!c || !c->fb.key)
+		return 0;
+	*f = (struct dcp_m4_frame){
+		.width = c->fb.width, .height = c->fb.height, .stride = c->fb.pitch,
+		.format = DCP_M4_ARGB8888, .premultiplied = true,
+	};
+	u->x = c->x;
+	u->y = c->y;
+	/* Checked before any window is taken for it: the DRM check let it through. */
+	u->frame = f;
+	f->dva = DCP_M4_SCANOUT_BASE;
+	f->backing_size = (u64)c->fb.pitch * c->fb.height;
+	if (dcp_m4_upper_check_on(u, r->ext_width, r->ext_height)) {
+		dev_warn_ratelimited(dcp->dev, "cursor %ux%u (pitch %u) at %u,%u: not on the %ux%u output, not shown\n",
+				     c->fb.width, c->fb.height, c->fb.pitch, c->x, c->y,
+				     r->ext_width, r->ext_height);
+		u->frame = NULL;
+		return 0;
+	}
+	w = dcp_m4_ext_win_get(r, &c->fb, PAGE_ALIGN((size_t)c->fb.pitch * c->fb.height));
+	if (w == -ENOSPC || w == -EOPNOTSUPP) {
+		dev_warn_ratelimited(dcp->dev, "cursor not shown: no window for its framebuffer (%d)\n",
+				     w);
+		u->frame = NULL;
+		return 0;
+	}
+	if (w < 0) {
+		u->frame = NULL;
+		return w;
+	}
+	f->dva = r->ext_win[w].dva;
+	f->backing_size = (u64)r->ext_win[w].count * SZ_16K;
+	r->ext_swap_cwin = w;
+	return 0;
+}
+
 /*
  * One DRM frame scanned out directly
  * from its framebuffer, mapped into a SID0 host window (kept per
@@ -5089,11 +5223,14 @@ static void dcp_m4_ext_async_work(struct work_struct *work)
  * -EOPNOTSUPP for a framebuffer that does not fit the mode or the window: the
  * caller copies it instead.
  */
-int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_ext_fb *fb)
+int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_ext_fb *fb,
+				const struct iomfb_m4_ext_cursor *cursor)
 {
 	struct iomfb_m4 *dcp = owner->v26_6;
+	unsigned long until = jiffies + msecs_to_jiffies(DCP_M4_EXT_SLOT_WAIT_MS);
 	struct dcp_m4_runtime *r;
-	struct dcp_m4_frame f;
+	struct dcp_m4_frame f, cf;
+	struct dcp_m4_upper cu;
 	int ret = -ENOLINK, w;
 	unsigned int depth, free;
 	size_t need;
@@ -5101,6 +5238,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	if (!dcp || !dcp->external)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
+again:
 	r = dcp->runtime;
 	/* Pairs with the release store of r->done in startup. */
 	if (!r || !smp_load_acquire(&r->done) || READ_ONCE(dcp->error) || !r->ext_connected ||
@@ -5112,9 +5250,25 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 		goto out;
 	ret = -EBUSY;
 	depth = clamp_val(READ_ONCE(t8132_ext_swap_depth), 1, DCP_M4_EXT_INFLIGHT);
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn >= depth || r->ext_sleeping)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_sleeping)
 		goto out;
+	/*
+	 * Every slot taken: the frame waits for the oldest swap in flight to
+	 * complete (or be given up), rather than being dropped while the
+	 * display is slow to take the first frames of a mode. The session lock
+	 * is dropped meanwhile; whatever changed is checked again.
+	 */
+	if (r->ext_qn >= depth) {
+		long left = (long)(until - jiffies);
+
+		if (left <= 0)
+			goto out;
+		mutex_unlock(&dcp->lock);
+		wait_event_timeout(dcp->ext_settle_wq,
+				   READ_ONCE(r->ext_qn) < depth || READ_ONCE(dcp->error), left);
+		mutex_lock(&dcp->lock);
+		goto again;
+	}
 	/*
 	 * A slot for each swap in flight, this one included, that a later D590
 	 * may complete (dcp_m4_runtime_swap_done()); else frames are copied.
@@ -5160,14 +5314,21 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 		.width = fb->width, .height = fb->height, .stride = fb->pitch,
 		.format = DCP_M4_XRGB8888,
 	};
+	/* The frame's window is taken: the cursor's may not reuse it. */
+	r->ext_swap_win = w;
+	ret = dcp_m4_ext_cursor(r, cursor, &cf, &cu);
+	if (ret) {
+		r->ext_swap_win = -1;
+		goto out;
+	}
 	r->ext_hold_probe = false;
 	r->ext_swap_surface = -1;
-	r->ext_swap_win = w;
 	r->ext_swap_async = depth;
 	r->ext_swap_now = false;
-	ret = dcp_m4_runtime_swap_full(r, true, &f, NULL, 0, false, 0, 0, 0);
+	ret = dcp_m4_runtime_swap_full(r, true, &f, cu.frame ? &cu : NULL, 0, false, 0, 0, 0);
 	r->ext_swap_async = 0;
 	r->ext_swap_win = -1;
+	r->ext_swap_cwin = -1;
 	if (!ret && r->ext_swap_now)
 		ret = 1;
 out:
