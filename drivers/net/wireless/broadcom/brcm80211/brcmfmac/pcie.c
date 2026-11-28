@@ -1503,6 +1503,10 @@ static int brcmf_pcie_ring_mb_update_rptr(void *ctx)
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
 		return -EIO;
 
+	/* Flowrings are allocated before their depth is configured. */
+	if (!commonring->depth)
+		return -EIO;
+
 	/* The dongle's index is only used inside the ring; keep the last good one */
 	ptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);
 	if (ptr >= commonring->depth) {
@@ -1528,6 +1532,10 @@ static int brcmf_pcie_ring_mb_update_wptr(void *ctx)
 	u16 ptr;
 
 	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
+		return -EIO;
+
+	/* Flowrings are allocated before their depth is configured. */
+	if (!commonring->depth)
 		return -EIO;
 
 	/* The dongle's index is only used inside the ring; keep the last good one */
