@@ -1,0 +1,31 @@
+name: Verify a published Linux Edge source
+description: Verify one exact Linux kernel-release workflow attempt and its Edge source digest
+inputs:
+  revision:
+    description: Full Linux commit from the package recipe
+    required: true
+  publication:
+    description: Exact kernel-release run ID and attempt, separated by /
+    required: true
+  token:
+    description: GitHub token for public run metadata and build attestations
+    required: true
+outputs:
+  source-sha256:
+    description: SHA-256 of the attested source.commit marker
+    value: ${{ steps.verify.outputs.source-sha256 }}
+runs:
+  using: composite
+  steps:
+    - id: verify
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        ACTION_DIR: ${{ github.action_path }}
+        REVISION: ${{ inputs.revision }}
+        PUBLICATION: ${{ inputs.publication }}
+      run: |
+        set -euo pipefail
+        [[ $PUBLICATION =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]
+        digest=$(bash "$ACTION_DIR/verify-linux-edge-run.sh" "$REVISION" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
+        printf 'source-sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
