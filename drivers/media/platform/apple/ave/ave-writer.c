@@ -866,6 +866,16 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 		ave_start_put32(cmd, l->h264_transform_mode, p->high ? 2 : 0);
 		if (l->h264_skip_mode)
 			ave_put16(cmd, l->h264_skip_mode, AVE_AVC_RECON_SKIP_MODE);
+		/*
+		 * With these left zero, most of each P picture is coded as
+		 * 8x8 partitions. They weight the full-pel search and the
+		 * inter and intra decisions.
+		 */
+		if (p->h264_inter) {
+			ave_start_put32(cmd, l->h264_me_fullpel_lambda, 64);
+			ave_start_put32(cmd, l->h264_md_inter_lambda, 256);
+			ave_start_put32(cmd, l->h264_md_intra_lambda, 64);
+		}
 		ave_start_put32(cmd, l->h264_input_bit_depth, depth);
 		ave_start_put32(cmd, l->h264_parameter_set_count, 1);
 		ave_start_put32(cmd, l->h264_slice_map_count, 1);
@@ -1261,7 +1271,15 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	else
 		ave_put32(cmd, l->const5, 5);
 	ave_put64(cmd, l->fps, ave_f64(p->fps_num, p->fps_den));
-	ave_put64(cmd, l->timescale, AVE_PROC_TIMESCALE);
+	/*
+	 * With a nonzero timescale every H.264 P picture is coded with
+	 * nal_ref_idc 0. Zero keeps them references; the PTS below still
+	 * counts in AVE_PROC_TIMESCALE.
+	 */
+	if (p->h264_inter && p->codec == AVE_CODEC_H264)
+		ave_put64(cmd, l->timescale, 0);
+	else
+		ave_put64(cmd, l->timescale, AVE_PROC_TIMESCALE);
 	if (l->crop)
 		ave_put32(cmd, l->crop,
 			  p->cw != p->width || p->ch != p->height);
