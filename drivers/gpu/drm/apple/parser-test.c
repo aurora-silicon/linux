@@ -586,7 +586,10 @@ static void parser_vrr_empty_range(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, modes[0].min_vrr, 0U);
 	KUNIT_EXPECT_EQ(test, modes[0].max_vrr, 0U);
 	kfree(modes);
-	/* The catalog owner enables this convention only for desktop firmware. */
+	/*
+	 * The catalog owner takes zero placeholders as no range on every
+	 * firmware, so an internal ProMotion timing gets its range either way.
+	 */
 	for (desktop = 0; desktop < 2; desktop++) {
 		struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 		u64 generation;
@@ -601,9 +604,9 @@ static void parser_vrr_empty_range(struct kunit *test)
 		generation = dcp_modes_transfer_begin(dcp);
 		KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, generation), 0);
 		KUNIT_ASSERT_EQ(test, dcp->nr_modes, 1U);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].vrr, !!desktop);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, desktop ? 24U << 16 : 0U);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, desktop ? 120U << 16 : 0U);
+		KUNIT_EXPECT_TRUE(test, dcp->modes[0].vrr);
+		KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, 24U << 16);
+		KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, 120U << 16);
 		kfree(dcp->modes);
 	}
 }
