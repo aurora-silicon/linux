@@ -1699,6 +1699,32 @@ impl Registry {
             )
         })
     }
+
+    /// Takes the rest of its allowance from the compute command a waiting job's `verdict`
+    /// charges ([`crate::g17::timeout::Verdict::forfeits`]; only compute commands have one),
+    /// given the job's excuse and the command it was first excused behind. Returns that
+    /// command if it lost its allowance here.
+    pub(in crate::g17) fn forfeit_blocker(
+        &self,
+        verdict: &crate::g17::timeout::Verdict,
+        excuse: crate::g17::timeout::Excuse,
+        first: u64,
+    ) -> Option<crate::g17::timeout::Head> {
+        let computes = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.timeout_head());
+        let blocker = verdict.forfeits(excuse, first,
+            Iterator::chain(self.render_timeout_heads(), computes))?;
+        self.compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.forfeit_head(blocker))
+            .then_some(blocker)
+    }
 }
 
 impl RenderState {

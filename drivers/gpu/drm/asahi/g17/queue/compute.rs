@@ -1045,6 +1045,20 @@ impl Queue {
         })
     }
 
+    /// Takes the rest of its allowance from the command at [`Self::timeout_head`] if that is
+    /// `head` ([`crate::g17::timeout::Verdict::forfeits`]). Returns whether it lost one. The
+    /// whole head is compared, so a command whose allowance ended since the verdict (its
+    /// `excused` changed) keeps nothing to lose and is skipped.
+    pub(crate) fn forfeit_head(&self, head: crate::g17::timeout::Head) -> bool {
+        if self.timeout_head() != Some(head) {
+            return false;
+        }
+        self.active
+            .iter()
+            .find(|active| !active.stamps_owed)
+            .is_some_and(|active| active.packet.forfeit_allowance())
+    }
+
     pub(crate) fn can_classify_timeout(&self, packet: &Arc<Packet>) -> bool {
         !self.quarantined && self.owns_packet(packet)
     }
@@ -1487,7 +1501,11 @@ impl Queue {
         for active in self.active.iter_mut() {
             let completion = &active.packet.completion;
             // A command whose stamp is owed ran and has its result.
-            if active.stamps_owed || completion.spared() || completion.guilty() {
+            if active.stamps_owed
+                || completion.spared()
+                || completion.guilty()
+                || completion.forfeited()
+            {
                 continue;
             }
             if dropped {

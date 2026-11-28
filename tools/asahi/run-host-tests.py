@@ -285,7 +285,7 @@ ASAHI_TESTS = {
                                    'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
                                    'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
                                    'timeout-fails-retired', 'no-owed-poll', 'count-recordless',
-                                   'count-owed-twice'), []),
+                                   'count-owed-twice', 'forfeit-spared', 'forfeit-unclassified'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-compute-retired-tests.py': [([], PASS)]

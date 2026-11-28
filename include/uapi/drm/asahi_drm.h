@@ -1344,20 +1344,22 @@ struct drm_asahi_queue_create {
 	 *   run alongside the allowance, not after it: a command is renewed
 	 *   for the longer of the two.
 	 *
-	 * The allowance is per command, and nothing bounds the sum: a queue
-	 * that is kept full of long commands occupies the GPU for as long as
-	 * it is fed. The driver does not shield the other clients from such a
-	 * queue: they share the GPU with it as the firmware schedules them,
-	 * and a command of another client may have to wait until a long
-	 * command ends. The watchdog does not fail such a waiting command,
-	 * render or compute, while the earlier command it waits behind runs
-	 * inside its allowance; afterwards the usual deferrals apply. A
-	 * waiting command is excused this way for at most the longest
-	 * allowance the system permits in total, so a command that keeps
-	 * waiting behind other clients' work longer than that and its own
-	 * deferrals is still failed. Userspace should ask for an allowance
-	 * only for queues whose commands need one, and keep those commands as
-	 * short as it can.
+	 * The allowance is per command. Other clients share the GPU with a
+	 * queue that uses one as the firmware schedules them, and a command of
+	 * another client may have to wait until a long command ends. The
+	 * watchdog does not fail such a waiting command, render or compute,
+	 * while the earlier command it waits behind runs inside its allowance;
+	 * afterwards the usual deferrals apply. A waiting command is excused
+	 * this way for at most the longest allowance the system permits in
+	 * total, however many commands it waits behind in turn. Once that is
+	 * used up, a later command it waits behind (not the one it first
+	 * waited behind) loses what is left of its allowance and its other
+	 * renewals. The watchdog then settles that command like any command
+	 * past its allowance, normally failing it with -ETIMEDOUT as a lost
+	 * device, together with the commands queued behind it, so that the
+	 * waiting command can go on. Userspace should ask for an allowance only
+	 * for queues whose commands need one, and keep those commands as short
+	 * as it can.
 	 */
 	__u32 compute_timeout_ms;
 

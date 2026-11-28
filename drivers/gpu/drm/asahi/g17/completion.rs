@@ -768,6 +768,7 @@ impl Completion {
             match class {
                 Class::Spared => 1,
                 Class::Guilty => 2,
+                Class::Forfeited => 3,
             },
             Ordering::Release,
         );
@@ -779,6 +780,11 @@ impl Completion {
 
     pub(crate) fn guilty(&self) -> bool {
         self.class.load(Ordering::Acquire) == 2
+    }
+
+    /// See [`Class::Forfeited`].
+    pub(crate) fn forfeited(&self) -> bool {
+        self.class.load(Ordering::Acquire) == 3
     }
 
     /// A recovery blamed this command, whatever class it keeps: it may have caused the fault,

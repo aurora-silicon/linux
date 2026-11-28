@@ -138,6 +138,12 @@ pub(crate) struct Packet {
     /// When the job's watchdog allowance ends (host ns, [`super::timeout::Allowance::end`]):
     /// zero under the default allowance, `u64::MAX` for a longer one not yet placed.
     allowance_end: AtomicU64,
+    /// Another VM's watchdog took the rest of the allowance away
+    /// ([`super::timeout::Verdict::forfeits`]).
+    forfeited: AtomicBool,
+    /// The publication of the command this job was first excused behind
+    /// ([`super::timeout::Verdict::first_excuse`]); zero before that.
+    first_excuse: AtomicU64,
 }
 
 impl Packet {
@@ -171,6 +177,8 @@ impl Packet {
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
                 allowance_end: AtomicU64::new(0),
+                forfeited: AtomicBool::new(false),
+                first_excuse: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
@@ -179,7 +187,30 @@ impl Packet {
     /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
     /// ([`super::timeout::Head::excused`]).
     pub(crate) fn within_allowance(&self, now: u64) -> bool {
-        now < self.allowance_end.load(Ordering::Relaxed)
+        !self.forfeited.load(Ordering::Relaxed) && now < self.allowance_end.load(Ordering::Relaxed)
+    }
+
+    /// Ends the job's allowance and every other renewal its own watchdog would grant it
+    /// ([`super::timeout::Verdict::forfeits`]): its next expiry goes straight to the
+    /// attribution. Returns whether the job had not lost them already.
+    pub(crate) fn forfeit_allowance(&self) -> bool {
+        !self.forfeited.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether another VM's watchdog took the job's allowance away.
+    pub(crate) fn allowance_forfeited(&self) -> bool {
+        self.forfeited.load(Ordering::Relaxed)
+    }
+
+    /// Records the command the job was first excused behind (`published`), once.
+    pub(crate) fn note_first_excuse(&self, published: u64) {
+        let _ = self.first_excuse.compare_exchange(0, published, Ordering::Relaxed,
+            Ordering::Relaxed);
+    }
+
+    /// The command the job was first excused behind; zero if none.
+    pub(crate) fn first_excuse(&self) -> u64 {
+        self.first_excuse.load(Ordering::Relaxed)
     }
 
     pub(crate) fn engine(&self) -> Engine {
@@ -423,6 +454,35 @@ impl PublishedExpiry {
     }
 }
 
+impl<B: Backend> Timeout<B> {
+    /// Attributes an expiry that no renewal of the job's own covered: deferred or excused
+    /// behind other work, or given up. `renews_shared` and `since_retired` are the sharing
+    /// inputs the renewals were decided on, for the log line.
+    fn settle(&mut self, renews_shared: bool, since_retired: Option<u64>) -> bool {
+        match self.backend.defer_timeout(&self.packet, self.victim_renewals, self.excused) {
+            super::timeout::Decision::Defer => {
+                self.victim_renewals = self.victim_renewals.saturating_add(1);
+                true
+            }
+            super::timeout::Decision::Excuse => {
+                self.excused = self.excused.saturating_add(1);
+                true
+            }
+            // The backend retired the job on its completion record: its fence has signalled.
+            super::timeout::Decision::Retire => true,
+            decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
+                // The sharing inputs are the ones the renewal above was decided on.
+                self.backend.gave_up(&self.packet, &super::timeout::GaveUp::new(
+                    &self.allowance, super::now_ns(), self.packet.command.long_job(),
+                    self.execution_renewals, renews_shared, self.shared_renewals, since_retired,
+                    self.victim_renewals, self.excused, decision,
+                ));
+                false
+            }
+        }
+    }
+}
+
 impl<B: Backend> Drop for Job<B> {
     fn drop(&mut self) {
         // Entity teardown can free a queued job without invoking cancel.
@@ -456,6 +516,12 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         if finished || job.packet.completion.take_replay_timeout() {
             return true;
         }
+        // A job whose allowance another VM's watchdog took away gets no renewal of its own
+        // left; only the attribution below decides between failing it and deferring it.
+        if job.packet.allowance_forfeited() {
+            let since_retired = super::recovery::since_retired(super::now_ns());
+            return job.settle(job.backend.renews_shared(), since_retired);
+        }
         // Within the allowance its queue asked for. Past it, the deferrals below still apply;
         // the shared renewals run alongside an allowance rather than after it.
         let placing = job.allowance.placing_after_wait(job.packet.is_published());
@@ -484,27 +550,7 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
         }
-        match job.backend.defer_timeout(&job.packet, job.victim_renewals, job.excused) {
-            super::timeout::Decision::Defer => {
-                job.victim_renewals = job.victim_renewals.saturating_add(1);
-                true
-            }
-            super::timeout::Decision::Excuse => {
-                job.excused = job.excused.saturating_add(1);
-                true
-            }
-            // The backend retired the job on its completion record: its fence has signalled.
-            super::timeout::Decision::Retire => true,
-            decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
-                // The sharing inputs are the ones the renewal above was decided on.
-                job.backend.gave_up(&job.packet, &super::timeout::GaveUp::new(
-                    &job.allowance, super::now_ns(), job.packet.command.long_job(),
-                    job.execution_renewals, renews_shared, job.shared_renewals, since_retired,
-                    job.victim_renewals, job.excused, decision,
-                ));
-                false
-            }
-        }
+        job.settle(renews_shared, since_retired)
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {

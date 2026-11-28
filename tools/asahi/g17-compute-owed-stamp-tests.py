@@ -52,6 +52,7 @@ def line(source, prefix):
 def fixture():
     retirement = (G17 / 'queue/compute/retirement.rs').read_text()
     compute = (G17 / 'queue/compute.rs').read_text()
+    exit = (G17 / 'queue/compute/exit.rs').read_text()
     control = (G17 / 'runtime/compute_control.rs').read_text()
     timeout = (G17 / 'timeout.rs').read_text()
     depth = re.search(r'pub\(crate\) const COMPUTE_DEPTH: usize = (\d+);',
@@ -80,7 +81,8 @@ def fixture():
         'pub(crate) fn quarantine(', 'pub(crate) fn retire(', 'fn classify_unexecuted(',
         'pub(crate) fn owns_packet(', 'pub(crate) fn retired_held(',
         'pub(crate) fn expire_stamp_wait(', 'pub(crate) fn timeout(',
-        'pub(crate) fn can_classify_timeout('])
+        'pub(crate) fn can_classify_timeout(', 'pub(crate) fn forfeit_head(',
+        'pub(crate) fn classify(']) + '\n' + item(exit, 'pub(crate) fn timed_out(')
     pairs = (G17 / 'pairs.rs').read_text()
     hz = re.search(r'pub\(crate\) const COMMAND_TIMESTAMP_HZ: u64 = ([0-9_]+);',
                    (ROOT / 'hw/t8140.rs').read_text()).group(1)
@@ -128,7 +130,7 @@ mod g17 {
     pub(crate) mod recovery {
         pub(crate) fn note_retired() {}
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(crate) enum Class { Spared, Guilty }
+        pub(crate) enum Class { Spared, Guilty, Forfeited }
     }
     pub(crate) mod trace {
         pub(crate) const COMPUTE: u8 = 1;
@@ -179,6 +181,7 @@ impl Completion {
     }
     fn spared(&self) -> bool { self.class.get() == Some(recovery::Class::Spared) }
     fn guilty(&self) -> bool { self.class.get() == Some(recovery::Class::Guilty) }
+    fn forfeited(&self) -> bool { self.class.get() == Some(recovery::Class::Forfeited) }
     fn classify(&self, class: recovery::Class) { self.class.set(Some(class)); }
     fn status(&self) -> &Arc<VmStatus> { &self.status }
 }
@@ -208,10 +211,14 @@ impl Vm { fn id(&self) -> u64 { self.0 } }
 pub struct Context { vm: Vm }
 impl Context { fn vm(&self) -> &Vm { &self.vm } }
 pub struct Order { sequence: u64 }
-pub struct Packet { completion: Arc<Completion>, order: Order, context: Context }
+pub struct Packet { completion: Arc<Completion>, order: Order, context: Context, forfeited: Cell<bool> }
 impl Packet {
     fn check_firmware_producers(&self) -> Result { Ok(()) }
     fn within_allowance(&self, _: u64) -> bool { false }
+    fn forfeit_allowance(&self) -> bool { !self.forfeited.replace(true) }
+    fn allowance_forfeited(&self) -> bool { self.forfeited.get() }
+    fn note_first_excuse(&self, _: u64) {}
+    fn first_excuse(&self) -> u64 { 0 }
 }
 pub struct WorkStateLease { drained: Cell<bool> }
 impl WorkStateLease { fn drained(&self) -> Result<bool> { Ok(self.drained.get()) } }
@@ -252,6 +259,7 @@ pub struct Queue {
     terminal: Option<(Arc<VmStatus>, Error)>,
     fault_stamp: Option<u32>,
     timed_out_at: u64,
+    exit: Option<()>,
 }
 impl Queue {
     fn qid(&self) -> u8 { 28 }
@@ -259,7 +267,6 @@ impl Queue {
     fn retire_configuration(&mut self, _: u64) -> Result { Ok(()) }
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
     fn qos_owner(&self) -> qos::Owner { qos::Owner }
-    fn classify(&self, _: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {}
     fn clear_owner(&mut self, stamp_released_at: bool) {
         self.owner = None;
         if stamp_released_at { self.released_at = now_ns(); }
@@ -287,6 +294,15 @@ impl Queues {
     /// Other VMs' heads, as render pairs and other queues give them.
     fn render_timeout_heads(&self) -> impl Iterator<Item = g17::timeout::Head> + '_ {
         self.render.iter().copied()
+    }
+    fn forfeit_blocker(&self, verdict: &g17::timeout::Verdict, excuse: g17::timeout::Excuse,
+        first: u64) -> Option<g17::timeout::Head> {
+        let computes: Vec<_> = self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.timeout_head()).collect();
+        let blocker = verdict.forfeits(excuse, first,
+            Iterator::chain(self.render_timeout_heads(), computes.into_iter()))?;
+        self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.forfeit_head(blocker)).then_some(blocker)
     }
 }
 pub struct Init;
@@ -334,13 +350,14 @@ mod owed {
             spared_deferred: false, awaiting_witness: false, retire_pending: false, last_end: 0,
             previous: None, submitted: 0, retirement_ready: true, released: false, owner: Some(OWNER),
             released_at: 0, heavy_run: 0, terminal: None, fault_stamp: None, timed_out_at: 0,
+            exit: None,
         }
     }
 
     /// Publishes the command of kick `kick`; `drained`: the rest of its ioctl completed.
     fn publish(queue: &mut Queue, kick: u64, drained: bool) -> Arc<Packet> {
         let packet = Arc::new(Packet { completion: Arc::new(Completion::new()),
-            order: Order { sequence: kick }, context: Context { vm: Vm(70) } });
+            order: Order { sequence: kick }, context: Context { vm: Vm(70) }, forfeited: Cell::new(false) });
         let ticket = Ticket { owner: OWNER, submission: kick, context_id: 1, qid: 28,
             descriptor: 0x1000 + kick, work_node: 0x2000, kick, ordinal: kick as u32,
             item_producer: 4, item_count: 64, epoch: EPOCH };
@@ -566,6 +583,45 @@ mod owed {
     }
 
     #[test]
+    fn a_forfeited_blocker_is_failed_and_killed_on_timeout() {
+        // Another VM's waiting job took the rest of this command's allowance: its next expiry
+        // fails it as its own. It is classed as forfeited, not spared, so its VM fails and on
+        // M5 the open timeout kill applies (timed_out), as for any command past its allowance.
+        for m5 in [true, false] {
+            let mut q = queue(m5);
+            let p = publish(&mut q, 0x10, true);
+            let p2 = publish(&mut q, 0x11, true);
+            let b = backend(q, vec![]);
+            assert!(p.forfeit_allowance() && !p.forfeit_allowance(), "a forfeit is taken once");
+            assert_eq!(b.defer_compute_timeout(&p, 0, 0), Decision::Own);
+            assert_eq!(class(&p), Some(recovery::Class::Forfeited), "m5 {m5}");
+            assert_eq!(class(&p2), Some(recovery::Class::Forfeited), "the queue's active set");
+            assert_eq!(b.timeout_compute(&p), Ok(()));
+            assert_eq!(result(&p), Some(Err(ETIMEDOUT)));
+            assert_eq!(result(&p2), Some(Err(ETIMEDOUT)));
+            assert_eq!(b.failed.get(), Some(ETIMEDOUT), "its VM fails, as past its allowance");
+            with_queue(&b, |q| {
+                assert!(q.quarantined && !q.spared_quarantine, "not a spared quarantine");
+                assert_eq!(q.timed_out(), m5, "M5 kills it on timeout");
+            });
+        }
+        // Without a forfeit the same expiry leaves the command unclassified, as before.
+        let mut q = queue(true);
+        let p = publish(&mut q, 0x10, true);
+        let b = backend(q, vec![]);
+        assert_eq!(b.defer_compute_timeout(&p, 0, 0), Decision::Own);
+        assert_eq!(class(&p), None);
+        // Spared work, by contrast, keeps its VM and is never killed: the forfeit must not be.
+        let mut q = queue(true);
+        let p = publish(&mut q, 0x10, true);
+        let b = backend(q, vec![]);
+        with_queue(&b, |q| q.classify(&|_| recovery::Class::Spared));
+        assert_eq!(b.timeout_compute(&p), Ok(()));
+        assert_eq!(b.failed.get(), None);
+        with_queue(&b, |q| assert!(q.spared_quarantine && !q.timed_out()));
+    }
+
+    #[test]
     fn a_watchdog_behind_retired_commands_weighs_its_own_command() {
         let mut q = queue(false);
         let p1 = publish(&mut q, 0x10, true);
@@ -745,8 +801,12 @@ MUTATIONS = {
     'held-stamped-pops': [('if stampless || at != 0 {', 'if stampless {')],
     'crossed-behind-owed': [('                    if at != 0 {\n                        // Only its stamp retires it now',
                              '                    if false {\n                        // Only its stamp retires it now')],
-    'owed-classified': [('if active.stamps_owed || completion.spared() || completion.guilty() {',
-                         'if completion.spared() || completion.guilty() {')],
+    # A forfeited blocker is spared again: no VM failure, no M5 timeout kill (linux#2887 review).
+    'forfeit-spared': [('Decision::Own if packet.allowance_forfeited() => Some(Class::Forfeited),',
+                        'Decision::Own if packet.allowance_forfeited() => Some(Class::Spared),')],
+    # A forfeited blocker is not classified at all.
+    'forfeit-unclassified': [('Decision::Own if packet.allowance_forfeited() => Some(Class::Forfeited),', '')],
+    'owed-classified': [('if active.stamps_owed\n                || completion.spared()', 'if completion.spared()')],
     'rebind-check-entry': [('self.previous.as_ref().is_some_and(|p| p.publication != first)',
                             'self.previous.as_ref().is_some_and(|p| p.publication != Some((front.packet.order.sequence, ticket.epoch)))')],
     'timeout-fails-retired': [('if !queue.owns_packet(packet) || queue.retired_held(packet) {',

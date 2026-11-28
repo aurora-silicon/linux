@@ -47,9 +47,17 @@ impl Backend {
                 verdict.decision = self.retire_on_record(firmware, packet, &mut deferred)?;
             }
             let decision = verdict.decision;
-            if decision == Decision::Spare {
+            // A command that lost its allowance to another VM's waiting work
+            // ([`timeout::Verdict::forfeits`]) is failed for that. It is not spared: a spared
+            // quarantine is never killed, and a forfeited command may be one that never ends.
+            let class = match decision {
+                Decision::Spare => Some(Class::Spared),
+                Decision::Own if packet.allowance_forfeited() => Some(Class::Forfeited),
+                _ => None,
+            };
+            if let Some(class) = class {
                 firmware.queues.compute_for_packet(self.owner, packet).ok_or(EIO)?
-                    .classify(&|_| Class::Spared);
+                    .classify(&|_| class);
             }
             if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
                 dev_warn!(self.shared.dev.as_ref(),
@@ -57,6 +65,16 @@ impl Backend {
                     self.owner, own.vm, own.published, renewals, excused, decision,
                     blocker.vm, blocker.published, u8::from(blocker.failed),
                     u8::from(blocker.excused));
+            }
+            if let Some(published) = verdict.first_excuse(excuse) {
+                packet.note_first_excuse(published);
+            }
+            if let Some(blocker) =
+                firmware.queues.forfeit_blocker(&verdict, excuse, packet.first_excuse())
+            {
+                dev_warn!(self.shared.dev.as_ref(),
+                    "Compute watchdog owner={} vm={} publication={} excused for the longest allowance: blocker_vm={} blocker_publication={} loses its allowance\n",
+                    self.owner, own.vm, own.published, blocker.vm, blocker.published);
             }
             Ok(decision)
         })();

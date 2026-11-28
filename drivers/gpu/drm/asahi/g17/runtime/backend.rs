@@ -506,6 +506,17 @@ impl job::Backend for Backend {
                         decision, blocker.vm, blocker.published, u8::from(blocker.failed),
                         u8::from(blocker.excused));
                 }
+                if let Some(published) = verdict.first_excuse(excuse) {
+                    packet.note_first_excuse(published);
+                }
+                if let Some(blocker) =
+                    firmware.queues.forfeit_blocker(&verdict, excuse, packet.first_excuse())
+                {
+                    dev_warn!(self.shared.dev.as_ref(),
+                        "Render watchdog owner={} vm={} publication={} excused for the longest allowance: blocker_vm={} blocker_publication={} loses its allowance\n",
+                        self.owner, verdict.own.vm, verdict.own.published, blocker.vm,
+                        blocker.published);
+                }
             }
             Ok(decision)
         })();
