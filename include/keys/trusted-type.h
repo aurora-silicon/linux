@@ -60,6 +60,13 @@ struct trusted_key_ops {
 	 */
 	unsigned char migratable;
 
+	/*
+	 * flag to indicate if the source accepts "import": sealing key
+	 * material the caller already holds in plaintext. Off for the
+	 * upstream sources, whose keys are only made by "new".
+	 */
+	unsigned char importable;
+
 	/* Initialize key interface. */
 	int (*init)(void);
 

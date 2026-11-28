@@ -23,6 +23,7 @@
 #include <linux/parser.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
+#include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/static_call.h>
 #include <linux/string.h>
@@ -77,6 +78,8 @@ static struct trusted_key_source *trusted_key_source_registered;
  * registered later keeps its migration policy here, -1 while there is none.
  */
 static int trusted_key_source_migratable = -1;
+/* The active source accepts "import" (its ops->importable). */
+static bool trusted_key_source_importable;
 /* trusted_key_core_init() has run once, from init_trusted(). */
 static bool trusted_key_core_done;
 
@@ -152,6 +155,7 @@ int register_trusted_key_source(struct trusted_key_source *src)
 	static_call_update(trusted_key_unseal, src->ops->unseal);
 	static_call_update(trusted_key_get_random, get_random);
 	WRITE_ONCE(trusted_key_source_migratable, src->ops->migratable);
+	WRITE_ONCE(trusted_key_source_importable, src->ops->importable);
 	trusted_key_source_active = true;
 	trusted_key_source_registered = src;
 
@@ -185,6 +189,7 @@ void unregister_trusted_key_source(struct trusted_key_source *src)
 	if (src->ops->exit)
 		src->ops->exit();
 	WRITE_ONCE(trusted_key_source_migratable, -1);
+	WRITE_ONCE(trusted_key_source_importable, false);
 	trusted_key_source_active = false;
 	trusted_key_source_registered = NULL;
 
@@ -239,6 +244,17 @@ static int datablob_parse(char **datablob, struct trusted_key_payload *p)
 		ret = Opt_new;
 		break;
 	case Opt_import:
+		/*
+		 * Seal caller-held plaintext only when the kernel allows it and
+		 * the active source opts in, and never under integrity
+		 * lockdown. All of this is checked before the source is called.
+		 */
+		if (!IS_ENABLED(CONFIG_TRUSTED_KEYS_IMPORT) ||
+		    !READ_ONCE(trusted_key_source_importable))
+			return -EINVAL;
+		ret = security_locked_down(LOCKDOWN_INTEGRITY_MAX);
+		if (ret)
+			return ret;
 		c = strsep(datablob, " \t");
 		if (!c || strlen(c) % 2)
 			return -EINVAL;
@@ -576,6 +592,8 @@ trusted_key_core_init(const struct trusted_key_source *sources, size_t n)
 
 			trusted_key_exit = sources[i].ops->exit;
 			migratable = sources[i].ops->migratable;
+			WRITE_ONCE(trusted_key_source_importable,
+				   sources[i].ops->importable);
 		}
 
 		if (!ret || ret != -ENODEV)

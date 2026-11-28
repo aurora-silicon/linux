@@ -16,6 +16,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/key-type.h>
 #include <keys/trusted-type.h>
@@ -49,13 +50,28 @@ static int tk_init(void)
 	return rs_init ? rs_init() : -ENODEV;
 }
 
+/*
+ * The SEP source binds a key to the machine ref-key only: it has no PCR
+ * binding, no blobauth or keyauth password and no key handle. Refuse any
+ * option after the command, so that a caller who asks for one gets an error
+ * instead of a key without the protection it asked for.
+ */
+static bool tk_has_options(const char *datablob)
+{
+	return datablob && *skip_spaces(datablob);
+}
+
 static int tk_seal(struct trusted_key_payload *p, char *datablob)
 {
+	if (tk_has_options(datablob))
+		return -EINVAL;
 	return rs_seal ? rs_seal(p, datablob) : -ENODEV;
 }
 
 static int tk_unseal(struct trusted_key_payload *p, char *datablob)
 {
+	if (tk_has_options(datablob))
+		return -EINVAL;
 	return rs_unseal ? rs_unseal(p, datablob) : -ENODEV;
 }
 
@@ -78,6 +94,8 @@ static char sep_tk_name[] = "applesep";
 
 static struct trusted_key_ops sep_tk_ops = {
 	.migratable	= 0,
+	/* "import": see Documentation/security/keys/apple-sep.rst */
+	.importable	= 1,
 	.init		= tk_init,
 	.seal		= tk_seal,
 	.unseal		= tk_unseal,
