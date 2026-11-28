@@ -74,6 +74,12 @@ static const u8 *dcp_adt_bytes(struct dcp_adt_cursor *c, size_t size)
 	return p;
 }
 
+/*
+ * A panel serial property is a string of serials; the K114s (T6050) one is
+ * 362 bytes, the J616s one 170.  Only its hash is used.
+ */
+#define DCP_ADT_SERIAL_MAX	1024
+
 /* Hash panel serial bytes into EDID's numeric serial; never log the input. */
 static u32 dcp_adt_serial(const u8 *data, size_t size)
 {
@@ -103,7 +109,8 @@ static void dcp_adt_panel_property(struct dcp_panel_adt *panel, const char *name
 		    !strcmp(name, "panel-id")) && size == 4) {
 		id->product = number & U16_MAX;
 	} else if ((!strcmp(name, "serial-number") ||
-		    !strcmp(name, "raw-panel-serial-number")) && size && size <= 256) {
+		    !strcmp(name, "raw-panel-serial-number")) && size &&
+		   size <= DCP_ADT_SERIAL_MAX) {
 		id->serial = dcp_adt_serial(value, size);
 	} else if (!strcmp(name, "display-serial-number") && size == 4) {
 		id->serial = number;

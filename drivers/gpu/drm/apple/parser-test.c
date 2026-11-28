@@ -1774,6 +1774,53 @@ static void parser_identity_bounds(struct kunit *test)
 	}
 }
 
+/* A /product panel serial longer than 256 bytes still names the panel. */
+static void parser_adt_long_serial(struct kunit *test)
+{
+	const char root[] = "device-tree", product[] = "product";
+	const size_t capacity = 2048;
+	u8 *adt = kunit_kzalloc(test, capacity, GFP_KERNEL);
+	u8 *serial = kunit_kzalloc(test, 1025, GFP_KERNEL);
+	static const u32 sizes[] = { 170, 362, 1024, 1025 };
+	u32 seen[ARRAY_SIZE(sizes)];
+
+	KUNIT_ASSERT_NOT_NULL(test, adt);
+	KUNIT_ASSERT_NOT_NULL(test, serial);
+	/* Synthetic printable bytes, not a real serial. */
+	for (unsigned int i = 0; i < 1025; i++)
+		serial[i] = 'A' + i % 26;
+	for (unsigned int t = 0; t < ARRAY_SIZE(sizes); t++) {
+		struct dcp_panel_adt panel = { .identity = { .manufacturer = "APP" } };
+		size_t pos = 8, used;
+
+		memset(adt, 0, capacity);
+		put_unaligned_le32(1, adt);
+		put_unaligned_le32(1, adt + 4);
+		used = parser_adt_property(adt + pos, capacity - pos, "name", root, sizeof(root));
+		KUNIT_ASSERT_GT(test, used, 0);
+		pos += used;
+		put_unaligned_le32(2, adt + pos);
+		put_unaligned_le32(0, adt + pos + 4);
+		pos += 8;
+		used = parser_adt_property(adt + pos, capacity - pos, "name", product,
+					   sizeof(product));
+		KUNIT_ASSERT_GT(test, used, 0);
+		pos += used;
+		used = parser_adt_property(adt + pos, capacity - pos,
+					   "raw-panel-serial-number", serial, sizes[t]);
+		KUNIT_ASSERT_GT(test, used, 0);
+		pos += used;
+		KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, pos, &panel), 0);
+		seen[t] = panel.identity.serial;
+	}
+	KUNIT_EXPECT_NE(test, seen[0], 0U);
+	KUNIT_EXPECT_NE(test, seen[1], 0U);
+	KUNIT_EXPECT_NE(test, seen[2], 0U);
+	KUNIT_EXPECT_NE(test, seen[0], seen[1]);
+	/* Beyond the bound the property is ignored, as before. */
+	KUNIT_EXPECT_EQ(test, seen[3], 0U);
+}
+
 static void parser_adt_bounds(struct kunit *test)
 {
 	struct dcp_panel_adt panel = { .identity = { .manufacturer = "APP" } };
@@ -2373,6 +2420,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_h17p_publication),
 	KUNIT_CASE(parser_panel_v13_5_publication),
 	KUNIT_CASE(parser_panel_identity_absent),
+	KUNIT_CASE(parser_adt_long_serial),
 	KUNIT_CASE(parser_adt_bounds),
 	KUNIT_CASE(parser_identity_bounds),
 	KUNIT_CASE(parser_panel_identity_stable),
