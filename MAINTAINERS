@@ -2791,6 +2791,7 @@ F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
+F:	drivers/dma/apple-piodma-test.c
 F:	drivers/dma/apple-piodma.c
 F:	drivers/gpio/gpio-macsmc.c
 F:	drivers/hwmon/apple-aon-ptd-hwmon*.c
