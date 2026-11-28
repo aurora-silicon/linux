@@ -2040,7 +2040,10 @@ def main():
 
     def read(path, ref=None):
         ref = ref or a.ref
-        return (subprocess.check_output(['git', 'show', f'{ref}:{path}'], cwd=ROOT, text=True,
+        # OLD_REF is only compared when it is already in the clone: the remote no longer serves it, and in a
+        # partial clone an on-demand fetch of it retries for hours at GBs of memory instead of failing.
+        env = dict(os.environ, GIT_NO_LAZY_FETCH='1') if ref == OLD_REF else None
+        return (subprocess.check_output(['git', 'show', f'{ref}:{path}'], cwd=ROOT, text=True, env=env,
                                         stderr=subprocess.DEVNULL)
                 if ref else (ROOT / path).read_text())
 
