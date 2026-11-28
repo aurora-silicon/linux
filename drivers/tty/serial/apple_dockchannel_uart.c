@@ -15,6 +15,7 @@
 #include <linux/tty_flip.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
+#include <linux/pm.h>
 
 #include "apple_dockchannel.h"
 
@@ -46,10 +47,16 @@
 
 #define MAX_PORTS         8
 /*
- * Software-drained channels are polled at this interval. At 115200 baud
- * that is about 115 bytes per poll, far below the FIFO size.
+ * Software-drained channels poll at SW_DRAIN_MS while active (~115 bytes at
+ * 115200 baud, far below the 2 KiB FIFO). When open and idle they back off
+ * exponentially to SW_DRAIN_IDLE_MS (~1152 bytes at 115200 baud, still under
+ * the FIFO). A console port stays initialized after its last close (tty_port
+ * skips shutdown for consoles), so when no tty holds it open and no TX is
+ * pending the drain timer stops completely and resumes via start_rx() on
+ * reopen.
  */
-#define SW_DRAIN_MS       10
+#define SW_DRAIN_MS        10
+#define SW_DRAIN_IDLE_MS   100
 /*
  * TX never waits for FIFO room: what does not fit stays in the xmit buffer
  * and the timer sends it as room appears. After this many ticks with no room
@@ -67,8 +74,13 @@ struct dcuart_port {
 	/* The channel does not interrupt on RX; drain it from a timer. */
 	bool sw_drain;
 	struct timer_list drain_timer;
-	/* Serializes IRQ mask updates and RX FIFO draining. */
+	/* Serializes IRQ mask updates, RX FIFO draining, and drain_timer state. */
 	spinlock_t lock;
+	bool drain_active;
+	bool rx_stopped;
+	bool shutting_down;
+	unsigned int drain_ms;
+	unsigned int drain_kick_gen;
 	/* DOCKCHANNEL_NEVER_WAIT: TX never waits for room (J775D only). */
 	bool never_wait;
 	/* One console write's view of the TX FIFO (dockchannel_console_putc). */
@@ -293,31 +305,94 @@ static unsigned int dcuart_tx_chars(struct dcuart_port *dcuart, bool tick)
 	return 0;
 }
 
+static bool dcuart_has_reader(struct uart_port *port)
+{
+	struct tty_port *tport = &port->state->port;
+	unsigned long flags;
+	bool open;
+
+	if (!tport->console)
+		return true;
+
+	spin_lock_irqsave(&tport->lock, flags);
+	open = tport->count > 0 || tport->tty;
+	spin_unlock_irqrestore(&tport->lock, flags);
+	return open;
+}
+
+static unsigned int dcuart_next_drain_ms(struct dcuart_port *dcuart,
+					 bool active)
+{
+	unsigned int cur;
+
+	if (active)
+		return SW_DRAIN_MS;
+
+	cur = dcuart->drain_ms ? dcuart->drain_ms : SW_DRAIN_MS;
+	return min_t(unsigned int, cur * 2, SW_DRAIN_IDLE_MS);
+}
+
+/* Called with dcuart->lock held. Never pushes an earlier deadline forward. */
+static void dcuart_arm_drain_timer_locked(struct dcuart_port *dcuart,
+					  unsigned int delay_ms)
+{
+	unsigned long expires;
+
+	if (dcuart->shutting_down)
+		return;
+
+	expires = jiffies + msecs_to_jiffies(delay_ms);
+	if (timer_pending(&dcuart->drain_timer) &&
+	    time_before_eq(dcuart->drain_timer.expires, expires)) {
+		if (!dcuart->drain_ms || delay_ms < dcuart->drain_ms)
+			dcuart->drain_ms = delay_ms;
+		return;
+	}
+
+	dcuart->drain_ms = delay_ms;
+	mod_timer(&dcuart->drain_timer, expires);
+}
+
+static void dcuart_kick_drain_timer(struct dcuart_port *dcuart)
+{
+	unsigned long flags;
+
+	if (!dcuart->sw_drain)
+		return;
+
+	spin_lock_irqsave(&dcuart->lock, flags);
+	if (dcuart->drain_active && !dcuart->shutting_down &&
+	    !dcuart->rx_stopped) {
+		dcuart->drain_kick_gen++;
+		dcuart_arm_drain_timer_locked(dcuart, SW_DRAIN_MS);
+	}
+	spin_unlock_irqrestore(&dcuart->lock, flags);
+}
+
 static void dcuart_drain_timer(struct timer_list *t)
 {
 	struct dcuart_port *dcuart = timer_container_of(dcuart, t, drain_timer);
 	struct uart_port *port = &dcuart->port;
 	unsigned long flags;
-	unsigned int pending;
+	unsigned int pending = 0;
+	unsigned int start_gen;
+	bool reader;
+	bool got = false;
 
-	if (!dcuart->never_wait) {
-		bool got;
+	/*
+	 * Snapshot drain_kick_gen before checking reader presence: any reopen
+	 * that runs after this point advances drain_kick_gen under dcuart->lock,
+	 * while any reopen before it is already visible to dcuart_has_reader().
+	 */
+	spin_lock_irqsave(&dcuart->lock, flags);
+	start_gen = dcuart->drain_kick_gen;
+	spin_unlock_irqrestore(&dcuart->lock, flags);
 
+	reader = dcuart->sw_drain && dcuart_has_reader(port);
+	if (reader) {
 		spin_lock_irqsave(&dcuart->lock, flags);
-		got = dcuart_drain_rx(dcuart);
-		spin_unlock_irqrestore(&dcuart->lock, flags);
-
-		if (got)
-			tty_flip_buffer_push(&port->state->port);
-		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
-		return;
-	}
-
-	if (dcuart->sw_drain) {
-		bool got;
-
-		spin_lock_irqsave(&dcuart->lock, flags);
-		got = dcuart_drain_rx(dcuart);
+		if (!dcuart->shutting_down && !dcuart->rx_stopped)
+			got = dcuart_drain_rx(dcuart);
 		spin_unlock_irqrestore(&dcuart->lock, flags);
 
 		if (got)
@@ -325,11 +400,24 @@ static void dcuart_drain_timer(struct timer_list *t)
 	}
 
 	uart_port_lock_irqsave(port, &flags);
-	pending = dcuart_tx_chars(dcuart, true);
-	uart_port_unlock_irqrestore(port, flags);
+	if (dcuart->never_wait)
+		pending = dcuart_tx_chars(dcuart, true);
 
-	if (dcuart->sw_drain || pending)
-		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
+	spin_lock(&dcuart->lock);
+	if (!dcuart->shutting_down) {
+		bool kicked = dcuart->drain_kick_gen != start_gen;
+		bool need_rx = dcuart->sw_drain && !dcuart->rx_stopped &&
+			       (reader || kicked);
+
+		if (need_rx || pending) {
+			unsigned int delay = dcuart_next_drain_ms(dcuart,
+								  got || pending || kicked);
+
+			dcuart_arm_drain_timer_locked(dcuart, delay);
+		}
+	}
+	spin_unlock(&dcuart->lock);
+	uart_port_unlock_irqrestore(port, flags);
 }
 
 /*
@@ -348,6 +436,7 @@ static unsigned int dcuart_tx_empty(struct uart_port *port)
 static void dcuart_start_tx(struct uart_port *port)
 {
 	struct dcuart_port *dcuart = port_to_dc(port);
+	unsigned long flags;
 
 	if (!dcuart->never_wait) {
 		struct tty_port *tport = &port->state->port;
@@ -357,16 +446,43 @@ static void dcuart_start_tx(struct uart_port *port)
 			dcuart_putc(port, ch);
 			port->icount.tx++;
 		}
+		dcuart_kick_drain_timer(dcuart);
 		return;
 	}
 
-	/* The rest goes from the timer, which the RX poll keeps running anyway. */
-	if (dcuart_tx_chars(dcuart, false) && !timer_pending(&dcuart->drain_timer))
-		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
+	/* The rest goes from the timer; shorten any backed-off poll interval. */
+	if (dcuart_tx_chars(dcuart, false)) {
+		spin_lock_irqsave(&dcuart->lock, flags);
+		if (!dcuart->shutting_down) {
+			dcuart->drain_kick_gen++;
+			dcuart_arm_drain_timer_locked(dcuart, SW_DRAIN_MS);
+		}
+		spin_unlock_irqrestore(&dcuart->lock, flags);
+	} else {
+		dcuart_kick_drain_timer(dcuart);
+	}
 }
 
 static void dcuart_stop_tx(struct uart_port *port)
 {
+}
+
+static void dcuart_start_rx(struct uart_port *port)
+{
+	struct dcuart_port *dcuart = port_to_dc(port);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcuart->lock, flags);
+	dcuart->rx_stopped = false;
+	if (dcuart->drain_active && !dcuart->shutting_down) {
+		if (dcuart->sw_drain) {
+			dcuart->drain_kick_gen++;
+			dcuart_arm_drain_timer_locked(dcuart, SW_DRAIN_MS);
+		} else {
+			dcuart_irq_enable(dcuart, dcuart->irq_rx);
+		}
+	}
+	spin_unlock_irqrestore(&dcuart->lock, flags);
 }
 
 static void dcuart_stop_rx(struct uart_port *port)
@@ -375,7 +491,11 @@ static void dcuart_stop_rx(struct uart_port *port)
 	unsigned long flags;
 
 	spin_lock_irqsave(&dcuart->lock, flags);
+	dcuart->rx_stopped = true;
 	dcuart_irq_disable(dcuart, dcuart->irq_rx);
+	if (dcuart->sw_drain &&
+	    (!dcuart->never_wait || kfifo_is_empty(&port->state->port.xmit_fifo)))
+		timer_delete(&dcuart->drain_timer);
 	spin_unlock_irqrestore(&dcuart->lock, flags);
 }
 
@@ -399,16 +519,19 @@ static int dcuart_startup(struct uart_port *port)
 		port->state->port.closing_wait = ASYNC_CLOSING_WAIT_NONE;
 
 	spin_lock_irqsave(&dcuart->lock, flags);
+	dcuart->shutting_down = false;
+	dcuart->rx_stopped = false;
+	dcuart->drain_active = true;
 	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
 	writel_relaxed(1, dcuart->config_base + CONFIG_RX_THRESH);
 	writel_relaxed(FIFO_SIZE, dcuart->config_base + CONFIG_TX_THRESH);
 	if (!dcuart->sw_drain)
 		dcuart_irq_enable(dcuart, dcuart->irq_rx);
+	else
+		dcuart_arm_drain_timer_locked(dcuart, SW_DRAIN_MS);
 	spin_unlock_irqrestore(&dcuart->lock, flags);
 
-	if (dcuart->sw_drain)
-		mod_timer(&dcuart->drain_timer, jiffies + msecs_to_jiffies(SW_DRAIN_MS));
-	else
+	if (!dcuart->sw_drain)
 		enable_irq(port->irq);
 	return 0;
 }
@@ -418,15 +541,17 @@ static void dcuart_shutdown(struct uart_port *port)
 	struct dcuart_port *dcuart = port_to_dc(port);
 	unsigned long flags;
 
+	spin_lock_irqsave(&dcuart->lock, flags);
+	dcuart->shutting_down = true;
+	dcuart->drain_active = false;
+	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
+	spin_unlock_irqrestore(&dcuart->lock, flags);
+
 	/* With never_wait the timer also sends TX in IRQ mode. */
 	if (dcuart->sw_drain || dcuart->never_wait)
 		timer_delete_sync(&dcuart->drain_timer);
 	if (!dcuart->sw_drain)
 		disable_irq(port->irq);
-
-	spin_lock_irqsave(&dcuart->lock, flags);
-	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
-	spin_unlock_irqrestore(&dcuart->lock, flags);
 }
 
 static void dcuart_set_mctrl(struct uart_port *port, unsigned int mctrl)
@@ -445,6 +570,7 @@ static void dcuart_set_termios(struct uart_port *port, struct ktermios *new,
 	new->c_cflag |= CS8 | CLOCAL;
 	tty_termios_encode_baud_rate(new, 115200, 115200);
 	uart_update_timeout(port, new->c_cflag, 115200);
+	dcuart_kick_drain_timer(port_to_dc(port));
 }
 
 static void dcuart_release_port(struct uart_port *port)
@@ -466,6 +592,7 @@ static const struct uart_ops dcuart_ops = {
 	.tx_empty = dcuart_tx_empty,
 	.start_tx = dcuart_start_tx,
 	.stop_tx = dcuart_stop_tx,
+	.start_rx = dcuart_start_rx,
 	.stop_rx = dcuart_stop_rx,
 	.type = dcuart_type,
 	.startup = dcuart_startup,
@@ -566,10 +693,35 @@ cleanup:
 static void dcuart_remove(struct platform_device *pdev)
 {
 	struct dcuart_port *dcuart = platform_get_drvdata(pdev);
+	unsigned long flags;
 
 	uart_remove_one_port(&dcuart_drv, &dcuart->port);
+
+	/* A console port skips shutdown on hangup; ensure the timer stops. */
+	spin_lock_irqsave(&dcuart->lock, flags);
+	dcuart->shutting_down = true;
+	dcuart->drain_active = false;
+	spin_unlock_irqrestore(&dcuart->lock, flags);
+	timer_delete_sync(&dcuart->drain_timer);
+
 	dcuart_ports[dcuart->port.line] = NULL;
 }
+
+static int dcuart_suspend(struct device *dev)
+{
+	struct dcuart_port *dcuart = dev_get_drvdata(dev);
+
+	return uart_suspend_port(&dcuart_drv, &dcuart->port);
+}
+
+static int dcuart_resume(struct device *dev)
+{
+	struct dcuart_port *dcuart = dev_get_drvdata(dev);
+
+	return uart_resume_port(&dcuart_drv, &dcuart->port);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dcuart_pm_ops, dcuart_suspend, dcuart_resume);
 
 static struct platform_driver dcuart_platform_drv = {
 	.probe          = dcuart_probe,
@@ -577,6 +729,7 @@ static struct platform_driver dcuart_platform_drv = {
 	.driver         = {
 		.name   = "apple-dockchannel-uart",
 		.of_match_table = dcuart_id_table,
+		.pm     = pm_sleep_ptr(&dcuart_pm_ops),
 	},
 };
 
