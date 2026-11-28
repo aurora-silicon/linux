@@ -37,6 +37,7 @@
 
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
+#include "t6050-k114c-isp.dtsi"
 
 /* The internal panel, handed over by the boot loader */
 #include "t6050-k114-k116-display.dtsi"
