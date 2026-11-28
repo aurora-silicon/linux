@@ -209,7 +209,17 @@ int main(void)
  assert(rb->commonring.r_ptr == 63 && rb->commonring.w_ptr == 10);
  put16(rb->r_idx_addr, 64); put16(rb->w_idx_addr, 0xffff);
  assert(brcmf_pcie_ring_mb_update_rptr(rb) == -EIO && brcmf_pcie_ring_mb_update_wptr(rb) == -EIO);
- assert(rb->commonring.r_ptr == 63 && rb->commonring.w_ptr == 10); cases++;
+ assert(rb->commonring.r_ptr == 63 && rb->commonring.w_ptr == 10 && errs == 2); cases++;
+ /* Allocated flowrings have no depth until configured: do not read or log their indices. */
+ reset(); devinfo.state = BRCMFMAC_PCIE_STATE_UP; assert(!init() && !rings());
+ rb = &devinfo.shared.flowrings[0]; assert(!rb->commonring.depth);
+ const u16 unconfigured_ptrs[] = { 0, 0xffff };
+ for (unsigned i = 0; i < sizeof(unconfigured_ptrs) / sizeof(unconfigured_ptrs[0]); i++) {
+  put16(rb->r_idx_addr, unconfigured_ptrs[i]); put16(rb->w_idx_addr, unconfigured_ptrs[i]);
+  unsigned long before = reads;
+  assert(brcmf_pcie_ring_mb_update_rptr(rb) == -EIO && brcmf_pcie_ring_mb_update_wptr(rb) == -EIO);
+  assert(!rb->commonring.r_ptr && !rb->commonring.w_ptr && !errs && reads == before); cases++;
+ }
  /* A console descriptor or buffer outside the TCM leaves the console off; setup goes on. */
  reset(); put32(SHARED + BRCMF_SHARED_CONSOLE_ADDR_OFFSET, TCM_SIZE - 4);
  assert(!init() && !devinfo.shared.console.base_addr); cases++;
@@ -254,6 +264,7 @@ MUTATIONS = {
                    '\tptr = devinfo->read_ptr(devinfo, ring->r_idx_addr);\n\tif (false) {'),
     'wptr-depth': ('\tptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);\n\tif (ptr >= commonring->depth) {',
                    '\tptr = devinfo->read_ptr(devinfo, ring->w_idx_addr);\n\tif (false) {'),
+    'unconfigured-depth': ('\tif (!commonring->depth)\n', '\tif (false)\n'),
     'console-desc': ('\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,\n'
                      '\t\t\t\t\tBRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {', '\t    false) {'),
     'console-none': ('\tif (!console->base_addr ||\n', '\tif (false ||\n'),
