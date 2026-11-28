@@ -2282,6 +2282,7 @@ impl Firmware {
             self.slots.tilemap_clear_bytes_total()
         )?;
         writeln!(f, "type0: fs2c {} c2ta {}", s.fs2c0, s.c2ta0)?;
+        writeln!(f, "fs_ring: dep {} order {}", s.fs_dep, s.fs_order)?;
         write!(f, "horizon:")?;
         for n in s.hz.iter() {
             write!(f, " {}", n)?;

@@ -3,6 +3,7 @@
 """Execute production M4 publication/error isolation with a CPU-only transport recorder."""
 from common import kernel_root, output_dir, rustc, sha
 import json
+import re
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/engine.rs'
@@ -58,6 +59,18 @@ assert 'note_msaa_render' not in prefix_render_fn
 assert 'f.msaa |= cmd.is_multisampled();' in prefix_render_fn
 assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
 assert 'p.fs_dep.write(0, &dep)?;' in prefix_render_fn
+# The FS->FS barrier is posted only when the plan asks for it and the FS ring's order does not
+# cover it (cross-VM or InitBM). The decision comes after every InitBM producer is known, and
+# the counters are staged on Prefix and committed only after TA producer publication.
+assert (
+    prefix_render_fn.index('let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);')
+    < prefix_render_fn.index('let fs_ordered = fs_ring_orders_prev(cross_vm_prev, producer_initbm, init_buffer);')
+    < prefix_render_fn.index('if let Some(wait_fs) = plan.fs_render_wait {')
+    < prefix_render_fn.index('p.fs_dep.write(0, &dep)?;')
+), 'fs_ring_orders_prev must follow producer_initbm/init_buffer and gate p.fs_dep'
+assert 'pf.fs_order += 1;' in prefix_render_fn and 'pf.fs_dep += 1;' in prefix_render_fn
+assert 'self.engine.stats.fs_dep' not in prefix_render_fn
+assert 'self.engine.stats.fs_order' not in prefix_render_fn
 assert 'p.compute_barrier.write(off, &cbar)?;' in prefix_render_fn
 assert 'p.fs_compute_barrier.write(off, &fcbar)?;' in prefix_render_fn
 c2ta_slice = prefix_render_fn[
@@ -81,6 +94,9 @@ assert 'let waits_for_timestamps = c.query_access' in can_queue_behind_fn
 assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
 publish_prefix_body_fn = item('fn publish_prefix_body(')
 assert 'self.graph.render.threshold.w32(0, prefix.draw as u32)?;' in publish_prefix_body_fn
+_ta_pub = publish_prefix_body_fn.index('&self.graph.render.qstate[0],')
+assert publish_prefix_body_fn.index('self.engine.stats.fs_dep =') > _ta_pub
+assert publish_prefix_body_fn.index('self.engine.stats.fs_order =') > _ta_pub
 _visible = publish_prefix_body_fn.index('*visible = true;')
 assert publish_prefix_body_fn.count('job.vm.note_msaa_render();') == 1
 assert publish_prefix_body_fn.index('job.vm.note_msaa_render();') > _visible
@@ -3273,6 +3289,17 @@ mod msaa_fold_scope {
     }
 }
 
+__FS_RING_ORDERS_PREV__
+
+#[test]
+fn fs_ring_orders_prev_keeps_cross_vm_and_initbm_barriers() {
+    assert!(fs_ring_orders_prev(false, false, false));
+    assert!(!fs_ring_orders_prev(true, false, false));
+    assert!(!fs_ring_orders_prev(false, true, false));
+    assert!(!fs_ring_orders_prev(false, false, true));
+    assert!(!fs_ring_orders_prev(true, true, true));
+}
+
 '''
 harness = harness.replace('__LOGIC__', str(production.parent / 'recovery/logic.rs'))
 
@@ -3385,6 +3412,7 @@ for token, declaration in {
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
+    '__FS_RING_ORDERS_PREV__': 'fn fs_ring_orders_prev(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::vm::VmState", "crate::Vm").replace("super::fence::", "crate::fence::"))
 unit = output / 'publication.rs'
@@ -3399,7 +3427,9 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 70, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True,
+    'tests': int(re.search(r'^test result: ok\. (\d+) passed;', log, re.MULTILINE)[1]),
+    'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')
