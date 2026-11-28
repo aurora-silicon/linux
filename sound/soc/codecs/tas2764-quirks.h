@@ -92,17 +92,15 @@ static const struct reg_sequence tas2764_thermal_th1_dis_seq[] = {
  */
 #define TAS2764_SHUTDOWN_DANCE		BIT(7)
 
-static const struct reg_sequence tas2764_shutdown_dance_init_seq[] = {
-	/*
-	 * SDZ_MODE=01 (immediate)
-	 *
-	 * We want the shutdown to happen under the influence of
-	 * the magic writes in the 0xfdXX region, so make sure
-	 * the shutdown is immediate and there's no grace period
-	 * followed by the codec part.
-	 */
-	REG_SEQ0(TAS2764_REG(0x0, 0x7), 0x60),
-};
+/*
+ * The dance's init step, SDZ_MODE=01 (immediate), is made in
+ * tas2764_apply_init_quirks() as an update of that field alone.
+ *
+ * We want the shutdown to happen under the influence of
+ * the magic writes in the 0xfdXX region, so make sure
+ * the shutdown is immediate and there's no grace period
+ * followed by the codec part.
+ */
 
 static const struct reg_sequence tas2764_pre_shutdown_seq[] = {
 	REG_SEQ0(TAS2764_REG(0xfd, 0x0d), 0xd), /* switch hidden page */
@@ -120,7 +118,7 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
 					     unsigned int target)
 {
 	unsigned int curr;
-	int ret;
+	int ret, err;
 
 	curr = snd_soc_component_read_field(tas2764->component,
 					       TAS2764_PWR_CTRL,
@@ -129,26 +127,37 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
 	if (target == curr)
 		return 0;
 
-	/* Handle power state transition to shutdown */
+	/*
+	 * Handle power state transition to shutdown. update_bits() returns 1
+	 * when it changed the register, so only a negative value is an error.
+	 * Keep the first error, and always run the post sequence so that
+	 * 0xfd:0x64 is put back and the hidden page deselected, even when a
+	 * step before it failed.
+	 */
 	if (target == TAS2764_PWR_CTRL_SHUTDOWN &&
 	   (curr == TAS2764_PWR_CTRL_MUTE || curr == TAS2764_PWR_CTRL_ACTIVE)) {
 		ret = regmap_multi_reg_write(tas2764->regmap, tas2764_pre_shutdown_seq,
 					ARRAY_SIZE(tas2764_pre_shutdown_seq));
+		if (!ret) {
+			err = snd_soc_component_update_bits(tas2764->component,
+							    TAS2764_PWR_CTRL,
+							    TAS2764_PWR_CTRL_MASK,
+							    TAS2764_PWR_CTRL_SHUTDOWN);
+			if (err < 0)
+				ret = err;
+		}
+		err = regmap_multi_reg_write(tas2764->regmap,
+					     tas2764_post_shutdown_seq,
+					     ARRAY_SIZE(tas2764_post_shutdown_seq));
 		if (!ret)
-			ret = snd_soc_component_update_bits(tas2764->component,
-							TAS2764_PWR_CTRL,
-							TAS2764_PWR_CTRL_MASK,
-							TAS2764_PWR_CTRL_SHUTDOWN);
-		if (!ret)
-			ret = regmap_multi_reg_write(tas2764->regmap,
-						tas2764_post_shutdown_seq,
-						ARRAY_SIZE(tas2764_post_shutdown_seq));
+			ret = err;
+		return ret;
 	}
 
 	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_PWR_CTRL,
-						    TAS2764_PWR_CTRL_MASK, target);
+					    TAS2764_PWR_CTRL_MASK, target);
 
-	return ret;
+	return ret < 0 ? ret : 0;
 }
 
 /*
@@ -174,7 +183,7 @@ static const struct tas2764_quirk_init_sequence {
 	{ tas2764_unk_seq1, ARRAY_SIZE(tas2764_unk_seq1) },
 	{ tas2764_unk_seq2, ARRAY_SIZE(tas2764_unk_seq2) },
 	{ tas2764_thermal_th1_dis_seq, ARRAY_SIZE(tas2764_thermal_th1_dis_seq) },
-	{ tas2764_shutdown_dance_init_seq, ARRAY_SIZE(tas2764_shutdown_dance_init_seq) },
+	{ NULL, 0 },	/* TAS2764_SHUTDOWN_DANCE: see tas2764_apply_init_quirks() */
 };
 
 #endif /* __TAS2764_QUIRKS__ */
