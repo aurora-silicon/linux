@@ -1735,6 +1735,19 @@ static void set_pcie_cxl(struct pci_dev *dev)
 
 }
 
+/*
+ * The device tree marks a port that leads out of the machine with
+ * "external-facing", and everything below such a port is external. The
+ * x86 arch_pci_dev_is_removable() reads only the ACPI property, so check
+ * the device tree one here. The port itself stays internal.
+ */
+static bool pci_dev_below_of_external_port(struct pci_dev *dev)
+{
+	struct pci_dev *parent = pci_upstream_bridge(dev);
+
+	return parent && parent->external_facing && dev_of_node(&parent->dev);
+}
+
 static void set_pcie_untrusted(struct pci_dev *dev)
 {
 	struct pci_dev *parent = pci_upstream_bridge(dev);
@@ -1750,7 +1763,8 @@ static void set_pcie_untrusted(struct pci_dev *dev)
 		return;
 	}
 
-	if (arch_pci_dev_is_removable(dev)) {
+	if (arch_pci_dev_is_removable(dev) ||
+	    pci_dev_below_of_external_port(dev)) {
 		pci_dbg(dev, "marking as untrusted\n");
 		dev->untrusted = true;
 	}
@@ -1778,7 +1792,8 @@ static void pci_set_removable(struct pci_dev *dev)
 		return;
 	}
 
-	if (arch_pci_dev_is_removable(dev)) {
+	if (arch_pci_dev_is_removable(dev) ||
+	    pci_dev_below_of_external_port(dev)) {
 		pci_dbg(dev, "marking as removable\n");
 		dev_set_removable(&dev->dev, DEVICE_REMOVABLE);
 	}
