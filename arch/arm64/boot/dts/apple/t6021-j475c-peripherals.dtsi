@@ -162,7 +162,6 @@
 		reg = <0x13 0x1e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1528 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	m2_atc3_dpin1: displayport-input@1301e58000 {
@@ -170,10 +169,11 @@
 		reg = <0x13 0x1e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1529 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
+};
 
-	m2_apciec3_piodma: dma-controller@1322000000 {
+&usb4_3_pcie_tunnel {
+	m2_apciec3_piodma: dma@1322000000 {
 		compatible = "apple,t6021-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x13 0x22000000 0x0 0x4000>,
 			<0x13 0x22004000 0x0 0x4000>,
@@ -182,6 +182,5 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1320 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apciec3_dart 15>;
-		status = "disabled";
 	};
 };
