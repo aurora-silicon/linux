@@ -48,6 +48,7 @@ extern "C" {
     fn sep_diag_set_sensor_result(bind: c_uint, online: bool);
     fn sep_diag_set_bio_published();
     fn sep_diag_set_touchid(started: bool);
+    fn sep_diag_set_touchid_absent();
     fn sep_diag_set_sensor_attach(state: c_int);
     fn sep_diag_set_restore(state: c_int);
     fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
@@ -254,6 +255,12 @@ pub(crate) fn bio_published() {
 pub(crate) fn touchid(started: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_touchid(started) };
+}
+
+/// The machine has no fingerprint sensor: `/dev/sep-bio` is not published.
+pub(crate) fn touchid_absent() {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_touchid_absent() };
 }
 
 /// How far the attach of the sensor got, `SEP_DIAG_SENSOR_ATTACH_*`.

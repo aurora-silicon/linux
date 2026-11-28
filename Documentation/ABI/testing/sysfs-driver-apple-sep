@@ -229,6 +229,11 @@ Description:
 				ended without publishing /dev/sep-bio, or
 				activation failed. Neither is retried before
 				the next boot.
+		absent		The device tree says the machine has no
+				fingerprint sensor (apple,no-biometric-sensor
+				on the SEP node): /dev/sep-bio is not
+				published. The keybag, trusted keys and
+				/dev/sep-bio-rearm work as elsewhere.
 		=========	============================================
 
 		There is no read-only install: the xart_writes and

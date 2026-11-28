@@ -63,6 +63,7 @@
 #define SEP_DIAG_TOUCHID_UNAVAILABLE	2
 #define SEP_DIAG_TOUCHID_STARTED	3
 #define SEP_DIAG_TOUCHID_FAILED		4
+#define SEP_DIAG_TOUCHID_ABSENT		5
 
 /* The SEP's endpoint numbers are one byte. */
 #define SEP_DIAG_MAX_EP			256
@@ -359,6 +360,9 @@ static ssize_t touchid_show(struct device *dev, struct device_attribute *attr,
 	case SEP_DIAG_TOUCHID_UNAVAILABLE:
 	case SEP_DIAG_TOUCHID_FAILED:
 		state = "failed";
+		break;
+	case SEP_DIAG_TOUCHID_ABSENT:
+		state = "absent";
 		break;
 	default:
 		state = "unknown";
@@ -1004,6 +1008,15 @@ void sep_diag_set_bio_published(void)
 {
 	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
 			   SEP_DIAG_TOUCHID_PUBLISHED) ==
+	    SEP_DIAG_TOUCHID_PENDING)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
+}
+
+/* No sensor on this machine: /dev/sep-bio is never published this boot. */
+void sep_diag_set_touchid_absent(void)
+{
+	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
+			   SEP_DIAG_TOUCHID_ABSENT) ==
 	    SEP_DIAG_TOUCHID_PENDING)
 		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }

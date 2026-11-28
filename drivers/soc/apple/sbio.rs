@@ -2348,7 +2348,18 @@ impl SepData {
         }
         // Either one was already persisted or one has just been.
         diag::keybag(diag::Keybag::Present);
-        if let Err(e) = self.register_bio() {
+        // With no sensor there is nothing to enrol or match: publishing
+        // /dev/sep-bio would only have its first open look for one. The keybag
+        // above still backs the trusted keys, /dev/sep-key and the per-user
+        // key bags on /dev/sep-bio-rearm.
+        if dt::no_biometric_sensor() {
+            dev_info_ratelimited!(
+                self.dev,
+                "bringup: the device tree describes no fingerprint sensor; /dev/{} is not published\n",
+                bio::DEVICE_NAME
+            );
+            diag::touchid_absent();
+        } else if let Err(e) = self.register_bio() {
             dev_err_ratelimited!(
                 self.dev,
                 "bringup: could not publish /dev/{} after SKS became ready: {:?}\n",

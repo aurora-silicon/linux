@@ -24,6 +24,7 @@ const DMA_RANGE_PROP: &CStr = c"apple,dma-range";
 const REGISTERED_PROP: &CStr = c"apple,sep-shmem-registered-iova";
 const CHOSEN_PATH: &CStr = c"/chosen";
 const PREBOOT_UUID_PROP: &CStr = c"apfs-preboot-uuid";
+const NO_SENSOR_PROP: &CStr = c"apple,no-biometric-sensor";
 
 pub(crate) struct DtNode(*mut bindings::device_node);
 
@@ -155,6 +156,14 @@ fn queue_status_okay(cs: *mut bindings::of_changeset, node: &DtNode) -> Result<(
 
 pub(crate) fn sep_node() -> Option<DtNode> {
     DtNode::find_compatible(SEP_COMPATIBLE)
+}
+
+/// Whether the board's device tree says the machine has no fingerprint
+/// sensor on the SEP (`apple,no-biometric-sensor`). The SoC's sensor bus and
+/// sensor node can still be described there, disabled; without this property
+/// a disabled sensor node is enabled at the first open of `/dev/sep-bio`.
+pub(crate) fn no_biometric_sensor() -> bool {
+    sep_node().is_some_and(|sep| sep.has_property(NO_SENSOR_PROP))
 }
 
 pub(crate) fn preboot_uuid() -> Option<[u8; 16]> {

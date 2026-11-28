@@ -37,6 +37,7 @@
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
 		nvram = &nvram;
+		sep = &sep;
 	};
 
 	chosen {
@@ -2088,7 +2089,21 @@
 #include "t6041-j575c-usbc-dcpext3.dtsi"
 #include "t6041-j575c-hdmi.dtsi"
 
-/* Not described: the SEP (no Touch ID sensor). */
+/*
+ * The SEP, as on the J614c and J616c: iBoot hands it over booted (ADT sep
+ * sepfw-booted, iop-sep,ascwrap-v6) at the t604x.dtsi addresses and
+ * interrupts, behind dart-sep with the same vm-base and vm-size. The sep
+ * alias lets the loader reserve the SEP firmware; apple_sep enables the SEP
+ * and its DART. The ADT has no Touch ID sensor (no spi2/mesa): spi2 and the
+ * sensor node stay disabled.
+ */
+&sep {
+	apple,no-biometric-sensor;
+};
+
+&sep_mbox {
+	status = "okay";
+};
 
 /*
  * The PMP, as the M4 Max MacBook Pros run it. The pmp alias lets the loader

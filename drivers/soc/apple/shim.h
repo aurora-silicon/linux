@@ -241,6 +241,7 @@ unsigned int sep_diag_sensor_bind(void);
 void sep_diag_set_sensor_result(unsigned int bind, bool online);
 void sep_diag_set_bio_published(void);
 void sep_diag_set_touchid(bool started);
+void sep_diag_set_touchid_absent(void);
 void sep_diag_set_sensor_attach(int state);
 void sep_diag_set_restore(int state);
 void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
