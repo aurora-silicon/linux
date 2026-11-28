@@ -729,6 +729,33 @@ impl Memory {
             self.timestamps.dword(offset + 24)?.load(Ordering::Relaxed),
         ])
     }
+    /// The completion-link words of an M5 command as they now read, for a timeout report:
+    /// tiling +0x7a4 (fragment busy), +0x7a8 (linked fragment completion), +0x7b0/+0x7b1
+    /// (pass bytes), +0x8c6 (tiling completion), fragment +0x90 (pass byte), +0x2160 (fragment
+    /// completion). A torn read is possible; nothing acts on it.
+    pub(super) fn m5_link_words(&self, ordinal: u64) -> Result<[u64; 7]> {
+        if !self.graph.m5 || !self.owns(ordinal) {
+            return Err(EINVAL);
+        }
+        let bytes = self.graph.descriptors.bytes();
+        let ta = self.graph.offset(0, ordinal);
+        let fragment = self.graph.offset(1, ordinal);
+        let read = |at: usize, size: usize| -> Result<u64> {
+            let source = bytes.get(at..at + size).ok_or(EINVAL)?;
+            let mut value = [0u8; 8];
+            value[..size].copy_from_slice(source);
+            Ok(u64::from_le_bytes(value))
+        };
+        Ok([
+            read(ta + 0x7a4, 4)?,
+            read(ta + 0x7a8, 8)?,
+            read(ta + 0x7b0, 1)?,
+            read(ta + 0x7b1, 1)?,
+            read(ta + 0x8c6, 8)?,
+            read(fragment + 0x90, 1)?,
+            read(fragment + 0x2160, 8)?,
+        ])
+    }
     pub(super) fn owners(&self) -> [Option<u64>; DEPTH] {
         core::array::from_fn(|index| self.generations[index].as_ref().and_then(|g| g.ordinal()))
     }

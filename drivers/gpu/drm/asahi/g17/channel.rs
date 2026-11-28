@@ -388,6 +388,16 @@ impl Events {
         Ok(consumer != producer)
     }
 
+    /// The consumer and producer cursors of `role`'s event ring, for a timeout report.
+    pub(crate) fn cursors(init: &InitData, role: Role) -> Result<[u32; 2]> {
+        let state = status::EVENT_STATE as usize;
+        fence(Ordering::Acquire);
+        Ok([
+            init.status_word(role, state)?.load(Ordering::Relaxed),
+            init.status_word(role, state + RX_PRODUCER_OFFSET)?.load(Ordering::Relaxed),
+        ])
+    }
+
     pub(crate) fn new(role: Role, graph: super::fw::variant::InitGraph) -> Self {
         Self {
             role,

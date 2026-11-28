@@ -146,6 +146,20 @@ impl WorkStorage {
         fence(Ordering::Acquire);
         Ok(completed >= self.counts[slot])
     }
+    /// The firmware's completed count of node `word` and the kicks counted on it, for a timeout
+    /// report.
+    fn progress(&self, word: u32) -> Result<[u32; 2]> {
+        let slot = (word & 63) as usize;
+        if self.words.get(slot) != Some(&Some(word)) {
+            return Err(EINVAL);
+        }
+        let completed = self
+            .object
+            .word(slot * NODE_STRIDE + core::mem::offset_of!(fw::WorkNode, completed))?
+            .load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        Ok([completed, self.counts[slot]])
+    }
     fn change_count(&mut self, word: u32, kicks: u32, add: bool) -> Result<u32> {
         let slot = (word & 63) as usize;
         if self.words.get(slot) != Some(&Some(word)) {
@@ -808,6 +822,16 @@ impl WorkStateLease {
             return Err(EINVAL);
         }
         self.context.work.lock().drained(word)
+    }
+    /// This ioctl's node word, the firmware's completed count on it and the kicks counted on
+    /// it, for a timeout report.
+    pub(crate) fn progress(&self) -> Result<[u32; 3]> {
+        let word = self.word();
+        if word == FREE {
+            return Err(EINVAL);
+        }
+        let [completed, counted] = self.context.work.lock().progress(word)?;
+        Ok([word, completed, counted])
     }
     pub(crate) fn add_submitted_kicks(&self, kicks: u32) -> Result<u32> {
         self.context
