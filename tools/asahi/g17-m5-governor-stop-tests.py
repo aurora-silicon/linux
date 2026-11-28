@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host test: the M5 thermal governor hands everything back once it may not govern.
 
 Compiles production `Governor` and `CpuAdvice` from
