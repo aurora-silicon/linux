@@ -27,6 +27,7 @@
 /* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
 #include "t6050-soc-max.dtsi"
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 /* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0xbb). */
 #include "t6050-isp.dtsi"

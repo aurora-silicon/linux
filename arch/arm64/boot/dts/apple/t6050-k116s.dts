@@ -25,6 +25,7 @@
 
 #define T6050_K116S
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 &pinctrl_ap {
 	/*
@@ -486,76 +487,9 @@
 	apple,high-power-mode;
 };
 
-/*
- * The video decoder (K116sAP ADT avd0), its DART and power states, as on the J714s.
- * ADT: avd0 reg[0] 0x2108000000 + 0x1404000, interrupts 2417/2418; dart-avd0 at
- * 0x2109020000, interrupt 2424; FAB1_SOC at offset 0x1b0 and AVD_SYS at 0x1d8 of
- * the pmgr's reg[46] (0x2180600000).
- */
-&pmgr4 {
-	status = "okay";
-};
-
-/* macOS turns FAB1_SOC on once at boot and never gates it. */
-&ps_fab1_soc {
-	apple,always-on;
-	status = "okay";
-};
-
-&ps_avd_sys {
-	status = "okay";
-};
-
-&avd_dart {
-	status = "okay";
-};
-
-&avd {
-	status = "okay";
-};
-
 /* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
 #define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116s.bin", "apple/msrk-k116s.bin"
 #include "t6050-touchid.dtsi"
-
-/*
- * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does
- * not enter the firmware-driven sleep with it on. Enabled and unused, genpd turns it off at
- * boot. No encoder is described yet.
- */
-&ps_fab1_piogw {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-&ps_fab0_soc {
-	apple,always-on;
-	status = "okay";
-};
-
-&ps_venc0_sys {
-	status = "okay";
-};
-
-&ps_venc0_dma {
-	status = "okay";
-};
-
-&ps_venc0_pipe4 {
-	status = "okay";
-};
-
-&ps_venc0_pipe5 {
-	status = "okay";
-};
-
-&ps_venc0_me0 {
-	status = "okay";
-};
-
-&ps_venc0_me1 {
-	status = "okay";
-};
 
 /*
  * Deep sleep: the sleep controller's description and the J714s's SoC values, then what differs
