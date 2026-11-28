@@ -715,5 +715,7 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 			 struct vb2_v4l2_buffer *dst, bool same_input);
 int ave_mctf_register(struct ave_dev *ave);
 void ave_mctf_unregister(struct ave_dev *ave);
+bool ave_mctf_input_fits(size_t plane_size, u32 data_offset, size_t bytes);
+size_t ave_mctf_input_bytes(const struct v4l2_pix_format_mplane *f);
 
 #endif
