@@ -8,7 +8,7 @@
 	#size-cells = <0>;
 	interrupt-controller;
 	#interrupt-cells = <2>;
-	status = "disabled";
+	status = "okay";
 
 	nfc@c {
 		compatible = "apple,t8112-spmi-nfc",
@@ -22,7 +22,6 @@
 			<164 IRQ_TYPE_LEVEL_HIGH>,
 			<165 IRQ_TYPE_LEVEL_HIGH>,
 			<166 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 };
 

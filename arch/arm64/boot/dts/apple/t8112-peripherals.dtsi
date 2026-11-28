@@ -56,7 +56,6 @@
 	m2_aft: fabric-tracker@200110000 {
 		compatible = "apple,t8112-aft", "apple,aft";
 		reg = <0x2 0x110000 0x0 0x10000>;
-		status = "disabled";
 	};
 
 	m2_aes: aes@23500c000 {
@@ -81,7 +80,6 @@
 		power-domains = <&ps_fpwm0>;
 		clocks = <&clkref>;
 		#pwm-cells = <2>;
-		status = "disabled";
 	};
 
 	m2_aic_timebase: timer@23b0dc000 {
@@ -149,25 +147,21 @@
 	m2_nub_spmi0_sideband: spmi-sideband@23d704000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x3d704000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	m2_nub_spmi1_sideband: spmi-sideband@23d784000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x3d784000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	m2_aop_spmi0_sideband: spmi-sideband@24a884000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x4a884000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	m2_aop_spmi1_sideband: spmi-sideband@24a8c4000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x4a8c4000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	m2_scaler0: scaler@263000000 {
@@ -271,7 +265,6 @@
 			<AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_apr_0 0>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
 	};
 
 	m2_dart_apr_0: iommu@27d028000 {
@@ -281,7 +274,6 @@
 		interrupts = <AIC_IRQ 905 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	m2_dart_scdc: iommu@27d02c000 {
@@ -291,7 +283,6 @@
 		interrupts = <AIC_IRQ 905 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	m2_scdc: coprocessor@27e400000 {
@@ -313,7 +304,6 @@
 			<AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_scdc 0>, <&m2_dart_apr_0 0>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
 	};
 
 	m2_atc0_dpin0: displayport-input@381e50000 {
@@ -321,7 +311,6 @@
 		reg = <0x3 0x81e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1062 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	m2_atc0_dpin1: displayport-input@381e58000 {
@@ -329,19 +318,6 @@
 		reg = <0x3 0x81e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1063 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	m2_apciec0_piodma: dma-controller@3a2000000 {
-		compatible = "apple,t8112-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x3 0xa2000000 0x0 0x4000>,
-			<0x3 0xa2004000 0x0 0x4000>,
-			<0x3 0xa2008000 0x0 0x4000>,
-			<0x3 0xa0008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1026 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec0_dart 15>;
-		status = "disabled";
 	};
 
 	m2_atc1_dpin0: displayport-input@501e50000 {
@@ -349,7 +325,6 @@
 		reg = <0x5 0x1e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1143 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	m2_atc1_dpin1: displayport-input@501e58000 {
@@ -357,19 +332,6 @@
 		reg = <0x5 0x1e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1144 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	m2_apciec1_piodma: dma-controller@522000000 {
-		compatible = "apple,t8112-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x5 0x22000000 0x0 0x4000>,
-			<0x5 0x22004000 0x0 0x4000>,
-			<0x5 0x22008000 0x0 0x4000>,
-			<0x5 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1107 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec1_dart 15>;
-		status = "disabled";
 	};
 };
 
