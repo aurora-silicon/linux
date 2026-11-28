@@ -162,7 +162,21 @@ static const u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 static const u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,
 	WLAN_CIPHER_SUITE_AES_CMAC,
+	/*
+	 * Only as the group cipher of a WPA/WPA2 mixed-mode network (group
+	 * TKIP, pairwise CCMP): connect refuses TKIP as a pairwise cipher. The
+	 * firmware runs the 4-way handshake and installs every key itself;
+	 * there is no add_key here.
+	 */
+	WLAN_CIPHER_SUITE_TKIP,
 };
+
+/* The group ciphers a join may use: CCMP, or TKIP with WPA2-Personal. */
+static bool group_cipher_ok(u32 cipher)
+{
+	return cipher == WLAN_CIPHER_SUITE_CCMP ||
+	       cipher == WLAN_CIPHER_SUITE_TKIP;
+}
 
 /* The firmware's band numbers: 0 is 2.4 GHz, 1 is 5 GHz, 2 is 6 GHz. */
 static int firmware_band(enum nl80211_band band)
@@ -1572,7 +1586,7 @@ static int select_rsn(const u8 *body, size_t size, u32 akm, u8 *selected)
 	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
 	if (tail + 2 > size)
 		return -EINVAL;
-	if (get_unaligned_be32(body + 2) != WLAN_CIPHER_SUITE_CCMP ||
+	if (!group_cipher_ok(get_unaligned_be32(body + 2)) ||
 	    get_unaligned_le16(body + 6) != 1 ||
 	    get_unaligned_be32(body + 8) != WLAN_CIPHER_SUITE_CCMP)
 		return -EOPNOTSUPP;
@@ -1724,7 +1738,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	    params->crypto.sae_pwd_len > SAE_PASSWORD_MAX_LEN ||
 	    params->crypto.n_ciphers_pairwise != 1 ||
 	    params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
+	    !group_cipher_ok(params->crypto.cipher_group) ||
 	    params->ie_len > sizeof(wifi->request_ie)) {
 		dev_dbg(dev, "connect refused: %d pairwise ciphers, first %08x, group %08x, %zu bytes of elements\n",
 			params->crypto.n_ciphers_pairwise,
@@ -1760,6 +1774,12 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	}
 	rsn_size = ret;
 	sae = akm == WLAN_AKM_SUITE_SAE;
+	/* A TKIP group key goes only with WPA2-Personal, never with SAE. */
+	if (sae && params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP) {
+		dev_dbg(dev, "connect refused: SAE with group cipher %08x\n",
+			params->crypto.cipher_group);
+		return -EOPNOTSUPP;
+	}
 	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->stopping)) {
