@@ -94,6 +94,8 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 			     bool *limits_valid);
 int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
 void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
+void asahi_g16_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille);
+void asahi_g16_clpc_gpu_clear_busy(struct apple_clpc_gpu *gpu);
 void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu);
 
 static int asahi_g16_cooling_max(struct thermal_cooling_device *cdev,
@@ -613,6 +615,16 @@ int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
 {
 	apple_clpc_gpu_set_active(gpu, active);
+}
+
+void asahi_g16_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille)
+{
+	apple_clpc_gpu_set_busy(gpu, permille);
+}
+
+void asahi_g16_clpc_gpu_clear_busy(struct apple_clpc_gpu *gpu)
+{
+	apple_clpc_gpu_clear_busy(gpu);
 }
 
 void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)

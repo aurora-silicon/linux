@@ -191,6 +191,203 @@ const BURST_GAP_NS: u64 = CLPC_IDLE_HOLD_NS;
 /// Consecutive sub-`BURST_GAP_NS` turnarounds required before bridging short gaps.
 const BURST_STREAK_ON: u32 = 4;
 
+/// CLPC GPU busy-share measurement window (200 ms): spans multiple frames of
+/// paced 24-120 fps workloads while reacting quickly to sustained load changes.
+pub(crate) const CLPC_BUSY_WINDOW_NS: u64 = 200_000_000;
+/// Maximum window span before discarding a stale gap and clearing any cached share.
+pub(crate) const CLPC_BUSY_WINDOW_MAX_NS: u64 = 2_000_000_000;
+/// Idle gap after drain long enough to forget the prior busy share so a new
+/// burst after genuine idle starts at the top column, while paced 15-120 fps
+/// streams (8-67 ms gaps) preserve their window.
+pub(crate) const CLPC_BUSY_IDLE_RESET_NS: u64 = 100_000_000;
+/// Continuous busy run duration (or partial-window high-duty span) that lifts
+/// CLPC immediately to 1000 permille so a long render/compute job or saturated
+/// burst never sits at a low memory floor waiting for the full window.
+pub(crate) const CLPC_BUSY_LONG_NS: u64 = 50_000_000;
+/// Actual measured busy share (without inflating idle gaps) required over at
+/// least [`CLPC_BUSY_LONG_NS`] before lifting a below-top window early.
+const CLPC_BUSY_LIFT_PERMILLE: u32 = 800;
+
+/// Action to apply to the CLPC GPU busy-share input after a policy step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ClpcBusyAction {
+    /// Publish a measured or lifted busy share (0..=1000 permille).
+    Set(u32),
+    /// Clear any cached busy share so active work starts at the top column.
+    Clear,
+}
+
+/// Permille of `window` ns the GPU spent busy (0..=1000).
+fn permille_of(busy: u64, window: u64) -> u32 {
+    if window == 0 {
+        1000
+    } else {
+        let busy = busy.min(window);
+        let share = match busy.checked_mul(1000) {
+            Some(scaled) => scaled / window,
+            None => busy / (window / 1000),
+        };
+        share.min(1000) as u32
+    }
+}
+
+/// Per-window GPU busy-share tracker (0..=1000 permille) driving CLPC's optional
+/// DT-configured GPU memory/fabric ladder (`apple,gpu-busy-memory-states`).
+///
+/// Tracks actual publication-to-drain busy time (never counting idle gaps) across
+/// [`CLPC_BUSY_WINDOW_NS`] windows, preserves the window across brief inter-frame
+/// idle shorter than [`CLPC_BUSY_IDLE_RESET_NS`], resets from the drain timestamp
+/// on genuine idle even if an idle poll was delayed, and overrides to 1000 permille
+/// whenever a single unbroken run reaches [`CLPC_BUSY_LONG_NS`] (or an active
+/// partial window of at least [`CLPC_BUSY_LONG_NS`] reaches
+/// [`CLPC_BUSY_LIFT_PERMILLE`] actual busy time while below the top column).
+pub(crate) struct ClpcBusyShare {
+    window_start: Option<u64>,
+    busy_since: Option<u64>,
+    continuous_since: Option<u64>,
+    idle_since: Option<u64>,
+    inactive: bool,
+    busy_ns: u64,
+    below_top: bool,
+}
+
+impl ClpcBusyShare {
+    pub(crate) const fn new() -> Self {
+        Self {
+            window_start: None,
+            busy_since: None,
+            continuous_since: None,
+            idle_since: None,
+            inactive: false,
+            busy_ns: 0,
+            below_top: false,
+        }
+    }
+
+    /// Unconditionally resets the window and forgets any prior busy share (for
+    /// genuine idle expiry, fail-stop, or system sleep).
+    pub(crate) fn clear_active(&mut self) {
+        self.window_start = None;
+        self.busy_since = None;
+        self.continuous_since = None;
+        self.idle_since = None;
+        self.inactive = false;
+        self.busy_ns = 0;
+        self.below_top = false;
+    }
+
+    /// Records that CLPC became inactive after [`CLPC_IDLE_HOLD_NS`] expired so
+    /// subsequent idle housekeeping polls do not emit busy-share updates.
+    pub(crate) fn note_inactive(&mut self, now: u64) {
+        self.inactive = true;
+        self.idle_since.get_or_insert(now);
+    }
+
+    /// Evaluates whether the idle gap since the last drain reached
+    /// [`CLPC_BUSY_IDLE_RESET_NS`] before publishing work at `now`. Returns
+    /// `true` after clearing local state so the caller expires any delayed CLPC
+    /// hold and clears the provider's cached share before reactivating.
+    pub(crate) fn resume(&mut self, now: u64) -> bool {
+        self.inactive = false;
+        if self.busy_since.is_some() {
+            return false;
+        }
+        let Some(since) = self.idle_since else {
+            return false;
+        };
+        if now.saturating_sub(since) >= CLPC_BUSY_IDLE_RESET_NS {
+            self.clear_active();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_long_run(&self, now: u64) -> bool {
+        self.continuous_since
+            .is_some_and(|start| now.saturating_sub(start) >= CLPC_BUSY_LONG_NS)
+    }
+
+    /// Records work publication at `now`. Returns `Some(1000)` if a continuous
+    /// busy run while below the top CLPC column has reached [`CLPC_BUSY_LONG_NS`].
+    pub(crate) fn busy(&mut self, now: u64) -> Option<u32> {
+        self.inactive = false;
+        if self.busy_since.is_none() {
+            self.idle_since = None;
+            if self.window_start.is_none() {
+                self.window_start = Some(now);
+                self.busy_ns = 0;
+            }
+            self.busy_since = Some(now);
+            self.continuous_since = Some(now);
+        }
+        if self.below_top && self.is_long_run(now) {
+            self.below_top = false;
+            Some(1000)
+        } else {
+            None
+        }
+    }
+
+    /// Records engine drain at `now`.
+    pub(crate) fn idle(&mut self, now: u64) {
+        if let Some(since) = self.busy_since.take() {
+            self.busy_ns = self.busy_ns.saturating_add(now.saturating_sub(since));
+            self.continuous_since = None;
+            self.idle_since = Some(now);
+        }
+    }
+
+    /// Evaluates immediate lift or window completion at `now`.
+    pub(crate) fn sample(&mut self, now: u64, active: bool) -> Option<ClpcBusyAction> {
+        if !active && self.inactive {
+            return None;
+        }
+        if !active {
+            self.idle(now);
+        } else {
+            self.inactive = false;
+            if self.busy_since.is_none() {
+                let _ = self.busy(now);
+            }
+        }
+        let long_run = self.is_long_run(now);
+        let start = self.window_start?;
+        let elapsed = now.saturating_sub(start);
+        if elapsed < CLPC_BUSY_WINDOW_NS {
+            if self.below_top && active {
+                let in_flight = self.busy_since.map_or(0, |s| now.saturating_sub(s));
+                let actual_busy = self.busy_ns.saturating_add(in_flight);
+                let high_duty = elapsed >= CLPC_BUSY_LONG_NS
+                    && permille_of(actual_busy, elapsed) >= CLPC_BUSY_LIFT_PERMILLE;
+                if long_run || high_duty {
+                    self.below_top = false;
+                    return Some(ClpcBusyAction::Set(1000));
+                }
+            }
+            return None;
+        }
+        if let Some(since) = self.busy_since.as_mut() {
+            self.busy_ns = self.busy_ns.saturating_add(now.saturating_sub(*since));
+            *since = now;
+        }
+        let busy = self.busy_ns;
+        self.busy_ns = 0;
+        self.window_start = Some(now);
+        if elapsed > CLPC_BUSY_WINDOW_MAX_NS && !long_run {
+            self.below_top = false;
+            return Some(ClpcBusyAction::Clear);
+        }
+        let permille = if long_run {
+            1000
+        } else {
+            permille_of(busy, elapsed)
+        };
+        self.below_top = permille < 1000;
+        Some(ClpcBusyAction::Set(permille))
+    }
+}
+
 /// Busy-time accounting over the governor's windows. The engine reports each
 /// publication and drain; each power service closes the window once it is due.
 pub(crate) struct Governor {
@@ -1020,6 +1217,158 @@ mod tests {
                 false
             ),
             4
+        );
+    }
+
+    #[test]
+    fn clpc_busy_share_scales_paced_video_resets_after_idle_and_lifts_bursts() {
+        // 1. Paced 24 fps video (1.5 ms busy every 41.67 ms, idle ~40 ms < 100 ms reset):
+        // preserves window and settles well below 160 permille.
+        let mut bs = ClpcBusyShare::new();
+        let mut t = T;
+        let mut reports = 0u32;
+        for _ in 0..12 {
+            assert!(!bs.resume(t));
+            assert_eq!(bs.busy(t), None);
+            if let Some(ClpcBusyAction::Set(p)) = bs.sample(t, true) {
+                assert!(p < 100, "24 fps video should stay low, got {p}");
+                reports += 1;
+            }
+            bs.idle(t + 1_500_000);
+            let exp = t + 1_500_000 + CLPC_IDLE_HOLD_NS;
+            bs.note_inactive(exp);
+            assert_eq!(bs.sample(exp + 20_000_000, false), None);
+            t += 41_666_667;
+        }
+        assert!(reports >= 2);
+
+        // 2. Genuine idle (>= 100 ms after drain) resets the window and signals clear_busy(),
+        // even if the delayed idle poll never called note_inactive().
+        let mut bs = ClpcBusyShare::new();
+        assert_eq!(bs.busy(T), None);
+        bs.idle(T + 1_000_000);
+        assert_eq!(bs.busy(T + 189_000_000), None);
+        let drain = T + 190_000_000;
+        bs.idle(drain);
+        assert_eq!(
+            bs.sample(T + CLPC_BUSY_WINDOW_NS, false),
+            Some(ClpcBusyAction::Set(10))
+        );
+        // Fast submit arrives 130 ms after drain (monotonically after window close) before
+        // service_power() expires hold: resume() still detects genuine idle from idle_since.
+        let delayed_submit = drain + 130_000_000;
+        assert!(bs.resume(delayed_submit));
+        assert!(!bs.resume(delayed_submit + 1_000_000));
+        assert_eq!(bs.busy(delayed_submit), None);
+        assert_eq!(bs.sample(delayed_submit, true), None);
+
+        // 3. Stale window (> 2 s) without a long continuous run clears cached share
+        // rather than leaving an old low vote in CLPC.
+        let mut bs = ClpcBusyShare::new();
+        assert_eq!(bs.busy(T), None);
+        bs.idle(T + 1_000_000);
+        assert_eq!(
+            bs.sample(T + CLPC_BUSY_WINDOW_NS, false),
+            Some(ClpcBusyAction::Set(5))
+        );
+        let stale = T + CLPC_BUSY_WINDOW_NS + CLPC_BUSY_WINDOW_MAX_NS + 100_000_000;
+        assert_eq!(bs.sample(stale, false), Some(ClpcBusyAction::Clear));
+
+        // 4. Five evenly spaced 100 us flights per 120 Hz frame (1.56 ms gaps < 2 ms):
+        // real busy share is 60 permille; idle gaps must never inflate the share or lift.
+        let mut bs = ClpcBusyShare::new();
+        let mut t = T;
+        let mut reports = 0u32;
+        for _ in 0..40 {
+            let mut jt = t;
+            for _ in 0..5 {
+                assert!(!bs.resume(jt));
+                assert_eq!(bs.busy(jt), None);
+                if let Some(action) = bs.sample(jt, true) {
+                    assert!(
+                        matches!(action, ClpcBusyAction::Set(p) if (55..=65).contains(&p)),
+                        "expected ~60 permille, got {action:?}"
+                    );
+                    reports += 1;
+                }
+                bs.idle(jt + 100_000);
+                jt += 1_666_667;
+            }
+            t += 8_333_335;
+        }
+        assert!(reports >= 1);
+
+        // 5. Saturated back-to-back d=1 burst (90% real busy) transitioning directly
+        // from light paced work (idle gap < 100 ms, below_top == true) lifts early at
+        // 50 ms without counting idle gaps.
+        let mut bs = ClpcBusyShare::new();
+        assert_eq!(bs.busy(T), None);
+        bs.idle(T + 1_000_000);
+        // Keep idle gap < 100 ms so the burst starts while still below_top.
+        assert_eq!(bs.busy(T + 160_000_000), None);
+        bs.idle(T + 161_000_000);
+        assert_eq!(
+            bs.sample(T + CLPC_BUSY_WINDOW_NS, false),
+            Some(ClpcBusyAction::Set(10))
+        );
+        let mut bt = T + CLPC_BUSY_WINDOW_NS;
+        let mut lifted = false;
+        for _ in 0..60 {
+            assert!(!bs.resume(bt));
+            let _ = bs.busy(bt);
+            if bs.sample(bt + 900_000, true) == Some(ClpcBusyAction::Set(1000)) {
+                lifted = true;
+                break;
+            }
+            bs.idle(bt + 900_000);
+            bt += 1_000_000;
+        }
+        assert!(lifted);
+        assert!(bt - (T + CLPC_BUSY_WINDOW_NS) <= CLPC_BUSY_LONG_NS);
+
+        // 6. Long continuous job reaching 50 ms right at a window close with unknown
+        // cached share (below_top == false) must report 1000, never downgrade to 250.
+        let mut bs = ClpcBusyShare::new();
+        assert_eq!(bs.busy(T), None);
+        bs.idle(T + 1_000_000);
+        let long_start = T + CLPC_BUSY_WINDOW_NS - CLPC_BUSY_LONG_NS;
+        assert_eq!(bs.busy(long_start), None);
+        assert_eq!(
+            bs.sample(T + CLPC_BUSY_WINDOW_NS, true),
+            Some(ClpcBusyAction::Set(1000))
+        );
+        // Continues across the next window boundary while still unbroken: stays 1000.
+        assert_eq!(
+            bs.sample(T + 2 * CLPC_BUSY_WINDOW_NS, true),
+            Some(ClpcBusyAction::Set(1000))
+        );
+
+        // 7. Solo long command (>= 50 ms continuous) while below top lifts at 50 ms
+        // even when straddling a 200 ms window boundary.
+        let mut bs = ClpcBusyShare::new();
+        assert_eq!(bs.busy(T), None);
+        bs.idle(T + 1_000_000);
+        assert_eq!(
+            bs.sample(T + CLPC_BUSY_WINDOW_NS, false),
+            Some(ClpcBusyAction::Set(5))
+        );
+        let start = T + 380_000_000;
+        assert_eq!(bs.busy(start), None);
+        assert_eq!(
+            bs.sample(T + 400_000_000, true),
+            Some(ClpcBusyAction::Set(100))
+        );
+        assert_eq!(bs.sample(start + CLPC_BUSY_LONG_NS - 1, true), None);
+        assert_eq!(
+            bs.sample(start + CLPC_BUSY_LONG_NS, true),
+            Some(ClpcBusyAction::Set(1000))
+        );
+
+        // 8. Teardown / sleep clear_active resets all state cleanly.
+        bs.clear_active();
+        assert_eq!(
+            bs.sample(start + CLPC_BUSY_LONG_NS + CLPC_BUSY_WINDOW_NS, false),
+            None
         );
     }
 }
