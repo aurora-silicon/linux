@@ -504,7 +504,7 @@ SUITES = [
 
 # tools/testing/selftests/drivers/apple: the host-runnable harnesses build the
 # production driver code against host mocks. The others drive real devices.
-APPLE_TESTS = ['aop-las.py', 'aop-motion.py', 'atc-t8132-usb3.py', 'bcm4377-dma-window.py',
+APPLE_TESTS = ['aop-als.py', 'aop-las.py', 'aop-motion.py', 'atc-t8132-usb3.py', 'bcm4377-dma-window.py',
                'bcm4377-radio-sids.py', 'bcm4377-rti-address.py', 'bcm4377-state-wait.py',
                'centauri-t6050-probe.py', 'dart-s2idle-retention.py', 'dwc3-initial-role.py',
                'macsmc-j713.py', 'pmgr-inherited.py', 'sn201202x-transport.py']
