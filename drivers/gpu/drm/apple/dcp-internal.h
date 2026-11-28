@@ -5,6 +5,7 @@
 #define __APPLE_DCP_INTERNAL_H__
 
 #include "dcp-indicator.h"
+#include "dcp-notch.h"
 #include <drm/drm_mode.h>
 #include <linux/atomic.h>
 #include <linux/backlight.h>
@@ -226,6 +227,8 @@ struct dcp_panel {
 	int width_mm;
 	/// panel height in millimeter
 	int height_mm;
+	/// height below the notch rows (adj-height-mm), 0 if not given
+	u32 adj_height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (0 if unknown or no EDR headroom)
@@ -1050,6 +1053,8 @@ struct apple_dcp {
 	struct mutex modes_lock;
 	struct dcp_display_mode *modes;
 	unsigned int nr_modes;
+	/* Of them, notch-free twins of the panel's timings (dcp-notch.h), last. */
+	unsigned int nr_notch_twins;
 	u64 modes_generation;
 	u64 dimensions_generation;
 	struct work_struct dimensions_wq;
@@ -1065,7 +1070,23 @@ struct apple_dcp {
 	/* an external display whose backlight DCP can drive */
 	bool ext_backlight;
 
+	/*
+	 * Rows hidden for the whole boot, on the pipes that keep one notch
+	 * geometry (firmware 14.7/26.6 standalone pipes); 0 elsewhere.
+	 */
 	unsigned notch_height;
+	/* The panel's notch rows (apple,notch-height), shown or not; 0: no notch. */
+	u32 notch_rows;
+	/* Active rows of the full panel, notch rows included (from its modes). */
+	u32 notch_panel_rows;
+	/* enum dcp_notch_policy: the geometry asked for while a client owns the panel. */
+	u8 notch_policy;
+	/* A DRM master owns the device (apple_drm_master_set/drop()). */
+	bool notch_owned;
+	/* Panel rows above the last frame swapped in: the notch rows, or 0. */
+	u32 notch_scanout_y;
+	/* The notch-free geometry is what a compositor is offered now. */
+	bool notch_free_offered;
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
@@ -1356,6 +1377,23 @@ void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
 int dcp_retain_live_session(struct apple_dcp *dcp);
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
+/* The display's own timings: the catalogue less the notch-free twins. */
+static inline unsigned int dcp_nr_timings(const struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->nr_modes) - READ_ONCE(dcp->nr_notch_twins);
+}
+
+/*
+ * Pipes whose modes carry both notch geometries (dcp-notch.h).  The
+ * standalone firmware 14.7/26.6 pipes build one mode from the boot
+ * framebuffer and keep the boot loader's geometry for the boot.
+ */
+static inline bool dcp_notch_dynamic(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat != DCP_FIRMWARE_V_14_7 &&
+	       dcp->fw_compat != DCP_FIRMWARE_V_26_6;
+}
+
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
 {
 	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132) &&

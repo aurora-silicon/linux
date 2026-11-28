@@ -2422,6 +2422,55 @@ struct dcp_display_mode *dcp_modes_dup(struct apple_dcp *dcp,
 	return modes;
 }
 
+/* Notch-free twins in a catalogue; dcp_notch_add_twins() puts them last. */
+static unsigned int dcp_notch_twin_count(const struct dcp_display_mode *modes,
+					 unsigned int count)
+{
+	unsigned int i, twins = 0;
+
+	for (i = 0; modes && i < count; i++)
+		twins += modes[i].notch_free;
+	return twins;
+}
+
+/*
+ * Give every full-panel timing of a panel with @rows notch rows its
+ * notch-free twin (dcp-notch.h), after the full ones, and report the full
+ * panel's active rows in @panel_rows.  The automatic 180 Hz exception is an
+ * external display's and gets none.
+ */
+static int dcp_notch_add_twins(struct dcp_display_mode **modes, unsigned int *count,
+			       u32 rows, u32 *panel_rows)
+{
+	struct dcp_display_mode *all;
+	unsigned int i, n = *count, twins = 0;
+
+	*panel_rows = 0;
+	if (!rows || !n)
+		return 0;
+	all = krealloc_array(*modes, 2 * n, sizeof(**modes), GFP_KERNEL | __GFP_NOWARN);
+	if (!all)
+		return -ENOMEM;
+	*modes = all;
+	for (i = 0; i < n; i++) {
+		struct dcp_display_mode *twin = &all[n + twins];
+
+		if (all[i].notch_free || all[i].automatic_rgb8_quirk)
+			continue;
+		if (all[i].mode.vdisplay > *panel_rows)
+			*panel_rows = all[i].mode.vdisplay;
+		*twin = all[i];
+		if (!dcp_notch_free_mode(&twin->mode, rows))
+			continue;
+		twin->notch_free = true;
+		drm_mode_set_name(&twin->mode);
+		all[i].notch_twin = true;
+		twins++;
+	}
+	*count = n + twins;
+	return 0;
+}
+
 /*
  * A display came to @dcp from another pipeline without being unplugged:
  * offer the modes it had there until the firmware here describes it.
@@ -2446,6 +2495,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->modes = modes;
 	dcp->nr_modes = count;
+	dcp->nr_notch_twins = dcp_notch_twin_count(modes, count);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = true;
 	dcp->modes_provisional = true;
@@ -2483,7 +2533,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	unsigned int nr_modes = 0, i;
 	unsigned long flags;
 	bool provisional;
-	u32 entries = 0;
+	u32 entries = 0, panel_rows = 0;
 	int ret = 0;
 
 	/* A stale transfer is refused before it is parsed, as it is published. */
@@ -2534,6 +2584,16 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		kfree(modes);
 		return -EINVAL;
 	} else {
+		/* A notched panel offers both geometries of its timings. */
+		if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP &&
+		    dcp->notch_rows && dcp_notch_dynamic(dcp)) {
+			ret = dcp_notch_add_twins(&modes, &nr_modes, dcp->notch_rows,
+						  &panel_rows);
+			if (ret) {
+				kfree(modes);
+				return ret;
+			}
+		}
 		for (i = 0; i < nr_modes; i++)
 			if (modes[i].automatic_rgb8_quirk) {
 				modes[i].unsafe_rgb8_ticket = rate_ticket;
@@ -2558,6 +2618,9 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
 	dcp->modes = modes;
 	dcp->nr_modes = nr_modes;
+	dcp->nr_notch_twins = dcp_notch_twin_count(modes, nr_modes);
+	if (panel_rows)
+		WRITE_ONCE(dcp->notch_panel_rows, panel_rows);
 	/* Only a complete receipt for a current cable is that cable's catalogue. */
 	dcp->metadata.catalog_ticket = rate_ticket;
 	dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
@@ -2691,6 +2754,7 @@ void dcp_modes_release(void *data)
 	kfree(dcp->modes);
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
+	dcp->nr_notch_twins = 0;
 }
 /* Under mode_config.mutex, in get_modes: the identity of the EDID being published. */
 static void dcp_note_edid(struct apple_connector *connector, const struct drm_edid *drm_edid)
@@ -2770,6 +2834,8 @@ int dcp_get_modes(struct drm_connector *connector)
 	bool vrr_capable = false;
 	bool physical_edid;
 	bool pending_180hz = false, published_180hz = false;
+	enum dcp_notch_policy effective;
+	bool full_fits;
 	u64 edid_generation = 0;
 	u64 service_epoch = 0;
 	unsigned int i;
@@ -2786,19 +2852,55 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	dcp = platform_get_drvdata(pdev);
 	if (iomfb_is_m4(dcp)) {
-		struct drm_display_mode fixed;
+		struct drm_display_mode fixed, free;
+		bool preferred;
+		int n = 0;
 
 		if (iomfb_m4_get_mode(dcp, &fixed))
 			return 0;
-		mode = drm_mode_duplicate(dev, &fixed);
-		if (!mode)
-			return 0;
-		drm_mode_probed_add(connector, mode);
+		/* Its panel timing, in both notch geometries (dcp-notch.h). */
+		free = fixed;
+		if (dcp->notch_rows && dcp_notch_free_mode(&free, dcp->notch_rows)) {
+			WRITE_ONCE(dcp->notch_panel_rows, fixed.vdisplay);
+			drm_mode_set_name(&free);
+			effective = dcp_notch_effective(READ_ONCE(dcp->notch_policy),
+							READ_ONCE(dcp->notch_owned));
+			full_fits = dcp_notch_full_fits(apple_connector->probe_max_y,
+							fixed.vdisplay);
+			preferred = true;
+			if (dcp_notch_offer(false, effective, full_fits, &preferred)) {
+				mode = drm_mode_duplicate(dev, &fixed);
+				if (mode) {
+					drm_mode_probed_add(connector, mode);
+					n++;
+				}
+			}
+			preferred = true;
+			mode = NULL;
+			if (dcp_notch_offer(true, effective, full_fits, &preferred)) {
+				if (!preferred)
+					free.type &= ~DRM_MODE_TYPE_PREFERRED;
+				mode = drm_mode_duplicate(dev, &free);
+			}
+		} else {
+			mode = drm_mode_duplicate(dev, &fixed);
+		}
+		if (mode) {
+			drm_mode_probed_add(connector, mode);
+			n++;
+		}
 		of_property_read_u32(dcp->dev->of_node, "apple,panel-width-mm",
 				     &connector->display_info.width_mm);
 		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",
 				     &connector->display_info.height_mm);
-		return 1;
+		/* The physical size follows the geometry this probe offers. */
+		if (free.vdisplay < fixed.vdisplay &&
+		    dcp_notch_free_only(effective, full_fits))
+			connector->display_info.height_mm =
+				dcp_notch_free_mm(connector->display_info.height_mm,
+						  dcp->panel.adj_height_mm, fixed.vdisplay,
+						  free.vdisplay);
+		return n;
 	}
 	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
 
@@ -2937,7 +3039,10 @@ int dcp_get_modes(struct drm_connector *connector)
 		u32 defaults = 0;
 		bool panel = dcp->panel_identity && dcp_has_panel(dcp);
 		const struct drm_edid *derived = nr_modes ?
-			(panel ? dcp_panel_edid_snapshot(dcp, modes, nr_modes, &generation) :
+			/* The panel's EDID lists its timings, not their notch-free twins. */
+			(panel ? dcp_panel_edid_snapshot(dcp, modes, nr_modes -
+							 dcp_notch_twin_count(modes, nr_modes),
+							 &generation) :
 			 dcp_firmware_edid(dcp, &generation, &defaults)) : ERR_PTR(-ENODATA);
 
 		if (!IS_ERR(derived)) {
@@ -2989,13 +3094,36 @@ edid_done:
 			modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
 	}
 	/* Publish after a possibly delayed raw read, under its physical generation. */
+	effective = dcp_notch_effective(READ_ONCE(dcp->notch_policy),
+					READ_ONCE(dcp->notch_owned));
+	full_fits = dcp_notch_full_fits(apple_connector->probe_max_y,
+					READ_ONCE(dcp->notch_panel_rows));
+	/* What this probe offers sets the reported physical size. */
+	if (dcp->notch_rows && dcp_notch_dynamic(dcp))
+		WRITE_ONCE(dcp->notch_free_offered,
+			   dcp_notch_free_only(effective, full_fits));
 	for (i = 0; i < nr_modes; ++i) {
+		bool preferred = modes[i].mode.type & DRM_MODE_TYPE_PREFERRED;
+
+		/* A timing without a twin is offered as it is. */
+		if ((modes[i].notch_free || modes[i].notch_twin) &&
+		    !dcp_notch_offer(modes[i].notch_free, effective, full_fits, &preferred))
+			continue;
+
 		mode = drm_mode_duplicate(dev, &modes[i].mode);
 		if (!mode) {
 			dev_err(dev->dev, "Failed to duplicate display mode\n");
 			published = 0;
 			goto modes_done;
 		}
+		if (!preferred)
+			mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		/* The notch-free geometry is physically shorter too. */
+		if (modes[i].notch_free)
+			mode->height_mm = dcp_notch_free_mm(mode->height_mm,
+							    dcp->panel.adj_height_mm,
+							    READ_ONCE(dcp->notch_panel_rows),
+							    mode->vdisplay);
 		pending_180hz |= modes[i].automatic_rgb8_quirk &&
 			dcp_180hz_pending(dcp, &modes[i]);
 		if (!dcp_publish_mode(dcp, connector, &modes[i], mode))
@@ -3579,6 +3707,34 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return dcp_select_color_mode(mode, &req, &selected);
 }
 
+/*
+ * Panel rows above a frame of @mode on the M4 pipe: the notch rows for the
+ * notch-free twin of the panel timing, else 0.  From the timing the firmware
+ * reports, as iomfb_m4_plane_frame() checks the frame against.
+ */
+static u32 dcp_m4_notch_y(struct apple_dcp *dcp, const struct drm_display_mode *mode)
+{
+	struct drm_display_mode fixed;
+
+	if (!dcp->notch_rows || iomfb_m4_get_mode(dcp, &fixed))
+		return 0;
+	WRITE_ONCE(dcp->notch_panel_rows, fixed.vdisplay);
+	return dcp_notch_twin_of(&fixed, mode, dcp->notch_rows) ? dcp->notch_rows : 0;
+}
+
+/* @mode is one of the panel's own, in either notch geometry (dcp-notch.h). */
+bool dcp_notch_mode_known(struct apple_dcp *dcp, const struct drm_display_mode *mode)
+{
+	struct drm_display_mode fixed;
+
+	if (!iomfb_is_m4(dcp))
+		return lookup_mode(dcp, mode, NULL);
+	if (iomfb_m4_get_mode(dcp, &fixed))
+		return false;
+	return drm_mode_match(mode, &fixed, DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK) ||
+	       dcp_notch_twin_of(&fixed, mode, dcp->notch_rows);
+}
+
 static const struct dcp_display_mode *
 dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 {
@@ -3707,7 +3863,8 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode fixed;
 
-		return !iomfb_m4_get_mode(dcp, &fixed) && drm_mode_equal(mode, &fixed) ?
+		/* The panel's timing, full or notch-free (dcp-notch.h). */
+		return !iomfb_m4_get_mode(dcp, &fixed) && dcp_notch_mode_known(dcp, mode) ?
 			MODE_OK : MODE_BAD;
 	}
 
@@ -3743,7 +3900,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		if (!crtc_state || !crtc_state->active)
 			return 0;
 		ret = iomfb_m4_get_mode(dcp, &fixed);
-		return ret ? ret : drm_mode_equal(&crtc_state->mode, &fixed) ? 0 : -EINVAL;
+		return ret ? ret : dcp_notch_mode_known(dcp, &crtc_state->mode) ? 0 : -EINVAL;
 	}
 
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
@@ -3936,7 +4093,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode fixed;
 
-		return !iomfb_m4_get_mode(dcp, &fixed) && drm_mode_equal(mode, &fixed);
+		return !iomfb_m4_get_mode(dcp, &fixed) && dcp_notch_mode_known(dcp, mode);
 	}
 
 	/*
@@ -4545,9 +4702,14 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		ret = iomfb_m4_error(dcp);
 		/* A CRTC-only commit publishes no new framebuffer. */
 		if (!ret && plane) {
+			/* A notch-free mode is scanned out below the notch rows. */
+			u32 dst_y = dcp_m4_notch_y(dcp, &new->mode);
+
 			obj = plane->fb ? drm_fb_dma_get_gem_obj(plane->fb, 0) : NULL;
-			ret = obj ? iomfb_m4_present(dcp, plane->fb, obj->dma_addr,
-						       obj->base.size) : -EINVAL;
+			ret = obj ? iomfb_m4_present_at(dcp, plane->fb, obj->dma_addr,
+							obj->base.size, dst_y) : -EINVAL;
+			if (!ret)
+				WRITE_ONCE(dcp->notch_scanout_y, dst_y);
 		}
 		if (ret)
 			dcp_drm_crtc_error(to_apple_crtc(crtc), new, -EIO);

@@ -984,7 +984,8 @@ struct apple_dcp {
     struct { struct mutex lock; struct { u64 generation; bool connected; } epoch; } metadata;
     u64 typec_generation; bool typec_cable_connected;
     struct { size_t length; void *data; u64 av_service_epoch, automatic_connection_sequence; bool automatic_service_pending; struct test_mode_ticket mode_ticket; } chunks;
-    int width_mm,height_mm; struct { int width_mm,height_mm; } panel;
+    int width_mm,height_mm; struct { int width_mm,height_mm; unsigned adj_height_mm; } panel;
+    bool notch_free_offered; unsigned notch_rows,notch_panel_rows;
     unsigned int nr_modes; struct { struct { int width_mm,height_mm; } mode; } modes[1];
     struct apple_connector *connector;
     struct apple_dcp_afkep *dcpavservep,*dptxep,*avep,*systemep,*ibootep,*dptx_controller_ep;
@@ -1037,11 +1038,15 @@ rx_unused(apple_rtkit_kdebug_rx)
 rx_unused(apple_rtkit_ioreport_rx)
 rx_unused(apple_rtkit_oslog_rx)
 '''
-    parts=[function(dcp,'void dcp_set_dimensions('), function(template,'static u8 dcpep_cb_prop_start(')]
+    parts=[]
     if 'void dcp_update_connector_dimensions(' in dcp:
+        notch = (root / 'drivers/gpu/drm/apple/dcp-notch.h').read_text()
+        if 'dcp_notch_free_mm(' in notch:
+            parts.append(function(notch,'static inline int dcp_notch_free_mm('))
         parts.append(function(dcp,'void dcp_update_connector_dimensions('))
     else:
         parts.append('static void dcp_update_connector_dimensions(struct apple_dcp *d, struct drm_connector *c) { (void)d; (void)c; }')
+    parts += [function(dcp,'void dcp_set_dimensions('), function(template,'static u8 dcpep_cb_prop_start(')]
     parts += [function(iomfb,'void iomfb_recv_msg('),function(af,'int afk_receive_message('),
               function(dcp,'static struct apple_dcp_afkep *dcp_afkep('),
               function(dcp,'static void dcp_recv_msg(')]
@@ -1115,8 +1120,8 @@ int main(void)
     if owned:
         prefix=prefix.replace('struct apple_connector { struct drm_connector base; struct work_struct hotplug_wq; };',
             'struct apple_connector { struct drm_connector base; struct work_struct hotplug_wq,bl_sync_wq; };',1)
-        prefix=prefix.replace('    int width_mm,height_mm; struct { int width_mm,height_mm; } panel;',
-            '    int width_mm,height_mm; struct { int width_mm,height_mm; } panel;\n'
+        prefix=prefix.replace('    int width_mm,height_mm; struct { int width_mm,height_mm; unsigned adj_height_mm; } panel;\n    bool notch_free_offered; unsigned notch_rows,notch_panel_rows;',
+            '    int width_mm,height_mm; struct { int width_mm,height_mm; unsigned adj_height_mm; } panel;\n    bool notch_free_offered; unsigned notch_rows,notch_panel_rows;\n'
             '    struct mutex modes_lock; u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq; bool ext_backlight;',1)
         prefix=prefix.replace('struct { size_t length; void *data;','struct { size_t length; void *data; u64 modes_generation;',1)
         prefix=prefix.replace('static void schedule_work(struct work_struct *w) { queue_work(&dimensions_queue,w); }','''

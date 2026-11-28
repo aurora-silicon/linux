@@ -280,6 +280,46 @@ int main(void) { completion(); routes(); surfaces(); deadline(); return 0; }
 '''
 
 
+def notch(root):
+    # A notch-free frame (dcp-notch.h) on the J713 panel profile: 64 rows
+    # shorter, scanned out 64 rows down; the full frame stays at row 0.
+    return production(root) + r'''
+int main(void)
+{
+    static unsigned char swap[0x1bd8];
+    struct dcp_m4_frame f;
+    u64 dva = 0x10000100000ULL, size = 0x2000000;
+
+    assert(!dcp_m4_direct_frame_at(&f, dva, size, 2560, 1600, 10240, false, 64));
+    assert(f.dst_y == 64 && f.height == 1600);
+    assert(!dcp_m4_swap_encode_full(swap, sizeof(swap), 7, true, &f, NULL, 0, false, 0,
+                                    dcp_m4_frame_check));
+    /* Source w,h then destination x,y,w,h of surface 0. */
+    assert(get_unaligned_le32(swap + 0xb4) == 2560 && get_unaligned_le32(swap + 0xb8) == 1600);
+    assert(get_unaligned_le32(swap + 0x10c) == 0 && get_unaligned_le32(swap + 0x110) == 64);
+    assert(get_unaligned_le32(swap + 0x114) == 2560 && get_unaligned_le32(swap + 0x118) == 1600);
+
+    assert(!dcp_m4_direct_frame(&f, dva, size, 2560, 1664, 10240, false) && f.dst_y == 0);
+    assert(!dcp_m4_swap_encode_full(swap, sizeof(swap), 8, true, &f, NULL, 0, false, 0,
+                                    dcp_m4_frame_check));
+    assert(get_unaligned_le32(swap + 0x110) == 0 && get_unaligned_le32(swap + 0x118) == 1664);
+
+    /* Frame and offset must cover the panel exactly, within the notch bound. */
+    assert(dcp_m4_direct_frame(&f, dva, size, 2560, 1600, 10240, false) == -EINVAL);
+    assert(dcp_m4_direct_frame_at(&f, dva, size, 2560, 1600, 10240, false, 63) == -EINVAL);
+    assert(dcp_m4_direct_frame_at(&f, dva, size, 2560, 1664, 10240, false, 64) == -EINVAL);
+    assert(dcp_m4_direct_frame_at(&f, dva, size, 2560, 1500, 10240, false, 164) == -EINVAL);
+    /* An external frame has no notch. */
+    f = (struct dcp_m4_frame){ .dva = dva, .backing_size = size, .width = 1920, .height = 1080,
+                               .stride = 7680, .format = DCP_M4_XRGB8888 };
+    assert(!dcp_m4_frame_check_ext(&f));
+    f.dst_y = 1;
+    assert(dcp_m4_frame_check_ext(&f) == -EINVAL);
+    return 0;
+}
+'''
+
+
 def plane(root):
     source = (root / APPLE / 'plane.c').read_text()
     present = header_body((root / APPLE / 'iomfb_m4_present.h').read_text())
@@ -770,7 +810,8 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
     return 0;
 }
 ''' + functions + '\n' + '\n'.join(block(backend, name) for name in (
-        'static int iomfb_m4_swap(', 'int iomfb_m4_present(', 'int iomfb_m4_blank(')) + r'''
+        'static int iomfb_m4_swap(', 'int iomfb_m4_present_at(', 'int iomfb_m4_present(',
+        'int iomfb_m4_blank(')) + r'''
 int main(void)
 {
     for(order=0;order<2;order++) {

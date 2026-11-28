@@ -1928,6 +1928,8 @@ static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
 static bool dcp_vrr_live(struct apple_dcp *d)
 { return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
+static bool __attribute__((unused)) dcp_notch_mode_known(struct apple_dcp *d,
+    const struct drm_display_mode *m) { (void)d; (void)m; assert(false); return false; }
 static bool dcp_has_panel(struct apple_dcp *d) { return d->panel; }
 /* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
 static unsigned int peer_checks;
@@ -1938,7 +1940,7 @@ static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return 
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
 { (void)d; (void)m; assert(false); return -ENODEV; }
 static unsigned drm_plane_mask(void *p) { (void)p; assert(false); return 0; }
-static bool drm_mode_equal(const struct drm_display_mode *a,const struct drm_display_mode *b)
+static bool __attribute__((unused)) drm_mode_equal(const struct drm_display_mode *a,const struct drm_display_mode *b)
 { (void)a; (void)b; assert(false); return false; }
 /* These commits change no colour management, so no gamma table is sized. */
 static int __attribute__((unused)) drm_color_lut_size(const void *blob)

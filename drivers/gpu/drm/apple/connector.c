@@ -285,6 +285,19 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 #endif
 }
 
+/* The panel's notch state (dcp-notch.h), for checking what is on screen. */
+static int notch_show(struct seq_file *m, void *v)
+{
+	struct apple_dcp *dcp = m->private;
+
+	seq_printf(m, "rows %u\npanel_rows %u\npolicy %s\nowned %u\nscanout_y %u\n",
+		   dcp->notch_rows, READ_ONCE(dcp->notch_panel_rows),
+		   READ_ONCE(dcp->notch_policy) == DCP_NOTCH_SHOWN ? "shown" : "hidden",
+		   READ_ONCE(dcp->notch_owned), READ_ONCE(dcp->notch_scanout_y));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(notch);
+
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root)
 {
 	struct apple_connector *apple_con = to_apple_connector(connector);
@@ -293,6 +306,8 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
 
 	if (dcp && iomfb_is_m4(dcp))
 		iomfb_m4_debugfs_init(dcp, root);
+	if (dcp && dcp->notch_rows && dcp_notch_dynamic(dcp))
+		debugfs_create_file("notch", 0444, root, dcp, &notch_fops);
 
         debugfs_create_file("ColorElements", 0444, root, apple_con,
                             &chunk_color_fops);

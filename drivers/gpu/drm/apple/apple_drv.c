@@ -30,6 +30,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
+#include <drm/drm_client_event.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_crtc.h>
@@ -75,11 +76,57 @@ struct apple_drm_private {
 	bool s2r_skipped;
 	/* A dark wake left the outputs as the suspend did, for the next resume. */
 	bool dark_held;
+	/* The "notch" connector property, on panels with notch rows (dcp-notch.h). */
+	struct drm_property *notch_prop;
+	/* Re-probe after a "notch" change: userspace and the console. */
+	struct work_struct notch_hotplug;
+	/* The console took the display back: it re-probes its notch-free modes. */
+	struct work_struct notch_console;
+	/*
+	 * The console's first probe ran while a DRM master was offered the
+	 * full panel: its modes are not its notch-free surface's until it
+	 * re-probes, which the next master drop asks for, once.
+	 */
+	bool notch_console_stale;
 	/* On apple_drm_pm_list while bound, for the system-sleep notifier. */
 	struct list_head pm_node;
 	/* The notifier's output restore, run outside apple_drm_pm_lock. */
 	struct work_struct pm_resume_work;
 };
+
+static struct apple_drm_private *to_apple_drm(struct drm_device *drm)
+{
+	return container_of(drm, struct apple_drm_private, drm);
+}
+
+/* A connector state with the panel's "notch" property. */
+struct apple_connector_state {
+	struct drm_connector_state base;
+	u8 notch;	/* enum dcp_notch_policy */
+};
+
+static struct apple_connector_state *
+to_apple_connector_state(const struct drm_connector_state *state)
+{
+	return container_of(state, struct apple_connector_state, base);
+}
+
+static const struct drm_connector_funcs apple_connector_funcs;
+
+/* The panel pipeline behind @connector if its panel has notch rows, else NULL. */
+static struct apple_dcp *apple_connector_notch_dcp(struct drm_connector *connector)
+{
+	struct platform_device *pdev;
+	struct apple_dcp *dcp;
+
+	if (connector->funcs != &apple_connector_funcs)
+		return NULL;
+	pdev = READ_ONCE(to_apple_connector(connector)->dcp);
+	dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+
+	return dcp && dcp->notch_rows && dcp_notch_dynamic(dcp) &&
+	       connector->connector_type == DRM_MODE_CONNECTOR_eDP ? dcp : NULL;
+}
 
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
 #ifdef CONFIG_PM_SLEEP
@@ -347,9 +394,101 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		}
 	}
 
+	/*
+	 * The console never draws under a panel's notch: its surface is the
+	 * notch-free geometry, so every later probe of the fbdev client, which
+	 * is bounded by its surface, picks the notch-free modes.  Its first probe
+	 * normally ran with no DRM master and picked them already; this covers
+	 * a boot splash that held master then.
+	 */
+	drm_for_each_crtc(crtc, helper->dev) {
+		struct apple_dcp *dcp;
+		u32 rows;
+
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		rows = READ_ONCE(dcp->notch_panel_rows);
+		if (!dcp->notch_rows || !dcp_notch_dynamic(dcp) || !rows ||
+		    sizes->surface_height != rows)
+			continue;
+		sizes->surface_height -= dcp->notch_rows;
+		sizes->fb_height = min(sizes->fb_height, sizes->surface_height);
+		WRITE_ONCE(to_apple_drm(helper->dev)->notch_console_stale, true);
+		break;
+	}
+
 	return drm_fbdev_dma_driver_fbdev_probe(helper, sizes);
 }
 #endif
+
+/*
+ * Who owns the display decides the notch geometry offered (dcp-notch.h): a
+ * DRM master gets the policy, the console gets notch-free modes.  Every
+ * probe of the console after its first is bounded by its notch-free surface
+ * and so picks notch-free modes whoever owns the device; only a first probe
+ * under a master offered the full panel (a boot splash) leaves it with full
+ * modes, and the first master drop after that has it re-probe.  Other drops
+ * (greeter to session, user switch) leave the console alone.  When a master
+ * comes back, it is offered the policy's geometry at its next probe, and its
+ * own mode, full or notch-free, is a fast switch either way.
+ */
+static void apple_drm_notch_owner(struct drm_device *drm, bool owned)
+{
+	struct drm_crtc *crtc;
+	bool notch = false;
+
+	drm_for_each_crtc(crtc, drm) {
+		struct apple_dcp *dcp;
+
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		if (!dcp || !dcp->notch_rows || !dcp_notch_dynamic(dcp))
+			continue;
+		WRITE_ONCE(dcp->notch_owned, owned);
+		notch = true;
+	}
+	/* master_drop() runs under master_mutex, which the console's restore takes. */
+	if (notch && !owned && !drm_dev_is_unplugged(drm) &&
+	    xchg(&to_apple_drm(drm)->notch_console_stale, false))
+		schedule_work(&to_apple_drm(drm)->notch_console);
+}
+
+static void apple_drm_master_set(struct drm_device *drm, struct drm_file *file,
+				 bool from_open)
+{
+	apple_drm_notch_owner(drm, true);
+}
+
+static void apple_drm_master_drop(struct drm_device *drm, struct drm_file *file)
+{
+	apple_drm_notch_owner(drm, false);
+}
+
+static void apple_drm_notch_console(struct work_struct *work)
+{
+	struct drm_device *drm = &container_of(work, struct apple_drm_private,
+					       notch_console)->drm;
+	int idx;
+
+	if (!drm_dev_enter(drm, &idx))
+		return;
+	drm_client_dev_hotplug(drm);
+	drm_dev_exit(idx);
+}
+
+static void apple_drm_notch_hotplug(struct work_struct *work)
+{
+	struct drm_device *drm = &container_of(work, struct apple_drm_private,
+					       notch_hotplug)->drm;
+	int idx;
+
+	if (!drm_dev_enter(drm, &idx))
+		return;
+	drm_kms_helper_hotplug_event(drm);
+	drm_dev_exit(idx);
+}
 
 /*
  * HDR is asked for by the compositor that set it, but connector properties
@@ -451,6 +590,8 @@ static const struct drm_driver apple_drm_driver = {
 #endif
 	.postclose		= apple_drm_postclose,
 	.gem_create_object	= apple_drm_gem_create_object,
+	.master_set		= apple_drm_master_set,
+	.master_drop		= apple_drm_master_drop,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -1008,10 +1149,37 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.fb_create		= drm_gem_fb_create,
 };
 
+/*
+ * Publish the committed policy before completing the commit dependencies.
+ * Hotplug work runs after the hardware completion notification.
+ */
+static bool apple_commit_notch(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *old, *new;
+	struct drm_connector *conn;
+	bool changed = false;
+	int i;
+
+	for_each_oldnew_connector_in_state(state, conn, old, new, i) {
+		struct apple_dcp *dcp = apple_connector_notch_dcp(conn);
+		u8 notch;
+
+		if (!dcp)
+			continue;
+		notch = to_apple_connector_state(new)->notch;
+		if (notch == to_apple_connector_state(old)->notch)
+			continue;
+		WRITE_ONCE(dcp->notch_policy, notch);
+		changed = true;
+	}
+	return changed;
+}
+
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *old, *new;
+	bool notch_changed;
 	int i;
 
 	/* Retain displaced scanout even when the CRTC stays inactive. */
@@ -1034,8 +1202,11 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 	drm_atomic_helper_commit_modeset_enables(state->dev, state);
 	drm_atomic_helper_commit_planes(state->dev, state,
 					DRM_PLANE_COMMIT_ACTIVE_ONLY);
+	notch_changed = apple_commit_notch(state);
 	drm_atomic_helper_fake_vblank(state);
 	drm_atomic_helper_commit_hw_done(state);
+	if (notch_changed)
+		schedule_work(&to_apple_drm(state->dev)->notch_hotplug);
 	drm_atomic_helper_wait_for_flip_done(state->dev, state);
 	apple_fail_lost_flips(state);
 	drm_atomic_helper_cleanup_planes(state->dev, state);
@@ -1063,31 +1234,189 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	kfree(apple_connector);
 }
 
+/* Probe with the client's size limit at hand (see dcp_notch_offer()). */
+static int apple_connector_fill_modes(struct drm_connector *connector,
+				      u32 max_x, u32 max_y)
+{
+	struct drm_mode_config *config = &connector->dev->mode_config;
+
+	to_apple_connector(connector)->probe_max_y = max_y < config->max_height ? max_y : 0;
+	return drm_helper_probe_single_connector_modes(connector, max_x, max_y);
+}
+
+static void apple_connector_reset(struct drm_connector *connector)
+{
+	struct apple_connector_state *state = kzalloc_obj(*state);
+	struct apple_dcp *dcp = apple_connector_notch_dcp(connector);
+
+	if (connector->state) {
+		__drm_atomic_helper_connector_destroy_state(connector->state);
+		kfree(to_apple_connector_state(connector->state));
+		connector->state = NULL;
+	}
+	if (!state)
+		return;
+	__drm_atomic_helper_connector_reset(connector, &state->base);
+	if (connector->max_bpc_property) {
+		state->base.max_requested_bpc = 12;
+		state->base.max_bpc = 12;
+	}
+	state->notch = dcp ? READ_ONCE(dcp->notch_policy) : DCP_NOTCH_HIDDEN;
+}
+
+static struct drm_connector_state *
+apple_connector_duplicate_state(struct drm_connector *connector)
+{
+	struct apple_connector_state *state;
+
+	if (WARN_ON(!connector->state))
+		return NULL;
+	state = kmemdup(to_apple_connector_state(connector->state), sizeof(*state),
+			GFP_KERNEL);
+	if (!state)
+		return NULL;
+	__drm_atomic_helper_connector_duplicate_state(connector, &state->base);
+	return &state->base;
+}
+
+static void apple_connector_destroy_state(struct drm_connector *connector,
+					  struct drm_connector_state *state)
+{
+	__drm_atomic_helper_connector_destroy_state(state);
+	kfree(to_apple_connector_state(state));
+}
+
+static int apple_connector_atomic_set_property(struct drm_connector *connector,
+					       struct drm_connector_state *state,
+					       struct drm_property *property, u64 val)
+{
+	if (property != to_apple_drm(connector->dev)->notch_prop ||
+	    val > DCP_NOTCH_SHOWN)
+		return -EINVAL;
+	to_apple_connector_state(state)->notch = val;
+	return 0;
+}
+
+static int apple_connector_atomic_get_property(struct drm_connector *connector,
+					       const struct drm_connector_state *state,
+					       struct drm_property *property, u64 *val)
+{
+	if (property != to_apple_drm(connector->dev)->notch_prop)
+		return -EINVAL;
+	*val = to_apple_connector_state(state)->notch;
+	return 0;
+}
+
+static const struct drm_prop_enum_list apple_notch_names[] = {
+	{ DCP_NOTCH_HIDDEN, "hidden" },
+	{ DCP_NOTCH_SHOWN, "shown" },
+};
+
+/* The sysfs words, indexed by enum dcp_notch_policy. */
+static const char * const apple_notch_words[] = { "hidden", "shown" };
+
+/* Commit @notch for @connector, as a compositor setting "notch" would. */
+static int apple_connector_commit_notch(struct drm_connector *connector, u8 notch)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_connector_state *cs;
+	struct drm_atomic_commit *state;
+	int ret = -ENOMEM;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_commit_alloc(connector->dev);
+	if (!state)
+		goto out_ctx;
+	state->acquire_ctx = &ctx;
+retry:
+	cs = drm_atomic_get_connector_state(state, connector);
+	ret = PTR_ERR_OR_ZERO(cs);
+	if (!ret) {
+		to_apple_connector_state(cs)->notch = notch;
+		ret = drm_atomic_commit(state);
+	}
+	if (ret == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	drm_atomic_commit_put(state);
+out_ctx:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+/*
+ * /sys/class/drm/cardN-eDP-1/notch: "shown" or "hidden", the same policy as
+ * the "notch" connector property, for scripts.
+ */
+static ssize_t notch_show(struct device *kdev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct drm_connector *connector = dev_get_drvdata(kdev);
+	struct apple_dcp *dcp = apple_connector_notch_dcp(connector);
+
+	if (!dcp)
+		return -ENODEV;
+	return sysfs_emit(buf, "%s\n", apple_notch_words[READ_ONCE(dcp->notch_policy) ==
+							   DCP_NOTCH_SHOWN]);
+}
+
+static ssize_t notch_store(struct device *kdev, struct device_attribute *attr,
+			   const char *buf, size_t len)
+{
+	struct drm_connector *connector = dev_get_drvdata(kdev);
+	int ret = sysfs_match_string(apple_notch_words, buf);
+	int idx;
+
+	if (ret < 0) {
+		bool on;
+
+		if (kstrtobool(buf, &on))
+			return -EINVAL;
+		ret = on ? DCP_NOTCH_SHOWN : DCP_NOTCH_HIDDEN;
+	}
+	if (!apple_connector_notch_dcp(connector))
+		return -ENODEV;
+	if (!drm_dev_enter(connector->dev, &idx))
+		return -ENODEV;
+	ret = apple_connector_commit_notch(connector, ret);
+	drm_dev_exit(idx);
+	return ret ? ret : len;
+}
+static DEVICE_ATTR_RW(notch);
+
 static int apple_connector_late_register(struct drm_connector *connector)
 {
-	return apple_connector_backlight_late_register(to_apple_connector(connector));
+	int ret;
+
+	if (apple_connector_notch_dcp(connector)) {
+		ret = device_create_file(connector->kdev, &dev_attr_notch);
+		if (ret)
+			return ret;
+	}
+	ret = apple_connector_backlight_late_register(to_apple_connector(connector));
+	if (ret)
+		device_remove_file(connector->kdev, &dev_attr_notch);
+	return ret;
 }
 
 static void apple_connector_early_unregister(struct drm_connector *connector)
 {
 	apple_connector_backlight_early_unregister(to_apple_connector(connector));
-}
-
-static void apple_connector_reset(struct drm_connector *connector)
-{
-	drm_atomic_helper_connector_reset(connector);
-	if (connector->state && connector->max_bpc_property) {
-		connector->state->max_requested_bpc = 12;
-		connector->state->max_bpc = 12;
-	}
+	/* Nothing if it was never created. */
+	device_remove_file(connector->kdev, &dev_attr_notch);
 }
 
 static const struct drm_connector_funcs apple_connector_funcs = {
-	.fill_modes		= drm_helper_probe_single_connector_modes,
+	.fill_modes		= apple_connector_fill_modes,
 	.destroy		= appledrm_connector_cleanup,
 	.reset			= apple_connector_reset,
-	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
-	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+	.atomic_duplicate_state	= apple_connector_duplicate_state,
+	.atomic_destroy_state	= apple_connector_destroy_state,
+	.atomic_set_property	= apple_connector_atomic_set_property,
+	.atomic_get_property	= apple_connector_atomic_get_property,
 	.detect			= apple_connector_detect,
 	.debugfs_init		= apple_connector_debugfs_init,
 	.oob_hotplug_event	= apple_connector_oob_hotplug,
@@ -1143,6 +1472,40 @@ static u8 apple_connector_eotf(const struct drm_connector_state *state)
 	return hdr->hdmi_metadata_type1.eotf;
 }
 
+/*
+ * The two notch geometries of the panel's timing (dcp-notch.h) differ only in
+ * where the frame is scanned out: switching between them, the console taking
+ * the display back or a compositor taking it, keeps the panel's mode, so it
+ * is no mode set (no CRTC off and on, no firmware mode set).
+ */
+static int apple_connector_notch_fastset(struct drm_connector *conn,
+					 struct drm_atomic_commit *state,
+					 struct drm_connector_state *new)
+{
+	struct apple_dcp *dcp = apple_connector_notch_dcp(conn);
+	struct drm_crtc_state *old_cs, *new_cs;
+
+	if (!dcp || !new->crtc)
+		return 0;
+	old_cs = drm_atomic_get_old_crtc_state(state, new->crtc);
+	new_cs = drm_atomic_get_new_crtc_state(state, new->crtc);
+	if (!old_cs || !new_cs || !new_cs->mode_changed || new_cs->active_changed ||
+	    new_cs->connectors_changed || !old_cs->active || !new_cs->active ||
+	    old_cs->enable != new_cs->enable ||
+	    old_cs->vrr_enabled != new_cs->vrr_enabled ||
+	    !dcp_notch_twins(&old_cs->mode, &new_cs->mode, dcp->notch_rows) ||
+	    !dcp_notch_mode_known(dcp, &new_cs->mode))
+		return 0;
+	new_cs->mode_changed = false;
+	/* No mode_fixup() runs now: the adjusted mode is the mode, as it would be. */
+	drm_mode_copy(&new_cs->adjusted_mode, &new_cs->mode);
+	/*
+	 * The frame moves by the notch rows: the swap that does it needs the
+	 * CRTC's planes, which the core adds only to a mode set.
+	 */
+	return drm_atomic_add_affected_planes(state, new->crtc);
+}
+
 static int apple_connector_atomic_check(struct drm_connector *conn,
 					struct drm_atomic_commit *state)
 {
@@ -1150,6 +1513,12 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
 	const struct drm_property_blob *blob = new->hdr_output_metadata;
 	struct drm_crtc_state *crtc_state;
+	int ret;
+
+	/* Before anything below asks for a real mode set again. */
+	ret = apple_connector_notch_fastset(conn, state, new);
+	if (ret)
+		return ret;
 
 	if (blob && (blob->length != sizeof(struct hdr_output_metadata) ||
 		     !dcp_hdr_is_type1(blob->data)))
@@ -1323,6 +1692,33 @@ static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.mode_fixup		= dcp_crtc_mode_fixup,
 };
 
+/*
+ * "notch" (enum: hidden, shown) on a panel with notch rows: whether a
+ * compositor is offered the full panel height (dcp-notch.h).  The modes
+ * follow a change; the mode a commit carries decides what is scanned out.
+ */
+static int apple_connector_attach_notch(struct drm_connector *connector)
+{
+	struct apple_drm_private *apple = to_apple_drm(connector->dev);
+	struct apple_dcp *dcp = apple_connector_notch_dcp(connector);
+
+	if (!dcp)
+		return 0;
+	if (!apple->notch_prop) {
+		apple->notch_prop = drm_property_create_enum(connector->dev, 0, "notch",
+							     apple_notch_names,
+							     ARRAY_SIZE(apple_notch_names));
+		if (!apple->notch_prop)
+			return -ENOMEM;
+	}
+	drm_object_attach_property(&connector->base, apple->notch_prop,
+				   READ_ONCE(dcp->notch_policy));
+	if (connector->state)
+		to_apple_connector_state(connector->state)->notch =
+			READ_ONCE(dcp->notch_policy);
+	return 0;
+}
+
 static int apple_connector_create(struct drm_device *drm,
 				  struct platform_device *dcp,
 				  struct apple_crtc *crtc,
@@ -1361,6 +1757,9 @@ static int apple_connector_create(struct drm_device *drm,
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
 	apple_connector_set_pipeline(connector, dcp);
+	ret = apple_connector_attach_notch(&connector->base);
+	if (ret)
+		goto err_cleanup;
 
 	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
 	if (ret)
@@ -2098,6 +2497,8 @@ static int apple_drm_init(struct device *dev)
 	INIT_WORK(&apple->pm_resume_work, apple_drm_pm_resume_work);
 #endif
 	dev_set_drvdata(dev, apple);
+	INIT_WORK(&apple->notch_hotplug, apple_drm_notch_hotplug);
+	INIT_WORK(&apple->notch_console, apple_drm_notch_console);
 
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)
@@ -2256,6 +2657,8 @@ err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
+	disable_work_sync(&apple->notch_hotplug);
+	disable_work_sync(&apple->notch_console);
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
@@ -2286,6 +2689,9 @@ static void apple_drm_uninit(struct device *dev)
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
+	/* No sysfs write, commit or master change queues them now. */
+	disable_work_sync(&apple->notch_hotplug);
+	disable_work_sync(&apple->notch_console);
 
 	component_unbind_all(dev, NULL);
 

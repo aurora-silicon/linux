@@ -448,7 +448,7 @@ def panel_identity(root, output=None):
 struct apple_dcp {
     int fw_compat;bool has_panel;struct {bool lock;} metadata;
     struct dcp_panel_identity *panel_identity;
-    struct {u32 width_mm,height_mm,peak_nits;const struct dcp_color_space *color_target;} panel;void *connector;
+    struct {u32 width_mm,height_mm,adj_height_mm,peak_nits;const struct dcp_color_space *color_target;} panel;void *connector;
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}

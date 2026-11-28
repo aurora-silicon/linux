@@ -229,4 +229,6 @@ int dcp_peer_stop_26_6(struct apple_dcp *dcp);
 void dcp_peer_release_26_6(struct apple_dcp *dcp);
 void dcp_peer_bound_26_6(struct apple_dcp *dcp);
 
+bool dcp_notch_mode_known(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+
 #endif

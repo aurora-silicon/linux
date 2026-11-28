@@ -542,9 +542,6 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	return ready;
 }
 
-static bool show_notch;
-module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
 
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
@@ -1428,8 +1425,11 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
 	of_property_read_u32(panel_np, "width-mm", &dcp->panel.width_mm);
 	/* Read the full height first: adj-height-mm is optional. */
 	of_property_read_u32(panel_np, "height-mm", &dcp->panel.height_mm);
-	if (dcp->notch_height)
-		of_property_read_u32(panel_np, "adj-height-mm", &dcp->panel.height_mm);
+	/* The notch-free geometry's height (dcp-notch.h); optional. */
+	dcp->panel.adj_height_mm = 0;
+	of_property_read_u32(panel_np, "adj-height-mm", &dcp->panel.adj_height_mm);
+	if (dcp->notch_height && dcp->panel.adj_height_mm)
+		dcp->panel.height_mm = dcp->panel.adj_height_mm;
 }
 
 /*
@@ -1699,10 +1699,9 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
 	}
-	if (connector) {
-		connector->display_info.width_mm = width_mm;
-		connector->display_info.height_mm = height_mm;
-	}
+	/* As get_modes() would: the notch-free geometry is shorter. */
+	if (connector)
+		dcp_update_connector_dimensions(dcp, connector);
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
@@ -1723,6 +1722,13 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 	if (!width_mm || !height_mm) {
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
+	}
+	/* The notch-free geometry is physically shorter (dcp-notch.h). */
+	if (READ_ONCE(dcp->notch_free_offered)) {
+		u32 rows = READ_ONCE(dcp->notch_panel_rows);
+
+		height_mm = dcp_notch_free_mm(height_mm, dcp->panel.adj_height_mm,
+					      rows, rows - dcp->notch_rows);
 	}
 	connector->display_info.width_mm = width_mm;
 	connector->display_info.height_mm = height_mm;
@@ -2412,7 +2418,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		if (!(crtc_state->plane_mask & drm_plane_mask(crtc->primary)))
 			return -EINVAL;
 		ret = iomfb_m4_get_mode(dcp, &mode);
-		return ret ? ret : drm_mode_equal(&crtc_state->mode, &mode) ? 0 : -EINVAL;
+		if (ret)
+			return ret;
+		/* The panel's timing, full or notch-free (dcp-notch.h). */
+		return dcp_notch_mode_known(dcp, &crtc_state->mode) ? 0 : -EINVAL;
 	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		return iomfb_v26_6_atomic_check(dcp, crtc, commit);
@@ -7397,14 +7406,21 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	if (!show_notch && !boot_show_notch())
-		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
-					   &dcp->notch_height);
-
-	if (dcp->notch_height > MAX_NOTCH_HEIGHT)
-		dcp->notch_height = MAX_NOTCH_HEIGHT;
-	if (dcp->notch_height > 0)
-		dev_info(dev, "Detected display with notch of %u pixel\n", dcp->notch_height);
+	/*
+	 * The notch rows are a fact of the panel; whether they are drawn on is
+	 * the boot loader's choice first, then the user's, at run time (see
+	 * dcp-notch.h).
+	 */
+	of_property_read_u32(dev->of_node, "apple,notch-height", &dcp->notch_rows);
+	dcp->notch_rows = min_t(u32, dcp->notch_rows, MAX_NOTCH_HEIGHT);
+	dcp->notch_policy = boot_show_notch() ? DCP_NOTCH_SHOWN : DCP_NOTCH_HIDDEN;
+	if (!dcp_notch_dynamic(dcp) && dcp->notch_policy == DCP_NOTCH_HIDDEN)
+		dcp->notch_height = dcp->notch_rows;
+	if (dcp->notch_rows)
+		dev_info(dev, "Detected display with notch of %u pixel (%s%s)\n",
+			 dcp->notch_rows,
+			 dcp->notch_policy == DCP_NOTCH_SHOWN ? "shown" : "hidden",
+			 dcp_notch_dynamic(dcp) ? "" : " for this boot");
 
 	/* initialize brightness scale to a sensible default to avoid divide by 0*/
 	dcp->brightness.scale = 65536;

@@ -2208,7 +2208,7 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	     !r->power_done || !r->background_done || !dcp->scanout))
 		return -EINVAL;
 	if ((primary && frame && (check(frame) || frame->width != width ||
-				  frame->height != height)) ||
+				  frame->height + frame->dst_y != height)) ||
 	    (upper && dcp_m4_upper_check_on(upper, width, height)))
 		return -EINVAL;
 	/*
@@ -3569,8 +3569,9 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
 	return ret;
 }
 
-int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
-		     dma_addr_t dva, size_t mapped)
+/* As iomfb_m4_present(), @dst_y panel rows down: a notch-free frame. */
+int iomfb_m4_present_at(struct apple_dcp *owner, struct drm_framebuffer *fb,
+			dma_addr_t dva, size_t mapped, u32 dst_y)
 {
 	struct iomfb_m4 *dcp = owner->v26_6;
 	struct drm_framebuffer *retire = NULL;
@@ -3582,8 +3583,9 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 	    (fb->format->format != DRM_FORMAT_XRGB8888 &&
 	     fb->format->format != DRM_FORMAT_ARGB8888))
 		return -EINVAL;
-	ret = dcp_m4_direct_frame(&frame, dva, mapped, fb->width, fb->height,
-				  fb->pitches[0], fb->format->format == DRM_FORMAT_ARGB8888);
+	ret = dcp_m4_direct_frame_at(&frame, dva, mapped, fb->width, fb->height,
+				     fb->pitches[0], fb->format->format == DRM_FORMAT_ARGB8888,
+				     dst_y);
 	if (ret)
 		return ret;
 	/* A power-down not yet started is not needed; one under way finishes first. */
@@ -3629,6 +3631,12 @@ out:
 	if (retire)
 		drm_framebuffer_put(retire);
 	return ret;
+}
+
+int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+		     dma_addr_t dva, size_t mapped)
+{
+	return iomfb_m4_present_at(owner, fb, dva, mapped, 0);
 }
 
 int iomfb_m4_blank(struct apple_dcp *owner)

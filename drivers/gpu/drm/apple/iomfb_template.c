@@ -541,7 +541,7 @@ static bool __maybe_unused DCP_FW_NAME(dcp_fw27_keep_panel_mode)(struct apple_dc
 
 	if (policy == 0 || !dcp->main_display || !dcp_has_panel(dcp))
 		return false;
-	return policy > 0 || READ_ONCE(dcp->nr_modes) == 1;
+	return policy > 0 || dcp_nr_timings(dcp) == 1;
 #else
 	return false;
 #endif
@@ -4120,7 +4120,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * single fixed timing it advertises, already matched above.
 	 */
 	if (dcp_has_panel(dcp) && dcp->main_display &&
-	    READ_ONCE(dcp->nr_modes) == 1 && !mode->vrr) {
+	    dcp_nr_timings(dcp) == 1 && !mode->vrr) {
 		dcp->desktop->mode_live = true;
 		return 0;
 	}
@@ -4447,7 +4447,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode (%u fixed timing(s))\n",
-			 READ_ONCE(dcp->nr_modes));
+			 dcp_nr_timings(dcp));
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
@@ -4595,6 +4595,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_SWAP(dcp);
 	int plane_idx, l;
 	int has_surface = 0;
+	u32 notch_y;
 
 #if !DCP_FW_DESKTOP_26(DCP_FW_VER)
 	bool update_brightness;
@@ -4656,8 +4657,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
 #endif
 
-		if (dcp->notch_height > 0)
-			req->swap.dst_rect[l].y += dcp->notch_height;
+		/* A notch-free mode is scanned out below the notch rows. */
+		notch_y = dcp_notch_offset(&crtc_state->mode,
+					   READ_ONCE(dcp->notch_panel_rows),
+					   dcp->notch_rows);
+		WRITE_ONCE(dcp->notch_scanout_y, notch_y);
+		req->swap.dst_rect[l].y += dcp->notch_height + notch_y;
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;

@@ -89,6 +89,12 @@ struct apple_connector {
 	 * chosen one; -1 until then, and nothing is sent.
 	 */
 	int bl_level;
+	/*
+	 * The height limit of the probe in progress (fill_modes(), under
+	 * mode_config.mutex): a client whose surface is shorter than the panel,
+	 * the console's, is offered the notch-free modes (dcp-notch.h).
+	 */
+	u32 probe_max_y;
 };
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)

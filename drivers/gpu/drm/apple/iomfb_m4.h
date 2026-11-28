@@ -86,6 +86,8 @@ bool iomfb_m4_sleep_stopped(struct apple_dcp *dcp);
 /* The caller has waited for the producer fence before publishing the DMA GEM. */
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 		     dma_addr_t dva, size_t mapped);
+int iomfb_m4_present_at(struct apple_dcp *dcp, struct drm_framebuffer *fb,
+			dma_addr_t dva, size_t mapped, u32 dst_y);
 int iomfb_m4_blank(struct apple_dcp *dcp);
 int iomfb_m4_suspend(struct apple_dcp *dcp);
 int iomfb_m4_resume(struct apple_dcp *dcp);
@@ -169,6 +171,12 @@ static inline bool iomfb_m4_sleep_stopped(struct apple_dcp *dcp) { return false;
 
 static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 				  dma_addr_t dva, size_t mapped)
+{
+	return -ENODEV;
+}
+
+static inline int iomfb_m4_present_at(struct apple_dcp *dcp, struct drm_framebuffer *fb,
+				      dma_addr_t dva, size_t mapped, u32 dst_y)
 {
 	return -ENODEV;
 }

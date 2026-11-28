@@ -243,6 +243,8 @@ typedef u32 __le32;
 #define GFP_KERNEL 0
 #define kmalloc(n, f) malloc(n)
 #define kcalloc(n, s, f) calloc(n,s)
+#define krealloc_array(p, n, s, f) realloc(p, (n) * (s))
+#define __GFP_NOWARN 0
 #define kfree(p) free(p)
 #define mul_u32_u32(a, b) ((u64)(u32)(a) * (u32)(b))
 #define DIV_ROUND_CLOSEST_ULL(n, d) (((n) + (d) / 2) / (d))
@@ -292,7 +294,9 @@ struct drm_display_mode {
     int hdisplay, hsync_start, hsync_end, htotal, width_mm, height_mm;
 };
 static void drm_mode_set_name(struct drm_display_mode *mode) { (void)mode; }
-'''
+#define DCP_NOTCH_HOST
+''' + (base / 'dcp-notch.h').read_text().replace('static inline ', 'static inline __attribute__((unused)) ')
+
     stubs = r'''
 struct drm_edid { struct edid raw; u8 cta[128]; size_t size; };
 static const struct drm_edid *drm_edid_alloc(const void *data, size_t size)
@@ -681,7 +685,7 @@ struct work_struct { unsigned scheduled; };
 struct drm_edid { u8 data[256]; };
 struct apple_connector {
     void *dcp; bool connected, drm_edid_firmware_derived, edid_invalidation_pending;
-    u64 drm_edid_generation, drm_edid_service_epoch;
+    u64 drm_edid_generation, drm_edid_service_epoch; u32 probe_max_y;
     const struct drm_edid *drm_edid;
     struct { int registration_state; } base;
     struct work_struct hotplug_wq, bl_sync_wq;
@@ -701,6 +705,8 @@ struct apple_dcp {
     void *dev, *phy, *active_typec_route;
     bool dptx_tunnel, usb4, typec_cable_connected, quiescing, hpd_mutex;
     u64 typec_generation; unsigned int nr_modes;
+    /* No notched panel here: the notch-free twins are the panel tests'. */
+    unsigned int nr_notch_twins; u32 notch_rows, notch_panel_rows; u8 notch_policy; bool notch_owned, notch_free_offered;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel, iomfb_template_pq;
@@ -859,7 +865,7 @@ def publication(root):
     state = n['state']
     state = state.replace('struct apple_connector {', '''struct drm_device { void *dev; struct { bool mutex; } mode_config; };
 struct drm_connector { struct drm_device *dev; int registration_state; void *state;
-    struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;
+    struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; int width_mm,height_mm; } display_info;
 };
 struct apple_connector {''')
     state = state.replace('    struct { int registration_state; } base;', '    struct drm_connector base;')
@@ -875,7 +881,7 @@ struct apple_connector {''')
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
     bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
-    struct { int width_mm,height_mm; } panel;
+    struct { int width_mm,height_mm; unsigned adj_height_mm; } panel;
     struct { size_t length,received; void *data; bool contiguous,payload_complete; u64 modes_generation;
         u64 av_service_epoch,automatic_connection_sequence; bool automatic_service_pending;
         struct dcp_metadata_ticket metadata_ticket,mode_ticket;
@@ -895,6 +901,7 @@ struct apple_connector {''')
         firmware_edid += ('static bool dcp_metadata_timing_fits(const struct drm_display_mode *m) '
                           '{ return m->clock > 0 && m->clock <= 655350 && !(m->clock % 10); }\n')
     stubs = r'''
+#define dcp_notch_dynamic(d) ((void)(d), true)
 /* The rate/HPD fixture is an external H17P sink; it never selects M4. */
 #define iomfb_is_v26_6(dcp) false
 #define iomfb_v26_6_get_mode(dcp,mode) (-ENODEV)
@@ -1315,10 +1322,8 @@ def panel_dimensions(root):
     unit = unit.replace('bool modes_lock,modes_admitted,',
                         'bool external_physically_absent,modes_lock,modes_admitted,', 1)
     # The connector's physical size, which DRM keeps in display_info.
-    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
+    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; int width_mm,height_mm; } display_info;'
     assert unit.count(old) == 1
-    unit = unit.replace(old, 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; '
-                        'int width_mm,height_mm; } display_info;')
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     unit = unit.replace(block(unit, 'static bool __attribute__((unused)) dcp_has_panel('),
                         block(dcp, 'bool dcp_has_panel('))

@@ -198,6 +198,10 @@ struct dcp_display_mode {
 	u64 automatic_catalog_sequence;
 	bool automatic_service_pending;
 	bool has_bootstrap;
+	/* The notch-free twin of a full-panel timing (dcp-notch.h). */
+	bool notch_free;
+	/* A full-panel timing that has one. */
+	bool notch_twin;
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;
