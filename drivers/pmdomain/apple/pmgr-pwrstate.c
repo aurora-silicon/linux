@@ -492,6 +492,63 @@ int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_ps_verify_state);
 
+static int apple_pmgr_ps_set_auto_pm_locked(struct apple_pmgr_ps *ps, bool enable)
+{
+	int ret = 0;
+
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed ||
+	    ps->no_auto_enable)
+		return -EPERM;
+
+	ps->no_auto_pm = !enable;
+	if (ps->genpd.status == GENPD_STATE_ON) {
+		if (enable)
+			ret = regmap_update_bits(ps->regmap, ps->offset,
+						 APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
+						 APPLE_PMGR_AUTO_ENABLE);
+		else
+			ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE, false);
+	}
+	return ret;
+}
+
+/**
+ * apple_pmgr_ps_set_auto_pm() - toggle hardware automatic PM on a consumer's domain
+ * @consumer: device attached to an apple-pmgr-pwrstate power domain
+ * @enable: whether hardware automatic power management may gate the domain
+ *
+ * For a consumer whose bootloader marked its power domain apple,no-auto-pm to
+ * keep PMGR from gating the block during firmware bring-up, once the firmware
+ * is running with its own idle power-off policy enabled (or needs auto-PM
+ * cleared again before a deep-sleep commit).
+ *
+ * Return: 0 on success, or a negative errno on error.
+ */
+int apple_pmgr_ps_set_auto_pm(struct device *consumer, bool enable)
+{
+	int (*genpd_suspend)(struct device *dev) = READ_ONCE(apple_pmgr_genpd_runtime_suspend);
+	struct generic_pm_domain *genpd;
+	struct apple_pmgr_ps *ps;
+	unsigned long flags;
+	int ret;
+
+	if (!consumer || !consumer->pm_domain || !genpd_suspend ||
+	    consumer->pm_domain->ops.runtime_suspend != genpd_suspend)
+		return -EINVAL;
+	genpd = pd_to_genpd(consumer->pm_domain);
+	if (genpd->power_on != apple_pmgr_ps_power_on ||
+	    !(genpd->flags & GENPD_FLAG_IRQ_SAFE))
+		return -EOPNOTSUPP;
+	ps = genpd_to_apple_pmgr_ps(genpd);
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	ret = apple_pmgr_ps_set_auto_pm_locked(ps, enable);
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_set_auto_pm);
+
 /**
  * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
  * @np: the power state node, as named by a consumer's power-domains

@@ -826,6 +826,41 @@ static void pmgr_ps_auto_enable_fail_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
 }
 
+static void pmgr_ps_set_auto_pm_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_named_domain(test, "apple-pmgr-ps-set-auto",
+				       APPLE_PMGR_PS_ACTIVE, true, &r);
+	ps->genpd.status = GENPD_STATE_ON;
+	r->val |= APPLE_PMGR_WAS_PWRGATED;
+
+	/* Enabling auto-PM sets AUTO_ENABLE without clearing W1C flags. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_set_auto_pm_locked(ps, true), 0);
+	KUNIT_EXPECT_FALSE(test, ps->no_auto_pm);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+	KUNIT_EXPECT_EQ(test, r->flag_writes, 0U);
+
+	/* Simulate hardware power-gating while idle, then disabling auto-PM raises ACTIVE. */
+	r->val &= ~APPLE_PMGR_PS_ACTUAL;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_set_auto_pm_locked(ps, false), 0);
+	KUNIT_EXPECT_TRUE(test, ps->no_auto_pm);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+
+	/* Firmware-owned, inherited, auto-managed, and no-auto-enable domains are rejected. */
+	ps->firmware_owned = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_set_auto_pm_locked(ps, true), -EPERM);
+	ps->firmware_owned = false;
+	ps->no_auto_enable = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_set_auto_pm_locked(ps, true), -EPERM);
+	ps->no_auto_enable = false;
+
+	/* NULL / unattached consumer returns -EINVAL. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_set_auto_pm(NULL, true), -EINVAL);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
@@ -853,6 +888,7 @@ static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_auto_enable_test),
 	KUNIT_CASE(pmgr_ps_auto_enable_skip_test),
 	KUNIT_CASE(pmgr_ps_auto_enable_fail_test),
+	KUNIT_CASE(pmgr_ps_set_auto_pm_test),
 	{}
 };
 
