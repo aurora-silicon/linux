@@ -772,10 +772,11 @@ struct apple_atcphy;
  * @sleep_drops_common: Deep sleep lowers the common power domain behind
  *                      genpd's back, so resume must mark @pd_was_off even
  *                      without a genpd power-off notification
- * @idle_power_off: Let an idle PHY runtime-suspend, so that its power domain
- *                  can also drop while the system runs, see atcphy_rpm_get().
- *                  Only for PHYs without DisplayPort, whose phy ops and tunnel
- *                  calls take no runtime PM reference
+ * @idle_power_off: Default-enable runtime idle power-off even when the DT
+ *                  node lacks @apple,idle-power-off (for older T8132 DTs);
+ *                  other PHYs with @restore_after_pd_off require
+ *                  @apple,idle-power-off, and the DT power-domain hierarchy
+ *                  must still allow power-off, see atcphy_rpm_get()
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -2874,6 +2875,8 @@ static int atcphy_auspll_apb_command(struct apple_atcphy *atcphy, u32 command)
 	return ret;
 }
 
+static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy);
+
 static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_rate lr)
 {
 	const struct atcphy_dp_link_rate_configuration *cfg;
@@ -2888,6 +2891,7 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
 		return -EBUSY;
+	atcphy_restore_after_pd_off(atcphy);
 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
 	cfg = &dp_lr_config[lr];
 
@@ -5398,7 +5402,13 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 			return -EINVAL;
 		}
 
-		return atcphy_dp_configure(atcphy, link_rate);
+		int ret = atcphy_rpm_get(atcphy);
+
+		if (ret < 0)
+			return ret;
+		ret = atcphy_dp_configure(atcphy, link_rate);
+		atcphy_rpm_put(atcphy);
+		return ret;
 	}
 
 	return 0;
@@ -5549,6 +5559,15 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 			return ret;
 	}
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->idle_rpm &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_TBT) {
+		if (!rate) {
+			atcphy->tunnel_users &= ~BIT(dpin);
+			return 0;
+		}
+		return -EBUSY;
+	}
 	if (!rate) {
 		if (apple_atc_tunnel_is_t8103_style()) {
 			/*
@@ -7692,6 +7711,50 @@ static int atcphy_probe_power_domains(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * A PHY can power off at runtime only when its DT power domain can drop:
+ * neither the domain itself nor all of its parent domains carry
+ * apple,always-on (where ps_atcN_usb has ps_atcN_usb_aon plus ps_atcN_common,
+ * idle power-off drops ps_atcN_common while ps_atcN_usb_aon stays on for DWC3).
+ */
+static bool atcphy_pd_can_power_off(const struct device_node *np)
+{
+	struct device_node *pd_np __free(device_node) = of_parse_phandle(np, "power-domains", 0);
+	struct of_phandle_iterator it;
+	bool has_parents = false;
+	int err;
+
+	if (!pd_np || of_property_read_bool(pd_np, "apple,always-on"))
+		return false;
+	of_for_each_phandle(&it, err, pd_np, "power-domains", "#power-domain-cells", -1) {
+		has_parents = true;
+		if (!of_property_read_bool(it.node, "apple,always-on")) {
+			of_node_put(it.node);
+			return true;
+		}
+	}
+	if (err != -ENOENT)
+		return false;
+	return !has_parents;
+}
+
+/*
+ * Enable runtime idle power-off only when the PHY can restore state after
+ * power loss, either the hardware variant defaults it on for older DTs or the
+ * DT node explicitly advertises apple,idle-power-off, and its DT power-domain
+ * hierarchy allows power-off.
+ */
+static bool atcphy_can_idle_power_off(const struct atcphy_hw *hw,
+				      const struct device_node *np)
+{
+	if (!hw->restore_after_pd_off)
+		return false;
+	if (!hw->idle_power_off &&
+	    !of_property_read_bool(np, "apple,idle-power-off"))
+		return false;
+	return atcphy_pd_can_power_off(np);
+}
+
 static void atcphy_sleep_finish_work(struct work_struct *work);
 
 static int atcphy_probe(struct platform_device *pdev)
@@ -7756,10 +7819,12 @@ static int atcphy_probe(struct platform_device *pdev)
 	followed = atcphy_probe_pd_notifier(atcphy);
 
 	/*
-	 * Only a PHY that follows its domain may let it drop. Before the PHYs are
-	 * created, so that they follow runtime PM too.
+	 * Only a PHY that follows its domain, advertises idle power-off (or
+	 * defaults it on for older DTs), and has a droppable DT power-domain
+	 * hierarchy may let it drop. Before the PHYs are created, so that they
+	 * follow runtime PM too.
 	 */
-	if (atcphy->hw->idle_power_off && followed) {
+	if (followed && atcphy_can_idle_power_off(atcphy->hw, dev->of_node)) {
 		pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
 		pm_runtime_use_autosuspend(dev);
 		ret = devm_pm_runtime_set_active_enabled(dev);

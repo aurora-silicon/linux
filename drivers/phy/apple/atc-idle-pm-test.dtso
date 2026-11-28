@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+/dts-v1/;
+/plugin/;
+
+/*
+ * Power-domain and ATC PHY topologies used to test runtime idle power-off
+ * admission, including T8112 ATC1 where ps_atc1_common lacks apple,always-on
+ * while its ps_atc1_pcie child retains it.
+ */
+&{/} {
+	atc-idle-pm-test {
+		ps_atc0_usb_aon: power-controller@0 {
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		ps_atc0_common: power-controller@1 {
+			#power-domain-cells = <0>;
+		};
+
+		ps_atc0_usb: power-controller@2 {
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
+		};
+
+		ps_atc0_common_aon: power-controller@3 {
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		ps_atc0_usb_aon_only: power-controller@4 {
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common_aon>;
+		};
+
+		ps_atc1_usb_aon: power-controller@5 {
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		ps_atc1_common: power-controller@6 {
+			#power-domain-cells = <0>;
+		};
+
+		ps_atc1_pcie: power-controller@7 {
+			#power-domain-cells = <0>;
+			apple,always-on;
+			power-domains = <&ps_atc1_common>;
+		};
+
+		ps_atc1_usb: power-controller@8 {
+			#power-domain-cells = <0>;
+			power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+		};
+
+		ps_t8132_common: power-controller@9 {
+			#power-domain-cells = <0>;
+		};
+
+		ps_t8132_usb_aon: power-controller@a {
+			#power-domain-cells = <0>;
+		};
+
+		ps_t8132_usb: power-controller@b {
+			#power-domain-cells = <0>;
+			power-domains = <&ps_t8132_common>, <&ps_t8132_usb_aon>;
+		};
+
+		atcphy0-t8103 {
+			compatible = "apple,t8103-atcphy";
+			apple,idle-power-off;
+			power-domains = <&ps_atc0_usb>;
+		};
+
+		atcphy0-t8103-legacy {
+			compatible = "apple,t8103-atcphy";
+			power-domains = <&ps_atc0_usb>;
+		};
+
+		atcphy0-t8103-aon {
+			compatible = "apple,t8103-atcphy";
+			apple,idle-power-off;
+			power-domains = <&ps_atc0_usb_aon_only>;
+		};
+
+		atcphy1-t8112 {
+			compatible = "apple,t8112-atcphy", "apple,t8103-atcphy";
+			power-domains = <&ps_atc1_usb>;
+		};
+
+		atcphy1-t8112-capable {
+			compatible = "apple,t8112-atcphy", "apple,t8103-atcphy";
+			apple,idle-power-off;
+			power-domains = <&ps_atc1_usb>;
+		};
+
+		atcphy0-t8132 {
+			compatible = "apple,t8132-atcphy";
+			power-domains = <&ps_t8132_usb>;
+		};
+	};
+};

@@ -457,6 +457,13 @@ properties:
       DP transmitter instead of falling back to USB. Without it, DP on T8132
       is only carried in USB4/Thunderbolt tunnels.
 
+  apple,idle-power-off:
+    type: boolean
+    description: >
+      The PHY's consumers and platform power-domain tree allow the PHY to
+      runtime-suspend when idle so its common power domain can drop while the
+      system runs.
+
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
     description: T8132 AXI setup followed by write-disable and lock operations.

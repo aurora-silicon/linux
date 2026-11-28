@@ -712,9 +712,12 @@ int main(void) {
 def generation_scope(source, root):
     """Resolve real DT fallback compatibles through the driver's actual match table."""
     tables = {}
-    for name in ("t8103", "t8122", "t8140", "t8142"):
-        text = block(source, "static const struct atcphy_hw atcphy_hw_" + name + " =")
-        tables["atcphy_hw_" + name] = re.search(r"\.gen\s*=\s*(ATCPHY_GENERATION_\w+)", text).group(1)
+    for m in re.finditer(r"static const struct atcphy_hw (atcphy_hw_[a-zA-Z0-9_]+)\s*=", source):
+        sym = m.group(1)
+        text = block(source, "static const struct atcphy_hw " + sym + " =")
+        gen = re.search(r"\.gen\s*=\s*(ATCPHY_GENERATION_\w+)", text)
+        if gen:
+            tables[sym] = gen.group(1)
     matches = dict(re.findall(r'\.compatible\s*=\s*"([^"]+)"\s*,\s*\.data\s*=\s*&([a-zA-Z0-9_]+)', source))
     scope = []
     for family, filename, expected in (

@@ -5,6 +5,7 @@
  */
 
 #include <kunit/device.h>
+#include <kunit/of.h>
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
 
@@ -1463,8 +1464,75 @@ static void atcphy_test_t8103_usb3_machine_scope(struct kunit *test)
 	}
 }
 
+static const struct atcphy_hw *atcphy_test_match_hw(struct kunit *test,
+						    const struct device_node *np)
+{
+	const struct of_device_id *match = of_match_node(atcphy_match, np);
+
+	KUNIT_ASSERT_NOT_NULL(test, match);
+	return match->data;
+}
+
+/*
+ * Runtime idle power-off requires an explicit DT capability (apple,idle-power-off)
+ * unless the hardware variant already defaults it on for older DTs, and a
+ * power-domain hierarchy that can drop. T8112 ATC1 lacks apple,always-on on
+ * ps_atc1_common (its PCIe child holds it) and must stay runtime-active unless
+ * explicitly capable.
+ */
+static void atcphy_test_idle_power_off_dt(struct kunit *test)
+{
+	struct device_node *np;
+	const struct atcphy_hw *hw;
+
+	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, atc_idle_pm_test));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy1-t8112");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_PTR_EQ(test, hw, &atcphy_hw_t8103);
+	KUNIT_EXPECT_FALSE(test, atcphy_can_idle_power_off(hw, np));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy1-t8112-capable");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_TRUE(test, atcphy_can_idle_power_off(hw, np));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy0-t8103");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_TRUE(test, atcphy_can_idle_power_off(hw, np));
+	/* Variants without state restoration never idle-power-off even if DT asks. */
+	KUNIT_EXPECT_FALSE(test, atcphy_can_idle_power_off(&atcphy_hw_t8152, np));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy0-t8103-legacy");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_FALSE(test, atcphy_can_idle_power_off(hw, np));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy0-t8103-aon");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_FALSE(test, atcphy_can_idle_power_off(hw, np));
+
+	np = of_find_node_by_path("/atc-idle-pm-test/atcphy0-t8132");
+	KUNIT_ASSERT_NOT_NULL(test, np);
+	of_node_put_kunit(test, np);
+	hw = atcphy_test_match_hw(test, np);
+	KUNIT_EXPECT_PTR_EQ(test, hw, &atcphy_hw_t8132);
+	KUNIT_EXPECT_TRUE(test, atcphy_can_idle_power_off(hw, np));
+
+	KUNIT_EXPECT_FALSE(test, atcphy_can_idle_power_off(&atcphy_hw_t8103, NULL));
+}
+
 static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_t8103_usb3_machine_scope),
+	KUNIT_CASE(atcphy_test_idle_power_off_dt),
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_target_mode_t8132),

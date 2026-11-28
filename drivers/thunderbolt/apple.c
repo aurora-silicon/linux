@@ -905,14 +905,13 @@ static void apple_dpin_poll_fn(struct work_struct *work)
 {
 	struct apple_dpin_ctx *c = container_of(to_delayed_work(work),
 						struct apple_dpin_ctx, poll);
-	bool mapped;
 
 	apple_dpin_irq_dispatch(c);
-	scoped_guard(mutex, &c->lock)
-		mapped = c->irq_enabled && c->regs;
-	if (mapped)
-		queue_delayed_work(system_dfl_wq, &c->poll,
-				   msecs_to_jiffies(APPLE_DPIN_POLL_MS));
+	scoped_guard(mutex, &c->lock) {
+		if (c->irq_enabled && c->regs)
+			queue_delayed_work(system_dfl_wq, &c->poll,
+					   msecs_to_jiffies(APPLE_DPIN_POLL_MS));
+	}
 }
 
 /* Start taking the interrupts of a mapped adapter. c->lock held. */
@@ -1242,6 +1241,11 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 		c->dcp_active = false;
 		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
 	}
+	/* Drain any in-flight IRQ thread or poll before unmapping or cutting power. */
+	if (c->irq > 0)
+		synchronize_irq(c->irq);
+	else
+		cancel_delayed_work_sync(&c->poll);
 	if (regs)
 		iounmap(regs);
 }
@@ -3341,8 +3345,44 @@ static int apple_cio_remove_children(struct apple_cio *acio,
 	 * only the DP-IN lock on this controller. Keep that invariant for
 	 * future monitor/reconnect work; this drain holds acio->lock.
 	 */
-	if (acio->dp_wq)
+	if (acio->dp_wq) {
 		flush_workqueue(acio->dp_wq);
+		for (unsigned int i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+			struct apple_dpin_ctx *c = &acio->dpin[i];
+			bool leaked = false;
+
+			scoped_guard(mutex, &c->lock) {
+				if (c->state.alive || c->regs || c->irq_enabled) {
+					u64 gen = c->tokens.requested;
+
+					leaked = true;
+					if (gen) {
+						apple_dpin_request(c, gen, false);
+					} else {
+						apple_dpin_irq_stop(c);
+						c->state.alive = false;
+					}
+				}
+			}
+			if (leaked) {
+				dev_warn(acio->dev,
+					 "dpin%u: still active during ACIO teardown; forcing down\n",
+					 i);
+				queue_work(acio->dp_wq, &c->work);
+			}
+		}
+		for (unsigned int i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++)
+			cancel_delayed_work_sync(&acio->dpin[i].retry);
+		flush_workqueue(acio->dp_wq);
+		for (unsigned int i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+			struct apple_dpin_ctx *c = &acio->dpin[i];
+
+			if (c->irq > 0)
+				synchronize_irq(c->irq);
+			else
+				cancel_delayed_work_sync(&c->poll);
+		}
+	}
 
 	of_platform_depopulate(acio->dev);
 	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
@@ -3619,27 +3659,6 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	lockdep_assert_held(&acio->lock);
 
-	/*
-	 * PCIe-C's power domain stays on across cable teardown, so apart from
-	 * this reset nothing returns the controller to a known state between
-	 * tunnels. After system sleep with a Thunderbolt 3 dock, state left in
-	 * it has kept every later link from training until reboot. Reset it
-	 * while its host and DART are unbound and before ACIO's domains come
-	 * up, in the same order as after boot.
-	 */
-	if (acio->pcie_reset) {
-		ret = reset_control_acquire(acio->pcie_reset);
-		if (ret)
-			return dev_err_probe(acio->dev, ret,
-					     "PCIe-C reset is still in use\n");
-		ret = reset_control_reset(acio->pcie_reset);
-		reset_control_release(acio->pcie_reset);
-		if (ret)
-			return dev_err_probe(acio->dev, ret,
-					     "failed to reset PCIe-C\n");
-		dev_info(acio->dev, "PCIe-C reset before ACIO start\n");
-	}
-
 	/* Create device links to the power domains in order to power them on */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
 		link = device_link_add(acio->dev, acio->pd_list->pd_devs[i],
@@ -3657,6 +3676,31 @@ static int apple_cio_start(struct apple_cio *acio)
 		 * removes the runtime-active links and gives system PM ownership back.
 		 */
 		dev_pm_syscore_device(acio->pd_list->pd_devs[i], true);
+	}
+
+	/*
+	 * Reset PCIe-C while its host and DART are unbound and its power domain
+	 * is on, before releasing ACIO's own reset. Where PCIe-C's domain stayed
+	 * on across cable teardown, this is the only step that returns the
+	 * controller to a known state between tunnels; where the domain was
+	 * power-gated while idle, powering it on first keeps the synchronous
+	 * PMGR reset clocked.
+	 */
+	if (acio->pcie_reset) {
+		ret = reset_control_acquire(acio->pcie_reset);
+		if (ret) {
+			ret = dev_err_probe(acio->dev, ret,
+					    "PCIe-C reset is still in use\n");
+			goto remove_links;
+		}
+		ret = reset_control_reset(acio->pcie_reset);
+		reset_control_release(acio->pcie_reset);
+		if (ret) {
+			ret = dev_err_probe(acio->dev, ret,
+					    "failed to reset PCIe-C\n");
+			goto remove_links;
+		}
+		dev_info(acio->dev, "PCIe-C reset before ACIO start\n");
 	}
 
 	/*

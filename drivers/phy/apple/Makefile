@@ -2,6 +2,7 @@
 
 obj-$(CONFIG_PHY_APPLE_ATC)		+= phy-apple-atc.o
 phy-apple-atc-y			:= atc.o
+phy-apple-atc-$(CONFIG_PHY_APPLE_ATC_KUNIT_TEST) += atc-idle-pm-test.dtbo.o
 
 obj-$(CONFIG_PHY_APPLE_T6040_USB2)	+= phy-apple-t6040-usb2.o
 phy-apple-t6040-usb2-y			:= t6040-usb2.o
