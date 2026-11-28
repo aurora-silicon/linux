@@ -79,7 +79,7 @@
 			next-level-cache = <&l2_cache_3>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
-			operating-points-v2 = <&icestorm_opp>;
+			operating-points-v2 = <&icestorm_e1_opp>;
 			capacity-dmips-mhz = <714>;
 			performance-domains = <&cpufreq_e_die1>;
 		};
@@ -93,7 +93,7 @@
 			next-level-cache = <&l2_cache_3>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
-			operating-points-v2 = <&icestorm_opp>;
+			operating-points-v2 = <&icestorm_e1_opp>;
 			capacity-dmips-mhz = <714>;
 			performance-domains = <&cpufreq_e_die1>;
 		};
@@ -107,7 +107,7 @@
 			next-level-cache = <&l2_cache_4>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p2_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0_die1>;
 		};
@@ -121,7 +121,7 @@
 			next-level-cache = <&l2_cache_4>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p2_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0_die1>;
 		};
@@ -135,7 +135,7 @@
 			next-level-cache = <&l2_cache_4>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p2_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0_die1>;
 		};
@@ -149,7 +149,7 @@
 			next-level-cache = <&l2_cache_4>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p2_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0_die1>;
 		};
@@ -163,7 +163,7 @@
 			next-level-cache = <&l2_cache_5>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p3_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1_die1>;
 		};
@@ -177,7 +177,7 @@
 			next-level-cache = <&l2_cache_5>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p3_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1_die1>;
 		};
@@ -191,7 +191,7 @@
 			next-level-cache = <&l2_cache_5>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p3_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1_die1>;
 		};
@@ -205,7 +205,7 @@
 			next-level-cache = <&l2_cache_5>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
-			operating-points-v2 = <&firestorm_opp>;
+			operating-points-v2 = <&firestorm_p3_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1_die1>;
 		};
@@ -230,6 +230,24 @@
 			cache-unified;
 			cache-size = <0xc00000>;
 		};
+	};
+
+	icestorm_e1_opp: opp-table-e1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+#include "t600x-icestorm-opp.dtsi"
+	};
+
+	firestorm_p2_opp: opp-table-p2 {
+		compatible = "operating-points-v2";
+		opp-shared;
+#include "t600x-firestorm-opp.dtsi"
+	};
+
+	firestorm_p3_opp: opp-table-p3 {
+		compatible = "operating-points-v2";
+		opp-shared;
+#include "t600x-firestorm-opp.dtsi"
 	};
 
 	die0: soc@200000000 {
