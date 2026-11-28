@@ -91,6 +91,8 @@ static ssize_t iommu_map_sgtable(void *domain,u64 dva,struct sg_table *map,int f
 {assert(domain && dva==0x8000 && map->sgl && flags==3);maps++;return SZ_16K;}
 static size_t iommu_unmap(void *domain,u64 dva,size_t size)
 {assert(domain && dva==0x8000 && size==SZ_16K);unmaps++;return size;}
+/* No thread waits for the channels to go idle in this single-threaded control. */
+static void iomfb_channels_idle_wake(struct apple_dcp *d){(void)d;}
 '''
     # dev logging in the DMA helper has no local 'dev', unlike the dispatcher.
     unmap = block(template, 'static bool dcpep_unmap_piodma(')
