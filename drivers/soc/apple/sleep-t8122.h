@@ -16,8 +16,11 @@
 #define T8122_PS_ANS		0x3f8
 #define T8122_PS_ATC0_COMMON	0x400
 #define T8122_PS_ATC1_COMMON	0x408
+#define T8122_PS_DISPEXT_SYS	0x410
 #define T8122_PS_APCIE_GP	0x440
 #define T8122_PS_APCIE_ST	0x448
+#define T8122_PS_DISPEXT_FE	0x480
+#define T8122_PS_DISPEXT_CPU	0x488
 #define T8122_PS_APCIE_PHY_SW	0x4a0
 #define T8122_PS_SEP		0xc00
 #define T8122_PS_DISP_CPU	0x10000
@@ -662,6 +665,11 @@ static int t8122_sleep_display_off(struct apple_sleep *s)
 	u64 start, hz = arch_timer_get_cntfrq();
 	bool off = false;
 
+	if (FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISPEXT_CPU)))
+		t8122_ps_lower_if_on(s, T8122_PS_DISPEXT_CPU, 0x0f0000ff, 0x0f0003f0);
+	t8122_ps_lower_if_on(s, T8122_PS_DISPEXT_FE, 0, 0x23f0);
+	t8122_ps_lower_if_on(s, T8122_PS_DISPEXT_SYS, 0, 0x23f0);
+
 	if (FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISP_CPU))) {
 		writel(0x0f0000ff, s->ps + T8122_PS_DISP_CPU);
 		writel(3, s->pwrgate + T8122_PWRGATE_DISP_A);
@@ -674,15 +682,19 @@ static int t8122_sleep_display_off(struct apple_sleep *s)
 
 	start = read_sysreg(cntvct_el0);
 	while (read_sysreg(cntvct_el0) - start < hz / 10) {
-		if (!FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISP_CPU))) {
+		if (!FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISP_CPU)) &&
+		    !FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISPEXT_CPU)) &&
+		    !FIELD_GET(PS_ACTUAL, readl(s->ps + T8122_PS_DISPEXT_SYS))) {
 			off = true;
 			break;
 		}
 		cpu_relax();
 	}
 	if (!off) {
-		dev_err(s->dev, "refused: DISP_CPU stayed on: %#x\n",
-			readl(s->ps + T8122_PS_DISP_CPU));
+		dev_err(s->dev, "refused: display stayed on: DISP_CPU=%#x DISPEXT_CPU=%#x DISPEXT_SYS=%#x\n",
+			readl(s->ps + T8122_PS_DISP_CPU),
+			readl(s->ps + T8122_PS_DISPEXT_CPU),
+			readl(s->ps + T8122_PS_DISPEXT_SYS));
 		return -EBUSY;
 	}
 
@@ -1203,11 +1215,9 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 
 static const struct apple_sleep_soc t8122_sleep_soc = {
 	.ops = &t8122_sleep_ops,
-	.untested = true,
 	.pen_deep = true,
 	.el1_wfi = true,
 	.no_pmu_notes = true,
-	.display_no_restart = true,
 	.early_context = true,
 	.stray = t8122_stray,
 	.nstray = ARRAY_SIZE(t8122_stray),
