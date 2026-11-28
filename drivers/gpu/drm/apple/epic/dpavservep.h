@@ -68,6 +68,8 @@ void dcpavserv_close_work(struct work_struct *work);
 const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service);
 bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation);
 bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch);
+int dcpavserv_i2c(struct apple_dcp *dcp, bool read, u8 chip, u8 offset,
+		  u8 *data, size_t len);
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
 					u64 *epoch);
 void dpavservep_detach(struct apple_dcp *dcp);

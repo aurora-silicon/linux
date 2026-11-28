@@ -3,6 +3,7 @@
 
 #include "dpavservep.h"
 #include "dpavserv-edid.h"
+#include "dpavserv-ddc.h"
 
 #define EDID_EXT_BLOCK_COUNT_OFFSET 0x7E
 
@@ -10,7 +11,9 @@
 #include <kunit/static_stub.h>
 
 #include <linux/completion.h>
+#include <linux/cleanup.h>
 #include <linux/device.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -785,6 +788,66 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	return edid;
 }
 
+/*
+ * One I2C transfer on the sink's DDC bus (dpavserv-ddc.h).  Only through an
+ * instance that is live and, on the 14.7 external processor, already opened
+ * by the EDID read: a DDC transfer never opens one itself.
+ */
+int dcpavserv_i2c(struct apple_dcp *dcp, bool read, u8 chip, u8 offset,
+		  u8 *data, size_t len)
+{
+	struct apple_epic_service *service = NULL;
+	u8 *msg __free(kfree) = kzalloc(DCPAV_I2C_MSG_MAX, GFP_KERNEL);
+	u8 *reply __free(kfree) = kzalloc(DCPAV_I2C_MSG_MAX, GFP_KERNEL);
+	size_t received = 0;
+	u32 retcode = 0;
+	u64 epoch;
+	int size, transport, ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcpavserv_i2c, dcp, read, chip, offset, data, len);
+
+	if (!msg || !reply)
+		return -ENOMEM;
+	size = dcpav_i2c_message(msg, read, chip, offset, data, len);
+	if (size < 0)
+		return size;
+	if (READ_ONCE(dcp->crashed))
+		return -ENODEV;
+
+	scoped_guard(mutex, &dcp->dcpavserv.lock) {
+		epoch = dcp->dcpavserv.epoch;
+		if (!dcpavserv_edid_service_current(dcp, epoch))
+			return -ENODEV;
+		if (dcp_is_v14_7_external(dcp) &&
+		    (dcp->dcpavserv.terminated_epoch == epoch ||
+		     dcp->dcpavserv.opened_epoch != epoch))
+			return -EAGAIN;
+		service = afk_service_get(dcp->dcpavserv.service);
+	}
+	if (!service)
+		return -ENODEV;
+
+	if (service->ep->wire_v2)
+		transport = afk_send_command_len(service, EPIC_SUBTYPE_STD_SERVICE,
+						 msg, size, reply, size, &retcode,
+						 &received);
+	else
+		transport = afk_send_command_with_reply_len(service,
+							    EPIC_SUBTYPE_STD_SERVICE,
+							    msg, size, reply, size,
+							    &retcode, &received);
+	ret = dcpav_i2c_result(transport, retcode, reply, received, read, data, len);
+
+	scoped_guard(mutex, &dcp->dcpavserv.lock) {
+		/* An answer from a retired instance is no answer of this sink. */
+		if (!ret && (dcp->dcpavserv.service != service ||
+			     !dcpavserv_edid_service_current(dcp, epoch)))
+			ret = -ENODEV;
+	}
+	afk_service_put(service);
+	return ret;
+}
+
 static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpav-service-epic",
@@ -856,4 +919,5 @@ int dpavservep_init(struct apple_dcp *dcp)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dpavservep-v14-test.c"
 #include "dpavservep-identity-test.c"
+#include "dpavserv-ddc-test.c"
 #endif
