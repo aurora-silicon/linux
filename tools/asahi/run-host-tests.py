@@ -353,6 +353,11 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-direct-stage-prefixes-tests.py': [([], PASS)]
+        + mutations('--mutation', ('reject-staged', 'skip-render-tiling',
+                                   'skip-tiling-prefix', 'skip-compute-resolve',
+                                   'skip-eagain-fallback', 'skip-other-pair-guard',
+                                   'skip-borrowed-sibling', 'skip-tiling-sibling'), []),
     'g17-highpri-sched-wq-tests.py': [([], PASS)]
         + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],

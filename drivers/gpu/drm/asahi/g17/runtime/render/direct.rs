@@ -32,6 +32,11 @@ pub(in crate::g17::runtime) struct Loan {
     lease: PublicationLease,
     addresses: RenderAddresses,
     uat: Arc<crate::mmu::Uat>,
+    compute: [crate::g17::fw::kick::KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    compute_count: usize,
+    fragment_compute:
+        [crate::g17::fw::kick::KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    fragment_compute_count: usize,
 }
 
 enum DirectTarget {
@@ -213,6 +218,15 @@ impl crate::g17::Firmware {
         if self.recovery.pending() || self.recovery.generation() != generation {
             return Ok(None);
         }
+        // Check cross-pair dependencies before sampling host growth (which resets
+        // firmware page high-water): `Pair::own_dependencies` only sees `slot`, and
+        // `publication_barriers` skips same-owner renders covered by `wait_through[0]`,
+        // so any sibling pair with live prefix-covered work (resident or borrowed,
+        // under either `wait_through[0]` or `tiling_wait_through[0]`) must fall back
+        // to the device-mutex path.
+        if self.queues.has_other_pair_dependencies(slot, owner, packet)? {
+            return Ok(None);
+        }
         let Ok(entry) = self.queues.render.entry_mut(slot) else {
             return Ok(None);
         };
@@ -250,6 +264,61 @@ impl crate::g17::Firmware {
                 self.init.stamp_addresses(qids[1])?,
             ],
         };
+        let mut compute = [crate::g17::fw::kick::KickDependency::ZERO;
+            crate::g17::pairs::COMPUTE_CHANNELS_MAX];
+        let mut compute_count = 0usize;
+        let mut fragment_compute = [crate::g17::fw::kick::KickDependency::ZERO;
+            crate::g17::pairs::COMPUTE_CHANNELS_MAX];
+        let mut fragment_compute_count = 0usize;
+        if packet.order.wait_through[1].unwrap_or(0) != 0
+            || packet.order.tiling_wait_through[1].unwrap_or(0) != 0
+        {
+            let recovery_state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
+            if recovery_state != 0 {
+                return Ok(None);
+            }
+            for queue in self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .filter(|queue| queue.owner() == Some(owner))
+            {
+                let tiling = match queue.dependency(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.tiling_wait_through[1],
+                    recovery_state,
+                ) {
+                    Ok(dep) => dep,
+                    Err(error) if error == EAGAIN => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if let Some(dep) = tiling {
+                    *compute.get_mut(compute_count).ok_or(EOVERFLOW)? = dep;
+                    compute_count += 1;
+                }
+                if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
+                    let whole = match queue.dependency(
+                        owner,
+                        packet.completion.status(),
+                        packet.order.wait_through[1],
+                        recovery_state,
+                    ) {
+                        Ok(dep) => dep,
+                        Err(error) if error == EAGAIN => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(dep) = whole.filter(|dep| Some(*dep) != tiling) {
+                        *fragment_compute
+                            .get_mut(fragment_compute_count)
+                            .ok_or(EOVERFLOW)? = dep;
+                        fragment_compute_count += 1;
+                    }
+                }
+            }
+        }
         let (buffer, buffer_token) = match buffer_context {
             Some((context, pb_va)) => {
                 self.queues
@@ -293,6 +362,10 @@ impl crate::g17::Firmware {
             lease,
             addresses,
             uat: self.uat.clone(),
+            compute,
+            compute_count,
+            fragment_compute,
+            fragment_compute_count,
         }))
     }
 
@@ -357,15 +430,9 @@ impl Backend {
         slot: u8,
         deferred: &mut DeferredBatch,
     ) -> Option<Result> {
-        // A compute prefix needs the compute queue's state; leave it to the
-        // device-mutex path.
         if packet.is_published()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
-            || packet.order.wait_through[1].unwrap_or(0) != 0
-            // Only the device-mutex path resolves a staged render's tiling prefixes.
-            || matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
-                if pass.stage_prefixes)
             || self.admission_open().is_err()
         {
             return None;
@@ -427,6 +494,12 @@ impl Backend {
                 DirectTarget::Legacy(port.observe_render_room(&render, priority)?.ok_or(EBUSY)?)
             };
             let mut dependencies = pair.own_dependencies(self.owner, packet)?;
+            dependencies.compute[..loan.compute_count]
+                .copy_from_slice(&loan.compute[..loan.compute_count]);
+            dependencies.compute_count = loan.compute_count;
+            dependencies.fragment_compute[..loan.fragment_compute_count]
+                .copy_from_slice(&loan.fragment_compute[..loan.fragment_compute_count]);
+            dependencies.fragment_compute_count = loan.fragment_compute_count;
             if let Some(footprint) = packet.footprint.as_ref() {
                 dependencies.hazard_count = self.admission.publication_barriers(
                     self.owner,

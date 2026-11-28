@@ -3263,8 +3263,31 @@ impl Pair {
                 .ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
         }
-        if dependencies.render_count != 0
-            && matches!(&packet.command, Validated::Render { pass, .. } if pass.fragment_barriers)
+        let staged =
+            matches!(&packet.command, Validated::Render { pass, .. } if pass.stage_prefixes);
+        if staged {
+            let mut render_tiling = crate::g17::dependency::Frontier::new();
+            self.collect_dependencies(
+                owner,
+                packet.completion.status(),
+                packet.order.tiling_wait_through[0],
+                &mut render_tiling,
+                false,
+            )?;
+            for dependency in render_tiling.as_slice() {
+                *dependencies
+                    .render_tiling
+                    .get_mut(dependencies.render_tiling_count)
+                    .ok_or(EOVERFLOW)? = *dependency;
+                dependencies.render_tiling_count += 1;
+            }
+        }
+        if staged
+            || (dependencies.render_count != 0
+                && matches!(
+                    &packet.command,
+                    Validated::Render { pass, .. } if pass.fragment_barriers
+                ))
         {
             let mut tiling = crate::g17::dependency::Frontier::new();
             self.collect_tiling_dependencies(
