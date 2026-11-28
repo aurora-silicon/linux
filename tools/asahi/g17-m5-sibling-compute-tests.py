@@ -188,7 +188,7 @@ def build_harness(mutation=None):
     identity_wired_ok = (
         'packet.context.next_compute_identity()' in parent_pred
         and 'object_ids: m5_object_ids,' in m5_args_block
-        and 'submit_sequence: if board.completion_inputs() { u64::from(m5_ordinal) } else { 0 },' in m5_args_block
+        and 'submit_sequence: if board.completion_inputs() {\n                u64::from(m5_ordinal)\n' in m5_args_block
         and 'completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, m5_ordinal),' in m5_args_block
         and 'peek_compute_ordinal' not in queue_src
     )

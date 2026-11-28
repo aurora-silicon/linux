@@ -3493,9 +3493,8 @@ impl Board {
     /// [`super::compute::kick_tuple`] gives them. Any other graph family keeps them off until its
     /// kicks are known to take that form.
     /// - The common interface (the J813) encodes its kicks in its own forms
-    ///   ([`Board::j813_forms`]): it already gives explicit dependencies the completion class,
-    ///   but its kicks carry no submission sequence and no retired-parent relaxation, which the
-    ///   M5 graph's form adds, so its waits stay on the host.
+    ///   ([`Board::j813_forms`]) and has no retired-parent relaxation, which the M5 graph's form
+    ///   adds; its waits stay in firmware by [`Board::firmware_cross_waits`] instead.
     /// - The G17D host encodings ([`Board::g17d_forms`]) run compute only with the qualified
     ///   tuple and the entry-signal gate, and take their firmware waits in the pipelined class
     ///   ([`super::compute::explicit_dependency`]); the counted G17S form's tuple does not apply
@@ -3516,6 +3515,17 @@ impl Board {
     /// forms rather than the M5 Pro's (read out of its own kicks under aura).
     pub(crate) const fn j813_forms(&self) -> bool {
         self.chip_id == 0x8142
+    }
+
+    /// Whether a kick's waits on other queues' and the other engine's kicks stay in firmware
+    /// (the completion class) instead of on the host: the [`Board::completion_inputs`] boards,
+    /// and the J813 forms ([`Board::j813_forms`]), whose compute kicks carry a nonzero
+    /// submission sequence and whose TA and 3D dependencies take the completion class, as
+    /// macOS 27.0's own J813/J815 kicks do (traced under aura). As on the M5 Pro, a
+    /// wait on another queue's compute stays in firmware only for work that declares a visible
+    /// completion (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION); others wait on the host.
+    pub(crate) const fn firmware_cross_waits(&self) -> bool {
+        self.completion_inputs() || self.j813_forms()
     }
 
     /// The board's `index`th register window.

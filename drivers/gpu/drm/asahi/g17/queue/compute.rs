@@ -3027,8 +3027,15 @@ impl Queue {
             common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
             // M5 Pro's descriptors carry the shared context ordinal as both submit_sequence and
-            // completion_ordinal.
-            submit_sequence: if board.completion_inputs() { u64::from(m5_ordinal) } else { 0 },
+            // completion_ordinal. The J813 forms carry the queue's ordinal one-based, never zero,
+            // for their firmware cross waits (Board::firmware_cross_waits).
+            submit_sequence: if board.completion_inputs() {
+                u64::from(m5_ordinal)
+            } else if board.j813_forms() {
+                u64::from(m5_ordinal) + 1
+            } else {
+                0
+            },
             work_state_va: work_node,
             cdm_end_va: *cdm_end_va, stamp_va: [args.stamp_va, args.aux_stamp_va],
             stamp_value: crate::g17::fw::stamp_value(kick_timestamp.get() as u32), qid: u32::from(qid),

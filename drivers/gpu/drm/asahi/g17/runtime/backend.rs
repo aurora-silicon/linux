@@ -129,10 +129,10 @@ impl job::Backend for Backend {
         self.shared.pin_scheduler_cluster()
     }
     fn host_producer_waits(&self) -> bool {
-        self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())
+        self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.firmware_cross_waits())
     }
     fn firmware_sources_need_visible_completion(&self) -> bool {
-        self.shared.m5_board.is_some_and(|board| board.completion_inputs())
+        self.shared.m5_board.is_some_and(|board| board.firmware_cross_waits())
     }
     fn fence_queue(&self) -> Arc<kernel::workqueue::OwnedQueue> {
         self.shared.fence_queue()

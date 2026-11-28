@@ -1072,10 +1072,12 @@ impl Pair {
         // themselves: eight clients' task-stage renders run at once started tiling, consumed
         // their kicks and never ended, and none of them was ever stamped.
         let order = CrossPairOrder::of(j813);
+        let mut cross_pair_slot = None;
         if let Some(source) = order.source(task) {
             let last = order.dependency(source.load(core::sync::atomic::Ordering::Acquire), qids);
             if let Some(last) = last {
                 if barriers.tiling_count < barriers.tiling.len() {
+                    cross_pair_slot = Some(barriers.tiling_count);
                     barriers.tiling[barriers.tiling_count] = last;
                     barriers.tiling_types[barriers.tiling_count] = 2;
                     barriers.tiling_count += 1;
@@ -1096,6 +1098,16 @@ impl Pair {
             .copy_from_slice(&barriers.fragment_types[..barriers.fragment_count + 1]);
         fragment_types[barriers.fragment_count + 1] = 1;
         let fragment_typed = barriers.fragment_count + 1 + usize::from(ancestor.is_some());
+        if m5 && j813 {
+            // The J813 forms' firmware cross waits (Board::firmware_cross_waits): every TA and 3D
+            // dependency, explicit or the self-parent, takes the completion class (1), as macOS
+            // 27.0's own J813/J815 kicks do. The cross-client CrossPairOrder TA wait keeps class 2.
+            barriers.tiling_types[..=barriers.tiling_count].fill(1);
+            if let Some(slot) = cross_pair_slot {
+                barriers.tiling_types[slot] = 2;
+            }
+            fragment_types[..fragment_typed].fill(1);
+        }
         let barrier_types = [
             &barriers.tiling_types[..barriers.tiling_count + 1],
             &fragment_types[..fragment_typed],
