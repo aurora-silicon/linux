@@ -169,30 +169,11 @@
 	status = "okay";
 };
 
-/* A spare PWM channel for developers; no consumer is known. */
-&fpwm0 {
-	status = "okay";
-};
-
 &fpwm1 {
 	status = "okay";
 };
 
-&aop_mbox {
-       status = "okay";
-};
-
-&aop_dart {
-       status = "okay";
-};
-
-&aop_admac {
-       status = "okay";
-};
-
 &aop {
-	status = "okay";
-
 	accel {
 		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
 	};
@@ -314,19 +295,6 @@
 	status = "okay";
 };
 
-&i2c2 {
-	retimer@18 {
-		compatible = "apple,t8112-atcrt", "apple,atcrt";
-		reg = <0x18>;
-		status = "disabled";
-	};
-	retimer@19 {
-		compatible = "apple,t8112-atcrt", "apple,atcrt";
-		reg = <0x19>;
-		status = "disabled";
-	};
-};
-
 &spi4 {
 	cs-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
 	status = "okay";
@@ -345,21 +313,20 @@
 	avellino@44 {
 		compatible = "apple,t8112-avellino", "apple,avellino";
 		reg = <0x44>;
-		status = "disabled";
 	};
 
 	avellino@77 {
 		compatible = "apple,t8112-avellino", "apple,avellino";
 		reg = <0x77>;
-		status = "disabled";
 	};
 };
 
 &aop_spmi0 {
+	status = "okay";
+
 	radio-pmu@e {
 		compatible = "apple,t8112-wifibt-pmu", "apple,radio-pmu";
 		reg = <0xe SPMI_USID>;
-		status = "disabled";
 	};
 };
 
@@ -613,23 +580,6 @@
 			};
 		};
 	};
-};
-
-/* Read-only fault counter views (apple-regview); nothing writes these windows. */
-&m2_nub_spmi0_sideband {
-	status = "okay";
-};
-
-&m2_nub_spmi1_sideband {
-	status = "okay";
-};
-
-&m2_aop_spmi0_sideband {
-	status = "okay";
-};
-
-&m2_aop_spmi1_sideband {
-	status = "okay";
 };
 
 /* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */

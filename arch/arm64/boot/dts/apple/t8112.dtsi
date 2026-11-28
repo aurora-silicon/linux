@@ -1064,7 +1064,6 @@
 			dmas = <&sio 0x64>;
 			dma-names = "tx";
 			power-domains = <&ps_dpa0>;
-			status = "disabled";
 
 			ports {
 				#address-cells = <1>;
@@ -1701,7 +1700,6 @@
 			interrupt-names = "send-empty", "send-not-empty",
 				"recv-empty", "recv-not-empty";
 			#mbox-cells = <0>;
-			status = "disabled";
 		};
 
 		aop_dart: iommu@24a808000 {
@@ -1710,7 +1708,6 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 338 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
 		};
 
 		aop_spmi0: spmi@24a894000 {
@@ -1739,7 +1736,6 @@
 					      <&aic AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
 					      <0>;
 			iommus = <&aop_dart 10>;
-			status = "disabled";
 		};
 
 		aop: aop@24ac00000 {
@@ -1749,8 +1745,6 @@
 			mboxes = <&aop_mbox>;
 			mbox-names = "mbox";
 			iommus = <&aop_dart 0>;
-
-			status = "disabled";
 
 			aop_audio: audio {
 				compatible = "apple,t8112-aop-audio", "apple,aop-audio";
@@ -1763,7 +1757,7 @@
 				// intentionally empty
 			};
 
-			las {
+			aop_las: las {
 				compatible = "apple,t8112-aop-las", "apple,aop-las";
 			};
 		};
@@ -2249,6 +2243,17 @@
 							<0 0 0 4 &apciec0_port 0 0 0 3>;
 				};
 			};
+
+			m2_apciec0_piodma: dma@3a2000000 {
+				compatible = "apple,t8112-pciec-piodma", "apple,pciec-piodma";
+				reg = <0x3 0xa2000000 0x0 0x4000>,
+					<0x3 0xa2004000 0x0 0x4000>,
+					<0x3 0xa2008000 0x0 0x4000>,
+					<0x3 0xa0008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1026 IRQ_TYPE_LEVEL_HIGH>;
+				iommus = <&apciec0_dart 15>;
+			};
 		};
 
 		dwc3_0: usb@382280000 {
@@ -2471,6 +2476,17 @@
 							<0 0 0 3 &apciec1_port 0 0 0 2>,
 							<0 0 0 4 &apciec1_port 0 0 0 3>;
 				};
+			};
+
+			m2_apciec1_piodma: dma@522000000 {
+				compatible = "apple,t8112-pciec-piodma", "apple,pciec-piodma";
+				reg = <0x5 0x22000000 0x0 0x4000>,
+					<0x5 0x22004000 0x0 0x4000>,
+					<0x5 0x22008000 0x0 0x4000>,
+					<0x5 0x20008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1107 IRQ_TYPE_LEVEL_HIGH>;
+				iommus = <&apciec1_dart 15>;
 			};
 		};
 
