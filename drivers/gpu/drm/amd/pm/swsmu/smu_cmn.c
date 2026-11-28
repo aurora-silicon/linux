@@ -1162,7 +1162,25 @@ int smu_cmn_update_table_read_arg(struct smu_context *smu,
 int smu_cmn_vram_cpy(struct smu_context *smu, void *dst, const void *src,
 		     size_t len)
 {
-	memcpy(dst, src, len);
+	if (pci_resource_flags(smu->adev->pdev, 0) & IORESOURCE_MEM_NONPOSTED)
+		memcpy_fromio(dst, (const void __iomem *)src, len);
+	else
+		memcpy(dst, src, len);
+
+	/* Don't trust the copy operation if RAS fatal error happened. */
+	if (amdgpu_ras_get_fed_status(smu->adev))
+		return -EHWPOISON;
+
+	return 0;
+}
+
+int smu_cmn_vram_cpy_to(struct smu_context *smu, void *dst, const void *src,
+			size_t len)
+{
+	if (pci_resource_flags(smu->adev->pdev, 0) & IORESOURCE_MEM_NONPOSTED)
+		memcpy_toio((void __iomem *)dst, src, len);
+	else
+		memcpy(dst, src, len);
 
 	/* Don't trust the copy operation if RAS fatal error happened. */
 	if (amdgpu_ras_get_fed_status(smu->adev))

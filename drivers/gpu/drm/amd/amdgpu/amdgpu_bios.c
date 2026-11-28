@@ -264,7 +264,11 @@ static bool amdgpu_read_platform_bios(struct amdgpu_device *adev)
 	if (!adev->bios)
 		return false;
 
-	bios = ioremap(rom, romlen);
+	if (pci_resource_flags(adev->pdev, PCI_ROM_RESOURCE) &
+	    IORESOURCE_MEM_NONPOSTED)
+		bios = ioremap_np(rom, romlen);
+	else
+		bios = ioremap(rom, romlen);
 	if (!bios)
 		goto free_bios;
 

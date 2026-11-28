@@ -1196,17 +1196,21 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 
 		num_entries = cursor.size >> AMDGPU_GPU_PAGE_SHIFT;
 		if (pages_addr) {
+			uint64_t sub_entries =
+				(cursor.start & ~PAGE_MASK) >>
+				AMDGPU_GPU_PAGE_SHIFT;
 			bool contiguous = true;
 
-			if (num_entries > AMDGPU_GPU_PAGES_IN_CPU_PAGE) {
+			if (sub_entries + num_entries >
+			    AMDGPU_GPU_PAGES_IN_CPU_PAGE) {
 				uint64_t pfn = cursor.start >> PAGE_SHIFT;
 				uint64_t count;
 
 				contiguous = pages_addr[pfn + 1] ==
 					pages_addr[pfn] + PAGE_SIZE;
 
-				tmp = num_entries /
-					AMDGPU_GPU_PAGES_IN_CPU_PAGE;
+				tmp = DIV_ROUND_UP(sub_entries + num_entries,
+						   AMDGPU_GPU_PAGES_IN_CPU_PAGE);
 				for (count = 2; count < tmp; ++count) {
 					uint64_t idx = pfn + count;
 
@@ -1216,15 +1220,17 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 				}
 				if (!contiguous)
 					count--;
-				num_entries = count *
-					AMDGPU_GPU_PAGES_IN_CPU_PAGE;
+				num_entries = min(num_entries,
+						  count * AMDGPU_GPU_PAGES_IN_CPU_PAGE -
+						  sub_entries);
 			}
 
 			if (!contiguous) {
 				addr = cursor.start;
 				params.pages_addr = pages_addr;
 			} else {
-				addr = pages_addr[cursor.start >> PAGE_SHIFT];
+				addr = pages_addr[cursor.start >> PAGE_SHIFT] +
+					(cursor.start & ~PAGE_MASK);
 				params.pages_addr = NULL;
 			}
 

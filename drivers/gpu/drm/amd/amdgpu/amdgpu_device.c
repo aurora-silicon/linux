@@ -802,7 +802,10 @@ static int amdgpu_device_read_fb_via_bar0(struct amdgpu_device *adev,
 	map_base = aper_base + (offset & PAGE_MASK);
 	map_size = PAGE_ALIGN(map_offset + size);
 
-	vram = ioremap_wc(map_base, map_size);
+	if (flags & IORESOURCE_MEM_NONPOSTED)
+		vram = ioremap_np(map_base, map_size);
+	else
+		vram = ioremap_wc(map_base, map_size);
 	if (!vram)
 		return -ENOMEM;
 

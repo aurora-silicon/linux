@@ -2372,7 +2372,7 @@ static int smu_v13_0_6_request_i2c_xfer(struct smu_context *smu,
 
 	table_size = smu_table->tables[SMU_TABLE_I2C_COMMANDS].size;
 
-	ret = smu_cmn_vram_cpy(smu, table->cpu_addr, table_data, table_size);
+	ret = smu_cmn_vram_cpy_to(smu, table->cpu_addr, table_data, table_size);
 	if (ret)
 		return ret;
 
@@ -2391,7 +2391,7 @@ static int smu_v13_0_6_i2c_xfer(struct i2c_adapter *i2c_adap,
 	struct smu_context *smu = adev->powerplay.pp_handle;
 	struct smu_table_context *smu_table = &smu->smu_table;
 	struct smu_table *table = &smu_table->driver_table;
-	SwI2cRequest_t *req, *res = (SwI2cRequest_t *)table->cpu_addr;
+	SwI2cRequest_t *req;
 	int i, j, r, c;
 	u16 dir;
 
@@ -2447,13 +2447,15 @@ static int smu_v13_0_6_i2c_xfer(struct i2c_adapter *i2c_adap,
 			goto fail;
 	}
 
+	amdgpu_bo_memcpy_from(table->bo, req, table->cpu_addr, sizeof(*req));
+
 	for (c = i = 0; i < num_msgs; i++) {
 		if (!(msg[i].flags & I2C_M_RD)) {
 			c += msg[i].len;
 			continue;
 		}
 		for (j = 0; j < msg[i].len; j++, c++) {
-			SwI2cCmd_t *cmd = &res->SwI2cCmds[c];
+			SwI2cCmd_t *cmd = &req->SwI2cCmds[c];
 
 			msg[i].buf[j] = cmd->ReadWriteData;
 		}

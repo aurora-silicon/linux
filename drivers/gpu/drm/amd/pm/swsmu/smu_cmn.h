@@ -212,6 +212,8 @@ int smu_cmn_update_table_read_arg(struct smu_context *smu,
 
 int smu_cmn_vram_cpy(struct smu_context *smu, void *dst,
 		     const void *src, size_t len);
+int smu_cmn_vram_cpy_to(struct smu_context *smu, void *dst,
+			const void *src, size_t len);
 
 int smu_cmn_write_watermarks_table(struct smu_context *smu);
 
