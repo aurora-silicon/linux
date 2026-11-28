@@ -308,6 +308,13 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.dp = &apple_dpin_m5,
 };
 
+/*
+ * T6040 deep sleep (the sleep controller's, linux#2215) removes the CIO power
+ * domains, and the ATC PHY is shared with DWC3: tear a connected router down
+ * before tasks freeze (ahead of DWC3's PM notifier) and ask for fresh cable
+ * state at the wake, as on T8103/T8122/T8142. s2idle and freeze leave the
+ * port up.
+ */
 static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.mxwrap = true,
 	.type7 = true,
@@ -316,6 +323,9 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
+	.sleep_removes_domains = true,
+	.restart_on_wake = true,
+	.phy_shared_with_dwc3 = true,
 	/* The T8132 (M4) DP IN flow; the PHY's AUSPLL is the pixel clock. */
 	.dp = &apple_dpin_m4,
 };
