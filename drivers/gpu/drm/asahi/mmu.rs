@@ -1339,6 +1339,9 @@ pub(crate) struct Vm {
     private_bytes: Arc<AtomicU64>,
     /// [`UatQuirks::narrow_pool_window`].
     narrow_pool_window: bool,
+    /// The UAT this VM was created on, the same one [`VmInner`] holds. Kept here so that
+    /// [`Vm::mark_binding_published`] reaches it without the VM reservation.
+    uat_inner: Arc<UatInner>,
 }
 no_debug!(Vm);
 
@@ -2647,7 +2650,7 @@ impl Vm {
                 bind_sequence: bind_sequence.clone(),
                 epoch: mapping_epoch.is_some().then_some(0),
                 mm,
-                uat_inner,
+                uat_inner: uat_inner.clone(),
                 binding: binding.clone(),
                 id,
                 sparse_tiles: [None, None],
@@ -2675,6 +2678,7 @@ impl Vm {
             binding,
             private_bytes: Arc::new(AtomicU64::new(0), GFP_KERNEL)?,
             narrow_pool_window,
+            uat_inner,
         })
     }
 
@@ -3236,8 +3240,11 @@ impl Vm {
     }
 
     /// Spend the binding generation only for an incarnation exposed to firmware.
+    ///
+    /// G16 publishes jobs inside a `SignallingGuard` section, so this must not take the VM
+    /// reservation: a thread holding it may wait for a fence that this publication signals.
     pub(crate) fn mark_binding_published(&self) -> Result {
-        let uat = self.gpuvm.lock_inner().uat_inner.clone();
+        let uat = &self.uat_inner;
         let binding = self.binding.lock();
         let slot = binding.binding.as_ref().ok_or(EIO)?.slot() as usize + UAT_USER_CTX_START;
         let mut shared = uat.lock();
