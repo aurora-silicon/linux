@@ -4,21 +4,14 @@
 //!
 //! Shares the 27.2 recovery phase state machine, snapshot decoder, and storm
 //! admission window directly from `g16/recovery/logic.rs` (the same protocol
-//! G16 and G14 27.2 answer) so no phase logic is duplicated across backends.
+//! G16 and G14 27.2 answer). Restarts charged to the guilty VM's shared
+//! `VmStatus::charge_restart` budget do not count toward that storm window.
 
 #[path = "../g16/recovery/logic.rs"]
 #[allow(dead_code)]
 pub(crate) mod logic;
 
 pub(crate) use logic::{RecoveryAction, SnapshotEntry};
-
-/// Maximum quarantined aborted flights per boot (half of the 63 user UAT
-/// contexts). Exceeding this cap fails closed into device fail-stop rather
-/// than leaking bindings/packets without bound across storm windows.
-pub(crate) const QUARANTINE_LIMIT: usize = 31;
-
-/// Additional recovery rounds answered while stopped work drains from queues.
-pub(crate) const FURTHER_RECOVERIES: u32 = 4;
 
 /// Maximum time to wait for stopped work to drain from work rings after phase 0.
 pub(crate) const RECOVERY_DRAIN_MS: i64 = 1000;
@@ -109,36 +102,16 @@ pub(crate) const fn is_trailing_stats(
     }
 }
 
-/// Cumulative per-boot bound on quarantined flights across recovery windows.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct QuarantineBudget {
-    count: usize,
-    limit: usize,
-}
-
-impl QuarantineBudget {
-    pub(crate) const fn new(limit: usize) -> Self {
-        Self { count: 0, limit }
-    }
-
-    pub(crate) const fn count(&self) -> usize {
-        self.count
-    }
-
-    pub(crate) const fn can_admit(&self, flights: usize) -> bool {
-        match self.count.checked_add(flights) {
-            Some(total) => total <= self.limit,
-            None => false,
-        }
-    }
-
-    pub(crate) fn charge(&mut self, flights: usize) -> bool {
-        if !self.can_admit(flights) {
-            return false;
-        }
-        self.count += flights;
-        true
-    }
+/// A guilty VM pays for the first restart and those its already-published commands
+/// can still cause. As in G17, only restarts beyond its budget enter the device storm
+/// window; unrelated clients do not spend a shared lifetime allowance.
+pub(crate) fn admit_restart(
+    charged: bool,
+    now: u64,
+    window_ns: &mut u64,
+    count: &mut u32,
+) -> bool {
+    charged || logic::admit(now, window_ns, count)
 }
 
 #[cfg(test)]
@@ -147,7 +120,6 @@ mod tests {
 
     #[test]
     fn extended_offsets_match_shared_g16_and_272_layouts() {
-        assert!(FURTHER_RECOVERIES > 0);
         assert!(RECOVERY_DRAIN_MS > 0);
         assert!(RECOVERY_BUDGET_MS >= RECOVERY_DRAIN_MS);
 
@@ -186,17 +158,21 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_budget_bounds_cumulative_retention() {
-        let mut budget = QuarantineBudget::new(QUARANTINE_LIMIT);
-        assert!(budget.can_admit(1));
-        for i in 0..QUARANTINE_LIMIT {
-            assert_eq!(budget.count(), i);
-            assert!(budget.charge(1));
+    fn charged_clients_do_not_spend_the_device_storm_window() {
+        let (mut window, mut count) = (0, 0);
+        for _ in 0..64 {
+            assert!(admit_restart(true, 10, &mut window, &mut count));
         }
-        assert_eq!(budget.count(), QUARANTINE_LIMIT);
-        assert!(!budget.can_admit(1));
-        assert!(!budget.charge(1));
-        assert_eq!(budget.count(), QUARANTINE_LIMIT);
+        assert_eq!((window, count), (0, 0));
+        for _ in 0..logic::WINDOW_LIMIT {
+            assert!(admit_restart(false, 10, &mut window, &mut count));
+        }
+        assert!(!admit_restart(false, 11, &mut window, &mut count));
+        // A new client's allowance is independent even of an exhausted storm window.
+        assert!(admit_restart(true, 11, &mut window, &mut count));
+        assert_eq!(count, logic::WINDOW_LIMIT);
+        assert!(admit_restart(false, logic::WINDOW_NS + 1, &mut window, &mut count));
+        assert_eq!(count, 1);
     }
 
     #[test]
