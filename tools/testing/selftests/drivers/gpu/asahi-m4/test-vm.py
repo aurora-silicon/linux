@@ -26,6 +26,8 @@ layout = hw[hw.index('pub(crate) const FW_25G83: FwLayout = FwLayout {'):]
 leaves = layout[layout.index('leaves: Some(&[') + len('leaves: Some('):layout.index(']),') + 1]
 hw_leaves = '\n'.join([body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) enum Segment {'),
                        body(hw, 'pub(crate) struct Leaves {'),
+                       body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) enum FwAbi {'),
+                       body(hw, 'impl FwAbi {'),
                        body(hw, '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) struct PplMagic {'),
                        'pub const LEAVES_25G83: &[Leaves] = ' + leaves + ';'])
 vm = (ROOT/'drivers/gpu/drm/asahi/g16/vm.rs').read_text()
@@ -89,8 +91,8 @@ fn with_table<R>(pa:u64,count:usize,f:impl FnOnce(&[AtomicU64])->R)->Result<R>{l
 fn entry(pa:u64,index:usize)->Result<u64>{with_table(pa,index+1,|e|e[index].load(Ordering::Acquire))}
 fn clean_entries(pa:u64,first:usize,count:usize)->Result{with_table(pa,first+count,|_|())?;note(format!("clean:{pa:x}:{first}:{count}"));Ok(())}
 fn clean_page(pa:u64)->Result{clean_entries(pa,0,ENTRIES)}
-struct Window{handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves],ppl:hw::PplMagic}
-impl Window{fn blank()->Self{Self{handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl:hw::PplMagic{ap:hw::PPL_MAGIC,firmware:hw::PPL_MAGIC,answers:false}}}
+struct Window{abi:hw::FwAbi,handoff:Mapping,ttbs:Mapping,root:Mapping,shared_l2:Mapping,image:Vec<u64>,snapshot:Vec<u64>,published:bool,firmware_root:[u64;2],text_pa:u64,data_pa:u64,leaves:&'static [hw::Leaves],ppl:hw::PplMagic}
+impl Window{fn blank()->Self{Self{abi:hw::FwAbi::V25G83,handoff:Mapping::new(0x807000000,0x4000,"handoff"),ttbs:Mapping::new(0x808000000,0x4000,"ttbs"),root:Mapping::new(0x800000000,0x40000,"root"),shared_l2:Mapping::new(0x801000000,0x4000,"shared"),image:vec![0;2048],snapshot:vec![0;2048],published:false,firmware_root:[0;2],text_pa:0x802000000,data_pa:0x803000000,leaves:hw::LEAVES_25G83,ppl:hw::PplMagic{ap:hw::PPL_MAGIC,firmware:hw::PPL_MAGIC,answers:false}}}
 '''
 post = r'''
 }
@@ -117,9 +119,36 @@ fn root_admission_tests(){
  for i in 0..195{w.handoff.try_write64(1,0x20+i*8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));w.handoff.try_write64(0,0x20+i*8).unwrap();}
  for i in 0..128{w.ttbs.try_write64(1,i*8).unwrap();assert_eq!(w.admit_cold(),Err(EBUSY));w.ttbs.try_write64(0,i*8).unwrap();}
 }
+fn live_root_tests() {
+    for abi in [hw::FwAbi::V25G83, hw::FwAbi::V26B123, hw::FwAbi::V26B123G15S] {
+        let mut w = Window::blank();
+        w.abi = abi;
+        let compact = abi == hw::FwAbi::V26B123G15S;
+        let g15_table = (w.root.pa + 3 * hw::PAGE) | 0x403;
+        let g16_table = (w.root.pa + 4 * hw::PAGE) | 0x00200000000004cb;
+        let (table, other) = if compact { (g15_table, g16_table) } else { (g16_table, g15_table) };
+        w.root.try_write64(w.shared_l2.pa | 3, 16).unwrap();
+        w.root.try_write64(other, 8).unwrap();
+        assert_eq!(w.verify_root(), Err(EIO));
+        w.root.try_write64(table, 8).unwrap();
+        w.verify_root().unwrap();
+        let flags = if compact { 0x403 } else { 0x00200000000004cb };
+        let wrong_flags = if compact { 0x00200000000004cb } else { 0x403 };
+        w.root.try_write64(w.shared_l2.pa | wrong_flags, 16).unwrap();
+        assert_eq!(w.verify_root(), Err(EIO));
+        w.root.try_write64(w.shared_l2.pa | flags, 16).unwrap();
+        w.verify_root().unwrap();
+        w.root.try_write64((w.shared_l2.pa + hw::PAGE) | flags, 16).unwrap();
+        assert_eq!(w.verify_root(), Err(EIO));
+        w.root.try_write64(w.shared_l2.pa | flags, 16).unwrap();
+        w.root.try_write64(0, 8).unwrap();
+        assert_eq!(w.verify_root(), Err(EIO));
+    }
+}
 // 26B123: the firmware builds its own tree at start, so only an empty tree is admitted, and it
 // leaves its own magic at +8 of the handoff page once it has run.
 fn firmware_built_tree_tests(){
+ live_root_tests();
  const FW:u64=0x4b1d000000000003;
  let fresh=||{let mut w=Window::blank();w.leaves=&[];w.ppl=hw::PplMagic{ap:FW,firmware:FW,answers:true};w};
  assert!(fresh().admit_cold().is_ok());

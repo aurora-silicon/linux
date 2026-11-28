@@ -3,10 +3,11 @@
 //! J713/G16G 25G83 compute packet layout. All offsets are bytes.
 
 pub(crate) const WORK_SIZE: usize = 0x2000;
-/// Active head span of a compute work image: header (`0x00..0x18`) plus up to 28 register
-/// records (`0x20..0x170`, including USC base and RT/SCS records), 16-byte aligned. Bytes
-/// between `HEAD_ACTIVE_SIZE` and `BODY_ACTIVE_START` remain zeroed after a full write.
-pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x170;
+/// Active head span of a compute work image: header (`0x00..0x18`) plus up to 29 register
+/// records (`0x20..0x17c`, including optional 0x12091, USC base and RT/SCS records), 16-byte
+/// aligned. Bytes between `HEAD_ACTIVE_SIZE` and `BODY_ACTIVE_START` remain zeroed after a full
+/// write.
+pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x180;
 /// First active body byte of a compute work image (`work_gva + 0x20` pointer at `0x720`).
 pub(crate) const BODY_ACTIVE_START: usize = 0x720;
 /// Exclusive end of the active body span of a compute work image (`0xf00..0xf08` tail).
@@ -43,7 +44,17 @@ pub(crate) const PAGE_LIST_SIZE: usize = 0x4000;
 pub(crate) const START_SCS: usize = 0x40;
 pub(crate) const EVENT: u32 = 15;
 /// Firmware completion events for concurrent compute pipes `0..COMPUTE_PIPES`.
-pub(crate) const EVENTS: [u32; 2] = [EVENT, 16];
+/// All events reside in type-1 event word 1 (`15..32`) so event draining reads only words 1 and 4.
+pub(crate) const EVENTS: [u32; 8] = [EVENT, 16, 17, 18, 19, 20, 21, 22];
+
+/// Resolves a firmware compute completion event back to its compute pipe index (`0..EVENTS.len()`).
+pub(crate) const fn pipe_of_event(event: u32) -> Option<usize> {
+    if event >= EVENT && (event - EVENT) < EVENTS.len() as u32 {
+        Some((event - EVENT) as usize)
+    } else {
+        None
+    }
+}
 /// The binding generation.
 pub(crate) const GENERATION: usize = 0x88b;
 
@@ -63,6 +74,17 @@ pub(crate) struct Layout {
     /// Optional `(start, end)` u64 tick offsets inside the work object when the firmware writes
     /// compute GPU timestamps into work rather than the unit's ITS pair.
     pub(crate) work_ticks: Option<(usize, usize)>,
+    /// Offset of the four preemption saved-state pointers (`0x1a4d0..0x1a4e8`) in the
+    /// preemption buffer.
+    pub(crate) preempt_tail: u64,
+    /// Whether to emit G15 register `0x12091 = 0x1c` immediately before `0x101d9`.
+    pub(crate) has_reg_12091: bool,
+    /// Whether to emit HAL200 USC-base register `0x10071`.
+    pub(crate) has_usc_base_reg: bool,
+    /// Four sub-offsets inside `context_store_gva` written at `StartCompute +0x188..+0x1a0`.
+    pub(crate) context_store_offsets: [u64; 4],
+    /// Pool threshold words written at compute work `+0x873` and `+0x87b`.
+    pub(crate) pool_words: [u64; 2],
 }
 
 pub(crate) const V25G83: Layout = Layout {
@@ -72,6 +94,11 @@ pub(crate) const V25G83: Layout = Layout {
     target: 0x8ac,
     cached: 0x8c0,
     work_ticks: None,
+    preempt_tail: 0x1480,
+    has_reg_12091: false,
+    has_usc_base_reg: true,
+    context_store_offsets: [0, 0xf400, 0x1e800, 0x1f000],
+    pool_words: [0x1588000, 0xef8000],
 };
 
 pub(crate) const V26B123: Layout = Layout {
@@ -81,6 +108,25 @@ pub(crate) const V26B123: Layout = Layout {
     target: 0x8b3,
     cached: 0x8e0,
     work_ticks: Some((0x7ec, 0x7f4)),
+    preempt_tail: 0x1480,
+    has_reg_12091: false,
+    has_usc_base_reg: true,
+    context_store_offsets: [0, 0xf400, 0x1e800, 0x1f000],
+    pool_words: [0x1588000, 0xef8000],
+};
+
+pub(crate) const V26B123_G15S: Layout = Layout {
+    generation_bytes: 8,
+    completion: 0x893,
+    auxiliary: 0x8a3,
+    target: 0x8b3,
+    cached: 0x8e0,
+    work_ticks: Some((0x7ec, 0x7f4)),
+    preempt_tail: 0x1b80,
+    has_reg_12091: true,
+    has_usc_base_reg: false,
+    context_store_offsets: [0, 0x1e400, 0x3c800, 0x3d800],
+    pool_words: [0x31cc000, 0x2308000],
 };
 
 const fn valid(l: &Layout) -> bool {
@@ -90,11 +136,14 @@ const fn valid(l: &Layout) -> bool {
         && l.target + 4 <= l.cached
         && l.cached <= SEQ_EMBEDDED
         && SEQ_EMBEDDED + SEQ_SIZE <= NOTIFIER
+        && l.preempt_tail + 0x20 <= PREEMPT_SIZE as u64
+        && l.context_store_offsets[3] + 0x1000 <= CONTEXT_STORE_SIZE as u64
 }
 const _: () = assert!(
     valid(&V25G83)
         && valid(&V26B123)
-        && REGS + (SEL.len() + 4) * 12 <= HEAD_ACTIVE_SIZE
+        && valid(&V26B123_G15S)
+        && REGS + (SEL.len() + 5) * 12 <= HEAD_ACTIVE_SIZE
         && HEAD_ACTIVE_SIZE <= BODY_ACTIVE_START
         && BODY_ACTIVE_START <= GENERATION
         && DESCRIPTOR + DESCRIPTOR_SIZE <= BODY_ACTIVE_END

@@ -38,6 +38,8 @@ pub(crate) mod qinfo {
         /// Firmware u32 busy flag: 1 from when the firmware takes a record until DONE (+0x20)
         /// reaches the head (+0x28).
         pub(crate) busy: usize,
+        /// Optional trailing `(offset, value)` u64 word in the firmware header.
+        pub(crate) tail_word: Option<(usize, u64)>,
     }
 
     pub(crate) const V25G83: Layout = Layout {
@@ -47,6 +49,7 @@ pub(crate) mod qinfo {
         uuid: UUID,
         sched_ctx: SCHED_CTX,
         busy: 0x80,
+        tail_word: None,
     };
 
     /// 26B123 queue-info header (0x80 bytes): class_c at 0x44, unk_4c at 0x48, uuid at 0x4c,
@@ -58,6 +61,19 @@ pub(crate) mod qinfo {
         uuid: 0x4c,
         sched_ctx: 0x78,
         busy: 0x54,
+        tail_word: None,
+    };
+
+    /// G15S 26B123 queue-info header (0x88 bytes invalidated by the firmware): trailing u64 `4`
+    /// at `+0x80`, with queue scratch starting right after it at `+0x88`.
+    pub(crate) const V26B123_G15S: Layout = Layout {
+        header: 0x88,
+        class_c: 0x44,
+        unk_4c: 0x48,
+        uuid: 0x4c,
+        sched_ctx: 0x78,
+        busy: 0x54,
+        tail_word: Some((0x80, 4)),
     };
 }
 
@@ -110,8 +126,6 @@ pub(crate) mod notifier_page {
     pub(crate) const TA_RECORD: usize = 0;
     pub(crate) const FS_RECORD: usize = 0x200;
     pub(crate) const COMPUTE_RECORD: usize = 0x400;
-    pub(crate) const COMPUTE_CONTEXT: usize = COMPUTE_RECORD + super::notifier::CONTEXT;
-    pub(crate) const COMPUTE_STAMP: usize = 0x648;
     pub(crate) const TA_STAMP: usize = 0x620;
     pub(crate) const FS_STAMP: usize = 0x630;
 }
@@ -205,6 +219,9 @@ pub(crate) fn queue_image_for(
         (layout.unk_4c, u32::MAX),
     ] {
         q[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    if let Some((at, value)) = layout.tail_word {
+        q[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
     q
 }

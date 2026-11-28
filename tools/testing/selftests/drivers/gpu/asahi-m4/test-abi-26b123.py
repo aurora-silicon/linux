@@ -200,6 +200,9 @@ def main():
     first = identity.index('pub(crate) struct FirmwareBuild {')
     source = (HERE / 'check-abi-26b123.rs').read_text().replace('@KERNEL@', str(root))
     source = source.replace('@FWID_BUILD@', identity[first:identity.index('\n}', first) + 2])
+    channel = (root / 'drivers/gpu/drm/asahi/g16/channel.rs').read_text()
+    ring = channel[channel.index('pub(crate) struct Ring {'):channel.index('    /// The producer')]
+    source = source.replace('@RING@', ring + '}')
     harness = out / 'check-abi-26b123.rs'
     harness.write_text(source)
     binary = out / 'check-abi-26b123'

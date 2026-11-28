@@ -29,7 +29,7 @@ config DRM_ASAHI
 	  be called aurora. It keeps "asahi" as a module alias.
 
 config DRM_ASAHI_G16
-	bool "Apple M4 (G16G) support"
+	bool "Apple M4 (G16G) and M3 Pro (G15S 27.2) support"
 	depends on DRM_ASAHI && ARM64
 	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
 	depends on DRM_APPLE_DCP_T8132
@@ -38,12 +38,12 @@ config DRM_ASAHI_G16
 	depends on THERMAL_OF
 	default y
 	help
-	  Backend for the M4 (T8132) GPU running the 25G83 firmware of
-	  macOS 26.6.2, which the boot loader leaves loaded. The driver
-	  binds when the GPU node appears and starts the firmware once the
-	  PMP supplier, and a native display the boot loader handed over,
-	  are up. The firmware session is retained until reboot and stays
-	  running across suspend-to-idle.
+	  Shared backend for the M4 (T8132) GPU on firmware 25G83 or
+	  26B123 and the M3 Pro (T6030) GPU on 26B123. The boot loader
+	  leaves the firmware loaded and publishes its handoff. A native
+	  display, if handed over, starts before the GPU. T8132 also
+	  retains its PMP supplier. The firmware session is retained until
+	  reboot and stays running across suspend-to-idle.
 	  A rendering VM pins about 0.7 GiB. An aborted receipt disables
 	  that command class until reboot.
 

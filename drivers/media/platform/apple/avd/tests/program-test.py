@@ -539,12 +539,17 @@ def prepare_regressions(out):
     inst = re.sub(r'^#include.*\n', '', (ROOT / 'avd-inst.h').read_text(), flags=re.M)
     helpers = re.sub(r'^#include.*\n', '', (ROOT / 'avd-h264-params.h').read_text(), flags=re.M)
     pre = h264_prelude().replace('struct vb2_v4l2_buffer *dst; } bufs;', 'struct vb2_v4l2_buffer *src,*dst; } bufs;')
+    pre = pre.replace('dma_addr_t comp_out, y_out, uv_out;', 'dma_addr_t coded_in, comp_out, y_out, uv_out;')
     pre = pre.replace('struct { struct { struct { struct { u32 bytesperline; } plane_fmt[1]; } pix_mp; } fmt; } decoded_fmt;',
                       'struct { struct { struct v4l2_pix_format_mplane pix_mp; } fmt; } decoded_fmt,coded_fmt;')
     pre = pre.replace('struct vb2_buffer vb2_buf; };', 'struct vb2_buffer vb2_buf; unsigned int flags; };')
     pre = pre.replace('unsigned int bank; };', 'unsigned int bank; size_t grey_chroma_offset; bool grey_chroma_10bit; };')
+    pre += '#define S8_MIN (-128)\n#define S8_MAX 127\n#define U32_MAX UINT32_MAX\n'
+    pre += '#define IS_ENABLED(x) 0\n'
     pre += 'enum vb2_buffer_state { VB2_BUF_STATE_DONE, VB2_BUF_STATE_ERROR };\n'
-    code = pre + helpers + inst + h264
+    parse_h = re.sub(r'^#include.*\n', '', (ROOT / 'avd-h264-parse.h').read_text(), flags=re.M)
+    parse_c = re.sub(r'^#include.*\n', '', (ROOT / 'avd-h264-parse.c').read_text(), flags=re.M)
+    code = pre + helpers + parse_h + parse_c + inst + h264
     for name in ('avd_h264_alloc_bufs', 'avd_h264_validate_sps_fmt', 'avd_h264_validate_sps',
                  'avd_h264_validate_pps',
                  'avd_h264_validate_slice', 'avd_h264_drop_bank_slices', 'avd_h264_pick_bank',
@@ -554,7 +559,7 @@ def prepare_regressions(out):
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_check_sps_geometry')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps_fmt')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps')
-    code += RUN_FIXTURE + function(source, 'avd_h264_sps_image_fmt') + function(source, 'avd_h264_run') + RUN_MAIN
+    code += RUN_FIXTURE + function(source, 'avd_h264_sps_image_fmt') + function(source, 'avd_h264_run_frame') + function(source, 'avd_h264_run') + RUN_MAIN
     dest = out / 'prepare.c'
     dest.write_text(code)
     exe = dest.with_suffix('')

@@ -104,6 +104,11 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 typedef int64_t s64; typedef long long ktime_t;
 #define BIT(n) (1u << (n))
 #define SEP_PS_DEV_DISABLE BIT(10)
+#define GENMASK(h, l) ((~0u << (l)) & (~0u >> (31 - (h))))
+#define FIELD_GET(m, v) (((v) & (m)) / ((m) & -(m)))
+/* The enclave's power word while it runs (target and actual 0xf), and gated without DEV_DISABLE */
+#define SEP_PS_RUNNING 0xffu
+#define SEP_PS_ACTUAL_OFF 0x0fu
 #define USEC_PER_MSEC 1000
 #define NSEC_PER_USEC 1000
 #define READ_ONCE(x) (x)
@@ -149,7 +154,7 @@ static int domain_error, property_error, address_error, read_error, read_error_a
 static int gate_after, reads, put_refs, maps, unmaps, lookups, prepares, restores;
 static int prepare_error, send_error, bulk_error, one_error, sends, closes;
 static int mailbox_reads, message_reads, forwarded, lock_depth;
-static int resource_bytes, close_gate, early_gate;
+static int resource_bytes, close_gate, early_gate, actual_gate;
 static bool message_in_lock, matched_read;
 static struct apple_mbox_msg queue[4];
 static unsigned queued, consumed;
@@ -231,7 +236,9 @@ static void apple_mbox_set_recv_enabled(struct apple_mbox *m, bool enabled) {
 }
 static u32 readl(void *p) {
     // PMGR is the sole permitted query after the matched reply/receive close.
-    return early_gate || (closes && close_gate) ? SEP_PS_DEV_DISABLE : 0;
+    if (early_gate || (closes && close_gate))
+        return SEP_PS_DEV_DISABLE;
+    return closes && actual_gate ? SEP_PS_ACTUAL_OFF : SEP_PS_RUNNING;
 }
 static jmp_buf fatal_env;
 static bool fatal_armed;
@@ -258,7 +265,7 @@ void fixture(void) {
     put_refs = maps = unmaps = lookups = prepares = restores = sends = closes = 0;
     prepare_error = send_error = bulk_error = one_error = 0;
     mailbox_reads = message_reads = forwarded = lock_depth = 0;
-    resource_bytes = 4; close_gate = 1; early_gate = 0; read_error_after = 1;
+    resource_bytes = 4; close_gate = 1; early_gate = 0; actual_gate = 0; read_error_after = 1;
     queued = consumed = 0; message_in_lock = matched_read = false; now = 0;
     fatal_armed = false; fatal_message[0] = 0; sep_pm_told = yes;
 }
@@ -397,6 +404,10 @@ static void test_sent(void) {
     fixture(); assert(stage() == 0); reply(0); close_gate = 0;
     expect_stop_fatal("did not gate after send: -110");
     assert(closes == 1 && sep_pm_commit.gate_valid && sep_pm_commit.gate_ret == -ETIMEDOUT);
+    /* An enclave that gates without ever setting DEV_DISABLE (M1): its actual state at 0. */
+    fixture(); assert(stage() == 0); reply(0); close_gate = 0; actual_gate = 1;
+    assert(sep_pm_commit_stop(&sep_pm_commit) == 0);
+    assert(closes == 1 && sep_pm_commit.gate_valid && !sep_pm_commit.gate_ret);
 
     fixture(); assert(stage() == 0); reply(0); assert(sep_pm_commit_stop(&sep_pm_commit) == 0);
     fatal_armed = true;
@@ -681,7 +692,7 @@ def sources(source, contracts, mutation):
     sleep = (source / 'drivers/soc/apple/sleep.c').read_text()
     iopoll = (contracts / 'include/linux/iopoll.h').read_text()
     names = {
-        'shim': ['sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
+        'shim': ['sep_ps_down', 'sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
                  'sep_pm_commit_rx', 'sep_pm_commit_take_rx', 'sep_pm_commit_stop',
                  'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
@@ -700,7 +711,7 @@ def sources(source, contracts, mutation):
               'read_poll_timeout_atomic', 'readx_poll_timeout_atomic', 'readl_poll_timeout_atomic']
     c = C_PREFIX + '\n' + '\n'.join(macro(iopoll, n) for n in macros)
     c += '\n' + '\n'.join(re.search(r'^#define ' + n + r'\s+.*$', shim, re.M).group()
-                            for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US'])
+                            for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US', 'SEP_PS_ACTUAL'])
     start = shim.index('static struct sep_pm_commit {')
     c += '\n' + shim[start:shim.index('} sep_pm_commit;', start) + len('} sep_pm_commit;')]
     # Use the actual provider helper, with only removal/capability dependency state

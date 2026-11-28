@@ -1378,6 +1378,27 @@
 	status = "okay";
 };
 
+/*
+ * The Neural Engine and its three DARTs, as on the J614c/J616c. The J575c's
+ * ADT has ane0 with pre-loaded firmware (__TEXT;__DATA); the loader fills the
+ * reservations of t6041-j616c-ane.dtsi and the firmware IOVAs from it.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
 /* Both JPEG engines; they have no board wiring. */
 &ps_jpg {
 	status = "okay";
@@ -1396,6 +1417,32 @@
 };
 
 &jpeg1 {
+	status = "okay";
+};
+
+/*
+ * First ProRes encoder (apr0) and its DART, as on the J616c. The J575c's ADT
+ * has apr0 and dart-apr0 at the t6041.dtsi addresses and interrupts. apr0
+ * runs with SCODEC_STREAMING (and SCODEC) powered and uses the driver's
+ * built-in T6041 power-up rows.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
 	status = "okay";
 };
 
@@ -1449,6 +1496,7 @@
 		apple,event-irq-in-sleep;
 		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
 		apple,reset-inherited-usb2-connection;
+		apple,debug-lock-key = "575J";
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1481,6 +1529,7 @@
 		apple,event-irq-in-sleep;
 		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
 		apple,reset-inherited-usb2-connection;
+		apple,debug-lock-key = "575J";
 
 		typec2: connector {
 			compatible = "usb-c-connector";
@@ -2036,6 +2085,7 @@
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
 #include "t6041-j575c-usbc-dcpext2.dtsi"
+#include "t6041-j575c-usbc-dcpext3.dtsi"
 #include "t6041-j575c-hdmi.dtsi"
 
 /* Not described: the SEP (no Touch ID sensor). */
@@ -2099,5 +2149,46 @@
 
 /* The QSPI controller cannot probe while its power state is disabled. */
 &ps_qspi {
+	status = "okay";
+};
+
+/*
+ * Both MSR scalers (scaler0, scaler1) and their DARTs, as on the J616c. The
+ * J575c's ADT has them at the addresses, interrupts and PMGR offsets of
+ * t6041-j614-j616-j575-scaler.dtsi.
+ */
+&ps_fab5_soc {
+	status = "okay";
+};
+
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+&ps_msr1 {
+	status = "okay";
+};
+
+&ps_msr1_ase_core {
+	status = "okay";
+};
+
+&scaler1_dart {
+	status = "okay";
+};
+
+&scaler1 {
 	status = "okay";
 };

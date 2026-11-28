@@ -305,6 +305,7 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
  */
 
 int apple_rtkit_poweroff(struct apple_rtkit *rtk);
+int apple_rtkit_mbox_restore(struct apple_rtkit *rtk);
 
 /*
  * After poweroff and a power cycle: start a fresh session, let @start start the

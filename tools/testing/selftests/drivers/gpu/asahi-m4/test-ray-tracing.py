@@ -79,6 +79,7 @@ command = (BACKEND / 'command.rs').read_text()
 engine = (BACKEND / 'engine.rs').read_text()
 admission = '\n'.join(function(command, name) for name in
                       ['check_intersection', 'check_render_ray', 'check_compute_ray'])
+reserve = function((BACKEND / 'queue.rs').read_text(), 'reserve_render_scs')
 conversion = '\n'.join(function(engine, name) for name in ['compute_rt', 'stage_rt'])
 # The client address map, which bounds SCS pools (SCS_POOL_WINDOW).
 client = block((BACKEND / 'hw.rs').read_text(), 'pub(crate) mod client {')
@@ -147,6 +148,36 @@ impl SpanBatch {
     }
 }
 struct Context<'a> { vm: &'a mmu::Vm, usc_base: u64, active_cores: u32, render_scs: [u16; 2] }
+mod queue_test {
+    use super::*;
+    struct Config { supports_render_scs: bool }
+    struct Queue { cfg: Config, accepted: [u64; 2], active_cores: u32, render_scs: [u16; 2] }
+    const EBUSY: i32 = -16;
+    struct Error;
+    impl Error { fn from_errno(code: i32) -> i32 { code } }
+    impl Queue { @RESERVE@ }
+
+    #[test]
+    fn reserve_scratch() {
+        let mut q = Queue {
+            cfg: Config { supports_render_scs: false },
+            accepted: [0; 2], active_cores: 10, render_scs: [0; 2],
+        };
+        let (layout, pages) = LAYOUTS[0];
+        assert_eq!(q.reserve_render_scs([0, 0]), Ok(()));
+        for request in [[layout, 0], [0, layout]] {
+            assert_eq!(q.reserve_render_scs(request), Err(-95));
+            assert_eq!(q.render_scs, [0, 0]);
+        }
+        q.cfg.supports_render_scs = true;
+        assert_eq!(q.reserve_render_scs([layout, 0]), Ok(()));
+        assert_eq!(q.render_scs, [pages, 0]);
+        q.accepted = [1, 0];
+        assert_eq!(q.reserve_render_scs([0, 0]), Err(EBUSY));
+        assert_eq!(q.render_scs, [pages, 0]);
+    }
+}
+pub mod bindings { pub const EOPNOTSUPP: u32 = 95; }
 @ADMISSION@
 @CONVERSION@
 type KBox<T> = Box<T>;
@@ -191,7 +222,7 @@ fn compute_refs() -> encode::ComputeRefs {
     let f = 0xfffffc2000000000u64; let g = 0x1000000000u64;
     encode::ComputeRefs {
         notifier: f + 0x600400, qinfo: f + 0x200000, user_stamp: f + 0x600648, fw_stamp: f + 0x600640,
-        work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900, preempt_gva: g + 0x200000,
+        work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900, descriptor_fw: 0, preempt_gva: g + 0x200000,
         its: f + 0x1008c0, stats_fw: f + 0x300000, auxiliary_fw: f + 0x400000, auxiliary_gva: g + 0x400000,
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000, pool_state_gva: g + 0x600000,
         page_list_gva: g + 0x700000, usc_base: 1 << 40, record_fw: f + 0x700000, binding_generation: 1,
@@ -577,7 +608,7 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-rt-') as name:
     (staged / 'encode.rs').write_text(encode_source + gates)
     source = harness
     for key, value in {'@FLAT@': str(FLAT), '@ADMISSION@': admission, '@CONVERSION@': conversion,
-                       '@LONG@': long, '@CLIENT@': client}.items():
+                       '@RESERVE@': reserve, '@LONG@': long, '@CLIENT@': client}.items():
         source = source.replace(key, value)
     source = source.replace('#[path = "@BACKEND@/encode.rs"]', '#[path = "' + str(staged / 'encode.rs') + '"]')
     source = source.replace('@BACKEND@', str(BACKEND))

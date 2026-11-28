@@ -23,19 +23,19 @@ pub(crate) mod work;
 use super::hw::FwAbi;
 
 impl FwAbi {
-    /// The InitData objects.
-    pub(crate) const fn initdata(self) -> &'static initdata::Layout {
-        match self {
-            FwAbi::V25G83 => &initdata::V25G83,
-            FwAbi::V26B123 => &initdata::V26B123,
-        }
-    }
-
     /// The device-control opcodes the host sends.
     pub(crate) const fn devctl(self) -> &'static channels::devctl::Opcodes {
         match self {
             FwAbi::V25G83 => &channels::devctl::V25G83,
-            FwAbi::V26B123 => &channels::devctl::V26B123,
+            FwAbi::V26B123 | FwAbi::V26B123G15S => &channels::devctl::V26B123,
+        }
+    }
+
+    /// The parameter-buffer manager layout.
+    pub(crate) const fn pb_manager(self) -> &'static buffer::pb_manager::Layout {
+        match self {
+            FwAbi::V25G83 | FwAbi::V26B123 => &buffer::pb_manager::V25G83,
+            FwAbi::V26B123G15S => &buffer::pb_manager::V26B123_G15S,
         }
     }
 
@@ -44,6 +44,7 @@ impl FwAbi {
         match self {
             FwAbi::V25G83 => &graph::qinfo::V25G83,
             FwAbi::V26B123 => &graph::qinfo::V26B123,
+            FwAbi::V26B123G15S => &graph::qinfo::V26B123_G15S,
         }
     }
 
@@ -52,6 +53,7 @@ impl FwAbi {
         match self {
             FwAbi::V25G83 => &work::ta::V25G83,
             FwAbi::V26B123 => &work::ta::V26B123,
+            FwAbi::V26B123G15S => &work::ta::V26B123_G15S,
         }
     }
 
@@ -60,6 +62,7 @@ impl FwAbi {
         match self {
             FwAbi::V25G83 => &work::fs::V25G83,
             FwAbi::V26B123 => &work::fs::V26B123,
+            FwAbi::V26B123G15S => &work::fs::V26B123_G15S,
         }
     }
 
@@ -68,6 +71,7 @@ impl FwAbi {
         match self {
             FwAbi::V25G83 => &work::compute::V25G83,
             FwAbi::V26B123 => &work::compute::V26B123,
+            FwAbi::V26B123G15S => &work::compute::V26B123_G15S,
         }
     }
 }

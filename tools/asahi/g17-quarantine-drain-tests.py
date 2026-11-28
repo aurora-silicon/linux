@@ -85,7 +85,7 @@ def fixture():
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(admission, name) for name in [
         'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
         'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
         'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
         'fn claim_sibling(', 'fn usable(', 'fn position(', 'fn release(',
@@ -106,6 +106,7 @@ def fixture():
 #![allow(dead_code, unused_macros, unused_imports, unused_variables, unused_mut)]
 use std::collections::VecDeque;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst}};
+macro_rules! pr_warn { ($($arg:tt)*) => { eprint!($($arg)*) }; }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error(i32);
@@ -158,7 +159,7 @@ impl Status {
     fn report_failure(&self, _: Error) {}
 }
 pub struct Output;
-impl Output { fn finish(&self, _: Result<[u64; 4]>) {} }
+impl Output { fn finish(&self, _: Result<[u64; 4]>, _: &Status) {} }
 pub struct Sources;
 impl Sources { fn release(&self) {} }
 
@@ -227,7 +228,11 @@ pub struct Memory { retired: Vec<u64> }
 impl Memory { fn retire(&mut self, ordinal: u64) -> Result { self.retired.push(ordinal); Ok(()) } }
 /// The firmware state behind `Pair::firmware_drained`: cursors done == write, free-list
 /// blocks returned, and stamps covering the last publication or the context's kill acknowledged.
-pub trait Host { fn drained(&self) -> bool; }
+pub trait Host {
+    fn drained(&self) -> bool;
+    /// No restart in progress (recovery generation, state).
+    fn epoch(&self) -> Result<(u64, u32)> { Ok((1, 0)) }
+}
 pub struct FakeHost { drained: bool }
 impl Host for FakeHost { fn drained(&self) -> bool { self.drained } }
 pub struct Pair {
@@ -237,9 +242,13 @@ pub struct Pair {
     memory: Memory,
     drain_failures: u32,
     drain_retry_at: u64,
+    guilty_released: bool,
+    slot: u8,
 }
 impl Pair {
     fn firmware_drained(&self, host: &impl Host) -> Result<bool> { Ok(host.drained()) }
+    // This fixture models no killed guilty context (`Pair::guilty_killed`).
+    fn guilty_killed(&self, _generation: u64, _state: u32) -> bool { false }
     fn resync(&mut self) {}
     // The cross-pair task-stage order is not modelled here (KUnit asahi_g17_render_cross_pair_order).
     fn release_task_order_if_held(&self) {}
@@ -308,7 +317,8 @@ fn firmware(pool: &Arc<Pool>, commands: &[(&Command, u64)]) -> Firmware {
         stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
     }).collect();
     let pair = Pair { quarantined: false, active: Ring(active), terminal: None, memory: Memory { retired: Vec::new() },
-                      drain_failures: 0, drain_retry_at: 0 };
+                      drain_failures: 0, drain_retry_at: 0, guilty_released: false,
+                      slot: 0 };
     Firmware { queues: Queues { admission: pool.clone() }, pair: Some(Box::new(pair)), host: FakeHost { drained: false } }
 }
 fn batch() -> DeferredBatch { DeferredBatch { values: Vec::new() } }

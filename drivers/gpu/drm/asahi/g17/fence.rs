@@ -222,9 +222,20 @@ pub(super) unsafe fn exported_source_raw(raw: *mut bindings::dma_fence) -> Optio
         .cloned()
 }
 
+/// Immutable cross-QID kick metadata published once a compute source is committed in firmware.
+/// Consumers on the same VM read this without acquiring the global device mutex.
+#[derive(Clone)]
+pub(crate) struct PublishedSource {
+    pub(crate) epoch: u64,
+    pub(crate) published: u64,
+    pub(crate) dependency: super::fw::kick::KickDependency,
+    pub(crate) readers: Arc<core::sync::atomic::AtomicU32>,
+}
+
 struct State {
     work: Option<Arc<WorkStateLease>>,
     ready: Option<Fence>,
+    published: Option<PublishedSource>,
 }
 
 // One Member per parsed command, plus the enqueue guard. Exported references
@@ -236,6 +247,8 @@ kernel::static_assert!(crate::file::MAX_COMMANDS_PER_SUBMISSION < u8::MAX as u32
 pub(crate) struct Submission {
     #[pin]
     state: Mutex<State>,
+    /// Immutable VM status of this submission, stored outside `state` so `same_vm()` is lock-free.
+    vm_status: Option<Arc<super::status::VmStatus>>,
     remaining: AtomicU8,
     error: AtomicI32,
     /// Live Member objects, plus the enqueue guard, independently of signalling.
@@ -245,22 +258,38 @@ pub(crate) struct Submission {
     /// is queued, before its fence is signalled off-lock: a consumer published
     /// in between needs no wait on it.
     retired: AtomicBool,
+    /// Non-zero encoded recovery epoch (`epoch.wrapping_add(1)`) while `state.published` holds a
+    /// live `PublishedSource` snapshot, or `0` when unpublished.
+    published_epoch: AtomicU64,
+    /// Set atomically when a firmware kick depends on this source so replay/retirement
+    /// observes consumers without scanning producer queues under the device mutex.
+    firmware_consumer: AtomicBool,
 }
 
 impl Submission {
+    fn encode_epoch(epoch: u64) -> u64 {
+        epoch.wrapping_add(1)
+    }
     fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
         let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
         Self::with_work(Some(work), firmware_source)
     }
     fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
+        let vm_status = work.as_ref().map(|work| work.status().clone());
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State { work, ready: None }, "G17 submission work state"),
+                state <- new_mutex!(
+                    State { work, ready: None, published: None },
+                    "G17 submission work state"
+                ),
+                vm_status,
                 remaining: AtomicU8::new(1),
                 error: AtomicI32::new(0),
                 owners: AtomicU8::new(1),
                 firmware_source,
                 retired: AtomicBool::new(false),
+                published_epoch: AtomicU64::new(0),
+                firmware_consumer: AtomicBool::new(false),
             }),
             GFP_KERNEL,
         )
@@ -275,14 +304,54 @@ impl Submission {
         Ok(complete)
     }
     pub(super) fn same_vm(&self, status: &Arc<super::status::VmStatus>) -> bool {
-        self.state
-            .lock()
-            .work
+        self.vm_status
             .as_ref()
-            .is_some_and(|work| Arc::ptr_eq(work.status(), status))
+            .is_some_and(|vm| Arc::ptr_eq(vm, status))
     }
     pub(super) fn ready(&self) -> Option<Fence> {
         self.state.lock().ready.clone()
+    }
+    pub(super) fn set_published(&self, source: PublishedSource) {
+        if !self.firmware_source {
+            return;
+        }
+        let tag = Self::encode_epoch(source.epoch);
+        let mut state = self.state.lock();
+        if state.work.is_some()
+            && self.error.load(Ordering::Acquire) == 0
+            && !self.retired.load(Ordering::Acquire)
+        {
+            state.published = Some(source);
+            self.published_epoch.store(tag, Ordering::Release);
+        }
+    }
+    pub(super) fn clear_published(&self) {
+        if self.published_epoch.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        let old = self.state.lock().published.take();
+        drop(old);
+    }
+    pub(super) fn published_source(&self, epoch: u64) -> Option<PublishedSource> {
+        if !self.has_published_epoch(epoch) {
+            return None;
+        }
+        let state = self.state.lock();
+        state
+            .published
+            .as_ref()
+            .filter(|source| source.epoch == epoch)
+            .cloned()
+    }
+    pub(super) fn has_published_epoch(&self, epoch: u64) -> bool {
+        let tag = Self::encode_epoch(epoch);
+        self.firmware_source && tag != 0 && self.published_epoch.load(Ordering::Acquire) == tag
+    }
+    pub(super) fn note_firmware_consumer(&self) {
+        self.firmware_consumer.store(true, Ordering::Release);
+    }
+    pub(super) fn has_firmware_consumer(&self) -> bool {
+        self.firmware_consumer.load(Ordering::Acquire)
     }
     fn set_ready(&self, ready: Fence) {
         if !self.firmware_source {
@@ -294,14 +363,16 @@ impl Submission {
         }
     }
     fn note_error(&self, error: Error) -> bool {
+        self.clear_published();
         self.error
             .compare_exchange(0, error.to_errno(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
     fn release_state(&self) {
+        self.published_epoch.store(0, Ordering::Release);
         let old = {
             let mut state = self.state.lock();
-            (state.work.take(), state.ready.take())
+            (state.work.take(), state.ready.take(), state.published.take())
         };
         drop(old);
     }
@@ -406,7 +477,17 @@ impl Member {
         let source = self.aggregate.source();
         if source.firmware_source {
             source.retired.store(true, Ordering::Release);
+            source.clear_published();
         }
+    }
+    pub(super) fn note_published(&self, published: PublishedSource) {
+        self.aggregate.source().set_published(published);
+    }
+    pub(super) fn clear_published(&self) {
+        self.aggregate.source().clear_published();
+    }
+    pub(super) fn has_firmware_consumer(&self) -> bool {
+        self.aggregate.source().has_firmware_consumer()
     }
     pub(crate) fn complete(&self, result: Result) {
         if !self.complete.swap(true, Ordering::AcqRel) {
@@ -526,7 +607,7 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 
 pub(crate) struct Outputs {
     fallback: Option<UniqueFence<ExportFence>>,
-    syncs: KVec<SyncItem>,
+    syncs: KVVec<SyncItem>,
     input_count: usize,
     submission: Option<Aggregate>,
     result: Result,
@@ -535,7 +616,7 @@ pub(crate) struct Outputs {
 impl Outputs {
     pub(crate) fn new(
         contexts: &FenceContexts,
-        mut syncs: KVec<SyncItem>,
+        mut syncs: KVVec<SyncItem>,
         input_count: usize,
         allocation_failure: &Fence,
     ) -> Result<Self> {

@@ -12,7 +12,9 @@
 #include <linux/phy/phy.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/display.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/workqueue.h>
@@ -226,6 +228,17 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
 }
 
+bool dcp_t8132_ext_m4_node(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8132-dcpext") &&
+	       !apple_t8132_dcpext_v27_2(np);
+}
+
+bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return dcp_t8132_ext_m4_node(dcp->dev->of_node);
+}
+
 /*
  * A route of an adopted T8132 dcpext whose PHY has no DP alt mode: the
  * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
@@ -234,15 +247,10 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
-	if (!of_device_is_compatible(route->dcp->dev->of_node, "apple,t8132-dcpext"))
+	if (!dcp_is_t8132_ext(route->dcp))
 		return false;
 	return IS_ERR_OR_NULL(route->phy) ||
 	       !of_property_read_bool(route->phy->dev.of_node, "apple,dp-alt-mode");
-}
-
-bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
-{
-	return of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
 }
 
 /*
@@ -564,6 +572,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dpxbar_preselect(struct mux_control *mux, int state);
 static bool dcp_xbar_t8142(struct mux_control *mux);
+static bool dcp_xbar_t6041(struct mux_control *mux);
 
 static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 {
@@ -578,6 +587,7 @@ static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 	return ret;
 }
 
+/* A desktop external processor on firmware 27: T6041's, or the J773g's T8132 one. */
 static bool dcp_t6041_ext_v27(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->desktop_external;
@@ -843,11 +853,13 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			} else {
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
 				/*
-				 * The T8142-layout crossbar writes an output only when it
-				 * is selected: one never selected is idle already.
+				 * The T8142-layout and runtime-PM T6041
+				 * crossbars write an output only when it is
+				 * selected: one never selected is idle already.
 				 */
 				if (ret == -EOPNOTSUPP &&
 				    (dcp_xbar_t8142(route->active_xbar) ||
+				     dcp_xbar_t6041(route->active_xbar) ||
 				     dcp_typec_route_no_dp_alt(route)))
 					ret = 0;
 			}
@@ -2296,17 +2308,27 @@ static bool dcp_xbar_t8142(struct mux_control *mux)
 					      "apple,t8142-display-crossbar");
 }
 
+/* The T6041-layout crossbar (one per ATC on T6040/T6041) */
+static bool dcp_xbar_t6041(struct mux_control *mux)
+{
+	return mux && of_device_is_compatible(mux->chip->dev.parent->of_node,
+					      "apple,t6041-display-crossbar");
+}
+
 /*
  * Tunnel routes whose crossbar must point the DP IN output at its pipeline
  * before the firmware uses AUX through it, i.e. from DCP's Activate: the T6030
- * 14.7 pipeline on its T602X crossbar (other T602X tunnels keep their order)
- * and firmware 27 on the T8142-layout crossbar. Selecting routes the output
- * only; its clocks follow the link.
+ * 14.7 pipeline on its T602X crossbar (other T602X tunnels keep their order),
+ * the T6041 crossbar on every firmware (its runtime-PM path only writes the
+ * mux while selected), and firmware 27 on the T8142-layout crossbar. Selecting
+ * routes the output only; its clocks follow the link.
  */
 static bool dcp_t602x_tunnel_route(struct apple_dcp_typec_route *route)
 {
 	if (!route || !route->tunnel || !route->active_xbar)
 		return false;
+	if (dcp_xbar_t6041(route->active_xbar))
+		return true;
 	if (route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		return dcp_xbar_t8142(route->active_xbar);
 	return route->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
@@ -2417,6 +2439,12 @@ static int dcp_tunnel_split_up_locked(struct apple_dcp *dcp)
 		ret = mux_control_try_select(dcp->split.xbar, dcp->split.mux_state);
 		if (!ret)
 			dcp->split.xbar_up = true;
+		/*
+		 * T6041 DP IN selection reserves and routes the mux only, so
+		 * the first link up also enables the connection clocks.
+		 */
+		if (!ret && dcp_xbar_t6041(dcp->split.xbar))
+			ret = dcp_dpxbar_link(dcp->split.xbar, true);
 	} else {
 		ret = dcp_dpxbar_link(dcp->split.xbar, true);
 	}
@@ -2555,15 +2583,13 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit)
 		if (!ret)
 			route->xbar_up = true;
 		/*
-		 * T602X DP IN selection reserves and routes the mux only, so the
-		 * first link up also enables the connection. The T6041 crossbar
-		 * (M4 Pro/Max) takes the same T6030 flow on every firmware: without
-		 * this its clocks stay off until a retrain, and a mode set that
-		 * keeps the trained link (5K on 26.6) never gets any video.
+		 * T602X, T6041 and T8142 DP IN selection reserves and routes
+		 * the mux only, so the first link up also enables the
+		 * connection: without this its clocks stay off until a
+		 * retrain, and a mode set that keeps the trained link (5K on
+		 * 26.6) never gets any video.
 		 */
-		if (!ret && (dcp_t602x_tunnel_route(route) ||
-			     of_device_is_compatible(route->active_xbar->chip->dev.parent->of_node,
-						     "apple,t6041-display-crossbar"))) {
+		if (!ret && dcp_t602x_tunnel_route(route)) {
 			ret = dcp_tunnel_xbar_configure(route);
 			if (!ret)
 				ret = dcp_dpxbar_link(route->active_xbar, true);
@@ -2857,6 +2883,14 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active)
 	if (unit) {
 		if (!dcp->split.active || !dcp->split.generation || !dcp->split.set_active)
 			return 0;
+		if (active && dcp_xbar_t6041(dcp->split.xbar) &&
+		    !dcp->split.xbar_up) {
+			ret = mux_control_try_select(dcp->split.xbar,
+						     dcp->split.mux_state);
+			if (ret)
+				return ret;
+			dcp->split.xbar_up = true;
+		}
 		return dcp->split.set_active(dcp->split.binding, active);
 	}
 	/* Route the upstream engine before firmware begins AUX negotiation.
@@ -5032,8 +5066,10 @@ static int dcp_register_typec_routes_present(void *data)
 		dcp->nr_typec_routes++;
 	}
 
-	if (!dcp->nr_typec_routes)
-		return dev_err_probe(dev, -EINVAL, "Type-C route container is empty\n");
+	if (!dcp->nr_typec_routes) {
+		dev_info(dev, "no usable Type-C display routes\n");
+		return 0;
+	}
 
 	dcp->phy_managed_by_typec = true;
 	return 0;
@@ -5064,8 +5100,12 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 	struct device_node *routes __free(device_node) =
 		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
 	struct dcp_route_probe_context ctx = { .dcp = dcp, .routes = routes };
+	bool has_routes = dcp_typec_routes_available(routes);
 
-	return dcp_fabric_run_probe(!!routes, dcp_register_typec_routes_present, &ctx);
+	if (routes && !has_routes)
+		dev_info(dcp->dev, "no usable Type-C display routes\n");
+
+	return dcp_fabric_run_probe(has_routes, dcp_register_typec_routes_present, &ctx);
 }
 
 /*

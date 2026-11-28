@@ -11,7 +11,7 @@ r=r'''
 #![allow(dead_code,unused_variables)]
 use std::pin::Pin;use std::sync::atomic::{AtomicU32,Ordering};
 type Result<T=()> = std::result::Result<T,i32>;const ERESTARTSYS:i32=512;const EBUSY:i32=16;
-type KVec<T>=Vec<T>;type KBox<T>=Box<T>;
+type KVec<T>=Vec<T>;type KVVec<T>=Vec<T>;type KBox<T>=Box<T>;
 mod xarray{pub struct XArray<T>(pub T);}
 mod file{pub struct SyncItem;pub struct Object;}
 mod driver{pub struct AsahiRegData<'a>(pub &'a ());}

@@ -699,5 +699,91 @@
 				     0x5003c0000 0x5003e4000>;
 };
 
+/*
+ * The scaler/CSC (ADT scaler0, MSR) and its DART. It has no board wiring,
+ * so it is enabled on every M4 Pro.
+ */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+/*
+ * The ProRes encoder (ADT apr0) and its DART. It has no board wiring, so it
+ * is enabled on every M4 Pro. The engine runs with SCODEC_STREAMING (and so
+ * SCODEC) powered. The driver has built-in power-up rows for it; an optional
+ * apple/prores-t6041-init.bin replaces them.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
 #include "t6040-usb4.dtsi"
 #include "t6040-pciec.dtsi"
+
+/*
+ * The SIO coprocessor is part of every T6040 and has no board wiring: iBoot
+ * loads its firmware on every board, and the boot loader enables the SIO
+ * node, which it finds by the alias, once it has reserved that firmware and
+ * published the T6041 boot tables. The SIO AES engine sits behind its DART.
+ */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+/*
+ * The SIO firmware drives the SPI, UART and DP audio shims, so keep their
+ * parents on while it runs, as on T6000, T8112 and T8140. The ADT lists
+ * only SIO as SIO_CPU's parent. Without this, SPI_P stays on only because
+ * the QSPI controller never runtime-suspends, and UART_P is left as iBoot
+ * set it; a T8140 SIO with SPI_P/UART_P off crashes at boot.
+ */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};

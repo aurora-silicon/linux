@@ -136,7 +136,8 @@ static void v14_bl_boards(struct kunit *test)
 	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s", NULL };
 	static const char *const t6030_j514s[] = { "apple,t6030-dcp", "apple,j514s", NULL };
 	static const char *const j613[] = { "apple,t8122-dcp", "apple,j613", NULL };
-	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615", NULL };
+	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615", "apple,panel-j615" };
+	static const char *const j615_no_panel[] = { "apple,t8122-dcp", "apple,j615", NULL };
 	static const char *const j504[] = { "apple,t8122-dcp", "apple,j504", "apple,panel-j504" };
 	static const char *const j504_no_panel[] = { "apple,t8122-dcp", "apple,j504", NULL };
 	static const char *const j516c[] = { "apple,t6031-dcp", "apple,j516c", NULL };
@@ -166,11 +167,14 @@ static void v14_bl_boards(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j613));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j615));
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
 				     j615, &known);
-	KUNIT_ASSERT_NOT_NULL(test, board);
-	KUNIT_EXPECT_FALSE(test, board->panel_nits);
+	KUNIT_ASSERT_PTR_EQ(test, board, &dcp_v14_board_j615);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j615));
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j615_no_panel, &known);
+	KUNIT_EXPECT_NULL(test, board);
+	KUNIT_EXPECT_TRUE(test, known);
 	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
 				     j504, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
@@ -374,13 +378,13 @@ static bool v14_bl_queued(struct apple_dcp_v14 *v14)
 }
 
 /*
- * The production paths on J615 and J514C: no policy is consulted, no
+ * The production paths on J514C: no policy is consulted, no
  * level is encoded, the work does nothing, sleep leaves the gate alone.
  */
 static void v14_bl_other_boards_untouched(struct kunit *test)
 {
 	const struct dcp_v14_board *boards[] = {
-		&dcp_v14_board_j615, &dcp_v14_board_j514c,
+		&dcp_v14_board_j514c,
 	};
 	struct dcp_backlight_present present;
 	unsigned int i;
@@ -498,6 +502,11 @@ static void v14_bl_t6030_swap_levels(struct kunit *test)
 	v14_bl_swap_levels(test, &dcp_v14_board_t6030);
 }
 
+static void v14_bl_j615_swap_levels(struct kunit *test)
+{
+	v14_bl_swap_levels(test, &dcp_v14_board_j615);
+}
+
 static void v14_bl_j613_swap_levels(struct kunit *test)
 {
 	v14_bl_swap_levels(test, &dcp_v14_board_j613);
@@ -612,6 +621,7 @@ static struct kunit_case v14_backlight_cases[] = {
 	KUNIT_CASE(v14_bl_external_untouched),
 	KUNIT_CASE(v14_bl_t6030_swap_levels),
 	KUNIT_CASE(v14_bl_j613_swap_levels),
+	KUNIT_CASE(v14_bl_j615_swap_levels),
 	KUNIT_CASE(v14_bl_t6030_gate),
 	KUNIT_CASE(v14_bl_t6030_work),
 	{}

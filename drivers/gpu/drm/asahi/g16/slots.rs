@@ -12,43 +12,80 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
+use super::fw::buffer;
 use super::fw::work::{barrier, compute, fs, ta};
-use super::graph::{alloc, alloc_work, Client};
-use super::hw::{client, sizes};
+use super::graph::{alloc, Client};
+use super::hw::{client, engine, sizes};
 use super::object::{Class, Factory, FwLease, FwObject, Objects};
 use super::pools::lifetime::Lifetime;
 
-/// The compute command records of one hardware compute unit index (microsequence and barrier
-/// records), shared by every VM's [`ComputeSlot`] bound to that hardware unit: the unit index
-/// is device-global and claimed by one flight at a time. The host writes them before
-/// publication and never reads back what the firmware writes, so they take the firmware-cached
-/// [`Class::FwCoherent`] view macOS 26B123 gives its per-queue command objects, with no client
-/// or lower alias.
+/// The compute command records of one hardware compute unit index (work image, microsequence, and
+/// barrier records), shared by every VM's [`ComputeSlot`] bound to that hardware unit: the unit
+/// index is device-global and claimed by one flight at a time. The host writes them before
+/// publication and they take the firmware-cached [`Class::FwCoherent`] view macOS 26B123 gives its
+/// per-queue command objects; the work image keeps its uncached kernel GPU task lower alias and
+/// cleans host stores to PoC for the GPU, matching [`PassCmds`].
 #[derive(Clone)]
 pub(crate) struct UnitCmds {
+    pub(crate) work: Arc<FwObject>,
     pub(crate) seq: Arc<FwObject>,
     pub(crate) barrier: Arc<FwObject>,
 }
 
 impl UnitCmds {
-    /// Allocates one compute unit index's command records from a device-lifetime allocator
+    /// Allocates hardware compute unit `k`'s command records from a device-lifetime allocator
     /// ([`Factory::persistent_objects`]), which the caller never drops.
-    pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+    #[allow(dead_code)]
+    pub(crate) fn new(o: &mut Objects, k: u64) -> Result<Self> {
+        let (mut work, mut seq, mut barrier) = (None, None, None);
+        Self::init_into(o, k, &mut work, &mut seq, &mut barrier)
+    }
+
+    /// Populates any missing persistent command records for hardware compute unit `k` into the
+    /// caller-owned slots so partial failure retains already-mapped `FwCoherent` records instead
+    /// of leaking or re-allocating them on retry.
+    pub(crate) fn init_into(
+        o: &mut Objects,
+        k: u64,
+        work: &mut Option<Arc<FwObject>>,
+        seq: &mut Option<Arc<FwObject>>,
+        barrier: &mut Option<Arc<FwObject>>,
+    ) -> Result<Self> {
         let coherent = Class::FwCoherent;
-        Ok(Self {
-            seq: alloc(o, compute::SEQ_SIZE, coherent, None, 0, false)?,
-            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
-            barrier: alloc(
+        if work.is_none() {
+            *work = Some(o.alloc(super::object::Request {
+                size: compute::WORK_SIZE,
+                class: coherent,
+                placement: super::object::Placement::Anywhere,
+                offset: 0,
+                client: None,
+                lower: Some(client::WORK_PAGE + k * client::CWORK_STRIDE),
+                cpu: true,
+            })?);
+        }
+        if seq.is_none() {
+            *seq = Some(alloc(o, compute::SEQ_SIZE, coherent, None, 0, false)?);
+        }
+        if barrier.is_none() {
+            // Holds fs2c (+0x00) and per-pipe c2c (+(1 + pipe) * barrier::SIZE) barriers in 1 page.
+            *barrier = Some(alloc(
                 o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
+                barrier::SIZE * (1 + sizes::COMPUTE_PIPES),
                 coherent,
                 None,
                 0,
                 false,
-            )?,
+            )?);
+        }
+        Ok(Self {
+            work: work.as_ref().ok_or(EINVAL)?.clone(),
+            seq: seq.as_ref().ok_or(EINVAL)?.clone(),
+            barrier: barrier.as_ref().ok_or(EINVAL)?.clone(),
         })
     }
 }
+
+const _: () = assert!(barrier::SIZE * (1 + sizes::COMPUTE_PIPES) <= super::hw::PAGE as usize);
 
 /// One immutable allocation set. Mutable firmware pool cursors survive successful reuse.
 pub(crate) struct ComputeSlot {
@@ -58,6 +95,7 @@ pub(crate) struct ComputeSlot {
     pub(crate) seq: Arc<FwObject>,
     #[allow(dead_code)]
     pub(crate) barrier: Arc<FwObject>,
+    pub(crate) descriptor: Arc<FwObject>,
     pub(crate) pool: Arc<FwObject>,
     pub(crate) pool_state: Arc<FwObject>,
     pub(crate) page_list: Arc<FwObject>,
@@ -66,9 +104,8 @@ pub(crate) struct ComputeSlot {
     pub(crate) aux: Arc<FwObject>,
     /// Freelist entries of the unit's UMA pool, seeded once ([`init_uma_pool`]).
     pub(crate) seeds: u32,
-    /// VM-free firmware lease keeping `work` (containing the compute UMA manager at `+0xe00`)
-    /// and `counter` mapped in context-0 UAT until a later compute retirement overwrites
-    /// firmware `uma_mgr_table[1 + k]`.
+    /// VM-free firmware lease keeping this unit's `descriptor` and `counter` mapped in context-0
+    /// UAT until a later compute retirement overwrites firmware `uma_mgr_table[1 + k]`.
     uma_lease: Arc<FwLease>,
 }
 
@@ -104,13 +141,6 @@ impl Placement {
             Placement::Base => client::compute_state(k),
             Placement::Scs { .. } => self.pool(k) + self.pool_bytes() as u64,
         }
-    }
-    fn work(self, k: u64) -> u64 {
-        let index = match self {
-            Placement::Base => k,
-            Placement::Scs { .. } => sizes::COMPUTE_UNITS as u64 + k,
-        };
-        client::WORK_PAGE + index * client::CWORK_STRIDE
     }
     /// Freelist entries of the unit's pool.
     pub(crate) fn seeds(self) -> u32 {
@@ -187,24 +217,29 @@ impl ComputeSlot {
         k: u64,
         cmds: &UnitCmds,
     ) -> Result<Self> {
-        Self::new_in(o, fw_factory, k, Placement::Base, cmds)
+        Self::new_in(o, fw_factory, k, k as u32, Placement::Base, cmds)
     }
 
-    /// Unit `k` at `placement`, around the device-lifetime command records `cmds` of its
-    /// hardware ledger slot.
+    /// Unit `k` at `placement` bound to hardware ledger slot `hw_slot`, around the device-lifetime
+    /// command records `cmds` of `hw_slot`.
     pub(crate) fn new_in(
         o: &mut Objects,
         fw_factory: &Factory,
         k: u64,
+        hw_slot: u32,
         placement: Placement,
         cmds: &UnitCmds,
     ) -> Result<Self> {
         placement.check()?;
         let sh = Class::Shared;
         let state = placement.state(k);
+        // Keep the per-VM UMA manager descriptor and submission counter in one VM-free Class::Fw
+        // page inside `uma_lease` (matching `pools::Allocator`) while `work`, `seq`, and `barrier`
+        // live in device-lifetime `Class::FwCoherent` `UnitCmds`.
         let mut fw = fw_factory.fw_objects();
-        let work = alloc_work(&mut fw, 0x2000, placement.work(k), 0)?;
-        let counter = alloc(&mut fw, 0x80, sh, None, 0, false)?;
+        let uma_page = alloc(&mut fw, 0x200, Class::Fw, None, 0, false)?;
+        let descriptor = FwObject::view(&uma_page, 0, compute::DESCRIPTOR_SIZE)?;
+        let counter = FwObject::view(&uma_page, 0x100, 0x80)?;
         let uma_lease = FwLease::new(fw)?;
         let unit = Self {
             its: alloc(o, 16, sh, None, 0, false)?,
@@ -216,9 +251,10 @@ impl ComputeSlot {
                 0,
                 false,
             )?,
-            work,
+            work: cmds.work.clone(),
             seq: cmds.seq.clone(),
             barrier: cmds.barrier.clone(),
+            descriptor,
             pool: o.alloc(super::object::Request {
                 size: placement.pool_bytes(),
                 class: sh,
@@ -270,10 +306,23 @@ impl ComputeSlot {
             unit.pool.gva.ok_or(EINVAL)?,
             unit.seeds,
         )?;
+        unit.descriptor.write(
+            0,
+            &buffer::compute_uma_manager_image(
+                unit.work.va,
+                engine::COMPUTE_UMA_SLOT + hw_slot,
+                unit.pool_state.gva.ok_or(EINVAL)?,
+                unit.page_list.gva.ok_or(EINVAL)?,
+                unit.counter.va,
+                unit.seeds,
+                super::rt::freelist_records(unit.seeds),
+            ),
+        )?;
         Ok(unit)
     }
 
-    /// VM-free firmware lease keeping this unit's `work` and `counter` mapped in context-0 UAT.
+    /// VM-free firmware lease keeping this unit's `descriptor` and `counter` mapped in context-0
+    /// UAT.
     pub(crate) fn uma_lease(&self) -> Arc<FwLease> {
         self.uma_lease.clone()
     }
@@ -1392,40 +1441,67 @@ impl Slots {
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
+        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+        // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
+        // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
+        // secondary pipes keep maximum unit headroom.
+        let tiers: [u32; 2] = if pipe == 0 {
+            [allowed & p0_mask, allowed & !p0_mask]
+        } else {
+            [allowed, 0]
+        };
         let mut chosen = None;
         if let Some(id) = vm_id {
-            for i in 0..n {
-                let k = (base_cursor + i) % n;
-                if (allowed & (1u32 << k)) != 0
-                    && !self.compute.scrub_full[k]
-                    && self.compute.owner[k]
-                        .as_ref()
-                        .is_some_and(|prev| prev.id == id)
-                    && self.compute.lifetime.claim(k)
-                {
-                    chosen = Some(k);
-                    break;
+            // 1. Reuse a warm unit already owned by `vm_id` (preferring pipe-0-exclusive units).
+            'warm: for tier in tiers {
+                if tier == 0 {
+                    continue;
                 }
-            }
-            if chosen.is_none() {
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (allowed & (1u32 << k)) != 0
-                        && self.compute.owner[k].is_none()
+                    if (tier & (1u32 << k)) != 0
+                        && !self.compute.scrub_full[k]
+                        && self.compute.owner[k]
+                            .as_ref()
+                            .is_some_and(|prev| prev.id == id)
                         && self.compute.lifetime.claim(k)
                     {
                         chosen = Some(k);
-                        break;
+                        break 'warm;
+                    }
+                }
+            }
+            // 2. Claim an unowned unit before stealing another VM's warm unit.
+            if chosen.is_none() {
+                'unowned: for tier in tiers {
+                    if tier == 0 {
+                        continue;
+                    }
+                    for i in 0..n {
+                        let k = (base_cursor + i) % n;
+                        if (tier & (1u32 << k)) != 0
+                            && self.compute.owner[k].is_none()
+                            && self.compute.lifetime.claim(k)
+                        {
+                            chosen = Some(k);
+                            break 'unowned;
+                        }
                     }
                 }
             }
         }
+        // 3. Fall back to round-robin over any available unit (preferring pipe-0-exclusive).
         if chosen.is_none() {
-            for i in 0..n {
-                let k = (base_cursor + i) % n;
-                if (allowed & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
-                    chosen = Some(k);
-                    break;
+            'any: for tier in tiers {
+                if tier == 0 {
+                    continue;
+                }
+                for i in 0..n {
+                    let k = (base_cursor + i) % n;
+                    if (tier & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
+                        chosen = Some(k);
+                        break 'any;
+                    }
                 }
             }
         }

@@ -223,6 +223,55 @@ int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t 
  */
 int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
+struct device_node;
+struct platform_device;
+
+#define APPLE_SMC_WARM_RESET_WRITES	4
+
+/**
+ * struct apple_smc_warm_reset - a PCIe endpoint's reset through an SMC key
+ * @smc: the SMC's device (a reference, dropped by apple_smc_warm_reset_put())
+ * @key: the key to write
+ * @count: how many writes
+ * @writes: per write, the key's value (its bytes from the cell's most significant down)
+ *	and the wait after it in microseconds
+ *
+ * Read from a PCIe root port's "apple,function-warm-reset" and "apple,warm-reset-writes"
+ * (bindings/pci/apple,pcie.yaml).
+ */
+struct apple_smc_warm_reset {
+	struct platform_device *smc;
+	smc_key key;
+	unsigned int count;
+	u32 writes[2 * APPLE_SMC_WARM_RESET_WRITES];
+};
+
+/**
+ * apple_smc_warm_reset_parse - read a root port's warm reset
+ * @np: the root port's node
+ * @wr: filled in on success
+ *
+ * Return: Zero on success, -ENODEV when the port describes none or its SMC has no device,
+ * -EINVAL when the writes are malformed.
+ */
+int apple_smc_warm_reset_parse(struct device_node *np, struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset_put - drop the reference apple_smc_warm_reset_parse() took
+ * @wr: the parsed reset; cleared
+ */
+void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset - give a parsed warm reset
+ * @wr: the parsed reset
+ * @noirq: from another device's noirq callbacks: the replies are polled for and the waits
+ *	busy-wait, as for apple_smc_write_noirq()
+ *
+ * Return: Zero on success, -ENODEV when the SMC isn't bound, or the first write's error.
+ */
+int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq);
+
 /**
  * apple_smc_enter_atomic - Enter atomic mode to be able to use apple_smc_write_atomic
  * @smc: Pointer to apple_smc struct

@@ -268,8 +268,14 @@ impl gpu::Gpu for Backend {
             self.feature_flags() & uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY as u64 != 0,
             self.feature_flags() & uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY as u64 != 0)?,GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>) -> Result<crate::timestamp::Buffer> {
+    fn timestamp_window_size(&self) -> u64 {
+        crate::m3::agx_memory::TIMESTAMP_RANGE.end - crate::m3::agx_memory::TIMESTAMP_RANGE.start
+    }
+
+    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>, window: crate::timestamp::WindowPermit) -> Result<crate::timestamp::Buffer> {
+        if !window.is_allowed() { return Err(ENOSPC); }
         crate::timestamp::Buffer::firmware(
-            Option::as_mut(&mut *self.shared.lock()).ok_or(ENODEV)?.map_timestamp(bo,range)?)
+            Option::as_mut(&mut *self.shared.lock()).ok_or(ENODEV)?.map_timestamp(bo,range)?,
+            window.into_share())
     }
 }

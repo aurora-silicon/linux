@@ -9,6 +9,7 @@
 
 use super::Output;
 use crate::g17::{dependency::PRODUCER_FAILED, status::VmStatus};
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::{new_mutex, prelude::*, sync::{Arc, Mutex}};
 
 type Links = Option<KBox<Link>>;
@@ -28,6 +29,9 @@ struct State {
     predecessor_error: Option<Error>,
     claimed: bool,
     published: Option<Result>,
+    // All predecessors published cleanly while this timestamp-free publication
+    // still has no result of its own; successors have already been released.
+    upstream_released: bool,
     successors: Links,
 }
 
@@ -49,16 +53,27 @@ impl State {
 pub(crate) struct Publication {
     output: Output,
     status: Arc<VmStatus>,
+    has_outputs: bool,
+    // True while this publication may still write host timestamps or deliver a
+    // deferred predecessor error. Cleared only once no host write or error
+    // remains, and never set again.
+    pending: AtomicBool,
     #[pin]
     state: Mutex<State>,
 }
 
 impl Publication {
-    pub(super) fn new(output: Output, status: Arc<VmStatus>) -> Result<Arc<Self>> {
+    pub(super) fn new(
+        output: Output,
+        status: Arc<VmStatus>,
+        has_outputs: bool,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 output,
                 status,
+                has_outputs,
+                pending: AtomicBool::new(true),
                 state <- new_mutex!(State {
                     // Acceptance installs all links before releasing this sentinel.
                     remaining: 1,
@@ -66,6 +81,7 @@ impl Publication {
                     predecessor_error: None,
                     claimed: false,
                     published: None,
+                    upstream_released: false,
                     successors: None,
                 }, "G17 host timestamp publication"),
             }),
@@ -75,6 +91,17 @@ impl Publication {
 
     pub(super) fn output(&self) -> &Output {
         &self.output
+    }
+
+    /// Whether this command itself writes host timestamps.
+    pub(crate) fn has_outputs(&self) -> bool {
+        self.has_outputs
+    }
+
+    /// Whether this publication still has an unpublished host timestamp write
+    /// or an unresolved or failed predecessor chain.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
     }
 
     /// One terminal result, offered separately from its physical-retirement proof.
@@ -100,13 +127,16 @@ impl Publication {
                 self.status.report_failure(error);
             }
         }
-        self.output.publish(result);
+        self.output.publish(result, &self.status);
         let result = result.map(|_| ());
         let mut links = {
             let mut state = self.state.lock();
             // A late link is acknowledged only after timestamp writes, the public
             // fence and aggregate membership have all been published off this lock.
             state.published = Some(result);
+            if result.is_ok() {
+                self.pending.store(false, Ordering::Release);
+            }
             state.successors.take()
         };
         let mut next = links.as_mut();
@@ -118,31 +148,56 @@ impl Publication {
     }
 
     fn predecessor_done(&self, result: Result) -> Links {
-        let ready = {
+        let (ready, settled) = {
             let mut state = self.state.lock();
             debug_assert!(state.remaining != 0);
             if result.is_err() && state.predecessor_error.is_none() {
                 state.predecessor_error = Some(PRODUCER_FAILED);
             }
             state.remaining -= 1;
-            state.claim()
+            if let Some(ready) = state.claim() {
+                (Some(ready), None)
+            } else if state.remaining == 0
+                && !self.has_outputs
+                && state.predecessor_error.is_none()
+                && !state.upstream_released
+            {
+                // Every predecessor published cleanly and this command writes
+                // no host timestamps, so downstream commands need not wait on
+                // or chain behind its GPU execution.
+                state.upstream_released = true;
+                self.pending.store(false, Ordering::Release);
+                (None, state.successors.take())
+            } else {
+                (None, None)
+            }
         };
-        ready.and_then(|result| self.publish(result))
+        if let Some(result) = ready {
+            return self.publish(result);
+        }
+        let mut links = settled;
+        let mut next = links.as_mut();
+        while let Some(link) = next {
+            link.result = Ok(());
+            next = link.next.as_mut();
+        }
+        links
     }
 
     fn add_successor(&self, mut link: KBox<Link>) {
-        let published = {
+        let immediate = {
             let mut state = self.state.lock();
-            match state.published {
-                Some(result) => result,
-                None => {
-                    link.next = state.successors.take();
-                    state.successors = Some(link);
-                    return;
-                }
+            if let Some(result) = state.published {
+                result
+            } else if state.upstream_released {
+                Ok(())
+            } else {
+                link.next = state.successors.take();
+                state.successors = Some(link);
+                return;
             }
         };
-        Self::drain(link.target.predecessor_done(published));
+        Self::drain(link.target.predecessor_done(immediate));
     }
 
     /// Iterative depth-first notification, O(nodes + links), with no stack growth.
@@ -213,6 +268,7 @@ impl Publication {
     pub(crate) fn test_pair(
         contexts: &kernel::dma_fence::FenceContexts,
         status: &Arc<VmStatus>,
+        has_outputs: bool,
     ) -> Result<(Arc<Self>, kernel::dma_fence::Fence)> {
         let fence = crate::g17::fence::independent(contexts)?;
         let handle = kernel::dma_fence::Fence::from_fence(&fence);
@@ -221,7 +277,7 @@ impl Publication {
             member: crate::g17::fence::Aggregate::test_member(contexts)?,
             destinations: super::Destinations::empty(),
         };
-        Ok((Self::new(output, status.clone())?, handle))
+        Ok((Self::new(output, status.clone(), has_outputs)?, handle))
     }
 }
 
@@ -240,6 +296,7 @@ mod tests {
     fn make_pub(
         contexts: &FenceContexts,
         status: &Arc<VmStatus>,
+        has_outputs: bool,
     ) -> (Arc<Publication>, Fence) {
         let fence = independent(contexts).unwrap();
         let handle = Fence::from_fence(&fence);
@@ -248,16 +305,16 @@ mod tests {
             member: Aggregate::test_member(contexts).unwrap(),
             destinations: Destinations::empty(),
         };
-        (Publication::new(output, status.clone()).unwrap(), handle)
+        (Publication::new(output, status.clone(), has_outputs).unwrap(), handle)
     }
 
     #[test]
     fn consumer_retiring_before_delayed_producer_failure_inherits_error() {
         let contexts = FenceContexts::new(1, c_str!("asahi_pub_test"), KEY).unwrap();
         let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
-        let (producer, prod_fence) = make_pub(&contexts, &status);
-        let (consumer, cons_fence) = make_pub(&contexts, &status);
-        let (downstream, down_fence) = make_pub(&contexts, &status);
+        let (producer, prod_fence) = make_pub(&contexts, &status, true);
+        let (consumer, cons_fence) = make_pub(&contexts, &status, false);
+        let (downstream, down_fence) = make_pub(&contexts, &status, false);
 
         Prepared::new(producer.clone(), core::iter::empty()).unwrap().activate();
         Prepared::new(consumer.clone(), core::iter::once(&producer)).unwrap().activate();
@@ -275,5 +332,75 @@ mod tests {
         assert_eq!(fence_status(&prod_fence), EIO.to_errno());
         assert_eq!(fence_status(&cons_fence), PRODUCER_FAILED.to_errno());
         assert_eq!(fence_status(&down_fence), PRODUCER_FAILED.to_errno());
+        assert!(producer.is_pending());
+        assert!(consumer.is_pending());
+        assert!(downstream.is_pending());
+    }
+
+    #[test]
+    fn clean_producer_settles_timestamp_free_chain_while_in_flight() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_pub_settle"), KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let (producer, prod_fence) = make_pub(&contexts, &status, true);
+        let (consumer, cons_fence) = make_pub(&contexts, &status, false);
+        let (downstream, down_fence) = make_pub(&contexts, &status, false);
+
+        Prepared::new(producer.clone(), core::iter::empty()).unwrap().activate();
+        Prepared::new(consumer.clone(), core::iter::once(&producer)).unwrap().activate();
+        Prepared::new(downstream.clone(), core::iter::once(&consumer)).unwrap().activate();
+
+        assert!(producer.is_pending());
+        assert!(consumer.is_pending());
+        assert!(downstream.is_pending());
+
+        // Producer completes cleanly while consumer and downstream are still
+        // executing on the GPU: both timestamp-free publications settle at once
+        // without signalling their own completion fences early.
+        producer.finish(Ok([1, 2, 0, 0]));
+        assert!(fence_status(&prod_fence) > 0);
+        assert!(!producer.is_pending());
+        assert!(!consumer.is_pending());
+        assert!(!downstream.is_pending());
+        assert_eq!(fence_status(&cons_fence), 0);
+        assert_eq!(fence_status(&down_fence), 0);
+
+        // Downstream finishing before consumer still publishes immediately.
+        downstream.finish(Ok([5, 6, 0, 0]));
+        assert!(fence_status(&down_fence) > 0);
+        assert_eq!(fence_status(&cons_fence), 0);
+
+        consumer.finish(Ok([3, 4, 0, 0]));
+        assert!(fence_status(&cons_fence) > 0);
+    }
+
+    #[test]
+    fn settled_publication_failing_later_delivers_error_to_late_successor() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_pub_settle_err"), KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let (producer, _) = make_pub(&contexts, &status, true);
+        let (consumer, cons_fence) = make_pub(&contexts, &status, false);
+        let (early, early_fence) = make_pub(&contexts, &status, false);
+
+        Prepared::new(producer.clone(), core::iter::empty()).unwrap().activate();
+        Prepared::new(consumer.clone(), core::iter::once(&producer)).unwrap().activate();
+        Prepared::new(early.clone(), core::iter::once(&consumer)).unwrap().activate();
+
+        producer.finish(Ok([1, 2, 0, 0]));
+        assert!(!consumer.is_pending());
+        assert!(!early.is_pending());
+
+        // Consumer's own GPU execution later fails: early successor was already
+        // released at settlement, while a late successor added after publish
+        // observes consumer's error.
+        consumer.finish(Err(EIO));
+        assert_eq!(fence_status(&cons_fence), EIO.to_errno());
+
+        early.finish(Ok([3, 4, 0, 0]));
+        assert!(fence_status(&early_fence) > 0);
+
+        let (late, late_fence) = make_pub(&contexts, &status, false);
+        Prepared::new(late.clone(), core::iter::once(&consumer)).unwrap().activate();
+        late.finish(Ok([5, 6, 0, 0]));
+        assert_eq!(fence_status(&late_fence), PRODUCER_FAILED.to_errno());
     }
 }

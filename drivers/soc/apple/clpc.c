@@ -20,10 +20,14 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/atomic.h>
+#include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
 #include <linux/cpufreq.h>
 #include <linux/kref.h>
 #include <linux/ktime.h>
 #include <linux/of_platform.h>
+#include <linux/percpu.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/soc/apple/clpc.h>
@@ -40,6 +44,8 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
+#include <linux/tick.h>
+#include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -198,14 +204,37 @@ struct apple_clpc_ane {
 	struct delayed_work *wake;
 };
 
+struct apple_clpc;
+
+struct apple_clpc_idle_timer {
+	struct timer_list timer;
+	struct apple_clpc *clpc;
+	u64 last_idle;
+	u64 last_wall;
+};
+
 struct apple_clpc {
 	struct device *dev;
 	struct device *pmc;
 	const struct apple_clpc_hw *hw;
+	/*
+	 * The board's states for a CPU cluster busy in the top quarter of its
+	 * range (apple,cpu-busy-floor) outside the low-power profile, in place
+	 * of the top of @hw->map; GPU and ANE demand still use @hw. Unset:
+	 * @hw->map applies.
+	 */
+	u8 cpu_top[APPLE_CLPC_RAILS];
+	bool cpu_top_set;
 	unsigned int agent;
-	/* Samples while a vote is held; idle_work defers to busy CPUs. */
+	/* Samples while a vote is held; idle_work or per-CPU idle_timers defer to busy CPUs. */
 	struct delayed_work work;
 	struct delayed_work idle_work;
+	struct apple_clpc_idle_timer __percpu *idle_timers;
+	struct mutex idle_lock;
+	cpumask_t idle_online_cpus;
+	struct hlist_node cpuhp_node;
+	bool cpuhp_added;
+	atomic_t idle_armed;
 	struct mutex sample_lock;
 	bool stopped;
 	struct apple_clpc_cluster clusters[APPLE_CLPC_MAX_CLUSTERS];
@@ -603,6 +632,20 @@ static void apple_clpc_find_clusters(struct apple_clpc *clpc)
 	}
 }
 
+/*
+ * The state a busy CPU cluster in frequency quarter @q asks @rail for.
+ * The board's override applies outside the low-power platform profile,
+ * where macOS drops the single-thread busy floor.
+ */
+static unsigned int apple_clpc_cpu_state(const struct apple_clpc *clpc,
+					 unsigned int rail, unsigned int q)
+{
+	if (clpc->cpu_top_set && q == APPLE_CLPC_LEVELS - 1 &&
+	    !READ_ONCE(clpc->low_power))
+		return clpc->cpu_top[rail];
+	return clpc->hw->map[rail][q];
+}
+
 static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 				      struct apple_clpc_cluster *cl)
 {
@@ -652,7 +695,7 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT &&
 				    cl->streak >= clpc->hw->sustain ?
-				   clpc->hw->map[rail][q] : 0;
+				   apple_clpc_cpu_state(clpc, rail, q) : 0;
 }
 
 static unsigned int apple_clpc_vote(struct apple_clpc_vote *vote,
@@ -681,6 +724,131 @@ static u32 apple_clpc_floor(struct apple_clpc *clpc, const unsigned int *state)
 	return floor;
 }
 
+static enum cpuhp_state apple_clpc_cpuhp_state;
+
+static unsigned long apple_clpc_idle_step(void)
+{
+	return max_t(unsigned long, msecs_to_jiffies(APPLE_CLPC_SAMPLE_MS), 2);
+}
+
+static void apple_clpc_idle_timer_fn(struct timer_list *timer)
+{
+	struct apple_clpc_idle_timer *t = timer_container_of(t, timer, timer);
+	struct apple_clpc *clpc = t->clpc;
+	unsigned int cpu = smp_processor_id();
+	unsigned long step = apple_clpc_idle_step();
+	u64 wall, idle, dw, di;
+
+	if (READ_ONCE(clpc->stopped) || !atomic_read(&clpc->idle_armed))
+		return;
+
+	idle = get_cpu_idle_time(cpu, &wall, 0);
+	if (wall < t->last_wall || idle < t->last_idle) {
+		t->last_wall = wall;
+		t->last_idle = idle;
+		mod_timer(&t->timer, jiffies + step);
+		return;
+	}
+	dw = wall - t->last_wall;
+	if (dw < APPLE_CLPC_SAMPLE_MS * 1000ULL) {
+		mod_timer(&t->timer, jiffies + step);
+		return;
+	}
+	di = idle - t->last_idle;
+	t->last_wall = wall;
+	t->last_idle = idle;
+
+	/*
+	 * A CPU that only woke briefly for an IRQ or short timer stayed mostly
+	 * idle (or an out-of-order iowait/idle read yielded di > dw); re-arm
+	 * its pinned deferrable timer without waking a kworker.
+	 */
+	if (di > dw || (dw - di) * 100 < dw * APPLE_CLPC_BUSY_PCT) {
+		mod_timer(&t->timer, jiffies + step);
+		return;
+	}
+
+	if (atomic_cmpxchg(&clpc->idle_armed, 1, 0) == 1)
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &clpc->work, 0);
+}
+
+static int apple_clpc_cpu_online(unsigned int cpu, struct hlist_node *node)
+{
+	struct apple_clpc *clpc = hlist_entry_safe(node, struct apple_clpc,
+						   cpuhp_node);
+	struct apple_clpc_idle_timer *t;
+
+	if (!clpc || !clpc->idle_timers)
+		return 0;
+
+	guard(mutex)(&clpc->idle_lock);
+	cpumask_set_cpu(cpu, &clpc->idle_online_cpus);
+	if (READ_ONCE(clpc->stopped) || !atomic_read(&clpc->idle_armed))
+		return 0;
+
+	t = per_cpu_ptr(clpc->idle_timers, cpu);
+	timer_delete_sync(&t->timer);
+	t->last_idle = get_cpu_idle_time(cpu, &t->last_wall, 0);
+	t->timer.expires = jiffies + apple_clpc_idle_step();
+	add_timer_on(&t->timer, cpu);
+	return 0;
+}
+
+static int apple_clpc_cpu_down(unsigned int cpu, struct hlist_node *node)
+{
+	struct apple_clpc *clpc = hlist_entry_safe(node, struct apple_clpc,
+						   cpuhp_node);
+
+	if (!clpc || !clpc->idle_timers)
+		return 0;
+
+	/* Delete before CPU teardown migrates the pinned timer elsewhere. */
+	guard(mutex)(&clpc->idle_lock);
+	cpumask_clear_cpu(cpu, &clpc->idle_online_cpus);
+	timer_delete_sync(&per_cpu_ptr(clpc->idle_timers, cpu)->timer);
+	return 0;
+}
+
+/*
+ * Arm a pinned deferrable timer on every online CPU. Idle CPUs stay asleep
+ * (TIMER_DEFERRABLE never sends an IPI or wakes a NO_HZ CPU), while any busy
+ * CPU runs the callback once its tick resumes and kicks active CLPC sampling.
+ */
+static void apple_clpc_arm_idle(struct apple_clpc *clpc)
+{
+	unsigned long expires = jiffies + apple_clpc_idle_step();
+	unsigned int cpu;
+
+	/*
+	 * Serialize with CPU hotplug callbacks and halt via idle_lock (ordered
+	 * strictly inside cpuhp and sample_lock) rather than taking
+	 * cpus_read_lock() inside sample_lock.
+	 */
+	guard(mutex)(&clpc->idle_lock);
+	atomic_set(&clpc->idle_armed, 0);
+	smp_mb();
+	for_each_possible_cpu(cpu) {
+		struct apple_clpc_idle_timer *t = per_cpu_ptr(clpc->idle_timers, cpu);
+
+		timer_delete_sync(&t->timer);
+	}
+
+	for_each_cpu(cpu, &clpc->idle_online_cpus) {
+		struct apple_clpc_idle_timer *t = per_cpu_ptr(clpc->idle_timers, cpu);
+
+		t->last_idle = get_cpu_idle_time(cpu, &t->last_wall, 0);
+	}
+	atomic_set(&clpc->idle_armed, 1);
+	smp_mb();
+	for_each_cpu(cpu, &clpc->idle_online_cpus) {
+		struct apple_clpc_idle_timer *t = per_cpu_ptr(clpc->idle_timers, cpu);
+
+		t->timer.expires = expires;
+		add_timer_on(&t->timer, cpu);
+	}
+}
+
 static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 {
 	if (READ_ONCE(clpc->stopped))
@@ -704,9 +872,21 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 	/*
 	 * A held vote has to be sampled on time so that it drops once demand
 	 * stops; with no vote held, sampling can wait for a CPU that wakes up
-	 * anyway rather than waking an idle one every period, unless the SoC
-	 * samples on time (@idle_on_time).
+	 * anyway rather than waking an idle one every period. On SoCs with
+	 * @idle_on_time (and without nohz_full, which can stop ticks on busy
+	 * CPUs), arm a per-CPU deferrable timer across online CPUs so an idle
+	 * system takes zero CLPC wakeups. Preserve any fresh client demand
+	 * already queued on clpc->work.
 	 */
+	if (idle && clpc->idle_timers && !tick_nohz_full_enabled()) {
+		cancel_delayed_work(&clpc->idle_work);
+		if (delayed_work_pending(&clpc->work))
+			return;
+		apple_clpc_arm_idle(clpc);
+		return;
+	}
+
+	atomic_set(&clpc->idle_armed, 0);
 	idle = idle && !clpc->hw->idle_on_time;
 	/* A demand edge can queue work while the deferrable pass is pending.
 	 * Keep one sampling cadence once the serialized pass settles.
@@ -1064,6 +1244,7 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	unsigned int i, rail;
 	u32 reason = 0, floor = 0;
 
+	atomic_set(&clpc->idle_armed, 0);
 	clpc->samples++;
 	if (!cpumask_equal(clpc->covered, cpu_possible_mask) &&
 	    (!clpc->has_pmc || time_after_eq(now, clpc->next_scan))) {
@@ -1159,6 +1340,37 @@ static void apple_clpc_idle_work(struct work_struct *work)
 	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, idle_work));
 }
 
+/*
+ * apple,cpu-busy-floor: the DCS and fabric states, in that order, for a CPU
+ * cluster busy in the top quarter of its frequency range outside the low-power
+ * profile, where the board's measurement differs from the SoC's table. A bad
+ * value costs the override, not the driver.
+ */
+static void apple_clpc_cpu_top_init(struct apple_clpc *clpc)
+{
+	u32 top[APPLE_CLPC_RAILS];
+	unsigned int rail;
+	int ret;
+
+	if (!of_property_present(clpc->dev->of_node, "apple,cpu-busy-floor"))
+		return;
+	ret = of_property_read_u32_array(clpc->dev->of_node, "apple,cpu-busy-floor",
+					 top, APPLE_CLPC_RAILS);
+	for (rail = 0; !ret && rail < APPLE_CLPC_RAILS; rail++)
+		if (top[rail] > 0xf)
+			ret = -ERANGE;
+	if (ret || of_property_count_u32_elems(clpc->dev->of_node,
+					       "apple,cpu-busy-floor") != APPLE_CLPC_RAILS) {
+		dev_warn(clpc->dev, "invalid apple,cpu-busy-floor; using the SoC's states\n");
+		return;
+	}
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		clpc->cpu_top[rail] = top[rail];
+	clpc->cpu_top_set = true;
+	dev_info(clpc->dev, "busy CPU floor: DCS %u, fabric %u\n",
+		 clpc->cpu_top[APPLE_CLPC_DCS], clpc->cpu_top[APPLE_CLPC_SOC]);
+}
+
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_clpc *clpc = s->private;
@@ -1174,8 +1386,10 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 				   clpc->hw->rail[rail], clpc->vote[rail].state,
 				   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
 							   clpc->hw->rail[rail]),
-				   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
-				   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
+				   apple_clpc_cpu_state(clpc, rail, 0),
+				   apple_clpc_cpu_state(clpc, rail, 1),
+				   apple_clpc_cpu_state(clpc, rail, 2),
+				   apple_clpc_cpu_state(clpc, rail, 3));
 		seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
 			   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
 			   READ_ONCE(clpc->last_vote_ns));
@@ -1340,14 +1554,27 @@ static void apple_clpc_free_clusters(struct apple_clpc *clpc)
 /* Stop sampling and give the floor back, before suspend and on removal. */
 static void apple_clpc_halt(struct apple_clpc *clpc)
 {
-	unsigned int rail, i;
+	unsigned int rail, i, cpu;
 
 	/*
-	 * Each pass queues one of the two works unless stopped. A pass that
-	 * began before the flag was set can still queue the other work once,
-	 * which the second round cancels.
+	 * Each pass queues one of the two works (or arms per-CPU deferrable
+	 * timers) unless stopped. Cancel any in-flight pass first, drain every
+	 * per-CPU idle timer so none can re-queue work, then cancel once more.
 	 */
 	WRITE_ONCE(clpc->stopped, true);
+	atomic_set(&clpc->idle_armed, 0);
+	cancel_delayed_work_sync(&clpc->work);
+	cancel_delayed_work_sync(&clpc->idle_work);
+	if (clpc->idle_timers) {
+		scoped_guard(mutex, &clpc->idle_lock) {
+			for_each_possible_cpu(cpu) {
+				struct apple_clpc_idle_timer *t =
+					per_cpu_ptr(clpc->idle_timers, cpu);
+
+				timer_delete_sync(&t->timer);
+			}
+		}
+	}
 	for (i = 0; i < 2; i++) {
 		cancel_delayed_work_sync(&clpc->work);
 		cancel_delayed_work_sync(&clpc->idle_work);
@@ -1382,6 +1609,13 @@ static void apple_clpc_stop(void *data)
 	}
 	apple_clpc_ane_detach(clpc->ane);
 	debugfs_remove_recursive(clpc->debugfs);
+	WRITE_ONCE(clpc->stopped, true);
+	atomic_set(&clpc->idle_armed, 0);
+	if (clpc->cpuhp_added) {
+		cpuhp_state_remove_instance_nocalls(apple_clpc_cpuhp_state,
+						    &clpc->cpuhp_node);
+		clpc->cpuhp_added = false;
+	}
 	apple_clpc_halt(clpc);
 	/* The SMC keeps this mode after the driver's profile state is gone. */
 	mutex_lock(&clpc->sample_lock);
@@ -1742,6 +1976,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 				     "parent is not a PMC and no platform profile is available\n");
 
 	if (clpc->has_pmc) {
+		apple_clpc_cpu_top_init(clpc);
 		/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 		 * host publication/idle input, not that supplier state, drives demand;
 		 * the T8132 and M5 (T8142) GPU drivers report through the same input.
@@ -1839,8 +2074,36 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	apple_clpc_find_clusters(clpc);
 	clpc->next_scan = jiffies + HZ;
 	mutex_init(&clpc->sample_lock);
+	mutex_init(&clpc->idle_lock);
+	cpumask_clear(&clpc->idle_online_cpus);
 	INIT_DELAYED_WORK(&clpc->work, apple_clpc_work);
 	INIT_DEFERRABLE_WORK(&clpc->idle_work, apple_clpc_idle_work);
+	if (clpc->has_pmc && clpc->hw->idle_on_time) {
+		unsigned int cpu;
+
+		clpc->idle_timers = devm_alloc_percpu(dev, struct apple_clpc_idle_timer);
+		if (!clpc->idle_timers) {
+			apple_clpc_free_clusters(clpc);
+			return -ENOMEM;
+		}
+		for_each_possible_cpu(cpu) {
+			struct apple_clpc_idle_timer *t =
+				per_cpu_ptr(clpc->idle_timers, cpu);
+
+			t->clpc = clpc;
+			timer_setup(&t->timer, apple_clpc_idle_timer_fn,
+				    TIMER_DEFERRABLE | TIMER_PINNED);
+		}
+		if (apple_clpc_cpuhp_state > 0) {
+			ret = cpuhp_state_add_instance(apple_clpc_cpuhp_state,
+						       &clpc->cpuhp_node);
+			if (ret) {
+				apple_clpc_free_clusters(clpc);
+				return ret;
+			}
+			clpc->cpuhp_added = true;
+		}
+	}
 	/* Sample at a cold publication only where that publication is the demand.
 	 * Dense counting needs no extra sample, and one taken as each frame of a
 	 * frame-paced client starts finds its CPUs busy and votes their fabric.
@@ -1894,7 +2157,9 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	mutex_lock(&apple_clpc_clients_lock);
 	platform_set_drvdata(pdev, clpc);
 	mutex_unlock(&apple_clpc_clients_lock);
+	mutex_lock(&clpc->sample_lock);
 	apple_clpc_queue(clpc, true);
+	mutex_unlock(&clpc->sample_lock);
 	return 0;
 }
 
@@ -1914,12 +2179,14 @@ static int apple_clpc_resume(struct device *dev)
 	struct apple_clpc *clpc = dev_get_drvdata(dev);
 	unsigned int cpu;
 
+	mutex_lock(&clpc->sample_lock);
 	if (clpc->wall)
 		for_each_possible_cpu(cpu)
 			clpc->wall[cpu] = 0;
 	clpc->power_next = jiffies;
 	WRITE_ONCE(clpc->stopped, false);
 	apple_clpc_queue(clpc, true);
+	mutex_unlock(&clpc->sample_lock);
 	return 0;
 }
 
@@ -2478,6 +2745,32 @@ static void apple_clpc_ane_wake_removal_test(struct kunit *test)
 	apple_clpc_ane_put(ane);
 }
 
+static void apple_clpc_cpu_busy_floor_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	clpc->hw = &apple_clpc_hw_t6050;
+
+	/* Without the board override, the top quarter uses the SoC map. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 2u);
+
+	/* With the override active outside low-power, only the top quarter changes. */
+	clpc->cpu_top[APPLE_CLPC_DCS] = 6;
+	clpc->cpu_top[APPLE_CLPC_SOC] = 3;
+	clpc->cpu_top_set = true;
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 2), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 2), 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 6u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 3u);
+
+	/* Under the low-power platform profile, fall back to the SoC map. */
+	WRITE_ONCE(clpc->low_power, true);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 2u);
+}
+
 static void apple_clpc_low_power_roundup_test(struct kunit *test)
 {
 	/* M4 Pro P-cluster OPPs around the 2808 MHz ADT ceiling (J616s). */
@@ -2616,6 +2909,7 @@ static void apple_clpc_profile_ops_test(struct kunit *test)
 }
 
 static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_cpu_busy_floor_test),
 	KUNIT_CASE(apple_clpc_ane_demand_hold_test),
 	KUNIT_CASE(apple_clpc_ane_states_test),
 	KUNIT_CASE(apple_clpc_ane_cluster_test),
@@ -2874,7 +3168,36 @@ static struct platform_driver apple_clpc_driver = {
 		.pm = pm_sleep_ptr(&apple_clpc_pm_ops),
 	},
 };
-module_platform_driver(apple_clpc_driver);
+static int __init apple_clpc_driver_init(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN,
+				      "soc/apple/clpc:online",
+				      apple_clpc_cpu_online,
+				      apple_clpc_cpu_down);
+	if (ret < 0)
+		return ret;
+	apple_clpc_cpuhp_state = ret;
+
+	ret = platform_driver_register(&apple_clpc_driver);
+	if (ret) {
+		cpuhp_remove_multi_state(apple_clpc_cpuhp_state);
+		apple_clpc_cpuhp_state = 0;
+	}
+	return ret;
+}
+module_init(apple_clpc_driver_init);
+
+static void __exit apple_clpc_driver_exit(void)
+{
+	platform_driver_unregister(&apple_clpc_driver);
+	if (apple_clpc_cpuhp_state > 0) {
+		cpuhp_remove_multi_state(apple_clpc_cpuhp_state);
+		apple_clpc_cpuhp_state = 0;
+	}
+}
+module_exit(apple_clpc_driver_exit);
 
 MODULE_DESCRIPTION("Apple SoC host performance controller floors");
 MODULE_LICENSE("Dual MIT/GPL");

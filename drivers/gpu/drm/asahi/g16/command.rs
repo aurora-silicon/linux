@@ -37,6 +37,8 @@ const NONE: u16 = uapi::DRM_ASAHI_BARRIER_NONE as u16;
 
 const VERTEX_SCRATCH: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH;
 const PROCESS_EMPTY_TILES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
+const NO_VERTEX_CLUSTERING: u32 =
+    uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_IS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
 const FEW_PRIMITIVES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
@@ -72,7 +74,6 @@ const SET_COMPUTE_ATTACHMENTS: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMP
 
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
-const MAX_TILE_BUFFER: u32 = 32768;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
 /// Size of a queue's USC window.
 pub(crate) const USC_WINDOW: u64 = 1 << 32;
@@ -189,6 +190,11 @@ impl RenderCommand {
     /// Whether this render pass requires the conservative `TA_WAVE_PASSES` wave window.
     pub(crate) fn is_heavy_ta(&self) -> bool {
         self.heavy_ta
+    }
+
+    /// Whether this render pass is multisampled.
+    pub(crate) fn is_multisampled(&self) -> bool {
+        self.cmd.samples > 1
     }
 }
 
@@ -371,6 +377,8 @@ pub(crate) struct Context<'a> {
     pub(crate) active_cores: u32,
     /// The queue's reserved render scratch pages per stage (`render_scs_layout`).
     pub(crate) render_scs: [u16; 2],
+    /// Largest tile buffer render commands may use, in bytes (`Config::max_tile_buffer`).
+    pub(crate) max_tile_buffer: u32,
 }
 
 /// A stream whose timestamps and ordinals are resolved ([`ParsedStream::prepare`]), before its
@@ -379,6 +387,7 @@ pub(crate) struct Prepared {
     commands: Commands,
     orders: Orders,
     counts: [u64; 2],
+    gpu_generation: u32,
 }
 
 /// One command of the stream.
@@ -556,9 +565,30 @@ fn check_render_helpers(cmd: &uapi::drm_asahi_cmd_render) -> Result {
 
 /// Reject geometry which cannot fit any retained pass before a submission is accepted.
 /// The encoder owns the sizing formula; admission and publication use the same calculation.
-fn check_geometry(cmd: &uapi::drm_asahi_cmd_render) -> Result {
-    super::encode::Geometry::new(cmd, 0)
+fn check_geometry(
+    cmd: &uapi::drm_asahi_cmd_render,
+    num_clusters: u32,
+    gpu_generation: u32,
+) -> Result {
+    super::encode::Geometry::new_for(cmd, 0, num_clusters, gpu_generation)
         .validate_capacity(hw::client::TPC_SIZE, hw::client::TILEMAP_SIZE)
+}
+
+fn render_allowed_flags(early_tiling: bool, gpu_generation: u32) -> u32 {
+    let gen_flags = if gpu_generation >= 16 {
+        FEW_PRIMITIVES
+    } else {
+        NO_VERTEX_CLUSTERING
+    };
+    PROCESS_EMPTY_TILES
+        | DBIAS_IS_INT
+        | RSRC_SPEC_HI
+        | gen_flags
+        | if early_tiling {
+            FRAGMENT_BARRIERS | STAGE_PREFIXES
+        } else {
+            0
+        }
 }
 
 fn validate_attachments_header(entry: &Entry<'_>) -> Result {
@@ -585,6 +615,8 @@ fn validate_render_entry(
     entry: &Entry<'_>,
     counts: [u32; 2],
     early_tiling: bool,
+    num_clusters: u32,
+    gpu_generation: u32,
 ) -> Result<(
     uapi::drm_asahi_cmd_render,
     Option<uapi::drm_asahi_render_stage_prefixes>,
@@ -592,8 +624,15 @@ fn validate_render_entry(
 )> {
     let (packet, prefixes) = render_payload(entry.payload)?;
     let cmd = &packet;
-    // The ray-query stages after the historical prefixes (RENDER_RAY_QUERY).
+    // The ray-query stages after the historical prefixes (RENDER_RAY_QUERY, G16+ only).
     let ray_query = render_ray_query(entry.payload)?;
+    if gpu_generation < 16
+        && ray_query
+            .iter()
+            .any(|stage| stage.intersection.enabled() || stage.scratch.enabled())
+    {
+        return Err(EINVAL);
+    }
     if let Some(prefixes) = prefixes {
         if (prefixes.ta_vdm_barrier != NONE && u32::from(prefixes.ta_vdm_barrier) > counts[RENDER])
             || (prefixes.ta_cdm_barrier != NONE
@@ -603,16 +642,7 @@ fn validate_render_entry(
         }
     }
     check_render_helpers(cmd)?;
-    // M4 HAL200 resource words carry all four high halves.
-    let allowed = PROCESS_EMPTY_TILES
-        | DBIAS_IS_INT
-        | FEW_PRIMITIVES
-        | RSRC_SPEC_HI
-        | if early_tiling {
-            FRAGMENT_BARRIERS | STAGE_PREFIXES
-        } else {
-            0
-        };
+    let allowed = render_allowed_flags(early_tiling, gpu_generation);
     if cmd.flags & !allowed != 0
         || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
         || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -621,7 +651,7 @@ fn validate_render_entry(
     {
         return Err(EINVAL);
     }
-    check_geometry(cmd)?;
+    check_geometry(cmd, num_clusters, gpu_generation)?;
     // Timestamp copies are reserved for another runtime. No copy
     // feature is advertised, and zero handles do not waive MBZ offsets.
     if cmd
@@ -649,12 +679,16 @@ fn validate_render_entry(
 fn validate_compute_entry(
     entry: &Entry<'_>,
     range: &Range<u64>,
+    gpu_generation: u32,
 ) -> Result<(uapi::drm_asahi_cmd_compute, super::rt::ComputeRay, bool)> {
     let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
     let cmd = &packet;
     let Some(as_build) = super::rt::as_build(cmd.flags & !COMPUTE_NO_QUERY_ACCESS) else {
         return Err(EINVAL);
     };
+    if gpu_generation < 16 && as_build {
+        return Err(EINVAL);
+    }
     if cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
         || !inside(
             cmd.cdm_ctrl_stream_base,
@@ -671,8 +705,11 @@ fn validate_compute_entry(
     {
         return Err(EINVAL);
     }
-    // The G17P scratch layout and intersection tables (RENDER_RAY_QUERY).
+    // The G17P scratch layout and intersection tables (RENDER_RAY_QUERY, G16+ only).
     let ray = compute_ray(cmd)?;
+    if gpu_generation < 16 && (ray.intersection.enabled() || ray.scratch.enabled()) {
+        return Err(EINVAL);
+    }
     Ok((packet, ray, as_build))
 }
 
@@ -1209,12 +1246,27 @@ fn check_render(
     vertex: &[uapi::drm_asahi_attachment],
     fragment: &[uapi::drm_asahi_attachment],
 ) -> Result {
+    check_render_for(batch, context, cmd, vertex, fragment, 16)
+}
+
+fn check_render_for(
+    batch: &mut SpanBatch,
+    context: &Context<'_>,
+    cmd: &uapi::drm_asahi_cmd_render,
+    vertex: &[uapi::drm_asahi_attachment],
+    fragment: &[uapi::drm_asahi_attachment],
+    gpu_generation: u32,
+) -> Result {
     check_render_helpers(cmd)?;
     let vm = context.vm;
     let allowed = PROCESS_EMPTY_TILES
         | RSRC_SPEC_HI
         | DBIAS_IS_INT
-        | FEW_PRIMITIVES
+        | if gpu_generation >= 16 {
+            FEW_PRIMITIVES
+        } else {
+            uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
+        }
         | if super::params::early_tiling() {
             FRAGMENT_BARRIERS | STAGE_PREFIXES
         } else {
@@ -1231,7 +1283,7 @@ fn check_render(
         || !matches!(cmd.samples, 1 | 2 | 4)
         || !matches!(cmd.utile_width_px, 16 | 32)
         || !matches!(cmd.utile_height_px, 16 | 32)
-        || tile_buffer > MAX_TILE_BUFFER
+        || tile_buffer > context.max_tile_buffer
         || cmd.sampler_heap != 0
         || cmd.sampler_count != 0
         || cmd.ppp_ctrl & !0x203 != 0
@@ -1449,11 +1501,22 @@ pub(crate) struct ParsedStream {
     commands: Commands,
     meta: OrderMetas,
     counts: [u64; 2],
+    gpu_generation: u32,
 }
 
 /// Structurally validates and decodes a command stream in a single pass, before anything is
 /// looked up or device state is consulted.
 pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStream> {
+    parse_stream_for(bytes, early_tiling, 1, 16)
+}
+
+/// [`parse_stream`] parameterized by the GPU's cluster count and hardware generation.
+pub(crate) fn parse_stream_for(
+    bytes: &[u8],
+    early_tiling: bool,
+    num_clusters: u32,
+    gpu_generation: u32,
+) -> Result<ParsedStream> {
     if bytes.is_empty() || bytes.len() > MAX_CMDBUF || bytes.len() % 8 != 0 {
         return Err(EINVAL);
     }
@@ -1495,8 +1558,13 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
         let next_idx = commands.len();
         match entry.kind {
             CMD_RENDER => {
-                let (packet, prefixes, ray_query) =
-                    validate_render_entry(&entry, counts, early_tiling)?;
+                let (packet, prefixes, ray_query) = validate_render_entry(
+                    &entry,
+                    counts,
+                    early_tiling,
+                    num_clusters,
+                    gpu_generation,
+                )?;
                 counts[RENDER] += 1;
                 if counts[RENDER] + counts[COMPUTE] > MAX_COMMANDS {
                     return Err(EINVAL);
@@ -1527,7 +1595,8 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 let vertex_attachments = take_render(&mut vertex, false)?;
                 let fragment_attachments = take_render(&mut fragment, true)?;
                 let heavy_ta = packet.layers > 1
-                    || super::encode::Geometry::new(&packet, 0).tilemap_bytes
+                    || super::encode::Geometry::new_for(&packet, 0, num_clusters, gpu_generation)
+                        .tilemap_bytes
                         > hw::sizes::TA_LIGHT_TILEMAP_BYTES;
                 commands.push(Command::Render(KBox::new(
                     RenderCommand {
@@ -1547,7 +1616,8 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 })?;
             }
             CMD_COMPUTE => {
-                let (packet, ray, as_build) = validate_compute_entry(&entry, &range)?;
+                let (packet, ray, as_build) =
+                    validate_compute_entry(&entry, &range, gpu_generation)?;
                 counts[COMPUTE] += 1;
                 if counts[RENDER] + counts[COMPUTE] > MAX_COMMANDS {
                     return Err(EINVAL);
@@ -1593,6 +1663,7 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
         commands,
         meta,
         counts: [u64::from(counts[RENDER]), u64::from(counts[COMPUTE])],
+        gpu_generation,
     })
 }
 
@@ -1641,6 +1712,7 @@ impl ParsedStream {
             commands: self.commands,
             orders,
             counts: self.counts,
+            gpu_generation: self.gpu_generation,
         })
     }
 }
@@ -1685,6 +1757,7 @@ impl Prepared {
             mut commands,
             orders,
             counts,
+            gpu_generation,
         } = self;
         if commands.is_empty() {
             return Err(EINVAL);
@@ -1697,12 +1770,13 @@ impl Prepared {
             for command in commands.iter_mut() {
                 match command {
                     Command::Render(render) => {
-                        check_render(
+                        check_render_for(
                             &mut scratch.batch,
                             context,
                             &render.cmd,
                             &render.vertex_attachments,
                             &render.fragment_attachments,
+                            gpu_generation,
                         )?;
                         render.scs =
                             check_render_ray(&mut scratch.batch, context, &render.ray_query)?;

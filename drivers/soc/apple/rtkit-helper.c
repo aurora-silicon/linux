@@ -189,6 +189,20 @@ static bool apple_rtkit_helper_reserved(struct device_node *np,
 	return false;
 }
 
+/*
+ * The MTPs whose live handoff uses the retained form: the boot loader always
+ * publishes the buffer inventory with the session, and no buffer may be
+ * allocated after adoption. That form belongs to the MTP firmware, so it is
+ * keyed on the MTP's compatible: every T8132 MTP and every T6040/T6041 MTP
+ * (both use apple,t6041-mtp), whichever board it sits in. The boot loader
+ * picks the form by the same compatibles.
+ */
+static bool apple_rtkit_helper_retained_mtp(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8132-mtp") ||
+	       of_device_is_compatible(np, "apple,t6041-mtp");
+}
+
 static int apple_rtkit_helper_inherit_buffers(
 	struct apple_rtkit_helper *helper,
 	struct apple_rtkit_inherited_buffer *buffers)
@@ -201,9 +215,7 @@ static int apple_rtkit_helper_inherit_buffers(
 	/* T8140 producers predating the buffer inventory remain compatible. */
 	inventory = of_find_property(np, "apple,rtkit-buffers", &length);
 	if (!inventory) {
-		if (of_device_is_compatible(np, "apple,t8132-mtp") ||
-		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(np, "apple,t6041-mtp")))
+		if (apple_rtkit_helper_retained_mtp(np))
 			return -EINVAL;
 		return 0;
 	}
@@ -297,8 +309,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, count, "Invalid inherited RTKit buffers\n");
 		if ((apple_t8132_live_mtp() &&
 		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
-		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")) ||
+		    of_device_is_compatible(dev->of_node, "apple,t6041-mtp") ||
 		    of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
 			helper->preserved = true;
 	}
@@ -345,9 +356,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		 */
 		helper->adopted = true;
 		helper->strict_buffers = count > 0 ||
-			of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
-			(of_machine_is_compatible("apple,j614s") &&
-			 of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+			apple_rtkit_helper_retained_mtp(dev->of_node);
 		helper->rtk = apple_rtkit_init_adopted_with_buffers(
 			dev, helper, NULL, 0, &apple_rtkit_helper_ops, buffers, count);
 		if (IS_ERR(helper->rtk))

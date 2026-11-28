@@ -19,8 +19,10 @@
 #include <linux/bitops.h>
 #include <linux/ctype.h>
 #include <linux/device.h>
+#include <linux/kernfs.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
@@ -118,7 +120,40 @@ static struct {
 	atomic_t unhandled;
 	atomic_t sleeps;
 	atomic_t sleeping;
+	/* SEP_DIAG_TRUSTED_*, with the refusal status above it. */
+	atomic_t trusted;
+
+	struct kernfs_node *keystore_kn;
+	struct kernfs_node *touchid_kn;
 } sep_diag;
+
+static DEFINE_SPINLOCK(sep_diag_kn_lock);
+
+static void sep_diag_put_kns(void *data)
+{
+	struct kernfs_node *keystore_kn, *touchid_kn;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	keystore_kn = sep_diag.keystore_kn;
+	touchid_kn = sep_diag.touchid_kn;
+	sep_diag.keystore_kn = NULL;
+	sep_diag.touchid_kn = NULL;
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+
+	sysfs_put(keystore_kn);
+	sysfs_put(touchid_kn);
+}
+
+static void sep_diag_notify_kn(struct kernfs_node **knp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	if (*knp)
+		kernfs_notify(*knp);
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+}
 
 /* Written once per probe, before pnon reads SEP_DIAG_PNON_READ. */
 static u8 sep_diag_pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
@@ -684,6 +719,23 @@ static ssize_t sleep_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(sleep);
 
+static ssize_t trusted_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	int word = atomic_read(&sep_diag.trusted);
+
+	switch (word & 0xff) {
+	case SEP_DIAG_TRUSTED_READY:
+		return sysfs_emit(buf, "ready\n");
+	case SEP_DIAG_TRUSTED_REFUSED:
+		/* One word, so the status is the one this refusal stored. */
+		return sysfs_emit(buf, "refused %d\n", (s8)(word >> 8));
+	default:
+		return sysfs_emit(buf, "unknown\n");
+	}
+}
+static DEVICE_ATTR_RO(trusted);
+
 static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_abi.attr,
 	&dev_attr_profile.attr,
@@ -720,6 +772,7 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
 	&dev_attr_sleep.attr,
+	&dev_attr_trusted.attr,
 	NULL
 };
 
@@ -735,6 +788,10 @@ static const struct attribute_group sep_diag_group = {
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart)
 {
+	struct kernfs_node *diag_kn, *keystore_kn = NULL, *touchid_kn = NULL;
+	unsigned long flags;
+	int ret;
+
 	profile_len = min(profile_len, sizeof(sep_diag.profile) - 1);
 	memcpy(sep_diag.profile, profile, profile_len);
 	sep_diag.profile[profile_len] = '\0';
@@ -742,8 +799,26 @@ int sep_diag_register(struct device *dev, const char *profile,
 	sep_diag.sepos13 = sepos13;
 	sep_diag.xart = xart;
 	sep_diag.probe_ns = ktime_get_boottime_ns();
+	/* A refusal belongs to the bind that saw it. */
+	atomic_set(&sep_diag.trusted, SEP_DIAG_TRUSTED_UNKNOWN);
 
-	return devm_device_add_group(dev, &sep_diag_group);
+	ret = devm_device_add_group(dev, &sep_diag_group);
+	if (ret)
+		return ret;
+
+	diag_kn = sysfs_get_dirent(dev->kobj.sd, "diag");
+	if (diag_kn) {
+		keystore_kn = sysfs_get_dirent(diag_kn, "keystore");
+		touchid_kn = sysfs_get_dirent(diag_kn, "touchid");
+		sysfs_put(diag_kn);
+	}
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	sep_diag.keystore_kn = keystore_kn;
+	sep_diag.touchid_kn = touchid_kn;
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+
+	return devm_add_action_or_reset(dev, sep_diag_put_kns, NULL);
 }
 
 void sep_diag_set_attach(bool attached)
@@ -867,7 +942,9 @@ void sep_diag_log_summary(struct device *dev)
 
 void sep_diag_set_keystore_open(void)
 {
-	atomic_set(&sep_diag.keystore, SEP_DIAG_KEYSTORE_OPEN);
+	if (atomic_xchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_OPEN) !=
+	    SEP_DIAG_KEYSTORE_OPEN)
+		sep_diag_notify_kn(&sep_diag.keystore_kn);
 }
 
 void sep_diag_set_keybag(int state)
@@ -925,14 +1002,18 @@ void sep_diag_set_sensor_result(unsigned int bind, bool online)
  */
 void sep_diag_set_bio_published(void)
 {
-	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
-		       SEP_DIAG_TOUCHID_PUBLISHED);
+	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
+			   SEP_DIAG_TOUCHID_PUBLISHED) ==
+	    SEP_DIAG_TOUCHID_PENDING)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }
 
 void sep_diag_set_touchid(bool started)
 {
-	atomic_set(&sep_diag.touchid,
-		   started ? SEP_DIAG_TOUCHID_STARTED : SEP_DIAG_TOUCHID_FAILED);
+	int state = started ? SEP_DIAG_TOUCHID_STARTED : SEP_DIAG_TOUCHID_FAILED;
+
+	if (atomic_xchg(&sep_diag.touchid, state) != state)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }
 
 void sep_diag_set_sensor_attach(int state)
@@ -958,6 +1039,40 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 	atomic_set(&sep_diag.matching, matching);
 }
 
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status)
+{
+	atomic_set(word, (state & 0xff) | ((u8)status << 8));
+}
+
+/*
+ * The latest answer wins: a success after a refusal (or the reverse) is what
+ * the next seal or unseal can expect.
+ */
+void sep_diag_set_trusted(int state, int status)
+{
+	sep_diag_set_trusted_atomic(&sep_diag.trusted, state, status);
+}
+
+/*
+ * A validated identity unlock (for example through /dev/sep-key) clears any
+ * stale refusal so a loader re-run probes again, while leaving "ready" tied
+ * to a working trusted-key unseal.
+ */
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word)
+{
+	int old = atomic_read(word);
+
+	while ((old & 0xff) == SEP_DIAG_TRUSTED_REFUSED) {
+		if (atomic_try_cmpxchg(word, &old, SEP_DIAG_TRUSTED_UNKNOWN))
+			break;
+	}
+}
+
+void sep_diag_clear_trusted_refusal(void)
+{
+	sep_diag_clear_trusted_refusal_atomic(&sep_diag.trusted);
+}
+
 /* With matching as the refusal leaves it. */
 void sep_diag_xart_guard_refused(int matching)
 {
@@ -978,13 +1093,17 @@ void sep_diag_set_xart(bool writable)
 void sep_diag_keystore_ended(void)
 {
 	atomic64_cmpxchg(&sep_diag.ready_ns, 0, ktime_get_boottime_ns());
-	atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
-		       SEP_DIAG_KEYSTORE_CLOSED);
+	if (atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
+			   SEP_DIAG_KEYSTORE_CLOSED) ==
+	    SEP_DIAG_KEYSTORE_UNKNOWN)
+		sep_diag_notify_kn(&sep_diag.keystore_kn);
 }
 
 void sep_diag_bringup_ended(void)
 {
 	sep_diag_keystore_ended();
-	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
-		       SEP_DIAG_TOUCHID_UNAVAILABLE);
+	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
+			   SEP_DIAG_TOUCHID_UNAVAILABLE) ==
+	    SEP_DIAG_TOUCHID_PENDING)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }

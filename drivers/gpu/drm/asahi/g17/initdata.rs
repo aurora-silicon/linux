@@ -681,15 +681,17 @@ impl InitData {
     }
 
     /// M5 TA, fragment and compute share the compute outer ring per priority.
-    /// The physical queue claim prevents reassignment while this credit lives.
+    /// The caller must hold `Port::m5_outer`; the physical queue claim prevents
+    /// reassignment while this credit lives.
     pub(crate) fn reserve_outer(&self, priority: u8, count: u32) -> Result<OuterClaim> {
         if !self.m5 { return Err(EINVAL); }
         let cursors = self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?;
         self.outer_credits.as_ref().ok_or(EIO)?.reserve(priority, count, cursors)
     }
 
-    /// Hold the device mutex for this scope, including its Drop. The result
-    /// borrows only the claim, allowing the caller to publish through Firmware.
+    /// Hold the device mutex for this scope, including its Drop, and serialize entry
+    /// and Drop under `Port::m5_outer` via `Port::outer_scope`. The result borrows
+    /// only the claim, allowing the caller to publish through Firmware.
     pub(crate) fn outer_scope<'a>(&self, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
         self.outer_credits.as_ref().ok_or(EINVAL)?.scope(claim)
     }
@@ -1074,6 +1076,8 @@ impl InitData {
             // The word recovery_state() reads: the status block moves with the firmware build.
             recovery: self.object(self.cluster)?.word(self.recovery_state_offset())?,
             mailbox,
+            m5_credits: self.outer_credits.clone(),
+            m5_history: self.m5_history_view()?,
         })
     }
 

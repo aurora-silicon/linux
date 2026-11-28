@@ -570,6 +570,7 @@ static void cd321x_stop_work(struct cd321x *c) {
                               ' struct notifier_block tbt_watch;\n bool tbt_watch_registered;\n', 1)
         mocks = mocks.replace('static void cd321x_stop_work(struct cd321x *c) {\n', r'''#define INIT_WORK(p,fn) ((p)->pending=false)
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static int watches, watch_error;
 /* Like the real watch, hold the port fwnode until the port is unregistered. */
 static int cd321x_tbt_watch_late(struct cd321x *c,struct fwnode_handle *f) {

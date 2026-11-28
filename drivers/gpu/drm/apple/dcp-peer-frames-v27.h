@@ -8,9 +8,22 @@
  * outstanding swaps, as in the existing single-pipe retirement path.
  */
 struct dcp_peer_frames_v27 {
+	u32 timing;
+	u32 color;
+	u32 min_vrr;
+	bool output_hdr;
 	u32 first, submitted, engine[2], retired, shown[2];
 	bool active, armed, failed, have[2], have_retired, have_shown[2];
 };
+
+static inline bool dcp_peer_vrr_only_v27(const struct dcp_peer_frames_v27 *frames,
+					 u32 timing, u32 color, u32 min_vrr,
+					 bool output_hdr)
+{
+	return frames->active && !frames->failed && frames->timing == timing &&
+	       frames->color == color && frames->min_vrr != min_vrr &&
+	       frames->output_hdr == output_hdr;
+}
 
 static inline void dcp_peer_frame_submit_v27(struct dcp_peer_frames_v27 *s, u32 id)
 {

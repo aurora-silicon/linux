@@ -48,12 +48,15 @@ pub(crate) enum Class {
     SharedCached,
     /// ASC-cached (AttrIndex 0) behind a cacheable host mapping: the leaf macOS 26B123 gives its
     /// per-queue command objects and the G13-G15 private-allocator contract (`PROT_FW_PRIV_RW`
-    /// behind `gem::new_kernel_object`). Only for command records the host writes before
-    /// publication and never reads back what the firmware writes, with no client alias, and only
-    /// from device-lifetime allocators ([`Factory::persistent_objects`]): an ASC-cached M4
-    /// mapping has no qualified teardown, so its owner is never dropped. A kernel GPU task lower
-    /// alias stays uncached, as macOS maps its work items for the GPU; host stores to such an
-    /// object are cleaned to the point of coherency for it ([`FwObject::write`]).
+    /// behind `gem::new_kernel_object`). Only for device-lifetime command records with no client
+    /// alias ([`Factory::persistent_objects`]): an ASC-cached M4 mapping has no qualified
+    /// teardown, so its owner is never dropped. A kernel GPU task lower alias stays uncached, as
+    /// macOS maps its work items for the GPU; host stores to such an object are cleaned to the
+    /// point of coherency for it ([`FwObject::write`]). Host readback of any firmware- or
+    /// GPU-written field inside a `FwCoherent` record (such as 26B123 compute `work_ticks`) must
+    /// call [`FwObject::sync_for_cpu`] first to clean+invalidate the CPU lines to PoC; because
+    /// prior host stores were already cleaned to PoC before publication and no host store occurs
+    /// while in flight, clean+invalidate never overwrites firmware/GPU writes.
     FwCoherent,
     /// Firmware device mapping.
     #[allow(dead_code)]
@@ -113,6 +116,9 @@ pub(crate) struct FwObject {
     /// Host stores go through a cacheable view the GPU reads through its uncached lower alias:
     /// each store is cleaned to the point of coherency.
     clean: bool,
+    /// Host CPU mapping is write-back cacheable (`Class::FwCoherent`): any post-publication CPU
+    /// readback of firmware- or GPU-written words must call [`Self::sync_for_cpu`] first.
+    cached_cpu: bool,
 }
 
 // SAFETY: The object only refers to kernel memory shared with the firmware; every host access
@@ -162,6 +168,7 @@ impl FwObject {
                 _parent: Some(object.clone()),
                 limit: Some(size),
                 clean: object.clean,
+                cached_cpu: object.cached_cpu,
             },
             GFP_KERNEL,
         )?)
@@ -173,6 +180,18 @@ impl FwObject {
             crate::pgtable::clean_poc(p, len);
             crate::pgtable::poc_barrier();
         }
+    }
+
+    /// Invalidates CPU cache lines covering `len` bytes at `offset` when this object uses a
+    /// cacheable host mapping (`Class::FwCoherent`), ensuring subsequent CPU reads observe
+    /// firmware- or GPU-written words (e.g. 26B123 compute `work_ticks`) after publication.
+    pub(crate) fn sync_for_cpu(&self, offset: usize, len: usize) -> Result {
+        let p = self.ptr(offset, len)?;
+        if self.cached_cpu {
+            crate::pgtable::clean_invalidate_poc(p, len);
+            crate::pgtable::poc_barrier();
+        }
+        Ok(())
     }
 
     /// Copies bytes into the object before it is published, or into host-owned words.
@@ -577,15 +596,35 @@ impl Objects {
         {
             return Err(EINVAL);
         }
-        let private = self.private.as_ref().ok_or(EINVAL)?;
         let bytes = req
             .offset
             .checked_add(req.size)
             .and_then(|size| size.checked_add(hw::PAGE as usize - 1))
             .ok_or(EOVERFLOW)?
             & !(hw::PAGE as usize - 1);
+        {
+            let private = self.private.as_ref().ok_or(EINVAL)?;
+            if client_range.is_some() {
+                if private.vm.is_none() {
+                    return Err(EINVAL);
+                }
+            } else if let Some((gva, leaf)) = req.client {
+                if private.vm.is_none() {
+                    return Err(EINVAL);
+                }
+                let end = gva.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
+                if gva < hw::client::CLIENT_APERTURE.start
+                    || end > hw::client::CLIENT_APERTURE.end
+                    || gva & (hw::PAGE - 1) != 0
+                    || leaf != pte::LEAF_NC && leaf != pte::LEAF_PB_LIST
+                {
+                    return Err(EINVAL);
+                }
+            }
+        }
         self.retained.reserve(1, GFP_KERNEL)?;
         self.mappings.reserve(3, GFP_KERNEL)?;
+        let object_slot = UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?;
         // A firmware-cached record needs a cacheable host view of the same pages (the host and
         // firmware caches are coherent, as for G13-G15 private objects); every other private
         // class keeps its write-combined view.
@@ -606,6 +645,7 @@ impl Objects {
             gem::prepare_new_object(&backing.gem, parent.as_ref())?;
         }
         let clean = req.class == Class::FwCoherent && req.lower.is_some();
+        let cached_cpu = req.class == Class::FwCoherent;
         let cpu = if req.cpu {
             let vmap = backing.vmap()?;
             let pointer = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
@@ -619,17 +659,7 @@ impl Objects {
         } else {
             None
         };
-        let firmware = self.uat.kernel_vm().map_in_range(
-            &backing.gem,
-            0..bytes,
-            hw::PAGE,
-            private.firmware.clone(),
-            mmu::Prot::from_pte(req.class.pte()),
-            true,
-        )?;
-        let va = firmware.iova();
-        self.mappings.push(firmware, GFP_KERNEL)?;
-        let lower_gva = if req.lower.is_some() {
+        let lower_mapping = if req.lower.is_some() {
             // No two live VMs share a context-0 work address. The self-check at 0x70ff...
             // and all fixed client aliases are outside this aperture.
             let lower = self.uat.kernel_lower_vm().map_in_range(
@@ -640,77 +670,90 @@ impl Objects {
                 mmu::Prot::from_pte(pte::LOWER),
                 true,
             )?;
-            let address = lower.iova() + req.offset as u64;
-            self.mappings.push(lower, GFP_KERNEL)?;
             uat::clean_lower(&self.uat)?;
-            Some(address)
+            Some(lower)
         } else {
             None
         };
-        let client_gva = if let Some(range) = client_range {
-            let vm = private.vm.as_ref().ok_or(EINVAL)?;
-            let mapping = vm.map_in_range(
-                &backing.gem,
-                0..bytes,
-                hw::PAGE,
-                range,
-                mmu::Prot::from_pte(pte::LEAF_NC),
-                true,
-            )?;
-            let address = mapping.iova();
-            self.mappings.push(mapping, GFP_KERNEL)?;
-            Some(address)
-        } else if let Some((gva, leaf)) = req.client {
-            let vm = private.vm.as_ref().ok_or(EINVAL)?;
-            let end = gva.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
-            if gva < hw::client::CLIENT_APERTURE.start
-                || end > hw::client::CLIENT_APERTURE.end
-                || gva & (hw::PAGE - 1) != 0
-                || leaf != pte::LEAF_NC && leaf != pte::LEAF_PB_LIST
-            {
-                return Err(EINVAL);
+        let (client_mapping, client_gva) = {
+            let private = self.private.as_ref().ok_or(EINVAL)?;
+            if let Some(range) = client_range {
+                let vm = private.vm.as_ref().ok_or(EINVAL)?;
+                let mapping = vm.map_in_range(
+                    &backing.gem,
+                    0..bytes,
+                    hw::PAGE,
+                    range,
+                    mmu::Prot::from_pte(pte::LEAF_NC),
+                    true,
+                )?;
+                let address = mapping.iova();
+                (Some(mapping), Some(address))
+            } else if let Some((gva, leaf)) = req.client {
+                let vm = private.vm.as_ref().ok_or(EINVAL)?;
+                let mapping =
+                    vm.map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?;
+                (Some(mapping), Some(gva))
+            } else {
+                (None, None)
             }
-            self.mappings.push(
-                vm.map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?,
-                GFP_KERNEL,
-            )?;
-            Some(gva)
-        } else {
-            None
         };
-        wmb();
-        let private = self.private.as_mut().ok_or(EINVAL)?;
-        let end = va + bytes as u64;
-        private.pending = Some(match private.pending.take() {
-            Some(range) => range.start.min(va)..range.end.max(end),
-            None => va..end,
-        });
-        let object = Arc::new(
-            FwObject {
-                va: va + req.offset as u64,
-                gva: client_gva.map(|gva| gva + req.offset as u64),
-                lower_gva,
-                size: req.size,
-                offset: req.offset,
-                bytes,
-                client_leaf: req.client.map_or(pte::LEAF_NC, |(_, leaf)| leaf),
-                cpu,
-                backing,
-                _parent: None,
-                limit: None,
-                clean,
-            },
-            GFP_KERNEL,
+        let fw_range = self.private.as_ref().ok_or(EINVAL)?.firmware.clone();
+        // Map the firmware aperture last: for `Class::FwCoherent` an ASC-cached mapping cannot
+        // be torn down on drop, so every fallible allocation, validation, and uncached alias
+        // must succeed before it is created.
+        let firmware = self.uat.kernel_vm().map_in_range(
+            &backing.gem,
+            0..bytes,
+            hw::PAGE,
+            fw_range,
+            mmu::Prot::from_pte(req.class.pte()),
+            true,
         )?;
-        self.retained.push(object.clone(), GFP_KERNEL)?;
+        let va = firmware.iova();
+        let lower_gva = lower_mapping.as_ref().map(|m| m.iova() + req.offset as u64);
+        let _ = self.mappings.push_within_capacity(firmware);
+        if let Some(lower) = lower_mapping {
+            let _ = self.mappings.push_within_capacity(lower);
+        }
+        if let Some(client) = client_mapping {
+            let _ = self.mappings.push_within_capacity(client);
+        }
+        wmb();
+        if let Some(private) = self.private.as_mut() {
+            let end = va + bytes as u64;
+            private.pending = Some(match private.pending.take() {
+                Some(range) => range.start.min(va)..range.end.max(end),
+                None => va..end,
+            });
+        }
+        let object = Arc::from(object_slot.write(FwObject {
+            va: va + req.offset as u64,
+            gva: client_gva.map(|gva| gva + req.offset as u64),
+            lower_gva,
+            size: req.size,
+            offset: req.offset,
+            bytes,
+            client_leaf: req.client.map_or(pte::LEAF_NC, |(_, leaf)| leaf),
+            cpu,
+            backing,
+            _parent: None,
+            limit: None,
+            clean,
+            cached_cpu,
+        }));
+        let _ = self.retained.push_within_capacity(object.clone());
         self.pages += bytes / hw::PAGE as usize;
         Ok(object)
     }
 
     /// Publish a completed private arena in one shared-L2 transaction.
     pub(crate) fn finish_private(&mut self) -> Result {
-        if let Some(range) = self.private.as_mut().ok_or(EINVAL)?.pending.take() {
+        if let Some(range) = self.private.as_ref().ok_or(EINVAL)?.pending.clone() {
             self.window.lock().sync_range(&self.uat, range)?;
+            if let Some(private) = self.private.as_mut() {
+                private.pending = None;
+            }
         }
         Ok(())
     }
@@ -855,6 +898,7 @@ impl Objects {
                 _parent: None,
                 limit: None,
                 clean: false,
+                cached_cpu: false,
             })
             .into();
         self.retained.push(object.clone(), GFP_KERNEL)?;

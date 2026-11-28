@@ -12,7 +12,6 @@
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
@@ -26,6 +25,7 @@
 #include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
+#include <linux/soc/apple/t8132.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -126,6 +126,8 @@ static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
 static struct device *apple_t8132_display;
+#define APPLE_DRM_PUBLISHED_MAX 8
+static struct device *apple_drm_published[APPLE_DRM_PUBLISHED_MAX];
 
 /* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
@@ -209,6 +211,67 @@ int apple_drm_t8132_link_device(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
 
+static int apple_drm_display_publish(struct device *dev)
+{
+	int free_slot = -1;
+	int i;
+
+	if (!dev->of_node)
+		return 0;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] == dev)
+			return 0;
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == dev->of_node)
+			return -EBUSY;
+		if (!apple_drm_published[i] && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return -ENOSPC;
+	apple_drm_published[free_slot] = get_device(dev);
+	return 0;
+}
+
+static void apple_drm_display_withdraw(struct device *dev)
+{
+	struct device *old = NULL;
+	int i;
+
+	scoped_guard(mutex, &apple_g15_display_lock) {
+		for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+			if (apple_drm_published[i] == dev) {
+				old = apple_drm_published[i];
+				apple_drm_published[i] = NULL;
+				break;
+			}
+		}
+	}
+	put_device(old);
+}
+
+int apple_drm_link_device(struct device *consumer,
+			  const struct device_node *display_node)
+{
+	struct device_link *link;
+	int i;
+
+	if (!consumer || !consumer->of_node || !display_node)
+		return -EINVAL;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == display_node) {
+			link = device_link_add(consumer, apple_drm_published[i],
+					       DL_FLAG_AUTOREMOVE_CONSUMER);
+			return link ? 0 : -EINVAL;
+		}
+	}
+	return -EPROBE_DEFER;
+}
+EXPORT_SYMBOL_GPL(apple_drm_link_device);
+
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
 #define DART_PAGE_SIZE 16384
@@ -221,6 +284,42 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
         args->size = round_up(args->pitch * args->height, DART_PAGE_SIZE);
 
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
+}
+
+/*
+ * A T8122 dcpext mirrors framebuffers into its own display DART domain.
+ * Remove a buffer's mirror before its pages and its DVA are released.
+ */
+static void apple_drm_gem_free(struct drm_gem_object *gem)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, gem->dev) {
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp_fb_unmirror(to_apple_crtc(crtc)->dcp, to_drm_gem_dma_obj(gem));
+	}
+	drm_gem_dma_object_free(gem);
+}
+
+static const struct drm_gem_object_funcs apple_drm_gem_funcs = {
+	.free		= apple_drm_gem_free,
+	.print_info	= drm_gem_dma_object_print_info,
+	.get_sg_table	= drm_gem_dma_object_get_sg_table,
+	.vmap		= drm_gem_dma_object_vmap,
+	.mmap		= drm_gem_dma_object_mmap,
+	.vm_ops		= &drm_gem_dma_vm_ops,
+};
+
+static struct drm_gem_object *apple_drm_gem_create_object(struct drm_device *drm,
+							  size_t size)
+{
+	struct drm_gem_dma_object *obj = kzalloc_obj(*obj);
+
+	if (!obj)
+		return ERR_PTR(-ENOMEM);
+	obj->base.funcs = &apple_drm_gem_funcs;
+	return &obj->base;
 }
 
 #ifdef CONFIG_DRM_FBDEV_EMULATION
@@ -351,6 +450,7 @@ static const struct drm_driver apple_drm_driver = {
 	DRM_FBDEV_DMA_DRIVER_OPS,
 #endif
 	.postclose		= apple_drm_postclose,
+	.gem_create_object	= apple_drm_gem_create_object,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -1723,6 +1823,8 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
+	/* apple_dcp_usable(): only one on firmware 27.2 (apple_t8132_dcpext_v27_2()). */
+	{ .compatible = "apple,t8132-dcpext" },
 	{},
 };
 
@@ -1741,7 +1843,21 @@ static bool apple_dcp_usable(struct device_node *np)
 		dcp_h17p_external_supported(np)) &&
 	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
-		dcp_t6041_ext_enabled());
+		dcp_t6041_ext_enabled()) &&
+	       /*
+		* The T8132 main DCP is the M4 backend's on its 26.6.2
+		* firmware path, and the firmware-27 backend's wherever the
+		* boot loader handed it over with the 27.2 image and its
+		* clocks, on any board (see dcp_check_firmware_version()).
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcp") ||
+		apple_t8132_firmware_path() || apple_t8132_dcp_v27_2(np)) &&
+	       /*
+		* A T8132 dcpext the M4 backend adopts is no component: its
+		* outputs are t8132_ext_drm.c's. One on the 27.2 image is a pipe.
+		*/
+	       (!of_device_is_compatible(np, "apple,t8132-dcpext") ||
+		apple_t8132_dcpext_v27_2(np));
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
@@ -1763,6 +1879,22 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 		disable_work_sync(&apple_connector->hotplug_wq);
 		disable_work_sync(&apple_connector->bl_sync_wq);
 		disable_work_sync(&apple_connector->bl_commit_wq);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
+/* Process the hotplug reports queued while the display processors started. */
+static void apple_drm_flush_start_reports(struct drm_device *drm)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		/* A T8132 external output has no DCP hotplug work. */
+		if (t8132_ext_connector(connector))
+			continue;
+		flush_work(&to_apple_connector(connector)->hotplug_wq);
 	}
 	drm_connector_list_iter_end(&iter);
 }
@@ -1924,8 +2056,12 @@ static int apple_drm_init_dcp(struct device *dev)
 		return -ENODEV;
 	}
 
-	/* HACK: Wait for dcp* to settle before a modeset */
-	msleep(100);
+	/*
+	 * What the firmware reported while its processor started (connection,
+	 * modes) is processed before the device registers, so the first
+	 * modeset sees it. Later reports arrive as hotplug events.
+	 */
+	apple_drm_flush_start_reports(&apple->drm);
 
 	return 0;
 }
@@ -2102,6 +2238,13 @@ static int apple_drm_init(struct device *dev)
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
 	}
+	ret = apple_drm_display_publish(dev);
+	if (ret) {
+		apple_g15_display_withdraw(dev);
+		t8132_ext_drm_fini(&apple->drm);
+		drm_dev_unregister(&apple->drm);
+		goto err_unbind;
+	}
 
 	mutex_lock(&apple_drm_pm_lock);
 	list_add_tail(&apple->pm_node, &apple_drm_pm_list);
@@ -2124,6 +2267,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
+	apple_drm_display_withdraw(dev);
 	apple_g15_display_withdraw(dev);
 
 	/* An aborted takeover leaves its DCPs running until the reboot. */
@@ -2193,7 +2337,8 @@ static int add_dcp_components(struct device *dev,
 				 * ignore it here.
 				 */
 				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				    of_device_is_compatible(port, "apple,t8122-atcphy") ||
+				    of_device_is_compatible(port, "apple,t8142-atcphy")) {
 					of_node_put(port);
 					continue;
 				}

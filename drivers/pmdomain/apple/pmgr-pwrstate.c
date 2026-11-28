@@ -642,8 +642,26 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	u32 reg;
 	int ret;
 
-	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
-	    ps->auto_managed || ps->sleep_driver_owned ||
+	if (!pm_resume_via_firmware() || ps->firmware_owned)
+		return 0;
+
+	/*
+	 * The wake resets each word's minimum state with the rest, and probe is the only
+	 * place that sets apple,min-state: put it back, whoever owns the domain now. With
+	 * AUTO_ENABLE on and a minimum of 0, the hardware power-gates a domain whose
+	 * coprocessor is only waiting in WFI, as a display coprocessor's CPU does.
+	 */
+	if (ps->min_state && ps->min_state <= APPLE_PMGR_PS_ACTIVE) {
+		spin_lock_irqsave(&ps->genpd.slock, flags);
+		if (!regmap_read(ps->regmap, ps->offset, &reg) &&
+		    FIELD_GET(APPLE_PMGR_PS_MIN, reg) != ps->min_state)
+			regmap_update_bits(ps->regmap, ps->offset,
+					   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+					   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+		spin_unlock_irqrestore(&ps->genpd.slock, flags);
+	}
+
+	if (ps->inherited_on || ps->auto_managed || ps->sleep_driver_owned ||
 	    apple_sleep_domain_is_down(dev->of_node))
 		return 0;
 
@@ -859,12 +877,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
 	/*
-	 * On the M4 firmware path some domains are the firmware's, which Linux
-	 * cannot access. The early compatibility adapter supplies the explicit
-	 * status and ownership before population; fail closed if it was not
-	 * enabled. Other firmware keeps the tree's own domain descriptions.
+	 * Some T8132 power states are the firmware's, which Linux cannot
+	 * access. The platform handoff supplies the explicit status and
+	 * ownership of every one before population, on any firmware: fail
+	 * closed on a state it did not mark. Keep the same protection for
+	 * qualified firmware and the Airs even without the handoff.
 	 */
-	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
+	if (t8132 && (IS_ENABLED(CONFIG_APPLE_T8132_PLATFORM_HANDOFF) ||
+		      apple_t8132_firmware_path()) &&
+	    !of_property_present(node, "status"))
 		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);

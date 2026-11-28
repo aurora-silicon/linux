@@ -30,7 +30,7 @@ fn refs(variant:u64)->encode::ComputeRefs {
     let g=0x1000000000+variant*0x100000000;
     encode::ComputeRefs {
         notifier:f+0x600400,qinfo:f+0x200000,user_stamp:f+0x600648,fw_stamp:f+0x600640,
-        work:f+0x100000,work_gva:g+0x100000,seq:f+0x100900,preempt_gva:g+0x200000,
+        work:f+0x100000,work_gva:g+0x100000,seq:f+0x100900,descriptor_fw:0,preempt_gva:g+0x200000,
         its:if variant&2!=0{f+0x500040}else{f+0x1008c0},stats_fw:f+0x300000,
         auxiliary_fw:f+0x400000,auxiliary_gva:g+0x400000,context_store_gva:g+0x500000,
         counter_fw:f+0x500000,pool_state_gva:g+0x600000,page_list_gva:g+0x700000,

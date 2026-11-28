@@ -20,6 +20,7 @@ fn input()->wire::Input {
         loader_va:core::array::from_fn(|i|if wire::LOADERS[i].length!=0 {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}else{0}),
         scratch:HOST+0xa000000,lower_uma:wire::BOOTSTRAP_START+0x200000,
         lower_parameter:wire::BOOTSTRAP_START+0x240000,ktrace_mask:0,progress_recovery:1,
+        enabled_cores: 10,
         power_sample_clks:200_000,power_sample_us:8333,power_sample_period_ms:8,
         timebase_khz:24_000,avg_power_filter_tc_ms:248,lowpeak_limiter_tc_ms:16,
         lowpeak_limiter_ki_q16:134_217,lowpeak_limiter_kp_q16:33_554,coredump_copy_size:0x8000,

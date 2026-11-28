@@ -69,6 +69,19 @@ pub(crate) struct PassRefs {
     pub(crate) ta_scratch: u64,
 }
 
+/// Packed 16-bit tiler hardware configuration fields written to TA `0x1c051`.
+const TA_TILER_CONFIG: u64 = 0x0003 | (0x006b << 16) | (0x0012 << 32) | (0x003a << 48);
+/// Default render cache configuration written to TA `0x1c8f8` and FS `0x100b8`.
+const RENDER_CACHE_CONFIG: u64 = 0x8860;
+/// Default ISP control word written to FS `0x15049` and mirrored at FS work `+0x9d0`.
+const FS_ISP_CTRL_DEFAULT: u64 = 0x10_0000;
+/// Default ZLS per-lane sample mask written to FS `0x15349` and mirrored at FS work `+0x940`.
+const FS_ZLS_SAMPLE_MASK_DEFAULT: u64 = 0x0404_0404;
+/// UMA page-table cache (PTC) policy words for G16G render (`0xa5a1`/`0xa5a9`) and G15S TA/FS.
+const G16G_RENDER_UMA_PTC: u64 = uma_ptc_word(0x20, 0x40, 0x60);
+const G15S_TA_UMA_PTC: u64 = uma_ptc_word(0x20, 0x40, 0x7f);
+const G15S_FS_UMA_PTC: u64 = uma_ptc_word(0x20, 0x40, 0x9f);
+
 /// Write the macOS 27.2 J773g SCS enable pair (`0x017e1 = 1` before `at`, `0x017d9 = 1` at the
 /// end) in the register list of a render stage with scratch: `0x017e1 = 1` first in the TA list
 /// (before `0x1748`) and after `0x1739` in the FS list, with `0x017d9 = 1` last in both, matching
@@ -142,7 +155,7 @@ fn metadata(w: &mut [u8], off: usize, r: &RenderRefs, engine: usize, target: u32
     // Wire sequence stays zero; host reservations are 64-bit notifier state.
 }
 
-fn inline_uma(q: &mut [u8], off: usize, r: &RenderRefs, engine: usize) {
+fn inline_uma(q: &mut [u8], off: usize, r: &RenderRefs, engine: usize, engine_byte: bool) {
     put64(q, off, r.uma_mgr[0]);
     put64(
         q,
@@ -151,7 +164,9 @@ fn inline_uma(q: &mut [u8], off: usize, r: &RenderRefs, engine: usize) {
     );
     put64(q, off + 0x28, r.counter[engine]);
     put32(q, off + 0x30, 0x70 + engine as u32);
-    put8(q, off + 0x34, engine as u8);
+    if engine_byte {
+        put8(q, off + 0x34, engine as u8);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,76 +285,159 @@ pub(crate) fn encode_ta_rt(
             0x7000000000
         })) & 0x7ffffffffe)
         | ((scratch & (1 << 42)) >> 3);
-    let val: [u64; 66] = [
-        1,
-        0x200,
-        compact(p.tilemap_gva),
-        compact(p.tilemap_gva),
-        compact(p.tpc_gva),
-        compact(p.heap_gva) | 1 << 63,
-        compact(p.heap_gva) | 1 << 63,
-        0x003a0012006b0003,
-        1,
-        u64::from(geo.utile_config),
-        u.ppp_multisamplectl,
-        compact(p.pre_gva[0]),
-        compact(p.pre_gva[0]),
-        compact(p.pre_gva[1]),
-        compact(p.pre_gva[1]),
-        1,
-        compact(p.pre_gva[2]) | 1 << 50,
-        0,
-        compact(u.vdm_ctrl_stream_base) & !3,
-        compact(geo.layer_metadata),
-        compact(geo.layer_metadata),
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0x8860,
-        u64::from(geo.region_stride),
-        u64::from(geo.region_stride),
-        0x88,
-        u64::from(2 | (u.ppp_ctrl & 0x201)),
-        u64::from(geo.pixels),
-        u64::from(geo.screen),
-        geo.x_blocks,
-        geo.y_blocks,
-        u64::from(geo.blocks),
-        u64::from(geo.tpc_stride),
-        0x100,
-        u64::from(geo.layer_mode),
-        0,
-        u64::MAX,
-        u64::MAX,
-        0,
-        0x1c,
-        0,
-        rt.intersection[0],
-        rt.intersection[1],
-        rt.intersection[2],
-        rt.intersection[3],
-        rt.intersection[4],
-        rt.intersection[5],
-        rt.size,
-        rt.tail,
-        rt.stack,
-        rt.window,
-        u64::from(r.parameter_id),
-        compact(scene_list_va(r, p)),
-        compact(scene_list_va(r, p)),
-        scratch_word,
-        0x6000400020,
-        0x200000001,
-        u64::from(r.uuid),
-        u64::from(r.uuid),
-        u64::from(r.uuid),
-        // USC base is a shared queue property carried by the render refs.
-        r.usc_base,
-    ];
-    let count = stage_regs(&mut w[ta::REGS..], &ta::SEL, &val, rt.scs, 0);
+    let count = match layout.profile {
+        ta::RegProfile::G16G => {
+            let val: [u64; 66] = [
+                1,
+                0x200,
+                compact(p.tilemap_gva),
+                compact(p.tilemap_gva),
+                compact(p.tpc_gva),
+                compact(p.heap_gva) | 1 << 63,
+                compact(p.heap_gva) | 1 << 63,
+                TA_TILER_CONFIG,
+                1,
+                u64::from(geo.utile_config),
+                u.ppp_multisamplectl,
+                compact(p.pre_gva[0]),
+                compact(p.pre_gva[0]),
+                compact(p.pre_gva[1]),
+                compact(p.pre_gva[1]),
+                1,
+                compact(p.pre_gva[2]) | 1 << 50,
+                0,
+                compact(u.vdm_ctrl_stream_base) & !3,
+                compact(geo.layer_metadata),
+                compact(geo.layer_metadata),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                RENDER_CACHE_CONFIG,
+                u64::from(geo.region_stride),
+                u64::from(geo.region_stride),
+                0x88,
+                u64::from(2 | (u.ppp_ctrl & 0x201)),
+                u64::from(geo.pixels),
+                u64::from(geo.screen),
+                geo.x_blocks,
+                geo.y_blocks,
+                u64::from(geo.blocks),
+                u64::from(geo.tpc_stride),
+                0x100,
+                u64::from(geo.layer_mode),
+                0,
+                u64::MAX,
+                u64::MAX,
+                0,
+                STAGE_CTRL_DEFAULT,
+                0,
+                rt.intersection[0],
+                rt.intersection[1],
+                rt.intersection[2],
+                rt.intersection[3],
+                rt.intersection[4],
+                rt.intersection[5],
+                rt.size,
+                rt.tail,
+                rt.stack,
+                rt.window,
+                u64::from(r.parameter_id),
+                compact(scene_list_va(r, p)),
+                compact(scene_list_va(r, p)),
+                scratch_word,
+                G16G_RENDER_UMA_PTC,
+                DEFAULT_DUPM_CONTROL,
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                // USC base is a shared queue property carried by the render refs.
+                r.usc_base,
+            ];
+            stage_regs(&mut w[ta::REGS..], &ta::SEL, &val, rt.scs, 0)
+        }
+        ta::RegProfile::G15S => {
+            let val: [u64; 74] = [
+                0x200,
+                compact(p.tilemap_gva),
+                compact(p.tilemap_gva),
+                0,
+                0,
+                compact(p.tpc_gva),
+                compact(p.heap_gva) | 1 << 63,
+                compact(p.heap_gva) | 1 << 63,
+                TA_TILER_CONFIG,
+                1,
+                u64::from(geo.utile_config),
+                u.ppp_multisamplectl,
+                compact(p.pre_gva[0]),
+                compact(p.pre_gva[0]),
+                compact(p.pre_gva[1]),
+                compact(p.pre_gva[1]),
+                1,
+                compact(p.pre_gva[2]) | 1 << 50,
+                0,
+                compact(u.vdm_ctrl_stream_base) & !3,
+                0,
+                0,
+                0,
+                1,
+                0,
+                compact(geo.layer_metadata),
+                compact(geo.layer_metadata),
+                0,
+                0,
+                0,
+                0,
+                4 * u64::from(r.pb_init_blocks),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                RENDER_CACHE_CONFIG,
+                u64::from(geo.region_stride),
+                u64::from(geo.region_stride),
+                0x88,
+                u64::from(2 | (u.ppp_ctrl & 0x201)),
+                u64::from(geo.pixels),
+                u64::from(geo.screen),
+                geo.x_blocks,
+                geo.y_blocks,
+                u64::from(geo.blocks),
+                u64::from(geo.tpc_stride),
+                0x100,
+                u64::from(geo.layer_mode),
+                STAGE_CTRL_DEFAULT,
+                STAGE_CTRL_DEFAULT,
+                0,
+                rt.intersection[0],
+                rt.intersection[1],
+                rt.intersection[2],
+                rt.intersection[3],
+                rt.intersection[4],
+                rt.intersection[5],
+                rt.size,
+                rt.tail,
+                rt.stack,
+                rt.window,
+                G15S_TA_UMA_PTC,
+                DEFAULT_DUPM_CONTROL,
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.parameter_id),
+                compact(scene_list_va(r, p)),
+                compact(scene_list_va(r, p)),
+                scratch_word,
+            ];
+            stage_regs(&mut w[ta::REGS..], &ta::SEL_G15S, &val, rt.scs, 0)
+        }
+    };
     put64(w, 4, r.counter[0]);
     put32(w, 0xc, ctx);
     put64(w, 0x10, r.notifier);
@@ -350,7 +448,7 @@ pub(crate) fn encode_ta_rt(
     put64(w, 0x740, p.ta_work_gva + 0x40);
     put16(w, 0x748, count);
     put16(w, 0x74a, count * 12);
-    put64(w, 0x760, p.tpc_fw);
+    put64(w, 0x760, if layout.tpc_is_gva { p.tpc_gva } else { p.tpc_fw });
     put64(w, ta::TPC_BYTES, geo.tpc_bytes);
     put64(w, 0x770, p.ta_seq);
     put32(w, 0x778, ta::SEQ_SIZE as u32);
@@ -380,7 +478,7 @@ pub(crate) fn encode_ta_rt(
     put32(q, 0x7c, r.uuid);
     put32(q, ta::START_SCS, u32::from(RENDER_SCS_ENABLE && rt.scs));
     // TA attachments are filled by render_attachments before publication.
-    inline_uma(q, 0x190, r, 0);
+    inline_uma(q, 0x190, r, 0, layout.inline_uma_engine_byte);
     timestamps(
         q,
         0x1cc,
@@ -406,7 +504,7 @@ pub(crate) fn encode_ta_rt(
     put64(q, f + 0x78, p.ta_seq + 0x190);
     put32(q, f + 0x80, 0u32.wrapping_sub(f as u32));
     put64(q, f + 0x85, work + layout.completion as u64);
-    put8(q, f + 0x8d, 1);
+    put8(q, f + 0x8d, layout.finalize_flag);
     put32(q, f + 0x94, 0x40000002);
 }
 
@@ -481,106 +579,208 @@ pub(crate) fn encode_fs_rt(
 ) {
     w.fill(0);
     q.fill(0);
-    let val: [u64; 82] = [
-        1,
-        u64::from(geo.utile_config),
-        prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi),
-        prog_addr(usc, &u.eot),
-        prog_rsrc(u, &u.bg, u.bg_rsrc_spec_hi),
-        prog_addr(usc, &u.bg),
-        u64::from(u.isp_merge_upper_x),
-        u64::from(u.isp_merge_upper_y),
-        0,
-        0,
-        0,
-        0,
-        u.ppp_multisamplectl,
-        u64::from(geo.isp_blocks),
-        u64::from(geo.isp_blocks),
-        u64::from(geo.screen),
-        0,
-        rt.window | 1 << 9,
-        p.heap_gva & !63,
-        u.isp_scissor_base & !3,
-        u.isp_dbias_base & !3,
-        u64::from(geo.isp_control),
-        u64::from(u.height_px) << 32 | u64::from(u.width_px),
-        0x100000,
-        u64::from(geo.tilebuffer_control),
-        u64::from(u.isp_zls_pixels),
-        u64::from(u.isp_bgobjdepth),
-        u64::from(u.isp_bgobjvals),
-        u.isp_oclqry_base & !15,
-        u.zls_ctrl,
-        0x04040404,
-        0,
-        u.depth.base,
-        u.depth.base,
-        u.stencil.base,
-        u.stencil.base,
-        0,
-        0,
-        0,
-        0,
-        u64::from(u.depth.stride),
-        u64::from(u.depth.stride),
-        u64::from(u.stencil.stride),
-        u64::from(u.stencil.stride),
-        u.depth.comp_base,
-        u64::from(u.depth.comp_stride),
-        u.depth.comp_base,
-        u64::from(u.depth.comp_stride),
-        u.stencil.comp_base,
-        u64::from(u.stencil.comp_stride),
-        u.stencil.comp_base,
-        u64::from(u.stencil.comp_stride),
-        p.tilemap_gva,
-        geo.layer_metadata,
-        u64::from(geo.region_stride) << 26,
-        u64::from(geo.tile_mode),
-        0,
-        0,
-        0,
-        0x8860,
-        p.aux_gva,
-        p.aux_gva,
-        0x1c,
-        0,
-        geo.native_tiles,
-        rt.intersection[0],
-        rt.intersection[1],
-        rt.intersection[2],
-        rt.intersection[3],
-        rt.intersection[4],
-        rt.intersection[5],
-        rt.size,
-        rt.tail,
-        rt.stack,
-        0x6000400020,
-        0x200000001,
-        u64::from(r.uuid),
-        u64::from(r.uuid),
-        u64::from(r.uuid),
-        u64::from(r.parameter_id),
-        compact(scene_list_va(r, p)),
-        usc,
-    ];
-    let count = stage_regs(&mut w[fs::REGS..], &fs::SEL, &val, rt.scs, 1);
+    let count = match layout.profile {
+        fs::RegProfile::G16G => {
+            let val: [u64; 82] = [
+                1,
+                u64::from(geo.utile_config),
+                prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi),
+                prog_addr(usc, &u.eot),
+                prog_rsrc(u, &u.bg, u.bg_rsrc_spec_hi),
+                prog_addr(usc, &u.bg),
+                u64::from(u.isp_merge_upper_x),
+                u64::from(u.isp_merge_upper_y),
+                0,
+                0,
+                0,
+                0,
+                u.ppp_multisamplectl,
+                u64::from(geo.isp_blocks),
+                u64::from(geo.isp_blocks),
+                u64::from(geo.screen),
+                0,
+                rt.window | 1 << 9,
+                p.heap_gva & !63,
+                u.isp_scissor_base & !3,
+                u.isp_dbias_base & !3,
+                u64::from(geo.isp_control),
+                u64::from(u.height_px) << 32 | u64::from(u.width_px),
+                FS_ISP_CTRL_DEFAULT,
+                u64::from(geo.tilebuffer_control),
+                u64::from(u.isp_zls_pixels),
+                u64::from(u.isp_bgobjdepth),
+                u64::from(u.isp_bgobjvals),
+                u.isp_oclqry_base & !15,
+                u.zls_ctrl,
+                FS_ZLS_SAMPLE_MASK_DEFAULT,
+                0,
+                u.depth.base,
+                u.depth.base,
+                u.stencil.base,
+                u.stencil.base,
+                0,
+                0,
+                0,
+                0,
+                u64::from(u.depth.stride),
+                u64::from(u.depth.stride),
+                u64::from(u.stencil.stride),
+                u64::from(u.stencil.stride),
+                u.depth.comp_base,
+                u64::from(u.depth.comp_stride),
+                u.depth.comp_base,
+                u64::from(u.depth.comp_stride),
+                u.stencil.comp_base,
+                u64::from(u.stencil.comp_stride),
+                u.stencil.comp_base,
+                u64::from(u.stencil.comp_stride),
+                p.tilemap_gva,
+                geo.layer_metadata,
+                u64::from(geo.region_stride) << 26,
+                u64::from(geo.tile_mode),
+                0,
+                0,
+                0,
+                RENDER_CACHE_CONFIG,
+                p.aux_gva,
+                p.aux_gva,
+                STAGE_CTRL_DEFAULT,
+                0,
+                geo.native_tiles,
+                rt.intersection[0],
+                rt.intersection[1],
+                rt.intersection[2],
+                rt.intersection[3],
+                rt.intersection[4],
+                rt.intersection[5],
+                rt.size,
+                rt.tail,
+                rt.stack,
+                G16G_RENDER_UMA_PTC,
+                DEFAULT_DUPM_CONTROL,
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.parameter_id),
+                compact(scene_list_va(r, p)),
+                usc,
+            ];
+            stage_regs(&mut w[fs::REGS..], &fs::SEL, &val, rt.scs, 1)
+        }
+        fs::RegProfile::G15S => {
+            let val: [u64; 82] = [
+                1,
+                u64::from(geo.utile_config),
+                prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi),
+                prog_addr(usc, &u.eot),
+                prog_rsrc(u, &u.bg, u.bg_rsrc_spec_hi),
+                prog_addr(usc, &u.bg),
+                u64::from(u.isp_merge_upper_x),
+                u64::from(u.isp_merge_upper_y),
+                0,
+                0,
+                0,
+                0,
+                u.ppp_multisamplectl,
+                u64::from(geo.isp_blocks),
+                u64::from(geo.isp_blocks),
+                u64::from(geo.screen),
+                rt.window | 1 << 9,
+                p.heap_gva & !63,
+                u.isp_scissor_base & !3,
+                u.isp_dbias_base & !3,
+                u64::from(geo.isp_control),
+                u64::from(u.height_px) << 32 | u64::from(u.width_px),
+                FS_ISP_CTRL_DEFAULT,
+                u64::from(geo.tilebuffer_control),
+                u64::from(u.isp_zls_pixels),
+                u64::from(u.isp_bgobjdepth),
+                u64::from(u.isp_bgobjvals),
+                u.isp_oclqry_base & !15,
+                u.zls_ctrl,
+                FS_ZLS_SAMPLE_MASK_DEFAULT,
+                0,
+                u.depth.base,
+                u.depth.base,
+                u.stencil.base,
+                u.stencil.base,
+                0,
+                0,
+                0,
+                0,
+                u64::from(u.depth.stride),
+                u64::from(u.depth.stride),
+                u64::from(u.stencil.stride),
+                u64::from(u.stencil.stride),
+                u.depth.comp_base,
+                u64::from(u.depth.comp_stride),
+                u.depth.comp_base,
+                u64::from(u.depth.comp_stride),
+                u.stencil.comp_base,
+                u64::from(u.stencil.comp_stride),
+                u.stencil.comp_base,
+                u64::from(u.stencil.comp_stride),
+                p.tilemap_gva,
+                geo.layer_metadata,
+                u64::from(geo.region_stride) << 26,
+                u64::from(geo.tile_mode),
+                0,
+                0,
+                0,
+                RENDER_CACHE_CONFIG,
+                p.aux_gva,
+                p.aux_gva,
+                STAGE_CTRL_DEFAULT,
+                STAGE_CTRL_DEFAULT,
+                0,
+                geo.native_tiles,
+                0,
+                rt.intersection[0],
+                rt.intersection[1],
+                rt.intersection[2],
+                rt.intersection[3],
+                rt.intersection[4],
+                rt.intersection[5],
+                rt.size,
+                rt.tail,
+                rt.stack,
+                u64::from(r.parameter_id),
+                compact(scene_list_va(r, p)),
+                G15S_FS_UMA_PTC,
+                DEFAULT_DUPM_CONTROL,
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+                u64::from(r.uuid),
+            ];
+            stage_regs(&mut w[fs::REGS..], &fs::SEL_G15S, &val, rt.scs, 1)
+        }
+    };
     put32(w, 0, 1);
     put64(w, 4, r.counter[1]);
     put32(w, 0xc, ctx);
     put64(w, 0x14, p.fs_seq);
-    put32(w, 0x1c, fs::SEQ_SIZE as u32);
+    put32(w, 0x1c, layout.seq_size as u32);
     put64(w, 0x20, r.notifier + 0x200);
     put64(w, 0x28, r.pb_mgr);
     put64(w, 0x30, p.scene);
     put64(w, 0x38, p.scene + 0x100);
     put64(w, 0x40, p.tilemap_gva);
-    put32(w, 0x50, 1);
-    put32(w, 0x54, geo.isp_blocks);
-    put32(w, 0x60, geo.x_blocks as u32);
-    put32(w, 0x64, geo.y_blocks as u32);
-    put32(w, 0x68, geo.blocks);
+    match layout.profile {
+        fs::RegProfile::G16G => {
+            put32(w, 0x50, 1);
+            put32(w, 0x54, geo.isp_blocks);
+            put32(w, 0x60, geo.x_blocks as u32);
+            put32(w, 0x64, geo.y_blocks as u32);
+            put32(w, 0x68, geo.blocks);
+        }
+        fs::RegProfile::G15S => {
+            put32(w, 0x48, 0x88);
+            put32(w, 0x50, 1);
+            put32(w, 0x54, geo.isp_blocks);
+            put32(w, 0x68, u.isp_merge_upper_x);
+            put32(w, 0x6c, u.isp_merge_upper_y);
+        }
+    }
     put32(w, 0x78, geo.tiles);
     put64(w, 0x780, p.fs_work_gva + 0x80);
     put16(w, 0x788, count);
@@ -597,7 +797,7 @@ pub(crate) fn encode_fs_rt(
     );
     put64(w, 0x930, prog_addr(usc, &u.partial_bg));
     put64(w, 0x938, u.zls_ctrl);
-    put64(w, 0x940, 0x04040404);
+    put64(w, 0x940, FS_ZLS_SAMPLE_MASK_DEFAULT);
     put64(w, 0x948, u.depth.base);
     put64(w, 0x950, u64::from(u.depth.stride));
     put64(w, 0x958, u64::from(u.depth.comp_stride));
@@ -617,7 +817,7 @@ pub(crate) fn encode_fs_rt(
         0x9c8,
         u64::from(u.height_px) << 32 | u64::from(u.width_px),
     );
-    put64(w, 0x9d0, 0x100000);
+    put64(w, 0x9d0, FS_ISP_CTRL_DEFAULT);
     put64(w, 0x9d8, u64::from(geo.tile_mode));
     put64(w, 0x9f4, prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi));
     put64(w, 0x9fc, prog_addr(usc, &u.eot));
@@ -647,7 +847,7 @@ pub(crate) fn encode_fs_rt(
     put64(q, 0x1c, p.scene);
     put64(q, 0x24, r.activity[1]);
     put64(q, 0x2c, work + 0xb70);
-    put64(q, 0x34, p.scene + 0x54);
+    put64(q, 0x34, p.scene + layout.scene_field_off);
     put64(q, 0x3c, work + 0xbb0);
     put64(q, 0x44, work + 0xbb4);
     put64(q, 0x4c, r.qinfo[1]);
@@ -659,10 +859,10 @@ pub(crate) fn encode_fs_rt(
     put64(q, 0x84, work + 0xbf0);
     put32(q, 0xa0, r.uuid);
     put32(q, fs::START_SCS, u32::from(RENDER_SCS_ENABLE && rt.scs));
-    inline_uma(q, 0x1b0, r, 1);
+    inline_uma(q, 0x1b0, r, 1, layout.inline_uma_engine_byte);
     timestamps(
         q,
-        0x1ec,
+        layout.ts_start,
         work,
         r.qinfo[1],
         ts_va[2] != 0 || ts_va[3] != 0,
@@ -670,7 +870,7 @@ pub(crate) fn encode_fs_rt(
         1,
         layout.auxiliary,
     );
-    let f = 0x288;
+    let f = layout.finalize;
     put32(q, f, 8);
     put32(q, f + 4, r.uuid);
     put64(q, f + 0xc, r.fw_stamp[1]);
@@ -689,15 +889,36 @@ pub(crate) fn encode_fs_rt(
     put64(q, f + 0x98, p.fs_seq + 0x1b0);
     put32(q, f + 0xa0, 0u32.wrapping_sub(f as u32));
     put64(q, f + 0xa5, work + layout.completion as u64);
-    put32(q, f + 0xad, 1);
-    put8(q, f + 0xb1, 1);
-    put32(q, f + 0xb2, 0x71);
-    put32(q, f + 0xbc, 0x40000002);
+    if layout.compact_finalize {
+        put32(q, f + 0xad, 0x71);
+        put32(q, f + 0xb4, work::op::END);
+    } else {
+        put32(q, f + 0xad, 1);
+        put8(q, f + 0xb1, 1);
+        put32(q, f + 0xb2, 0x71);
+        put32(q, f + 0xbc, work::op::END);
+    }
 }
 
 /// Complete attachment blocks include the count at the last word. The scheduler
 /// has validated full retained ranges; alignment is for firmware cache lines.
 pub(crate) fn render_attachments(q: &mut [u8], engine: usize, att: &[uapi::drm_asahi_attachment]) {
+    let finalize = if engine == 0 {
+        ta::FINALIZE
+    } else {
+        fs::FINALIZE
+    };
+    render_attachments_for(q, engine, finalize, att);
+}
+
+/// [`render_attachments`] with an explicit finalize-record offset for ABIs whose FS
+/// microsequence finalize offset differs from [`fs::FINALIZE`].
+pub(crate) fn render_attachments_for(
+    q: &mut [u8],
+    engine: usize,
+    finalize: usize,
+    att: &[uapi::drm_asahi_attachment],
+) {
     let base = if engine == 0 { 0x88 } else { 0xa8 };
     for (i, a) in att.iter().enumerate().take(16) {
         let start = a.pointer & !127;
@@ -709,11 +930,7 @@ pub(crate) fn render_attachments(q: &mut [u8], engine: usize, att: &[uapi::drm_a
         put16(q, off + 0xe, 1);
     }
     put32(q, base + 0x100, att.len().min(16) as u32);
-    let f = if engine == 0 {
-        ta::FINALIZE + 0x84
-    } else {
-        fs::FINALIZE + 0xa4
-    };
+    let f = finalize + if engine == 0 { 0x84 } else { 0xa4 };
     put8(q, f, u8::from(!att.is_empty()));
 }
 

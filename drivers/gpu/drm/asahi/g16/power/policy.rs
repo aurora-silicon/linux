@@ -304,6 +304,163 @@ impl Governor {
     }
 }
 
+/// Startup/fault confirmation cadence (minimum spacing across 10 distinct sensor polls)
+/// and gradual cooling-release step interval.
+pub(crate) const ZONE_CONFIRM_NS: u64 = 20_000_000;
+pub(crate) const ZONE_CONFIRM_READS: u32 = 10;
+pub(crate) const ZONE_RELEASE_NS: u64 = 200_000_000;
+
+/// Machine-supplied thermal-zone trip limits (millidegrees Celsius) read from the kernel
+/// thermal zone (`passive`/`active` trip with hysteresis, and `hot`/`critical` trip).
+/// If the machine provides no valid limits, [`ZoneBackstop`] fails closed at [`COOLING_MAX`] (S1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ZoneLimits {
+    pub(crate) release_mc: i64,
+    pub(crate) hot_mc: i64,
+    pub(crate) critical_mc: i64,
+}
+
+impl ZoneLimits {
+    pub(crate) const fn is_valid(&self) -> bool {
+        self.release_mc > 0 && self.release_mc <= self.hot_mc && self.critical_mc > self.hot_mc
+    }
+}
+
+/// Cooling level for a measured thermal-zone die temperature against machine-supplied trip
+/// limits: 0 below `hot_mc`, 1..=7 linearly across `hot_mc..critical_mc`, and [`COOLING_MAX`]
+/// at or above `critical_mc` (or whenever `limits` are invalid).
+pub(crate) fn zone_heat_level(mc: i64, limits: ZoneLimits) -> u32 {
+    if !limits.is_valid() {
+        return COOLING_MAX;
+    }
+    if mc < limits.hot_mc {
+        0
+    } else if mc >= limits.critical_mc {
+        COOLING_MAX
+    } else {
+        let span = limits.critical_mc - limits.hot_mc;
+        let delta = mc - limits.hot_mc;
+        let steps = (COOLING_MAX - 1) as i64;
+        (((delta * steps) / span) as u32 + 1).min(COOLING_MAX)
+    }
+}
+
+/// Fail-closed thermal backstop driven by kernel SoC die thermal zones when a GPU DT node
+/// has no `apple,pmp` telemetry bridge. Starts at [`COOLING_MAX`] (S1), requires
+/// [`ZONE_CONFIRM_READS`] distinct fresh sensor polls with valid machine-supplied trip limits
+/// before stepping down gradually, and immediately clamps back to [`COOLING_MAX`] on missing,
+/// stale, unconfigured, or critical readings.
+pub(crate) struct ZoneBackstop {
+    level: u32,
+    hard: bool,
+    good_reads: u32,
+    last_seq: u64,
+    good_ns: u64,
+    release_ns: u64,
+}
+
+impl ZoneBackstop {
+    pub(crate) const fn new() -> Self {
+        Self {
+            level: COOLING_MAX,
+            hard: true,
+            good_reads: 0,
+            last_seq: 0,
+            good_ns: 0,
+            release_ns: 0,
+        }
+    }
+
+    pub(crate) const fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Incorporates one sampled temperature (millidegrees Celsius), poller sequence `seq`,
+    /// machine-supplied `limits`, or sensor `error` at `now`.
+    pub(crate) fn sample(
+        &mut self,
+        now: u64,
+        seq: u64,
+        mc: i64,
+        limits: Option<ZoneLimits>,
+        error: bool,
+    ) -> u32 {
+        let Some(limits) = limits.filter(ZoneLimits::is_valid) else {
+            self.level = COOLING_MAX;
+            self.hard = true;
+            self.good_reads = 0;
+            if seq != 0 {
+                self.last_seq = seq;
+            }
+            self.good_ns = now;
+            self.release_ns = now;
+            return self.level;
+        };
+
+        if error || seq == 0 || mc <= 0 || mc >= limits.critical_mc {
+            self.level = COOLING_MAX;
+            self.hard = true;
+            self.good_reads = 0;
+            if seq != 0 {
+                self.last_seq = seq;
+            }
+            self.good_ns = now;
+            self.release_ns = now;
+            return self.level;
+        }
+
+        let fresh = seq != self.last_seq;
+        if self.hard {
+            if mc < limits.hot_mc {
+                let due = self.good_reads == 0 || now.wrapping_sub(self.good_ns) >= ZONE_CONFIRM_NS;
+                if fresh && due {
+                    self.last_seq = seq;
+                    self.good_ns = now;
+                    self.good_reads = self.good_reads.saturating_add(1).min(ZONE_CONFIRM_READS);
+                }
+                if self.good_reads >= ZONE_CONFIRM_READS {
+                    self.hard = false;
+                }
+            } else {
+                self.last_seq = seq;
+                self.good_reads = 0;
+                self.good_ns = now;
+            }
+            self.release_ns = now;
+            if self.hard {
+                return self.level;
+            }
+        }
+
+        if fresh {
+            self.last_seq = seq;
+        }
+        let target = zone_heat_level(mc, limits);
+        if target > self.level {
+            self.level = target;
+            self.release_ns = now;
+        } else if fresh
+            && mc < limits.release_mc
+            && now.wrapping_sub(self.release_ns) >= ZONE_RELEASE_NS
+        {
+            self.level = self.level.saturating_sub(1);
+            self.release_ns = now;
+        } else if mc >= limits.release_mc {
+            self.release_ns = now;
+        }
+        self.level
+    }
+
+    /// Retains a cooling-device governor restriction inside the gradual release envelope.
+    pub(crate) fn observe(&mut self, now: u64, governor: u32) {
+        let clamped = governor.min(COOLING_MAX);
+        if clamped > self.level {
+            self.level = clamped;
+            self.release_ns = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,5 +822,204 @@ mod tests {
             assert!(g.govern(now, PSTATE_MAX, false) <= FLOOR + 1);
         }
         assert_eq!(g.demand, FLOOR);
+    }
+
+    #[test]
+    fn zone_backstop_starts_fail_closed_releases_gradually_and_clamps_on_heat_or_fault() {
+        let limits = ZoneLimits {
+            release_mc: 75_000,
+            hot_mc: 80_000,
+            critical_mc: 94_000,
+        };
+        let mut z = ZoneBackstop::new();
+        assert_eq!(z.level(), COOLING_MAX);
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Missing or invalid machine trip limits keep the GPU clamped at S1 forever.
+        for i in 1..=20u64 {
+            assert_eq!(
+                z.sample(T + i * ZONE_CONFIRM_NS, i, 55_000, None, false),
+                COOLING_MAX
+            );
+        }
+        let bad_limits = ZoneLimits {
+            release_mc: 80_000,
+            hot_mc: 80_000,
+            critical_mc: 80_000,
+        };
+        assert_eq!(
+            z.sample(T + 500_000_000, 21, 55_000, Some(bad_limits), false),
+            COOLING_MAX
+        );
+
+        // Sensor errors or non-positive readings keep the GPU clamped at S1.
+        assert_eq!(
+            z.sample(T + 1_000_000_000, 22, 0, Some(limits), true),
+            COOLING_MAX
+        );
+        assert_eq!(
+            z.sample(T + 1_020_000_000, 23, 0, Some(limits), false),
+            COOLING_MAX
+        );
+
+        // Repeated reads of a single cached temperature (unchanged seq) CANNOT satisfy
+        // startup confirmation even as timestamps advance past 10 * ZONE_CONFIRM_NS.
+        let base = T + 2_000_000_000;
+        let cached_seq = 100u64;
+        for step in 0..50u64 {
+            assert_eq!(
+                z.sample(
+                    base + step * ZONE_CONFIRM_NS,
+                    cached_seq,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX
+            );
+        }
+        // Advancing past release interval with the same cached seq still stays at S1.
+        assert_eq!(
+            z.sample(
+                base + 60 * ZONE_CONFIRM_NS + ZONE_RELEASE_NS,
+                cached_seq,
+                55_000,
+                Some(limits),
+                false
+            ),
+            COOLING_MAX
+        );
+
+        // 9 more distinct fresh sensor polls complete the 10-poll startup confirmation.
+        let fresh_base = base + 60 * ZONE_CONFIRM_NS + 2 * ZONE_RELEASE_NS;
+        for step in 1..ZONE_CONFIRM_READS as u64 {
+            assert_eq!(
+                z.sample(
+                    fresh_base + step * ZONE_CONFIRM_NS,
+                    cached_seq + step,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX
+            );
+        }
+        // Gradual release: one cooling level per fresh poll every 200 ms below release_mc.
+        let confirmed = fresh_base + (ZONE_CONFIRM_READS as u64 - 1) * ZONE_CONFIRM_NS;
+        let mut seq = cached_seq + ZONE_CONFIRM_READS as u64;
+        assert_eq!(
+            z.sample(confirmed + ZONE_RELEASE_NS - 1, seq, 55_000, Some(limits), false),
+            COOLING_MAX
+        );
+        for step in 1..=COOLING_MAX as u64 {
+            seq += 1;
+            assert_eq!(
+                z.sample(
+                    confirmed + step * ZONE_RELEASE_NS,
+                    seq,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX - step as u32
+            );
+        }
+        assert_eq!(z.level(), 0);
+        assert_eq!(cooling_ceiling(8, z.level()), 8);
+
+        // Progressive heat throttling across hot_mc..critical_mc, hard clamp at >= critical_mc.
+        let hot_t = confirmed + 10 * ZONE_RELEASE_NS;
+        seq += 1;
+        assert_eq!(z.sample(hot_t, seq, 79_999, Some(limits), false), 0);
+        seq += 1;
+        assert_eq!(z.sample(hot_t + 10_000_000, seq, 80_000, Some(limits), false), 1);
+        seq += 1;
+        assert_eq!(z.sample(hot_t + 20_000_000, seq, 86_000, Some(limits), false), 4);
+        // Holding between release_mc and hot_mc does not release cooling.
+        seq += 1;
+        assert_eq!(
+            z.sample(hot_t + 500_000_000, seq, 75_000, Some(limits), false),
+            4
+        );
+        seq += 1;
+        assert_eq!(
+            z.sample(hot_t + 1_000_000_000, seq, 79_000, Some(limits), false),
+            4
+        );
+        // Critical heat immediately returns to hard COOLING_MAX (S1).
+        seq += 1;
+        assert_eq!(
+            z.sample(
+                hot_t + 1_010_000_000,
+                seq,
+                limits.critical_mc,
+                Some(limits),
+                false
+            ),
+            COOLING_MAX
+        );
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Different machine-supplied trip limits govern dynamically without code constants.
+        let higher_limits = ZoneLimits {
+            release_mc: 85_000,
+            hot_mc: 90_000,
+            critical_mc: 104_000,
+        };
+        let mut z2 = ZoneBackstop::new();
+        for step in 1..=ZONE_CONFIRM_READS as u64 {
+            z2.sample(
+                base + step * ZONE_CONFIRM_NS,
+                step,
+                84_000,
+                Some(higher_limits),
+                false,
+            );
+        }
+        let c2 = base + (ZONE_CONFIRM_READS as u64) * ZONE_CONFIRM_NS;
+        for step in 1..=COOLING_MAX as u64 {
+            z2.sample(
+                c2 + step * ZONE_RELEASE_NS,
+                ZONE_CONFIRM_READS as u64 + step,
+                84_000,
+                Some(higher_limits),
+                false,
+            );
+        }
+        assert_eq!(z2.level(), 0);
+        // 89 C is still below higher_limits.hot_mc (90 C).
+        assert_eq!(
+            z2.sample(
+                c2 + 9 * ZONE_RELEASE_NS,
+                100,
+                89_000,
+                Some(higher_limits),
+                false
+            ),
+            0
+        );
+        // Governor observation is retained in the release envelope.
+        z2.observe(c2 + 9 * ZONE_RELEASE_NS, 5);
+        assert_eq!(z2.level(), 5);
+        assert_eq!(
+            z2.sample(
+                c2 + 9 * ZONE_RELEASE_NS + 1,
+                101,
+                84_000,
+                Some(higher_limits),
+                false
+            ),
+            5
+        );
+        assert_eq!(
+            z2.sample(
+                c2 + 10 * ZONE_RELEASE_NS,
+                102,
+                84_000,
+                Some(higher_limits),
+                false
+            ),
+            4
+        );
     }
 }

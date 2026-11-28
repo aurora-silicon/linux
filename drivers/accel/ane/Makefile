@@ -11,7 +11,7 @@ obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST) += ane_fw_platform_test.o \
 	ane_h16_pending_test.o ane_h16_hwx_test.o ane_h16_preload_test.o \
 	ane_h16_program_test.o ane_fw_cold_test.o ane_h16_accel_test.o \
 	ane_fw_pages_test.o \
-	ane_t6021_lifetime_test.o
+	ane_t6021_lifetime_test.o ane_t6021_fwmap_test.o
 
 ane-y := \
 	ane_drv.o \

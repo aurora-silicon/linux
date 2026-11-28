@@ -8,7 +8,7 @@ struct platform_device;
 struct dcp_sound_cookie;
 
 int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie);
-int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie);
+int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie, u64 *gen);
 int dcp_audiosrv_stoplink(struct device *dev);
 int dcp_audiosrv_unprepare(struct device *dev);
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize);

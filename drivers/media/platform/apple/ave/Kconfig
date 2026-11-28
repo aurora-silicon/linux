@@ -45,3 +45,17 @@ config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	  entropy interleave, alignment refusal, seven-channel discovery and
 	  encoding refusal.
 	  These tests run without firmware or encoder hardware.
+
+config VIDEO_APPLE_AVE_IPC_KUNIT_TEST
+	bool "KUnit tests for Apple AVE firmware and userspace input checks" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && VIDEO_APPLE_AVE=y
+	default KUNIT_ALL_TESTS
+	help
+	  Feed malformed firmware input to the AVE IPC layer: hello words,
+	  channel tables with overlapping or out-of-range rings, ring index
+	  wrap, full and empty rings, command acks and messages outside the
+	  shared window, log lines and shared-memory requests. Also test that
+	  the 6070 Start and Process builders refuse out-of-range session
+	  counts, unaligned buffers and short codec state before writing.
+	  The tests use kernel memory for the shared window and the mailbox
+	  and run without firmware or encoder hardware.

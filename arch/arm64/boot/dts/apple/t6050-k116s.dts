@@ -9,6 +9,9 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
+#define T6050_K_N1_FIRMWARE	"apple/centauri/k116s-ftab.bin"
+#define T6050_K_BOARD_ID	0x16
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -23,16 +26,6 @@
 #define T6050_K116S
 #include "t6050-peripherals.dtsi"
 
-/ {
-	aliases {
-		/* The loader fills the N1's factory addresses through these */
-		wifi0 = &n1_alpha;
-		bluetooth0 = &n1_beta;
-		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
-		sep = &sep;
-	};
-};
-
 &pinctrl_ap {
 	/*
 	 * Pin 112 takes an SError when read, so only the pins a node names are
@@ -44,319 +37,11 @@
 };
 
 /*
- * PCIe port 0: the N1 (Wi-Fi and Bluetooth), laid out as on J714s. ADT apcie0
- * gives port 0's registers and IRQ 1523, pci-bridge0's PERST# is GPIO 80, and
- * the N1's three functions are on DART streams 1-3. The platform ID is this
- * board's ADT /chosen board-id (0x16) << 16 | chip 0x6050.
- *
- * PCIe port 1: the SD card reader (ADT apcie0/pci-bridge1/pcie-sdreader, a
- * GL9755), as on J714s. The boot loader leaves the port down, so the kernel
- * trains it. From this board's ADT:
- *   port1, phy1, intr2axi1: apcie0 reg[22], reg[24], reg[25] (port 0's are
- *     reg[16], reg[18], reg[19]), behind /arm-io's ranges (+0x200000000)
- *   phy-shared: apcie0 reg[3], the shared PHY's state, which the train reads;
- *     the boot loader leaves the PHY up with port 0
- *   IRQ 1531: apcie0 interrupts[1]
- *   PERST#: pci-bridge1 function-perst, gpio0 pin 0x51 (81)
- *   power: pcie-sdreader function-sd_pwr_en, SMC pcIO (0x0, 0x190000), output
- *     0 of smc_pcio below
- *   link tunables: pci-bridge1's apcie-config-tunables, pcie-rc-tunables and
- *     pcie-rc-gen{3,4,5}-shadow-tunables, as (offset, size, mask, value)
- * The reader is behind dart-apcie1 (0x211000000, IRQ 1532; manual-availability:
- * it answers only once the root complex is up). The ADT's mapper-apcie1 names
- * no stream (the bridge requests one at run time), so stream 1 is this tree's
- * choice, below the DART's first bypass stream (16), as on J714s.
- * pci-bridge1's function-clkreq (gpio0 pin 0x4d) is not described: the
- * driver does not take CLKREQ# lines.
+ * PCIe port 0 (the N1) and port 1 (the SD card reader) are in t6050-k114-k116.dtsi.
+ * This board drives one SMC pcIO output (below), so the reader's power is output 0.
  */
-&pcie0 {
-	reg = <0x1c 0xb0000000 0x0 0x10000000>,
-	      <0x4 0x14000000 0x0 0x4000>,
-	      <0x4 0x10028000 0x0 0x8000>,
-	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>,
-	      <0x4 0x11028000 0x0 0x8000>,
-	      <0x4 0x17014000 0x0 0x4000>,
-	      <0x4 0x11024000 0x0 0x4000>,
-	      <0x4 0x17020000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0", "port1", "phy1", "intr2axi1",
-		    "phy-shared";
-	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>,
-		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
-	interrupt-names = "port0", "port1";
-	iommu-map = <0x100 &dart_apcie0 1 3>,
-		    <0x200 &apcie1_dart 1 1>;
-	bus-range = <0 4>;
-	/* apcie1_dart probes only once port 1 is up: the host must not wait for it */
-	post-init-providers = <&apcie1_dart>;
-	status = "okay";
-
-	port00: pci@0,0 {
-		device_type = "pci";
-		reg = <0x0 0 0 0 0>;
-		bus-range = <1 1>;
-		apple,link-trained-by-bootloader;
-		/* PERST#: ADT pci-bridge0 function-perst, GPIO 80 */
-		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
-		status = "disabled";
-
-		#address-cells = <3>;
-		#size-cells = <2>;
-		ranges;
-
-		interrupt-controller;
-		#interrupt-cells = <1>;
-		interrupt-map-mask = <0 0 0 7>;
-		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
-				<0 0 0 2 &port00 0 0 0 1>,
-				<0 0 0 3 &port00 0 0 0 2>,
-				<0 0 0 4 &port00 0 0 0 3>;
-
-		n1_control: control@0,0 {
-			compatible = "pci106b,1900";
-			reg = <0x10000 0x0 0x0 0x0 0x0>;
-			firmware-name = "apple/centauri/k116s-ftab.bin";
-			apple,centauri-platform-id = <0x00166050>;
-			apple,centauri-protocol = <27>;
-		};
-
-		n1_alpha: wifi@0,1 {
-			compatible = "pci106b,1902";
-			reg = <0x10100 0x0 0x0 0x0 0x0>;
-			local-mac-address = [00 00 00 00 00 00];
-		};
-
-		n1_beta: bluetooth@0,2 {
-			compatible = "pci106b,1903";
-			reg = <0x10200 0x0 0x0 0x0 0x0>;
-			local-bd-address = [00 00 00 00 00 00];
-		};
-	};
-
-	port01: pci@1,0 {
-		device_type = "pci";
-		reg = <0x800 0 0 0 0>;
-		bus-range = <2 2>;
-		/* Down at boot: the kernel trains it, powering the reader first */
-		apple,link-trained-by-bootloader;
-		/* ADT pcie-sdreader function-sd_pwr_en: SMC pcIO output 0 below */
-		pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
-		/* PERST#: ADT pci-bridge1 function-perst, GPIO 81 */
-		reset-gpios = <&pinctrl_ap 81 GPIO_ACTIVE_LOW>;
-		/* ADT pci-bridge1 */
-		apple,apcie-config-tunables = <0x140 4 0x1 0x1>,
-			<0x144 4 0xffffff 0x253770>,
-			<0x8a8 4 0x1 0x1>,
-			<0x8ac 4 0x1 0x1>;
-		apple,pcie-rc-tunables = <0x78 4 0x7000 0x0>,
-			<0x194 4 0x2 0x2>,
-			<0xb80 4 0x7f3f3f 0x7f1e1e>,
-			<0xb88 4 0x7f3f3f 0x7f1e1e>;
-		apple,pcie-rc-gen3-shadow-tunables = <0x154 4 0xf0f0f0f 0x5050505>,
-			<0x890 4 0x3000000 0x0>,
-			<0x8a8 4 0xffff0f 0x1>;
-		apple,pcie-rc-gen4-shadow-tunables = <0x178 4 0xffff 0x5555>,
-			<0x890 4 0x3000000 0x1000000>,
-			<0x8a8 4 0xffff0f 0x1>;
-		apple,pcie-rc-gen5-shadow-tunables = <0x1ac 4 0xffff 0x5555>,
-			<0x890 4 0x3000000 0x2000000>,
-			<0x8a8 4 0xffff0f 0x1>;
-
-		#address-cells = <3>;
-		#size-cells = <2>;
-		ranges;
-
-		interrupt-controller;
-		#interrupt-cells = <1>;
-		interrupt-map-mask = <0 0 0 7>;
-		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
-				<0 0 0 2 &port01 0 0 0 1>,
-				<0 0 0 3 &port01 0 0 0 2>,
-				<0 0 0 4 &port01 0 0 0 3>;
-
-		/*
-		 * The GL9755. Card detect and write protect are active high: ADT
-		 * pcie-sdreader card-detect-polarity and write-protect-polarity = 1.
-		 */
-		sdhci0: mmc@0,0 {
-			compatible = "pci17a0,9755";
-			reg = <0x20000 0x0 0x0 0x0 0x0>;
-			cd-inverted;
-			wp-inverted;
-		};
-	};
-};
-
-/* ADT dart-apcie1 manual-availability: pcie-apple enables it once port 1 is up */
-&apcie1_dart {
-	apple,manual-availability;
-	status = "okay";
-};
-
-/*
- * Type-C, from the ADT (as on J714s):
- *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
- *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
- *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
- *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
- */
-
-/* Left-front port (ATC1): the SN201202x hpm1 and the connector graph */
-&nub_spmi_a0 {
-	status = "okay";
-
-	hpm1: usb-pd@a {
-		compatible = "apple,sn201202x";
-		reg = <0xa SPMI_USID>;
-
-		typec1: connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Left-front";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					typec1_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					typec1_ss: endpoint {
-						remote-endpoint = <&atc1_phy_typec>;
-					};
-				};
-			};
-		};
-	};
-};
-
-&atc1_phy_mbox {
-	status = "okay";
-};
-
-&atc1_phy {
-	status = "okay";
-
-	port {
-		atc1_phy_typec: endpoint {
-			remote-endpoint = <&typec1_ss>;
-		};
-	};
-};
-
-&usb_drd1 {
-	status = "okay";
-
-	port {
-		usb_drd1_hs: endpoint {
-			remote-endpoint = <&typec1_hs>;
-		};
-	};
-};
-
-&usb_drd1_dart_0 {
-	status = "okay";
-};
-
-&usb_drd1_dart_1 {
-	status = "okay";
-};
-
-/*
- * Right port (ATC2): hpm2 on nub-spmi-a1, USB only (dcpext0's DisplayPort route
- * through ATC2 stays off). The driver polls the generation 4 bus and refuses an
- * interrupt, so it takes the first register window only, as on J714s.
- */
-&nub_spmi_a1 {
-	reg = <0x2 0x8a1a8000 0x0 0x4000>;
-	/delete-property/ interrupts;
-	status = "okay";
-
-	hpm2: usb-pd@c {
-		compatible = "apple,sn201202x";
-		reg = <0xc SPMI_USID>;
-
-		typec2: connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Right";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					typec2_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					typec2_ss: endpoint {
-						remote-endpoint = <&atc2_phy_typec>;
-					};
-				};
-			};
-		};
-	};
-};
-
-&ps_atc2_common {
-	status = "okay";
-};
-
-&ps_atc2_usb_aon {
-	status = "okay";
-};
-
-&ps_atc2_phymxwrap {
-	status = "okay";
-};
-
-&ps_atc2_usb {
-	status = "okay";
-};
-
-&atc2_phy_mbox {
-	status = "okay";
-};
-
-&atc2_phy {
-	status = "okay";
-
-	port {
-		atc2_phy_typec: endpoint {
-			remote-endpoint = <&typec2_ss>;
-		};
-	};
-};
-
-&usb_drd2 {
-	status = "okay";
-
-	port {
-		usb_drd2_hs: endpoint {
-			remote-endpoint = <&typec2_hs>;
-		};
-	};
-};
-
-&usb_drd2_dart_0 {
-	status = "okay";
-};
-
-&usb_drd2_dart_1 {
-	status = "okay";
+&port01 {
+	pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
 };
 
 /*
@@ -382,95 +67,6 @@
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
 	};
-};
-
-/*
- * The internal panel and the display coprocessor, for the boot loader's display
- * hand-off (aura, chosen.aurora,t6050-display=1). Everything stays disabled: the
- * loader checks the ADT and the live DCP and DART state, publishes the DCP's
- * firmware properties, reserves the ADT /vram as the framebuffer and only then
- * enables dcp, its DARTs and mailbox and the display subsystem. A loader without
- * the hand-off leaves the boot framebuffer to simpledrm.
- */
-/ {
-	aliases {
-		/* The loader writes apple,notch-height into the "dcp" alias */
-		dcp = &dcp;
-		disp0 = &display;
-	};
-
-	/* As on J714s, with the internal display's DART (disp0, SID 0) */
-	display: display-subsystem {
-		compatible = "apple,display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
-};
-
-/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
-&dcp_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&disp0_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcp {
-	/*
-	 * ADT disp0 clock-ids. The loader adds the clock nodes, "clocks" and the
-	 * bandwidth request scratch ("apple,bw-scratch") when it hands the panel
-	 * over, as on the J714s, and refuses a tree that already has them.
-	 */
-	apple,clock-ids = <361 458>;
-
-	/*
-	 * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
-	 * these are the panel's active area, for the DPI only.
-	 */
-	panel {
-		compatible = "apple,panel-k116", "apple,panel";
-		width-mm = <345>;
-		height-mm = <223>;
-	};
-};
-
-/* The ADT lists no clocks for the external engines (clock-ids = []) */
-&dcpext1 {
-	apple,clock-ids;
-};
-
-&dcpext2 {
-	apple,clock-ids;
-};
-
-&dcpext3 {
-	apple,clock-ids;
-};
-
-/* ADT dart-dcpextN and dart-dispextN: vm-base 1 TiB, vm-size 3 TiB */
-&dcpext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
 };
 
 /*
@@ -509,10 +105,18 @@
 / {
 	aliases {
 		keyboard = &keyboard;
-		/* The loader fills the PHYs' tunables from the ADT through these */
-		atcphy1 = &atc1_phy;
-		atcphy2 = &atc2_phy;
 	};
+};
+
+/* The USB-C ports ATC1 and ATC2, as on the other K boards */
+#include "t6050-k114-k116-usb.dtsi"
+
+/*
+ * Right port (ATC2): nub-spmi-a1 takes the first register window only, as on
+ * J714s.
+ */
+&nub_spmi_a1 {
+	reg = <0x2 0x8a1a8000 0x0 0x4000>;
 };
 
 /*
@@ -564,29 +168,6 @@
 };
 
 #include "t6050-k116s-pmp-tunables.dtsi"
-
-/*
- * The SEP (ADT sep, dart-sep), as on the J714s: its mailbox, and its power domain with the two
- * fabric parents left to the firmware, which genpd votes on and never turns off. The boot
- * loader enables the SEP itself through its alias.
- */
-&sep_mbox {
-	status = "okay";
-};
-
-&ps_sep {
-	status = "okay";
-};
-
-&ps_fab8_soc {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-&ps_fab0_piogw {
-	apple,firmware-owned;
-	status = "okay";
-};
 
 /* Sound: the J714s description, every value checked against the K116s ADT. */
 /*
@@ -851,7 +432,26 @@
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
 /* The GPU, handed over by the boot loader */
-#include "t6050-k116s-gpu.dtsi"
+#include "t6050-k114-k116-gpu.dtsi"
+
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+};
+
+/*
+ * As t6050-j714s.dts: the GPU on the PMP's GFX report entry (report@f, on ps_gfx), so the PMP
+ * is told the GPU is on only while it is powered. This board runs the PMP with its report
+ * (&pmp0_report above).
+ */
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
 
 /*
  * The camera: the T6050 ISP as J716c and J714s describe it. From the K116sAP ADT (27.2):
@@ -914,57 +514,9 @@
 	status = "okay";
 };
 
-/*
- * Touch ID (ADT spi2/mesa): the Mesa sensor on spi2 at 8 MHz, chip select 0,
- * powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP GPIO 138, as
- * on the J714s. spi2 runs from the 24 MHz reference (ADT clock-ids 451).
- */
-&ps_nub_gpio {
-	status = "okay";
-};
-
-&nub_gpio0 {
-	status = "okay";
-};
-
-&ps_spi2 {
-	status = "okay";
-};
-
-&spi2 {
-	clocks = <&clkref>;
-	status = "okay";
-
-	mesa: fingerprint@0 {
-		compatible = "apple,mesa-fingerprint";
-		reg = <0>;
-		spi-max-frequency = <8000000>;
-		spi-cpol;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
-		interrupt-parent = <&pinctrl_ap>;
-		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
-		/* Per-device factory data from this Mac's own iBoot system container */
-		firmware-name = "apple/mesacal-k116s.bin", "apple/msrk-k116s.bin";
-	};
-};
-
-/*
- * The PMU's RTC and its alarm. ADT: the PMU's info-rtc (0x2002),
- * info-rtc_alarm_offset (0x2008), info-rtc_irq_mask_offset (0x200e),
- * info-rtc_alarm_ctrl (0x2000) and info-rtc_scrpad (0x2100), the registers of
- * the T6041 PMU. It raises no interrupt on this SoC: an armed alarm can only
- * wake the machine from a firmware sleep, not from s2idle.
- */
-&pmu {
-	pmu_rtc: rtc {
-		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
-		nvmem-cells = <&rtc_offset>;
-		nvmem-cell-names = "rtc_offset";
-		wakeup-source;
-	};
-};
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116s.bin", "apple/msrk-k116s.bin"
+#include "t6050-touchid.dtsi"
 
 /*
  * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does
@@ -1046,9 +598,8 @@
 };
 
 /*
- * The panel's plug takes about 2.9 ms here from the video interface's announcement to the
- * firmware's "ioav i/f is now closed", and the next round of reports follows about 33 ms later.
- * With the J714s's 2500 us the open landed 25 us before the close.
+ * t6050-j714s-sleep-soc.dtsi, included above, sets the J714s's 2500 us; keep the K boards'
+ * 10000 us (t6050-k114-k116-display.dtsi).
  */
 &dcp {
 	apple,panel-video-open-delay-us = <10000>;

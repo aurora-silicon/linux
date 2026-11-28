@@ -94,6 +94,19 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
 bool dcp_panel_edr(struct platform_device *pdev);
 bool dcp_ext_color_props_supported(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
+/* Whether a DCP reporting firmware-compat @compat runs the firmware-27 instance. */
+enum dcp_v27_admission {
+	DCP_V27_NOT_V27,	/* older than 27: the older interfaces decide */
+	DCP_V27_NO_TABLE,	/* 27 or later, no method table for the build */
+	DCP_V27_INCOMPLETE,	/* 27 or later, a method has no known ID */
+	DCP_V27_ADMITTED,
+};
+
+struct dcp_method_entry;
+enum dcp_v27_admission dcp_v27_admission(const char *compat,
+					 const struct dcp_method_entry **methods,
+					 const char **missing,
+					 unsigned int *num_missing);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);
 void dcp_backlight_takeover_registered(struct platform_device *pdev);
@@ -114,6 +127,9 @@ void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
+int dcp_fb_mirror(struct apple_dcp *dcp, struct drm_framebuffer *fb);
+struct drm_gem_dma_object;
+void dcp_fb_unmirror(struct platform_device *pdev, struct drm_gem_dma_object *obj);
 void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
 void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
 bool dcp_is_initialized(struct platform_device *pdev);
@@ -140,6 +156,7 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
+/* Must be called from sleepable context; may sleep on 14.7/ext26 mailboxes. */
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);

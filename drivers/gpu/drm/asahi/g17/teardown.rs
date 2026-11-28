@@ -205,7 +205,11 @@ impl Pending {
                     }
                     continue;
                 }
+                // A queue the kernel closed for its still open client holds the context until
+                // the client closes it: its scheduler is released, and the context reclaimed, only
+                // after that. Its guilty work went with the kill already.
                 if entry.phase != Phase::Draining
+                    || entry.context.held_by_open_client()
                     || !host.render_idle(&entry.context)?
                     || !host.flists_released(&entry.context)
                     || !host.compute_idle(&entry.context)

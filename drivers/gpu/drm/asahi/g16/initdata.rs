@@ -20,6 +20,7 @@ use super::object::{Class, FwObject, Objects, Placement, Request};
 pub(crate) struct InitData {
     /// The firmware ABI these objects were encoded for.
     pub(crate) abi: FwAbi,
+    pub(crate) layout: &'static wire::Layout,
     pub(crate) globals: Option<Arc<FwObject>>,
     /// Recovery/scheduler owner: root.FirmwareData, not the small Control.
     pub(crate) control: Option<Arc<FwObject>>,
@@ -62,7 +63,7 @@ impl InitData {
 
     /// The FirmwareData words of this ABI.
     pub(crate) fn firmware_data(&self) -> &'static wire::FirmwareData {
-        &self.abi.initdata().firmware_data
+        &self.layout.firmware_data
     }
 
     /// A phase 1 or 3 stop is owned by the M4 recovery handshake.
@@ -85,10 +86,12 @@ impl InitData {
 }
 
 fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
-    Ring {
-        state: graph[state].clone(),
-        ring: graph[ring].clone(),
-    }
+    Ring::new(
+        graph[state].clone(),
+        graph[ring].clone(),
+        wire::TxLayout::StateBlock,
+        false,
+    )
 }
 
 /// Builds the complete unpublished M4 graph. The return shape is shared with
@@ -97,12 +100,15 @@ fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
 pub(crate) fn build(
     dev: &device::Device,
     adt: &GpuAdt,
+    cfg: &super::Config,
+    regs: &super::regs::Regs,
+    enabled_cores: u32,
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
     let abi = adt.layout.abi;
-    let layout = abi.initdata();
+    let layout = adt.layout.initdata;
     let performance = board::qualify(dev, adt)?;
-    // The top row: S9 on J713, S10 on J773g.
+    // The top row of the qualified table, excluding the off state.
     let ceiling = performance.count as u32 - 1;
     let rows = performance.count as u32;
     let max_khz = performance.frequency[ceiling as usize] * 1000;
@@ -147,7 +153,13 @@ pub(crate) fn build(
     }
     let channels = Channels::alloc_submit_and_attach(
         objects,
-        pair(&graph, id::DEVCTRL_STATE, id::DEVCTRL_RING),
+        layout.tx,
+        Ring::new(
+            graph[id::DEVCTRL_STATE].clone(),
+            graph[id::DEVCTRL_RING].clone(),
+            layout.tx,
+            true,
+        ),
         pair(&graph, id::EVENT_STATE, id::EVENT_DATA),
         pair(&graph, id::LOG_STATE, id::LOG_ENTRIES),
         graph[id::LOG_DATA].clone(),
@@ -235,6 +247,7 @@ pub(crate) fn build(
         lower_parameter: wire::BOOTSTRAP_START + 0x8000,
         ktrace_mask: 0,
         progress_recovery: 1,
+        enabled_cores,
     };
     for i in 0..wire::OBJECT_COUNT {
         input.va[i] = graph[i].va;
@@ -243,7 +256,7 @@ pub(crate) fn build(
         input.channel_state[i] = channels.submit[i].state.va;
         input.channel_ring[i] = channels.submit[i].ring.va;
     }
-    for (slot, entry) in wire::LOADERS.iter().enumerate() {
+    for (slot, entry) in layout.loaders.iter().enumerate() {
         // An empty record, or one this ABI has no slot for, is neither mapped nor described.
         if entry.length == 0 || layout.slot(slot).is_none() {
             continue;
@@ -252,15 +265,24 @@ pub(crate) fn build(
         let at =
             objects.reserve_io((offset + u64::from(entry.length)).next_multiple_of(wire::PAGE))?;
         input.loader_va[slot] = at + offset;
-        for bank in 0..if slot == 3 { 2 } else { 1 } {
-            let (pa, size, delta) = wire::loader_span(slot, bank).map_err(|()| EINVAL)?;
+        for bank in 0..entry.banks() {
+            let (pa, size, delta) = entry.span(bank).map_err(|()| EINVAL)?;
             objects.map_mmio_class(at + u64::from(delta), pa, u64::from(size), entry.attrs)?;
         }
     }
-    input.scratch = objects.reserve_io(0x8000)?;
-    // This scratch alias deliberately has firmware RAM attrs, matching the
-    // qualified owner, even though the target is an SGX register window.
-    objects.map_mmio_class(input.scratch, 0x300d60000, 0x8000, hw::pte::FW)?;
+    let scratch = &adt.layout.scratch;
+    let &(last, _, bytes) = scratch.spans.last().ok_or(EINVAL)?;
+    let at = objects.reserve_io(last + bytes)?;
+    input.scratch = at + scratch.pointer;
+    // The scratch alias uses firmware RAM attributes on these SGX registers.
+    for &(va_offset, pa_offset, bytes) in scratch.spans {
+        objects.map_mmio_class(
+            at + va_offset,
+            regs.sgx_pa() + scratch.register + pa_offset,
+            bytes,
+            hw::pte::FW,
+        )?;
+    }
 
     // Private CPU-side staging keeps the pure encoder independent of raw GEM
     // pointers. No staging references survive publication.
@@ -304,6 +326,7 @@ pub(crate) fn build(
     Ok((
         InitData {
             abi,
+            layout,
             globals: Some(graph[id::GLOBALS].clone()),
             control: Some(graph[id::FIRMWARE_DATA].clone()),
             ready_control: Some(graph[id::CONTROL].clone()),

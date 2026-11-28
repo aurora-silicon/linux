@@ -278,10 +278,131 @@ static bool avoided(struct centauri_t6050_wifi *wifi,
 	       !memcmp(ssid, wifi->avoid_ssid, ssid_len);
 }
 
+/*
+ * The skip-th entry of the avoided network's 6 GHz BSSes that may go, and how
+ * many there are. An entry may not go when its set holds @keep, or a BSS of
+ * @cur_ssid: the network being joined or used, when that is not the avoided
+ * one.
+ */
+struct avoid_find {
+	struct centauri_t6050_wifi *wifi;
+	const u8 *keep, *cur_ssid;
+	size_t cur_ssid_len;
+	unsigned int skip, count;
+	u8 bssid[ETH_ALEN];
+	struct ieee80211_channel *channel;
+};
+
+/* Whether @bss is one to keep. Under cfg80211's BSS lock. */
+static bool avoid_keep_bss(const struct avoid_find *find,
+			   struct cfg80211_bss *bss)
+{
+	const struct element *ssid;
+	bool same;
+
+	if (find->keep && ether_addr_equal(bss->bssid, find->keep))
+		return true;
+	if (!find->cur_ssid)
+		return false;
+	rcu_read_lock();
+	ssid = ieee80211_bss_get_elem(bss, WLAN_EID_SSID);
+	same = ssid && ssid->datalen == find->cur_ssid_len &&
+	       !memcmp(ssid->data, find->cur_ssid, find->cur_ssid_len);
+	rcu_read_unlock();
+	return same;
+}
+
+/*
+ * Whether @bss's set holds a BSS to keep: the beacon's own BSS and those of
+ * its multiple-BSSID element, which cfg80211 unlinks together.
+ */
+static bool avoid_keep_set(const struct avoid_find *find,
+			   struct cfg80211_bss *bss)
+{
+	struct cfg80211_bss *set = bss->transmitted_bss ?: bss, *member;
+
+	if (avoid_keep_bss(find, set))
+		return true;
+	list_for_each_entry(member, &set->nontrans_list, nontrans_list)
+		if (avoid_keep_bss(find, member))
+			return true;
+	return false;
+}
+
+/* Called for every BSS entry, under cfg80211's BSS lock. */
+static void avoid_find_one(struct wiphy *wiphy, struct cfg80211_bss *bss,
+			   void *data)
+{
+	struct avoid_find *find = data;
+	const struct element *ssid;
+	bool same;
+
+	rcu_read_lock();
+	ssid = ieee80211_bss_get_elem(bss, WLAN_EID_SSID);
+	same = ssid && avoided(find->wifi, bss->channel, ssid->data,
+			       ssid->datalen);
+	rcu_read_unlock();
+	if (!same || avoid_keep_set(find, bss))
+		return;
+	if (find->count++ == find->skip) {
+		ether_addr_copy(find->bssid, bss->bssid);
+		find->channel = bss->channel;
+	}
+}
+
+/*
+ * Unlink the avoided network's 6 GHz BSSes but @keep. cfg80211 keeps the
+ * networks one beacon describes, its own and those of its multiple-BSSID
+ * element, as one set, and unlinking any of them unlinks the set. So an
+ * entry whose set holds @keep, or a BSS of the network being joined or used
+ * (unless that is the avoided one), stays, and the others go with their
+ * sets. The iterator may not unlink, so each pass looks up one entry and
+ * unlinks it; one that cfg80211 does not return or unlink is passed over,
+ * with one more walk to find the entry after it. Each entry the first walk
+ * found gets one pass.
+ *
+ * This runs after every 6 GHz beacon while the window is open: one walk of
+ * the whole BSS list under cfg80211's BSS lock, with bottom halves off, plus
+ * one more walk for each entry it unlinks or passes over.
+ */
+static void avoid_unlink(struct centauri_t6050_wifi *wifi, const u8 *keep)
+{
+	struct avoid_find find = { .wifi = wifi, .keep = keep };
+	struct cfg80211_bss *bss;
+	unsigned int passes, count;
+
+	if ((wifi->connecting || wifi->connected) && wifi->ssid_len &&
+	    !(wifi->ssid_len == wifi->avoid_ssid_len &&
+	      !memcmp(wifi->ssid, wifi->avoid_ssid, wifi->ssid_len))) {
+		find.cur_ssid = wifi->ssid;
+		find.cur_ssid_len = wifi->ssid_len;
+	}
+	cfg80211_bss_iter(wifi->wiphy, NULL, avoid_find_one, &find);
+	for (passes = find.count; passes && find.skip < find.count; passes--) {
+		count = find.count;
+		bss = cfg80211_get_bss(wifi->wiphy, find.channel, find.bssid,
+				       wifi->avoid_ssid, wifi->avoid_ssid_len,
+				       IEEE80211_BSS_TYPE_ANY,
+				       IEEE80211_PRIVACY_ANY);
+		if (bss) {
+			cfg80211_unlink_bss(wifi->wiphy, bss);
+			cfg80211_put_bss(wifi->wiphy, bss);
+		}
+		find.count = 0;
+		cfg80211_bss_iter(wifi->wiphy, NULL, avoid_find_one, &find);
+		if (find.count < count)
+			continue;
+		/* Not unlinked: pass it over and look up the entry after it. */
+		find.skip++;
+		find.count = 0;
+		cfg80211_bss_iter(wifi->wiphy, NULL, avoid_find_one, &find);
+	}
+}
+
 static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 			  size_t size)
 {
-	const u8 *frame, *ie, *end, *ssid = NULL;
+	const u8 *frame, *ie, *end;
 	struct ieee80211_channel *channel;
 	struct cfg80211_bss *bss;
 	u16 frame_size;
@@ -299,8 +420,6 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 	end = frame + frame_size;
 	for (ie = frame + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
 	     ie += 2 + ie[1]) {
-		if (ie[0] == WLAN_EID_SSID && !ssid)
-			ssid = ie;
 		if ((ie[0] == WLAN_EID_DS_PARAMS ||
 		     ie[0] == WLAN_EID_HT_OPERATION) &&
 		    ie[1]) {
@@ -325,22 +444,20 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 		return;
 	frequency = ieee80211_channel_to_frequency(number, band);
 	channel = ieee80211_get_channel(wifi->wiphy, frequency);
-	if (!channel)
+	if (!channel || channel->flags & IEEE80211_CHAN_DISABLED)
 		return;
 	signal = max_t(s8, payload[0x16], payload[0x17]);
 	if (signal >= 0 || signal < -127)
 		signal = -95;
-	if (ssid && avoided(wifi, channel, ssid + 2, ssid[1]) &&
-	    !((wifi->connecting || wifi->connected) &&
-	      ether_addr_equal(((struct ieee80211_mgmt *)frame)->bssid,
-			       wifi->bssid)))
-		return;
 	bss = cfg80211_inform_bss_frame(wifi->wiphy, channel,
 					(struct ieee80211_mgmt *)frame,
 					frame_size, signal * 100, GFP_KERNEL);
 	if (bss) {
 		wifi->beacons_seen++;
 		cfg80211_put_bss(wifi->wiphy, bss);
+		if (channel->band == NL80211_BAND_6GHZ && wifi->avoid_valid)
+			avoid_unlink(wifi, wifi->connecting || wifi->connected ?
+						   wifi->bssid : NULL);
 	}
 }
 
@@ -1848,78 +1965,44 @@ static int join_timeout(u16 status)
  */
 #define AVOID_SECONDS 120
 
-struct avoid_entry {
-	u8 bssid[ETH_ALEN];
-	struct ieee80211_channel *channel;
-};
-
-struct avoid_list {
+struct avoid_band {
 	struct centauri_t6050_wifi *wifi;
 	bool other_band;
-	unsigned int count;
-	struct avoid_entry entry[16];
 };
 
 /* Called for every BSS entry, under cfg80211's BSS lock. */
-static void avoid_collect(struct wiphy *wiphy, struct cfg80211_bss *bss,
-			  void *data)
+static void avoid_other_band(struct wiphy *wiphy, struct cfg80211_bss *bss,
+			     void *data)
 {
-	struct avoid_list *list = data;
-	struct centauri_t6050_wifi *wifi = list->wifi;
+	struct avoid_band *band = data;
+	struct centauri_t6050_wifi *wifi = band->wifi;
 	const struct element *ssid;
-	bool same;
 
+	if (band->other_band || bss->channel->band == NL80211_BAND_6GHZ)
+		return;
 	rcu_read_lock();
 	ssid = ieee80211_bss_get_elem(bss, WLAN_EID_SSID);
-	same = ssid && ssid->datalen == wifi->ssid_len &&
-	       !memcmp(ssid->data, wifi->ssid, wifi->ssid_len);
+	band->other_band = ssid && ssid->datalen == wifi->ssid_len &&
+			   !memcmp(ssid->data, wifi->ssid, wifi->ssid_len);
 	rcu_read_unlock();
-	if (!same)
-		return;
-	if (bss->channel->band != NL80211_BAND_6GHZ) {
-		list->other_band = true;
-	} else if (list->count < ARRAY_SIZE(list->entry)) {
-		ether_addr_copy(list->entry[list->count].bssid, bss->bssid);
-		list->entry[list->count++].channel = bss->channel;
-	}
 }
 
 /* The 6 GHz join to wifi->bssid failed. Called with wifi->lock held. */
 static void join_avoid_6ghz(struct centauri_t6050_wifi *wifi)
 {
-	struct avoid_list list = { .wifi = wifi };
-	struct cfg80211_bss *bss;
-	unsigned int i, pass;
+	struct avoid_band band = { .wifi = wifi };
 
-	/* Entries can share a BSSID, and the iterator may not unlink. */
-	for (pass = 0; pass < 8; pass++) {
-		list.count = 0;
-		cfg80211_bss_iter(wifi->wiphy, NULL, avoid_collect, &list);
-		if (!list.other_band)
-			return;
-		if (!pass) {
-			memcpy(wifi->avoid_ssid, wifi->ssid, wifi->ssid_len);
-			wifi->avoid_ssid_len = wifi->ssid_len;
-			wifi->avoid_until = jiffies + AVOID_SECONDS * HZ;
-			wifi->avoid_valid = true;
-			dev_info(&wifi->control->pdev->dev,
-				 "6 GHz join to %pM failed: not reporting this network's 6 GHz BSSes for %u s\n",
-				 wifi->bssid, AVOID_SECONDS);
-		}
-		for (i = 0; i < list.count; i++) {
-			bss = cfg80211_get_bss(wifi->wiphy,
-					       list.entry[i].channel,
-					       list.entry[i].bssid, NULL, 0,
-					       IEEE80211_BSS_TYPE_ANY,
-					       IEEE80211_PRIVACY_ANY);
-			if (!bss)
-				continue;
-			cfg80211_unlink_bss(wifi->wiphy, bss);
-			cfg80211_put_bss(wifi->wiphy, bss);
-		}
-		if (!list.count)
-			break;
-	}
+	cfg80211_bss_iter(wifi->wiphy, NULL, avoid_other_band, &band);
+	if (!band.other_band)
+		return;
+	memcpy(wifi->avoid_ssid, wifi->ssid, wifi->ssid_len);
+	wifi->avoid_ssid_len = wifi->ssid_len;
+	wifi->avoid_until = jiffies + AVOID_SECONDS * HZ;
+	wifi->avoid_valid = true;
+	dev_info(&wifi->control->pdev->dev,
+		 "6 GHz join to %pM failed: not reporting this network's 6 GHz BSSes for %u s\n",
+		 wifi->bssid, AVOID_SECONDS);
+	avoid_unlink(wifi, NULL);
 }
 
 static void connect_worker(struct work_struct *work)
@@ -2959,6 +3042,13 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	 * on the preferred scanning channels and those the 2.4/5 GHz APs report.
 	 */
 	wifi->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
+	/*
+	 * An AP serving several networks on one radio, the rule at 6 GHz,
+	 * beacons one of them and describes the others in a multiple-BSSID
+	 * element. cfg80211 makes scan entries for those nontransmitted BSSes
+	 * only with this set; the firmware joins any of them by its BSSID.
+	 */
+	wifi->wiphy->support_mbssid = true;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->reg_notifier = wifi_regulatory;
 	wifi->wiphy->cipher_suites = cipher_suites;

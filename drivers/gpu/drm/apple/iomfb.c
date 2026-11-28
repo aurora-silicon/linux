@@ -2090,9 +2090,12 @@ void dcp_hotplug(struct work_struct *work)
 }
 
 /*
- * J700/25G83 asks D134 after publishing its external video interface.
- * The observed async record has no input and a four-byte result. Use the
- * existing zero reply for this record only; its feature remains unsupported.
+ * The H17P external firmware (26.6.2) asks D134 after publishing its
+ * external video interface. The observed async record has no input and a
+ * four-byte result. Use the existing zero reply for this record only; its
+ * feature remains unsupported. The record belongs to the firmware ABI: the
+ * method profile is only set for that firmware, which probe has already
+ * checked against apple,firmware-version (dcp_h17p_external_supported()).
  */
 static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 				    enum dcp_context_id context,
@@ -2101,9 +2104,7 @@ static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 	return tag == 134 && context == DCP_CONTEXT_ASYNC &&
 	       in_len == 0 && out_len == sizeof(u32) &&
 	       dcp->hw.iomfb_method_profile ==
-	       DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	       of_machine_is_compatible("apple,j700") &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+	       DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
@@ -3259,8 +3260,9 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
-	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_fw_panel_decodes_pq(dcp) &&
+	       dcp_has_panel(dcp) && dcp->panel.edr_ceiling &&
+	       READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
@@ -3642,11 +3644,14 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	/*
-	 * The T6050 internal DCP (M5 Max) crashes on 3024x1986@60 and the
-	 * other 60 Hz timings it lists.  Only the 120 Hz timing is known to
-	 * survive a modeset, so refuse the rest until they are understood.
+	 * The T6050 internal DCP (M5 Max, K114s) crashes on a mode set away
+	 * from the timing iBoot left the panel at: 120 -> 60 Hz, and 60 ->
+	 * 120 Hz when macOS left it at 60 Hz.  Offer only the rate the
+	 * firmware reported at start (dcp_rtk_syslog_boot_rate()), 120 Hz
+	 * when it reported none.
 	 */
-	if (dcp->hw.only_120hz_modes && drm_mode_vrefresh(mode) != 120)
+	if (dcp->hw.only_120hz_modes &&
+	    drm_mode_vrefresh(mode) != (READ_ONCE(dcp->boot_rate) ?: 120))
 		return false;
 
 	return true;

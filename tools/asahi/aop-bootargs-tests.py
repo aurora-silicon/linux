@@ -82,7 +82,15 @@ fn main(){
  assert!(!std::ptr::eq(alt,t8122),"T8122 without regions takes its fallback");
  assert!(!alt.fw_regions&&alt.without_fw_regions.is_none(),"the fallback needs no regions");
  assert!(alt.ncal==HW_CFG_T6020.ncal&&alt.ec0p==HW_CFG_T6020.ec0p&&alt.quiesce_on_unbind==HW_CFG_T6020.quiesce_on_unbind&&alt.bootargs_word_access==HW_CFG_T6020.bootargs_word_access&&alt.halt_on_failed_start==HW_CFG_T6020.halt_on_failed_start,"T8122 fallback is T6020's");
- let others:[(&str,&'static AopHwConfig);10]=[("T8103",&HW_CFG_T8103),("T8112",&HW_CFG_T8112),("T6000",&HW_CFG_T6000),("T6020",&HW_CFG_T6020),("T6040",&HW_CFG_T6040),("T8132",&HW_CFG_T8132),("T8140",&HW_CFG_T8140),("T8152",&HW_CFG_T8152),("T8142",&HW_CFG_T8142),("T6050",&HW_CFG_T6050)];
+ // A T8103 AOP the bootloader reserved no regions for (firmware 13.5) starts as before.
+ let t8103:&'static AopHwConfig=&HW_CFG_T8103;
+ assert!(t8103.fw_regions,"T8103 checks its firmware regions");
+ assert!(std::ptr::eq(t8103.for_regions(true),t8103),"T8103 with regions keeps its own configuration");
+ let direct=t8103.for_regions(false);
+ assert!(!std::ptr::eq(direct,t8103),"T8103 without regions takes its direct start");
+ assert!(!direct.fw_regions&&direct.without_fw_regions.is_none(),"the direct start needs no regions");
+ assert!(direct.ncal==t8103.ncal&&direct.ec0p==t8103.ec0p&&direct.aopt==t8103.aopt,"the direct start is the same AOP");
+ let others:[(&str,&'static AopHwConfig);9]=[("T8112",&HW_CFG_T8112),("T6000",&HW_CFG_T6000),("T6020",&HW_CFG_T6020),("T6040",&HW_CFG_T6040),("T8132",&HW_CFG_T8132),("T8140",&HW_CFG_T8140),("T8152",&HW_CFG_T8152),("T8142",&HW_CFG_T8142),("T6050",&HW_CFG_T6050)];
  for (name,cfg) in others {
   assert!(cfg.without_fw_regions.is_none(),"{} names no fallback",name);
   for regions in [true,false] {assert!(std::ptr::eq(cfg.for_regions(regions),cfg),"{} keeps its configuration (regions {})",name,regions);}
@@ -140,7 +148,8 @@ def method(source):
 
 
 def configs(source):
-    """struct AopHwConfig and the HW_CFG_* constants, each with its doc comment.
+    """struct AopHwConfig, the HW_CFG_* constants and the AOP_S2R_* flags they use, each with its
+    doc comment.
 
     Other items between them (the sleep's PM callbacks) use kernel bindings the harness
     doesn't have.
@@ -153,7 +162,8 @@ def configs(source):
             if not line.strip() or line.startswith(('//', '#[')):
                 pending.append(line)
                 continue
-            keep = line.startswith(('struct AopHwConfig', 'impl AopHwConfig', 'const HW_CFG_'))
+            keep = line.startswith(('struct AopHwConfig', 'impl AopHwConfig', 'const HW_CFG_',
+                                    'const AOP_S2R_'))
             item, pending, depth = pending + [line], [], 0
         else:
             item.append(line)

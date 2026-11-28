@@ -350,14 +350,17 @@
 };
 
 &pmgr_aux {
-	/* Always on: the firmware leaves ATCn_USB on below it, and genpd refuses an active child under a parent it would turn off. */
+	/*
+	 * All USB-C ATC0-2 consumers (dwc3, atcphy, mailbox, DARTs, display
+	 * crossbar, and USB4/CIO where enabled) manage runtime PM;
+	 * ps_atc0..2_usb_aon stay always-on for wake and Type-C detection.
+	 */
 	ps_atc0_common: power-controller@390 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x390 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0_common";
-		apple,always-on;
 	};
 
 	ps_atc1_common: power-controller@3b8 {
@@ -366,7 +369,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc1_common";
-		apple,always-on;
 	};
 
 	ps_atc2_common: power-controller@3e0 {
@@ -375,7 +377,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc2_common";
-		apple,always-on;
 	};
 };
 

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware, and the 26B123
-//! firmware's ABI, whose start is refused until its remaining unknowns are known).
+//! Classic GPU support for T8132 G16G (25G83 and 26B123), T6030 G15S (26B123) and T8122 G15G
+//! (26B123).
 //!
-//! G16 firmware is *classic*: one ring per engine (TA, FS, compute) and ordering expressed by
+//! Classic firmware uses one ring per engine (TA, FS, compute) and expresses ordering through
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID
 //! model. The boot loader leaves the firmware loaded; this driver identifies the exact build,
-//! adopts the inherited UAT handoff and builds the M4 initdata graph
+//! adopts the inherited UAT handoff and builds the InitData graph
 //! and brings the firmware to READY. All logical queues and VMs share one persistent compute
 //! graph and one render graph; the commands of a submission are encoded into compute and pass
 //! slots and published as *prefixes* on the firmware's queues, then retired on their stamps.
@@ -15,8 +15,10 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` with a module alias. Its
-//!   probe waits for the PMP supplier and the native display before booting firmware. It calls
+//! - [`Driver`] matches `apple,agx-t8132`, `apple,agx-t6030` and `apple,agx-t8122`. T6030 and
+//!   T8122 select this backend through the boot loader's handoff (marker, layout and, on
+//!   T8122, `apple,firmware-compat` 27.2; see [`adt::claims`]). Probe links a handed-over
+//!   native display and, on T8132, the PMP supplier before booting firmware. It calls
 //!   [`crate::driver::AsahiPlatformDriver::probe_g16`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
@@ -98,44 +100,42 @@ use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
 /// Name of the G16 platform driver.
 pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 
-/// GPU generation reported to userspace.
-pub(crate) const GPU_GENERATION: u32 = 16;
-
-/// Static configuration of a SoC with a G16 GPU.
-pub(crate) struct Config {
-    /// SoC identifier reported to userspace.
-    pub(crate) chip_id: u32,
-    /// GPU variant reported to userspace.
-    pub(crate) gpu_variant: crate::hw::GpuVariant,
-    /// GPU revision reported to userspace.
-    pub(crate) gpu_revision: u32,
-    /// Input address bits translated by each UAT root.
-    pub(crate) uat_ias: u32,
-    /// Output (physical) address bits of the UAT.
-    pub(crate) uat_oas: u32,
-    /// Clusters and cores per cluster.
-    pub(crate) num_clusters: u32,
-    pub(crate) num_cores_per_cluster: u32,
-    /// Qualified identification register values.
-    pub(crate) hw_ids: &'static [hw::HwId],
-    /// Qualified firmware builds.
-    pub(crate) firmware: &'static [hw::FirmwareBuild],
-}
+pub(crate) use hw::Config;
 
 /// OF match table of the G16 platform driver.
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
-    kernel::device_id::IdArray::new([(
-        of::DeviceId::new(c_str!("apple,agx-t8132")),
-        &&hw::t8132::CONFIG,
-    )]);
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 3> =
+    kernel::device_id::IdArray::new([
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8132")),
+            &&hw::t8132::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            &&hw::t6030::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8122")),
+            &&hw::t8122::CONFIG,
+        ),
+    ]);
 
 // Probe admission waits for the PMP supplier and the native display before
 // firmware starts, so the module may be loaded at device creation.
 kernel::of_device_table!(
     AUTOLOAD_OF_TABLE,
     @none,
-    [of::DeviceId::new(c_str!("apple,agx-t8132"))]
+    [
+        of::DeviceId::new(c_str!("apple,agx-t8132")),
+        of::DeviceId::new(c_str!("apple,agx-t6030")),
+        of::DeviceId::new(c_str!("apple,agx-t8122")),
+    ]
 );
+
+/// Whether this backend owns `dev` under the configuration of its compatible, so that another
+/// backend serving the same compatible steps aside.
+pub(crate) fn claims(dev: &device::Device, cfg: &Config) -> bool {
+    adt::claims(dev, cfg)
+}
 
 /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
 /// [`AsahiPlatformDriver::probe_g16`].
@@ -164,6 +164,9 @@ impl platform::Driver for Driver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = *info.ok_or(ENODEV)?;
+        if cfg.needs_handoff_marker && !adt::claims(pdev.as_ref(), cfg) {
+            return Err(ENODEV);
+        }
         dev_info!(pdev.as_ref(), "G16: probing\n");
         match AsahiPlatformDriver::probe_g16(pdev, cfg) {
             Ok(driver) => Ok(Some(driver)),
@@ -573,6 +576,8 @@ impl Shared {
 /// be stopped, so dropping this structure leaks the firmware-visible parts on purpose
 /// ([`Gpu::retain`]).
 pub(crate) struct Firmware {
+    /// Static hardware configuration for this GPU instance.
+    pub(crate) cfg: &'static hw::Config,
     /// RTKit, MMIO, regions, the adopted UAT and the host window.
     pub(crate) session: boot::Session,
     /// The initdata graph and its live words (Globals, Control, HardwareData, ...).
@@ -703,7 +708,7 @@ impl Gpu {
         let uat = booted.session.uat();
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
-        let firmware = Firmware::start_backend(dev, booted, &shared, power)?;
+        let firmware = Firmware::start_backend(dev, cfg, booted, &shared, power)?;
         let vms = firmware.vms.clone();
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
@@ -745,6 +750,7 @@ impl Firmware {
     #[inline(never)]
     fn start_backend(
         dev: &AsahiDrmDevice,
+        cfg: &'static hw::Config,
         mut booted: KBox<boot::Booted>,
         shared: &Arc<Shared>,
         mut power: power::Power,
@@ -760,14 +766,15 @@ impl Firmware {
             let pools = pools::Pools::new_boxed(dev)?;
             let vms = vm::Registry::new()?;
             let engine = engine::Engine::new()?;
+            let recovery = recovery::Recovery::new()?;
             let render_cmds = resources::RenderCmds::new()?;
             let compute_cmds = resources::ComputeCmds::new()?;
             let private_factory = booted.objects.private_factory(render_cmds, compute_cmds);
             let graph = graph::Graphs::finish(dev, graph_session, &private_factory)?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, private_factory, slots, pools, vms, engine, slot))
+            Ok((graph, private_factory, slots, pools, vms, engine, recovery, slot))
         })();
-        let (graph, private_factory, slots, pools, vms, engine, slot) = match backend {
+        let (graph, private_factory, slots, pools, vms, engine, recovery, slot) = match backend {
             Ok(backend) => backend,
             Err(error) => {
                 dev_err!(
@@ -789,6 +796,7 @@ impl Firmware {
         } = KBox::into_inner(booted);
         let mut firmware = slot
             .write_init(init!(Firmware {
+                cfg,
                 session,
                 init,
                 private_factory,
@@ -798,7 +806,7 @@ impl Firmware {
                 graph,
                 slots,
                 engine,
-                recovery: recovery::Recovery::new(),
+                recovery,
                 power,
                 pools,
                 vms,
@@ -889,8 +897,10 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// G16 programs no fault mode into the firmware: an unmapped shader access behaves as the
+    /// firmware's default fault mode makes it. `fault_control` (default 0xb) stays the opt-out.
     fn soft_faults(&self) -> bool {
-        false
+        true
     }
 
     fn prepare_new_objects(&self) -> bool {
@@ -932,6 +942,7 @@ impl gpu::Gpu for Gpu {
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        _window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
         timestamp::map(self, bo, range)
     }

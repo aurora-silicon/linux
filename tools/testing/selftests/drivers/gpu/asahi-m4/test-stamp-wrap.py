@@ -28,7 +28,7 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 #[path="__LOGIC__"]mod logic;
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
-mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 2; } }
+mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; } }
 struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
 impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {
@@ -38,21 +38,21 @@ impl Object {
     fn reset_reads(&self){self.reads.set(0);}
 }
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
-mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
+mod notifier_page {pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
-mod compute {pub const DESCRIPTOR_COMPLETED:usize=0;pub const DESCRIPTOR_COUNTER:usize=8;}
-#[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
+mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
+#[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object,user_stamp:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
-struct Graph{compute:[CGraph;2],render:RGraph}
+struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
 impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}}
 struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
-struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
-struct Engine{flights:Vec<Flight>,target:[u32;2],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
+struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],chan_settled:bool,pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
+struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
-struct CUnit{counter:Object,its:Object,work:Object}
+struct CUnit{counter:Object,descriptor:Object,its:Object,work:Object}
 struct RUnit{scene:Object}
 struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
@@ -80,20 +80,20 @@ impl Firmware{
 }
 fn firmware(render:bool,ordinal:u64)->Firmware{
     let target=encode::stamp(ordinal);
+    let mut target_arr=[0u32;hw::sizes::COMPUTE_PIPES];target_arr[0]=target;
     let mut f=Firmware{
-        graph:Graph{compute:[CGraph::default(),CGraph::default()],
+        graph:Graph{compute:core::array::from_fn(|_|CGraph::default()),
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:[target,0],ta_target:target,fs_target:target,retired_ticks:[0;4]},
-        slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+        slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
     f.graph.compute[0].fw_stamp.set(0,u64::from(target));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(target));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[0].user_stamp.set(0,u64::from(target));
     f.engine.flights[0].job.resources.compute[0].counter.set(0,ordinal);
     f.engine.flights[0].job.resources.compute[0].its.set(0,100);f.engine.flights[0].job.resources.compute[0].its.set(8,101);
-    f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,ordinal);
-    f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COUNTER,0x1234);
+    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,ordinal);
+    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COUNTER,0x1234);
     for stage in 0..2{f.graph.render.fw_stamp[stage].set(0,u64::from(target));}
     f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(target));
     f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(target));
@@ -137,15 +137,14 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.engine.flights.push(later);f.engine.target[0]=encode::stamp(n+1);
         // The command behind it finished too: the shared stamp and notifier cells name it.
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n+1)));
-        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,9);
+        f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(n+1)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,n-1);
+        f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,n-1);
         assert_eq!(f.retired(),Ok(Retirement::Pending));
     }
 }
@@ -198,8 +197,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights.push(c);
     f.engine.target[0]=encode::stamp(20);
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(20)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(20)));
     // Keep render FS stamp unreached so render at index 0 stays pending.
     f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
@@ -223,11 +221,11 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
 #[test]fn multi_compute_horizon_requires_every_claimed_unit_receipt(){
     let mut f=firmware(false,12);
     let mk_unit=|sub:u64,start:u64,end:u64|{
-        let mut u=CUnit{counter:Object::default(),its:Object::default(),work:Object::default()};
+        let mut u=CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()};
         u.counter.set(0,sub);
         u.its.set(0,start);u.its.set(8,end);
-        u.work.set(compute::DESCRIPTOR_COMPLETED,sub);
-        u.work.set(compute::DESCRIPTOR_COUNTER,0x1234);
+        u.descriptor.set(manager::COMPLETED,sub);
+        u.descriptor.set(manager::COUNTER,0x1234);
         u
     };
     let fl=&mut f.engine.flights[0];
@@ -238,9 +236,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fl.job.resources.compute=vec![mk_unit(10,100,110),mk_unit(11,110,120),mk_unit(12,120,130)];
     assert_eq!(f.retired(),Ok(Retirement::Full));
     // Missing interior unit completion keeps the whole batched flight pending.
-    f.engine.flights[0].job.resources.compute[1].work.set(compute::DESCRIPTOR_COMPLETED,10);
+    f.engine.flights[0].job.resources.compute[1].descriptor.set(manager::COMPLETED,10);
     assert_eq!(f.retired(),Ok(Retirement::Pending));
-    f.engine.flights[0].job.resources.compute[1].work.set(compute::DESCRIPTOR_COMPLETED,11);
+    f.engine.flights[0].job.resources.compute[1].descriptor.set(manager::COMPLETED,11);
     // Missing tail unit ticks keeps the whole batched flight pending.
     f.engine.flights[0].job.resources.compute[2].its.set(8,0);
     assert_eq!(f.retired(),Ok(Retirement::Pending));
@@ -292,7 +290,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
     fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
     fmix.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
-    let (mut check_c,mut check_r)=([true;2],true);
+    let (mut check_c,mut check_r)=([true;hw::sizes::COMPUTE_PIPES],true);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
     assert!(!check_c[0] && !check_c[1] && check_r);
     fmix.engine.flights.remove(1);
@@ -428,12 +426,11 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     c1.compute_pipe=1;
     c1.rec[2]=2;
     f.engine.flights.push(c1);
-    f.engine.target=[encode::stamp(10),encode::stamp(11)];
+    f.engine.target[0]=encode::stamp(10);f.engine.target[1]=encode::stamp(11);
     f.channels.compute_producer=2;
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(9)));
     f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(11)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(11)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[1].user_stamp.set(0,u64::from(encode::stamp(11)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
     assert_eq!(f.last_chan_passed.get(),Some(true));
     f.engine.flights.remove(1);
@@ -468,14 +465,12 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     innocent.job.resources.compute[0].its.set(8,530);
     f.engine.flights.push(innocent);
 
-    f.engine.target=[encode::stamp(40),encode::stamp(41)];
+    f.engine.target[0]=encode::stamp(40);f.engine.target[1]=encode::stamp(41);
     f.channels.compute_producer=2;
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(40)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(40)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,1);
+    f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(40)));
     f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(41)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(41)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[1].user_stamp.set(0,u64::from(encode::stamp(41)));
 
     // Within grace: pipe 0 records gate_passed_ns while innocent pipe 1 retires Full immediately.
     let (idx_b,ret_b)=f.retired_flight().unwrap().unwrap();
@@ -536,8 +531,8 @@ mod queue_proof {
         }
         fn producer(&self, ch: Channel) -> u32 { self.channel(ch).write }
     }
-    struct Engine { head: [u32; 2], ta_head: u32, fs_head: u32 }
-    struct Flight { compute_pipe: u8, c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3] }
+    struct Engine { head: [u32; hw::sizes::COMPUTE_PIPES], ta_head: u32, fs_head: u32, flights: Vec<Flight> }
+    struct Flight { computes: u32, compute_pipe: u8, c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3], chan_settled: bool }
     struct Firmware { init: Init, channels: Channels, engine: Engine }
     mod inner {
         use super::*;
@@ -545,6 +540,7 @@ mod queue_proof {
             __QUEUE_RING_RECEIPT__
             __QUEUE_RING_PASSED__
             __CHANNEL_RECEIPT__
+            __LATCH_COMPUTE_CHANNEL_RECEIPTS__
             __QUEUE_RECEIPT__
             __QUEUE_PASSED__
         }
@@ -559,7 +555,7 @@ mod queue_proof {
                     ta: Pipe { read: 7, completion: 7, write: 7 },
                     fs: Pipe { read: 9, completion: 9, write: 9 },
                 },
-                engine: Engine { head: [10, 12], ta_head: 20, fs_head: 30 },
+                engine: Engine { head: { let mut h = [0u32; hw::sizes::COMPUTE_PIPES]; h[0] = 10; h[1] = 12; h }, ta_head: 20, fs_head: 30, flights: vec![] },
             };
             let mut state = Object::default();
             let mut info = Object::default();
@@ -594,7 +590,7 @@ mod queue_proof {
             assert_eq!(fw.queue_ring_receipt(&state, &info, 12), Ok(true));
             assert_eq!(fw.channel_receipt(Channel::Compute, 5, false), Ok(false));
             assert_eq!(fw.channel_receipt(Channel::Compute, 5, true), Ok(true));
-            let f_p1 = Flight { compute_pipe: 1, c_start: 10, head: 11, ta_start: 0, ta_head: 1, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
+            let f_p1 = Flight { computes: 1, compute_pipe: 1, c_start: 10, head: 11, ta_start: 0, ta_head: 1, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
             assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(true));
             state.set(qstate::READ, 10);
             assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(false));
@@ -603,7 +599,7 @@ mod queue_proof {
             // queue_passed with queued work behind flight (including wrap-around) never reads qinfo.
             fw.engine.ta_head = 2;
             fw.channels.ta = Pipe { read: 2, completion: 2, write: 3 };
-            let f = Flight { compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
+            let f = Flight { computes: 0, compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
             state.set(qstate::READ, 1);
             assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(true));
             assert_eq!(info.reads.get(), 0);
@@ -616,11 +612,64 @@ mod queue_proof {
             assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(false));
             assert_eq!(info.reads.get(), 0);
         }
+        #[test]
+        fn cross_pipe_channel_wrap_latches_receipt_before_producer_laps_flight() {
+            // Pipe 0 submits compute record 1 while pipe 1 submits and retires 255 records,
+            // stopping at producer=0, read=0, completion=0. Raw ring_passed(0, 0, 1, 0, 256)
+            // would be false forever, but latch_compute_channel_receipts proves record 1 before
+            // the 256-entry submit channel wraps.
+            let mut fw = Firmware {
+                init: Init { abi: Abi },
+                channels: Channels {
+                    compute: Pipe { read: 1, completion: 1, write: 1 },
+                    ta: Pipe { read: 0, completion: 0, write: 0 },
+                    fs: Pipe { read: 0, completion: 0, write: 0 },
+                },
+                engine: Engine {
+                    head: [0u32; hw::sizes::COMPUTE_PIPES],
+                    ta_head: 0,
+                    fs_head: 0,
+                    flights: vec![Flight {
+                        computes: 1,
+                        compute_pipe: 0,
+                        c_start: 0,
+                        head: 1,
+                        ta_start: 0,
+                        ta_head: 0,
+                        fs_start: 0,
+                        fs_head: 0,
+                        rec: [0, 0, 1],
+                        chan_settled: false,
+                    }],
+                },
+            };
+            // While firmware has not completed record 1 yet, latch stays false.
+            fw.channels.compute = Pipe { read: 1, completion: 0, write: 2 };
+            fw.latch_compute_channel_receipts().unwrap();
+            assert!(!fw.engine.flights[0].chan_settled);
+            // Out-of-range firmware cursors (>= RING_SLOTS, e.g. 257 which wraps mod 256 to 1)
+            // must be rejected before modular comparison in both passed receipts and latching.
+            for (read, completion) in [(257, 257), (257, 2), (2, 257)] {
+                fw.channels.compute = Pipe { read, completion, write: 2 };
+                assert_eq!(fw.channel_receipt(Channel::Compute, 1, true), Ok(false));
+                fw.latch_compute_channel_receipts().unwrap();
+                assert!(!fw.engine.flights[0].chan_settled);
+            }
+            // Once read and completion pass record 1 before wrap, latch becomes true.
+            fw.channels.compute = Pipe { read: 2, completion: 2, write: 2 };
+            fw.latch_compute_channel_receipts().unwrap();
+            assert!(fw.engine.flights[0].chan_settled);
+            // Even after pipe 1 submits 254 more records and stops at producer=0 (where raw
+            // channel_receipt(Compute, 1, true) returns false), the latched proof persists.
+            fw.channels.compute = Pipe { read: 0, completion: 0, write: 0 };
+            assert_eq!(fw.channel_receipt(Channel::Compute, 1, true), Ok(false));
+            assert!(fw.engine.flights[0].chan_settled);
+        }
     }
 }
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__LATCH_COMPUTE_CHANNEL_RECEIPTS__','poll.rs','latch_compute_channel_receipts'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
     body = function((backend/path).read_text(),name)
     if token in ('__RETIRED_FLIGHT__', '__RETIRED_FLIGHT_CLASSES__', '__RETIRED_SNAPSHOT_AT__'):
         body = body.replace('super::hw::', 'hw::')

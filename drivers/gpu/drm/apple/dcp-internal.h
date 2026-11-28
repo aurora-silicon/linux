@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/xarray.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -251,6 +252,13 @@ struct dcp_s2r_layout {
 	u32 disp_streams;
 	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
 	bool pmc_dcp;
+	/*
+	 * From the device tree (dcp_s2r_layout_from_dt()): only the @*_mask bits of a
+	 * retention word are written, @*_off while off and the value read at probe back on.
+	 * Zero masks: the whole words, as above.
+	 */
+	u32 ret_ff_mask, ret_ff_off, ret_ff_on;
+	u32 ret_mem_mask, ret_mem_off, ret_mem_on;
 };
 
 /*
@@ -322,6 +330,8 @@ struct apple_dcp_hw_data {
 	 * standard RTKit wake instead of starting or restarting the ASC.
 	 */
 	bool adopt_live_session;
+	/* Bootloader property marking this DCP as running under iBoot. */
+	const char *iboot_handoff;
 	enum dcp_firmware_version firmware_compat;
 	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
 	const struct resource *firmware_clock;
@@ -407,6 +417,16 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {
@@ -577,6 +597,18 @@ struct apple_dcp {
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
+	/*
+	 * J615 dcpext: a child device on the display DART stream the external
+	 * pipe scans framebuffers through. Framebuffers are mirrored into its
+	 * domain at the display subsystem's addresses. fb_mirrors holds the
+	 * mapped length of every mirrored GEM object, indexed by the object's
+	 * address, until the object is freed; fb_mirror_lock protects it and
+	 * fb_dom.
+	 */
+	struct platform_device *fbdma;
+	struct iommu_domain *fb_dom;
+	struct xarray fb_mirrors;
+	struct mutex fb_mirror_lock;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
 	struct apple_rtkit *rtk;
@@ -632,7 +664,11 @@ struct apple_dcp {
 	bool external;
 	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
 	bool dcpext;
-	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	/*
+	 * A desktop external processor: apple,t6041-dcpext (26.x or 27.2), or
+	 * the J773g's apple,t8132-dcpext on 27.2 (apple_t8132_dcpext_v27_2()),
+	 * which drives the HDMI port the same way.
+	 */
 	bool desktop_external;
 	/*
 	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
@@ -767,6 +803,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
@@ -926,8 +964,14 @@ struct apple_dcp {
 	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
+	bool s2r_hdmi_irq_disabled;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
+	/*
+	 * The firmware confirmed the scanout stop of a set_power_state(0) and no power-on has
+	 * started since: its D572(0) has come and gone, and a second set_power_state(0) gets none.
+	 */
+	bool pipe_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
 	bool s2r_refused_off;
 	/* The firmware's secure mailbox, where it has one. */
@@ -941,6 +985,8 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* Stopped cold for firmware-driven sleep, with no restart until reboot. */
+	bool sleep_cold_stopped;
 	/*
 	 * Its last system suspend left the firmware running and its domains on
 	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
@@ -971,12 +1017,17 @@ struct apple_dcp {
 	bool s2r_power_on;
 	bool s2r_power_oob;
 	u8 s2r_step;
+	struct mutex s2r_dart_lock; /* serializes D572 DART callback with s2r_active */
 	struct completion s2r_dart_done;
+	int s2r_dart_err;
 	struct completion s2r_hpd_done;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
+	/* hw.s2r without a layout in its hw data: the device tree's, see dcp_s2r_layout_from_dt() */
+	struct dcp_s2r_layout s2r_dt_layout;
+	bool s2r_dt_layout_ok;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -1063,6 +1114,12 @@ struct apple_dcp {
 	char link_line[120];
 	u64 link_line_generation;
 	u8 link_dsc;
+	/*
+	 * hw.only_120hz_modes: the refresh rate iBoot left the panel at, from the
+	 * firmware's "update_rr_index syncrate N" line before our first mode set
+	 * (dcp_rtk_syslog_boot_rate()); 0 until seen.
+	 */
+	u32 boot_rate;
 
 	/* V27 sleep: the panel's next mode set is the mode it already has */
 	bool v27_keep_mode;
@@ -1432,6 +1489,19 @@ static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
+/*
+ * Whether the firmware decodes PQ surfaces on its EDR panel path.  Firmware 27
+ * does not: on the K114s (T6050) a surface tagged ST 2084 is decoded with the
+ * sRGB curve and scaled by about 10000/100, and every other transfer function
+ * value gives the plain sRGB decode, whatever the colour space.  A PQ desktop
+ * then clips everything above a quarter of the code range to the panel's peak.
+ * So firmware 27 panels don't offer PQ until the EDR path maps it some other way.
+ */
+static inline bool dcp_fw_panel_decodes_pq(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat != DCP_FIRMWARE_V_27_0;
 }
 
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)

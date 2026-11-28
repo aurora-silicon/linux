@@ -2662,6 +2662,12 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
 	if (ret)
 		return ret;
+	/*
+	 * Stop the transport after verifying the mailbox so it drops its
+	 * runtime-PM reference while the port is idle; the first attach
+	 * starts it again in t6040_usb3_cpu_start().
+	 */
+	t6040_rtkit_stop_transport(tphy);
 
 	ret = t6040_debugfs_init(tphy);
 	if (ret)

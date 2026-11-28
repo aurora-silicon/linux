@@ -360,6 +360,8 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    if 'mutex_lock(&afkep->tx_lock);' in af:
+        queued=queued.replace('bool lock,stopping;','bool lock,tx_lock,stopping;',1)
     if 'atomic_inc(&ep->sleep_jobs);' in af:
         # The receive jobs a firmware sleep waits for; nothing here waits.
         anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'

@@ -33,8 +33,7 @@ use kernel::{
 
 use super::channel::Channel;
 use super::engine::{complete, now_ns, rmb, Flight, Lap};
-use super::fw::graph::{notifier, notifier_page, qstate};
-use super::fw::work::compute;
+use super::fw::graph::{manager, notifier, notifier_page, qstate};
 use super::job::{self, Completions, Job};
 use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
@@ -623,9 +622,7 @@ pub(crate) fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
 
 /// Cursor `c` of a ring of `m` entries passed end `h` of entries from `b`, within tail `t`.
 pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
-    let d = |x: u32| x.wrapping_add(m).wrapping_sub(b) % m;
-    let (dc, dh, dt) = (d(c), d(h), d(t));
-    dh <= dc && dc <= dt
+    super::recovery::logic::ring_passed(c, b, h, t, m)
 }
 
 impl Firmware {
@@ -924,9 +921,6 @@ impl Firmware {
                     render_behind = true;
                 }
             }
-            if compute_behind[0] && compute_behind[1] && render_behind {
-                break;
-            }
         }
         rmb();
         for p in 0..super::hw::sizes::COMPUTE_PIPES {
@@ -993,7 +987,8 @@ impl Firmware {
     /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair;
     /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. Check
     /// `work_ticks` first when the ABI defines them so 26B123 skips two always-zero WC reads
-    /// per command, falling back to ITS if `work_ticks` holds no interval.
+    /// per command, invalidating the cacheable `FwCoherent` work lines to PoC before reading
+    /// (`sync_for_cpu`), and falling back to ITS if `work_ticks` holds no interval.
     fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
         Self::compute_ticks_with(self.init.abi.compute().work_ticks, unit)
     }
@@ -1004,6 +999,9 @@ impl Firmware {
     ) -> Result<(u64, u64)> {
         if let Some((start_off, end_off)) = work_ticks {
             let w = &unit.work;
+            let lo = start_off.min(end_off);
+            let hi = start_off.max(end_off).checked_add(8).ok_or(EINVAL)?;
+            w.sync_for_cpu(lo, hi - lo)?;
             // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
             let at = |o: usize| -> Result<u64> {
                 for _ in 0..4 {
@@ -1098,13 +1096,56 @@ impl Firmware {
         }
         let pipe = self.channels.channel(channel);
         if passed {
+            let read = pipe.read()?;
+            let comp = pipe.completion()?;
+            if read >= slots || comp >= slots {
+                return Ok(false);
+            }
             let first = (record + slots - 1) % slots;
             let producer = self.channels.producer(channel);
-            Ok(ring_passed(pipe.read()?, first, record, producer, slots)
-                && ring_passed(pipe.completion()?, first, record, producer, slots))
+            Ok(ring_passed(read, first, record, producer, slots)
+                && ring_passed(comp, first, record, producer, slots))
         } else {
             Ok(pipe.read()? == record && pipe.completion()? == record && pipe.write()? == record)
         }
+    }
+
+    /// Latches `Channel::Compute` read and completion proofs onto active compute flights before
+    /// the shared submit ring can lap them, so a long flight on one compute pipe stays retirable
+    /// even after other pipes wrap the 256-entry submit channel.
+    pub(crate) fn latch_compute_channel_receipts(&mut self) -> Result {
+        if !self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.computes != 0 && !f.chan_settled)
+        {
+            return Ok(());
+        }
+        let slots = super::fw::channels::RING_SLOTS;
+        let pipe = self.channels.channel(Channel::Compute);
+        let read = pipe.read()?;
+        let comp = pipe.completion()?;
+        if read >= slots || comp >= slots {
+            return Ok(());
+        }
+        let producer = self.channels.producer(Channel::Compute);
+        for f in self.engine.flights.iter_mut() {
+            if f.computes == 0 || f.chan_settled {
+                continue;
+            }
+            let record = f.rec[2];
+            if record >= slots {
+                return Err(EINVAL);
+            }
+            let first = (record + slots - 1) % slots;
+            if ring_passed(read, first, record, producer, slots)
+                && ring_passed(comp, first, record, producer, slots)
+            {
+                f.chan_settled = true;
+            }
+        }
+        Ok(())
     }
 
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
@@ -1172,7 +1213,7 @@ impl Firmware {
     ) -> Result<Option<(usize, Retirement)>> {
         let mut compute_idx = [None; super::hw::sizes::COMPUTE_PIPES];
         let mut render_idx = None;
-        if check_compute[0] || check_compute[1] || *check_render {
+        if check_compute.iter().any(|&c| c) || *check_render {
             for (i, f) in self.engine.flights.iter().enumerate() {
                 if f.computes != 0 {
                     let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
@@ -1182,12 +1223,6 @@ impl Firmware {
                 }
                 if *check_render && render_idx.is_none() && f.renders != 0 {
                     render_idx = Some(i);
-                }
-                if (!check_compute[0] || compute_idx[0].is_some())
-                    && (!check_compute[1] || compute_idx[1].is_some())
-                    && (!*check_render || render_idx.is_some())
-                {
-                    break;
                 }
             }
         }
@@ -1259,25 +1294,28 @@ impl Firmware {
                 let tail = self.engine.target[pipe];
                 if !stamp_reached(g.fw_stamp.r32(0)?, f.target, tail)
                     || !self.queue_ring_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
-                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
+                    || !(f.chan_settled
+                        || self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?)
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, tail)
-                    && (stamp != f.target
-                        || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+                // The service stamp alone authenticates the receipt: its target is this pipe's
+                // own ordinal, and the firmware stores it only after its last access to the
+                // command's work item, microsequence and UMA descriptor. The cached notifier
+                // record's context word is written back only when the record is unlinked, so
+                // the host cannot read it reliably.
+                full &= stamp_reached(g.user_stamp.r32(0)?, f.target, tail);
             } else {
                 if g.fw_stamp.r32(0)? != f.target
                     || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
-                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
+                    || !(f.chan_settled
+                        || self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?)
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
+                full &= g.user_stamp.r32(0)? == f.target;
             }
             let count = f.claims.slot_count as usize;
             full &= count != 0 && count == f.computes as usize;
@@ -1288,8 +1326,8 @@ impl Firmware {
                     let submitted = f.csubmitted[m];
                     if submitted == 0
                         || unit.counter.r64(0)? != submitted
-                        || unit.work.r64(compute::DESCRIPTOR_COMPLETED)? != submitted
-                        || unit.work.r64(compute::DESCRIPTOR_COUNTER)? != unit.counter.va
+                        || unit.descriptor.r64(manager::COMPLETED)? != submitted
+                        || unit.descriptor.r64(manager::COUNTER)? != unit.counter.va
                     {
                         full = false;
                         break;
@@ -1517,8 +1555,12 @@ impl Firmware {
             }
             if f.renders != 0 {
                 for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
-                    self.recovery.last_retired.push(2, f.r_ta_stamp[m]);
-                    self.recovery.last_retired.push(3, f.r_fs_stamp[m]);
+                    self.recovery
+                        .last_retired
+                        .push(super::hw::sizes::COMPUTE_PIPES, f.r_ta_stamp[m]);
+                    self.recovery
+                        .last_retired
+                        .push(super::hw::sizes::COMPUTE_PIPES + 1, f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
@@ -1637,12 +1679,13 @@ impl Firmware {
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
             self.power.report_work(false);
         }
-        // The next prefix on the retired flight's class(es) starts executing about now.
+        // The next prefix on the retired flight's pipe/class starts executing about now.
         if f.renders != 0 {
             self.renew_render_deadline();
         }
         if f.computes != 0 {
-            self.renew_compute_deadline();
+            let pipe = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            self.renew_compute_pipe_deadline(pipe);
         }
         let job = f.job.clone();
         let p = &job.progress;
@@ -1754,7 +1797,7 @@ impl Firmware {
         }
     }
 
-    /// Progress of the oldest compute pipe 0/1 and oldest render flights: a FW stamp of a pipe on
+    /// Progress of the oldest compute pipes and oldest render flights: a FW stamp of a pipe on
     /// which its oldest flight still has unreached work moved since the last poll. Renews the
     /// deadline; the first call for a flight only records its position.
     /// [`Self::check_hangs`] calls it while no firmware recovery notification is pending.
@@ -1762,13 +1805,13 @@ impl Firmware {
         if self.engine.flights.is_empty() {
             return;
         }
+        const CP: usize = super::hw::sizes::COMPUTE_PIPES;
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
-        let mut fc: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
-            [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut fc: [Option<&Flight>; CP] = [None; CP];
         let mut fr = None;
         for f in e.flights.iter() {
             if f.computes != 0 {
-                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                let p = (f.compute_pipe as usize).min(CP - 1);
                 if fc[p].is_none() {
                     fc[p] = Some(f);
                 }
@@ -1776,42 +1819,52 @@ impl Firmware {
             if fr.is_none() && f.renders != 0 {
                 fr = Some(f);
             }
-            if fc[0].is_some() && fc[1].is_some() && fr.is_some() {
-                break;
-            }
         }
         // None denotes an inactive/reached stage. A real unreached stamp may be zero
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
-        let mut c = [None; super::hw::sizes::COMPUTE_PIPES];
-        let (mut ta, mut fs) = (None, None);
-        let mut published = [0u64; 3];
-        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+        let mut next_progress = [None; CP + 2];
+        let mut published = [0u64; CP + 1];
+        for p in 0..CP {
             if let Some(f) = fc[p] {
-                c[p] = pending(g[p].fw_stamp.r32(0).unwrap_or(0), f.target, e.target[p]);
+                next_progress[p] = pending(
+                    g[p].fw_stamp.r32(0).unwrap_or(0),
+                    f.target,
+                    e.target[p],
+                );
                 published[p] = f.published_ns;
             }
         }
         if let Some(fr) = fr {
-            ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
-            fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
-            published[2] = fr.published_ns;
+            next_progress[CP] = pending(
+                r.fw_stamp[0].r32(0).unwrap_or(0),
+                fr.ta_target,
+                e.ta_target,
+            );
+            next_progress[CP + 1] =
+                pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
+            published[CP] = fr.published_ns;
         }
-        let compute_moved = (0..super::hw::sizes::COMPUTE_PIPES).any(|p| {
-            fc[p].is_some() && e.progress_flight[p] == published[p] && c[p] != e.progress[p]
-        });
+        let mut compute_moved = [false; CP];
+        for p in 0..CP {
+            compute_moved[p] = fc[p].is_some()
+                && e.progress_flight[p] == published[p]
+                && next_progress[p] != e.progress[p];
+        }
         let render_moved = fr.is_some()
-            && e.progress_flight[2] == published[2]
-            && [ta, fs] != [e.progress[2], e.progress[3]];
-        if compute_moved {
-            self.renew_compute_deadline();
+            && e.progress_flight[CP] == published[CP]
+            && [next_progress[CP], next_progress[CP + 1]] != [e.progress[CP], e.progress[CP + 1]];
+        for (p, moved) in compute_moved.into_iter().enumerate() {
+            if moved {
+                self.renew_compute_pipe_deadline(p);
+            }
         }
         if render_moved {
             self.renew_render_deadline();
         }
         self.engine.progress_flight = published;
-        self.engine.progress = [c[0], c[1], ta, fs];
+        self.engine.progress = next_progress;
     }
 
     /// The device mutex still excludes slot reuse after owner-ledger retirement. Read the
@@ -2007,16 +2060,16 @@ impl Firmware {
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
         }
-        for b in 0..4 {
-            let t = self.events.event_ns[b];
-            let skip = match b {
-                2 => f.computes == 0 || f.compute_pipe != 0,
-                3 => f.computes == 0 || f.compute_pipe != 1,
-                _ => f.renders == 0,
-            };
-            if skip {
-                continue;
+        if f.renders != 0 {
+            for b in 0..2 {
+                let t = self.events.event_ns[b];
+                first = first.min(t);
+                last = last.max(t);
             }
+        }
+        if f.computes != 0 {
+            let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            let t = self.events.event_ns[2 + p];
             first = first.min(t);
             last = last.max(t);
         }

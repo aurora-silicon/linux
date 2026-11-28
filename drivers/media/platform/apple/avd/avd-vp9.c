@@ -192,7 +192,6 @@ struct avd_vp9_bank {
 		struct avd_buf lf_left_info;
 		struct avd_buf lf_left;
 		struct avd_buf color;
-		struct avd_buf seg;
 		struct avd_buf pipe_state;
 		struct avd_buf counts;
 		struct avd_buf probs;
@@ -200,8 +199,6 @@ struct avd_vp9_bank {
 	struct avd_vp9_frame_info cur;
 	struct avd_vp9_frame_info last;
 	u8 submit_num;
-	/* The seg buffer holds a map laid out for another frame size. */
-	bool seg_clear;
 };
 
 struct avd_vp9_ctx {
@@ -212,6 +209,16 @@ struct avd_vp9_ctx {
 	struct avd_vp9_bank *b;
 	/* The size changed, and no frame has updated the segmentation map since. */
 	bool seg_reset;
+	/*
+	 * The segmentation map, one per stream. A frame reads the map the frame
+	 * before it left (temporal prediction, or a frame without a map update),
+	 * so the two banks of the queued transport must share it: with one
+	 * buffer per bank, a frame read the map of the frame before last. A size
+	 * change moves to the other, cleared buffer (avd_vp9_run_preamble()): the frame
+	 * still in flight keeps reading the old one.
+	 */
+	struct avd_buf seg_buf[2];
+	unsigned int seg_cur;
 };
 
 static bool avd_vp9_needs_counts(u32 flags)
@@ -442,8 +449,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	pusha(vp9_ctx->b->bufs.counts.addr, "counts", 0);
 	pusha(vp9_ctx->b->bufs.probs.addr, "probs", 0);
 	pusha(vp9_ctx->b->bufs.above_info.addr, "above_info", 0);
-	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 1);
-	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 2);
+	pusha(vp9_ctx->seg_buf[vp9_ctx->seg_cur].addr, "seg", 1);
+	pusha(vp9_ctx->seg_buf[vp9_ctx->seg_cur].addr, "seg", 2);
 	pusha(vp9_ctx->b->bufs.color.addr, "color", 3);
 	pusha(avd_vp9_uses_prev_mv(frame, &vp9_ctx->last) ?
 		      vp9_ctx->last.color : vp9_ctx->b->bufs.color.addr,
@@ -845,10 +852,6 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
 	if (ret)
 		return ret;
 
-	ret = avd_buf_alloc(avd, &bank->bufs.seg, DIV_ROUND_UP(w, 8) * 24);
-	if (ret)
-		return ret;
-
 	ret = avd_buf_alloc(avd, &bank->bufs.lf_left,
 			    DIV_ROUND_UP(h, 8) * 16 * bit_depth);
 	if (ret)
@@ -991,20 +994,20 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	/*
 	 * VP9 clears the segmentation map when the frame size changes, and the
-	 * decoder carries part of it over in the seg buffer. Every bank's buffer
-	 * holds the old map, but a busy bank's belongs to the hardware until the
-	 * frame retires: clear each bank's when it is next taken. The map reset
-	 * goes to every frame that uses segmentation until one updates the map
-	 * (make_flags1(), update_ctx_last_info()).
+	 * decoder carries part of it over in the seg buffer. The frame in the
+	 * other bank may still be reading the old map, so move to the other
+	 * buffer and clear that one: at most one frame is in flight besides this
+	 * one, and it uses the current buffer. The map reset goes to every frame
+	 * that uses segmentation until one updates the map (make_flags1(),
+	 * update_ctx_last_info()).
 	 */
 	if (vp9_ctx->last.valid && !avd_vp9_same_size(dec_params, &vp9_ctx->last)) {
-		for (unsigned int i = 0; i < vp9_ctx->nbanks; i++)
-			vp9_ctx->bank[i].seg_clear = true;
+		struct avd_buf *seg;
+
+		vp9_ctx->seg_cur ^= 1;
+		seg = &vp9_ctx->seg_buf[vp9_ctx->seg_cur];
+		memset(seg->cpu, 0, seg->size);
 		vp9_ctx->seg_reset = true;
-	}
-	if (vp9_ctx->b->seg_clear) {
-		memset(vp9_ctx->b->bufs.seg.cpu, 0, vp9_ctx->b->bufs.seg.size);
-		vp9_ctx->b->seg_clear = false;
 	}
 
 	vp9_ctx->b->cur.tx_mode = run->prob_updates->tx_mode;
@@ -1293,6 +1296,8 @@ static void avd_vp9_free(struct avd_ctx *ctx, struct avd_vp9_ctx *vp9_ctx)
 	struct avd_dev *avd = ctx->dev;
 
 	ctx->max_frames = 1;
+	avd_buf_free(avd, &vp9_ctx->seg_buf[0]);
+	avd_buf_free(avd, &vp9_ctx->seg_buf[1]);
 	for (unsigned int i = 0; i < vp9_ctx->nbanks; i++) {
 		struct avd_vp9_bank *bank = &vp9_ctx->bank[i];
 
@@ -1300,7 +1305,6 @@ static void avd_vp9_free(struct avd_ctx *ctx, struct avd_vp9_ctx *vp9_ctx)
 		avd_buf_free(avd, &bank->bufs.inst);
 		avd_buf_free(avd, &bank->bufs.probs);
 		avd_buf_free(avd, &bank->bufs.counts);
-		avd_buf_free(avd, &bank->bufs.seg);
 		avd_buf_free(avd, &bank->bufs.color);
 		avd_buf_free(avd, &bank->bufs.ip_above);
 		avd_buf_free(avd, &bank->bufs.lf_above);
@@ -1332,6 +1336,12 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 
 	vp9_ctx->nbanks = avd_qfw_has_vp_done(ctx->dev) ? AVD_VP9_BANKS : 1;
 	vp9_ctx->b = &vp9_ctx->bank[0];
+	for (unsigned int i = 0; i < ARRAY_SIZE(vp9_ctx->seg_buf); i++) {
+		ret = avd_buf_alloc(ctx->dev, &vp9_ctx->seg_buf[i],
+				    DIV_ROUND_UP(fmt_width(ctx), 8) * 24);
+		if (ret)
+			goto err_free_ctx;
+	}
 	for (unsigned int i = 0; i < vp9_ctx->nbanks; i++) {
 		ret = avd_vp9_alloc_bufs(ctx, &vp9_ctx->bank[i]);
 		if (ret)

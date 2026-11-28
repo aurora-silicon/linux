@@ -12,7 +12,18 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8142-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
+	"apple,t8103-sleep",
+	"apple,t8122-sleep",
 };
+
+/*
+ * Region-based profiles, and those whose operations drive every word themselves (T8103),
+ * keep their words in their own tables, not in the shared lists checked here.
+ */
+static bool apple_sleep_test_own_tables(const struct apple_sleep_soc *soc)
+{
+	return soc->regions || !soc->ps_all.count;
+}
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
 {
@@ -59,7 +70,8 @@ static void apple_sleep_test_known_profiles(struct kunit *test)
 		KUNIT_EXPECT_NOT_NULL_MSG(test, id->data, "%s has no data", id->compatible);
 		KUNIT_ASSERT_LT(test, n, ARRAY_SIZE(apple_sleep_test_profiles));
 		KUNIT_EXPECT_STREQ(test, id->compatible, apple_sleep_test_profiles[n]);
-		if (!strcmp(id->compatible, "apple,t8142-sleep")) {
+		if (!strcmp(id->compatible, "apple,t8142-sleep") ||
+		    !strcmp(id->compatible, "apple,t8122-sleep")) {
 			const struct apple_sleep_soc *soc = id->data;
 
 			KUNIT_ASSERT_NOT_NULL(test, soc);
@@ -86,8 +98,7 @@ static void apple_sleep_test_words(struct kunit *test)
 		};
 		int i;
 
-		/* Region-based profiles keep their words in their own tables */
-		if (soc->regions)
+		if (apple_sleep_test_own_tables(soc))
 			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
@@ -201,7 +212,8 @@ static void apple_sleep_test_layout(struct kunit *test)
 	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		const struct apple_sleep_soc *soc = id->data;
 
-		if (soc->regions)
+		/* Its memory controller and NI words are its operations' own, too. */
+		if (apple_sleep_test_own_tables(soc))
 			continue;
 		KUNIT_EXPECT_GE(test, soc->ncluster_cpu, 1);
 		KUNIT_EXPECT_LE(test, soc->ncluster_cpu, SLEEP_CPU_CLUSTERS_MAX);

@@ -52,6 +52,7 @@ early_param("idle", setup_idle);
  */
 static bool apple_wfi_loses_regs __ro_after_init;
 static bool apple_keep_idle_nop __initdata;
+static bool apple_wfi_deferred __initdata;
 
 /*
  * Older boot loaders append idle=nop after the user's arguments on these
@@ -79,12 +80,31 @@ void __init apple_wfi_quirk_init(void)
 	 * WFI states spin too): on T8142 the SoC sits near 90 C and
 	 * throttles, on T6050 the system draws about 10 W more at idle, on
 	 * T8140 the die idles at 85-92 C instead of 43 C. WFI is safe here.
+	 *
+	 * The switch waits until the built-in drivers have probed: on a
+	 * K114c (M5 Max, chip 0x6050), WFI early in boot gated the unclaimed
+	 * root domain nub_gpio off before pmgr and pinctrl probed.
 	 */
 	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop) {
-		idle = ARM64_IDLE_WFI;
-		pr_info("Apple: idling in WFI, ignoring idle=nop\n");
+		apple_wfi_deferred = true;
+		pr_info("Apple: WFI idling deferred until built-in drivers probe\n");
 	}
 }
+
+/*
+ * Runs after the built-in drivers' initcalls. cpu_do_idle() reads idle on
+ * every entry, so the switch takes effect at once.
+ */
+static int __init apple_wfi_defer_enable(void)
+{
+	if (!apple_wfi_deferred)
+		return 0;
+
+	idle = ARM64_IDLE_WFI;
+	pr_info("Apple: idling in WFI, ignoring idle=nop (after built-in probes)\n");
+	return 0;
+}
+late_initcall_sync(apple_wfi_defer_enable);
 
 static __always_inline bool apple_wfi_needs_save(void)
 {

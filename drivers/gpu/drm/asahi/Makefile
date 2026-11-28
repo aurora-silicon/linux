@@ -9,6 +9,6 @@ aurora-$(CONFIG_DRM_ASAHI_UAT_ADOPTION) += g15/uat_glue.o
 
 aurora-$(CONFIG_DRM_ASAHI_G16) += g16/glue.o
 
-aurora-y += retain.o cpu_capacity.o g17/mesh_tvb_floor.o g17/mesh_exclusion.o rtkit_dump.o
+aurora-y += retain.o sleep_pd.o cpu_capacity.o g17/mesh_tvb_floor.o g17/mesh_exclusion.o rtkit_dump.o
 aurora-$(CONFIG_DRM_ASAHI_G18) += g18/sync_input.o
 aurora-$(CONFIG_DRM_ASAHI_G18) += g18/demand.o

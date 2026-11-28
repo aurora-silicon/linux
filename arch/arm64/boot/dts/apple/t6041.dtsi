@@ -20,7 +20,21 @@
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
+/* The loader supplies the ANE firmware and reservations. */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
 &ane {
+	status = "okay";
 	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
 			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
@@ -495,6 +509,19 @@
 	};
 
 	/*
+	 * The CPU power-gate enables, in /arm-io/pmgr at 0x50282c000, one word
+	 * per core: E core 0 at +0x0 and P0 core 0 (the boot core) at +0x40,
+	 * matching the two wake gates t6041-sleep restores on resume. iBoot
+	 * leaves the boot core's word clear, so P0 never powers down in WFI
+	 * unless set early in boot.
+	 */
+	cluster_pwrgate: power-gate@50282c000 {
+		compatible = "apple,t6041-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x5 0x0282c000 0x0 0x4>,
+		      <0x5 0x0282c040 0x0 0x4>;
+	};
+
+	/*
 	 * Suspend-to-RAM at EL2 through aura's S2R mailbox; without the mailbox
 	 * it stays out. Stays disabled at the SoC level so boards without
 	 * qualified deep sleep (such as J575c) remain on s2idle; qualified board
@@ -675,7 +702,6 @@
 		#reset-cells = <0>;
 		label = "aes";
 		power-domains = <&ps_sio>;
-		apple,always-on;
 		status = "disabled";
 	};
 };
@@ -1013,3 +1039,32 @@
 
 #include "t6041-pmgr.dtsi"
 #include "t6041-sleep-pmgr.dtsi"
+
+/* The loader uses this alias to enable SIO after placing its firmware. */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};

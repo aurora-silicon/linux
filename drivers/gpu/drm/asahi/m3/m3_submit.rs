@@ -13,7 +13,7 @@ impl FenceOps for Completion {
     fn get_driver_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("asahi")}
     fn get_timeline_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("m3-native")}
 }
-pub(crate) struct Destination { mapping: Arc<mmu::KernelMapping>, offset: usize }
+pub(crate) struct Destination { _buffer: Arc<crate::timestamp::Bound>, iova: u64 }
 impl Destination {
     fn resolve(objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamp: agx_uapi::UapiTimestamp) -> Result<Option<Self>> {
@@ -27,11 +27,12 @@ impl Destination {
                 if offset & 7 != 0 || offset.checked_add(8).ok_or(EOVERFLOW)? > mapping.size() {
                     return Err(EINVAL);
                 }
-                Ok(Some(Self { mapping, offset }))
+                let iova = mapping.iova() + offset as u64;
+                Ok(Some(Self { _buffer: buffer.clone(), iova }))
             }
         }
     }
-    fn firmware_address(&self) -> u64 { self.mapping.iova() + self.offset as u64 }
+    fn firmware_address(&self) -> u64 { self.iova }
 }
 
 #[derive(Copy,Clone)]
@@ -318,9 +319,9 @@ pub(crate) struct Queue {
     /// for every sample count and layer count. Otherwise only the single-sample,
     /// single-layer compressed depth layout is admitted.
     zls_compression_all_layouts:bool,
-    /// Whether this queue's command builders encode the render sampler heap and the render and
-    /// compute helper programs, in the 13.5 places. Otherwise they are refused: the M3 26.x
-    /// commands stream their sampler state and carry no helper.
+    /// Whether this queue's command builders encode the render and compute sampler heaps and
+    /// helper programs, in the 13.5 places. Otherwise they are refused: the M3 26.x commands
+    /// stream their sampler state and carry no helper.
     samplers_and_helpers:bool,
     urgency:u8,
 }
@@ -355,16 +356,24 @@ impl Queue {
             // compression words in every layout (g14_v27_2_render.rs).
             zls_compression_all_layouts:true,
             // Its render commands carry the sampler heap and both helper programs, and its
-            // compute command the 13.5 compute JobParameters1 with the helper
-            // (g14_v27_2_render.rs, gpu/v27_2.rs).
+            // compute command the 13.5 compute JobParameters1 with the helper and the sampler
+            // heap words the firmware loads for every command type (g14_v27_2_render.rs,
+            // g14_v27_2_abi.rs, gpu/v27_2.rs).
             samplers_and_helpers:true,
             urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
             render_queue: Some(render_queue)})
     }
 }
 impl queue::Queue for Queue {
-    fn submit(&mut self,_reg_data:&crate::driver::AsahiRegData<'_>,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
-        raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
+    fn submit(
+        &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
+        _id: u64,
+        mut syncs: KVVec<file::SyncItem>,
+        in_sync_count: usize,
+        raw: &[u8],
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
@@ -390,7 +399,7 @@ impl queue::Queue for Queue {
             // Other engines and helpers need their own M3 firmware translation.
             let wide=kernel::uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_WIDE_VISIBILITY as u32;
             if payload.flags & !wide !=0 || (!self.wide_visibility && payload.flags & wide != 0)
-                || payload.sampler_count!=0 || payload.sampler_heap!=0 {
+                || (!self.samplers_and_helpers && (payload.sampler_count!=0 || payload.sampler_heap!=0)) {
                 pr_err!("M3 compute rejected: flags={:#x} samplers={} heap={:#x} attachments={} timestamps={}/{}\n",payload.flags,payload.sampler_count,payload.sampler_heap,attachments.as_slice().len(),payload.timestamps.start.handle,payload.timestamps.end.handle);
                 return Err(ENOTSUPP);
             }
@@ -414,7 +423,7 @@ impl queue::Queue for Queue {
             let c=agx_uapi::translate_compute_command(payload,attachments,
                 agx_uapi::QueueUscWindow{base:self.usc,user_start:0x4000,user_end:(1u64<<42)-0x8000},
                 &AddressSpace(&self.vm)).map_err(|e| {
-                    pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper);
+                    pr_err!("M3 compute translation rejected {:?}: stream={:#x}..{:#x} helper={:?} samplers={} heap={:#x}\n",e,payload.control_stream_base,payload.control_stream_end,payload.helper,payload.sampler_count,payload.sampler_heap);
                     EINVAL
                 })?;
             // The launch check decodes the 26.x G15 CDM launch format; G14 streams differ.
@@ -424,7 +433,10 @@ impl queue::Queue for Queue {
             }
             timestamps.push([Destination::resolve(objects,payload.timestamps.start)?,
                 Destination::resolve(objects,payload.timestamps.end)?,None,None],GFP_KERNEL)?;
-            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc,helper}),GFP_KERNEL)?;
+            // The translator checked the heap: at most 1024 samplers, both fields set or both zero,
+            // 8-byte aligned and readable in this VM. Only a queue that encodes it admits one.
+            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc,helper,
+                sampler_heap:c.sampler_heap,sampler_count:c.sampler_count}),GFP_KERNEL)?;
         }
         parser.finish().map_err(|_|EINVAL)?;
         let preempt=match &self.preempt_alloc {
@@ -477,7 +489,8 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
     #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
     let stage_scope = { let _ = early_tiling; 0 };
-    if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
+    let vertex_scratch = if samplers_and_helpers { 1 } else { 0 };
+    if r.flags & !(vertex_scratch | 2 | 16 | (1 << 18) | stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || (!samplers_and_helpers && (r.sampler_count != 0 || r.sampler_heap != 0
             || r.vertex_helper != empty || r.fragment_helper != empty))
         || (!zls_compression_all_layouts

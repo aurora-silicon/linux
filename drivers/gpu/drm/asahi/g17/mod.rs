@@ -85,7 +85,7 @@ use kernel::{
     c_str,
     device::{self, Core},
     drm::gem::shmem,
-    impl_has_delayed_work, impl_has_work,
+    impl_has_delayed_work, impl_has_hr_timer, impl_has_work,
     io::{
         IoBase,
         IoSysMap,
@@ -97,13 +97,19 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc,
+        ArcBorrow,
         CondVar,
         Mutex, //
     },
     time::{
         delay::fsleep,
+        hrtimer::{
+            ArcHrTimerHandle, HrTimer, HrTimerCallback, HrTimerCallbackContext, HrTimerPointer,
+            HrTimerRestart, RelativeMode,
+        },
         msecs_to_jiffies,
-        Delta, //
+        Delta,
+        Monotonic, //
     },
     types::{ForeignOwnable, Opaque},
     uapi,
@@ -855,6 +861,11 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    /// The firmware's fixed timestamp window, on the older firmware graph; `None` on M5's graph.
+    fn timestamp_window(&self) -> Option<Range<u64>> {
+        (!self.uat.is_m5()).then_some(hw::t8140::dynamic::TIMESTAMP_WINDOW)
+    }
+
     /// The firmware instances this GPU runs.
     fn roles(&self) -> &'static [Role] {
         if self.secondary.is_some() {
@@ -1185,6 +1196,28 @@ const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
 const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
 
+/// The compute channel features of a GPU whose logical compute queues each hold up to `channels`
+/// physical compute channels ([`pairs::compute_channels_per_owner`]): with more than one, the
+/// kernel fans independent compute commands out itself.
+fn compute_channel_features(channels: u8) -> u64 {
+    if channels > 1 {
+        crate::file::DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL
+    } else {
+        0
+    }
+}
+
+/// Whether the firmware keeps partial renders (tiler-heap overflow fragment passes) strictly
+/// ordered behind earlier fragment work: advertised where `fragment_busy` drains an outstanding
+/// fragment pass on the pair and each logical render queue uses a single physical render pair.
+fn ordered_partial_renders_feature(fragment_busy: bool, render_pairs: u8) -> u64 {
+    if fragment_busy && render_pairs == 1 {
+        uapi::DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS as u64
+    } else {
+        0
+    }
+}
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -1194,6 +1227,42 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+/// Deferred housekeeping deadline when a completion drained the last in-flight work within
+/// `HOUSEKEEPING_NS`.
+const HOUSEKEEPING_WORK: u64 = 7;
+
+/// `CondVar` wrapper that tracks active waiters so `notify_all()` skips the waitqueue lock
+/// in the common zero-waiter steady state.
+#[pin_data]
+struct TrackedCondVar {
+    #[pin]
+    condvar: CondVar,
+    waiters: AtomicU32,
+}
+
+impl TrackedCondVar {
+    fn wait_timeout<T: ?Sized>(
+        &self,
+        guard: &mut kernel::sync::MutexGuard<'_, T>,
+        timeout: kernel::time::Jiffies,
+    ) -> kernel::sync::CondVarTimeoutResult {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiter = Waiter(&self.waiters);
+        self.condvar.wait_timeout(guard, timeout)
+    }
+
+    fn notify_all(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.condvar.notify_all();
+        }
+    }
+}
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1265,8 +1334,18 @@ struct Shared {
     housekeeping_ns: AtomicU64,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
+    /// Active retirement rescan hrtimer, replacing 1-jiffy delayed-work waits while GPU work
+    /// stays in flight.
+    rescan_stopped: AtomicBool,
+    rescan_deadline_ns: AtomicU64,
+    #[pin]
+    rescan: HrTimer<Shared>,
+    #[pin]
+    rescan_handle: Mutex<Option<ArcHrTimerHandle<Shared>>>,
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
+    #[pin]
+    housekeeping_timer: DelayedWork<Shared, HOUSEKEEPING_WORK>,
     /// M5: the thermal governor runs (the firmware has the host power budget word).
     governs: bool,
     /// Non-M5 submission-capable device registered for compute-waiter effort wakeups.
@@ -1281,11 +1360,23 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and high
-    /// priority. The event work runs in the cluster of the CPU that last published work, not
-    /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
-    /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
+    /// high priority, as `system_highpri_wq`. The event work runs in the cluster of the CPU that
+    /// last published work (see `queue_event_records`); [`Self::new_events_queue`] says where in
+    /// it.
     events: Arc<workqueue::OwnedQueue>,
+    /// Preallocated completion collector owned exclusively by `run_runtime_events`.
+    #[pin]
+    worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
+    /// Collector, as large as the event worker's, for the observation a render borrower owes the
+    /// pair it puts back (`Backend::render_direct`). Taken only with `try_lock`, so no borrower
+    /// waits for another, and finished after the device mutex is released.
+    #[pin]
+    render_collector: Mutex<runtime::DeferredBatch>,
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster, beside the
+    /// event work. Single-die M5 parts leave schedulers unrestricted so queues created on one
+    /// thread do not contend on a single cluster under multi-queue load.
+    pin_scheduler_cluster: bool,
     /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1307,7 +1398,7 @@ struct Shared {
     #[pin]
     actuators: Mutex<thermal::Actuators>,
     #[pin]
-    changed: CondVar,
+    changed: TrackedCondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -1319,8 +1410,31 @@ impl_has_work! {
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, POLL_WORK> for Shared { self.poll }
 }
+impl_has_hr_timer! {
+    impl HasHrTimer<Self> for Shared {
+        mode: RelativeMode<Monotonic>, field: self.rescan
+    }
+}
+impl HrTimerCallback for Shared {
+    type Pointer<'a> = Arc<Self>;
+
+    fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
+        let this: Arc<Self> = this.into();
+        this.rescan_deadline_ns.store(0, Ordering::Release);
+        if !this.sleeping()
+            && !this.rescan_stopped.load(Ordering::Acquire)
+            && !this.crashed.load(Ordering::Acquire)
+        {
+            this.queue_event_records();
+        }
+        HrTimerRestart::NoRestart
+    }
+}
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, HOUSEKEEPING_WORK> for Shared { self.housekeeping_timer }
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, GOVERNOR_WORK> for Shared { self.governor }
@@ -1406,6 +1520,15 @@ impl WorkItem<POLL_WORK> for Shared {
 impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        this.queue_events();
+    }
+}
+impl WorkItem<HOUSEKEEPING_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         this.queue_events();
     }
 }
@@ -1640,6 +1763,36 @@ impl Shared {
         self.events.clone()
     }
 
+    /// The queue of [`Self::events`].
+    ///
+    /// On M5 the queue is unbound. [`Self::queue_event_records`] queues the event work where the
+    /// completion is taken when that is in the cluster of the CPU that last published work, and
+    /// aims it at that CPU otherwise. On an unbound queue either only selects the affinity pod,
+    /// the CPUs sharing that L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
+    /// per-CPU queue the worker would run on the submitting CPU itself whenever the interrupt is
+    /// taken there and, with the higher priority, preempt the submitter for every completion,
+    /// often in the middle of a publication holding the locks the event work takes next. As
+    /// their owner would not be running, the worker could not spin on them: it would sleep until
+    /// the submitter unlocks and then preempt it again, two context switches of the submitter per
+    /// completion.
+    ///
+    /// Otherwise the queue is per-CPU and the event work runs on the CPU it is queued on, as on
+    /// `system_highpri_wq`.
+    fn new_events_queue(m5: bool) -> Result<workqueue::OwnedQueue> {
+        if m5 {
+            workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
+        } else {
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
+        }
+    }
+
+    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
+    /// (all but single-die M5).
+    pub(super) fn pin_scheduler_cluster(&self) -> bool {
+        self.pin_scheduler_cluster
+    }
+
     /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
         let cpu = kernel::cpu::CpuId::current().as_u32();
@@ -1692,7 +1845,48 @@ impl Shared {
     }
 
     fn queue_poll(self: &Arc<Self>) {
-        self.queue_poll_after(1);
+        // Sub-ms retirement rescan hrtimer: avoids 1-jiffy (4 ms at HZ=250) stalls when a
+        // completion's stamps or ring cursors lag its event notification.
+        const RESCAN_POLL_US: i64 = 50;
+        const RESCAN_POLL_NS: u64 = (RESCAN_POLL_US as u64) * 1_000;
+        if !self.submission_enabled
+            || self.sleeping()
+            || self.rescan_stopped.load(Ordering::Acquire)
+            || self.crashed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let now = now_ns();
+        let armed_ns = self.rescan_deadline_ns.load(Ordering::Acquire);
+        if armed_ns != 0 && armed_ns > now {
+            return;
+        }
+        let mut handle = self.rescan_handle.lock();
+        if self.sleeping()
+            || self.rescan_stopped.load(Ordering::Acquire)
+            || self.crashed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let armed_ns = self.rescan_deadline_ns.load(Ordering::Acquire);
+        if armed_ns != 0 && armed_ns > now {
+            return;
+        }
+        drop(handle.take());
+        self.rescan_deadline_ns
+            .store(now.saturating_add(RESCAN_POLL_NS), Ordering::Release);
+        *handle = Some(self.clone().start(Delta::from_micros(RESCAN_POLL_US)));
+    }
+
+    fn cancel_rescan(&self) {
+        let mut handle = self.rescan_handle.lock();
+        self.rescan_deadline_ns.store(0, Ordering::Release);
+        drop(handle.take());
+    }
+
+    fn disable_rescan(&self) {
+        self.rescan_stopped.store(true, Ordering::Release);
+        self.cancel_rescan();
     }
 
     fn queue_poll_after(self: &Arc<Self>, delay_ms: u32) {
@@ -1723,6 +1917,16 @@ impl Shared {
         let delay_ms = delay_ns.div_ceil(1_000_000).min(u64::from(u32::MAX)) as u32;
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, IDLE_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
+    }
+
+    fn queue_housekeeping(self: &Arc<Self>, delay_ns: u64) {
+        let delay_ms = delay_ns
+            .div_ceil(1_000_000)
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        let _ = workqueue::system_highpri().enqueue_delayed::<Arc<Self>, HOUSEKEEPING_WORK>(
+            self.clone(),
+            msecs_to_jiffies(delay_ms),
+        );
     }
 
     fn disable_timer<const ID: u64>(self: &Arc<Self>, timer: &DelayedWork<Self, ID>) {
@@ -1937,18 +2141,13 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        let events = Arc::new(
-            if m5 {
-                workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)?
-            } else {
-                workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?
-            },
-            GFP_KERNEL,
-        )?;
+        let events = Arc::new(Shared::new_events_queue(m5)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
+        let worker_deferred = runtime::DeferredBatch::worker()?;
+        let render_collector = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1984,7 +2183,12 @@ impl Gpu {
                 housekeeping: AtomicBool::new(true),
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
+                rescan_stopped: AtomicBool::new(false),
+                rescan_deadline_ns: AtomicU64::new(0),
+                rescan <- HrTimer::new(),
+                rescan_handle <- new_mutex!(None, "g17::Shared::rescan_handle"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
+                housekeeping_timer <- new_delayed_work!("g17::Shared::housekeeping_timer"),
                 governs: m5,
                 tracks_effort_wake: !m5 && submits,
                 full_effort_published: AtomicBool::new(false),
@@ -1992,6 +2196,12 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
+                worker_deferred <- new_mutex!(
+                    Some(worker_deferred),
+                    "g17::Shared::worker_deferred"
+                ),
+                render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
@@ -1999,7 +2209,10 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
-                changed <- new_condvar!("g17::Shared::changed"),
+                changed <- pin_init!(TrackedCondVar {
+                    condvar <- new_condvar!("g17::Shared::changed"),
+                    waiters: AtomicU32::new(0),
+                }),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
@@ -2691,8 +2904,10 @@ impl Gpu {
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
+        self.shared.disable_rescan();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
+        self.shared.disable_timer(&self.shared.housekeeping_timer);
         self.shared.disable_timer(&self.shared.governor);
         if let Some(firmware) = (*self.shared.state.lock()).as_deref_mut() {
             firmware.governor_restore();
@@ -2768,8 +2983,11 @@ impl gpu::Gpu for Gpu {
                 | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                 | sync_output::FEATURE_CUMULATIVE_SIGNALS
-                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT
+                | compute_channel_features(pairs::compute_channels_per_owner());
         let variant = self.shared.variant;
+        params.features |=
+            ordered_partial_renders_feature(variant.fragment_busy, pairs::per_owner());
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
@@ -2952,48 +3170,50 @@ impl gpu::Gpu for Gpu {
         Ok(KBox::new(frontend, GFP_KERNEL)?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        let state = self.shared.state.lock();
+        (*state)
+            .as_ref()
+            .and_then(|firmware| firmware.timestamp_window())
+            .map_or(0, |window| window.end - window.start)
+    }
+
     fn map_timestamp_buffer(
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        let (mapping, window) = {
+        let windowed = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            // The timestamp window is part of the older firmware graph, not M5's graph.
-            let windowed = if firmware.uat.is_m5() {
-                None
-            } else {
-                bo.map_range_into_range(
-                    firmware.uat.kernel_vm(),
-                    range.clone(),
-                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
-                    mmu::UAT_PGSZ as u64,
-                    mmu::PROT_FW_SHARED_RW,
-                    false,
-                )
-                .ok()
-            };
-            match windowed {
-                Some(mapping) => (mapping, true),
-                // A full window: this buffer's stamps are all host-written.
-                None => (
+            // A file whose share of the window is used up gets a host-written buffer, as when
+            // the window is full.
+            if window.is_allowed() {
+                firmware.timestamp_window().and_then(|window| {
                     bo.map_range_into_range(
                         firmware.uat.kernel_vm(),
-                        range,
-                        firmware.uat.kernel_dynamic_range(),
+                        range.clone(),
+                        window,
                         mmu::UAT_PGSZ as u64,
                         mmu::PROT_FW_SHARED_RW,
                         false,
-                    )?,
-                    false,
-                ),
+                    )
+                    .ok()
+                })
+            } else {
+                None
             }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        match window {
-            true => crate::timestamp::Buffer::firmware_window(mapping),
-            false => crate::timestamp::Buffer::firmware(mapping),
+        match windowed {
+            Some(mapping) => {
+                crate::timestamp::Buffer::firmware_window(mapping, window.into_share())
+            }
+            // Outside the window the host writes every stamp, and the firmware never sees the
+            // buffer: give it no firmware alias, which would take kernel address space shared
+            // with every firmware object (queues, rings, pools) for as long as it is bound.
+            None => crate::timestamp::Buffer::host(&bo, range),
         }
     }
 }

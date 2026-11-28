@@ -41,13 +41,27 @@ extern crate self as kernel;
 #[derive(Copy,Clone,Debug,Eq,PartialEq)] pub struct Error(i32);
 pub const EINVAL:Error=Error(22); pub const EAGAIN:Error=Error(11); pub const E2BIG:Error=Error(7);
 pub const EBUSY:Error=Error(16); pub const EOVERFLOW:Error=Error(75); pub const EIO:Error=Error(5);
+pub const ENOMEM:Error=Error(12);
 pub const ETIMEDOUT:Error=Error(110);pub const ERESTARTSYS:Error=Error(512);
 pub const GFP_KERNEL:u32=0;
 pub type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! init { ($($tt:tt)*) => { $($tt)* }; }
-pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
+pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ENOMEM,ETIMEDOUT,ERESTARTSYS};}
+std::thread_local!{pub static FAIL_KBOX_UNINIT:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
 pub struct KBox<T>(Box<T>);
-impl<T>KBox<T>{pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))} pub fn init(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}}
+impl<T>KBox<T>{
+    pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}
+    pub fn init(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}
+    pub fn new_uninit(_:u32)->Result<KBox<core::mem::MaybeUninit<T>>>{
+        if FAIL_KBOX_UNINIT.with(|f|f.replace(false)){return Err(ENOMEM);}
+        Ok(KBox(Box::new(core::mem::MaybeUninit::uninit())))
+    }
+    pub fn write(mut b:KBox<core::mem::MaybeUninit<T>>,x:T)->Self{
+        b.0.write(x);
+        // SAFETY: `write` just initialized `b.0`.
+        Self(unsafe{Box::from_raw(Box::into_raw(b.0).cast::<T>())})
+    }
+}
 impl<T>std::ops::Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl<T>std::ops::DerefMut for KBox<T>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 pub struct KVec<T>(Vec<T>);
@@ -123,7 +137,32 @@ pub mod g16 {
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
-        pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub persistent:bool}
+        pub struct Window {
+            pub fail_once: std::sync::atomic::AtomicBool,
+            pub calls: std::sync::atomic::AtomicUsize,
+            pub ranges: std::sync::Mutex<Vec<core::ops::Range<u64>>>,
+        }
+        impl Window {
+            pub fn new() -> Self {
+                Self {
+                    fail_once: std::sync::atomic::AtomicBool::new(false),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    ranges: std::sync::Mutex::new(Vec::new()),
+                }
+            }
+            pub fn sync_range(&self, _uat: &(), range: core::ops::Range<u64>) -> Result {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.ranges.lock().unwrap().push(range);
+                if self.fail_once.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    return Err(EIO);
+                }
+                Ok(())
+            }
+        }
+        pub struct Private {
+            pub pending: Option<core::ops::Range<u64>>,
+        }
+        pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub persistent:bool,pub uat:(),pub window:Arc<crate::sync::Mutex<Window>>,pub private:Option<Private>}
         // Device-lifetime render and compute command records, per test thread (the production
         // tables are resources::RenderCmds and resources::ComputeCmds): one never-dropped
         // allocator owns them.
@@ -139,15 +178,16 @@ pub mod g16 {
         }
         pub fn test_unit_cmds(k:u64)->crate::g16::slots::UnitCmds{
             if let Some(c)=UNIT_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
-            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::UnitCmds::new(p.get_or_insert_with(Objects::persistent)).unwrap()});
+            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::UnitCmds::new(p.get_or_insert_with(Objects::persistent),k).unwrap()});
             UNIT_CMDS.with(|p|p.borrow_mut().push((k,c.clone())));c
         }
         impl Objects{
-            pub fn new()->Self{Self{objects:vec![],persistent:false}}
-            pub fn persistent()->Self{Self{objects:vec![],persistent:true}}
-            pub fn finish_private(&mut self)->Result{Ok(())}
+            pub fn new()->Self{Self::with_window(false,Arc::new(crate::sync::Mutex::new(Window::new()),0).unwrap())}
+            pub fn persistent()->Self{Self::with_window(true,Arc::new(crate::sync::Mutex::new(Window::new()),0).unwrap())}
+            pub fn with_window(persistent:bool,window:Arc<crate::sync::Mutex<Window>>)->Self{Self{objects:vec![],persistent,uat:(),window,private:Some(Private{pending:None})}}
+            __FINISH_PRIVATE__
             pub fn alloc_dynamic_client(&mut self,size:usize)->Result<Arc<FwObject>>{self.alloc(Request{size,class:Class::Shared,placement:Placement::Anywhere,offset:0,client:Some((0x7040000000,super::hw::pte::LEAF_NC)),lower:None,cpu:true})}
-            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
+            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;if let Some(p)=self.private.as_mut(){let end=va+bytes as u64;p.pending=Some(match p.pending.take(){Some(range)=>range.start.min(va)..range.end.max(end),None=>va..end});}self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
         }
     }
     pub mod graph {
@@ -636,29 +676,33 @@ pub mod g16 {
         let mut vm_b = Objects::new();
         let f = g16::object::Factory;
         // Per-VM non-persistent allocator refuses UnitCmds (Class::FwCoherent).
-        assert!(matches!(UnitCmds::new(&mut vm_a), Err(EINVAL)));
+        assert!(matches!(UnitCmds::new(&mut vm_a, 3), Err(EINVAL)));
         // Normal VM unit 3 and an SCS VM local unit 0 bound to hardware slot 3 share slot 3's
-        // device-lifetime seq + barrier records; neither VM arena owns any FwCoherent object.
+        // device-lifetime work + seq + barrier records; neither VM arena owns any FwCoherent object.
         let ca = ComputeSlot::new(&mut vm_a, &f, 3, &g16::object::test_unit_cmds(3)).unwrap();
         let cb = ComputeSlot::new_in(
             &mut vm_b,
             &f,
             0,
+            3,
             SlotPlacement::Scs { seeds: 8192 },
             &g16::object::test_unit_cmds(3),
         )
         .unwrap();
-        let ra = [ca.seq.clone(), ca.barrier.clone()];
-        let rb = [cb.seq.clone(), cb.barrier.clone()];
-        for (x, y) in ra.iter().zip(rb.iter()) {
+        let ra = [ca.work.clone(), ca.seq.clone(), ca.barrier.clone()];
+        let rb = [cb.work.clone(), cb.seq.clone(), cb.barrier.clone()];
+        for (idx, (x, y)) in ra.iter().zip(rb.iter()).enumerate() {
             assert!(crate::sync::Arc::ptr_eq(x, y));
             assert_eq!(x.class, Class::FwCoherent);
-            assert_eq!((x.gva, x.client_leaf, x.lower_gva), (None, None, None));
+            assert_eq!((x.gva, x.client_leaf), (None, None));
+            assert_eq!(x.lower_gva.is_some(), idx == 0);
             assert_eq!(x.va & 0x3fff, 0);
         }
+        assert_ne!(ca.work.va, ca.seq.va);
         assert_ne!(ca.seq.va, ca.barrier.va);
-        assert_eq!(ca.work.class, Class::Shared);
-        assert!(ca.work.lower_gva.is_some());
+        assert_eq!(ca.descriptor.class, Class::Fw);
+        assert_eq!(cb.descriptor.class, Class::Fw);
+        assert_ne!(ca.descriptor.va, cb.descriptor.va);
         assert!(vm_a.objects.iter().chain(vm_b.objects.iter()).all(|o| o.class != Class::FwCoherent));
         assert!(vm_a
             .objects
@@ -667,19 +711,22 @@ pub mod g16 {
             .all(|o| ra.iter().all(|r| !crate::sync::Arc::ptr_eq(o, r))));
         // Distinct hardware slot gets distinct UnitCmds.
         let cc = ComputeSlot::new(&mut vm_b, &f, 4, &g16::object::test_unit_cmds(4)).unwrap();
+        assert!(!crate::sync::Arc::ptr_eq(&cc.work, &ca.work));
         assert!(!crate::sync::Arc::ptr_eq(&cc.seq, &ca.seq));
         assert!(!crate::sync::Arc::ptr_eq(&cc.barrier, &ca.barrier));
         // Closing VM a leaves slot 3's UnitCmds owned by the device-lifetime allocator.
         drop(ca);
         drop(vm_a);
         let again = g16::object::test_unit_cmds(3);
-        assert!(crate::sync::Arc::ptr_eq(&again.seq, &rb[0]));
-        assert!(crate::sync::Arc::ptr_eq(&again.barrier, &rb[1]));
+        assert!(crate::sync::Arc::ptr_eq(&again.work, &rb[0]));
+        assert!(crate::sync::Arc::ptr_eq(&again.seq, &rb[1]));
+        assert!(crate::sync::Arc::ptr_eq(&again.barrier, &rb[2]));
         g16::object::PERSISTENT.with(|p| {
             let p = p.borrow();
             let owned = &p.as_ref().unwrap().objects;
             assert!(owned.iter().any(|o| crate::sync::Arc::ptr_eq(o, &rb[0])));
             assert!(owned.iter().any(|o| crate::sync::Arc::ptr_eq(o, &rb[1])));
+            assert!(owned.iter().any(|o| crate::sync::Arc::ptr_eq(o, &rb[2])));
             assert!(owned.iter().all(|o| o.class == Class::FwCoherent));
         });
         // Work rings require a device-lifetime persistent allocator and never live in session o.
@@ -722,7 +769,7 @@ pub mod g16 {
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
-        assert!(arena.compute.compute.iter().all(|s|s.work.class==g16::object::Class::Shared));
+        assert!(arena.compute.compute.iter().all(|s|s.work.class==g16::object::Class::FwCoherent));
         assert!(arena.render.passes.iter().all(|s|s.ta_work.class==g16::object::Class::FwCoherent&&s.fs_work.class==g16::object::Class::FwCoherent));
         let work=arena.compute.compute.iter().map(|s|&s.work)
             .chain(arena.render.passes.iter().flat_map(|s|[&s.ta_work,&s.fs_work]));
@@ -2311,7 +2358,7 @@ pub mod g16 {
         assert_eq!(c.job_list.class, Class::FwCached);
         assert_eq!(c.sched_ctx.class, Class::Fw);
         assert_eq!(c.qstate.class, Class::Fw);
-        assert_eq!(c.notifier.class, Class::Fw);
+        assert_eq!(c.notifier.class, Class::FwCached);
         assert_eq!(c.threshold.class, Class::Fw);
         assert_eq!(c.ring.class, Class::FwCoherent);
         assert_eq!(c.user_stamp.class, Class::Shared);
@@ -3314,6 +3361,82 @@ pub mod g16 {
         assert!(!p.reclaim_closed());
     }
 
+    mod compute_cmds_retry {
+        use crate::*;
+        use crate::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use crate::g16::object::{FwObject, Objects, Window};
+        use crate::g16::slots::UnitCmds;
+        pub(super) mod hw {
+            pub(crate) use crate::g16::hw::sizes;
+        }
+        pub struct Factory {
+            window: Arc<Mutex<Window>>,
+            persistent_calls: AtomicUsize,
+        }
+        impl Factory {
+            pub fn persistent_objects(&self) -> Objects {
+                self.persistent_calls.fetch_add(1, Ordering::Relaxed);
+                Objects::with_window(true, self.window.clone())
+            }
+        }
+        __PERSISTENT_UNIT_CMDS__
+        __COMPUTE_CMDS_STRUCT__
+        impl ComputeCmds {
+            pub(crate) fn new() -> Result<Arc<Self>> {
+                Arc::new(
+                    Self {
+                        sets: Mutex::new([const { None }; hw::sizes::COMPUTE_UNITS]),
+                    },
+                    GFP_KERNEL,
+                )
+            }
+            __COMPUTE_CMDS_GET__
+        }
+        #[test]
+        fn failed_finish_private_retries_sync_and_failed_kbox_skips_persistent_objects() {
+            let window = Arc::new(Mutex::new(Window::new()), GFP_KERNEL).unwrap();
+            window.lock().fail_once.store(true, Ordering::Release);
+            let factory = Factory {
+                window: window.clone(),
+                persistent_calls: AtomicUsize::new(0),
+            };
+            let cmds = ComputeCmds::new().unwrap();
+
+            // KBox::new_uninit OOM must fail before calling factory.persistent_objects().
+            crate::FAIL_KBOX_UNINIT.with(|f| f.set(true));
+            assert_eq!(cmds.get(&factory, 0).err(), Some(ENOMEM));
+            assert_eq!(factory.persistent_calls.load(Ordering::Relaxed), 0);
+
+            // First real call allocates work/seq/barrier (3 objects) and fails sync_range once.
+            let before = crate::g16::object::ALL_OBJECTS.with(|a| a.borrow().len());
+            assert_eq!(cmds.get(&factory, 0).err(), Some(EIO));
+            assert_eq!(factory.persistent_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(crate::g16::object::ALL_OBJECTS.with(|a| a.borrow().len()) - before, 3);
+            assert_eq!(window.lock().calls.load(Ordering::Relaxed), 1);
+
+            // Retry must NOT re-allocate work/seq/barrier AND MUST retry sync_range on the
+            // preserved pending range before marking finished = true.
+            let first = cmds.get(&factory, 0).unwrap();
+            assert_eq!(factory.persistent_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(crate::g16::object::ALL_OBJECTS.with(|a| a.borrow().len()) - before, 3);
+            assert_eq!(window.lock().calls.load(Ordering::Relaxed), 2);
+            {
+                let w = window.lock();
+                let ranges = w.ranges.lock().unwrap();
+                assert_eq!(ranges.len(), 2);
+                assert_eq!(ranges[0], ranges[1]);
+            }
+
+            // Third call hits finished fast-path without calling sync_range again.
+            let second = cmds.get(&factory, 0).unwrap();
+            assert_eq!(window.lock().calls.load(Ordering::Relaxed), 2);
+            assert!(Arc::ptr_eq(&first.work, &second.work));
+            assert!(Arc::ptr_eq(&first.seq, &second.seq));
+            assert!(Arc::ptr_eq(&first.barrier, &second.barrier));
+        }
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -3404,6 +3527,14 @@ assert 'ring_objects.finish_private()?;' in graphs_finish_fn, 'Graphs::finish mu
 alloc_private_in_fn = item(object_source, 'fn alloc_private_in(')
 assert 'pub(crate) fn persistent_objects_probe(&self) -> Objects' in object_source, 'Factory must expose persistent_objects_probe for probe-time work rings'
 assert 'if self.probe {' in alloc_private_in_fn and 'self.dev.registration_guard().ok_or(ENODEV)?' in alloc_private_in_fn, 'alloc_private_in must gate as_bound() on self.probe and keep registration_guard() otherwise'
+assert alloc_private_in_fn.index('UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must pre-allocate UniqueArc before mapping firmware aperture'
+assert alloc_private_in_fn.index('self.uat.kernel_lower_vm().map_in_range(') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must map uncached aliases before firmware aperture'
+assert alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range(') < alloc_private_in_fn.index('self.mappings.push_within_capacity(firmware)'), 'alloc_private_in must commit mappings infallibly after firmware map'
+source = (source
+    .replace('__FINISH_PRIVATE__', item(object_source, 'pub(crate) fn finish_private('))
+    .replace('__PERSISTENT_UNIT_CMDS__', item(resources_source, 'struct PersistentUnitCmds {'))
+    .replace('__COMPUTE_CMDS_STRUCT__', item(resources_source, 'pub(crate) struct ComputeCmds {').replace('#[pin]\n', '').replace('super::hw::', 'hw::'))
+    .replace('__COMPUTE_CMDS_GET__', item(resources_source, 'pub(crate) fn get(&self, factory: &Factory, k: usize) -> Result<UnitCmds> {')))
 ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')
 ext_tiers_end = resources_source.index('];\n', ext_tiers_start) + 3
 render_burst_lines = (

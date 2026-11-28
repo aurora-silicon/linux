@@ -1255,8 +1255,22 @@ impl PbEpoch {
 
     /// Like [`Self::prepare`], recording whether this epoch is bound to the VM's SCS-capable
     /// render allocators (`scs == true`) or its base allocators (`scs == false`).
+    #[allow(dead_code)]
     pub(crate) fn prepare_with_scs(
         &self,
+        k: usize,
+        heap: u64,
+        heap_blocks: u32,
+        scs: bool,
+    ) -> Result {
+        self.prepare_with_scs_for(&buffer::pb_manager::V25G83, k, heap, heap_blocks, scs)
+    }
+
+    /// Like [`Self::prepare_with_scs`], encoding the PB manager with `layout` for the active
+    /// firmware ABI.
+    pub(crate) fn prepare_with_scs_for(
+        &self,
+        layout: &buffer::pb_manager::Layout,
         k: usize,
         heap: u64,
         heap_blocks: u32,
@@ -1290,7 +1304,8 @@ impl PbEpoch {
         self.counter.w64(0, 1)?;
         self.manager.write(
             0,
-            &buffer::pb_manager_image(
+            &buffer::pb_manager_image_for(
+                layout,
                 k as u32,
                 self.pages.va,
                 gva(&self.pages)?,

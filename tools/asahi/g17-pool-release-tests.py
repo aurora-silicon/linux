@@ -31,7 +31,8 @@ def fixture():
     predicate = '.any(|queue| queue.retirement_polling() || queue.pool_release_pending())'
     assert events.count(predicate) == 1
     methods = '\n'.join(item(runtime, name) for name in [
-        'fn compute_admission_error(', 'pub(super) fn reserve_compute(']).replace('pub(super) ', '').replace('queue: ComputeSlot::new()?', 'queue: None')
+        'fn compute_admission_error(', 'pub(super) fn reserve_compute(',
+        'pub(super) fn reserve_compute_channel(']).replace('pub(super) ', '').replace('queue: ComputeSlot::new()?', 'queue: None')
     pending = item(compute, 'pub(crate) fn pool_release_pending(') + '\n' + \
         item(compute, 'pub(crate) fn release_settling(')
     return r'''

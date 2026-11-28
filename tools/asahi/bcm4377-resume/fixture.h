@@ -23,6 +23,7 @@
 #define HCI_SETUP 1
 #define HCI_AUTO_OFF 2
 #define HCI_UNREGISTER 4
+#define HCI_MAX_ACL_SIZE 1024
 #define HCI_USER_CHANNEL 8
 #define HCI_RUNNING 16
 #define HCI_UP 32
@@ -45,7 +46,7 @@ static void bacpy(bdaddr_t *a,const bdaddr_t *b) { *a=*b; }
 static int bacmp(const bdaddr_t *a,const bdaddr_t *b) { return memcmp(a,b,6); }
 struct bcm4377_data;
 struct firmware { const unsigned char *data; int size; };
-struct hci_dev { struct bcm4377_data *data; unsigned int flags; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
+struct hci_dev { struct bcm4377_data *data; unsigned int flags; unsigned short acl_mtu,le_mtu; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
 struct ring { bool enabled; };
 struct pci_dev {
 	int irq, dev;
@@ -90,6 +91,7 @@ static int send_ptb(struct bcm4377_data *b,const struct firmware *f) { assert(f=
 static const struct firmware *bcm4377_request_blob(struct bcm4377_data *b,const char *suffix) { assert(!strcmp(suffix,"ptb"));return missing_blob?NULL:&fw; }
 static void release_firmware(const struct firmware *f) { assert(f==&fw); }
 static int bcm4377_check_bdaddr(struct bcm4377_data *b) { return 0; }
+static int bcm4377_init_cfg(struct bcm4377_data *b) { (void)b; return 0; }
 static int bcm4377_destroy_transfer_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_destroy_completion_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_hci_set_bdaddr(struct hci_dev *h,const bdaddr_t *a) { addr_count++;if(addr_error)return addr_error;h->bdaddr=*a;return 0; }

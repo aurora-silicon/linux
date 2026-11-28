@@ -569,9 +569,23 @@ mod tests {
                 0x86, 0x8b, 0xc9, 0xcf,
             ],
         ];
+        // builds[0] is the normalized entry; the per-board J713 entries follow it.
+        let normalized = &builds[0];
+        assert!(normalized
+            .boot_filled
+            .iter()
+            .all(|&(offset, len)| u64::from(offset) + u64::from(len) <= normalized.text_size));
+        let found = measured(
+            builds,
+            0x13c000,
+            &[[0x5c8df, 0x5c9c2]],
+            normalized.text_sha256,
+        )
+        .unwrap();
+        assert!(core::ptr::eq(found, normalized));
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
-            assert!(core::ptr::eq(found, &builds[i]));
+            assert!(core::ptr::eq(found, &builds[i + 1]));
             assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
         }
         assert!(measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], [0; 32]).is_none());

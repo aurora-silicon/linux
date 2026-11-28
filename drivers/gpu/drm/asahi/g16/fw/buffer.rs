@@ -46,6 +46,66 @@ pub(crate) mod pb_manager {
     pub(crate) const COUNTER: usize = 0x64;
     pub(crate) const MAX_PAGES_A: usize = 0x7c;
     pub(crate) const MAX_PAGES_B: usize = 0x80;
+
+    /// PB manager field offsets that differ between G16G (`0xc0`) and G15S 26B123 (`0x90`,
+    /// shifted `-4` bytes from `ID_A` onward).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Layout {
+        /// Primary parameter-buffer slot ID offset (`parameter_id` / PBID).
+        pub(crate) id_a: usize,
+        /// Secondary slot ID offset, when the record carries a second copy.
+        pub(crate) id_b: Option<usize>,
+        pub(crate) page_list_fw: usize,
+        pub(crate) page_list: usize,
+        pub(crate) page_list_bytes: usize,
+        pub(crate) pages: usize,
+        pub(crate) k: usize,
+        pub(crate) blocks: usize,
+        pub(crate) block_list: usize,
+        pub(crate) block_ctl: usize,
+        pub(crate) last_page: usize,
+        pub(crate) block_bytes: usize,
+        pub(crate) counter: usize,
+        pub(crate) max_pages_a: usize,
+        pub(crate) max_pages_b: usize,
+    }
+
+    pub(crate) const V25G83: Layout = Layout {
+        id_a: ID_A,
+        id_b: Some(ID_B),
+        page_list_fw: PAGE_LIST_FW,
+        page_list: PAGE_LIST,
+        page_list_bytes: PAGE_LIST_BYTES,
+        pages: PAGES,
+        k: K,
+        blocks: BLOCKS,
+        block_list: BLOCK_LIST,
+        block_ctl: BLOCK_CTL,
+        last_page: LAST_PAGE,
+        block_bytes: BLOCK_BYTES,
+        counter: COUNTER,
+        max_pages_a: MAX_PAGES_A,
+        max_pages_b: MAX_PAGES_B,
+    };
+
+    /// G15S 26B123 uses one slot ID. The adjacent bank selector stays zero.
+    pub(crate) const V26B123_G15S: Layout = Layout {
+        id_a: 0x08,
+        id_b: None,
+        page_list_fw: 0x1c,
+        page_list: 0x24,
+        page_list_bytes: 0x2c,
+        pages: 0x30,
+        k: 0x34,
+        blocks: 0x38,
+        block_list: 0x40,
+        block_ctl: 0x48,
+        last_page: 0x50,
+        block_bytes: 0x54,
+        counter: 0x60,
+        max_pages_a: 0x78,
+        max_pages_b: 0x7c,
+    };
 }
 pub(crate) mod uma_manager {
     pub(crate) const SIZE: usize = 0xa0;
@@ -96,24 +156,50 @@ pub(crate) fn pb_manager_image(
     count_fw: u64,
     heap_blocks: u32,
 ) -> [u8; pb_manager::SIZE] {
+    pb_manager_image_for(
+        &pb_manager::V25G83,
+        id,
+        pages_fw,
+        pages_gpu,
+        blocks_fw,
+        ring_fw,
+        count_fw,
+        heap_blocks,
+    )
+}
+
+/// Fresh PB manager encoded for `layout`'s firmware ABI, zero-padded to [`pb_manager::SIZE`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pb_manager_image_for(
+    layout: &pb_manager::Layout,
+    id: u32,
+    pages_fw: u64,
+    pages_gpu: u64,
+    blocks_fw: u64,
+    ring_fw: u64,
+    count_fw: u64,
+    heap_blocks: u32,
+) -> [u8; pb_manager::SIZE] {
     let blocks = heap_blocks.clamp(1, MAX_BLOCKS);
     let pages = blocks * PAGES_PER_BLOCK;
     let mut m = [0; pb_manager::SIZE];
-    put32(&mut m, 0xc, id);
-    put32(&mut m, 0x10, id);
-    put64(&mut m, 0x20, pages_fw);
-    put64(&mut m, 0x28, pages_gpu);
-    put32(&mut m, 0x30, PAGE_LIST_SIZE as u32);
-    put32(&mut m, 0x34, pages);
-    put32(&mut m, 0x38, BLOCK_LIST_RECORDS);
-    put32(&mut m, 0x3c, blocks);
-    put64(&mut m, 0x44, blocks_fw);
-    put64(&mut m, 0x4c, ring_fw);
-    put32(&mut m, 0x54, pages - 1);
-    put32(&mut m, 0x58, BLOCK_BYTES as u32);
-    put64(&mut m, 0x64, count_fw);
-    put32(&mut m, 0x7c, pages);
-    put32(&mut m, 0x80, pages);
+    put32(&mut m, layout.id_a, id);
+    if let Some(id_b) = layout.id_b {
+        put32(&mut m, id_b, id);
+    }
+    put64(&mut m, layout.page_list_fw, pages_fw);
+    put64(&mut m, layout.page_list, pages_gpu);
+    put32(&mut m, layout.page_list_bytes, PAGE_LIST_SIZE as u32);
+    put32(&mut m, layout.pages, pages);
+    put32(&mut m, layout.k, BLOCK_LIST_RECORDS);
+    put32(&mut m, layout.blocks, blocks);
+    put64(&mut m, layout.block_list, blocks_fw);
+    put64(&mut m, layout.block_ctl, ring_fw);
+    put32(&mut m, layout.last_page, pages - 1);
+    put32(&mut m, layout.block_bytes, BLOCK_BYTES as u32);
+    put64(&mut m, layout.counter, count_fw);
+    put32(&mut m, layout.max_pages_a, pages);
+    put32(&mut m, layout.max_pages_b, pages);
     m
 }
 
@@ -149,6 +235,24 @@ pub(crate) fn uma_manager_image(
     // Both start at zero for paired render engines and are never AP command serials.
     put32(&mut m, 0x84, 1);
     put32(&mut m, 0x94, 2);
+    m
+}
+
+/// One retained M4 compute UMA descriptor (`COMPUTE_UMA_SLOT + hw_slot`), identical to
+/// [`uma_manager_image`] with `COMPUTE_EXCLUSION = 1` and `work_fw` at offset 0.
+pub(crate) fn compute_uma_manager_image(
+    work_fw: u64,
+    slot: u32,
+    state_gpu: u64,
+    list_gpu: u64,
+    counter_fw: u64,
+    seeds: u32,
+    records: u32,
+) -> [u8; uma_manager::SIZE] {
+    let mut m = uma_manager_image(
+        work_fw, slot, state_gpu, list_gpu, counter_fw, seeds, records,
+    );
+    put32(&mut m, super::graph::manager::COMPUTE_EXCLUSION, 1);
     m
 }
 

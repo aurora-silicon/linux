@@ -1,0 +1,9 @@
+# ./tools/testing/kunit/kunit.py run --arch=arm64 --kunitconfig=drivers/input/touchscreen/apple_z2.kunitconfig
+CONFIG_KUNIT=y
+CONFIG_ARCH_APPLE=y
+CONFIG_SPI=y
+CONFIG_INPUT=y
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_FW_LOADER=y
+CONFIG_TOUCHSCREEN_APPLE_Z2=y
+CONFIG_TOUCHSCREEN_APPLE_Z2_KUNIT_TEST=y

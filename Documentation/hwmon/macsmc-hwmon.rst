@@ -52,6 +52,15 @@ with that active trip and ``macsmc_hwmon_hotspot_assist_policy()`` exposes the
 thresholds and hold time to hotspot fan assistance. Without those properties
 from the Devicetree, hotspot fan assistance stays off.
 
+When the Devicetree gives ``apple,soc-die-passive-millicelsius`` and
+``apple,soc-die-hot-millicelsius``, ``macsmc_soc_die`` also carries a passive
+trip and a hot trip at those temperatures. They describe the machine's SoC die
+limits for in-kernel power consumers that read the zone's trips (the GPU
+thermal backstop sheds performance from the passive trip and holds its lowest
+state at the hot one). The hot trip only reports: the zone has no hot callback
+and no critical trip, so it never shuts the machine down. Without both
+properties the zone carries no passive or hot trip.
+
 SoC die temperatures are described by the ``apple,soc-die-keys`` string list
 on the hwmon device node. The driver appends these temperature channels after
 the ``temperature-*`` children, in list order, with labels ``SoC die <key>``.

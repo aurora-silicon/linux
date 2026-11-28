@@ -783,6 +783,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	} else {
 		ave_start_put32(cmd, l->fps.numerator, p->fps_int);
 	}
+	/* A second copy of the integer rate: macOS 27.2.1 writes 60 at 60 fps (M5). */
+	ave_start_put32(cmd, l->fps_int_copy, p->fps_int);
 
 	/* Rate control */
 	/*

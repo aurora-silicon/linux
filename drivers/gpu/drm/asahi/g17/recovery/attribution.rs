@@ -63,9 +63,15 @@ pub(crate) struct Sources {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Attribution {
+pub(crate) enum Attribution {
+    /// Only the firmware's blame: unconfirmed.
     Firmware,
+    /// Evidence names these queues: slot identity, a latched fault, or a VM an earlier recovery
+    /// found guilty.
     Queues(u128),
+    /// The host's pass records suspect these queues (the oldest running render): unconfirmed,
+    /// like the firmware's blame.
+    Suspects(u128),
     NoCulprit,
 }
 
@@ -218,17 +224,17 @@ impl Sources {
 
     /// When slot identity cannot check a timeout's blame (25G83 reads every key as 0, and a
     /// single-slot mask has no peer), the host's own pass records still can: a blamed render
-    /// that never started was starved, not hung. `culprit` names the queues of the one VM whose
-    /// render started and did not finish; without one the firmware's blame stands.
+    /// that never started was starved, not hung. `culprit` gives their attribution
+    /// (`Queues::render_culprit`); without one the firmware's blame stands.
     pub(super) fn host_fallback(
         &self,
         attribution: Attribution,
-        culprit: impl FnOnce() -> Option<u128>,
+        culprit: impl FnOnce() -> Option<Attribution>,
     ) -> Attribution {
         if attribution != Attribution::Firmware || self.reason.is_none() || self.page_fault() {
             return attribution;
         }
-        culprit().map_or(Attribution::Firmware, Attribution::Queues)
+        culprit().unwrap_or(Attribution::Firmware)
     }
 
     /// A page fault's MMU record names the UAT slots of the faulting accesses. Firmware blames
@@ -324,8 +330,10 @@ mod tests {
         sources.reason = Some(0);
         let attribution = sources.attribute(Some(36), |_, _| panic!("unknown key"));
         assert_eq!(attribution, Attribution::Firmware);
-        assert_eq!(sources.host_fallback(attribution, || Some(3 << 60)), Attribution::Queues(3 << 60));
+        assert_eq!(sources.host_fallback(attribution, || Some(Attribution::Suspects(3 << 60))), Attribution::Suspects(3 << 60));
         assert_eq!(sources.host_fallback(attribution, || None), Attribution::Firmware);
+        // The host's records clear every running render (the blamed one never started).
+        assert_eq!(sources.host_fallback(attribution, || Some(Attribution::NoCulprit)), Attribution::NoCulprit);
     }
 
     #[test]
@@ -375,7 +383,7 @@ mod tests {
         sources.check_fault_banks(&[(0, 0); 2]);
         let attribution = sources.attribute(Some(40), |_, _| panic!("unknown key"));
         assert_eq!(attribution, Attribution::Firmware);
-        assert_eq!(sources.host_fallback(attribution, || Some(3 << 84)), Attribution::Queues(3 << 84));
+        assert_eq!(sources.host_fallback(attribution, || Some(Attribution::Queues(3 << 84))), Attribution::Queues(3 << 84));
         assert_eq!(sources.fault_override(attribution, Some(40), 0, |_| panic!("no fault")),
             Attribution::Firmware);
     }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! J713/T8132 initdata for the qualified 25G83 firmware and the 26B123 firmware.
+//! InitData for the qualified 25G83 and 26B123 classic GPU firmware.
 //!
 //! The encoder is written in 25G83 offsets; a [`Layout`] maps them to another firmware ABI
 //! (26B123 inserts and removes words in several objects, renumbers the register map and
@@ -118,6 +118,32 @@ pub(crate) struct FirmwareData {
     pub(crate) snapshot_entries: usize,
 }
 
+/// Pointer geometry of the twelve TX channels and device-control channel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxLayout {
+    /// Three state pointers spaced by 0x10 and a separate record buffer.
+    StateBlock,
+    /// Read and completion pointers spaced by eight. For the TX channels the
+    /// producer is the eight-byte header before the records.
+    RingHeader,
+}
+
+impl TxLayout {
+    pub(crate) const fn completion(self) -> usize {
+        match self {
+            Self::StateBlock => 0x10,
+            Self::RingHeader => 8,
+        }
+    }
+
+    pub(crate) const fn ring_header(self, control: bool) -> usize {
+        match self {
+            Self::RingHeader if !control => 8,
+            _ => 0,
+        }
+    }
+}
+
 /// The InitData ABI of one firmware build: what differs from the 25G83 objects the encoder
 /// writes. Offsets of every run are 25G83 offsets.
 pub(crate) struct Layout {
@@ -127,10 +153,16 @@ pub(crate) struct Layout {
     pub(crate) object_size: [usize; OBJECT_COUNT],
     /// RUNTIME (main config) offset of the unaligned power-config (POWER_PERFORMANCE) pointer.
     pub(crate) power_config: usize,
+    pub(crate) tx: TxLayout,
     /// Register-map slot in MAIN of each logical (25G83-numbered) loader record; `None` for a
     /// record that is empty, and the number of slots of the map at MAIN + 0x640.
     pub(crate) loader_slot: [Option<u8>; LOADER_COUNT],
     pub(crate) register_slots: usize,
+    pub(crate) loaders: &'static [Loader; LOADER_COUNT],
+    /// Slots with an empty address and length but a default write-enabled mode.
+    pub(crate) empty_loader_modes: u64,
+    /// Physical core slots in MAIN where the firmware expects the topology count.
+    pub(crate) main_core_slots: Option<u32>,
     /// MAIN (HW data) after the register map, GLOBALS (region C) and POWER_PERFORMANCE (power
     /// config). Only runs whose new position is known are listed.
     pub(crate) main: &'static [Run],
@@ -157,6 +189,9 @@ pub(crate) struct Layout {
     /// ADT (`clpc` low-peak limiter properties and `sgx` sample period), where the build has
     /// them.
     pub(crate) power_limiter: Option<PowerLimiter>,
+    /// POWER_PERFORMANCE u32 that must lie above every performance-state index, where the build
+    /// has one: the number of performance rows is written there.
+    pub(crate) state_bound: Option<usize>,
 }
 
 /// POWER_PERFORMANCE offsets of the words derived from the GPU power sample period and
@@ -198,6 +233,10 @@ pub(crate) struct PowerLimiter {
 /// nearest, ties to even. The encoder runs where the kernel has no floating point. With 32-bit
 /// inputs every step fits in 64 bits.
 pub(crate) const fn f32_bits(num: u32, den: u32) -> u32 {
+    // +0.0: a zero numerator never normalizes (`n < d` would loop forever).
+    if num == 0 {
+        return 0;
+    }
     let (mut n, mut d) = (num as u64, den as u64);
     let mut exponent: i32 = 0;
     while n >= 2 * d {
@@ -221,6 +260,7 @@ pub(crate) const fn f32_bits(num: u32, den: u32) -> u32 {
 }
 const _: () = assert!(f32_bits(28, 29) == 0x3f77_2c23 && f32_bits(1, 29) == 0x3d0d_3dcb);
 const _: () = assert!(f32_bits(8333, 1) == 0x4602_3400 && f32_bits(65536, 1) == 0x4780_0000);
+const _: () = assert!(f32_bits(0, 1) == 0 && f32_bits(1, 1) == 0x3f80_0000);
 
 /// Where the RETENTION object (0x4000 zeroed bytes) is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +285,7 @@ impl Layout {
     /// Register-map records from slot 0 through the highest slot the encoder fills.
     pub(crate) fn loader_records(&self) -> usize {
         (0..LOADER_COUNT)
-            .filter(|&slot| LOADERS[slot].length != 0)
+            .filter(|&slot| self.loaders[slot].length != 0)
             .filter_map(|slot| self.slot(slot))
             .max()
             .map_or(0, |slot| slot + 1)
@@ -288,8 +328,12 @@ pub(crate) const V25G83: Layout = Layout {
     version: 0x0c89c357839204b8,
     object_size: OBJECT_SIZE,
     power_config: 0x469,
+    tx: TxLayout::StateBlock,
     loader_slot: identity_slots(),
     register_slots: 53,
+    loaders: &LOADERS,
+    empty_loader_modes: 0,
+    main_core_slots: None,
     main: &[run(0, 0x640, 0), run(0xe88, 0x2658, 0)],
     globals: &[run(0, 0xe48, 0)],
     power_performance: &[run(0, 0x6578, 0)],
@@ -309,6 +353,7 @@ pub(crate) const V25G83: Layout = Layout {
     power_policy: &[],
     power_sampling: None,
     power_limiter: None,
+    state_bound: None,
 };
 
 /// The 26B123 InitData ABI: the same 31 objects and pointers, with
@@ -332,8 +377,12 @@ pub(crate) const V26B123: Layout = Layout {
         0x4800, 0x4, 0x30, 0x4800, 0x4000, 0x4000, 0x4000,
     ],
     power_config: 0x479,
+    tx: TxLayout::StateBlock,
     loader_slot: slots_26b123(),
     register_slots: 60,
+    loaders: &LOADERS,
+    empty_loader_modes: 0,
+    main_core_slots: None,
     main: &[
         run(0, 0x640, 0),
         run(0xe88, 0xe90, 0x118),
@@ -397,7 +446,103 @@ pub(crate) const V26B123: Layout = Layout {
         filter_tc_ms: 0xad8,
         filter_tc_clks: 0xae0,
     }),
+    state_bound: None,
 };
+
+/// G15S 26B123 keeps the protocol layouts and ADT-derived power sampling/limiter encoding while
+/// supplying its own HW data and register map.
+pub(crate) const G15S_26B123: Layout = Layout {
+    name: "26B123 G15S",
+    version: 0x0c8a836f039404b8,
+    tx: TxLayout::RingHeader,
+    object_size: {
+        let mut sizes = V26B123.object_size;
+        sizes[id::MAIN] = 0x2790;
+        sizes
+    },
+    loader_slot: slots_g15s(),
+    loaders: &G15S_LOADERS,
+    empty_loader_modes: (1 << 2)
+        | (0xf << 5)
+        | (7 << 25)
+        | (1 << 32)
+        | (1 << 35)
+        | (1 << 43)
+        | (3 << 46)
+        | (0xf << 52)
+        | (1 << 58),
+    main_core_slots: Some(20),
+    main_policy: &[(0x275c, 1), (0x2786, 1), (0x278a, 1)],
+    globals: &[run(0, 0x38, 0), run(0x38, 0xe28, 4), run(0xe28, 0xe47, 5)],
+    globals_policy: &[(0xe31, 1)],
+    ..V26B123
+};
+
+/// G15G (T8122 C0) 26B123: the G16G 26B123 objects, register-map positions and protocol, with
+/// the InitData version this image accepts (measured on the J615, linux#2781: the G16G version,
+/// 0x0391, 0x0393 and 0x0395 in the differing field fault right after the root), the T8122
+/// register blocks, and the words the m3 27.2 runtime adds to the performance object.
+pub(crate) const G15G_26B123: Layout = Layout {
+    name: "26B123 G15G",
+    version: 0x0c8a836f039404b8,
+    loaders: &G15G_LOADERS,
+    // 26.6.2 slots 2, 5-7, 30, 33, 34, 37, 38 and 41-43 carry write mode 2 while empty
+    // (`m3_mmio_26::empty_mode`); at their 26B123 positions (`slots_26b123`).
+    empty_loader_modes: (1 << 2) | (7 << 5) | (1 << 35) | (3 << 38) | (3 << 42) | (7 << 46),
+    // Two words this InitData family adds, 1 each as the G14 27.2 path sets them, next to the
+    // four power-up words (linux#2781 `relocate_26b123`).
+    power_policy: &[
+        (0x9c, 1),
+        (0xa0, 1),
+        (0xa4, 1),
+        (0xa8, 1),
+        (0x2f34, 1),
+        (0x6ac8, 1),
+    ],
+    // The shared3 block's state word (+0x62ac + 8): with the block all zero the G15G firmware
+    // never takes the first device-control records.
+    state_bound: Some(0x62b4),
+    // GLOBALS as the G15 family's 26B123 InitData version lays it out (the same version as
+    // G15S): the words from 25G83 +0xe28 on sit 5 bytes up, not G16G's 4. With G16G's runs the
+    // soft-fault word (25G83 +0xe28 = 3) lands one byte low, the firmware reads 0 there and an
+    // unmapped shader write faults the context instead of being dropped.
+    globals: G15S_26B123.globals,
+    ..V26B123
+};
+
+/// The T8122 register blocks behind each logical 26.6.2 slot (`m3_mmio_26::area` with the
+/// T8122 blocks of `m3_adt_config::T8122_IO_MAPPINGS`).
+const G15G_LOADERS: [Loader; LOADER_COUNT] = {
+    const SGX: u64 = 0x290000000;
+    let mut out = [EMPTY; LOADER_COUNT];
+    out[0] = mmio(0x2d1014000, 0x4000, 0, 2);
+    // The memory cache, two banks, as on T8132.
+    out[3] = LOADERS[3];
+    out[9] = mmio(0x2d03d0000, 0x1000, 0, 2);
+    out[10] = mmio(0x2d03c0000, 0x2000, 0, 0);
+    out[12] = mmio(0x31145c000, 0x4000, 0, 2);
+    out[14] = mmio(0x2d0280000, 0x8000, 0, 0);
+    out[17] = mmio(SGX, 0x20000, 0, 2);
+    out[26] = mmio(SGX + 0xd04000, 0x8000, 0xd04000, 2);
+    out[27] = mmio(SGX + 0xd0d000, 0x1000, 0xd0d000, 2);
+    out[28] = mmio(SGX + 0xd50000, 0x8000, 0xd50000, 2);
+    out[29] = mmio(SGX + 0xd10000, 0x4000, 0xd10000, 2);
+    out[31] = mmio(SGX + 0xd40000, 0x4000, 0xd40000, 2);
+    out[32] = mmio(SGX + 0xd60000, 0x8000, 0xd60000, 2);
+    out[35] = mmio(SGX + 0xe00000, 0x4000, 0xe00000, 2);
+    out[39] = mmio(SGX + 0xe08000, 0x8000, 0, 2);
+    out[40] = mmio(SGX + 0xe1c000, 0x4000, 0xe1c000, 2);
+    out
+};
+
+const fn slots_g15s() -> [Option<u8>; LOADER_COUNT] {
+    let mut slots = slots_26b123();
+    // The final two named registers use G15S-specific slots. Slot 41 (G16G's
+    // firmware-owned power transition block) stays empty on G15S.
+    slots[35] = Some(40);
+    slots[41] = Some(48);
+    slots
+}
 
 /// Runs are ordered, disjoint and land inside an object of `size` bytes.
 const fn runs_fit(runs: &[Run], size: usize) -> bool {
@@ -732,7 +877,13 @@ const fn retention_fits(layout: &Layout) -> bool {
         }
     }
 }
-const _: () = assert!(layout_fits(&V25G83) && layout_fits(&V26B123));
+const _: () = assert!(layout_fits(&V25G83) && layout_fits(&V26B123) && layout_fits(&G15S_26B123));
+const _: () = assert!(layout_fits(&G15G_26B123));
+const _: () = assert!(match G15G_26B123.state_bound {
+    Some(at) =>
+        power_slot_clear(&G15G_26B123, at) && power_policy_overlaps(G15G_26B123.power_policy, at),
+    None => false,
+});
 
 /// One logical loader record, including its page offset and exact PTE class.
 #[derive(Clone, Copy, Debug)]
@@ -913,24 +1064,76 @@ const fn loaders() -> [Loader; LOADER_COUNT] {
 }
 pub(crate) const LOADERS: [Loader; LOADER_COUNT] = loaders();
 
-/// Actual mapped span: slot 3 has two discontiguous physical banks.
-pub(crate) fn loader_span(slot: usize, bank: usize) -> Result<(u64, u32, u32), ()> {
-    let e = LOADERS.get(slot).ok_or(())?;
-    if e.length == 0 || bank > if slot == 3 { 1 } else { 0 } {
-        return Err(());
+const G15S_LOADERS: [Loader; LOADER_COUNT] = {
+    const SGX: u64 = 0x290000000;
+    let mut out = [EMPTY; LOADER_COUNT];
+    out[0] = mmio(0x351014000, 0x4000, 0, 2);
+    out[1] = mmio(0x3502bc000, 0x4000, 0, 0);
+    out[3] = LOADERS[3];
+    out[4] = mmio(0x35104c000, 0x4000, 0, 0);
+    out[9] = mmio(0x3503d0000, 0x4000, 0, 2);
+    out[10] = mmio(0x3503c0000, 0x4000, 0, 0);
+    out[11] = mmio(0x3503d8000, 0x4000, 0, 2);
+    out[12] = mmio(0x30945c000, 0x4000, 0, 2);
+    out[14] = mmio(0x350280000, 0x8000, 0, 0);
+    out[17] = mmio(SGX, 0x20000, 0, 2);
+    out[20] = mmio(0x293000000, 0x400000, 0, 2);
+    out[26] = mmio(SGX + 0xd04000, 0x8000, 0xd04000, 2);
+    out[28] = mmio(SGX + 0xd50000, 0x8000, 0xd50000, 2);
+    out[29] = mmio(SGX + 0xd10000, 0x4000, 0xd10000, 2);
+    out[31] = mmio(SGX + 0xd40000, 0x4000, 0xd40000, 2);
+    out[32] = mmio(SGX + 0xd60000, 0x20000, 0xd60000, 2);
+    out[33] = mmio(SGX + 0xd44000, 0x4000, 0xd44000, 2);
+    out[34] = mmio(SGX + 0xd4c000, 0x200, 0xd4c000, 2);
+    // The protected register block is explicitly supplied with mode 2 in G15S slot 40.
+    out[35] = mmio(SGX + 0xe00000, 0x4000, 0xe00000, 2);
+    out[37] = mmio(SGX + 0xe40000, 0x4000, 0xe40000, 2);
+    out[39] = mmio(SGX + 0xe08000, 0x8000, 0, 2);
+    out[40] = mmio(SGX + 0xe5c000, 0x4000, 0xe5c000, 2);
+    out[41] = mmio(SGX + 0xe60000, 0x50, 0xe60000, 2);
+    out
+};
+
+const fn mmio(pa: u64, length: u32, tag: u64, mode: u8) -> Loader {
+    Loader {
+        pa,
+        length,
+        requested: length,
+        tag,
+        mode,
+        attrs: if mode == 2 { MMIO_RW } else { MMIO_RO },
     }
-    let offset = e.pa & (PAGE - 1);
-    let bytes = if slot == 3 {
-        0x18000
-    } else {
-        u64::from(e.length)
-    };
-    let size = (offset + bytes + PAGE - 1) & !(PAGE - 1);
-    Ok((
-        (e.pa & PA_MASK) + if bank != 0 { 0x2000000 } else { 0 },
-        size as u32,
-        if bank != 0 { 0x18000 } else { 0 },
-    ))
+}
+
+impl Loader {
+    /// Number of banks in this window. A banked record encodes the combined span
+    /// and the requested size of one bank.
+    pub(crate) fn banks(&self) -> usize {
+        if self.length > self.requested {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Actual mapped span. The two banks have adjacent VAs and discontiguous PAs.
+    pub(crate) fn span(&self, bank: usize) -> Result<(u64, u32, u32), ()> {
+        if self.length == 0 || bank >= self.banks() {
+            return Err(());
+        }
+        let offset = self.pa & (PAGE - 1);
+        let bytes = u64::from(self.requested);
+        let size = (offset + bytes + PAGE - 1) & !(PAGE - 1);
+        Ok((
+            (self.pa & PA_MASK) + bank as u64 * 0x2000000,
+            size as u32,
+            bank as u32 * self.requested,
+        ))
+    }
+}
+
+pub(crate) fn loader_span(slot: usize, bank: usize) -> Result<(u64, u32, u32), ()> {
+    LOADERS.get(slot).ok_or(())?.span(bank)
 }
 
 fn put32(out: &mut [u8], at: usize, value: u32) -> Result<(), ()> {
@@ -947,29 +1150,35 @@ fn put64(out: &mut [u8], at: usize, value: u64) -> Result<(), ()> {
 }
 
 pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(), ()> {
-    let e = LOADERS.get(slot).ok_or(())?;
-    let out = record.get_mut(..LOADER_STRIDE).ok_or(())?;
-    if e.length == 0 {
-        if va != 0 {
+    LOADERS.get(slot).ok_or(())?.encode(va, record)
+}
+
+impl Loader {
+    fn encode(&self, va: u64, record: &mut [u8]) -> Result<(), ()> {
+        let e = self;
+        let out = record.get_mut(..LOADER_STRIDE).ok_or(())?;
+        if e.length == 0 {
+            if va != 0 {
+                return Err(());
+            }
+            out.fill(0);
+            return Ok(());
+        }
+        let offset = e.pa & (PAGE - 1);
+        let span = (offset + u64::from(e.length) + PAGE - 1) & !(PAGE - 1);
+        if !(HOST_START..HOST_END).contains(&va)
+            || va & (PAGE - 1) != offset
+            || span > HOST_END - (va - offset)
+        {
             return Err(());
         }
-        out.fill(0);
-        return Ok(());
+        put64(out, 0, e.pa)?;
+        put64(out, 8, va)?;
+        put32(out, 0x10, e.length)?;
+        put32(out, 0x14, e.requested)?;
+        put64(out, 0x18, e.tag)?;
+        put64(out, 0x20, u64::from(e.mode))
     }
-    let offset = e.pa & (PAGE - 1);
-    let span = (offset + u64::from(e.length) + PAGE - 1) & !(PAGE - 1);
-    if !(HOST_START..HOST_END).contains(&va)
-        || va & (PAGE - 1) != offset
-        || span > HOST_END - (va - offset)
-    {
-        return Err(());
-    }
-    put64(out, 0, e.pa)?;
-    put64(out, 8, va)?;
-    put32(out, 0x10, e.length)?;
-    put32(out, 0x14, e.requested)?;
-    put64(out, 0x18, e.tag)?;
-    put64(out, 0x20, u64::from(e.mode))
 }
 
 /// Capacity for the largest qualified table: J713 has ten rows, J773g eleven.
@@ -1033,6 +1242,7 @@ pub(crate) struct Input {
     pub(crate) lower_parameter: u64,
     pub(crate) ktrace_mask: u32,
     pub(crate) progress_recovery: u32,
+    pub(crate) enabled_cores: u32,
     pub(crate) performance: Performance,
     /// Exact GPU power sample period in system-counter ticks (`gpu-pwr-sample-period-aic-clks`),
     /// written to POWER_PERFORMANCE +4/+8. Non-zero is required.
@@ -1127,7 +1337,22 @@ pub(crate) fn encode_channel(
     ring: u64,
     control: bool,
 ) -> Result<(), ()> {
-    let bytes = if control { 0x4000 } else { 0x1800 };
+    encode_tx(TxLayout::StateBlock, out, state, ring, control)
+}
+
+fn encode_tx(
+    layout: TxLayout,
+    out: &mut [u8],
+    state: u64,
+    ring: u64,
+    control: bool,
+) -> Result<(), ()> {
+    let header = layout.ring_header(control) as u64;
+    let bytes = if control {
+        0x4000
+    } else {
+        0x1800 + header as usize
+    };
     if !object_va(state, 0x30)
         || !object_va(ring, bytes)
         || (state < ring + bytes as u64 && ring < state + 0x30)
@@ -1135,9 +1360,9 @@ pub(crate) fn encode_channel(
         return Err(());
     }
     put64(out, 0, state)?;
-    put64(out, 8, state + 0x10)?;
-    put64(out, 0x10, state + 0x20)?;
-    put64(out, 0x18, ring)
+    put64(out, 8, state + layout.completion() as u64)?;
+    put64(out, 0x10, if header == 0 { state + 0x20 } else { ring })?;
+    put64(out, 0x18, ring + header)
 }
 
 /// Encodes the complete private 31-object 25G83 graph, byte-for-byte matching the
@@ -1174,8 +1399,8 @@ pub(crate) fn encode_for(
         if input.power_sample_us == 0 || input.avg_power_filter_tc_ms == 0 {
             return Err(());
         }
-        let samples_u64 = (u64::from(input.avg_power_filter_tc_ms) * 1000)
-            / u64::from(input.power_sample_us);
+        let samples_u64 =
+            (u64::from(input.avg_power_filter_tc_ms) * 1000) / u64::from(input.power_sample_us);
         let samples = u32::try_from(samples_u64).map_err(|_| ())?;
         if samples < 2 || samples.checked_mul(4).is_none() {
             return Err(());
@@ -1193,8 +1418,12 @@ pub(crate) fn encode_for(
         {
             return Err(());
         }
+        // The low-peak IIR filter spans `periods` sample periods. One period (the ADT's
+        // limiter time constant equals its sample period, as on the 15-inch M3 Air) is a valid
+        // filter: a_neg = (1 - 1) / 1 = +0.0 and a = 1 / 1 = +1.0, i.e. each sample is taken
+        // as is. Only a time constant shorter than one period is refused.
         let periods = input.lowpeak_limiter_tc_ms / input.power_sample_period_ms;
-        if periods < 2 {
+        if periods < 1 {
             return Err(());
         }
         let periods_x4 = periods.checked_mul(4).ok_or(())?;
@@ -1250,6 +1479,9 @@ pub(crate) fn encode_for(
     ] {
         put64(runtime, at, input.va[i])?;
     }
+    if layout.tx == TxLayout::RingHeader {
+        put64(runtime, 0x8, input.va[id::TIMER])?;
+    }
     put64(runtime, 0x18, input.scratch)?;
     put64(runtime, 0x2d0, input.lower_parameter)?;
     put64(runtime, 0x2e0, input.lower_uma)?;
@@ -1259,14 +1491,16 @@ pub(crate) fn encode_for(
         put64(runtime, at, input.va[id::RETENTION])?;
     }
     for i in 0..12 {
-        encode_channel(
+        encode_tx(
+            layout.tx,
             &mut runtime[0x20 + i * 0x20..],
             input.channel_state[i],
             input.channel_ring[i],
             false,
         )?;
     }
-    encode_channel(
+    encode_tx(
+        layout.tx,
         &mut runtime[0x1a0..],
         input.va[id::DEVCTRL_STATE],
         input.va[id::DEVCTRL_RING],
@@ -1302,6 +1536,7 @@ pub(crate) fn encode_for(
     for &(at, value) in layout.main_policy {
         put32(main, at, value)?;
     }
+    let core_slots = layout.main_core_slots;
     for (at, value) in [
         (0xea0, 1),
         (0xee0, 1),
@@ -1309,20 +1544,28 @@ pub(crate) fn encode_for(
         (0xed0, 24000),
         (0xed4, 1),
         (0xed8, 8),
-        (0xfc0, input.performance.count as u32),
+        (0xfc0, core_slots.unwrap_or(input.performance.count as u32)),
         (0x259c, 1),
-        (0x2544, 4),
+        (0x2544, if core_slots.is_some() { 5 } else { 4 }),
         (0x2548, 6),
         (0x254c, 3),
         (0x2550, 7),
         (0x2554, 7),
-        (0x2568, 8),
-        (0x2570, 1),
+        (0x2568, if core_slots.is_some() { 0 } else { 8 }),
+        (0x2570, core_slots.map_or(1, |_| input.enabled_cores)),
     ] {
         put32(main, remap(runs, at, 4)?, value)?;
     }
     put32(main, remap(runs, 0xea4, 4)?, input.progress_recovery)?;
-    put64(main, remap(runs, 0xf24, 8)?, 0x0000000607002004)?;
+    put64(
+        main,
+        remap(runs, 0xf24, 8)?,
+        if core_slots.is_some() {
+            4
+        } else {
+            0x0000000607002004
+        },
+    )?;
     put32(main, remap(runs, 0xfc4, 4)?, ceiling)?;
     for i in 0..=ceiling as usize {
         put32(
@@ -1361,15 +1604,24 @@ pub(crate) fn encode_for(
             return Err(());
         }
         let mut record = [0u8; LOADER_STRIDE];
-        loader_encode(slot, input.loader_va[slot], &mut record)?;
+        layout.loaders[slot].encode(input.loader_va[slot], &mut record)?;
         let at = 0x640 + at * LOADER_STRIDE;
         main.get_mut(at..at + LOADER_STRIDE)
             .ok_or(())?
             .copy_from_slice(&record);
     }
+    for slot in 0..layout.register_slots {
+        if layout.empty_loader_modes & (1 << slot) != 0 {
+            put64(main, 0x640 + slot * LOADER_STRIDE + 0x20, 2)?;
+        }
+    }
     let runs = layout.power_performance;
     let p = &mut objects[id::POWER_PERFORMANCE];
-    put64(p, remap(runs, POWER_TEMP_PTR, 8)?, input.va[id::TEMPERATURE])?;
+    put64(
+        p,
+        remap(runs, POWER_TEMP_PTR, 8)?,
+        input.va[id::TEMPERATURE],
+    )?;
     let power_fixed_values = [
         input.power_sample_clks,
         input.power_sample_clks,
@@ -1388,6 +1640,9 @@ pub(crate) fn encode_for(
     // proved at compile time by layout_fits().
     for &(at, value) in layout.power_policy {
         put32(p, at, value)?;
+    }
+    if let Some(at) = layout.state_bound {
+        put32(p, at, input.performance.count as u32)?;
     }
     if let (Some(sampling), Some((period, samples))) = (layout.power_sampling, sampling_values) {
         for &at in sampling.period {

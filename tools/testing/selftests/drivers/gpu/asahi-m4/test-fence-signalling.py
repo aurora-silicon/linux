@@ -382,7 +382,7 @@ mod cumulative_syncs_test {
         pub(crate) cumulative: Option<g17::sync_output::SignalBundle>,
     }
 
-    pub(crate) type KVec<T> = Vec<T>;
+    pub(crate) type KVVec<T> = Vec<T>;
 
     fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
         for sync in outputs {

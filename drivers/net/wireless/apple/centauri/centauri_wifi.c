@@ -160,6 +160,7 @@ struct centauri_wifi {
 	u8 country[3];
 	bool country_valid;
 	u8 station_stats[0x378];
+	u16 station_stats_len;
 	bool station_stats_valid;
 	u8 rx_crypto_stats[64];
 	bool rx_crypto_stats_valid;
@@ -549,6 +550,43 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		netif_wake_queue(wifi->netdev);
 }
 
+/* Record a reply to the statistics command 0xb0001. */
+static void record_stats_reply(struct centauri_wifi *wifi, const u8 *packet,
+			       u16 size, u16 status)
+{
+	wifi->stats_reply_size = size;
+	wifi->stats_tag = size >= 28 ? get_unaligned_le16(packet + 24) : 0;
+	wifi->stats_length = size >= 28 ? get_unaligned_le16(packet + 26) : 0;
+	if (!status && wifi->stats_tag == 0xf928 &&
+	    (wifi->stats_length == 752 || wifi->stats_length == 888) &&
+	    size >= 28 + wifi->stats_length) {
+		/* Native firmware returns the older 752-byte counter record. */
+		memset(wifi->station_stats, 0, sizeof(wifi->station_stats));
+		memcpy(wifi->station_stats, packet + 28, wifi->stats_length);
+		/* A later reply can change stats_length; keep this record's own. */
+		wifi->station_stats_len = wifi->stats_length;
+		wifi->station_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf921 &&
+	    wifi->stats_length == sizeof(wifi->rx_crypto_stats) &&
+	    size >= 28 + sizeof(wifi->rx_crypto_stats)) {
+		memcpy(wifi->rx_crypto_stats, packet + 28, sizeof(wifi->rx_crypto_stats));
+		wifi->rx_crypto_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf91b &&
+	    wifi->stats_length == sizeof(wifi->dot11_mib_stats) &&
+	    size >= 28 + sizeof(wifi->dot11_mib_stats)) {
+		memcpy(wifi->dot11_mib_stats, packet + 28, sizeof(wifi->dot11_mib_stats));
+		wifi->dot11_mib_stats_valid = true;
+	}
+	if (!status && wifi->stats_tag == 0xf920 &&
+	    wifi->stats_length == sizeof(wifi->tx_power_report) &&
+	    size >= 28 + sizeof(wifi->tx_power_report)) {
+		memcpy(wifi->tx_power_report, packet + 28, sizeof(wifi->tx_power_report));
+		wifi->tx_power_report_valid = true;
+	}
+}
+
 static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 {
 	unsigned int ring;
@@ -673,37 +711,8 @@ static void drain_control(struct centauri_wifi *wifi, bool pm_command)
 						pos += 4 + length;
 					}
 				}
-				if (command == 0xb0001) {
-					wifi->stats_reply_size = size;
-					wifi->stats_tag = size >= 28 ? get_unaligned_le16(packet + 24) : 0;
-					wifi->stats_length = size >= 28 ? get_unaligned_le16(packet + 26) : 0;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf928 &&
-				    (wifi->stats_length == 752 || wifi->stats_length == 888) &&
-				    size >= 28 + wifi->stats_length) {
-					/* Native firmware returns the older 752-byte counter record. */
-					memset(wifi->station_stats, 0, sizeof(wifi->station_stats));
-					memcpy(wifi->station_stats, packet + 28, wifi->stats_length);
-					wifi->station_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf921 &&
-				    wifi->stats_length == sizeof(wifi->rx_crypto_stats) &&
-				    size >= 28 + sizeof(wifi->rx_crypto_stats)) {
-					memcpy(wifi->rx_crypto_stats, packet + 28, sizeof(wifi->rx_crypto_stats));
-					wifi->rx_crypto_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf91b &&
-				    wifi->stats_length == sizeof(wifi->dot11_mib_stats) &&
-				    size >= 28 + sizeof(wifi->dot11_mib_stats)) {
-					memcpy(wifi->dot11_mib_stats, packet + 28, sizeof(wifi->dot11_mib_stats));
-					wifi->dot11_mib_stats_valid = true;
-				}
-				if (command == 0xb0001 && !status && wifi->stats_tag == 0xf920 &&
-				    wifi->stats_length == sizeof(wifi->tx_power_report) &&
-				    size >= 28 + sizeof(wifi->tx_power_report)) {
-					memcpy(wifi->tx_power_report, packet + 28, sizeof(wifi->tx_power_report));
-					wifi->tx_power_report_valid = true;
-				}
+				if (command == 0xb0001)
+					record_stats_reply(wifi, packet, size, status);
 				if (command == 0xf0025) {
 					wifi->pmk_seen = !status && size >= 60;
 					wifi->pmk_matches = wifi->pmk_seen &&
@@ -745,8 +754,10 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 		return -EBUSY;
 	if (size + 24 > BUFFER_SIZE)
 		return -EMSGSIZE;
-	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1))
+	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1)) {
+		centauri_recovery_request(wifi->control, "command ring full");
 		return -ENOSPC;
+	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
 	put_unaligned_le16(24 + size, packet + 0x10);
@@ -766,8 +777,10 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		drain_control(wifi, pm_command);
-		if (readl(wifi->a.bar + 8) != 2)
+		if (readl(wifi->a.bar + 8) != 2) {
+			centauri_recovery_request(wifi->control, "command: Alpha stage");
 			return -EIO;
+		}
 		/* Bit 30 is more-data-pending, not part of the command identity.
 		 * Scan/connect replies set it before their later completion event.
 		 */
@@ -782,7 +795,24 @@ static int command_control(struct centauri_wifi *wifi, u32 id, const void *paylo
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
 	dev_err(&wifi->control->pdev->dev, "Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
+	centauri_recovery_request(wifi->control, "command timeout");
 	return -ETIMEDOUT;
+}
+
+/*
+ * The firmware has stopped: Alpha left execution stage 2, or the command ring stays full
+ * (a running firmware drains each command before the next is queued). Not while the
+ * transport is paused for a system sleep.
+ */
+bool centauri_wifi_stalled(struct centauri *c)
+{
+	struct centauri_wifi *wifi = c->wifi;
+
+	if (!wifi || READ_ONCE(wifi->transport_paused) || READ_ONCE(wifi->stopping))
+		return false;
+	if (readl(wifi->a.bar + 8) != 2)
+		return true;
+	return (READ_ONCE(wifi->command_head) + 1) % ring_size[1] == index_read(wifi, 1, 1);
 }
 
 static int command(struct centauri_wifi *wifi, u32 id, const void *payload, size_t size)
@@ -1005,6 +1035,9 @@ static void scan_worker(struct work_struct *work)
 		progress = jiffies;
 		do {
 			if (scan_transport_stopped(wifi)) {
+				if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused) &&
+				    readl(wifi->a.bar + 8) != 2)
+					centauri_recovery_request(wifi->control, "scan: Alpha stage");
 				ret = -EIO;
 				break;
 			}
@@ -1345,9 +1378,10 @@ static void connect_worker(struct work_struct *work)
 			probe_ret = query_station_stats(wifi);
 			dev_info(&wifi->control->pdev->dev,
 				 "connection counters: complete=%d rc=%d valid=%d length=%u\n",
-				 wifi->connect_event, probe_ret, wifi->station_stats_valid, wifi->stats_length);
+				 wifi->connect_event, probe_ret, wifi->station_stats_valid,
+				 wifi->station_stats_len);
 			if (!probe_ret && wifi->station_stats_valid)
-				for (i = 0; i < wifi->stats_length; i += 4) {
+				for (i = 0; i < wifi->station_stats_len; i += 4) {
 					u32 value = get_unaligned_le32(wifi->station_stats + i);
 
 					if (value)
@@ -2341,6 +2375,7 @@ static int query_station_stats(struct centauri_wifi *wifi)
 	put_unaligned_le16(363, payload + 9);
 	put_unaligned_le16(9, payload + 11);
 	wifi->station_stats_valid = false;
+	wifi->station_stats_len = 0;
 	wifi->stats_reply_size = wifi->stats_tag = wifi->stats_length = 0;
 	ret = wifi->configured ? command(wifi, 0xb0001, payload, sizeof(payload)) : -ENETDOWN;
 	if (!ret) {
@@ -2358,10 +2393,11 @@ static int station_stats_show(struct seq_file *seq, void *unused)
 
 	mutex_lock(&wifi->lock);
 	ret = query_station_stats(wifi);
-	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u\n", ret,
-		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag, wifi->stats_length);
+	seq_printf(seq, "rc=%d valid=%d size=%u tag=%#x length=%u counters=%u\n", ret,
+		   wifi->station_stats_valid, wifi->stats_reply_size, wifi->stats_tag,
+		   wifi->stats_length, wifi->station_stats_len);
 	if (!ret && wifi->station_stats_valid)
-		for (i = 0; i < wifi->stats_length; i += 4) {
+		for (i = 0; i < wifi->station_stats_len; i += 4) {
 			u32 value = get_unaligned_le32(wifi->station_stats + i);
 
 			if (value)
@@ -2879,3 +2915,7 @@ void centauri_wifi_unregister(struct centauri *c)
 	kfree(wifi);
 	c->wifi = NULL;
 }
+
+#if IS_ENABLED(CONFIG_APPLE_CENTAURI_KUNIT_TEST)
+#include "centauri_wifi_test.c"
+#endif

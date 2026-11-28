@@ -179,6 +179,8 @@ pub(crate) struct Queue {
     timeline: Arc<Timeline>,
     /// Enabled GPU cores, which SCS memory is sized for.
     active_cores: u32,
+    /// Hardware capabilities for stream admission and scratch reservations.
+    cfg: &'static hw::Config,
     /// Reserved render scratch pages per stage (`render_scs_layout`).
     render_scs: [u16; 2],
     // Last field: all preceding fields (especially scheduler) drop before capacity returns.
@@ -243,6 +245,7 @@ impl Queue {
             shared: gpu.shared.clone(),
             timeline,
             active_cores: gpu.id.core_masks.iter().map(|mask| mask.count_ones()).sum(),
+            cfg: gpu.cfg,
             render_scs: [0; 2],
             _credit: credit,
         })
@@ -260,7 +263,16 @@ impl Queue {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
-        let parsed = command::parse_stream(bytes, params::early_tiling())?;
+        let parsed = if self.cfg.gpu_generation < 16 {
+            command::parse_stream_for(
+                bytes,
+                params::early_tiling(),
+                self.cfg.num_clusters,
+                self.cfg.gpu_generation,
+            )?
+        } else {
+            command::parse_stream(bytes, params::early_tiling())?
+        };
         if self.shared.crashed.load(Ordering::Acquire) {
             return Err(EIO);
         }
@@ -276,6 +288,7 @@ impl Queue {
                 usc_base: self.state.usc_base,
                 active_cores: self.active_cores,
                 render_scs: self.render_scs,
+                max_tile_buffer: self.cfg.max_tile_buffer,
             },
             &mut self.proof,
         )?;
@@ -356,6 +369,12 @@ impl crate::queue::Queue for Queue {
     /// A render's UMA pool serves both stages of one render at a time, so their extra pages add
     /// up ([`super::rt::required_seeds`]).
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if !self.cfg.supports_render_scs {
+            if layouts == [0; 2] {
+                return Ok(());
+            }
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         if self.accepted != [0; 2] {
             return Err(EBUSY);
         }
@@ -372,7 +391,7 @@ impl crate::queue::Queue for Queue {
         &mut self,
         _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
