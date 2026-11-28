@@ -582,7 +582,7 @@ impl crate::g17::Shared {
         let requested = self
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
-        let (recover, masks, fast_done, render_changed) = {
+        let (recover, masks, fast_done, render_changed, render_rescan) = {
             // Taken before `state` so single-lock render retirement observes a live preparation
             // epoch and drops it before `wait_drained_until()` if recovery opens.
             let fast_epoch = self.preparations.try_enter().ok();
@@ -604,12 +604,12 @@ impl crate::g17::Shared {
             let mut fast_done = false;
             let mut render_changed = false;
             let mut rescan = false;
+            let mut render_clean = false;
             if !recover
-                && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
             {
                 let needs_render = masks != [0; 2] || firmware.render_observation_needed();
-                let render_clean = if !needs_render {
+                render_clean = if !needs_render {
                     true
                 } else if fast_epoch.as_ref().is_some_and(|epoch| epoch.is_current()) {
                     let before = deferred.pending();
@@ -666,7 +666,7 @@ impl crate::g17::Shared {
                         || self.queues.has_waiters()
                         || self.renders.has_waiters();
                     let no_housekeeping = !housekeeping_due(
-                        false,
+                        requested,
                         false,
                         false,
                         !firmware.queues.teardown.is_empty(),
@@ -703,7 +703,14 @@ impl crate::g17::Shared {
                     }
                 }
             }
-            (recover, masks, fast_done, render_changed)
+            // Once try_fast_observe_render() has retired every ready render in this pass, do
+            // not re-retain the same masks and re-enter observe_renders() on the slow path.
+            let remaining_masks = if render_clean && !recover {
+                [0; 2]
+            } else {
+                masks
+            };
+            (recover, remaining_masks, fast_done, render_changed, rescan)
         };
         if render_changed {
             self.note_changed();
@@ -760,6 +767,8 @@ impl crate::g17::Shared {
                     self.queue_poll();
                 }
             }
+        } else if render_rescan && !firmware.recovery.pending() {
+            self.queue_poll();
         }
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());

@@ -307,6 +307,9 @@ ASAHI_TESTS = {
     'g17-m5-idle-housekeeping-tests.py': [([], PASS)]
         + mutations('--mutation', ('idle-forces-housekeeping', 'no-deferred-timer',
                                    'hardcode-in-flight-true', 'skip-cadence-expiry'), []),
+    'g17-report-drain-tests.py': [([], PASS)]
+        + mutations('--mutation', ('per-record-store', 'always-read-full-trace',
+                                   'drop-partial-error-flush', 'keep-stale-render-masks'), []),
     'g17-m5-event-placement-tests.py': [([], PASS)]
         + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
                                    'record-never', 'not-reclaim', 'split-flag'), []),

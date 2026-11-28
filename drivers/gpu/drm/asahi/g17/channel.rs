@@ -295,40 +295,62 @@ impl Rings {
         } else {
             0
         };
+        let trace_record = matches!(ring, ReportRing::Trace);
+        let read_full = !trace_record || super::trace::report_enabled();
+        let mut drained = false;
         while consumer != producer {
-            if matches!(ring, ReportRing::Statistics) && *statistics_cutoff == Some(consumer) {
+            if !trace_record && *statistics_cutoff == Some(consumer) {
                 *statistics_cutoff = None;
             }
             let offset = entries + consumer as usize * EVENT_RECORD_SIZE;
             // Decode only the complete copy, before returning the slot.
             // Statistics never affect scheduling or power control.
-            let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
-            super::trace::report(role as u8, ring as u8, &words);
-            let tag = words[0];
-            if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
-                return Err(EIO);
-            }
-            if matches!(ring, ReportRing::Statistics) {
-                let admitted = accept_statistics && statistics_cutoff.is_none();
-                reports.record(role, words, host_ns, allowed_types, admitted);
-                if admitted {
-                    telemetry.record(&words, host_ns, max_age_ns);
-                } else if accept_busy {
-                    telemetry.record_busy(&words);
+            if read_full {
+                let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
+                super::trace::report(role as u8, ring as u8, &words);
+                let tag = words[0];
+                if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
+                    if drained {
+                        fence(Ordering::SeqCst);
+                        consumer_word.store(consumer, Ordering::Relaxed);
+                        fence(Ordering::SeqCst);
+                    }
+                    return Err(EIO);
+                }
+                if !trace_record {
+                    let admitted = accept_statistics && statistics_cutoff.is_none();
+                    reports.record(role, words, host_ns, allowed_types, admitted);
+                    if admitted {
+                        telemetry.record(&words, host_ns, max_age_ns);
+                    } else if accept_busy {
+                        telemetry.record_busy(&words);
+                    }
+                }
+            } else {
+                // Only the tag word is checked when the report tracepoint is disabled; avoid
+                // copying 17 unused words from write-combined firmware memory per record.
+                let tag = init.status_read_words::<1>(role, offset)?[0];
+                if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
+                    if drained {
+                        fence(Ordering::SeqCst);
+                        consumer_word.store(consumer, Ordering::Relaxed);
+                        fence(Ordering::SeqCst);
+                    }
+                    return Err(EIO);
                 }
             }
             consumer = (consumer + 1) & (capacity - 1);
+            drained = true;
+        }
+        // Return the whole drained batch to firmware with a single consumer update instead of
+        // issuing full barriers and write-combined stores on every record.
+        if drained {
             fence(Ordering::SeqCst);
             consumer_word.store(consumer, Ordering::Relaxed);
-            if matches!(ring, ReportRing::Trace) {
-                fence(Ordering::SeqCst);
-            }
-        }
-        if matches!(ring, ReportRing::Statistics) {
-            if *statistics_cutoff == Some(consumer) {
-                *statistics_cutoff = None;
-            }
             fence(Ordering::SeqCst);
+        }
+        if !trace_record && *statistics_cutoff == Some(consumer) {
+            *statistics_cutoff = None;
         }
         Ok(())
     }
