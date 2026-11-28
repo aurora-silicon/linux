@@ -72,7 +72,10 @@ struct apple_rtkit {
 	 * hand out kdebug buffers, and poll the mailbox while waiting.
 	 */
 	bool sync_syslog_ack;
-	/* Echo each OSLOG channel-0 counter, as macOS does. */
+	/*
+	 * Echo each OSLOG channel-0 counter, as macOS does. On unless the node has
+	 * apple,sync-syslog-ack or the client turned it off; off drops the counters.
+	 */
 	bool oslog_echo;
 	/* A counter queued for the receive work and not yet echoed. */
 	u64 oslog_owed;
@@ -142,7 +145,6 @@ struct apple_rtkit {
 	bool crashlog_inherited;
 	/* The crash log buffer is the firmware's own, mapped here when it crashed. */
 	bool crashlog_placed;
-	bool oslog_inherited;
 
 	/* A crash reported before the crashlog buffer was mapped: the log is
 	 * read once the co-processor has written it. */

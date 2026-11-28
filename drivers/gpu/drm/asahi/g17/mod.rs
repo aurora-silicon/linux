@@ -636,11 +636,7 @@ impl Coprocessor {
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
             match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
-                Ok(receiver) => {
-                    // Its OSLOG counters stay unanswered until a soak shows echoing them is safe.
-                    receiver.set_oslog_echo(false);
-                    return Ok(receiver);
-                }
+                Ok(receiver) => return Ok(receiver),
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
                     if attempt + 1 < RECEIVER_ATTEMPTS {
                         fsleep(Delta::from_millis(RECEIVER_RETRY_MS));

@@ -448,7 +448,7 @@ ASAHI_TESTS = {
     'rtkit-crashlog-map-tests.py': [(out(), PASS),
                                     (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
-        + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+        + mutations('--mutate', ('owed', 'policy', 'counter', 'reset', 'buffer'), out()),
     'rtkit-adopted-session-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-management', 'any-system', 'any-version',
                                    'ignore-ops-version', 'any-buffer-endpoint'), out()),
