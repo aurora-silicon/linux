@@ -2516,12 +2516,10 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	 * A panel's timing lists its variable refresh range as zero placeholders
 	 * on desktop 26.x and firmware 27 alike (the K114s's 120 Hz timing:
 	 * MinimumVariableRefreshRate and MaximumVariableRefreshRate both 0), so
-	 * zeros mean no range was given there.  Only an internal ProMotion timing
-	 * then takes a range (dcp_refresh_range()); external timings stay fixed.
-	 * Older firmware keeps zeros as a range, as before.
+	 * zeros mean no range was given.  Only an internal ProMotion timing then
+	 * takes a range (dcp_refresh_range()); external timings stay fixed.
 	 */
-	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-				       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	ctx->zero_vrr_range_fallback = true;
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP &&
 	    smp_load_acquire(&dcp->dptxport[0].tile_hint)) {
