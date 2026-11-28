@@ -3665,12 +3665,14 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
  * 280 Hz (video clock 485/565 MHz, provider clock 360 MHz), while 144 Hz
  * (292 MHz) is whole.
  *
- * Offer an external display only the modes the provider clock scans, while
- * no running PMP has taken this processor's display request (once one has,
- * it scales the clock and the limit steps aside).  The provider clock is the
- * one the boot loader published for this processor and that the driver
- * already answers the firmware with; a processor without a provider clock
- * table, and internal panels, are not limited here.
+ * Offer an external display only the modes the provider clock scans, unless
+ * the processor is described with a PMP display request (apple,pmp-report):
+ * such a processor starts its display only once the PMP has acknowledged
+ * that request, and the PMP then scales the clock.  This reads only the
+ * device tree, so a mode query never starts or waits on the PMP.  The
+ * provider clock is the one the boot loader published for this processor
+ * and that the driver already answers the firmware with; a processor without
+ * a provider clock table, and internal panels, are not limited here.
  */
 static bool dcp_mode_beyond_provider_clock(struct apple_dcp *dcp,
 					   struct drm_connector *connector,
@@ -3684,7 +3686,7 @@ static bool dcp_mode_beyond_provider_clock(struct apple_dcp *dcp,
 		return false;
 
 	rate = clk_get_rate(dcp->firmware_clocks[0].clk);
-	if (!rate || dcp_pmp_display_ready(dcp))
+	if (!rate || of_property_present(dcp->dev->of_node, "apple,pmp-report"))
 		return false;
 
 	/* mode->clock is in kHz; the video clock is half the pixel clock. */
