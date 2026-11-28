@@ -282,7 +282,11 @@ impl EventManager {
         });
 
         for wq in owners {
-            wq.fail_all(error);
+            if wq.fail_all(error) {
+                // Keep the queue and its ring until reboot; pinned commands retain their
+                // VM guards and bindings because firmware DMA has not been ruled out.
+                core::mem::forget(wq);
+            }
         }
     }
 }

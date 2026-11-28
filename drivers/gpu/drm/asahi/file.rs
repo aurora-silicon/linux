@@ -161,7 +161,6 @@ struct Vm {
     vm: mmu::Vm,
     user_range: Range<u64>,
     kernel_range: Range<u64>,
-    _dummy_mapping: mmu::KernelMapping,
     gpu: Arc<dyn gpu::Gpu>,
 }
 
@@ -174,20 +173,17 @@ impl Drop for Vm {
             // object must not outlive the client's VM handle.
             status.release_mirror();
         }
-        // Tracked jobs can outlive their file's VM handle: their last guard runs the
-        // teardown once no accepted work can still dereference the mappings. On
-        // untracked VMs this unmaps every user GPUVA at once without allocating or
+        // Accepted jobs retain mappings until firmware completion or GPU stop.
+        // On idle VMs this unmaps every user GPUVA at once without allocating or
         // charging split nodes, so teardown succeeds even at the client's memory limit.
         if let Err(error) = self
             .vm
             .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
         {
-            pr_err!("Vm::Drop: user unmap failed: {:?}\n", error);
+            pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
         }
         self.vm.bo_deferred_cleanup();
-        if self.vm.status().is_some() {
-            self.gpu.vm_closed(&self.vm);
-        }
+        self.gpu.vm_closed(&self.vm);
     }
 }
 
@@ -795,13 +791,14 @@ impl File {
         let file_id = file.inner().id;
         let vm = gpu
             .new_vm_for_file(kernel_range.clone(), file_id)?
-            .with_memory_client(file.inner().mem.clone());
+            .with_memory_client(file.inner().mem.clone())
+            .with_job_lifetime()?;
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
         let failed_vm = ScopeGuard::new_with_data(
             (vm.clone(), user_range.clone(), kernel_range.clone()),
             |(vm, user_range, kernel_range)| {
-                if gpu.tracked_submission() && vm.status().is_some() && !vm.is_closed() {
+                if !vm.is_closed() {
                     vm.close_idle_reclaim();
                     if let Err(error) = vm.unmap_user_ranges(user_range, kernel_range) {
                         pr_err!("VM create: closing unpublished VM failed: {:?}\n", error);
@@ -867,6 +864,7 @@ impl File {
             mmu::PROT_GPU_SHARED_RW,
             true,
         )?;
+        vm.retain_mapping(dummy_mapping)?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM created\n", file_id, id);
         resv.fill(KBox::new(
@@ -881,7 +879,6 @@ impl File {
                 vm,
                 user_range,
                 kernel_range,
-                _dummy_mapping: dummy_mapping,
                 gpu: gpu.clone(),
             },
             GFP_KERNEL,
