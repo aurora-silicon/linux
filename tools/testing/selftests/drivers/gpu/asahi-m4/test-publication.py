@@ -53,6 +53,15 @@ assert (
 ), 'render_bar must be hoisted ahead of barrier emission'
 assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
 assert 'p.prev_barrier.write(0, &prev)?;' in prefix_render_fn
+# The TA->TA barrier is posted exactly when the plan asks for it and the TA ring's order
+# does not already imply it, decided after every InitBM producer is known.
+assert 'if plan.ta_prev_wait && !ta_ordered {' in prefix_render_fn
+assert (
+    prefix_render_fn.index('let producer_initbm = pf.initbm')
+    < prefix_render_fn.index('let ta_ordered = ta_ring_orders_prev(cross_vm_prev, producer_initbm);')
+    < prefix_render_fn.index('if plan.ta_prev_wait && !ta_ordered {')
+    < prefix_render_fn.index('p.prev_barrier.write(0, &prev)?;')
+), 'prev_barrier must follow the ring-order decision'
 # The VM mark waits for visibility: an unpublished prefix never marks its VM.
 assert 'note_msaa_render' not in prefix_render_fn
 assert 'f.msaa |= cmd.is_multisampled();' in prefix_render_fn
@@ -921,6 +930,7 @@ mod queue_behind_scope {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
+    __TA_RING_ORDERS_PREV__
     __SCS_COMPUTE_CONFLICT__
     __MSAA_RENDER_CONFLICT__
     impl QueueBehindHost {
@@ -1919,6 +1929,15 @@ mod queue_behind_scope {
                 fs_compute_wait: NO_C1,
             }
         );
+    }
+    #[test]fn ta_ring_order_replaces_only_the_same_vm_ta_barrier(){
+        // A same-VM predecessor with no InitBM on either side: the plan's TA->TA wait is
+        // left to the TA ring's order (case 2 above still plans it).
+        assert!(ta_ring_orders_prev(false, false));
+        // Another VM's predecessor, or an InitBM producer or consumer, keeps prev_barrier.
+        assert!(!ta_ring_orders_prev(true, false));
+        assert!(!ta_ring_orders_prev(false, true));
+        assert!(!ta_ring_orders_prev(true, true));
     }
     #[test]fn two_pipe_concurrent_compute_dispatch_and_fw_timestamp_safety(){
         let vm1=Arc::new(Vm{id:1,status:Status(AtomicU32::new(0)),slot:1,msaa:AtomicBool::new(false)});
@@ -3385,6 +3404,7 @@ for token, declaration in {
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
+    '__TA_RING_ORDERS_PREV__': 'fn ta_ring_orders_prev(',
 }.items():
     harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::vm::VmState", "crate::Vm").replace("super::fence::", "crate::fence::"))
 unit = output / 'publication.rs'
@@ -3399,7 +3419,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 70, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 71, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')
