@@ -62,3 +62,16 @@
  */
 #include "t6050-k114-k116-usb.dtsi"
 #include "t6050-k114-usb.dtsi"
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+/* Keep J716c's unqualified sleep description disabled. */
+#include "t6050-j716c-sleep.dtsi"
+
+&hpm5 {
+	status = "okay";
+};

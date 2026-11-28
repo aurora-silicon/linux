@@ -3980,7 +3980,6 @@ static const struct apple_sleep_soc t6050_sleep_soc = {
 	.smc_policy = &t6050_smc_policy,
 	.early_context = true,
 	.own_wake = true,
-	.machine = "apple,j714s",
 	/* The interrupt mask every SPMI bus has through the sleep, as on T8140 and T8132 */
 	.spmi_notify_sleep = 0x2000001,
 	.boot_mpidr = 0x040000,
@@ -4113,7 +4112,6 @@ static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
 	.pmp_unstarted = true,
 	.clusters_down_first = true,
 	.lower_venc0 = true,
-	.machine = "apple,j716c",
 	.spmi_notify_sleep = 0x2000001,
 	.boot_mpidr = 0x040000,
 	.cpu_count = 18,
