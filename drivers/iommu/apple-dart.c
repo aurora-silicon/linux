@@ -3858,11 +3858,83 @@ static int apple_dart_domain_add_streams(struct apple_dart_domain *domain,
 				      true);
 }
 
+/*
+ * Undo a paging attach that failed after it programmed the first @reached of
+ * the device's stream maps (the failing one included) with @domain's tables.
+ * The IOMMU core keeps a device whose attach failed on @old and may free
+ * @domain at once, so none of these streams may go on translating through
+ * it. Each goes back to @old where that is the identity domain or a paging
+ * domain of this driver, and is blocked otherwise (a first attach has no
+ * @old) or when putting @old back fails. A managed DART is quarantined. A
+ * locked DART keeps the firmware's roots; apple_dart_domain_free() unmaps
+ * them before it frees @domain's tables.
+ */
+static void apple_dart_attach_paging_undo(struct iommu_domain *domain,
+					  struct apple_dart_master_cfg *cfg,
+					  int reached, struct iommu_domain *old)
+{
+	struct apple_dart_domain *old_paging = NULL;
+	struct apple_dart_stream_map *stream_map;
+	int i;
+
+	if (old && old != domain && old->ops == domain->ops) {
+		old_paging = to_dart_domain(old);
+		if (!old_paging->finalized || !old_paging->pgtbl_ops || old_paging->dcp)
+			old_paging = NULL;
+	}
+
+	for_each_stream_map(i, cfg, stream_map) {
+		struct apple_dart *dart = stream_map->dart;
+
+		if (i >= reached)
+			break;
+		if (dart->managed_sids) {
+			apple_dart_managed_quarantine(dart);
+			continue;
+		}
+		if (dart->locked)
+			continue;
+		if (old && old->type == IOMMU_DOMAIN_IDENTITY && dart->supports_bypass &&
+		    !dart->retained_mtp) {
+			apple_dart_hw_enable_bypass(stream_map);
+			continue;
+		}
+		if (old_paging && !apple_dart_setup_translation(old_paging, stream_map))
+			continue;
+		apple_dart_hw_disable_dma(stream_map);
+	}
+}
+
+/*
+ * Take a failed attach's streams back out of @domain's stream maps, on every
+ * DART, so that @domain's invalidations and apple_dart_domain_free() no
+ * longer count them. A locked stream the attach reached stays: its firmware
+ * root may name @domain's tables, and apple_dart_domain_free() must unmap it
+ * before it frees them.
+ */
+static void apple_dart_attach_paging_drop_streams(struct apple_dart_domain *domain,
+						  struct apple_dart_master_cfg *cfg,
+						  int reached)
+{
+	struct apple_dart_stream_map *stream_map;
+	int i, j;
+
+	for_each_stream_map(i, cfg, stream_map) {
+		struct apple_dart *dart = stream_map->dart;
+
+		if (dart->locked && !dart->managed_sids && i < reached)
+			continue;
+		for (j = 0; j < BITS_TO_LONGS(dart->num_streams); j++)
+			atomic_long_and(~stream_map->sidmap[j],
+					&domain->stream_maps[i].sidmap[j]);
+	}
+}
+
 static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 					struct device *dev,
 					struct iommu_domain *old)
 {
-	int ret, i;
+	int ret, i, reached = 0;
 	struct apple_dart_stream_map *stream_map;
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
@@ -3889,6 +3961,8 @@ static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 	streams_added = true;
 
 	for_each_stream_map(i, cfg, stream_map) {
+		/* From here this stream map may name @domain's tables. */
+		reached = i + 1;
 		if (stream_map->dart->managed_sids) {
 			struct apple_dart *dart = stream_map->dart;
 			unsigned long flags;
@@ -3915,8 +3989,11 @@ static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 	}
 
 err:
-	if (ret && streams_added && cfg->stream_maps[0].dart->managed_sids)
-		apple_dart_mod_streams(dart_domain->stream_maps, cfg->stream_maps, false);
+	if (ret) {
+		apple_dart_attach_paging_undo(domain, cfg, reached, old);
+		if (streams_added)
+			apple_dart_attach_paging_drop_streams(dart_domain, cfg, reached);
+	}
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
 	return ret;

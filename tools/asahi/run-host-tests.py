@@ -142,6 +142,10 @@ ASAHI_TESTS = {
                                    'no-t6050-wake-restore'), out()),
     'apple-m4-pmu-tests.py': [([], PASS)]
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
+    # 255761f1d55f leaves streams on a domain whose paging attach failed part way.
+    'apple-dart-attach-undo-tests.py': [([], PASS),
+                                        (['--ref', '255761f1d55f8dcf3e2c24d17095439237ad6f72'],
+                                         KILL)],
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
