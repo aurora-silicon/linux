@@ -763,6 +763,32 @@ impl Queue {
             Backing::Render(ring) => ring.storage.high.gpu_va(),
         }
     }
+    /// The dependency words of the entry `timestamp` selects as the ring now holds them, for a
+    /// timeout report: the dependency control word, the dependencies and their two-bit types.
+    /// Host reads of shared memory only; a torn read is possible and nothing acts on it.
+    pub(crate) fn report_dependencies(
+        &self,
+        timestamp: KickTimestamp,
+    ) -> Result<(u64, [u64; KICK_DEPENDENCIES], u64)> {
+        let object = match &self.backing {
+            Backing::Compute { low, .. } => low,
+            Backing::Render(ring) => &ring.storage.high,
+        };
+        let entry = object
+            .pointer(timestamp.entry_offset(), size_of::<KickEntry>())?
+            .cast::<KickEntry>();
+        fence(Ordering::Acquire);
+        // SAFETY: `pointer` checked that the whole entry lies inside the live ring mapping; the
+        // unaligned reads copy plain words and create no reference to the shared memory.
+        Ok(unsafe {
+            (
+                core::ptr::addr_of!((*entry).dependency_control).read_unaligned(),
+                core::ptr::addr_of!((*entry).dependencies).read_unaligned(),
+                core::ptr::addr_of!((*entry).dependency_types).read_unaligned(),
+            )
+        })
+    }
+
     fn object(&mut self) -> &mut KernelObject {
         match &mut self.backing {
             Backing::Compute { low, .. } => low,
