@@ -2331,9 +2331,9 @@ pub mod g16 {
         assert_eq!(cmd_shared(), Class::Shared);
         let mut o = Objects::new();
         let mut rings = Objects::persistent();
-        let ctx = o.alloc(g16::object::Request {
-            size: 0x40,
-            class: Class::Fw,
+        let ctx = rings.alloc(g16::object::Request {
+            size: g16::fw::graph::sched_ctx::SIZE,
+            class: Class::FwCoherent,
             placement: g16::object::Placement::Anywhere,
             offset: 0,
             client: None,
@@ -2356,7 +2356,7 @@ pub mod g16 {
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
         assert_eq!(c.job_list.class, Class::FwCached);
-        assert_eq!(c.sched_ctx.class, Class::Fw);
+        assert_eq!(c.sched_ctx.class, Class::FwCoherent);
         assert_eq!(c.qstate.class, Class::Fw);
         assert_eq!(c.notifier.class, Class::FwCached);
         assert_eq!(c.threshold.class, Class::Fw);
@@ -2372,7 +2372,7 @@ pub mod g16 {
             assert_eq!(r.user_stamp[stage].class, Class::Shared);
             assert_eq!(r.fw_stamp[stage].class, Class::Shared);
         }
-        assert_eq!(r.sched_ctx.class, Class::Fw);
+        assert_eq!(r.sched_ctx.class, Class::FwCoherent);
         assert_eq!(r.notifier.class, Class::Fw);
         assert_eq!(r.threshold.class, Class::Fw);
         assert_eq!(r.legacy_empty.class, Class::Shared);
@@ -3523,7 +3523,10 @@ assert 's.seq.write(0, q)?;' in prefix_compute_fn, 'prefix_compute must write en
 assert '&w[work::compute::BODY_ACTIVE_START..work::compute::SEQ_EMBEDDED]' in prefix_compute_fn, 'clean compute reuse must skip embedded sequence copy into WC work'
 graphs_finish_fn = item(graph_source, 'pub(crate) fn finish(')
 assert 'core::mem::ManuallyDrop::new(factory.persistent_objects_probe())' in graphs_finish_fn, 'Graphs::finish must keep probe-time FwCoherent ring allocator in ManuallyDrop'
+assert 'Class::FwCoherent' in graphs_finish_fn and 'sched_ctx::SIZE' in graphs_finish_fn, 'Graphs::finish must allocate shared sched_ctx as FwCoherent'
 assert 'ring_objects.finish_private()?;' in graphs_finish_fn, 'Graphs::finish must publish persistent ring mappings'
+register_ctx_fn = item(engine_source, 'pub(crate) fn register_context(')
+assert register_ctx_fn.count('sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;') == 2, 'register_context must sync FwCoherent sched_ctx before pre-post check and in poll loop'
 alloc_private_in_fn = item(object_source, 'fn alloc_private_in(')
 assert 'pub(crate) fn persistent_objects_probe(&self) -> Objects' in object_source, 'Factory must expose persistent_objects_probe for probe-time work rings'
 assert 'if self.probe {' in alloc_private_in_fn and 'self.dev.registration_guard().ok_or(ENODEV)?' in alloc_private_in_fn, 'alloc_private_in must gate as_bound() on self.probe and keep registration_guard() otherwise'

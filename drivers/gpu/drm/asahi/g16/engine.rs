@@ -22,7 +22,7 @@ use super::channel::Channel;
 use super::command::{Command, ComputeCommand, RenderCommand};
 use super::encode::{self, ComputeRefs, ComputeRt, Geometry, RenderRefs, StageRt};
 use super::fw::channels::{SubmitRecord, RING_SLOTS};
-use super::fw::graph::{notifier_page, qstate};
+use super::fw::graph::{notifier_page, qstate, sched_ctx};
 use super::fw::work::{self, BarrierType};
 use super::hw::{engine as engine_ids, sizes};
 use super::job::{Completions, Job};
@@ -835,6 +835,7 @@ impl Firmware {
         bytes[12..20].copy_from_slice(&zero.to_le_bytes());
         bytes[0x20..0x24].copy_from_slice(&0x80u32.to_le_bytes());
         barrier.write(0, &bytes)?;
+        r.sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;
         if r.qstate[0].r32(qstate::READ)? != 0
             || r.qstate[0].r32(qstate::WRITE)? != 0
             || r.sched_ctx.r32(0)? & 0xffffff != 0x00ffff
@@ -867,6 +868,7 @@ impl Firmware {
             if now >= deadline {
                 return Err(ETIMEDOUT);
             }
+            self.graph.render.sched_ctx.sync_for_cpu(0, sched_ctx::SIZE)?;
             let context = self.graph.render.sched_ctx.r32(0)?;
             let registered = context & 0xff != 0xff
                 && (context >> 8) & 0xff != 0xff
