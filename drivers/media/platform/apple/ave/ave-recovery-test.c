@@ -116,4 +116,5 @@ static struct kunit_suite ave_recovery_suite = {
 
 kunit_test_suite(ave_recovery_suite);
 
+MODULE_DESCRIPTION("Apple AVE firmware recovery window tests");
 MODULE_LICENSE("GPL");

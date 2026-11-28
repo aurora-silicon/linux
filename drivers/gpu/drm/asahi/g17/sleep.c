@@ -46,14 +46,13 @@
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 
-/* Only the M5 boards with a deep sleep need a wrapped provider translation here: the J714s
- * and the J716c. Other G17 clients retain their established direct-domain methods below.
+/* Only the M5 boards with a deep sleep need a wrapped provider translation here: those whose
+ * device tree describes it. Other G17 clients retain their established direct-domain methods
+ * below.
  */
 static bool asahi_g17_m5_provider(struct device *dev)
 {
-	return (of_machine_is_compatible("apple,j714s") ||
-		of_machine_is_compatible("apple,j716c")) &&
-	       of_machine_is_compatible("apple,t6050") &&
+	return apple_t6050_sleep_described() &&
 	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
 }
 
@@ -194,6 +193,24 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
+/*
+ * The node of the GPU's power state word. Where the GPU's first power domain is its PMP
+ * report entry (a small index for a reg, under the PMP), as in the J616C device tree the
+ * bring-up runs, the word is that entry's own domain.
+ */
+static struct device_node *asahi_g17_ps_node(struct device *dev)
+{
+	struct device_node *np, *next;
+
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry")) {
+		next = of_parse_phandle(np, "power-domains", 0);
+		of_node_put(np);
+		np = next;
+	}
+	return np;
+}
+
 static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 {
 	struct device_node *np;
@@ -213,7 +230,7 @@ static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 		of_node_put(np);
 		return ret;
 	}
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	np = asahi_g17_ps_node(dev);
 	if (!np)
 		return -EINVAL;
 	ret = of_property_read_u32(np, "reg", offset);
@@ -370,7 +387,7 @@ struct asahi_g17_commit {
 /*
  * Whether the commit's stop raises the GPU's domain before it touches the coprocessor: on the
  * SoCs the raise was made for, the T8142 (J815: the GPU gates itself between frames and its
- * registers may not answer below full power) and the T6050. Elsewhere the stop goes straight
+ * registers may not answer below full power). Elsewhere the stop goes straight
  * to the idle poll, as before the raise. On the T8140 (J700) the domain reads its target on
  * and nothing powered under automatic power at the commit (0x1000230f); a raise from there
  * times out with BUSY latched, the PMP's AP IDLE then goes unanswered, the sleep takes the
@@ -378,8 +395,7 @@ struct asahi_g17_commit {
  */
 static bool asahi_g17_commit_raises(struct device *dev)
 {
-	return of_device_is_compatible(dev->of_node, "apple,agx-t8142") ||
-	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
+	return of_device_is_compatible(dev->of_node, "apple,agx-t8142");
 }
 
 /*
@@ -624,7 +640,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 		of_node_put(parent);
 		of_node_put(np);
 	} else {
-		np = of_parse_phandle(dev->of_node, "power-domains", 0);
+		np = asahi_g17_ps_node(dev);
 		if (!np)
 			goto err;
 		if (!of_property_read_u32(np, "reg", &offset) && np->parent)

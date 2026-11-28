@@ -127,6 +127,9 @@ config APPLE_SIO_KUNIT_TEST
 	  generic SIO of the M1 and M2, and a T6030 SIO only with validated
 	  protocol-10 boot tables. The compatible selects the firmware layout.
 	  Also check protocol-9 table order, DMA array counts and ACK failures.
+	  And check that a firmware ACK, NACK or report naming a tag that
+	  is not outstanding, or a channel the device does not have, is
+	  dropped.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS

@@ -220,9 +220,11 @@ static void isp_test_sensor_sysfs(struct kunit *test)
 {
 	struct device *dev = kunit_device_register(test, "apple-isp-sensor-test");
 	struct apple_isp *isp;
-	char buf[32];
+	/* sysfs_emit() wants the page-aligned buffer sysfs hands to show(). */
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
 	KUNIT_EXPECT_EQ(test, sensor_show(dev, &dev_attr_sensor, buf), -ENODATA);
 
 	isp = kunit_kzalloc(test, sizeof(*isp), GFP_KERNEL);

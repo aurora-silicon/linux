@@ -19,28 +19,36 @@
 //! `pw0 ` (which also brings up the audio fabric), prepare requests `pwrd`
 //! (the firmware then runs the serializer and its clocks) and shutdown goes
 //! back to `pw0 `. On T8152 and T8142 the serializer (MCA) leaves are the
-//! AP's to power; on T6050 the firmware powers them itself. The
-//! front-end PCMs are plain dmaengine PCMs on the base-ns channels; macaudio
-//! links them to the codecs.
+//! AP's to power; on T6050 the firmware powers them itself. The front-end PCMs
+//! are plain dmaengine PCMs on the base-ns channels except for speaker V/I
+//! sense on multi-amp streams, which is served from a driver-owned cyclic ring
+//! (`SenseRing`) armed on the stopped serializer before every `pwrd` so sense
+//! capture starts and restarts stay frame-aligned. Macaudio links them to the
+//! codecs.
 //!
 //! Copyright (C) The Asahi Linux Contributors
 //! Copyright (C) 2026 The Aurora Silicon Contributors
 
-use core::{mem, ptr, slice};
+use core::{
+    ffi::c_void,
+    mem, ptr, slice,
+    sync::atomic::{
+        fence, AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
+    },
+};
 
 use kernel::{
-    bindings, c_str,
-    device,
+    bindings, c_str, device,
     device::Core,
     error::from_err_ptr,
-    module_platform_driver, of, platform,
+    module_platform_driver, new_mutex, of, platform,
     prelude::*,
     soc::apple::aop::{from_fourcc, EPICService, AOP},
     str::CString,
     sync::{
         aref::ARef,
         atomic::{Atomic, AtomicFlag, Relaxed},
-        Arc, ArcBorrow,
+        Arc, ArcBorrow, Mutex,
     },
     types::{ForeignOwnable, Opaque},
     workqueue::{self, impl_has_work, new_work, Work, WorkItem},
@@ -227,6 +235,569 @@ impl Service {
     }
 }
 
+/// Serialized power state of the speaker back-end (`spkr`).
+struct SpkrState {
+    open: bool,
+    running: bool,
+    /// True only after `pw0 ` has been verified and before any `pwrd`
+    /// transition attempt. `SenseRing` may only be armed while
+    /// `!running && pw0_verified`.
+    pw0_verified: bool,
+    resume_run: bool,
+}
+
+impl SpkrState {
+    const fn new() -> Self {
+        Self {
+            open: false,
+            running: false,
+            pw0_verified: false,
+            resume_run: false,
+        }
+    }
+
+    fn ensure_pw0(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        set_pw0: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || (self.open && !self.pw0_verified) {
+            self.pw0_verified = false;
+            set_pw0()?;
+            self.running = false;
+            self.pw0_verified = true;
+            spkr_running.store(false, Relaxed);
+        }
+        Ok(())
+    }
+
+    fn start_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || !self.pw0_verified {
+            return Err(EIO);
+        }
+        ring_stop();
+        ring_start()?;
+        self.pw0_verified = false;
+        if let Err(e) = set_pwrd() {
+            ring_stop();
+            return Err(e);
+        }
+        self.running = true;
+        spkr_running.store(true, Relaxed);
+        Ok(())
+    }
+
+    fn stop(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        has_ring: bool,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl FnOnce(),
+    ) -> Result<()> {
+        self.ensure_pw0(spkr_running, set_pw0)?;
+        if has_ring {
+            ring_stop();
+        }
+        Ok(())
+    }
+
+    fn prepare_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        quiesce: impl FnOnce() -> Result<()>,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || !self.pw0_verified {
+            quiesce()?;
+            self.pw0_verified = false;
+            set_pw0()?;
+            self.running = false;
+            self.pw0_verified = true;
+            spkr_running.store(false, Relaxed);
+        }
+        self.start_with_ring(spkr_running, ring_stop, ring_start, set_pwrd)
+    }
+
+    fn suspend(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        has_ring: bool,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl FnOnce(),
+    ) -> Result<()> {
+        let was_running = self.running;
+        let res = self.ensure_pw0(spkr_running, set_pw0);
+        if has_ring {
+            ring_stop();
+        }
+        self.resume_run = was_running;
+        res
+    }
+
+    fn resume_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if !mem::take(&mut self.resume_run) || !self.open {
+            return Ok(());
+        }
+        self.ensure_pw0(spkr_running, set_pw0)?;
+        self.start_with_ring(spkr_running, ring_stop, ring_start, set_pwrd)
+    }
+}
+
+const SENSE_RATE: u64 = 48000;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+/// 2.5 ms periods (120 frames at 48 kHz), 32 of them: an 80 ms ring, delivered
+/// in whole-frame chunks small enough that a 512-frame front-end period
+/// completes well within its headroom. Both 8-channel (16 B/frame -> 1920 B)
+/// and 12-channel (24 B/frame -> 2880 B) periods stay aligned to whole frames
+/// and to the ADMAC's 48-byte RX FIFO threshold.
+const SENSE_RING_PERIOD_FRAMES: usize = 120;
+const SENSE_RING_PERIODS: usize = 32;
+const SENSE_RING_FRAMES: usize = SENSE_RING_PERIOD_FRAMES * SENSE_RING_PERIODS;
+const SENSE_RING_NS: u64 = SENSE_RING_FRAMES as u64 * NSEC_PER_SEC / SENSE_RATE;
+const SENSE_RING_PERIOD_NS: u64 = SENSE_RING_PERIOD_FRAMES as u64 * NSEC_PER_SEC / SENSE_RATE;
+/// SNDRV_PCM_STATE_RUNNING and _XRUN (cast macros the bindings do not carry).
+const PCM_STATE_RUNNING: bindings::snd_pcm_state_t = 3;
+const PCM_STATE_XRUN: bindings::snd_pcm_state_t = 4;
+
+/// The ring may have gone round once or more in `elapsed_ns` since the last
+/// callback: its position alone cannot tell a lap from no advance, or two laps
+/// from one. The DMA runs at the sense rate and its reported position lags it
+/// by less than a ring period, so a lap needs at least the ring's time less a
+/// period.
+fn sense_ring_may_lap(elapsed_ns: i64) -> bool {
+    elapsed_ns < 0 || elapsed_ns as u64 + SENSE_RING_PERIOD_NS >= SENSE_RING_NS
+}
+
+/// Returns whether `incoming` frames fit strictly inside the capture front-end
+/// ring buffer of `buffer_frames` without overwriting unread frames
+/// (`unread_alsa`) or frames already copied since the last pointer sync
+/// (`pending`), and without advancing the modulo pointer back to the same
+/// position (an exact full-buffer advance is ambiguous to ALSA's pointer check).
+fn sense_ring_has_fe_space(
+    buffer_frames: usize,
+    unread_alsa: usize,
+    pending: usize,
+    incoming: usize,
+) -> bool {
+    unread_alsa
+        .checked_add(pending)
+        .and_then(|used| used.checked_add(incoming))
+        .is_some_and(|total| total < buffer_frames)
+}
+
+/// The driver-owned speaker sense capture (base-ns ADMAC RX): a cyclic ring
+/// armed on the stopped serializer before every `pwrd`, so ring offset 0 is
+/// slot 0 of a frame and every whole-frame offset is a frame start. The sense
+/// front-end copies whole frames out of this ring instead of starting or
+/// stopping the ADMAC channel while the serializer runs, which otherwise slips
+/// the V/I sense slots modulo the channel count.
+///
+/// The ring fields change only with the channel stopped and synchronized (no
+/// callback runs); `start` publishes them before the channel starts.
+struct SenseRing {
+    frame_bytes: usize,
+    chan: AtomicPtr<bindings::dma_chan>,
+    cpu: AtomicPtr<u8>,
+    handle: AtomicU64,
+    cookie: AtomicI32,
+    /// Ring offset (a whole frame) up to which the callback has consumed the data.
+    done: AtomicUsize,
+    /// When `done` was last moved (or the ring started), CLOCK_MONOTONIC ns.
+    done_at: AtomicI64,
+    /// True while a cyclic transfer is active; cleared before terminating the
+    /// channel so `sense_ring_done` never consumes a terminated channel's
+    /// zero-residue status.
+    active: AtomicBool,
+    /// The attached sense front-end, or null; cleared under that front-end's
+    /// stream lock, which the callback holds while it uses the front-end.
+    sub: AtomicPtr<bindings::snd_pcm_substream>,
+    /// Frames delivered to the front-end since its start; changed under its
+    /// stream lock.
+    fe_pos: AtomicUsize,
+    /// The front-end runs (its trigger sets this under the stream lock).
+    fe_running: AtomicBool,
+}
+
+impl SenseRing {
+    fn new(frame_bytes: usize) -> Self {
+        Self {
+            frame_bytes,
+            chan: AtomicPtr::new(ptr::null_mut()),
+            cpu: AtomicPtr::new(ptr::null_mut()),
+            handle: AtomicU64::new(0),
+            cookie: AtomicI32::new(0),
+            done: AtomicUsize::new(0),
+            done_at: AtomicI64::new(0),
+            active: AtomicBool::new(false),
+            sub: AtomicPtr::new(ptr::null_mut()),
+            fe_pos: AtomicUsize::new(0),
+            fe_running: AtomicBool::new(false),
+        }
+    }
+
+    fn period_bytes(&self) -> usize {
+        SENSE_RING_PERIOD_FRAMES * self.frame_bytes
+    }
+
+    fn ring_bytes(&self) -> usize {
+        SENSE_RING_FRAMES * self.frame_bytes
+    }
+
+    /// Requests the channel and the ring (once per speaker session) and starts
+    /// the cyclic transfer. The caller holds `spkr_state` with the fabric
+    /// powered and the serializer stopped (`pw0 `).
+    fn start(&self, dev: &device::Device) -> Result<()> {
+        let ring_bytes = self.ring_bytes();
+        let period_bytes = self.period_bytes();
+        let mut chan = self.chan.load(Ordering::Acquire);
+        if chan.is_null() {
+            // SAFETY: the device is live and the name is NUL-terminated.
+            chan = from_err_ptr(unsafe {
+                bindings::dma_request_chan(dev.as_raw(), c"sense".as_char_ptr())
+            })?;
+            let mut handle: bindings::dma_addr_t = 0;
+            // SAFETY: the channel's device is the ADMAC; it outlives the ring,
+            // which `release` frees before releasing the channel.
+            let cpu = unsafe {
+                bindings::dma_alloc_attrs(
+                    (*(*chan).device).dev,
+                    ring_bytes,
+                    &mut handle,
+                    bindings::GFP_KERNEL,
+                    0,
+                )
+            };
+            if cpu.is_null() {
+                // SAFETY: requested above, unused.
+                unsafe { bindings::dma_release_channel(chan) };
+                return Err(ENOMEM);
+            }
+            self.cpu.store(cpu.cast(), Ordering::Release);
+            self.handle.store(handle as u64, Ordering::Release);
+            self.chan.store(chan, Ordering::Release);
+        }
+        let handle = self.handle.load(Ordering::Acquire) as bindings::dma_addr_t;
+        let mut cfg = bindings::dma_slave_config::default();
+        cfg.direction = bindings::dma_transfer_direction_DMA_DEV_TO_MEM;
+        cfg.src_addr_width = bindings::dma_slave_buswidth_DMA_SLAVE_BUSWIDTH_2_BYTES;
+        cfg.src_port_window_size = 4;
+        // SAFETY: `chan` is our live, stopped channel; the descriptor is ours
+        // until submitted.
+        unsafe {
+            let dma = (*chan).device;
+            let ret = match (*dma).device_config {
+                Some(f) => f(chan, &mut cfg),
+                None => ENOSYS.to_errno(),
+            };
+            if ret < 0 {
+                return Err(Error::from_errno(ret));
+            }
+            let prep = (*dma).device_prep_dma_cyclic.ok_or(ENOSYS)?;
+            let desc = prep(
+                chan,
+                handle,
+                ring_bytes,
+                period_bytes,
+                bindings::dma_transfer_direction_DMA_DEV_TO_MEM,
+                bindings::dma_ctrl_flags_DMA_PREP_INTERRUPT as _,
+            );
+            if desc.is_null() {
+                return Err(EIO);
+            }
+            (*desc).callback = Some(sense_ring_done);
+            (*desc).callback_param = ptr::from_ref(self).cast_mut().cast();
+            self.done.store(0, Ordering::Release);
+            // SAFETY: no preconditions.
+            self.done_at.store(bindings::ktime_get(), Ordering::Release);
+            let cookie = ((*desc).tx_submit.ok_or(EIO)?)(desc);
+            if cookie < 0 {
+                return Err(Error::from_errno(cookie));
+            }
+            self.cookie.store(cookie, Ordering::Release);
+            if let Some(f) = (*dma).device_issue_pending {
+                self.active.store(true, Ordering::Release);
+                f(chan);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops the transfer and waits for its callback; a no-op without a channel.
+    fn stop(&self) {
+        self.active.store(false, Ordering::Release);
+        let chan = self.chan.load(Ordering::Acquire);
+        if chan.is_null() {
+            return;
+        }
+        // SAFETY: our live channel; terminate and synchronize are valid on an
+        // idle channel too.
+        unsafe {
+            let dma = (*chan).device;
+            if let Some(f) = (*dma).device_terminate_all {
+                f(chan);
+            }
+            if let Some(f) = (*dma).device_synchronize {
+                f(chan);
+            }
+        }
+    }
+
+    /// Stops, then frees the ring and releases the channel (with the fabric
+    /// still powered).
+    fn release(&self) {
+        self.stop();
+        let chan = self.chan.swap(ptr::null_mut(), Ordering::AcqRel);
+        if chan.is_null() {
+            return;
+        }
+        // SAFETY: the transfer is stopped and synchronized; the ring was
+        // allocated on this channel's device in `start`.
+        unsafe {
+            bindings::dma_free_attrs(
+                (*(*chan).device).dev,
+                self.ring_bytes(),
+                self.cpu.swap(ptr::null_mut(), Ordering::AcqRel).cast(),
+                self.handle.load(Ordering::Acquire) as bindings::dma_addr_t,
+                0,
+            );
+            bindings::dma_release_channel(chan);
+        }
+    }
+
+    fn attach(&self, substream: *mut bindings::snd_pcm_substream) {
+        self.fe_running.store(false, Ordering::Relaxed);
+        self.fe_pos.store(0, Ordering::Relaxed);
+        self.sub.store(substream, Ordering::Release);
+    }
+
+    /// Detaches the front-end under its stream lock: a callback that read the
+    /// pointer before takes the same lock, sees the front-end gone and leaves
+    /// it alone.
+    ///
+    /// # Safety
+    ///
+    /// `substream` must be the attached front-end, in its close.
+    unsafe fn detach(&self, substream: *mut bindings::snd_pcm_substream) {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            let flags = bindings::_snd_pcm_stream_lock_irqsave(substream);
+            self.sub.store(ptr::null_mut(), Ordering::Release);
+            self.fe_running.store(false, Ordering::Relaxed);
+            bindings::snd_pcm_stream_unlock_irqrestore(substream, flags);
+        }
+    }
+
+    /// Copies `bytes` (whole frames) from ring offset `from` into a running
+    /// front-end's buffer.
+    ///
+    /// # Safety
+    ///
+    /// `sub` must be a substream this ring had attached. The substream itself
+    /// belongs to the PCM and outlives the ring's use of it: the ring stops
+    /// and synchronizes with this callback before the card can go away.
+    unsafe fn deliver(
+        &self,
+        sub: *mut bindings::snd_pcm_substream,
+        from: usize,
+        bytes: usize,
+        last_ns: i64,
+    ) {
+        let frame_bytes = self.frame_bytes;
+        let ring_bytes = self.ring_bytes();
+        // SAFETY: by the caller's contract; the stream lock orders this with
+        // the trigger, the pointer callback and `detach`.
+        let flags = unsafe { bindings::_snd_pcm_stream_lock_irqsave(sub) };
+        let rt = if self.sub.load(Ordering::Acquire) == sub {
+            // SAFETY: still attached under the lock; the runtime lives until
+            // after the front-end's close.
+            unsafe { (*sub).runtime }
+        } else {
+            ptr::null_mut()
+        };
+        // SAFETY: an attached front-end's runtime (see above).
+        if !rt.is_null()
+            && self.fe_running.load(Ordering::Relaxed)
+            && unsafe { (*rt).state } == PCM_STATE_RUNNING
+            && unsafe { (*rt).frame_bits } as usize == frame_bytes * 8
+        {
+            // SAFETY: no preconditions.
+            if sense_ring_may_lap(unsafe { bindings::ktime_get() } - last_ns) {
+                // SAFETY: a running front-end, under its stream lock.
+                unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
+            } else {
+                // SAFETY: as above; status and control are valid while running.
+                let (area, frames, period, hw_ptr, appl_ptr, boundary) = unsafe {
+                    (
+                        (*rt).dma_area,
+                        (*rt).buffer_size as usize,
+                        (*rt).period_size as usize,
+                        (*(*rt).status).hw_ptr as usize,
+                        (*(*rt).control).appl_ptr as usize,
+                        (*rt).boundary as usize,
+                    )
+                };
+                let ring = self.cpu.load(Ordering::Acquire);
+                let incoming = bytes / frame_bytes;
+                if !area.is_null() && !ring.is_null() && frames > 0 && incoming > 0 {
+                    let mut pos = self.fe_pos.load(Ordering::Relaxed);
+                    let unread_alsa = if hw_ptr >= appl_ptr {
+                        hw_ptr - appl_ptr
+                    } else if boundary > 0 {
+                        hw_ptr + boundary - appl_ptr
+                    } else {
+                        frames
+                    };
+                    let pending = (pos % frames + frames - hw_ptr % frames) % frames;
+                    if !sense_ring_has_fe_space(frames, unread_alsa, pending, incoming) {
+                        // SAFETY: a running front-end, under its stream lock.
+                        unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
+                    } else {
+                        let first = pos;
+                        let mut src = from;
+                        let mut left = incoming;
+                        while left > 0 {
+                            let off = pos % frames;
+                            let n = left.min(frames - off).min((ring_bytes - src) / frame_bytes);
+                            // SAFETY: `n` frames fit at `off` in the front-end
+                            // buffer and at `src` in the ring; post-copy lap
+                            // validation below rejects the batch if DMA could
+                            // have reached `from` before the copy finished.
+                            unsafe {
+                                ptr::copy_nonoverlapping(
+                                    ring.add(src),
+                                    area.add(off * frame_bytes),
+                                    n * frame_bytes,
+                                )
+                            };
+                            pos += n;
+                            left -= n;
+                            src = (src + n * frame_bytes) % ring_bytes;
+                        }
+                        fence(Ordering::Acquire);
+                        // SAFETY: no preconditions.
+                        if sense_ring_may_lap(unsafe { bindings::ktime_get() } - last_ns) {
+                            // SAFETY: a running front-end, under its stream lock.
+                            unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
+                        } else {
+                            self.fe_pos.store(pos, Ordering::Relaxed);
+                            if first / period.max(1) != pos / period.max(1) {
+                                // SAFETY: a running, attached front-end, under its stream lock.
+                                unsafe { bindings::snd_pcm_period_elapsed_under_stream_lock(sub) };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { bindings::snd_pcm_stream_unlock_irqrestore(sub, flags) };
+    }
+
+    /// The ring may have lapped since the last callback: stop a running
+    /// front-end with an XRUN rather than delivering frames shifted in time
+    /// against playback.
+    ///
+    /// # Safety
+    ///
+    /// As for [`SenseRing::deliver`].
+    unsafe fn lost(&self, sub: *mut bindings::snd_pcm_substream) {
+        // SAFETY: as in `deliver`.
+        let flags = unsafe { bindings::_snd_pcm_stream_lock_irqsave(sub) };
+        if self.sub.load(Ordering::Acquire) == sub && self.fe_running.load(Ordering::Relaxed) {
+            // SAFETY: an attached front-end, under its stream lock; its
+            // runtime lives until after its close.
+            let rt = unsafe { (*sub).runtime };
+            // SAFETY: as above.
+            if !rt.is_null() && unsafe { (*rt).state } == PCM_STATE_RUNNING {
+                // SAFETY: a running front-end, under its stream lock.
+                unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { bindings::snd_pcm_stream_unlock_irqrestore(sub, flags) };
+    }
+}
+
+/// The ring's period callback (the ADMAC tasklet): hands the whole frames
+/// written since the last call to a running sense front-end, or drops them.
+///
+/// # Safety
+///
+/// `param` is the `SenseRing` that set up the transfer; `stop` synchronizes
+/// with this callback before the ring changes or goes away.
+unsafe extern "C" fn sense_ring_done(param: *mut c_void) {
+    // SAFETY: by the function's contract.
+    let ring = unsafe { &*param.cast::<SenseRing>() };
+    if !ring.active.load(Ordering::Acquire) {
+        return;
+    }
+    let chan = ring.chan.load(Ordering::Acquire);
+    if chan.is_null() {
+        return;
+    }
+    let mut state = bindings::dma_tx_state {
+        last: 0,
+        used: 0,
+        residue: 0,
+        in_flight_bytes: 0,
+    };
+    // SAFETY: our live channel and cookie.
+    let status = unsafe {
+        match (*(*chan).device).device_tx_status {
+            Some(f) => f(chan, ring.cookie.load(Ordering::Acquire), &mut state),
+            None => return,
+        }
+    };
+    if !ring.active.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let now_ns = unsafe { bindings::ktime_get() };
+    let ring_bytes = ring.ring_bytes();
+    let frame_bytes = ring.frame_bytes;
+    let residue = state.residue as usize;
+    if status == bindings::dma_status_DMA_ERROR || residue > ring_bytes {
+        return;
+    }
+    // The device wrote everything up to here before it reported the residue.
+    fence(Ordering::SeqCst);
+    let now = (ring_bytes - residue) % ring_bytes / frame_bytes * frame_bytes;
+    let from = ring.done.swap(now, Ordering::AcqRel);
+    let last_ns = ring.done_at.swap(now_ns, Ordering::AcqRel);
+    let sub = ring.sub.load(Ordering::Acquire);
+    if sense_ring_may_lap(now_ns - last_ns) {
+        if !sub.is_null() {
+            // SAFETY: a substream the ring had attached (`lost` re-checks under its lock).
+            unsafe { ring.lost(sub) };
+        }
+        return;
+    }
+    let bytes = (now + ring_bytes - from) % ring_bytes;
+    if bytes == 0 {
+        return;
+    }
+    if !sub.is_null() {
+        // SAFETY: a substream the ring had attached (`deliver` re-checks under its lock).
+        unsafe { ring.deliver(sub, from, bytes, last_ns) };
+    }
+}
+
 #[pin_data]
 struct T8152AopAudio {
     dev: ARef<device::Device>,
@@ -235,10 +806,12 @@ struct T8152AopAudio {
     cout: Service,
     cin: Service,
     spkr: Service,
+    #[pin]
+    spkr_state: Mutex<SpkrState>,
+    /// Driver-owned cyclic sense ring when the speaker stream returns V/I sense.
+    sense_ring: Option<SenseRing>,
     mca: KVec<PowerDomain>,
     cfg: &'static HwConfig,
-    /// The open sense capture front-end, if any.
-    sense: Atomic<*mut bindings::snd_pcm_substream>,
     hpai: Service,
     /// The microphone array's leaves (`LEAP_NAMES`); empty without one.
     leap: KVec<PowerDomain>,
@@ -404,18 +977,127 @@ impl T8152AopAudio {
         Ok(())
     }
 
-    /// The sense capture's back-end. Its front-end requests the ADMAC
-    /// channel next, and the ADMAC only answers while the firmware holds
-    /// the audio fabric up, which it does while a service is in `pw0 ` or
-    /// `pwrd`. Opening the sense before any other stream since boot (as
-    /// speakersafetyd does) otherwise faults the bus (SError). Shutdown
-    /// leaves the service in `pw0 `, as the other streams do.
+    /// The sense capture's back-end. Opening the sense before any other stream
+    /// since boot attaches `spkr` and raises `pw0 ` so the audio fabric is up
+    /// without disturbing an already-running speaker stream.
     fn sense_startup(&self) -> Result<()> {
+        let mut st = self.spkr_state.lock();
         self.attach(&self.spkr)?;
-        if !self.spkr.running.load(Relaxed) {
+        if !st.running {
+            st.pw0_verified = false;
             self.set_power(&self.spkr, POWER_STATE_PW0)?;
+            st.pw0_verified = true;
         }
         Ok(())
+    }
+
+    fn spkr_startup(&self) -> Result<()> {
+        let mut st = self.spkr_state.lock();
+        self.attach(&self.spkr)?;
+        st.pw0_verified = false;
+        self.set_power(&self.spkr, POWER_STATE_PW0)?;
+        if let Err(e) = self.mca_up() {
+            let _ = self.set_power(&self.spkr, POWER_STATE_PW0);
+            return Err(e);
+        }
+        st.open = true;
+        st.running = false;
+        st.pw0_verified = true;
+        st.resume_run = false;
+        self.spkr.running.store(false, Relaxed);
+        Ok(())
+    }
+
+    /// Speaker prepare: when a sense ring is in use, every playback prepare
+    /// starts a fresh serializer with the ring armed first so offset 0 is slot
+    /// 0 of a frame. If the serializer was still running or its `pw0 ` state is
+    /// unconfirmed (re-prepare after an underrun, failed stop, or resume),
+    /// `quiesce` mutes the amps before stopping the clock.
+    fn spkr_prepare(&self, quiesce: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut st = self.spkr_state.lock();
+        let Some(ring) = &self.sense_ring else {
+            if !st.running {
+                st.pw0_verified = false;
+                self.set_power(&self.spkr, POWER_STATE_PWRD)?;
+                st.running = true;
+                self.spkr.running.store(true, Relaxed);
+            }
+            return Ok(());
+        };
+        st.prepare_with_ring(
+            &self.spkr.running,
+            quiesce,
+            || self.set_power(&self.spkr, POWER_STATE_PW0),
+            || ring.stop(),
+            || ring.start(&self.dev),
+            || self.set_power(&self.spkr, POWER_STATE_PWRD),
+        )
+    }
+
+    fn spkr_pw0(&self) -> Result<()> {
+        if let Err(e) = self.set_power(&self.spkr, POWER_STATE_PW0) {
+            dev_err!(self.dev, "spkr: pw0 failed: {:?}\n", e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn spkr_stop_locked(&self, st: &mut SpkrState) -> Result<()> {
+        st.stop(
+            &self.spkr.running,
+            self.sense_ring.is_some(),
+            || self.spkr_pw0(),
+            || {
+                if let Some(ring) = &self.sense_ring {
+                    ring.stop();
+                }
+            },
+        )
+    }
+
+    fn spkr_hw_free(&self) -> Result<()> {
+        if self.sense_ring.is_none() {
+            return Ok(());
+        }
+        let mut st = self.spkr_state.lock();
+        self.spkr_stop_locked(&mut st)
+    }
+
+    fn spkr_shutdown(&self) {
+        {
+            let mut st = self.spkr_state.lock();
+            let _ = self.spkr_stop_locked(&mut st);
+            st.open = false;
+            st.resume_run = false;
+            // Release the ring and its ADMAC channel while the fabric is still
+            // powered (`pw0 `) and before the MCA leaves power down.
+            if let Some(ring) = &self.sense_ring {
+                ring.release();
+            }
+        }
+        self.mca_down();
+    }
+
+    fn spkr_suspend(&self) -> Result<()> {
+        let Some(ring) = &self.sense_ring else {
+            return Ok(());
+        };
+        let mut st = self.spkr_state.lock();
+        st.suspend(&self.spkr.running, true, || self.spkr_pw0(), || ring.stop())
+    }
+
+    fn spkr_resume(&self) -> Result<()> {
+        let Some(ring) = &self.sense_ring else {
+            return Ok(());
+        };
+        let mut st = self.spkr_state.lock();
+        st.resume_with_ring(
+            &self.spkr.running,
+            || self.spkr_pw0(),
+            || ring.stop(),
+            || ring.start(&self.dev),
+            || self.set_power(&self.spkr, POWER_STATE_PWRD),
+        )
     }
 
     /// `pwrd`: the firmware starts the serializer clocks and the stream.
@@ -423,47 +1105,9 @@ impl T8152AopAudio {
         if svc.running.load(Relaxed) {
             return Ok(());
         }
-        if ptr::eq(svc, &self.spkr) && self.cfg.realign_sense {
-            self.realign_sense();
-        }
         self.set_power(svc, POWER_STATE_PWRD)?;
         svc.running.store(true, Relaxed);
         Ok(())
-    }
-
-    /// Before the speaker's serializer starts, restart a running sense
-    /// capture at a frame boundary. The sense words are the serializer's RX,
-    /// which the firmware stops anywhere in a frame; a capture that stays
-    /// open across speaker streams (speakersafetyd keeps it) would carry
-    /// the partial frame forward and attribute one amplifier's voltage and
-    /// current to another. Nothing flows while the serializer is stopped,
-    /// so this loses no data; the partial frame reads as zeros.
-    fn realign_sense(&self) {
-        let ss = self.sense.load(Relaxed);
-        if ss.is_null() {
-            return;
-        }
-        // SAFETY: the sense front-end's open and close and this back-end's
-        // prepare all run under the card's DPCM mutex, so `ss` is live; its
-        // stream lock orders this against the front-end's trigger.
-        unsafe {
-            bindings::snd_pcm_stream_lock_irq(ss);
-            let rt = (*ss).runtime;
-            if !rt.is_null() && (*rt).state == SNDRV_PCM_STATE_RUNNING {
-                let chan = bindings::snd_dmaengine_pcm_get_chan(ss);
-                let ops = &*(*chan).device;
-                if let (Some(pause), Some(resume)) = (ops.device_pause, ops.device_resume) {
-                    pause(chan);
-                    let frame = ((*rt).frame_bits / 8) as usize;
-                    let pos = bindings::snd_dmaengine_pcm_pointer(ss) as usize;
-                    if frame != 0 && pos < (*rt).buffer_size as usize && !(*rt).dma_area.is_null() {
-                        ptr::write_bytes((*rt).dma_area.add(pos * frame), 0, frame);
-                    }
-                    resume(chan);
-                }
-            }
-            bindings::snd_pcm_stream_unlock_irq(ss);
-        }
     }
 
     /// The clocks run from prepare on: the codecs see a bit clock as soon
@@ -550,8 +1194,6 @@ const FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
 /// SNDRV_PCM_FMTBIT_S16_LE (1 << SNDRV_PCM_FORMAT_S16_LE), which the
 /// bindings do not export.
 const FMTBIT_S16_LE: u64 = 1 << 2;
-/// SNDRV_PCM_STATE_RUNNING, likewise.
-const SNDRV_PCM_STATE_RUNNING: bindings::snd_pcm_state_t = 3;
 
 /// What differs between the machines: the shape of the firmware's `spkr`
 /// stream (ADT iop-audio-controller/audio-speaker).
@@ -561,9 +1203,9 @@ struct HwConfig {
     /// Words the amplifiers send back on the stream's RX side (V/I sense).
     sense_channels: u32,
     sense_formats: u64,
-    /// The sense capture is the speaker stream's RX: restart it at a frame
-    /// boundary whenever the speaker starts (see `realign_sense`).
-    realign_sense: bool,
+    /// The sense capture is the speaker stream's RX: serve it from a
+    /// driver-owned cyclic ring armed before every `pwrd` (see `SenseRing`).
+    sense_ring: bool,
     /// The AP powers the serializer (MCA) leaves.
     ap_mca: bool,
     /// The AP powers the microphone array's LEAP leaves. Without it the
@@ -577,7 +1219,7 @@ static HW_CFG_T8152: HwConfig = HwConfig {
     spkr_channels: 1,
     sense_channels: 2,
     sense_formats: FORMATS,
-    realign_sense: false,
+    sense_ring: false,
     ap_mca: true,
     ap_leap: true,
 };
@@ -589,19 +1231,19 @@ static HW_CFG_T8142: HwConfig = HwConfig {
     spkr_channels: 4,
     sense_channels: 8,
     sense_formats: FMTBIT_S16_LE,
-    realign_sense: true,
+    sense_ring: true,
     ap_mca: true,
     ap_leap: true,
 };
 
-/// J714s: six amplifiers in 32-bit slots 0-5, their voltage and current
-/// sense back as twelve 16-bit slots on the stream's RX, as on J813. The
-/// MCA and LEAP leaves have no AP power state: the firmware powers them.
+/// J714s / J716c: six amplifiers in 32-bit slots 0-5, their voltage and
+/// current sense back as twelve 16-bit slots on the stream's RX, as on J813.
+/// The MCA and LEAP leaves have no AP power state: the firmware powers them.
 static HW_CFG_T6050: HwConfig = HwConfig {
     spkr_channels: 6,
     sense_channels: 12,
     sense_formats: FMTBIT_S16_LE,
-    realign_sense: true,
+    sense_ring: true,
     ap_mca: false,
     ap_leap: false,
 };
@@ -615,7 +1257,7 @@ static HW_CFG_T8142_6AMP: HwConfig = HwConfig {
     spkr_channels: 6,
     sense_channels: 12,
     sense_formats: FMTBIT_S16_LE,
-    realign_sense: true,
+    sense_ring: true,
     ap_mca: true,
     ap_leap: true,
 };
@@ -749,6 +1391,67 @@ unsafe fn dmaengine_open(
     }
 }
 
+/// The sense ring behind a front-end substream, `None` for every other stream.
+///
+/// # Safety
+///
+/// `component` must be this driver's live registered component and `substream`
+/// a live substream of one of its links.
+unsafe fn sense_ring<'a>(
+    component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> Option<&'a SenseRing> {
+    // SAFETY: by the caller's contract.
+    let (data, rtd) = unsafe { (component_data(component), substream_rtd(substream)) };
+    // SAFETY: as above.
+    if unsafe { rtd_is_be(rtd) || is_playback(substream) } {
+        return None;
+    }
+    // SAFETY: as above.
+    if unsafe { fe_index(rtd) } != Some(2) {
+        return None;
+    }
+    data.sense_ring.as_ref()
+}
+
+/// Hardware description for the VMALLOC sense front-end: require at least one
+/// ring period per ALSA period so even the minimum two-period buffer holds
+/// incoming ring batches without XRUNning on the first callback.
+fn sense_pcm_hw(formats: u64, ring_period_bytes: usize) -> bindings::snd_pcm_hardware {
+    let mut hw = pcm_hw();
+    hw.info |= bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER | bindings::SNDRV_PCM_INFO_BATCH;
+    hw.formats = formats;
+    hw.period_bytes_min = hw.period_bytes_min.max(ring_period_bytes);
+    hw.periods_max = (hw.buffer_bytes_max / hw.period_bytes_min) as u32;
+    hw
+}
+
+/// The sense front-end's buffer: plain memory the ring callback copies whole
+/// frames into.
+fn sense_open(
+    substream: *mut bindings::snd_pcm_substream,
+    formats: u64,
+    ring_period_bytes: usize,
+) -> i32 {
+    // SAFETY: a live substream in its open.
+    unsafe {
+        if (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 {
+            let ret = bindings::snd_pcm_set_managed_buffer(
+                substream,
+                bindings::SNDRV_DMA_TYPE_VMALLOC as i32,
+                ptr::null_mut(),
+                0,
+                0,
+            );
+            if ret < 0 {
+                return ret;
+            }
+        }
+        (*(*substream).runtime).hw = sense_pcm_hw(formats, ring_period_bytes);
+    }
+    0
+}
+
 /// # Safety
 ///
 /// Called by ASoC on this driver's component with live arguments.
@@ -773,6 +1476,16 @@ unsafe extern "C" fn asoc_pcm_open(
     let Some(name) = FE_DMA_NAMES[fe][usize::from(!playback)] else {
         return ENODEV.to_errno();
     };
+    if fe == 2 && !playback {
+        if let Some(ring) = &data.sense_ring {
+            let ret = sense_open(substream, data.cfg.sense_formats, ring.period_bytes());
+            if ret < 0 {
+                return ret;
+            }
+            ring.attach(substream);
+            return 0;
+        }
+    }
     // SAFETY: the device is live and the name is NUL-terminated.
     let chan = match from_err_ptr(unsafe {
         bindings::dma_request_chan(data.dev.as_raw(), name.as_char_ptr())
@@ -789,8 +1502,14 @@ unsafe extern "C" fn asoc_pcm_open(
     if ret < 0 {
         // SAFETY: the open failed, so the channel is still ours.
         unsafe { bindings::dma_release_channel(chan) };
-    } else if fe == 2 && !playback {
-        data.sense.store(substream, Relaxed);
+    } else if fe == 1 && playback && data.sense_ring.is_some() {
+        // The playback slots line up only when prepare starts a fresh
+        // serializer: a paused DMA restarted mid-frame would shift them.
+        // SAFETY: `dmaengine_open` initialized the runtime above.
+        unsafe {
+            (*(*substream).runtime).hw.info &=
+                !(bindings::SNDRV_PCM_INFO_PAUSE | bindings::SNDRV_PCM_INFO_RESUME);
+        }
     }
     ret
 }
@@ -807,9 +1526,10 @@ unsafe extern "C" fn asoc_pcm_close(
         return 0;
     }
     // SAFETY: as above.
-    let data = unsafe { component_data(component) };
-    if data.sense.load(Relaxed) == substream {
-        data.sense.store(ptr::null_mut(), Relaxed);
+    if let Some(ring) = unsafe { sense_ring(component, substream) } {
+        // SAFETY: the attached sense front-end, in its close.
+        unsafe { ring.detach(substream) };
+        return 0;
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
     unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) }
@@ -824,7 +1544,8 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     params: *mut bindings::snd_pcm_hw_params,
 ) -> i32 {
     // SAFETY: by the caller's contract.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    if unsafe { rtd_is_be(substream_rtd(substream)) || sense_ring(component, substream).is_some() }
+    {
         return 0;
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
@@ -849,15 +1570,6 @@ unsafe extern "C" fn asoc_pcm_hw_params(
     } else {
         cfg.src_port_window_size = window;
     }
-    // The sense capture: the frame size its channel restarts aligned to
-    // (apple-admac reads a u32 here; see `realign_sense`).
-    // SAFETY: by the caller's contract.
-    let data = unsafe { component_data(component) };
-    let mut frame_bytes = channels * cfg.src_addr_width as u32;
-    if ptr::eq(substream, data.sense.load(Relaxed)) && data.cfg.realign_sense {
-        cfg.peripheral_config = ptr::from_mut(&mut frame_bytes).cast();
-        cfg.peripheral_size = mem::size_of::<u32>();
-    }
     // SAFETY: `chan` is the live channel behind the substream.
     unsafe {
         match (*(*chan).device).device_config {
@@ -871,12 +1583,33 @@ unsafe extern "C" fn asoc_pcm_hw_params(
 ///
 /// Called by ASoC on this driver's component with live arguments.
 unsafe extern "C" fn asoc_pcm_trigger(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     cmd: i32,
 ) -> i32 {
     // SAFETY: by the caller's contract.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    // The sense attaches to the ring at its next whole frame; ALSA holds the
+    // stream lock, which the ring callback takes too.
+    // SAFETY: as above.
+    if let Some(ring) = unsafe { sense_ring(component, substream) } {
+        match cmd as u32 {
+            bindings::SNDRV_PCM_TRIGGER_START => {
+                ring.fe_pos.store(0, Ordering::Relaxed);
+                ring.fe_running.store(true, Ordering::Relaxed);
+            }
+            bindings::SNDRV_PCM_TRIGGER_RESUME | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+                ring.fe_running.store(true, Ordering::Relaxed);
+            }
+            bindings::SNDRV_PCM_TRIGGER_STOP
+            | bindings::SNDRV_PCM_TRIGGER_SUSPEND
+            | bindings::SNDRV_PCM_TRIGGER_PAUSE_PUSH => {
+                ring.fe_running.store(false, Ordering::Relaxed);
+            }
+            _ => return EINVAL.to_errno(),
+        }
         return 0;
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
@@ -889,11 +1622,12 @@ unsafe extern "C" fn asoc_pcm_trigger(
 ///
 /// Called by ASoC on this driver's component with a live substream.
 unsafe extern "C" fn asoc_pcm_sync_stop(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
     // SAFETY: by the caller's contract.
-    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+    if unsafe { rtd_is_be(substream_rtd(substream)) || sense_ring(component, substream).is_some() }
+    {
         return 0;
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
@@ -904,12 +1638,19 @@ unsafe extern "C" fn asoc_pcm_sync_stop(
 ///
 /// Called by ASoC on this driver's component with live arguments.
 unsafe extern "C" fn asoc_pcm_pointer(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> bindings::snd_pcm_uframes_t {
     // SAFETY: by the caller's contract.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
         return (-i64::from(bindings::ENOTSUPP)) as bindings::snd_pcm_uframes_t;
+    }
+    // SAFETY: as above; ALSA calls this under the stream lock with a live runtime.
+    if let Some(ring) = unsafe { sense_ring(component, substream) } {
+        // SAFETY: as above.
+        let frames = unsafe { (*(*substream).runtime).buffer_size } as usize;
+        return (ring.fe_pos.load(Ordering::Relaxed) % frames.max(1))
+            as bindings::snd_pcm_uframes_t;
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
     unsafe { bindings::snd_dmaengine_pcm_pointer(substream) }
@@ -976,6 +1717,31 @@ unsafe fn be_service<'a>(
     Some((data, svc))
 }
 
+/// Mutes a back-end's codecs (the amps); `__soc_pcm_prepare` unmutes them right
+/// after `be_prepare`.
+///
+/// # Safety
+///
+/// `rtd` must be a live back-end runtime, in its prepare.
+unsafe fn mute_codecs(rtd: *mut bindings::snd_soc_pcm_runtime) -> Result<()> {
+    // SAFETY: by the caller's contract; the codec DAIs follow the CPU DAIs in `dais`.
+    unsafe {
+        let link = (*rtd).dai_link;
+        let cpus = (*link).num_cpus as usize;
+        for i in 0..(*link).num_codecs as usize {
+            let ret = bindings::snd_soc_dai_digital_mute(
+                *(*rtd).dais.add(cpus + i),
+                1,
+                bindings::SNDRV_PCM_STREAM_PLAYBACK as i32,
+            );
+            if ret < 0 {
+                return Err(Error::from_errno(ret));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// # Safety
 ///
 /// Called by ASoC with a live DAI of this component and a live substream.
@@ -995,7 +1761,12 @@ unsafe extern "C" fn be_startup(
         }
         return 0;
     };
-    match data.startup(svc) {
+    let res = if ptr::eq(svc, &data.spkr) {
+        data.spkr_startup()
+    } else {
+        data.startup(svc)
+    };
+    match res {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
@@ -1012,10 +1783,34 @@ unsafe extern "C" fn be_prepare(
     let Some((data, svc)) = (unsafe { be_service(dai, substream) }) else {
         return 0;
     };
-    match data.prepare(svc) {
+    let res = if ptr::eq(svc, &data.spkr) {
+        // SAFETY: the back-end runtime of this substream is live for the call.
+        data.spkr_prepare(|| unsafe { mute_codecs(substream_rtd(substream)) })
+    } else {
+        data.prepare(svc)
+    };
+    match res {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
+}
+
+/// # Safety
+///
+/// Called by ASoC with a live DAI of this component and a live substream.
+unsafe extern "C" fn be_hw_free(
+    substream: *mut bindings::snd_pcm_substream,
+    dai: *mut bindings::snd_soc_dai,
+) -> i32 {
+    // SAFETY: by the caller's contract.
+    if let Some((data, svc)) = unsafe { be_service(dai, substream) } {
+        if ptr::eq(svc, &data.spkr) {
+            if let Err(e) = data.spkr_hw_free() {
+                return e.to_errno();
+            }
+        }
+    }
+    0
 }
 
 /// # Safety
@@ -1027,7 +1822,33 @@ unsafe extern "C" fn be_shutdown(
 ) {
     // SAFETY: by the caller's contract.
     if let Some((data, svc)) = unsafe { be_service(dai, substream) } {
-        data.shutdown(svc);
+        if ptr::eq(svc, &data.spkr) {
+            data.spkr_shutdown();
+        } else {
+            data.shutdown(svc);
+        }
+    }
+}
+
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component.
+unsafe extern "C" fn asoc_suspend(component: *mut bindings::snd_soc_component) -> i32 {
+    // SAFETY: by the caller's contract.
+    match unsafe { component_data(component) }.spkr_suspend() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// # Safety
+///
+/// Called by ASoC on this driver's registered component.
+unsafe extern "C" fn asoc_resume(component: *mut bindings::snd_soc_component) -> i32 {
+    // SAFETY: by the caller's contract.
+    match unsafe { component_data(component) }.spkr_resume() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -1049,6 +1870,7 @@ impl DaiOps {
             be: bindings::snd_soc_dai_ops {
                 startup: Some(be_startup),
                 prepare: Some(be_prepare),
+                hw_free: Some(be_hw_free),
                 shutdown: Some(be_shutdown),
                 ..fe
             },
@@ -1133,6 +1955,8 @@ impl AsocContext {
         let dais = KBox::new(Opaque::new(dai_drivers(&ops, data.cfg)), GFP_KERNEL)?;
         let component = bindings::snd_soc_component_driver {
             name: c"t8152-aop-audio".as_char_ptr(),
+            suspend: Some(asoc_suspend),
+            resume: Some(asoc_resume),
             open: Some(asoc_pcm_open),
             close: Some(asoc_pcm_close),
             hw_params: Some(asoc_pcm_hw_params),
@@ -1530,6 +2354,9 @@ impl platform::Driver for T8152AopAudioDriver {
                 .is_some_and(|node| node.property_match_string(c"dma-names", c"hpai").is_ok())
         };
 
+        let sense_ring = cfg
+            .sense_ring
+            .then(|| SenseRing::new(cfg.sense_channels as usize * 2));
         let data_dev = dev.clone();
         let data = Arc::pin_init(
             pin_init!(T8152AopAudio {
@@ -1539,9 +2366,10 @@ impl platform::Driver for T8152AopAudioDriver {
                 cout: Service::new(from_fourcc(b"cout"), "cout", true),
                 cin: Service::new(from_fourcc(b"cin "), "cin", true),
                 spkr: Service::new(from_fourcc(b"spkr"), "spkr", false),
+                spkr_state <- new_mutex!(SpkrState::new()),
+                sense_ring,
                 mca,
                 cfg,
-                sense: Atomic::new(ptr::null_mut()),
                 hpai: Service::new(from_fourcc(b"hpai"), "hpai", false),
                 leap,
                 hpai_want_run: AtomicFlag::new(false),
@@ -1597,6 +2425,9 @@ impl platform::Driver for T8152AopAudioDriver {
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.unregister();
+        if let Some(ring) = &this.asoc.data.sense_ring {
+            ring.release();
+        }
     }
 }
 
@@ -1605,4 +2436,428 @@ module_platform_driver! {
     name: "snd_soc_t8152_aop_audio",
     description: "Apple T8152 AOP audio: headphone jack, speakers and microphones",
     license: "Dual MIT/GPL",
+}
+
+#[kunit_tests(snd_soc_apple_t8152_aop_audio)]
+mod tests {
+    use super::*;
+
+    const fn frames_ns(frames: u64) -> i64 {
+        (frames * NSEC_PER_SEC / SENSE_RATE) as i64
+    }
+
+    #[test]
+    fn sense_ring_lap_detection() {
+        let ring_frames = SENSE_RING_FRAMES as u64;
+        let period_frames = SENSE_RING_PERIOD_FRAMES as u64;
+
+        assert!(!sense_ring_may_lap(0));
+        assert!(!sense_ring_may_lap(frames_ns(period_frames)));
+        assert!(!sense_ring_may_lap(frames_ns(ring_frames / 2)));
+        assert!(!sense_ring_may_lap(
+            frames_ns(ring_frames - period_frames) - 1
+        ));
+
+        assert!(sense_ring_may_lap(frames_ns(ring_frames - period_frames)));
+        assert!(sense_ring_may_lap(frames_ns(ring_frames)));
+        assert!(sense_ring_may_lap(frames_ns(
+            2 * ring_frames + period_frames
+        )));
+        assert!(sense_ring_may_lap(-1));
+    }
+
+    #[test]
+    fn sense_ring_geometry_covers_8ch_and_12ch() {
+        assert_eq!(SENSE_RING_NS, 80_000_000);
+        assert_eq!(SENSE_RING_PERIOD_NS, 2_500_000);
+
+        // T8142 4-amp (8ch S16_LE = 16 B/frame) and T8142 6-amp / T6050 (12ch S16_LE = 24 B/frame)
+        for ch in [HW_CFG_T8142.sense_channels, HW_CFG_T6050.sense_channels] {
+            let frame = ch as usize * 2;
+            let ring = SenseRing::new(frame);
+            assert_eq!(ring.period_bytes() % frame, 0);
+            assert_eq!(ring.ring_bytes() % ring.period_bytes(), 0);
+            // Whole multiples of the ADMAC RX FIFO threshold (0x18 * 2 = 48 B)
+            assert_eq!(ring.period_bytes() % 48, 0);
+        }
+    }
+
+    #[test]
+    fn sense_ring_fe_space_guards_overrun() {
+        // Every supported multi-amp geometry constrains ALSA negotiation so the
+        // smallest admitted buffer (2 periods of period_bytes_min) exceeds one
+        // 120-frame ring batch and cannot XRUN on an empty capture buffer.
+        for cfg in [&HW_CFG_T8142, &HW_CFG_T8142_6AMP, &HW_CFG_T6050] {
+            let frame = cfg.sense_channels as usize * 2;
+            let ring = SenseRing::new(frame);
+            let hw = sense_pcm_hw(cfg.sense_formats, ring.period_bytes());
+            assert_eq!(hw.period_bytes_min, ring.period_bytes());
+            assert!(hw.period_bytes_min <= hw.period_bytes_max);
+            assert_eq!(hw.periods_min, 2);
+            assert!(hw.periods_min <= hw.periods_max);
+            let min_period_frames = hw.period_bytes_min / frame;
+            let min_buffer_frames = hw.periods_min as usize * min_period_frames;
+            assert_eq!(min_period_frames, SENSE_RING_PERIOD_FRAMES);
+            assert_eq!(min_buffer_frames, 2 * SENSE_RING_PERIOD_FRAMES);
+            assert!(sense_ring_has_fe_space(
+                min_buffer_frames,
+                0,
+                0,
+                SENSE_RING_PERIOD_FRAMES
+            ));
+            assert!(!sense_ring_has_fe_space(
+                min_buffer_frames,
+                SENSE_RING_PERIOD_FRAMES,
+                0,
+                SENSE_RING_PERIOD_FRAMES
+            ));
+        }
+
+        // Exact full-buffer advance (e.g. 120 frames into a 120-frame buffer) wraps the
+        // modulo pointer back to the same offset, so it must trigger XRUN; strictly less fits.
+        assert!(!sense_ring_has_fe_space(120, 0, 0, 120));
+        assert!(sense_ring_has_fe_space(121, 0, 0, 120));
+        assert!(!sense_ring_has_fe_space(121, 1, 0, 120));
+        assert!(!sense_ring_has_fe_space(121, 0, 1, 120));
+        // Coalesced callbacks exceeding remaining space after unread + pending frames trigger XRUN
+        assert!(sense_ring_has_fe_space(1024, 512, 120, 240));
+        assert!(!sense_ring_has_fe_space(1024, 512, 240, 360));
+        // Overflow in unread + pending + incoming fails closed
+        assert!(!sense_ring_has_fe_space(1024, usize::MAX, 0, 1));
+    }
+
+    #[test]
+    fn spkr_state_requires_verified_pw0_before_rearm() {
+        use core::cell::Cell;
+
+        let spkr_running = AtomicFlag::new(false);
+        let ring_starts = Cell::new(0u32);
+        let ring_stops = Cell::new(0u32);
+        let pw0_calls = Cell::new(0u32);
+        let quiesce_calls = Cell::new(0u32);
+
+        let mut st = SpkrState {
+            open: true,
+            running: false,
+            pw0_verified: true,
+            resume_run: false,
+        };
+
+        // Initial prepare arms ring and enters running (`pw0_verified` clears).
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(spkr_running.load(Relaxed));
+        assert_eq!(ring_starts.get(), 1);
+        assert_eq!(pw0_calls.get(), 0);
+
+        // If AOP rejects `pw0 ` on stop (`hw_free` / `suspend`), running stays
+        // true, `pw0_verified` stays false, and DMA is not stopped.
+        let stops_before = ring_stops.get();
+        assert_eq!(
+            st.stop(
+                &spkr_running,
+                true,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(spkr_running.load(Relaxed));
+        assert_eq!(ring_stops.get(), stops_before);
+
+        // Next prepare fails closed if `pw0 ` still fails, without rearming RX.
+        assert_eq!(
+            st.prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(quiesce_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 1);
+        assert!(st.running);
+
+        // Even if `resume_run` were set while `pw0 ` is unverified and `pw0 `
+        // still fails on resume, resume fails closed without arming RX.
+        st.resume_run = true;
+        assert_eq!(
+            st.resume_with_ring(
+                &spkr_running,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(ring_starts.get(), 1);
+
+        // Once `pw0 ` succeeds, prepare verifies it and rearms the ring cleanly.
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 2);
+        assert!(st.running);
+
+        // Suspend with failed `pw0 ` stops RX and records restart intent so
+        // resume must verify `pw0 ` before rearming.
+        let stops_before = ring_stops.get();
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(ring_stops.get(), stops_before + 1);
+        assert!(st.resume_run);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+
+        // Suspend with verified `pw0 ` stops DMA, then resume restarts cleanly
+        // without an extra `pw0 ` call.
+        assert!(st
+            .suspend(
+                &spkr_running,
+                true,
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+            )
+            .is_ok());
+        assert!(!st.running);
+        assert!(st.pw0_verified);
+        assert!(st.resume_run);
+        assert!(st
+            .resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 3);
+        assert!(st.running);
+
+        // An unconfirmed `pwrd` transition clears `pw0_verified` so the next
+        // prepare re-verifies `pw0 ` before arming RX again.
+        assert!(st
+            .stop(
+                &spkr_running,
+                true,
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+            )
+            .is_ok());
+        assert_eq!(
+            st.prepare_with_ring(
+                &spkr_running,
+                || Ok(()),
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Err(EIO),
+            ),
+            Err(EIO)
+        );
+        assert!(!st.running);
+        assert!(!st.pw0_verified);
+        assert_eq!(ring_starts.get(), 4);
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 2);
+        assert_eq!(ring_starts.get(), 5);
+    }
+
+    #[test]
+    fn spkr_state_suspend_pw0_failure_and_resume() {
+        use core::cell::Cell;
+
+        let spkr_running = AtomicFlag::new(true);
+        let ring_stops = Cell::new(0u32);
+        let ring_starts = Cell::new(0u32);
+        let pw0_calls = Cell::new(0u32);
+        let pwrd_calls = Cell::new(0u32);
+
+        let mut st = SpkrState {
+            open: true,
+            running: true,
+            pw0_verified: false,
+            resume_run: false,
+        };
+
+        // Failed `pw0 ` during suspend still stops/synchronizes RX and records
+        // restart intent so resume verifies `pw0 ` before rearming.
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_stops.get(), 1);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(st.resume_run);
+        assert!(spkr_running.load(Relaxed));
+
+        // Resume fails closed without rearming RX if retry `pw0 ` still fails.
+        assert_eq!(
+            st.resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pwrd_calls.set(pwrd_calls.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 2);
+        assert_eq!(ring_starts.get(), 0);
+        assert_eq!(pwrd_calls.get(), 0);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(!st.resume_run);
+        assert!(spkr_running.load(Relaxed));
+
+        // Another suspend with `pw0 ` failing still stops RX and records intent;
+        // when retry `pw0 ` succeeds on resume, RX is cleanly rearmed before `pwrd`.
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 3);
+        assert_eq!(ring_stops.get(), 2);
+        assert!(st.resume_run);
+
+        assert!(st
+            .resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pwrd_calls.set(pwrd_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 4);
+        assert_eq!(ring_stops.get(), 3);
+        assert_eq!(ring_starts.get(), 1);
+        assert_eq!(pwrd_calls.get(), 1);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(!st.resume_run);
+        assert!(spkr_running.load(Relaxed));
+    }
 }

@@ -102,6 +102,12 @@ impl<T: MailCallback> Mailbox<T> {
         to_result(unsafe { bindings::apple_mbox_send(self.mbox, msg, atomic) })
     }
 
+    /// Whether the firmware has room for another message (its receive FIFO isn't full).
+    pub fn send_ready(&self) -> bool {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_send_ready(self.mbox) }
+    }
+
     /// Sets bit 0 of the receive control word, for firmware that powers itself down.
     pub fn set_recv_enabled(&self, enabled: bool) {
         // SAFETY: Calling the c function, `mbox` is a valid pointer

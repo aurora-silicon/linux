@@ -112,11 +112,29 @@ failed() {
 run_dir=${AURORA_SEP_RUN:-/run/aurora-sep}
 repair_checked=
 repair_started=
+# This boot's kernel messages of the SEP device named by the diag directory
+# (journal entries whose kernel fields are that device; dmesg without
+# journald). The driver writes them as "apple_sep <device>: ...".
+sep_device=${diag%/diag}
+sep_device=${sep_device##*/}
+sep_kernel_log() {
+    [ -n "$sep_device" ] || return 0
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -k -b -o cat --no-pager _KERNEL_SUBSYSTEM=platform \
+            "_KERNEL_DEVICE=+platform:$sep_device" 2>/dev/null
+    else
+        dmesg 2>/dev/null | sed 's/^\[[^]]*\] //'
+    fi
+}
 repair_once() {
     [ -z "$repair_checked" ] || return 0
     repair_checked=1
-    line=$({ journalctl -k -b -o cat --no-pager 2>/dev/null || dmesg 2>/dev/null; } |
-        grep -m1 -E 'sensor: ((LOAD_CALIBRATION|SENSOR_ROOT_KEY) refused|calibration refused|calibration blob [^ ]+ could not be loaded|signed root-key container [^ ]+ unavailable)')
+    [ -n "$sep_device" ] || return 0
+    # Only a line that starts with the driver's own prefix for this device:
+    # text that merely contains the words (a USB product string) is not one.
+    device_re=$(printf '%s' "$sep_device" | sed 's/[][\.*^$/]/\\&/g')
+    line=$(sep_kernel_log |
+        grep -m1 -E "^apple_sep $device_re: sensor: ((LOAD_CALIBRATION|SENSOR_ROOT_KEY) refused|calibration refused|calibration blob [^ ]+ could not be loaded|signed root-key container [^ ]+ unavailable)")
     [ -n "$line" ] || return 0
     if [ -e "$run_dir/touchid-auto-rebuild" ]; then
         log "the enclave refused a Touch ID file again ($line); the automatic rebuild already ran this boot, so not again. Run 'sudo aurora-touchid-setup --check' for details"
@@ -140,7 +158,7 @@ blocked_reason() {
     optout="To match anyway, set 'options apple_sep xart_guard=0' in /etc/modprobe.d/ and reboot; the enclave may then rewrite session records another OS on this Mac (macOS) created, see XART-SAFETY.md"
     refusals=$(attr xart_guard_refusals)
     if [ "$(attr xart)" = disabled ]; then
-        echo "xART writes are disabled (xart_writes=0, or the gigalocker did not validate for writing), and a match must save state there"
+        echo "xART writes are disabled (the store is read-only this boot, or a leftover xart_writes setting under a kernel from before linux#2591), and a match must save state there"
     elif [ "$refusals" != absent ] && [ "$refusals" != 0 ]; then
         echo "the xART guard (level $(attr xart_guard)) refused $refusals write(s) of records this Linux install did not create. $optout"
     elif [ "$(attr xart_guard_list)" = unavailable ]; then
