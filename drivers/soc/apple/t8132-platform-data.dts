@@ -103,3 +103,11 @@
 &ps_dpa_p {
 	status = "okay";
 };
+
+&ps_dpa1 {
+	status = "okay";
+};
+
+&ps_dpa2 {
+	status = "okay";
+};
