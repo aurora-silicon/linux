@@ -293,13 +293,11 @@ struct apple_nvme {
 	bool t8122_warm_refused;
 	/*
 	 * After a refused warm sleep ANS comes back on its old session's buffers and
-	 * asks for none: they are kept, allocated and in the SART, until a start in
-	 * which it asks for new ones. Still kept at removal, they are not freed.
+	 * asks for none: they are kept, allocated and in the SART, until ANS has been
+	 * shut down cleanly (apple_nvme_rtkit_shutdown()).
 	 */
 	bool shmem_defer;
-	unsigned int shmem_setups;
-	unsigned int n_stale_shmem;
-	struct apple_rtkit_shmem stale_shmem[8];
+	struct list_head kept_shmem;
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -678,10 +676,13 @@ unmap_buffer:
 		bfr->buffer = NULL;
 		return -ENOMEM;
 	}
-	anv->shmem_setups++;
-
 	return 0;
 }
+
+struct apple_nvme_kept_shmem {
+	struct list_head node;
+	struct apple_rtkit_shmem bfr;
+};
 
 static void apple_nvme_shmem_free(struct apple_nvme *anv,
 				  struct apple_rtkit_shmem *bfr)
@@ -704,21 +705,38 @@ static void apple_nvme_sart_dma_destroy(void *cookie,
 {
 	struct apple_nvme *anv = cookie;
 
+	struct apple_nvme_kept_shmem *kept;
+
 	if (!anv->shmem_defer) {
 		apple_nvme_shmem_free(anv, bfr);
 		return;
 	}
-	if (anv->n_stale_shmem < ARRAY_SIZE(anv->stale_shmem))
-		anv->stale_shmem[anv->n_stale_shmem++] = *bfr;
-	else
-		dev_warn(anv->dev, "RTKit buffer %pad+%#zx kept for good: no room to free it later\n",
-			 &bfr->iova, bfr->size);
+	/* Small, and a kept buffer must stay tracked. */
+	kept = kmalloc(sizeof(*kept), GFP_KERNEL | __GFP_NOFAIL);
+	kept->bfr = *bfr;
+	list_add(&kept->node, &anv->kept_shmem);
+	dev_dbg(anv->dev, "keeping RTKit buffer %pad+%#zx while ANS uses it\n",
+		&bfr->iova, bfr->size);
 }
 
-static void apple_nvme_free_stale_shmem(struct apple_nvme *anv)
+/*
+ * Shut ANS down and free the buffers kept for it: once it acknowledges the shutdown it
+ * no longer uses them, the same point at which its session's own buffers are freed.
+ */
+static int apple_nvme_rtkit_shutdown(struct apple_nvme *anv)
 {
-	while (anv->n_stale_shmem)
-		apple_nvme_shmem_free(anv, &anv->stale_shmem[--anv->n_stale_shmem]);
+	struct apple_nvme_kept_shmem *kept, *tmp;
+	int ret;
+
+	ret = apple_rtkit_shutdown(anv->rtk);
+	if (ret)
+		return ret;
+	list_for_each_entry_safe(kept, tmp, &anv->kept_shmem, node) {
+		list_del(&kept->node);
+		apple_nvme_shmem_free(anv, &kept->bfr);
+		kfree(kept);
+	}
+	return 0;
 }
 
 static const struct apple_rtkit_ops apple_nvme_rtkit_ops = {
@@ -1946,7 +1964,6 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 	bool inherited = !anv->owns_rtkit;
 	bool fw_sleep;
 	bool warm_restarted = false;
-	unsigned int setups = anv->shmem_setups;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -2062,7 +2079,7 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
 			apple_nvme_disable_legacy(anv, false);
 		dev_dbg(anv->dev, "Trying to shut down RTKit before reset.");
-		ret = apple_rtkit_shutdown(anv->rtk);
+		ret = apple_nvme_rtkit_shutdown(anv);
 		if (ret)
 			goto out;
 
@@ -2170,10 +2187,7 @@ rtkit_ready:
 
 	dev_dbg(anv->dev, "ANS booted successfully.");
 
-	/* Kept buffers go once ANS has asked for new ones (see shmem_defer). */
 	anv->shmem_defer = false;
-	if (anv->n_stale_shmem && anv->shmem_setups != setups)
-		apple_nvme_free_stale_shmem(anv);
 
 	/*
 	 * Pre-M4 ANS keeps running across a kexec, and a crashed kernel hands
@@ -2430,7 +2444,7 @@ out:
 	}
 	if (phase_locked)
 		mutex_unlock(&anv->disable_lock);
-	/* ANS's state is unknown: buffers kept for it stay kept (see shmem_defer). */
+	/* ANS's state is unknown: buffers kept for it stay kept (see kept_shmem). */
 	anv->shmem_defer = false;
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
@@ -2810,6 +2824,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	mutex_init(&anv->disable_lock);
 	spin_lock_init(&anv->event_lock);
 	INIT_LIST_HEAD(&anv->quarantine_node);
+	INIT_LIST_HEAD(&anv->kept_shmem);
 	anv->controller_start = resource->start;
 	ret = devm_add_action_or_reset(dev, apple_nvme_put_resource_owner, anv);
 	if (ret)
@@ -3173,7 +3188,7 @@ static void apple_nvme_remove(struct platform_device *pdev)
 
 	/* Post-M4 firmware stays live; see apple_nvme_shutdown(). */
 	if (!anv->hw->needs_ioq_registers && apple_rtkit_is_running(anv->rtk)) {
-		apple_rtkit_shutdown(anv->rtk);
+		apple_nvme_rtkit_shutdown(anv);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
@@ -3213,7 +3228,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		apple_rtkit_shutdown(anv->rtk);
+		apple_nvme_rtkit_shutdown(anv);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
@@ -3586,7 +3601,7 @@ static int apple_nvme_suspend(struct device *dev)
 			if (!ret)
 				ret = apple_rtkit_reinit(anv->rtk);
 		} else {
-			ret = apple_rtkit_shutdown(anv->rtk);
+			ret = apple_nvme_rtkit_shutdown(anv);
 		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
