@@ -3260,9 +3260,8 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return dcp_fw_swap_has_edr(dcp) && dcp_fw_panel_decodes_pq(dcp) &&
-	       dcp_has_panel(dcp) && dcp->panel.edr_ceiling &&
-	       READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
