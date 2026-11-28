@@ -22,6 +22,17 @@
 
 #define APPLE_T600X_NON_ULTRA
 
+#ifndef APPLE_T6000_SUBSET
+/*
+ * The PMP manages system power states on every M1 Max: m1n1 boots it, it
+ * takes over the fabric and DCS p-states, and the GPU's AGX vote, the CPU
+ * memory floor and the AVD, JPEG, scaler and video encoder report to it.
+ * The PMP firmware, its DVFS domain table and the report layout are the
+ * SoC's, the same on every T6001 board.
+ */
+#define APPLE_USE_PMP
+#endif
+
 #include "t600x-common.dtsi"
 
 / {
@@ -150,6 +161,88 @@
 };
 
 #ifndef APPLE_T6000_SUBSET
+/*
+ * DRAM interface class for M1 Max: 512-bit LPDDR5-6400, the 400 GB/s class.
+ * As on T6000, width and maximum rate are inferred from topology and the
+ * published bandwidth class, and lower-state rates remain unqualified; the
+ * PMP's DVFS domain table lists four DCS states. State IDs below describe
+ * firmware DCS states, not PMGR codes.
+ *
+ * The report only validates this description and publishes it read-only
+ * (its dram/ sysfs group); nothing else reads it.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+			opp-hz = /bits/ 64 <3200000000>;
+			apple,data-rate = /bits/ 64 <6400000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <512>;
+	apple,dcs-state-count = <4>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <409600000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <400000000000>;
+};
+
+#ifdef APPLE_USE_PMP
+/*
+ * With the PMP managing DCS and fabric, CPU-only load stays at the idle
+ * memory state; the CPU clients' floor raises it while the CPUs are busy:
+ * request class 0x21 (DRAM) at 3 and class 0x25 (fabric) at 2, the top of
+ * the four DCS and three fabric states in this SoC's PMP DVFS domain table,
+ * as on T6000.
+ *
+ * The video encoder, AVD, the JPEG codecs and the scaler also report to the
+ * PMP while they are powered. The bootloader fills each entry's performance
+ * levels from this machine's ADT (apple,adt-dvfs); an entry it leaves
+ * unfilled sends the power request only.
+ */
+&pmp_report {
+	apple,pmp-tables = <&pmp>;
+	apple,cpu-memory-floor = <0x21 3 0x25 2>;
+};
+
+&pmp_report_venc_sys {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_avd_sys {
+	apple,adt-dvfs;
+};
+
+&pmp_report_jpg {
+	apple,adt-dvfs;
+};
+
+&pmp_report_msr0 {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+#endif
+
 #include "t6001-peripherals.dtsi"
 #include "t6001-aux-spmi.dtsi"
 #include "t6001-display-extra.dtsi"
@@ -169,5 +262,17 @@
 
 &ave {
 	status = "okay";
+#ifdef APPLE_USE_PMP
+	power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+			<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>,
+			<&pmp_report_venc_sys>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+#endif
 };
+
+#ifdef APPLE_USE_PMP
+&scaler0 {
+	power-domains = <&pmp_report_msr0>, <&ps_msr0_ase_core>;
+};
+#endif
 #endif
