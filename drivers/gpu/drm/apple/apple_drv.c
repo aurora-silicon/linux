@@ -1150,10 +1150,10 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 };
 
 /*
- * A committed "notch" policy changes which modes are offered: tell
- * userspace and the console to probe again.
+ * Publish the committed policy before completing the commit dependencies.
+ * Hotplug work runs after the hardware completion notification.
  */
-static void apple_commit_notch(struct drm_atomic_commit *state)
+static bool apple_commit_notch(struct drm_atomic_commit *state)
 {
 	struct drm_connector_state *old, *new;
 	struct drm_connector *conn;
@@ -1172,14 +1172,14 @@ static void apple_commit_notch(struct drm_atomic_commit *state)
 		WRITE_ONCE(dcp->notch_policy, notch);
 		changed = true;
 	}
-	if (changed)
-		schedule_work(&to_apple_drm(state->dev)->notch_hotplug);
+	return changed;
 }
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *old, *new;
+	bool notch_changed;
 	int i;
 
 	/* Retain displaced scanout even when the CRTC stays inactive. */
@@ -1202,9 +1202,11 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 	drm_atomic_helper_commit_modeset_enables(state->dev, state);
 	drm_atomic_helper_commit_planes(state->dev, state,
 					DRM_PLANE_COMMIT_ACTIVE_ONLY);
+	notch_changed = apple_commit_notch(state);
 	drm_atomic_helper_fake_vblank(state);
 	drm_atomic_helper_commit_hw_done(state);
-	apple_commit_notch(state);
+	if (notch_changed)
+		schedule_work(&to_apple_drm(state->dev)->notch_hotplug);
 	drm_atomic_helper_wait_for_flip_done(state->dev, state);
 	apple_fail_lost_flips(state);
 	drm_atomic_helper_cleanup_planes(state->dev, state);
