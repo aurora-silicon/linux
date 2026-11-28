@@ -745,11 +745,13 @@ impl CrossPairOrder {
     }
 
     /// The dependency a tiling kick of the pair `qids` gets from the recorded fragment kick `last`:
-    /// none without one, nor, for the task-stage order, when it is the pair's own, because a pair's
-    /// tiling ring already runs its own kicks in order.
+    /// none without one, nor when it is the pair's own previous fragment kick (`qids[1]`), because
+    /// a pair's tiling ring already runs its own kicks in order in the same VM slot, while another
+    /// pair's fragment kick still orders cross-context tiling behind it.
     fn dependency(self, last: u64, qids: [u8; 2]) -> Option<KickDependency> {
-        let last = KickDependency::from_word(last).filter(|d| d.word() != 0 && d.qid() != qids[0])?;
-        (self != Self::TaskAfterTask || last.qid() != qids[1]).then_some(last)
+        let _ = self;
+        KickDependency::from_word(last)
+            .filter(|d| d.word() != 0 && d.qid() != qids[0] && d.qid() != qids[1])
     }
 }
 
@@ -3610,8 +3612,10 @@ mod cross_pair_order_tests {
         // Its own pair's previous fragment kick: the tiling ring already orders it.
         assert!(order.dependency(word(5), [4, 5]).is_none());
         assert!(order.dependency(0, [4, 5]).is_none());
-        // The J813 order keeps its own pair's kick, as before.
-        assert!(CrossPairOrder::All.dependency(word(5), [4, 5]).map(|d| d.word()) == Some(word(5)));
+        // The J813 order also waits only for another pair's fragment kick, skipping its own pair
+        // so same-context TA/3D can pipeline while preserving cross-context isolation.
+        assert!(CrossPairOrder::All.dependency(word(9), [4, 5]).map(|d| d.word()) == Some(word(9)));
+        assert!(CrossPairOrder::All.dependency(word(5), [4, 5]).is_none());
     }
 }
 
