@@ -27,12 +27,15 @@ properties:
       - apple,t6020-pmgr-misc
 
   reg:
-    maxItems: 2
+    minItems: 2
+    maxItems: 3
 
   reg-names:
+    minItems: 2
     items:
       - const: fabric-ps
       - const: dcs-ps
+      - const: disp-ps
 
   apple,fabric-min-pstate:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -52,6 +55,16 @@ properties:
       s2idle scaling without starving active display scanout. When absent on
       SoCs without a built-in suspend floor, the boot DCS p-state is retained
       for idle and s2idle. Mutually exclusive with operating-points-v2.
+
+  apple,disp-min-pstate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 15
+    description: |
+      Lowest raw PMGR display perf p-state verified safe on this board for idle
+      and s2idle scaling while scanning out the internal panel. Requires the
+      optional disp-ps register range; when absent, the boot display perf
+      p-state is retained.
 
   '#interconnect-cells':
     const: 1
