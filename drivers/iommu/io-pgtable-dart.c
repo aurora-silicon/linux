@@ -483,3 +483,7 @@ struct io_pgtable_init_fns io_pgtable_apple_dart_init_fns = {
 	.alloc	= apple_dart_alloc_pgtable,
 	.free	= apple_dart_free_pgtable,
 };
+
+#if IS_ENABLED(CONFIG_IOMMU_IO_PGTABLE_DART_KUNIT_TEST)
+#include "io-pgtable-dart-test.c"
+#endif

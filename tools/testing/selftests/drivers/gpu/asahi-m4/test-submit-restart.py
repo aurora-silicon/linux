@@ -11,15 +11,15 @@ r=r'''
 #![allow(dead_code,unused_variables)]
 use std::pin::Pin;use std::sync::atomic::{AtomicU32,Ordering};
 type Result<T=()> = std::result::Result<T,i32>;const ERESTARTSYS:i32=512;const EBUSY:i32=16;
-type KVec<T>=Vec<T>;type KBox<T>=Box<T>;
+type KVec<T>=Vec<T>;type KVVec<T>=Vec<T>;type KBox<T>=Box<T>;
 mod xarray{pub struct XArray<T>(pub T);}
 mod file{pub struct SyncItem;pub struct Object;}
 mod driver{pub struct AsahiRegData<'a>(pub &'a ());}
 static ACCEPTED:AtomicU32=AtomicU32::new(0);static REFUSED:AtomicU32=AtomicU32::new(0);
-struct Syncs;impl Syncs{fn new(_v:Vec<file::SyncItem>,_n:usize)->Self{Self}fn accept(&self,_f:&u32){ACCEPTED.fetch_add(1,Ordering::SeqCst);}fn refuse(&self,_t:&(),error:i32){assert_ne!(error,ERESTARTSYS);REFUSED.fetch_add(1,Ordering::SeqCst);}}
+struct Syncs;impl Syncs{fn new(_v:Vec<file::SyncItem>,_n:usize)->Self{Self}fn publish(&mut self,_f:&u32)->Result{ACCEPTED.fetch_add(1,Ordering::SeqCst);Ok(())}fn refuse(&self,_t:&(),error:i32){assert_ne!(error,ERESTARTSYS);REFUSED.fetch_add(1,Ordering::SeqCst);}}
 struct Status;impl Status{fn record_if_device_loss(&self,_e:i32){}}
 struct Vm{status:Status}struct Queue{vm:Vm,timeline:(),next:Result<u32>}
-impl Queue{fn submit_job(&self,_id:u64,_syncs:&Syncs,_count:usize,_raw:&[u8],_objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result<u32>{self.next}
+impl Queue{fn submit_job(&self,_id:u64,syncs:&mut Syncs,_count:usize,_raw:&[u8],_objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result{let fence=self.next?;syncs.publish(&fence)}
 __SUBMIT__
 }
 #[test]fn restart_has_no_output_fence_and_retry_accepts_once(){

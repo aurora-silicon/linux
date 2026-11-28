@@ -132,11 +132,12 @@ pub(crate) fn start(raw: &Raw) -> Start {
     }
 }
 
-/// The shipped board policy changes only an omitted start parameter. Explicit recovery-off,
-/// explicit experimental start, and malformed values retain their original meanings.
-/// Hardware resources and firmware identity are admitted separately by the caller.
-pub(crate) fn start_for_board(raw: &Raw, admitted_board: bool) -> Start {
-    if raw.start == UNSET && admitted_board {
+/// The shipped default changes only an omitted start parameter: it starts where the boot loader
+/// handed the GPU over. Explicit recovery-off, explicit experimental start, and malformed values
+/// retain their original meanings. Hardware resources and firmware identity are admitted
+/// separately by the caller.
+pub(crate) fn start_for_board(raw: &Raw, handed_over: bool) -> Start {
+    if raw.start == UNSET && handed_over {
         Start::On
     } else {
         start(raw)

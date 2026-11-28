@@ -76,6 +76,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1384,6 +1385,76 @@ TEST_F(asahi, kept_objects_go_under_urgent_pressure)
 	/* Released, not purged: the contents come back with the next binding. */
 	EXPECT_EQ(1, madvise_object(self->fd, a, DRM_ASAHI_GEM_MADV_WILLNEED));
 	EXPECT_EQ(kept0 + (long long)kept_size, gpu_memory_field("user_kept"));
+}
+
+struct rebinder {
+	int fd;
+	uint32_t vm, handle;
+	uint64_t addr, size;
+	int stop;
+	long binds;
+};
+
+/* Unbinds and binds again one object at its address, until stopped. */
+static void *rebind(void *arg)
+{
+	struct rebinder *r = arg;
+
+	while (!__atomic_load_n(&r->stop, __ATOMIC_RELAXED)) {
+		bind(r->fd, r->vm, 0, r->addr, r->size, DRM_ASAHI_BIND_UNBIND);
+		bind(r->fd, r->vm, r->handle, r->addr, r->size,
+		     DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE);
+		__atomic_add_fetch(&r->binds, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* The files of the destruction race, each with a VM of its own. */
+#define DESTROY_CYCLES 200
+
+/*
+ * Binds racing with the destruction of their VM. In each of a number of
+ * fresh files, one thread unbinds and binds a kept object again and again
+ * while the main thread closes the object's handle and destroys the VM;
+ * then the file is closed. Whatever each bind found, nothing may retain the
+ * object afterwards: the kept total comes back to where it was.
+ */
+TEST_F_TIMEOUT(asahi, vm_destroy_releases_racing_binds, 120)
+{
+	const uint64_t size = 1024 * PAGE;
+	long long kept0 = gpu_memory_field("user_kept");
+	struct drm_asahi_vm_create vm = {
+		.kernel_start = self->va_end,
+		.kernel_end = self->params.vm_end,
+	};
+
+	ASSERT_GE(kept0, 0);
+	for (int i = 0; i < DESTROY_CYCLES; i++) {
+		struct rebinder r = { .size = size };
+		struct drm_asahi_vm_destroy destroy = { 0 };
+		uint64_t va = self->params.vm_start;
+		pthread_t thread;
+
+		r.fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+		ASSERT_LE(0, r.fd);
+		ASSERT_EQ(0, ioc(r.fd, DRM_IOCTL_ASAHI_VM_CREATE, &vm));
+		r.vm = vm.vm_id;
+		r.handle = bound_object(r.fd, r.vm, &va, vm.kernel_start, size);
+		ASSERT_NE(0, r.handle);
+		r.addr = va - size;
+		ASSERT_EQ(0, residency(r.fd, r.handle, DRM_ASAHI_GEM_RESIDENCY_KEEP));
+		ASSERT_EQ(0, pthread_create(&thread, NULL, rebind, &r));
+		/* Vary where in a bind the destruction comes. */
+		while (__atomic_load_n(&r.binds, __ATOMIC_RELAXED) < 1 + i % 8)
+			sched_yield();
+		close_handle(r.fd, r.handle);
+		destroy.vm_id = r.vm;
+		ASSERT_EQ(0, ioc(r.fd, DRM_IOCTL_ASAHI_VM_DESTROY, &destroy));
+		__atomic_store_n(&r.stop, 1, __ATOMIC_RELAXED);
+		ASSERT_EQ(0, pthread_join(thread, NULL));
+		close(r.fd);
+	}
+	EXPECT_EQ(kept0, gpu_memory_field("user_kept"));
 }
 
 /*

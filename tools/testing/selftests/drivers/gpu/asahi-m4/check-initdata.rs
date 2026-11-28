@@ -7,12 +7,13 @@ fn input(variant: u64) -> initdata::Input {
     let start = 0xfffffc2000000000u64;
     let shift = variant * 0x100000000;
     let mut input = initdata::Input {
-        // Independently pinned qualified C/J713 bin for this immutable byte fixture.
+        // J713 frequencies with synthetic voltage bins.
         performance: initdata::Performance {
-            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470],
-            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326],
-            voltage: [125,610,645,680,725,780,825,865,895,970],
-            sram: [780,780,780,780,780,780,825,865,895,970],
+            count: 10,
+            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470,0],
+            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326,0],
+            voltage: [100,600,650,700,750,800,850,900,950,1000,0],
+            sram: [800,800,800,800,800,800,850,900,950,1000,0],
         },
         va: core::array::from_fn(|i| start + shift + 0x100000 + i as u64 * 0x100000),
         channel_state: core::array::from_fn(|i| start + shift + 0x4000000 + i as u64 * 0x10000),
@@ -23,6 +24,17 @@ fn input(variant: u64) -> initdata::Input {
         lower_parameter: 0x7000240000,
         ktrace_mask: [0, 0x12345678, 0xfedcba98][variant as usize],
         progress_recovery: u32::from(variant != 1),
+        enabled_cores: 10,
+        // T8132 ADT power-sampling ticks; 25G83 writes power_sample_clks to +4/+8.
+        power_sample_clks: 200_000,
+        power_sample_us: 8333,
+        power_sample_period_ms: 8,
+        timebase_khz: 24_000,
+        avg_power_filter_tc_ms: 248,
+        lowpeak_limiter_tc_ms: 16,
+        lowpeak_limiter_ki_q16: 134_217,
+        lowpeak_limiter_kp_q16: 33_554,
+        coredump_copy_size: 0x8000,
     };
     for (i, loader) in initdata::LOADERS.iter().enumerate() {
         if loader.length != 0 {
@@ -41,12 +53,30 @@ fn main() {
         let mut slices: [&mut [u8]; initdata::OBJECT_COUNT] = buffers.each_mut().map(|buffer| buffer.as_mut_slice());
         initdata::encode(&mut slices, &input(variant as u64), ceiling).expect("valid C fixture rejected");
         let got: Vec<_> = buffers.into_iter().flatten().collect();
-        let expected = std::fs::read(directory.join(format!("initdata-{variant}.bin"))).unwrap();
+        let mut expected =
+            std::fs::read(directory.join(format!("initdata-{variant}.bin"))).unwrap();
+        // Substitute synthetic voltages in the immutable C golden before comparison.
+        let main: usize = initdata::OBJECT_SIZE[..initdata::id::MAIN].iter().sum();
+        let perf = input(variant as u64).performance;
+        for i in 0..=ceiling as usize { for lane in 0..16 {
+            for (offset, value) in [(0x1008, perf.voltage[i]), (0x1408, perf.sram[i])] {
+                let at = main + offset + (i * 16 + lane) * 4;
+                expected[at..at+4].copy_from_slice(&value.to_le_bytes());
+            }
+        }}
+        // Substitute calibrated DM2 compute watchdogs (40 -> 750, 50 -> 800) in the frozen C
+        // golden.
+        let globals: usize = initdata::OBJECT_SIZE[..initdata::id::GLOBALS].iter().sum();
+        for (offset, old, new) in [(0x9c8usize, 40u32, 750u32), (0x9ccusize, 50u32, 800u32)] {
+            let wd = globals + offset;
+            assert_eq!(u32::from_le_bytes(expected[wd..wd+4].try_into().unwrap()), old);
+            expected[wd..wd+4].copy_from_slice(&new.to_le_bytes());
+        }
         if let Some(offset) = got.iter().zip(&expected).position(|(a, b)| a != b) {
             panic!("initdata variant {variant} differs at {offset:#x}: C={:#x}, Rust={:#x}", expected[offset], got[offset]);
         }
         assert_eq!(got.len(), expected.len());
         bytes_checked += got.len();
     }
-    println!("3 initdata fixtures / {bytes_checked} output bytes match qualified C exactly");
+    println!("3 initdata fixtures / {bytes_checked} bytes match C with synthetic voltages");
 }

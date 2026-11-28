@@ -12,6 +12,7 @@ extern "C" {
     fn sep_store_open_writable_existing(path: *const c_char) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
+    fn sep_store_open_internal_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
     fn sep_store_size(handle: *mut c_void) -> i64;
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
@@ -98,6 +99,19 @@ impl StoreFile {
         // SAFETY: `path` is NUL-terminated; the shim opens read-only unless
         // explicitly asked to write, and rejects writes to a read-only device.
         let handle = unsafe { sep_store_open_block(path.as_char_ptr(), c_int::from(writable)) };
+        if handle.is_null() {
+            return Err(ENODEV);
+        }
+        Ok(StoreFile { handle })
+    }
+
+    /// As [`Self::open_block`], and the device must be on the internal NVMe
+    /// disk: `path` names the partition but does not identify the disk.
+    pub(crate) fn open_internal_block(path: &CStr, writable: bool) -> Result<StoreFile> {
+        // SAFETY: `path` is NUL-terminated; as `open_block`, and the shim
+        // also rejects a device that is not below the embedded NVMe controller.
+        let handle =
+            unsafe { sep_store_open_internal_block(path.as_char_ptr(), c_int::from(writable)) };
         if handle.is_null() {
             return Err(ENODEV);
         }

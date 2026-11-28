@@ -25,8 +25,17 @@ properties:
           - apple,agx-t8140
           - apple,agx-t8142
       - items:
+          - enum:
+              - apple,agx-g17c
+              - apple,agx-g17d
+          - const: apple,agx-g17s
+      - description:
+          G17C firmware handoff with the SoC fallback required by installed
+          boot loaders when filling operating points and firmware resources.
+        items:
           - const: apple,agx-g17c
           - const: apple,agx-g17s
+          - const: apple,agx-t6050
       - items:
           - const: apple,agx-t8103
           - const: apple,agx-g13g
@@ -267,12 +276,15 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,agx-g17s
+          anyOf:
+            - const: apple,agx-g17s
+            - contains:
+                const: apple,agx-g17d
     then:
       description:
-        The M5 Pro GPU uses one MMIO range and two firmware mailbox roles.
-        Its firmware graph supplies the performance tables, so it has no
-        operating-point table in the board DT.
+        The M5 Pro and M5 Ultra GPUs use one MMIO range and two firmware
+        mailbox roles. Their firmware graph supplies the performance tables,
+        so they have no operating-point table in the board DT.
       properties:
         reg:
           maxItems: 1

@@ -46,6 +46,7 @@ pub(super) struct Lane<'a> {
     prefix: usize,
     prefix_end: u32,
     pub(super) window: Window,
+    retained: bool,
 }
 impl<'a> Lane<'a> {
     #[expect(
@@ -61,6 +62,7 @@ impl<'a> Lane<'a> {
         present: bool,
         timestamp: KickTimestamp,
         lead: bool,
+        retained: bool,
     ) -> Result<Self> {
         // macOS 27.0 on the J813 (common 26A428 interface) publishes the Neo form: its
         // TA, 3D and compute item rings carry [configuration], descriptor, KickAnnounce (tag 0xe)
@@ -68,7 +70,11 @@ impl<'a> Lane<'a> {
         let j813 = crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed);
         let m5 = graph.is_m5() && !j813;
         // M5 items carry no descriptor: [configuration], notification.
-        let count = u32::from(present) + u32::from(lead) + if m5 { 1 } else { 2 };
+        let count = if retained {
+            0
+        } else {
+            u32::from(present) + u32::from(lead) + if m5 { 1 } else { 2 }
+        };
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
         let offset = ordinal as usize % memory::RECORDS;
         let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
@@ -138,9 +144,10 @@ impl<'a> Lane<'a> {
                 )?)
             },
             announce_destination,
-            prefix: count as usize - 1,
-            prefix_end: (base + count - 1) % ITEM_RING_ENTRIES,
+            prefix: count.saturating_sub(1) as usize,
+            prefix_end: (base + count.saturating_sub(1)) % ITEM_RING_ENTRIES,
             window,
+            retained,
         })
     }
     fn items(&self, range: core::ops::Range<usize>) {
@@ -179,17 +186,26 @@ impl<'a> Lane<'a> {
     /// Fill the retained records without advancing the firmware-visible cursor.
     /// M5's host-port transaction must occur between this and publish_kick.
     pub(super) fn prepare(&self) {
+        if self.retained {
+            return;
+        }
         self.items(0..self.prefix + 1);
         self.config();
         self.announce();
     }
     pub(super) fn publish_prefix(&self) {
+        if self.retained {
+            return;
+        }
         self.items(0..self.prefix);
         self.config();
         fence(Ordering::SeqCst);
         self.producer.store(self.prefix_end, Ordering::Relaxed);
     }
     pub(super) fn publish_kick(&self) {
+        if self.retained {
+            return;
+        }
         self.announce();
         self.items(self.prefix..self.prefix + 1);
         fence(Ordering::SeqCst);
@@ -202,6 +218,9 @@ impl<'a> Lane<'a> {
         inner: &AtomicU32,
         next_inner: u32,
     ) {
+        if self.retained {
+            return;
+        }
         self.items(0..self.prefix + 1);
         self.config();
         self.announce();

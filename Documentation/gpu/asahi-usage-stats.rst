@@ -48,10 +48,13 @@ start and end operations. The shared G17 backend runs several commands of one
 queue at once, so their stages overlap. It charges each engine of a queue the
 union of that queue's stage intervals (exact, because a queue's stages retire in
 the order they started), so a queue never counts more than the wall time on one
-engine. Queues of one file still add up. The other backends sum their intervals
-without merging overlapping commands on the same engine. Missing, zero-start or
-reversed intervals are ignored. Failed or cancelled commands do not contribute
-incomplete intervals;
+engine. Queues of one file still add up on G17. Native G16 executes pipelined
+commands and dual-pipe compute across sibling queues of one DRM file, so it
+unions overlapping stage intervals per file (``Client::add_union``) to keep each
+engine bounded by wall time. The other backends sum their intervals without
+merging overlapping commands on the same engine. Missing, zero-start or reversed
+intervals are ignored. Failed or cancelled commands do not contribute incomplete
+intervals;
 successful stages that retired before a later failure remain counted. An
 unexecuted G17 replay contributes only when it eventually retires successfully.
 There is no submit-to-completion wall-time fallback in the current backends.
@@ -62,7 +65,8 @@ cycles, or multiplying time by a sampled/maximum GPU frequency, would give
 incorrect frequency-weighted utilization. Per-client execution-cycle counters
 would require a separate hardware measurement source.
 
-On the M5 and the A18 Pro each engine also has the frequency keys::
+On the M5, the A18 Pro and T6041 (M4 Max, 25G83) each engine also has
+the frequency keys::
 
     drm-curfreq-compute: 1620000000 Hz
     drm-maxfreq-compute: 1620000000 Hz
@@ -88,9 +92,10 @@ The native backends reuse
 existing timestamp reads. Classic completion callbacks read two internal cells
 per stage; commands without application timestamps also execute two existing
 timestamp microsequence operations per stage. Reading fdinfo loads three counters
-and does not traverse queues, wait for fences or access hardware. On the M5 and
-the A18 Pro a read also takes the device mutex once and drains the statistics
-rings, as a read of ``agx_stats`` does, for the frequency keys.
+and does not traverse queues, wait for fences or access hardware. On the M5,
+the A18 Pro and T6041 (25G83) a read also takes the device mutex once
+and drains the statistics rings, as a read of ``agx_stats`` does, for the
+frequency keys.
 
 G16S and G17P device utilisation
 ------------------------------
@@ -133,33 +138,44 @@ ring on powered cores becomes stale rather than fabricating a zero-utilisation
 sample; only gated cores read as zero. Readers
 must not convert these percentages into engine nanoseconds or cycles.
 
-Performance state and busy time on V26A428 (A18 Pro and M5)
------------------------------------------------------------
+Performance state and busy time on V26A428 (A18 Pro and M5) and T6041
+---------------------------------------------------------------------
 
-The V26A428 firmware, which the A18 Pro (T8140, G17P) and the M5 run on the same
-backend and decoder, carries more in its statistics ring. ``agx_stats`` reports
-there:
+The V26A428 firmware (A18 Pro T8140 and M5) and T6041's 25G83 firmware
+run on the same backend and decoder and carry more in their statistics ring.
+``agx_stats`` reports there:
 
 * ``pstate``: the performance state in effect, from the firmware's state
   reports (tag ``0x1b``, words 1 and 3, which must agree). It is an index into
-  the performance state table: 1 to 10 on the A18 Pro, 1 to 13 on the M5. The
-  interval record before a report (tag ``0x19``) gives its firmware timestamp.
+  the performance state table: 1 to 10 on the A18 Pro and T6041, 1 to 13 on
+  the M5. The interval record before a report (tag ``0x19``) gives its
+  firmware timestamp.
   A report that names state 0 or a state beyond the table is not used. While
   the cores are gated the GPU is off and ``pstate`` reads a valid 0; power-up
   starts a new epoch, ``stale`` until the next report.
 * ``achieved_frequency_hz``: the frequency of that state while
   ``pstate_status`` is ``valid``, 0 for state 0. The M5 takes it from its
-  board's table. The A18 Pro takes the device tree operating point that the
-  state's entry of its performance table A names: its records do not name the
-  table, but at its top state a sustained FP32 FMA load completes faster than
-  table B's frequency there allows.
+  board's table. The A18 Pro and T6041 take the device tree operating point
+  that the state's entry of their performance table A names: their records do
+  not name the table; on the A18 Pro, at the top state a sustained FP32 FMA
+  load completes faster than table B's frequency there allows, while on T6041
+  both tables map state 10 to OPP 15 (1578 MHz) and only differ on mid-states
+  (states 5..9 on 32-core J616C, 6..9 on 40-core), so those mid-state
+  frequencies are nominal (taken from table A) until measured by a mid-state
+  ALU benchmark.
 * ``busy_ns``: the utilisation records carry their own timestamps (words 1 and
-  2, 24 MHz ticks), one every 8 ms on the M5 and every 16 ms on the A18 Pro, so
-  each record closes a window of known length, which is credited at the
-  record's device utilisation. A record that follows the previous one by more
-  than two periods, or whose timestamp went back, only starts a new window:
-  time the GPU spent gated is never credited, and a load sparser than one
-  period reads low. The total keeps counting across power epochs.
+  2, 24 MHz ticks), one every 8 ms on the M5 and T6041 and every 16 ms on the
+  A18 Pro, so each record closes a window of known length, which is credited at the
+  record's device utilisation. Records are credited in timestamp order, from
+  both roles and across power epochs: the driver keeps the timestamp up to
+  which it has counted, and a record at or before it adds nothing. A record
+  within two periods of that mark closes the window since it; after a longer
+  gap it closes only its own period, so time the GPU spent gated is never
+  credited. Under a frame-paced load the cores gate many times a second, often
+  with one record per power epoch, so the records a power boundary keeps out of
+  the utilisation average still count here. Suspend, recovery and quarantine
+  keep them out, and ``busy_ns`` reads ``stale`` once a statistics ring is
+  quarantined.
 
 The driver asks for full performance while work is in flight, which the
 firmware takes as a floor for its state. An A18 Pro at work therefore normally
@@ -174,8 +190,10 @@ fdinfo's per-client ``drm-engine-*`` counters.
 Deferred shared power telemetry
 ------------------------------
 
-Current pstate and requested/achieved frequency remain unsupported on G16S
-(V25G83); V26A428 reports its state in the statistics ring, see above. The
+Current pstate and requested/achieved frequency remain unsupported on T6040
+(M4 Pro, V25G83), which is left on ``Protocol::NONE`` because it has not been
+measured yet; V26A428 and T6041 (25G83) report their state in the statistics
+ring, see above. The
 shared-power snapshot ABI is not sufficiently specified to implement a
 read-only reader, which G16S would need, and which would also name the A18
 Pro's table directly. For **each** of G16S and G17P, it still needs:

@@ -22,6 +22,8 @@
 
 	aliases {
 		gpu = &gpu;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		/* m1n1 copies this machine's Thunderbolt calibration onto the
 		 * node these names point at. Current m1n1 looks up usb4-N-acio
 		 * and usb4-N-nhi; the packaged 1.6.1 bootloader looks up
@@ -658,6 +660,7 @@
 
 		dcp: dcp@231c00000 {
 			compatible = "apple,t8103-dcp", "apple,dcp";
+			apple,display-power = <&dcp_power>;
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcp_dart 0 0x0 0x0 0x0 0xfc000000>;
@@ -1111,6 +1114,43 @@
 			reg = <0x2 0x3b700000 0 0x14000>;
 		};
 
+		/*
+		 * The power words the DCP's driver lowers and raises around a stop of its
+		 * firmware: DISP0's CPU and front end, in the PMGR's power state block.
+		 * No driver binds this.
+		 */
+		dcp_power: display-power@23b700000 {
+			compatible = "apple,t8103-display-power";
+			reg = <0x2 0x3b700000 0x0 0x14000>;
+			reg-names = "ps";
+		};
+
+		/*
+		 * Suspend-to-RAM. The blocks the sleep writes, each shared with its own
+		 * driver and not claimed: the main PMGR (CPM gating, the CPU clusters,
+		 * SEP's power-gate wait), the always-on PMGR (the S2R timer), the SoC
+		 * clock generator's muxes, the AOP's wake block (five mask, then five
+		 * status words), the CPU start block, the watchdog and nub-spmi0.
+		 * A board that sleeps enables it.
+		 */
+		sleep: sleep-controller@23b700000 {
+			compatible = "apple,t8103-sleep";
+			reg = <0x2 0x3b700000 0x0 0x8c000>,
+			      <0x2 0x3d280000 0x0 0x74000>,
+			      <0x2 0x3b000000 0x0 0x41000>,
+			      <0x2 0x3d004000 0x0 0x30>,
+			      <0x2 0x3b754000 0x0 0x10>,
+			      <0x2 0x3d2b0000 0x0 0x20>,
+			      <0x2 0x3d0d9300 0x0 0x100>;
+			reg-names = "ps", "ps-aon", "clk-mux", "wake",
+				    "cpu-start", "wdt", "spmi";
+			/* NUB.SPMI0Sw3IRQ: the PMU RTC's alarm */
+			apple,wake-enable = <54>;
+			apple,display-coprocessors = <&dcp>;
+			apple,pinctrl = <&pinctrl_ap>;
+			status = "disabled";
+		};
+
 		pmgr_dcp: power-management@23b738000 {
 			reg = <0x2 0x3b738000 0x0 0x1000>,
 				<0x2 0x3bc3c000 0x0 0x1000>;
@@ -1209,10 +1249,25 @@
 			reg = <0x2 0x3d0d9300 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>;
+			apple,response-vector = <192>;
 
 			pmic1: pmic@f {
 				compatible = "apple,sera-pmic", "apple,spmi-nvmem";
 				reg = <0xf SPMI_USID>;
+
+				pmu_rtc: rtc {
+					compatible = "apple,t8103-pmu-rtc", "apple,t8112-pmu-rtc";
+					apple,rtc-base = <0xd000>;
+					interrupt-parent = <&nub_spmi>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
 
 				nvmem-layout {
 					compatible = "fixed-layout";
@@ -1242,8 +1297,8 @@
 						bits = <3 1>;
 					};
 
-					fault_shadow: fault-shadow@a67b {
-						reg = <0xa67b 0x10>;
+					fault_shadow: fault-shadow@a47b {
+						reg = <0xa47b 0x10>;
 					};
 
 					socd: socd@ab00 {
@@ -1323,7 +1378,7 @@
 				compatible = "apple,smc-hwmon";
 			};
 
-			rtc {
+			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;
 				nvmem-cell-names = "rtc_offset";
@@ -1378,6 +1433,11 @@
 			mboxes = <&sep_mbox>;
 			mbox-names = "mbox";
 			iommus = <&sep_dart 0>;
+			/*
+			 * The enclave stops reading its mailbox for good once
+			 * the GPIO power state is switched off under it.
+			 */
+			power-domains = <&ps_sep>, <&ps_gpio>;
 			status = "disabled";
 		};
 
@@ -1593,6 +1653,7 @@
 
 		dcpext: dcp@271c00000 {
 			compatible = "apple,t8103-dcpext", "apple,dcpext";
+			apple,display-power = <&dcp_power>;
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcpext_dart 0 0x0 0x0 0x0 0xfc000000>;
@@ -1693,6 +1754,11 @@
 			mboxes = <&usb4_0_mbox>;
 			resets = <&cio_reset 0>;
 
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 807 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 808 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dpin0", "dpin1";
+
 			power-domains = <&ps_atc0_cio>,
 					<&ps_atc0_cio_pcie>,
 					<&ps_atc0_cio_usb>,
@@ -1715,6 +1781,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 810 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_cio>;
 			};
 
 			usb4_0_nhi: nhi@f00000 {
@@ -1773,6 +1840,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc0_pcie>;
 			};
 
 			apciec0: pcie@3b0000000 {
@@ -1919,6 +1987,11 @@
 			mboxes = <&usb4_1_mbox>;
 			resets = <&cio_reset 1>;
 
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 887 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 888 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dpin0", "dpin1";
+
 			power-domains = <&ps_atc1_cio>,
 					<&ps_atc1_cio_pcie>,
 					<&ps_atc1_cio_usb>,
@@ -1941,6 +2014,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 890 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_cio>;
 			};
 
 			usb4_1_nhi: nhi@f00000 {
@@ -1999,6 +2073,7 @@
 				interrupt-parent = <&aic>;
 				interrupts = <AIC_IRQ 851 IRQ_TYPE_LEVEL_HIGH>;
 				#iommu-cells = <1>;
+				power-domains = <&ps_atc1_pcie>;
 			};
 
 			apciec1: pcie@530000000 {

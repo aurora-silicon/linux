@@ -2,8 +2,10 @@
 /* This fixture selects the original controller layout, not T8132. */
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
-    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+	bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* A device role without SuperSpeed device mode runs on USB2 (hw->no_ss_device). */
+	bool usb2_device;
 	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
 	struct {
 		bool prepared;
@@ -25,7 +27,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_usb3, cio_only, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
@@ -76,12 +78,18 @@ static void regulator_disable(int p)
 {
 	assert(!p);
 }
+/* include/uapi/linux/usb/ch9.h: UNKNOWN is 0, so zeroed fixtures save no speed. */
+enum usb_device_speed {
+	USB_SPEED_UNKNOWN, USB_SPEED_LOW, USB_SPEED_FULL, USB_SPEED_HIGH,
+	USB_SPEED_WIRELESS, USB_SPEED_SUPER, USB_SPEED_SUPER_PLUS,
+};
 struct dwc3 {
 	struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
 	int dev, usb_psy, vbus_draw_work, dr_mode, current_dr_role;
 	bool dis_u3_susphy_quirk;
+	enum usb_device_speed maximum_speed;
 	struct { void *notifier_call; } psy_nb;
 };
 struct dwc3_apple {
@@ -102,6 +110,8 @@ struct dwc3_apple {
 	bool pre_core_rpm;
 	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
 	bool sleep_phy_wait, sleep_phy_pending;
+	/* J714s only: a SuperSpeed device looked for after a sleep; never set here. */
+	bool ss_retry;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
@@ -115,6 +125,8 @@ struct dwc3_apple {
 	 */
 	bool sleep_tunnel;
 	enum usb_role sleep_tunnel_role;
+	/* The controller maximum saved by a high-speed gadget clamp; UNKNOWN here. */
+	enum usb_device_speed maximum_speed;
 };
 /* The epoch spinlock: taken only when free, released only when held. */
 #define spin_lock_irqsave(l, f) do { assert(!*(l)); *(l) = 1; (f) = 0; } while (0)
@@ -250,11 +262,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
 static int atcphy_power_off(struct apple_atcphy *p);
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+static void __attribute__((unused)) atcphy_lanes_down_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); }
 
 
 /* Model the USB2 power-on boundary's running state. */
@@ -371,6 +387,11 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *a)
 	(void)a;
 	setup_cio++;
 }
+/* The check after a sleep is only for a fixed hub or a J714s SuperSpeed device; neither here. */
+static void dwc3_apple_check_hub_later(struct dwc3_apple *a)
+{
+	assert(!a->fixed_hub && !a->ss_retry);
+}
 /* The hibernation block's register setup; teardown order doesn't depend on it. */
 static void __attribute__((unused)) dwc3_apple_setup_hibernation(struct dwc3_apple *a)
 {
@@ -393,6 +414,12 @@ static int dwc3_host_init(struct dwc3 *d)
 		pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
 	}
 	return host_init_error;
+}
+
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple *a)
+{
+	return dwc3_host_init(&a->dwc);
 }
 static int dwc3_gadget_init(struct dwc3 *d)
 {

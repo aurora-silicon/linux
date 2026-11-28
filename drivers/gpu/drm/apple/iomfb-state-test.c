@@ -148,7 +148,27 @@ static void dcp_mode_withdraw_modeset_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, state.valid);
 }
 
+/*
+ * J473 (T8112) external pipe: 360 MHz provider clock. 2560x1440 at 165 Hz
+ * (666.46 MHz pixel clock) fits; 180 Hz (727.05 MHz) and 240 Hz (969.4 MHz)
+ * do not. With the PMP acknowledged, or without a provider clock, nothing is
+ * limited.
+ */
+static void dcp_provider_clock_limits_test(struct kunit *test)
+{
+	const unsigned long provider = 360000000;
+
+	KUNIT_EXPECT_FALSE(test, dcp_provider_clock_limits(666460, provider, false));
+	KUNIT_EXPECT_FALSE(test, dcp_provider_clock_limits(720000, provider, false));
+	KUNIT_EXPECT_TRUE(test, dcp_provider_clock_limits(720001, provider, false));
+	KUNIT_EXPECT_TRUE(test, dcp_provider_clock_limits(727050, provider, false));
+	KUNIT_EXPECT_TRUE(test, dcp_provider_clock_limits(969400, provider, false));
+	KUNIT_EXPECT_FALSE(test, dcp_provider_clock_limits(969400, provider, true));
+	KUNIT_EXPECT_FALSE(test, dcp_provider_clock_limits(969400, 0, false));
+}
+
 static struct kunit_case dcp_mode_cases[] = {
+	KUNIT_CASE(dcp_provider_clock_limits_test),
 	KUNIT_CASE(dcp_mode_success_test),
 	KUNIT_CASE(dcp_mode_failure_test),
 	KUNIT_CASE(dcp_mode_deferred_disconnect_test),

@@ -1,0 +1,7 @@
+# ./tools/testing/kunit/kunit.py run --arch=arm64 --kunitconfig=drivers/pwm/pwm-apple.kunitconfig
+CONFIG_KUNIT=y
+CONFIG_ARCH_APPLE=y
+CONFIG_PM=y
+CONFIG_PWM=y
+CONFIG_PWM_APPLE=y
+CONFIG_PWM_APPLE_KUNIT_TEST=y

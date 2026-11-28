@@ -13,7 +13,7 @@ DRIVER = ROOT / 'drivers/net/wireless/broadcom/brcm80211/brcmfmac'
 
 
 def function(source, name):
-    match = re.search(r'^(?:static\s+)?(?:void|int|bool|s32)\s+' + name +
+    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:void|int|bool|s32)\s+' + name +
                       r'\([^;]*?\)\s*\{', source, re.M)
     if not match:
         raise ValueError('Missing function ' + name)
@@ -66,7 +66,7 @@ struct brcmf_pcie_console { u32 base_addr, buf_addr, bufsize, read_idx;
  u32 scan_idx; u8 scan_line[8]; u8 scan_len; };
 struct brcmf_pcie_shared_info { u32 tcm_base_address; struct brcmf_pcie_console console; };
 struct brcmf_pciedev_info { enum brcmf_pcie_state state; struct pci_dev *pdev;
- struct brcmf_pcie_shared_info shared; bool fw_dead, reset_wanted; u32 recoveries; unsigned long recovery_window; };
+ size_t tcm_size; struct brcmf_pcie_shared_info shared; bool fw_dead, reset_wanted; u32 recoveries; unsigned long recovery_window; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct device *dev; struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
@@ -91,16 +91,16 @@ static void brcmf_bus_change_state(struct brcmf_bus *b, enum brcmf_bus_state s)
 { b->state = s; if (s == BRCMF_BUS_DOWN) state_downs++; }
 
 /* msgbuf side */
-struct brcmf_msgbuf { u32 ctl_stalls; bool ctl_completed; void *rx_pktids; u32 ioctl_resp_pktid,
- ioctl_resp_ret_len; int ioctl_resp_status; struct brcmf_pub *drvr; };
+struct brcmf_msgbuf { u32 ctl_stalls; bool ctl_completed; void *rx_pktids; struct sk_buff *ioctl_resp;
+ u32 ioctl_resp_ret_len; int ioctl_resp_status; struct brcmf_pub *drvr; };
 static int tx_error, reply;
 static u32 stall_calls, last_stalls;
 static void brcmf_bus_ctl_stall(struct brcmf_bus *b, u32 stalls) { (void)b; stall_calls++; last_stalls = stalls; }
-static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d, int i, uint c, void *b, uint l)
-{ (void)d; (void)i; (void)c; (void)b; (void)l; return tx_error; }
-static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m) { (void)m; return reply; }
 static struct sk_buff skb;
-static struct sk_buff *brcmf_msgbuf_get_pktid(void *d, void *p, u32 n) { (void)d; (void)p; (void)n; return &skb; }
+/* A request that is sent is answered with skb, as the completion hands it over. */
+static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d, int i, uint c, void *b, uint l)
+{ (void)i; (void)c; (void)b; (void)l; if (!tx_error && reply) ((struct brcmf_msgbuf *)d->proto->pd)->ioctl_resp = &skb; return tx_error; }
+static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m) { (void)m; return reply; }
 static void brcmu_pkt_buf_free_skb(struct sk_buff *s) { (void)s; }
 '''
 
@@ -116,6 +116,7 @@ static void reset(void)
 {
  memset(tcm, 0, sizeof(tcm)); link_down = false;
  memset(&devinfo, 0, sizeof(devinfo)); devinfo.pdev = &pdev; devinfo.state = BRCMFMAC_PCIE_STATE_UP;
+ devinfo.tcm_size = sizeof(tcm);
  devinfo.shared.tcm_base_address = SHARED; put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 0x10007);
  devinfo.shared.console.base_addr = CONS; devinfo.shared.console.buf_addr = BUF;
  devinfo.shared.console.bufsize = BUFSZ; put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, 0);
@@ -145,6 +146,9 @@ int main(void)
  /* Trap flag in shared RAM: dead at the first stall. */
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_TRAP); put32(SHARED + BRCMF_SHARED_TRAP_ADDR_OFFSET, 0x800);
  put32(0x800, 4); put32(0x804, 0x1234); stall(1); assert(died("trap in shared RAM")); cases++;
+ /* A trap record outside the TCM is not read; the firmware is still dead. */
+ reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_TRAP);
+ put32(SHARED + BRCMF_SHARED_TRAP_ADDR_OFFSET, sizeof(tcm) - 4); stall(1); assert(died("trap in shared RAM")); cases++;
  /* Assert only counts when the firmware was built with asserts. */
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_ASSERT); stall(1); assert(!crashes); cases++;
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_ASSERT | BRCMF_PCIE_SHARED_ASSERT_BUILT);
@@ -209,6 +213,7 @@ MUTATIONS = {
     'wanted-over-limit': ('pcie', '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n',
                           '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n'
                           '\tWRITE_ONCE(devinfo->reset_wanted, true);\n'),
+    'trap-bound': ('pcie', '\t\tif (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))', '\t\tif (true)'),
     'stall-reset': ('msgbuf', '\tmsgbuf->ctl_stalls = 0;\n', ''),
     'ring-full': ('msgbuf', '\t\tif (err == -ENOMEM)\n', '\t\tif (false)\n'),
 }
@@ -220,12 +225,13 @@ def main():
     parser.add_argument('--mutation', choices=sorted(MUTATIONS))
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text() for name in ('pcie', 'msgbuf')}
+    sources['pcie.h'] = (DRIVER / 'pcie.h').read_text()
     defines = ''.join(define(sources['pcie'], n) for n in (
         'BRCMF_PCIE_SHARED_ASSERT_BUILT', 'BRCMF_PCIE_SHARED_ASSERT', 'BRCMF_PCIE_SHARED_TRAP',
         'BRCMF_SHARED_FLAGS_OFFSET', 'BRCMF_SHARED_TRAP_ADDR_OFFSET', 'BRCMF_CONSOLE_WRITEIDX_OFFSET',
         'BRCMF_PCIE_CTL_STALL_MAX', 'BRCMF_PCIE_RECOVERY_MAX', 'BRCMF_PCIE_RECOVERY_WINDOW_S'))
     bodies = {
-        'pcie': ''.join(function(sources['pcie'], n) for n in (
+        'pcie': function(sources['pcie.h'], 'brcmf_pcie_tcm_range_valid') + ''.join(function(sources['pcie'], n) for n in (
             'brcmf_pcie_fw_died', 'brcmf_pcie_console_trapped', 'brcmf_pcie_ctl_stall')),
         'msgbuf': function(sources['msgbuf'], 'brcmf_msgbuf_query_dcmd_len'),
     }
