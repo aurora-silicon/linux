@@ -471,6 +471,11 @@ pub(super) const BUSY_WINDOW_NS: u64 = 200_000_000;
 /// A longer gap between reports with no long command in flight was idle: start over
 /// rather than average it in.
 pub(super) const BUSY_WINDOW_MAX_NS: u64 = 2_000_000_000;
+/// Inactive gap (after [`IDLE_HOLD_NS`] ends effort) long enough to forget the prior
+/// busy share so a new burst starts at the top CLPC column. Short enough to avoid
+/// diluting new bursts after real idle, yet longer than inter-frame gaps of paced
+/// low-fps workloads (e.g. 24-30 fps video or VRR, 25-42 ms).
+pub(super) const BUSY_IDLE_RESET_NS: u64 = 100_000_000;
 /// An unretired command that has been running continuously for this long saturates
 /// its engine and immediately lifts the busy share to 1000 permille, without waiting
 /// for it to retire or for the current window to end.
@@ -491,6 +496,7 @@ pub(super) const BUSY_LONG_COMMAND_NS: u64 = 50_000_000;
 /// stages retiring together, err toward a higher share, which is the safe direction.
 pub(super) struct BusyShare {
     start_ns: Option<u64>,
+    inactive_since: Option<u64>,
     retired_ns: [u64; crate::usage::NUM_ENGINES],
     in_flight_ns: [u64; crate::usage::NUM_ENGINES],
     below_top: bool,
@@ -500,20 +506,47 @@ impl BusyShare {
     pub(super) const fn new() -> Self {
         Self {
             start_ns: None,
+            inactive_since: None,
             retired_ns: [0; crate::usage::NUM_ENGINES],
             in_flight_ns: [0; crate::usage::NUM_ENGINES],
             below_top: false,
         }
     }
 
-    /// CLPC cleared GPU activity (forgetting its last share so a new burst starts
-    /// at the top column). Only called once the GPU is idle: restart the window so
-    /// the first report of the next burst re-baselines instead of closing a window
-    /// diluted by the idle gap, which would drop the burst off the top column.
+    /// Unconditionally resets the window and forgets any prior busy share (for
+    /// genuine idle expiry or teardown).
     pub(super) fn clear_active(&mut self) {
         self.start_ns = None;
+        self.inactive_since = None;
         self.in_flight_ns = [0; crate::usage::NUM_ENGINES];
         self.below_top = false;
+    }
+
+    /// Marks the GPU inactive after [`IDLE_HOLD_NS`] expires without wiping the
+    /// measurement window yet. Paced 24-30 fps streams resume well inside
+    /// [`BUSY_IDLE_RESET_NS`] and keep their window; longer idle gaps clear on
+    /// [`Self::resume`]. Idempotent while already inactive.
+    pub(super) fn note_inactive(&mut self, now_ns: u64) {
+        self.inactive_since.get_or_insert(now_ns);
+    }
+
+    pub(super) fn inactive_since(&self) -> Option<u64> {
+        self.inactive_since
+    }
+
+    /// Resumes activity at `now_ns` after [`Self::note_inactive`]. Returns `true`
+    /// when the inactive gap reached [`BUSY_IDLE_RESET_NS`] and the window was
+    /// cleared so the caller clears CLPC's cached share before reactivating.
+    pub(super) fn resume(&mut self, now_ns: u64) -> bool {
+        let Some(since) = self.inactive_since.take() else {
+            return false;
+        };
+        if now_ns.saturating_sub(since) >= BUSY_IDLE_RESET_NS {
+            self.clear_active();
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn below_top(&self) -> bool {
@@ -534,6 +567,7 @@ impl BusyShare {
         if !self.below_top {
             return None;
         }
+        self.inactive_since = None;
         self.start_ns = Some(now_ns);
         self.retired_ns = retired_ns;
         for (slot, &since) in self.in_flight_ns.iter_mut().zip(oldest_in_flight.iter()) {
@@ -577,6 +611,7 @@ impl BusyShare {
         retired_ns: [u64; crate::usage::NUM_ENGINES],
         oldest_in_flight: [u64; crate::usage::NUM_ENGINES],
     ) -> Option<u32> {
+        let _ = self.resume(now_ns);
         let long_in_flight = Self::is_long_in_flight(now_ns, oldest_in_flight);
         let Some(start) = self.start_ns else {
             self.start_ns = Some(now_ns);
@@ -957,6 +992,43 @@ mod tests {
     }
 
     #[test]
+    fn paced_low_fps_preserves_window_across_effort_clears() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        let mut retired = 0u64;
+        let mut reported = None;
+
+        // 24 fps light video/compositor (~42 ms period, 0.5 ms fragment work/frame):
+        // Effort::idle fires 16 ms after each frame, leaving a ~26 ms inactive gap
+        // (< BUSY_IDLE_RESET_NS). The 200 ms window must survive and close cleanly.
+        for frame in 0..8u64 {
+            let t = 1000 * NS_MS + frame * 42 * NS_MS;
+            assert!(!share.resume(t));
+            if let Some(p) = share.sample(t, [0, retired, 0], [0, 0, 0]) {
+                reported = Some((frame, p));
+            }
+            retired += 500_000;
+            // Idempotent note_inactive (Effort::idle calls set_effort_full(false) twice).
+            share.note_inactive(t + 16 * NS_MS);
+            share.note_inactive(t + 20 * NS_MS);
+            assert_eq!(share.inactive_since(), Some(t + 16 * NS_MS));
+        }
+        // Frame 5 is at t = 1210 ms (210 ms elapsed, 2.5 ms retired -> 11 permille).
+        assert_eq!(reported, Some((5, 11)));
+        assert!(share.below_top());
+
+        // A genuine idle gap (>= BUSY_IDLE_RESET_NS) clears the window so the next
+        // burst starts fresh at the top CLPC column instead of diluting the window.
+        let last_inactive = 1000 * NS_MS + 7 * 42 * NS_MS + 16 * NS_MS;
+        let next_burst = last_inactive + BUSY_IDLE_RESET_NS;
+        assert!(share.resume(next_burst));
+        assert!(!share.below_top());
+        assert_eq!(share.window_start(), None);
+        assert_eq!(share.sample(next_burst, [0, retired, 0], [0, 0, 0]), None);
+        assert_eq!(share.window_start(), Some(next_burst));
+    }
+
+    #[test]
     fn compute_waiters_lift_immediately_and_expire_while_streaming() {
         const NS_MS: u64 = 1_000_000;
         let mut effort = Effort::new();
@@ -990,6 +1062,7 @@ unsafe extern "C" {
     fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
     fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
     fn asahi_clpc_gpu_set_busy(gpu: *mut core::ffi::c_void, permille: core::ffi::c_uint);
+    fn asahi_clpc_gpu_clear_busy(gpu: *mut core::ffi::c_void);
 }
 
 /// DT-selected memory-demand provider. Its independent allocation outlives a
@@ -1025,6 +1098,11 @@ impl Demand {
     pub(super) fn set_busy(&self, permille: u32) {
         // SAFETY: the retained reference is live; NULL denotes no DT provider.
         unsafe { asahi_clpc_gpu_set_busy(self.0, permille.min(1000) as core::ffi::c_uint) };
+    }
+
+    pub(super) fn clear_busy(&self) {
+        // SAFETY: the retained reference is live; NULL denotes no DT provider.
+        unsafe { asahi_clpc_gpu_clear_busy(self.0) };
     }
 }
 

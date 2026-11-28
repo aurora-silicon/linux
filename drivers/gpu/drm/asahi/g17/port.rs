@@ -141,6 +141,7 @@ pub(super) struct Port {
     /// Mirrored from `busy` and `qos` for a lock-free fast path in `note_gpu_activity()`.
     busy_window_start: AtomicU64,
     busy_below_top: AtomicBool,
+    busy_inactive_since: AtomicU64,
     oldest_in_flight_any: AtomicU64,
     statistics_epoch: AtomicU64,
     last_submission_ns: AtomicU64,
@@ -236,6 +237,7 @@ impl Port {
                 busy <- new_spinlock!(super::power::BusyShare::new(), "g17::Port::busy"),
                 busy_window_start: AtomicU64::new(0),
                 busy_below_top: AtomicBool::new(false),
+                busy_inactive_since: AtomicU64::new(0),
                 oldest_in_flight_any: AtomicU64::new(0),
                 statistics_epoch: AtomicU64::new(0),
                 last_submission_ns: AtomicU64::new(0),
@@ -937,17 +939,48 @@ impl Port {
         self.submissions.load(Ordering::SeqCst)
     }
 
-    pub(super) fn set_effort_full(&self, full: bool) {
-        self.effort_full.store(full, Ordering::SeqCst);
-        if full {
-            self.demand.set_active(true);
-        } else {
-            let mut busy = self.busy.lock();
-            self.demand.set_active(false);
-            busy.clear_active();
+    fn resume_busy_if_inactive(&self, now_ns: u64) {
+        if self.busy_inactive_since.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let now_ns = super::now_ns().max(now_ns);
+        let mut busy = self.busy.lock();
+        if busy.resume(now_ns) {
+            self.demand.clear_busy();
             self.busy_window_start.store(0, Ordering::Relaxed);
             self.busy_below_top.store(false, Ordering::Relaxed);
         }
+        self.busy_inactive_since.store(0, Ordering::Release);
+    }
+
+    pub(super) fn set_effort_full(&self, full: bool) {
+        self.effort_full.store(full, Ordering::SeqCst);
+        if full {
+            self.resume_busy_if_inactive(super::now_ns());
+            self.demand.set_active(true);
+        } else {
+            let now = super::now_ns();
+            let mut busy = self.busy.lock();
+            self.demand.set_active(false);
+            if self.demand.has_provider() {
+                busy.note_inactive(now);
+                self.busy_inactive_since.store(
+                    busy.inactive_since().map_or(0, |s| s.max(1)),
+                    Ordering::Release,
+                );
+            }
+        }
+    }
+
+    pub(super) fn clear_effort_and_busy(&self) {
+        self.effort_full.store(false, Ordering::SeqCst);
+        let mut busy = self.busy.lock();
+        self.demand.set_active(false);
+        self.demand.clear_busy();
+        busy.clear_active();
+        self.busy_window_start.store(0, Ordering::Relaxed);
+        self.busy_below_top.store(false, Ordering::Relaxed);
+        self.busy_inactive_since.store(0, Ordering::Release);
     }
 
     /// The next statistics drain and reader discard what the decoder holds.
@@ -988,6 +1021,12 @@ impl Port {
         let oldest = self.qos.lock().oldest_in_flight();
         let now_ns = super::now_ns().max(now_ns);
         let mut busy = self.busy.lock();
+        if busy.inactive_since().is_some() {
+            if busy.resume(now_ns) {
+                self.demand.clear_busy();
+            }
+            self.busy_inactive_since.store(0, Ordering::Release);
+        }
         if let Some(permille) = busy.sample(now_ns, retired, oldest) {
             self.demand.set_busy(permille);
         }
@@ -1012,6 +1051,7 @@ impl Port {
         let mut busy = self.busy.lock();
         if let Some(permille) = busy.lift_saturated(now_ns, retired, oldest) {
             self.demand.set_busy(permille);
+            self.busy_inactive_since.store(0, Ordering::Release);
         }
         self.busy_window_start
             .store(busy.window_start().map_or(0, |s| s.max(1)), Ordering::Relaxed);
@@ -1051,6 +1091,7 @@ impl Port {
             self.statistics_epoch.fetch_add(1, Ordering::Release);
         }
         self.last_submission_ns.store(now, Ordering::Relaxed);
+        self.resume_busy_if_inactive(now);
         self.demand.set_active(true);
         self.report_busy(now);
     }

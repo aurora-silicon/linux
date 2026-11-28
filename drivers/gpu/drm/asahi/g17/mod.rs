@@ -851,7 +851,7 @@ impl Drop for Firmware {
             secondary.stop();
         }
         self.primary.stop();
-        self.port.set_effort_full(false);
+        self.port.clear_effort_and_busy();
         self.primary.state.shared.set_full_effort_published(false);
         self.pool.stop_after_firmware();
         // RTKit destruction releases the mailbox power references. Clear the bridge while

@@ -31,7 +31,7 @@ def test_g17_busy_share():
     power = (ROOT / 'drivers/gpu/drm/asahi/g17/power.rs').read_text()
     consts = '\n'.join(
         re.search(r'^pub\(super\) const ' + name + r': u64 = [^\n]+$', power, re.M).group(0)
-        for name in ('BUSY_WINDOW_NS', 'BUSY_WINDOW_MAX_NS', 'BUSY_LONG_COMMAND_NS'))
+        for name in ('BUSY_WINDOW_NS', 'BUSY_WINDOW_MAX_NS', 'BUSY_IDLE_RESET_NS', 'BUSY_LONG_COMMAND_NS'))
     struct_def = item(power, 'pub(super) struct BusyShare {')
     impl_def = item(power, 'impl BusyShare {')
     prod = f'{consts}\n{struct_def}\n{impl_def}\n'
@@ -118,10 +118,10 @@ fn main() {
     assert_eq!(misc.sample(5000 * MS, [0, 120 * MS, 150 * MS], [0, 0, 5000 * MS]), None);
     assert_eq!(misc.sample(8000 * MS, [0, 120 * MS, 150 * MS], [0, 0, 5000 * MS]), Some(1000));
 
-    // Scenario 5: steady 600 permille work until 1400 ms, idle (CLPC cleared), then a
-    // new burst at 2000 ms. Closing [1300, 2000] would report a diluted 85 permille
-    // (60 ms in 700 ms); the first submission re-baselines instead and nothing is
-    // reported until a fresh 200 ms window of the new burst completes.
+    // Scenario 5: steady 600 permille work until 1400 ms, genuine idle (>= BUSY_IDLE_RESET_NS),
+    // then a new burst at 2000 ms. Closing [1300, 2000] would report a diluted 85 permille
+    // (60 ms in 700 ms); resume() clears the window so the first submission re-baselines
+    // instead and nothing is reported until a fresh 200 ms window of the new burst completes.
     let mut burst = BusyShare::new();
     assert_eq!(burst.sample(900 * MS, [0, 0, 0], [0, 0, 0]), None);
     let mut idle_events = Vec::new();
@@ -130,7 +130,8 @@ fn main() {
         assert_eq!(p, Some(600));
         idle_events.push((t, p));
     }
-    burst.clear_active();
+    burst.note_inactive(1416 * MS);
+    assert!(burst.resume(2000 * MS));
     assert!(!burst.below_top());
     for (t, frag) in [(2000, 300), (2048, 328), (2100, 360), (2148, 388), (2196, 417), (2200, 420)] {
         let p = burst.sample(t * MS, [0, frag * MS, 0], [0, 0, 0]);
@@ -140,14 +141,34 @@ fn main() {
     }
     assert!(burst.below_top());
 
+    // Scenario 6: paced 24 fps light work (42 ms period, 0.5 ms GPU/frame). Effort::idle
+    // fires 16 ms after each frame, leaving a 26 ms inactive gap (< BUSY_IDLE_RESET_NS).
+    // BusyShare must preserve its 200 ms window across those brief clears and report ~11 permille.
+    let mut paced = BusyShare::new();
+    let mut paced_events = Vec::new();
+    let mut frag_ns = 0u64;
+    for frame in 0..18u64 {
+        let t_ms = 1000 + frame * 42;
+        assert!(!paced.resume(t_ms * MS), "brief inter-frame gap must not reset BusyShare");
+        let p = paced.sample(t_ms * MS, [0, frag_ns, 0], [0, 0, 0]);
+        paced_events.push((t_ms, p));
+        frag_ns += 500_000;
+        paced.note_inactive((t_ms + 16) * MS);
+    }
+    assert!(paced.below_top(), "24 fps light frames must close their 200 ms window");
+    assert!(paced_events.iter().any(|&(_, p)| p == Some(11)));
+
     println!("EVENTS:1200={r0},1400={r1},1600={r2},1810={r3},2010={r4},2210={r5},2410={r6}");
     let idle: Vec<String> =
         idle_events.iter().map(|(t, p)| format!("{t}={}", p.map_or(-1, i64::from))).collect();
     println!("IDLE:{}", idle.join(","));
+    let paced_out: Vec<String> =
+        paced_events.iter().map(|(t, p)| format!("{t}={}", p.map_or(-1, i64::from))).collect();
+    println!("PACED:{}", paced_out.join(","));
 }
 '''
     rustc = os.environ.get('RUSTC', 'rustc')
-    events = idle_events = None
+    events = idle_events = paced_events = None
     with tempfile.TemporaryDirectory(prefix='asahi-g17-busy-') as tmp:
         root = Path(tmp)
         for name, text in [
@@ -166,9 +187,11 @@ fn main() {
              harness.replace('if elapsed > BUSY_WINDOW_MAX_NS && !long_in_flight {',
                              'if false && elapsed > BUSY_WINDOW_MAX_NS && !long_in_flight {')),
             ('g17-idle-keeps-window',
-             harness.replace('self.start_ns = None;\n        self.in_flight_ns = [0; crate::usage::NUM_ENGINES];\n'
-                             '        self.below_top = false;',
-                             'self.below_top = false;')),
+             harness.replace('if now_ns.saturating_sub(since) >= BUSY_IDLE_RESET_NS {',
+                             'if false && now_ns.saturating_sub(since) >= BUSY_IDLE_RESET_NS {')),
+            ('g17-brief-idle-resets-window',
+             harness.replace('if now_ns.saturating_sub(since) >= BUSY_IDLE_RESET_NS {',
+                             'if true || now_ns.saturating_sub(since) >= BUSY_IDLE_RESET_NS {')),
         ]:
             assert name == 'fixed' or text != harness, 'stale mutation: ' + name
             src = root / (name + '.rs')
@@ -180,18 +203,21 @@ fn main() {
             if name == 'fixed':
                 assert run.returncode == 0, run.stderr
                 lines = run.stdout.strip().splitlines()
-                assert len(lines) == 2 and lines[0].startswith('EVENTS:') \
-                    and lines[1].startswith('IDLE:'), lines
+                assert len(lines) == 3 and lines[0].startswith('EVENTS:') \
+                    and lines[1].startswith('IDLE:') \
+                    and lines[2].startswith('PACED:'), lines
                 events = [tuple(int(x) for x in pair.split('='))
                           for pair in lines[0].removeprefix('EVENTS:').split(',')]
                 idle_events = [tuple(int(x) for x in pair.split('='))
                                for pair in lines[1].removeprefix('IDLE:').split(',')]
+                paced_events = [tuple(int(x) for x in pair.split('='))
+                                for pair in lines[2].removeprefix('PACED:').split(',')]
                 print('PASS: g17 BusyShare (in-flight long command, early lift, solo recheck, '
-                      'non-double-counting, new burst after idle)')
+                      'non-double-counting, new burst after idle, 24 fps brief idle)')
             else:
                 assert run.returncode != 0, name
                 print('PASS negative control:', name)
-    return events, idle_events
+    return events, idle_events, paced_events
 
 
 def strip_dts_comments(text):
@@ -247,7 +273,7 @@ def test_t6050_dt_negative_controls(t6050_dts):
 
 
 def main():
-    g17_events, g17_idle_events = test_g17_busy_share()
+    g17_events, g17_idle_events, g17_paced_events = test_g17_busy_share()
     source = (ROOT / 'drivers/soc/apple/clpc.c').read_text()
     header = (ROOT / 'include/linux/soc/apple/pmc.h').read_text()
     rail_shift = re.search(r'^#define APPLE_PMC_RAIL_SHIFT\(rail\).*$', header, re.M).group(0)
@@ -282,8 +308,13 @@ def main():
         'static const struct { unsigned long ms; unsigned int permille; } g17_long_events[] = {'
         + ', '.join(f'{{{t}, {p}}}' for t, p in g17_events) + '};\n'
         'static const struct { unsigned long ms; int permille; } g17_idle_events[] = {'
-        + ', '.join(f'{{{t}, {p}}}' for t, p in g17_idle_events) + '};\n')
+        + ', '.join(f'{{{t}, {p}}}' for t, p in g17_idle_events) + '};\n'
+        'static const struct { unsigned long ms; int permille; } g17_paced_events[] = {'
+        + ', '.join(f'{{{t}, {p}}}' for t, p in g17_paced_events) + '};\n')
     methods = '\n'.join(item(source, s) for s in [
+        'void apple_clpc_gpu_set_active(',
+        'void apple_clpc_gpu_set_busy(',
+        'void apple_clpc_gpu_clear_busy(',
         'static unsigned int apple_clpc_vote(', 'static u32 apple_clpc_floor(',
         'static bool apple_clpc_gpu_streaming(',
         'static bool apple_clpc_gpu_dense_step(',
@@ -317,6 +348,7 @@ struct device;
 #define APPLE_CLPC_GPU_BACKOFF_MS 100
 #define HZ 1000
 #define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a,b) ((a) < (b) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define GENMASK(h,l) (((1u << ((h)-(l)+1))-1) << (l))
 #define BIT(n) (1u << (n))
@@ -325,14 +357,17 @@ struct device;
 #define time_after(a,b) ((long)((a)-(b)) > 0)
 #define time_before(a,b) ((long)((a)-(b)) < 0)
 #define msecs_to_jiffies(ms) (ms)
+#define system_freezable_power_efficient_wq NULL
+static void mod_delayed_work(void *wq, void *w, unsigned long d) { (void)wq; (void)w; (void)d; }
 static int warned, dt_warned;
 #define dev_warn_once(d, ...) ((void)(d), warned++)
 #define dev_warn(d, ...) ((void)(d), dt_warned++)
 enum apple_clpc_rail { APPLE_CLPC_DCS, APPLE_CLPC_SOC, APPLE_CLPC_RAILS };
 ''' + types + r'''
 struct apple_clpc_gpu {
- int lock; bool active; u64 sequence;
+ int lock; bool active; u64 updated_ns; u64 sequence;
  unsigned int busy; bool busy_valid; unsigned int level; unsigned long level_since;
+ void *wake;
 };
 struct apple_clpc_ane { int lock; bool active, pending; };
 #define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
@@ -671,8 +706,8 @@ static void check_t6041_long_in_flight(void) {
 }
 
 // End-to-end: g17 BusyShare's samples (-1: no report) for steady 600 permille
-// work, an idle gap in which the GPU clears its activity (apple_clpc_gpu_set_active
-// false also clears busy_valid), and a new burst 600 ms later. The new burst starts
+// work, a genuine idle gap in which the GPU clears its activity and busy share
+// (via apple_clpc_gpu_clear_busy), and a new burst 600 ms later. The new burst starts
 // at the top (0x35) and stays there until a fresh 200 ms window reports; the
 // diluted 85 permille a stale window would report drops it to 0x01 at once.
 static void check_t6041_idle_burst(void) {
@@ -689,17 +724,17 @@ static void check_t6041_idle_burst(void) {
   jiffies = g17_idle_events[i].ms; apple_clpc_sample(&c);
  }
  assert(gpu.level == 2);
- // Idle: the GPU clears its activity and CLPC forgets the share.
- gpu.active = false; gpu.busy_valid = false;
+ // Idle: after genuine idle (>= BUSY_IDLE_RESET_NS), g17 clears both activity and busy.
+ apple_clpc_gpu_set_active(&gpu, false);
+ apple_clpc_gpu_clear_busy(&gpu);
  for (jiffies = 1416; jiffies < 2000; jiffies += 4)
   apple_clpc_sample(&c);
  assert(published == 0);
- gpu.active = true;
+ apple_clpc_gpu_set_active(&gpu, true);
  for (jiffies = 2000; jiffies <= 2200; jiffies += 4) {
   if (i < n && g17_idle_events[i].ms == jiffies) {
-   if (g17_idle_events[i].permille >= 0) {
-    gpu.busy = g17_idle_events[i].permille; gpu.busy_valid = true;
-   }
+   if (g17_idle_events[i].permille >= 0)
+    apple_clpc_gpu_set_busy(&gpu, g17_idle_events[i].permille);
    i++;
   }
   assert(gpu.busy_valid == (jiffies >= 2200));
@@ -708,10 +743,38 @@ static void check_t6041_idle_burst(void) {
  }
  assert(i == n);
  // The stale window's diluted share would have dropped the new burst at once.
- gpu.active = false; gpu.busy_valid = false; jiffies = 2400; apple_clpc_sample(&c);
- gpu.active = true; gpu.busy = 85; gpu.busy_valid = true; jiffies = 3000;
- apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
- gpu.active = false; jiffies = 3100; apple_clpc_sample(&c); assert(published == 0);
+ apple_clpc_gpu_set_active(&gpu, false); apple_clpc_gpu_clear_busy(&gpu);
+ jiffies = 2400; apple_clpc_sample(&c);
+ apple_clpc_gpu_set_active(&gpu, true); apple_clpc_gpu_set_busy(&gpu, 85);
+ jiffies = 3000; apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
+ apple_clpc_gpu_set_active(&gpu, false); jiffies = 3100; apple_clpc_sample(&c); assert(published == 0);
+}
+
+// End-to-end: paced 24 fps light work (42 ms period). Every frame clears activity
+// after 16 ms (Effort::idle) and resumes 26 ms later (inside CLPC's 32 ms vote
+// hold). Keeping busy_valid across set_active(false) lets g17's 200 ms window
+// drop CLPC from 0x35 (level 3) to 0x01 (level 0) after APPLE_CLPC_GPU_DOWN_MS.
+static void check_t6041_paced_24fps(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t6041_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ size_t n = ARRAY_SIZE(g17_paced_events);
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ assert(n == 18 && g17_paced_events[0].ms == 1000);
+ for (size_t i = 0; i < n; i++) {
+  unsigned long start = g17_paced_events[i].ms;
+  unsigned long end = (i + 1 < n) ? g17_paced_events[i + 1].ms : start + 42;
+  apple_clpc_gpu_set_active(&gpu, true);
+  if (g17_paced_events[i].permille >= 0)
+   apple_clpc_gpu_set_busy(&gpu, g17_paced_events[i].permille);
+  for (jiffies = start; jiffies < end; jiffies += 4) {
+   if (jiffies >= start + 16)
+    apple_clpc_gpu_set_active(&gpu, false);
+   apple_clpc_sample(&c);
+  }
+ }
+ // By frame 17 (~1714..1756 ms), 200 ms window + 400 ms down-step + 32 ms fabric hold
+ // have all elapsed: floor must have dropped to DCS 1 / fabric 0 (0x01).
+ assert(gpu.busy_valid && gpu.level == 0 && published == 0x01);
 }
 
 // T8132's G16 firmware keeps graphics powered while the GPU idles: the
@@ -864,6 +927,7 @@ int main(void) {
  check_t6050_busy();
  check_t6041_long_in_flight();
  check_t6041_idle_burst();
+ check_t6041_paced_24fps();
  check_t8132();
  check_t6041(&apple_clpc_hw_t6041);
  check_t6041(&t6041_dt_hw);
@@ -904,6 +968,8 @@ int main(void) {
                                               'if (true || gpu->busy >= hw->gpu_busy_top)')),
             ('gpu-no-share-uses-table', code.replace('if (!gpu->busy_valid || gpu->busy >= hw->gpu_busy_top)',
                                                      'if (gpu->busy >= hw->gpu_busy_top)')),
+            ('clpc-set-active-clears-busy', code.replace('\tgpu->active = active;\n',
+                                                         '\tgpu->active = active;\n\tif (!active)\n\t\tgpu->busy_valid = false;\n')),
             ('gpu-busy-without-dt', code.replace('bool has_busy = hw->gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1];',
                                                  'bool has_busy = true;')),
             ('retain-at-idle', code.replace('vote->state = 0;', '')),
