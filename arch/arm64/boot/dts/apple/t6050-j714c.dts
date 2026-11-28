@@ -46,6 +46,7 @@
 			/* Scanned out by the internal DCP, handed off or not. */
 			display = <&dcp>;
 			status = "disabled";
+			panel = <&panel>;
 		};
 	};
 };
@@ -329,6 +330,15 @@
 };
 
 #include "t6050-peripherals.dtsi"
+
+&dcp {
+	/* Physical dimensions from the 14.2-inch J714s panel. */
+	panel: panel {
+		compatible = "apple,panel-j714", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+	};
+};
 
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s. iBoot loads its firmware and the
