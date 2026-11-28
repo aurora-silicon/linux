@@ -892,6 +892,7 @@ struct apple_dcp {
 	/* The driver holds the sink HPD low itself; hpd_mutex. */
 	bool typec_hpd_held;
 	bool use_timestamps;
+	bool vrr_capable;
 	bool vrr_enabled;
 	struct {
 		/* Pins the AV service and tracks HDR10 metadata for its link. */

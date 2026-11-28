@@ -300,6 +300,9 @@ struct dcp_wait_cookie {
 	struct completion done;
 	u32 status;
 	bool replied;
+	bool vrr_refused;
+	bool vrr_enable;
+	bool vrr_was_enabled;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -4244,13 +4247,25 @@ static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 				     void *cookie)
 {
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (!out || get_unaligned_le32(out)) {
-		struct dcp_wait_cookie *wait = cookie;
+	struct dcp_wait_cookie *wait = cookie;
+	u32 st = out ? get_unaligned_le32(out) : ~0U;
 
-		wait->status = -EOPNOTSUPP;
-		complete(&wait->done);
-		kref_put(&wait->refcount, release_wait_cookie);
-		return;
+	if (st) {
+		WRITE_ONCE(wait->vrr_refused, true);
+		if (!dcp_has_panel(dcp) || READ_ONCE(wait->vrr_was_enabled)) {
+			if (dcp_has_panel(dcp))
+				dev_warn(dcp->dev,
+					 "adaptive sync %s refused (%#x); keeping active state\n",
+					 wait->vrr_enable ? "update" : "disable",
+					 st);
+			wait->status = -EOPNOTSUPP;
+			complete(&wait->done);
+			kref_put(&wait->refcount, release_wait_cookie);
+			return;
+		}
+		dev_warn_once(dcp->dev,
+			      "adaptive sync parameter refused (%#x); keeping fixed refresh\n",
+			      st);
 	}
 #endif
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
@@ -4260,6 +4275,7 @@ static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 				  void *cookie)
 {
+	struct dcp_wait_cookie *wait = cookie;
 	struct dcp_set_parameter_dcp param = {
 		.param =
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
@@ -4279,6 +4295,8 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 #endif
 	};
 
+	wait->vrr_enable = min_vrr != 0;
+	wait->vrr_was_enabled = READ_ONCE(dcp->vrr_enabled);
 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_adaptive_sync,
 			      cookie);
 }
@@ -4296,6 +4314,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
 	bool keep_mode = false;
+	bool vrr_sent = false;
 	int ret;
 
 	if (!mode)
@@ -4376,28 +4395,39 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			cmode->range, mode->vrr);
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	/*
-	 * After a V27 sleep the panel's firmware brings its link and its mode back
-	 * itself once frames arrive; macOS sends no mode set then, and one
-	 * sent before the link is up waits out the firmware's timeout.
-	 */
-	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
-		    dcp->mode.color_mode_id == mode->color_mode_id &&
-		    dcp->mode.timing_mode_id == mode->timing_mode_id;
-	/*
-	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
-	 * has reported the panel, which it does after the open.
-	 */
-	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
-		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
-						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
-			dev_warn(dcp->dev, "V27 wake: panel video interface not open after %u ms\n",
-				 V27_WAKE_VIDEO_MS);
-		else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
-						      msecs_to_jiffies(V27_WAKE_HOTPLUG_MS)))
-			dev_warn(dcp->dev, "V27 wake: no hotplug report %u ms after the panel's open\n",
-				 V27_WAKE_HOTPLUG_MS);
-		keep_mode = false;
+	{
+		bool wake_ready;
+
+		/*
+		 * After a V27 sleep the panel's firmware brings its link and
+		 * its mode back itself once frames arrive; macOS sends no mode
+		 * set then, and one sent before the link is up waits out the
+		 * firmware's timeout.
+		 */
+		wake_ready = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false);
+		keep_mode = wake_ready &&
+			    dcp->mode.color_mode_id == mode->color_mode_id &&
+			    dcp->mode.timing_mode_id == mode->timing_mode_id &&
+			    !(mode->vrr && crtc_state->vrr_enabled);
+		/*
+		 * Firmware 27.2: wait until the panel's video interface is
+		 * open again and the firmware has reported the panel, even
+		 * when VRR reprogramming clears keep_mode.
+		 */
+		if (wake_ready && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+			unsigned long video_wait = msecs_to_jiffies(V27_WAKE_VIDEO_MS);
+			unsigned long hotplug_wait = msecs_to_jiffies(V27_WAKE_HOTPLUG_MS);
+
+			if (!wait_for_completion_timeout(&dcp->v27_wake_video, video_wait))
+				dev_warn(dcp->dev,
+					 "V27 wake: panel video interface not open after %u ms\n",
+					 V27_WAKE_VIDEO_MS);
+			else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug, hotplug_wait))
+				dev_warn(dcp->dev,
+					 "V27 wake: no hotplug report %u ms after the panel's open\n",
+					 V27_WAKE_HOTPLUG_MS);
+			keep_mode = false;
+		}
 	}
 #endif
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
@@ -4456,6 +4486,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 				      crtc_state->vrr_enabled && mode->vrr ? mode->min_vrr : 0)) != -EOPNOTSUPP) {
 		cookie->status = ret;
 		paired = true;
+		vrr_sent = !ret;
 		if (!ret)
 			crtc_state->color_mgmt_changed = true;
 		complete_set_digital_out_mode(dcp, NULL, cookie);
@@ -4468,14 +4499,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 #endif
 	if ((mode->vrr || dcp->vrr_enabled) &&
 	    dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		vrr_sent = true;
 		dcp_set_adaptive_sync(dcp,
 				      mode->vrr && crtc_state->vrr_enabled ?
 				      mode->min_vrr : 0,
 				      cookie);
-	else
+	} else {
 		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 					 complete_set_digital_out_mode, cookie);
+	}
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -4536,8 +4569,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return ret;
 	}
 #endif
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (!paired && READ_ONCE(cookie->vrr_refused) &&
+	    (!dcp_has_panel(dcp) || READ_ONCE(cookie->vrr_was_enabled))) {
+		ret = (int)READ_ONCE(cookie->status);
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return ret ?: -EOPNOTSUPP;
+	}
+#endif
+	dcp->vrr_enabled = vrr_sent && mode->vrr && crtc_state->vrr_enabled &&
+			   !READ_ONCE(cookie->vrr_refused);
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))

@@ -2376,6 +2376,18 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return modes;
 }
+
+static bool dcp_modes_have_vrr(const struct dcp_display_mode *modes,
+			       unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		if (modes[i].vrr)
+			return true;
+	return false;
+}
+
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	/* H17P external catalogs are fenced by their connection receipt. */
@@ -2385,6 +2397,7 @@ void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
 	dcp->modes_provisional = false;
+	WRITE_ONCE(dcp->vrr_capable, false);
 }
 
 bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
@@ -2397,6 +2410,7 @@ bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *ro
 		dcp->modes_generation++;
 		dcp->modes_admitted = false;
 		dcp->modes_provisional = false;
+		WRITE_ONCE(dcp->vrr_capable, false);
 	}
 	return true;
 }
@@ -2449,6 +2463,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = true;
 	dcp->modes_provisional = true;
+	WRITE_ONCE(dcp->vrr_capable, dcp_modes_have_vrr(modes, count));
 }
 
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
@@ -2512,7 +2527,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->pq_dsc = READ_ONCE(dcp->iomfb_template_pq) &&
 			      !dcp_has_panel(dcp);
 	}
-	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+				       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP &&
 	    smp_load_acquire(&dcp->dptxport[0].tile_hint)) {
@@ -2566,6 +2582,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = !ret;
 	dcp->modes_provisional = false;
+	WRITE_ONCE(dcp->vrr_capable, !ret && dcp_modes_have_vrr(modes, nr_modes));
 	/* A fresh catalog replaced one adopted across a route move. */
 	if (!ret && provisional && dcp->connector && dcp->dev &&
 	    dcp_modes_for_connector(dcp, dcp->connector) &&
@@ -2688,6 +2705,7 @@ void dcp_modes_release(void *data)
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+	WRITE_ONCE(dcp->vrr_capable, false);
 	kfree(dcp->modes);
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
@@ -3687,15 +3705,37 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
+static void dcp_crtc_prepare_hdr(struct apple_dcp *dcp)
+{
+	if (dcp->color_req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+	    !dcp_hdr_output_supported(dcp))
+		dcp_hdr_infoframe_stop(dcp);
+	dcp_hdr_metadata_forget(dcp);
+}
+
+static bool dcp_color_request_equal(const struct dcp_color_request *a,
+				    const struct dcp_color_request *b)
+{
+	return a->eotf == b->eotf && a->colorspace == b->colorspace &&
+	       a->color_format == b->color_format &&
+	       a->broadcast_rgb == b->broadcast_rgb &&
+	       a->max_bpc == b->max_bpc && a->allow_hdr == b->allow_hdr &&
+	       a->allow_dsc == b->allow_dsc &&
+	       a->allow_unsafe_sdr == b->allow_unsafe_sdr &&
+	       a->default_rgb == b->default_rgb;
+}
+
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 			    struct drm_atomic_commit *commit)
 {
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
-	struct drm_crtc_state *crtc_state;
+	struct drm_crtc_state *crtc_state, *old_crtc_state;
+	struct dcp_color_request color_req;
 	unsigned int action;
 	int ret = -EIO;
-	bool modeset;
+	bool modeset, pq_requested, output_edr, was_valid, vrr_only;
+	bool was_paired, preserve_valid;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode fixed;
@@ -3755,16 +3795,29 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return -EAGAIN;
 	}
 
-	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
-	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
-	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
-			  dcp_crtc_bt2020(dcp, crtc, commit);
-	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
-	if (dcp->color_req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
-	    !dcp_hdr_output_supported(dcp))
-		dcp_hdr_infoframe_stop(dcp);
-	dcp_hdr_metadata_forget(dcp);
-	dcp_mode_begin(&dcp->mode_state);
+	old_crtc_state = drm_atomic_get_old_crtc_state(commit, crtc);
+	dcp_crtc_color_request(dcp, crtc, commit, &color_req);
+	pq_requested = color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
+	output_edr = pq_requested && dcp_panel_edr_supported(dcp) &&
+		     dcp_crtc_bt2020(dcp, crtc, commit);
+	pq_requested &= dcp_hdr_output_supported(dcp);
+	vrr_only = old_crtc_state &&
+		   old_crtc_state->active && crtc_state->active &&
+		   !crtc_state->active_changed &&
+		   !crtc_state->connectors_changed &&
+		   drm_mode_equal(&old_crtc_state->mode, &crtc_state->mode) &&
+		   old_crtc_state->vrr_enabled != crtc_state->vrr_enabled &&
+		   dcp_color_request_equal(&color_req, &dcp->color_req) &&
+		   pq_requested == dcp->pq_requested &&
+		   output_edr == dcp->output_edr;
+	was_paired = READ_ONCE(dcp->peer_frames.active);
+	dcp->color_req = color_req;
+	dcp->pq_requested = pq_requested;
+	dcp->output_edr = output_edr;
+	was_valid = dcp_mode_begin(&dcp->mode_state);
+	vrr_only = vrr_only && was_valid;
+	if (!vrr_only)
+		dcp_crtc_prepare_hdr(dcp);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		ret = iomfb_modeset_v12_3(dcp, crtc_state);
@@ -3796,9 +3849,20 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 			  dcp->fw_compat);
 		break;
 	}
+	if (vrr_only && !ret)
+		dcp_crtc_prepare_hdr(dcp);
 
-	action = dcp_mode_finish(&dcp->mode_state, !ret, dcp->connector ?
-				&dcp->connector->connected : NULL);
+	/*
+	 * A refused property-only VRR change skips set_digital_out_mode() and
+	 * keeps the working timing and confirmed VRR state intact, so later
+	 * plane-only flips continue to submit.
+	 */
+	preserve_valid = vrr_only && ret == -EOPNOTSUPP &&
+			 dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			 (!was_paired || READ_ONCE(dcp->peer_frames.active));
+	action = dcp_mode_finish(&dcp->mode_state, !ret || preserve_valid,
+				 dcp->connector ? &dcp->connector->connected :
+				 NULL);
 	/* A successful mode set makes the CRTC owner of this Type-C session. */
 	if (!ret && dcp_is_typec_output(dcp)) {
 		scoped_guard(mutex, &dcp->hpd_mutex)

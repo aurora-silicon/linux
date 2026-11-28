@@ -20,16 +20,23 @@ enum dcp_hotplug_action {
 	DCP_HOTPLUG_NOTIFY = BIT(1),
 };
 
-static inline void dcp_mode_begin(struct dcp_mode_state *state)
+/*
+ * Start a mode set and return whether a mode was valid immediately before
+ * clearing validity and any prior invalidation under the state lock.
+ */
+static inline bool dcp_mode_begin(struct dcp_mode_state *state)
 {
 	unsigned long flags;
+	bool was_valid;
 
 	spin_lock_irqsave(&state->lock, flags);
+	was_valid = state->valid;
 	state->valid = false;
 	state->changing = true;
 	state->invalidated = false;
 	state->hotplug_pending = false;
 	spin_unlock_irqrestore(&state->lock, flags);
+	return was_valid;
 }
 
 /* For a pipe whose firmware keeps its own mode state (T6030 14.7). */

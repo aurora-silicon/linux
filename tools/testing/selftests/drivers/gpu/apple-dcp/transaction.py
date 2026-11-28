@@ -46,7 +46,7 @@ def controls(ROOT):
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
      struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
-     int modes_lock; unsigned long long modes_generation; bool modes_admitted,modes_provisional;
+     int modes_lock; unsigned long long modes_generation; bool modes_admitted,modes_provisional,vrr_capable;
      struct { int iomfb_method_profile; } hw;
      /* Thunderbolt DP IN events queued for the DPTX port (dcp_tb_events_retire()) */
      int tb_event_lock,tb_event_work; unsigned long tb_events; unsigned long long tb_event_generation;
