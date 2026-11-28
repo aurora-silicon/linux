@@ -231,6 +231,43 @@ static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
 				      struct syncobj_wait_entry *wait);
 
 /*
+ * Check whether every predecessor of a timeline chain node is already
+ * signaled using only monotonic flag checks (no driver callbacks, safe under
+ * syncobj->lock). A prior node whose wait was previously bypassed by
+ * drm_syncobj_direct_wait_fence() never had dma_fence_signal() called on the
+ * chain wrapper itself, even though its contained fence and earlier nodes are
+ * already signaled.
+ */
+static bool drm_syncobj_chain_prev_signaled(struct dma_fence *prev)
+{
+	unsigned int steps = 0;
+
+	while (prev) {
+		struct dma_fence_chain *prev_chain;
+		struct dma_fence *next;
+
+		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &prev->flags)) {
+			dma_fence_put(prev);
+			return true;
+		}
+		prev_chain = to_dma_fence_chain(prev);
+		if (!prev_chain || !prev_chain->fence ||
+		    !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT,
+			      &prev_chain->fence->flags) ||
+		    ++steps > 8) {
+			dma_fence_put(prev);
+			return false;
+		}
+		rcu_read_lock();
+		next = dma_fence_get_rcu_safe(&prev_chain->prev);
+		rcu_read_unlock();
+		dma_fence_put(prev);
+		prev = next;
+	}
+	return true;
+}
+
+/*
  * A chain node is the conjunction of its contained fence and its predecessor.
  * Once the predecessor is signaled it remains so, making the contained fence
  * an equivalent wait target. Waiting on it directly avoids the chain's
@@ -251,16 +288,8 @@ static struct dma_fence *drm_syncobj_direct_wait_fence(struct dma_fence *fence)
 	rcu_read_lock();
 	prev = dma_fence_get_rcu_safe(&chain->prev);
 	rcu_read_unlock();
-	/*
-	 * The core bit is monotonic and avoids polling another fence while the
-	 * syncobj spinlock may be held. A logically complete but not yet signaled
-	 * predecessor merely keeps the conservative chain wait.
-	 */
-	if (prev && !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &prev->flags)) {
-		dma_fence_put(prev);
+	if (!drm_syncobj_chain_prev_signaled(prev))
 		return fence;
-	}
-	dma_fence_put(prev);
 
 	contained = dma_fence_get(chain->fence);
 	dma_fence_put(fence);
