@@ -1248,7 +1248,8 @@ mod tests {
                     endpoint: 0,
                 },
                 packets: [KVec::new(), KVec::new(), KVec::new()],
-                stream <- new_mutex!(Stream::default()),
+                stream <- new_mutex!(Stream::new()),
+                idle_work <- new_delayed_work!("Control::idle_work"),
             }),
             GFP_KERNEL,
         )?;
