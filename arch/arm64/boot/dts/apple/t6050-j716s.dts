@@ -41,6 +41,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
@@ -527,8 +529,23 @@
 	status = "okay";
 };
 
+/* The MTP and its DockChannel FIFO, which carry the keyboard and trackpad */
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
 /* The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO */
 &mtp_dockchannel {
+	status = "okay";
+
 	mtp_hid: input@8000 {
 		compatible = "apple,dockchannel-hid";
 		reg = <0x8000 0x1000>, <0xc000 0x1000>,
@@ -570,3 +587,6 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0x76). */
+#include "t6050-isp.dtsi"

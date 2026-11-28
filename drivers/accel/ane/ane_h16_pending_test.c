@@ -328,4 +328,5 @@ static struct kunit_suite pending_suite = {
 };
 
 kunit_test_suite(pending_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple ANE pending requests");
 MODULE_LICENSE("Dual MIT/GPL");

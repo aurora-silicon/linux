@@ -77,7 +77,14 @@ static void *vb2_plane_vaddr(struct vb2_buffer *b,int p){(void)p;return b->cpu;}
 static unsigned long vb2_get_plane_payload(struct vb2_buffer *b,unsigned int p){(void)b;(void)p;return 1UL<<20;}
 static struct vb2_v4l2_buffer *current_src,*current_dst;
 static struct vb2_v4l2_buffer *v4l2_m2m_next_src_buf(void *m){(void)m;return current_src;}
-struct v4l2_ctrl {unsigned int id; unsigned int elems; union {void *p;} p_cur;};
+struct device;
+struct v4l2_ctrl {unsigned int id; unsigned int elems, elem_size; union {void *p;} p_cur;};
+static void v4l2_ctrl_lock(struct v4l2_ctrl *c){(void)c;}
+static void v4l2_ctrl_unlock(struct v4l2_ctrl *c){(void)c;}
+static void *kmemdup_array(const void *p,size_t n,size_t size,int f){
+ (void)f;void *d=calloc(n?n:1,size);if(d)memcpy(d,p,n*size);return d;}
+/* The run-time format check has its own KUnit suite (avd-fmt-test.c). */
+static int avd_check_run_image_fmt(struct avd_ctx *ctx,int f){(void)ctx;(void)f;return 0;}
 struct v4l2_ctrl_ref {struct v4l2_ctrl_ref *next; struct v4l2_ctrl *ctrl; bool p_req_valid; union {void *p;} p_req;};
 struct v4l2_ctrl_handler {struct v4l2_ctrl_ref *ctrl_refs;};
 #define list_for_each_entry(ref,head,node) for((ref)=*(head);(ref);(ref)=(ref)->next)
@@ -92,12 +99,14 @@ static unsigned int request_gets,request_puts;
 static struct v4l2_ctrl_handler *v4l2_ctrl_request_hdl_find(void *req,void *h){(void)h;assert(req==&request_hdl);request_gets++;return &request_hdl;}
 static void v4l2_ctrl_request_hdl_put(struct v4l2_ctrl_handler *h){assert(h==&request_hdl);request_puts++;}
 static struct v4l2_ctrl *v4l2_ctrl_find(void *h,u32 id){
- (void)h;controls[0].p_cur.p=&seq;controls[1].p_cur.p=&params;controls[2].p_cur.p=&tile;controls[2].elems=1;controls[3].p_cur.p=&grain;
+ (void)h;controls[0].p_cur.p=&seq;controls[1].p_cur.p=&params;controls[2].p_cur.p=&tile;controls[2].elems=1;controls[2].elem_size=sizeof(tile);controls[3].p_cur.p=&grain;
  if(id==V4L2_CID_STATELESS_AV1_SEQUENCE)return &controls[0];
  if(id==V4L2_CID_STATELESS_AV1_FRAME)return &controls[1];
  if(id==V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY)return &controls[2];
  return &controls[3];
 }
+static int avd_ctrl_copy(struct avd_ctx *ctx,u32 id,void *dst,size_t size){
+ (void)ctx;memcpy(dst,v4l2_ctrl_find(NULL,id)->p_cur.p,size);return 0;}
 static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run){
  (void)ctx;memset(run,0,sizeof(*run));run->bufs.src=current_src;run->bufs.dst=current_dst;
  run->coded_in=current_src->vb2_buf.dma;run->comp_out=current_dst->vb2_buf.dma;
@@ -106,7 +115,7 @@ static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run){
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *run){(void)ctx;(void)run;}
 static int avd_init_job(struct avd_ctx *ctx,int codec,size_t segments){
  free(ctx->job.segments);ctx->job.codec=codec;ctx->job.num=0;
- ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));return ctx->job.segments?0:-ENOMEM;
+ ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));ctx->job.overflow=false;ctx->job.max=ctx->job.segments?segments:0;return ctx->job.segments?0:-ENOMEM;
 }
 static int avd_submit_job(struct avd_ctx *ctx);
 '''

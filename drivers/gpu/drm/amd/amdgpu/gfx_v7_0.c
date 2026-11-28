@@ -2740,7 +2740,7 @@ static int gfx_v7_0_mec_init(struct amdgpu_device *adev)
 	}
 
 	/* clear memory.  Not sure if this is required or not */
-	memset(hpd, 0, mec_hpd_size);
+	amdgpu_bo_memset(adev->gfx.mec.hpd_eop_obj, hpd, 0, mec_hpd_size);
 
 	amdgpu_bo_kunmap(adev->gfx.mec.hpd_eop_obj);
 	amdgpu_bo_unreserve(adev->gfx.mec.hpd_eop_obj);
@@ -2813,7 +2813,7 @@ static void gfx_v7_0_mqd_init(struct amdgpu_device *adev,
 	u32 tmp;
 
 	/* init the mqd struct */
-	memset(mqd, 0, sizeof(struct cik_mqd));
+	amdgpu_bo_memset(ring->mqd_obj, mqd, 0, sizeof(struct cik_mqd));
 
 	mqd->header = 0xC0310800;
 	mqd->compute_static_thread_mgmt_se0 = 0xffffffff;
@@ -2960,7 +2960,7 @@ static int gfx_v7_0_compute_queue_init(struct amdgpu_device *adev, int ring_id)
 	int mqd_idx = ring - &adev->gfx.compute_ring[0];
 
 	if (!amdgpu_in_reset(adev) && !adev->in_suspend) {
-		memset((void *)mqd, 0, ring->mqd_size);
+		amdgpu_bo_memset(ring->mqd_obj, mqd, 0, ring->mqd_size);
 		mutex_lock(&adev->srbm_mutex);
 		cik_srbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		gfx_v7_0_mqd_init(adev, mqd, ring->mqd_gpu_addr, ring);
@@ -2970,11 +2970,15 @@ static int gfx_v7_0_compute_queue_init(struct amdgpu_device *adev, int ring_id)
 		mutex_unlock(&adev->srbm_mutex);
 
 		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, ring->mqd_size);
+			amdgpu_bo_memcpy_from(ring->mqd_obj,
+					      adev->gfx.mec.mqd_backup[mqd_idx],
+					      mqd, ring->mqd_size);
 	} else {
 		/* restore MQD to a clean status */
 		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], ring->mqd_size);
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
+					    adev->gfx.mec.mqd_backup[mqd_idx],
+					    ring->mqd_size);
 
 		/* Re-commit the restored backup */
 		mutex_lock(&adev->srbm_mutex);

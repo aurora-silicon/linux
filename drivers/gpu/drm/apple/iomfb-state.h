@@ -144,4 +144,20 @@ dcp_mode_finish(struct dcp_mode_state *state, bool completed,
 	return action;
 }
 
+/*
+ * Whether a mode is beyond what a display pipe scans at its provider clock.
+ * Firmware 27 compares the video clock, half the pixel clock, with the
+ * provider clock it reads with getClockFrequency(0), and leaves raising the
+ * display clock to the PMP. @mode_khz: pixel clock in kHz. @provider_hz: the
+ * provider clock, 0 if the processor has none. @pmp_acked: a running PMP
+ * acknowledged the processor's display request and scales the clock.
+ */
+static inline bool dcp_provider_clock_limits(u32 mode_khz, unsigned long provider_hz,
+					     bool pmp_acked)
+{
+	if (!provider_hz || pmp_acked)
+		return false;
+	return (u64)mode_khz * 1000 > 2 * (u64)provider_hz;
+}
+
 #endif

@@ -207,6 +207,48 @@ static void avd_submit_order(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, avd_slot_submit_first(pool, &pool[1]));
 }
 
+/*
+ * The legacy transport programs the context FIFO, which only exists while
+ * the OUTPUT queue streams. With no codec capability the submission stops
+ * before it touches the hardware either way.
+ */
+static void avd_open_submit_needs_fifo(struct kunit *test)
+{
+	static const struct avd_coded_fmt_desc desc = {};
+	struct avd_dev *avd;
+	struct avd_ctx *ctx;
+	struct avd_frame *f;
+	struct avd_buf *prog;
+	u32 *words;
+
+	avd = kunit_kzalloc(test, sizeof(*avd), GFP_KERNEL);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	prog = kunit_kzalloc(test, sizeof(*prog), GFP_KERNEL);
+	words = kunit_kcalloc(test, 4, sizeof(*words), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, avd);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, prog);
+	KUNIT_ASSERT_NOT_NULL(test, words);
+
+	ctx->dev = avd;
+	ctx->coded_fmt_desc = &desc;
+	prog->cpu = words;
+	prog->size = 4 * sizeof(*words);
+	f->ctx = ctx;
+	f->prog = prog;
+	f->prog_words = 1;
+	f->cmd[0] = AVD_CODEC_H264;
+
+	KUNIT_EXPECT_EQ(test, avd_open_backend.submit(avd, f), -EINVAL);
+	KUNIT_EXPECT_NULL(test, avd->compat_active);
+
+	ctx->inst.cpu = words;
+	KUNIT_EXPECT_EQ(test, avd_open_backend.submit(avd, f), -EOPNOTSUPP);
+	KUNIT_EXPECT_NULL(test, avd->compat_active);
+}
+
 static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_slots_and_tags),
 	KUNIT_CASE(avd_retirement_order),
@@ -215,6 +257,7 @@ static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_command_builders),
 	KUNIT_CASE(avd_dispatch_reservation),
 	KUNIT_CASE(avd_submit_order),
+	KUNIT_CASE(avd_open_submit_needs_fifo),
 	{}
 };
 

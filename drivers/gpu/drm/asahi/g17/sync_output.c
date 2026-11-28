@@ -98,7 +98,7 @@ static void asahi_g17_signal_install(struct asahi_g17_signal_target *target,
 }
 
 int asahi_g17_signals_publish(struct asahi_g17_signal_bundle *bundle,
-			      struct dma_fence *submitted)
+			      struct dma_fence *submitted, bool compute_only)
 {
 	struct dma_fence *previous, *scope;
 	size_t i;
@@ -107,7 +107,8 @@ int asahi_g17_signals_publish(struct asahi_g17_signal_bundle *bundle,
 		return -EINVAL;
 	previous = drm_syncobj_fence_get(bundle->targets[bundle->anchor].syncobj);
 	scope = asahi_g17_scope_create(previous, submitted,
-				      bundle->targets[bundle->anchor].point);
+				       bundle->targets[bundle->anchor].point,
+				       compute_only);
 	dma_fence_put(previous);
 	if (!scope)
 		return -ENOMEM;

@@ -28,6 +28,7 @@
 #define LOAD_COMMAND_SEND_BLOB           1
 #define LOAD_COMMAND_SEND_CALIBRATION    2
 #define CAL_PROP_NAME                    "apple,z2-cal-blob"
+#define APPLE_Z2_RX_BUF_SIZE             4000
 
 struct apple_z2 {
 	struct spi_device *spidev;
@@ -86,11 +87,16 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 	int nfingers;
 	int slot;
 	int slot_valid;
+	size_t max_fingers = 0;
 	struct apple_z2_finger *fingers;
 
 	if (msg_len <= APPLE_Z2_NUM_FINGERS_OFFSET)
 		return;
-	nfingers = msg[APPLE_Z2_NUM_FINGERS_OFFSET];
+	/* Only trust the finger records that the report has room for */
+	if (msg_len > APPLE_Z2_FINGERS_OFFSET)
+		max_fingers = (msg_len - APPLE_Z2_FINGERS_OFFSET) /
+			      sizeof(*fingers);
+	nfingers = min_t(size_t, msg[APPLE_Z2_NUM_FINGERS_OFFSET], max_fingers);
 	fingers = (struct apple_z2_finger *)(msg + APPLE_Z2_FINGERS_OFFSET);
 	for (i = 0; i < nfingers; i++) {
 		slot = input_mt_get_slot_by_key(z2->input_dev, fingers[i].finger);
@@ -147,6 +153,17 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 		return 0;
 
 	pkt_len = (get_unaligned_le16(z2->rx_buf + 1) + 8) & 0xfffffffc;
+	/*
+	 * No valid packet is this long. Drop it unread rather than read it in
+	 * pieces: a controller that sends one is misbehaving, and touch input
+	 * stopping is the safe outcome.
+	 */
+	if (pkt_len > APPLE_Z2_RX_BUF_SIZE) {
+		dev_warn_ratelimited(&z2->spidev->dev,
+				     "dropping oversized packet (%zu bytes)\n",
+				     pkt_len);
+		return -EMSGSIZE;
+	}
 
 	error = spi_read(z2->spidev, z2->rx_buf, pkt_len);
 	if (error)
@@ -253,7 +270,8 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 	return 0;
 }
 
-static int apple_z2_upload_firmware(struct apple_z2 *z2)
+static int apple_z2_load_firmware(struct apple_z2 *z2,
+				  const struct firmware *fw)
 {
 	const struct apple_z2_fw_hdr *fw_hdr;
 	size_t fw_idx = sizeof(struct apple_z2_fw_hdr);
@@ -263,15 +281,9 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	bool init;
 	size_t size;
 
-	const struct firmware *fw __free(firmware) = NULL;
-	error = request_firmware(&fw, z2->fw_name, &z2->spidev->dev);
-	if (error) {
-		dev_err(&z2->spidev->dev, "unable to load firmware\n");
-		return error;
-	}
-
 	fw_hdr = (const struct apple_z2_fw_hdr *)fw->data;
-	if (le32_to_cpu(fw_hdr->magic) != APPLE_Z2_FW_MAGIC || le32_to_cpu(fw_hdr->version) != 1) {
+	if (fw->size < sizeof(*fw_hdr) ||
+	    le32_to_cpu(fw_hdr->magic) != APPLE_Z2_FW_MAGIC || le32_to_cpu(fw_hdr->version) != 1) {
 		dev_err(&z2->spidev->dev, "invalid firmware header\n");
 		return -EINVAL;
 	}
@@ -329,6 +341,20 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	return 0;
 }
 
+static int apple_z2_upload_firmware(struct apple_z2 *z2)
+{
+	int error;
+
+	const struct firmware *fw __free(firmware) = NULL;
+	error = request_firmware(&fw, z2->fw_name, &z2->spidev->dev);
+	if (error) {
+		dev_err(&z2->spidev->dev, "unable to load firmware\n");
+		return error;
+	}
+
+	return apple_z2_load_firmware(z2, fw);
+}
+
 static int apple_z2_boot(struct apple_z2 *z2)
 {
 	int error;
@@ -363,7 +389,7 @@ static int apple_z2_probe(struct spi_device *spi)
 	if (!z2->tx_buf)
 		return -ENOMEM;
 	/* 4096 will end up being rounded up to 8192 due to devres header */
-	z2->rx_buf = devm_kzalloc(dev, 4000, GFP_KERNEL);
+	z2->rx_buf = devm_kzalloc(dev, APPLE_Z2_RX_BUF_SIZE, GFP_KERNEL);
 	if (!z2->rx_buf)
 		return -ENOMEM;
 
@@ -479,3 +505,7 @@ module_spi_driver(apple_z2_driver);
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("apple/dfrmtfw-*.bin");
 MODULE_DESCRIPTION("Apple Z2 touchscreens driver");
+
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_APPLE_Z2_KUNIT_TEST)
+#include "apple_z2-test.c"
+#endif

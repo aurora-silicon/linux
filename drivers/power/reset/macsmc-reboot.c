@@ -98,7 +98,9 @@ static int nvmem_cell_get_u8(struct nvmem_cell *cell)
 
 static int nvmem_cell_set_u8(struct nvmem_cell *cell, u8 val)
 {
-	return nvmem_cell_write(cell, &val, sizeof(val));
+	int ret = nvmem_cell_write(cell, &val, sizeof(val));
+
+	return ret < 0 ? ret : 0;
 }
 
 /*
@@ -380,7 +382,19 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "Failed to register restart prepare handler\n");
-	ret = devm_register_sys_off_handler(&pdev->dev, SYS_OFF_MODE_RESTART, SYS_OFF_PRIO_HIGH,
+	/*
+	 * Restart through the SoC watchdog first (apple_wdt registers its
+	 * restart handler at priority 128) and keep the SMC as the fallback.
+	 * An SMC restart (MBSE = phra) intermittently never completes: the
+	 * SMC takes the machine down but it does not come back, and the
+	 * hardware watchdog that systemd-shutdown armed for the reboot never
+	 * fires either, so the Mac stays off until it is power-cycled or
+	 * reset over USB-C. On an M2 Mac mini that was 5 of 68 warm reboots;
+	 * restarting through the watchdog bite instead, 0 of 70. The SMC is
+	 * still told a restart is coming (macsmc_reboot_notify()) and still
+	 * handles power-off.
+	 */
+	ret = devm_register_sys_off_handler(&pdev->dev, SYS_OFF_MODE_RESTART, SYS_OFF_PRIO_DEFAULT,
 					    macsmc_restart, reboot);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to register restart handler\n");
@@ -413,3 +427,7 @@ module_platform_driver(macsmc_reboot_driver);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC reboot/poweroff driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
+
+#if IS_ENABLED(CONFIG_POWER_RESET_MACSMC_KUNIT_TEST)
+#include "macsmc-reboot-test.c"
+#endif

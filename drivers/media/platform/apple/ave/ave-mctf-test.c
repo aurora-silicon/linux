@@ -9,10 +9,12 @@
  * Copyright The Aurora Silicon Contributors
  */
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/errno.h>
+#include <linux/limits.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+
+#include <media/videobuf2-v4l2.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -426,11 +428,118 @@ static void ave_mctf_strength(struct kunit *test)
 						   AVE_MCTF_STRENGTH_MAX + 1), -EINVAL);
 }
 
+/* Plane memory for t_plane(): the test's own small buffer. */
+static void *t_vaddr(struct vb2_buffer *vb, void *buf_priv)
+{
+	return buf_priv;
+}
+
+static const struct vb2_mem_ops t_mem_ops = {
+	.vaddr = t_vaddr,
+};
+
+/*
+ * An OUTPUT buffer of the MCTF queue with one plane of @length bytes, all of
+ * it payload, whose picture starts at @off. Its memory is only @mem: a copy
+ * that is not refused reads past it.
+ */
+static void t_plane(struct vb2_v4l2_buffer *b, struct vb2_queue *q, u8 *mem,
+		    u32 length, u32 off)
+{
+	memset(b, 0, sizeof(*b));
+	b->vb2_buf.vb2_queue = q;
+	b->vb2_buf.type = q->type;
+	b->vb2_buf.num_planes = 1;
+	b->vb2_buf.planes[0].mem_priv = mem;
+	b->vb2_buf.planes[0].length = length;
+	b->vb2_buf.planes[0].bytesused = length;
+	b->vb2_buf.planes[0].data_offset = off;
+}
+
+/*
+ * A picture is copied from data_offset on, so it must fit in the plane
+ * after it. vb2 only keeps data_offset below bytesused, both u32: a huge
+ * plane with data_offset at its end must not wrap the sum past the check,
+ * at QBUF (buf_prepare) or at the copy.
+ */
+static void ave_mctf_input_offset(struct kunit *test)
+{
+	const u32 nv12_size = AVE_MCTF_WIDTH * ALIGN(AVE_MCTF_HEIGHT, 16) * 3 / 2;
+	const u32 nv12 = AVE_MCTF_WIDTH * AVE_MCTF_HEIGHT * 3 / 2;
+	struct v4l2_pix_format_mplane *f;
+	struct vb2_v4l2_buffer *b;
+	struct ave_cmp420_geom g;
+	struct vb2_queue *q;
+	struct t_mctf t;
+	u8 *mem;
+
+	t_mctf_init(test, &t);
+	q = kunit_kzalloc(test, sizeof(*q), GFP_KERNEL);
+	b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
+	mem = kunit_kzalloc(test, SZ_4K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	KUNIT_ASSERT_NOT_NULL(test, mem);
+	KUNIT_ASSERT_EQ(test, ave_cmp420_geom(&g, AVE_MCTF_WIDTH, AVE_MCTF_HEIGHT), 0);
+	q->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	q->drv_priv = t.ctx;
+	q->mem_ops = &t_mem_ops;
+	t.sess->mctf_geom = g;
+	t.sess->mctf_in[0].cpu = mem;
+	t.sess->mctf_surf = mem;
+	t.sess->mctf_lin = mem;
+
+	KUNIT_EXPECT_TRUE(test, ave_mctf_input_fits(g.bytes, 0, g.bytes));
+	KUNIT_EXPECT_TRUE(test, ave_mctf_input_fits(U32_MAX, U32_MAX - g.bytes, g.bytes));
+	KUNIT_EXPECT_FALSE(test, ave_mctf_input_fits(g.bytes, 1, g.bytes));
+	KUNIT_EXPECT_FALSE(test, ave_mctf_input_fits(U32_MAX, U32_MAX - 1, g.bytes));
+	KUNIT_EXPECT_FALSE(test, ave_mctf_input_fits(SIZE_MAX, 1, SIZE_MAX));
+
+	/* The lossless form: the whole compressed surface is copied. */
+	f = &t.ctx->src_fmt;
+	f->pixelformat = V4L2_PIX_FMT_APPLE_L8V0;
+	f->width = AVE_MCTF_WIDTH;
+	f->height = AVE_MCTF_HEIGHT;
+	f->plane_fmt[0].bytesperline = g.y_pitch;
+	f->plane_fmt[0].sizeimage = g.bytes;
+	KUNIT_EXPECT_EQ(test, ave_mctf_input_bytes(f), (size_t)g.bytes);
+	t_plane(b, q, mem, g.bytes, 0);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), 0);
+	t_plane(b, q, mem, g.bytes + 64, 64);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), 0);
+	t_plane(b, q, mem, g.bytes + 64, 65);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_mctf_cmd_process(t.ctx, 0, b, NULL, false), -EINVAL);
+	t_plane(b, q, mem, U32_MAX, U32_MAX - 1);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_mctf_cmd_process(t.ctx, 0, b, NULL, false), -EINVAL);
+
+	/* NV12: 1080 lines are read, of the 1088 the buffer has room for. */
+	f->pixelformat = V4L2_PIX_FMT_NV12;
+	f->plane_fmt[0].bytesperline = AVE_MCTF_WIDTH;
+	f->plane_fmt[0].sizeimage = nv12_size;
+	KUNIT_EXPECT_EQ(test, ave_mctf_input_bytes(f), (size_t)nv12);
+	t_plane(b, q, mem, nv12_size, nv12_size - nv12);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), 0);
+	t_plane(b, q, mem, nv12_size, nv12_size - nv12 + 1);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_mctf_cmd_process(t.ctx, 0, b, NULL, false), -EINVAL);
+	t_plane(b, q, mem, U32_MAX, U32_MAX - 1);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_mctf_cmd_process(t.ctx, 0, b, NULL, false), -EINVAL);
+
+	/* The encoder places its input itself (ave_sess_input()). */
+	t.ctx->mctf = false;
+	t_plane(b, q, mem, nv12_size, nv12_size - 1);
+	KUNIT_EXPECT_EQ(test, ave_qops.buf_prepare(&b->vb2_buf), 0);
+}
+
 static struct kunit_case ave_mctf_cases[] = {
 	KUNIT_CASE(ave_mctf_start_image),
 	KUNIT_CASE(ave_mctf_process_frames),
 	KUNIT_CASE(ave_mctf_refusal),
 	KUNIT_CASE(ave_mctf_strength),
+	KUNIT_CASE(ave_mctf_input_offset),
 	{}
 };
 
@@ -439,6 +548,3 @@ static struct kunit_suite ave_mctf_suite = {
 	.test_cases = ave_mctf_cases,
 };
 kunit_test_suite(ave_mctf_suite);
-
-MODULE_DESCRIPTION("Apple AVE MCTF command image tests");
-MODULE_LICENSE("GPL");

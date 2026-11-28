@@ -92,3 +92,4 @@ obj-$(CONFIG_EDAC_LOONGSON)		+= loongson_edac.o
 obj-$(CONFIG_EDAC_VERSALNET)		+= versalnet_edac.o
 obj-$(CONFIG_EDAC_CORTEX_A72)		+= a72_edac.o
 obj-$(CONFIG_EDAC_APPLE_SOC)		+= apple_soc_edac.o
+obj-$(CONFIG_EDAC_APPLE_SOC_KUNIT_TEST) += apple_soc_edac-test.o

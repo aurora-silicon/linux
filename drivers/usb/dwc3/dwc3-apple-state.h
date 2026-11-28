@@ -49,6 +49,38 @@ static inline int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state target
 }
 
 /**
+ * dwc3_apple_usb3_mode_before_start() - USB3 PHY mode to select before xHCI or gadget starts
+ * @target: the state the controller is brought up in
+ * @pipe_reset_before_host: true if the controller pulses PHYSOFTRST before xHCI starts
+ * @mode: set to the mode to select, or to PHY_MODE_INVALID to route a host once xHCI has reset
+ *
+ * Device mode routes the USB3 PHY before dwc3_gadget_init(). Host mode routes it while xHCI
+ * sets up its SuperSpeed root hub, after xhci_reset() (USBCMD.HCRST) has completed on the
+ * dummy PIPE producer and dwc3_xhci_plat_start() has enabled SUSPHY, and before xhci_run():
+ * routing the live USB3 PHY before dwc3_host_init() exposes an ongoing SuperSpeed link
+ * handshake to HCRST and can leave a partner hub stuck in Rx.Detect. Controllers that must
+ * pulse GUSB3PIPECTL.PHYSOFTRST before xHCI starts still route the PHY beforehand.
+ *
+ * Return: 0, or -EINVAL if @target is not DWC3_APPLE_HOST or DWC3_APPLE_DEVICE.
+ */
+static inline int dwc3_apple_usb3_mode_before_start(enum dwc3_apple_state target,
+						    bool pipe_reset_before_host,
+						    enum phy_mode *mode)
+{
+	switch (target) {
+	case DWC3_APPLE_HOST:
+		*mode = pipe_reset_before_host ? PHY_MODE_USB_HOST : PHY_MODE_INVALID;
+		return 0;
+	case DWC3_APPLE_DEVICE:
+		*mode = PHY_MODE_USB_DEVICE;
+		return 0;
+	default:
+		*mode = PHY_MODE_INVALID;
+		return -EINVAL;
+	}
+}
+
+/**
  * dwc3_apple_state_for_role() - state a role asks for while the core is stopped for sleep
  * @role: the role asked for
  *

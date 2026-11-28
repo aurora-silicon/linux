@@ -1,3 +1,17 @@
+Aurora Silicon
+==============
+
+This tree is the Aurora Silicon kernel for Apple silicon Macs. Work lands on
+the `main` branch through pull requests (see CONTRIBUTING.md). RELEASES.md
+describes the three GitHub Release channels and when they become available.
+
+* stable: a `v*` release (https://github.com/aurora-silicon/linux/releases/latest)
+* nightly: the `aurora-nightly` prerelease, rebuilt daily when main moved
+* edge: the `aurora-edge` prerelease, rebuilt on every push to main
+
+The release workflow introduces the shared configuration. Once it lands,
+build that configuration locally with `make aurora_defconfig asahi.config`.
+
 Linux kernel
 ============
 
