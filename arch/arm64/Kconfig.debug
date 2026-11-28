@@ -42,7 +42,9 @@ config ARM64_USER4K_EXPERIMENTAL
 	  prctls refuse every non-native size with EINVAL, every exec gets
 	  the native granule, the CPUs report no alternative
 	  user granule and the per-page 4K ownership record in page_ext is not
-	  reserved. The shared MM code paths remain compiled in either way.
+	  reserved. The shared MM code paths remain compiled in either way, so
+	  a few behaviours differ from upstream even while it is off; see
+	  Documentation/arch/arm64/user4k.rst.
 
 	  While it is on, an experimental prctl selects a supported granule
 	  for the next exec. Ordinary address spaces and kernel tables retain
@@ -50,6 +52,7 @@ config ARM64_USER4K_EXPERIMENTAL
 	  and device mappings still require integration and validation. The
 	  private prctl numbers are not upstream assignments or a stable ABI
 	  promise. Programs that do not use the prctl keep the native granule.
+	  KSM does not merge the memory of programs that use another granule.
 
 config ARM64_CPUINFO_KUNIT_TEST
 	bool "KUnit tests for the /proc/cpuinfo model name" if !KUNIT_ALL_TESTS

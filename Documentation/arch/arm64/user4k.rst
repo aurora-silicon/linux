@@ -73,8 +73,23 @@ While it is off:
   16K pages). ``page_ext`` itself is still allocated if another user, such
   as page_owner, needs it.
 
-The shared MM code paths that serve every process are compiled in either
-way and do not change with the parameter.
+The shared MM code that serves every process is compiled in either way, and
+the parameter does not switch it back to the upstream code. A kernel built
+with this option therefore differs from upstream even while the feature is
+off. The differences that callers can see are:
+
+* ``vm_insert_pages()`` returns ``EFAULT`` for a start address that is not
+  aligned to the address space's page size.
+* The ``fault_around_bytes`` debugfs file accepts values down to 4K, so
+  writing ``0`` reads back 4096 rather than the native page size.
+* ``generic_access_phys()`` handles at most one user page per call.
+  ``access_process_vm()`` and other callers that loop still move the same
+  total.
+* ``locked_vm`` is counted in 4K units for every process. Limit checks and
+  ``VmLck`` give the same results as before for native address spaces.
+
+Other changes, such as the 64K zero page and ``pgtable_t`` holding a
+``pte_t`` pointer, keep native results the same.
 
 While it is on, the CPU capability line appears on CPUs that support
 the 4K translation granule, and the launcher below can select 4K pages.
@@ -181,6 +196,12 @@ length and ownership. Unconverted paths must not silently round a pin or DMA
 mapping into neighboring slots. Mock IOMMU/VFIO tests validate the recorded
 translations and ownership paths, not physical-device DMA on arbitrary
 hardware.
+
+KSM does not merge the memory of an address space with a non-native
+granule. ``MADV_MERGEABLE`` and ``PR_SET_MEMORY_MERGE`` fail there with
+``EOPNOTSUPP``. An exec that selects another granule drops an inherited
+``PR_SET_MEMORY_MERGE`` setting, so ``PR_GET_MEMORY_MERGE`` then reports it
+off, and native programs that this process starts later do not inherit it.
 
 Alternative-granule THP/KSM and hugetlb support, remaining legacy pin
 consumers, larger-than-native process activation and broader device

@@ -2688,6 +2688,12 @@ next_mm:
 	mmap_read_lock(mm);
 	if (ksm_test_exit(mm))
 		goto no_vmas;
+	/*
+	 * The merge paths still assume native leaves. Treat an mm with another
+	 * user granule as having no mergeable VMAs, so it leaves the KSM list.
+	 */
+	if (mm_page_size(mm) != PAGE_SIZE)
+		goto no_vmas;
 
 	for_each_vma(vmi, vma) {
 		if (!(vma->vm_flags & VM_MERGEABLE))
@@ -2874,6 +2880,9 @@ static bool __ksm_should_add_vma(const struct file *file, vma_flags_t vma_flags)
 
 static void __ksm_add_vma(struct vm_area_struct *vma)
 {
+	/* KSM merges native pages only; see get_mergeable_page(). */
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return;
 	if (__ksm_should_add_vma(vma->vm_file, vma->flags))
 		vm_flags_set(vma, VM_MERGEABLE);
 }
@@ -2907,6 +2916,7 @@ vma_flags_t ksm_vma_flags(struct mm_struct *mm, const struct file *file,
 			  vma_flags_t vma_flags)
 {
 	if (mm_flags_test(MMF_VM_MERGE_ANY, mm) &&
+	    mm_page_size(mm) == PAGE_SIZE &&
 	    __ksm_should_add_vma(file, vma_flags)) {
 		vma_flags_set(&vma_flags, VMA_MERGEABLE_BIT);
 		/*
@@ -2950,12 +2960,15 @@ static int ksm_del_vmas(struct mm_struct *mm)
  *
  * @mm:  Pointer to mm
  *
- * Returns 0 on success, otherwise error code
+ * Returns 0 on success, otherwise error code. An mm with a non-native user
+ * granule gets -EOPNOTSUPP, as MADV_MERGEABLE does.
  */
 int ksm_enable_merge_any(struct mm_struct *mm)
 {
 	int err;
 
+	if (mm_page_size(mm) != PAGE_SIZE)
+		return -EOPNOTSUPP;
 	if (mm_flags_test(MMF_VM_MERGE_ANY, mm))
 		return 0;
 
