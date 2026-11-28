@@ -251,6 +251,12 @@ ASAHI_TESTS = {
     'display26-tests.py': [([], PASS)],
     # The old revision publishes the fd before copy_to_user() succeeds.
     'dma-heap-fd-tests.py': [(out() + ['--old-ref', 'cb732d027aa18e1fcf9d2797f47d20b179ebc59c'], PASS)],
+    'g14-v27-2-fw-window-gc-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('boot-only-mirror', 'skip-l3-clean', 'skip-l3-barrier',
+                                   'skip-shared-l2-clean', 'skip-tlbi', 'skip-intact-check',
+                                   'skip-existing-shared-check',
+                                   'partial-publish-before-validate', 'info-in-private-leak',
+                                   'premature-free-in-flight'), out()),
     'g15-display-order-tests.py': [([], PASS)],
     'g15-input-error-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS),
                                  (out('--output') + ['--ref', 'ede99b3c1990b4a4a8c045fdf627a2bd0f14446a'], PASS)],

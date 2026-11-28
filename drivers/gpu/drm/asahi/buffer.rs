@@ -384,10 +384,26 @@ pub(crate) struct Buffer {
 }
 
 /// Address space in which the parameter-buffer lists are visible to their consumers.
+#[derive(Copy, Clone)]
 pub(crate) enum ParameterListPlacement {
     VmPrivate,
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     KernelGpu,
+}
+
+impl ParameterListPlacement {
+    /// Whether the legacy 13.5 `buffer::Info` descriptor is exposed to firmware in
+    /// `alloc.private`. G14 firmware 27.2 (`KernelGpu`) builds its own 27.2 record in
+    /// `alloc.shared` and never reads `buffer::Info`, so placing the unused wrapper in
+    /// uncached `alloc.shared` prevents queue create/destroy cycles from accumulating
+    /// unreclaimable cached `alloc.private` garbage.
+    pub(crate) const fn info_in_private(self) -> bool {
+        match self {
+            Self::VmPrivate => true,
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            Self::KernelGpu => false,
+        }
+    }
 }
 
 #[versions(AGX)]
@@ -441,11 +457,17 @@ impl Buffer::ver {
                 lists.array_empty_tagged(max_blocks * 2, b"BLST")?,
             )
         };
-        let shared = &mut alloc.shared;
-        let info = alloc.private.new_init(
+        let block_ctl = alloc.shared.new_default::<buffer::BlockControl>()?;
+        let counter = alloc.shared.new_default::<buffer::Counter>()?;
+        let info_alloc = if list_placement.info_in_private() {
+            &mut alloc.private
+        } else {
+            &mut alloc.shared
+        };
+        let info = info_alloc.new_init(
             try_init!(buffer::Info::ver {
-                block_ctl: shared.new_default::<buffer::BlockControl>()?,
-                counter: shared.new_default::<buffer::Counter>()?,
+                block_ctl,
+                counter,
                 page_list,
                 block_list,
             }),
