@@ -791,7 +791,6 @@
 		power-domains = <&ps_i2c5>;
 		#address-cells = <0x1>;
 		#size-cells = <0x0>;
-		status = "disabled";
 	};
 
 	spi1: spi@39b104000 {

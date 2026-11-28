@@ -81,3 +81,8 @@
 	compatible = "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J316";
 };
+
+/* ATC3 is HDMI-only on laptops; keep tunnel 3 PIODMA disabled. */
+&apciec3_piodma {
+	status = "disabled";
+};

@@ -13,7 +13,6 @@
 	ethernet_sideband: ethernet-sideband@32 {
 		compatible = "apple,t6000-aqc107-i2c", "apple,aqc107-i2c";
 		reg = <0x32>;
-		status = "disabled";
 	};
 };
 
