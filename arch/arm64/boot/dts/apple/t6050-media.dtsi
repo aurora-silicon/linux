@@ -7,15 +7,10 @@
  * The nodes themselves are in t6050-peripherals.dtsi (t6050-ultra.dtsi for
  * the J775D's decoders); this file only enables them.
  *
- * Not enabled here:
- * - ave1, the second encoder. The encoder runs firmware that iBoot
- *   preloads; the boot loader hands only the first T6050 encoder's preload
- *   (ADT ave0) to the DT, and the driver refuses an encoder without its two
- *   preloaded segments.
- * - apr1, the M5 Max's second ProRes engine. The driver's T6050 variant
- *   needs the first engine's named core, wrapper, aux and ctrl windows and
- *   its SCODEC rows; the second engine sits in the PRORES power state with a
- *   different window layout, which the driver does not describe.
+ * The second encoder (ave1) and the second ProRes engine (apr1) are enabled
+ * where the board's ADT describes them (the J873S, below). Their drivers
+ * decide whether they can run: the encoder needs the firmware the boot loader
+ * preloads, and it refuses an engine without its two preloaded segments.
  */
 
 #ifndef T6050_J775D
@@ -140,3 +135,61 @@
 &jpeg1 {
 	status = "okay";
 };
+
+#ifdef T6050_J873S
+/*
+ * The J873S ADT also has ave1 (VENC1_* power states, dart-ave1) and apr1
+ * (PRORES power state, dart-apr1). Describe them like their first engines.
+ */
+&ps_fab2_soc {
+	status = "okay";
+};
+
+&ps_venc1_sys {
+	status = "okay";
+};
+
+&ps_venc1_dma {
+	status = "okay";
+};
+
+&ps_venc1_pipe4 {
+	status = "okay";
+};
+
+&ps_venc1_pipe5 {
+	status = "okay";
+};
+
+&ps_venc1_me0 {
+	status = "okay";
+};
+
+&ps_venc1_me1 {
+	status = "okay";
+};
+
+&ave1_dart {
+	status = "okay";
+};
+
+&ave1_dart1 {
+	status = "okay";
+};
+
+&ave1 {
+	status = "okay";
+};
+
+&ps_prores {
+	status = "okay";
+};
+
+&apr1_dart {
+	status = "okay";
+};
+
+&apr1 {
+	status = "okay";
+};
+#endif
