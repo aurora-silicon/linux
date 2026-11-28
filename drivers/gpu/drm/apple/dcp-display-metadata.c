@@ -428,7 +428,8 @@ const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *meta
 
 /*
  * This identity-only DTD is not enumerated or programmed. Keep the DCP clock,
- * active area and blanking, but fit vertical sync placement into EDID's six-bit
+ * active area and blanking, give a sync polarity where the firmware gives none
+ * (as on M4), and fit vertical sync placement into EDID's six-bit
  * fields. Notch hiding expands the real sync pulse beyond those fields; the
  * exact syncs remain in the authoritative TimingElements catalogue.
  */
@@ -438,6 +439,7 @@ static int dcp_panel_identity_timing(struct detailed_timing *timing,
 {
 	struct drm_display_mode summary = *mode;
 
+	dcp_metadata_timing_polarity(&summary);
 	/* Refuse invalid source geometry before reducing the EDID summary. */
 	if (mode->vdisplay <= 0 || mode->vdisplay > 4095 ||
 	    mode->vsync_start < mode->vdisplay || mode->vsync_end <= mode->vsync_start ||

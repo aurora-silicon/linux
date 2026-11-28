@@ -1555,6 +1555,26 @@ static void parser_panel_color_target(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, raw->gamma, 0xff);
 }
 
+/* A timing without a sync polarity, as M4 firmware gives, still describes the panel. */
+static void parser_panel_timing_polarity(struct kunit *test)
+{
+	static const struct dcp_display_metadata metadata = {
+		.manufacturer = "APP", .name = "Apple Panel",
+	};
+	struct dcp_display_mode mode = panel_color_mode;
+	const struct drm_edid *edid;
+
+	mode.mode.flags = 0;
+	edid = dcp_panel_edid(&metadata, dcp_color_space_lookup("display-p3"), &mode, 1, 290, 188);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
+	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
+	KUNIT_EXPECT_EQ(test, drm_edid_raw(edid)->detailed_timings[0].data.pixel_data.misc,
+			0x18 | DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE);
+	drm_edid_free(edid);
+	/* The mode published stays the firmware's. */
+	KUNIT_EXPECT_EQ(test, mode.mode.flags, 0U);
+}
+
 static size_t parser_adt_property(u8 *out, size_t capacity, const char *name,
 				  const void *value, u32 size)
 {
@@ -2378,6 +2398,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_identity_stable),
 	KUNIT_CASE(parser_panel_identity),
 	KUNIT_CASE(parser_panel_color_target),
+	KUNIT_CASE(parser_panel_timing_polarity),
 	KUNIT_CASE(parser_panel_adt_color_target),
 	KUNIT_CASE(parser_tiled_size_keeps_dsc_modes),
 	KUNIT_CASE(parser_score_presence),

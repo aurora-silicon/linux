@@ -2756,6 +2756,26 @@ void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 	dev_info(dcp->dev, "ext %u: %s\n", dcp->index ? dcp->index - 1 : 0, line);
 }
 
+/*
+ * The EDID of an M4 internal panel: the identity and colour target of every
+ * internal panel, with the firmware's one timing.
+ */
+static void dcp_m4_panel_edid(struct apple_dcp *dcp, struct drm_connector *connector,
+			      const struct drm_display_mode *timing)
+{
+	struct dcp_display_mode mode = { .mode = *timing };
+	const struct drm_edid *edid;
+	u64 generation;
+
+	edid = dcp_panel_edid_snapshot(dcp, &mode, 1, &generation);
+	if (IS_ERR(edid)) {
+		dev_dbg(dcp->dev, "panel EDID generation failed: %pe\n", edid);
+		edid = NULL;
+	}
+	drm_edid_connector_update(connector, edid);
+	drm_edid_free(edid);
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -2794,6 +2814,8 @@ int dcp_get_modes(struct drm_connector *connector)
 		if (!mode)
 			return 0;
 		drm_mode_probed_add(connector, mode);
+		dcp_m4_panel_edid(dcp, connector, &fixed);
+		/* The EDID's size is in whole centimetres. */
 		of_property_read_u32(dcp->dev->of_node, "apple,panel-width-mm",
 				     &connector->display_info.width_mm);
 		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",

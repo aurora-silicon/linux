@@ -7325,6 +7325,13 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		ret = dcp_pin_live_session(dcp);
 		if (ret)
 			return ret;
+		if (dcp->panel_identity) {
+			of_property_read_u32(dev->of_node, "apple,panel-width-mm",
+					     &dcp->panel.width_mm);
+			of_property_read_u32(dev->of_node, "apple,panel-height-mm",
+					     &dcp->panel.height_mm);
+			dcp_panel_read_adt(dcp);
+		}
 		ret = iomfb_m4_start(dcp, main);
 		if (!ret)
 			WRITE_ONCE(dcp->active, true);
@@ -8529,6 +8536,12 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			if (!dcp->panel_identity)
 				return -ENOMEM;
 		}
+	} else if (of_property_present(dev->of_node, "apple,panel-width-mm")) {
+		/* Its node describes the panel itself, without a child. */
+		dcp->panel_identity = devm_kzalloc(dev, sizeof(*dcp->panel_identity),
+						   GFP_KERNEL);
+		if (!dcp->panel_identity)
+			return -ENOMEM;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0) {
 		char compat_str[DCP_FW_VERSION_STR_LEN];
