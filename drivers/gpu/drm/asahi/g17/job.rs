@@ -129,6 +129,8 @@ pub(crate) struct Packet {
     pub(crate) order: Order,
     pub(crate) completion: Arc<Completion>,
     pub(crate) footprint: Option<Arc<super::hazard::Footprint>>,
+    /// Number of render passes in the submit ioctl that created this packet.
+    pub(crate) batch_renders: u16,
     inputs: KVec<Fence>,
     firmware: KVec<Fence>,
     publication: AtomicU8,
@@ -141,12 +143,17 @@ pub(crate) struct Packet {
 }
 
 impl Packet {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Packet captures the validated command, ordering, batch size, and fence inputs."
+    )]
     pub(crate) fn new(
         id: u64,
         context: Arc<Context>,
         command: Validated,
         order: Order,
         completion: Arc<Completion>,
+        batch_renders: u16,
         inputs: KVec<Fence>,
         firmware: KVec<Fence>,
     ) -> Result<Arc<Self>> {
@@ -166,6 +173,7 @@ impl Packet {
                 order,
                 completion,
                 footprint,
+                batch_renders,
                 inputs,
                 firmware,
                 publication: AtomicU8::new(0),

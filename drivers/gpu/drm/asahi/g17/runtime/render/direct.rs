@@ -413,7 +413,12 @@ impl Backend {
                 dev: &dev,
                 uat: &loan.uat,
             };
-            pair.prepare(&alloc, packet, loan.addresses)?;
+            pair.prepare(
+                &alloc,
+                packet,
+                loan.addresses,
+                self.backlog.load(Ordering::Acquire) as usize,
+            )?;
             let render = port.render_lock();
             if !lease.is_current() {
                 return Err(EBUSY);

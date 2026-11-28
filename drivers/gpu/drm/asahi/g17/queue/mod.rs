@@ -234,6 +234,7 @@ impl<B: Backend> Queue<B> {
         aggregate: &super::fence::Aggregate,
         inputs: &[file::SyncItem],
         destinations: Destinations,
+        batch_renders: u16,
     ) -> Result {
         let engine = Engine::of(&command);
         let index = engine.index();
@@ -421,6 +422,7 @@ impl<B: Backend> Queue<B> {
             command,
             order,
             completion,
+            batch_renders,
             checked_inputs,
             firmware,
         )?;
@@ -591,9 +593,14 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             self.prepare_submission(bytes, objects, &mut scratch)?;
             let Scratch { pending, guards } = &mut scratch;
-            let has_render = pending
-                .iter()
-                .any(|(command, _, _)| matches!(command, Validated::Render { .. }));
+            let batch_renders = u16::try_from(
+                pending
+                    .iter()
+                    .filter(|(command, _, _)| matches!(command, Validated::Render { .. }))
+                    .count(),
+            )
+            .unwrap_or(u16::MAX);
+            let has_render = batch_renders != 0;
             if has_render {
                 self.context.note_render();
             }
@@ -646,6 +653,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     &aggregate,
                     outputs.inputs(),
                     destinations,
+                    batch_renders,
                 )?;
             }
             Ok(())
