@@ -490,12 +490,36 @@ impl Buffer::ver {
 
         // Technically similar to Scene below, let's play it safe.
         let kernel_buffer = alloc.shared.array_empty_tagged(0x40, b"KBUF")?;
-        let stats = alloc
+        let stats: GpuObject<buffer::Stats> = alloc
             .shared
             .new_object(Default::default(), |_inner| buffer::raw::Stats {
                 reset: AtomicU32::from(1),
                 ..Default::default()
             })?;
+
+        #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+        if matches!(list_placement, ParameterListPlacement::KernelGpu) {
+            // The firmware/GPU mappings bypass CPU caches. Publish the initial lists,
+            // controls and stats before the parameter manager or render engines use them.
+            for list in [&info.page_list, &info.block_list] {
+                let data = list.as_slice();
+                crate::pgtable::clean_poc(data.as_ptr().cast(), core::mem::size_of_val(data));
+            }
+            info.block_ctl.with(|raw, _| {
+                crate::pgtable::clean_poc(
+                    core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+            });
+            info.counter.with(|raw, _| {
+                crate::pgtable::clean_poc(
+                    core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+            });
+            stats.with(|raw, _| {
+                crate::pgtable::clean_poc(
+                    core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+            });
+            crate::pgtable::clean_poc(kernel_buffer.as_slice().as_ptr(), kernel_buffer.len());
+            crate::pgtable::poc_barrier();
+        }
 
         Ok(Buffer::ver {
             inner: Arc::pin_init(
