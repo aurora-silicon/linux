@@ -59,6 +59,15 @@ config ARM64_CPUINFO_KUNIT_TEST
 	  Test how /proc/cpuinfo reads the processor's name from the SMBIOS
 	  Processor Information.
 
+config ARM64_TPIDRRO_CPU_KUNIT_TEST
+	bool "KUnit tests for TPIDRRO_EL0 logical CPU index" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && ARM64_TPIDRRO_CPU
+	default KUNIT_ALL_TESTS
+	help
+	  Test TPIDRRO_EL0 value selection for native and compat tasks,
+	  PR_GET_TPIDRRO_CPU prctl handling, and live TPIDRRO_EL0 updates
+	  across CPU migration.
+
 config ARM64_USER4K_KUNIT_TEST
 	bool "Test mixed userspace granules with larger kernel pages"
 	depends on KUNIT=y && ARM64_USER4K_EXPERIMENTAL

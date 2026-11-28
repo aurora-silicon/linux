@@ -138,6 +138,9 @@
 #ifndef AURORA_GET_AMX
 # define AURORA_GET_AMX()		(-EINVAL)
 #endif
+#ifndef GET_TPIDRRO_CPU
+# define GET_TPIDRRO_CPU()		(-EINVAL)
+#endif
 #ifndef SVE_SET_VL
 # define SVE_SET_VL(a)		(-EINVAL)
 #endif
@@ -2666,6 +2669,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;
 		error = AURORA_GET_AMX();
+		break;
+	case PR_GET_TPIDRRO_CPU:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = GET_TPIDRRO_CPU();
 		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {

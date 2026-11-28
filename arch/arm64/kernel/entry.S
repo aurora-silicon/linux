@@ -231,6 +231,19 @@ alternative_cb_end
 	ldr	x19, [tsk, #TSK_TI_FLAGS]
 	disable_step_tsk x19, x20
 
+#ifdef CONFIG_ARM64_TPIDRRO_CPU
+	.if	\regsize == 64
+	/*
+	 * Entry trampolines (KPTI or Spectre-BHB) clobber and zero
+	 * tpidrro_el0 on 64-bit EL0 entry. Restore the logical CPU index
+	 * while interrupts are masked so returning without a context switch
+	 * (or saving host state in KVM) still observes it.
+	 */
+	ldr	w0, [tsk, #TSK_TI_CPU]
+	msr	tpidrro_el0, x0
+	.endif
+#endif
+
 	/* Check for asynchronous tag check faults in user space */
 	ldr	x0, [tsk, THREAD_SCTLR_USER]
 	check_mte_async_tcf x22, x23, x0

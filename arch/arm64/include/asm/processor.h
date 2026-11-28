@@ -464,6 +464,11 @@ int apple_amx_get(void);
 #define AURORA_GET_AMX()		apple_amx_get()
 #endif
 
+#ifdef CONFIG_ARM64_TPIDRRO_CPU
+int arch_prctl_get_tpidrro_cpu(void);
+#define GET_TPIDRRO_CPU()		arch_prctl_get_tpidrro_cpu()
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)
