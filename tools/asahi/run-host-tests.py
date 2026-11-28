@@ -472,6 +472,7 @@ ASAHI_TESTS = {
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
     'tiled-split-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'tunnel-route-tests.py': [(out(), PASS)],
+    'bar-safe-tests.py': [(out('--output'), PASS)],
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
