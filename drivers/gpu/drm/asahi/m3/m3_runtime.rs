@@ -87,6 +87,9 @@ struct Inner {
     /// Whether a T8122 job verdict line was already emitted for the current job, so the
     /// execute-path fallback does not add a second one. T8122 only.
     t8122_verdict: bool,
+    /// Publish the front packet alone once: a batch that joined later packets failed before
+    /// anything reached the firmware, and the front packet must not take the blame for them.
+    solo_next: bool,
     /// The step the firmware boot sequence has reached, for the T8122 boot verdict. T8122 only.
     boot_step: crate::m3::t8122_start::BootStep,
     /// Packets that joined a batch started by an earlier packet (debug summary).
@@ -96,6 +99,8 @@ struct Inner {
     /// Recent measured render GPU time per pass by VM. Smoothed over batches;
     /// replacing the least recently measured VM does not retain its mappings.
     pass_cost: policy::PassCosts,
+    /// Measured GPU time per compute command, per VM (the compute twin of `pass_cost`).
+    compute_cost: policy::PassCosts,
     /// Latched only after the isolated InitBM draw fully retired.
     render_initialized: bool,
     config: Config,
@@ -515,6 +520,7 @@ impl Inner {
         self.packets.retain(|p| self.active.iter().any(|b|b.entries.iter().any(|(q,_)|Arc::ptr_eq(p,q))));
     }
     fn fail_front(&mut self,error:Error) {
+        self.solo_next=false;
         if let Ok((packet,_))=self.pending.remove(0) {
             if !self.packet_active(&packet) && !self.fault_captured {packet.release_guard();}
             packet.fail_packet(error);
@@ -525,8 +531,8 @@ impl Inner {
         for (packet,_) in entries {packet.finish(result);}
     }
     /// Choose the next batch from the front of `pending`: the front packet's next commands of
-    /// one engine, and for render also the leading render commands of following packets of the
-    /// same VM, up to the ordered-batch limit.
+    /// one engine, and the leading commands of that engine of following packets of the same VM,
+    /// up to the ordered-batch limit and the batch's GPU-time budget.
     fn next_batch(&self,max:usize)->Result<KVec<(Arc<crate::m3::m3_submit::Packet>,usize)>> {
         let mut entries=KVec::new();
         let Some((packet,next))=self.pending.first() else {return Ok(entries);};
@@ -550,17 +556,18 @@ impl Inner {
                 .clamp(1,crate::m3::m3_compute_storage::SLOTS)
         };
         let same_engine=|c:&crate::m3::m3_submit::Command| render==matches!(c,crate::m3::m3_submit::Command::Render{..});
-        let per_pass=self.pass_cost.get(packet.vm.id());
+        let per_pass=if render {self.pass_cost.get(packet.vm.id())} else {self.compute_cost.get(packet.vm.id())};
         let budget=crate::m3::m3_params::render_batch_budget_ns(self.device.soc());
+        let explicit=crate::m3::m3_params::compute_batch_overridden();
         let in_flight:usize=self.active.iter().map(|b|b.entries.len()).sum();
         for (position,(candidate,start)) in self.pending.iter().enumerate() {
-            // Later packets join only render batches, only from their first command, and only
-            // for the VM the batch is bound to, while the batch's expected GPU time is within
-            // the budget.
-            if position>0 && !policy::may_join(render,*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency) {break;}
+            // Later packets join only from their first command, only for the VM the batch is
+            // bound to and at its urgency, while the batch's expected GPU time is within the
+            // budget. Each queued submission otherwise pays a full firmware round trip.
+            if position>0 && (self.solo_next || !policy::may_join(*start,candidate.vm.same(&packet.vm),candidate.urgency==packet.urgency)) {break;}
             let mut index=*start;
             while index<candidate.commands.len() && entries.len()<limit && same_engine(&candidate.commands[index]) {
-                if render && !policy::within_budget(per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
+                if !policy::admits(render,position>0,explicit,per_pass,budget,in_flight+entries.len()) {return Ok(entries);}
                 entries.push((candidate.clone(),index),GFP_KERNEL)?;
                 index+=1;
             }
@@ -638,6 +645,7 @@ impl Inner {
             };
             match self.publish(&entries,base,overlap) {
                 Ok(batch)=>{
+                    self.solo_next=false;
                     // Consume the published commands from `pending`.
                     let Some((last,last_index))=entries.last().map(|(p,i)|(p.clone(),*i)) else {break;};
                     while let Some((packet,_))=self.pending.first() {
@@ -662,21 +670,35 @@ impl Inner {
                             self.t8122_verdict=true;
                         }
                         // A live ring WRITE or doorbell may have been published: keep packets
-                        // retained (self.packets) and fail them and everything in flight.
+                        // retained (self.packets) and fail them and everything in flight. The
+                        // error may come from before the batch's packets were marked.
+                        for (p,_) in entries.iter() {p.mark_published();}
                         self.capture_fault(error);
                         Self::finish_all(&entries,Err(error));
                         self.fail_active(error);
                         self.fail_pending(error);
                         return true;
-                    } else if overlap && error==EBUSY {
-                        // Not publishable behind the running batch (new VM binding or storage
-                        // growth): wait for it to retire.
-                        break;
                     } else {
-                        // Nothing reached the firmware: fail only the front packet, as a failed
-                        // execute() did before publication.
-                        self.fail_front(error);
-                        progress=true;
+                        // Nothing reached the firmware. A packet whose first command is in this
+                        // batch was never published before, so it is unpublished again if the
+                        // batch marked it: a later failure then releases its VM job guard.
+                        for (p,i) in entries.iter() {if policy::first_publication(*i) {p.clear_published();}}
+                        if overlap && error==EBUSY {
+                            // Not publishable behind the running batch (new VM binding or
+                            // storage growth): wait for it to retire.
+                            break;
+                        } else if !self.solo_next && entries.iter().any(|(p,_)|!Arc::ptr_eq(p,&entries[0].0)) {
+                            // Later packets joined, and the error may be theirs: retry the front
+                            // packet alone. If it publishes, the next packet is tried as the
+                            // front in turn, so only a packet that fails alone is failed.
+                            self.solo_next=true;
+                            progress=true;
+                        } else {
+                            // Fail only the front packet, as a failed execute() did before
+                            // publication.
+                            self.fail_front(error);
+                            progress=true;
+                        }
                     }
                 }
             }
@@ -706,9 +728,11 @@ impl Inner {
         for (p,_) in entries {
             if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
         }
-        // Before any producer state changes: an append the overlapping firmware consumes, or a
-        // partial publication, makes these packets visible to it.
-        for (p,_) in entries {p.mark_published();}
+        // Behind a running batch the firmware can consume an append without a new doorbell, so
+        // the packets count as published before any producer state changes. With nothing in
+        // flight they are marked only once every command is encoded (below): an encoding
+        // failure then leaves them unpublished.
+        if overlap {for (p,_) in entries {p.mark_published();}}
         let found=self.jobs.iter().position(|job| matches!((job,control),
             (NativeJob::Compute(_),crate::m3::m3_submit::Command::Compute(_)) |
             (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})));
@@ -800,6 +824,8 @@ impl Inner {
             packet.vm.mark_binding_published().map_err(early)?;
         }
         let publication_tick=if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {physical_counter()} else {0};
+        // Every command is encoded and the next step tells the firmware about the batch.
+        for (p,_) in entries {p.mark_published();}
         self.state.health.set_gpu_pending(true);
         self.gpu_pending = true;
         let late=|e:Error|(e,true);
@@ -1038,7 +1064,7 @@ impl Inner {
                     return Ok(true);
                 }
                 Ok(false)=>{
-                    let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(2),b.previous_events)).ok_or(EIO)?;
+                    let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(policy::batch_deadline_secs(b.entries.len())),b.previous_events)).ok_or(EIO)?;
                     if expired {
                         dev_err!(self.drm.as_ref(),"M3 pipelined completion events={} previous={}\n",self.config.completed_events,previous);
                         if self.config.recovery_phase() == Ok(1) {
@@ -1120,7 +1146,7 @@ impl Inner {
                 if evented && batch.events_ns<0 {batch.events_ns=at;}
             }
             if let Some(t)=poll_start {batch.polling_ns+=t.elapsed().as_nanos();batch.polls+=1;}
-            (evented,batch.start.elapsed()>=Delta::from_secs(2),batch.previous_events)
+            (evented,batch.start.elapsed()>=Delta::from_secs(policy::batch_deadline_secs(batch.entries.len())),batch.previous_events)
         };
         if stamped && evented {
             let retire_mmio=crate::m3::m3_params::retire_mmio(self.device.soc());
@@ -1224,6 +1250,8 @@ impl Inner {
             let vm=batch.entries[0].0.vm.id();
             self.pass_cost.record(vm,gpu_ns/batch_count as u64);
             self.render_initialized=true;
+        } else {
+            self.compute_cost.record(batch.entries[0].0.vm.id(),gpu_ns/batch_count as u64);
         }
         if crate::debug::debug_enabled(crate::debug::DebugFlags::M3PassTiming) {
             let observed_tick=physical_counter();
@@ -1441,7 +1469,7 @@ impl Runtime {
             quarantined_packets:KVec::new(),quarantine_budget:crate::m3::m3_recovery::QuarantineBudget::new(crate::m3::m3_recovery::QUARANTINE_LIMIT),
             recovery_window_ns:0,recovery_window_count:0,recoveries:0,
             gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
-            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,
+            geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),compute_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,solo_next:false,
             boot_step:crate::m3::t8122_start::BootStep::Publish })) })
     }
     pub(crate) fn drm(&self) -> driver::AsahiDevRef { self.inner.drm.clone() }

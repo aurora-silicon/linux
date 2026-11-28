@@ -122,8 +122,12 @@ impl Packet {
         }
         drop(guard_slot.take());
     }
-    /// Called before the first firmware-visible change of a batch that includes this packet.
+    /// Called before the first firmware-visible change of a batch that includes this packet: once
+    /// the batch's commands are encoded, or before encoding behind a batch that is still running.
     pub(crate) fn mark_published(&self) {self.published.store(true,Ordering::Relaxed);}
+    /// Undo `mark_published` for a packet whose first command was in a batch that failed before
+    /// any firmware-visible change.
+    pub(crate) fn clear_published(&self) {self.published.store(false,Ordering::Relaxed);}
     /// Whether the firmware may have seen any of this packet's commands.
     pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}

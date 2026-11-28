@@ -48,8 +48,10 @@ pub(crate) fn urgent_waiting(urgencies: impl Iterator<Item=u8>, active:u8) -> bo
     urgencies.into_iter().any(|p|p>active)
 }
 
-pub(crate) const fn may_join(render:bool, next:usize, same_vm:bool, same_urgency:bool) -> bool {
-    render && next==0 && same_vm && same_urgency
+/// A later pending packet may extend a batch of either engine from its first command, for the
+/// batch's VM and at its urgency. The batch limit and GPU-time budget still bound the batch.
+pub(crate) const fn may_join(next:usize, same_vm:bool, same_urgency:bool) -> bool {
+    next==0 && same_vm && same_urgency
 }
 
 pub(crate) const fn default_depth(t8122:bool) -> usize {if t8122 {2} else {1}}
@@ -66,6 +68,23 @@ pub(crate) fn pipeline_room(depth: usize, batches: usize, passes: usize,
     if batches >= depth || passes >= SLOTS || last_base >= SLOTS
         || last_count == 0 || last_count > passes { return None; }
     Some(((last_base + last_count) % SLOTS, SLOTS - passes))
+}
+
+/// Whether the next command may extend the batch. Render passes always need the budget. A compute
+/// batch always takes one command; further commands need a budget and the VM's measured compute
+/// cost, so that without a budget every compute batch is one command, as before. Only an
+/// explicit `m3_compute_batch_override` lets the front packet's own commands go unbudgeted.
+pub(crate) fn admits(render:bool, joined:bool, explicit:bool, cost:Option<u64>, budget:Option<u64>,
+    passes:usize) -> bool {
+    if render || passes == 0 { return within_budget(cost, budget, passes); }
+    if explicit && !joined { return true; }
+    budget.is_some() && within_budget(cost, budget, passes)
+}
+
+/// Seconds a published batch may run before it is failed: each command keeps the two seconds it
+/// had when it was published alone, so batching never shortens a command's deadline.
+pub(crate) const fn batch_deadline_secs(commands:usize) -> i64 {
+    2 * (if commands == 0 { 1 } else { commands }) as i64
 }
 
 /// Always admit one pass; subsequent passes must fit the measured budget.
@@ -87,6 +106,12 @@ pub(crate) const fn packet_retired(pending: bool, active: bool) -> bool {
 /// it. Any other keeps the guard, and its VM stays quarantined, until the runtime drops it.
 pub(crate) const fn release_unpublished(may_be_published: bool) -> bool {
     !may_be_published
+}
+
+/// A batch entry that is its packet's first command: no earlier batch included the packet, so if
+/// this batch fails before anything reached the firmware, the packet is unpublished again.
+pub(crate) const fn first_publication(command: usize) -> bool {
+    command == 0
 }
 
 pub(crate) const fn retain_runtime(stop_failed: bool, gpu_pending: bool) -> bool {

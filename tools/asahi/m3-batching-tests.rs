@@ -21,16 +21,125 @@ fn priority_fifo_and_partial_packet_yields() {
     // An unfinished low-priority packet gets a high-priority predecessor next batch.
     let low_continuation=vec![0,0];
     assert_eq!(pending_position(low_continuation.into_iter(),3),0);
-    assert!(!may_join(true,0,true,false));
-    assert!(!may_join(true,1,true,true));
-    assert!(!may_join(true,0,false,true));
-    assert!(!may_join(false,0,true,true));
-    assert!(may_join(true,0,true,true));
+    assert!(!may_join(0,true,false));
+    assert!(!may_join(1,true,true));
+    assert!(!may_join(0,false,true));
+    assert!(may_join(0,true,true));
     // A sorted pending head cannot detect its own urgency advantage. Compare
     // with the active batch so same-VM urgent work also stops extending it.
     assert!(urgent_waiting([3,0].into_iter(),0));
     assert!(!urgent_waiting([3,0].into_iter(),3));
     assert!(!urgent_waiting([0,0].into_iter(),0));
+}
+
+#[test]
+fn compute_batches_grow_only_under_a_budget() {
+    let budget=Some(4_000_000);
+    for joined in [false,true] { for explicit in [false,true] {
+        // One command always goes.
+        assert!(admits(false,joined,explicit,None,None,0));
+        // A measured cost that fits the budget lets the batch grow.
+        assert!(admits(false,joined,explicit,Some(1_000_000),budget,3));
+        assert!(admits(false,joined,explicit,Some(10_000),budget,1));
+    }}
+    // Without an override: no budget or no measurement keeps one command per batch.
+    for joined in [false,true] {
+        assert!(!admits(false,joined,false,Some(10_000),None,1));
+        assert!(!admits(false,joined,false,None,budget,1));
+        assert!(!admits(false,joined,false,Some(1_000_000),budget,4));
+    }
+    // An explicit override bounds the front packet's own commands alone, never joined ones.
+    assert!(admits(false,false,true,None,None,15));
+    assert!(admits(false,false,true,Some(10_000_000),budget,15));
+    assert!(!admits(false,true,true,None,None,1));
+    assert!(!admits(false,true,true,Some(1_000_000),budget,4));
+    // Render keeps its budget rule.
+    for joined in [false,true] {
+        assert!(admits(true,joined,false,None,budget,0));
+        assert!(!admits(true,joined,false,None,budget,1));
+        assert!(admits(true,joined,false,None,None,7));
+    }
+}
+
+#[test]
+fn batched_commands_keep_their_deadline() {
+    assert_eq!(batch_deadline_secs(0),2);
+    assert_eq!(batch_deadline_secs(1),2);
+    assert_eq!(batch_deadline_secs(8),16);
+    assert_eq!(batch_deadline_secs(16),32);
+}
+
+/// Commands a compute batch admits for a cost and budget, with no override (`next_batch()` asks
+/// `admits` once per command; m3-batch-select-tests.py runs that selection itself).
+fn compute_commands(joined:bool,cost:Option<u64>,budget:Option<u64>) -> usize {
+    (0..SLOTS).take_while(|n|admits(false,joined,false,cost,budget,*n)).count()
+}
+
+#[test]
+fn the_measured_compute_cost_sizes_the_batch() {
+    let budget=Some(default_budget_us(true)*1000);
+    for joined in [false,true] {
+        let mut costs=PassCosts::default();
+        // No measurement for the VM yet: one command.
+        assert_eq!(compute_commands(joined,costs.get(1),budget),1);
+        // A light dispatch (182 ns): only the slots bound the batch.
+        costs.record(1,182);
+        assert_eq!(compute_commands(joined,costs.get(1),budget),SLOTS);
+        // Another VM's measurement doesn't count.
+        assert_eq!(compute_commands(joined,costs.get(2),budget),1);
+        // The measured cost caps the count: cost * commands stays within the 4 ms budget.
+        for (ns,commands) in [(250_000,16),(500_000,8),(1_000_000,4),(1_500_000,2),(2_000_000,2),
+            (2_000_001,1),(4_000_000,1),(200_000_000,1)] {
+            let mut costs=PassCosts::default();
+            costs.record(1,ns);
+            assert_eq!(compute_commands(joined,costs.get(1),budget),commands,"{ns} ns");
+        }
+        // Without a budget every batch is one command, measured or not.
+        assert_eq!(compute_commands(joined,Some(182),None),1);
+        assert_eq!(compute_commands(joined,None,None),1);
+    }
+}
+
+#[test]
+fn a_stale_compute_cost_cannot_time_out_a_batch_of_valid_commands() {
+    let budget=Some(default_budget_us(true)*1000);
+    // A VM measured at 100 us per command then queues 200 ms dispatches: the stale cost still
+    // admits a full batch.
+    let mut costs=PassCosts::default();
+    costs.record(1,100_000);
+    let commands=compute_commands(true,costs.get(1),budget);
+    assert_eq!(commands,SLOTS);
+    // Its deadline is the sum of the deadlines the commands had alone, so the batch (3.2 s)
+    // is in time, and so is any batch whose commands each fit their own deadline.
+    let alone=batch_deadline_secs(1);
+    for n in 1..=SLOTS {assert_eq!(batch_deadline_secs(n),alone*n as i64);}
+    assert!(commands as i64*200<batch_deadline_secs(commands)*1000);
+    // The batch's retirement corrects the estimate: the next batch is one command again.
+    costs.record(1,200_000_000);
+    assert_eq!(compute_commands(true,costs.get(1),budget),1);
+}
+
+#[test]
+fn a_batch_that_fails_before_publication_leaves_new_packets_unpublished() {
+    // (first command of the entry, published before the batch)
+    struct Packet {published:bool,guard:bool}
+    // The front packet continues at command 3 (an earlier batch published 0..3); two packets
+    // join from their first command.
+    let entries=[(0usize,3usize),(1,0),(2,0)];
+    for overlap in [false,true] {
+        let mut packets=[Packet{published:true,guard:true},Packet{published:false,guard:true},
+            Packet{published:false,guard:true}];
+        // Behind a running batch the packets are marked before encoding; otherwise only after.
+        if overlap {for (p,_) in entries {packets[p].published=true;}}
+        // Encoding fails: nothing reached the firmware.
+        for (p,command) in entries {if first_publication(command) {packets[p].published=false;}}
+        // A later failure of everything pending releases only the guards of unseen packets.
+        for p in packets.iter_mut() {if release_unpublished(p.published) {p.guard=false;}}
+        assert!(packets[0].guard,"the partly published front packet keeps its guard");
+        assert!(!packets[1].guard && !packets[2].guard,"joined packets release theirs");
+    }
+    assert!(first_publication(0));
+    assert!(!first_publication(1));
 }
 
 #[test]
