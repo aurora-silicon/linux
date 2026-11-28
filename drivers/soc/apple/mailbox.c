@@ -259,12 +259,14 @@ struct apple_mbox_priv {
 	struct apple_mbox mbox;
 	/* ASCWrap v8 only: the provider's PMGR2 PSD service block (read-only). */
 	void __iomem *psd_regs;
-	/* ASCWrap v8 only: receive by polling; fixed at probe. */
+	/* Receive by polling from the start (v8 poll mode only). */
 	bool rx_poll_only;
 	/* rx_lock: recv interrupt enabled and not yet disabled again. */
 	bool rx_irq_live;
 	/* rx_lock: consecutive recv interrupts that drained nothing. */
 	unsigned int rx_irq_empty_run;
+	/* rx_lock: active apple_mbox_hold_rx() nesting depth. */
+	unsigned int rx_hold_depth;
 	/* rx_lock: an unpowered-PSD receive skip was logged this activation. */
 	bool rx_psd_skip_logged;
 	struct delayed_work rx_poll_work;
@@ -275,10 +277,24 @@ static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
 	return container_of(mbox, struct apple_mbox_priv, mbox);
 }
 
+/*
+ * Providers whose mailbox cannot ack or mask its own level lines (no
+ * mailbox-level IRQ controls): every ASCWrap v6 GPU wrapper and ASCWrap v8.
+ * Their recv-not-empty line can only be masked at the AIC, so receive uses
+ * the storm guard and poll fallback. Keyed on the IRQ-control limitation,
+ * not on one board table: all T6040/T8140/T8142/T6050 providers (J775D
+ * included) set has_irq_controls = false and share the path.
+ */
+static bool apple_mbox_uses_v8_rx_path(const struct apple_mbox *mbox)
+{
+	return mbox->hw->is_ascwrap_v8 ||
+	       (mbox->hw->is_ascwrap_v6 && !mbox->hw->has_irq_controls);
+}
+
 /* Only providers allocated by apple_mbox_probe() have a receive poller. */
 static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
 {
-	return mbox->hw->is_ascwrap_v8;
+	return apple_mbox_uses_v8_rx_path(mbox);
 }
 
 /* Both ASCWrap generations share the consumer lifecycle API below. */
@@ -964,9 +980,10 @@ static void apple_mbox_v8_rx_irq_guard(struct apple_mbox *mbox, int drained)
 
 	priv->rx_irq_live = false;
 	disable_irq_nosync(mbox->irq_recv_not_empty);
-	dev_err(mbox->dev,
-		"ASCWrap v8 recv-not-empty IRQ %d fired %u times without a message; disabled, receive falls back to polling\n",
-		mbox->irq_recv_not_empty, priv->rx_irq_empty_run);
+	dev_warn_once(mbox->dev,
+		      "recv-not-empty IRQ %d fired %u times without a message; "
+		      "disabled, receive switches to polling\n",
+		      mbox->irq_recv_not_empty, priv->rx_irq_empty_run);
 	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
 }
 
@@ -979,7 +996,7 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
 		consumed = apple_mbox_poll_locked(mbox);
-	if (mbox->hw->is_ascwrap_v8)
+	if (apple_mbox_uses_v8_rx_path(mbox))
 		apple_mbox_v8_rx_irq_guard(mbox, consumed);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
@@ -1090,10 +1107,15 @@ static void apple_mbox_v8_rx_poll_work(struct work_struct *work)
 						    struct apple_mbox_priv,
 						    rx_poll_work);
 	struct apple_mbox *mbox = &priv->mbox;
+	unsigned long flags;
 
 	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
 		return;
-	apple_mbox_poll(mbox);
+	/* Serialize the hold check with the receive reads and callbacks. */
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (!priv->rx_hold_depth && likely(!READ_ONCE(mbox->removing)))
+		apple_mbox_poll_locked(mbox);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work,
 			   APPLE_ASCWRAP_V8_RX_POLL_JIFFIES);
 }
@@ -1275,14 +1297,51 @@ EXPORT_SYMBOL(apple_mbox_restore);
 
 void apple_mbox_hold_rx(struct apple_mbox *mbox)
 {
-	if (mbox->irq_recv_not_empty >= 0)
+	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
+	unsigned long flags;
+
+	if (mbox->irq_recv_not_empty < 0)
+		return;
+
+	if (!apple_mbox_has_rx_poller(mbox)) {
 		disable_irq(mbox->irq_recv_not_empty);
+		return;
+	}
+
+	/*
+	 * Keep lifecycle and storm-guard IRQ masks independent from this hold.
+	 * Only the outermost hold adds a mask, but every holder must wait
+	 * for the IRQ handler after dropping rx_lock.
+	 */
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (!priv->rx_hold_depth++)
+		disable_irq_nosync(mbox->irq_recv_not_empty);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	synchronize_irq(mbox->irq_recv_not_empty);
 }
 EXPORT_SYMBOL(apple_mbox_hold_rx);
 
 void apple_mbox_release_rx(struct apple_mbox *mbox)
 {
-	if (mbox->irq_recv_not_empty >= 0)
+	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
+	unsigned long flags;
+	bool release = false;
+
+	if (mbox->irq_recv_not_empty < 0)
+		return;
+
+	if (!apple_mbox_has_rx_poller(mbox)) {
+		enable_irq(mbox->irq_recv_not_empty);
+		return;
+	}
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (priv->rx_hold_depth && !--priv->rx_hold_depth)
+		release = true;
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	if (release)
 		enable_irq(mbox->irq_recv_not_empty);
 }
 EXPORT_SYMBOL(apple_mbox_release_rx);
@@ -1684,6 +1743,20 @@ static int apple_mbox_probe(struct platform_device *pdev)
 				       irqname, mbox);
 		if (ret)
 			return ret;
+	}
+
+	if (mbox->hw->is_ascwrap_v6 && apple_mbox_uses_v8_rx_path(mbox) &&
+	    mbox->irq_recv_not_empty >= 0) {
+		const char *role;
+
+		INIT_DELAYED_WORK(&priv->rx_poll_work, apple_mbox_v8_rx_poll_work);
+		priv->rx_poll_only = false;
+		if (of_property_read_string(dev->of_node, "apple,firmware-role", &role))
+			role = "unknown";
+		dev_info(dev,
+			 "%s ASCWrap v6 provider: recv-not-empty IRQ (irq %d); poll only after storm guard (%u empty edges)\n",
+			 role, mbox->irq_recv_not_empty,
+			 APPLE_ASCWRAP_V8_RX_STORM_LIMIT);
 	}
 
 	ret = devm_pm_runtime_enable(dev);
