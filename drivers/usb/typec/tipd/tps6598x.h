@@ -352,11 +352,16 @@ struct tipd_data {
 	int (*connect)(struct tps6598x *tps, u32 status);
 	int (*prepare)(struct tps6598x *tps);
 	void (*complete)(struct tps6598x *tps);
+	/* Stop what sends the controller commands; tipd_shutdown() */
+	void (*shutdown)(struct tps6598x *tps);
 };
 
 struct tps6598x {
-	/* Native H17 routes retain ENOSPC admission and their own HPD path. */
-	u8 h17_display:1;
+	/*
+	 * apple,display-native-hpd: the port's display route has its own HPD path
+	 * (the T8140 and T8142 display routes).
+	 */
+	u8 display_native_hpd:1;
 	/* On the list tipd_port_replug() looks a port up on, by its role switch; its replug. */
 	struct list_head port_node;
 	struct work_struct replug_work;
@@ -566,6 +571,14 @@ int tipd_usbw_locked(struct tps6598x *tps, u8 mode);
 #define TIPD_USBW_HIGH_SPEED	0x09
 #define TIPD_USBW_HAND_BACK	0x80
 #define TIPD_USBW_OFF		0x00
+void tipd_shutdown(struct tps6598x *tps);
+/*
+ * The longest limit this driver gives a command (LDCM; SSPS S0 outside the sleep's rules). A
+ * command still running after that does not end on its own.
+ */
+#define TPS_CMD_MAX_MS			5000
+int tipd_cmd_wait_idle(struct tps6598x *tps, unsigned int timeout_ms, u32 *busy);
+int tipd_cmd_write_busy(struct tps6598x *tps, const char *cmd);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);

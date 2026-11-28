@@ -53,6 +53,15 @@ properties:
       Tell the controller the system's power state (SSPS) around a
       firmware-driven suspend, S3 before it and S0 after.
 
+  apple,display-native-hpd:
+    type: boolean
+    description: |
+      The display route behind this controller's port has its own HPD path,
+      as the display coprocessor routes of the T8140 and T8142 do. The driver
+      passes on the HPD level of the port's data status only: it does not
+      follow the partner's DP status updates, synthesize IRQ_HPD pulses, or
+      send the display connector a recheck when a USB4 route starts.
+
   apple,cable-change-ssps:
     type: boolean
     description:

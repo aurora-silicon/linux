@@ -424,7 +424,8 @@ static int devm_request_threaded_irq(void *d,int irq,void *h,void *th,int flags,
 static int system_power_efficient_wq;
 static unsigned msecs_to_jiffies(unsigned ms) { return ms; }
 static void queue_delayed_work(int wq,int *work,unsigned delay) { (void)wq;(void)work;(void)delay; }
-static bool device_property_read_bool(void *d,const char *p) { (void)d;(void)p;return false; }
+/* The native H17 fixture's DT: apple,display-native-hpd only. */
+static bool device_property_read_bool(void *d,const char *p) { (void)d;return !strcmp(p,"apple,display-native-hpd"); }
 static void tipd_debugfs_register(struct tps6598x *t) { (void)t; }
 static void tipd_port_list_add(struct tps6598x *t) { (void)t; }
 static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(void)f;return register_error; }
