@@ -59,7 +59,10 @@ static bool igp_read_bios_from_vram(struct radeon_device *rdev)
 
 	rdev->bios = NULL;
 	vram_base = pci_resource_start(rdev->pdev, 0);
-	bios = ioremap(vram_base, size);
+	if (pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED)
+		bios = ioremap_np(vram_base, size);
+	else
+		bios = ioremap(vram_base, size);
 	if (!bios) {
 		return false;
 	}

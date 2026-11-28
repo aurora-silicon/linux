@@ -346,7 +346,12 @@ static int radeon_doorbell_init(struct radeon_device *rdev)
 	if (rdev->doorbell.num_doorbells == 0)
 		return -EINVAL;
 
-	rdev->doorbell.ptr = ioremap(rdev->doorbell.base, rdev->doorbell.num_doorbells * sizeof(u32));
+	if (pci_resource_flags(rdev->pdev, 2) & IORESOURCE_MEM_NONPOSTED)
+		rdev->doorbell.ptr = ioremap_np(rdev->doorbell.base,
+						rdev->doorbell.num_doorbells * sizeof(u32));
+	else
+		rdev->doorbell.ptr = ioremap(rdev->doorbell.base,
+					     rdev->doorbell.num_doorbells * sizeof(u32));
 	if (rdev->doorbell.ptr == NULL) {
 		return -ENOMEM;
 	}
@@ -1399,7 +1404,12 @@ int radeon_device_init(struct radeon_device *rdev,
 		rdev->rmmio_base = pci_resource_start(rdev->pdev, 2);
 		rdev->rmmio_size = pci_resource_len(rdev->pdev, 2);
 	}
-	rdev->rmmio = ioremap(rdev->rmmio_base, rdev->rmmio_size);
+	if (pci_resource_flags(rdev->pdev,
+			       rdev->family >= CHIP_BONAIRE ? 5 : 2) &
+	    IORESOURCE_MEM_NONPOSTED)
+		rdev->rmmio = ioremap_np(rdev->rmmio_base, rdev->rmmio_size);
+	else
+		rdev->rmmio = ioremap(rdev->rmmio_base, rdev->rmmio_size);
 	if (rdev->rmmio == NULL)
 		return -ENOMEM;
 
