@@ -45,6 +45,9 @@ def check(root, output):
     #define kmalloc(n,g) malloc(n)
     #define EPIC_TYPE_COMMAND 3
     #define EPIC_CAT_COMMAND 3
+    /* The stall report reads the rings and the mailbox state; nothing here checks its text. */
+    static void afk_report_stall(struct apple_epic_service *s,u16 tag) { (void)s;(void)tag; }
+    __attribute__((unused)) static unsigned int afk_service_unanswered_locked(struct apple_epic_service *s) { (void)s;return 0; }
     static int bitmap_find_free_region(unsigned long *p,int n,int order) {
         (void)order;for(int i=0;i<n;i++) if(!test_bit(i,p)) { *p|=1UL<<i;return i; } return -ENOSPC;
     }

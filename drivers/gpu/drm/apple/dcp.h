@@ -157,7 +157,7 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
 /* Must be called from sleepable context; may sleep on 14.7/ext26 mailboxes. */
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
+int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 bool dcp_t6030_ext_native(const struct device_node *np);

@@ -2354,7 +2354,7 @@ static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+int dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	bool native_14_7 = dcp->fw_compat == DCP_FIRMWARE_V_14_7;
 	int ret;
@@ -2363,7 +2363,7 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 
 	if (READ_ONCE(dcp->quiescing) ||
 	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
-		return;
+		return -ESHUTDOWN;
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
 	 * The adopted T6030 14.7 and native26 (ext26) sessions share this
@@ -2377,10 +2377,16 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (ret && dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_err(dcp->dev, "native26 mailbox send failed ep=%#x: %d\n", endpoint, ret);
-	}
-	if (ret && native_14_7)
+	} else if (ret) {
+		/*
+		 * Nothing retries the message: an AFK doorbell lost here leaves
+		 * its command unread until a later doorbell, which a stalled
+		 * mailbox never delivers either.
+		 */
 		dev_warn_ratelimited(dcp->dev, "DCP send ep %02x failed: %d\n",
 				     endpoint, ret);
+	}
+	return ret;
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit)

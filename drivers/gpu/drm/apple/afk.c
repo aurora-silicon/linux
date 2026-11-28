@@ -21,6 +21,7 @@
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 
+#include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 
 #include "afk.h"
@@ -95,9 +96,10 @@ static unsigned int afk_service_timeout_ms(struct apple_epic_service *service)
 	return service ? afk_timeout_ms(service->ep) : MSEC_PER_SEC;
 }
 
-static void afk_send(struct apple_dcp_afkep *ep, u64 message)
+static int afk_send(struct apple_dcp_afkep *ep, u64 message)
 {
-	dcp_send_message(ep->dcp, ep->endpoint, message);
+	KUNIT_STATIC_STUB_REDIRECT(afk_send, ep, message);
+	return dcp_send_message(ep->dcp, ep->endpoint, message);
 }
 
 static void afk_release_context(void *data)
@@ -2091,9 +2093,10 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 {
 	struct epic_cmd *cmd = payload;
 	struct apple_epic_service *service;
-	unsigned long flags;
+	unsigned long flags, waited;
 	u8 idx = tag & (ep->wire_v2 ? 0xf : 0xff);
 	void *rxbuf, *txbuf;
+	bool late;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
 
@@ -2139,6 +2142,11 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	service->cmds[idx].retcode = le32_to_cpu(cmd->retcode);
 	service->cmds[idx].reply_len = le32_to_cpu(cmd->rxlen);
 	service->cmds[idx].reply_len_valid = true;
+	/* The firmware answers again: a stall from now on is a new one. */
+	service->stall_reported = false;
+	service->full_reported = false;
+	late = !service->cmds[idx].completion;
+	waited = jiffies - service->cmds[idx].queued;
 	if (service->cmds[idx].free_on_ack) {
 		/* defer freeing until we're no longer in atomic context */
 		rxbuf = service->cmds[idx].rxbuf;
@@ -2156,6 +2164,13 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		complete(service->cmds[idx].completion);
 
 	spin_unlock_irqrestore(&service->lock, flags);
+
+	/* Whether the firmware was only slow, or had stopped: say when it answered. */
+	if (late)
+		dev_info_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: chan %u tag 0x%04x answered after its timeout, %u ms after it was queued (retcode %#x)\n",
+				     ep->endpoint, channel, tag, jiffies_to_msecs(waited),
+				     le32_to_cpu(cmd->retcode));
 
 	if (rxbuf && rxlen)
 		dma_free_coherent(ep->dcp->dev, rxlen, rxbuf, rxbuf_dma);
@@ -3257,8 +3272,19 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	spin_unlock_irqrestore(&ep->lock, flags);
 
 	/* Keep tx_lock held across the doorbell so ring writes stay ordered. */
-	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
-		     FIELD_PREP(SEND_WPTR, wptr));
+	ret = afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
+			   FIELD_PREP(SEND_WPTR, wptr));
+	/*
+	 * The entry stays in the ring whatever became of its doorbell: a later
+	 * doorbell carries a later write pointer, and the firmware reads up to
+	 * that. A lost one is only noted, for afk_report_stall().
+	 */
+	if (ret) {
+		WRITE_ONCE(ep->doorbells_lost, ep->doorbells_lost + 1);
+		WRITE_ONCE(ep->doorbell_error, ret);
+	} else {
+		WRITE_ONCE(ep->doorbells_lost, 0);
+	}
 	mutex_unlock(&ep->tx_lock);
 	return 0;
 
@@ -3310,6 +3336,115 @@ static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
 	spin_unlock_irqrestore(&ep->lock, flags);
 	return tag;
 }
+
+/*
+ * A command that timed out keeps its slot, and its buffers, for the reply the
+ * firmware may still send: the firmware writes the reply into the command's
+ * buffer and names the slot in it, so both stay the command's until then
+ * (afk_recv_handle_reply()). The number of such commands on @service.
+ */
+static unsigned int afk_service_unanswered_locked(struct apple_epic_service *service)
+{
+	unsigned int i, unanswered = 0;
+
+	lockdep_assert_held(&service->lock);
+	for_each_set_bit(i, service->cmd_map, MAX_PENDING_CMDS)
+		if (!service->cmds[i].done && !service->cmds[i].completion)
+			unanswered++;
+	return unanswered;
+}
+
+/*
+ * A command of @service, @tag, timed out unanswered. The first one since the
+ * service's last reply reports what the host sees of the endpoint, once: its
+ * slots, the rings in shared memory and the doorbells. Nothing here reads the
+ * coprocessor.
+ */
+static void afk_report_stall(struct apple_epic_service *service, u16 tag)
+{
+	struct apple_dcp_afkep *ep = service->ep;
+	struct apple_rtkit *rtk = ep->dcp->rtk;
+	unsigned int held, unanswered;
+	u32 tx_r, tx_w, rx_r, rx_w;
+	unsigned long flags;
+	bool first;
+
+	spin_lock_irqsave(&service->lock, flags);
+	first = !service->stall_reported;
+	service->stall_reported = true;
+	held = bitmap_weight(service->cmd_map, MAX_PENDING_CMDS);
+	unanswered = afk_service_unanswered_locked(service);
+	spin_unlock_irqrestore(&service->lock, flags);
+	if (!first || !ep->txbfr.ready || !ep->rxbfr.ready)
+		return;
+
+	dma_rmb();
+	tx_r = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
+	tx_w = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	rx_r = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
+	rx_w = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
+	/*
+	 * Unread TX bytes are what the firmware has not taken from the ring;
+	 * equal RX pointers, that the host has read all it was sent.
+	 */
+	dev_warn(ep->dcp->dev,
+		 "AFK[ep:%02x]: %s (chan:%u) stalled at tag 0x%04x: %u of %u command slots taken, %u by timed-out commands; TX r/w %#x/%#x (%u of %zu bytes unread), RX r/w %#x/%#x; %u doorbell(s) undelivered (%d); running=%d crashed=%d\n",
+		 ep->endpoint, service->ops->name, service->channel, tag, held,
+		 MAX_PENDING_CMDS, unanswered, tx_r, tx_w,
+		 tx_w >= tx_r ? tx_w - tx_r : (u32)ep->txbfr.bufsz - tx_r + tx_w,
+		 ep->txbfr.bufsz, rx_r, rx_w,
+		 READ_ONCE(ep->doorbells_lost), READ_ONCE(ep->doorbell_error),
+		 !IS_ERR_OR_NULL(rtk) && apple_rtkit_is_running(rtk),
+		 !IS_ERR_OR_NULL(rtk) && apple_rtkit_is_crashed(rtk));
+}
+
+/**
+ * afk_service_call_unanswered - whether a standard call is already queued unanswered
+ * @service: the service the call is for
+ * @group: the call's group
+ * @command: the call's command
+ * @data: the call's input
+ * @data_len: the length of @data
+ *
+ * True when the command queued last on @service is this call, with the same
+ * input, and it timed out with its answer still to come. The call then still
+ * waits in the firmware's queue with nothing queued behind it, and a copy
+ * would only queue behind it, to the same effect. The copy would also keep a
+ * command slot of its own until the firmware answers it (see
+ * afk_service_unanswered_locked()), so a caller that repeats such a call to
+ * firmware that has stopped answering takes every slot, and the service then
+ * refuses all of its calls with -ENOSPC.
+ *
+ * Compact EPIC keeps its timed-out commands apart (compact_keep_orphans), and
+ * is not covered.
+ */
+bool afk_service_call_unanswered(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len)
+{
+	const struct epic_service_call *call;
+	const struct epic_cmd_info *cmd;
+	unsigned long flags;
+	bool queued;
+
+	if (!service || !service->ep || READ_ONCE(service->ep->compact))
+		return false;
+
+	spin_lock_irqsave(&service->lock, flags);
+	cmd = &service->cmds[service->last_slot];
+	call = cmd->txbuf;
+	/* A set slot bit keeps the buffers: the reply clears it before freeing them. */
+	queued = service->last_valid && test_bit(service->last_slot, service->cmd_map) &&
+		 cmd->tag == service->last_tag && !cmd->done && !cmd->completion &&
+		 cmd->type == EPIC_SUBTYPE_STD_SERVICE && call &&
+		 cmd->txlen >= sizeof(*call) + data_len &&
+		 le32_to_cpu(call->magic) == EPIC_SERVICE_CALL_MAGIC &&
+		 le16_to_cpu(call->group) == group &&
+		 le32_to_cpu(call->command) == command &&
+		 (!data_len || !memcmp(call + 1, data, data_len));
+	spin_unlock_irqrestore(&service->lock, flags);
+	return queued;
+}
+EXPORT_SYMBOL_IF_KUNIT(afk_service_call_unanswered);
 
 static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   const void *payload, size_t payload_len,
@@ -3481,6 +3616,13 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	}
 	idx = bitmap_find_free_region(service->cmd_map, MAX_PENDING_CMDS, 0);
 	if (idx < 0) {
+		/* Once until the next reply: every call is refused until then. */
+		if (!service->full_reported)
+			dev_warn(ep->dcp->dev,
+				 "AFK[ep:%02x]: %s (chan:%u) has no free command slot: %u of %u held by timed-out commands still unanswered\n",
+				 ep->endpoint, service->ops->name, service->channel,
+				 afk_service_unanswered_locked(service), MAX_PENDING_CMDS);
+		service->full_reported = true;
 		ret = -ENOSPC;
 		goto err_unlock;
 	}
@@ -3501,6 +3643,10 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].free_on_ack = false;
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = &completion;
+	service->cmds[idx].queued = jiffies;
+	service->last_slot = idx;
+	service->last_tag = tag;
+	service->last_valid = true;
 	init_completion(&completion);
 	spin_unlock_irqrestore(&service->lock, flags);
 
@@ -3542,21 +3688,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
 				 ep->endpoint, service->ops->name, service->channel,
 				 type, tag, timeout_ms);
-			if (ep->dcp->external && ep->txbfr.ready && ep->rxbfr.ready) {
-				/* Diagnostic snapshot of shared RAM, not coprocessor MMIO.
-				 * Unequal TX pointers mean firmware has not drained the queue.
-				 */
-				dma_rmb();
-				dev_warn(ep->dcp->dev,
-					 "AFK timeout channel=%u tag=%#x TX r/w=%#x/%#x RX r/w=%#x/%#x running=%d crashed=%d\n",
-					 service->channel, tag,
-					 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)),
-					 le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)),
-					 le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr)),
-					 le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr)),
-					 apple_rtkit_is_running(ep->dcp->rtk),
-					 apple_rtkit_is_crashed(ep->dcp->rtk));
-			}
+			afk_report_stall(service, tag);
 			afk_service_put(service);
 			return -ETIMEDOUT;
 		}
@@ -3962,6 +4094,10 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
 #include "afk-parser-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "afk-stall-test.c"
 #endif
 
 /* Called after RX and the ordered endpoint worker have been joined. */
