@@ -333,7 +333,7 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
 	/*
-	 * Bits 10 to 15 are reported only by the G17P runtime.
+	 * Bits 10 to 16 are the HAL200/G16/G17P command-stream features.
 	 */
 
 	/**
@@ -542,6 +542,76 @@ enum drm_asahi_feature {
  * those of enum drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_ASYNC_SUBMIT ((1ULL) << 39)
+
+/*
+ * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
+ * root of a render's VDM stream may set the USC cache invalidate (bit 3).
+ * Reported on every GPU: the kernel's stream checks admit the barrier word
+ * with or without it. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
+
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_ONLY: the device runs compute commands only.
+ * DRM_ASAHI_CMD_RENDER is refused, so the device cannot serve graphics APIs;
+ * userspace should not offer it for them. Compute commands, the VM and GEM
+ * interfaces are unaffected. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
+
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
+ * independent compute commands of one queue on several firmware compute
+ * queues of its context, so that they overlap. Userspace needs no further
+ * queues of its own for that. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
+
+/*
+ * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK: DRM_IOCTL_ASAHI_GEM_USERPTR does not
+ * charge its pins to the caller's RLIMIT_MEMLOCK; only the GPU memory limits
+ * bound them (see struct drm_asahi_gem_userptr). Kernels that report
+ * DRM_ASAHI_FEATURE_USERPTR without it refuse with ENOMEM a range that
+ * exceeds that limit, unless the caller has CAP_IPC_LOCK, so userspace can
+ * check the limit before it offers imports of arbitrary size. Bit 42 is
+ * reserved for DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS: a render command that sets
+ * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS still waits for the earlier renders its
+ * barriers name: the fragment half waits for them to finish before it
+ * starts. Kernels that report DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS without
+ * this bit may drop that wait, so userspace that uses the flag to order a
+ * render after earlier ones must check for this bit. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS ((1ULL) << 44)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS: every fragment pass of a render
+ * command, including partial renders the firmware runs when the tiler heap
+ * fills, starts only after the fragment work its fragment half is ordered
+ * after has completed: the earlier fragment work of its physical queue and
+ * the renders named by its fragment barriers. Userspace may then order a
+ * render's attachment loads and stores against an earlier render with
+ * fragment-stage ordering alone, without a tiling-half wait. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS ((1ULL) << 45)
+
+/*
+ * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands on this GPU accept tile
+ * buffers of up to 48 KiB (sample_size_B * utile_width_px * utile_height_px *
+ * samples <= 49152). Without it, 32 KiB is the portable limit. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_TILE_BUFFER_48K ((1ULL) << 46)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
@@ -774,12 +844,12 @@ struct drm_asahi_gem_create {
  * object stays the parent's memory. The CPU and GPU views are coherent
  * without cache maintenance.
  *
- * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
- * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
- * and their size against the client and device limits of
+ * The size of the object counts against the client and device limits of
  * drm_asahi_params_global::client_memory_limit and
- * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
- * memory-pressure reclaim.
+ * drm_asahi_params_global::memory_limit (ENOMEM), as that of a
+ * DRM_IOCTL_ASAHI_GEM_CREATE object does. The pinned pages are shown in the
+ * caller's VmPin (mm->pinned_vm) but are not limited by its RLIMIT_MEMLOCK.
+ * They are never released by memory-pressure reclaim.
  *
  * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
  * writable, and not be a shared mapping of a file whose filesystem tracks
@@ -2283,10 +2353,12 @@ enum drm_asahi_compute_flags {
 	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 16),
 
 	/**
-	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command neither copies nor
-	 * resets queries, so it cannot observe timestamps the kernel publishes
-	 * for earlier commands and need not wait for that publication. Requires
-	 * DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
+	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command reads and writes no
+	 * timestamp or availability word whose host publication by the kernel
+	 * is still pending for an earlier command, so it need not wait for that
+	 * publication. The command may copy or reset queries whose words are
+	 * all already published, or were never bound for host timestamps.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
 	 */
 	DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS = (1L << 17),
 

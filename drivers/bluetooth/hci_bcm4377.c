@@ -441,6 +441,7 @@ struct bcm4377_transfer_ring {
 	size_t mapped_payload_size;
 	u8 completion_ring;
 	u16 n_entries;
+	u16 head;
 	u8 generation;
 
 	bool sync;
@@ -604,6 +605,8 @@ struct bcm4377_data {
 	const char *board_type;
 
 	bool needs_reset;
+	/* Fresh from a power loss: in reset already, the next reset skips the FLR */
+	bool power_lost;
 	/* Set while bcm4377_pci_reset() resets the function itself. */
 	bool own_reset;
 	bool cal_needed;
@@ -621,6 +624,8 @@ struct bcm4377_data {
 	bool resume_guarded;
 	bool resume_recovering;
 	struct work_struct resume_work;
+	/* Boots the firmware again after a sleep that took the function's power */
+	struct work_struct power_lost_work;
 	bdaddr_t bdaddr;
 
 	wait_queue_head_t event;
@@ -672,6 +677,19 @@ static void bcm4377_ring_doorbell(struct bcm4377_data *bcm4377, u8 doorbell,
 	iowrite32(db, bcm4377->bar0 + BCM4377_BAR0_DOORBELL);
 }
 
+/*
+ * The producer index of a transfer ring is kept by the host. The copy in
+ * ring_state is shared with the device and only ever written here, never
+ * read back, so what the device writes there cannot move the slot the host
+ * fills next.
+ */
+static void bcm4377_set_xfer_head(struct bcm4377_data *bcm4377,
+				  struct bcm4377_transfer_ring *ring, u16 head)
+{
+	ring->head = head;
+	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = cpu_to_le16(head);
+}
+
 static int bcm4377_extract_msgid(struct bcm4377_data *bcm4377,
 				 struct bcm4377_transfer_ring *ring,
 				 u16 raw_msgid, u8 *msgid)
@@ -700,7 +718,7 @@ static int bcm4377_extract_msgid(struct bcm4377_data *bcm4377,
 static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 				 struct bcm4377_transfer_ring *ring,
 				 u16 raw_msgid, u8 entry_flags, u8 type,
-				 void *payload, size_t len)
+				 void *payload, size_t len, size_t footer_size)
 {
 	struct sk_buff *skb;
 	u16 head;
@@ -729,6 +747,12 @@ static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 		}
 
 		payload = ring->payloads + msgid * ring->mapped_payload_size;
+	} else if (len > footer_size) {
+		/* The payload is in the completion entry's footer. */
+		dev_warn(&bcm4377->pdev->dev,
+			 "invalid footer payload len in event for ring %d: %zu > %zu\n",
+			 ring->ring_id, len, footer_size);
+		goto out;
 	}
 
 	skb = bt_skb_alloc(len, GFP_ATOMIC);
@@ -740,9 +764,8 @@ static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 	hci_recv_frame(bcm4377->hdev, skb);
 
 out:
-	head = le16_to_cpu(bcm4377->ring_state->xfer_ring_head[ring->ring_id]);
-	head = (head + 1) % ring->n_entries;
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = cpu_to_le16(head);
+	head = (ring->head + 1) % ring->n_entries;
+	bcm4377_set_xfer_head(bcm4377, ring, head);
 
 	bcm4377_ring_doorbell(bcm4377, ring->doorbell, head);
 
@@ -832,17 +855,17 @@ static void bcm4377_handle_completion(struct bcm4377_data *bcm4377,
 	case BCM4377_XFER_RING_HCI_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->hci_d2h_ring, msg_id,
 				     entry->flags, HCI_EVENT_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 	case BCM4377_XFER_RING_SCO_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->sco_d2h_ring, msg_id,
 				     entry->flags, HCI_SCODATA_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 	case BCM4377_XFER_RING_ACL_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->acl_d2h_ring, msg_id,
 				     entry->flags, HCI_ACLDATA_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 
 	default:
@@ -856,26 +879,31 @@ static void bcm4377_handle_completion(struct bcm4377_data *bcm4377,
 static void bcm4377_poll_completion_ring(struct bcm4377_data *bcm4377,
 					 struct bcm4377_completion_ring *ring)
 {
-	u16 tail;
 	__le16 *heads = bcm4377->ring_state->completion_ring_head;
 	__le16 *tails = bcm4377->ring_state->completion_ring_tail;
+	u16 head, tail, i;
 
 	if (!ring->enabled)
 		return;
 
+	/* Sample the producer index after the interrupt status read. */
+	dma_rmb();
+	head = le16_to_cpu(READ_ONCE(heads[ring->ring_id]));
+	if (head >= ring->n_entries) {
+		dev_warn_ratelimited(&bcm4377->pdev->dev,
+				     "invalid head %u for completion ring %u\n",
+				     head, ring->ring_id);
+		return;
+	}
+
 	tail = le16_to_cpu(tails[ring->ring_id]);
 	dev_dbg(&bcm4377->pdev->dev,
 		"completion ring #%d: head: %d, tail: %d\n", ring->ring_id,
-		le16_to_cpu(heads[ring->ring_id]), tail);
+		head, tail);
 
-	while (tail != le16_to_cpu(READ_ONCE(heads[ring->ring_id]))) {
-		/*
-		 * ensure the CPU doesn't speculate through the comparison.
-		 * otherwise it might already read the (empty) queue entry
-		 * before the updated head has been loaded and checked.
-		 */
-		dma_rmb();
-
+	/* Read the published entries after observing the device's head. */
+	dma_rmb();
+	for (i = 0; tail != head && i < ring->n_entries; i++) {
 		bcm4377_handle_completion(bcm4377, ring, tail);
 
 		tail = (tail + 1) % ring->n_entries;
@@ -985,7 +1013,7 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 
 	spin_lock_irqsave(&ring->lock, flags);
 
-	head = le16_to_cpu(bcm4377->ring_state->xfer_ring_head[ring->ring_id]);
+	head = ring->head;
 	tail = le16_to_cpu(bcm4377->ring_state->xfer_ring_tail[ring->ring_id]);
 
 	new_head = (head + 1) % ring->n_entries;
@@ -1042,8 +1070,7 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 	dev_dbg(&bcm4377->pdev->dev,
 		"updating head for transfer queue #%d to %d\n", ring->ring_id,
 		new_head);
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] =
-		cpu_to_le16(new_head);
+	bcm4377_set_xfer_head(bcm4377, ring, new_head);
 
 	if (!ring->sync)
 		bcm4377_ring_doorbell(bcm4377, ring->doorbell, new_head);
@@ -1148,7 +1175,7 @@ static int bcm4377_create_transfer_ring(struct bcm4377_data *bcm4377,
 	msg.flags = cpu_to_le16(flags);
 	msg.footer_size = ring->payload_size / 4;
 
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = 0;
+	bcm4377_set_xfer_head(bcm4377, ring, 0);
 	bcm4377->ring_state->xfer_ring_tail[ring->ring_id] = 0;
 	ring->generation++;
 	spin_unlock_irqrestore(&ring->lock, spinlock_flags);
@@ -1181,8 +1208,7 @@ static int bcm4377_create_transfer_ring(struct bcm4377_data *bcm4377,
 	 * to reply by acknowledging them in the completion ring
 	 */
 	if (ring->virtual || ring->d2h_buffers_only) {
-		bcm4377->ring_state->xfer_ring_head[ring->ring_id] =
-			cpu_to_le16(0xf);
+		bcm4377_set_xfer_head(bcm4377, ring, 0xf);
 		bcm4377_ring_doorbell(bcm4377, ring->doorbell, 0xf);
 	}
 
@@ -1427,16 +1453,23 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	if (bcm4377->hw->disable_aspm)
 		bcm4377_disable_aspm(bcm4377);
 
-	WRITE_ONCE(bcm4377->own_reset, true);
-	ret = pci_reset_function(bcm4377->pdev);
-	WRITE_ONCE(bcm4377->own_reset, false);
-	if (ret) {
-		dev_err(&bcm4377->pdev->dev,
-			"function level reset failed: %d\n", ret);
-		goto out_irq;
-	}
+	/*
+	 * A function that lost its power came back from PERST#, with its port's settle
+	 * time behind it: the FLR, and the wait for the chip after it, add nothing.
+	 */
+	if (!bcm4377->power_lost) {
+		WRITE_ONCE(bcm4377->own_reset, true);
+		ret = pci_reset_function(bcm4377->pdev);
+		WRITE_ONCE(bcm4377->own_reset, false);
+		if (ret) {
+			dev_err(&bcm4377->pdev->dev,
+				"function level reset failed: %d\n", ret);
+			goto out_irq;
+		}
 
-	msleep(100);
+		msleep(100);
+	}
+	bcm4377->power_lost = false;
 
 	pci_set_master(bcm4377->pdev);
 
@@ -1451,6 +1484,7 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	WRITE_ONCE(bcm4377->rti_status, 0);
 
 	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
+	bcm4377->control_h2d_ring.head = 0;
 	bcm4377->control_h2d_ring.generation = 0;
 	bcm4377->control_ack_ring.enabled = false;
 	bitmap_zero(bcm4377->control_h2d_ring.msgids,
@@ -1690,6 +1724,7 @@ static void bcm4377_resume_recovery_work(struct work_struct *work)
 }
 
 static void bcm4377_hci_reset(struct hci_dev *hdev);
+static void bcm4377_power_lost_work(struct work_struct *work);
 
 static void bcm4377_hci_timeout(struct hci_dev *hdev)
 {
@@ -1776,6 +1811,7 @@ static int bcm4377_hci_open(struct hci_dev *hdev)
 static int bcm4377_hci_close(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	bool reset_requested = bcm4377->needs_reset;
 
 	bcm4377_resume_recovery_invalidate(bcm4377);
 	dev_dbg(&bcm4377->pdev->dev, "destroying rings in hci_close\n");
@@ -1814,8 +1850,10 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 	}
 
 	if (bcm4377->needs_reset) {
-		/* A queued rebind resets it in probe: there is no next open. */
-		if (!test_bit(0, &bcm4377->reset_pending))
+		if (reset_requested)
+			dev_dbg(&bcm4377->pdev->dev,
+				"transport reset on next open, as requested\n");
+		else
 			dev_warn(&bcm4377->pdev->dev,
 				 "transport needs hardware reset on next open\n");
 		bcm4377->acl_d2h_ring.enabled = false;
@@ -1944,11 +1982,39 @@ static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	return 0;
 }
 
+/*
+ * The ACL transfer ring takes at most MAX_ACL_PAYLOAD_SIZE bytes per entry
+ * (HCI_MAX_ACL_SIZE of data), and bcm4377_enqueue() refuses anything larger.
+ * The core fragments ACL data to the MTUs the controller reports, so a
+ * controller that reports more than the ring takes would have every larger
+ * fragment dropped. Fragment to what the ring takes instead.
+ */
+static void bcm4377_clamp_acl_mtu(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	if (hdev->acl_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller ACL MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->acl_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->acl_mtu = HCI_MAX_ACL_SIZE;
+	}
+
+	if (hdev->le_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller LE MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->le_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->le_mtu = HCI_MAX_ACL_SIZE;
+	}
+}
+
 static int bcm4377_hci_post_init(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	const bdaddr_t *bda = NULL;
 	int ret;
+
+	bcm4377_clamp_acl_mtu(hdev);
 
 	if (!bcm4377->cal_needed)
 		return 0;
@@ -2779,10 +2845,13 @@ static void bcm4377_reset_work(struct work_struct *work)
 	 * Remove and probe again: probe resets the function and boots the
 	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
 	 * which is why this work and its device reference live outside it.
+	 * A timeout during system resume gets here while the driver core
+	 * blocks probing: the probe is deferred and runs once resume completes.
 	 */
 	ret = device_reprobe(&rw->pdev->dev);
-	/* A BCM4388 defers until its Wi-Fi function is bound again: the retry binds it. */
-	if (ret && ret != -EPROBE_DEFER)
+	if (ret == -EPROBE_DEFER)
+		dev_info(&rw->pdev->dev, "reprobe after command timeout deferred\n");
+	else if (ret)
 		dev_err(&rw->pdev->dev, "reprobe after command timeout failed: %d\n", ret);
 
 	pci_dev_put(rw->pdev);
@@ -2795,8 +2864,8 @@ static void bcm4377_reset_work(struct work_struct *work)
  * every later command times out until the module is reloaded. Recover the
  * same way, by rebinding the driver.
  */
-static void __bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
-				   const char *why, bool expected)
+static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
+				 const char *why)
 {
 	struct hci_dev *hdev = bcm4377->hdev;
 	struct bcm4377_reset_work *rw;
@@ -2818,19 +2887,10 @@ static void __bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
 		return;
 	}
 
-	if (expected)
-		bt_dev_info(hdev, "%s, rebinding the driver", why);
-	else
-		bt_dev_err(hdev, "%s, rebinding the driver", why);
+	bt_dev_err(hdev, "%s, rebinding the driver", why);
 	rw->pdev = pci_dev_get(bcm4377->pdev);
 	INIT_WORK(&rw->work, bcm4377_reset_work);
 	queue_work(bcm4377_reset_wq, &rw->work);
-}
-
-static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
-				 const char *why)
-{
-	__bcm4377_queue_rebind(bcm4377, why, false);
 }
 
 static void bcm4377_hci_reset(struct hci_dev *hdev)
@@ -2885,6 +2945,7 @@ static void bcm4377_hci_unregister_dev(void *data)
 	struct hci_dev *hdev = data;
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 
+	cancel_work_sync(&bcm4377->power_lost_work);
 	bcm4377_resume_recovery_stop(bcm4377);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
@@ -2979,6 +3040,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_DELAYED_WORK(&bcm4377->setup_retry_work, bcm4377_setup_retry_work);
 	spin_lock_init(&bcm4377->resume_lock);
 	INIT_WORK(&bcm4377->resume_work, bcm4377_resume_recovery_work);
+	INIT_WORK(&bcm4377->power_lost_work, bcm4377_power_lost_work);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -3126,6 +3188,33 @@ static void bcm4377_sleep_finish(struct device *dev)
 
 static int bcm4377_resume(struct device *dev);
 
+/*
+ * After a sleep that took the function's power. The transport is marked for a reset, so
+ * the close touches neither the rings nor the firmware, and the open boots the firmware
+ * and sends the calibration again. Only then does the HCI core resume, with commands the
+ * controller can answer. A controller that was off boots on its next open.
+ */
+static void bcm4377_power_lost_work(struct work_struct *work)
+{
+	struct bcm4377_data *bcm4377 = container_of(work, struct bcm4377_data,
+						 power_lost_work);
+	struct hci_dev *hdev = bcm4377->hdev;
+	int ret = 0;
+
+	hci_req_sync_lock(hdev);
+	if (test_bit(HCI_UP, &hdev->flags))
+		ret = hci_reset_dev_sync(hdev);
+	hci_req_sync_unlock(hdev);
+	if (ret) {
+		bt_dev_err(hdev, "firmware not back after the sleep: %d", ret);
+		return;
+	}
+	bt_dev_info(hdev, "firmware booted again after the sleep");
+	ret = hci_resume_dev(hdev);
+	if (ret)
+		bt_dev_err(hdev, "resume after the sleep failed: %d", ret);
+}
+
 static int __bcm4377_suspend(struct device *dev, bool wake)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -3135,9 +3224,11 @@ static int __bcm4377_suspend(struct device *dev, bool wake)
 	ret = apple_radio_sleep_endpoint_prepare(dev, bcm4377_sleep_finish);
 	if (ret)
 		return ret;
-	if (apple_radio_sleep_owned(dev) && device_may_wakeup(dev))
+	if (wake && apple_radio_sleep_owned(dev) && device_may_wakeup(dev))
 		return -EBUSY;
 
+	/* A firmware boot after the last sleep finishes before this one. */
+	flush_work(&bcm4377->power_lost_work);
 	bcm4377_resume_recovery_stop(bcm4377);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, true);
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
@@ -3234,7 +3325,7 @@ static int bcm4377_restore(struct device *dev)
 	/* The firmware's rings are not the image's: reset at the close. */
 	bcm4377->needs_reset = true;
 	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-	__bcm4377_queue_rebind(bcm4377, "restored from hibernation", true);
+	bcm4377_queue_rebind(bcm4377, "restored from hibernation");
 	return 0;
 }
 
@@ -3256,16 +3347,20 @@ static int bcm4377_resume(struct device *dev)
 
 	/*
 	 * A real sleep took the function's power: the firmware is gone, and every resume command
-	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
-	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 * would only time out (two times 2 s inside the system resume). Restore the private BAR0
+	 * windows and mark needs_reset so that neither the close before the firmware boots again
+	 * nor a stray frame can write BAR0 through unconfigured reset windows. Skip the resume
+	 * commands here: bcm4377_power_lost_work() boots the firmware and then resumes the HCI
+	 * core, outside the system resume.
 	 */
 	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
-		/* No firmware to take the rings down at the close before the rebind. */
 		bcm4377->needs_reset = true;
+		bcm4377->power_lost = true;
+		bcm4377_init_cfg(bcm4377);
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
-		__bcm4377_queue_rebind(bcm4377, "power lost in the sleep", true);
+		queue_work(system_freezable_wq, &bcm4377->power_lost_work);
 		return 0;
 	}
 
@@ -3477,3 +3572,7 @@ MODULE_FIRMWARE("brcm/brcmbt4387*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4387*.ptb");
 MODULE_FIRMWARE("brcm/brcmbt4388*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4388*.ptb");
+
+#if IS_ENABLED(CONFIG_BT_HCIBCM4377_KUNIT_TEST)
+#include "hci_bcm4377_test.c"
+#endif

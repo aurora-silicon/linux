@@ -118,6 +118,14 @@ struct ane_h16_device {
 	bool program_ready;
 	/* Firmware suspended and the engine power gated for system sleep. */
 	bool slept;
+	/* Powered off at idle (or after system sleep) until the next request. */
+	bool parked;
+	/* System sleep transition under way (PM_SUSPEND_PREPARE..PM_POST_SUSPEND). */
+	bool in_sleep;
+	/* Runtime PM autosuspend enabled on h->dev, and our own holds on it. */
+	bool rpm_enabled;
+	bool rpm_held;
+	bool rpm_busy;
 	/* genpd's transitions of each of the five domains across a sleep. */
 	struct ane_h16_genpd {
 		struct notifier_block nb;
@@ -207,12 +215,53 @@ static void ane_h16_log(void *ctx, const char *item, u64 a, u64 b)
 	dev_info(h->dev, "H16 %s %llx %llx\n", item, a, b);
 }
 
+/* Engines that cycle cold across sleep park through runtime PM between requests. */
+static bool ane_h16_rpm(const struct ane_h16_device *h)
+{
+	return h->boot.soc->sleep_cold && !h->boot.soc->sleep_warm;
+}
+
+/*
+ * The parked engine's autosuspend delay: a request that finds it parked waits
+ * for a cold boot from the preload and the replay of its programs (~10-18 ms).
+ * Two seconds keep that under 1% of a pause longer than the delay and prevent
+ * cycling power faster than every two seconds. power/autosuspend_delay_ms
+ * changes it; a negative value keeps the engine up until the next system sleep.
+ */
+#define ANE_H16_AUTOSUSPEND_MS 2000
+
+static void ane_h16_rpm_pin(struct ane_h16_device *h)
+{
+	lockdep_assert_held(&ane_h16_lock);
+	if (h->rpm_enabled && h->engine_on && !h->rpm_held) {
+		pm_runtime_get_noresume(h->dev);
+		h->rpm_held = true;
+	}
+}
+
+/*
+ * After bring-up: hand the device's runtime PM reference to autosuspend, which
+ * parks the engine once idle for ANE_H16_AUTOSUSPEND_MS. A quarantined engine
+ * keeps its reference.
+ */
+static void ane_h16_rpm_idle(struct ane_h16_device *h)
+{
+	lockdep_assert_held(&ane_h16_lock);
+	if (!h->rpm_enabled || !h->rpm_held || !h->program_ready ||
+	    h->boot.quarantined || h->session.quarantined)
+		return;
+	h->rpm_held = false;
+	pm_runtime_mark_last_busy(h->dev);
+	pm_runtime_put_autosuspend(h->dev);
+}
+
 static void ane_h16_startup_fwlog(struct ane_h16_device *h);
 
 static void ane_h16_quarantine(void *ctx, int error)
 {
 	struct ane_h16_device *h = ctx;
 
+	ane_h16_rpm_pin(h);
 	if ((error == -ETIMEDOUT || error == -ESHUTDOWN) && h->boot.stage == ANE_H16_BOOT)
 		ane_h16_startup_fwlog(h);
 
@@ -340,8 +389,8 @@ static void ane_h16_power_down(struct ane_h16_device *h)
 		pm_runtime_put_sync(h->dart[i]);
 	for (i = h->powered; i-- > 0; )
 		pm_runtime_put_sync(h->power[i]);
-	h->engine_on = false;
-	dev_info(h->dev, "H16 ANE: powered down for system sleep\n");
+	WRITE_ONCE(h->engine_on, false);
+	dev_info(h->dev, "H16 ANE: powered down\n");
 }
 
 /* The five domains in order, then the DARTs (their resume restores SID0). */
@@ -360,7 +409,7 @@ static int ane_h16_power_up(struct ane_h16_device *h)
 		if (ret < 0)
 			goto dart;
 	}
-	h->engine_on = true;
+	WRITE_ONCE(h->engine_on, true);
 	return 0;
 dart:
 	while (j--)
@@ -478,8 +527,9 @@ static void ane_h16_genpd_record(struct ane_h16_device *h)
  * again. At runtime the ANE DARTs, which sit in it, hold it on, so it stays
  * on across a runtime power cycle of the other four. A firmware startup stall
  * on the J616s survives that, and is cleared once sys is off too, as it is in
- * system sleep. The DARTs keep their SID0 state across it, as they do across
- * system sleep (the ANE DART's suspend and resume neither save nor restore).
+ * system sleep. When sys powers off in runtime suspend or system sleep, the
+ * ANE DARTs suspend first and save/restore TTBR and TCR across the cycle; an
+ * isolated sys cycle leaves their SID0 state intact across the reset.
  */
 static int ane_h16_sys_cycle(struct ane_h16_device *h)
 {
@@ -593,15 +643,152 @@ static int ane_h16_boot_again(struct ane_h16_device *h, unsigned int *restarts,
 	return ret;
 }
 
-static int ane_h16_cold_boot(struct ane_h16_device *h)
+static int ane_h16_cold_boot(struct ane_h16_device *h, unsigned int *restarts,
+			     const char *what, const char *why, bool recover)
 {
 	int ret;
 
 	ret = ane_h16_power_cycle(h, false);
 	if (ret)
 		return ret;
-	return ane_h16_boot_again(h, &h->resume_restarts, "resume restart/budget",
-				  "after system sleep", h->sleep_quarantined);
+	return ane_h16_boot_again(h, restarts, what, why, recover);
+}
+
+/*
+ * Boot a parked engine from the preload, as after a cold system sleep, and
+ * replay every open program behind its handle. Caller holds ane_h16_lock.
+ */
+static void ane_h16_unpark(struct ane_h16_device *h)
+{
+	unsigned int restarts = 0;
+	u64 start;
+	int ret;
+
+	lockdep_assert_held(&ane_h16_lock);
+	if (!h->parked || READ_ONCE(h->in_sleep))
+		return;
+	start = ktime_get_ns();
+	h->resume_ready_ns = 0;
+	h->resume_first_ns = 0;
+	h->resume_replayed = 0;
+	ret = ane_h16_cold_boot(h, &restarts, "wake restart/budget",
+				"on runtime wake", false);
+	WRITE_ONCE(h->parked, false);
+	WRITE_ONCE(h->session.parked, false);
+	if (ret) {
+		/* Power and mappings stay for diagnosis: quarantine pins the device. */
+		ane_h16_quarantine(h, ret);
+		h->boot.quarantined = true;
+		h->session.quarantined = true;
+	}
+	ane_h16_session_sleep(&h->session, false);
+	dev_info(h->dev, "H16 ANE: up for a request%s in %llu ms, %u programs replayed, %u restarts\n",
+		 ret ? " FAILED" : "", div_u64(ktime_get_ns() - start, NSEC_PER_MSEC),
+		 h->resume_replayed, restarts);
+}
+
+/*
+ * A request for a parked engine: runtime PM resumes the device (and its
+ * DART suppliers) and its resume callback boots the engine. Called without
+ * ane_h16_lock, which the callback takes.
+ */
+static int ane_h16_session_wake(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	int ret;
+
+	if (!READ_ONCE(h->parked))
+		return 0;
+	/* The system is going to sleep or coming back: PM_POST_SUSPEND wakes waiters. */
+	if (READ_ONCE(h->in_sleep))
+		return -EAGAIN;
+	ret = pm_runtime_resume_and_get(h->dev);
+	if (ret < 0)
+		return ret;
+	/*
+	 * Still parked: either the device never suspended (runtime PM forbidden
+	 * or a negative autosuspend delay) and a system sleep parked the engine,
+	 * or a system sleep began and prevented the resume callback from booting
+	 * it.
+	 */
+	if (READ_ONCE(h->parked)) {
+		guard(mutex)(&ane_h16_lock);
+		ane_h16_unpark(h);
+	}
+	if (READ_ONCE(h->parked)) {
+		pm_runtime_put_sync_suspend(h->dev);
+		return -EAGAIN;
+	}
+	pm_runtime_mark_last_busy(h->dev);
+	pm_runtime_put_autosuspend(h->dev);
+	return READ_ONCE(h->session.quarantined) ? -EIO : 0;
+}
+
+/*
+ * Runtime suspend after the autosuspend delay: drain in-flight requests,
+ * power down the five domains and explicit DART holds, and leave the session
+ * closed and parked. Returning 0 drops the DART device links so all three
+ * ANE IOMMUs and ANE_SYS power off until the next request.
+ */
+int ane_h16_backend_runtime_suspend(struct device *dev)
+{
+	struct ane_h16_device *h = dev_get_drvdata(dev);
+
+	/* Powered off already (or pre-acquire): nothing to stop, no lock needed. */
+	if (!h || !READ_ONCE(h->rpm_enabled) || !READ_ONCE(h->engine_on))
+		return 0;
+	guard(mutex)(&ane_h16_lock);
+	if (!h->engine_on)
+		return 0;
+	/* Bringing up, quarantined, recovering, or in a system sleep. */
+	if (!h->program_ready || READ_ONCE(h->in_sleep) || h->boot.quarantined ||
+	    READ_ONCE(h->session.quarantined) || READ_ONCE(h->recovering))
+		return -EBUSY;
+	/* Closes admission, waits for requests in flight and releases gating. */
+	ane_h16_session_sleep(&h->session, true);
+	/* Gate release quarantined it: leave recovery to ane_h16_hung(). */
+	if (READ_ONCE(h->session.quarantined)) {
+		ane_h16_session_sleep(&h->session, false);
+		return -EBUSY;
+	}
+	/*
+	 * An execute that raced the autosuspend boundary may have finished while
+	 * draining and refreshed last_busy: wait out the new delay instead of
+	 * parking right after it.
+	 */
+	if (pm_runtime_autosuspend_expiration(dev)) {
+		ane_h16_session_sleep(&h->session, false);
+		return -EBUSY;
+	}
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
+		if (h->boot.transport.pending[ch].active) {
+			/* Something is still pending on a ring: autosuspend tries later. */
+			ane_h16_session_sleep(&h->session, false);
+			pm_runtime_mark_last_busy(dev);
+			return -EBUSY;
+		}
+	}
+	ane_h16_power_down(h);
+	WRITE_ONCE(h->parked, true);
+	WRITE_ONCE(h->session.parked, true);
+	wake_up_all(&h->session.wake);
+	dev_info(dev, "H16 ANE: idle: parked until the next request\n");
+	return 0;
+}
+
+/* Runtime resume for a request (ane_h16_session_wake()): boot the parked engine. */
+int ane_h16_backend_runtime_resume(struct device *dev)
+{
+	struct ane_h16_device *h = dev_get_drvdata(dev);
+
+	/* Only a parked engine that serves programs is booted here. */
+	if (!h || !READ_ONCE(h->rpm_enabled) || !READ_ONCE(h->program_ready) ||
+	    !READ_ONCE(h->parked))
+		return 0;
+	guard(mutex)(&ane_h16_lock);
+	ane_h16_unpark(h);
+	/* A failed boot is the quarantine's to report: the device itself is up. */
+	return 0;
 }
 
 /*
@@ -646,15 +833,19 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 	int ret;
 
 	guard(mutex)(&ane_h16_lock);
+	/* Parked: already off, with nothing to stop. */
+	if (h->parked)
+		return 0;
 	for (unsigned int i = 0; i < ARRAY_SIZE(h->genpd); i++) {
 		h->genpd[i].offs = 0;
 		h->genpd[i].ons = 0;
 		h->genpd[i].off_at = 0;
 		h->genpd[i].off_ns = 0;
 	}
-	h->sleep_quarantined = false;
+	WRITE_ONCE(h->sleep_quarantined, false);
 	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
+	ane_h16_session_sleep(&h->session, true);
 	/* Without hung_stop a quarantined session stays so across the sleep. */
 	if (ane_t6021_hung_stop && (h->boot.quarantined || h->session.quarantined)) {
 		unsigned int held;
@@ -664,18 +855,20 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		 * off under it, DARTs held until its domains are off, and boot
 		 * it cold on resume if every domain went off.
 		 */
-		ane_h16_session_sleep(&h->session, true);
 		if (h->engine_on) {
 			held = ane_h16_hold_darts(h);
 			ane_h16_power_down(h);
 			ane_h16_release_darts(h, held);
 		}
-		h->sleep_quarantined = true;
+		if (h->rpm_enabled && h->rpm_held) {
+			h->rpm_held = false;
+			pm_runtime_put_noidle(h->dev);
+		}
+		WRITE_ONCE(h->sleep_quarantined, true);
 		dev_info(h->dev, "H16 ANE: quarantined engine powered off for system sleep\n");
 		WRITE_ONCE(h->slept, true);
 		return 0;
 	}
-	ane_h16_session_sleep(&h->session, true);
 	if (!h->boot.soc->sleep_warm) {
 		/* Cold cycle: nothing in flight, then power off under the firmware. */
 		for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
@@ -704,57 +897,100 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 
 static void ane_h16_sleep_resume(struct ane_h16_device *h)
 {
+	bool rpm = READ_ONCE(h->rpm_enabled);
+	bool held = false;
 	s64 ready, first;
 	u64 start;
 	int ret;
 
-	guard(mutex)(&ane_h16_lock);
-	if (!h->slept)
-		return;
-	start = ktime_get_ns();
-	h->resume_ready_ns = 0;
-	h->resume_first_ns = 0;
-	h->resume_replayed = 0;
-	h->resume_cold = !h->boot.soc->sleep_warm || h->sleep_quarantined;
-	h->resume_restarts = 0;
-	if (h->sleep_quarantined && !ane_h16_slept_off(h)) {
-		/* Not proven off: the old firmware may still run. Keep it. */
-		dev_err(h->dev, "H16 ANE: a domain of the quarantined engine never went off; kept quarantined\n");
-		ret = ane_h16_power_up(h);
-		if (!ret)
-			ret = -EIO;
-	} else if (h->resume_cold) {
-		ret = ane_h16_cold_boot(h);
-	} else {
-		ret = ane_h16_warm_boot(h);
-		if (ret) {
-			dev_warn(h->dev, "H16 ANE: warm boot failed (%d); cold boot and program replay\n",
-				 ret);
-			h->resume_cold = true;
-			ret = ane_h16_cold_boot(h);
+	/*
+	 * Normal runtime-PM sleep stays parked after wake until a request
+	 * needs the engine. A quarantined engine being recovered by sleep
+	 * needs the device active across its cold boot; take a reference
+	 * outside ane_h16_lock so runtime resume cannot wait on the lock.
+	 */
+	if (rpm && READ_ONCE(h->slept) && READ_ONCE(h->sleep_quarantined) &&
+	    pm_runtime_resume_and_get(h->dev) >= 0)
+		held = true;
+	scoped_guard(mutex, &ane_h16_lock) {
+		if (!h->slept)
+			break;
+		if (rpm && !h->sleep_quarantined) {
+			WRITE_ONCE(h->slept, false);
+			WRITE_ONCE(h->parked, true);
+			WRITE_ONCE(h->session.parked, true);
+			ane_h16_genpd_record(h);
+			dev_info(h->dev, "H16 ANE: resume ok: parked until the next request\n");
+			break;
 		}
+		start = ktime_get_ns();
+		h->resume_ready_ns = 0;
+		h->resume_first_ns = 0;
+		h->resume_replayed = 0;
+		h->resume_cold = !h->boot.soc->sleep_warm || h->sleep_quarantined;
+		h->resume_restarts = 0;
+		if (h->sleep_quarantined && !ane_h16_slept_off(h)) {
+			/* Not proven off: the old firmware may still run. Keep it. */
+			dev_err(h->dev, "H16 ANE: a domain of the quarantined engine never went off; kept quarantined\n");
+			ret = ane_h16_power_up(h);
+			if (!ret)
+				ret = -EIO;
+		} else if (h->resume_cold) {
+			ret = ane_h16_cold_boot(h, &h->resume_restarts, "resume restart/budget",
+						"after system sleep", h->sleep_quarantined);
+		} else {
+			ret = ane_h16_warm_boot(h);
+			if (ret) {
+				dev_warn(h->dev, "H16 ANE: warm boot failed (%d); cold boot and program replay\n",
+					 ret);
+				h->resume_cold = true;
+				ret = ane_h16_cold_boot(h, &h->resume_restarts,
+							"resume restart/budget",
+							"after system sleep", false);
+			}
+		}
+		WRITE_ONCE(h->slept, false);
+		if (ret) {
+			/* Every mapping and backing stays for diagnosis. */
+			ane_h16_quarantine(h, ret);
+			h->boot.quarantined = true;
+			h->session.quarantined = true;
+		} else if (h->sleep_quarantined) {
+			h->recoveries++;
+			dev_info(h->dev, "H16 ANE: quarantined engine recovered by system sleep\n");
+		}
+		WRITE_ONCE(h->sleep_quarantined, false);
+		ane_h16_session_sleep(&h->session, false);
+		ane_h16_genpd_record(h);
+		/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
+		ready = h->resume_ready_ns ?
+			div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
+		first = h->resume_first_ns ?
+			div_u64(h->resume_first_ns - start, NSEC_PER_MSEC) : -1;
+		dev_info(h->dev,
+			 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed, %u restarts\n",
+			 ret ? "FAILED" : "ok", h->resume_cold ? "cold" : "warm", ready, first,
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed,
+			 h->resume_restarts);
 	}
-	WRITE_ONCE(h->slept, false);
-	if (ret) {
-		/* Every mapping and backing stays for diagnosis. */
-		ane_h16_quarantine(h, ret);
-		h->boot.quarantined = true;
-		h->session.quarantined = true;
-	} else if (h->sleep_quarantined) {
-		h->recoveries++;
-		dev_info(h->dev, "H16 ANE: quarantined engine recovered by system sleep\n");
+	if (held) {
+		pm_runtime_mark_last_busy(h->dev);
+		pm_runtime_put_autosuspend(h->dev);
 	}
-	h->sleep_quarantined = false;
-	ane_h16_session_sleep(&h->session, false);
-	ane_h16_genpd_record(h);
-	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
-	ready = h->resume_ready_ns ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
-	first = h->resume_first_ns ? div_u64(h->resume_first_ns - start, NSEC_PER_MSEC) : -1;
-	dev_info(h->dev,
-		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed, %u restarts\n",
-		 ret ? "FAILED" : "ok", h->resume_cold ? "cold" : "warm", ready, first,
-		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed,
-		 h->resume_restarts);
+}
+
+/*
+ * Clear the sleep gates on PM_POST_SUSPEND or when PM_SUSPEND_PREPARE refuses
+ * a transition (the PM core does not send PM_POST_SUSPEND to the refusing
+ * notifier).
+ */
+static void ane_h16_sleep_unblock(struct ane_h16_device *h)
+{
+	WRITE_ONCE(h->in_sleep, false);
+	WRITE_ONCE(h->session.wake_blocked, false);
+	WRITE_ONCE(h->recover_blocked, false);
+	if (READ_ONCE(h->program_ready))
+		wake_up_all(&h->session.wake);
 }
 
 /*
@@ -801,16 +1037,39 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	event = ane_h16_sleep_event(h, event);
 	if (event == PM_POST_SUSPEND) {
 		ane_h16_sleep_resume(h);
-		WRITE_ONCE(h->recover_blocked, false);
+		ane_h16_sleep_unblock(h);
 		return NOTIFY_DONE;
 	}
 	if (event == PM_SUSPEND_PREPARE && pinned) {
+		struct device *dev = h->dev;
+		bool rpm = READ_ONCE(h->rpm_enabled);
+		int ret;
+
+		WRITE_ONCE(h->in_sleep, true);
+		WRITE_ONCE(h->session.wake_blocked, true);
 		/* A recovery under way finishes first; sleep handles later ones. */
 		WRITE_ONCE(h->recover_blocked, true);
 		flush_work(&h->recover);
-		if (!ane_h16_sleep_prepare(h))
+		/*
+		 * No idle park from here on: the sleep takes the engine down
+		 * itself. A park that already began finishes first (the sleep
+		 * waits for ane_h16_lock and finds the engine parked).
+		 */
+		if (rpm)
+			pm_runtime_get_noresume(dev);
+		ret = ane_h16_sleep_prepare(h);
+		if (rpm) {
+			if (!ret && !READ_ONCE(h->engine_on)) {
+				/* Off now: suspend so the DART links drop too. */
+				pm_runtime_put_sync_suspend(dev);
+			} else {
+				pm_runtime_mark_last_busy(dev);
+				pm_runtime_put_autosuspend(dev);
+			}
+		}
+		if (!ret)
 			return NOTIFY_DONE;
-		WRITE_ONCE(h->recover_blocked, false);
+		ane_h16_sleep_unblock(h);
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
@@ -852,7 +1111,8 @@ int ane_h16_backend_suspend(struct device *dev)
 {
 	struct ane_h16_device *h = dev_get_drvdata(dev);
 	/* Running firmware that the notifier did not suspend: refuse. */
-	bool running = h && READ_ONCE(h->pinned) && !READ_ONCE(h->slept);
+	bool running = h && READ_ONCE(h->pinned) && READ_ONCE(h->engine_on) &&
+		       !READ_ONCE(h->slept);
 
 	if (running)
 		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
@@ -1525,32 +1785,57 @@ static void ane_h16_recover_work(struct work_struct *work)
 		[ANE_T6021_RESTART_DONE] = "done",
 	};
 	enum ane_t6021_restart_stage stage;
+	bool rpm = READ_ONCE(h->rpm_enabled), held = false, reschedule = false;
 	u64 start = ktime_get_ns();
 	int ret;
 
-	guard(mutex)(&ane_h16_lock);
-	if (READ_ONCE(h->recover_blocked) || h->slept || !h->program_ready ||
-	    h->boot.quarantined || !h->session.quarantined || !ane_t6021_hung_stop) {
+	/*
+	 * Keep runtime PM from starting a park and wait for any park in flight
+	 * before taking ane_h16_lock.
+	 */
+	if (rpm) {
+		pm_runtime_get_noresume(h->dev);
+		pm_runtime_barrier(h->dev);
+		held = true;
+	}
+	scoped_guard(mutex, &ane_h16_lock) {
+		if (READ_ONCE(h->recover_blocked) || h->slept || h->parked ||
+		    !h->program_ready || h->boot.quarantined ||
+		    !h->session.quarantined || !ane_t6021_hung_stop) {
+			reschedule = h->program_ready && !h->parked && !h->slept &&
+				     !READ_ONCE(h->in_sleep) && !h->boot.quarantined &&
+				     !h->session.quarantined;
+			WRITE_ONCE(h->recovering, false);
+			break;
+		}
+		ane_h16_session_sleep(&h->session, true);
+		h->resume_replayed = 0;
+		h->resume_first_ns = 0;
+		ret = ane_t6021_restart_run(&ane_h16_restart_ops, h, false, &stage);
+		if (ret) {
+			h->recover_failures++;
+			dev_err(h->dev,
+				"H16 ANE: recovery after a hung request failed at the %s, error %d; quarantined until the next system sleep\n",
+				stages[stage], ret);
+		} else {
+			h->recoveries++;
+			reschedule = true;
+			dev_info(h->dev,
+				 "H16 ANE: firmware recovered after a hung request in %llu ms, %u programs replayed\n",
+				 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC),
+				 h->resume_replayed);
+		}
+		ane_h16_session_sleep(&h->session, false);
 		WRITE_ONCE(h->recovering, false);
-		return;
 	}
-	ane_h16_session_sleep(&h->session, true);
-	h->resume_replayed = 0;
-	h->resume_first_ns = 0;
-	ret = ane_t6021_restart_run(&ane_h16_restart_ops, h, false, &stage);
-	if (ret) {
-		h->recover_failures++;
-		dev_err(h->dev,
-			"H16 ANE: recovery after a hung request failed at the %s, error %d; quarantined until the next system sleep\n",
-			stages[stage], ret);
-	} else {
-		h->recoveries++;
-		dev_info(h->dev,
-			 "H16 ANE: firmware recovered after a hung request in %llu ms, %u programs replayed\n",
-			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed);
+	if (held) {
+		if (reschedule) {
+			pm_runtime_mark_last_busy(h->dev);
+			pm_runtime_put_autosuspend(h->dev);
+		} else {
+			pm_runtime_put_noidle(h->dev);
+		}
 	}
-	ane_h16_session_sleep(&h->session, false);
-	WRITE_ONCE(h->recovering, false);
 }
 
 /* Session ops->hung: may run under the session lock, so only queue. */
@@ -1570,6 +1855,7 @@ static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.unmap = ane_h16_program_unmap,
 	.log = ane_h16_log,
 	.busy = ane_h16_busy,
+	.wake = ane_h16_session_wake,
 	.hung = ane_h16_hung,
 };
 
@@ -1652,6 +1938,7 @@ static void ane_h16_release(struct ane_h16_device *h)
 		pm_runtime_put_sync(pd);
 		dev_pm_domain_detach(pd, true);
 	}
+	WRITE_ONCE(h->engine_on, false);
 	h->acquired = false;
 	vfree(h->pristine_data);
 	h->pristine_data = NULL;
@@ -1702,6 +1989,17 @@ static void ane_h16_busy(void *ctx, bool busy)
 	struct ane_h16_device *h = ctx;
 
 	apple_clpc_ane_set_active(h->clpc, busy);
+	/* Under the session lock: no callback runs here, the park drains first. */
+	if (READ_ONCE(h->rpm_enabled)) {
+		if (busy && !h->rpm_busy) {
+			pm_runtime_get_noresume(h->dev);
+			h->rpm_busy = true;
+		} else if (!busy && h->rpm_busy) {
+			h->rpm_busy = false;
+			pm_runtime_mark_last_busy(h->dev);
+			pm_runtime_put_autosuspend(h->dev);
+		}
+	}
 	if (!h->perf)
 		return;
 	if (busy) {
@@ -1822,7 +2120,7 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 		if (ret < 0)
 			return ret;
 		h->darts_powered++;
-		h->engine_on = h->darts_powered == ARRAY_SIZE(h->dart);
+		WRITE_ONCE(h->engine_on, h->darts_powered == ARRAY_SIZE(h->dart));
 		h->window[ANE_H16_DART0 + i] = ioremap_np(r.start, resource_size(&r));
 		if (!h->window[ANE_H16_DART0 + i])
 			return -ENOMEM;
@@ -1954,7 +2252,7 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 			ret);
 		return ret;
 	}
-	h->program_ready = true;
+	WRITE_ONCE(h->program_ready, true);
 	ane_h16_irq_wait_set(h, true);
 	dev_info(h->dev, "H16 stage 5 program window %llx..%llx%s\n", h->program_start,
 		 h->program_end - 1, h->clpc ? ", CLPC input attached" : "");
@@ -2003,6 +2301,7 @@ static int ane_h16_advance(struct ane_h16_device *h, enum ane_h16_stage stage)
 			h->refused = true;
 			return ret;
 		}
+		ane_h16_rpm_idle(h);
 	}
 	dev_info(h->dev, "H16 stage %s complete%s\n", ane_h16_stage_name(stage),
 		 h->boot.ran ? "; held until reboot" : "");
@@ -2012,6 +2311,10 @@ refuse:
 		ane_h16_stage_name(stage), ret);
 	h->refused = true;
 	ane_h16_release(h);
+	if (h->rpm_enabled && h->rpm_held) {
+		h->rpm_held = false;
+		pm_runtime_put_sync_suspend(h->dev);
+	}
 	return ret;
 }
 
@@ -2238,19 +2541,36 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	ret = register_pm_notifier(&h->pm_notifier);
 	if (ret) {
 		dev_err(h->dev, "H16 PM notifier refused, error %d\n", ret);
-		debugfs_remove_recursive(h->debugfs);
-		mutex_lock(&ane_h16_lock);
-		if (!--ane_h16_debugfs_users) {
-			debugfs_remove_recursive(ane_h16_debugfs);
-			ane_h16_debugfs = NULL;
+		goto err_notifier;
+	}
+	if (ane_h16_rpm(h)) {
+		ret = pm_runtime_set_active(h->dev);
+		if (ret) {
+			dev_err(h->dev, "H16 runtime PM activation refused, error %d\n", ret);
+			unregister_pm_notifier(&h->pm_notifier);
+			goto err_notifier;
 		}
-		mutex_unlock(&ane_h16_lock);
-		platform_set_drvdata(pdev, NULL);
-		kfree(h);
-		return ret;
+		pm_runtime_get_noresume(h->dev);
+		h->rpm_held = true;
+		pm_runtime_set_autosuspend_delay(h->dev, ANE_H16_AUTOSUSPEND_MS);
+		pm_runtime_use_autosuspend(h->dev);
+		WRITE_ONCE(h->rpm_enabled, true);
+		pm_runtime_enable(h->dev);
 	}
 	schedule_work(&h->start);
 	return 0;
+err_notifier:
+	debugfs_remove_recursive(h->debugfs);
+	mutex_lock(&ane_h16_lock);
+	if (!--ane_h16_debugfs_users) {
+		debugfs_remove_recursive(ane_h16_debugfs);
+		ane_h16_debugfs = NULL;
+	}
+	mutex_unlock(&ane_h16_lock);
+	platform_set_drvdata(pdev, NULL);
+	drm_mm_takedown(&h->program_window);
+	kfree(h);
+	return ret;
 free:
 	dev_err(h->dev, "H16 DT description refused, error %d\n", ret);
 	drm_mm_takedown(&h->program_window);
@@ -2263,26 +2583,48 @@ unlock:
 void ane_h16_backend_remove(struct platform_device *pdev)
 {
 	struct ane_h16_device *h = platform_get_drvdata(pdev);
-	bool keep;
+	bool keep, rpm_was_enabled;
 
 	if (!h)
 		return;
 	/* Waits for the boot bring-up and any stage write in progress. */
 	cancel_work_sync(&h->start);
 	cancel_work_sync(&h->recover);
-	if (h->program_ready) {
+	if (READ_ONCE(h->program_ready)) {
 		cancel_delayed_work_sync(&h->session.gate_work);
 		/* Return released exports; mapped ones stay with their mappings. */
 		flush_work(&h->session.export_work);
 	}
 	debugfs_remove_recursive(h->debugfs);
 	/*
+	 * Stop runtime PM outside ane_h16_lock before touching state: waits for
+	 * any in-flight park or wake callback and prevents new ones. A parked
+	 * device stays suspended; an active device stays active.
+	 */
+	rpm_was_enabled = READ_ONCE(h->rpm_enabled);
+	if (rpm_was_enabled) {
+		pm_runtime_disable(h->dev);
+		pm_runtime_dont_use_autosuspend(h->dev);
+	}
+	/*
 	 * Nothing can pin the device any more: the start work, the recovery
 	 * and the stage file are gone. An unpinned device drops its PM
 	 * notifier here, outside ane_h16_lock; a pinned one keeps it.
 	 */
-	scoped_guard(mutex, &ane_h16_lock)
+	scoped_guard(mutex, &ane_h16_lock) {
 		keep = h->boot.ran || h->pinned;
+		if (h->rpm_enabled) {
+			if (h->rpm_held) {
+				h->rpm_held = false;
+				pm_runtime_put_noidle(h->dev);
+			}
+			if (h->rpm_busy) {
+				h->rpm_busy = false;
+				pm_runtime_put_noidle(h->dev);
+			}
+			WRITE_ONCE(h->rpm_enabled, false);
+		}
+	}
 	if (!keep)
 		unregister_pm_notifier(&h->pm_notifier);
 	mutex_lock(&ane_h16_lock);
@@ -2296,7 +2638,11 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 	} else {
 		ane_h16_release(h);
 		drm_mm_takedown(&h->program_window);
+		platform_set_drvdata(pdev, NULL);
 		kfree(h);
 	}
 	mutex_unlock(&ane_h16_lock);
+	/* Drop any remaining supplier device-link holds after pre-RUN rollback. */
+	if (!keep && rpm_was_enabled)
+		pm_runtime_set_suspended(&pdev->dev);
 }

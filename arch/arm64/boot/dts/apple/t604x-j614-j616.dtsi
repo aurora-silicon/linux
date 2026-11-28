@@ -2727,6 +2727,7 @@
 			#size-cells = <2>;
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
+			supports-clkreq;
 			device_type = "pci";
 
 			bluetooth0: bluetooth@0,1 {
@@ -3431,6 +3432,7 @@
 		reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
 		bus-range = <2 2>;
 		pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+		supports-clkreq;
 		#address-cells = <3>;
 		#size-cells = <2>;
 		ranges;
@@ -3482,3 +3484,7 @@
 };
 
 #include "t604x-j614-j616-usb4.dtsi"
+
+&t6040_sleep {
+	apple,gp-pcie = <&pcie0>;
+};

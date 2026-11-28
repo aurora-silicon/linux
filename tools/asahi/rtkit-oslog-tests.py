@@ -74,6 +74,7 @@ static bool of_machine_is_compatible(const char *s)
 #define kfifo_reset(f) (*(f)=0)
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) (++warnings)
+#define dev_warn_ratelimited(...) (++warnings)
 #define dev_err(...) (++errors)
 static void set_bit(unsigned n, unsigned long *b) { b[n/64] |= 1UL << (n%64); }
 static void bitmap_zero(unsigned long *b, unsigned n) { memset(b,0,n/8); }

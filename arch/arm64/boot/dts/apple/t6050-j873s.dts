@@ -5,8 +5,10 @@
  * target-type: J873s
  *
  * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
- * yet: beyond the SoC this file only adds the board's hardware inventory
- * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ * yet. Beyond the SoC this file adds the board's hardware inventory
+ * (t6050-peripherals.dtsi, all of it disabled), the onboard Ethernet and
+ * the N1 (Wi-Fi and Bluetooth) on PCIe, and rear USB-C ports 1-3, from
+ * the board's ADT.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -20,6 +22,14 @@
 	model = "Apple Mac mini (M5 Pro, 2026)";
 	chassis-type = "desktop";
 
+	aliases {
+		/* the boot loader fills in the MAC address through this alias */
+		ethernet0 = &ethernet0;
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -27,10 +37,105 @@
 	};
 };
 
-/* PCIe port 0 is not described for this board yet */
+/*
+ * Shared with the Mac Studio: the onboard Ethernet (PCIe port 2) and rear USB-C ports 1-3, the
+ * three Thunderbolt ports. Port 1 (HPM0, "back-middle") is reserved for the debug link.
+ */
+#define T6050_DESKTOP_HPM1_LABEL "USB-C Back-left"
+#define T6050_DESKTOP_HPM2_LABEL "USB-C Back-right"
+#include "t6050-desktop.dtsi"
+
+/*
+ * PCIe ports 2 (the onboard Ethernet) and 0 (the N1). The board's ADT has bridges for these two
+ * ports only: no SD reader (port 1) and no USB-A xHCI (port 3). Port 0 is described disabled
+ * until the boot loader trains it (pci@0,0 below).
+ */
 &pcie0 {
-	status = "disabled";
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x12028000 0x0 0x8000>,
+	      <0x4 0x17018000 0x0 0x4000>,
+	      <0x4 0x12024000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port2", "phy2", "intr2axi2",
+		    "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 0 1539 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port2", "port0";
+
+	/*
+	 * The boot loader numbers port 2's secondary bus 1; port 0's is 2
+	 * until a boot loader that trains it renumbers both in the PCI core's
+	 * order. The N1's three functions are on DART streams 1-3.
+	 */
+	iommu-map = <0x100 &dart_apcie2 1 1>,
+		    <0x200 &dart_apcie0 1 3>;
+	bus-range = <0 2>;
+
+	/*
+	 * The N1 Wi-Fi/Bluetooth (106b:1900, its ROM), trained by the bootloader after the SMC
+	 * releases its reset. Its driver boots the firmware and has this port reset after the ROM
+	 * stage; Control, Alpha (Wi-Fi) and Beta (Bluetooth) then answer at functions 0-2.
+	 * Disabled with its DART: a bootloader that trains the port enables both and renumbers the
+	 * buses here (bus-range, reg, iommu-map) to the PCI core's order, port 0 first.
+	 */
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <2 2>;
+		apple,link-trained-by-bootloader;
+		/*
+		 * Its PERST# (pci-bridge0 function-perst): /arm-io/gpio0 pin 0x50, pad
+		 * register 0x140 of pinctrl_ap. Driven only by the root-port reset after
+		 * the N1's ROM stage.
+		 */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "disabled";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		/* The firmware: the chip's image with this board's ticket; platform ID is
+		 * (board 0x02 << 16) | chip 0x6050 */
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j873s-ftab.bin";
+			apple,centauri-platform-id = <0x00026050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x20100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x20200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
 };
+
+/*
+ * The front USB-C ports (ADT port-numbers 9 and 10, USB 3 only) sit behind a fixed USB hub on
+ * ATC3 (atc-phy3, usb-drd3), which has no PD controller. They are not described yet: the
+ * combo PHY starts USB only on a Type-C mux and orientation event, which a hub port without
+ * an HPM never gets.
+ */
 
 #define T6050_J873S
 #include "t6050-peripherals.dtsi"

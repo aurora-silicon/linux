@@ -234,6 +234,7 @@ struct vif_saved_ie {
  * @saved_ie: saved IE info for a vif.
  * @list: linked list.
  * @mgmt_tx: completion for management frame transmit.
+ * @link_down: completion for the link down event a disconnect before a suspend waits for.
  * @mgmt_tx_status: status of last management frame sent to firmware.
  * @mgmt_tx_id:
  * @mgmt_rx_reg: registered rx mgmt frame types.
@@ -251,6 +252,7 @@ struct brcmf_cfg80211_vif {
 	struct vif_saved_ie saved_ie;
 	struct list_head list;
 	struct completion mgmt_tx;
+	struct completion link_down;
 	unsigned long mgmt_tx_status;
 	u32 mgmt_tx_id;
 	u16 mgmt_rx_reg;

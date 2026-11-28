@@ -19,8 +19,10 @@
 #include <linux/bitops.h>
 #include <linux/ctype.h>
 #include <linux/device.h>
+#include <linux/kernfs.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
@@ -118,7 +120,38 @@ static struct {
 	atomic_t unhandled;
 	atomic_t sleeps;
 	atomic_t sleeping;
+
+	struct kernfs_node *keystore_kn;
+	struct kernfs_node *touchid_kn;
 } sep_diag;
+
+static DEFINE_SPINLOCK(sep_diag_kn_lock);
+
+static void sep_diag_put_kns(void *data)
+{
+	struct kernfs_node *keystore_kn, *touchid_kn;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	keystore_kn = sep_diag.keystore_kn;
+	touchid_kn = sep_diag.touchid_kn;
+	sep_diag.keystore_kn = NULL;
+	sep_diag.touchid_kn = NULL;
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+
+	sysfs_put(keystore_kn);
+	sysfs_put(touchid_kn);
+}
+
+static void sep_diag_notify_kn(struct kernfs_node **knp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	if (*knp)
+		kernfs_notify(*knp);
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+}
 
 /* Written once per probe, before pnon reads SEP_DIAG_PNON_READ. */
 static u8 sep_diag_pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
@@ -735,6 +768,10 @@ static const struct attribute_group sep_diag_group = {
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart)
 {
+	struct kernfs_node *diag_kn, *keystore_kn = NULL, *touchid_kn = NULL;
+	unsigned long flags;
+	int ret;
+
 	profile_len = min(profile_len, sizeof(sep_diag.profile) - 1);
 	memcpy(sep_diag.profile, profile, profile_len);
 	sep_diag.profile[profile_len] = '\0';
@@ -743,7 +780,23 @@ int sep_diag_register(struct device *dev, const char *profile,
 	sep_diag.xart = xart;
 	sep_diag.probe_ns = ktime_get_boottime_ns();
 
-	return devm_device_add_group(dev, &sep_diag_group);
+	ret = devm_device_add_group(dev, &sep_diag_group);
+	if (ret)
+		return ret;
+
+	diag_kn = sysfs_get_dirent(dev->kobj.sd, "diag");
+	if (diag_kn) {
+		keystore_kn = sysfs_get_dirent(diag_kn, "keystore");
+		touchid_kn = sysfs_get_dirent(diag_kn, "touchid");
+		sysfs_put(diag_kn);
+	}
+
+	spin_lock_irqsave(&sep_diag_kn_lock, flags);
+	sep_diag.keystore_kn = keystore_kn;
+	sep_diag.touchid_kn = touchid_kn;
+	spin_unlock_irqrestore(&sep_diag_kn_lock, flags);
+
+	return devm_add_action_or_reset(dev, sep_diag_put_kns, NULL);
 }
 
 void sep_diag_set_attach(bool attached)
@@ -867,7 +920,9 @@ void sep_diag_log_summary(struct device *dev)
 
 void sep_diag_set_keystore_open(void)
 {
-	atomic_set(&sep_diag.keystore, SEP_DIAG_KEYSTORE_OPEN);
+	if (atomic_xchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_OPEN) !=
+	    SEP_DIAG_KEYSTORE_OPEN)
+		sep_diag_notify_kn(&sep_diag.keystore_kn);
 }
 
 void sep_diag_set_keybag(int state)
@@ -925,14 +980,18 @@ void sep_diag_set_sensor_result(unsigned int bind, bool online)
  */
 void sep_diag_set_bio_published(void)
 {
-	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
-		       SEP_DIAG_TOUCHID_PUBLISHED);
+	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
+			   SEP_DIAG_TOUCHID_PUBLISHED) ==
+	    SEP_DIAG_TOUCHID_PENDING)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }
 
 void sep_diag_set_touchid(bool started)
 {
-	atomic_set(&sep_diag.touchid,
-		   started ? SEP_DIAG_TOUCHID_STARTED : SEP_DIAG_TOUCHID_FAILED);
+	int state = started ? SEP_DIAG_TOUCHID_STARTED : SEP_DIAG_TOUCHID_FAILED;
+
+	if (atomic_xchg(&sep_diag.touchid, state) != state)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }
 
 void sep_diag_set_sensor_attach(int state)
@@ -978,13 +1037,17 @@ void sep_diag_set_xart(bool writable)
 void sep_diag_keystore_ended(void)
 {
 	atomic64_cmpxchg(&sep_diag.ready_ns, 0, ktime_get_boottime_ns());
-	atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
-		       SEP_DIAG_KEYSTORE_CLOSED);
+	if (atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
+			   SEP_DIAG_KEYSTORE_CLOSED) ==
+	    SEP_DIAG_KEYSTORE_UNKNOWN)
+		sep_diag_notify_kn(&sep_diag.keystore_kn);
 }
 
 void sep_diag_bringup_ended(void)
 {
 	sep_diag_keystore_ended();
-	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
-		       SEP_DIAG_TOUCHID_UNAVAILABLE);
+	if (atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
+			   SEP_DIAG_TOUCHID_UNAVAILABLE) ==
+	    SEP_DIAG_TOUCHID_PENDING)
+		sep_diag_notify_kn(&sep_diag.touchid_kn);
 }

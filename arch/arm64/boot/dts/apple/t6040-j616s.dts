@@ -32,6 +32,10 @@
 };
 
 &smc {
+	apple,sleep-wake-type;
+	/* VDD_CIO: bit 8 set, bit 0 keeps port 0's CIO rail powered across sleep. */
+	apple,sleep-pmvc = <0x101>;
+
 	smc_gpio_low: gpio-low {
 		compatible = "apple,smc-low-gpio";
 		gpio-controller;
@@ -192,48 +196,6 @@
 	};
 };
 
-/* Scaler/CSC (MSR) and its DART, proven on this board. */
-&ps_msr0 {
-	status = "okay";
-};
-
-&ps_msr0_ase_core {
-	status = "okay";
-};
-
-&scaler0_dart {
-	status = "okay";
-};
-
-&scaler0 {
-	status = "okay";
-};
-
-/*
- * ProRes encoder and its DART. The engine runs with SCODEC_STREAMING (and so
- * SCODEC) powered. The driver has built-in power-up rows for it; an optional
- * apple/prores-t6041-init.bin replaces them.
- */
-&ps_fab1_soc {
-	status = "okay";
-};
-
-&ps_scodec {
-	status = "okay";
-};
-
-&ps_scodec_streaming {
-	status = "okay";
-};
-
-&apr0_dart {
-	status = "okay";
-};
-
-&apr0 {
-	status = "okay";
-};
-
 /*
  * USB4/Thunderbolt on all three Type-C ports: typec0 (left back, ACIO0),
  * typec1 (left front, ACIO1) and typec2 (right, ACIO2). The loader hands
@@ -388,15 +350,11 @@
 	status = "okay";
 };
 
-/* SIO AES engine, software keys only. */
-&ps_aes {
-	status = "okay";
-};
-
-&aes {
-	status = "okay";
-};
-
 &t6040_sleep {
 	status = "okay";
+};
+
+&dcp {
+	apple,sleep-host-stop;
+	apple,display-power = <&dcp_power>;
 };

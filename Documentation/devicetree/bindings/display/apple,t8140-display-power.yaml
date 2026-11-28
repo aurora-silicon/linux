@@ -4,32 +4,108 @@
 $id: http://devicetree.org/schemas/display/apple,t8140-display-power.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8140, T8142, T6040 and T6041 display power words
+title: Apple T8103, T6040, T6041, T8132, T8140 and T8142 display power words
 
 maintainers:
   - Diljit Singh <hey@djdev.me>
 
 description:
-  The words a display coprocessor's driver writes to power its domains off
-  and on around a restart of its firmware, as macOS does. A display
-  coprocessor names this node in its apple,display-power property. The words
-  belong to the power manager and the display block, so no driver binds it.
+  The words and PMGR power-state chains a display coprocessor's driver writes
+  to power its domains off and on around a restart of its firmware, as macOS
+  does. A display coprocessor names this node in its apple,display-power
+  property. The words belong to the power manager and the display block, so no
+  driver binds it.
 
 properties:
   compatible:
-    enum:
-      - apple,t6040-display-power
-      - apple,t6041-display-power
-      - apple,t8140-display-power
-      - apple,t8142-display-power
+    oneOf:
+      - enum:
+          - apple,t8103-display-power
+          - apple,t6041-display-power
+          - apple,t8132-display-power
+          - apple,t8140-display-power
+          - apple,t8142-display-power
+      - items:
+          - const: apple,t6040-display-power
+          - const: apple,t6041-display-power
 
   reg:
-    minItems: 2
-    maxItems: 7
+    minItems: 1
+    maxItems: 5
 
   reg-names:
-    minItems: 2
-    maxItems: 7
+    minItems: 1
+    maxItems: 5
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+patternProperties:
+  '^chain@[0-9]+$':
+    type: object
+    description: |
+      One ordered display power-domain chain for apple,t6041-display-power,
+      powered down in reg order during suspend-to-RAM. T6040 also restarts its
+      external display chains after wake; their labels ext0 and ext1 correspond
+      to the display coprocessors with apple,dcp-endpoint 1 and 2 respectively.
+    properties:
+      reg:
+        maxItems: 1
+
+      label:
+        description: Short name of the display chain (e.g. main, ext0..ext3).
+
+      apple,main-chain:
+        type: boolean
+        description:
+          Marks the internal display chain, which clears the display AXI2AF
+          bridge and PMC voter on stop and is restarted warm on wake.
+
+      apple,pwrgate-aux:
+        type: boolean
+        description:
+          Selects the pwrgate-aux register window instead of pwrgate for this
+          chain's power-gate retention words.
+
+      apple,gapf-offset:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Byte offset of this chain's clock-protection slice within the gapf
+          register window.
+
+      apple,pwrgate-offsets:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 2
+        maxItems: 2
+        description:
+          Byte offsets of the pair of power-gate retention words (A, then B)
+          within the selected pwrgate window.
+
+      apple,fabric-domain:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description:
+          Parent fabric PMGR power-state node held manually on while this chain
+          powers down, then returned to its previous auto-enable state.
+
+      power-domains:
+        minItems: 3
+        maxItems: 16
+        description: |
+          Ordered PMGR power-state nodes for this chain: SYS, FE, CPU, followed
+          by the chain's child sub-domains in parent-before-child order
+          (powered off in reverse).
+
+    required:
+      - reg
+      - label
+      - apple,gapf-offset
+      - apple,pwrgate-offsets
+      - power-domains
+
+    additionalProperties: false
 
 required:
   - compatible
@@ -40,7 +116,52 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,t8140-display-power
+          const: apple,t8103-display-power
+    then:
+      # T8103's display has no retention words and its PMC no count of the coprocessors.
+      properties:
+        reg:
+          items:
+            - description: the power manager's power state words
+        reg-names:
+          items:
+            - const: ps
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6041-display-power
+    then:
+      properties:
+        reg:
+          items:
+            - description: the display PMC voter counter pair
+            - description: the internal display power gate retention words
+            - description: the external display power gate retention words
+            - description: the clock-protection slices for all display chains
+            - description: the internal display AXI2AF bridge registers
+        reg-names:
+          items:
+            - const: pmc-dcp
+            - const: pwrgate
+            - const: pwrgate-aux
+            - const: gapf
+            - const: axi2af
+      required:
+        - '#address-cells'
+        - '#size-cells'
+    else:
+      properties:
+        '#address-cells': false
+        '#size-cells': false
+      patternProperties:
+        '^chain@[0-9]+$': false
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,t8132-display-power
+            - apple,t8140-display-power
     then:
       properties:
         reg:
@@ -68,39 +189,55 @@ allOf:
           items:
             - const: pwrgate
             - const: ps
-  - if:
-      properties:
-        compatible:
-          enum:
-            - apple,t6040-display-power
-            - apple,t6041-display-power
-    then:
-      # The external pipes' words are in a second power manager block, and the
-      # driver opens each DCP DART's fabric filter and clears bridge 4 itself.
-      # T6040 has two external pipes in the complex, T6041 four.
-      properties:
-        reg:
-          items:
-            - description: the display PMC word that counts the powered coprocessors
-            - description: the power manager's power state words of the internal pipe
-            - description: the power manager's power gate words of the internal pipe
-            - description: the power manager's power state words of the external pipes
-            - description: the power manager's power gate words of the external pipes
-            - description: the fabric filter protection words of the DCP DARTs
-            - description: the internal display block's bridge 4 words
-        reg-names:
-          items:
-            - const: pmc-dcp
-            - const: ps
-            - const: pwrgate
-            - const: ps-aux
-            - const: pwrgate-aux
-            - const: gapf
-            - const: bridge
 
 additionalProperties: false
 
 examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-power@5048a9c14 {
+            compatible = "apple,t6041-display-power";
+            reg = <0x5 0x048a9c14 0x0 0x8>,
+                  <0x5 0x022a1000 0x0 0x100>,
+                  <0x5 0x0282d000 0x0 0x1000>,
+                  <0x5 0x00578000 0x0 0x1000>,
+                  <0x4 0x03000100 0x0 0x10>;
+            reg-names = "pmc-dcp", "pwrgate", "pwrgate-aux", "gapf", "axi2af";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            chain@0 {
+                reg = <0>;
+                label = "ext3";
+                apple,pwrgate-aux;
+                apple,gapf-offset = <0x740>;
+                apple,pwrgate-offsets = <0xfb4 0xfd8>;
+                power-domains = <&ps_dispext3_sys>, <&ps_dispext3_fe>,
+                                <&ps_dispext3_cpu>, <&ps_dispext3_dbe>,
+                                <&ps_dpext3>, <&ps_dispext3_gp0>,
+                                <&ps_dispext3_gp1>, <&ps_dispext3_gpl>,
+                                <&ps_dispext3_ppp>, <&ps_dispext3_dsc>;
+            };
+
+            chain@4 {
+                reg = <4>;
+                label = "main";
+                apple,main-chain;
+                apple,gapf-offset = <0x540>;
+                apple,pwrgate-offsets = <0x1c 0x60>;
+                apple,fabric-domain = <&ps_fab6_soc>;
+                power-domains = <&ps_disp_sys>, <&ps_disp_fe>, <&ps_disp_cpu>,
+                                <&ps_disp_spi>, <&ps_disp_spmi>, <&ps_disp_dbe>,
+                                <&ps_disp_dp>, <&ps_disp_gp0>, <&ps_disp_gp1>,
+                                <&ps_disp_gpl>, <&ps_disp_cmb>, <&ps_disp_ppp>,
+                                <&ps_disp_brc>, <&ps_disp_blc>;
+            };
+        };
+    };
+
   - |
     soc {
         #address-cells = <2>;
@@ -125,24 +262,5 @@ examples:
             reg = <0x3 0x80724000 0x0 0x2000>,
                   <0x3 0x80700000 0x0 0x14000>;
             reg-names = "pwrgate", "ps";
-        };
-    };
-
-  - |
-    soc {
-        #address-cells = <2>;
-        #size-cells = <2>;
-
-        display-power@5048a9c14 {
-            compatible = "apple,t6041-display-power";
-            reg = <0x5 0x048a9c14 0x0 0x4>,
-                  <0x5 0x02280000 0x0 0x14000>,
-                  <0x5 0x022a1000 0x0 0x100>,
-                  <0x5 0x02800000 0x0 0x1000>,
-                  <0x5 0x0282d000 0x0 0x1000>,
-                  <0x5 0x00578000 0x0 0x1000>,
-                  <0x4 0x03000100 0x0 0x10>;
-            reg-names = "pmc-dcp", "ps", "pwrgate", "ps-aux", "pwrgate-aux",
-                        "gapf", "bridge";
         };
     };

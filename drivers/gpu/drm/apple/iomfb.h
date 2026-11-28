@@ -198,6 +198,28 @@ enum dcpep_method {
 	dcpep_pipe_set_476,
 	dcpep_unnamed_500,
 	iomfbep_set_brightness_correction,
+	/*
+	 * Firmware 27.x sleep and paired-mode calls named by their 27.0 ID.
+	 * Optional for single-engine boot (iomfb_v27_missing_method() skips
+	 * them); iomfb_v27_tag() refuses any call missing from a renumbered
+	 * table.
+	 */
+	dcpep_v27_sleep_a115,
+	dcpep_v27_wake_a442,
+	dcpep_v27_peer_a360,
+	dcpep_v27_peer_a361,
+	dcpep_v27_peer_a362,
+	dcpep_v27_peer_a364,
+	dcpep_v27_peer_a365,
+	dcpep_v27_peer_a366,
+	dcpep_v27_peer_a367,
+	dcpep_v27_peer_a368,
+	dcpep_v27_peer_a369,
+	dcpep_v27_peer_a370,
+	dcpep_v27_peer_a371,
+	dcpep_v27_peer_a372,
+	dcpep_v27_peer_a373,
+	dcpep_v27_peer_a449,
 	dcpep_num_methods
 };
 
@@ -220,6 +242,9 @@ struct dcp_method_entry {
 
 /* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
 const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *methods);
+int iomfb_v27_tag(const struct dcp_method_entry *methods, const char *tag, char *out);
+bool iomfb_v27_sleep_methods_complete(const struct dcp_method_entry *methods);
 const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
 						       const struct dcp_method_entry *methods);
 /* The first method of a firmware 27.x table that has no ID, NULL if none. */
@@ -231,6 +256,7 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_channels_idle(struct apple_dcp *dcp);
+int iomfb_wait_channels_idle(struct apple_dcp *dcp, unsigned int timeout_ms);
 int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on);
 bool iomfb_v27_sleep_described(struct apple_dcp *dcp);
 void iomfb_v27_wake_present(struct apple_dcp *dcp);

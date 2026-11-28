@@ -1927,6 +1927,21 @@ static int sdhci_pci_gli_resume(struct sdhci_pci_chip *chip)
 	return sdhci_pci_resume_host(chip);
 }
 
+static int gl9755_resume(struct sdhci_pci_chip *chip)
+{
+	struct sdhci_pci_slot *slot = chip->slots[0];
+
+	/*
+	 * A sleep that takes the reader's power resets its vendor configuration,
+	 * which the PCI core's state restore does not cover: set it up again as
+	 * at probe before the host resumes.
+	 */
+	gl9755_hw_setting(slot);
+	gl9755_vendor_init(slot->host);
+
+	return sdhci_pci_gli_resume(chip);
+}
+
 static int gl9763e_resume(struct sdhci_pci_chip *chip)
 {
 	struct sdhci_pci_slot *slot = chip->slots[0];
@@ -2052,7 +2067,7 @@ const struct sdhci_pci_fixes sdhci_gl9755 = {
 	.remove_host	= sdhci_pci_uhs2_remove_host,
 	.ops            = &sdhci_gl9755_ops,
 #ifdef CONFIG_PM_SLEEP
-	.resume         = sdhci_pci_gli_resume,
+	.resume         = gl9755_resume,
 #endif
 };
 

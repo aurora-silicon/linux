@@ -133,6 +133,8 @@ pub(crate) struct T8152Probe {
     /// The DRM device, not yet registered. The live-boot module allocates
     /// its kernel objects on it; the shared probe registers it at stage 10.
     pub(crate) drm: ARef<AsahiDrmDevice>,
+    /// The CLPC's GPU input, taken before the probe touched the GPU.
+    pub(crate) demand: crate::g18::demand::G18Demand,
 }
 
 /// Loader receipts the G18G firmware stages require. The loader writes one
@@ -286,6 +288,10 @@ fn prepare_t8152_device(
     let identity =
         identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
             .ok_or(EINVAL)?;
+    // Before any GPU access: a CLPC that has not probed yet defers this probe
+    // here, while it can still be repeated, instead of the GPU running
+    // without the floor for the whole boot.
+    let demand = crate::g18::demand::G18Demand::new(pdev.as_ref())?;
     if soc.chip_id != 0x8152
         || identity.gpu_gen != hw::GpuGen::G18
         || identity.gpu_variant != identity::GpuVariant::G
@@ -385,6 +391,7 @@ fn prepare_t8152_device(
         registers,
         observed,
         drm,
+        demand,
     })
 }
 

@@ -28,11 +28,34 @@ impl RenderState {
 
     /// Slots of `context`'s pairs whose commands all ran but stay unretired until its kill.
     pub(in crate::g17::runtime) fn executed_slots(&self, context: &Arc<Context>) -> u64 {
+        self.slots_where(|pair| pair.executed_for_kill(context))
+    }
+
+    /// Slots of `context`'s pairs whose guilty work stays unretired until its kill
+    /// (`Pair::guilty_for_kill`).
+    pub(in crate::g17::runtime) fn guilty_slots(&self, context: &Arc<Context>, generation: u64) -> u64 {
+        self.slots_where(|pair| pair.guilty_for_kill(context, generation))
+    }
+
+    /// Slots of `context`'s pairs that only its kill releases (`Pair::releasable_by_kill`).
+    pub(in crate::g17::runtime) fn kill_slots(&self, context: &Arc<Context>, generation: u64) -> u64 {
+        self.slots_where(|pair| pair.releasable_by_kill(context, generation))
+    }
+
+    /// The owner and context of `slot`'s pair while that owner is still open, its VM failed as
+    /// guilty (`Pair::failed_guilty`), and no builder or owner switch holds the slot.
+    pub(in crate::g17::runtime) fn failed_open_owner(&self, slot: usize) -> Option<(u64, Arc<Context>)> {
+        let entry = self.entries.get(slot)?.as_ref()?;
+        let pair = entry.pair.as_deref()?;
+        let open = !entry.closed && entry.preparing.is_none() && entry.pending_owner.is_none();
+        (open && pair.owner() == Some(entry.reservation.owner) && pair.failed_guilty())
+            .then(|| (entry.reservation.owner, pair.context().clone()))
+    }
+
+    fn slots_where(&self, matches: impl Fn(&crate::g17::queue::render::Pair) -> bool) -> u64 {
         let mut slots = 0;
         for (slot, entry) in self.entries.iter().enumerate() {
-            if entry.as_ref().and_then(|entry| entry.pair.as_ref())
-                .is_some_and(|pair| pair.executed_for_kill(context))
-            {
+            if entry.as_ref().and_then(|entry| entry.pair.as_deref()).is_some_and(&matches) {
                 slots |= 1u64 << slot;
             }
         }

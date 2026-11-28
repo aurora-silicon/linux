@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Where a firmware-27 dcpext opens its DPTX controller and ports.
+"""Where a firmware-27 dcpext, or a DCP with Type-C routes, opens its DPTX controller and ports.
 
 Builds the production dcp_v27_dptx_layout() and dptxep_init()'s endpoint
 choice, and runs them over firmware, processor role, advertised endpoints and
-hardware data. A firmware-27 dcpext whose firmware advertises both
-DPTX_CONTROLLER_ENDPOINT (0x24) and DPTX_ENDPOINT (0x2a) gets the controller
-and its ports there (J413 and J615 on 27.2); hardware data that names an
+hardware data. A firmware-27 dcpext, or a firmware-27 DCP that the device tree
+connects to Type-C display routes (the M2 Mac mini's primary), whose firmware
+advertises both DPTX_CONTROLLER_ENDPOINT (0x24) and DPTX_ENDPOINT (0x2a) gets
+the controller and its ports there (J413 and J615 on 27.2); hardware data that names an
 endpoint keeps it (T8142, T6050 and firmware-27 T6041 dcpexts); every other
 processor is unchanged. The selector must not test a compatible.
 
@@ -24,9 +25,11 @@ MUTATIONS = {
     'ignore-advertisement': ('\tif (!apple_rtkit_has_endpoint(dcp->rtk, DPTX_CONTROLLER_ENDPOINT) ||\n'
                              '\t    !apple_rtkit_has_endpoint(dcp->rtk, DPTX_ENDPOINT))\n\t\treturn;\n', ''),
     # Override hardware data that already names an endpoint.
-    'ignore-pinned': (' ||\n\t    dcp->hw.dptx_endpoint)\n', ')\n'),
-    # Apply to internal processors too.
-    'ignore-dcpext': (' || !dcp->dcpext', ''),
+    'ignore-pinned': (' || dcp->hw.dptx_endpoint)\n', ')\n'),
+    # Apply to every processor, with or without Type-C routes.
+    'ignore-dcpext': ('(!dcp->dcpext && !dcp->nr_typec_routes) || ', ''),
+    # Leave a DCP with Type-C routes on the default endpoints.
+    'ignore-typec-routes': ('(!dcp->dcpext && !dcp->nr_typec_routes)', '!dcp->dcpext'),
 }
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -93,7 +96,7 @@ enum { DCP_IOMFB_METHODS_DEFAULT, DCP_IOMFB_METHODS_H17P_EXTERNAL };
 #define DPTX_CONTROLLER_ENDPOINT 0x24
 #define DPTX_ENDPOINT 0x2a
 #define DPTX_ENDPOINT_V2 0x2c
-struct apple_dcp { int fw_compat; bool dcpext, ext26; void *rtk, *dev;
+struct apple_dcp { int fw_compat; bool dcpext, ext26; u32 nr_typec_routes; void *rtk, *dev;
  struct { u8 dptx_endpoint; bool dptx_controller; int iomfb_method_profile; } hw; };
 static u32 advertised;
 static bool apple_rtkit_has_endpoint(void *rtk, int ep) { return advertised & (1u << (ep - 0x20)); }
@@ -122,12 +125,13 @@ int main(void)
 	for (unsigned ext = 0; ext < 2; ext++)
 	for (unsigned m = 0; m < 6; m++)
 	for (unsigned p = 0; p < 3; p++)
-	for (unsigned c = 0; c < 2; c++) {
-		struct apple_dcp d = { .fw_compat = fws[f], .dcpext = ext,
+	for (unsigned c = 0; c < 2; c++)
+	for (unsigned r = 0; r < 2; r++) {
+		struct apple_dcp d = { .fw_compat = fws[f], .dcpext = ext, .nr_typec_routes = 2 * r,
 				       .hw.dptx_endpoint = pins[p], .hw.dptx_controller = c };
 		struct apple_dcp before = d;
 		bool both = (maps[m] & BIT(0x24)) && (maps[m] & BIT(0x2a));
-		bool chosen = fws[f] == DCP_FIRMWARE_V_27_0 && ext && !pins[p] && both;
+		bool chosen = fws[f] == DCP_FIRMWARE_V_27_0 && (ext || r) && !pins[p] && both;
 
 		advertised = maps[m];
 		info_lines = 0;
@@ -175,4 +179,4 @@ with tempfile.TemporaryDirectory() as tmp:
     run = subprocess.run([str(exe)])
     if run.returncode:
         sys.exit(f'FAIL: the layout matrix exited {run.returncode}')
-print('PASS firmware-27 dcpext DPTX layout from its advertised endpoints; pinned and other processors unchanged')
+print('PASS firmware-27 dcpext / Type-C-routed DCP DPTX layout from its advertised endpoints; pinned and other processors unchanged')

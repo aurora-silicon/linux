@@ -11,8 +11,10 @@
 use core::mem;
 use core::sync::atomic::{fence, AtomicI32, AtomicPtr, Ordering};
 
+mod pmp_alloc;
 mod pmp_bootargs;
 mod pmp_power;
+use pmp_alloc::AllocBudget;
 use pmp_power::Command;
 
 use kernel::{
@@ -72,6 +74,12 @@ const BOOTARGS_UUID_VERSION: u32 = 5;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
 const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
+/// The RTKit header word holding the SRAM offset of the firmware's data segment.
+const SRAM_DATA_START: usize = 0x234;
+/// How long the PMP's start waits for the firmware to acknowledge IOP power on by itself before
+/// asking for it. On the M4 Mac mini (J773g) the 27.2 image's whole RTKit start, from its CPU
+/// starting to its acknowledgment and the AP going on, takes 1.3 ms; this is 15 times that.
+const PMP_SELF_ACK_MS: u32 = 20;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -85,7 +93,7 @@ const OPC_UPDATE_IOREG: u64 = 0x36;
 const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
-const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
+const MALLOC_SIZE_MASK: u64 = pmp_alloc::MALLOC_SIZE_MAX;
 const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
@@ -130,8 +138,13 @@ struct SramCopy {
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
+    /// The number and total size of `allocs`.
+    alloc_budget: AllocBudget,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// The firmware's own index of each entry in `ioreg_entries` (word 0x48 of its
+    /// REGISTER_IOREG buffer), by which UPDATE_IOREG names the entry.
+    ioreg_ids: KVec<u32>,
     /// Held from a system sleep's start until its end.
     sram: Option<SramCopy>,
 }
@@ -141,8 +154,10 @@ impl PmpState {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
+            alloc_budget: AllocBudget::new(),
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            ioreg_ids: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
         })
     }
@@ -181,6 +196,12 @@ struct PmpData {
     display_error: AtomicI32,
     /// See [`PmpHwConfig::sram_backup`].
     sram_backup: Option<(usize, usize)>,
+    /// See [`PmpHwConfig::sram_backup_data`].
+    sram_backup_data: bool,
+    /// See [`PmpHwConfig::self_ack_start`].
+    self_ack_start: bool,
+    /// See [`PmpHwConfig::confirm_ioreg_len`].
+    confirm_ioreg_len: bool,
     /// See [`PmpHwConfig::check_bootargs_uuid`], for the hibernation restore's
     /// boot-argument patching (the boot loader cold-restarts the PMP on a
     /// resume from disk and nothing else replays the probe-time bring-up).
@@ -193,22 +214,18 @@ impl PmpData {
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
-        // The SRAM range kept over a sleep, if the SoC's config has none: from the DT, where
-        // the boot loader puts it.
-        let sram_backup = match cfg.sram_backup {
-            Some(range) => Some(range),
-            None => {
-                let node = dev.as_ref().fwnode().ok_or(EIO)?;
-                let prop_name = c"apple,sram-keep";
-                if node.property_present(prop_name) {
-                    let v = node
-                        .property_read_array_vec::<u32>(prop_name, 2)?
-                        .required_by(dev.as_ref())?;
-                    Some((v[0] as usize, v[1] as usize))
-                } else {
-                    None
-                }
-            }
+        // The SRAM range kept over a sleep: prefer the DT property (`apple,sram-keep`, where
+        // the boot loader supplies the exact offset and size from ADT segment-ranges) when
+        // present, otherwise fall back to the SoC's config.
+        let node = dev.as_ref().fwnode().ok_or(EIO)?;
+        let prop_name = c"apple,sram-keep";
+        let (sram_backup, sram_backup_data) = if node.property_present(prop_name) {
+            let v = node
+                .property_read_array_vec::<u32>(prop_name, 2)?
+                .required_by(dev.as_ref())?;
+            (Some((v[0] as usize, v[1] as usize)), false)
+        } else {
+            (cfg.sram_backup, cfg.sram_backup_data)
         };
         Arc::pin_init(
             try_pin_init!(
@@ -223,6 +240,9 @@ impl PmpData {
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
                     sram_backup,
+                    sram_backup_data,
+                    self_ack_start: cfg.self_ack_start,
+                    confirm_ioreg_len: cfg.confirm_ioreg_len,
                     check_bootargs_uuid: cfg.check_bootargs_uuid,
                 }
             ),
@@ -313,7 +333,14 @@ impl PmpData {
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.as_mut().wake()?;
+        // Some T8132 PMP images acknowledge IOP power on by themselves once they have reported in,
+        // and answer no request for it after that (macOS 27.2; macOS sends it none). Others wait
+        // to be asked. Only SoCs with `self_ack_start` wait for a self-acknowledgment first.
+        if self.self_ack_start {
+            rtk.as_mut().boot_or_wake(PMP_SELF_ACK_MS)?;
+        } else {
+            rtk.as_mut().wake()?;
+        }
         rtk.start_endpoint(PMP_ENDPOINT)
     }
     fn patch_bootargs(
@@ -405,23 +432,42 @@ impl PmpData {
     fn malloc(&self, size: u64) -> Result<u64> {
         // SAFETY: TODO: ensure self.dev is bound
         let bound_dev = unsafe { self.dev.as_bound() };
-        let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL)?;
         let mut state = self.state.lock();
+        if !state.alloc_budget.claim(size) {
+            dev_err!(
+                self.dev,
+                "Refusing a {} byte allocation: {} held\n",
+                size,
+                state.allocs.len()
+            );
+            return Err(ENOMEM);
+        }
+        let iomem = match Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL) {
+            Ok(iomem) => iomem,
+            Err(e) => {
+                state.alloc_budget.release(size);
+                return Err(e);
+            }
+        };
         let addr = iomem.dma_address();
         let msg = (OPC_MALLOC | OPC_ACK_MASK) << OPC_SHIFT | addr;
-        state.allocs.push(
+        if let Err(e) = state.allocs.push(
             PmpAllocation {
                 addr: addr,
                 alloc: iomem,
             },
             GFP_KERNEL,
-        )?;
+        ) {
+            state.alloc_budget.release(size);
+            return Err(e.into());
+        }
         Ok(msg)
     }
     fn free(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
         if let Some(idx) = state.find_alloc(addr) {
-            state.allocs.swap_remove(idx);
+            let freed = state.allocs.swap_remove(idx);
+            state.alloc_budget.release(freed.alloc.size() as u64);
         } else {
             dev_err!(
                 self.dev,
@@ -456,6 +502,14 @@ impl PmpData {
     }
     fn register_ioreg(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
+        if !pmp_alloc::ioreg_fits(state.ioreg_entries.len()) {
+            dev_err!(
+                self.dev,
+                "Refusing register {}: no index left\n",
+                state.ioreg_entries.len() + 1
+            );
+            return Err(ENOSPC);
+        }
         let msg_buf = if let Some(s) = state.get_buf(addr) {
             s
         } else {
@@ -470,6 +524,14 @@ impl PmpData {
         let mut size = u32::from_le_bytes(unsafe {
             <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
         });
+        let id = if msg_buf.size() >= 0x4c {
+            // SAFETY: TODO
+            u32::from_le_bytes(unsafe {
+                <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x48..0x4c]).unwrap()
+            })
+        } else {
+            u32::MAX
+        };
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
             name_vec
@@ -517,6 +579,7 @@ impl PmpData {
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
+        state.ioreg_ids.push(id, GFP_KERNEL)?;
         let index = state.ioreg_entries.len() as u64;
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
@@ -570,14 +633,40 @@ impl PmpData {
             .wrapping_add(ASC_CPU_CONTROL_OFFSET)
             .cast())
     }
-    /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
-    fn sram_alloc(&self, sram_size: usize) -> Result<Option<SramCopy>> {
-        let Some((offset, size)) = self.sram_backup else {
+    /// The SRAM range a system sleep keeps: with [`PmpHwConfig::sram_backup_data`], the
+    /// firmware's data segment, at the offset its header gives ([`SRAM_DATA_START`]) and on one
+    /// of its 4 KiB pages. An image whose header names no such segment is refused.
+    fn sram_range(
+        &self,
+        io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some((mut offset, size)) = self.sram_backup else {
             return Ok(None);
         };
-        if !pmp_bootargs::word_range_valid(offset, size, sram_size) {
+        if self.sram_backup_data {
+            let data = io.as_view().relaxed().read32(SRAM_DATA_START) as usize;
+            if data == 0 || data % 0x1000 != 0 {
+                dev_err!(self.dev, "firmware data segment at {:#x}\n", data);
+                return Err(EINVAL);
+            }
+            offset = data;
+        }
+        if !pmp_bootargs::word_range_valid(offset, size, io.size()) {
+            dev_err!(
+                self.dev,
+                "SRAM range {:#x}+{:#x} outside the SRAM\n",
+                offset,
+                size
+            );
             return Err(EINVAL);
         }
+        Ok(Some((offset, size)))
+    }
+    /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
+    fn sram_alloc(&self, io: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>) -> Result<Option<SramCopy>> {
+        let Some((offset, size)) = self.sram_range(io)? else {
+            return Ok(None);
+        };
         let mut words = KVVec::new();
         words.resize(size / 4, 0u32, GFP_KERNEL)?;
         Ok(Some(SramCopy { offset, words }))
@@ -588,7 +677,7 @@ impl PmpData {
         let bound_dev = unsafe { self.dev.as_bound() };
         let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
         let io = pmp_mmio.as_view().relaxed();
-        let mut copy = self.sram_alloc(io.size())?;
+        let mut copy = self.sram_alloc(&pmp_mmio)?;
         let rtk = self.rtkit_handle()?;
         let control = self.asc_cpu_control()?;
         // SAFETY: the handle stays valid until unbind, which can't run during a system sleep,
@@ -615,8 +704,7 @@ impl PmpData {
         // SAFETY: the PM core only calls a bound device.
         let bound_dev = unsafe { self.dev.as_bound() };
         let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
-        let size = pmp_mmio.as_view().relaxed().size();
-        let mut copy = self.sram_alloc(size)?;
+        let mut copy = self.sram_alloc(&pmp_mmio)?;
         stop.rtk = self.rtkit_handle()?;
         stop.control = self.asc_cpu_control()?;
         stop.sram = core::ptr::null_mut();
@@ -660,6 +748,30 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
+    /// CONFIRM_IOREG's value for an UPDATE_IOREG: the length of the entry the firmware names by
+    /// its own index, as registered. macOS 27.2 answers so on the M4 Mac mini (J773g), 8 for each
+    /// of the four entries that image updates. An index that names no registered entry, which
+    /// macOS doesn't see, gets 0, the answer this driver gave before.
+    fn confirm_ioreg_value(&self, id: u64) -> u64 {
+        let state = self.state.lock();
+        let found = state
+            .ioreg_ids
+            .iter()
+            .position(|&e| u64::from(e) == id)
+            .and_then(|i| state.ioreg_entries.get(i).copied());
+        drop(state);
+        match found {
+            Some(len) => u64::from(len),
+            None => {
+                dev_warn!(
+                    self.dev,
+                    "UPDATE_IOREG {:#x} names no registered entry\n",
+                    id
+                );
+                0
+            }
+        }
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -687,8 +799,15 @@ impl PmpData {
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
-            // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            // Do not echo the registry index or add a generic ACK bit.
+            OPC_UPDATE_IOREG => {
+                let value = if self.confirm_ioreg_len {
+                    self.confirm_ioreg_value(msg & SET_IOREG_INDEX_MASK)
+                } else {
+                    0
+                };
+                OPC_CONFIRM_IOREG << OPC_SHIFT | value
+            }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -958,6 +1077,14 @@ struct PmpHwConfig {
     /// The range of the firmware's SRAM, as (offset, size) in bytes, that a system sleep keeps
     /// and writes back. `None` where no sleep has been traced.
     sram_backup: Option<(usize, usize)>,
+    /// The range kept is the firmware's data segment: its offset comes from the firmware's
+    /// header ([`SRAM_DATA_START`]), and `sram_backup` gives its size.
+    sram_backup_data: bool,
+    /// Wait briefly for the firmware to acknowledge IOP power on by itself before sending
+    /// SET_IOP_PWR_STATE.
+    self_ack_start: bool,
+    /// Answer UPDATE_IOREG with the registered entry's length instead of 0.
+    confirm_ioreg_len: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -965,7 +1092,7 @@ struct PmpHwConfig {
 enum Ep7 {
     /// Never started.
     No,
-    /// Only on the retained J713 board.
+    /// Only on T8132 boards with a retained, qualified PMP session.
     RetainedBoard,
     /// On every board with this SoC.
     Always,
@@ -976,6 +1103,9 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    sram_backup_data: false,
+    self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -984,6 +1114,9 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: Some((0x3c000, 0x5c000)),
+    sram_backup_data: false,
+    self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -993,7 +1126,12 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
-    sram_backup: None,
+    // 26.6.2 firmware (J616C): __DATA at 0x500761000, 0x7d000 bytes; the 27.2 firmware has it at
+    // 0x62000. Kept across a real sleep.
+    sram_backup: Some((0x61000, 0x7d000)),
+    sram_backup_data: false,
+    self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -1004,6 +1142,9 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::Always,
     sram_backup: None,
+    sram_backup_data: false,
+    self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -1014,15 +1155,31 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    sram_backup_data: false,
+    self_ack_start: false,
+    confirm_ioreg_len: false,
 };
 
-/// T8132: the sleep engine reloads `__TEXT` from DRAM at the wake, and only `__DATA`
-/// (the ADT's second segment) has to be kept.
+/// T8122: the sleep engine reloads `__TEXT` from DRAM at the wake, and only `__DATA`
+/// (the ADT's second segment, offset 0x36000, size 0x47000) has to be kept. When the
+/// boot loader supplies `apple,sram-keep`, both offset and size come from the DT instead.
+const HW_CFG_T8122: PmpHwConfig = PmpHwConfig {
+    sram_backup: Some((0x36000, 0x47000)),
+    ..HW_CFG_DEFAULT
+};
+
+/// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
+/// 26.6.2/25G83 and 0x3d000 on 27.2/26B123 per ADT `segment-ranges` and SRAM header word 0x234)
+/// needs to be kept. When the boot loader supplies `apple,sram-keep`, both offset and size come
+/// from the DT instead of this fallback.
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
     sram_backup: Some((0x3c000, 0x68000)),
+    sram_backup_data: true,
+    self_ack_start: true,
+    confirm_ioreg_len: true,
 };
 
 impl Drop for PmpDriver {
@@ -1036,6 +1193,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <PmpDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c"apple,t8122-pmp-v2"), &HW_CFG_T8122),
         (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
@@ -1077,6 +1235,8 @@ impl platform::Driver for PmpDriver {
         let data = PmpData::new(pdev, cfg)?;
         let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
         let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
+        // The firmware's own header describes what a sleep keeps; refuse an image it doesn't.
+        data.sram_range(&pmp_mmio)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
@@ -1097,7 +1257,7 @@ impl platform::Driver for PmpDriver {
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
         // EP7 is a startup dependency on every T6041 PMP, and on the
-        // retained J713 PMP among the T8132 boards.
+        // retained, qualified PMP session among the T8132 boards.
         let needs_coreanalytics = match cfg.coreanalytics {
             Ep7::No => false,
             Ep7::Always => true,

@@ -6,7 +6,6 @@
  * J813 board fragments and overrides what the J815 ADT shows to be
  * different:
  *
- *  - /chosen board-id 0x26 (J813: 0x24)
  *  - 15.3" 2880x1864 panel (2880x1800 below the notch), 326 x 211 mm
  *  - six SN012776 speaker amplifiers on i2c3 (0x38-0x3d: two tweeters and
  *    four force-cancelling woofers); J813 has four
@@ -136,12 +135,14 @@
 	multi-touch {
 		/* ADT hid-merge-personality C1FD3,3 (J813: C1FD1,4). */
 		firmware-name = "apple/tpmtfw-j815.bin";
+		/* Touch states and path IDs decoded on this pad against macOS. */
+		apple,touch-states;
+		/*
+		 * Hand classes past 12 mm on two reports, any contact past 22 mm
+		 * at once (no finger on macOS passed 21 mm).
+		 */
+		apple,palm-tool-area = <1200 2200>;
 	};
-};
-
-&pmp {
-	/* ADT /chosen board-id (J815) */
-	apple,board-id = <38>;
 };
 
 &panel {
@@ -161,29 +162,6 @@
 	apple,chassis-name = "J815";
 	/* ADT iop-audio-controller/audio-speaker: 6 slots, 12 sense words. */
 	apple,speaker-amps = <6>;
-};
-
-/*
- * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on the
- * M4 Pro, not T8140's CT817. aop_als sends it the per-device calibration
- * (apple/aop-als-cal.bin) as its calibration property. There is no
- * firmware-name: that names the CT817 setup-port message, which this sensor
- * does not take.
- */
-&aop {
-	aop_als: als {
-		compatible = "apple,t8142-aop-als", "apple,aop-als";
-	};
-
-	/*
-	 * Lid angle: the J815 AOP firmware announces a "las" service, which
-	 * macOS 27.2 on this machine binds as an AppleSPUHIDDevice (usage page
-	 * 0x20, usage 0x8a), as on T6050. The ADT's i2c1 "mogul-las" is the
-	 * sensor's authentication chip, not the angle.
-	 */
-	aop_las: las {
-		compatible = "apple,t8142-aop-las", "apple,aop-las";
-	};
 };
 
 /* Names as in speakersafetyd's j815.conf; slots from ADT speaker-config. */
@@ -268,6 +246,12 @@
 		#address-cells = <3>;
 		#size-cells = <2>;
 		ranges;
+		/*
+		 * The N1's warm reset, as on J813: the J815 ADT's pci-bridge0
+		 * function-warm_reset names the same SMC key 'bpli' and argument.
+		 */
+		apple,function-warm-reset = <&smc 0x62706c69 0x1000000>;
+		apple,warm-reset-writes = <0x00010001 17000>, <0x00010001 20000>;
 
 		n1_control: control@0,0 {
 			compatible = "apple,t8142-centauri-control", "pci106b,1900";
@@ -358,6 +342,29 @@
  * init (drivers/soc/apple/dt.rs).
  */
 &pmgr {
+	/*
+	 * From the J815 ADT, as on J813: GPIO at +0x120 and SEP at +0xc00, both
+	 * always on (the enclave gates its own domain). The SEP driver stages its
+	 * sleep request on the SEP word, so the node has to name it.
+	 */
+	ps_gpio: power-controller@120 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+		apple,always-on;
+	};
+
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+	};
+
 	ps_spi2: power-controller@440 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x440 4>;
@@ -375,6 +382,7 @@
 		mboxes = <&sep_mbox>;
 		mbox-names = "mbox";
 		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>, <&ps_gpio>;
 		status = "disabled";
 	};
 

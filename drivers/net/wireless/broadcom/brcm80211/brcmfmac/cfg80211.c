@@ -9,6 +9,7 @@
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/module.h>
+#include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
 #include <net/netlink.h>
@@ -1680,12 +1681,13 @@ static int brcmf_set_pmk(struct brcmf_if *ifp, const u8 *pmk_data, u16 pmk_len)
 	return brcmf_set_wsec(ifp, pmk_data, pmk_len, 0);
 }
 
-static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 			    bool locally_generated)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(vif->wdev.wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	bool bus_up = drvr->bus_if->state == BRCMF_BUS_UP;
+	bool disassoc_sent = false;
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
@@ -1698,6 +1700,8 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 			if (err)
 				bphy_err(drvr, "WLC_DISASSOC failed (%d)\n",
 					 err);
+			else
+				disassoc_sent = true;
 		}
 
 		if ((vif->wdev.iftype == NL80211_IFTYPE_STATION) ||
@@ -1716,6 +1720,7 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 		vif->profile.use_fwsup = BRCMF_PROFILE_FWSUP_NONE;
 	}
 	brcmf_dbg(TRACE, "Exit\n");
+	return disassoc_sent;
 }
 
 static s32 brcmf_cfg80211_join_ibss(struct wiphy *wiphy,
@@ -5264,6 +5269,19 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	if (test_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status))
 		brcmf_abort_scanning(cfg);
 
+	/* An in-band MSI cannot wake the host once the link goes down, so
+	 * refuse WoWLAN for a deeper sleep than suspend-to-idle instead of
+	 * failing the whole system suspend. cfg80211 then leaves every
+	 * interface (AP and P2P-GO included) and suspends again without it.
+	 */
+	if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&
+	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+		bphy_info_once(cfg->pub,
+			       "WoWLAN wakes only from suspend-to-idle here, sleeping without it\n");
+		cfg->scan_status = 0;
+		return 1;
+	}
+
 	if (wowl == NULL) {
 		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		list_for_each_entry(vif, &cfg->vif_list, list) {
@@ -5273,12 +5291,17 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 			 * disassociate from AP to save power while system is
 			 * in suspended state
 			 */
-			brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true);
+			reinit_completion(&vif->link_down);
 			/* Make sure WPA_Supplicant receives all the event
 			 * generated due to DISASSOC call to the fw to keep
-			 * the state fw and WPA_Supplicant state consistent
+			 * the state fw and WPA_Supplicant state consistent:
+			 * wait for the firmware's link down, at most 500 ms.
+			 * An interface that sent no DISASSOC has none coming.
 			 */
-			brcmf_delay(500);
+			if (brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true) &&
+			    !wait_for_completion_timeout(&vif->link_down,
+							 msecs_to_jiffies(500)))
+				brcmf_dbg(INFO, "no link down event after the DISASSOC\n");
 		}
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
@@ -7101,6 +7124,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 	vif->wdev.wiphy = cfg->wiphy;
 	vif->wdev.iftype = type;
 	init_completion(&vif->mgmt_tx);
+	init_completion(&vif->link_down);
 
 	brcmf_init_prof(&vif->profile);
 
@@ -7769,6 +7793,7 @@ brcmf_notify_connect_status(struct brcmf_if *ifp,
 		brcmf_net_setcarrier(ifp, true);
 	} else if (brcmf_is_linkdown(ifp->vif, e)) {
 		brcmf_dbg(CONN, "Linkdown\n");
+		complete(&ifp->vif->link_down);
 		if (!brcmf_is_ibssmode(ifp->vif) &&
 		    (test_bit(BRCMF_VIF_STATUS_CONNECTED,
 			      &ifp->vif->sme_state) ||
@@ -8565,8 +8590,11 @@ static void brcmf_update_vht_cap(struct ieee80211_supported_band *band,
 }
 
 static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
-				struct ieee80211_sband_iftype_data *data)
+				struct ieee80211_sband_iftype_data *data,
+				u32 bw_cap[4])
 {
+	bool has_160 = band->band != NL80211_BAND_2GHZ &&
+		       (bw_cap[band->band] & WLC_BW_160MHZ_BIT);
 	int idx = 1;
 	struct ieee80211_sta_he_cap *he_cap = &data->he_cap;
 	struct ieee80211_he_cap_elem *he_cap_elem = &he_cap->he_cap_elem;
@@ -8600,12 +8628,27 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 
 	he_cap_elem->mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU;
 
-	/* HE PHY Capabilities Information */
-	he_cap_elem->phy_cap_info[0] =
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
-		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
-	;
+	/*
+	 * HE PHY Capabilities Information.
+	 *
+	 * The channel width set is per band (IEEE 802.11ax 9.4.2.248.3):
+	 * B0 is the 2.4 GHz bit, B1 and B2 apply to 5 GHz and 6 GHz.
+	 * 40/80 MHz stays on in 5 GHz and 6 GHz as before (80 MHz is
+	 * mandatory there, see brcmf_update_vht_cap()). 160 MHz follows the
+	 * firmware's per-band "bw_cap", the same source the VHT capability
+	 * uses, so it is only reported when the radio can use it. This runs
+	 * again when the wiphy bands are rebuilt, so set the field whole.
+	 */
+	if (band->band == NL80211_BAND_2GHZ) {
+		he_cap_elem->phy_cap_info[0] =
+			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+	} else {
+		he_cap_elem->phy_cap_info[0] =
+			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
+		if (has_160)
+			he_cap_elem->phy_cap_info[0] |=
+				IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+	}
 
 	he_cap_elem->phy_cap_info[1] =
 		IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD;
@@ -8646,10 +8689,14 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 		IEEE80211_HE_PHY_CAP7_MAX_NC_1;
 
 	he_cap_elem->phy_cap_info[8] =
-		IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI |
-		IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G |
-		IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
-		IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
+		IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI;
+	if (band->band == NL80211_BAND_2GHZ)
+		he_cap_elem->phy_cap_info[8] |=
+			IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G;
+	if (has_160)
+		he_cap_elem->phy_cap_info[8] |=
+			IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
+			IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
 
 	he_cap_elem->phy_cap_info[9] =
 		IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
@@ -8660,8 +8707,9 @@ static void brcmf_update_he_cap(struct ieee80211_supported_band *band,
 	/* HE Supported MCS and NSS Set */
 	he_mcs->rx_mcs_80 = cpu_to_le16(0xfffa);
 	he_mcs->tx_mcs_80 = cpu_to_le16(0xfffa);
-	he_mcs->rx_mcs_160 = cpu_to_le16(0xfffa);
-	he_mcs->tx_mcs_160 = cpu_to_le16(0xfffa);
+	/* 0xffff: no spatial stream is supported at 160 MHz */
+	he_mcs->rx_mcs_160 = cpu_to_le16(has_160 ? 0xfffa : 0xffff);
+	he_mcs->tx_mcs_160 = cpu_to_le16(has_160 ? 0xfffa : 0xffff);
 	/* HE 6 GHz band capabilities */
 	if (band->band == NL80211_BAND_6GHZ) {
 		u16 capa = 0;
@@ -8790,7 +8838,7 @@ static int brcmf_setup_wiphybands(struct brcmf_cfg80211_info *cfg)
 					     txbf_bfe_cap, txbf_bfr_cap,
 					     ldpc_cap, stbc_rx, stbc_tx);
 		if (he_enable)
-			brcmf_update_he_cap(band, &sdata[band->band]);
+			brcmf_update_he_cap(band, &sdata[band->band], bw_cap);
 	}
 
 	return 0;
@@ -9284,13 +9332,13 @@ static s32 __brcmf_cfg80211_down(struct brcmf_if *ifp)
 	 * from AP to save power
 	 */
 	if (check_vif_up(ifp->vif)) {
-		brcmf_link_down(ifp->vif, WLAN_REASON_UNSPECIFIED, true);
-
-		/* Make sure WPA_Supplicant receives all the event
-		   generated due to DISASSOC call to the fw to keep
-		   the state fw and WPA_Supplicant state consistent
-		 */
-		brcmf_delay(500);
+		if (brcmf_link_down(ifp->vif, WLAN_REASON_UNSPECIFIED, true)) {
+			/* Make sure WPA_Supplicant receives all the events
+			 * generated due to DISASSOC call to the fw to keep
+			 * the fw and WPA_Supplicant state consistent.
+			 */
+			brcmf_delay(500);
+		}
 	}
 
 	brcmf_abort_scanning(cfg);

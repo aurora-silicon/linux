@@ -55,6 +55,9 @@
 /* Restart and power-off go through atomic writes; give the SMC time. */
 #define SMC_ATOMIC_TIMEOUT_MS	5000
 
+/* WKTP wake type: 0 exits Silent Running / Power Nap for a full wake. */
+#define SMC_WAKE_TYPE_FULL	0U
+
 static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
@@ -83,12 +86,15 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 
 /*
  * T6050's reboot/power-off and RTC, for a kernel that owns the machine (J775D, booted bare
- * metal). Registered only where the device tree describes them, so a T6050 device tree without
- * them registers what it did before.
+ * metal), and the gP GPIO bank, which carries the J716s's N1 power line (gP13, the pwren-gpios
+ * of its Wi-Fi/Bluetooth port). Registered only where the device tree describes them, so a T6050
+ * device tree without them registers what it did before. The gP bank has a cell name of its own:
+ * "macsmc-gpio" is the PCIO bank's, and the driver binds both by compatible.
  */
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+	MFD_CELL_OF("macsmc-gp-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
@@ -113,9 +119,15 @@ static int apple_smc_add_described_devices(struct apple_smc *smc, const struct m
 	return 0;
 }
 
-/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+/*
+ * T8152: temperatures and fans (hwmon; the fan keys are read-only unless the
+ * unsafe fan_control parameter is set) and power off/restart (reboot, which
+ * only writes the MBSE key). Notifications, GPIO and the power supply are not
+ * qualified there yet.
+ */
 static const struct mfd_cell apple_smc_telemetry_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 };
 
 static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
@@ -629,6 +641,82 @@ static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
 	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/*
+ * The state the RTKit callbacks use. A message can arrive as soon as the
+ * RTKit is initialised, so this is set up before that.
+ */
+static void apple_smc_init_state(struct apple_smc *smc)
+{
+	mutex_init(&smc->mutex);
+	spin_lock_init(&smc->lock);
+	init_completion(&smc->init_done);
+	init_completion(&smc->cmd_done);
+	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
+	smc->boot_stage = APPLE_SMC_BOOTING;
+}
+
+/* A board's own numbering, from its device tree (apple,wake-reasons and their names) */
+static const struct apple_smc_wake_reason *apple_smc_dt_wake_reasons(struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	struct apple_smc_wake_reason *r;
+	int i, n;
+
+	n = of_property_count_u32_elems(np, "apple,wake-reasons");
+	if (n <= 0 || n != of_property_count_strings(np, "apple,wake-reason-names"))
+		return NULL;
+	r = devm_kcalloc(dev, n + 1, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		u32 bit;
+
+		if (of_property_read_u32_index(np, "apple,wake-reasons", i, &bit) || bit > 63 ||
+		    of_property_read_string_index(np, "apple,wake-reason-names", i, &r[i].name))
+			return NULL;
+		r[i].bit = bit;
+	}
+	return r;
+}
+
+static void apple_smc_write_full_wake(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WAKE_TYPE_FULL);
+	if (ret < 0)
+		dev_warn(smc->dev, "Failed to write WKTP = %u: %d\n",
+			 SMC_WAKE_TYPE_FULL, ret);
+}
+
+static void apple_smc_probe_wktp(struct apple_smc *smc)
+{
+	struct apple_smc_key_info info;
+	int ret;
+
+	ret = apple_smc_get_key_info(smc, SMC_KEY(WKTP), &info);
+	if (ret < 0 || info.size != sizeof(u8) ||
+	    !(info.flags & APPLE_SMC_WRITABLE))
+		return;
+
+	smc->has_wktp = true;
+	apple_smc_write_full_wake(smc);
+}
+
+/* pmVC as the boot left it, next to what apple,sleep-pmvc has the sleep commit write. */
+static void apple_smc_sleep_pmvc_report(struct apple_smc *smc)
+{
+	u32 cur;
+	int ret = apple_smc_read_u32(smc, SMC_KEY(pmVC), &cur);
+
+	if (ret)
+		dev_dbg(smc->dev, "pmVC unreadable (%d); the sleep commit writes %#x\n", ret,
+			smc->sleep_pmvc);
+	else
+		dev_dbg(smc->dev, "pmVC %#x at boot; the sleep commit writes %#x\n", cur,
+			smc->sleep_pmvc);
+}
+
 /* The SMC endpoint started and initialised after the RTKit wake: probe, hibernation restore. */
 static int apple_smc_start(struct apple_smc *smc)
 {
@@ -674,6 +762,7 @@ static int apple_smc_read_key_count(struct apple_smc *smc)
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_smc_wake_reason *dt_reasons;
 	struct apple_smc *smc;
 	bool t6050;
 	int ret;
@@ -681,23 +770,29 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
 	if (!smc)
 		return -ENOMEM;
-	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
-			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	dt_reasons = apple_smc_dt_wake_reasons(dev);
+	smc->wake_reasons = dt_reasons;
+	if (!smc->wake_reasons)
+		smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
+				    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->sleep_wake_type = of_property_read_bool(dev->of_node, "apple,sleep-wake-type");
+	smc->sleep_pmvc_set = !of_property_read_u32(dev->of_node, "apple,sleep-pmvc",
+						    &smc->sleep_pmvc);
 
-	mutex_init(&smc->mutex);
-	spin_lock_init(&smc->lock);
-	init_completion(&smc->init_done);
-	init_completion(&smc->cmd_done);
+	apple_smc_init_state(smc);
 	smc->dev = &pdev->dev;
-	smc->wktp = of_device_is_compatible(dev->of_node, "apple,t6041-smc");
-	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
-		(of_machine_is_compatible("apple,j714s") ||
-		 of_machine_is_compatible("apple,j716c")) &&
+	smc->saved_enabled = apple_t6050_sleep_described() &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
-	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
+	smc->port_dark_wake = smc->saved_enabled && of_machine_is_compatible("apple,j714s");
+	/* A J714s device tree from before apple,wake-reasons */
+	if (smc->port_dark_wake && !dt_reasons)
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
-	/* J813's late notice needs the bounded, IRQ-independent transport too. */
-	if (of_machine_is_compatible("apple,j813"))
+	/*
+	 * J813's late notice needs the bounded, IRQ-independent transport too, as does T8103's:
+	 * its SMC hears last, after SEP and the other coprocessors stopped.
+	 */
+	if (of_machine_is_compatible("apple,j813") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8103-smc"))
 		smc->saved_enabled = true;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
@@ -710,7 +805,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->rtk))
 		return dev_err_probe(dev, PTR_ERR(smc->rtk), "Failed to initialize RTKit");
 
-	smc->boot_stage = APPLE_SMC_BOOTING;
 	ret = apple_rtkit_wake(smc->rtk);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to wake up SMC");
@@ -724,13 +818,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return ret;
 
 	dev_set_drvdata(&pdev->dev, smc);
-	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
 	ret = apple_smc_read_key_count(smc);
 	if (ret)
 		return ret;
 
-	/* Notifications, GPIO and power management are not qualified on T8152. */
+	if (smc->sleep_pmvc_set)
+		apple_smc_sleep_pmvc_report(smc);
+
+	/* T8152: key reads and writes are qualified; notifications and GPIO are not. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,
@@ -746,6 +842,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
 	if (ret)
 		return ret;
+
+	apple_smc_probe_wktp(smc);
 
 	t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-smc");
 	if (t6050)
@@ -851,6 +949,70 @@ int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, s
 }
 EXPORT_SYMBOL_GPL(apple_smc_write_noirq);
 
+int apple_smc_warm_reset_parse(struct device_node *np, struct apple_smc_warm_reset *wr)
+{
+	struct of_phandle_args fn;
+	int count, i;
+
+	memset(wr, 0, sizeof(*wr));
+	if (!np || of_parse_phandle_with_fixed_args(np, "apple,function-warm-reset", 2, 0, &fn))
+		return -ENODEV;
+	wr->smc = of_find_device_by_node(fn.np);
+	of_node_put(fn.np);
+	if (!wr->smc)
+		return -ENODEV;
+	count = of_property_count_u32_elems(np, "apple,warm-reset-writes");
+	if (count < 2 || count % 2 || count > ARRAY_SIZE(wr->writes) ||
+	    of_property_read_u32_array(np, "apple,warm-reset-writes", wr->writes, count))
+		goto bad;
+	for (i = 1; i < count; i += 2)
+		if (wr->writes[i] > 100 * USEC_PER_MSEC)
+			goto bad;
+	wr->key = fn.args[0];
+	wr->count = count / 2;
+	return 0;
+bad:
+	apple_smc_warm_reset_put(wr);
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_parse);
+
+void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr)
+{
+	if (wr->smc)
+		put_device(&wr->smc->dev);
+	memset(wr, 0, sizeof(*wr));
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_put);
+
+int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq)
+{
+	struct apple_smc *smc = wr->smc ? platform_get_drvdata(wr->smc) : NULL;
+	unsigned int i;
+	int ret = 0;
+
+	if (!smc || !wr->count)
+		return -ENODEV;
+	for (i = 0; i < wr->count && !ret; i++) {
+		__be32 value = cpu_to_be32(wr->writes[2 * i]);
+		u32 wait = wr->writes[2 * i + 1];
+
+		if (noirq) {
+			ret = apple_smc_write_noirq(smc, wr->key, &value, sizeof(value));
+			if (!ret) {
+				mdelay(wait / USEC_PER_MSEC);
+				udelay(wait % USEC_PER_MSEC);
+			}
+		} else {
+			ret = apple_smc_write(smc, wr->key, &value, sizeof(value));
+			if (!ret)
+				fsleep(wait);
+		}
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset);
+
 static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 {
 	int ret;
@@ -859,34 +1021,6 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 	if (ret)
 		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
 }
-
-/*
- * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100 (0x101 on the T6040's
- * J616s). Linux never asks for the rail, which is power-gated otherwise, and
- * a rail the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
- * ports.
- */
-#define SMC_PMVC_REQUEST	0x101
-
-/**
- * apple_smc_request_pmvc() - ask the SMC to keep the VDD_CIO rail up
- * @smc: the SMC
- *
- * Writes pmVC at the moment the caller picks, for a sleep controller that issues it ahead of
- * the device suspend phase.
- *
- * Return: 0 on success, a negative errno otherwise.
- */
-int apple_smc_request_pmvc(struct apple_smc *smc)
-{
-	int ret;
-
-	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), SMC_PMVC_REQUEST);
-	if (ret < 0)
-		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", SMC_PMVC_REQUEST, ret);
-	return ret;
-}
-EXPORT_SYMBOL(apple_smc_request_pmvc);
 
 static void apple_smc_sleep_warn(struct apple_smc *smc)
 {
@@ -919,24 +1053,54 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 }
 
 /*
- * WKTP, one byte, the value for power state 0. It goes first at the sleep request, ahead of
- * the other sleep keys (slpa among them) and the AP idle notice. Only for an SMC known to take
- * it: the T6041's.
+ * WKTP, one byte: 2 at the sleep commit, 0 again once a wake is a full one. With the
+ * key left at 2 the SMC treats all the time awake as a power nap: it keeps its own fan
+ * policy against a fan request (the write times out and the fans stay at its idle
+ * speed), and under thermal load it requests a sleep once a second. #1910 does the same
+ * on the M4 Pro.
  */
 #define SMC_WKTP_SLEEP		2
-/* And once a wake is a full one: see apple_smc_wake_full(). */
 #define SMC_WKTP_AWAKE		0
+
+/* WKTP back to 0 after a full wake, or after a sleep that ended in a refusal. */
+static void apple_smc_wake_full(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->wake_silent)
+		return;
+	smc->wake_silent = false;
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
+	if (ret)
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
+}
 
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
-	/* The wake after this is a dark one until apple_smc_wake_full() says otherwise. */
-	smc->wake_silent = true;
-	if (smc->wktp) {
+	/*
+	 * apple,sleep-wake-type and apple,sleep-pmvc (T6041): macOS writes WKTP = 2, going to
+	 * sleep, and pmVC, the VDD_CIO rail mask (bit 8 set, bit n keeping port n's CIO rail
+	 * powered across sleep so rails the sleep engine polls active remain up), before its
+	 * sleep notice. Either failing refuses the sleep before slpa; .complete then tells the
+	 * SMC the sleep is off and writes WKTP back.
+	 */
+	if (smc->sleep_wake_type) {
+		/* Whatever came of the write, the SMC may run silent until it is told. */
+		smc->wake_silent = true;
 		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
-		if (ret)
+		if (ret) {
 			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_SLEEP, ret);
+			return ret;
+		}
+	}
+	if (smc->sleep_pmvc_set) {
+		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), smc->sleep_pmvc);
+		if (ret) {
+			dev_err(smc->dev, "Failed to write pmVC = %#x: %d\n", smc->sleep_pmvc, ret);
+			return ret;
+		}
 	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
@@ -1100,14 +1264,14 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 	const char *why = is_radio ? "wifibt" : "USB-C_plug";
 	s64 asleep_ms;
 
-	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
-	if (smc->wake_reasons != apple_smc_j714s_wake_reasons)
-		return;
 	/* Already dark (a port's wake with the lid closed): counted, so the re-entry waits as after ours. */
 	if (pm_dark_wake()) {
 		smc->dark_wakes++;
 		return;
 	}
+	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
+	if (!smc->port_dark_wake)
+		return;
 	if (!is_radio && (port < 0 || smc->wake_record != BIT_ULL(port)))
 		return;
 	asleep_ms = ktime_ms_delta(ktime_get_boottime(), smc->sleep_entry_boot) -
@@ -1190,6 +1354,9 @@ static void apple_smc_sleep_wake(struct apple_smc *smc, bool woken)
 	}
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
+	/* A dark wake sleeps again, and its commit writes the key anyway. */
+	if (!pm_dark_wake())
+		apple_smc_wake_full(smc);
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
 		pm_wakeup_event(smc->dev, 0);
@@ -1275,7 +1442,8 @@ static int apple_smc_saved_drain(struct apple_smc *smc)
 	return -ENOBUFS;
 }
 
-static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 value)
+static int apple_smc_saved_write(struct apple_smc *smc, smc_key key, const void *buf,
+				 size_t size)
 {
 	u64 msg;
 	int ret;
@@ -1291,10 +1459,10 @@ static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 val
 	if (ret)
 		return ret;
 	/* Guard precedes the copy. Timeout keeps both this ID and this SRAM. */
-	memcpy_toio(smc->shmem.iomem, &value, sizeof(value));
+	memcpy_toio(smc->shmem.iomem, buf, size);
 	smc->msg_id = (smc->msg_id + 1) & 0xf;
 	msg = FIELD_PREP(SMC_MSG, SMC_MSG_WRITE_KEY) |
-		FIELD_PREP(SMC_SIZE, sizeof(value)) |
+		FIELD_PREP(SMC_SIZE, size) |
 		FIELD_PREP(SMC_ID, smc->msg_id) | FIELD_PREP(SMC_DATA, key);
 	smp_store_release(&smc->saved_pending, true);
 	ret = apple_rtkit_m5_saved_send(smc->rtk, msg);
@@ -1309,6 +1477,11 @@ static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 val
 		return -EIO;
 	/* The existing write_u32 callers require a zero-length write ACK. */
 	return FIELD_GET(SMC_SIZE, smc->cmd_ret) ? -EPROTO : 0;
+}
+
+static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 value)
+{
+	return apple_smc_saved_write(smc, key, &value, sizeof(value));
 }
 
 static u64 apple_smc_saved_stamp(void)
@@ -1581,9 +1754,11 @@ static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 };
 
 /*
- * J813 retains its existing MBSE/AP sequence and delay floors. The transport
- * is the saved lane: no scheduler, jiffies, IRQ worker or SRAM reuse is needed
- * after the peer stops. Unrelated notifications are retained until resume.
+ * J813 and T8103 retain their existing MBSE/AP sequence and delay floors. The
+ * transport is the saved lane: no scheduler, jiffies, IRQ worker or SRAM reuse
+ * is needed after the peer stops. Unrelated notifications are retained until
+ * resume, except on gen 1, whose are drained once the AP's power-down is
+ * answered.
  */
 static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 {
@@ -1597,14 +1772,26 @@ static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 		return -EINVAL;
 
 	smc->saved_committed = true;
+	/* Gen 1 (T8103): WKTP between slpw and slpa; this SMC has no pmVC. */
+	if (apple_sleep_smc_gen1_keys()) {
+		u8 wktp = 2;
+
+		ret = apple_smc_saved_write(smc, SMC_KEY(WKTP), &wktp, sizeof(wktp));
+		if (ret)
+			goto out;
+	}
 	ret = apple_smc_saved_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
 	if (ret)
 		goto out;
 	mdelay(SMC_SLEEP_ARM_MS);
 	smc->ap_notified = true;
 	ret = apple_rtkit_m5_saved_ap_power(smc->rtk, false, sent, ack);
-	if (!ret)
+	if (!ret) {
+		/* Gen 1: what the SMC posted with its answer, out of the mailbox first */
+		if (apple_sleep_smc_gen1_keys())
+			apple_smc_saved_drain(smc);
 		mdelay(SMC_SLEEP_IDLE_MS);
+	}
 out:
 	smc->saved_notice_error = ret;
 	return ret;
@@ -1648,7 +1835,7 @@ static int apple_smc_prepare_policy(struct apple_smc *smc)
 
 /*
  * The saved-context guard, under the command mutex, without waiting for it: a sleep a user asks
- * for doesn't wait on a stuck command. The re-entry right after a J714s dark wake does, for at
+ * for doesn't wait on a stuck command. The re-entry right after a counted dark wake does, for at
  * most SMC_DARK_REENTRY_MS: the notification of the event that woke it is still being handled
  * then, its ordinary command in flight, and refusing ended every dark wake in a full one.
  */
@@ -1744,24 +1931,6 @@ static int apple_smc_suspend(struct device *dev)
 	return apple_smc_sleep_prepare(smc);
 }
 
-/*
- * WKTP once a wake is a full one: 0, where a wake that stays dark keeps the key nonzero.
- * Without the 0 the SMC treats all the time awake as a power nap.
- */
-static void apple_smc_wake_full(struct apple_smc *smc)
-{
-	int ret;
-
-	if (!smc->wake_silent)
-		return;
-	smc->wake_silent = false;
-	if (!smc->wktp)
-		return;
-	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
-	if (ret)
-		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
-}
-
 /* Warned, and a refusal came before the notice: tell it the sleep is off. */
 static void apple_smc_complete(struct device *dev)
 {
@@ -1771,7 +1940,6 @@ static void apple_smc_complete(struct device *dev)
 	/* A full wake ends the run of dark ones. */
 	if (!pm_dark_wake())
 		smc->dark_wakes = smc->radio_dark_wakes = 0;
-	apple_smc_wake_full(smc);
 
 	/* Not saved_pending: an ordinary command may be in flight here, and it is read without the mutex. */
 	if (smc->saved_enabled && (smc->saved_recovery || smc->saved_fault)) {
@@ -1801,6 +1969,12 @@ static void apple_smc_complete(struct device *dev)
 		smc->sleep_warned = false;
 	}
 	smc->sleep_policy = NULL;
+	if (smc->has_wktp && !pm_dark_wake()) {
+		smc->wake_silent = false;
+		apple_smc_write_full_wake(smc);
+	}
+	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
+	apple_smc_wake_full(smc);
 }
 
 /*
@@ -1854,6 +2028,9 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
 
+	if (!pm_suspend_via_firmware())
+		return 0;
+
 	/* For the time asleep a dark wake logs: boot time counts the sleep, monotonic doesn't. */
 	smc->sleep_entry_boot = ktime_get_boottime();
 	smc->sleep_entry_mono = ktime_get();
@@ -1869,10 +2046,15 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	return ret;
 }
 
-static int __apple_smc_resume_noirq(struct device *dev)
+static int apple_smc_resume_noirq(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
-	bool woken = smc->woken_done;
+	bool woken;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	woken = smc->woken_done;
 
 	/* This wake's own: never left for another attempt's resume */
 	smc->woken_done = false;
@@ -1908,30 +2090,6 @@ static int __apple_smc_resume_noirq(struct device *dev)
 		apple_smc_set_polled(smc, false);
 	}
 
-	return 0;
-}
-
-/*
- * Once the SMC is back, the rest of the noirq resume can need it: a PCIe host sets its ports up
- * again there, before the PCI core restores the functions behind them, and the ports' power
- * enables are SMC GPIOs. The mailbox's interrupt is still off, so until the early resume the
- * replies are fetched, as this driver fetches its own in its noirq callbacks. A consumer's
- * device link orders its noirq resume after this one.
- */
-static int apple_smc_resume_noirq(struct device *dev)
-{
-	struct apple_smc *smc = dev_get_drvdata(dev);
-	int ret;
-
-	ret = __apple_smc_resume_noirq(dev);
-	if (!ret)
-		apple_smc_set_polled(smc, true);
-	return ret;
-}
-
-static int apple_smc_resume_early(struct device *dev)
-{
-	apple_smc_set_polled(dev_get_drvdata(dev), false);
 	return 0;
 }
 
@@ -2018,7 +2176,6 @@ static const struct dev_pm_ops apple_smc_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_smc_prepare),
 	.suspend = pm_sleep_ptr(apple_smc_suspend),
 	.complete = pm_sleep_ptr(apple_smc_complete),
-	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_smc_resume_early)
 #ifdef CONFIG_HIBERNATION
 	.freeze = apple_smc_freeze,
 	.thaw = apple_smc_thaw,

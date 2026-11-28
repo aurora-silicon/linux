@@ -179,6 +179,19 @@
 	status = "okay";
 };
 
+&sleep {
+	status = "okay";
+};
+
+/* The port controllers' system power state: S3 before a firmware-driven sleep, S0 after it */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
 &aop_audio {
 	apple,chassis-name = "J313";
 	apple,machine-kind = "MacBook Air";

@@ -807,4 +807,70 @@ static struct kunit_suite macsmc_charge_test_suite = {
 	.test_cases = macsmc_charge_test_cases,
 };
 
-kunit_test_suites(&macsmc_power_test_suite, &macsmc_charge_test_suite);
+/* The adapter's input power, PDTR, a float in watts reported in microwatts */
+struct macsmc_ac_test {
+	struct apple_smc smc;
+	struct macsmc_power power;
+	u32 pdtr;
+	int err;
+};
+
+static int ac_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
+{
+	struct macsmc_ac_test *t = container_of(smc, struct macsmc_ac_test, smc);
+
+	if (key != SMC_KEY(PDTR) || size != sizeof(u32))
+		return -EINVAL;
+	if (t->err)
+		return t->err;
+	memcpy(buf, &t->pdtr, size);
+	return size;
+}
+
+static int macsmc_ac_test_init(struct kunit *test)
+{
+	struct macsmc_ac_test *t;
+
+	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return -ENOMEM;
+	t->power.smc = &t->smc;
+	test->priv = t;
+	kunit_activate_static_stub(test, apple_smc_read, ac_test_read);
+	return 0;
+}
+
+static void macsmc_ac_power_now_test(struct kunit *test)
+{
+	struct macsmc_ac_test *t = test->priv;
+	int uw = -1;
+
+	t->pdtr = 0x414eb021; /* 12.918 W */
+	KUNIT_EXPECT_EQ(test, macsmc_ac_read_power_now(&t->power, &uw), 0);
+	KUNIT_EXPECT_EQ(test, uw, 12918000);
+
+	t->pdtr = 0x430b8000; /* 139.5 W */
+	KUNIT_EXPECT_EQ(test, macsmc_ac_read_power_now(&t->power, &uw), 0);
+	KUNIT_EXPECT_EQ(test, uw, 139500000);
+
+	t->pdtr = 0; /* adapter idle or unplugged */
+	KUNIT_EXPECT_EQ(test, macsmc_ac_read_power_now(&t->power, &uw), 0);
+	KUNIT_EXPECT_EQ(test, uw, 0);
+
+	t->err = -EIO;
+	KUNIT_EXPECT_EQ(test, macsmc_ac_read_power_now(&t->power, &uw), -EIO);
+}
+
+static struct kunit_case macsmc_ac_test_cases[] = {
+	KUNIT_CASE(macsmc_ac_power_now_test),
+	{}
+};
+
+static struct kunit_suite macsmc_ac_test_suite = {
+	.name = "macsmc-power-ac",
+	.init = macsmc_ac_test_init,
+	.test_cases = macsmc_ac_test_cases,
+};
+
+kunit_test_suites(&macsmc_power_test_suite, &macsmc_charge_test_suite,
+		  &macsmc_ac_test_suite);

@@ -127,10 +127,20 @@ allOf:
                 minItems: 2
                 maxItems: 3
 
+              reg-names:
+                minItems: 2
+                items:
+                  - const: core
+                  - const: wrapper
+                  - const: aux
+
               interrupts:
                 maxItems: 1
 
               power-domains:
+                maxItems: 1
+
+              resets:
                 maxItems: 1
 
               iommus:

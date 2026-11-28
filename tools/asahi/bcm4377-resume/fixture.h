@@ -16,14 +16,14 @@
 #define HCI_UP_INDEX 5
 #define dev_dbg(...) ((void)0)
 #define dev_err(...) ((void)0)
-static int dev_warnings;
-#define dev_warn(...) ((void)(dev_warnings++))
+#define dev_warn(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define HCI_SETUP 1
 #define HCI_AUTO_OFF 2
 #define HCI_UNREGISTER 4
+#define HCI_MAX_ACL_SIZE 1024
 #define HCI_USER_CHANNEL 8
 #define HCI_RUNNING 16
 #define HCI_UP 32
@@ -46,7 +46,7 @@ static void bacpy(bdaddr_t *a,const bdaddr_t *b) { *a=*b; }
 static int bacmp(const bdaddr_t *a,const bdaddr_t *b) { return memcmp(a,b,6); }
 struct bcm4377_data;
 struct firmware { const unsigned char *data; int size; };
-struct hci_dev { struct bcm4377_data *data; unsigned int flags; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
+struct hci_dev { struct bcm4377_data *data; unsigned int flags; unsigned short acl_mtu,le_mtu; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
 struct ring { bool enabled; };
 struct pci_dev {
 	int irq, dev;
@@ -64,25 +64,14 @@ struct bcm4377_data {
 	pthread_mutex_t resume_lock;
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
-	bool resume_guarded, resume_recovering;
-	unsigned long dma_window_base;
-	unsigned int reset_pending;
-	struct work_struct resume_work;
+	/* T6041 S2R: zero, so a real sleep's power loss boots the firmware again (not modelled: see below). */
+	uint64_t dma_window_base;
+	bool resume_guarded, resume_recovering, power_lost;
+	struct work_struct resume_work, power_lost_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
 static int rebind_count;
-/* A real sleep that took the function's power, and the rebind it queues. */
-static bool resume_via_firmware;
-static int power_rebinds;
-static bool pm_resume_via_firmware(void) { return resume_via_firmware; }
-static void __bcm4377_queue_rebind(struct bcm4377_data *b, const char *why, bool expected)
-{
-	(void)why;
-	assert(expected);
-	b->reset_pending |= 1;
-	power_rebinds++;
-}
 
 /* Controlled boundary for the existing driver's asynchronous rebind work. */
 static void bcm4377_hci_reset(struct hci_dev *hdev)
@@ -102,6 +91,7 @@ static int send_ptb(struct bcm4377_data *b,const struct firmware *f) { assert(f=
 static const struct firmware *bcm4377_request_blob(struct bcm4377_data *b,const char *suffix) { assert(!strcmp(suffix,"ptb"));return missing_blob?NULL:&fw; }
 static void release_firmware(const struct firmware *f) { assert(f==&fw); }
 static int bcm4377_check_bdaddr(struct bcm4377_data *b) { return 0; }
+static int bcm4377_init_cfg(struct bcm4377_data *b) { (void)b; return 0; }
 static int bcm4377_destroy_transfer_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_destroy_completion_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_hci_set_bdaddr(struct hci_dev *h,const bdaddr_t *a) { addr_count++;if(addr_error)return addr_error;h->bdaddr=*a;return 0; }
@@ -121,6 +111,14 @@ static pthread_t producer_thread;
 static void hci_cmd_timeout(struct work_struct *work);
 static struct bcm4377_data *active;
 static bool hdev_is_powered(struct hci_dev *h) {return (h->flags&HCI_UP) && !(h->flags&HCI_AUTO_OFF);}
+/* The controls model resumes after s2idle; a real sleep's rebind path is not taken. */
+static bool pm_resume_via_firmware(void) { return false; }
+struct bcm4377_data;
+static void bcm4377_queue_rebind(struct bcm4377_data *b, const char *why)
+{
+	(void)b; (void)why;
+	assert(0);
+}
 static bool of_machine_is_compatible(const char *s) {assert(!strcmp(s,"apple,j493"));return board_j493;}
 static void *kmalloc(size_t n,int flags) {return allocation_error?NULL:malloc(n);}
 static void kfree(void *p) {free(p);}

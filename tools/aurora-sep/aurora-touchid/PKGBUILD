@@ -1,7 +1,7 @@
 # Maintainer: Chris Kearney <303316+iconidentify@users.noreply.github.com>
 pkgname=aurora-touchid
 pkgver=20261003
-pkgrel=2
+pkgrel=3
 pkgdesc="Touch ID for Omarchy on Apple Silicon (aurora kernel SEP driver)"
 arch=('any')
 url="https://github.com/iconidentify/aurora-linux"
@@ -12,6 +12,7 @@ source=('aurora-touchid-setup'
         'apple-sep.service'
         'apple-sep.path'
         'fprintd-aurora.conf'
+        'aurora-touchid-device.service'
         'aurora-touchid.sleep'
         'wait-for-display'
         'sddm-wait-display.conf')
@@ -19,7 +20,8 @@ sha256sums=('406da23baf0127dd5ba116c2f83808fb10d979315a17227a78731c5d3081efe4'
             '15a878dcf382a22c5d807f0f2c754fe70d39baec88f65aea183b1fe56cf69441'
             '4f7b8a97e35e3511afa482ee8aedd019e960b1a67320675bd347f534feab49c3'
             '2f4b265a4c2180a9e0e4926c53ec77c3dbb074ddc3e083d7925d58db10a576b9'
-            'e1b1152e576e9588cc134b09291b3a2306ac686d9a47be6f128670608da535fc'
+            '1ff4dc0bb2a731fc8ee7a65d270b86b51e0d11d7f68dcce0204a3e67570e58b1'
+            '6da30137e6e2408cab9b755af7a6c4b1e004057a79d857b0d528d5eaf08bfe5a'
             'a87526383319cc7c1214082196d0d80ad9a6da09b5c30bf215f866e01443c611'
             '062f70bb84e4139baf75d4dbefff21478af28f67e5569ee095692734d764746b'
             '07edd06103f5d199e7d6dcca0b7fa8e10a912cb657973ffce764c6e2ef65fa40')
@@ -30,6 +32,7 @@ package() {
   install -Dm644 apple-sep.service "$pkgdir/usr/lib/systemd/system/apple-sep.service"
   install -Dm644 apple-sep.path "$pkgdir/usr/lib/systemd/system/apple-sep.path"
   install -Dm644 fprintd-aurora.conf "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora.conf"
+  install -Dm644 aurora-touchid-device.service "$pkgdir/usr/lib/systemd/system/aurora-touchid-device.service"
   install -Dm755 aurora-touchid.sleep "$pkgdir/usr/lib/systemd/system-sleep/aurora-touchid"
   install -Dm755 wait-for-display "$pkgdir/usr/lib/aurora-touchid/wait-for-display"
   install -Dm644 sddm-wait-display.conf "$pkgdir/usr/lib/systemd/system/sddm.service.d/50-aurora-wait-display.conf"

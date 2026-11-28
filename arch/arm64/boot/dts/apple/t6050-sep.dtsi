@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The SEP (ADT sep, dart-sep) on the T6050 laptops: its mailbox, and its power domain with the
+ * two fabric parents left to the firmware, which genpd votes on and never turns off. The SEP
+ * and its DART stay disabled here: apple_sep enables them after it selects its policy, and only
+ * where the mailbox is enabled.
+ *
+ * Included after t6050-peripherals.dtsi.
+ */
+
+/ {
+	aliases {
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
+	};
+};
+
+&sep_mbox {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};

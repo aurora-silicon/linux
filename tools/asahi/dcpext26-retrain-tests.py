@@ -13,7 +13,7 @@ b = s.index('\nvoid dcp_handle_hotplug_actions', a)
 body = s[a:b]
 if '--negative-control' in sys.argv:
     a = body.index('\t} else if (dcp_is_ext26(dcp) && crtc && crtc->state &&')
-    b = body.index('\t} else if (crtc && crtc->state && crtc->state->active &&', a)
+    b = body.index('\t} else if (dcp_t6040_relinks() && crtc && crtc->state &&', a)
     body = body[:a] + body[b:]
 
 pre = r'''
@@ -31,7 +31,7 @@ struct apple_connector { struct { struct drm_device *dev; struct { struct drm_cr
 struct apple_dcp { bool native, admitted, external_stopped; struct { bool valid; } mode_state; };
 struct drm_mode_set { struct drm_crtc *crtc; };
 static int resets, toggles, releases, transition;
-static bool lost, unlisted, follows;
+static bool lost, unlisted, follows, t604x = true;
 static struct apple_dcp *current;
 static void acquire(void) {
  /* Model the commit that held the modeset locks before the queued worker. */
@@ -46,6 +46,7 @@ static void acquire(void) {
 #define DRM_MODESET_LOCK_ALL_END(dev, ctx, ret) } while (0)
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native; }
 static bool dcp_has_mode(struct apple_dcp *d, const struct mode *m) { return d->admitted && m->id == 1; }
+static bool dcp_t6040_relinks(void) { return t604x; }
 static bool dcp_mode_settable(struct apple_dcp *d, const struct mode *m) { return !unlisted; }
 static bool dcp_typec_follows_crtc(struct apple_dcp *d) { return follows; }
 static bool dcp_crtc_lost_route(struct drm_crtc *c, struct apple_connector *p) { return lost; }
@@ -78,7 +79,10 @@ int main(void) {
  /* unless the Type-C route follows this CRTC, whose own mode set reads the list */
  follows=true;
  assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==3);
- unlisted=follows=false;
+ /* and only on T604x: elsewhere the reset goes ahead as before */
+ follows=false; t604x=false;
+ assert(!dcp_retrain_active_crtc(&c,&d,false) && resets==4);
+ unlisted=follows=false; t604x=true;
  d.native=true; d.admitted=false; lost=true;
  assert(!dcp_retrain_active_crtc(&c,&d,false) && releases==1);
 }
@@ -92,4 +96,4 @@ with tempfile.TemporaryDirectory() as t:
     result = subprocess.run([str(p.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle, unlisted mode')
+print('PASS native26 retrain: lock-wait layout restart, fresh READY, completed commit, classic reset/power cycle, unlisted mode on T604x')

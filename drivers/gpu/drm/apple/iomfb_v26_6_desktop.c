@@ -40,6 +40,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A414", dcpep_pipe_cfg_414),
 	IOMFB_METHOD("A423", iomfbep_set_matrix),
 	IOMFB_METHOD("A427", iomfbep_get_color_remap_mode),
+	IOMFB_METHOD("A428", iomfbep_set_brightness_correction),
 	IOMFB_METHOD("A442", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A446", dcpep_create_default_fb),
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings),
@@ -58,6 +59,22 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #define DCP_FW_VER DCP_FW_VERSION_DESKTOP(26, 6, 0)
 
 #include "iomfb_template.c"
+
+/*
+ * D572: 0 when the firmware is done with the display, 1 when it wants it back. Only a
+ * sleep path waiting for it (s2r_active) acts on it; the firmware takes a zero status.
+ */
+static bool trampoline_dart_power_v26_6_desktop(struct apple_dcp *dcp, int tag, void *out,
+						void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	/* A bool in a 4-byte slot: its upper padding bytes are not cleared. */
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, !!*(const u8 *)in);
+
+	return trampoline_zero(dcp, tag, out, in);
+}
 
 /*
  * D114 periodically publishes dictionary-valued statistics: the analytics
@@ -115,21 +132,6 @@ done:
 	/* Preserve the existing setter acknowledgment for unrelated properties. */
 	*(u8 *)out = true;
 	return true;
-}
-
-/*
- * D572: the firmware's display DART power, 0xffff0000 when it is done with the display and
- * 0xffff0001 when it takes it back. A sleep's stop waits for the first.
- */
-static bool trampoline_dart_power_v26_6_desktop(struct apple_dcp *dcp, int tag,
-						void *out, void *in)
-{
-	const struct dcp_packet_header *header = in - sizeof(*header);
-
-	if (header->in_len >= sizeof(u32) && !(get_unaligned_le32(in) & 0xffff))
-		complete(&dcp->t6041_dart_off);
-
-	return trampoline_zero(dcp, tag, out, in);
 }
 
 static bool iomfb_check_callback_exact_v26_6_desktop(int tag, u32 in_len, u32 out_len)
@@ -373,7 +375,7 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
 
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER

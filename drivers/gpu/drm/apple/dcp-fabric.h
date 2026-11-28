@@ -4,9 +4,11 @@
 
 #include <linux/interrupt.h>
 #include <linux/list.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 #include "dcp-fabric-core.h"
+#include "dcp-fabric-effects.h"
 
 struct apple_connector;
 struct apple_crtc;
@@ -127,11 +129,23 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
-/* An adopted T8132 dcpext. */
+/*
+ * A T8132 dcpext adopted through the M4 26.6.2 backend (iomfb_m4.c,
+ * t8132_ext_drm.c). A J773g dcpext on firmware 27.2 is an ordinary
+ * firmware-27 pipe instead and is neither of these.
+ */
+bool dcp_t8132_ext_m4_node(const struct device_node *np);
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
+static inline bool dcp_typec_routes_available(const struct device_node *routes)
+{
+	return dcp_fabric_has_available_routes(!!routes,
+					       routes ? of_get_available_child_count(routes) : 0);
+}
+
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_sleep_hold_phys(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);
 void dcp_typec_route_unpark(struct apple_dcp *dcp);
 int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2]);

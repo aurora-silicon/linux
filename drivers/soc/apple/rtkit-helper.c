@@ -20,6 +20,10 @@
 #include <linux/string.h>
 #include <linux/suspend.h>
 
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define APPLE_ASC_CPU_CONTROL		0x44
 #define APPLE_ASC_CPU_CONTROL_RUN	BIT(4)
 
@@ -216,6 +220,20 @@ static bool apple_rtkit_helper_reserved(struct device_node *np,
 	return false;
 }
 
+/*
+ * The MTPs whose live handoff uses the retained form: the boot loader always
+ * publishes the buffer inventory with the session, and no buffer may be
+ * allocated after adoption. That form belongs to the MTP firmware, so it is
+ * keyed on the MTP's compatible: every T8132 MTP and every T6040/T6041 MTP
+ * (both use apple,t6041-mtp), whichever board it sits in. The boot loader
+ * picks the form by the same compatibles.
+ */
+static bool apple_rtkit_helper_retained_mtp(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8132-mtp") ||
+	       of_device_is_compatible(np, "apple,t6041-mtp");
+}
+
 static int apple_rtkit_helper_inherit_buffers(
 	struct apple_rtkit_helper *helper,
 	struct apple_rtkit_inherited_buffer *buffers)
@@ -228,9 +246,7 @@ static int apple_rtkit_helper_inherit_buffers(
 	/* T8140 producers predating the buffer inventory remain compatible. */
 	inventory = of_find_property(np, "apple,rtkit-buffers", &length);
 	if (!inventory) {
-		if (of_device_is_compatible(np, "apple,t8132-mtp") ||
-		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(np, "apple,t6041-mtp")))
+		if (apple_rtkit_helper_retained_mtp(np))
 			return -EINVAL;
 		return 0;
 	}
@@ -288,10 +304,7 @@ static int apple_rtkit_helper_inherit_buffers(
  */
 static bool apple_rtkit_helper_strict(struct device *dev, int count)
 {
-	return count > 0 ||
-	       of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
-	       (of_machine_is_compatible("apple,j614s") &&
-		of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+	return count > 0 || apple_rtkit_helper_retained_mtp(dev->of_node);
 }
 
 static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
@@ -339,8 +352,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, count, "Invalid inherited RTKit buffers\n");
 		if ((apple_t8132_live_mtp() &&
 		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
-		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")) ||
+		    of_device_is_compatible(dev->of_node, "apple,t6041-mtp") ||
 		    of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
 			helper->preserved = true;
 	}
@@ -448,9 +460,18 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	writel_relaxed(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
 }
 
+/* The AP power notice itself: the KUnit test replaces it with a static stub. */
+static int apple_rtkit_helper_send_ap_power(struct apple_rtkit_helper *helper, bool on)
+{
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_rtkit_helper_send_ap_power, helper, on);
+#endif
+	return apple_rtkit_ap_power(helper->rtk, on);
+}
+
 static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
 {
-	int ret = apple_rtkit_ap_power(helper->rtk, on);
+	int ret = apple_rtkit_helper_send_ap_power(helper, on);
 
 	if (ret)
 		dev_err(helper->dev, "AP power notice (%s) not answered: %d\n",
@@ -483,7 +504,7 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 		}
 		helper->idle_pending = false;
 		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on first\n");
-		if (apple_rtkit_ap_power(helper->rtk, true)) {
+		if (apple_rtkit_helper_send_ap_power(helper, true)) {
 			dev_err(helper->dev, "AP on after the late answer not answered: no sleep\n");
 			helper->idle_pending = true;
 			return -EBUSY;
@@ -850,3 +871,7 @@ module_platform_driver(apple_rtkit_helper_driver);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple RTKit helper driver");
+
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+#include "rtkit-helper-test.c"
+#endif

@@ -5,6 +5,7 @@
 #ifndef _DOCKCHANNEL_HID_PROTOCOL_H
 #define _DOCKCHANNEL_HID_PROTOCOL_H
 
+#include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -31,6 +32,18 @@
 
 #define DCHID_PM1_CMD_SIZE		4
 #define DCHID_PM2_CMD_SIZE		9
+
+/* IOKit kIOReturnBadArgument: returned when firmware rejects power method 1. */
+#define DCHID_ERR_BAD_ARGUMENT		0xe00002c2
+
+static inline bool dchid_pm1_needs_pm2_fallback(int ret, u32 retcode,
+						bool pm_explicit,
+						bool use_ring,
+						bool has_afe_reset)
+{
+	return ret == -EIO && retcode == DCHID_ERR_BAD_ARGUMENT &&
+	       !pm_explicit && !use_ring && has_afe_reset;
+}
 
 static inline void dchid_pm1_command(u8 iface, u8 state,
 				     u8 cmd[DCHID_PM1_CMD_SIZE])

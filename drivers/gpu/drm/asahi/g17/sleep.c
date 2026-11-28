@@ -46,14 +46,13 @@
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 
-/* Only the M5 boards with a deep sleep need a wrapped provider translation here: the J714s
- * and the J716c. Other G17 clients retain their established direct-domain methods below.
+/* Only the M5 boards with a deep sleep need a wrapped provider translation here: those whose
+ * device tree describes it. Other G17 clients retain their established direct-domain methods
+ * below.
  */
 static bool asahi_g17_m5_provider(struct device *dev)
 {
-	return (of_machine_is_compatible("apple,j714s") ||
-		of_machine_is_compatible("apple,j716c")) &&
-	       of_machine_is_compatible("apple,t6050") &&
+	return apple_t6050_sleep_described() &&
 	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
 }
 
@@ -196,8 +195,8 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 
 /*
  * The node of the GPU's power state word. Where the GPU's first power domain is its PMP
- * report entry (a small index for a reg, under the PMP), the word is that entry's own power
- * domain.
+ * report entry (a small index for a reg, under the PMP), as in the J616C device tree the
+ * bring-up runs, the word is that entry's own domain.
  */
 static struct device_node *asahi_g17_ps_node(struct device *dev)
 {

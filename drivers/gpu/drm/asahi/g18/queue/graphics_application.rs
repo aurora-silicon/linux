@@ -242,6 +242,29 @@ impl G18ParameterBuffer {
         Ok(aliases)
     }
 
+    /// Storage the previous VM's renders wrote (every block, grown ones
+    /// included, the scene scratch and the discard page) may still hold its
+    /// data; clear it before another VM maps it. Construction leaves it zero.
+    /// The page list, block table, scene records, metrics and ring cursors
+    /// are kept: they name the PB's own objects and the PM owns their
+    /// progress. The caller proved the render retired and dropped the
+    /// previous VM's aliases.
+    pub(crate) fn clear_client_data(&mut self) -> Result {
+        let clear = |object: &mut MappedObject| {
+            object.with_bytes_mut(|bytes| {
+                bytes.fill(0);
+                Ok(())
+            })
+        };
+        for block in self.blocks.iter_mut() {
+            clear(block)?;
+        }
+        clear(&mut self.scene_scratch)?;
+        clear(&mut self.discard)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Blocks backed so far: the initial ones plus every growth.
     fn backed_blocks(&self) -> Result<u32> {
         let bytes: usize = self.blocks.iter().map(|block| block.logical_size).sum();

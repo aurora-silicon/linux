@@ -41,6 +41,11 @@
 	apple,output-templates = <0xe 0x00800000>;
 };
 
+/* The 16-inch M4 Max chassis has High Power mode, as on the J616s */
+&clpc {
+	apple,high-power-mode;
+};
+
 /*
  * ADT aop-spmi0/stockholm-spmi: the Stockholm NFC controller at SPMI 9, its
  * interrupts in 224-230 and its enable on SMC gp0e, as on the J616s.
@@ -100,5 +105,67 @@
 };
 
 &aes {
+	status = "okay";
+};
+
+/*
+ * First ProRes encoder (apr0) and its DART. Runs with SCODEC_STREAMING (and
+ * SCODEC) powered; uses the driver's built-in T6041 power-up rows, optionally
+ * overridden by apple/prores-t6041-init.bin.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/* Both MSR scalers/CSCs (scaler0, scaler1) and their DARTs. */
+&ps_fab5_soc {
+	status = "okay";
+};
+
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+&ps_msr1 {
+	status = "okay";
+};
+
+&ps_msr1_ase_core {
+	status = "okay";
+};
+
+&scaler1_dart {
+	status = "okay";
+};
+
+&scaler1 {
 	status = "okay";
 };

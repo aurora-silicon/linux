@@ -652,6 +652,7 @@ impl RegisterWindow {
 const RESERVED_SLOT_UNK_20: u32 = 2;
 
 /// One register-map slot of the hardware data.
+#[derive(Debug)]
 #[repr(C)]
 pub(crate) struct RegisterMapEntry {
     /// Physical address of the window.

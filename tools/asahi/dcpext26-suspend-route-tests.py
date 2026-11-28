@@ -58,7 +58,7 @@ struct device { int unused; };
 struct apple_dcp {
  struct { int iomfb_method_profile; } hw;
  void *coproc_reg;
- bool crashed, ext26_blocked, external_suspended;
+ bool crashed, ext26_blocked, external_suspended, sleep_fw_runs;
  int external_error;
 };
 static unsigned run=1, parks, unparks, wake_paths, disabled, enabled;
@@ -70,6 +70,8 @@ static void dcp_disable_typec_work(struct apple_dcp *d,bool sync) { disabled++; 
 static void dcp_enable_typec_work(struct apple_dcp *d) { enabled++; }
 static int dcp_external_disconnect(struct apple_dcp *d,bool wait) { return disconnect_error; }
 static void device_set_wakeup_path(struct device *d) { wake_paths++; }
+/* The DP PHY hold has its own test (dcp-sleep-phy-hold-tests.py). */
+static void dcp_sleep_hold_phys(struct apple_dcp *d) { (void)d; }
 static void reset_counts(void) { parks=unparks=wake_paths=disabled=enabled=0; }
 '''
 code = pre + function(header, 'dcp_is_ext26') + '\n' + function(source, 'dcp_is_external_h17p') + '\n' + function(source, 'dcp_is_retained_external')
@@ -81,19 +83,19 @@ int main(void) {
  struct apple_dcp native={.hw.iomfb_method_profile=DCP_IOMFB_METHODS_J613_EXT26,
                          .coproc_reg=(void *)0x1000,.external_suspended=true};
  assert(suspend_path(&dev,&native)==0);
- assert(parks==0 && disabled==0 && wake_paths==1);
+ assert(parks==0 && disabled==0 && wake_paths==1 && native.sleep_fw_runs);
  assert(resume_path(&dev,&native)==0 && unparks==0 && !native.external_suspended);
- reset_counts();run=0;
- assert(suspend_path(&dev,&native)==-EHOSTDOWN && parks==0 && wake_paths==0);
+ reset_counts();run=0;native.sleep_fw_runs=false;
+ assert(suspend_path(&dev,&native)==-EHOSTDOWN && parks==0 && wake_paths==0 && !native.sleep_fw_runs);
  assert(resume_path(&dev,&native)==-EHOSTDOWN && native.ext26_blocked && native.external_error==-EHOSTDOWN);
  run=1;reset_counts();disconnect_error=-EBUSY;
  assert(suspend_path(&dev,&native)==-EBUSY && parks==0 && wake_paths==0 && enabled==0);
  struct apple_dcp h17p={.hw.iomfb_method_profile=DCP_IOMFB_METHODS_H17P_EXTERNAL};
  disconnect_error=0;reset_counts();
- assert(suspend_path(&dev,&h17p)==0 && parks==1 && disabled==1 && wake_paths==1);
+ assert(suspend_path(&dev,&h17p)==0 && parks==1 && disabled==1 && wake_paths==1 && h17p.sleep_fw_runs);
  assert(resume_path(&dev,&h17p)==0 && unparks==1);
- reset_counts();disconnect_error=-EBUSY;
- assert(suspend_path(&dev,&h17p)==-EBUSY && parks==0 && wake_paths==0 && disabled==1 && enabled==1);
+ reset_counts();disconnect_error=-EBUSY;h17p.sleep_fw_runs=false;
+ assert(suspend_path(&dev,&h17p)==-EBUSY && parks==0 && wake_paths==0 && disabled==1 && enabled==1 && !h17p.sleep_fw_runs);
  struct apple_dcp other={0};disconnect_error=0;reset_counts();
  assert(suspend_path(&dev,&other)==0 && resume_path(&dev,&other)==0 && parks==0 && unparks==0);
 }
@@ -106,4 +108,5 @@ with tempfile.TemporaryDirectory() as directory:
     result = subprocess.run([str(path.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS retained sleep: H17P park/unpark paired; native26 no park, RUN refusal; disconnect rollback preserved')
+print('PASS retained sleep: H17P park/unpark paired; native26 no park, RUN refusal; disconnect rollback preserved; '
+      'firmware-runs flag set with the wakeup path only')

@@ -14,7 +14,11 @@ device is enabled when it and every node above it are okay) is skipped: the
 block is off as a whole, which is consistent.
 
 Exempt: the DARTs of the SEP and of the AOP. Those coprocessors run from
-before the handoff on states the AP never switches off.
+before the handoff on states the AP never switches off. Also exempt: a DART
+that is a child of a device node (not a bus) with power-domains of its own,
+such as a USB4 router's. Its parent's driver populates it after powering the
+parent's domains, so it is covered by them; the parent's domains must then be
+enabled.
 
 Install python3-libfdt (or pylibfdt) to read DTBs. Labels are shown when the DTBs
 were built with DTC_FLAGS=-@.
@@ -36,6 +40,7 @@ import sys
 
 DART = re.compile(r"apple,.*dart")
 SOC = re.compile(r"apple,[st]\d{4}$")
+BUSES = ("simple-bus", "simple-pm-bus", "simple-mfd", "isa")
 EXEMPT = (
     (re.compile(r"apple,sep$"), "SEP"),
     (re.compile(r"apple,(t\d+-)?aop$"), "AOP"),
@@ -115,6 +120,28 @@ def findings(filename):
             consumers.setdefault(phandles[spec[i + 1]], []).append(offset)
             i += 3 + iommu_cells(phandles[spec[i + 1]])
 
+    def domain_providers(offset):
+        domains = cells(prop(offset, "power-domains"))
+        i = 0
+        while i < len(domains):
+            provider = phandles.get(domains[i])
+            if provider is None:
+                break
+            yield provider
+            n = cells(prop(provider, "#power-domain-cells"))
+            i += 1 + (n[0] if n else 0)
+
+    def disabled_domains(offset):
+        return [nodes[p] for p in domain_providers(offset) if status(p) != "okay"]
+
+    def powered_device(offset):
+        """A device node (not a bus) with power domains of its own: platform
+        code does not populate its children, its driver does."""
+        compatible = strings(prop(offset, "compatible"))
+        return (offset != 0 and bool(compatible) and
+                not any(c in BUSES for c in compatible) and
+                bool(cells(prop(offset, "power-domains"))))
+
     for offset, path in nodes.items():
         compatible = strings(prop(offset, "compatible"))
         if not any(DART.match(c) for c in compatible):
@@ -130,6 +157,13 @@ def findings(filename):
                      for c in strings(prop(o, "compatible"))]
             why = [name for pattern, name in EXEMPT if any(pattern.match(c) for c in users)]
             problem = "exempt (%s)" % why[0] if why else "no power-domains"
+            parent = offsets[path.rsplit("/", 1)[0] or "/"]
+            if not why and powered_device(parent):
+                # The parent device's driver populates this DART once it has
+                # powered its own domains; it is never probed on its own.
+                bad = disabled_domains(parent)
+                problem = ("parent's power domain %s is disabled" % bad[0] if bad else
+                           "exempt (inside %s)" % nodes[parent])
             yield path, label, compatible[0], status(offset), problem
             continue
         i = 0

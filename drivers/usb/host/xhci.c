@@ -1649,6 +1649,11 @@ static int xhci_check_ep0_maxpacket(struct xhci_hcd *xhci, struct xhci_virt_devi
 	int hw_max_packet_size;
 	int ret = 0;
 
+	/* Only slots initialized by successful Address Device command need updating */
+	if (GET_SLOT_STATE(le32_to_cpu(xhci_get_slot_ctx(xhci, vdev->out_ctx)->dev_state))
+	    == SLOT_STATE_ENABLED)
+		return 0;
+
 	ep_ctx = xhci_get_ep_ctx(xhci, vdev->out_ctx, 0);
 	hw_max_packet_size = MAX_PACKET_DECODED(le32_to_cpu(ep_ctx->ep_info2));
 	max_packet_size = usb_endpoint_maxp(&vdev->udev->ep0.desc);

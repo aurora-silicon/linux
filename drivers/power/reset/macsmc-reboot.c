@@ -98,7 +98,9 @@ static int nvmem_cell_get_u8(struct nvmem_cell *cell)
 
 static int nvmem_cell_set_u8(struct nvmem_cell *cell, u8 val)
 {
-	return nvmem_cell_write(cell, &val, sizeof(val));
+	int ret = nvmem_cell_write(cell, &val, sizeof(val));
+
+	return ret < 0 ? ret : 0;
 }
 
 /*
@@ -428,3 +430,7 @@ module_platform_driver(macsmc_reboot_driver);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC reboot/poweroff driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
+
+#if IS_ENABLED(CONFIG_POWER_RESET_MACSMC_KUNIT_TEST)
+#include "macsmc-reboot-test.c"
+#endif

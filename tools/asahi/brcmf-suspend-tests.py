@@ -43,7 +43,7 @@ typedef int32_t s32; typedef uint32_t u32; typedef uint8_t u8; typedef uint32_t 
 #define smp_load_acquire(p) (*(p))
 #define brcmf_dbg(...) ((void)0)
 #define bphy_err(...) ((void)drvr)
-#define bphy_info_once(...) ((void)drvr)
+#define bphy_info_once(d, ...) ((void)(d))
 #define brcmf_info(...) ((void)0)
 #define brcmf_err(...) ((void)0)
 #define __brcmf_err(...) ((void)0)
@@ -61,7 +61,9 @@ enum brcmf_bus_state { BRCMF_BUS_DOWN, BRCMF_BUS_UP };
 /* STOP_REASONS */
 struct net_device { bool stopped; unsigned drains, wakes; };
 struct brcmf_pub;
-struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg80211_vif *next; };
+struct completion { bool done; };
+struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg80211_vif *next;
+ struct completion link_down; };
 struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct net_device *ndev;
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
@@ -72,6 +74,7 @@ struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer, sleep_res
  struct { int intmask, mailboxmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr; bool wowl_transport, wowl_wake;
+ bool wowl_s2idle_only;
  struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
 struct brcmf_pub { struct brcmf_bus *bus_if; struct brcmf_if *iflist[BRCMF_MAX_IFS];
@@ -192,6 +195,7 @@ CALLBACK_STUBS = r'''
 #define BRCMF_E_PFN_NET_FOUND 1
 #define BRCMF_SCAN_STATUS_BUSY 1
 #define BRCMF_VIF_STATUS_READY 2
+#define BRCMF_VIF_STATUS_CONNECTED 3
 #define WLAN_REASON_UNSPECIFIED 1
 #define test_bit(i,p) ((*(p)&BIT(i))!=0)
 #define list_for_each_entry(v,h,m) for ((v)=(h)->first;(v);(v)=(v)->next)
@@ -209,7 +213,8 @@ static bool vif_up;
 static struct net_device *cfg_to_ndev(struct brcmf_cfg80211_info *c) {return c->pub->iflist[0]->ndev;}
 static struct brcmf_if *netdev_priv(struct net_device *n) {return &ifp[n-ndev];}
 static bool check_vif_up(struct brcmf_cfg80211_vif *v) {(void)v;return vif_up;}
-static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;(void)f;return false;}
+static unsigned feats;
+static bool brcmf_feat_is_enabled(struct brcmf_if *i,int f) {(void)i;return feats&BIT(f);}
 static void brcmf_report_wowl_wakeind(struct wiphy *w,struct brcmf_if *i) {(void)w;(void)i;can_command();}
 static void brcmf_fil_iovar_int_set(struct brcmf_if *i,const char *s,int n) {(void)i;(void)s;(void)n;can_command();}
 static void brcmf_config_wowl_pattern(struct brcmf_if *i,const char *s,void *p,int n,void *q,int t) {(void)i;(void)s;(void)p;(void)n;(void)q;(void)t;can_command();}
@@ -219,11 +224,18 @@ static void brcmf_cfg80211_sched_scan_stop(struct wiphy *w,struct net_device *n,
 static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 #define brcmf_fweh_register(p,e,f) ((void)(p),(void)(e))
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
-static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;(void)e;}
-static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
+static unsigned wowl_offs;
+static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
+/* A DISASSOC goes out for a connected vif; the firmware's link down event completes its link_down. */
+static unsigned link_downs, link_waits;
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {bool sent=v->sme_state&BIT(BRCMF_VIF_STATUS_CONNECTED);(void)r;(void)b;can_command();link_downs++;if(sent)v->link_down.done=true;return sent;}
+static void reinit_completion(struct completion *c) {c->done=false;}
+static unsigned long msecs_to_jiffies(unsigned int m) {return m;}
+static unsigned long wait_for_completion_timeout(struct completion *c,unsigned long t) {assert(t==500);link_waits++;return c->done;}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
-static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
+static unsigned wowl_configs;
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();wowl_configs++;return 0;}
 static void brcmf_keepalive_start(struct brcmf_if *i,int n) {(void)i;(void)n;can_command();}
 '''
 
@@ -240,7 +252,7 @@ static void reset(void) {
  devinfo.state=BRCMFMAC_PCIE_STATE_UP;devinfo.intr=devinfo.ready=devinfo.timer=true;
  country_gets=sets=bands=txflows=creates=cancels=removes=probes=0;
  failure=translation=d0_error=probe_error=wake_error=save_error=0;ack=true;retain=1;d3_informs=d0_informs=0;
- pm_suspend_target_state=PM_SUSPEND_TO_IDLE;
+ pm_suspend_target_state=PM_SUSPEND_TO_IDLE;feats=0;
 }
 static void hint(const char *a) {
  struct regulatory_request r={.alpha2={a[0],a[1]}};brcmf_cfg80211_reg_notifier(&wiphy,&r);
@@ -351,6 +363,23 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   assert(msgbuf.flowring_work.queued && msgbuf.txflow_work.queued);
   assert(!d0_informs && !removes && !probes);cases++;
  }
+ /* WoWLAN over an in-band MSI only wakes from s2idle: a deeper target
+  * refuses WoWLAN like the other refusals (scan state cleared, return 1,
+  * nothing configured) so cfg80211 leaves every interface and suspends
+  * again without it; s2idle, and a bus with a real wake line, keep it. */
+ for(int only=0;only<2;only++)for(int deep=0;deep<2;deep++) {
+  static struct cfg80211_wowlan magic={.magic_pkt=true};
+  reset();vif_up=true;wowl_offs=wowl_configs=0;bus.wowl_s2idle_only=only;feats=BIT(BRCMF_FEAT_WOWL);
+  cfg.scan_status=BIT(BRCMF_SCAN_STATUS_BUSY);
+  pm_suspend_target_state=deep?PM_SUSPEND_ON:PM_SUSPEND_TO_IDLE;
+  int ret=brcmf_cfg80211_suspend(&wiphy,&magic);
+  assert(!cfg.scan_status);
+  if(only&&deep) {
+   assert(ret==1 && !cfg.suspended && !wowl_offs && !wowl_configs);
+   assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended && wowl_offs==1 && !wowl_configs);
+  } else assert(!ret && cfg.suspended && !wowl_offs && wowl_configs==1);
+  cases++;
+ }
  /* Outside s2idle (hibernation) Apple firmware still gets the D3 handshake. */
  reset();devinfo.fwseed=true;pm_suspend_target_state=PM_SUSPEND_ON;
  assert(!brcmf_pcie_pm_enter_D3(&device) && d3_informs==1 && !devinfo.s2idle_d0);
@@ -361,6 +390,17 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   reset();assert(!brcmf_pcie_pm_enter_D3(&device));retain=!cold;d0_error=cold?0:-EIO;
   probe_error=fail?-EIO:0;assert(brcmf_pcie_pm_leave_D3(&device)==probe_error);
   assert(removes==1 && probes==1 && ndev[0].stopped && msgbuf.tx_suspended);cases++;
+ }
+ /* A suspend without WoWLAN takes every ready interface down, and waits for the
+  * firmware's link down only where a DISASSOC went out. */
+ {
+  static struct brcmf_cfg80211_vif conn,idle,off;
+  reset();link_downs=link_waits=0;
+  conn.sme_state=BIT(BRCMF_VIF_STATUS_READY)|BIT(BRCMF_VIF_STATUS_CONNECTED);
+  idle.sme_state=BIT(BRCMF_VIF_STATUS_READY);off.sme_state=0;
+  cfg.vif_list.first=&conn;conn.next=&idle;idle.next=&off;
+  assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended);
+  assert(link_downs==2 && link_waits==1 && conn.link_down.done && !off.link_down.done);cases++;
  }
  printf("%u regulatory, TX queue, worker retention and PCIe PM controls passed\n",cases);
  return 0;
@@ -373,7 +413,7 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=['country-gate', 'queue-reasons', 'worker-gate',
                                               'resume-order', 'tx-drain', 'lpas-resume',
-                                              's2idle-d3'])
+                                              's2idle-d3', 'wowl-s2idle-only'])
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text()
                for name in ('cfg80211', 'core', 'pcie', 'msgbuf')}
@@ -406,6 +446,9 @@ def main():
                             'return brcmf_restore_lpas(cfg, ifp);')
     elif args.mutation == 's2idle-d3':
         body = body.replace('if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)',
+                            'if (false)')
+    elif args.mutation == 'wowl-s2idle-only':
+        body = body.replace('if (wowl && cfg->pub->bus_if->wowl_s2idle_only &&\n\t    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)',
                             'if (false)')
     elif args.mutation == 'tx-drain':
         body = body.replace('netif_tx_disable(ifp->ndev);', '(void)ifp;')

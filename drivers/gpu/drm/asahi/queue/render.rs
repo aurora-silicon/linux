@@ -47,7 +47,7 @@ impl super::QueueInner::ver {
     /// This validates the flags and dimensions of the command first, so that every caller,
     /// including the submission-wide TVB sizing pass that runs before [`Self::submit_render`],
     /// rejects a malformed command with `EINVAL` before any arithmetic on its dimensions.
-    fn get_tiling_params(
+    pub(crate) fn get_tiling_params(
         cmdbuf: &uapi::drm_asahi_cmd_render,
         num_clusters: u32,
     ) -> Result<buffer::TileInfo> {

@@ -985,6 +985,8 @@ patternProperties:
     description: Linutronix GmbH
   "^linux,.*":
     description: Linux-specific binding
+  "^linux-enablement-mac,.*":
+    description: Aurora Silicon Apple silicon loader hand-off bindings
   "^linx,.*":
     description: Linx Technologies
   "^liontron,.*":
