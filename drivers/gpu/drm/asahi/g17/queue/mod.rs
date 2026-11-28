@@ -313,6 +313,7 @@ impl<B: Backend> Queue<B> {
                 engine,
                 host_waits,
                 query_access,
+                has_outputs,
             )?;
             let completion = Completion::new(
                 &self.dev,
@@ -697,12 +698,26 @@ const fn cross_engine_wait_completed(
     host_waits: bool,
     engine: Engine,
     query_access: bool,
+    writes_timestamps: bool,
     has_pending_publication: bool,
 ) -> bool {
     if host_waits {
         return true;
     }
-    has_pending_publication && matches!(engine, Engine::Compute) && query_access
+    has_pending_publication && observes_published_timestamps(engine, query_access, writes_timestamps)
+}
+
+/// Whether a consumer's result depends on the host timestamp publication of the commands it
+/// follows: query-accessing compute can read or reset their query words, and a command that
+/// writes timestamps orders its own against theirs. Overlapping such a producer, the consumer
+/// would run, and stamp, before the producer's timestamps are published, and its timestamps
+/// would come out earlier than the producer's.
+const fn observes_published_timestamps(
+    engine: Engine,
+    query_access: bool,
+    writes_timestamps: bool,
+) -> bool {
+    writes_timestamps || (matches!(engine, Engine::Compute) && query_access)
 }
 
 /// Whether a cross-engine consumer overlaps execution with a producer that has
@@ -711,8 +726,9 @@ const fn cross_engine_chain_publication(
     host_waits: bool,
     engine: Engine,
     query_access: bool,
+    writes_timestamps: bool,
 ) -> bool {
-    !host_waits && !(matches!(engine, Engine::Compute) && query_access)
+    !host_waits && !observes_published_timestamps(engine, query_access, writes_timestamps)
 }
 
 /// Whether a same-engine consumer must wait on the host for covered same-engine
@@ -802,6 +818,7 @@ impl<'a> EnqueueOrdering<'a> {
         engine: Engine,
         host_waits: bool,
         query_access: bool,
+        writes_timestamps: bool,
     ) -> Result<Self> {
         let index = engine.index();
         let other = 1 - index;
@@ -810,7 +827,8 @@ impl<'a> EnqueueOrdering<'a> {
 
         let same_wait = same_engine_wait_completed(engine, query_access);
         let same_chain = !same_wait;
-        let cross_chain = cross_engine_chain_publication(host_waits, engine, query_access);
+        let cross_chain =
+            cross_engine_chain_publication(host_waits, engine, query_access, writes_timestamps);
 
         // Retain covered pending or failed publications (`status() <= 0`, not
         // only `== 0`) that survived `prune_frontier()`: if a predecessor's
@@ -876,6 +894,7 @@ impl<'a> EnqueueOrdering<'a> {
                 host_waits,
                 engine,
                 query_access,
+                writes_timestamps,
                 entry.pending_publication().is_some(),
             ) {
                 if host_waits
@@ -1028,6 +1047,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_b.host_waits.is_empty());
@@ -1057,6 +1077,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_c.host_waits.is_empty());
@@ -1117,6 +1138,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(plan_c.predecessors.len(), 1);
@@ -1157,6 +1179,7 @@ mod tests {
             Engine::Compute,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(plan_rc.host_waits.is_empty());
@@ -1177,6 +1200,7 @@ mod tests {
             Engine::Compute,
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(plan_rc_query.host_waits.len(), 1);
@@ -1204,6 +1228,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_cr.host_waits.is_empty());
@@ -1214,6 +1239,110 @@ mod tests {
 
         pub_ra.finish(Ok([1, 2, 0, 0]));
         pub_ca.finish(Ok([3, 4, 0, 0]));
+    }
+
+    /// A command that writes timestamps never overlaps a cross-engine producer whose timestamps
+    /// are not yet published, on either engine: multiview timestamp queries alternate a render
+    /// pass and a compute timestamp write, and each must stamp after the last one's publication.
+    /// A consumer that writes none still overlaps.
+    #[test]
+    fn timestamp_writers_wait_for_cross_engine_publication() {
+        let none = frontier([]);
+        let contexts = FenceContexts::new(1, c_str!("asahi_ts_writer_test"), TEST_KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let after_render = Order {
+            sequence: 1,
+            wait_through: [Some(1), None],
+            tiling_wait_through: [None, None],
+        };
+        let after_compute = Order {
+            sequence: 1,
+            wait_through: [None, Some(1)],
+            tiling_wait_through: [None, None],
+        };
+
+        let (render, render_publication) = test_entry(&contexts, &status, Some(true));
+        let render_publication = render_publication.unwrap();
+        PreparedPublication::new(render_publication.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+        let render_completed = render.completed.raw();
+        let render_frontier = frontier([(1, render)]);
+
+        // Render(ts) -> NO_QUERY_ACCESS compute that writes a timestamp: host wait.
+        let plan = EnqueueOrdering::build(
+            &none,
+            &render_frontier,
+            after_render,
+            Engine::Compute,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.host_waits.len(), 1);
+        assert_eq!(plan.host_waits[0].raw(), render_completed);
+        assert!(plan.firmware_waits.is_empty());
+        assert!(plan.predecessors.is_empty());
+
+        let (compute, compute_publication) = test_entry(&contexts, &status, Some(true));
+        let compute_publication = compute_publication.unwrap();
+        PreparedPublication::new(compute_publication.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+        let compute_scheduled = compute.scheduled.raw();
+        let compute_completed = compute.completed.raw();
+        let compute_frontier = frontier([(1, compute)]);
+
+        // Compute(ts) -> render that writes timestamps: host wait, nothing chained.
+        let plan = EnqueueOrdering::build(
+            &none,
+            &compute_frontier,
+            after_compute,
+            Engine::Render,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.host_waits.len(), 1);
+        assert_eq!(plan.host_waits[0].raw(), compute_completed);
+        assert!(plan.firmware_waits.is_empty());
+        assert!(plan.predecessors.is_empty());
+
+        // Compute(ts) -> render that writes none: still overlaps in firmware and chains.
+        let plan = EnqueueOrdering::build(
+            &none,
+            &compute_frontier,
+            after_compute,
+            Engine::Render,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(plan.host_waits.is_empty());
+        assert_eq!(plan.firmware_waits.len(), 1);
+        assert_eq!(plan.firmware_waits[0].0.raw(), compute_scheduled);
+        assert_eq!(plan.predecessors.len(), 1);
+
+        // Where producers are always waited for on the host (M5 without the G17D forms),
+        // nothing changes.
+        let plan = EnqueueOrdering::build(
+            &none,
+            &compute_frontier,
+            after_compute,
+            Engine::Render,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.host_waits.len(), 1);
+        assert!(plan.firmware_waits.is_empty());
+
+        render_publication.finish(Ok([1, 2, 0, 0]));
+        compute_publication.finish(Ok([3, 4, 0, 0]));
     }
 
     #[test]
@@ -1250,6 +1379,7 @@ mod tests {
             Engine::Compute,
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(plan_before.host_waits.len(), 1);
@@ -1274,6 +1404,7 @@ mod tests {
             Engine::Compute,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_query.host_waits.is_empty());
@@ -1290,6 +1421,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_render.host_waits.is_empty());
@@ -1338,6 +1470,7 @@ mod tests {
             Engine::Render,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(plan_c.predecessors.is_empty());
@@ -1360,6 +1493,7 @@ mod tests {
                 tiling_wait_through: [None, None],
             },
             Engine::Compute,
+            false,
             false,
             false,
         )
@@ -1417,6 +1551,7 @@ mod tests {
                 tiling_wait_through: [None, None],
             },
             Engine::Compute,
+            false,
             false,
             false,
         )
