@@ -57,6 +57,33 @@ const EP_DOORBELL: u8 = 0x21;
 const ASC_CPU_CONTROL: usize = 0x44;
 const ASC_RUN: u32 = 0x10;
 
+#[cfg(CONFIG_APPLE_PMGR_PWRSTATE)]
+#[allow(improper_ctypes)]
+unsafe extern "C" {
+    fn apple_pmgr_ps_set_auto_pm(
+        consumer: *mut kernel::bindings::device,
+        enable: bool,
+    ) -> core::ffi::c_int;
+}
+
+fn set_gpu_auto_pm(dev: &device::Device, enable: bool) {
+    #[cfg(CONFIG_APPLE_PMGR_PWRSTATE)]
+    {
+        // SAFETY: `dev` is a live bound GPU platform device.
+        let ret = unsafe { apple_pmgr_ps_set_auto_pm(dev.as_raw(), enable) };
+        if ret != 0 {
+            dev_warn!(
+                dev,
+                "GPU: apple_pmgr_ps_set_auto_pm({}) failed: {}\n",
+                enable,
+                ret
+            );
+        }
+    }
+    #[cfg(not(CONFIG_APPLE_PMGR_PWRSTATE))]
+    let _ = (dev, enable);
+}
+
 #[cfg(CONFIG_APPLE_SOC_SLEEP)]
 #[allow(improper_ctypes)]
 unsafe extern "C" {
@@ -544,7 +571,12 @@ pub(crate) fn start<'a>(
         peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
         wait(&root, 3000, || root.boot_job_complete())?;
         step = "idle power-off policy";
-        enable_optional_idle_off(dev, &root, &mut peer, root.has_pwr_controller(), "startup")
+        let allowed =
+            enable_optional_idle_off(dev, &root, &mut peer, root.has_pwr_controller(), "startup")?;
+        if allowed {
+            set_gpu_auto_pm(dev, true);
+        }
+        Ok(allowed)
     })();
     let idle_off_allowed = match result {
         Ok(allowed) => allowed,
@@ -1617,6 +1649,9 @@ impl Runtime {
                 return err;
             }
         }
+        if state.idle_off_allowed {
+            set_gpu_auto_pm(self.dev.as_ref(), true);
+        }
         self.notify.set_deep_sleeping(self, false);
         self.asleep.store(false, Ordering::Release);
         if self.healthy() {
@@ -1737,6 +1772,9 @@ impl Runtime {
                 );
                 return Err(self.abort_deep_prepare(state, policy_published, err));
             }
+            if state.idle_off_allowed {
+                set_gpu_auto_pm(self.dev.as_ref(), false);
+            }
             // SAFETY: `ASC_CPU_CONTROL` lies within the mapped ASC page.
             let asc_ctl = unsafe { state.asc.0.add(ASC_CPU_CONTROL) };
             let commit = match KBox::new(CommitStop {
@@ -1804,6 +1842,7 @@ impl Runtime {
                     }
                 } else {
                     dev_info!(self.dev, "GPU: deep sleep refused before commit\n");
+                    set_gpu_auto_pm(self.dev.as_ref(), true);
                 }
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
@@ -1862,6 +1901,9 @@ impl Runtime {
             match restart {
                 Ok(idle_off_allowed) => {
                     state.idle_off_allowed = idle_off_allowed;
+                    if idle_off_allowed {
+                        set_gpu_auto_pm(self.dev.as_ref(), true);
+                    }
                     // No round crosses a sleep (sleep_prepare refuses one), and the restarted
                     // firmware may count generations again from its start: forget old rounds.
                     state.ledger = g14_v27_2_abi::RecoveryLedger::default();
@@ -1934,6 +1976,9 @@ impl Runtime {
                 self.notify.messages.load(Ordering::Relaxed)
             );
         } else {
+            if state.idle_off_allowed {
+                set_gpu_auto_pm(self.dev.as_ref(), false);
+            }
             let allowed = if state.idle_off_allowed {
                 Ok(())
             } else {
