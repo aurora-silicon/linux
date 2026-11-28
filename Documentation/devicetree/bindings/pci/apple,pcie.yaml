@@ -589,12 +589,12 @@ allOf:
               apple,msi-vector-base:
                 description:
                   The bridge's 32-vector slice of the shared MSI window,
-                  after the internal host's vectors 0..31.
+                  after the internal host's vectors 0..31. T8122 bridges
+                  name it; T6030 bridges, which share this compatible, are
+                  still described with the whole window.
                 minimum: 32
                 maximum: 224
                 multipleOf: 32
-            required:
-              - apple,msi-vector-base
         - if:
             properties:
               compatible:
