@@ -597,7 +597,7 @@ impl Pair {
             heapmeta_va: target.heap,
             tpc_va: self.memory.target.tpc_va(),
             tpc_size: layout.tpc_size as u64,
-            gtp_va: self.memory.target.gtp_va(&layout)?,
+            gtp_va: self.memory.target.gtp_va(ordinal, &layout)?,
             deflake_va: deflake,
             ta_status_va: ta_status,
             mesh_storage,
