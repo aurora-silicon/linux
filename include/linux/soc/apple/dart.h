@@ -53,6 +53,9 @@ int apple_dart_dcp_dispext_map(struct device *piodma, unsigned int sid, u64 phys
 int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid);
 /* A host-written surface in SID0 of an external display DART (Normal-NC CPU view). */
 void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_t size, u64 *dva);
+/* Map an existing SID0 scanout surface's pages into a peer external display DART's SID0. */
+int apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+					    struct device *peer_piodma, u64 *peer_dva);
 /* An adopted external display DART's state after its power-up; reads only. */
 int apple_dart_dcp_dispext_state(struct device_node *consumer);
 /*
@@ -66,11 +69,12 @@ int apple_dart_dcp_power_off(struct device *dev);
 int apple_dart_dcp_power_on(struct device *dev);
 
 /*
- * Remappable host windows in SID0 of an external display DART: one
- * whole arena slice each, claimed until reboot, mapped and unmapped by the
- * host only (every change flushed and read back). Pages are the caller's.
+ * Remappable host windows in SID0 of an external display DART: one or two
+ * contiguous 32-MiB arena slices each (for @size up to 64 MiB), claimed until
+ * reboot, mapped and unmapped by the host only (every change flushed and read
+ * back). Pages are the caller's.
  */
-int apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva);
+int apple_dart_dcp_dispext_window_claim(struct device *piodma, size_t size, u64 *dva);
 int apple_dart_dcp_dispext_window_map(struct device *piodma, u64 dva, const phys_addr_t *phys,
 				      unsigned int count);
 int apple_dart_dcp_dispext_window_unmap(struct device *piodma, u64 dva);
@@ -121,7 +125,8 @@ static inline int apple_dart_dcp_dispext_state(struct device_node *consumer)
 	return -EOPNOTSUPP;
 }
 
-static inline int apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva)
+static inline int apple_dart_dcp_dispext_window_claim(struct device *piodma, size_t size,
+						      u64 *dva)
 {
 	return -EOPNOTSUPP;
 }
@@ -151,6 +156,13 @@ static inline void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, 
 							 u64 *dva)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int apple_dart_dcp_dispext_scanout_map_peer(struct device *src_piodma, u64 src_dva,
+							  struct device *peer_piodma,
+							  u64 *peer_dva)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline void *apple_dart_dcp_scanout_alloc(struct device *dev, size_t size, dma_addr_t *dva)

@@ -134,15 +134,20 @@ static inline u64 dcp_m4_nits_binary64(u32 nits)
 	return ((u64)(1023 + bit) << 52) | ((u64)(nits - (1U << bit)) << (52 - bit));
 }
 
+/* Largest external linear XRGB/ARGB scanout (5120x2880x4 = 56.25 MiB <= 64 MiB). */
+#define DCP_M4_EXT_MAX_WIDTH	5120U
+#define DCP_M4_EXT_MAX_HEIGHT	2880U
+
 /*
- * External outputs: any qualified size up to 3840x2160, same surface layout.
+ * External outputs: any qualified size up to 5120x2880, same surface layout.
  * The frame must already be described at its wire DVA in an owned mapping.
  */
 static inline int dcp_m4_frame_check_ext(const struct dcp_m4_frame *frame)
 {
 	u64 size = (u64)frame->stride * frame->height;
 
-	if (!frame->width || !frame->height || frame->width > 3840 || frame->height > 2160 ||
+	if (!frame->width || !frame->height ||
+	    frame->width > DCP_M4_EXT_MAX_WIDTH || frame->height > DCP_M4_EXT_MAX_HEIGHT ||
 	    frame->stride < frame->width * 4 || frame->stride % 64 ||
 	    !size || size > 0xffffffffULL || frame->backing_size < size ||
 	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
@@ -302,6 +307,30 @@ static inline void dcp_m4_swap_set_deadline(void *output, u64 deadline)
 	put_unaligned_le64(deadline, data + 0x0);
 	put_unaligned_le64(deadline, data + 0x8);
 	put_unaligned_le64(deadline, data + 0x30);
+}
+
+/*
+ * Retarget surface 0 of an encoded external swap to a horizontal tile
+ * [src_x, src_x + tile_w) x [0, height) scanned onto [0, tile_w) x [0, height)
+ * of a dual-pipe merged output, keeping the full-frame surface descriptor.
+ */
+static inline int dcp_m4_swap_set_tile(void *output, size_t length, u32 full_width,
+				       u32 src_x, u32 tile_w, u32 height)
+{
+	u8 *data = output;
+
+	if (!output || length < 0x11c || !tile_w || !height ||
+	    tile_w > full_width || src_x > full_width - tile_w)
+		return -EINVAL;
+	put_unaligned_le32(src_x, data + 0xac);
+	put_unaligned_le32(0, data + 0xb0);
+	put_unaligned_le32(tile_w, data + 0xb4);
+	put_unaligned_le32(height, data + 0xb8);
+	put_unaligned_le32(0, data + 0x10c);
+	put_unaligned_le32(0, data + 0x110);
+	put_unaligned_le32(tile_w, data + 0x114);
+	put_unaligned_le32(height, data + 0x118);
+	return 0;
 }
 
 static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,

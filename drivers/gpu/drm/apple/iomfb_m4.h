@@ -50,6 +50,8 @@ int iomfb_m4_health(struct apple_dcp *dcp);
 int iomfb_m4_error(struct apple_dcp *dcp);
 bool iomfb_m4_external_ready(struct apple_dcp *dcp);
 void iomfb_m4_external_link_gone(struct apple_dcp *dcp);
+int iomfb_m4_peer_hints(struct apple_dcp *dcp, unsigned int port_unit,
+			const void *data, size_t size, void *reply, size_t reply_size);
 /* An adopted external DCP's sink, for its DRM connector (t8132_ext_drm.c). */
 int iomfb_m4_ext_detect(struct apple_dcp *dcp);
 int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
@@ -109,6 +111,12 @@ static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
 static inline bool iomfb_m4_external_ready(struct apple_dcp *dcp) { return false; }
 static inline void iomfb_m4_external_link_gone(struct apple_dcp *dcp) { }
+static inline int iomfb_m4_peer_hints(struct apple_dcp *dcp, unsigned int port_unit,
+				      const void *data, size_t size, void *reply,
+				      size_t reply_size)
+{
+	return -ENODEV;
+}
 static inline int iomfb_m4_ext_detect(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector)
 {

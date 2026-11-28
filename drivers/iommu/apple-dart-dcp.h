@@ -33,6 +33,8 @@ struct apple_dart_dcp {
 	DECLARE_BITMAP(arena, DCP_DART_ENTRIES); /* SID0 retained surfaces only. */
 	/* SID0 arena slices claimed as remappable host windows. */
 	DECLARE_BITMAP(window, DCP_DART_ENTRIES);
+	/* Number of contiguous slices (1..2) owned by a window starting at root. */
+	u8 window_slices[DCP_DART_ENTRIES];
 	unsigned long retained; /* SID0 pages pinned after an uncertain unmap. */
 	u32 ttbr;
 	unsigned int sid;
@@ -191,9 +193,19 @@ struct apple_dart_dcp_allocation {
 };
 
 /* SID0 slices for the retained copy surfaces; generic DMA gets the other free ones. */
-#define DCP_DART_SCANOUT_SLOTS	4
-/* An external display DART's SID0 arena: the surfaces and host windows. */
-#define DCP_DART_DISPEXT_SLOTS	10
+#define DCP_DART_SCANOUT_SLOTS		4
+/*
+ * An external display DART's SID0 arena (reserved at admission, before mode
+ * selection): up to 18 x 32-MiB slices (576 MiB of the 64-GiB aperture, +256 MiB
+ * over the previous 10-slice cap, leaving >63 GiB unreserved; external SID0 has
+ * no generic DMA consumer and allocates no physical RAM until surfaces are used).
+ */
+#define DCP_DART_DISPEXT_SLOTS		18
+/* Up to two contiguous 32-MiB slices (64 MiB) per external surface or window. */
+#define DCP_DART_DISPEXT_MAX_SLICES	2
+#define DCP_DART_DISPEXT_MAX_SIZE	(DCP_DART_DISPEXT_MAX_SLICES * DCP_DART_SLICE)
+/* Total retained external SID0 surface budget (fits 4K + 5K upgrade and D201). */
+#define DCP_DART_DISPEXT_SCANOUT_MAX	(6 * DCP_DART_SLICE)
 
 static bool apple_dart_has_borrowed(struct apple_dart *dart)
 {

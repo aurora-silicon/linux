@@ -23,6 +23,7 @@
 #include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
+#include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
 
 #include "dptx-j700-training.h"
@@ -1035,6 +1036,10 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			dptxport_note_tile_hint(service, data, data_size);
 		if (dptxport_dual_pipe_alloc(service, data, data_size, reply,
 					     reply_size))
+			return 0;
+		if (dcp_is_t8132_ext(service->ep->dcp) &&
+		    iomfb_m4_peer_hints(service->ep->dcp, dptx->unit, data,
+					data_size, reply, reply_size) == 0)
 			return 0;
 		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 			return dcp_peer_hints_v27(service->ep->dcp, dptx, data,

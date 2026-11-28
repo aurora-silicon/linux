@@ -355,7 +355,7 @@ static void t8132_ext_direct_refused(struct t8132_ext_out *out, struct drm_frame
  * flip comes later, t8132_ext_drm_flip_done()), -ENOSPC or -EOPNOTSUPP to
  * copy it instead, else the error (the frame lost). A linear XRGB8888 or
  * ARGB8888 GEM DMA buffer, own or imported, from its first byte, at the
- * mode's size, the pitch a multiple of 64 bytes, at most 32 MiB, and every
+ * mode's size, the pitch a multiple of 64 bytes, at most 64 MiB, and every
  * 16 KiB of it one 16 KiB page (t8132_ext_fb_pages()).
  *
  * An imported buffer is cleaned out of the CPU caches for the display every
@@ -390,8 +390,8 @@ static int t8132_ext_present_direct(struct t8132_ext_out *out, struct apple_dcp 
 		why = "not the mode's size";
 	else if (fb->pitches[0] % 64 || fb->pitches[0] < fb->width * 4)
 		why = "the pitch is not a multiple of 64 bytes";
-	else if ((u64)fb->pitches[0] * fb->height > SZ_32M || obj->size > SZ_32M)
-		why = "over 32 MiB";
+	else if ((u64)fb->pitches[0] * fb->height > SZ_64M || obj->size > SZ_64M)
+		why = "over 64 MiB";
 	if (why) {
 		t8132_ext_direct_refused(out, fb, why);
 		return -EOPNOTSUPP;

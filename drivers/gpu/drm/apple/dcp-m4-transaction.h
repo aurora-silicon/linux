@@ -85,6 +85,7 @@ static inline int dcp_m4_call_begin_stream(struct dcp_m4_transaction *state, voi
 		.remote = remote, .stream = stream,
 	};
 	const struct dcp_m4_packet *outer = NULL;
+	bool concurrent_oob;
 	u8 *data;
 	int ret, offset;
 
@@ -93,10 +94,17 @@ static inline int dcp_m4_call_begin_stream(struct dcp_m4_transaction *state, voi
 	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !word || (input_size && !input) ||
 	    !dcp_m4_tag(tag, 'A') || state->calls >= DCP_M4_CALL_DEPTH)
 		return dcp_m4_transaction_fail(state, -EINVAL);
-	/* Out of band (stream 1) on the external profile too: top-level only. */
-	if (stream > 1 || (stream && (state->calls || state->callbacks)))
+	/*
+	 * Out of band (stream 1): top-level, or one concurrent OOB query on an
+	 * external DCP while a stream-0 call (e.g. paired A413) is paused at a
+	 * modeset rendezvous on the same serialized owner.
+	 */
+	concurrent_oob = stream == 1 && state->external && !state->oob &&
+			 !state->callbacks && state->calls == 1 &&
+			 !state->call[0].packet.stream && !remote;
+	if (stream > 1 || (stream && !concurrent_oob && (state->calls || state->callbacks)))
 		return dcp_m4_transaction_fail(state, -EINVAL);
-	if (state->calls) {
+	if (state->calls && !concurrent_oob) {
 		struct dcp_m4_call *pending = &state->call[state->calls - 1];
 
 		/* Merely queuing a callback does not grant nested-call ownership. */
@@ -208,7 +216,8 @@ static inline int dcp_m4_call_reply(struct dcp_m4_transaction *state, const void
 		memcpy(output, (const u8 *)rpc + offset + DCP_M4_PACKET_HEADER +
 		       call->packet.input_size, output_size);
 	/* The out-of-band call itself, not a call nested in its callbacks. */
-	if (call->packet.stream && state->calls == 1)
+	if (call->packet.stream &&
+	    (state->calls == 1 || !state->call[state->calls - 2].packet.stream))
 		state->oob = false;
 	state->calls--;
 	return 0;
