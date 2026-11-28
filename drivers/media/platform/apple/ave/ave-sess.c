@@ -950,6 +950,8 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 		sess->mctf_surf = NULL;
 		kvfree(sess->mctf_lin);
 		sess->mctf_lin = NULL;
+		if (!sess->mctf_borrowed)
+			ave->failed_count++;
 		sess->failed_next = ave->failed_sessions;
 		ave->failed_sessions = sess;
 	} else {
@@ -987,6 +989,7 @@ void ave_sess_reap(struct ave_dev *ave)
 		kfree(sess);
 		freed = true;
 	}
+	ave->failed_count = 0;
 	domain = freed ? iommu_get_domain_for_dev(ave->dev) : NULL;
 	if (domain)
 		iommu_flush_iotlb_all(domain);

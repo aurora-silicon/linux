@@ -500,6 +500,9 @@ SUITES = [
     # recovery code built against host boundaries.
     ('ave-host', AVE_TESTS, ['python3', '-I', '-B', 'run.py', '--build', '{out}']),
     ('ave-recovery', AVE_TESTS, ['python3', '-I', '-B', 'run-recovery.py']),
+    # This revision keeps every session stopped beside a running one.
+    ('ave-recovery-old', AVE_TESTS, ['python3', '-I', '-B', 'run-recovery.py',
+                                     '--ref', '255761f1d55f8dcf3e2c24d17095439237ad6f72'], KILL),
     ('ave-input', AVE_TESTS, ['python3', '-I', '-B', 'run-input.py']),
     ('ave-ipc', AVE_TESTS, ['python3', '-I', '-B', 'run-ipc.py']),
 ]
@@ -537,11 +540,12 @@ def jobs(work, conf, dtc):
         sys.exit(2)
     result = []
     # The suites take longest, so start them first.
-    for name, cwd, cmd in SUITES:
+    for name, cwd, cmd, *expect in SUITES:
         d = work / name
         # Only ASan catches an unbounded legacy reply copy, so keep it on.
         env = {'AFKV2_SANITIZERS': '1', 'HOSTCC': name.rsplit('-', 1)[1]} if name.startswith('apple-afkv2') else {}
-        result.append((name, [a.replace('{out}', str(d / 'out')) for a in cmd], cwd, PASS, d, env))
+        result.append((name, [a.replace('{out}', str(d / 'out')) for a in cmd], cwd,
+                       expect[0] if expect else PASS, d, env))
     for name, runs in ASAHI_TESTS.items():
         for index, (args, expect) in enumerate(runs):
             label = name.removesuffix('.py') + ('' if not args or args == out() or args == out('--output')
