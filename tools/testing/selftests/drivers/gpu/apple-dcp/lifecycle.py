@@ -5,6 +5,156 @@ from pathlib import Path
 import re
 from common import block, apple_function, atc_set_mode_prototypes, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers, atc_cfg_helpers
 
+def reconnect(root):
+    source = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    defines = '\n'.join(line for line in source.splitlines()
+                        if line.startswith('#define DPTX_RECONNECT_'))
+    production = '\n'.join(block(source, marker) for marker in (
+        'static void dcp_queue_typec_reconnect_locked(',
+        'static void dcp_typec_reconnect_work('))
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <errno.h>
+typedef uint32_t u32;
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; bool pending; unsigned long delay; };
+struct dcp_fabric_session { unsigned id; };
+struct apple_dcp {
+ int hpd_mutex; void *dev; bool crashed, external, typec_cable_connected;
+ bool typec_follow_retiring, external_error, sessionless, tunnel, t8132;
+ u32 typec_reconnect_generation, typec_reconnect_tries;
+ struct dcp_fabric_session typec_reconnect_session;
+ struct delayed_work typec_reconnect_wq;
+};
+struct lock_guard { int *lock; bool run; };
+static struct lock_guard take_lock(int *lock)
+{ assert(!*lock); *lock = 1; return (struct lock_guard){lock, true}; }
+static void drop_lock(struct lock_guard *g) { assert(*g->lock); *g->lock = 0; }
+#define scoped_guard(kind, lock) \
+ for (struct lock_guard g __attribute__((cleanup(drop_lock))) = take_lock(lock); \
+      g.run; g.run = false)
+#define lockdep_assert_held(lock) assert(*(lock))
+#define READ_ONCE(x) (x)
+#define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
+#define to_delayed_work(p) container_of(p, struct delayed_work, work)
+#define delayed_work_pending(w) ((w)->pending)
+#define msecs_to_jiffies(x) (x)
+#define system_freezable_wq 0
+#define dcp_typec_sessionless(d) ((d)->sessionless)
+#define dcp_j714s_ext(d) false
+#define dcpext_scanout_terminal(d) false
+#define dcp_is_t8132_ext(d) ((d)->t8132)
+#define dcp_uses_t6020_tunnel_flow(d) ((d)->tunnel)
+#define dev_warn(...) ((void)0)
+static unsigned calls, errors, kicks, tiles;
+static bool replace, stale;
+static int connect_result;
+#define dev_err(...) ((void)++errors)
+#define dcp_announce_kick(d) ((void)++kicks)
+static struct dcp_fabric_session dcp_session_locked(struct apple_dcp *d)
+{ assert(d->hpd_mutex); return (struct dcp_fabric_session){1}; }
+static bool dcp_session_valid_locked(struct apple_dcp *d,
+                                    struct dcp_fabric_session s, bool cable)
+{ assert(d->hpd_mutex && cable); return !stale && s.id == 1; }
+static void mod_delayed_work(int queue, struct delayed_work *w, unsigned long delay)
+{ (void)queue; w->pending = true; w->delay = delay; }
+static void dcp_queue_typec_reconnect_locked(struct apple_dcp *, unsigned long);
+static int dcp_dptx_connect(struct apple_dcp *d, unsigned port)
+{
+ assert(!d->hpd_mutex && port == 0); calls++;
+ if (replace) {
+  replace = false;
+  scoped_guard(mutex, &d->hpd_mutex) { dcp_queue_typec_reconnect_locked(d, 0); }
+ }
+ return connect_result;
+}
+static int dcp_dptx_connect_raw(struct apple_dcp *d, unsigned port, void *unused,
+                              struct dcp_fabric_session *s, bool cable, bool recovery)
+{ assert(!unused && s->id == 1 && cable && !recovery); return dcp_dptx_connect(d, port); }
+static int dcp_dptx_connect_tile(struct apple_dcp *d)
+{ assert(!d->hpd_mutex); tiles++; return 0; }
+''' + defines + '\n' + production + r'''
+static void request(struct apple_dcp *d)
+{
+ scoped_guard(mutex, &d->hpd_mutex) { dcp_queue_typec_reconnect_locked(d, 0); }
+}
+static void run(struct apple_dcp *d)
+{
+ assert(d->typec_reconnect_wq.pending);
+ d->typec_reconnect_wq.pending = false;
+ dcp_typec_reconnect_work(&d->typec_reconnect_wq.work);
+ assert(!d->hpd_mutex);
+}
+int main(void)
+{
+ for (unsigned sessionless = 0; sessionless < 2; sessionless++) {
+  for (unsigned flow = 0; flow < 3; flow++) {
+   struct apple_dcp d = {.sessionless = sessionless, .tunnel = flow == 1,
+                        .t8132 = flow == 2, .typec_cable_connected = true};
+   unsigned limit = flow ? 1 : DPTX_RECONNECT_RETRIES;
+   calls = errors = kicks = tiles = 0;
+   connect_result = -ETIMEDOUT;
+   request(&d);
+   for (unsigned n = 1; n <= limit; n++) {
+    run(&d);
+    assert(d.typec_reconnect_tries == n);
+    assert(d.typec_reconnect_wq.pending == (n < limit));
+    if (n < limit) assert(d.typec_reconnect_wq.delay == DPTX_RECONNECT_DELAY);
+   }
+   assert(calls == limit && errors == 1);
+   request(&d);
+   assert(d.typec_reconnect_tries == 0);
+
+   /* A dispatched old worker must not adopt a replacement already pending. */
+   dcp_typec_reconnect_work(&d.typec_reconnect_wq.work);
+   assert(calls == limit && d.typec_reconnect_tries == 0);
+   assert(d.typec_reconnect_wq.pending && d.typec_reconnect_wq.delay == 0);
+
+   /* Replace the request during connect without changing its fabric session. */
+   replace = true;
+   run(&d);
+   assert(calls == limit + 1 && errors == 1 && d.typec_reconnect_tries == 0);
+   assert(d.typec_reconnect_wq.pending && d.typec_reconnect_wq.delay == 0);
+   for (unsigned n = 0; n < limit; n++) run(&d);
+   assert(calls == 2 * limit + 1 && errors == 2);
+
+   /* Success issues the same calls and leaves a newer request untouched. */
+   request(&d);
+   connect_result = 0;
+   unsigned before = calls, before_tiles = tiles;
+   run(&d);
+   assert(calls == before + 1 && tiles == before_tiles + !sessionless);
+   assert(!d.typec_reconnect_wq.pending && d.typec_reconnect_tries == 0);
+   assert(errors == 2 && kicks == 0);
+   request(&d);
+   replace = true;
+   run(&d);
+   assert(d.typec_reconnect_wq.pending && d.typec_reconnect_wq.delay == 0);
+   assert(d.typec_reconnect_tries == 0 && errors == 2);
+   run(&d);
+   assert(!d.typec_reconnect_wq.pending);
+
+   if (!sessionless) {
+    request(&d);
+    stale = true;
+    before = calls;
+    run(&d);
+    assert(calls == before && errors == 2);
+    stale = false;
+   }
+   printf("PASS: sessionless=%u flow=%u budget, overlap, pending, success\n",
+          sessionless, flow);
+  }
+ }
+ return 0;
+}
+'''
+
+
 def disconnect(root):
     # Copyright 2026 Ryan Murray
 

@@ -2259,7 +2259,6 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 			 * A T8132 dcpext has no connector of its own: it connects
 			 * from the Type-C reconnect work, as for a tunnel.
 			 */
-			dcp->typec_reconnect_tries = 0;
 			dcp_queue_typec_reconnect(dcp, 0);
 		}
 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
@@ -3160,7 +3159,6 @@ static void dcp_tb_queue_reconnect(void *data)
 	struct dcp_tb_attach_context *ctx = data;
 	struct apple_dcp *dcp = ctx->best->dcp;
 
-	dcp->typec_reconnect_tries = 0;
 	dcp_queue_typec_reconnect(dcp, 0);
 }
 
@@ -4194,7 +4192,6 @@ static int dcp_follow_attach(void *data, unsigned int index, bool restore)
 		dcp->typec_generation++;
 		dcp->typec_follow_start = true;
 		dcp->typec_follow_gen = dcp->typec_generation;
-		dcp->typec_reconnect_tries = 0;
 		dcp->placeholder_retried = false;
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
 		WRITE_ONCE(dcp->typec_crtc_off, true);
