@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The left-front port's (ATC1) USB4 DisplayPort tunnel clocks on T6050, as the right port's
+ * (t6050-atc2-dp-tunnel.dtsi): the PHY's DP IN pixel clock sources (dp-clock-source), their four
+ * clock gates, the PHY's dp0..dp3 power domains, and the router's DP IN interrupts (ADT
+ * atc1-dpin0..3). Without the clock sources a display behind a USB4/Thunderbolt dock or enclosure
+ * on this port stays dark. Addresses and interrupts are the T6050's (J714sAP and K114sAP ADT
+ * agree). For boards that describe the ATC1 router (acio1): J714s (t6050-j714s-display.dtsi),
+ * K114s and K114c (t6050-k114-usb.dtsi).
+ */
+
+&ps_atc1_common_dp_0 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_1 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_2 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_3 {
+	status = "okay";
+};
+
+&atc1_phy {
+	reg = <0x2 0xab000000 0x0 0x2c000>,
+	      <0x2 0xaaa90000 0x0 0x4000>,
+	      <0x2 0xaa800000 0x0 0x4000>,
+	      <0x2 0xab200000 0x0 0x4000>,
+	      <0x2 0xab244000 0x0 0x4000>,
+	      <0x2 0xa8000000 0x0 0x8000>,
+	      <0x2 0xa8020000 0x0 0x4000>,
+	      <0x2 0xab250000 0x0 0x4000>,
+	      <0x2 0xab140000 0x0 0x4000>,
+	      <0x2 0xab0c0000 0x0 0x10000>,
+	      <0x2 0xaaa84000 0x0 0x4000>,
+	      <0x2 0x80000058 0x0 0x10>;
+	reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+		    "common-cfg", "usb-control", "firmware-data", "pipehandler",
+		    "dp-clock-source";
+	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>, <&ps_atc1_phymxwrap>,
+			<&ps_atc1_usb>, <&ps_atc1_common_dp_0>, <&ps_atc1_common_dp_1>,
+			<&ps_atc1_common_dp_2>, <&ps_atc1_common_dp_3>;
+	power-domain-names = "usb-aon", "common", "wrapper", "usb", "dp0", "dp1", "dp2", "dp3";
+};
+
+/* The left-front router's DP IN interrupts (ADT atc1-dpin0..3) */
+&acio1 {
+	interrupts = <AIC_IRQ 0 1635 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1636 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1641 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1642 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
+};

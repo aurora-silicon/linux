@@ -6,6 +6,8 @@
  * addresses and interrupts (/arm-io/acio1, acio-cpu1, dart-acio1, apciec1, dart-apciec1). Like
  * the right port's (t6050-max-atc2.dtsi), it is powered per connection and nothing is touched at
  * boot. The router, DART and tunnel tunables are this board's, from its ADT; they equal ATC2's.
+ * The K114s ADT has the same router nodes: t6050-k114-usb.dtsi includes this for the K114s
+ * and K114c.
  */
 
 &ps_atc1_cio {
@@ -191,7 +193,6 @@
 			reg-names = "config", "rc", "port0", "fabric", "debug", "ltssm", "intr2axi";
 			/* The port's: link events and INTx */
 			interrupts = <AIC_IRQ 0 1437 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "port0";
 			power-domains = <&ps_atc1_pcie>;
 			/* No boot loader hands the port over: the kernel cold-initializes it. */
 			apple,pciec-kernel-init;

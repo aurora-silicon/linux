@@ -30,7 +30,7 @@
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
 
-		connector {
+		typec1: connector {
 			compatible = "usb-c-connector";
 			label = "USB-C Left-front";
 			power-role = "dual";
