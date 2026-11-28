@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * "Speaker Protection Interface": the volume lock in charge from the bind,
- * the switch to the lease and back through the floor of both, and the way
- * back when the lease has no owner. On the card of fake controls that
+ * at a ceiling that nothing lifts, the switch to the lease (the only owner
+ * that lifts the speakers) and back through the floor, and the way back
+ * when the lease has no owner. On the card of fake controls that
  * macaudio-protection-test.h builds, with the volume lock's controls added.
  */
 #include <kunit/test.h>
@@ -11,7 +12,7 @@ struct macaudio_test_iface {
 	struct macaudio_test_spk t;
 	struct snd_kcontrol *slk;
 	struct snd_kcontrol *iface;
-	/* The legacy daemon's control file */
+	/* A retired daemon's control file (speakersafetyd, speakerguardd 0.1) */
 	struct snd_ctl_file *daemon;
 };
 
@@ -61,14 +62,14 @@ static int macaudio_test_iface_write(struct kunit *test, struct macaudio_test_if
 	return macaudio_spk_iface_put(f->iface, uval);
 }
 
-/* The legacy daemon takes the lock and every speaker volume */
+/* A retired daemon holds every speaker volume; the lock control is refused */
 static void macaudio_test_daemon_take(struct kunit *test, struct macaudio_test_iface *f)
 {
 	unsigned int i;
 
 	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
 		f->t.vols[i]->vd[0].owner = f->daemon;
-	KUNIT_ASSERT_EQ(test, macaudio_slk_lock(f->slk, f->daemon), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(f->slk, f->daemon), -EPERM);
 }
 
 static int macaudio_test_daemon_ping(struct kunit *test, struct macaudio_test_iface *f)
@@ -111,37 +112,32 @@ static void macaudio_iface_volume_lock_from_binding(struct kunit *test)
 	macaudio_test_expect_limit(test, &f, 1, 1);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f.t.ma->spk_unowned_work));
 
-	/* Speaker volumes are the daemon's to write */
+	/* Speaker volumes are writable, below the ceiling */
 	KUNIT_EXPECT_EQ(test, f.t.vols[0]->write_check(f.t.vols[0], NULL), 0);
 
-	/* The daemon unlocks them as on a lock-only kernel */
+	/* A retired daemon's lock and ping are refused and lift nothing */
 	macaudio_test_daemon_take(test, &f);
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
-	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
-	macaudio_test_expect_limit(test, &f, 1, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
+	macaudio_test_expect_limit(test, &f, 1, 1);
 }
 
-/* Into the lease: the lock's ceiling, then the lease's floor, then the lift */
+/* Into the lease: the lease's floor, then the lift */
 static void macaudio_iface_switch_goes_through_the_floor(struct kunit *test)
 {
 	struct macaudio_test_iface f;
-	unsigned int i;
 
 	macaudio_test_iface_card(test, &f);
 	macaudio_test_daemon_take(test, &f);
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
-	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
-		macaudio_test_vol(f.t.vols[i])->value = 180;
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
 
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
 	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	/* At the lease's floor, below a ceiling that no longer applies */
 	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
 
 	/* The volume lock is refused, and so are the daemon's volume writes */
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
 	KUNIT_EXPECT_EQ(test, f.t.vols[0]->write_check(f.t.vols[0], NULL), -EPERM);
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 0);
 
@@ -156,8 +152,7 @@ static void macaudio_iface_switch_goes_through_the_floor(struct kunit *test)
 
 /*
  * Back to the volume lock: the speakers come back at the floor under the
- * lock's ceiling, and go up only once the daemon pings, as after a cold
- * bind; its first ping learns that it lost the lock.
+ * lock's ceiling, and stay there: no daemon lifts them.
  */
 static void macaudio_iface_revert_starts_at_the_floor(struct kunit *test)
 {
@@ -174,20 +169,23 @@ static void macaudio_iface_revert_starts_at_the_floor(struct kunit *test)
 	macaudio_test_settle(f.t.ma);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	macaudio_test_expect_limit(test, &f, 0, 1);
 	/* The lease grants nothing any more */
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), -EBUSY);
 	macaudio_test_expect_limit(test, &f, 0, 1);
 
-	/* The daemon's lock was lost: told once, then it unlocks */
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -ETIMEDOUT);
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	/* Nor does the retired daemon, however often it pings */
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
 	macaudio_test_expect_limit(test, &f, 0, 1);
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
-	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
-	/* Unlocking lifts the ceiling only: the daemon sets the volumes itself */
-	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
+
+	/* The lease takes them again and grants as before */
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_limit(test, &f, SN012776_0DB, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 0), 0);
+	macaudio_test_settle(f.t.ma);
 }
 
 /* The engine dies: the lease's floor at once, the volume lock after the grace */
@@ -220,7 +218,6 @@ static void macaudio_iface_unowned_lease_reverts(struct kunit *test)
 	flush_delayed_work(&f.t.ma->spk_unowned_work);
 	macaudio_test_settle(f.t.ma);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	macaudio_test_expect_limit(test, &f, 0, 1);
 }
 
@@ -249,7 +246,7 @@ static void macaudio_iface_needs_cap_sys_admin(struct kunit *test)
  * J813: its four SN012776 (the fake card's Left/Right Woofer/Tweeter
  * volumes, the J813 amps' prefixes) are behind both interfaces from the
  * bind, as on the MCA machines. Under the volume lock they stay at its
- * ceiling until a daemon holds the lock and pings; under the lease they are
+ * ceiling, whatever a daemon does; under the lease they are
  * at the floor and no speaker start is admitted until an owner is granted.
  */
 static void macaudio_iface_j813_speakers_protected(struct kunit *test)
@@ -259,21 +256,16 @@ static void macaudio_iface_j813_speakers_protected(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
 	macaudio_test_iface_card_cfg(test, &f, &macaudio_j813_cfg);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	macaudio_test_expect_limit(test, &f, 1, 1);
 
-	/* A daemon that holds the lock but has not pinged lifts nothing */
+	/* A daemon that holds the volumes and pings lifts nothing */
 	macaudio_test_daemon_take(test, &f);
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), -EPERM);
 	macaudio_test_expect_limit(test, &f, 1, 1);
-	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
-	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
-	macaudio_test_expect_limit(test, &f, 1, SN012776_0DB);
 
 	/* Into the lease: the floor, and nothing admitted without an owner */
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
 	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
-	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
 	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), -EPERM);

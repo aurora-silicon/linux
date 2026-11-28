@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * The speaker volumes the system-sleep lock clips are set again at the
- * daemon's first ping after it, through the lock control and the PM notifier.
+ * Under "Speaker Volume Unlock" the speaker volumes sit at its ceiling from
+ * the bind, and a system sleep, a retired daemon's lock and ping, or both,
+ * never lift it. The card here is shared with macaudio-vlimit-test.h.
  */
 #include <kunit/test.h>
 
@@ -49,8 +50,6 @@ static void macaudio_pmt_pm_cleanup(void *data)
 {
 	struct macaudio_snd_data *ma = data;
 
-	cancel_delayed_work_sync(&ma->lock_timeout_work);
-	macaudio_pm_volumes_drop(ma);
 	macaudio_spk_fini(ma);
 }
 
@@ -59,11 +58,11 @@ static const char *const macaudio_pmt_vol_names[] = {
 	"Right Woofer Speaker Volume",
 	"Left Tweeter Speaker Volume",
 	"Right Tweeter Speaker Volume",
-	/* Not a speaker volume: never locked, kept or set */
+	/* Not a speaker volume: never clipped */
 	"Headphone Playback Volume",
 };
 
-/* As the daemon set them before the sleep */
+/* What the amps' volumes held before the bind */
 static const long macaudio_pmt_vols[] = { 201, 190, 201, 170, 120 };
 
 #define MACAUDIO_PMT_NR_VOLS ARRAY_SIZE(macaudio_pmt_vol_names)
@@ -88,7 +87,7 @@ static struct snd_kcontrol *macaudio_pmt_add_kctl(struct kunit *test, struct snd
 	return kctl;
 }
 
-/* A card with speaker safety, its lock control and the volumes, none owned yet */
+/* A bound card with speaker safety, its lock control and the volumes at its ceiling */
 static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 {
 	struct snd_kcontrol_new slk = {
@@ -97,6 +96,7 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 		.info = snd_ctl_boolean_mono_info,
 		.get = macaudio_slk_get,
 		.put = macaudio_slk_put,
+		.lock = macaudio_slk_lock,
 	};
 	struct macaudio_snd_data *ma;
 	struct snd_card *card;
@@ -119,7 +119,6 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 	ma->has_safety = true;
 	INIT_LIST_HEAD(&ma->card.rtd_list);
 	mutex_init(&ma->volume_lock_mutex);
-	INIT_DELAYED_WORK(&ma->lock_timeout_work, macaudio_vlimit_timeout_work);
 	/* The volume lock is the interface, as at every bind */
 	mutex_init(&ma->spk_mutex);
 	KUNIT_ASSERT_EQ(test, macaudio_spk_init(ma), 0);
@@ -147,9 +146,17 @@ static void macaudio_pmt_pm_card(struct kunit *test, struct macaudio_pmt_pm *t)
 
 	ret = kunit_add_action_or_reset(test, macaudio_pmt_pm_cleanup, ma);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	/* As macaudio_late_probe() does at every bind */
+	mutex_lock(&ma->volume_lock_mutex);
+	macaudio_vlimit_unlock(ma, false);
+	mutex_unlock(&ma->volume_lock_mutex);
 }
 
-/* A daemon takes the lock and every speaker volume, as speakersafetyd does */
+/*
+ * A retired daemon (speakersafetyd, speakerguardd 0.1) holds every speaker
+ * volume and asks for the lock control: refused.
+ */
 static void macaudio_pmt_take(struct kunit *test, struct macaudio_pmt_pm *t)
 {
 	struct snd_ctl_file *owner = kunit_kzalloc(test, sizeof(*owner), GFP_KERNEL);
@@ -158,7 +165,7 @@ static void macaudio_pmt_take(struct kunit *test, struct macaudio_pmt_pm *t)
 	KUNIT_ASSERT_NOT_NULL(test, owner);
 	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
 		t->vols[i]->vd[0].owner = owner;
-	KUNIT_ASSERT_EQ(test, macaudio_slk_lock(t->slk, owner), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(t->slk, owner), -EPERM);
 }
 
 static int macaudio_pmt_ping(struct kunit *test, struct macaudio_pmt_pm *t)
@@ -175,9 +182,8 @@ static void macaudio_pmt_notify(struct macaudio_pmt_pm *t, unsigned long action)
 	macaudio_pm_notify(&t->ma->pm_nb, action, NULL);
 }
 
-/* The speaker volumes as the daemon set them, or clipped to the lock's ceiling */
-static void macaudio_pmt_expect_vols(struct kunit *test, struct macaudio_pmt_pm *t,
-				      bool clipped)
+/* Every speaker volume clipped to the lock's ceiling, and limited there */
+static void macaudio_pmt_expect_vols(struct kunit *test, struct macaudio_pmt_pm *t)
 {
 	unsigned int i;
 
@@ -185,79 +191,48 @@ static void macaudio_pmt_expect_vols(struct kunit *test, struct macaudio_pmt_pm 
 		bool speaker = i < MACAUDIO_PMT_NR_VOLS - 1;
 
 		KUNIT_EXPECT_EQ(test, macaudio_pmt_vol(t->vols[i])->value,
-				speaker && clipped ? 1L : macaudio_pmt_vols[i]);
+				speaker ? 1L : macaudio_pmt_vols[i]);
+		if (speaker)
+			KUNIT_EXPECT_EQ(test, macaudio_pmt_vol(t->vols[i])->mc.platform_max, 1);
 	}
 }
 
-static void macaudio_pm_volumes_restored_after_sleep(struct kunit *test)
+/* A sleep under the volume lock leaves the ceiling where it was */
+static void macaudio_pm_volumes_sleep_keeps_the_ceiling(struct kunit *test)
 {
 	struct macaudio_pmt_pm t;
 
 	macaudio_pmt_pm_card(test, &t);
-	macaudio_pmt_take(test, &t);
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
-	macaudio_pmt_expect_vols(test, &t, false);
+	macaudio_pmt_expect_vols(test, &t);
 
 	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
-	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
-	macaudio_pmt_expect_vols(test, &t, true);
-	/* A ping before the freeze leaves them locked */
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
-
-	/* Locked after the resume until the daemon pings */
+	macaudio_pmt_expect_vols(test, &t);
 	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
-	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
-	macaudio_pmt_expect_vols(test, &t, true);
-
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
-	macaudio_pmt_expect_vols(test, &t, false);
-	KUNIT_EXPECT_NULL(test, t.ma->pm_volumes);
+	macaudio_pmt_expect_vols(test, &t);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(t.ma));
 }
 
-/* The daemon pings only once a stream runs: a second sleep can come first. */
-static void macaudio_pm_volumes_second_sleep_before_ping(struct kunit *test)
+/* A retired daemon's lock and pings around a sleep lift nothing */
+static void macaudio_pm_volumes_daemon_across_sleep(struct kunit *test)
 {
 	struct macaudio_pmt_pm t;
 
 	macaudio_pmt_pm_card(test, &t);
 	macaudio_pmt_take(test, &t);
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	macaudio_pmt_expect_vols(test, &t);
 
 	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
 	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
-	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
-	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
-	macaudio_pmt_expect_vols(test, &t, true);
-
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	macaudio_pmt_expect_vols(test, &t, false);
-}
-
-/* A new owner, such as a restarted daemon, sets the volumes itself. */
-static void macaudio_pm_volumes_new_owner(struct kunit *test)
-{
-	struct macaudio_pmt_pm t;
-
-	macaudio_pmt_pm_card(test, &t);
 	macaudio_pmt_take(test, &t);
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
-	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
-
-	macaudio_pmt_take(test, &t);
-	KUNIT_EXPECT_NULL(test, t.ma->pm_volumes);
-	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
-	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
-	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	macaudio_pmt_expect_vols(test, &t);
 }
 
 static struct kunit_case macaudio_pm_volumes_cases[] = {
-	KUNIT_CASE(macaudio_pm_volumes_restored_after_sleep),
-	KUNIT_CASE(macaudio_pm_volumes_second_sleep_before_ping),
-	KUNIT_CASE(macaudio_pm_volumes_new_owner),
+	KUNIT_CASE(macaudio_pm_volumes_sleep_keeps_the_ceiling),
+	KUNIT_CASE(macaudio_pm_volumes_daemon_across_sleep),
 	{}
 };
 

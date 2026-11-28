@@ -66,11 +66,10 @@
  */
 #define MACAUDIO_MAX_BCLK_FREQ	24576000
 
+/* The ping of the retired "Speaker Volume Unlock" daemons, refused */
 #define SPEAKER_MAGIC_VALUE (s32)0xdec1be15
 /* Primary, Secondary and Speaker Sense */
 #define MACAUDIO_NUM_FE_LINKS	3
-/* The "Speaker Volume Unlock" lease, in milliseconds */
-#define SPEAKER_LOCK_TIMEOUT 250
 /*
  * While "Speaker Protection" is the interface, this long without an owner of
  * it (the engine died, or never came) puts "Speaker Volume Unlock" back in
@@ -228,16 +227,11 @@ struct ma_codec_idle {
 	u32 idle_mask;
 };
 
-/* A speaker volume control and its value, as the system-sleep lock found it */
-struct macaudio_pm_volume {
-	struct snd_kcontrol *kctl;
-	long value[2];
-};
-
 /*
  * The interface that owns the speakers (see "Speaker Protection Interface"):
- * the volume lock of speakersafetyd and speakerguardd 0.1, or the lease of a
- * protection engine in the signal path.
+ * the volume lock, which holds the speaker volumes at its ceiling and lifts
+ * them for no one, or the lease of a protection engine in the signal path,
+ * the only owner that can lift them.
  */
 enum macaudio_spk_iface {
 	MACAUDIO_SPK_IFACE_UNLOCK,
@@ -358,32 +352,15 @@ struct macaudio_snd_data {
 	struct snd_soc_component *sw_gain_component;
 
 	/*
-	 * "Speaker Volume Unlock": the speakersafetyd / speakerguardd 0.1
-	 * interface (see macaudio_vlimit_update()).
+	 * "Speaker Volume Unlock": the speaker volumes' ceiling outside the
+	 * lease. Nothing lifts it: the retired daemons' lock and ping on the
+	 * control are refused (macaudio_slk_lock(), macaudio_slk_put()).
 	 */
 	int speaker_sample_rate;
 	struct snd_kcontrol *speaker_sample_rate_kctl;
 
 	struct mutex volume_lock_mutex;
-	bool speaker_volume_unlocked;
-	bool speaker_volume_was_locked;
 	struct snd_kcontrol *speaker_lock_kctl;
-	struct snd_ctl_file *speaker_lock_owner;
-	u64 bes_active;
-	bool speaker_lock_timeout_enabled;
-	ktime_t speaker_lock_timeout;
-	ktime_t speaker_lock_remain;
-	struct delayed_work lock_timeout_work;
-	struct work_struct lock_update_work;
-	/*
-	 * The speaker volumes as the system-sleep lock found them. Locking clips
-	 * them to its ceiling and unlocking only lifts the ceiling; the daemon
-	 * keeps its lease across the sleep and does not set them again.
-	 */
-	struct macaudio_pm_volume *pm_volumes;
-	unsigned int pm_nr_volumes;
-	/* Allocated with them, so that setting them again cannot fail */
-	struct snd_ctl_elem_value *pm_uval;
 
 	/*
 	 * Software-gain amplifier: a lower gain cannot change samples that
@@ -528,15 +505,12 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 };
 
 /*
- * "Speaker Volume Unlock": speaker protection by a userspace daemon
- * (speakersafetyd, speakerguardd 0.1), the default interface.
- *
- * The daemon holds SNDRV_CTL_IOCTL_ELEM_LOCK on "Speaker Volume Unlock" and
- * on every speaker volume control, and pings the unlock control with
- * SPEAKER_MAGIC_VALUE at least every SPEAKER_LOCK_TIMEOUT ms while the
- * speakers play. While it does, the volumes may go up to the amps' 0 dB;
- * otherwise they are held at the lock's ceiling. The daemon governs them
- * from its thermal model.
+ * "Speaker Volume Unlock": the default interface, from every bind. The
+ * speaker volumes are held at its ceiling, the safe level, and nothing
+ * lifts it: only the "Speaker Protection" lease can (see
+ * macaudio_spk_enter_lease()). The lock and ping of the daemons that used
+ * to lift it (SNDRV_CTL_IOCTL_ELEM_LOCK on the control and every speaker
+ * volume, then SPEAKER_MAGIC_VALUE written to it) are refused.
  */
 
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
@@ -550,6 +524,9 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		WARN_ON_ONCE(1);
 		return;
 	}
+
+	/* Only the lease lifts the ceiling (macaudio_spk_enter_lease()) */
+	unlock = unlock && macaudio_spk_leased(ma);
 
 	switch (ma->cfg->amp) {
 	case AMP_NONE:
@@ -664,323 +641,6 @@ static void macaudio_lock_fail_work(struct work_struct *work)
 
 	dev_crit(ma->card.dev, "speaker volume lock failed: stopping and refusing playback\n");
 	macaudio_stop_playback(ma, false);
-}
-
-static void macaudio_pm_volumes_drop(struct macaudio_snd_data *ma)
-{
-	kfree(ma->pm_volumes);
-	kfree(ma->pm_uval);
-	ma->pm_volumes = NULL;
-	ma->pm_nr_volumes = 0;
-	ma->pm_uval = NULL;
-}
-
-/*
- * Keep the speaker volumes before the system-sleep lock clips them.
- *
- * Context: volume_lock_mutex and the card's controls_rwsem held, so the daemon
- * cannot set a volume between this and the clip.
- */
-static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
-{
-	const char *name = volume_control_names[ma->cfg->amp];
-	struct snd_ctl_elem_value *uval = NULL;
-	struct macaudio_pm_volume *vols = NULL;
-	struct snd_kcontrol *kctl;
-	unsigned int nr = 0, i = 0;
-	int ret;
-
-	lockdep_assert_held(&ma->volume_lock_mutex);
-	lockdep_assert_held(&ma->card.snd_card->controls_rwsem);
-
-	if (!ma->has_safety || !name || ma->card.snd_card->shutdown)
-		return;
-	/*
-	 * Locked already, as after a sleep the daemon has not pinged since:
-	 * the volumes are at the ceiling, and those from before it are kept.
-	 */
-	if (!ma->speaker_volume_unlocked)
-		return;
-	macaudio_pm_volumes_drop(ma);
-
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list)
-		if (snd_soc_control_matches(kctl, name))
-			nr++;
-	if (!nr)
-		return;
-
-	vols = kzalloc_objs(*vols, nr);
-	uval = kzalloc_obj(*uval);
-	if (!vols || !uval)
-		goto out;
-
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if (!snd_soc_control_matches(kctl, name))
-			continue;
-		memset(uval, 0, sizeof(*uval));
-		uval->id = kctl->id;
-		ret = kctl->get(kctl, uval);
-		if (ret < 0) {
-			dev_warn(ma->card.dev, "Failed to keep volume %s for the system sleep: %d\n",
-				 kctl->id.name, ret);
-			goto out;
-		}
-		vols[i].kctl = kctl;
-		vols[i].value[0] = uval->value.integer.value[0];
-		vols[i].value[1] = uval->value.integer.value[1];
-		i++;
-	}
-
-	ma->pm_volumes = vols;
-	ma->pm_nr_volumes = i;
-	ma->pm_uval = uval;
-	return;
-out:
-	kfree(uval);
-	kfree(vols);
-}
-
-/*
- * At the unlock after a system sleep: the volumes the daemon had set.
- *
- * Context: volume_lock_mutex and the card's controls_rwsem held, so no volume
- * write races these.
- */
-static void macaudio_pm_volumes_restore(struct macaudio_snd_data *ma)
-{
-	struct snd_ctl_elem_value *uval = ma->pm_uval;
-	unsigned int i;
-	int ret;
-
-	if (!ma->pm_volumes)
-		return;
-
-	for (i = 0; i < ma->pm_nr_volumes; i++) {
-		struct snd_kcontrol *kctl = ma->pm_volumes[i].kctl;
-
-		memset(uval, 0, sizeof(*uval));
-		uval->id = kctl->id;
-		uval->value.integer.value[0] = ma->pm_volumes[i].value[0];
-		uval->value.integer.value[1] = ma->pm_volumes[i].value[1];
-		ret = kctl->put(kctl, uval);
-		if (ret < 0)
-			dev_err(ma->card.dev, "Failed to restore volume %s: %d\n",
-				kctl->id.name, ret);
-		else if (ret > 0)
-			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
-				       &kctl->id);
-	}
-	macaudio_pm_volumes_drop(ma);
-}
-
-static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
-{
-	int i;
-	bool unlock = true;
-	struct snd_kcontrol *kctl;
-	const char *reason;
-
-	/* Do nothing if there is no safety configured */
-	if (!ma->has_safety)
-		return;
-
-	/*
-	 * "Speaker Protection" owns the speakers: the lock is held at its
-	 * ceiling until the interface switches back (macaudio_spk_leave_lease()).
-	 */
-	if (macaudio_spk_leased(ma))
-		return;
-
-	/* No protection daemon can hold these speakers: nothing to unlock */
-	if (macaudio_spk_lease_only(ma->cfg))
-		return;
-
-	/* Check that someone is holding the main lock */
-	if (!ma->speaker_lock_owner) {
-		reason = "Main control not locked";
-		unlock = false;
-	}
-
-	/* Check that the control has been pinged within the timeout */
-	if (ma->speaker_lock_remain <= 0) {
-		reason = "Lock timeout";
-		unlock = false;
-	}
-
-	/*
-	 * System sleep: userspace is frozen long before the card suspends (over
-	 * half a second on J616s), and a playback stream left running then plays
-	 * out its stale buffer and stops on an xrun into the still unmuted amps.
-	 * Lock the volumes before the freeze instead of when the frozen daemon's
-	 * lease runs out.
-	 */
-	if (ma->pm_quiesced) {
-		reason = "System suspend";
-		unlock = false;
-	}
-
-	/* Check that *every* limited control is locked by the same owner */
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if(!snd_soc_control_matches(kctl, volume_control_names[ma->cfg->amp]))
-			continue;
-
-		for (i = 0; i < kctl->count; i++) {
-			if (kctl->vd[i].owner != ma->speaker_lock_owner) {
-				reason = "Not all child controls locked by the same process";
-				unlock = false;
-			}
-		}
-	}
-
-
-	if (unlock != ma->speaker_volume_unlocked) {
-		if (unlock) {
-			dev_info(ma->card.dev, "Speaker volumes unlocked\n");
-		} else  {
-			dev_info(ma->card.dev, "Speaker volumes locked: %s\n", reason);
-			/* The system-sleep lock is the kernel's own, not a lease the daemon lost */
-			if (!ma->pm_quiesced)
-				ma->speaker_volume_was_locked = true;
-		}
-
-		macaudio_vlimit_unlock(ma, unlock);
-		if (unlock)
-			macaudio_pm_volumes_restore(ma);
-		if (!unlock && ma->cfg->amp == AMP_MAX98360A) {
-			/* Samples already converted at the old gain must not play */
-			atomic_inc(&ma->sw_gain_lock_epoch);
-			schedule_work(&ma->sw_gain_stop_work);
-		}
-		ma->speaker_volume_unlocked = unlock;
-		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
-			       &ma->speaker_lock_kctl->id);
-	}
-}
-
-/*
- * The volume lock's part of a system sleep (see macaudio_pm_notify()), after
- * pm_quiesced has been set or cleared.
- *
- * Volume writes hold the controls for writing: none can land between
- * keeping the volumes and clipping them. Control writes take
- * volume_lock_mutex inside it as well.
- */
-static void macaudio_vlimit_pm(struct macaudio_snd_data *ma, bool quiesce)
-{
-	down_read(&ma->card.snd_card->controls_rwsem);
-	mutex_lock(&ma->volume_lock_mutex);
-	/*
-	 * The lease ends here, so after the resume the volumes stay locked until
-	 * the daemon's next ping. Its clock (CLOCK_MONOTONIC) stops across s2idle:
-	 * a lease left running would unlock them at resume and expire before the
-	 * thawed daemon pings, which reports a lost lock and restarts it cold.
-	 */
-	if (quiesce) {
-		cancel_delayed_work(&ma->lock_timeout_work);
-		ma->speaker_lock_remain = 0;
-		macaudio_pm_volumes_save(ma);
-	}
-	macaudio_vlimit_update(ma);
-	mutex_unlock(&ma->volume_lock_mutex);
-	up_read(&ma->card.snd_card->controls_rwsem);
-}
-
-static void macaudio_vlimit_enable_timeout(struct macaudio_snd_data *ma)
-{
-	mutex_lock(&ma->volume_lock_mutex);
-
-	if (ma->speaker_lock_timeout_enabled) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return;
-	}
-
-	if (ma->speaker_lock_remain > 0) {
-		ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-		schedule_delayed_work(&ma->lock_timeout_work, usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
-		dev_dbg(ma->card.dev, "Enabling volume limit timeout: %ld us left\n",
-			(long)ktime_to_us(ma->speaker_lock_remain));
-	}
-
-	macaudio_vlimit_update(ma);
-
-	ma->speaker_lock_timeout_enabled = true;
-	mutex_unlock(&ma->volume_lock_mutex);
-}
-
-static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
-{
-	ktime_t now;
-
-	mutex_lock(&ma->volume_lock_mutex);
-
-	if (!ma->speaker_lock_timeout_enabled) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return;
-	}
-
-	now = ktime_get();
-
-	cancel_delayed_work(&ma->lock_timeout_work);
-
-	if (ktime_after(now, ma->speaker_lock_timeout))
-		ma->speaker_lock_remain = 0;
-	else if (ma->speaker_lock_remain > 0)
-		ma->speaker_lock_remain = ktime_sub(ma->speaker_lock_timeout, now);
-
-	dev_dbg(ma->card.dev, "Disabling volume limit timeout: %ld us left\n",
-		(long)ktime_to_us(ma->speaker_lock_remain));
-
-	macaudio_vlimit_update(ma);
-
-	ma->speaker_lock_timeout_enabled = false;
-
-	mutex_unlock(&ma->volume_lock_mutex);
-}
-
-static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
-{
-        struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
-						    struct macaudio_snd_data, lock_timeout_work);
-	ktime_t now, left;
-
-	mutex_lock(&ma->volume_lock_mutex);
-
-	/*
-	 * A ping or a disabled timeout can have cancelled this work after it
-	 * had already started running; neither must expire the lease.
-	 */
-	if (!ma->speaker_lock_timeout_enabled || !ma->speaker_lock_owner ||
-	    ma->speaker_lock_remain <= 0)
-		goto out;
-
-	/* A ping renewed the lease while this work was already running */
-	now = ktime_get();
-	if (ktime_before(now, ma->speaker_lock_timeout)) {
-		left = ktime_sub(ma->speaker_lock_timeout, now);
-		schedule_delayed_work(&ma->lock_timeout_work,
-				      usecs_to_jiffies(ktime_to_us(left)));
-		goto out;
-	}
-
-	ma->speaker_lock_remain = 0;
-	macaudio_vlimit_update(ma);
-
-out:
-	mutex_unlock(&ma->volume_lock_mutex);
-}
-
-static void macaudio_vlimit_update_work(struct work_struct *wrk)
-{
-        struct macaudio_snd_data *ma = container_of(wrk,
-						    struct macaudio_snd_data, lock_update_work);
-
-	/* An unlock here sets the kept volumes again: no volume write may race it */
-	down_read(&ma->card.snd_card->controls_rwsem);
-	if (ma->bes_active)
-		macaudio_vlimit_enable_timeout(ma);
-	else
-		macaudio_vlimit_disable_timeout(ma);
-	up_read(&ma->card.snd_card->controls_rwsem);
 }
 
 static bool macaudio_sw_gain_pcm(struct snd_pcm_substream *substream)
@@ -1614,10 +1274,10 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 			dev_warn(ma->card.dev,
 				 "speaker floor for system sleep waited %lld ms for the protection lock\n",
 				 waited);
+		/* Under the volume lock the speakers are at its ceiling already */
 		if (macaudio_spk_leased(ma))
 			macaudio_spk_floor(ma, "system sleep");
 		mutex_unlock(&ma->spk_mutex);
-		macaudio_vlimit_pm(ma, true);
 		return NOTIFY_OK;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
@@ -1627,7 +1287,6 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 		if (ma->spk_owner)
 			ma->spk_lapsed = true;
 		mutex_unlock(&ma->spk_mutex);
-		macaudio_vlimit_pm(ma, false);
 		return NOTIFY_OK;
 	default:
 		return NOTIFY_DONE;
@@ -1637,20 +1296,19 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 /*
  * The "Speaker Protection Interface" switch.
  *
- * At every card bind "Speaker Volume Unlock" is in charge, exactly as on a
- * kernel without the lease. A CAP_SYS_ADMIN write of "Speaker Protection"
- * hands the speakers to the lease, through the floor of both: the volume
- * lock's ceiling first, then no speaker start, the running streams stopped,
- * the lease's safe level, the amps' own gains fixed at their limit, and only
- * then the ceiling lifted, with every volume still at the safe level. A
- * write of "Speaker Volume Unlock", or SPEAKER_LEASE_UNOWNED_MS without an
- * owner of "Speaker Protection", hands them back through the lease's floor:
- * the volumes stay at the safe level under the lock's ceiling, and go up
- * only once a daemon holds the lock and pings it, as after a cold bind. Its
- * first ping after the switch fails with -ETIMEDOUT: the lock was lost.
+ * At every card bind "Speaker Volume Unlock" is in charge: the speaker
+ * volumes at its ceiling, the safe level, which nothing lifts. A
+ * CAP_SYS_ADMIN write of "Speaker Protection" hands the speakers to the
+ * lease, the only owner that can lift them: no speaker start, the running
+ * streams stopped, the lease's safe level, the amps' own gains fixed at
+ * their limit, and only then the ceiling lifted, with every volume still at
+ * the safe level. A write of "Speaker Volume Unlock", or
+ * SPEAKER_LEASE_UNOWNED_MS without an owner of "Speaker Protection", hands
+ * them back through the lease's floor: the volumes stay at the safe level
+ * under the lock's ceiling until the lease is the interface again.
  *
- * While leased the lock's ping fails with -EBUSY, and the speaker volumes
- * and amp gains are the driver's: userspace writes fail with -EPERM.
+ * While leased the speaker volumes and amp gains are the driver's:
+ * userspace writes fail with -EPERM.
  *
  * The switch is state for the boot, not a mixer setting: INACTIVE keeps
  * alsactl off it. Whatever makes it persist (the protection engine's
@@ -1756,17 +1414,11 @@ static int macaudio_spk_enter_lease(struct macaudio_snd_data *ma)
 	if (READ_ONCE(ma->spk_floor_failed) || READ_ONCE(ma->speaker_lock_failed))
 		return -EIO;
 
-	/* The volume lock's ceiling first: whatever a daemon had unlocked goes down */
+	/*
+	 * The volume lock's ceiling holds: it is never lifted outside the
+	 * lease. No speaker start from here on: nothing is granted yet.
+	 */
 	mutex_lock(&ma->volume_lock_mutex);
-	cancel_delayed_work(&ma->lock_timeout_work);
-	ma->speaker_lock_remain = 0;
-	macaudio_pm_volumes_drop(ma);
-	macaudio_vlimit_update(ma);
-	if (READ_ONCE(ma->speaker_lock_failed)) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return -EIO;
-	}
-	/* No speaker start from here on: nothing is granted yet */
 	WRITE_ONCE(ma->spk_iface, MACAUDIO_SPK_IFACE_LEASE);
 	mutex_unlock(&ma->volume_lock_mutex);
 
@@ -1827,16 +1479,9 @@ static void macaudio_spk_leave_lease(struct macaudio_snd_data *ma, const char *w
 	}
 
 	mutex_lock(&ma->volume_lock_mutex);
-	/* The lock's ceiling over the safe level; it lifts on a fresh ping only */
+	/* The lock's ceiling over the safe level, for good: nothing lifts it */
 	if (!ma->spk_dead)
 		macaudio_vlimit_unlock(ma, false);
-	ma->speaker_volume_unlocked = false;
-	cancel_delayed_work(&ma->lock_timeout_work);
-	ma->speaker_lock_remain = 0;
-	ma->speaker_lock_timeout = 0;
-	macaudio_pm_volumes_drop(ma);
-	/* A daemon still holding the lock learns that it lost it */
-	ma->speaker_volume_was_locked = true;
 	if (READ_ONCE(ma->spk_floor_failed) && !READ_ONCE(ma->speaker_lock_failed)) {
 		WRITE_ONCE(ma->speaker_lock_failed, true);
 		schedule_work(&ma->lock_fail_work);
@@ -1847,7 +1492,6 @@ static void macaudio_spk_leave_lease(struct macaudio_snd_data *ma, const char *w
 		schedule_work(&ma->sw_gain_stop_work);
 	}
 	WRITE_ONCE(ma->spk_iface, MACAUDIO_SPK_IFACE_UNLOCK);
-	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
 
 	dev_info(ma->card.dev, "Speaker protection interface: Speaker Volume Unlock (%s)\n", why);
@@ -2199,8 +1843,8 @@ static void macaudio_protect_sense(struct snd_soc_card *card)
 }
 
 /*
- * Speaker volumes and amp gains: the volume lock's daemon sets them under
- * "Speaker Volume Unlock"; while leased they are the driver's alone.
+ * Speaker volumes and amp gains: writable under "Speaker Volume Unlock",
+ * below its ceiling; while leased they are the driver's alone.
  */
 static int macaudio_spk_owned_write_check(struct snd_kcontrol *kctl,
 					  struct snd_ctl_file *file)
@@ -3188,20 +2832,14 @@ static int macaudio_be_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (macaudio_spk_leased(ma) && !macaudio_spk_admitted(ma))
 			return macaudio_spk_refuse(ma);
-		ma->bes_active |= BIT(rtd->dai_link->id);
-		break;
+		return 0;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_STOP:
-		ma->bes_active &= ~BIT(rtd->dai_link->id);
-		break;
+		return 0;
 	default:
 		return -EINVAL;
 	}
-
-	/* The volume lock's lease runs only while the speakers play */
-	schedule_work(&ma->lock_update_work);
-	return 0;
 }
 
 static const struct snd_soc_ops macaudio_fe_ops = {
@@ -3604,15 +3242,6 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	kthread_cancel_work_sync(&ma->spk_expire_work);
 	kthread_cancel_work_sync(&ma->spk_stop_work);
 	cancel_delayed_work_sync(&ma->spk_unowned_work);
-	/*
-	 * No back-end can trigger any more, but a lock update it queued takes
-	 * the card's controls_rwsem: finish it while the snd_card still exists.
-	 */
-	cancel_work_sync(&ma->lock_update_work);
-	cancel_delayed_work_sync(&ma->lock_timeout_work);
-	mutex_lock(&ma->volume_lock_mutex);
-	macaudio_pm_volumes_drop(ma);
-	mutex_unlock(&ma->volume_lock_mutex);
 	return 0;
 }
 
@@ -3862,6 +3491,19 @@ static int macaudio_slk_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_
 	return 0;
 }
 
+/*
+ * The daemons that used to lift the speaker volumes from this control
+ * (speakersafetyd, speakerguardd 0.1) lock it and ping it: both are
+ * refused, so that such a daemon fails at once instead of believing it
+ * guards speakers it cannot reach. Only the "Speaker Protection" lease
+ * lifts them.
+ */
+static void macaudio_slk_refused(struct macaudio_snd_data *ma)
+{
+	dev_info_once(ma->card.dev,
+		      "Speaker Volume Unlock refused: only the Speaker Protection lease lifts the speakers\n");
+}
+
 static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *uvalue)
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
@@ -3869,10 +3511,9 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	long val = uvalue->value.integer.value[0];
 
 	/*
-	 * Reads return the lock state (0 or 1), so a saved mixer state holds
-	 * one of those. Writing it back changes nothing: only the lock owner's
-	 * magic value renews the lease. Accept it as a no-op so that restoring
-	 * a saved state before the daemon has taken the lock is not an error.
+	 * Reads return 0, and a saved mixer state may hold 0 or 1. Writing it
+	 * back changes nothing: accept it as a no-op so that restoring a saved
+	 * state is not an error.
 	 */
 	if (val == 0 || val == 1)
 		return 0;
@@ -3880,105 +3521,23 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	if (val != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
 
-	mutex_lock(&ma->volume_lock_mutex);
-
-	if (!ma->speaker_lock_owner) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return -EPERM;
-	}
-
-	/* "Speaker Protection" owns the speakers: no unlock to renew */
-	if (macaudio_spk_leased(ma)) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return -EBUSY;
-	}
-
-	/* Serves as a notification that the lock was lost at some point */
-	if (ma->speaker_volume_was_locked) {
-		ma->speaker_volume_was_locked = false;
-		mutex_unlock(&ma->volume_lock_mutex);
-		return -ETIMEDOUT;
-	}
-
-	/* Between suspend-prepare and the freeze: the lease starts again after the resume */
-	if (ma->pm_quiesced) {
-		mutex_unlock(&ma->volume_lock_mutex);
-		return 0;
-	}
-
-	cancel_delayed_work(&ma->lock_timeout_work);
-
-	ma->speaker_lock_remain = ms_to_ktime(SPEAKER_LOCK_TIMEOUT);
-	ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-	macaudio_vlimit_update(ma);
-
-	if (ma->speaker_lock_timeout_enabled) {
-		dev_dbg(ma->card.dev, "Volume limit timeout ping: %ld us left\n",
-			(long)ktime_to_us(ma->speaker_lock_remain));
-		schedule_delayed_work(&ma->lock_timeout_work, usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
-	}
-
-	mutex_unlock(&ma->volume_lock_mutex);
-
-	return 0;
+	macaudio_slk_refused(ma);
+	return -EPERM;
 }
 
+/* The ceiling is never lifted from here: the volumes read as locked */
 static int macaudio_slk_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *uvalue)
 {
-	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
-
-	uvalue->value.integer.value[0] = ma->speaker_volume_unlocked ? 1 : 0;
-
+	uvalue->value.integer.value[0] = 0;
 	return 0;
 }
 
 static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file *owner)
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
-	mutex_lock(&ma->volume_lock_mutex);
-
-	/*
-	 * A lease belongs to the owner that pinged for it. Whatever the
-	 * previous owner had left must not unlock the volume for a new one
-	 * before it has pinged itself.
-	 */
-	cancel_delayed_work(&ma->lock_timeout_work);
-	ma->speaker_lock_remain = 0;
-	ma->speaker_lock_timeout = 0;
-	/* A new owner sets the volumes itself */
-	macaudio_pm_volumes_drop(ma);
-
-	ma->speaker_lock_owner = owner;
-	macaudio_vlimit_update(ma);
-
-	/*
-	 * Reset the unintended lock flag when the control is first locked.
-	 * At this point the state is locked and cannot be unlocked until
-	 * userspace writes to this control, so this cannot spuriously become
-	 * true again until that point.
-	 */
-	ma->speaker_volume_was_locked = false;
-
-	mutex_unlock(&ma->volume_lock_mutex);
-
-	return 0;
-}
-
-static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
-{
-	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
-
-	mutex_lock(&ma->volume_lock_mutex);
-	cancel_delayed_work(&ma->lock_timeout_work);
-	ma->speaker_lock_owner = NULL;
-	ma->speaker_lock_remain = 0;
-	ma->speaker_lock_timeout = 0;
-	macaudio_vlimit_update(ma);
-	mutex_unlock(&ma->volume_lock_mutex);
+	macaudio_slk_refused(snd_soc_card_get_drvdata(card));
+	return -EPERM;
 }
 
 /* The speaker controls go last: a card without speakers drops them. */
@@ -4003,7 +3562,7 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.name = "Speaker Volume Unlock",
 		.info = macaudio_slk_info,
 		.put = macaudio_slk_put, .get = macaudio_slk_get,
-		.lock = macaudio_slk_lock, .unlock = macaudio_slk_unlock,
+		.lock = macaudio_slk_lock,
 	},
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
@@ -4071,10 +3630,10 @@ struct macaudio_platform_cfg macaudio_j313_cfg = {
  * launched on the rising SCLK edge: DSP_A with an inverted bit clock. The
  * speakers are one MAX98360A per channel on the "spkr" back-end, with no
  * sense lines and no amplifier controls; the volume is the CPU DAI's
- * software gain, which the volume lock holds 20 dB down until a protection
- * daemon takes it, and the lease 20 dB down below the full scale until its
- * engine is granted. The "Speaker Sense" capture is the SpeakerTap, a
- * digital tap of the words the amplifier receives; there is no V/I sense.
+ * software gain, which the volume lock holds 20 dB down, and the lease
+ * 20 dB down below the full scale until its engine is granted. The
+ * "Speaker Sense" capture is the SpeakerTap, a digital tap of the words the
+ * amplifier receives; there is no V/I sense.
  */
 struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.enable_speakers = true,
@@ -4150,9 +3709,8 @@ struct macaudio_platform_cfg macaudio_j775_cfg = {
  * woofer and one tweeter per side) on "spkr", whose voltage and current
  * sense return on the same stream. As on the other SN012776 laptops, the
  * speakers are behind the speaker protection interfaces from the bind: the
- * volumes stay at the lock's ceiling until a protection daemon
- * (speakersafetyd) holds them, or under "Speaker Protection" at the floor
- * until an owner is granted. Each amp's level is its apple,speaker-config
+ * volumes stay at the lock's ceiling, or under "Speaker Protection" at the
+ * floor until an owner is granted. Each amp's level is its apple,speaker-config
  * from the boot loader.
  */
 struct macaudio_platform_cfg macaudio_j813_cfg = {
@@ -4238,8 +3796,8 @@ struct macaudio_platform_cfg macaudio_k114_cfg = {
  * two woofers and a tweeter per side, in ADT speaker-config order (left
  * woofer 1, right woofer 1, left tweeter, right tweeter, left woofer 2,
  * right woofer 2: left in even slots, right in odd), and twelve V/I sense
- * words on the same stream. Locked to the safe level until speakersafetyd
- * holds the volume, as on J813. Each amp's level is its apple,speaker-config
+ * words on the same stream. Locked to the safe level until a "Speaker
+ * Protection" owner is granted, as on J813. Each amp's level is its apple,speaker-config
  * from the boot loader (15 on all six in the J815 ADT).
  */
 struct macaudio_platform_cfg macaudio_j815_cfg = {
@@ -4340,8 +3898,8 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 /*
  * J604 (T8132, MacBook Pro 14" M4): the J614s's six amps, two woofers and a
  * tweeter per side, on all six playback and twelve sense slots of the same
- * frame. The speakers stay at their safe level until speakersafetyd takes
- * them with the J604 profile.
+ * frame. The speakers stay at their safe level until a "Speaker Protection"
+ * owner is granted.
  */
 struct macaudio_platform_cfg macaudio_j604_cfg = {
 	.enable_speakers = true,
@@ -4661,8 +4219,6 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		}
 	}
 
-	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
-	INIT_DELAYED_WORK(&data->lock_timeout_work, macaudio_vlimit_timeout_work);
 	INIT_WORK(&data->sw_gain_stop_work, macaudio_sw_gain_stop_work);
 	INIT_WORK(&data->lock_fail_work, macaudio_lock_fail_work);
 	atomic_set(&data->sw_gain_lock_epoch, 0);
@@ -4686,8 +4242,6 @@ static void macaudio_snd_platform_remove(struct platform_device *pdev)
 
 	/* The card's removal stops the lease timer and its works; devm frees them */
 	snd_soc_unregister_card(&ma->card);
-	cancel_work_sync(&ma->lock_update_work);
-	cancel_delayed_work_sync(&ma->lock_timeout_work);
 	cancel_work_sync(&ma->sw_gain_stop_work);
 	cancel_work_sync(&ma->lock_fail_work);
 	cancel_delayed_work_sync(&ma->spk_unowned_work);
