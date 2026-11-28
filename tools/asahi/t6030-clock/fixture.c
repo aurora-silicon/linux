@@ -86,7 +86,7 @@ struct apple_dcp {
 	u64 tb_generation;
 	struct apple_dcp_typec_route *active_typec_route;
 	struct {
-		bool active, xbar_up, clock_ok;
+		bool active, xbar_up, clock_ok, clock_held;
 		u64 generation;
 		void *xbar;
 	} split;

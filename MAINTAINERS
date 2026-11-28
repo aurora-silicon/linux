@@ -2061,6 +2061,8 @@ F:	Documentation/devicetree/bindings/display/apple,dcp-typec-routes.yaml
 F:	Documentation/gpu/apple-dcp-*.rst
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
+F:	tools/asahi/afk-compact-start-tests.py
+F:	tools/asahi/dcp-tunnel-prepare-tests.py
 F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 

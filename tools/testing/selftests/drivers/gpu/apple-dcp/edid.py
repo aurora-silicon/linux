@@ -89,7 +89,7 @@ struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later,
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
-    bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;
+    bool lock,enabled,torndown,defer_start,started;unsigned int users;u32 channel;u8 cmd_tag;
     unsigned long cmd_map[1];struct epic_cmd_info cmds[MAX_PENDING_CMDS];
     struct { u64 generation,epoch; } admission;void *cookie;
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;

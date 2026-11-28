@@ -571,6 +571,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar);
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dpxbar_preselect(struct mux_control *mux, int state);
+static int dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
+			      struct mux_control *xbar);
 static bool dcp_xbar_t8142(struct mux_control *mux);
 static bool dcp_xbar_t6041(struct mux_control *mux);
 
@@ -669,6 +671,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	struct apple_dcp *dcp = route->dcp;
 	struct apple_connector *connector =
 		dcp_typec_route_connector(route, xbar != route->xbar);
+	bool fixed_deselected = false;
 	int ret;
 
 	dcp_tb_events_retire(dcp);
@@ -693,6 +696,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		dcp->fixed_route_selected = false;
 		if (ret)
 			return ret;
+		fixed_deselected = true;
 	}
 
 	/*
@@ -712,18 +716,31 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	/*
 	 * Thunderbolt DP IN: the crossbar connection may only be brought up
 	 * once DCP has configured the link and the tunnel pixel clock runs,
-	 * see dcp_tunnel_crossbar_up(). Just remember the output here.
+	 * see dcp_tunnel_crossbar_up(). Preselect the output and wake the
+	 * PHY's tunnel path here so a failure still rolls back the attach.
 	 */
-	if (xbar != route->xbar && route->mux_index) {
-		/*
-		 * The T602X crossbar must point a DP IN at its pipeline before
-		 * DCP probes AUX; other crossbars select it at link-up and
-		 * report -EOPNOTSUPP here.
-		 */
-		ret = dcp_dpxbar_tunnel_select_source(xbar, route->mux_index);
-		if (ret == -EOPNOTSUPP)
-			ret = 0;
-	} else if (xbar == route->xbar) {
+	if (xbar != route->xbar) {
+		bool source_selected = false;
+
+		if (route->mux_index) {
+			/*
+			 * The T602X crossbar must point a DP IN at its pipeline
+			 * before DCP probes AUX; other crossbars select it at
+			 * link-up and report -EOPNOTSUPP here.
+			 */
+			ret = dcp_dpxbar_tunnel_select_source(xbar,
+							      route->mux_index);
+			if (!ret)
+				source_selected = true;
+			else if (ret == -EOPNOTSUPP)
+				ret = 0;
+		}
+		if (!ret) {
+			ret = dcp_tunnel_prepare(route, xbar);
+			if (ret && source_selected)
+				dcp_dpxbar_tunnel_select_source(xbar, -1);
+		}
+	} else {
 		/*
 		 * The control is only ever held by a route of this port, which
 		 * lets it go under the fabric lock held here: waiting for it
@@ -735,7 +752,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 			dev_err(dcp->dev, "Type-C crossbar control still held, route not taken\n");
 	}
 	if (ret) {
-		if (dcp->fixed_xbar) {
+		if (fixed_deselected && dcp->fixed_xbar) {
 			int restore_ret;
 
 			restore_ret = mux_control_select(dcp->fixed_xbar,
@@ -2377,27 +2394,37 @@ static int dcp_dpxbar_preselect(struct mux_control *mux, int state)
  * dispext0: any other one activates the link, gets no answer from the sink
  * and gives up with DEVICE_NOT_RESPONDING before it ever sets a link rate.
  */
-static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
-			       struct mux_control *xbar)
+static int dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
+			      struct mux_control *xbar)
 {
 	typeof(&apple_atc_dp_tunnel_open) open;
 	struct apple_dcp *dcp = route->dcp;
+	bool preselected = false;
 	int ret;
 
 	ret = dcp_dpxbar_preselect(xbar, route->mux_index);
-	if (ret && ret != -EOPNOTSUPP)
+	if (!ret) {
+		preselected = true;
+	} else if (ret != -EOPNOTSUPP && ret != -ENOENT) {
 		dev_warn(dcp->dev, "DP tunnel crossbar preselect failed: %d\n", ret);
+		return ret;
+	}
 
 	/* The clock call starts everything on a PHY that clocks the tunnel. */
-	if (dcp_phy_clocks_tunnel(dcp->phy))
-		return;
+	if (dcp_phy_clocks_tunnel(route->phy))
+		return 0;
 	open = symbol_get(apple_atc_dp_tunnel_open);
 	if (!open)
-		return;
-	ret = open(dcp->phy);
+		return 0;
+	ret = open(route->phy);
 	symbol_put(apple_atc_dp_tunnel_open);
-	if (ret && ret != -EOPNOTSUPP)
+	if (ret && ret != -EOPNOTSUPP) {
 		dev_warn(dcp->dev, "DP tunnel PHY open failed: %d\n", ret);
+		if (preselected)
+			dcp_dpxbar_preselect(xbar, MUX_IDLE_DISCONNECT);
+		return ret;
+	}
+	return 0;
 }
 
 /* DP IN adapter handshake through the thunderbolt glue; tb_lock held */
@@ -2819,6 +2846,8 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			if (!link_rate && dcp->split.xbar_up)
 				dcp_dpxbar_link(dcp->split.xbar, false);
 			ret = dcp_route_clock_rate(route, phy, 1, link_rate);
+			if (!ret)
+				dcp->split.clock_held = !!link_rate;
 		}
 		dcp->split.clock_ok = !ret && link_rate;
 		if (ret)
@@ -3116,7 +3145,6 @@ static void dcp_tb_claim(void *data)
 		port->tile_hint_deadline = jiffies + msecs_to_jiffies(2000);
 	/* the port is in USB4 mode, not DP-alt */
 	port->dp_wanted = false;
-	dcp_tunnel_prepare(best, ctx->ctl);
 
 	dev_info(dcp->dev, "display routed to Thunderbolt DP tunnel dpin%u\n", dpin);
 
@@ -3232,15 +3260,17 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 	scoped_guard(mutex, &dcp->tb_lock) {
 		/* Retire the callback before dropping its clock reference. */
 		dcp->split.active = false;
-		if (dcp->phy) {
-			if (dcp_phy_clocks_tunnel(dcp->phy)) {
-				dcp_phy_tunnel_rate(dcp->phy, 1, 0);
+		if (dcp->split.phy &&
+		    (dcp->split.ready || dcp->split.clock_held ||
+		     dcp->split.clock_ok)) {
+			if (dcp_phy_clocks_tunnel(dcp->split.phy)) {
+				dcp_phy_tunnel_rate(dcp->split.phy, 1, 0);
 			} else {
 				typeof(apple_atc_dp_tunnel_rate) *stop =
 					symbol_get(apple_atc_dp_tunnel_rate);
 
 				if (stop) {
-					stop(dcp->phy, 1, 0);
+					stop(dcp->split.phy, 1, 0);
 					symbol_put(apple_atc_dp_tunnel_rate);
 				}
 			}
@@ -3254,8 +3284,10 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 			dcp_dpxbar_tunnel_select_source(dcp->split.xbar, -1);
 		}
 		dcp->split.xbar = NULL;
+		dcp->split.phy = NULL;
 		dcp->split.xbar_up = false;
 		dcp->split.clock_ok = false;
+		dcp->split.clock_held = false;
 		dcp->split.ready = false;
 		dcp->split.generation = 0;
 		dcp->split.set_active = NULL;
@@ -3298,9 +3330,11 @@ static int dcp_tb_split_join_locked(struct apple_dcp_typec_port *port,
 
 	scoped_guard(mutex, &dcp->tb_lock) {
 		dcp->split.xbar = xbar;
+		dcp->split.phy = route->phy;
 		dcp->split.mux_state = state;
 		dcp->split.xbar_up = false;
 		dcp->split.clock_ok = false;
+		dcp->split.clock_held = false;
 		dcp->split.generation = generation;
 		dcp->split.set_active = set_active;
 		dcp->split.binding = binding;
@@ -4164,8 +4198,6 @@ static int dcp_follow_activate(struct apple_dcp_typec_route *route,
 		}
 		return ret;
 	}
-	if (slot->tunnel)
-		dcp_tunnel_prepare(route, ctl);
 	if (slot->split) {
 		scoped_guard(mutex, &dcp->tb_lock)
 			dcp->split.ready = true;

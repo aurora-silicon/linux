@@ -255,14 +255,6 @@ static int dcpdpserv_prepare(struct apple_epic_service *service, const char *nam
 	return service->ep->wire_v2 ? -EOPNOTSUPP : 0;
 }
 
-static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
-			  const char *class, s64 unit)
-{
-	/* Compact EPIC (desktop 26.x): the firmware's own client never opens it. */
-	if (READ_ONCE(service->ep->compact))
-		service->defer_start = true;
-}
-
 static void dcpdpserv_teardown(struct apple_epic_service *service)
 {
 	afk_service_disable(service);
@@ -799,8 +791,9 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 		.name = "dcpdp-service-epic",
 		.reusable = true,
 		.optional = true,
+		/* Compact EPIC (desktop 26.x): the firmware's own client never opens it. */
+		.defer_start = true,
 		.prepare = dcpdpserv_prepare,
-		.init = dcpdpserv_init,
 		.teardown = dcpdpserv_teardown,
 		.report = dcpdpserv_report,
 	},

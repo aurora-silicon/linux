@@ -1195,9 +1195,11 @@ struct apple_dcp {
 		bool active;
 		bool ready; /* admitted second-stream setup */
 		struct mux_control *xbar;	/* the port's dpin1 crossbar control */
+		struct phy *phy;		/* the split route's PHY */
 		int mux_state;			/* dispextN, DPTX port 1 */
 		bool xbar_up;
 		bool clock_ok;
+		bool clock_held;		/* dpin1 pixel clock started */
 		u64 generation;			/* the Thunderbolt binding's */
 		int (*set_active)(void *binding, bool active);
 		void *binding;

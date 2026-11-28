@@ -4680,6 +4680,16 @@ static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
 	{},
 };
 
+static int dcp_dpavctrl_service_prepare(struct apple_epic_service *service,
+					const char *name, const char *class,
+					s64 unit)
+{
+	/* Interface 7 is opened only once the AV controllers are. */
+	if ((service->channel & 7) == 7)
+		service->defer_start = true;
+	return 0;
+}
+
 static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 				      const char *name, const char *class,
 				      s64 unit)
@@ -4691,11 +4701,8 @@ static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 	if (service_class && strstr(service_class, "dcpav-controller-epic"))
 		d->dpavctrl_av_controller[!!(service->channel & BIT(2))] = service;
 
-	/* Interface 7 is opened only once the AV controllers are. */
-	if ((service->channel & 7) == 7) {
-		service->defer_start = true;
+	if ((service->channel & 7) == 7)
 		d->dpavctrl_late_service = service;
-	}
 
 	/*
 	 * The internal panel announces only the AV controller on interface 5
@@ -4712,14 +4719,17 @@ static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 static const struct apple_epic_service_ops dcp_dpavctrl_ops[] = {
 	{
 		.name = "AppleDCPDPTXController",
+		.prepare = dcp_dpavctrl_service_prepare,
 		.init = dcp_dpavctrl_service_init,
 	},
 	{
 		.name = "dcpav-controller-epic",
+		.prepare = dcp_dpavctrl_service_prepare,
 		.init = dcp_dpavctrl_service_init,
 	},
 	{
 		.name = "dcpdp-controller-epic",
+		.prepare = dcp_dpavctrl_service_prepare,
 		.init = dcp_dpavctrl_service_init,
 	},
 	{},
