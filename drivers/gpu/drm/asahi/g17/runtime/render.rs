@@ -1681,7 +1681,7 @@ impl Registry {
             .iter()
             .flatten()
             .filter_map(|entry| entry.pair.as_ref())
-            .find(|pair| pair.contains_packet(packet))
+            .find(|pair| pair.contains_packet(packet) && !pair.retired_held(packet))
             .and_then(|pair| pair.timeout_head());
         let computes = self
             .compute

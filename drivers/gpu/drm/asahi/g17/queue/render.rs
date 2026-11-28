@@ -176,7 +176,8 @@ struct Active {
     stamp_wait_since: Option<u64>,
     /// The group retired on its pass record without completion stamps and its client has its
     /// result, but the firmware may still store the stamps through its descriptor: the
-    /// descriptor slot stays held until stamps cover the group.
+    /// descriptor slot stays held until stamps cover the group. Also set for a group that
+    /// retired behind such groups: it leaves the pair after them.
     stamps_owed: bool,
 }
 
@@ -1659,8 +1660,8 @@ impl Pair {
         }
     }
 
-    /// Latches when the front group executed and the firmware consumed its ring entries while
-    /// `stamps` still lag it, and reports whether that has held for
+    /// Latches when the oldest unretired group executed and the firmware consumed its ring entries
+    /// while `stamps` still lag it, and reports whether that has held for
     /// [`retirement::STAMP_FALLBACK_NS`] (`now`, host ns). The observation scan then retires it
     /// on its pass record instead of waiting for stamps no later event will move. Not on M5,
     /// whose pass record can precede the group's writes: as for M5 compute, only the stamps
@@ -1674,7 +1675,7 @@ impl Pair {
         if self.quarantined || self.prepared.is_some() || state != 0 || self.memory.graph.is_m5() {
             return Ok(false);
         }
-        let Some(front) = self.active.front_mut() else {
+        let Some(front) = self.active.iter_mut().find(|active| !active.stamps_owed) else {
             return Ok(false);
         };
         if !front.outer_published {
@@ -1720,17 +1721,19 @@ impl Pair {
         }
     }
 
-    /// Whether the front group's stamp wait is latched: the observation scan rechecks the pair
-    /// without a completion notification, which may never come for such a group.
+    /// Whether the oldest unretired group's stamp wait is latched: the observation scan rechecks
+    /// the pair without a completion notification, which may never come for such a group.
     pub(crate) fn stamp_waiting(&self) -> bool {
         self.active
-            .front()
+            .iter()
+            .find(|active| !active.stamps_owed)
             .is_some_and(|front| front.stamp_wait_since.is_some())
     }
 
-    /// The watchdog of `packet` expired while it is this pair's front: if the firmware executed
-    /// it and consumed its ring entries while the stamps lag, it retires on its pass record now
-    /// instead of failing. Failing would give up on the stamps as well.
+    /// The watchdog of `packet` expired while it is this pair's oldest group still to retire:
+    /// if the firmware executed it and consumed its ring entries while the stamps lag, it
+    /// retires on its pass record now instead of failing. Failing would give up on the stamps
+    /// as well.
     pub(crate) fn expire_stamp_wait(
         &mut self,
         packet: &Arc<Packet>,
@@ -1739,7 +1742,8 @@ impl Pair {
     ) -> Result<bool> {
         if !self
             .active
-            .front()
+            .iter()
+            .find(|active| !active.stamps_owed)
             .is_some_and(|front| Arc::ptr_eq(&front.packet, packet))
         {
             return Ok(false);
@@ -1747,7 +1751,7 @@ impl Pair {
         if !self.note_stamp_wait(stamps, state, crate::g17::now_ns())? && !self.stamp_waiting() {
             return Ok(false);
         }
-        if let Some(front) = self.active.front_mut() {
+        if let Some(front) = self.active.iter_mut().find(|active| !active.stamps_owed) {
             front.stamp_wait_since = Some(0);
         }
         Ok(true)
@@ -1765,7 +1769,12 @@ impl Pair {
         if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= REPORTS {
             return;
         }
-        let Some(front) = self.active.front() else {
+        let Some(front) = self
+            .active
+            .iter()
+            .find(|active| !active.stamps_owed)
+            .or_else(|| self.active.front())
+        else {
             return;
         };
         let ordinal = front.ticket.ordinal;
@@ -1806,11 +1815,19 @@ impl Pair {
     /// The oldest published group still running, for cross-VM timeout attribution
     /// (crate::g17::timeout). A quarantined pair's work holds the GPU until the firmware drains
     /// it, so it stays visible to other VMs' watchdogs, as compute does, marked as failed.
+    /// Quarantined pairs whose groups all executed unstamped (`Self::executed_unstamped`) or
+    /// that were parked out of service (`DRAIN_RETRY_LIMIT`) no longer hold the GPU, and groups
+    /// that already retired (`Active::stamps_owed`) or were accounted drained are not the head.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
+        if self.quarantined
+            && (self.drain_failures >= DRAIN_RETRY_LIMIT || self.executed_unstamped())
+        {
+            return None;
+        }
         self.active
             .iter()
             .filter(|active| active.outer_published)
-            .find(|active| active.drained_result.is_none())
+            .find(|active| !active.stamps_owed && active.drained_result.is_none())
             .map(|active| crate::g17::timeout::Head {
                 vm: active.packet.context.vm().id(),
                 published: active.published,
@@ -1829,6 +1846,12 @@ impl Pair {
                 .as_ref()
                 .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, packet))
     }
+    /// `packet` retired and its group only holds its descriptor (`Active::stamps_owed`).
+    pub(crate) fn retired_held(&self, packet: &Arc<Packet>) -> bool {
+        self.active
+            .iter()
+            .any(|active| active.stamps_owed && Arc::ptr_eq(&active.packet, packet))
+    }
     pub(crate) fn replay_contains(&self, packet: &Arc<Packet>) -> bool {
         self.replay.iter().any(|replay| Arc::ptr_eq(replay, packet))
     }
@@ -1843,7 +1866,10 @@ impl Pair {
     }
 
     pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
-        self.active.front().map(|active| active.packet.clone())
+        self.active
+            .iter()
+            .find(|active| !active.stamps_owed)
+            .map(|active| active.packet.clone())
     }
     /// Sample PM feedback only after this pair's exact retirement. A busy pair
     /// grows ahead of the render only by appending blocks to its inventory, as a
@@ -2006,12 +2032,13 @@ impl Pair {
     }
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
         self.active
-            .front()
+            .iter()
+            .find(|active| !active.stamps_owed)
             .map(|active| active.packet.completion.spared())
     }
     /// A recovery record names one of this pair's queues and the completion
     /// stamp of the group it interrupted, `(ordinal + 1) << 8` like the pair's
-    /// stamps. Without a stamp match the oldest published group is marked.
+    /// stamps. Without a stamp match the oldest published unretired group is marked.
     pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
         let sequence = stamp >> 8;
         if let Some(active) = self
@@ -2020,10 +2047,17 @@ impl Pair {
             .filter(|active| active.outer_published)
             .find(|active| (active.ticket.ordinal.wrapping_add(1) as u32) & 0xff_ffff == sequence)
         {
+            if active.stamps_owed {
+                return recovery::Interrupted::None;
+            }
             active.packet.completion.note_interrupted();
             return recovery::Interrupted::Exact;
         }
-        match self.active.iter().find(|active| active.outer_published) {
+        match self
+            .active
+            .iter()
+            .find(|active| active.outer_published && !active.stamps_owed)
+        {
             Some(active) => {
                 active.packet.completion.note_interrupted();
                 recovery::Interrupted::Oldest
@@ -2036,45 +2070,51 @@ impl Pair {
             visit(active.packet.completion.status());
         }
     }
-    /// The context ID (UAT slot) of every in-flight packet.
+    /// The context ID (UAT slot) of every unretired in-flight packet.
     pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
-        for active in self.active.iter() {
+        for active in self.active.iter().filter(|active| !active.stamps_owed) {
             visit(active.packet.context.id());
         }
     }
     pub(crate) fn classify(&self, classify: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
-        for active in self.active.iter() {
+        for active in self.active.iter().filter(|active| !active.stamps_owed) {
             active
                 .packet
                 .completion
                 .classify(classify(active.packet.completion.status()));
         }
     }
-    /// A slot stamp must name retained work before its execution markers are meaningful.
+    /// A slot stamp must name unretired retained work before its execution markers are meaningful.
     pub(crate) fn pass_started(&self, stamp: u64) -> Option<bool> {
         const MASK: u64 = (1 << 40) - 1;
         let ordinal = self
             .active
             .iter()
+            .filter(|active| !active.stamps_owed)
             .map(|active| active.ticket.ordinal)
             .find(|ordinal| ordinal.wrapping_add(1) & MASK == stamp & MASK)?;
         Some(observation::snapshot(&self.memory, ordinal).ok()?.pass[0] != 0)
     }
 
-    /// The oldest published group has neither its tiler start nor its fragment end written.
+    /// The oldest published unretired group has neither its tiler start nor its fragment end
+    /// written.
     pub(crate) fn front_untouched(&self) -> Option<bool> {
-        let front = self.active.iter().find(|active| active.outer_published)?;
+        let front = self
+            .active
+            .iter()
+            .find(|active| active.outer_published && !active.stamps_owed)?;
         Some(observation::snapshot(&self.memory, front.ticket.ordinal).ok()?.untouched())
     }
 
-    /// A published group whose tiler started and whose fragment end is unwritten, with its pass
-    /// record. Groups an earlier recovery listed or blamed are skipped: a restart drops started
-    /// groups, so their records stay half-written without anything running.
+    /// A published unretired group whose tiler started and whose fragment end is unwritten, with
+    /// its pass record. Groups an earlier recovery listed or blamed are skipped: a restart drops
+    /// started groups, so their records stay half-written without anything running.
     fn running(&self) -> Option<(&Active, [u64; 2])> {
         self.active
             .iter()
             .filter(|active| {
                 active.outer_published
+                    && !active.stamps_owed
                     && !active.packet.completion.interrupted()
                     && !active.packet.completion.blamed()
             })
@@ -2134,9 +2174,9 @@ impl Pair {
         if self
             .active
             .iter()
-            .any(|active| active.packet.completion.spared())
+            .any(|active| !active.stamps_owed && active.packet.completion.spared())
         {
-            for active in self.active.iter() {
+            for active in self.active.iter().filter(|active| !active.stamps_owed) {
                 active.packet.completion.classify(recovery::Class::Spared);
             }
         }
@@ -2211,7 +2251,7 @@ impl Pair {
         &mut self,
         masks: Option<[u64; 2]>,
         state: u32,
-        observed: Option<Observed>,
+        mut observed: Option<Observed>,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<bool> {
@@ -2222,79 +2262,93 @@ impl Pair {
         let qos = self.qos_owners();
         let pool = self.free_list.id();
         let buffer = self.buffer_id();
-        let Some(front) = self.active.front_mut() else {
-            return Ok(false);
-        };
-        if !front.outer_published {
-            return Ok(false);
-        }
-        if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
-            || !self.memory.owns(front.ticket.ordinal)
-        {
-            return Err(EIO);
-        }
-        if front.stamps_owed {
-            // Already reported: only the descriptor slot waits for the stamps.
+        // Groups that retired without their stamps keep their place and descriptor slots until
+        // stamps cover them; step past leading owed entries to retire the groups behind them.
+        let mut at = 0;
+        let (stampless, timestamps) = loop {
+            let Some(front) = self.active.get_mut(at) else {
+                return Ok(false);
+            };
+            if !front.outer_published {
+                return Ok(false);
+            }
+            if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
+                || !self.memory.owns(front.ticket.ordinal)
+            {
+                return Err(EIO);
+            }
+            if at == 0 && observed.as_ref().is_some_and(|observed| observed.ticket != front.ticket)
+            {
+                return Err(EIO);
+            }
+            if front.stamps_owed {
+                if at != 0 {
+                    at += 1;
+                    continue;
+                }
+                // Already reported: only the descriptor slot waits for the stamps.
+                let mut observer = Observer {
+                    memory: &self.memory,
+                    qids,
+                    host,
+                };
+                let result = retirement::poll(&mut front.ticket, &mut observer);
+                let ordinal = front.ticket.ordinal;
+                let context_update = front.context_update;
+                match result {
+                    Ok(retirement::Poll::Complete(_)) => {
+                        self.memory.retire(ordinal)?;
+                        self.active.pop().ok_or(EIO)?;
+                        self.note_retirement(ordinal, context_update);
+                        return Ok(true);
+                    }
+                    Ok(retirement::Poll::Pending) | Ok(retirement::Poll::Retry) => {
+                        at += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.quarantine(error, defer)?;
+                        return Ok(false);
+                    }
+                }
+            }
+            let stampless = front
+                .stamp_wait_since
+                .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
             let mut observer = Observer {
                 memory: &self.memory,
                 qids,
                 host,
             };
-            let result = retirement::poll(&mut front.ticket, &mut observer);
-            let ordinal = front.ticket.ordinal;
-            return match result {
-                Ok(retirement::Poll::Complete(_)) => {
-                    self.memory.retire(ordinal)?;
-                    self.active.pop().ok_or(EIO)?;
-                    Ok(true)
+            let result = if let Some(observed) = observed.take().filter(|_| at == 0) {
+                if stampless {
+                    retirement::poll_stampless(&mut front.ticket, &mut observer)
+                } else {
+                    retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
                 }
-                Ok(_) => Ok(false),
-                Err(error) => {
-                    self.quarantine(error, defer)?;
-                    Ok(false)
-                }
-            };
-        }
-        let stampless = front
-            .stamp_wait_since
-            .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
-        let mut observer = Observer {
-            memory: &self.memory,
-            qids,
-            host,
-        };
-        let result = if let Some(observed) = observed {
-            if observed.ticket != front.ticket {
-                return Err(EIO);
-            }
-            if stampless {
+            } else if stampless {
                 retirement::poll_stampless(&mut front.ticket, &mut observer)
             } else {
-                retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
-            }
-        } else if stampless {
-            retirement::poll_stampless(&mut front.ticket, &mut observer)
-        } else {
-            retirement::poll(&mut front.ticket, &mut observer)
-        };
-        let timestamps = match result {
-            Ok(retirement::Poll::Complete(timestamps)) => timestamps,
-            Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer, true),
-            Ok(retirement::Poll::Retry) => return Ok(false),
-            Err(error) => {
-                self.quarantine(error, defer)?;
-                return Ok(false);
+                retirement::poll(&mut front.ticket, &mut observer)
+            };
+            match result {
+                Ok(retirement::Poll::Complete(timestamps)) => break (stampless, timestamps),
+                Ok(retirement::Poll::Pending) if at == 0 => {
+                    return self.replay_abandoned(host, defer, true);
+                }
+                Ok(retirement::Poll::Pending) | Ok(retirement::Poll::Retry) => return Ok(false),
+                Err(error) => {
+                    self.quarantine(error, defer)?;
+                    return Ok(false);
+                }
             }
         };
+        let front = self.active.get_mut(at).ok_or(EIO)?;
         let ordinal = front.ticket.ordinal;
         let context_update = front.context_update;
         if stampless {
             retirement::note_stampless(u16::from(self.slot), ordinal);
         }
-        self.note_retirement(ordinal, context_update);
-        // Work of this pair retires: a later blame on it is collateral again.
-        self.collateral_at = None;
-        let front = self.active.front_mut().ok_or(EIO)?;
         if !front.flist_completed {
             host.complete_render(
                 (!front.qos_completed).then_some(qos),
@@ -2317,15 +2371,23 @@ impl Pair {
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
         ))?;
-        if stampless {
+        if stampless || at != 0 {
             // The pass record is no witness that the firmware is done with the descriptor: it
             // can still store the completion stamps through it, and a reused slot names no
-            // stamp target. Keep the slot until stamps cover the group.
+            // stamp target. Keep the slot until stamps cover the group, as well as one that
+            // retired behind such groups so it leaves in order.
+            front.stamp_wait_since = None;
             front.stamps_owed = true;
+            // Work of this pair retires: a later blame on it is collateral again.
+            self.collateral_at = None;
+            self.executed_generation = Some(host.generation());
             return Ok(true);
         }
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
+        self.note_retirement(ordinal, context_update);
+        // Work of this pair retires: a later blame on it is collateral again.
+        self.collateral_at = None;
         self.executed_generation = Some(host.generation());
         Ok(true)
     }
@@ -2336,7 +2398,7 @@ impl Pair {
     }
     /// Published work of this pair is still live: in flight and not parked.
     pub(crate) fn live_unparked(&self) -> bool {
-        self.replay.len() == 0 && self.active.len() != 0
+        self.replay.len() == 0 && self.active.iter().any(|active| !active.stamps_owed)
     }
     /// The oldest parked group precedes a command waiting through `through`.
     pub(crate) fn replay_through(&self, through: Option<u64>) -> bool {
@@ -2364,7 +2426,10 @@ impl Pair {
         grace: bool,
     ) -> Result<bool> {
         use retirement::Memory;
-        if self.quarantined || self.active.len() == 0 || self.replay.len() != 0 {
+        if self.quarantined
+            || self.active.front().is_none_or(|front| front.stamps_owed)
+            || self.replay.len() != 0
+        {
             return Ok(false);
         }
         if let Some(progressed) = self.settle_interrupted_front(host, defer, grace)? {
@@ -2888,13 +2953,18 @@ impl Pair {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
             // proof above covers its stamps too (or the kill of its context), so only its
             // descriptor is released. It has no drained result of its own.
-            if !active.stamps_owed {
+            let owed = active.stamps_owed;
+            let ordinal = active.ticket.ordinal;
+            let context_update = active.context_update;
+            if !owed {
                 let result = active.drained_result.ok_or(EIO)?;
                 defer(Deferred::Drained(active.packet.completion.clone(), result))?;
             }
-            let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
+            if owed {
+                self.note_retirement(ordinal, context_update);
+            }
         }
         self.quarantined = false;
         self.guilty_released |= guilty;
@@ -2929,7 +2999,11 @@ impl Pair {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<bool> {
         use retirement::Memory;
-        if !self.active.iter().any(|a| Arc::ptr_eq(&a.packet, packet)) {
+        if !self
+            .active
+            .iter()
+            .any(|a| !a.stamps_owed && Arc::ptr_eq(&a.packet, packet))
+        {
             return Ok(false);
         }
         self.release_task_order_if_held();

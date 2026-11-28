@@ -469,6 +469,9 @@ impl job::Backend for Backend {
             if let Some(deferred) = deferred.as_mut() {
                 firmware.scan_renders(deferred)?;
             }
+            if packet.completion.retirement_queued() {
+                return Ok(Decision::Retire);
+            }
             if let Some((older, own)) = self.behind_own_head(packet, &firmware.init, renewals) {
                 if renewals == 0 {
                     dev_info!(self.shared.dev.as_ref(),
@@ -477,7 +480,9 @@ impl job::Backend for Backend {
                 }
                 return Ok(Decision::Defer);
             }
-            // Borrowed-graph and queued-retirement deferrals share the renewal bound.
+            // Queued retirements already returned `Decision::Retire` above, so only
+            // borrowed-graph deferrals reach the renewal bound here (`defer_render_timeout`'s
+            // `retirement_queued()` guard still serves `timeout_render`).
             if timeout::transaction_grace(renewals)
                 && firmware.queues.defer_render_timeout(packet, ETIMEDOUT)
             {
@@ -486,8 +491,9 @@ impl job::Backend for Backend {
             let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
                 crate::module_parameters::compute_timeout_max_ms.value()) };
             let verdict = firmware.queues.render_timeout_decision(packet, renewals, excuse);
-            // Nothing retires a render here: one whose stamps lag retires on its pass record
-            // when it is failed (`fail_render_packet`).
+            // Nothing retires a render in attribution: one whose stamps lag retires on its pass
+            // record in `scan_renders()` once its stamp wait expires, or when failed
+            // (`fail_render_packet`).
             let decision = match verdict.map(|verdict| verdict.decision) {
                 None | Some(Decision::Retire) => Decision::Own,
                 Some(decision) => decision,
