@@ -941,6 +941,21 @@ struct apple_dcp {
 	bool active;
 	/* A successful initial enable keeps the H17P pipe running across DPMS. */
 	bool pipe_enabled_h17p;
+	/* External DCP runtime idle power-gating (when no display/cable attached) */
+	struct mutex ext_idle_lock;
+	struct delayed_work ext_idle_wq;
+	enum {
+		DCP_EXT_IDLE_ON,
+		DCP_EXT_IDLE_OFF,
+		DCP_EXT_IDLE_FAILED,
+		DCP_EXT_IDLE_CLOSED,
+	} ext_idle_state;
+	int ext_idle_err;
+	bool ext_idle_armed;
+	bool ext_idle_paused;
+	bool ext_idle_domains_off;
+	bool ext_idle_initialized;
+
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
 

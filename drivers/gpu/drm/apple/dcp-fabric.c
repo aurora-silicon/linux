@@ -677,6 +677,10 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	if (xbar == route->xbar && dcp_typec_route_no_dp_alt(route))
 		return -EOPNOTSUPP;
 
+	ret = dcp_ext_idle_wake(dcp);
+	if (ret)
+		return ret;
+
 	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
 	/*
@@ -685,14 +689,18 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	 * (a no-op otherwise), or connecting the borrowed route returns early.
 	 */
 	ret = dcp_dptx_disconnect(dcp, 0);
-	if (ret)
+	if (ret) {
+		dcp_ext_idle_kick(dcp);
 		return ret;
+	}
 
 	if (dcp->fixed_route_selected) {
 		ret = mux_control_deselect(dcp->fixed_xbar);
 		dcp->fixed_route_selected = false;
-		if (ret)
+		if (ret) {
+			dcp_ext_idle_kick(dcp);
 			return ret;
+		}
 	}
 
 	/*
@@ -749,6 +757,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 					"failed to restore fixed display route: %d\n",
 					restore_ret);
 		}
+		dcp_ext_idle_kick(dcp);
 		return ret;
 	}
 
@@ -905,6 +914,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
+	dcp_ext_idle_kick(dcp);
 
 	if (connector && connector->dcp == to_platform_device(dcp->dev)) {
 		/*

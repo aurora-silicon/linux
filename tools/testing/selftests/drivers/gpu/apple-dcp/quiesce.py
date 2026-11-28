@@ -90,6 +90,8 @@ static bool dcp_typec_tunnel_held(struct apple_dcp *d) { (void)d;return false; }
 #define DCP_FIRMWARE_V_26_6_DESKTOP 100
 static void __attribute__((unused)) dcp_typec_route_phy_off(struct apple_dcp_typec_route *r)
 { (void)r; /* never powered: the real one returns at once */ }
+static int __attribute__((unused)) dcp_ext_idle_wake(struct apple_dcp *d) { (void)d; return 0; }
+static void __attribute__((unused)) dcp_ext_idle_kick(struct apple_dcp *d) { (void)d; }
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *r) { deactivate_calls++;r->selected=false;return 0; }
 static void dcp_typec_port_attach(struct apple_dcp_typec_port *p) { (void)p; }
 static int gpiod_get_value_cansleep(void *p) { (void)p;return 0; }
