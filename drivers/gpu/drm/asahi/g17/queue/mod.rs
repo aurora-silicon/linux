@@ -122,15 +122,24 @@ pub(crate) struct Queue<B: Backend> {
     /// a submit on fragmentation.
     finished: KVVec<Fences>,
     failures: [FailureRecord<Fences>; 2],
+    /// The commands and VM pins of the ioctl being submitted, kept empty between
+    /// ioctls so their room is allocated once ([`Self::prepare_submission`]).
+    scratch: Scratch,
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
 }
 
-type ValidatedBatch = (
-    KVec<(Validated, Order, Destinations)>,
-    KVec<mmu::VmJobGuard>,
-);
+/// Up to [`MAX_COMMANDS_PER_SUBMISSION`] commands. A validated command is over a kilobyte,
+/// so `pending` would need a high-order block of contiguous pages; neither needs them. Each
+/// userspace queue keeps its own, so they are charged to the caller.
+///
+/// [`MAX_COMMANDS_PER_SUBMISSION`]: crate::file::MAX_COMMANDS_PER_SUBMISSION
+#[derive(Default)]
+struct Scratch {
+    pending: KVVec<(Validated, Order, Destinations)>,
+    guards: KVVec<mmu::VmJobGuard>,
+}
 
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
@@ -174,6 +183,7 @@ impl<B: Backend> Queue<B> {
             publishers: [Outstanding::new(failures), Outstanding::new(failures)],
             finished: KVVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
+            scratch: Scratch::default(),
             _slot: slot,
         })
     }
@@ -431,14 +441,16 @@ impl<B: Backend> Queue<B> {
         self.frontiers[index].push_within_capacity(order.sequence, fences)?;
         Ok(())
     }
-    /// Finish parsing, validation and VM pinning before entering publication.
-    /// Keeping this frame separate bounds the scheduler/ioctl stack depth.
+    /// Finish parsing, validation and VM pinning before entering publication, into the
+    /// empty `scratch`. Keeping this frame separate bounds the scheduler/ioctl stack depth.
     #[inline(never)]
     fn prepare_submission(
         &mut self,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<ValidatedBatch> {
+        scratch: &mut Scratch,
+    ) -> Result {
+        let Scratch { pending, guards } = scratch;
         // A refused submission reaches userspace as EINVAL alone, so name the step that
         // refused it: the command's own requirements are only one of several.
         let refused = |step: &str, error: kernel::error::Error| {
@@ -458,7 +470,7 @@ impl<B: Backend> Queue<B> {
         // starts only after the entire ioctl has been validated and pinned.
         let base = self.sequence;
         let mut preceding = [0; 2];
-        let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
+        pending.reserve(1, GFP_KERNEL_ACCOUNT)?;
         while let Some(command) = parser.next()? {
             let mut payload = self
                 .proof
@@ -498,11 +510,11 @@ impl<B: Backend> Queue<B> {
                 }
             }
             .map_err(|error| refused("its timestamp destinations", error))?;
-            pending.push((payload, order, destinations), GFP_KERNEL)?;
+            pending.push((payload, order, destinations), GFP_KERNEL_ACCOUNT)?;
         }
         parser.finish()?;
         // Every accepted command pins the VM before any command is enqueued.
-        let mut guards = KVec::with_capacity(pending.len(), GFP_KERNEL)?;
+        guards.reserve(pending.len(), GFP_KERNEL_ACCOUNT)?;
         guards
             .push_within_capacity(parse_guard)
             .map_err(|_| ENOMEM)?;
@@ -511,7 +523,7 @@ impl<B: Backend> Queue<B> {
                 .push_within_capacity(self.context.vm().retain_job()?)
                 .map_err(|_| ENOMEM)?;
         }
-        Ok((pending, guards))
+        Ok(())
     }
 }
 
@@ -569,6 +581,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 return Err(error);
             }
         };
+        let mut scratch = core::mem::take(&mut self.scratch);
         let result = (|| {
             if !self.backend.supports_submission() {
                 return Err(ENOTSUPP);
@@ -576,7 +589,8 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            self.prepare_submission(bytes, objects, &mut scratch)?;
+            let Scratch { pending, guards } = &mut scratch;
             let has_render = pending
                 .iter()
                 .any(|(command, _, _)| matches!(command, Validated::Render { .. }));
@@ -602,7 +616,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             for (publishers, room) in self.publishers.iter_mut().zip(room) {
                 publishers.reserve(room)?;
             }
-            let mut guards = guards.into_iter();
+            let mut guards = guards.drain_all();
             // Where a firmware wait reports completion before a weak stream tail's writes are
             // visible, only a command that declares a visible completion is waited for there.
             let visible_required = self.backend.firmware_sources_need_visible_completion();
@@ -622,7 +636,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 0,
                 Some(&output_fence),
             );
-            for (command, order, destinations) in pending {
+            for (command, order, destinations) in pending.drain_all() {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
                     id,
@@ -636,6 +650,10 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             Ok(())
         })();
+        // What an error left unsubmitted is released here, as before the scratch was kept.
+        scratch.pending.clear();
+        scratch.guards.clear();
+        self.scratch = scratch;
         // Everything this ioctl publishes is visible; release what it pruned.
         self.finished.clear();
         if let Err(error) = result {
