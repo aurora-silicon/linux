@@ -31,9 +31,10 @@ int tb_path_sleep(struct tb_path *path)
 	/* Even a partial drain must be replayed on abort. Credits stay allocated. */
 	path->sleep_valid = true;
 	/*
-	 * TEST: macOS writes no PCIe or USB3 path before a T6050 router's sleep in place
-	 * (run mxt6: only the two display tunnels' paths are cleared); the hops are written
-	 * again after the wake, and after a refused sleep they are found as they were.
+	 * QUIRK_CIO_MACOS_FRAMES: macOS writes no PCIe or USB3 path before a T6050 router's
+	 * sleep in place (run mxt6: only the two display tunnels' paths are cleared); the
+	 * hops are written again after the wake, and after a refused sleep they are found as
+	 * they were.
 	 */
 	if (path->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)
 		return 0;
