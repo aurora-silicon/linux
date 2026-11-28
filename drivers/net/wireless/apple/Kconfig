@@ -53,4 +53,17 @@ config APPLE_CENTAURI_T6050_WIFI
 	help
 	  Add scanning and station connections for the T6050 protocol profile.
 
+config APPLE_CENTAURI_T6050_KUNIT_TEST
+	bool "KUnit tests for the T6050 N1 Centauri Wi-Fi connect checks" if !KUNIT_ALL_TESTS
+	depends on APPLE_CENTAURI_T6050_WIFI && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests that pass connect requests to the T6050 Centauri Wi-Fi
+	  admission checks and compare the result: a network without
+	  security is admitted only for open-system or automatic
+	  authentication, contradictory security settings are refused, and
+	  6 GHz stays limited to WPA3-Personal. They need no N1 hardware.
+
+	  If unsure, say N.
+
 endif
