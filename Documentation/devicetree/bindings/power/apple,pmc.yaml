@@ -264,6 +264,13 @@ patternProperties:
         $ref: /schemas/types.yaml#/definitions/phandle
         description: PMGR power state of the GPU, used as a demand input.
 
+      apple,ane-cpu-opp:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description:
+          An OPP in the table of the CPU cluster whose frequency sets the
+          Neural Engine's speed. While ANE work is in flight that cluster is
+          held at or above the OPP's frequency.
+
       apple,smc:
         $ref: /schemas/types.yaml#/definitions/phandle
         description:

@@ -237,6 +237,7 @@ ASAHI_TESTS = {
                                      'ignore-quiescing'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
+    'clpc-ane-cpu-opp-tests.py': [([], PASS)] + mutations('--mutation', ('any-cpu', 'hz', 'leak', 'u32', 'no-parent'), []),
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
         (out() + ['--old-ref', '677be395b9d2e15d98696107ebf88191f08efbf9'], PASS)],
     # The old policy always disabled compute preemption.
