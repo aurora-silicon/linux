@@ -155,6 +155,9 @@ ASAHI_TESTS = {
                                       (['--dtc', '{dtc}', '--mutation', 'every-dart'],
                                        KILL)],
     'apple-router-sleep-tests.py': [(out('--output'), PASS)],
+    # The old revision returns the buffers of a failed job before stopping the engine.
+    'apple-scaler-recovery-tests.py': [([], PASS),
+                                       (['--ref', '40e5e29cc915a421fb2676f895ff7dcc3f47a224'], KILL)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'atc-cio-sleep-tests.py': [(out('--output'), PASS)],

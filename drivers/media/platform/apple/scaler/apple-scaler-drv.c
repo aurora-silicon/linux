@@ -152,7 +152,8 @@ static void asc_write(struct apple_scaler *asc, u32 reg, u32 val)
 /*
  * After power-up or a failed job: wait for idle, pulse the engine reset
  * (no register may be read while it is held), clear stale status and
- * enable completion and errors.
+ * enable completion and errors. A completion or error source the reset
+ * left set would hold the interrupt line, so that is a failure too.
  */
 static int asc_hw_init(struct apple_scaler *asc)
 {
@@ -170,12 +171,28 @@ static int asc_hw_init(struct apple_scaler *asc)
 	if (ret)
 		return ret;
 	asc_write(asc, ASC_IRQ_STATUS, asc_read(asc, ASC_IRQ_STATUS));
+	if (asc_read(asc, ASC_IRQ_STATUS) & (ASC_IRQ_DONE | ASC_IRQ_ERRORS))
+		return -EIO;
 	asc_write(asc, ASC_IRQ_ENABLE, ASC_IRQ_DONE | ASC_IRQ_ERRORS);
 	asc->need_init = false;
 	return 0;
 }
 
-static void asc_finish(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, int err)
+/*
+ * Reset the engine; if it does not go idle, fall back to the PMGR reset of
+ * its power domain and try once more.
+ */
+static int asc_reset_engine(struct apple_scaler *asc)
+{
+	int ret = asc_hw_init(asc);
+
+	if (ret && asc->rst && !reset_control_reset(asc->rst))
+		ret = asc_hw_init(asc);
+	return ret;
+}
+
+static void asc_complete(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, int err,
+			 bool powered_off)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	enum vb2_buffer_state state = err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
@@ -193,37 +210,63 @@ static void asc_finish(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, i
 		v4l2_m2m_buf_done(src, state);
 		v4l2_m2m_buf_done(dst, state);
 	}
-	pm_runtime_put_autosuspend(asc->dev);
+	if (!powered_off)
+		pm_runtime_put_autosuspend(asc->dev);
 	v4l2_m2m_job_finish(asc->m2m_dev, m2m);
 }
 
-/* A failed job leaves the engine in an unknown state: reset before the next. */
-static void asc_recover(struct apple_scaler *asc)
+static void asc_finish(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, int err)
 {
-	asc->need_init = true;
+	asc_complete(asc, ctx, err, false);
 }
 
+/*
+ * A failed or timed-out job can leave the engine running on the job's
+ * buffers, and its error leaves the interrupt line asserted until the
+ * engine is reset. Mask the interrupt and reset the engine, and hand the
+ * buffers back only once it is idle with no status left. If no reset stops
+ * it, power it off first. Called with the interrupt line disabled.
+ */
+static void asc_abort(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, int err)
+{
+	bool powered_off = false;
+
+	asc_write(asc, ASC_IRQ_ENABLE, 0);
+	if (asc_reset_engine(asc)) {
+		dev_err(asc->dev, "engine does not stop after a failed job, powering it off\n");
+		asc->need_init = true;
+		powered_off = true;
+		pm_runtime_put_sync_suspend(asc->dev);
+	}
+	asc_complete(asc, ctx, err, powered_off);
+}
+
+/*
+ * Threaded, so the line stays masked until an error has been handled:
+ * a failed job's error keeps the line asserted until the engine is reset.
+ */
 static irqreturn_t asc_irq(int irq, void *data)
 {
 	struct apple_scaler *asc = data;
 	struct apple_scaler_ctx *ctx;
+	unsigned long flags;
 	u32 status;
 	int err = 0;
 
 	if (pm_runtime_get_if_active(asc->dev) <= 0)
 		return IRQ_NONE;
 
-	spin_lock(&asc->hw_lock);
+	spin_lock_irqsave(&asc->hw_lock, flags);
 	status = asc_read(asc, ASC_IRQ_STATUS);
 	if (!status) {
-		spin_unlock(&asc->hw_lock);
+		spin_unlock_irqrestore(&asc->hw_lock, flags);
 		pm_runtime_put_noidle(asc->dev);
 		return IRQ_NONE;
 	}
 	asc_write(asc, ASC_IRQ_STATUS, status);
 	ctx = asc->active;
 	if (!ctx || !(status & (ASC_IRQ_DONE | ASC_IRQ_ERRORS))) {
-		spin_unlock(&asc->hw_lock);
+		spin_unlock_irqrestore(&asc->hw_lock, flags);
 		dev_warn_ratelimited(asc->dev, "unexpected interrupt, status %#x\n", status);
 		pm_runtime_put_noidle(asc->dev);
 		return IRQ_HANDLED;
@@ -234,13 +277,14 @@ static irqreturn_t asc_irq(int irq, void *data)
 				    status, asc_read(asc, ASC_DEBUG_STATUS));
 		err = -EIO;
 	}
-	spin_unlock(&asc->hw_lock);
+	spin_unlock_irqrestore(&asc->hw_lock, flags);
 	pm_runtime_put_noidle(asc->dev);
 
 	cancel_delayed_work(&asc->watchdog);
 	if (err)
-		asc_recover(asc);
-	asc_finish(asc, ctx, err);
+		asc_abort(asc, ctx, err);
+	else
+		asc_finish(asc, ctx, 0);
 	return IRQ_HANDLED;
 }
 
@@ -256,12 +300,13 @@ static void asc_watchdog(struct work_struct *work)
 	if (ctx)
 		asc_write(asc, ASC_IRQ_ENABLE, 0);
 	spin_unlock_irqrestore(&asc->hw_lock, flags);
-	if (ctx) {
-		dev_err(asc->dev, "job timed out (running %#x)\n",
-			asc_read(asc, ASC_IS_RUNNING));
-		asc_recover(asc);
-		asc_finish(asc, ctx, -ETIMEDOUT);
-	}
+	if (!ctx)
+		return;
+	dev_err(asc->dev, "job timed out (running %#x)\n", asc_read(asc, ASC_IS_RUNNING));
+	/* Let an interrupt handler already running finish before the reset. */
+	disable_irq(asc->irq);
+	asc_abort(asc, ctx, -ETIMEDOUT);
+	enable_irq(asc->irq);
 }
 
 static void asc_image(struct asc_image *img, const struct v4l2_pix_format_mplane *pix,
@@ -323,15 +368,9 @@ static void asc_device_run(void *priv)
 		return;
 	}
 
-	/*
-	 * Engine reset and interrupt setup, once per power-up and after any
-	 * failure. If the engine does not go idle, fall back to the PMGR reset
-	 * of its power domain and try once more.
-	 */
+	/* Engine reset and interrupt setup, once per power-up and after any failure. */
 	if (asc->need_init) {
-		ret = asc_hw_init(asc);
-		if (ret && asc->rst && !reset_control_reset(asc->rst))
-			ret = asc_hw_init(asc);
+		ret = asc_reset_engine(asc);
 		if (ret) {
 			dev_err_ratelimited(asc->dev, "engine does not go idle: %d\n", ret);
 			asc_finish(asc, ctx, -EIO);
@@ -2066,7 +2105,8 @@ static int asc_probe(struct platform_device *pdev)
 	asc->irq = platform_get_irq(pdev, 0);
 	if (asc->irq < 0)
 		return asc->irq;
-	ret = devm_request_irq(dev, asc->irq, asc_irq, 0, dev_name(dev), asc);
+	ret = devm_request_threaded_irq(dev, asc->irq, NULL, asc_irq, IRQF_ONESHOT,
+					dev_name(dev), asc);
 	if (ret)
 		return ret;
 
