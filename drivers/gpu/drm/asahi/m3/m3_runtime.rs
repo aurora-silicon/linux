@@ -70,9 +70,8 @@ struct Inner {
     /// Published batches, oldest first. More than one only with asahi.m3_pipeline_depth > 1.
     active: KVec<Batch>,
     /// Packets from firmware-aborted batches retained until teardown so their
-    /// quarantined VM job guards remain pinned; bounded by `quarantine_budget`.
+    /// quarantined VM job guards remain pinned. Failed VMs publish no new work.
     quarantined_packets: KVec<Arc<crate::m3::m3_submit::Packet>>,
-    quarantine_budget: crate::m3::m3_recovery::QuarantineBudget,
     recovery_window_ns: u64,
     recovery_window_count: u32,
     recoveries: u64,
@@ -224,30 +223,10 @@ impl Inner {
         if self.active.is_empty() || self.state.health.crashed() {
             return Err(EIO);
         }
-        let flights = self.active.len();
-        if !self.quarantine_budget.can_admit(flights) {
-            dev_err!(
-                self.drm.as_ref(),
-                "M3 GPU quarantine limit reached ({}/{}); fail-stop\n",
-                self.quarantine_budget.count(),
-                rec::QUARANTINE_LIMIT
-            );
-            return Err(EIO);
-        }
-        let start_ns = now_ns();
-        if !logic::admit(
-            start_ns,
-            &mut self.recovery_window_ns,
-            &mut self.recovery_window_count,
-        ) {
-            dev_err!(self.drm.as_ref(), "M3 GPU recovery storm; fail-stop\n");
-            return Err(EIO);
-        }
         self.log_owners(trigger);
         let vm = self.active[0].entries[0].0.vm.clone();
         let mut blame_err = trigger;
         let overall = Instant::<Monotonic>::now();
-        let mut rounds = 0u32;
         let mut prev_gen: Option<u64> = None;
         let mut blamed = false;
         loop {
@@ -331,6 +310,21 @@ impl Inner {
                     latch_guilty(packet, blame_err);
                 }
                 blamed = true;
+            }
+            // Batching and pipeline admission keep every active command on this VM.
+            // Charge each generation once, including further stops while its work drains,
+            // through the same per-VM budget as G17. Only excess restarts count as a storm.
+            let in_flight = self.active.iter().flat_map(|b| b.entries.iter())
+                .fold(0u32, |count, _| count.saturating_add(1));
+            let charged = vm.status().is_some_and(|status| status.charge_restart(in_flight));
+            if !rec::admit_restart(
+                charged,
+                now_ns(),
+                &mut self.recovery_window_ns,
+                &mut self.recovery_window_count,
+            ) {
+                dev_err!(self.drm.as_ref(), "M3 GPU recovery storm; fail-stop\n");
+                return Err(EIO);
             }
             let ack_start = Instant::<Monotonic>::now();
             self.config.write_recovery_phase(2)?;
@@ -445,11 +439,6 @@ impl Inner {
             if !another_round {
                 break;
             }
-            rounds += 1;
-            if rounds > rec::FURTHER_RECOVERIES {
-                dev_err!(self.drm.as_ref(), "M3 GPU recovery exceeded further rounds ({})\n", rounds);
-                return Err(EIO);
-            }
         }
         // Re-sync stamps/pool counters and mark faulting VM views for quarantine.
         for batch in self.active.iter() {
@@ -461,7 +450,6 @@ impl Inner {
         // Reserve capacity before draining active batches; fail and pin every stopped packet.
         let active_packets: usize = self.active.iter().map(|b| b.entries.len()).sum();
         let _ = self.quarantined_packets.reserve(active_packets, GFP_KERNEL);
-        self.quarantine_budget.charge(flights);
         for batch in self.active.drain_all() {
             for (packet, _) in batch.entries {
                 packet.finish(Err(blame_err));
@@ -1438,7 +1426,7 @@ impl Runtime {
         };
         Ok(Self { inner: ManuallyDrop::new(owner.write(Inner { transport, state, config, uat, window, drm, device,
             jobs:KVec::new(),packets:KVec::new(),pending:KVec::new(),active:KVec::new(),
-            quarantined_packets:KVec::new(),quarantine_budget:crate::m3::m3_recovery::QuarantineBudget::new(crate::m3::m3_recovery::QUARANTINE_LIMIT),
+            quarantined_packets: KVec::new(),
             recovery_window_ns:0,recovery_window_count:0,recoveries:0,
             gpu_pending:false,active_power_last:None,active_power_samples:0,fault_captured:false,timing:[[0;7];2],render_batches:[0;crate::m3::m3_pass_layout::SLOTS],
             geometry:[GeometryTiming::default();32],geometry_overflow:0,coalesced_packets:0,coalesced_render_stamps:0,mixed_batches:0,pass_cost:policy::PassCosts::default(),render_initialized:false,t8122_verdict:false,

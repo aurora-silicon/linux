@@ -17,16 +17,16 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     entry = src
     if args.mutate:
-        # Negative control: drop the cumulative quarantine budget limit.
+        # Negative control: charge guilty clients to the global storm window too.
         text = src.read_text()
-        target = "Some(total) => total <= self.limit,"
+        target = "charged || logic::admit(now, window_ns, count)"
         if target not in text:
             raise RuntimeError("mutation target missing in m3_recovery.rs")
         g16_logic = (repo / "drivers/gpu/drm/asahi/g16/recovery/logic.rs").resolve()
         mutated = text.replace(
             '#[path = "../g16/recovery/logic.rs"]',
             f'#[path = "{g16_logic}"]',
-        ).replace(target, "Some(_) => true,")
+        ).replace(target, "logic::admit(now, window_ns, count)")
         entry = args.out / "m3_recovery_mut.rs"
         entry.write_text(mutated)
     binary = args.out.resolve() / "tests"
