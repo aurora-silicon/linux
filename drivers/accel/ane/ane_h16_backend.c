@@ -843,6 +843,22 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_ns = 0;
 	}
 	WRITE_ONCE(h->sleep_quarantined, false);
+	/*
+	 * A bring-up that failed after RUN, every restart used: the firmware
+	 * cannot be asked for anything and holds no program. Power the engine
+	 * off under it, as for a hung session, and let the sleep go on. It stays
+	 * off and quarantined until reboot, every mapping held.
+	 */
+	if (!h->program_ready && h->boot.ran && h->boot.quarantined && ane_t6021_hung_stop) {
+		if (h->engine_on) {
+			unsigned int held = ane_h16_hold_darts(h);
+
+			ane_h16_power_down(h);
+			ane_h16_release_darts(h, held);
+			dev_info(h->dev, "H16 ANE: engine that failed its bring-up powered off for system sleep\n");
+		}
+		return 0;
+	}
 	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
 	ane_h16_session_sleep(&h->session, true);
@@ -1611,11 +1627,17 @@ static void ane_h16_startup_fwlog(struct ane_h16_device *h)
 
 /*
  * Power cycles allowed after a startup timeout or stop at bring-up. On the
- * J616s the firmware's CPU is stopped part way through startup on about one
- * boot in six: it posts no further request and never answers the pending
- * command.
+ * J616s the firmware's CPU is stopped part way through startup when it runs
+ * while the rest of the SoC comes up around it: every stop seen at boot fell
+ * within the burst of other blocks powering up as their drivers load (the
+ * GPU, the display controllers, the media and I/O coprocessors). Restarted
+ * at once, the firmware ran into the same burst: 4 of 10 boots with a stop
+ * used up both restarts and stayed quarantined. Each restart now waits
+ * longer first, with the engine powered and its CPU held, so a later one
+ * boots after the burst.
  */
-#define ANE_H16_STARTUP_RESTARTS 2
+#define ANE_H16_STARTUP_RESTARTS 4
+#define ANE_H16_RESTART_WAIT_MS 250
 
 /*
  * A startup that timed out at bring-up: keep the log, then a verified power
@@ -1631,13 +1653,19 @@ static int ane_h16_restart_engine(void *ctx)
 	struct ane_h16_device *h = ctx;
 	int ret;
 
+	unsigned int attempt = clamp(h->boot.restart_attempt, 1U, ANE_H16_STARTUP_RESTARTS);
+	unsigned int wait = ANE_H16_RESTART_WAIT_MS << (attempt - 1);
+
 	ane_h16_startup_fwlog(h);
 	ret = ane_h16_power_cycle(h, true);
-	if (ret)
+	if (ret) {
 		dev_err(h->dev, "H16 ANE: startup timed out; power cycle failed, error %d\n", ret);
-	else
-		dev_warn(h->dev, "H16 ANE: startup timed out; engine power cycled, booting again\n");
-	return ret;
+		return ret;
+	}
+	dev_warn(h->dev, "H16 ANE: startup timed out; engine power cycled, booting again in %u ms\n",
+		 wait);
+	msleep(wait);
+	return 0;
 }
 
 static const struct ane_h16_boot_ops ane_h16_ops = {
