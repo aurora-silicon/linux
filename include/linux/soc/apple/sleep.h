@@ -155,6 +155,9 @@ int apple_sleep_coproc_wake_error(struct device *dev);
  */
 bool apple_sleep_commit_stops_coprocs(void);
 
+/* This firmware sleep's commit stops @dev, the internal display CPU, for good: see sleep.c. */
+bool apple_sleep_display_no_restart(struct device *dev);
+
 /* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
 bool apple_sleep_dry_run(void);
 
@@ -417,6 +420,11 @@ static inline bool apple_sleep_commit_stops_coprocs(void)
 }
 
 static inline bool apple_sleep_dry_run(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_display_no_restart(struct device *dev)
 {
 	return false;
 }

@@ -1199,6 +1199,19 @@ static bool apple_sleep_dry(const struct apple_sleep *s)
 }
 
 /*
+ * The internal display of a SoC whose commit powers it down for good (display_no_restart), with
+ * its coprocessor's stop registered first and readied by its driver: the engine runs that stop
+ * in its first pass, after the last refusal, and only then powers the display down, so a
+ * sleep refused before that leaves the display running. Otherwise the display goes down at the
+ * start of the entry as before.
+ */
+static bool sleep_display_late(struct apple_sleep *s)
+{
+	return s->soc->display_no_restart && s->soc->ndisp && s->display[0].np &&
+	       !apple_sleep_dry(s) && apple_sleep_coproc_ready_node(s->display[0].np);
+}
+
+/*
  * Untested SoCs: each step of a sleep in PMU scratch, readable after a reset. J815's ADT
  * pmu-main info-scrpad is 0x8000 + 0x2800; aurora-silicon/linux#1664 (T6041) notes its steps
  * at 0x8308 too. +0 magic, +1 the last step, +2/+4 the step's own detail, +3 the attempt's
@@ -1736,6 +1749,21 @@ bool apple_sleep_commit_stops_coprocs(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
+/*
+ * Whether this firmware sleep's commit powers @dev, the internal display coprocessor (the first
+ * of apple,display-coprocessors), down with no restart after the wake, as the SoC's sleep data
+ * says (display_no_restart). Its driver then stops it cold itself, before the commit, and leaves
+ * it stopped until a reboot. Any other display coprocessor isn't covered.
+ */
+bool apple_sleep_display_no_restart(struct device *dev)
+{
+	struct apple_sleep *s = READ_ONCE(apple_sleep);
+
+	return s && dev && s->soc->display_no_restart && s->soc->ndisp &&
+	       s->display[0].np && s->display[0].np == dev->of_node && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_display_no_restart);
+
 /* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
 bool apple_sleep_dry_run(void)
 {
@@ -1965,6 +1993,12 @@ const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void)
 	return apple_sleep && pm_suspend_via_firmware() ? apple_sleep->soc->smc_policy : NULL;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_policy);
+
+/* One sleep, then it clears itself: what a sleep refused at its very last check unwinds. */
+static bool sleep_refuse_late;
+module_param_named(refuse_late, sleep_refuse_late, bool, 0644);
+MODULE_PARM_DESC(refuse_late,
+		 "TEST ONLY: refuse the next early_context sleep at its last check, after every other");
 
 static bool sleep_j813_smc_late = true;
 module_param_named(j813_smc_late, sleep_j813_smc_late, bool, 0444);
@@ -3657,6 +3691,9 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 				dev_info(s->dev, "dry run: the display coprocessor is left running; a sleep that commits stops it cold, until a reboot\n");
 				continue;
 			}
+			/* Stopped after the last refusal: sleep_display_late(). */
+			if (i == 0 && sleep_display_late(s))
+				continue;
 			dev_err(s->dev, "refused: a bound display coprocessor is still running\n");
 			refused = true;
 		}
@@ -6356,6 +6393,7 @@ static int apple_sleep_enter_dry(struct apple_sleep *s)
 static int apple_sleep_enter_prepare(struct apple_sleep *s)
 {
 	const char *step = "SoC check";
+	bool late_display;
 	int ret;
 
 	if (s->soc->ops->check) {
@@ -6372,7 +6410,8 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	if (apple_sleep_dry(s))
 		return apple_sleep_enter_dry(s);
 	ret = apple_sleep_cpus_hold(s);
-	if (!ret) {
+	late_display = sleep_display_late(s);
+	if (!ret && !late_display) {
 		step = "display prepare";
 		if (s->soc->regions)
 			s->regs_staged = true;
@@ -6405,6 +6444,11 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		step = "wakeup pending";
 		ret = -EBUSY;
 	}
+	if (!ret && xchg(&sleep_refuse_late, false)) {
+		step = "test: refuse_late";
+		ret = -EBUSY;
+		dev_info(s->dev, "test: refused at the last check (refuse_late)\n");
+	}
 	if (ret && s->soc->regions)
 		dev_info(s->dev, "refused at .enter: %s: %d\n", step, ret);
 	if (!ret && s->soc->ops->display_stop) {
@@ -6428,6 +6472,13 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	/* No returning error path below this point. */
 	if (!s->soc->ops->display_stop)
 		apple_sleep_coprocs_stop(s, true);
+	/* Its driver's stop ran just above; past the last refusal, a failure goes on. */
+	if (late_display) {
+		ret = s->soc->ops->display_off(s);
+		if (ret)
+			dev_err(s->dev, "display power-down past the last refusal failed: %d\n",
+				ret);
+	}
 	if (!s->soc->own_wake) {
 		sleep_wake_arm(s);
 		s->wake_masks_saved = true;

@@ -11229,6 +11229,70 @@ static bool dcp_sleep_owned(struct apple_dcp *dcp)
 	       !dcp->external && apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
 }
 
+/* Interrupts off, one CPU, after the sleep's last refusal: the idle pair and receive off. */
+static int dcp_commit_stop(void *data)
+{
+	struct apple_dcp *dcp = data;
+	struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	unsigned int us;
+	int ret = -ENODEV;
+
+	if (!IS_ERR_OR_NULL(rtk)) {
+		ret = apple_rtkit_sleep_idle_polled(rtk, control, &us);
+		apple_rtkit_mailbox_recv_off(rtk);
+	}
+	/* Registered first, it clears its run bit itself, twice as the engine does. */
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+
+	return ret;
+}
+
+/*
+ * Any other internal DCP whose firmware a firmware-driven deep sleep's commit
+ * powers down for good, as the SoC's sleep data says
+ * (apple_sleep_display_no_restart(), the firmware-27 T8122 DCP for one): its
+ * suspend is the ordinary one, which leaves the firmware running, and the
+ * sleep engine idles and stops it after the sleep's last refusal
+ * (dcp_commit_stop()), in its first pass of coprocessor stops, before the
+ * wake is armed and macOS's off words drop, then powers the display down.
+ * A sleep refused before then resumes it as usual; one that got that far
+ * has stopped it, and it stays stopped until a reboot. If the stop can't be registered the
+ * firmware is left running and the engine refuses the sleep.
+ */
+static void dcp_commit_stop_arm(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) || dcp->external ||
+	    !apple_sleep_display_no_restart(dcp->dev) || !apple_sleep_commit_stops_coprocs() ||
+	    apple_sleep_dry_run())
+		return;
+	ret = apple_sleep_coproc_register_first(dcp->dev, dcp_commit_stop, dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "no stop registered for the sleep's commit (%d): the sleep is refused\n",
+			 ret);
+		return;
+	}
+	apple_sleep_coproc_set_ready(dcp->dev, true);
+	dcp->commit_stop_armed = true;
+}
+
+/* True when the sleep's commit stopped the firmware (dcp_commit_stop_arm()). */
+static bool dcp_commit_stop_disarm(struct apple_dcp *dcp)
+{
+	bool stopped;
+
+	if (!dcp->commit_stop_armed)
+		return false;
+	dcp->commit_stop_armed = false;
+	stopped = apple_sleep_coproc_stopped(dcp->dev);
+	apple_sleep_coproc_unregister(dcp->dev);
+
+	return stopped;
+}
+
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -11526,6 +11590,7 @@ static int dcp_platform_suspend(struct device *dev)
 	dcp_sleep_hold_phys(dcp);
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
+	dcp_commit_stop_arm(dcp);
 
 	return 0;
 }
@@ -11548,6 +11613,12 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
 		return dcp_v27_sleep_resume(dcp);
+
+	if (dcp_commit_stop_disarm(dcp)) {
+		dev_warn(dev, "display coprocessor stopped by the sleep's commit; panel stays off until reboot\n");
+		WRITE_ONCE(dcp->quiescing, true);
+		WRITE_ONCE(dcp->sleep_cold_stopped, true);
+	}
 
 	/* Stopped cold, with no restart path until reboot. */
 	if (READ_ONCE(dcp->sleep_cold_stopped))
