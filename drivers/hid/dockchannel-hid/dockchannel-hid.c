@@ -1104,7 +1104,14 @@ static int dchid_create_interface(struct dchid_iface *iface)
 
 /* hid-core rejects any Report Size above this (see hid_parser_global()). */
 #define DCHID_MAX_REPORT_SIZE	16384
-#define DCHID_REPORT_PAD_SIZE	(DCHID_MAX_REPORT_SIZE / 8 + 1)
+/*
+ * A short report is padded to the length hid-core expects. That length is
+ * the sum of every field and count in the report, not just the clamped
+ * item, and hid-core never asks for more than the transport's buffer limit
+ * (HID_MAX_BUFFER_SIZE here: dchid_ll sets no max_buffer_size), so pad to
+ * that limit and any report hid-core accepts fits.
+ */
+#define DCHID_REPORT_PAD_SIZE	HID_MAX_BUFFER_SIZE
 
 /*
  * The T6050 multi-touch firmware declares its raw touch report as one item of

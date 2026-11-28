@@ -299,6 +299,65 @@ static void dchid_numbered_short_report_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, iface->pad[DCHID_REPORT_PAD_SIZE - 1], 0);
 }
 
+/*
+ * The pad must hold the whole report hid-core expects: a clamped opaque
+ * field plus further fields and counts, not just the clamped item.
+ */
+static void dchid_clamped_aggregate_report_test(struct kunit *test)
+{
+	static struct hid_driver driver = {
+		.raw_event = dchid_test_capture_raw,
+		.report = dchid_test_capture_parsed,
+	};
+	static const u8 rdesc[] = {
+		0x05, 0x0d, 0x09, 0x04, 0xa1, 0x01,	/* Digitizer, Touch Screen */
+		0x85, 0x01,				/* Report ID (1) */
+		0x09, 0x30, 0x15, 0x00, 0x26, 0xff, 0x00,
+		0x77, 0x00, 0x00, 0x08, 0x00,		/* Report Size (0x80000), clamped */
+		0x95, 0x01, 0x81, 0x02,			/* Report Count (1), Input */
+		0x75, 0x08, 0x95, 0x10, 0x81, 0x02,	/* 16 more bytes */
+		0xc0,
+	};
+	struct dchid_iface *iface = test->priv;
+	struct {
+		struct dchid_init_hdr hdr;
+		struct dchid_init_block_hdr block;
+		u8 descriptor[sizeof(rdesc)];
+	} __packed msg = {
+		.hdr = { .iface = 1, .more_packets = 1 },
+		.block = { .type = INIT_HID_DESCRIPTOR, .length = sizeof(rdesc) },
+	};
+	u8 data[] = { 1, 0x12, 0x34 };
+	struct hid_device *hid;
+	struct dchid_test_report seen = {};
+
+	memcpy(msg.descriptor, rdesc, sizeof(rdesc));
+	dchid_handle_init(iface->dchid, &msg, sizeof(msg));
+	KUNIT_ASSERT_NOT_NULL(test, iface->hid_desc);
+	KUNIT_ASSERT_NOT_NULL(test, iface->pad);
+
+	hid = hid_allocate_device();
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, hid);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dchid_test_destroy_hid, hid), 0);
+	hid->ll_driver = &dchid_ll;
+	hid->driver = &driver;
+	hid_set_drvdata(hid, &seen);
+	KUNIT_ASSERT_EQ(test, hid_parse_report(hid, iface->hid_desc, iface->hid_desc_len), 0);
+	hid->bpf_rdesc = hid->dev_rdesc;
+	hid->bpf_rsize = hid->dev_rsize;
+	KUNIT_ASSERT_EQ(test, hid_open_report(hid), 0);
+	/* the report is longer than the clamped item alone */
+	KUNIT_ASSERT_NOT_NULL(test, hid->report_enum[HID_INPUT_REPORT].report_id_hash[1]);
+	KUNIT_ASSERT_GT(test, hid->report_enum[HID_INPUT_REPORT].report_id_hash[1]->size, 16384u);
+
+	iface->hid = hid;
+	iface->open = true;
+	dchid_handle_report(iface, data, sizeof(data));
+
+	KUNIT_EXPECT_EQ(test, seen.raw_size, sizeof(data));
+	KUNIT_EXPECT_TRUE(test, seen.parsed);
+}
+
 static void dchid_packet_checksum_test(struct kunit *test)
 {
 	struct dchid_hdr hdr = { .hdr_len = sizeof(hdr), .length = 8 };
@@ -397,6 +456,7 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_init_descriptor_repeat_test),
 	KUNIT_CASE(dchid_report_size_clamp_test),
 	KUNIT_CASE(dchid_numbered_short_report_test),
+	KUNIT_CASE(dchid_clamped_aggregate_report_test),
 	KUNIT_CASE(dchid_packet_checksum_test),
 	KUNIT_CASE(dchid_ring_wrap_test),
 	KUNIT_CASE(dchid_ring_bad_header_test),
