@@ -422,7 +422,8 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 
 	mutex_lock(&net->connection_lock);
 	netif_carrier_off(net->dev);
-	netif_stop_queue(net->dev);
+	/* Wait for an in-flight ndo_start_xmit before stopping its rings. */
+	netif_tx_disable(net->dev);
 
 	if (net->rings_started) {
 		int ret, retries = TBNET_LOGOUT_RETRIES;
@@ -464,6 +465,12 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 
 		tb_ring_stop(net->rx_ring.ring);
 		tb_ring_stop(net->tx_ring.ring);
+		/*
+		 * A TX completion callback running before tb_ring_stop() may
+		 * have raced with carrier_off and re-woken the queue; stop and
+		 * drain ndo_start_xmit() once no more callbacks can run.
+		 */
+		netif_tx_disable(net->dev);
 		net->rings_started = false;
 		tbnet_free_buffers(&net->rx_ring);
 		tbnet_free_buffers(&net->tx_ring);
@@ -637,7 +644,8 @@ static void tbnet_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	/* Return buffer to the ring */
 	net->tx_ring.prod++;
 
-	if (tbnet_available_buffers(&net->tx_ring) >= TBNET_RING_SIZE / 2)
+	if (!canceled && netif_carrier_ok(net->dev) &&
+	    tbnet_available_buffers(&net->tx_ring) >= TBNET_RING_SIZE / 2)
 		netif_wake_queue(net->dev);
 }
 
