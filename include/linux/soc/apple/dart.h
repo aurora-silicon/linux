@@ -225,6 +225,8 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 u32 apple_dart_enabled_streams(struct device *dev);
 /* A locked display DART's TCR and TTBR words kept across a real sleep (T6041). */
 int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
+/* The display streams turned off read disabled and the DART has nothing in flight. */
+int apple_dart_display_streams_idle(struct device *dev, u32 streams);
 /* A GAPF slice released before its coprocessor's CPU domain comes up after a wake. */
 int apple_dart_gapf_ready(struct device *dev);
 /* A display DART whose domain goes off at runtime while others still map into it. */
@@ -265,6 +267,11 @@ static inline u32 apple_dart_enabled_streams(struct device *dev)
 }
 
 static inline int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
+{
+	return -ENODEV;
+}
+
+static inline int apple_dart_display_streams_idle(struct device *dev, u32 streams)
 {
 	return -ENODEV;
 }

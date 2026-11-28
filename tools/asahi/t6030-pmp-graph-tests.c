@@ -160,6 +160,8 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	/* Always-on entries: a sleep doesn't wait for their acknowledgment. */
+	u64 always_on;
 	bool defer;
 	/* Firmware-driven sleep: the request word at its start, the DVFS words kept. */
 	u64 sleep_request;
@@ -939,6 +941,9 @@ int main(void)
 		       overlay_entries[i].always_on);
 		assert(!!(e->genpd.flags & GENPD_FLAG_IRQ_SAFE) ==
 		       overlay_entries[i].irq_safe);
+		/* A sleep doesn't wait for an always-on entry's acknowledgment. */
+		assert(!!(r->always_on & BIT_ULL(e->id)) ==
+		       overlay_entries[i].always_on);
 	}
 	assert(apple_pmp_report_wait_ready(&entries[0], 30000) == 0 &&
 	       enables == 1 && pmp_node.available);

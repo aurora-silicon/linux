@@ -61,7 +61,9 @@ enum brcmf_bus_state { BRCMF_BUS_DOWN, BRCMF_BUS_UP };
 /* STOP_REASONS */
 struct net_device { bool stopped; unsigned drains, wakes; };
 struct brcmf_pub;
-struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg80211_vif *next; };
+struct completion { bool done; };
+struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg80211_vif *next;
+ struct completion link_down; };
 struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct net_device *ndev;
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
@@ -193,6 +195,7 @@ CALLBACK_STUBS = r'''
 #define BRCMF_E_PFN_NET_FOUND 1
 #define BRCMF_SCAN_STATUS_BUSY 1
 #define BRCMF_VIF_STATUS_READY 2
+#define BRCMF_VIF_STATUS_CONNECTED 3
 #define WLAN_REASON_UNSPECIFIED 1
 #define test_bit(i,p) ((*(p)&BIT(i))!=0)
 #define list_for_each_entry(v,h,m) for ((v)=(h)->first;(v);(v)=(v)->next)
@@ -223,7 +226,12 @@ static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
 static unsigned wowl_offs;
 static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
-static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();return true;}
+/* A DISASSOC goes out for a connected vif; the firmware's link down event completes its link_down. */
+static unsigned link_downs, link_waits;
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {bool sent=v->sme_state&BIT(BRCMF_VIF_STATUS_CONNECTED);(void)r;(void)b;can_command();link_downs++;if(sent)v->link_down.done=true;return sent;}
+static void reinit_completion(struct completion *c) {c->done=false;}
+static unsigned long msecs_to_jiffies(unsigned int m) {return m;}
+static unsigned long wait_for_completion_timeout(struct completion *c,unsigned long t) {assert(t==500);link_waits++;return c->done;}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
 static unsigned wowl_configs;
@@ -382,6 +390,17 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   reset();assert(!brcmf_pcie_pm_enter_D3(&device));retain=!cold;d0_error=cold?0:-EIO;
   probe_error=fail?-EIO:0;assert(brcmf_pcie_pm_leave_D3(&device)==probe_error);
   assert(removes==1 && probes==1 && ndev[0].stopped && msgbuf.tx_suspended);cases++;
+ }
+ /* A suspend without WoWLAN takes every ready interface down, and waits for the
+  * firmware's link down only where a DISASSOC went out. */
+ {
+  static struct brcmf_cfg80211_vif conn,idle,off;
+  reset();link_downs=link_waits=0;
+  conn.sme_state=BIT(BRCMF_VIF_STATUS_READY)|BIT(BRCMF_VIF_STATUS_CONNECTED);
+  idle.sme_state=BIT(BRCMF_VIF_STATUS_READY);off.sme_state=0;
+  cfg.vif_list.first=&conn;conn.next=&idle;idle.next=&off;
+  assert(!brcmf_cfg80211_suspend(&wiphy,NULL) && cfg.suspended);
+  assert(link_downs==2 && link_waits==1 && conn.link_down.done && !off.link_down.done);cases++;
  }
  printf("%u regulatory, TX queue, worker retention and PCIe PM controls passed\n",cases);
  return 0;

@@ -722,6 +722,12 @@ struct apple_sleep_soc {
 	unsigned int ncluster_cpu;
 	/* "cpu-start": a core's bit is BIT(cpu_start_stride * cluster + core). */
 	unsigned int cpu_start_stride;
+	/*
+	 * "cpu-start", for a SoC whose clusters don't sit a fixed stride apart (T6040: E 0-3, P0
+	 * 4-9, P1 10-15): each cluster's first bit, a core's bit is then BIT(first + core) and
+	 * cpu_start_stride is not used.
+	 */
+	const u8 *cpu_start_first_bit;
 	/* In "clk-mux": parked in this order before the commit, with this value */
 	u32 clk_mux_parked[SLEEP_CLK_MUX_MAX];
 	unsigned int nclk_mux_parked;
@@ -2192,6 +2198,9 @@ static unsigned int sleep_cpu_core(u64 mpidr)
 
 static u32 sleep_cpu_start_bit(const struct apple_sleep *s, u64 mpidr)
 {
+	if (s->soc->cpu_start_first_bit)
+		return BIT(s->soc->cpu_start_first_bit[sleep_cpu_cluster(s, mpidr)] +
+			   sleep_cpu_core(mpidr));
 	return BIT(s->soc->cpu_start_stride * sleep_cpu_cluster(s, mpidr) +
 		   sleep_cpu_core(mpidr));
 }
@@ -2210,11 +2219,21 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 	int index, ret;
 
 	if (soc->cpu_cluster_affinity > 3 || !soc->cpu_clusters || !soc->cpu_cores_per_cluster ||
-	    soc->cpu_cores_per_cluster > 32 || soc->cpu_start_stride > 32 ||
-	    soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
-	    soc->cpu_start_stride * (soc->cpu_clusters - 1) +
-		    soc->cpu_cores_per_cluster > 32)
+	    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	if (soc->cpu_start_first_bit) {
+		unsigned int c;
+
+		for (c = 0; c < soc->cpu_clusters; c++)
+			if (soc->cpu_start_first_bit[c] + soc->cpu_cores_per_cluster > 32)
+				return dev_err_probe(s->dev, -EINVAL,
+						     "invalid CPU-start geometry\n");
+	} else if (soc->cpu_start_stride > 32 ||
+		   soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
+		   soc->cpu_start_stride * (soc->cpu_clusters - 1) +
+			   soc->cpu_cores_per_cluster > 32) {
+		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	}
 
 	/* The node's compatible chose the profile: its machine is where it was measured */
 	if (soc->machine && (cpu_logical_map(0) != soc->boot_mpidr ||
@@ -3576,7 +3595,7 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
+	if (s->soc->ndisp && !s->display[0].bound) {
 		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
 		refused = true;
 	}
@@ -7981,6 +8000,7 @@ static void apple_sleep_put_node(void *np)
 }
 
 #include "sleep-t6050.h"
+#include "sleep-t6040.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
 int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
@@ -8286,7 +8306,7 @@ static int apple_sleep_profile_validate(const struct apple_sleep_soc *soc)
 	    !soc->ops->deep_wfi_arm || !soc->ops->aic_mask_all || !soc->ops->aic_ack ||
 	    !soc->ops->aic_restore ||
 	    (!soc->ops->commit_regs && (!soc->ops->lower_io || !soc->ops->last_mile)) ||
-	    !soc->ndisp || soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
+	    soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
 		return -EINVAL;
 	return 0;
 }
@@ -10153,6 +10173,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
 	{ .compatible = "apple,t8132-sleep", .data = &t8132_sleep_soc },
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
+	{ .compatible = "apple,t6040-sleep", .data = &t6040_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
 	{ .compatible = "apple,t8103-sleep", .data = &t8103_sleep_soc },

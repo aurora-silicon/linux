@@ -544,7 +544,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		apple_crtc->fabric_held = true;
 	}
 	if (crtc_state->active &&
-	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp) ||
+	     dcp_external_pipe_off(apple_crtc->dcp))) {
 		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
 		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);

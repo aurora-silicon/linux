@@ -5291,13 +5291,17 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 			 * disassociate from AP to save power while system is
 			 * in suspended state
 			 */
-			if (brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true)) {
-				/* Make sure WPA_Supplicant receives all the event
-				 * generated due to DISASSOC call to the fw to keep
-				 * the state fw and WPA_Supplicant state consistent
-				 */
-				brcmf_delay(500);
-			}
+			reinit_completion(&vif->link_down);
+			/* Make sure WPA_Supplicant receives all the event
+			 * generated due to DISASSOC call to the fw to keep
+			 * the state fw and WPA_Supplicant state consistent:
+			 * wait for the firmware's link down, at most 500 ms.
+			 * An interface that sent no DISASSOC has none coming.
+			 */
+			if (brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true) &&
+			    !wait_for_completion_timeout(&vif->link_down,
+							 msecs_to_jiffies(500)))
+				brcmf_dbg(INFO, "no link down event after the DISASSOC\n");
 		}
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
@@ -7120,6 +7124,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 	vif->wdev.wiphy = cfg->wiphy;
 	vif->wdev.iftype = type;
 	init_completion(&vif->mgmt_tx);
+	init_completion(&vif->link_down);
 
 	brcmf_init_prof(&vif->profile);
 
@@ -7788,6 +7793,7 @@ brcmf_notify_connect_status(struct brcmf_if *ifp,
 		brcmf_net_setcarrier(ifp, true);
 	} else if (brcmf_is_linkdown(ifp->vif, e)) {
 		brcmf_dbg(CONN, "Linkdown\n");
+		complete(&ifp->vif->link_down);
 		if (!brcmf_is_ibssmode(ifp->vif) &&
 		    (test_bit(BRCMF_VIF_STATUS_CONNECTED,
 			      &ifp->vif->sme_state) ||

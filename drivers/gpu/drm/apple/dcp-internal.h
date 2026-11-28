@@ -277,6 +277,8 @@ struct dcp_t6041_chain {
 	void __iomem **domains;
 	u32 *child_saved;
 	unsigned int num_domains;
+	/* T6040: an external chain's child_saved holds what its stop found */
+	bool child_valid;
 };
 
 /*
@@ -296,6 +298,8 @@ struct dcp_t6041_power {
 	bool child_valid;
 	u32 boot_ps[3];
 	bool boot_ps_valid;
+	/* apple,t6040-display-power: the external DCPs are restarted after the wake */
+	bool t6040;
 };
 
 /*
@@ -681,6 +685,22 @@ struct apple_dcp {
 	bool ext_dead;
 	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
 	bool t6041_ext_seen;
+	/* T6040 S2R: this external DCP's link set up again once its firmware is back */
+	struct work_struct t6040_link_work;
+	/*
+	 * T6040 S2R: an external display's link work is through once the firmware reports the
+	 * display plugged again; this bounds the wait for that.
+	 */
+	struct delayed_work t6040_plug_wq;
+	/* T6040 S2R: the link work waits for the firmware's plug of the display. */
+	bool t6040_plug_wait;
+	/*
+	 * T6040 S2R: from this external DCP's stop until its link work is through, the DRM
+	 * entry points leave its firmware alone (see dcp_t6040_ext_link_down()).
+	 */
+	bool t6040_relinking;
+	/* T6040 S2R: the fixed HDMI output's DP PHY was given back for the sleep. */
+	bool t6040_fixed_phy_off;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -1021,6 +1041,11 @@ struct apple_dcp {
 	struct completion s2r_dart_done;
 	int s2r_dart_err;
 	struct completion s2r_hpd_done;
+	/* Woken when a channel's call depth or the pending ACKs fall. */
+	wait_queue_head_t channels_idle_wq;
+	/* Shown swap completions and the last one's id, for the commit after a wake. */
+	atomic_t shown_swaps;
+	u32 shown_swap_id;
 	bool sleep_host_stop;
 	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
@@ -1452,6 +1477,7 @@ void dcp_backlight_stop(struct apple_dcp *dcp);
 void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 extern int fw27_panel_boot_mode;
@@ -1623,5 +1649,18 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
 void dcp_indicator_display_resumed(struct apple_dcp *dcp);
 extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
+
+/*
+ * A swap the firmware completed with shown set, recorded for the commit after a T6041 wake:
+ * the id first, so a reader that sees the new count sees that swap's id or a later one.
+ */
+static inline void dcp_note_swap_complete(struct apple_dcp *dcp, u32 swap_id, bool shown)
+{
+	if (!shown)
+		return;
+	WRITE_ONCE(dcp->shown_swap_id, swap_id);
+	smp_mb__before_atomic();	/* pairs with the smp_rmb() in dcp_wake_swap_shown() */
+	atomic_inc(&dcp->shown_swaps);
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

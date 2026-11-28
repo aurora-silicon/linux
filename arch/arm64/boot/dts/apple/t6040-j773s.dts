@@ -917,3 +917,7 @@
  * driver. The SEP stays off: its driver only runs on boards whose Touch ID
  * wiring was read.
  */
+
+&t6040_sleep {
+	apple,gp-pcie = <&pcie0>;
+};

@@ -60,6 +60,12 @@ properties:
   "#size-cells":
     const: 1
 
+  nonposted-mmio:
+    type: boolean
+    description:
+      Some of the power state registers in the block only take non-posted
+      writes.
+
 patternProperties:
   "power-controller@[0-9a-f]+$":
     description:

@@ -3484,3 +3484,7 @@
 };
 
 #include "t604x-j614-j616-usb4.dtsi"
+
+&t6040_sleep {
+	apple,gp-pcie = <&pcie0>;
+};

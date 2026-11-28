@@ -389,6 +389,22 @@ bool iomfb_channels_idle(struct apple_dcp *dcp)
 	       !atomic_read_acquire(&dcp->pending_acks);
 }
 
+static void iomfb_channels_idle_wake(struct apple_dcp *dcp)
+{
+	/* The barrier in wq_has_sleeper() orders the depth and ACK updates before the check. */
+	if (wq_has_sleeper(&dcp->channels_idle_wq))
+		wake_up_all(&dcp->channels_idle_wq);
+}
+
+/* 0 once every channel is idle, -ETIMEDOUT if one is still busy after @timeout_ms. */
+int iomfb_wait_channels_idle(struct apple_dcp *dcp, unsigned int timeout_ms)
+{
+	if (!wait_event_timeout(dcp->channels_idle_wq, iomfb_channels_idle(dcp),
+				msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+	return 0;
+}
+
 enum iomfb_opaque_x_state {
 	IOMFB_OPAQUE_X_WAITING,
 	IOMFB_OPAQUE_X_NEEDED,
@@ -730,6 +746,7 @@ void iomfb_reset_transport(struct apple_dcp *dcp)
 	dcp->present_state_h17p.pending = false;
 	dcp->present_state_h17p.accepted = false;
 	mutex_unlock(&dcp->iomfb.lock);
+	iomfb_channels_idle_wake(dcp);
 }
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
@@ -1467,6 +1484,7 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	/* Order dcp_send_message() before publishing pending_acks == 0. */
 	smp_mb__before_atomic();
 	atomic_dec(&dcp->pending_acks);
+	iomfb_channels_idle_wake(dcp);
 }
 
 /*
@@ -1529,6 +1547,9 @@ static int dcp_set_crtc_active(struct drm_crtc *crtc,
 	return ret;
 }
 
+static bool dcp_mode_settable(struct apple_dcp *dcp,
+			      const struct drm_display_mode *mode);
+
 /*
  * @power_cycle: the firmware powered the pipe down with the lost link, so a
  * modeset alone cannot bring it back. Turn the CRTC off and on instead, which
@@ -1570,6 +1591,15 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 		   (READ_ONCE(dcp->mode_state.valid) ||
 		    !dcp_has_mode(dcp, &crtc->state->mode))) {
 		ret = 0;
+	} else if (dcp_t6040_relinks() && crtc && crtc->state && crtc->state->active &&
+		   !dcp_mode_settable(dcp, &crtc->state->mode) &&
+		   !dcp_typec_follows_crtc(dcp)) {
+		/*
+		 * The display's mode list lacks the CRTC's mode: a sink just woken
+		 * lists its base modes first. Its own HPD pulse or the link recovery
+		 * reads the full list; until then a reset is refused by mode_fixup.
+		 */
+		ret = -ENOENT;
 	} else if (crtc && crtc->state && crtc->state->active &&
 		   dcp_crtc_can_retrain(crtc, connector) && power_cycle) {
 		/* A commit that held the locks first may have set the mode. */
@@ -1992,6 +2022,13 @@ void dcp_hotplug(struct work_struct *work)
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 	if (READ_ONCE(dcp->mode_state.valid))
 		dcp->tunnel_power_cycles = 0;
+	/*
+	 * T604x: HPD went low, as when a sink just woken asserts it again with its full
+	 * mode list: the plug that follows reads that list, so a link recovery
+	 * pending for the old one would only take the new link down.
+	 */
+	if (!READ_ONCE(connector->connected) && dcp_t6040_relinks())
+		cancel_delayed_work(&dcp->link_recovery_wq);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
 		if (READ_ONCE(connector->dcp) == pdev)
@@ -2045,6 +2082,8 @@ void dcp_hotplug(struct work_struct *work)
 		    */
 		   !READ_ONCE(dcp->typec_enable_pending) &&
 		   !READ_ONCE(dcp->mode_state.changing) &&
+		   /* T6040 S2R: applied again once the link work is through. */
+		   !READ_ONCE(dcp->t6040_relinking) &&
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
@@ -2067,7 +2106,10 @@ void dcp_hotplug(struct work_struct *work)
 		 * callback has completed.
 		 */
 		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle);
-		if (ret) {
+		if (ret == -ENOENT) {
+			dev_dbg(dcp->dev, "active CRTC mode not listed yet, retrain deferred\n");
+			dcp_link_recovery_schedule(dcp);
+		} else if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
 				 ret);
@@ -2252,6 +2294,7 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	}
 
 	dcp_pop_depth(&ch->depth);
+	iomfb_channels_idle_wake(dcp);
 
 	cb = ch->callbacks[ch->depth];
 	cookie = ch->cookies[ch->depth];
@@ -3707,6 +3750,16 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return ret ? ret : drm_mode_equal(&crtc_state->mode, &fixed) ? 0 : -EINVAL;
 	}
 
+	/*
+	 * T6040 S2R: the external link is not back yet, and a mode set now
+	 * leaves the pipe off ("Modeset done, but pipe not enabled") and
+	 * fails.  dcp_poweron() and the flips leave the firmware alone until
+	 * then too; the hotplug worker sets the mode of the CRTC that is
+	 * still active once the link work is through (dcp_t6040_plug_done()).
+	 */
+	if (READ_ONCE(dcp->t6040_relinking))
+		return 0;
+
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_retained_external(dcp) &&
@@ -3910,6 +3963,41 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	return dcp_mode_settable(dcp, mode) || dcp_typec_follows_crtc(dcp);
 }
 
+
+/*
+ * Desktop 26.x external display replugged while the compositor kept its CRTC
+ * active: no atomic enable follows, and the firmware, which powered the pipe
+ * off with the unplug, swallows every swap.  Run the power-on and mode set the
+ * enable would have run, once.
+ *
+ * Only for a mode the display lists again: a mode whose link has to be proven
+ * first, such as the 180 Hz exception mode, is missing from the list for a
+ * while after the link comes back, and setting it then fails with no match.
+ * The hotplug that lists it sets it (dcp_retrain_active_crtc()), and
+ * userspace may pick another mode meanwhile.
+ */
+static void dcp_desktop_ext_repower(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				    struct drm_atomic_commit *commit)
+{
+	struct drm_crtc_state *cs;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    !dcp->desktop->ext_pipe_off || dcp->main_display ||
+	    READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected))
+		return;
+	cs = drm_atomic_get_new_crtc_state(commit, crtc);
+	if (!cs || !cs->active || !cs->mode.hdisplay)
+		return;
+	if (!dcp_mode_settable(dcp, &cs->mode)) {
+		dev_dbg(dcp->dev, "external pipe stays off until " DRM_MODE_FMT " is listed\n",
+			DRM_MODE_ARG(&cs->mode));
+		return;
+	}
+	dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
+	dcp_poweron(to_apple_crtc(crtc)->dcp);
+	dcp_crtc_atomic_modeset(crtc, commit);
+}
 
 static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout)
 {
@@ -4522,24 +4610,13 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
-	/*
-	 * Desktop 26.x external display replugged while the compositor kept
-	 * its CRTC active: no atomic enable follows, and the firmware, which
-	 * powered the pipe off with the unplug, swallows every swap.  Run the
-	 * power-on and mode set the enable would have run, once.
-	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    dcp->desktop->ext_pipe_off && !dcp->main_display &&
-	    !READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected)) {
-		struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(commit, crtc);
-
-		if (cs && cs->active && cs->mode.hdisplay) {
-			dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
-			dcp_poweron(pdev);
-			dcp_crtc_atomic_modeset(crtc, commit);
-		}
+	/* T6040 S2R: no swap until the external link work is through. */
+	if (READ_ONCE(dcp->t6040_relinking)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
 	}
+
+	dcp_desktop_ext_repower(dcp, crtc, commit);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_flush(dcp, crtc, commit);
 		return;

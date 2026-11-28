@@ -866,6 +866,7 @@ static void dcp_swap_complete_id(struct apple_dcp *dcp, u32 swap_id, bool shown)
 {
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, swap_id);
+	dcp_note_swap_complete(dcp, swap_id, shown);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_swap_complete_v27(dcp, swap_id, now, shown,
 				      dcp_peer_queue_completion))
@@ -2841,6 +2842,35 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 
 	return left ? 0 : -ETIMEDOUT;
 }
+
+/*
+ * The system's power state on the framebuffer: A473 with the first and the last
+ * transition flag and no result, as the firmware's own sleep sends it, 1 after
+ * the wake. The display's own power (dcp_poweron(), DPMS) sets no flag and only
+ * moves the soft power state.
+ */
+int DCP_FW_NAME(iomfb_system_power)(struct apple_dcp *dcp, bool on)
+{
+	struct DCP_FW_NAME(dcp_set_power_state_req) req =
+		dcp_power_state_req(on, DCP_POWER_TRANSITION_RESTARTABLE_SLEEP);
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+
+	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, complete_set_powerstate, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
 #endif
 
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
@@ -3216,6 +3246,19 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	/*
+	 * T6040 S2R: the unplug an external output reports when its link and pipe go down for
+	 * the sleep. The display is still there, and the link work after the wake brings it
+	 * back (see dcp_t6040_ext_link_down()).
+	 */
+	if (!(*connected) && READ_ONCE(dcp->t6040_relinking)) {
+		dcp_mode_invalidate(&dcp->mode_state);
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+	/* T6040 S2R: the display is back, which the link work waits for. */
+	if (*connected && READ_ONCE(dcp->t6040_plug_wait))
+		dcp_t6040_plug_done(dcp, true);
 	/* DCP lost a sink which is still attached, see dcp_typec_relink() */
 	if (!(*connected) && dcp_typec_relink(dcp)) {
 		dcp_mode_invalidate(&dcp->mode_state);

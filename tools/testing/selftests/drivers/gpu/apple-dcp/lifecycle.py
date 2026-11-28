@@ -856,7 +856,7 @@ struct apple_dcp {
  struct apple_connector *connector;
  struct { bool active; } split;
  bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
- bool typec_cable_connected, typec_crtc_off, external_native;
+ bool typec_cable_connected, typec_crtc_off, external_native, t6040_relinking;
  u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
 };
 struct platform_device { struct apple_dcp *data; };

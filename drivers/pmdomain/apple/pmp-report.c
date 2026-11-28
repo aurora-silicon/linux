@@ -111,7 +111,7 @@ struct apple_pmp_report {
 	struct device *ane_owner;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
-	/* Protects the request word, @shadow, @known and @defer. */
+	/* Protects the request word, @shadow, @known, @always_on and @defer. */
 	spinlock_t lock;
 	struct list_head list;
 	struct dentry *debugfs;
@@ -122,6 +122,11 @@ struct apple_pmp_report {
 	u64 known;
 	/* Bits whose drivers withdraw them at the sleep's commit, with the PMP still running. */
 	u64 commit_owned;
+	/*
+	 * Bits of the always-on entries: their blocks, the CPU clusters among them, may run up
+	 * to the sleep's commit, so a sleep doesn't wait for their acknowledgment to go.
+	 */
+	u64 always_on;
 	/*
 	 * Requests are held in memory until the PMP runs (@defer_requests), and
 	 * while it's stopped for a system sleep.
@@ -596,6 +601,8 @@ void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
 		rep->defer = true;
 		spin_unlock_irqrestore(&rep->lock, flags);
 
+		/* The boot CPU's own cluster stays acknowledged while it runs this. */
+		withdrawn &= ~rep->always_on;
 		if (withdrawn && readq_poll_timeout(rep->base + offs->actual, val,
 						    !(val & withdrawn), 100, 50000))
 			dev_warn(rep->dev, "PMP still acknowledges withdrawn requests %#llx (ack %#llx)\n",
@@ -3542,6 +3549,13 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		if (rep) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			rep->always_on |= BIT_ULL(ent->id);
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
 		ret = apple_pmp_report_entry_set_state(&ent->genpd, true);
 		if (ret && ent->native_owner)
 			goto err_free;
