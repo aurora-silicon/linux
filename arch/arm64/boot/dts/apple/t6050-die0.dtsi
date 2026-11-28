@@ -39,7 +39,9 @@
 
 	wdt: watchdog@28836c000 {
 		compatible = "apple,t6050-wdt", "apple,t8103-wdt";
-		reg = <0x2 0x8836c000 0x0 0x4000>;
+		reg = <0x2 0x8836c000 0x0 0x4000>,
+		      <0x2 0x8833002c 0x0 0x4>;
+		reg-names = "wdt", "reconfig";
 		clocks = <&clkref>;
 		interrupts = <AIC_IRQ 0 721 IRQ_TYPE_LEVEL_HIGH>;
 	};
@@ -292,6 +294,17 @@
 			compatible = "apple,t6050-clpc", "apple,t6041-clpc";
 			reg = <1>;
 			apple,smc = <&smc>;
+			/*
+			 * T6050 GPU busy-share memory-state ladder (common across
+			 * M5 Pro/Max/Ultra die 0): DCS 1, 2, 4, 6 and fabric
+			 * 0, 0, 0, 2 at 160, 500 and 800 permille. The top
+			 * column matches apple_clpc_hw_t6050's DCS 6 / fabric 2
+			 * GPU floor; lower columns keep light compositing below
+			 * the CPU floor while long/saturated bursts lift to the
+			 * top column. Validated on J716c (16-inch M5 Max).
+			 */
+			apple,gpu-busy-memory-states = <1 2 4 6>, <0 0 0 2>;
+			apple,gpu-busy-permille = <160 500 800>;
 		};
 	};
 
@@ -831,6 +844,7 @@
 		 */
 		aop_als: als {
 			compatible = "apple,t6050-aop-als", "apple,aop-als";
+			firmware-name = "apple/aop-als-cal.bin";
 		};
 
 		/* The firmware's "las" service: the lid angle, as on T6020 and T8112. */
@@ -998,6 +1012,7 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x178 4>;
 		label = "atc2_usb_aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		status = "disabled";
@@ -1029,6 +1044,7 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x190 4>;
 		label = "atc3_usb_aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 	};

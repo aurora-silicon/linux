@@ -8,6 +8,7 @@ on:
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
       - 'drivers/pmdomain/apple/pmp-report.c'
+      - 'include/linux/apple-sep-hdcp.h'
       - 'include/uapi/linux/apple-sep.h'
       - 'tools/aurora-sep/**'
       - 'Kconfig'
@@ -17,6 +18,13 @@ on:
       - 'include/linux/phy/apple-atc.h'
       - 'scripts/ci/apple-dwc3-atc-compile.sh'
       - '.github/workflows/sep-source.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sep-source-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   source:
@@ -29,6 +37,7 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             drivers/soc/apple/**
+            include/linux/apple-sep-hdcp.h
             include/uapi/linux/apple-sep.h
             tools/aurora-sep/**
       - name: Check biometric ioctl ABI sizes
@@ -52,6 +61,9 @@ jobs:
           python3 -O -m unittest tools/aurora-sep/tests/test_store_open_errors.py -v
           python3 -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
           python3 -O -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
+      - name: Test capture wiping on rejected reads
+        run: |
+          python3 -I tools/aurora-sep/tests/capture-error-wipe/run.py
       - name: Test selected-policy diagnostics
         run: |
           python3 -m unittest tools/aurora-sep/tests/test_diag_policy.py tools/aurora-sep/tests/test_diag_sensor.py -v
@@ -64,7 +76,15 @@ jobs:
           python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
           python3 -m unittest tools/aurora-sep/tests/test_policy_window.py -v
           python3 -m unittest tools/aurora-sep/tests/test_log_ratelimit.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_key_context_cleanup.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_hdcp_client.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_sep_writes_always_on.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_boot_locks.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_kernel_log_anchor.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_collect_handover.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_touchid_package.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_root_staging.py -v
 
   rust-build:
     runs-on: ubuntu-24.04
@@ -75,7 +95,13 @@ jobs:
           fetch-depth: 1
       - name: Install kernel build dependencies
         run: |
-          sudo apt-get update
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
           sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           rustup component add rust-src
@@ -106,7 +132,13 @@ jobs:
           fetch-depth: 1
       - name: Install kernel build and QEMU dependencies
         run: |
-          sudo apt-get update
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
           sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl qemu-system-arm
           rustup component add rust-src
@@ -123,6 +155,15 @@ jobs:
             --make_options LLVM=1 \
             --kunitconfig=drivers/soc/apple/sep.kunitconfig \
             --jobs="$(nproc)" --timeout=900 'apple_sep*'
+      - name: Run the Apple AOP KUnit suites on arm64 QEMU
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --build_dir=.kunit-aop \
+            --make_options LLVM=1 \
+            --kunitconfig=drivers/soc/apple/aop.kunitconfig \
+            --jobs="$(nproc)" --timeout=900 'apple_aop*'
 
   dwc3-atc-compile:
     name: DWC3/ATC ${{ matrix.profile }}

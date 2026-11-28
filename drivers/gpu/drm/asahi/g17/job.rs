@@ -4,7 +4,7 @@
 
 use super::{command::Validated, completion::Completion, context::Context};
 use crate::driver::AsahiDrmDevice;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
     cpu::CpuId,
@@ -37,6 +37,13 @@ pub(crate) enum Engine {
 }
 
 impl Engine {
+    pub(crate) fn of(command: &Validated) -> Self {
+        match command {
+            Validated::Render { .. } => Self::Render,
+            Validated::Compute { .. } => Self::Compute,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Render => 0,
@@ -128,6 +135,9 @@ pub(crate) struct Packet {
     cancelled: AtomicBool,
     early: AtomicI32,
     backlog: AtomicBool,
+    /// When the job's watchdog allowance ends (host ns, [`super::timeout::Allowance::end`]):
+    /// zero under the default allowance, `u64::MAX` for a longer one not yet placed.
+    allowance_end: AtomicU64,
 }
 
 impl Packet {
@@ -160,16 +170,20 @@ impl Packet {
                 cancelled: AtomicBool::new(false),
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
+                allowance_end: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
     }
 
+    /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
+    /// ([`super::timeout::Head::excused`]).
+    pub(crate) fn within_allowance(&self, now: u64) -> bool {
+        now < self.allowance_end.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn engine(&self) -> Engine {
-        match &self.command {
-            Validated::Render { .. } => Engine::Render,
-            Validated::Compute { .. } => Engine::Compute,
-        }
+        Engine::of(&self.command)
     }
 
     /// Replay holds the device mutex. Its original inputs were satisfied before
@@ -260,6 +274,7 @@ impl Packet {
     }
     pub(crate) fn request_cancel(&self) -> bool {
         self.cancelled.store(true, Ordering::Release);
+        self.completion.clear_source_published();
         self.publication
             .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -313,7 +328,7 @@ pub(crate) trait Backend: Send + Sync {
     /// The device accepts command submission (an M5 GPU before its queues take submission
     /// does not).
     fn supports_submission(&self) -> bool { true }
-    /// Whether this backend's scheduler workers run in their queue creator's cluster (M5).
+    /// Whether this backend's scheduler workers run in their queue creator's cluster.
     fn creator_cluster_scheduling(&self) -> bool { false }
     /// Whether to keep compute input completion waits and wait on the host for other-engine
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
@@ -348,15 +363,24 @@ pub(crate) trait Backend: Send + Sync {
     /// packet lacks. Called again once it signals.
     fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence>;
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence>;
-    fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
+    /// `again`: the watchdog already gave up on `packet` once while it was published, and
+    /// settling it then did not end it.
+    fn timed_out(&self, packet: Arc<Packet>, again: bool) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);
-    /// Transfer a timeout to an outstanding off-lock graph transaction, if any.
-    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool;
+    /// Transfer a timeout to an outstanding off-lock graph transaction, if any, or decide it
+    /// against other VMs' older work ([`super::timeout::decide`]). `renewals` and `excused`
+    /// count the job's earlier [`super::timeout::Decision::Defer`] and
+    /// [`super::timeout::Decision::Excuse`] results; the job is renewed on either.
+    /// [`super::timeout::Decision::Retire`] only once its completion has been signalled.
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> super::timeout::Decision;
     /// A long job of another queue is running beside `packet`.
     fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool { false }
     /// A published job's deadline may be renewed while other work retires
     /// ([`super::timeout::renew_shared`]).
     fn renews_shared(&self) -> bool { true }
+    /// The watchdog stopped renewing `packet`: it is failed as timed out next, if it is published.
+    fn gave_up(&self, _packet: &Arc<Packet>, _why: &super::timeout::GaveUp) {}
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
     fn count_backlog(&self, packet: &Packet);
@@ -365,14 +389,38 @@ pub(crate) trait Backend: Send + Sync {
 struct Job<B: Backend> {
     backend: Arc<B>,
     packet: Arc<Packet>,
+    /// The watchdog allowance of the job ([`super::timeout::Allowance`]), in ms.
+    allowance_ms: u32,
 }
 
 struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
+    /// Polls excused behind other VMs' live work inside its allowance
+    /// ([`super::timeout::Decision::Excuse`]).
+    excused: u32,
     execution_renewals: u8,
     shared_renewals: u8,
+    allowance: super::timeout::Allowance,
+    /// Whether the watchdog already expired the job while it was published.
+    published_expiry: PublishedExpiry,
     packet: Arc<Packet>,
+}
+
+/// Whether a job's watchdog already expired while it was published: then settling it did not
+/// end it, and the next expiry is passed to [`Backend::timed_out`] as `again`.
+#[derive(Default)]
+struct PublishedExpiry(bool);
+
+impl PublishedExpiry {
+    /// An expiry of a job that was `published` before [`Backend::timed_out`] saw it; returns
+    /// `again` for that call. A publication racing the call is read as unpublished, so it gets
+    /// one more expiry of its own.
+    fn expire(&mut self, published: bool) -> bool {
+        let again = self.0;
+        self.0 |= published;
+        again
+    }
 }
 
 impl<B: Backend> Drop for Job<B> {
@@ -395,14 +443,30 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         Timeout {
             backend: self.backend.clone(),
             victim_renewals: 0,
+            excused: 0,
             execution_renewals: 0,
             shared_renewals: 0,
+            allowance: super::timeout::Allowance::new(self.allowance_ms),
+            published_expiry: PublishedExpiry::default(),
             packet: self.packet.clone(),
         }
     }
 
     fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
         if finished || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        // Within the allowance its queue asked for. Past it, the deferrals below still apply;
+        // the shared renewals run alongside an allowance rather than after it.
+        let placing = job.allowance.placing_after_wait(job.packet.is_published());
+        let within = job.allowance.renew(job.packet.is_published(), super::now_ns());
+        // Other VMs' watchdogs read the end to excuse work waiting behind this one.
+        if let Some(end) = job.allowance.end() {
+            job.packet.allowance_end.store(end, Ordering::Relaxed);
+        }
+        if within {
+            super::timeout::count_allowance_poll(job.allowance.asked() && !placing,
+                &mut job.shared_renewals);
             return true;
         }
         if super::timeout::renew_execution(
@@ -412,17 +476,35 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         }
         // Other work retiring means the GPU is shared, not hung. So does another long job
         // running beside a long job, though neither retires until it ends.
-        let shared = job.backend.renews_shared()
-            && (super::timeout::retiring(super::recovery::since_retired(super::now_ns()))
+        let renews_shared = job.backend.renews_shared();
+        let since_retired = super::recovery::since_retired(super::now_ns());
+        let shared = renews_shared
+            && (super::timeout::retiring(since_retired)
                 || (job.packet.command.long_job() && job.backend.long_job_beside(&job.packet)));
         if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
         }
-        let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
-        if deferred {
-            job.victim_renewals = job.victim_renewals.saturating_add(1);
+        match job.backend.defer_timeout(&job.packet, job.victim_renewals, job.excused) {
+            super::timeout::Decision::Defer => {
+                job.victim_renewals = job.victim_renewals.saturating_add(1);
+                true
+            }
+            super::timeout::Decision::Excuse => {
+                job.excused = job.excused.saturating_add(1);
+                true
+            }
+            // The backend retired the job on its completion record: its fence has signalled.
+            super::timeout::Decision::Retire => true,
+            decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
+                // The sharing inputs are the ones the renewal above was decided on.
+                job.backend.gave_up(&job.packet, &super::timeout::GaveUp::new(
+                    &job.allowance, super::now_ns(), job.packet.command.long_job(),
+                    job.execution_renewals, renews_shared, job.shared_renewals, since_retired,
+                    job.victim_renewals, job.excused, decision,
+                ));
+                false
+            }
         }
-        deferred
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {
@@ -443,7 +525,8 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         // its parent callback intact while the driver settles the exact owner;
         // reinsertion also handles completion racing with timeout observation.
         if !finished {
-            job.backend.timed_out(job.packet.clone());
+            let again = job.published_expiry.expire(job.packet.is_published());
+            job.backend.timed_out(job.packet.clone(), again);
         }
         sched::Status::NoHang
     }
@@ -457,13 +540,20 @@ pub(crate) struct Scheduler<B: Backend> {
     entity: sched::Entity<Job<B>>,
     _scheduler: sched::Scheduler<Job<B>>,
     backend: Arc<B>,
+    allowance_ms: u32,
 }
 
 #[derive(Clone)]
 pub(crate) struct Fences {
     pub(crate) ready: Fence,
+    pub(crate) scheduled: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    /// Pending host-timestamp writer completion fences inherited through
+    /// timestamp-free publication chaining. `None` for commands that write their
+    /// own timestamps (covered by `completed`) or have no pending timestamp
+    /// ancestors.
+    pub(crate) timestamp_waits: Option<Arc<KVec<Fence>>>,
     pub(crate) owner: Arc<Completion>,
 }
 
@@ -474,6 +564,13 @@ impl super::dependency::Retention for Fences {
 }
 
 impl Fences {
+    /// The command has an ordered host publication, or writes host timestamps and so is ready
+    /// only once it has completed and the host has written them (see `Scheduler::enqueue`).
+    /// Only such a command can be a same-engine predecessor or host wait of a later one.
+    pub(crate) fn publishes(&self) -> bool {
+        self.publication.is_some() || self.ready.raw() == self.completed.raw()
+    }
+
     /// Scheduler::enqueue always supplies our explicit completion fence here.
     /// It has no polling callback, so pending frontier checks need no lock.
     pub(crate) fn status(&self) -> i32 {
@@ -486,7 +583,11 @@ impl Fences {
 }
 
 impl<B: Backend> Scheduler<B> {
-    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
+    /// `allowance_ms`: the watchdog allowance of each job ([`super::timeout::allowance_ms`]);
+    /// the watchdog still polls every [`TIMEOUT_MS`].
+    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine, allowance_ms: u32)
+        -> Result<Self>
+    {
         let (credits, name) = match engine {
             Engine::Render => (
                 RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
@@ -495,16 +596,21 @@ impl<B: Backend> Scheduler<B> {
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let device = dev.as_ref().as_ref();
-        let submit = if backend.creator_cluster_scheduling() {
+        // Run drm_sched's submit worker at WQ_HIGHPRI so host-waited jobs (such as
+        // query-access computes unblocked by completion events) are not delayed in
+        // CFS behind busy game/render threads.
+        let queue = workqueue::OwnedQueue::new_ordered_highpri_reclaim(name)?;
+        if backend.creator_cluster_scheduling() {
             // The run and free work stays in the creating CPU's cluster, as the event work
             // follows the submitter, instead of wherever an unbound worker last ran.
-            let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
-            queue.restrict(Cpumask::cluster_of(CpuId::current()))?;
-            Some(queue)
-        } else {
-            // drm_sched allocates its own ordered reclaim-safe queue.
-            None
-        };
+            let cluster = Cpumask::cluster_of(CpuId::current());
+            // Without a cpu-map in the device tree each CPU is its own cluster: the queue then
+            // stays unrestricted rather than tied to the one CPU that created it.
+            if cluster.weight() > 1 {
+                queue.restrict(cluster)?;
+            }
+        }
+        let submit = Some(queue);
         let scheduler = sched::Scheduler::new_with_queues(
             device, 1, credits, 0, TIMEOUT_MS, name, submit, Some(backend.fence_queue()),
         )?;
@@ -513,6 +619,7 @@ impl<B: Backend> Scheduler<B> {
             entity,
             _scheduler: scheduler,
             backend,
+            allowance_ms,
         })
     }
 
@@ -523,22 +630,22 @@ impl<B: Backend> Scheduler<B> {
         early: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
-        super::trace::schedule(&packet, 0, dependencies.len() as i32);
+        let dependency_count = dependencies.len();
+        super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
-        // Only commands which actually write timestamps become host-prefix
-        // producers. Ordinary consumers retain the scheduled ready fence and
-        // their existing firmware dependency path for cross-engine overlap.
-        let host_publication = if host_timestamps {
-            packet.completion.publication()
-        } else {
-            None
-        };
+        // Expose any ordered publication so later commands that overlap execution
+        // with this command still order their completion and error propagation.
+        let host_publication = packet.completion.publication();
+        if self.allowance_ms > super::timeout::DEFAULT_ALLOWANCE_MS {
+            packet.allowance_end.store(u64::MAX, Ordering::Relaxed);
+        }
         let mut job = self.entity.new_job(
             1,
             Job {
                 backend: self.backend.clone(),
                 packet: packet.clone(),
+                allowance_ms: self.allowance_ms,
             },
         )?;
         if dependencies.len() > MERGED_DEPENDENCIES {
@@ -553,15 +660,24 @@ impl<B: Backend> Scheduler<B> {
         if let Some(publication) = publication {
             publication.activate();
         }
+        let scheduled = job.fences().scheduled();
         let ready = if host_timestamps {
             completed.clone()
         } else {
-            job.fences().scheduled()
+            scheduled.clone()
         };
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         let inline = early && self.backend.try_early(&packet);
-        super::trace::schedule(&packet, if inline { 1 } else { 2 }, 0);
+        // Why a command was queued instead of published inline (phase 2).
+        let queued_reason = if dependency_count != 0 {
+            2
+        } else if early {
+            3
+        } else {
+            0
+        };
+        super::trace::schedule(&packet, if inline { 1 } else { 2 }, queued_reason);
         if !inline {
             if packet.completion.needs_source_ready() {
                 packet.completion.set_source_ready(ready.clone());
@@ -569,6 +685,32 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences {
+            ready,
+            scheduled,
+            completed,
+            publication: host_publication,
+            timestamp_waits: None,
+            owner: packet.completion.clone(),
+        })
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_job_expiry)]
+mod tests {
+    use super::PublishedExpiry;
+
+    #[test]
+    fn only_an_expiry_after_a_published_one_is_again() {
+        let mut expiry = PublishedExpiry::default();
+        // Expiries before publication (capacity or graph waits) are never again.
+        assert!(!expiry.expire(false));
+        assert!(!expiry.expire(false));
+        // The first published expiry is the command's own; every later one is again.
+        assert!(!expiry.expire(true));
+        assert!(expiry.expire(true));
+        assert!(expiry.expire(true));
+        // Published at the read stays published: a later unpublished read cannot reset it.
+        assert!(expiry.expire(false));
     }
 }

@@ -81,27 +81,37 @@ MODULE_PARM_DESC(autosuspend_ms,
 		 "Power the ANE off this many ms after its last use (default 1500; 0 = keep it powered while the driver is bound)");
 
 /*
- * 1 (default): BO_INIT maps a buffer object with one iommu_map_sg(), so
+ * 1 (default): a buffer object goes into the DART (at the first SUBMIT
+ * that names it, see ane_dart_confine()) with one iommu_map_sg(), so
  * apple-dart invalidates the TLB of each DART once for each BO. 0: one
  * iommu_map() and one TLB invalidate on each DART for each page (a
  * 458 MB buffer: 27,955 pages x 3 DARTs = 83,865 invalidates). Read
- * once for each BO_INIT; BOs mapped either way unmap the same way.
+ * at each map; BOs mapped either way unmap the same way.
  */
 static bool map_batch = true;
 module_param(map_batch, bool, 0644);
 MODULE_PARM_DESC(map_batch,
-		 "BO_INIT DART mapping: 1 = one TLB sync for each buffer object (default); 0 = one TLB sync for each page");
+		 "Buffer object DART mapping: 1 = one TLB sync for each buffer object (default); 0 = one TLB sync for each page");
 
 #define CMD_BUF_BDX 0
 #define KRN_BUF_BDX 1
 
+/*
+ * A BO owns its IOVA range (mm, iova) from BO_INIT to its free, but its
+ * pages are in the DART only while @mapped: from the first SUBMIT that
+ * names it until a SUBMIT that does not (see ane_dart_confine()).
+ */
 struct ane_bo {
 	struct drm_gem_object base;
 	struct list_head node;
+	struct list_head mapped_node;
 	struct drm_mm_node *mm;
 	u32 npages;
 	struct page **pages;
 	dma_addr_t iova;
+	u64 job_seq;
+	int prot;
+	bool mapped;
 };
 
 #define to_bo(gem) (container_of(gem, struct ane_bo, base))
@@ -114,6 +124,33 @@ static struct ane_bo *bo_lookup(struct drm_file *file, u32 handle)
 		return NULL;
 	return to_bo(gem);
 }
+
+/*
+ * The IOVA span of a buffer object. Computed in 64 bits: the reservation
+ * and the map must cover the same range for any page count.
+ */
+VISIBLE_IF_KUNIT u64 ane_bo_iova_size(u32 npages, unsigned int shift)
+{
+	return (u64)npages << shift;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_bo_iova_size);
+
+/*
+ * A buffer object must fit the device address range the allocator
+ * manages, or it can never be mapped. Refusing it before any page is
+ * allocated also keeps the page count within the u32 that the map
+ * paths use.
+ */
+VISIBLE_IF_KUNIT int ane_bo_check_size(u64 size, u64 iova_span)
+{
+	if (!size)
+		return -EINVAL;
+	if (size > iova_span || size > U64_MAX - (PAGE_SIZE - 1) ||
+	    round_up(size, PAGE_SIZE) > iova_span)
+		return -E2BIG;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_bo_check_size);
 
 /* Unmap every valid PTE in [start, end) and return how many there were. */
 static unsigned long ane_iommu_clear_range(struct ane_device *ane, u64 start,
@@ -145,7 +182,7 @@ static int ane_iommu_map_each(struct ane_device *ane, struct ane_bo *bo,
 	int err = 0;
 
 	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
+		dma_addr_t iova = bo->iova + ((u64)i << ane->shift);
 		bool healed = false;
 
 retry:
@@ -168,12 +205,12 @@ retry:
 
 				unmapped = iommu_unmap(ane->domain,
 						       bo->iova +
-						       (i << ane->shift),
+						       ((u64)i << ane->shift),
 						       1UL << ane->shift);
 				if (unmapped != 1UL << ane->shift)
 					dev_err(ane->dev,
 						"rollback unmap short at %#llx: %zu\n",
-						bo->iova + (i << ane->shift),
+						bo->iova + ((u64)i << ane->shift),
 						unmapped);
 			}
 			break;
@@ -191,7 +228,7 @@ retry:
 static int ane_iommu_map_batch(struct ane_device *ane, struct ane_bo *bo,
 			       int prot)
 {
-	size_t size = (size_t)bo->npages << ane->shift;
+	size_t size = ane_bo_iova_size(bo->npages, ane->shift);
 	struct sg_table sgt;
 	unsigned long strays;
 	ssize_t mapped;
@@ -240,54 +277,111 @@ static int ane_iommu_map_batch(struct ane_device *ane, struct ane_bo *bo,
  * setup, invalidation and fault IRQs are all provider-owned);
  * iommu_unmap() flushes through the provider before returning, so pages
  * may be reclaimed once it succeeds.
+ *
+ * BO_INIT only reserves the BO's IOVA range. The pages go into the DART
+ * when a SUBMIT names the BO (ane_dart_confine()), so the range stays the
+ * BO's for its whole life while its PTEs come and go.
  */
-static int ane_iommu_map_pages(struct ane_device *ane, struct ane_bo *bo)
+static int ane_iommu_reserve(struct ane_device *ane, struct ane_bo *bo)
 {
-	int prot = IOMMU_READ | IOMMU_WRITE;
 	int err;
 
 	lockdep_assert_held(&ane->engine_lock);
 	if (bo->mm)
 		return -EBUSY;
 
+	bo->prot = IOMMU_READ | IOMMU_WRITE;
 	if (map_mode & 1)
-		prot |= IOMMU_CACHE;
+		bo->prot |= IOMMU_CACHE;
 
 	bo->mm = kzalloc_obj(*bo->mm);
 	if (!bo->mm)
 		return -ENOMEM;
 
 	mutex_lock(&ane->iommu_lock);
-
 	/* reserve area from ANE address space */
 	err = drm_mm_insert_node_generic(&ane->mm, bo->mm,
-					 bo->npages << ane->shift,
-					 1UL << ane->shift, 0, 0);
+					 ane_bo_iova_size(bo->npages, ane->shift),
+					 1UL << ane->shift, ANE_MM_BO_UNMAPPED,
+					 0);
+	mutex_unlock(&ane->iommu_lock);
 	if (err < 0) {
 		dev_err(ane->dev, "out of ANE space: %d\n", err);
-		goto unlock;
+		kfree(bo->mm);
+		bo->mm = NULL;
+		return err;
 	}
 
 	bo->iova = bo->mm->start;
-
-	if (READ_ONCE(map_batch))
-		err = ane_iommu_map_batch(ane, bo, prot);
-	else
-		err = ane_iommu_map_each(ane, bo, prot);
-	if (err < 0) {
-		drm_mm_remove_node(bo->mm);
-		bo->iova = 0;
-	}
-
-unlock:
-	mutex_unlock(&ane->iommu_lock);
-	if (err < 0) {
-		kfree(bo->mm);
-		bo->mm = NULL;
-	}
-	return err;
+	return 0;
 }
 
+/*
+ * Put the pages of a BO with a reserved range into the DART. A fault
+ * drain may have put a scratch page into the range of a BO that is not in
+ * the DART (ane_dart_drain_fault()); the scratch pages are released when
+ * the faulting job completes or at the recovery after it, both before any
+ * later SUBMIT gets here, so such a page is never found here. Refuse it
+ * anyway: mapping over it would take the scratch PTE for a stray and
+ * clear it, and the scratch release would then unmap the BO's page.
+ */
+static int ane_bo_dart_map(struct ane_device *ane, struct ane_bo *bo)
+{
+	int err;
+
+	lockdep_assert_held(&ane->engine_lock);
+	if (bo->mapped)
+		return 0;
+	if (!bo->mm)
+		return -EINVAL;
+	if (WARN_ON_ONCE(ane_dart_scratch_in(ane, bo->mm)))
+		return -EBUSY;
+
+	mutex_lock(&ane->iommu_lock);
+	if (READ_ONCE(map_batch))
+		err = ane_iommu_map_batch(ane, bo, bo->prot);
+	else
+		err = ane_iommu_map_each(ane, bo, bo->prot);
+	if (!err)
+		bo->mm->color = ANE_MM_BO_MAPPED;
+	mutex_unlock(&ane->iommu_lock);
+	if (err < 0)
+		return err;
+
+	bo->mapped = true;
+	list_add_tail(&bo->mapped_node, &ane->mapped_list);
+	return 0;
+}
+
+/*
+ * Take the pages of a BO out of the DART and keep its range. A mapped BO
+ * has a PTE on every page, so one range unmap (one TLB flush per DART)
+ * takes them all; a short unmap is cleared page by page.
+ */
+static void ane_bo_dart_unmap(struct ane_device *ane, struct ane_bo *bo)
+{
+	size_t size = ane_bo_iova_size(bo->npages, ane->shift);
+	size_t unmapped;
+
+	lockdep_assert_held(&ane->engine_lock);
+	if (!bo->mapped)
+		return;
+
+	mutex_lock(&ane->iommu_lock);
+	unmapped = iommu_unmap(ane->domain, bo->iova, size);
+	if (unmapped != size) {
+		dev_err(ane->dev, "unmap short at %#llx+%#zx: %zu\n",
+			bo->iova, size, unmapped);
+		ane_iommu_clear_range(ane, bo->iova, bo->iova + size);
+	}
+	bo->mm->color = ANE_MM_BO_UNMAPPED;
+	mutex_unlock(&ane->iommu_lock);
+
+	list_del_init(&bo->mapped_node);
+	bo->mapped = false;
+}
+
+/* Unmap a BO and give its range back to the allocator. */
 static void ane_iommu_unmap_pages(struct ane_device *ane, struct ane_bo *bo)
 {
 	struct drm_mm_node *mm = bo->mm;
@@ -298,22 +392,52 @@ static void ane_iommu_unmap_pages(struct ane_device *ane, struct ane_bo *bo)
 		return;
 
 	list_del_init(&bo->node);
+	ane_bo_dart_unmap(ane, bo);
+	/* ane_gem_free_object() preserves a range that holds a drain page. */
+	WARN_ON_ONCE(ane_dart_scratch_in(ane, mm));
 	mutex_lock(&ane->iommu_lock);
-	for (u32 i = 0; i < bo->npages; i++) {
-		dma_addr_t iova = bo->iova + (i << ane->shift);
-		size_t unmapped = iommu_unmap(ane->domain, iova,
-					      1UL << ane->shift);
-
-		if (unmapped != 1UL << ane->shift)
-			dev_err(ane->dev, "unmap short at %#llx: %zu\n",
-				iova, unmapped);
-	}
 	drm_mm_remove_node(mm);
 	bo->mm = NULL;
 	bo->iova = 0;
 	mutex_unlock(&ane->iommu_lock);
 
 	kfree(mm);
+}
+
+/*
+ * All files share one DART domain, and the task descriptors of a job
+ * address memory as a tile base plus an offset the kernel cannot check.
+ * So the DART is the bound: before the engine starts, every BO that is
+ * not part of this job leaves the DART and every BO of the job is put
+ * in. A descriptor that leaves the job's buffers then lands in a hole
+ * and faults (see ane_dart_drain_fault()) instead of reaching another
+ * file's buffer. Jobs run one at a time under engine_lock, and a job's
+ * lookup references keep its BOs alive until it completed, so the set
+ * cannot change under a running job. A BO that the next job names again
+ * stays mapped, so repeated jobs on the same buffers cost no remapping.
+ */
+static int ane_dart_confine(struct ane_device *ane, struct ane_bo **job,
+			    int count)
+{
+	struct ane_bo *bo, *tmp;
+	u64 seq;
+	int err;
+
+	lockdep_assert_held(&ane->engine_lock);
+	seq = ++ane->job_seq;
+	for (int i = 0; i < count; i++)
+		job[i]->job_seq = seq;
+
+	list_for_each_entry_safe(bo, tmp, &ane->mapped_list, mapped_node)
+		if (bo->job_seq != seq)
+			ane_bo_dart_unmap(ane, bo);
+
+	for (int i = 0; i < count; i++) {
+		err = ane_bo_dart_map(ane, job[i]);
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
 /*
@@ -330,12 +454,17 @@ struct ane_preserved {
 	struct drm_mm_node *mm;
 	struct page **pages;
 	u32 npages;
+	/* The BO's pages were in the DART, not only drain pages. */
+	bool mapped;
 };
 
 static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 {
 	struct ane_preserved *p;
 
+	mutex_lock(&ane->iommu_lock);
+	bo->mm->color = ANE_MM_PRESERVED;
+	mutex_unlock(&ane->iommu_lock);
 	p = kzalloc_obj(*p);
 	if (!p) {
 		/* Fail closed the old way: the node stays inserted and the
@@ -349,6 +478,7 @@ static void ane_preserve_bo(struct ane_device *ane, struct ane_bo *bo)
 	p->mm = bo->mm;
 	p->pages = bo->pages;
 	p->npages = bo->npages;
+	p->mapped = bo->mapped;
 	list_add_tail(&p->list, &ane->preserved_list);
 	bo->mm = NULL;
 	bo->pages = NULL;
@@ -367,16 +497,17 @@ void ane_reclaim_preserved(struct ane_device *ane)
 		u64 iova = p->mm->start;
 
 		mutex_lock(&ane->iommu_lock);
-		for (u32 i = 0; i < p->npages; i++) {
+		/* Its drain pages went with the scratch release above. */
+		for (u32 i = 0; p->mapped && i < p->npages; i++) {
 			size_t unmapped;
 
 			unmapped = iommu_unmap(ane->domain,
-					       iova + (i << ane->shift),
+					       iova + ((u64)i << ane->shift),
 					       1UL << ane->shift);
 			if (unmapped != 1UL << ane->shift)
 				dev_err(ane->dev,
 					"preserved unmap short at %#llx: %zu\n",
-					iova + (i << ane->shift), unmapped);
+					iova + ((u64)i << ane->shift), unmapped);
 		}
 		drm_mm_remove_node(p->mm);
 		mutex_unlock(&ane->iommu_lock);
@@ -432,18 +563,28 @@ static void ane_gem_free_object(struct drm_gem_object *gem)
 
 	mutex_lock(&ane->engine_lock);
 	if (bo->mm) {
-		if (atomic_read(&ane->wedged)) {
+		/*
+		 * A drain page in the range of a BO that is not in the DART
+		 * stays until the recovery that follows the wedge, and the
+		 * range must stay reserved until then.
+		 */
+		if ((atomic_read(&ane->wedged) && bo->mapped) ||
+		    ane_dart_scratch_in(ane, bo->mm)) {
 			/* Fail closed: keep the mapping and the pages so no
 			 * IOVA is torn down or page reused underneath active
 			 * DMA. The range's node stays reserved and tracked
 			 * until recovery quiesces the engine and reclaims
 			 * it, so no later BO_INIT can map over these PTEs
 			 * (a leaked-but-forgotten mapping turns into
-			 * dart_init_pte -EEXIST WARNs).
+			 * dart_init_pte -EEXIST WARNs). A BO that is not in
+			 * the DART was not part of the job that wedged and
+			 * the engine cannot reach it, so it is freed below.
 			 */
 			dev_err(ane->dev, "wedged: preserving bo mapping\n");
 			list_del_init(&bo->node);
+			list_del_init(&bo->mapped_node);
 			ane_preserve_bo(ane, bo);
+			bo->mapped = false;
 		} else {
 			ane_iommu_unmap_pages(ane, bo);
 		}
@@ -488,13 +629,17 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 	struct ane_bo *bo;
 	int err;
 
-	if (args->pad || !args->size)
+	if (args->pad)
 		return -EINVAL;
+	err = ane_bo_check_size(args->size, ane->iova_span);
+	if (err)
+		return err;
 
 	bo = kzalloc_obj(*bo);
 	if (!bo)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&bo->node);
+	INIT_LIST_HEAD(&bo->mapped_node);
 
 	gem = &bo->base;
 	gem->funcs = &ane_gem_object_funcs;
@@ -529,7 +674,7 @@ static int ane_bo_init(struct drm_device *drm, void *data,
 		goto unlock_put;
 	}
 
-	err = ane_iommu_map_pages(ane, bo);
+	err = ane_iommu_reserve(ane, bo);
 	if (err < 0)
 		goto unlock_put;
 	list_add_tail(&bo->node, &ane->bo_list);
@@ -609,9 +754,11 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	struct drm_ane_submit *args = data;
 	struct drm_gem_object *gem[DRM_ANE_TILE_COUNT] = { 0 };
 	struct drm_gem_object *btsp = NULL;
+	struct ane_bo *job[DRM_ANE_TILE_COUNT + 1];
 	struct ane_bo *bo;
 	struct ane_request req;
 	u64 stats_idx = 0;
+	int njob = 0;
 	int err;
 
 	memset(&req, 0, sizeof(req));
@@ -677,8 +824,14 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	/*
 	 * Lookup references are held across the synchronous execute and
 	 * dropped only after ane_tm_execute() confirmed completion, so a
-	 * concurrent BO_FREE cannot unmap a buffer the engine reads.
+	 * concurrent BO_FREE cannot unmap a buffer the engine reads. The
+	 * same references are the job's DART set (ane_dart_confine()).
 	 */
+	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++)
+		if (gem[bdx])
+			job[njob++] = to_bo(gem[bdx]);
+	job[njob++] = to_bo(btsp);
+
 	mutex_lock(&ane->engine_lock);
 	if (ane->removed) {
 		err = -ENODEV;
@@ -687,6 +840,12 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	if (atomic_read(&ane->wedged)) {
 		dev_err_ratelimited(ane->dev, "wedged: refusing submit\n");
 		err = -ECANCELED;
+		goto unlock;
+	}
+
+	err = ane_dart_confine(ane, job, njob);
+	if (err) {
+		dev_err_ratelimited(ane->dev, "job buffers not mapped: %d\n", err);
 		goto unlock;
 	}
 
@@ -1044,7 +1203,8 @@ static int ane_iommu_domain_init(struct ane_device *ane)
 		return -EINVAL;
 	ane->domain = domain;
 	ane->shift = PAGE_SHIFT;
-	drm_mm_init(&ane->mm, min_iova, limit - min_iova);
+	ane->iova_span = limit - min_iova;
+	drm_mm_init(&ane->mm, min_iova, ane->iova_span);
 
 	return 0;
 }
@@ -1256,6 +1416,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 	mutex_init(&ane->engine_lock);
 	mutex_init(&ane->pm_lock);
 	INIT_LIST_HEAD(&ane->bo_list);
+	INIT_LIST_HEAD(&ane->mapped_list);
 	INIT_LIST_HEAD(&ane->preserved_list);
 	err = ane_perf_init(ane, soc->high_level);
 	if (err < 0)
@@ -1354,9 +1515,10 @@ static void ane_platform_remove(struct platform_device *pdev)
 		return;
 	}
 
+	/* Drain pages first: they may sit in the range of a listed BO. */
+	ane_reclaim_preserved(ane);
 	list_for_each_entry_safe(bo, tmp, &ane->bo_list, node)
 		ane_iommu_unmap_pages(ane, bo);
-	ane_reclaim_preserved(ane);
 	drm_mm_takedown(&ane->mm);
 
 	ane_detach_genpd(ane);
@@ -1377,7 +1539,7 @@ static int __maybe_unused ane_runtime_suspend(struct device *dev)
 	 * when recovery is power-cycling a wedged engine to establish
 	 * exactly that quiescence.
 	 */
-	if (atomic_read(&ane->wedged) && !ane->recovering)
+	if (atomic_read(&ane->wedged) && !ane->recovering && !ane->sleep_wedged)
 		return -EBUSY;
 
 	return ane_perf_suspend(ane);
@@ -1439,10 +1601,55 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * A wedged engine (a job hung and recovery failed or gave up) no longer
+ * refuses system sleep. Its partitions go off with the sleep, consumer
+ * before its DART suppliers, the same power-off a recovery cycle performs.
+ * On resume an engine whose recovery may still help gets one more
+ * attempt, as from the reset file; a final wedge stays until reboot.
+ */
+static int __maybe_unused ane_system_suspend(struct device *dev)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&ane->engine_lock);
+	ane->sleep_wedged = atomic_read(&ane->wedged);
+	mutex_unlock(&ane->engine_lock);
+	if (ane->sleep_wedged)
+		dev_info(dev, "engine wedged; its partitions go off with the sleep\n");
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		ane->sleep_wedged = false;
+	return ret;
+}
+
+static int __maybe_unused ane_system_resume(struct device *dev)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+	bool wedged = ane->sleep_wedged;
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	ane->sleep_wedged = false;
+	if (ret || !wedged)
+		return ret;
+	mutex_lock(&ane->pm_lock);
+	if (pm_runtime_resume_and_get(dev) >= 0) {
+		mutex_lock(&ane->engine_lock);
+		if (!ane->removed && !ane->wedge_final && ane_tm_recover(ane) < 0)
+			dev_err(dev, "recovery after system sleep failed; submissions stay disabled\n");
+		mutex_unlock(&ane->engine_lock);
+		pm_runtime_put_autosuspend(dev);
+	}
+	mutex_unlock(&ane->pm_lock);
+	return 0;
+}
+
 // clang-format off
 static const struct dev_pm_ops ane_pm_ops = {
 	SET_RUNTIME_PM_OPS(ane_runtime_suspend, ane_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(ane_system_suspend, ane_system_resume)
 };
 
 // clang-format on

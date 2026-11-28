@@ -24,11 +24,15 @@
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/soc/apple/spmi-fifo.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
 #include <linux/suspend.h>
+
+#include "spmi-apple-irq.h"
 
 /* SPMI Controller Registers */
 #define SPMI_STATUS_REG 0
@@ -36,8 +40,6 @@
 #define SPMI_RSP_REG 0x8
 #define SPMI_ACT_REG 0xa4
 
-#define SPMI_IRQ_MASK_BASE 0x20
-#define SPMI_IRQ_ACK_BASE 0x60
 /*
  * Peripheral interrupts come first. The RX FIFO notification sits right
  * after them, followed by the controller's own fault interrupts, so the
@@ -54,6 +56,15 @@
 #define SPMI_ACT_FIFO_FLUSH BIT(0)
 #define SPMI_RX_FIFO_EMPTY BIT(24)
 
+/*
+ * Generation 4 queues fault records in its second register window, a FIFO laid out as the
+ * reply FIFO. macOS acks the controller's fault interrupt (source 263, after the 256
+ * peripheral sources; ack words from 0x600) and empties the queue when the controller starts.
+ */
+#define SPMI_FAULT_QUEUE_MAX 64
+/* More than the reply FIFO holds: the bound of a recovery's read-out. */
+#define SPMI_GEN4_REPLY_DRAIN_MAX 64
+
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
 
@@ -64,6 +75,8 @@ struct apple_spmi_hw {
 	u32 rx_empty;
 	bool legacy_irqs;
 	u32 num_irqs;
+	u32 irq_mask;
+	u32 irq_ack;
 };
 
 static const struct apple_spmi_hw apple_spmi_gen1 = {
@@ -73,6 +86,8 @@ static const struct apple_spmi_hw apple_spmi_gen1 = {
 	.rx_empty = SPMI_RX_FIFO_EMPTY,
 	.legacy_irqs = true,
 	.num_irqs = 256,
+	.irq_mask = APPLE_SPMI_GEN1_IRQ_MASK,
+	.irq_ack = APPLE_SPMI_GEN1_IRQ_ACK,
 };
 
 /* M1 Pro, Max and Ultra: 192 peripheral interrupts, notification at 192 */
@@ -83,6 +98,8 @@ static const struct apple_spmi_hw apple_spmi_t6000 = {
 	.rx_empty = SPMI_RX_FIFO_EMPTY,
 	.legacy_irqs = true,
 	.num_irqs = 192,
+	.irq_mask = APPLE_SPMI_GEN1_IRQ_MASK,
+	.irq_ack = APPLE_SPMI_GEN1_IRQ_ACK,
 };
 
 static const struct apple_spmi_hw apple_spmi_gen4 = {
@@ -90,11 +107,18 @@ static const struct apple_spmi_hw apple_spmi_gen4 = {
 	.command = 0x210,
 	.reply = 0x220,
 	.rx_empty = BIT(30),
+	.num_irqs = 256,
+	.irq_mask = APPLE_SPMI_GEN4_IRQ_MASK,
+	.irq_ack = APPLE_SPMI_GEN4_IRQ_ACK,
 };
 
 struct apple_spmi {
 	void __iomem *regs;
+	void __iomem *faults;
+	unsigned int nfaults;
+	struct device *dev;
 	const struct apple_spmi_hw *hw;
+	u32 num_irqs;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
 	struct irq_domain *irqd;
@@ -110,21 +134,21 @@ struct apple_spmi {
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_ACK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_ack + (irq / 32) * 4;
 
 	writel(BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_mask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
 	writel(readl(reg) & ~BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_unmask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
 	writel(readl(reg) | BIT(irq % 32), reg);
 }
@@ -163,6 +187,26 @@ static inline u32 apple_spmi_pack_cmd(u8 opc, u8 sid, u16 param)
 	return opc | sid << 8 | (u32)param << 16 | (1 << 15);
 }
 
+/* Ack the fault interrupt, then pop and log every queued fault record */
+static void apple_spmi_drain_faults(struct device *dev, struct apple_spmi *spmi)
+{
+	void __iomem *ack = spmi->regs + APPLE_SPMI_GEN4_IRQ_ACK + (APPLE_SPMI_GEN4_FAULT_IRQ / 32) * 4;
+	u32 bit = BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32), fault;
+	int i;
+
+	if (!spmi->faults)
+		return;
+	if (readl(ack) & bit)
+		writel(bit, ack);
+	for (i = 0; i < SPMI_FAULT_QUEUE_MAX; i++) {
+		if (readl(spmi->faults + spmi->hw->status) & spmi->hw->rx_empty)
+			return;
+		fault = readl(spmi->faults + spmi->hw->reply);
+		spmi->nfaults++;
+		dev_warn_ratelimited(dev, "fault %#010x (%u so far)\n", fault, spmi->nfaults);
+	}
+}
+
 /* Wait for Rx FIFO to have something */
 static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 {
@@ -195,8 +239,33 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	return 0;
 }
 
-static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
-			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
+/*
+ * Generation 4 after a failed exchange. Its FIFO flush is not known, so the reply that came
+ * late, or the stray one that was read in a reply's place, is read out instead: the bus gets a
+ * command's whole timeout to finish, then the reply FIFO is read until it is empty. Nothing of
+ * an old exchange can then answer a new command. A FIFO that does not empty keeps the failure.
+ * This is the controller's own reply FIFO, so it applies to every generation 4 controller
+ * (apple,t8142-spmi: T8142 and T6050), on every board.
+ */
+static int apple_spmi_gen4_recover(struct spmi_controller *ctrl, struct apple_spmi *spmi)
+{
+	unsigned int i;
+
+	usleep_range(REG_POLL_TIMEOUT_US, 2 * REG_POLL_TIMEOUT_US);
+	for (i = 0; i < SPMI_GEN4_REPLY_DRAIN_MAX; i++) {
+		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) {
+			dev_warn(&ctrl->dev,
+				 "recovered from a failed exchange, %u stale words dropped\n", i);
+			return 0;
+		}
+		readl(spmi->regs + spmi->hw->reply);
+	}
+	dev_err_ratelimited(&ctrl->dev, "reply FIFO does not empty\n");
+	return -EIO;
+}
+
+static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+			  const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
 {
 	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
 	u32 spmi_cmd = apple_spmi_pack_cmd(opc, sid, param);
@@ -204,14 +273,16 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
 	size_t i = 0, j;
 	int ret;
 
-	guard(mutex)(&spmi->fifo_lock);
-
 	if (spmi->prev_fail) {
 		/* Do not consume a late reply as the reply to a new command. */
-		if (!spmi->hw->legacy_irqs)
-			return -EIO;
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
-		apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+		if (!spmi->hw->legacy_irqs) {
+			ret = apple_spmi_gen4_recover(ctrl, spmi);
+			if (ret)
+				return ret;
+		} else {
+			writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
+			apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
+		}
 		spmi->prev_fail = false;
 	}
 	reinit_completion(&spmi->fifo_rx);
@@ -267,6 +338,20 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
 		return -EIO;
 	}
 	return 0;
+}
+
+/* Logs the fault queue's records after a failed command */
+static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
+{
+	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+	int ret;
+
+	guard(mutex)(&spmi->fifo_lock);
+	ret = __spmi_raw_cmd(ctrl, opc, sid, param, buf_wr, len_wr, buf_rd, len_rd);
+	if (ret)
+		apple_spmi_drain_faults(&ctrl->dev, spmi);
+	return ret;
 }
 
 /* Send a raw command with 1..16 input data frames */
@@ -365,7 +450,7 @@ static int apple_spmi_irq_domain_translate(struct irq_domain *irqd,
 	if (fwspec->param_count != 2)
 		return -EINVAL;
 
-	if (args[0] >= spmi->hw->num_irqs)
+	if (args[0] >= spmi->num_irqs)
 		return -EINVAL;
 	*hwirq = args[0];
 	*type = args[1] & IRQ_TYPE_SENSE_MASK;
@@ -385,7 +470,7 @@ static int apple_spmi_irq_domain_alloc(struct irq_domain *irqd, unsigned int vir
 	if (ret)
 		return ret;
 
-	if (hwirq + nr_irqs > spmi->hw->num_irqs)
+	if (hwirq + nr_irqs > spmi->num_irqs)
 		return -EINVAL;
 
 	for (i = 0; i < nr_irqs; i++) {
@@ -422,12 +507,23 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 {
 	struct apple_spmi *spmi = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	u32 notify = spmi->hw->num_irqs;
+	u32 notify = spmi->num_irqs;
 	bool handled = false, held = false, raw_pending = false;
 	unsigned long val, offset, bit;
 
 	chained_irq_enter(chip, desc);
-	val = readl(spmi->regs + SPMI_IRQ_ACK_BASE + (notify / 32) * 4);
+	val = readl(spmi->regs + spmi->hw->irq_ack + (notify / 32) * 4);
+	/*
+	 * On gen4 the controller's own fault source shares this last ack word
+	 * (0x620, bit 7). Its queued records must be read before the source is
+	 * acked, or drain_faults() never sees them.
+	 */
+	if (!spmi->hw->legacy_irqs && spmi->faults &&
+	    (val & BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32))) {
+		apple_spmi_drain_faults(spmi->dev, spmi);
+		val &= ~BIT(APPLE_SPMI_GEN4_FAULT_IRQ % 32);
+		handled = true;
+	}
 	raw_pending |= !!val;
 	if (val & BIT(notify % 32)) {
 		apple_spmi_irq_ack_raw(spmi, notify);
@@ -436,14 +532,14 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	}
 	/* Other queues' responses, such as the sleep's own commands at the debug link's cut. */
 	if (val & ~BIT(notify % 32)) {
-		writel(val & ~BIT(notify % 32), spmi->regs + SPMI_IRQ_ACK_BASE + (notify / 32) * 4);
+		writel(val & ~BIT(notify % 32), spmi->regs + spmi->hw->irq_ack + (notify / 32) * 4);
 		handled = true;
 	}
 
 	for (offset = 0; offset < notify / 8; offset += sizeof(val)) {
 		unsigned long stray;
 
-		val = readq(spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		val = readq(spmi->regs + spmi->hw->irq_ack + offset);
 		raw_pending |= !!val;
 		/*
 		 * After a real sleep, sources no driver uses come up pending (on the Neo the
@@ -454,8 +550,8 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		 */
 		stray = val & ~spmi->irq_used[offset / sizeof(val)];
 		if (stray) {
-			writel(lower_32_bits(stray), spmi->regs + SPMI_IRQ_ACK_BASE + offset);
-			writel(upper_32_bits(stray), spmi->regs + SPMI_IRQ_ACK_BASE + offset + 4);
+			writel(lower_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset);
+			writel(upper_32_bits(stray), spmi->regs + spmi->hw->irq_ack + offset + 4);
 			handled = true;
 		}
 		if (val & spmi->irq_used[offset / sizeof(val)] &
@@ -485,7 +581,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	 * unmasked, or it fires again for what was just cleared.
 	 */
 	if (handled)
-		readl(spmi->regs + SPMI_IRQ_ACK_BASE);
+		readl(spmi->regs + spmi->hw->irq_ack);
 	chained_irq_exit(chip, desc);
 }
 
@@ -493,8 +589,9 @@ static void apple_spmi_teardown_irq(void *data)
 {
 	struct apple_spmi *spmi = data;
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4)
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+	for (size_t offset = 0; offset < spmi->num_irqs / 8 + (spmi->hw->legacy_irqs ? 4 : 0);
+	     offset += 4)
+		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
 
 	synchronize_irq(spmi->irq);
 	irq_set_chained_handler_and_data(spmi->irq, NULL, NULL);
@@ -513,9 +610,10 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+	for (size_t offset = 0; offset < spmi->num_irqs / 8 + (spmi->hw->legacy_irqs ? 4 : 0);
+	     offset += 4) {
+		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
+		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
 	}
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
@@ -527,8 +625,10 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 		return ret;
 
 	irq_set_chained_handler_and_data(spmi->irq, apple_spmi_irq_handler, spmi);
-	apple_spmi_irq_unmask_raw(spmi, spmi->hw->num_irqs);
-	spmi->notify_irq = true;
+	if (spmi->hw->legacy_irqs) {
+		apple_spmi_irq_unmask_raw(spmi, spmi->num_irqs);
+		spmi->notify_irq = true;
+	}
 
 	return 0;
 }
@@ -553,8 +653,8 @@ static int apple_spmi_suspend_noirq(struct device *dev)
 	spmi->notify_irq = false;
 	spmi->notify_parked = true;
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
-	apple_spmi_irq_mask_raw(spmi, spmi->hw->num_irqs);
-	apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+	apple_spmi_irq_mask_raw(spmi, spmi->num_irqs);
+	apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
 	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 
 	return 0;
@@ -567,19 +667,45 @@ static int apple_spmi_resume_noirq(struct device *dev)
 	unsigned long flags;
 	size_t i;
 
-	if (!spmi->notify_parked)
+	if (!spmi->notify_parked) {
+		/* Gen 4 never parks the notification, but a firmware sleep entry writes the mask bank itself. */
+		if (spmi->hw->legacy_irqs || !spmi->irqd || !pm_resume_via_firmware())
+			return 0;
+		raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->num_irqs);
+		for (i = 0; i < spmi->num_irqs / 32; i++)
+			writel(words[i], spmi->regs + spmi->hw->irq_mask + i * 4);
+		raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 		return 0;
+	}
 
 	guard(mutex)(&spmi->fifo_lock);
+	/*
+	 * Firmware and the platform's sleep code use this queue while Linux is
+	 * away. Every command of ours was answered before the suspend, so any
+	 * reply waiting now is someone else's, and would be read as the reply
+	 * to our next command.
+	 */
+	if (pm_resume_via_firmware()) {
+		unsigned int stale = 0;
+
+		while (!(readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) &&
+		       stale < 64) {
+			readl(spmi->regs + spmi->hw->reply);
+			stale++;
+		}
+		if (stale)
+			dev_info(dev, "dropped %u stale reply words after the wake\n", stale);
+	}
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
 	/* Whether the enables survive a real sleep has not been measured. */
 	if (pm_resume_via_firmware()) {
-		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->hw->num_irqs);
-		for (i = 0; i < spmi->hw->num_irqs / 32; i++)
-			writel(words[i], spmi->regs + SPMI_IRQ_MASK_BASE + i * 4);
+		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->num_irqs);
+		for (i = 0; i < spmi->num_irqs / 32; i++)
+			writel(words[i], spmi->regs + spmi->hw->irq_mask + i * 4);
 	}
-	apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
-	apple_spmi_irq_unmask_raw(spmi, spmi->hw->num_irqs);
+	apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
+	apple_spmi_irq_unmask_raw(spmi, spmi->num_irqs);
 	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 	spmi->notify_parked = false;
 	spmi->notify_irq = true;
@@ -601,9 +727,34 @@ static int apple_spmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spmi = spmi_controller_get_drvdata(ctrl);
+	spmi->dev = &pdev->dev;
 	spmi->hw = device_get_match_data(&pdev->dev);
 	if (!spmi->hw)
 		return -EINVAL;
+	spmi->num_irqs = spmi->hw->num_irqs;
+	if (spmi->hw->legacy_irqs) {
+		u32 response_vector;
+
+		ret = of_property_read_u32(pdev->dev.of_node,
+					   "apple,response-vector",
+					   &response_vector);
+		if (!ret) {
+			if (!response_vector ||
+			    response_vector > SPMI_MAX_PERIPHERAL_IRQS ||
+			    response_vector % 64)
+				return dev_err_probe(&pdev->dev, -EINVAL,
+						     "invalid apple,response-vector %u\n",
+						     response_vector);
+			spmi->num_irqs = response_vector;
+		} else if (ret != -EINVAL) {
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read apple,response-vector\n");
+		}
+	} else if (of_property_present(pdev->dev.of_node,
+				       "apple,response-vector")) {
+		dev_warn(&pdev->dev,
+			 "ignoring apple,response-vector on generation 4 controller\n");
+	}
 	mutex_init(&spmi->fifo_lock);
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
@@ -611,6 +762,13 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	spmi->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spmi->regs))
 		return PTR_ERR(spmi->regs);
+
+	if (!spmi->hw->legacy_irqs && platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
+		spmi->faults = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(spmi->faults))
+			return PTR_ERR(spmi->faults);
+		apple_spmi_drain_faults(&pdev->dev, spmi);
+	}
 
 	ctrl->dev.of_node = pdev->dev.of_node;
 
@@ -622,9 +780,6 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	if (spmi->irq < 0 && spmi->irq != -ENXIO)
 		return spmi->irq;
 	if (spmi->irq >= 0) {
-		if (!spmi->hw->legacy_irqs)
-			return dev_err_probe(&pdev->dev, -EOPNOTSUPP,
-					     "Generation 4 interrupt layout is not supported\n");
 		ret = apple_spmi_init_irq(pdev, spmi, spmi->irq);
 		if (ret)
 			return ret;
@@ -655,6 +810,31 @@ static struct platform_driver apple_spmi_driver = {
 		.pm	= pm_sleep_ptr(&apple_spmi_pm_ops),
 	},
 };
+
+/*
+ * For the sleep controller's by-hand PMU commands, sent where this driver's own exchange (a
+ * mutex, a sleeping poll) can't run. The lock is only tried: a holder means an exchange of
+ * ours is under way, and the caller keeps off the bus.
+ */
+int apple_spmi_fifo_trylock(struct device *dev)
+{
+	struct apple_spmi *spmi;
+
+	if (dev->driver != &apple_spmi_driver.driver)
+		return -ENODEV;
+	spmi = dev_get_drvdata(dev);
+	return mutex_trylock(&spmi->fifo_lock) ? 0 : -EBUSY;
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_trylock);
+
+void apple_spmi_fifo_unlock(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	mutex_unlock(&spmi->fifo_lock);
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_unlock);
+
 module_platform_driver(apple_spmi_driver);
 
 MODULE_AUTHOR("Jean-Francois Bortolotti <jeff@borto.fr>");

@@ -8,6 +8,7 @@
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
 #include <linux/err.h>
+#include <linux/init.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -76,8 +77,11 @@ struct apple_pmgr_ps {
 	bool sleep_retained;
 	/* apple,sleep-driver-owned: the driver behind it brings it back after a sleep */
 	bool sleep_driver_owned;
+	bool sleep_wakeup_path;
 	/* Never enable automatic power management (apple,no-auto-pm). */
 	bool no_auto_pm;
+	/* Hardware auto-managed domain armed early at boot (apple,auto-managed). */
+	bool auto_managed;
 	bool inherited_on;
 	bool no_auto_enable;
 	bool needs_reset_idle_wait;
@@ -102,6 +106,8 @@ struct apple_pmgr_ps {
 	struct {
 		u32 offset, mask, value, saved;
 	} retention[APPLE_PMGR_PS_MAX_RETENTION];
+	/* Two bridge link words of the block behind this state, usable while it is on. */
+	void __iomem *bridge;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -309,7 +315,12 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	 * and the sleep engine, which powers them up itself in a wake that keeps DRAM
 	 * up, stalls on a latched one until its watchdog resets the SoC. Only a PS
 	 * reset clears it, and the domain is off, so pulse one as on the power-on
-	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
+	 * path.
+	 *
+	 * T8140 only. Other SoCs do not need it: on T8112 the gfx domain reaches
+	 * off with BUSY set before every system sleep and is fine left that way,
+	 * while a PS reset of a domain whose block is still busy can reset the
+	 * whole SoC (a hung ANE does on T8112).
 	 */
 	/*
 	 * Off only once BUSY clears too: macOS waits for (word & 0x8ff) == 0. The
@@ -322,15 +333,19 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 						APPLE_PMGR_BUSY_SETTLE_US);
 
 	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
-	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && (!ps->system_sleep || ps->macos_lower) &&
-	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked) {
-		/* macOS never needs this: say so when it does. */
-		if (ps->macos_lower)
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->wait_parent &&
+	    !ps->strict_state && !ps->externally_clocked) {
+		if (ps->macos_lower) {
+			/* macOS never needs this: say so when it does. */
 			dev_info_ratelimited(ps->dev,
 					     "PS %s: off with BUSY%s: %#x; cleared by a PS reset\n",
 					     genpd->name, ps->system_sleep ? " in a system sleep" : "",
 					     cur);
-		apple_pmgr_ps_unlatch_off(ps, &cur);
+			apple_pmgr_ps_unlatch_off(ps, &cur);
+		} else {
+			dev_dbg(ps->dev, "PS %s: off with BUSY: %#x; left as it is\n",
+				genpd->name, cur);
+		}
 	}
 
 report:
@@ -425,7 +440,7 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 
 	if (ps->firmware_owned)
 		return 0;
-	if (ps->inherited_on)
+	if (ps->inherited_on || ps->auto_managed)
 		return -EBUSY;
 	/* A live coprocessor keeps this domain through system sleep. */
 	if (ps->sleep_retained && ps->system_sleep)
@@ -444,6 +459,37 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 
 	return ret;
 }
+
+/* genpd's runtime suspend callback, as it installs it in every genpd's dev_pm_domain. */
+static int (*apple_pmgr_genpd_runtime_suspend)(struct device *dev);
+
+/* Check the physical result of genpd's void syscore suspend/resume helpers. */
+int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
+{
+	int (*genpd_suspend)(struct device *dev) = READ_ONCE(apple_pmgr_genpd_runtime_suspend);
+	struct generic_pm_domain *genpd;
+	struct apple_pmgr_ps *ps;
+	u32 value, mask = APPLE_PMGR_PS_LEVELS | APPLE_PMGR_BUSY |
+			  APPLE_PMGR_RESET | APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE;
+
+	/* Only a genpd's dev_pm_domain is embedded in one: anything else is refused. */
+	if (!domain_dev->pm_domain || !genpd_suspend ||
+	    domain_dev->pm_domain->ops.runtime_suspend != genpd_suspend)
+		return -EINVAL;
+	genpd = pd_to_genpd(domain_dev->pm_domain);
+	if (genpd->power_on != apple_pmgr_ps_power_on ||
+	    !(genpd->flags & GENPD_FLAG_IRQ_SAFE))
+		return -EOPNOTSUPP;
+	ps = genpd_to_apple_pmgr_ps(genpd);
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed)
+		return -EPERM;
+	if (!on)
+		mask |= APPLE_PMGR_AUTO_ENABLE;
+	return regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, value,
+					      (value & mask) == (on ? APPLE_PMGR_PS_ALL_ON : 0),
+					      1, APPLE_PMGR_PS_PARENT_TIMEOUT);
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_verify_state);
 
 /**
  * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
@@ -473,7 +519,7 @@ int apple_pmgr_ps_cycle(struct device_node *np)
 		ret = -EPROBE_DEFER;
 		goto out;
 	}
-	if (ps->firmware_owned || ps->inherited_on) {
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed) {
 		ret = -EPERM;
 		goto out;
 	}
@@ -548,7 +594,7 @@ static int apple_pmgr_ps_suspend_noirq(struct device *dev)
 	u32 reg;
 
 	ps->sleep_raised_by_other = false;
-	if (ps->firmware_owned || ps->inherited_on)
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed)
 		return 0;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
@@ -596,8 +642,27 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	u32 reg;
 	int ret;
 
-	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
-	    ps->sleep_driver_owned || apple_sleep_domain_is_down(dev->of_node))
+	if (!pm_resume_via_firmware() || ps->firmware_owned)
+		return 0;
+
+	/*
+	 * The wake resets each word's minimum state with the rest, and probe is the only
+	 * place that sets apple,min-state: put it back, whoever owns the domain now. With
+	 * AUTO_ENABLE on and a minimum of 0, the hardware power-gates a domain whose
+	 * coprocessor is only waiting in WFI, as a display coprocessor's CPU does.
+	 */
+	if (ps->min_state && ps->min_state <= APPLE_PMGR_PS_ACTIVE) {
+		spin_lock_irqsave(&ps->genpd.slock, flags);
+		if (!regmap_read(ps->regmap, ps->offset, &reg) &&
+		    FIELD_GET(APPLE_PMGR_PS_MIN, reg) != ps->min_state)
+			regmap_update_bits(ps->regmap, ps->offset,
+					   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+					   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+		spin_unlock_irqrestore(&ps->genpd.slock, flags);
+	}
+
+	if (ps->inherited_on || ps->auto_managed || ps->sleep_driver_owned ||
+	    apple_sleep_domain_is_down(dev->of_node))
 		return 0;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
@@ -637,7 +702,7 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	int ret;
 	u32 reg;
 
-	if (ps->firmware_owned || ps->inherited_on)
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed)
 		return -EPERM;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
@@ -675,7 +740,7 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
 
-	if (ps->firmware_owned || ps->inherited_on)
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed)
 		return -EPERM;
 
 	if (ps->reset_time_us == APPLE_PMGR_T8132_RESET_TIME)
@@ -717,7 +782,7 @@ static int apple_pmgr_reset_status(struct reset_controller_dev *rcdev, unsigned 
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	u32 reg = 0;
 
-	if (ps->firmware_owned || ps->inherited_on)
+	if (ps->firmware_owned || ps->inherited_on || ps->auto_managed)
 		return -EPERM;
 	regmap_read(ps->regmap, ps->offset, &reg);
 
@@ -812,12 +877,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
 	/*
-	 * On the M4 firmware path some domains are the firmware's, which Linux
-	 * cannot access. The early compatibility adapter supplies the explicit
-	 * status and ownership before population; fail closed if it was not
-	 * enabled. Other firmware keeps the tree's own domain descriptions.
+	 * Some T8132 power states are the firmware's, which Linux cannot
+	 * access. The platform handoff supplies the explicit status and
+	 * ownership of every one before population, on any firmware: fail
+	 * closed on a state it did not mark. Keep the same protection for
+	 * qualified firmware and the Airs even without the handoff.
 	 */
-	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
+	if (t8132 && (IS_ENABLED(CONFIG_APPLE_T8132_PLATFORM_HANDOFF) ||
+		      apple_t8132_firmware_path()) &&
+	    !of_property_present(node, "status"))
 		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);
@@ -890,8 +958,27 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "retention workaround needs a consumer switch\n");
 	}
+	if (of_property_present(node, "apple,bridge-link")) {
+		struct of_phandle_args link;
+		struct resource res;
+
+		if (!ps->consumer_switched ||
+		    of_parse_phandle_with_fixed_args(node, "apple,bridge-link", 2, 0, &link))
+			return dev_err_probe(dev, -EINVAL, "bad bridge link\n");
+		ret = of_address_to_resource(link.np, link.args[0], &res);
+		of_node_put(link.np);
+		if (ret)
+			return dev_err_probe(dev, ret, "bad bridge link block\n");
+		ps->bridge = devm_ioremap(dev, res.start + link.args[1], 8);
+		if (!ps->bridge)
+			return -ENOMEM;
+	}
 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
 	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
+	ps->sleep_wakeup_path = of_property_read_bool(node, "apple,sleep-wakeup-path");
+	/* A cold-started coprocessor CPU must not be gated behind its firmware. */
+	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
+	ps->auto_managed = of_property_read_bool(node, "apple,auto-managed");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
@@ -899,7 +986,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	ps->inherited_on = t8132 && of_property_read_bool(node, "apple,inherited-on");
 	if (ps->inherited_on &&
-	    (ps->firmware_owned || ps->sleep_retained ||
+	    (ps->firmware_owned || ps->sleep_retained || ps->auto_managed ||
 	     of_property_present(node, "apple,min-state") ||
 	     of_property_present(node, "apple,always-on") ||
 	     of_property_present(node, "apple,force-disable") ||
@@ -907,8 +994,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	     of_property_present(node, "apple,externally-clocked")))
 		return dev_err_probe(dev, -EINVAL, "conflicting inherited power policy\n");
 
+	if (ps->auto_managed &&
+	    (ps->firmware_owned || ps->no_auto_pm || ps->no_auto_enable || t8132))
+		return dev_err_probe(dev, -EINVAL, "conflicting auto-managed power policy\n");
+
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->firmware_owned)
+	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE &&
+	    !ps->firmware_owned && !ps->auto_managed)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
@@ -920,9 +1012,6 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
-
-	/* A cold-started coprocessor CPU must not be gated behind its firmware. */
-	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
 
 	/*
 	 * An inherited-on domain has readable state but no transition ownership.
@@ -944,9 +1033,19 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret, "cannot read power state\n");
 		active = ret;
 	}
-	/* Legacy handoff DTs must also keep the throttle controller powered. */
-	if (!ps->firmware_owned && !ps->inherited_on &&
-	    apple_pmgr_ps_always_on(node, ps->offset, name)) {
+	if (ps->auto_managed) {
+		if (!active) {
+			if (apple_pmgr_ps_always_on(node, ps->offset, name))
+				return dev_err_probe(dev, -EIO,
+						     "always-on auto-managed domain %s is off at boot\n",
+						     name);
+			dev_dbg(dev, "auto-managed domain %s is off at boot, skipping\n", name);
+			return -ENODEV;
+		}
+		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+	} else if (!ps->firmware_owned && !ps->inherited_on &&
+		   apple_pmgr_ps_always_on(node, ps->offset, name)) {
+		/* Legacy handoff DTs must also keep the throttle controller powered. */
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			/*
@@ -966,10 +1065,18 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		}
 	} else if (active && !ps->firmware_owned && !ps->inherited_on) {
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
+	} else if (ps->sleep_wakeup_path && !ps->firmware_owned && !ps->inherited_on) {
+		/*
+		 * Off at probe, powered up later by its consumer, which the sleep's
+		 * commit stops after the noirq phase: hold it while that consumer is
+		 * on the wakeup path.
+		 */
+		ps->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */
-	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable)
+	if (active && !ps->firmware_owned && !ps->inherited_on &&
+	    !ps->no_auto_enable && !ps->auto_managed)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
@@ -978,6 +1085,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		dev_err(dev, "pm_genpd_init failed\n");
 		return ret;
 	}
+	WRITE_ONCE(apple_pmgr_genpd_runtime_suspend, ps->genpd.domain.ops.runtime_suspend);
 
 	ret = of_genpd_add_provider_simple(node, &ps->genpd);
 	if (ret < 0) {
@@ -1072,6 +1180,22 @@ static bool apple_pmgr_ps_consumer_ready(u32 reg)
  * automatic power management while staying on, set the retention workaround,
  * then power off (clearing the history bits) and wait for it.
  */
+/* Only with the state on: the link down before its power-off, up after its power-on. */
+static void apple_pmgr_ps_bridge(struct apple_pmgr_ps *ps, bool up)
+{
+	if (!ps->bridge)
+		return;
+	for (unsigned int i = 0; i < 2; i++) {
+		u32 value = readl(ps->bridge + 4 * i);
+
+		writel(up ? value | BIT(0) : value & ~BIT(0), ps->bridge + 4 * i);
+	}
+	/* Complete the stores before the state word changes or its block is used. */
+	mb();
+	readl(ps->bridge);
+	dev_dbg(ps->dev, "PS %s: bridge link %s\n", ps->genpd.name, up ? "up" : "down");
+}
+
 static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 {
 	u32 reg, cur;
@@ -1108,6 +1232,7 @@ static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 		if (ret)
 			goto fail;
 	}
+	apple_pmgr_ps_bridge(ps, false);
 	ps->consumer_off = true;
 	reg = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_FLAGS |
 	      FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_PWRGATE);
@@ -1149,6 +1274,7 @@ static int apple_pmgr_ps_consumer_state_on(struct apple_pmgr_ps *ps)
 		ret = apple_pmgr_ps_wait(ps, APPLE_PMGR_PS_LEVELS, APPLE_PMGR_PS_ALL_ON, &cur);
 	if (ret)
 		goto fail;
+	apple_pmgr_ps_bridge(ps, true);
 	for (unsigned int i = 0; i < ps->nr_retention; i++) {
 		u32 mask = ps->retention[i].mask;
 
@@ -1269,12 +1395,33 @@ int apple_pmgr_ps_consumer_on(struct device *consumer)
 		return n;
 	for (int i = n - 1; i >= 0; i--) {
 		ret = apple_pmgr_ps_consumer_switch(chain[i], true);
-		if (ret)
+		/* Also a rollback after a power-off that stopped partway: skip what stayed on. */
+		if (ret && ret != -EALREADY)
 			return ret;
 	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_on);
+
+/*
+ * Whether @consumer's own state, the first of its chain, is powered off: after
+ * a power-off that stopped partway, whether its block went through reset.
+ */
+bool apple_pmgr_ps_consumer_is_off(struct device *consumer)
+{
+	struct apple_pmgr_ps *chain[APPLE_PMGR_PS_MAX_CHAIN];
+	int n = apple_pmgr_ps_consumer_chain(consumer, chain);
+	unsigned long flags;
+	bool off;
+
+	if (n < 0)
+		return false;
+	spin_lock_irqsave(&chain[0]->genpd.slock, flags);
+	off = chain[0]->consumer_off;
+	spin_unlock_irqrestore(&chain[0]->genpd.slock, flags);
+	return off;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_is_off);
 
 static const struct of_device_id apple_pmgr_ps_of_match[] = {
 	{ .compatible = "apple,t8103-pmgr-pwrstate" },
@@ -1283,6 +1430,124 @@ static const struct of_device_id apple_pmgr_ps_of_match[] = {
 };
 
 MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
+
+/*
+ * Switch a power-state word left forced on by the boot loader (target 0xf,
+ * AUTO_ENABLE clear) to hardware automatic power management, early at boot,
+ * before the PMP starts: write target 0xf, wait for actual 0xf, then set
+ * AUTO_ENABLE. Words that are fused off, not forced on, held in reset, or
+ * already on AUTO_ENABLE are left untouched (returns 0). Returns 1 if
+ * switched, or a negative errno on read/write error or timeout.
+ */
+static int apple_pmgr_ps_auto_enable(struct regmap *regmap, u32 offset)
+{
+	u32 v;
+	int ret;
+
+	ret = regmap_read(regmap, offset, &v);
+	if (ret)
+		return ret;
+
+	if (FIELD_GET(APPLE_PMGR_PS_TARGET, v) != APPLE_PMGR_PS_ACTIVE ||
+	    (v & (APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_RESET |
+		  APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE)))
+		return 0;
+
+	ret = regmap_write(regmap, offset,
+			   (v & ~(APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+				  APPLE_PMGR_PS_TARGET)) |
+			   FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE));
+	if (ret)
+		return ret;
+
+	ret = regmap_read_poll_timeout_atomic(regmap, offset, v,
+					      FIELD_GET(APPLE_PMGR_PS_ACTUAL, v) ==
+					      APPLE_PMGR_PS_ACTIVE,
+					      1, APPLE_PMGR_PS_PARENT_TIMEOUT);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(regmap, offset,
+			   (v & ~(APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY)) |
+			   APPLE_PMGR_AUTO_ENABLE);
+	return ret ?: 1;
+}
+
+static const struct of_device_id apple_pmgr_of_match[] __initconst = {
+	{ .compatible = "apple,t8103-pmgr" },
+	{ .compatible = "apple,pmgr" },
+	{}
+};
+
+static bool __init apple_pmgr_ps_node_is_auto_managed(struct device_node *np)
+{
+	return of_match_node(apple_pmgr_ps_of_match, np) &&
+	       of_property_read_bool(np, "apple,auto-managed") &&
+	       !of_property_read_bool(np, "apple,no-auto-pm") &&
+	       !of_property_read_bool(np, "apple,firmware-owned") &&
+	       !of_property_read_bool(np, "apple,inherited-on") &&
+	       !of_device_is_compatible(np, "apple,t8132-pmgr-pwrstate");
+}
+
+/*
+ * Arm hardware automatic power management for DT-marked domains early at
+ * boot, before platform drivers (in particular the PMP) start: enabling
+ * AUTO_ENABLE on memory and fabric domains after the PMP is running freezes
+ * the SoC.
+ */
+static int __init apple_pmgr_ps_auto_init(void)
+{
+	struct device_node *pmgr_np;
+	unsigned int done = 0, failed = 0;
+
+	for_each_matching_node(pmgr_np, apple_pmgr_of_match) {
+		struct regmap *regmap = NULL;
+		struct device_node *child;
+
+		if (!of_device_is_available(pmgr_np))
+			continue;
+
+		for_each_available_child_of_node(pmgr_np, child) {
+			u32 offset;
+			int ret;
+
+			if (!apple_pmgr_ps_node_is_auto_managed(child))
+				continue;
+
+			if (of_property_read_u32(child, "reg", &offset)) {
+				pr_warn("apple-pmgr-pwrstate: %pOF: missing reg property\n",
+					child);
+				continue;
+			}
+
+			if (!regmap) {
+				regmap = syscon_node_to_regmap(pmgr_np);
+				if (IS_ERR(regmap)) {
+					pr_warn("apple-pmgr-pwrstate: %pOF: cannot map PMGR: %ld\n",
+						pmgr_np, PTR_ERR(regmap));
+					of_node_put(child);
+					break;
+				}
+			}
+
+			ret = apple_pmgr_ps_auto_enable(regmap, offset);
+			if (ret > 0) {
+				done++;
+			} else if (ret < 0) {
+				failed++;
+				pr_warn("apple-pmgr-pwrstate: %pOF: auto-enable failed: %d\n",
+					child, ret);
+			}
+		}
+	}
+
+	if (done || failed)
+		pr_info("apple-pmgr-pwrstate: %u auto-managed domains enabled, %u failed\n",
+			done, failed);
+
+	return 0;
+}
+arch_initcall(apple_pmgr_ps_auto_init);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)

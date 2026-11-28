@@ -14,6 +14,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef uint64_t ph
 #define IOMMU_WRITE 2
 #define IOMMU_CACHE 4
 #define APPLE_DART_PTE_VALID 1
+#define APPLE_DART 1
 #define APPLE_DART2 2
 #define GFP_KERNEL 0
 #define MEMREMAP_WB 0
@@ -50,7 +51,28 @@ static unsigned lock_depth;
 static size_t find_next_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(test_bit(a,p))break;return a;}
 static size_t find_next_zero_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(!test_bit(a,p))break;return a;}
 struct apple_dart_hw;struct device;
-struct apple_dart {struct device*dev;unsigned pgsize,oas,fw_mirror,fw_tree,tcr,fw_handoff,ias,locked,num_streams,version,managed_sids;struct {int ready;} iommu;struct apple_dart_hw*hw;u64 dma_offset,locked_window[2];u64 *locked_ttbr[2][4],*locked_owned[2][4];struct apple_dart_fw_root*locked_fw[2][4];struct apple_dart_fw_tree*locked_fw_tree[2];bool display_dark,display_tlb_stale;DECLARE_BITMAP(display_tcr_four,64);int lock,locked_retire_err[2];};
+struct apple_dart {
+	struct device *dev;
+	unsigned int pgsize, oas, fw_mirror, fw_tree, tcr, fw_handoff, ias, locked, num_streams,
+		version, managed_sids;
+	struct {
+		int ready;
+	} iommu;
+	struct apple_dart_hw *hw;
+	u64 dma_offset, locked_window[2];
+	u64 *locked_ttbr[2][4], *locked_owned[2][4];
+	struct apple_dart_fw_root *locked_fw[2][4];
+	struct apple_dart_fw_tree *locked_fw_tree[2];
+	bool display_dark, display_tlb_stale;
+	DECLARE_BITMAP(display_tcr_four, 64);
+	int lock, locked_retire_err[2];
+	/* A J713 sleep's, never set here. */
+	void *sleep_record;
+	bool cio_active;
+	/* A J714s display sleep's and its firmware 27 provider's, never set here. */
+	struct device *m5_sleep_owner;
+	bool v27_provider, v27_lost;
+};
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_dcp;struct apple_dart_domain {struct apple_dart_atomic_stream_map stream_maps[2];unsigned long fw_sidmap[2][1];void*pgtbl_ops;struct apple_dart_dcp*dcp;};
@@ -62,9 +84,8 @@ static int commands,command_error;static u64 command_start[8],command_end[8];
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map*m,int op,bool range,u64 lo,u64 hi){assert(op==1&&range&&commands<8);command_start[commands]=lo;command_end[commands++]=hi;return command_error;}
 struct list_head {int count;};
 struct iommu_resv_region {u64 start,length,dva;int prot,type;struct list_head list;};
-struct device_node {int count;u32 value;bool t8140;};
+struct device_node {int count;u32 value;};
 struct iommu_device;struct device {struct device_node*of_node;struct apple_dart_master_cfg*cfg;struct iommu_device*iommu;};
-static int of_device_is_compatible(struct device_node*np,const char*s){assert(!strcmp(s,"apple,t8140-dart"));return np->t8140;}
 static int of_property_count_u32_elems(struct device_node*np,const char*s){assert(!strcmp(s,"apple,firmware-root-handoff"));return np->count;}
 static int of_property_read_u32(struct device_node*np,const char*s,u32*v){assert(!strcmp(s,"apple,firmware-root-handoff"));*v=np->value;return np->count<1?-EINVAL:0;}
 #define dev_iommu_priv_get(d) ((d)->cfg)
@@ -109,6 +130,38 @@ static void free_io_pgtable_ops(void*ops){assert(ops);pgtable_frees++;}
 /* No borrowed display roots here; the DCP paths are covered elsewhere. */
 static bool apple_dart_has_borrowed(struct apple_dart*d){return false;}
 static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map*m){abort();}
+/* No J713 sleep owns these DARTs: releasing their state is always allowed. */
+static void apple_dart_sleep_release_failed(void)
+{
+	abort();
+}
+
+/* Admitted and counted, as a writer of a DART a sleep owns; every one must leave. */
+#define APPLE_DART_WRITER_COUNTED 1
+#define APPLE_DART_WRITER_CLOSED 2
+static int writers;
+static int apple_dart_sleep_writer_get(struct apple_dart *dart)
+{
+	(void)dart;
+	writers++;
+	return APPLE_DART_WRITER_COUNTED;
+}
+
+static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
+{
+	(void)dart;
+	assert(gate == APPLE_DART_WRITER_COUNTED && writers > 0);
+	writers--;
+}
+
+/* The stream maps a device or domain has, as the fixture's arrays hold them. */
+#define MAX_DARTS_PER_DEVICE 2
+/* Only a J714s firmware 27 provider DART lists its clients; none is one here. */
+static void apple_dart_v27_client_remove(struct apple_dart_stream_map *map)
+{
+	if (map->dart->v27_provider)
+		abort();
+}
 #define dev_info(d,...) ((void)0)
 /* PRODUCTION */
 #define IOMMU_RESV_DIRECT 1
@@ -135,7 +188,7 @@ int main(int argc,char**argv){
  firmware_leaf[0]=leaf(0x8000);ours_leaf[0]=leaf(0x8000);phys_addr_t phys;
  struct apple_dart_domain domain={0};domain.stream_maps[0].dart=&d;domain.fw_sidmap[0][0]=1;
  struct apple_dart_master_cfg cfg={0};cfg.stream_maps[0].dart=&d;cfg.stream_maps[0].sidmap[0]=1;
- struct iommu_device io={0};struct device_node node={1,1,true};struct device dev={&node,&cfg,&io};d.dev=&dev;struct list_head head={0};
+ struct iommu_device io={0};struct device_node node={1,1};struct device dev={&node,&cfg,&io};d.dev=&dev;struct list_head head={0};
  d.locked_ttbr[0][0]=root;static u64 shadow[2048];d.locked_owned[0][0]=shadow;d.locked_fw[0][0]=&fw;
  if(!strncmp(c,"legacy-",7)){
   d.fw_handoff=0;d.fw_mirror=1;root[0]=0x1401;
@@ -150,11 +203,15 @@ int main(int argc,char**argv){
   }else abort();
  }
  else if(!strncmp(c,"handoff-",8)){
+  d.version=0x0202;
   if(!strcmp(c,"handoff-missing"))node.count=-EINVAL;
   if(!strcmp(c,"handoff-duplicate"))node.count=2;
   if(!strcmp(c,"handoff-zero"))node.value=0;
   if(!strcmp(c,"handoff-unlocked"))d.locked=0;
-  if(!strcmp(c,"handoff-other-soc"))node.t8140=false;
+  if(!strcmp(c,"handoff-dart1-format"))hw.fmt=APPLE_DART;
+  /* A T6000 DART has the APPLE_DART2 layout but reports no version. */
+  if(!strcmp(c,"handoff-unversioned"))d.version=0;
+  if(!strcmp(c,"handoff-version-0201"))d.version=0x0201;
   assert(apple_dart_fw_handoff_enabled(&d)==!strcmp(c,"handoff-matched"));
  }
  else if(!strncmp(c,"core-",5)){

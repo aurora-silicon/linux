@@ -15,6 +15,7 @@
 #include <linux/perf/arm_pmuv3.h>
 #include <linux/platform_device.h>
 
+#include <asm/apple-idle.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/irq_regs.h>
 #include <asm/perf_event.h>
@@ -273,12 +274,43 @@ static const unsigned int t6050_pmu_perf_map[PERF_COUNT_HW_MAX] = {
 	[PERF_COUNT_HW_BRANCH_MISSES]		= T6050_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
 };
 
+/*
+ * The generic L1D read-miss event, for in-kernel users such as the
+ * scheduler: the same counter as each core's l1d-load-misses event.
+ */
+static const unsigned int t6050_pmu_cache_map[PERF_COUNT_HW_CACHE_MAX]
+					     [PERF_COUNT_HW_CACHE_OP_MAX]
+					     [PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+	PERF_CACHE_MAP_ALL_UNSUPPORTED,
+	[C(L1D)][C(OP_READ)][C(RESULT_MISS)]	= T6050_PMU_PERFCTR_L1D_CACHE_MISS_LD,
+};
+
+static const unsigned int m4_pmu_cache_map[PERF_COUNT_HW_CACHE_MAX]
+					  [PERF_COUNT_HW_CACHE_OP_MAX]
+					  [PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+	PERF_CACHE_MAP_ALL_UNSUPPORTED,
+	[C(L1D)][C(OP_READ)][C(RESULT_MISS)]	= M4_PMU_PERFCTR_L1D_CACHE_MISS_LD,
+};
+
 static const unsigned int m4_pmu_perf_map[PERF_COUNT_HW_MAX] = {
 	PERF_MAP_ALL_UNSUPPORTED,
 	[PERF_COUNT_HW_CPU_CYCLES]		= M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
 	[PERF_COUNT_HW_INSTRUCTIONS]		= M4_PMU_PERFCTR_INST_ALL,
 	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= M4_PMU_PERFCTR_INST_BRANCH,
 	[PERF_COUNT_HW_BRANCH_MISSES]		= M4_PMU_PERFCTR_BRANCH_MISPRED,
+};
+
+/*
+ * As above, for M1 and M2: their L1D load-miss event, 0xa3 in the M1 event
+ * list above (M1_PMU_PERFCTR_L1D_CACHE_MISS_LD), which came with this
+ * driver from the Asahi Linux project's public event documentation. M2
+ * uses the same table.
+ */
+static const unsigned int m1_pmu_cache_map[PERF_COUNT_HW_CACHE_MAX]
+					  [PERF_COUNT_HW_CACHE_OP_MAX]
+					  [PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+	PERF_CACHE_MAP_ALL_UNSUPPORTED,
+	[C(L1D)][C(OP_READ)][C(RESULT_MISS)]	= M1_PMU_PERFCTR_L1D_CACHE_MISS_LD,
 };
 
 static const unsigned m1_pmu_perf_map[PERF_COUNT_HW_MAX] = {
@@ -770,14 +802,26 @@ static void __m1_pmu_set_mode(u8 mode)
 	isb();
 }
 
+#ifdef CONFIG_ARCH_APPLE
+static void apple_pmu_wfi_freeze_set(bool active)
+{
+	this_cpu_write(apple_pmu_wfi_freeze, active);
+}
+#else
+static void apple_pmu_wfi_freeze_set(bool active) { }
+#endif
+
 static void m1_pmu_start(struct arm_pmu *cpu_pmu)
 {
+	/* arm_pmu only starts the PMU with at least one event on it. */
+	apple_pmu_wfi_freeze_set(true);
 	__m1_pmu_set_mode(PMCR0_IMODE_FIQ);
 }
 
 static void m1_pmu_stop(struct arm_pmu *cpu_pmu)
 {
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 }
 
 static int m1_pmu_map_event(struct perf_event *event)
@@ -788,7 +832,7 @@ static int m1_pmu_map_event(struct perf_event *event)
 	 * being 47bit wide to mimick the behaviour of the ARM PMU.
 	 */
 	event->hw.flags |= ARMPMU_EVT_47BIT;
-	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &m1_pmu_perf_map, &m1_pmu_cache_map, M1_PMU_CFG_EVENT);
 }
 
 static int m2_pmu_map_event(struct perf_event *event)
@@ -799,20 +843,22 @@ static int m2_pmu_map_event(struct perf_event *event)
 	 * Yes, this is getting awkward.
 	 */
 	event->hw.flags |= ARMPMU_EVT_63BIT;
-	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &m1_pmu_perf_map, &m1_pmu_cache_map, M1_PMU_CFG_EVENT);
 }
 
 static int m4_pmu_map_event(struct perf_event *event)
 {
 	/* 64bit counters, overflow flag on bit 63, as on M2. */
 	event->hw.flags |= ARMPMU_EVT_63BIT;
-	return armpmu_map_event(event, &m4_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &m4_pmu_perf_map, &m4_pmu_cache_map,
+				M4_PMU_CFG_EVENT);
 }
 
 static int t6050_pmu_map_event(struct perf_event *event)
 {
 	event->hw.flags |= ARMPMU_EVT_63BIT;
-	return armpmu_map_event(event, &t6050_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
+	return armpmu_map_event(event, &t6050_pmu_perf_map, &t6050_pmu_cache_map,
+				M4_PMU_CFG_EVENT);
 }
 
 static int __m1_pmu_map_pmuv3_event(const u16 *map, unsigned int eventsel)
@@ -856,6 +902,7 @@ static void m1_pmu_reset(void *info)
 	int i;
 
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 
 	for (i = 0; i < M1_PMU_NR_COUNTERS; i++) {
 		m1_pmu_disable_counter(i);
@@ -992,6 +1039,20 @@ static int t6050_pmu_init(struct arm_pmu *cpu_pmu)
 	return 0;
 }
 
+/*
+ * The M5 (T8142) cores count as the M5 Pro and Max cores do: XNU's event
+ * table is the same in both kernels, and macOS's event database for the
+ * M5 lists the same counter classes, so take T6050's tables.
+ */
+static int t8142_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret = t6050_pmu_init(cpu_pmu);
+
+	if (!ret)
+		cpu_pmu->name = "apple_t8142_pmu";
+	return ret;
+}
+
 static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 {
 	cpu_pmu->name = "apple_t8140_pmu";
@@ -1002,6 +1063,7 @@ static const struct of_device_id m1_pmu_of_device_ids[] = {
 	{ .compatible = "apple,t8140-pmu",	.data = m4_pmu_t8140_init, },
 	{ .compatible = "apple,t6040-pmu",	.data = m4_pmu_t6040_init, },
 	{ .compatible = "apple,t6050-pmu",	.data = t6050_pmu_init, },
+	{ .compatible = "apple,t8142-pmu",	.data = t8142_pmu_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
@@ -1025,3 +1087,7 @@ static struct platform_driver m1_pmu_driver = {
 };
 
 module_platform_driver(m1_pmu_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_M1_CPU_PMU_KUNIT_TEST)
+#include "apple_m1_cpu_pmu-test.c"
+#endif

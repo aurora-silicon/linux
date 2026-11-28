@@ -135,6 +135,8 @@ struct ave_start_layout {
 	u32 const_214;
 	u32 const_218;
 	struct ave_rational_layout fps;
+	/* A second copy of the integer frame rate (26A428 Start). */
+	u32 fps_int_copy;
 	u32 rc_mode;
 	/* Optional ABI-specific wire value for the driver's fixed-QP mode. */
 	u32 rc_mode_fixed_qp;
@@ -220,7 +222,7 @@ struct ave_start_layout {
 	u32 h264_scaling_4x4;
 	u32 h264_scaling_8x8;
 	u32 h264_sve_count;
-	u32 h264_multi_me;
+	u32 multi_me; /* u16: 6070 second ME unit for two active references */
 	u32 h264_vui_restriction;
 	u32 h264_vui_mv_over_boundaries;
 	u32 h264_vui_max_bytes_denom;
@@ -250,8 +252,10 @@ struct ave_start_layout {
 	u32 hevc_conf_right;
 	u32 hevc_conf_top;
 	u32 hevc_conf_bottom;
+	u32 hevc_chroma_format;
 	u32 hevc_depth_luma;
 	u32 hevc_depth_chroma;
+	u32 hevc_log2_max_poc_lsb_minus4;
 	u32 hevc_refs;
 	u32 hevc_reorder_copy;
 	u32 hevc_dpb_minus1;
@@ -289,6 +293,8 @@ struct ave_start_layout {
 	u32 hevc_sps_fw_header;
 	u32 hevc_sps_header_len;
 	u32 hevc_pps_extra_slice_bits;
+	u32 hevc_pps_l0_default_active_minus1;
+	u32 hevc_pps_l1_default_active_minus1;
 	u32 hevc_pps_init_qp;
 	u32 hevc_pps_cu_qp_delta;
 	u32 hevc_pps_cu_qp_depth;
@@ -335,6 +341,10 @@ struct ave_proc_layout {
 	u32 crop; /* HEVC only */
 	u32 meta_size, extra, frame_size;
 	u32 low_delay; /* HEVC only: 3 with reordering off */
+	/* HEVC only: u8; one transcoder writes directly to the coded buffer. */
+	u32 hevc_single_transcoder;
+	/* HEVC only: nonzero selects the explicit short-term RPS in Process. */
+	u32 hevc_use_explicit_rps;
 	/* Per-picture reconstruction and motion-search selections. */
 	struct ave_recon_selection_layout current_recon, list0_recon;
 	struct ave_recon_selection_layout list0_recon_second, list1_recon;
@@ -373,13 +383,19 @@ struct ave_fw_layout {
 	u8 max_sessions;
 	u32 codec_state_bytes[2];
 	bool counted;
+	/*
+	 * A counted layout normally runs only 30 fps sessions with B-frames
+	 * (H.264 Baseline and intra-only aside). Set where the firmware build
+	 * has been shown to encode without B-frames and at other rates too.
+	 */
+	bool any_gop;
 };
 
 extern const struct ave_fw_abi ave_abi_9003, ave_abi_6070;
 extern const struct ave_fw_layout ave_layout_9003_78_0;
 extern const struct ave_fw_layout ave_layout_6070_11_1;
 /* Not selectable until its loader TEXT CRC is measured and qualified. */
-extern const struct ave_fw_layout ave_layout_26a428;
+extern const struct ave_fw_layout ave_layout_26a428, ave_layout_26b123;
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc);
 
 #endif

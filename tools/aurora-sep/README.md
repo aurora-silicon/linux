@@ -53,22 +53,30 @@ for example with `systemctl edit aurora-sep.service`:
 Environment=AURORA_SEP_READY_TIMEOUT=180
 ```
 
-The driver defaults to `xart_writes=1`. It exports no module alias, so udev
+The loader does not wait when the enclave refuses the identity key-bag unlock
+that trusted keys need: the driver's `diag/trusted` then reads
+`refused <status>`, and the loader logs it and exits at once, because asking
+again gets the same answer.
+
+SEP writes are always on: xART writes and identity-keybag provisioning have
+no switch. The driver's `xart_writes` and `provision_keybag` parameters were
+removed (aurora-silicon/linux#2591), and a stale value on the kernel command
+line or in modprobe.d is ignored. Kernels from before that change still honour a
+`0`, so remove any `xart_writes=0` or `provision_keybag=0` left from an earlier
+read-only install. The driver exports no module alias, so udev
 never loads it on its own: the service above loads it, once the iBoot system
 container is reachable. Writes are accepted only when the APFS `.gl`
 extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
-fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
-modprobe configuration to retain read-only operation. `provision_keybag=1`
-is also the default: first boot creates the Linux identity needed for trusted
+fail closed. The first boot creates the Linux identity needed for trusted
 keys, and later boots recover that identity and its machine reference key.
 An existing unreadable or invalid identity is not silently replaced.
-Enabling writes has been tested on m2 with identity-keybag provisioning,
+Writes were first tested on m2 with identity-keybag provisioning,
 trusted-key seal/unseal, and reboot reload. The raw iBoot container hash did not
 change in those tests, so an actual xART write was **not** validated. Do not
 infer that all SEP or Touch ID operations work with a read-only GigaLocker.
-Read `XART-SAFETY.md` before enabling writes on another dual-boot machine.
+Read `XART-SAFETY.md` before installing on a machine that also runs macOS.
 
 For read-only structural diagnostics on Linux, run
 `sudo python3 apfs-xart-inspect.py /dev/disk/by-partlabel/iBootSystemContainer`.
@@ -335,10 +343,15 @@ suspend instead, so pressing while authenticating loses nothing and the next
 press wakes the machine, and holding the button for 5 s powers off cleanly.
 GNOME sessions and the GDM login screen handle a short press themselves
 (`power-button-action`, `suspend` by default); the setting covers consoles
-and other desktops. It takes effect at the next boot. By hand:
+and other desktops. It takes effect at the next boot. The packages install it
+as `05-aurora-sep.conf`: logind sorts the drop-ins of `/etc` and `/usr/lib` by
+file name and the last one wins, so it only replaces logind's own default,
+and a distribution or administrator drop-in (`HandlePowerKey=ignore` where a
+compositor shows its own power menu, for example) still takes precedence. By
+hand:
 
 ```sh
-install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
+install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/05-aurora-sep.conf
 ```
 
 GNOME Shell 51 offers fingerprint only on the lock screen, never on the

@@ -16,7 +16,62 @@ struct hwx_range {
 	u64 start, size;
 };
 
+struct hwx_target {
+	u32 subtype;
+	u32 linear, mixed;
+	unsigned int header_words;
+	u32 trailer_bar;
+	bool has_perf_record;
+	bool allow_zero_prologue;
+	bool require_tight_end;
+	bool allow_stabs_note;
+	bool allow_slot5_table;
+	bool allow_zero_scratch_text_flags;
+};
+
+static const struct hwx_target *hwx_target(u32 subtype)
+{
+	static const struct hwx_target targets[] = {
+		{
+			.subtype = ANE_HWX_SUBTYPE_H15,
+			.linear = 0x890,
+			.mixed = 0x8b0,
+			.header_words = 8,
+			.trailer_bar = 5,
+			.allow_zero_prologue = true,
+		},
+		{
+			.subtype = ANE_HWX_SUBTYPE_H16,
+			.linear = 0x8a0,
+			.mixed = 0x8c0,
+			.header_words = 9,
+			.trailer_bar = 4,
+			.has_perf_record = true,
+			.require_tight_end = true,
+		},
+		{
+			.subtype = ANE_HWX_SUBTYPE_H17,
+			.linear = 0x8a0,
+			.mixed = 0x8c0,
+			.header_words = 9,
+			.trailer_bar = 4,
+			.has_perf_record = true,
+			.allow_zero_prologue = true,
+			.allow_stabs_note = true,
+			.allow_slot5_table = true,
+			.allow_zero_scratch_text_flags = true,
+		},
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(targets); i++)
+		if (targets[i].subtype == subtype)
+			return &targets[i];
+	return NULL;
+}
+
 struct hwx_parser {
+	const struct hwx_target *target;
 	const u8 *bytes;
 	size_t size, command_end;
 	struct ane_h16_hwx info;
@@ -25,7 +80,7 @@ struct hwx_parser {
 	u32 tensors[ANE_H16_SURFACES], refs[ANE_H16_SURFACES];
 	u32 tensor_count, ref_count, segment_count, file_count, section_count;
 	u32 symoff, nsyms, stroff, strsize;
-	bool guard, symtab, metadata;
+	bool guard, symtab, metadata, note;
 };
 
 static bool hwx_fits(u64 start, u64 length, u64 size)
@@ -73,7 +128,7 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 {
 	struct ane_h16_hwx_section *dest;
 	u64 vm, size, file, filesz;
-	u32 nsects, prot, i;
+	u32 nsects, prot, flags, i;
 	bool text, kernel, scratch, surface, guard;
 
 	if (length < 72)
@@ -112,9 +167,17 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 		   hwx_file_add(p, file, filesz)) {
 		return -ENOEXEC;
 	}
-	if (get_unaligned_le32(c + 68) != (surface ? 6 : text ?
-		(p->info.scratch.size ? 4 : 0) : 4))
+	/*
+	 * __TEXT is SG_NORELOC (4) beside a scratch segment in the MobileNet program; Apple's
+	 * zin_ane_compiler 10.205 marks it 0 there too on H17 (relocations are checked below).
+	 */
+	flags = get_unaligned_le32(c + 68);
+	if (text && p->target->allow_zero_scratch_text_flags && p->info.scratch.size) {
+		if (flags != 4 && flags)
+			return -ENOEXEC;
+	} else if (flags != (surface ? 6 : text ? (p->info.scratch.size ? 4 : 0) : 4)) {
 		return -ENOEXEC;
+	}
 	if ((text && (prot != 5 || nsects != 2 || p->info.text.size)) ||
 	    (kernel && (prot != 1 || nsects != 1 || p->info.kernel.size)) ||
 	    (scratch && (prot != 3 || p->info.scratch.size)) ||
@@ -206,15 +269,33 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	return 0;
 }
 
+/*
+ * The fp32 trailer word at +0x880 (+0x8a0 with scratch) is 10000.0f in HWX
+ * from ANECompiler 10.205 and mil-hwx-compiler, and 1000.0f in H16 and H17
+ * HWX from ANECompiler 10.302 (macOS 27.3). Both load; any other value is
+ * refused.
+ */
+static u32 hwx_trailer_value(const u8 *c, u32 offset)
+{
+	u32 value = get_unaligned_le32(c + offset);
+
+	return value == 0x447a0000 ? value : 0x461c4000;
+}
+
 static int hwx_program(struct hwx_parser *p)
 {
+	const struct hwx_target *t = p->target;
 	const u8 *c = p->bytes + p->info.program_offset;
 	struct ane_h16_hwx *info = &p->info;
-	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
-	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
+	u32 length = get_unaligned_le32(c + 4), records, record_limit, table, i, off, count;
+	u32 prologue = 1;
 	size_t final_end = 0;
 	u64 work_limit = 0;
-	bool mixed = length == 0x8c0;
+	bool mixed = length == t->mixed;
+
+	if (t->allow_zero_prologue && info->text.size >= 4 &&
+	    !get_unaligned_le32(p->bytes + info->text.offset))
+		prologue = 0;
 	/* Nonzero cells only; every other byte is checked below. */
 	static const u16 common[] = {
 		0, 4, 8, 0xc, 0x10, 0x14, 0x20, 0x24, 0x40, 0x44,
@@ -224,9 +305,9 @@ static int hwx_program(struct hwx_parser *p)
 	u8 *expected;
 	int ret = -ENOEXEC;
 
-	if (length != 0x8a0 && !mixed)
+	if (length != t->linear && !mixed)
 		return -ENOEXEC;
-	if (get_unaligned_le32(c + 0xc) != (mixed ? 0x22a : 0x222) ||
+	if (get_unaligned_le32(c + 0xc) != length / 4 - 6 ||
 	    get_unaligned_le64(c + 0x10) != info->text.vm ||
 	    get_unaligned_le64(c + 0x810) != info->text.vm ||
 	    get_unaligned_le64(c + 0x20) != info->constants.vm ||
@@ -235,7 +316,7 @@ static int hwx_program(struct hwx_parser *p)
 	    get_unaligned_le32(c + 0x838) != U32_MAX ||
 	    get_unaligned_le32(c + 0x83c) != U32_MAX ||
 	    get_unaligned_le32(c + 0x844) != 0xffff ||
-	    get_unaligned_le32(c + 0x848) != (mixed ? 0x8b8 : 0x898))
+	    get_unaligned_le32(c + 0x848) != length - 8)
 		return -ENOEXEC;
 	records = get_unaligned_le32(c + 0x860);
 	info->tasks = get_unaligned_le32(c + 0x830);
@@ -250,12 +331,18 @@ static int hwx_program(struct hwx_parser *p)
 		   get_unaligned_le32(c + 0x858)) {
 		return -ENOEXEC;
 	}
+	/*
+	 * BAR slot s takes its base from the qword at +0x10 * (s + 1). The surfaces then the
+	 * kernel fill consecutive slots from slot 6 (+0x70); Apple's zin_ane_compiler 10.205
+	 * starts the same run at slot 5 (+0x60) on H17, the task stream naming slots 5, 6, 7.
+	 */
+	table = t->allow_slot5_table && get_unaligned_le64(c + 0x60) ? 0x60 : 0x70;
 	for (i = 0; i < 5; i++) {
 		u64 base = i < info->surface_count ? info->surfaces[i].section.vm :
 			   i == info->surface_count ? info->kernel.vm : 0;
 
-		if (get_unaligned_le64(c + 0x70 + i * 16) != base ||
-		    get_unaligned_le64(c + 0x78 + i * 16))
+		if (get_unaligned_le64(c + table + i * 16) != base ||
+		    get_unaligned_le64(c + table + 8 + i * 16))
 			return -ENOEXEC;
 	}
 	/*
@@ -265,7 +352,7 @@ static int hwx_program(struct hwx_parser *p)
 	 */
 	for (i = 0; i < info->surface_count; i++)
 		work_limit += info->surfaces[i].allocation;
-	if (get_unaligned_le32(c + (mixed ? 0x8b0 : 0x890)) > work_limit)
+	if (get_unaligned_le32(c + length - 16) > work_limit)
 		return -ENOEXEC;
 
 	/* Construct the exact fixed trailer and reserved-space expectation. */
@@ -275,30 +362,38 @@ static int hwx_program(struct hwx_parser *p)
 	for (i = 0; i < ARRAY_SIZE(common); i++)
 		memcpy(expected + common[i], c + common[i], 4);
 	for (i = 0; i < 5; i++)
-		memcpy(expected + 0x70 + i * 16, c + 0x70 + i * 16, 8);
-	put_unaligned_le32(4, expected + 0x868);
-	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
-	put_unaligned_le32(mixed ? 2 : 7, expected + 0x878);
-	put_unaligned_le32(8, expected + 0x87c);
-	put_unaligned_le32(mixed ? get_unaligned_le32(c + 0x858) : 0x461c4000,
-			   expected + 0x880);
-	put_unaligned_le32(mixed ? 3 : 9, expected + 0x888);
-	put_unaligned_le32(8, expected + 0x88c);
+		memcpy(expected + table + i * 16, c + table + i * 16, 8);
+	count = 1 + (mixed ? 2 : 0) + (t->has_perf_record ? 1 : 0);
+	put_unaligned_le32(t->trailer_bar, expected + 0x868);
+	put_unaligned_le32(count, expected + 0x870);
+	off = 0x878;
 	if (mixed) {
-		put_unaligned_le32(0x08020004, expected + 0x890);
-		put_unaligned_le32(8, expected + 0x894);
-		put_unaligned_le32(7, expected + 0x898);
-		put_unaligned_le32(8, expected + 0x89c);
-		put_unaligned_le32(0x461c4000, expected + 0x8a0);
-		put_unaligned_le32(9, expected + 0x8a8);
-		put_unaligned_le32(8, expected + 0x8ac);
+		put_unaligned_le32(2, expected + off);
+		put_unaligned_le32(8, expected + off + 4);
+		put_unaligned_le32(get_unaligned_le32(c + 0x858), expected + off + 8);
+		off += 16;
+		put_unaligned_le32(3, expected + off);
+		put_unaligned_le32(8, expected + off + 4);
+		put_unaligned_le32(0x08020004, expected + off + 8);
+		put_unaligned_le32(8, expected + off + 12);
+		off += 16;
 	}
-	memcpy(expected + (mixed ? 0x8b0 : 0x890), c + (mixed ? 0x8b0 : 0x890), 4);
-	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
+	if (t->has_perf_record) {
+		put_unaligned_le32(7, expected + off);
+		put_unaligned_le32(8, expected + off + 4);
+		put_unaligned_le32(hwx_trailer_value(c, off + 8), expected + off + 8);
+		off += 16;
+	}
+	put_unaligned_le32(9, expected + off);
+	put_unaligned_le32(8, expected + off + 4);
+	memcpy(expected + off + 8, c + off + 8, 4);
+	off += 16;
+	memcpy(expected + off, "main", 5);
 	if (!memcmp(c, expected, length)) {
-		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
-							info->text.size, info->tasks, prologue,
-							&record_limit, &final_end);
+		ret = ane_hx_task_stream_validate_hdr(p->bytes + info->text.offset,
+						      info->text.size, info->tasks, prologue,
+						      info->task_header_words, &record_limit,
+						      &final_end);
 		/* This compiler hint need not equal the encoded record count. */
 		if (!ret && (!records || records > record_limit))
 			ret = -ENOEXEC;
@@ -307,8 +402,7 @@ static int hwx_program(struct hwx_parser *p)
 		 * zero blocks after it leave the engine armed, and the next
 		 * EXECUTE on the device times out.
 		 */
-		if (!ret && info->subtype == ANE_HWX_SUBTYPE_H16 &&
-		    final_end != info->text.size)
+		if (!ret && t->require_tight_end && final_end != info->text.size)
 			ret = -ENOEXEC;
 	}
 	kfree(expected);
@@ -347,6 +441,36 @@ static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
 	return match;
 }
 
+/*
+ * Surface element formats: the descriptor's format code (+0x24) and the
+ * element size in bytes (+0x68) always come as one of these pairs in
+ * Apple's H16 and H17 objects. Observed 8-bit objects align rows to 64
+ * bytes like fp16 ones, so a row can be shorter than 2 * width and
+ * hwx_tensor() checks only the width * element floor (not row alignment).
+ * Any other pair (fp32, packed or unknown formats) stays refused.
+ */
+static const struct {
+	u32 format, element;
+} hwx_formats[] = {
+	{ 5, 2 },	/* fp16 */
+	{ 2, 1 },	/* int8 */
+	{ 3, 1 },	/* uint8 */
+};
+
+static u32 hwx_element_size(const u8 *c)
+{
+	u32 format = get_unaligned_le32(c + 0x24);
+	unsigned int i;
+
+	if (get_unaligned_le32(c + 0x6c))
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(hwx_formats); i++)
+		if (hwx_formats[i].format == format &&
+		    hwx_formats[i].element == get_unaligned_le32(c + 0x68))
+			return hwx_formats[i].element;
+	return 0;
+}
+
 static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 {
 	struct ane_h16_hwx_surface *b = &p->info.surfaces[index];
@@ -356,17 +480,19 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	u64 n, channels, height, width, row, plane, batch, minimum;
 	size_t symbol_length, short_length;
 	unsigned int i;
+	u32 element;
 
 	if (length < 0xd48 || length > SZ_16K || get_unaligned_le32(c + 0xc) != 0x34a ||
 	    get_unaligned_le32(c + 0x10) != 3 ||
 	    get_unaligned_le32(c + 0x14) != b->direction ||
 	    get_unaligned_le32(c + 0x18) != 0xd38 || !hwx_zero(c, 0x1c, 0x20) ||
 	    get_unaligned_le32(c + 0x20) != 0xd3d ||
-	    get_unaligned_le32(c + 0x24) != 5 ||
 	    get_unaligned_le32(c + 0x38) != 1 || !hwx_zero(c, 0x3c, 0x50) ||
-	    get_unaligned_le64(c + 0x68) != 2 ||
 	    get_unaligned_le32(c + 0x78) != 1 || !hwx_zero(c, 0x88, 0xd38) ||
 	    memcmp(c + 0xd38, "main", 5))
+		return -ENOEXEC;
+	element = hwx_element_size(c);
+	if (!element)
 		return -ENOEXEC;
 	n = get_unaligned_le32(c + 0x28);
 	channels = get_unaligned_le32(c + 0x2c);
@@ -376,7 +502,7 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	plane = get_unaligned_le64(c + 0x58);
 	row = get_unaligned_le64(c + 0x60);
 	if (!n || !channels || !height || !width ||
-	    check_mul_overflow(width, 2ULL, &minimum) || row < minimum ||
+	    check_mul_overflow(width, (u64)element, &minimum) || row < minimum ||
 	    check_mul_overflow(height, row, &minimum) || plane < minimum ||
 	    check_mul_overflow(channels, plane, &minimum) || batch < minimum ||
 	    get_unaligned_le64(c + 0x70) != batch ||
@@ -423,9 +549,18 @@ static int hwx_symbols(struct hwx_parser *p)
 		u64 value = get_unaligned_le64(s + 8);
 		const struct ane_h16_hwx_section *section;
 		const char *name;
+		/*
+		 * zin_ane_compiler 10.205 (H17) adds stabs type records (N_GSYM 0x20 for each
+		 * surface, N_LSYM 0x80 for each element type) with no section and value 0.
+		 * n_desc holds the stabs type number. They name no address; their strings are
+		 * still checked below.
+		 */
+		bool h17 = p->target->allow_stabs_note;
+		bool stab = h17 && (s[4] == 0x20 || s[4] == 0x80);
 
-		if (strx >= p->strsize || !s[5] || s[5] > p->section_count ||
-		    (s[4] & ~1) != 0xe)
+		if (strx >= p->strsize ||
+		    (stab ? s[5] || value :
+			    !s[5] || s[5] > p->section_count || (s[4] & ~1) != 0xe))
 			return -ENOEXEC;
 		name = p->bytes + p->stroff + strx;
 		if (!*name || strnlen(name, min_t(u32, 256, p->strsize - strx)) ==
@@ -437,8 +572,12 @@ static int hwx_symbols(struct hwx_parser *p)
 			if (!strcmp(name, p->bytes + p->stroff + previous))
 				return -ENOEXEC;
 		}
+		if (stab)
+			continue;
 		section = &p->sections[s[5] - 1];
-		if (value < section->vm || value - section->vm >= section->size)
+		/* H17 places the empty per-core kernel objects (…_ne_N) at the section end. */
+		if (value < section->vm || value - section->vm > section->size ||
+		    (value - section->vm == section->size && !h17))
 			return -ENOEXEC;
 		for (j = 0; j < p->info.surface_count; j++) {
 			const struct ane_h16_hwx_surface *b = &p->info.surfaces[j];
@@ -461,37 +600,30 @@ static int hwx_symbols(struct hwx_parser *p)
 static bool hwx_relocations_in_payload(const struct hwx_parser *p, unsigned long *sites)
 {
 	const u8 *text = p->bytes + p->info.text.offset;
-	size_t pos = 16;
+	struct ane_hx_task t;
+	size_t pos = 16, record;
+	u32 count;
+	int ret;
 
 	while (pos < p->info.text.size) {
-		u32 words = (get_unaligned_le32(text + pos) >> 16) & 0x7ff;
-		size_t end, record;
-
-		if (!words) {
-			pos += 16;
+		ret = ane_hx_task_frame(text, p->info.text.size, pos,
+					p->info.task_header_words, &t);
+		if (ret < 0)
+			return false;
+		pos = t.next;
+		if (!ret)
 			continue;
+		for (record = t.rec; record < t.end; record += 4 + count * 4) {
+			count = ane_hx_record_count(get_unaligned_le32(text + record));
+			bitmap_clear(sites, record / 4 + 1, count);
 		}
-		end = pos + words * 4;
-		record = pos + 9 * 4;
-		if ((get_unaligned_le32(text + pos + 8 * 4) & 3) == 3)
-			record += 4;
-		while (record < end) {
-			u32 header = get_unaligned_le32(text + record);
-			u32 count = header & BIT(31) ?
-				1 + hweight32((header >> 15) & 0xffff) :
-				1 + ((header >> 15) & 0x3f);
-
-			record += 4;
-			bitmap_clear(sites, record / 4, count);
-			record += count * 4;
-		}
-		pos = ALIGN(end, 16);
 	}
 	return bitmap_empty(sites, p->info.text.size / 4);
 }
 
 int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *info)
 {
+	const struct hwx_target *target;
 	struct hwx_parser *p;
 	const void *relocations;
 	const u8 *c = bytes;
@@ -502,10 +634,11 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 
 	if (!c || !info || size < 32 || size > ANE_H16_HWX_MAX ||
 	    get_unaligned_le32(c) != 0xbeefface || get_unaligned_le32(c + 4) != 0x80 ||
-	    (get_unaligned_le32(c + 8) != ANE_HWX_SUBTYPE_H16 &&
-	     get_unaligned_le32(c + 8) != ANE_HWX_SUBTYPE_H17) ||
 	    get_unaligned_le32(c + 12) != 2 ||
 	    get_unaligned_le32(c + 24) != 0x200000 || get_unaligned_le32(c + 28))
+		return -ENOEXEC;
+	target = hwx_target(get_unaligned_le32(c + 8));
+	if (!target)
 		return -ENOEXEC;
 	count = get_unaligned_le32(c + 16);
 	length = get_unaligned_le32(c + 20);
@@ -514,10 +647,12 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	p = kzalloc_obj(*p);
 	if (!p)
 		return -ENOMEM;
+	p->target = target;
 	p->bytes = bytes;
 	p->size = size;
 	p->command_end = 32 + (size_t)length;
-	p->info.subtype = get_unaligned_le32(p->bytes + 8);
+	p->info.subtype = target->subtype;
+	p->info.task_header_words = target->header_words;
 	for (i = 0; i < count; i++) {
 		u32 cmd, len;
 
@@ -551,7 +686,8 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 					goto invalid;
 				p->tensors[p->tensor_count++] = pos;
 			} else if (get_unaligned_le32(c + 8) == 4) {
-				if (p->info.program_offset || (len != 0x8a0 && len != 0x8c0))
+				if (p->info.program_offset ||
+				    (len != p->target->linear && len != p->target->mixed))
 					goto invalid;
 				p->info.program_offset = pos;
 			} else {
@@ -575,6 +711,17 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 			p->metadata = true;
 			break;
 		}
+		case 0x31:
+			/*
+			 * LC_NOTE: zin_ane_compiler 10.205 (H17) records its runtime version
+			 * inline, offset 40 into this command, 4 bytes. It maps nothing.
+			 */
+			if (!p->target->allow_stabs_note || p->note || len != 48 ||
+			    !hwx_name(c + 8, "rt.version") || get_unaligned_le64(c + 24) != 40 ||
+			    get_unaligned_le64(c + 32) != 4 || !hwx_zero(c, 44, len))
+				goto invalid;
+			p->note = true;
+			break;
 		default:
 			goto invalid;
 		}

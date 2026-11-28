@@ -87,6 +87,9 @@ struct brcmf_bus_dcmd {
  * @get_memdump: obtain device memory dump in provided buffer.
  * @get_blob: obtain a firmware blob.
  * @remove: initiate unbind of the device.
+ * @ctl_stall: a control request got no response or could not be queued;
+ *	@stalls counts such requests since the last one that completed
+ *	(optional).
  *
  * This structure provides an abstract interface towards the
  * bus specific driver. For control messages to common driver
@@ -109,6 +112,7 @@ struct brcmf_bus_ops {
 	int (*reset)(struct device *dev);
 	void (*remove)(struct device *dev);
 	void (*d2h_mb_rx)(struct device *dev, u32 data);
+	void (*ctl_stall)(struct device *dev, u32 stalls);
 };
 
 
@@ -161,6 +165,8 @@ struct brcmf_bus_stats {
  * @always_use_fws_queue: bus wants use queue also when fwsignal is inactive.
  * @wowl_transport: bus can keep the firmware running during system sleep.
  * @wowl_wake: platform can route a wake signal from the device.
+ * @wowl_s2idle_only: the wake signal only works while the link stays up (in-band
+ *	MSI): there is no WoWLAN in a system sleep deeper than suspend-to-idle.
  * @ops: callbacks for this bus instance.
  * @msgbuf: msgbuf protocol parameters provided by bus layer.
  * @list: member used to add this bus instance to linked list.
@@ -183,6 +189,7 @@ struct brcmf_bus {
 	bool always_use_fws_queue;
 	bool wowl_transport;
 	bool wowl_wake;
+	bool wowl_s2idle_only;
 	bool removing;		/* device removal in progress; quiesce async work */
 	struct mutex bus_reset_lock;
 
@@ -192,6 +199,7 @@ struct brcmf_bus {
 	struct list_head list;
 };
 
+void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if);
 void brcmf_bus_cancel_reset_work(struct brcmf_bus *bus_if);
 void brcmf_bus_allow_reset_work(struct brcmf_bus *bus_if);
 
@@ -302,6 +310,15 @@ void brcmf_bus_d2h_mb_rx(struct brcmf_bus *bus, u32 data)
 		return;
 
 	return bus->ops->d2h_mb_rx(bus->dev, data);
+}
+
+static inline
+void brcmf_bus_ctl_stall(struct brcmf_bus *bus, u32 stalls)
+{
+	if (!bus->ops->ctl_stall)
+		return;
+
+	bus->ops->ctl_stall(bus->dev, stalls);
 }
 
 /*

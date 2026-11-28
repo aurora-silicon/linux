@@ -14,7 +14,7 @@ DRIVER = 'drivers/soc/apple/rtkit.c'
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:void|int) ' + name + r'\(', source, re.M)
+    match = re.search(r'^(?:static )?(?:void|int|bool) ' + name + r'\(', source, re.M)
     assert match, name
     opening = source.index('{', match.end())
     depth, end = 1, opening + 1
@@ -37,6 +37,9 @@ typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #define APPLE_RTKIT_MAX_ENDPOINTS 256
 #define WRITE_ONCE(x,v) ((x)=(v))
+/* As the shared Apple configuration builds it. */
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
 #define cmpxchg(p,o,n) __sync_val_compare_and_swap((p),(o),(n))
 #define spin_lock_irqsave(l,f) ((void)(l), (f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l), (void)(f))
@@ -52,6 +55,8 @@ struct apple_rtkit {
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  bool oslog_echo;
  u64 oslog_owed;
+ /* Read only by the J714s firmware 27 sleep; a failed echo sets it. */
+ bool v27_rx_failed;
  int boot_result;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4], started[4];
@@ -69,6 +74,7 @@ static bool of_machine_is_compatible(const char *s)
 #define kfifo_reset(f) (*(f)=0)
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) (++warnings)
+#define dev_warn_ratelimited(...) (++warnings)
 #define dev_err(...) (++errors)
 static void set_bit(unsigned n, unsigned long *b) { b[n/64] |= 1UL << (n%64); }
 static void bitmap_zero(unsigned long *b, unsigned n) { memset(b,0,n/8); }
@@ -166,9 +172,18 @@ def main():
     # Older receivers have no LOG constant or inherited field writes.
     if not re.search(r'#define APPLE_RTKIT_OSLOG_LOG\s', constants):
         constants += '\n#define APPLE_RTKIT_OSLOG_LOG 2\n'
-    bodies = '\n'.join(function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit'])
+    # The session reset reinit() and a cold restart share, where the driver has one.
+    names = ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running']
+    # The echo's predicate, where the receiver is built on one.
+    if 'static bool apple_rtkit_oslog_echoed(' in source:
+        names[:0] = ['apple_rtkit_oslog_unanswered', 'apple_rtkit_oslog_echoed']
+    if 'static void apple_rtkit_reset_session(' in source:
+        names.append('apple_rtkit_reset_session')
+    names.append('apple_rtkit_reinit')
+    bodies = '\n'.join(function(source, name) for name in names)
     if args.mutate == 'admission':
         bodies = bodies.replace('(!rtk->oslog_buffer.size && !rtk->oslog_inherited)', 'false')
+        bodies = bodies.replace('(rtk->oslog_buffer.size || rtk->oslog_inherited)', 'true')
     elif args.mutate == 'channel':
         bodies = bodies.replace('(msg & APPLE_RTKIT_OSLOG_LOG_RESERVED)', 'false')
     elif args.mutate == 'counter':
@@ -179,7 +194,7 @@ def main():
         bodies = bodies.replace('apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);', '')
     # A mutation that no longer matches the driver would test nothing.
     assert not args.mutate or bodies != '\n'.join(
-        function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit']), \
+        function(source, name) for name in names), \
         'stale mutation: ' + args.mutate
     code = PREFIX.replace('struct apple_rtkit_shmem', constants + '\nstruct apple_rtkit_shmem', 1) + bodies + MAIN
 

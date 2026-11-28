@@ -45,9 +45,13 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
+    # What a sink left out (DCP_METADATA_DEFAULT_*), as the parser notes it.
+    defaults = ''.join(re.sub(r'\bBIT\((\d+)\)', r'(1U << \1)', d) + '\n'
+                       for d in source_defines(metadata) if d.startswith('#define DCP_METADATA_DEFAULT_'))
     metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
                 block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
-                block(metadata, 'struct dcp_color_space {') + ';\n')
+                block(metadata, 'struct dcp_color_space {') + ';\n' +
+                defaults)
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
@@ -94,14 +98,55 @@ def parser_fixture(root):
     pq_raw = bytearray(struct.pack('<I', 0xd3))
     wire(pq_fixture, pq_raw)
     timing_source += 'static const unsigned char pq_blob[] = {' + ','.join(map(str,pq_raw)) + '};\n'
-    # Without link bandwidth for PQ RGB: YCbCr 4:4:4 BT.2020, never 4:2:2.
+    # Without link bandwidth for PQ RGB: YCbCr 4:4:4 (encoding=3) BT.2020 outranks 4:2:2 (encoding=2).
     ycc_fixture = [dict(timing_fixture[0], ColorModes=[
-        color(85, 1, 10, 0, 10), color(95, 5, 12, 2, 7, encoding=2), color(96, 9, 10, 2, 7, encoding=2),
-        color(97, 20, 12, 2, 7, encoding=3), color(98, 30, 10, 2, 9)],
+        color(85, 1, 10, 0, 10), color(95, 5, 12, 2, 7, encoding=3), color(96, 9, 10, 2, 7, encoding=3),
+        color(97, 20, 12, 2, 7, encoding=2), color(98, 30, 10, 2, 9)],
         UnsafeColorElementIDs=[96, 98])]
     ycc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(ycc_fixture, ycc_raw)
     timing_source += 'static const unsigned char ycc_blob[] = {' + ','.join(map(str,ycc_raw)) + '};\n'
+    # A fast external timing offers DSC RGB and uncompressed YCbCr 4:4:4 (encoding=3).
+    dsc_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(85, 1, 10, 0, 10), color(122, 5, 10, 2, 9),
+        color(127, 9, 10, 2, 7, encoding=3), color(130, 20, 10, 2, 9)],
+        UnsafeColorElementIDs=[130], DSCRequiredColorElementIDs=[122, 130])]
+    dsc_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(dsc_fixture, dsc_raw)
+    timing_source += 'static const unsigned char dsc_blob[] = {' + ','.join(map(str,dsc_raw)) + '};\n'
+    # An unsafe-only HDMI 2.0 >340 MHz timing (e.g. 1440p144): 8-bit SDR (24 bpp)
+    # caps non-DSC unsafe PQ to <=24 bpp (12-bit 4:2:2 id 105), rejecting both
+    # DSC-required PQ (113) and over-budget non-DSC 10-bit RGB PQ (114, 30 bpp).
+    unsafe_only_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(114, 20, 10, 2, 9), color(105, 5, 12, 2, 7, encoding=2),
+        color(113, 9, 10, 2, 9), color(80, 1, 8, 0, 10)],
+        UnsafeColorElementIDs=[80, 105, 113, 114], DSCRequiredColorElementIDs=[113])]
+    unsafe_only_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(unsafe_only_fixture, unsafe_only_raw)
+    timing_source += 'static const unsigned char unsafe_only_blob[] = {' + ','.join(map(str,unsafe_only_raw)) + '};\n'
+    # Acer 1080p180-shaped unsafe-only timing: 10-bit RGB SDR (30 bpp) admits 10-bit RGB PQ (30 bpp).
+    unsafe_30bpp_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(114, 20, 10, 2, 9), color(105, 5, 12, 2, 7, encoding=2),
+        color(86, 1, 10, 0, 10)],
+        UnsafeColorElementIDs=[86, 105, 114])]
+    unsafe_30bpp_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(unsafe_30bpp_fixture, unsafe_30bpp_raw)
+    timing_source += 'static const unsigned char unsafe_30bpp_blob[] = {' + ','.join(map(str,unsafe_30bpp_raw)) + '};\n'
+    # DP-to-HDMI bridge 4K60 YCbCr 4:2:0 via DownstreamFormat (MCDP2900 CE 119/162),
+    # plus an upstream RGB element with DownstreamFormat=420 to prove sdr_rgb stays intact.
+    ds420_fixture = [dict(timing_fixture[0], ColorModes=[
+        dict(color(80, 242999, 8, 0, 10, encoding=0),
+             DownstreamFormat=color(79, 242999, 8, 0, 1, encoding=1, dynamic=1)),
+        color(83, 232999, 8, 0, 1, encoding=3, dynamic=1),
+        dict(color(119, 202232, 8, 0, 1, encoding=3, dynamic=1),
+             DownstreamFormat=color(118, 202999, 8, 0, 1, encoding=1, dynamic=1)),
+        color(105, 627999, 12, 2, 7, encoding=2, dynamic=1),
+        dict(color(162, 607627, 12, 2, 7, encoding=2, dynamic=1),
+             DownstreamFormat=color(161, 607999, 12, 2, 7, encoding=1, dynamic=1))],
+        UnsafeColorElementIDs=[80, 83, 105, 162])]
+    ds420_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(ds420_fixture, ds420_raw)
+    timing_source += 'static const unsigned char ds420_blob[] = {' + ','.join(map(str,ds420_raw)) + '};\n'
     # Default mode: an external display's native resolution at its highest
     # usable refresh rate; a panel keeps the timing its firmware prefers.
     def timing(i, w, h, hz, pref, score, unsafe=False):
@@ -326,6 +371,67 @@ int main(int argc, char **argv)
         assert(!IS_ERR(m) && n == 1 && m[0].pq.id == 95 && m[0].pq.depth == 12);
         assert(m[0].color_mode_id == 85);
         free(m);
+        for (unsigned int dsc = 0; dsc < 2; dsc++) {
+            assert(!parse(dsc_blob, sizeof(dsc_blob), &c));
+            c.pq_dsc = dsc;
+            m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+            assert(!IS_ERR(m) && n == 1 && m[0].color_mode_id == 85);
+            assert(m[0].pq.id == (dsc ? 122 : 127) && m[0].pq.depth == 10);
+            free(m);
+        }
+        /* Unsafe-only >340 MHz timing falls back to non-DSC unsafe PQ within
+         * sdr_unsafe_max_bpp: 24-bpp SDR picks 12-bit 4:2:2 (105) over 30-bpp
+         * non-DSC RGB (114) and DSC-required RGB (113); 30-bpp SDR picks 114. */
+        for (unsigned int dsc = 0; dsc < 2; dsc++) {
+            assert(!parse(unsafe_only_blob, sizeof(unsafe_only_blob), &c));
+            c.pq_dsc = dsc;
+            m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+            assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
+            assert(m[0].sdr_unsafe_max_bpp == 24);
+            assert(m[0].pq.id == 105 && m[0].pq.depth == 12 &&
+                   m[0].pq.format == DCP_COLOR_FORMAT_YCBCR422);
+            free(m);
+        }
+        assert(!parse(unsafe_30bpp_blob, sizeof(unsafe_30bpp_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && m[0].sdr_unsafe_max_bpp == 30);
+        assert(m[0].pq.id == 114 && m[0].pq.depth == 10 &&
+               m[0].pq.format == DCP_COLOR_FORMAT_RGB);
+        free(m);
+        /* DP-to-HDMI bridge 4K60 DownstreamFormat flags true wire YCbCr 4:2:0
+         * (CE 119 SDR, CE 162 PQ) while keeping upstream format intact (CE 80
+         * stays in sdr_rgb, CE 83 stays 4:4:4, CE 105 stays 4:2:2). */
+        assert(!parse(ds420_blob, sizeof(ds420_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && m[0].sdr_usable &&
+               m[0].sdr_rgb.id == 80 && m[0].sdr_rgb.format == DCP_COLOR_FORMAT_RGB &&
+               m[0].sdr_444.id == 83);
+        {
+            unsigned int found_420_sdr = 0, found_420_pq = 0, found_444 = 0, found_422 = 0;
+            for (unsigned int j = 0; j < m[0].nr_colors; j++) {
+                if (m[0].colors[j].id == 119) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444 &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420) &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
+                    found_420_sdr++;
+                } else if (m[0].colors[j].id == 162) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422 &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420) &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
+                    found_420_pq++;
+                } else if (m[0].colors[j].id == 83) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444 &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420));
+                    found_444++;
+                } else if (m[0].colors[j].id == 105) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422 &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420));
+                    found_422++;
+                }
+            }
+            assert(found_420_sdr == 1 && found_420_pq == 1 && found_444 == 1 && found_422 == 1);
+        }
+        free(m);
         /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
         static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
             { default_acer, sizeof(default_acer), false, 2 },
@@ -363,6 +469,23 @@ int main(int argc, char **argv)
     memset(&metadata, 0xa5, sizeof(metadata)); unchanged = metadata;
     assert(!parse(data, length, &ctx));
     int ret = parse_display_metadata(&ctx, &metadata);
+    if (argv[2][0] == 'd' || argv[2][0] == 't') {
+        /* Left out or out of range: noted and left undefined; the EDID is still built. */
+        unsigned long want = argv[2][0] == 'd' ? strtoul(argv[2] + 1, NULL, 0) : 0;
+        assert(!ret && (metadata.defaults & want) == want && (want || !metadata.defaults));
+        if (want & DCP_METADATA_DEFAULT_SIZE)
+            assert(!metadata.width_cm && !metadata.height_cm);
+        if (want & DCP_METADATA_DEFAULT_COLOR)
+            assert(!metadata.gamma && !metadata.white[0] && !metadata.chromaticity[0][0]);
+        if (want & DCP_METADATA_DEFAULT_DATE)
+            assert(!metadata.week && !metadata.year);
+        if (argv[2][0] == 't')
+            assert(strlen(metadata.name) == 13);
+        const struct drm_edid *e = dcp_metadata_edid(&metadata, NULL);
+        assert(!IS_ERR(e));
+        drm_edid_free(e);
+        free(data); return 0;
+    }
     if (atoi(argv[2])) {
         assert(ret == -EINVAL && !memcmp(&metadata, &unchanged, sizeof(metadata)));
         free(data); return 0;
@@ -424,11 +547,27 @@ int main(int argc, char **argv)
         assert(!memcmp(edid->cta, "\x02\x03\x08\x00\xe3\x06\x05\x01", 8));
         drm_edid_free(edid);
     }
+    /* A sync polarity the firmware leaves out is given as positive. */
     mode.flags = 0;
-    assert(IS_ERR(dcp_metadata_edid(&metadata, &mode)));
+    edid = dcp_metadata_edid(&metadata, &mode);
+    assert(!IS_ERR(edid));
+    {
+        const u8 *r = (const u8 *)&edid->raw;
+        assert((r[24] & DRM_EDID_FEATURE_PREFERRED_TIMING) && (r[54] | r[55]));
+        assert((r[71] & (DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE)) ==
+               (DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE));
+    }
+    drm_edid_free(edid);
+    /* No detailed timing holds the mode: a dummy descriptor, no preferred timing. */
     mode.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
     mode.clock++;
-    assert(IS_ERR(dcp_metadata_edid(&metadata, &mode)));
+    edid = dcp_metadata_edid(&metadata, &mode);
+    assert(!IS_ERR(edid));
+    {
+        const u8 *r = (const u8 *)&edid->raw;
+        assert(!(r[24] & DRM_EDID_FEATURE_PREFERRED_TIMING) && !r[54] && !r[55] && r[57] == 0x10);
+    }
+    drm_edid_free(edid);
     free(data);
     if (argc == 5) {
         f=fopen(argv[4],"rb"); assert(f && !fseek(f,0,SEEK_END));
@@ -529,6 +668,7 @@ def policy(root):
     state=r'''
 #define U64_MAX UINT64_MAX
 #define READ_ONCE(v) (v)
+#define smp_load_acquire(p) (*(p))
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DPTX_ENDPOINT_V2 0x2c
@@ -548,9 +688,10 @@ struct apple_connector {
 };
 struct apple_epic { struct apple_dcp *dcp; unsigned endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };
-struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; };
+struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; bool tile_hint; u32 tile_width, tile_height; };
 struct apple_dcp {
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw;
+    /* link_report: the link line of T6050's external processors; none is one here. */
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints, link_report; } hw;
     struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; struct dcp_metadata_ticket catalog_ticket;
         u64 catalog_connection_sequence; } metadata;
     struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;
@@ -562,7 +703,7 @@ struct apple_dcp {
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
-    bool ext_backlight, has_panel;
+    bool ext_backlight, has_panel, iomfb_template_pq;
     /* External pipes carry no internal panel identity. */
     void *panel_identity;
 };
@@ -730,6 +871,7 @@ struct apple_connector {''')
     state = state.replace('    struct work_struct hotplug_wq, bl_sync_wq;\n};', '    struct work_struct hotplug_wq, bl_sync_wq;\n    bool edid_live; unsigned hotplug_reasons;\n};', 1)
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
     struct apple_epic *dcpavservep;
+    void *desktop;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
     bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
@@ -742,6 +884,16 @@ struct apple_connector {''')
     start = state.index('static bool dcpavserv_edid_current(')
     state = state[:start]
 
+    dcp_c = (base/'dcp.c').read_text()
+    # The firmware-derived EDID reports what the sink left out, once the tree has it.
+    defaults_arg = re.search(r'dcp_firmware_edid\(\s*dcp,\s*&generation,\s*&defaults\s*\)', dcp_c + iomfb)
+    firmware_edid = ('static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation' +
+                     (',u32 *defaults) { (void)defaults; ' if defaults_arg else ') { ') +
+                     '(void)d; (void)generation; return ERR_PTR(-ENODATA); }\n')
+    if 'dcp_metadata_timing_fits(' in dcp_c:
+        # A detailed timing descriptor holds a pixel clock of at most 655.35 MHz.
+        firmware_edid += ('static bool dcp_metadata_timing_fits(const struct drm_display_mode *m) '
+                          '{ return m->clock > 0 && m->clock <= 655350 && !(m->clock % 10); }\n')
     stubs = r'''
 /* The rate/HPD fixture is an external H17P sink; it never selects M4. */
 #define iomfb_is_v26_6(dcp) false
@@ -762,6 +914,8 @@ struct apple_connector {''')
 #define DCP_FW_VERSION(a,b,c) (a)
 #define SZ_1M (1024*1024)
 #define kzalloc(n,f) calloc(1,n)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define dev_err(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_info(...) ((void)0)
@@ -775,11 +929,14 @@ static void complete(int *p) { (*p)++; }
 static void reinit_completion(int *p) { *p=0; }
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s) { if(!s->enabled) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s) { assert(s->users); s->users--; }
+static void dcp_hdr_service_bind(struct apple_epic_service *s) { (void)s; }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s) { (void)s; }
 static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock); s->enabled=false; s->torndown=true; }
 /* These H17P scenarios never queue the native 14.7 Close worker. */
 static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
 /* Native audio is out of scope: reject entry instead of silently queueing it. */
 static void dcp_external_audio_start(struct apple_dcp *d) { assert(!d->external_native); }
+static void av_audio_sink_changed(struct apple_dcp *d) { (void)d; }
 /* The stubbed read always carries an EDID: nothing asks for a re-probe. */
 static bool dcpavserv_edid_retry(struct apple_dcp *d,u64 e) { (void)d;(void)e;assert(0);return false; }
 static void dcpavserv_edid_retry_reset(struct apple_dcp *d) { assert(d->dcpavserv.lock); }
@@ -801,7 +958,7 @@ static void drm_edid_free(const struct drm_edid *e) { if(e) { assert(raw_allocat
 static int drm_edid_connector_update(struct drm_connector *c,const struct drm_edid *e) {
     assert(c->dev->mode_config.mutex); (void)e; return fail_update?-EIO:0;
 }
-static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation) { (void)d; (void)generation; return ERR_PTR(-ENODATA); }
+DCP_FIRMWARE_EDID_STUB
 static bool dcp_firmware_metadata_current(struct apple_dcp *d,u64 generation) { (void)d; (void)generation; return false; }
 static const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *d,const struct dcp_display_mode *m,unsigned n,u64 *generation) { (void)d;(void)m;(void)n;(void)generation;assert(!"panel identity in external fixture");return ERR_PTR(-ENODATA); }
 static bool dcp_panel_metadata_current(struct apple_dcp *d,u64 generation) { (void)d;(void)generation;assert(!"panel identity in external fixture");return false; }
@@ -863,13 +1020,26 @@ static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_conne
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [
-        'static void dcpavserv_notify_edid(', 'static bool dcpavserv_identity(',
+        'static void dcpavserv_notify_edid(', 'static bool dcpavserv_hdr_class(',
+        'static bool dcpavserv_identity(',
         'static bool dcpavserv_admission_current(', 'static int dcpavserv_prepare(',
         'static void dcpavserv_init(', 'static void dcpavserv_invalidate_edid(',
         'static void dcpavserv_teardown(', 'void dpavservep_detach(',
         'bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(',
     ])
+    # dcp-fabric.c decides it in the driver; each scenario below defines it.
+    transport = transport.replace('static bool dcpavserv_admission_current(',
+        'static bool dcp_is_typec_output(struct apple_dcp *d);\n'
+        'static bool dcpavserv_admission_current(', 1)
     mode_helpers = iomfb[iomfb.index('static struct dcp_display_mode *dcp_modes_snapshot('):iomfb.index('int dcp_get_modes(')]
+    # The link line of a processor whose hardware description asks for it
+    # (hw.link_report, T6050's external ones): no processor here does.
+    if 'void dcp_link_report(' in mode_helpers:
+        mode_helpers = mode_helpers.replace(block(mode_helpers, 'void dcp_link_report('), '')
+    if 'static void dcp_note_edid(' in mode_helpers:
+        mode_helpers = mode_helpers.replace(block(mode_helpers, 'static void dcp_note_edid('),
+            'static void dcp_note_edid(struct apple_connector *c,const struct drm_edid *e)\n'
+            '{ (void)c;(void)e;assert(!"EDID identity noted without a link report"); }')
     # The catalogue owner check, hotplug queueing, connector EDID helpers and
     # property bounds the catalogue helpers use, all actual.
     property_header = base/'dcp-property.h'
@@ -882,7 +1052,23 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
                     + mode_helpers)
     # The desktop 26.6 VRR filter is gone once that firmware takes adaptive sync.
     vrr_filter = block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n' if 'static bool dcp_mode_vrr_supported(' in iomfb else ''
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'bool lookup_mode(')
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'static const struct dcp_display_mode *\ndcp_find_mode(')+block(iomfb,'bool lookup_mode(')
+    if 'dcp_edid_sdr(' in publication:
+        # Keep extracting the real publication path, including its SDR helper.
+        # Model only kernel allocation/DRM ownership at the host boundary.
+        sdr = '\n'.join(line for line in (base / 'dcp-sdr-edid.h').read_text().splitlines()
+                        if not line.startswith('#include'))
+        publication = sdr + r"""
+static void *kmemdup(const void *data,size_t size,int gfp) {
+    (void)gfp;void *copy=malloc(size);if(copy)memcpy(copy,data,size);return copy;
+}
+static const struct drm_edid *drm_edid_alloc(const void *data,size_t size) {
+    assert(size<=sizeof(transport_edid.data));
+    struct drm_edid *e=calloc(1,sizeof(*e));
+    if(e) { memcpy(e->data,data,size);raw_allocations++; }
+    return e;
+}
+""" + publication
     # Drive malformed replacements through the same chunk/end ingress as firmware.
     # The dictionary cache is a boundary substitute and takes ownership of the blob.
     receipt = r'''
@@ -1001,6 +1187,7 @@ static void permutations(void) {
     puts("PASS: 24 callback/timing/AV arrival permutations and real get_modes/lookup publication; early configuration needs no second callback; CLOSE, physical reconnect, receipt epochs and publication races deny stale proof");
 }
 '''
+    stubs=stubs.replace('DCP_FIRMWARE_EDID_STUB\n',firmware_edid)
     unit=n['prefix']+n['metadata']+n['epoch']+n['header']+n['edid_header']+n['parser']+n['blobs']+n['policy']+n['proof']+state+stubs+transport+n['source']+n['callback_types']+n['callback_stubs']+n['callback']+n['connection']+publication+receipt+helpers+fixture+'int main(int argc,char **argv) {'+main_prefix+main
     # Conflicts are scanned across the full binary receipt, including filtered
     # siblings. Exercise both orders, replacement receipts and equivalent aliases.
@@ -1175,8 +1362,10 @@ static void panel_dimension_probes(void) {
     puts("PASS: internal panel dimensions survive repeated EDID clears; firmware size and DT fallback; external EDID size preserved");
 }
 """
+    # The panel scenarios model a Type-C output, as the hotplug ones.
     unit = unit.replace('int main(int argc,char **argv) {',
-                        checks + 'int main(int argc,char **argv) {')
+                        'static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n'
+                        + checks + 'int main(int argc,char **argv) {')
     return unit.replace('    transport_edid=raw;',
                         '    transport_edid=raw;panel_dimension_probes();', 1)
 
@@ -1313,39 +1502,55 @@ static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
 
 
 def metadata(root, output):
-    """Keep malformed/duplicate metadata cases with synthetic bounded wire input."""
+    """Keep malformed/duplicate metadata cases with synthetic bounded wire input.
+
+    Only a sink's identity (manufacturer and product code, once each) is
+    required. A size, colour description or date out of range or missing is
+    noted in the metadata's defaults (DCP_METADATA_DEFAULT_*), left undefined,
+    and the sink still gets an EDID; a name longer than a descriptor is cut.
+    """
     n = parser_fixture(root)
     fixture = n['fixture']
-    cases = [(fixture, False)]
-    for path, value in [
-        (('MaxHorizontalImageSize',), 256), (('MaxVerticalImageSize',), '33'),
-        (('Chromaticity', 'Red', 'X'), True), (('Chromaticity', 'Blue', 'Y'), 65536),
-        (('DefaultWhitePoint', 'Y'), 64000), (('DefaultWhitePoint', 'Gamma'), 65535),
-        (('DefaultWhitePoint', 'Gamma'), 240000), (('ProductAttributes', 'ManufacturerID'), 'AC'),
-        (('ProductAttributes', 'ManufacturerID'), 'A\0R'), (('ProductAttributes', 'LegacyManufacturerID'), 1),
-        (('ProductAttributes', 'ProductName'), 'x' * 14), (('ProductAttributes', 'ProductID'), 65536),
-        (('ProductAttributes', 'YearOfManufacture'), 1989), (('ProductAttributes', 'WeekOfManufacture'), 54),
+    header = (root / 'drivers/gpu/drm/apple/dcp-display-metadata.h').read_text()
+    bits = {m.group(1): 1 << int(m.group(2)) for m in
+            re.finditer(r'^#define DCP_METADATA_DEFAULT_(\w+)\s+BIT\((\d+)\)', header, re.M)}
+    # Expectations: '1' refused and the output untouched, 'd<mask>' parsed with
+    # those defaults noted, 't' parsed with the name cut to 13 characters.
+    reject = '1'
+    size, color, date = (f"d{bits[k]}" for k in ('SIZE', 'COLOR', 'DATE'))
+    cases = [(fixture, '0')]
+    for path, value, expect in [
+        (('MaxHorizontalImageSize',), 256, size), (('MaxVerticalImageSize',), '33', size),
+        (('Chromaticity', 'Red', 'X'), True, color), (('Chromaticity', 'Blue', 'Y'), 65536, color),
+        (('DefaultWhitePoint', 'Y'), 64000, color), (('DefaultWhitePoint', 'Gamma'), 65535, color),
+        (('DefaultWhitePoint', 'Gamma'), 240000, color), (('ProductAttributes', 'ManufacturerID'), 'AC', reject),
+        (('ProductAttributes', 'ManufacturerID'), 'A\0R', reject),
+        (('ProductAttributes', 'LegacyManufacturerID'), 1, reject),
+        (('ProductAttributes', 'ProductName'), 'x' * 14, 't'), (('ProductAttributes', 'ProductID'), 65536, reject),
+        (('ProductAttributes', 'YearOfManufacture'), 1989, date),
+        (('ProductAttributes', 'WeekOfManufacture'), 54, date),
     ]:
         bad = copy.deepcopy(fixture)
         target = bad
         for key in path[:-1]:
             target = target[key]
         target[path[-1]] = value
-        cases.append((bad, True))
-    for key in ('Chromaticity', 'DefaultWhitePoint', 'ProductAttributes'):
+        cases.append((bad, expect))
+    # Missing: a colour description may be, the identity may not. Twice: never.
+    for key, missing in (('Chromaticity', color), ('DefaultWhitePoint', color), ('ProductAttributes', reject)):
         bad = copy.deepcopy(fixture)
         del bad[key]
-        cases.append((bad, True))
+        cases.append((bad, missing))
         second = copy.deepcopy(fixture[key])
-        cases.append((n['ObjectPairs'](list(fixture.items()) + [(key, second)]), True))
-    for path, field in [(('Chromaticity', 'Red'), 'X'), (('ProductAttributes',), 'ProductName')]:
+        cases.append((n['ObjectPairs'](list(fixture.items()) + [(key, second)]), reject))
+    for path, field, expect in [(('Chromaticity', 'Red'), 'X', color), (('ProductAttributes',), 'ProductName', reject)]:
         bad = copy.deepcopy(fixture)
         target = bad
         for key in path[:-1]:
             target = target[key]
         value = target[path[-1]]
         target[path[-1]] = n['ObjectPairs'](list(value.items()) + [(field, value[field])])
-        cases.append((bad, True))
+        cases.append((bad, expect))
     inputs = output / 'metadata-inputs'
     inputs.mkdir(parents=True, exist_ok=True)
     arguments = []
@@ -1354,7 +1559,7 @@ def metadata(root, output):
         n['wire'](value, data)
         path = inputs / str(index)
         path.write_bytes(data)
-        arguments.append((str(path), str(int(bad)), str(inputs / 'edid')))
+        arguments.append((str(path), bad, str(inputs / 'edid')))
     unit = ''.join(n[k] for k in ('prefix', 'metadata', 'epoch', 'header', 'edid_header',
                                   'stubs', 'parser', 'builder', 'timing_source', 'proof_test', 'suffix'))
     return unit, tuple(arguments)

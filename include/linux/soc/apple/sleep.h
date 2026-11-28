@@ -9,12 +9,82 @@
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
-struct device_node;
+struct resource;
+
+/*
+ * A T6050 machine whose device tree describes the firmware-driven sleep. What a
+ * driver does for that sleep follows the description, not a list of boards.
+ * With @prop: the description also has that property.
+ */
+static inline bool apple_t6050_sleep_property(const char *prop)
+{
+	struct device_node *np;
+	bool ret;
+
+	if (!of_machine_is_compatible("apple,t6050"))
+		return false;
+	np = of_find_compatible_node(NULL, NULL, "apple,t6050-sleep");
+	ret = np && of_device_is_available(np) && (!prop || of_property_read_bool(np, prop));
+	of_node_put(np);
+	return ret;
+}
+
+static inline bool apple_t6050_sleep_described(void)
+{
+	return apple_t6050_sleep_property(NULL);
+}
+
+/* The SMC's sleep messages: the pmVC value and the spacings between them, used as floors */
+struct apple_sleep_smc_policy {
+	u32 pmvc;
+	u32 warn_to_pmvc_us, pmvc_to_slpa_us, slpa_to_idle_us;
+	u32 idle_to_timer_us, waka_to_pmvc_us;
+};
+
+/* The M5 Pro's SMC lane: begin/end in the suspend task with IRQs on, device locked.
+ * late_notice runs in saved context with IRQs off and parked/offline peers.
+ */
+struct apple_sleep_smc_saved_ops {
+	int (*begin)(void *data);
+	/* No TX/SRAM mutation: last returning check under the held scope. */
+	int (*check)(void *data);
+	/* Only after irreversible stops; nonzero is fatal, never cancellation. */
+	int (*commit_notice)(void *data, u64 *sent, u64 *ack);
+	int (*late_notice)(void *data, u64 *sent, u64 *ack);
+	int (*end)(void *data);
+	/*
+	 * Optional, right after a clean .end at the platform wake, before the SoC's PMU wake steps:
+	 * the SMC's first wake commands (its wake record, waka).
+	 */
+	void (*woken)(void *data);
+	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
+	int (*pmvc)(void *data);
+};
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
+const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
+/* J813 experiment: send the final SMC notice after the peer idle handshakes. */
+bool apple_sleep_smc_defer_notice(void);
+/* Gen 1 (T8103): the SMC gets WKTP between slpw and slpa */
+bool apple_sleep_smc_gen1_keys(void);
+int apple_sleep_smc_register(struct device *dev,
+	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
+int apple_sleep_smc_register_saved(struct device *dev,
+	const struct apple_sleep_smc_saved_ops *ops, void *data);
+void apple_sleep_smc_unregister(struct device *dev);
+/* Driver attests firmware idle AND its DART/GAPF release, never a generic stop request. */
+void apple_sleep_display_quiesced(struct device *dev, bool quiesced);
+/* Read-only handoff: provider restored domains/gates, prior errors refuse. */
+int apple_sleep_display_v27_power_ready(struct device *dev);
+/* T6050: the internal display's power words around its coprocessor's restart after a wake. */
+int apple_sleep_m5_display_power(bool on);
+/* T6050: one external display coprocessor's, by its device. */
+int apple_sleep_m5_dispext_power(struct device *dev, bool on);
+
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
  * restarted without one. While one is registered and not ready, a suspend is
@@ -26,6 +96,17 @@ struct device_node;
  */
 int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
 				int (*last_stop)(void *data), void *data);
+
+/*
+ * For a SoC sleep driver of its own (T6041): advertise commit-time stop
+ * support and run the refusal checks, enclave stop, and coprocessor stops
+ * with interrupts off.
+ */
+void apple_sleep_set_commit_stops_coprocs(bool enable);
+int apple_sleep_coprocs_check_all(void);
+int apple_sleep_enclave_stop_all(void);
+int apple_sleep_coprocs_stop_all(void);
+bool apple_sleep_coprocs_ans_stopped(void);
 
 /*
  * The same with no ASC to clear: @last_stop clears its own run bits and lowers its own power
@@ -60,15 +141,28 @@ void apple_sleep_enclave_unregister(struct device *dev);
 
 /* Its driver has quiesced it for that last step, or has taken it back. */
 void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
+void apple_sleep_coproc_set_early(struct device *dev);
 
 /* Whether the last step stopped it: after a refused sleep, false means it still runs. */
 bool apple_sleep_coproc_stopped(struct device *dev);
+
+/* Platform wake error for a stopped coprocessor (0 if its power domain and fabric restored). */
+int apple_sleep_coproc_wake_error(struct device *dev);
 
 /*
  * Whether this sleep's commit stops the registered coprocessors. Then one that can't be
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
  */
 bool apple_sleep_commit_stops_coprocs(void);
+
+/* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
+bool apple_sleep_dry_run(void);
+
+/*
+ * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
+ * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
+ */
+void apple_sleep_note_sub(u8 step);
 
 /*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
@@ -78,10 +172,25 @@ bool apple_sleep_commit_stops_coprocs(void);
 void apple_sleep_usb_set_asleep(bool asleep);
 
 /*
+ * J714s: called at T6050's .prepare_late (no other SoC calls it), after every device's noirq suspend (the USB PHYs'
+ * stops) and before the SMC's scope, with whether a USB host sleeps in place: macOS arms a
+ * USB-C port controller's USB wake right after its PHY has stopped.
+ */
+struct notifier_block;
+int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb);
+void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb);
+
+/*
  * The USB host is up, as macOS's USB_SLP_DDR vote has it: from the host's start to its stop,
  * awake and asleep. It sets bit 0 of the wake block's word 0 for every sleep in between.
  */
 void apple_sleep_usb_slp_ddr(bool up);
+
+/*
+ * A Type-C port in use asks for its always-on USB domain to stay up through the next sleep,
+ * and takes the request back after it. Returns whether the domain will be kept.
+ */
+bool apple_sleep_usb_aon_keep(unsigned int port, bool keep);
 
 /*
  * The fixed hub's ports with a device at or below them that can wake the system, bit n for
@@ -125,6 +234,7 @@ bool apple_sleep_debug_link_up(void);
  * device has resumed, as macOS does from a dark wake.
  */
 void apple_sleep_lid_closed_wake(void);
+void apple_sleep_port_wake(bool lid_closed);
 
 /*
  * From the SMC's driver, in its noirq resume: the lid as it reads now, after every
@@ -159,6 +269,25 @@ void apple_sleep_debug_link_cut_wake(void);
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
 
+/*
+ * T6050: from the radio host's noirq suspend, with its DART saved and gated: the port's link
+ * shutdown. An error means nothing was written and the sleep must be refused.
+ */
+int apple_sleep_radio_port_down(void);
+
+/* T6050: from its noirq resume, the port's wake steps: 0 after its set-up, 1 after its DART's. */
+void apple_sleep_radio_port_wake(unsigned int step);
+
+/* T6050: from its noirq resume: 0 once the root complex runs again; else nothing there is read. */
+int apple_sleep_radio_rc_ready(void);
+
+/*
+ * T6050: whether the last sleep entry, refused, switched the power word of @pd (a power
+ * controller's node) off and on again. The block behind it then holds reset values, as after a
+ * real sleep, though pm_resume_via_firmware() is false.
+ */
+bool apple_sleep_refusal_cycled(struct device_node *pd);
+
 /* From RTKit: this coprocessor's firmware crashed. */
 void apple_sleep_coproc_crashed(struct device *dev);
 
@@ -170,13 +299,42 @@ void apple_sleep_restore_pins(void);
  * sleep engine's PMGR reset of its own domains, its DARTs kept. The caller starts it after.
  */
 int apple_sleep_engine_reset(struct device *dev);
+
+/*
+ * Watchdog handoff over a firmware-driven suspend. Between .begin and .end the
+ * sleep driver owns WD2 as its suspend/resume safety net; at .end it clears WD2
+ * and invokes @restore so a watchdog driver sharing that WD2 block can re-arm
+ * its active timer. Registration matches @wdt against any available sleep node's
+ * "wdt" region; watchdogs without a matching sleep node return 0 without registering.
+ */
+int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+			     void (*restore)(void *data), void *data);
+void apple_sleep_wdt_unregister(struct device *dev);
+bool apple_sleep_wdt_active(struct device *dev);
 #else
+static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
+static inline bool apple_sleep_smc_defer_notice(void) { return false; }
+static inline bool apple_sleep_smc_gen1_keys(void) { return false; }
+static inline int apple_sleep_smc_register(struct device *dev,
+	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
+static inline int apple_sleep_smc_register_saved(struct device *dev,
+	const struct apple_sleep_smc_saved_ops *ops, void *data) { return -EOPNOTSUPP; }
+static inline void apple_sleep_smc_unregister(struct device *dev) {}
+static inline void apple_sleep_display_quiesced(struct device *dev, bool quiesced) {}
 static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
 					      bool pcie_ans, int (*last_stop)(void *data),
 					      void *data)
 {
 	return -EOPNOTSUPP;
 }
+
+static inline int apple_sleep_display_v27_power_ready(struct device *dev)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_m5_display_power(bool on) { return -ENODEV; }
+static inline int apple_sleep_m5_dispext_power(struct device *dev, bool on) { return -ENODEV; }
 
 static inline int apple_sleep_coproc_register_first(struct device *dev,
 						    int (*last_stop)(void *data), void *data)
@@ -209,6 +367,10 @@ static inline void apple_sleep_enclave_unregister(struct device *dev)
 {
 }
 
+static inline void apple_sleep_coproc_set_early(struct device *dev)
+{
+}
+
 static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 {
 }
@@ -218,7 +380,43 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 	return false;
 }
 
+static inline int apple_sleep_coproc_wake_error(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline void apple_sleep_note_sub(u8 step) {}
+
+static inline void apple_sleep_set_commit_stops_coprocs(bool enable)
+{
+}
+
+static inline int apple_sleep_coprocs_check_all(void)
+{
+	return 0;
+}
+
+static inline int apple_sleep_enclave_stop_all(void)
+{
+	return 0;
+}
+
+static inline int apple_sleep_coprocs_stop_all(void)
+{
+	return 0;
+}
+
+static inline bool apple_sleep_coprocs_ans_stopped(void)
+{
+	return false;
+}
+
 static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_dry_run(void)
 {
 	return false;
 }
@@ -227,8 +425,23 @@ static inline void apple_sleep_usb_set_asleep(bool asleep)
 {
 }
 
+struct notifier_block;
+static inline int apple_sleep_usb_asleep_notifier_register(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void apple_sleep_usb_asleep_notifier_unregister(struct notifier_block *nb)
+{
+}
+
 static inline void apple_sleep_usb_slp_ddr(bool up)
 {
+}
+
+static inline bool apple_sleep_usb_aon_keep(unsigned int port, bool keep)
+{
+	return false;
 }
 
 static inline void apple_sleep_usb_set_wake_ports(unsigned long ports)
@@ -279,6 +492,10 @@ static inline void apple_sleep_lid_closed_wake(void)
 {
 }
 
+static inline void apple_sleep_port_wake(bool lid_closed)
+{
+}
+
 static inline void apple_sleep_lid_at_wake(bool closed)
 {
 }
@@ -305,6 +522,25 @@ static inline void apple_sleep_radio_port_up(void)
 {
 }
 
+static inline int apple_sleep_radio_port_down(void)
+{
+	return -ENODEV;
+}
+
+static inline void apple_sleep_radio_port_wake(unsigned int step)
+{
+}
+
+static inline int apple_sleep_radio_rc_ready(void)
+{
+	return 0;
+}
+
+static inline bool apple_sleep_refusal_cycled(struct device_node *pd)
+{
+	return false;
+}
+
 static inline void apple_sleep_coproc_crashed(struct device *dev)
 {
 }
@@ -316,6 +552,21 @@ static inline void apple_sleep_restore_pins(void)
 static inline int apple_sleep_engine_reset(struct device *dev)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+					   void (*restore)(void *data), void *data)
+{
+	return 0;
+}
+
+static inline void apple_sleep_wdt_unregister(struct device *dev)
+{
+}
+
+static inline bool apple_sleep_wdt_active(struct device *dev)
+{
+	return false;
 }
 #endif
 

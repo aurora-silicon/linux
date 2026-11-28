@@ -78,10 +78,6 @@ impl RenderIds {
         }), GFP_KERNEL)
     }
 
-    pub(crate) fn availability(&self) -> &Arc<super::availability::Availability> {
-        &self.available
-    }
-
     fn pin(self: &Arc<Self>, cell: &Arc<RenderIdCell>, assigned: impl FnOnce()) -> Result<RenderIdPin> {
         let mut state = self.state.lock();
         let slot = cell.slot.load(Ordering::Acquire);
@@ -501,6 +497,17 @@ impl Pages {
     }
 }
 
+/// What one render pool of the smallest size takes of the shared lower
+/// window, with its guard.
+pub(crate) const RENDER_POOL_SPAN: u64 =
+    (TABLE_SIZE + RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE + mmu::UAT_PGSZ) as u64;
+
+// The A18 Pro's shared pool window holds the smallest render pool for every execution context.
+const _: () = assert!(
+    crate::hw::t8140::dynamic::WIDE_LOWER.end - crate::hw::t8140::dynamic::WIDE_LOWER.start
+        >= crate::mmu::MAX_EXECUTION_CONTEXTS as u64 * RENDER_POOL_SPAN
+);
+
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -577,8 +584,9 @@ impl RenderStorage {
 
 /// A render pool retained by a logical context and every graph referencing it.
 /// Its backing can be given back while the pool's free-list release has been
-/// consumed and the client VM is evicted; a fresh backing is installed before
-/// the pool is staged again.
+/// consumed: when the client VM is evicted, or when its queue is idle and the
+/// shared window is short. A fresh backing is installed before the pool is
+/// staged again.
 pub(crate) struct RenderPool {
     storage: Arc<RenderStorage>,
     /// Counts installed backings, so a re-armed backing is a new free-list
@@ -613,15 +621,27 @@ impl RenderPool {
         Ok(pin.map(|pin| PoolPin { _identity: pin, _pool: self.clone() }))
     }
 
-    pub(crate) fn new(
+    /// Uses the identity in `reserved` when there is one
+    /// ([`super::fw::Variant::render_id_at_create`]) and takes it only once the backing is
+    /// placed, so a refused placement keeps it. Without one, the identity is taken first, so a
+    /// refused identity places no backing.
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
         blocks: usize,
+        reserved: Option<&Mutex<Option<RenderId>>>,
     ) -> Result<Self> {
-        let id = RenderId::new(ids)?;
+        let fresh = match reserved {
+            Some(reserved) if reserved.lock().is_some() => None,
+            _ => Some(RenderId::new(ids)?),
+        };
         let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
+        let id = match fresh.or_else(|| reserved.and_then(|reserved| reserved.lock().take())) {
+            Some(id) => id,
+            None => RenderId::new(ids)?,
+        };
         Self::with_backing(alloc, id, client, backing)
     }
 
@@ -1092,9 +1112,6 @@ impl ComputePool {
     pub(crate) fn descriptor(&self) -> Result<PoolDescriptor> {
         self.pages.as_ref().ok_or(EAGAIN)?.descriptor(self.id)
     }
-    pub(crate) fn completed_submissions(&self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.completed_bytes()?))
-    }
     fn completed_bytes(&self) -> Result<[u8; 8]> {
         let offset = if self.m5 { super::fw::m5::pool::completed_offset() } else { FreeListControl::COMPLETED };
         let pointer = self.control.pointer(offset, 8)?;
@@ -1209,7 +1226,9 @@ pub(crate) struct Owner {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum LeasePhase {
-    Preparing,
+    /// Active and/or preparing. `references == commands + preparing` with
+    /// `commands >= 2 * preparing`. When `references == 0`, `published` is
+    /// true and a final `FreeListRelease` is pending.
     Ready,
     /// No reference since the given time. The registration stays live so that
     /// the owner's next render reuses it without a control-ring release; the
@@ -1232,6 +1251,8 @@ pub(crate) struct Lease {
     generation: u64,
     references: u32,
     commands: u32,
+    preparing: u32,
+    published: bool,
     phase: LeasePhase,
     previous_release: Option<u32>,
 }
@@ -1247,7 +1268,9 @@ impl Lease {
                 generation: 0,
                 references: 3,
                 commands: 2,
-                phase: LeasePhase::Preparing,
+                preparing: 1,
+                published: false,
+                phase: LeasePhase::Ready,
                 previous_release: None,
             });
         };
@@ -1270,6 +1293,7 @@ impl Lease {
         }
         let references = previous.references.checked_add(3).ok_or(EOVERFLOW)?;
         let commands = previous.commands.checked_add(2).ok_or(EOVERFLOW)?;
+        let preparing = previous.preparing.checked_add(1).ok_or(EOVERFLOW)?;
         Ok(Self {
             owner,
             generation: if overlapping {
@@ -1279,7 +1303,9 @@ impl Lease {
             },
             references,
             commands,
-            phase: LeasePhase::Preparing,
+            preparing,
+            published: overlapping && previous.published,
+            phase: LeasePhase::Ready,
             previous_release: previous.release_witness(),
         })
     }
@@ -1296,9 +1322,14 @@ impl Lease {
             LeasePhase::ReleaseSent(_) | LeasePhase::Released
         ) && self.references == 0
             && self.commands == 0
+            && self.preparing == 0
     }
     pub(crate) fn released(&self) -> bool {
-        self.phase == LeasePhase::Released && self.previous_release.is_none()
+        self.phase == LeasePhase::Released
+            && self.previous_release.is_none()
+            && self.references == 0
+            && self.commands == 0
+            && self.preparing == 0
     }
     pub(crate) fn release_witness(&self) -> Option<u32> {
         match self.phase {
@@ -1309,12 +1340,46 @@ impl Lease {
 
     /// Publication retires preparation independently of the command references.
     pub(crate) fn retire_prepare(&mut self) -> Result {
-        if self.phase != LeasePhase::Preparing || self.references < 3 {
+        let reserved_refs = self.preparing.checked_mul(3).ok_or(EINVAL)?;
+        let reserved_cmds = self.preparing.checked_mul(2).ok_or(EINVAL)?;
+        if self.phase != LeasePhase::Ready
+            || self.preparing == 0
+            || self.references < reserved_refs
+            || self.commands < reserved_cmds
+        {
             return Err(EINVAL);
         }
+        self.preparing -= 1;
         self.references -= 1;
-        self.phase = LeasePhase::Ready;
+        self.published = true;
         Ok(())
+    }
+    /// Rolls back one unpublished `acquire()` without disturbing sibling
+    /// completions or observed release witnesses that occurred meanwhile.
+    /// If the rolled-back preparation held the last reference on an already
+    /// published generation, its final release becomes pending.
+    pub(crate) fn cancel_prepare(
+        &mut self,
+    ) -> Result<Option<super::fw::channels::FreeListRelease>> {
+        let reserved_refs = self.preparing.checked_mul(3).ok_or(EINVAL)?;
+        let reserved_cmds = self.preparing.checked_mul(2).ok_or(EINVAL)?;
+        if self.phase != LeasePhase::Ready
+            || self.preparing == 0
+            || self.references < reserved_refs
+            || self.commands < reserved_cmds
+        {
+            return Err(EINVAL);
+        }
+        self.preparing -= 1;
+        self.references -= 3;
+        self.commands -= 2;
+        if self.references == 0 && !self.published {
+            self.phase = match self.previous_release.take() {
+                Some(cursor) => LeasePhase::ReleaseSent(cursor),
+                None => LeasePhase::Released,
+            };
+        }
+        Ok(self.pending_release())
     }
     /// Fixed prepopulated pools never submit an asynchronous growth request.
     /// An incoming growth completion therefore cannot name a live request.
@@ -1331,7 +1396,13 @@ impl Lease {
         &mut self,
         linger: bool,
     ) -> Result<Option<super::fw::channels::FreeListRelease>> {
-        if self.phase != LeasePhase::Ready || self.references < 2 || self.commands < 2 {
+        let reserved_refs = self.preparing.checked_mul(3).ok_or(EINVAL)?;
+        let reserved_cmds = self.preparing.checked_mul(2).ok_or(EINVAL)?;
+        if self.phase != LeasePhase::Ready
+            || !self.published
+            || self.references < reserved_refs.saturating_add(2)
+            || self.commands < reserved_cmds.saturating_add(2)
+        {
             return Err(EINVAL);
         }
         self.references -= 2;
@@ -1355,7 +1426,7 @@ impl Lease {
         }
     }
     pub(crate) fn pending_release(&self) -> Option<super::fw::channels::FreeListRelease> {
-        (self.phase == LeasePhase::Ready && self.references == 0).then(|| {
+        (self.phase == LeasePhase::Ready && self.references == 0 && self.published).then(|| {
             super::fw::channels::FreeListRelease::new(self.generation, self.owner.buffer_slot)
         })
     }
@@ -1366,10 +1437,6 @@ impl Lease {
         }
         self.phase = LeasePhase::ReleaseSent(cursor);
         Ok(())
-    }
-    /// Only sent releases and inherited release witnesses consume cursors.
-    pub(crate) fn needs_release_observation(&self) -> bool {
-        self.previous_release.is_some() || matches!(self.phase, LeasePhase::ReleaseSent(_))
     }
 
     /// Observes all older release records passed by one consumer snapshot.
@@ -1429,5 +1496,82 @@ mod capacity_tests {
             drop(pools);
             assert_eq!(ids.used(), 0);
         }
+    }
+
+    fn owner(slot: u32, serial: u64) -> Owner {
+        Owner {
+            serial,
+            epoch: 1,
+            buffer_slot: slot,
+            control_va: 0x1000,
+            ring_va: 0x2000,
+            cookie: 0x3000,
+        }
+    }
+
+    #[test]
+    fn sibling_render_completes_while_direct_prepare_is_lent() {
+        let owner = owner(129, 1);
+        let mut lease = Lease::acquire(None, owner).unwrap();
+        // An unactivated preparation cannot complete as a render.
+        assert!(matches!(lease.complete_render(false), Err(EINVAL)));
+        lease.retire_prepare().unwrap();
+
+        // Sibling pair lends the same pool off-lock.
+        lease = Lease::acquire(Some(&lease), owner).unwrap();
+        assert_eq!(lease.generation(), 0);
+        // Active sibling completes while the direct preparation is still lent.
+        assert!(lease.complete_render(false).unwrap().is_none());
+        // No other published render remains until the lent preparation activates.
+        assert!(matches!(lease.complete_render(false), Err(EINVAL)));
+
+        lease.retire_prepare().unwrap();
+        let release = lease.complete_render(false).unwrap();
+        assert!(release.is_some());
+        assert!(lease.pending_release().is_some());
+    }
+
+    #[test]
+    fn rollback_after_sibling_completion_exposes_pending_release() {
+        let owner = owner(129, 1);
+        let mut lease = Lease::acquire(None, owner).unwrap();
+        lease.retire_prepare().unwrap();
+
+        // Sibling prepares off-lock, active sibling retires, then preparation rolls back.
+        lease = Lease::acquire(Some(&lease), owner).unwrap();
+        assert!(lease.complete_render(false).unwrap().is_none());
+        let release = lease.cancel_prepare().unwrap();
+        assert!(release.is_some());
+        assert!(lease.pending_release().is_some());
+        lease.mark_release_sent(4).unwrap();
+        assert!(lease.reacquirable());
+    }
+
+    #[test]
+    fn rollback_of_unpublished_generation_preserves_release_witness() {
+        let owner = owner(129, 1);
+        let mut lease = Lease::acquire(None, owner).unwrap();
+        assert!(lease.cancel_prepare().unwrap().is_none());
+        assert!(lease.released());
+        assert!(lease.pending_release().is_none());
+
+        // Publish and send release at cursor 5, then reacquire and observe consumption
+        // before rolling back the unpublished successor.
+        lease = Lease::acquire(Some(&lease), owner).unwrap();
+        lease.retire_prepare().unwrap();
+        assert!(lease.complete_render(false).unwrap().is_some());
+        lease.mark_release_sent(5).unwrap();
+
+        let mut unconsumed = Lease::acquire(Some(&lease), owner).unwrap();
+        assert!(unconsumed.cancel_prepare().unwrap().is_none());
+        assert!(unconsumed.reacquirable());
+        assert!(!unconsumed.released());
+        assert_eq!(unconsumed.release_witness(), Some(5));
+
+        let mut consumed = Lease::acquire(Some(&lease), owner).unwrap();
+        consumed.observe_releases(6, 6).unwrap();
+        assert!(consumed.cancel_prepare().unwrap().is_none());
+        assert!(consumed.released());
+        assert_eq!(consumed.release_witness(), None);
     }
 }

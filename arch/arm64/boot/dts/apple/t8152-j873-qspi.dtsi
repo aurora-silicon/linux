@@ -25,7 +25,8 @@
 				     "syscon", "simple-mfd";
 			#address-cells = <1>;
 			#size-cells = <1>;
-			reg = <0x3 0x700000 0x0 0x14000>;
+			/* ADT pmgr reg[32]: power states up to DISP_CPU at 0x14000 */
+			reg = <0x3 0x700000 0x0 0x1c000>;
 		};
 
 		qspi: spi@331118000 {

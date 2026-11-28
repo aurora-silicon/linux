@@ -4,7 +4,15 @@
 use crate::{g18::fw::render_params::G17pRenderParameters, g18::address_map as va,
     g18::fw::render::G18RenderControls, g18::fw::render_command::*, g18::fw::render_assembly as g18_render_assembly};
 
-pub(crate) const PB_BLOCKS: u32 = 8; // plan: overprovision >=8; no PB growth.
+/// PB blocks backed before the first render (the native initial size).
+pub(crate) const PB_BLOCKS: u32 = 8;
+/// Blocks added per firmware TVB grow request (event 6), up to
+/// PB_MAX_BLOCKS: the ring the firmware is given holds PB_CAPACITY slots and
+/// one stays empty, so a full ring is told from an empty one. A request
+/// refused below what the firmware was given leaves the tiler waiting until
+/// the job watchdog.
+pub(crate) const PB_GROW_BLOCKS: u32 = 16;
+pub(crate) const PB_MAX_BLOCKS: u32 = PB_CAPACITY - 1;
 pub(crate) const PB_CAPACITY: u32 = 1650;
 pub(crate) const UMA_BLOCKS: u32 = 24; // 24 MiB > sum of both M5 budgets.
 pub(crate) const USC_REQUIRED: [u64; 2] = [0x7d4000, 0x934000]; // M5 DRM hardware path.
@@ -64,23 +72,15 @@ pub(crate) fn resource_pairs() -> [[u64; 2]; 2] {
 // force-kind-1 flag. Invalid selectors fail target_plan before publication.
 #[cfg(CONFIG_RUST)]
 mod parameter {
-    use kernel::{bindings, module_param::{KernelParam, ModuleParamAccess, PARAM_OPS_U32}};
+    use kernel::module_param::{ModuleParamAccess, PARAM_OPS_U32};
     pub(super) static VALUE: ModuleParamAccess<u32> = ModuleParamAccess::new(1);
-    #[link_section = "__param"]
-    #[used(compiler)]
-    static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-            c"g18_render_target_kind"
-        } else { c"aurora.g18_render_target_kind" }),
-        // SAFETY: module lifetime and parameter serialization are managed by
-        // the kernel, identically to the kernel::module! registration.
-        #[cfg(MODULE)]
-        mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-        #[cfg(not(MODULE))]
-        mod_: core::ptr::null_mut(),
-        ops: core::ptr::from_ref(&PARAM_OPS_U32), perm: 0, level: -1, flags: 0,
-        __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: VALUE.as_void_ptr() },
-    });
+    crate::g18::params::g18_kernel_param!(
+        PARAM,
+        "g18_render_target_kind",
+        ops: core::ptr::from_ref(&PARAM_OPS_U32),
+        perm: 0,
+        arg: VALUE.as_void_ptr(),
+    );
     #[link_section = ".modinfo"]
     #[used(compiler)]
     static TYPE: [u8; b"parmtype=g18_render_target_kind:uint\0".len()] = *b"parmtype=g18_render_target_kind:uint\0";
@@ -101,27 +101,18 @@ pub(crate) static HOST_TARGET_KIND: core::sync::atomic::AtomicU32 = core::sync::
 // knobs), read at every 4x render.
 #[cfg(CONFIG_RUST)]
 mod msaa4_fragment {
-    use kernel::{bindings, module_param::KernelParam};
+    use kernel::bindings;
     pub(super) static VALUE: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0xd_0009);
-    #[link_section = "__param"]
-    #[used(compiler)]
-    static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-            c"g18_msaa4_fragment_word"
-        } else { c"aurora.g18_msaa4_fragment_word" }),
-        #[cfg(MODULE)]
-        mod_: &raw mut bindings::__this_module,
-        #[cfg(not(MODULE))]
-        mod_: core::ptr::null_mut(),
+    crate::g18::params::g18_kernel_param!(
+        PARAM,
+        "g18_msaa4_fragment_word",
         // SAFETY: exported vmlinux ops; they access `arg` as an unsigned int
         // under the parameter lock, which AtomicU32 represents exactly.
         ops: unsafe { core::ptr::from_ref(&bindings::param_ops_uint) },
-        perm: 0o644, level: -1, flags: 0,
-        __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 {
-            arg: core::ptr::from_ref(&VALUE).cast_mut().cast(),
-        },
-    });
+        perm: 0o644,
+        arg: core::ptr::from_ref(&VALUE).cast_mut().cast(),
+    );
     #[link_section = ".modinfo"]
     #[used(compiler)]
     static TYPE: [u8; b"parmtype=g18_msaa4_fragment_word:uint\0".len()] =

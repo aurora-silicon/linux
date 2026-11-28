@@ -25,11 +25,30 @@ allOf:
         apple,sleep-retained: false
         apple,sleep-driver-owned: false
         apple,always-on: false
+        apple,auto-managed: false
         apple,min-state: false
         apple,force-disable: false
         apple,force-reset: false
         apple,externally-clocked: false
         apple,consumer-switched: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pmgr-pwrstate
+      required:
+        - compatible
+    then:
+      properties:
+        apple,auto-managed: false
+  - if:
+      required:
+        - apple,auto-managed
+    then:
+      properties:
+        apple,no-auto-pm: false
+        apple,firmware-owned: false
+        apple,inherited-on: false
   - if:
       required:
         - apple,consumer-switched
@@ -39,6 +58,12 @@ allOf:
   - if:
       required:
         - apple,retention-workaround
+    then:
+      required:
+        - apple,consumer-switched
+  - if:
+      required:
+        - apple,bridge-link
     then:
       required:
         - apple,consumer-switched
@@ -84,6 +109,7 @@ properties:
               - apple,t8132-pmgr-pwrstate
               - apple,t8140-pmgr-pwrstate
               - apple,t8142-pmgr-pwrstate
+              - apple,t8152-pmgr-pwrstate
           - const: apple,t8103-pmgr-pwrstate
 
   reg:
@@ -129,6 +155,18 @@ properties:
       coprocessors' CPU domains.
     type: boolean
 
+  apple,auto-managed:
+    description: |
+      Hardware-managed power domain (such as a DRAM channel slice or memory
+      fabric) that the boot loader may leave forced on and that must be
+      switched to hardware automatic power management (auto-enable) early
+      at boot, before the PMP firmware starts.
+
+      Once switched, the hardware gates the domain by itself and it has no
+      software-controlled power transitions. On parts where an instance is
+      fused off, its power-state register reads as off.
+    type: boolean
+
   apple,sleep-retained:
     description:
       A coprocessor keeps running in this domain across system sleep with no
@@ -141,6 +179,16 @@ properties:
       The driver behind this domain lowers it before a system sleep and brings
       it back afterwards, in an order its hardware needs. The power controller
       leaves it alone after a wake.
+    type: boolean
+
+  apple,sleep-wakeup-path:
+    description:
+      A consumer of this domain can keep running into system sleep, until the
+      sleep's final commit after the noirq phase or through the whole sleep,
+      and is then on the wakeup path. The OS keeps the domain on through
+      system sleep while a device under it is on the wakeup path, also when
+      the domain was off when the power controller probed. Other domains are
+      unaffected.
     type: boolean
 
   apple,firmware-owned:
@@ -178,6 +226,21 @@ properties:
         - description: mask
         - description: value while the domain is off
     maxItems: 4
+
+  apple,bridge-link:
+    description:
+      The two consecutive 32-bit link words of the bus bridge of the block
+      behind this consumer-switched domain, as the node of that block, the
+      index of one of its reg entries and the offset of the words from the
+      start of that entry. Bit 0 of each is cleared before the domain powers
+      off and set after it has powered on. The words are only accessible
+      while the domain is on.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: node of the block behind the domain
+          - description: index of a reg entry of that node
+          - description: offset of the link words from the start of that entry
 
   apple,inherited-on:
     description: |

@@ -75,9 +75,106 @@ static void macsmc_hwmon_test_temp_label(struct kunit *test)
 						      hwmon_temp_input, 1), 0444);
 }
 
+/* The channel a gated die key joins the zone through (see populate_sensors). */
+static void macsmc_hwmon_test_find_temp(struct kunit *test)
+{
+	struct macsmc_hwmon_sensor sensors[3] = {};
+	struct macsmc_hwmon hwmon = {
+		.temp = { .sensors = sensors },
+	};
+
+	macsmc_hwmon_test_add(&hwmon.temp, "Te05", 0);
+	macsmc_hwmon_test_add(&hwmon.temp, "Tg0e", -EINVAL);
+	macsmc_hwmon_test_add(&hwmon.temp, "Tg0f", 0);
+
+	KUNIT_EXPECT_PTR_EQ(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tg0f)),
+			    &sensors[2]);
+	KUNIT_EXPECT_PTR_EQ(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Te05)),
+			    &sensors[0]);
+	/* A node that failed to set up has no key and takes no die key. */
+	KUNIT_EXPECT_NULL(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tg0e)));
+	KUNIT_EXPECT_NULL(test, macsmc_hwmon_find_temp(&hwmon, SMC_KEY(Tp01)));
+}
+
+#if IS_ENABLED(CONFIG_THERMAL) && IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST)
+#define DIE_TEST_F4_607	0x40936c8b	/* 4.607f, a GPU key with the GPU off */
+#define DIE_TEST_F40	0x42200000	/* 40.0f */
+#define DIE_TEST_F45_5	0x42360000	/* 45.5f */
+#define DIE_TEST_F50	0x42480000	/* 50.0f */
+
+static u32 die_test_gpu;
+
+static int die_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
+{
+	u32 value;
+
+	switch (key) {
+	case __SMC_KEY('T', 'g', '0', 'f'):
+		value = die_test_gpu;
+		break;
+	case __SMC_KEY('T', 'e', '0', '5'):
+		value = DIE_TEST_F40;
+		break;
+	case __SMC_KEY('T', 'p', '0', '1'):
+		value = DIE_TEST_F45_5;
+		break;
+	default:
+		return -EINVAL;
+	}
+	memcpy(buf, &value, min(size, sizeof(value)));
+	return size;
+}
+
+static void die_test_sensor(struct macsmc_hwmon_sensor *sensor, smc_key key)
+{
+	sensor->macsmc_key = key;
+	sensor->info.type_code = __SMC_KEY('f', 'l', 't', ' ');
+	sensor->info.size = 4;
+	sensor->die = true;
+}
+
+/* A GPU key below its no-data threshold is left out of the SoC die zone. */
+static void macsmc_hwmon_test_die_skips_no_data(struct kunit *test)
+{
+	struct apple_smc smc = {};
+	struct macsmc_hwmon_sensor sensors[3] = {};
+	struct macsmc_hwmon hwmon = {
+		.smc = &smc,
+		.temp = { .sensors = sensors, .count = 3 },
+	};
+	int temp = 0;
+
+	die_test_sensor(&sensors[0], SMC_KEY(Tg0f));
+	sensors[0].has_no_data_below = true;
+	sensors[0].no_data_below = 10000;
+	die_test_sensor(&sensors[1], SMC_KEY(Te05));
+	die_test_sensor(&sensors[2], SMC_KEY(Tp01));
+	kunit_activate_static_stub(test, apple_smc_read, die_test_read);
+
+	/* GPU off: the placeholder neither fails the zone nor counts. */
+	die_test_gpu = DIE_TEST_F4_607;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), 0);
+	KUNIT_EXPECT_EQ(test, temp, 45500);
+
+	/* GPU on and hottest: it counts. */
+	die_test_gpu = DIE_TEST_F50;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), 0);
+	KUNIT_EXPECT_EQ(test, temp, 50000);
+
+	/* Only powered-down sensors: no data. */
+	hwmon.temp.count = 1;
+	die_test_gpu = DIE_TEST_F4_607;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_die_hottest(&hwmon, &temp), -ENODATA);
+}
+#endif
+
 static struct kunit_case macsmc_hwmon_test_cases[] = {
 	KUNIT_CASE(macsmc_hwmon_test_failed_temp_keeps_slot),
 	KUNIT_CASE(macsmc_hwmon_test_temp_label),
+	KUNIT_CASE(macsmc_hwmon_test_find_temp),
+#if IS_ENABLED(CONFIG_THERMAL) && IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST)
+	KUNIT_CASE(macsmc_hwmon_test_die_skips_no_data),
+#endif
 	{}
 };
 
@@ -113,6 +210,9 @@ struct macsmc_fan_test {
 	int manual_busy[2];
 	int target_writes;
 	smc_key fail_key;
+	smc_key fail_read_key;
+	bool relock_stuck;
+	u8 relock_mode;
 };
 
 static int fan_test_index(smc_key key)
@@ -125,6 +225,9 @@ static int fan_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t s
 	struct macsmc_fan_test *t = container_of(smc, struct macsmc_fan_test, smc);
 	u32 value;
 	int i = fan_test_index(key);
+
+	if (key == t->fail_read_key)
+		return -EIO;
 
 	switch (key & 0xff00ffff) {
 	case __SMC_KEY('F', 0, 'M', 'd'):
@@ -165,8 +268,10 @@ static int fan_test_write(struct apple_smc *smc, smc_key key, const void *buf, s
 		for (i = 0; i < ARRAY_SIZE(t->mode); i++) {
 			if (value && t->mode[i] == MACSMC_FAN_MODE_SYSTEM)
 				t->mode[i] = MACSMC_FAN_MODE_AUTO;
-			else if (!value)
+			else if (!value && !t->relock_stuck)
 				t->mode[i] = MACSMC_FAN_MODE_SYSTEM;
+			else if (!value)
+				t->mode[i] = t->relock_mode;
 		}
 		return size;
 	}
@@ -223,6 +328,7 @@ static int macsmc_fan_test_init(struct kunit *test)
 		fan_test_key(&t->fans[i].max, keys[i][2], flt);
 		fan_test_key(&t->fans[i].set, keys[i][3], flt);
 		fan_test_key(&t->fans[i].mode, keys[i][4], ui8);
+		t->fans[i].manual_control = true;
 		t->mode[i] = MACSMC_FAN_MODE_SYSTEM;
 	}
 	t->hwmon.smc = &t->smc;
@@ -231,15 +337,9 @@ static int macsmc_fan_test_init(struct kunit *test)
 	t->hwmon.fan.unlock_key = SMC_KEY(Ftst);
 	mutex_init(&t->hwmon.fan.lock);
 	test->priv = t;
-	fan_control = true;
 	kunit_activate_static_stub(test, apple_smc_read, fan_test_read);
 	kunit_activate_static_stub(test, apple_smc_write, fan_test_write);
 	return 0;
-}
-
-static void macsmc_fan_test_exit(struct kunit *test)
-{
-	fan_control = false;
 }
 
 static void fan_test_released(struct kunit *test, struct macsmc_fan_test *t)
@@ -325,6 +425,18 @@ static void macsmc_fan_test_no_unlock_key(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
 }
 
+/* A fan without apple,fan-manual-control refuses a target, with no SMC write. */
+static void macsmc_fan_test_not_manual(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	t->fans[0].manual_control = false;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, t->writes, 0);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_SYSTEM);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+}
+
 /* Firmware that takes the mode directly keeps the mode 0 restore. */
 static void macsmc_fan_test_legacy(struct kunit *test)
 {
@@ -403,6 +515,127 @@ static void macsmc_fan_test_unlock_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->refused, 0);
 }
 
+static void fan_test_enable_controllable(struct macsmc_fan_test *t)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(t->fans); i++)
+		t->fans[i].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+}
+
+/* A live AUTO write failure keeps ownership so the next release retries. */
+static void macsmc_fan_test_auto_write_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(F0Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].manual);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].kernel);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 1);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* At suspend, failed AUTO writes still yield to the global relock. */
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(F0Md);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_suspend(&dev), 0);
+	fan_test_released(test, t);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_resume(&dev), 0);
+}
+
+/* A failed relock write leaves unlocked set so the next release retries. */
+static void macsmc_fan_test_relock_write_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(Ftst);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
+/* Relock stays pending across readback errors so repeated releases recheck. */
+static void macsmc_fan_test_relock_readback_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+	int ftst_writes;
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_read_key = SMC_KEY(F1Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	/* Repeated release still fails and retries relock once while readback fails. */
+	ftst_writes = t->ftst_writes;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->ftst_writes, ftst_writes + 1);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_read_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* A fresh manual request after a readback failure re-unlocks Ftst. */
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_read_key = SMC_KEY(F1Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+	t->fail_read_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 2);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
+/* A relock readback timeout keeps unlocked set until a later release confirms system mode. */
+static void macsmc_fan_test_relock_timeout(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->relock_stuck = true;
+	t->relock_mode = MACSMC_FAN_MODE_AUTO;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->relock_stuck = false;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
 /* A stopped fan may leave mode 3 before the manual-mode write is ready. */
 static void macsmc_fan_test_stopped_manual_busy(struct kunit *test)
 {
@@ -453,6 +686,65 @@ static void macsmc_fan_test_spinning(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
 }
 
+/* Manual-only kernel fan request touches only apple,fan-manual-control fans. */
+static void macsmc_fan_test_manual_only_request(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct macsmc_hwmon_fan_assist policy = {};
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	t->fans[0].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+	t->fans[1].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+	t->fans[0].manual_control = true;
+	t->fans[1].manual_control = false;
+	t->hwmon.fan_assist.trigger_mc = 98000;
+	t->hwmon.fan_assist.release_mc = 82000;
+	t->hwmon.fan_assist.hold_ms = 30000;
+	t->hwmon.fan_assist_valid = true;
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, &policy), 0);
+	KUNIT_EXPECT_EQ(test, policy.trigger_mc, 98000);
+	KUNIT_EXPECT_EQ(test, policy.release_mc, 82000);
+	KUNIT_EXPECT_EQ(test, policy.hold_ms, 30000U);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 1000, 0), 5777);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
+	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_AUTO);
+	KUNIT_EXPECT_EQ(test, t->target[1], 0);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* Manual-only release leaves a non-manual fan held by the unrestricted API. */
+	KUNIT_ASSERT_GT(test, macsmc_hwmon_fans_request(&dev, 500, 0), 0);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_TRUE(test, t->fans[1].kernel);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 0, 0), 0);
+	KUNIT_EXPECT_FALSE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[0].manual);
+	KUNIT_EXPECT_TRUE(test, t->fans[1].kernel);
+	KUNIT_EXPECT_TRUE(test, t->fans[1].manual);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 1);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* Without any manual-control fan, policy and boost return -ENODEV. */
+	t->fans[0].manual_control = false;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, NULL), -ENODEV);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request_manual(&dev, 1000, 0), -ENODEV);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+
+	/* Without DT-supplied trip thresholds, policy returns -ENODEV. */
+	t->fans[0].manual_control = true;
+	t->hwmon.fan_assist_valid = false;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_hotspot_assist_policy(&dev, NULL), -ENODEV);
+}
+
 static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_stopped_manual_busy),
 	KUNIT_CASE(macsmc_fan_test_manual_busy_timeout),
@@ -462,18 +754,23 @@ static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_target_write_fails),
 	KUNIT_CASE(macsmc_fan_test_two_fans),
 	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
+	KUNIT_CASE(macsmc_fan_test_not_manual),
 	KUNIT_CASE(macsmc_fan_test_legacy),
 	KUNIT_CASE(macsmc_fan_test_legacy_write_only),
 	KUNIT_CASE(macsmc_fan_test_untouched),
 	KUNIT_CASE(macsmc_fan_test_suspend_manual),
 	KUNIT_CASE(macsmc_fan_test_unlock_fails),
+	KUNIT_CASE(macsmc_fan_test_auto_write_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_write_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_readback_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_timeout),
+	KUNIT_CASE(macsmc_fan_test_manual_only_request),
 	{}
 };
 
 static struct kunit_suite macsmc_fan_test_suite = {
 	.name = "macsmc-hwmon-fan",
 	.init = macsmc_fan_test_init,
-	.exit = macsmc_fan_test_exit,
 	.test_cases = macsmc_fan_test_cases,
 };
 kunit_test_suites(&macsmc_hwmon_test_suite, &macsmc_fan_test_suite);

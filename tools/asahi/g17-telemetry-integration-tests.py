@@ -146,18 +146,30 @@ mod g17 {
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
-    struct Variant { graph:fw::variant::InitGraph }
+    struct Variant { graph:fw::variant::InitGraph, telemetry_protocol:telemetry::Protocol }
     struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
     mod reports;
 '''
 RUST_TESTS = r'''
-    fn reader(graph:fw::variant::InitGraph)->stats::Reader {
+    fn default_protocol(graph:fw::variant::InitGraph)->telemetry::Protocol {
+        match graph {
+            fw::variant::InitGraph::G17P=>telemetry::Protocol::PSTATE_16MS,
+            fw::variant::InitGraph::V25G83=>telemetry::Protocol::NONE,
+        }
+    }
+
+    fn reader_with(graph:fw::variant::InitGraph,protocol:telemetry::Protocol,frequencies:Option<stats::StateFrequencies>)->stats::Reader {
+        let max_pstate=frequencies.as_ref().map_or(0,stats::StateFrequencies::max_pstate);
         stats::Reader(std::sync::Arc::new(Shared {
             state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
-                rings:channel::Rings::new(graph).unwrap(),
+                rings:channel::Rings::new(graph,protocol,max_pstate).unwrap(),
                 init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-            })))),dev:crate::device::Device,variant:Variant { graph },crashed:false.into(),
-        }))
+            })))),dev:crate::device::Device,variant:Variant { graph, telemetry_protocol:protocol },crashed:false.into(),
+        }),frequencies)
+    }
+
+    fn reader(graph:fw::variant::InitGraph)->stats::Reader {
+        reader_with(graph,default_protocol(graph),None)
     }
 
     #[test]
@@ -184,7 +196,8 @@ RUST_TESTS = r'''
             }
             let view=reader.read();
             assert_eq!((view.util_status,view.device,view.util_samples),(telemetry::VALID,0,1));
-            assert_eq!(view.pstate_status,telemetry::UNSUPPORTED);
+            // 26A428 reports its state in tags 0x19/0x1b, none of which arrived; 25G83 never does.
+            assert_eq!(view.pstate_status,match graph { InitGraph::G17P=>telemetry::UNAVAILABLE, _=>telemetry::UNSUPPORTED });
             NOW.with(|now|now.set(1));
         }
     }
@@ -253,13 +266,15 @@ RUST_TESTS = r'''
     fn captured_histograms_are_preserved_without_inventing_pstate() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
-        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+        for (graph,protocol,max_pstate) in [(InitGraph::V25G83,telemetry::Protocol::NONE,0),(InitGraph::V25G83,telemetry::Protocol::PSTATE_8MS,10),(InitGraph::G17P,telemetry::Protocol::PSTATE_16MS,10)] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
+            let mut rings=Rings::new(graph,protocol,max_pstate).unwrap();
             for words in [HIST_IDLE,HIST_ACTIVE,HIST_OTHER,TRANSITION] {
                 init.push(Secondary,words);
                 rings.drain_statistics(&dev,&init,Secondary);
-                assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+                // Protocols with a utilisation period integrate busy time; none arrived.
+                let busy=if protocol.util_period_ticks != 0 { telemetry::VALID } else { telemetry::UNSUPPORTED };
+                assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:busy,..Default::default() });
                 assert!(report(&rings).contains(&format!("words={:08x?}",words)));
             }
         }
@@ -271,7 +286,7 @@ RUST_TESTS = r'''
         let dev=crate::device::Device;
         for start in [0,5,7] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            let mut rings=Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_16MS,10).unwrap();
             for &role in &[Primary,Secondary] {
                 for cursor in &init.cursors[role as usize] { cursor.store(start,Ordering::Relaxed); }
                 for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
@@ -286,7 +301,7 @@ RUST_TESTS = r'''
                 let line=text.lines().find(|line|line.starts_with(&format!("role={} tag={:#x} ",role,tag))).unwrap();
                 assert!(line.contains("count=2 host_ns=1 admitted=1 last_admitted=true"),"{}",line);
             } }
-            assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+            assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:telemetry::VALID,..Default::default() });
         }
     }
 
@@ -295,7 +310,8 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        // The decoder's tag 0x10 path: only a firmware without 0x19/0x1b state records decodes it.
+        let mut rings=Rings::new(InitGraph::V25G83,telemetry::Protocol::NONE,0).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         let pstate=[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
@@ -322,27 +338,125 @@ RUST_TESTS = r'''
     }
 
     #[test]
-    fn current_firmwares_report_pstate_unsupported_and_keep_utilisation() {
+    fn v25g83_reports_pstate_unsupported_and_keeps_utilisation() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
-        for graph in [InitGraph::V25G83,InitGraph::G17P] {
-            assert!(!stats::reports_pstate(graph));
-            let empty=stats::qualify(graph,telemetry::Readout::default());
-            assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
-            let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
-            init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
-            // Even a decodable tag 0x10 does not override the firmware's match data.
-            init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
-            rings.drain_statistics(&dev,&init,Primary);
-            assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
-            let view=stats::qualify(graph,rings.read_statistics(1));
-            assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
-                       (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
-            rings.invalidate_statistics();
-            let view=stats::qualify(graph,rings.read_statistics(1));
-            assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
+        // Protocols with reports_pstate emit tags 0x19/0x1b; Protocol::NONE does not.
+        assert!(!stats::reports_pstate(telemetry::Protocol::NONE));
+        assert!(stats::reports_pstate(telemetry::Protocol::PSTATE_8MS));
+        assert!(stats::reports_pstate(telemetry::Protocol::PSTATE_16MS));
+        let graph=InitGraph::V25G83;
+        let empty=stats::qualify(telemetry::Protocol::NONE,telemetry::Readout::default());
+        assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(graph,telemetry::Protocol::NONE,0).unwrap();
+        init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
+        // Even a decodable tag 0x10 does not override the firmware's match data.
+        init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+        let view=stats::qualify(telemetry::Protocol::NONE,rings.read_statistics(1));
+        assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
+                   (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
+        rings.invalidate_statistics();
+        let view=stats::qualify(telemetry::Protocol::NONE,rings.read_statistics(1));
+        assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
+    }
+
+    #[test]
+    fn t6041_reports_its_state_and_busy_time_through_the_reader() {
+        use {fw::variant::InitGraph,Role::*};
+        // J616C OPP frequencies mapped by PERF.states_a (states 0..=10).
+        let mhz=[0,338,618,796,924,1056,1182,1312,1380,1470,1578];
+        let freqs=stats::StateFrequencies::new(mhz.into_iter()).unwrap();
+        assert_eq!(freqs.max_pstate(),10);
+        let reader=reader_with(InitGraph::V25G83,telemetry::Protocol::PSTATE_8MS,Some(freqs));
+        let push=|words|reader.0.state.lock().as_ref().unwrap().init.push(Primary,words);
+        // Safe fallback when no 0x1b arrives (e.g. a firmware that omits it): pstate unavailable, util still works.
+        push([0x13,100_000,0,20,40,0,50,0,0,0,0,0,0,0,0,0,0,0]);
+        let view=reader.read();
+        assert_eq!((view.util_status,view.device,view.pstate_status,view.busy_status,view.busy_ns),
+                   (telemetry::VALID,50,telemetry::UNAVAILABLE,telemetry::VALID,0));
+        assert_eq!(reader.frequency(),Some((None,1_578_000_000)));
+        // 8 ms (192_000 ticks) at 50% -> 4 ms busy; 16 ms (384_000 ticks) at 100% -> +16 ms; after a
+        // >384_000 ticks gap only the record's own 8 ms period at 100% -> +8 ms.
+        push([0x13,100_000+192_000,0,20,40,0,50,0,0,0,0,0,0,0,0,0,0,0]);
+        push([0x13,100_000+192_000+384_000,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
+        push([0x13,100_000+192_000+384_000+384_001,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().busy_ns,28_000_000);
+        // Tag 0x10 is ignored when Protocol::PSTATE_8MS is active.
+        push([0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+        // Tag 0x19 + 0x1b report state 10 -> 1578 MHz.
+        push([0x19,0x2000,0x40,0x1000,0x40,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        push([0x1b,10,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.pstate_timestamp,view.achieved_frequency_hz),
+                   (telemetry::VALID,10,0x40_0000_2000,1_578_000_000));
+        assert_eq!(reader.frequency(),Some((Some(1_578_000_000),1_578_000_000)));
+        // Mismatched words[1] != words[3], state 0, or state beyond derived max_pstate (10) -> UNAVAILABLE.
+        for (a,b) in [(4,10),(0,0),(11,11),(13,13)] {
+            push([0x1b,a,0,b,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+            assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+            assert_eq!(reader.frequency(),Some((None,1_578_000_000)));
         }
+        // Recover to valid state 1 -> 338 MHz.
+        push([0x1b,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().achieved_frequency_hz,338_000_000);
+        // Gated cores -> state 0, 0 Hz.
+        reader.0.state.lock().as_mut().unwrap().powered=false;
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.achieved_frequency_hz),(telemetry::VALID,0,0));
+        assert_eq!(reader.frequency(),Some((Some(0),1_578_000_000)));
+        // Power-up -> STALE until next report.
+        reader.0.state.lock().as_mut().unwrap().powered=true;
+        assert_eq!(reader.read().pstate_status,telemetry::STALE);
+        assert_eq!(reader.frequency(),Some((None,1_578_000_000)));
+        // Same Protocol::PSTATE_8MS with a 14-state table (M5) derives max_pstate 13; without a table it fails closed.
+        let m5_mhz=[0,338,492,618,740,860,980,1100,1200,1300,1400,1470,1540,1620];
+        let m5_freqs=stats::StateFrequencies::new(m5_mhz.into_iter()).unwrap();
+        assert_eq!(m5_freqs.max_pstate(),13);
+        let m5_reader=reader_with(InitGraph::G17P,telemetry::Protocol::PSTATE_8MS,Some(m5_freqs));
+        m5_reader.0.state.lock().as_ref().unwrap().init.push(Primary,[0x1b,13,0,13,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(m5_reader.read().achieved_frequency_hz,1_620_000_000);
+        m5_reader.0.state.lock().as_ref().unwrap().init.push(Primary,[0x1b,14,0,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(m5_reader.read().pstate_status,telemetry::UNAVAILABLE);
+        let closed=reader_with(InitGraph::V25G83,telemetry::Protocol::PSTATE_8MS,None);
+        closed.0.state.lock().as_ref().unwrap().init.push(Primary,[0x1b,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(closed.read().pstate_status,telemetry::UNAVAILABLE);
+    }
+
+    #[test]
+    fn a18_pro_reports_its_state_through_the_reader() {
+        use {fw::variant::InitGraph,Role::*};
+        // States 0 to 10; an interval record, then the state in words 1 and 3.
+        let mhz=[0,338,492,618,796,928,1056,1170,1278,1338,1470];
+        let reader=reader_with(InitGraph::G17P,telemetry::Protocol::PSTATE_16MS,stats::StateFrequencies::new(mhz.into_iter()));
+        let push=|words|reader.0.state.lock().as_ref().unwrap().init.push(Secondary,words);
+        // Tag 0x10 is not this firmware's state report.
+        push([0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+        assert_eq!(reader.frequency(),Some((None,1_470_000_000)));
+        push([0x19,0x2000,0x40,0x1000,0x40,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        push([0x1b,7,0,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.pstate_timestamp,view.achieved_frequency_hz),
+                   (telemetry::VALID,7,0x40_0000_2000,1_170_000_000));
+        assert_eq!(reader.frequency(),Some((Some(1_170_000_000),1_470_000_000)));
+        // A state beyond the table is not a state.
+        push([0x1b,11,0,11,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
+        push([0x1b,10,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+        assert_eq!(reader.read().achieved_frequency_hz,1_470_000_000);
+        // Gated cores run at no state: off, 0 Hz.
+        reader.0.state.lock().as_mut().unwrap().powered=false;
+        let view=reader.read();
+        assert_eq!((view.pstate_status,view.pstate,view.achieved_frequency_hz),(telemetry::VALID,0,0));
+        assert_eq!(reader.frequency(),Some((Some(0),1_470_000_000)));
+        // Power-up starts a new epoch: no state until the firmware reports one.
+        reader.0.state.lock().as_mut().unwrap().powered=true;
+        assert_eq!(reader.read().pstate_status,telemetry::STALE);
+        assert_eq!(reader.frequency(),Some((None,1_470_000_000)));
     }
 
     #[test]
@@ -350,7 +464,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,telemetry::Protocol::NONE,0).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         // Three 8 ms records per producer update, one update every 24 ms.
         for n in 0..3u64 {
@@ -370,7 +484,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_16MS,10).unwrap();
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,0);
         init.push(Secondary,HIST_IDLE);
         rings.drain_statistics(&dev,&init,Secondary);
@@ -390,13 +504,13 @@ RUST_TESTS = r'''
         let graph=InitGraph::G17P;
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(graph).unwrap();
+        let mut rings=Rings::new(graph,telemetry::Protocol::PSTATE_16MS,10).unwrap();
         init.push(Secondary,HIST_IDLE);
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
         init.push(Secondary,HIST_ACTIVE);
         let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
             rings,init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-        })))),dev,variant:Variant { graph },crashed:false.into() });
+        })))),dev,variant:Variant { graph, telemetry_protocol:telemetry::Protocol::PSTATE_16MS },crashed:false.into() });
         let view=reports::View(shared.clone());
         struct View<'a>(&'a reports::View);
         impl std::fmt::Display for View<'_> {
@@ -414,7 +528,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_16MS,10).unwrap();
         let sample=|ta,render,device|[0x13,0,0,ta,render,0xdeadbeef,device,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,sample(25,75,50));
         init.push(Secondary,sample(35,85,65));
@@ -438,7 +552,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,telemetry::Protocol::NONE,0).unwrap();
         let words=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,words);
         rings.drain_statistics(&dev,&init,Primary);
@@ -463,11 +577,52 @@ RUST_TESTS = r'''
         }
     }
     #[test]
+    fn m5_busy_time_takes_records_a_power_boundary_kept_out() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_8MS,13).unwrap();
+        // 8 ms windows at 100%, timestamps in words 1 and 2.
+        let util=|ticks:u32|[0x13,ticks,0x59,0,0,100,100,0,0,0,0,0,0,0,0,0,0,0];
+        init.push(Primary,util(0));
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,0);
+        // Queued at a gate: cut off from the average, still busy time.
+        init.push(Primary,util(192_000));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,8_000_000);
+        // Drained while gated, from the other role: the same.
+        init.push(Secondary,util(384_000));
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,16_000_000);
+        // Powered again: one record per epoch keeps counting, a repeat does not.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,2);
+        init.push(Primary,util(576_000));
+        init.push(Secondary,util(576_000));
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        assert_eq!(rings.read_statistics(1).busy_status,telemetry::VALID);
+        // Suspend's discard keeps queued records out.
+        init.push(Primary,util(768_000));
+        rings.suspend_statistics(true);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.suspend_statistics(false);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        // Quarantine stops the total: it reads stale.
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.busy_status,view.busy_ns),(telemetry::STALE,24_000_000));
+    }
+    #[test]
     fn pstate_uses_drain_order_without_role_deduplication() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,telemetry::Protocol::NONE,0).unwrap();
         init.push(Primary,[0x10,0x1000,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0]);
         init.push(Secondary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
         rings.drain_statistics(&dev,&init,Primary);
@@ -498,6 +653,7 @@ struct device {};
 struct device_attribute {
     struct { const char *name; unsigned mode; } attr;
     ssize_t (*show)(struct device*,struct device_attribute*,char*);
+    ssize_t (*store)(struct device*,struct device_attribute*,const char*,size_t);
 };
 struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned long,void*); };
 #define PM_SUSPEND_PREPARE 1
@@ -509,6 +665,24 @@ struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned lon
 #define NOTIFY_OK 1
 #define ENODEV 19
 #define ENOMEM 12
+#define EINVAL 22
+#define PAGE_SHIFT 12
+static u32 submitted_pct;
+static unsigned int limit_writes;
+static void asahi_set_mem_limit_pct(u32 pct) {
+    submitted_pct=pct;
+    limit_writes++;
+}
+#define DEFINE_MUTEX(n) int n
+#define mutex_lock(m) ((void)(m))
+#define mutex_unlock(m) ((void)(m))
+static unsigned long totalram_pages(void) { return 1UL<<18; }
+static u64 div64_u64(u64 a,u64 b) { return a/b; }
+static int kstrtou32(const char *s,unsigned base,u32 *res) {
+    char *end;unsigned long v=strtoul(s,&end,base);
+    if(end==s || (*end && !(*end=='\n' && !end[1]))) return -EINVAL;
+    *res=(u32)v;return 0;
+}
 #define BUILD_BUG_ON(x) _Static_assert(!(x),#x)
 #define kzalloc_obj(x) calloc(1,sizeof(x))
 #define sysfs_attr_init(x) ((void)0)
@@ -575,18 +749,35 @@ int main(void) {
         assert(strstr(now,"power_mw unsupported\n"));
         assert(strstr(now,"temperature_raw unsupported\n"));
         assert(strstr(now,"requested_frequency_hz unsupported\n"));
-        assert(strstr(now,"achieved_frequency_hz unsupported\n"));
         if(status==1) {
+            /* A valid state with no frequency in the board's table. */
+            assert(strstr(now,"achieved_frequency_hz unsupported\n"));
             assert(strstr(now,"util_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"));
             assert(strstr(now,"pstate 6\n"));
         } else {
+            /* Not valid: the pstate and its frequency say why. */
+            assert(strstr(now,status==2?"pstate stale\n":"pstate unavailable\n"));
+            assert(strstr(now,status==2?"achieved_frequency_hz stale\n":"achieved_frequency_hz unavailable\n"));
             assert(strstr(now,"util_device_percent unsupported\n"));
-            assert(strstr(now,"pstate unsupported\n"));
             assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
             assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
     }
-    /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
+    /* 26A428 reports the state the GPU runs at; state 0 (gated cores) runs at 0 Hz. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=10,.achieved_frequency_hz=1470000000};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate_status valid\npstate 10\nrequested_frequency_hz unsupported\nachieved_frequency_hz 1470000000\n"));
+    current.pstate=0;current.achieved_frequency_hz=0;
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate 0\nrequested_frequency_hz unsupported\nachieved_frequency_hz 0\n"));
+    current.pstate_status=2;
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"pstate stale\nrequested_frequency_hz unsupported\nachieved_frequency_hz stale\n"));
+    /* M5: a stopped busy total reads stale. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=6,.busy_status=2,.busy_ns=77};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"busy_ns stale\n") && !strstr(now,"busy_ns 77"));
+    /* G16S: pstate unsupported by firmware, utilisation still valid. */
     current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
                                           .util_samples=19,.util_host_ns=123};
     agx_stats_show(NULL,&stats.attr,now);
@@ -604,6 +795,23 @@ int main(void) {
     assert(suspend_calls==11);
     asahi_sysfs_unregister(&dev,handle);
     assert(removed==1);
+    struct asahi_gpu_memory limits={.limit=536870912,.client_limit=536870912};
+    assert(!asahi_sysfs_register(&dev,&snap,1,&limits,&handle,NULL,NULL,NULL));
+    struct asahi_stats_attribute *limit_stats=handle;
+    char pct[16];
+    assert(limit_stats->limit_attr.show(&dev,&limit_stats->limit_attr,pct)==3 && !strcmp(pct,"50\n"));
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"99\n",3)==3);
+    assert(limit_writes==1 && submitted_pct==99);
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"100",3)==3);
+    assert(limit_writes==2 && submitted_pct==100);
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"abc",3)==-EINVAL);
+    assert(limit_writes==2);
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"0",1)==1);
+    assert(limit_writes==3 && submitted_pct==0);
+    assert(limits.limit==536870912 && limits.client_limit==536870912);
+    limits.client_limit=0;
+    assert(limit_stats->limit_attr.show(&dev,&limit_stats->limit_attr,pct)==2 && !strcmp(pct,"0\n"));
+    asahi_sysfs_unregister(&dev,handle);
     for(int failure=1;failure<=2;failure++) {
         created=0;fail_file=failure;handle=NULL;
         assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
@@ -633,6 +841,11 @@ def main():
     # Compile the production transport and decoder; only MMIO/shared memory,
     # kernel logging and allocation adapters are replaced by host fixtures.
     channel = '\n'.join(line for line in channel.splitlines() if not line.startswith('//!'))
+    # The fixture's firmware ring has 8 slots (fw::channels below), so drop the kernel's
+    # check that the decoder's ring size matches the real 256-slot ring.
+    ring_check = 'const _: () = assert!(super::telemetry::STATISTICS_RING_RECORDS == STATISTICS_SLOTS);'
+    assert ring_check in channel
+    channel = channel.replace(ring_check, '', 1)
     (work / 'channel.rs').write_text(channel)
     reports = (DRIVER / 'g17/reports.rs').read_text()
     store = reports.split('/// The view owns the session')[0]
@@ -687,7 +900,10 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     header = (RUST_HEADER.replace('M5_STATISTICS_TYPES', m5_types).replace('M5_ASSERTS_GPU_POWER', m5_power)
               .replace('INITDATA_FAMILY', family))
 
-    reader_rs = 'pub(crate) struct Reader(pub(super) Arc<Shared>);\n' + item(stats_rs, 'impl Reader')
+    reader_rs = ('#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item(stats_rs, 'pub(crate) struct StateFrequencies')
+                 + '\n' + item(stats_rs, 'impl StateFrequencies') + '\n'
+                 + 'pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>);\n'
+                 + item(stats_rs, 'impl Reader'))
     (work / 'rings.rs').write_text(header + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
                                   + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
@@ -709,8 +925,10 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     for signature in ['struct asahi_stats_snapshot', 'struct asahi_gpu_memory', 'struct asahi_stats_attribute']:
         pieces.append(item(source, signature) + ';')
     pieces.append(item(baseline, 'static ssize_t agx_stats_show').replace('agx_stats_show(', 'old_agx_stats_show(', 1))
+    pieces += [line for line in source.splitlines() if line.startswith('static DEFINE_MUTEX(asahi_limit_lock)')]
     for signature in ['static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
                       'static int asahi_stats_pm_notify', 'static ssize_t agx_stats_show',
+                      'static ssize_t gpu_mem_limit_pct_show', 'static ssize_t gpu_mem_limit_pct_store',
                       'int asahi_sysfs_register(', 'void asahi_sysfs_unregister(']:
         pieces.append(item(source, signature))
     pieces.append(C_TESTS)

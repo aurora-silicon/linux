@@ -84,6 +84,13 @@ impl StatsSnapshot {
         self.frequencies_hz.get(pstate as usize).copied()
     }
 
+    /// The frequency the GPU runs at now, if the firmware reports it, and its highest, in
+    /// Hz, for fdinfo (`drm-curfreq-*`, `drm-maxfreq-*`): V26A428 (A18 Pro and M5) and
+    /// T6041 (25G83).
+    pub(crate) fn engine_frequency(&self) -> Option<(Option<u64>, u64)> {
+        self.g17_reader.as_ref()?.frequency()
+    }
+
     /// Bump the completed-submission counter (called from the queue
     /// completion path in `JobFence::command_complete`, NOT from the stats
     /// channel).

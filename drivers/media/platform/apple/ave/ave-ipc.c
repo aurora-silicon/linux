@@ -100,22 +100,34 @@ static bool ave_rings_overlap(const struct ave_ring *a,
 
 int ave_ipc_parse_channels(struct ave_dev *ave)
 {
+	const struct ave_fw_transport *t = ave->layout->abi->transport;
+	/* Validated host-to-firmware rings by descriptor; zero slots: none. */
+	struct {
+		u32 slots;
+		u32 offset;
+	} h2t[AVE_IPC_MAX_CHANNELS] = {};
 	bool found[AVE_RINGS] = {};
 
+	if (t->descriptors > ARRAY_SIZE(h2t))
+		return -EPROTO;
 	memset(ave->ring, 0, sizeof(ave->ring));
-	for (unsigned int i = 0; i < ave->layout->abi->transport->descriptors;
-	     i++) {
-		u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
-			   i * AVE_CHAN_DESC_STRIDE;
-		u32 dir = get_unaligned_le32(desc + AVE_CHAN_DESC_DIR);
-		u32 doorbell = get_unaligned_le32(desc + AVE_CHAN_DESC_IRQ);
-		u32 slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
-		u64 addr = get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR);
+	for (unsigned int i = 0; i < t->descriptors; i++) {
+		/*
+		 * The firmware may write the channel area at any time: take one
+		 * copy of the descriptor and use only that copy from here on.
+		 */
+		u8 desc[AVE_CHAN_DESC_ADDR + sizeof(u64)];
+		u32 dir, doorbell, slots, offset;
 		struct ave_ring *r;
+		u64 addr;
 		int id;
-		u32 offset;
 
-		const struct ave_fw_transport *t = ave->layout->abi->transport;
+		memcpy(desc, ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
+			     i * AVE_CHAN_DESC_STRIDE, sizeof(desc));
+		dir = get_unaligned_le32(desc + AVE_CHAN_DESC_DIR);
+		doorbell = get_unaligned_le32(desc + AVE_CHAN_DESC_IRQ);
+		slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
+		addr = get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR);
 
 		if (!memchr(desc, 0, AVE_CHAN_DESC_NAME_LEN) ||
 		    slots > ave->channel_bytes / AVE_RING_SLOT_BYTES ||
@@ -128,7 +140,11 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 		    offset + slots * AVE_RING_SLOT_BYTES >
 			    AVE_IPC_CHANNEL_OFF + ave->channel_bytes)
 			return -EPROTO;
-		id = ave_ring_id(desc);
+		if (!dir) {
+			h2t[i].slots = slots;
+			h2t[i].offset = offset;
+		}
+		id = ave_ring_id((const char *)desc);
 		/* Channels the host has no use for are left alone. */
 		if (id == AVE_RING_SMALLOC && !t->smalloc_bytes)
 			id = -ENOENT;
@@ -148,7 +164,7 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 
 		found[id] = true;
 		r = &ave->ring[id];
-		strscpy(r->name, desc, sizeof(r->name));
+		strscpy(r->name, (const char *)desc, sizeof(r->name));
 		/*
 		 * Host-to-firmware rings start empty, firmware-to-host rings
 		 * full. Bit 0 of a slot's first word says whose turn it is:
@@ -172,22 +188,12 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 	/*
 	 * Hand every slot of every host-to-firmware ring to the host, the ones
 	 * the host never uses too: ownership is bit 0, and a slot left at zero
-	 * reads to the firmware as a message posted to it.
+	 * reads to the firmware as a message posted to it. Only the values
+	 * validated above are used; the descriptors are not read again.
 	 */
-	for (unsigned int i = 0; i < ave->layout->abi->transport->descriptors;
-	     i++) {
-		u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
-			   i * AVE_CHAN_DESC_STRIDE;
-		u32 slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
-		u32 offset;
-
-		if (get_unaligned_le32(desc + AVE_CHAN_DESC_DIR))
-			continue;
-		/* Checked above. */
-		ave_fw_offset(ave, get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR),
-			      (size_t)slots * AVE_RING_SLOT_BYTES, &offset);
-		for (unsigned int n = 0; n < slots; n++) {
-			__le64 *slot = ave->ipc.cpu + offset +
+	for (unsigned int i = 0; i < t->descriptors; i++) {
+		for (unsigned int n = 0; n < h2t[i].slots; n++) {
+			__le64 *slot = ave->ipc.cpu + h2t[i].offset +
 				       n * AVE_RING_SLOT_BYTES;
 
 			slot[0] = cpu_to_le64(1);
@@ -389,7 +395,8 @@ static int ave_smalloc_get(struct ave_dev *ave, u32 bytes, u64 *addr)
 	const struct ave_fw_transport *t = ave->layout->abi->transport;
 	u32 total = min_t(u32, t->smalloc_bytes / AVE_SMALLOC_GRANULE,
 			  AVE_SMALLOC_UNITS);
-	u32 units = DIV_ROUND_UP(bytes, AVE_SMALLOC_GRANULE);
+	/* In 64 bits: a request near 4 GiB must not round up to 0 units */
+	u32 units = DIV_ROUND_UP_ULL(bytes, AVE_SMALLOC_GRANULE);
 	unsigned long first;
 	unsigned int i;
 
@@ -1000,3 +1007,7 @@ int ave_ipc_settle(struct ave_dev *ave, unsigned int wait_ms)
 	ave->reply_err = 0;
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_IPC_KUNIT_TEST)
+#include "ave-ipc-test.c"
+#endif

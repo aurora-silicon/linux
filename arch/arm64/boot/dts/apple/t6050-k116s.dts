@@ -9,6 +9,9 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
+#define T6050_K_N1_FIRMWARE	"apple/centauri/k116s-ftab.bin"
+#define T6050_K_BOARD_ID	0x16
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -22,3 +25,582 @@
 
 #define T6050_K116S
 #include "t6050-peripherals.dtsi"
+
+&pinctrl_ap {
+	/*
+	 * Pin 112 takes an SError when read, so only the pins a node names are
+	 * exposed: 80/81 (PCIe ports 0 and 1's PERST#), 106/107 (amp fault, amp
+	 * shutdown), 134/139 (jack codec interrupt, reset), 136/137 (speaker ID)
+	 * and 138 (Touch ID data ready).
+	 */
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
+};
+
+/*
+ * PCIe port 0 (the N1) and port 1 (the SD card reader) are in t6050-k114-k116.dtsi.
+ * This board drives one SMC pcIO output (below), so the reader's power is output 0.
+ */
+&port01 {
+	pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+};
+
+/*
+ * SMC sensors, as on J714s: every readable float T* key is discovered through
+ * apple,discover-temperatures in t6050-die0.dtsi, so the shared temperature
+ * nodes and apple,soc-die-keys go. The T6050 SMC spells the fan mode keys
+ * F0md/F1md and drives the fans itself.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	status = "okay";
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
+
+/*
+ * The trackpad's AFE reset. The ADT names the SMC pcIO template (0x10000,
+ * 0x11c0000), the same line as SMC GPIO gp1c, active low, which gpio-macsmc
+ * drives; through the pcIO outputs the multi-touch interface never comes up.
+ * As on J714s: gp1c. The keyboard alias lets the loader fill the layout from
+ * the ADT.
+ *
+ * The one SMC pcIO output this board drives, as a pKW8('pcIO', lo, hi) template
+ * written (hi << 32) | lo with the level in the low bits; this replaces the
+ * three of t6050-k114-k116.dtsi:
+ *   0 sd_pwr_en (0x0, 0x190000): ADT pcie-sdreader function-sd_pwr_en (and
+ *     /pcie-sdreader-helper), the SD reader's power on PCIe port 1
+ */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x0019000000000000>;
+};
+
+&mtp_hid {
+	apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
+
+	keyboard: keyboard {
+	};
+
+	/*
+	 * The touchscreen's MTP interface. Its GPIO functions (reset, power, clock,
+	 * display sync) are not described yet, so the interface stays off until
+	 * they are, as a pending GPIO request from the firmware stalls the others.
+	 */
+	kiwi {
+		status = "disabled";
+	};
+};
+
+/ {
+	aliases {
+		keyboard = &keyboard;
+	};
+};
+
+/* The USB-C ports ATC1 and ATC2, as on the other K boards */
+#include "t6050-k114-k116-usb.dtsi"
+
+/*
+ * Right port (ATC2): nub-spmi-a1 takes the first register window only, as on
+ * J714s.
+ */
+&nub_spmi_a1 {
+	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+};
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s: iBoot loads its firmware and
+ * the driver starts it with these boot arguments and the firmware properties in the tunables
+ * file. Its report tells it which devices are on; the PMC honours its votes next to the CLPC.
+ * The AOP's audio firmware needs it too: its LEAP cluster enable goes through PMP-managed
+ * power domains (every AOP and AUDIO domain of this ADT is "no_ps"), and without the PMP it
+ * fails, the audio controller never reaches systemReady and no AOP service is announced.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* ADT /chosen board-id, dram-vendor-id */
+	apple,board-id = <22>;
+	apple,dram-vendor-id = <1>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+#include "t6050-k116s-pmp-tunables.dtsi"
+
+/* Sound: the J714s description, every value checked against the K116s ADT. */
+/*
+ * The amps' shared shutdown line (SDZ): ADT audio-speaker function-reset, AP pin 107. One
+ * regulator as the SDZ supply of all six (not per-amp shutdown-gpios: with GPIO_SHARED six
+ * references become a vote, and one amp driving the line low would not shut the others down).
+ */
+/ {
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+/*
+ * The left amps: ADT /arm-io/i2c1. i2c1 is disabled by t6050-k114-k116.dtsi ("Audio is not
+ * brought up"); re-enabled here. Sense slots from the ADT speaker-config (V at 4N, I at 4N+2
+ * for group index N); the firmware's frame is 250 BCLKs of 12 MHz, which the amp driver's
+ * ratio detection rejects, hence ti,bclk-ratio. Every amp joins the SDZ fail-closed group:
+ * an over-temperature or over-current fault on any one forces the shared line low.
+ *
+ * Each amp's operating level (AMP_LEVEL 15 here) is its row of the ADT speaker-config,
+ * which aura copies into the node as apple,speaker-config (aura commit "kboot: hand the
+ * speaker amps' configuration from the ADT to the kernel", patches/aura/). macaudio
+ * refuses to run the speakers on an SN012776 without it (the jack still works).
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <2>;
+		ti,vmon-slot-no = <0>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <10>;
+		ti,vmon-slot-no = <8>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <18>;
+		ti,vmon-slot-no = <16>;
+		ti,bclk-ratio = <250>;
+	};
+};
+
+/*
+ * The right amps: ADT /arm-io/i2c3. In t6050-peripherals.dtsi i2c3 is disabled, clocked from
+ * peripheral_clocks 4 and powered by ps_i2c3 under ps_sio. The ADT gives i2c1, i2c2 and i2c3
+ * the same clock-ids (4), so i2c3 takes clkref like i2c1/i2c2 in t6050-die0.dtsi; its power
+ * state's parent (SIO) is left undescribed, as for i2c1 and i2c2 (same as J714s).
+ */
+&ps_i2c3 {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&i2c3 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <6>;
+		ti,vmon-slot-no = <4>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <14>;
+		ti,vmon-slot-no = <12>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <22>;
+		ti,vmon-slot-no = <20>;
+		ti,bclk-ratio = <250>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output, reg 0x4b): reset on AP
+ * pin 139 (function-reset GPIO(0x8b, 0x1)), driven high to run; interrupt AP pin 134, level
+ * low. i2c2 is disabled by t6050-k114-k116.dtsi; re-enabled here.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/* ADT admac-base-ns: 0x293800000, IRQ 637, 13 TX + 13 RX channels, dart-aop stream 8 */
+&admac_base_ns {
+	status = "okay";
+};
+
+/*
+ * The AOP audio service (apple,t6050-aop-audio, t6050-die0.dtsi: dmas cout/cin/spkr/sense =
+ * base-ns 4/5/0/1). The chassis name is the microphone card's identity (AppleK116HPAI), the
+ * machine kind the card's long name.
+ */
+&aop_audio {
+	apple,chassis-name = "K116";
+	apple,machine-kind = "MacBook Pro";
+};
+
+/*
+ * The sound card. "apple,k116-macaudio" needs its macaudio.c entry (patches/0001-ASoC-apple-
+ * macaudio-Add-K116.patch): the same amps, slots, frame and sense layout as J714
+ * (macaudio_j714_cfg), a different chassis. Until that lands, "apple,j714-macaudio" as the
+ * first compatible gives the same card under the J714 name.
+ */
+/ {
+	sound {
+		compatible = "apple,k116-macaudio", "apple,macaudio";
+		model = "MacBook Pro K116";
+		/* ADT audio-speaker function-speaker-id0 and -id1: gpio0 0x88, 0x89 */
+		speaker-id-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl_ap 137 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				/* T8152-style driver: DAI 0 is the jack ("cout"/"cin") back-end */
+				sound-dai = <&aop_audio 0>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+			/*
+			 * Codecs in ADT speaker-config (group) order, so that macaudio gives them
+			 * playback slots 0-5 as macOS does (left in slots 0, 2, 4; right in 1, 3, 5).
+			 * The idle masks are ADT amp-tx-zd-config rows 0 and 1 (fff0f0f0, ff0f0f0f):
+			 * left woofer 1 drives zeros in the right amps' sense slots, right woofer 1
+			 * in the left amps'.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-1 = <0xff0f0f0f>;
+
+			cpu {
+				/* DAI 3 is the "spkr" back-end (its V/I sense is the card's third PCM) */
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+};
+
+/*
+ * The AOP, booted through its setup port (ADT aop-exclave-mailbox at 0x2d067c000, dart-aop
+ * stream 1), with its RTKit mailbox (ADT aop interrupts 578-581), dart-aop (0x290fc0000,
+ * IRQ 616, 17 streams, locked tables on the ADT l1-tt-0 root) and the AOP itself
+ * (0x290c00000 SRAM window, ASC 0x290600000). All four nodes are in t6050-die0.dtsi /
+ * t6050-peripherals.dtsi of the PR tree, disabled.
+ */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+/*
+ * The microphone array: ADT audio-hp-mic ("Digital Mic", three microphones imi1/imi2/imi3,
+ * 48 kHz float32) on leap-s ADMAC RX0, which the AP reaches through the proxy aperture ADT
+ * admac-hp-mic-ec-proxy: reg 0x2d3200000 size 0x34000 (not behind the arm-io translation,
+ * like the AOP setup port), dma-channel 0, admac-leap-s interrupt 638, dart-aop
+ * mapper-admac-leap-s stream 11 (vm-base-11 0x10040000000, vm-size-11 0xffff0000). The K116s
+ * ADT has the J714s values in each of these. The AOP audio service captures the array on a
+ * card of its own (AppleK116HPAI). The LEAP leaves have no AP power state: the firmware
+ * raises them with the hpai service's "pw0 " when the capture opens, and the ADMAC's
+ * registers are first touched after that, when the capture requests its channel.
+ */
+&admac_ec_proxy {
+	status = "okay";
+};
+
+&aop_audio {
+	/* hpai: leap-s RX0 is Linux channel 1 of the proxy ADMAC (2N for TX N, 2N+1 for RX N) */
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
+};
+/* The GPU, handed over by the boot loader */
+#include "t6050-k114-k116-gpu.dtsi"
+
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
+&panel {
+	compatible = "apple,panel-k116", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+};
+
+/*
+ * As t6050-j714s.dts: the GPU on the PMP's GFX report entry (report@f, on ps_gfx), so the PMP
+ * is told the GPU is on only while it is powered. This board runs the PMP with its report
+ * (&pmp0_report above).
+ */
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
+
+/*
+ * The camera: the T6050 ISP as J716c and J714s describe it. From the K116sAP ADT (27.2):
+ *  - isp0 reg[0] 0x380000000 (+ the arm-io range, 0x580000000) + 0x3ff0000 holds the windows
+ *    the include names; reg[1] 0x280900000 + 0x3f4 ends at the last ISP power state (0x3f0);
+ *    interrupts 513..516, 526; EIC mmio-wd-isp 0x5c3b50000 + 0x8000.
+ *  - dart-isp0: three instances at 0x5828c0000, 0x5828e0000 and 0x582900000 (0xc000 each),
+ *    the address filter at 0x5828d0000, interrupt 531, host streams 0 and 12 (sid), exclave
+ *    streams 4/5 and 8/9, remap 1, 6, 7, 10, 11, DAPF stream mask 0xcc3.
+ *  - pmgr: FAB9_SOC 0x398, ISP_SYS 0x3a0 and ISPSENS0 0x100 in the second register block
+ *    (0x280900000); ISP_CPU, ISP_FE, DPRX, ISP_SECURE, ISP_BE and ISP_CLR are devices 0xdc,
+ *    0xdd and 0xe1..0xe4 with no register of their own in the table, eight bytes per device
+ *    from ISP_SYS (0xda): 0x3b0, 0x3b8 and 0x3d8..0x3f0, the range the DAPF opens.
+ *  - two firmware segments, 0xc1c000 and 0x13d0000 bytes at DART address 0x10000000000.
+ * The firmware (uuid 980F533B-34EA-3FBA-878C-809F6AF57345) runs one "FrontRGB" IMX958 here,
+ * J714s's sensor. The sensor type is 0xbc and the connection scheme 0x10; the loader passes
+ * both. Everything stays disabled until the loader has reserved the firmware.
+ */
+#include "t6050-j716c-isp.dtsi"
+
+/*
+ * The CPU PMU the shared T6050 files turn on for every board (t6050-base.dtsi, measured on
+ * the J714s) is held back here until it has been tried on the K116s. To try it, remove
+ * this block.
+ */
+&cpu_pmu {
+	status = "disabled";
+};
+
+/* macOS offers High Power mode on this machine */
+&clpc {
+	apple,high-power-mode;
+};
+
+/*
+ * The video decoder (K116sAP ADT avd0), its DART and power states, as on the J714s.
+ * ADT: avd0 reg[0] 0x2108000000 + 0x1404000, interrupts 2417/2418; dart-avd0 at
+ * 0x2109020000, interrupt 2424; FAB1_SOC at offset 0x1b0 and AVD_SYS at 0x1d8 of
+ * the pmgr's reg[46] (0x2180600000).
+ */
+&pmgr4 {
+	status = "okay";
+};
+
+/* macOS turns FAB1_SOC on once at boot and never gates it. */
+&ps_fab1_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};
+
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116s.bin", "apple/msrk-k116s.bin"
+#include "t6050-touchid.dtsi"
+
+/*
+ * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does
+ * not enter the firmware-driven sleep with it on. Enabled and unused, genpd turns it off at
+ * boot. No encoder is described yet.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+/*
+ * Deep sleep: the sleep controller's description and the J714s's SoC values, then what differs
+ * on this board (firmware 27.2).
+ */
+#include "t6050-k116s-sleep.dtsi"
+/* No USB4 router is described on this board: without the J714s's CIO sleep part. */
+#define T6050_SLEEP_SOC_NO_CIO
+#include "t6050-j714s-sleep-soc.dtsi"
+
+/*
+ * macOS on this board parks the four clock words with 0x80100000 in the last 0.5 ms before its
+ * commit (traced as an aura guest); the J714s's values have bit 10 set.
+ */
+&sleep {
+	apple,seq-commit-sio =
+		<0x0 17 0x290 0x400024f>,
+		<0x0 17 0x2a0 0x400024f>,
+		<0x1 51 0xa0 0x0>,
+		<0x0 51 0xa0 0x80100000>,
+		<0x1 51 0xa0 0x0>,
+		<0x1 51 0xa4 0x0>,
+		<0x0 51 0xa4 0x80100000>,
+		<0x1 51 0xa4 0x0>,
+		<0x1 51 0x94 0x0>,
+		<0x0 51 0x94 0x80100000>,
+		<0x1 51 0x94 0x0>,
+		<0x1 51 0x90 0x0>,
+		<0x0 51 0x90 0x80100000>,
+		<0x1 51 0x90 0x0>;
+};
+
+/*
+ * The PMP firmware's __DATA starts at 0x56000 on 27.2 (ADT pmp0 segment-ranges: __TEXT 0x56000
+ * bytes, __DATA 0x9b000 bytes), not at the J714s's 0x58000. With the wrong range kept over the
+ * sleep the PMP does not come back (endpoint discovery -62).
+ */
+&pmp0 {
+	apple,sram-keep = <0x56000 0x9b000>;
+};
+
+/*
+ * t6050-j714s-sleep-soc.dtsi, included above, sets the J714s's 2500 us; keep the K boards'
+ * 10000 us (t6050-k114-k116-display.dtsi).
+ */
+&dcp {
+	apple,panel-video-open-delay-us = <10000>;
+};

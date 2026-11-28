@@ -18,6 +18,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "ave.h"
 #include "ave-regs.h"
 
@@ -76,6 +77,29 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
+/*
+ * HEVC Main 10 (P010 input): the 9003 and the counted (26A428) layouts,
+ * whose Starts map every field that changes with bit depth. The 6070
+ * layout has none.
+ */
+static bool ave_main10_supported(const struct ave_dev *ave)
+{
+	return ave->layout && (ave->layout->counted ||
+			       ave->layout->kind == AVE_LAYOUT_9003);
+}
+
+/*
+ * Whether raw @fourcc can be encoded to @coded on @ave. P010 is only the
+ * input of HEVC Main 10: H.264 has no 10-bit profile here.
+ */
+static bool ave_raw_fmt_ok(const struct ave_dev *ave, u32 coded, u32 fourcc)
+{
+	if (fourcc == V4L2_PIX_FMT_NV12)
+		return true;
+	return fourcc == V4L2_PIX_FMT_P010 && coded == V4L2_PIX_FMT_HEVC &&
+	       ave_main10_supported(ave);
+}
+
 /* HEVC Main tier levels 5 to 5.2 allow at most this many luma samples. */
 #define AVE_HEVC_MAX_SAMPLES	8912896
 
@@ -92,13 +116,15 @@ static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
  * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
  * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
  * is the input for HEVC Main 10. @coded is the context's coded format,
- * which limits the size.
+ * which limits the size and the formats: a raw format @coded cannot take
+ * becomes NV12, and ENUM_FMT does not list it for @coded.
  */
-static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
+static void ave_fill_raw(const struct ave_dev *ave,
+			 struct v4l2_pix_format_mplane *f, u32 coded)
 {
 	u32 stride, height, bytes;
 
-	if (f->pixelformat != V4L2_PIX_FMT_P010 || coded != V4L2_PIX_FMT_HEVC)
+	if (!ave_raw_fmt_ok(ave, coded, f->pixelformat))
 		f->pixelformat = V4L2_PIX_FMT_NV12;
 	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	ave_clamp_size(coded, &f->width, &f->height);
@@ -137,7 +163,13 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	struct v4l2_pix_format_mplane *src = &ctx->src_fmt, *dst = &ctx->dst_fmt;
 
 	memset(dst, 0, sizeof(*dst));
-	dst->pixelformat = V4L2_PIX_FMT_H264;
+	/*
+	 * OUTPUT formats follow the CAPTURE format, and clients such as
+	 * GStreamer list them before choosing a codec. Start on HEVC where it
+	 * takes P010 so that list has every raw format the device takes.
+	 */
+	dst->pixelformat = ave_main10_supported(ctx->ave) ? V4L2_PIX_FMT_HEVC :
+							     V4L2_PIX_FMT_H264;
 	dst->width = AVE_DEFAULT_W;
 	dst->height = AVE_DEFAULT_H;
 	ave_fill_coded(dst);
@@ -145,7 +177,7 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	memset(src, 0, sizeof(*src));
 	src->width = dst->width;
 	src->height = dst->height;
-	ave_fill_raw(src, dst->pixelformat);
+	ave_fill_raw(ctx->ave, src, dst->pixelformat);
 	src->colorspace = V4L2_COLORSPACE_REC709;
 	src->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	src->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -176,19 +208,30 @@ static int ave_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *
 	return 0;
 }
 
+/* The raw formats the current coded format can take, as the encoder spec asks. */
 static int ave_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index >= ARRAY_SIZE(ave_raw_fmts))
-		return -EINVAL;
-	f->pixelformat = ave_raw_fmts[f->index];
-	return 0;
+	struct ave_ctx *ctx = ave_file_to_ctx(file);
+	unsigned int n = 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_raw_fmts); i++) {
+		if (!ave_raw_fmt_ok(ctx->ave, ctx->dst_fmt.pixelformat, ave_raw_fmts[i]))
+			continue;
+		if (n++ == f->index) {
+			f->pixelformat = ave_raw_fmts[i];
+			return 0;
+		}
+	}
+	return -EINVAL;
 }
 
 static int ave_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
+	struct ave_ctx *ctx = ave_file_to_ctx(file);
+
 	if (fs->index ||
 	    (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), fs->pixel_format) &&
-	     !ave_fmt_listed(ave_raw_fmts, ARRAY_SIZE(ave_raw_fmts), fs->pixel_format)))
+	     !ave_raw_fmt_ok(ctx->ave, ctx->dst_fmt.pixelformat, fs->pixel_format)))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -220,7 +263,7 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
 
-	ave_fill_raw(pix, ctx->dst_fmt.pixelformat);
+	ave_fill_raw(ctx->ave, pix, ctx->dst_fmt.pixelformat);
 	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT) {
 		pix->colorspace = ctx->src_fmt.colorspace;
 		pix->xfer_func = ctx->src_fmt.xfer_func;
@@ -230,21 +273,58 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
+/*
+ * P010 can only be encoded as HEVC Main 10, so S_FMT selects it: a client
+ * that keeps the default profile (GStreamer's v4l2h265enc, FFmpeg) gets a
+ * session for 10-bit input too, and reading the control afterwards gives
+ * the profile the stream has. Going back to NV12 undoes only a Main 10
+ * that S_FMT chose; one the client set stays and is refused at STREAMON,
+ * as is Main set after S_FMT on P010.
+ */
+static void ave_sync_hevc_profile(struct ave_ctx *ctx)
+{
+	/* Only HEVC takes P010, so with H.264 this only undoes an automatic Main 10. */
+	bool ten = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_P010;
+	s32 cur;
+
+	if (!ctx->hevc_profile_ctrl)
+		return;
+	cur = v4l2_ctrl_g_ctrl(ctx->hevc_profile_ctrl);
+	if (ten && cur != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) {
+		v4l2_ctrl_s_ctrl(ctx->hevc_profile_ctrl, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10);
+		ctx->hevc_profile_auto = true;
+	} else if (!ten && cur == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 &&
+		   ctx->hevc_profile_auto) {
+		v4l2_ctrl_s_ctrl(ctx->hevc_profile_ctrl, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+		ctx->hevc_profile_auto = false;
+	}
+}
+
 static int ave_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
+	struct vb2_queue *out_vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						   V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+	bool raw_ok;
 
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 	/* The coded format comes first; the raw side follows its size. */
 	ave_fill_coded(pix);
+	/* A raw format the new codec cannot take (P010 for H.264) becomes NV12. */
+	raw_ok = ave_raw_fmt_ok(ctx->ave, pix->pixelformat, ctx->src_fmt.pixelformat);
+	if (!raw_ok && vb2_is_busy(out_vq))
+		return -EBUSY;
 	pix->colorspace = ctx->src_fmt.colorspace;
 	pix->xfer_func = ctx->src_fmt.xfer_func;
 	pix->ycbcr_enc = ctx->src_fmt.ycbcr_enc;
 	pix->quantization = ctx->src_fmt.quantization;
 	ctx->dst_fmt = *pix;
+	if (!raw_ok)
+		ave_fill_raw(ctx->ave, &ctx->src_fmt, pix->pixelformat);
+	ave_sync_hevc_profile(ctx);
 	return 0;
 }
 
@@ -261,6 +341,7 @@ static int ave_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	if (ret)
 		return ret;
 	ctx->src_fmt = *pix;
+	ave_sync_hevc_profile(ctx);
 
 	/* The coded size follows the raw size (crop is the whole frame). */
 	ctx->dst_fmt.width = pix->width;
@@ -460,7 +541,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctx->hevc_max_qp = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		/* ave_sync_hevc_profile() sets the flag again after its own change. */
 		ctx->hevc_profile = ctrl->val;
+		ctx->hevc_profile_auto = false;
 		break;
 	case V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED:
 		ctx->prioritize_speed = ctrl->val;
@@ -545,12 +628,23 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
-	/* Main 10 takes P010 input; the profile is checked against it at STREAMON. */
-	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
-			       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
-				 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	/*
+	 * Main 10 takes P010 input: S_FMT sets the profile from the raw format
+	 * and STREAMON checks it. It is offered only where it is mapped.
+	 */
+	if (ave_main10_supported(ctx->ave))
+		ctx->hevc_profile_ctrl =
+			v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+					       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+						 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	else
+		ctx->hevc_profile_ctrl =
+			v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
+					       ~BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN),
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_1);
@@ -1061,7 +1155,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 		v4l2_m2m_buf_copy_metadata(s->src, dst);
 		dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
 				V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
-		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
+		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME :
+			      s->bframe ? V4L2_BUF_FLAG_BFRAME : V4L2_BUF_FLAG_PFRAME;
 		dst->sequence = ctx->dst_sequence++;
 
 		sess->done_head = (sess->done_head + 1) % AVE_MAX_SLOTS;
@@ -1434,7 +1529,8 @@ int ave_v4l2_register(struct ave_dev *ave)
 	int ret;
 
 	mutex_init(&ave->vdev_lock);
-	ave->wq = alloc_ordered_workqueue("apple-ave", WQ_MEM_RECLAIM);
+	ave->wq = alloc_ordered_workqueue("ave-%s", WQ_MEM_RECLAIM,
+					  dev_name(ave->dev));
 	if (!ave->wq)
 		return -ENOMEM;
 	INIT_WORK(&ave->irq_work, ave_irq_work);
@@ -1464,7 +1560,7 @@ int ave_v4l2_register(struct ave_dev *ave)
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, ave);
 
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret)
 		goto err_m2m;
 	ret = ave_mctf_register(ave);

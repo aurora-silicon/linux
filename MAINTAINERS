@@ -2068,7 +2068,10 @@ APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
 L:	linux-pci@vger.kernel.org
 S:	Maintained
+F:	drivers/pci/controller/pcie-apple-radio.c
 F:	drivers/pci/controller/pcie-apple.c
+F:	include/linux/soc/apple/radio-sleep.h
+F:	tools/asahi/radio-*-tests.*
 
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>
@@ -2090,6 +2093,7 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-running.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
@@ -2146,6 +2150,15 @@ F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/apple/aop-las.py
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
+
+APPLE T8152 DCP DISPLAY DRIVER (IBOOT INTERFACE)
+M:	Thomas Glanzmann <thomas@glanzmann.de>
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/display/apple,t8152-dcp-iboot.yaml
+F:	drivers/gpu/drm/apple/iboot_drm.c
+F:	drivers/gpu/drm/apple/iomfb_iboot.*
+F:	drivers/gpu/drm/apple/t8152_*
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
@@ -2696,6 +2709,7 @@ F:	Documentation/devicetree/bindings/dma/apple,sio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,*
 F:	Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
 F:	Documentation/devicetree/bindings/sound/trivial-codec.yaml
+F:	drivers/dma/apple-sio-msg-test.c
 F:	drivers/dma/apple-sio-probe-test.c
 F:	drivers/dma/apple-sio-probe-test.dtso
 F:	drivers/dma/apple-sio-t6030-test.dtso
@@ -2719,6 +2733,7 @@ B:	https://github.com/AsahiLinux/linux/issues
 C:	irc://irc.oftc.net/asahi-dev
 T:	git https://github.com/AsahiLinux/linux.git
 F:	Documentation/ABI/testing/sysfs-driver-apple-dart
+F:	Documentation/ABI/testing/sysfs-driver-apple-isp
 F:	Documentation/ABI/testing/sysfs-driver-apple-pmp-dram
 F:	Documentation/devicetree/bindings/arm/apple.yaml
 F:	Documentation/devicetree/bindings/arm/apple/*
@@ -2754,6 +2769,7 @@ F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
 F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,aon-ptd.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,cluster-pwrgate.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6000-pmgr-misc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,sep.yaml
@@ -2764,15 +2780,20 @@ F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-nhi.yaml
 F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
+F:	Documentation/hwmon/apple-aon-ptd-hwmon.rst
 F:	Documentation/hwmon/macsmc-hwmon.rst
 F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
+F:	drivers/bluetooth/hci_bcm4377_test.c
+F:	tools/asahi/bcm4377-completion-tests.py
+F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
 F:	drivers/dma/apple-piodma.c
 F:	drivers/gpio/gpio-macsmc.c
+F:	drivers/hwmon/apple-aon-ptd-hwmon*.c
 F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
@@ -2782,6 +2803,8 @@ F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
 F:	drivers/input/touchscreen/apple_z2.c
+F:	drivers/iommu/apple-dart-power.h
+F:	drivers/iommu/apple-dart-sleep.c
 F:	drivers/iommu/apple-dart-test.c
 F:	drivers/iommu/apple-dart.c
 F:	drivers/iommu/io-pgtable-dart.c
@@ -2789,9 +2812,13 @@ F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
 F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
+F:	drivers/nvme/host/apple-kunit.c
 F:	drivers/nvme/host/apple.c
+F:	drivers/nvme/host/apple.kunitconfig
 F:	drivers/nvmem/apple-efuses.c
+F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
+F:	drivers/nvmem/apple-spmi-nvmem.kunitconfig
 F:	drivers/phy/apple/
 F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
@@ -2811,6 +2838,7 @@ F:	tools/asahi/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple-test.c
 F:	tools/asahi/test-m3-uapi.py
 F:	drivers/spi/spi-apple.c
+F:	tools/spi/apple-spi-clock-test.py
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thermal/apple-pmp*
 F:	drivers/thunderbolt/.kunitconfig.apple-dpin
@@ -2832,6 +2860,8 @@ F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+F:	tools/asahi/dart-sleep-*-tests.*
+F:	tools/asahi/sleep_test_utils.py
 F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE AVE VIDEO ENCODER DRIVER
@@ -2866,6 +2896,7 @@ S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
 F:	drivers/media/platform/apple/scaler/
+F:	tools/media/apple-scaler/
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
@@ -5573,6 +5604,7 @@ L:	brcm80211-dev-list.pdl@broadcom.com
 S:	Supported
 F:	drivers/net/wireless/broadcom/brcm80211/
 F:	include/linux/platform_data/brcmfmac.h
+F:	tools/asahi/brcmfmac-sleep-lifetime-tests.*
 
 BROADCOM BRCMSTB GPIO DRIVER
 M:	Doug Berger <opendmb@gmail.com>
@@ -25621,6 +25653,7 @@ S:	Maintained
 F:	drivers/base/property.c
 F:	drivers/base/swnode.c
 F:	drivers/base/test/swnode-devlink-test.c
+F:	drivers/base/test/swnode-managed-test.c
 F:	include/linux/fwnode.h
 F:	include/linux/property.h
 

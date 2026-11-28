@@ -550,6 +550,29 @@ static void dcpaud_hold_link_needs_channel(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
 }
 
+static void dcpaud_hold_link_needs_power(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	int ret;
+
+	/*
+	 * Runtime PM enabled at bind and off now (a system sleep in progress):
+	 * the device's domain cannot be powered, so no link is held and
+	 * nothing is sent.
+	 */
+	dcpaud_link_test_channel(test, audio);
+	audio->rpm_enabled = true;
+	scoped_guard(mutex, &audio->link_lock)
+		ret = dcpaud_hold_link_locked(audio);
+	KUNIT_EXPECT_EQ(test, ret, -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "");
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
 /* The PCM core's view of @sub for snd_pcm_suspend_all(): its PCM's only substream */
 static void dcpaud_link_test_pcm(struct kunit *test, struct dcp_audio *audio,
 				 struct snd_pcm_substream *sub)
@@ -664,6 +687,86 @@ static void dcpaud_sleep_ends_cleared_dma(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
 }
 
+/* The monitor's ELD, as drm builds it from an EDID with a name: 'QG270 S3' */
+static int dcpaud_eld_test_sink(struct device *dev, u8 *eld, size_t size)
+{
+	static const char name[] = "QG270 S3";
+
+	memset(eld, 0, size);
+	eld[DRM_ELD_VER] = DRM_ELD_VER_CEA861D;
+	eld[DRM_ELD_CEA_EDID_VER_MNL] = DRM_ELD_CEA_EDID_VER_CEA861BCD |
+					 (sizeof(name) - 1);
+	eld[DRM_ELD_MANUFACTURER_NAME0] = 0x04;
+	eld[DRM_ELD_MANUFACTURER_NAME1] = 0x72;
+	memcpy(eld + DRM_ELD_MONITOR_NAME_STRING, name, sizeof(name) - 1);
+	return 0;
+}
+
+/*
+ * A Type-C processor's service connects before its route's EDID is read: the
+ * card has the basic fallback. Once the EDID is published, it takes the name.
+ */
+static void dcpaud_eld_refresh_takes_monitor_name(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *dcpaud = dcpaud_link_setup(test, &pdev);
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	mutex_init(&dcpaud->data_lock);
+	dcpaud->connected = true;
+	dcpaud_build_eld(dcpaud, dcpaud->eld);	/* no EDID yet: fallback */
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 0);
+	KUNIT_EXPECT_EQ(test, drm_eld_sad_count(dcpaud->eld), 1);
+
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_sink);
+	dcpaud_build_eld(dcpaud, eld);
+	KUNIT_EXPECT_TRUE(test, dcpaud_eld_update(dcpaud, eld));
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 8);
+	KUNIT_EXPECT_MEMEQ(test, dcpaud->eld + DRM_ELD_MONITOR_NAME_STRING, "QG270 S3", 8);
+	KUNIT_EXPECT_EQ(test, drm_eld_sad_count(dcpaud->eld), 1);
+	/* The same ELD again is no change. */
+	KUNIT_EXPECT_FALSE(test, dcpaud_eld_update(dcpaud, eld));
+}
+
+/* A card without a sink keeps its zero ELD: the jack follows the firmware. */
+static void dcpaud_eld_refresh_needs_connection(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *dcpaud = dcpaud_link_setup(test, &pdev);
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	mutex_init(&dcpaud->data_lock);
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_sink);
+	dcpaud_build_eld(dcpaud, eld);
+	KUNIT_EXPECT_FALSE(test, dcpaud_eld_update(dcpaud, eld));
+	KUNIT_EXPECT_EQ(test, dcpaud->eld[DRM_ELD_VER], 0);
+}
+
+/* The EDID was cleared (stale route) or is still to be read: no ELD */
+static int dcpaud_eld_test_no_edid(struct device *dev, u8 *eld, size_t size)
+{
+	memset(eld, 0, size);
+	return -ENODATA;
+}
+
+/* A cleared or unread EDID leaves a connected card's named ELD as it is. */
+static void dcpaud_eld_refresh_keeps_name_without_edid(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *dcpaud = dcpaud_link_setup(test, &pdev);
+
+	mutex_init(&dcpaud->data_lock);
+	dcpaud->connected = true;
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_sink);
+	KUNIT_EXPECT_TRUE(test, dcpaud_refresh_eld_from_edid(dcpaud));
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 8);
+
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_no_edid);
+	KUNIT_EXPECT_FALSE(test, dcpaud_refresh_eld_from_edid(dcpaud));
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 8);
+	KUNIT_EXPECT_MEMEQ(test, dcpaud->eld + DRM_ELD_MONITOR_NAME_STRING, "QG270 S3", 8);
+}
+
 static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_link_release_instance),
 	KUNIT_CASE(dcpaud_disconnect_sync_completes_live_owner),
@@ -680,9 +783,13 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_hold_link_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_did_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_needs_channel),
+	KUNIT_CASE(dcpaud_hold_link_needs_power),
 	KUNIT_CASE(dcpaud_sleep_suspends_running_stream),
 	KUNIT_CASE(dcpaud_sleep_releases_held_link),
 	KUNIT_CASE(dcpaud_sleep_ends_cleared_dma),
+	KUNIT_CASE(dcpaud_eld_refresh_takes_monitor_name),
+	KUNIT_CASE(dcpaud_eld_refresh_needs_connection),
+	KUNIT_CASE(dcpaud_eld_refresh_keeps_name_without_edid),
 	{}
 };
 

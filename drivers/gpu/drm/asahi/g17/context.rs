@@ -8,13 +8,13 @@
 
 mod identity;
 use super::{
-    freelist::{RenderIds, RenderPool},
+    freelist::{RenderId, RenderIds, RenderPool},
     fw::{context as fw, queue::Policy},
-    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject, ReturnMark},
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 
 /// Both of a context's render channels are bound to other pairs whose publications have not
@@ -166,9 +166,9 @@ impl WorkStorage {
     }
 }
 
-/// A context's scheduler page. The M5 firmware caches its mapping, so on M5 it
-/// comes from the retention pool and stays mapped until firmware stop; elsewhere
-/// it is an ordinary allocation.
+/// A context's scheduler page. On M5 it comes from the retention pool so its
+/// VA stays mapped and fenced across releases (uncached, because both firmware
+/// and host write it on reuse); elsewhere it is an ordinary allocation.
 pub(crate) enum SchedulerStorage {
     Ordinary(KernelObject),
     Retained(PooledObject),
@@ -214,9 +214,21 @@ pub(crate) struct Context {
     /// A kill of this context was published, through a compute queue or on its render pairs'
     /// behalf. A context is killed at most once.
     kill_published: AtomicBool,
-    /// Advisory only: publication still checks the physical binding under the
-    /// device mutex. False skips an inline attempt known to need admission.
-    compute_binding_hint: AtomicBool,
+    /// The host's recovery generation when it first saw the kill of this context done (its
+    /// scheduler page's killed state), `u64::MAX` before ([`Self::restarted_since_kill`]).
+    kill_seen: AtomicU64,
+    /// The host's recovery generation at this context's first close, `u64::MAX` while open
+    /// ([`Self::note_closed`], [`Self::restarted_since_close`]).
+    closed_generation: AtomicU64,
+    /// The kernel closed this context's queue on its client's behalf
+    /// (`Firmware::close_failed_owners`) and the client has not closed it yet.
+    closed_for_open_client: AtomicBool,
+    /// Advisory count of bound compute channels: publication still checks the physical binding
+    /// under the device mutex. Zero skips an inline attempt known to need admission.
+    compute_bindings: AtomicU32,
+    /// Shared monotonic compute completion ordinal / submit sequence across an M5 multi-channel
+    /// context's physical compute queues.
+    compute_ordinal: AtomicU32,
     /// Mixed-engine contexts keep the original inline publication path.
     render_seen: AtomicBool,
     qos: Arc<QosLease>,
@@ -231,20 +243,30 @@ pub(crate) struct Context {
     order: Arc<Mutex<Order>>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
+    /// How far the work storage's address reached the firmware, kept up to date by every
+    /// accessor that hands it out (A18 Pro, cached storage only; see [`ReturnMark`]).
+    work_mark: Option<Arc<ReturnMark>>,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// The render pool identity taken with the context
+    /// ([`super::fw::Variant::render_id_at_create`]), until its render pool takes it over or
+    /// the closed context is reclaimed.
+    render_id: Arc<Mutex<Option<RenderId>>>,
     render_blocks: AtomicUsize,
     /// Timestamp pages of retired compute commands, mapped in this context's VM.
     compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
+    /// This logical queue's use of the execution context its VM's queues share
+    /// (`super::exec_share`); `None` on M5.
+    share: Option<super::exec_share::Use>,
 }
 impl Context {
     #[expect(
         clippy::too_many_arguments,
         reason = "A context takes its allocators, identities and both admission domains."
     )]
-    pub(crate) fn new(
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
         qos: &Arc<QosIds>,
@@ -253,6 +275,8 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        share: Option<super::exec_share::Use>,
+        render_id: Option<RenderId>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -269,7 +293,7 @@ impl Context {
                 alloc,
                 Family::Scheduler,
                 UAT_PGSZ,
-                UAT_PGSZ,
+                0,
                 kernel_prot,
                 CpuMap::WriteCombined,
             )?)
@@ -288,15 +312,24 @@ impl Context {
         fence(Ordering::SeqCst);
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
+        // Both firmware and host write work nodes (reused every 63 submissions
+        // and zeroed on pool reuse). M5 keeps the whole work-state object
+        // uncached. G17P maps the node page firmware-cached: the host rewrites
+        // a node only after `WorkStorage::drained` has read the firmware's
+        // final `completed` count from memory, and zeroes a returned object
+        // only once its pool fence is met, so it never rewrites a node the
+        // firmware is still updating. The counter page, which the host writes
+        // on every kick, stays uncached.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            UAT_PGSZ,
+            if alloc.uat.is_m5() { 0 } else { UAT_PGSZ },
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
         let work_base = object.gpu_va();
+        let work_mark = object.return_mark();
         object.write(
             UAT_PGSZ + 0x400,
             fw::WorkHead {
@@ -320,6 +353,8 @@ impl Context {
             GFP_KERNEL,
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let render_id =
+            Arc::pin_init(new_mutex!(render_id, "G17 context render pool identity"), GFP_KERNEL)?;
         let order =
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
         Ok(Self {
@@ -331,20 +366,30 @@ impl Context {
             scheduler_generation,
             published: AtomicBool::new(false),
             kill_published: AtomicBool::new(false),
-            compute_binding_hint: AtomicBool::new(false),
+            kill_seen: AtomicU64::new(u64::MAX),
+            closed_generation: AtomicU64::new(u64::MAX),
+            closed_for_open_client: AtomicBool::new(false),
+            compute_bindings: AtomicU32::new(0),
+            compute_ordinal: AtomicU32::new(0),
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
-            states: WorkStates::new(),
+            states: match &share {
+                Some(share) => WorkStates::shared(share.claims().clone()),
+                None => WorkStates::new(),
+            },
             state_returns,
             compute_returns,
             order,
             work,
             work_base,
+            work_mark,
             render,
+            render_id,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
+            share,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -352,7 +397,11 @@ impl Context {
     }
     pub(crate) fn compute_binding_hint(&self) -> bool {
         self.render_seen.load(Ordering::Acquire)
-            || self.compute_binding_hint.load(Ordering::Relaxed)
+            || self.compute_bindings.load(Ordering::Relaxed) != 0
+    }
+    /// Advisory count of physical compute channels currently bound to this context.
+    pub(crate) fn compute_binding_count(&self) -> u32 {
+        self.compute_bindings.load(Ordering::Acquire)
     }
     /// This logical queue has submitted render work, so its compute may have a render prefix.
     pub(crate) fn render_seen(&self) -> bool {
@@ -364,7 +413,27 @@ impl Context {
         }
     }
     pub(crate) fn note_compute_binding(&self, owned: bool) {
-        self.compute_binding_hint.store(owned, Ordering::Relaxed);
+        if owned {
+            self.compute_bindings.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self
+                .compute_bindings
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                });
+        }
+    }
+    /// Atomically allocates the next 1-based shared compute ordinal and packed
+    /// `(predecessor_id << 32) | current_id` descriptor object_ids pair for a multi-channel
+    /// M5 context, so concurrent direct submissions across sibling QIDs never collide on
+    /// `submit_sequence`, `completion_ordinal`, or `object_ids`.
+    pub(crate) fn next_compute_identity(&self) -> (u32, u64) {
+        let prev = self.compute_ordinal.fetch_add(1, Ordering::AcqRel);
+        let next = prev.wrapping_add(1);
+        let predecessor_id = if prev == 0 { 1 } else { prev };
+        let current_id = if next == 0 { 1 } else { next };
+        let object_ids = (u64::from(predecessor_id) << 32) | u64::from(current_id);
+        (next, object_ids)
     }
     pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
         &self.compute_timestamps
@@ -420,7 +489,14 @@ impl Context {
     /// Scheduler release and command retirement have both been witnessed.
     /// Keep installed storage alive while returning the finite TTBAT identity.
     pub(crate) fn release_execution(&self) {
-        self.execution.release();
+        match &self.share {
+            Some(share) => share.release_execution(),
+            None => self.execution.release(),
+        }
+    }
+    /// `other` runs in this context's shared execution context.
+    pub(crate) fn shares_execution(&self, other: &Context) -> bool {
+        self.share.is_some() && core::ptr::eq(&*self.execution, &*other.execution)
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
@@ -429,6 +505,11 @@ impl Context {
     /// scheduler page and the work storage holding the job-list head. A retained
     /// physical queue keeps these after dropping the context itself.
     pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
+        // The retained record is replaced without a control-ring witness, so the work
+        // storage keeps the strict fence when it comes back.
+        if let Some(mark) = &self.work_mark {
+            mark.retain();
+        }
         FirmwarePages {
             _scheduler: self.scheduler.clone(),
             _work: self.work.clone(),
@@ -442,11 +523,18 @@ impl Context {
     /// the same work storage (the object cache hands it out again) made the firmware recover
     /// the GPU. Keep the storage mapped and out of reuse until firmware stop; returns whether
     /// it was linked.
+    ///
+    /// An empty list means that no record or command the firmware still follows names the
+    /// storage: on the A18 Pro it may be reused as soon as it comes back, unless a retained
+    /// queue record names it (see [`ReturnMark`]). The caller observed the control ring on the
+    /// cursor snapshot that proved the release consumed, so the witness already covers it.
     pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
         // An unreadable head counts as linked: retaining is the safe side.
-        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_va()]);
+        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_address()]);
         if linked {
             self.work.lock().object.retain_until_stop(pool);
+        } else if let Some(mark) = &self.work_mark {
+            mark.released(super::channel::control_witnessed());
         }
         linked
     }
@@ -455,11 +543,24 @@ impl Context {
     /// linked and the scheduler page shows no kill. Unreadable state counts as linked.
     pub(crate) fn firmware_may_link(&self) -> bool {
         let killed = super::queue::compute::exit::State::read(self).map_or(0, |state| state.killed);
-        must_retain(self.work_head().ok(), self.work_head_va(), killed)
+        must_retain(self.work_head().ok(), self.work_head_address(), killed)
     }
 
+    /// The work-list head, for a queue record: the firmware may follow it from then on.
     pub(crate) fn work_head_va(&self) -> u64 {
+        self.expose_work();
+        self.work_head_address()
+    }
+    /// The work-list head's address for comparisons with the host's own reads. It must not
+    /// reach the firmware: use [`Self::work_head_va`] for that.
+    pub(crate) fn work_head_address(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64
+    }
+    /// The work storage's address is being handed to the firmware.
+    fn expose_work(&self) {
+        if let Some(mark) = &self.work_mark {
+            mark.expose();
+        }
     }
     /// Shared scheduler list head, sampled under the context's storage lock.
     pub(crate) fn work_head(&self) -> Result<[u64; 2]> {
@@ -480,6 +581,42 @@ impl Context {
     /// A kill of this context was published.
     pub(crate) fn kill_published(&self) -> bool {
         self.kill_published.load(Ordering::Acquire)
+    }
+
+    /// This context's queue closed at the host's recovery `generation`, under the device mutex:
+    /// by its client (`release_queue`), or on its behalf once a GPU recovery failed its VM as
+    /// guilty (`Firmware::close_failed_owners`). Only the first close counts. A close notes it
+    /// only after its teardown entry is reserved, so a close that failed there can be redone.
+    pub(crate) fn note_closed(&self, generation: u64) {
+        close_once(&self.closed_generation, generation);
+    }
+
+    /// This context's queue closed already ([`Self::note_closed`]). Under the device mutex.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed_generation.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// The kernel closed this context's queue for its still open client (`true`), or the client
+    /// closed it (`false`, `release_queue`). Under the device mutex.
+    pub(crate) fn note_open_client(&self, open: bool) {
+        self.closed_for_open_client.store(open, Ordering::Release);
+    }
+
+    /// See [`Self::note_open_client`]: until the client closes its queue, that queue still holds
+    /// this context, so its scheduler is not released and the context not reclaimed.
+    pub(crate) fn held_by_open_client(&self) -> bool {
+        self.closed_for_open_client.load(Ordering::Acquire)
+    }
+
+    /// The host accepted a GPU restart (`generation`) after this context's first close.
+    pub(crate) fn restarted_since_close(&self, generation: u64) -> bool {
+        restarted_after(self.closed_generation.load(Ordering::Acquire), generation)
+    }
+
+    /// The firmware finished the kill of this context (`killed`, its scheduler page) and the
+    /// host accepted a GPU restart (`generation`) after it first saw that. See [`restarted_since`].
+    pub(crate) fn restarted_since_kill(&self, killed: bool, generation: u64) -> bool {
+        restarted_since(&self.kill_seen, killed, generation)
     }
 
     pub(crate) fn is_published(&self) -> bool {
@@ -544,9 +681,14 @@ impl Context {
                     self.vm(),
                     plan.geometry,
                 )?,
-                None => {
-                    RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?
-                }
+                None => RenderPool::new(
+                    alloc,
+                    ids,
+                    render_global,
+                    self.vm(),
+                    self.render_blocks(),
+                    Some(&self.render_id),
+                )?,
             },
             GFP_KERNEL,
         )?;
@@ -560,6 +702,11 @@ impl Context {
     /// context itself until replacement; they never use the render pool.
     pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
         self.render.lock().take()
+    }
+    /// Gives back the identity a closed context took at creation and never used: compute
+    /// bindings may retain the context itself until they are replaced.
+    pub(crate) fn release_render_id(&self) {
+        drop(self.render_id.lock().take());
     }
     pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
         self.render
@@ -643,11 +790,13 @@ impl WorkStateLease {
         }
         self.context.states.older_live(word)
     }
+    /// This ioctl's node, for a command: the firmware may follow it from then on.
     pub(crate) fn node_va(&self) -> Result<u64> {
         let word = self.word();
         if word == FREE {
             return Err(EINVAL);
         }
+        self.context.expose_work();
         Ok(self.context.work_base + u64::from(word & 63) * NODE_STRIDE as u64)
     }
     /// Whether the firmware completed every kick counted so far on this ioctl's node. It stores
@@ -769,9 +918,69 @@ fn must_retain(head: Option<[u64; 2]>, head_va: u64, killed: u32) -> bool {
     killed == 0 && head.is_none_or(|head| head != [0, head_va])
 }
 
+/// A restart was accepted (`generation`) after the event recorded at generation `at`
+/// (`u64::MAX`: never happened).
+fn restarted_after(at: u64, generation: u64) -> bool {
+    at != u64::MAX && generation > at
+}
+
+/// Records the recovery `generation` of a context's first close in `at`; true for that close.
+fn close_once(at: &AtomicU64, generation: u64) -> bool {
+    at.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// Records in `seen` the recovery `generation` of the first call that sees a kill done
+/// (`killed`), and reports whether a later generation was accepted since. A restart accepted
+/// after that sighting was raised after the firmware had finished the kill, so it dropped
+/// whatever of the killed context was still running; a restart between the kill's
+/// publication and its completion does not count. A late first sighting only asks for a later
+/// restart.
+fn restarted_since(seen: &AtomicU64, killed: bool, generation: u64) -> bool {
+    if !killed {
+        return false;
+    }
+    let first = match seen.compare_exchange(u64::MAX, generation, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => generation,
+        Err(first) => first,
+    };
+    restarted_after(first, generation)
+}
+
 #[kunit_tests(asahi_g17_qos_capacity)]
 mod capacity_tests {
     use super::*;
+
+    #[test]
+    fn only_a_restart_after_the_kill_was_seen_done_counts() {
+        let seen = AtomicU64::new(u64::MAX);
+        // No acknowledged kill: never, whatever restarts happened.
+        assert!(!restarted_since(&seen, false, 3));
+        assert!(!restarted_since(&seen, false, 9));
+        // The kill seen done at generation 4 (a restart at 3 came before it): not yet.
+        assert!(!restarted_since(&seen, true, 4));
+        assert!(!restarted_since(&seen, true, 4));
+        // The next accepted restart.
+        assert!(restarted_since(&seen, true, 5));
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn only_the_first_close_counts() {
+        let at = AtomicU64::new(u64::MAX);
+        // Closed on its client's behalf at generation 5, then by the client at 9.
+        assert!(close_once(&at, 5));
+        assert!(!close_once(&at, 9));
+        assert_eq!(at.load(Ordering::Relaxed), 5);
+        // So the restart at 6 still counts for its kill.
+        assert!(restarted_after(at.load(Ordering::Relaxed), 6));
+    }
+
+    #[test]
+    fn only_a_restart_after_the_close_counts() {
+        assert!(!restarted_after(u64::MAX, u64::MAX - 1));
+        assert!(!restarted_after(7, 7));
+        assert!(restarted_after(7, 8));
+    }
 
     #[test]
     fn linked_unkilled_work_is_retained() {

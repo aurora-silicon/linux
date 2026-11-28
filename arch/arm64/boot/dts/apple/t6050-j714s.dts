@@ -14,6 +14,8 @@
 /dts-v1/;
 
 #define T6050_J714S
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 #include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
@@ -42,11 +44,6 @@
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
 	chassis-type = "laptop";
 
-	aliases {
-		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
-		sep = &sep;
-	};
-
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -56,6 +53,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
@@ -238,12 +237,27 @@
 	status = "okay";
 };
 
+/* The MTP and its DockChannel FIFO, which carry the keyboard and trackpad */
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
 /*
  * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO
  * (ADT dockchannel-mtp/mtp-transport: multi-touch, keyboard, stm, actuator,
  * tp-accel), as on J716s.
  */
 &mtp_dockchannel {
+	status = "okay";
+
 	mtp_hid: input@8000 {
 		compatible = "apple,dockchannel-hid";
 		reg = <0x8000 0x1000>, <0xc000 0x1000>,
@@ -296,12 +310,13 @@
 
 /*
  * Type-C, from the ADT:
- *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
+ *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port)
  *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
  *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
- *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe 3, power in only: no connector node)
  * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus stay
- * off. Both described ports are wired as on J716s.
+ * off. The left-front and right ports are wired as on J716s; the left-back port is in
+ * t6050-j714s-left-back.dtsi.
  */
 &atc3_phy_mbox {
 	status = "disabled";
@@ -359,6 +374,18 @@
 			};
 		};
 	};
+
+	/*
+	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
+	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
+	 * for it, as on J616s. Its ADT features-supported is <3>, "Power In" only: no liquid
+	 * detection (LDCM, feature 2 of the USB-C ports' <1 2 3>).
+	 */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
 };
 
 &usb_drd1 {
@@ -380,12 +407,20 @@
 /*
  * Right port (ATC2): hpm2 on nub-spmi-a1, with USB and the USB4/Thunderbolt router. The
  * inventory's nub-spmi-a1 has the generation 4 bus's three register windows and IRQ (ADT
- * nub-spmi-a1); the driver polls it and refuses an interrupt, so it takes the first window only.
+ * nub-spmi-a1). The driver polls it and refuses an interrupt, so it takes the command window
+ * and the fault queue's (ADT reg[0] and reg[1]), as for nub-spmi-a0 below.
  */
 &nub_spmi_a1 {
-	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+	reg = <0x2 0x8a1a8000 0x0 0x4000>,
+	      <0x2 0x8a1a4000 0x0 0x4000>;
 	/delete-property/ interrupts;
 	status = "okay";
+};
+
+/* nub-spmi-a0's fault queue window (ADT reg[1]), which macOS empties when the controller starts */
+&nub_spmi_a0 {
+	reg = <0x2 0x8a188000 0x0 0x4000>,
+	      <0x2 0x8a184000 0x0 0x4000>;
 };
 
 #include "t6050-max-atc2.dtsi"
@@ -399,6 +434,17 @@
 			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
 			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+/* Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel */
+#include "t6050-j714s-left-usb4.dtsi"
+
+/* Left-back port (ATC0) */
+#include "t6050-j714s-left-back.dtsi"
+
+/* Reserve ATC0 LSTX until aura hands it over; ATC1/2 retain their pins. */
+&pinctrl_aop {
+	gpio-reserved-ranges = <0 79>, <80 1>, <82 3>;
 };
 
 /*
@@ -442,74 +488,44 @@
 	status = "okay";
 };
 
+/*
+ * The PMP runs a control loop on the die's hot-spot sensors and publishes an effort for each
+ * cluster in its FAST-DIE-CE range, in the order of the ADT's fast-die-ctrl-ce-map: MACC0, MACC1
+ * and PACC_ANE (the P cluster). The OS enforces it as a frequency limit; the ADT's CLPC node lists
+ * the same range among its ptd-ranges. Without the limit the clusters keep their top state while
+ * the effort sits at its maximum under a sustained all-core load. Until the PMP reports that it
+ * runs (also on a boot without the PMP driver), cpufreq holds each cluster at its fallback limit.
+ */
+&cpufreq_mc0 {
+	apple,fast-die-effort = <&pmp0_report 0>;
+};
+
+&cpufreq_mc1 {
+	apple,fast-die-effort = <&pmp0_report 1>;
+};
+
+&cpufreq_pc {
+	apple,fast-die-effort = <&pmp0_report 2>;
+};
+
 &pmc {
 	/* PMP, CLPC and AP agents, once the PMP runs */
 	apple,static-voters = <0 1 3>;
 	apple,pmp = <&pmp0>;
 };
 
+/* The 14-inch M5 Pro has High Power mode */
+&clpc {
+	apple,high-power-mode;
+};
+
 &sgx {
 	power-domains = <&pmp0_gfx>;
 };
 
-/*
- * The SEP (ADT sep, dart-sep): its mailbox, and its power domain with the two
- * fabric parents left to the firmware, which genpd votes on and never turns off.
- * The boot loader enables the SEP itself through its alias.
- */
-&sep_mbox {
-	status = "okay";
-};
-
-&ps_sep {
-	status = "okay";
-};
-
-&ps_fab8_soc {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-&ps_fab0_piogw {
-	apple,firmware-owned;
-	status = "okay";
-};
-
-/*
- * Touch ID (ADT spi2/mesa): J616s's Mesa sensor (sensor-id 0x3356) at 8 MHz on
- * chip select 0, powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP
- * GPIO 138. The controller's clock (ADT clock-ids 451) is the 24 MHz reference.
- */
-&ps_nub_gpio {
-	status = "okay";
-};
-
-&nub_gpio0 {
-	status = "okay";
-};
-
-&ps_spi2 {
-	status = "okay";
-};
-
-&spi2 {
-	clocks = <&clkref>;
-	status = "okay";
-
-	mesa: fingerprint@0 {
-		compatible = "apple,mesa-fingerprint";
-		reg = <0>;
-		spi-max-frequency = <8000000>;
-		spi-cpol;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
-		interrupt-parent = <&pinctrl_ap>;
-		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
-		/* Per-device factory data from this Mac's own iBoot system container */
-		firmware-name = "apple/mesacal-j714s.bin", "apple/msrk-j714s.bin";
-	};
-};
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-j714s.bin", "apple/msrk-j714s.bin"
+#include "t6050-touchid.dtsi"
 
 /*
  * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its
@@ -556,10 +572,10 @@
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
- * SMC sensors, as on J716s: the shared fan, power, voltage and current keys, plus
- * every readable float T* key through apple,discover-temperatures in
- * t6050-die0.dtsi, labelled with the key name. A key this SMC lacks only drops
- * its channel.
+ * SMC sensors, as on J716s except that userspace may set the fans (below): the
+ * shared fan, power, voltage and current keys, plus every readable float T* key
+ * through apple,discover-temperatures in t6050-die0.dtsi, labelled with the key
+ * name. A key this SMC lacks only drops its channel.
  *
  * Discovery refuses to run once any temperature channel exists, so the shared
  * temperature nodes go (their keys are discovered anyway), and so does
@@ -577,18 +593,105 @@
 	/delete-node/ temperature-TCHP;
 	/delete-node/ temperature-TW0P;
 
-	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	/*
+	 * The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the
+	 * fans (the M5 GPU governor sets them through macsmc_hwmon_fans_request()
+	 * as well); it also accepts a manual speed for both from userspace and
+	 * returns them to firmware control when the request is dropped.
+	 */
 	fan-F0Ac {
 		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
 	};
 
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
 	};
 };
 
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
 #include "t6050-j716c-isp.dtsi"
+
+/*
+ * The J714s camera sizes: sensor config 8 (the 3040x2880 frame binned 2x2 to 1520x1440)
+ * cropped and scaled by the ISP per size. Binning averages four pixels: indoors it shows
+ * a third to a fifth of the luma noise and about half the colour noise of the
+ * full-resolution configs (5, 6, 7 and 0), for some fine detail. Each crop is centred on
+ * the frame, where the lens covers it: the landscape sizes take two-thirds of its width,
+ * the portrait sizes the same length of its height and the square that side. The binned
+ * crops are too small for the driver to derive 1280x960 and 960x1280 from them without
+ * upscaling, so those two are listed as well.
+ */
+&isp0 {
+	/delete-node/ sensor-presets;
+
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <254 434 1012 570>;
+		};
+		/* 640x480 */
+		preset1 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <640 480>;
+			apple,crop = <254 340 1012 760>;
+		};
+		/* 1280x720 */
+		preset2 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1280 720>;
+			apple,crop = <254 434 1012 570>;
+		};
+		/* 1760x1328 */
+		preset3 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1760 1328>;
+			apple,crop = <254 338 1012 764>;
+		};
+		/* 1328x1760 */
+		preset4 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1328 1760>;
+			apple,crop = <378 214 764 1012>;
+		};
+		/* 1552x1552 */
+		preset5 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1552 1552>;
+			apple,crop = <254 214 1012 1012>;
+		};
+		/* 1080x1920 */
+		preset6 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1080 1920>;
+			apple,crop = <474 214 570 1012>;
+		};
+		/* 1280x960 */
+		preset7 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1280 960>;
+			apple,crop = <254 340 1012 760>;
+		};
+		/* 960x1280 */
+		preset8 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <960 1280>;
+			apple,crop = <380 214 760 1012>;
+		};
+	};
+};
 
 /* The GPU and the internal panel, for the boot loader's handoff */
 #include "t6050-j714s-gpu-panel.dtsi"
@@ -596,124 +699,78 @@
 /* External displays, on the left-front and right ports */
 #include "t6050-j714s-display.dtsi"
 
+/* DisplayPort audio of dcpext0's displays */
+#include "t6050-j714s-dpaudio.dtsi"
+
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
+/*
+ * The port controllers: the sleep's command rules, a reset and more probe tries after a failed
+ * probe, and for the USB-C ports LOCK's key, the board number reversed ("417J"; their debug mode
+ * and a partner replug, "DISC", need it).
+ */
+&hpm0 {
+	apple,sleep-ssps-rules;
+	apple,reset-on-failed-probe;
+	apple,debug-lock-key = "417J";
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+	apple,reset-on-failed-probe;
+	apple,debug-lock-key = "417J";
+};
+
+&hpm2 {
+	apple,sleep-ssps-rules;
+	apple,reset-on-failed-probe;
+	apple,debug-lock-key = "417J";
+};
+
+&hpm5 {
+	apple,sleep-ssps-rules;
+	apple,reset-on-failed-probe;
+};
+
+#include "t6050-j714s-sleep.dtsi"
+#include "t6050-j714s-sleep-soc.dtsi"
+#include "t6050-j714s-sleep-adt.dtsi"
+
+/* A merged mode's pair is given only while every external display has an engine */
+&dcpext0 {
+	apple,merged-mode-limit;
+};
+
+&dcpext1 {
+	apple,merged-mode-limit;
+};
+
+&dcpext2 {
+	apple,merged-mode-limit;
+};
+
+&dcpext3 {
+	apple,merged-mode-limit;
+};
+
+/* The display coprocessors take the sleep through their firmware 27 method table */
+&sleep {
+	apple,display-method-sleep;
+};
+
+/* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
+&smc {
+	apple,wake-reasons = <0 8 9 11 13 35 40 41 42 43 44 45 48>;
+	apple,wake-reason-names = "pwrbtn", "lid", "sdconn", "charger", "wifibt",
+				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
+				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+};
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the
  * CS42L84 headphone jack on admac-base-ns TX2/RX2 and the six SN012776 speaker amps
- * on TX0, their voltage and current sense on RX0 (ADT iop-audio-controller).
- *
- * The amps (ADT /arm-io/i2c1/audio-speaker* and /arm-io/i2c3/audio-speaker*) share
- * one shutdown line, AP pin 107 (function-reset of the first), and one fault
- * interrupt, pin 106. The ADT's speaker-config gives amp N playback slot N, its
- * voltage sense in slot 4N and current sense in 4N+2, in the order of the first
- * amp's speakerN: left woofer 1, right woofer 1, left woofer 2, right woofer 2,
- * left tweeter, right tweeter. The firmware's speaker frame is 250 BCLKs of 12 MHz
- * (ADT audio-speaker stream), which the amps' ratio detection rejects.
+ * (t6050-sn012776-speakers.dtsi, included after the card).
  */
-/ {
-	speaker_sdz: regulator-sn012776-sdz {
-		compatible = "regulator-fixed";
-		regulator-name = "sn012776-sdz";
-		gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
-		enable-active-high;
-	};
-};
-
-&i2c1 {
-	status = "okay";
-
-	speaker_left_woof1: codec@38 {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x38>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Left Woofer 1";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <2>;
-		ti,vmon-slot-no = <0>;
-		ti,bclk-ratio = <250>;
-	};
-
-	speaker_left_woof2: codec@39 {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x39>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Left Woofer 2";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <10>;
-		ti,vmon-slot-no = <8>;
-		ti,bclk-ratio = <250>;
-	};
-
-	speaker_left_tweet: codec@3a {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x3a>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Left Tweeter";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <18>;
-		ti,vmon-slot-no = <16>;
-		ti,bclk-ratio = <250>;
-	};
-};
-
-/* The I2C power states have no described parent (SIO), as for i2c1 and i2c2 */
-&ps_i2c3 {
-	/delete-property/ power-domains;
-	status = "okay";
-};
-
-&i2c3 {
-	/* The ADT gives i2c1, i2c2 and i2c3 the same clock-ids (4) */
-	clocks = <&clkref>;
-	status = "okay";
-
-	speaker_right_woof1: codec@3b {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x3b>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Right Woofer 1";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <6>;
-		ti,vmon-slot-no = <4>;
-		ti,bclk-ratio = <250>;
-	};
-
-	speaker_right_woof2: codec@3c {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x3c>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Right Woofer 2";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <14>;
-		ti,vmon-slot-no = <12>;
-		ti,bclk-ratio = <250>;
-	};
-
-	speaker_right_tweet: codec@3d {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x3d>;
-		SDZ-supply = <&speaker_sdz>;
-		apple,sdz-group-fail-closed;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Right Tweeter";
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		ti,imon-slot-no = <22>;
-		ti,vmon-slot-no = <20>;
-		ti,bclk-ratio = <250>;
-	};
-};
 
 /*
  * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output): its reset line
@@ -734,7 +791,7 @@
 };
 
 / {
-	sound {
+	sound: sound {
 		compatible = "apple,j714-macaudio", "apple,macaudio";
 		model = "MacBook Pro J714";
 		/* ADT audio-speaker function-speaker-id0 and -id1 */
@@ -755,34 +812,10 @@
 				sound-dai = <&jack_codec>;
 			};
 		};
-
-		dai-link@1 {
-			reg = <1>;
-			link-name = "Speaker";
-			/*
-			 * Codecs in ADT speaker-config order, so that macaudio gives them
-			 * playback slots 0-5 as macOS does (left channels in slots 0, 2
-			 * and 4, right in 1, 3 and 5). The idle masks are the ADT
-			 * amp-tx-zd-config rows 0 and 1: left woofer 1 drives zeros in the
-			 * right amps' sense slots, right woofer 1 in the left amps'.
-			 */
-			dai-tdm-idle-mode-0 = "zero";
-			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
-			dai-tdm-idle-mode-1 = "zero";
-			dai-tdm-slot-tx-idle-mask-1 = <0xff0f0f0f>;
-
-			cpu {
-				sound-dai = <&aop_audio 3>;
-			};
-
-			codec {
-				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
-					    <&speaker_left_woof2>, <&speaker_right_woof2>,
-					    <&speaker_left_tweet>, <&speaker_right_tweet>;
-			};
-		};
 	};
 };
+
+#include "t6050-sn012776-speakers.dtsi"
 
 /* The AOP, booted through its setup port, with its sensor and audio services. */
 &aop_mbox {

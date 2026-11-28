@@ -47,4 +47,8 @@
 	macaudio-kunit-codec-one-high {
 		sound-dai = <&ma_amp_high>, <&ma_amp_a>;
 	};
+
+	macaudio-kunit-codec-level-15 {
+		sound-dai = <&ma_amp_a>;
+	};
 };

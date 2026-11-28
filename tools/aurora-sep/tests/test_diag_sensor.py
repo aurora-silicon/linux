@@ -34,13 +34,13 @@ typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64
 typedef unsigned short umode_t;
 typedef uint64_t __u64; typedef uint32_t __u32; typedef uint16_t __u16; typedef uint8_t __u8;
 typedef int64_t __s64; typedef int32_t __s32;
+typedef struct { int counter; } atomic_t;
 #define __user
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 #define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
 ''',
     'linux/atomic.h': r'''
 #include <linux/types.h>
-typedef struct { int counter; } atomic_t;
 #define atomic_read(v) __atomic_load_n(&(v)->counter, __ATOMIC_SEQ_CST)
 #define atomic_set(v, i) __atomic_store_n(&(v)->counter, (i), __ATOMIC_SEQ_CST)
 static inline int atomic_cmpxchg(atomic_t *v, int old, int new_)
@@ -95,9 +95,30 @@ static inline u64 ktime_get_boottime_ns(void)
 }
 static inline u64 div_u64(u64 value, u32 divisor) { return value / divisor; }
 ''',
+    'linux/kernfs.h': r'''
+#include <linux/types.h>
+struct kernfs_node {
+	const char *name;
+	struct kernfs_node *const *children;
+	unsigned int notifies;
+};
+static inline void kernfs_notify(struct kernfs_node *kn)
+{
+	if (kn)
+		kn->notifies++;
+}
+''',
+    'linux/spinlock.h': r'''
+typedef struct { int unused; } spinlock_t;
+#define DEFINE_SPINLOCK(x) spinlock_t x
+#define spin_lock_irqsave(lock, flags) do { (void)(lock); (flags) = 0; } while (0)
+#define spin_unlock_irqrestore(lock, flags) do { (void)(lock); (void)(flags); } while (0)
+''',
     'linux/device.h': r'''
 #include <linux/types.h>
-struct device { int unused; };
+struct kernfs_node;
+struct kobject { struct kernfs_node *sd; };
+struct device { struct kobject kobj; };
 #define dev_info(dev, ...) ((void)(dev))
 struct attribute { const char *name; umode_t mode; };
 struct device_attribute {
@@ -108,6 +129,9 @@ struct attribute_group { const char *name; struct attribute **attrs; };
 #define DEVICE_ATTR_RO(_name) \
 	struct device_attribute dev_attr_##_name = \
 		{ .attr = { .name = #_name, .mode = 0444 }, .show = _name##_show }
+#define DEVICE_ATTR_ADMIN_RO(_name) \
+	struct device_attribute dev_attr_##_name = \
+		{ .attr = { .name = #_name, .mode = 0400 }, .show = _name##_show }
 extern const struct attribute_group *registered_group;
 static inline int devm_device_add_group(struct device *dev,
 					const struct attribute_group *grp)
@@ -115,11 +139,32 @@ static inline int devm_device_add_group(struct device *dev,
 	registered_group = grp;
 	return 0;
 }
+static inline int devm_add_action_or_reset(struct device *dev,
+					   void (*action)(void *), void *data)
+{
+	(void)dev;
+	(void)action;
+	(void)data;
+	return 0;
+}
 ''',
     'linux/sysfs.h': r'''
+#include <linux/kernfs.h>
 #include <linux/types.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
+static inline struct kernfs_node *sysfs_get_dirent(struct kernfs_node *parent,
+						   const char *name)
+{
+	if (!parent || !parent->children)
+		return NULL;
+	for (struct kernfs_node *const *c = parent->children; *c; c++)
+		if (!strcmp((*c)->name, name))
+			return *c;
+	return NULL;
+}
+static inline void sysfs_put(struct kernfs_node *kn) { (void)kn; }
 static inline int sysfs_emit(char *buf, const char *fmt, ...)
 {
 	va_list args;
@@ -157,6 +202,7 @@ HARNESS = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <linux/types.h>
+#include <linux/kernfs.h>
 #include <linux/device.h>
 #include "shim.h"
 
@@ -212,7 +258,13 @@ static void dump(const char *dir)
 
 int main(int argc, char **argv)
 {
-	struct device dev;
+	struct kernfs_node keystore_kn = { .name = "keystore" };
+	struct kernfs_node touchid_kn = { .name = "touchid" };
+	struct kernfs_node *const diag_children[] = { &keystore_kn, &touchid_kn, NULL };
+	struct kernfs_node diag_kn = { .name = "diag", .children = diag_children };
+	struct kernfs_node *const root_children[] = { &diag_kn, NULL };
+	struct kernfs_node root_kn = { .name = "root", .children = root_children };
+	struct device dev = { .kobj = { .sd = &root_kn } };
 	unsigned int bind, stale;
 
 	/* The Neo: warm attach, xART writable, no guard. */
@@ -242,6 +294,10 @@ int main(int argc, char **argv)
 	expect("attach", "sensor_attach", "attached");
 	expect("attach", "restore", "restored");
 	expect("attach", "touchid", "ready");
+	if (touchid_kn.notifies != 2) {
+		printf("FAIL attach: touchid notifies is %u, want 2\n", touchid_kn.notifies);
+		failures++;
+	}
 	if (argc > 1)
 		dump(argv[1]);
 
@@ -282,6 +338,7 @@ GUARD_HARNESS = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <linux/types.h>
+#include <linux/kernfs.h>
 #include <linux/device.h>
 #include "shim.h"
 
@@ -307,7 +364,7 @@ static const char *attr(const char *name)
 /* argv: level list matching-at-probe refusals matching-after-refusal */
 int main(int argc, char **argv)
 {
-	struct device dev;
+	struct device dev = { 0 };
 	int refusals = atoi(argv[4]);
 
 	sep_diag_set_xart_guard(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]));

@@ -7,6 +7,8 @@
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 
+#include <linux/moduleparam.h>
+#include <linux/suspend.h>
 #include <linux/backlight.h>
 #include <linux/math64.h>
 #include <linux/completion.h>
@@ -17,6 +19,10 @@
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_v14_7.h"
+
+static bool v27_keep_level = true;
+module_param(v27_keep_level, bool, 0644);
+MODULE_PARM_DESC(v27_keep_level, "Firmware 27: keep the panel's level through a sleep, as macOS");
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -246,6 +252,9 @@ static int dcp_get_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* Nothing is presented any more: there is no level to report. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		/*
@@ -263,7 +272,24 @@ static int dcp_get_brightness(struct backlight_device *bd)
 		return actual;
 	}
 
-	return dcp->brightness.nits;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	actual = dcp_bl_presented_actual(&dcp->brightness.presented,
+					 READ_ONCE(dcp->brightness.nits));
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return actual;
+}
+
+/*
+ * A present set the panel to @nits, outside the policy: every one that
+ * carries a level, and the power-off present, which carries 0.
+ */
+void dcp_backlight_presented(struct apple_dcp *dcp, u32 nits)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	dcp_bl_presented_set(&dcp->brightness.presented, nits);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 }
 
 int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
@@ -408,6 +434,34 @@ void dcp_backlight_finish_fade(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 }
 
+/*
+ * After the S2R display restart: ask for the user's level again and send it, whatever the
+ * backlight core's flags say at that moment. The class device resumes on its own schedule:
+ * when it runs after the restart the panel stays dark until then (suspended and core_blank
+ * still set at the mode set, 11 Nov), and when it runs before, its request goes to a firmware
+ * that isn't up yet and nothing sends it again (the dark lid wakes).
+ */
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp)
+{
+	struct backlight_device *bd = READ_ONCE(dcp->brightness.bl_dev);
+	unsigned long flags;
+
+	if (!dcp_backlight_desktop(dcp) || !bd)
+		return;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	/*
+	 * A level sent to the firmware that the stop then took down never gets its answer: the
+	 * state stayed in_flight for good and nothing was sent again (dark lid wake of 20:30,
+	 * "sent 0 ... dirty 1 in_flight 1"). The restarted firmware knows nothing of it.
+	 */
+	dcp->backlight.state.in_flight = false;
+	dcp->backlight.state.retries = 0;
+	dcp_bl_request(&dcp->backlight.state, bd->props.brightness, false, false);
+	dcp->backlight.state.dirty = true;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	dcp_backlight_kick(dcp);
+}
+
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
 {
 	unsigned long flags;
@@ -429,9 +483,16 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 
 	spin_lock_irqsave(&dcp->backlight.lock, flags);
 	ret = dcp_bl_prepare(&dcp->backlight.state, have_surface, present);
-	/* No reservation: carry the last completed level on an ordinary present. */
-	if (ret == -EALREADY)
+	/*
+	 * No reservation: carry the last completed level on an ordinary
+	 * present, and on one without a surface, which cannot apply a new
+	 * level. A pending level waits for the next present with a surface.
+	 */
+	if (ret == -EALREADY ||
+	    (ret == -ENODATA && !have_surface && dcp->backlight.state.ready)) {
 		present->nits = dcp->backlight.state.actual;
+		ret = -EALREADY;
+	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return ret;
 }
@@ -459,6 +520,20 @@ bool dcp_backlight_pending(struct apple_dcp *dcp)
 	return pending;
 }
 
+/* The panel is showing a level now, so a pending change can be presented. */
+bool dcp_backlight_lit(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool lit;
+
+	if (!dcp_backlight_active(dcp))
+		return false;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	lit = dcp_bl_lit(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return lit;
+}
+
 /*
  * Called from the receive path, which must not queue a transaction itself;
  * the caller schedules the update worker when this returns true.  Requests
@@ -481,6 +556,36 @@ bool dcp_backlight_resend(struct apple_dcp *dcp)
 	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return resend;
+}
+
+/*
+ * For the first present after a firmware 27 power-on. That present comes before DRM's DPMS-on
+ * and the backlight core's resume, which clear the DPMS-off, suspend and blank marks only later
+ * (backlight_is_blank() counts the core's suspend too), so it would carry level 0. Clear the
+ * three marks now: the present carries the panel's level, and the DPMS-on and resume that
+ * follow change nothing. The level is marked for this present directly rather than through
+ * dcp_backlight_resend(), whose once-a-second budget stays for the firmware's own
+ * enable-backlight request after the power-on.
+ * Returns the level the present carries, or a negative error.
+ */
+int dcp_backlight_wake_lit(struct apple_dcp *dcp)
+{
+	struct dcp_backlight_state *state = &dcp->backlight.state;
+	unsigned long flags;
+	int ret = -ENODATA;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (state->ready) {
+		state->dpms_off = false;
+		state->suspended = false;
+		state->core_blank = false;
+		state->controlled = true;
+		state->retries = 0;
+		dcp_bl_jump(state);
+		ret = dcp_bl_effective(state);
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return ret;
 }
 
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
@@ -573,11 +678,18 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 
 #define SCALE_FACTOR (1 << 10)
 
+/*
+ * Each table word holds two DAC values, one in each 16-bit half: the
+ * level's and the one half a step below it.  Interpolate the halves
+ * separately.  A blend of the whole word carries the upper half's fraction
+ * into the lower one: for 370 nits the lower half became 0x10a, a 4 to 5
+ * nit value, and for most levels it left the DAC range altogether.
+ */
 static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 {
-	u32 frac;
-	u64 low, high;
+	u32 frac, word = 0;
 	u32 interpolated = (tbl_size - 1) * ((val - min) * SCALE_FACTOR) / (max - min);
+	unsigned int shift;
 
 	size_t index = interpolated / SCALE_FACTOR;
 
@@ -585,10 +697,14 @@ static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
 		return tbl[tbl_size / 2];
 
 	frac = interpolated & (SCALE_FACTOR - 1);
-	low = tbl[index];
-	high = tbl[index + 1];
+	for (shift = 0; shift < 32; shift += 16) {
+		u32 low = (tbl[index] >> shift) & 0xffff;
+		u32 high = (tbl[index + 1] >> shift) & 0xffff;
 
-	return ((frac * high) + ((SCALE_FACTOR - frac) * low)) / SCALE_FACTOR;
+		word |= ((frac * high + (SCALE_FACTOR - frac) * low) / SCALE_FACTOR) << shift;
+	}
+
+	return word;
 }
 
 static u32 calculate_dac(struct apple_dcp *dcp, int val)
@@ -602,7 +718,7 @@ static u32 calculate_dac(struct apple_dcp *dcp, int val)
 	else if (val == MIN_BRIGHTNESS_PART2)
 		return 16 * brightness_part2[0];
 	else if (val >= MAX_BRIGHTNESS_PART2)
-		return brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
+		return 16 * brightness_part2[ARRAY_SIZE(brightness_part2) - 1];
 
 	if (val < MAX_BRIGHTNESS_PART1) {
 		dac = interpolate(val, MIN_BRIGHTNESS_PART1, MAX_BRIGHTNESS_PART1,
@@ -772,18 +888,26 @@ static int dcp_set_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* A crashed processor discards every present, the level with it. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		struct dcp_backlight_state *state = &dcp->backlight.state;
 		bool fade;
 		u32 old;
 
+		bool suspended = bd->props.state & BL_CORE_SUSPENDED;
+
+		/* macOS keeps the panel's level through a firmware 27 sleep. */
+		if (suspended && READ_ONCE(v27_keep_level) &&
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0 && pm_suspend_via_firmware())
+			suspended = false;
 		/* Preserve the requested level even while the core forces zero. */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		old = state->target;
 		ret = dcp_bl_request(state, bd->props.brightness,
-				     backlight_is_blank(bd),
-				     bd->props.state & BL_CORE_SUSPENDED);
+				     backlight_is_blank(bd), suspended);
 		/* A new level restarts the fade from the level presented last. */
 		fade = !ret && state->fading && state->target != old;
 		if (fade)

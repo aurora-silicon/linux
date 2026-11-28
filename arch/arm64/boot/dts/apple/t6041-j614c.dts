@@ -31,10 +31,15 @@
 
 &wifi0 {
 	brcm,board-type = "apple,mriya";
+	/* WLAN host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 39 GPIO_ACTIVE_HIGH>;
+	wakeup-source;
 };
 
 &bluetooth0 {
 	brcm,board-type = "apple,mriya";
+	/* Bluetooth host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 40 GPIO_ACTIVE_HIGH>;
 };
 
 /* The J614s panel. */
@@ -90,4 +95,22 @@
 
 &mesa {
 	firmware-name = "apple/mesacal-j614c.bin", "apple/msrk-j614c.bin";
+};
+
+/*
+ * ADT /arm-io/aon-ptd ptd_data_table: the battery record ("IFtb", layout 1,
+ * slots 0x12-0x15). Only its peek aperture is read.
+ */
+&aon_ptd {
+	apple,battery-record = <0x49467462 1 0x12 4>;
+	status = "okay";
+};
+
+/* SIO AES engine, software keys only. */
+&ps_aes {
+	status = "okay";
+};
+
+&aes {
+	status = "okay";
 };

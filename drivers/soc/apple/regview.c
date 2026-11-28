@@ -13,6 +13,9 @@
  *  - SPMI sideband (T8112): the bus and queue fault counters. These are
  *    plain 32-bit counters; the interrupt status and acknowledge words of
  *    the window are left out, since clearing them takes a write.
+ *  - SPMI monitor (T6000, T6001, T6002): the sixteen fault counters of the
+ *    primary bus. The fault queue window next to them is mapped but never
+ *    read, because reading its data port consumes a queued entry.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -28,40 +31,16 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 
-/* One run of 32-bit registers inside one DT reg entry. */
-struct apple_regview_range {
-	u8 reg;		/* index into the node's reg property */
-	u32 offset;	/* byte offset from the start of that entry */
-	u32 count;	/* number of 32-bit registers */
-	u32 stride;	/* byte distance between registers; 0 means 4 */
-	const char *name;
-};
+#include "regview-internal.h"
 
-struct apple_regview_hw {
-	const struct apple_regview_range *ranges;
-	unsigned int nr_ranges;
-	unsigned int nr_regs;	/* reg entries the node must have */
-};
-
-struct apple_regview_map {
-	void __iomem *base;
-	resource_size_t size;
-};
+#if IS_ENABLED(CONFIG_APPLE_REGVIEW_KUNIT_TEST)
+#include <kunit/visibility.h>
+#else
+#define VISIBLE_IF_KUNIT static
+#define EXPORT_SYMBOL_IF_KUNIT(symbol)
+#endif
 
 static struct dentry *apple_regview_root;
-
-struct apple_regview {
-	struct device *dev;
-	const struct apple_regview_hw *hw;
-	struct apple_regview_map *maps;
-	struct dentry *dir;
-};
-
-#define MCC_PLANE_STRIDE	0x40000
-#define MCC_PLANE_CACHE_STATUS	0x1c04
-#define MCC_TZ_BASE		0x6a0
-#define MCC_TZ_STRIDE		0x10
-#define MCC_TZ_REGIONS		4
 
 /*
  * Plane 0 carveout start, end and enable of each region, then the cache
@@ -104,8 +83,6 @@ static const struct apple_regview_hw apple_regview_t6000_mcc_hw = {
  * collisions) followed by seven queue and filter fault counters. Only the
  * counters are listed; how they wrap is not part of the interface.
  */
-#define SPMI_SB_BUS_FAULTS	0x200
-#define SPMI_SB_NR_BUS_FAULTS	10
 #define SPMI_SB_QUEUE_FAULTS	0x25c
 #define SPMI_SB_NR_QUEUE_FAULTS	7
 
@@ -120,12 +97,45 @@ static const struct apple_regview_hw apple_regview_t8112_spmi_sb_hw = {
 	.nr_regs = 1,
 };
 
-static u32 apple_regview_stride(const struct apple_regview_range *r)
+/*
+ * SPMI monitor counter window (reg[1]). Three runs of plain 32-bit counters:
+ * unmapped writes, unsupported reads and missing responses; then command
+ * parity (start of message and later), address parity, data parity,
+ * unrecognised commands and collisions; then the write-disabled filter and
+ * reset, transmit filter, hardware and software queue over/underflow and
+ * the backlight request and response queues. The words between the runs
+ * have no known meaning and are not read. reg[0] holds the fault queue, whose
+ * data port pops an entry on every read, so nothing in reg[0] is listed.
+ */
+#define SPMI_MON_BUS_FAULTS		0x00
+#define SPMI_MON_NR_BUS_FAULTS		3
+#define SPMI_MON_PROTO_FAULTS		0x10
+#define SPMI_MON_NR_PROTO_FAULTS	6
+#define SPMI_MON_QUEUE_FAULTS		0x5c
+#define SPMI_MON_NR_QUEUE_FAULTS	7
+
+static const struct apple_regview_range apple_regview_t6000_spmi_mon[] = {
+	{ SPMI_MON_COUNTERS, SPMI_MON_BUS_FAULTS, SPMI_MON_NR_BUS_FAULTS, 0,
+	  "bus-fault-count" },
+	{ SPMI_MON_COUNTERS, SPMI_MON_PROTO_FAULTS, SPMI_MON_NR_PROTO_FAULTS, 0,
+	  "protocol-fault-count" },
+	{ SPMI_MON_COUNTERS, SPMI_MON_QUEUE_FAULTS, SPMI_MON_NR_QUEUE_FAULTS, 0,
+	  "queue-fault-count" },
+};
+
+static const struct apple_regview_hw apple_regview_t6000_spmi_mon_hw = {
+	.ranges = apple_regview_t6000_spmi_mon,
+	.nr_ranges = ARRAY_SIZE(apple_regview_t6000_spmi_mon),
+	.nr_regs = 2,
+};
+
+VISIBLE_IF_KUNIT u32 apple_regview_stride(const struct apple_regview_range *r)
 {
 	return r->stride ? r->stride : 4;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_regview_stride);
 
-static int apple_regview_check(const struct apple_regview *rv)
+VISIBLE_IF_KUNIT int apple_regview_check(const struct apple_regview *rv)
 {
 	const struct apple_regview_hw *hw = rv->hw;
 	unsigned int i;
@@ -143,8 +153,9 @@ static int apple_regview_check(const struct apple_regview *rv)
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_regview_check);
 
-static int apple_regview_show(struct seq_file *s, void *unused)
+VISIBLE_IF_KUNIT int apple_regview_show(struct seq_file *s, void *unused)
 {
 	struct apple_regview *rv = s->private;
 	const struct apple_regview_hw *hw = rv->hw;
@@ -166,7 +177,16 @@ static int apple_regview_show(struct seq_file *s, void *unused)
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(apple_regview_show);
 DEFINE_SHOW_ATTRIBUTE(apple_regview);
+
+#if IS_ENABLED(CONFIG_APPLE_REGVIEW_KUNIT_TEST)
+const struct file_operations *apple_regview_test_fops(void)
+{
+	return &apple_regview_fops;
+}
+EXPORT_SYMBOL_IF_KUNIT(apple_regview_test_fops);
+#endif
 
 static void apple_regview_remove_debugfs(void *data)
 {
@@ -224,13 +244,16 @@ static int apple_regview_probe(struct platform_device *pdev)
 					rv->dir);
 }
 
-static const struct of_device_id apple_regview_of_match[] = {
+VISIBLE_IF_KUNIT const struct of_device_id apple_regview_of_match[] = {
 	{ .compatible = "apple,t8112-mcc", .data = &apple_regview_t8112_mcc_hw },
 	{ .compatible = "apple,t6000-mcc", .data = &apple_regview_t6000_mcc_hw },
 	{ .compatible = "apple,t8112-spmi-sideband",
 	  .data = &apple_regview_t8112_spmi_sb_hw },
+	{ .compatible = "apple,t6000-spmi-monitor",
+	  .data = &apple_regview_t6000_spmi_mon_hw },
 	{}
 };
+EXPORT_SYMBOL_IF_KUNIT(apple_regview_of_match);
 MODULE_DEVICE_TABLE(of, apple_regview_of_match);
 
 static struct platform_driver apple_regview_driver = {

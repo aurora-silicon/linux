@@ -2,7 +2,6 @@
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
 #include <kunit/device.h>
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -266,6 +265,64 @@ static void ave_9003_hevc_main10(struct kunit *test)
 			KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main8 + off),
 					    get_unaligned_le32(main10 + off),
 					    "word +%#zx", off);
+	}
+}
+
+/*
+ * HEVC Main 10 on the counted layouts: 26A428, which T8142 encodes with, and
+ * 26B123 (the M3/M4 27.2 build), which shares its Start. The words that change
+ * with bit depth take the 9003 capture's Main 10 values (the host tests in
+ * tests/test.c check the same words).
+ */
+static void ave_26a428_hevc_main10(struct kunit *test)
+{
+	static const struct ave_fw_layout *const layouts[] = {
+		&ave_layout_26a428, &ave_layout_26b123,
+	};
+
+	for (unsigned int l = 0; l < ARRAY_SIZE(layouts); l++) {
+		struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+		struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+		struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+		u8 *main8, *main10;
+		size_t len;
+
+		KUNIT_ASSERT_NOT_NULL(test, ave);
+		KUNIT_ASSERT_NOT_NULL(test, ctx);
+		KUNIT_ASSERT_NOT_NULL(test, sess);
+		ave->layout = layouts[l];
+		ctx->ave = ave;
+		ctx->sess = sess;
+		len = ave->layout->bytes[AVE_CODEC_HEVC - 1][AVE_IMAGE_START];
+		main8 = kunit_kzalloc(test, len, GFP_KERNEL);
+		main10 = kunit_kzalloc(test, len, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, main8);
+		KUNIT_ASSERT_NOT_NULL(test, main10);
+
+		ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main8, len), 0);
+		ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+		sess->p.min_qp = -12;
+		sess->p.profile = 2;
+		sess->p.bit_depth = 10;
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main10, len), 0);
+
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main10 + 0x35e8), 0x10040,
+				    "layout %u", l);
+		KUNIT_EXPECT_NE_MSG(test, get_unaligned_le32(main8 + 0x35e8), 0x10040,
+				    "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main8 + 0x37c0), 8, "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main10 + 0x37c0), 10, "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, (s32)get_unaligned_le32(main10 + 0x3678), -12,
+				    "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, (s32)get_unaligned_le32(main10 + 0x3740), -12,
+				    "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main10 + 0x3a60), 0x01000101,
+				    "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main10 + 0x6530), 0x01000000,
+				    "layout %u", l);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main10 + 0x66dc), 2, "layout %u", l);
+		KUNIT_EXPECT_NE_MSG(test, get_unaligned_le32(main8 + 0x66dc), 2, "layout %u", l);
 	}
 }
 
@@ -1002,18 +1059,47 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_input_format),
 			16U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_chroma_format),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_log2_max_poc_lsb_minus4),
+			4U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_num_views[0]),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_sve_count), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_vps_temporal_nesting], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_temporal_nesting], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_tmvp], 0U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_fw_header], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_pps_fw_header], 1U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps + 4 + 0xbc),
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l0_default_active_minus1),
 			0U);
 	KUNIT_EXPECT_EQ(test,
-			get_unaligned_le32(start + sl->hevc_rps + 4 + 0x164 + 0xbc),
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l1_default_active_minus1),
+			0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_rps + 0x5a68], 0U);
+	/* IbP set 2 is P {-2}; set 3 is B {-1, +1}. */
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le16(start + sl->hevc_rps + 4 +
+					   2 * 0x164 + 0x38),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   2 * 0x164 + 0xe0),
+			(u32)-2);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   3 * 0x164 + 0xbc),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 +
+					   3 * 0x164 + 0x120),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(start + sl->recon.address + 8),
 			sess->ref_a[0].dma + recon.luma_metadata_offset);
@@ -1031,13 +1117,73 @@ static void ave_6070_hevc_contract(struct kunit *test)
 					  false),
 			0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->frame_type), 2U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x68), 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15d], 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15e], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x15f], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x414), 3U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
 	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x6528), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x30), 0U);
 	KUNIT_EXPECT_EQ(test,
 			get_unaligned_le64(process + pl->list1_recon.luma_data),
 			sess->ref_a[2].dma);
+
+	/* The P after a B also selects the firmware-indexed SPS table. */
+	sess->frames = 2;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 2,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+
+	/* IDR syntax has no short-term RPS selector at all. */
+	sess->frames = 0;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 0,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 0U);
+
+	/* Low delay advertises four equivalent {-1} SPS sets. */
+	sess->p.bframes = false;
+	sess->p.reorder_off = true;
+	sess->p.refs = 2;
+	sess->p.slots = 3;
+	memset(start, 0, 0x32dc8);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 4U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 0U);
+	for (u32 i = 0; i < 4; i++) {
+		u32 entry = sl->hevc_rps + 4 + i * 0x164;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0x30), 1U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0xb8), 1U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + entry + 0xe0),
+				(u32)-1);
+	}
+	sess->frames = 1;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 1,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
 }
 
 static void ave_6070_alignment_refusal(struct kunit *test)
@@ -1375,8 +1521,217 @@ static void ave_6070_text_id(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
 }
 
+/*
+ * The M4 Max loader sets one TEXT word every boot: the identity hashes it as
+ * zero, so two boots give one CRC, and it leaves the rest of TEXT counted.
+ */
+/* The 27.2 build differs from 26A428 only in its Process command sizes. */
+static void ave_26b123_layout(struct kunit *test)
+{
+	const struct ave_fw_layout *a = &ave_layout_26a428;
+	const struct ave_fw_layout *b = ave_layout_for_crc(0x99fc929a);
+	struct ave_start_layout *start = kunit_kzalloc(test, sizeof(a->start), GFP_KERNEL);
+	struct ave_proc_layout *process = kunit_kzalloc(test, sizeof(a->process), GFP_KERNEL);
+
+	KUNIT_ASSERT_PTR_EQ(test, b, &ave_layout_26b123);
+	KUNIT_EXPECT_TRUE(test, b->encode_ready);
+	KUNIT_EXPECT_EQ(test, b->kind, AVE_LAYOUT_26A428);
+	KUNIT_EXPECT_PTR_EQ(test, b->abi, a->abi);
+	for (unsigned int c = 0; c < 2; c++) {
+		KUNIT_EXPECT_EQ(test, b->bytes[c][AVE_IMAGE_START],
+				a->bytes[c][AVE_IMAGE_START]);
+		KUNIT_EXPECT_EQ(test, b->bytes[c][AVE_IMAGE_PROCESS],
+				a->bytes[c][AVE_IMAGE_PROCESS] + 0x10);
+	}
+	KUNIT_EXPECT_EQ(test, b->bytes[0][AVE_IMAGE_PROCESS], 0x6e08);
+	KUNIT_EXPECT_EQ(test, b->bytes[1][AVE_IMAGE_PROCESS], 0x78c8);
+	/* Apart from the two words only the M5 26A428 sessions were run with. */
+	KUNIT_ASSERT_NOT_NULL(test, start);
+	KUNIT_ASSERT_NOT_NULL(test, process);
+	memcpy(start, a->start, sizeof(a->start));
+	memcpy(process, a->process, sizeof(a->process));
+	for (unsigned int c = 0; c < 2; c++) {
+		KUNIT_EXPECT_EQ(test, b->start[c].fps_int_copy, 0U);
+		start[c].fps_int_copy = 0;
+	}
+	KUNIT_EXPECT_EQ(test, b->process[1].low_delay, 0U);
+	process[1].low_delay = 0;
+	KUNIT_EXPECT_EQ(test, memcmp(b->start, start, sizeof(a->start)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->process, process, sizeof(a->process)), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(b->result, a->result, sizeof(a->result)), 0);
+	KUNIT_EXPECT_EQ(test, b->hdr_bytes, a->hdr_bytes);
+	KUNIT_EXPECT_EQ(test, b->max_slots, a->max_slots);
+	KUNIT_EXPECT_EQ(test, b->process_subtype, a->process_subtype);
+	/* Both counted, and both run sessions without B-frames and at any rate. */
+	KUNIT_EXPECT_TRUE(test, a->counted && b->counted);
+	KUNIT_EXPECT_TRUE(test, a->any_gop);
+	KUNIT_EXPECT_TRUE(test, b->any_gop);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8122_26B123), b);
+}
+
+/*
+ * The M2 with the 27.2 stub: the reserved segment sizes select the 27.2
+ * build's own start (device 12, handshake type 12) and the 26B123 layout;
+ * the 13.5 build keeps the M2's 6070 start. Other sizes fall back to
+ * ave_t8112, whose size check in ave_fw_probe() then refuses them.
+ */
+static void ave_t8112_26b123_build(struct kunit *test)
+{
+	const struct ave_variant *n = ave_t8112.next_build;
+
+	KUNIT_ASSERT_NOT_NULL(test, n);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0xd0000, 0x128000),
+			    &ave_t8112);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x11c000, 0x128000), n);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x11c000, 0x12c000),
+			    &ave_t8112);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x134000, 0x128000),
+			    &ave_t8112);
+	/* The near misses are refused: no variant of the chain pins them. */
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x134000, 0x128000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(n, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(&ave_t8112, 0xd0000, 0x128000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(n, 0x11c000, 0x128000));
+	KUNIT_EXPECT_NULL(test, n->next_build);
+	KUNIT_EXPECT_TRUE(test, n->boot_qualified);
+	KUNIT_EXPECT_PTR_EQ(test, n->regs, ave_t8112.regs);
+	KUNIT_EXPECT_EQ(test, n->boot_device_id, 12U);
+	KUNIT_EXPECT_EQ(test, n->device_type, 12U);
+	KUNIT_EXPECT_EQ(test, n->boot_arg_value, 0x10000U);
+	KUNIT_EXPECT_EQ(test, n->timebase_multiplier, 1U);
+	KUNIT_EXPECT_EQ(test, n->mbox_idle, 0x38U);
+	KUNIT_EXPECT_TRUE(test, n->restore_data_first);
+	KUNIT_EXPECT_EQ(test, n->text_link_cell, 0U);
+	/* The Mac mini's loader sets the word at TEXT 0x4224 on every boot. */
+	KUNIT_ASSERT_EQ(test, n->build_count, 1U);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_boot_word, 0x4224U);
+	/* The 27.2 builds' reference buffer sizing, as on the M3 and M4. */
+	KUNIT_EXPECT_EQ(test, n->lfs_ref_scale, 2U);
+	KUNIT_EXPECT_EQ(test, ave_t8112.lfs_ref_scale, 1U);
+	KUNIT_EXPECT_EQ(test, n->extra0_size, 0U);
+	KUNIT_EXPECT_EQ(test, n->vcbar_flags, (u64)AVE_COPROC_VCBAR_VALID);
+	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(n, 0x800000000ULL), 0x800000001ULL);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_crc, AVE_FW_TEXT_CRC_T8112_26B123);
+	{
+		const u32 off = n->builds[0].text_boot_word, size = off + 0x40;
+		u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+		u32 zeroed, a, b;
+
+		KUNIT_ASSERT_NOT_NULL(test, text);
+		zeroed = crc32_le(~0U, text, size) ^ ~0U;
+		put_unaligned_le32(0x003d0000, text + off);
+		KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+		put_unaligned_le32(0x00a10000, text + off);
+		KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &b), 0);
+		/* Any per-boot value gives the zeroed-word CRC. */
+		KUNIT_EXPECT_EQ(test, a, zeroed);
+		KUNIT_EXPECT_EQ(test, b, zeroed);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(n->builds[0].text_crc), &ave_layout_26b123);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(ave_t8112.text_crc),
+			    &ave_layout_6070_11_1);
+}
+
+/*
+ * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
+ * comes with the IDR access unit; the B slice after it has two extra bits
+ * before slice_type, and reads as an I slice if they are not skipped.
+ */
+static void ave_hevc_bframe_extra_bits(struct kunit *test)
+{
+	static const u8 idr_au[] = {
+		0, 0, 0, 1, 0x44, 0x01, 0xc5, 0x80,	/* PPS: ids 0/0, 2 extra bits */
+		0, 0, 1, 0x26, 0x01, 0xa3, 0x80,	/* IDR_W_RADL slice, I */
+	};
+	static const u8 b_au[] = {
+		0, 0, 0, 1, 0x02, 0x01, 0xdc, 0x80,	/* TRAIL_R slice, extra bits 01, B */
+	};
+	u8 bits = 0;
+
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(idr_au, sizeof(idr_au), true, true, &bits));
+	KUNIT_EXPECT_EQ(test, bits, 2);
+	KUNIT_EXPECT_TRUE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
+	/* Without the PPS's bits the same slice reads as I. */
+	bits = 0;
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
+}
+
+static void ave_t6041_text_boot_word(struct kunit *test)
+{
+	const struct ave_fw_build *m4 = ave_t6041.builds;
+	const u32 off = m4[0].text_boot_word, size = off + 0x100;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, a, b;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_EXPECT_EQ(test, off, 0x4224U);
+	/* The M4 Pro and M4 Max builds: the same word, the Max with a larger DATA. */
+	KUNIT_ASSERT_EQ(test, ave_t6041.build_count, 2U);
+	KUNIT_EXPECT_EQ(test, m4[1].data_size, 0x130000U);
+	KUNIT_EXPECT_EQ(test, m4[1].text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
+	/* The M4 27.2 build: the same word, set per boot by some loaders. */
+	KUNIT_ASSERT_EQ(test, ave_t8132.build_count, 1U);
+	KUNIT_EXPECT_EQ(test, ave_t8132.builds[0].text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t8132.builds[0].text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_link_cell, 0U);
+	/*
+	 * The M5 Pro/Max 26A428 build: the same word, which differs per boot on
+	 * the J775D. The 26C5035 build has none set: its CRC matches as it is.
+	 */
+	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 2U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_crc, AVE_FW_TEXT_CRC_T6050_26A428);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_boot_word, 0U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_crc, AVE_FW_TEXT_CRC_T6050_26C5035);
+	KUNIT_EXPECT_EQ(test, ave_t6050.text_link_cell, 0U);
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 7 + 3;
+	memset(text + off, 0, 4);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+
+	put_unaligned_le32(0x00dd0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	put_unaligned_le32(0x007d0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &b), 0);
+	KUNIT_EXPECT_EQ(test, a, image);
+	KUNIT_EXPECT_EQ(test, b, image);
+	/* A change anywhere else is a different TEXT. */
+	text[off + 4] ^= 1;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	KUNIT_EXPECT_NE(test, a, image);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
+}
+
+/*
+ * The M3 generation binds probe-only: no build is pinned, the coprocessor
+ * is never started, and nothing is encoded, whatever layout a TEXT CRC
+ * might select.
+ */
+static void ave_m3_probe_only(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_EXPECT_FALSE(test, ave_m3.boot_qualified);
+	KUNIT_EXPECT_NULL(test, ave_m3.regs);
+	KUNIT_EXPECT_EQ(test, ave_m3.fw_text_size, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.build_count, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.boot_device_id, 0U);
+	KUNIT_EXPECT_EQ(test, ave_m3.device_type, 0U);
+
+	ave->variant = &ave_m3;
+	ave->text_crc = 0x25bfd039;
+	ave->layout = ave_layout_for_crc(ave->text_crc);
+	KUNIT_ASSERT_NOT_NULL(test, ave->layout);
+	KUNIT_EXPECT_EQ(test, ave_fw_check_boot(ave), -EOPNOTSUPP);
+}
+
 static struct kunit_case ave_abi_cases[] = {
+	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+	KUNIT_CASE(ave_26a428_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
@@ -1389,6 +1744,10 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
 	KUNIT_CASE(ave_6070_smalloc),
+	KUNIT_CASE(ave_m3_probe_only),
+	KUNIT_CASE(ave_26b123_layout),
+	KUNIT_CASE(ave_t8112_26b123_build),
+	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };
 
@@ -1397,5 +1756,3 @@ static struct kunit_suite ave_abi_suite = {
 	.test_cases = ave_abi_cases,
 };
 kunit_test_suite(ave_abi_suite);
-
-MODULE_LICENSE("GPL");

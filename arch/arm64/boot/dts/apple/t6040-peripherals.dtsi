@@ -25,7 +25,7 @@
 		power-domains = <&ps_dwi>;
 	};
 
-	/* ADT /arm-io/aes. */
+	/* ADT /arm-io/aes: the SIO AES engine, software keys only. */
 	aes: crypto@42900c000 {
 		compatible = "apple,t6041-aes", "apple,aes";
 		reg = <0x4 0x2900c000 0x0 0x4000>,
@@ -35,7 +35,7 @@
 		interrupts = <AIC_IRQ 1574 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
 		iommus = <&sio_dart 1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	/* ADT /arm-io/aon-ptd. */
@@ -188,7 +188,7 @@
 		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec>;
+		power-domains = <&ps_scodec_streaming>;
 		iommus = <&apr0_dart 1>;
 		resets = <&ps_scodec>;
 		status = "disabled";

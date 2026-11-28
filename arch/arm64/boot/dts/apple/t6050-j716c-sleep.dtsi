@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J716c sleep resources. The sleep controller and coprocessors remain disabled;
+ * the PMU RTC is enabled for counter and alarm qualification while awake.
+ * The native EL2 resume path and a J716c transition profile must be qualified
+ * before enabling the sleep node. In particular, no J714s commit schedule, clock
+ * programming, MCC stop masks or SMC timings are inherited here.
+ *
+ * The common apertures are inside the J716c hardware description's ranges.
+ * The GFX AIC aperture is the T6050 driver's shared location and still needs
+ * independent J716c validation. Only the first five MCC windows are named by
+ * the current binding; J716c has 32 and their sleep participation needs tracing.
+ */
+
+/ {
+	sleep: sleep-controller@280600000 {
+		compatible = "apple,t6050-j716c-sleep", "apple,t6050-sleep";
+		status = "disabled";
+		reg = <0x2 0x80600000 0x0 0x4000>,
+		      <0x2 0x80900000 0x0 0x4000>,
+		      <0x2 0x88300000 0x0 0xc000>,
+		      <0x23 0x00e80000 0x0 0x4000>,
+		      <0x23 0x80600000 0x0 0xc000>,
+		      <0x23 0x88300000 0x0 0x4000>,
+		      <0x2 0x80760000 0x0 0x10000>,
+		      <0x2 0x807d4000 0x0 0x4000>,
+		      <0x2 0x80930000 0x0 0x4000>,
+		      <0x23 0x00e90000 0x0 0x4000>,
+		      <0x23 0x80760000 0x0 0x10000>,
+		      <0x2 0x80700000 0x0 0x20000>,
+		      <0x23 0x80700000 0x0 0x14000>,
+		      <0x2 0x807ec000 0x0 0x4000>,
+		      <0x2 0x80950000 0x0 0x4000>,
+		      <0x23 0x807dc000 0x0 0x4000>,
+		      <0x2 0x80620000 0x0 0x4000>,
+		      <0x2 0x8062c000 0x0 0x4000>,
+		      <0x2 0x80688000 0x0 0x4000>,
+		      <0x2 0x88f04000 0x0 0x4000>,
+		      <0x2 0x8836c000 0x0 0x4000>,
+		      <0x2 0x88330000 0x0 0x4000>,
+		      <0x2 0x80920000 0x0 0x4000>,
+		      <0x2 0x8a014000 0x0 0x4000>,
+		      <0x2 0x86700000 0x0 0x14000>,
+		      <0x2 0x86806000 0x0 0x3000>,
+		      <0x2 0x84240000 0x0 0x20000>,
+		      <0x2 0x803f0000 0x0 0x4000>,
+		      <0x2 0x88370000 0x0 0x4000>,
+		      <0x23 0x88370000 0x0 0x4000>,
+		      <0x2 0x10e40000 0x0 0x10000>,
+		      <0x2 0x11e40000 0x0 0x10000>,
+		      <0x2 0x12e40000 0x0 0x10000>,
+		      <0x4 0x17020000 0x0 0x4000>,
+		      <0x4 0x17980000 0x0 0x4000>,
+		      <0x2 0x80000000 0x0 0x4000>,
+		      <0x2 0x80078000 0x0 0x4000>,
+		      <0x23 0x80078000 0x0 0x4000>,
+		      <0x22 0x20200000 0x0 0x8000>,
+		      <0x22 0x20400000 0x0 0x8000>,
+		      <0x22 0x20600000 0x0 0x8000>,
+		      <0x22 0x20800000 0x0 0x8000>,
+		      <0x22 0x22200000 0x0 0x8000>,
+		      <0x2 0x88004000 0x0 0x4000>,
+		      <0x23 0x88004000 0x0 0x4000>,
+		      <0x23 0x80400000 0x0 0x4000>;
+		reg-names = "ps0", "ps1", "ps-aon", "ps-gpx", "ps-media", "ps-gfx-aon",
+			    "clk", "clk-soc", "clk1", "afr-clk", "media-clk",
+			    "perf", "media-perf", "table0", "table1", "media-table",
+			    "cluster", "pwrgate", "cpu-start", "commit", "wdt", "wdt-aux",
+			    "disp-gate", "spmi", "pmc-voters", "pmc-rails", "ptd", "gapf",
+			    "aon-clk", "media-aon-clk", "cpm0", "cpm1", "cpm2",
+			    "storage-phy", "storage-phy-ip",
+			    "clkgen", "clkgen-78", "media-clkgen-78",
+			    "mcc22", "mcc23", "mcc24", "mcc25", "mcc26",
+			    "wake", "wake-gfx", "aic-gfx";
+		apple,display-coprocessors = <&dcp>, <&dcpext0>, <&dcpext1>, <&dcpext2>, <&dcpext3>;
+		apple,spmi-buses = <&nub_spmi_a0>, <&nub_spmi2>, <&nub_spmi_a1>, <&nub_spmi3>,
+				   <&aop_spmi0>;
+		/* SEP's, PMP0's, SIO's and the DCP's DART, stopped in the sleep's last steps */
+		apple,sleep-darts = <&sep_dart>, <&pmp0_dart>, <&sio_dart>, <&dcp_dart>;
+		/* The N1's host: its link is shut down for the sleep and brought back after it */
+		apple,radio-pcie = <&pcie0>;
+		apple,pinctrl = <&pinctrl_ap>;
+		apple,pinctrl-skip-pins = <5 6 7 112 141>;
+		apple,wake-enable = <16 18 28 30 38 39 62 65 69 71 72 73 74 76 122 127
+				     147 148 149 150 151 152 153 154 171 183 290>;
+		apple,wake-enable-gfx = <1>;
+		/*
+		 * The SoC data the boot loader is to add (see the binding): the commit schedule
+		 * and the SMC's sleep spacings (without them there is no deep sleep), the register
+		 * sequences, word lists and values the entry and the wake take, the AP pins to
+		 * leave alone and the pins driven low, the AP wake sources, the clock and CPM
+		 * set-up, the radio link's and the shared PCIe PHY's sequences, and the DARTs'
+		 * GAPF slices.
+		 */
+	};
+};
+
+/*
+ * Abbey's counter and alarm layout match the J716c hardware description. The
+ * generation 4 SPMI controller has no Linux PMU alarm IRQ yet; enabling the RTC
+ * alone does not qualify the platform wake route or deep sleep.
+ */
+&pmu {
+	pmu_rtc: rtc {
+		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+		wakeup-source;
+		status = "okay";
+	};
+};
+
+/* MagSafe's controller is separate from all three USB-C data ports. */
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+		status = "disabled";
+	};
+};
+
+/* Split the two ASC mailboxes from their coprocessor banks for later use. */
+&{/soc@200000000} {
+	aop2_mbox: mailbox@291608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x91608000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 586 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 587 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 588 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 589 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+&aop2 {
+	reg = <0x2 0x91600000 0x0 0x4000>;
+	reg-names = "asc";
+	/delete-property/ interrupts;
+	mboxes = <&aop2_mbox>;
+	mbox-names = "mbox";
+	apple,dma-range = <0x110 0x0 0x10 0x0>;
+	status = "disabled";
+};
+
+/* The SIO's register banks and mailbox, disabled together. */
+&{/soc@200000000} {
+	sio_mbox: mailbox@505e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x5e08000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1391 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1392 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1393 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1394 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_sio_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+&sio {
+	reg = <0x5 0x5e00000 0x0 0x8000>,
+	      <0x5 0x5850000 0x0 0x4000>,
+	      <0x5 0x5e0c000 0x0 0x7c000>;
+	reg-names = "asc", "auxiliary", "asc-tail";
+	/delete-property/ interrupts;
+	dma-channels = <128>;
+	mboxes = <&sio_mbox>;
+	status = "disabled";
+};
+
+&sio_dart {
+	power-domains = <&ps_sio_cpu>;
+	status = "disabled";
+};

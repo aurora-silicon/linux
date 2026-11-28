@@ -114,6 +114,15 @@ properties:
     minItems: 2
     description: Host physical address and size pairs mapped into firmware PIO space.
 
+  apple,sram-keep:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - description: Offset in the firmware SRAM
+      - description: Size
+    description:
+      The firmware SRAM range the OS keeps over a system sleep, read after the
+      firmware's stop and written back before its restart. Set by the bootloader.
+
   apple,tunable-segment-names:
     $ref: /schemas/types.yaml#/definitions/string
     description:

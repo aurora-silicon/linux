@@ -129,6 +129,90 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
 };
 
 /*
+ * T8132 (M4): the engine AXI2AF set at +0x0, then its write-disable and lock
+ * bits. The lock holds until ANE_SYS power is cycled, so a group that finds
+ * it set only checks its values. Bit 31 of each AXI2AF word (+0x0..+0x38)
+ * loads its fields: it reads back set after the write and clears when a
+ * sub-block power cycles under a held ANE_SYS (an aborted system suspend);
+ * the fields stay. The bit-31 words further up keep it. M4 has no XL or
+ * C1PPT writes.
+ */
+static const struct ane_h16_tunable ane_t8132_axi2af[] = {
+	{ 0x0000, 0x800000ff, 0x8000001b },
+	{ 0x0004, 0x80ff00ff, 0x800d000d },
+	{ 0x0008, 0x80ff00ff, 0x800d000d },
+	{ 0x000c, 0x80ff00ff, 0x800d000d },
+	{ 0x0010, 0x80ff00ff, 0x80010003 },
+	{ 0x0014, 0x80ff00ff, 0x80010003 },
+	{ 0x0018, 0x800000ff, 0x80000014 },
+	{ 0x001c, 0x800000ff, 0x80000022 },
+	{ 0x0020, 0x80ff00ff, 0x8012000c },
+	{ 0x0024, 0x80ff00ff, 0x80180006 },
+	{ 0x0028, 0x80ff00ff, 0x80060002 },
+	{ 0x002c, 0x80ff00ff, 0x80060002 },
+	{ 0x0030, 0x800000ff, 0x80000016 },
+	{ 0x0034, 0x800000ff, 0x80000012 },
+	{ 0x0038, 0x800000ff, 0x80000012 },
+};
+
+static const struct ane_h16_tunable ane_t8132_axi[] = {
+	{ 0x0100, 0x000000ff, 0x000000ff },
+	{ 0x0104, 0x00ff0000, 0x00010000 },
+	{ 0x0108, 0xffff0006, 0x00040000 },
+	{ 0x0304, 0x3f3f0000, 0x02020000 },
+	{ 0x0314, 0x80000000, 0x80000000 },
+	{ 0x031c, 0x80000000, 0x80000000 },
+	{ 0x0324, 0x80000000, 0x80000000 },
+	{ 0x0338, 0xffffffff, 0x00050020 },
+	{ 0x033c, 0xffffffff, 0x000a0030 },
+	{ 0x0408, 0xffff0020, 0x00130020 },
+	{ 0x0748, 0x07ff07ff, 0x00200030 },
+	{ 0x0848, 0x07ff07ff, 0x00100030 },
+	{ 0x0948, 0x07ff07ff, 0x01000100 },
+	{ 0x0b00, 0xffffffff, 0x7fffffff },
+	{ 0x0b04, 0x00000100, 0x00000100 },
+	{ 0x4008, 0x00000001, 0x00000000 },
+	{ 0x400c, 0x00000001, 0x00000000 },
+	{ 0x4014, 0x00000001, 0x00000000 },
+	{ 0x4018, 0x00000001, 0x00000000 },
+	{ 0x401c, 0x00000001, 0x00000001 },
+	{ 0x4020, 0xffff0000, 0x00000000 },
+	{ 0x4024, 0xffff0000, 0x00000000 },
+	{ 0x4028, 0xffff0000, 0x00000000 },
+	{ 0x402c, 0xffff0000, 0x00000000 },
+	{ 0x4030, 0xffff0000, 0x00000000 },
+	{ 0x4034, 0xffff0000, 0x00000000 },
+};
+
+static const struct ane_h16_tunable ane_t8132_axi_wd[] = {
+	{ 0x0df8, 0x00000001, 0x00000001 },
+	{ 0x0ef8, 0x00000001, 0x00000001 },
+	{ 0x0ff8, 0x00000001, 0x00000001 },
+	{ 0x10f8, 0x00000001, 0x00000001 },
+	{ 0x11f8, 0x00000001, 0x00000001 },
+};
+
+static const struct ane_h16_tunable ane_t8132_axi_lock[] = {
+	{ 0x0dfc, 0x00000001, 0x00000001 },
+	{ 0x0efc, 0x00000001, 0x00000001 },
+	{ 0x0ffc, 0x00000001, 0x00000001 },
+	{ 0x10fc, 0x00000001, 0x00000001 },
+	{ 0x11fc, 0x00000001, 0x00000001 },
+};
+
+static const struct ane_h16_tunables ane_t8132_tunables[] = {
+	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi2af,
+	  .count = ARRAY_SIZE(ane_t8132_axi2af), .lock_offset = 0xdfc, .lock_mask = 1,
+	  .strobe = BIT(31) },
+	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi,
+	  .count = ARRAY_SIZE(ane_t8132_axi), .lock_offset = 0xdfc, .lock_mask = 1 },
+	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi_wd,
+	  .count = ARRAY_SIZE(ane_t8132_axi_wd), .lock_offset = 0xdfc, .lock_mask = 1 },
+	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi_lock,
+	  .count = ARRAY_SIZE(ane_t8132_axi_lock), .lock_offset = 0xdfc, .lock_mask = 1 },
+};
+
+/*
  * T6041 (J616s) ANE DARTs, revision 2.2 (PARAMS3 0x2a2a0202). The ADT
  * dart-ane0 node has one DAPF bank, the reg entry its instance property tags
  * FPAD "DAPFLLT" at DART0 + 0x10000; BRD and BWR have none, and their
@@ -186,6 +270,40 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	.c1ppt = true,
 	.tunables = ane_h16_tunables_26a428,
 	.tunable_count = ARRAY_SIZE(ane_h16_tunables_26a428),
+	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+/* The J713 25G83 firmware takes the 26A428 boot values; M4 engine writes. */
+static const struct ane_h16_build ane_h16_build_t8132_25g83 = {
+	.cpu_control = 0x1600044,
+	.rvbar = 0x1050000,
+	.ce = 0x18a4000,
+	.ce_delays = 5001,
+	.ce_delay_us = 10,
+	.ready = 0x08042006,
+	.run = 0x10,
+	.scratch_polls = 1000,
+	.scratch_delay_us = 1000,
+	.command_timeout_ns = 3000000000ULL,
+	.pool_dva = 0x10000384000,
+	.ipc_dva = 0x100003d0000,
+	.heap_dva = 0x100003e4000,
+	.shared_dva = 0x10001300000,
+	.expected_rvbar = 0x10000000001,
+	.pool_size = 0x40000,
+	.init_offset = 0x180,
+	.init_size = 0x174,
+	.config_span = 0x380000,
+	.config_window = 0x10000000,
+	.template_count = 64,
+	.template_word = 0x12c,
+	.template_value = 4,
+	.max_channels = 0x21,
+	/* Host allocation policy, not a recovered firmware ceiling. */
+	.max_heap = SZ_16M,
+	.native_free = true,
+	.tunables = ane_t8132_tunables,
+	.tunable_count = ARRAY_SIZE(ane_t8132_tunables),
 	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
 };
 
@@ -360,12 +478,105 @@ static const struct ane_h16_preload_rule ane_h16_preload_25g83_j614c = {
 	},
 };
 
+/*
+ * The M4 (J713) 26.6.2 (25G83) preload: the T6041 25G83 patchbay records and
+ * rewritten range 0x4f0 bytes later in DATA, plus two records whose values
+ * change on every boot (GKTS and ECAP).
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_25g83_t8132[] = {
+	{ "GKTS", 0x9eb0, 8, true },
+	{ "ECAP", 0x9fa3, 8, true },
+	{ "ABOI", 0xa0c9, 8, false },
+	{ "ZSOI", 0xa0d9, 4, false },
+	{ "ARcM", 0xa0e5, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_25g83_j713 = {
+	.cells = ane_h16_patchbay_25g83_t8132,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_25g83_t8132),
+	.zero_start = 0x1c0f0,
+	.zero_end = 0x1c790,
+	.digest = {
+		0x14, 0x87, 0xde, 0x7a, 0x0e, 0x39, 0xd9, 0xa3,
+		0x4f, 0xcb, 0xbf, 0x9b, 0x36, 0xa5, 0xbe, 0xe7,
+		0xe6, 0x6e, 0x20, 0x72, 0x2f, 0xf5, 0xc1, 0x56,
+		0x55, 0xb0, 0xee, 0x7a, 0x8a, 0x85, 0x86, 0xc6,
+	},
+};
+
+/* T8132 firmware builds; never offered to the T6041, nor its builds here. */
+static const struct ane_h16_profile ane_t8132_profiles[] __maybe_unused = {
+	{
+		.identity = "H16 T8132 26.6.2 25G83 J713",
+		.preload = &ane_h16_preload_25g83_j713,
+		.build = &ane_h16_build_t8132_25g83,
+	},
+};
+
+/*
+ * The M4 (J713) 27.2 (26B123) preload: iBoot hands over TEXT 0xbc000 and
+ * DATA 0x2b0000. DATA carries the 26A428 patchbay records and rewritten
+ * range 0x10 bytes earlier, and the same records as on 25G83 change on
+ * every boot (GKTS and ECAP).
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_26b123_t8132[] = {
+	{ "GKTS", 0x5a30, 8, true },
+	{ "ECAP", 0x5b23, 8, true },
+	{ "ABOI", 0x5c49, 8, false },
+	{ "ZSOI", 0x5c59, 4, false },
+	{ "ARcM", 0x5c65, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_26b123_j713 = {
+	.cells = ane_h16_patchbay_26b123_t8132,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_26b123_t8132),
+	.zero_start = 0x17c70,
+	.zero_end = 0x18310,
+	.text_size = 0xbc000,
+	.data_size = 0x2b0000,
+	.digest = {
+		0xb6, 0x88, 0x93, 0xc9, 0x55, 0x8a, 0xa0, 0xd3,
+		0xbc, 0x15, 0xe5, 0x9a, 0x69, 0xa1, 0x7a, 0x34,
+		0xf1, 0x5b, 0x6e, 0x38, 0x7d, 0xb0, 0x92, 0xca,
+		0x8c, 0xc4, 0x19, 0x5a, 0xf7, 0x0a, 0x87, 0x21,
+	},
+};
+
+/* The 27.2 builds; their preload is not the size of the 25G83 one. */
+static const struct ane_h16_profile ane_t8132_profiles_26b123[] __maybe_unused = {
+	{
+		.identity = "H16 T8132 27.2 26B123 J713",
+		.preload = &ane_h16_preload_26b123_j713,
+		.build = &ane_h16_build_t8132_25g83,
+	},
+};
+
+/* 27.2 (26B123) preload on T6041 (J616c): 26A428 DATA layout and zeroed range. */
+static const struct ane_h16_preload_rule ane_h16_preload_26b123 = {
+	.cells = ane_h16_patchbay_26a428,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_26a428),
+	.zero_start = 0x17c80,
+	.zero_end = 0x18320,
+	.digest = {
+		0xd1, 0xbd, 0xb9, 0xd0, 0x4d, 0x6e, 0x35, 0xa7,
+		0x31, 0x71, 0xc2, 0xa8, 0xa9, 0x66, 0x38, 0xfe,
+		0xc2, 0x6c, 0x4c, 0xed, 0x7a, 0x0e, 0xfd, 0xc4,
+		0xb9, 0xde, 0x58, 0x5f, 0x70, 0x92, 0x33, 0x16,
+	},
+};
+
 /* Every supported H16 firmware build, matched against the live preload. */
 static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
 		.identity = "H16 27.0 26A428",
 		.preload = &ane_h16_preload_26a428,
 		.build = &ane_h16_build_26a428,
+	},
+	{
+		.identity = "H16 27.2 26B123",
+		.preload = &ane_h16_preload_26b123,
+		.build = &ane_h16_build_26a428,
+		.require_dart_unlocked = true,
 	},
 	{
 		.identity = "H16 26.6.2 25G83",
@@ -386,6 +597,91 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 		.identity = "H16 26.5.2 25F84",
 		.preload = &ane_h16_preload_25f84,
 		.build = &ane_h16_build_26a428,
+	},
+};
+
+/*
+ * T8122 (M3) ANE DARTs, revision 2.0 (PARAMS3 0x2a2a0200). Same fault/protect/
+ * lock and DAPF record layout as T6041/T8132, with the DAPF bank at DART0
+ * + 0x4000.
+ */
+static const struct ane_h16_mmio ane_h15_mmio_t8122[] __maybe_unused = {
+	{
+		.dart_revision = 0x0200,
+		.dart_fault = 0x100,
+		.dart_address_lo = 0x170,
+		.dart_address_hi = 0x174,
+		.dart_protect = 0x200,
+		.dart_lock = 0x208,
+		.dapf_records = 0,
+		.dapf_stride = 0x40,
+		.dapf_end_mask = ~3ULL,
+		.dapf_r0 = 0x31,
+		.dapf_r4 = 0,
+		.dapf_r20 = 1,
+	},
+};
+
+/* T8122 (M3) H15 27.2 (26B123): no CE block and no pre-RUN engine tunables. */
+static const struct ane_h16_build ane_h15_build_t8122_26b123 = {
+	.cpu_control = 0x1400044,
+	.rvbar = 0x1050000,
+	.ready = 0x08042006,
+	.run = 0x10,
+	.scratch_polls = 1000,
+	.scratch_delay_us = 1000,
+	.command_timeout_ns = 3000000000ULL,
+	.pool_dva = 0x10000384000,
+	.ipc_dva = 0x100003d0000,
+	.heap_dva = 0x100003e4000,
+	.shared_dva = 0x10001300000,
+	.expected_rvbar = 0x10000000001,
+	.pool_size = 0x40000,
+	.init_offset = 0x180,
+	.init_size = 0x174,
+	.config_span = 0x380000,
+	.config_window = 0x10000000,
+	.template_count = 64,
+	.template_word = 0x12c,
+	.template_value = 4,
+	.max_channels = 0x21,
+	.max_heap = SZ_16M,
+	.native_free = true,
+	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+/*
+ * M3 Air (J615) 27.2 (26B123) preload: TEXT 0xc8000, DATA 0x2a4000.
+ * Patchbay cells in DATA order (GKTS, ECAP, ARcM mutable; ABOI, ZSOI fixed).
+ */
+static const struct ane_h16_preload_cell ane_h15_patchbay_26b123_t8122[] = {
+	{ "GKTS", 0x6850, 8, true },
+	{ "ECAP", 0x6943, 8, true },
+	{ "ARcM", 0x6a18, 4, true },
+	{ "ABOI", 0x6a75, 8, false },
+	{ "ZSOI", 0x6a85, 4, false },
+};
+
+static const struct ane_h16_preload_rule ane_h15_preload_26b123_j615 = {
+	.cells = ane_h15_patchbay_26b123_t8122,
+	.cell_count = ARRAY_SIZE(ane_h15_patchbay_26b123_t8122),
+	.zero_start = 0x2a4000,
+	.zero_end = 0x2a4000,
+	.text_size = 0xc8000,
+	.data_size = 0x2a4000,
+	.digest = {
+		0xed, 0x4a, 0x5a, 0xcf, 0x99, 0x53, 0x21, 0xd1,
+		0x51, 0xca, 0xc8, 0xec, 0x2d, 0x2b, 0xf1, 0x1a,
+		0x0f, 0xb7, 0x34, 0x4c, 0x43, 0xc0, 0xec, 0x24,
+		0x01, 0x6b, 0x59, 0x09, 0x37, 0xee, 0x29, 0x17,
+	},
+};
+
+static const struct ane_h16_profile ane_t8122_profiles_26b123[] __maybe_unused = {
+	{
+		.identity = "H15 T8122 27.2 26B123 J615",
+		.preload = &ane_h15_preload_26b123_j615,
+		.build = &ane_h15_build_t8122_26b123,
 	},
 };
 

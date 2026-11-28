@@ -111,6 +111,119 @@ static void td_flags_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 2), 0);
 }
 
+/* Fill @s with a TD stream (slot 2) and a constant section (slot 6) of @buf. */
+static void fill_two(struct kunit *test, struct ane_t6021_secs *s,
+		     const u8 *buf, u8 **copy)
+{
+	copy[0] = kunit_kzalloc(test, 0x90, GFP_KERNEL);
+	copy[1] = kunit_kzalloc(test, 0x40, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy[0]);
+	KUNIT_ASSERT_NOT_NULL(test, copy[1]);
+	ane_t6021_secs_fill(s, ANE_T6021_SEC_TEXT - 1, copy[0], copy[0],
+			    0x40000000, buf, 0x90);
+	ane_t6021_secs_fill(s, 6, copy[1], copy[1], 0x40004000, buf + 0x90,
+			    0x40);
+}
+
+static void check_records(struct kunit *test, const u8 *cmd)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
+		const u8 *rec = cmd + 0x8 + i * 0x30;
+		u32 want_id = 0;
+		u64 want_iova = 0, want_size = 0;
+
+		if (i == ANE_T6021_SEC_TEXT - 1) {
+			want_id = ANE_T6021_SEC_TEXT;
+			want_iova = 0x40000000;
+			want_size = 0x90;
+		} else if (i == 6) {
+			want_id = 7;
+			want_iova = 0x40004000;
+			want_size = 0x40;
+		}
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(rec), want_id ? 1U : 0U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(rec + 0x04), want_id);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(rec + 0x18), want_iova);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(rec + 0x20), want_size);
+	}
+}
+
+/*
+ * PROG_LOAD keys, checks and names a kernel copy of the caller's sections.
+ * The caller's buffer stays writable to it after the load, so a change
+ * there must reach neither the key, nor the TD check, nor the memory any
+ * LOAD of the program (first or reload) names.
+ */
+static void prog_sections_copied_test(struct kunit *test)
+{
+	struct ane_t6021_secs *secs, *ref, *now;
+	u8 digest[SHA256_DIGEST_SIZE], want[SHA256_DIGEST_SIZE];
+	u8 changed[SHA256_DIGEST_SIZE];
+	u8 *buf, *orig, *cmd, *copy[2], *ref_copy[2], *now_copy[2];
+	struct ane_t6021_prog *p;
+	unsigned int i;
+
+	buf = kunit_kzalloc(test, 0xd0, GFP_KERNEL);
+	cmd = kunit_kzalloc(test, 0x1c0, GFP_KERNEL);
+	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, cmd);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	secs = kunit_kzalloc(test, sizeof(*secs), GFP_KERNEL);
+	ref = kunit_kzalloc(test, sizeof(*ref), GFP_KERNEL);
+	now = kunit_kzalloc(test, sizeof(*now), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, secs);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	KUNIT_ASSERT_NOT_NULL(test, now);
+	/* A well-formed single-task TD stream, then constants. */
+	put_task(buf, 0x10, 0x20, 0x2a);
+	memset(buf + 0x90, 0x5a, 0x40);
+	orig = kunit_kzalloc(test, 0xd0, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, orig);
+	memcpy(orig, buf, 0xd0);
+
+	fill_two(test, secs, buf, copy);
+	/* The caller rewrites its buffer: a TD stream the check refuses and
+	 * other constants.
+	 */
+	put32(buf + 0x18, 0x08);
+	memset(buf + 0x90, 0xa5, 0x40);
+
+	/* Key and check see the bytes as they were at the copy. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_secs_key(secs, digest), 0);
+	fill_two(test, ref, orig, ref_copy);
+	KUNIT_EXPECT_EQ(test, ane_t6021_secs_key(ref, want), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(digest, want, sizeof(want)), 0);
+	/* The rewritten bytes would have been refused and keyed apart. */
+	fill_two(test, now, buf, now_copy);
+	KUNIT_EXPECT_EQ(test, ane_t6021_secs_key(now, changed), -EINVAL);
+	KUNIT_EXPECT_NE(test, memcmp(digest, changed, sizeof(changed)), 0);
+
+	/* The program owns the copies; the LOAD names them, not the buffer. */
+	ane_t6021_secs_give(secs, p);
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++)
+		KUNIT_EXPECT_NULL(test, secs->mem[i]);
+	KUNIT_EXPECT_PTR_EQ(test, p->sec[ANE_T6021_SEC_TEXT - 1], (void *)copy[0]);
+	KUNIT_EXPECT_PTR_EQ(test, p->sec[6], (void *)copy[1]);
+	ane_t6021_load_records(cmd, p);
+	check_records(test, cmd);
+	KUNIT_EXPECT_EQ(test, memcmp(copy[0], orig, 0x90), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(copy[1], orig + 0x90, 0x40), 0);
+	KUNIT_EXPECT_NE(test, memcmp(copy[0], buf, 0x90), 0);
+
+	/* A reload after an eviction or restart names the same copies, whatever
+	 * the caller's buffer holds by then.
+	 */
+	memset(buf, 0xff, 0xd0);
+	memset(cmd, 0, 0x1c0);
+	ane_t6021_load_records(cmd, p);
+	check_records(test, cmd);
+	KUNIT_EXPECT_EQ(test, memcmp(copy[0], orig, 0x90), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(copy[1], orig + 0x90, 0x40), 0);
+}
+
 /* A fake firmware. Records every command class and fails on demand. */
 struct fake_fw {
 	struct kunit *test;
@@ -641,6 +754,8 @@ struct fake_restart {
 	char log[8];
 	unsigned int n;
 	char fail;
+	bool busy;		/* halt: RUN clear, STOPPED never seen */
+	int contain_ret;
 };
 
 static int fake_step(struct fake_restart *r, char step)
@@ -661,7 +776,18 @@ static int fr_wait_idle(void *ctx)
 
 static int fr_halt(void *ctx)
 {
-	return fake_step(ctx, 'h');
+	struct fake_restart *r = ctx;
+	int ret = fake_step(r, 'h');
+
+	return !ret && r->busy ? ANE_T6021_ASC_BUSY : ret;
+}
+
+static int fr_contain(void *ctx)
+{
+	struct fake_restart *r = ctx;
+
+	r->log[r->n++] = 'k';
+	return r->contain_ret;
 }
 
 static int fr_power_cycle(void *ctx)
@@ -675,6 +801,16 @@ static int fr_boot(void *ctx)
 }
 
 static const struct ane_t6021_restart_ops fr_ops = {
+	.power_down = fr_power_down,
+	.wait_idle = fr_wait_idle,
+	.halt = fr_halt,
+	.contain = fr_contain,
+	.power_cycle = fr_power_cycle,
+	.boot = fr_boot,
+};
+
+/* The same steps without a contain step (the driver option is off). */
+static const struct ane_t6021_restart_ops fr_ops_nocontain = {
 	.power_down = fr_power_down,
 	.wait_idle = fr_wait_idle,
 	.halt = fr_halt,
@@ -703,6 +839,64 @@ static void restart_stop_boundary_test(struct kunit *test)
 		KUNIT_EXPECT_NULL(test, strchr(r.log, 'c'));
 		KUNIT_EXPECT_NULL(test, strchr(r.log, 'b'));
 	}
+}
+
+static void restart_busy_core_test(struct kunit *test)
+{
+	enum ane_t6021_restart_stage stage;
+	struct fake_restart r = { .busy = true };
+
+	/* A hung job: the busy core is contained, cycled and booted. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage), 0);
+	KUNIT_EXPECT_STREQ(test, r.log, "hkcb");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_DONE);
+
+	/* A planned stop never contains: an idle instance must stop itself. */
+	memset(&r, 0, sizeof(r));
+	r.busy = true;
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, true, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "pwh");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
+
+	/* Contain refused: nothing is powered off. */
+	memset(&r, 0, sizeof(r));
+	r.busy = true;
+	r.contain_ret = -EIO;
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage),
+			-EIO);
+	KUNIT_EXPECT_STREQ(test, r.log, "hk");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
+
+	/* Contain switched off: the old refusal. */
+	memset(&r, 0, sizeof(r));
+	r.busy = true;
+	r.contain_ret = -EOPNOTSUPP;
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "hk");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
+
+	/* No contain step at all: same. */
+	memset(&r, 0, sizeof(r));
+	r.busy = true;
+	KUNIT_EXPECT_EQ(test,
+			ane_t6021_restart_run(&fr_ops_nocontain, &r, false, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "h");
+
+	/* Any other halt failure (engine unreachable) is never contained. */
+	memset(&r, 0, sizeof(r));
+	r.fail = 'h';
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "h");
+
+	/* The system-sleep stop takes the same boundary. */
+	memset(&r, 0, sizeof(r));
+	r.busy = true;
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_stop(&fr_ops, &r, false), 0);
+	KUNIT_EXPECT_STREQ(test, r.log, "hk");
 }
 
 static void perf_mode_cmd_test(struct kunit *test)
@@ -775,6 +969,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(mring_classify_test),
 	KUNIT_CASE(legtab_reuse_test),
 	KUNIT_CASE(td_flags_test),
+	KUNIT_CASE(prog_sections_copied_test),
 	KUNIT_CASE(progtab_shared_unload_test),
 	KUNIT_CASE(multitask_unloaded_at_close_test),
 	KUNIT_CASE(progtab_failed_unload_holds_test),
@@ -788,6 +983,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(unload_order_test),
 	KUNIT_CASE(restart_state_machine_test),
 	KUNIT_CASE(restart_stop_boundary_test),
+	KUNIT_CASE(restart_busy_core_test),
 	KUNIT_CASE(perf_mode_cmd_test),
 	{}
 };

@@ -38,9 +38,6 @@
 	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are
 	 * the ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
 	 * amps' sense slots, RW1 in the left amps'.
-	 *
-	 * The speakers wait for their own bring-up and a J604 protection
-	 * profile; until then the card and the amps stay disabled.
 	 */
 	sound: sound {
 		compatible = "apple,j604-macaudio", "apple,macaudio";
@@ -50,7 +47,6 @@
 				   <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "disabled";
 
 		dai-link@0 {
 			reg = <0>;
@@ -111,8 +107,7 @@
  * The six SN012776 speaker amps (ADT /arm-io/i2c3/audio-speaker at 0x38
  * and its speaker1..5): one interrupt line on AP GPIO 14, level low; sense
  * slots from speaker-config (amp i at bytes 4i and 4i + 2, in provider
- * order). Every amp joins the SDZ fail-closed group. Disabled until the
- * speakers' bring-up.
+ * order). Every amp joins the SDZ fail-closed group.
  */
 &i2c3 {
 	status = "okay";
@@ -128,7 +123,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
-		status = "disabled";
 	};
 
 	speaker_left_woof2: codec@39 {
@@ -142,7 +136,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <8>;
 		ti,vmon-slot-no = <10>;
-		status = "disabled";
 	};
 
 	speaker_left_tweet: codec@3a {
@@ -156,7 +149,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <16>;
 		ti,vmon-slot-no = <18>;
-		status = "disabled";
 	};
 
 	speaker_right_woof1: codec@3b {
@@ -170,7 +162,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <4>;
 		ti,vmon-slot-no = <6>;
-		status = "disabled";
 	};
 
 	speaker_right_woof2: codec@3c {
@@ -184,7 +175,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <12>;
 		ti,vmon-slot-no = <14>;
-		status = "disabled";
 	};
 
 	speaker_right_tweet: codec@3d {
@@ -198,7 +188,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <20>;
 		ti,vmon-slot-no = <22>;
-		status = "disabled";
 	};
 };
 
@@ -210,7 +199,7 @@
 	label = "USB-C Left Rear";
 };
 
-/* hpm3 is ATC3's port controller; hpm5, the MagSafe port's, is not wired. */
+/* hpm3 is ATC3's port controller. The MagSafe port's, hpm5, is in t8132-laptop.dtsi. */
 &nub_spmi_a1 {
 	status = "okay";
 
@@ -252,6 +241,7 @@
 };
 
 &atcphy3 {
+	apple,dp-alt-mode;
 	status = "okay";
 
 	ports {
@@ -276,7 +266,6 @@
 };
 
 &dwc3_3 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -339,7 +328,15 @@
 	};
 };
 
+/*
+ * Touch ID: the ADT names the J604's Mesa sensor "R3", J613's generation, so
+ * it runs in J613's SPI mode 1 (spi-cpha), not the mode 2 (spi-cpol) the
+ * T8132 node defaults to for J713's V3 sensor. In mode 3 (both) every wake
+ * read returns sixteen zero bytes and apple_sep gates the sensor.
+ */
 &mesa {
+	/delete-property/ spi-cpol;
+	spi-cpha;
 	/*
 	 * Per-device factory data from this Mac's own iBoot system container:
 	 * the calibration, and the signed root key the nonce session loads.
@@ -349,7 +346,8 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
-#include "hwmon-fan-dual.dtsi"
+#include "hwmon-fan.dtsi"
+#include "t8132-j604-hwmon-rails.dtsi"
 
 /*
  * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
@@ -372,5 +370,278 @@
 };
 
 &avd {
+	status = "okay";
+};
+
+#include "t8132-j604-atcphy-tunables.dtsi"
+
+/*
+ * External displays over USB-C: both pipes (dcpext0/1), routed through each
+ * port's display crossbar to its ATC PHY in DisplayPort alt mode. The left
+ * ports sit on ATC0/ATC1 with typec0/typec1 as on the J713, the right port on
+ * ATC3 with typec3 (its PHY is marked above). The HDMI port (ATC2) is not
+ * described here.
+ */
+&atcphy0 {
+	apple,dp-alt-mode;
+};
+
+&atcphy1 {
+	apple,dp-alt-mode;
+};
+
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&atc0_dpxbar {
+	status = "okay";
+};
+
+&atc1_dpxbar {
+	status = "okay";
+};
+
+/*
+ * dcpext0's Type-C routes, UFP mux selector 2 on each ATC crossbar
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The routes are disabled here; the
+ * display gate enables them only for a dcpext the boot loader handed over,
+ * since a USB-C port controller waits for every available route.
+ */
+&dcpext0 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc3_dpxbar 0>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1",
+			    "typec2";
+	apple,typec-mux-indices = <2 2 2>;
+	apple,typec-dptx-phys = <0 1 3>;
+
+	status = "okay";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec3: endpoint {
+					remote-endpoint = <&typec3_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * dcpext1's Type-C routes, UFP mux selector 4 on each ATC crossbar
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The routes are disabled here; the
+ * display gate enables them only for a dcpext the boot loader handed over,
+ * since a USB-C port controller waits for every available route.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc3_dpxbar 0>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1",
+			    "typec2";
+	apple,typec-mux-indices = <4 4 4>;
+	apple,typec-dptx-phys = <0 1 3>;
+
+	status = "okay";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext1>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec3: endpoint {
+					remote-endpoint = <&typec3_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+
+			typec0_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+
+			typec1_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&atc3_dpxbar {
+	status = "okay";
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec3_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec3>;
+			};
+
+			typec3_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
+};
+
+/*
+ * Keyboard backlight on macOS's scale: its levels 0.0625..1.0 drive
+ * 69..336 of 960 PWM cycles, on = 52 + 284 * level, so the top level is
+ * 35 % duty and the line starts at 5.42 %.
+ */
+&kbd_led {
+	min-duty-cycle-bp = <542>;
+	max-duty-cycle-bp = <3500>;
+};
+
+/*
+ * The headset jack reports the plug on ring sense; tip sense keeps
+ * re-asserting with nothing plugged in.
+ */
+&jack_codec {
+	cirrus,ring-sense-detect;
+};
+
+/*
+ * ProRes: the engine and its DART. The driver binds the T8132 engine whenever
+ * apple/prores-t8132-init.bin is installed and leaves it off without it.
+ */
+&dart_apr0 {
+	status = "okay";
+};
+
+&apr {
 	status = "okay";
 };

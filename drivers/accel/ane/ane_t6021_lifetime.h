@@ -25,8 +25,10 @@
  *    the next poll and the cursor does not move.
  *
  * A program is shared by every file that loaded byte-identical sections and
- * outlives the firmware instance it was loaded into. Each file holds one
- * reference per program it loaded, by an opaque kernel ID that never changes.
+ * outlives the firmware instance it was loaded into. It owns a kernel copy of
+ * its sections, made at PROG_LOAD, and the firmware only ever reads that
+ * copy. Each file holds one reference per program it loaded, by an opaque
+ * kernel ID that never changes.
  * Whether the program is in the firmware right now (resident) is separate:
  *
  *  - When the last file holding a program closes, it is unloaded:
@@ -50,6 +52,7 @@
 #define __ANE_T6021_LIFETIME_H__
 
 #include <asm/byteorder.h>
+#include <crypto/sha2.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/sizes.h>
@@ -210,13 +213,107 @@ struct ane_t6021_prog {
 	enum ane_t6021_prog_state state;
 	bool resident;		/* LOADed into the current firmware instance */
 	u64 last_use;
-	/* The program's own reference on each section buffer, or NULL, and
-	 * the IOVA and size its LOAD names for that section.
+	/* The program's own kernel copy of each section, or NULL, and the
+	 * IOVA and size its LOAD names for that section.
 	 */
 	void *sec[ANE_T6021_PROG_SECS];
 	u64 sec_iova[ANE_T6021_PROG_SECS];
 	u64 sec_size[ANE_T6021_PROG_SECS];
 };
+
+/*
+ * The sections of a program while PROG_LOAD builds it, by slot (id - 1).
+ * Each is a kernel copy no client can map and the engine maps read-only:
+ * the cache key, the TD check and every LOAD of the program read the copy,
+ * never the caller's buffer, so what was keyed and checked is what the
+ * firmware reads. PROG_LOAD also keys a view of the caller's buffers (mem
+ * the BOs) to find a program already loaded; that view is never loaded.
+ */
+struct ane_t6021_secs {
+	void *mem[ANE_T6021_PROG_SECS];	/* driver allocation, NULL: no section */
+	u8 *cpu[ANE_T6021_PROG_SECS];
+	u64 iova[ANE_T6021_PROG_SECS];
+	u64 size[ANE_T6021_PROG_SECS];
+};
+
+/* Copy @size bytes of the caller's section at @src into @cpu, the kernel
+ * allocation @mem at @iova, and record it at @slot. @src is not read again.
+ */
+static inline void ane_t6021_secs_fill(struct ane_t6021_secs *s,
+				       unsigned int slot, void *mem, u8 *cpu,
+				       u64 iova, const u8 *src, u64 size)
+{
+	memcpy(cpu, src, size);
+	s->mem[slot] = mem;
+	s->cpu[slot] = cpu;
+	s->iova[slot] = iova;
+	s->size[slot] = size;
+}
+
+/*
+ * The cache key of the copies: SHA-256 over each section's id, size and
+ * bytes in slot order, so identical bytes give the same program. Returns
+ * ane_t6021_td_flags_check() of the TD stream copy.
+ */
+static inline int ane_t6021_secs_key(const struct ane_t6021_secs *s,
+				     u8 digest[SHA256_DIGEST_SIZE])
+{
+	struct sha256_ctx sha;
+	unsigned int i;
+	int td_flags = 0;
+
+	sha256_init(&sha);
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
+		u64 hdr[2] = { i + 1, s->size[i] };
+
+		if (!s->mem[i])
+			continue;
+		sha256_update(&sha, (const u8 *)hdr, sizeof(hdr));
+		sha256_update(&sha, s->cpu[i], s->size[i]);
+		if (i + 1 == ANE_T6021_SEC_TEXT)
+			td_flags = ane_t6021_td_flags_check(s->cpu[i],
+							    s->size[i]);
+	}
+	sha256_final(&sha, digest);
+	return td_flags;
+}
+
+/* The program takes the copies; @s keeps none. */
+static inline void ane_t6021_secs_give(struct ane_t6021_secs *s,
+				       struct ane_t6021_prog *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
+		p->sec[i] = s->mem[i];
+		p->sec_iova[i] = s->iova[i];
+		p->sec_size[i] = s->size[i];
+	}
+	memset(s, 0, sizeof(*s));
+}
+
+/*
+ * The section records of a LOAD_PROGRAM (0x200) into the zeroed command
+ * @cmd: one 0x30-byte record per section at its identity slot from +0x08,
+ * flags bit0 = 1, id at +0x04, iova at +0x18, size at +0x20. The same
+ * records serve the first load and every reload.
+ */
+static inline void ane_t6021_load_records(u8 *cmd,
+					  const struct ane_t6021_prog *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
+		u8 *rec = cmd + 0x8 + i * 0x30;
+
+		if (!p->sec[i])
+			continue;
+		*(__le32 *)(rec + 0x00) = cpu_to_le32(1);
+		*(__le32 *)(rec + 0x04) = cpu_to_le32(i + 1);
+		*(__le64 *)(rec + 0x18) = cpu_to_le64(p->sec_iova[i]);
+		*(__le64 *)(rec + 0x20) = cpu_to_le64(p->sec_size[i]);
+	}
+}
 
 struct ane_t6021_progtab {
 	struct ane_t6021_prog progs[ANE_T6021_MAX_PROGRAMS];
@@ -235,7 +332,7 @@ struct ane_t6021_fdprogs {
 struct ane_t6021_progtab_ops {
 	/* Unload from the firmware; zero only when every command was acked. */
 	int (*unload)(void *ctx, struct ane_t6021_prog *p);
-	/* The firmware no longer reads the sections: drop their references. */
+	/* The firmware no longer reads the sections: free their copies. */
 	void (*release)(void *ctx, struct ane_t6021_prog *p);
 	/* LOAD the program again; on success set fw_prog_id. */
 	int (*load)(void *ctx, struct ane_t6021_prog *p);
@@ -297,8 +394,8 @@ static inline bool ane_t6021_prog_unloadable(const struct ane_t6021_prog *p)
 
 /*
  * Claim a slot for a program about to be loaded. It starts HELD so nothing
- * can find it, and it owns the section references taken before the LOAD is
- * sent: if the LOAD fails, the buffers stay held with it. Make room in the
+ * can find it, and it owns the section copies given to it before the LOAD is
+ * sent: if the LOAD fails, the copies stay held with it. Make room in the
  * firmware before this: a restart frees unreferenced slots, this one too.
  */
 static inline struct ane_t6021_prog *
@@ -582,7 +679,7 @@ static inline int ane_t6021_progtab_ensure(struct ane_t6021_progtab *t,
 /*
  * A verified firmware restart dropped every program and process. Programs
  * no file holds are freed; held ones become LIVE and non-resident, keep
- * their kernel IDs and section references, and load again on next use.
+ * their kernel IDs and section copies, and load again on next use.
  */
 static inline void ane_t6021_progtab_restarted(struct ane_t6021_progtab *t,
 					       const struct ane_t6021_progtab_ops *ops,
@@ -652,7 +749,28 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  * overtake it, so only the RUN clear is tried. If STOPPED is not seen
  * nothing is powered off, and the caller keeps the instance quarantined
  * with every mapping and its power claim.
+ *
+ * A job that hangs the engine leaves the core busy: RUN clear never brings
+ * STOPPED (halt returns ANE_T6021_ASC_BUSY). Only an unplanned stop may then
+ * use the contain step, which replaces the STOPPED proof with a power-off of
+ * the CPU and engine domains through the power-domain framework (children
+ * first, the PMGR state machine doing each transition, address translation
+ * kept on). It never asserts a reset: a power-state reset of the live CPU
+ * domain resets the whole SoC. The power cycle that follows still has to
+ * read every domain back off, and the cold CPU must read STOPPED again
+ * before the firmware boots.
  */
+#define ANE_T6021_ASC_BUSY	1	/* RUN clear, STOPPED never seen */
+
+/*
+ * Module parameters hung_stop and hung_settle_ms, shared by the T8112 and
+ * H16 paths of ane_t6021.ko: whether a hung job's engine is powered off and
+ * cold-booted (1) or kept quarantined until reboot (0), and the extra wait
+ * before that power-off.
+ */
+extern unsigned int ane_t6021_hung_stop;
+extern unsigned int ane_t6021_hung_settle_ms;
+
 enum ane_t6021_restart_stage {
 	ANE_T6021_RESTART_STOP,		/* failed before power removal */
 	ANE_T6021_RESTART_CYCLE,	/* failed in the power cycle */
@@ -664,6 +782,7 @@ struct ane_t6021_restart_ops {
 	int (*power_down)(void *ctx);	/* POWER_DOWN taken by the firmware */
 	int (*wait_idle)(void *ctx);	/* bounded wait for WFI */
 	int (*halt)(void *ctx);		/* clear RUN, require STOPPED */
+	int (*contain)(void *ctx);	/* optional: busy core, unplanned only */
 	int (*power_cycle)(void *ctx);	/* domains verified off, then on */
 	int (*boot)(void *ctx);		/* cold boot and handshake */
 };
@@ -683,7 +802,14 @@ static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops
 		if (ret)
 			return ret;
 	}
-	return ops->halt(ctx);
+	ret = ops->halt(ctx);
+	if (ret != ANE_T6021_ASC_BUSY)
+		return ret;
+	/* A planned stop of an idle instance that will not stop is not a hang. */
+	if (planned || !ops->contain)
+		return -ETIMEDOUT;
+	ret = ops->contain(ctx);
+	return ret == -EOPNOTSUPP ? -ETIMEDOUT : ret;
 }
 
 static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,

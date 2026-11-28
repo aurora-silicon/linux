@@ -243,10 +243,45 @@ impl Drop for Lease {
 
 /// Registration lifetime belongs to the file's VM handle, not the VM clone
 /// retained by the callback. Unregister synchronously before dropping the clone.
+///
+/// A VM has two shrinkers. The first purges advised contents and releases the
+/// idle objects userspace did not ask to keep, in step with the rest of
+/// reclaim. The second releases the objects userspace asked to keep resident
+/// (DRM_IOCTL_ASAHI_GEM_RESIDENCY) as well, after the others, and the shrinker
+/// core calls its scan only for a pass that is to scan everything it counted:
+/// see `KEPT_BATCH`.
+///
+/// Neither is memcg-aware: reclaim inside a memory cgroup below the root does
+/// not call them, so only reclaim on behalf of the whole system releases GPU
+/// memory. Both release idle backing only of a VM that passes the gate's
+/// test (`Gate::try_reclaim`): no lease held, none released for
+/// `RECLAIM_QUIET_NS`, and the backoff after a restoration over. Userspace's
+/// request to keep an object is thus an order among the objects that these
+/// shrinkers may release, and no more.
 pub(crate) struct VmShrinker {
     vm: crate::mmu::Vm,
     raw: *mut kernel::bindings::shrinker,
+    kept: *mut kernel::bindings::shrinker,
 }
+
+/// The batch of the shrinker of kept objects: more than a scan target can be.
+///
+/// The shrinker core scans a shrinker when the target it worked out reaches the
+/// batch, or reaches everything the shrinker counted. The target is the count
+/// scaled down by the reclaim priority (at most twice the count, at the last
+/// priority), so with this batch only the second case is left: the target of
+/// the last two of the thirteen priorities, or of the last three once scans
+/// deferred by earlier passes have built up. A pass at an earlier priority
+/// does not scan kept objects.
+///
+/// Reclaim works down the priorities only as far as it must to free what it
+/// was asked for. It comes to the last ones when the page cache, the other
+/// shrinkers and this VM's first one did not give that much at the
+/// priorities before: under memory pressure that nothing else relieves, and
+/// also for a request that names more than the system has to spare (a reclaim
+/// request to the root memory cgroup, say). Dropping the slab caches
+/// (`drop_caches`) runs every shrinker at the last priority at once.
+const KEPT_BATCH: kernel::ffi::c_long = kernel::ffi::c_long::MAX;
 
 // SAFETY: shrinker core serializes registration lifetime; callback VM operations
 // use its residency/reservation locks. raw is never dereferenced after free.
@@ -261,6 +296,7 @@ impl VmShrinker {
             Self {
                 vm: vm.clone(),
                 raw: core::ptr::null_mut(),
+                kept: core::ptr::null_mut(),
             },
             GFP_KERNEL,
         )?;
@@ -271,14 +307,29 @@ impl VmShrinker {
             return Err(ENOMEM);
         }
         owner.raw = raw;
-        // SAFETY: Newly allocated/unregistered shrinker is exclusively owned.
+        // SAFETY: As above.
+        let kept =
+            unsafe { kernel::bindings::shrinker_alloc(0, c_str!("aurora-kept-vm").as_char_ptr()) };
+        if kept.is_null() {
+            return Err(ENOMEM);
+        }
+        owner.kept = kept;
+        // SAFETY: Newly allocated/unregistered shrinkers are exclusively owned. The
+        // shrinker of kept objects is registered second: a reclaim pass that reaches it
+        // has asked this VM's first shrinker before.
         unsafe {
             (*raw).count_objects = Some(Self::count);
             (*raw).scan_objects = Some(Self::scan);
             (*raw).private_data = core::ptr::from_ref(&*owner).cast_mut().cast();
             (*raw).seeks = 2;
             (*raw).batch = 256;
+            (*kept).count_objects = Some(Self::count_kept);
+            (*kept).scan_objects = Some(Self::scan_kept);
+            (*kept).private_data = core::ptr::from_ref(&*owner).cast_mut().cast();
+            (*kept).seeks = 2;
+            (*kept).batch = KEPT_BATCH;
             kernel::bindings::shrinker_register(raw);
+            kernel::bindings::shrinker_register(kept);
         }
         Ok(owner)
     }
@@ -295,7 +346,21 @@ impl VmShrinker {
     ) -> kernel::ffi::c_ulong {
         // SAFETY: The registration owns this stable allocation until callbacks drain.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        owner.vm.idle_reclaim_count()
+        owner.vm.idle_reclaim_count(false)
+    }
+
+    /// Count the reclaimable pages of the objects userspace asked to keep resident.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::count`].
+    unsafe extern "C" fn count_kept(
+        raw: *mut kernel::bindings::shrinker,
+        _sc: *mut kernel::bindings::shrink_control,
+    ) -> kernel::ffi::c_ulong {
+        // SAFETY: The registration owns this stable allocation until callbacks drain.
+        let owner = unsafe { &*((*raw).private_data as *const Self) };
+        owner.vm.idle_reclaim_count(true)
     }
 
     /// Reclaim idle pages.
@@ -312,16 +377,35 @@ impl VmShrinker {
         let owner = unsafe { &*((*raw).private_data as *const Self) };
         // SAFETY: The shrinker core supplies a live initialized control.
         let target = unsafe { (*sc).nr_to_scan };
-        owner.vm.reclaim_idle_pages(target)
+        owner.vm.reclaim_idle_pages(target, false)
+    }
+
+    /// Reclaim idle pages for a pass that scans everything: the objects userspace asked to
+    /// keep resident too, after the others.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::scan`].
+    unsafe extern "C" fn scan_kept(
+        raw: *mut kernel::bindings::shrinker,
+        sc: *mut kernel::bindings::shrink_control,
+    ) -> kernel::ffi::c_ulong {
+        // SAFETY: Both pointers are supplied by the registered shrinker core.
+        let owner = unsafe { &*((*raw).private_data as *const Self) };
+        // SAFETY: The shrinker core supplies a live initialized control.
+        let target = unsafe { (*sc).nr_to_scan };
+        owner.vm.reclaim_idle_pages(target, true)
     }
 }
 
 impl Drop for VmShrinker {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            // SAFETY: This owns the sole registration; free drains callbacks
-            // before the embedded VM and callback private_data can disappear.
-            unsafe { kernel::bindings::shrinker_free(self.raw) };
+        for raw in [self.kept, self.raw] {
+            if !raw.is_null() {
+                // SAFETY: This owns the sole registration; free drains callbacks
+                // before the embedded VM and callback private_data can disappear.
+                unsafe { kernel::bindings::shrinker_free(raw) };
+            }
         }
     }
 }
@@ -356,7 +440,10 @@ impl Vm {
             .transpose()
     }
 
-    pub(crate) fn idle_reclaim_count(&self) -> usize {
+    /// The pages reclaim could release now: with `kept`, those of the idle objects userspace
+    /// asked to keep resident; without, those of the other idle objects and of every object
+    /// whose contents userspace advised away, kept or not.
+    pub(crate) fn idle_reclaim_count(&self, kept: bool) -> usize {
         let Some(gate) = self.residency.as_ref() else {
             return 0;
         };
@@ -386,7 +473,12 @@ impl Vm {
                 (advised || object.has_sg_table_locked())
                     && object.unleased_pages_releasable_locked()
             };
-            if object.idle_reclaim_candidate() && (advised || idle) && releasable {
+            let counted = if advised {
+                !kept
+            } else {
+                idle && object.keep_resident() == kept
+            };
+            if object.idle_reclaim_candidate() && counted && releasable {
                 pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(true)
@@ -475,7 +567,10 @@ impl Vm {
         purged
     }
 
-    pub(crate) fn reclaim_idle_pages(&self, target: usize) -> usize {
+    /// Releases idle backing until `target` pages are free: contents userspace advised away
+    /// first, then the objects it did not ask to keep resident and, only with `kept` and only
+    /// if those did not reach the target, the objects it did.
+    pub(crate) fn reclaim_idle_pages(&self, target: usize, kept: bool) -> usize {
         let Some(gate) = self.residency.as_ref() else {
             return 0;
         };
@@ -508,50 +603,58 @@ impl Vm {
         };
         let contexts = shared.contexts_naming_root(inner.ttb(), inner.uat_inner.m4_adopted);
         let mut unpinned = 0usize;
-        // SAFETY: Exclusive residency and the private reservation exclude jobs,
-        // binding edits and retirement. Callbacks change PTEs/flags only; all
-        // logical aliases stay linked and retain their borrowed BO/GEM.
-        let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
-            if unpinned >= target { return Ok(false); }
-            let object = bo.obj();
-            if !object.idle_reclaim_candidate() { return Ok(true); }
-            {
-                // Avoid inversion against preparation (VmBoInner -> resv).
-                let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                let releasable = if segments.is_some() {
-                    object.sole_sg_lease_releasable_locked()
-                } else {
-                    // A competing lease may have made the previous release fail after we
-                    // dropped our segments. Retry that table, but do not count empty backing.
-                    object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
-                };
-                if !releasable { return Ok(true); }
-            }
-            // The association retains SG backing until *all* aliases have
-            // been invalidated and their device translations flushed. A
-            // contended cursor or PTE failure retains backing and the touched
-            // INVALIDATED prefix for restoration or a later reclaim attempt.
-            inner.invalidate_private_bo_mappings(bo, |inner, start, range| {
-                reclaim.mark_changed();
-                let end = start.checked_add(range).ok_or(EOVERFLOW)?;
-                let _change = inner.mapping_mutation();
-                inner.page_table.discard_partial_map(start..end)?;
-                inner.tlbi_context_mask(start, range as usize, contexts);
-                Ok(())
-            })?;
-            {
-                let Some(mut segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                *segments = None;
-            }
-            // Every private GPUVA alias was removed from the device page
-            // tables above. Kernel mappings and other SG owners are excluded;
-            // the C/Rust backing helper rechecks exclusion before release.
-            if object.release_idle_pages_locked().is_ok() {
-                crate::gem::set_mapping_held(object, false);
-                unpinned = unpinned.saturating_add(object.size() / kernel::page::PAGE_SIZE);
-            }
-            Ok(unpinned < target)
-        }) };
+        // Kept objects go in a second pass, when the first left the target unmet.
+        for keep_pass in [false, true] {
+            if unpinned >= target || (keep_pass && !kept) { break; }
+            // SAFETY: Exclusive residency and the private reservation exclude jobs,
+            // binding edits and retirement. Callbacks change PTEs/flags only; all
+            // logical aliases stay linked and retain their borrowed BO/GEM.
+            let _ = unsafe { inner.for_each_private_bo(|inner, bo| {
+                if unpinned >= target { return Ok(false); }
+                let object = bo.obj();
+                if !object.idle_reclaim_candidate() || object.keep_resident() != keep_pass {
+                    return Ok(true);
+                }
+                {
+                    // Avoid inversion against preparation (VmBoInner -> resv).
+                    let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
+                    let releasable = if segments.is_some() {
+                        object.sole_sg_lease_releasable_locked()
+                    } else {
+                        // A competing lease may have made the previous release fail after we
+                        // dropped our segments. Retry that table, but do not count empty backing.
+                        object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
+                    };
+                    if !releasable { return Ok(true); }
+                }
+                // The association retains SG backing until *all* aliases have
+                // been invalidated and their device translations flushed. A
+                // contended cursor or PTE failure retains backing and the touched
+                // INVALIDATED prefix for restoration or a later reclaim attempt.
+                inner.invalidate_private_bo_mappings(bo, |inner, start, range| {
+                    reclaim.mark_changed();
+                    let end = start.checked_add(range).ok_or(EOVERFLOW)?;
+                    let _change = inner.mapping_mutation();
+                    inner.page_table.discard_partial_map(start..end)?;
+                    inner.tlbi_context_mask(start, range as usize, contexts);
+                    Ok(())
+                })?;
+                {
+                    let Some(mut segments) = bo.data().segments.try_lock() else {
+                        return Ok(true);
+                    };
+                    *segments = None;
+                }
+                // Every private GPUVA alias was removed from the device page
+                // tables above. Kernel mappings and other SG owners are excluded;
+                // the C/Rust backing helper rechecks exclusion before release.
+                if object.release_idle_pages_locked().is_ok() {
+                    crate::gem::set_mapping_held(object, false);
+                    unpinned = unpinned.saturating_add(object.size() / kernel::page::PAGE_SIZE);
+                }
+                Ok(unpinned < target)
+            }) };
+        }
         drop(shared);
         drop(inner);
 

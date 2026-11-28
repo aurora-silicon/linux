@@ -208,3 +208,50 @@ __DMA_ATTR_ALLOC_CC_SHARED differs from DMA_ATTR_CC_SHARED in that it is not
 a caller-visible DMA API attribute. DMA_ATTR_CC_SHARED describes an
 already-shared mapping and requires the caller to have prepared normal
 system memory before mapping it.
+
+DMA_ATTR_NO_BOUNCE
+------------------
+
+A mapping request with DMA_ATTR_NO_BOUNCE fails where the DMA core could
+only satisfy it through a bounce buffer (SWIOTLB): a successful mapping
+gives the device the memory that was passed in, never a copy of it. This
+is for callers whose device and CPU must see the same memory for as long
+as the mapping exists, with no synchronization points in between, such as
+long-lived mappings of pinned userspace memory.
+
+The request fails for memory that the device cannot address, where
+bouncing is forced (swiotlb=force, a restricted DMA pool, a device that
+needs unencrypted memory), for a kmalloc() buffer that is too small to be
+aligned for DMA to a device that is not DMA coherent, and for a buffer
+that is not aligned to the IOMMU granule of an untrusted device. It also
+fails for a device that is mapped by DMA operations of its own (struct
+dma_map_ops), since the DMA core cannot tell what those map onto.
+
+A refused request logs nothing, whether or not the system has a SWIOTLB
+that could have made the mapping: a driver may pass on requests of
+unprivileged callers for memory it knows nothing about. What each mapping
+function returns for it:
+
+- dma_map_page_attrs(), dma_map_single_attrs() and dma_map_phys():
+  DMA_MAPPING_ERROR, to be tested with dma_mapping_error().
+- dma_map_sg_attrs(): 0.
+- dma_map_sgtable(): -EIO where a bounce buffer would have been needed,
+  -EOPNOTSUPP for a device with DMA operations of its own. -EIO is the
+  error of any segment that cannot be mapped, so it does not tell a
+  refused bounce buffer from another mapping failure. Segments mapped
+  before the refused one are unmapped again.
+- dma_iova_link(): -EPERM.
+
+DMA_ATTR_NO_BOUNCE differs from DMA_ATTR_REQUIRE_COHERENT in that it does
+not require the device to be DMA coherent and does not change CPU cache
+maintenance: caches are synchronized at map, sync and unmap time as for
+any other mapping, unless DMA_ATTR_SKIP_CPU_SYNC is given as well. It
+says nothing about whether the device is coherent with the CPU caches.
+
+The attribute is a property of a mapping request and nothing else looks
+at it. The allocation functions (dma_alloc_attrs(), dma_alloc_pages(),
+dma_alloc_noncontiguous()), dma_mmap_attrs() and dma_get_sgtable_attrs()
+ignore it. So do the unmap and sync functions: no bounce buffer stands
+behind a mapping that was made with it. A DMA_ATTR_MMIO mapping
+(dma_map_resource()) is never bounced, and the attribute changes nothing
+for it on a device that the DMA core maps itself.

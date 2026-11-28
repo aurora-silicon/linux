@@ -971,7 +971,8 @@ work="$FAKE/preparation"
 mkdir -p "$work"
 touch "$work/$(m3_pro_mesa_file)" "$work/unrelated.pkg.tar.zst" "$work/transaction.conf"
 python3() {
-  if [[ $1 == "$work/frozen-dependencies.py" ]]; then
+  if [[ $1 == -I && $2 == "$work/frozen-dependencies.py" ]]; then
+    shift
     printf 'planner-arg:%s\\n' "$@" >>"$FAKE/log"
     printf '{"transaction_config":"%s/transaction.conf","candidate_sha256":{"%s/%s":"fixture"},"dependencies":[{"file":"%s/approved.pkg.tar.gz"}]}' "$work" "$work" "$(m3_pro_mesa_file)" "$work"
   else command python3 "$@"; fi

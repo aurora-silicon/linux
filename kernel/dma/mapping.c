@@ -174,6 +174,9 @@ dma_addr_t dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 		return DMA_MAPPING_ERROR;
 	else if (use_dma_iommu(dev))
 		addr = iommu_dma_map_phys(dev, phys, size, dir, attrs);
+	else if (attrs & DMA_ATTR_NO_BOUNCE)
+		/* What the device's own operations map is not known here */
+		return DMA_MAPPING_ERROR;
 	else if (ops->map_phys)
 		addr = ops->map_phys(dev, phys, size, dir, attrs);
 
@@ -256,6 +259,9 @@ static int __dma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
 		ents = dma_direct_map_sg(dev, sg, nents, dir, attrs);
 	else if (use_dma_iommu(dev))
 		ents = iommu_dma_map_sg(dev, sg, nents, dir, attrs);
+	else if (attrs & DMA_ATTR_NO_BOUNCE)
+		/* What the device's own operations map is not known here */
+		return -EOPNOTSUPP;
 	else
 		ents = ops->map_sg(dev, sg, nents, dir, attrs);
 
@@ -327,6 +333,11 @@ EXPORT_SYMBOL(dma_map_sg_attrs);
  *			DMA_MAPPING_ERROR.
  *   -EREMOTEIO		The DMA device cannot access P2PDMA memory specified
  *			in the sg_table. This will not succeed if retried.
+ *   -EOPNOTSUPP	The device cannot be given a mapping with a property
+ *			that @attrs require: DMA_ATTR_REQUIRE_COHERENT for a
+ *			device that is not DMA coherent, DMA_ATTR_NO_BOUNCE
+ *			for a device that is mapped by DMA operations of its
+ *			own. Will not succeed if retried.
  */
 int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
 		    enum dma_data_direction dir, unsigned long attrs)
