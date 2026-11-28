@@ -241,6 +241,27 @@ impl<T: DriverObject> Object<T> {
         let _ = unsafe { KBox::from_raw(this) };
     }
 
+    /// `pages_changed` callback of the C helpers, for drivers that implement
+    /// [`DriverObject::pages_changed`].
+    extern "C" fn pages_changed_callback(
+        shmem: *mut bindings::drm_gem_shmem_object,
+        present: bool,
+    ) {
+        // SAFETY: The C helpers pass a live shmem object of this driver, with its reservation lock
+        // held. Every GEM object of the driver is an `Object<T>` (see `create_object_callback()`).
+        let obj: &gem::DriverAllocImpl<T> =
+            unsafe { IntoGEMObject::from_raw(&raw mut (*shmem).base) };
+        T::pages_changed(obj, present);
+    }
+
+    /// The `pages_changed` callback to install in a new object.
+    const PAGES_CHANGED: Option<unsafe extern "C" fn(*mut bindings::drm_gem_shmem_object, bool)> =
+        if T::HAS_PAGES_CHANGED {
+            Some(Self::pages_changed_callback)
+        } else {
+            None
+        };
+
     extern "C" fn refuse_export_callback(
         _obj: *mut bindings::drm_gem_object,
         _flags: i32,
@@ -405,6 +426,9 @@ impl<T: DriverObject> Object<T> {
         // SAFETY: The object is initialized but not published. The C initializer
         // reads this policy when setting up the backing mapping's GFP mask.
         unsafe { (*new.as_raw_shmem()).pages_bounded_reclaim = config.pages_bounded_reclaim };
+
+        // SAFETY: The object is not published yet; the C helpers read this only once it has pages.
+        unsafe { (*new.as_raw_shmem()).pages_changed = Self::PAGES_CHANGED };
 
         // SAFETY: The arguments are all valid via the type invariants.
         to_result(unsafe { bindings::drm_gem_shmem_init(dev.as_raw(), new.as_raw_shmem(), size) })?;
@@ -589,6 +613,7 @@ impl<T: DriverObject> Object<T> {
         unsafe {
             let obj = (*new).obj.get();
             (*obj).base.funcs = &Self::VTABLE;
+            (*obj).pages_changed = Self::PAGES_CHANGED;
             &raw mut (*obj).base
         }
     }
@@ -1095,6 +1120,7 @@ mod tests {
         io::Io,
         page::PAGE_SIZE, //
     };
+    use core::sync::atomic::AtomicBool;
 
     // The bare minimum needed to create a fake drm driver for kunit
 
@@ -1103,7 +1129,12 @@ mod tests {
     struct KunitDriver;
     struct KunitFile;
     #[pin_data]
-    struct KunitObject {}
+    struct KunitObject {
+        /// Whether `pages_changed` last reported the pages present.
+        present: AtomicBool,
+        /// How often `pages_changed` was called.
+        changes: AtomicUsize,
+    }
 
     const INFO: drm::DriverInfo = drm::DriverInfo {
         major: 0,
@@ -1137,7 +1168,15 @@ mod tests {
             _size: usize,
             _args: Self::Args,
         ) -> impl PinInit<Self, Error> {
-            try_pin_init!(KunitObject {})
+            try_pin_init!(KunitObject {
+                present: AtomicBool::new(false),
+                changes: AtomicUsize::new(0),
+            })
+        }
+
+        fn pages_changed(obj: &Object<KunitObject>, present: bool) {
+            obj.present.store(present, Ordering::Release);
+            obj.changes.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1229,6 +1268,31 @@ mod tests {
         assert_eq!(obj.sgt_access.load(Ordering::Acquire), 1);
         drop(second);
         assert_eq!(obj.sgt_access.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pages_changed_spans_every_holder() -> Result {
+        let (dev, drm) = create_drm_dev()?;
+        let obj = Object::<KunitObject>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
+        assert!(!obj.present.load(Ordering::Acquire));
+        let vmap = obj.vmap::<4>()?;
+        assert!(obj.present.load(Ordering::Acquire));
+        let table = obj.sg_table(dev.as_ref().as_ref())?.into_lease();
+        drop(vmap);
+        // The device SG table still holds the pages.
+        assert!(obj.present.load(Ordering::Acquire));
+        drop(table);
+        {
+            let _guard = DmaResvGuard::new(&obj);
+            // SAFETY: Reservation held; no device mappings or SG leases exist in this test.
+            unsafe { obj.release_idle_pages_locked()? };
+        }
+        assert!(!obj.present.load(Ordering::Acquire));
+        assert_eq!(obj.changes.load(Ordering::Acquire), 2);
+        drop(obj.vmap::<4>()?);
+        assert!(!obj.present.load(Ordering::Acquire));
+        assert_eq!(obj.changes.load(Ordering::Acquire), 4);
         Ok(())
     }
 

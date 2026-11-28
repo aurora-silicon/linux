@@ -283,6 +283,9 @@ static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
 
 	refcount_set(&shmem->pages_use_count, 1);
 
+	if (shmem->pages_changed)
+		shmem->pages_changed(shmem, true);
+
 	return 0;
 }
 
@@ -310,6 +313,9 @@ void drm_gem_shmem_put_pages_locked(struct drm_gem_shmem_object *shmem)
 		shmem->pages = NULL;
 		shmem->pages_mark_accessed_on_put = false;
 		shmem->pages_mark_dirty_on_put = false;
+
+		if (shmem->pages_changed)
+			shmem->pages_changed(shmem, false);
 	}
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_put_pages_locked);

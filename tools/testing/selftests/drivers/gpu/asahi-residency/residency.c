@@ -6,6 +6,13 @@
  * objects) and what reclaim does with kept objects. No GPU work is submitted.
  * Skipped where the render node is not this driver's or lacks the feature.
  *
+ * The objects cases check what a client and its process are charged for an
+ * object that CPU mappings, dma-buf mappings and the imports of other drivers
+ * hold. They need only an asahi render node. On GPUs whose driver prepares a
+ * new object for the device, the backing is held from creation, and so
+ * charged until the object is freed; the cases take what an object holds
+ * once created as its own share.
+ *
  * The cases that make the kernel reclaim memory act on the whole system.
  * They need root and run only when asked for in the environment:
  *
@@ -83,10 +90,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/magic.h>
@@ -175,6 +184,22 @@ static long long client_resident(int fd)
 	}
 	fclose(f);
 	return value;
+}
+
+/* RssShmem of this process in bytes, which includes the objects it is charged for. */
+static long long rss_shmem(void)
+{
+	char line[256];
+	long long kb = -1;
+	FILE *f = fopen("/proc/self/status", "r");
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "RssShmem: %lld kB", &kb) == 1)
+			break;
+	fclose(f);
+	return kb < 0 ? -1 : kb << 10;
 }
 
 /* MemAvailable in bytes. */
@@ -870,6 +895,64 @@ static int is_asahi(int fd)
 	return !ioc(fd, DRM_IOCTL_VERSION, &version) && !strcmp(name, "aurora");
 }
 
+/* Exports @handle as a dma-buf: returns its file descriptor, or -errno. */
+static int export_object(int fd, uint32_t handle)
+{
+	struct drm_prime_handle args = {
+		.handle = handle, .flags = DRM_CLOEXEC | DRM_RDWR,
+	};
+	int ret = ioc(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &args);
+
+	return ret ? ret : args.fd;
+}
+
+/* Maps the first @size bytes of @handle shared, or returns MAP_FAILED. */
+static void *map_object(int fd, uint32_t handle, size_t size)
+{
+	struct drm_asahi_gem_mmap_offset args = { .handle = handle };
+
+	if (ioc(fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &args))
+		return MAP_FAILED;
+	return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+		    args.offset);
+}
+
+/*
+ * Imports the dma-buf @buf into the first DRM node of another driver that
+ * takes it, through a file of its own: returns that file, with the handle of
+ * the import in *@handle, or -1.
+ */
+static int foreign_import(int buf, uint32_t *handle)
+{
+	static const struct {
+		const char *format;
+		int first;
+	} nodes[] = {
+		{ "/dev/dri/renderD%d", 128 },
+		{ "/dev/dri/card%d", 0 },
+	};
+	char path[32];
+
+	for (size_t n = 0; n < ARRAY_SIZE(nodes); n++) {
+		for (int i = nodes[n].first; i < nodes[n].first + 64; i++) {
+			struct drm_prime_handle args = { .fd = buf };
+			int fd;
+
+			snprintf(path, sizeof(path), nodes[n].format, i);
+			fd = open(path, O_RDWR | O_CLOEXEC);
+			if (fd < 0)
+				continue;
+			if (!is_asahi(fd) &&
+			    !ioc(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &args)) {
+				*handle = args.handle;
+				return fd;
+			}
+			close(fd);
+		}
+	}
+	return -1;
+}
+
 FIXTURE(asahi)
 {
 	int fd;
@@ -1088,6 +1171,157 @@ TEST_F(asahi, shared_objects_take_the_flag)
 	EXPECT_EQ(0, residency(self->fd, bo.handle, 0));
 	EXPECT_EQ(kept0, gpu_memory_field("user_kept"));
 	close_handle(self->fd, bo.handle);
+}
+
+/* A client, for the cases that need nothing but objects. */
+FIXTURE(objects)
+{
+	int fd;
+};
+
+/*
+ * What the object of @size bytes just created holds by itself, of what the
+ * client behind @fd holds: nothing, or all of it where the driver prepares
+ * new objects for the device. -1 if neither.
+ */
+static long long created_share(int fd, long long resident0, uint64_t size)
+{
+	long long share = client_resident(fd) - resident0;
+
+	return share == 0 || share == (long long)size ? share : -1;
+}
+
+FIXTURE_SETUP(objects)
+{
+	self->fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	if (self->fd < 0 || !is_asahi(self->fd))
+		SKIP(return, "renderD128 is not an asahi render node");
+}
+
+FIXTURE_TEARDOWN(objects)
+{
+	if (self->fd >= 0)
+		close(self->fd);
+}
+
+/*
+ * A CPU mapping holds all of an object's pages, however little of it is
+ * mapped, and so does a mapping of its dma-buf and the copy of a mapping
+ * that a child inherits: the object is charged to its client and to the
+ * process that created it from the first of them to the release of the
+ * last, and once only.
+ */
+TEST_F(objects, cpu_mappings_hold_the_backing)
+{
+	const uint64_t size = 64 * PAGE;
+	struct drm_asahi_gem_create bo = { .size = size };
+	long long resident0 = client_resident(self->fd), rss0 = rss_shmem();
+	const long long resident = resident0 + (long long)size;
+	const long long rss = rss0 + (long long)size;
+	int ready[2], exit_now[2], buf, status;
+	char *map, *buf_map, c = 0;
+	long long share;
+	pid_t child;
+
+	ASSERT_GE(resident0, 0);
+	ASSERT_GE(rss0, 0);
+	ASSERT_EQ(0, ioc(self->fd, DRM_IOCTL_ASAHI_GEM_CREATE, &bo));
+	share = created_share(self->fd, resident0, size);
+	ASSERT_LE(0, share);
+	EXPECT_EQ(rss0 + share, rss_shmem());
+
+	map = map_object(self->fd, bo.handle, PAGE);
+	ASSERT_NE(MAP_FAILED, map);
+	map[0] = 1;
+	EXPECT_EQ(resident, client_resident(self->fd));
+	EXPECT_EQ(rss, rss_shmem());
+
+	buf = export_object(self->fd, bo.handle);
+	ASSERT_LE(0, buf);
+	buf_map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, buf, 0);
+	ASSERT_NE(MAP_FAILED, buf_map);
+	EXPECT_EQ(1, buf_map[0]);
+	EXPECT_EQ(resident, client_resident(self->fd));
+	ASSERT_EQ(0, munmap(map, PAGE));
+	EXPECT_EQ(resident, client_resident(self->fd));
+
+	ASSERT_EQ(0, pipe(ready));
+	ASSERT_EQ(0, pipe(exit_now));
+	child = fork();
+	ASSERT_LE(0, child);
+	if (!child) {
+		/* The child holds its copy of the mapping until told to exit. */
+		close(ready[0]);
+		close(exit_now[1]);
+		if (write(ready[1], &c, 1) != 1 || read(exit_now[0], &c, 1) < 0)
+			_exit(1);
+		_exit(buf_map[0] == 1 ? 0 : 1);
+	}
+	close(ready[1]);
+	close(exit_now[0]);
+	ASSERT_EQ(1, read(ready[0], &c, 1));
+	ASSERT_EQ(0, munmap(buf_map, size));
+	EXPECT_EQ(resident, client_resident(self->fd));
+	EXPECT_EQ(rss, rss_shmem());
+	close(exit_now[1]);
+	ASSERT_EQ(child, waitpid(child, &status, 0));
+	EXPECT_TRUE(WIFEXITED(status) && !WEXITSTATUS(status));
+	close(ready[0]);
+	EXPECT_EQ(resident0 + share, client_resident(self->fd));
+	EXPECT_EQ(rss0 + share, rss_shmem());
+
+	close(buf);
+	close_handle(self->fd, bo.handle);
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	EXPECT_EQ(rss0, rss_shmem());
+}
+
+/*
+ * An import of the object's dma-buf by a device of another driver pins its
+ * pages: the object is charged to its client from the first import to the
+ * release of the last, which may come after the client closed its handle.
+ * Skipped where no DRM device of another driver imports it.
+ */
+TEST_F(objects, foreign_imports_hold_the_backing)
+{
+	/* One page, which any importer can map contiguously. */
+	const uint64_t size = PAGE;
+	struct drm_asahi_gem_create bo = { .size = size };
+	long long resident0 = client_resident(self->fd), rss0 = rss_shmem();
+	const long long resident = resident0 + (long long)size;
+	uint32_t first_handle, second_handle;
+	int buf, first, second;
+
+	ASSERT_GE(resident0, 0);
+	ASSERT_GE(rss0, 0);
+	ASSERT_EQ(0, ioc(self->fd, DRM_IOCTL_ASAHI_GEM_CREATE, &bo));
+	buf = export_object(self->fd, bo.handle);
+	ASSERT_LE(0, buf);
+	/* A dma-buf holds the object, not its pages. */
+	ASSERT_LE(0, created_share(self->fd, resident0, size));
+	first = foreign_import(buf, &first_handle);
+	if (first < 0) {
+		close(buf);
+		close_handle(self->fd, bo.handle);
+		SKIP(return, "no DRM device of another driver imports the dma-buf");
+	}
+	EXPECT_EQ(resident, client_resident(self->fd));
+	EXPECT_EQ(rss0 + (long long)size, rss_shmem());
+	second = foreign_import(buf, &second_handle);
+	ASSERT_LE(0, second);
+	EXPECT_EQ(resident, client_resident(self->fd));
+
+	/* The imports keep the object, and its charge, without the client's handle. */
+	close(buf);
+	close_handle(self->fd, bo.handle);
+	EXPECT_EQ(resident, client_resident(self->fd));
+	close_handle(first, first_handle);
+	close(first);
+	EXPECT_EQ(resident, client_resident(self->fd));
+	close_handle(second, second_handle);
+	close(second);
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	EXPECT_EQ(rss0, rss_shmem());
 }
 
 /*

@@ -81,19 +81,21 @@ pub(crate) struct AsahiObject {
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 
-/// Marks whether the pages of `gem` are held for the device.
+/// Marks whether the pages of `gem` are held.
 ///
-/// Populated asahi objects keep their pages referenced (device SG table, kernel vmap or a PFN
-/// CPU mapping), so the pages cannot migrate. Unmarked, the compaction migrate scanner still
+/// It follows the object's shmem page array ([`AsahiObject::pages_changed`]). Every holder of
+/// that array keeps its pages referenced (a device SG table, a kernel vmap, a PFN CPU mapping or
+/// a dma-buf pin), so the pages cannot migrate. Unmarked, the compaction migrate scanner still
 /// isolates them from the unevictable LRU and every migration fails. The shmem mapping of a
 /// held object is therefore marked inaccessible, which compaction and migration check and which
 /// comes with unevictable, as `mapping_set_inaccessible()` sets it; nothing reads or writes a GEM
-/// shmem file through its mapping. Releasing idle backing or purging clears the mark, so the
-/// released pages can be swapped and migrated again.
+/// shmem file through its mapping. Releasing the array (the last holder gone, idle backing
+/// released or the object purged) clears the mark, so the released pages can be swapped and
+/// migrated again.
 ///
 /// The same transitions charge and uncharge the held pages (see [`memacct`]): a held user object
 /// counts towards the resident set of the process that created it.
-pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
+fn set_mapping_held(gem: &Object, held: bool) {
     let raw = gem.as_raw();
     // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
     // `f_mapping` are set at initialization and never change; imported objects have none.
@@ -121,8 +123,8 @@ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
     gem.charge.set_held(held);
 }
 
-/// Takes the SG table of `gem`, which holds its pages for the device, and marks the
-/// object held (see [`set_mapping_held`]).
+/// Takes the SG table of `gem`, which holds its pages for the device (and so the object, see
+/// [`set_mapping_held`]).
 ///
 /// For mappings the driver creates for itself or the firmware (kernel aliases, timestamp
 /// buffers, firmware structures), which user-memory objects never back: those are refused.
@@ -160,9 +162,7 @@ pub(crate) fn mapped_sg_table<'a>(
     gem: &'a Object,
     dev: &'a kernel::device::Device<kernel::device::Bound>,
 ) -> Result<shmem::SGTable<'a, AsahiObject>> {
-    let sgt = gem.sg_table(dev)?;
-    set_mapping_held(gem, true);
-    Ok(sgt)
+    gem.sg_table(dev)
 }
 
 /// VM-private BOs share their assigned VM's reservation object. Validate this
@@ -350,7 +350,6 @@ fn new_kernel_object_mapped(
         },
     )?;
 
-    set_mapping_held(&gem, true);
     mod_pr_debug!("AsahiObject new kernel object id={}\n", gem.id);
     Ok(ObjectRef::new(gem))
 }
@@ -653,6 +652,14 @@ impl DriverObject for AsahiObject {
         if file::File::unbind_gem_object(file, obj).is_err() {
             pr_err!("AsahiObject::close: Failed to unbind GEM object\n");
         }
+    }
+
+    /// The page array of `obj` was populated or released: its backing is held from the first
+    /// holder of the array to the last (see [`set_mapping_held`]). That includes the holders the
+    /// generic shmem helpers create, CPU mappings, dma-buf pins and kernel vmaps, as well as the
+    /// SG tables of device mappings.
+    fn pages_changed(obj: &<Self::Driver as drm::Driver>::Object, present: bool) {
+        set_mapping_held(obj, present);
     }
 
     /// Optional handle for exporting a gem object.

@@ -555,7 +555,6 @@ impl Vm {
                 *segments = None;
             }
             if object.purge_locked().is_ok() {
-                crate::gem::set_mapping_held(object, false);
                 purged = purged.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             } else {
                 gate.note_evicted();
@@ -649,7 +648,6 @@ impl Vm {
                 // tables above. Kernel mappings and other SG owners are excluded;
                 // the C/Rust backing helper rechecks exclusion before release.
                 if object.release_idle_pages_locked().is_ok() {
-                    crate::gem::set_mapping_held(object, false);
                     unpinned = unpinned.saturating_add(object.size() / kernel::page::PAGE_SIZE);
                 }
                 Ok(unpinned < target)
