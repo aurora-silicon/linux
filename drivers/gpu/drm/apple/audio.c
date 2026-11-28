@@ -250,6 +250,7 @@ static void dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
 	sieve->nchans = GENMASK(c->max, c->min);
 	sieve->formats = f->bits[0] | ((u64) f->bits[1]) << 32; /* TODO: don't open-code */
 
+	sieve->rates = 0;
 	for (i = 0; i < snd_pcm_known_rates.count; i++) {
 		unsigned int rate = snd_pcm_known_rates.list[i];
 
