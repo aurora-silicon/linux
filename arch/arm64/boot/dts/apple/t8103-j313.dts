@@ -183,6 +183,17 @@
 	status = "okay";
 };
 
+/*
+ * The J313 ADT does not describe fabric or display-scanout DCS floors. Visual
+ * testing on the internal 2560x1600@60Hz panel showed fabric=1 with DCS
+ * p-states 6, 5, and 4 keeps scanout clean while DCS p-state 3 starves and
+ * latches disp0 blank.
+ */
+&pmgr_misc {
+	apple,fabric-min-pstate = <1>;
+	apple,dcs-min-pstate = <4>;
+};
+
 /* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
 &smc {
 	apple,wake-reasons = <0 8 9 11 12 21 40 41 42 43 44 45 48>;
