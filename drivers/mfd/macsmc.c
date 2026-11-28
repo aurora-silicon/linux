@@ -10,6 +10,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/hex.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/iopoll.h>
@@ -703,6 +704,16 @@ static void apple_smc_probe_wktp(struct apple_smc *smc)
 	apple_smc_write_full_wake(smc);
 }
 
+/* Whether the device tree has the sleep controller @compatible and leaves it enabled. */
+static bool apple_smc_sleep_controller_available(const char *compatible)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL, compatible);
+	bool available = np && of_device_is_available(np);
+
+	of_node_put(np);
+	return available;
+}
+
 /* pmVC as the boot left it, next to what apple,sleep-pmvc has the sleep commit write. */
 static void apple_smc_sleep_pmvc_report(struct apple_smc *smc)
 {
@@ -737,6 +748,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->sleep_wake_type = of_property_read_bool(dev->of_node, "apple,sleep-wake-type");
 	smc->sleep_pmvc_set = !of_property_read_u32(dev->of_node, "apple,sleep-pmvc",
 						    &smc->sleep_pmvc);
+	ret = of_property_read_variable_u32_array(dev->of_node, "apple,sleep-low-pins",
+						  smc->sleep_low_pins, 1,
+						  ARRAY_SIZE(smc->sleep_low_pins));
+	smc->sleep_low_pin_count = ret > 0 ? ret : 0;
 
 	apple_smc_init_state(smc);
 	smc->dev = &pdev->dev;
@@ -752,6 +767,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 	 */
 	if (of_machine_is_compatible("apple,j813") ||
 	    of_device_is_compatible(dev->of_node, "apple,t8103-smc"))
+		smc->saved_enabled = true;
+	/* As is T6000's, on a board whose device tree enables its sleep controller. */
+	if (of_device_is_compatible(dev->of_node, "apple,t6000-smc") &&
+	    apple_smc_sleep_controller_available("apple,t6000-sleep"))
 		smc->saved_enabled = true;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
@@ -1271,6 +1290,34 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 }
 
 /*
+ * apple,sleep-low-pins: key "gP" plus the GPIO number as two hex digits. Written 0 before
+ * the sleep notice, as macOS does, and switched on again with the SMC GPIO output command.
+ */
+#define SMC_GPIO_CMD_OUTPUT	BIT(24)
+
+static smc_key apple_smc_gpio_key(u32 gpio)
+{
+	return __SMC_KEY('g', 'P', hex_asc_hi(gpio), hex_asc_lo(gpio));
+}
+
+/* After waka: the ones this sleep lowered, on again. */
+static void apple_smc_sleep_gpios_high(struct apple_smc *smc)
+{
+	unsigned long lowered = smc->sleep_low_pins_lowered;
+	unsigned int i;
+	int ret;
+
+	smc->sleep_low_pins_lowered = 0;
+	for_each_set_bit(i, &lowered, ARRAY_SIZE(smc->sleep_low_pins)) {
+		ret = apple_smc_write_u32(smc, apple_smc_gpio_key(smc->sleep_low_pins[i]),
+					  SMC_GPIO_CMD_OUTPUT | 1);
+		if (ret)
+			dev_err(smc->dev, "Failed to switch SMC GPIO %u back on: %d\n",
+				smc->sleep_low_pins[i], ret);
+	}
+}
+
+/*
  * The SMC's first wake commands after AP ON: MBSE and MBSW read, then MBSE = waka. With a sleep
  * policy, waka only after a clean read, and when it was answered for the pmVC that follows.
  */
@@ -1281,6 +1328,7 @@ static int apple_smc_wake_record(struct apple_smc *smc, bool *mbsw, bool later)
 	smc->wake_lid_read = false;
 	if (!smc->sleep_policy) {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
+		apple_smc_sleep_gpios_high(smc);
 		return ret;
 	}
 	if (!ret)
@@ -1722,6 +1770,22 @@ static int apple_smc_sleep_saved_pmvc(void *data)
 	return 0;
 }
 
+/* In the saved lane, after the peers stopped. The ones lowered are raised after the wake. */
+static int apple_smc_sleep_gpios_low(struct apple_smc *smc)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < smc->sleep_low_pin_count; i++) {
+		ret = apple_smc_saved_write_u32(smc, apple_smc_gpio_key(smc->sleep_low_pins[i]),
+						0);
+		if (ret)
+			return ret;
+		smc->sleep_low_pins_lowered |= BIT(i);
+	}
+	return 0;
+}
+
 static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 	.begin = apple_smc_sleep_saved_begin,
 	.check = apple_smc_sleep_saved_check,
@@ -1751,10 +1815,22 @@ static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 		return -EINVAL;
 
 	smc->saved_committed = true;
-	/* Gen 1 (T8103): WKTP between slpw and slpa; this SMC has no pmVC. */
+	/* apple,sleep-low-pins: off before the keys below, as macOS has them. */
+	ret = apple_smc_sleep_gpios_low(smc);
+	if (ret)
+		goto out;
+	/*
+	 * Gen 1: WKTP between slpw and slpa. T8103's SMC has no pmVC; T6000's takes it
+	 * before WKTP (apple,sleep-pmvc).
+	 */
 	if (apple_sleep_smc_gen1_keys()) {
 		u8 wktp = 2;
 
+		if (smc->sleep_pmvc_set) {
+			ret = apple_smc_saved_write_u32(smc, SMC_KEY(pmVC), smc->sleep_pmvc);
+			if (ret)
+				goto out;
+		}
 		ret = apple_smc_saved_write(smc, SMC_KEY(WKTP), &wktp, sizeof(wktp));
 		if (ret)
 			goto out;

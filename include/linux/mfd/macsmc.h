@@ -154,6 +154,11 @@ struct apple_smc {
 	/* apple,sleep-pmvc: when set, the pmVC value written at the sleep commit. */
 	bool sleep_pmvc_set;
 	u32 sleep_pmvc;
+	/* apple,sleep-low-pins: SMC GPIOs low from the sleep notice to after waka. */
+	u32 sleep_low_pins[4];
+	unsigned int sleep_low_pin_count;
+	/* Bit n: sleep_low_pins[n] was lowered for this sleep. */
+	unsigned long sleep_low_pins_lowered;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
