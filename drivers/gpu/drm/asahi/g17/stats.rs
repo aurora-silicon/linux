@@ -4,8 +4,11 @@
 //! Reads drain the statistics rings without waking the GPU or servicing work.
 
 use super::{fw::variant::InitGraph, telemetry::Readout, Shared};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use kernel::sync::Arc;
+
+const HOTSPOT_CACHE_NS: u64 = 250_000_000;
+const HOTSPOT_NONE: i32 = i32::MIN;
 
 /// Frequency of each performance state the firmware reports, in MHz; state 0 is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,9 +52,37 @@ impl StateFrequencies {
 
 /// The device's shared state, and the frequency of each performance state the firmware
 /// reports.
-pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>);
+pub(crate) struct Reader(
+    pub(super) Arc<Shared>,
+    pub(super) Option<StateFrequencies>,
+    AtomicI32,
+    AtomicU64,
+);
 
 impl Reader {
+    pub(super) fn new(shared: Arc<Shared>, frequencies: Option<StateFrequencies>) -> Self {
+        Self(
+            shared,
+            frequencies,
+            AtomicI32::new(HOTSPOT_NONE),
+            AtomicU64::new(0),
+        )
+    }
+
+    fn cached_hotspot_mc(&self) -> Option<i32> {
+        let now = super::now_ns();
+        let at = self.3.load(Ordering::Relaxed);
+        let val = if at == 0 || now.saturating_sub(at) >= HOTSPOT_CACHE_NS {
+            let fresh = super::thermal::hotspot_temperature_mc().unwrap_or(HOTSPOT_NONE);
+            self.2.store(fresh, Ordering::Relaxed);
+            self.3.store(now.max(1), Ordering::Relaxed);
+            fresh
+        } else {
+            self.2.load(Ordering::Relaxed)
+        };
+        (val != HOTSPOT_NONE).then_some(val)
+    }
+
     pub(crate) fn read(&self) -> Readout {
         let mut view = self.read_firmware();
         if view.pstate_status == super::telemetry::VALID {
@@ -60,6 +91,20 @@ impl Reader {
                 .as_ref()
                 .and_then(|states| states.hz(view.pstate))
                 .unwrap_or(0);
+        }
+        if self.0.variant.m5_commands {
+            if let Some(mc) = self.cached_hotspot_mc() {
+                view.temp_status = super::telemetry::VALID;
+                view.temp_mc = mc;
+            } else {
+                view.temp_status = super::telemetry::UNAVAILABLE;
+                view.temp_mc = 0;
+            }
+        } else {
+            view.power_status = super::telemetry::UNSUPPORTED;
+            view.power_mw = 0;
+            view.temp_status = super::telemetry::UNSUPPORTED;
+            view.temp_mc = 0;
         }
         view
     }
@@ -78,6 +123,7 @@ impl Reader {
 
     fn read_firmware(&self) -> Readout {
         let protocol = self.0.variant.telemetry_protocol;
+        let m5 = self.0.variant.m5_commands;
         let mut state = self.0.state.lock();
         let Some(firmware) = state.as_deref_mut() else {
             return qualify(protocol, Readout::default());
@@ -99,7 +145,14 @@ impl Reader {
             // export samples across an observed boundary.
             firmware.observe_statistics_power();
         }
-        qualify(protocol, firmware.rings.read_statistics(super::now_ns()))
+        let mut view = qualify(protocol, firmware.rings.read_statistics(super::now_ns()));
+        if m5 {
+            if let Ok(mw) = firmware.init.m5_gpu_power_mw() {
+                view.power_status = super::telemetry::VALID;
+                view.power_mw = mw;
+            }
+        }
+        view
     }
 
     pub(crate) fn suspend(&self, suspended: bool) {

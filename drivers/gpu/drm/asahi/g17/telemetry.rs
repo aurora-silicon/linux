@@ -39,12 +39,18 @@ pub(crate) struct Readout {
     pub(crate) achieved_frequency_hz: u64,
     pub(crate) busy_status: u32,
     pub(crate) _pad: u32,
+    pub(crate) power_status: u32,
+    pub(crate) power_mw: u32,
+    pub(crate) temp_status: u32,
+    pub(crate) temp_mc: i32,
 }
 
 const _: () = {
     assert!(core::mem::offset_of!(Readout, util_host_ns) == 24);
     assert!(core::mem::offset_of!(Readout, busy_ns) == 56);
-    assert!(core::mem::size_of::<Readout>() == 80);
+    assert!(core::mem::offset_of!(Readout, power_status) == 80);
+    assert!(core::mem::offset_of!(Readout, temp_mc) == 92);
+    assert!(core::mem::size_of::<Readout>() == 96);
 };
 
 const TIMER_HZ: u64 = 24_000_000;
@@ -572,6 +578,10 @@ mod tests {
         achieved_frequency_hz: 0,
         busy_status: UNSUPPORTED,
         _pad: 0,
+        power_status: UNAVAILABLE,
+        power_mw: 0,
+        temp_status: UNAVAILABLE,
+        temp_mc: 0,
     };
 
     fn ticks_ns(ticks: u64) -> u64 {
