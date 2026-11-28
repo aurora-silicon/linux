@@ -3,6 +3,7 @@
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -2830,6 +2831,10 @@ out:
 	return ret;
 }
 
+static const struct ethtool_ops centauri_ethtool_ops = {
+	.get_drvinfo = cfg80211_get_drvinfo,
+};
+
 static const struct net_device_ops net_ops = {
 	.ndo_open = net_open,
 	.ndo_stop = net_stop,
@@ -3106,6 +3111,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->wdev.netdev = wifi->netdev;
 	wifi->netdev->ieee80211_ptr = &wifi->wdev;
 	wifi->netdev->netdev_ops = &net_ops;
+	wifi->netdev->ethtool_ops = &centauri_ethtool_ops;
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;

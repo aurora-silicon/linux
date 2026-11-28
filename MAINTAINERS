@@ -4615,6 +4615,7 @@ L:	linux-wireless@vger.kernel.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
 F:	Documentation/devicetree/bindings/net/bluetooth/apple,centauri.yaml
+F:	Documentation/networking/device_drivers/wifi/apple/
 F:	drivers/bluetooth/btcentauri.c
 F:	include/linux/apple-centauri.h
 F:	drivers/net/wireless/apple/
