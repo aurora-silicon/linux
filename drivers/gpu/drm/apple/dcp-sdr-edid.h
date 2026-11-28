@@ -83,4 +83,24 @@ static inline size_t dcp_edid_sdr(u8 *edid, size_t size)
 	return output;
 }
 
+/*
+ * dcp_edid_sdr() for an output without an sRGB contract, whose link carries
+ * SDR RGB in the sink's own gamut: the sink's primaries are what its frames
+ * are shown with, so they stay.
+ */
+static inline size_t dcp_edid_sdr_native(u8 *edid, size_t size)
+{
+	u8 primaries[DCP_EDID_CHROMATICITY_SIZE];
+
+	if (size < DCP_EDID_BLOCK_SIZE)
+		return 0;
+	memcpy(primaries, edid + DCP_EDID_CHROMATICITY, sizeof(primaries));
+	size = dcp_edid_sdr(edid, size);
+	if (size) {
+		memcpy(edid + DCP_EDID_CHROMATICITY, primaries, sizeof(primaries));
+		dcp_edid_checksum(edid);
+	}
+	return size;
+}
+
 #endif

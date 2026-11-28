@@ -77,12 +77,19 @@ int main(void) {
  memcpy(original,sdr,256);assert(dcp_edid_sdr(sdr,256)==256);assert(!memcmp(sdr,original,256));
  for(unsigned n=0;n<128;n++)assert(!dcp_edid_sdr(sdr,n));
  assert(!dcp_edid_sdr(sdr,128));
+ /* The sink's own primaries kept, the rest as above and the checksum right. */
+ u8 native[384];memset(sdr+25,0x55,10);checksum(sdr);memcpy(native,sdr,sizeof(native));
+ assert(dcp_edid_sdr(sdr,256)==256);assert(dcp_edid_sdr_native(native,256)==256);
+ for(unsigned i=0;i<256;i++)assert(native[i]==(i>=25&&i<35?0x55:i==127?native[127]:sdr[i]));
+ {u8 sum=0;for(unsigned j=0;j<128;j++)sum+=native[j];assert(!sum);}
+ for(unsigned n=0;n<128;n++)assert(!dcp_edid_sdr_native(native,n));
+ assert(!dcp_edid_sdr_native(native,128));
  /* A CTA with no data collection can still advertise basic stereo audio. */
  memset(sdr,0,sizeof(sdr));memcpy(sdr,header,8);sdr[126]=1;
  cta=sdr+128;cta[0]=2;cta[1]=3;cta[3]=0x40;checksum(sdr);checksum(cta);
  assert(dcp_edid_sdr(sdr,256)==256);assert(sdr[126]==1 && cta[3]==0x40);
 
- puts("PASS SDR EDID identity, audio, timing, colour removal, checksums, bounds and idempotence");
+ puts("PASS SDR EDID identity, audio, timing, colour removal, native primaries, checksums, bounds and idempotence");
  puts("PASS native26 AV identity, stale attachment/owner, bounded EDID length, extension count and checksum failures");
 }
 '''

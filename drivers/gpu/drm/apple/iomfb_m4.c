@@ -3333,10 +3333,10 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 }
 
 /*
- * The EDID the connector publishes, as native26's (dcp_edid_sdr()): this
- * scanout is 8-bpc RGB SDR, so the sink's colour capabilities, deep colour
- * and 4:2:0 timings go. The last would otherwise make the probe helper prune
- * the catalog's mode of a timing the sink lists as 4:2:0 only.
+ * The EDID the connector publishes (dcp_edid_sdr_native()): this scanout is
+ * 8-bpc RGB SDR, so the sink's colour capabilities, deep colour and 4:2:0
+ * timings go. The last would otherwise make the probe helper prune the
+ * catalog's mode of a timing the sink lists as 4:2:0 only. Its primaries stay.
  */
 static const struct drm_edid *iomfb_m4_ext_edid_sdr(const struct drm_edid *edid)
 {
@@ -3351,7 +3351,7 @@ static const struct drm_edid *iomfb_m4_ext_edid_sdr(const struct drm_edid *edid)
 	copy = kmemdup(raw, size, GFP_KERNEL);
 	if (!copy)
 		return ERR_PTR(-ENOMEM);
-	size = dcp_edid_sdr(copy, size);
+	size = dcp_edid_sdr_native(copy, size);
 	sdr = size ? drm_edid_alloc(copy, size) : ERR_PTR(-EPROTO);
 	kfree(copy);
 	return sdr ?: ERR_PTR(-ENOMEM);
