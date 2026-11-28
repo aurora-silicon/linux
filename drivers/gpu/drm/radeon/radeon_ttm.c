@@ -31,6 +31,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/pagemap.h>
 #include <linux/pci.h>
@@ -258,6 +259,7 @@ static int radeon_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_resourc
 	struct radeon_device *rdev = radeon_get_rdev(bdev);
 	size_t bus_size = (size_t)mem->size;
 
+	mem->bus.is_nonposted = false;
 	switch (mem->mem_type) {
 	case TTM_PL_SYSTEM:
 		/* system memory */
@@ -274,6 +276,8 @@ static int radeon_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_resourc
 #endif
 		break;
 	case TTM_PL_VRAM:
+		mem->bus.is_nonposted = !!(pci_resource_flags(rdev->pdev, 0) &
+					   IORESOURCE_MEM_NONPOSTED);
 		mem->bus.offset = mem->start << PAGE_SHIFT;
 		/* check if it's visible */
 		if ((mem->bus.offset + bus_size) > rdev->mc.visible_vram_size)
@@ -480,12 +484,12 @@ static void radeon_ttm_backend_destroy(struct ttm_device *bdev, struct ttm_tt *t
 static struct ttm_tt *radeon_ttm_tt_create(struct ttm_buffer_object *bo,
 					   uint32_t page_flags)
 {
+	struct radeon_device *rdev = radeon_get_rdev(bo->bdev);
 	struct radeon_ttm_tt *gtt;
 	enum ttm_caching caching;
 	struct radeon_bo *rbo;
-#if IS_ENABLED(CONFIG_AGP)
-	struct radeon_device *rdev = radeon_get_rdev(bo->bdev);
 
+#if IS_ENABLED(CONFIG_AGP)
 	if (rdev->flags & RADEON_IS_AGP) {
 		return ttm_agp_tt_create(bo, rdev->agp->bridge, page_flags);
 	}
@@ -497,9 +501,16 @@ static struct ttm_tt *radeon_ttm_tt_create(struct ttm_buffer_object *bo,
 		return NULL;
 	}
 
+	/*
+	 * Behind a non-posted BAR on a non-coherent PCIe host, dirty CPU cache
+	 * lines in cached GTT pages are invisible to GPU DMA; map GTT pages
+	 * write-combined unless uncached was requested.
+	 */
 	if (rbo->flags & RADEON_GEM_GTT_UC)
 		caching = ttm_uncached;
-	else if (rbo->flags & RADEON_GEM_GTT_WC)
+	else if ((rbo->flags & RADEON_GEM_GTT_WC) ||
+		 ((pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED) &&
+		  !dev_is_dma_coherent(rdev->dev)))
 		caching = ttm_write_combined;
 	else
 		caching = ttm_cached;

@@ -730,6 +730,26 @@ vm_fault_t radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
 	if (bo->resource->mem_type != TTM_PL_VRAM)
 		return 0;
 
+	/*
+	 * Behind a non-posted BAR the CPU reaches VRAM as Device-nGnRnE memory,
+	 * where userspace memset()/memcpy() and unaligned stores fault (and
+	 * under write-combine DC ZVA raises an asynchronous SError). Migrate
+	 * CPU-faulted VRAM BOs to GTT; a pinned BO cannot move.
+	 */
+	if (pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED) {
+		if (rbo->tbo.pin_count > 0)
+			return VM_FAULT_SIGBUS;
+
+		radeon_ttm_placement_from_domain(rbo, RADEON_GEM_DOMAIN_GTT);
+		r = ttm_bo_validate(bo, &rbo->placement, &ctx);
+		if (unlikely(r == -EBUSY || r == -ERESTARTSYS))
+			return VM_FAULT_NOPAGE;
+		if (unlikely(r) || bo->resource->mem_type == TTM_PL_VRAM)
+			return VM_FAULT_SIGBUS;
+		ttm_bo_move_to_lru_tail_unlocked(bo);
+		return 0;
+	}
+
 	size = bo->resource->size;
 	offset = bo->resource->start << PAGE_SHIFT;
 	if ((offset + size) <= rdev->mc.visible_vram_size)
