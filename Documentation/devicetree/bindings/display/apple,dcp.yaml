@@ -834,11 +834,21 @@ allOf:
               - required: [route@2]
               - required: [route@3]
     then:
+      description:
+        An empty typec-routes container leaves the Type-C routes to the boot
+        loader. Only a fixed output (an HDMI port's DP PHY and its crossbar
+        output) may be named already; the loader writes the routes after it.
       properties:
-        phys: false
-        phy-names: false
-        mux-controls: false
-        mux-control-names: false
+        phys:
+          maxItems: 1
+        phy-names:
+          items:
+            - const: dp-phy
+        mux-controls:
+          maxItems: 1
+        mux-control-names:
+          items:
+            - const: dp-xbar
         apple,typec-mux-indices: false
         apple,typec-dptx-phys: false
         apple,dptx-die: false

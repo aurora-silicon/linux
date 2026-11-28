@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * The 14-inch K boards' ports beyond t6050-k114-k116-usb.dtsi: the MagSafe 3 PD controller
- * on nub-spmi-a0 and ATC2's USB4/Thunderbolt router with its PCIe tunnel. The live K114s ADT
+ * on nub-spmi-a0, the USB4/Thunderbolt routers of ATC2 (right) and ATC1 (left-front) with
+ * their PCIe tunnels and DisplayPort tunnel clocks, and the HDMI port. The live K114s ADT
  * (27.2) and the K114c's have the same nodes and values here, phandles aside.
  *
  * Included after t6050-k114-k116-usb.dtsi. t6050-max.dtsi describes the ATC2 router for the
@@ -85,4 +86,30 @@
 	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
+};
+
+/*
+ * The left-front port's USB4/Thunderbolt router (acio1) and PCIe tunnel, and its DisplayPort
+ * tunnels, as on J714s: the K114s ADT's acio1, acio-cpu1, dart-acio1, apciec1, dart-apciec1 and
+ * atc1-dpin0..3 equal the J714sAP ADT's (host DROM and LSTX pin included), phandles aside, and
+ * so do atc-phy1's CIO RX_TOP tunables. (The K116s's RX_TOP tunables differ.) Without it a
+ * Thunderbolt dock or enclosure on this port gets USB only, and no DP or PCIe tunnel.
+ */
+#include "t6050-j714s-left-usb4.dtsi"
+#include "t6050-atc1-dp-tunnel.dtsi"
+
+/*
+ * The HDMI port (ATC3, dcpext0's fixed output). Its converter's power enables are this board's
+ * pcIO outputs 1 (hdmi_pwr_en) and 0 (dp2hdmi_pwr_en), see t6050-k114-k116.dtsi.
+ */
+#define T6050_HDMI_PWREN_LINE		1
+#define T6050_DP2HDMI_PWREN_LINE	0
+#include "t6050-atc3-hdmi.dtsi"
+
+/*
+ * The AOP GPIO pins in use: the HDMI converter's hotplug (14) and the LSTX pins of both
+ * routers, 79 (acio1) and 81 (acio2).
+ */
+&pinctrl_aop {
+	gpio-reserved-ranges = <0 14>, <15 64>, <80 1>, <82 3>;
 };
