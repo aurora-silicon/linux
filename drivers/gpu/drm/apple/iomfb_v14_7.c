@@ -1814,6 +1814,7 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 	dcp->v14 = v14;
+	WRITE_ONCE(dcp->pmp_display_acked, true);
 	dev_info(dev, "PMP running with the display request acknowledged\n");
 	return 0;
 }

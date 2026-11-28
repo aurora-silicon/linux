@@ -7245,6 +7245,7 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 		return ret;
 	}
 	dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+	WRITE_ONCE(dcp->pmp_display_acked, true);
 	return 0;
 }
 

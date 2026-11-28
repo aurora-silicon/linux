@@ -3666,10 +3666,10 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
  * (292 MHz) is whole.
  *
  * Offer an external display only the modes the provider clock scans, unless
- * the processor is described with a PMP display request (apple,pmp-report):
- * such a processor starts its display only once the PMP has acknowledged
- * that request, and the PMP then scales the clock.  This reads only the
- * device tree, so a mode query never starts or waits on the PMP.  The
+ * a running PMP acknowledged this processor's display request when it
+ * started (pmp_display_acked, set by the start paths that verify it): the
+ * PMP then scales the clock.  This reads only that recorded state, so a mode
+ * query never starts or waits on the PMP.  The
  * provider clock is the one the boot loader published for this processor
  * and that the driver already answers the firmware with; a processor without
  * a provider clock table, and internal panels, are not limited here.
@@ -3686,11 +3686,8 @@ static bool dcp_mode_beyond_provider_clock(struct apple_dcp *dcp,
 		return false;
 
 	rate = clk_get_rate(dcp->firmware_clocks[0].clk);
-	if (!rate || of_property_present(dcp->dev->of_node, "apple,pmp-report"))
-		return false;
-
-	/* mode->clock is in kHz; the video clock is half the pixel clock. */
-	return (u64)mode->clock * 1000 > 2 * (u64)rate;
+	return dcp_provider_clock_limits(mode->clock, rate,
+					 READ_ONCE(dcp->pmp_display_acked));
 }
 
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,

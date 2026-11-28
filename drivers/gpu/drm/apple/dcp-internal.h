@@ -1031,6 +1031,11 @@ struct apple_dcp {
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
+	/*
+	 * A running PMP acknowledged this processor's display request at
+	 * start (apple,pmp-report); it scales the display clock.
+	 */
+	bool pmp_display_acked;
 
 	/* clear all surfaces on init */
 	bool surfaces_cleared;
