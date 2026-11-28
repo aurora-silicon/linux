@@ -39,6 +39,8 @@ struct ane_h16_accel_file {
 	/* Pins the program lifetime across LOAD and an EXECUTE's copy phases. */
 	struct mutex lock;
 	struct ane_h16_program *program;
+	/* Under lock: a LOAD was admitted and is reading its HWX unlocked. */
+	bool loading;
 };
 
 static struct ane_h16_accel *to_h16_accel(struct drm_device *drm)
@@ -88,13 +90,46 @@ static int ane_h16_sections_copy(const struct drm_ane_h16_load *args,
 		    s->size < ANE_H16_AUX_MIN || s->size > ANE_H16_AUX_MAX ||
 		    !IS_ALIGNED(s->size, 4))
 			return -EINVAL;
-		bytes = memdup_user(u64_to_user_ptr(s->data_ptr), s->size);
-		if (IS_ERR(bytes))
-			return PTR_ERR(bytes);
+		/* Charged to the caller's memory cgroup, as the HWX copy is. */
+		bytes = kmalloc(s->size, GFP_USER | __GFP_ACCOUNT | __GFP_NOWARN);
+		if (!bytes)
+			return -ENOMEM;
 		aux[kind] = bytes;
 		aux_size[kind] = s->size;
+		if (copy_from_user(bytes, u64_to_user_ptr(s->data_ptr), s->size))
+			return -EFAULT;
 	}
 	return 0;
+}
+
+/*
+ * Admit a LOAD before it copies anything: a refused LOAD allocates nothing.
+ * A file loads one program, and has one LOAD in flight at a time, which then
+ * reads its sections and HWX with no lock held. A program lost across system
+ * sleep is released here, as the caller is reloading.
+ */
+static int ane_h16_load_admit(struct ane_h16_accel *a, struct ane_h16_accel_file *f,
+			      bool nonblock)
+{
+	int ret;
+
+	mutex_lock(&f->lock);
+	ret = f->loading ? -EBUSY : ane_h16_session_enter(a->session, nonblock);
+	if (ret)
+		goto unlock;
+	if (f->program && ane_h16_program_lost(a->session, f->program) &&
+	    !ane_h16_session_close(a->session, f->program)) {
+		ane_h16_session_put(a->session, f->program);
+		f->program = NULL;
+	}
+	if (f->program)
+		ret = -EBUSY;
+	else
+		f->loading = true;
+	mutex_unlock(&a->lock);
+unlock:
+	mutex_unlock(&f->lock);
+	return ret;
 }
 
 static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
@@ -106,40 +141,36 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	void *aux[ANE_H16_AUX_COUNT] = {};
 	size_t aux_size[ANE_H16_AUX_COUNT] = {};
 	struct ane_h16_program *program = NULL;
+	const bool nonblock = file->filp->f_flags & O_NONBLOCK;
 	unsigned int i;
 	int ret;
 
 	if (args->flags || args->pad)
 		return -EINVAL;
+	ret = ane_h16_load_admit(a, f, nonblock);
+	if (ret)
+		return ret;
+	/*
+	 * No lock of ours is held while user memory is read: faulting it in can
+	 * wait for as long as whoever backs it likes, and mmap() of the node
+	 * takes the file and node locks under the process mmap lock.
+	 */
 	ret = ane_h16_sections_copy(args, aux, aux_size);
 	if (!ret)
 		ret = ane_h16_hwx_snapshot_from_user(u64_to_user_ptr(args->hwx_ptr),
 						     args->hwx_size, &snapshot);
-	if (ret)
-		goto out;
 	mutex_lock(&f->lock);
-	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret) {
-		mutex_unlock(&f->lock);
-		goto out;
-	}
-	/* Lost across system sleep: release it, the caller is reloading. */
-	if (f->program && ane_h16_program_lost(a->session, f->program) &&
-	    !ane_h16_session_close(a->session, f->program)) {
-		ane_h16_session_put(a->session, f->program);
-		f->program = NULL;
-	}
-	if (f->program) {
-		ret = -EBUSY;
-	} else {
-		ret = ane_h16_session_load(a->session, &snapshot,
-					   (const void *const *)aux, aux_size, &program);
-		if (!ret)
-			f->program = program;
-	}
+	if (!ret)
+		ret = ane_h16_session_enter(a->session, nonblock);
+	if (ret)
+		goto unlock;
+	/* Only this LOAD sets the program while the file is loading. */
+	ret = ane_h16_session_load(a->session, &snapshot,
+				   (const void *const *)aux, aux_size, &program);
 	if (!ret) {
 		const struct ane_h16_hwx *hwx = &program->hwx;
 
+		f->program = program;
 		args->surface_count = program->resource_count;
 		for (i = 0; i < DRM_ANE_H16_SURFACES; i++) {
 			args->surface_size[i] = i < program->resource_count ?
@@ -149,8 +180,9 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		}
 	}
 	mutex_unlock(&a->lock);
+unlock:
+	f->loading = false;
 	mutex_unlock(&f->lock);
-out:
 	/* A consumed snapshot was moved into the program and reads as empty. */
 	if (snapshot.bytes)
 		ane_h16_hwx_snapshot_destroy(&snapshot);
