@@ -929,7 +929,8 @@ static void pf_dt_pmp_unbound_test(struct kunit *test)
 }
 
 static int pf_dt_floor_run(struct kunit *test, struct apple_pmgr_misc *misc,
-			   const char *prop, const u32 *vals, size_t nvals, bool fabric)
+			   const char *prop, const u32 *vals, size_t nvals,
+			   enum sys_device dev)
 {
 	struct of_changeset cs;
 	struct device_node *np;
@@ -945,7 +946,12 @@ static int pf_dt_floor_run(struct kunit *test, struct apple_pmgr_misc *misc,
 				0);
 	KUNIT_ASSERT_EQ(test, of_changeset_apply(&cs), 0);
 	misc->dev->of_node = np;
-	ret = fabric ? apple_pmgr_fabric_floor_init(misc) : apple_pmgr_dcs_floor_init(misc);
+	if (dev == DEV_FABRIC)
+		ret = apple_pmgr_fabric_floor_init(misc);
+	else if (dev == DEV_DCS)
+		ret = apple_pmgr_dcs_floor_init(misc);
+	else
+		ret = apple_pmgr_disp_floor_init(misc);
 	misc->dev->of_node = saved;
 	pf_dt_revert(&cs);
 	return ret;
@@ -954,13 +960,19 @@ static int pf_dt_floor_run(struct kunit *test, struct apple_pmgr_misc *misc,
 static int pf_dt_fab_floor(struct kunit *test, struct apple_pmgr_misc *misc,
 			   const u32 *vals, size_t nvals)
 {
-	return pf_dt_floor_run(test, misc, "apple,fabric-min-pstate", vals, nvals, true);
+	return pf_dt_floor_run(test, misc, "apple,fabric-min-pstate", vals, nvals, DEV_FABRIC);
 }
 
 static int pf_dt_dcs_floor(struct kunit *test, struct apple_pmgr_misc *misc,
 			   const u32 *vals, size_t nvals)
 {
-	return pf_dt_floor_run(test, misc, "apple,dcs-min-pstate", vals, nvals, false);
+	return pf_dt_floor_run(test, misc, "apple,dcs-min-pstate", vals, nvals, DEV_DCS);
+}
+
+static int pf_dt_disp_floor(struct kunit *test, struct apple_pmgr_misc *misc,
+			    const u32 *vals, size_t nvals)
+{
+	return pf_dt_floor_run(test, misc, "apple,disp-min-pstate", vals, nvals, DEV_DISP);
 }
 
 static void pf_dt_floors_test(struct kunit *test)
@@ -1050,6 +1062,93 @@ static void pf_dt_floors_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_dcs_state_valid(misc, 6));
 }
 
+static void pf_t8103_disp_scaling_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+	u32 *disp = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
+	static const u32 v0[] = { 0 };
+	static const u32 v2[] = { 2 };
+	static const u32 v3[] = { 3 };
+	static const u32 v4[] = { 4 };
+	static const u32 v16[] = { 16 };
+	static const u32 vpair[] = { 2, 3 };
+
+	KUNIT_ASSERT_NOT_NULL(test, disp);
+	pf_step_cnt = 0;
+	pf_step_inject_busy = false;
+	pf_step_inject_bad_desired = false;
+	kunit_activate_static_stub(test, apple_pmgr_perf_step, pf_fake_perf_step);
+
+	misc->single_step = true;
+	misc->devices[DEV_FABRIC].active_state = 4;
+	misc->devices[DEV_FABRIC].suspend_state = 4;
+	misc->devices[DEV_DCS].active_state = 6;
+	misc->devices[DEV_DCS].suspend_state = 6;
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	writel(0x00000444, f->fabric);
+	writel(0x00000666, f->dcs);
+
+	/* Property without disp-ps reg fails cleanly. */
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v2, 1), -EINVAL);
+
+	writel(0x00000333, disp);
+	misc->devices[DEV_DISP].base = (void __iomem *)disp;
+	misc->devices[DEV_DISP].active_state = 3;
+	misc->devices[DEV_DISP].suspend_state = 3;
+	misc->disp_now = 3;
+
+	/* Validate absent, out-of-range, above-boot, equal-to-boot, and valid floors. */
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, NULL, 0), 0);
+	KUNIT_EXPECT_EQ(test, misc->idle_disp_pstate, 0U);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v0, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v4, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v16, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, vpair, 2), -EINVAL);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v3, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->idle_disp_pstate, 0U);
+	KUNIT_EXPECT_EQ(test, pf_dt_disp_floor(test, misc, v2, 1), 0);
+	KUNIT_EXPECT_EQ(test, misc->devices[DEV_DISP].suspend_state, 2U);
+	KUNIT_EXPECT_EQ(test, misc->idle_disp_pstate, 2U);
+
+	/* Idle lowers disp 3 -> 2; hold and GPU busy raise it back to 3. */
+	pf_publish(f);
+	f->cpus_min = true;
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 2U);
+	KUNIT_EXPECT_EQ(test, readl(disp), 0x00000322U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	KUNIT_EXPECT_EQ(test, apple_pmgr_fabric_hold(), 0);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 3U);
+	KUNIT_EXPECT_EQ(test, readl(disp), 0x00000333U);
+	apple_pmgr_fabric_release();
+
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 2U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 3U);
+	apple_pmgr_gpu_busy_put();
+
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 2U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	/* Prepare raises disp back to boot state; s2idle steps 3 -> 2 -> 3. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_misc_prepare(misc->dev), 0);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 3U);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_misc_suspend_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+	KUNIT_EXPECT_EQ(test, readl(disp), 0x00000322U);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_misc_resume_noirq_target(misc, PM_SUSPEND_TO_IDLE), 0);
+	KUNIT_EXPECT_EQ(test, misc->disp_now, 3U);
+	KUNIT_EXPECT_EQ(test, readl(disp), 0x00000333U);
+	apple_pmgr_misc_complete(misc->dev);
+	cancel_delayed_work_sync(&misc->idle_work);
+}
+
 static int pf_suite_init(struct kunit_suite *suite)
 {
 	struct of_changeset cs;
@@ -1105,6 +1204,7 @@ static struct kunit_case apple_pmgr_fabric_test_cases[] = {
 	KUNIT_CASE(pf_prepare_complete_test),
 	KUNIT_CASE(pf_match_data_test),
 	KUNIT_CASE(pf_t8103_gpu_tracking_and_step_test),
+	KUNIT_CASE(pf_t8103_disp_scaling_test),
 	KUNIT_CASE(pf_dt_floors_test),
 	KUNIT_CASE(pf_dt_voters_test),
 	KUNIT_CASE(pf_dt_voters_missing_test),
