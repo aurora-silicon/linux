@@ -3,6 +3,7 @@
 """Execute production M4 publication/error isolation with a CPU-only transport recorder."""
 from common import kernel_root, output_dir, rustc, sha
 import json
+import re
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/engine.rs'
@@ -64,6 +65,9 @@ assert (
     < prefix_render_fn.index('if plan.ta_prev_wait && !ta_ordered {')
     < prefix_render_fn.index('p.prev_barrier.write(0, &prev)?;')
 ), 'prev_barrier must follow the ring-order decision'
+# Barrier stats are staged on `Prefix` and committed only on TA producer publication.
+assert 'stats.ta_prev' not in prefix_render_fn and 'stats.ta_order' not in prefix_render_fn
+assert 'pf.ta_order += 1;' in prefix_render_fn and 'pf.ta_prev += 1;' in prefix_render_fn
 # The VM mark waits for visibility: an unpublished prefix never marks its VM.
 assert 'note_msaa_render' not in prefix_render_fn
 assert 'f.msaa |= cmd.is_multisampled();' in prefix_render_fn
@@ -3163,7 +3167,7 @@ mod msaa_fold_scope {
             group: Group(vec![]), msaa: false, pb: Some(Pb), pb_slot: 0 }
     }
     __MSAA_RENDER_CONFLICT__
-    struct Prefix { draw: u64, ta_head: u32, fs_head: u32, renders: u32 }
+    struct Prefix { draw: u64, ta_head: u32, fs_head: u32, renders: u32, ta_prev: u64, ta_order: u64 }
     struct Cfg { num_clusters: u32, gpu_generation: u32 }
     struct Slots { pass_busy: u64, publish_fails: bool }
     impl Slots {
@@ -3174,11 +3178,27 @@ mod msaa_fold_scope {
         fn publish(&mut self, _c: &mut Claims) -> Result { if self.publish_fails { Err(EIO) } else { Ok(()) } }
     }
     struct Pools; impl Pools { fn hold_alloc(&mut self, _k: usize, _vm: &Arc<Vm>, _a: u32, _l: u32) -> Result { Ok(()) } }
-    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>> }
-    struct Host { cfg: Cfg, slots: Slots, pools: Pools, engine: Engine, prefixed: Vec<(u32, u32)> }
+    mod qstate { pub const WRITE: usize = 0; }
+    struct QState { fail: bool }
+    impl QState {
+        fn w32(&self, _off: usize, _v: u32) -> Result {
+            if self.fail { Err(EIO) } else { Ok(()) }
+        }
+    }
+    struct RenderGraph { qstate: [QState; 2] }
+    struct Graph { render: RenderGraph }
+    #[derive(Default)]
+    struct RenderStats { publications: [u64; 2], ta_prev: u64, ta_order: u64 }
+    fn publish_producer(q: &QState, head: u32, count: &mut u64) -> Result {
+        q.w32(qstate::WRITE, head)?;
+        *count += 1;
+        Ok(())
+    }
+    struct Engine { flights: Vec<Flight>, pending: Vec<Arc<Job>>, stats: RenderStats }
+    struct Host { cfg: Cfg, slots: Slots, pools: Pools, graph: Graph, engine: Engine, prefixed: Vec<(u32, u32)>, recovery: bool }
     impl Host {
         __MSAA_MEMBER_ALLOWED__
-        fn recovery_pending(&self) -> Result<bool> { Ok(false) }
+        fn recovery_pending(&self) -> Result<bool> { Ok(self.recovery) }
         fn wait_compute_stamps_for(&self, _j: &Arc<Job>, _t: Option<u64>) -> Result { Ok(()) }
         fn wait_stamp_for_with(&self, _j: &Arc<Job>, _c: usize, _t: Option<u64>, _f: Option<&Flight>) -> Result { Ok(()) }
         #[allow(clippy::too_many_arguments)]
@@ -3195,7 +3215,7 @@ mod msaa_fold_scope {
         fn fold(&mut self, job: &Arc<Job>, f: &mut Flight, more: usize) -> Result<u32> {
             let index = 0u32;
             let mut end = 1u32;
-            let mut prefix = Prefix { draw: 1, ta_head: 0, fs_head: 0, renders: 1 };
+            let mut prefix = Prefix { draw: 1, ta_head: 0, fs_head: 0, renders: 1, ta_prev: 0, ta_order: 0 };
             let (ta_read, fs_read) = (0u32, 0u32);
             let (behind, class_behind) = (true, true);
             let stage_prefix = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
@@ -3214,10 +3234,23 @@ mod msaa_fold_scope {
             if fail_after { return Err(EIO); }
             Ok(())
         }
+        fn publish_render_producers(&mut self, job: &Arc<Job>, f: &mut Flight, prefix: &Prefix, visible: &mut bool) -> Result {
+            let render = true;
+            __PUBLICATION_PROLOGUE__
+            __RENDER_PRODUCER_PUBLICATION__
+            Ok(())
+        }
     }
     fn host(flights: Vec<Flight>, pending: Vec<Arc<Job>>) -> Host {
-        Host { cfg: Cfg { num_clusters: 1, gpu_generation: 16 }, slots: Slots { pass_busy: 1, publish_fails: false }, pools: Pools,
-            engine: Engine { flights, pending }, prefixed: vec![] }
+        Host {
+            cfg: Cfg { num_clusters: 1, gpu_generation: 16 },
+            slots: Slots { pass_busy: 1, publish_fails: false },
+            pools: Pools,
+            graph: Graph { render: RenderGraph { qstate: [QState { fail: false }, QState { fail: false }] } },
+            engine: Engine { flights, pending, stats: RenderStats::default() },
+            prefixed: vec![],
+            recovery: false,
+        }
     }
     #[test] fn same_submit_fold_splits_before_a_multisampled_member_beside_another_vm() {
         let (vm1, vm2, q1, q2) = (vm(1), vm(2), Arc::new(Queue), Arc::new(Queue));
@@ -3298,6 +3331,30 @@ mod msaa_fold_scope {
         assert!(visible && !v3.renders_msaa());
         let _ = (EAGAIN, EINVAL);
     }
+    #[test] fn ta_prev_barrier_stats_commit_only_on_ta_producer_publication() {
+        let q = Arc::new(Queue);
+        let v = vm(1);
+        let j = job(1, &v, &q, 1, &[LIGHT]);
+        let prefix = Prefix { draw: 1, ta_head: 4, fs_head: 5, renders: 1, ta_prev: 2, ta_order: 3 };
+        // Rejected by recovery_pending (-EAGAIN) before visibility: staged counts are discarded.
+        let mut h = host(vec![], vec![]);
+        h.recovery = true;
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Err(EAGAIN));
+        assert!(!visible && h.engine.stats.ta_prev == 0 && h.engine.stats.ta_order == 0);
+        // TA producer publication fails: counts do not advance.
+        let mut h = host(vec![], vec![]);
+        h.graph.render.qstate[0].fail = true;
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Err(EIO));
+        assert!(visible && h.engine.stats.ta_prev == 0 && h.engine.stats.ta_order == 0);
+        // TA producer publishes cleanly: staged counts commit alongside publications[1].
+        let mut h = host(vec![], vec![]);
+        let (mut f, mut visible) = (flight(&j, 1), false);
+        assert_eq!(h.publish_render_producers(&j, &mut f, &prefix, &mut visible), Ok(()));
+        assert!(visible && h.engine.stats.publications[1] == 1);
+        assert_eq!((h.engine.stats.ta_prev, h.engine.stats.ta_order), (2, 3));
+    }
 }
 
 '''
@@ -3311,12 +3368,18 @@ _prologue_start = source.index('        if self.recovery_pending()? {\n         
 _prologue_end = source.index('        let publication = (|| -> Result {', _prologue_start)
 _prologue = source[_prologue_start:_prologue_end]
 assert '*visible = true;' in _prologue and 'job.vm.note_msaa_render();' in _prologue
+_ta_pub_start = source.index('                publish_producer(\n                    &self.graph.render.qstate[0],', _prologue_end)
+_ta_pub_end = source.index('            } else {', _ta_pub_start)
+_ta_pub = source[_ta_pub_start:_ta_pub_end]
+assert 'self.engine.stats.ta_prev += prefix.ta_prev;' in _ta_pub
+assert 'self.engine.stats.ta_order += prefix.ta_order;' in _ta_pub
 _scope_start = harness.index('mod msaa_fold_scope {')
 _scope = harness[_scope_start:]
 for token, text in {
     '__SAME_SUBMIT_FOLD__': _same_fold,
     '__HORIZON_FOLD__': _horizon_fold,
     '__PUBLICATION_PROLOGUE__': _prologue,
+    '__RENDER_PRODUCER_PUBLICATION__': _ta_pub,
     '__IS_MULTISAMPLED__': item_in(command_src, 'pub(crate) fn is_multisampled('),
     '__RENDERS_MSAA__': item_in(vm_src, 'pub(crate) fn renders_msaa('),
     '__NOTE_MSAA_RENDER__': item_in(vm_src, 'pub(crate) fn note_msaa_render('),
@@ -3427,8 +3490,10 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     (output/'publication.log').write_text(log)
     if result.returncode:
         raise SystemExit(result.returncode)
+passed_match = re.search(r'test result: ok\. (\d+) passed; 0 failed;', log)
+assert passed_match, f'could not parse test count from:\n{log}'
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 71, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': int(passed_match.group(1)), 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

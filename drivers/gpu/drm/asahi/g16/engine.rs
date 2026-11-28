@@ -451,6 +451,8 @@ struct Prefix {
     last_ct: u32,
     last_ta: u32,
     last_fs: u32,
+    ta_prev: u64,
+    ta_order: u64,
 }
 
 /// Error provenance must remain independent of errno: EIO can be an ordinary failed VM
@@ -3532,6 +3534,8 @@ impl Firmware {
                     prefix.ta_head,
                     &mut self.engine.stats.publications[1],
                 )?;
+                self.engine.stats.ta_prev += prefix.ta_prev;
+                self.engine.stats.ta_order += prefix.ta_order;
                 self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
             } else {
                 publish_producer(
@@ -4143,7 +4147,7 @@ impl Firmware {
         // not already dominated by TA.
         let ta_ordered = ta_ring_orders_prev(cross_vm_prev, producer_initbm);
         if plan.ta_prev_wait && ta_ordered {
-            self.engine.stats.ta_order += 1;
+            pf.ta_order += 1;
         }
         if plan.ta_prev_wait && !ta_ordered {
             let prev = encode::barrier(
@@ -4157,7 +4161,7 @@ impl Firmware {
             p.prev_barrier.write(0, &prev)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
-            self.engine.stats.ta_prev += 1;
+            pf.ta_prev += 1;
         }
         if let Some(wait_fs) = plan.ta_fs_wait {
             let ta_fs = encode::barrier(
