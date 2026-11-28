@@ -66,11 +66,12 @@ int apple_dart_dcp_power_off(struct device *dev);
 int apple_dart_dcp_power_on(struct device *dev);
 
 /*
- * Remappable host windows in SID0 of an external display DART: one
- * whole arena slice each, claimed until reboot, mapped and unmapped by the
- * host only (every change flushed and read back). Pages are the caller's.
+ * Remappable host windows in SID0 of an external display DART: one or two
+ * contiguous 32-MiB arena slices each (for @size up to 64 MiB), claimed until
+ * reboot, mapped and unmapped by the host only (every change flushed and read
+ * back). Pages are the caller's.
  */
-int apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva);
+int apple_dart_dcp_dispext_window_claim(struct device *piodma, size_t size, u64 *dva);
 int apple_dart_dcp_dispext_window_map(struct device *piodma, u64 dva, const phys_addr_t *phys,
 				      unsigned int count);
 int apple_dart_dcp_dispext_window_unmap(struct device *piodma, u64 dva);
@@ -121,7 +122,8 @@ static inline int apple_dart_dcp_dispext_state(struct device_node *consumer)
 	return -EOPNOTSUPP;
 }
 
-static inline int apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva)
+static inline int apple_dart_dcp_dispext_window_claim(struct device *piodma, size_t size,
+						      u64 *dva)
 {
 	return -EOPNOTSUPP;
 }

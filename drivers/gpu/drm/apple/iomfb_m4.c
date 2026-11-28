@@ -848,9 +848,10 @@ out:
  * confirmed swap shows it (given-up swaps that may still show it are in
  * ext_lost_swap); pinned: its unmap failed, kept until reboot.
  */
-#define DCP_M4_EXT_WINDOWS	6
+#define DCP_M4_EXT_WINDOWS	8
 struct dcp_m4_ext_window {
 	u64 dva;
+	size_t cap;
 	void *key;
 	void (*put)(void *key);
 	unsigned int count;
@@ -4290,20 +4291,25 @@ static int dcp_m4_ext_scanout_gate(struct iomfb_m4 *dcp)
 }
 
 /*
- * Two host-written XRGB8888 surfaces in the display DART's SID0, each allocated
- * once for the largest mode (3840x2160) and reused for every mode, so that
- * mode changes never use up the SID0 arena. Both are stale: the next two
- * frames are copied whole.
+ * Two host-written XRGB8888 surfaces in the display DART's SID0: sized once
+ * for 3840x2160 (one 32-MiB slice) for modes up to 4K, or 5120x2880 (two
+ * contiguous 32-MiB slices) once a larger mode is requested, and reused for
+ * every smaller mode so that mode changes do not exhaust the SID0 arena. Both
+ * are stale: the next two frames are copied whole.
  */
 static int dcp_m4_ext_drm_buffers(struct dcp_m4_runtime *r)
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	u32 width = r->ext_width, height = r->ext_height;
 	u32 stride = ALIGN(width * 4, 64);
-	size_t size = PAGE_ALIGN((size_t)ALIGN(3840 * 4, 64) * 2160);
+	size_t need = PAGE_ALIGN((size_t)stride * height);
+	size_t tier1 = PAGE_ALIGN((size_t)ALIGN(3840 * 4, 64) * 2160);
+	size_t tier2 = PAGE_ALIGN((size_t)ALIGN(DCP_M4_EXT_MAX_WIDTH * 4, 64) *
+				  DCP_M4_EXT_MAX_HEIGHT);
+	size_t size = need > tier1 ? tier2 : tier1;
 	int ret;
 
-	if (!width || !height || width > 3840 || height > 2160)
+	if (!width || !height || width > DCP_M4_EXT_MAX_WIDTH || height > DCP_M4_EXT_MAX_HEIGHT)
 		return -EINVAL;
 	ret = dcp_m4_ext_scanout_ok(dcp, "DRM buffers");
 	if (ret)
@@ -4847,15 +4853,29 @@ static int dcp_m4_ext_win_get(struct dcp_m4_runtime *r, const struct iomfb_m4_ex
 	struct dcp_m4_ext_window *w;
 	phys_addr_t *phys = NULL;
 	unsigned int count = 0;
+	size_t bytes, want;
 	int pick = -1, ret;
 
 	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 		if (r->ext_win[i].key == fb->key) {
+			if ((size_t)r->ext_win[i].count * SZ_16K < need)
+				return -EOPNOTSUPP;
 			r->ext_win[i].used = jiffies;
 			return i;
 		}
-	for (int i = 0; pick < 0 && i < DCP_M4_EXT_WINDOWS; i++)
-		if (r->ext_win[i].dva && !r->ext_win[i].key && !r->ext_win[i].pinned)
+	ret = fb->pages(fb->key, &phys, &count);
+	if (ret)
+		return -EOPNOTSUPP;
+	bytes = (size_t)count * SZ_16K;
+	if (bytes < need || bytes > SZ_64M) {
+		kfree(phys);
+		return -EOPNOTSUPP;
+	}
+	want = bytes > SZ_32M ? SZ_64M : SZ_32M;
+	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
+		if (r->ext_win[i].dva && !r->ext_win[i].key && !r->ext_win[i].pinned &&
+		    r->ext_win[i].cap >= want &&
+		    (pick < 0 || r->ext_win[i].cap < r->ext_win[pick].cap))
 			pick = i;
 	/*
 	 * A new slice only once the copy surfaces have theirs: the copy
@@ -4867,36 +4887,36 @@ static int dcp_m4_ext_win_get(struct dcp_m4_runtime *r, const struct iomfb_m4_ex
 
 		if (r->ext_win[i].dva)
 			continue;
-		ret = apple_dart_dcp_dispext_window_claim(piodma, &dva);
+		ret = apple_dart_dcp_dispext_window_claim(piodma, want, &dva);
 		/* Not confirmed since sleep: the frame waits (no window, no copy). */
-		if (ret == -EAGAIN)
+		if (ret == -EAGAIN) {
+			kfree(phys);
 			return ret;
+		}
 		if (ret)
 			break;
 		r->ext_win[i].dva = dva;
-		dev_dbg(dcp->dev, "window %d claimed at DVA %#llx\n", i, dva);
+		r->ext_win[i].cap = want;
+		dev_dbg(dcp->dev, "window %d (%zu MiB) claimed at DVA %#llx\n", i, want >> 20, dva);
 		pick = i;
 	}
 	if (pick < 0) {
 		for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
-			if (dcp_m4_ext_win_idle(r, i) &&
+			if (dcp_m4_ext_win_idle(r, i) && r->ext_win[i].cap >= want &&
 			    (pick < 0 || time_before(r->ext_win[i].used, r->ext_win[pick].used)))
 				pick = i;
-		if (pick < 0)
+		if (pick < 0) {
+			kfree(phys);
 			return -ENOSPC;
+		}
 		/* A failed unmap is a hardware error, not a reason to copy. */
 		ret = dcp_m4_ext_win_release(r, pick);
-		if (ret)
+		if (ret) {
+			kfree(phys);
 			return ret;
+		}
 	}
 	w = &r->ext_win[pick];
-	ret = fb->pages(fb->key, &phys, &count);
-	if (ret)
-		return -EOPNOTSUPP;
-	if ((size_t)count * SZ_16K < need || count > SZ_32M / SZ_16K) {
-		kfree(phys);
-		return -EOPNOTSUPP;
-	}
 	/* The reference first: a failed mapping keeps the pages until reboot. */
 	fb->get(fb->key);
 	w->key = fb->key;
@@ -5131,7 +5151,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	ret = -EOPNOTSUPP;
 	need = PAGE_ALIGN((size_t)fb->pitch * fb->height);
 	if (fb->width != r->ext_width || fb->height != r->ext_height ||
-	    fb->pitch < fb->width * 4 || fb->pitch % 64 || need > SZ_32M)
+	    fb->pitch < fb->width * 4 || fb->pitch % 64 || need > SZ_64M)
 		goto out;
 	/* Last before the DART is touched; no callback is handled until the swap. */
 	ret = dcp_m4_ext_scanout_gate(dcp);
