@@ -217,7 +217,7 @@ static const struct apple_cio_hw apple_cio_t8142_hw = {
  * states are enabled, then drops; it also dropped in the middle of a
  * transition to an asymmetric width. Its links stay in CL0 and symmetric.
  * Gen4 itself is not a property of this description: see
- * apple_nhi_host_gen4().
+ * apple_nhi_probe_host_gen4().
  */
 static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.dpin_count = 4,
@@ -1436,6 +1436,8 @@ struct apple_nhi {
 	struct tb *tb;
 	struct tb_nhi nhi;
 	struct tb_nhi_ops ops;
+	/* the host router's lane adapters report Gen4 (read once at probe) */
+	bool host_gen4;
 
 	void __iomem *nhi_base;
 	struct apple_tunable *nhi_tunable;
@@ -2578,23 +2580,30 @@ static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
  * A host router that can run USB4 Gen4 says so in the Supported Link Speeds
  * field of its lane adapters (USB4 v2, LANE_ADP_CS_0). The field is the
  * same on every Apple USB4 router, so this, not the SoC, decides whether a
- * Gen4 cable word is handed to the router.
+ * Gen4 cable word is handed to the router. It is a property of the router
+ * itself, so it is read once at probe and kept: a read that fails later
+ * (around a wake) must not turn a Gen4 router into a 20 Gb/s one.
  */
-static bool apple_nhi_host_gen4(struct tb_switch *sw)
+static bool apple_nhi_probe_host_gen4(struct apple_nhi *anhi)
 {
 	struct tb_port *port;
+	bool read_any = false;
 	u32 val;
 
-	tb_switch_for_each_port(sw, port) {
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
 		if (!tb_port_is_null(port) || !port->cap_phy)
 			continue;
 		if (tb_port_read(port, &val, TB_CFG_PORT,
 				 port->cap_phy + LANE_ADP_CS_0, 1))
 			continue;
+		read_any = true;
 		if (FIELD_GET(LANE_ADP_CS_0_SUPPORTED_SPEED_MASK, val) &
 		    LANE_ADP_CS_0_SUPPORTED_SPEED_GEN4)
 			return true;
 	}
+	if (!read_any)
+		dev_warn(anhi->dev,
+			 "no host lane adapter readable, Gen4 cables get the 20 Gb/s word\n");
 	return false;
 }
 
@@ -2606,7 +2615,7 @@ static u32 apple_nhi_cable_info(struct apple_nhi *anhi, u32 info)
 {
 	if (!(info & TB_VSE_CAP_APPLE_CABLE_INFO_GEN4))
 		return info;
-	if (apple_nhi_host_gen4(anhi->tb->root_switch)) {
+	if (anhi->host_gen4) {
 		dev_dbg(anhi->dev, "Gen4 cable, host router supports Gen4\n");
 		return info;
 	}
@@ -2834,6 +2843,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 				 port->port, ret);
 	}
 
+	anhi->host_gen4 = apple_nhi_probe_host_gen4(anhi);
 	cable_info = apple_nhi_cable_info(anhi, acio->target_cable_info);
 	ret = tb_sw_write(anhi->tb->root_switch, &cable_info, TB_CFG_SWITCH,
 			  cap_apple + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
@@ -3958,7 +3968,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
 		if (data->orientation == TYPEC_ORIENTATION_REVERSE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ORIENTATION_REVERSE;
-		dev_dbg(acio->dev, "USB4 cable: eudo 0x%x, orientation %d -> cable info 0x%x\n",
+		dev_dbg(acio->dev, "USB4 cable: eudo 0x%x, orientation %d -> requested cable info 0x%x\n",
 			data->usb4.eudo, data->orientation, acio->target_cable_info);
 		break;
 	}
