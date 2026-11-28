@@ -77,6 +77,11 @@ static int dcp_v14_pmp_wait_ready(struct device_node *entry,
 	symbol_put(apple_pmp_report_wait_ready);
 	return ret;
 }
+/*
+ * Extra RTKit boots after a wake that timed out (-ETIME). Why the first
+ * handshake times out is not known (aurora-silicon/linux#2461); every retry
+ * that was needed is logged so the cause can be found and the loop dropped.
+ */
 #define DCP_V14_RTKIT_RETRIES	4
 #define DCP_V14_MAX_PROPERTIES	256
 #define DCP_V14_MAX_RAW		32
@@ -1485,6 +1490,8 @@ static void dcp_v14_idle(struct work_struct *work)
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v14->failed = true;
 		dev_err(v14->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+		/* Nothing pumps the link again: stop it queueing events. */
+		dcp_v14_link_fail(&v14->link);
 		dcp_v14_external_stopped(v14);
 	}
 	mutex_unlock(&v14->lock);
@@ -2291,6 +2298,8 @@ static int dcpext_boot(struct apple_dcp *dcp)
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
 		ret = apple_rtkit_boot(rtk);
+	if (n)
+		dev_warn(dev, "RTKit wake timed out; %u extra boot(s), last %d\n", n, ret);
 	if (ret) {
 		dev_err(dev, "dcpext RTKit did not wake: %d\n", ret);
 		return ret;
@@ -2390,6 +2399,11 @@ int iomfb_v14_7_external_open(struct apple_dcp *dcp)
 		v14->opened = true;
 	} else {
 		v14->failed = true;
+		/*
+		 * A refused open (-EPROTO) leaves the link running: nothing pumps
+		 * a failed session, so stop it queueing events.
+		 */
+		dcp_v14_link_fail(&v14->link);
 		dcp_v14_external_stopped(v14);
 	}
 	mutex_unlock(&v14->lock);
@@ -2470,6 +2484,8 @@ int iomfb_v14_7_bind(struct apple_dcp *dcp)
 	ret = apple_rtkit_wake(rtk);
 	for (n = 0; ret == -ETIME && n < DCP_V14_RTKIT_RETRIES; n++)
 		ret = apple_rtkit_boot(rtk);
+	if (n)
+		dev_warn(dev, "RTKit wake timed out; %u extra boot(s), last %d\n", n, ret);
 	if (ret) {
 		v14->failed = true;
 		return dev_err_probe(dev, ret,
@@ -2719,6 +2735,8 @@ fail:
 	dev_err(dcp->dev,
 		"%s display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
 		v14->board->name, step, ret);
+	/* Nothing pumps a failed session: stop the link queueing events. */
+	dcp_v14_link_fail(&v14->link);
 	return ret;
 }
 
@@ -2907,8 +2925,11 @@ static int dcp_v14_swap_locked(struct apple_dcp_v14 *v14, const u8 *surface, u64
 	 * refuses it, which ends nothing. Link failures stop the session in
 	 * dcp_v14_call() either way.
 	 */
-	if (ret && !v14->external)
+	if (ret && !v14->external) {
 		v14->failed = true;
+		/* Nothing pumps a failed session: stop the link queueing events. */
+		dcp_v14_link_fail(&v14->link);
+	}
 
 	kfree(swap);
 	return ret;

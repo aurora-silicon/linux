@@ -800,6 +800,8 @@ static void dcp_v26_idle(struct work_struct *work)
 	if (ret && ret != -ETIMEDOUT && ret != -EAGAIN) {
 		v26->failed = true;
 		dev_err(v26->dev, "DCP notification failed: %d; recovery requires a reboot\n", ret);
+		/* Nothing pumps the link again: stop it queueing events. */
+		dcp_v26_link_fail(&v26->link);
 	}
 	mutex_unlock(&v26->lock);
 }
@@ -1487,6 +1489,8 @@ fail:
 	dev_err(dcp->dev,
 		"%s display not started: %s failed: %d; the boot framebuffer stays (reboot to retry)\n",
 		v26->board->name, step, ret);
+	/* Nothing pumps a failed session: stop the link queueing events. */
+	dcp_v26_link_fail(&v26->link);
 	return ret;
 }
 
@@ -1635,6 +1639,8 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 	}
 	if (ret) {
 		v26->failed = true;
+		/* Nothing pumps a failed session: stop the link queueing events. */
+		dcp_v26_link_fail(&v26->link);
 	} else {
 		dcp_v26_brightness_done(v26, brightness);
 		rec.replied = v26->link.reply_time;
