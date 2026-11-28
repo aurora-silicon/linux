@@ -32,7 +32,9 @@ int pci_mmap_resource_range(struct pci_dev *pdev, int bar,
 	if (vma->vm_pgoff + vma_pages(vma) > size)
 		return -EINVAL;
 
-	if (write_combine)
+	if (pci_resource_flags(pdev, bar) & IORESOURCE_MEM_NONPOSTED)
+		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	else if (write_combine)
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	else
 		vma->vm_page_prot = pgprot_device(vma->vm_page_prot);

@@ -100,6 +100,8 @@ void __iomem *pci_iomap_wc_range(struct pci_dev *dev,
 	if (maxlen && len > maxlen)
 		len = maxlen;
 
+	if (flags & IORESOURCE_MEM_NONPOSTED)
+		return ioremap_np(start, len) ?: ioremap(start, len);
 	if (flags & IORESOURCE_MEM)
 		return ioremap_wc(start, len);
 

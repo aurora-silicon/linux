@@ -184,11 +184,33 @@ static void radeon_fbdev_fb_destroy(struct fb_info *info)
 	drm_client_release(&fb_helper->client);
 }
 
+static int radeon_fbdev_fb_mmap(struct fb_info *info,
+				struct vm_area_struct *vma)
+{
+	struct drm_fb_helper *fb_helper = info->par;
+	struct radeon_device *rdev = fb_helper->dev->dev_private;
+
+	/*
+	 * Behind a non-posted BAR, write-combine mappings let userspace
+	 * execute DC ZVA / zero-fill instructions that trigger an async
+	 * SError. Map Device-nGnRnE so unsupported stores fault with SIGBUS.
+	 */
+	if (pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED) {
+		vma->vm_page_prot = pgprot_noncached(vma_get_page_prot(vma));
+		return vm_iomap_memory(vma, info->fix.smem_start,
+				       info->fix.smem_len);
+	}
+
+	return fb_io_mmap(info, vma);
+}
+
 static const struct fb_ops radeon_fbdev_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_open = radeon_fbdev_fb_open,
 	.fb_release = radeon_fbdev_fb_release,
-	FB_DEFAULT_IOMEM_OPS,
+	__FB_DEFAULT_IOMEM_OPS_RDWR,
+	__FB_DEFAULT_IOMEM_OPS_DRAW,
+	.fb_mmap = radeon_fbdev_fb_mmap,
 	DRM_FB_HELPER_DEFAULT_OPS,
 	.fb_destroy = radeon_fbdev_fb_destroy,
 };

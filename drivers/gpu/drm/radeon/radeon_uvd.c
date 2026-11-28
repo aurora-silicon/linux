@@ -466,13 +466,21 @@ static int radeon_uvd_validate_codec(struct radeon_cs_parser *p,
 static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 			     unsigned offset, unsigned buf_sizes[])
 {
-	int32_t *msg, msg_type, handle;
+	uint32_t msg[29];
+	int32_t msg_type, handle;
 	unsigned img_size = 0;
+	size_t bo_size;
 	void *ptr;
 	int i, r;
 
 	if (offset & 0x3F) {
 		DRM_ERROR("UVD messages must be 64 byte aligned!\n");
+		return -EINVAL;
+	}
+
+	bo_size = radeon_bo_size(bo);
+	if (offset >= bo_size || bo_size - offset < 3 * sizeof(uint32_t)) {
+		DRM_ERROR("UVD message exceeds buffer size!\n");
 		return -EINVAL;
 	}
 
@@ -482,7 +490,9 @@ static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 		return r;
 	}
 
-	msg = ptr + offset;
+	memset(msg, 0, sizeof(msg));
+	radeon_bo_memcpy_from(bo, msg, (u8 *)ptr + offset,
+			      min_t(size_t, sizeof(msg), bo_size - offset));
 
 	msg_type = msg[1];
 	handle = msg[2];
@@ -495,6 +505,12 @@ static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 
 	switch (msg_type) {
 	case 0:
+		if (bo_size - offset < 9 * sizeof(uint32_t)) {
+			radeon_bo_kunmap(bo);
+			DRM_ERROR("UVD create message exceeds buffer size!\n");
+			return -EINVAL;
+		}
+
 		/* it's a create msg, calc image size (width * height) */
 		img_size = msg[7] * msg[8];
 
@@ -521,6 +537,12 @@ static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 		return -EINVAL;
 
 	case 1:
+		if (bo_size - offset < sizeof(msg)) {
+			radeon_bo_kunmap(bo);
+			DRM_ERROR("UVD decode message exceeds buffer size!\n");
+			return -EINVAL;
+		}
+
 		/* it's a decode msg, validate codec and calc buffer sizes */
 		r = radeon_uvd_validate_codec(p, msg[4]);
 		if (!r)

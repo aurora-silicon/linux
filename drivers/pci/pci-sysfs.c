@@ -1393,6 +1393,11 @@ static umode_t pci_dev_resource_wc_is_visible(struct kobject *kobj,
 					      const struct bin_attribute *a,
 					      int n)
 {
+	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
+
+	if (pci_resource_flags(pdev, n) & IORESOURCE_MEM_NONPOSTED)
+		return 0;
+
 	return __pci_resource_attr_is_visible(kobj, a, n, true,
 					      IORESOURCE_MEM | IORESOURCE_PREFETCH);
 }

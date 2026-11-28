@@ -6459,9 +6459,9 @@ void cik_init_cp_pg_table(struct radeon_device *rdev)
 				table_size = le32_to_cpu(hdr->jt_size);
 			}
 
-			for (i = 0; i < table_size; i ++) {
-				dst_ptr[bo_offset + i] =
-					cpu_to_le32(le32_to_cpu(fw_data[table_offset + i]));
+			for (i = 0; i < table_size; i++) {
+				writel(le32_to_cpu(fw_data[table_offset + i]),
+				       (void __iomem *)&dst_ptr[bo_offset + i]);
 			}
 			bo_offset += table_size;
 		} else {
@@ -6482,9 +6482,9 @@ void cik_init_cp_pg_table(struct radeon_device *rdev)
 				table_offset = CP_MEC_TABLE_OFFSET;
 			}
 
-			for (i = 0; i < table_size; i ++) {
-				dst_ptr[bo_offset + i] =
-					cpu_to_le32(be32_to_cpu(fw_data[table_offset + i]));
+			for (i = 0; i < table_size; i++) {
+				writel(be32_to_cpu(fw_data[table_offset + i]),
+				       (void __iomem *)&dst_ptr[bo_offset + i]);
 			}
 			bo_offset += table_size;
 		}

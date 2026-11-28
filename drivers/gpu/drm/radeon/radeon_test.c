@@ -149,11 +149,14 @@ static void radeon_do_test_moves(struct radeon_device *rdev, int flag)
 		     vram_start = vram_map, vram_end = vram_map + size;
 		     vram_start < vram_end;
 		     gtt_start++, vram_start++) {
-			if (*vram_start != gtt_start) {
+			void *val;
+
+			radeon_bo_memcpy_from(vram_obj, &val, vram_start, sizeof(val));
+			if (val != gtt_start) {
 				DRM_ERROR("Incorrect GTT->VRAM copy %d: Got 0x%p, "
 					  "expected 0x%p (GTT/VRAM offset "
 					  "0x%16llx/0x%16llx)\n",
-					  i, *vram_start, gtt_start,
+					  i, val, gtt_start,
 					  (unsigned long long)
 					  (gtt_addr - rdev->mc.gtt_start +
 					   (void *)gtt_start - gtt_map),
@@ -163,7 +166,7 @@ static void radeon_do_test_moves(struct radeon_device *rdev, int flag)
 				radeon_bo_kunmap(vram_obj);
 				goto out_lclean_unpin;
 			}
-			*vram_start = vram_start;
+			radeon_bo_memcpy_to(vram_obj, vram_start, &vram_start, sizeof(vram_start));
 		}
 
 		radeon_bo_kunmap(vram_obj);

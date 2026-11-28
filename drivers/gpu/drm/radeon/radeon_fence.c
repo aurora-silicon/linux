@@ -69,8 +69,12 @@ static void radeon_fence_write(struct radeon_device *rdev, u32 seq, int ring)
 	struct radeon_fence_driver *drv = &rdev->fence_drv[ring];
 
 	if (likely(rdev->wb.enabled || !drv->scratch_reg)) {
-		if (drv->cpu_addr)
-			*drv->cpu_addr = cpu_to_le32(seq);
+		if (drv->cpu_addr) {
+			if (ring == R600_RING_TYPE_UVD_INDEX)
+				writel(seq, (void __iomem *)drv->cpu_addr);
+			else
+				*drv->cpu_addr = cpu_to_le32(seq);
+		}
 	} else {
 		WREG32(drv->scratch_reg, seq);
 	}
@@ -91,10 +95,14 @@ static u32 radeon_fence_read(struct radeon_device *rdev, int ring)
 	u32 seq = 0;
 
 	if (likely(rdev->wb.enabled || !drv->scratch_reg)) {
-		if (drv->cpu_addr)
-			seq = le32_to_cpu(*drv->cpu_addr);
-		else
+		if (drv->cpu_addr) {
+			if (ring == R600_RING_TYPE_UVD_INDEX)
+				seq = readl((void __iomem *)drv->cpu_addr);
+			else
+				seq = le32_to_cpu(*drv->cpu_addr);
+		} else {
 			seq = lower_32_bits(atomic64_read(&drv->last_seq));
+		}
 	} else {
 		seq = RREG32(drv->scratch_reg);
 	}

@@ -4209,7 +4209,7 @@ int sumo_rlc_init(struct radeon_device *rdev)
 		if (rdev->family >= CHIP_TAHITI) {
 			/* SI */
 			for (i = 0; i < rdev->rlc.reg_list_size; i++)
-				dst_ptr[i] = cpu_to_le32(src_ptr[i]);
+				writel(src_ptr[i], (void __iomem *)&dst_ptr[i]);
 		} else {
 			/* ON/LN/TN */
 			/* format:
@@ -4223,10 +4223,11 @@ int sumo_rlc_init(struct radeon_device *rdev)
 				if (i < dws)
 					data |= (src_ptr[i] >> 2) << 16;
 				j = (((i - 1) * 3) / 2);
-				dst_ptr[j] = cpu_to_le32(data);
+				writel(data, (void __iomem *)&dst_ptr[j]);
 			}
 			j = ((i * 3) / 2);
-			dst_ptr[j] = cpu_to_le32(RLC_SAVE_RESTORE_LIST_END_MARKER);
+			writel(RLC_SAVE_RESTORE_LIST_END_MARKER,
+			       (void __iomem *)&dst_ptr[j]);
 		}
 		radeon_bo_kunmap(rdev->rlc.save_restore_obj);
 		radeon_bo_unreserve(rdev->rlc.save_restore_obj);
@@ -4284,7 +4285,17 @@ int sumo_rlc_init(struct radeon_device *rdev)
 			return r;
 		}
 		/* set up the cs buffer */
-		dst_ptr = rdev->rlc.cs_ptr;
+		if (rdev->rlc.clear_state_obj->tbo.resource->bus.is_nonposted) {
+			dst_ptr = kvzalloc(dws * 4, GFP_KERNEL);
+			if (!dst_ptr) {
+				radeon_bo_kunmap(rdev->rlc.clear_state_obj);
+				radeon_bo_unreserve(rdev->rlc.clear_state_obj);
+				sumo_rlc_fini(rdev);
+				return -ENOMEM;
+			}
+		} else {
+			dst_ptr = rdev->rlc.cs_ptr;
+		}
 		if (rdev->family >= CHIP_BONAIRE) {
 			cik_get_csb_buffer(rdev, dst_ptr);
 		} else if (rdev->family >= CHIP_TAHITI) {
@@ -4323,6 +4334,11 @@ int sumo_rlc_init(struct radeon_device *rdev)
 				}
 			}
 			dst_ptr[reg_list_hdr_blk_index] = cpu_to_le32(RLC_CLEAR_STATE_END_MARKER);
+		}
+		if (dst_ptr != rdev->rlc.cs_ptr) {
+			memcpy_toio((void __iomem *)rdev->rlc.cs_ptr,
+				    (const void *)dst_ptr, dws * 4);
+			kvfree((void *)dst_ptr);
 		}
 		radeon_bo_kunmap(rdev->rlc.clear_state_obj);
 		radeon_bo_unreserve(rdev->rlc.clear_state_obj);

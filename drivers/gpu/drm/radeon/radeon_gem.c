@@ -100,6 +100,17 @@ int radeon_gem_object_create(struct radeon_device *rdev, unsigned long size,
 	unsigned long max_size;
 	int r;
 
+	/*
+	 * Non-posted VRAM requires kernel I/O accessors; userspace BOs that
+	 * ask for CPU access start in GTT.
+	 */
+	if (!kernel && (flags & RADEON_GEM_CPU_ACCESS) &&
+	    (initial_domain & RADEON_GEM_DOMAIN_VRAM) &&
+	    (pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED)) {
+		flags &= ~RADEON_GEM_CPU_ACCESS;
+		initial_domain = RADEON_GEM_DOMAIN_GTT;
+	}
+
 	*obj = NULL;
 	/* At least align on page size */
 	if (alignment < PAGE_SIZE) {
@@ -302,8 +313,12 @@ int radeon_gem_info_ioctl(struct drm_device *dev, void *data,
 	man = ttm_manager_type(&rdev->mman.bdev, TTM_PL_VRAM);
 
 	args->vram_size = (u64)man->size << PAGE_SHIFT;
-	args->vram_visible = rdev->mc.visible_vram_size;
-	args->vram_visible -= rdev->vram_pin_size;
+	if (pci_resource_flags(rdev->pdev, 0) & IORESOURCE_MEM_NONPOSTED) {
+		args->vram_visible = 0;
+	} else {
+		args->vram_visible = rdev->mc.visible_vram_size;
+		args->vram_visible -= rdev->vram_pin_size;
+	}
 	args->gart_size = rdev->mc.gtt_size;
 	args->gart_size -= rdev->gart_pin_size;
 
@@ -855,6 +870,9 @@ int radeon_mode_dumb_create(struct drm_file *file_priv,
 		return -EINVAL;
 
 	r = radeon_gem_object_create(rdev, args->size, 0,
+				     (pci_resource_flags(rdev->pdev, 0) &
+				      IORESOURCE_MEM_NONPOSTED) ?
+				     RADEON_GEM_DOMAIN_GTT :
 				     RADEON_GEM_DOMAIN_VRAM, 0,
 				     false, &gobj);
 	if (r)
