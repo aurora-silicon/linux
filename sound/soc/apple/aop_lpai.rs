@@ -26,6 +26,11 @@
 //! report after a start only sets the position, so audio from before the start
 //! is never copied.
 //!
+//! Samples the driver cannot deliver in order (a producer that lapped the
+//! consumer, stepped back, or skipped ahead) are a capture overrun: the
+//! stream stops with an xrun, as for any capture device that lost data, and
+//! the application's prepare restarts it at the producer.
+//!
 //! Copyright (C) 2026 The Aurora Silicon Contributors
 
 use core::{mem, ptr, slice};
@@ -129,11 +134,10 @@ const RING_BYTES_MAX: usize = 64 << 20;
 
 /// Warning classes, one message per class and driver instance.
 const WARN_MALFORMED: usize = 0;
-const WARN_GAP: usize = 1;
+const WARN_LOST: usize = 1;
 const WARN_BACKWARDS: usize = 2;
-const WARN_OVERRUN: usize = 3;
-const WARN_CURSOR: usize = 4;
-const WARN_COUNT: usize = 5;
+const WARN_CURSOR: usize = 3;
+const WARN_COUNT: usize = 4;
 
 fn le_u32(buf: &[u8], off: usize) -> Option<u32> {
     let b = buf.get(off..off.checked_add(4)?)?;
@@ -423,8 +427,10 @@ pub(crate) fn parse_ring_report(report: &[u8], frame_bytes: usize) -> Option<(u6
 /// What the consumer at `copied` does with a ring producer position.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RingStep {
-    /// Take the position without copying (first report, backwards, overrun).
-    Rebase,
+    /// The first report after a start: take the position without copying.
+    Start,
+    /// The producer stepped back or lapped the consumer: samples are lost.
+    Lost,
     Copy(usize),
 }
 
@@ -450,37 +456,32 @@ pub(crate) fn ring_geometry(format: &StreamFormat, frames: u64, quantum: u64) ->
 
 pub(crate) fn ring_step(copied: Option<u64>, absolute: u64, ring_bytes: usize) -> RingStep {
     match copied {
+        None => RingStep::Start,
         Some(c) if absolute >= c && ((absolute - c) as usize) < ring_bytes => {
             RingStep::Copy((absolute - c) as usize)
         }
-        _ => RingStep::Rebase,
+        Some(_) => RingStep::Lost,
     }
 }
 
-/// What a sample span means for a consumer at `copied`: the bytes of the
-/// span to skip (already copied), and whether a gap was crossed.
+/// What a sample span means for a consumer at `copied`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Continuity {
-    /// Copy the span from `skip` bytes in.
-    Copy { skip: usize, gap: bool },
+    /// Copy the span from `skip` bytes in (already copied).
+    Copy { skip: usize },
+    /// The span starts after what was copied: the samples between are lost.
+    Gap,
     /// The whole span is older than what was copied.
     Stale,
 }
 
 pub(crate) fn continuity(copied: Option<u64>, span: &SampleSpan) -> Continuity {
     match copied {
-        None => Continuity::Copy {
-            skip: 0,
-            gap: false,
-        },
+        None => Continuity::Copy { skip: 0 },
         Some(c) if span.end <= c => Continuity::Stale,
-        Some(c) if span.start >= c => Continuity::Copy {
-            skip: 0,
-            gap: span.start > c,
-        },
+        Some(c) if span.start > c => Continuity::Gap,
         Some(c) => Continuity::Copy {
             skip: (c - span.start) as usize,
-            gap: false,
         },
     }
 }
@@ -868,14 +869,23 @@ impl LpaiCapture {
             return Ok(());
         }
         let len = match ring_step(st.copied, absolute, ring_bytes) {
-            RingStep::Rebase => {
-                if let Some(c) = st.copied {
-                    let class = if absolute < c { WARN_BACKWARDS } else { WARN_OVERRUN };
-                    if self.warn_once(class) {
-                        dev_warn!(self.dev, "lpai ring position lost, continuing at the producer\n");
-                    }
-                }
+            RingStep::Start => {
                 st.copied = Some(absolute);
+                return Ok(());
+            }
+            RingStep::Lost => {
+                let c = st.copied.unwrap_or(absolute);
+                let class = if absolute < c { WARN_BACKWARDS } else { WARN_LOST };
+                if self.warn_once(class) {
+                    dev_warn!(
+                        self.dev,
+                        "lpai ring producer at {} with {} copied (ring {} bytes): overrun\n",
+                        absolute,
+                        c,
+                        ring_bytes
+                    );
+                }
+                Self::overrun(&st);
                 return Ok(());
             }
             RingStep::Copy(0) => return Ok(()),
@@ -899,6 +909,15 @@ impl LpaiCapture {
         }
         self.advance(&mut st, absolute, dst, len);
         Ok(())
+    }
+
+    /// Stops the stream with an xrun: the samples the producer announced
+    /// cannot be delivered in order.  Called under the stream state lock,
+    /// which the trigger callback (run under the ALSA stream lock) never
+    /// takes: the order `snd_pcm_period_elapsed()` already uses here.
+    fn overrun(st: &StreamState) {
+        // SAFETY: the substream is valid while registered in the state.
+        unsafe { bindings::snd_pcm_stop_xrun(st.substream) };
     }
 
     fn advance(&self, st: &mut StreamState, absolute: u64, new_ptr: usize, len: usize) {
@@ -942,19 +961,26 @@ impl ReportListener for LpaiCapture {
                 }
                 return Ok(());
             }
-            Continuity::Copy { skip, gap } => {
-                if gap && self.warn_once(WARN_GAP) {
-                    dev_warn!(self.dev, "lpai stream gap, continuing at the new position\n");
+            Continuity::Gap => {
+                if self.warn_once(WARN_LOST) {
+                    dev_warn!(
+                        self.dev,
+                        "lpai report starts at {} with {} copied: overrun\n",
+                        span.start,
+                        st.copied.unwrap_or(0)
+                    );
                 }
-                skip
+                Self::overrun(&st);
+                return Ok(());
             }
+            Continuity::Copy { skip } => skip,
         };
         let samples = &report[span.offset + skip..span.offset + span.len];
         if samples.len() >= st.buffer_bytes {
-            if self.warn_once(WARN_OVERRUN) {
-                dev_warn!(self.dev, "lpai report larger than the ALSA buffer\n");
+            if self.warn_once(WARN_LOST) {
+                dev_warn!(self.dev, "lpai report larger than the ALSA buffer: overrun\n");
             }
-            st.copied = Some(span.end);
+            Self::overrun(&st);
             return Ok(());
         }
         // SAFETY: the substream is registered in the stream state, which
@@ -1159,10 +1185,10 @@ mod tests {
     #[test]
     fn continuity_follows_the_absolute_byte_count() {
         let span = |start, end| SampleSpan { start, end, offset: 0, len: (end - start) as usize };
-        assert_eq!(continuity(None, &span(60, 120)), Continuity::Copy { skip: 0, gap: false });
-        assert_eq!(continuity(Some(60), &span(60, 120)), Continuity::Copy { skip: 0, gap: false });
-        assert_eq!(continuity(Some(30), &span(60, 120)), Continuity::Copy { skip: 0, gap: true });
-        assert_eq!(continuity(Some(90), &span(60, 120)), Continuity::Copy { skip: 30, gap: false });
+        assert_eq!(continuity(None, &span(60, 120)), Continuity::Copy { skip: 0 });
+        assert_eq!(continuity(Some(60), &span(60, 120)), Continuity::Copy { skip: 0 });
+        assert_eq!(continuity(Some(30), &span(60, 120)), Continuity::Gap);
+        assert_eq!(continuity(Some(90), &span(60, 120)), Continuity::Copy { skip: 30 });
         assert_eq!(continuity(Some(120), &span(60, 120)), Continuity::Stale);
     }
 
@@ -1287,11 +1313,11 @@ mod tests {
     }
 
     #[test]
-    fn the_ring_consumer_starts_at_the_producer_and_rebases_on_loss() {
-        assert_eq!(ring_step(None, 38400, 768000), RingStep::Rebase);
+    fn the_ring_consumer_starts_at_the_producer_and_reports_loss() {
+        assert_eq!(ring_step(None, 38400, 768000), RingStep::Start);
         assert_eq!(ring_step(Some(38400), 76800, 768000), RingStep::Copy(38400));
-        assert_eq!(ring_step(Some(76800), 38400, 768000), RingStep::Rebase);
-        assert_eq!(ring_step(Some(0), 768000, 768000), RingStep::Rebase);
+        assert_eq!(ring_step(Some(76800), 38400, 768000), RingStep::Lost);
+        assert_eq!(ring_step(Some(0), 768000, 768000), RingStep::Lost);
         assert_eq!(ring_step(Some(0), 767988, 768000), RingStep::Copy(767988));
     }
 
