@@ -6,7 +6,9 @@
 #include "xe_bo.h"
 
 #include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
 #include <linux/nospec.h>
+#include <linux/pci.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_dumb_buffers.h>
@@ -22,6 +24,7 @@
 
 #include <trace/events/gpu_mem.h>
 
+#include "regs/xe_bars.h"
 #include "xe_device.h"
 #include "xe_dma_buf.h"
 #include "xe_drm_client.h"
@@ -615,6 +618,8 @@ static struct ttm_tt *xe_ttm_tt_create(struct ttm_buffer_object *ttm_bo,
 		if ((!bo->cpu_caching && bo->flags & XE_BO_FLAG_FORCE_WC) ||
 		    (!xe->info.has_cached_pt && bo->flags & XE_BO_FLAG_PAGETABLE))
 			caching = ttm_write_combined;
+	} else if (!dev_is_dma_coherent(xe->drm.dev)) {
+		caching = ttm_write_combined;
 	}
 
 	if (bo->flags & XE_BO_FLAG_NEEDS_UC) {
@@ -754,10 +759,15 @@ static int xe_ttm_io_mem_reserve(struct ttm_device *bdev,
 
 		mem->bus.offset += vram->io_start;
 		mem->bus.is_iomem = true;
-
+		if (pci_resource_flags(to_pci_dev(xe->drm.dev), LMEM_BAR) &
+		    IORESOURCE_MEM_NONPOSTED) {
+			mem->bus.is_nonposted = true;
+			mem->bus.caching = ttm_uncached;
+		} else {
 #if  !IS_ENABLED(CONFIG_X86)
-		mem->bus.caching = ttm_write_combined;
+			mem->bus.caching = ttm_write_combined;
 #endif
+		}
 		return 0;
 	} case XE_PL_STOLEN:
 		return xe_ttm_stolen_io_mem_reserve(xe, mem);
@@ -2025,6 +2035,19 @@ static void xe_gem_object_close(struct drm_gem_object *obj,
 
 static bool should_migrate_to_smem(struct xe_bo *bo)
 {
+	struct xe_device *xe = xe_bo_device(bo);
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+
+	/*
+	 * Behind a non-posted LMEM BAR, userspace VRAM mappings use
+	 * Device-nGnRnE attributes which fault on arm64 memset(0) (dc zva).
+	 * Migrate unpinned BOs to system memory when permitted.
+	 */
+	if ((bo->flags & XE_BO_FLAG_SYSTEM) &&
+	    !xe_bo_is_pinned(bo) &&
+	    (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED))
+		return true;
+
 	/*
 	 * NOTE: The following atomic checks are platform-specific. For example,
 	 * if a device supports CXL atomics, these may not be necessary or
@@ -2471,9 +2494,11 @@ struct xe_bo *xe_bo_init_locked(struct xe_device *xe, struct xe_bo *bo,
 		flags |= XE_BO_FLAG_INTERNAL_64K;
 		alignment = align >> PAGE_SHIFT;
 	} else {
-		aligned_size = ALIGN(size, SZ_4K);
+		aligned_size = ALIGN(size, PAGE_SIZE);
+		if (type != ttm_bo_type_device)
+			size = aligned_size;
 		flags &= ~XE_BO_FLAG_INTERNAL_64K;
-		alignment = SZ_4K >> PAGE_SHIFT;
+		alignment = 1;
 	}
 
 	if (type == ttm_bo_type_device && aligned_size != size) {

@@ -38,6 +38,11 @@ static bool resource_is_valid(struct pci_dev *pdev, int bar)
 	return true;
 }
 
+static void xe_vram_unmap_np(void *mapping)
+{
+	iounmap((void __force __iomem *)mapping);
+}
+
 static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *lmem_bar)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
@@ -56,7 +61,16 @@ static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *
 	lmem_bar->dpa_base = 0;
 
 	/* set up a map to the total memory area. */
-	lmem_bar->mapping = devm_ioremap_wc(&pdev->dev, lmem_bar->io_start, lmem_bar->io_size);
+	if (pci_resource_flags(pdev, LMEM_BAR) & IORESOURCE_MEM_NONPOSTED) {
+		lmem_bar->mapping = ioremap_np(lmem_bar->io_start, lmem_bar->io_size);
+		if (lmem_bar->mapping &&
+		    devm_add_action_or_reset(&pdev->dev, xe_vram_unmap_np,
+					     (void __force *)lmem_bar->mapping))
+			lmem_bar->mapping = NULL;
+	} else {
+		lmem_bar->mapping = devm_ioremap_wc(&pdev->dev, lmem_bar->io_start,
+						    lmem_bar->io_size);
+	}
 
 	return 0;
 }
