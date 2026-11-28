@@ -61,6 +61,58 @@
 };
 
 /*
+ * The external display engines (dcpext0..3, die 0) on the USB-C ports. Each empty
+ * typec-routes container asks the boot loader to write the engine's routes from the ADT
+ * (dp-switch-* on the engine and on each port's direct DP output), for the ports whose PHY,
+ * crossbar and PD controller this tree describes: ATC1 (left-front) and ATC2 (right). The
+ * loader hands an engine over with its routes, or leaves it, and what its routes need,
+ * disabled. dcpext0's route through ATC2 in t6050-die0.dtsi is dropped, with the PHY,
+ * crossbar and DPTX die it names, so that its routes come from the ADT too (the loader writes
+ * no routes for an engine that already names PHYs or crossbars, and writes apple,dptx-die with
+ * the routes it adds; the binding allows none of them beside an empty typec-routes).
+ */
+&dcpext0 {
+	/delete-property/ apple,typec-dptx-phys;
+	/delete-property/ apple,typec-mux-indices;
+	/delete-property/ phys;
+	/delete-property/ phy-names;
+	/delete-property/ mux-controls;
+	/delete-property/ mux-control-names;
+	/delete-property/ apple,dptx-die;
+
+	typec-routes {
+		/delete-node/ route@0;
+	};
+};
+
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+/*
  * DisplayPort audio of the external displays. The K boards' ADT describes the same display
  * engines, display ADMACs and dp-audio nodes as the J714s (dcpext0..3, admac-dispext0..3,
  * dp-audio0..4), with dcpext0..2 driving displays of their own, so they take the J714s
