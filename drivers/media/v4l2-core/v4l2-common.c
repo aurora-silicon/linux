@@ -324,6 +324,8 @@ const struct v4l2_format_info *v4l2_format_info(u32 format)
 		{ .format = V4L2_PIX_FMT_NV24,    .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 2, .bpp = { 1, 2, 0, 0 }, .bpp_div = { 1, 1, 1, 1 }, .hdiv = 1, .vdiv = 1 },
 		{ .format = V4L2_PIX_FMT_NV42,    .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 2, .bpp = { 1, 2, 0, 0 }, .bpp_div = { 1, 1, 1, 1 }, .hdiv = 1, .vdiv = 1 },
 		{ .format = V4L2_PIX_FMT_P010,    .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 2, .bpp = { 2, 2, 0, 0 }, .bpp_div = { 1, 1, 1, 1 }, .hdiv = 2, .vdiv = 1 },
+		{ .format = V4L2_PIX_FMT_P030,    .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 2, .bpp = { 4, 8, 0, 0 }, .bpp_div = { 3, 3, 1, 1 }, .hdiv = 2, .vdiv = 2,
+		  .block_w = { 6, 6, 0, 0 }, .block_h = { 1, 1, 0, 0 }},
 		{ .format = V4L2_PIX_FMT_P012,    .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 2, .bpp = { 2, 4, 0, 0 }, .bpp_div = { 1, 1, 1, 1 }, .hdiv = 2, .vdiv = 2 },
 
 		{ .format = V4L2_PIX_FMT_YUV410,  .pixel_enc = V4L2_PIXEL_ENC_YUV, .mem_planes = 1, .comp_planes = 3, .bpp = { 1, 1, 1, 0 }, .bpp_div = { 1, 1, 1, 1 }, .hdiv = 4, .vdiv = 4 },
@@ -436,7 +438,7 @@ static inline unsigned int v4l2_format_plane_stride(const struct v4l2_format_inf
 {
 	unsigned int hdiv = plane ? info->hdiv : 1;
 	unsigned int aligned_width =
-		ALIGN(width, v4l2_format_block_width(info, plane));
+		roundup(width, v4l2_format_block_width(info, plane));
 
 	/*
 	 * Formats with a single memory plane derive the stride of the
@@ -466,7 +468,7 @@ static inline unsigned int v4l2_format_plane_height(const struct v4l2_format_inf
 {
 	unsigned int vdiv = plane ? info->vdiv : 1;
 	unsigned int aligned_height =
-		ALIGN(height, v4l2_format_block_height(info, plane));
+		roundup(height, v4l2_format_block_height(info, plane));
 
 	return DIV_ROUND_UP(aligned_height, vdiv);
 }

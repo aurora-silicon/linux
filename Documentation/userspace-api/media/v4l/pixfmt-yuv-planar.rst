@@ -159,6 +159,13 @@ All components are stored with the same number of bits per component.
       - Cb, Cr
       - Yes
       - Linear
+    * - V4L2_PIX_FMT_P030
+      - 'P030'
+      - 10
+      - 4:2:0
+      - Cb, Cr
+      - Yes
+      - Linear
     * - V4L2_PIX_FMT_NV15_4L4
       - 'VT15'
       - 15
@@ -384,6 +391,34 @@ with no padding between each component. A group of 4 components are stored over
 
 .. _V4L2-PIX-FMT-NV12MT:
 .. _V4L2-PIX-FMT-NV12MT-16X16:
+.. _V4L2-PIX-FMT-P030:
+
+P030
+----
+
+Semi-planar 10-bit YUV 4:2:0 format similar to NV12, the same layout as
+DRM_FORMAT_P030. Each little endian 32-bit word holds three 10-bit components
+in bits [9:0], [19:10] and [29:20], first component in the low bits; bits
+[31:30] are padding. The CbCr plane continues Cb, Cr, Cb, Cr, ... across the
+words in the same way. A line holds DIV_ROUND_UP(width, 3) words in each
+plane, so ``bytesperline`` is a multiple of 4 bytes and at least
+DIV_ROUND_UP(width, 3) * 4; drivers may pad it further.
+
+.. flat-table:: Sample 6x2 P030 Image (1 word per cell)
+    :header-rows:  0
+    :stub-columns: 0
+
+    * - start + 0:
+      - x\ Y'\ :sub:`02`\ Y'\ :sub:`01`\ Y'\ :sub:`00`
+      - x\ Y'\ :sub:`05`\ Y'\ :sub:`04`\ Y'\ :sub:`03`
+    * - start + stride:
+      - x\ Y'\ :sub:`12`\ Y'\ :sub:`11`\ Y'\ :sub:`10`
+      - x\ Y'\ :sub:`15`\ Y'\ :sub:`14`\ Y'\ :sub:`13`
+    * - start + 2 * stride:
+      - x\ Cb\ :sub:`01`\ Cr\ :sub:`00`\ Cb\ :sub:`00`
+      - x\ Cr\ :sub:`02`\ Cb\ :sub:`02`\ Cr\ :sub:`01`
+
+
 .. _V4L2-PIX-FMT-NV12-4L4:
 .. _V4L2-PIX-FMT-NV12-16L16:
 .. _V4L2-PIX-FMT-NV12-32L32:

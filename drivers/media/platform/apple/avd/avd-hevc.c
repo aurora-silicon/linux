@@ -316,6 +316,9 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+		     AVD_OP_HDR_FLAG_PACKED(ctx->decoded_fmt.fmt.pix_mp.pixelformat ==
+					    V4L2_PIX_FMT_P030 &&
+					    sps->bit_depth_luma_minus8 == 2) |
 		     AVD_OP_HDR_FLAG_INTRA(is_intra) | AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),

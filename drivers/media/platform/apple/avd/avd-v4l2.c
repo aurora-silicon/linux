@@ -151,6 +151,13 @@ static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
 {
 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
 			    pix_mp->height);
+	if (pix_mp->pixelformat == V4L2_PIX_FMT_P030) {
+		u32 bpl = ALIGN(DIV_ROUND_UP(pix_mp->width, 3) * 4, 64);
+
+		pix_mp->plane_fmt[0].bytesperline = bpl;
+		pix_mp->plane_fmt[0].sizeimage =
+			bpl * (pix_mp->height + DIV_ROUND_UP(pix_mp->height, 2));
+	}
 
 	comp->start_offset = pix_mp->plane_fmt[0].sizeimage;
 	fill_comp(comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
@@ -304,6 +311,11 @@ static const struct avd_decoded_fmt_desc avd_hevc_decoded_fmts[] = {
 		/* TODO: missing P210 */
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
+	},
+	{
+		/* After P010, so that P010 stays the default. */
+		.fourcc = V4L2_PIX_FMT_P030,
+		.image_fmt = AVD_IMG_FMT_420_10BIT,
 	},
 };
 
