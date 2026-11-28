@@ -743,6 +743,7 @@ static const u32 dcp_primary_formats[] = {
 
 /* The H17P alpha semantics of 10-bit XRGB are unknown. */
 static const u32 dcp_primary_formats_h17p[] = {
+	DRM_FORMAT_ABGR16161616F,	/* LAB ONLY (FW27-HDR): FP16 EDR test */
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,

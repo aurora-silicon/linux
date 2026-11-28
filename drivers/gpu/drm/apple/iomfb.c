@@ -985,6 +985,22 @@ static bool v27_sleep_power_oob;
 module_param(v27_sleep_power_oob, bool, 0644);
 MODULE_PARM_DESC(v27_sleep_power_oob, "V27 sleep: the power state calls on the out-of-band context (0, default: the command context)");
 
+/* LAB ONLY (K114S-DISPLAY, never for a PR): PQ surface tag sweep on firmware 27. */
+int dcp_lab_pq_xfer = -1, dcp_lab_pq_cs = -1, dcp_lab_pad_off = -1, dcp_lab_pad_val;
+module_param_named(lab_pq_xfer, dcp_lab_pq_xfer, int, 0644);
+module_param_named(lab_pq_cs, dcp_lab_pq_cs, int, 0644);
+module_param_named(lab_pad_off, dcp_lab_pad_off, int, 0644);
+module_param_named(lab_pad_val, dcp_lab_pad_val, int, 0644);
+static int dcp_lab_rate;
+module_param_named(lab_rate, dcp_lab_rate, int, 0644);
+EXPORT_SYMBOL_GPL(dcp_lab_pq_xfer);
+/* LAB ONLY (FW27-HDR): A457 swap submit on 27.2; xfer override for SDR-tagged FP16 surfaces. */
+int dcp_lab_a457, dcp_lab_sdr_xfer = -1;
+module_param_named(lab_a457, dcp_lab_a457, int, 0644);
+module_param_named(lab_sdr_xfer, dcp_lab_sdr_xfer, int, 0644);
+EXPORT_SYMBOL_GPL(dcp_lab_a457);
+EXPORT_SYMBOL_GPL(dcp_lab_sdr_xfer);
+
 /* macOS's A442 (key 0x41) on the out-of-band context alongside the display's power-on. */
 static bool v27_a442 = true;
 module_param(v27_a442, bool, 0644);
@@ -3649,6 +3665,8 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	 * firmware reported at start (dcp_rtk_syslog_boot_rate()), 120 Hz
 	 * when it reported none.
 	 */
+	if (dcp_lab_rate > 0)
+		return drm_mode_vrefresh(mode) == dcp_lab_rate;
 	if (dcp->hw.only_120hz_modes &&
 	    drm_mode_vrefresh(mode) != (READ_ONCE(dcp->boot_rate) ?: 120))
 		return false;
