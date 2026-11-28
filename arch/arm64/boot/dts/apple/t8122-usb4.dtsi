@@ -45,6 +45,17 @@
 				<0x328 0x3ffffffc 0x1f0bffc>;
 		};
 
+		apciec0_piodma: dma@722000000 {
+			compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
+			reg = <0x7 0x22000000 0x0 0x4000>,
+			      <0x7 0x22004000 0x0 0x4000>,
+			      <0x7 0x22008000 0x0 0x4000>,
+			      <0x7 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&usb4_0_pcie_dart 15>;
+		};
+
 		usb4_0_pcie: pcie@730000000 {
 			compatible = "apple,t8122-pciec", "apple,t8103-pciec";
 			device_type = "pci";
@@ -145,6 +156,17 @@
 				<0x318 0x1f31 0x1>,
 				<0x320 0x3ffffffc 0x1f00000>,
 				<0x328 0x3ffffffc 0x1f0bffc>;
+		};
+
+		apciec1_piodma: dma@b22000000 {
+			compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
+			reg = <0xb 0x22000000 0x0 0x4000>,
+			      <0xb 0x22004000 0x0 0x4000>,
+			      <0xb 0x22008000 0x0 0x4000>,
+			      <0xb 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1021 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&usb4_1_pcie_dart 15>;
 		};
 
 		usb4_1_pcie: pcie@b30000000 {
