@@ -69,6 +69,49 @@ static void dcp_firmware_27_method_admission(struct kunit *test)
 }
 
 /*
+ * The firmware 27 display sleep sends each call by the build's own ID, so a table carries it
+ * when it has an ID for every one of them: 27.0's (and the J714s copy) and 27.2's, not 27.3's
+ * yet. The answer is the one transport admission takes (iomfb_v27_sleep_methods_complete()).
+ */
+static void dcp_firmware_27_sleep_methods(struct kunit *test)
+{
+	const struct dcp_method_entry *earlier = iomfb_v27_methods("27.0.0");
+	const struct dcp_method_entry *later = iomfb_v27_methods("27.2.0");
+	const struct dcp_method_entry *newest = iomfb_v27_methods("27.3.0");
+	struct dcp_method_entry *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, earlier);
+	KUNIT_ASSERT_NOT_NULL(test, later);
+	KUNIT_ASSERT_NOT_NULL(test, newest);
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(earlier));
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_sleep_methods_complete(earlier));
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(later));
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_sleep_methods_complete(later));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(newest),
+			   earlier[dcpep_is_main_display].name);
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_sleep_methods_complete(newest));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(NULL),
+			   earlier[dcpep_is_main_display].name);
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_sleep_methods_complete(NULL));
+
+	/*
+	 * The J714s copy differs in a call the sleep does not make, and another ID for a sleep
+	 * call is sent as that ID; a sleep call with no ID is enough to refuse the sleep.
+	 */
+	table = kunit_kmalloc(test, sizeof(*earlier) * dcpep_num_methods, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table);
+	memcpy(table, earlier, sizeof(*earlier) * dcpep_num_methods);
+	memcpy(table[dcpep_swap_submit].tag, "A407", sizeof(table[dcpep_swap_submit].tag));
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(table));
+	memcpy(table[dcpep_is_main_display].tag, "A462", sizeof(table[dcpep_is_main_display].tag));
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(table));
+	memset(table[dcpep_unnamed_500].tag, 0, sizeof(table[dcpep_unnamed_500].tag));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(table),
+			   earlier[dcpep_unnamed_500].name);
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_sleep_methods_complete(table));
+}
+
+/*
  * Firmware 27 provider clocks on a T602x display processor: the 27.2 ADT
  * lists none (an empty /arm-io/disp0 and dispext<n> clock-ids), and the
  * node keeps its display clock.
@@ -321,6 +364,7 @@ static void dcp_typec_routes_available_children(struct kunit *test)
 static struct kunit_case dcp_firmware_cases[] = {
 	KUNIT_CASE(dcp_firmware_13_5_compat),
 	KUNIT_CASE(dcp_firmware_27_method_admission),
+	KUNIT_CASE(dcp_firmware_27_sleep_methods),
 	KUNIT_CASE(dcp_firmware_27_empty_clock_table),
 	KUNIT_CASE(dcp_firmware_27_pin_precedence),
 	KUNIT_CASE(dcp_typec_routes_available_children),

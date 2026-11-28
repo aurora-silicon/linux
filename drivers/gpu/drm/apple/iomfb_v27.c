@@ -427,6 +427,25 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 	return first;
 }
 
+/*
+ * The driver's name for the first call of the firmware 27 display sleep that @methods has no
+ * ID for (every one, without a table), NULL if it has one for each: the sleep sends every
+ * call by the build's own ID (iomfb_v27_tag()), so a call without one cannot go out. NULL
+ * exactly when iomfb_v27_sleep_methods_complete() is true.
+ */
+const char *iomfb_v27_sleep_missing_method(const struct dcp_method_entry *methods)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(iomfb_v27_sleep_methods); i++) {
+		enum dcpep_method m = iomfb_v27_sleep_methods[i];
+
+		if (!methods || !methods[m].tag[0])
+			return dcp_methods_27_0[m].name;
+	}
+	return NULL;
+}
+
 /* The template's calls resolve through the table probe chose for this build. */
 #define dcp_methods (dcp->v27_methods)
 

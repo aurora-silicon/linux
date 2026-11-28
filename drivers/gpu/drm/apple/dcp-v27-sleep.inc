@@ -460,6 +460,27 @@ static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp)
 	apple_sleep_v27_prepared(dcp->dev, false);
 }
 
+/*
+ * Whether this build's method table has an ID for every call of the display sleep
+ * (iomfb_v27_sleep_missing_method()). A deep sleep the T6050 sleep would run with a processor
+ * whose table does not is refused at the device .prepare, before any device suspends, with one
+ * line; s2idle never comes here (no pm_suspend_via_firmware()). Admission to the transport asks
+ * the same of the table (iomfb_v27_sleep_methods_complete()); this keeps the refusal ahead of
+ * any device suspend should the two ever differ.
+ */
+static int dcp_v27_sleep_known(struct apple_dcp *dcp)
+{
+	char compat[DCP_FW_VERSION_STR_LEN] = "";
+	const char *missing = iomfb_v27_sleep_missing_method(dcp->v27_methods);
+
+	if (!missing)
+		return 0;
+	dcp_read_fw_version(dcp->dev, "apple,firmware-compat", compat);
+	dev_warn(dcp->dev, "deep sleep refused: firmware %s has no ID for the display sleep's %s; s2idle is not affected\n",
+		 compat, missing);
+	return -EOPNOTSUPP;
+}
+
 /* DCPEXT0..3, from the processors' DT index (the internal display's is 0). */
 static unsigned int dcp_v27_ext_nr(struct apple_dcp *dcp)
 {
@@ -1039,6 +1060,28 @@ static void dcp_v27_ext_wq_destroy(void *data)
 	destroy_workqueue(data);
 }
 
+/*
+ * The whole endpoint set, checked before the first endpoint is started: each one exists, and
+ * one the sleep does not track runs no ring yet (starting it again makes the firmware assert).
+ * A refusal here leaves every endpoint as it was, with nothing sent.
+ */
+static int dcp_v27_sleep_endpoints_check(struct apple_dcp *dcp)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
+		u8 id = v27_sleep_endpoints[i];
+
+		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
+			return -ENODEV;
+		if (READ_ONCE(dcp->sleep_v27_ep[id - 0x20]))
+			continue;
+		if (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))
+			return -EPROTO;
+	}
+	return 0;
+}
+
 /* Do not replace a running endpoint or call afk_shutdown: both keep their
  * rings, service references and outstanding callback lifetimes across sleep.
  * New auxiliary endpoints get only the actual ring start and code4/5 handshake;
@@ -1051,14 +1094,15 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 	struct apple_dcp_afkep *ep;
 	int i, ret, check;
 
+	ret = dcp_v27_sleep_endpoints_check(dcp);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
 		u8 id = v27_sleep_endpoints[i];
 		bool ext = s && dcp_v27_external(dcp) && t6050_ext_services;
 		bool served = ext && (id == 0x29 || id == 0x2a);
 		const struct apple_epic_service_ops *ops = no_services;
 
-		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
-			return -ENODEV;
 		ep = READ_ONCE(dcp->sleep_v27_ep[id - 0x20]);
 		if (ep)
 			continue;
@@ -1513,6 +1557,9 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	int ret;
 
 	dcp_v27_sleep_invalidate(dcp);
+	/* .prepare refused it already; no call goes out that this build has no ID for. */
+	if (iomfb_v27_sleep_missing_method(dcp->v27_methods))
+		return -EOPNOTSUPP;
 	/* Refused before anything changes: the sleep RPCs' arguments come from the DT. */
 	if (!iomfb_v27_sleep_described(dcp)) {
 		dev_warn(dcp->dev, "V27 sleep: no sleep RPC arguments in the DT\n");
@@ -1834,6 +1881,7 @@ static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
 static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
+static int dcp_v27_sleep_known(struct apple_dcp *dcp) { return 0; }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 #endif

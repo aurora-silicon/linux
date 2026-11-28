@@ -56,31 +56,118 @@ assert prefix.index(v27) < prefix.index(native)
 pre = common + r'''
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
-struct apple_dcp { bool v27, native26, crashed, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
+struct apple_dcp { bool v27, v27_known, native26, crashed, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
 struct device { struct apple_dcp *d; };
 static int invalidations, cancellations, disables; static bool firmware;
 static void *dev_get_drvdata(struct device *v) { return v->d; }
 static bool pm_suspend_via_firmware(void) { return firmware; }
 static bool dcp_v27_sleep_selected(struct apple_dcp *d) { return d->v27; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *d) { invalidations++; }
+static int dcp_v27_sleep_known(struct apple_dcp *d) { return d->v27_known ? 0 : -EOPNOTSUPP; }
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native26; }
 static void cancel_work_sync(int *w) { cancellations++; }
 static void dcp_disable_typec_work(struct apple_dcp *d, bool sync) { disables++; }
 '''
 tests = r'''
 int main(void) {
- struct apple_dcp d={.v27=true,.native26=true}; struct device dev={.d=&d}; firmware=true;
+ struct apple_dcp d={.v27=true,.v27_known=true,.native26=true}; struct device dev={.d=&d}; firmware=true;
  assert(dcp_platform_prepare(&dev)==0 && invalidations==1 && cancellations==0 && !d.ext26_pm_preparing);
+ /* A deep sleep whose display sleep the build's table does not carry: refused, nothing else runs. */
+ d.v27_known=false; assert(dcp_platform_prepare(&dev)==-EOPNOTSUPP && invalidations==2 && cancellations==0);
  d.v27=false; d.crashed=true; assert(dcp_platform_prepare(&dev)==-EIO && cancellations==0);
  d.crashed=false; assert(dcp_platform_prepare(&dev)==0 && cancellations==1 && disables==1 && d.ext26_pm_work_off);
- d.native26=false; d.v27=true; firmware=false; assert(dcp_platform_prepare(&dev)==42 && invalidations==1);
+ d.native26=false; d.v27=true; firmware=false; assert(dcp_platform_prepare(&dev)==42 && invalidations==2);
 }
 '''
 for label, body, negative in [('prepare', prefix, False),
                               ('prepare-drop-v27', prefix.replace(v27, ''), True),
+                              ('prepare-ignore-known', prefix.replace('return dcp_v27_sleep_known(dcp);', 'return 0;'), True),
                               ('prepare-drop-native', prefix.replace(native, ''), True),
                               ('prepare-reverse-order', prefix.replace(v27, '').replace(native, native + '\n' + v27), True)]:
     run(label, pre + body + '\nreturn 42;\n}\n' + tests, negative)
+
+sleep = (A / 'dcp-v27-sleep.inc').read_text()
+endpoints = re.search(r'static const u8 v27_sleep_endpoints\[\] = \{.*?\};\n', sleep, re.S)[0]
+check = function(sleep, 'dcp_v27_sleep_endpoints_check')
+opener = function(sleep, 'dcp_v27_sleep_endpoints_open')
+preflight = '\tret = dcp_v27_sleep_endpoints_check(dcp);\n\tif (ret)\n\t\treturn ret;\n'
+tracked = '\t\tep = READ_ONCE(dcp->sleep_v27_ep[id - 0x20]);\n\t\tif (ep)\n\t\t\tcontinue;\n'
+assert opener.count(preflight) == 1 and opener.count(tracked) == 1
+# The order reviewed at 7987e8f8: each endpoint checked in the loop that starts the ones before it.
+in_loop = opener.replace(preflight, '').replace(tracked, '\t\tif (!apple_rtkit_has_endpoint(dcp->rtk, id))\n\t\t\treturn -ENODEV;\n' + tracked +
+                                                '\t\tif (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))\n\t\t\treturn -EPROTO;\n')
+pre = common + r'''
+typedef uint8_t u8;
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define ARRAY_SIZE(a) ((int)(sizeof(a)/sizeof((a)[0])))
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+#define PTR_ERR(p) ((long)(intptr_t)(p))
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
+#define WQ_UNBOUND 0
+#define AV_AUDIO_ENDPOINT_DESKTOP 0x2b
+#define read_poll_timeout(op,val,cond,sleep_us,timeout_us,before,...) ({ (val) = op(__VA_ARGS__); (cond) ? 0 : -ETIMEDOUT; })
+struct apple_epic_service_ops { const char *name; };
+struct apple_dcp_afkep { u8 endpoint; bool match_epic_name, inline_v2, v27_closed_teardown, sleep_poisoned, sleep_closed; };
+struct apple_rtkit { bool present[0x20]; };
+struct dcp_v27_sleep { void *ext_wq; bool ext_wq_owned; };
+struct apple_dcp { struct apple_rtkit *rtk; struct dcp_v27_sleep *sleep_v27; void *dev;
+                   struct apple_dcp_afkep *sleep_v27_ep[0x20], *running[0x20]; };
+static const struct apple_epic_service_ops dcp_v27_ext_services[1], dcp_v27_ext_av_services[1];
+static bool t6050_ext_services;
+static struct apple_dcp_afkep pool[64]; static int inits, starts, controls; static u8 started[64];
+static bool dcp_v27_external(struct apple_dcp *d) { return false; }
+static bool apple_rtkit_has_endpoint(struct apple_rtkit *r, u8 id) { return r->present[id - 0x20]; }
+/* As the driver's: the sleep's own endpoint if tracked, else a ring something else runs. */
+static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *d, u8 id) { return d->sleep_v27_ep[id - 0x20] ?: d->running[id - 0x20]; }
+static void *alloc_workqueue(const char *n, int f, int m) { return NULL; }
+static int devm_add_action(void *dev, void (*fn)(void *), void *data) { return 0; }
+static void dcp_v27_ext_wq_destroy(void *data) {}
+static struct apple_dcp_afkep *afk_init(struct apple_dcp *d, u8 id, const struct apple_epic_service_ops *ops) {
+ struct apple_dcp_afkep *ep=&pool[inits]; assert(inits < 64); started[inits++]=id; ep->endpoint=id; d->sleep_v27_ep[id - 0x20]=ep; return ep;
+}
+static int afk_start(struct apple_dcp_afkep *ep) { starts++; return 0; }
+static int afk_v27_sleep_check(struct apple_dcp_afkep *ep) { return 0; }
+static int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open) { assert(open); controls++; return 0; }
+''' + endpoints
+tests = r'''
+static void reset(struct apple_dcp *d) {
+ inits=starts=controls=0; memset(pool,0,sizeof(pool)); memset(d->sleep_v27_ep,0,sizeof(d->sleep_v27_ep)); memset(d->running,0,sizeof(d->running));
+ for (int i=0;i<ARRAY_SIZE(v27_sleep_endpoints);i++) d->rtk->present[v27_sleep_endpoints[i]-0x20]=true;
+}
+static void untouched(struct apple_dcp *d) {
+ assert(inits==0 && starts==0 && controls==0);
+ for (int i=0;i<0x20;i++) assert(!d->sleep_v27_ep[i]);
+}
+int main(void) {
+ struct apple_rtkit rtk={0}; struct dcp_v27_sleep s={0}; struct apple_dcp d={.rtk=&rtk,.sleep_v27=&s};
+ struct apple_dcp_afkep foreign={.endpoint=0x2b}, kept={.endpoint=0x28};
+ int n=ARRAY_SIZE(v27_sleep_endpoints);
+ /* 0x20 would start first; 0x2b, later in the set, runs a ring the sleep does not track. */
+ reset(&d); d.running[0x2b-0x20]=&foreign;
+ assert(dcp_v27_sleep_endpoints_open(&d)==-EPROTO); untouched(&d); assert(!foreign.sleep_poisoned);
+ /* The same with the conflict on the set's last endpoint. */
+ reset(&d); d.running[v27_sleep_endpoints[n-1]-0x20]=&foreign;
+ assert(dcp_v27_sleep_endpoints_open(&d)==-EPROTO); untouched(&d);
+ /* The set's last endpoint missing: refused before the first start too. */
+ reset(&d); rtk.present[v27_sleep_endpoints[n-1]-0x20]=false;
+ assert(dcp_v27_sleep_endpoints_open(&d)==-ENODEV); untouched(&d);
+ /* An endpoint the sleep already tracks is kept, not refused; the rest start in order. */
+ reset(&d); d.sleep_v27_ep[0x28-0x20]=&kept;
+ assert(dcp_v27_sleep_endpoints_open(&d)==0 && inits==n-1 && starts==n-1 && controls==n-1 && !kept.sleep_poisoned);
+ for (int i=0,j=0;i<n;i++) if (v27_sleep_endpoints[i]!=0x28) assert(started[j++]==v27_sleep_endpoints[i]);
+ /* Nothing running: every endpoint starts once; a second open finds them all tracked. */
+ reset(&d); assert(dcp_v27_sleep_endpoints_open(&d)==0 && inits==n && starts==n && controls==n);
+ assert(dcp_v27_sleep_endpoints_open(&d)==0 && inits==n && starts==n);
+}
+'''
+for label, c, o, negative in [('endpoints', check, opener, False),
+                              ('endpoints-check-in-loop', check, in_loop, True),
+                              ('endpoints-drop-preflight', check, opener.replace(preflight, ''), True),
+                              ('endpoints-drop-running', check.replace('\t\tif (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))\n\t\t\treturn -EPROTO;\n', ''), opener, True),
+                              ('endpoints-refuse-tracked', check.replace('\t\tif (READ_ONCE(dcp->sleep_v27_ep[id - 0x20]))\n\t\t\tcontinue;\n', ''), opener, True)]:
+    assert negative == (c + o != check + opener)
+    run(label, pre + c + o + tests, negative)
 
 iomfb = (A / 'iomfb.c').read_text()
 start = iomfb.index('\tif (out_len && dcp->push_out_prefill)')
@@ -225,5 +312,5 @@ for label, body, version, negative in [('mode26', mode, 26, False), ('mode27', m
     code = pre + 'static int evaluate(struct apple_dcp *dcp,bool keep_mode,struct cookie *cookie) { int ret;\n' + body + '{ modesets++; }\nreturn 0;\n}\n' + tests
     run(label, code, negative, extra=(f'-DDCP_FW_VER={version}',))
 
-assert len(results) == 17
-print('PASS: 17 compiled merge-boundary runs, including runtime controls', flush=True)
+assert len(results) == 23
+print('PASS: 23 compiled merge-boundary runs, including runtime controls', flush=True)

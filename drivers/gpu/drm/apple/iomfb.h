@@ -250,6 +250,8 @@ const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
 /* The first method of a firmware 27.x table that has no ID, NULL if none. */
 const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 				     unsigned int *count);
+/* The first call of the firmware 27 display sleep that a 27.x table lacks, NULL if none. */
+const char *iomfb_v27_sleep_missing_method(const struct dcp_method_entry *methods);
 
 #define IOMFB_MAX_CB (1000)
 
