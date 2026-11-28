@@ -422,9 +422,10 @@ static int avd_h264_run_preamble(struct avd_ctx *ctx,struct avd_h264_run *r) { (
 /* The run-time format check has its own KUnit suite (avd-fmt-test.c). */
 static int avd_check_run_image_fmt(struct avd_ctx *ctx,int f) { (void)ctx;(void)f;return 0; }
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *r) { (void)ctx;(void)r;postambles++; }
-static bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *s,size_t n,size_t b,u32 l,size_t z)
-{ (void)s;(void)b;(void)l;(void)z;return n<20; }
-static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *s) { (void)s;return 20; }
+static bool avd_h264_slice_fits(const struct v4l2_pix_format_mplane *p,const struct v4l2_ctrl_h264_sps *s,size_t n,size_t b,u32 l,size_t z)
+{ (void)p;(void)s;(void)b;(void)l;(void)z;return n<20; }
+static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *p)
+{ return (size_t)((p->width/16)*(p->height/16)); }
 static int avd_h264_realloc_slices(struct avd_ctx *c,size_t n) { (void)c;(void)n;abort(); }
 static int avd_init_job(struct avd_ctx *c,unsigned int codec,size_t n) {
  free(c->job.segments);c->job.codec=codec;c->job.num=0;c->job.overflow=false;

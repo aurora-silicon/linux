@@ -33,12 +33,6 @@
 
 #define H264_TRANSFORM_8X8_MODE(v)		FIELD_PREP(BIT(7), !!(v))
 
-/*
- * Most slices held for one picture. This bounds the slice table, the job
- * table and the memory that a client can pin.
- */
-#define MAX_SLICES	4096
-
 struct avd_h264_run {
 	struct avd_run base;
 
@@ -1038,18 +1032,16 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
 }
 
 /*
- * Every slice codes at least one macroblock, so a picture has no more slices
- * than macroblocks, counting both fields of a frame.
+ * Slices one picture may hold. H.264 7.4.3: each slice holds at least one
+ * macroblock (first_mb_in_slice), so slices <= PicSizeInMbs. PicSizeInMbs for
+ * the decode path is the macroblock count of the NEGOTIATED decoded size (the
+ * SPS control geometry is not trusted). Interlaced pictures use a negotiated
+ * buffer tall enough for both fields; do not scale again from FRAME_MBS_ONLY.
  */
-static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *sps)
+static size_t avd_h264_max_slices(const struct v4l2_pix_format_mplane *pix)
 {
-	size_t mbs = (size_t)(sps->pic_width_in_mbs_minus1 + 1) *
-		     (sps->pic_height_in_map_units_minus1 + 1);
-
-	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
-		mbs *= 2;
-
-	return min_t(size_t, mbs, MAX_SLICES);
+	return DIV_ROUND_UP((size_t)pix->width, 16) *
+	       DIV_ROUND_UP((size_t)pix->height, 16);
 }
 
 /* Slice table entries made at STREAMON: one slice per row to begin with. */
@@ -1064,22 +1056,25 @@ EXPORT_SYMBOL_IF_KUNIT(avd_h264_start_slices);
 /*
  * Coded data held for one picture. A picture of PCM macroblocks is about the
  * size of the decoded one and emulation prevention adds at most one byte for
- * every two, so twice the decoded buffer is enough; MAX_SLICES pages leave
- * room for small pictures cut into many slices.
+ * every two, so twice the decoded buffer is enough; one page per slice the
+ * picture may hold leaves room for small pictures cut into many slices.
  */
-static size_t avd_h264_slice_budget(size_t decoded_size)
+static size_t avd_h264_slice_budget(const struct v4l2_pix_format_mplane *pix,
+				    size_t decoded_size)
 {
-	return max_t(size_t, 2 * decoded_size, MAX_SLICES * PAGE_SIZE);
+	return max_t(size_t, 2 * decoded_size,
+		     avd_h264_max_slices(pix) * PAGE_SIZE);
 }
 
 /* Check that one more slice of len bytes fits in the current picture. */
-VISIBLE_IF_KUNIT bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps,
+VISIBLE_IF_KUNIT bool avd_h264_slice_fits(const struct v4l2_pix_format_mplane *pix,
+					  const struct v4l2_ctrl_h264_sps *sps,
 					  size_t held, size_t held_bytes,
 					  u32 len, size_t decoded_size)
 {
-	return held < avd_h264_max_slices(sps) &&
+	return held < avd_h264_max_slices(pix) &&
 	       held_bytes + PAGE_ALIGN((size_t)len) <=
-	       avd_h264_slice_budget(decoded_size);
+	       avd_h264_slice_budget(pix, decoded_size);
 }
 
 /*
@@ -1335,8 +1330,9 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		goto err_free_jobs;
 	}
 
-	if (!avd_h264_slice_fits(run.sps, h264_ctx->b->slice_num,
-				 h264_ctx->b->slice_bytes, payload_len,
+	if (!avd_h264_slice_fits(&ctx->decoded_fmt.fmt.pix_mp, run.sps,
+				 h264_ctx->b->slice_num, h264_ctx->b->slice_bytes,
+				 payload_len,
 				 ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage)) {
 		dev_err_ratelimited(ctx->dev->dev,
 				    "too many slices for one picture, dropping it\n");
@@ -1345,7 +1341,8 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	}
 
 	if (h264_ctx->b->slice_num >= h264_ctx->b->alloc_slice_num) {
-		ret = avd_h264_realloc_slices(ctx, avd_h264_max_slices(run.sps));
+		ret = avd_h264_realloc_slices(ctx,
+					      avd_h264_max_slices(&ctx->decoded_fmt.fmt.pix_mp));
 		if (ret)
 			goto err_free_jobs;
 	}

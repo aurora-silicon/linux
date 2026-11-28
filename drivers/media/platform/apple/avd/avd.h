@@ -397,7 +397,8 @@ int avd_ctrl_copy(struct avd_ctx *ctx, u32 id, void *dst, size_t size);
 int avd_ctrl_copy_value(struct v4l2_ctrl *ctrl, void *dst, size_t size);
 bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
 			      u32 *off);
-bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
+bool avd_h264_slice_fits(const struct v4l2_pix_format_mplane *pix,
+			 const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
 bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 			      const struct v4l2_ctrl_h264_scaling_matrix *scaling);
