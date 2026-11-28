@@ -294,6 +294,12 @@ impl Port {
         Ok((index, *self.views()?.compute.get(index).ok_or(EINVAL)?))
     }
 
+    /// The two firmware consumers and the host producer of the work ring of `priority`, for a
+    /// timeout report.
+    pub(super) fn work_ring_cursors(&self, priority: u8) -> Result<[u32; 3]> {
+        self.ring(priority)?.1.cursors()
+    }
+
     /// Reserves one slot of the compute work ring of `priority`. EAGAIN while firmware has not
     /// consumed enough slots; only consumption, never a waiting publisher, frees one.
     pub(super) fn reserve_compute(&self, priority: u8) -> Result<OuterClaim<'_>> {
