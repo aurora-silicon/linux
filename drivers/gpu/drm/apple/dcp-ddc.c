@@ -11,7 +11,11 @@
  *    address, for a DDC/CI message), the rest the data;
  *  - a read from 0x37 (DDC/CI reply), with the DDC/CI offset 0x51;
  *  - a one-byte write then a read of the same chip (the EDID at 0x50): a read
- *    at that offset.
+ *    at that offset;
+ *  - the same as two separate transfers, as i2c-dev read() and write() make
+ *    them (ddcutil reads the EDID that way): a one-byte write to 0x50 only
+ *    sets the offset, and a read from 0x50 reads there and moves it on, like
+ *    the EDID EEPROM's address counter.
  *
  * The connector's pipeline is looked up per transfer: a Type-C port changes
  * pipelines, and an unrouted connector has no DDC.
@@ -39,6 +43,8 @@ struct apple_ddc {
 	struct apple_connector *connector;
 	/* One transfer at a time: the service answers them in order. */
 	struct mutex lock;
+	/* The EDID EEPROM's address counter (0x50), under @lock. */
+	u8 edid_offset;
 };
 
 /*
@@ -46,7 +52,8 @@ struct apple_ddc {
  * cannot carry (an address-only probe, a repeated start to another chip,
  * more than two messages, the E-DDC segment pointer).
  */
-int apple_ddc_plan(const struct i2c_msg *msgs, int num, struct apple_ddc_xfer *xfer)
+int apple_ddc_plan(const struct i2c_msg *msgs, int num, u8 edid_offset,
+		   struct apple_ddc_xfer *xfer)
 {
 	const struct i2c_msg *m = &msgs[0];
 
@@ -67,17 +74,23 @@ int apple_ddc_plan(const struct i2c_msg *msgs, int num, struct apple_ddc_xfer *x
 		return 0;
 	}
 	if (m->flags & I2C_M_RD) {
-		/* A bare read has no offset of its own: only a DDC/CI reply has one. */
-		if (m->addr != DDC_CI_ADDR || !m->len || m->len > DCPAV_I2C_MAX_DATA)
+		/* A DDC/CI reply's offset is the host address, the EDID's the counter. */
+		if (!m->len || m->len > DCPAV_I2C_MAX_DATA)
 			return -EOPNOTSUPP;
 		*xfer = (struct apple_ddc_xfer) {
-			.read = true, .chip = m->addr, .offset = DDC_CI_HOST_OFFSET,
+			.read = true, .chip = m->addr,
+			.offset = m->addr == DDC_CI_ADDR ? DDC_CI_HOST_OFFSET : edid_offset,
 			.buf = m->buf, .len = m->len,
 		};
 		return 0;
 	}
 	if (!m->len || m->len - 1 > DCPAV_I2C_MAX_DATA)
 		return -EOPNOTSUPP;
+	if (m->addr == DDC_EDID_ADDR && m->len == 1) {
+		*xfer = (struct apple_ddc_xfer) { .none = true, .chip = m->addr,
+						  .offset = m->buf[0] };
+		return 0;
+	}
 	*xfer = (struct apple_ddc_xfer) {
 		.read = false, .chip = m->addr, .offset = m->buf[0],
 		.buf = m->buf + 1, .len = m->len - 1,
@@ -92,16 +105,25 @@ static int apple_ddc_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int
 	struct apple_ddc_xfer xfer;
 	int ret;
 
-	ret = apple_ddc_plan(msgs, num, &xfer);
+	guard(mutex)(&ddc->lock);
+	ret = apple_ddc_plan(msgs, num, ddc->edid_offset, &xfer);
 	if (ret)
 		return ret;
-	guard(mutex)(&ddc->lock);
+	if (xfer.none) {
+		ddc->edid_offset = xfer.offset;
+		return num;
+	}
 	pdev = READ_ONCE(ddc->connector->dcp);
 	if (!pdev)
 		return -ENODEV;
 	ret = dcpavserv_i2c(platform_get_drvdata(pdev), xfer.read, xfer.chip,
 			    xfer.offset, xfer.buf, xfer.len);
-	return ret ?: num;
+	if (ret)
+		return ret;
+	/* The EEPROM's counter moves past what was read. */
+	if (xfer.chip == DDC_EDID_ADDR && xfer.read)
+		ddc->edid_offset = xfer.offset + xfer.len;
+	return num;
 }
 
 static u32 apple_ddc_functionality(struct i2c_adapter *adapter)

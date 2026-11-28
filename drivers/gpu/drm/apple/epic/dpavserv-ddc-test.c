@@ -104,19 +104,19 @@ static void dpavddc_plan(struct kunit *test)
 	};
 	struct apple_ddc_xfer x;
 
-	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_w, 1, &x), 0);
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_w, 1, 0, &x), 0);
 	KUNIT_EXPECT_FALSE(test, x.read);
 	KUNIT_EXPECT_EQ(test, x.chip, 0x37);
 	KUNIT_EXPECT_EQ(test, x.offset, 0x51);
 	KUNIT_EXPECT_PTR_EQ(test, x.buf, &wbuf[1]);
 	KUNIT_EXPECT_EQ(test, x.len, 4);
 
-	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_r, 1, &x), 0);
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_r, 1, 0, &x), 0);
 	KUNIT_EXPECT_TRUE(test, x.read);
 	KUNIT_EXPECT_EQ(test, x.offset, 0x51);
 	KUNIT_EXPECT_EQ(test, x.len, 12);
 
-	KUNIT_ASSERT_EQ(test, apple_ddc_plan(edid, 2, &x), 0);
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(edid, 2, 0, &x), 0);
 	KUNIT_EXPECT_TRUE(test, x.read);
 	KUNIT_EXPECT_EQ(test, x.chip, 0x50);
 	KUNIT_EXPECT_EQ(test, x.offset, 0x80);
@@ -124,21 +124,39 @@ static void dpavddc_plan(struct kunit *test)
 
 	/* What the service cannot carry. */
 	edid[0].addr = 0x30;		/* E-DDC segment pointer */
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, 0, &x), -EOPNOTSUPP);
 	edid[0].addr = 0x50;
 	edid[1].addr = 0x37;		/* repeated start to another chip */
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, 0, &x), -EOPNOTSUPP);
 	edid[1].addr = 0x50;
 	edid[1].len = 129;
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, &x), -EOPNOTSUPP);
-	ddcci_r.addr = 0x50;		/* a bare read has no offset */
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_r, 1, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(edid, 2, 0, &x), -EOPNOTSUPP);
+	/* i2c-dev's separate EDID offset write, then a bare read at the counter. */
+	edid[0].addr = 0x50;
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&edid[0], 1, 0, &x), 0);
+	KUNIT_EXPECT_TRUE(test, x.none);
+	KUNIT_EXPECT_EQ(test, x.offset, 0x80);
+	edid[1].len = 128;
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&edid[1], 1, 0x80, &x), 0);
+	KUNIT_EXPECT_FALSE(test, x.none);
+	KUNIT_EXPECT_TRUE(test, x.read);
+	KUNIT_EXPECT_EQ(test, x.chip, 0x50);
+	KUNIT_EXPECT_EQ(test, x.offset, 0x80);
+	KUNIT_EXPECT_EQ(test, x.len, 128);
+	/* A DDC/CI write is sent, never taken as an offset. */
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_w, 1, 0x80, &x), 0);
+	KUNIT_EXPECT_FALSE(test, x.none);
+	/* A bare DDC/CI reply read keeps the host-address offset. */
+	KUNIT_ASSERT_EQ(test, apple_ddc_plan(&ddcci_r, 1, 0x80, &x), 0);
+	KUNIT_EXPECT_EQ(test, x.offset, 0x51);
+	ddcci_r.addr = 0x30;		/* E-DDC segment pointer */
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_r, 1, 0, &x), -EOPNOTSUPP);
 	ddcci_w.len = 0;		/* address-only probe */
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 1, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 1, 0, &x), -EOPNOTSUPP);
 	ddcci_w.len = 5;
 	ddcci_w.flags = I2C_M_TEN;
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 1, &x), -EOPNOTSUPP);
-	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 3, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 1, 0, &x), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ddc_plan(&ddcci_w, 3, 0, &x), -EOPNOTSUPP);
 }
 
 static struct kunit_case dpavddc_test_cases[] = {
