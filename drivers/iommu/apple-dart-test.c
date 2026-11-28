@@ -113,11 +113,7 @@ static void apple_dart_test_consumer_window(struct kunit *test)
 	dart->pgsize = SZ_16K;
 	dev->of_node = &node;
 
-	/*
-	 * J613's common scanout alias survives both DART defaults, but only
-	 * inside each stream's own window: the external DART excludes its top
-	 * 64 KiB, so the shared aperture must too.
-	 */
+	/* J613's common scanout aperture must survive both DART defaults. */
 	for (i = 0; i < 2; i++) {
 		dart->dma_min = i ? 0 : 0x10000000000;
 		dart->dma_max = i ? 0xffffeffff : 0x10fffffffff;
@@ -125,18 +121,17 @@ static void apple_dart_test_consumer_window(struct kunit *test)
 						  &dma_min, &dma_max);
 		KUNIT_EXPECT_EQ(test, ret, 0);
 		KUNIT_EXPECT_EQ(test, dma_min, (dma_addr_t)0x10000000000);
-		KUNIT_EXPECT_EQ(test, dma_max,
-				(dma_addr_t)(i ? 0x10ffffeffff : 0x10fffffffff));
+		KUNIT_EXPECT_EQ(test, dma_max, (dma_addr_t)0x10fffffffff);
 	}
 
-	/* A five-cell stream window narrows the consumer aperture the same way. */
+	/* Domain allocation gives the consumer priority over five-cell args too. */
 	args.args_count = 5;
 	args.args[3] = 0xf;
 	args.args[4] = 0xffff0000;
 	ret = apple_dart_parse_dma_window(dev, dart, &args, &dma_min, &dma_max);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, dma_min, (dma_addr_t)0x10000000000);
-	KUNIT_EXPECT_EQ(test, dma_max, (dma_addr_t)0x10ffffeffff);
+	KUNIT_EXPECT_EQ(test, dma_max, (dma_addr_t)0x10fffffffff);
 
 	/* An override must not make a malformed stream specifier acceptable. */
 	args.args[3] = 0;
@@ -152,54 +147,6 @@ static void apple_dart_test_consumer_window(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, dma_min, (dma_addr_t)0);
 	KUNIT_EXPECT_EQ(test, dma_max, (dma_addr_t)0xffffeffff);
-}
-
-static void apple_dart_test_disjoint_consumer_window(struct kunit *test)
-{
-	/* 2 GiB at the 1 TiB alias; its low bits start at 2 GiB. */
-	__be64 value[] = { cpu_to_be64(0x10080000000), cpu_to_be64(SZ_2G) };
-	struct property property = {
-		.name = "apple,dma-range",
-		.length = sizeof(value),
-		.value = value,
-	};
-	struct device_node node = { .properties = &property };
-	struct of_phandle_args args = { .args_count = 1 };
-	struct apple_dart *dart;
-	struct device *dev;
-	dma_addr_t dma_min, dma_max;
-
-	dev = kunit_device_register(test, "apple-dart-disjoint-window-test");
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
-	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, dart);
-	dart->ias = 36;
-	dart->pgsize = SZ_16K;
-	dev->of_node = &node;
-
-	/* The stream's window ends where the consumer's low bits begin. */
-	dart->dma_min = 0;
-	dart->dma_max = SZ_2G - 1;
-	KUNIT_EXPECT_EQ(test, apple_dart_parse_dma_window(dev, dart, &args,
-							 &dma_min, &dma_max), -EINVAL);
-
-	/* The same holds for a stream window given by a five-cell specifier. */
-	dart->dma_max = DMA_BIT_MASK(dart->ias);
-	args.args_count = 5;
-	args.args[1] = 0x100;
-	args.args[2] = 0;
-	args.args[3] = 0;
-	args.args[4] = 0x80000000;
-	KUNIT_EXPECT_EQ(test, apple_dart_parse_dma_window(dev, dart, &args,
-							 &dma_min, &dma_max), -EINVAL);
-
-	/* One page of overlap is enough, and only that page is returned. */
-	args.args[4] = 0x80004000;
-	KUNIT_EXPECT_EQ(test, apple_dart_parse_dma_window(dev, dart, &args,
-							 &dma_min, &dma_max), 0);
-	KUNIT_EXPECT_EQ(test, dma_min, (dma_addr_t)0x10080000000);
-	KUNIT_EXPECT_EQ(test, dma_max, (dma_addr_t)0x10080003fff);
-	dev->of_node = NULL;
 }
 
 static void apple_dart_test_invalid_consumer_window(struct kunit *test)
@@ -1704,7 +1651,6 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_topology),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_consumer_window),
-	KUNIT_CASE(apple_dart_test_disjoint_consumer_window),
 	KUNIT_CASE(apple_dart_test_invalid_consumer_window),
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),
