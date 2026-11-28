@@ -163,6 +163,7 @@ struct dchid_iface {
 	struct hid_device *hid;
 	struct workqueue_struct *wq;
 
+	/* Freezes the descriptor from queueing through successful registration. */
 	bool creating;
 	struct work_struct create_work;
 
@@ -255,6 +256,8 @@ static ssize_t apple_layout_id_show(struct device *dev,
 
 static DEVICE_ATTR_RO(apple_layout_id);
 
+static void dchid_create_interface_work(struct work_struct *ws);
+
 static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
@@ -330,6 +333,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	init_completion(&iface->ready);
 	mutex_init(&iface->out_mutex);
 	spin_lock_init(&iface->resp_lock);
+	INIT_WORK(&iface->create_work, dchid_create_interface_work);
 	iface->wq = alloc_ordered_workqueue("dchid-%s", WQ_MEM_RECLAIM, iface->name);
 	if (!iface->wq)
 		goto err_put_node;
@@ -436,6 +440,18 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	return ret;
 }
 
+static void dchid_retire_cmd(struct dchid_iface *iface)
+{
+	/* Serialize retirement with the ACK checks and response copy. */
+	spin_lock(&iface->resp_lock);
+	iface->tx_seq++;
+	iface->out_report = -1;
+	iface->out_flags = 0;
+	iface->resp_buf = NULL;
+	iface->resp_size = 0;
+	spin_unlock(&iface->resp_lock);
+}
+
 static int dchid_cmd_retcode(struct dchid_iface *iface, u32 type, u32 req,
 			     void *data, size_t size, void *resp_buf,
 			     size_t resp_size, u32 *retcode_out)
@@ -481,13 +497,7 @@ done:
 	 * Retire the command before the caller's buffer goes away: an
 	 * acknowledgment that arrives from now on no longer matches it.
 	 */
-	spin_lock(&iface->resp_lock);
-	iface->tx_seq++;
-	iface->out_report = -1;
-	iface->out_flags = 0;
-	iface->resp_buf = NULL;
-	iface->resp_size = 0;
-	spin_unlock(&iface->resp_lock);
+	dchid_retire_cmd(iface);
 	mutex_unlock(&iface->out_mutex);
 	if (retcode_out)
 		*retcode_out = fw_retcode;
@@ -1039,14 +1049,17 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	ret = dchid_enable_interface(iface);
 	if (ret < 0) {
 		dev_warn(dchid->dev, "Failed to enable %s: %d\n", iface->name, ret);
-		return;
+		goto failed;
 	}
 
 	iface->deferred = false;
 
 	hid = hid_allocate_device();
-	if (IS_ERR(hid))
-		return;
+	if (IS_ERR(hid)) {
+		dev_warn(dchid->dev, "Failed to allocate HID device %s: %ld\n",
+			 iface->name, PTR_ERR(hid));
+		goto failed;
+	}
 
 	snprintf(hid->name, sizeof(hid->name), "Apple MTP %s", iface->name);
 	snprintf(hid->phys, sizeof(hid->phys), "%s.%d (%s)",
@@ -1086,19 +1099,25 @@ static void dchid_create_interface_work(struct work_struct *ws)
 	if (ret < 0) {
 		iface->hid = NULL;
 		hid_destroy_device(hid);
-		dev_warn(iface->dchid->dev, "Failed to register hid device %s\n", iface->name);
+		dev_warn(dchid->dev, "Failed to register HID device %s: %d\n", iface->name, ret);
+		goto failed;
 	}
+	return;
+
+failed:
+	/* Allow a later init to replace the descriptor only after cleanup. */
+	smp_store_release(&iface->creating, false);
 }
 
 static int dchid_create_interface(struct dchid_iface *iface)
 {
 	if (READ_ONCE(iface->dchid->stopping))
 		return -ESHUTDOWN;
-	if (iface->creating)
+	/* Pairs with the failed worker's release after descriptor cleanup. */
+	if (smp_load_acquire(&iface->creating))
 		return -EBUSY;
 
 	iface->creating = true;
-	INIT_WORK(&iface->create_work, dchid_create_interface_work);
 	return queue_work(iface->dchid->new_iface_wq, &iface->create_work);
 }
 
@@ -1170,9 +1189,11 @@ static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, s
 
 	/*
 	 * Once the interface is queued for creation the HID core may be
-	 * parsing its descriptor, which must then stay as it is.
+	 * parsing its descriptor, which must then stay as it is. A failed
+	 * worker releases it only after it has stopped using the descriptor.
 	 */
-	if (iface->hid || iface->creating) {
+	/* Pairs with the failed worker's release after descriptor cleanup. */
+	if (smp_load_acquire(&iface->creating) || iface->hid) {
 		dev_warn(iface->dchid->dev, "Tried to initialize already started interface %s!\n",
 			 iface->name);
 		return;
@@ -1512,24 +1533,26 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	/* The command must not be retired between the checks and the copy. */
 	spin_lock(&iface->resp_lock);
 	if (shdr->flags != iface->out_flags) {
-		dev_err(iface->dchid->dev,
-			"Received unexpected flags 0x%x on ACK channel (expected 0x%x)\n",
-			shdr->flags, iface->out_flags);
+		dev_err_ratelimited(iface->dchid->dev,
+				    "Received unexpected flags 0x%x on ACK channel (expected 0x%x)\n",
+				    shdr->flags, iface->out_flags);
 		goto out;
 	}
 
 	if (shdr->length < 1) {
-		dev_err(iface->dchid->dev, "Received length 0 output report ack\n");
+		dev_err_ratelimited(iface->dchid->dev, "Received length 0 output report ack\n");
 		goto out;
 	}
 	if (iface->tx_seq != hdr->seq) {
-		dev_err(iface->dchid->dev, "Received ACK with bad seq (expected %d, got %d)\n",
-			iface->tx_seq, hdr->seq);
+		dev_err_ratelimited(iface->dchid->dev,
+				    "Received ACK with bad seq (expected %d, got %d)\n",
+				    iface->tx_seq, hdr->seq);
 		goto out;
 	}
 	if (iface->out_report != payload[0]) {
-		dev_err(iface->dchid->dev, "Received ACK with bad report (expected %d, got %d\n",
-			iface->out_report, payload[0]);
+		dev_err_ratelimited(iface->dchid->dev,
+				    "Received ACK with bad report (expected %d, got %d)\n",
+				    iface->out_report, payload[0]);
 		goto out;
 	}
 
