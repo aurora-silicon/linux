@@ -296,6 +296,12 @@ struct macaudio_snd_data {
 	/* The lease ran out: the owner's next write is refused with -ETIMEDOUT */
 	bool spk_lapsed;
 	/*
+	 * Another file wrote the speaker route since the last grant decision,
+	 * so the next grant is refused (macaudio_route_check()). Under the
+	 * card's controls_rwsem, which every control write holds.
+	 */
+	bool spk_route_moved;
+	/*
 	 * Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND: no grant. Set
 	 * without spk_mutex (macaudio_pm_notify()), cleared under it.
 	 */
@@ -1063,6 +1069,16 @@ static void macaudio_sw_gain_stop_work(struct work_struct *work)
  * again; so does an owner that was frozen across a system sleep. Reads
  * return 1 while protection is granted, 0 otherwise, and every change is
  * notified.
+ *
+ * The owner grants for the front-end its engine drives, which it reads on
+ * "Speaker Playback Mux". Under a grant the mux cannot be written. Before
+ * one, any file may write it (the seat's UCM sets it), and a write by
+ * another file between the owner's read and its grant would put another
+ * front-end on the speakers under that grant. Such a write still goes
+ * through, but the next grant is refused with -EBUSY and grants nothing:
+ * the owner reads the route again before it grants again. The kernel cannot
+ * tell when the owner read it, so every such write since the last grant
+ * decision counts.
  *
  * On machines that open the tweeters' playback high-pass while granted, a
  * grant opens it only for an owner that has declared, on the boolean
@@ -2047,6 +2063,13 @@ static int macaudio_spk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	}
 
 	if (!ma->spk_active) {
+		/* Another file re-routed since the owner could have read the route */
+		if (ma->spk_route_moved) {
+			ma->spk_route_moved = false;
+			dev_dbg(ma->card.dev, "Speaker protection not granted: re-routed since the last decision\n");
+			ret = -EBUSY;
+			goto out;
+		}
 		ret = macaudio_spk_grant(ma, ms);
 		goto out;
 	}
@@ -2231,19 +2254,25 @@ static int macaudio_sense_write_check(struct snd_kcontrol *kctl, struct snd_ctl_
  * The speaker route may not change under a grant: the owner admitted the
  * front-end its engine drives, and another one routed to the speakers would
  * reach the amps without protection until the owner noticed. Re-route only
- * while protection is withdrawn.
+ * while protection is withdrawn. A re-route then by any file but the owner's
+ * refuses the next grant (macaudio_spk_put()): the owner may have read the
+ * route before it.
  */
-static int macaudio_route_check(struct macaudio_snd_data *ma)
+static int macaudio_route_check(struct macaudio_snd_data *ma, struct snd_ctl_file *file)
 {
-	/* Pairs with the release in macaudio_spk_grant() */
-	return smp_load_acquire(&ma->spk_granted) ? -EBUSY : 0;
+	/* Under a grant: pairs with the release in macaudio_spk_grant() */
+	if (smp_load_acquire(&ma->spk_granted))
+		return -EBUSY;
+	if (!file || file != ma->spk_owner)
+		ma->spk_route_moved = true;
+	return 0;
 }
 
 static int macaudio_route_write_check(struct snd_kcontrol *kctl, struct snd_ctl_file *file)
 {
 	struct snd_soc_card *card = snd_soc_dapm_to_card(snd_soc_dapm_kcontrol_to_dapm(kctl));
 
-	return macaudio_route_check(snd_soc_card_get_drvdata(card));
+	return macaudio_route_check(snd_soc_card_get_drvdata(card), file);
 }
 
 /*
