@@ -120,7 +120,7 @@ struct macsmc_power {
 	 * firmware, but J700 firmware has a native B0RM and a 4-byte BCF0.
 	 */
 	bool b0rm_native;
-	/* Charging with a negative battery current is discharging (J700) */
+	/* B0AC is a signed 16-bit current: a negative one while charging is net discharge */
 	bool status_from_current;
 
 	u8 num_cells;
@@ -232,9 +232,12 @@ static void macsmc_do_dbg(struct macsmc_power *power)
 }
 
 /*
- * The status to report where the SMC flags say the battery is charging. On
- * J700 a charge-capable adapter can be online while the system draws more
- * than it supplies, and the battery then drains.
+ * The status to report where the SMC flags say the battery is charging. A
+ * charge-capable adapter can be online while the system draws more than it
+ * supplies (a low-power USB-C source, or a heavy load on a small adapter),
+ * and the battery then drains: B0AC, the battery current, is negative.
+ * CHCE and CHCC describe the adapter, not the battery, so the battery
+ * current decides.
  */
 static int macsmc_battery_charging_status(struct macsmc_power *power)
 {
@@ -1172,6 +1175,14 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		 * J700 it does not follow that layout (it decodes to 2082) and
 		 * macOS reports no manufacture date for the battery: leave the
 		 * date out there rather than report a wrong one.
+		 *
+		 * This is the battery's data format, not a driver policy. On
+		 * the J700 BMDT still reads as six ASCII digits, the same form
+		 * as on other Macs, so the value does not tell the layouts
+		 * apart, and no difference in the key's reported type or size
+		 * has been recorded: the J700 stays matched by machine. If the
+		 * SMC key inventory (hwmon debugfs "keys") shows BMDT with a
+		 * different type or size there, key it on that instead.
 		 */
 		if (!of_machine_is_compatible("apple,j700")) {
 			props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_YEAR;
@@ -1227,7 +1238,15 @@ static int macsmc_power_probe(struct platform_device *pdev)
 
 		power->b0rm_native = power->fw_ge_27 ||
 				     of_machine_is_compatible("apple,j700");
-		power->status_from_current = of_machine_is_compatible("apple,j700");
+		/*
+		 * CURRENT_NOW reports B0AC as a signed 16-bit mA value, negative
+		 * while the battery discharges. Let its sign decide the
+		 * charging status wherever the SMC reports B0AC with that type.
+		 */
+		power->status_from_current =
+			!apple_smc_get_key_info(power->smc, SMC_KEY(B0AC), &info) &&
+			info.type_code == __SMC_KEY('s', 'i', '1', '6') &&
+			info.size == sizeof(s16);
 
 		/*
 		 * Preserve firmware charge policy until userspace changes it:
