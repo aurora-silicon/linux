@@ -301,7 +301,8 @@ ASAHI_TESTS = {
     'g17-publication-direct-lazy-tests.py': [([], PASS)]
         + mutations('--mutation', ('clique-chain', 'skip-failed-status-direct',
                                    'eager-activate', 'cycle-target-some',
-                                   'skip-error-clear-settled', 'skip-fast-check'), []),
+                                   'skip-error-clear-settled', 'skip-fast-check',
+                                   'drop-chain-link'), []),
     'g17-m5-multiqueue-contention-tests.py': [([], PASS)]
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',

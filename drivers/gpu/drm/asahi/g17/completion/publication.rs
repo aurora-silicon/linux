@@ -14,6 +14,12 @@ use kernel::{new_mutex, prelude::*, sync::{Arc, Mutex}};
 
 type Links = Option<KBox<Link>>;
 
+/// How many unsettled timestamp-free predecessors deep `Publication::is_pending()` follows
+/// before it answers pending. Commands link the newest pending entry of their prefixes, so an
+/// unretired pipeline is a chain of such links; the bound keeps the probe off the stack, and a
+/// probe that stops early only leaves the settlement to `finish()`.
+const PENDING_PROBE_DEPTH: usize = 4;
+
 struct Link {
     // Populated only when attached to a predecessor's successor list so
     // `deferred_links` held on the target itself never forms a self-Arc cycle.
@@ -113,6 +119,10 @@ impl Publication {
     /// Whether this publication still has an unpublished host timestamp write
     /// or an unresolved or failed predecessor chain.
     pub(crate) fn is_pending(&self) -> bool {
+        self.pending_within(PENDING_PROBE_DEPTH)
+    }
+
+    fn pending_within(&self, depth: usize) -> bool {
         if !self.pending.load(Ordering::Acquire) {
             return false;
         }
@@ -151,7 +161,7 @@ impl Publication {
             drop(dropped);
             match probe {
                 Some(pred) => {
-                    if pred.is_pending() {
+                    if depth == 0 || pred.pending_within(depth - 1) {
                         return true;
                     }
                 }

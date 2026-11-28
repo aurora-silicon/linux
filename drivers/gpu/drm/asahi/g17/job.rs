@@ -553,6 +553,9 @@ pub(crate) struct Fences {
     /// timestamp-free publication chaining. `None` for commands that write
     /// their own timestamps or have no pending timestamp ancestors.
     pub(crate) timestamp_publications: Option<Arc<KVec<Arc<super::completion::Publication>>>>,
+    /// The prefix of its own engine this command covers (`Order::wait_through`). A later
+    /// command that links this command's publication reaches that prefix through it.
+    pub(crate) covers: Option<u64>,
     pub(crate) owner: Arc<Completion>,
 }
 
@@ -690,6 +693,7 @@ impl<B: Backend> Scheduler<B> {
             completed,
             publication: host_publication,
             timestamp_publications: None,
+            covers: None,
             owner: packet.completion.clone(),
         })
     }

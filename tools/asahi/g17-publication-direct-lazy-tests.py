@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host test for direct timestamp-writer linking and lazy Publication attachment.
 
 Verifies:
 1. `collect_publication_predecessors()` in `queue/mod.rs` links directly to
    pending timestamp writers (`has_outputs()`) and failed entries (`status() < 0`)
    via `timestamp_publications`, preventing an O(N^2) clique of intermediate
-   timestamp-free pass-through links.
+   timestamp-free pass-through links, while `PublicationChain::link()` keeps the
+   newest uncovered pending timestamp-free entry linked so its failure still
+   reaches a covering successor, whether it fails before or after the successor
+   is enqueued.
 2. `Publication` in `completion/publication.rs` defers predecessor attachment
    until `finish()` with `target: None` in `deferred_links` (no Arc self-cycle
    when dropped unfinished), skips locking cleanly settled predecessors on the
@@ -47,7 +50,8 @@ def build_harness(mutation=None):
     finish_fn = item(pub_src, 'pub(crate) fn finish(self: &Arc<Self>,')
     attach_fn = item(pub_src, 'fn attach_deferred(self: &Arc<Self>,')
     publish_fn = item(pub_src, 'fn publish(&self, result: Result<[u64; 4]>) -> Links')
-    is_pending_fn = item(pub_src, 'pub(crate) fn is_pending(&self) -> bool')
+    is_pending_fn = item(pub_src, 'fn pending_within(&self, depth: usize) -> bool')
+    chain_fn = item(q_src, 'fn link(self, direct: &[Arc<Publication>], out: &mut KVec<Arc<Publication>>)')
 
     if mutation == 'clique-chain':
         collect_fn = collect_fn.replace(
@@ -79,6 +83,8 @@ def build_harness(mutation=None):
             '',
             1,
         )
+    elif mutation == 'drop-chain-link':
+        build_fn = build_fn.replace('chain.link(&predecessors, &mut chained)?;', '', 2)
     elif mutation == 'skip-fast-check':
         attach_fn = attach_fn.replace(
             'if predecessor.settled_clean.load(Ordering::Acquire) {',
@@ -98,6 +104,10 @@ def build_harness(mutation=None):
         'clear_settled_on_err': 'self.settled_clean.store(false, Ordering::Release);' in publish_fn,
         'finish_takes_deferred': 'core::mem::take(&mut state.deferred_links)' in finish_fn,
         'is_pending_settles': 'state.upstream_released = true;' in is_pending_fn,
+        'bounded_probe': 'pred.pending_within(depth - 1)' in is_pending_fn,
+        'covers_field': 'pub(crate) covers: Option<u64>,' in job_src,
+        'chain_links': build_fn.count('chain.link(&predecessors, &mut chained)?;') == 2
+            and 'Order::contains(covered, *sequence)' in chain_fn,
     }
 
     # Behavioral Rust model mirroring the exact lazy Publication + direct-writer rules.
@@ -107,12 +117,14 @@ def build_harness(mutation=None):
     cycle_target_some = mutation == 'cycle-target-some'
     skip_err_clear = mutation == 'skip-error-clear-settled'
     skip_fast = mutation == 'skip-fast-check'
+    drop_chain = mutation == 'drop-chain-link'
 
     return f'''
 use std::sync::{{Arc, Mutex, Weak, atomic::{{AtomicBool, AtomicI32, AtomicUsize, Ordering}}}};
 
 const PRODUCER_FAILED: i32 = -5;
 const EIO: i32 = -5;
+const PENDING_PROBE_DEPTH: usize = 4;
 
 type Links = Option<Box<Link>>;
 
@@ -181,6 +193,10 @@ impl Publication {{
     fn has_outputs(&self) -> bool {{ self.has_outputs }}
 
     fn is_pending(&self) -> bool {{
+        self.pending_within(PENDING_PROBE_DEPTH)
+    }}
+
+    fn pending_within(&self, depth: usize) -> bool {{
         if !self.pending.load(Ordering::Acquire) {{
             return false;
         }}
@@ -216,7 +232,7 @@ impl Publication {{
             drop(dropped);
             match probe {{
                 Some(p) => {{
-                    if p.is_pending() {{
+                    if depth == 0 || p.pending_within(depth - 1) {{
                         return true;
                     }}
                 }}
@@ -408,8 +424,44 @@ fn activate(target: &Arc<Publication>, preds: &[Arc<Publication>]) {{
 }}
 
 struct Entry {{
+    seq: u64,
+    covers: Option<u64>,
     pub_node: Arc<Publication>,
     inherited: Vec<Arc<Publication>>,
+}}
+
+fn has(out: &[Arc<Publication>], p: &Arc<Publication>) -> bool {{
+    out.iter().any(|e| Arc::ptr_eq(e, p))
+}}
+
+// EnqueueOrdering::build() over one covered prefix: the flattened writers (inherited by later
+// commands) and the chain links (PublicationChain::link), kept apart.
+fn build(prefix: &[Entry]) -> (Vec<Arc<Publication>>, Vec<Arc<Publication>>) {{
+    let mut direct = Vec::new();
+    let mut pending = Vec::new();
+    for e in prefix {{
+        if e.pub_node.fence_status.load(Ordering::Acquire) > 0 || !e.pub_node.is_pending() {{
+            continue;
+        }}
+        collect(e, &mut direct);
+        pending.push(e);
+    }}
+    let mut chain = Vec::new();
+    if !{str(drop_chain).lower()} {{
+        let mut covered: Option<u64> = None;
+        for e in pending.iter().rev() {{
+            let inside = covered.is_some_and(|c| e.seq != 0 && e.seq <= c);
+            if !inside && !e.pub_node.has_outputs() && !has(&direct, &e.pub_node) && !has(&chain, &e.pub_node) {{
+                chain.push(e.pub_node.clone());
+            }}
+            covered = covered.max(e.covers);
+        }}
+    }}
+    (direct, chain)
+}}
+
+fn all(direct: &[Arc<Publication>], chain: &[Arc<Publication>]) -> Vec<Arc<Publication>> {{
+    direct.iter().chain(chain.iter()).cloned().collect()
 }}
 
 fn collect(entry: &Entry, out: &mut Vec<Arc<Publication>>) {{
@@ -448,25 +500,27 @@ fn main() {{
     assert!({str(src_checks['clear_settled_on_err']).lower()}, "publish(Err) must clear settled_clean");
     assert!({str(src_checks['finish_takes_deferred']).lower()}, "finish() must take deferred_links before attaching");
     assert!({str(src_checks['is_pending_settles']).lower()}, "is_pending() must settle clean deferred chains");
+    assert!({str(src_checks['bounded_probe']).lower()}, "is_pending() must bound its predecessor probe");
+    assert!({str(src_checks['covers_field']).lower()}, "Fences must record the prefix it covers");
+    assert!({str(src_checks['chain_links']).lower()}, "EnqueueOrdering::build must chain both covered prefixes");
 
-    // 1. 64-deep timestamp-free chain behind 1 writer must stay O(1) links per node (NOT O(N^2) clique).
+    // 1. 64-deep timestamp-free chain behind 1 writer must stay O(1) links per node (NOT O(N^2) clique):
+    // the writer plus the newest pending entry, which covers the older ones.
     let writer = Publication::new(true);
     activate(&writer, &[]);
-    let mut entries = vec![Entry {{ pub_node: writer.clone(), inherited: vec![] }}];
+    let mut entries = vec![Entry {{ seq: 1, covers: None, pub_node: writer.clone(), inherited: vec![] }}];
     let mut total_links = 0usize;
-    for _ in 0..64 {{
-        let mut preds = Vec::new();
-        for e in &entries {{
-            collect(e, &mut preds);
-        }}
-        assert_eq!(preds.len(), 1, "must link only to direct timestamp writer, got {{}}", preds.len());
+    for seq in 2..=65u64 {{
+        let (preds, chain) = build(&entries);
+        assert_eq!(preds.len(), 1, "must flatten to the direct timestamp writer, got {{}}", preds.len());
         assert!(Arc::ptr_eq(&preds[0], &writer));
-        total_links += preds.len();
+        assert!(chain.len() <= 1, "chain must link only the newest pending entry, got {{}}", chain.len());
+        total_links += preds.len() + chain.len();
         let node = Publication::new(false);
-        activate(&node, &preds);
-        entries.push(Entry {{ pub_node: node, inherited: preds }});
+        activate(&node, &all(&preds, &chain));
+        entries.push(Entry {{ seq, covers: Some(seq - 1), pub_node: node, inherited: preds }});
     }}
-    assert_eq!(total_links, 64);
+    assert!(total_links <= 2 * 64, "links {{}}", total_links);
     assert_eq!(writer.add_succ_calls.load(Ordering::Relaxed), 0, "lazy activate must not lock predecessor");
 
     // 2. In-order writer finish drains 0 links and successors skip add_successor completely.
@@ -493,7 +547,7 @@ fn main() {{
     activate(&w3, &[]);
     let mid = Publication::new(false);
     activate(&mid, &[w3.clone()]);
-    let mid_entry = Entry {{ pub_node: mid.clone(), inherited: vec![w3.clone()] }};
+    let mid_entry = Entry {{ seq: 2, covers: Some(1), pub_node: mid.clone(), inherited: vec![w3.clone()] }};
     w3.finish(Ok(()));
     mid.finish(Err(EIO));
     let mut preds3 = Vec::new();
@@ -525,6 +579,36 @@ fn main() {{
     }}
     assert!(weak_c5.upgrade().is_none(), "unfinished deferred publication leaked via Arc self-cycle!");
 
+    // 7./8. Timestamp-free B fails while its writer A is still pending (its fence still reads 0).
+    // C covers B; it flattens B to A, and must still inherit B's failure when A succeeds,
+    // whether B fails before (7) or after (8) C is enqueued.
+    for fail_before in [true, false] {{
+        let a = Publication::new(true);
+        activate(&a, &[]);
+        let b = Publication::new(false);
+        activate(&b, &[a.clone()]);
+        let mut prefix = vec![
+            Entry {{ seq: 1, covers: None, pub_node: a.clone(), inherited: vec![] }},
+            Entry {{ seq: 2, covers: Some(1), pub_node: b.clone(), inherited: vec![a.clone()] }},
+        ];
+        if fail_before {{
+            b.finish(Err(EIO));
+            assert_eq!(b.fence_status.load(Ordering::Acquire), 0);
+        }}
+        let (preds, chain) = build(&prefix);
+        let c = Publication::new(true);
+        activate(&c, &all(&preds, &chain));
+        prefix.clear();
+        if !fail_before {{
+            b.finish(Err(EIO));
+        }}
+        c.finish(Ok(()));
+        a.finish(Ok(()));
+        assert_eq!(b.fence_status.load(Ordering::Acquire), EIO);
+        assert_eq!(c.fence_status.load(Ordering::Acquire), PRODUCER_FAILED,
+            "covering successor must inherit B's failure (fail_before={{}})", fail_before);
+    }}
+
     println!("PASS g17-publication-direct-lazy-tests");
 }}
 '''
@@ -539,6 +623,7 @@ def main():
         'cycle-target-some',
         'skip-error-clear-settled',
         'skip-fast-check',
+        'drop-chain-link',
     ])
     args = parser.parse_args()
     src = build_harness(args.mutation)
