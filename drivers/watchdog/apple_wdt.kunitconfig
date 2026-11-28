@@ -1,0 +1,6 @@
+# ./tools/testing/kunit/kunit.py run --arch=arm64 --kunitconfig=drivers/watchdog/apple_wdt.kunitconfig
+CONFIG_KUNIT=y
+CONFIG_ARCH_APPLE=y
+CONFIG_WATCHDOG=y
+CONFIG_APPLE_WATCHDOG=y
+CONFIG_APPLE_WATCHDOG_KUNIT_TEST=y
