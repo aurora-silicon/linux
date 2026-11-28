@@ -7384,7 +7384,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 
 	dart->tunnel_state_restored = false;
 	/* The display sleep's owner checks retained state before its firmware can run. */
-	if (dart->m5_sleep_owner)
+	if (dart->m5_sleep_owner || READ_ONCE(dart->display_dark))
 		return 0;
 	/* Its consumer saved this already and restores it: see apple_dart_sleep_prepare(). */
 	if (dart->sleep_saved)
@@ -7695,7 +7695,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	int ret;
 
 	/* Do not enable DMA or overwrite its snapshot behind the display sleep's owner. */
-	if (dart->m5_sleep_owner)
+	if (dart->m5_sleep_owner || READ_ONCE(dart->display_dark))
 		return 0;
 	/* Native owners restore after host clocks and before their requesters. */
 	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
@@ -7818,7 +7818,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 	bool domain_cycled = false;
 	int ret;
 
-	if (READ_ONCE(dart->m5_sleep_owner))
+	if (READ_ONCE(dart->m5_sleep_owner) || READ_ONCE(dart->display_dark))
 		return 0;
 	/* Its host restores every register after the native port clocks return. */
 	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
@@ -8000,7 +8000,7 @@ static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	if (READ_ONCE(dart->m5_sleep_owner)) {
+	if (READ_ONCE(dart->m5_sleep_owner) || READ_ONCE(dart->display_dark)) {
 		dart->v27_noirq_skip = true;
 		return 0;
 	}
@@ -8741,8 +8741,10 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 		ret = apple_dart_display_dark_exit(dart);
 		if (ret)
 			return ret;
-		writel(0, dart->regs + 0x210);
-		writel(0, dart->regs + 0x4060);
+		writel(0, dart->regs + DART_T8110_DIAG_LOCK);
+		writel(0, dart->regs + (dart->version >= 0x0202 ?
+					DART_T8110_V2_ERROR_MASK :
+					DART_T8110_ERROR_MASK));
 		writel(streams, dart->regs + DART_T8110_ENABLE_STREAMS);
 		return 0;
 	}
@@ -8754,18 +8756,51 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	if (ret)
 		return ret;
 
-	writel(U32_MAX, dart->regs + 0x4060);
-	writel(0, dart->regs + 0x4000);
-	writel(U32_MAX, dart->regs + 0x704);
+	if (dart->version >= 0x0202) {
+		writel(U32_MAX, dart->regs + DART_T8110_V2_ERROR_MASK);
+		writel(0, dart->regs + DART_T8110_EXCEPTION(0));
+		writel(U32_MAX, dart->regs + DART_T8110_ERR_IRQ_STATUS);
+	} else {
+		unsigned int i;
+
+		writel(U32_MAX, dart->regs + DART_T8110_ERROR_MASK);
+		writel(readl(dart->regs + DART_T8110_ERROR),
+		       dart->regs + DART_T8110_ERROR);
+		for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32); i++)
+			writel(U32_MAX, dart->regs + DART_T8110_ERROR_STREAMS + 4 * i);
+	}
 	for_each_set_bit(sid, &bits, BITS_PER_TYPE(streams))
 		writel(BIT(sid), dart->regs + DART_T8110_DISABLE_STREAMS);
 	if (!flush)
 		return 0;
 
-	writel(0xa000, dart->regs + DART_T8110_TLB_CMD);
-	ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
-					!(status & DART_T8110_TLB_CMD_BUSY), 1,
-					DART_T8110_FLUSH_BUSY_TIMEOUT);
+	if (dart->version >= 0x0202) {
+		writel(0xa000, dart->regs + DART_T8110_TLB_CMD);
+		ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+						!(status & DART_T8110_TLB_CMD_BUSY), 1,
+						DART_T8110_FLUSH_BUSY_TIMEOUT);
+	} else {
+		ret = 0;
+		for_each_set_bit(sid, &bits, BITS_PER_TYPE(streams)) {
+			u32 cmd = FIELD_PREP(DART_T8110_TLB_CMD_OP,
+					     DART_T8110_TLB_CMD_OP_FLUSH_SID) |
+				  FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
+
+			ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD,
+							status,
+							!(status & DART_T8110_TLB_CMD_BUSY),
+							1, DART_T8110_FLUSH_BUSY_TIMEOUT);
+			if (ret)
+				break;
+			writel(cmd, dart->regs + DART_T8110_TLB_CMD);
+			ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD,
+							status,
+							!(status & DART_T8110_TLB_CMD_BUSY),
+							1, DART_T8110_FLUSH_BUSY_TIMEOUT);
+			if (ret)
+				break;
+		}
+	}
 	if (ret) {
 		dev_err(dev, "flush for a power-down didn't finish: %#x\n", status);
 		return ret;
