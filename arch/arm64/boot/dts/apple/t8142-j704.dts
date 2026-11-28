@@ -327,3 +327,4 @@
 #include "t8142-j704-power.dtsi"
 #include "t8142-j704-hwmon.dtsi"
 #include "t8142-j704-audio.dtsi"
+#include "t8142-j704-usbc-display.dtsi"
