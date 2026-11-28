@@ -300,6 +300,12 @@ struct macaudio_snd_data {
 	 * without spk_mutex (macaudio_pm_notify()), cleared under it.
 	 */
 	bool pm_quiesced;
+	/*
+	 * System sleeps begun since bind ("Speaker Protection Sleeps"): bumped
+	 * at PM_SUSPEND_PREPARE / PM_HIBERNATION_PREPARE, before any task
+	 * freezes, aborted sleeps included. READ_ONCE/WRITE_ONCE, no lock.
+	 */
+	unsigned int pm_sleeps;
 	/* The card is being removed: no grant, no amp access */
 	bool spk_dead;
 	/*
@@ -365,6 +371,14 @@ struct macaudio_snd_data {
 	struct snd_kcontrol *speaker_sample_rate_kctl;
 
 	struct mutex volume_lock_mutex;
+	/*
+	 * A CAP_SYS_ADMIN process wrote "Speaker Volume Unlock" to "Speaker
+	 * Protection Interface" since the card bound, and no write of "Speaker
+	 * Protection" came after it: only then may a daemon take the volume
+	 * lock (see macaudio_slk_selected()). Never set by the kernel itself.
+	 * Written under spk_mutex and volume_lock_mutex.
+	 */
+	bool spk_legacy_selected;
 	bool speaker_volume_unlocked;
 	bool speaker_volume_was_locked;
 	struct snd_kcontrol *speaker_lock_kctl;
@@ -537,6 +551,11 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
  * speakers play. While it does, the volumes may go up to the amps' 0 dB;
  * otherwise they are held at the lock's ceiling. The daemon governs them
  * from its thermal model.
+ *
+ * Only once an administrator has selected it, though: a CAP_SYS_ADMIN write
+ * of "Speaker Volume Unlock" to "Speaker Protection Interface" since the
+ * card bound. Until then, and after a write of "Speaker Protection", the
+ * lock and the ping fail with -EPERM (see macaudio_slk_refused()).
  */
 
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
@@ -794,6 +813,12 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	/* No protection daemon can hold these speakers: nothing to unlock */
 	if (macaudio_spk_lease_only(ma->cfg))
 		return;
+
+	/* Only after an explicit selection of the volume lock */
+	if (!ma->spk_legacy_selected) {
+		reason = "Speaker Volume Unlock not selected";
+		unlock = false;
+	}
 
 	/* Check that someone is holding the main lock */
 	if (!ma->speaker_lock_owner) {
@@ -1584,7 +1609,9 @@ static int macaudio_spk_init(struct macaudio_snd_data *ma)
  *
  * The owner was frozen with the rest of userspace, so the state of its
  * engine is unknown: its first write after the resume fails with
- * -ETIMEDOUT, as after any stall, and the one after it grants.
+ * -ETIMEDOUT, as after any stall, and the one after it grants. The sleep
+ * is counted first ("Speaker Protection Sleeps"), so the owner can tell
+ * this lapse from a stall.
  */
 static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 			      void *data)
@@ -1600,6 +1627,12 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		/*
+		 * Counted first: the owner reads the count after the thaw and
+		 * must see this sleep whatever else the chain does (see
+		 * macaudio_spk_sleeps_get()).
+		 */
+		WRITE_ONCE(ma->pm_sleeps, READ_ONCE(ma->pm_sleeps) + 1);
 		/*
 		 * Before anything that can wait, spk_mutex included: a writer
 		 * that holds it may be stuck behind the sleep itself. No grant
@@ -1648,6 +1681,11 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
  * the volumes stay at the safe level under the lock's ceiling, and go up
  * only once a daemon holds the lock and pings it, as after a cold bind. Its
  * first ping after the switch fails with -ETIMEDOUT: the lock was lost.
+ *
+ * A daemon may hold the lock at all only after an explicit CAP_SYS_ADMIN
+ * write of "Speaker Volume Unlock" during this bind, also where it is the
+ * interface already. The kernel's own returns to it (no owner of the lease)
+ * select nothing, and a write of "Speaker Protection" deselects it.
  *
  * While leased the lock's ping fails with -EBUSY, and the speaker volumes
  * and amp gains are the driver's: userspace writes fail with -EPERM.
@@ -1869,6 +1907,26 @@ static void macaudio_spk_unowned_work(struct work_struct *work)
 	up_write(&ma->card.snd_card->controls_rwsem);
 }
 
+/*
+ * Select or deselect the volume lock for daemons (spk_legacy_selected). A
+ * deselection relocks whatever a daemon had unlocked.
+ *
+ * Context: the card's controls_rwsem and spk_mutex held.
+ */
+static void macaudio_slk_select(struct macaudio_snd_data *ma, bool selected)
+{
+	lockdep_assert_held(&ma->spk_mutex);
+
+	mutex_lock(&ma->volume_lock_mutex);
+	if (ma->spk_legacy_selected != selected) {
+		ma->spk_legacy_selected = selected;
+		dev_info(ma->card.dev, "Speaker Volume Unlock %s by the administrator\n",
+			 selected ? "selected" : "deselected");
+		macaudio_vlimit_update(ma);
+	}
+	mutex_unlock(&ma->volume_lock_mutex);
+}
+
 static int macaudio_spk_iface_info(struct snd_kcontrol *kcontrol,
 				   struct snd_ctl_elem_info *uinfo)
 {
@@ -1901,6 +1959,9 @@ static int macaudio_spk_iface_put(struct snd_kcontrol *kcontrol,
 		return -EPERM;
 
 	mutex_lock(&ma->spk_mutex);
+	/* A write of "Speaker Protection" deselects the volume lock, at once */
+	if (item == MACAUDIO_SPK_IFACE_LEASE)
+		macaudio_slk_select(ma, false);
 	if (item == READ_ONCE(ma->spk_iface)) {
 		ret = 0;
 	} else if (item == MACAUDIO_SPK_IFACE_LEASE) {
@@ -1911,6 +1972,12 @@ static int macaudio_spk_iface_put(struct snd_kcontrol *kcontrol,
 		macaudio_spk_leave_lease(ma, "switched by the administrator");
 		ret = 1;
 	}
+	/*
+	 * An explicit write of "Speaker Volume Unlock", even where it is the
+	 * interface already (as from the bind), selects the volume lock.
+	 */
+	if (item == MACAUDIO_SPK_IFACE_UNLOCK)
+		macaudio_slk_select(ma, true);
 	mutex_unlock(&ma->spk_mutex);
 	return ret;
 }
@@ -3550,6 +3617,8 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 			return dev_err_probe(card->dev, ret, "software gain ceiling not set\n");
 
 		mutex_lock(&ma->volume_lock_mutex);
+		/* Every bind starts unselected: only an administrator selects it */
+		ma->spk_legacy_selected = false;
 		macaudio_vlimit_unlock(ma, false);
 		ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
 		mutex_unlock(&ma->volume_lock_mutex);
@@ -3852,6 +3921,19 @@ static int macaudio_sss_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	return 0;
 }
 
+/*
+ * The volume lock lifts the speakers only for a daemon an administrator
+ * chose: a CAP_SYS_ADMIN write of "Speaker Volume Unlock" to "Speaker
+ * Protection Interface" since the card bound (spk_legacy_selected). Without
+ * it the lock and the ping are refused, so a daemon started on its own fails
+ * at once instead of believing it guards the speakers.
+ */
+static void macaudio_slk_refused(struct macaudio_snd_data *ma)
+{
+	dev_info_once(ma->card.dev,
+		      "Speaker Volume Unlock refused: not selected on Speaker Protection Interface\n");
+}
+
 static int macaudio_slk_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
@@ -3891,6 +3973,13 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	if (macaudio_spk_leased(ma)) {
 		mutex_unlock(&ma->volume_lock_mutex);
 		return -EBUSY;
+	}
+
+	/* Deselected since the daemon took the lock */
+	if (!ma->spk_legacy_selected) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		macaudio_slk_refused(ma);
+		return -EPERM;
 	}
 
 	/* Serves as a notification that the lock was lost at some point */
@@ -3940,6 +4029,12 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 
 	mutex_lock(&ma->volume_lock_mutex);
 
+	if (!ma->spk_legacy_selected) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		macaudio_slk_refused(ma);
+		return -EPERM;
+	}
+
 	/*
 	 * A lease belongs to the owner that pinged for it. Whatever the
 	 * previous owner had left must not unlock the volume for a new one
@@ -3981,13 +4076,52 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	mutex_unlock(&ma->volume_lock_mutex);
 }
 
-/* The speaker controls go last: a card without speakers drops them. */
-#define MACAUDIO_NUM_SPEAKER_CONTROLS 4
+/*
+ * The speaker controls go last: a card without speakers drops them. The
+ * controls before them are the ones every card has; the platform probe
+ * checks at build time that the two counts add up to the array.
+ */
+#define MACAUDIO_NUM_COMMON_CONTROLS 3
+#define MACAUDIO_NUM_SPEAKER_CONTROLS 5
+
+/*
+ * "Speaker Protection Sleeps": how many system sleeps have begun since the
+ * card bound, read-only, wrapping at INT_MAX.
+ *
+ * A lease that a sleep ends and one whose owner stalled both fail the
+ * owner's next write with -ETIMEDOUT, and the suspend counters userspace
+ * can read move only after the thaw and the PM_POST_SUSPEND chain, with no
+ * bound on how long after. This count moves at PM_SUSPEND_PREPARE, before
+ * the freezer, so by the time the owner runs again it has moved for every
+ * sleep that began, an aborted one too. An owner that reads it before a
+ * renewal and again at a lapse knows the lapse was a stall when it has not
+ * changed. Only equality is meaningful.
+ */
+static int macaudio_spk_sleeps_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = INT_MAX;
+	return 0;
+}
+
+static int macaudio_spk_sleeps_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	uvalue->value.integer.value[0] = READ_ONCE(ma->pm_sleeps) & INT_MAX;
+	return 0;
+}
 
 static const struct snd_kcontrol_new macaudio_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Speaker"),
 	SOC_DAPM_PIN_SWITCH("Headphone"),
 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
+	/* Speaker-only from here (MACAUDIO_NUM_SPEAKER_CONTROLS) */
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.access = SNDRV_CTL_ELEM_ACCESS_READ |
@@ -4019,6 +4153,14 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.name = "Speaker Protection Interface",
 		.info = macaudio_spk_iface_info,
 		.put = macaudio_spk_iface_put, .get = macaudio_spk_iface_get,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = SNDRV_CTL_ELEM_ACCESS_READ |
+			SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.name = "Speaker Protection Sleeps",
+		.info = macaudio_spk_sleeps_info,
+		.get = macaudio_spk_sleeps_get,
 	},
 };
 
@@ -4210,27 +4352,6 @@ struct macaudio_platform_cfg macaudio_j714_cfg = {
 	.spk_secondary_only = true,
 	/* Granted, the tweeters restore their DT corner, as on the J616s */
 	.tweeter_hpf_granted = true,
-};
-
-/*
- * K114s (T6050, MacBook Pro 14" M5 Pro): the J714s's AOP-fed card for the
- * headphone jack only. Its ADT describes the same jack codec, AOP audio
- * service and six SN012776 as the J714s's, but no speaker protection data
- * exists for this chassis, so the speakers stay off as on the J873: no safe
- * level and speakers disabled, so macaudio_speakers_allowed() refuses a
- * speaker link however the DT is written. The jack frame is the J714s's.
- */
-struct macaudio_platform_cfg macaudio_k114_cfg = {
-	.enable_speakers = false,
-	.amp = AMP_SN012776,
-	.speakers = SPKR_2W1T,
-	.stereo = true,
-	.safe_vol = 0,
-	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
-	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
-	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
-		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
-	.spk_secondary_only = true,
 };
 
 /*
@@ -4544,8 +4665,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
 	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
 	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
-	/* k114    -       sn012776    -       2x 2W+1T (AOP-fed; jack only, speakers off) */
-	{ .compatible = "apple,k114-macaudio", .data = &macaudio_k114_cfg },
+	/* k114    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 14" PROLED chassis, J714's amps and frame) */
+	{ .compatible = "apple,k114-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
@@ -4643,6 +4764,9 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		card->num_dapm_routes--;
 
 	/* Admitted speakers always have a safe level (macaudio_speakers_allowed()) */
+	/* A speaker control added or removed without its count fails here */
+	BUILD_BUG_ON(ARRAY_SIZE(macaudio_controls) !=
+		     MACAUDIO_NUM_COMMON_CONTROLS + MACAUDIO_NUM_SPEAKER_CONTROLS);
 	if (!data->has_speakers) {
 		card->num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
 	} else {

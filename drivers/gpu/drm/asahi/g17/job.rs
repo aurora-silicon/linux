@@ -13,7 +13,7 @@ use kernel::{
     dma_fence::{Fence, RawDmaFence},
     drm::sched,
     prelude::*,
-    sync::Arc,
+    sync::{Arc, UniqueArc},
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
@@ -156,8 +156,10 @@ impl Packet {
             }
             Validated::Compute { .. } => None,
         };
-        Ok(Arc::new(
-            Self {
+        // Allocated first and written in place: built on the stack, the command (about 1.3 KB)
+        // was copied three more times.
+        let packet = UniqueArc::new_uninit(GFP_KERNEL)?;
+        let Ok(packet) = packet.init_with(init!(Self {
                 id,
                 context,
                 command,
@@ -171,9 +173,8 @@ impl Packet {
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
                 allowance_end: AtomicU64::new(0),
-            },
-            GFP_KERNEL,
-        )?)
+            }));
+        Ok(packet.into())
     }
 
     /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
@@ -549,6 +550,11 @@ pub(crate) struct Fences {
     pub(crate) scheduled: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    /// Pending host-timestamp writer completion fences inherited through
+    /// timestamp-free publication chaining. `None` for commands that write their
+    /// own timestamps (covered by `completed`) or have no pending timestamp
+    /// ancestors.
+    pub(crate) timestamp_waits: Option<Arc<KVec<Fence>>>,
     pub(crate) owner: Arc<Completion>,
 }
 
@@ -680,7 +686,14 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, scheduled, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences {
+            ready,
+            scheduled,
+            completed,
+            publication: host_publication,
+            timestamp_waits: None,
+            owner: packet.completion.clone(),
+        })
     }
 }
 

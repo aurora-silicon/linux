@@ -388,6 +388,8 @@ int main(void)
 #define DWC3_GCTL_PRTCAP_DEVICE 2
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
 enum phy_mode { PHY_MODE_INVALID, PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
+enum usb_device_speed { USB_SPEED_UNKNOWN, USB_SPEED_LOW, USB_SPEED_FULL, USB_SPEED_HIGH,
+    USB_SPEED_WIRELESS, USB_SPEED_SUPER, USB_SPEED_SUPER_PLUS };
 /* The task running the code: the glue's, or another one probing xHCI. */
 struct task_struct { int id; };
 static struct task_struct glue_task, other_task, *current_task = &glue_task, *lock_owner;
@@ -395,10 +397,12 @@ static struct task_struct glue_task, other_task, *current_task = &glue_task, *lo
 #define lockdep_assert_held(x) assert(lock_owner == current)
 struct device { const char *of_node; bool registered, bound; };
 struct platform_device { struct device dev; };
-struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; struct platform_device *xhci; };
+struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; struct platform_device *xhci;
+    enum usb_device_speed maximum_speed; };
 struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy, *role_sw; int lock, state;
     bool dt_dis_u3_susphy, host_only, sleep_ddr, fixed_hub, sleep_phy_wait, sleep_phy_pending;
-    struct task_struct *host_start_task; bool usb3_host_owed; int usb3_host_ret; };
+    struct task_struct *host_start_task; bool usb3_host_owed; int usb3_host_ret;
+    enum usb_device_speed maximum_speed; };
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
 static struct platform_device xhci_pdev;
 /* The xHCI model: its probe's progress, and what the PIPE and the controller do meanwhile. */
@@ -406,6 +410,7 @@ static bool driver_registered = true, async_probe, async_race, hcrst_done, runni
 static int phy_error, phy_calls, pre_host_phy_calls, probes, refused, host_calls, host_exits, gadget_calls;
 static int stops, syscore, pipe_resets, slp_votes, late_error;
 static bool susphy_on;
+static int validate_error, high_speed;
 /* The SuperSpeed root hub leaves the USB3 PHY to the glue, see dwc3_host_init(). */
 static const bool skip_usb3_phy_init = true;
 static bool of_device_is_compatible(const char *node, const char *name) { return !strcmp(node,name); }
@@ -419,6 +424,11 @@ static int phy_set_mode(void *phy, int mode) {
     pipe_live = !phy_error;
     return phy_error;
 }
+static int phy_validate(void *phy, int mode, int submode, void *opts)
+{ (void)phy; assert(mode == PHY_MODE_USB_DEVICE); (void)submode; (void)opts; return validate_error; }
+/* The GUCTL1 clock write is the controller's; the speed limit is what the role logic decides. */
+static void dwc3_apple_gadget_high_speed(struct dwc3_apple *a)
+{ if (a->dwc.maximum_speed <= USB_SPEED_HIGH) return; a->dwc.maximum_speed = USB_SPEED_HIGH; high_speed++; }
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, int cap) { (void)a; (void)cap; }
 static void dwc3_enable_susphy(struct dwc3 *d, bool on) { susphy_on = on && !d->dis_u3_susphy_quirk; }
 static int dwc3_gadget_init(struct dwc3 *d) { (void)d; gadget_calls++; return 0; }
@@ -542,7 +552,8 @@ static void stopped(struct dwc3_apple *a, int s)
 int main(void)
 {
     struct device dev = { "apple,t8132-dwc3" };
-    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .role_sw=&dev, .state=DWC3_APPLE_NO_CABLE };
+    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .role_sw=&dev, .state=DWC3_APPLE_NO_CABLE,
+                            .dwc.maximum_speed=USB_SPEED_SUPER };
     int s = 0, cores = 0;
 
     lock_owner = &glue_task;
@@ -603,14 +614,44 @@ int main(void)
     current_task=&other_task; hcrst_done=false;
     assert(xhci_plat_probe()==-EBUSY && !phy_calls && refused==1);
     current_task=&glue_task; xhci_pdev.dev.registered=false;
-    /* Device mode routes before the gadget: T8132 refuses a failure, older ports warn. */
+    /* A connection that cannot carry a SuperSpeed device still starts the gadget. */
     reset(&a, "apple,t8132-dwc3", -EOPNOTSUPP);
-    assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EOPNOTSUPP);
-    assert(!gadget_calls && stops==++s && phy_calls==1);
-    reset(&a, "apple,t8103-dwc3", -ETIMEDOUT);
     assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==1 && syscore==++cores);
-    assert(!a.dwc.dis_u3_susphy_quirk);
-    puts("ok 7 - USB3 host routed between HCRST and xHCI start, errors reach dwc3_apple_init, USB2-only fallback");
+    assert(stops==s && phy_calls==1 && !host_exits);
+    assert(high_speed==1 && a.dwc.maximum_speed==USB_SPEED_HIGH && a.maximum_speed==USB_SPEED_SUPER);
+    assert(a.state==DWC3_APPLE_DEVICE && !running);
+
+    /* The next host starts at the saved speed, after xHCI's reset. */
+    reset(&a, "apple,t8132-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER && phy_calls==1 && !pre_host_phy_calls);
+    started(&a);
+
+    /* A PHY can route USB2 while declining SuperSpeed device mode. */
+    reset(&a, "apple,t8132-dwc3", 0); validate_error=-EOPNOTSUPP;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==2 && syscore==++cores);
+    assert(phy_calls==1 && high_speed==2 && a.dwc.maximum_speed==USB_SPEED_HIGH);
+    validate_error=0;
+
+    /* A controller with no USB3 PHY also uses the saved speed on a role change. */
+    a.usb3_phy=NULL;
+    reset(&a, "apple,t8103-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER);
+    started(&a);
+    reset(&a, "apple,t8103-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==3 && syscore==++cores);
+    assert(high_speed==3 && a.dwc.maximum_speed==USB_SPEED_HIGH);
+    a.usb3_phy=&dev;
+
+    /* Other route errors still use the controller's existing error policy. */
+    reset(&a, "apple,t8132-dwc3", -EIO);
+    assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EIO);
+    assert(gadget_calls==3 && stops==++s && phy_calls==1);
+    reset(&a, "apple,t8103-dwc3", -ETIMEDOUT);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==4 && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER && !a.dwc.dis_u3_susphy_quirk);
+    puts("ok 7 - USB3 host routed after HCRST and high-speed gadget fallback preserves host speed");
     return 0;
 }
 '''

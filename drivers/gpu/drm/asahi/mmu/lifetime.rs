@@ -522,7 +522,7 @@ impl Vm {
 
     pub(super) fn defer_bind_batch(
         &self,
-        batch: &mut PreparedUserBindBatch,
+        batch: &mut PreparedUserBindBatch<'_>,
         start: usize,
     ) -> Result<bool> {
         use super::bind::PreparedUserBindOp;

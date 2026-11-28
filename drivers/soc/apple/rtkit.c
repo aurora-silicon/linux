@@ -2556,6 +2556,23 @@ static long apple_rtkit_wait_timeout(struct apple_rtkit *rtk, struct completion 
  * messages queued without another interrupt during bootstrap, so poll it
  * while waiting. Everyone else waits as before.
  */
+/*
+ * How long one handshake wait may take: the handshake timeout, cut short by
+ * the deadline of apple_rtkit_boot_by().
+ */
+static unsigned long apple_rtkit_handshake_jiffies(struct apple_rtkit *rtk)
+{
+	unsigned long t = msecs_to_jiffies(rtk->handshake_timeout_ms);
+	long left;
+
+	if (!rtk->handshake_deadline_set)
+		return t;
+	left = (long)(rtk->handshake_deadline - jiffies);
+	if (left <= 0)
+		return 0;
+	return min_t(unsigned long, t, left);
+}
+
 static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 {
 	unsigned long timeout;
@@ -2565,7 +2582,7 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 	if (!rtk->sync_syslog_ack && !rtk->poll_waits)
 		return apple_rtkit_wait_for_completion(rtk, c);
 
-	timeout = jiffies + msecs_to_jiffies(rtk->handshake_timeout_ms);
+	timeout = jiffies + apple_rtkit_handshake_jiffies(rtk);
 	do {
 		ret = apple_rtkit_poll(rtk);
 		if (ret < 0)
@@ -2609,9 +2626,12 @@ EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_session);
 static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
 					   struct completion *c)
 {
+	unsigned long timeout = apple_rtkit_handshake_jiffies(rtk);
 	long t;
 
-	t = apple_rtkit_wait_timeout(rtk, c, msecs_to_jiffies(rtk->handshake_timeout_ms));
+	if (!timeout)
+		return try_wait_for_completion(c) ? 0 : -ETIME;
+	t = apple_rtkit_wait_timeout(rtk, c, timeout);
 	if (t < 0)
 		return t;
 	else if (t == 0)
@@ -2862,6 +2882,23 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	return apple_rtkit_boot_common(rtk, false, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
+
+/*
+ * apple_rtkit_boot(), with no handshake wait running past @deadline (jiffies):
+ * a caller with an overall budget doesn't overrun it by a handshake timeout
+ * at every step. Returns -ETIME once the deadline has passed.
+ */
+int apple_rtkit_boot_by(struct apple_rtkit *rtk, unsigned long deadline)
+{
+	int ret;
+
+	rtk->handshake_deadline = deadline;
+	rtk->handshake_deadline_set = true;
+	ret = apple_rtkit_boot(rtk);
+	rtk->handshake_deadline_set = false;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_by);
 
 int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data), void *data)
 {

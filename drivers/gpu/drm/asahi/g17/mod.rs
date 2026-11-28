@@ -2108,7 +2108,16 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
-        let feed = feed::Feed::new(m5)?;
+        // Firmware command timestamps count the system time base at its own 24 MHz, not at
+        // the CPU counter's rate (CNTFRQ_EL0 is 1 GHz on T6040 and T8140).
+        let feed = feed::Feed::new(
+            if m5 {
+                &feed::Policy::M5
+            } else {
+                &feed::Policy::DEFAULT
+            },
+            crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ,
+        )?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
@@ -2608,7 +2617,6 @@ impl Gpu {
                 session.init.port_views(mailbox)?,
                 session.bridge.regs.clone(),
                 shared.variant.registration,
-                !shared.variant.m5_commands,
             )
             .inspect_err(at("port"))?;
         session
@@ -2794,7 +2802,6 @@ impl Gpu {
             session.init.port_views(mailbox)?,
             session.bridge.regs.clone(),
             shared.variant.registration,
-            !shared.variant.m5_commands,
         )?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {

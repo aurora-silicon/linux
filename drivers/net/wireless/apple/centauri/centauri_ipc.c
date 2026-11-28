@@ -574,15 +574,36 @@ bool centauri_beta_running(struct centauri *c)
 	return readl(ipc->bar[2] + 0x18) == 2 && !readl(ipc->bar[2]);
 }
 
-void centauri_free_ipc(struct centauri *c)
+/*
+ * Clearing Bus Master stops new requests only. The read back of the command
+ * register returns after the function's earlier posted writes, and the wait
+ * covers its requests still in flight.
+ */
+bool centauri_stop_dma(struct pci_dev *pdev)
+{
+	u16 command;
+
+	pci_clear_master(pdev);
+	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
+	    (command & PCI_COMMAND_MASTER))
+		return false;
+	return pci_wait_for_pending_transaction(pdev);
+}
+
+/*
+ * Stop the IPC's interrupts and every function's DMA. Returns false if a
+ * function's DMA could not be stopped; a later call (a retried restart, or
+ * removal) tries again.
+ */
+bool centauri_stop_ipc(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
-	struct cen_buffer *buffer, *next;
+	bool stopped = true;
 	int i, cap;
 	u16 control;
 
 	if (!ipc)
-		return;
+		return true;
 	for (i = 0; i < 3; i++)
 		if (ipc->vectors[i])
 			free_vectors(c, i);
@@ -598,6 +619,21 @@ void centauri_free_ipc(struct centauri *c)
 		}
 		pci_clear_master(ipc->function[i]);
 	}
+	for (i = 0; i < 3; i++)
+		if (ipc->function[i] && !centauri_stop_dma(ipc->function[i]))
+			stopped = false;
+	return stopped;
+}
+
+/* Only after centauri_stop_ipc() and the boot DMA's stop both succeeded. */
+void centauri_free_ipc(struct centauri *c)
+{
+	struct centauri_ipc *ipc = c->ipc;
+	struct cen_buffer *buffer, *next;
+	int i;
+
+	if (!ipc)
+		return;
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		dma_free_coherent(buffer->dev, buffer->size, buffer->cpu, buffer->dma);
 		list_del(&buffer->list);
@@ -637,7 +673,7 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 }
 
 /* Called once under the Wi-Fi lock. Published logging memory stays owned by
- * IPC until every function has bus mastering disabled in centauri_free_ipc.
+ * IPC until every function's DMA has stopped in centauri_stop_ipc.
  */
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size)
 {

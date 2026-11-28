@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 /*
- * Apple T6040 Type-C PHY -- USB2 and USB3 host
+ * Apple T6040 Type-C PHY -- USB2 host and device, USB3 host
  *
  * This deliberately does not share the T8103/T8122 ATC PHY compatible. T6040
  * has CIO4/TB5-era resources and a different event-bank layout. The
- * implemented operations are the USB2 host sequence and the USB3 host attach
- * (mode 4) decoded from the paired AppleT6040TypeCPhy driver.
+ * implemented operations are the USB2 host and device sequences and the USB3
+ * host attach (mode 4).
+ *
+ * USB2 device: the same eUSB2 power-on as the host, with the device tunables
+ * from the boot loader instead of the host one (without them the port stays a
+ * host), the role signature cleared and
+ * VBUS forced valid (the Type-C port controller, not this PHY, sees VBUS: the
+ * controller only enters device mode once the port controller has reported a
+ * USB data connection from a host). The USB3 PHY has no device sequence, so a
+ * device port runs at high speed with its PIPE on the dummy PHY.
  *
  * USB3: the Type-C orientation switch records the plug orientation; power_on
  * of the USB3 PHY wakes the PHY, applies the tunables and the crossbar for
@@ -57,7 +65,7 @@
 
 #define T6040_USB2_USBCTL		0x00
 #define T6040_USB2_USBCTL_MODE		GENMASK(2, 0)
-#define T6040_USB2_USBCTL_MODE_HOST	2
+#define T6040_USB2_USBCTL_MODE_HOST	2	/* "run": host and device alike */
 
 #define T6040_USB2_CTL			0x04
 #define T6040_USB2_CTL_RESET		BIT(0)
@@ -68,6 +76,8 @@
 #define T6040_USB2_SIG			0x08
 #define T6040_USB2_SIG_VBUSDET_FORCE_VAL	BIT(0)
 #define T6040_USB2_SIG_VBUSDET_FORCE_EN	BIT(1)
+#define T6040_USB2_SIG_VBUSVLDEXT_FORCE_VAL	BIT(2)
+#define T6040_USB2_SIG_VBUSVLDEXT_FORCE_EN	BIT(3)
 #define T6040_USB2_SIG_HOST_0		BIT(12)
 #define T6040_USB2_SIG_HOST_1		BIT(13)
 #define T6040_USB2_SIG_HOST_2		BIT(14)
@@ -281,6 +291,9 @@ struct t6040_usb2_phy {
 	struct apple_tunable *tunable_pipehandler;
 	/* ADT tunable_USB2PHY_HOST, applied after the signal setup. */
 	struct apple_tunable *tunable_usb2_host;
+	/* ADT tunable_USB2PHY_DFLT and _DEV, applied in their place for device mode. */
+	struct apple_tunable *tunable_usb2_default;
+	struct apple_tunable *tunable_usb2_device;
 	struct apple_rtkit *rtk;
 	struct device *mbox_dev;
 	struct completion app_reply;
@@ -330,11 +343,27 @@ static inline void t6040_usb2_clear32(void __iomem *reg, u32 clear)
 	t6040_usb2_mask32(reg, clear, 0);
 }
 
+static int t6040_usb2_validate(struct phy *phy, enum phy_mode mode, int submode,
+			       union phy_configure_opts *opts)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	if (mode == PHY_MODE_USB_HOST)
+		return 0;
+	/*
+	 * Device mode runs on the boot loader's device tunables. Without them
+	 * the port stays a host rather than run an untuned device mode.
+	 */
+	if (mode == PHY_MODE_USB_DEVICE && tphy->tunable_usb2_device)
+		return 0;
+	return -EOPNOTSUPP;
+}
+
 static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 
-	if (mode != PHY_MODE_USB_HOST)
+	if (t6040_usb2_validate(phy, mode, submode, NULL))
 		return -EOPNOTSUPP;
 
 	guard(mutex)(&tphy->lock);
@@ -351,16 +380,37 @@ static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 #define T6040_USB2_SIG_INIT	(T6040_USB2_SIG_HOST_0 | T6040_USB2_SIG_HOST_1 | \
 				 T6040_USB2_SIG_HOST_2 | T6040_USB2_SIG_VBUSDET_FORCE_VAL | \
 				 T6040_USB2_SIG_VBUSDET_FORCE_EN)
+#define T6040_USB2_SIG_ROLE	(T6040_USB2_SIG_HOST_0 | T6040_USB2_SIG_HOST_1 | \
+				 T6040_USB2_SIG_HOST_2)
+#define T6040_USB2_SIG_VBUSVLDEXT (T6040_USB2_SIG_VBUSVLDEXT_FORCE_VAL | \
+				   T6040_USB2_SIG_VBUSVLDEXT_FORCE_EN)
+/* The signal bits power_on programs and checks in both roles. */
+#define T6040_USB2_SIG_CHECKED	(T6040_USB2_SIG_INIT | T6040_USB2_SIG_VBUSVLDEXT)
 
-static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
+static u32 t6040_usb2_sig_tunable(u32 sig, const struct apple_tunable *t)
 {
-	struct apple_tunable *t = tphy->tunable_usb2_host;
-	u32 want = T6040_USB2_SIG_INIT;
 	size_t i;
 
 	for (i = 0; t && i < t->sz; i++)
 		if (t->values[i].offset == T6040_USB2_SIG)
-			want = (want & ~t->values[i].mask) | t->values[i].value;
+			sig = (sig & ~t->values[i].mask) | t->values[i].value;
+	return sig;
+}
+
+/* The checked signal bits as power_on leaves them in the current mode. */
+static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
+{
+	u32 want = T6040_USB2_SIG_INIT;
+
+	if (tphy->mode == PHY_MODE_USB_DEVICE) {
+		want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_default);
+		want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_device);
+		want = (want & ~T6040_USB2_SIG_ROLE) | T6040_USB2_SIG_VBUSVLDEXT;
+		return want & T6040_USB2_SIG_CHECKED;
+	}
+
+	want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_default);
+	want = t6040_usb2_sig_tunable(want, tphy->tunable_usb2_host);
 	return want & T6040_USB2_SIG_INIT;
 }
 
@@ -373,7 +423,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 	if (tphy->shutdown_failed)
 		return -EIO;
 
-	if (tphy->mode != PHY_MODE_USB_HOST)
+	if (tphy->mode != PHY_MODE_USB_HOST && tphy->mode != PHY_MODE_USB_DEVICE)
 		return -EINVAL;
 	if (tphy->powered)
 		return 0;
@@ -394,13 +444,33 @@ static int t6040_usb2_power_on(struct phy *phy)
 	t6040_usb2_set32(tphy->usb2 + T6040_USB2_SIG,
 			 T6040_USB2_SIG_VBUSDET_FORCE_EN);
 
-	/*
-	 * The host tunable then sets the signal fields for host mode: on the
-	 * J616s it clears SIG[14:12] again (mask 0x7003, value 0x3). Left at
-	 * their init values, which are the device-mode ones, the USB2 port
-	 * never sees a connect.
-	 */
-	apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_host);
+	if (tphy->mode == PHY_MODE_USB_DEVICE) {
+		/*
+		 * Device mode takes the default and device tunables instead. On
+		 * the J616s they leave SIG[14:12] set (SIG reads 0x01c0700f), and
+		 * with those set a host never sees the device connect: clear them,
+		 * as the host tunable does for host mode. VBUS is the port
+		 * controller's: force it valid, or the controller sees no session
+		 * (J616s USB2 device row, aura#245, 2026-11-19).
+		 */
+		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
+		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_device);
+		t6040_usb2_clear32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_ROLE);
+		t6040_usb2_set32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_VBUSVLDEXT);
+	} else {
+		/*
+		 * The host tunable then sets the signal fields for host mode: it
+		 * clears SIG[14:12] again.
+		 * Left at their init values the USB2 port never sees a connect.
+		 * The default tunable, when the boot loader provides it, goes
+		 * first, as for a device: fields only the device tunable writes
+		 * do not carry over from a device session.
+		 */
+		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_default);
+		apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_host);
+		/* Forced VBUS valid belongs only to the device role. */
+		t6040_usb2_clear32(tphy->usb2 + T6040_USB2_SIG, T6040_USB2_SIG_VBUSVLDEXT);
+	}
 
 	msleep(10);
 
@@ -434,7 +504,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 			  T6040_USB2_USBCTL_MODE,
 			  T6040_USB2_USBCTL_MODE_HOST);
 
-	/* Confirm the programmed fields before the core can start the host. */
+	/* Confirm the programmed fields before the core can start. */
 	sig_want = t6040_usb2_sig_want(tphy);
 	ctl = readl(tphy->usb2 + T6040_USB2_CTL);
 	sig = readl(tphy->usb2 + T6040_USB2_SIG);
@@ -446,7 +516,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 	    (ctl & (T6040_USB2_CTL_RESET | T6040_USB2_CTL_PORT_RESET |
 		    T6040_USB2_CTL_SIDDQ | T6040_USB2_CTL_APB_RESET_N)) !=
 		   T6040_USB2_CTL_APB_RESET_N ||
-	    (sig & T6040_USB2_SIG_INIT) != sig_want ||
+	    (sig & T6040_USB2_SIG_CHECKED) != sig_want ||
 	    (tune & (T6040_USB2_MISCTUNE_APBCLK_GATE_OFF |
 		     T6040_USB2_MISCTUNE_REFCLK_GATE_OFF)) ||
 	    (mode & T6040_USB2_USBCTL_MODE) != T6040_USB2_USBCTL_MODE_HOST ||
@@ -454,7 +524,8 @@ static int t6040_usb2_power_on(struct phy *phy)
 		goto failed;
 
 	tphy->powered = true;
-	dev_info(tphy->dev, "USB2 host sequence complete\n");
+	dev_info(tphy->dev, "USB2 %s sequence complete\n",
+		 tphy->mode == PHY_MODE_USB_DEVICE ? "device" : "host");
 	return 0;
 failed:
 	tphy->shutdown_failed = true;
@@ -516,11 +587,19 @@ static int t6040_usb2_power_off(struct phy *phy)
 		return -EIO;
 	tphy->shutdown_failed = false;
 	tphy->powered = false;
+	/*
+	 * dwc3-apple selects device mode before each device session; xHCI asks
+	 * for host mode only once the PHY is powered. Start the next session in
+	 * host mode, as at probe, or a host after a device session would power
+	 * on as a device and then fail xHCI's request.
+	 */
+	tphy->mode = PHY_MODE_USB_HOST;
 	return 0;
 }
 
 static const struct phy_ops t6040_usb2_phy_ops = {
 	.owner = THIS_MODULE,
+	.validate = t6040_usb2_validate,
 	.set_mode = t6040_usb2_set_mode,
 	.power_on = t6040_usb2_power_on,
 	.power_off = t6040_usb2_power_off,
@@ -1181,14 +1260,18 @@ static int t6040_usb3_power_off(struct phy *phy)
 }
 
 /*
- * Host only. dwc3-apple calls this after the core init and before xHCI
+ * dwc3-apple calls this after the core init and before xHCI or the gadget
  * starts; the xHCI root hub calls it again as it starts, also for a port
- * that stays at USB2, which must not fail.
+ * that stays at USB2, which must not fail. There is no SuperSpeed device
+ * sequence (t6040_usb3_validate()): a device role runs on USB2 and leaves
+ * the PIPE parked on its dummy producer, where power_off put it.
  */
 static int t6040_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 
+	if (mode == PHY_MODE_USB_DEVICE)
+		return 0;
 	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_HOST_SS)
 		return -EOPNOTSUPP;
 
@@ -1202,8 +1285,16 @@ static int t6040_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	return 0;
 }
 
+/* SuperSpeed host only: dwc3-apple runs a device role as a high-speed device. */
+static int t6040_usb3_validate(struct phy *phy, enum phy_mode mode, int submode,
+			       union phy_configure_opts *opts)
+{
+	return mode == PHY_MODE_USB_HOST || mode == PHY_MODE_USB_HOST_SS ? 0 : -EOPNOTSUPP;
+}
+
 static const struct phy_ops t6040_usb3_phy_ops = {
 	.owner = THIS_MODULE,
+	.validate = t6040_usb3_validate,
 	.set_mode = t6040_usb3_set_mode,
 	.power_on = t6040_usb3_power_on,
 	.power_off = t6040_usb3_power_off,
@@ -2700,6 +2791,9 @@ static int t6040_usb2_reset_assert(struct reset_controller_dev *rcdev,
 			   T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
 			 T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	/* A device start that failed before power_on also ends here: back to host mode. */
+	if (!tphy->powered)
+		tphy->mode = PHY_MODE_USB_HOST;
 	if (tphy->dwc3_running) {
 		tphy->dwc3_running = false;
 		pm_runtime_put(tphy->dev);
@@ -2772,6 +2866,22 @@ static struct phy *t6040_usb2_xlate(struct device *dev,
 	}
 }
 
+/* An optional USB2 tunable from the boot loader, for the bank0 region. */
+static int t6040_usb2_tunable(struct platform_device *pdev, const char *name,
+			      struct apple_tunable **tunable)
+{
+	struct device *dev = &pdev->dev;
+
+	if (!of_property_present(dev->of_node, name))
+		return 0;
+	*tunable = devm_apple_tunable_parse(dev, dev->of_node, name,
+					    platform_get_resource_byname(pdev, IORESOURCE_MEM,
+									 "bank0"));
+	if (IS_ERR(*tunable))
+		return dev_err_probe(dev, PTR_ERR(*tunable), "invalid %s\n", name);
+	return 0;
+}
+
 static int t6040_usb2_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2790,9 +2900,9 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	 * to this phy. dwc3-apple's early phy_set_mode() call happens while
 	 * dwc.usb2_generic_phy[] is still unpopulated, so it is a silent no-op
 	 * on a NULL phy, and a PHY_MODE_INVALID default then fails power_on
-	 * with -EINVAL ("failed to initialize core", ticket 108). This
-	 * provider implements exactly one mode, so start in it; set_mode
-	 * still rejects every request that is not PHY_MODE_USB_HOST.
+	 * with -EINVAL ("failed to initialize core", ticket 108). Start in
+	 * host mode; dwc3-apple selects device mode before a device session,
+	 * and power_off returns to host mode.
 	 */
 	tphy->mode = PHY_MODE_USB_HOST;
 	mutex_init(&tphy->lock);
@@ -2804,15 +2914,15 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(tphy->usb2),
 				     "failed to map USB2 bank 0\n");
 
-	if (of_property_present(dev->of_node, "apple,tunable-usb2-host")) {
-		tphy->tunable_usb2_host =
-			devm_apple_tunable_parse(dev, dev->of_node, "apple,tunable-usb2-host",
-						 platform_get_resource_byname(pdev, IORESOURCE_MEM,
-									      "bank0"));
-		if (IS_ERR(tphy->tunable_usb2_host))
-			return dev_err_probe(dev, PTR_ERR(tphy->tunable_usb2_host),
-					     "invalid apple,tunable-usb2-host\n");
-	}
+	ret = t6040_usb2_tunable(pdev, "apple,tunable-usb2-host", &tphy->tunable_usb2_host);
+	if (!ret)
+		ret = t6040_usb2_tunable(pdev, "apple,tunable-usb2-default",
+					 &tphy->tunable_usb2_default);
+	if (!ret)
+		ret = t6040_usb2_tunable(pdev, "apple,tunable-usb2-device",
+					 &tphy->tunable_usb2_device);
+	if (ret)
+		return ret;
 
 	tphy->evt = devm_platform_ioremap_resource_byname(pdev, "bank1");
 	if (IS_ERR(tphy->evt))
