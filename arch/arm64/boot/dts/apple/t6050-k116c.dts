@@ -29,6 +29,9 @@
 #include "t6050-peripherals.dtsi"
 #include "t6050-media.dtsi"
 
+/* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0xbb). */
+#include "t6050-isp.dtsi"
+
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
