@@ -2684,28 +2684,6 @@ int apple_rtkit_port_restart(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_port_restart);
 
-/* What a firmware that restarts from its reset vector has forgotten. */
-static void apple_rtkit_free_session_buffers(struct apple_rtkit *rtk)
-{
-	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
-	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
-	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
-
-	kfree(rtk->syslog_msg_buffer);
-
-	rtk->syslog_msg_buffer = NULL;
-	rtk->syslog_n_entries = 0;
-	rtk->syslog_msg_size = 0;
-	rtk->syslog_inherited = false;
-	rtk->crashlog_inherited = false;
-	rtk->oslog_inherited = false;
-}
-
 /*
  * Everything of a firmware session but the mailbox hardware and, with
  * @keep_buffers, the shared buffers and the syslog geometry.
@@ -2719,8 +2697,25 @@ static void apple_rtkit_reset_session(struct apple_rtkit *rtk, bool keep_buffers
 	flush_workqueue(rtk->wq);
 	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 
-	if (!keep_buffers)
-		apple_rtkit_free_session_buffers(rtk);
+	if (!keep_buffers) {
+		apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->pmp_aux_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+		apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
+		apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
+
+		kfree(rtk->syslog_msg_buffer);
+
+		rtk->syslog_msg_buffer = NULL;
+		rtk->syslog_n_entries = 0;
+		rtk->syslog_msg_size = 0;
+		rtk->syslog_inherited = false;
+		rtk->crashlog_inherited = false;
+		rtk->oslog_inherited = false;
+	}
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
@@ -2745,11 +2740,11 @@ static void apple_rtkit_reset_session(struct apple_rtkit *rtk, bool keep_buffers
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 }
 
-static int apple_rtkit_reinit_session(struct apple_rtkit *rtk, bool keep_buffers)
+int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
 	int ret;
 
-	apple_rtkit_reset_session(rtk, keep_buffers);
+	apple_rtkit_reset_session(rtk, false);
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret) {
 		apple_rtkit_detach_rx(rtk);
@@ -2757,16 +2752,19 @@ static int apple_rtkit_reinit_session(struct apple_rtkit *rtk, bool keep_buffers
 	}
 	return ret;
 }
-
-int apple_rtkit_reinit(struct apple_rtkit *rtk)
-{
-	return apple_rtkit_reinit_session(rtk, false);
-}
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
 int apple_rtkit_reinit_retaining_buffers(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_reinit_session(rtk, true);
+	int ret;
+
+	apple_rtkit_reset_session(rtk, true);
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+	}
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit_retaining_buffers);
 
