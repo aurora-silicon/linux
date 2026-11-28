@@ -269,6 +269,9 @@ void apple_sleep_debug_link_cut_wake(void);
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
 
+/* T6050: whether the sleep driver can take the radio port down for a runtime recycle. */
+bool apple_sleep_radio_port_ready(void);
+
 /*
  * T6050: from the radio host's noirq suspend, with its DART saved and gated: the port's link
  * shutdown. An error means nothing was written and the sleep must be refused.
@@ -520,6 +523,11 @@ static inline void apple_sleep_debug_link_cut_wake(void)
 
 static inline void apple_sleep_radio_port_up(void)
 {
+}
+
+static inline bool apple_sleep_radio_port_ready(void)
+{
+	return false;
 }
 
 static inline int apple_sleep_radio_port_down(void)

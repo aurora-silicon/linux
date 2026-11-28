@@ -54,7 +54,7 @@ struct centauri_t6050_ipc { bool fenced; };
 struct centauri_t6050_rewake {
     struct pci_dev *bridge, *control, *beta;
     unsigned slot, generation, work_generation;
-    bool active, rerun, beta_fallback;
+    bool active, rerun, force_recycle, fault_only, fault_gave_up, beta_fallback;
     int error, node;
     void *arena;
     struct kref ref;
@@ -68,7 +68,7 @@ struct centauri_t6050 {
     int boot_work, boot_lock, alpha_irqs, irqs, boot_phase;
     void *firmware, *descriptor;
 };
-static int cen_recovery_lock, cen_recovery_owners, cen_rewake_wq;
+static int cen_recovery_lock, cen_active_lock, cen_recovery_owners, cen_rewake_wq;
 static bool cen_exiting, supported_sleep=true;
 static struct centauri_t6050_rewake *owner;
 static struct pci_dev *slots[3];
@@ -385,6 +385,10 @@ RACE_PRELUDE = r'''
 #include <string.h>
 #include <errno.h>
 typedef uint64_t dma_addr_t;
+#define HZ 250UL
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define READ_ONCE(x) (x)
+#define time_before(a, b) ((long)((a) - (b)) < 0)
 #define PCI_DEVFN(s,f) (((s)<<3)|(f))
 #define SZ_16K 16384
 struct device { bool locked; void *driver; void *data; };
@@ -395,12 +399,13 @@ struct kref { int refs; };
 struct centauri_t6050_ipc { bool fenced; int frees; };
 struct centauri_t6050_rewake {
     struct pci_dev *bridge, *control;
-    unsigned slot;
+    unsigned slot, generation, fault_gen, fault_count;
+    unsigned long fault_at[3];
     struct centauri_t6050_ipc *ipc;
     void *firmware, *descriptor, *arena;
     dma_addr_t firmware_dma, descriptor_dma;
     size_t firmware_size;
-    bool control_lease;
+    bool control_lease, fault_only, fault_gave_up, teardown_active;
     struct kref ref;
 };
 struct centauri_t6050 {
@@ -409,8 +414,17 @@ struct centauri_t6050 {
     void *firmware, *descriptor;
     dma_addr_t firmware_dma, descriptor_dma;
     size_t firmware_size;
+    unsigned generation;
+    int boot_lock;
+    bool removing, pm_prepared, firmware_sleep, firmware_kept, boot_hw_failed, link_ready;
 };
 static struct { int driver; } centauri_t6050_driver;
+static int cen_recovery_lock;
+static unsigned long jiffies;
+static void mutex_lock(int *p) { assert(!*p); *p=1; }
+static void mutex_unlock(int *p) { assert(*p); *p=0; }
+static bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c) { (void)c; return false; }
+static void pci_err(const void *d, const char *f, ...) { (void)d; (void)f; }
 static struct pci_dev *original;
 static bool inject_remove, remove_pending, remove_done, dispatching_remove;
 static int dma_frees, requests, quiesces;
@@ -507,6 +521,235 @@ int main(void)
 '''
 
 
+FAULT_PRELUDE = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#define HZ 250UL
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define PCI_DEVFN(s, f) (((s) << 3) | (f))
+#define PCI_SLOT(f) ((f) >> 3)
+#define CEN_BOOT_READY 3
+#define CEN_BOOT_FAILED 4
+#define guard(x) mock_guard
+#define list_for_each_entry(v, h, n) for ((v) = fault_owner; (v); (v) = NULL)
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+struct device { int lock; void *driver; void *data; };
+struct pci_bus;
+struct pci_dev { struct device dev; struct pci_bus *bus, *subordinate; unsigned devfn; int refs; };
+struct pci_bus { struct pci_dev *self, *fn; };
+struct kref { int refs; };
+struct work_struct { int queued; };
+struct delayed_work { struct work_struct work; unsigned long delay; bool pending; };
+static struct delayed_work *to_delayed_work(struct work_struct *w)
+{ return container_of(w, struct delayed_work, work); }
+struct centauri_t6050_rewake {
+    struct pci_dev *bridge, *control;
+    unsigned slot, generation, work_generation, fault_count, fault_gen;
+    bool active, rerun, force_recycle, fault_only, fault_gave_up, control_lease;
+    int error, node;
+    unsigned long fault_at[3];
+    struct kref ref;
+    struct work_struct work;
+    struct delayed_work fault_work;
+};
+struct centauri_t6050 {
+    struct centauri_t6050_rewake *recovery;
+    struct pci_dev *pdev;
+    int boot_lock, boot_phase;
+    unsigned generation;
+    bool removing, pm_prepared, firmware_sleep, firmware_kept, link_ready, warm_reset, boot_hw_failed;
+};
+static struct { int driver; } centauri_t6050_driver;
+static int cen_recovery_lock, cen_active_lock, cen_recovery_owners, cen_rewake_wq;
+static struct centauri_t6050_rewake *fault_owner;
+static bool cen_exiting, can_recycle_val, wifi_stalled_val;
+static unsigned long jiffies;
+static int queued_works, delayed_queues, quiesce_calls, sleep_locks, rescan_locks;
+static void mutex_lock(int *p) { assert(!*p); *p = 1; }
+static void mutex_unlock(int *p) { assert(*p); *p = 0; }
+static unsigned int lock_system_sleep(void) { assert(!sleep_locks); sleep_locks = 1; return 0x42; }
+static void unlock_system_sleep(unsigned int f) { assert(sleep_locks == 1 && f == 0x42); sleep_locks = 0; }
+static void pci_lock_rescan_remove(void) { assert(sleep_locks == 1 && !rescan_locks); rescan_locks = 1; }
+static void pci_unlock_rescan_remove(void) { assert(rescan_locks == 1); rescan_locks = 0; }
+static void mock_guard(int *p) { (void)p; }
+static void device_lock(struct device *d) { mutex_lock(&d->lock); }
+static void device_unlock(struct device *d) { mutex_unlock(&d->lock); }
+static void kref_get(struct kref *r) { r->refs++; }
+static void centauri_t6050_owner_free(struct kref *r) { (void)r; assert(0); }
+static void kref_put(struct kref *r, void (*f)(struct kref *))
+{ assert(r->refs > 1); r->refs--; (void)f; }
+static struct pci_dev *pci_get_slot(struct pci_bus *b, unsigned devfn)
+{ (void)devfn; if (b->fn) b->fn->refs++; return b->fn; }
+static void pci_dev_put(struct pci_dev *p) { if (p) { assert(p->refs > 0); p->refs--; } }
+static void *pci_get_drvdata(struct pci_dev *p) { return p->dev.data; }
+static bool queue_delayed_work(int wq, struct delayed_work *dw, unsigned long delay)
+{
+    (void)wq;
+    if (dw->pending)
+        return false;
+    dw->pending = true;
+    dw->delay = delay;
+    delayed_queues++;
+    return true;
+}
+static bool queue_work(int wq, struct work_struct *w)
+{ (void)wq; assert(!w->queued); w->queued = 1; queued_works++; return true; }
+static bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c)
+{ assert(c->boot_lock); return wifi_stalled_val; }
+static bool apple_pcie_t6050_can_recycle(struct pci_dev *b)
+{ (void)b; return can_recycle_val; }
+static int centauri_t6050_quiesce(struct centauri_t6050 *c)
+{ (void)c; quiesce_calls++; return 0; }
+static void dev_warn(const void *d, const char *f, ...) { (void)d; (void)f; }
+static void dev_info(const void *d, const char *f, ...) { (void)d; (void)f; }
+static void pci_warn(const void *d, const char *f, ...) { (void)d; (void)f; }
+static void pci_err(const void *d, const char *f, ...) { (void)d; (void)f; }
+'''
+
+FAULT_TESTS = r'''
+static void run_fault(struct centauri_t6050_rewake *rw)
+{
+    assert(rw->fault_work.pending);
+    rw->fault_work.pending = false;
+    centauri_t6050_fault_worker(&rw->fault_work.work);
+}
+int main(void)
+{
+    struct pci_dev bridge = {0}, fn = {.refs = 1};
+    struct pci_bus bus = {.self = &bridge, .fn = &fn};
+    struct centauri_t6050_rewake rw = {.bridge = &bridge, .control = &fn, .control_lease = true,
+                                       .ref.refs = 2, .generation = 1};
+    struct centauri_t6050 c = {.recovery = &rw, .pdev = &fn, .boot_phase = CEN_BOOT_READY,
+                               .generation = 1, .link_ready = true, .warm_reset = true};
+    bridge.subordinate = &bus;
+    fn.bus = &bus;
+    fn.dev.driver = &centauri_t6050_driver.driver;
+    fn.dev.data = &c;
+    fault_owner = &rw;
+    can_recycle_val = true;
+
+    /* No warm-reset DT capability -> fault report is a no-op. */
+    c.warm_reset = false;
+    centauri_t6050_fault_report(&c, "no-dt");
+    assert(!delayed_queues && rw.ref.refs == 2);
+    c.warm_reset = true;
+
+    /* Transient fault that clears during the 2 s settle window -> no restart. */
+    wifi_stalled_val = false;
+    centauri_t6050_fault_report(&c, "transient");
+    assert(delayed_queues == 1 && rw.fault_work.delay == 2 * HZ && rw.ref.refs == 3);
+    /* Duplicate report while pending does not leak a ref. */
+    centauri_t6050_fault_report(&c, "dup");
+    assert(delayed_queues == 1 && rw.ref.refs == 3);
+    run_fault(&rw);
+    assert(!queued_works && !rw.active && !rw.force_recycle && rw.ref.refs == 2);
+
+    /* Missing firmware (CEN_BOOT_FAILED without boot_hw_failed) does not restart. */
+    c.boot_phase = CEN_BOOT_FAILED;
+    c.boot_hw_failed = false;
+    centauri_t6050_fault_report(&c, "missing-fw");
+    run_fault(&rw);
+    assert(!queued_works && !rw.active && rw.ref.refs == 2);
+    c.boot_phase = CEN_BOOT_READY;
+
+    /* Fault during PM prepare backs off cleanly. */
+    wifi_stalled_val = true;
+    c.pm_prepared = true;
+    centauri_t6050_fault_report(&c, "pm");
+    run_fault(&rw);
+    assert(!queued_works && !rw.active && rw.ref.refs == 2);
+    c.pm_prepared = false;
+
+    /* Host unable to recycle port backs off without consuming rate-limit budget. */
+    can_recycle_val = false;
+    centauri_t6050_fault_report(&c, "no-recycle");
+    run_fault(&rw);
+    assert(!queued_works && !rw.active && !rw.fault_count && rw.ref.refs == 2);
+    can_recycle_val = true;
+
+    /* Generation change between check and lock aborts without queuing work. */
+    rw.generation = 2;
+    centauri_t6050_fault_report(&c, "stale-gen");
+    run_fault(&rw);
+    assert(!queued_works && !rw.active && !rw.fault_count && rw.ref.refs == 2);
+    c.generation = 2;
+
+    /* Three stalled restarts within 30 min succeed (including jiffies == 0); 4th gives up. */
+    unsigned long times[3] = { 0UL, 60 * HZ, 120 * HZ };
+    for (int i = 0; i < 3; i++) {
+        jiffies = times[i];
+        centauri_t6050_fault_report(&c, "stalled");
+        run_fault(&rw);
+        assert(queued_works == i + 1 && rw.active && rw.force_recycle && rw.fault_only &&
+               rw.fault_gen == 2 && rw.ref.refs == 3);
+        /* Fault worker does not charge the budget until teardown commits. */
+        assert(rw.fault_count == (unsigned)i);
+        /* An intervening sleep recovery supersedes force_recycle/fault_only without charging. */
+        if (i == 0) {
+            apple_centauri_sleep_recovery_needed(&fn, 0);
+            assert(!rw.force_recycle && !rw.fault_only && !rw.fault_gave_up);
+        }
+        /* Simulate teardown committing the restart and charging the sliding window. */
+        rw.fault_at[rw.fault_count++] = jiffies;
+        rw.active = false; rw.force_recycle = false; rw.fault_only = false;
+        rw.work.queued = 0; rw.ref.refs--;
+    }
+    assert(rw.fault_count == 3 && !rw.fault_gave_up);
+
+    /* Preliminary fault check never latches fault_gave_up before teardown revalidates. */
+    jiffies = 180 * HZ;
+    centauri_t6050_fault_report(&c, "fourth");
+    run_fault(&rw);
+    assert(queued_works == 4 && rw.active && !rw.fault_gave_up && rw.ref.refs == 3);
+    /* Simulate teardown latching fault_gave_up on confirmed 4th stall in 30 min. */
+    rw.fault_gave_up = true;
+    rw.active = false; rw.force_recycle = false; rw.fault_only = false;
+    rw.work.queued = 0; rw.ref.refs--;
+    /* Once gave_up is set, further reports do not even schedule fault_work. */
+    int before_delayed = delayed_queues;
+    centauri_t6050_fault_report(&c, "fifth");
+    assert(delayed_queues == before_delayed && rw.ref.refs == 2);
+
+    /* Sleep recovery resets fault_gave_up centrally across all sleep paths. */
+    apple_centauri_sleep_recovery_needed(&fn, 0);
+    assert(!rw.fault_gave_up && rw.active && !rw.force_recycle && !rw.fault_only);
+    rw.active = false; rw.work.queued = 0; rw.ref.refs--;
+
+    /* After 30 minutes elapse, sliding window allows another restart. */
+    jiffies = 31 * 60 * HZ;
+    centauri_t6050_fault_report(&c, "after-window");
+    run_fault(&rw);
+    assert(queued_works == 6 && rw.active && rw.force_recycle && !rw.fault_gave_up);
+    rw.active = false; rw.work.queued = 0; rw.ref.refs--;
+
+    /* Replacement generation can schedule a fault check while previous generation's rewake finishes. */
+    rw.active = true; rw.work_generation = 1; rw.generation = 2; c.generation = 2;
+    before_delayed = delayed_queues;
+    centauri_t6050_fault_report(&c, "replacement-startup");
+    assert(delayed_queues == before_delayed + 1 && rw.fault_work.pending && rw.ref.refs == 3);
+    rw.active = false; rw.fault_work.pending = false; rw.ref.refs--;
+    /* Same generation while active still ignores duplicate reports. */
+    rw.active = true; rw.work_generation = 2;
+    before_delayed = delayed_queues;
+    centauri_t6050_fault_report(&c, "same-gen-active");
+    assert(delayed_queues == before_delayed && !rw.fault_work.pending && rw.ref.refs == 2);
+    rw.active = false;
+
+    /* Shutdown stops future recovery and quiesces without releasing F0 ownership. */
+    centauri_t6050_shutdown(&fn);
+    assert(cen_exiting && quiesce_calls == 1 && rw.control == &fn && rw.control_lease && rw.ref.refs == 2);
+    puts("N1 production runtime fault worker and rate limit: PASS");
+}
+'''
+
+
 def limits():
     resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -539,8 +782,15 @@ def run():
         ('negative-unlock-before-tuples', race.replace(
             '\tif (!ret)\n\t\tret = centauri_t6050_beta_call(rw, true);',
             '\tdevice_unlock(&fn->dev);\n\tif (!ret)\n\t\tret = centauri_t6050_beta_call(rw, true);'))]
+    fault = '\n'.join(block(name) for name in [
+        'apple_centauri_sleep_recovery_needed',
+        'centauri_t6050_fault_report', 'centauri_t6050_fault_worker',
+        'centauri_t6050_shutdown'])
+    fault_variants = [('runtime-fault', fault),
+        ('negative-skip-force-recycle', fault.replace('rw->force_recycle = true;', 'rw->force_recycle = false;'))]
     failures = {
         'negative-unlock-before-tuples': '!remove_done && original->dev.locked && rw->control==original',
+        'negative-skip-force-recycle': 'rw.force_recycle',
         'negative-skip-fence': 'first(WIFI_STOP)<first(CLEAR)',
         'negative-skip-release': 'first(RELEASE)>first(FENCE) && first(FREE)>first(RELEASE)',
         'negative-stale-state-saved': '!saved_fns[0] && saved_fns[1]==1 && saved_fns[2]==1',
@@ -554,14 +804,19 @@ def run():
         out = args.out or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)
         compiler = shlex.split(os.environ.get('CC', 'cc'))
-        for name, body in variants + ownership_variants + race_variants:
+        for name, body in variants + ownership_variants + race_variants + fault_variants:
             if name.startswith('negative-') and not args.negative_controls:
                 continue
             src, exe = out / f'{name}.c', out / name
             is_ownership = name in {n for n, _ in ownership_variants}
             is_race = name in {n for n, _ in race_variants}
-            prelude = RACE_PRELUDE if is_race else OWNERSHIP_PRELUDE if is_ownership else PRELUDE
-            tests = RACE_TESTS if is_race else OWNERSHIP_TESTS if is_ownership else TESTS
+            is_fault = name in {n for n, _ in fault_variants}
+            prelude = (FAULT_PRELUDE if is_fault else
+                       RACE_PRELUDE if is_race else
+                       OWNERSHIP_PRELUDE if is_ownership else PRELUDE)
+            tests = (FAULT_TESTS if is_fault else
+                     RACE_TESTS if is_race else
+                     OWNERSHIP_TESTS if is_ownership else TESTS)
             src.write_text(prelude + body + tests)
             subprocess.run(compiler + ['-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-unused-function', '-Wno-unused-variable',
@@ -569,7 +824,7 @@ def run():
             result = subprocess.run([str(exe)], capture_output=True, text=True,
                                     preexec_fn=limits)
             (out / (name + '.log')).write_text(result.stdout + result.stderr)
-            if name in ('baseline', 'ownership', 'remove-interleaving'):
+            if name in ('baseline', 'ownership', 'remove-interleaving', 'runtime-fault'):
                 assert result.returncode == 0, result.stderr
                 print(result.stdout.strip())
             else:

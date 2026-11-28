@@ -964,13 +964,45 @@ void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr)
 }
 EXPORT_SYMBOL_GPL(apple_smc_warm_reset_put);
 
-int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq)
+bool apple_smc_warm_reset_lock(const struct apple_smc_warm_reset *wr)
 {
-	struct apple_smc *smc = wr->smc ? platform_get_drvdata(wr->smc) : NULL;
+	if (!wr || !wr->smc || !wr->count)
+		return false;
+	device_lock(&wr->smc->dev);
+	if (!device_is_bound(&wr->smc->dev) || !platform_get_drvdata(wr->smc)) {
+		device_unlock(&wr->smc->dev);
+		return false;
+	}
+	return true;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_lock);
+
+void apple_smc_warm_reset_unlock(const struct apple_smc_warm_reset *wr)
+{
+	if (wr && wr->smc)
+		device_unlock(&wr->smc->dev);
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_unlock);
+
+bool apple_smc_warm_reset_ready(const struct apple_smc_warm_reset *wr)
+{
+	if (!apple_smc_warm_reset_lock(wr))
+		return false;
+	apple_smc_warm_reset_unlock(wr);
+	return true;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_ready);
+
+int apple_smc_warm_reset_locked(const struct apple_smc_warm_reset *wr, bool noirq)
+{
+	struct apple_smc *smc;
 	unsigned int i;
 	int ret = 0;
 
-	if (!smc || !wr->count)
+	if (!wr || !wr->smc || !wr->count)
+		return -ENODEV;
+	smc = device_is_bound(&wr->smc->dev) ? platform_get_drvdata(wr->smc) : NULL;
+	if (!smc)
 		return -ENODEV;
 	for (i = 0; i < wr->count && !ret; i++) {
 		__be32 value = cpu_to_be32(wr->writes[2 * i]);
@@ -988,6 +1020,20 @@ int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq)
 				fsleep(wait);
 		}
 	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_locked);
+
+int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq)
+{
+	int ret;
+
+	if (noirq)
+		return apple_smc_warm_reset_locked(wr, true);
+	if (!apple_smc_warm_reset_lock(wr))
+		return -ENODEV;
+	ret = apple_smc_warm_reset_locked(wr, false);
+	apple_smc_warm_reset_unlock(wr);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_smc_warm_reset);

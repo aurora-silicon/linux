@@ -18,6 +18,7 @@
 #include <linux/pci-apple.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/reboot.h>
 #include <linux/sizes.h>
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
@@ -29,9 +30,12 @@ struct centauri_t6050_rewake {
 	struct list_head node;
 	struct kref ref;
 	struct work_struct work;
+	struct delayed_work fault_work;
 	struct pci_dev *bridge;
 	unsigned int slot;
-	bool active, rerun;
+	bool active, rerun, force_recycle, fault_only, fault_gave_up, teardown_active;
+	unsigned int fault_count, fault_gen;
+	unsigned long fault_at[3];
 	unsigned int generation, work_generation;
 	int error;
 	struct pci_dev *control;
@@ -51,9 +55,12 @@ struct centauri_t6050_rewake {
 
 static LIST_HEAD(cen_recovery_owners);
 static DEFINE_MUTEX(cen_recovery_lock);
+/* Held by recovery workers inside lock_system_sleep() so reboot_notify can drain active work. */
+static DEFINE_MUTEX(cen_active_lock);
 static struct workqueue_struct *cen_rewake_wq;
 static bool cen_exiting;
 static void centauri_t6050_rewake_worker(struct work_struct *work);
+static void centauri_t6050_fault_worker(struct work_struct *work);
 static int centauri_t6050_quiesce(struct centauri_t6050 *c);
 
 static void centauri_t6050_owner_free(struct kref *ref)
@@ -85,6 +92,7 @@ static struct centauri_t6050_rewake *centauri_t6050_owner_get(struct pci_dev *fn
 		return ERR_PTR(-ENOMEM);
 	kref_init(&rw->ref);
 	INIT_WORK(&rw->work, centauri_t6050_rewake_worker);
+	INIT_DELAYED_WORK(&rw->fault_work, centauri_t6050_fault_worker);
 	rw->bridge = pci_dev_get(fn->bus->self);
 	rw->slot = PCI_SLOT(fn->devfn);
 	list_add_tail(&rw->node, &cen_recovery_owners);
@@ -169,6 +177,9 @@ void apple_centauri_sleep_recovery_needed(struct pci_dev *fn, int error)
 	list_for_each_entry(rw, &cen_recovery_owners, node) {
 		if (rw->bridge != fn->bus->self || rw->slot != PCI_SLOT(fn->devfn))
 			continue;
+		rw->force_recycle = false;
+		rw->fault_only = false;
+		rw->fault_gave_up = false;
 		if (error && !rw->error)
 			rw->error = error;
 		/* One owner and one work reference even while the work is running. */
@@ -351,6 +362,8 @@ static int centauri_t6050_rom_boot(struct centauri_t6050 *c)
 
 	if (!ret && stage != 4)
 		ret = -EIO;
+	if (ret == -EIO || ret == -ETIMEDOUT)
+		c->boot_hw_failed = true;
 	goto release;
 free_buffers:
 	centauri_t6050_free_boot(c);
@@ -456,7 +469,7 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 {
 	struct centauri_t6050 *c = container_of(to_delayed_work(work), struct centauri_t6050, boot_work);
 	struct pci_dev *beta = NULL;
-	bool retry = false;
+	bool retry = false, fault = false;
 	int ret;
 
 	mutex_lock(&c->boot_lock);
@@ -496,11 +509,24 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 out:
 	if (READ_ONCE(c->removing))
 		c->boot_phase = CEN_BOOT_STOPPED;
+	fault = c->boot_phase == CEN_BOOT_FAILED && c->boot_hw_failed && c->link_ready;
 	mutex_unlock(&c->boot_lock);
 	if (beta)
 		centauri_t6050_attach_beta(c, beta);
+	if (fault)
+		centauri_t6050_fault_report(c, "startup failed");
 	if (retry && !READ_ONCE(c->removing))
 		queue_delayed_work(system_long_wq, &c->boot_work, msecs_to_jiffies(20));
+}
+
+static bool centauri_t6050_warm_reset_described(struct pci_dev *bridge)
+{
+	struct device_node *np = bridge ? pci_device_to_OF_node(bridge) : NULL;
+
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !np)
+		return false;
+	return of_property_present(np, "apple,function-warm-reset") &&
+	       of_property_present(np, "apple,warm-reset-writes");
 }
 
 static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -522,6 +548,7 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 		return -ENOMEM;
 	c->pdev = pdev;
 	c->link_ready = true;
+	c->warm_reset = centauri_t6050_warm_reset_described(pdev->bus->self);
 	mutex_init(&c->boot_lock);
 	INIT_DELAYED_WORK(&c->boot_work, centauri_t6050_boot_worker);
 	c->boot_phase = CEN_BOOT_ROM;
@@ -552,19 +579,28 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 	c->recovery = centauri_t6050_owner_get(pdev);
 	if (IS_ERR(c->recovery))
 		return PTR_ERR(c->recovery);
-	if (c->recovery->control) {
+	mutex_lock(&cen_recovery_lock);
+	if (c->recovery->control || c->recovery->teardown_active) {
+		mutex_unlock(&cen_recovery_lock);
 		kref_put(&c->recovery->ref, centauri_t6050_owner_free);
 		return -EBUSY;
 	}
+	mutex_unlock(&cen_recovery_lock);
 	ret = iommu_device_use_default_domain(&pdev->dev);
 	if (ret) {
 		kref_put(&c->recovery->ref, centauri_t6050_owner_free);
 		return ret;
 	}
+	mutex_lock(&cen_recovery_lock);
+	if (c->recovery->control || c->recovery->teardown_active) {
+		mutex_unlock(&cen_recovery_lock);
+		iommu_device_unuse_default_domain(&pdev->dev);
+		kref_put(&c->recovery->ref, centauri_t6050_owner_free);
+		return -EBUSY;
+	}
 	c->recovery->control = pci_dev_get(pdev);
 	c->recovery->control_lease = true;
-	mutex_lock(&cen_recovery_lock);
-	c->recovery->generation++;
+	c->generation = ++c->recovery->generation;
 	mutex_unlock(&cen_recovery_lock);
 	pci_clear_master(pdev);
 	pci_set_drvdata(pdev, c);
@@ -846,6 +882,55 @@ static int centauri_t6050_rewake_teardown(struct centauri_t6050_rewake *rw)
 		goto out;
 	}
 	c = fn->dev.driver == &centauri_t6050_driver.driver ? pci_get_drvdata(fn) : NULL;
+	mutex_lock(&cen_recovery_lock);
+	if (rw->fault_only) {
+		unsigned int expected = rw->fault_gen;
+		bool stalled = false;
+
+		mutex_unlock(&cen_recovery_lock);
+		if (!c) {
+			ret = -ECANCELED;
+			goto out;
+		}
+		mutex_lock(&c->boot_lock);
+		if (!READ_ONCE(c->removing) && !c->pm_prepared &&
+		    !c->firmware_sleep && !c->firmware_kept)
+			stalled = (c->boot_hw_failed && c->link_ready) ||
+				  centauri_t6050_wifi_stalled(c);
+		mutex_unlock(&c->boot_lock);
+		if (!stalled) {
+			ret = -ECANCELED;
+			goto out;
+		}
+		mutex_lock(&cen_recovery_lock);
+		if (rw->fault_only) {
+			unsigned long now = jiffies;
+
+			if (rw->generation != expected || c->generation != expected ||
+			    rw->fault_gave_up) {
+				mutex_unlock(&cen_recovery_lock);
+				ret = -ECANCELED;
+				goto out;
+			}
+			if (rw->fault_count >= ARRAY_SIZE(rw->fault_at) &&
+			    time_before(now, rw->fault_at[0] + 30 * 60 * HZ)) {
+				rw->fault_gave_up = true;
+				mutex_unlock(&cen_recovery_lock);
+				pci_err(rw->bridge,
+					"N1 firmware stopped again after 3 restarts in 30 min; leaving Wi-Fi down\n");
+				ret = -ECANCELED;
+				goto out;
+			}
+			if (rw->fault_count < ARRAY_SIZE(rw->fault_at)) {
+				rw->fault_at[rw->fault_count++] = now;
+			} else {
+				memmove(rw->fault_at, rw->fault_at + 1,
+					sizeof(rw->fault_at) - sizeof(rw->fault_at[0]));
+				rw->fault_at[ARRAY_SIZE(rw->fault_at) - 1] = now;
+			}
+		}
+	}
+	mutex_unlock(&cen_recovery_lock);
 	if (c)
 		ret = centauri_t6050_quiesce(c);
 	/* F0 may have unbound already; the independent owner holds its resources. */
@@ -880,6 +965,11 @@ static int centauri_t6050_rewake_teardown(struct centauri_t6050_rewake *rw)
 		}
 	}
 	ret = rw->arena ? -EBUSY : 0;
+	if (!ret) {
+		mutex_lock(&cen_recovery_lock);
+		rw->teardown_active = true;
+		mutex_unlock(&cen_recovery_lock);
+	}
 out:
 	device_unlock(&fn->dev);
 	pci_dev_put(fn);
@@ -896,14 +986,24 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 {
 	struct centauri_t6050_rewake *rw = container_of(work, struct centauri_t6050_rewake, work);
 	struct pci_dev *bridge = rw->bridge, *fn;
-	struct pci_bus *bus = bridge->subordinate;
+	struct pci_bus *bus;
 	s64 down_ms = -1, up_ms = -1, wait_ms;
 	ktime_t begin, start, up_at;
+	unsigned int sleep_flags;
 	u16 lnksta = 0, first = 0;
+	bool force_recycle, need_recycle, smc_locked = false, exiting;
 	int i, ret;
 
-	if (!bus)
+	sleep_flags = lock_system_sleep();
+	mutex_lock(&cen_active_lock);
+	mutex_lock(&cen_recovery_lock);
+	exiting = cen_exiting;
+	mutex_unlock(&cen_recovery_lock);
+	if (exiting) {
+		mutex_unlock(&cen_active_lock);
+		unlock_system_sleep(sleep_flags);
 		goto out;
+	}
 	/*
 	 * The bridge stays active to the new enumeration: with its functions removed it is
 	 * idle, and a runtime suspend that starts while the host has the port down for the
@@ -911,7 +1011,23 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 	 */
 	pm_runtime_get_sync(&bridge->dev);
 	pci_lock_rescan_remove();
+	bus = bridge->subordinate;
+	if (!bus)
+		goto unlock;
+	mutex_lock(&cen_recovery_lock);
+	force_recycle = rw->force_recycle;
+	mutex_unlock(&cen_recovery_lock);
+	need_recycle = force_recycle || !apple_pcie_t6050_warm_reset_done(bridge);
+	if (need_recycle) {
+		smc_locked = apple_pcie_t6050_recycle_lock(bridge);
+		if (!smc_locked) {
+			pci_warn(bridge, "N1 recovery skipped: host cannot recycle port\n");
+			goto unlock;
+		}
+	}
 	ret = centauri_t6050_rewake_teardown(rw);
+	if (ret == -ECANCELED)
+		goto unlock;
 	if (ret) {
 		pci_err(bridge, "N1 recovery refused: DMA resources retained (%d, original %d)\n",
 			ret, READ_ONCE(rw->error));
@@ -923,22 +1039,36 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 			pci_stop_and_remove_bus_device(fn);
 		pci_dev_put(fn);
 	}
+	mutex_lock(&cen_recovery_lock);
+	rw->teardown_active = false;
+	rw->force_recycle = false;
+	rw->fault_only = false;
+	mutex_unlock(&cen_recovery_lock);
 	/*
 	 * The host resets the N1 in its noirq resume, while the port is still down. A reset given
 	 * here, on a trained link, would take the link down for good: after a suspend that kept the
 	 * link the host takes the port down and up around the reset instead.
 	 */
-	if (apple_pcie_t6050_warm_reset_done(bridge)) {
+	if (!need_recycle) {
 		pci_dbg(bridge, "N1 after the sleep: reset by the host before its port came up\n");
 		ret = 0;
 	} else {
 		ret = apple_pcie_t6050_port_recycle(bridge);
 		if (!ret)
-			pci_dbg(bridge, "N1 after a suspend that kept its link: port cycled by the host for the reset\n");
+			pci_dbg(bridge, "N1 port cycled by the host for the warm reset\n");
+	}
+	if (smc_locked) {
+		apple_pcie_t6050_recycle_unlock(bridge);
+		smc_locked = false;
 	}
 	if (ret) {
-		pci_err(bridge, "N1 after the sleep: no warm reset (%d); Wi-Fi and Bluetooth stay down\n",
-			ret);
+		if (ret != -ENOLINK && centauri_t6050_link_active(bridge)) {
+			pci_err(bridge, "N1 warm reset failed (%d); rescanning active link\n", ret);
+			pci_rescan_bus(bus);
+		} else {
+			pci_err(bridge, "N1 after the sleep: no warm reset (%d); Wi-Fi and Bluetooth stay down\n",
+				ret);
+		}
 		goto unlock;
 	}
 	/*
@@ -993,8 +1123,15 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 			lnksta);
 	pci_dev_put(fn);
 unlock:
+	if (smc_locked)
+		apple_pcie_t6050_recycle_unlock(bridge);
+	mutex_lock(&cen_recovery_lock);
+	rw->teardown_active = false;
+	mutex_unlock(&cen_recovery_lock);
 	pci_unlock_rescan_remove();
 	pm_runtime_put(&bridge->dev);
+	mutex_unlock(&cen_active_lock);
+	unlock_system_sleep(sleep_flags);
 out:
 	mutex_lock(&cen_recovery_lock);
 	if (rw->rerun && !cen_exiting) {
@@ -1005,6 +1142,9 @@ out:
 		mutex_unlock(&cen_recovery_lock);
 		return;
 	}
+	rw->teardown_active = false;
+	rw->force_recycle = false;
+	rw->fault_only = false;
 	rw->active = false;
 	rw->error = 0;
 	mutex_unlock(&cen_recovery_lock);
@@ -1014,6 +1154,105 @@ out:
 static void centauri_t6050_queue_rewake(struct pci_dev *fn)
 {
 	apple_centauri_sleep_recovery_needed(fn, 0);
+}
+
+/*
+ * The Wi-Fi transport saw a sign of a stopped firmware: Alpha left execution
+ * stage 2, the command ring filled, or a command timed out. Re-check 2 s later
+ * on the ordered, freezable recovery workqueue and warm-reset the N1 only if
+ * the firmware is still stopped outside system sleep.
+ */
+void centauri_t6050_fault_report(struct centauri_t6050 *c, const char *why)
+{
+	struct centauri_t6050_rewake *rw = c ? c->recovery : NULL;
+	bool queued;
+
+	if (!rw || !c->warm_reset || READ_ONCE(c->removing))
+		return;
+	guard(mutex)(&cen_recovery_lock);
+	if (cen_exiting || rw->fault_gave_up ||
+	    (rw->active && c->generation == rw->work_generation))
+		return;
+	kref_get(&rw->ref);
+	queued = queue_delayed_work(cen_rewake_wq, &rw->fault_work, 2 * HZ);
+	if (!queued) {
+		kref_put(&rw->ref, centauri_t6050_owner_free);
+		return;
+	}
+	dev_warn(&c->pdev->dev, "N1 firmware fault (%s); checking again in 2 s\n", why);
+}
+
+static void centauri_t6050_fault_worker(struct work_struct *work)
+{
+	struct centauri_t6050_rewake *rw =
+		container_of(to_delayed_work(work), struct centauri_t6050_rewake, fault_work);
+	struct pci_bus *bus;
+	struct pci_dev *fn;
+	struct centauri_t6050 *c;
+	bool stalled = false, active_driver = false, exiting;
+	unsigned int checked_gen = 0, sleep_flags;
+
+	sleep_flags = lock_system_sleep();
+	mutex_lock(&cen_active_lock);
+	mutex_lock(&cen_recovery_lock);
+	exiting = cen_exiting;
+	mutex_unlock(&cen_recovery_lock);
+	if (exiting)
+		goto put_sleep;
+	pci_lock_rescan_remove();
+	bus = rw->bridge->subordinate;
+	fn = bus ? pci_get_slot(bus, PCI_DEVFN(rw->slot, 0)) : NULL;
+	pci_unlock_rescan_remove();
+	if (!fn)
+		goto put_sleep;
+	device_lock(&fn->dev);
+	if (rw->control == fn && fn->dev.driver == &centauri_t6050_driver.driver) {
+		c = pci_get_drvdata(fn);
+		if (c) {
+			mutex_lock(&c->boot_lock);
+			if (!READ_ONCE(c->removing) && !c->pm_prepared &&
+			    !c->firmware_sleep && !c->firmware_kept) {
+				active_driver = true;
+				checked_gen = c->generation;
+				stalled = (c->boot_hw_failed && c->link_ready) ||
+					  centauri_t6050_wifi_stalled(c);
+			}
+			mutex_unlock(&c->boot_lock);
+		}
+	}
+	device_unlock(&fn->dev);
+	if (!active_driver)
+		goto put_fn;
+	if (!stalled) {
+		dev_info(&fn->dev, "N1 firmware fault cleared; no restart\n");
+		goto put_fn;
+	}
+	if (!apple_pcie_t6050_can_recycle(rw->bridge)) {
+		pci_warn(rw->bridge, "N1 firmware stopped; host cannot recycle port for warm reset\n");
+		goto put_fn;
+	}
+
+	mutex_lock(&cen_recovery_lock);
+	if (cen_exiting || rw->active || rw->fault_gave_up ||
+	    rw->generation != checked_gen) {
+		mutex_unlock(&cen_recovery_lock);
+		goto put_fn;
+	}
+	rw->force_recycle = true;
+	rw->fault_only = true;
+	rw->fault_gen = checked_gen;
+	rw->active = true;
+	rw->work_generation = rw->generation;
+	kref_get(&rw->ref);
+	queue_work(cen_rewake_wq, &rw->work);
+	mutex_unlock(&cen_recovery_lock);
+	pci_warn(rw->bridge, "N1 firmware stopped; restarting via warm reset\n");
+put_fn:
+	pci_dev_put(fn);
+put_sleep:
+	mutex_unlock(&cen_active_lock);
+	unlock_system_sleep(sleep_flags);
+	kref_put(&rw->ref, centauri_t6050_owner_free);
 }
 
 /* Bluetooth's resume: a suspend stopped after Bluetooth's teardown, before this function's */
@@ -1330,6 +1569,54 @@ static int centauri_t6050_resume(struct device *dev)
 	return 0;
 }
 
+static void centauri_t6050_shutdown(struct pci_dev *pdev)
+{
+	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+
+	mutex_lock(&cen_recovery_lock);
+	cen_exiting = true;
+	mutex_unlock(&cen_recovery_lock);
+	if (c)
+		centauri_t6050_quiesce(c);
+}
+
+static void centauri_t6050_stop_recovery(void)
+{
+	struct centauri_t6050_rewake *rw;
+
+	mutex_lock(&cen_recovery_lock);
+	cen_exiting = true;
+	mutex_unlock(&cen_recovery_lock);
+	/* Cancel pending delayed fault checks before draining queued recovery work. */
+	list_for_each_entry(rw, &cen_recovery_owners, node)
+		if (cancel_delayed_work_sync(&rw->fault_work))
+			kref_put(&rw->ref, centauri_t6050_owner_free);
+	flush_workqueue(cen_rewake_wq);
+}
+
+static int centauri_t6050_reboot_notify(struct notifier_block *nb,
+					unsigned long action, void *data)
+{
+	/*
+	 * Under sys_reboot(), system_transition_mutex is already held, so no
+	 * worker holds cen_active_lock (which is only taken inside
+	 * lock_system_sleep()). Under direct restart paths such as
+	 * deferred_cad(), taking cen_active_lock drains any worker already
+	 * inside recovery without blocking on queued workers waiting on
+	 * system_transition_mutex.
+	 */
+	mutex_lock(&cen_recovery_lock);
+	cen_exiting = true;
+	mutex_unlock(&cen_recovery_lock);
+	mutex_lock(&cen_active_lock);
+	mutex_unlock(&cen_active_lock);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block cen_reboot_nb = {
+	.notifier_call = centauri_t6050_reboot_notify,
+};
+
 static const struct dev_pm_ops centauri_t6050_pm_ops = {
 	.prepare = centauri_t6050_prepare,
 	.complete = centauri_t6050_complete,
@@ -1349,7 +1636,7 @@ static struct pci_driver centauri_t6050_driver = {
 	.id_table = centauri_t6050_ids,
 	.probe = centauri_t6050_probe,
 	.remove = centauri_t6050_remove,
-	.shutdown = centauri_t6050_remove,
+	.shutdown = centauri_t6050_shutdown,
 	.driver.pm = pm_sleep_ptr(&centauri_t6050_pm_ops),
 };
 
@@ -1357,12 +1644,25 @@ static int __init centauri_t6050_init(void)
 {
 	int ret;
 
-	cen_rewake_wq = alloc_ordered_workqueue("centauri_t6050_rewake", WQ_FREEZABLE);
+	/*
+	 * Workers serialize against suspend/reboot via lock_system_sleep()
+	 * rather than WQ_FREEZABLE, avoiding deadlock between the freezer and
+	 * system_transition_mutex (and between pci_rescan_remove_lock and the
+	 * PM notifier chain during PM_SUSPEND_PREPARE).
+	 */
+	cen_rewake_wq = alloc_ordered_workqueue("centauri_t6050_rewake", 0);
 	if (!cen_rewake_wq)
 		return -ENOMEM;
-	ret = pci_register_driver(&centauri_t6050_driver);
-	if (ret)
+	ret = register_reboot_notifier(&cen_reboot_nb);
+	if (ret) {
 		destroy_workqueue(cen_rewake_wq);
+		return ret;
+	}
+	ret = pci_register_driver(&centauri_t6050_driver);
+	if (ret) {
+		unregister_reboot_notifier(&cen_reboot_nb);
+		destroy_workqueue(cen_rewake_wq);
+	}
 	return ret;
 }
 module_init(centauri_t6050_init);
@@ -1371,11 +1671,9 @@ static void __exit centauri_t6050_exit(void)
 {
 	struct centauri_t6050_rewake *rw, *next;
 
-	mutex_lock(&cen_recovery_lock);
-	cen_exiting = true;
-	mutex_unlock(&cen_recovery_lock);
+	unregister_reboot_notifier(&cen_reboot_nb);
 	/* Drain before unregister: no worker can race callback data destruction. */
-	flush_workqueue(cen_rewake_wq);
+	centauri_t6050_stop_recovery();
 	pci_unregister_driver(&centauri_t6050_driver);
 	/* Drains a pending rewake before the module's code goes */
 	destroy_workqueue(cen_rewake_wq);

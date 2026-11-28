@@ -15,6 +15,9 @@
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define smp_store_release(p, v) (*(p) = (v))
+#define HZ 250UL
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define time_before(a, b) ((long)((a) - (b)) < 0)
 #define PCI_DEVFN(s, f) (((s) << 3) | (f))
 #define PCI_COMMAND 4
 #define PCI_COMMAND_MASTER 4
@@ -50,8 +53,9 @@ struct apple_centauri_sleep_ops {
 struct centauri_t6050_rewake {
  struct work_struct work; struct kref ref;
  struct pci_dev *bridge, *control, *beta;
- unsigned int slot, generation, work_generation;
- bool active, rerun, control_lease, beta_lease;
+ unsigned int slot, generation, work_generation, fault_gen, fault_count;
+ unsigned long fault_at[3];
+ bool active, rerun, force_recycle, fault_only, fault_gave_up, teardown_active, control_lease, beta_lease;
  int error;
  struct centauri_t6050_ipc *ipc;
  void *firmware, *descriptor, *arena, *data;
@@ -67,7 +71,8 @@ struct centauri_t6050 {
  void *firmware, *descriptor;
  dma_addr_t firmware_dma, descriptor_dma;
  size_t firmware_size;
- bool removing, ready, firmware_sleep, link_ready, boot_attempted;
+ unsigned int generation;
+ bool removing, ready, firmware_sleep, firmware_kept, pm_prepared, link_ready, boot_attempted, boot_hw_failed;
  int boot_lock, boot_work, boot_phase;
  struct centauri_t6050_irqs irqs, alpha_irqs;
 };
@@ -78,10 +83,13 @@ struct cen_bt {
  int irq_count, io_work;
 };
 static struct { int driver; } centauri_t6050_driver;
-static int cen_recovery_lock, cen_rewake_wq;
-static bool cen_exiting, thawed, callbacks_done, warm_done, link_active;
+static int cen_recovery_lock, cen_active_lock, cen_rewake_wq;
+static bool cen_exiting, thawed, callbacks_done, warm_done, link_active, can_recycle_val = true, wifi_stalled_val = true;
+static bool smc_lock_held;
+static int recycle_ret;
+static unsigned long jiffies;
 static bool force_pending, fail_beta_quiesce, fail_beta_release, module_available;
-static int rescan_lock, removes, rescans, recycles, refusals, log_error, log_original;
+static int rescan_lock, sleep_lock, removes, rescans, recycles, refusals, log_error, log_original;
 static int module_refs, wifi_users, irq_users, boot_users, frees;
 static ktime_t fake_time;
 static struct pci_dev devs[4], replacement;
@@ -160,14 +168,28 @@ static void kref_put(struct kref *r, void (*f)(struct kref *))
 { assert(r->count > 1); if (!--r->count) f(r); }
 static void apple_centauri_sleep_recovery_needed(struct pci_dev *p, int e)
 { (void)p; assert(e); }
+static unsigned int lock_system_sleep(void)
+{ assert(!sleep_lock && !rescan_lock); sleep_lock = 1; return 0x42; }
+static void unlock_system_sleep(unsigned int f)
+{ assert(sleep_lock == 1 && !rescan_lock && f == 0x42); sleep_lock = 0; }
 static void pm_runtime_get_sync(struct device *d) { d->runtime++; }
 static void pm_runtime_put(struct device *d) { assert(d->runtime > 0); d->runtime--; }
 static void pci_lock_rescan_remove(void)
-{ assert(thawed && callbacks_done && !rescan_lock); rescan_lock = 1; }
+{ assert(thawed && callbacks_done && sleep_lock == 1 && !rescan_lock); rescan_lock = 1; }
 static void pci_unlock_rescan_remove(void) { assert(rescan_lock); rescan_lock = 0; }
+static bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c)
+{ assert(c->boot_lock); return wifi_stalled_val; }
 static bool apple_pcie_t6050_warm_reset_done(struct pci_dev *p) { (void)p; return warm_done; }
+static bool apple_pcie_t6050_recycle_lock(struct pci_dev *p)
+{ (void)p; assert(!smc_lock_held); if (!can_recycle_val) return false; smc_lock_held = true; return true; }
+static void apple_pcie_t6050_recycle_unlock(struct pci_dev *p)
+{ (void)p; assert(smc_lock_held); smc_lock_held = false; }
 static int apple_pcie_t6050_port_recycle(struct pci_dev *p)
-{ (void)p; assert(!bus.slot[0] && !bus.slot[1] && !bus.slot[2]); recycles++; warm_done = true; return 0; }
+{
+ (void)p; assert(!bus.slot[0] && !bus.slot[1] && !bus.slot[2]); recycles++;
+ if (recycle_ret) return recycle_ret;
+ warm_done = true; return 0;
+}
 static ktime_t ktime_get(void) { return fake_time += 1000; }
 static s64 ktime_ms_delta(ktime_t a, ktime_t b) { return a - b; }
 static ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *p) { (void)p; return 1; }
@@ -180,14 +202,16 @@ static void pci_rescan_bus(struct pci_bus *b)
 { assert(!b->slot[0] && !b->slot[1] && !b->slot[2]); rescans++; b->slot[0] = &replacement; }
 static void queue_work(int q, struct work_struct *w) { (void)q; (void)w; assert(false); }
 #define dev_warn(...) ((void)0)
+#define pci_warn(...) ((void)0)
 #define pci_dbg(p, ...) model_debug(__VA_ARGS__)
 static void model_debug(const char *fmt, ...) { (void)fmt; }
-#define pci_err(p, fmt, ...) model_error(fmt, __VA_ARGS__)
+#define pci_err(p, ...) model_error(__VA_ARGS__)
 static void model_error(const char *fmt, ...)
 {
- assert(strstr(fmt, "recovery refused"));
- va_list ap; va_start(ap, fmt); log_error = va_arg(ap, int); log_original = va_arg(ap, int);
- va_end(ap); refusals++;
+ if (strstr(fmt, "recovery refused")) {
+  va_list ap; va_start(ap, fmt); log_error = va_arg(ap, int); log_original = va_arg(ap, int);
+  va_end(ap); refusals++;
+ }
 }
 static void pci_stop_and_remove_bus_device(struct pci_dev *p);
 
@@ -387,10 +411,83 @@ static void test_callback_refusals(void)
  puts("producer/release/module refusal cleanup: PASS");
 }
 
+static void test_runtime_force_recycle(void)
+{
+ fixture(); publish_all();
+ /* Host unable to recycle aborts runtime recovery before teardown/removal without charging budget. */
+ can_recycle_val = false; wifi_stalled_val = true; recycle_ret = 0;
+ owner.generation = control.generation = 1;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 1;
+ thaw_and_run();
+ assert(!refusals && !removes && !rescans && !recycles && live_allocations() == 4);
+ assert(!owner.force_recycle && !owner.fault_only && !owner.fault_count && !smc_lock_held && !owner.teardown_active);
+
+ /* Cleared stall before teardown aborts cleanly without charging budget. */
+ fixture(); publish_all();
+ can_recycle_val = true; wifi_stalled_val = false; recycle_ret = 0;
+ owner.generation = control.generation = 1;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 1;
+ thaw_and_run();
+ assert(!refusals && !removes && !rescans && !recycles && live_allocations() == 4);
+ assert(!owner.force_recycle && !owner.fault_only && !owner.fault_count && !smc_lock_held && !owner.teardown_active);
+
+ /* Stale generation aborts runtime recovery before teardown/removal without charging budget. */
+ fixture(); publish_all();
+ can_recycle_val = true; wifi_stalled_val = true; recycle_ret = 0;
+ owner.generation = control.generation = 2;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 1;
+ thaw_and_run();
+ assert(!refusals && !removes && !rescans && !recycles && live_allocations() == 4);
+ assert(!owner.force_recycle && !owner.fault_only && !owner.fault_count && !smc_lock_held && !owner.teardown_active);
+
+ /* Matching generation + active stall + stale warm_done forces runtime recycle and charges budget. */
+ fixture(); publish_all();
+ can_recycle_val = true; wifi_stalled_val = true; recycle_ret = 0;
+ warm_done = true;
+ owner.generation = control.generation = 2;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 2;
+ thaw_and_run();
+ assert(!refusals && removes == 3 && rescans == 1 && recycles == 1 && owner.fault_count == 1);
+ assert(!owner.force_recycle && !owner.fault_only && !smc_lock_held && !owner.teardown_active);
+ assert(!live_allocations() && frees == 4);
+
+ /* Non-link-loss recycle failure with active link rescans instead of stranding functions. */
+ fixture(); publish_all();
+ can_recycle_val = true; wifi_stalled_val = true; recycle_ret = -EIO; link_active = true;
+ owner.generation = control.generation = 3;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 3;
+ thaw_and_run();
+ assert(!refusals && removes == 3 && recycles == 1 && rescans == 1);
+ assert(!smc_lock_held && !owner.teardown_active);
+ recycle_ret = 0;
+
+ /* Sleep fallback without noirq warm reset also pins SMC and refuses before teardown if unavailable. */
+ fixture(); publish_all();
+ can_recycle_val = false; warm_done = false;
+ thaw_and_run();
+ assert(!refusals && !removes && !rescans && !recycles && live_allocations() == 4);
+ assert(!smc_lock_held && !owner.teardown_active);
+ can_recycle_val = true;
+
+ /* Authoritative 4th stall in 30 min latches fault_gave_up in teardown without touching hardware. */
+ fixture(); publish_all();
+ can_recycle_val = true; wifi_stalled_val = true;
+ owner.generation = control.generation = 4;
+ owner.fault_count = 3;
+ owner.fault_at[0] = 0; owner.fault_at[1] = 60 * HZ; owner.fault_at[2] = 120 * HZ;
+ jiffies = 180 * HZ;
+ owner.force_recycle = true; owner.fault_only = true; owner.fault_gen = 4;
+ thaw_and_run();
+ assert(!refusals && !removes && !rescans && !recycles && owner.fault_gave_up);
+ assert(live_allocations() == 4 && !smc_lock_held && !owner.teardown_active);
+ puts("runtime force_recycle ignores stale warm_done: PASS");
+}
+
 int main(void)
 {
  test_physical(); test_devices_only_and_aborted_suspend(); test_each_retained_tuple();
  test_pending_and_refusal_retry(); test_lost_port_and_identity(); test_callback_refusals();
+ test_runtime_force_recycle();
  puts("PASS: production teardown/worker reset-domain and refusal suite");
  return 0;
 }

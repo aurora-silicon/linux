@@ -41,6 +41,9 @@ int apple_pcie_tunnel_cio_finish(struct device *dev);
 #if IS_REACHABLE(CONFIG_PCIE_APPLE)
 bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge);
 ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *bridge);
+bool apple_pcie_t6050_can_recycle(struct pci_dev *bridge);
+bool apple_pcie_t6050_recycle_lock(struct pci_dev *bridge);
+void apple_pcie_t6050_recycle_unlock(struct pci_dev *bridge);
 int apple_pcie_t6050_port_recycle(struct pci_dev *bridge);
 void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge);
 void apple_pcie_t6050_sleep_keep_alive(struct pci_dev *bridge);
@@ -53,6 +56,20 @@ static inline bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 static inline ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *bridge)
 {
 	return 0;
+}
+
+static inline bool apple_pcie_t6050_can_recycle(struct pci_dev *bridge)
+{
+	return false;
+}
+
+static inline bool apple_pcie_t6050_recycle_lock(struct pci_dev *bridge)
+{
+	return false;
+}
+
+static inline void apple_pcie_t6050_recycle_unlock(struct pci_dev *bridge)
+{
 }
 
 static inline int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)

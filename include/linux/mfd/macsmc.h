@@ -263,6 +263,41 @@ int apple_smc_warm_reset_parse(struct device_node *np, struct apple_smc_warm_res
 void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr);
 
 /**
+ * apple_smc_warm_reset_ready - report whether the SMC for @wr is bound
+ * @wr: the parsed reset
+ *
+ * Return: True when @wr has a parsed reset and its SMC device is bound.
+ */
+bool apple_smc_warm_reset_ready(const struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset_lock - pin the SMC binding across a runtime warm reset
+ * @wr: the parsed reset
+ *
+ * Acquires the SMC device lock and verifies that the SMC driver is bound.
+ * Callers must pair a true return with apple_smc_warm_reset_unlock() and call
+ * apple_smc_warm_reset_locked() while holding it.
+ *
+ * Return: True when locked and bound, false otherwise (unlocked).
+ */
+bool apple_smc_warm_reset_lock(const struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset_unlock - release the lock taken by apple_smc_warm_reset_lock()
+ * @wr: the parsed reset
+ */
+void apple_smc_warm_reset_unlock(const struct apple_smc_warm_reset *wr);
+
+/**
+ * apple_smc_warm_reset_locked - give a parsed warm reset with the SMC binding pinned
+ * @wr: the parsed reset
+ * @noirq: from another device's noirq callbacks
+ *
+ * Return: Zero on success, -ENODEV when the SMC isn't bound, or the first write's error.
+ */
+int apple_smc_warm_reset_locked(const struct apple_smc_warm_reset *wr, bool noirq);
+
+/**
  * apple_smc_warm_reset - give a parsed warm reset
  * @wr: the parsed reset
  * @noirq: from another device's noirq callbacks: the replies are polled for and the waits
