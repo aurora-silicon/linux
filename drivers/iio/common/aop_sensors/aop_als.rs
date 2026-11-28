@@ -36,19 +36,25 @@ const ALS_PROP_RAW_INTERVAL: u32 = 0x5c;
 const ALS_PROP_VERBOSITY: u32 = 0xe1;
 
 /*
- * The CT817 starts reporting on the zero to non-zero transition of its
- * report interval, and it accepts that transition only once its batch and
- * raw interval properties have been written. Despite their names these two
- * are not intervals; they are the values the sensor is configured with on
- * the T8140. The sensor answers every one of these writes with a
- * not-permitted status and applies them regardless, so the status is only
- * logged.
+ * The ALS starts reporting on the zero to non-zero transition of its report
+ * interval, and it accepts that transition only once its batch and raw
+ * interval properties have been written. Despite their names these two are
+ * not intervals; they are the values the CT817 is configured with on the
+ * T8140. macOS runs the VD6286 of the M5 Max with the same batch value and
+ * writes no verbosity to it. The CT817 answers every one of these writes
+ * with a not-permitted status and applies them regardless, so the status is
+ * only logged.
  */
 const ALS_BATCH_INTERVAL: u32 = 1;
 const ALS_RAW_INTERVAL: u32 = 0;
 const ALS_VERBOSITY: u32 = 6;
 /// The reporting interval in microseconds.
 const ALS_INTERVAL_US: u32 = 200000;
+/// The VD6286's report interval macOS runs on the M5 Max: the captured Ioreg
+/// ReportInterval for this sensor (197380 = 0x30304). The running daily accepts
+/// it with status 0 and reads live lux; the shared 200000 above stays for the
+/// CT817, where it is the only tested value.
+const ALS_INTERVAL_US_VD6286: u32 = 197380;
 const LUX_OFFSET_CT720: usize = 0x1d;
 // These offsets address the fake-HID EPIC payload, not a host HID event.
 const LUX_OFFSET_VD6286: usize = 0x28;
@@ -103,8 +109,36 @@ fn enable_als(
                 e
             ),
         }
-        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
-        return Ok(());
+        let set = |tag: u32, val: u32, what: &str| -> Result<()> {
+            let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
+            // Info, not dbg: release kernels compile dev_dbg out (rust pr_dbg is
+            // debug_assertions-gated even with CONFIG_DYNAMIC_DEBUG=y), so these
+            // statuses would be invisible exactly when a sensor fails to arm.
+            // This runs once at probe: three lines per boot, not noise.
+            dev_info!(
+                dev.as_ref(),
+                "{} = {:#x}: status {:#x}\n",
+                what,
+                val,
+                status
+            );
+            Ok(())
+        };
+        // The VD6286 is armed the way macOS arms it: batch interval, raw
+        // interval, then the report interval, and no verbosity write. At this
+        // change's predecessor the verbosity/batch/raw sequence after
+        // calibration NAKed 0xe00002e2 on the M5 Max (comb4e hardware run),
+        // and macOS writes no verbosity to this sensor. The statuses stay
+        // logged: the sensor may refuse and still apply, as the CT817 does.
+        set(
+            ALS_PROP_BATCH_INTERVAL,
+            ALS_BATCH_INTERVAL,
+            "batch interval",
+        )?;
+        set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
+        // The interval is zero at probe, so this is the transition that arms
+        // the sensor.
+        return set(ALS_PROP_INTERVAL, ALS_INTERVAL_US_VD6286, "interval");
     }
 
     arm_ct817(aop, dev.as_ref(), svc)
