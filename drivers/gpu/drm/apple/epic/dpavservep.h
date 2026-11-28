@@ -21,6 +21,8 @@ struct dcpavserv {
 	u64 epoch; /* Changes even when the same service slot is reused. */
 	bool enabled;
 	struct completion enable_completion;
+	/* Legacy start without a discovery wait: re-probe on the first announcement. */
+	bool late_notify;
 	u32 unit;
 	struct apple_epic_service *service;
 	/*
