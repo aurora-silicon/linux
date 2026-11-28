@@ -206,6 +206,39 @@ properties:
               the surface at once.
             maximum: 32767
 
+      apple,palm-classes:
+        type: boolean
+        description:
+          The trackpad controller classes every contact it reports (thumb,
+          finger or palm). A contact it classes as a palm is a palm once its
+          tool area is larger than apple,palm-class-tool-major.
+
+      apple,palm-class-tool-major:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 32767
+        description:
+          Tool area, in the units of the controller's reports, above which a
+          contact the controller classes as a palm is a palm. No smaller
+          than the largest tool area a finger reaches on this trackpad, so
+          that a finger the class flickers on while a hand lands is never
+          taken for a palm.
+          The driver reads it from this node; there is no default.
+
+      apple,palm-tool-major:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 32767
+        description:
+          Tool area, in the units of the controller's reports, above which a
+          contact is a palm whatever its class. Only for trackpads on which
+          no finger reaches this area.
+
+    dependentRequired:
+      apple,palm-classes: [ "apple,palm-class-tool-major" ]
+      apple,palm-class-tool-major: [ "apple,palm-classes" ]
+      apple,palm-tool-major: [ "apple,palm-classes" ]
+
     allOf:
       - if:
           required:
@@ -213,6 +246,14 @@ properties:
         then:
           properties:
             apple,palm-debounce: false
+      # One palm rule per pad.
+      - if:
+          required:
+            - apple,palm-classes
+        then:
+          properties:
+            apple,palm-debounce: false
+            apple,palm-tool-area: false
       - if:
           required:
             - compatible
@@ -221,6 +262,9 @@ properties:
             apple,touch-states: false
             apple,palm-debounce: false
             apple,palm-tool-area: false
+            apple,palm-classes: false
+            apple,palm-class-tool-major: false
+            apple,palm-tool-major: false
       - if:
           required:
             - apple,firmware-managed-reset
