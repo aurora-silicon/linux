@@ -1034,4 +1034,19 @@ config INPUT_MACSMC_INPUT
 	  To compile this driver as a module, choose M here: the
 	  module will be called macsmc-input.
 
+config INPUT_MACSMC_INPUT_KUNIT_TEST
+	bool "KUnit tests for the Apple SMC lid/buttons driver" if !KUNIT_ALL_TESTS
+	depends on INPUT_MACSMC_INPUT=y && KUNIT=y
+	depends on MFD_MACSMC_KUNIT_TEST && SUSPEND
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SMC input driver: the decoding of the
+	  SMC's power button and lid notifications, and their handling as
+	  wake events while the system goes to sleep, including the lid-open
+	  check against MSLD and the settle time. A static stub replaces SMC
+	  reads, so the tests need no Apple hardware.
+	  The tests report power button presses and lid changes through an
+	  input device and change global suspend state, so they run only at
+	  boot, before user space, and skip when run later.
+
 endif

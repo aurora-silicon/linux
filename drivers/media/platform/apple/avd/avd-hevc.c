@@ -13,6 +13,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
+#include <kunit/visibility.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
@@ -598,8 +599,9 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 {
 	const struct v4l2_ctrl_hevc_decode_params *decode = run->decode;
 	struct avd_decoded_buffer *dst, *ref;
-	bool ref_valid;
+	bool ref_valid, col_in_dpb;
 	const u8 *ref_list;
+	u8 col;
 
 	if (sl->slice_type == V4L2_HEVC_SLICE_TYPE_I) {
 		push(AVD_OP_SL_REF |
@@ -616,11 +618,17 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 							      sl->ref_idx_l1;
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
-	ref = avd_get_ref_buf(
-		ctx, &dst->base.vb,
-		decode->dpb[ref_list[sl->collocated_ref_idx]].timestamp);
+	/*
+	 * Clients mark a reference they do not have with an index past the
+	 * DPB (0xff); there is no collocated picture to take MVs from then.
+	 */
+	col = ref_list[sl->collocated_ref_idx];
+	col_in_dpb = col < ARRAY_SIZE(decode->dpb);
+	ref = col_in_dpb ?
+		avd_get_ref_buf(ctx, &dst->base.vb, decode->dpb[col].timestamp) :
+		dst;
 
-	ref_valid = !(sl->flags &
+	ref_valid = col_in_dpb && !(sl->flags &
 		      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) &&
 		    (sl->flags &
 		     V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED) &&
@@ -661,8 +669,7 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 				   mv_color_size(fmt_width(ctx), fmt_height(ctx)),
 				   AVD_ALIGN);
 		pusha(mv_color_addr, "slc_bd4_sps_tile_addr2_lsb8",
-		      decode->dpb[ref_list[sl->collocated_ref_idx]]
-			      .pic_order_cnt_val);
+		      decode->dpb[col].pic_order_cnt_val);
 	}
 }
 
@@ -832,20 +839,25 @@ static void compute_rs_to_ts(struct avd_hevc_run *run, u32 pic_in_ctbs_size,
 	}
 }
 
-static void compute_tile_ids(struct avd_hevc_run *run, u32 pic_in_ctbs_width,
-			     u32 *col_bd, u32 *row_bd, u32 *ctb_addr_rs_to_ts,
-			     u32 *tile_ids)
+static void compute_tile_ids(struct avd_hevc_run *run, u32 pic_in_ctbs_size,
+			     u32 pic_in_ctbs_width, u32 *col_bd, u32 *row_bd,
+			     u32 *ctb_addr_rs_to_ts, u32 *tile_ids)
 {
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
 	int j, i, y, x;
-	u32 tile_idx;
+	u32 tile_idx, rs, ts;
+
 	for (j = 0, tile_idx = 0; j <= pps->num_tile_rows_minus1; j++)
 		for (i = 0; i <= pps->num_tile_columns_minus1; i++, tile_idx++)
 			for (y = row_bd[j]; y < row_bd[j + 1]; y++)
-				for (x = col_bd[i]; x < col_bd[i + 1]; x++)
-					tile_ids[ctb_addr_rs_to_ts
-							 [y * pic_in_ctbs_width +
-							  x]] = tile_idx;
+				for (x = col_bd[i]; x < col_bd[i + 1]; x++) {
+					rs = y * pic_in_ctbs_width + x;
+					if (rs >= pic_in_ctbs_size)
+						continue;
+					ts = ctb_addr_rs_to_ts[rs];
+					if (ts < pic_in_ctbs_size)
+						tile_ids[ts] = tile_idx;
+				}
 }
 
 struct sl_ctx {
@@ -952,6 +964,10 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 			row = pos / num_cols;
 			col = pos % num_cols;
+			/* More tiles than the boundary tables describe */
+			if (tiles_enabled && (slice_flag & NEW_TILE_ID) &&
+			    row + 1 >= ARRAY_SIZE(tile_info->row_bd))
+				return -EINVAL;
 
 			/*
 			 * not a fan of this, in JCT-VC-HEVC_V1 only TILES_B_Cisco_1
@@ -1022,14 +1038,9 @@ static void avd_hevc_adjust_decoded_fmt(struct avd_ctx *ctx,
 		mv_color_size(pix_mp->width, pix_mp->height);
 }
 
-static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
-						 struct v4l2_ctrl *ctrl)
+static enum avd_image_fmt
+avd_hevc_sps_image_fmt(const struct v4l2_ctrl_hevc_sps *sps)
 {
-	const struct v4l2_ctrl_hevc_sps *sps = ctrl->p_new.p_hevc_sps;
-
-	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
-		return AVD_IMG_FMT_ANY;
-
 	/* avd_hevc_validate_sps() refuses 4:4:4 and depths other than 8/10. */
 	if (sps->bit_depth_luma_minus8 == 0) {
 		if (sps->chroma_format_idc == 2)
@@ -1046,9 +1057,166 @@ static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
 	return AVD_IMG_FMT_ANY;
 }
 
-static int avd_hevc_validate_sps(struct avd_ctx *ctx,
-				 const struct v4l2_ctrl_hevc_sps *sps)
+static enum avd_image_fmt avd_hevc_get_image_fmt(struct avd_ctx *ctx,
+						 struct v4l2_ctrl *ctrl)
 {
+	if (ctrl->id != V4L2_CID_STATELESS_HEVC_SPS)
+		return AVD_IMG_FMT_ANY;
+
+	return avd_hevc_sps_image_fmt(ctrl->p_new.p_hevc_sps);
+}
+
+/*
+ * The picture must have at least one sample in each direction and the CTB
+ * size must be one of those H.265 allows (CtbLog2SizeY 4 to 6, 7.4.3.2.1):
+ * the picture size in CTBs sizes the tile tables and divides slice addresses.
+ */
+VISIBLE_IF_KUNIT int
+avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps)
+{
+	unsigned int ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
+				sps->log2_diff_max_min_luma_coding_block_size;
+
+	if (!sps->pic_width_in_luma_samples || !sps->pic_height_in_luma_samples)
+		return -EINVAL;
+	if (ctb_log2 < 4 || ctb_log2 > 6)
+		return -EINVAL;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_sps_geometry);
+
+static void avd_hevc_pic_in_ctbs(const struct v4l2_ctrl_hevc_sps *sps,
+				 u32 *width, u32 *height)
+{
+	u32 ctb = 1 << (sps->log2_min_luma_coding_block_size_minus3 + 3 +
+			sps->log2_diff_max_min_luma_coding_block_size);
+
+	*width = DIV_ROUND_UP(sps->pic_width_in_luma_samples, ctb);
+	*height = DIV_ROUND_UP(sps->pic_height_in_luma_samples, ctb);
+}
+
+/*
+ * The tile columns and rows must cover the picture, each at least one CTB
+ * wide or high (H.265 7.4.3.3.1). Explicitly sized tiles give all but the
+ * last width and height; the last one takes the rest and must not be empty.
+ * avd_hevc_check_sps_geometry() must have accepted the SPS.
+ */
+VISIBLE_IF_KUNIT int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+					  const struct v4l2_ctrl_hevc_pps *pps)
+{
+	u32 width, height, sum;
+	int i;
+
+	if (!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED))
+		return 0;
+
+	if (pps->num_tile_columns_minus1 >= ARRAY_SIZE(pps->column_width_minus1) ||
+	    pps->num_tile_rows_minus1 >= ARRAY_SIZE(pps->row_height_minus1))
+		return -EINVAL;
+
+	avd_hevc_pic_in_ctbs(sps, &width, &height);
+	if (pps->num_tile_columns_minus1 >= width ||
+	    pps->num_tile_rows_minus1 >= height)
+		return -EINVAL;
+	if (pps->flags & V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING)
+		return 0;
+
+	for (i = 0, sum = 0; i < pps->num_tile_columns_minus1; i++)
+		sum += pps->column_width_minus1[i] + 1;
+	if (sum >= width)
+		return -EINVAL;
+
+	for (i = 0, sum = 0; i < pps->num_tile_rows_minus1; i++)
+		sum += pps->row_height_minus1[i] + 1;
+	if (sum >= height)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_tiles);
+
+/*
+ * Check what the slice builder takes from the slice parameters before it
+ * uses them: the slice address must be a CTB of the picture, the collocated
+ * reference must be an entry of its reference list (H.265 7.4.7.1), and
+ * every slice segment's data must lie in the payload. The
+ * segment layout is the one stream_slices() programs.
+ * avd_hevc_check_sps_geometry() must have accepted the SPS.
+ */
+VISIBLE_IF_KUNIT int
+avd_hevc_check_slices(const struct v4l2_ctrl_hevc_sps *sps,
+		      const struct v4l2_ctrl_hevc_pps *pps,
+		      const struct v4l2_ctrl_hevc_decode_params *decode,
+		      const struct v4l2_ctrl_hevc_slice_params *slices,
+		      u32 num_slices, const u32 *entry_points,
+		      u32 num_entry_points, u32 payload)
+{
+	bool tiles = pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED;
+	u32 width, height, ep = 0, s, i, to;
+	s64 offset = 0, seg_offset, size, next;
+
+	if (payload > INT_MAX)
+		return -EINVAL;
+	avd_hevc_pic_in_ctbs(sps, &width, &height);
+
+	for (s = 0; s < num_slices; s++) {
+		const struct v4l2_ctrl_hevc_slice_params *sl = &slices[s];
+		s64 bytes = sl->bit_size / 8;
+
+		if (sl->slice_segment_addr >= width * height)
+			return -EINVAL;
+
+		if (sl->slice_type != V4L2_HEVC_SLICE_TYPE_I) {
+			bool l0 = sl->slice_type == V4L2_HEVC_SLICE_TYPE_P ||
+				  sl->flags &
+				  V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0;
+			u8 last = l0 ? sl->num_ref_idx_l0_active_minus1 :
+				       sl->num_ref_idx_l1_active_minus1;
+
+			if (sl->collocated_ref_idx >= ARRAY_SIZE(sl->ref_idx_l0))
+				return -EINVAL;
+			if ((sl->flags &
+			     V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED) &&
+			    sl->collocated_ref_idx > last)
+				return -EINVAL;
+		}
+
+		to = tiles ? sl->num_entry_point_offsets + 1 : 1;
+		if (tiles && sl->num_entry_point_offsets >
+				     num_entry_points - ep)
+			return -EINVAL;
+
+		seg_offset = 0;
+		for (i = 0; i < to; i++) {
+			if (to > 1 && i < sl->num_entry_point_offsets) {
+				size = entry_points[ep++];
+				next = size;
+			} else if (to > 1) {
+				size = bytes - sl->data_byte_offset - seg_offset;
+				next = size + sl->data_byte_offset;
+			} else {
+				size = bytes - sl->data_byte_offset;
+				next = size + sl->data_byte_offset;
+			}
+			if (size < 0 ||
+			    offset + seg_offset + sl->data_byte_offset + size >
+				    payload)
+				return -EINVAL;
+			seg_offset += next;
+		}
+		offset += bytes;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_slices);
+
+VISIBLE_IF_KUNIT int
+avd_hevc_validate_sps_fmt(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_hevc_sps *sps)
+{
+	if (!sps->pic_width_in_luma_samples || !sps->pic_height_in_luma_samples)
+		return -EINVAL;
 	if (sps->pic_width_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.width ||
 	    sps->pic_height_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.height)
 		return -EINVAL;
@@ -1074,6 +1242,16 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 		return -EINVAL;
 
 	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_validate_sps_fmt);
+
+static int avd_hevc_validate_sps(struct avd_ctx *ctx,
+				 const struct v4l2_ctrl_hevc_sps *sps)
+{
+	if (avd_hevc_check_sps_geometry(sps))
+		return -EINVAL;
+
+	return avd_hevc_validate_sps_fmt(ctx, sps);
 }
 
 static int avd_hevc_alloc_bufs(struct avd_ctx *ctx, struct avd_hevc_bank *bank)
@@ -1292,6 +1470,9 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	tiles_enabled = !!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED);
 
+	if (avd_hevc_check_tiles(sps, pps))
+		return -EINVAL;
+
 	tile_info->ctb_addr_rs_to_ts = kzalloc(
 		sizeof(*tile_info->ctb_addr_rs_to_ts) * pic_in_ctbs_size,
 		GFP_KERNEL);
@@ -1332,7 +1513,8 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 				 tile_info->col_bd, tile_info->row_bd,
 				 tile_info->col_width, tile_info->row_height,
 				 tile_info->ctb_addr_rs_to_ts);
-		compute_tile_ids(run, pic_in_ctbs_width, tile_info->col_bd,
+		compute_tile_ids(run, pic_in_ctbs_size, pic_in_ctbs_width,
+				 tile_info->col_bd,
 				 tile_info->row_bd,
 				 tile_info->ctb_addr_rs_to_ts,
 				 tile_info->tile_ids);
@@ -1345,6 +1527,36 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/* Build the tile tables of a picture and copy out tile_ids in tile scan order. */
+int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+				 const struct v4l2_ctrl_hevc_pps *pps,
+				 u32 *tile_ids, size_t n)
+{
+	struct avd_hevc_run *run;
+	u32 width, height;
+	int ret;
+
+	run = kzalloc(sizeof(*run), GFP_KERNEL);
+	if (!run)
+		return -ENOMEM;
+	run->sps = sps;
+	run->pps = pps;
+	ret = avd_hevc_compute_tiles(NULL, run);
+	if (!ret) {
+		avd_hevc_pic_in_ctbs(sps, &width, &height);
+		memcpy(tile_ids, run->tile_info.tile_ids,
+		       min_t(size_t, n, (size_t)width * height) *
+			       sizeof(*tile_ids));
+	}
+	kfree(run->tile_info.ctb_addr_rs_to_ts);
+	kfree(run->tile_info.tile_ids);
+	kfree(run);
+	return ret;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_kunit_compute_tiles);
+#endif
 
 /*
  * The slice builder below expects the GStreamer layout: the slices tile the
@@ -1391,9 +1603,34 @@ static void avd_hevc_normalize_slices(struct avd_hevc_run *run, u32 payload)
 	}
 }
 
+/*
+ * A copy of a control's current value. The caller holds the control lock,
+ * so the control must have been looked up before (v4l2_ctrl_find() takes
+ * that lock too).
+ */
+static void *avd_hevc_ctrl_dup(struct v4l2_ctrl *ctrl)
+{
+	if (!ctrl)
+		return NULL;
+	return kmemdup(ctrl->p_cur.p, ctrl->elems * ctrl->elem_size,
+		       GFP_KERNEL);
+}
+
+static void avd_hevc_free_run(struct avd_hevc_run *run)
+{
+	kfree(run->tile_info.ctb_addr_rs_to_ts);
+	kfree(run->tile_info.tile_ids);
+	kfree(run->sl);
+	kfree(run->entry_point_offsets);
+	kfree(run->decode);
+	kfree(run->sps);
+	kfree(run->pps);
+	kfree(run->scaling_matrix);
+}
+
 static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
-	struct v4l2_ctrl *ctrl, *sl, *ep;
+	struct v4l2_ctrl *sl, *ep, *decode, *sps, *pps, *scaling;
 	u32 dst_len, mv_color_len;
 
 	if (!v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS) ||
@@ -1411,20 +1648,15 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	if (run->base.setup_err)
 		return run->base.setup_err;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
-	run->decode = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
-	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
-	run->pps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
-	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
-
 	sl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
 	ep = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			    V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
+	decode = v4l2_ctrl_find(&ctx->ctrl_hdl,
+				V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
+	sps = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
+	pps = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
+	scaling = v4l2_ctrl_find(&ctx->ctrl_hdl,
+				 V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
 
 	/*
 	 * Setting a larger dynamic array on a queued request reallocates the
@@ -1432,15 +1664,24 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	 * the run needs while holding the control lock.
 	 */
 	v4l2_ctrl_lock(sl);
+	/*
+	 * A plain VIDIOC_S_EXT_CTRLS can also change the picture controls
+	 * while the job is built. The checks below and the builder must see
+	 * the same values, so take copies of those too.
+	 */
+	run->decode = avd_hevc_ctrl_dup(decode);
+	run->sps = avd_hevc_ctrl_dup(sps);
+	run->pps = avd_hevc_ctrl_dup(pps);
+	run->scaling_matrix = avd_hevc_ctrl_dup(scaling);
 	run->num_slices = sl->elems;
 	run->sl = kmemdup(sl->p_cur.p, sl->elems * sl->elem_size, GFP_KERNEL);
 	run->num_entry_point_offsets = ep->elems;
 	run->entry_point_offsets =
 		kmemdup(ep->p_cur.p, ep->elems * ep->elem_size, GFP_KERNEL);
 	v4l2_ctrl_unlock(sl);
-	if (!run->sl || !run->entry_point_offsets) {
-		kfree(run->sl);
-		kfree(run->entry_point_offsets);
+	if (!run->sl || !run->entry_point_offsets || !run->decode ||
+	    !run->sps || !run->pps || !run->scaling_matrix) {
+		avd_hevc_free_run(run);
 		avd_run_postamble(ctx, &run->base);
 		return -ENOMEM;
 	}
@@ -1459,6 +1700,7 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
 	struct avd_hevc_run run = {};
 	struct avd_decoded_buffer *dst;
+	u32 payload;
 	int ret;
 
 	ret = avd_hevc_run_preamble(ctx, &run);
@@ -1467,11 +1709,19 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 
 	/* Also validate controls applied from a queued request before submission. */
 	ret = avd_hevc_validate_sps(ctx, run.sps);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_hevc_sps_image_fmt(run.sps));
 	if (ret)
 		goto complete;
 
-	avd_hevc_normalize_slices(&run,
-				  vb2_get_plane_payload(&run.base.bufs.src->vb2_buf, 0));
+	payload = vb2_get_plane_payload(&run.base.bufs.src->vb2_buf, 0);
+	avd_hevc_normalize_slices(&run, payload);
+	ret = avd_hevc_check_slices(run.sps, run.pps, run.decode, run.sl,
+				    run.num_slices, run.entry_point_offsets,
+				    run.num_entry_point_offsets, payload);
+	if (ret)
+		goto complete;
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, &run.sl[0]);
 
@@ -1505,17 +1755,33 @@ complete:
 	/* The request was applied; complete it on every way out. */
 	avd_run_postamble(ctx, &run.base);
 done:
-	kfree(run.tile_info.ctb_addr_rs_to_ts);
-	kfree(run.tile_info.tile_ids);
-	kfree(run.sl);
-	kfree(run.entry_point_offsets);
+	avd_hevc_free_run(&run);
 	return ret;
 }
 
 static int avd_hevc_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_HEVC_SPS)
-		return avd_hevc_validate_sps(ctx, ctrl->p_new.p_hevc_sps);
+	if (ctrl->id == V4L2_CID_STATELESS_HEVC_SPS) {
+		const struct v4l2_ctrl_hevc_sps *sps = ctrl->p_new.p_hevc_sps;
+		struct vb2_queue *vq =
+			ctx->fh.m2m_ctx ?
+				v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) :
+				NULL;
+
+		/*
+		 * Pre-streaming format negotiation (e.g. Chromium
+		 * SetExtCtrlsInit) populates dimensions, chroma format and bit
+		 * depth while leaving CTB size fields zeroed. Defer the CTB
+		 * geometry check until streaming / avd_hevc_run().
+		 */
+		if ((!vq || !vb2_is_streaming(vq)) &&
+		    !sps->log2_min_luma_coding_block_size_minus3 &&
+		    !sps->log2_diff_max_min_luma_coding_block_size)
+			return avd_hevc_validate_sps_fmt(ctx, sps);
+
+		return avd_hevc_validate_sps(ctx, sps);
+	}
 
 	return 0;
 }

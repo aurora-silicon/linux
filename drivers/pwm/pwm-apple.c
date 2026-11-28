@@ -252,3 +252,7 @@ module_platform_driver(apple_pwm_driver);
 
 MODULE_DESCRIPTION("Apple SoC PWM driver");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_PWM_APPLE_KUNIT_TEST)
+#include "pwm-apple-test.c"
+#endif

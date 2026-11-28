@@ -30,6 +30,17 @@ pub(crate) struct Render {
     last_progress_ns:i64,
     stamp_epoch:timeline::StampEpoch,
     draw:u64, heads:[u16;2], cached_views:KVec<CachedViews>,
+    /// Quarantined client views and replaced arena backing retained after
+    /// firmware-aborted draws so their ASIDs and driver mappings are never
+    /// evicted or recycled while quiescence is unproven.
+    quarantined_views:KVec<CachedViews>,
+    quarantined_buffers:KVec<Buffer>,
+    quarantine_active_vm:bool,
+    /// Draw number whose batch was aborted by firmware recovery so `complete()`
+    /// does not reject the next draw with `EBUSY` on a firmware-discarded FS `DONE`.
+    recovery_aborted_draw:Option<u64>,
+    /// Cumulative draws aborted by recovery that did not advance pool+0x54.
+    pool_delta:[u64;2],
     slot:usize, batch_count:usize, early_count:u32,
     /// Measurement packets in the pass most recently appended to its queues.
     stage_timestamps:[bool;2],
@@ -99,7 +110,7 @@ impl Render {
         tiler_bytes.resize(if profile==super::m3_profile::Profile::Extended {tiler::EXTENDED_SIZE} else {tiler::SIZE},0u8,GFP_KERNEL)?;
         let mut fragment_bytes=KVec::new();
         fragment_bytes.resize(if profile==super::m3_profile::Profile::Extended {fragment::EXTENDED_SIZE} else {fragment::SIZE},0u8,GFP_KERNEL)?;
-        let mut job=Self{passes,init_bm,stats,profile,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,stamp_epoch:timeline::StampEpoch::default(),draw:0,heads:[0;2],cached_views:KVec::new(),slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers,_lower_tlbi:lower_tlbi};
+        let mut job=Self{passes,init_bm,stats,profile,sequence_bytes,tiler_bytes,fragment_bytes,objects,_aliases:aliases,_binding:binding,last_progress_ns:0,stamp_epoch:timeline::StampEpoch::default(),draw:0,heads:[0;2],cached_views:KVec::new(),quarantined_views:KVec::new(),quarantined_buffers:KVec::new(),quarantine_active_vm:false,recovery_aborted_draw:None,pool_delta:[0;2],slot:0,batch_count:0,early_count:0,stage_timestamps:[true;2],base:0,checkpoint:(0,[0;2],0,0,0,0),clusters,registers,_lower_tlbi:lower_tlbi};
         // Lists and the matching manager are built before InitBM publication.
         job.initialize_parameter_buffer()?;
         for (index,pool) in UMA_POOLS.iter().enumerate() {
@@ -557,8 +568,12 @@ impl Render {
             };
             // Finish fallible allocations before replacing the current owner.
             let old_views=KVec::with_capacity(next.views.len(),GFP_KERNEL)?;
-            self.cached_views.reserve(1,GFP_KERNEL)?;
-            if self.cached_views.len()==3 {drop(self.cached_views.remove(0).map_err(|_|EIO)?);}
+            if self.quarantine_active_vm {
+                self.quarantined_views.reserve(1,GFP_KERNEL)?;
+            } else {
+                self.cached_views.reserve(1,GFP_KERNEL)?;
+                if self.cached_views.len()==3 {drop(self.cached_views.remove(0).map_err(|_|EIO)?);}
+            }
             let mut old=CachedViews {
                 binding:core::mem::replace(&mut self._binding,next.binding),
                 aliases:core::mem::replace(&mut self._aliases,next.aliases),
@@ -567,7 +582,12 @@ impl Render {
             for (i,view) in next.views {
                 old.views.push((i,self.view_owner(i).swap_gpu_view(view)?),GFP_KERNEL)?;
             }
-            self.cached_views.push(old,GFP_KERNEL)?;
+            if self.quarantine_active_vm {
+                self.quarantine_active_vm=false;
+                self.quarantined_views.push(old,GFP_KERNEL)?;
+            } else {
+                self.cached_views.push(old,GFP_KERNEL)?;
+            }
         }
         // Growth is legal only after exact retirement, and before append.
         // Cached VM mappings must be dropped before freeing the old backing.
@@ -580,11 +600,14 @@ impl Render {
             for (field,base,bytes) in [(P::Tpc,s::TPC_LABEL,g.tpc_bytes),(P::Tilemap,s::TILEMAP_LABEL,g.tilemap_bytes)] {
                 let size=usize::try_from(bytes).map_err(|_|EOVERFLOW)?;
                 if size>self.passes[slot].get(field).size() {
+                    let keep_old = !self.quarantined_views.is_empty() || self.quarantine_active_vm;
+                    if keep_old { self.quarantined_buffers.reserve(1,GFP_KERNEL)?; }
                     let buffer=Buffer::tiler(dev,uat.kernel_vm(),vm,size)?;
                     self.cached_views.clear();
                     dev_info!(dev.as_ref(),"M3 render arena growth: slot={} object={} {} -> {} bytes GPU={:#x}\n",
                         slot,base,self.passes[slot].get(field).size(),size,buffer.gpu_va()?);
-                    *self.passes[slot].get_mut(field)=buffer;
+                    let prev = core::mem::replace(self.passes[slot].get_mut(field), buffer);
+                    if keep_old { let _ = self.quarantined_buffers.push(prev, GFP_KERNEL); }
                 }
             }
         }
@@ -768,18 +791,104 @@ impl Render {
         Ok(done)
     }
     pub(crate) fn complete(&mut self)->Result<bool> {
-        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,self.stamp_epoch.value(s::STAMP_TA - 256,self.draw),self.heads[0]),
-            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,self.stamp_epoch.value(s::STAMP_FRAGMENT - 256,self.draw),self.heads[1])] {
+        let recovered = self.recovery_aborted_draw == Some(self.draw);
+        for (stage,stamp,fw,pointers,value,head) in [(0usize,s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,self.stamp_epoch.value(s::STAMP_TA - 256,self.draw),self.heads[0]),
+            (1usize,s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,self.stamp_epoch.value(s::STAMP_FRAGMENT - 256,self.draw),self.heads[1])] {
+            let allow_lagging_done = recovered && stage == 1;
             if self.objects[stamp].read_u32(0)?!=value || self.objects[fw].read_u32(0)?!=value
-                || self.objects[pointers].read_u32(queue::DONE)?!=u32::from(head)
+                || (!allow_lagging_done && self.objects[pointers].read_u32(queue::DONE)?!=u32::from(head))
                 || self.objects[pointers].read_u32(queue::READ)?!=u32::from(head) {return Ok(false);}
         }
         if self.profile==super::m3_profile::Profile::Extended && self.draw!=0 {
-            for pool in UMA_POOLS {
-                if self.objects[pool.manager].read_u64(0x54)?!=self.draw {return Ok(false);}
+            for (idx, pool) in UMA_POOLS.iter().enumerate() {
+                let actual = self.objects[pool.manager].read_u64(0x54)?;
+                let expected = self.draw.saturating_sub(self.pool_delta[idx]);
+                if actual < expected || actual > self.draw {return Ok(false);}
+                if actual > expected {
+                    self.pool_delta[idx] = self.draw - actual;
+                }
             }
         }
         Ok(true)
+    }
+    /// Clear TPC storage for all pass slots of an active batch before answering
+    /// recovery phase 2 when the firmware snapshot names a stopped tiler.
+    pub(crate) fn clear_active_tpc(&mut self, base: usize, count: usize) -> Result {
+        for index in 0..count {
+            let slot = Self::at(base, index);
+            self.passes[slot].get_mut(P::Tpc).fill(0)?;
+        }
+        crate::m3::agx_memory::publish();
+        Ok(())
+    }
+    /// Whether the firmware has drained both render work rings to their current write heads.
+    pub(crate) fn queues_drained(&mut self) -> Result<bool> {
+        for (pointers, head) in [(s::TA_POINTERS, self.heads[0]), (s::FRAGMENT_POINTERS, self.heads[1])] {
+            if self.objects[pointers].read_u32(queue::DONE)? != u32::from(head)
+                || self.objects[pointers].read_u32(queue::READ)? != u32::from(head)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// Whether TA aborted and retired its ring while fragment has `READ == head`
+    /// with `DONE != head` and neither the TA host stamp nor the fragment FW
+    /// stamp reached the expected draw value.
+    ///
+    /// On a tiler-only fault, 27.2 firmware advances `TA.DONE` (already before
+    /// phase 3) while leaving `TA_STAMP` behind and discarding the paired
+    /// fragment command without advancing `FRAGMENT_POINTERS.DONE` or
+    /// `FRAGMENT_FW_STAMP` (`READ` still reaches `head`); the next draw catches
+    /// `DONE` back up to `head`.
+    pub(crate) fn fragment_read_only_pending(&mut self) -> Result<bool> {
+        let ta_expected = self.stamp_epoch.value(s::STAMP_TA - 256, self.draw);
+        let fs_expected = self.stamp_epoch.value(s::STAMP_FRAGMENT - 256, self.draw);
+        let ta_host = self.objects[s::TA_STAMP].read_u32(0)?;
+        let fs_fw = self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?;
+        let ta_done = self.objects[s::TA_POINTERS].read_u32(queue::DONE)?;
+        let ta_read = self.objects[s::TA_POINTERS].read_u32(queue::READ)?;
+        let fs_done = self.objects[s::FRAGMENT_POINTERS].read_u32(queue::DONE)?;
+        let fs_read = self.objects[s::FRAGMENT_POINTERS].read_u32(queue::READ)?;
+        Ok(ta_done == u32::from(self.heads[0])
+            && ta_read == u32::from(self.heads[0])
+            && ta_host != ta_expected
+            && fs_read == u32::from(self.heads[1])
+            && fs_done != u32::from(self.heads[1])
+            && fs_fw != fs_expected)
+    }
+    /// Re-synchronize render stamps and pool expectations after firmware recovery
+    /// drained the stopped batch, and mark the faulting VM's binding for quarantine.
+    pub(crate) fn finish_recovery(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
+        self.quarantine_active_vm = true;
+        self.recovery_aborted_draw = if self.fragment_read_only_pending()? {
+            Some(self.draw)
+        } else {
+            None
+        };
+        let ta_expected = self.stamp_epoch.value(s::STAMP_TA - 256, self.draw);
+        let fs_expected = self.stamp_epoch.value(s::STAMP_FRAGMENT - 256, self.draw);
+        let ta_host = self.objects[s::TA_STAMP].read_u32(0)?;
+        let ta_fw = self.objects[s::TA_FW_STAMP].read_u32(0)?;
+        let fs_host = self.objects[s::FRAGMENT_STAMP].read_u32(0)?;
+        let fs_fw = self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?;
+        let pool0 = self.objects[UMA_POOLS[0].manager].read_u64(0x54)?;
+        let pool1 = self.objects[UMA_POOLS[1].manager].read_u64(0x54)?;
+        dev_info!(
+            dev.as_ref(),
+            "M3 recovery render post-drain: draw={} ta={:#x}/{:#x} (want {:#x}) fs={:#x}/{:#x} (want {:#x}) pool54={}/{}\n",
+            self.draw, ta_host, ta_fw, ta_expected, fs_host, fs_fw, fs_expected, pool0, pool1
+        );
+        if ta_host != ta_expected { self.objects[s::TA_STAMP].u32(0, ta_expected)?; }
+        if ta_fw != ta_expected { self.objects[s::TA_FW_STAMP].u32(0, ta_expected)?; }
+        if fs_host != fs_expected { self.objects[s::FRAGMENT_STAMP].u32(0, fs_expected)?; }
+        if fs_fw != fs_expected { self.objects[s::FRAGMENT_FW_STAMP].u32(0, fs_expected)?; }
+        if self.profile == super::m3_profile::Profile::Extended {
+            self.pool_delta[0] = self.draw.saturating_sub(pool0);
+            self.pool_delta[1] = self.draw.saturating_sub(pool1);
+        }
+        crate::m3::agx_memory::publish();
+        Ok(())
     }
     pub(crate) fn log(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         // Retain allocator state as well as payloads: an exhausted parameter

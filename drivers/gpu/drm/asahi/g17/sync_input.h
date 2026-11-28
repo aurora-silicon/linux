@@ -13,7 +13,11 @@ struct asahi_g17_fence_leaf {
 
 int asahi_g17_collect_fences(struct dma_fence *head,
 			   struct asahi_g17_fence_leaf *out, size_t capacity);
+int asahi_g17_collect_fences_coalesced(struct dma_fence *head,
+				     struct asahi_g17_fence_leaf *out,
+				     size_t capacity);
 void asahi_g17_put_fence(struct dma_fence *fence);
 struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t count);
+int asahi_g17_fence_order(struct dma_fence *a, struct dma_fence *b);
 
 #endif

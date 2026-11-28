@@ -124,15 +124,39 @@ impl Firmware {
                     // backpressure uses the existing failed-replay retirement.
                     Err(EBUSY)
                 } else { (|| {
-                    self.queues.compute[index]
-                        .as_mut()
-                        .and_then(|entry| entry.queue.as_deref_mut())
-                        .ok_or(EIO)?
-                        .prepare_replay(&packet)?;
+                    let qid = {
+                        let mut queue = self.queues.compute[index]
+                            .as_mut()
+                            .and_then(|entry| entry.queue.as_deref_mut())
+                            .ok_or(EIO)?;
+                        queue.prepare_replay(&packet)?;
+                        queue.qid()
+                    };
                     let owner = owner.ok_or(EIO)?;
                     packet.check_replay_dependencies()?;
-                    let dependencies = self.queues.render_prefix(owner, &packet)?;
-                    self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred)
+                    let mut dependencies = self.queues.render_prefix(owner, &packet)?;
+                    let recovery_state = recovery::Memory::recovery_state(&self.init)?;
+                    let require_visible = self
+                        .primary
+                        .state
+                        .shared
+                        .m5_board
+                        .is_some_and(|board| board.completion_inputs());
+                    self.queues.append_compute_prefix(
+                        owner,
+                        Some(qid),
+                        &packet,
+                        recovery_state,
+                        require_visible,
+                        &mut dependencies,
+                    )?;
+                    self.publish_compute_on(
+                        owner,
+                        Some(qid),
+                        packet.clone(),
+                        dependencies.as_slice(),
+                        deferred,
+                    )
                 })() };
                 let recovery_wait = matches!(result, Err(EAGAIN) | Err(EBUSY))
                     && (self.recovery.pending()

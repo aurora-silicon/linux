@@ -23,6 +23,7 @@ impl G18UmaPoolMemory {
     pub(crate) fn application_aliases(&mut self, uat: &mmu::Uat, vm: &mmu::Vm)
         -> Result<KVec<mmu::KernelMapping>> {
         if !self.render || self.scratch_plan.is_none() {return Err(EINVAL);}
+        self.clear_scratch_for(vm)?;
         let mut aliases=KVec::new();
         for (index,page) in self.directory.iter_mut().enumerate() {
             let address=DIRECTORY_BASE+self.layout.page_offset(index as u32).ok_or(EINVAL)?;

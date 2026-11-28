@@ -33,6 +33,18 @@ config RESET_APPLE_CIO
 	  before the USB4/Thunderbolt host routers inside them can be brought
 	  up by the thunderbolt driver.
 
+config RESET_APPLE_CIO_KUNIT_TEST
+	bool "KUnit tests for the Apple CIO reset driver" if !KUNIT_ALL_TESTS
+	depends on RESET_APPLE_CIO=y && KUNIT=y && OF_DYNAMIC
+	default KUNIT_ALL_TESTS
+	help
+	  Run the deassert sequence of every CIO register layout against a
+	  modelled request/busy register, including busy waits, timeouts and
+	  write errors. Also probe a pmgr-child controller from a test device
+	  tree fragment and check that the reset core refuses reset ids past
+	  the number of ports. No hardware is accessed; only useful for kernel
+	  developers.
+
 config RESET_ASPEED
 	tristate "ASPEED Reset Driver"
 	depends on ARCH_ASPEED || COMPILE_TEST

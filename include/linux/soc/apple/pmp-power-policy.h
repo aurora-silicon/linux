@@ -19,7 +19,7 @@ struct apple_pmp_power_policy {
 	int sustainable_mw, allowed_mw, total_mw, filtered_mc;
 	unsigned int level[3], next_release, good;
 	unsigned int active;
-	bool initialized, fault;
+	bool initialized, fault, unbudgeted;
 };
 
 /* SMC little-endian IEEE binary32 Watts -> mW. Reject NaN/Inf, negative,
@@ -53,6 +53,20 @@ static inline void apple_pmp_power_init(struct apple_pmp_power_policy *s)
 	};
 }
 
+/* A Mac whose fan the SMC appears to run on the heat the SoC makes: the
+ * energy budget above is the fanless Airs' and takes that heat away, so the
+ * fan stops and power stays near the floor. Such a board keeps the die guard as its
+ * limit; the rails are still read, and a fault or a gap in them still selects
+ * full protection and recovers one step per second, as on the Airs.
+ */
+static inline void apple_pmp_power_init_unbudgeted(struct apple_pmp_power_policy *s)
+{
+	apple_pmp_power_init(s);
+	s->sustainable_mw = 0;
+	s->allowed_mw = 0;
+	s->unbudgeted = true;
+}
+
 /* A newly attached consumer starts restricted. An absent consumer cannot
  * absorb releases or be selected as a way to reduce measured consumption.
  */
@@ -74,6 +88,59 @@ static inline void apple_pmp_power_fail(struct apple_pmp_power_policy *s)
 		s->level[i] = s->active & (1U << i) ? 8 : 0;
 	s->fault = true;
 	s->good = 0;
+}
+
+/* Release the largest weighted restriction, round-robin on ties. */
+static inline void apple_pmp_power_release(struct apple_pmp_power_policy *s,
+					   unsigned long long now,
+					   const unsigned int weight[3])
+{
+	unsigned int i, chosen = 3;
+
+	for (i = 0; i < 3; i++) {
+		unsigned int candidate = (s->next_release + i) % 3;
+
+		if ((s->active & (1U << candidate)) && s->level[candidate] &&
+		    (chosen == 3 ||
+		    s->level[candidate] * weight[candidate] >
+		    s->level[chosen] * weight[chosen]))
+			chosen = candidate;
+	}
+	if (chosen < 3) {
+		s->level[chosen]--;
+		s->next_release = (chosen + 1) % 3;
+	}
+	s->change_ns = now;
+}
+
+/* On an unbudgeted board die temperature does not drive an energy bucket.
+ * While every die sensor is dark (-ENODATA) and the SMC rails were read, keep
+ * the rail sum and sample timestamp current so a >2 s idle dark span does not
+ * trip the gap fault on the next valid die reading. A genuine >2 s telemetry
+ * gap still fails closed, and any prior fault stays latched until valid die
+ * samples confirm recovery.
+ */
+static inline void apple_pmp_power_dark(struct apple_pmp_power_policy *s,
+					unsigned long long now,
+					const unsigned int mw[3])
+{
+	unsigned long long dt = s->last_ns ? now - s->last_ns : 0;
+	unsigned int i;
+
+	if (!s->unbudgeted)
+		return;
+	if (dt > 2000000000ULL) {
+		apple_pmp_power_fail(s);
+		s->last_ns = now;
+		return;
+	}
+	if (s->last_ns && dt < 400000000ULL)
+		return;
+	s->last_ns = now;
+	s->total_mw = 0;
+	for (i = 0; i < 3; i++)
+		if (s->active & (1U << i))
+			s->total_mw += mw[i];
 }
 
 static inline void apple_pmp_power_sample(struct apple_pmp_power_policy *s,
@@ -104,7 +171,7 @@ static inline void apple_pmp_power_sample(struct apple_pmp_power_policy *s,
 			s->total_mw += mw[i];
 	if (!s->initialized) {
 		s->initialized = true;
-		s->credit_mj = mc < 75000 ? APPLE_PMP_BURST_MJ : 0;
+		s->credit_mj = mc < 75000 && !s->unbudgeted ? APPLE_PMP_BURST_MJ : 0;
 		s->filtered_mc = mc;
 		s->tune_ns = now;
 	}
@@ -114,6 +181,12 @@ static inline void apple_pmp_power_sample(struct apple_pmp_power_policy *s,
 		return;
 	s->fault = false;
 	s->filtered_mc += (mc - s->filtered_mc) * (long long)ms / (long long)(5000 + ms);
+	if (s->unbudgeted) {
+		/* Release one step per second; nothing restricts again. */
+		if (now - s->change_ns >= 1000000000ULL)
+			apple_pmp_power_release(s, now, weight);
+		return;
+	}
 	if (s->total_mw > s->sustainable_mw)
 		s->credit_mj -= (s->total_mw - s->sustainable_mw) * (long long)ms / 1000;
 	else if (mc < 75000)
@@ -163,20 +236,7 @@ static inline void apple_pmp_power_sample(struct apple_pmp_power_policy *s,
 		 * This restores graphics headroom before spending it on CPU stress.
 		 * Fault recovery still restores only one step per elapsed interval.
 		 */
-		for (i = 0; i < 3; i++) {
-			unsigned int candidate = (s->next_release + i) % 3;
-
-			if ((s->active & (1U << candidate)) && s->level[candidate] &&
-			    (chosen == 3 ||
-			    s->level[candidate] * weight[candidate] >
-			    s->level[chosen] * weight[chosen]))
-				chosen = candidate;
-		}
-		if (chosen < 3) {
-			s->level[chosen]--;
-			s->next_release = (chosen + 1) % 3;
-		}
-		s->change_ns = now;
+		apple_pmp_power_release(s, now, weight);
 	}
 }
 
