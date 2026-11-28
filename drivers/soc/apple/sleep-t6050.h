@@ -643,8 +643,9 @@ static int t6050_sleep_check_alarm(struct apple_sleep *s)
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &control, 1);
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_MASK, NULL, &mask, 1);
+	/* No armed alarm is no refusal: the SMC's wake sources (lid, keys) do not need it */
 	if (!ret && (!(control & T6050_RTC_CTL_ARMED) || (mask & BIT(0))))
-		ret = -EBUSY;
+		return 0;
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL,
 					   r->alarm_compare, 4);
@@ -2798,6 +2799,9 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	ret = t6050_sleep_check_alarm(s);
 	if (ret)
 		return ret;
+	/* No alarm armed: nothing to hold against the sleep timer */
+	if (!r->alarm_valid)
+		return 0;
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6);
 	if (ret)
 		return ret;
@@ -3119,6 +3123,33 @@ static void t6050_clusters_down_first_report(struct apple_sleep *s)
 			 r->early_seq[1], r->early_us[1], r->early_ret[2]);
 }
 
+static void t6050_sleep_commit_wdt(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+
+	if (r && r->seq[T6050_SEQ_WDT].n) {
+		s->aon_wdt_saved = readl(s->wdt_aux + AON_WDT_SLEEP);
+		s->aon_wdt_marked = true;
+	}
+	t6050_seq(s, T6050_SEQ_WDT);
+	writel(0, s->wdt + WDT_WD0_CTL);
+	apple_sleep_set_wd2(s, T6050_WDT_COMMIT_SECS);
+	writel(0, s->wdt_aux + AON_AP_DEADLINE);
+}
+
+static void t6050_sleep_wake_wdt(struct apple_sleep *s)
+{
+	writel(0, s->wdt + WDT_WD2_CTL);
+	writel(WDT_WD2_CTL_IRQ_STATUS, s->wdt + WDT_WD2_CTL);
+	(void)readl(s->wdt + WDT_WD2_CTL);
+	if (s->aon_wdt_marked) {
+		writel(s->aon_wdt_saved, s->wdt_aux + AON_WDT_SLEEP);
+		(void)readl(s->wdt_aux + AON_WDT_SLEEP);
+		s->aon_wdt_marked = false;
+	}
+	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+}
+
 /*
  * The commit window, each step at the DT schedule's time before the sleep timer: the MCC
  * requests released, the storage link's PHY parked and its words down, the watchdogs, the
@@ -3171,10 +3202,7 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 		}
 	}
 	t6050_step(s, T6050_STEP_WDT);
-	t6050_seq(s, T6050_SEQ_WDT);
-	writel(0, s->wdt + WDT_WD0_CTL);
-	apple_sleep_set_wd2(s, T6050_WDT_COMMIT_SECS);
-	writel(0, s->wdt_aux + 8);
+	t6050_sleep_commit_wdt(s);
 	/* The memory floor's voter to 0, not read */
 	t6050_step(s, T6050_STEP_FLOOR);
 	s->region->floor_changed |= BIT(1);
@@ -3792,8 +3820,7 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 		r->gfx_aic[2] = readl(r->aic_gfx + 0x14);
 	}
 	/* The complexes' requests back, in macOS's early wake order */
-	writel(0, s->wdt + WDT_WD2_CTL);
-	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+	t6050_sleep_wake_wdt(s);
 	for (i = 0; i < 3; i++)
 		writel(r->cluster_saved[i], s->cluster + 4 * i);
 	writel(PWRGATE_ON, s->pwrgate);

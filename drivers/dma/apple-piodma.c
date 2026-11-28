@@ -9,6 +9,7 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/build_bug.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/iopoll.h>
@@ -31,6 +32,8 @@
 #define APPLE_PIODMA_ARENA_SIZE		SZ_16K
 #define APPLE_PIODMA_COMPLETION_OFFSET	SZ_4K
 #define APPLE_PIODMA_IDLE_TIMEOUT_US	50000
+/* How often an engine that did not stop is told to stop again */
+#define APPLE_PIODMA_RESET_RETRY_MS	100
 
 static_assert(APPLE_PIODMA_PACKET_SOURCE_LO_BITS ==
 	      __const_hweight32(APPLE_PIODMA_PACKET0_SOURCE_LO));
@@ -64,14 +67,25 @@ struct apple_piodma {
 
 	/* Serialises engine re-initialisation after a stop or an error. */
 	struct mutex reset_lock;
-	struct work_struct reset_work;
+	struct delayed_work reset_work;
 
 	/* Protected by vc.lock. */
 	struct apple_piodma_desc *active;
+	/*
+	 * A request that failed while the engine may still be copying it; it
+	 * completes once the engine is seen stopped.
+	 */
+	struct apple_piodma_desc *failed;
 	size_t chunk;
 	unsigned int generation;
 	u8 tag;
 	bool halted;
+	/*
+	 * The engine was told to stop with a request on it, and has not yet
+	 * been seen stopped: until it has, it may still read the request's
+	 * source and write its destination.
+	 */
+	bool stopping;
 
 	bool allocated;
 };
@@ -267,13 +281,45 @@ static void apple_piodma_halt_locked(struct apple_piodma *piodma)
 
 	writel(0, piodma->engine + APPLE_PIODMA_REG_COMMAND);
 	piodma->halted = true;
-	schedule_work(&piodma->reset_work);
+	piodma->stopping = true;
+	mod_delayed_work(system_dfl_wq, &piodma->reset_work, 0);
+}
+
+/*
+ * apple_piodma_hw_init() saw the engine stopped and idle; vc.lock held.
+ * A request that failed is complete now that nothing copies it any more.
+ */
+static void apple_piodma_restart_locked(struct apple_piodma *piodma)
+{
+	lockdep_assert_held(&piodma->vc.lock);
+
+	/* Any IRQ that sampled the engine before the reset is now stale. */
+	piodma->generation++;
+	piodma->halted = false;
+	piodma->stopping = false;
+	if (piodma->failed) {
+		vchan_cookie_complete(&piodma->failed->vd);
+		piodma->failed = NULL;
+	}
+}
+
+static bool apple_piodma_stopping(struct apple_piodma *piodma)
+{
+	unsigned long flags;
+	bool stopping;
+
+	spin_lock_irqsave(&piodma->vc.lock, flags);
+	stopping = piodma->stopping;
+	spin_unlock_irqrestore(&piodma->vc.lock, flags);
+
+	return stopping;
 }
 
 static void apple_piodma_reset_work(struct work_struct *work)
 {
 	struct apple_piodma *piodma =
-		container_of(work, struct apple_piodma, reset_work);
+		container_of(to_delayed_work(work), struct apple_piodma,
+			     reset_work);
 	unsigned long flags;
 	bool halted;
 	int ret;
@@ -287,14 +333,16 @@ static void apple_piodma_reset_work(struct work_struct *work)
 
 	ret = apple_piodma_hw_init(piodma);
 	if (ret) {
-		dev_err(piodma->dev, "request engine did not restart: %d\n", ret);
+		/* Stay halted, and keep what it may still copy, until it stops. */
+		dev_err_ratelimited(piodma->dev,
+				    "request engine did not restart: %d\n", ret);
+		mod_delayed_work(system_dfl_wq, &piodma->reset_work,
+				 msecs_to_jiffies(APPLE_PIODMA_RESET_RETRY_MS));
 		goto out;
 	}
 
 	spin_lock_irqsave(&piodma->vc.lock, flags);
-	/* Any IRQ that sampled the engine before the reset is now stale. */
-	piodma->generation++;
-	piodma->halted = false;
+	apple_piodma_restart_locked(piodma);
 	apple_piodma_start_next_locked(piodma);
 	spin_unlock_irqrestore(&piodma->vc.lock, flags);
 out:
@@ -340,14 +388,20 @@ static irqreturn_t apple_piodma_irq(int irq, void *data)
 				    status, tag, piodma->tag);
 		desc->vd.tx_result.result = DMA_TRANS_ABORTED;
 		desc->vd.tx_result.residue = desc->len - desc->done;
+		/* The engine may still be copying it: complete it once stopped. */
+		list_del(&desc->vd.node);
+		piodma->active = NULL;
+		piodma->failed = desc;
 		apple_piodma_halt_locked(piodma);
-	} else {
-		desc->done += piodma->chunk;
-		if (desc->done < desc->len) {
-			apple_piodma_start_locked(piodma);
-			spin_unlock_irqrestore(&piodma->vc.lock, flags);
-			return IRQ_HANDLED;
-		}
+		spin_unlock_irqrestore(&piodma->vc.lock, flags);
+		return IRQ_HANDLED;
+	}
+
+	desc->done += piodma->chunk;
+	if (desc->done < desc->len) {
+		apple_piodma_start_locked(piodma);
+		spin_unlock_irqrestore(&piodma->vc.lock, flags);
+		return IRQ_HANDLED;
 	}
 
 	list_del(&desc->vd.node);
@@ -403,25 +457,56 @@ static int apple_piodma_terminate_all(struct dma_chan *chan)
 	LIST_HEAD(head);
 
 	spin_lock_irqsave(&piodma->vc.lock, flags);
+	/*
+	 * Free only the requests the engine never saw: what it was given is
+	 * freed by device_synchronize once the engine is seen stopped, so
+	 * desc_terminated is left alone.
+	 */
+	if (piodma->active)
+		list_del(&piodma->active->vd.node);
+	list_splice_tail_init(&piodma->vc.desc_allocated, &head);
+	list_splice_tail_init(&piodma->vc.desc_submitted, &head);
+	list_splice_tail_init(&piodma->vc.desc_issued, &head);
+	list_splice_tail_init(&piodma->vc.desc_completed, &head);
 	if (piodma->active) {
 		apple_piodma_halt_locked(piodma);
-		list_del(&piodma->active->vd.node);
 		vchan_terminate_vdesc(&piodma->active->vd);
 		piodma->active = NULL;
 	}
-	vchan_get_all_descriptors(&piodma->vc, &head);
+	/* Its client is not called back. */
+	if (piodma->failed) {
+		vchan_terminate_vdesc(&piodma->failed->vd);
+		piodma->failed = NULL;
+	}
 	spin_unlock_irqrestore(&piodma->vc.lock, flags);
 	vchan_dma_desc_free_list(&piodma->vc, &head);
 
 	return 0;
 }
 
+/*
+ * Returns once the engine is seen stopped, so that the memory of every
+ * request it was given may be freed. An engine that does not stop is told to
+ * stop again every APPLE_PIODMA_RESET_RETRY_MS, for as long as it takes:
+ * returning earlier would hand the client memory the engine may still write.
+ */
 static void apple_piodma_synchronize(struct dma_chan *chan)
 {
 	struct apple_piodma *piodma = to_apple_piodma(chan);
+	bool warned = false;
 
-	synchronize_irq(piodma->irq);
-	flush_work(&piodma->reset_work);
+	for (;;) {
+		synchronize_irq(piodma->irq);
+		flush_delayed_work(&piodma->reset_work);
+		if (!apple_piodma_stopping(piodma))
+			break;
+		if (!warned) {
+			dev_warn(piodma->dev,
+				 "waiting for the request engine to stop\n");
+			warned = true;
+		}
+		msleep(APPLE_PIODMA_RESET_RETRY_MS);
+	}
 	vchan_synchronize(&piodma->vc);
 }
 
@@ -478,8 +563,7 @@ static int apple_piodma_runtime_resume(struct device *dev)
 		return ret;
 
 	spin_lock_irqsave(&piodma->vc.lock, flags);
-	piodma->generation++;
-	piodma->halted = false;
+	apple_piodma_restart_locked(piodma);
 	/* A chunk cut off by system suspend is copied again from the start. */
 	if (piodma->active)
 		apple_piodma_start_locked(piodma);
@@ -535,7 +619,7 @@ static int apple_piodma_probe(struct platform_device *pdev)
 	ret = devm_mutex_init(dev, &piodma->reset_lock);
 	if (ret)
 		return ret;
-	INIT_WORK(&piodma->reset_work, apple_piodma_reset_work);
+	INIT_DELAYED_WORK(&piodma->reset_work, apple_piodma_reset_work);
 	/* Start halted: runtime resume configures the engine. */
 	piodma->halted = true;
 
@@ -593,7 +677,7 @@ static void apple_piodma_remove(struct platform_device *pdev)
 	dma_async_device_unregister(&piodma->dma);
 	if (piodma->allocated)
 		apple_piodma_free_chan_resources(&piodma->vc.chan);
-	cancel_work_sync(&piodma->reset_work);
+	cancel_delayed_work_sync(&piodma->reset_work);
 	if (ret >= 0) {
 		writel(0, piodma->engine + APPLE_PIODMA_REG_IRQ_ENABLE);
 		apple_piodma_ack_irqs(piodma);
@@ -628,6 +712,10 @@ static struct platform_driver apple_piodma_driver = {
 	},
 };
 module_platform_driver(apple_piodma_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_PIODMA_KUNIT_TEST)
+#include "apple-piodma-test.c"
+#endif
 
 MODULE_DESCRIPTION("Apple PCIe PIODMA engine driver");
 MODULE_LICENSE("GPL");

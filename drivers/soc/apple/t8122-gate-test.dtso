@@ -4,7 +4,10 @@
  * nodes of t8122-dcp.dtsi with the boot loader's handoff applied, the power
  * states they hang from, the PMP topology of t8122.dtsi that the gate
  * reuses, and PMP values. The values are made up: only their presence and
- * the PMP image UUID matter to the gate.
+ * the PMP image UUID matter to the gate. The external display processor
+ * (dcpext) of t8122-dcp.dtsi is there too, with its DARTs' 14.7 windows,
+ * but without the boot loader's firmware-ready mark: the cases that start
+ * it add the mark and its firmware versions.
  *
  * The nodes live under their own disabled bus, not /soc, so that they do
  * not collide with the T6030 test tree (both SoCs put the DCP at
@@ -88,6 +91,14 @@
 						apple,min-state = <4>;
 						apple,inherited-on;
 					};
+
+					t8122_ps_dispext_cpu: power-controller@488 {
+						compatible = "apple,t8122-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x488 4>;
+						#power-domain-cells = <0>;
+						label = "dispext_cpu";
+						apple,min-state = <4>;
+					};
 				};
 
 				t8122_pmp_dart: iommu@2d0300000 {
@@ -117,7 +128,7 @@
 						apple,always-on;
 					};
 
-					report@8 {
+					t8122_report_dispext: report@8 {
 						compatible = "apple,t8122-pmp-v2-report-entry",
 							     "apple,t6000-pmp-v2-report-entry";
 						reg = <0x8>;
@@ -176,6 +187,7 @@
 					interrupts = <0 750 4>;
 					#iommu-cells = <1>;
 					power-domains = <&t8122_ps_disp_cpu>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
 					status = "disabled";
 				};
 
@@ -186,6 +198,7 @@
 					interrupts = <0 750 4>;
 					#iommu-cells = <1>;
 					power-domains = <&t8122_ps_disp_cpu>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
 					status = "disabled";
 				};
 
@@ -206,6 +219,66 @@
 					piodma {
 						iommus = <&t8122_disp0_dart 4>;
 						apple,t8122-handoff = <1>;
+					};
+				};
+
+				t8122_dispext0_dart: iommu@319304000 {
+					compatible = "apple,t8122-dart", "apple,t8110-dart";
+					reg = <0x3 0x19304000 0x0 0x4000>;
+					interrupt-parent = <&t8122_aic>;
+					interrupts = <0 599 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x0 0x0 0xf 0xffff0000>;
+					power-domains = <&t8122_ps_dispext_cpu>;
+					status = "disabled";
+				};
+
+				t8122_dcpext_dart: iommu@31930c000 {
+					compatible = "apple,t8122-dart", "apple,t8110-dart";
+					reg = <0x3 0x1930c000 0x0 0x4000>;
+					interrupt-parent = <&t8122_aic>;
+					interrupts = <0 599 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x8 0x0 0x7 0xffff0000>;
+					power-domains = <&t8122_ps_dispext_cpu>;
+					status = "disabled";
+				};
+
+				t8122_dcpext_mbox: mailbox@31ac08000 {
+					compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+					reg = <0x3 0x1ac08000 0x0 0x4000>;
+					interrupt-parent = <&t8122_aic>;
+					interrupts = <0 582 4>, <0 583 4>, <0 584 4>, <0 585 4>;
+					interrupt-names = "send-empty", "send-not-empty",
+							  "recv-empty", "recv-not-empty";
+					#mbox-cells = <0>;
+					power-domains = <&t8122_ps_dispext_cpu>;
+					status = "disabled";
+				};
+
+				/* Stands in for the boot loader's firmware reservations. */
+				t8122_dcpext_mem: dcpext-firmware {
+				};
+
+				dcp@31ac00000 {
+					compatible = "apple,t8122-dcpext", "apple,dcpext";
+					mboxes = <&t8122_dcpext_mbox>;
+					mbox-names = "mbox";
+					iommus = <&t8122_dcpext_dart 5>;
+					reg-names = "coproc";
+					reg = <0x3 0x1ac00000 0x0 0x4000>;
+					power-domains = <&t8122_ps_dispext_cpu>;
+					apple,pmp-report = <&t8122_report_dispext>;
+					memory-region = <&t8122_dcpext_mem>;
+					status = "disabled";
+
+					piodma {
+						iommus = <&t8122_dispext0_dart 4>;
+					};
+
+					fbdma {
+						iommus = <&t8122_dispext0_dart 0>;
+						apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
 					};
 				};
 

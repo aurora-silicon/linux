@@ -79,9 +79,8 @@ const BUILDS: [fw::variant::Build; 5] = [
         ..BUILD_25G83
     },
     fw::variant::Build {
-        name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
         config: Some(&super::t6041_25g83::CONFIG),
-        ..BUILD_25G83
+        ..BUILD_25G83_32CORE
     },
     fw::variant::Build {
         config: Some(&BASE),
@@ -111,6 +110,7 @@ pub(super) const BUILD_26B123: fw::variant::Build = fw::variant::Build {
     }],
     variant: &fw::variant::Variant {
         ta_mode_1: true,
+        render_id_at_create: true,
         ..fw::variant::V26B123
     },
     config: None,
@@ -141,9 +141,10 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. Three are listed: the 32-core J616C's, which runs with
-/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
-/// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed.
+/// measurement. Four are listed: the 32-core J616C's, which runs via [`BUILD_25G83_32CORE`]
+/// with [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
+/// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed, as is the
+/// J614C's under system firmware 27.2, whose iBoot fills the same ranges.
 pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     os_version: [26, 6, 2],
     name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
@@ -187,13 +188,46 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
                 0x74, 0x0a, 0x3c, 0xcd,
             ],
         },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J614C, iBoot 27.2)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: &[[0x59839, 0x5991c]],
+            // Under system firmware 27.2 (mBoot-20457.41.3) iBoot fills the J614C's header load
+            // field and SLID record block as it does on the J575C, so they are zeroed the same way.
+            boot_filled: &[(0x224, 4), (0x59839, 0x231)],
+            text_sha256: [
+                0x1b, 0x54, 0x21, 0x51, 0x66, 0x75, 0x20, 0x5e, 0x0d, 0x90, 0x25, 0xd5, 0x5a, 0xf8,
+                0x91, 0x10, 0xe1, 0xaf, 0xdf, 0x89, 0xda, 0xdb, 0x09, 0xf4, 0x81, 0xc6, 0x3d, 0x36,
+                0x15, 0xa5, 0x2c, 0x7d,
+            ],
+        },
     ],
-    // Four clusters: the tiler segment values of 25F84 on this machine.
+    // 40-core T6041 parts (J614C, J575C) stay on TA mode 1 until clustered tiling is tested on
+    // 40-core hardware; 32-core parts run [`BUILD_25G83_32CORE`] below.
+    // T6041's 25G83 firmware emits pstate reports (tags 0x19/0x1b) and 8 ms
+    // timestamped utilisation records (tag 0x13).
     variant: &fw::variant::Variant {
         ta_mode_1: true,
+        telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
         ..fw::variant::V25G83
     },
     config: None,
+};
+
+/// 32-core T6041 (J616C) on 25G83: inherits the 25G83 image list (the 32- vs 40-core config
+/// is chosen by probed core count) and tiles clustered with the four-cluster segment words
+/// (`fw::m5::target::cluster_control`). A clustered RD32 Minecraft frame needs ~1600-2200 heap
+/// blocks, past the 0x45e normal maximum, and at that maximum a four-cluster pass never starts
+/// (reason 0 recoveries), so the heap may use every slot of the block table.
+pub(super) const BUILD_25G83_32CORE: fw::variant::Build = fw::variant::Build {
+    name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
+    variant: &fw::variant::Variant {
+        ta_mode_1: false,
+        tvb_normal_blocks: crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS,
+        ..*BUILD_25G83.variant
+    },
+    ..BUILD_25G83
 };
 
 /// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and
@@ -203,6 +237,8 @@ const CONFIG_25G83: Config = Config {
     reserved_slots: &[],
     chip: Some(&CHIP_25G83),
     firmware: fw::variant::Firmware::Identified(&[BUILD_25G83]),
+    // The GPU is restarted after a real sleep, as on the 32-core part.
+    sleep_restart: true,
     ..BASE
 };
 
@@ -372,14 +408,31 @@ const CHIP: v25g83::Chip = v25g83::Chip {
     cs_perf_table: false,
 };
 
-/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`.
+/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`, and its power configuration keeps
+/// the 25G83 starting values of the performance limiter ([`POWER_CONFIG_WORDS_25G83`]).
 ///
 /// 25F84 runs with 1 there. On 25G83 the 40-core J614C then accepts work and marks it done,
 /// but the GPU never runs it: no completion, no fault, every job times out. With 0, which is
 /// also what the J616C's 25G83 contents have, compute and render work run.
 const CHIP_25G83: v25g83::Chip = v25g83::Chip {
     hw_data_words: HW_DATA_WORDS_25G83,
+    power_config_words: POWER_CONFIG_WORDS_25G83,
     ..CHIP
+};
+
+/// [`POWER_CONFIG_WORDS`] without its first three words, `+0x0 = 1`, `+0x44 = 0xc` and
+/// `+0x9c = 338.0`.
+///
+/// They are state the firmware writes into its performance limiter while it runs (it sets
+/// `+0x44` to 0xc itself, and `+0x9c` reaches 338.0 once the limit is at its floor), measured
+/// from a running 25F84. Started with them, the 25G83 firmware lowers the limit at `+0x48`
+/// (1000 at boot) on cold GPU power-ups and never raises it again: on the 40-core J575C it
+/// reached 162 after 6,000 short Vulkan clients and the GPU ran at 46 % of its speed until a
+/// reboot. With the 25G83 starting values (`+0x44 = 1`, as the M4 Pro and the J616C run),
+/// the limit stays at 1000.
+const POWER_CONFIG_WORDS_25G83: &[(usize, u32, usize)] = match POWER_CONFIG_WORDS {
+    [(0x0, 0x1, 1), (0x44, 0xc, 1), (0x9c, 0x43a9_0000, 1), rest @ ..] => rest,
+    _ => panic!("the first T6041 power configuration words must be +0x0, +0x44 and +0x9c"),
 };
 
 /// [`HW_DATA_WORDS`] without its last word, `+0x2610 = 1`.

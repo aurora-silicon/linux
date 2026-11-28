@@ -27,6 +27,7 @@
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/overflow.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -181,7 +182,7 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 	}
 
 static const struct ave_mctf_layout ave_mctf_layouts[] = {
-	/* MacBook Neo (T8140), AppleAVE2FW 9003.78.0: captured at 1080p */
+	/* MacBook Neo (T8140), encoder firmware 9003.78.0: captured at 1080p */
 	AVE_MCTF_25G83(AVE_FW_TEXT_CRC_9003_78_0, true),
 	/* M4 Pro (T6040): same carrier sizes, no capture yet */
 	AVE_MCTF_25G83(AVE_FW_TEXT_CRC_T6040_25G83, false),
@@ -366,6 +367,27 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 }
 
 /*
+ * Whether a picture of @bytes starting at @data_offset fits in a plane of
+ * @plane_size bytes. vb2 only keeps data_offset below bytesused, and both
+ * are u32, so their sum is taken without wrapping.
+ */
+bool ave_mctf_input_fits(size_t plane_size, u32 data_offset, size_t bytes)
+{
+	size_t end;
+
+	return !check_add_overflow((size_t)data_offset, bytes, &end) &&
+	       end <= plane_size;
+}
+
+/* The bytes ave_mctf_put_picture() reads from an OUTPUT plane of format @f. */
+size_t ave_mctf_input_bytes(const struct v4l2_pix_format_mplane *f)
+{
+	if (f->pixelformat == V4L2_PIX_FMT_APPLE_L8V0)
+		return f->plane_fmt[0].sizeimage;
+	return (size_t)f->plane_fmt[0].bytesperline * f->height * 3 / 2;
+}
+
+/*
  * Fill input surface @n from @src: a lossless picture as it is, an NV12
  * picture written with every tile raw. The
  * conversion runs in cached memory; the DMA surfaces see only bulk copies.
@@ -377,22 +399,21 @@ static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src
 	const struct ave_cmp420_geom *g = &sess->mctf_geom;
 	const struct ave_params *p = &sess->p;
 	size_t luma = (size_t)p->stride * p->height;
+	bool lossless = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0;
+	size_t bytes = lossless ? g->bytes : luma * 3 / 2;
+	u32 off = src->vb2_buf.planes[0].data_offset;
 	u8 *to = sess->mctf_in[n].cpu;
 	const u8 *from = vb2_plane_vaddr(&src->vb2_buf, 0);
 
 	if (!to || !from || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
-	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0) {
-		if (src->vb2_buf.planes[0].data_offset + g->bytes >
-		    vb2_plane_size(&src->vb2_buf, 0))
-			return -EINVAL;
-		memcpy(to, from + src->vb2_buf.planes[0].data_offset, g->bytes);
+	if (!ave_mctf_input_fits(vb2_plane_size(&src->vb2_buf, 0), off, bytes))
+		return -EINVAL;
+	from += off;
+	if (lossless) {
+		memcpy(to, from, g->bytes);
 		return 0;
 	}
-	if (src->vb2_buf.planes[0].data_offset + luma * 3 / 2 >
-	    vb2_plane_size(&src->vb2_buf, 0))
-		return -EINVAL;
-	from += src->vb2_buf.planes[0].data_offset;
 	memcpy(sess->mctf_lin, from, luma * 3 / 2);
 	ave_cmp420_pack(g, sess->mctf_surf, sess->mctf_lin, sess->mctf_lin + luma,
 			p->stride);

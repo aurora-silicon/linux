@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Owned J713 initdata: 31 inventory objects, 12 submit channel pairs and the
-//! exact 42-entry MMIO loader. All bytes are encoded in fresh GEM backing before
-//! the boot owner publishes a root or loader address. Firmware-reachable
-//! backing and mappings are retained by `Objects` until reboot.
+//! exact MMIO register map, in the layout of the admitted firmware's ABI. All bytes are
+//! encoded in fresh GEM backing before the boot owner publishes a root or loader address.
+//! Firmware-reachable backing and mappings are retained by `Objects` until reboot.
 
 use kernel::{device, prelude::*, sync::Arc};
 
 use super::adt::GpuAdt;
 use super::board;
+use super::boot::glue;
 use super::channel::{Channels, Ring};
-use super::fw::initdata::{self as wire, control, globals, id, ready_control};
-use super::hw;
+use super::fw::initdata::{self as wire, id, ready_control};
+use super::hw::{self, FwAbi};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 
 /// Firmware graph handles. The small root.Control and large FirmwareData are
 /// intentionally separate: only the former carries the READY acknowledgement.
 pub(crate) struct InitData {
+    /// The firmware ABI these objects were encoded for.
+    pub(crate) abi: FwAbi,
+    pub(crate) layout: &'static wire::Layout,
     pub(crate) globals: Option<Arc<FwObject>>,
     /// Recovery/scheduler owner: root.FirmwareData, not the small Control.
     pub(crate) control: Option<Arc<FwObject>>,
@@ -38,7 +42,10 @@ pub(crate) struct InitData {
     #[allow(dead_code)]
     pub(crate) parameter: Arc<FwObject>,
     root: Arc<FwObject>,
-    loader: [u8; wire::LOADER_BYTES],
+    /// Rows of the board's firmware performance table, including off.
+    pub(crate) rows: u32,
+    /// The register-map records, slot 0 through the highest filled one.
+    loader: KVec<u8>,
     /// The complete inventory, including firmware-only log and retention data.
     _graph: KVec<Arc<FwObject>>,
 }
@@ -48,14 +55,24 @@ impl InitData {
         Ok(self.root.va)
     }
 
-    /// Exact Main loader records which the boot owner publishes to firmware DATA.
-    pub(crate) fn loader_bytes(&self) -> &[u8; wire::LOADER_BYTES] {
+    /// Exact Main register-map records, which the boot owner publishes to firmware DATA when
+    /// the layout has the host write them.
+    pub(crate) fn loader_bytes(&self) -> &[u8] {
         &self.loader
+    }
+
+    /// The FirmwareData words of this ABI.
+    pub(crate) fn firmware_data(&self) -> &'static wire::FirmwareData {
+        &self.layout.firmware_data
     }
 
     /// A phase 1 or 3 stop is owned by the M4 recovery handshake.
     pub(crate) fn halted(&self) -> Result<bool> {
-        let phase = self.control.as_ref().ok_or(ENODEV)?.r32(control::PHASE)?;
+        let phase = self
+            .control
+            .as_ref()
+            .ok_or(ENODEV)?
+            .r32(self.firmware_data().phase)?;
         Ok(phase == 1 || phase == 3)
     }
 
@@ -69,23 +86,34 @@ impl InitData {
 }
 
 fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
-    Ring {
-        state: graph[state].clone(),
-        ring: graph[ring].clone(),
-    }
+    Ring::new(
+        graph[state].clone(),
+        graph[ring].clone(),
+        wire::TxLayout::StateBlock,
+        false,
+    )
 }
 
 /// Builds the complete unpublished M4 graph. The return shape is shared with
 /// the other backend, while all object layouts and policy are M4-specific.
+#[inline(never)]
 pub(crate) fn build(
     dev: &device::Device,
     adt: &GpuAdt,
+    cfg: &super::Config,
+    regs: &super::regs::Regs,
+    enabled_cores: u32,
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
+    let abi = adt.layout.abi;
+    let layout = adt.layout.initdata;
     let performance = board::qualify(dev, adt)?;
-    let max_khz = performance.frequency[wire::PERF_STATES - 1] * 1000;
+    // The top row of the qualified table, excluding the off state.
+    let ceiling = performance.count as u32 - 1;
+    let rows = performance.count as u32;
+    let max_khz = performance.frequency[ceiling as usize] * 1000;
     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
-    for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
+    for (i, size) in layout.object_size.iter().copied().enumerate() {
         let lower = match i {
             id::UMA => Some(wire::BOOTSTRAP_START),
             id::PARAMETER => Some(wire::BOOTSTRAP_START + 0x8000),
@@ -125,17 +153,91 @@ pub(crate) fn build(
     }
     let channels = Channels::alloc_submit_and_attach(
         objects,
-        pair(&graph, id::DEVCTRL_STATE, id::DEVCTRL_RING),
+        layout.tx,
+        Ring::new(
+            graph[id::DEVCTRL_STATE].clone(),
+            graph[id::DEVCTRL_RING].clone(),
+            layout.tx,
+            true,
+        ),
         pair(&graph, id::EVENT_STATE, id::EVENT_DATA),
         pair(&graph, id::LOG_STATE, id::LOG_ENTRIES),
+        graph[id::LOG_DATA].clone(),
         pair(&graph, id::KTRACE_STATE, id::KTRACE_DATA),
         pair(&graph, id::STATISTICS_STATE, id::STATISTICS_DATA),
         // FWCTL state and ring share one allocation (ring starts at+0x40).
         // The host never posts on this firmware-only control channel.
         pair(&graph, id::FWCTL, id::FWCTL),
     )?;
+    // The GPU power sample period: `gpu-pwr-sample-period-aic-clks` gives the exact hardware
+    // sample period in system-counter ticks (e.g. 200000 ticks at 24 MHz = 8333 us), whereas
+    // `gpu-power-sample-period` is the coarse truncated integer millisecond period (8 ms).
+    // Power config +4/+8 take the exact AIC ticks; the us sampling slots and average-power
+    // filter sample count use the exact us period, while the low-peak (PPM) limiter filter
+    // uses the coarse ms period, matching `drivers/gpu/drm/asahi/initdata.rs`.
+    let timebase_hz = glue::timebase_hz();
+    let timebase_khz = timebase_hz / 1000;
+    let Some(power_sample_clks) = adt.performance.power_sample_clks else {
+        dev_err!(
+            dev,
+            "G16: the ADT gives no GPU power sample period (gpu-pwr-sample-period-aic-clks)\n"
+        );
+        return Err(EINVAL);
+    };
+    let power_sample_us = (u64::from(power_sample_clks) * 1_000_000)
+        .checked_div(u64::from(timebase_hz))
+        .and_then(|us| u32::try_from(us).ok())
+        .unwrap_or(0);
+    let power_sample_period_ms = adt.performance.power_sample_period_ms.unwrap_or(0);
+    let avg_power_filter_tc_ms = adt.performance.avg_power_filter_tc_ms.unwrap_or(0);
+    let lowpeak_limiter_tc_ms = adt.performance.lowpeak_limiter_tc_ms.unwrap_or(0);
+    let lowpeak_limiter_ki_q16 = adt.performance.lowpeak_limiter_ki_q16.unwrap_or(0);
+    let lowpeak_limiter_kp_q16 = adt.performance.lowpeak_limiter_kp_q16.unwrap_or(0);
+    if layout.power_sampling.is_some() && (power_sample_us == 0 || avg_power_filter_tc_ms == 0) {
+        dev_err!(
+            dev,
+            "G16: the ADT lacks GPU power sampling parameters (power_sample_us={}, cpu-avg-limiter-input-tc={})\n",
+            power_sample_us,
+            avg_power_filter_tc_ms
+        );
+        return Err(EINVAL);
+    }
+    if layout.power_limiter.is_some()
+        && (power_sample_period_ms == 0
+            || timebase_khz == 0
+            || lowpeak_limiter_tc_ms == 0
+            || lowpeak_limiter_ki_q16 == 0
+            || lowpeak_limiter_kp_q16 == 0)
+    {
+        dev_err!(
+            dev,
+            "G16: the ADT lacks GPU low-peak power limiter parameters (period_ms={}, tc_ms={}, ki={}, kp={})\n",
+            power_sample_period_ms,
+            lowpeak_limiter_tc_ms,
+            lowpeak_limiter_ki_q16,
+            lowpeak_limiter_kp_q16
+        );
+        return Err(EINVAL);
+    }
+    let coredump_copy_size = u64::from(adt.performance.coredump_copy_size.unwrap_or(0));
+    if layout.coredump_copy.is_some() && coredump_copy_size == 0 {
+        dev_err!(
+            dev,
+            "G16: the ADT gives no GPU crash copy buffer size (coredump-copy-buffer)\n"
+        );
+        return Err(EINVAL);
+    }
     let mut input = wire::Input {
         performance,
+        power_sample_clks,
+        power_sample_us,
+        power_sample_period_ms,
+        timebase_khz,
+        avg_power_filter_tc_ms,
+        lowpeak_limiter_tc_ms,
+        lowpeak_limiter_ki_q16,
+        lowpeak_limiter_kp_q16,
+        coredump_copy_size,
         va: [0; wire::OBJECT_COUNT],
         channel_state: [0; 12],
         channel_ring: [0; 12],
@@ -145,6 +247,7 @@ pub(crate) fn build(
         lower_parameter: wire::BOOTSTRAP_START + 0x8000,
         ktrace_mask: 0,
         progress_recovery: 1,
+        enabled_cores,
     };
     for i in 0..wire::OBJECT_COUNT {
         input.va[i] = graph[i].va;
@@ -153,28 +256,38 @@ pub(crate) fn build(
         input.channel_state[i] = channels.submit[i].state.va;
         input.channel_ring[i] = channels.submit[i].ring.va;
     }
-    for (slot, entry) in wire::LOADERS.iter().enumerate() {
-        if entry.length == 0 {
+    for (slot, entry) in layout.loaders.iter().enumerate() {
+        // An empty record, or one this ABI has no slot for, is neither mapped nor described.
+        if entry.length == 0 || layout.slot(slot).is_none() {
             continue;
         }
         let offset = entry.pa & (wire::PAGE - 1);
         let at =
             objects.reserve_io((offset + u64::from(entry.length)).next_multiple_of(wire::PAGE))?;
         input.loader_va[slot] = at + offset;
-        for bank in 0..if slot == 3 { 2 } else { 1 } {
-            let (pa, size, delta) = wire::loader_span(slot, bank).map_err(|()| EINVAL)?;
+        for bank in 0..entry.banks() {
+            let (pa, size, delta) = entry.span(bank).map_err(|()| EINVAL)?;
             objects.map_mmio_class(at + u64::from(delta), pa, u64::from(size), entry.attrs)?;
         }
     }
-    input.scratch = objects.reserve_io(0x8000)?;
-    // This scratch alias deliberately has firmware RAM attrs, matching the
-    // qualified owner, even though the target is an SGX register window.
-    objects.map_mmio_class(input.scratch, 0x300d60000, 0x8000, hw::pte::FW)?;
+    let scratch = &adt.layout.scratch;
+    let &(last, _, bytes) = scratch.spans.last().ok_or(EINVAL)?;
+    let at = objects.reserve_io(last + bytes)?;
+    input.scratch = at + scratch.pointer;
+    // The scratch alias uses firmware RAM attributes on these SGX registers.
+    for &(va_offset, pa_offset, bytes) in scratch.spans {
+        objects.map_mmio_class(
+            at + va_offset,
+            regs.sgx_pa() + scratch.register + pa_offset,
+            bytes,
+            hw::pte::FW,
+        )?;
+    }
 
     // Private CPU-side staging keeps the pure encoder independent of raw GEM
     // pointers. No staging references survive publication.
     let mut images = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
-    for size in wire::OBJECT_SIZE {
+    for size in layout.object_size {
         images.push(KVVec::from_elem(0u8, size, GFP_KERNEL)?, GFP_KERNEL)?;
     }
     {
@@ -184,22 +297,36 @@ pub(crate) fn build(
         }
         let array: &mut [&mut [u8]; wire::OBJECT_COUNT] =
             (&mut slices[..]).try_into().map_err(|_| EINVAL)?;
-        wire::encode(array, &input, 9).map_err(|()| EINVAL)?;
+        wire::encode_for(layout, array, &input, ceiling).map_err(|()| EINVAL)?;
     }
-    let mut loader = [0u8; wire::LOADER_BYTES];
-    loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);
-    // Host startup policy: Main and PowerPerformance contain S9, but the
+    let records = layout.loader_records();
+    let mut loader = KVec::with_capacity(records * wire::LOADER_STRIDE, GFP_KERNEL)?;
+    loader.extend_from_slice(
+        images[id::MAIN]
+            .get(0x640..0x640 + records * wire::LOADER_STRIDE)
+            .ok_or(EINVAL)?,
+        GFP_KERNEL,
+    )?;
+    // Host startup policy: Main and PowerPerformance contain the top row, but the
     // published selectors remain S1 until the thermal owner admits a raise.
-    for at in globals::PSTATE_SELECTORS {
+    for at in layout.pstate_selectors {
         images[id::GLOBALS][at..at + 4].copy_from_slice(&100u32.to_le_bytes());
     }
     for i in 0..wire::OBJECT_COUNT {
         graph[i].write(0, &images[i])?;
     }
 
-    dev_info!(dev, "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S9 tables)\n");
+    dev_info!(
+        dev,
+        "M4 initdata ({}): 31 objects, 12 submit channel pairs, {} register-map slots, S1 startup (S{} tables)\n",
+        layout.name,
+        records,
+        ceiling
+    );
     Ok((
         InitData {
+            abi,
+            layout,
             globals: Some(graph[id::GLOBALS].clone()),
             control: Some(graph[id::FIRMWARE_DATA].clone()),
             ready_control: Some(graph[id::CONTROL].clone()),
@@ -213,6 +340,7 @@ pub(crate) fn build(
             uma: graph[id::UMA].clone(),
             parameter: graph[id::PARAMETER].clone(),
             root: graph[id::ROOT].clone(),
+            rows,
             loader,
             _graph: graph,
         },

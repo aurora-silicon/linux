@@ -1146,6 +1146,27 @@ static bool cd321x_identity_known(const struct usb_pd_identity *id)
 static void cd321x_macos_usbw(struct cd321x *cd321x);
 static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role);
 
+/*
+ * DisplayPort pin D comes to a connection whose USB 3 already runs: the partner entered the
+ * mode after the port's first update had set it up for USB. A lane provider that adds pin D
+ * beside a running USB 3 link (typec_mux_dp_joins_usb()) gets the change with the USB role
+ * kept, as macOS keeps the port's host running there and only adds the display. Every other
+ * mode change stops the role first.
+ */
+static bool cd321x_dp_joins_usb(struct cd321x *cd321x, const struct cd321x_status *st)
+{
+	u32 ds = st->data_status;
+
+	return cd321x->state_valid && !cd321x->state.alt &&
+	       cd321x->state.mode == TYPEC_STATE_USB &&
+	       (ds & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	       (ds & TPS_DATA_STATUS_DP_CONNECTION) &&
+	       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(ds) ==
+		       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_D &&
+	       !(st->data_status_changed & TPS_DATA_STATUS_USB3_CONNECTION) &&
+	       typec_mux_dp_joins_usb(cd321x->mux);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1248,6 +1269,10 @@ static void cd321x_update_work(struct work_struct *work)
 	if (!new_connected)
 		reset |= CD321X_DP_RESET_UNPLUG;
 
+	/* DisplayPort pin D joining the running USB 3 link keeps the role. */
+	bool dp_joins = dp_mode_changed && !was_disconnected && new_role == old_role &&
+			cd321x_dp_joins_usb(cd321x, &st);
+
 	/* A new DP connection: its DP status counts once one is signalled. */
 	if (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)
 		cd321x->dp_sid_valid = false;
@@ -1298,7 +1323,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If we are switching from an active role, transition to USB_ROLE_NONE. */
 	if (old_role != USB_ROLE_NONE &&
-	    (new_role != old_role || was_disconnected || dp_mode_changed)) {
+	    (new_role != old_role || was_disconnected || (dp_mode_changed && !dp_joins))) {
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
@@ -1415,6 +1440,16 @@ static void cd321x_update_work(struct work_struct *work)
 			goto retry;
 	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	/*
+	 * A provider failed the change with the role kept: stop the role and set the mode
+	 * again, as for any other mode change.
+	 */
+	if (ret && dp_joins && !display_busy && !held) {
+		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+		if (ret)
+			goto retry;
+		ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	}
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
@@ -2811,21 +2846,13 @@ VISIBLE_IF_KUNIT int cd321x_reboot_notify(struct notifier_block *nb,
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_notify);
 
-/* Separate so that the KUnit tests can choose the driver core's answer. */
-VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
-{
-	KUNIT_STATIC_STUB_REDIRECT(cd321x_tbt_switch_keep_waiting, dev);
-
-	return driver_deferred_probe_check_state(dev) == -EPROBE_DEFER;
-}
-EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
-
 /*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
  * comes up. If its driver is not built or has not bound yet, do not leave power
- * delivery, USB and DisplayPort on this port without a driver as well: stop
- * waiting for the router when the driver core stops waiting for missing
- * dependencies. The router can still bind later, so set @late to take it then.
+ * delivery, USB and DisplayPort on this port without a driver as well. The port
+ * takes the router whenever it binds (set @late), so it does not wait for it:
+ * waiting for the driver core to give up on a router that is not built delays
+ * every port by the deferred probe timeout.
  */
 VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
@@ -2835,7 +2862,7 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 
 	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
-	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
+	if (sw != ERR_PTR(-EPROBE_DEFER))
 		return sw;
 
 	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it until it binds\n");
@@ -2845,9 +2872,9 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
 /*
- * Take a router that bound after the port gave up on it, or that unbound and
- * bound again. An attached cable raises no new event, so reapply it through
- * the router as after system sleep.
+ * Take a router that bound after the port probed without it, or that unbound
+ * and bound again. An attached cable raises no new event, so reapply it
+ * through the router as after system sleep.
  */
 static void cd321x_tbt_attach_work(struct work_struct *work)
 {
@@ -3554,33 +3581,38 @@ static int cd321x_remove(struct tps6598x *tps)
 }
 
 /*
- * Boards whose inherited boot connection must be renegotiated. The port
- * controller key is the reversed target identifier.
- *
- * J716c: the boot port keeps a USB2 repeater connection.
- * J575c: a connection that was up before Linux keeps its Type-C retimer set up
- * from before the host PHY ran, so SuperSpeed stays in RxDetect until the
- * partner is replugged. Byte 7 of register 0x7e has bit 3 set once the
- * controller has completed an attach with the OS running (after a replug, and
- * under macOS) and bit 2 in the inherited state; renegotiate only without
- * bit 3. A failure leaves the port as it was (USB2 only) instead of failing
- * the probe.
+ * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
+ * number reversed).
  */
-#define CD321X_ATTACH_STATE_REG		0x7e
-#define CD321X_ATTACH_STATE_BYTE	7
-#define CD321X_ATTACH_STATE_DONE	BIT(3)
+static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
+{
+	const char *s;
 
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
+		return -EOPNOTSUPP;
+	memcpy(key, s, 4);
+	return 0;
+}
+
+/*
+ * A connection that was up before Linux keeps state from the boot chain: a USB2 repeater
+ * connection on the J716c boot port, or on the J575c a Type-C retimer set up before the host PHY
+ * ran, so SuperSpeed stays in RxDetect until the partner is replugged. The controller reports
+ * nothing that tells such a connection apart from one that trains, so every one is renegotiated.
+ *
+ * The renegotiation's DISC takes the controller unlocked with the board's LOCK key, the board
+ * number reversed. A port whose DT gives it (apple,debug-lock-key) is left as it was if the
+ * renegotiation fails. The J716c's DT does not give it yet: its key is here, and a failure there
+ * fails the probe.
+ */
 struct cd321x_inherited_board {
 	const char *compatible;
 	u8 key[4];
-	bool check_attach_state;
-	bool best_effort;
 };
 
 static const struct cd321x_inherited_board cd321x_inherited_boards[] = {
 	{ .compatible = "apple,j716c", .key = { '6', '1', '7', 'J' } },
-	{ .compatible = "apple,j575c", .key = { '5', '7', '5', 'J' },
-	  .check_attach_state = true, .best_effort = true },
 };
 
 static const struct cd321x_inherited_board *cd321x_inherited_board(void)
@@ -3593,21 +3625,7 @@ static const struct cd321x_inherited_board *cd321x_inherited_board(void)
 	return NULL;
 }
 
-static int cd321x_attach_state_done(struct tps6598x *tps)
-{
-	u8 state[CD321X_ATTACH_STATE_BYTE + 1];
-	int ret;
-
-	ret = tps6598x_block_read(tps, CD321X_ATTACH_STATE_REG, state, sizeof(state));
-	if (ret)
-		return ret;
-	dev_dbg(tps->dev, "inherited connection, attach state 0x%02x\n",
-		state[CD321X_ATTACH_STATE_BYTE]);
-	return !!(state[CD321X_ATTACH_STATE_BYTE] & CD321X_ATTACH_STATE_DONE);
-}
-
-static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
-						const struct cd321x_inherited_board *board,
+static int __cd321x_reset_inherited_connection(struct tps6598x *tps, const u8 key[4],
 						u32 *status)
 {
 	static const u8 locked[4];
@@ -3618,15 +3636,9 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
 	mode = tps6598x_check_mode(tps);
 	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
 		return 0;
-	if (board->check_attach_state) {
-		ret = cd321x_attach_state_done(tps);
-		if (ret)
-			return ret < 0 ? ret : 0;
-	}
 
 	/* All suppliers are available, but no USB or router session has started. */
-	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(board->key), board->key, sizeof(result),
-				&result);
+	ret = tps6598x_exec_cmd(tps, "LOCK", 4, key, sizeof(result), &result);
 	if (ret)
 		return ret;
 	if (result) {
@@ -3669,6 +3681,8 @@ relock:
 static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 {
 	const struct cd321x_inherited_board *board;
+	bool best_effort = true;
+	u8 key[4];
 	int ret;
 
 	if (!device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection") ||
@@ -3676,12 +3690,19 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	    tps->dbma_at_probe || !(*status & TPS_STATUS_PLUG_PRESENT) ||
 	    !TPS_STATUS_TO_TYPEC_DATAROLE(*status))
 		return 0;
-	board = cd321x_inherited_board();
-	if (!board)
-		return 0;
+	if (tipd_replug_key(tps, key)) {
+		board = cd321x_inherited_board();
+		if (!board) {
+			dev_warn(tps->dev,
+				 "inherited connection not reinitialized: no apple,debug-lock-key\n");
+			return 0;
+		}
+		memcpy(key, board->key, sizeof(key));
+		best_effort = false;
+	}
 
-	ret = __cd321x_reset_inherited_connection(tps, board, status);
-	if (!ret || !board->best_effort)
+	ret = __cd321x_reset_inherited_connection(tps, key, status);
+	if (!ret || !best_effort)
 		return ret;
 
 	dev_warn(tps->dev, "inherited connection not reinitialized: %d\n", ret);
@@ -3716,21 +3737,6 @@ static void tipd_port_list_del(struct tps6598x *tps)
 	list_del_init(&tps->port_node);
 	mutex_unlock(&tipd_ports_lock);
 	cancel_work_sync(&tps->replug_work);
-}
-
-/*
- * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
- * number reversed).
- */
-static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
-{
-	const char *s;
-
-	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
-	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
-		return -EOPNOTSUPP;
-	memcpy(key, s, 4);
-	return 0;
 }
 
 bool tipd_replug_supported(struct tps6598x *tps)

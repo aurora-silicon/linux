@@ -482,11 +482,12 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
 			return ret;
-	} else if (dptx->lane_count < lane_count &&
-		   !(dcp_is_t8132_ext(dcp) && dcp_is_usb4_output(dcp))) {
+	} else if (dptx->lane_count < lane_count && !dcp_is_usb4_output(dcp) &&
+		   dcp->dptx_phy <= 3) {
 		/*
-		 * A T8132 tunnel has no PHY lanes to check: its lane count
-		 * is the tunnel's, and lane_count holds the previous active one.
+		 * A DP tunnel or a fixed non-ATC-PHY output (dptx_phy > 3) has
+		 * no ATC PHY lanes to check: its lane count is accepted below,
+		 * and lane_count holds the previous active one.
 		 */
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
@@ -685,6 +686,14 @@ unsupported:
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
+			/*
+			 * A dcpext takes its link down (rate 0) when its HPD goes
+			 * low, and its ATC PHY may have left DP mode already: the
+			 * link is down then. Refused, the firmware waits on this
+			 * call and answers nothing else, the HPD low among them.
+			 */
+			if (ret == -EOPNOTSUPP && !phy_link_rate)
+				ret = 0;
 			if (ret)
 				return ret;
 		}
@@ -978,7 +987,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		lc->lane_count = cpu_to_le64(dptx->lane_count);
 		return 0;
 	}
-        case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
+	case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
 		return dptxport_call_link_config(service, true, data, data_size,
 						 reply, reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_HPD:
@@ -1051,7 +1060,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 						     reply, reply_size);
 		return dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
-        case DPTX_APCALL_ACTIVATE:
+	case DPTX_APCALL_ACTIVATE:
 		return dptxport_call_activate(service, data, data_size,
 					      reply, reply_size);
 	case DPTX_APCALL_DEACTIVATE:
@@ -1658,7 +1667,16 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
 			 * up so a later announce can still bind.
 			 */
-			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp)) {
+			/*
+			 * A firmware-27 external processor, or a firmware-27
+			 * DCP with Type-C routes, whose ports are not on this
+			 * endpoint announces nothing here either (a 27.2 DCP on
+			 * DPTX_ENDPOINT_V2 where its firmware does not advertise
+			 * DPTX_ENDPOINT, see dcp_v27_dptx_layout()).
+			 */
+			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp) ||
+			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			     (dcp->dcpext || dcp->nr_typec_routes))) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;

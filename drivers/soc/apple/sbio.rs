@@ -2552,11 +2552,11 @@ impl SepData {
     }
 
     /// Whether the verify this work item runs is still wanted: not cancelled,
-    /// not ended by a suspend and not closed.
+    /// not ended by a suspend and not closed, and, for a touch-gated
+    /// `/dev/sep-key` call, not given up for `/dev/sep-bio` (see
+    /// [`Self::capture_live`]).
     fn verify_wanted(&self) -> bool {
-        !self.shutting_down.load(Relaxed)
-            && ((self.key_touch_active.load(Relaxed) && !self.key_touch_cancel.load(Relaxed))
-                || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)))
+        !self.shutting_down.load(Relaxed) && self.capture_live()
     }
 
     // Every verify registers the sensor again. On a profile with a nonce
@@ -2819,12 +2819,14 @@ impl SepData {
                 VERIFY_RETRY_LIMIT
             );
         }
-        // macOS hands a no-match to LocalAuthentication as soon as the touch
-        // is finished (MATCH_POLICY and the image cleanup done), and saves the
+        // macOS hands a result to LocalAuthentication as soon as the touch is
+        // finished (MATCH_POLICY and the image cleanup done), and saves the
         // lockout record and collects the background result after it, while
         // the person lifts the finger. Do the same: the next verify waits for
         // this worker, so the bookkeeping below still precedes its capture.
-        let reported_early = matches!(outcome, bio::VerifyOutcome::NoMatch);
+        // A no-match has nothing to persist. A match is reported below, once
+        // MATCH_CANCEL and the unlock evaluation are done.
+        let mut reported_early = matches!(outcome, bio::VerifyOutcome::NoMatch);
         if reported_early {
             self.finish_verify(bio::VerifyOutcome::NoMatch, token_bytes);
         }
@@ -2864,9 +2866,23 @@ impl SepData {
                 Some(context) => drop(context),
                 None => self.close_unlock_evaluation(&evaluation),
             }
-            if key_mode && matched {
+            if key_mode && matched && !self.key_context_failed.load(Relaxed) {
                 self.key_touch_after_close(&evaluation);
             }
+        }
+        // A match is reported as soon as the enclave matched and the unlock
+        // evaluation is satisfied, before the lockout record and the template
+        // persistence, as macOS hands it to LocalAuthentication at that point.
+        // The worker still completes both below, and the next verify waits for
+        // it; a failure sets persistence_owed so it precedes the next capture.
+        // /dev/sep-key results stay with their job: its signature is not done.
+        if !key_mode && matches!(outcome, bio::VerifyOutcome::Matched(_)) {
+            dev_info_ratelimited!(
+                self.dev,
+                "verify: the match is reported before the post-result state is persisted\n"
+            );
+            reported_early = true;
+            self.finish_verify(outcome.clone(), token_bytes);
         }
         // macOS saves the enclave's lockout record once after every answered
         // result (SAVE_LOCKOUT, kept on disk for the boot's LOAD_LOCKOUT),
@@ -2888,12 +2904,21 @@ impl SepData {
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
         ) {
             // A template update must be persisted (user, then master) before a
-            // match is reported.
+            // match is reported, unless the match has already been handed to
+            // userspace; then the next verify persists it before its capture.
             if !self.await_and_handle_bg_ops(c"after a match result", BG_OPS_WAIT_MS)
                 && matches!(outcome, bio::VerifyOutcome::Matched(_))
             {
-                dev_err_ratelimited!(self.dev, "verify: the background result was not handled; not reporting this verify as a match\n");
-                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+                if reported_early {
+                    dev_err_ratelimited!(
+                        self.dev,
+                        "verify: the background result after the reported match was not handled; the next verify persists it before the capture\n"
+                    );
+                    self.persistence_owed.store(true, Relaxed);
+                } else {
+                    dev_err_ratelimited!(self.dev, "verify: the background result was not handled; not reporting this verify as a match\n");
+                    outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+                }
             }
         }
         // Keep the sensor up for the next verify unless the sensor itself
@@ -2969,7 +2994,7 @@ impl SepData {
                 if reported_early {
                     dev_err_ratelimited!(
                         self.dev,
-                        "verify: the state after the reported no-match was not persisted; the next verify persists it first\n"
+                        "verify: the state after the reported result was not persisted; the next verify persists it first\n"
                     );
                     self.persistence_owed.store(true, Relaxed);
                 } else {
@@ -3046,10 +3071,9 @@ impl SepData {
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             CaptureWait::Abandon => {
-                // A cancelled verify also abandons; only a live one is a fault.
-                if self.key_touch_active.load(Relaxed)
-                    || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
-                {
+                // A cancelled or given-up capture also abandons; only one
+                // still wanted is a fault.
+                if self.capture_live() {
                     dev_err_ratelimited!(
                         self.dev,
                         "verify: the sensor status became unreadable during the capture\n"

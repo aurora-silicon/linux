@@ -32,6 +32,10 @@ properties:
           - apple,t8103-usb4-dart
           - apple,t8110-dart
           - apple,t6000-dart
+          - apple,t8152-dart-gen3
+          - apple,t8152-acio-dart
+          - apple,t8152-pciec-dart
+          - apple,t8152-avd-dart
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -70,12 +74,23 @@ properties:
       normal streams and their exact-RID entries may be adopted by the OS.
       Other streams and RID entries remain inherited. The documented static
       SID16 bypass role may be initialized only from a disabled stream with
-      no valid root; an existing bypass remains unchanged. PIODMA and other
+      no valid root; an existing bypass remains unless apple,sid16-page
+      narrows it to one page. PIODMA and other
       reserved roles are not modified. This does not authorize a controller
       reset or takeover of active page tables. Both the radio DART and PCI
       host describe the same two ordinary streams. Error reporting must
       already be unmasked at admission; the OS preserves the inherited global
       error-mask policy rather than changing it for these streams.
+
+  apple,sid16-page:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Physical address of the one 16 KiB page the radio's static SID16
+      stream needs to reach. When present, the OS translates SID16 through a
+      table that maps only this page, identity, instead of keeping its
+      bypass. It applies only with apple,managed-sids, when the DART is
+      admitted as the managed radio DART. It must be 16 KiB aligned and below
+      2^36.
 
   reg:
     minItems: 1
@@ -87,13 +102,16 @@ properties:
           fabric filter (GAPF) that protects the power state of the
           coprocessor CPU behind this DART, cleared to power that CPU down,
           or the shared PS write-disable register that holds this DART's
-          bit for the same purpose (T8142)
+          bit for the same purpose (T8142), or on a T8152 Gen3 DART its
+          window in the SoC's TLB invalidation aperture (ADT
+          dart-tlbi-aperture plus tlbi-aperture-offset), which the Gen3
+          DARTs share
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, gapf, ps-wr-dis, auxiliary]
+      - enum: [dapf, gapf, ps-wr-dis, auxiliary, tlbi]
 
   interrupts:
     maxItems: 1
@@ -320,6 +338,17 @@ properties:
       and filtering state without a separate page-table root. Source and
       destination must differ, and both must exist on the controller.
 
+  apple,retain-translation:
+    type: boolean
+    description: >
+      The bootloader hands this DART over translating, with stream page
+      tables that a co-processor's firmware keeps using, but without setting
+      the hardware lock. The operating system then treats the DART as locked:
+      it does not reset it or replace the inherited stream roots, adds its
+      own mappings only in root entries that are empty at handoff, and on
+      detach clears only the entries it added. The entries present at handoff
+      stay owned by the firmware, which may keep using them at any time.
+
 required:
   - compatible
   - reg
@@ -328,6 +357,7 @@ required:
 
 dependencies:
   apple,gapf-slice-values: [ 'apple,gapf-slice' ]
+  apple,sid16-page: [ 'apple,managed-sids' ]
 
 allOf:
   - if:
@@ -350,6 +380,68 @@ allOf:
     then:
       required:
         - reg-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8152-dart-gen3
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
+              - apple,t8152-avd-dart
+    then:
+      description:
+        The T8152 Gen3 DARTs in front of the display coprocessors and their
+        display pipes belong to the SPTM. The bootloader hands them over
+        locked, and the operating system only adds page table entries in
+        root slots that are empty at handoff. Their TLB command register
+        answers translation queries; a stream is invalidated through the
+        TLB invalidation aperture instead. The DARTs of the rear USB4
+        routers (ACIO NHI streams) and of their PCIe-C tunnels use the same
+        invalidation aperture, each at its own slot, but start unlocked with
+        inactive streams and are initialized by the operating system.
+        The T8152 AVD instance uses the same aperture, starts unlocked with
+        inactive streams and is initialized after its PSD domain is on.
+      properties:
+        reg:
+          minItems: 2
+        reg-names:
+          items:
+            - const: dart
+            - const: tlbi
+      required:
+        - reg-names
+    else:
+      properties:
+        reg-names:
+          minItems: 1
+          items:
+            - const: dart
+            - enum: [dapf, gapf, ps-wr-dis, auxiliary]
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-avd-dart
+    then:
+      required:
+        - power-domains
+        - apple,dma-range
+        - apple,tunable
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
+    then:
+      # apple,tunable: the bootloader copies it from the ADT (dart-acioN,
+      # dart-apciecN); a device tree describes these DARTs without one.
+      required:
+        - apple,dma-range
 
 additionalProperties: false
 

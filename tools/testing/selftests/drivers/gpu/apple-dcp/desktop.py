@@ -203,7 +203,7 @@ def brightness_takeover(root):
     prefix = prefix.replace('static inline ', 'static inline __attribute__((unused)) ')
     functions = '\n'.join(block(source, marker) for marker in (
         'static bool dcp_backlight_desktop(', 'static int dcp_get_brightness(',
-        'static void dcp_backlight_sync_hint(',
+        'void dcp_backlight_presented(', 'static void dcp_backlight_sync_hint(',
         'int dcp_backlight_register(', 'static int dcp_set_brightness(',
         'static bool dcp_backlight_controls_device('))
     # The 14.7 panel's nits policy and class operations (an M3 internal
@@ -242,10 +242,11 @@ struct device {int unused;};
 struct backlight_properties {int type,brightness,max_brightness,scale,state;};
 struct backlight_device {struct backlight_properties props;void *data;bool ops_lock;};
 struct apple_dcp {
-    int fw_compat;bool quiescing;
+    int fw_compat;bool quiescing,crashed;
     struct {int iomfb_method_profile;} hw;
     struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
-        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;
+        struct dcp_bl_presented presented;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -336,6 +337,31 @@ int main(void)
     inject_user=true;dcp_backlight_sync_hint(&d);
     assert(d.backlight.state.controlled && d.backlight.state.target==450);
     assert(registered.props.brightness==450 && !registered.ops_lock);
+    /*
+     * DAC firmware (J414s, 13.5): the report of the loader's level until a
+     * present, then the presented level, through a display power cycle whose
+     * power-off report of 0 is not followed by one for the lit panel.
+     */
+    struct apple_dcp dac={.fw_compat=0,.brightness={.maximum=500,.nits=140}};
+    struct backlight_device dac_bl={.data=&dac};
+    assert(dcp_get_brightness(&dac_bl)==140);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500);
+    dcp_backlight_presented(&dac,0);dac.brightness.nits=0;
+    assert(dcp_get_brightness(&dac_bl)==0);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500 && !dac.backlight.lock);
+    /*
+     * A crashed processor discards every present: no level is reported, and
+     * a new level is refused without changing the requested one.
+     */
+    struct dcp_backlight_state before=d.backlight.state;
+    d.crashed=true;registered.props.brightness=200;
+    assert(dcp_get_brightness(&registered)==-EIO);
+    assert(dcp_set_brightness(&registered)==-EIO);
+    assert(!memcmp(&before,&d.backlight.state,sizeof(before)) && !d.backlight.lock);
+    d.crashed=false;
+    assert(!dcp_set_brightness(&registered) && d.backlight.state.target==200);
     return 0;
 }
 '''
@@ -426,6 +452,8 @@ struct apple_dcp {
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}
+/* 27 stands for DCP_FIRMWARE_V_27_0 here: its panel path has no PQ decode. */
+static bool dcp_fw_panel_decodes_pq(struct apple_dcp *d) {return d->fw_compat != 27;}
 static void dcp_queue_hotplug(void *con) {assert(con);notifications++;}
 ''' + helpers + dictionary + '\nstatic const u8 attributes[]={'+','.join(map(str,raw))+'};\n' + 'static const u8 product[]={'+','.join(map(str,product))+'};\n' + 'static const u8 minimal[]={'+','.join(map(str,minimal))+'};\n' + r'''
 int main(int argc, char **argv)
@@ -453,6 +481,12 @@ int main(int argc, char **argv)
     assert(!IS_ERR(hdr) && drm_edid_valid(hdr) && hdr->size==256);
     assert(!memcmp(hdr->cta,"\x02\x03\x0f\x00\xe3\x05\x80\x00\xe6\x06\x05\x01\xa0\xa0\x00",15));
     drm_edid_free(hdr);
+    /* Firmware 27: no PQ decode, so no HDR block even with a peak. */
+    d.fw_compat=27;
+    const struct drm_edid *nopq=dcp_panel_edid_snapshot(&d,modes,3,&generation);
+    assert(!IS_ERR(nopq) && drm_edid_valid(nopq) && nopq->size==128);
+    drm_edid_free(nopq);
+    d.fw_compat=5;
     d.panel.peak_nits=0;
     const struct drm_edid *fallback=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(fallback) && drm_edid_valid(fallback) && fallback->size==128);

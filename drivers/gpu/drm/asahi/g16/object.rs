@@ -46,6 +46,18 @@ pub(crate) enum Class {
     Shared,
     /// Firmware and GPU, ASC-cached.
     SharedCached,
+    /// ASC-cached (AttrIndex 0) behind a cacheable host mapping: the leaf macOS 26B123 gives its
+    /// per-queue command objects and the G13-G15 private-allocator contract (`PROT_FW_PRIV_RW`
+    /// behind `gem::new_kernel_object`). Only for device-lifetime command records with no client
+    /// alias ([`Factory::persistent_objects`]): an ASC-cached M4 mapping has no qualified
+    /// teardown, so its owner is never dropped. A kernel GPU task lower alias stays uncached, as
+    /// macOS maps its work items for the GPU; host stores to such an object are cleaned to the
+    /// point of coherency for it ([`FwObject::write`]). Host readback of any firmware- or
+    /// GPU-written field inside a `FwCoherent` record (such as 26B123 compute `work_ticks`) must
+    /// call [`FwObject::sync_for_cpu`] first to clean+invalidate the CPU lines to PoC; because
+    /// prior host stores were already cleaned to PoC before publication and no host store occurs
+    /// while in flight, clean+invalidate never overwrites firmware/GPU writes.
+    FwCoherent,
     /// Firmware device mapping.
     #[allow(dead_code)]
     Mmio,
@@ -59,6 +71,7 @@ impl Class {
             Class::FwCached => pte::FW_CACHED,
             Class::Shared => pte::SHARED,
             Class::SharedCached => pte::SHARED_CACHED,
+            Class::FwCoherent => pte::FW_CACHED,
             Class::Mmio => pte::MMIO,
         }
     }
@@ -100,6 +113,12 @@ pub(crate) struct FwObject {
     // Subrecords retain the owning WC vmap as well as their GEM.
     _parent: Option<Arc<FwObject>>,
     limit: Option<usize>,
+    /// Host stores go through a cacheable view the GPU reads through its uncached lower alias:
+    /// each store is cleaned to the point of coherency.
+    clean: bool,
+    /// Host CPU mapping is write-back cacheable (`Class::FwCoherent`): any post-publication CPU
+    /// readback of firmware- or GPU-written words must call [`Self::sync_for_cpu`] first.
+    cached_cpu: bool,
 }
 
 // SAFETY: The object only refers to kernel memory shared with the firmware; every host access
@@ -148,9 +167,31 @@ impl FwObject {
                 backing: gem::ObjectRef::new(object.gem()),
                 _parent: Some(object.clone()),
                 limit: Some(size),
+                clean: object.clean,
+                cached_cpu: object.cached_cpu,
             },
             GFP_KERNEL,
         )?)
+    }
+
+    /// Makes host stores to `len` bytes at `p` visible to an uncached GPU alias.
+    fn stored(&self, p: *const u8, len: usize) {
+        if self.clean {
+            crate::pgtable::clean_poc(p, len);
+            crate::pgtable::poc_barrier();
+        }
+    }
+
+    /// Invalidates CPU cache lines covering `len` bytes at `offset` when this object uses a
+    /// cacheable host mapping (`Class::FwCoherent`), ensuring subsequent CPU reads observe
+    /// firmware- or GPU-written words (e.g. 26B123 compute `work_ticks`) after publication.
+    pub(crate) fn sync_for_cpu(&self, offset: usize, len: usize) -> Result {
+        let p = self.ptr(offset, len)?;
+        if self.cached_cpu {
+            crate::pgtable::clean_invalidate_poc(p, len);
+            crate::pgtable::poc_barrier();
+        }
+        Ok(())
     }
 
     /// Copies bytes into the object before it is published, or into host-owned words.
@@ -159,6 +200,7 @@ impl FwObject {
         // SAFETY: `p` is valid for `bytes.len()` bytes of the object's mapping, which no Rust
         // reference aliases.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+        self.stored(p, bytes.len());
         Ok(())
     }
 
@@ -167,6 +209,7 @@ impl FwObject {
         let p = self.ptr(offset, len)?;
         // SAFETY: As for `write`.
         unsafe { core::ptr::write_bytes(p, value, len) };
+        self.stored(p, len);
         Ok(())
     }
 
@@ -176,6 +219,7 @@ impl FwObject {
         if p as usize % 4 == 0 {
             // SAFETY: `p` is valid and aligned for a u32.
             unsafe { p.cast::<u32>().write_volatile(value.to_le()) };
+            self.stored(p, 4);
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -188,6 +232,7 @@ impl FwObject {
         if p as usize % 8 == 0 {
             // SAFETY: `p` is valid and aligned for a u64.
             unsafe { p.cast::<u64>().write_volatile(value.to_le()) };
+            self.stored(p, 8);
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -214,9 +259,23 @@ impl FwObject {
     pub(crate) fn read(&self, offset: usize, out: &mut [u8]) -> Result {
         let p = self.ptr(offset, out.len())?;
         rmb();
-        for (index, byte) in out.iter_mut().enumerate() {
+        let mut index = 0;
+        let len = out.len();
+        while index < len && (p as usize + index) % 8 != 0 {
             // SAFETY: ptr() bounds the complete range; WC memory permits byte accesses.
-            *byte = unsafe { p.add(index).read_volatile() };
+            out[index] = unsafe { p.add(index).read_volatile() };
+            index += 1;
+        }
+        while index + 8 <= len {
+            // SAFETY: ptr() bounds the range and `p.add(index)` is 8-byte aligned.
+            let word = unsafe { p.add(index).cast::<u64>().read_volatile() };
+            out[index..index + 8].copy_from_slice(&word.to_ne_bytes());
+            index += 8;
+        }
+        while index < len {
+            // SAFETY: ptr() bounds the complete range; WC memory permits byte accesses.
+            out[index] = unsafe { p.add(index).read_volatile() };
+            index += 1;
         }
         rmb();
         Ok(())
@@ -231,6 +290,30 @@ impl FwObject {
             rmb();
             // SAFETY: ptr() bounds this naturally aligned 64-bit volatile receipt.
             return Ok(u64::from_le(unsafe { (p as *const u64).read_volatile() }));
+        }
+        if p as usize % 4 == 0 {
+            // Packed 64-bit firmware fields such as compute::DESCRIPTOR_COUNTER (0xe4c) and
+            // DESCRIPTOR_COMPLETED (0xe54) are 4-byte aligned. Read aligned 32-bit word pairs
+            // rather than falling through to 16 single-byte WC loads in self.read().
+            let pair = |words: *const u32| -> (u32, u32) {
+                rmb();
+                // SAFETY: ptr() bounds 8 bytes and `words` is 4-byte aligned.
+                let lo = u32::from_le(unsafe { words.read_volatile() });
+                // SAFETY: `words.add(1)` stays within the 8-byte range and is 4-byte aligned.
+                let hi = u32::from_le(unsafe { words.add(1).read_volatile() });
+                (lo, hi)
+            };
+            let words = p.cast::<u32>();
+            let mut first = pair(words);
+            for _ in 0..3 {
+                let next = pair(words);
+                if first == next {
+                    rmb();
+                    return Ok(u64::from(next.0) | (u64::from(next.1) << 32));
+                }
+                first = next;
+            }
+            return Err(EAGAIN);
         }
         let mut first = [0u8; 8];
         let mut next = [0u8; 8];
@@ -282,9 +365,26 @@ pub(crate) struct Request {
 
 /// Private allocation coordinates. Only normal non-cacheable objects may be reclaimed.
 struct Private {
-    vm: mmu::Vm,
+    vm: Option<mmu::Vm>,
     firmware: core::ops::Range<u64>,
     pending: Option<core::ops::Range<u64>>,
+}
+
+/// VM-independent firmware-object lease whose backing and firmware/lower mappings stay alive
+/// until a later command overwrites the same hardware table slot in firmware RAM.
+///
+/// Dropping an `Arc<FwLease>` offloads unmap to `cleanup::Deferred`, so replacing a lease under
+/// `Shared::state` never sleeps or blocks fence producers.
+pub(crate) struct FwLease(crate::cleanup::Deferred<Objects>);
+
+impl FwLease {
+    pub(crate) fn new(mut objects: Objects) -> Result<Arc<Self>> {
+        objects.finish_private()?;
+        Ok(Arc::new(
+            Self(crate::cleanup::Deferred::new(objects)?),
+            GFP_KERNEL,
+        )?)
+    }
 }
 
 /// Immutable factory shared by ioctl-side private arena construction.
@@ -294,6 +394,8 @@ pub(crate) struct Factory {
     uat: Arc<mmu::Uat>,
     window: Arc<Mutex<uat::Window>>,
     firmware: core::ops::Range<u64>,
+    render_cmds: Arc<super::resources::RenderCmds>,
+    compute_cmds: Arc<super::resources::ComputeCmds>,
 }
 
 impl Factory {
@@ -303,18 +405,92 @@ impl Factory {
             uat: self.uat.clone(),
             window: self.window.clone(),
             private: Some(Private {
-                vm: vm.clone(),
+                vm: Some(vm.clone()),
                 firmware: self.firmware.clone(),
                 pending: None,
             }),
             sealed: false,
+            persistent: false,
+            probe: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         }
+    }
+
+    /// Allocates firmware-only and context-0 lower-alias objects with no client VM binding.
+    pub(crate) fn fw_objects(&self) -> Objects {
+        Objects {
+            dev: self.dev.clone(),
+            uat: self.uat.clone(),
+            window: self.window.clone(),
+            private: Some(Private {
+                vm: None,
+                firmware: self.firmware.clone(),
+                pending: None,
+            }),
+            sealed: false,
+            persistent: false,
+            probe: false,
+            fw_next: self.firmware.start,
+            retained: KVec::new(),
+            clients: KVec::new(),
+            mappings: KVec::new(),
+            error: None,
+            pages: 0,
+            charges: KVec::new(),
+        }
+    }
+
+    /// Allocates the only objects that may hold [`Class::FwCoherent`] records: firmware-only,
+    /// with no client VM binding. The caller owns them for the device lifetime and never drops
+    /// them ([`super::resources::RenderCmds`]).
+    pub(crate) fn persistent_objects(&self) -> Objects {
+        Objects {
+            dev: self.dev.clone(),
+            uat: self.uat.clone(),
+            window: self.window.clone(),
+            private: Some(Private {
+                vm: None,
+                firmware: self.firmware.clone(),
+                pending: None,
+            }),
+            sealed: false,
+            persistent: true,
+            probe: false,
+            fw_next: self.firmware.start,
+            retained: KVec::new(),
+            clients: KVec::new(),
+            mappings: KVec::new(),
+            error: None,
+            pages: 0,
+            charges: KVec::new(),
+        }
+    }
+
+    /// Probe-time variant of [`Self::persistent_objects`], called only from
+    /// [`super::graph::Graphs::finish`] during platform `probe()` before `drm_dev_register()`
+    /// makes `registration_guard()` available.
+    pub(crate) fn persistent_objects_probe(&self) -> Objects {
+        let mut objects = self.persistent_objects();
+        objects.probe = true;
+        objects
+    }
+
+    /// The device-lifetime render command records of pass slot `k`, shared by every VM's
+    /// [`super::slots::PassSlot`] `k`.
+    pub(crate) fn pass_cmds(&self, k: usize) -> Result<super::slots::PassCmds> {
+        self.render_cmds.get(self, k)
+    }
+
+    /// The device-lifetime compute command records of hardware compute unit `k`, shared by every
+    /// VM's [`super::slots::ComputeSlot`] bound to hardware unit `k`.
+    pub(crate) fn compute_cmds(&self, k: usize) -> Result<super::slots::UnitCmds> {
+        self.compute_cmds.get(self, k)
     }
 }
 
@@ -326,6 +502,10 @@ pub(crate) struct Objects {
     pub(crate) window: Arc<Mutex<uat::Window>>,
     private: Option<Private>,
     sealed: bool,
+    /// A device-lifetime allocator that may map [`Class::FwCoherent`] records.
+    persistent: bool,
+    /// Runs during platform `probe()` before `drm_dev_register()` provides `registration_guard()`.
+    probe: bool,
     /// Next free VA of the firmware allocator window.
     fw_next: u64,
     /// Every object owned by this session or private arena.
@@ -340,6 +520,8 @@ pub(crate) struct Objects {
     error: Option<Error>,
     /// Host-window pages backed by objects.
     pages: usize,
+    /// The charges of private objects sized by the VM's client, held as long as their backing.
+    charges: KVec<crate::memacct::Charge>,
 }
 
 impl Objects {
@@ -354,29 +536,39 @@ impl Objects {
             window: Arc::pin_init(new_mutex!(window, "g16::Objects::window"), GFP_KERNEL)?,
             private: None,
             sealed: false,
+            persistent: false,
+            probe: false,
             fw_next: hw::va::FW_ALLOC.start,
             retained: KVec::new(),
             clients: KVec::new(),
             mappings: KVec::new(),
             error: None,
             pages: 0,
+            charges: KVec::new(),
         })
     }
 
     /// Freeze the session allocation boundary before making any private arenas.
-    pub(crate) fn private_factory(&mut self) -> Factory {
+    pub(crate) fn private_factory(
+        &mut self,
+        render_cmds: Arc<super::resources::RenderCmds>,
+        compute_cmds: Arc<super::resources::ComputeCmds>,
+    ) -> Factory {
         self.sealed = true;
         Factory {
             dev: self.dev.clone(),
             uat: self.uat.clone(),
             window: self.window.clone(),
             firmware: self.fw_next..hw::va::FW_ALLOC.end,
+            render_cmds,
+            compute_cmds,
         }
     }
 
     /// Maps private backing into one client and unique kernel/firmware apertures. Mapping
     /// owners retain the GEM independently, including every partial construction failure.
-    /// All reclaimable objects are NC from creation; there is no ASC cache transition.
+    /// All reclaimable objects are NC from creation; there is no ASC cache transition. Only a
+    /// device-lifetime allocator maps [`Class::FwCoherent`] records, never reclaimed.
     fn alloc_private(&mut self, req: Request) -> Result<Arc<FwObject>> {
         self.alloc_private_in(req, None)
     }
@@ -392,7 +584,7 @@ impl Objects {
                 lower: None,
                 cpu: true,
             },
-            Some(0x7040000000..0x7080000000),
+            Some(hw::client::DYNAMIC),
         )
     }
 
@@ -402,45 +594,95 @@ impl Objects {
         client_range: Option<core::ops::Range<u64>>,
     ) -> Result<Arc<FwObject>> {
         if !matches!(req.placement, Placement::Anywhere)
-            || !matches!(req.class, Class::Fw | Class::Shared)
+            || !matches!(req.class, Class::Fw | Class::Shared | Class::FwCoherent)
+            || (req.class == Class::FwCoherent
+                && (!self.persistent || req.client.is_some() || client_range.is_some()))
             || req.size == 0
             || req.offset >= hw::PAGE as usize
         {
             return Err(EINVAL);
         }
-        let private = self.private.as_ref().ok_or(EINVAL)?;
         let bytes = req
             .offset
             .checked_add(req.size)
             .and_then(|size| size.checked_add(hw::PAGE as usize - 1))
             .ok_or(EOVERFLOW)?
             & !(hw::PAGE as usize - 1);
+        {
+            let private = self.private.as_ref().ok_or(EINVAL)?;
+            if client_range.is_some() {
+                if private.vm.is_none() {
+                    return Err(EINVAL);
+                }
+            } else if let Some((gva, leaf)) = req.client {
+                if private.vm.is_none() {
+                    return Err(EINVAL);
+                }
+                let end = gva.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
+                if gva < hw::client::CLIENT_APERTURE.start
+                    || end > hw::client::CLIENT_APERTURE.end
+                    || gva & (hw::PAGE - 1) != 0
+                    || leaf != pte::LEAF_NC && leaf != pte::LEAF_PB_LIST
+                {
+                    return Err(EINVAL);
+                }
+            }
+        }
         self.retained.reserve(1, GFP_KERNEL)?;
         self.mappings.reserve(3, GFP_KERNEL)?;
-        let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
-        let registered = self.dev.registration_guard().ok_or(ENODEV)?;
-        let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
-        gem::prepare_new_object(&backing.gem, parent.as_ref())?;
+        let object_slot = UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?;
+        // A firmware-cached record needs a cacheable host view of the same pages (the host and
+        // firmware caches are coherent, as for G13-G15 private objects); every other private
+        // class keeps its write-combined view.
+        // A client VM's arena is client memory: admitted against, and counted for, its client
+        // instead of the device's kernel total.
+        let client = self
+            .private
+            .as_ref()
+            .and_then(|private| private.vm.as_ref())
+            .and_then(|vm| vm.memory_client());
+        let charge = match client {
+            Some(client) => {
+                self.charges.reserve(1, GFP_KERNEL)?;
+                let commit = crate::memacct::LEDGER.admit(client, bytes as u64)?;
+                Some(crate::memacct::Charge::user(commit, None))
+            }
+            None => None,
+        };
+        let mut backing = if req.class == Class::FwCoherent {
+            gem::new_kernel_object(&self.dev, bytes)?
+        } else if charge.is_some() {
+            gem::new_kernel_object_wc_user_charged(&self.dev, bytes)?
+        } else {
+            gem::new_kernel_object_wc(&self.dev, bytes)?
+        };
+        if self.probe {
+            // SAFETY: `Factory::persistent_objects_probe()` is called only from
+            // `Graphs::finish()` during platform `probe()`, while the platform device is
+            // bound and before `drm_dev_register()` makes `registration_guard()` available.
+            let bound = unsafe { self.dev.as_ref().as_ref().as_bound() };
+            gem::prepare_new_object(&backing.gem, bound)?;
+        } else {
+            let registered = self.dev.registration_guard().ok_or(ENODEV)?;
+            let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+            gem::prepare_new_object(&backing.gem, parent.as_ref())?;
+        }
+        let clean = req.class == Class::FwCoherent && req.lower.is_some();
+        let cached_cpu = req.class == Class::FwCoherent;
         let cpu = if req.cpu {
             let vmap = backing.vmap()?;
             let pointer = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
-            // SAFETY: Fresh private WC mapping spans bytes and has not been exposed.
+            // SAFETY: Fresh private mapping spans bytes and has not been exposed.
             unsafe { core::ptr::write_bytes(pointer.as_ptr(), 0, bytes) };
+            if clean {
+                crate::pgtable::clean_poc(pointer.as_ptr(), bytes);
+                crate::pgtable::poc_barrier();
+            }
             Some(pointer)
         } else {
             None
         };
-        let firmware = self.uat.kernel_vm().map_in_range(
-            &backing.gem,
-            0..bytes,
-            hw::PAGE,
-            private.firmware.clone(),
-            mmu::Prot::from_pte(req.class.pte()),
-            true,
-        )?;
-        let va = firmware.iova();
-        self.mappings.push(firmware, GFP_KERNEL)?;
-        let lower_gva = if req.lower.is_some() {
+        let lower_mapping = if req.lower.is_some() {
             // No two live VMs share a context-0 work address. The self-check at 0x70ff...
             // and all fixed client aliases are outside this aperture.
             let lower = self.uat.kernel_lower_vm().map_in_range(
@@ -451,76 +693,97 @@ impl Objects {
                 mmu::Prot::from_pte(pte::LOWER),
                 true,
             )?;
-            let address = lower.iova() + req.offset as u64;
-            self.mappings.push(lower, GFP_KERNEL)?;
             uat::clean_lower(&self.uat)?;
-            Some(address)
+            Some(lower)
         } else {
             None
         };
-        let client_gva = if let Some(range) = client_range {
-            let mapping = private.vm.map_in_range(
-                &backing.gem,
-                0..bytes,
-                hw::PAGE,
-                range,
-                mmu::Prot::from_pte(pte::LEAF_NC),
-                true,
-            )?;
-            let address = mapping.iova();
-            self.mappings.push(mapping, GFP_KERNEL)?;
-            Some(address)
-        } else if let Some((gva, leaf)) = req.client {
-            let end = gva.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
-            if gva < hw::client::CLIENT_APERTURE.start
-                || end > hw::client::CLIENT_APERTURE.end
-                || gva & (hw::PAGE - 1) != 0
-                || leaf != pte::LEAF_NC && leaf != pte::LEAF_PB_LIST
-            {
-                return Err(EINVAL);
+        let (client_mapping, client_gva) = {
+            let private = self.private.as_ref().ok_or(EINVAL)?;
+            if let Some(range) = client_range {
+                let vm = private.vm.as_ref().ok_or(EINVAL)?;
+                let mapping = vm.map_in_range(
+                    &backing.gem,
+                    0..bytes,
+                    hw::PAGE,
+                    range,
+                    mmu::Prot::from_pte(pte::LEAF_NC),
+                    true,
+                )?;
+                let address = mapping.iova();
+                (Some(mapping), Some(address))
+            } else if let Some((gva, leaf)) = req.client {
+                let vm = private.vm.as_ref().ok_or(EINVAL)?;
+                let mapping =
+                    vm.map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?;
+                (Some(mapping), Some(gva))
+            } else {
+                (None, None)
             }
-            self.mappings.push(
-                private
-                    .vm
-                    .map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?,
-                GFP_KERNEL,
-            )?;
-            Some(gva)
-        } else {
-            None
         };
-        wmb();
-        let private = self.private.as_mut().ok_or(EINVAL)?;
-        let end = va + bytes as u64;
-        private.pending = Some(match private.pending.take() {
-            Some(range) => range.start.min(va)..range.end.max(end),
-            None => va..end,
-        });
-        let object = Arc::new(
-            FwObject {
-                va: va + req.offset as u64,
-                gva: client_gva.map(|gva| gva + req.offset as u64),
-                lower_gva,
-                size: req.size,
-                offset: req.offset,
-                bytes,
-                client_leaf: req.client.map_or(pte::LEAF_NC, |(_, leaf)| leaf),
-                cpu,
-                backing,
-                _parent: None,
-                limit: None,
-            },
-            GFP_KERNEL,
+        let fw_range = self.private.as_ref().ok_or(EINVAL)?.firmware.clone();
+        // Map the firmware aperture last: for `Class::FwCoherent` an ASC-cached mapping cannot
+        // be torn down on drop, so every fallible allocation, validation, and uncached alias
+        // must succeed before it is created.
+        let firmware = self.uat.kernel_vm().map_in_range(
+            &backing.gem,
+            0..bytes,
+            hw::PAGE,
+            fw_range,
+            mmu::Prot::from_pte(req.class.pte()),
+            true,
         )?;
-        self.retained.push(object.clone(), GFP_KERNEL)?;
+        let va = firmware.iova();
+        let lower_gva = lower_mapping.as_ref().map(|m| m.iova() + req.offset as u64);
+        let _ = self.mappings.push_within_capacity(firmware);
+        if let Some(lower) = lower_mapping {
+            let _ = self.mappings.push_within_capacity(lower);
+        }
+        if let Some(client) = client_mapping {
+            let _ = self.mappings.push_within_capacity(client);
+        }
+        wmb();
+        if let Some(private) = self.private.as_mut() {
+            let end = va + bytes as u64;
+            private.pending = Some(match private.pending.take() {
+                Some(range) => range.start.min(va)..range.end.max(end),
+                None => va..end,
+            });
+        }
+        let object = Arc::from(object_slot.write(FwObject {
+            va: va + req.offset as u64,
+            gva: client_gva.map(|gva| gva + req.offset as u64),
+            lower_gva,
+            size: req.size,
+            offset: req.offset,
+            bytes,
+            client_leaf: req.client.map_or(pte::LEAF_NC, |(_, leaf)| leaf),
+            cpu,
+            backing,
+            _parent: None,
+            limit: None,
+            clean,
+            cached_cpu,
+        }));
+        let _ = self.retained.push_within_capacity(object.clone());
+        // Held only once nothing can fail any more: an earlier error frees the backing, and a
+        // held charge left behind in a container that lives on would count memory that is gone.
+        // `charges` has room reserved; a charge that could not be kept uncharges on drop.
+        if let Some(charge) = charge {
+            charge.set_held(true);
+            let _ = self.charges.push_within_capacity(charge);
+        }
         self.pages += bytes / hw::PAGE as usize;
         Ok(object)
     }
 
     /// Publish a completed private arena in one shared-L2 transaction.
     pub(crate) fn finish_private(&mut self) -> Result {
-        if let Some(range) = self.private.as_mut().ok_or(EINVAL)?.pending.take() {
+        if let Some(range) = self.private.as_ref().ok_or(EINVAL)?.pending.clone() {
             self.window.lock().sync_range(&self.uat, range)?;
+            if let Some(private) = self.private.as_mut() {
+                private.pending = None;
+            }
         }
         Ok(())
     }
@@ -536,13 +799,14 @@ impl Objects {
         self.pages
     }
 
-    /// Bounded live UAT ownership checks; no user leaf walk and no firmware memory repair.
+    /// Bounded live checks of the host window; no user leaf walk and no firmware memory repair.
+    /// The UAT's context bindings are checked by [`super::boot::Session::check`], which every
+    /// caller runs just before this.
     pub(crate) fn health(&mut self) -> Result {
         if let Some(error) = self.error {
             return Err(error);
         }
-        self.window.lock().check()?;
-        self.uat.check_adopted_bindings()
+        self.window.lock().check()
     }
 
     /// Allocates and maps a zeroed firmware object.
@@ -565,6 +829,10 @@ impl Objects {
                 return Err(EINVAL);
             }
             return self.alloc_private(req);
+        }
+        // Session objects are write-combined: they never give the firmware a cached record.
+        if req.class == Class::FwCoherent {
+            return Err(EINVAL);
         }
         if self.sealed {
             return Err(EBUSY);
@@ -659,6 +927,8 @@ impl Objects {
                 backing,
                 _parent: None,
                 limit: None,
+                clean: false,
+                cached_cpu: false,
             })
             .into();
         self.retained.push(object.clone(), GFP_KERNEL)?;

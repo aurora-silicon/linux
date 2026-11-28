@@ -693,7 +693,11 @@ is no module parameter and no H14 boot parameter changes the H16 path. H17 still
 All build-dependent boot values and ordered masked updates belong to the
 H16 27.0 (26A428) match-data build shared by the supported H16 profiles
 (27.0 26A428, 27.2 26B123, 26.6.2 25G83, and 26.5.2 25F84). The preload
-validator must accept the resident image before a profile can run. Live mutable
+validator must accept the resident image before a profile can run.
+The T8132 (M4) has its own builds: 26.6.2 25G83 and 27.2 26B123. Each firmware
+build of an SoC may hand over its own TEXT and DATA sizes (27.2 on the T8132:
+0xbc000 and 0x2b0000); the driver picks the build whose sizes and IOVAs the
+loader handed over, and each preload rule checks the sizes it was made for. Live mutable
 patchbay and firmware tunable values are preserved, with no disk firmware owner.
 
 ``preflight`` raises the five real domains through genpd, in DT order, and

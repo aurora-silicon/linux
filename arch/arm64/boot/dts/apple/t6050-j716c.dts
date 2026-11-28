@@ -14,7 +14,12 @@
 /dts-v1/;
 
 #define T6050_J716C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
+/* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
+#define T6050_ATC2_USB4_ROUTER
 #include "t6050-max.dtsi"
+#include "hwmon-fan-dual.dtsi"
 
 / {
 	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
@@ -47,6 +52,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
@@ -176,16 +183,32 @@
 
 /*
  * Pin 112's register (0x29c0001c0) takes an SError when read, so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst).
+ * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst) and
+ * 138 (the Touch ID sensor's data-ready line).
  * A reserved line cannot be requested, so a node that names a new pin opens it here too.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 57>, <139 82>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/*
+ * Inherit apple,discover-temperatures and apple,soc-die-keys ("TCMb") from
+ * t6050-die0.dtsi so all readable T* float sensors are discovered and TCMb
+ * supplies the macsmc_soc_die thermal zone for the GPU thermal governor.
+ * T6050 spells the fan mode keys F0md/F1md and accepts manual fan targets.
+ */
 &smc_hwmon {
-	status = "disabled";
+	status = "okay";
+
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
 };
 
 /*
@@ -261,12 +284,15 @@
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
-#include "t6050-j716c-isp.dtsi"
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-j716c.bin", "apple/msrk-j716c.bin"
+#include "t6050-touchid.dtsi"
+
+#include "t6050-isp.dtsi"
 #include "t6050-j716c-gpu-panel.dtsi"
 
 #include "t6050-j716c-display.dtsi"
 #include "t6050-j716c-left-usb4.dtsi"
-#include "t6050-j716c-sep.dtsi"
 
 #include "t6050-j716c-sleep.dtsi"
 #include "t6050-j716c-sleep-full.dtsi"

@@ -11,6 +11,7 @@
 #include "ane_fw_transport.h"
 #include "ane_h16_load.h"
 #include "ane_h16_pending.h"
+#include "ane_stats.h"
 
 /*
  * Program lifecycle for one H16 firmware session: LOAD_PROGRAM, CREATE_PROCESS,
@@ -53,6 +54,8 @@
 #define ANE_H16_GENERIC_HEADER		0x208
 #define ANE_H16_GENERIC_ENTRY		0x30
 #define ANE_H16_GENERIC_ID_MAX		0x3c
+/* The u32 at +0x28 of every entry, as every host builder writes it. */
+#define ANE_H16_GENERIC_ENTRY_TAIL	0xffff
 
 /* Host-built operation section: a count, then fixed-size BAR records. */
 #define ANE_H16_OPERATION_RECORD	0x40c
@@ -70,6 +73,10 @@ enum ane_h16_aux {
 
 #define ANE_H16_AUX_MIN 0x28
 #define ANE_H16_AUX_MAX SZ_64K
+
+/* The one form of the procedure and text-properties sections. */
+#define ANE_H16_PROCEDURE_SIZE 0x38
+#define ANE_H16_PROPERTIES_SIZE 0x28
 
 /* Source of one LOAD slot. */
 enum ane_h16_slot_source {
@@ -155,6 +162,12 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 			       const struct ane_h16_process_binding *bindings,
 			       unsigned int count,
 			       const struct ane_h16_process_binding *scratch);
+void ane_h16_fixed_sections(const struct ane_h16_hwx *hwx,
+			    u8 procedure[ANE_H16_PROCEDURE_SIZE],
+			    u8 properties[ANE_H16_PROPERTIES_SIZE]);
+int ane_h16_fixed_sections_validate(const struct ane_h16_hwx *hwx,
+				    const void *const aux[ANE_H16_AUX_COUNT],
+				    const size_t aux_size[ANE_H16_AUX_COUNT]);
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count);
@@ -402,6 +415,14 @@ struct ane_h16_session {
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
 	spinlock_t stats_lock;
 	struct ane_h16_exec_stats stats;
+	/*
+	 * The sysfs ane_stats counters: every request published to the
+	 * firmware, failed ones included, and the union of their busy time.
+	 * Unlike stats, they never reset. One ring slot: no timeline is kept.
+	 */
+	struct ane_stats_counters sysfs_ctrs;
+	struct ane_stats_ring sysfs_ring;
+	struct ane_stats_ring_entry sysfs_slot;
 	/* Exports whose last mapping is gone, returned by export_work. */
 	spinlock_t export_lock;
 	struct list_head exports_done;

@@ -11,13 +11,28 @@
 
 #include "t8122.dtsi"
 #include "t8122-j613-j615.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
 / {
 	compatible = "apple,j615", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M3, 2024)";
 };
 
+/*
+ * CPU memory floor, class 0x25 (DCS) at 4 and 0x21 (fabric) at 2. The 14.x
+ * PMP answers it with DVFS-STATE 0x24: 4-thread membw2 19.8 -> 68.2 GB/s.
+ */
+&pmp_report {
+	apple,cpu-memory-floor = <0x21 2 0x25 4>;
+};
+
 &dcp {
+	/*
+	 * DRM owns swap slots 0 and 1 here. On this panel the indicator
+	 * shows in slot 3; in slot 2 it does not show under the desktop.
+	 */
+	apple,camera-indicator-surface = <3>;
+
 	panel: panel {
 		compatible = "apple,panel-j615", "apple,panel";
 		/* 2880x1864 at 224 ppi; 64 notch rows above the desktop. */
@@ -26,6 +41,10 @@
 		adj-height-mm = <204>;
 		apple,max-brightness = <500>;
 	};
+};
+
+&isp {
+	apple,camera-indicator = <&dcp>;
 };
 
 &wifi0 {
@@ -155,9 +174,69 @@
 
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j615.bin";
+	/*
+	 * No apple,power-method: the 14.7 trackpad firmware takes only
+	 * method 1 and the 27.x firmware only method 2. dockchannel-hid
+	 * starts with method 1 and moves to method 2 when it is rejected.
+	 */
+};
+
+/* The J615 MTP firmware cannot be restarted once quiesced: hand it over running. */
+&mtp {
+	apple,rtkit-keep-running;
 };
 
 &mesa {
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j615.bin";
 };
+
+/*
+ * The J615 ADT puts the boot NOR and its nvram on QSPIMC, as on the J613.
+ * No NVRAM write entry exists for this board yet: keep it read-only.
+ */
+&nvram_qspi {
+	read-only;
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/*
+ * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the J615 ADT gives
+ * the Wi-Fi bridge a CLKREQ function), so the link may use Clock PM and the L1
+ * PM Substates.
+ */
+&port00 {
+	supports-clkreq;
+};
+
+/*
+ * The dcpext wiring is shared with the J613 (t8122-j613-j615.dtsi). fbdma is
+ * the display DART stream the dcpext scans framebuffers through, with the
+ * display subsystem's DVA window: on the J615 the gate must not add
+ * dispext0_dart to the display subsystem (apple,no-shared-display-dart), so
+ * appledrm mirrors framebuffers there instead.
+ */
+&dcpext {
+	apple,no-shared-display-dart;
+
+	fbdma {
+		iommus = <&dispext0_dart 0>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+	};
+};
+

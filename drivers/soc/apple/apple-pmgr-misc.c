@@ -8,6 +8,7 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/cpufreq.h>
+#include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/interconnect-provider.h>
 #include <linux/io.h>
@@ -19,10 +20,11 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/soc/apple/pmgr-misc.h>
 #include <linux/sort.h>
 #include <linux/workqueue.h>
-#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST) || IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
 #include <kunit/static_stub.h>
 #endif
 
@@ -499,6 +501,9 @@ static bool apple_pmgr_cpus_at_min(void)
 	unsigned int cpu;
 	bool at_min = true;
 
+#if IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmgr_cpus_at_min);
+#endif
 	for_each_online_cpu(cpu) {
 		policy = cpufreq_cpu_get(cpu);
 		if (!policy)
@@ -736,6 +741,37 @@ static int apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 	return 0;
 }
 
+/* Read only: the whole clock-generator word of one system device (the desired state is bits 3:0, the actual state bits 7:4), no side effect. */
+static int apple_pmgr_misc_ps_show(struct seq_file *s, void *unused)
+{
+	const struct apple_pmgr_sys_device *d = s->private;
+
+	seq_printf(s, "%#010x\n", readl_relaxed(d->base + APPLE_CLKGEN_PSTATE));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_pmgr_misc_ps);
+
+static void apple_pmgr_misc_debugfs_remove(void *dir)
+{
+	debugfs_remove(dir);
+}
+
+static void apple_pmgr_misc_debugfs_init(struct apple_pmgr_misc *misc)
+{
+	static const char * const names[DEV_MAX] = { "fabric_ps", "dcs_ps" };
+	char *dirname = devm_kasprintf(misc->dev, GFP_KERNEL, "apple-pmgr-misc-%s", dev_name(misc->dev));
+	struct dentry *dir;
+	int i;
+
+	if (!dirname)
+		return;
+	dir = debugfs_create_dir(dirname, NULL);
+	for (i = 0; i < DEV_MAX; i++)
+		if (misc->devices[i].base)
+			debugfs_create_file(names[i], 0400, dir, &misc->devices[i], &apple_pmgr_misc_ps_fops);
+	devm_add_action_or_reset(misc->dev, apple_pmgr_misc_debugfs_remove, dir);
+}
+
 static int apple_pmgr_misc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -763,6 +799,8 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		return ret;
 
 	platform_set_drvdata(pdev, misc);
+
+	apple_pmgr_misc_debugfs_init(misc);
 
 	/*
 	 * With PMP enabled its firmware owns the fabric and DCS p-states.
@@ -848,4 +886,8 @@ module_platform_driver(apple_pmgr_misc_driver);
 
 #if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
 #include "apple-pmgr-dcs-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
+#include "apple-pmgr-fabric-test.c"
 #endif

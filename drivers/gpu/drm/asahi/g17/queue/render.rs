@@ -53,8 +53,10 @@ pub(crate) struct RenderDependencies {
     pub(crate) render_tiling_count: usize,
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
-    pub(crate) compute: Option<KickDependency>,
-    pub(crate) fragment_compute: Option<KickDependency>,
+    pub(crate) compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) compute_count: usize,
+    pub(crate) fragment_compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) fragment_compute_count: usize,
     /// Fragment kicks of other pairs' overlapping same-VM renders.
     pub(crate) hazards: [KickDependency; crate::g17::hazard::PUBLICATION_BARRIERS],
     pub(crate) hazard_count: usize,
@@ -68,8 +70,10 @@ impl RenderDependencies {
         render_tiling_count: 0,
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
-        compute: None,
-        fragment_compute: None,
+        compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        compute_count: 0,
+        fragment_compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        fragment_compute_count: 0,
         hazards: [KickDependency::ZERO; crate::g17::hazard::PUBLICATION_BARRIERS],
         hazard_count: 0,
     };
@@ -186,6 +190,16 @@ pub(crate) enum Registration {
     M5(crate::g17::fw::m5::queue::HardwareSubmission),
 }
 
+/// A tiler heap growth the host makes before publishing a render, to this many blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HostGrowth {
+    /// The pair is idle: the page list and the PB descriptor are rebuilt.
+    Idle(usize),
+    /// The pair has work in flight: blocks are only appended to the inventory,
+    /// as for a firmware grow request.
+    Busy(usize),
+}
+
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
 pub(crate) struct Pair {
@@ -196,6 +210,11 @@ pub(crate) struct Pair {
     /// acknowledgement: the pair keeps its owner and graph until then.
     channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
+    /// The read-only views of the two kick rings in the VM of the pair's contexts, installed with
+    /// its first graph in that VM. They belong to the pair's time in that VM, not to the VM: they
+    /// go before the pair runs a context of another VM, so its previous owner cannot read the
+    /// new owner's kick entries. Dropped before `kicks`.
+    client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
     free_list: Arc<RenderPool>,
@@ -222,6 +241,14 @@ pub(crate) struct Pair {
     /// Bit `p` set once a work slot of priority class `p` named the pair.
     outer_started: u8,
     quarantined: bool,
+    /// Its groups were released on the guilty proof after its context's kill
+    /// (`Pair::guilty_killed`): the firmware may never consume the ring entries of the groups
+    /// the kill unlinked, so the pair is released and detached on that proof
+    /// (`counts_idle`, `Pair::can_keep`), never parked for reuse while those entries remain.
+    guilty_released: bool,
+    /// The recovery generation of the first restart that blamed this pair's spared work as
+    /// collateral, until a group of it retires (`recovery::Queues::note_collateral`).
+    collateral_at: Option<u64>,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
     displaced: Option<RetiredBinding>,
@@ -332,7 +359,8 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout = m5_render_submission::layout(&first.command, clusters, variant.programs)?;
+        let layout =
+            m5_render_submission::layout(&first.command, clusters, variant.programs, board)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
@@ -353,6 +381,7 @@ impl Pair {
         storage.write_init(kernel::try_init!(Self {
             pool_pin,
             kick_aliases: Some([ta_alias, fragment_alias]),
+            client_kicks: [None, None],
             memory,
             kicks: [tiling, fragment],
             free_list,
@@ -376,6 +405,8 @@ impl Pair {
             registered: None,
             outer_started: 0,
             quarantined: false,
+            guilty_released: false,
+            collateral_at: None,
             terminal: None,
             previous: None,
             displaced: None,
@@ -523,7 +554,8 @@ impl Pair {
         let node = work.node_va()?;
         let word = work.word();
         let layout =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?;
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?;
         let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
@@ -602,6 +634,7 @@ impl Pair {
             },
             programs: self.variant.programs,
             ta_mode_1: self.variant.ta_mode_1,
+            clusters: self.clusters,
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
@@ -654,12 +687,14 @@ impl Pair {
 /// 1 the tiling encoder, 2 a full channel or compute completion, 3 the
 /// fragment encoder; the last class is the implicit parent's.
 struct RenderBarriers {
-    tiling: [KickDependency; 5],
+    tiling: [KickDependency; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
     tiling_count: usize,
-    fragment: [KickDependency; 4 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    fragment: [KickDependency;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
-    tiling_types: [u8; 6],
-    fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    tiling_types: [u8; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    fragment_types: [u8;
+        4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
 /// The last fragment kick published on any pair, and the last one of a render with an API task
@@ -726,12 +761,14 @@ fn render_barriers(
     compute_class: u8,
 ) -> RenderBarriers {
     let fragment_stage = fragment_stage || stage_prefixes;
-    let mut tiling_barriers = [KickDependency::ZERO; 5];
+    let mut tiling_barriers = [KickDependency::ZERO; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 4 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut fragment_barriers = [own_tiling;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
-    let mut tiling_types = [1; 6];
-    let mut fragment_types = [3; 5 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut tiling_types = [1; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
+    let mut fragment_types =
+        [3; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     fragment_types[0] = 1;
     for dependency in &dependencies.render_tiling[..dependencies.render_tiling_count] {
         tiling_barriers[tiling_count] = *dependency;
@@ -761,13 +798,13 @@ fn render_barriers(
             }
         }
     }
-    if let Some(compute) = dependencies.compute {
-        tiling_barriers[tiling_count] = compute;
+    for compute in &dependencies.compute[..dependencies.compute_count] {
+        tiling_barriers[tiling_count] = *compute;
         tiling_types[tiling_count] = compute_class;
         tiling_count += 1;
     }
-    if let Some(compute) = dependencies.fragment_compute {
-        fragment_barriers[fragment_count] = compute;
+    for compute in &dependencies.fragment_compute[..dependencies.fragment_compute_count] {
+        fragment_barriers[fragment_count] = *compute;
         fragment_types[fragment_count] = compute_class;
         fragment_count += 1;
     }
@@ -958,6 +995,8 @@ impl Pair {
         // The J813's (common 26A428) items carry configuration, descriptor and announcement in
         // one publication; macOS 27.0 never publishes a configuration alone there.
         let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        let host_only_render_kicks =
+            m5 && !j813 && self.board.is_some_and(|board| board.host_only_render_kicks);
         if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
@@ -1085,9 +1124,8 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
-            // macOS 27.0 TA and 3D kicks name no event at all.
-            event_mask: if m5 && stage == 0 && !j813 {
+            // Common 26A428 and the host-only form use an empty tiling event mask.
+            event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
@@ -1144,6 +1182,16 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
+        // For a firmware that supports host-only kicks, an installed render
+        // pair with work in flight can use the host-port kick alone:
+        // another item-ring notification has no new configuration or lead
+        // command to publish. Keep the ordinary inner publication for the
+        // first command, a drained restart, a rebind, and a class change.
+        let sparse_inner = host_only_render_kicks
+            && self.active.front().is_some() && self.previous.is_none()
+            && self.registered == Some(policy.priority()) && !self.context_update
+            && !self.identity_update && !present.into_iter().any(|value| value)
+            && !leads.into_iter().any(|value| value);
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -1154,6 +1202,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
+                sparse_inner,
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -1164,6 +1213,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
+                sparse_inner,
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -1387,6 +1437,7 @@ impl Pair {
                 true,
                 kicks[0],
                 false,
+                false,
             )?,
             publication::Lane::new(
                 &self.memory.graph,
@@ -1396,6 +1447,7 @@ impl Pair {
                 configs[1],
                 true,
                 kicks[1],
+                false,
                 false,
             )?,
         ];
@@ -1793,11 +1845,14 @@ impl Pair {
     pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
         self.active.front().map(|active| active.packet.clone())
     }
-    /// Sample PM feedback only after this pair's exact retirement. Busy pairs
-    /// keep their current capacity and let firmware request growth as needed.
-    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
+    /// Sample PM feedback only after this pair's exact retirement. A busy pair
+    /// grows ahead of the render only by appending blocks to its inventory, as a
+    /// firmware grow request does (`buffer::Manager::busy_target`), and otherwise
+    /// keeps its current capacity and lets firmware request growth as needed.
+    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
         let mut required =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?
                 .tvb_blocks;
         // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
         // it, whether the firmware then grows the heap or partial-renders, and the tile-count
@@ -1810,11 +1865,18 @@ impl Pair {
                 required = required.max(floor);
             }
         }
-        self.memory
-            .manager
-            .note_required(required, crate::g17::now_ns());
+        let now = crate::g17::now_ns();
+        self.memory.manager.note_required(required, now);
         if self.in_flight() {
-            return Ok(None);
+            if self.quarantined {
+                return Ok(None);
+            }
+            let client = self.memory.context.vm().memory_client().cloned();
+            return Ok(self
+                .memory
+                .manager
+                .busy_target(required, now, client.as_ref())?
+                .map(HostGrowth::Busy));
         }
         if !self.idle_for_context(self.context())? {
             return Err(EBUSY);
@@ -1830,7 +1892,7 @@ impl Pair {
         // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
         // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
         let required = required.max(feedback).min(self.memory.manager.max_blocks());
-        Ok((required > self.memory.manager.blocks()).then_some(required))
+        Ok((required > self.memory.manager.blocks()).then_some(HostGrowth::Idle(required)))
     }
 
     /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are
@@ -1934,6 +1996,14 @@ impl Pair {
         }
     }
 
+    /// A restart before `generation` blamed this pair's spared work as collateral, and none of
+    /// it retired since.
+    pub(crate) fn collateral_before(&self, generation: u64) -> bool {
+        self.collateral_at.is_some_and(|at| at < generation)
+    }
+    pub(crate) fn note_collateral(&mut self, generation: u64) {
+        self.collateral_at.get_or_insert(generation);
+    }
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
         self.active
             .front()
@@ -1966,6 +2036,12 @@ impl Pair {
             visit(active.packet.completion.status());
         }
     }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
+        }
+    }
     pub(crate) fn classify(&self, classify: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
         for active in self.active.iter() {
             active
@@ -1991,10 +2067,10 @@ impl Pair {
         Some(observation::snapshot(&self.memory, front.ticket.ordinal).ok()?.untouched())
     }
 
-    /// The owner of a published group whose tiler started and whose fragment end is unwritten.
-    /// Groups an earlier recovery listed or blamed are skipped: a restart drops started groups,
-    /// so their records stay half-written without anything running.
-    pub(crate) fn running_owner(&self) -> Option<&Arc<VmStatus>> {
+    /// A published group whose tiler started and whose fragment end is unwritten, with its pass
+    /// record. Groups an earlier recovery listed or blamed are skipped: a restart drops started
+    /// groups, so their records stay half-written without anything running.
+    fn running(&self) -> Option<(&Active, [u64; 2])> {
         self.active
             .iter()
             .filter(|active| {
@@ -2002,11 +2078,15 @@ impl Pair {
                     && !active.packet.completion.interrupted()
                     && !active.packet.completion.blamed()
             })
-            .find(|active| {
-                observation::snapshot(&self.memory, active.ticket.ordinal)
-                    .is_ok_and(|snapshot| snapshot.pass[0] != 0 && snapshot.pass[1] == 0)
+            .find_map(|active| {
+                let pass = observation::snapshot(&self.memory, active.ticket.ordinal).ok()?.pass;
+                (pass[0] != 0 && pass[1] == 0).then_some((active, pass))
             })
-            .map(|active| active.packet.completion.status())
+    }
+
+    /// The owner of the `running` group and its tiler start, read while firmware is halted.
+    pub(crate) fn running_start(&self) -> Option<(&Arc<VmStatus>, u64)> {
+        self.running().map(|(active, pass)| (active.packet.completion.status(), pass[0]))
     }
 
     /// Firmware is halted and all graph borrowers have joined before this copy.
@@ -2040,6 +2120,11 @@ impl Pair {
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        // A killed guilty pair released on its proof holds no groups and only waits for its
+        // detach: quarantined again (another queue of its VM failed), it could never park.
+        if self.guilty_released {
+            return Ok(());
+        }
         self.quarantined = true;
         // Its groups end here, without their own watchdogs: none of their fragment kicks may hold
         // the task-stage order of other clients.
@@ -2207,6 +2292,8 @@ impl Pair {
             retirement::note_stampless(u16::from(self.slot), ordinal);
         }
         self.note_retirement(ordinal, context_update);
+        // Work of this pair retires: a later blame on it is collateral again.
+        self.collateral_at = None;
         let front = self.active.front_mut().ok_or(EIO)?;
         if !front.flist_completed {
             host.complete_render(
@@ -2616,9 +2703,22 @@ impl Pair {
         }
         let counters = self.free_list.counters()?;
         let stamps = host.stamps(self.qids())?;
-        let (_, state) = host.epoch()?;
+        let (generation, state) = host.epoch()?;
         Ok(retirement::drained(self.ordinal, stamps, counters, state)
-            || (state == 0 && self.executed_unstamped() && self.context_killed()))
+            || (state == 0 && self.executed_unstamped() && self.context_killed())
+            || self.guilty_killed(generation, state))
+    }
+
+    /// The pair's groups of a guilty context may go although they never retired: the firmware
+    /// finished the context's kill, and a GPU restart it raised after that has completed
+    /// (`state` 0). The kill unlinks the context's work list, but a group that was running at
+    /// the kill keeps running until a restart drops it, and only then is none of its memory
+    /// reachable. The pair itself, its ring and the context's work list stay held until the
+    /// context's scheduler release is consumed (detach, `release_killed_slots`).
+    fn guilty_killed(&self, generation: u64, state: u32) -> bool {
+        guilty_kill_done(self.guilty_unretired(generation), state, || {
+            self.memory.context.restarted_since_kill(self.context_killed(), generation)
+        })
     }
 
     /// The firmware acknowledged a kill of this pair's context (scheduler page): it no longer
@@ -2633,6 +2733,49 @@ impl Pair {
     /// Its memory stays until the kill is acknowledged.
     pub(crate) fn executed_for_kill(&self, context: &Arc<Context>) -> bool {
         Arc::ptr_eq(context, &self.memory.context) && self.executed_unstamped()
+    }
+
+    /// A kill of the pair's context releases it with work that never retired: its commands all
+    /// ran unstamped (`executed_unstamped`), or a recovery found its VM guilty
+    /// (`guilty_unretired`). Its memory stays until the kill is done (`firmware_drained`).
+    pub(crate) fn releasable_by_kill(&self, context: &Arc<Context>, generation: u64) -> bool {
+        self.executed_for_kill(context) || self.guilty_for_kill(context, generation)
+    }
+
+    /// The pair's context may be killed although its queued groups did not run: a recovery
+    /// found its VM guilty (`guilty_unretired`).
+    pub(crate) fn guilty_for_kill(&self, context: &Arc<Context>, generation: u64) -> bool {
+        Arc::ptr_eq(context, &self.memory.context) && self.guilty_unretired(generation)
+    }
+
+    /// A GPU recovery failed the pair's VM as guilty (its status records the failure, so every
+    /// later submission and publication of it is refused) and quarantined the pair. Not on M5.
+    pub(crate) fn failed_guilty(&self) -> bool {
+        let status = self.memory.context.status();
+        !self.memory.graph.is_m5() && self.quarantined && status.recovery_guilty() && status.get() != 0
+    }
+
+    /// A closed owner's quarantined pair holding published work of a VM that a GPU recovery
+    /// found guilty. Its started group hangs the GPU again after every restart, with its queued
+    /// groups behind it, so its work never retires like other work: on 25G83 the host cannot
+    /// take published groups back, and only a kill of the context unlinks them. Left alone,
+    /// the restarts reach the storm limit and every client loses the device (11-19 19:12 UTC).
+    ///
+    /// Only once the host accepted a restart (`generation`) since the context's first close:
+    /// the VM stays guilty, and a failed VM's pairs are all quarantined, but its groups queued
+    /// behind the one that hung may run and retire on their stamps. A kill then would unlink
+    /// those with nothing left to hang and so no restart to release them. A guilty group still
+    /// running hangs the GPU again within about 83 ms, which costs at most that one restart.
+    /// Not on M5, which takes published work back through its recovery target.
+    fn guilty_unretired(&self, generation: u64) -> bool {
+        !self.memory.graph.is_m5()
+            && self.memory.context.restarted_since_close(generation)
+            && self.quarantined
+            && self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.active.iter().all(|active| active.outer_published)
+            && self.memory.context.status().recovery_guilty()
     }
 
     /// Every command of this quarantined pair ran, its ring entries were consumed and its
@@ -2674,7 +2817,8 @@ impl Pair {
         // Commands the firmware never unlinked are released only after it acknowledged the
         // kill of their context, on every path (see `firmware_drained`).
         let unstamped = self.executed_unstamped();
-        let killed = unstamped && self.context_killed();
+        let (generation, state) = host.epoch()?;
+        let killed = (unstamped && self.context_killed()) || self.guilty_killed(generation, state);
         let Some(active) = self.active.iter_mut().find(|a| !a.flist_completed) else {
             return Ok(false);
         };
@@ -2685,8 +2829,9 @@ impl Pair {
         };
         let result = match retirement::poll(&mut active.ticket, &mut observer)? {
             retirement::Poll::Complete(ticks) => Ok(ticks),
-            // Its commands ran without a stamp (see `executed_unstamped`): they already failed
-            // with the quarantine, and the client sees them cancelled.
+            // Its commands ran without a stamp (see `executed_unstamped`), or its guilty context
+            // was killed (`guilty_killed`): they already failed with the quarantine, and the
+            // client sees them cancelled.
             retirement::Poll::Pending | retirement::Poll::Retry if killed => {
                 crate::g17::trace::teardown(2, u64::from(self.slot), active.ticket.ordinal, 0);
                 Err(ECANCELED)
@@ -2733,6 +2878,12 @@ impl Pair {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
             return Ok(false);
         }
+        let (generation, state) = host.epoch()?;
+        let guilty = self.guilty_killed(generation, state);
+        if guilty {
+            pr_warn!("G17: render slot {}: {} groups of a killed guilty context released after a later restart (gen {})\n",
+                self.slot, self.active.len(), generation);
+        }
         while let Some(active) = self.active.front() {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
             // proof above covers its stamps too (or the kill of its context), so only its
@@ -2746,10 +2897,25 @@ impl Pair {
             self.active.pop().ok_or(EIO)?;
         }
         self.quarantined = false;
+        self.guilty_released |= guilty;
         self.drain_failures = 0;
         self.drain_retry_at = 0;
         self.resync();
         Ok(true)
+    }
+
+    /// While the firmware is halted for a restart: a finished kill of this pair's context
+    /// counts as seen done at `generation`, the one before that restart, at the latest.
+    pub(crate) fn note_kill_sighting(&self, generation: u64) {
+        let context = &self.memory.context;
+        if context.kill_published() {
+            context.restarted_since_kill(self.context_killed(), generation);
+        }
+    }
+
+    /// See the `guilty_released` field.
+    pub(crate) fn guilty_released(&self) -> bool {
+        self.guilty_released
     }
 
     /// The registry first polls the completed prefix through this exact Arc.
@@ -2901,10 +3067,13 @@ impl Pair {
             &mut self.memory,
             &mut self.pending_aliases,
             &mut self.kick_aliases,
+            &mut self.client_kicks,
         )
     }
 }
 
+/// Installs a graph's memory. The new kick ring views in `kick_aliases` go to `views`, the
+/// pair's views in the graph's VM ([`Pair::client_kicks`]).
 fn install_memory(
     alloc: &Allocator<'_>,
     descriptors: &crate::g17::object::KernelObject,
@@ -2912,6 +3081,7 @@ fn install_memory(
     memory: &mut memory::Memory,
     pending_aliases: &mut Option<KVec<mmu::KernelMapping>>,
     kick_aliases: &mut Option<[Option<mmu::KernelMapping>; 2]>,
+    views: &mut [Option<mmu::KernelMapping>; 2],
 ) -> Result {
     use core::sync::atomic::{fence, Ordering};
     if pending_aliases.is_none() && kick_aliases.is_none() {
@@ -2920,8 +3090,6 @@ fn install_memory(
     if !memory.context.is_current() || kick_aliases.is_none() {
         return Err(EIO);
     }
-    let mut driver = KVec::new();
-    driver.reserve(2, GFP_KERNEL)?;
     let aliases = memory.take_persistent(pending_aliases.as_mut().ok_or(EIO)?)?;
     let context = memory.context.clone();
     let vm = context.vm();
@@ -2950,10 +3118,11 @@ fn install_memory(
         }
         fence(Ordering::SeqCst);
         staged = Some(previous);
-        for mapping in kick_aliases.take().ok_or(EIO)?.into_iter().flatten() {
-            driver.push(mapping, GFP_KERNEL)?;
+        for (view, alias) in views.iter_mut().zip(kick_aliases.take().ok_or(EIO)?) {
+            if alias.is_some() {
+                *view = alias;
+            }
         }
-        vm.append_driver_mappings(driver)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -2995,6 +3164,10 @@ pub(crate) struct PreparedBinding {
 /// The registry retains displaced backing until this exact context's release
 /// is acknowledged. A warm binding retains the old context without its graph.
 pub(crate) struct RetiredBinding {
+    /// Views of the kick rings in `context`'s VM that a pair parked after the VM's client
+    /// closed it gave up (`Pair::park`). Only held: declared first, they drop before the
+    /// memory and the context below.
+    _client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: Option<KBox<memory::Memory>>,
     context: Arc<Context>,
     pool: Arc<RenderPool>,
@@ -3035,6 +3208,9 @@ impl Pair {
                 previous.ready = true;
             }
         }
+    }
+    pub(crate) fn graph_started(&self) -> bool {
+        self.graph_started
     }
     pub(crate) fn forget_registration(&mut self) {
         self.registered = None;
@@ -3149,16 +3325,20 @@ impl Pair {
             .into_iter()
             .all(|c| c.done == c.read && c.read == c.write))
     }
-    pub(crate) fn reusable(&self) -> Result<bool> {
+    /// Idle, drained, and free of pending retirement or channel errors so a
+    /// live owner's sibling can be detached or a closed owner's pair reused.
+    pub(crate) fn detachable(&self) -> Result<bool> {
         let previous_ready = self
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
         Ok(!self.channel_error
-            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
+    }
+    pub(crate) fn reusable(&self) -> Result<bool> {
+        Ok(self.owner.is_none() && self.detachable()?)
     }
     /// An M5 pool may be replaced without changing the pair's live logical
     /// owner. Commands already using the pair must drain, and an earlier
@@ -3233,11 +3413,27 @@ impl Pair {
             let buffer_id = buffer_id.ok_or(EINVAL)?;
             let pm_generation = pm_generation.ok_or(EINVAL)?;
             let layout =
-                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs)?;
+                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs,
+                    self.board)?;
+            // A context of another VM gets the rings cleared before its VM is given its view,
+            // so it cannot read the entries earlier owners' commands left, as for a parked pair.
+            // The pair is bindable, hence idle: the firmware consumed every entry.
+            let other_vm = self.context().vm().id() != context.vm().id();
+            if other_vm {
+                for kick in &mut self.kicks {
+                    kick.clear_render_ring()?;
+                }
+            }
             let aliases = [
                 self.kicks[0].prepare_client_alias(context.vm())?,
                 self.kicks[1].prepare_client_alias(context.vm())?,
             ];
+            // A view the VM already has is the one this pair holds for it.
+            for (alias, view) in aliases.iter().zip(&self.client_kicks) {
+                if alias.is_none() && (other_vm || view.is_none()) {
+                    return Err(EFAULT);
+                }
+            }
             let (memory, persistent) = memory::Memory::new(
                 alloc,
                 pool,
@@ -3294,6 +3490,7 @@ impl Pair {
             } else {
                 None
             };
+            let mut views = [None, None];
             let installed = install_memory(
                 alloc,
                 descriptors,
@@ -3301,6 +3498,7 @@ impl Pair {
                 memory,
                 &mut binding.aliases,
                 &mut binding.kicks,
+                &mut views,
             );
             if let Err(error) = installed {
                 if let Some((slot, mappings)) = moved {
@@ -3309,6 +3507,16 @@ impl Pair {
                 return Err(error);
             }
             drop(moved);
+            // The previous VM's views go before the new owner's first kick entry is written.
+            if self.context().vm().id() != binding.context.vm().id() {
+                drop(core::mem::replace(&mut self.client_kicks, views));
+            } else {
+                for (view, alias) in self.client_kicks.iter_mut().zip(views) {
+                    if alias.is_some() {
+                        *view = alias;
+                    }
+                }
+            }
         } else {
             // The same logical context keeps its M5 queue records: their host
             // words already name it, and a rewrite would store firmware-owned
@@ -3327,6 +3535,7 @@ impl Pair {
             .take()
             .map(|memory| core::mem::replace(&mut self.memory, memory));
         let retired = RetiredBinding {
+            _client_kicks: [None, None],
             memory: old_memory,
             context: old_context,
             pool: old_pool,
@@ -3341,6 +3550,9 @@ impl Pair {
             self.previous = Some(retired);
         }
         self.memory.context = binding.context.clone();
+        // The pair is reused in place: the collateral mark of a previous owner, which may have
+        // closed without retiring anything, must not make the next owner's first blame its second.
+        self.collateral_at = rebound_collateral(self.collateral_at, self.owner == Some(binding.owner));
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
         if foreign {
@@ -3433,6 +3645,39 @@ mod completion_noted_tests {
         let mut both = bit(3);
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
+    }
+}
+
+/// A pair's collateral mark (`Pair::collateral_at`) when it is bound to an owner: kept for the
+/// same owner (a pool rebind), dropped for a new one. Not at the owner's close: an exited
+/// culprit's spared work stays published, and dropping its mark then would cost a restart.
+pub(crate) fn rebound_collateral(mark: Option<u64>, same_owner: bool) -> Option<u64> {
+    mark.filter(|_| same_owner)
+}
+
+/// See `Pair::guilty_killed`: a guilty pair (`guilty`) goes only with no restart in progress
+/// (`state` 0) and once `restarted` (`Context::restarted_since_kill`) holds. `restarted` is only
+/// asked of a guilty pair with no restart in progress, so that its first sighting of the kill
+/// is recorded at a settled generation.
+fn guilty_kill_done(guilty: bool, state: u32, restarted: impl FnOnce() -> bool) -> bool {
+    guilty && state == 0 && restarted()
+}
+
+#[kunit_tests(asahi_g17_render_guilty_kill)]
+mod guilty_kill_tests {
+    use super::guilty_kill_done;
+
+    #[test]
+    fn a_guilty_pair_goes_only_after_its_kill_and_a_later_restart() {
+        // Kill not acknowledged, or acknowledged with no restart since: held.
+        assert!(!guilty_kill_done(true, 0, || false));
+        // A restart in progress: held, and the kill's sighting is not recorded mid-restart.
+        assert!(!guilty_kill_done(true, 1, || panic!("asked during a restart")));
+        assert!(!guilty_kill_done(true, 3, || panic!("asked during a restart")));
+        // Acknowledged, restarted since, restart complete: released.
+        assert!(guilty_kill_done(true, 0, || true));
+        // Not a guilty pair: this proof never applies.
+        assert!(!guilty_kill_done(false, 0, || panic!("asked for an innocent pair")));
     }
 }
 

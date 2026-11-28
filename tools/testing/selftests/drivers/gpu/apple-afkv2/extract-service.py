@@ -24,6 +24,8 @@ prefix = r'''
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
 #define kfree(p) free(p)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define max(a,b) ((a)>(b)?(a):(b))
 #define min(a,b) ((a)<(b)?(a):(b))
 #define cpu_to_le16(x) (x)

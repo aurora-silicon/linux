@@ -58,6 +58,9 @@ struct apple_rtkit {
 	int version;
 	/* How long to wait for each handshake reply from the co-processor. */
 	unsigned int handshake_timeout_ms;
+	/* With handshake_deadline_set, no handshake wait runs past this (jiffies). */
+	unsigned long handshake_deadline;
+	bool handshake_deadline_set;
 
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;

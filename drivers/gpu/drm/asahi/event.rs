@@ -54,6 +54,11 @@ pub(crate) type Event = slotalloc::Guard<EventInner>;
 pub(crate) struct EventValue(u32);
 
 impl EventValue {
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+
     /// Returns the `EventValue` that succeeds this one.
     pub(crate) fn next(&self) -> EventValue {
         EventValue(self.0.wrapping_add(0x100))
@@ -119,6 +124,14 @@ impl EventInner {
         // keeps the GpuObject the stamp is contained within alive.
         EventValue(unsafe { &*self.stamp }.load(Ordering::Acquire))
     }
+
+    /// Read a completion stamp written by an agent outside the CPU coherency domain.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn current_noncoherent(&self) -> EventValue {
+        crate::pgtable::clean_invalidate_poc(self.stamp.cast(), core::mem::size_of::<u32>());
+        crate::pgtable::poc_barrier();
+        self.current()
+    }
 }
 
 impl slotalloc::SlotItem for EventInner {
@@ -128,6 +141,12 @@ impl slotalloc::SlotItem for EventInner {
         mod_pr_debug!("EventManager: Released slot {}\n", slot);
         data.owners[slot as usize] = None;
     }
+}
+
+/// Returns the owner registered for `slot`. Slot numbers come from firmware messages, so one
+/// outside the table is treated like an empty slot instead of being trusted as an index.
+pub(crate) fn slot_owner<T: Clone>(owners: &[Option<T>], slot: u32) -> Option<T> {
+    owners.get(slot as usize).and_then(|owner| owner.as_ref().cloned())
 }
 
 /// Inner data for the event manager, to be protected by the SlotAllocator lock.
@@ -199,11 +218,29 @@ impl EventManager {
         Ok(ev)
     }
 
+    /// Make freshly initialized stamps visible before a non-coherent firmware starts.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn sync_initial_stamps(&self) {
+        self.alloc.with_inner(|inner| {
+            let stamps = inner.stamps.as_slice();
+            let fw_stamps = inner.fw_stamps.as_slice();
+            crate::pgtable::clean_poc(stamps.as_ptr().cast(), core::mem::size_of_val(stamps));
+            crate::pgtable::clean_poc(fw_stamps.as_ptr().cast(), core::mem::size_of_val(fw_stamps));
+        });
+        crate::pgtable::poc_barrier();
+    }
+
+    /// Reserve the normal stamp pair for a kernel queue that polls its own completion.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn try_get_polled(&self) -> Result<Event> {
+        self.alloc.try_get(None)
+    }
+
     /// Signals an event by slot, indicating completion (of one or more commands).
     pub(crate) fn signal(&self, slot: u32) {
         match self
             .alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 owner.signal();
@@ -218,7 +255,7 @@ impl EventManager {
     pub(crate) fn mark_error(&self, slot: u32, wait_value: u32, error: workqueue::WorkError) {
         match self
             .alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 owner.mark_error(EventValue(wait_value), error);
@@ -235,7 +272,7 @@ impl EventManager {
         slot: u32,
     ) -> Option<Arc<dyn workqueue::WorkQueue + Send + Sync>> {
         self.alloc
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| slot_owner(&inner.owners, slot))
     }
 
     /// Fail all commands, used when the GPU crashes.
@@ -253,5 +290,19 @@ impl EventManager {
         for wq in owners {
             wq.fail_all(error);
         }
+    }
+}
+
+#[kunit_tests(asahi_event_slot_owner)]
+mod tests {
+    use super::slot_owner;
+
+    #[test]
+    fn firmware_slot_outside_the_table_has_no_owner() {
+        let owners = [Some(7u32), None];
+        assert_eq!(slot_owner(&owners, 0), Some(7));
+        assert_eq!(slot_owner(&owners, 1), None);
+        assert_eq!(slot_owner(&owners, 2), None);
+        assert_eq!(slot_owner(&owners, u32::MAX), None);
     }
 }

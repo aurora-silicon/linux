@@ -4,7 +4,6 @@
  */
 
 #include <kunit/device.h>
-#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <kunit/test-bug.h>
 #include <linux/module.h>
@@ -100,20 +99,9 @@ static const struct software_node * const cd321x_test_nodes[] = {
 
 struct cd321x_tbt_test {
 	struct device *dev;
-	bool keep_waiting;
-	unsigned int keep_waiting_calls;
 	unsigned int set_calls;
 	int last_state;
 };
-
-/* Stands in for the driver core's answer on whether to keep waiting. */
-static bool cd321x_tbt_test_keep_waiting(struct device *dev)
-{
-	struct cd321x_tbt_test *ctx = kunit_get_current_test()->priv;
-
-	ctx->keep_waiting_calls++;
-	return ctx->keep_waiting;
-}
 
 static void cd321x_tbt_test_unregister_nodes(void *unused)
 {
@@ -137,9 +125,6 @@ static int cd321x_tbt_test_init(struct kunit *test)
 
 	ctx->dev = kunit_device_register(test, "cd321x");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->dev);
-
-	kunit_activate_static_stub(test, cd321x_tbt_switch_keep_waiting,
-				   cd321x_tbt_test_keep_waiting);
 	return 0;
 }
 
@@ -170,7 +155,6 @@ static void cd321x_tbt_no_router_test(struct kunit *test)
 				   &late);
 	KUNIT_EXPECT_NULL(test, sw);
 	KUNIT_EXPECT_FALSE(test, late);
-	KUNIT_EXPECT_EQ(test, ctx->keep_waiting_calls, 0);
 }
 
 /* A router whose driver has registered its switch is used. */
@@ -203,44 +187,25 @@ static void cd321x_tbt_router_bound_test(struct kunit *test)
 				   &late);
 	KUNIT_EXPECT_NOT_ERR_OR_NULL(test, sw);
 	KUNIT_EXPECT_FALSE(test, late);
-	KUNIT_EXPECT_EQ(test, ctx->keep_waiting_calls, 0);
 	typec_thunderbolt_switch_put(sw);
 }
 
-/* A router that has not registered its switch yet defers the port. */
-static void cd321x_tbt_router_pending_test(struct kunit *test)
-{
-	struct cd321x_tbt_test *ctx = test->priv;
-	struct typec_thunderbolt_switch *sw;
-	bool late = true;
-
-	ctx->keep_waiting = true;
-	sw = cd321x_tbt_switch_get(ctx->dev,
-				   software_node_fwnode(&cd321x_test_connector),
-				   &late);
-	KUNIT_EXPECT_PTR_EQ(test, sw, ERR_PTR(-EPROBE_DEFER));
-	KUNIT_EXPECT_FALSE(test, late);
-	KUNIT_EXPECT_EQ(test, ctx->keep_waiting_calls, 1);
-}
-
 /*
- * Once the driver core stops waiting for missing dependencies, a router that
- * has not registered its switch no longer keeps the port from probing, and the
- * port is told to take the router if it binds later.
+ * A router that has not registered its switch does not keep the port from
+ * probing, even while the driver core still waits for missing dependencies:
+ * the port is told to take the router when it binds.
  */
-static void cd321x_tbt_router_never_binds_test(struct kunit *test)
+static void cd321x_tbt_router_pending_test(struct kunit *test)
 {
 	struct cd321x_tbt_test *ctx = test->priv;
 	struct typec_thunderbolt_switch *sw;
 	bool late = false;
 
-	ctx->keep_waiting = false;
 	sw = cd321x_tbt_switch_get(ctx->dev,
 				   software_node_fwnode(&cd321x_test_connector),
 				   &late);
 	KUNIT_EXPECT_NULL(test, sw);
 	KUNIT_EXPECT_TRUE(test, late);
-	KUNIT_EXPECT_EQ(test, ctx->keep_waiting_calls, 1);
 }
 
 static int cd321x_tbt_test_notify(struct notifier_block *nb,
@@ -458,7 +423,6 @@ static struct kunit_case cd321x_tbt_cases[] = {
 	KUNIT_CASE(cd321x_tbt_no_router_test),
 	KUNIT_CASE(cd321x_tbt_router_bound_test),
 	KUNIT_CASE(cd321x_tbt_router_pending_test),
-	KUNIT_CASE(cd321x_tbt_router_never_binds_test),
 	KUNIT_CASE(cd321x_tbt_router_binds_late_test),
 	KUNIT_CASE(cd321x_tbt_router_bound_before_watch_test),
 	KUNIT_CASE(cd321x_tbt_other_router_binds_test),

@@ -18,6 +18,13 @@
 
 #define tps_to_sn(tps) container_of_const((tps), struct sn201202x, cd.tps)
 
+/* How long a register selection may take to be confirmed. */
+#define SN201202X_SELECT_TIMEOUT_US	100000
+/*
+ * The same while the controller wakes up: a selection sent before it is
+ * awake is never confirmed, so sn201202x_wake_poll() retries after this.
+ */
+#define SN201202X_WAKE_SELECT_TIMEOUT_US	5000
 /* A sleeping controller does not answer a select; give up on it sooner. */
 #define SN201202X_ATOMIC_SELECT_MS	10
 
@@ -34,7 +41,8 @@
 #define SN201202X_LDCM_RESULT		GENMASK(5, 4)
 #define SN201202X_LDCM_RETRY_MS		500
 
-static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
+static int sn201202x_select_reg(struct spmi_device *sdev, u8 reg,
+				unsigned int timeout_us)
 {
 	int err;
 	u8 val;
@@ -55,19 +63,23 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	if (sn->polled || sn->select_polled) {
 		int poll_err;
 
-		if (sn->atomic)
+		if (sn->atomic) {
+			unsigned int atomic_us = min_t(unsigned int, timeout_us,
+						       SN201202X_ATOMIC_SELECT_MS * 1000);
+
 			poll_err = read_poll_timeout_atomic(spmi_register_read, err,
 							    err || val == reg, 100,
-							    SN201202X_ATOMIC_SELECT_MS * 1000,
-							    false, sdev, 0, &val);
-		else
+							    atomic_us, false, sdev, 0, &val);
+		} else {
 			poll_err = read_poll_timeout(spmi_register_read, err,
-						     err || val == reg, 100, 100000,
+						     err || val == reg, 100, timeout_us,
 						     false, sdev, 0, &val);
+		}
 		return err ?: poll_err;
 	}
 
-	if (!wait_for_completion_timeout(&sn->select_completion, msecs_to_jiffies(100)))
+	if (!wait_for_completion_timeout(&sn->select_completion,
+					 max(1UL, usecs_to_jiffies(timeout_us))))
 		return -ETIMEDOUT;
 
 	while (--attempts) {
@@ -89,6 +101,11 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	}
 
 	return -EIO;
+}
+
+static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
+{
+	return sn201202x_select_reg(sdev, reg, SN201202X_SELECT_TIMEOUT_US);
 }
 
 static int __regmap_sn201202x_read(void *context,
@@ -580,7 +597,12 @@ static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 						 msecs_to_jiffies(100)))
 		return 0;
 
-	/* A sleeping ACE3 ACKs commands but returns zeros until it is awake. */
+	/*
+	 * A sleeping ACE3 ACKs commands but returns zeros until it is awake,
+	 * and does not confirm a register selection sent before then. Retry
+	 * the selection after a few ms instead of waiting the full awake
+	 * selection timeout on every polled wake.
+	 */
 	deadline = jiffies + msecs_to_jiffies(500);
 	do {
 		if (++tries % 20 == 0) {
@@ -588,9 +610,10 @@ static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 			if (ret)
 				return ret;
 		}
-		ret = regmap_sn201202x_select_reg(sn->sdev, TPS_REG_MODE);
+		ret = sn201202x_select_reg(sn->sdev, TPS_REG_MODE,
+					   SN201202X_WAKE_SELECT_TIMEOUT_US);
 		if (ret == -ETIMEDOUT) {
-			budget_ms -= SN201202X_ATOMIC_SELECT_MS;
+			budget_ms -= SN201202X_WAKE_SELECT_TIMEOUT_US / 1000;
 			continue;
 		}
 		if (ret)

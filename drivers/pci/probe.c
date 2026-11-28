@@ -1402,6 +1402,8 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 	u8 primary, secondary, subordinate;
 	int broken = 0;
 	bool fixed_buses;
+	bool reassign = pcibios_assign_all_busses() &&
+			!pci_find_host_bridge(bus)->no_reassign_bus;
 	u8 fixed_sec, fixed_sub;
 	int next_busnr;
 
@@ -1449,7 +1451,7 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 	}
 
 	if ((secondary || subordinate) &&
-	    !pcibios_assign_all_busses() && !broken) {
+	    !reassign && !broken) {
 		unsigned int cmax, buses;
 
 		/*
@@ -1491,7 +1493,7 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
 		 * do in the second pass.
 		 */
 		if (!pass) {
-			if (pcibios_assign_all_busses() || broken)
+			if (reassign || broken)
 
 				/*
 				 * Temporarily disable forwarding of the

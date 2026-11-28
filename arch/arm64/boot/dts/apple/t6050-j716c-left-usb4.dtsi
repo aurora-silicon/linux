@@ -190,6 +190,8 @@
 };
 &{/soc@200000000} {
 	acio0_mbox: mailbox@2a1108000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x2 0xa1108000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 837 IRQ_TYPE_LEVEL_HIGH>,
@@ -201,6 +203,8 @@
 		#mbox-cells = <0>;
 	};
 	acio0: acio@2a1ac0000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-usb4-acio";
 		reg = <0x2 0xa1ac0000 0x0 0xc000>,
 		<0x2 0xa1080000 0x0 0x26000>,
@@ -648,6 +652,8 @@
 };
 &{/soc@200000000} {
 	acio1_mbox: mailbox@2a9108000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x2 0xa9108000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 847 IRQ_TYPE_LEVEL_HIGH>,
@@ -659,6 +665,8 @@
 		#mbox-cells = <0>;
 	};
 	acio1: acio@2a9ac0000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-usb4-acio";
 		reg = <0x2 0xa9ac0000 0x0 0xc000>,
 		<0x2 0xa9080000 0x0 0x26000>,
@@ -1076,11 +1084,6 @@
 
 /* DisplayPort alt mode and USB4 DP tunnels on the left ports. */
 &atc0_dpxbar {
-	compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
-	reg = <0x2 0xa324c000 0x0 0x4000>;
-	#mux-control-cells = <1>;
-	power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "okay";
 };
 &ps_atc0_common_dp_0 {
@@ -1133,11 +1136,6 @@
 				hpm0_dp1: endpoint@1 { reg = <1>; remote-endpoint = <&dcpext2_left0>; };
 			}; }; }; };
 &atc1_dpxbar {
-	compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
-	reg = <0x2 0xab24c000 0x0 0x4000>;
-	#mux-control-cells = <1>;
-	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "okay";
 };
 &ps_atc1_common_dp_0 {
