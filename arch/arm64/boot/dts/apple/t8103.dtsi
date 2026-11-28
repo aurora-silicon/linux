@@ -1092,8 +1092,9 @@
 		pmgr_misc: power-management@23b058000 {
 			compatible = "apple,t8103-pmgr-misc";
 			reg = <0x2 0x3b058000 0x0 0x400>,
-			      <0x2 0x3b05c000 0x0 0x400>;
-			reg-names = "fabric-ps", "dcs-ps";
+			      <0x2 0x3b05c000 0x0 0x400>,
+			      <0x2 0x3b060000 0x0 0x400>;
+			reg-names = "fabric-ps", "dcs-ps", "disp-ps";
 		};
 
 		aic: interrupt-controller@23b100000 {

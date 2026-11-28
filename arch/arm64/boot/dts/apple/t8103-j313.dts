@@ -247,4 +247,8 @@
 	status = "okay";
 };
 
+&pmgr_misc {
+	apple,disp-min-pstate = <2>;
+};
+
 #include "t8103-j313-control.dtsi"
