@@ -583,9 +583,10 @@ static int uvd_v3_1_sw_init(struct amdgpu_ip_block *ip_block)
 	/* Retrieval firmware validate key */
 	ptr = adev->uvd.inst[0].cpu_addr;
 	ptr += 192 + 16;
-	memcpy(&ucode_len, ptr, 4);
+	amdgpu_bo_memcpy_from(adev->uvd.inst[0].vcpu_bo, &ucode_len, ptr, 4);
 	ptr += ucode_len;
-	memcpy(&adev->uvd.keyselect, ptr, 4);
+	amdgpu_bo_memcpy_from(adev->uvd.inst[0].vcpu_bo, &adev->uvd.keyselect,
+			      ptr, 4);
 
 	return r;
 }

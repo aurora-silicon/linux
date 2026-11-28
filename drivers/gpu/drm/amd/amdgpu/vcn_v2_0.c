@@ -2085,7 +2085,8 @@ static int vcn_v2_0_start_sriov(struct amdgpu_device *adev)
 
 		/* add end packet */
 		tmp = sizeof(struct mmsch_v2_0_cmd_end);
-		memcpy((void *)init_table, &end, tmp);
+		amdgpu_bo_memcpy_to(adev->virt.mm_table.bo, init_table, &end,
+				    tmp);
 		table_size += (tmp / 4);
 		header->vcn_table_size = table_size;
 

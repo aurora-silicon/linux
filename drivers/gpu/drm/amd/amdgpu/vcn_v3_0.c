@@ -1539,7 +1539,7 @@ static int vcn_v3_0_start_sriov(struct amdgpu_device *adev)
 	/* Update init table header in memory */
 	size = sizeof(struct mmsch_v3_0_init_header);
 	table_loc = (uint32_t *)table->cpu_addr;
-	memcpy((void *)table_loc, &header, size);
+	amdgpu_bo_memcpy_to(table->bo, table_loc, &header, size);
 
 	/* message MMSCH (in VCN[0]) to initialize this client
 	 * 1, write to mmsch_vf_ctx_addr_lo/hi register with GPU mc addr

@@ -24,6 +24,7 @@
 #include "smumgr.h"
 #include "vega20_inc.h"
 #include "soc15_common.h"
+#include "amdgpu_object.h"
 #include "vega20_smumgr.h"
 #include "vega20_ppsmc.h"
 #include "smu11_driver_if.h"
@@ -194,8 +195,9 @@ static int vega20_copy_table_from_smc(struct pp_hwmgr *hwmgr,
 
 	amdgpu_hdp_invalidate(adev, NULL);
 
-	memcpy(table, priv->smu_tables.entry[table_id].table,
-			priv->smu_tables.entry[table_id].size);
+	amdgpu_bo_memcpy_from(priv->smu_tables.entry[table_id].handle, table,
+			      priv->smu_tables.entry[table_id].table,
+			      priv->smu_tables.entry[table_id].size);
 
 	return 0;
 }
@@ -220,8 +222,9 @@ static int vega20_copy_table_to_smc(struct pp_hwmgr *hwmgr,
 	PP_ASSERT_WITH_CODE(priv->smu_tables.entry[table_id].size != 0,
 			"Invalid SMU Table Length!", return -EINVAL);
 
-	memcpy(priv->smu_tables.entry[table_id].table, table,
-			priv->smu_tables.entry[table_id].size);
+	amdgpu_bo_memcpy_to(priv->smu_tables.entry[table_id].handle,
+			    priv->smu_tables.entry[table_id].table, table,
+			    priv->smu_tables.entry[table_id].size);
 
 	amdgpu_hdp_flush(adev, NULL);
 
@@ -253,8 +256,10 @@ int vega20_set_activity_monitor_coeff(struct pp_hwmgr *hwmgr,
 	struct amdgpu_device *adev = hwmgr->adev;
 	int ret = 0;
 
-	memcpy(priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].table, table,
-			priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].size);
+	amdgpu_bo_memcpy_to(priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].handle,
+			    priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].table,
+			    table,
+			    priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].size);
 
 	amdgpu_hdp_flush(adev, NULL);
 
@@ -308,8 +313,10 @@ int vega20_get_activity_monitor_coeff(struct pp_hwmgr *hwmgr,
 
 	amdgpu_hdp_invalidate(adev, NULL);
 
-	memcpy(table, priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].table,
-			priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].size);
+	amdgpu_bo_memcpy_from(priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].handle,
+			      table,
+			      priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].table,
+			      priv->smu_tables.entry[TABLE_ACTIVITY_MONITOR_COEFF].size);
 
 	return 0;
 }

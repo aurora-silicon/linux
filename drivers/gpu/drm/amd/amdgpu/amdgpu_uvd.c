@@ -797,6 +797,8 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
 {
 	struct amdgpu_device *adev = ctx->parser->adev;
 	int32_t *msg, msg_type, handle;
+	int32_t msg_buf[62];
+	size_t bo_size;
 	void *ptr;
 	long r;
 	int i;
@@ -812,7 +814,20 @@ static int amdgpu_uvd_cs_msg(struct amdgpu_uvd_cs_ctx *ctx,
 		return r;
 	}
 
-	msg = ptr + offset;
+	if (bo->tbo.resource->bus.is_nonposted) {
+		bo_size = amdgpu_bo_size(bo);
+		if (offset >= bo_size || bo_size - offset < 3 * sizeof(int32_t)) {
+			amdgpu_bo_kunmap(bo);
+			return -EINVAL;
+		}
+		memset(msg_buf, 0, sizeof(msg_buf));
+		amdgpu_bo_memcpy_from(bo, msg_buf, (u8 *)ptr + offset,
+				      min_t(size_t, sizeof(msg_buf),
+					    bo_size - offset));
+		msg = msg_buf;
+	} else {
+		msg = ptr + offset;
+	}
 
 	msg_type = msg[1];
 	handle = msg[2];

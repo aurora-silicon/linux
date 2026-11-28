@@ -1116,13 +1116,18 @@ static int amdgpu_ucode_init_single_fw(struct amdgpu_device *adev,
 			le32_to_cpu(header->ucode_array_offset_bytes);
 	}
 
-	memcpy(ucode->kaddr, ucode_addr, ucode->ucode_size);
+	if (adev->firmware.fw_buf)
+		amdgpu_bo_memcpy_to(adev->firmware.fw_buf, ucode->kaddr,
+				    ucode_addr, ucode->ucode_size);
+	else
+		memcpy(ucode->kaddr, ucode_addr, ucode->ucode_size);
 
 	return 0;
 }
 
-static int amdgpu_ucode_patch_jt(struct amdgpu_firmware_info *ucode,
-				uint64_t mc_addr, void *kptr)
+static int amdgpu_ucode_patch_jt(struct amdgpu_device *adev,
+				 struct amdgpu_firmware_info *ucode,
+				 uint64_t mc_addr, void *kptr)
 {
 	const struct gfx_firmware_header_v1_0 *header = NULL;
 	const struct common_firmware_header *comm_hdr = NULL;
@@ -1140,7 +1145,11 @@ static int amdgpu_ucode_patch_jt(struct amdgpu_firmware_info *ucode,
 	src_addr = (uint8_t *)ucode->fw->data +
 			   le32_to_cpu(comm_hdr->ucode_array_offset_bytes) +
 			   (le32_to_cpu(header->jt_offset) * 4);
-	memcpy(dst_addr, src_addr, le32_to_cpu(header->jt_size) * 4);
+	if (adev->firmware.fw_buf)
+		amdgpu_bo_memcpy_to(adev->firmware.fw_buf, dst_addr, src_addr,
+				    le32_to_cpu(header->jt_size) * 4);
+	else
+		memcpy(dst_addr, src_addr, le32_to_cpu(header->jt_size) * 4);
 
 	return 0;
 }
@@ -1159,7 +1168,9 @@ int amdgpu_ucode_create_bo(struct amdgpu_device *adev)
 			dev_err(adev->dev, "failed to create kernel buffer for firmware.fw_buf\n");
 			return -ENOMEM;
 		} else if (amdgpu_sriov_vf(adev)) {
-			memset(adev->firmware.fw_buf_ptr, 0, adev->firmware.fw_size);
+			amdgpu_bo_memset(adev->firmware.fw_buf,
+					 adev->firmware.fw_buf_ptr, 0,
+					 adev->firmware.fw_size);
 		}
 	}
 	return 0;
@@ -1207,8 +1218,9 @@ int amdgpu_ucode_init_bo(struct amdgpu_device *adev)
 				const struct gfx_firmware_header_v1_0 *cp_hdr;
 
 				cp_hdr = (const struct gfx_firmware_header_v1_0 *)ucode->fw->data;
-				amdgpu_ucode_patch_jt(ucode,  adev->firmware.fw_buf_mc + fw_offset,
-						    adev->firmware.fw_buf_ptr + fw_offset);
+				amdgpu_ucode_patch_jt(adev, ucode,
+						      adev->firmware.fw_buf_mc + fw_offset,
+						      adev->firmware.fw_buf_ptr + fw_offset);
 				fw_offset += ALIGN(le32_to_cpu(cp_hdr->jt_size) << 2, PAGE_SIZE);
 			}
 			fw_offset += ALIGN(ucode->ucode_size, PAGE_SIZE);

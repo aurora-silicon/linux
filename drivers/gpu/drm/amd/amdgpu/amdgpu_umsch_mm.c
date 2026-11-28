@@ -199,7 +199,8 @@ int amdgpu_umsch_mm_allocate_ucode_buffer(struct amdgpu_umsch_mm *umsch)
 		return r;
 	}
 
-	memcpy(adev->umsch_mm.ucode_fw_ptr, fw_data, fw_size);
+	amdgpu_bo_memcpy_to(adev->umsch_mm.ucode_fw_obj,
+			    adev->umsch_mm.ucode_fw_ptr, fw_data, fw_size);
 
 	amdgpu_bo_kunmap(adev->umsch_mm.ucode_fw_obj);
 	amdgpu_bo_unreserve(adev->umsch_mm.ucode_fw_obj);
@@ -231,7 +232,8 @@ int amdgpu_umsch_mm_allocate_ucode_data_buffer(struct amdgpu_umsch_mm *umsch)
 		return r;
 	}
 
-	memcpy(adev->umsch_mm.data_fw_ptr, fw_data, fw_size);
+	amdgpu_bo_memcpy_to(adev->umsch_mm.data_fw_obj,
+			    adev->umsch_mm.data_fw_ptr, fw_data, fw_size);
 
 	amdgpu_bo_kunmap(adev->umsch_mm.data_fw_obj);
 	amdgpu_bo_unreserve(adev->umsch_mm.data_fw_obj);

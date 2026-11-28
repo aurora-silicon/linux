@@ -528,7 +528,7 @@ static int jpeg_v5_0_1_start_sriov(struct amdgpu_device *adev)
 		/* send init table to MMSCH */
 		size = sizeof(struct mmsch_v5_0_init_header);
 		table_loc = (uint32_t *)table->cpu_addr;
-		memcpy((void *)table_loc, &header, size);
+		amdgpu_bo_memcpy_to(table->bo, table_loc, &header, size);
 
 		ctx_addr = table->gpu_addr;
 		WREG32_SOC15(VCN, jpeg_inst, regMMSCH_VF_CTX_ADDR_LO, lower_32_bits(ctx_addr));

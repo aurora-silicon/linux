@@ -26,6 +26,7 @@
 #include "smumgr.h"
 #include "smu10_inc.h"
 #include "soc15_common.h"
+#include "amdgpu_object.h"
 #include "smu10_smumgr.h"
 #include "ppatomctrl.h"
 #include "rv_ppsmc.h"
@@ -141,8 +142,9 @@ static int smu10_copy_table_from_smc(struct pp_hwmgr *hwmgr,
 
 	amdgpu_hdp_invalidate(adev, NULL);
 
-	memcpy(table, (uint8_t *)priv->smu_tables.entry[table_id].table,
-			priv->smu_tables.entry[table_id].size);
+	amdgpu_bo_memcpy_from(priv->smu_tables.entry[table_id].handle, table,
+			      priv->smu_tables.entry[table_id].table,
+			      priv->smu_tables.entry[table_id].size);
 
 	return 0;
 }
@@ -161,8 +163,9 @@ static int smu10_copy_table_to_smc(struct pp_hwmgr *hwmgr,
 	PP_ASSERT_WITH_CODE(priv->smu_tables.entry[table_id].size != 0,
 			"Invalid SMU Table Length!", return -EINVAL;);
 
-	memcpy(priv->smu_tables.entry[table_id].table, table,
-			priv->smu_tables.entry[table_id].size);
+	amdgpu_bo_memcpy_to(priv->smu_tables.entry[table_id].handle,
+			    priv->smu_tables.entry[table_id].table, table,
+			    priv->smu_tables.entry[table_id].size);
 
 	amdgpu_hdp_flush(adev, NULL);
 

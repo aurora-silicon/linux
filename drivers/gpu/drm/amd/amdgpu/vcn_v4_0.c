@@ -1459,7 +1459,10 @@ static int vcn_v4_0_start_sriov(struct amdgpu_device *adev)
 		if (amdgpu_sriov_is_vcn_rb_decouple(adev)) {
 			vcn_v4_0_init_ring_metadata(adev, i, ring_enc);
 
-			memset((void *)&rb_setup->rb_info, 0, sizeof(struct amdgpu_vcn_rb_setup_info) * MAX_NUM_VCN_RB_SETUP);
+			amdgpu_bo_memset(adev->vcn.inst[i].vcpu_bo,
+					 &rb_setup->rb_info, 0,
+					 sizeof(struct amdgpu_vcn_rb_setup_info) *
+					 MAX_NUM_VCN_RB_SETUP);
 			if (!(adev->vcn.harvest_config & (1 << 0))) {
 				rb_setup->rb_info[0].rb_addr_lo = lower_32_bits(adev->vcn.inst[0].ring_enc[0].gpu_addr);
 				rb_setup->rb_info[0].rb_addr_hi = upper_32_bits(adev->vcn.inst[0].ring_enc[0].gpu_addr);
@@ -1501,7 +1504,7 @@ static int vcn_v4_0_start_sriov(struct amdgpu_device *adev)
 	/* Update init table header in memory */
 	size = sizeof(struct mmsch_v4_0_init_header);
 	table_loc = (uint32_t *)table->cpu_addr;
-	memcpy((void *)table_loc, &header, size);
+	amdgpu_bo_memcpy_to(table->bo, table_loc, &header, size);
 
 	/* message MMSCH (in VCN[0]) to initialize this client
 	 * 1, write to mmsch_vf_ctx_addr_lo/hi register with GPU mc addr
