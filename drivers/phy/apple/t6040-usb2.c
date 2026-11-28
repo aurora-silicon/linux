@@ -40,6 +40,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/phy/apple-atc.h>
 #include <linux/phy/apple-t6040-cio.h>
@@ -138,6 +139,8 @@
 #define T6040_CORE_UC_CTRL_TNBL_DONE	BIT(10)	/* the coprocessor has tuned the PHY */
 #define T6040_CORE_XBAR			0x6c
 #define T6040_CORE_XBAR_LANES		0x78
+#define T6040_CORE_LN0_RX_TOP_CIO	0x935c
+#define T6040_CORE_LN1_RX_TOP_CIO	0x1935c
 #define T6040_CORE_BIST			0x29000	/* ACIOPHY_BIST_BLK, atc-phy reg[35] */
 #define T6040_BIST_CFG0			0x004
 #define T6040_BIST_CFG1			0x008
@@ -366,6 +369,7 @@ struct t6040_usb2_phy {
 	/* CIO (USB4/Thunderbolt); cio_ok is false unless the DT has the CIO tables */
 	struct apple_tunable *cio_tunables[5];
 	bool cio_ok;
+	bool cio_rx_top_dflt;	/* no CIO lane tables in the DT: the RX_TOP defaults */
 	bool cio_up;		/* PHY in mode 2, holds a runtime PM reference */
 	bool cio_elsewhere;	/* USB4/TBT on the port without CIO here: lanes left alone */
 	bool pipe_tunneled;	/* the controller's PIPE runs on the USB4 router */
@@ -2427,6 +2431,15 @@ static void t6040_cio_tunables(struct t6040_usb2_phy *tphy)
 				    tphy->tunables[i]);
 	for (i = 0; i < ARRAY_SIZE(tphy->cio_tunables); i++)
 		apple_tunable_apply(t6040_core(tphy), tphy->cio_tunables[i]);
+	/*
+	 * A device tree without the CIO lane tables (the T6040 ones): the
+	 * tunable_LN0/1_RX_TOP_CIO_DFLT writes they would carry.  UC_REGS_CIO
+	 * and RX_EQ_CIO are empty there.
+	 */
+	if (tphy->cio_rx_top_dflt) {
+		t6040_usb2_clear32(t6040_core(tphy) + T6040_CORE_LN0_RX_TOP_CIO, 0xe00);
+		t6040_usb2_clear32(t6040_core(tphy) + T6040_CORE_LN1_RX_TOP_CIO, 0xe00);
+	}
 }
 
 /* The mode-2 crossbar: lane fields of core+0x6c cleared, core+0x78[4:0] = flip, then [1:0] = 2. */
@@ -2675,21 +2688,54 @@ put:
 	return ret;
 }
 
+/* Whether @router and this PHY are linked to the same Type-C connector. */
+static bool t6040_cio_router_shares_connector(struct t6040_usb2_phy *tphy,
+					      struct device_node *router)
+{
+	struct device_node *rep, *pep;
+
+	for_each_endpoint_of_node(router, rep) {
+		struct device_node *con = of_graph_get_remote_port_parent(rep);
+
+		if (!con)
+			continue;
+		for_each_endpoint_of_node(tphy->dev->of_node, pep) {
+			struct device_node *pcon = of_graph_get_remote_port_parent(pep);
+			bool match = pcon == con;
+
+			of_node_put(pcon);
+			if (match) {
+				of_node_put(pep);
+				of_node_put(con);
+				of_node_put(rep);
+				return true;
+			}
+		}
+		of_node_put(con);
+	}
+	return false;
+}
+
 /*
  * A USB4/Thunderbolt mux event only takes the port into CIO while the router
- * that runs over this PHY (a node whose phys property names it) is enabled
- * in the live device tree. The default device trees keep the routers
- * disabled, so the port stays on its USB2/USB3/DP paths until a router is
- * enabled.
+ * that runs over this PHY is enabled in the live device tree: a node whose
+ * phys property names this PHY, or whose graph endpoint is on the Type-C
+ * connector this PHY serves (the T6040 device trees link the router that
+ * way).  With the router disabled, the port stays on its USB2/USB3/DP paths.
  */
 static bool t6040_cio_router_enabled(struct t6040_usb2_phy *tphy)
 {
 	struct device_node *np;
 
 	for_each_compatible_node(np, NULL, "apple,t6040-usb4-acio") {
-		struct device_node *phy = of_parse_phandle(np, "phys", 0);
-		bool match = phy == tphy->dev->of_node && of_device_is_available(np);
+		struct device_node *phy;
+		bool match;
 
+		if (!of_device_is_available(np))
+			continue;
+		phy = of_parse_phandle(np, "phys", 0);
+		match = phy == tphy->dev->of_node ||
+			t6040_cio_router_shares_connector(tphy, np);
 		of_node_put(phy);
 		if (match) {
 			of_node_put(np);
@@ -2721,18 +2767,24 @@ static void t6040_cio_remove(void *data)
 	t6040_cio_down_locked(tphy);
 }
 
-/* CIO needs the USB3 pieces and the CIO lane tables; anything less leaves it off. */
+/*
+ * CIO needs the USB3 pieces.  The CIO lane tables come from the device tree
+ * when it has them; without them (the T6040 device trees) the lanes take
+ * the RX_TOP defaults (t6040_cio_tunables()).
+ */
 static int t6040_cio_probe(struct t6040_usb2_phy *tphy)
 {
 	struct device *dev = tphy->dev;
 	size_t i;
 
-	if (!tphy->usb3_ok ||
-	    (!of_property_present(dev->of_node, t6040_cio_tunable_props[1]) &&
-	     !of_property_present(dev->of_node, t6040_cio_tunable_props[2])))
+	if (!tphy->usb3_ok)
 		return 0;
 
-	for (i = 0; i < ARRAY_SIZE(t6040_cio_tunable_props); i++) {
+	if (!of_property_present(dev->of_node, t6040_cio_tunable_props[1]) &&
+	    !of_property_present(dev->of_node, t6040_cio_tunable_props[2]))
+		tphy->cio_rx_top_dflt = true;
+
+	for (i = 0; !tphy->cio_rx_top_dflt && i < ARRAY_SIZE(t6040_cio_tunable_props); i++) {
 		const char *prop = t6040_cio_tunable_props[i];
 		struct apple_tunable *t;
 
