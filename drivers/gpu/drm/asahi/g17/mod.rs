@@ -1348,7 +1348,7 @@ struct Shared {
     housekeeping_timer: DelayedWork<Shared, HOUSEKEEPING_WORK>,
     /// M5: the thermal governor runs (the firmware has the host power budget word).
     governs: bool,
-    /// Non-M5 submission-capable device registered for compute-waiter effort wakeups.
+    /// Submission-capable device registered for compute-waiter effort wakeups.
     tracks_effort_wake: bool,
     /// Region C currently holds FULL_EFFORT; mirrored with `BELOW_FULL_COUNT` under
     /// `EFFORT_TARGETS` so steady-state compute waits take no lock.
@@ -1664,8 +1664,8 @@ fn unregister_effort_target(shared: &Arc<Shared>) {
     drop(removed);
 }
 
-/// Wakes any non-M5 device still below `FULL_EFFORT` so a newly waited pure-compute dispatch
-/// lifts Region C effort to `FULL_EFFORT` immediately instead of waiting 16 ms.
+/// Wakes any submission-capable device still below `FULL_EFFORT` so a newly waited pure-compute
+/// dispatch lifts Region C effort to `FULL_EFFORT` immediately instead of waiting 16 ms.
 /// Safe in atomic `dma_fence->lock` context: lock-free once already at `FULL_EFFORT`, and
 /// `EFFORT_TARGETS` keeps every `Arc<Shared>` refcount >= 2 across `queue_event_records()`.
 pub(super) fn wake_for_compute_waiter() {
@@ -2190,7 +2190,7 @@ impl Gpu {
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 housekeeping_timer <- new_delayed_work!("g17::Shared::housekeeping_timer"),
                 governs: m5,
-                tracks_effort_wake: !m5 && submits,
+                tracks_effort_wake: submits,
                 full_effort_published: AtomicBool::new(false),
                 governor <- new_delayed_work!("g17::Shared::governor"),
                 governor_armed: AtomicBool::new(false),

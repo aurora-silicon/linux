@@ -7,8 +7,9 @@ and `Effort` / `BusyRuns` from `drivers/gpu/drm/asahi/g17/power.rs`, verifying:
 1. M5 publishes FULL_EFFORT when a client is continuously GPU-bound (`bound == true`)
    even when `waited == false` (pipelined submission loops).
 2. M5 still publishes FULL_EFFORT when `waited == true` (submit-and-wait loops).
-3. M5 publishes 0 when neither `waited` nor `bound` (paced work with idle gaps >= 2 ms)
-   and decays cleanly back to 0 after IDLE_HOLD_NS of idle.
+3. M5 publishes FULL_EFFORT when `compute_waited == true` (scoped pure-compute syncobj waits).
+4. M5 publishes 0 when none of `waited`, `bound`, or `compute_waited` hold (paced work with
+   idle gaps >= 2 ms) and decays cleanly back to 0 after IDLE_HOLD_NS of idle.
 """
 import argparse
 import os
@@ -76,7 +77,7 @@ fn main() {{
 
     // Direct policy matrix on M5 vs non-M5.
     assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, false), 0);
-    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, true), 0);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, true), FULL_EFFORT);
     assert_eq!(m5.submission_effort(FULL_EFFORT, true, false, false), FULL_EFFORT);
     assert_eq!(m5.submission_effort(FULL_EFFORT, false, true, false), FULL_EFFORT);
     assert_eq!(m5.submission_effort(FULL_EFFORT, true, true, false), FULL_EFFORT);
