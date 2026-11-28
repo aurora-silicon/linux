@@ -9488,6 +9488,13 @@ static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 		iomfb_pause_presentation(dcp, false);
 		return;
 	}
+	/*
+	 * A queued brightness present can re-arm the EDR tick while settling.
+	 * Presentation is now paused and idle, so nothing can re-arm it after
+	 * this cancellation. Wait for a running tick before holding the mailbox.
+	 */
+	WRITE_ONCE(dcp->edr_ramping, false);
+	cancel_delayed_work_sync(&dcp->iomfb.edr_tick);
 	apple_rtkit_hold_rx(dcp->rtk);
 	dcp->rx_held = true;
 }
