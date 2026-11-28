@@ -394,7 +394,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp);
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_DESKTOP_26(DCP_FW_VER) || DCP_FW_VER == DCP_FW_VERSION(13, 3, 0)
 int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp);
 #endif
 #if DCP_FW_H17(DCP_FW_VER)

@@ -77,6 +77,47 @@
 	adj-height-mm = <189>;
 };
 
+/*
+ * Suspend-to-RAM, qualified on this board. What follows is what its sequence
+ * needs from the other devices.
+ */
+&sleep {
+	/*
+	 * Left alone across a sleep, as in the board's ADT no-restore-gpio-pins.
+	 */
+	apple,pinctrl-skip-pins = <114 115 119>;
+	status = "okay";
+};
+
+&smc {
+	/* VDD_CIO rail mask before the sleep notice: no port's rail kept up */
+	apple,sleep-pmvc = <0x100>;
+	/* The SD card reader's power enable (port01's pwren), off while asleep */
+	apple,sleep-low-pins = <26>;
+};
+
+&pmp {
+	/* The sleep takes the firmware's SRAM: all of it is kept and written back */
+	apple,sram-keep = <0x0 0x100000>;
+};
+
+/* macOS moves each port controller to S3 before the sleep and to S0 after it. */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
+&hpm2 {
+	apple,sleep-ssps;
+};
+
+&hpm5 {
+	apple,sleep-ssps;
+};
+
 &aop_audio {
 	apple,chassis-name = "J314";
 	apple,machine-kind = "MacBook Pro";

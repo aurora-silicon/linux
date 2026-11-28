@@ -317,6 +317,8 @@ static const struct aic_info aic2_info __initconst = {
 
 	.fast_ipi	= true,
 	.local_fast_ipi = true,
+	/* As AIC3: the configuration goes with the SoC's power in a firmware-driven suspend. */
+	.fw_suspend	= true,
 };
 
 static const struct aic_info aic3_info __initconst = {

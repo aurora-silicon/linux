@@ -19,6 +19,7 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t6000-sleep
       - apple,t8103-sleep
       - apple,t8122-sleep
       - apple,t8132-sleep
@@ -107,6 +108,42 @@ required:
   - apple,display-coprocessors
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6000-sleep
+    then:
+      required:
+        - apple,wake-enable
+      properties:
+        reg:
+          minItems: 22
+          maxItems: 22
+        reg-names:
+          items:
+            - const: ps
+            - const: ps-east
+            - const: ps-aon
+            - const: cpu-start
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: wake
+            - const: sep-pg
+            - const: acc0
+            - const: acc1
+            - const: acc2
+            - const: clkgen
+            - const: pll0
+            - const: dcs
+            - const: apcie-q
+            - const: amcc0
+            - const: amcc1
+            - const: amcc2
+            - const: amcc3
+            - const: ptd
+            - const: spmi
   - if:
       properties:
         compatible:

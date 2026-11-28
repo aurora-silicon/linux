@@ -62,6 +62,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     raw_stats: *mut core::ffi::c_void,
     // Own the allocation until unregister has drained all sysfs readers.
     stats: Option<Arc<crate::stats::StatsSnapshot>>,
+    /// The first-generation driver's GPU and its ASC block, for [`legacy_sleep`].
+    legacy_gpu: Option<Arc<dyn gpu::Gpu>>,
+    legacy_asc: Option<kernel::io::mem::IoMem<'bound, { regs::ASC_CTL_SIZE }>>,
 }
 
 // SAFETY: `raw_dev` is only passed back to the sysfs shim, which serializes its own state.
@@ -285,8 +288,74 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
     }
     match data.g17.as_ref() {
         Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
+        // A GPU whose firmware is parked at .suspend and restarted at .resume has nothing to
+        // refuse here.
+        None if legacy_sleep(data).is_some() => 0,
         None => EBUSY.to_errno(),
     }
+}
+
+#[cfg(CONFIG_APPLE_SOC_SLEEP)]
+extern "C" {
+    fn apple_sleep_dry_run() -> bool;
+}
+
+/// Whether this firmware-driven sleep stops before its commit.
+fn sleep_dry_run() -> bool {
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    // SAFETY: Takes no arguments and reads the sleep driver's state.
+    return unsafe { apple_sleep_dry_run() };
+    #[cfg(not(CONFIG_APPLE_SOC_SLEEP))]
+    false
+}
+
+/// The offset of the ASC's CPU control word in its `asc` block.
+const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
+
+/// The GPU and its ASC CPU control word, where the firmware is parked for a firmware-driven
+/// sleep and restarted after it ([`hw::HwConfig::sleep_restart`]).
+fn legacy_sleep<'a>(
+    data: &'a AsahiPlatformDriverData<'_>,
+) -> Option<(&'a Arc<dyn gpu::Gpu>, *mut core::ffi::c_void)> {
+    let gpu = data.legacy_gpu.as_ref()?;
+    let asc = data.legacy_asc.as_ref()?;
+
+    if !gpu.sleep_supported() {
+        return None;
+    }
+    let control =
+        <kernel::io::MmioBackend as kernel::io::IoBackend>::as_ptr(kernel::io::IoBase::as_view(asc))
+            .cast::<u8>()
+            .wrapping_add(ASC_CPU_CONTROL_OFFSET)
+            .cast::<core::ffi::c_void>();
+    Some((gpu, control))
+}
+
+/// Parks the firmware for a sleep that takes its power. Not in a dry run: a parked firmware
+/// only comes back through a real sleep.
+unsafe extern "C" fn sleep_suspend(dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Reads a global flag word.
+    if !unsafe { bindings::pm_suspend_via_firmware() } || sleep_dry_run() {
+        return 0;
+    }
+    // SAFETY: Called by the PM core.
+    let data = unsafe { sleep_data(dev) };
+    match legacy_sleep(data) {
+        Some((gpu, control)) => {
+            kernel::error::from_result(|| gpu.sleep_suspend(control).map(|_| 0))
+        }
+        None => 0,
+    }
+}
+
+/// Runs once the power domains and the PMP are back, before user space thaws.
+unsafe extern "C" fn sleep_resume(dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core.
+    let data = unsafe { sleep_data(dev) };
+    if let Some((gpu, control)) = legacy_sleep(data) {
+        gpu.sleep_resume(control);
+    }
+    0
 }
 
 extern "C" {
@@ -333,6 +402,8 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
+    suspend: Some(sleep_suspend),
+    resume: Some(sleep_resume),
     suspend_noirq: Some(sleep_suspend_noirq),
     resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
@@ -497,6 +568,10 @@ impl platform::Driver for AsahiPlatformDriver {
         };
         gpu.init()?;
 
+        let legacy_gpu = Some(gpu.clone());
+        let legacy_asc = pdev
+            .io_request_by_name(c"asc")
+            .and_then(|req| req.iomap_sized::<{ regs::ASC_CTL_SIZE }>().ok());
         let stats = gpu.stats_snapshot();
         let debug_stats = gpu.raw_stats_snapshot();
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
@@ -535,6 +610,8 @@ impl platform::Driver for AsahiPlatformDriver {
             raw_dev,
             raw_stats,
             stats,
+            legacy_gpu,
+            legacy_asc,
         };
 
         Ok(driver)
@@ -580,6 +657,8 @@ impl AsahiPlatformDriver {
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 
@@ -617,6 +696,8 @@ impl AsahiPlatformDriver {
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 
@@ -659,6 +740,8 @@ impl AsahiPlatformDriver {
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 
@@ -744,6 +827,8 @@ impl AsahiPlatformDriver {
             raw_dev,
             raw_stats,
             stats,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 }
@@ -793,6 +878,8 @@ impl AsahiPlatformDriver {
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 }
@@ -834,6 +921,8 @@ impl AsahiPlatformDriver {
             raw_dev,
             raw_stats,
             stats: None,
+            legacy_gpu: None,
+            legacy_asc: None,
         })
     }
 }
@@ -893,6 +982,8 @@ impl AsahiPlatformDriver {
                 raw_dev: core::ptr::null_mut(),
                 raw_stats: core::ptr::null_mut(),
                 stats: None,
+                legacy_gpu: None,
+                legacy_asc: None,
             }),
         })
     }

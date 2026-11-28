@@ -7,6 +7,7 @@ use crate::f32;
 use super::*;
 
 pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
+    sleep_restart: false,
     chip_id: 0x8112,
     gpu_gen: GpuGen::G14,
     gpu_variant: GpuVariant::G,

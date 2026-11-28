@@ -44,6 +44,7 @@ const fn iomaps(mcc_count: usize, has_die1: bool) -> [Option<IOMapping>; 20] {
 }
 
 pub(crate) const HWCONFIG_T6002: super::HwConfig = HwConfig {
+    sleep_restart: false,
     chip_id: 0x6002,
     gpu_gen: GpuGen::G13,
     gpu_variant: GpuVariant::D,
@@ -150,6 +151,8 @@ pub(crate) const HWCONFIG_T6001: super::HwConfig = HwConfig {
 
 pub(crate) const HWCONFIG_T6000: super::HwConfig = HwConfig {
     chip_id: 0x6000,
+    // Qualified on the M1 Pro alone; T6001 and T6002 have no sleep controller.
+    sleep_restart: true,
     gpu_variant: GpuVariant::S,
     gpu_core: GpuCore::G13S,
 

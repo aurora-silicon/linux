@@ -270,6 +270,15 @@ static int apple_radio_prepare(struct device *dev)
     radio_prepare_calls++;
     return 0;
 }
+static void apple_radio_complete(struct device *dev)
+{
+    (void)dev;
+}
+static int apple_pcie_hib_prepare_aspm(struct apple_pcie *pcie)
+{
+    (void)pcie;
+    return 0;
+}
 static int dev_pm_genpd_add_notifier(struct device *dev,
                                      struct notifier_block *nb)
 {

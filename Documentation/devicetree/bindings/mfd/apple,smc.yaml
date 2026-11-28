@@ -69,6 +69,19 @@ properties:
       what the SoC's sleep sequence powers on itself. Without the property
       pmVC is not written.
 
+  apple,sleep-low-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 4
+    items:
+      maximum: 0xff
+    description:
+      SMC GPIO numbers (the number in the GPIO's gPxx key) that are driven
+      low before the SMC is told of a suspend-to-RAM and high again after the
+      wake, for a supply that has to be off while the machine sleeps and that
+      no driver switches at that point. On the J314s this is GPIO 26, the SD
+      card reader's power enable.
+
   gpio:
     oneOf:
       - $ref: /schemas/gpio/apple,smc-gpio.yaml

@@ -3154,6 +3154,9 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// `nCal` keeps the firmware's own value, as on T8112.
+///
+/// The sleep and wake lists are the twelve AFK endpoints the traced profiles name; the order
+/// is untraced on this SoC.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     ncal: None,
@@ -3162,8 +3165,8 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
-    sleep_endpoints: &[],
-    wake_endpoints: &[],
+    sleep_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b],
+    wake_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b],
     setup_epmap_endpoints: false,
     setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,

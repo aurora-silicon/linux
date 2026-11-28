@@ -28,6 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -1324,6 +1325,11 @@ static int spihid_apple_core_suspend(struct device *dev)
 {
 	int ret;
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
+	/*
+	 * A firmware sleep wakes through the SMC, and an armed interrupt would be
+	 * counted as a wakeup event after every wake.
+	 */
+	bool wake = device_may_wakeup(dev) && !pm_suspend_via_firmware();
 
 	if (spihid->tp.hid) {
 		ret = hid_driver_suspend(spihid->tp.hid, PMSG_SUSPEND);
@@ -1357,7 +1363,7 @@ static int spihid_apple_core_suspend(struct device *dev)
 	 * system. Its state is kept, so resume does not reboot it.
 	 */
 	spihid->irq_wake_enabled = false;
-	if (device_may_wakeup(dev)) {
+	if (wake) {
 		ret = spihid->ops->enable_irq_wake(spihid->ops);
 		if (!ret) {
 			spihid->irq_wake_enabled = true;

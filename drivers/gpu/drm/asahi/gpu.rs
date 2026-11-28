@@ -164,6 +164,9 @@ pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffffffaeffff0000;
 
 /// Timeout for entering the halt state after a fault or request.
 const HALT_ENTER_TIMEOUT: Delta = Delta::from_millis(100);
+/// How long submissions in flight get to finish before a sleep, and how often they are polled.
+const SLEEP_DRAIN_MS: i64 = 500;
+const SLEEP_DRAIN_POLL_MS: i64 = 5;
 
 /// Minimum interval between GPU fault / timeout / channel-error reports.
 ///
@@ -329,6 +332,7 @@ pub(crate) struct GpuManager {
     /// The firmware's timestamp aperture in the kernel VM, where timestamp buffers are bound.
     timestamp_range: Range<u64>,
     crashed: AtomicBool,
+    sleep_parked: AtomicBool,
     /// Set once the over-limit firmware-private garbage was reported as held.
     garbage_held: AtomicBool,
     #[pin]
@@ -430,6 +434,17 @@ pub(crate) trait Gpu: Send + Sync {
     fn ids(&self) -> &SequenceIDs;
     /// Check whether the GPU is crashed
     fn is_crashed(&self) -> bool;
+    /// Whether the firmware can be parked for a firmware-driven sleep and restarted after it.
+    fn sleep_supported(&self) -> bool {
+        false
+    }
+    /// Parks the firmware and stops its CPU, with user space frozen and before the noirq phase.
+    /// `asc_cpu_control` is the mapped CPU control word of the GPU's ASC.
+    fn sleep_suspend(&self, _asc_cpu_control: *mut core::ffi::c_void) -> Result {
+        Err(EBUSY)
+    }
+    /// Restarts a firmware [`Gpu::sleep_suspend`] parked, after a sleep that took its power.
+    fn sleep_resume(&self, _asc_cpu_control: *mut core::ffi::c_void) {}
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
     /// Whether unmapped GPU reads return zero (fault_control programmed into the firmware).
@@ -1130,6 +1145,7 @@ impl GpuManager::ver {
                 next_mmio_iova: IOVA_KERN_MMIO_RANGE.start,
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
+                sleep_parked: AtomicBool::new(false),
                 garbage_held: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
@@ -1728,6 +1744,80 @@ impl Gpu for GpuManager::ver {
 
     fn is_crashed(&self) -> bool {
         self.crashed.load(Ordering::Relaxed)
+    }
+
+    fn sleep_supported(&self) -> bool {
+        self.cfg.sleep_restart
+    }
+
+    fn sleep_suspend(&self, asc_cpu_control: *mut core::ffi::c_void) -> Result {
+        if !self.sleep_supported() || self.is_crashed() || asc_cpu_control.is_null() {
+            return Err(EBUSY);
+        }
+
+        // User space is frozen, so nothing new is submitted: what the firmware still has in
+        // flight gets SLEEP_DRAIN_MS to finish, then the sleep is refused.
+        let mut pending = 0u32;
+        for _ in 0..SLEEP_DRAIN_MS / SLEEP_DRAIN_POLL_MS {
+            pending = self
+                .initdata
+                .globals
+                .with(|raw, _inner| raw.pending_submissions.load(Ordering::Acquire));
+            if pending == 0 {
+                break;
+            }
+            kernel::time::delay::fsleep(Delta::from_millis(SLEEP_DRAIN_POLL_MS));
+        }
+        if pending != 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "{} submission(s) still pending: refusing the sleep\n",
+                pending
+            );
+            return Err(EBUSY);
+        }
+
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        // SAFETY: The driver passes the CPU control word of this GPU's mapped ASC block.
+        unsafe { rtk.sleep_stop(asc_cpu_control) }?;
+        self.sleep_parked.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn sleep_resume(&self, asc_cpu_control: *mut core::ffi::c_void) {
+        if !self.sleep_parked.swap(false, Ordering::AcqRel) || asc_cpu_control.is_null() {
+            return;
+        }
+        // SAFETY: Reads a global flag word.
+        if !unsafe { kernel::bindings::pm_resume_via_firmware() } {
+            dev_warn!(
+                self.dev.as_ref(),
+                "the sleep was refused with the firmware parked: it stays down until a sleep that happens\n"
+            );
+            return;
+        }
+
+        let ret = {
+            let mut guard = self.rtkit.lock();
+            match guard.as_mut().as_pin_mut() {
+                // SAFETY: As in `sleep_suspend()`.
+                Some(rtk) => unsafe { rtk.sleep_return_with_init(asc_cpu_control) },
+                None => Err(ENODEV),
+            }
+        };
+        match ret {
+            Ok(()) => {
+                let _ = self.kick_firmware();
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "firmware did not restart after the sleep: {:?}\n",
+                    e
+                );
+            }
+        }
     }
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
