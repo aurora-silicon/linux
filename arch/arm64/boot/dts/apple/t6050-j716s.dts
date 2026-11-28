@@ -587,3 +587,6 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/* The GPU and the internal panel, for the boot loader's handoff */
+#include "t6050-j716s-gpu-panel.dtsi"
