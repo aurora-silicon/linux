@@ -484,6 +484,7 @@ ASAHI_RUST.append('m3-firmware-tests.rs')
 # G14 firmware 27.2 queue, event and recovery records (its KUnit suite, run on the host).
 ASAHI_RUST.append('g14-v27-2-abi-tests.rs')
 ASAHI_RUST.append('pmp-alloc-tests.rs')
+ASAHI_RUST.append('aop-spkr-ring-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
