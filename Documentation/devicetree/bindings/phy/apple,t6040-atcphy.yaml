@@ -172,6 +172,16 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: USB2 host tunables, applied to the bank0 region.
 
+  apple,tunable-usb2-default:
+    $ref: "#/$defs/apple,tunable"
+    description:
+      USB2 default tunables, applied to the bank0 region before the device
+      tunables when the port runs as a USB device.
+
+  apple,tunable-usb2-device:
+    $ref: "#/$defs/apple,tunable"
+    description: USB2 device tunables, applied to the bank0 region.
+
 required:
   - compatible
   - reg
