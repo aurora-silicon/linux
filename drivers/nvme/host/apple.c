@@ -346,6 +346,8 @@ struct apple_nvme {
 	 * Delayed cache flush handling state
 	 */
 	struct nvme_ns *flush_ns;
+	/* Orders the interval and the arming of flush_dwork against remove(). */
+	spinlock_t flush_lock;
 	unsigned long flush_interval;
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
@@ -1456,22 +1458,36 @@ static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
 	 * Post-M4 internal-root storage must submit it to the controller and
 	 * wait for its completion, even when the legacy grace period is set.
 	 */
-	if (anv->hw->needs_ioq_registers ||
-	    !anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
+	if (anv->hw->needs_ioq_registers || req_op(req) != REQ_OP_FLUSH)
+		return false;
+
+	guard(spinlock_irqsave)(&anv->flush_lock);
+	if (!anv->flush_interval)
 		return false;
 	if (delayed_work_pending(&anv->flush_dwork))
 		return true;
 	if (time_before(jiffies, anv->last_flush + anv->flush_interval)) {
 		kblockd_mod_delayed_work_on(WORK_CPU_UNBOUND, &anv->flush_dwork,
-						anv->flush_interval);
-		if (WARN_ON_ONCE(anv->flush_ns && anv->flush_ns != ns))
-			goto out;
-		anv->flush_ns = ns;
-		return true;
+					    anv->flush_interval);
+		if (!WARN_ON_ONCE(anv->flush_ns && anv->flush_ns != ns)) {
+			anv->flush_ns = ns;
+			return true;
+		}
 	}
-out:
 	anv->last_flush = jiffies;
 	return false;
+}
+
+/*
+ * Send every later flush straight to the drive, then run the flush that is
+ * still deferred, if any. Clearing the interval under flush_lock means no
+ * apple_nvme_delayed_flush() can arm the work again after it is flushed here.
+ */
+static void apple_nvme_stop_deferred_flush(struct apple_nvme *anv)
+{
+	scoped_guard(spinlock_irqsave, &anv->flush_lock)
+		anv->flush_interval = 0;
+	flush_delayed_work(&anv->flush_dwork);
 }
 
 static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -3284,6 +3300,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		anv->last_flush = jiffies - anv->flush_interval;
 	}
 
+	spin_lock_init(&anv->flush_lock);
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
 	if (anv->hw->sleep_traced && (!anv->hw->sleep_untested || sleep_untested)) {
@@ -3335,7 +3352,13 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	cancel_work_sync(&anv->recovery_work);
 	cancel_work_sync(&anv->ctrl.reset_work);
 	nvme_stop_ctrl(&anv->ctrl);
-	cancel_delayed_work_sync(&anv->flush_dwork);
+	/*
+	 * The deferred work uses flush_ns, which namespace removal frees, and
+	 * removing a namespace flushes its disk. Run the deferred flush now,
+	 * while its namespace exists, and send the removal flushes straight to
+	 * the drive so they cannot arm the work again.
+	 */
+	apple_nvme_stop_deferred_flush(anv);
 	nvme_remove_namespaces(&anv->ctrl);
 	/* A quarantined controller keeps everything it may still DMA into. */
 	if (apple_nvme_disable(anv, true))
@@ -3374,7 +3397,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 	WRITE_ONCE(anv->final_shutdown, true);
 	apple_nvme_set_reset_ready(anv, false);
-	flush_delayed_work(&anv->flush_dwork);
+	apple_nvme_stop_deferred_flush(anv);
 	if (apple_nvme_disable(anv, true))
 		return;
 	cancel_work_sync(&anv->recovery_work);
