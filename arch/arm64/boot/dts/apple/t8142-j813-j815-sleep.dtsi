@@ -4,9 +4,9 @@
  * the shared PCIe block the wake brings back, and the port controllers' sleep power state.
  * Included at the end of each board's device tree, after the nodes it refers to.
  *
- * The boot core's power gate (cluster_pwrgate), the internal display's power words (dcp_power)
- * and the DCP DART's PS write-disable bit are in t8142-j813-j815.dtsi (aurora-silicon/linux#1942,
- * #1941).
+ * The boot core's power gate (cluster_pwrgate) is in t8142.dtsi; the internal display's power
+ * words (dcp_power) and the DCP DART's PS write-disable bit are in t8142-j813-j815.dtsi
+ * (aurora-silicon/linux#1942, #1941).
  */
 
 #include <dt-bindings/gpio/gpio.h>

@@ -110,10 +110,6 @@
 	status = "okay";
 };
 
-&cpu_pmu {
-	status = "okay";
-};
-
 &dockchannel {
 	status = "okay";
 };
