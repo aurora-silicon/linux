@@ -322,7 +322,7 @@ impl<B: Backend> Queue<B> {
                 .map(|target| {
                     PreparedPublication::new(
                         target,
-                        ordering.predecessors.iter().chain(ordering.chain.iter()),
+                        Iterator::chain(ordering.predecessors.iter(), ordering.chain.iter()),
                     )
                 })
                 .transpose()?;
@@ -1534,7 +1534,7 @@ mod tests {
             let pub_r = pub_r.unwrap();
             PreparedPublication::new(
                 pub_r.clone(),
-                plan.predecessors.iter().chain(plan.chain.iter()),
+                Iterator::chain(plan.predecessors.iter(), plan.chain.iter()),
             )
             .unwrap()
             .activate();
@@ -1604,7 +1604,7 @@ mod tests {
         let (pub_c, fence_c) = Publication::test_pair(&contexts, &status, true).unwrap();
         PreparedPublication::new(
             pub_c.clone(),
-            plan_c.predecessors.iter().chain(plan_c.chain.iter()),
+            Iterator::chain(plan_c.predecessors.iter(), plan_c.chain.iter()),
         )
         .unwrap()
         .activate();
