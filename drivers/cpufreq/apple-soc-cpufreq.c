@@ -7,6 +7,7 @@
  * Based on scpi-cpufreq.c
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/cpu.h>
@@ -111,8 +112,9 @@
  *
  * The effort has to be sampled, since no interrupt is known to signal a new
  * one under Linux.  While the limit is at the cluster's maximum, every CPU
- * of the cluster has a pinned, deferrable timer that samples the effort once
- * a tick, and the first CPU to run in a tick takes the sample.  Deferrable
+ * of the cluster has a pinned, deferrable timer that samples the effort every
+ * APPLE_FAST_DIE_POLL_MS, and the first busy CPU of the cluster to run in
+ * that window takes the sample.  Deferrable
  * timers do not wake idle CPUs, so only busy CPUs sample, and an idle
  * cluster, which produces no heat, costs nothing.  Once the limit is below
  * the maximum, a per-cluster hrtimer samples every 5 ms whether the cluster
@@ -1124,24 +1126,52 @@ static enum hrtimer_restart apple_fast_die_poll(struct hrtimer *t)
 	return restart;
 }
 
+static unsigned long apple_fast_die_tick_jiffies(void)
+{
+	return max(1UL, (unsigned long)APPLE_FAST_DIE_POLL_MS * HZ / MSEC_PER_SEC);
+}
+
+static bool apple_fast_die_claim_sample(struct apple_fast_die *fd,
+					unsigned long now, unsigned long step)
+{
+	unsigned long last = READ_ONCE(fd->last_poll);
+
+	while (time_after_eq(now, last + step)) {
+		if (try_cmpxchg(&fd->last_poll, &last, now))
+			return true;
+	}
+
+	return false;
+}
+
 static void apple_fast_die_tick(struct timer_list *t)
 {
 	struct apple_fast_die_timer *ft = timer_container_of(ft, t, timer);
 	struct apple_fast_die *fd = ft->fd;
+	unsigned long step = apple_fast_die_tick_jiffies();
 	unsigned long now = jiffies;
+	bool claimed = apple_fast_die_claim_sample(fd, now, step);
+	unsigned long next;
 
 	/*
-	 * The first busy CPU of the cluster to run in a tick takes the sample,
-	 * unless the non-deferrable timer is sampling.
+	 * The first busy CPU of the cluster to run in a polling window takes
+	 * the sample, unless the non-deferrable timer is sampling.
 	 */
-	if (xchg(&fd->last_poll, now) != now && spin_trylock(&fd->lock)) {
+	if (claimed && spin_trylock(&fd->lock)) {
 		if (!fd->polling) {
 			apple_fast_die_sample(fd);
 			apple_fast_die_arm(fd);
 		}
 		spin_unlock(&fd->lock);
 	}
-	mod_timer(t, now + 1);
+	if (claimed) {
+		next = now + step;
+	} else {
+		next = READ_ONCE(fd->last_poll) + step;
+		if (time_before_eq(next, now))
+			next = now + 1;
+	}
+	mod_timer(t, next);
 }
 
 static int apple_fast_die_cpu_online(unsigned int cpu)
@@ -1153,7 +1183,7 @@ static int apple_fast_die_cpu_online(unsigned int cpu)
 
 	/* Wait for a running sample, which rearms the timer, before arming it. */
 	timer_delete_sync(&ft->timer);
-	ft->timer.expires = jiffies + 1;
+	ft->timer.expires = jiffies + apple_fast_die_tick_jiffies();
 	add_timer_on(&ft->timer, cpu);
 
 	return 0;
@@ -1235,6 +1265,7 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 	fd->max = policy->freq_table[n - 1].frequency;
 	fd->fallback = apple_fast_die_fit(fd, div_u64(fd->power[n - 1], 3));
 	fd->start = jiffies;
+	fd->last_poll = fd->start - apple_fast_die_tick_jiffies();
 
 	if (parsed) {
 		/* The limit is meant to be there, so keep the fallback. */

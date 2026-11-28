@@ -981,6 +981,40 @@ static void cft_test_fast_die_interval(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ktime_to_ms(apple_fast_die_interval(fd)), 100);
 }
 
+static void cft_test_fast_die_claim(struct kunit *test)
+{
+	struct cft_ctx *ctx = cft_setup(test, &soc_t8112_info, 4);
+	struct apple_fast_die *fd = cft_fast_die(test, ctx);
+	unsigned long step = apple_fast_die_tick_jiffies();
+	unsigned long base;
+
+	KUNIT_EXPECT_GE(test, step, 1UL);
+	KUNIT_EXPECT_TRUE(test, step == 1UL ||
+			  step * MSEC_PER_SEC / HZ <= APPLE_FAST_DIE_POLL_MS);
+
+	/* Deduplication across adjacent jiffies within a multi-jiffy window. */
+	base = 1000;
+	fd->last_poll = base - 5;
+	KUNIT_EXPECT_TRUE(test, apple_fast_die_claim_sample(fd, base, 5));
+	KUNIT_EXPECT_EQ(test, fd->last_poll, base);
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, base, 5));
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, base + 1, 5));
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, base + 4, 5));
+	KUNIT_EXPECT_TRUE(test, apple_fast_die_claim_sample(fd, base + 5, 5));
+	KUNIT_EXPECT_EQ(test, fd->last_poll, base + 5);
+
+	/* Wrap-around across ULONG_MAX -> 0 (as after INITIAL_JIFFIES at boot). */
+	base = ULONG_MAX - 2;
+	fd->last_poll = base - 5;
+	KUNIT_EXPECT_TRUE(test, apple_fast_die_claim_sample(fd, base, 5));
+	KUNIT_EXPECT_EQ(test, fd->last_poll, base);
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, ULONG_MAX, 5));
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, 0, 5));
+	KUNIT_EXPECT_FALSE(test, apple_fast_die_claim_sample(fd, 1, 5));
+	KUNIT_EXPECT_TRUE(test, apple_fast_die_claim_sample(fd, 2, 5));
+	KUNIT_EXPECT_EQ(test, fd->last_poll, 2UL);
+}
+
 /* The hrtimer samples only when the per-CPU timers do not. */
 static void cft_test_fast_die_arm(struct kunit *test)
 {
@@ -1319,6 +1353,7 @@ static struct kunit_case apple_soc_cpufreq_test_cases[] = {
 	KUNIT_CASE(cft_test_fast_die_fit),
 	KUNIT_CASE(cft_test_fast_die_limit),
 	KUNIT_CASE(cft_test_fast_die_interval),
+	KUNIT_CASE(cft_test_fast_die_claim),
 	KUNIT_CASE(cft_test_fast_die_arm),
 	KUNIT_CASE(cft_test_fast_die_cap),
 	KUNIT_CASE(cft_test_fast_die_cap_unverified),
