@@ -1112,9 +1112,11 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn forty_eight_render_passes_and_twenty_four_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn forty_eight_render_passes_and_thirty_two_compute_units_are_disjoint_in_mesa_hole(){
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
-        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 32);
+        assert_eq!(g16::hw::sizes::COMPUTE_PIPES, 16);
+        assert_eq!(g16::hw::sizes::PIPE1_COMPUTE_START, 2);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         for idx in 0..g16::hw::sizes::EXT_PB_SLOTS {
@@ -2219,12 +2221,21 @@ pub mod g16 {
         assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c,Some(bad.id),0).unwrap(),Some(0));
         s.hold_vm(&c,&bad).unwrap();s.publish(&mut c).unwrap();s.quarantine(&mut c);
         assert_eq!(s.quarantined_compute_mask(), 1u32 << 0);
-        // Pipe 1 runs concurrent non-SCS compute on PIPE1_COMPUTE_START..COMPUTE_UNITS.
+        // Pipe 1 runs concurrent non-SCS compute outside dynamic pipe0_exclusive_mask() ([1, 2]),
+        // so it claims unit 3 and never holds an undisplaced lease on the fresh SCS VM's [1, 2].
+        let _ = p1_start;
+        assert_eq!(s.pipe0_exclusive_mask(), (1u32 << 1) | (1u32 << 2));
         let mut c_p1=Claims::new();
-        assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c_p1,Some(other.id),1).unwrap(),Some(p1_start));
+        assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c_p1,Some(other.id),1).unwrap(),Some(3));
         s.hold_vm(&c_p1,&other).unwrap();s.publish(&mut c_p1).unwrap();s.retire(&mut c_p1).unwrap();
-        // Brand-new SCS compute VM skips quarantined unit 0 and binds [1, 2] (mask 0b110), both < PIPE1_COMPUTE_START.
-        let scs_slots = pick_scs_compute_slots(s.quarantined_compute_mask(), g16::hw::sizes::COMPUTE_UNITS);
+        // Brand-new SCS compute VM skips quarantined unit 0 and binds [1, 2] (mask 0b110), matching
+        // dynamic pipe0_exclusive_mask() / scs_compute_mask().
+        assert_eq!(s.scs_compute_mask(), (1u32 << 1) | (1u32 << 2));
+        let scs_slots = pick_scs_compute_slots(
+            s.scs_compute_mask(),
+            s.quarantined_compute_mask(),
+            g16::hw::sizes::COMPUTE_UNITS,
+        );
         assert_eq!(scs_slots, [1, 2]);
         let mut scs_units=KVec::new();
         for (local, &hw_slot) in scs_slots.iter().enumerate() {
@@ -2242,9 +2253,218 @@ pub mod g16 {
             assert_eq!(s.claim_compute_for_pipe(&prep_scs,&mut cs,Some(fresh.id),0).unwrap(),Some(expected));
             s.hold_vm(&cs,&fresh).unwrap();s.publish(&mut cs).unwrap();s.retire(&mut cs).unwrap();
         }
-        // Up to 4 quarantines in 0..PIPE1_COMPUTE_START stay inside pipe-0-exclusive 0..6; beyond that falls back cleanly.
-        assert_eq!(pick_scs_compute_slots(0b001111, g16::hw::sizes::COMPUTE_UNITS), [4, 5]);
-        assert_eq!(pick_scs_compute_slots(0b111111, g16::hw::sizes::COMPUTE_UNITS), [6, 7]);
+        let make_scs_arena = |o: &mut Objects, slots: [usize; 2]| {
+            let mut units = KVec::new();
+            for (local, &hw_slot) in slots.iter().enumerate() {
+                units
+                    .push(
+                        g16::slots::ComputeSlot::new(
+                            o,
+                            &g16::object::Factory,
+                            local as u64,
+                            &crate::g16::object::test_unit_cmds(hw_slot as u64),
+                        )
+                        .unwrap(),
+                        0,
+                    )
+                    .unwrap();
+            }
+            g16::resources::ComputeArena {
+                compute: units,
+                render: None,
+                hw_slots: Some(slots),
+            }
+        };
+        // Ordering A: secondary pipe 1 retires onto unit 2 BEFORE pipe 0 quarantines unit 0.
+        // Reservation must skip secondary-pinned unit 2 and promote unit 3 -> [1, 3].
+        let mut s_ord_a = Slots::new().unwrap();
+        let mut c_p1a = Claims::new();
+        assert_eq!(s_ord_a.claim_compute_for_pipe(&prep_full, &mut c_p1a, Some(other.id), 1).unwrap(), Some(2));
+        s_ord_a.hold_vm(&c_p1a, &other).unwrap(); s_ord_a.publish(&mut c_p1a).unwrap(); s_ord_a.retire(&mut c_p1a).unwrap();
+        let mut c_bada = Claims::new();
+        assert_eq!(s_ord_a.claim_compute_for_pipe(&prep_full, &mut c_bada, Some(bad.id), 0).unwrap(), Some(0));
+        s_ord_a.hold_vm(&c_bada, &bad).unwrap(); s_ord_a.publish(&mut c_bada).unwrap(); s_ord_a.quarantine(&mut c_bada);
+        assert_eq!(s_ord_a.pipe0_exclusive_mask(), (1u32 << 1) | (1u32 << 3));
+        assert_eq!(s_ord_a.scs_compute_mask(), (1u32 << 1) | (1u32 << 3));
+        let scs_a = pick_scs_compute_slots(
+            s_ord_a.scs_compute_mask(),
+            s_ord_a.quarantined_compute_mask(),
+            g16::hw::sizes::COMPUTE_UNITS,
+        );
+        assert_eq!(scs_a, [1, 3]);
+        let prep_scs_a = make_scs_arena(&mut o, scs_a);
+        let mask_a = prep_scs_a.compute_slot_mask().unwrap();
+        for expected in [1usize, 3, 1, 3] {
+            assert!(!s_ord_a.compute_exhausted_in_mask(mask_a));
+            assert!(s_ord_a.compute_available_in_mask(mask_a));
+            let mut cs = Claims::new();
+            assert_eq!(s_ord_a.claim_compute_for_pipe(&prep_scs_a, &mut cs, Some(fresh.id), 0).unwrap(), Some(expected));
+            s_ord_a.hold_vm(&cs, &fresh).unwrap(); s_ord_a.publish(&mut cs).unwrap(); s_ord_a.retire(&mut cs).unwrap();
+        }
+        // Ordering C (monotonicity): even after pipe 1 later displaces unit 2, [1, 3] stays
+        // monotonically reserved so secondary pipes cannot steal unit 3 from the already-bound SCS VM.
+        let mut c_disp = Claims::new();
+        let u_disp = s_ord_a.claim_compute_for_pipe(&prep_full, &mut c_disp, Some(other.id), 1).unwrap().unwrap();
+        assert_ne!(u_disp, 1);
+        assert_ne!(u_disp, 3);
+        s_ord_a.hold_vm(&c_disp, &other).unwrap(); s_ord_a.publish(&mut c_disp).unwrap(); s_ord_a.retire(&mut c_disp).unwrap();
+        assert_eq!(s_ord_a.pipe0_exclusive_mask(), (1u32 << 1) | (1u32 << 3));
+        let mut c_p2 = Claims::new();
+        let u_p2 = s_ord_a.claim_compute_for_pipe(&prep_full, &mut c_p2, Some(other.id), 2).unwrap().unwrap();
+        assert_ne!(u_p2, 1);
+        assert_ne!(u_p2, 3);
+        s_ord_a.hold_vm(&c_p2, &other).unwrap(); s_ord_a.publish(&mut c_p2).unwrap(); s_ord_a.retire(&mut c_p2).unwrap();
+        for expected in [1usize, 3] {
+            assert!(!s_ord_a.compute_exhausted_in_mask(mask_a));
+            let mut cs = Claims::new();
+            assert_eq!(s_ord_a.claim_compute_for_pipe(&prep_scs_a, &mut cs, Some(fresh.id), 0).unwrap(), Some(expected));
+            s_ord_a.hold_vm(&cs, &fresh).unwrap(); s_ord_a.publish(&mut cs).unwrap(); s_ord_a.retire(&mut cs).unwrap();
+        }
+        // Ordering B: secondary pipe 1 is STILL IN-FLIGHT on unit 2 when pipe 0 quarantines unit 0,
+        // and retires unit 2 afterwards. Reservation must still skip in-flight unit 2 -> [1, 3].
+        let mut s_ord_b = Slots::new().unwrap();
+        let mut c_p1b = Claims::new();
+        assert_eq!(s_ord_b.claim_compute_for_pipe(&prep_full, &mut c_p1b, Some(other.id), 1).unwrap(), Some(2));
+        s_ord_b.hold_vm(&c_p1b, &other).unwrap(); s_ord_b.publish(&mut c_p1b).unwrap();
+        let mut c_badb = Claims::new();
+        assert_eq!(s_ord_b.claim_compute_for_pipe(&prep_full, &mut c_badb, Some(bad.id), 0).unwrap(), Some(0));
+        s_ord_b.hold_vm(&c_badb, &bad).unwrap(); s_ord_b.publish(&mut c_badb).unwrap(); s_ord_b.quarantine(&mut c_badb);
+        assert_eq!(s_ord_b.pipe0_exclusive_mask(), (1u32 << 1) | (1u32 << 3));
+        assert_eq!(s_ord_b.scs_compute_mask(), (1u32 << 1) | (1u32 << 3));
+        // Secondary pipe 1 finishes and retires unit 2 afterwards, pinning unit 2 on pipe 1.
+        s_ord_b.retire(&mut c_p1b).unwrap();
+        let scs_b = pick_scs_compute_slots(
+            s_ord_b.scs_compute_mask(),
+            s_ord_b.quarantined_compute_mask(),
+            g16::hw::sizes::COMPUTE_UNITS,
+        );
+        assert_eq!(scs_b, [1, 3]);
+        let prep_scs_b = make_scs_arena(&mut o, scs_b);
+        let mask_b = prep_scs_b.compute_slot_mask().unwrap();
+        for expected in [1usize, 3, 1, 3] {
+            assert!(!s_ord_b.compute_exhausted_in_mask(mask_b));
+            assert!(s_ord_b.compute_available_in_mask(mask_b));
+            let mut cs = Claims::new();
+            assert_eq!(s_ord_b.claim_compute_for_pipe(&prep_scs_b, &mut cs, Some(fresh.id), 0).unwrap(), Some(expected));
+            s_ord_b.hold_vm(&cs, &fresh).unwrap(); s_ord_b.publish(&mut cs).unwrap(); s_ord_b.retire(&mut cs).unwrap();
+        }
+        // Ordering D (total 15-pipe saturation + Tier-2 fallback + double-crash self-heal):
+        // Every secondary pipe 1..16 holds 1 retired + 1 in-flight unit (all 30 secondary units
+        // pinned) when pipe 0 quarantines unit 0. Tier-2 promotes a non-tail unit (2) whose pipe
+        // has a newer in-flight publication (17); retiring 17 displaces 2 cleanly, while a second
+        // crash quarantining 17 instead self-heals scs_compute_mask() onto another clean unit.
+        let mut s_sat = Slots::new().unwrap();
+        let mut sat_inflight = Vec::new();
+        for p in 1..g16::hw::sizes::COMPUTE_PIPES {
+            let mut c_ret = Claims::new();
+            let _ = s_sat.claim_compute_for_pipe(&prep_full, &mut c_ret, Some(other.id), p).unwrap().unwrap();
+            s_sat.hold_vm(&c_ret, &other).unwrap(); s_sat.publish(&mut c_ret).unwrap(); s_sat.retire(&mut c_ret).unwrap();
+        }
+        for p in 1..g16::hw::sizes::COMPUTE_PIPES {
+            let mut c_pub = Claims::new();
+            let _ = s_sat.claim_compute_for_pipe(&prep_full, &mut c_pub, Some(other.id), p).unwrap().unwrap();
+            s_sat.hold_vm(&c_pub, &other).unwrap(); s_sat.publish(&mut c_pub).unwrap();
+            sat_inflight.push(c_pub);
+        }
+        let mut c_bads = Claims::new();
+        assert_eq!(s_sat.claim_compute_for_pipe(&prep_full, &mut c_bads, Some(bad.id), 0).unwrap(), Some(0));
+        s_sat.hold_vm(&c_bads, &bad).unwrap(); s_sat.publish(&mut c_bads).unwrap(); s_sat.quarantine(&mut c_bads);
+        let scs_sat = pick_scs_compute_slots(
+            s_sat.scs_compute_mask(),
+            s_sat.quarantined_compute_mask(),
+            g16::hw::sizes::COMPUTE_UNITS,
+        );
+        assert_eq!(scs_sat[0], 1);
+        let promoted = scs_sat[1];
+        assert!(promoted >= 2 && promoted < 17, "Tier 2 must pick a non-tail retired unit, got {promoted}");
+        // Retiring pipe 2..16's in-flight units frees units 3..17, while quarantining pipe 1's
+        // in-flight unit (which sat ahead of `promoted` = 2) pins 2 and triggers self-healing
+        // promotion of a clean unit into scs_compute_mask().
+        for c_pub in sat_inflight.iter_mut().skip(1) {
+            s_sat.retire(c_pub).unwrap();
+        }
+        s_sat.quarantine(&mut sat_inflight[0]);
+        let healed = pick_scs_compute_slots(
+            s_sat.scs_compute_mask(),
+            s_sat.quarantined_compute_mask(),
+            g16::hw::sizes::COMPUTE_UNITS,
+        );
+        assert_eq!(healed[0], 1);
+        assert_ne!(healed[1], promoted);
+        let prep_healed = make_scs_arena(&mut o, healed);
+        let mask_healed = prep_healed.compute_slot_mask().unwrap();
+        for _ in 0..4 {
+            assert!(!s_sat.compute_exhausted_in_mask(mask_healed));
+            let mut cs = Claims::new();
+            assert!(s_sat.claim_compute_for_pipe(&prep_healed, &mut cs, Some(fresh.id), 0).unwrap().is_some());
+            s_sat.hold_vm(&cs, &fresh).unwrap(); s_sat.publish(&mut cs).unwrap(); s_sat.retire(&mut cs).unwrap();
+        }
+        // Ordering E: multiple sequential quarantines across secondary-pipe retired leases on
+        // units 2, 4, 5, 6 slide scs_compute_mask() cleanly across [1, 3] -> [3, 7] -> [3, 8].
+        let mut s_multi = Slots::new().unwrap();
+        for (p, expected_u) in [(1usize, 2usize), (2, 3), (3, 4), (4, 5)] {
+            let mut cp = Claims::new();
+            assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cp, Some(other.id), p).unwrap(), Some(expected_u));
+            s_multi.hold_vm(&cp, &other).unwrap(); s_multi.publish(&mut cp).unwrap(); s_multi.retire(&mut cp).unwrap();
+        }
+        // Displace unit 3 on pipe 2 so secondary tails are {2, 4, 5, 6}, leaving 3 and 7 clean.
+        let mut cp2_disp = Claims::new();
+        assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cp2_disp, Some(other.id), 2).unwrap(), Some(6));
+        s_multi.hold_vm(&cp2_disp, &other).unwrap(); s_multi.publish(&mut cp2_disp).unwrap(); s_multi.retire(&mut cp2_disp).unwrap();
+        for (q_unit, expected_pair) in [(0usize, [1usize, 3]), (1, [3, 7]), (7, [3, 8])] {
+            let mut cq = Claims::new();
+            assert_eq!(s_multi.claim_compute_for_pipe(&prep_full, &mut cq, Some(bad.id), 0).unwrap(), Some(q_unit));
+            s_multi.hold_vm(&cq, &bad).unwrap(); s_multi.publish(&mut cq).unwrap(); s_multi.quarantine(&mut cq);
+            let pair = pick_scs_compute_slots(
+                s_multi.scs_compute_mask(),
+                s_multi.quarantined_compute_mask(),
+                g16::hw::sizes::COMPUTE_UNITS,
+            );
+            assert_eq!(pair, expected_pair);
+        }
+        let prep_multi = make_scs_arena(&mut o, [3, 8]);
+        let mask_multi = prep_multi.compute_slot_mask().unwrap();
+        for _ in 0..4 {
+            assert!(!s_multi.compute_exhausted_in_mask(mask_multi));
+            let mut cs = Claims::new();
+            assert!(s_multi.claim_compute_for_pipe(&prep_multi, &mut cs, Some(fresh.id), 0).unwrap().is_some());
+            s_multi.hold_vm(&cs, &fresh).unwrap(); s_multi.publish(&mut cs).unwrap(); s_multi.retire(&mut cs).unwrap();
+        }
+        // Up to 28 quarantines slide pick_scs_compute_slots cleanly across COMPUTE_UNITS = 32.
+        assert_eq!(pick_scs_compute_slots(0, 0b001111, g16::hw::sizes::COMPUTE_UNITS), [4, 5]);
+        assert_eq!(pick_scs_compute_slots(0, 0b111111, g16::hw::sizes::COMPUTE_UNITS), [6, 7]);
+        assert_eq!(
+            pick_scs_compute_slots((1u32 << 1) | (1u32 << 3), 1u32 << 0, g16::hw::sizes::COMPUTE_UNITS),
+            [1, 3]
+        );
+        // 16 concurrent compute VMs across all 16 pipes with 32 compute units: 0 cross-VM evictions,
+        // 0 slot exhaustion, each pipe keeps 2 dedicated units (1 retired undisplaced + 1 claimable).
+        let mut s16 = Slots::new().unwrap();
+        let vms16: Vec<_> = (100u64..116).map(vm).collect();
+        for round in 0..4usize {
+            let mut claims = Vec::new();
+            for p in 0..g16::hw::sizes::COMPUTE_PIPES {
+                let mut cp = Claims::new();
+                let u = s16
+                    .claim_compute_for_pipe(&prep_full, &mut cp, Some(vms16[p].id), p)
+                    .unwrap()
+                    .expect("16 concurrent pipes must each claim a unit with 32 units");
+                if p == 0 {
+                    assert!(u < 2, "pipe 0 prefers pipe0_exclusive_mask [0, 1], got {u}");
+                } else {
+                    assert!(u >= 2, "secondary pipe {p} must stay clear of [0, 1], got {u}");
+                }
+                s16.hold_vm(&cp, &vms16[p]).unwrap();
+                s16.publish(&mut cp).unwrap();
+                claims.push(cp);
+            }
+            for cp in &mut claims {
+                s16.retire(cp).unwrap();
+            }
+            if round >= 1 {
+                assert_eq!(s16.stats.cross_vm_retargets[0], 0);
+            }
+        }
         // Twin fix: pick_base_pb_slots skips quarantined warm PB slots and falls back to EXT_PB_SLOTS.
         assert_eq!(pick_base_pb_slots(0, 0), [0, 1]);
         assert_eq!(pick_base_pb_slots(3, 1u32 << 3), [4, 5]);

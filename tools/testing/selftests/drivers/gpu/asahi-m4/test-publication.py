@@ -205,7 +205,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn validate_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64)->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=16; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=32; pub const PIPE1_COMPUTE_START:usize=2; pub const COMPUTE_SLOTS:usize=32; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -871,8 +871,11 @@ impl QueueBehindSlots{
     fn render_exhausted(&self)->bool{self.render_exhausted}
     fn compute_available(&self,_n:usize)->bool{self.compute_available}
     fn compute_available_in_mask(&self,_mask:u32)->bool{self.compute_available}
+    fn compute_allowed_for_pipe(&self,mask:u32,pipe:usize)->u32{
+        if pipe == 0 { mask } else { mask & !((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1) }
+    }
     fn compute_available_in_mask_for_pipe(&self,mask:u32,pipe:usize)->bool{
-        let allowed = if pipe == 0 { mask } else { mask & !((1u32 << hw::sizes::PIPE1_COMPUTE_START) - 1) };
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
         self.compute_available && allowed != 0
     }
     fn compute_available_for_pipe(&self,n:usize,pipe:usize)->bool{
@@ -1980,7 +1983,7 @@ mod queue_behind_scope {
         assert_eq!(host.choose_compute_pipe(&q2, &vm2, no_w, (1u32 << 24) - 1, true, true), None);
         // A 2-unit base-only or SCS same-VM stays pinned to pipe 0.
         assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b11, false, true), Some(0));
-        assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b110, false, true), Some(0));
+        assert_eq!(host.choose_compute_pipe(&q2, &vm1, no_w, 0b110, true, true), Some(0));
         assert!(host.can_queue_behind(&c2));
         // Add second concurrent flight on pipe 1 from VM2 (q2): VM1 stays on pipe 0 (or expands to
         // pipe 2 for heavy compute, capped at MAX_VM_COMPUTE_PIPES=2), VM2 stays on pipe 1.

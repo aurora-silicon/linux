@@ -2328,11 +2328,7 @@ impl Firmware {
             if load == 0 {
                 continue;
             }
-            let allowed = if p == 0 {
-                slot_mask
-            } else {
-                slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-            };
+            let allowed = self.slots.compute_allowed_for_pipe(slot_mask, p);
             if allowed == 0 || self.slots.compute_exhausted_in_mask(allowed) {
                 continue;
             }
@@ -2573,7 +2569,7 @@ impl Firmware {
             }
             None
         };
-        let has_secondary = (slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)) != 0;
+        let has_secondary = self.slots.compute_allowed_for_pipe(slot_mask, 1) != 0;
         let prefer_secondary = has_secondary && active_other.iter().any(|&a| a);
         if vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES {
             if let Some(p) = pick_idle(prefer_secondary) {

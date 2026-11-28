@@ -787,7 +787,16 @@ pub(crate) struct ComputeOwners {
     /// private unit dirty even if another VM uses the hardware slot in between.
     dirty: [Option<Arc<AtomicBool>>; sizes::COMPUTE_UNITS],
     pending_dirty: [Option<Arc<AtomicBool>>; sizes::COMPUTE_UNITS],
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0 (never
+    /// claimable by secondary pipes `1..COMPUTE_PIPES`). Starts at `INITIAL_PIPE0_RESERVED`
+    /// (`[0, 1]`) and promotes clean non-secondary-pinned replacements when a reserved unit is
+    /// permanently quarantined.
+    pipe0_reserved: u32,
 }
+
+/// Initial pipe-0-exclusive compute unit reservation (`0..PIPE1_COMPUTE_START` = `[0, 1]`).
+const INITIAL_PIPE0_RESERVED: u32 = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+const _: () = assert!(sizes::COMPUTE_UNITS <= 32 && sizes::PIPE1_COMPUTE_START < 32);
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
 const PASS_MASK: u64 = u64::MAX >> (64 - sizes::RENDER_SLOTS);
@@ -1069,6 +1078,7 @@ impl Slots {
                     last_full: [true; sizes::COMPUTE_UNITS],
                     dirty: [const { None }; sizes::COMPUTE_UNITS],
                     pending_dirty: [const { None }; sizes::COMPUTE_UNITS],
+                    pipe0_reserved: INITIAL_PIPE0_RESERVED,
                 }),
                 GFP_KERNEL,
             )?,
@@ -1166,16 +1176,86 @@ impl Slots {
         }
         false
     }
-    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
-    /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
-    /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
-    /// leases.
-    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
-        let allowed = if pipe == 0 {
+    /// Promotes clean, non-secondary-pinned replacement units into `pipe0_reserved` after a
+    /// compute quarantine so pipe 0 always retains `SCS_COMPUTE_UNITS` healthy, non-secondary-tail
+    /// units without un-reserving healthy units that earlier SCS VMs may already hold.
+    fn refresh_pipe0_reserved(&mut self) {
+        let q = self.compute.lifetime.quarantined_mask();
+        self.compute.pipe0_reserved &= !q;
+        let tail = self.compute.lifetime.secondary_tail_mask();
+        let mut usable = self.compute.pipe0_reserved & !tail;
+        if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+            return;
+        }
+        let pinned = self.compute.lifetime.secondary_pinned_mask();
+        // Tier 1: prefer units completely clear of secondary pipes so fresh SCS VMs can claim
+        // immediately without waiting on any secondary-pipe retirement.
+        for k in 0..sizes::COMPUTE_UNITS {
+            let bit = 1u32 << k;
+            if (self.compute.pipe0_reserved & bit) == 0 && ((q | pinned) & bit) == 0 {
+                self.compute.pipe0_reserved |= bit;
+                usable |= bit;
+                if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+                    return;
+                }
+            }
+        }
+        // Tier 2: if all non-reserved units are simultaneously active on secondary pipes, promote
+        // a non-tail unit that will be displaced as soon as its secondary pipe's newer in-flight
+        // publication retires.
+        for k in 0..sizes::COMPUTE_UNITS {
+            let bit = 1u32 << k;
+            if (self.compute.pipe0_reserved & bit) == 0 && ((q | tail) & bit) == 0 {
+                self.compute.pipe0_reserved |= bit;
+                usable |= bit;
+                if usable.count_ones() as usize >= sizes::SCS_COMPUTE_UNITS {
+                    return;
+                }
+            }
+        }
+    }
+    /// Monotonic bitmask of healthy compute units reserved exclusively for pipe 0
+    /// (`0..PIPE1_COMPUTE_START` = `[0, 1]` when healthy, sliding past quarantined units and any
+    /// unit pinned by a secondary pipe).
+    pub(crate) fn pipe0_exclusive_mask(&self) -> u32 {
+        self.compute.pipe0_reserved
+    }
+    /// Bitmask of up to `SCS_COMPUTE_UNITS` healthy, non-secondary-tail units in
+    /// [`Self::pipe0_exclusive_mask`] for fresh SCS compute VMs to bind.
+    pub(crate) fn scs_compute_mask(&self) -> u32 {
+        let reserved = self.compute.pipe0_reserved;
+        if reserved == INITIAL_PIPE0_RESERVED {
+            return reserved;
+        }
+        let q = self.compute.lifetime.quarantined_mask();
+        let tail = self.compute.lifetime.secondary_tail_mask();
+        let mut out = 0u32;
+        let mut found = 0usize;
+        for pass in [reserved & !q & !tail, reserved & !q] {
+            let mut rem = pass & !out;
+            while rem != 0 && found < sizes::SCS_COMPUTE_UNITS {
+                let k = rem.trailing_zeros();
+                rem &= rem - 1;
+                out |= 1u32 << k;
+                found += 1;
+            }
+        }
+        out
+    }
+    /// Submask of `mask` eligible for `pipe` (pipe 0 may use any unit; secondary pipes exclude
+    /// [`Self::pipe0_exclusive_mask`]).
+    pub(crate) fn compute_allowed_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+        if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
+            mask & !self.pipe0_exclusive_mask()
+        }
+    }
+    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
+    /// Pipe 0 may claim any bit in `mask`; secondary pipes exclude [`Self::pipe0_exclusive_mask`]
+    /// so base-only and SCS VMs never contend with undisplaced secondary-pipe leases.
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = self.compute_allowed_for_pipe(mask, pipe);
         self.compute_available_in_mask(allowed)
     }
     /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
@@ -1399,11 +1479,7 @@ impl Slots {
     }
     /// Available compute units in `mask` eligible for `pipe`.
     pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
-        let mut rem = if pipe == 0 {
-            mask
-        } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
+        let mut rem = self.compute_allowed_for_pipe(mask, pipe);
         let mut count = 0u32;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -1505,23 +1581,18 @@ impl Slots {
         }
         // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
         // before falling back to round-robin over `allowed`: pipe 0 spans `mask`, while
-        // secondary pipes stay in `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START`
-        // only ever hold pipe-0 leases and 2-unit base/SCS VMs never split across two pipes.
+        // secondary pipes exclude `pipe0_exclusive_mask()` so base-only and SCS VMs never split
+        // across two pipes or contend with undisplaced secondary-pipe leases.
         let mask = units.compute_slot_mask()?;
-        let allowed = if pipe == 0 {
-            mask
-        } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
-        };
+        let p0_mask = self.pipe0_exclusive_mask();
+        let allowed = if pipe == 0 { mask } else { mask & !p0_mask };
         if allowed == 0 {
             return Ok(None);
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
-        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
-        // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
-        // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
-        // secondary pipes keep maximum unit headroom.
+        // On pipe 0, prefer pipe-0-exclusive units before spilling into secondary-pipe units so
+        // concurrent secondary pipes keep maximum unit headroom.
         let tiers: [u32; 2] = if pipe == 0 {
             [allowed & p0_mask, allowed & !p0_mask]
         } else {
@@ -2317,6 +2388,7 @@ impl Slots {
         Ok(())
     }
     pub(crate) fn quarantine(&mut self, f: &mut Claims) {
+        let compute_quarantined = f.slot_count != 0;
         for &k in &f.slot[..f.slot_count as usize] {
             let k = k as usize;
             self.compute.lifetime.quarantine(k);
@@ -2328,6 +2400,9 @@ impl Slots {
                 flag.store(true, Ordering::Release);
             }
             self.compute.scrub_full[k] = true;
+        }
+        if compute_quarantined {
+            self.refresh_pipe0_reserved();
         }
         let mut mask = f.pass_mask & PASS_MASK;
         while mask != 0 {

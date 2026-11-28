@@ -143,6 +143,45 @@ impl<const N: usize> Lifetime<N> {
         }
         mask
     }
+    /// Bitmask of owners in `0..N.min(32)` currently held in `Preparing`, or `Published` /
+    /// undisplaced `Retired` on any secondary pipe (`pipe != 0`).
+    pub(crate) fn secondary_pinned_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for k in 0..N.min(32) {
+            let u = &self.units[k];
+            if u.state == State::Preparing
+                || (u.pipe != 0
+                    && (u.state == State::Published
+                        || (u.state == State::Retired && !self.available(k))))
+            {
+                mask |= 1u32 << k;
+            }
+        }
+        mask
+    }
+    /// Bitmask of owners in `0..N.min(32)` that are the newest non-quarantined (`Published` or
+    /// `Retired`) publication on any secondary pipe (`pipe != 0`): an idle secondary pipe's
+    /// undisplaced `Retired` unit, or an active secondary pipe's newest in-flight `Published`
+    /// unit (which becomes undisplaced once that pipe drains).
+    pub(crate) fn secondary_tail_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for k in 0..N.min(32) {
+            let u = &self.units[k];
+            if u.pipe == 0 || !matches!(u.state, State::Published | State::Retired) {
+                continue;
+            }
+            let has_newer = self.units.iter().enumerate().any(|(b, other)| {
+                b != k
+                    && other.pipe == u.pipe
+                    && matches!(other.state, State::Published | State::Retired)
+                    && other.publication > u.publication
+            });
+            if !has_newer {
+                mask |= 1u32 << k;
+            }
+        }
+        mask
+    }
     /// Whether any owner in `0..n` is permanently quarantined.
     pub(crate) fn any_quarantined_within(&self, n: usize) -> bool {
         (0..n.min(N)).any(|k| self.units[k].state == State::Quarantined)
@@ -374,5 +413,35 @@ mod tests {
         assert!(l.available(0));
         assert!(!l.available(1));
         assert!(!l.available(3));
+    }
+    #[test]
+    fn secondary_masks_track_retired_in_flight_and_quarantined_tails() {
+        let mut l = Lifetime::<6>::new(true);
+        assert_eq!(l.secondary_pinned_mask(), 0);
+        assert_eq!(l.secondary_tail_mask(), 0);
+        // Pipe 0 never enters secondary masks.
+        assert!(l.claim(0) && l.publish_on(0, 0) && l.retire(0));
+        assert_eq!(l.secondary_pinned_mask(), 0);
+        assert_eq!(l.secondary_tail_mask(), 0);
+        // Pipe 1 publishes unit 2 (in-flight tail).
+        assert!(l.claim(2) && l.publish_on(2, 1));
+        assert_eq!(l.secondary_pinned_mask(), 1 << 2);
+        assert_eq!(l.secondary_tail_mask(), 1 << 2);
+        // Pipe 1 retires unit 2 (idle undisplaced tail).
+        assert!(l.retire(2));
+        assert_eq!(l.secondary_pinned_mask(), 1 << 2);
+        assert_eq!(l.secondary_tail_mask(), 1 << 2);
+        // Pipe 1 publishes unit 3 behind retired unit 2: both are pinned, only 3 is the tail.
+        assert!(l.claim(3) && l.publish_on(3, 1));
+        assert_eq!(l.secondary_pinned_mask(), (1 << 2) | (1 << 3));
+        assert_eq!(l.secondary_tail_mask(), 1 << 3);
+        // If unit 3 quarantines instead of retiring, unit 2 remains pipe 1's undisplaced tail.
+        l.quarantine(3);
+        assert_eq!(l.secondary_pinned_mask(), 1 << 2);
+        assert_eq!(l.secondary_tail_mask(), 1 << 2);
+        // Pipe 1 publishes and retires unit 4: unit 2 is displaced and cleared from both masks.
+        assert!(l.claim(4) && l.publish_on(4, 1) && l.retire(4));
+        assert_eq!(l.secondary_pinned_mask(), 1 << 4);
+        assert_eq!(l.secondary_tail_mask(), 1 << 4);
     }
 }

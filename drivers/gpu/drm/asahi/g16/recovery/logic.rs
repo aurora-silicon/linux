@@ -159,7 +159,7 @@ impl SnapshotEntry {
 /// Bounded per-stage history of recently retired firmware stamps.
 pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
 /// Number of compute pipes tracked by [`RetiredStamps`] (matches `hw::sizes::COMPUTE_PIPES`).
-pub(crate) const RETIRED_COMPUTE_PIPES: usize = 8;
+pub(crate) const RETIRED_COMPUTE_PIPES: usize = 16;
 /// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, TA, FS.
 pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2;
 

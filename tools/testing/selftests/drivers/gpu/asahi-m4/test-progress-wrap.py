@@ -18,7 +18,7 @@ use logic::stamp_reached;
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]struct Error(i32);
 const EIO:Error=Error(5);const ETIMEDOUT:Error=Error(110);
 type Result<T=()>=core::result::Result<T,Error>;
-mod hw{pub mod sizes{pub const COMPUTE_PIPES:usize=8;}}
+mod hw{pub mod sizes{pub const COMPUTE_PIPES:usize=16;}}
 mod command{pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 mod params{
     pub fn recovery()->bool{true}

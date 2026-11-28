@@ -684,6 +684,11 @@ def mod_block(text, name):
         end+=1
     return text[start:end]
 harness=(harness
+    .replace('pub const COMPUTE_PIPES: usize = 8;', next(
+        line.strip().replace('pub(crate)', 'pub')
+        for line in hw_text.splitlines()
+        if 'const COMPUTE_PIPES:' in line
+    ))
     .replace('__HW_CLIENT__',mod_block(hw_text,'client'))
     .replace('__HW_ENGINE__',mod_block(hw_text,'engine'))
     .replace('__HW_TUNING__',mod_block(hw_text,'tuning'))

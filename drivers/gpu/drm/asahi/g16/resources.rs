@@ -362,6 +362,8 @@ pub(crate) struct PrepareHints<'a> {
     pub(crate) expand_compute_ext: bool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
     pub(crate) quarantined_compute_mask: u32,
+    /// Bitmask of healthy pipe-0-exclusive compute units reserved for fresh SCS compute VMs.
+    pub(crate) scs_compute_mask: u32,
     /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
     pub(crate) expand_render_ext: bool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -373,10 +375,11 @@ pub(crate) struct PrepareHints<'a> {
 }
 
 /// Selects `SCS_COMPUTE_UNITS` distinct hardware compute ledger indices for a VM's SCS compute
-/// set, skipping permanently quarantined units in `quarantined_mask`. Scans from `0` up so
-/// pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) are preferred before falling back to
-/// `PIPE1_COMPUTE_START..max_units`.
+/// set, preferring healthy units already reserved for pipe 0 (`reserved_mask`) so fresh SCS
+/// VMs never bind onto units carrying an undisplaced secondary-pipe lease, then falling back
+/// to any non-quarantined units in `0..max_units`.
 fn pick_scs_compute_slots(
+    reserved_mask: u32,
     quarantined_mask: u32,
     max_units: usize,
 ) -> [usize; super::hw::sizes::SCS_COMPUTE_UNITS] {
@@ -385,8 +388,18 @@ fn pick_scs_compute_slots(
         .max(super::hw::sizes::SCS_COMPUTE_UNITS);
     let mut out = [0usize; super::hw::sizes::SCS_COMPUTE_UNITS];
     let mut found = 0usize;
+    let preferred = reserved_mask & !quarantined_mask;
     for k in 0..limit {
-        if (quarantined_mask & (1u32 << k)) == 0 {
+        if (preferred & (1u32 << k)) != 0 {
+            out[found] = k;
+            found += 1;
+            if found == out.len() {
+                return out;
+            }
+        }
+    }
+    for k in 0..limit {
+        if (quarantined_mask & (1u32 << k)) == 0 && !out[..found].contains(&k) {
             out[found] = k;
             found += 1;
             if found == out.len() {
@@ -1171,6 +1184,7 @@ impl Cache {
                 match ready.compute_scs.as_ref().map(|set| set.seeds()) {
                     None => {
                         let hw_slots = pick_scs_compute_slots(
+                            hints.scs_compute_mask,
                             hints.quarantined_compute_mask,
                             super::params::compute_units(),
                         );

@@ -1487,6 +1487,12 @@ impl Firmware {
     /// immediately when a base or PB allocator slot has been permanently quarantined.
     pub(crate) fn sync_quarantine_hints(&self) {
         if let Some(shared) = &self.engine.shared {
+            // Publish the updated pipe-0 SCS reservation before `quarantined_compute_mask` so
+            // lock-free `SUBMIT` readers observing a new quarantine always observe its matching
+            // non-secondary-pinned SCS slots.
+            shared
+                .scs_compute_mask
+                .store(self.slots.scs_compute_mask(), Ordering::Release);
             shared
                 .base_compute_quarantined
                 .store(self.slots.base_compute_quarantined(), Ordering::Release);
