@@ -74,7 +74,6 @@ const SET_COMPUTE_ATTACHMENTS: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMP
 
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
-const MAX_TILE_BUFFER: u32 = 32768;
 const ZLS_METADATA_STRIDE: u64 = 0x80;
 /// Size of a queue's USC window.
 pub(crate) const USC_WINDOW: u64 = 1 << 32;
@@ -378,6 +377,8 @@ pub(crate) struct Context<'a> {
     pub(crate) active_cores: u32,
     /// The queue's reserved render scratch pages per stage (`render_scs_layout`).
     pub(crate) render_scs: [u16; 2],
+    /// Largest tile buffer render commands may use, in bytes (`Config::max_tile_buffer`).
+    pub(crate) max_tile_buffer: u32,
 }
 
 /// A stream whose timestamps and ordinals are resolved ([`ParsedStream::prepare`]), before its
@@ -1282,7 +1283,7 @@ fn check_render_for(
         || !matches!(cmd.samples, 1 | 2 | 4)
         || !matches!(cmd.utile_width_px, 16 | 32)
         || !matches!(cmd.utile_height_px, 16 | 32)
-        || tile_buffer > MAX_TILE_BUFFER
+        || tile_buffer > context.max_tile_buffer
         || cmd.sampler_heap != 0
         || cmd.sampler_count != 0
         || cmd.ppp_ctrl & !0x203 != 0

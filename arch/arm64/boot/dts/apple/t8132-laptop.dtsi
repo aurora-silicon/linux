@@ -185,3 +185,12 @@
 		apple,no-liquid-detection;
 	};
 };
+
+/*
+ * ADT /arm-io/spi4/dp855: the panel timing controller. Chip select from the
+ * spi4 function-spi_cs0, the same pin on the J604, J713 and J715.
+ */
+&spi4 {
+	cs-gpios = <&pinctrl_ap 76 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};

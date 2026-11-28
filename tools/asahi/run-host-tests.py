@@ -26,6 +26,7 @@ import concurrent.futures
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -352,6 +353,8 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-highpri-sched-wq-tests.py': [([], PASS)]
+        + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
@@ -375,6 +378,10 @@ ASAHI_TESTS = {
                                    'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
                                    'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
                                    'owed-slow-path'), []),
+    'g17-rescan-poll-tests.py': [([], PASS)]
+        + mutations('--mutation', ('starve-fast-pending', 'starve-slow-pending', 'jiffy-poll',
+                                   'skip-backpressure-poll', 'skip-sleep-cancel',
+                                   'skip-shutdown-disable'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),
@@ -406,6 +413,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
                                    'usb-rpm', 'usb-epoch-syscore', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
+    'pcie-adopted-clkpm-tests.py': [([], PASS)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
     'sep-suspend-errors-tests.py': [(out(), PASS)]
@@ -599,16 +607,42 @@ def run(job, timeout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
-    ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory)')
+    ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory, '
+                    'removed at the end but for the failed runs\' logs)')
     ap.add_argument('--conf', type=Path, help='a built scripts/kconfig/conf (default: build one)')
     ap.add_argument('--dtc', type=Path, help='a built scripts/dtc/dtc (default: build one)')
     ap.add_argument('--only', help='run only jobs whose name contains this text')
     ap.add_argument('--timeout', type=int, default=900)
     args = ap.parse_args()
 
-    work = args.work or Path(tempfile.mkdtemp(prefix='aurora-host-tests-'))
-    work = work.resolve()
-    work.mkdir(parents=True, exist_ok=True)
+    if args.work:
+        work = args.work.resolve()
+        work.mkdir(parents=True, exist_ok=True)
+        return 1 if run_all(args, work) else 0
+    # A run leaves several GB of build products, so a temporary work directory goes when it ends: all of it after a
+    # pass or an interrupted run, all but the failed runs' logs after a failure.
+    work = Path(tempfile.mkdtemp(prefix='aurora-host-tests-')).resolve()
+    failed = []
+    try:
+        failed = run_all(args, work)
+    finally:
+        keep = {log.parent for _, log in failed}
+        for d in work.iterdir():
+            for path in (d.iterdir() if d in keep else [d]):
+                if path.name == 'log' and d in keep:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+        if not keep:
+            work.rmdir()
+    if failed:
+        print(f'\nthe failed runs\' logs are kept in {work}')
+    return 1 if failed else 0
+
+
+def run_all(args, work):
     conf, dtc = args.conf, args.dtc
     build = work / 'kconfig'
     if conf is None or dtc is None:
@@ -636,7 +670,7 @@ def main():
         text = log.read_text(errors='replace').splitlines()
         print(f'\n=== {label}: last lines of {log}')
         print('\n'.join(text[-40:]))
-    return 1 if failed else 0
+    return failed
 
 
 if __name__ == '__main__':

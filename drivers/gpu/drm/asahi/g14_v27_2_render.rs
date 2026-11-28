@@ -468,6 +468,9 @@ pub(crate) fn encode_vertex(
     put32(cmd, 0x564, u32::from(r.sampler_count));
     // Allow a synchronous parameter-buffer request.
     put32(cmd, 0x570, 1);
+    // Vertex shader scratch flag: 13.5 uses_scratch is 8 bytes past sync_grow (0x570 -> 0x578).
+    const _: () = assert!(offset_of!(Rv, uses_scratch) - offset_of!(Rv, sync_grow) == 8);
+    put32(cmd, 0x578, u32::from(r.flags & 1 != 0));
     // Job meta at 0x580.
     put64(cmd, 0x584, q.stamp);
     put64(cmd, 0x58c, q.fw_stamp);

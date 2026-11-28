@@ -288,6 +288,7 @@ impl Queue {
                 usc_base: self.state.usc_base,
                 active_cores: self.active_cores,
                 render_scs: self.render_scs,
+                max_tile_buffer: self.cfg.max_tile_buffer,
             },
             &mut self.proof,
         )?;

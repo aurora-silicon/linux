@@ -2812,7 +2812,9 @@ F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
 F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
+F:	drivers/nvme/host/apple-kunit.c
 F:	drivers/nvme/host/apple.c
+F:	drivers/nvme/host/apple.kunitconfig
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c

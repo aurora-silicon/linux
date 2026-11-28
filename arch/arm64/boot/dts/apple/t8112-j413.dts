@@ -314,16 +314,6 @@
 	status = "okay";
 };
 
-&nub_spmi1 {
-	status = "okay";
-
-	pmic@e {
-		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
-		reg = <0xe SPMI_USID>;
-		read-only;
-	};
-};
-
 &i2c2 {
 	retimer@18 {
 		compatible = "apple,t8112-atcrt", "apple,atcrt";
@@ -640,4 +630,21 @@
 
 &m2_aop_spmi1_sideband {
 	status = "okay";
+};
+
+/* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
+&smc {
+	apple,wake-reasons = <0 8 9 12 13 22 40 41 42 43 44 45 48>;
+	apple,wake-reason-names = "pwrbtn", "lid", "codec", "charger", "wifibt",
+				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
+				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+};
+
+/* The port controllers' system power state: S3 before a firmware-driven sleep, S0 after it */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
 };

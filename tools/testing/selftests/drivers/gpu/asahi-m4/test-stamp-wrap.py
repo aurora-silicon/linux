@@ -38,10 +38,10 @@ impl Object {
     fn reset_reads(&self){self.reads.set(0);}
 }
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
-mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
+mod notifier_page {pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
 mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
-#[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
+#[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object,user_stamp:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
@@ -89,8 +89,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
     f.graph.compute[0].fw_stamp.set(0,u64::from(target));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(target));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[0].user_stamp.set(0,u64::from(target));
     f.engine.flights[0].job.resources.compute[0].counter.set(0,ordinal);
     f.engine.flights[0].job.resources.compute[0].its.set(0,100);f.engine.flights[0].job.resources.compute[0].its.set(8,101);
     f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,ordinal);
@@ -138,8 +137,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.engine.flights.push(later);f.engine.target[0]=encode::stamp(n+1);
         // The command behind it finished too: the shared stamp and notifier cells name it.
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n+1)));
-        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,9);
+        f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(n+1)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
@@ -199,8 +197,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights.push(c);
     f.engine.target[0]=encode::stamp(20);
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(20)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(20)));
     // Keep render FS stamp unreached so render at index 0 stays pending.
     f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
@@ -433,8 +430,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.channels.compute_producer=2;
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(9)));
     f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(11)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(11)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[1].user_stamp.set(0,u64::from(encode::stamp(11)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
     assert_eq!(f.last_chan_passed.get(),Some(true));
     f.engine.flights.remove(1);
@@ -472,11 +468,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.target[0]=encode::stamp(40);f.engine.target[1]=encode::stamp(41);
     f.channels.compute_producer=2;
     f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(40)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(40)));
-    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,1);
+    f.graph.compute[0].user_stamp.set(0,u64::from(encode::stamp(40)));
     f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(41)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(41)));
-    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[1].user_stamp.set(0,u64::from(encode::stamp(41)));
 
     // Within grace: pipe 0 records gate_passed_ns while innocent pipe 1 retires Full immediately.
     let (idx_b,ret_b)=f.retired_flight().unwrap().unwrap();

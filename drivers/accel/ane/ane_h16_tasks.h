@@ -217,9 +217,9 @@ static inline bool ane_hx_dma_base(u32 addr)
 static inline bool ane_hx_dma_modelled(u32 addr)
 {
 	return (addr >= 0x4d00 && addr <= 0x4d3c) || addr == 0x4d68 || addr == 0x4d6c ||
-	       addr == 0x5100 || (addr >= 0x5108 && addr <= 0x511c) || addr == 0x5138 ||
-	       addr == 0x5500 || addr == 0x5504 || (addr >= 0x5510 && addr <= 0x55dc) ||
-	       (addr >= 0x5610 && addr <= 0x561c);
+	       addr == 0x5100 || addr == 0x5104 || (addr >= 0x5108 && addr <= 0x511c) ||
+	       addr == 0x5138 || addr == 0x5500 || addr == 0x5504 ||
+	       (addr >= 0x5510 && addr <= 0x55dc) || (addr >= 0x5610 && addr <= 0x561c);
 }
 
 /* Source 1, source 2 and destination DMA configuration and coefficient lanes. */
@@ -361,6 +361,9 @@ static inline void ane_hx_dma_defaults(struct ane_hx_dma_state *st)
 	unsigned int i;
 
 	memset(st, 0, sizeof(*st));
+	/* Input and output channel counts (0x0c, 0x1c) reset to 16 on H16/H17. */
+	st->img[ane_hx_dma_index(0x0c)] = 16;
+	st->img[ane_hx_dma_index(0x1c)] = 16;
 	st->img[ane_hx_dma_index(0x40)] = 3;
 	for (i = 0; i < 16; i++)
 		st->img[ane_hx_dma_index(0x55a0 + 4 * i)] = 64;
@@ -473,6 +476,7 @@ static inline int ane_hx_dma_image_check(const u32 *img)
 	}
 	if ((img[ane_hx_dma_index(0x4d08)] | img[ane_hx_dma_index(0x4d0c)]) & ~0xffU ||
 	    (img[ane_hx_dma_index(0x4d68)] | img[ane_hx_dma_index(0x4d6c)]) & ~0x0f003031U ||
+	    img[ane_hx_dma_index(0x5104)] & ~0x7f000000U ||
 	    img[ane_hx_dma_index(0x5138)] & ~0x0f303031U ||
 	    (img[ane_hx_dma_index(0x40)] & 7) > 5)
 		return -ENOEXEC;

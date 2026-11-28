@@ -1175,7 +1175,7 @@ static void ane_fw_unpark(struct ane_fw_backend *b)
 	if (ret) {
 		/* Power and mappings stay for diagnosis: the quarantine pins the device. */
 		ane_fw_quarantine(b, ret);
-		b->session.quarantined = true;
+		WRITE_ONCE(b->session.quarantined, true);
 	}
 	ane_h16_session_sleep(&b->session, false);
 	dev_info(&b->pdev->dev, "H17 ANE: up for a request%s\n", ret ? " FAILED" : "");
@@ -1415,7 +1415,7 @@ static void ane_fw_recover_work(struct work_struct *work)
 			b->recover_failures++;
 			/* Booted over memory proven free: as any failed boot, until reboot. */
 			ane_fw_quarantine(b, ret);
-			b->session.quarantined = true;
+			WRITE_ONCE(b->session.quarantined, true);
 		} else {
 			ane_fw_hung_recovered(b);
 			ane_fw_rpm_idle(b);
@@ -1566,7 +1566,7 @@ int ane_fw_staged_runtime_suspend(struct device *dev)
 	b->in_rpm = false;
 	if (ret) {
 		ane_fw_quarantine(b, ret);
-		b->session.quarantined = true;
+		WRITE_ONCE(b->session.quarantined, true);
 		ane_h16_session_sleep(&b->session, false);
 		dev_err(dev, "H17 ANE: idle park failed (%d): quarantined\n", ret);
 		return -EBUSY;
@@ -1671,7 +1671,7 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 		 * session (SPEC-ANE-SLEEP.md section 6).
 		 */
 		ane_fw_quarantine(b, ret);
-		b->session.quarantined = true;
+		WRITE_ONCE(b->session.quarantined, true);
 		ane_h16_session_sleep(&b->session, false);
 		return ret;
 	}
@@ -1781,7 +1781,7 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
-		b->session.quarantined = true;
+		WRITE_ONCE(b->session.quarantined, true);
 	} else if (recover) {
 		ane_fw_hung_recovered(b);
 		ane_fw_rpm_idle(b);
@@ -2893,7 +2893,7 @@ static int ane_fw_first_bringup(struct ane_fw_backend *b)
 		b->stage = ANE_STAGE_PROGRAM;
 		ret = 0;
 	} else {
-		b->session.quarantined = true;
+		WRITE_ONCE(b->session.quarantined, true);
 	}
 	WRITE_ONCE(b->parked, false);
 	WRITE_ONCE(b->session.parked, false);

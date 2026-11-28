@@ -1300,10 +1300,12 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, tail)
-                    && (stamp != f.target
-                        || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+                // The service stamp alone authenticates the receipt: its target is this pipe's
+                // own ordinal, and the firmware stores it only after its last access to the
+                // command's work item, microsequence and UMA descriptor. The cached notifier
+                // record's context word is written back only when the record is unlinked, so
+                // the host cannot read it reliably.
+                full &= stamp_reached(g.user_stamp.r32(0)?, f.target, tail);
             } else {
                 if g.fw_stamp.r32(0)? != f.target
                     || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
@@ -1313,8 +1315,7 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
+                full &= g.user_stamp.r32(0)? == f.target;
             }
             let count = f.claims.slot_count as usize;
             full &= count != 0 && count == f.computes as usize;
