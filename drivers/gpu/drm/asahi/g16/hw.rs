@@ -1166,19 +1166,6 @@ pub(crate) mod sizes {
     /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
     /// `c2c` barrier + `work`).
     pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
-    /// Maximum unfinished TA passes kept in flight at once for heavy multi-layer or large-tilemap
-    /// renders so heavy bursts stay inside M4 firmware's `<= 4`-pass TA/scene pipeline.
-    pub(crate) const TA_WAVE_PASSES: usize = 4;
-    /// Maximum unfinished TA passes kept in flight at once for light single-layer renders
-    /// (`tilemap_bytes <= TA_LIGHT_TILEMAP_BYTES`), doubling the wave window for light render
-    /// bursts and deeper micro-coalesced batches.
-    pub(crate) const TA_WAVE_PASSES_LIGHT: usize = 8;
-    /// Tilemap byte threshold at or below which a single-layer render qualifies for
-    /// `TA_WAVE_PASSES_LIGHT`.
-    pub(crate) const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024;
-    /// Headroom below the active TA wave cap at which a TA-wave-paused render queue wakes to
-    /// launch the next wave, avoiding 1-pass stub drips.
-    pub(crate) const TA_WAVE_REFILL_HEADROOM: usize = 2;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most. A slot is reused only after a later render
