@@ -252,6 +252,9 @@ static int dcp_get_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* Nothing is presented any more: there is no level to report. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		/*
@@ -888,6 +891,9 @@ static int dcp_set_brightness(struct backlight_device *bd)
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
+	/* A crashed processor discards every present, the level with it. */
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
 		struct dcp_backlight_state *state = &dcp->backlight.state;

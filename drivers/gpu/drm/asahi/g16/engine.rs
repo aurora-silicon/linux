@@ -3691,7 +3691,7 @@ impl Firmware {
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             qinfo: g.qinfo.va,
-            user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+            user_stamp: g.user_stamp.va,
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,

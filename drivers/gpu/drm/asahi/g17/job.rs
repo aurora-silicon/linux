@@ -549,6 +549,11 @@ pub(crate) struct Fences {
     pub(crate) scheduled: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    /// Pending host-timestamp writer completion fences inherited through
+    /// timestamp-free publication chaining. `None` for commands that write their
+    /// own timestamps (covered by `completed`) or have no pending timestamp
+    /// ancestors.
+    pub(crate) timestamp_waits: Option<Arc<KVec<Fence>>>,
     pub(crate) owner: Arc<Completion>,
 }
 
@@ -680,7 +685,14 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, scheduled, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences {
+            ready,
+            scheduled,
+            completed,
+            publication: host_publication,
+            timestamp_waits: None,
+            owner: packet.completion.clone(),
+        })
     }
 }
 

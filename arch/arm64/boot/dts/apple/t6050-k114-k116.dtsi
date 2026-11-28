@@ -395,6 +395,13 @@
 		};
 
 		/*
+		 * The trackpad's haptic engine (ADT mtp-transport/actuator). The
+		 * ADT gives it no click strength, so the firmware's is kept.
+		 */
+		actuator {
+		};
+
+		/*
 		 * The touchscreen (ADT mtp-transport/kiwi, image-tag "fsat"). macOS
 		 * sends it firmware through the same CBOR bootloader as the trackpad.
 		 * Its power, reset, 24 MHz clock and display-sync lines are SoC GPIOs

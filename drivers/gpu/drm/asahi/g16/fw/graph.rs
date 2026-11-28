@@ -126,8 +126,6 @@ pub(crate) mod notifier_page {
     pub(crate) const TA_RECORD: usize = 0;
     pub(crate) const FS_RECORD: usize = 0x200;
     pub(crate) const COMPUTE_RECORD: usize = 0x400;
-    pub(crate) const COMPUTE_CONTEXT: usize = COMPUTE_RECORD + super::notifier::CONTEXT;
-    pub(crate) const COMPUTE_STAMP: usize = 0x648;
     pub(crate) const TA_STAMP: usize = 0x620;
     pub(crate) const FS_STAMP: usize = 0x630;
 }
