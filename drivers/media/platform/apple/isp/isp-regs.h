@@ -25,6 +25,14 @@
 #define ISP_COPROC_IRQ_MASK_4  0x1400a10
 #define ISP_COPROC_IRQ_MASK_5  0x1400a14
 
+/*
+ * Two words the reset before T8140 reads until they are 0. What they are is
+ * not known; the T8140 reset reads its acknowledge words at 0x1600818 and
+ * 0x160081c instead.
+ */
+#define ISP_COPROC_DRAIN_0     0x818
+#define ISP_COPROC_DRAIN_1     0x81c
+
 #define ISP_COPROC_CONTROL_T8140 0x1600044
 #define ISP_COPROC_STATUS_T8140	 0x1600048
 #define ISP_COPROC_QUIESCE_T8140 0x1600040
