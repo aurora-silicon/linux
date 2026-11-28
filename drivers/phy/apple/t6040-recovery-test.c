@@ -35,10 +35,28 @@ static void t6040_recovery_retry_exhaustion_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.retries, (u8)T6040_RECOVERY_RETRIES);
 }
 
+static void t6040_recovery_power_lost_test(struct kunit *test)
+{
+	struct t6040_usb2_phy *tphy;
+
+	tphy = kunit_kzalloc(test, sizeof(*tphy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tphy);
+
+	t6040_recovery_power_down(&tphy->recovery, false, false);
+	KUNIT_ASSERT_TRUE(test, t6040_recovery_retry(&tphy->recovery));
+	tphy->shutdown_failed = true;
+
+	t6040_power_lost(tphy);
+	KUNIT_EXPECT_FALSE(test, tphy->recovery.cycle_pending);
+	KUNIT_EXPECT_EQ(test, tphy->recovery.retries, (u8)0);
+	KUNIT_EXPECT_FALSE(test, tphy->shutdown_failed);
+}
+
 static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_missed_ack_test),
 	KUNIT_CASE(t6040_recovery_failed_tune_test),
 	KUNIT_CASE(t6040_recovery_retry_exhaustion_test),
+	KUNIT_CASE(t6040_recovery_power_lost_test),
 	{}
 };
 

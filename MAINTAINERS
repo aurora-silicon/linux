@@ -2863,6 +2863,7 @@ F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
 F:	tools/asahi/dart-sleep-*-tests.*
 F:	tools/asahi/sleep_test_utils.py
+F:	tools/asahi/t6040-usb2-s2r-tests.py
 F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE AVE VIDEO ENCODER DRIVER

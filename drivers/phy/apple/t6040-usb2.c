@@ -225,6 +225,13 @@ static void t6040_recovery_complete(struct t6040_recovery_state *state)
 	state->retries = 0;
 }
 
+/* SoC power loss is a full domain power cycle for the PHY coprocessor. */
+static void t6040_recovery_power_lost(struct t6040_recovery_state *state)
+{
+	state->cycle_pending = false;
+	state->retries = 0;
+}
+
 enum t6040_usb3_region {
 	T6040_USB3_AXI2AF,
 	T6040_USB3_AXI2AF_LIOA,
@@ -295,6 +302,8 @@ struct t6040_usb2_phy {
 	struct apple_tunable *tunable_usb2_default;
 	struct apple_tunable *tunable_usb2_device;
 	struct apple_rtkit *rtk;
+	bool sleep_rtk_stale;	/* RTKit transport survived a firmware sleep; stop on resume */
+	bool sleep_rpm_idle_pending;	/* CIO ref dropped in resume_early; idle on resume */
 	struct device *mbox_dev;
 	struct completion app_reply;
 	struct t6040_recovery_state recovery;
@@ -315,6 +324,7 @@ struct t6040_usb2_phy {
 	struct phy *dp;
 	struct typec_mux_dev *mux;
 	bool dp_ok;
+	bool dp_on;		/* DP consumer holds the DP phy powered on */
 	bool dp_up;		/* DP mode is programmed on the PHY */
 	bool dp_alt;		/* the Type-C port is in DP alt mode */
 	bool dp_two_lanes;	/* pin D keeps USB3 on the other pair */
@@ -733,6 +743,15 @@ static void t6040_rtkit_stop_transport(struct t6040_usb2_phy *tphy)
 		return;
 	apple_rtkit_free(tphy->rtk);
 	tphy->rtk = NULL;
+}
+
+static void t6040_drop_stale_rtk_locked(struct t6040_usb2_phy *tphy)
+{
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->sleep_rtk_stale)
+		return;
+	tphy->sleep_rtk_stale = false;
+	t6040_rtkit_stop_transport(tphy);
 }
 
 /*
@@ -1175,6 +1194,7 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 	/* PIPE_HANDLER_DEFAULT: the dummy PIPE clock the controller keeps using at USB2 */
 	apple_tunable_apply(tphy->pipehandler, tphy->tunable_pipehandler);
 
+	t6040_drop_stale_rtk_locked(tphy);
 	cycle = t6040_recovery_start(&tphy->recovery);
 retry:
 	if (cycle) {
@@ -1824,6 +1844,7 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	if (ret)
 		return ret;
 
+	t6040_drop_stale_rtk_locked(tphy);
 	cycle = t6040_recovery_start(&tphy->recovery);
 retry:
 	if (cycle) {
@@ -1885,16 +1906,16 @@ static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 
 /* ---- DP phy_ops ---- */
 
-static int t6040_dp_power_on(struct phy *phy)
+static int t6040_dp_up_locked(struct t6040_usb2_phy *tphy)
 {
-	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 	int ret;
 
-	guard(mutex)(&tphy->lock);
+	lockdep_assert_held(&tphy->lock);
 	if (!tphy->dp_ok || tphy->dp_up)
 		return 0;
 	if (tphy->cio_up)
 		return -EBUSY;
+	t6040_drop_stale_rtk_locked(tphy);
 	/* Pin D shares the running PHY with USB3. Keep its PIPE and firmware. */
 	if (tphy->dp_two_lanes) {
 		if (!tphy->usb3_ok || !tphy->dp_alt)
@@ -1915,6 +1936,8 @@ static int t6040_dp_power_on(struct phy *phy)
 	}
 	/* C/E and the fixed HDMI PHY hand all four lanes to DP. */
 	if (!t6040_dp_only(tphy)) {
+		if (!tphy->dp_alt)
+			return -ENOLINK;
 		t6040_usb3_down_locked(tphy);
 		tphy->usb3_lent = true;
 	}
@@ -1926,10 +1949,41 @@ static int t6040_dp_power_on(struct phy *phy)
 	t6040_dp_mode_setup(tphy, tphy->dp_flip);
 	tphy->dp_rate = -1;
 	tphy->dp_mode_two_lanes = false;
+	tphy->dp_mode_flip = false;
 	tphy->dp_up = true;
 	dev_dbg(tphy->dev, "DP PHY mode set, lane map %s\n",
 		tphy->dp_flip ? "reversed" : "normal");
 	return 0;
+}
+
+static int t6040_dp_restore_locked(struct t6040_usb2_phy *tphy)
+{
+	int ret;
+
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->dp_on || tphy->dp_up)
+		return 0;
+
+	ret = pm_runtime_resume_and_get(tphy->dev);
+	if (ret)
+		return ret;
+	ret = t6040_dp_up_locked(tphy);
+	pm_runtime_put(tphy->dev);
+	return ret;
+}
+
+static int t6040_dp_power_on(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+	int ret;
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->dp_ok)
+		return 0;
+	ret = t6040_dp_up_locked(tphy);
+	if (!ret)
+		tphy->dp_on = true;
+	return ret;
 }
 
 static int t6040_dp_power_off(struct phy *phy)
@@ -1955,10 +2009,12 @@ static int t6040_dp_power_off(struct phy *phy)
 		t6040_usb3_sleep(tphy);
 		dev_info(tphy->dev, "DP PHY down, PHY asleep\n");
 	}
+	tphy->dp_on = false;
 	tphy->dp_up = false;
 	if (tphy->dp_mode_two_lanes && !tphy->usb3_on)
 		t6040_usb3_down_locked(tphy);
 	tphy->dp_mode_two_lanes = false;
+	tphy->dp_mode_flip = false;
 	t6040_usb3_reclaim_locked(tphy);
 	return ret;
 }
@@ -1994,8 +2050,18 @@ static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 			return -EINVAL;
 		return t6040_tun_rate_locked(tphy, opts->tunnel_dpin, opts->tunnel_rate);
 	}
-	if (!tphy->dp_up)
-		return -EINVAL;
+	if (!tphy->dp_up) {
+		if (!tphy->dp_on)
+			return -EINVAL;
+		if (opts->set_rate && !opts->link_rate &&
+		    !opts->set_lanes && !opts->set_voltages)
+			return 0;
+		ret = t6040_dp_restore_locked(tphy);
+		if (ret)
+			return ret;
+		if (!tphy->dp_up)
+			return -EINVAL;
+	}
 	if ((opts->set_lanes || opts->set_voltages) &&
 	    opts->lanes > (tphy->dp_mode_two_lanes ? 2 : 4))
 		return -EINVAL;
@@ -2042,9 +2108,17 @@ static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 /* ACTIVATE/DEACTIVATE: PHY_MODE_DP, submode = the DCP's DPTX port index. */
 static int t6040_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
-	if (mode == PHY_MODE_DP || mode == PHY_MODE_INVALID)
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	if (mode == PHY_MODE_INVALID)
 		return 0;
-	return -EOPNOTSUPP;
+	if (mode != PHY_MODE_DP)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&tphy->lock);
+	if (tphy->dp_on && !tphy->dp_up)
+		return t6040_dp_restore_locked(tphy);
+	return 0;
 }
 
 static const struct phy_ops t6040_dp_phy_ops = {
@@ -2569,6 +2643,85 @@ static void t6040_keep_running_cpu_awake(struct t6040_usb2_phy *tphy, bool noirq
 	}
 }
 
+static void t6040_power_lost(struct t6040_usb2_phy *tphy)
+{
+	t6040_recovery_power_lost(&tphy->recovery);
+	tphy->shutdown_failed = false;
+}
+
+/*
+ * Firmware-driven deep sleep powers down the ATC domains behind genpd and the
+ * PHY consumers' backs, returning the PHY, pipehandler and coprocessor
+ * cold-reset on wake. Any hardware-live state still set here (such as USB3
+ * and RTKit retained by a pin-D dock whose DP side stayed up, an active DP
+ * route whose DCP never called phy_power_off(), or an active CIO session) no
+ * longer reflects silicon and must be cleared before consumers resume so the
+ * next bring-up programs the PHY from cold instead of switching the PIPE onto
+ * a sleeping PHY or skipping firmware boot.
+ *
+ * Consumer ownership (usb3_on, usb3_pipe, dp_on, dwc3_running) and Type-C
+ * partner state (orientation, dp_alt, dp_two_lanes, dp_flip) are preserved so
+ * consumer reference counts stay balanced, the next bring-up keeps the plug
+ * state, and a DP consumer that stayed powered across deep sleep has its PHY
+ * mode restored in .resume() (and lazily on .set_mode() / .configure() if
+ * resume restore was deferred or failed). Only CIO's PHY-internal runtime PM
+ * reference is dropped with cio_up, with idle requested in .resume().
+ * Hardware-live USB2 state (powered) has no PHY-internal refcount and is
+ * cleared with the rest so the next USB2 power-on re-runs the init sequence.
+ * Stale RTKit transport teardown is deferred to .resume() once the mailbox
+ * supplier and runtime PM are active again.
+ */
+static void t6040_sleep_power_lost_locked(struct t6040_usb2_phy *tphy)
+{
+	bool stale_hw;
+	bool cio_was_up;
+
+	lockdep_assert_held(&tphy->lock);
+
+	t6040_power_lost(tphy);
+
+	stale_hw = tphy->powered || tphy->usb3_up ||
+		   (tphy->dp_up && !t6040_dp_only(tphy)) || tphy->cio_up ||
+		   tphy->pipe_switched || tphy->rtk ||
+		   tphy->dp_mode_two_lanes || tphy->tun_pll ||
+		   tphy->tun_pre || tphy->tun_rate[0] || tphy->tun_rate[1] ||
+		   (tphy->usb3_lent && tphy->usb3_on);
+	if (stale_hw) {
+		dev_warn(tphy->dev,
+			 "firmware sleep left stale PHY state (usb2 %d, usb3 %d, pipe %d, lent %d, dp %d, dp2 %d, rate %d, cio %d, rtk %d): resetting\n",
+			 tphy->powered, tphy->usb3_up, tphy->pipe_switched,
+			 tphy->usb3_lent, tphy->dp_up, tphy->dp_mode_two_lanes,
+			 tphy->dp_rate, tphy->cio_up, !!tphy->rtk);
+	} else if (t6040_dp_only(tphy) && tphy->dp_up) {
+		dev_dbg(tphy->dev,
+			"firmware sleep cleared DP-only PHY state (rate %d)\n",
+			tphy->dp_rate);
+	}
+
+	cio_was_up = tphy->cio_up;
+	if (tphy->rtk)
+		tphy->sleep_rtk_stale = true;
+
+	tphy->powered = false;
+	tphy->usb3_up = false;
+	tphy->pipe_switched = false;
+	tphy->usb3_lent = false;
+	tphy->cio_up = false;
+	tphy->tun_rate[0] = 0;
+	tphy->tun_rate[1] = 0;
+	tphy->tun_pre = false;
+	tphy->tun_pll = false;
+	tphy->dp_up = false;
+	tphy->dp_mode_two_lanes = false;
+	tphy->dp_mode_flip = false;
+	tphy->dp_rate = -1;
+
+	if (cio_was_up) {
+		tphy->sleep_rpm_idle_pending = true;
+		pm_runtime_put_noidle(tphy->dev);
+	}
+}
+
 static int t6040_usb2_suspend(struct device *dev)
 {
 	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), false);
@@ -2581,9 +2734,47 @@ static int t6040_usb2_suspend_noirq(struct device *dev)
 	return 0;
 }
 
+static int t6040_usb2_resume_early(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy || !pm_resume_via_firmware())
+		return 0;
+
+	guard(mutex)(&tphy->lock);
+	t6040_sleep_power_lost_locked(tphy);
+	return 0;
+}
+
+static int t6040_usb2_resume(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+	bool idle_pending;
+	int ret = 0;
+
+	if (!tphy)
+		return 0;
+
+	scoped_guard(mutex, &tphy->lock) {
+		t6040_drop_stale_rtk_locked(tphy);
+		idle_pending = tphy->sleep_rpm_idle_pending;
+		tphy->sleep_rpm_idle_pending = false;
+		if (tphy->dp_on && !tphy->dp_up)
+			ret = t6040_dp_restore_locked(tphy);
+	}
+	if (ret)
+		dev_warn(tphy->dev, "DP PHY restore after firmware sleep failed: %d\n",
+			 ret);
+	if (idle_pending)
+		pm_request_idle(tphy->dev);
+	return 0;
+}
+
 static const struct dev_pm_ops t6040_usb2_pm_ops = {
 	.suspend = t6040_usb2_suspend,
 	.suspend_noirq = t6040_usb2_suspend_noirq,
+	.resume_early = t6040_usb2_resume_early,
+	.resume = t6040_usb2_resume,
 };
 
 static void t6040_mbox_dev_put(void *data)
