@@ -394,10 +394,16 @@ static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 		writeq(value, addr);
 }
 
-unsigned int flush_interval = 1000;
+/*
+ * A non-zero grace period completes a flush that arrives within it at once,
+ * before the data reaches the drive, and sends one flush when the period
+ * ends. A power loss in between loses data the filesystem was told is safe,
+ * so every flush goes to the drive unless the user opts in.
+ */
+static unsigned int flush_interval;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
-		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+		 "Grace period in msecs between flushes; a non-zero value acknowledges flushes before they reach the drive (default 0, ignored on post-M4 ANS)");
 
 /*
  * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
@@ -3803,6 +3809,9 @@ static const struct apple_nvme_hw apple_nvme_t8122_hw = {
  * The post-M4 (T8132 and later) I/O queue setup follows Yureka Lilian's T8132
  * support in m1n1 (commit 53f8ee9b54ba, "nvme: support T8132").
  */
+/* Explicit flushes are required for writes to survive a reset on J713. */
+#define APPLE_NVME_T8132_QUIRKS NVME_QUIRK_BROKEN_FUA
+
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,
@@ -3814,8 +3823,7 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
-	/* Explicit flushes are required for writes to survive a reset on J713. */
-	.quirks = NVME_QUIRK_BROKEN_FUA,
+	.quirks = APPLE_NVME_T8132_QUIRKS,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8140_hw = {
@@ -3868,7 +3876,8 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.sleep_traced = true,
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
-	.quirks = NVME_QUIRK_NO_APST,
+	/* The T8132 controller, so the same FUA result applies. */
+	.quirks = APPLE_NVME_T8132_QUIRKS | NVME_QUIRK_NO_APST,
 };
 
 /*
