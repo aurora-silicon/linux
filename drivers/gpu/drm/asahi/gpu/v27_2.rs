@@ -681,6 +681,20 @@ impl GpuManagerG14V13_5 {
     }
 }
 
+/// Validated ring and queue positions ready for [`RootV27_2::stage_work`] to populate.
+struct StagedRing<'a> {
+    head: &'a core::sync::atomic::AtomicU32,
+    old: u32,
+    capacity: u32,
+    target: u32,
+    first: bool,
+    producer: &'a core::sync::atomic::AtomicU32,
+    indices: &'a fw::types::GpuArray<u8>,
+    ring: &'a fw::types::GpuArray<u8>,
+    w: u32,
+    next: u32,
+}
+
 impl RootV27_2 {
     fn word(a: &fw::types::GpuArray<u8>, at: usize) -> Result<u32> {
         Ok(a.shared_index(at)?.load(Ordering::Acquire))
@@ -773,6 +787,24 @@ impl RootV27_2 {
         self.render_queues[dm].announced.load(Ordering::Acquire)
     }
 
+    /// Checks that both render submission rings and queues have room before preparing a scene
+    /// (at least 1 TA entry and 2 FS entries for own-barrier + fragment).
+    pub(crate) fn check_render(&self) -> Result {
+        for (dm, count) in [(TILER, 1), (FRAGMENT, 2)] {
+            let queue = &self.render_queues[dm];
+            self.check_work(&queue.positions, &queue.pointers, Some(&queue.announced),
+                            RENDER_GROUP, dm, count)?;
+        }
+        Ok(())
+    }
+
+    /// Checks that the compute submission ring and queue have room for one command.
+    pub(crate) fn check_compute(&self) -> Result {
+        self.check_work(&self.boot.positions, &self.boot.pointers, None,
+                        PRIORITY_GROUP, COMPUTE, 1)?;
+        Ok(())
+    }
+
     pub(crate) fn stage_render(&self, dm: usize, commands: &[u64]) -> Result<Submission<'_>> {
         let queue = self.render_queues.get(dm).ok_or(EINVAL)?;
         self.stage_work(&queue.positions, &queue.pointers, queue.info(0),
@@ -784,12 +816,11 @@ impl RootV27_2 {
                         None, PRIORITY_GROUP, COMPUTE, &[command])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn stage_work<'a>(
+    fn check_work<'a>(
         &'a self, positions: &'a fw::types::GpuArray<u8>, pointers: &fw::types::GpuArray<u8>,
-        queue: QueueInfo, announced: Option<&'a core::sync::atomic::AtomicBool>,
-        group: usize, dm: usize, commands: &[u64],
-    ) -> Result<Submission<'a>> {
+        announced: Option<&'a core::sync::atomic::AtomicBool>,
+        group: usize, dm: usize, count: u32,
+    ) -> Result<StagedRing<'a>> {
         let ring_index = 3 * group + dm;
         let indices = &self.channels[2 * ring_index];
         let ring = &self.channels[2 * ring_index + 1];
@@ -805,7 +836,6 @@ impl RootV27_2 {
         if capacity as usize > pointers.len() / 8 || (first && old != retired) {
             return Err(EIO);
         }
-        let count = u32::try_from(commands.len()).map_err(|_| EINVAL)?;
         let target = g14_v27_2_abi::queue_head(capacity, old, retired, count).map_err(|error| {
             match error {
                 QueueError::Geometry => EIO,
@@ -819,24 +849,38 @@ impl RootV27_2 {
         if w >= RING_RECORDS || r >= RING_RECORDS { return Err(EIO); }
         let next = (w + 1) % RING_RECORDS;
         if next == r { return Err(EBUSY); }
+        Ok(StagedRing { head, old, capacity, target, first, producer, indices, ring, w, next })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_work<'a>(
+        &'a self, positions: &'a fw::types::GpuArray<u8>, pointers: &fw::types::GpuArray<u8>,
+        queue: QueueInfo, announced: Option<&'a core::sync::atomic::AtomicBool>,
+        group: usize, dm: usize, commands: &[u64],
+    ) -> Result<Submission<'a>> {
+        let count = u32::try_from(commands.len()).map_err(|_| EINVAL)?;
+        let staged = self.check_work(positions, pointers, announced, group, dm, count)?;
         let slot = u8::try_from(queue.slot).map_err(|_| EINVAL)?;
-        let entry = crate::m3::submission_entry(dm as u32, queue.queue,
-            u16::try_from(target).map_err(|_| EINVAL)?, slot, first).map_err(|_| EINVAL)?;
-        let base = w as usize * entry.len();
+        let entry = crate::m3::submission_entry(
+            dm as u32, queue.queue, u16::try_from(staged.target).map_err(|_| EINVAL)?,
+            slot, staged.first,
+        ).map_err(|_| EINVAL)?;
+        let base = staged.w as usize * entry.len();
         for (index, &command) in commands.iter().enumerate() {
-            let at = ((old as usize + index) % capacity as usize) * 8;
+            let at = ((staged.old as usize + index) % staged.capacity as usize) * 8;
             pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
             pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
             crate::pgtable::clean_poc(pointers.as_slice()[at..].as_ptr(), 8);
         }
         for (index, word) in entry.chunks_exact(4).enumerate() {
-            ring.shared_index(base + 4 * index)?.store(
+            staged.ring.shared_index(base + 4 * index)?.store(
                 u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
         }
-        crate::pgtable::clean_poc(ring.as_slice()[base..].as_ptr(), entry.len());
+        crate::pgtable::clean_poc(staged.ring.as_slice()[base..].as_ptr(), entry.len());
         crate::pgtable::poc_barrier();
-        Ok(Submission { head, positions: positions.as_slice(), target, producer,
-            indices: indices.as_slice(), next, announced })
+        Ok(Submission { head: staged.head, positions: positions.as_slice(), target: staged.target,
+            producer: staged.producer, indices: staged.indices.as_slice(), next: staged.next,
+            announced })
     }
 
     /// Publishes the boot job, whose command and ring entry the root already holds. The GPU
