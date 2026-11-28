@@ -23,6 +23,7 @@
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -75,6 +76,8 @@ struct apple_dptx_phy {
 	u32 source_select;
 	bool pclkdrv_select;
 	bool active;
+	/* T6050: the domain reference taken at probe, until the first mode switch */
+	bool boot_hold;
 	u32 rate;		/* Mbit/s; 0: none programmed */
 
 	struct phy *phy_dp;
@@ -932,14 +935,55 @@ static int dptx_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	struct apple_dptx_phy *dptx_phy = phy_get_drvdata(phy);
 
 	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
-		int ret = -EINVAL;
+		struct device *dev = dptx_phy->dev;
+		bool was_active, boot_hold;
+		int pm_ret, ret = -EINVAL;
+
+		if (mode != PHY_MODE_DP && mode != PHY_MODE_INVALID)
+			return -EINVAL;
 
 		mutex_lock(&dptx_phy->lock);
-		if (mode == PHY_MODE_INVALID)
+		/* An active link holds the PHY's power domain, see dptx_phy_probe(). */
+		if (mode == PHY_MODE_DP && dptx_phy->active) {
+			mutex_unlock(&dptx_phy->lock);
+			return 0;
+		}
+		if (mode == PHY_MODE_DP) {
+			ret = phy_pm_runtime_get_sync(phy);
+			if (ret < 0) {
+				mutex_unlock(&dptx_phy->lock);
+				return ret;
+			}
+		}
+		was_active = dptx_phy->active;
+		if (mode == PHY_MODE_INVALID) {
 			ret = t6050_deactivate(dptx_phy);
-		else if (mode == PHY_MODE_DP)
-			ret = dptx_phy->active ? 0 : t6050_activate(dptx_phy);
+		} else if (mode == PHY_MODE_DP) {
+			ret = t6050_activate(dptx_phy);
+			if (ret)
+				t6050_deactivate(dptx_phy);
+		}
+		boot_hold = dptx_phy->boot_hold;
+		dptx_phy->boot_hold = false;
 		mutex_unlock(&dptx_phy->lock);
+
+		/*
+		 * t6050_deactivate() powers the blocks down and clears ->active
+		 * even when the PLL power-down reports an error, so an active
+		 * link's reference goes with it whatever it returned. A put that
+		 * fails after the PHY is already down is only reported: failing
+		 * the mode switch would leave the PHY core's mode at DP.
+		 */
+		pm_ret = 0;
+		if (mode == PHY_MODE_DP && ret)
+			pm_ret = phy_pm_runtime_put_sync(phy);
+		else if (mode == PHY_MODE_INVALID && was_active)
+			pm_ret = phy_pm_runtime_put_sync(phy);
+		if (pm_ret < 0)
+			dev_warn(dev, "runtime PM put failed: %d\n", pm_ret);
+		/* The DCP owns the link from its first mode switch on. */
+		if (boot_hold)
+			pm_runtime_put(dev);
 		return ret;
 	}
 
@@ -1045,10 +1089,25 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 	.set_mode = dptx_phy_set_mode,
 };
 
+static void dptx_phy_drop_boot_hold(void *data)
+{
+	struct apple_dptx_phy *dptx_phy = data;
+	bool drop;
+
+	mutex_lock(&dptx_phy->lock);
+	drop = dptx_phy->boot_hold;
+	dptx_phy->boot_hold = false;
+	mutex_unlock(&dptx_phy->lock);
+
+	if (drop)
+		pm_runtime_put_noidle(dptx_phy->dev);
+}
+
 static int dptx_phy_probe(struct platform_device *pdev)
 {
 	struct apple_dptx_phy *dptx_phy;
 	struct device *dev = &pdev->dev;
+	int ret;
 
 	dptx_phy = devm_kzalloc(dev, sizeof(*dptx_phy), GFP_KERNEL);
 	if (!dptx_phy)
@@ -1069,6 +1128,38 @@ static int dptx_phy_probe(struct platform_device *pdev)
 		devm_platform_ioremap_resource_byname(pdev, "dptx");
 	if (IS_ERR(dptx_phy->regs.dptx))
 		return PTR_ERR(dptx_phy->regs.dptx);
+
+	/*
+	 * The T6050 PHY powers its blocks up and down with the link
+	 * (t6050_activate(), t6050_deactivate()); runtime PM lets its power
+	 * domain follow.
+	 */
+	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
+		/*
+		 * The boot loader may leave an HDMI link up for simplefb, and
+		 * nothing else holds the domain before the DCP's first mode
+		 * switch, which can come late (or never, if the DCP fails).
+		 * Start active with a reference which that switch drops, so
+		 * genpd's unused power-off cannot take the domain from a live
+		 * link before then.
+		 */
+		pm_runtime_get_noresume(dev);
+		ret = pm_runtime_set_active(dev);
+		if (ret) {
+			pm_runtime_put_noidle(dev);
+			return ret;
+		}
+		ret = devm_pm_runtime_enable(dev);
+		if (ret) {
+			pm_runtime_put_noidle(dev);
+			return ret;
+		}
+		dptx_phy->boot_hold = true;
+		ret = devm_add_action_or_reset(dev, dptx_phy_drop_boot_hold,
+					       dptx_phy);
+		if (ret)
+			return ret;
+	}
 
 	/* create phy */
 	dptx_phy->phy_dp =

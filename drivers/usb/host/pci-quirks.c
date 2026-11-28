@@ -1148,6 +1148,14 @@ void usb_disable_xhci_ports(struct pci_dev *xhci_pdev)
 EXPORT_SYMBOL_GPL(usb_disable_xhci_ports);
 
 /*
+ * The capability registers that every xHCI revision defines end with RTSOFF
+ * at offset 0x18 (xHCI 1.2, section 5.3), so the operational registers that
+ * CAPLENGTH points to start at 0x1c or later, on a dword boundary (section
+ * 5.4).
+ */
+#define XHCI_MIN_CAP_LENGTH	0x1c
+
+/*
  * PCI Quirks for xHCI.
  *
  * Takes care of the handoff between the Pre-OS (i.e. BIOS) and the OS.
@@ -1227,11 +1235,11 @@ hc_init:
 	/*
 	 * A dead or unprogrammed BAR reads as all-ones. The capability
 	 * length is then 0xff, and the operational-register read below is
-	 * not 4-byte aligned and faults. A real xHCI length is at least
-	 * 0x10 and dword-aligned.
+	 * not 4-byte aligned and faults. A real xHCI length covers the
+	 * capability registers and is dword-aligned, see XHCI_MIN_CAP_LENGTH.
 	 */
 	val = readl(base);
-	if (XHCI_HC_LENGTH(val) < 0x10 || (XHCI_HC_LENGTH(val) & 3)) {
+	if (XHCI_HC_LENGTH(val) < XHCI_MIN_CAP_LENGTH || (XHCI_HC_LENGTH(val) & 3)) {
 		dev_warn(&pdev->dev,
 			 "xHCI capability length %#x unusable, skipping handoff\n",
 			 XHCI_HC_LENGTH(val));

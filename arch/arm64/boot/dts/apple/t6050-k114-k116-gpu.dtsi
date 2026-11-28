@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The GPU of the K114c, K114s, K116s and K116c (ADT /arm-io/sgx "gpu,t6050"), for the boot
+ * loader's GPU hand-off. It is the GPU half of t6050-j714s-gpu-panel.dtsi: the four boards'
+ * ADTs have the J714s's sgx, gfx-asc and gfx1-asc.
+ *
+ * Everything here stays disabled: the loader checks the ADT and the live GPU firmware build,
+ * fills the six reservations, then enables the GPU PMGR, GPX, AFR, GFX, both mailboxes and the
+ * GPU, the GPU last. A loader that refuses leaves the GPU off and the rest of the boot as it is.
+ *
+ * arm-io's ranges add 0x2_0000_0000 to the ADT's 0x21_xxxx_xxxx bus addresses.
+ */
+
+/ {
+	aliases {
+		/* The loader finds the GPU through this alias */
+		gpu = &sgx;
+	};
+
+	reserved-memory {
+		/*
+		 * Filled and enabled by the loader from the ADT: sgx gpu-region-*,
+		 * gfx-shared-region-*, gfx-shared-l2-region-* and gfx-handoff-* (the UAT
+		 * ranges), the GPU ASCs' __TEXT (fw-text) and gfx-data-base to the end of
+		 * gfx1-data-shared-ro (fw-data). iBoot places them; they differ per Mac.
+		 */
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+/* The inventory ASC nodes; the mailboxes below describe the same windows. */
+/delete-node/ &gfx_asc;
+/delete-node/ &gfx1_asc;
+
+&{/soc} {
+	/*
+	 * ADT gfx-asc: reg 0x21_02600000 + 0x88000 (wrapper), 0x21_02050000 + 8 (iop-vbar);
+	 * interrupts [2798, 2797, 2800, 2799], of which the second and third are send-empty
+	 * and recv-not-empty; role "GFX"; power-gates [614] (GFX_ASC).
+	 */
+	gfx_mbox: mailbox@2302600000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2600000 0x0 0x88000>,
+		      <0x23 0x2050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT gfx1-asc: reg 0x21_02e00000 + 0x88000, 0x21_02850000 (ADT size 0x60000; the
+	 * driver uses the first 8 bytes); interrupts [2802, 2801, 2804, 2803]; role "GFX1";
+	 * power-gates [657] (GFX_ASC1).
+	 */
+	gfx1_mbox: mailbox@2302e00000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2e00000 0x0 0x88000>,
+		      <0x23 0x2850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * ADT pmgr devices GPX (id 359, +0x0), AFR (id 360, +0x100) and GFX (id 362, +0x110) in the
+ * GPU PMGR. The ADT marks GPX and AFR, GFX's parents, critical; GFX not.
+ */
+&ps_gpx {
+	apple,always-on;
+};
+
+&ps_afr {
+	apple,always-on;
+};
+
+/*
+ * The G17 firmware stays live across suspend-to-idle, as the G16's does on T8132: keep
+ * GFX on in the noirq phase instead of gating it under the running firmware.
+ */
+&ps_gfx {
+	apple,sleep-retained;
+};
+
+&sgx {
+	/* What the loader checks and drivers/gpu/drm/asahi binds */
+	compatible = "apple,agx-g17s";
+	/* ADT sgx reg[0] 0x21_00000000 + 0x3fdc000; the driver maps the first 16 MiB as "sgx" */
+	reg = <0x23 0x0 0x0 0x3fdc000>;
+	reg-names = "sgx";
+	/delete-property/ interrupts;
+	mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+};

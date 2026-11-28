@@ -167,10 +167,8 @@ static int apple_nvme_m5_attach(struct apple_nvme *anv)
 {
 	int ret;
 
-	/* Both boards use T6050 ANS2's split NVMe/NVMMU layout and retained SART. */
-	if (!of_machine_is_compatible("apple,t6050") ||
-	    (!of_machine_is_compatible("apple,j714s") &&
-	     !of_machine_is_compatible("apple,j716c")))
+	/* T6050 ANS2's split NVMe/NVMMU layout and retained SART, where the sleep is described. */
+	if (!apple_t6050_sleep_described())
 		return -EOPNOTSUPP;
 	/* The wait before the restart after a sleep comes from the DT; without it, no sleep. */
 	if (of_property_read_u32(anv->dev->of_node, "apple,sleep-wake-delay-ms",
@@ -192,8 +190,7 @@ static int apple_nvme_m5_attach(struct apple_nvme *anv)
 /* T6050's ANS2, whose final stop the sleep makes in its last steps */
 static bool apple_nvme_m5_sleep(struct apple_nvme *anv)
 {
-	return anv->hw->m5_sleep == &apple_nvme_t6050_sleep_policy && apple_sleep_ans_late() &&
-	       of_device_is_compatible(anv->dev->of_node, "apple,t6050-nvme-ans2");
+	return anv->hw->m5_sleep == &apple_nvme_t6050_sleep_policy && apple_sleep_ans_late();
 }
 
 struct apple_nvme_m5_drain {

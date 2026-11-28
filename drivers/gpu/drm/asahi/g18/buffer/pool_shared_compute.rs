@@ -70,6 +70,8 @@ impl G18UmaPoolMemory {
         let mut pool = Self::new_layout(dev, uat, high.clone(), 12,
             true, false, bias, 1, G18_COMPUTE_BLOCK_BYTES)?;
         pool.prepare_shared_compute_retaining(dev, uat, high, plan, Some(self))?;
+        // The retained scratch objects carry the last client's data along.
+        pool.client_vm = self.client_vm;
         Ok(pool)
     }
 

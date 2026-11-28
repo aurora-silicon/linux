@@ -17,7 +17,9 @@
 #include "../afk.h"
 #include "../dcp.h"
 #include "../dcp-internal.h"
+#include "../dcp-fabric.h"
 #include "../connector.h"
+#include "../iomfb_internal.h"
 #include "../trace.h"
 
 static void dcpavserv_notify_edid(struct apple_epic_service *service)
@@ -34,6 +36,16 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 	schedule_work(&connector->hotplug_wq);
 }
 
+static bool dcpavserv_hdr_class(const char *class)
+{
+	return class &&
+		(!strcmp(class, "DCPDP13Service") ||
+		 !strcmp(class, "DCPDPService") ||
+		 !strcmp(class, "AppleDCPDP2HDMI") ||
+		 !strcmp(class, "AppleDCPMCDP29XX") ||
+		 !strcmp(class, "AppleDCPMCDP2900"));
+}
+
 static bool dcpavserv_identity(struct apple_epic_service *service, const char *name,
 			       const char *class, s64 unit)
 {
@@ -44,20 +56,38 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 			class && !strcmp(class, "DCPDPService") && service->channel;
 	if (!service->ep->wire_v2)
 		return unit == 0;
+	if (!class || !service->channel || service->channel > U16_MAX)
+		return false;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
-	return service->ep->endpoint == DPAVSERV_ENDPOINT_V2 && class &&
-		(!strcmp(class, "AppleDCPDP2HDMI") ||
-		 !strcmp(class, "DCPDP13Service")) && service->channel &&
-		service->channel <= U16_MAX && unit == service->channel;
+	if (service->ep->endpoint == DPAVSERV_ENDPOINT_V2)
+		return (!strcmp(class, "AppleDCPDP2HDMI") ||
+			!strcmp(class, "DCPDP13Service")) && unit == service->channel;
+	/*
+	 * Firmware 27 names an MCDP29xx DP-to-HDMI converter's AV service after
+	 * its part (the M2 Mac mini's HDMI port, USB-C to HDMI adapters) and
+	 * announces it on the classic DPAV endpoint with EPICUnit 0; its
+	 * interface-id (the channel) is dynamic across reconnects. The M3 and
+	 * M4 Airs' external processors announce the generic DCPDP13Service
+	 * there the same way.
+	 */
+	return service->ep->endpoint == DPAVSERV_ENDPOINT && unit == 0 &&
+		(!strcmp(class, "AppleDCPMCDP29XX") ||
+		 !strcmp(class, "AppleDCPMCDP2900") ||
+		 !strcmp(class, "DCPDP13Service"));
 }
 
 static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
-	/* Initial service discovery may precede the first Type-C attachment. */
+	/*
+	 * Initial service discovery may precede the first Type-C attachment. A
+	 * fixed output that no Type-C display has borrowed (the HDMI port) has no
+	 * Type-C cable to wait for: every sleep and DPMS cycle still moves the
+	 * generation on, so a service announced before it is not taken after it.
+	 */
 	return !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent) &&
 		generation == dcp->typec_generation &&
-		(!generation || dcp->typec_cable_connected);
+		(!generation || dcp->typec_cable_connected || !dcp_is_typec_output(dcp));
 }
 
 /* Admission runs before AFKV2 OPEN and before readers can pin the service. */
@@ -130,6 +160,9 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			dcp->dcpavserv.opened = NULL;
 			dcp->dcpavserv.opened_epoch = 0;
 			service->cookie = &dcp->dcpavserv;
+			if (!dcp->desktop && !dcp_is_ext26(dcp) &&
+			    dcpavserv_hdr_class(class))
+				dcp_hdr_service_bind(service);
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;
 		}
@@ -175,6 +208,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service == service) {
+		dcp_hdr_service_unbind(service);
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
@@ -204,6 +238,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	dcp->dcpavserv.opened_epoch = 0;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
+		dcp_hdr_service_unbind(service);
 		afk_service_retire(service);
 		dcpavserv_invalidate_edid(dcp);
 	}
@@ -581,6 +616,17 @@ static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_servi
 	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE, edid_size);
 }
 
+/*
+ * The sink's EDID through @service, a dcpav-service-epic its caller keeps
+ * pinned, for a driver that tracks the service itself (the M4 external DCP,
+ * iomfb_m4_ext_edid()): only the read, no instance bookkeeping.
+ */
+const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service)
+{
+	return service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
+		dcpavserv_read_edid_legacy(service);
+}
+
 bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
@@ -598,9 +644,6 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 		((!dcp_is_ext26(dcp) && dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
 		 !READ_ONCE(dcp->external_physically_absent));
 }
-
-#define DCPAVSERV_EDID_RETRIES 5
-#define DCPAVSERV_EDID_RETRY_MS 500
 
 static void dcpavserv_edid_retry_work(struct work_struct *work)
 {
@@ -812,4 +855,5 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dpavservep-v14-test.c"
+#include "dpavservep-identity-test.c"
 #endif

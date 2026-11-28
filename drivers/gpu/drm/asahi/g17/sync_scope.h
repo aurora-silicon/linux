@@ -8,10 +8,13 @@ void asahi_g17_signal_fence(struct dma_fence *fence);
 int asahi_g17_completion_fence_status(struct dma_fence *fence);
 
 struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
-				      struct dma_fence *submitted, u64 point);
+					 struct dma_fence *submitted, u64 point,
+					 bool compute_only);
 void asahi_g17_scope_bind(struct dma_fence *scope, struct dma_fence *root);
 bool asahi_g17_is_scope(struct dma_fence *fence);
 /* Returns owned child references, or zero once the scope is signalled. */
 unsigned int asahi_g17_scope_children(struct dma_fence *fence,
 				     struct dma_fence *children[2]);
+void asahi_g17_note_compute_waiter(void);
+void asahi_g17_unnote_compute_waiter(void);
 #endif
