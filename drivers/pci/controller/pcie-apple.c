@@ -582,6 +582,8 @@ struct apple_pcie {
 	struct apple_pcie_port	*t6050_port;
 	bool			t6050_down;
 	bool			t6050_lost;
+	/* Woken when t6050_down clears or t6050_lost sets */
+	wait_queue_head_t	t6050_wq;
 	/* Ports Linux powers and trains, parked over a firmware sleep: their functions removed */
 	struct notifier_block	t6050_pm_nb;
 	/* Those ports back, and their functions looked for, once the resume is over */
@@ -5293,6 +5295,11 @@ static int apple_pcie_t6050_cold_up(struct apple_pcie_port *port, u32 *status)
 	 * abandoned): the setup is then not started, and the caller parks the port again.
 	 */
 	mutex_unlock(&pcie->lock);
+	/*
+	 * Power stable to PERST# release is at least 100 ms (Tpvperl, PCIe CEM r5.0 2.9.2);
+	 * 150 ms is what the boot-time bring-up of this port gives it. The endpoint has no
+	 * status to poll before its link trains.
+	 */
 	msleep(150);
 	mutex_lock(&pcie->lock);
 	if (READ_ONCE(pcie->t6050_down) || pcie->t6050_lost ||
@@ -5445,6 +5452,9 @@ static void apple_pcie_t6050_unpark_cold_early(struct apple_pcie *pcie)
 			apple_pcie_t6050_cold_wake(pcie, port, true);
 }
 
+/* How long a parked port waits for the radio's port to come back up */
+#define APPLE_PCIE_T6050_RADIO_BACK_MS	2000
+
 /*
  * After a suspend, with every device resumed and the tasks thawed (the park ran before the
  * freeze), from apple_pcie_t6050_unpark_work(): the ports still parked come back, and the
@@ -5456,8 +5466,6 @@ static void apple_pcie_t6050_unpark_cold(struct apple_pcie *pcie)
 	struct apple_pcie_port *port;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
-		int i;
-
 		if (pcie->t6050_rescan & BIT(port->idx)) {
 			apple_pcie_t6050_cold_rescan(pcie, port);
 			continue;
@@ -5472,10 +5480,13 @@ static void apple_pcie_t6050_unpark_cold(struct apple_pcie *pcie)
 		/*
 		 * The shared PHY and the root complex come back with the radio's port, which its
 		 * endpoint's driver may be taking down and up once more for the warm reset
+		 * (apple_pcie_t6050_port_recycle()): wait until apple_pcie_t6050_sleep_up()
+		 * brings it up or gives it up.
 		 */
-		for (i = 0; i < 40 && READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost; i++)
-			msleep(50);
-		if (READ_ONCE(pcie->t6050_down) || pcie->t6050_lost) {
+		wait_event_timeout(pcie->t6050_wq,
+				   !READ_ONCE(pcie->t6050_down) || READ_ONCE(pcie->t6050_lost),
+				   msecs_to_jiffies(APPLE_PCIE_T6050_RADIO_BACK_MS));
+		if (READ_ONCE(pcie->t6050_down) || READ_ONCE(pcie->t6050_lost)) {
 			dev_warn(pcie->dev, "port %d: stays parked: the radio's port is not back\n",
 				 port->idx);
 			continue;
@@ -5634,6 +5645,7 @@ static int apple_pcie_t6050_sleep_down(struct apple_pcie *pcie)
 		if (ret) {
 			/* Nothing was written: the port and its DART are as they were */
 			WRITE_ONCE(pcie->t6050_down, false);
+			wake_up_all(&pcie->t6050_wq);
 			apple_dart_host_resume(pcie->t6050_dart);
 		}
 	}
@@ -5696,6 +5708,7 @@ static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq, bool w
 	WRITE_ONCE(port->link_failed, false);
 	pcie->t6050_link_up = ktime_get();
 	WRITE_ONCE(pcie->t6050_down, false);
+	wake_up_all(&pcie->t6050_wq);
 	dev_info(pcie->dev, "port %d: link up again after the sleep in %lld ms, status %#x\n",
 		 port->idx, ktime_ms_delta(ktime_get(), start),
 		 apple_pcie_port_readl(port, PORT_LINKSTS));
@@ -5712,7 +5725,8 @@ lost:
 		return 0;
 	}
 	/* The port, its DART and the functions' config space stay unread until a restart */
-	pcie->t6050_lost = true;
+	WRITE_ONCE(pcie->t6050_lost, true);
+	wake_up_all(&pcie->t6050_wq);
 	WRITE_ONCE(port->link_failed, true);
 	pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
 	dev_err(pcie->dev, "port %d: not back after the sleep: %d (%s); its functions are out of reach until a restart\n",
@@ -6008,6 +6022,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&pcie->lock);
+	init_waitqueue_head(&pcie->t6050_wq);
 	INIT_LIST_HEAD(&pcie->ports);
 	INIT_LIST_HEAD(&pcie->hib_fns);
 
