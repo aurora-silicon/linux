@@ -105,6 +105,23 @@ properties:
     description: The lid angle sensor service.
     unevaluatedProperties: false
 
+  accel:
+    type: object
+    $ref: /schemas/iio/imu/apple,aop-motion.yaml#
+    description: The accelerometer service.
+    unevaluatedProperties: false
+
+  gyro:
+    type: object
+    $ref: /schemas/iio/imu/apple,aop-motion.yaml#
+    description: The gyroscope service.
+    unevaluatedProperties: false
+
+  devmotion6:
+    type: object
+    $ref: /schemas/iio/imu/apple,aop-devmotion.yaml#
+    description: The device motion (orientation) service.
+
 allOf:
   - if:
       properties:

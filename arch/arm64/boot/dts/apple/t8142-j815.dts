@@ -164,6 +164,26 @@
 	apple,speaker-amps = <6>;
 };
 
+&aop {
+	/*
+	 * The inertial sensor: ADT iop-aop-nub accel and gyro. The boot loader
+	 * copies their calibration from the ADT into these nodes; without it
+	 * the services stay off. devmotion6 gets a device only if the firmware
+	 * announces it.
+	 */
+	aop_accel: accel {
+		compatible = "apple,t8142-aop-accel", "apple,aop-accel";
+	};
+
+	aop_gyro: gyro {
+		compatible = "apple,t8142-aop-gyro", "apple,aop-gyro";
+	};
+
+	aop_devmotion: devmotion6 {
+		compatible = "apple,t8142-aop-devmotion6", "apple,aop-devmotion6";
+	};
+};
+
 /* Names as in speakersafetyd's j815.conf; slots from ADT speaker-config. */
 &speaker_left_woofer {
 	sound-name-prefix = "Left Woofer 1";

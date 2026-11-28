@@ -40,8 +40,35 @@ use kernel::{
 const SUBTYPE_SET_PROPERTY: u16 = 4;
 /// The report interval property, in microseconds. Zero stops the reports.
 const PROP_INTERVAL: u32 = 0;
-/// 50 Hz.
-const INTERVAL_US: u32 = 20_000;
+/// The properties macOS 27.2.1 sends an M5 (T8142) service around the report
+/// interval: 0x3d = 2 after the calibration, and 0x16 = 1, 0x5c = 0 before
+/// it; to stop, 0x16 = 0, 0x5c = 0 before the zero interval. Without them
+/// an M5 service takes the calibration and the interval and never reports.
+const PROP_MODE: u32 = 0x3d;
+const MODE_ON: u32 = 2;
+const PROP_BATCH: u32 = 0x16;
+const PROP_RAW: u32 = 0x5c;
+
+/// How a service's reports are started, chosen by its compatible.
+struct Protocol {
+    /// The report interval, in microseconds.
+    interval_us: u32,
+    /// Send the companion properties around the interval.
+    companions: bool,
+}
+
+/// Calibration, then the interval: 50 Hz.
+static PROTOCOL_V1: Protocol = Protocol {
+    interval_us: 20_000,
+    companions: false,
+};
+
+/// The M5 (T8142) firmware: the companion properties, and 100 Hz, the
+/// interval macOS sends (10000 us, from the AOP message trace).
+static PROTOCOL_T8142: Protocol = Protocol {
+    interval_us: 10_000,
+    companions: true,
+};
 /// How long a direct read waits for the first report of a fresh start.
 const FIRST_SAMPLE_MS: i64 = 200;
 const FIRST_SAMPLE_POLL_MS: i64 = 5;
@@ -93,6 +120,14 @@ struct Kind {
     chan_type: u32,
     /// The size of one raw count in m/s^2 or rad/s, in billionths.
     scale_nano: i32,
+    protocol: &'static Protocol,
+}
+
+impl Kind {
+    /// The rate the reports are started at, in Hz.
+    fn rate_hz(&self) -> i32 {
+        (1_000_000 / self.protocol.interval_us) as i32
+    }
 }
 
 /// 9.80665 / 65536 m/s^2 per count.
@@ -100,6 +135,14 @@ static ACCEL: Kind = Kind {
     name: c"aop-sensors-accel",
     chan_type: bindings::BINDINGS_IIO_ACCEL,
     scale_nano: 149_638,
+    protocol: &PROTOCOL_V1,
+};
+
+static ACCEL_T8142: Kind = Kind {
+    name: c"aop-sensors-accel",
+    chan_type: bindings::BINDINGS_IIO_ACCEL,
+    scale_nano: 149_638,
+    protocol: &PROTOCOL_T8142,
 };
 
 /// pi / (180 * 65536) rad/s per count.
@@ -107,6 +150,14 @@ static GYRO: Kind = Kind {
     name: c"aop-sensors-gyro",
     chan_type: bindings::BINDINGS_IIO_ANGL_VEL,
     scale_nano: 266,
+    protocol: &PROTOCOL_V1,
+};
+
+static GYRO_T8142: Kind = Kind {
+    name: c"aop-sensors-gyro",
+    chan_type: bindings::BINDINGS_IIO_ANGL_VEL,
+    scale_nano: 266,
+    protocol: &PROTOCOL_T8142,
 };
 
 /// Decodes a sample report into its X, Y and Z counts.
@@ -250,6 +301,8 @@ struct Control {
     aop: Arc<dyn AOP>,
     service: EPICService,
     packets: [KVec<u8>; 3],
+    /// How the reports are started.
+    protocol: &'static Protocol,
     /// Serializes starting and stopping the reports.
     #[pin]
     stream: Mutex<Stream<Instant<Monotonic>>>,
@@ -263,7 +316,12 @@ impl_has_delayed_work! {
 }
 
 impl Control {
-    fn new(dev: &device::Device, aop: Arc<dyn AOP>, service: EPICService) -> Result<Arc<Self>> {
+    fn new(
+        dev: &device::Device,
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        protocol: &'static Protocol,
+    ) -> Result<Arc<Self>> {
         let node = dev.fwnode().ok_or(ENODEV)?;
         let mut packets = [KVec::new(), KVec::new(), KVec::new()];
         for ((_, name), packet) in CALIBRATION.iter().zip(packets.iter_mut()) {
@@ -287,6 +345,7 @@ impl Control {
                 aop,
                 service,
                 packets,
+                protocol,
                 stream <- new_mutex!(Stream::new()),
                 idle_work <- new_delayed_work!("Control::idle_work"),
             }),
@@ -348,11 +407,38 @@ impl Control {
     }
 
     fn start_reports(&self) -> Result {
-        self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
+        if self.protocol.companions {
+            // A refused companion property leaves the service silent, so it
+            // fails the start like a refused interval.
+            self.set(PROP_MODE, &MODE_ON.to_le_bytes())?;
+            self.set(PROP_BATCH, &1u32.to_le_bytes())?;
+            self.set(PROP_RAW, &0u32.to_le_bytes())?;
+        }
+        self.set(PROP_INTERVAL, &self.protocol.interval_us.to_le_bytes())
     }
 
     fn stop_reports(&self) -> Result {
+        if self.protocol.companions {
+            self.companion(PROP_BATCH, 0);
+            self.companion(PROP_RAW, 0);
+        }
         self.set(PROP_INTERVAL, &0u32.to_le_bytes())
+    }
+
+    /// Writes one of the M5's companion properties on the way to a stop. Its
+    /// status is only logged: the zero interval that follows decides.
+    fn companion(&self, prop: u32, value: u32) {
+        match self.write(prop, &value.to_le_bytes()) {
+            Ok(0) => {}
+            Ok(status) => dev_dbg!(
+                self.dev,
+                "property {:#x} = {}: status {:#x}\n",
+                prop,
+                value,
+                status
+            ),
+            Err(e) => dev_dbg!(self.dev, "property {:#x} = {}: {:?}\n", prop, value, e),
+        }
     }
 
     /// Checks once at probe that the service accepts the calibration and the
@@ -640,7 +726,7 @@ unsafe extern "C" fn motion_read_raw(
     } else if mask == bindings::BINDINGS_IIO_CHAN_INFO_SCALE as isize {
         (0, state.kind.scale_nano, bindings::IIO_VAL_INT_PLUS_NANO)
     } else if mask == bindings::BINDINGS_IIO_CHAN_INFO_SAMP_FREQ as isize {
-        ((1_000_000 / INTERVAL_US) as i32, 0, bindings::IIO_VAL_INT)
+        (state.kind.rate_hz(), 0, bindings::IIO_VAL_INT)
     } else {
         return EINVAL.to_errno();
     };
@@ -1071,6 +1157,14 @@ kernel::of_device_table!(
     OF_TABLE,
     &'static Kind,
     [
+        (
+            of::DeviceId::new(c_str!("apple,t8142-aop-accel")),
+            &ACCEL_T8142
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,t8142-aop-gyro")),
+            &GYRO_T8142
+        ),
         (of::DeviceId::new(c_str!("apple,aop-accel")), &ACCEL),
         (of::DeviceId::new(c_str!("apple,aop-gyro")), &GYRO),
     ]
@@ -1100,7 +1194,7 @@ impl platform::Driver for IIOAopMotionDriver {
         // SAFETY: The record lives as long as the device it is attached to.
         let service = unsafe { *service };
 
-        let control = Control::new(dev, aop.clone(), service)?;
+        let control = Control::new(dev, aop.clone(), service, kind.protocol)?;
         let (mut iio, state) = MotionIio::new(dev, kind, control.clone())?;
         let listener = FakehidRegistration::new(aop, service, state)?;
         let pm = PmHook::new(control.clone())?;
