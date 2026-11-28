@@ -406,6 +406,8 @@ static void topology_route_skip_test(struct kunit *test)
 	/* A repeated refusal neither allocates a changeset nor replaces status. */
 	KUNIT_EXPECT_NULL(test, dcp_typec_routes_disable_nodes(dev, NULL, route_np));
 	KUNIT_EXPECT_NULL(test, dcp_typec_routes_disable_nodes(dev, route_np->parent, NULL));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(dcp_typec_route_skip(dev, route_np, "typec1")),
+			-ENODEV);
 	KUNIT_EXPECT_FALSE(test, of_device_is_available(route_np));
 
 	/*

@@ -4928,11 +4928,14 @@ static struct of_changeset *dcp_typec_route_skip(struct device *dev,
 						 const char *name)
 {
 	const char *what = dcp_typec_route_supplier_disabled(dev, name);
+	struct of_changeset *cs;
 
 	if (!what)
 		return NULL;
 	dev_warn(dev, "%pOF: its %s is disabled, route skipped\n", route_np, what);
-	return dcp_typec_routes_disable_nodes(dev, NULL, route_np);
+	cs = dcp_typec_routes_disable_nodes(dev, NULL, route_np);
+	/* A concurrent refusal may already have disabled it; still skip it. */
+	return cs ?: ERR_PTR(-ENODEV);
 }
 
 static int dcp_register_typec_routes_present(void *data)
