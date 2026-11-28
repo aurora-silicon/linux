@@ -2,6 +2,7 @@
 /* Additional T6021 hardware resources. Keep unqualified blocks disabled. */
 
 &{/soc} {
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_dispext0_1: iommu@289300000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x2 0x89300000 0x0 0x4000>;
@@ -9,6 +10,7 @@
 		interrupts = <AIC_IRQ 0 950 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext0_cpu0>;
+		status = "disabled";
 	};
 
 	m2_event_log_handler: event-log@28e080000 {
@@ -384,6 +386,7 @@
 		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_dispext1_1: iommu@315300000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x3 0x15300000 0x0 0x4000>;
@@ -391,6 +394,7 @@
 		interrupts = <AIC_IRQ 0 986 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext1_cpu0>;
+		status = "disabled";
 	};
 
 	m2_jpeg0: jpeg@38d000000 {
@@ -748,6 +752,7 @@
 		#iommu-cells = <1>;
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave0_2: iommu@40d020000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x4 0xd020000 0x0 0x4000>;
@@ -755,6 +760,7 @@
 		interrupts = <AIC_IRQ 0 1107 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
 	m2_dart_ave0_0: iommu@40d030000 {
@@ -775,6 +781,7 @@
 		#iommu-cells = <1>;
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave0_3: iommu@40d044000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x4 0xd044000 0x0 0x4000>;
@@ -782,6 +789,7 @@
 		interrupts = <AIC_IRQ 0 1107 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
 	m2_ave0: video-codec@40d100000 {
@@ -804,6 +812,7 @@
 		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_dispext2_1: iommu@48d300000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x4 0x8d300000 0x0 0x4000>;
@@ -811,6 +820,7 @@
 		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext2_cpu0>;
+		status = "disabled";
 	};
 
 	m2_scaler1: scaler@491000000 {
@@ -834,6 +844,7 @@
 		#iommu-cells = <1>;
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave1_2: iommu@507020000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x5 0x7020000 0x0 0x4000>;
@@ -841,6 +852,7 @@
 		interrupts = <AIC_IRQ 0 1119 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
 	m2_dart_ave1_0: iommu@507030000 {
@@ -861,6 +873,7 @@
 		#iommu-cells = <1>;
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_ave1_3: iommu@507044000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x5 0x7044000 0x0 0x4000>;
@@ -868,6 +881,7 @@
 		interrupts = <AIC_IRQ 0 1119 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
 	m2_ave1: video-codec@507100000 {
@@ -890,6 +904,7 @@
 		status = "disabled";
 	};
 
+	/* Companion non-translation DART window; apple-dart probes -ENODEV. */
 	m2_dart_dispext3_1: iommu@50d300000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x5 0xd300000 0x0 0x4000>;
@@ -897,6 +912,7 @@
 		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext3_cpu0>;
+		status = "disabled";
 	};
 
 	m2_apcie0_piodma: dma-controller@594010000 {
