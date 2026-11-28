@@ -999,8 +999,8 @@ static int __init gate_add_bool(struct of_changeset *cs, struct device_node *np,
 /*
  * Completes the device tree's own PMP topology (gate_reuse_resolve()) in one
  * changeset, as the overlay path completes the overlay's:
- *  - the display request is requested by soc-device record where the PTD
- *    is indexed that way (T8122);
+ *  - the display and storage requests are requested by soc-device record
+ *    where the PTD is indexed that way (T8122);
  *  - the storage request is always on, and not acknowledged, as the PMP
  *    keeps a block up only if its request was set when it started;
  *  - the T8122 GPU, if available, is linked to the PMP;
@@ -1016,6 +1016,9 @@ static int __init gate_reuse_apply(struct device_node **ps)
 	of_changeset_init(&gate_pmp_cs);
 	if (gate_soc->records)
 		ret = gate_add_bool(&gate_pmp_cs, r->disp, "apple,soc-device-record");
+	/* The storage request too: its bit is its record, not its ID - 1. */
+	if (!ret && gate_soc->records)
+		ret = gate_add_bool(&gate_pmp_cs, r->ans, "apple,soc-device-record");
 	if (!ret)
 		ret = gate_add_bool(&gate_pmp_cs, r->ans, "apple,always-on");
 	/* The PMP does not acknowledge storage requests. */
