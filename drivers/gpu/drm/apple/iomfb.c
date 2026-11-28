@@ -45,6 +45,7 @@
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "iomfb_m4.h"
+#include "iomfb_v27.h"
 #include "dcpext26-lifecycle.h"
 #include "parser.h"
 #include "trace.h"
@@ -684,6 +685,11 @@ static void iomfb_callback_work(struct work_struct *work)
 }
 
 static void iomfb_edr_tick(struct work_struct *work);
+static void iomfb_v27_idle_tx_release(struct iomfb_transaction *transaction);
+static int dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			    const struct dcp_method_entry *call, u32 in_len,
+			    u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie, bool unwind_on_err);
 
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
@@ -697,6 +703,8 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
 	INIT_DELAYED_WORK(&dcp->iomfb.edr_tick, iomfb_edr_tick);
+	spin_lock_init(&dcp->v27_idle_lock);
+	INIT_DELAYED_WORK(&dcp->v27_idle_cache_work, iomfb_v27_idle_cache_work);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
@@ -730,6 +738,7 @@ void iomfb_reset_transport(struct apple_dcp *dcp)
 	dcp->present_state_h17p.pending = false;
 	dcp->present_state_h17p.accepted = false;
 	mutex_unlock(&dcp->iomfb.lock);
+	iomfb_v27_idle_cache_reset(dcp);
 }
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
@@ -753,6 +762,21 @@ void iomfb_queue_stop(struct apple_dcp *dcp)
 	cancel_delayed_work_sync(&dcp->iomfb.timeout);
 	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
 	cancel_delayed_work_sync(&dcp->iomfb.edr_tick);
+	iomfb_v27_idle_cache_cancel(dcp);
+	/*
+	 * Reply delivery is fenced (iomfb.stopped is set and all queue/callback
+	 * workers are drained), so release an active idle-cache transaction
+	 * here to drop any uncommitted session retention and clear in-flight.
+	 */
+	mutex_lock(&dcp->iomfb.lock);
+	if (dcp->iomfb.active &&
+	    dcp->iomfb.active->release == iomfb_v27_idle_tx_release) {
+		struct iomfb_transaction *active = dcp->iomfb.active;
+
+		dcp->iomfb.active = NULL;
+		iomfb_v27_idle_tx_release(active);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
 }
 
 /*
@@ -1138,6 +1162,716 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	return ret;
 }
 
+#define DCP_V27_IDLE_CACHING_METHOD		138
+#define DCP_V27_IDLE_CACHING_METHOD_REPLAY	2
+#define DCP_V27_SWAP_INTENT_IDLE_CACHE		8
+#define DCP_V27_IDLE_SURFACE_ID			2
+#define DCP_V27_IDLE_CACHE_DELAY_MS		1000U
+#define DCP_V27_IDLE_CACHE_RETRY_MS		10000U
+
+struct iomfb_v27_idle_tx {
+	struct iomfb_transaction transaction;
+	struct apple_dcp *dcp;
+	struct dcp_session_ref *pending_session;
+	struct dcp_surface surf;
+	struct dcp_rect src_rect;
+	struct dcp_rect dst_rect;
+	dma_addr_t dma_addr;
+	u64 gen;
+	u64 release_seq;
+	bool had_dma_pin;
+	bool negotiate_only;
+	bool requeue;
+};
+
+static bool iomfb_v27_idle_surface_span(const struct dcp_surface *surf,
+					size_t *out_span)
+{
+	u64 max_end, end;
+	u32 i, planes;
+
+	if (!surf->buf_size || !surf->width || !surf->height || !surf->stride)
+		return false;
+	if (surf->plane_cnt > DCP_SURF_MAX_PLANES ||
+	    surf->plane_cnt2 > DCP_SURF_MAX_PLANES)
+		return false;
+	if (check_mul_overflow((u64)surf->stride, (u64)surf->height, &end) ||
+	    check_add_overflow((u64)surf->offset, end, &end))
+		return false;
+	max_end = max_t(u64, surf->buf_size, end);
+
+	planes = max(surf->plane_cnt, surf->plane_cnt2);
+	if (surf->has_planes) {
+		for (i = 0; i < planes; i++) {
+			const struct dcp_plane_info *p = &surf->planes[i];
+			u64 pspan;
+
+			if (!p->size)
+				return false;
+			if (check_add_overflow((u64)p->offset, (u64)p->size,
+					       &pspan))
+				return false;
+			max_end = max(max_end, pspan);
+		}
+	}
+	if (surf->has_compr_info) {
+		for (i = 0; i < planes; i++) {
+			const struct dcp_compression_info *c =
+				&surf->compression_info[i];
+			u64 cend;
+
+			if (c->meta_bytes) {
+				if (check_add_overflow((u64)c->metadata_offset,
+						       (u64)c->meta_bytes, &cend))
+					return false;
+				max_end = max(max_end, cend);
+			}
+			if (c->tiles_w && c->tiles_h && c->tile_bytes) {
+				u64 tiles;
+
+				if (check_mul_overflow((u64)c->tiles_w,
+						       (u64)c->tiles_h, &tiles) ||
+				    check_mul_overflow(tiles, (u64)c->tile_bytes,
+						       &cend) ||
+				    check_add_overflow((u64)c->data_offset,
+						       cend, &cend))
+					return false;
+				max_end = max(max_end, cend);
+			}
+		}
+	}
+	if (!max_end || max_end > SIZE_MAX - PAGE_SIZE)
+		return false;
+	if (out_span)
+		*out_span = PAGE_ALIGN((size_t)max_end);
+	return true;
+}
+
+bool iomfb_v27_idle_cache_fb_eligible(const struct drm_framebuffer *fb)
+{
+	if (!fb)
+		return false;
+	if (fb->funcs && fb->funcs->dirty)
+		return true;
+	return fb->funcs != &apple_drm_client_fb_funcs;
+}
+
+void iomfb_v27_idle_cache_kick(struct apple_dcp *dcp)
+{
+	unsigned long delay = msecs_to_jiffies(DCP_V27_IDLE_CACHE_DELAY_MS);
+	unsigned long flags;
+
+	if (!dcp_v27_idle_cache_supported(dcp) ||
+	    READ_ONCE(dcp->v27_idle_unavailable))
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_gen++;
+	dcp->v27_idle_pending_valid = false;
+	dcp->v27_idle_deadline = jiffies + delay;
+	if (!dcp->v27_idle_closed && dcp->v27_idle_template_valid)
+		mod_delayed_work(system_dfl_wq, &dcp->v27_idle_cache_work,
+				 delay);
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+}
+
+void iomfb_v27_idle_cache_retry(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (!dcp_v27_idle_cache_supported(dcp) ||
+	    READ_ONCE(dcp->v27_idle_unavailable))
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (!dcp->v27_idle_closed && dcp->v27_idle_template_valid)
+		queue_delayed_work(system_dfl_wq, &dcp->v27_idle_cache_work,
+				   msecs_to_jiffies(DCP_V27_IDLE_CACHE_RETRY_MS));
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+}
+
+void iomfb_v27_idle_cache_on_present(struct apple_dcp *dcp,
+				     const struct dcp_surface *surf,
+				     const struct dcp_rect *src_rect,
+				     const struct dcp_rect *dst_rect,
+				     bool valid)
+{
+	unsigned long flags;
+	bool armed;
+
+	if (!dcp_v27_idle_cache_supported(dcp))
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_gen++;
+	dcp->v27_idle_closed = false;
+	dcp->v27_idle_template_valid = false;
+	armed = valid && iomfb_v27_idle_surface_span(surf, NULL);
+	if (armed) {
+		dcp->v27_idle_pending_surf = *surf;
+		dcp->v27_idle_pending_src = *src_rect;
+		dcp->v27_idle_pending_dst = *dst_rect;
+		dcp->v27_idle_pending_valid = true;
+	} else {
+		dcp->v27_idle_pending_valid = false;
+	}
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	if (!armed)
+		cancel_delayed_work(&dcp->v27_idle_cache_work);
+}
+
+void iomfb_v27_idle_cache_on_displayed(struct apple_dcp *dcp)
+{
+	unsigned long delay = msecs_to_jiffies(DCP_V27_IDLE_CACHE_DELAY_MS);
+	unsigned long flags;
+
+	if (!dcp_v27_idle_cache_supported(dcp))
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (!dcp->v27_idle_closed && dcp->v27_idle_pending_valid) {
+		dcp->v27_idle_template_surf = dcp->v27_idle_pending_surf;
+		dcp->v27_idle_src_rect = dcp->v27_idle_pending_src;
+		dcp->v27_idle_dst_rect = dcp->v27_idle_pending_dst;
+		dcp->v27_idle_pending_valid = false;
+		dcp->v27_idle_template_valid = true;
+		dcp->v27_idle_gen++;
+		dcp->v27_idle_deadline = jiffies + delay;
+		if (!READ_ONCE(dcp->v27_idle_unavailable))
+			mod_delayed_work(system_dfl_wq, &dcp->v27_idle_cache_work,
+					 delay);
+	}
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+}
+
+void iomfb_v27_idle_cache_invalidate(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_gen++;
+	dcp->v27_idle_pending_valid = false;
+	dcp->v27_idle_template_valid = false;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	cancel_delayed_work(&dcp->v27_idle_cache_work);
+}
+
+/*
+ * Close replay admission and drain pending work without discarding the
+ * outstanding swap_id: a late completion or abort for an already-submitted
+ * replay swap must still be filtered until consumed or until firmware reset.
+ */
+void iomfb_v27_idle_cache_cancel(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_closed = true;
+	dcp->v27_idle_gen++;
+	dcp->v27_idle_pending_valid = false;
+	dcp->v27_idle_template_valid = false;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	cancel_delayed_work_sync(&dcp->v27_idle_cache_work);
+	if (iomfb_uses_queue(dcp)) {
+		mutex_lock(&dcp->iomfb.lock);
+		mutex_unlock(&dcp->iomfb.lock);
+	}
+}
+
+/* Confirmed firmware stop or transport reset: no prior RPCs can complete. */
+void iomfb_v27_idle_cache_reset(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_gen++;
+	dcp->v27_idle_release_seq++;
+	dcp->v27_idle_state = DCP_V27_IDLE_STATE_OFF;
+	dcp->v27_idle_fences = 0;
+	dcp->v27_idle_registered = false;
+	dcp->v27_idle_submitting = false;
+	dcp->v27_idle_dma_pinned = false;
+	dcp->v27_idle_in_flight = false;
+	dcp->v27_idle_swap_pending = false;
+	dcp->v27_idle_swap_id = 0;
+	dcp->v27_idle_method_set = false;
+	dcp->v27_idle_pending_valid = false;
+	dcp->v27_idle_template_valid = false;
+	dcp->v27_idle_closed = false;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+}
+
+static bool iomfb_v27_idle_cache_fw_pinned_locked(struct apple_dcp *dcp)
+{
+	return dcp->v27_idle_dma_pinned || dcp->v27_idle_registered ||
+	       dcp->v27_idle_submitting ||
+	       dcp->v27_idle_state != DCP_V27_IDLE_STATE_OFF ||
+	       dcp->v27_idle_fences;
+}
+
+static bool iomfb_v27_idle_cache_dma_pinned(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool pinned;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->v27_idle_obj)
+		return false;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	pinned = iomfb_v27_idle_cache_fw_pinned_locked(dcp) ||
+		 dcp->v27_idle_in_flight;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	return pinned;
+}
+
+/*
+ * Drop the cache GEM object only when the firmware has released it (D581) or
+ * a confirmed stop/reset cleared ownership; otherwise unbind retains DMA.
+ */
+void iomfb_v27_idle_cache_release_obj(struct apple_dcp *dcp)
+{
+	if (!dcp->v27_idle_obj || dcp->retain_dma ||
+	    iomfb_v27_idle_cache_dma_pinned(dcp))
+		return;
+	drm_gem_object_put(&dcp->v27_idle_obj->base);
+	dcp->v27_idle_obj = NULL;
+	dcp->v27_idle_obj_size = 0;
+}
+
+bool iomfb_v27_idle_cache_swap_complete(struct apple_dcp *dcp, u32 swap_id)
+{
+	unsigned long flags;
+	bool matched;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return false;
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	matched = dcp->v27_idle_swap_pending && swap_id == dcp->v27_idle_swap_id;
+	if (matched) {
+		dcp->v27_idle_swap_pending = false;
+		dcp->v27_idle_swap_id = 0;
+	}
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	return matched;
+}
+
+static void iomfb_v27_idle_swapped(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	struct iomfb_v27_idle_tx *tx = cookie;
+	struct dcp_swap_submit_resp_v27 *resp = data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_submitting = false;
+	if (!resp || resp->ret) {
+		/*
+		 * Explicit firmware rejection means this submission did not
+		 * enter firmware and no D594/D597 will follow. Only release
+		 * the DMA pin if no prior registration is still held.
+		 */
+		if (resp && resp->ret && resp->ret != U32_MAX) {
+			dcp->v27_idle_swap_pending = false;
+			dcp->v27_idle_swap_id = 0;
+			if (!tx->had_dma_pin &&
+			    dcp->v27_idle_release_seq == tx->release_seq &&
+			    !dcp->v27_idle_registered &&
+			    dcp->v27_idle_state == DCP_V27_IDLE_STATE_OFF &&
+			    !dcp->v27_idle_fences)
+				dcp->v27_idle_dma_pinned = false;
+		}
+		spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+		dev_warn_ratelimited(dcp->dev, "v27 idle-cache registration failed: %u\n",
+				     resp ? resp->ret : ~0U);
+		iomfb_v27_idle_cache_retry(dcp);
+		return;
+	}
+	if (dcp->v27_idle_release_seq == tx->release_seq)
+		dcp->v27_idle_registered = true;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_entries++;
+}
+
+static void iomfb_v27_idle_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	struct iomfb_v27_idle_tx *tx = cookie;
+	struct dcp_swap_start_resp_h17p *resp = data;
+	unsigned long flags;
+	void *req_ptr;
+	u32 req_len;
+	int l, ret;
+
+	if (!resp || resp->ret) {
+		dev_warn_ratelimited(dcp->dev, "v27 idle-cache swap_start rejected: %u\n",
+				     resp ? resp->ret : ~0U);
+		iomfb_v27_idle_cache_retry(dcp);
+		return;
+	}
+
+	/* D579 can arrive before the swap_submit reply. */
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (dcp->v27_idle_closed || !dcp->v27_idle_template_valid ||
+	    tx->gen != dcp->v27_idle_gen || dcp->v27_idle_swap_pending ||
+	    READ_ONCE(dcp->pipe_off)) {
+		spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+		return;
+	}
+	tx->release_seq = dcp->v27_idle_release_seq;
+	tx->had_dma_pin = dcp->v27_idle_dma_pinned;
+	dcp->v27_idle_submitting = true;
+	dcp->v27_idle_dma_pinned = true;
+	dcp->v27_idle_swap_pending = true;
+	dcp->v27_idle_swap_id = resp->swap_id;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	if (dcp->v27_a407) {
+		struct dcp_swap_submit_req_v27_a407 *req = &dcp->present_v27_a407;
+
+		memset(req, 0, sizeof(*req));
+		for (l = 0; l < SWAP_SURFACES; l++)
+			req->surf_null[l] = true;
+		memset(req->surf2_null, 1, sizeof(req->surf2_null));
+		req->unknown_pointer_null = true;
+		req->unknown_output_null = true;
+		req->swap.swap_id = resp->swap_id;
+		req->swap.swap_enabled = BIT(0);
+		req->swap.swap_completed = BIT(0);
+		req->swap.surf_ids[0] = DCP_V27_IDLE_SURFACE_ID;
+		req->swap.src_rect[0] = tx->src_rect;
+		req->swap.dst_rect[0] = tx->dst_rect;
+		req->swap.swap_intent = DCP_V27_SWAP_INTENT_IDLE_CACHE;
+		req->surf_null[0] = false;
+		req->surf[0].base = tx->surf;
+		req->surf_iova[0] = tx->dma_addr;
+		req_ptr = req;
+		req_len = sizeof(*req);
+	} else {
+		struct dcp_swap_submit_req_v27 *req = &dcp->present_v27;
+
+		memset(req, 0, sizeof(*req));
+		for (l = 0; l < SWAP_SURFACES; l++)
+			req->surf_null[l] = true;
+		req->unknown_pointer_null = true;
+		req->unknown_output_null = true;
+		req->swap.swap_id = resp->swap_id;
+		req->swap.swap_enabled = BIT(0);
+		req->swap.swap_completed = BIT(0);
+		req->swap.surf_ids[0] = DCP_V27_IDLE_SURFACE_ID;
+		req->swap.src_rect[0] = tx->src_rect;
+		req->swap.dst_rect[0] = tx->dst_rect;
+		req->swap.swap_intent = DCP_V27_SWAP_INTENT_IDLE_CACHE;
+		req->surf_null[0] = false;
+		req->surf[0].base = tx->surf;
+		req->surf_iova[0] = tx->dma_addr;
+		req_ptr = req;
+		req_len = sizeof(*req);
+	}
+
+	ret = dcp_push_context(dcp, dcp_call_context(dcp, false),
+			       &dcp->v27_methods[dcpep_swap_submit],
+			       req_len, sizeof(struct dcp_swap_submit_resp_v27),
+			       req_ptr, iomfb_v27_idle_swapped, tx, true);
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (!ret) {
+		if (tx->pending_session &&
+		    dcp_retain_live_session_commit(dcp, tx->pending_session))
+			tx->pending_session = NULL;
+	} else {
+		dcp->v27_idle_submitting = false;
+		dcp->v27_idle_swap_pending = false;
+		dcp->v27_idle_swap_id = 0;
+		if (!tx->had_dma_pin &&
+		    dcp->v27_idle_release_seq == tx->release_seq &&
+		    !dcp->v27_idle_registered &&
+		    dcp->v27_idle_state == DCP_V27_IDLE_STATE_OFF &&
+		    !dcp->v27_idle_fences)
+			dcp->v27_idle_dma_pinned = false;
+	}
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	if (ret) {
+		dev_warn_ratelimited(dcp->dev, "v27 idle-cache submit send failed: %d\n",
+				     ret);
+		if (ret != -ESHUTDOWN && ret != -EIO)
+			iomfb_v27_idle_cache_retry(dcp);
+	}
+}
+
+static void iomfb_v27_idle_send_swap_start(struct apple_dcp *dcp,
+					   struct iomfb_v27_idle_tx *tx)
+{
+	struct dcp_swap_start_req_h17p start_req = { 0 };
+	unsigned long flags;
+	bool valid;
+	int ret;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	valid = !dcp->v27_idle_closed && dcp->v27_idle_template_valid &&
+		tx->gen == dcp->v27_idle_gen && !dcp->v27_idle_swap_pending;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	if (!valid || !READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected) || READ_ONCE(dcp->pipe_off))
+		return;
+
+	ret = dcp_push_context(dcp, dcp_call_context(dcp, false),
+			       &dcp->v27_methods[dcpep_swap_start],
+			       sizeof(start_req),
+			       sizeof(struct dcp_swap_start_resp_h17p),
+			       &start_req, iomfb_v27_idle_swap_started, tx,
+			       true);
+	if (ret) {
+		dev_warn_ratelimited(dcp->dev, "v27 idle-cache swap_start send failed: %d\n",
+				     ret);
+		if (ret != -ESHUTDOWN && ret != -EIO)
+			iomfb_v27_idle_cache_retry(dcp);
+	}
+}
+
+static void iomfb_v27_idle_method_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_v27_idle_tx *tx = cookie;
+	u32 status = out ? get_unaligned_le32(out) : ~0U;
+	unsigned long flags;
+
+	/* applyProperty status: a refused method stays refused. */
+	if (status) {
+		dev_warn(dcp->dev, "v27 idle caching refused: %#x\n", status);
+		WRITE_ONCE(dcp->v27_idle_unavailable, true);
+		return;
+	}
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_method_set = true;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	tx->requeue = true;
+}
+
+static void iomfb_v27_idle_tx_start(struct apple_dcp *dcp,
+				    struct iomfb_transaction *transaction)
+{
+	struct iomfb_v27_idle_tx *tx = container_of(transaction,
+						    struct iomfb_v27_idle_tx,
+						    transaction);
+	__le32 prop[2] = {
+		cpu_to_le32(DCP_V27_IDLE_CACHING_METHOD),
+		cpu_to_le32(DCP_V27_IDLE_CACHING_METHOD_REPLAY),
+	};
+	unsigned long flags;
+	bool valid;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	valid = !dcp->v27_idle_closed && dcp->v27_idle_template_valid &&
+		tx->gen == dcp->v27_idle_gen &&
+		dcp->v27_idle_state == DCP_V27_IDLE_STATE_OFF &&
+		!dcp->v27_idle_fences && !dcp->v27_idle_swap_pending &&
+		(tx->negotiate_only ? !dcp->v27_idle_method_set :
+				      dcp->v27_idle_method_set);
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	if (!valid || READ_ONCE(dcp->pipe_off) ||
+	    READ_ONCE(dcp->v27_idle_unavailable))
+		return;
+
+	/*
+	 * Firmware 27 negotiates replay support through applyProperty(138, 2)
+	 * on A352, returning non-zero when unsupported (latched above).
+	 */
+	if (tx->negotiate_only) {
+		int ret;
+
+		ret = dcp_push_context(dcp, dcp_call_context(dcp, false),
+				       &dcp->v27_methods[dcpep_pipe_set_352],
+				       sizeof(prop), sizeof(u32), prop,
+				       iomfb_v27_idle_method_done, tx, true);
+		if (ret) {
+			dev_warn_ratelimited(dcp->dev, "v27 idle-cache negotiate send failed: %d\n",
+					     ret);
+			if (ret != -ESHUTDOWN && ret != -EIO)
+				iomfb_v27_idle_cache_retry(dcp);
+		}
+	} else {
+		iomfb_v27_idle_send_swap_start(dcp, tx);
+	}
+}
+
+static void iomfb_v27_idle_tx_release(struct iomfb_transaction *transaction)
+{
+	struct iomfb_v27_idle_tx *tx = container_of(transaction,
+						    struct iomfb_v27_idle_tx,
+						    transaction);
+	struct apple_dcp *dcp = tx->dcp;
+	bool requeue = tx->requeue;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_submitting = false;
+	dcp->v27_idle_in_flight = false;
+	if (requeue && !dcp->v27_idle_closed && dcp->v27_idle_template_valid &&
+	    !READ_ONCE(dcp->v27_idle_unavailable)) {
+		unsigned long rem = time_before(jiffies, dcp->v27_idle_deadline) ?
+				    dcp->v27_idle_deadline - jiffies : 0;
+
+		mod_delayed_work(system_dfl_wq, &dcp->v27_idle_cache_work, rem);
+	}
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	dcp_retain_live_session_abort(tx->pending_session);
+	kfree(tx);
+}
+
+void iomfb_v27_idle_cache_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					  struct apple_dcp,
+					  v27_idle_cache_work);
+	struct iomfb_v27_idle_tx *tx;
+	struct dcp_session_ref *session;
+	struct dcp_surface surf;
+	struct dcp_rect src_rect, dst_rect;
+	unsigned long flags;
+	bool method_set, still_valid;
+	size_t needed;
+	u64 gen;
+	int ret;
+
+	if (!dcp_v27_idle_cache_supported(dcp) ||
+	    !dcp->v27_methods || !dcp->v27_methods[dcpep_pipe_set_352].tag[0] ||
+	    !dcp->active || !dcp->crtc || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected) ||
+	    !READ_ONCE(dcp->mode_state.valid) ||
+	    READ_ONCE(dcp->crashed) || READ_ONCE(dcp->pipe_off) ||
+	    READ_ONCE(dcp->v27_idle_unavailable))
+		return;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (dcp->v27_idle_closed || !dcp->v27_idle_template_valid ||
+	    READ_ONCE(dcp->v27_idle_unavailable) ||
+	    dcp->v27_idle_state != DCP_V27_IDLE_STATE_OFF ||
+	    dcp->v27_idle_fences || dcp->v27_idle_in_flight ||
+	    dcp->v27_idle_swap_pending) {
+		spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+		return;
+	}
+	if (time_before(jiffies, dcp->v27_idle_deadline)) {
+		mod_delayed_work(system_dfl_wq, &dcp->v27_idle_cache_work,
+				 dcp->v27_idle_deadline - jiffies);
+		spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+		return;
+	}
+	surf = dcp->v27_idle_template_surf;
+	src_rect = dcp->v27_idle_src_rect;
+	dst_rect = dcp->v27_idle_dst_rect;
+	gen = dcp->v27_idle_gen;
+	method_set = dcp->v27_idle_method_set;
+	dcp->v27_idle_in_flight = true;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	if (!iomfb_v27_idle_surface_span(&surf, &needed))
+		goto err_unlock_flag;
+
+	/*
+	 * Negotiate replay support before allocating the cache surface or
+	 * retaining the live session, so unsupported panels stay rebindable.
+	 */
+	if (!method_set) {
+		tx = kzalloc_obj(*tx);
+		if (!tx)
+			goto err_unlock_flag;
+		tx->dcp = dcp;
+		tx->gen = gen;
+		tx->negotiate_only = true;
+		tx->transaction.start = iomfb_v27_idle_tx_start;
+		tx->transaction.release = iomfb_v27_idle_tx_release;
+		tx->transaction.presentation = true;
+
+		ret = iomfb_queue(dcp, &tx->transaction);
+		if (ret) {
+			iomfb_v27_idle_tx_release(&tx->transaction);
+			if (ret != -EIO)
+				iomfb_v27_idle_cache_retry(dcp);
+		}
+		return;
+	}
+
+	if (!dcp->v27_idle_obj || dcp->v27_idle_obj_size < needed) {
+		struct drm_gem_dma_object *obj, *old;
+		bool fw_pinned = false;
+
+		if (dcp->v27_idle_obj) {
+			spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+			fw_pinned = iomfb_v27_idle_cache_fw_pinned_locked(dcp);
+			spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+		}
+		if (fw_pinned)
+			goto err_unlock_flag;
+
+		obj = drm_gem_dma_create(dcp->crtc->base.dev, needed);
+		if (IS_ERR(obj)) {
+			dev_warn(dcp->dev, "v27 idle-cache surface alloc failed: %ld\n",
+				 PTR_ERR(obj));
+			WRITE_ONCE(dcp->v27_idle_unavailable, true);
+			goto err_unlock_flag;
+		}
+		old = dcp->v27_idle_obj;
+		dcp->v27_idle_obj = obj;
+		dcp->v27_idle_obj_size = needed;
+		if (old)
+			drm_gem_object_put(&old->base);
+	}
+
+	tx = kzalloc_obj(*tx);
+	if (!tx)
+		goto err_unlock_flag;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	still_valid = !dcp->v27_idle_closed && dcp->v27_idle_template_valid &&
+		      dcp->v27_idle_method_set && gen == dcp->v27_idle_gen &&
+		      !time_before(jiffies, dcp->v27_idle_deadline);
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	if (!still_valid || READ_ONCE(dcp->pipe_off) ||
+	    READ_ONCE(dcp->v27_idle_unavailable)) {
+		kfree(tx);
+		goto err_unlock_flag;
+	}
+
+	/*
+	 * Pre-acquire the live-session retention references here (process
+	 * context), but only commit retention under v27_idle_lock right at the
+	 * swap_submit IOVA boundary so an unbind closing admission before then
+	 * never retains an unused session.
+	 */
+	session = dcp_retain_live_session_prepare(dcp);
+	if (IS_ERR(session)) {
+		dev_warn(dcp->dev, "v27 idle-cache session retention failed: %ld\n",
+			 PTR_ERR(session));
+		WRITE_ONCE(dcp->v27_idle_unavailable, true);
+		kfree(tx);
+		goto err_unlock_flag;
+	}
+
+	tx->dcp = dcp;
+	tx->pending_session = session;
+	tx->surf = surf;
+	tx->src_rect = src_rect;
+	tx->dst_rect = dst_rect;
+	tx->dma_addr = dcp->v27_idle_obj->dma_addr;
+	tx->gen = gen;
+	tx->transaction.start = iomfb_v27_idle_tx_start;
+	tx->transaction.release = iomfb_v27_idle_tx_release;
+	tx->transaction.presentation = true;
+
+	ret = iomfb_queue(dcp, &tx->transaction);
+	if (ret) {
+		iomfb_v27_idle_tx_release(&tx->transaction);
+		if (ret != -EIO)
+			iomfb_v27_idle_cache_retry(dcp);
+	}
+	return;
+
+err_unlock_flag:
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_in_flight = false;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+}
+
 struct iomfb_crc_transaction {
 	struct iomfb_transaction transaction;
 	u32 swap_id;
@@ -1262,22 +1996,24 @@ static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
 }
 
 /* Call a DCP function given by a tag */
-static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
-			     const struct dcp_method_entry *call, u32 in_len,
-			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
+static int dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			    const struct dcp_method_entry *call, u32 in_len,
+			    u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie, bool unwind_on_err)
 {
 	struct dcp_method_entry resolved = *call;
+	int ret;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* A KUnit test answers for the firmware. */
 	if (dcp->test_push) {
 		dcp->test_push(dcp, call, cb, cookie);
-		return;
+		return 0;
 	}
 #endif
 
 	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
-		return;
+		return -EIO;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
@@ -1310,7 +2046,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			       DCP_PACKET_ALIGNMENT))) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
-		return;
+		return -EINVAL;
 	}
 	depth = dcp_push_depth(&ch->depth);
 	offset = dcp_packet_start(ch, depth);
@@ -1339,8 +2075,16 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	if (dcp_is_ext26(dcp))
 		dma_wmb();
-	dcp_send_message(dcp, IOMFB_ENDPOINT,
-			 dcpep_msg(context, data_len, offset));
+	ret = dcp_send_message_checked(dcp, IOMFB_ENDPOINT,
+				       dcpep_msg(context, data_len, offset));
+	if (ret && unwind_on_err && iomfb_uses_queue(dcp) &&
+	    ch->depth == depth + 1) {
+		ch->callbacks[depth] = NULL;
+		ch->cookies[depth] = NULL;
+		ch->output[depth] = NULL;
+		ch->end[depth] = 0;
+		WRITE_ONCE(ch->depth, depth);
+	}
 	/* Only a successful transport send can establish the readiness boundary. */
 	if (dcp_is_ext26(dcp) && !memcmp(call->tag, "A473", 4) && in_len == 16 &&
 	    get_unaligned_le64(data) == 1) {
@@ -1350,7 +2094,19 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 		WRITE_ONCE(dcp->ext26_power_ns, sent ? ktime_get_ns() : 0);
 		WRITE_ONCE(dcp->ext26_power_sent, sent);
 	}
+	return ret;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+int iomfb_test_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			    const struct dcp_method_entry *call, u32 in_len,
+			    u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie, bool unwind_on_err)
+{
+	return dcp_push_context(dcp, context, call, in_len, out_len, data, cb,
+				cookie, unwind_on_err);
+}
+#endif
 
 void dcp_push(struct apple_dcp *dcp, bool oob,
 	      const struct dcp_method_entry *call, u32 in_len, u32 out_len,
@@ -1365,7 +2121,7 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 	}
 
 	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
-			 in_len, out_len, data, cb, cookie);
+			 in_len, out_len, data, cb, cookie, false);
 }
 
 /*
@@ -1389,7 +2145,7 @@ int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry
 	} else {
 		WRITE_ONCE(dcp->iomfb.owner, current);
 		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
-				 in_len, out_len, data, cb, cookie);
+				 in_len, out_len, data, cb, cookie, false);
 		WRITE_ONCE(dcp->iomfb.owner, NULL);
 	}
 	mutex_unlock(&dcp->iomfb.lock);
@@ -1424,7 +2180,8 @@ int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 	if (!ch || !ch->depth || ch->depth >= DCP_MAX_CALL_DEPTH ||
 	    (u64)sizeof(struct dcp_packet_header) + in_len + out_len > 0x8000)
 		return -EINVAL;
-	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
+	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie,
+			 false);
 	return READ_ONCE(dcp->crashed) ? -EPROTO : 0;
 }
 
@@ -3803,6 +4560,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	    !dcp_hdr_output_supported(dcp))
 		dcp_hdr_infoframe_stop(dcp);
 	dcp_hdr_metadata_forget(dcp);
+	iomfb_v27_idle_cache_invalidate(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -4344,10 +5102,13 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 		return;
 
 	dcp->swap.h17p = scanout->request;
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		if (dcp_v27_idle_cache_supported(dcp))
+			iomfb_v27_idle_cache_kick(dcp);
 		iomfb_present_backlight_v27(dcp);
-	else
+	} else {
 		iomfb_present_backlight_h17p(dcp);
+	}
 }
 
 static void iomfb_backlight_release(struct iomfb_transaction *transaction)

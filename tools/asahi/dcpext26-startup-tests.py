@@ -243,6 +243,7 @@ static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
 static int iomfb_queue_command(struct apple_dcp *d,bool o,const struct dcp_method_entry *m,u32 i,u32 n,void *p,dcp_callback_t cb,void *c){abort();}
 static u64 ktime_get_ns(void){return 1;}
 static void dcp_send_message(struct apple_dcp *,u8,u64);
+static int dcp_send_message_checked(struct apple_dcp *d,u8 ep,u64 m){dcp_send_message(d,ep,m);return 0;}
 static void dcp_ack(struct apple_dcp *,enum dcp_context_id);
 static void dcp_push(struct apple_dcp *,bool,const struct dcp_method_entry *,u32,u32,void *,dcp_callback_t,void *);
 static void boot_done(struct apple_dcp *,void *,void *);

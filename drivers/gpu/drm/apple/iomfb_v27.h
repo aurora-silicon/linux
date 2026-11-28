@@ -29,7 +29,9 @@ struct dcp_swap_v27 {
 	u32 swap_completed;
 
 	u32 bg_color;
-	u8 reserved_158[0x1fc];
+	u8 reserved_158[0x24];
+	u32 swap_intent;
+	u8 reserved_180[0x1d4];
 
 	u8 brightness_update;
 	u8 reserved_355[3];
@@ -122,6 +124,7 @@ static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, unkbool) == 0x1d08);
 static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, swap_null) == 0x1d22);
 static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf_null) == 0x1d23);
 static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, unknown_output_null) == 0x1d2f);
+static_assert(offsetof(struct dcp_swap_v27, swap_intent) == 0x17c);
 static_assert(offsetof(struct dcp_swap_v27, brightness_update) == 0x354);
 static_assert(offsetof(struct dcp_swap_v27, brightness_nits) == 0x35e);
 static_assert(offsetof(struct dcp_swap_v27, bl_flags) == 0x358);
@@ -147,5 +150,30 @@ void iomfb_present_backlight_v27(struct apple_dcp *dcp);
 void iomfb_present_matrix_v27(struct apple_dcp *dcp);
 int iomfb_s2r_500_v27(struct apple_dcp *dcp);
 int iomfb_s2r_power_v27(struct apple_dcp *dcp, bool on, bool named_calls, bool oob);
+
+#define DCP_V27_IDLE_STATE_OFF			0
+#define DCP_V27_IDLE_STATE_ACTIVE		4
+#define DCP_V27_IDLE_FENCE_REFRESH		6
+
+void iomfb_v27_idle_cache_work(struct work_struct *work);
+void iomfb_v27_idle_cache_kick(struct apple_dcp *dcp);
+void iomfb_v27_idle_cache_retry(struct apple_dcp *dcp);
+void iomfb_v27_idle_cache_cancel(struct apple_dcp *dcp);
+void iomfb_v27_idle_cache_reset(struct apple_dcp *dcp);
+struct drm_framebuffer;
+struct drm_framebuffer_funcs;
+
+extern const struct drm_framebuffer_funcs apple_drm_client_fb_funcs;
+
+void iomfb_v27_idle_cache_release_obj(struct apple_dcp *dcp);
+bool iomfb_v27_idle_cache_fb_eligible(const struct drm_framebuffer *fb);
+void iomfb_v27_idle_cache_on_present(struct apple_dcp *dcp,
+				     const struct dcp_surface *surf,
+				     const struct dcp_rect *src_rect,
+				     const struct dcp_rect *dst_rect,
+				     bool valid);
+void iomfb_v27_idle_cache_on_displayed(struct apple_dcp *dcp);
+void iomfb_v27_idle_cache_invalidate(struct apple_dcp *dcp);
+bool iomfb_v27_idle_cache_swap_complete(struct apple_dcp *dcp, u32 swap_id);
 
 #endif

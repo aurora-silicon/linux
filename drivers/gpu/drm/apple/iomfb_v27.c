@@ -740,6 +740,90 @@ static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+static bool dcpep_cb_idle_caching_state_v27(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	u32 state = get_unaligned_le32(in);
+	u32 mem = get_unaligned_le32((const u8 *)in + 4);
+	u8 uses_host = ((const u8 *)in)[8];
+	unsigned long flags;
+	u64 replays;
+	u32 prev;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	prev = dcp->v27_idle_state;
+	dcp->v27_idle_state = state;
+	dcp->v27_idle_mem_total = mem;
+	dcp->v27_idle_uses_host = uses_host;
+	if (state == DCP_V27_IDLE_STATE_ACTIVE && prev != DCP_V27_IDLE_STATE_ACTIVE)
+		dcp->v27_idle_replays++;
+	replays = dcp->v27_idle_replays;
+	if (state == DCP_V27_IDLE_STATE_OFF)
+		dcp->v27_idle_fences = 0;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	if (prev != state) {
+		if (state == DCP_V27_IDLE_STATE_ACTIVE && replays == 1)
+			dev_info(dcp->dev,
+				 "v27 idle cache active (mem=%u host=%u)\n",
+				 mem, uses_host);
+		else
+			dev_dbg(dcp->dev,
+				"v27 idle cache state %u -> %u (mem=%u host=%u replays=%llu)\n",
+				prev, state, mem, uses_host, replays);
+	}
+	if (state == DCP_V27_IDLE_STATE_OFF)
+		iomfb_v27_idle_cache_retry(dcp);
+	return true;
+}
+
+static bool dcpep_cb_idle_fence_create_v27(struct apple_dcp *dcp, int tag,
+					   void *out, void *in)
+{
+	u32 state = get_unaligned_le32(in);
+	unsigned long flags;
+	bool grant;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	grant = (dcp->v27_idle_registered || dcp->v27_idle_submitting) &&
+		!dcp->v27_idle_closed && !READ_ONCE(dcp->pipe_off) &&
+		(!dcp->v27_idle_fences || state == DCP_V27_IDLE_FENCE_REFRESH);
+	if (grant)
+		dcp->v27_idle_fences++;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+
+	put_unaligned_le32(grant, out);
+	return true;
+}
+
+static bool dcpep_cb_idle_fence_complete_v27(struct apple_dcp *dcp, int tag,
+					     void *out, void *in)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	if (dcp->v27_idle_fences)
+		dcp->v27_idle_fences--;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	return true;
+}
+
+static bool dcpep_cb_idle_surface_release_v27(struct apple_dcp *dcp, int tag,
+					      void *out, void *in)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->v27_idle_lock, flags);
+	dcp->v27_idle_release_seq++;
+	dcp->v27_idle_registered = false;
+	dcp->v27_idle_submitting = false;
+	dcp->v27_idle_dma_pinned = false;
+	dcp->v27_idle_fences = 0;
+	spin_unlock_irqrestore(&dcp->v27_idle_lock, flags);
+	iomfb_v27_idle_cache_retry(dcp);
+	return true;
+}
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = dcpep_cb_d000_h17p,
 	[1] = trampoline_true,
@@ -758,7 +842,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_create_backlight_service,
 	[112] = trampoline_true,
 	[113] = dcpep_cb_core_analytics_v27,
-	[116] = trampoline_nop,
+	[116] = dcpep_cb_idle_caching_state_v27,
 	[117] = trampoline_zero,
 	[118] = trampoline_zero,
 	[119] = trampoline_zero,
@@ -808,6 +892,15 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[574] = iomfbep_cb_video_range_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,
+	[577] = trampoline_nop,
+	[578] = trampoline_nop,
+	[579] = dcpep_cb_idle_fence_create_v27,
+	[580] = dcpep_cb_idle_fence_complete_v27,
+	[581] = dcpep_cb_idle_surface_release_v27,
+	[582] = trampoline_nop,
+	[583] = trampoline_nop,
+	[584] = trampoline_nop,
+	[585] = trampoline_nop,
 	[586] = iomfbep_cb_create_dfb_surface,
 	[587] = trampoline_nop,
 	[588] = trampoline_nop,
@@ -900,6 +993,15 @@ static const struct {
 	[574] = { 0x4, 0x8 },
 	[575] = { 0x58, 0x4c },
 	[576] = { 0x4, 0x0 },
+	[577] = { 0x8, 0x0 },
+	[578] = { 0x0, 0x0 },
+	[579] = { 0x4, 0x4 },
+	[580] = { 0x0, 0x0 },
+	[581] = { 0x0, 0x0 },
+	[582] = { 0xc, 0x0 },
+	[583] = { 0x4, 0x0 },
+	[584] = { 0x0, 0x0 },
+	[585] = { 0xc, 0x0 },
 	[586] = { 0x8, 0x4 },
 	[587] = { 0x0, 0x0 },
 	[588] = { 0x18, 0x0 },

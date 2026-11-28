@@ -828,6 +828,10 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now,
 	if (retire) {
 		dcp_release_retained_framebuffers(dcp, id);
 		dcp_drm_crtc_page_flip(dcp, now);
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (shown && dcp_v27_idle_cache_supported(dcp))
+			iomfb_v27_idle_cache_on_displayed(dcp);
+#endif
 	}
 	if (READ_ONCE(dcp->crc_enabled)) {
 #if DCP_FW_H17(DCP_FW_VER)
@@ -867,6 +871,8 @@ static void dcp_swap_complete_id(struct apple_dcp *dcp, u32 swap_id, bool shown)
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, swap_id);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (iomfb_v27_idle_cache_swap_complete(dcp, swap_id))
+		return;
 	if (dcp_peer_swap_complete_v27(dcp, swap_id, now, shown,
 				      dcp_peer_queue_completion))
 		return;
@@ -3362,6 +3368,10 @@ static void
 dcpep_cb_abort_swap_ap_gated(struct apple_dcp *dcp, u32 *swap_id)
 {
 	trace_iomfb_abort_swap_ap_gated(dcp, *swap_id);
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (iomfb_v27_idle_cache_swap_complete(dcp, *swap_id))
+		return;
+#endif
 #if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		dcp_present_aborted(dcp, *swap_id);
@@ -4591,6 +4601,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *new_state, *old_state;
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	struct drm_framebuffer *primary_fb = NULL;
+#endif
 	struct drm_crtc_state *crtc_state;
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_SWAP(dcp);
 	int plane_idx, l;
@@ -4647,6 +4660,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp_fb_mirror(dcp, new_state->fb))
 			continue;
 		req->surf_null[l] = false;
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (!l)
+			primary_fb = new_state->fb;
+#endif
 		has_surface = 1;
 
 		req->swap.src_rect[l] = apple_state->src_rect;
@@ -4785,6 +4802,22 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;
+
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (dcp_v27_idle_cache_supported(dcp)) {
+		if (req->swap.swap_enabled & BIT(0)) {
+			bool valid = !req->surf_null[0] &&
+				     iomfb_v27_idle_cache_fb_eligible(primary_fb);
+
+			iomfb_v27_idle_cache_on_present(dcp, &req->surf[0].base,
+							&req->swap.src_rect[0],
+							&req->swap.dst_rect[0],
+							valid);
+		} else {
+			iomfb_v27_idle_cache_kick(dcp);
+		}
+	}
+#endif
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* The shared ramp is encoded after swap_start, at submission time. */

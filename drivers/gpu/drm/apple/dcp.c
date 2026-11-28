@@ -102,21 +102,22 @@ struct dcp_session_ref {
 };
 
 static LIST_HEAD(dcp_retained_sessions);
-static DEFINE_MUTEX(dcp_retained_sessions_lock);
+static DEFINE_SPINLOCK(dcp_retained_sessions_lock);
 
 static bool dcp_session_retained(struct device *dev)
 {
 	struct dcp_session_ref *session;
+	unsigned long flags;
 	bool retained = false;
 
-	mutex_lock(&dcp_retained_sessions_lock);
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
 	list_for_each_entry(session, &dcp_retained_sessions, link) {
 		if (dev_fwnode(session->dev) == dev_fwnode(dev)) {
 			retained = true;
 			break;
 		}
 	}
-	mutex_unlock(&dcp_retained_sessions_lock);
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
 	return retained;
 }
 
@@ -124,28 +125,104 @@ static bool dcp_session_retained(struct device *dev)
  * Keep a live session's DMA device, domain use and this driver until reboot,
  * and refuse a new probe of its device after an unbind.
  */
-int dcp_retain_live_session(struct apple_dcp *dcp)
+struct dcp_session_ref *dcp_retain_live_session_prepare(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
 
-	if (dcp->retain_dma)
-		return 0;
+	if (READ_ONCE(dcp->retain_dma))
+		return NULL;
 	session = kzalloc_obj(*session);
 	if (!session)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	/* Keep the DMA device, domain usage and driver code valid until reset. */
 	if (!try_module_get(THIS_MODULE)) {
 		kfree(session);
-		return -ENODEV;
+		return ERR_PTR(-ENODEV);
 	}
 	session->dev = get_device(dcp->dev);
 	session->group = iommu_group_get(dcp->dev);
-	WRITE_ONCE(dcp->retain_dma, true);
-	mutex_lock(&dcp_retained_sessions_lock);
-	list_add_tail(&session->link, &dcp_retained_sessions);
-	mutex_unlock(&dcp_retained_sessions_lock);
-	dev_dbg(dcp->dev, "live DCP DMA resources retained until reboot\n");
+	return session;
+}
+
+void dcp_retain_live_session_abort(struct dcp_session_ref *session)
+{
+	if (!session)
+		return;
+	if (session->group)
+		iommu_group_put(session->group);
+	put_device(session->dev);
+	module_put(THIS_MODULE);
+	kfree(session);
+}
+
+bool dcp_retain_live_session_commit(struct apple_dcp *dcp,
+				    struct dcp_session_ref *session)
+{
+	unsigned long flags;
+	bool committed = false;
+
+	if (!session)
+		return false;
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
+	if (!READ_ONCE(dcp->retain_dma)) {
+		WRITE_ONCE(dcp->retain_dma, true);
+		list_add_tail(&session->link, &dcp_retained_sessions);
+		committed = true;
+	}
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
+	if (committed)
+		dev_dbg(dcp->dev, "live DCP DMA resources retained until reboot\n");
+	return committed;
+}
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+bool dcp_test_session_retained(struct device *dev)
+{
+	struct dcp_session_ref *session;
+	unsigned long flags;
+	bool retained = false;
+
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
+	list_for_each_entry(session, &dcp_retained_sessions, link) {
+		if (session->dev == dev) {
+			retained = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
+	return retained;
+}
+
+void dcp_test_release_retained_session(struct device *dev)
+{
+	struct dcp_session_ref *session, *next;
+	LIST_HEAD(released);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
+	list_for_each_entry_safe(session, next, &dcp_retained_sessions, link) {
+		if (session->dev == dev)
+			list_move_tail(&session->link, &released);
+	}
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
+
+	list_for_each_entry_safe(session, next, &released, link) {
+		list_del(&session->link);
+		dcp_retain_live_session_abort(session);
+	}
+}
+#endif
+
+int dcp_retain_live_session(struct apple_dcp *dcp)
+{
+	struct dcp_session_ref *session;
+
+	session = dcp_retain_live_session_prepare(dcp);
+	if (IS_ERR(session))
+		return PTR_ERR(session);
+	if (session && !dcp_retain_live_session_commit(dcp, session))
+		dcp_retain_live_session_abort(session);
 	return 0;
 }
 
@@ -2354,7 +2431,7 @@ static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+int dcp_send_message_checked(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	bool native_14_7 = dcp->fw_compat == DCP_FIRMWARE_V_14_7;
 	int ret;
@@ -2363,7 +2440,11 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 
 	if (READ_ONCE(dcp->quiescing) ||
 	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
-		return;
+		return -ESHUTDOWN;
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+	if (dcp->test_send)
+		return dcp->test_send(dcp, endpoint, message);
+#endif
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
 	 * The adopted T6030 14.7 and native26 (ext26) sessions share this
@@ -2381,6 +2462,12 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (ret && native_14_7)
 		dev_warn_ratelimited(dcp->dev, "DCP send ep %02x failed: %d\n",
 				     endpoint, ret);
+	return ret;
+}
+
+void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+{
+	dcp_send_message_checked(dcp, endpoint, message);
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
@@ -5747,6 +5834,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	 * display then powers off as well, after the backlight.
 	 */
 	if (dcp_uses_soft_dpms(dcp)) {
+		iomfb_v27_idle_cache_cancel(dcp);
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
@@ -7753,7 +7841,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (dcp_is_ext26(dcp))
 		cancel_work_sync(&dcp->ext26_blank_work);
-	if (dcp->retain_dma) {
+	iomfb_v27_idle_cache_cancel(dcp);
+	if (READ_ONCE(dcp->retain_dma)) {
 		/* No firmware stop is acknowledged: detach host users, never DMA. */
 		scoped_guard(mutex, &dcp->iomfb.lock)
 			WRITE_ONCE(dcp->quiescing, true);
@@ -7879,6 +7968,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		iomfb_shutdown(dcp);
 
 	iomfb_queue_stop(dcp);
+	iomfb_v27_idle_cache_release_obj(dcp);
 	dcp_release_piodma_iommu_dev(dcp);
 
 	cancel_delayed_work_sync(&dcp->bl_fallback_wq);
@@ -10241,6 +10331,8 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	bool was_off;
 	int ret;
 
+	iomfb_v27_idle_cache_cancel(dcp);
+
 	/*
 	 * Not bound into the display subsystem (a component unbind released the RTKit
 	 * session): nothing of the firmware is this driver's to stop.
@@ -10688,6 +10780,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
 	dcp_s2r_forget_crash(dcp);
+	iomfb_v27_idle_cache_reset(dcp);
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
@@ -11352,6 +11445,8 @@ static int dcp_platform_suspend(struct device *dev)
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	dcp->s2r_prewarmed = false;
 
+	iomfb_v27_idle_cache_cancel(dcp);
+
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
 		return dcp_v27_sleep_suspend(dcp);
 
@@ -11773,6 +11868,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.only_120hz_modes = true,
+	/*
+	 * T6050 firmware accepts applyProperty(138, 2) and swap_intent = 8
+	 * into setup state 2 with zero transitions to active replay state 4;
+	 * gate off before swap_submit allocates a cache surface and retains
+	 * the live session for no power savings.
+	 */
+	.no_v27_idle_cache = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
