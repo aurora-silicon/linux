@@ -1405,6 +1405,47 @@ end:
 	return 0;
 }
 
+static void pci_pm_notify_host(struct pci_dev *dev)
+{
+	struct pci_host_bridge *bridge;
+
+	bridge = dev->bus ? pci_find_host_bridge(dev->bus) : NULL;
+	if (bridge && bridge->pm_state_change)
+		bridge->pm_state_change(bridge, dev);
+}
+
+/*
+ * Tell ASPM and the host bridge that @dev reached D0. @locked is true when
+ * the caller holds pci_bus_sem.
+ */
+void pci_pm_notify_state_change(struct pci_dev *dev, bool locked)
+{
+	if (dev->current_state != PCI_D0)
+		return;
+
+	if (dev->bus && dev->bus->self)
+		pcie_aspm_pm_state_change(dev->bus->self, locked);
+	pcie_aspm_pm_state_change(dev, locked);
+	pci_pm_notify_host(dev);
+}
+
+/*
+ * Same notification for resume paths that may run with pci_bus_sem held for
+ * read (runtime resume from pci_walk_bus() in error recovery). The ASPM update
+ * needs pci_bus_sem, so it is deferred to a work item; the host bridge hook
+ * takes no PCI core lock and runs inline.
+ */
+void pci_pm_notify_resume(struct pci_dev *dev)
+{
+	if (dev->current_state != PCI_D0)
+		return;
+
+	if (dev->bus && dev->bus->self)
+		pcie_aspm_pm_state_change_deferred(dev->bus->self);
+	pcie_aspm_pm_state_change_deferred(dev);
+	pci_pm_notify_host(dev);
+}
+
 /**
  * pci_set_full_power_state - Put a PCI device into D0 and update its state
  * @dev: PCI device to power up
@@ -1453,7 +1494,9 @@ static int pci_set_full_power_state(struct pci_dev *dev, bool locked)
 		pci_restore_bars(dev);
 	}
 
-	if (dev->bus->self)
+	if (dev->current_state == PCI_D0)
+		pci_pm_notify_state_change(dev, locked);
+	else if (dev->bus->self)
 		pcie_aspm_pm_state_change(dev->bus->self, locked);
 
 	return 0;

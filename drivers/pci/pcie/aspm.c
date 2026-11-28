@@ -24,6 +24,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/time.h>
+#include <linux/workqueue.h>
 
 #include "../pci.h"
 
@@ -121,6 +122,7 @@ void pci_save_aspm_l1ss_state(struct pci_dev *pdev)
 	pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2, cap++);
 	pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1, cap++);
 }
+EXPORT_SYMBOL_GPL(pci_save_aspm_l1ss_state);
 
 void pci_restore_aspm_l1ss_state(struct pci_dev *pdev)
 {
@@ -239,6 +241,7 @@ struct pcie_link_state {
 	u32 aspm_default:7;		/* Default ASPM state by BIOS or
 					   override */
 	u32 aspm_disable:7;		/* Disabled ASPM state */
+	u32 aspm_sleep_disable:7;	/* Temporarily disabled during sleep */
 
 	/* Clock PM state */
 	u32 clkpm_capable:1;		/* Clock PM capable? */
@@ -1080,7 +1083,8 @@ static void pcie_config_aspm_link(struct pcie_link_state *link, u32 state)
 	struct pci_bus *linkbus = parent->subordinate;
 
 	/* Enable only the states that were not explicitly disabled */
-	state &= (link->aspm_capable & ~link->aspm_disable);
+	state &= (link->aspm_capable & ~link->aspm_disable &
+		  ~link->aspm_sleep_disable);
 
 	/* Can't enable any substates if L1 is not enabled */
 	if (!(state & PCIE_LINK_STATE_L1))
@@ -1451,9 +1455,10 @@ void pcie_aspm_exit_link_state(struct pci_dev *pdev)
  */
 void pcie_aspm_pm_state_change(struct pci_dev *pdev, bool locked)
 {
-	struct pcie_link_state *link = pdev->link_state;
+	struct pcie_link_state *link;
 
-	if (aspm_disabled || !link)
+	/* Unlocked hint only; pdev->link_state is validated under aspm_lock. */
+	if (aspm_disabled || !READ_ONCE(pdev->link_state))
 		return;
 	/*
 	 * Devices changed PM state, we should recheck if latency
@@ -1462,11 +1467,61 @@ void pcie_aspm_pm_state_change(struct pci_dev *pdev, bool locked)
 	if (!locked)
 		down_read(&pci_bus_sem);
 	mutex_lock(&aspm_lock);
-	pcie_update_aspm_capable(link->root);
-	pcie_config_aspm_path(link);
+	/* free_link_state() clears pdev->link_state under aspm_lock. */
+	link = pdev->link_state;
+	if (link) {
+		pcie_update_aspm_capable(link->root);
+		pcie_config_aspm_path(link);
+	}
 	mutex_unlock(&aspm_lock);
 	if (!locked)
 		up_read(&pci_bus_sem);
+}
+
+struct pcie_aspm_pm_work {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+static void pcie_aspm_pm_work_fn(struct work_struct *work)
+{
+	struct pcie_aspm_pm_work *w =
+		container_of(work, struct pcie_aspm_pm_work, work);
+
+	/*
+	 * Runs outside any pci_bus_sem holder. The work item pins @pdev, and
+	 * pcie_aspm_pm_state_change() revalidates pdev->link_state under
+	 * aspm_lock, so a link freed after queueing is simply skipped and no
+	 * cancel is needed on removal.
+	 */
+	pcie_aspm_pm_state_change(w->pdev, false);
+	pci_dev_put(w->pdev);
+	kfree(w);
+}
+
+/**
+ * pcie_aspm_pm_state_change_deferred - Recheck ASPM from a work item
+ * @pdev: the root port or switch downstream port
+ *
+ * For callers that may run with pci_bus_sem held for read, such as runtime
+ * resume reached from pci_walk_bus() in error recovery. Taking pci_bus_sem
+ * again there can deadlock behind a queued writer, so the update runs later
+ * from process context without any PCI lock held.
+ */
+void pcie_aspm_pm_state_change_deferred(struct pci_dev *pdev)
+{
+	struct pcie_aspm_pm_work *w;
+
+	if (aspm_disabled || !READ_ONCE(pdev->link_state))
+		return;
+
+	w = kmalloc_obj(*w, GFP_ATOMIC);
+	if (!w)
+		return;
+
+	w->pdev = pci_dev_get(pdev);
+	INIT_WORK(&w->work, pcie_aspm_pm_work_fn);
+	queue_work(system_dfl_wq, &w->work);
 }
 
 void pcie_aspm_powersave_config_link(struct pci_dev *pdev)
@@ -1655,6 +1710,88 @@ int pci_enable_link_state_locked(struct pci_dev *pdev, int state)
 	return __pci_enable_link_state(pdev, state, true);
 }
 EXPORT_SYMBOL(pci_enable_link_state_locked);
+
+/**
+ * pcie_aspm_l1ss_sleep_begin_locked - Serialize sleep L1SS teardown with ASPM
+ * @pdev: Upstream port (Root Port or Switch Downstream Port) of the link
+ * @disable_fn: Driver callback that clears hardware L1SS enables
+ * @data: Opaque argument passed to @disable_fn
+ *
+ * Serializes hardware L1SS teardown with the PCI core ASPM lock and records
+ * temporary sleep suppression without altering link->aspm_disable or
+ * link->aspm_default, keeping link->aspm_enabled and saved L1SS state in sync
+ * across suspend/resume.
+ *
+ * Context: Caller holds pci_bus_sem read lock.
+ */
+int pcie_aspm_l1ss_sleep_begin_locked(struct pci_dev *pdev,
+				      int (*disable_fn)(void *data,
+							bool core_managed),
+				      void *data)
+{
+	struct pcie_link_state *link;
+	bool core_managed;
+	int ret;
+
+	lockdep_assert_held_read(&pci_bus_sem);
+
+	mutex_lock(&aspm_lock);
+	link = pdev->link_state;
+	core_managed = !aspm_disabled && link && link->downstream;
+	ret = disable_fn(data, core_managed);
+	if (!ret && core_managed) {
+		link->aspm_sleep_disable |= PCIE_LINK_STATE_L1SS;
+		link->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;
+		pci_save_aspm_l1ss_state(link->downstream);
+		pci_save_aspm_l1ss_state(link->pdev);
+	}
+	mutex_unlock(&aspm_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcie_aspm_l1ss_sleep_begin_locked);
+
+/**
+ * pcie_aspm_l1ss_sleep_end - Restore L1SS after sleep via the PCI core ASPM path
+ * @pdev: Upstream port (Root Port or Switch Downstream Port) of the link
+ * @restore_fn: Driver callback restoring L1SS timing (and enables if unmanaged)
+ * @data: Opaque argument passed to @restore_fn
+ *
+ * Serializes restoration with pci_bus_sem and aspm_lock. When the link is
+ * managed by the ASPM core, clears temporary sleep suppression and lets
+ * pcie_config_aspm_link() re-apply policy-permitted L1SS enables, deferring
+ * PCI-PM L1.1/L1.2 until both ends of the link are in PCI_D0.
+ */
+int pcie_aspm_l1ss_sleep_end(struct pci_dev *pdev,
+			     int (*restore_fn)(void *data, bool core_managed),
+			     void *data)
+{
+	struct pcie_link_state *link;
+	bool core_managed;
+	int ret;
+
+	down_read(&pci_bus_sem);
+	mutex_lock(&aspm_lock);
+
+	link = pdev->link_state;
+	core_managed = !aspm_disabled && link && link->downstream;
+	ret = restore_fn(data, core_managed);
+	if (core_managed) {
+		link->aspm_sleep_disable &= ~PCIE_LINK_STATE_L1SS;
+		link->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;
+		if (!ret) {
+			pcie_config_aspm_link(link, policy_to_aspm_state(link));
+			pci_save_aspm_l1ss_state(link->downstream);
+			pci_save_aspm_l1ss_state(link->pdev);
+		}
+	}
+
+	mutex_unlock(&aspm_lock);
+	up_read(&pci_bus_sem);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcie_aspm_l1ss_sleep_end);
 
 void pcie_aspm_remove_cap(struct pci_dev *pdev, u32 lnkcap)
 {

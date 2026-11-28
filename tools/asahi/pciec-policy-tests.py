@@ -161,6 +161,8 @@ typedef uint32_t u32;
 #define container_of(ptr, type, member) \
     ((type *)((char *)(ptr) - offsetof(type, member)))
 #define kzalloc_obj(x) calloc(1, sizeof(x))
+#define GFP_ATOMIC 0
+#define kmalloc_obj(x, gfp) calloc(1, sizeof(x))
 #define kfree(p) free(p)
 #define NOTIFY_OK 0x0001
 #define NOTIFY_STOP_MASK 0x8000
@@ -171,11 +173,35 @@ typedef uint32_t u32;
 #define PM_SUSPEND_MEM 3
 #define PCI_VENDOR_ID           0x00
 #define PCI_EXP_LNKCTL          0x10
+#define PCI_EXP_LNKCTL_ASPM_L0S 0x0001
+#define PCI_EXP_LNKCTL_ASPM_L1  0x0002
 #define PCI_EXP_LNKCTL_ASPMC    0x0003
 #define PCI_L1SS_CTL1           0x08
 #define PCI_L1SS_CTL2           0x0c
-#define PCI_L1SS_CTL1_L1SS_MASK 0x0000000f
-#define PCI_L1SS_CTL1_L1_2_MASK 0x00000005
+#define PCI_L1SS_CTL1_PCIPM_L1_2 0x00000001
+#define PCI_L1SS_CTL1_PCIPM_L1_1 0x00000002
+#define PCI_L1SS_CTL1_ASPM_L1_2  0x00000004
+#define PCI_L1SS_CTL1_ASPM_L1_1  0x00000008
+#define PCI_L1SS_CTL1_L1_2_MASK  0x00000005
+#define PCI_L1SS_CTL1_L1SS_MASK  0x0000000f
+typedef int pci_power_t;
+#define PCI_D0          0
+#define PCI_D3hot       3
+#define PCI_D3cold      4
+#define BUS_NOTIFY_DEL_DEVICE 0x0002
+#define NOTIFY_DONE     0x0000
+#define pci_fixup_resume_early 0
+#define PCIE_LINK_STATE_L0S_UP     BIT(0)
+#define PCIE_LINK_STATE_L0S_DW     BIT(1)
+#define PCIE_LINK_STATE_L0S        (PCIE_LINK_STATE_L0S_UP | PCIE_LINK_STATE_L0S_DW)
+#define PCIE_LINK_STATE_L1         BIT(2)
+#define PCIE_LINK_STATE_L1_1       BIT(3)
+#define PCIE_LINK_STATE_L1_2       BIT(4)
+#define PCIE_LINK_STATE_L1_1_PCIPM BIT(5)
+#define PCIE_LINK_STATE_L1_2_PCIPM BIT(6)
+#define PCIE_LINK_STATE_L1_SS_PCIPM (PCIE_LINK_STATE_L1_1_PCIPM | PCIE_LINK_STATE_L1_2_PCIPM)
+#define PCIE_LINK_STATE_L1SS       (PCIE_LINK_STATE_L1_1 | PCIE_LINK_STATE_L1_1_PCIPM | \
+                                    PCIE_LINK_STATE_L1_2 | PCIE_LINK_STATE_L1_2_PCIPM)
 static inline int notifier_from_errno(int err)
 {
     return err ? (NOTIFY_STOP_MASK | (NOTIFY_OK - err)) : NOTIFY_OK;
@@ -190,9 +216,17 @@ struct notifier_block;
 typedef int (*notifier_fn_t)(struct notifier_block *nb,
                              unsigned long action, void *data);
 struct notifier_block { notifier_fn_t notifier_call; };
+struct device;
+struct dev_pm_ops {
+    int (*runtime_resume)(struct device *dev);
+};
+struct device_driver {
+    const struct dev_pm_ops *pm;
+};
 struct device {
     struct apple_pcie *pcie;
     struct notifier_block *genpd_nb;
+    const struct device_driver *driver;
     bool genpd_on;
     int genpd_add_ret;
     unsigned int add_calls, remove_calls;
@@ -232,6 +266,13 @@ static void list_del(struct list_head *entry)
     entry->next = NULL;
     entry->prev = NULL;
 }
+struct mutex {
+    bool held;
+};
+static void mutex_init(struct mutex *lock)
+{
+    lock->held = false;
+}
 struct apple_pcie_port {
     struct list_head entry;
     unsigned int idx;
@@ -245,6 +286,9 @@ struct apple_pcie {
     u8 *base;
     struct list_head ports;
     struct list_head hib_l1ss;
+    struct list_head hib_l1ss_pending;
+    struct mutex hib_l1ss_lock;
+    struct notifier_block hib_l1ss_pci_nb;
     struct pci_host_bridge *bridge;
     bool power_retained, kernel_init, tunnel_cold_init;
     bool bus_stopped, resume_failed, link_kept;
@@ -305,29 +349,136 @@ static void apple_radio_complete(struct device *dev)
     (void)dev;
     radio_complete_calls++;
 }
+struct pci_host_bridge;
 struct pci_bus {
     struct list_head devices;
+    struct pci_dev *self;
+    struct pci_host_bridge *bridge;
 };
+struct pcie_link_state;
 struct pci_dev {
     struct list_head bus_list;
+    struct pci_bus *bus;
     struct pci_bus *subordinate;
+    struct pcie_link_state *link_state;
+    struct device dev;
+    void *driver;
+    pci_power_t current_state;
     u8 devfn;
     u16 l1ss;
     u16 lnkctl;
     bool downstream_port;
+    bool disconnected;
+    bool power_up_fail;
     unsigned int refs;
+    unsigned int restore_calls;
     u32 cfg[128];
+    u32 saved_l1ss_ctl1;
     unsigned int lnkctl_write_calls;
     unsigned int fail_lnkctl_write_on_call;
     unsigned int cfg_write_calls;
     unsigned int fail_cfg_write_on_call;
 };
+#define to_pci_dev(d) container_of(d, struct pci_dev, dev)
+static int pci_bus_sem;
+static struct mutex aspm_lock;
+static int pci_bus_sem_depth;
+static bool aspm_disabled;
+static void down_read(int *sem)
+{
+    assert(sem == &pci_bus_sem);
+    assert(pci_bus_sem_depth == 0);
+    pci_bus_sem_depth++;
+}
+static void up_read(int *sem)
+{
+    assert(sem == &pci_bus_sem);
+    assert(pci_bus_sem_depth == 1);
+    pci_bus_sem_depth--;
+}
+static void lockdep_assert_held_read(int *sem)
+{
+    assert(sem == &pci_bus_sem && pci_bus_sem_depth > 0);
+}
+static void (*aspm_lock_pre_hook)(void);
+static void (*mutex_unlock_hook)(struct mutex *lock);
+static void (*cfg_write_hook)(struct pci_dev *pdev);
+static void mutex_lock(struct mutex *lock)
+{
+    if (lock == &aspm_lock && aspm_lock_pre_hook) {
+        void (*hook)(void) = aspm_lock_pre_hook;
+
+        aspm_lock_pre_hook = NULL;
+        hook();
+    }
+    assert(!lock->held);
+    lock->held = true;
+}
+static void mutex_unlock(struct mutex *lock)
+{
+    assert(lock->held);
+    lock->held = false;
+    if (mutex_unlock_hook)
+        mutex_unlock_hook(lock);
+}
+/* Single-threaded workqueue: work runs only when the test drains it. */
+struct work_struct {
+    void (*func)(struct work_struct *work);
+    struct work_struct *next;
+};
+struct workqueue_struct { int unused; };
+static struct workqueue_struct system_dfl_wq_obj;
+#define system_dfl_wq (&system_dfl_wq_obj)
+#define INIT_WORK(w, f) do { (w)->func = (f); (w)->next = NULL; } while (0)
+static struct work_struct *work_head, *work_tail;
+static unsigned int queued_works;
+static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
+{
+    assert(wq == system_dfl_wq);
+    work->next = NULL;
+    if (work_tail)
+        work_tail->next = work;
+    else
+        work_head = work;
+    work_tail = work;
+    queued_works++;
+    return true;
+}
+static void run_queued_work(void)
+{
+    /* Work items run from process context with no PCI lock held. */
+    assert(pci_bus_sem_depth == 0 && !aspm_lock.held);
+    while (work_head) {
+        struct work_struct *work = work_head;
+
+        work_head = work->next;
+        if (!work_head)
+            work_tail = NULL;
+        work->func(work);
+    }
+}
 struct pci_host_bridge {
     struct pci_bus *bus;
+    void *priv;
+    void (*pm_state_change)(struct pci_host_bridge *bridge, struct pci_dev *dev);
 };
 static struct pci_host_bridge *pci_host_bridge_from_priv(struct apple_pcie *pcie)
 {
     return pcie->bridge;
+}
+static void *pci_host_bridge_priv(struct pci_host_bridge *bridge)
+{
+    return bridge->priv;
+}
+static struct pci_host_bridge *pci_find_host_bridge(struct pci_bus *bus)
+{
+    while (bus && bus->self && bus->self->bus)
+        bus = bus->self->bus;
+    return bus ? bus->bridge : NULL;
+}
+static bool pci_dev_is_disconnected(const struct pci_dev *pdev)
+{
+    return pdev->disconnected;
 }
 static bool pcie_downstream_port(const struct pci_dev *pdev)
 {
@@ -358,6 +509,12 @@ static int pci_read_config_dword(struct pci_dev *pdev, int pos, u32 *val)
 }
 static int pci_write_config_dword(struct pci_dev *pdev, int pos, u32 val)
 {
+    if (cfg_write_hook) {
+        void (*hook)(struct pci_dev *) = cfg_write_hook;
+
+        cfg_write_hook = NULL;
+        hook(pdev);
+    }
     assert((pos & 3) == 0 && (size_t)(pos >> 2) < ARRAY_SIZE(pdev->cfg));
     pdev->cfg_write_calls++;
     if (pdev->fail_cfg_write_on_call &&
@@ -382,6 +539,67 @@ static int pcie_capability_write_word(struct pci_dev *pdev, int pos, u16 val)
     pdev->lnkctl = val;
     return 0;
 }
+static int pci_clear_and_set_config_dword(struct pci_dev *pdev, int pos,
+                                          u32 clear, u32 set)
+{
+    u32 val;
+    int ret = pci_read_config_dword(pdev, pos, &val);
+
+    if (ret)
+        return ret;
+    val = (val & ~clear) | set;
+    return pci_write_config_dword(pdev, pos, val);
+}
+static int pcie_capability_clear_and_set_word(struct pci_dev *pdev, int pos,
+                                              u16 clear, u16 set)
+{
+    u16 val;
+    int ret = pcie_capability_read_word(pdev, pos, &val);
+
+    if (ret)
+        return ret;
+    val = (val & ~clear) | set;
+    return pcie_capability_write_word(pdev, pos, val);
+}
+static void pci_save_aspm_l1ss_state(struct pci_dev *pdev)
+{
+    struct pci_dev *parent = pdev && pdev->bus ? pdev->bus->self : NULL;
+
+    if (!pdev || pdev->downstream_port || !parent || !pdev->l1ss || !parent->l1ss)
+        return;
+    pci_read_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL1,
+                          &pdev->saved_l1ss_ctl1);
+    pci_read_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+                          &parent->saved_l1ss_ctl1);
+}
+static void pci_update_aspm_saved_state(struct pci_dev *pdev)
+{
+    (void)pdev;
+}
+static void pci_pm_power_up_and_verify_state(struct pci_dev *pci_dev)
+{
+    if (!pci_dev->power_up_fail)
+        pci_dev->current_state = PCI_D0;
+    else
+        pci_dev->current_state = PCI_D3cold;
+}
+static void pci_restore_state(struct pci_dev *pci_dev)
+{
+    struct pci_dev *parent = pci_dev->bus ? pci_dev->bus->self : NULL;
+
+    pci_dev->restore_calls++;
+    if (!pci_dev->downstream_port && parent && pci_dev->l1ss && parent->l1ss) {
+        pci_write_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+                               parent->saved_l1ss_ctl1);
+        pci_write_config_dword(pci_dev, pci_dev->l1ss + PCI_L1SS_CTL1,
+                               pci_dev->saved_l1ss_ctl1);
+    }
+}
+static void pci_pme_restore(struct pci_dev *pci_dev) { (void)pci_dev; }
+static void pci_resume_ptm(struct pci_dev *pci_dev) { (void)pci_dev; }
+static void pci_fixup_device(int pass, struct pci_dev *pci_dev) { (void)pass; (void)pci_dev; }
+static void pci_pm_default_resume(struct pci_dev *pci_dev) { (void)pci_dev; }
+static void pci_pm_bridge_power_up_actions(struct pci_dev *pci_dev) { (void)pci_dev; }
 static void pci_warn(const struct pci_dev *pdev, const char *fmt, ...)
 {
     (void)pdev;
@@ -404,7 +622,9 @@ static bool pci_walk_bus_rec(struct pci_bus *top,
 static void pci_walk_bus(struct pci_bus *top,
                          int (*cb)(struct pci_dev *, void *), void *userdata)
 {
+    down_read(&pci_bus_sem);
     pci_walk_bus_rec(top, cb, userdata);
+    up_read(&pci_bus_sem);
 }
 static int dev_pm_genpd_add_notifier(struct device *dev,
                                      struct notifier_block *nb)
@@ -462,6 +682,8 @@ static void reset_host(struct device *dev, struct apple_pcie *pcie,
     pcie->cio_dart = cio_dart;
     list_init(&pcie->ports);
     list_init(&pcie->hib_l1ss);
+    list_init(&pcie->hib_l1ss_pending);
+    mutex_init(&pcie->hib_l1ss_lock);
     s2idle_keep_link = true;
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
     suspend_via_firmware = false;
@@ -469,6 +691,38 @@ static void reset_host(struct device *dev, struct apple_pcie *pcie,
     radio_prepare_calls = 0;
     radio_complete_calls = 0;
     warn_calls = 0;
+    aspm_disabled = false;
+    pci_bus_sem_depth = 0;
+    aspm_lock.held = false;
+}
+/* Concurrent events, injected at the point the real code would race. */
+static struct pci_dev *race_pdev;
+static struct pcie_link_state *race_link;
+static struct apple_pcie *race_pcie;
+static struct pci_dev *race_dev;
+static bool race_blocked;
+/* free_link_state() ran before this thread got aspm_lock. */
+static void race_free_link_hook(void)
+{
+    memset(race_link, 0, sizeof(*race_link));
+    race_pdev->link_state = NULL;
+}
+/* An endpoint reaches D0 mid-restore; its notification waits for hib_l1ss_lock. */
+static void race_d0_cfg_hook(struct pci_dev *pdev)
+{
+    (void)pdev;
+    race_dev->current_state = PCI_D0;
+    if (race_pcie->hib_l1ss_lock.held)
+        race_blocked = true;
+    else
+        apple_pcie_pm_state_change(race_pcie->bridge, race_dev);
+}
+static void race_unlock_hook(struct mutex *lock)
+{
+    if (race_blocked && lock == &race_pcie->hib_l1ss_lock) {
+        race_blocked = false;
+        apple_pcie_pm_state_change(race_pcie->bridge, race_dev);
+    }
 }
 int main(void)
 {
@@ -712,17 +966,31 @@ int main(void)
         list_init(&root_bus.devices); \
         list_init(&sub0_bus.devices); \
         list_init(&sub1_bus.devices); \
+        root_bus.self = NULL; \
+        root_bus.bridge = &bridge; \
+        sub0_bus.self = &rp0; \
+        sub0_bus.bridge = NULL; \
+        sub1_bus.self = &rp1; \
+        sub1_bus.bridge = NULL; \
         bridge.bus = &root_bus; \
+        bridge.priv = &pcie; \
+        bridge.pm_state_change = apple_pcie_pm_state_change; \
         pcie.bridge = &bridge; \
+        pcie.hib_l1ss_pci_nb.notifier_call = apple_pcie_hib_l1ss_pci_notify; \
         INIT_DEV(rp0, 0x00, 0x150, &sub0_bus, true, 0x106b, 0x000000ff, 0x28, 0x0042); \
         INIT_DEV(fn0, 0x00, 0x160, NULL, false, 0x14e4, 0x000000ff, 0x28, 0x0042); \
         INIT_DEV(fn1, 0x01, 0, NULL, false, 0x14e4, 0, 0, 0x0043); \
+        rp0.bus = &root_bus; \
+        fn0.bus = &sub0_bus; \
+        fn1.bus = &sub0_bus; \
         list_add_tail(&rp0.bus_list, &root_bus.devices); \
         list_add_tail(&fn0.bus_list, &sub0_bus.devices); \
         list_add_tail(&fn1.bus_list, &sub0_bus.devices); \
         if (two_links) { \
             INIT_DEV(rp1, 0x08, 0x150, &sub1_bus, true, 0x106b, 0x0000005f, 0x14, 0x0042); \
             INIT_DEV(ep1, 0x00, 0x160, NULL, false, 0x14e4, 0x0000005f, 0x14, 0x0042); \
+            rp1.bus = &root_bus; \
+            ep1.bus = &sub1_bus; \
             list_add_tail(&rp1.bus_list, &root_bus.devices); \
             list_add_tail(&ep1.bus_list, &sub1_bus.devices); \
         } \
@@ -816,6 +1084,258 @@ int main(void)
     assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1 && rp1.refs == 1 && ep1.refs == 1);
     assert(radio_complete_calls == 1 && warn_calls == 0);
 
+    /* Unmanaged fallback: runtime-suspended D3hot endpoint syncs saved state, defers PCI-PM, and restores on real pci_pm_runtime_resume(). */
+    RESET_L1SS(false);
+    aspm_disabled = true;
+    fn0.current_state = PCI_D3hot;
+    rp0.saved_l1ss_ctl1 = 0x000000ff;
+    fn0.saved_l1ss_ctl1 = 0x000000ff;
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000f0 && fn0.saved_l1ss_ctl1 == 0x000000f0);
+    /* A PCI restore during the sleep window must not replay stale PCI-PM enables. */
+    pci_restore_state(&fn0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(!list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL2) >> 2] == 0x28);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL2) >> 2] == 0x28);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000fc && fn0.saved_l1ss_ctl1 == 0x000000fc);
+    /* Real runtime resume restores masked config (0xfc) then applies deferred PCI-PM enables (0xff). */
+    assert(pci_pm_runtime_resume(&fn0.dev) == 0);
+    assert(fn0.current_state == PCI_D0);
+    assert(list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000ff && fn0.saved_l1ss_ctl1 == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    /* Unmanaged fallback across two sleeps in D3hot preserves original PCI-PM bits and cleans up on remove/del. */
+    RESET_L1SS(false);
+    aspm_disabled = true;
+    fn0.current_state = PCI_D3hot;
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(!list_empty(&pcie.hib_l1ss_pending));
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(!list_empty(&pcie.hib_l1ss_pending));
+    assert(pci_pm_runtime_resume(&fn0.dev) == 0);
+    assert(list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    /* Unmanaged pending record drops cleanly on device removal or host free without leaking refs. */
+    RESET_L1SS(false);
+    aspm_disabled = true;
+    fn0.current_state = PCI_D3hot;
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(!list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.refs == 2 && fn0.refs == 2);
+    assert(apple_pcie_hib_l1ss_pci_notify(&pcie.hib_l1ss_pci_nb, BUS_NOTIFY_DEL_DEVICE, &fn0.dev) == NOTIFY_DONE);
+    assert(list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.refs == 1 && fn0.refs == 1);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(!list_empty(&pcie.hib_l1ss_pending));
+    apple_pcie_hib_free_l1ss(&pcie);
+    assert(list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    /* Core-managed link: normal D0 sleep/resume preserves policy and syncs aspm_enabled. */
+    struct pcie_link_state link0;
+    #define ATTACH_LINK(l, up, dn, sup, en, def, dis) do { \
+        memset(&(l), 0, sizeof(l)); \
+        (l).pdev = (up); \
+        (l).downstream = (dn); \
+        (l).root = &(l); \
+        (l).aspm_support = (sup); \
+        (l).aspm_capable = (sup); \
+        (l).aspm_enabled = (en); \
+        (l).aspm_default = (def); \
+        (l).aspm_disable = (dis); \
+        (up)->link_state = &(l); \
+    } while (0)
+    #define ALL_L1_STATES (PCIE_LINK_STATE_L1 | PCIE_LINK_STATE_L1SS)
+
+    RESET_L1SS(false);
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(link0.aspm_sleep_disable == PCIE_LINK_STATE_L1SS);
+    assert(link0.aspm_enabled == PCIE_LINK_STATE_L1);
+    assert(link0.aspm_default == ALL_L1_STATES && link0.aspm_disable == 0);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000f0 && fn0.saved_l1ss_ctl1 == 0x000000f0);
+    /* Mid-sleep D0 transition notification must keep L1SS suppressed until complete(). */
+    pcie_aspm_pm_state_change(&rp0, false);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    apple_pcie_complete(&dev);
+    assert(link0.aspm_sleep_disable == 0);
+    assert(link0.aspm_enabled == ALL_L1_STATES);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000ff && fn0.saved_l1ss_ctl1 == 0x000000ff);
+
+    /* Core-managed link: D3hot endpoint defers PCI-PM L1.1/L1.2 until endpoint enters D0. */
+    RESET_L1SS(false);
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    assert(apple_pcie_prepare(&dev) == 0);
+    fn0.current_state = PCI_D3hot;
+    apple_pcie_complete(&dev);
+    assert(link0.aspm_sleep_disable == 0);
+    assert(link0.aspm_enabled == (PCIE_LINK_STATE_L1 | PCIE_LINK_STATE_L1_1 | PCIE_LINK_STATE_L1_2));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000fc && fn0.saved_l1ss_ctl1 == 0x000000fc);
+    /* Subsequent D3hot->D0 transition via real pci_pm_runtime_resume() enables deferred PCI-PM L1.1/L1.2. */
+    fn0.power_up_fail = true;
+    assert(pci_pm_runtime_resume(&fn0.dev) == 0);
+    assert(fn0.current_state == PCI_D3cold && queued_works == 0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    fn0.power_up_fail = false;
+    fn0.restore_calls = 0;
+    /*
+     * Error recovery resumes devices inside pci_walk_bus(), which holds
+     * pci_bus_sem for read. Runtime resume must not take it again: the
+     * fixture's down_read() asserts on recursion.
+     */
+    pci_bus_sem_depth = 1;
+    assert(pci_pm_runtime_resume(&fn0.dev) == 0);
+    pci_bus_sem_depth = 0;
+    assert(fn0.current_state == PCI_D0 && fn0.restore_calls == 1);
+    /* The ASPM update is queued, pinning the port, and not yet applied. */
+    assert(queued_works == 1 && rp0.refs == 2);
+    assert(link0.aspm_enabled != ALL_L1_STATES);
+    run_queued_work();
+    assert(rp0.refs == 1 && fn0.refs == 1);
+    assert(link0.aspm_enabled == ALL_L1_STATES);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000ff && fn0.saved_l1ss_ctl1 == 0x000000ff);
+
+    /* Core-managed link starting with L1SS disabled still installs sleep mask against mid-sleep enable. */
+    RESET_L1SS(false);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, PCIE_LINK_STATE_L1, ALL_L1_STATES, 0);
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(!list_empty(&pcie.hib_l1ss));
+    assert(link0.aspm_sleep_disable == PCIE_LINK_STATE_L1SS);
+    pcie_aspm_pm_state_change(&rp0, false);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    apple_pcie_complete(&dev);
+    assert(link0.aspm_sleep_disable == 0);
+    assert(link0.aspm_enabled == ALL_L1_STATES);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+
+    /* Core-managed link: parent port not in D0 also defers PCI-PM L1.1/L1.2 until both in D0. */
+    RESET_L1SS(false);
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    assert(apple_pcie_prepare(&dev) == 0);
+    rp0.current_state = PCI_D3hot;
+    apple_pcie_complete(&dev);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    rp0.current_state = PCI_D0;
+    pcie_aspm_pm_state_change(&rp0, false);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+
+    /* Core-managed link: pre-existing aspm_disable bits stay disabled after resume. */
+    RESET_L1SS(false);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000fe;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000fe;
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES,
+                ALL_L1_STATES & ~PCIE_LINK_STATE_L1_2_PCIPM,
+                ALL_L1_STATES, PCIE_LINK_STATE_L1_2_PCIPM);
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(link0.aspm_disable == PCIE_LINK_STATE_L1_2_PCIPM);
+    assert(link0.aspm_enabled == (ALL_L1_STATES & ~PCIE_LINK_STATE_L1_2_PCIPM));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fe);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fe);
+    assert(pci_bus_sem_depth == 0 && !aspm_lock.held && !pcie.hib_l1ss_lock.held);
+
+    /* A link freed between queueing and running the work item is skipped, not used. */
+    RESET_L1SS(false);
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    queued_works = 0;
+    fn0.current_state = PCI_D0;
+    assert(pci_pm_runtime_resume(&fn0.dev) == 0);
+    assert(queued_works == 1 && rp0.refs == 2);
+    race_pdev = &rp0;
+    race_link = &link0;
+    aspm_lock_pre_hook = race_free_link_hook;
+    run_queued_work();
+    assert(rp0.link_state == NULL && rp0.refs == 1 && !aspm_lock.held);
+    assert(aspm_lock_pre_hook == NULL);
+
+    /* Removal of the link between the unlocked hint and aspm_lock must not be dereferenced. */
+    RESET_L1SS(false);
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    race_pdev = &rp0;
+    race_link = &link0;
+    aspm_lock_pre_hook = race_free_link_hook;
+    pcie_aspm_pm_state_change(&rp0, false);
+    assert(rp0.link_state == NULL && aspm_lock_pre_hook == NULL);
+    assert(pci_bus_sem_depth == 0 && !aspm_lock.held);
+    /* Same with the caller already holding pci_bus_sem. */
+    ATTACH_LINK(link0, &rp0, &fn0, ALL_L1_STATES, ALL_L1_STATES, ALL_L1_STATES, 0);
+    pci_bus_sem_depth = 1;
+    aspm_lock_pre_hook = race_free_link_hook;
+    pcie_aspm_pm_state_change(&rp0, true);
+    pci_bus_sem_depth = 0;
+    assert(rp0.link_state == NULL && !aspm_lock.held);
+
+    /*
+     * Unmanaged link: an endpoint reaching D0 right after the restore masked
+     * PCI-PM L1.1/L1.2 but before the pending record exists must still get
+     * its enables. The notification blocks on hib_l1ss_lock, so it only runs
+     * once the record is published.
+     */
+    RESET_L1SS(false);
+    aspm_disabled = true;
+    fn0.current_state = PCI_D3hot;
+    assert(apple_pcie_prepare(&dev) == 0);
+    race_pcie = &pcie;
+    race_dev = &fn0;
+    race_blocked = false;
+    cfg_write_hook = race_d0_cfg_hook;
+    mutex_unlock_hook = race_unlock_hook;
+    apple_pcie_complete(&dev);
+    mutex_unlock_hook = NULL;
+    assert(cfg_write_hook == NULL && !race_blocked);
+    assert(fn0.current_state == PCI_D0);
+    assert(list_empty(&pcie.hib_l1ss) && list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.saved_l1ss_ctl1 == 0x000000ff && fn0.saved_l1ss_ctl1 == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1 && !pcie.hib_l1ss_lock.held);
+
+    /* Unmanaged link that is already in D0 at restore applies everything at once. */
+    RESET_L1SS(false);
+    aspm_disabled = true;
+    assert(apple_pcie_prepare(&dev) == 0);
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss_pending));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    #undef ALL_L1_STATES
+    #undef ATTACH_LINK
     #undef RESET_L1SS
     #undef INIT_DEV
 
@@ -1124,6 +1644,9 @@ def main():
     parser.add_argument('--out', type=Path)
     args = parser.parse_args()
     pci = (ROOT / 'drivers/pci/controller/pcie-apple.c').read_text()
+    aspm = (ROOT / 'drivers/pci/pcie/aspm.c').read_text()
+    pci_core = (ROOT / 'drivers/pci/pci.c').read_text()
+    pci_drv = (ROOT / 'drivers/pci/pci-driver.c').read_text()
     acio = (ROOT / 'drivers/thunderbolt/apple.c').read_text()
     defines = '\n'.join(re.findall(r'^#define (?:[^\n]*\\\n)*[^\n]*$', pci, re.M))
     info = pci[pci.index('struct hw_info {'):pci.index('static const struct of_device_id apple_pcie_of_match[];')]
@@ -1133,9 +1656,39 @@ def main():
                             function(acio, 'apple_cio_pciec_eligible'),
                             function(acio, 'apple_cio_pcie_tunnel_is_preinitialized')))
     code = FIXTURE.replace('/* PRODUCTION */', production)
+    aspm_struct = re.search(r'^struct pcie_link_state \{.*?\n\};', aspm, re.M | re.S)[0]
+    aspm_helpers = '''
+static int policy_to_aspm_state(struct pcie_link_state *link)
+{
+    return link->aspm_default;
+}
+static void pcie_update_aspm_capable(struct pcie_link_state *root)
+{
+    /* A link freed before aspm_lock was taken has no root left. */
+    assert(root && aspm_lock.held);
+}
+'''
+    aspm_work_struct = re.search(r'^struct pcie_aspm_pm_work \{.*?\n\};', aspm,
+                                 re.M | re.S)[0]
+    aspm_prod = '\n'.join((aspm_struct, aspm_work_struct, aspm_helpers,
+                           *(function(aspm, n) for n in (
+                               'pcie_config_aspm_dev',
+                               'pcie_config_aspm_l1ss',
+                               'pcie_config_aspm_link',
+                               'pcie_config_aspm_path',
+                               'pcie_aspm_pm_state_change',
+                               'pcie_aspm_pm_work_fn',
+                               'pcie_aspm_pm_state_change_deferred',
+                               'pcie_aspm_l1ss_sleep_begin_locked',
+                               'pcie_aspm_l1ss_sleep_end')),
+                           function(pci_core, 'pci_pm_notify_host'),
+                           function(pci_core, 'pci_pm_notify_state_change'),
+                           function(pci_core, 'pci_pm_notify_resume'),
+                           function(pci_drv, 'pci_pm_default_resume_early'),
+                           function(pci_drv, 'pci_pm_runtime_resume')))
     l1ss_structs = pci[pci.index('struct apple_pcie_hib_l1ss {'):
                        pci.index('static int apple_pcie_cfg_read_u32(')]
-    s2idle_prod = '\n'.join((defines, info, matches, l1ss_structs,
+    s2idle_prod = '\n'.join((defines, info, matches, aspm_prod, l1ss_structs,
                              *(function(pci, n) for n in (
                                  'apple_pcie_pd_notify',
                                  'apple_pcie_release_domains',
@@ -1152,8 +1705,13 @@ def main():
                                  'apple_pcie_hib_merge_aspm',
                                  'apple_pcie_hib_orig_fn_lnkctl',
                                  'apple_pcie_link_set_l1ss',
+                                 'apple_pcie_hib_disable_l1ss_link',
+                                 'apple_pcie_hib_restore_l1ss_link',
                                  'apple_pcie_hib_disable_l1ss_cb',
                                  'apple_pcie_hib_restore_l1ss',
+                                 'apple_pcie_pm_state_change',
+                                 'apple_pcie_hib_l1ss_pci_notify',
+                                 'apple_pcie_hib_free_l1ss',
                                  'apple_pcie_s2r_reinit',
                                  'apple_pcie_prepare',
                                  'apple_pcie_complete'))))
@@ -1217,11 +1775,97 @@ def main():
             '\t\t\t\tu16 orig = apple_pcie_hib_orig_fn_lnkctl(saved,',
             'if (true) {\n'
             '\t\t\t\tu16 orig = apple_pcie_hib_orig_fn_lnkctl(saved,'),
+        'drop-fallback-d0-check': (
+            'if (defer_pcipm) {\n'
+            '\t\t\t\tpl_ctl1 &= ~APPLE_PCIE_L1SS_PCIPM_MASK;',
+            'if (false) {\n'
+            '\t\t\t\tpl_ctl1 &= ~APPLE_PCIE_L1SS_PCIPM_MASK;'),
+        'drop-core-d0-check': (
+            'if (parent->current_state != PCI_D0 || child->current_state != PCI_D0) {\n'
+            '\t\tstate &= ~PCIE_LINK_STATE_L1_SS_PCIPM;',
+            'if (false) {\n'
+            '\t\tstate &= ~PCIE_LINK_STATE_L1_SS_PCIPM;'),
+        'drop-aspm-sleep-disable-mask': (
+            'state &= (link->aspm_capable & ~link->aspm_disable &\n'
+            '\t\t  ~link->aspm_sleep_disable);',
+            'state &= (link->aspm_capable & ~link->aspm_disable);'),
+        'drop-sleep-begin-clear-enabled': (
+            '\t\tlink->aspm_sleep_disable |= PCIE_LINK_STATE_L1SS;\n'
+            '\t\tlink->aspm_enabled &= ~PCIE_LINK_STATE_L1SS;',
+            '\t\tlink->aspm_sleep_disable |= PCIE_LINK_STATE_L1SS;'),
+        'drop-runtime-resume-aspm-notify': (
+            '\tpci_pm_default_resume_early(pci_dev);\n'
+            '\tpci_resume_ptm(pci_dev);\n'
+            '\tpci_pm_notify_resume(pci_dev);',
+            '\tpci_pm_default_resume_early(pci_dev);\n'
+            '\tpci_resume_ptm(pci_dev);'),
+        'sync-runtime-resume-aspm-notify': (
+            '\tpci_resume_ptm(pci_dev);\n'
+            '\tpci_pm_notify_resume(pci_dev);',
+            '\tpci_resume_ptm(pci_dev);\n'
+            '\tpci_pm_notify_state_change(pci_dev, false);'),
+        'prelock-link-read': [
+            ('\tstruct pcie_link_state *link;\n\n'
+             '\t/* Unlocked hint only; pdev->link_state is validated under aspm_lock. */\n'
+             '\tif (aspm_disabled || !READ_ONCE(pdev->link_state))',
+             '\tstruct pcie_link_state *link = pdev->link_state;\n\n'
+             '\tif (aspm_disabled || !link)'),
+            ('\t/* free_link_state() clears pdev->link_state under aspm_lock. */\n'
+             '\tlink = pdev->link_state;\n',
+             ''),
+        ],
+        'drop-unmanaged-pending-keep': (
+            '\tif (defer) {\n'
+            '\t\tlist_add_tail(&saved->entry, &pcie->hib_l1ss_pending);\n'
+            '\t\tctx->keep_pending = true;\n'
+            '\t}',
+            '\tif (defer)\n'
+            '\t\tctx->keep_pending = false;'),
+        'publish-pending-after-masking': (
+            '\tmutex_lock(&pcie->hib_l1ss_lock);\n'
+            '\tdefer = ((saved->pl_ctl1 | saved->cl_ctl1) & APPLE_PCIE_L1SS_PCIPM_MASK) &&\n'
+            '\t\t(parent->current_state != PCI_D0 || child->current_state != PCI_D0);\n'
+            '\tret = apple_pcie_link_set_l1ss(saved, true, ctx->rollback, false, defer);\n'
+            '\tif (ret) {\n'
+            '\t\tmutex_unlock(&pcie->hib_l1ss_lock);\n'
+            '\t\tpci_warn(child, "failed to restore PCIe L1SS after sleep: %d\\n",\n'
+            '\t\t\t ret);\n'
+            '\t\treturn ret;\n'
+            '\t}\n'
+            '\n'
+            '\tpci_save_aspm_l1ss_state(child);\n',
+            '\tdefer = ((saved->pl_ctl1 | saved->cl_ctl1) & APPLE_PCIE_L1SS_PCIPM_MASK) &&\n'
+            '\t\t(parent->current_state != PCI_D0 || child->current_state != PCI_D0);\n'
+            '\tret = apple_pcie_link_set_l1ss(saved, true, ctx->rollback, false, defer);\n'
+            '\tif (ret) {\n'
+            '\t\tpci_warn(child, "failed to restore PCIe L1SS after sleep: %d\\n",\n'
+            '\t\t\t ret);\n'
+            '\t\treturn ret;\n'
+            '\t}\n'
+            '\n'
+            '\tpci_save_aspm_l1ss_state(child);\n'
+            '\tmutex_lock(&pcie->hib_l1ss_lock);\n'),
+        'drop-unmanaged-sleep-save-state': (
+            '\tif (!ret && !core_managed)\n'
+            '\t\tpci_save_aspm_l1ss_state(child);',
+            ''),
+        'drop-zero-l1ss-sleep-suppress': (
+            '\tif (!((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK)) {\n'
+            '\t\tsaved->active = core_managed;\n'
+            '\t\treturn 0;\n'
+            '\t}',
+            '\tif (!((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK)) {\n'
+            '\t\tsaved->active = false;\n'
+            '\t\treturn 0;\n'
+            '\t}'),
     }
     s2idle_cases = {'s2idle-production': s2idle_code}
-    for name, (old, new) in s2idle_muts.items():
-        assert s2idle_code.count(old) == 1, name
-        s2idle_cases[name] = s2idle_code.replace(old, new)
+    for name, edits in s2idle_muts.items():
+        mutated = s2idle_code
+        for old, new in ([edits] if isinstance(edits, tuple) else edits):
+            assert mutated.count(old) == 1, name
+            mutated = mutated.replace(old, new)
+        s2idle_cases[name] = mutated
     with tempfile.TemporaryDirectory(prefix='pciec-policy-') as tmp:
         out = args.out or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)

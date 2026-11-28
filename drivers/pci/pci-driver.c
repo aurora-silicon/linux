@@ -595,6 +595,7 @@ static int pci_restore_standard_config(struct pci_dev *pci_dev)
 
 	pci_restore_state(pci_dev);
 	pci_pme_restore(pci_dev);
+	pci_pm_notify_resume(pci_dev);
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
@@ -1405,6 +1406,7 @@ static int pci_pm_runtime_resume(struct device *dev)
 	 */
 	pci_pm_default_resume_early(pci_dev);
 	pci_resume_ptm(pci_dev);
+	pci_pm_notify_resume(pci_dev);
 
 	if (!pci_dev->driver)
 		return 0;

@@ -656,6 +656,10 @@ struct apple_pcie {
 	struct list_head	ports;
 	struct list_head	hib_fns;
 	struct list_head	hib_l1ss;
+	struct list_head	hib_l1ss_pending;
+	/* Protects hib_l1ss_pending across sleep and D0 notifications. */
+	struct mutex		hib_l1ss_lock;
+	struct notifier_block	hib_l1ss_pci_nb;
 	bool			hib_saved;
 	struct completion	event;
 	struct irq_fwspec	fwspec;
@@ -710,6 +714,13 @@ static void __noreturn apple_radio_terminal(void);
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
 static struct apple_pcie *apple_pcie_lookup(struct device *dev);
 static int apple_pcie_radio_check_cold(struct apple_pcie_port *port);
+static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie);
+static void apple_pcie_pm_state_change(struct pci_host_bridge *bridge,
+				       struct pci_dev *pdev);
+static int apple_pcie_hib_l1ss_pci_notify(struct notifier_block *nb,
+					  unsigned long action, void *data);
+static void apple_pcie_hib_l1ss_pci_unregister(void *data);
+static void apple_pcie_hib_free_l1ss(struct apple_pcie *pcie);
 
 static void rmw_set(u32 set, void __iomem *addr)
 {
@@ -3649,6 +3660,7 @@ static void apple_pcie_cleanup(void *data)
 	struct apple_pcie *pcie = data;
 	struct apple_pcie_port *port, *tmp;
 
+	apple_pcie_hib_free_l1ss(pcie);
 	list_for_each_entry_safe(port, tmp, &pcie->ports, entry)
 		apple_pcie_port_teardown(port);
 
@@ -6012,6 +6024,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&pcie->ports);
 	INIT_LIST_HEAD(&pcie->hib_fns);
 	INIT_LIST_HEAD(&pcie->hib_l1ss);
+	INIT_LIST_HEAD(&pcie->hib_l1ss_pending);
+	mutex_init(&pcie->hib_l1ss_lock);
 
 	/* Resolve PM dependencies before publishing the PCI hierarchy. */
 	if (pcie->hw->tunneled) {
@@ -6047,6 +6061,22 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (hw->adopt_link)
 		bridge->reset_root_port = apple_pcie_t6050_reset_root_port;
+	if (apple_pcie_s2r_reinit(pcie)) {
+		bridge->pm_state_change = apple_pcie_pm_state_change;
+		pcie->hib_l1ss_pci_nb.notifier_call = apple_pcie_hib_l1ss_pci_notify;
+		ret = bus_register_notifier(&pci_bus_type, &pcie->hib_l1ss_pci_nb);
+		if (ret) {
+			apple_pcie_cleanup(pcie);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev,
+					       apple_pcie_hib_l1ss_pci_unregister,
+					       pcie);
+		if (ret) {
+			apple_pcie_cleanup(pcie);
+			return ret;
+		}
+	}
 	ret = apple_pcie_host_init(pdev, bridge);
 	if (ret) {
 		apple_pcie_cleanup(pcie);
@@ -6674,6 +6704,7 @@ static void apple_pcie_remove(struct platform_device *pdev)
 	 * issuing MMIO to the dead tunneled aperture and wedging the SoC.
 	 */
 	pci_lock_rescan_remove();
+	apple_pcie_hib_free_l1ss(pcie);
 	if (!pcie->bus_stopped) {
 		if (pcie->hw->tunneled)
 			pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
@@ -7731,8 +7762,11 @@ struct apple_pcie_hib_fn {
 	struct pci_saved_state	*state;
 };
 
+#define APPLE_PCIE_L1SS_PCIPM_MASK (PCI_L1SS_CTL1_PCIPM_L1_1 | PCI_L1SS_CTL1_PCIPM_L1_2)
+
 struct apple_pcie_hib_l1ss {
 	struct list_head	entry;
+	struct apple_pcie	*pcie;
 	struct pci_dev		*parent;
 	struct pci_dev		*child;
 	u32			pl_ctl2;
@@ -7743,11 +7777,19 @@ struct apple_pcie_hib_l1ss {
 	u16			fn_lnkctl[8];
 	u8			fn_devfn[8];
 	unsigned int		nfn;
+	bool			active;
+	bool			hw_cleared;
 };
 
 struct apple_pcie_l1ss_walk {
 	struct apple_pcie	*pcie;
 	int			err;
+};
+
+struct apple_pcie_l1ss_restore_ctx {
+	struct apple_pcie_hib_l1ss *saved;
+	bool			rollback;
+	bool			keep_pending;
 };
 
 static int apple_pcie_cfg_read_u32(struct pci_dev *pdev, int pos, u32 *val)
@@ -7826,7 +7868,8 @@ static u16 apple_pcie_hib_orig_fn_lnkctl(const struct apple_pcie_hib_l1ss *saved
 }
 
 static int apple_pcie_link_set_l1ss(const struct apple_pcie_hib_l1ss *saved,
-				    bool enable, bool rollback)
+				    bool enable, bool rollback,
+				    bool core_managed, bool defer_pcipm)
 {
 	struct pci_dev *parent = saved->parent;
 	struct pci_dev *child = saved->child;
@@ -7918,23 +7961,48 @@ static int apple_pcie_link_set_l1ss(const struct apple_pcie_hib_l1ss *saved,
 		ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL2, cl_ctl2);
 		if (ret)
 			goto restore_aspm;
-		ret = apple_pcie_cfg_write_u32(parent, parent->l1ss + PCI_L1SS_CTL1,
-					       pl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
-		if (ret)
-			goto restore_aspm;
-		ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,
-					       cl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
-		if (ret)
-			goto restore_aspm;
-		if ((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1_2_MASK) {
+		if (core_managed) {
+			/*
+			 * Restore timing fields only; the PCI core enables
+			 * policy-permitted L1SS bits and defers PCI-PM L1.1/L1.2
+			 * until both ends of the link are in PCI_D0.
+			 */
 			ret = apple_pcie_cfg_write_u32(parent, parent->l1ss + PCI_L1SS_CTL1,
-						       pl_ctl1);
+						       pl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);
 			if (ret)
 				goto restore_aspm;
 			ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,
-						       cl_ctl1);
+						       cl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);
 			if (ret)
 				goto restore_aspm;
+		} else {
+			/*
+			 * Both ports must be in D0 before enabling PCI-PM
+			 * L1.1/L1.2. The caller decides under hib_l1ss_lock so
+			 * the same decision publishes the pending record.
+			 */
+			if (defer_pcipm) {
+				pl_ctl1 &= ~APPLE_PCIE_L1SS_PCIPM_MASK;
+				cl_ctl1 &= ~APPLE_PCIE_L1SS_PCIPM_MASK;
+			}
+			ret = apple_pcie_cfg_write_u32(parent, parent->l1ss + PCI_L1SS_CTL1,
+						       pl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
+			if (ret)
+				goto restore_aspm;
+			ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,
+						       cl_ctl1 & ~PCI_L1SS_CTL1_L1_2_MASK);
+			if (ret)
+				goto restore_aspm;
+			if ((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1_2_MASK) {
+				ret = apple_pcie_cfg_write_u32(parent, parent->l1ss + PCI_L1SS_CTL1,
+							       pl_ctl1);
+				if (ret)
+					goto restore_aspm;
+				ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,
+							       cl_ctl1);
+				if (ret)
+					goto restore_aspm;
+			}
 		}
 	}
 
@@ -7956,13 +8024,118 @@ restore_aspm:
 	return ret;
 }
 
+static int apple_pcie_hib_disable_l1ss_link(void *data, bool core_managed)
+{
+	struct apple_pcie_hib_l1ss *saved = data;
+	struct apple_pcie *pcie = saved->pcie;
+	struct pci_dev *parent = saved->parent;
+	struct pci_dev *child = saved->child;
+	struct apple_pcie_hib_l1ss *pend, *tmp;
+	int ret;
+
+	ret = apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL2,
+				      &saved->pl_ctl2) ?:
+	      apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL1,
+				      &saved->pl_ctl1) ?:
+	      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL2,
+				      &saved->cl_ctl2) ?:
+	      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL1,
+				      &saved->cl_ctl1);
+	if (ret)
+		return ret;
+
+	ret = apple_pcie_hib_save_lnkctl(parent, saved);
+	if (ret)
+		return ret;
+
+	/* Carry forward deferred PCI-PM bits if an endpoint stayed out of D0 across sleeps. */
+	mutex_lock(&pcie->hib_l1ss_lock);
+	list_for_each_entry_safe(pend, tmp, &pcie->hib_l1ss_pending, entry) {
+		if (pend->parent == parent && pend->child == child) {
+			list_del(&pend->entry);
+			saved->pl_ctl1 |= pend->pl_ctl1 & APPLE_PCIE_L1SS_PCIPM_MASK;
+			saved->cl_ctl1 |= pend->cl_ctl1 & APPLE_PCIE_L1SS_PCIPM_MASK;
+			pci_dev_put(pend->child);
+			pci_dev_put(pend->parent);
+			kfree(pend);
+		}
+	}
+	mutex_unlock(&pcie->hib_l1ss_lock);
+
+	if (!((saved->pl_ctl1 | saved->cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK)) {
+		saved->active = core_managed;
+		return 0;
+	}
+
+	saved->active = true;
+	saved->hw_cleared = true;
+	ret = apple_pcie_link_set_l1ss(saved, false, false, false, false);
+	if (!ret && !core_managed)
+		pci_save_aspm_l1ss_state(child);
+	return ret;
+}
+
+static int apple_pcie_hib_restore_l1ss_link(void *data, bool core_managed)
+{
+	struct apple_pcie_l1ss_restore_ctx *ctx = data;
+	struct apple_pcie_hib_l1ss *saved = ctx->saved;
+	struct apple_pcie *pcie = saved->pcie;
+	struct pci_dev *parent = saved->parent;
+	struct pci_dev *child = saved->child;
+	bool defer;
+	u32 id;
+	int ret;
+
+	if (!saved->hw_cleared)
+		return 0;
+
+	if (apple_pcie_cfg_read_u32(parent, PCI_VENDOR_ID, &id) ||
+	    apple_pcie_cfg_read_u32(child, PCI_VENDOR_ID, &id))
+		return -ENODEV;
+
+	if (core_managed) {
+		ret = apple_pcie_link_set_l1ss(saved, true, ctx->rollback, true,
+					       false);
+		if (ret)
+			pci_warn(child, "failed to restore PCIe L1SS after sleep: %d\n",
+				 ret);
+		return ret;
+	}
+
+	/*
+	 * Decide whether to defer PCI-PM L1.1/L1.2, mask the hardware and
+	 * publish the pending record under one hib_l1ss_lock hold. The D0
+	 * notification takes the same lock, so an endpoint reaching D0 after
+	 * the decision finds the record, and one that reached D0 before it is
+	 * seen as D0 here and applied immediately.
+	 */
+	mutex_lock(&pcie->hib_l1ss_lock);
+	defer = ((saved->pl_ctl1 | saved->cl_ctl1) & APPLE_PCIE_L1SS_PCIPM_MASK) &&
+		(parent->current_state != PCI_D0 || child->current_state != PCI_D0);
+	ret = apple_pcie_link_set_l1ss(saved, true, ctx->rollback, false, defer);
+	if (ret) {
+		mutex_unlock(&pcie->hib_l1ss_lock);
+		pci_warn(child, "failed to restore PCIe L1SS after sleep: %d\n",
+			 ret);
+		return ret;
+	}
+
+	pci_save_aspm_l1ss_state(child);
+	if (defer) {
+		list_add_tail(&saved->entry, &pcie->hib_l1ss_pending);
+		ctx->keep_pending = true;
+	}
+	mutex_unlock(&pcie->hib_l1ss_lock);
+	return 0;
+}
+
 static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 {
 	struct apple_pcie_l1ss_walk *walk = data;
 	struct apple_pcie *pcie = walk->pcie;
 	struct pci_dev *child = NULL, *fn;
 	struct apple_pcie_hib_l1ss *saved;
-	u32 pl_ctl2, pl_ctl1, cl_ctl2, cl_ctl1, id;
+	u32 id;
 	int ret;
 
 	if (!pcie_downstream_port(parent) || !parent->l1ss || !parent->subordinate)
@@ -7994,43 +8167,32 @@ static int apple_pcie_hib_disable_l1ss_cb(struct pci_dev *parent, void *data)
 	if (id == U32_MAX)
 		return 0;
 
-	ret = apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL2, &pl_ctl2) ?:
-	      apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL1, &pl_ctl1) ?:
-	      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL2, &cl_ctl2) ?:
-	      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL1, &cl_ctl1);
-	if (ret) {
-		walk->err = ret;
-		return 1;
-	}
-	if (!((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK))
-		return 0;
-
 	saved = kzalloc_obj(*saved);
 	if (!saved) {
 		walk->err = -ENOMEM;
 		return 1;
 	}
-	saved->pl_ctl2 = pl_ctl2;
-	saved->pl_ctl1 = pl_ctl1;
-	saved->cl_ctl2 = cl_ctl2;
-	saved->cl_ctl1 = cl_ctl1;
-	ret = apple_pcie_hib_save_lnkctl(parent, saved);
-	if (ret) {
-		kfree(saved);
-		walk->err = ret;
-		return 1;
-	}
+	saved->pcie = pcie;
 	saved->parent = pci_dev_get(parent);
 	saved->child = pci_dev_get(child);
 	list_add_tail(&saved->entry, &pcie->hib_l1ss);
 
 	/*
-	 * Clear L1SS downstream before upstream so endpoints entering D3hot do
-	 * not drop the link into L1.2 (CLKREQ# deasserted) ahead of the sleep
-	 * commit. Added to hib_l1ss first so a partial failure rolls back this
-	 * link together with earlier links.
+	 * Snapshot CTL1/LNKCTL and clear L1SS downstream before upstream under
+	 * aspm_lock so endpoints entering D3hot do not drop into L1.2 ahead of
+	 * the sleep commit and eligible managed links keep L1SS suppressed.
+	 * Added to hib_l1ss first so a partial failure rolls back this link
+	 * together with earlier links.
 	 */
-	ret = apple_pcie_link_set_l1ss(saved, false, false);
+	ret = pcie_aspm_l1ss_sleep_begin_locked(parent,
+						apple_pcie_hib_disable_l1ss_link,
+						saved);
+	if (!saved->active) {
+		list_del(&saved->entry);
+		pci_dev_put(child);
+		pci_dev_put(parent);
+		kfree(saved);
+	}
 	if (ret) {
 		walk->err = ret;
 		return 1;
@@ -8045,21 +8207,123 @@ static void apple_pcie_hib_restore_l1ss(struct apple_pcie *pcie, bool rollback)
 	list_for_each_entry_safe(saved, tmp, &pcie->hib_l1ss, entry) {
 		struct pci_dev *parent = saved->parent;
 		struct pci_dev *child = saved->child;
-		u32 id;
+		struct apple_pcie_l1ss_restore_ctx ctx = {
+			.saved = saved,
+			.rollback = rollback,
+		};
 
 		list_del(&saved->entry);
-		if (!apple_pcie_cfg_read_u32(parent, PCI_VENDOR_ID, &id) &&
+		pcie_aspm_l1ss_sleep_end(parent,
+					 apple_pcie_hib_restore_l1ss_link,
+					 &ctx);
+		/*
+		 * A published record belongs to the pending list now; a D0
+		 * notification may already have consumed it.
+		 */
+		if (!ctx.keep_pending) {
+			pci_dev_put(child);
+			pci_dev_put(parent);
+			kfree(saved);
+		}
+	}
+}
+
+static void apple_pcie_pm_state_change(struct pci_host_bridge *bridge,
+				       struct pci_dev *pdev)
+{
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_hib_l1ss *saved, *tmp;
+
+	if (pdev->current_state != PCI_D0)
+		return;
+
+	mutex_lock(&pcie->hib_l1ss_lock);
+	list_for_each_entry_safe(saved, tmp, &pcie->hib_l1ss_pending, entry) {
+		struct pci_dev *parent = saved->parent;
+		struct pci_dev *child = saved->child;
+		u32 id;
+
+		if (parent != pdev && child != pdev)
+			continue;
+
+		if (!pci_dev_is_disconnected(parent) &&
+		    !pci_dev_is_disconnected(child) &&
+		    (parent->current_state != PCI_D0 ||
+		     child->current_state != PCI_D0))
+			continue;
+
+		list_del(&saved->entry);
+		if (!pci_dev_is_disconnected(parent) &&
+		    !pci_dev_is_disconnected(child) &&
+		    !apple_pcie_cfg_read_u32(parent, PCI_VENDOR_ID, &id) &&
 		    !apple_pcie_cfg_read_u32(child, PCI_VENDOR_ID, &id)) {
-			int ret = apple_pcie_link_set_l1ss(saved, true, rollback);
+			int ret = apple_pcie_link_set_l1ss(saved, true, false,
+							   false, false);
 
 			if (ret)
-				pci_warn(child, "failed to restore PCIe L1SS after sleep: %d\n",
+				pci_warn(child, "failed to restore deferred PCIe L1SS: %d\n",
 					 ret);
+			else
+				pci_save_aspm_l1ss_state(child);
 		}
 		pci_dev_put(child);
 		pci_dev_put(parent);
 		kfree(saved);
 	}
+	mutex_unlock(&pcie->hib_l1ss_lock);
+}
+
+static int apple_pcie_hib_l1ss_pci_notify(struct notifier_block *nb,
+					  unsigned long action, void *data)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie,
+					       hib_l1ss_pci_nb);
+	struct pci_dev *pdev = to_pci_dev(data);
+	struct apple_pcie_hib_l1ss *saved, *tmp;
+
+	if (action != BUS_NOTIFY_DEL_DEVICE)
+		return NOTIFY_DONE;
+
+	mutex_lock(&pcie->hib_l1ss_lock);
+	list_for_each_entry_safe(saved, tmp, &pcie->hib_l1ss_pending, entry) {
+		if (saved->parent != pdev && saved->child != pdev)
+			continue;
+		list_del(&saved->entry);
+		pci_dev_put(saved->child);
+		pci_dev_put(saved->parent);
+		kfree(saved);
+	}
+	mutex_unlock(&pcie->hib_l1ss_lock);
+	return NOTIFY_DONE;
+}
+
+static void apple_pcie_hib_free_l1ss(struct apple_pcie *pcie)
+{
+	struct apple_pcie_hib_l1ss *saved, *tmp;
+
+	list_for_each_entry_safe(saved, tmp, &pcie->hib_l1ss, entry) {
+		list_del(&saved->entry);
+		pci_dev_put(saved->child);
+		pci_dev_put(saved->parent);
+		kfree(saved);
+	}
+
+	mutex_lock(&pcie->hib_l1ss_lock);
+	list_for_each_entry_safe(saved, tmp, &pcie->hib_l1ss_pending, entry) {
+		list_del(&saved->entry);
+		pci_dev_put(saved->child);
+		pci_dev_put(saved->parent);
+		kfree(saved);
+	}
+	mutex_unlock(&pcie->hib_l1ss_lock);
+}
+
+static void apple_pcie_hib_l1ss_pci_unregister(void *data)
+{
+	struct apple_pcie *pcie = data;
+
+	bus_unregister_notifier(&pci_bus_type, &pcie->hib_l1ss_pci_nb);
+	apple_pcie_hib_free_l1ss(pcie);
 }
 
 /* A real sleep takes a conventional host's power: its ports are set up again as at probe. */

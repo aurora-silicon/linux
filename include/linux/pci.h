@@ -654,6 +654,7 @@ struct pci_host_bridge {
 	int (*enable_device)(struct pci_host_bridge *bridge, struct pci_dev *dev);
 	void (*disable_device)(struct pci_host_bridge *bridge, struct pci_dev *dev);
 	int (*reset_root_port)(struct pci_host_bridge *bridge, struct pci_dev *dev);
+	void (*pm_state_change)(struct pci_host_bridge *bridge, struct pci_dev *dev);
 	void		*release_data;
 	unsigned int	ignore_reset_delay:1;	/* For entire hierarchy */
 	unsigned int	no_ext_tags:1;		/* No Extended Tags */
@@ -1961,6 +1962,13 @@ int pci_disable_link_state(struct pci_dev *pdev, int state);
 int pci_disable_link_state_locked(struct pci_dev *pdev, int state);
 int pci_enable_link_state(struct pci_dev *pdev, int state);
 int pci_enable_link_state_locked(struct pci_dev *pdev, int state);
+int pcie_aspm_l1ss_sleep_begin_locked(struct pci_dev *pdev,
+				      int (*disable_fn)(void *data,
+							bool core_managed),
+				      void *data);
+int pcie_aspm_l1ss_sleep_end(struct pci_dev *pdev,
+			     int (*restore_fn)(void *data, bool core_managed),
+			     void *data);
 void pcie_no_aspm(void);
 bool pcie_aspm_support_enabled(void);
 bool pcie_aspm_enabled(struct pci_dev *pdev);
@@ -1973,6 +1981,16 @@ static inline int pci_enable_link_state(struct pci_dev *pdev, int state)
 { return 0; }
 static inline int pci_enable_link_state_locked(struct pci_dev *pdev, int state)
 { return 0; }
+static inline int pcie_aspm_l1ss_sleep_begin_locked(struct pci_dev *pdev,
+						    int (*disable_fn)(void *data,
+								      bool core_managed),
+						    void *data)
+{ return disable_fn(data, false); }
+static inline int pcie_aspm_l1ss_sleep_end(struct pci_dev *pdev,
+					   int (*restore_fn)(void *data,
+							     bool core_managed),
+					   void *data)
+{ return restore_fn(data, false); }
 static inline void pcie_no_aspm(void) { }
 static inline bool pcie_aspm_support_enabled(void) { return false; }
 static inline bool pcie_aspm_enabled(struct pci_dev *pdev) { return false; }
