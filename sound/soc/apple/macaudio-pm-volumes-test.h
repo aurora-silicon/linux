@@ -8,6 +8,8 @@
 struct macaudio_pmt_vol {
 	struct soc_mixer_control mc;
 	long value;
+	/* The next read fails once, as the keeping before the sleep can meet */
+	int get_err;
 };
 
 static struct macaudio_pmt_vol *macaudio_pmt_vol(struct snd_kcontrol *kctl)
@@ -26,7 +28,14 @@ static int macaudio_pmt_vol_info(struct snd_kcontrol *kctl, struct snd_ctl_elem_
 
 static int macaudio_pmt_vol_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *uval)
 {
-	uval->value.integer.value[0] = macaudio_pmt_vol(kctl)->value;
+	struct macaudio_pmt_vol *vol = macaudio_pmt_vol(kctl);
+	int err = vol->get_err;
+
+	/* Once only: the clip after the keeping reads the control too */
+	vol->get_err = 0;
+	if (err)
+		return err;
+	uval->value.integer.value[0] = vol->value;
 	return 0;
 }
 
@@ -254,10 +263,82 @@ static void macaudio_pm_volumes_new_owner(struct kunit *test)
 	macaudio_pmt_expect_vols(test, &t, true);
 }
 
+/* The stream's stop, through lock_update_work, as the back-ends trigger it */
+static void macaudio_pmt_bes(struct macaudio_pmt_pm *t, bool active)
+{
+	t->ma->bes_active = active;
+	macaudio_vlimit_update_work(&t->ma->lock_update_work);
+}
+
+/*
+ * A speaker stream runs at suspend-prepare: the stop that the gate queues
+ * takes the lock with pm_quiesced already set, before macaudio_vlimit_pm().
+ * The volumes are kept there, and come back at the first ping after resume.
+ */
+static void macaudio_pm_volumes_lock_taken_before_pm(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+
+	macaudio_pmt_pm_card(test, &t);
+	macaudio_pmt_take(test, &t);
+	macaudio_pmt_bes(&t, true);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+
+	WRITE_ONCE(t.ma->pm_quiesced, true);
+	macaudio_pmt_bes(&t, false);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_NOT_NULL(test, t.ma->pm_volumes);
+	macaudio_pmt_expect_vols(test, &t, true);
+
+	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
+	macaudio_pmt_expect_vols(test, &t, true);
+
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, false);
+	KUNIT_EXPECT_NULL(test, t.ma->pm_volumes);
+	KUNIT_EXPECT_FALSE(test, t.ma->pm_lock_taken);
+	/* Set back, not lost: no lost-lock report follows */
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+}
+
+/*
+ * Keeping the volumes fails: the unlock after resume has nothing to set
+ * back, so the daemon learns that the lock was lost (its next ping fails
+ * with -ETIMEDOUT) and sets the volumes again itself. Once only.
+ */
+static void macaudio_pm_volumes_save_fails(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+
+	macaudio_pmt_pm_card(test, &t);
+	macaudio_pmt_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+
+	macaudio_pmt_vol(t.vols[1])->get_err = -EIO;
+	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	KUNIT_EXPECT_NULL(test, t.ma->pm_volumes);
+	KUNIT_EXPECT_TRUE(test, t.ma->pm_lock_taken);
+	macaudio_pmt_expect_vols(test, &t, true);
+	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
+
+	/* The unlock itself: the volumes stay at the ceiling for the daemon */
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_FALSE(test, t.ma->pm_lock_taken);
+	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+}
+
 static struct kunit_case macaudio_pm_volumes_cases[] = {
 	KUNIT_CASE(macaudio_pm_volumes_restored_after_sleep),
 	KUNIT_CASE(macaudio_pm_volumes_second_sleep_before_ping),
 	KUNIT_CASE(macaudio_pm_volumes_new_owner),
+	KUNIT_CASE(macaudio_pm_volumes_lock_taken_before_pm),
+	KUNIT_CASE(macaudio_pm_volumes_save_fails),
 	{}
 };
 
