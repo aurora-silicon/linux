@@ -4504,6 +4504,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		if (!new || !new->active)
 			return;
 		ret = iomfb_m4_error(dcp);
+		/* The colour matrix goes with this commit's frame, else the one shown. */
+		if (!ret && new->color_mgmt_changed && iomfb_m4_has_ctm(dcp))
+			ret = iomfb_m4_set_ctm(dcp, new->ctm ? new->ctm->data : NULL, !plane);
 		/* A CRTC-only commit publishes no new framebuffer. */
 		if (!ret && plane) {
 			obj = plane->fb ? drm_fb_dma_get_gem_obj(plane->fb, 0) : NULL;

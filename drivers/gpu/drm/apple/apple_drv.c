@@ -1519,8 +1519,11 @@ static int apple_probe_per_dcp(struct device *dev,
 		return ret;
 
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
-	/* T8132 has no qualified CTM transaction. */
-	if (!iomfb_is_m4(dcp_data)) {
+	/* The M4 panel takes a colour matrix and no gamma table. */
+	if (iomfb_is_m4(dcp_data)) {
+		if (iomfb_m4_has_ctm(dcp_data))
+			drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
+	} else {
 		unsigned int gamma_size = dcp_gamma_lut_size(dcp);
 
 		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, gamma_size);

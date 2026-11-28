@@ -87,6 +87,7 @@ def main():
         ('m4', 'm4-common-plane', m4.plane, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-producer-retirement', m4.prepare, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dpms-retirement', m4.blank, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('m4', 'm4-panel-ctm', m4.ctm, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-power-gate', m4.gate, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dart-consumer', m4.dart, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),

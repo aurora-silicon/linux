@@ -218,6 +218,13 @@ struct iomfb_m4 {
 	struct drm_framebuffer *uncertain_fb;
 	struct dcp_m4_frame active_frame;
 	u64 flips, blanks, brightness_swaps;
+	/*
+	 * The internal panel's colour matrix as the firmware takes it, whether
+	 * the CRTC ever asked for one (until then the firmware keeps its own),
+	 * and whether the next frame sends it
+	 */
+	u64 ctm[9];
+	bool ctm_set, ctm_pending;
 	struct delayed_work idle_cache;
 	/*
 	 * Framebuffer references a window let go of, put
@@ -3569,6 +3576,78 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
 	return ret;
 }
 
+/*
+ * Send the pending colour matrix, before the swap that is to show it: set_matrix
+ * (A423) at location 9, as iomfb_v26_6.c does. A refused matrix leaves the
+ * previous one in place and the frame goes out all the same; only a transport
+ * failure, which has failed the session, is returned.
+ */
+static int iomfb_m4_send_ctm(struct iomfb_m4 *dcp)
+{
+	struct iomfb_set_matrix_req req = { .location = 9 };
+	struct iomfb_set_matrix_resp resp = {};
+	int ret;
+
+	lockdep_assert_held(&dcp->lock);
+	if (!dcp->ctm_pending)
+		return 0;
+	memcpy(req.matrix, dcp->ctm, sizeof(req.matrix));
+	ret = dcp_m4_runtime_call(dcp->runtime, 423, false, &req, sizeof(req),
+				  &resp, sizeof(resp));
+	if (ret)
+		return ret;
+	dcp->ctm_pending = false;
+	if (resp.ret)
+		dev_warn_ratelimited(dcp->dev, "colour matrix not applied (status %u)\n",
+				     resp.ret);
+	return 0;
+}
+
+bool iomfb_m4_has_ctm(struct apple_dcp *owner)
+{
+	return owner->v26_6 && !owner->v26_6->external;
+}
+
+/*
+ * The CRTC's colour matrix as of a commit (NULL: none), for the commit's own
+ * frame or, with @present, for the frame on screen presented again. Nothing is
+ * sent until the CRTC first has a matrix, nor for an unchanged one.
+ */
+int iomfb_m4_set_ctm(struct apple_dcp *owner, const struct drm_color_ctm *ctm, bool present)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	u64 fw[9];
+	int ret = 0;
+
+	if (!dcp || dcp->external || !dcp->runtime)
+		return 0;
+	dcp_ctm_to_fw(fw, ctm);
+	mutex_lock(&dcp->lock);
+	if (!ctm && !dcp->ctm_set)
+		goto out;
+	if (!dcp->ctm_set || memcmp(fw, dcp->ctm, sizeof(fw))) {
+		memcpy(dcp->ctm, fw, sizeof(fw));
+		dcp->ctm_set = true;
+		dcp->ctm_pending = true;
+	}
+	/* Blanked or powered down: the frame that powers it up sends it. */
+	if (!present || !dcp->ctm_pending || !dcp->active_frame.dva || dcp->display_off ||
+	    dcp->gated || dcp->powered_off)
+		goto out;
+	ret = dcp_m4_runtime_live(dcp->runtime);
+	if (!ret)
+		ret = iomfb_m4_send_ctm(dcp);
+	if (!ret)
+		ret = iomfb_m4_swap(dcp, &dcp->active_frame);
+	if (ret)
+		dcp_m4_failed(dcp, ret);
+	else
+		iomfb_m4_idle_cache_kick(dcp);
+out:
+	mutex_unlock(&dcp->lock);
+	return ret;
+}
+
 int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 		     dma_addr_t dva, size_t mapped)
 {
@@ -3608,6 +3687,10 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 						     dcp->display_on_us_max);
 		}
 	}
+	if (ret)
+		goto out;
+	/* A new colour matrix goes out before the frame it is to be seen with. */
+	ret = iomfb_m4_send_ctm(dcp);
 	if (ret)
 		goto out;
 	/* Keep the source before the first work descriptor can become visible. */
@@ -3714,6 +3797,9 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
 		ret = -EIO;
 		dcp_m4_failed(dcp, ret);
 	}
+	/* The firmware may lose the colour matrix with the display off. */
+	if (!ret && !on && dcp->ctm_set)
+		dcp->ctm_pending = true;
 	/* A display powered back up starts outside the idle cache. */
 	if (!ret && on) {
 		dcp->runtime->idle_state = 0;

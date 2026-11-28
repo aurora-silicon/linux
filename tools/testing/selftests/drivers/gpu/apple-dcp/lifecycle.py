@@ -1935,6 +1935,7 @@ static int dcp_peer_check_v27(struct apple_dcp *d, struct drm_atomic_commit *s,
     struct drm_crtc_state *c)
 { (void)s; (void)c; assert(d->fw_compat == DCP_FIRMWARE_V_27_0); peer_checks++; return d->peer_check; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
+static bool iomfb_m4_has_ctm(struct apple_dcp *d) { (void)d; assert(false); return false; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
 { (void)d; (void)m; assert(false); return -ENODEV; }
 static unsigned drm_plane_mask(void *p) { (void)p; assert(false); return 0; }

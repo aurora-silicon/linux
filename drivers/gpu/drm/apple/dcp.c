@@ -2404,7 +2404,8 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 		if (!crtc_state)
 			return 0;
-		if (crtc_state->vrr_enabled || crtc_state->ctm ||
+		if (crtc_state->vrr_enabled ||
+		    (crtc_state->ctm && !iomfb_m4_has_ctm(dcp)) ||
 		    crtc_state->degamma_lut || crtc_state->gamma_lut)
 			return -EINVAL;
 		if (!crtc_state->enable)

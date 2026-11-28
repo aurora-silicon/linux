@@ -10,6 +10,7 @@
 struct apple_dcp;
 struct device;
 struct dentry;
+struct drm_color_ctm;
 struct drm_connector;
 struct drm_edid;
 struct drm_display_mode;
@@ -87,6 +88,9 @@ bool iomfb_m4_sleep_stopped(struct apple_dcp *dcp);
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 		     dma_addr_t dva, size_t mapped);
 int iomfb_m4_blank(struct apple_dcp *dcp);
+/* The internal panel's CRTC colour matrix (DRM CTM; NULL: none). */
+bool iomfb_m4_has_ctm(struct apple_dcp *dcp);
+int iomfb_m4_set_ctm(struct apple_dcp *dcp, const struct drm_color_ctm *ctm, bool present);
 int iomfb_m4_suspend(struct apple_dcp *dcp);
 int iomfb_m4_resume(struct apple_dcp *dcp);
 void iomfb_m4_configure_backlight(struct apple_dcp *dcp);
@@ -173,6 +177,12 @@ static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer
 	return -ENODEV;
 }
 static inline int iomfb_m4_blank(struct apple_dcp *dcp) { return -ENODEV; }
+static inline bool iomfb_m4_has_ctm(struct apple_dcp *dcp) { return false; }
+static inline int iomfb_m4_set_ctm(struct apple_dcp *dcp, const struct drm_color_ctm *ctm,
+				   bool present)
+{
+	return -ENODEV;
+}
 static inline int iomfb_m4_suspend(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_resume(struct apple_dcp *dcp) { return -ENODEV; }
 static inline void iomfb_m4_configure_backlight(struct apple_dcp *dcp) { }
