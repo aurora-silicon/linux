@@ -1967,6 +1967,7 @@ static int parse_metadata_luminance(struct dcp_parse_ctx *handle,
 		out->max_luminance = values[0];
 		out->max_fall = values[1];
 		out->min_luminance = values[2];
+		out->has_min_luminance = seen & 4;
 		return 0;
 	}
 	*handle = at;

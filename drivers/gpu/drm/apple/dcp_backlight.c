@@ -10,6 +10,7 @@
 #include <linux/moduleparam.h>
 #include <linux/suspend.h>
 #include <linux/backlight.h>
+#include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -685,7 +686,7 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
  * into the lower one: for 370 nits the lower half became 0x10a, a 4 to 5
  * nit value, and for most levels it left the DAC range altogether.
  */
-static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
+static u32 interpolate(int val, int min, int max, const u32 *tbl, size_t tbl_size)
 {
 	u32 frac, word = 0;
 	u32 interpolated = (tbl_size - 1) * ((val - min) * SCALE_FACTOR) / (max - min);
@@ -1066,16 +1067,33 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	return 0;
 }
 
-/*
- * External displays that report SupportsBacklightControl, such as the Apple
- * Studio Display, take the same swap backlight fields as an integrated
- * panel.  bl_value is then a signed 32-bit level from 0 (dimmest) to S32_MAX
- * (brightest); DCP converts it for the display.  The backlight device belongs
- * to the connector, so userspace can tell which output it dims.
- */
-#define DCP_EXT_BL_MAX	1000
+#define DCP_EXT_BL_MAX		1000
+#define EXT_MIN_NITS		(4U << 16)
+#define EXT_MAX_NITS		(600U << 16)
+#define EXT_MAX_BRIGHTNESS	0x7fe0
 
 /*
+ * Map levels 1..1000 to the sink's 16.16 luminance range. Three square
+ * roots and a cube give (nits / max)^(3/8) with a Q16 intermediate.
+ */
+static u32 dcp_ext_backlight_code(unsigned int level, u32 min, u32 max)
+{
+	u32 nits, root;
+
+	if (!max)
+		max = EXT_MAX_NITS;
+	if (min >= max)
+		min = max > EXT_MIN_NITS ? EXT_MIN_NITS : 0;
+	nits = min + div_u64((u64)(level - 1) * (max - min), DCP_EXT_BL_MAX - 1);
+	root = int_sqrt64(div_u64((u64)nits << 32, max));
+	root = int_sqrt64((u64)root << 16);
+	root = int_sqrt64((u64)root << 16);
+	return ((u64)EXT_MAX_BRIGHTNESS * root * root * root) >> 48;
+}
+
+/*
+ * For external displays with SupportsBacklightControl, the upper half of
+ * bl_value is a 16-bit brightness code. The backlight belongs to the connector.
  * The bl_value for the display on this DCP, or -1 to send none: it has no
  * backlight, or userspace has not chosen a level yet, so the display keeps
  * its own.
@@ -1083,6 +1101,7 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	u32 min = U32_MAX, max = 0;
 	int level;
 
 	if (!connector || !READ_ONCE(dcp->ext_backlight))
@@ -1092,10 +1111,11 @@ s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
 		return -1;
 
 	level = READ_ONCE(connector->bl_level);
-	if (level < 0)
-		return -1;
+	if (level <= 0)
+		return level < 0 ? -1 : 0;
 
-	return div_u64((u64)level * S32_MAX, DCP_EXT_BL_MAX);
+	dcp_firmware_metadata_luminance(dcp, &min, &max);
+	return dcp_ext_backlight_code(level, min, max) << 16;
 }
 
 static int dcp_ext_backlight_update_status(struct backlight_device *bd)

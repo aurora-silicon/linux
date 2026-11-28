@@ -15,8 +15,8 @@ struct dcp_display_metadata {
 	char manufacturer[4];
 	char name[14];
 	char serial_text[14];
-	/* Optional HDR capability: false and zero when not reported */
-	bool pq, static_metadata_type1, bt2020_rgb;
+	/* Optional capabilities: false and zero when not reported. */
+	bool pq, static_metadata_type1, bt2020_rgb, has_min_luminance;
 	u32 max_luminance, max_fall, min_luminance; /* 16.16 cd/m2 */
 	/* DCP_METADATA_DEFAULT_*: what the sink left out, so the EDID leaves undefined */
 	u32 defaults;

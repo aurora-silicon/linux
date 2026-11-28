@@ -514,14 +514,15 @@ int main(int argc, char **argv)
     /* The sink's HDR capability, as the firmware reports it. */
     assert(metadata.pq && metadata.static_metadata_type1 && metadata.bt2020_rgb);
     assert(metadata.max_luminance == 27375011 && metadata.max_fall == 25652679 &&
-           metadata.min_luminance == 5154);
+           metadata.min_luminance == 5154 && metadata.has_min_luminance);
     {
         /* Primaries pass as reported; a missing Min is 0, a missing frame average the Max. */
         struct dcp_parse_ctx c;
         struct dcp_display_metadata s;
         assert(!parse(sink_blob, sizeof(sink_blob), &c) && !parse_display_metadata(&c, &s));
         assert(s.chromaticity[0][0] == 45248 && s.chromaticity[0][1] == 20992);
-        assert(s.max_luminance == 27375011 && s.max_fall == 25652679 && s.min_luminance == 0);
+        assert(s.max_luminance == 27375011 && s.max_fall == 25652679 &&
+               s.min_luminance == 0 && !s.has_min_luminance);
         const struct drm_edid *e = dcp_metadata_edid(&s, &mode);
         assert(!IS_ERR(e));
         const u8 *r = (const u8 *)&e->raw;
