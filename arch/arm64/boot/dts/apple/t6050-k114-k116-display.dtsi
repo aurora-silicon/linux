@@ -109,3 +109,11 @@
 		#size-cells = <0>;
 	};
 };
+
+/*
+ * DisplayPort audio of the external displays. The K boards' ADT describes the same display
+ * engines, display ADMACs and dp-audio nodes as the J714s (dcpext0..3, admac-dispext0..3,
+ * dp-audio0..4), with dcpext0..2 driving displays of their own, so they take the J714s
+ * description as is.
+ */
+#include "t6050-j714s-dpaudio.dtsi"
