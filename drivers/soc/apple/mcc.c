@@ -377,7 +377,8 @@ static int apple_mcc_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&mcc->boot_dma.link);
 	mcc->boot_dma.dev = dev;
 	mcc->boot_dma.lost = apple_mcc_boot_dma_lost;
-	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
+	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8122-mcc") ||
+			of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
 	mcc->ways_off = of_device_is_compatible(dev->of_node, "apple,t8142-mcc");
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
@@ -538,6 +539,7 @@ static const struct dev_pm_ops apple_mcc_pm_ops = {
 };
 
 static const struct of_device_id apple_mcc_of_match[] = {
+	{ .compatible = "apple,t8122-mcc" },
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
 	{ .compatible = "apple,t8142-mcc" },

@@ -167,16 +167,16 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
- const u8 known[][3]={{0xef,0x65,0x17},{0xc2,0x2b,0x27},{0xef,0x65,0x15},{0xc8,0x83,0x15}};
- const u32 sizes[]={0x800000,0x800000,0x200000,0x200000};
- const u8 tolerated[]={0,0,0x1c,0x1c};
+ const u8 known[][3]={{0xef,0x65,0x17},{0xc2,0x2b,0x27},{0xef,0x65,0x15},{0xc8,0x83,0x15},{0xc8,0x83,0x17}};
+ const u32 sizes[]={0x800000,0x800000,0x200000,0x200000,0x800000};
+ const u8 tolerated[]={0,0,0x1c,0x1c,0};
  for(unsigned int i=0;i<ARRAY_SIZE(known);i++){
   const struct apple_qspi_part *part=apple_qspi_find_part(known[i]);
   assert(part&&part->size==sizes[i]&&part->bp_ok==tolerated[i]);
  }
  const u8 unknown[][3]={{0xef,0x65,0x16},{0xef,0x65,0x18},{0xc2,0x2b,0x28},{0xc8,0x60,0x15},{0xef,0x40,0x17},{0,0,0},{0xff,0xff,0xff}};
  for(unsigned int i=0;i<ARRAY_SIZE(unknown);i++)assert(!apple_qspi_find_part(unknown[i]));
- puts("PASS part table: W25Q64, Macronix 2B27, W25Q16 and GD25UF16E with their size and tolerated BP bits; other IDs refused");
+ puts("PASS part table: W25Q64, Macronix 2B27, W25Q16, GD25UF16E and GD25UF64E with their size and tolerated BP bits; other IDs refused");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  /* T8140 (J700) shares the verified policy at its DT nvram window; its data
@@ -308,6 +308,25 @@ int main(void){
  reset();memcpy(jedec,gd25uf16e,3);jedec[1]=0x60;window(0x24000,0x1f4000);arm();
  wire_count=0;o=program(0x24000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
  puts("PASS GD25UF16E J700 part: GigaDevice SR1/SR2/SR3 checks; WIP, WEL, BP3, BP4, CMP, SUS1, SUS2 and other IDs refused");
+ /* J775D GD25UF64E part: GigaDevice checks in its 12-bank partition, as its loader leaves the status. */
+ const u8 gd25uf64e[3]={0xc8,0x83,0x17};
+ reset();memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);arm();
+ memset(data,0x55,sizeof(data));sr[0]=0x00;sr[1]=0x02;sr[2]=0x20;
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x700000,data,256)&&sr[0]==0x00&&sr[1]==0x02&&sr[2]==0x20);
+ erase.addr.val=0x7bf000;memset(flash+0x7bf000,0,4096);
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20));
+ for(unsigned int i=0;i<4096;i++)assert(flash[0x7bf000+i]==0xff);
+ /* The part tolerates no BP bits: BP0 is refused before WREN. */
+ reset();memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);arm();
+ sr[0]=0x04;sr[1]=0x02;sr[2]=0x20;wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x02));
+ /* First-write qualification on the J775D 12-bank GD25UF64E window (SFDP + bank header). */
+ reset();q.qualified=0;memcpy(jedec,gd25uf64e,3);window(0x700000,0x7c0000);
+ store_at(0x710000);arm();memset(data,0x55,sizeof(data));
+ sr[0]=0x00;sr[1]=0x02;sr[2]=0x20;wire_count=0;o=program(0x700000,256,data);
+ assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x5a)&&sent(0x02)&&q.qualified);
+ puts("PASS GD25UF64E J775D part: GigaDevice SR1/SR2/SR3 checks with SR1 0x00, SR2 0x02, SR3 0x20; qualify and BP0 refusal");
  /* BP0 protects the top 64 KiB of a 2 MiB part, the J700 window's last 16 KiB: refused before WREN there. */
  reset();memcpy(jedec,w25q16,3);window(0x24000,0x1f4000);arm();sr[0]=0x04;
  wire_count=0;o=program(0x1f0000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
@@ -468,6 +487,8 @@ def main():
             ('gd-cmp', '!(sr2 & 0xc4)', '!(sr2 & 0x84)'),
             ('j700-gd-id', 'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x15 }',
              'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x16 }'),
+            ('j775d-gd-id', 'APPLE_QSPI_JEDEC_GD25UF64E\t{ 0xc8, 0x83, 0x17 }',
+             'APPLE_QSPI_JEDEC_GD25UF64E\t{ 0xc8, 0x83, 0x18 }'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),

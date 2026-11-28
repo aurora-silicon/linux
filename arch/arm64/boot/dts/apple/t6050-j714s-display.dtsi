@@ -16,7 +16,6 @@
  */
 
 &dcpext1 {
-	apple,dcp-index = <2>;
 	apple,connector-type = "USB-C";
 	apple,dptx-die = <0>;
 	/*
@@ -88,7 +87,6 @@
 };
 
 &dcpext2 {
-	apple,dcp-index = <3>;
 	apple,connector-type = "USB-C";
 	apple,dptx-die = <0>;
 	apple,typec-dptx-phys = <2 1 0>;
@@ -145,7 +143,6 @@
 };
 
 &dcpext3 {
-	apple,dcp-index = <4>;
 	apple,connector-type = "USB-C";
 	apple,dptx-die = <0>;
 };
@@ -272,26 +269,11 @@
 	};
 };
 
-/* Scanout and PIODMA share the first register window, as on dispext0 */
-&dispext1_dart {
-	reg = <0x3 0x92300000 0x0 0xc000>;
-};
-
-&dispext2_dart {
-	reg = <0x3 0x02300000 0x0 0xc000>;
-};
-
-&dispext3_dart {
-	reg = <0x3 0x06300000 0x0 0xc000>;
-};
-
 &atc2_xbar {
 	status = "okay";
 };
 
 &atc1_dpxbar {
-	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "okay";
 };
 
@@ -329,8 +311,6 @@
 
 /* The left-back crossbar (the inventory's, as atc1_dpxbar) and the PHY's tunnel clock gates */
 &atc0_dpxbar {
-	power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "disabled";
 };
 

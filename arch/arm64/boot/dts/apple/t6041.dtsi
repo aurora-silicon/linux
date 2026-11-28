@@ -20,7 +20,21 @@
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
+/* The loader supplies the ANE firmware and reservations. */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
 &ane {
+	status = "okay";
 	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
 			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
@@ -486,6 +500,198 @@
 		#address-cells = <0>;
 		status = "disabled";
 	};
+
+	pmgr_disp: power-management@502290000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x5 0x02290000 0x0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+
+	/*
+	 * The CPU power-gate enables, in /arm-io/pmgr at 0x50282c000, one word
+	 * per core: E core 0 at +0x0 and P0 core 0 (the boot core) at +0x40,
+	 * matching the two wake gates t6041-sleep restores on resume. iBoot
+	 * leaves the boot core's word clear, so P0 never powers down in WFI
+	 * unless set early in boot.
+	 */
+	cluster_pwrgate: power-gate@50282c000 {
+		compatible = "apple,t6041-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x5 0x0282c000 0x0 0x4>,
+		      <0x5 0x0282c040 0x0 0x4>;
+	};
+
+	/*
+	 * Suspend-to-RAM at EL2 through aura's S2R mailbox; without the mailbox
+	 * it stays out. Stays disabled at the SoC level so boards without
+	 * qualified deep sleep (such as J575c) remain on s2idle; qualified board
+	 * trees wire apple,apcie and apple,atc-phys and enable it.
+	 */
+	t6041_sleep: sleep-controller@508304000 {
+		compatible = "apple,t6041-sleep";
+		reg = <0x5 0x08304000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x4000>,
+		      <0x5 0x0282c000 0x0 0x4000>,
+		      <0x5 0x02888000 0x0 0x4000>,
+		      <0x5 0x0836c000 0x0 0x4000>,
+		      <0x5 0x08330000 0x0 0x4000>,
+		      <0x5 0x08904000 0x0 0x4>,
+		      <0x5 0x00038000 0x0 0x4000>,
+		      <0x5 0x029dc000 0x0 0x880>,
+		      <0x5 0x022d0000 0x0 0x880>,
+		      <0x5 0x04800000 0x0 0xb0000>,
+		      <0x5 0x003c0000 0x0 0x20000>,
+		      <0x5 0x0020c000 0x0 0x800>,
+		      <0x5 0x08004000 0x0 0x58>,
+		      <0x2 0x20000000 0x0 0x200000>,
+		      <0x2 0x22000000 0x0 0x200000>,
+		      <0x2 0x24000000 0x0 0x200000>,
+		      <0x2 0x26000000 0x0 0x200000>,
+		      <0x2 0x28000000 0x0 0x200000>,
+		      <0x2 0x2a000000 0x0 0x200000>,
+		      <0x2 0x2c000000 0x0 0x200000>,
+		      <0x2 0x2e000000 0x0 0x200000>,
+		      <0x2 0x20200000 0x0 0x601000>,
+		      <0x2 0x22200000 0x0 0x601000>,
+		      <0x2 0x24200000 0x0 0x601000>,
+		      <0x2 0x26200000 0x0 0x601000>,
+		      <0x2 0x28200000 0x0 0x601000>,
+		      <0x2 0x2a200000 0x0 0x601000>,
+		      <0x2 0x2c200000 0x0 0x601000>,
+		      <0x2 0x2e200000 0x0 0x601000>,
+		      <0x4 0x03000100 0x0 0x10>,
+		      <0x3 0xa3000100 0x0 0x10>,
+		      <0x6 0x03000100 0x0 0x10>,
+		      <0x6 0x07000100 0x0 0x10>,
+		      <0x3 0x07000100 0x0 0x10>,
+		      <0x4 0x0b000100 0x0 0x10>,
+		      <0x2 0x80000100 0x0 0x10>,
+		      <0x2 0x82000100 0x0 0x10>,
+		      <0x2 0x84000100 0x0 0x10>,
+		      <0x4 0x86000100 0x0 0x10>;
+		reg-names = "ps-aop",
+			    "cluster", "pwrgate", "cpu-start", "wdt",
+			    "aon-misc", "commit", "clk-mux", "ka-pmgr",
+			    "ka-east", "pmc", "ptd", "perf", "wake",
+			    "amcc0", "amcc1", "amcc2", "amcc3",
+			    "amcc4", "amcc5", "amcc6", "amcc7",
+			    "dcs0", "dcs1", "dcs2", "dcs3",
+			    "dcs4", "dcs5", "dcs6", "dcs7",
+			    "axi2af-disp", "axi2af-dispext0",
+			    "axi2af-dispext1", "axi2af-dispext2",
+			    "axi2af-dispext3", "axi2af-ans",
+			    "axi2af-avd", "axi2af-venc0",
+			    "axi2af-venc1", "axi2af-jpg";
+		apple,pinctrl = <&pinctrl>;
+		apple,pinctrl-skip-pins = <190 191 192>;
+		apple,spmi-buses = <&nub_spmi0>, <&nub_spmi_a0>;
+		/* ADT ap-wake-sources unmasked across S2R */
+		apple,wake-enable = <13 15 25 27 28 41 44 48 50 51 52 53 55
+				     101 106 126 127 128 129 130 131 132 133
+				     155 167>;
+		apple,sleep-off-domains = <&ps_venc1_me1>, <&ps_venc0_me1>, <&ps_venc1_pipe5>,
+					  <&ps_venc1_pipe4>, <&ps_venc1_me0>, <&ps_venc0_pipe5>,
+					  <&ps_venc0_pipe4>, <&ps_venc0_me0>, <&ps_apcie_phy_sw>,
+					  <&ps_ane_base>, <&ps_venc1_dma>, <&ps_venc0_dma>,
+					  <&ps_scodec_streaming>, <&ps_msr1_ase_core>,
+					  <&ps_msr0_ase_core>, <&ps_apcie_sys_st1>,
+					  <&ps_apcie_sys_st0>, <&ps_apcie_sys_gp>, <&ps_ane_td>,
+					  <&ps_ane_mpm>, <&ps_ane_cpu>, <&ps_gfx>, <&ps_venc1_sys>,
+					  <&ps_venc0_sys>, <&ps_spi5>, <&ps_spi4>, <&ps_spi3>,
+					  <&ps_spi2>, <&ps_spi1>, <&ps_spi0>, <&ps_scodec>,
+					  <&ps_rom>, <&ps_qspi>, <&ps_prores>, <&ps_pms_fpwm4>,
+					  <&ps_pms_fpwm3>, <&ps_pms_fpwm2>, <&ps_pms_fpwm1>,
+					  <&ps_pms_fpwm0>, <&ps_pmgr_soc_ocla>, <&ps_nub_spi0>,
+					  <&ps_nub_ocla>, <&ps_msr1>, <&ps_msr0>, <&ps_msg>,
+					  <&ps_jpg>, <&ps_ispsens0>, <&ps_isp_sys>, <&ps_i2c8>,
+					  <&ps_i2c7>, <&ps_i2c6>, <&ps_i2c5>, <&ps_i2c4>,
+					  <&ps_i2c3>, <&ps_i2c2>, <&ps_i2c1>, <&ps_i2c0>,
+					  <&ps_fpwm2>, <&ps_fpwm1>, <&ps_fpwm0>, <&ps_dpa4>,
+					  <&ps_dpa3>, <&ps_dpa2>, <&ps_dpa1>, <&ps_dpa0>,
+					  <&ps_avd_sys>, <&ps_ans>, <&ps_apcie_st1>,
+					  <&ps_apcie_st0>, <&ps_apcie_gp>, <&ps_ap_tmm>,
+					  <&ps_ane_sys>, <&ps_afr>;
+		apple,atc-off-domains = <&ps_atc0_phymxwrap>, <&ps_atc1_phymxwrap>,
+					<&ps_atc2_phymxwrap>, <&ps_atc3_phymxwrap>,
+					<&ps_atc0_usb>, <&ps_atc1_usb>,
+					<&ps_atc2_usb>, <&ps_atc3_usb>,
+					<&ps_atc0_usb_aon>, <&ps_atc1_usb_aon>,
+					<&ps_atc2_usb_aon>, <&ps_atc3_usb_aon>,
+					<&ps_atc0_common_dp>, <&ps_atc1_common_dp>,
+					<&ps_atc2_common_dp>, <&ps_atc3_common_dp>,
+					<&ps_atc0_cio_usb>, <&ps_atc0_cio_pcie>,
+					<&ps_atc0_pcie>, <&ps_atc0_cio>,
+					<&ps_atc1_cio_usb>, <&ps_atc1_cio_pcie>,
+					<&ps_atc1_pcie>, <&ps_atc1_cio>,
+					<&ps_atc2_cio_usb>, <&ps_atc2_cio_pcie>,
+					<&ps_atc2_pcie>, <&ps_atc2_cio>,
+					<&ps_atc3_cio_usb>, <&ps_atc3_cio_pcie>,
+					<&ps_atc3_pcie>, <&ps_atc3_cio>,
+					<&ps_atc0_common>, <&ps_atc1_common>,
+					<&ps_atc2_common>, <&ps_atc3_common>;
+		apple,sleep-auto-domains = <&ps_fab_gw_1>, <&ps_fab_afr>, <&ps_fab4_soc>,
+					   <&ps_amcc4>, <&ps_amcc5>, <&ps_amcc6>, <&ps_amcc7>,
+					   <&ps_amcc12>, <&ps_amcc13>, <&ps_amcc14>, <&ps_amcc15>,
+					   <&ps_amcc20>, <&ps_amcc21>, <&ps_amcc22>, <&ps_amcc23>,
+					   <&ps_fab0_soc>, <&ps_amcc0>, <&ps_amcc1>, <&ps_amcc2>,
+					   <&ps_amcc3>, <&ps_amcc8>, <&ps_amcc9>, <&ps_amcc10>,
+					   <&ps_amcc11>, <&ps_amcc16>, <&ps_amcc17>, <&ps_amcc18>,
+					   <&ps_amcc19>, <&ps_fab1_soc>, <&ps_fab6_soc>,
+					   <&ps_fab7_soc>, <&ps_nub_sram>, <&ps_dcs_23>, <&ps_sep>,
+					   <&ps_dcs_19>, <&ps_amcc24>, <&ps_amcc25>, <&ps_amcc26>,
+					   <&ps_amcc27>, <&ps_amcc28>, <&ps_amcc29>, <&ps_amcc30>,
+					   <&ps_amcc31>;
+		apple,sleep-auto-clkgate-domains = <&ps_nub_spmi_a0>, <&ps_nub_spmi_a1>,
+						   <&ps_nub_spmi_a2>, <&ps_fab3_soc>, <&ps_pmc>,
+						   <&ps_nub_spmi0>, <&ps_nub_spmi1>,
+						   <&ps_nub_spmi2>, <&ps_nub_spmi3>,
+						   <&ps_nub_spmi4>, <&ps_dcs_04>, <&ps_dcs_06>,
+						   <&ps_dcs_07>, <&ps_dcs_12>, <&ps_dcs_13>,
+						   <&ps_dcs_14>, <&ps_dcs_15>, <&ps_dcs_20>,
+						   <&ps_dcs_21>, <&ps_dcs_22>, <&ps_dcs_00>,
+						   <&ps_dcs_01>, <&ps_dcs_02>, <&ps_dcs_03>,
+						   <&ps_dcs_08>, <&ps_dcs_09>, <&ps_dcs_10>,
+						   <&ps_dcs_16>, <&ps_dcs_17>, <&ps_dcs_18>,
+						   <&ps_dcs_24>, <&ps_dcs_25>, <&ps_dcs_26>,
+						   <&ps_dcs_27>, <&ps_dcs_28>, <&ps_dcs_29>,
+						   <&ps_dcs_30>, <&ps_dcs_31>;
+		apple,sleep-auto-active-domains = <&ps_gpx>, <&ps_pms>, <&ps_afi>, <&ps_afc>,
+						  <&ps_fab_gw_0>, <&ps_debug_gated>, <&ps_nub_aon>,
+						  <&ps_nub_fabric>, <&ps_debug_switch>,
+						  <&ps_fab2_soc>, <&ps_pmp>, <&ps_pms_sram>,
+						  <&ps_fab5_soc>, <&ps_dcs_05>, <&ps_dcs_11>,
+						  <&ps_sbr>;
+		apple,sleep-keep-on-domains = <&ps_dwi>, <&ps_nub_spmi_ahb>, <&ps_nub_gpio>,
+					      <&ps_aic>, <&ps_pms_c1ppt>, <&ps_soc_dpe>, <&ps_sio>,
+					      <&ps_sio_cpu>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>,
+					      <&ps_aes>, <&ps_gpio>, <&ps_uart_n>, <&ps_uart0>,
+					      <&ps_uart1>, <&ps_uart2>, <&ps_uart3>, <&ps_uart4>,
+					      <&ps_uart5>, <&ps_uart6>;
+		apple,cpu-domains = <&ps_ecpu_0>, <&ps_ecpu_1>, <&ps_ecpu_2>, <&ps_ecpu_3>,
+				    <&ps_pcpu0_0>, <&ps_pcpu0_1>, <&ps_pcpu0_2>, <&ps_pcpu0_3>,
+				    <&ps_pcpu0_4>, <&ps_pcpu0_5>, <&ps_pcpu1_0>, <&ps_pcpu1_1>,
+				    <&ps_pcpu1_2>, <&ps_pcpu1_3>, <&ps_pcpu1_4>, <&ps_pcpu1_5>;
+		apple,cpm-domains = <&ps_ecpm>, <&ps_pcpm0>, <&ps_pcpm1>;
+		apple,sep-domain = <&ps_sep>;
+		apple,spmi-a0-domain = <&ps_nub_spmi_a0>;
+		apple,atc-common-domains = <&ps_atc0_common>, <&ps_atc1_common>, <&ps_atc2_common>,
+					   <&ps_atc3_common>;
+		apple,atc-fabric-domain = <&ps_fab2_soc>;
+		apple,atc-afi-domain = <&ps_afi>;
+		apple,apcie-domains = <&ps_ans>, <&ps_apcie_gp>, <&ps_apcie_sys_gp>,
+				      <&ps_apcie_st0>, <&ps_apcie_sys_st0>, <&ps_apcie_st1>,
+				      <&ps_apcie_sys_st1>, <&ps_apcie_phy_sw>;
+		apple,commit-sio-domains = <&ps_sio>, <&ps_sio_cpu>;
+		apple,commit-periph-domains = <&ps_i2c6>, <&ps_i2c3>, <&ps_i2c2>, <&ps_i2c1>,
+					      <&ps_spi2>;
+		apple,axi2af-domains = <&ps_atc0_common>, <&ps_atc1_common>, <&ps_atc2_common>,
+				       <&ps_atc3_common>, <&ps_disp_sys>, <&ps_dispext0_sys>,
+				       <&ps_dispext1_sys>, <&ps_dispext2_sys>, <&ps_dispext3_sys>,
+				       <&ps_ans>, <&ps_avd_sys>, <&ps_venc0_sys>, <&ps_venc1_sys>,
+				       <&ps_jpg>, <&ps_apcie_sys_gp>;
+		apple,full-part-detect-domains = <&ps_amcc24>, <&ps_amcc28>;
+		status = "disabled";
+	};
 };
 
 &pmgr {
@@ -496,7 +702,6 @@
 		#reset-cells = <0>;
 		label = "aes";
 		power-domains = <&ps_sio>;
-		apple,always-on;
 		status = "disabled";
 	};
 };
@@ -579,6 +784,20 @@
 };
 
 /*
+ * What the SEP's DART gets around a sleep, as offset and value: the writes T8140's has
+ * (t8140.dtsi), which the J616C has slept with. The SEP driver saves the DART with them
+ * before it tells the enclave to sleep at suspend.
+ */
+&sep_dart {
+	apple,sleep-prepare = <0x80 0xa102>, <0x704 0xffffffff>;
+	apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+			      <0x220 0xf0f0f>, <0x224 0x80808>,
+			      <0x300 0x1>, <0x318 0x1>;
+	apple,sleep-restore-late = <0x80 0x8000>, <0x228 0x3f3f3f3f>,
+				   <0x22c 0x1010101>;
+};
+
+/*
  * The ISP DART's address filter, from the full-die J616c ADT's dart-isp0
  * dapf-instance-0 (its sixth reg window), in the ADT's order: the
  * firmware's PMGR, PMP and DSID windows, with one window for each of the
@@ -622,6 +841,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "venc1_sys";
+		power-domains = <&ps_fab0_soc>;
 		status = "disabled";
 	};
 
@@ -721,21 +941,11 @@
 
 /*
  * First ProRes engine (ADT /arm-io/apr0) and its DART, from the J616c ADT.
- * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0,
- * SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper and aux windows.
+ * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0 in
+ * t6041-pmgr.dtsi, SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper
+ * and aux windows.
  */
 &pmgr_aux {
-	ps_fab1_soc: power-controller@2d0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x2d0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab1_soc";
-		power-domains = <&ps_afi>;
-		apple,always-on;
-		status = "disabled";
-	};
-
 	ps_scodec: power-controller@328 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x328 4>;
@@ -824,5 +1034,37 @@
 };
 
 &ave {
+	status = "okay";
+};
+
+#include "t6041-pmgr.dtsi"
+#include "t6041-sleep-pmgr.dtsi"
+
+/* The loader uses this alias to enable SIO after placing its firmware. */
+/ {
+	aliases {
+		sio = &sio;
+	};
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
 	status = "okay";
 };

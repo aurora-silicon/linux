@@ -2709,6 +2709,7 @@ F:	Documentation/devicetree/bindings/dma/apple,sio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,*
 F:	Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
 F:	Documentation/devicetree/bindings/sound/trivial-codec.yaml
+F:	drivers/dma/apple-sio-msg-test.c
 F:	drivers/dma/apple-sio-probe-test.c
 F:	drivers/dma/apple-sio-probe-test.dtso
 F:	drivers/dma/apple-sio-t6030-test.dtso
@@ -2785,6 +2786,7 @@ F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
 F:	drivers/bluetooth/hci_bcm4377_test.c
+F:	tools/asahi/bcm4377-completion-tests.py
 F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
@@ -2812,7 +2814,9 @@ F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
 F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
+F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
+F:	drivers/nvmem/apple-spmi-nvmem.kunitconfig
 F:	drivers/phy/apple/
 F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
@@ -2890,6 +2894,7 @@ S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
 F:	drivers/media/platform/apple/scaler/
+F:	tools/media/apple-scaler/
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>

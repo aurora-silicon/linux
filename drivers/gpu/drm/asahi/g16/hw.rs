@@ -4,29 +4,114 @@
     reason = "Firmware layout catalog also describes fields used by host wire regressions."
 )]
 
-//! T8132 (G16G) hardware and firmware-ABI constants (layout values are shared by several
+//! Classic GPU hardware and firmware-ABI constants (layout values are shared by several
 //! modules; change one only together with its users). The tuned policy values are in
 //! [`tuning`].
 
 use core::ops::Range;
 
-/// Identification register values of a qualified G16G.
+/// Identification register values of a qualified GPU.
 pub(crate) struct HwId {
     /// SGX identity word (`sgx + 0xd04000`).
     pub(crate) version: u32,
     /// SGX layout word (`sgx + 0xd04010`).
     pub(crate) counts: u32,
+    /// Bits of `version` and `counts` that must match; the others are not qualified.
+    pub(crate) version_mask: u32,
+    pub(crate) counts_mask: u32,
+}
+
+impl HwId {
+    /// Mask both words exactly; rows give their values with `..HwId::EXACT`.
+    pub(crate) const EXACT: HwId = HwId {
+        version: 0,
+        counts: 0,
+        version_mask: u32::MAX,
+        counts_mask: u32::MAX,
+    };
+
+    /// Whether the identification registers read `version` and `counts`.
+    pub(crate) const fn matches(&self, version: u32, counts: u32) -> bool {
+        (version ^ self.version) & self.version_mask == 0
+            && (counts ^ self.counts) & self.counts_mask == 0
+    }
 }
 
 pub(crate) use crate::fwid::FirmwareBuild;
 
+/// Static configuration of a SoC supported by this backend.
+pub(crate) struct Config {
+    /// SoC identifier reported to userspace.
+    pub(crate) chip_id: u32,
+    /// GPU generation reported to userspace.
+    pub(crate) gpu_generation: u32,
+    pub(crate) gpu_hal_generation: u32,
+    /// GPU variant reported to userspace.
+    pub(crate) gpu_variant: crate::hw::GpuVariant,
+    /// GPU revision reported to userspace.
+    pub(crate) gpu_revision: u32,
+    /// Input address bits translated by each UAT root.
+    pub(crate) uat_ias: u32,
+    /// Output (physical) address bits of the UAT.
+    pub(crate) uat_oas: u32,
+    /// Clusters and cores per cluster.
+    pub(crate) num_clusters: u32,
+    pub(crate) num_cores_per_cluster: u32,
+    /// Qualified identification register values.
+    pub(crate) hw_ids: &'static [HwId],
+    /// Compatible of the original ADT SGX node.
+    pub(crate) adt_compatible: &'static [u8],
+    /// NUL-terminated compatible of the native display subsystem supplier.
+    pub(crate) display_compatible: &'static [u8],
+    /// Qualified boot-loader handoffs.
+    pub(crate) layouts: &'static [&'static FwLayout],
+    /// Qualified firmware builds.
+    pub(crate) firmware: &'static [FirmwareBuild],
+    /// Whether this compatible also has a legacy driver.
+    pub(crate) needs_handoff_marker: bool,
+    /// GPU node property holding the boot loader's handoff version (the handoff marker).
+    pub(crate) handoff_property: &'static core::ffi::CStr,
+    /// `apple,firmware-compat` values this backend owns on a compatible that another backend
+    /// also serves; empty when the handoff layout alone selects the backend.
+    pub(crate) firmware_compat: &'static [[u32; 3]],
+    /// T8132 retains the PMP bridge even on firmware that does not send an AGX vote.
+    pub(crate) prepare_pmp: bool,
+    /// PMGR register offset of the GFX domain.
+    pub(crate) power_offset: u32,
+    /// Number of valid fault-bank selectors in the SGX status window.
+    pub(crate) fault_banks: usize,
+    /// GFXCAXI2AF needs host enable writes before the 27.2 firmware starts.
+    pub(crate) axi2af: bool,
+    /// Offsets to zero, in order, in the host block before InitData on 27.2.
+    pub(crate) host_block_zero_order: &'static [usize],
+    /// Whether the host probes scratch and raises the ready word after zeroing.
+    pub(crate) host_block_ready: bool,
+    /// Whether the TVM gate and firmware warm restart are supported.
+    pub(crate) deep_sleep: bool,
+    /// Whether render work accepts scratch for ray queries.
+    pub(crate) supports_render_scs: bool,
+    /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
+    pub(crate) cross_engine_hold: bool,
+    /// Largest tile buffer a render command may use, in bytes per tile (sample size times
+    /// utile width, utile height and samples). Reported as DRM_ASAHI_FEATURE_TILE_BUFFER_48K
+    /// when it reaches [`sizes::TILE_BUFFER_48K`].
+    pub(crate) max_tile_buffer: u32,
+}
+
+impl Config {
+    pub(crate) const fn core_slots(&self) -> u32 {
+        self.num_clusters * self.num_cores_per_cluster
+    }
+}
+
 /// The J713/J773g T8132 configuration. Hardware admission also checks the exact TEXT image.
 pub(crate) mod t8132 {
-    use super::super::Config;
-    use super::{FirmwareBuild, HwId};
+    use super::{Config, FirmwareBuild, HwId, FW_25G83, FW_26B123};
 
     pub(crate) const CONFIG: Config = Config {
         chip_id: 0x8132,
+        gpu_generation: 16,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_200,
         gpu_variant: crate::hw::GpuVariant::G,
         gpu_revision: 0x10,
         uat_ias: 42,
@@ -36,8 +121,31 @@ pub(crate) mod t8132 {
         hw_ids: &[HwId {
             version: 0x0a021100,
             counts: 0x0011010a,
+            ..HwId::EXACT
         }],
+        adt_compatible: b"gpu,t8132",
+        display_compatible: b"apple,t8132-display-subsystem\0",
+        layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
+            FirmwareBuild {
+                // 25G83 (build 2 of armfw_g16g.im4p) as iBoot loads it on a T8132 Air. Besides
+                // the entropy, iBoot fills a header field, the record block the header points at
+                // (0x5c8df, 0x231) and the tunables block its TUNS/TUNZ records describe
+                // (0x5cb10, 0x6a0). With those zeroed, the loaded image hashes the same as the
+                // TEXT of the firmware file.
+                name: "Apple GFX 25G83 (normalized loaded image, boot-filled ranges)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[(0x23c, 8), (0x5c8df, 0x231), (0x5cb10, 0x6a0)],
+                text_sha256: [
+                    0x3a, 0x41, 0xe4, 0x77, 0xb1, 0x2d, 0x48, 0x8d, 0x0c, 0x27, 0x7d, 0x1d, 0x30,
+                    0x6b, 0x60, 0x88, 0x5e, 0x67, 0x5e, 0xc7, 0x98, 0x54, 0xca, 0xaf, 0x90, 0x29,
+                    0x35, 0xc2, 0x7e, 0xf8, 0x76, 0x5e,
+                ],
+            },
+            // The per-board entries below stay until an 8-core and a 10-core J713 on 26.6.2
+            // have booted with only the normalized entry above.
             FirmwareBuild {
                 name: "Apple GFX 25G83 (normalized loaded image)",
                 text_size: 0x60000,
@@ -126,6 +234,20 @@ pub(crate) mod t8132 {
                 ],
             },
         ],
+        needs_handoff_marker: false,
+        handoff_property: super::G16_HANDOFF_PROPERTY,
+        firmware_compat: &[],
+        prepare_pmp: true,
+        power_offset: 0x250,
+        fault_banks: 8,
+        axi2af: true,
+        host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
+        host_block_ready: true,
+        deep_sleep: true,
+        supports_render_scs: true,
+        cross_engine_hold: false,
+        // macOS 26B123 programs 48 KiB tiles (MSAA4, 32x16 utiles) on this GPU.
+        max_tile_buffer: super::sizes::TILE_BUFFER_48K,
     };
 
     /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
@@ -235,6 +357,217 @@ pub(crate) mod t8132 {
     ];
 }
 
+/// T6030 (G15S), qualified with the b000 image loaded on J516s.
+pub(crate) mod t6030 {
+    use super::super::fw::initdata;
+    use super::{Config, FirmwareBuild, FwLayout, HwId, Scratch, FW_26B123, HOST_BLOCK, UPPER};
+
+    pub(crate) const CONFIG: Config = Config {
+        chip_id: 0x6030,
+        gpu_generation: 15,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
+        gpu_variant: crate::hw::GpuVariant::S,
+        gpu_revision: 0x11,
+        uat_ias: 42,
+        uat_oas: 42,
+        num_clusters: 2,
+        num_cores_per_cluster: 10,
+        hw_ids: &[HwId {
+            version: 0x07031100,
+            counts: 0x00110209,
+            ..HwId::EXACT
+        }],
+        adt_compatible: b"gpu,t6030",
+        display_compatible: b"apple,t6030-display-subsystem\0",
+        layouts: &[&LAYOUT],
+        firmware: &[FirmwareBuild {
+            name: "Apple GFX 26B123 G15S (build b000, iBoot-filled ranges zeroed)",
+            text_size: LAYOUT.text_size,
+            data_size: LAYOUT.data_size,
+            entropy: &[[0x5be64, 0x5bf47]],
+            boot_filled: BOOT_FILLED_B000,
+            text_sha256: [
+                0x31, 0xc7, 0xc7, 0x7a, 0x24, 0x85, 0x88, 0x7b, 0x66, 0x2e, 0xa2, 0x2d, 0xe6, 0xcc,
+                0xc5, 0xf9, 0xf6, 0x87, 0xa2, 0x4b, 0x07, 0xbd, 0xbd, 0xdf, 0x95, 0x21, 0x1a, 0x06,
+                0xcd, 0x5f, 0x57, 0x3b,
+            ],
+        }],
+        needs_handoff_marker: true,
+        handoff_property: super::G16_HANDOFF_PROPERTY,
+        firmware_compat: &[],
+        prepare_pmp: false,
+        power_offset: 0x110,
+        fault_banks: 2,
+        axi2af: false,
+        // Host-block control words zeroed read-before-write at cold 26B123 startup:
+        // +0x0000 is the host device-control generation word; +0x1808 and +0x3010 are the
+        // per-pipe host-block control words cleared before endpoints 0x20/0x21 start.
+        host_block_zero_order: &[0, 0x1808, 0x3010],
+        host_block_ready: false,
+        deep_sleep: false,
+        supports_render_scs: false,
+        cross_engine_hold: true,
+        max_tile_buffer: super::sizes::TILE_BUFFER_32K,
+    };
+
+    const LAYOUT: FwLayout = FwLayout {
+        name: "26B123 G15S",
+        segment_vas: &[UPPER, UPPER + 0x60000, UPPER + 0x18c000],
+        text_size: 0x60000,
+        data_size: 0x134000,
+        abi: super::FwAbi::V26B123G15S,
+        initdata: &initdata::G15S_26B123,
+        scratch: Scratch {
+            register: HOST_BLOCK,
+            // The G15S scratch window leaves an unmapped guard page at VA +0x14000 while the
+            // physical host-register window stays contiguous across the split (+0x14000..+0x20000).
+            spans: &[(0, 0, 0x14000), (0x18000, 0x14000, 0xc000)],
+            pointer: 0x12068,
+        },
+        // Offset on the PPL handoff page where the G15S 26B123 firmware records
+        // whether the GPU is powered during idle power-gating.
+        powered: Some(0x638),
+        ..FW_26B123
+    };
+
+    /// Fixed normalization ranges of the qualified G15S b000 image. Only the
+    /// values of iBoot's records, the two header fields and the tunable contents
+    /// are ignored. The digest still covers the tags, lengths and table headers.
+    const BOOT_FILLED_B000: &[(u32, u32)] = &[
+        (0x224, 4),
+        (0x23c, 8),
+        (0x5be6c, 8),
+        (0x5be7c, 8),
+        (0x5be8c, 8),
+        (0x5be9c, 8),
+        (0x5beac, 8),
+        (0x5bebc, 8),
+        (0x5becc, 8),
+        (0x5bedc, 4),
+        (0x5bee8, 1),
+        (0x5bef1, 8),
+        (0x5bf01, 8),
+        (0x5bf11, 4),
+        (0x5bf1d, 8),
+        (0x5bf2d, 1),
+        (0x5bf36, 1),
+        (0x5bf3f, 8),
+        (0x5bf4f, 8),
+        (0x5bf5f, 8),
+        (0x5bf6f, 8),
+        (0x5bf7f, 8),
+        (0x5bf8f, 8),
+        (0x5bf9f, 8),
+        (0x5bfaf, 8),
+        (0x5bfbf, 8),
+        (0x5bfcf, 8),
+        (0x5bfdf, 8),
+        (0x5bfef, 1),
+        (0x5bff8, 8),
+        (0x5c008, 4),
+        (0x5c014, 8),
+        (0x5c024, 4),
+        (0x5c030, 4),
+        (0x5c03c, 4),
+        (0x5c048, 8),
+        (0x5c058, 8),
+        (0x5c068, 1),
+        (0x5c071, 8),
+        (0x5c081, 8),
+        (0x5c091, 4),
+        (0x5c098, 1),
+        (0x5c099, 0x2d4),
+        (0x5c370, 1),
+        (0x5c371, 0x2d4),
+    ];
+}
+
+/// The handoff marker aura publishes for the T8132 and T6030 GPUs.
+pub(crate) const G16_HANDOFF_PROPERTY: &core::ffi::CStr = c"apple,g16-handoff-version";
+
+/// T8122 (G15G), qualified with the C0 image the macOS 27.2 boot chain loads (26B123).
+///
+/// The same compatible is served by the `m3` runtime for the 14.8.3 and 26.6.2 firmware, so this
+/// row owns a device only when its `firmware-compat` is 27.2 and the handoff describes [`LAYOUT`]
+/// ([`Config::firmware_compat`], `adt::claims`). Aura names the handoff version
+/// `apple,m3-handoff-version` on this SoC (aura#448/#455).
+pub(crate) mod t8122 {
+    use super::super::fw::initdata;
+    use super::{Config, FirmwareBuild, FwLayout, HwId, FW_26B123, UPPER};
+
+    pub(crate) const CONFIG: Config = Config {
+        chip_id: 0x8122,
+        gpu_generation: 15,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
+        gpu_variant: crate::hw::GpuVariant::G,
+        // C0 (`crate::hw::GpuRevision::C0`), as the m3 runtime reports it.
+        gpu_revision: 0x20,
+        uat_ias: 42,
+        uat_oas: 42,
+        // One cluster of ten core slots; eight or ten are enabled.
+        num_clusters: 1,
+        num_cores_per_cluster: 10,
+        // Family 7, variant 2 (G15G), revision 0x20; one die and one cluster. The other bits
+        // of the two words are not qualified (`m3_soc::T8122.id`).
+        hw_ids: &[HwId {
+            version: 0x07022000,
+            counts: 0x00010100,
+            version_mask: 0xffffff00,
+            counts_mask: 0x000fff00,
+        }],
+        adt_compatible: b"gpu,t8122",
+        display_compatible: b"apple,t8122-display-subsystem\0",
+        layouts: &[&LAYOUT],
+        firmware: &[FirmwareBuild {
+            // GKTS/ECAP-normalized loaded TEXT, measured on the J615 over three boots
+            // (linux#2781, `m3_firmware::T8122_IMAGES_27`): only the two entropy values are
+            // zeroed, which is this backend's normalization with no boot-filled ranges.
+            name: "Apple GFX 26B123 G15G (C0, entropy zeroed)",
+            text_size: LAYOUT.text_size,
+            data_size: LAYOUT.data_size,
+            entropy: &[[0x60f60, 0x61043]],
+            boot_filled: &[],
+            text_sha256: [
+                0x74, 0x06, 0xa5, 0x68, 0x34, 0x28, 0x37, 0xa7, 0x9f, 0x22, 0xc0, 0x3f, 0x7d, 0x45,
+                0x7f, 0x9f, 0x9d, 0x3e, 0x08, 0x8c, 0x4b, 0x78, 0xd7, 0x83, 0xe2, 0xdc, 0xad, 0x76,
+                0x71, 0x6f, 0x16, 0xf5,
+            ],
+        }],
+        needs_handoff_marker: true,
+        handoff_property: c"apple,m3-handoff-version",
+        firmware_compat: &[[27, 2, 0]],
+        // The 27.2 start sends no PMP vote.
+        prepare_pmp: false,
+        // `ps_gfx` in t8122-pmgr.dtsi.
+        power_offset: 0x1e0,
+        fault_banks: 1,
+        // The m3 27.2 start on the J615 writes no GFXCAXI2AF enables (no slot 22 either).
+        axi2af: false,
+        host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
+        host_block_ready: true,
+        deep_sleep: false,
+        supports_render_scs: false,
+        cross_engine_hold: true,
+        max_tile_buffer: super::sizes::TILE_BUFFER_32K,
+    };
+
+    /// 26B123 G15G: __TEXT 0x64000 as on G16G, __DATA 0xb4000 and the 0x8000 __DATA_SHARED_RO
+    /// tail, so the third segment is at UPPER + 0x118000 (aura's version-2 handoff).
+    pub(crate) const LAYOUT: FwLayout = FwLayout {
+        name: "26B123 G15G",
+        segment_vas: &[UPPER, UPPER + 0x64000, UPPER + 0x118000],
+        data_size: 0xbc000,
+        initdata: &initdata::G15G_26B123,
+        // The G15 family's 26B123 protocol: the J615 firmware installs root[1] at root + 3
+        // pages with 0x403 attributes, the G15S convention, not G16G's.
+        abi: super::FwAbi::V26B123G15S,
+        // Not known for this firmware; the host keeps reading GPU registers while it runs, as
+        // the m3 runtime does.
+        powered: None,
+        ..FW_26B123
+    };
+}
+
 /// Which part of the loaded image a firmware page-table leaf maps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Segment {
@@ -257,6 +590,18 @@ pub(crate) struct Leaves {
 pub(crate) enum FwAbi {
     V25G83,
     V26B123,
+    V26B123G15S,
+}
+
+impl FwAbi {
+    /// Offset of the table installed in root[1] after startup, and the
+    /// descriptor attributes the firmware uses for it and the shared L2.
+    pub(crate) const fn live_root_table(self) -> (u64, u64) {
+        match self {
+            Self::V25G83 | Self::V26B123 => (4 * PAGE, 0x00200000000004cb),
+            Self::V26B123G15S => (3 * PAGE, 0x403),
+        }
+    }
 }
 
 /// How the firmware's MMIO register table in loaded DATA is filled.
@@ -281,6 +626,9 @@ pub(crate) enum Start {
     /// 26B123 start sequence: see [`start_27_2`].
     MacOs27_2,
 }
+
+/// Host-owned SGX register block.
+pub(crate) const HOST_BLOCK: u64 = 0xd60000;
 
 /// The 26B123 start sequence up to the InitData doorbell:
 /// 1. before RUN, bit 0 of GFXCAXI2AF `+0x104` and `+0x108` is set (read, then written);
@@ -325,6 +673,20 @@ pub(crate) struct PplMagic {
     pub(crate) answers: bool,
 }
 
+/// Firmware-visible alias of host registers, with the pointer InitData passes into it.
+pub(crate) struct Scratch {
+    pub(crate) register: u64,
+    /// `(va_offset, pa_offset, bytes)` spans in ascending VA order.
+    pub(crate) spans: &'static [(u64, u64, u64)],
+    pub(crate) pointer: u64,
+}
+
+const T8132_SCRATCH: Scratch = Scratch {
+    register: HOST_BLOCK,
+    spans: &[(0, 0, 0x8000)],
+    pointer: 0,
+};
+
 /// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
 /// it reserves, the leaves it builds in the firmware page tables, and where the boot path writes.
 pub(crate) struct FwLayout {
@@ -339,6 +701,9 @@ pub(crate) struct FwLayout {
     pub(crate) data_size: u64,
     /// The firmware ABI of the builds this layout holds.
     pub(crate) abi: FwAbi,
+    /// InitData wire layout, including the version word of this firmware image.
+    pub(crate) initdata: &'static super::fw::initdata::Layout,
+    pub(crate) scratch: Scratch,
     /// Every leaf the boot loader builds in the firmware's own page tables, in VA order, and
     /// the only leaves cold admission accepts (none: the firmware builds its own tree at
     /// start); `None` until known, which refuses the firmware.
@@ -391,6 +756,8 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     text_size: 0x60000,
     data_size: 0x13c000,
     abi: FwAbi::V25G83,
+    initdata: &super::fw::initdata::V25G83,
+    scratch: T8132_SCRATCH,
     leaves: Some(&[
         Leaves {
             range: 0..0x50000,
@@ -452,6 +819,8 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     text_size: 0x64000,
     data_size: 0xd8000,
     abi: FwAbi::V26B123,
+    initdata: &super::fw::initdata::V26B123,
+    scratch: T8132_SCRATCH,
     // The firmware builds its own tree at start; admit only an empty tree.
     leaves: Some(&[]),
     ppl_magic: Some(PplMagic {
@@ -466,9 +835,6 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     // and to 0 after each power-down.
     powered: Some(0x648),
 };
-
-/// The firmware layouts this backend knows, newest last.
-pub(crate) const FW_LAYOUTS: &[&FwLayout] = &[&FW_25G83, &FW_26B123];
 
 /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
 pub(crate) const USER_RANGE: Range<u64> = 0x4000..0x3ffffff8000;
@@ -542,6 +908,9 @@ pub(crate) mod rings {
     pub(crate) const LOG_RINGS: usize = 9;
     pub(crate) const LOG_STATE_SIZE: usize = 0x1b0;
     pub(crate) const LOG_RING_SIZE: usize = 0x28800;
+    pub(crate) const LOG_PAYLOAD_SIZE: usize = 0xd8;
+    pub(crate) const LOG_PAYLOAD_TEXT_OFFSET: usize = 0x10;
+    pub(crate) const LOG_PAYLOAD_TEXT_SIZE: usize = 0xc8;
     pub(crate) const TRACE_RING_SIZE: usize = 0x9000;
     pub(crate) const STATS_RING_SIZE: usize = 0x4800;
     pub(crate) const FWCTL_RING_SIZE: usize = 0x4000;
@@ -571,16 +940,17 @@ pub(crate) mod client {
     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
 
-    // Persistent compute units, each in its own 64 MiB interval and reused across
-    // application queues. Units 0 and 1 keep their original placement below the render
-    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live between the
-    // unused CT window and the PB heap, clear of the dynamic PB page-list range
-    // 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // Persistent compute units reused across application queues. Units 0 and 1 keep their
+    // original 64 MiB placement below the render allocators; extension units (2..COMPUTE_UNITS)
+    // pack at a 40 MiB stride from 0x7080000000 up to the SCS compute records (0x70b8000000),
+    // clear of [`DYNAMIC`] and [`SCS_POOLS`] and leaving 7.25 MiB guard above each unit's
+    // 32.75 MiB footprint (`0x20c0000`). Every alias is inside Mesa's reserved hole.
+    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02800000;
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7090000000 + (k - 2) * 0x04000000
+            0x7080000000 + (k - 2) * EXT_COMPUTE_STRIDE
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -605,9 +975,29 @@ pub(crate) mod client {
     pub(crate) const WORK_OFF: u64 = 0;
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
-    // Render allocator units contain one 32 MiB UMA pool and its persistent lists.
+    // SCS-capable compute units (ray-query scratch), one 64 MiB interval each after the last
+    // compute unit (0x70b7000000) and below the PB heap (0x70c0000000), holding the unit's
+    // list, preempt, auxiliary and context records at the base units' offsets from their
+    // state. Its UMA pool and freelist are in its SCS pool window ([`scs_compute_pool`]).
+    pub(crate) const fn scs_compute_records(k: u64) -> u64 {
+        0x70b8000000 + k * 0x04000000
+    }
+    /// Offsets of a compute unit's records from its state.
+    pub(crate) const COMPUTE_LIST_OFF: u64 = compute_list(0) - compute_state(0);
+    pub(crate) const COMPUTE_PREEMPT_OFF: u64 = compute_preempt(0) - compute_state(0);
+    pub(crate) const COMPUTE_AUX_OFF: u64 = compute_aux(0) - compute_state(0);
+    pub(crate) const COMPUTE_CONTEXT_OFF: u64 = compute_context(0) - compute_state(0);
+
+    // Render allocator units contain one 32 MiB UMA pool and its persistent lists in a
+    // 64 MiB stride. Per-VM local slots 0..4 live in 0x7010000000..0x7020000000; local slots
+    // 4..MAX_VM_PB_SLOTS live in 0x7008000000..0x7010000000, above base compute units 0..2
+    // (ending at 0x70070c0000) and below the render pass slot window (0x7020000000..0x7040000000).
     pub(crate) const fn render_base(k: u64) -> u64 {
-        0x7010000000 + k * 0x08000000
+        if k < 4 {
+            0x7010000000 + k * 0x04000000
+        } else {
+            0x7008000000 + (k - 4) * 0x04000000
+        }
     }
     pub(crate) const fn render_pool(k: u64) -> u64 {
         render_base(k)
@@ -624,6 +1014,29 @@ pub(crate) mod client {
     pub(crate) const fn render_pb_pages(k: u64) -> u64 {
         render_base(k) + 0x2040000
     }
+    // SCS-capable render allocators: the list and descriptor in their render unit's interval
+    // past its records, at the base allocator's offsets from its state. The UMA pool and
+    // freelist are in the allocator's SCS pool window ([`scs_render_pool`]).
+    pub(crate) const fn scs_render_records(k: u64) -> u64 {
+        render_base(k) + 0x2100000
+    }
+    /// Kernel-placed client objects (PB page lists, `Objects::alloc_dynamic_client`).
+    pub(crate) const DYNAMIC: Range<u64> = 0x7040000000..0x7060000000;
+    /// SCS pool windows, after [`DYNAMIC`] and up to the CT window: each holds one
+    /// SCS-capable UMA pool and, right after it, its freelist (`rt::window_bytes`). Windows 0
+    /// and 1 are the SCS compute units', 2 and 3 the SCS render allocators'.
+    pub(crate) const SCS_POOLS: u64 = 0x7060000000;
+    pub(crate) const SCS_POOL_WINDOW: u64 = 0x8000000;
+    pub(crate) const SCS_POOL_WINDOWS: u64 = 4;
+    pub(crate) const fn scs_compute_pool(k: u64) -> u64 {
+        SCS_POOLS + k * SCS_POOL_WINDOW
+    }
+    pub(crate) const fn scs_render_pool(k: u64) -> u64 {
+        SCS_POOLS + (2 + k) * SCS_POOL_WINDOW
+    }
+    /// Offsets of a render allocator's records from its state.
+    pub(crate) const RENDER_LIST_OFF: u64 = render_list(0) - render_state(0);
+    pub(crate) const RENDER_DESCRIPTOR_OFF: u64 = render_descriptor(0) - render_state(0);
     pub(crate) const PB_HEAP: u64 = 0x70c0000000;
     pub(crate) const PB_HEAP_SIZE: u64 = 0x10000000;
     pub(crate) const fn pb_heap(k: u64) -> u64 {
@@ -633,13 +1046,23 @@ pub(crate) mod client {
     pub(crate) const PB_PAGE_LIST: u64 = 0x7012040000;
     pub(crate) const PB_PAGE_LIST_SIZE: u64 = 0x8000;
 
-    // Render pass resources, each in a distinct 256 MiB interval.
+    // Host-chosen client VA layout for render pass resources within 0x7020000000..0x7040000000
+    // (512 MiB). Firmware takes explicit 64-bit VAs for each pass object rather than indexing
+    // by stride:
+    // - Base slots `0..BASE_RENDER_SLOTS` keep 32 MiB intervals with full 16 MiB TPC / 8 MiB
+    //   tilemap capacity for worst-case geometries.
+    // - Extension slots `BASE_RENDER_SLOTS..RENDER_SLOTS` pack into 8 MiB intervals starting at
+    //   `EXT_PASS_BASE` (`0x7024000000`) with 2 MiB TPC / 1 MiB tilemap capacity, fitting 48
+    //   total pass slots (`0x7020000000..0x703b000000`, leaving 80 MiB free below 0x7040000000).
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
     pub(crate) const TA_WORK_OFF: u64 = 0;
-    pub(crate) const WORK_STRIDE: u64 = 0x10000000;
+    pub(crate) const WORK_STRIDE: u64 = 0x02000000;
     pub(crate) const PASS_STRIDE: u64 = WORK_STRIDE;
+    pub(crate) const EXT_PASS_STRIDE: u64 = 0x00800000;
+    pub(crate) const EXT_PASS_BASE: u64 =
+        FS_WORK_PAGE + (super::sizes::BASE_RENDER_SLOTS as u64) * PASS_STRIDE;
     pub(crate) const PRE0_PAGE: u64 = 0x7020080000;
     pub(crate) const PRE1_PAGE: u64 = 0x70200a0000;
     pub(crate) const PRE2_PAGE: u64 = 0x70200c0000;
@@ -648,13 +1071,37 @@ pub(crate) mod client {
     pub(crate) const FS_SCRATCH: u64 = 0x7020140000;
     pub(crate) const AUX: u64 = 0x7020160000;
     pub(crate) const AUX_STRIDE: u64 = WORK_STRIDE;
-    pub(crate) const TPC: u64 = 0x7024000000;
+    pub(crate) const SCENE_LIST: u64 = 0x7020180000;
+    pub(crate) const TPC: u64 = 0x7020400000;
     pub(crate) const TPC_SIZE: u64 = 0x1000000;
-    pub(crate) const TILEMAP: u64 = 0x7026000000;
+    pub(crate) const TILEMAP: u64 = 0x7021400000;
     pub(crate) const TILEMAP_SIZE: u64 = 0x800000;
-    pub(crate) const TPC_SLOT_SIZE: u64 = TPC_SIZE;
-    pub(crate) const TILEMAP_SLOT_SIZE: u64 = TILEMAP_SIZE;
+    /// Extension pass slot TPC/tilemap sizes (2 MiB / 1 MiB, covering 4K multi-layer and 8K
+    /// passes); base slots keep full `TPC_SIZE` / `TILEMAP_SIZE` for worst-case geometries.
+    pub(crate) const TPC_SLOT_SIZE: u64 = 0x200000;
+    pub(crate) const TILEMAP_SLOT_SIZE: u64 = 0x100000;
     pub(crate) const TPC_SLOT_STRIDE: u64 = WORK_STRIDE;
+    pub(crate) const EXT_TILEMAP_OFF: u64 = (TPC - FS_WORK_PAGE) + TPC_SLOT_SIZE;
+
+    pub(crate) const fn pass_base(i: u64) -> u64 {
+        if i < super::sizes::BASE_RENDER_SLOTS as u64 {
+            FS_WORK_PAGE + i * PASS_STRIDE
+        } else {
+            EXT_PASS_BASE + (i - super::sizes::BASE_RENDER_SLOTS as u64) * EXT_PASS_STRIDE
+        }
+    }
+
+    pub(crate) const fn pass_off(i: u64) -> u64 {
+        pass_base(i) - FS_WORK_PAGE
+    }
+
+    pub(crate) const fn pass_tilemap(i: u64) -> u64 {
+        if i < super::sizes::BASE_RENDER_SLOTS as u64 {
+            TILEMAP + i * PASS_STRIDE
+        } else {
+            pass_base(i) + EXT_TILEMAP_OFF
+        }
+    }
     pub(crate) const CT: u64 = 0x7080000000;
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
     pub(crate) const CT_SIZE: u64 = 0x400000;
@@ -662,36 +1109,202 @@ pub(crate) mod client {
 
 /// Sizes and counts of the engine's objects.
 pub(crate) mod sizes {
+    /// Tile buffer limits of [`super::Config::max_tile_buffer`].
+    pub(crate) const TILE_BUFFER_32K: u32 = 32 * 1024;
+    pub(crate) const TILE_BUFFER_48K: u32 = 48 * 1024;
     pub(crate) const POOLS: usize = 16;
     pub(crate) const POOL_SIZE: u64 = 0x200000;
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
-    pub(crate) const COMPUTE_SLOTS: usize = 2;
-    pub(crate) const RENDER_SLOTS: usize = 2;
+    /// Independent firmware compute workqueue pipes sharing `Channel::Compute` and `sched_ctx`.
+    /// Each pipe owns a disjoint `ComputeGraph` (`qinfo`, work ring, `qstate`, `fw_stamp`,
+    /// `notifier`, `threshold`, `job_list`) and completion event (`work::compute::EVENTS`) so
+    /// concurrent compute VMs lease disjoint workqueues instead of mixing ASIDs in one active
+    /// `qinfo`. Pipe 0 exclusively owns `0..PIPE1_COMPUTE_START` for base-only and SCS VMs;
+    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (18 units
+    /// for 7 secondary pipes, leaving 11 active units beyond the 7 undisplaced retired leases).
+    pub(crate) const COMPUTE_PIPES: usize = 8;
+    /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
+    /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
+    pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
+    const _: () = assert!(COMPUTE_PIPES >= 2 && COMPUTE_PIPES <= 16);
+    const _: () = assert!(MAX_VM_COMPUTE_PIPES >= 2 && MAX_VM_COMPUTE_PIPES <= COMPUTE_PIPES);
+    const _: () = assert!(COMPUTE_UNITS - PIPE1_COMPUTE_START >= (COMPUTE_PIPES - 1) * 2);
+    /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
+    pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
+    /// Base physical PB/UMA allocator slots allocated per VM on first render.
+    pub(crate) const BASE_PB_SLOTS: usize = 2;
+    /// Device-wide warm physical PB/UMA allocator slots (`parameter_id` `0..WARM_PB_SLOTS`,
+    /// hardware UMA slots `33..33 + WARM_PB_SLOTS`). Each VM maps two base units (`local_idx`
+    /// `0..BASE_PB_SLOTS`) bound to a rotating `[home, alt]` pair in this pool so up to
+    /// `WARM_PB_SLOTS` concurrent render VMs stay warm without extra per-VM memory.
+    pub(crate) const WARM_PB_SLOTS: usize = 16;
+    /// Lazily allocated recovery PB/UMA allocator slots (`WARM_PB_SLOTS..PB_SLOTS`, mapped at
+    /// per-VM local VA indices `BASE_PB_SLOTS..MAX_VM_PB_SLOTS`) claimed only after a render
+    /// hang permanently quarantines an allocator slot.
+    pub(crate) const EXT_PB_SLOTS: usize = 4;
+    /// Maximum PB/UMA allocator slots mapped in one VM's client VA space (`render_base(0..6)`).
+    pub(crate) const MAX_VM_PB_SLOTS: usize = BASE_PB_SLOTS + EXT_PB_SLOTS;
+    /// Total device-wide physical PB/UMA allocator slots (`parameter_id` `0..PB_SLOTS`, hardware
+    /// UMA slots `RENDER_UMA_SLOT..RENDER_UMA_SLOT + PB_SLOTS`).
+    pub(crate) const PB_SLOTS: usize = WARM_PB_SLOTS + EXT_PB_SLOTS;
+    const _: () = assert!(WARM_PB_SLOTS >= BASE_PB_SLOTS);
+    const _: () = assert!(MAX_VM_PB_SLOTS >= BASE_PB_SLOTS && MAX_VM_PB_SLOTS <= 6);
+    const _: () = assert!(PB_SLOTS <= 32);
+    const _: () =
+        assert!(super::client::compute_context(1) + 0x40000 <= super::client::render_base(4));
+    const _: () =
+        assert!(super::client::render_descriptor(3) + 0x4000 <= super::client::FS_WORK_PAGE);
+    const _: () =
+        assert!(super::client::render_descriptor(5) + 0x4000 <= super::client::render_base(0));
+    /// Worst-case firmware work-ring entries consumed per pipelined render pass on TA
+    /// (`prev_barrier`, `ta_fs_barrier`, up to `COMPUTE_PIPES` `compute_barrier` entries,
+    /// `ta_work`) and FS (`fs_dep`, up to `COMPUTE_PIPES` `fs_compute_barrier` entries,
+    /// `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine (`initbm` + `ta_work` = 2
+    /// entries).
+    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 5;
+    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
+    /// `c2c` barrier + `work`).
+    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
+    /// Maximum unfinished TA passes kept in flight at once for heavy multi-layer or large-tilemap
+    /// renders so heavy bursts stay inside M4 firmware's `<= 4`-pass TA/scene pipeline.
+    pub(crate) const TA_WAVE_PASSES: usize = 4;
+    /// Maximum unfinished TA passes kept in flight at once for light single-layer renders
+    /// (`tilemap_bytes <= TA_LIGHT_TILEMAP_BYTES`), doubling the wave window for light render
+    /// bursts and deeper micro-coalesced batches.
+    pub(crate) const TA_WAVE_PASSES_LIGHT: usize = 8;
+    /// Tilemap byte threshold at or below which a single-layer render qualifies for
+    /// `TA_WAVE_PASSES_LIGHT`.
+    pub(crate) const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024;
+    /// Headroom below the active TA wave cap at which a TA-wave-paused render queue wakes to
+    /// launch the next wave, avoiding 1-pass stub drips.
+    pub(crate) const TA_WAVE_REFILL_HEADROOM: usize = 2;
+    /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
+    pub(crate) const BASE_RENDER_SLOTS: usize = 2;
+    /// Retained render pass slots per VM at most. A slot is reused only after a later render
+    /// retired (displacing it), so `n` slots keep up to `n - 1` renders in flight.
+    ///
+    /// Sized inside both the host client-VA window (`0x7020000000..0x7040000000`) and firmware
+    /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
+    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), use
+    /// per-allocator hardware UMA slots `RENDER_UMA_SLOT + slot` (`33..38`, strictly inside the
+    /// firmware render slot range `33..64`), post at most `FLIGHTS = 32` `SubmitRecord`s (vs
+    /// `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the firmware recovery
+    /// `snapshot_entries = 448` limit.
+    pub(crate) const RENDER_SLOTS: usize = 48;
+    const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 64);
+    const _: () = assert!(super::engine::RENDER_UMA_SLOT + (PB_SLOTS as u32) <= 65);
+    const _: () = assert!((RENDER_SLOTS - 1) * MAX_RENDER_RING_ENTRIES < QUEUE_CAP as usize);
+    const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
+    const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
+    const _: () = assert!(super::client::TPC + super::client::TPC_SIZE <= super::client::TILEMAP);
+    const _: () = assert!(
+        super::client::TILEMAP + super::client::TILEMAP_SIZE
+            <= super::client::FS_WORK_PAGE + super::client::PASS_STRIDE
+    );
+    const _: () = assert!(
+        super::client::EXT_TILEMAP_OFF + super::client::TILEMAP_SLOT_SIZE
+            <= super::client::EXT_PASS_STRIDE
+    );
+    const _: () = assert!(super::client::pass_base(RENDER_SLOTS as u64) <= 0x7040000000);
     pub(crate) const CT_BUFS: usize = 0;
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;
-    pub(crate) const MAX_CLIENT: usize = 320;
+    pub(crate) const MAX_CLIENT: usize = 512;
     pub(crate) const PB_PAGES: u32 = 8192;
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. A render is published only with nothing else in flight;
-    /// compute commands may queue behind each other on the one firmware compute queue, each
-    /// in its own retained unit ([`COMPUTE_UNITS`]).
-    pub(crate) const FLIGHTS: usize = 16;
+    /// Published prefixes at most. Warm render commands may pipeline across VMs on disjoint
+    /// hardware UMA slots, compute only behind its own VM's work, while cold `InitBM` renders
+    /// and recovery paths drain.
+    pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
-    /// (`COMPUTE_UMA_SLOT + index`). A unit is reused only after a later publication retired
-    /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
-    pub(crate) const COMPUTE_UNITS: usize = 8;
-    const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
-    /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
-    pub(crate) const HORIZON_JOBS: u32 = 1;
-    /// Jobs admitted to the engine per logical queue: enough to keep a queue's compute
-    /// commands in flight back to back; exact prior-command dependencies still gate each one.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 16;
+    /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
+    /// only after a later publication retired (it displaced the unit), so `n` units keep up to
+    /// `n - 1` compute commands in flight (`23 * 2 = 46` entries of the 256-entry compute work
+    /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
+    /// `snapshot_entries = 448`).
+    pub(crate) const COMPUTE_UNITS: usize = 24;
+    const _: () = assert!(COMPUTE_UNITS >= 2);
+    const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
+    const _: () = assert!(
+        super::client::compute_context(2) + 0x40000 <= super::client::compute_base(3)
+    );
+    const _: () = assert!(
+        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP
+    );
+    const _: () = assert!(
+        super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
+            <= super::engine::RENDER_UMA_SLOT
+    );
+    /// SCS-capable compute units per VM, bound dynamically to healthy compute ledger indices
+    /// (and UMA slots) preferring pipe-0-exclusive indices `0..PIPE1_COMPUTE_START`.
+    pub(crate) const SCS_COMPUTE_UNITS: usize = 2;
+    /// First hardware compute ledger index usable by secondary compute pipes (`pipe >= 1`).
+    /// Keeping `0..PIPE1_COMPUTE_START` exclusive to pipe 0 guarantees that pipe 1 never holds
+    /// an undisplaced lease on those units, so 2-unit base-only and SCS compute VMs always have
+    /// at least one claimable unit across up to `PIPE1_COMPUTE_START - 2` permanent quarantines.
+    pub(crate) const PIPE1_COMPUTE_START: usize = 6;
+    const _: () = assert!(
+        PIPE1_COMPUTE_START >= SCS_COMPUTE_UNITS && PIPE1_COMPUTE_START + 2 <= COMPUTE_UNITS
+    );
+    /// Bytes of a base UMA pool (its seeds of 4 KiB).
+    pub(crate) const POOL_BYTES: u64 = 0x2000000;
+    const _: () = assert!(
+        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::scs_compute_records(0)
+            && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64 - 1)
+                + super::client::COMPUTE_CONTEXT_OFF
+                + 0x40000
+                <= super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
+            && super::client::scs_compute_records(SCS_COMPUTE_UNITS as u64)
+                <= super::client::PB_HEAP
+            && super::client::WORK_PAGE
+                + (COMPUTE_UNITS + SCS_COMPUTE_UNITS) as u64 * super::client::CWORK_STRIDE
+                <= super::client::compute_base(0)
+    );
+    const _: () = assert!(
+        super::client::render_pb_pages(0) + super::client::PB_PAGE_LIST_SIZE
+            <= super::client::scs_render_records(0)
+            && super::client::scs_render_records(0) + super::client::RENDER_DESCRIPTOR_OFF + 0x4000
+                <= super::client::render_base(1)
+            && super::client::scs_render_records(BASE_PB_SLOTS as u64 - 1)
+                + super::client::RENDER_DESCRIPTOR_OFF
+                + 0x4000
+                <= super::client::render_base(BASE_PB_SLOTS as u64)
+    );
+    // One window per SCS compute unit and render allocator, between the dynamic range and the
+    // CT window.
+    const _: () = assert!(
+        super::client::DYNAMIC.end <= super::client::scs_compute_pool(0)
+            && super::client::scs_compute_pool(SCS_COMPUTE_UNITS as u64)
+                == super::client::scs_render_pool(0)
+            && super::client::scs_render_pool(BASE_PB_SLOTS as u64)
+                == super::client::SCS_POOLS
+                    + super::client::SCS_POOL_WINDOWS * super::client::SCS_POOL_WINDOW
+            && super::client::scs_render_pool(BASE_PB_SLOTS as u64) <= super::client::CT
+            && super::client::pass_base(RENDER_SLOTS as u64) <= super::client::DYNAMIC.start
+    );
+    /// Maximum jobs folded into one barrier-free compute horizon prefix.
+    pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
+    /// Maximum commands accumulated in a busy-state horizon micro-coalescing batch before
+    /// immediate publication, and maximum hold window (18 us) while a queue already has >= 2
+    /// active commands in flight.
+    pub(crate) const COALESCE_MAX_CMDS: usize = 6;
+    pub(crate) const COALESCE_WINDOW_US: u32 = 18;
+    pub(crate) const COALESCE_WINDOW_NS: u64 = (COALESCE_WINDOW_US as u64) * 1000;
+    /// Per-queue retired CDM execution EWMA threshold (microseconds) at or above which
+    /// barrier-free compute fans out across both CDM pipes instead of staying 1-pipe affine.
+    pub(crate) const COMPUTE_HEAVY_EMA_US: u32 = 200;
+    /// Elapsed wall-clock time (nanoseconds) on a sole active single-command compute flight
+    /// that immediately classifies the queue as heavy before its first retirement updates EWMA.
+    pub(crate) const COMPUTE_HEAVY_INFLIGHT_NS: u64 = 180_000;
+    /// Jobs admitted to the engine per logical queue: enough to keep deep queues (`d=64`)
+    /// queued back to back without scheduler backpressure stalls; exact prior-command
+    /// dependencies still gate each one.
+    pub(crate) const SCHEDULER_CREDITS: u32 = 64;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
-    pub(crate) const AHEAD_RECORDS: u32 = 64;
+    pub(crate) const AHEAD_RECORDS: u32 = 128;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
     pub(crate) const MAX_QUEUES: u32 = 58;
     /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).
@@ -701,7 +1314,10 @@ pub(crate) mod sizes {
 /// Firmware channels, doorbells, seeds and identifiers.
 pub(crate) mod engine {
     pub(crate) const DOORBELL: u64 = 0x0083000000000000;
+    pub(crate) const DEVCTL_INIT_DOORBELL: u64 = DOORBELL | 0x11;
     pub(crate) const DEVCTL_DOORBELL: u64 = 0x0084000000000011;
+    pub(crate) const RECEIVE_DOORBELL: u64 = DOORBELL | 0x10;
+    pub(crate) const G15S_RECEIVE_DOORBELL: u64 = 0x0087000000000010;
     pub(crate) const EVENT_SLOT: u32 = 2;
     pub(crate) const COMPUTE_UMA_SLOT: u32 = 1;
     pub(crate) const RENDER_UMA_SLOT: u32 = 33;

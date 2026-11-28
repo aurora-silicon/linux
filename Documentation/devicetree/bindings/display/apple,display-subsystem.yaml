@@ -19,6 +19,7 @@ properties:
       - enum:
           - apple,display-subsystem
           - apple,t6031-display-subsystem
+          - apple,t8122-display-subsystem
           - apple,t8132-display-subsystem
       - const: apple,t8132-display-diagnostics
         deprecated: true
@@ -51,6 +52,17 @@ properties:
   apple,j713-inherited-mappings:
     type: boolean
     description: The loader validated the inherited J713 SID0 scanout mapping.
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Common scanout DMA aperture, encoded as a base and nonzero size. Bits
+      above a DART's address width select the alias the display uses; the
+      remaining bits are intersected with the window of each referenced DART
+      stream, so the aperture never extends past any of them. Other consumers
+      of the same DART retain their own apertures.
 
 required:
   - compatible

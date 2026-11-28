@@ -36,6 +36,8 @@ prefix = r'''
 typedef u32 __le32;
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define kfree(p) free(p)
 #define max(a,b) ((a)>(b)?(a):(b))
 #define min(a,b) ((a)<(b)?(a):(b))

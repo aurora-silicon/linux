@@ -24,6 +24,7 @@ fn input(variant: u64) -> initdata::Input {
         lower_parameter: 0x7000240000,
         ktrace_mask: [0, 0x12345678, 0xfedcba98][variant as usize],
         progress_recovery: u32::from(variant != 1),
+        enabled_cores: 10,
         // T8132 ADT power-sampling ticks; 25G83 writes power_sample_clks to +4/+8.
         power_sample_clks: 200_000,
         power_sample_us: 8333,
@@ -63,6 +64,14 @@ fn main() {
                 expected[at..at+4].copy_from_slice(&value.to_le_bytes());
             }
         }}
+        // Substitute calibrated DM2 compute watchdogs (40 -> 750, 50 -> 800) in the frozen C
+        // golden.
+        let globals: usize = initdata::OBJECT_SIZE[..initdata::id::GLOBALS].iter().sum();
+        for (offset, old, new) in [(0x9c8usize, 40u32, 750u32), (0x9ccusize, 50u32, 800u32)] {
+            let wd = globals + offset;
+            assert_eq!(u32::from_le_bytes(expected[wd..wd+4].try_into().unwrap()), old);
+            expected[wd..wd+4].copy_from_slice(&new.to_le_bytes());
+        }
         if let Some(offset) = got.iter().zip(&expected).position(|(a, b)| a != b) {
             panic!("initdata variant {variant} differs at {offset:#x}: C={:#x}, Rust={:#x}", expected[offset], got[offset]);
         }

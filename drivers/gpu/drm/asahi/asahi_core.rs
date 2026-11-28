@@ -17,6 +17,10 @@ mod fw;
 mod fwid;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
+// Without the G15 backend, only the UAT adoption the T8122 runtime shares with it.
+#[cfg(all(CONFIG_DRM_ASAHI_UAT_ADOPTION, not(CONFIG_DRM_ASAHI_G15)))]
+#[path = "g15/adopt.rs"]
+mod g15;
 mod g17;
 mod gem;
 
@@ -55,8 +59,6 @@ mod sysfs_exports;
 mod timestamp;
 mod usage;
 mod util;
-#[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
-mod vm;
 mod workqueue;
 
 use kernel::prelude::*;
@@ -111,6 +113,8 @@ impl kernel::InPlaceModule for DriverModule {
         unsafe { queue_share::init() };
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { g17::exec_share::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { g17::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
@@ -268,7 +272,7 @@ module! {
             description: "G16: compute completion-stamp deadline, ms (0 permits unbounded compute; firmware recovery stays active)",
         },
         g16_repoll_us: u32 {
-            default: 15,
+            default: 8,
             description: "G16: repoll interval while publication waits for record consumption, us",
         },
         g16_resnap_us: u32 {

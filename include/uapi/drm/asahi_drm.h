@@ -333,7 +333,7 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
 	/*
-	 * Bits 10 to 15 are reported only by the G17P runtime.
+	 * Bits 10 to 16 are the HAL200/G16/G17P command-stream features.
 	 */
 
 	/**
@@ -562,6 +562,15 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
 
 /*
+ * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
+ * independent compute commands of one queue on several firmware compute
+ * queues of its context, so that they overlap. Userspace needs no further
+ * queues of its own for that. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
+
+/*
  * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK: DRM_IOCTL_ASAHI_GEM_USERPTR does not
  * charge its pins to the caller's RLIMIT_MEMLOCK; only the GPU memory limits
  * bound them (see struct drm_asahi_gem_userptr). Kernels that report
@@ -572,6 +581,37 @@ enum drm_asahi_feature {
  * those of enum drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS: a render command that sets
+ * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS still waits for the earlier renders its
+ * barriers name: the fragment half waits for them to finish before it
+ * starts. Kernels that report DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS without
+ * this bit may drop that wait, so userspace that uses the flag to order a
+ * render after earlier ones must check for this bit. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS ((1ULL) << 44)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS: every fragment pass of a render
+ * command, including partial renders the firmware runs when the tiler heap
+ * fills, starts only after the fragment work its fragment half is ordered
+ * after has completed: the earlier fragment work of its physical queue and
+ * the renders named by its fragment barriers. Userspace may then order a
+ * render's attachment loads and stores against an earlier render with
+ * fragment-stage ordering alone, without a tiling-half wait. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS ((1ULL) << 45)
+
+/*
+ * DRM_ASAHI_FEATURE_TILE_BUFFER_48K: render commands on this GPU accept tile
+ * buffers of up to 48 KiB (sample_size_B * utile_width_px * utile_height_px *
+ * samples <= 49152). Without it, 32 KiB is the portable limit. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_TILE_BUFFER_48K ((1ULL) << 46)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2

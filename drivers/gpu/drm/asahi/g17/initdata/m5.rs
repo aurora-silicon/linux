@@ -52,6 +52,32 @@ impl InitData {
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
+    /// Direct-port view of the M5 submission-history table (none off M5 or on common 26A428).
+    pub(super) fn m5_history_view(&self) -> Result<Option<crate::g17::port::M5HistoryView>> {
+        if !self.m5 || self.graph.is_common26() {
+            return Ok(None);
+        }
+        let private = self.object(self.cluster)?;
+        let base = self.graph.private.status_config;
+        let field = |offset| {
+            self.m5_status_config
+                .relocate(offset)
+                .map(|at| base + at)
+                .ok_or(EINVAL)
+        };
+        let history = field(m::M5_STATUS_CONFIG_HISTORY)?;
+        Ok(Some(crate::g17::port::M5HistoryView {
+            generation: private.word(field(m::M5_STATUS_CONFIG_HISTORY_GENERATION)?)?,
+            config: [
+                private.word(history)?,
+                private.word(history + 4)?,
+                private.word(history + 8)?,
+                private.word(history + 12)?,
+            ],
+            slots: private.pointer(field(m::M5_STATUS_CONFIG_HISTORY_SLOTS)?, 256)?,
+        }))
+    }
+
     /// Selects the power-policy layout of the M5 firmware build `build_m5` encodes for.
     pub(in crate::g17) fn set_m5_policy_layouts(
         &mut self,

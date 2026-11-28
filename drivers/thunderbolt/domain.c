@@ -605,14 +605,20 @@ int tb_domain_resume_noirq(struct tb *tb)
 	int ret = 0;
 
 	mutex_lock(&tb->lock);
-	if (!tb->noirq_ctl_retained)
-		tb_ctl_start(tb->ctl);
-	if (tb->cm_ops->resume_noirq)
-		ret = tb->cm_ops->resume_noirq(tb);
+	/*
+	 * End the hold before resume_noirq(), where a stopped channel would be
+	 * started: hotplug events and XDomain responses then reach the
+	 * connection manager from the same point as without the hold. Requests
+	 * still wait for tb->lock, which is held until the resume is done.
+	 */
 	if (tb->noirq_ctl_retained) {
 		WRITE_ONCE(tb->noirq_ctl_retained, false);
 		tb_dbg(tb, "XDomain control channel remained active\n");
+	} else {
+		tb_ctl_start(tb->ctl);
 	}
+	if (tb->cm_ops->resume_noirq)
+		ret = tb->cm_ops->resume_noirq(tb);
 	mutex_unlock(&tb->lock);
 
 	return ret;

@@ -113,6 +113,7 @@ typedef uint8_t u8; typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define IS_ENABLED(x) 1
 #define dev_warn(...) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define APPLE_RTKIT_EP_MGMT 0
@@ -135,6 +136,8 @@ static u64 ktime_get_ns(void) { clock_calls++; return 37; }
 STUB(apple_rtkit_management_rx) STUB(apple_rtkit_crashlog_rx) STUB(apple_rtkit_syslog_rx)
 STUB(apple_rtkit_ioreport_rx) STUB(apple_rtkit_kdebug_rx) STUB(apple_rtkit_pmp_aux_rx)
 STUB(apple_rtkit_coreanalytics_rx) STUB(apple_rtkit_oslog_rx)
+static bool apple_rtkit_ep7_served(struct apple_rtkit *r) { return false; }
+static void apple_rtkit_unserved_ep_msg(struct apple_rtkit *r,u8 e,u64 m) {}
 static void timed_cb(void *c,u8 e,u64 m,u64 ns) { assert(e==0x2a && m==0x1234); timed++; observed=ns; }
 static void legacy_cb(void *c,u8 e,u64 m) { assert(e==0x2a && m==0x1234); legacy++; }
 '''

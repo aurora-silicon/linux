@@ -32,6 +32,8 @@ struct asahi_g17_scope_callback {
 struct asahi_g17_scope {
 	struct dma_fence base;
 	atomic_t pending;
+	atomic_t compute_waited;
+	bool compute_only;
 	struct dma_fence *children[2];
 	struct asahi_g17_scope_callback callbacks[2];
 	struct irq_work work;
@@ -43,6 +45,8 @@ struct asahi_g17_scope {
 
 static const struct dma_fence_ops scope_ops;
 static DEFINE_PER_CPU(struct llist_head *, active_scopes);
+/* Suppresses internal scope chaining from counting as a host compute waiter. */
+static DEFINE_PER_CPU(struct dma_fence *, scope_chaining_fence);
 #define SCOPE_ATOMIC_BATCH 64
 
 bool asahi_g17_is_scope(struct dma_fence *fence)
@@ -76,8 +80,22 @@ static bool scope_signaled(struct dma_fence *fence)
 
 static bool scope_enable_signaling(struct dma_fence *fence)
 {
+	struct asahi_g17_scope *scope = to_scope(fence);
+
 	/* Child callbacks are already armed; no recursive callback installation. */
-	return !scope_signaled(fence);
+	if (scope_signaled(fence))
+		return false;
+	if (scope->compute_only &&
+	    __this_cpu_read(scope_chaining_fence) != fence &&
+	    !atomic_xchg(&scope->compute_waited, 1))
+		asahi_g17_note_compute_waiter();
+	return true;
+}
+
+static void scope_unwait(struct asahi_g17_scope *scope)
+{
+	if (atomic_xchg(&scope->compute_waited, 0))
+		asahi_g17_unnote_compute_waiter();
 }
 
 unsigned int asahi_g17_scope_children(struct dma_fence *fence,
@@ -118,6 +136,7 @@ static void scope_complete(struct asahi_g17_scope *scope)
 {
 	cmpxchg(&scope->base.error, 1, 0);
 	dma_fence_signal(&scope->base);
+	scope_unwait(scope);
 	scope_release_completed(scope);
 }
 
@@ -126,6 +145,7 @@ static void scope_work(struct irq_work *work)
 	struct asahi_g17_scope *scope = container_of(work, struct asahi_g17_scope, work);
 	cmpxchg(&scope->base.error, 1, 0);
 	asahi_g17_signal_fence(&scope->base);
+	scope_unwait(scope);
 	scope_release_completed(scope);
 }
 
@@ -218,6 +238,7 @@ static void scope_release(struct dma_fence *fence)
 	struct asahi_g17_scope *scope = to_scope(fence);
 	unsigned int i;
 
+	scope_unwait(scope);
 	for (i = 0; i < ARRAY_SIZE(scope->children); ++i)
 		dma_fence_put(scope->children[i]);
 	dma_fence_free(fence);
@@ -268,7 +289,8 @@ void asahi_g17_scope_bind(struct dma_fence *fence, struct dma_fence *root)
 }
 
 struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
-				      struct dma_fence *submitted, u64 point)
+					 struct dma_fence *submitted, u64 point,
+					 bool compute_only)
 {
 	struct dma_fence *contained = previous ? dma_fence_chain_contained(previous) : NULL;
 	struct dma_fence *parent = NULL;
@@ -304,6 +326,7 @@ struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
 	}
 	dma_fence_init64(&scope->base, &scope_ops, NULL, context, point);
 	init_irq_work(&scope->work, scope_work);
+	scope->compute_only = compute_only;
 	scope->children[0] = parent;
 	scope->children[1] = dma_fence_get(submitted);
 	/* The constructor guard prevents completion while callbacks are being installed. */
@@ -311,13 +334,21 @@ struct dma_fence *asahi_g17_scope_create(struct dma_fence *previous,
 	scope->base.error = 1;
 	for (i = 0; i < ARRAY_SIZE(scope->children); ++i) {
 		struct dma_fence *child = scope->children[i];
+		int err;
+
 		if (!child) {
 			scope_arrived(scope, 0);
 			continue;
 		}
 		scope->callbacks[i].scope = scope;
 		dma_fence_get(&scope->base);
-		if (dma_fence_add_callback(child, &scope->callbacks[i].callback, scope_callback)) {
+		preempt_disable();
+		__this_cpu_write(scope_chaining_fence, child);
+		err = dma_fence_add_callback(child, &scope->callbacks[i].callback,
+					     scope_callback);
+		__this_cpu_write(scope_chaining_fence, NULL);
+		preempt_enable();
+		if (err) {
 			scope_arrived(scope, child->error);
 			dma_fence_put(&scope->base);
 		}

@@ -3,7 +3,20 @@
 //! Pure G16G compute encoding (25G83 and 26B123 work layouts). Publication and lifetime proofs
 //! belong to the engine.
 
-use super::{compute, manager, put16, put32, put64, put8, uapi};
+use super::{compute, manager, pools, put16, put32, put64, put8, uapi};
+
+/// G15-only compute stage control register emitted immediately before [`REG_STAGE_CTRL`].
+const REG_G15_STAGE_CTRL: u32 = 0x12091;
+/// Shared compute stage control register.
+const REG_STAGE_CTRL: u32 = 0x101d9;
+/// HAL200 compute USC-base register (`0x10071`).
+const REG_HAL200_USC_BASE: u32 = 0x10071;
+/// Default compute stage hardware control word (`0x101d9` / G15 `0x12091`).
+const STAGE_CTRL_DEFAULT: u64 = 0x1c;
+/// Packed compute UMA page-table cache (PTC) policy word (`0xa599`): min=0x20, mid=0x40, max=0x132.
+const COMPUTE_UMA_PTC: u64 = 0x20 | (0x40 << 16) | (0x132 << 32);
+/// Packed compute DUPM resource-control word (`0xd411`): lo=1, hi=2.
+const DEFAULT_DUPM_CONTROL: u64 = 1 | (2 << 32);
 
 /// Stores the binding generation `v` as a little-endian integer of `bytes` (1 or 8) bytes.
 pub(super) fn put_generation(b: &mut [u8], off: usize, bytes: usize, v: u8) {
@@ -38,6 +51,8 @@ pub(crate) struct ComputeRefs {
     pub(crate) work: u64,
     pub(crate) work_gva: u64,
     pub(crate) seq: u64,
+    /// Zero selects the embedded `work + DESCRIPTOR`; otherwise a separate firmware UMA manager.
+    pub(crate) descriptor_fw: u64,
     pub(crate) preempt_gva: u64,
     pub(crate) its: u64,
     pub(crate) stats_fw: u64,
@@ -52,6 +67,8 @@ pub(crate) struct ComputeRefs {
     pub(crate) record_fw: u64,
     pub(crate) binding_generation: u8,
     pub(crate) uma_slot: u32,
+    /// Firmware completion event assigned to this compute pipe (e.g. 15 or 16).
+    pub(crate) event: u32,
     /// Native command descriptor identifier (work+0x820), independent of compute index.
     pub(crate) command_id: u64,
     /// Native u32 compute sequence/index (StartCompute+0x38).
@@ -62,6 +79,60 @@ pub(crate) struct ComputeRefs {
     /// Cumulative private UMA submissions; never derived from the engine stamp.
     pub(crate) submitted: u64,
 }
+
+/// The first and last register records of a ray-query compute work item, as macOS 27.2 on the
+/// J773g writes them: 0x017e1 = 1 first (only in ray-query items) and 0x017d9 = 1 last. macOS
+/// also writes the trailing 0x017d9 in some compute work without ray queries; G16G's
+/// non-ray-query work keeps the list it has always had.
+const RAY_QUERY_FIRST: (u32, u64) = (0x017e1, 1);
+const RAY_QUERY_LAST: (u32, u64) = (0x017d9, 1);
+/// Write the SCS driver word 0x1a141 after 0x1a0e9 for a command with scratch, as g17's G17P
+/// compute program does (zero on Gen1). Off: 25F84's program does not write it. Trace
+/// question T1.
+pub(crate) const COMPUTE_SCS_DRIVER_WORD: bool = false;
+
+/// The ray-tracing words of one compute work item, and the UMA pool it runs with.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComputeRt {
+    /// 0x1a089, 0x1a091, 0x1a059, 0x1a061, 0x1a0b9, 0x1a0c1.
+    pub(crate) intersection: [u64; 6],
+    /// 0x101d1.
+    pub(crate) size: u64,
+    /// 0xd479.
+    pub(crate) tail: u64,
+    /// 0x1a0e9.
+    pub(crate) stack: u64,
+    /// 0x107a1.
+    pub(crate) window: u64,
+    /// 0x1a141, with [`COMPUTE_SCS_DRIVER_WORD`].
+    pub(crate) driver: u64,
+    /// The command has scratch (the gated registers apply).
+    pub(crate) scs: bool,
+    /// Freelist entries of the unit's UMA pool, published in a fresh descriptor (SEEDS_A/B).
+    pub(crate) seeds: u32,
+    /// Records of the unit's freelist, published in a fresh descriptor (+0x1c).
+    pub(crate) records: u32,
+}
+
+impl ComputeRt {
+    /// A command without ray state in a base UMA pool: the words G16G has always written.
+    pub(crate) const DISABLED: Self = Self {
+        intersection: [0; 6],
+        size: 0,
+        tail: 0,
+        stack: 8,
+        window: 0xff0000,
+        driver: 0,
+        scs: false,
+        seeds: 8192,
+        records: manager::UNK_1C_VALUE,
+    };
+}
+
+/// Register records of a compute work item at most: the 24 of [`compute::SEL`], optional G15
+/// `0x12091`, optional HAL200 `0x10071`, the ray-query first and last records and the gated SCS
+/// driver word.
+const MAX_REGS: usize = compute::SEL.len() + 5;
 
 const FW_START: u64 = 0xfffffc2000000000;
 const FW_END: u64 = 0xfffffc2ffc000000;
@@ -109,17 +180,17 @@ pub(crate) fn init_compute_pool(
     Ok(())
 }
 
-/// Restores the complete allocator descriptor into a newly encoded, unpublished work after
-/// the engine has proved A retired, distinct B displaced A in the same UMA slot, and B retired.
-/// Numeric checks here do not establish that ownership proof. The old descriptor's completion
-/// counter must equal A's cumulative submission count. Pool/list/counter backing stays pinned;
-/// only the work pointer and destination slot are rewritten. Returns the next private counter.
-pub(crate) fn preserve_compute_descriptor(
+fn validate_compute_descriptor_inner(
     r: &ComputeRefs,
     old: &[u8; compute::DESCRIPTOR_SIZE],
     submitted_before: u64,
-    w: &mut [u8; compute::WORK_SIZE],
+    check_index: bool,
 ) -> Result<u64, ComputeEncodeError> {
+    fn read32(b: &[u8], off: usize) -> u32 {
+        let mut v = [0; 4];
+        v.copy_from_slice(&b[off..off + 4]);
+        u32::from_le_bytes(v)
+    }
     fn read64(b: &[u8], off: usize) -> u64 {
         let mut v = [0; 8];
         v.copy_from_slice(&b[off..off + 8]);
@@ -130,6 +201,7 @@ pub(crate) fn preserve_compute_descriptor(
         || r.submitted != submitted_before + 1
         || r.uma_slot == 0
         || r.uma_slot > 32
+        || (check_index && read32(old, manager::INDEX) != r.uma_slot)
         || read64(old, manager::WORK) != r.work
         || read64(old, manager::FREELIST) != r.pool_state_gva
         || read64(old, manager::POOL_TABLE) != r.page_list_gva
@@ -138,10 +210,37 @@ pub(crate) fn preserve_compute_descriptor(
     {
         return Err(ComputeEncodeError::Descriptor);
     }
+    Ok(submitted_before + 1)
+}
+
+/// Validates an in-place retained compute UMA manager descriptor before reuse after displacement.
+/// Numeric checks here do not establish ownership proof; the engine proves prior retirement and
+/// distinct displacement first. Returns the next private submission counter.
+pub(crate) fn validate_compute_descriptor(
+    r: &ComputeRefs,
+    old: &[u8; compute::DESCRIPTOR_SIZE],
+    submitted_before: u64,
+) -> Result<u64, ComputeEncodeError> {
+    validate_compute_descriptor_inner(r, old, submitted_before, true)
+}
+
+/// Restores the complete allocator descriptor into a newly encoded, unpublished work after
+/// the engine has proved A retired, distinct B displaced A in the same UMA slot, and B retired.
+/// Numeric checks here do not establish that ownership proof. The old descriptor's completion
+/// counter must equal A's cumulative submission count. Pool/list/counter backing stays pinned;
+/// only the work pointer and destination slot are rewritten. Returns the next private counter.
+#[allow(dead_code)]
+pub(crate) fn preserve_compute_descriptor(
+    r: &ComputeRefs,
+    old: &[u8; compute::DESCRIPTOR_SIZE],
+    submitted_before: u64,
+    w: &mut [u8; compute::WORK_SIZE],
+) -> Result<u64, ComputeEncodeError> {
+    let next = validate_compute_descriptor_inner(r, old, submitted_before, false)?;
     w[compute::DESCRIPTOR..compute::DESCRIPTOR + compute::DESCRIPTOR_SIZE].copy_from_slice(old);
     put64(w, compute::DESCRIPTOR + manager::WORK, r.work);
     put32(w, compute::DESCRIPTOR + manager::INDEX, r.uma_slot);
-    Ok(submitted_before + 1)
+    Ok(next)
 }
 
 fn timestamp(
@@ -183,8 +282,38 @@ pub(crate) fn encode_compute(
 }
 
 /// [`encode_compute`] for the work layout of another firmware ABI.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_compute_for(
+    layout: &compute::Layout,
+    r: &ComputeRefs,
+    c: &uapi::drm_asahi_cmd_compute,
+    att: &[uapi::drm_asahi_attachment],
+    ts_va: &[u64; 2],
+    ctx: u32,
+    n: u64,
+    fault_mask: u32,
+    w: &mut [u8; compute::WORK_SIZE],
+    q: &mut [u8; compute::SEQ_SIZE],
+) -> Result<(), ComputeEncodeError> {
+    encode_compute_rt(
+        layout,
+        r,
+        c,
+        att,
+        ts_va,
+        ctx,
+        n,
+        fault_mask,
+        &ComputeRt::DISABLED,
+        w,
+        q,
+    )
+}
+
+/// [`encode_compute_for`] with the command's ray-tracing words and its unit's UMA pool. With
+/// [`ComputeRt::DISABLED`] the bytes are [`encode_compute_for`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_compute_rt(
     layout: &compute::Layout,
     r: &ComputeRefs,
     c: &uapi::drm_asahi_cmd_compute,
@@ -193,15 +322,27 @@ pub(crate) fn encode_compute_for(
     ctx: u32,
     _n: u64,
     fault_mask: u32,
+    rt: &ComputeRt,
     w: &mut [u8; compute::WORK_SIZE],
     q: &mut [u8; compute::SEQ_SIZE],
 ) -> Result<(), ComputeEncodeError> {
+    // Whole 2-MiB pool rows within the freelist the manager reports, which is never smaller
+    // than a base unit's.
+    if rt.seeds == 0
+        || rt.seeds % 512 != 0
+        || rt.seeds > rt.records
+        || rt.records < manager::UNK_1C_VALUE
+    {
+        return Err(ComputeEncodeError::Storage);
+    }
     if ctx == 0 || ctx >= 64 {
         return Err(ComputeEncodeError::Context);
     }
     if r.binding_generation == 0
         || r.uma_slot == 0
         || r.uma_slot > 32
+        || r.event == 0
+        || r.event >= 128
         || r.target_stamp & 0xff != 0
         || r.submitted == 0
     {
@@ -209,6 +350,7 @@ pub(crate) fn encode_compute_for(
     }
     if !fw(r.work, compute::WORK_SIZE as u64)
         || !fw(r.seq, compute::SEQ_SIZE as u64)
+        || (r.descriptor_fw != 0 && !fw(r.descriptor_fw, compute::DESCRIPTOR_SIZE as u64))
         || !fw(r.qinfo, 0x24c0)
         || !fw(r.stats_fw, 0xe10)
         || !fw(r.auxiliary_fw, compute::AUX_SIZE as u64)
@@ -226,7 +368,12 @@ pub(crate) fn encode_compute_for(
             compute::CONTEXT_STORE_SIZE as u64,
             0x4000,
         )
-        || !gpu(r.pool_state_gva, compute::POOL_STATE_SIZE as u64, 0x4000)
+        // The freelist: one u64 seed address per record.
+        || !gpu(
+            r.pool_state_gva,
+            u64::from(rt.records) * core::mem::size_of::<u64>() as u64,
+            0x4000,
+        )
         || !gpu(r.page_list_gva, compute::PAGE_LIST_SIZE as u64, 0x4000)
         || (r.usc_base != 0 && !gpu(r.usc_base, 0x100000000, 0x100000000))
     {
@@ -268,43 +415,65 @@ pub(crate) fn encode_compute_for(
         }
     }
     let pre = r.preempt_gva;
+    let tail = layout.preempt_tail;
+    let [i0, i1, i2, i3, i4, i5] = rt.intersection;
     let values = [
         pre,
         base,
-        pre + 0x1480,
-        pre + 0x1488,
-        pre + 0x1490,
-        pre + 0x1498,
+        pre + tail,
+        pre + tail + 8,
+        pre + tail + 0x10,
+        pre + tail + 0x18,
         0x154024201,
         0x10c08860,
-        0x1c,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        8,
-        0xff0000,
-        0x13200400020,
-        0x200000001,
+        STAGE_CTRL_DEFAULT,
+        i0,
+        i1,
+        i2,
+        i3,
+        i4,
+        i5,
+        rt.size,
+        rt.tail,
+        rt.stack,
+        rt.window,
+        COMPUTE_UMA_PTC,
+        DEFAULT_DUPM_CONTROL,
         1,
         1,
         1,
     ];
     w.fill(0);
     q.fill(0);
-    for (i, (&sel, &value)) in compute::SEL.iter().zip(values.iter()).enumerate() {
+    let mut records = [(0u32, 0u64); MAX_REGS];
+    let mut count = 0;
+    let mut push = |sel: u32, value: u64| {
+        records[count] = (sel, value);
+        count += 1;
+    };
+    if rt.scs {
+        push(RAY_QUERY_FIRST.0, RAY_QUERY_FIRST.1);
+    }
+    for (&sel, &value) in compute::SEL.iter().zip(values.iter()) {
+        if sel == REG_STAGE_CTRL && layout.has_reg_12091 {
+            push(REG_G15_STAGE_CTRL, STAGE_CTRL_DEFAULT);
+        }
+        push(sel, value);
+        if sel == 0x1a0e9 && COMPUTE_SCS_DRIVER_WORD && rt.scs {
+            push(0x1a141, rt.driver);
+        }
+    }
+    if layout.has_usc_base_reg && r.usc_base != 0 {
+        push(REG_HAL200_USC_BASE, r.usc_base);
+    }
+    if rt.scs {
+        push(RAY_QUERY_LAST.0, RAY_QUERY_LAST.1);
+    }
+    for (i, &(sel, value)) in records[..count].iter().enumerate() {
         put32(w, compute::REGS + i * 12, sel);
         put64(w, compute::REGS + i * 12 + 4, value);
     }
-    let count = if r.usc_base == 0 { 24 } else { 25 };
-    if r.usc_base != 0 {
-        put32(w, compute::REGS + 24 * 12, 0x10071);
-        put64(w, compute::REGS + 24 * 12 + 4, r.usc_base);
-    }
+    let count = count as u16;
     put32(w, 0, 3);
     put32(w, 0xc, ctx);
     put64(
@@ -328,7 +497,7 @@ pub(crate) fn encode_compute_for(
     put64(w, 0x800, r.user_stamp);
     put64(w, 0x808, r.fw_stamp);
     put32(w, 0x810, r.target_stamp);
-    put32(w, 0x814, compute::EVENT);
+    put32(w, 0x814, r.event);
     put32(w, 0x81c, 1);
     put32(w, 0x818, r.work_818);
     put64(w, 0x820, r.command_id);
@@ -336,10 +505,15 @@ pub(crate) fn encode_compute_for(
     put64(w, 0x83c, r.its + 8);
     put64(w, 0x844, ts_va[0]);
     put64(w, 0x84c, ts_va[1]);
-    put64(w, 0x86a, r.work + compute::DESCRIPTOR as u64);
+    let descriptor_fw = if r.descriptor_fw == 0 {
+        r.work + compute::DESCRIPTOR as u64
+    } else {
+        r.descriptor_fw
+    };
+    put64(w, 0x86a, descriptor_fw);
     put8(w, 0x872, 1);
-    put64(w, 0x873, 0x1588000);
-    put64(w, 0x87b, 0xef8000);
+    put64(w, 0x873, layout.pool_words[0]);
+    put64(w, 0x87b, layout.pool_words[1]);
     put64(w, 0x883, r.auxiliary_fw);
     put_generation(
         w,
@@ -356,6 +530,7 @@ pub(crate) fn encode_compute_for(
     put32(q, 0x30, u32::from(fault_mask != 0));
     put32(q, 0x38, r.compute_index);
     put32(q, 0x3c, r.work_818);
+    put32(q, compute::START_SCS, u32::from(rt.scs));
     put64(q, 0x44, r.work + 0x76c);
     put32(q, 0x50, 1);
     for (i, a) in att.iter().enumerate() {
@@ -368,14 +543,14 @@ pub(crate) fn encode_compute_for(
         put16(q, off + 0xe, 1);
     }
     put32(q, 0x158, att.len() as u32);
-    put64(q, 0x160, r.work + compute::DESCRIPTOR as u64);
+    put64(q, 0x160, descriptor_fw);
     put64(q, 0x178, r.auxiliary_gva);
-    put64(q, 0x188, r.context_store_gva);
-    put64(q, 0x190, r.context_store_gva + 0xf400);
-    put64(q, 0x198, r.context_store_gva + 0x1e800);
-    put64(q, 0x1a0, r.context_store_gva + 0x1f000);
+    put64(q, 0x188, r.context_store_gva + layout.context_store_offsets[0]);
+    put64(q, 0x190, r.context_store_gva + layout.context_store_offsets[1]);
+    put64(q, 0x198, r.context_store_gva + layout.context_store_offsets[2]);
+    put64(q, 0x1a0, r.context_store_gva + layout.context_store_offsets[3]);
     put64(q, 0x1a8, r.work + layout.target as u64);
-    put32(q, 0x1b8, compute::EVENT);
+    put32(q, 0x1b8, r.event);
     let requested = ts_va[0] != 0 || ts_va[1] != 0;
     timestamp(q, compute::TS_START, false, r, requested, layout.auxiliary);
     put32(q, 0x208, 1);
@@ -408,12 +583,12 @@ pub(crate) fn encode_compute_for(
     put32(w, d + manager::INDEX, r.uma_slot);
     put32(w, d + manager::ONE, 2);
     put64(w, d + manager::FREELIST, r.pool_state_gva);
-    put32(w, d + manager::UNK_1C, manager::UNK_1C_VALUE);
-    put32(w, d + manager::SEEDS_A, 8192);
-    put32(w, d + manager::SEEDS_B, 8192);
+    put32(w, d + manager::UNK_1C, rt.records);
+    put32(w, d + manager::SEEDS_A, rt.seeds);
+    put32(w, d + manager::SEEDS_B, rt.seeds);
     put64(w, d + manager::POOL_TABLE, r.page_list_gva);
     put32(w, d + 0x40, 4);
-    put32(w, d + 0x48, 128);
+    put32(w, d + manager::ROW_WORDS, pools::row_words(rt.seeds));
     put64(w, compute::DESCRIPTOR_COUNTER, r.counter_fw);
     // Native M+0x5c distinguishes shared compute from per-workqueue-private pools.
     // Retain the existing value for these persistent units reused across queues;

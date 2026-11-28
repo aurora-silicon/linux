@@ -13,8 +13,18 @@ pub(crate) const PSTATE_MAX: u32 = 10;
 pub(crate) const TOP_DEFAULT: u32 = 9;
 pub(crate) const COOLING_MAX: u32 = 8;
 pub(crate) const SAMPLE_NS: u64 = 5_000_000;
-/// Utilization window of the governor.
+/// Utilization window of the governor (slow decay cadence).
 pub(crate) const WINDOW_NS: u64 = 20_000_000;
+/// Fast upward ramp window aligned with the PMP sampling cadence ([`SAMPLE_NS`], 5 ms = 1/4
+/// of [`WINDOW_NS`]) so active bursts step up before the full window closes without
+/// overshooting on light periodic desktop frames.
+pub(crate) const RAMP_WINDOW_NS: u64 = SAMPLE_NS;
+/// Short idle hold before dropping the CLPC active hint between consecutive jobs.
+/// `drivers/soc/apple/clpc.c` already holds DCS/fabric rails for `APPLE_CLPC_HOLD_MS` (32 ms)
+/// on a `APPLE_CLPC_SAMPLE_MS` (4 ms) cadence; a 2 ms hold (half of `APPLE_CLPC_SAMPLE_MS`)
+/// bridges sub-ms depth-1 inter-job gaps and avoids redundant `mod_delayed_work(..., 0)`
+/// flushes without holding across 60 Hz (16.67 ms) or 120 Hz (8.33 ms) frame periods.
+pub(crate) const CLPC_IDLE_HOLD_NS: u64 = 2_000_000;
 /// Lowest governed state. On the J713 S1-S3 draw under 0.1 W for a desktop
 /// load and S4 several times that; S3 runs at 2.4 times the clock of S1.
 pub(crate) const FLOOR: u32 = 3;
@@ -88,6 +98,99 @@ pub(crate) fn demand(current: u32, util: u32, average: u32, top: u32) -> u32 {
     next.clamp(FLOOR, top)
 }
 
+/// Fast upward-only demand step for partial burst windows ([`RAMP_WINDOW_NS`]):
+/// matches [`demand`]'s upward thresholds (`>= 70%` -> `top`, `>= 40%` -> `+1`) and
+/// never decays, so light periodic frames cannot pump to `top` while sustained bursts
+/// still reach `top` within one 5 ms sample.
+pub(crate) fn ramp_demand(current: u32, util: u32, top: u32) -> u32 {
+    let top = top.clamp(FLOOR, PSTATE_MAX);
+    let next = if util >= 70 {
+        top
+    } else if util >= 40 {
+        current.saturating_add(1)
+    } else {
+        current
+    };
+    next.max(current).clamp(FLOOR, top)
+}
+
+/// CLPC active-floor hysteresis: keeps the memory and fabric floor raised for
+/// [`CLPC_IDLE_HOLD_NS`] after flights drain so short `d=1` inter-job gaps do
+/// not drop and re-raise CLPC on every submission.
+pub(crate) struct ClpcHold {
+    reported: Option<bool>,
+    idle_since: Option<u64>,
+}
+
+impl ClpcHold {
+    pub(crate) const fn new() -> Self {
+        Self {
+            reported: None,
+            idle_since: None,
+        }
+    }
+
+    /// Updates work-in-flight state. Returns `Some(active)` only when the
+    /// CLPC provider must transition immediately.
+    pub(crate) fn report(&mut self, in_flight: bool, now: u64) -> Option<bool> {
+        if in_flight {
+            self.idle_since = None;
+            if self.reported != Some(true) {
+                self.reported = Some(true);
+                return Some(true);
+            }
+            return None;
+        }
+        if self.reported == Some(true) {
+            self.idle_since.get_or_insert(now);
+            None
+        } else if self.reported.is_none() {
+            self.reported = Some(false);
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Releases a held CLPC floor once [`CLPC_IDLE_HOLD_NS`] has elapsed idle.
+    pub(crate) fn expire(&mut self, now: u64) -> bool {
+        if self.reported == Some(true)
+            && self
+                .idle_since
+                .is_some_and(|since| now.wrapping_sub(since) >= CLPC_IDLE_HOLD_NS)
+        {
+            self.idle_since = None;
+            self.reported = Some(false);
+            return true;
+        }
+        false
+    }
+
+    /// Immediately drops the CLPC floor (fail-stop or system sleep).
+    pub(crate) fn release_now(&mut self) -> bool {
+        self.idle_since = None;
+        if self.reported != Some(false) {
+            self.reported = Some(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the CLPC floor is currently being held across an idle gap.
+    pub(crate) fn holding(&self) -> bool {
+        self.reported == Some(true) && self.idle_since.is_some()
+    }
+}
+
+/// Maximum inter-flight idle gap bridged for active-burst GPU demand.
+/// Matches [`CLPC_IDLE_HOLD_NS`] (2 ms): back-to-back `d=1` CPU-recording bursts
+/// sit well below 2 ms while 60 Hz (16.67 ms) and 120 Hz (8.33 ms) desktop frames
+/// exceed it cleanly and stay at [`FLOOR`].
+const BURST_GAP_NS: u64 = CLPC_IDLE_HOLD_NS;
+/// Consecutive sub-`BURST_GAP_NS` turnarounds required before bridging short gaps.
+const BURST_STREAK_ON: u32 = 4;
+
 /// Busy-time accounting over the governor's windows. The engine reports each
 /// publication and drain; each power service closes the window once it is due.
 pub(crate) struct Governor {
@@ -98,6 +201,8 @@ pub(crate) struct Governor {
     pub(crate) top: u32,
     window_ns: u64,
     busy_since: Option<u64>,
+    idle_since: Option<u64>,
+    burst_streak: u32,
     busy_ns: u64,
 }
 
@@ -109,19 +214,35 @@ impl Governor {
             top: TOP_DEFAULT,
             window_ns: 0,
             busy_since: None,
+            idle_since: None,
+            burst_streak: 0,
             busy_ns: 0,
         }
     }
 
     /// The engine published work; it stays busy until [`Governor::idle`].
     pub(crate) fn busy(&mut self, now: u64) {
-        self.busy_since.get_or_insert(now);
+        if self.busy_since.is_none() {
+            if let Some(idle_at) = self.idle_since.take() {
+                let gap = now.saturating_sub(idle_at);
+                if gap < BURST_GAP_NS {
+                    self.burst_streak = self.burst_streak.saturating_add(1);
+                    if self.burst_streak >= BURST_STREAK_ON {
+                        self.busy_ns = self.busy_ns.saturating_add(gap);
+                    }
+                } else {
+                    self.burst_streak = 0;
+                }
+            }
+            self.busy_since = Some(now);
+        }
     }
 
     /// The engine drained.
     pub(crate) fn idle(&mut self, now: u64) {
         if let Some(since) = self.busy_since.take() {
             self.busy_ns += now.saturating_sub(since);
+            self.idle_since = Some(now);
         }
     }
 
@@ -131,12 +252,34 @@ impl Governor {
         self.busy_since.is_none() && self.demand > FLOOR
     }
 
+    /// Whether a busy engine below its ceiling has enough partial-window
+    /// utilization to step up before the full [`WINDOW_NS`] window closes.
+    pub(crate) fn ramp_due(&self, now: u64, limit: u32) -> bool {
+        let cap = self.top.min(limit);
+        if self.demand >= cap || self.busy_since.is_none() {
+            return false;
+        }
+        let window = now.wrapping_sub(self.window_ns);
+        if window < RAMP_WINDOW_NS {
+            return false;
+        }
+        let active = self.busy_since.map_or(0, |s| now.saturating_sub(s));
+        let util = utilization(self.busy_ns.saturating_add(active), window);
+        ramp_demand(self.demand, util, self.top).min(limit) > self.demand
+    }
+
     /// Closes the window once it is due and returns the state to publish
     /// under the ceiling `limit`; `busy` is whether flights are outstanding.
     pub(crate) fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
         // Recovery can drop flights without a drain.
         if !busy {
             self.idle(now);
+            if self
+                .idle_since
+                .is_some_and(|at| now.saturating_sub(at) >= BURST_GAP_NS)
+            {
+                self.burst_streak = 0;
+            }
         }
         let window = now.wrapping_sub(self.window_ns);
         if window >= WINDOW_NS {
@@ -149,8 +292,172 @@ impl Governor {
             self.demand = demand(self.demand.min(limit), util, self.average, self.top);
             self.window_ns = now;
             self.busy_ns = 0;
+        } else if busy && window >= RAMP_WINDOW_NS && self.demand < self.top.min(limit) {
+            let active = self.busy_since.map_or(0, |since| now.saturating_sub(since));
+            let util = utilization(self.busy_ns.saturating_add(active), window);
+            let next = ramp_demand(self.demand.min(limit), util, self.top).min(limit);
+            if next > self.demand {
+                self.demand = next;
+            }
         }
         self.demand.min(limit)
+    }
+}
+
+/// Startup/fault confirmation cadence (minimum spacing across 10 distinct sensor polls)
+/// and gradual cooling-release step interval.
+pub(crate) const ZONE_CONFIRM_NS: u64 = 20_000_000;
+pub(crate) const ZONE_CONFIRM_READS: u32 = 10;
+pub(crate) const ZONE_RELEASE_NS: u64 = 200_000_000;
+
+/// Machine-supplied thermal-zone trip limits (millidegrees Celsius) read from the kernel
+/// thermal zone (`passive`/`active` trip with hysteresis, and `hot`/`critical` trip).
+/// If the machine provides no valid limits, [`ZoneBackstop`] fails closed at [`COOLING_MAX`] (S1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ZoneLimits {
+    pub(crate) release_mc: i64,
+    pub(crate) hot_mc: i64,
+    pub(crate) critical_mc: i64,
+}
+
+impl ZoneLimits {
+    pub(crate) const fn is_valid(&self) -> bool {
+        self.release_mc > 0 && self.release_mc <= self.hot_mc && self.critical_mc > self.hot_mc
+    }
+}
+
+/// Cooling level for a measured thermal-zone die temperature against machine-supplied trip
+/// limits: 0 below `hot_mc`, 1..=7 linearly across `hot_mc..critical_mc`, and [`COOLING_MAX`]
+/// at or above `critical_mc` (or whenever `limits` are invalid).
+pub(crate) fn zone_heat_level(mc: i64, limits: ZoneLimits) -> u32 {
+    if !limits.is_valid() {
+        return COOLING_MAX;
+    }
+    if mc < limits.hot_mc {
+        0
+    } else if mc >= limits.critical_mc {
+        COOLING_MAX
+    } else {
+        let span = limits.critical_mc - limits.hot_mc;
+        let delta = mc - limits.hot_mc;
+        let steps = (COOLING_MAX - 1) as i64;
+        (((delta * steps) / span) as u32 + 1).min(COOLING_MAX)
+    }
+}
+
+/// Fail-closed thermal backstop driven by kernel SoC die thermal zones when a GPU DT node
+/// has no `apple,pmp` telemetry bridge. Starts at [`COOLING_MAX`] (S1), requires
+/// [`ZONE_CONFIRM_READS`] distinct fresh sensor polls with valid machine-supplied trip limits
+/// before stepping down gradually, and immediately clamps back to [`COOLING_MAX`] on missing,
+/// stale, unconfigured, or critical readings.
+pub(crate) struct ZoneBackstop {
+    level: u32,
+    hard: bool,
+    good_reads: u32,
+    last_seq: u64,
+    good_ns: u64,
+    release_ns: u64,
+}
+
+impl ZoneBackstop {
+    pub(crate) const fn new() -> Self {
+        Self {
+            level: COOLING_MAX,
+            hard: true,
+            good_reads: 0,
+            last_seq: 0,
+            good_ns: 0,
+            release_ns: 0,
+        }
+    }
+
+    pub(crate) const fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Incorporates one sampled temperature (millidegrees Celsius), poller sequence `seq`,
+    /// machine-supplied `limits`, or sensor `error` at `now`.
+    pub(crate) fn sample(
+        &mut self,
+        now: u64,
+        seq: u64,
+        mc: i64,
+        limits: Option<ZoneLimits>,
+        error: bool,
+    ) -> u32 {
+        let Some(limits) = limits.filter(ZoneLimits::is_valid) else {
+            self.level = COOLING_MAX;
+            self.hard = true;
+            self.good_reads = 0;
+            if seq != 0 {
+                self.last_seq = seq;
+            }
+            self.good_ns = now;
+            self.release_ns = now;
+            return self.level;
+        };
+
+        if error || seq == 0 || mc <= 0 || mc >= limits.critical_mc {
+            self.level = COOLING_MAX;
+            self.hard = true;
+            self.good_reads = 0;
+            if seq != 0 {
+                self.last_seq = seq;
+            }
+            self.good_ns = now;
+            self.release_ns = now;
+            return self.level;
+        }
+
+        let fresh = seq != self.last_seq;
+        if self.hard {
+            if mc < limits.hot_mc {
+                let due = self.good_reads == 0 || now.wrapping_sub(self.good_ns) >= ZONE_CONFIRM_NS;
+                if fresh && due {
+                    self.last_seq = seq;
+                    self.good_ns = now;
+                    self.good_reads = self.good_reads.saturating_add(1).min(ZONE_CONFIRM_READS);
+                }
+                if self.good_reads >= ZONE_CONFIRM_READS {
+                    self.hard = false;
+                }
+            } else {
+                self.last_seq = seq;
+                self.good_reads = 0;
+                self.good_ns = now;
+            }
+            self.release_ns = now;
+            if self.hard {
+                return self.level;
+            }
+        }
+
+        if fresh {
+            self.last_seq = seq;
+        }
+        let target = zone_heat_level(mc, limits);
+        if target > self.level {
+            self.level = target;
+            self.release_ns = now;
+        } else if fresh
+            && mc < limits.release_mc
+            && now.wrapping_sub(self.release_ns) >= ZONE_RELEASE_NS
+        {
+            self.level = self.level.saturating_sub(1);
+            self.release_ns = now;
+        } else if mc >= limits.release_mc {
+            self.release_ns = now;
+        }
+        self.level
+    }
+
+    /// Retains a cooling-device governor restriction inside the gradual release envelope.
+    pub(crate) fn observe(&mut self, now: u64, governor: u32) {
+        let clamped = governor.min(COOLING_MAX);
+        if clamped > self.level {
+            self.level = clamped;
+            self.release_ns = now;
+        }
     }
 }
 
@@ -386,5 +693,333 @@ mod tests {
         assert_eq!(cooling_ceiling(10, COOLING_MAX), 1);
         assert_eq!(cooling_ceiling(10, u32::MAX), 1);
         assert_eq!(limit(10, cooling_ceiling(10, 0), 10), 10);
+    }
+
+    #[test]
+    fn fast_ramp_raises_active_bursts_while_preserving_decay_and_cooling_ceiling() {
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        // Simulate d=1 back-to-back burst (80% busy) from FLOOR: reaches S10 at 5 ms.
+        let mut t = T;
+        for _ in 0..20 {
+            g.busy(t);
+            g.idle(t + 200_000);
+            t += 250_000;
+        }
+        assert_eq!(t, T + RAMP_WINDOW_NS);
+        g.busy(t);
+        assert!(g.ramp_due(t, PSTATE_MAX));
+        assert_eq!(g.govern(t, PSTATE_MAX, true), PSTATE_MAX);
+        assert!(!g.ramp_due(t, PSTATE_MAX));
+
+        // Moderate 50% active load steps +1 (aligned with demand()), never jumps to top
+        // and never decays before the full 20 ms window.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        g.busy(T);
+        g.idle(T + 2_500_000);
+        g.busy(T + RAMP_WINDOW_NS);
+        assert!(g.ramp_due(T + RAMP_WINDOW_NS, PSTATE_MAX));
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS, PSTATE_MAX, true), FLOOR + 1);
+        g.idle(T + RAMP_WINDOW_NS);
+        assert_eq!(g.govern(T + WINDOW_NS - 1, PSTATE_MAX, false), FLOOR + 1);
+
+        // Light 60 Hz compositor frames (2.5 ms busy every 16.67 ms -> 15% over 20 ms)
+        // never pump to top and settle back at FLOOR.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut now = T;
+        for _ in 0..10 {
+            g.busy(now);
+            assert!(g.govern(now + 2_500_000, PSTATE_MAX, true) <= FLOOR + 1);
+            g.idle(now + 2_500_000);
+            now += 16_666_667;
+            let state = g.govern(now, PSTATE_MAX, false);
+            assert!(state <= FLOOR + 1);
+        }
+        assert_eq!(g.demand, FLOOR);
+
+        // Thermal cooling ceiling clamps stored demand too: relaxing by one level steps
+        // cleanly to cap + 1 rather than jumping straight to top.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        g.busy(T);
+        let cap = cooling_ceiling(PSTATE_MAX, 5);
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS, cap, true), cap);
+        assert_eq!(g.demand, cap);
+        assert!(!g.ramp_due(T + RAMP_WINDOW_NS, cap));
+        // Even if the ceiling opens to TOP right after the capped ramp, stored demand
+        // stays at `cap` until new utilization above `cap` is observed.
+        g.idle(T + RAMP_WINDOW_NS + 1);
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS + 2, PSTATE_MAX, false), cap);
+        assert_eq!(g.demand, cap);
+    }
+
+    #[test]
+    fn clpc_hold_keeps_floor_across_short_gaps_and_releases_on_expiry_or_reset() {
+        let mut hold = ClpcHold::new();
+        assert!(!hold.holding());
+        assert_eq!(hold.report(true, T), Some(true));
+        assert!(!hold.holding());
+        // Short idle gap (< 2 ms): CLPC stays active without toggling.
+        assert_eq!(hold.report(false, T + 200_000), None);
+        assert!(hold.holding());
+        assert!(!hold.expire(T + 200_000 + CLPC_IDLE_HOLD_NS - 1));
+        assert_eq!(hold.report(true, T + 500_000), None);
+        assert!(!hold.holding());
+        // Full 2 ms idle expires and releases the CLPC floor (well below 60/120 Hz frames).
+        assert_eq!(hold.report(false, T + 1_000_000), None);
+        assert!(hold.holding());
+        assert!(hold.expire(T + 1_000_000 + CLPC_IDLE_HOLD_NS));
+        assert!(!hold.holding());
+        assert!(!hold.expire(T + 1_000_000 + 2 * CLPC_IDLE_HOLD_NS));
+        // Fail-stop / sleep drops CLPC immediately regardless of hold timer.
+        assert_eq!(hold.report(true, T + 30_000_000), Some(true));
+        assert_eq!(hold.report(false, T + 30_100_000), None);
+        assert!(hold.holding());
+        assert!(hold.release_now());
+        assert!(!hold.holding());
+        assert!(!hold.release_now());
+    }
+
+    #[test]
+    fn active_burst_demand_ramps_low_duty_d1_while_preserving_120hz_and_idle_decay() {
+        // Low-duty d=1 CPU-recording-bound burst: 170 us GPU + 600 us host gap (22% raw duty,
+        // < 2 ms turnaround). Bridges short refill gaps after BURST_STREAK_ON and ramps to top.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut t = T;
+        for _ in 0..8 {
+            g.busy(t);
+            g.idle(t + 170_000);
+            t += 770_000;
+        }
+        assert!(t - T >= RAMP_WINDOW_NS);
+        g.busy(t);
+        assert!(g.ramp_due(t, PSTATE_MAX));
+        assert_eq!(g.govern(t, PSTATE_MAX, true), PSTATE_MAX);
+
+        // Once idle, burst streak resets after 2 ms and demand decays cleanly back to FLOOR.
+        g.idle(t + 170_000);
+        let mut now = t + 170_000;
+        for _ in 0..20 {
+            now += WINDOW_NS;
+            let _ = g.govern(now, PSTATE_MAX, false);
+        }
+        assert_eq!(g.demand, FLOOR);
+        assert!(!g.decaying());
+
+        // 120 Hz desktop pacing (2 ms busy every 8.33 ms -> 6.33 ms gap >= 2 ms) never bridges
+        // gaps and stays bounded at FLOOR.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut now = T;
+        for _ in 0..16 {
+            g.busy(now);
+            assert!(g.govern(now + 2_000_000, PSTATE_MAX, true) <= FLOOR + 1);
+            g.idle(now + 2_000_000);
+            now += 8_333_333;
+            assert!(g.govern(now, PSTATE_MAX, false) <= FLOOR + 1);
+        }
+        assert_eq!(g.demand, FLOOR);
+    }
+
+    #[test]
+    fn zone_backstop_starts_fail_closed_releases_gradually_and_clamps_on_heat_or_fault() {
+        let limits = ZoneLimits {
+            release_mc: 75_000,
+            hot_mc: 80_000,
+            critical_mc: 94_000,
+        };
+        let mut z = ZoneBackstop::new();
+        assert_eq!(z.level(), COOLING_MAX);
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Missing or invalid machine trip limits keep the GPU clamped at S1 forever.
+        for i in 1..=20u64 {
+            assert_eq!(
+                z.sample(T + i * ZONE_CONFIRM_NS, i, 55_000, None, false),
+                COOLING_MAX
+            );
+        }
+        let bad_limits = ZoneLimits {
+            release_mc: 80_000,
+            hot_mc: 80_000,
+            critical_mc: 80_000,
+        };
+        assert_eq!(
+            z.sample(T + 500_000_000, 21, 55_000, Some(bad_limits), false),
+            COOLING_MAX
+        );
+
+        // Sensor errors or non-positive readings keep the GPU clamped at S1.
+        assert_eq!(
+            z.sample(T + 1_000_000_000, 22, 0, Some(limits), true),
+            COOLING_MAX
+        );
+        assert_eq!(
+            z.sample(T + 1_020_000_000, 23, 0, Some(limits), false),
+            COOLING_MAX
+        );
+
+        // Repeated reads of a single cached temperature (unchanged seq) CANNOT satisfy
+        // startup confirmation even as timestamps advance past 10 * ZONE_CONFIRM_NS.
+        let base = T + 2_000_000_000;
+        let cached_seq = 100u64;
+        for step in 0..50u64 {
+            assert_eq!(
+                z.sample(
+                    base + step * ZONE_CONFIRM_NS,
+                    cached_seq,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX
+            );
+        }
+        // Advancing past release interval with the same cached seq still stays at S1.
+        assert_eq!(
+            z.sample(
+                base + 60 * ZONE_CONFIRM_NS + ZONE_RELEASE_NS,
+                cached_seq,
+                55_000,
+                Some(limits),
+                false
+            ),
+            COOLING_MAX
+        );
+
+        // 9 more distinct fresh sensor polls complete the 10-poll startup confirmation.
+        let fresh_base = base + 60 * ZONE_CONFIRM_NS + 2 * ZONE_RELEASE_NS;
+        for step in 1..ZONE_CONFIRM_READS as u64 {
+            assert_eq!(
+                z.sample(
+                    fresh_base + step * ZONE_CONFIRM_NS,
+                    cached_seq + step,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX
+            );
+        }
+        // Gradual release: one cooling level per fresh poll every 200 ms below release_mc.
+        let confirmed = fresh_base + (ZONE_CONFIRM_READS as u64 - 1) * ZONE_CONFIRM_NS;
+        let mut seq = cached_seq + ZONE_CONFIRM_READS as u64;
+        assert_eq!(
+            z.sample(confirmed + ZONE_RELEASE_NS - 1, seq, 55_000, Some(limits), false),
+            COOLING_MAX
+        );
+        for step in 1..=COOLING_MAX as u64 {
+            seq += 1;
+            assert_eq!(
+                z.sample(
+                    confirmed + step * ZONE_RELEASE_NS,
+                    seq,
+                    55_000,
+                    Some(limits),
+                    false
+                ),
+                COOLING_MAX - step as u32
+            );
+        }
+        assert_eq!(z.level(), 0);
+        assert_eq!(cooling_ceiling(8, z.level()), 8);
+
+        // Progressive heat throttling across hot_mc..critical_mc, hard clamp at >= critical_mc.
+        let hot_t = confirmed + 10 * ZONE_RELEASE_NS;
+        seq += 1;
+        assert_eq!(z.sample(hot_t, seq, 79_999, Some(limits), false), 0);
+        seq += 1;
+        assert_eq!(z.sample(hot_t + 10_000_000, seq, 80_000, Some(limits), false), 1);
+        seq += 1;
+        assert_eq!(z.sample(hot_t + 20_000_000, seq, 86_000, Some(limits), false), 4);
+        // Holding between release_mc and hot_mc does not release cooling.
+        seq += 1;
+        assert_eq!(
+            z.sample(hot_t + 500_000_000, seq, 75_000, Some(limits), false),
+            4
+        );
+        seq += 1;
+        assert_eq!(
+            z.sample(hot_t + 1_000_000_000, seq, 79_000, Some(limits), false),
+            4
+        );
+        // Critical heat immediately returns to hard COOLING_MAX (S1).
+        seq += 1;
+        assert_eq!(
+            z.sample(
+                hot_t + 1_010_000_000,
+                seq,
+                limits.critical_mc,
+                Some(limits),
+                false
+            ),
+            COOLING_MAX
+        );
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Different machine-supplied trip limits govern dynamically without code constants.
+        let higher_limits = ZoneLimits {
+            release_mc: 85_000,
+            hot_mc: 90_000,
+            critical_mc: 104_000,
+        };
+        let mut z2 = ZoneBackstop::new();
+        for step in 1..=ZONE_CONFIRM_READS as u64 {
+            z2.sample(
+                base + step * ZONE_CONFIRM_NS,
+                step,
+                84_000,
+                Some(higher_limits),
+                false,
+            );
+        }
+        let c2 = base + (ZONE_CONFIRM_READS as u64) * ZONE_CONFIRM_NS;
+        for step in 1..=COOLING_MAX as u64 {
+            z2.sample(
+                c2 + step * ZONE_RELEASE_NS,
+                ZONE_CONFIRM_READS as u64 + step,
+                84_000,
+                Some(higher_limits),
+                false,
+            );
+        }
+        assert_eq!(z2.level(), 0);
+        // 89 C is still below higher_limits.hot_mc (90 C).
+        assert_eq!(
+            z2.sample(
+                c2 + 9 * ZONE_RELEASE_NS,
+                100,
+                89_000,
+                Some(higher_limits),
+                false
+            ),
+            0
+        );
+        // Governor observation is retained in the release envelope.
+        z2.observe(c2 + 9 * ZONE_RELEASE_NS, 5);
+        assert_eq!(z2.level(), 5);
+        assert_eq!(
+            z2.sample(
+                c2 + 9 * ZONE_RELEASE_NS + 1,
+                101,
+                84_000,
+                Some(higher_limits),
+                false
+            ),
+            5
+        );
+        assert_eq!(
+            z2.sample(
+                c2 + 10 * ZONE_RELEASE_NS,
+                102,
+                84_000,
+                Some(higher_limits),
+                false
+            ),
+            4
+        );
     }
 }

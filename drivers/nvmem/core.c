@@ -204,8 +204,13 @@ static ssize_t force_ro_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
 	struct nvmem_device *nvmem = to_nvmem_device(dev);
-	int ret = kstrtobool(buf, &nvmem->read_only);
+	int ret;
 
+	/* It would only govern the kernel's cell writes. */
+	if (nvmem->sysfs_read_only)
+		return -EPERM;
+
+	ret = kstrtobool(buf, &nvmem->read_only);
 	if (ret < 0)
 		return ret;
 
@@ -266,6 +271,10 @@ static ssize_t bin_attr_nvmem_write(struct file *filp, struct kobject *kobj,
 		dev = kobj_to_dev(kobj);
 	nvmem = to_nvmem_device(dev);
 
+	/* Whatever the file's mode, and whatever force_ro says */
+	if (nvmem->sysfs_read_only)
+		return -EPERM;
+
 	if (!IS_ALIGNED(pos, nvmem->stride))
 		return -EINVAL;
 
@@ -296,7 +305,7 @@ static umode_t nvmem_bin_attr_get_umode(struct nvmem_device *nvmem)
 	if (!nvmem->root_only)
 		mode |= 0044;
 
-	if (!nvmem->read_only)
+	if (!nvmem->read_only && !nvmem->sysfs_read_only)
 		mode |= 0200;
 
 	if (!ops->reg_write)
@@ -344,6 +353,10 @@ static umode_t nvmem_attr_is_visible(struct kobject *kobj,
 	 */
 	if (attr == &dev_attr_force_ro.attr && !ops->reg_write)
 		return 0;	/* Attribute not visible */
+
+	/* Shown, but it cannot make the device's file writable. */
+	if (attr == &dev_attr_force_ro.attr && nvmem->sysfs_read_only)
+		return 0444;
 
 	return attr->mode;
 }
@@ -945,6 +958,7 @@ struct nvmem_device *nvmem_register(const struct nvmem_config *config)
 	nvmem->word_size = config->word_size ?: 1;
 	nvmem->size = config->size;
 	nvmem->root_only = config->root_only;
+	nvmem->sysfs_read_only = config->sysfs_read_only;
 	nvmem->priv = config->priv;
 	nvmem->type = config->type;
 	nvmem->keepout = config->keepout;

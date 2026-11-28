@@ -3,7 +3,7 @@
  * The audio of the M5 Mac Studio (J775c, J775d): the headphone jack (a
  * CS42L84) and the built-in speaker (one SN012776), both reached through the
  * AOP's audio services. The card waits for its CPU component, the AOP audio
- * node, which exists only after the boot loader's AOP handoff.
+ * node, which exists once the board enables the AOP.
  *
  * The speaker is described but stays off: the ADT's audio-speaker stream has
  * no RX (sense) slot, and macaudio admits the speaker only once a protection

@@ -152,8 +152,8 @@ pub(crate) struct Identity {
     pub(crate) core_masks: [u32; 2],
 }
 
-/// Fault-bank selector values (`+0xd800`) that name a fault bank.
-const FAULT_BANKS: u64 = 8;
+/// Maximum number of fault banks across the supported SGX status windows.
+const MAX_FAULT_BANKS: usize = 8;
 
 /// Engine receipts: busy bit and one fault bank.
 #[derive(Copy, Clone, Default)]
@@ -177,6 +177,29 @@ impl EngineState {
     }
 }
 
+/// Fault-register snapshot taken while firmware is halted for recovery.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct FaultScan {
+    /// Bit 0 of `+0xc020 | +0xc120`.
+    pub(crate) busy: u64,
+    /// Selector (`+0xd800`) observed before scanning and restored afterwards.
+    pub(crate) saved_bank: u64,
+    bank_count: usize,
+    /// Raw status (`+0xd8c0`) and address (`+0xd8c8 << 6`) of each fault bank.
+    banks: [EngineState; MAX_FAULT_BANKS],
+}
+
+impl FaultScan {
+    pub(crate) fn banks(&self) -> &[EngineState] {
+        &self.banks[..self.bank_count]
+    }
+
+    /// First bank whose latched fault bit (bit 0) is set.
+    pub(crate) fn first_latched(&self) -> Option<&EngineState> {
+        self.banks().iter().find(|entry| entry.status & 1 != 0)
+    }
+}
+
 /// G16 register access.
 pub(crate) struct Regs {
     /// The shared SGX mapping.
@@ -185,10 +208,11 @@ pub(crate) struct Regs {
     asc: Mapping,
     /// SGX status window (`sgx + 0xc000`, 0x4000).
     status: Mapping,
+    fault_banks: usize,
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
     /// GFXCAXI2AF registers (SGX +0x1000000), written only by the 27.2 start.
-    axi2af: Mapping,
+    axi2af: Option<Mapping>,
     /// Highest firmware performance state the board's table holds: S9 until the table is
     /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
     top: AtomicU32,
@@ -196,7 +220,14 @@ pub(crate) struct Regs {
 
 impl Regs {
     /// Maps the ASC control page and the SGX status window.
-    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Result<Self> {
+    pub(crate) fn new(
+        pdev: &platform::Device<Core<'_>>,
+        res: G16Resources,
+        cfg: &super::Config,
+    ) -> Result<Self> {
+        if !(1..=MAX_FAULT_BANKS).contains(&cfg.fault_banks) {
+            return Err(EINVAL);
+        }
         let window = |name: &CStr, offset: u64| -> Result<Mapping> {
             let r = pdev.resource_by_name(name).ok_or(EINVAL)?;
             let nonposted = r
@@ -210,11 +241,20 @@ impl Regs {
         Ok(Self {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
-            generation: window(c_str!("sgx"), 0xd60000)?,
-            axi2af: window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64)?,
+            fault_banks: cfg.fault_banks,
+            generation: window(c_str!("sgx"), super::hw::HOST_BLOCK)?,
+            axi2af: cfg
+                .axi2af
+                .then(|| window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64))
+                .transpose()?,
             top: AtomicU32::new(9),
             res,
         })
+    }
+
+    /// Physical base of the SGX resource.
+    pub(crate) fn sgx_pa(&self) -> u64 {
+        self.generation.phys - super::hw::HOST_BLOCK
     }
 
     /// Reads the identification words and the enabled-core mask (after the AGX vote on 25G83).
@@ -233,7 +273,9 @@ impl Regs {
 
     /// Adopts the board's firmware performance table, `rows` rows including off.
     pub(crate) fn set_table(&self, rows: u32) {
-        let top = rows.saturating_sub(1).clamp(1, super::fw::initdata::PERF_STATES as u32 - 1);
+        let top = rows
+            .saturating_sub(1)
+            .clamp(1, super::fw::initdata::PERF_STATES as u32 - 1);
         self.top.store(top, Ordering::Relaxed);
     }
 
@@ -265,7 +307,10 @@ impl Regs {
 
     /// 26B123 before RUN: sets bit 0 of the two GFXCAXI2AF enables, each read first.
     pub(crate) fn enable_axi2af(&self) -> Result {
-        let r = self.axi2af.io();
+        let Some(axi2af) = &self.axi2af else {
+            return Ok(());
+        };
+        let r = axi2af.io();
         for offset in super::hw::start_27_2::AXI2AF_ENABLES {
             let value = r.try_read32(offset)?;
             r.try_write32(value | 1, offset)?;
@@ -274,17 +319,23 @@ impl Regs {
         Ok(())
     }
 
-    /// 26B123 after AP power-on and before the GPU endpoints start: zeroes the host block,
-    /// reads the scratch word, then reads and raises the ready word. Returns the scratch word.
-    pub(crate) fn publish_host_block(&self) -> Result<u32> {
+    /// 26B123 after AP power-on and before the GPU endpoints start: reads then zeroes each
+    /// host-block control word, and on G16G reads the scratch word and raises the ready word.
+    pub(crate) fn publish_host_block(&self, cfg: &super::Config) -> Result<Option<u32>> {
         use super::hw::start_27_2 as s;
         let g = self.generation.io();
-        for offset in s::HOST_BLOCK_ZERO_ORDER {
+        for &offset in cfg.host_block_zero_order {
+            let _ = g.try_read32(offset)?;
             g.try_write32(0, offset)?;
         }
-        let probe = self.res.sgx_read32_at(s::SCRATCH_PROBE)?;
-        let _ = g.try_read32(s::HOST_READY)?;
-        g.try_write32(1, s::HOST_READY)?;
+        let probe = if cfg.host_block_ready {
+            let probe = self.res.sgx_read32_at(s::SCRATCH_PROBE)?;
+            let _ = g.try_read32(s::HOST_READY)?;
+            g.try_write32(1, s::HOST_READY)?;
+            Some(probe)
+        } else {
+            None
+        };
         mb();
         Ok(probe)
     }
@@ -313,29 +364,42 @@ impl Regs {
         })
     }
 
-    /// Engine receipts for a firmware halted for recovery and waiting on the host: the first
-    /// fault bank, selectors 0 to 7 in order, whose status has bit 0 set, with the saved
-    /// selector restored. Without a fault, the status is zero and the bank the saved selector.
-    pub(crate) fn fault_scan(&self) -> Result<EngineState> {
+    /// Engine receipts for a firmware halted for recovery and waiting on the host: reads all
+    /// supported fault banks in order, capturing status and address for every
+    /// non-zero bank, and restores the saved selector.
+    #[inline(never)]
+    pub(crate) fn fault_scan(&self) -> Result<FaultScan> {
         let r = self.status.io();
         let saved = r.try_read64(0x1800)?;
-        let mut state = EngineState {
-            busy: (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1,
-            bank: saved,
-            ..Default::default()
+        let busy = (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1;
+        let mut scan = FaultScan {
+            busy,
+            saved_bank: saved,
+            bank_count: self.fault_banks,
+            banks: [EngineState::default(); MAX_FAULT_BANKS],
         };
-        for bank in 0..FAULT_BANKS {
-            r.try_write64(bank, 0x1800)?;
-            let status = r.try_read64(0x18c0)?;
-            if status & 1 != 0 {
-                state.bank = bank;
-                state.status = status;
-                state.address = r.try_read64(0x18c8)? << 6;
-                break;
+        let result = (|| -> Result {
+            for (idx, entry) in scan.banks[..scan.bank_count].iter_mut().enumerate() {
+                let bank = idx as u64;
+                r.try_write64(bank, 0x1800)?;
+                let status = r.try_read64(0x18c0)?;
+                let address = if status != 0 {
+                    r.try_read64(0x18c8)? << 6
+                } else {
+                    0
+                };
+                *entry = EngineState {
+                    busy,
+                    bank,
+                    status,
+                    address,
+                };
             }
-        }
-        r.try_write64(saved, 0x1800)?;
-        Ok(state)
+            Ok(())
+        })();
+        let restore = r.try_write64(saved, 0x1800);
+        result.and(restore)?;
+        Ok(scan)
     }
 }
 

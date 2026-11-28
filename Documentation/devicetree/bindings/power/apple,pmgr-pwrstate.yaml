@@ -25,11 +25,30 @@ allOf:
         apple,sleep-retained: false
         apple,sleep-driver-owned: false
         apple,always-on: false
+        apple,auto-managed: false
         apple,min-state: false
         apple,force-disable: false
         apple,force-reset: false
         apple,externally-clocked: false
         apple,consumer-switched: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pmgr-pwrstate
+      required:
+        - compatible
+    then:
+      properties:
+        apple,auto-managed: false
+  - if:
+      required:
+        - apple,auto-managed
+    then:
+      properties:
+        apple,no-auto-pm: false
+        apple,firmware-owned: false
+        apple,inherited-on: false
   - if:
       required:
         - apple,consumer-switched
@@ -134,6 +153,18 @@ properties:
       firmware is started cold by Linux and must not be clock or power
       gated behind its back, such as the T6030 external display
       coprocessors' CPU domains.
+    type: boolean
+
+  apple,auto-managed:
+    description: |
+      Hardware-managed power domain (such as a DRAM channel slice or memory
+      fabric) that the boot loader may leave forced on and that must be
+      switched to hardware automatic power management (auto-enable) early
+      at boot, before the PMP firmware starts.
+
+      Once switched, the hardware gates the domain by itself and it has no
+      software-controlled power transitions. On parts where an instance is
+      fused off, its power-state register reads as off.
     type: boolean
 
   apple,sleep-retained:

@@ -132,6 +132,15 @@
 	status = "okay";
 };
 
+/* The SIO itself is described for every M4 Mac in t8132-sio.dtsi. */
+&ps_sio_cpu {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "okay";
+};
+
 /* The J713's full 2560x1664 panel including the notch rows, 224 ppi. */
 &dcp {
 	apple,panel-width-mm = <290>;
@@ -358,20 +367,16 @@
 };
 
 /*
- * t8132-j713-pmgr.dtsi disables SCODEC and SIO_CPU, and their engines with
- * them. Their DARTs, which name those states in t8132-peripherals.dtsi, would
- * wait for them forever if anything enabled them, so drop the reference here.
- * VENC is enabled there: the video encoder and its DARTs below.
+ * t8132-j713-pmgr.dtsi disables SCODEC, and its engines with it. Their DARTs,
+ * which name those states in t8132-peripherals.dtsi, would wait for them
+ * forever if anything enabled them, so drop the reference here. VENC is
+ * enabled there: the video encoder and its DARTs below.
  */
 &dart_ave2 {
 	/delete-property/ power-domains;
 };
 
 &dart_apr0 {
-	/delete-property/ power-domains;
-};
-
-&dart_sio0 {
 	/delete-property/ power-domains;
 };
 

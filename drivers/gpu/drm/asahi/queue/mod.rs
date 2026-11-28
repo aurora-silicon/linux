@@ -197,7 +197,7 @@ pub(crate) trait Queue: Send + Sync {
         &mut self,
         reg_data: &AsahiRegData<'_>,
         id: u64,
-        syncs: KVec<file::SyncItem>,
+        syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
@@ -1010,7 +1010,7 @@ impl Queue for Queue::ver {
         &mut self,
         reg_data: &AsahiRegData<'drm>,
         id: u64,
-        mut syncs: KVec<file::SyncItem>,
+        mut syncs: KVVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
@@ -1280,10 +1280,9 @@ impl Queue for Queue::ver {
 
             // A render's wait for earlier renders is added once its flags are
             // known: without DRM_ASAHI_RENDER_FRAGMENT_BARRIERS it goes on the
-            // vertex queue; with it no barrier is added, since the wait names
-            // only earlier fragment work, which the fragment queue already runs
-            // first, so the vertex half can run beside it. Each fragment half
-            // still waits for its own vertex half.
+            // vertex queue; with it, it goes on the fragment queue, so the
+            // vertex half can run beside the earlier fragment work. Each
+            // fragment half also waits for its own vertex half.
             let is_render =
                 u32::from(header.cmd_type) == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER;
             let mut render_wait = None;
@@ -1318,21 +1317,22 @@ impl Queue for Queue::ver {
                             cls_pr_debug!(Errors, "Unsupported render command fields\n")
                         })?;
 
-                    // With FRAGMENT_BARRIERS the wait names only earlier fragment work of
-                    // this queue (index 0 is its last fragment event, later indices are
-                    // renders of this submission), which the fragment workqueue already
-                    // runs first, so no barrier is needed at all.
+                    // The wait names earlier fragment work of this queue (index 0 is its
+                    // last fragment event, later indices are renders of this
+                    // submission). The fragment workqueue runs that work first, but queue
+                    // order alone does not make it finish first, so with FRAGMENT_BARRIERS
+                    // the wait moves to the fragment half instead of being dropped.
                     let fragment_only = render.flags
                         & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
                         != 0;
-                    if let Some(event) = render_wait.take().filter(|_| !fragment_only) {
+                    if let Some(event) = render_wait.take() {
+                        let queue_job = if fragment_only {
+                            job.get_frag()?
+                        } else {
+                            job.get_vtx()?
+                        };
                         Self::add_explicit_barrier(
-                            &self.dev,
-                            &gpu,
-                            job.get_vtx()?,
-                            &event,
-                            vm_slot,
-                            id,
+                            &self.dev, &gpu, queue_job, &event, vm_slot, id,
                         )?;
                     }
 

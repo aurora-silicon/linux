@@ -8,6 +8,7 @@ use super::parameter_buffer::{M5ParameterBuffer, BLOCK_BYTES, PAGE_LIST_BYTES, P
 use super::target_memory::M5TargetMemory;
 use crate::{driver::AsahiDrmDevice, m5::render_desc, m5::render, mmu};
 use crate::m5::completion::MAX_GRAPHICS_GENERATION;
+use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 
 const HIGH: u64 = 0xffff_fc20_c100_0000;
@@ -271,8 +272,9 @@ impl M5GraphicsJob {
     /// for the new VM and the pools are aliased into it. The previous VM's
     /// render targets are not used in the new VM: they stay cached under the
     /// previous VM for its next turn, and the next application frame takes or
-    /// allocates targets in the new VM. The caller publishes the new roots
-    /// before the next draw.
+    /// allocates targets in the new VM. Pool data storage is cleared before
+    /// the new VM maps it; allocator and parameter-manager state is kept. The
+    /// caller publishes the new roots before the next draw.
     pub(super) fn rebind_vm(&mut self, dev: &AsahiDrmDevice, vm: &mmu::Vm) -> Result {
         if self.owns_vm(vm) { return Ok(()); }
         if self.scheduler_status()? != [2, 0] { return Err(EBUSY); }
@@ -286,6 +288,12 @@ impl M5GraphicsJob {
         for alias in self.parameter_buffer.alias_into(vm)? {
             aliases.push(alias, GFP_KERNEL)?;
         }
+        // Compute operands and the preemption page released by the previous
+        // VM may still hold its data; clear them, and restore the zero
+        // robustness page, before another VM maps them.
+        self.compute_storage.with_bytes_mut(|out| { out.fill(0); Ok(()) })?;
+        // Order the clears before the new roots and the next draw are published.
+        fence(Ordering::SeqCst);
         let storage = self.compute_storage.iova();
         if let Some(alias) = self.compute_storage.map_alias_at_with_guards(
             vm, storage, mmu::PROT_GPU_SHARED_RW, 2)? {

@@ -52,10 +52,12 @@ early_param("idle", setup_idle);
  */
 static bool apple_wfi_loses_regs __ro_after_init;
 static bool apple_keep_idle_nop __initdata;
+static bool apple_wfi_deferred __initdata;
 
 /*
- * The boot loader appends idle=nop after the user's arguments, so it cannot
- * be overridden on the command line. This flag keeps it anyway.
+ * Older boot loaders append idle=nop after the user's arguments on these
+ * cores, so it cannot be overridden on the command line, and it is ignored
+ * below. This flag keeps it anyway, for comparisons.
  */
 static int __init setup_apple_keep_idle_nop(char *arg)
 {
@@ -66,26 +68,43 @@ early_param("apple_keep_idle_nop", setup_apple_keep_idle_nop);
 
 void __init apple_wfi_quirk_init(void)
 {
-	u32 model = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+	if (!midr_is_apple_m4_or_later(read_cpuid_id()))
+		return;
 
-	if (midr_is_apple_m4_or_later(read_cpuid_id())) {
-		apple_wfi_loses_regs = true;
-		pr_info("Apple: preserving registers across WFI\n");
-	}
+	apple_wfi_loses_regs = true;
+	pr_info("Apple: preserving registers across WFI\n");
+
 	/*
-	 * aura (J813) and m1n1 (T6050) pass idle=nop on M4 and later for
-	 * kernels without this quirk. Spinning idle keeps every core busy
-	 * (cpuidle's WFI states spin too): on T8142 the SoC sits near 90 C
-	 * and throttles, on T6050 the system draws about 10 W more at idle.
-	 * WFI is safe here.
+	 * aura and m1n1 used to pass idle=nop on M4 and later for kernels
+	 * without this path. Spinning idle keeps every core busy (cpuidle's
+	 * WFI states spin too): on T8142 the SoC sits near 90 C and
+	 * throttles, on T6050 the system draws about 10 W more at idle, on
+	 * T8140 the die idles at 85-92 C instead of 43 C. WFI is safe here.
+	 *
+	 * The switch waits until the built-in drivers have probed: on a
+	 * K114c (M5 Max, chip 0x6050), WFI early in boot gated the unclaimed
+	 * root domain nub_gpio off before pmgr and pinctrl probed.
 	 */
-	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop &&
-	    (model == MIDR_APPLE_T8142_E || model == MIDR_APPLE_T8142_P ||
-	     model == MIDR_APPLE_T6050_064 || model == MIDR_APPLE_T6050_065)) {
-		idle = ARM64_IDLE_WFI;
-		pr_info("Apple: idling in WFI, ignoring idle=nop\n");
+	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop) {
+		apple_wfi_deferred = true;
+		pr_info("Apple: WFI idling deferred until built-in drivers probe\n");
 	}
 }
+
+/*
+ * Runs after the built-in drivers' initcalls. cpu_do_idle() reads idle on
+ * every entry, so the switch takes effect at once.
+ */
+static int __init apple_wfi_defer_enable(void)
+{
+	if (!apple_wfi_deferred)
+		return 0;
+
+	idle = ARM64_IDLE_WFI;
+	pr_info("Apple: idling in WFI, ignoring idle=nop (after built-in probes)\n");
+	return 0;
+}
+late_initcall_sync(apple_wfi_defer_enable);
 
 static __always_inline bool apple_wfi_needs_save(void)
 {

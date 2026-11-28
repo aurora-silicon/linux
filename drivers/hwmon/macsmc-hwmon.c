@@ -136,6 +136,10 @@ struct macsmc_hwmon {
 	/* DT-supplied hotspot fan-assistance trip on macsmc_soc_die. */
 	struct macsmc_hwmon_fan_assist fan_assist;
 	bool fan_assist_valid;
+	/* DT-supplied passive and hot trips on macsmc_soc_die. */
+	int die_passive_mc;
+	int die_hot_mc;
+	bool die_limits_valid;
 	/* CPU clusters (policy->cpu) whose higher states these zones own */
 	struct delayed_work cpu_owner_work;
 	cpumask_t cpu_owned;
@@ -774,6 +778,29 @@ static bool macsmc_hwmon_parse_fan_assist(const struct device_node *np,
 		policy->release_mc = (int)(trip - hyst);
 		policy->hold_ms = hold_ms;
 	}
+	return true;
+}
+
+/*
+ * Parse the DT-supplied SoC die limits for macsmc_soc_die: the temperature
+ * from which power consumers shed performance (passive trip) and the one at
+ * which they hold their lowest state (hot trip). Both are required, and the
+ * hot trip must lie above the passive one.
+ */
+static bool macsmc_hwmon_parse_die_limits(const struct device_node *np,
+					  int *passive_mc, int *hot_mc)
+{
+	u32 passive, hot;
+
+	if (!np ||
+	    of_property_read_u32(np, "apple,soc-die-passive-millicelsius", &passive) ||
+	    of_property_read_u32(np, "apple,soc-die-hot-millicelsius", &hot))
+		return false;
+	if (!passive || hot <= passive || hot > MACSMC_DIE_MAX_MC)
+		return false;
+
+	*passive_mc = (int)passive;
+	*hot_mc = (int)hot;
 	return true;
 }
 
@@ -1541,14 +1568,22 @@ static void macsmc_hwmon_populate_fan_configs(u32 *configs, const struct macsmc_
 /*
  * The SoC die temperature zone: the hottest of the SoC die temperature
  * sensors, for in-kernel users that limit SoC power by temperature (they look
- * the zone up by name). It has no trip points and is not polled; each read
- * queries every SoC die sensor. A read fails if any of them cannot be read or
- * reads outside -40..150 degrees Celsius, so users never act on a partial or
- * implausible view. A sensor below its no-data threshold is powered down and
- * left out.
+ * the zone up by name). It is not polled; each read queries every SoC die
+ * sensor. Its trips come from the DT: the hotspot fan-assistance active trip
+ * and the SoC die passive and hot limits, each only when configured. A read
+ * fails if any of the sensors cannot be read or reads outside -40..150 degrees
+ * Celsius, so users never act on a partial or implausible view. A sensor below
+ * its no-data threshold is powered down and left out.
  */
 #if IS_ENABLED(CONFIG_THERMAL)
 #define MACSMC_SOC_DIE_ZONE	"macsmc_soc_die"
+/*
+ * The thermal sensor ID of the SoC die zone for a device tree thermal zone, on
+ * a node that discovers its temperatures and is a thermal sensor provider. It
+ * must stay above every temperature channel index the hwmon core registers;
+ * discovered channels are not bounded at build time, so probe checks it.
+ */
+#define MACSMC_SOC_DIE_SENSOR_ID	1000
 
 static int macsmc_hwmon_die_hottest(struct macsmc_hwmon *hwmon, int *temp)
 {
@@ -1597,8 +1632,10 @@ static void macsmc_hwmon_die_unregister(void *data)
 
 static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 {
+	struct thermal_trip trips[3];
 	struct thermal_zone_device *tz;
 	char keys[16 * 5] = "";
+	unsigned int n_trips = 0;
 	size_t len = 0;
 	u32 i;
 
@@ -1618,28 +1655,70 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 					 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
 	}
 
-	if (hwmon->fan_assist_valid) {
-		struct thermal_trip trip = {
+	/*
+	 * A board with a device tree zone on the die sensor gets that zone, with its trips and
+	 * cooling maps. Its lifetime is managed by the OF helper. The named zone below
+	 * is registered either way: the GPU drivers' governors look it up by its name.
+	 */
+	if (of_property_present(hwmon->dev->of_node, "#thermal-sensor-cells") &&
+	    hwmon->temp.count >= MACSMC_SOC_DIE_SENSOR_ID) {
+		dev_warn(hwmon->dev, "%u temperature channels reach the SoC die sensor ID %u\n",
+			 hwmon->temp.count, MACSMC_SOC_DIE_SENSOR_ID);
+	} else if (of_property_present(hwmon->dev->of_node, "#thermal-sensor-cells")) {
+		tz = devm_thermal_of_zone_register(hwmon->dev, MACSMC_SOC_DIE_SENSOR_ID, hwmon,
+						   &macsmc_hwmon_die_ops);
+		if (!IS_ERR(tz))
+			dev_info(hwmon->dev, "SoC die zone %s (device tree): hottest of%s (%u of %u keys)\n",
+				 thermal_zone_device_type(tz), keys, hwmon->die_count,
+				 hwmon->die_listed);
+		else if (PTR_ERR(tz) != -ENODEV)
+			dev_warn(hwmon->dev,
+				 "cannot register the device tree SoC die zone (%pe)\n", tz);
+	}
+
+	if (hwmon->fan_assist_valid)
+		trips[n_trips++] = (struct thermal_trip) {
 			.temperature = hwmon->fan_assist.trigger_mc,
 			.hysteresis = hwmon->fan_assist.trigger_mc -
 				      hwmon->fan_assist.release_mc,
 			.type = THERMAL_TRIP_ACTIVE,
 		};
+	/*
+	 * The hot trip only reports: the zone has no hot callback, so nothing
+	 * here shuts the machine down. Consumers that read the trips (the GPU
+	 * thermal backstop) shed performance from the passive trip and hold
+	 * their lowest state at the hot one.
+	 */
+	if (hwmon->die_limits_valid) {
+		trips[n_trips++] = (struct thermal_trip) {
+			.temperature = hwmon->die_passive_mc,
+			.type = THERMAL_TRIP_PASSIVE,
+		};
+		trips[n_trips++] = (struct thermal_trip) {
+			.temperature = hwmon->die_hot_mc,
+			.type = THERMAL_TRIP_HOT,
+		};
+	}
 
+	if (n_trips)
 		tz = thermal_zone_device_register_with_trips(MACSMC_SOC_DIE_ZONE,
-							     &trip, 1, hwmon,
+							     trips, n_trips, hwmon,
 							     &macsmc_hwmon_die_ops,
 							     NULL, 0, 0);
-	} else {
+	else
 		tz = thermal_tripless_zone_device_register(MACSMC_SOC_DIE_ZONE, hwmon,
 							   &macsmc_hwmon_die_ops, NULL);
-	}
 	if (IS_ERR(tz)) {
 		dev_warn(hwmon->dev, "cannot register the SoC die temperature zone (%pe)\n", tz);
 		return 0;
 	}
-	dev_info(hwmon->dev, "SoC die temperature zone %s: hottest of%s (%u of %u listed keys present)\n",
-		 MACSMC_SOC_DIE_ZONE, keys, hwmon->die_count, hwmon->die_listed);
+	if (hwmon->die_limits_valid)
+		dev_info(hwmon->dev, "SoC die temperature zone %s: hottest of%s (%u of %u listed keys present), passive %d mC, hot %d mC\n",
+			 MACSMC_SOC_DIE_ZONE, keys, hwmon->die_count, hwmon->die_listed,
+			 hwmon->die_passive_mc, hwmon->die_hot_mc);
+	else
+		dev_info(hwmon->dev, "SoC die temperature zone %s: hottest of%s (%u of %u listed keys present)\n",
+			 MACSMC_SOC_DIE_ZONE, keys, hwmon->die_count, hwmon->die_listed);
 	return devm_add_action_or_reset(hwmon->dev, macsmc_hwmon_die_unregister, tz);
 }
 #else
@@ -2038,6 +2117,11 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	if (hwmon->die_listed == 1 && hwmon->die_count == 1 &&
 	    macsmc_hwmon_parse_fan_assist(hwmon->dev->of_node, &hwmon->fan_assist))
 		hwmon->fan_assist_valid = true;
+
+	if (hwmon->die_count &&
+	    macsmc_hwmon_parse_die_limits(hwmon->dev->of_node, &hwmon->die_passive_mc,
+					  &hwmon->die_hot_mc))
+		hwmon->die_limits_valid = true;
 
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&

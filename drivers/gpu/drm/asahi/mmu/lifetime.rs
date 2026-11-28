@@ -62,6 +62,7 @@ struct State {
     commits: usize,
     blocked: bool,
     quarantined: bool,
+    quarantine_gen: u64,
     draining: bool,
     closed: bool,
     cleanup_failed: bool,
@@ -74,6 +75,8 @@ struct State {
 pub(super) struct VmLifetime {
     #[pin]
     state: Mutex<State>,
+    /// Lock-free mirror of `state.closed`, set once in [`Vm::unmap_user_ranges`].
+    closed: AtomicBool,
     #[pin]
     changed: CondVar,
     #[pin]
@@ -97,8 +100,10 @@ impl VmLifetime {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { active:0, commits:0, blocked:false,
-                    quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
+                    quarantined:false, quarantine_gen:0, draining:false, closed:false,
+                    cleanup_failed:false, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
+                closed: AtomicBool::new(false),
                 changed <- new_condvar!("VM mapping admission"),
                 driver <- new_mutex!(None, "VM driver mappings"),
             }),
@@ -123,7 +128,10 @@ impl VmJobGuard {
             while state.commits != 0 {
                 lifetime.changed.wait(&mut state);
             }
-            state.quarantined = true;
+            if !state.quarantined {
+                state.quarantine_gen = state.quarantine_gen.wrapping_add(1);
+                state.quarantined = true;
+            }
         }
     }
 }
@@ -375,11 +383,12 @@ impl Vm {
     }
 
     /// Whether the client's handle of this VM is gone ([`Self::unmap_user_ranges`] closed
-    /// admission for good). G15 releases its per-VM state after that.
+    /// admission for good). Lock-free so callers holding spinlocks (such as G16's standby
+    /// epoch lock) can test close state without sleeping.
     pub(crate) fn is_closed(&self) -> bool {
         self.lifetime
             .as_ref()
-            .is_some_and(|lifetime| lifetime.state.lock().closed)
+            .is_some_and(|lifetime| lifetime.closed.load(Ordering::Acquire))
     }
 
     /// Tests mappings and reservations which userspace must never replace.
@@ -520,49 +529,87 @@ impl Vm {
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
         };
-        let mut state = lifetime.state.lock();
-        if !state.blocked {
-            return Ok(false);
-        }
-        if state.closed {
-            return Err(ENOENT);
-        }
-        if batch
-            .ops
-            .iter()
-            .skip(start)
-            .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
-        {
-            return Err(EIO);
-        }
-        if !state.quarantined {
-            return Err(EBUSY);
-        }
-        // Reserve before accepting any range; a partial deferred batch must
-        // not leave canonical metadata ahead of the accepted cleanup.
-        state.unmaps.reserve(batch.ops.len() - start, GFP_KERNEL)?;
-        let retired =
-            self.untrack_context_ranges(batch.ops.iter().skip(start).filter_map(|op| match op {
-                PreparedUserBindOp::Unmap(unmap) => Some(unmap.iova..unmap.iova + unmap.size),
-                PreparedUserBindOp::Map(_) => None,
-            }));
-        // Transfer the preallocated split nodes along with each accepted range.
-        // Already-committed prefix operations must not be replayed: their nodes
-        // may have been consumed and another binding may now occupy the range.
-        for op in batch.ops.drain(start..) {
-            if let PreparedUserBindOp::Unmap(unmap) = op {
-                if !state
-                    .unmaps
+        loop {
+            let gen = {
+                let state = lifetime.state.lock();
+                if !state.blocked {
+                    return Ok(false);
+                }
+                if state.closed {
+                    return Err(ENOENT);
+                }
+                if batch
+                    .ops
                     .iter()
-                    .any(|old| old.iova == unmap.iova && old.size == unmap.size)
+                    .skip(start)
+                    .any(|op| matches!(op, PreparedUserBindOp::Map(_)))
                 {
-                    state.unmaps.push(unmap, GFP_KERNEL)?;
+                    return Err(EIO);
+                }
+                if !state.quarantined {
+                    return Err(EBUSY);
+                }
+                state.quarantine_gen
+            };
+
+            // Reserve a split charge before accepting any deferred hole-punch unmap so
+            // drain_mappings() never hits ENOMEM after VM_BIND returned 0 and quarantined
+            // unmaps cannot bypass client/device limits. While quarantined, maps cannot
+            // commit, so any unmap that can split at drain time is already strictly inside
+            // an existing GPUVA here.
+            if let Some(client) = self.memory_client() {
+                let inner = self.gpuvm.lock_inner();
+                for op in batch.ops.iter_mut().skip(start) {
+                    if let PreparedUserBindOp::Unmap(unmap) = op {
+                        if inner.range_strictly_inside_va(unmap.iova, unmap.size, |va| {
+                            va.data()._charge.is_some()
+                        }) {
+                            unmap.resources.reserve_split_charge(Some(client))?;
+                        }
+                    }
                 }
             }
+
+            let mut state = lifetime.state.lock();
+            if !state.blocked {
+                return Ok(false);
+            }
+            if state.closed {
+                return Err(ENOENT);
+            }
+            if !state.quarantined {
+                return Err(EBUSY);
+            }
+            if state.quarantine_gen != gen {
+                continue;
+            }
+            // Reserve before accepting any range; a partial deferred batch must
+            // not leave canonical metadata ahead of the accepted cleanup.
+            state.unmaps.reserve(batch.ops.len() - start, GFP_KERNEL)?;
+            let retired =
+                self.untrack_context_ranges(batch.ops.iter().skip(start).filter_map(|op| match op {
+                    PreparedUserBindOp::Unmap(unmap) => Some(unmap.iova..unmap.iova + unmap.size),
+                    PreparedUserBindOp::Map(_) => None,
+                }));
+            // Transfer the preallocated split nodes (and any reserved split charge)
+            // along with each accepted range. Already-committed prefix operations
+            // must not be replayed: their nodes may have been consumed and another
+            // binding may now occupy the range.
+            for op in batch.ops.drain(start..) {
+                if let PreparedUserBindOp::Unmap(unmap) = op {
+                    if !state
+                        .unmaps
+                        .iter()
+                        .any(|old| old.iova == unmap.iova && old.size == unmap.size)
+                    {
+                        state.unmaps.push(unmap, GFP_KERNEL)?;
+                    }
+                }
+            }
+            drop(state);
+            drop(retired);
+            return Ok(true);
         }
-        drop(state);
-        drop(retired);
-        Ok(true)
     }
 
     /// Returns true if a quarantined owner requires this unmap to be deferred.
@@ -570,43 +617,64 @@ impl Vm {
         let Some(lifetime) = self.lifetime.as_ref() else {
             return Ok(false);
         };
-        let state = lifetime.state.lock();
-        if state.closed {
-            return Err(ENOENT);
-        }
-        if !state.blocked {
-            return Ok(false);
-        }
-        if !state.quarantined {
-            return Err(EBUSY);
-        }
-        if state
-            .unmaps
-            .iter()
-            .any(|old| old.iova == iova && old.size == size)
-        {
+        let mut prepared: Option<bind::PreparedUserUnmap> = None;
+        loop {
+            let gen = {
+                let state = lifetime.state.lock();
+                if state.closed {
+                    return Err(ENOENT);
+                }
+                if !state.blocked {
+                    return Ok(false);
+                }
+                if !state.quarantined {
+                    return Err(EBUSY);
+                }
+                if state
+                    .unmaps
+                    .iter()
+                    .any(|old| old.iova == iova && old.size == size)
+                {
+                    return Ok(true);
+                }
+                state.quarantine_gen
+            };
+
+            let unmap = match prepared.as_mut() {
+                Some(unmap) => unmap,
+                None => prepared.insert(self.prepare_user_unmap(iova, size)?),
+            };
+            if let Some(client) = self.memory_client() {
+                let inner = self.gpuvm.lock_inner();
+                if inner.range_strictly_inside_va(iova, size, |va| va.data()._charge.is_some()) {
+                    unmap.resources.reserve_split_charge(Some(client))?;
+                }
+            }
+
+            let mut state = lifetime.state.lock();
+            if state.closed {
+                return Err(ENOENT);
+            }
+            if !state.blocked {
+                return Ok(false);
+            }
+            if !state.quarantined {
+                return Err(EBUSY);
+            }
+            if state.quarantine_gen != gen {
+                continue;
+            }
+            if !state
+                .unmaps
+                .iter()
+                .any(|old| old.iova == iova && old.size == size)
+            {
+                if let Some(unmap) = prepared.take() {
+                    state.unmaps.push(unmap, GFP_KERNEL)?;
+                }
+            }
             return Ok(true);
         }
-        drop(state);
-        let unmap = self.prepare_user_unmap(iova, size)?;
-        let mut state = lifetime.state.lock();
-        if state.closed {
-            return Err(ENOENT);
-        }
-        if !state.blocked {
-            return Ok(false);
-        }
-        if !state.quarantined {
-            return Err(EBUSY);
-        }
-        if !state
-            .unmaps
-            .iter()
-            .any(|old| old.iova == iova && old.size == size)
-        {
-            state.unmaps.push(unmap, GFP_KERNEL)?;
-        }
-        Ok(true)
     }
 
     /// Defers handle-close cleanup while any accepted job can still use the BO.
@@ -648,6 +716,7 @@ impl Vm {
                 lifetime.changed.wait(&mut state);
             }
             state.closed = true;
+            lifetime.closed.store(true, Ordering::Release);
             if state.active != 0 {
                 state.close_ranges = Some((user, kernel));
                 return Ok(());

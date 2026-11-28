@@ -38,6 +38,8 @@ pub(crate) mod qinfo {
         /// Firmware u32 busy flag: 1 from when the firmware takes a record until DONE (+0x20)
         /// reaches the head (+0x28).
         pub(crate) busy: usize,
+        /// Optional trailing `(offset, value)` u64 word in the firmware header.
+        pub(crate) tail_word: Option<(usize, u64)>,
     }
 
     pub(crate) const V25G83: Layout = Layout {
@@ -47,6 +49,7 @@ pub(crate) mod qinfo {
         uuid: UUID,
         sched_ctx: SCHED_CTX,
         busy: 0x80,
+        tail_word: None,
     };
 
     /// 26B123 queue-info header (0x80 bytes): class_c at 0x44, unk_4c at 0x48, uuid at 0x4c,
@@ -58,6 +61,19 @@ pub(crate) mod qinfo {
         uuid: 0x4c,
         sched_ctx: 0x78,
         busy: 0x54,
+        tail_word: None,
+    };
+
+    /// G15S 26B123 queue-info header (0x88 bytes invalidated by the firmware): trailing u64 `4`
+    /// at `+0x80`, with queue scratch starting right after it at `+0x88`.
+    pub(crate) const V26B123_G15S: Layout = Layout {
+        header: 0x88,
+        class_c: 0x44,
+        unk_4c: 0x48,
+        uuid: 0x4c,
+        sched_ctx: 0x78,
+        busy: 0x54,
+        tail_word: Some((0x80, 4)),
     };
 }
 
@@ -138,6 +154,10 @@ pub(crate) mod manager {
     pub(crate) const COMPLETED: usize = 0x54;
     /// ASC compute-exclusion bookkeeping. AP initializes once; never a command serial.
     pub(crate) const COMPUTE_EXCLUSION: usize = 0x5c;
+    /// Eight per valid pool-table row ([`super::pools::row_words`]): macOS 27.2 on the J773g
+    /// writes 8 x rows on every pool (20, 24 and 108 rows seen) and counts a pool's growth
+    /// in the same unit. A 16-row base pool has 128.
+    pub(crate) const ROW_WORDS: usize = 0x48;
 }
 
 /// A private 32 MiB UMA pool: 8192 4 KiB freelist entries and sixteen 2 MiB rows.
@@ -151,6 +171,13 @@ pub(crate) mod pools {
     pub(crate) const STATE_BYTES: usize = 0x20000;
     pub(crate) const TABLE_BYTES: usize = 0x4000;
     pub(crate) const SEEDS: usize = 8192;
+    /// [`super::manager::ROW_WORDS`] of a pool of `seeds` entries in whole rows: the u64 words
+    /// of its valid pool-table rows, eight per 0x40-byte row.
+    pub(crate) const fn row_words(seeds: u32) -> u32 {
+        let rows = seeds as u64 * SEED_BYTES / ROW_BYTES;
+        (rows * (TABLE_STRIDE / core::mem::size_of::<u64>()) as u64) as u32
+    }
+    const _: () = assert!(row_words(SEEDS as u32) == 128);
 }
 
 /// The nonzero 25G83 queue header; the rest of the fresh 0x24c0 object remains zero. Keeping
@@ -194,6 +221,9 @@ pub(crate) fn queue_image_for(
         (layout.unk_4c, u32::MAX),
     ] {
         q[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    if let Some((at, value)) = layout.tail_word {
+        q[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
     q
 }

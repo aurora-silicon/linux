@@ -1560,10 +1560,18 @@ static void fabric_effect_s50a_test(struct kunit *test)
 	struct fabric_fake f;
 
 	fabric_fake_init(&f, test, false);
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_has_available_routes(false, 0));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_has_available_routes(true, 0));
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_has_available_routes(true, 1));
 	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(false, fabric_fake_register, &f), 0);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_probe(dcp_fabric_has_available_routes(true, 0),
+					     fabric_fake_register, &f), 0);
 	KUNIT_EXPECT_EQ(test, f.count, 0U);
 	KUNIT_EXPECT_FALSE(test, f.f.pipeline[0].owned);
-	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(true, fabric_fake_register, &f), 0);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_probe(dcp_fabric_has_available_routes(true, 1),
+					     fabric_fake_register, &f), 0);
 	KUNIT_ASSERT_EQ(test, f.count, 1U);
 	KUNIT_EXPECT_EQ(test, f.trace[0], FX_REGISTER);
 }

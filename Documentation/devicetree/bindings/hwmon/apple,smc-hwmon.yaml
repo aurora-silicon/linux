@@ -100,6 +100,23 @@ properties:
       from the machine's ADT or SMC rather than hardcoded in static board .dts
       files.
 
+  apple,soc-die-passive-millicelsius:
+    maxItems: 1
+    description:
+      Passive trip temperature, in millidegrees Celsius, on the macsmc_soc_die
+      thermal zone. In-kernel power consumers begin shedding performance at
+      this temperature. Taken from the machine's ADT. Requires
+      apple,soc-die-keys and apple,soc-die-hot-millicelsius.
+
+  apple,soc-die-hot-millicelsius:
+    maxItems: 1
+    description:
+      Hot trip temperature, in millidegrees Celsius, on the macsmc_soc_die
+      thermal zone. In-kernel power consumers hold their lowest performance
+      state at this temperature. Taken from the machine's ADT. Must be above
+      apple,soc-die-passive-millicelsius. The trip reports the event without
+      shutting the machine down.
+
   apple,thermal-pressure-key:
     $ref: /schemas/types.yaml#/definitions/string
     pattern: "^[A-Za-z0-9]{4}$"
@@ -121,7 +138,11 @@ properties:
     const: 1
     description:
       The cell is the zero-based index of a temperature channel, counting
-      the temperature-* child nodes in order.
+      the temperature-* child nodes in order. With
+      apple,discover-temperatures, whose channel indices are not stable, the
+      only sensor is 1000, the hottest of the apple,soc-die-keys readings.
+      A thermal zone on it comes in addition to the macsmc_soc_die zone,
+      which is still registered for the users that look it up by name.
 
   "#cooling-cells":
     const: 3
@@ -195,6 +216,12 @@ dependentRequired:
     - apple,soc-die-keys
     - apple,soc-die-fan-trip-millicelsius
     - apple,soc-die-fan-hysteresis-millicelsius
+  apple,soc-die-passive-millicelsius:
+    - apple,soc-die-keys
+    - apple,soc-die-hot-millicelsius
+  apple,soc-die-hot-millicelsius:
+    - apple,soc-die-keys
+    - apple,soc-die-passive-millicelsius
 
 allOf:
   - if:

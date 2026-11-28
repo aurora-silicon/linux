@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Qualified selections of the original ADT's sixteen performance states for 25G83.
+//! Select firmware DVFS rows from this machine's ADT performance states.
 //!
-//! The firmware takes ten or eleven rows, each a main and an auxiliary frequency at one voltage.
-//! Every qualified layout maps the sixteen ADT states onto those rows by index; the values are
-//! always this machine's own, never frequencies or voltages copied from a reference machine.
-
-pub(crate) const SOURCE_STATES: usize = 16;
+//! Each row pairs a main and an auxiliary frequency at a shared voltage.
 
 /// One qualified mapping of the ADT states onto the first `rows` firmware rows.
 pub(crate) struct Layout {
@@ -39,6 +35,15 @@ pub(crate) const LAYOUTS: [Layout; 2] = [
     },
 ];
 
+// Four low states, then five equal-voltage pairs. The equal frequency at source
+// states 9 and 10 belongs to two voltage bins and is kept in both rows.
+const NINE_ROW_LAYOUT: Layout = Layout {
+    name: "9-row",
+    rows: 9,
+    main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 0, 0],
+    auxiliary: [0, 1, 2, 3, 4, 6, 8, 10, 12, 0, 0],
+};
+
 use super::super::fw::initdata::{Performance, PERF_STATES};
 
 /// Allocation-free selection, also exercised directly by the host-side source-data tests.
@@ -53,10 +58,13 @@ pub(crate) fn select_named(
     source: &super::super::adt::perf::Source,
 ) -> core::result::Result<(Performance, &'static str), super::super::adt::perf::Error> {
     use super::super::adt::perf::Error;
-    if source.count != SOURCE_STATES {
-        return Err(Error::Shape);
-    }
-    for layout in LAYOUTS.iter() {
+
+    let layouts = match source.count {
+        14 => core::slice::from_ref(&NINE_ROW_LAYOUT),
+        16 => LAYOUTS.as_slice(),
+        _ => return Err(Error::Shape),
+    };
+    for layout in layouts {
         match select_layout(source, layout) {
             Err(Error::Shape) => continue,
             Err(error) => return Err(error),
