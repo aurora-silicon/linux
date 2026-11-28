@@ -549,6 +549,87 @@ static void apple_pmc_test_interface_boot_state(struct kunit *test)
 }
 
 /*
+ * Deep sleep clears the display interface enables while genpd still tracks
+ * powered domains as on. Restore puts back only powered genpd interface
+ * domains, leaving off domains and consumer-switched interfaces alone.
+ */
+static void apple_pmc_test_interface_resume(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct apple_pmc_domain *dom0, *dom1, *boot_on, *cons;
+	unsigned long flags;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+	pmc->saved_boost = BIT(0);
+
+	dom0 = apple_pmc_test_interface_dom(test, pmc, "apple-pmc-test-ext0");
+	list_add_tail(&dom0->list, &pmc->domains);
+
+	dom1 = kunit_kzalloc(test, sizeof(*dom1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dom1);
+	dom1->pmc = pmc;
+	dom1->interface = true;
+	dom1->bwr_bit = 4;
+	dom1->boost_bit = 2;
+	dom1->genpd.name = "apple-pmc-test-ext1";
+	apple_pmc_test_genpd(test, &dom1->genpd, apple_pmc_interface_init(pmc, dom1));
+	list_add_tail(&dom1->list, &pmc->domains);
+
+	cons = kunit_kzalloc(test, sizeof(*cons), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cons);
+	cons->pmc = pmc;
+	cons->interface = true;
+	cons->bwr_bit = 0;
+	cons->boost_bit = 0;
+	cons->consumer_switched = true;
+	cons->on = true;
+	list_add_tail(&cons->list, &pmc->domains);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_domain_power_on(&dom0->genpd), 0);
+	KUNIT_EXPECT_TRUE(test, dom0->on);
+	KUNIT_EXPECT_FALSE(test, dom1->on);
+
+	/* Deep sleep wipes BWR to 0 and resets boost to BIT(0). */
+	writel(0, pmc->rails + hw->bwr_enable);
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interfaces_restore(pmc), 0);
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(3));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+
+	/* A domain already on at boot is also tracked and restored. */
+	pmc->saved_bwr = BIT(5);
+	pmc->saved_boost = BIT(0) | BIT(6);
+	boot_on = kunit_kzalloc(test, sizeof(*boot_on), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, boot_on);
+	boot_on->pmc = pmc;
+	boot_on->interface = true;
+	boot_on->bwr_bit = 5;
+	boot_on->boost_bit = 6;
+	boot_on->genpd.name = "apple-pmc-test-boot-on";
+	apple_pmc_test_genpd(test, &boot_on->genpd, apple_pmc_interface_init(pmc, boot_on));
+	list_add_tail(&boot_on->list, &pmc->domains);
+	KUNIT_EXPECT_TRUE(test, boot_on->on);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_domain_power_off(&dom0->genpd), 0);
+	KUNIT_EXPECT_FALSE(test, dom0->on);
+
+	writel(0, pmc->rails + hw->bwr_enable);
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interfaces_restore(pmc), 0);
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(5));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(6));
+}
+
+/*
  * The AP's DCS vote waits for the PMC to take the previous vote, as other
  * floor writes do, instead of writing over it.
  */
@@ -632,6 +713,7 @@ static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_interface_consumer_stuck),
 	KUNIT_CASE(apple_pmc_test_interface_genpd),
 	KUNIT_CASE(apple_pmc_test_interface_boot_state),
+	KUNIT_CASE(apple_pmc_test_interface_resume),
 	{}
 };
 
