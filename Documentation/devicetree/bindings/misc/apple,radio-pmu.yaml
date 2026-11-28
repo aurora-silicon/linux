@@ -21,6 +21,7 @@ properties:
           - apple,t6000-wifibt-pmu
           - apple,t6000-uwb-pmu
           - apple,t8112-wifibt-pmu
+          - apple,t8122-wifibt-pmu
       - const: apple,radio-pmu
 
   reg:

@@ -23,6 +23,7 @@ select:
           - apple,t6021-spmi-nfc
           - apple,t6022-spmi-nfc
           - apple,t8112-spmi-nfc
+          - apple,t8122-spmi-nfc
   required:
     - compatible
 
@@ -34,6 +35,7 @@ properties:
           - apple,t6021-spmi-nfc
           - apple,t6022-spmi-nfc
           - apple,t8112-spmi-nfc
+          - apple,t8122-spmi-nfc
       - const: apple,spmi-nfc
 
   reg:

@@ -99,6 +99,9 @@ properties:
       - items:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
+      - items:
+          - const: apple,t8122-pciec
+          - const: apple,t8103-pciec
       - const: apple,t6000-pciec
       - const: apple,t6050-pciec
       - const: apple,t8142-pciec
@@ -534,6 +537,15 @@ allOf:
                 - const: port0
                 - const: fabric
                 - const: debug
+                - const: ltssm
+                - const: oe-fabric
+                - const: intr2axi
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
                 - const: ioa
                 - const: ltssm
                 - const: intr2axi
@@ -553,6 +565,36 @@ allOf:
           minItems: 3
           maxItems: 3
       allOf:
+        - if:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t8122-pciec
+                  - const: apple,t8103-pciec
+          then:
+            properties:
+              reg:
+                minItems: 8
+                maxItems: 8
+              reg-names:
+                items:
+                  - const: config
+                  - const: rc
+                  - const: port0
+                  - const: fabric
+                  - const: debug
+                  - const: ltssm
+                  - const: oe-fabric
+                  - const: intr2axi
+              apple,msi-vector-base:
+                description:
+                  The bridge's 32-vector slice of the shared MSI window,
+                  after the internal host's vectors 0..31. T8122 bridges
+                  name it; T6030 bridges, which share this compatible, are
+                  still described with the whole window.
+                minimum: 32
+                maximum: 224
+                multipleOf: 32
         - if:
             properties:
               compatible:

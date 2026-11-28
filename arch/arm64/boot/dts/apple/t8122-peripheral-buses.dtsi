@@ -57,7 +57,11 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
+		radio-pmu@e {
+			compatible = "apple,t8122-wifibt-pmu", "apple,radio-pmu";
+			reg = <0xe SPMI_USID>;
+		};
 	};
 
 	aop_spmi1: spmi@2f48d4000 {
@@ -71,7 +75,19 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
+		nfc@9 {
+			compatible = "apple,t8122-spmi-nfc", "apple,spmi-nfc";
+			reg = <0x9 SPMI_USID>;
+			interrupt-parent = <&aop_spmi1>;
+			interrupts = <224 IRQ_TYPE_LEVEL_HIGH>,
+				     <225 IRQ_TYPE_LEVEL_HIGH>,
+				     <226 IRQ_TYPE_LEVEL_HIGH>,
+				     <227 IRQ_TYPE_LEVEL_HIGH>,
+				     <228 IRQ_TYPE_LEVEL_HIGH>,
+				     <229 IRQ_TYPE_LEVEL_HIGH>,
+				     <230 IRQ_TYPE_LEVEL_HIGH>;
+		};
 	};
 
 };

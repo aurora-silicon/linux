@@ -244,10 +244,34 @@
 
 &i2c2 {
 	status = "okay";
+
+	retimer@18 {
+		compatible = "apple,t8122-atcrt", "apple,atcrt";
+		reg = <0x18>;
+	};
+
+	retimer@19 {
+		compatible = "apple,t8122-atcrt", "apple,atcrt";
+		reg = <0x19>;
+	};
 };
 
 &i2c3 {
 	status = "okay";
+};
+
+&i2c4 {
+	status = "okay";
+
+	avellino@44 {
+		compatible = "apple,t8122-avellino", "apple,avellino";
+		reg = <0x44>;
+	};
+
+	avellino@77 {
+		compatible = "apple,t8122-avellino", "apple,avellino";
+		reg = <0x77>;
+	};
 };
 
 &nco_clkref {

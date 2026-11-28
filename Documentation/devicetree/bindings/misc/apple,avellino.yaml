@@ -17,7 +17,9 @@ description: |
 properties:
   compatible:
     items:
-      - const: apple,t8112-avellino
+      - enum:
+          - apple,t8112-avellino
+          - apple,t8122-avellino
       - const: apple,avellino
 
   reg:

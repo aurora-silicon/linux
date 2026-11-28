@@ -19,7 +19,6 @@
 		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_msr>;
-		status = "disabled";
 	};
 
 	dart_jpeg0: iommu@299004000 {
@@ -65,14 +64,12 @@
 	dart_ave2: iommu@315020000 {
 		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x15020000 0x0 0x4000>;
-		status = "disabled";
 		power-domains = <&ps_venc_sys>;
 	};
 
 	dart_ave3: filter@315044000 {
 		compatible = "apple,t8122-dapf", "apple,dapf";
 		reg = <0x3 0x15044000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	dart_apr0: iommu@321028000 {
@@ -82,7 +79,6 @@
 		interrupts = <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
 	};
 
 	dart_apr1: iommu@32102c000 {
@@ -92,13 +88,11 @@
 		interrupts = <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
 	};
 
 	dart_aop_companion1: filter@2f481c000 {
 		compatible = "apple,t8122-dapf", "apple,dapf";
 		reg = <0x2 0xf481c000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	dart_mtp_companion1: filter@2fa80c000 {
@@ -110,35 +104,30 @@
 	dart_disp0_companion1: iommu@28d300000 {
 		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0x8d300000 0x0 0x4000>;
-		status = "disabled";
 		power-domains = <&ps_disp_cpu>;
 	};
 
 	dart_dispext0_companion1: iommu@319300000 {
 		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
 		reg = <0x3 0x19300000 0x0 0x4000>;
-		status = "disabled";
 		power-domains = <&ps_dispext_cpu>;
 	};
 
 	dart_isp_companion3: iommu@2a64b0000 {
 		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0xa64b0000 0x0 0x4000>;
-		status = "disabled";
 		power-domains = <&ps_isp_sys>;
 	};
 
 	dart_isp_companion4: iommu@2a64b8000 {
 		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
 		reg = <0x2 0xa64b8000 0x0 0x4000>;
-		status = "disabled";
 		power-domains = <&ps_isp_sys>;
 	};
 
 	dart_isp_companion5: filter@2a64ac000 {
 		compatible = "apple,t8122-dapf", "apple,dapf";
 		reg = <0x2 0xa64ac000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	ane_dart0: iommu@311800000 {
@@ -155,7 +144,6 @@
 	dart_ane_companion3: filter@311804000 {
 		compatible = "apple,t8122-dapf", "apple,dapf";
 		reg = <0x3 0x11804000 0x0 0x4000>;
-		status = "disabled";
 	};
 
 	ane_dart1: iommu@311810000 {
@@ -215,6 +203,7 @@
 		status = "disabled";
 	};
 
+	/* Keep disabled: ASPM L1.2 stalls and faults Wi-Fi DART stream 15 (#3345). */
 	apcie0_piodma: dma-controller@594010000 {
 		compatible = "apple,t8122-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x5 0x94010000 0x0 0x4000>,
@@ -226,24 +215,11 @@
 		status = "disabled";
 	};
 
-	apciec0_piodma: dma-controller@722000000 {
-		compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x7 0x22000000 0x0 0x4000>,
-		      <0x7 0x22004000 0x0 0x4000>,
-		      <0x7 0x22008000 0x0 0x4000>,
-		      <0x7 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&pciec0_dart 15>;
-		status = "disabled";
-	};
-
 	atc0_dpin0: displayport@701e50000 {
 		compatible = "apple,t8122-dpin", "apple,dpin";
 		reg = <0x7 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1008 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc0_dpin1: displayport@701e58000 {
@@ -251,19 +227,6 @@
 		reg = <0x7 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec1_piodma: dma-controller@b22000000 {
-		compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
-		reg = <0xb 0x22000000 0x0 0x4000>,
-		      <0xb 0x22004000 0x0 0x4000>,
-		      <0xb 0x22008000 0x0 0x4000>,
-		      <0xb 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1021 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&pciec1_dart 15>;
-		status = "disabled";
 	};
 
 	atc1_dpin0: displayport@b01e50000 {
@@ -271,7 +234,6 @@
 		reg = <0xb 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1066 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc1_dpin1: displayport@b01e58000 {
@@ -279,7 +241,6 @@
 		reg = <0xb 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1067 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	mcc: memory-controller@220000000 {
@@ -350,7 +311,6 @@
 		             <AIC_IRQ 810 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 814 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 808 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	dwi: dwi@2d0200000 {
@@ -359,7 +319,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 16 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	aes: crypto@2a100c000 {
@@ -370,7 +329,6 @@
 		interrupts = <AIC_IRQ 778 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
 		iommus = <&sio_dart 1>;
-		status = "disabled";
 	};
 
 	event_log_handler: event-log@2d0700000 {
@@ -402,7 +360,6 @@
 		             <AIC_IRQ 511 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 217 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 219 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	rsm: rsm@2e4325000 {
@@ -447,7 +404,6 @@
 		             <AIC_IRQ 753 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
 		iommus = <&dart_scaler 0>, <&dart_scaler 1>;
-		status = "disabled";
 	};
 
 	jpeg0: jpeg@299000000 {
@@ -503,7 +459,6 @@
 		power-domains = <&ps_scodec>;
 		resets = <&ps_scodec>;
 		iommus = <&dart_apr0 1>, <&dart_apr1 1>;
-		status = "disabled";
 	};
 
 
