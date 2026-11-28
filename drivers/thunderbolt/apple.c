@@ -101,6 +101,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/ratelimit.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/phy/phy.h>
@@ -354,6 +355,11 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
  */
 #define APPLE_CIO_LINK_LOST_MS 3000
 #define APPLE_CIO_LINK_LOST_CYCLES 3
+/*
+ * Recovery policy: three automatic port cycles per one-minute window, even
+ * when a flapping peer completes discovery between link losses.
+ */
+#define APPLE_CIO_LINK_LOST_INTERVAL (60 * HZ)
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -569,6 +575,7 @@ struct apple_cio {
 	unsigned int start_gen; /* protected by lock: bumped by every start */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
+	struct ratelimit_state link_lost_limit; /* survives domain rebuilds */
 	u64 link_lost_cycle_activity; /* remote activity of this domain at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
@@ -3964,6 +3971,12 @@ static void apple_cio_link_lost_work(struct work_struct *work)
 			acio->sleep_peer_wanted = false;
 			return;
 		}
+		/* Discovery refills the consecutive budget, not this rate limit. */
+		if (!__ratelimit(&acio->link_lost_limit)) {
+			dev_warn(acio->dev, "peer link keeps dropping, port restart rate limit reached\n");
+			acio->sleep_peer_wanted = false;
+			return;
+		}
 		acio->link_lost_cycles++;
 		WRITE_ONCE(acio->link_lost_cycle_activity, activity);
 		acio->link_lost_restart = true;
@@ -4749,6 +4762,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 			  apple_cio_pcie_tunnel_work);
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
 	INIT_DELAYED_WORK(&acio->link_lost_work, apple_cio_link_lost_work);
+	ratelimit_state_init(&acio->link_lost_limit, APPLE_CIO_LINK_LOST_INTERVAL,
+			     APPLE_CIO_LINK_LOST_CYCLES);
 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
 	INIT_WORK(&acio->sleep_dp_undo_work, apple_cio_sleep_dp_undo_work);
 	init_completion(&acio->nhi_boot_completion);

@@ -403,11 +403,53 @@ static void topology_route_skip_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, cs);
 	KUNIT_EXPECT_FALSE(test, of_device_is_available(route_np));
 
-	/* A changeset still applied must not be destroyed */
+	/* A repeated refusal neither allocates a changeset nor replaces status. */
+	KUNIT_EXPECT_NULL(test, dcp_typec_routes_disable_nodes(dev, NULL, route_np));
+	KUNIT_EXPECT_NULL(test, dcp_typec_routes_disable_nodes(dev, route_np->parent, NULL));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(dcp_typec_route_skip(dev, route_np, "typec1")),
+			-ENODEV);
+	KUNIT_EXPECT_FALSE(test, of_device_is_available(route_np));
+
+	/*
+	 * A changeset still applied must not be destroyed here: retain it so
+	 * the test can revert before overlay removal.
+	 */
 	KUNIT_ASSERT_EQ(test, of_changeset_revert(cs), 0);
-	of_changeset_destroy(cs);
-	kfree(cs);
+	dcp_typec_routes_disable_free(cs);
 	KUNIT_EXPECT_TRUE(test, of_device_is_available(route_np));
+}
+
+/* Permanent changes retain their properties, but not changeset node refs. */
+static void topology_route_disable_cleanup_test(struct kunit *test)
+{
+	struct device_node *route_np;
+	struct property *status;
+	struct device *dev;
+	unsigned int refs;
+
+	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, dcp_route_supplier_test));
+	dev = kunit_device_register(test, "dcp-route-disable");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	dev->of_node = of_find_node_by_path("/dcp-route-supplier-test/dcp");
+	KUNIT_ASSERT_NOT_NULL(test, dev->of_node);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, topology_route_supplier_put, dev), 0);
+	route_np = of_find_node_by_path("/dcp-route-supplier-test/dcp/typec-routes/route@1");
+	KUNIT_ASSERT_NOT_NULL(test, route_np);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, topology_route_node_put, route_np), 0);
+	refs = kref_read(&route_np->kobj.kref);
+
+	dcp_typec_routes_disable_dev(dev);
+	KUNIT_EXPECT_FALSE(test, of_device_is_available(route_np));
+	KUNIT_EXPECT_EQ(test, kref_read(&route_np->kobj.kref), refs);
+	status = of_find_property(route_np, "status", NULL);
+	KUNIT_ASSERT_NOT_NULL(test, status);
+	KUNIT_EXPECT_STREQ(test, status->value, "disabled");
+
+	dcp_typec_routes_disable_dev(dev);
+	KUNIT_EXPECT_PTR_EQ(test, of_find_property(route_np, "status", NULL), status);
+	KUNIT_EXPECT_EQ(test, kref_read(&route_np->kobj.kref), refs);
 }
 
 /*
@@ -533,6 +575,7 @@ static struct kunit_case dcp_topology_cases[] = {
 	KUNIT_CASE(topology_connector_group_test),
 	KUNIT_CASE(topology_route_supplier_test),
 	KUNIT_CASE(topology_route_skip_test),
+	KUNIT_CASE(topology_route_disable_cleanup_test),
 	KUNIT_CASE(topology_rgb8_only_test),
 	{}
 };

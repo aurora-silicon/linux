@@ -4850,8 +4850,9 @@ static bool dcp_typec_route_supplier_available(struct device *dev, const char *l
  * Disables @route, or every available route under @routes if @route is NULL,
  * in the device tree, in one changeset, for good. A connector passes over
  * unavailable routes when it looks for its display routes, so the port no
- * longer waits for them. Returns the applied changeset, which stays (the live
- * tree refers to it), or an ERR_PTR.
+ * longer waits for them. Returns the applied changeset, NULL if nothing was
+ * available, or an ERR_PTR. The caller must destroy and free the changeset;
+ * destroying it does not revert the changes or free the live properties.
  */
 static struct of_changeset *dcp_typec_routes_disable_nodes(struct device *dev,
 							   struct device_node *routes,
@@ -4860,6 +4861,9 @@ static struct of_changeset *dcp_typec_routes_disable_nodes(struct device *dev,
 	struct of_changeset *cs;
 	struct device_node *np;
 	int ret = 0;
+
+	if (route ? !of_device_is_available(route) : !dcp_typec_routes_available(routes))
+		return NULL;
 
 	cs = kzalloc_obj(*cs);
 	if (!cs)
@@ -4890,6 +4894,14 @@ static struct of_changeset *dcp_typec_routes_disable_nodes(struct device *dev,
 	return cs;
 }
 
+static void dcp_typec_routes_disable_free(struct of_changeset *cs)
+{
+	if (IS_ERR_OR_NULL(cs))
+		return;
+	of_changeset_destroy(cs);
+	kfree(cs);
+}
+
 /*
  * Which of @dev's suppliers for its Type-C route @name ("typecN") has a
  * disabled node: "DP PHY", "display crossbar", or NULL if neither. Such a
@@ -4916,11 +4928,14 @@ static struct of_changeset *dcp_typec_route_skip(struct device *dev,
 						 const char *name)
 {
 	const char *what = dcp_typec_route_supplier_disabled(dev, name);
+	struct of_changeset *cs;
 
 	if (!what)
 		return NULL;
 	dev_warn(dev, "%pOF: its %s is disabled, route skipped\n", route_np, what);
-	return dcp_typec_routes_disable_nodes(dev, NULL, route_np);
+	cs = dcp_typec_routes_disable_nodes(dev, NULL, route_np);
+	/* A concurrent refusal may already have disabled it; still skip it. */
+	return cs ?: ERR_PTR(-ENODEV);
 }
 
 static int dcp_register_typec_routes_present(void *data)
@@ -4933,6 +4948,7 @@ static int dcp_register_typec_routes_present(void *data)
 	int ret;
 
 	for_each_available_child_of_node_scoped(routes, route_np) {
+		struct of_changeset *cs;
 		struct apple_dcp_typec_route *route;
 		struct device_node *endpoint __free(device_node) = NULL;
 		struct device_node *connector_np;
@@ -4964,8 +4980,11 @@ static int dcp_register_typec_routes_present(void *data)
 			return -ENOMEM;
 
 		/* Skipped even if disabling it failed (logged): it cannot register */
-		if (dcp_typec_route_skip(dev, route_np, name))
+		cs = dcp_typec_route_skip(dev, route_np, name);
+		if (cs) {
+			dcp_typec_routes_disable_free(cs);
 			continue;
+		}
 
 		route = &dcp->typec_routes[dcp->nr_typec_routes];
 		route->dcp = dcp;
@@ -5092,7 +5111,7 @@ void dcp_typec_routes_disable_dev(struct device *dev)
 		of_get_child_by_name(dev->of_node, "typec-routes");
 
 	if (routes)
-		dcp_typec_routes_disable_nodes(dev, routes, NULL);
+		dcp_typec_routes_disable_free(dcp_typec_routes_disable_nodes(dev, routes, NULL));
 }
 
 int dcp_register_typec_routes(struct apple_dcp *dcp)

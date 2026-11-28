@@ -1310,8 +1310,9 @@ static void cd321x_update_work(struct work_struct *work)
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
 	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
-	 * the USB role; otherwise the role transition tears down the ATC lanes and
-	 * PCIe-C cannot quiesce its hierarchy before NHI removal.
+	 * the USB role, so PCIe-C can quiesce its hierarchy before NHI removal.
+	 * Stopping the USB role parks its PIPE; the Type-C mux releases the ATC
+	 * lanes after the USB4/TBT session has closed.
 	 */
 	if ((!new_connected || was_disconnected) &&
 	    (!cd321x->state_valid || cd321x->state.mode != TYPEC_STATE_SAFE)) {
