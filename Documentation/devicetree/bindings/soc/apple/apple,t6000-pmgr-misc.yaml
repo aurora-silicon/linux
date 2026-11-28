@@ -22,6 +22,7 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t8103-pmgr-misc
       - apple,t6000-pmgr-misc
       - apple,t6020-pmgr-misc
 
@@ -32,6 +33,25 @@ properties:
     items:
       - const: fabric-ps
       - const: dcs-ps
+
+  apple,fabric-min-pstate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 15
+    description: |
+      Lowest raw PMGR fabric p-state verified safe on this board for idle and
+      s2idle scaling. When absent on SoCs without a built-in suspend floor,
+      the boot fabric p-state is retained for idle and s2idle.
+
+  apple,dcs-min-pstate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 15
+    description: |
+      Lowest raw PMGR DCS p-state verified safe on this board for idle and
+      s2idle scaling without starving active display scanout. When absent on
+      SoCs without a built-in suspend floor, the boot DCS p-state is retained
+      for idle and s2idle. Mutually exclusive with operating-points-v2.
 
   '#interconnect-cells':
     const: 1
@@ -56,11 +76,17 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,t6020-pmgr-misc
+          enum:
+            - apple,t8103-pmgr-misc
+            - apple,t6020-pmgr-misc
     then:
       properties:
         operating-points-v2: false
         '#interconnect-cells': false
+  - not:
+      required:
+        - apple,dcs-min-pstate
+        - operating-points-v2
 
 additionalProperties: false
 
