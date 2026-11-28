@@ -13,6 +13,22 @@ use kernel::sync::atomic::Relaxed;
 
 pub(crate) const REFKEY_ENVELOPE_VERSION: u32 = 2;
 
+/// Validates a `DEVICE_STATE_TRANSITION` response body and clears any stale
+/// refusal via `clear_refusal` so a subsequent loader run probes again. `Ready`
+/// stays tied to a successful trusted-key unseal.
+fn record_identity_unlock_with(body: &[u8], clear_refusal: impl FnOnce()) -> bool {
+    if body.len() == 20 && body[..4] == [0; 4] {
+        clear_refusal();
+        true
+    } else {
+        false
+    }
+}
+
+fn record_identity_unlock(body: &[u8]) -> bool {
+    record_identity_unlock_with(body, crate::diag::clear_trusted_refusal)
+}
+
 impl SepData {
     /// Keep only decoded bytes across switch-root, never an open initrd file.
     fn with_identity_keybag<T>(
@@ -102,12 +118,15 @@ impl SepData {
                 "sks: ref-key identity unlock refused (status {})\n",
                 out.reply.status
             );
+            // An answer, not a lost reply: the enclave decided on this bag.
+            // diag/trusted lets readers stop on it instead of asking again.
+            crate::diag::trusted(crate::diag::Trusted::Refused(out.reply.status));
             return false;
         }
         let Some(body) = self.sks_report_response(c"DEVICE_STATE_TRANSITION", &out) else {
             return false;
         };
-        body.len() == 20 && body[..4] == [0; 4]
+        record_identity_unlock(body)
     }
 
     fn sks_create_refkey(
@@ -342,6 +361,8 @@ impl SepData {
             drop(crate::Secret(recovered));
             return Err(EIO); // trusted.rs maps every unseal rejection to EBADMSG.
         }
+        // A seal's round trip ends here too.
+        crate::diag::trusted(crate::diag::Trusted::Ready);
         Ok(recovered)
     }
 
@@ -803,5 +824,51 @@ impl SepData {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_refkey_trusted)]
+mod tests {
+    use super::*;
+    use kernel::sync::atomic::Atomic;
+
+    #[test]
+    fn validated_unlock_clears_refusal_without_setting_ready() {
+        let state = Atomic::new(0i32);
+        crate::diag::set_trusted_for_test(&state, crate::diag::Trusted::Refused(-8));
+        assert_eq!(state.load(Relaxed) & 0xff, 2);
+        assert_eq!((state.load(Relaxed) >> 8) as i8, -8);
+
+        assert!(!record_identity_unlock_with(&[0; 19], || {
+            crate::diag::clear_trusted_refusal_for_test(&state)
+        }));
+        assert_eq!(state.load(Relaxed) & 0xff, 2);
+        assert_eq!((state.load(Relaxed) >> 8) as i8, -8);
+
+        let mut bad_status = [0u8; 20];
+        bad_status[0] = 1;
+        assert!(!record_identity_unlock_with(&bad_status, || {
+            crate::diag::clear_trusted_refusal_for_test(&state)
+        }));
+        assert_eq!(state.load(Relaxed) & 0xff, 2);
+
+        assert!(record_identity_unlock_with(&[0; 20], || {
+            crate::diag::clear_trusted_refusal_for_test(&state)
+        }));
+        assert_eq!(state.load(Relaxed), 0);
+
+        crate::diag::set_trusted_for_test(&state, crate::diag::Trusted::Ready);
+        assert_eq!(state.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn validated_unlock_preserves_ready() {
+        let state = Atomic::new(0i32);
+        crate::diag::set_trusted_for_test(&state, crate::diag::Trusted::Ready);
+        assert!(record_identity_unlock_with(&[0; 20], || {
+            crate::diag::clear_trusted_refusal_for_test(&state)
+        }));
+        assert_eq!(state.load(Relaxed), 1);
     }
 }
