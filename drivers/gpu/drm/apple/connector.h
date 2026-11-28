@@ -38,6 +38,9 @@ struct apple_connector {
 	/* The pipeline currently driving this connector, NULL if unrouted. */
 	struct platform_device *dcp;
 
+	/* An external display's DDC bus (dcp-ddc.c), NULL for a panel. */
+	struct i2c_adapter *ddc;
+
 	/*
 	 * A Type-C connector has one encoder covering its allowed pipelines.
 	 * T6050 has a connector per port/pipeline pair with a single CRTC;

@@ -9,6 +9,7 @@ appledrm-$(CONFIG_DRM_APPLE_CEC) += cec.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += audio.o
 appledrm-$(CONFIG_DRM_APPLE_AUDIO) += av.o
 appledrm-y += connector.o dcp-panel-adt.o dcp-display-metadata.o dcp-180hz.o
+appledrm-y += dcp-ddc.o
 appledrm-y += ibootep.o
 appledrm-y += dcpext_scanout.o
 appledrm-y += dcpext_drm.o

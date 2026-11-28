@@ -55,6 +55,7 @@
 #include "apple_resume.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp.h"
+#include "dcp-ddc.h"
 #include "plane.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
@@ -1056,6 +1057,7 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	cancel_work_sync(&apple_connector->bl_commit_wq);
 	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
+	apple_ddc_destroy(apple_connector->ddc);
 	kvfree(apple_connector->color_elements.data);
 	kvfree(apple_connector->timing_elements.data);
 	kvfree(apple_connector->display_attributes.data);
@@ -1346,8 +1348,17 @@ static int apple_connector_create(struct drm_device *drm,
 	if (attach_fwnode)
 		connector->base.fwnode = fwnode_handle_get(dcp->dev.fwnode);
 
-	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
-				 connector_type);
+	if (connector_type == DRM_MODE_CONNECTOR_DisplayPort ||
+	    connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+		connector->ddc = apple_ddc_create(drm, connector, dev_name(&dcp->dev));
+		if (IS_ERR(connector->ddc)) {
+			ret = PTR_ERR(connector->ddc);
+			connector->ddc = NULL;
+			goto err_free;
+		}
+	}
+	ret = drm_connector_init_with_ddc(drm, &connector->base, &apple_connector_funcs,
+					  connector_type, connector->ddc);
 	if (ret)
 		goto err_free;
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
@@ -1371,10 +1382,12 @@ static int apple_connector_create(struct drm_device *drm,
 
 err_cleanup:
 	drm_connector_cleanup(&connector->base);
+	apple_ddc_destroy(connector->ddc);
 	kfree(connector);
 	return ret;
 err_free:
 	fwnode_handle_put(connector->base.fwnode);
+	apple_ddc_destroy(connector->ddc);
 	kfree(connector);
 	return ret;
 }
@@ -1639,6 +1652,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		struct platform_device *pipeline = fixed ? dcp[idx / nr_ports] : NULL;
 		unsigned int port_idx = idx % nr_ports;
 		bool secondary = idx >= nr_ports;
+		char port[16];
 		u32 mask = 0;
 
 		/* Only a failed T8122 dcpext could drive it: no connector. */
@@ -1688,10 +1702,20 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		drm_connector_helper_add(&connector->base,
 					 &apple_connector_helper_funcs);
 
-		ret = drm_connector_init(drm, &connector->base,
-					 &apple_connector_funcs,
-					 DRM_MODE_CONNECTOR_DisplayPort);
+		snprintf(port, sizeof(port), "typec%u%s", port_idx,
+			 secondary ? "b" : "");
+		connector->ddc = apple_ddc_create(drm, connector, port);
+		if (IS_ERR(connector->ddc)) {
+			ret = PTR_ERR(connector->ddc);
+			kfree(connector);
+			return ret;
+		}
+		ret = drm_connector_init_with_ddc(drm, &connector->base,
+						  &apple_connector_funcs,
+						  DRM_MODE_CONNECTOR_DisplayPort,
+						  connector->ddc);
 		if (ret) {
+			apple_ddc_destroy(connector->ddc);
 			kfree(connector);
 			return ret;
 		}
