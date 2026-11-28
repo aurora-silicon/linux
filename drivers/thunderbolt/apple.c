@@ -354,6 +354,7 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
  */
 #define APPLE_CIO_LINK_LOST_MS 3000
 #define APPLE_CIO_LINK_LOST_CYCLES 3
+#define APPLE_CIO_LINK_LOST_RESTART_MS 30000
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -571,6 +572,8 @@ struct apple_cio {
 	unsigned int link_lost_cycles; /* protected by lock */
 	u64 link_lost_cycle_activity; /* remote activity of this domain at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
+	u32 link_lost_retry_cable; /* cable info before the requested cycle */
+	unsigned long link_lost_retry_until;
 	struct notifier_block pm_notifier;
 	struct notifier_block reboot_notifier;
 	/*
@@ -3967,6 +3970,9 @@ static void apple_cio_link_lost_work(struct work_struct *work)
 		acio->link_lost_cycles++;
 		WRITE_ONCE(acio->link_lost_cycle_activity, activity);
 		acio->link_lost_restart = true;
+		acio->link_lost_retry_cable = acio->current_cable_info;
+		acio->link_lost_retry_until = jiffies +
+			msecs_to_jiffies(APPLE_CIO_LINK_LOST_RESTART_MS);
 		dev_info(acio->dev,
 			 "peer link lost with the cable attached, restarting the port (%u/%u)\n",
 			 acio->link_lost_cycles, APPLE_CIO_LINK_LOST_CYCLES);
@@ -4029,6 +4035,7 @@ static int apple_cio_prepare(struct device *dev)
 		acio->resume_link_failed = false;
 		/* A cycle CD321x did not take up is not carried into this sleep. */
 		acio->resume_recovery_active = false;
+		acio->link_lost_retry_cable = 0;
 	}
 	return 0;
 }
@@ -4172,16 +4179,18 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		if (acio->resume_recovery_failed)
 			return -EHOSTDOWN;
 		ret = apple_cio_start(acio);
-		if (!ret)
+		if (!ret) {
+			bool retry = acio->link_lost_retry_cable == acio->current_cable_info &&
+				time_before(jiffies, acio->link_lost_retry_until);
+
 			WRITE_ONCE(acio->sleep_restart_owed, false);
-		/*
-		 * The port had a dock before its power-off for the sleep: one that is not
-		 * found again gets the port restarted, as a peer lost with the cable in.
-		 */
-		if (!ret && acio->sleep_peer_wanted) {
-			WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
-			mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
-					 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
+			acio->link_lost_retry_cable = 0;
+			/* An absent peer cannot generate a new link-loss event. */
+			if (retry || acio->sleep_peer_wanted) {
+				WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
+				mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
+						 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
+			}
 		}
 		if (ret && apple_cio_recovering(acio)) {
 			acio->resume_recovery_failed = true;
