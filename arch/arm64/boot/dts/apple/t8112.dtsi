@@ -25,6 +25,8 @@
 		#ifdef APPLE_USE_PMP
 		pmp = &pmp;
 		#endif
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 	};
 
 	clpc: performance-controller {

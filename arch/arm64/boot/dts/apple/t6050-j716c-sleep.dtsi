@@ -13,6 +13,11 @@
  */
 
 / {
+	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
+	};
+
 	sleep: sleep-controller@280600000 {
 		compatible = "apple,t6050-j716c-sleep", "apple,t6050-sleep";
 		status = "disabled";

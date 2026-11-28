@@ -35,6 +35,8 @@
 
 	aliases {
 		serial0 = &dockchannel;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		/* The boot loader fills the N1's factory addresses through these */
 		wifi0 = &n1_alpha;
 		bluetooth0 = &n1_beta;

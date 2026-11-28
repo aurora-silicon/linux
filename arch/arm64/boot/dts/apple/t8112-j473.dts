@@ -22,8 +22,6 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		ethernet0 = &ethernet0;
-		rtc0 = &smc_rtc;
-		rtc1 = &pmu_rtc;
 		sep = &sep;
 		wifi0 = &wifi0;
 	};
