@@ -1056,8 +1056,10 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
     if 'dcp_edid_sdr(' in publication:
         # Keep extracting the real publication path, including its SDR helper.
         # Model only kernel allocation/DRM ownership at the host boundary.
+        # dcp_edid_sdr_native() is the M4 outputs', not this path's.
         sdr = '\n'.join(line for line in (base / 'dcp-sdr-edid.h').read_text().splitlines()
-                        if not line.startswith('#include'))
+                        if not line.startswith('#include')).replace(
+                            'static inline ', 'static inline __attribute__((unused)) ')
         publication = sdr + r"""
 static void *kmemdup(const void *data,size_t size,int gfp) {
     (void)gfp;void *copy=malloc(size);if(copy)memcpy(copy,data,size);return copy;

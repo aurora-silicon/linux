@@ -49,6 +49,7 @@
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-display-metadata.h"
 #include "dcp-sdr-edid.h"
 #include "dptxep.h"
 #include "epic/dpavservep.h"
@@ -63,6 +64,7 @@
 #include "dcp-m4-property.h"
 #include "dcp-m4-frame.h"
 #include "dcp-refresh.h"
+#include "iomfb_plane.h"
 #include "parser.h"
 #include "t8132_ext_drm.h"
 
@@ -281,6 +283,8 @@ struct iomfb_m4 {
 	const struct drm_edid *ext_edid;
 	int ext_edid_link_gen;
 	unsigned int ext_edid_avserv_gen;
+	/* The primaries its frames carry, see iomfb_m4_ext_edid_published() */
+	u8 ext_colorspace;
 	/*
 	 * The sink generation, which a released route moves on (words received
 	 * before carry the old one and publish nothing); whether a
@@ -2262,6 +2266,9 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	if (!ret)
 		ret = dcp_m4_swap_encode_on(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
 					    keep, brightness_change, nits, check, width, height);
+	if (!ret && ext)
+		dcp_m4_swap_set_colorspace(input, primary && frame, upper,
+					   READ_ONCE(dcp->ext_colorspace));
 	if (!ret && intent)
 		dcp_m4_swap_set_intent(input, intent, surface_id);
 	/*
@@ -3333,10 +3340,10 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 }
 
 /*
- * The EDID the connector publishes, as native26's (dcp_edid_sdr()): this
- * scanout is 8-bpc RGB SDR, so the sink's colour capabilities, deep colour
- * and 4:2:0 timings go. The last would otherwise make the probe helper prune
- * the catalog's mode of a timing the sink lists as 4:2:0 only.
+ * The EDID the connector publishes (dcp_edid_sdr_native()): this scanout is
+ * 8-bpc RGB SDR, so the sink's colour capabilities, deep colour and 4:2:0
+ * timings go. The last would otherwise make the probe helper prune the
+ * catalog's mode of a timing the sink lists as 4:2:0 only. Its primaries stay.
  */
 static const struct drm_edid *iomfb_m4_ext_edid_sdr(const struct drm_edid *edid)
 {
@@ -3351,7 +3358,7 @@ static const struct drm_edid *iomfb_m4_ext_edid_sdr(const struct drm_edid *edid)
 	copy = kmemdup(raw, size, GFP_KERNEL);
 	if (!copy)
 		return ERR_PTR(-ENOMEM);
-	size = dcp_edid_sdr(copy, size);
+	size = dcp_edid_sdr_native(copy, size);
 	sdr = size ? drm_edid_alloc(copy, size) : ERR_PTR(-EPROTO);
 	kfree(copy);
 	return sdr ?: ERR_PTR(-ENOMEM);
@@ -3449,6 +3456,23 @@ const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *owner)
 	mutex_unlock(&dcp->ext_modes_lock);
 	drm_edid_free(old);
 	return edid;
+}
+
+/*
+ * The firmware converts a frame from the primaries it is tagged with to the
+ * sink's, and reads an untagged frame as sRGB. A compositor draws in the gamut
+ * of the EDID the connector publishes, so a Display P3 one's frames are tagged
+ * Display P3, as the panel's are, and any other's stay untagged.
+ */
+void iomfb_m4_ext_edid_published(struct apple_dcp *owner, const struct drm_edid *edid)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool p3 = edid && dcp_edid_has_color_space(drm_edid_raw(edid),
+						   dcp_color_space_lookup("display-p3"));
+
+	if (dcp && dcp->external)
+		WRITE_ONCE(dcp->ext_colorspace,
+			   p3 ? DCP_COLORSPACE_P3_D65 : DCP_COLORSPACE_UNSPECIFIED);
 }
 
 /*
@@ -3957,8 +3981,9 @@ static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
  * The colour element of a timing: RGB with the SDR gamma EOTF, not virtual,
  * not unsafe for the timing, at 8 bpc if the timing lists it as needing DSC;
  * the lowest depth offered (8 bpc if there is one); at that depth one that
- * needs no DSC over one that does, then sRGB/BT.709 colorimetry and full
- * range over others, then the higher score. Never PQ or HLG.
+ * needs no DSC over one that does, then Default RGB colorimetry (the sink's
+ * native gamut) over sRGB/BT.709 over others, then full range, then the higher
+ * score. Never PQ or HLG.
  */
 struct dcp_m4_ext_pick {
 	struct dcp_color_element best;
@@ -3967,9 +3992,14 @@ struct dcp_m4_ext_pick {
 
 static unsigned int dcp_m4_ext_color_rank(const struct dcp_color_element *e)
 {
-	return (e->colorimetry == DCP_COLORIMETRY_SRGB ||
-		e->colorimetry == DCP_COLORIMETRY_BT709 ? 2 : 0) +
-	       (e->range == DCP_COLOR_YCBCR_RANGE_FULL ? 1 : 0);
+	unsigned int space = 0;
+
+	if (e->colorimetry == DCP_COLORIMETRY_RGB)
+		space = 4;
+	else if (e->colorimetry == DCP_COLORIMETRY_SRGB ||
+		 e->colorimetry == DCP_COLORIMETRY_BT709)
+		space = 2;
+	return space + (e->range == DCP_COLOR_YCBCR_RANGE_FULL ? 1 : 0);
 }
 
 static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)

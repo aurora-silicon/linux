@@ -1555,6 +1555,35 @@ static void parser_panel_color_target(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, raw->gamma, 0xff);
 }
 
+/* An EDID's own primaries name a colour space, within its rounding. */
+static void parser_edid_color_space(struct kunit *test)
+{
+	const struct dcp_color_space *p3 = dcp_color_space_lookup("display-p3");
+	const struct dcp_color_space *srgb = dcp_color_space_lookup("srgb");
+	struct dcp_display_metadata metadata = {
+		.manufacturer = "APP", .product = 0x616, .name = "Apple Panel",
+	};
+	struct edid edid;
+
+	edid = *panel_color_edid(test, &metadata, p3);
+	KUNIT_EXPECT_TRUE(test, dcp_edid_has_color_space(&edid, p3));
+	KUNIT_EXPECT_FALSE(test, dcp_edid_has_color_space(&edid, srgb));
+	/* Red x 701/1024 is within the tolerance of 696, 702 is not. */
+	edid.red_x = 701 >> 2;
+	edid.red_green_lo = (edid.red_green_lo & 0x3f) | (701 & 3) << 6;
+	KUNIT_EXPECT_TRUE(test, dcp_edid_has_color_space(&edid, p3));
+	edid.red_green_lo = (edid.red_green_lo & 0x3f) | (702 & 3) << 6;
+	KUNIT_EXPECT_FALSE(test, dcp_edid_has_color_space(&edid, p3));
+	/* Display P3 primaries with a D50 white are another space. */
+	edid = *panel_color_edid(test, &metadata, p3);
+	edid.white_x = 353 >> 2;
+	KUNIT_EXPECT_FALSE(test, dcp_edid_has_color_space(&edid, p3));
+	/* No primaries at all. */
+	edid = (struct edid){};
+	KUNIT_EXPECT_FALSE(test, dcp_edid_has_color_space(&edid, p3));
+	KUNIT_EXPECT_FALSE(test, dcp_edid_has_color_space(&edid, srgb));
+}
+
 static size_t parser_adt_property(u8 *out, size_t capacity, const char *name,
 				  const void *value, u32 size)
 {
@@ -2378,6 +2407,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_identity_stable),
 	KUNIT_CASE(parser_panel_identity),
 	KUNIT_CASE(parser_panel_color_target),
+	KUNIT_CASE(parser_edid_color_space),
 	KUNIT_CASE(parser_panel_adt_color_target),
 	KUNIT_CASE(parser_tiled_size_keeps_dsc_modes),
 	KUNIT_CASE(parser_score_presence),

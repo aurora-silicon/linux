@@ -52,6 +52,9 @@ const struct dcp_color_space *dcp_color_space_lookup(const char *name);
 const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut gamut);
 const struct dcp_color_space *dcp_panel_color_target(enum dcp_panel_gamut gamut);
 
+struct edid;
+bool dcp_edid_has_color_space(const struct edid *edid, const struct dcp_color_space *space);
+
 struct drm_edid;
 struct drm_display_mode;
 struct dcp_display_mode;

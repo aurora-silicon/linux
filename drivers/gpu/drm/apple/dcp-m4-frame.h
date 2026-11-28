@@ -91,6 +91,9 @@ static inline int dcp_m4_direct_frame(struct dcp_m4_frame *frame, u64 dva, u64 m
 	return dcp_m4_frame_check(frame);
 }
 
+/* A surface's primaries: those of the panel, Display P3 with a D65 white. */
+#define DCP_M4_SURFACE_COLORSPACE	0x14
+
 /* Exact single-layer fixture, not an ABI for tiled or compressed surfaces. */
 static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame *frame)
 {
@@ -102,7 +105,7 @@ static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame 
 	put_unaligned_le32(1, surface + 7);
 	put_unaligned_le32(0x42475241, surface + 0x0b);
 	surface[0x13] = 13;
-	surface[0x14] = 12;
+	surface[DCP_M4_SURFACE_COLORSPACE] = 12;
 	put_unaligned_le32(frame->stride, surface + 0x15);
 	put_unaligned_le16(1, surface + 0x19);
 	surface[0x1b] = 1;
@@ -287,6 +290,22 @@ static inline void dcp_m4_swap_set_intent(void *output, u32 intent, u32 surface_
 
 	put_unaligned_le32(intent, data + dcp_m4_pf->swap_intent);
 	put_unaligned_le32(surface_id, data + 0x9c);
+}
+
+/*
+ * Give the surfaces of an encoded swap (surface 0 if it presents @primary, and
+ * @upper's) other primaries than the panel's.
+ */
+static inline void dcp_m4_swap_set_colorspace(void *output, bool primary,
+					      const struct dcp_m4_upper *upper, u8 colorspace)
+{
+	u8 *surfaces = (u8 *)output + dcp_m4_pf->swap_surface;
+
+	if (primary)
+		surfaces[DCP_M4_SURFACE_COLORSPACE] = colorspace;
+	if (upper && upper->frame)
+		surfaces[DCP_M4_SURFACE_SIZE * upper->index + DCP_M4_SURFACE_COLORSPACE] =
+			colorspace;
 }
 
 /*

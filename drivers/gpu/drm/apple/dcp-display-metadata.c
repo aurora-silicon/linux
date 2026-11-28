@@ -198,6 +198,26 @@ const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut g
 	}
 }
 
+/* How far an EDID's measured or rounded coordinates may be from the named ones, in 1/1024. */
+#define DCP_EDID_COLOR_TOLERANCE	5
+
+/* Whether the primaries and the white of @edid are those of @space. */
+bool dcp_edid_has_color_space(const struct edid *edid, const struct dcp_color_space *space)
+{
+	const u8 hi[] = { edid->red_x, edid->red_y, edid->green_x, edid->green_y,
+			  edid->blue_x, edid->blue_y, edid->white_x, edid->white_y };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(hi); i++) {
+		u8 lo = i < 4 ? edid->red_green_lo : edid->blue_white_lo;
+		int value = hi[i] << 2 | (lo >> (6 - 2 * (i % 4)) & 3);
+		u32 named = i < 6 ? space->chromaticity[i / 2][i % 2] : space->white[i - 6];
+
+		if (abs(value - (int)DIV_ROUND_CLOSEST(named, 64)) > DCP_EDID_COLOR_TOLERANCE)
+			return false;
+	}
+	return true;
+}
+
 /*
  * An internal panel's colour target: the standard space its ADT names, or
  * else Display P3. Every untagged RGB surface on an internal panel is tagged

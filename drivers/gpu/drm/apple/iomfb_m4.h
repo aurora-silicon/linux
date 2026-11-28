@@ -54,6 +54,8 @@ void iomfb_m4_external_link_gone(struct apple_dcp *dcp);
 int iomfb_m4_ext_detect(struct apple_dcp *dcp);
 int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
 const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *dcp);
+/* The EDID its connector now publishes, NULL for none: the gamut of its frames. */
+void iomfb_m4_ext_edid_published(struct apple_dcp *dcp, const struct drm_edid *edid);
 /* DRM drives the external output: modeset, copied frames, disable. */
 int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 			  struct iomfb_m4_ext_ids *ids);
@@ -118,6 +120,11 @@ static inline int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_conne
 static inline const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *dcp)
 {
 	return ERR_PTR(-ENODEV);
+}
+
+static inline void iomfb_m4_ext_edid_published(struct apple_dcp *dcp,
+					       const struct drm_edid *edid)
+{
 }
 
 static inline int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp,
