@@ -145,6 +145,8 @@ pub(crate) struct State {
     /// The completion worker, published once the runtime it services exists. The DRM device
     /// carries no driver data for it on 7.2, so the runtime's own state owns it.
     pub(crate) completion: SetOnce<Arc<crate::m3::m3_completion::Completion>>,
+    /// Suppresses completion-worker queueing while the GPU firmware is stopped for deep sleep.
+    completion_paused: AtomicBool,
 }
 
 /// Shared status contains no device references, so DRM files may retain it
@@ -204,6 +206,7 @@ impl State {
                 event_messages: AtomicU64::new(0),
                 events: EventWait::new()?,
                 completion: SetOnce::new(),
+                completion_paused: AtomicBool::new(false),
             },
             GFP_KERNEL,
         )?)
@@ -211,6 +214,14 @@ impl State {
 
     pub(crate) fn healthy(&self) -> bool {
         self.health.healthy()
+    }
+
+    pub(crate) fn completion_paused(&self) -> bool {
+        self.completion_paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_completion_paused(&self, paused: bool) {
+        self.completion_paused.store(paused, Ordering::Release);
     }
 }
 
@@ -227,6 +238,7 @@ impl Drop for FirmwareBuffer {
         // Includes allocation failure in RTKit's wrapper after shmem_map
         // returned: readiness must not survive loss of the actual mapping.
         self.state.health.mapped.store(false, Ordering::Release);
+        self.state.claimed.store(false, Ordering::Release);
     }
 }
 

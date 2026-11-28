@@ -596,6 +596,10 @@ impl Config {
         self.objects[CONTROL_REGION].read_u32(offsets.phase)
     }
 
+    pub(crate) fn reset_recovery_gen(&mut self) {
+        self.last_recovery_gen = None;
+    }
+
     pub(crate) fn recovery_generation(&mut self) -> Result<u64> {
         let offsets = self.recovery_offsets().ok_or(EOPNOTSUPP)?;
         let lo = self.objects[CONTROL_REGION].read_u32(offsets.generation)?;

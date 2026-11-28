@@ -2,7 +2,7 @@
 
 //! Completion work owned only by the M3 runtime.
 
-use kernel::{prelude::*, sync::Arc, workqueue::{self, impl_has_work, new_work, Work, WorkItem}};
+use kernel::{bindings, prelude::*, sync::Arc, workqueue::{self, impl_has_work, new_work, Work, WorkItem}};
 use crate::m3::{m3_drm::Shared, m3_rtkit::State};
 
 #[pin_data]
@@ -18,6 +18,11 @@ impl Completion {
             work <- new_work!("M3 completion"),
         }), GFP_KERNEL)
     }
+
+    pub(crate) fn flush(&self) {
+        // SAFETY: `self.work` is initialized and pinned for the lifetime of `Completion`.
+        unsafe { bindings::flush_work(Work::raw_get(&self.work)) };
+    }
 }
 impl_has_work! { impl HasWork<Completion> for Completion { self.work } }
 impl WorkItem for Completion {
@@ -31,6 +36,9 @@ impl WorkItem for Completion {
             let (outcome, events) = {
                 let mut guard = owner.shared.lock();
                 let Some(runtime) = Option::as_mut(&mut *guard) else { return; };
+                if runtime.completion_paused() {
+                    return;
+                }
                 let outcome=runtime.service_job();
                 let events=runtime.events();
                 // Preserve the root-only CPU-overlap diagnostic: disabled waits retain
@@ -56,6 +64,9 @@ impl WorkItem for Completion {
     }
 }
 pub(crate) fn queue(state: &State) {
+    if state.completion_paused() {
+        return;
+    }
     if let Some(work) = state.completion.as_ref() {
         let _ = workqueue::system_highpri().enqueue(work.clone());
     }

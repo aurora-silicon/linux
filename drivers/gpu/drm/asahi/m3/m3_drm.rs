@@ -2,8 +2,33 @@
 //! M3 through the common Asahi GEM, GPUVM and render-node frontend.
 use core::ops::Range;
 use core::any::Any;
-use kernel::{device::Core, drm, new_mutex, platform, prelude::*, sync::{Arc, Mutex}, uapi};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use kernel::{
+    bindings,
+    device::Core,
+    drm, new_mutex, platform, prelude::*,
+    sync::{aref::ARef, Arc, Mutex},
+    time::{delay::fsleep, Delta, Instant, Monotonic},
+    uapi,
+};
 use crate::{alloc, driver, gem, gpu, m3::hw, mmu, queue};
+
+extern "C" {
+    fn apple_sleep_dry_run() -> bool;
+    fn asahi_g17_commit_required() -> bool;
+    fn asahi_g16_commit_prepare(
+        dev: *mut core::ffi::c_void,
+        rtk: *mut bindings::apple_rtkit,
+    ) -> *mut core::ffi::c_void;
+    fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
+    fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
+    fn asahi_g17_power_raise(dev: *mut core::ffi::c_void, saved: u32) -> core::ffi::c_int;
+    fn asahi_g17_power_auto_on(dev: *mut core::ffi::c_void, saved: u32) -> core::ffi::c_int;
+    fn asahi_sleep_pd_domain_set(dev: *mut core::ffi::c_void, on: bool) -> core::ffi::c_int;
+}
+
+const SLEEP_DRAIN_MS: i64 = 3000;
+const SLEEP_POLL_MS: i64 = 1;
 
 pub(crate) type Shared = Arc<Mutex<Option<crate::m3::m3_runtime::Runtime>>>;
 struct ProgressView(Arc<crate::m3::m3_rtkit::Health>);
@@ -79,6 +104,7 @@ impl kernel::debugfs::Reader for SubmitOverlapView {
 /// probe with the runtime it wraps and handed to the DRM registration, which owns it: dropping it
 /// (unbind, or a failed registration) stops the runtime. The debugfs files share its lifetime.
 pub(crate) struct Backend {
+    dev: ARef<platform::Device>,
     shared: Shared,
     health: Arc<crate::m3::m3_rtkit::Health>,
     ids: gpu::SequenceIDs,
@@ -87,6 +113,11 @@ pub(crate) struct Backend {
     max_frequency_khz: u32,
     soc: &'static crate::m3::m3_soc::Soc,
     profile: super::m3_profile::Profile,
+    sleeping: AtomicBool,
+    sleep_stopped: AtomicBool,
+    holds_pd_in_firmware: AtomicBool,
+    sleep_commit: AtomicPtr<core::ffi::c_void>,
+    sleep_ps: AtomicU32,
     _progress: Pin<KBox<kernel::debugfs::File<ProgressView>>>,
     _activity: Pin<KBox<kernel::debugfs::File<ActivityView>>>,
     _memory: Pin<KBox<kernel::debugfs::File<crate::m3::agx_memory_stats::View>>>,
@@ -168,8 +199,13 @@ impl Backend {
         let shared: Shared = Arc::pin_init(new_mutex!(Some(runtime)), GFP_KERNEL)?;
         let completion_work = crate::m3::m3_completion::Completion::new(shared.clone())?;
         // From here on every failure drops the backend, which stops the runtime.
-        let backend = Arc::new(Self { shared, health, ids: gpu::SequenceIDs::default(),
+        let backend = Arc::new(Self { dev: pdev.into(), shared, health, ids: gpu::SequenceIDs::default(),
             scheduler, core_mask, max_frequency_khz, soc, profile,
+            sleeping: AtomicBool::new(false),
+            sleep_stopped: AtomicBool::new(false),
+            holds_pd_in_firmware: AtomicBool::new(false),
+            sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
+            sleep_ps: AtomicU32::new(0),
             _progress: progress, _activity: activity, _memory: memory, _timing: timing,
             _completion: completion, _overlap: overlap }, GFP_KERNEL)?;
         // The completion worker services this runtime from now on; the RTKit callbacks and
@@ -180,9 +216,308 @@ impl Backend {
         Ok(backend)
     }
 
+    pub(crate) fn holds_pd_in_firmware_sleep(&self) -> bool {
+        self.holds_pd_in_firmware.load(Ordering::Acquire)
+    }
+
+    /// Closes new GPU publication, waits for active work to retire, and for a firmware-driven
+    /// sleep registers the commit-time coprocessor stop.
+    pub(crate) fn sleep_prepare(&self, deep: bool) -> Result {
+        if deep {
+            if self.soc.chip_id != 0x8122 || self.profile != super::m3_profile::Profile::Extended {
+                return Err(EBUSY);
+            }
+            // SAFETY: Reads global sleep-controller state.
+            if !unsafe { asahi_g17_commit_required() } {
+                return Err(EBUSY);
+            }
+        }
+        let completion = {
+            let mut guard = self.shared.lock();
+            let runtime = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+            runtime.sleep_hold()?;
+            runtime.completion()
+        };
+        let deadline = Instant::<Monotonic>::now();
+        loop {
+            let quiet = {
+                let mut guard = self.shared.lock();
+                let Some(runtime) = Option::as_mut(&mut *guard) else {
+                    return Err(ENODEV);
+                };
+                match runtime.sleep_is_quiet() {
+                    Ok(quiet) => Ok(quiet),
+                    Err(error) => {
+                        runtime.sleep_unhold();
+                        Err(error)
+                    }
+                }
+            }?;
+            if quiet {
+                break;
+            }
+            if deadline.elapsed() >= Delta::from_millis(SLEEP_DRAIN_MS) {
+                let mut guard = self.shared.lock();
+                if let Some(runtime) = Option::as_mut(&mut *guard) {
+                    runtime.sleep_unhold();
+                }
+                dev_warn!(self.dev.as_ref(), "M3 GPU: timed out draining active work for sleep\n");
+                return Err(EBUSY);
+            }
+            fsleep(Delta::from_millis(SLEEP_POLL_MS));
+        }
+        if !deep {
+            self.sleeping.store(true, Ordering::Release);
+            return Ok(());
+        }
+        {
+            let mut guard = self.shared.lock();
+            let Some(runtime) = Option::as_mut(&mut *guard) else {
+                return Err(ENODEV);
+            };
+            runtime.set_completion_paused(true);
+        }
+        if let Some(work) = completion.as_ref() {
+            work.flush();
+        }
+        let mut guard = self.shared.lock();
+        let Some(runtime) = Option::as_mut(&mut *guard) else {
+            return Err(ENODEV);
+        };
+        match runtime.sleep_is_quiet() {
+            Ok(true) => {}
+            Ok(false) => {
+                runtime.sleep_unhold();
+                return Err(EBUSY);
+            }
+            Err(error) => {
+                runtime.sleep_unhold();
+                return Err(error);
+            }
+        }
+        // On a dry run, keep firmware alive and only register the commit-time
+        // descriptor so the gate check verifies readiness without stopping GPU.
+        // On a real deep sleep, hold the gfx genpd across suspend_noirq/resume_noirq
+        // so genpd does not touch PS_GFX out of order; sleep_suspend() lowers PS_GFX
+        // cleanly after releasing PMP GPU device 5, and sleep_complete() raises it
+        // back after PMP has resumed.
+        // SAFETY: Reads global sleep-controller state.
+        if !unsafe { apple_sleep_dry_run() } {
+            self.holds_pd_in_firmware.store(true, Ordering::Release);
+            self.sleeping.store(true, Ordering::Release);
+            return Ok(());
+        }
+        // SAFETY: `self.dev` is the bound GPU platform device and `rtkit` lives for the runtime.
+        let commit = unsafe {
+            asahi_g16_commit_prepare(self.dev.as_ref().as_raw().cast(), runtime.sleep_rtkit_raw())
+        };
+        match kernel::error::from_err_ptr(commit) {
+            Ok(ptr) => {
+                self.sleep_commit.store(ptr, Ordering::Release);
+                self.holds_pd_in_firmware.store(true, Ordering::Release);
+                self.sleeping.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "M3 GPU: commit stop prepare failed ({:?}); refusing sleep\n",
+                    error
+                );
+                runtime.sleep_unhold();
+                Err(error)
+            }
+        }
+    }
+
+    /// Stops GPU firmware, releases the PMP GPU device 5 vote while PMP is still running,
+    /// and lowers PS_GFX cleanly before the noirq window.
+    pub(crate) fn sleep_suspend(&self) -> Result {
+        if !self.sleeping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // SAFETY: Reads a global flag word.
+        if !unsafe { bindings::pm_suspend_via_firmware() } {
+            return Ok(());
+        }
+        if !self.sleep_commit.load(Ordering::Acquire).is_null() {
+            return Ok(());
+        }
+        let mut guard = self.shared.lock();
+        let Some(runtime) = Option::as_mut(&mut *guard) else {
+            return Err(ENODEV);
+        };
+        runtime.sleep_suspend()?;
+        let dev = self.dev.as_ref().as_raw().cast();
+        let mut saved = 0u32;
+        // SAFETY: `dev` is the bound GPU platform device and `saved` is writable.
+        let auto_ret = unsafe { asahi_g17_power_auto_off(dev, &mut saved) };
+        self.sleep_ps.store(saved, Ordering::Relaxed);
+        // Mark ps_gfx driver-down in apple-sleep and lower it so pmgr-pwrstate does not
+        // re-raise it in resume_noirq before PMP has resumed.
+        // SAFETY: `dev` is the bound GPU platform device.
+        let lower_ret = unsafe { asahi_sleep_pd_domain_set(dev, false) };
+        dev_info!(
+            self.dev.as_ref(),
+            "M3 GPU: PS_GFX lowered via apple-sleep (saved={:#x}, auto_off={}, lower={})\n",
+            saved,
+            auto_ret,
+            lower_ret
+        );
+        self.sleep_stopped.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reopens publication after a suspend-to-idle or refused deep sleep, or raises `ps_gfx`
+    /// and warm-restarts the GPU firmware after a firmware-driven wake.
+    pub(crate) fn sleep_complete(&self) {
+        self.holds_pd_in_firmware.store(false, Ordering::Release);
+        if !self.sleeping.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if self.sleep_stopped.swap(false, Ordering::AcqRel) {
+            let dev = self.dev.as_ref().as_raw().cast();
+            let saved = self.sleep_ps.load(Ordering::Relaxed);
+            // SAFETY: Reads a global flag word.
+            let real = unsafe { bindings::pm_resume_via_firmware() };
+            let started = Instant::<Monotonic>::now();
+            // SAFETY: `dev` is the bound GPU platform device.
+            let raise_res = kernel::error::to_result(unsafe { asahi_g17_power_raise(dev, saved) })
+                .and_then(|()| {
+                    // SAFETY: `dev` is the bound GPU platform device.
+                    kernel::error::to_result(unsafe { asahi_g17_power_auto_on(dev, saved) })
+                });
+            if let Err(error) = raise_res {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "M3 GPU: PS_GFX raise/auto_on failed (saved={:#x}): {:?}\n",
+                    saved,
+                    error
+                );
+            }
+            // SAFETY: PMP resumed before this consumer via the device link established at probe.
+            let power_res = raise_res.and_then(|()| {
+                kernel::error::to_result(unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) })
+                    .inspect_err(|e| {
+                        dev_err!(
+                            self.dev.as_ref(),
+                            "M3 GPU: PMP device 5 acquire failed: {:?}\n",
+                            e
+                        );
+                    })
+            });
+            let mut guard = self.shared.lock();
+            let Some(runtime) = Option::as_mut(&mut *guard) else {
+                return;
+            };
+            match power_res.and_then(|()| runtime.sleep_warm_restart()) {
+                Ok(()) => {
+                    // SAFETY: `dev` is the bound GPU platform device.
+                    let up_ret = unsafe { asahi_sleep_pd_domain_set(dev, true) };
+                    if up_ret != 0 {
+                        dev_warn!(
+                            self.dev.as_ref(),
+                            "M3 GPU: PS_GFX domain_set(on) failed: {}\n",
+                            up_ret
+                        );
+                    }
+                    dev_info!(
+                        self.dev.as_ref(),
+                        "M3 GPU: firmware back in {} us (real={})\n",
+                        started.elapsed().as_micros_ceil(),
+                        real
+                    );
+                    runtime.sleep_unhold();
+                }
+                Err(error) => {
+                    // SAFETY: `dev` is the bound GPU platform device.
+                    let _ = unsafe { asahi_sleep_pd_domain_set(dev, true) };
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "M3 GPU: firmware did not come back after sleep (real={}): {:?}\n",
+                        real,
+                        error
+                    );
+                    runtime.sleep_fail(error);
+                }
+            }
+            return;
+        }
+        let commit = self.sleep_commit.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if commit.is_null() {
+            let mut guard = self.shared.lock();
+            if let Some(runtime) = Option::as_mut(&mut *guard) {
+                runtime.sleep_unhold();
+            }
+            return;
+        }
+        let mut saved = self.sleep_ps.load(Ordering::Relaxed);
+        // SAFETY: `commit` came from `asahi_g16_commit_prepare` and is finished once.
+        let stopped = unsafe { asahi_g17_commit_finish(commit, &mut saved) };
+        self.sleep_ps.store(saved, Ordering::Relaxed);
+        // SAFETY: Reads a global flag word.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
+        if !stopped && !real {
+            dev_info!(
+                self.dev.as_ref(),
+                "M3 GPU: sleep refused before commit; firmware never stopped\n"
+            );
+            let mut guard = self.shared.lock();
+            if let Some(runtime) = Option::as_mut(&mut *guard) {
+                runtime.sleep_unhold();
+            }
+            return;
+        }
+        if !real {
+            dev_warn!(
+                self.dev.as_ref(),
+                "M3 GPU: sleep refused after commit stop; firmware stays stopped\n"
+            );
+            let mut guard = self.shared.lock();
+            if let Some(runtime) = Option::as_mut(&mut *guard) {
+                runtime.sleep_fail(EIO);
+            }
+            return;
+        }
+        let started = Instant::<Monotonic>::now();
+        // SAFETY: PMP resumed before this consumer via the device link established at probe.
+        let power_res = kernel::error::to_result(unsafe {
+            bindings::apple_pmp_set_device_power(0x0f, 5, 1)
+        });
+        let mut guard = self.shared.lock();
+        let Some(runtime) = Option::as_mut(&mut *guard) else {
+            return;
+        };
+        match power_res.and_then(|()| runtime.sleep_warm_restart()) {
+            Ok(()) => {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "M3 GPU: firmware back in {} us\n",
+                    started.elapsed().as_micros_ceil()
+                );
+                runtime.sleep_unhold();
+            }
+            Err(error) => {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "M3 GPU: firmware did not come back after sleep: {:?}\n",
+                    error
+                );
+                runtime.sleep_fail(error);
+            }
+        }
+    }
+
     /// Stops the runtime: called on unbind, while the device's resources are still live, and
     /// again (doing nothing) when the backend is dropped.
     pub(crate) fn stop(&self) {
+        self.holds_pd_in_firmware.store(false, Ordering::Release);
+        let commit = self.sleep_commit.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !commit.is_null() {
+            let mut saved = 0;
+            // SAFETY: `commit` came from `asahi_g16_commit_prepare` and is finished once.
+            let _ = unsafe { asahi_g17_commit_finish(commit, &mut saved) };
+        }
         self.health.mark_failed();
         drop(self.shared.lock().take());
     }

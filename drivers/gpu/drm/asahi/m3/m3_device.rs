@@ -23,7 +23,9 @@ use crate::m3::m3_firmware::Firmware;
 use crate::m3::m3_soc::Soc;
 
 const ASC_CPU_CONTROL: usize = 0x44;
+const ASC_CPU_STATUS: usize = 0x48;
 const ASC_CPU_RUN: u32 = 1 << 4;
+const ASC_CPU_STATUS_DOWN: u32 = (1 << 1) | (1 << 5);
 
 pub(crate) struct Device {
     dev: ARef<platform::Device>,
@@ -32,6 +34,7 @@ pub(crate) struct Device {
     firmware: Firmware,
     core_mask: u64,
     soc: &'static Soc,
+    sgx_setup: Option<(usize, u32)>,
     power_vote: bool,
 }
 
@@ -87,6 +90,7 @@ impl Device {
             firmware,
             core_mask: 0,
             soc,
+            sgx_setup: None,
             power_vote: false,
         };
 
@@ -134,8 +138,39 @@ impl Device {
         if let Some((setup_offset, setup_value)) = setup {
             registers.try_write32(setup_value, setup_offset)?;
         }
+        device.sgx_setup = setup;
         device.core_mask = core_mask;
         Ok(device)
+    }
+
+    /// Re-applies the SGX open/setup register write after `PS_GFX` has been power-cycled.
+    pub(crate) fn restore_sgx_setup(&self) -> Result {
+        let sgx_guard = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = sgx_guard.as_view();
+        let version = sgx.try_read32(0xd04000)?;
+        if let Some((offset, value)) = self.sgx_setup {
+            let before = sgx.try_read32(offset)?;
+            sgx.try_write32(value, offset)?;
+            let after = sgx.try_read32(offset)?;
+            dev_info!(
+                self.dev.as_ref(),
+                "M3 {}: wake SGX version={:#010x} setup +{:#x}: {:#x} -> {:#x} (want {:#x})\n",
+                self.soc.gpu_name,
+                version,
+                offset,
+                before,
+                after,
+                value
+            );
+        } else {
+            dev_info!(
+                self.dev.as_ref(),
+                "M3 {}: wake SGX version={:#010x} (no sgx_setup)\n",
+                self.soc.gpu_name,
+                version
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn core_mask(&self) -> u64 { self.core_mask }
@@ -290,6 +325,34 @@ impl Device {
 
     pub(crate) fn firmware(&self) -> &Firmware { &self.firmware }
 
+    pub(crate) fn asc_running(&self) -> Result<bool> {
+        let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
+        Ok(asc_guard.as_view().read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0)
+    }
+
+    pub(crate) fn asc_regs(&self) -> Result<(u32, u32)> {
+        let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
+        let asc = asc_guard.as_view();
+        Ok((asc.read32(ASC_CPU_CONTROL), asc.read32(ASC_CPU_STATUS)))
+    }
+
+    pub(crate) fn wait_asc_idle(&self) -> Result<u32> {
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let status = {
+                let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
+                asc_guard.as_view().read32(ASC_CPU_STATUS)
+            };
+            if status & ASC_CPU_STATUS_DOWN == ASC_CPU_STATUS_DOWN {
+                return Ok(status);
+            }
+            if start.elapsed() >= Delta::from_millis(5) {
+                return Ok(status);
+            }
+            fsleep(Delta::from_micros(50));
+        }
+    }
+
     pub(crate) fn require_stopped(&self, pdev: &platform::Device<Core<'_>>) -> Result {
         if self.asc.access(pdev.as_ref())?.as_view().read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 {
             return Err(EBUSY);
@@ -304,16 +367,37 @@ impl Device {
         Ok(())
     }
 
-    pub(crate) fn stop_asc(&self) -> Result {
+    pub(crate) fn restart_asc(&self) -> Result {
         let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
         let asc = asc_guard.as_view();
-        asc.write32(asc.read32(ASC_CPU_CONTROL) & !ASC_CPU_RUN, ASC_CPU_CONTROL);
+        let ctrl = asc.read32(ASC_CPU_CONTROL);
+        if ctrl & ASC_CPU_RUN != 0 {
+            return Err(EBUSY);
+        }
+        asc.write32(ctrl | ASC_CPU_RUN, ASC_CPU_CONTROL);
+        Ok(())
+    }
+
+    pub(crate) fn stop_asc(&self) -> Result {
+        {
+            let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
+            let asc = asc_guard.as_view();
+            asc.write32(asc.read32(ASC_CPU_CONTROL) & !ASC_CPU_RUN, ASC_CPU_CONTROL);
+        }
         let start = Instant::<Monotonic>::now();
-        while asc.read32(ASC_CPU_CONTROL) & ASC_CPU_RUN != 0 {
-            if start.elapsed() >= Delta::from_millis(100) { return Err(ETIMEDOUT); }
+        loop {
+            let ctrl = {
+                let asc_guard = self.asc.try_access().ok_or(ENODEV)?;
+                asc_guard.as_view().read32(ASC_CPU_CONTROL)
+            };
+            if ctrl & ASC_CPU_RUN == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= Delta::from_millis(100) {
+                return Err(ETIMEDOUT);
+            }
             fsleep(Delta::from_micros(10));
         }
-        Ok(())
     }
 
 }

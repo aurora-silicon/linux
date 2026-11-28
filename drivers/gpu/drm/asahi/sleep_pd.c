@@ -19,6 +19,7 @@
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/pm_domain.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 #include <linux/types.h>
 
@@ -61,12 +62,12 @@ int asahi_sleep_pd_init(struct device *dev)
 	return 0;
 }
 
-int asahi_sleep_pd_suspend_noirq(struct device *dev)
+int asahi_sleep_pd_suspend_noirq_hold(struct device *dev, bool hold_firmware)
 {
 	struct asahi_sleep_pd *hold;
 	int ret;
 
-	if (pm_suspend_via_firmware())
+	if (pm_suspend_via_firmware() && !hold_firmware)
 		return 0;
 
 	/*
@@ -77,13 +78,13 @@ int asahi_sleep_pd_suspend_noirq(struct device *dev)
 	 * directly. For a multi-domain GPU node, genpd_dev_pm_attach() leaves
 	 * dev->pm_domain unset, so dev_pm_genpd_is_on() would return false and
 	 * genpd would power those domains off under live GPU firmware; refuse
-	 * s2idle with -EBUSY rather than failing open.
+	 * sleep with -EBUSY rather than failing open.
 	 */
 	if (!dev->pm_domain) {
 		if (of_count_phandle_with_args(dev->of_node, "power-domains",
 					       "#power-domain-cells") > 1) {
 			dev_warn_once(dev,
-				      "GPU has multiple power domains; s2idle hold only supports a single genpd, refusing s2idle\n");
+				      "GPU has multiple power domains; sleep hold only supports a single genpd, refusing sleep\n");
 			return -EBUSY;
 		}
 		return 0;
@@ -101,7 +102,7 @@ int asahi_sleep_pd_suspend_noirq(struct device *dev)
 
 	ret = dev_pm_genpd_add_notifier(dev, &hold->nb);
 	if (ret == -EEXIST) {
-		dev_warn(dev, "genpd already has a power notifier; refusing s2idle\n");
+		dev_warn(dev, "genpd already has a power notifier; refusing sleep\n");
 		return -EBUSY;
 	}
 	if (ret)
@@ -109,6 +110,11 @@ int asahi_sleep_pd_suspend_noirq(struct device *dev)
 
 	hold->active = true;
 	return 0;
+}
+
+int asahi_sleep_pd_suspend_noirq(struct device *dev)
+{
+	return asahi_sleep_pd_suspend_noirq_hold(dev, false);
 }
 
 int asahi_sleep_pd_resume_noirq(struct device *dev)
@@ -122,4 +128,17 @@ int asahi_sleep_pd_resume_noirq(struct device *dev)
 	dev_pm_genpd_remove_notifier(dev);
 	hold->active = false;
 	return 0;
+}
+
+int asahi_sleep_pd_domain_set(struct device *dev, bool on)
+{
+	struct device_node *np;
+	int ret;
+
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!np)
+		return -ENODEV;
+	ret = apple_sleep_domain_set(np, on);
+	of_node_put(np);
+	return ret;
 }
