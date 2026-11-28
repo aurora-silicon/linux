@@ -256,6 +256,9 @@ void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
 
+/* apple_rtkit_boot(), with no handshake wait running past @deadline (jiffies). */
+int apple_rtkit_boot_by(struct apple_rtkit *rtk, unsigned long deadline);
+
 /* apple_rtkit_boot(), calling @before_ap between the IOP's report and the AP going on. */
 int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data), void *data);
 

@@ -29,6 +29,10 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
+
+/* The camera. The loader sets the platform ID from the ADT isp0 sensor-type (0xba). */
+#include "t6050-isp.dtsi"
 
 /* The 14-inch chassis: the Neural Engine, pins, the jack, the card and the AOP; no speakers */
 #include "t6050-k114.dtsi"
@@ -48,6 +52,10 @@
 	width-mm = <302>;
 	height-mm = <199>;
 };
+
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k114s.bin", "apple/msrk-k114s.bin"
+#include "t6050-touchid.dtsi"
 
 /*
  * The USB-C ports ATC1 and ATC2, as on the other K boards (t6050-k114-k116-usb.dtsi), then the

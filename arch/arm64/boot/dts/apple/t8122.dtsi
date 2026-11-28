@@ -2012,3 +2012,5 @@
 #include "t8122-coprocessors.dtsi"
 
 #include "t8122-misc-interfaces.dtsi"
+
+#include "t8122-usb4.dtsi"

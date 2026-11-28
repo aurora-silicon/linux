@@ -178,6 +178,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
 /* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
+/*
+ * macOS 27.2 (26B8125) / T6050, as its stub preloads it on the K114s: TEXT 0x158000,
+ * DATA 0x134000, the 26C5035 sizes.
+ */
+#define AVE_FW_TEXT_CRC_T6050_26B8125 0x1e27a926
 /* The M5 (T8142) build of the same 26A428 firmware (encoder firmware 9013.45.1). */
 #define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 /* The M4 (T8132) build preloaded by the macOS 27.2 (26B123) stub. */
@@ -715,5 +720,7 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 			 struct vb2_v4l2_buffer *dst, bool same_input);
 int ave_mctf_register(struct ave_dev *ave);
 void ave_mctf_unregister(struct ave_dev *ave);
+bool ave_mctf_input_fits(size_t plane_size, u32 data_offset, size_t bytes);
+size_t ave_mctf_input_bytes(const struct v4l2_pix_format_mplane *f);
 
 #endif

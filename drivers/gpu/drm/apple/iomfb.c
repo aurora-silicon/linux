@@ -3260,8 +3260,9 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
-	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_fw_panel_decodes_pq(dcp) &&
+	       dcp_has_panel(dcp) && dcp->panel.edr_ceiling &&
+	       READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
@@ -3643,14 +3644,54 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	/*
-	 * The T6050 internal DCP (M5 Max) crashes on 3024x1986@60 and the
-	 * other 60 Hz timings it lists.  Only the 120 Hz timing is known to
-	 * survive a modeset, so refuse the rest until they are understood.
+	 * The T6050 internal DCP (M5 Max, K114s) crashes on a mode set away
+	 * from the timing iBoot left the panel at: 120 -> 60 Hz, and 60 ->
+	 * 120 Hz when macOS left it at 60 Hz.  Offer only the rate the
+	 * firmware reported at start (dcp_rtk_syslog_boot_rate()), 120 Hz
+	 * when it reported none.
 	 */
-	if (dcp->hw.only_120hz_modes && drm_mode_vrefresh(mode) != 120)
+	if (dcp->hw.only_120hz_modes &&
+	    drm_mode_vrefresh(mode) != (READ_ONCE(dcp->boot_rate) ?: 120))
 		return false;
 
 	return true;
+}
+
+/*
+ * Firmware 27 compares a mode's video clock, half its pixel clock (it logs
+ * "getClockFrequency(0) (C) < videoClock V" with V = pixel clock / 2 at every
+ * rate), with the provider clock it asks for by index 0.  When the clock is
+ * below the video clock it gives up scaling ("Giving up on frequencies") and
+ * relies on the SoC's power manager to raise the display clock from the
+ * pipe's bandwidth vote.  Linux runs no power manager that acts on that vote,
+ * so the pipe stays at the provider clock.  On an M2 mini (T8112) an external
+ * 2560x1440 display then shows only a strip at the top of the frame at 240 and
+ * 280 Hz (video clock 485/565 MHz, provider clock 360 MHz), while 144 Hz
+ * (292 MHz) is whole.
+ *
+ * Offer an external display only the modes the provider clock scans, unless
+ * a running PMP acknowledged this processor's display request when it
+ * started (pmp_display_acked, set by the start paths that verify it): the
+ * PMP then scales the clock.  This reads only that recorded state, so a mode
+ * query never starts or waits on the PMP.  The
+ * provider clock is the one the boot loader published for this processor
+ * and that the driver already answers the firmware with; a processor without
+ * a provider clock table, and internal panels, are not limited here.
+ */
+static bool dcp_mode_beyond_provider_clock(struct apple_dcp *dcp,
+					   struct drm_connector *connector,
+					   const struct drm_display_mode *mode)
+{
+	unsigned long rate;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->num_firmware_clocks ||
+	    !dcp->firmware_clocks || !dcp->firmware_clocks[0].clk ||
+	    connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		return false;
+
+	rate = clk_get_rate(dcp->firmware_clocks[0].clk);
+	return dcp_provider_clock_limits(mode->clock, rate,
+					 READ_ONCE(dcp->pmp_display_acked));
 }
 
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
@@ -3679,6 +3720,8 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	 * connector probed again when that changes.
 	 */
 	if (dcp_peer_mode_limited_v27(dcp, mode->clock))
+		return MODE_CLOCK_HIGH;
+	if (dcp_mode_beyond_provider_clock(dcp, connector, mode))
 		return MODE_CLOCK_HIGH;
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }

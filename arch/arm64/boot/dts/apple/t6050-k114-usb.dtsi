@@ -29,10 +29,13 @@
 };
 
 /*
- * The right port's USB4/Thunderbolt router (acio2) and PCIe tunnel; the DisplayPort route
- * is not described.
+ * The right port's USB4/Thunderbolt router (acio2) and PCIe tunnel, and its DisplayPort
+ * tunnels: the PHY's DP IN pixel clock sources and gates and the router's DP IN interrupts, as
+ * on J714s, so a monitor behind a Thunderbolt dock or enclosure on this port gets a pixel clock
+ * for its link rate. The DCP side is the loader's (ADT routes, t6050-k114-k116-display.dtsi).
  */
 #include "t6050-max-atc2-router.dtsi"
+#include "t6050-atc2-dp-tunnel.dtsi"
 
 /*
  * The host DROM from the ADT (/arm-io/acio2 thunderbolt-drom, the same on the K114c and the

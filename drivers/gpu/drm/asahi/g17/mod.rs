@@ -950,10 +950,17 @@ impl Firmware {
     }
 
     /// One governor step with the hotspot temperature reading; returns whether to run again and
-    /// what the CPU ceiling should do (applied by the caller without the device lock).
+    /// what the CPU ceiling should do (applied by the caller without the device lock). `None`
+    /// while the firmware is stopped or crashed: the caller hands every actuator back.
     fn governor_tick(&mut self, temp_mc: Option<i32>, fans: bool)
-        -> (bool, thermal::CpuAdvice, bool)
+        -> Option<(bool, thermal::CpuAdvice, bool)>
     {
+        // A fault, its recovery, an unbind, a stop that keeps the firmware for outstanding
+        // preparations, or the sleep's commit: the firmware no longer runs, and its latched
+        // effort must not keep the fans boosted.
+        if !self.primary.running || power::Control::crashed(self) {
+            return None;
+        }
         let now = now_ns();
         // Work published since the last step, with or without the device mutex.
         let published = self.primary.state.shared.governor_activity_ns.swap(0, Ordering::AcqRel);
@@ -965,27 +972,39 @@ impl Firmware {
         if self.effort.applied() != 0 && thermal::requested() {
             self.governor.note_activity(now);
         }
-        // Without the budget controller only the fan assistance runs (FanBoost::apply).
+        // Without the budget controller (not requested, or the SoC die zone or its passive trip
+        // gone) only the fan assistance runs (FanBoost::apply). A budget the controller left
+        // below the calibrated maximum goes back, and a failed write is retried.
         if !thermal::enabled() {
+            if let Some(budget) = self.governor.restore() {
+                self.publish_budget(budget);
+            }
             let busy = thermal::requested() && self.governor.recent_activity(now);
-            return (busy || fans, thermal::CpuAdvice::Release, busy);
+            let again = busy || fans || self.governor.pending();
+            return Some((again, thermal::CpuAdvice::Release, busy));
         }
         let Ok(current) = self.init.m5_power_budget() else {
-            return (false, thermal::CpuAdvice::Release, false);
+            return Some((false, thermal::CpuAdvice::Release, false));
         };
         self.governor.set_maximum(current);
         let power = self.init.m5_gpu_power_mw().unwrap_or(0);
         let clamped = self.init.m5_firmware_clamped().unwrap_or(false);
         let (publish, again) = self.governor.tick(temp_mc, power, clamped, now);
         if let Some(budget) = publish {
-            if self.init.publish_m5_power_budget(budget).is_err() {
-                return (false, thermal::CpuAdvice::Release, false);
-            }
+            self.publish_budget(budget);
         }
         let advice = self.governor.cpu_advice(power, now);
         let want_fans = self.governor.fans_wanted(now);
-        // Keep ticking while the fans are still boosted, so the hold can expire.
-        (again || fans, advice, want_fans)
+        // Keep ticking while the fans are still boosted, so the hold can expire, and while a
+        // budget write is owed.
+        Some((again || fans || self.governor.pending(), advice, want_fans))
+    }
+
+    /// Publishes a budget the governor returned; a failed write stays owed for the next step.
+    fn publish_budget(&mut self, budget: u32) {
+        if self.init.publish_m5_power_budget(budget).is_err() {
+            self.governor.publish_failed();
+        }
     }
 
     /// Restore the calibrated maximum budget (shutdown).
@@ -1446,15 +1465,21 @@ impl WorkItem<GOVERNOR_WORK> for Shared {
         // Sensor reads may sleep: take them before the device lock.
         let temp = thermal::hotspot_temperature_mc();
         let fans = this.actuators.lock().fans.boosted();
-        let (again, advice, want_fans) = {
+        let tick = {
             let mut state = this.state.lock();
-            match (*state).as_deref_mut() {
-                Some(firmware) => firmware.governor_tick(temp, fans),
-                None => (false, thermal::CpuAdvice::Release, false),
-            }
+            (*state).as_deref_mut().and_then(|firmware| firmware.governor_tick(temp, fans))
         };
         // Frequency QoS updates and SMC accesses may sleep: outside the device lock.
-        this.actuators.lock().apply(advice, want_fans, temp, now_ns());
+        let again = match tick {
+            Some((again, advice, want_fans)) => {
+                this.actuators.lock().apply(advice, want_fans, temp, now_ns());
+                again
+            }
+            // The firmware stopped or crashed (Firmware::governor_tick), or is gone: every
+            // actuator goes back at once, without the fan hold, and the work runs again until
+            // they are back.
+            None => this.actuators.lock().stop(),
+        };
         if again {
             this.queue_governor();
         }
@@ -2108,7 +2133,16 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
-        let feed = feed::Feed::new(m5)?;
+        // Firmware command timestamps count the system time base at its own 24 MHz, not at
+        // the CPU counter's rate (CNTFRQ_EL0 is 1 GHz on T6040 and T8140).
+        let feed = feed::Feed::new(
+            if m5 {
+                &feed::Policy::M5
+            } else {
+                &feed::Policy::DEFAULT
+            },
+            crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ,
+        )?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
@@ -2608,7 +2642,6 @@ impl Gpu {
                 session.init.port_views(mailbox)?,
                 session.bridge.regs.clone(),
                 shared.variant.registration,
-                !shared.variant.m5_commands,
             )
             .inspect_err(at("port"))?;
         session
@@ -2794,7 +2827,6 @@ impl Gpu {
             session.init.port_views(mailbox)?,
             session.bridge.regs.clone(),
             shared.variant.registration,
-            !shared.variant.m5_commands,
         )?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {

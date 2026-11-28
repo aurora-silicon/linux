@@ -3,7 +3,8 @@
  * The "Speaker Volume Unlock" lease: the speaker volumes leave the safe
  * ceiling only while one process holds the lock control and every speaker
  * volume, and pings within SPEAKER_LOCK_TIMEOUT ms while speaker playback
- * runs. Built on the card of macaudio-pm-volumes-test.h.
+ * runs, and only once an administrator has selected the volume lock. Built
+ * on the card of macaudio-pm-volumes-test.h, selected unless a case says.
  */
 #include <kunit/test.h>
 #include <linux/delay.h>
@@ -230,7 +231,55 @@ static void macaudio_vlimit_without_safety(struct kunit *test)
 	macaudio_pmt_expect_vols(test, &t, false);
 }
 
+/*
+ * Without an administrator's selection the lock and the ping are refused,
+ * for root too, and nothing is unlocked.
+ */
+static void macaudio_vlimit_needs_the_selection(struct kunit *test)
+{
+	struct snd_ctl_file *owner = kunit_kzalloc(test, sizeof(*owner), GFP_KERNEL);
+	struct macaudio_pmt_pm t;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, owner);
+	macaudio_pmt_pm_card(test, &t);
+	t.ma->spk_legacy_selected = false;
+	KUNIT_EXPECT_TRUE(test, capable(CAP_SYS_ADMIN));
+	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
+		t.vols[i]->vd[0].owner = owner;
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(t.slk, owner), -EPERM);
+	KUNIT_EXPECT_NULL(test, t.ma->speaker_lock_owner);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	/* Saved mixer states still restore */
+	KUNIT_EXPECT_EQ(test, macaudio_vlt_put(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_vlt_put(test, &t, 1), 0);
+}
+
+/* A daemon that took the lock while selected loses it with the selection */
+static void macaudio_vlimit_deselected_owner_is_refused(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+
+	macaudio_pmt_pm_card(test, &t);
+	macaudio_pmt_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+
+	mutex_lock(&t.ma->volume_lock_mutex);
+	t.ma->spk_legacy_selected = false;
+	macaudio_vlimit_update(t.ma);
+	mutex_unlock(&t.ma->volume_lock_mutex);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+}
+
 static struct kunit_case macaudio_vlimit_cases[] = {
+	KUNIT_CASE(macaudio_vlimit_needs_the_selection),
+	KUNIT_CASE(macaudio_vlimit_deselected_owner_is_refused),
 	KUNIT_CASE(macaudio_vlimit_restore_values_are_noops),
 	KUNIT_CASE(macaudio_vlimit_ping_needs_the_lock),
 	KUNIT_CASE(macaudio_vlimit_needs_every_volume),

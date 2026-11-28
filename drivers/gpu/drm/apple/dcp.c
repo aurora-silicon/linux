@@ -1659,7 +1659,7 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 	*generation = id->generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	/* PQ content is shown as EDR up to the peak (see dcp_edr_prepare()). */
-	if (READ_ONCE(dcp->panel.peak_nits)) {
+	if (READ_ONCE(dcp->panel.peak_nits) && dcp_fw_panel_decodes_pq(dcp)) {
 		metadata.pq = true;
 		metadata.static_metadata_type1 = true;
 		metadata.bt2020_rgb = true;
@@ -2299,8 +2299,30 @@ static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const cha
 	return false;
 }
 
+/*
+ * The T6050 internal DCP (hw.only_120hz_modes) can't survive a mode set away
+ * from the timing iBoot left the panel at: 120 -> 60 Hz crashes it, and so does
+ * 60 -> 120 Hz when macOS left the panel at 60 Hz.  The firmware names that
+ * rate when it starts, "IOMFB update_rr_index syncrate 60", before any mode set
+ * of ours: keep the first one (dcp_mode_settable()).
+ */
+static void dcp_rtk_syslog_boot_rate(struct apple_dcp *dcp, const char *message)
+{
+	const char *p;
+	u32 rate;
+
+	if (!dcp->hw.only_120hz_modes || READ_ONCE(dcp->boot_rate))
+		return;
+	p = strstr(message, "update_rr_index syncrate ");
+	if (!p || sscanf(p, "update_rr_index syncrate %u", &rate) != 1)
+		return;
+	if (rate >= 24 && rate <= 240)
+		WRITE_ONCE(dcp->boot_rate, rate);
+}
+
 static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
 {
+	dcp_rtk_syslog_boot_rate(cookie, message);
 	return dcp_h17p_syslog_is_debug(context, message);
 }
 
@@ -4556,8 +4578,8 @@ bool dcp_panel_edr(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
-	       dcp->panel.edr_ceiling;
+	return dcp_fw_swap_has_edr(dcp) && dcp_fw_panel_decodes_pq(dcp) &&
+	       dcp_has_panel(dcp) && dcp->panel.edr_ceiling;
 }
 
 /* External connectors driven by iomfb_template support full colour selection. */
@@ -7245,6 +7267,7 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 		return ret;
 	}
 	dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+	WRITE_ONCE(dcp->pmp_display_acked, true);
 	return 0;
 }
 

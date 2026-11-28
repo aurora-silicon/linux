@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! GPU thermal management for M5: opt-in host power budget governor (J714) and
-//! DT-configured hotspot fan assistance.
+//! GPU thermal management for M5: the host power budget governor (J714), on by default with its
+//! fan boost, and DT-configured hotspot fan assistance where the governor is turned off.
 //!
 //! The firmware limits the GPU to the host power budget word in Region C within about a second
 //! (the calibrated maximum is written there at initialization). Left at that maximum under
@@ -31,6 +31,7 @@ use kernel::{bindings, prelude::*};
 // their drivers are not built.
 extern "C" {
     fn asahi_zone_temp(name: *const c_char, temp: *mut c_int) -> c_int;
+    fn asahi_zone_passive(name: *const c_char, temp: *mut c_int) -> c_int;
     fn asahi_fans_request(dev: *mut c_void, permille: c_uint, min_step_rpm: c_uint) -> c_int;
     fn asahi_fans_hotspot_described() -> bool;
     fn asahi_fans_hotspot_policy(
@@ -119,7 +120,13 @@ const GPU_SLACK_PERCENT: i64 = 70;
 const CPU_HEAT_MARGIN_MC: i32 = 2000;
 const CPU_HEAT_FLOOR_SLACK_MW: i64 = 1000;
 
+/// Whether the host power budget controller governs: requested (m5_thermal_governor bit 0, on by
+/// default) and given a target by the SoC die zone's passive trip. Without that zone or its trip
+/// the governor does not govern.
 pub(super) fn enabled() -> bool {
+    governor_requested() && target_mc().is_some()
+}
+fn governor_requested() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 1 != 0
 }
 
@@ -150,11 +157,30 @@ fn fan_curve_enabled() -> bool {
 /// Whether the governor work runs for a busy GPU: for the budget controller or the fan
 /// assistance.
 pub(super) fn requested() -> bool {
-    enabled() || hotspot_fans_only()
+    governor_requested() || hotspot_fans_only()
 }
-fn target_mc() -> i32 {
-    let parameter = crate::module_parameters::m5_thermal_target_mc.value();
-    i32::try_from(parameter).unwrap_or(90_000).clamp(70_000, 104_000)
+/// The hotspot the governor settles at: the SoC die zone's passive trip, the die temperature from
+/// which the machine sheds performance (from its ADT; on T6050 the PMP's fast die control holds
+/// `fast-die-ctrl-ts-avg-temp`, below the hotspot at which the GPU firmware's own limiter, after
+/// holding the GPU dies at their limit for about a minute, pins the GPU to its base performance
+/// state). Read with the hotspot on every step; 0 while the zone or its trip is missing.
+static TARGET_MC: AtomicI32 = AtomicI32::new(0);
+
+fn target_mc() -> Option<i32> {
+    let target = TARGET_MC.load(Ordering::Relaxed);
+    (target > 0).then_some(target)
+}
+
+/// Re-reads the target from the SoC die zone's passive trip under the provider guard.
+fn refresh_target(_provider: &SensorProvider) {
+    let mut temp: c_int = 0;
+    // SAFETY: the name is NUL-terminated and outlives the call, and temp is a valid destination;
+    // the zone is looked up and walked under the provider guard.
+    let target = (unsafe { asahi_zone_passive(SOC_DIE_ZONE.as_ptr(), &mut temp) } == 0)
+        .then_some(temp)
+        .filter(|temp| (1..=125_000).contains(temp))
+        .unwrap_or(0);
+    TARGET_MC.store(target, Ordering::Relaxed);
 }
 
 /// Whether the firmware's primary limiter words describe the emergency clamp.
@@ -220,7 +246,11 @@ fn zone_temperature_mc(_provider: &SensorProvider, name: &CStr) -> Option<i32> {
 /// cannot be read), or None when no sensor can be read. Called without driver locks held: zone
 /// lookups and sensor reads may sleep.
 pub(crate) fn hotspot_temperature_mc() -> Option<i32> {
-    let provider = SensorProvider::acquire()?;
+    let Some(provider) = SensorProvider::acquire() else {
+        TARGET_MC.store(0, Ordering::Relaxed);
+        return None;
+    };
+    refresh_target(&provider);
     if hotspot_fans_only() {
         // The assistance reads only the input that selected it: the SoC die zone, whose one key
         // is the hotspot. Without it the fans go back to the SMC.
@@ -399,7 +429,11 @@ impl FanBoost {
     }
 
     fn set_budget(&self, boost: bool) -> bool {
-        request_fans(if boost { 1000 } else { 0 }, 0).is_some()
+        self.set_budget_step(boost, 0)
+    }
+
+    fn set_budget_step(&self, boost: bool, step: u32) -> bool {
+        request_fans(if boost { 1000 } else { 0 }, step).is_some()
     }
 
     fn set_hotspot(&self, boost: bool, step: u32) -> bool {
@@ -503,8 +537,8 @@ impl FanBoost {
             return;
         }
         if !fan_boost_enabled() {
-            if fan_curve_enabled() {
-                self.apply_curve(want, temp_mc, target_mc(), now_ns);
+            if let (true, Some(target)) = (fan_curve_enabled(), target_mc()) {
+                self.apply_curve(want, temp_mc, target, now_ns);
             } else if self.curve_rpm != 0 {
                 let _ = self.release_budget();
             }
@@ -513,8 +547,12 @@ impl FanBoost {
         if want {
             self.since_ns = now_ns;
         }
-        if want && !self.budget_boosted {
-            self.budget_boosted = self.set_budget(true);
+        if want {
+            // Requested on every governed step, not only the first: a fan already at its maximum is
+            // left alone (the step), and one the SMC took back (suspend, or the hwmon cell unbound
+            // and bound again, both return the fans to automatic mode) is set again.
+            let step = if self.budget_boosted { FAN_CURVE_STEP_RPM } else { 0 };
+            self.budget_boosted = self.set_budget_step(true, step);
             if self.budget_boosted {
                 self.budget_release_pending = false;
             } else {
@@ -534,6 +572,15 @@ impl FanBoost {
     pub(crate) fn release(&mut self) {
         let _ = self.release_budget();
         let _ = self.release_hotspot();
+    }
+
+    /// The GPU firmware stopped (a fault, its recovery or an unbind): hand every fan back to the
+    /// SMC now, without the hold, and return whether a release is still pending, so the caller
+    /// runs again until the fans are back.
+    pub(crate) fn stop(&mut self) -> bool {
+        self.release();
+        self.since_ns = 0;
+        self.boosted()
     }
 
     pub(crate) fn boosted(&self) -> bool {
@@ -570,6 +617,13 @@ impl Actuators {
     pub(crate) fn release(&mut self) {
         self.cpu.release();
         self.fans.release();
+    }
+
+    /// The GPU firmware stopped: release every actuator at once. Returns whether a fan release is
+    /// still pending (see [`FanBoost::stop`]).
+    pub(crate) fn stop(&mut self) -> bool {
+        self.cpu.release();
+        self.fans.stop()
     }
 }
 
@@ -779,19 +833,21 @@ pub(crate) struct Governor {
     target_offset_mc: i32,
     target_offset_ns: u64,
     was_clamped: bool,
+    /// The last budget write failed: the budget word may still hold an earlier budget.
+    unpublished: bool,
 }
 
 impl Governor {
     pub(crate) const fn new() -> Self {
         Self { maximum_mw: 0, budget_mw: 0, integral_mw: 0, ceiling_mw: 0, converged_mw: 0, active: false,
             last_tick_ns: 0, last_activity_ns: 0, last_active_ns: 0, last_temp_mc: None, target_offset_mc: 0,
-            target_offset_ns: 0, was_clamped: false }
+            target_offset_ns: 0, was_clamped: false, unpublished: false }
     }
 
     /// The firmware accepted a submission; returns whether the control loop should run.
     pub(crate) fn note_activity(&mut self, now_ns: u64) -> bool {
         self.last_activity_ns = now_ns;
-        requested() || self.budget_mw != self.maximum_mw
+        requested() || self.pending()
     }
 
     /// Learn the calibrated maximum from the budget word before the first change.
@@ -802,17 +858,31 @@ impl Governor {
         }
     }
 
-    /// The budget to publish while stopping, if it differs from the maximum.
+    /// The calibrated maximum to publish while the controller may not govern (stopping, or the
+    /// target gone), if the budget word may differ from it.
     pub(crate) fn restore(&mut self) -> Option<u32> {
         self.active = false;
         self.integral_mw = 0;
         self.converged_mw = 0;
         self.target_offset_mc = 0;
-        if self.maximum_mw == 0 || self.budget_mw == self.maximum_mw {
+        if self.maximum_mw == 0 || (self.budget_mw == self.maximum_mw && !self.unpublished) {
             return None;
         }
         self.budget_mw = self.maximum_mw;
+        self.unpublished = false;
         Some(self.budget_mw)
+    }
+
+    /// The budget last returned for publishing did not reach the firmware: the next step or
+    /// restore publishes again.
+    pub(crate) fn publish_failed(&mut self) {
+        self.unpublished = true;
+    }
+
+    /// Whether the budget word is still owed a write: a budget below the calibrated maximum, or
+    /// a failed write. The work runs again until it is not.
+    pub(crate) fn pending(&self) -> bool {
+        self.unpublished || self.budget_mw != self.maximum_mw
     }
 
     /// Integral to engage with: the converged one while it is fresh, decaying to the cold-start
@@ -834,8 +904,9 @@ impl Governor {
     /// Learn from the firmware's emergency clamp: lower the effective target by a step on each
     /// clamp seen while governing, raise it again after a long period without one.
     fn adapt_target(&mut self, clamped: bool, now_ns: u64) {
+        let Some(base) = target_mc() else { return };
         if clamped && !self.was_clamped && self.active {
-            let limit = (target_mc() - CLAMP_TARGET_FLOOR_MC).clamp(0, CLAMP_TARGET_MAX_MC);
+            let limit = (base - CLAMP_TARGET_FLOOR_MC).clamp(0, CLAMP_TARGET_MAX_MC);
             self.target_offset_mc = (self.target_offset_mc + CLAMP_TARGET_STEP_MC).min(limit);
             self.target_offset_ns = now_ns;
         } else if !clamped && self.target_offset_mc > 0
@@ -861,9 +932,10 @@ impl Governor {
             // returns gradually and does not re-engage the governor at once.
             return CpuAdvice::Raise;
         }
+        let Some(base) = target_mc() else { return CpuAdvice::Release };
         let budget = i64::from(self.budget_mw);
         let power = i64::from(power_mw);
-        let target = target_mc() - self.target_offset_mc;
+        let target = base - self.target_offset_mc;
         let temp = self.last_temp_mc.unwrap_or(target);
         if temp >= target + CPU_HEAT_MARGIN_MC
             && budget <= FLOOR_MW.min(self.ceiling_mw) + CPU_HEAT_FLOOR_SLACK_MW
@@ -905,7 +977,8 @@ impl Governor {
         if enabled() {
             self.adapt_target(clamped, now_ns);
         }
-        let target = target_mc() - self.target_offset_mc;
+        // Without a target enabled() is false and the match below never reads it.
+        let target = target_mc().map_or(0, |base| base - self.target_offset_mc);
         let desired = match temp_mc {
             _ if maximum == 0 => return (None, false),
             None => {
@@ -968,11 +1041,12 @@ impl Governor {
             }
         };
         let desired = if desired >= maximum { maximum } else { desired - desired % STEP_MW };
-        let publish = (desired != i64::from(self.budget_mw)).then(|| {
+        let publish = (desired != i64::from(self.budget_mw) || self.unpublished).then(|| {
             self.budget_mw = desired as u32;
+            self.unpublished = false;
             self.budget_mw
         });
-        let again = (!idle && requested()) || self.budget_mw != self.maximum_mw;
+        let again = (!idle && requested()) || self.pending();
         (publish, again)
     }
 }

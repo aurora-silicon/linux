@@ -53,8 +53,10 @@ const GLOBALS_SHARED1: usize = 0xec;
 const GLOBALS_SHARED2: usize = 0x1b4;
 const SHARED1_BYTES: usize = 0xa8;
 const SHARED2_BYTES: usize = 0x510;
-/// Power-record offset of the 13.5 HwDataShared3 (0x50 bytes).
+/// Offsets of the 13.5 HwDataShared3 in the 27.2 power and controller records.
 const POWER_SHARED3: usize = 0x4f0;
+const CONTROLLER_SHARED3: usize = 0x62ac;
+const CONTROLLER_BYTES: usize = 0x6c48;
 const _: () = {
     assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared1>() == SHARED1_BYTES);
     assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared2>() == SHARED2_BYTES);
@@ -77,7 +79,9 @@ const _: () = {
     assert!(offset_of!(B13, num_frags) + offset_of!(B27, chip_id) - offset_of!(B13, chip_id) == 0x10a4);
     use fw::initdata::raw::HwDataShared3 as S3;
     assert!(core::mem::size_of::<S3>() == 0x50 && offset_of!(S3, table) == 0xc && offset_of!(S3, unk_4c) == 0x4c);
-    assert!(POWER_SHARED3 + 0x50 <= 0x6a0);
+    assert!(POWER_SHARED3 + core::mem::size_of::<S3>() <= 0x6a0);
+    assert!(CONTROLLER_SHARED3 + offset_of!(S3, table) == 0x62b8);
+    assert!(CONTROLLER_SHARED3 + core::mem::size_of::<S3>() <= CONTROLLER_BYTES);
 };
 
 /// Board facts the root needs, read from the device tree at probe.
@@ -1319,7 +1323,7 @@ impl RootV27_2 {
         let mut compute_state = 0;
         let mut render_states = [0; 2];
         for (offset, size) in [(0x10, 0x88), (0x254, 0x678), (0x25c, 0x760),
-                               (0x264, 0x6d0), (0x26c, 0x60), (0x485, 0x6c48)] {
+                               (0x264, 0x6d0), (0x26c, 0x60), (0x485, CONTROLLER_BYTES)] {
             let mut owner = alloc.private.array_empty::<u8>(size)?;
             if offset == 0x485 {
                 Self::controller(owner.as_mut_slice(), graph, &extra, sensors)?;
@@ -1603,9 +1607,9 @@ impl RootV27_2 {
         }
         put64(policy, 0x2f28, sensors);
         put32(policy, 0x3ba8, 1);
-        for (word, value) in policy[0x62b8..0x62f8].chunks_exact_mut(4).zip(cfg.shared3_tab) {
-            word.copy_from_slice(&value.to_le_bytes());
-        }
+        // Keep the controller's per-state table and the words that control its use
+        // together, as in the power record.
+        base.hwdata_a.with(|a, _| put_shared3(policy, CONTROLLER_SHARED3, &a.hws3));
         // Warm-restart operands: base operating point and wake flags.
         for (at, value) in [
             (0x9c, 1),

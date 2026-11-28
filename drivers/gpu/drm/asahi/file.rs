@@ -94,6 +94,9 @@ pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
     uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Render commands accept tile buffers of up to 48 KiB.
+pub(crate) const DRM_ASAHI_FEATURE_TILE_BUFFER_48K: u64 =
+    uapi::DRM_ASAHI_FEATURE_TILE_BUFFER_48K as u64;
 /// Compute commands may declare a stream that ends with a memory-scoped flush
 /// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
@@ -791,7 +794,7 @@ impl File {
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
         let vm = gpu
-            .new_vm_for_file(kernel_range.clone(), file_id)?
+            .new_vm_for_file(kernel_range.clone(), file_id, &file.inner().mem)?
             .with_memory_client(file.inner().mem.clone());
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
@@ -1244,7 +1247,7 @@ impl File {
                 entry.kernel_range.clone(),
             )
         };
-        let mut batch = mmu::PreparedUserBindBatch::new(count)?;
+        let mut batch = mmu::PreparedUserBindBatch::new(&vm, count)?;
         let mut unmaps = 0;
         // A fresh reader per declared stride also skips extension bytes in longer records.
         for bytes in bytes.chunks_exact(stride) {
@@ -1312,7 +1315,6 @@ impl File {
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;
         vm.commit_prepared_user_bind_batch(&mut batch)?;
-        vm.bo_deferred_cleanup();
         Ok(0)
     }
 

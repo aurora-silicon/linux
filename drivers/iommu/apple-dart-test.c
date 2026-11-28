@@ -1639,6 +1639,66 @@ static void apple_dart_test_fw_mirror_prot(struct kunit *test)
 	pm_runtime_disable(dart->dev);
 }
 
+static struct apple_dart *apple_dart_test_keep_dart(struct kunit *test, const char *name)
+{
+	struct apple_dart *dart;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, name);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dev_set_drvdata(dart->dev, dart);
+	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->hw = &apple_dart_hw_t8110;
+	dart->num_streams = 2;
+	return dart;
+}
+
+static void apple_dart_test_display_keep(struct kunit *test)
+{
+	struct device *no_data;
+	struct apple_dart *unsaved;
+	struct apple_dart *darts[11];
+	char name[32];
+	unsigned int i;
+
+	no_data = kunit_device_register(test, "apple-dart-keep-none");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, no_data);
+	KUNIT_EXPECT_EQ(test, apple_dart_display_keep(no_data, BIT(1), true), -ENODEV);
+
+	unsaved = apple_dart_test_keep_dart(test, "apple-dart-keep-unsaved");
+	KUNIT_EXPECT_EQ(test, apple_dart_display_keep(unsaved->dev, BIT(1), false), -ENOENT);
+
+	for (i = 0; i < ARRAY_SIZE(darts); i++) {
+		snprintf(name, sizeof(name), "apple-dart-keep-%u", i);
+		darts[i] = apple_dart_test_keep_dart(test, name);
+		writel(DART_T8110_TCR_TRANSLATE_ENABLE,
+		       darts[i]->regs + DART_TCR(darts[i], 1));
+		writel(darts[i]->hw->ttbr_valid | (0x1000 + i),
+		       darts[i]->regs + DART_TTBR(darts[i], 1, 0));
+	}
+
+	/* All 10 display DARTs (5 display processors x 2 DARTs) fit in keep[]. */
+	for (i = 0; i < 10; i++)
+		KUNIT_ASSERT_EQ(test, apple_dart_display_keep(darts[i]->dev, BIT(1), true), 0);
+
+	/* An 11th DART exceeds the table. */
+	KUNIT_EXPECT_EQ(test, apple_dart_display_keep(darts[10]->dev, BIT(1), true), -ENOSPC);
+
+	/* Clobber saved words and confirm every slot restores them cleanly. */
+	for (i = 0; i < 10; i++) {
+		writel(0, darts[i]->regs + DART_TCR(darts[i], 1));
+		writel(0, darts[i]->regs + DART_TTBR(darts[i], 1, 0));
+		KUNIT_EXPECT_EQ(test, apple_dart_display_keep(darts[i]->dev, BIT(1), false), 2);
+		KUNIT_EXPECT_EQ(test, readl(darts[i]->regs + DART_TCR(darts[i], 1)),
+				DART_T8110_TCR_TRANSLATE_ENABLE);
+		KUNIT_EXPECT_EQ(test, readl(darts[i]->regs + DART_TTBR(darts[i], 1, 0)),
+				darts[i]->hw->ttbr_valid | (0x1000 + i));
+		KUNIT_EXPECT_EQ(test, apple_dart_display_keep(darts[i]->dev, BIT(1), false), 0);
+	}
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
@@ -1653,6 +1713,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_firmware_roots),
 	KUNIT_CASE(apple_dart_test_t8132_fw_mirror_selection),
 	KUNIT_CASE(apple_dart_test_fw_mirror_prot),
+	KUNIT_CASE(apple_dart_test_display_keep),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),

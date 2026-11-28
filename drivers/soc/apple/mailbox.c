@@ -935,7 +935,7 @@ static void apple_mbox_apply_rx_util_min(struct apple_mbox *mbox)
 
 int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min)
 {
-	if (!IS_ENABLED(CONFIG_UCLAMP_TASK) || !apple_mbox_is_g17(mbox))
+	if (!IS_ENABLED(CONFIG_UCLAMP_TASK) || !mbox->rx_threaded)
 		return -EOPNOTSUPP;
 	if (util_min < -1 || util_min > SCHED_CAPACITY_SCALE)
 		return -EINVAL;
@@ -1657,7 +1657,13 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		if (!irqname)
 			return -ENOMEM;
 
-		if (apple_mbox_is_g17(mbox))
+		/*
+		 * The G17 GPU coprocessors can flood the receive FIFO; their
+		 * hard handler drains a bounded batch and wakes a thread (see
+		 * apple_mbox_g17_recv_thread()), the thread a clamp applies to.
+		 */
+		mbox->rx_threaded = apple_mbox_is_g17(mbox);
+		if (mbox->rx_threaded)
 			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty,
 							apple_mbox_g17_recv_irq,
 							apple_mbox_g17_recv_thread,

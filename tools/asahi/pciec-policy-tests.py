@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    start = re.search(r'^(?:static\s+)?(?:bool|int|void)\s+' + name + r'\(',
+    start = re.search(r'^(?:static\s+)?(?:bool|int|u16|void)\s+' + name + r'\([^{;]*\)\s*\{',
                       source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
@@ -146,14 +146,22 @@ S2IDLE_FIXTURE = r'''
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 typedef uint8_t u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 #define BIT(n) (1U << (n))
 #define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define FIELD_GET(mask, reg) (((reg) & (mask)) >> __builtin_ctz(mask))
+#define U16_MAX ((u16)~0U)
+#define U32_MAX ((u32)~0U)
 #define READ_ONCE(x) (x)
 #define container_of(ptr, type, member) \
     ((type *)((char *)(ptr) - offsetof(type, member)))
+#define kzalloc_obj(x) calloc(1, sizeof(x))
+#define kfree(p) free(p)
 #define NOTIFY_OK 0x0001
 #define NOTIFY_STOP_MASK 0x8000
 #define GENPD_NOTIFY_PRE_OFF 0
@@ -161,6 +169,20 @@ typedef uint32_t u32;
 #define PM_SUSPEND_ON 0
 #define PM_SUSPEND_TO_IDLE 1
 #define PM_SUSPEND_MEM 3
+#define PCI_VENDOR_ID           0x00
+#define PCI_EXP_LNKCTL          0x10
+#define PCI_EXP_LNKCTL_ASPMC    0x0003
+#define PCI_L1SS_CTL1           0x08
+#define PCI_L1SS_CTL2           0x0c
+#define PCI_L1SS_CTL1_PCIPM_L1_2 0x00000001
+#define PCI_L1SS_CTL1_PCIPM_L1_1 0x00000002
+#define PCI_L1SS_CTL1_ASPM_L1_2  0x00000004
+#define PCI_L1SS_CTL1_ASPM_L1_1  0x00000008
+#define PCI_L1SS_CTL1_L1SS_MASK 0x0000000f
+#define PCI_L1SS_CTL1_L1_2_MASK 0x00000005
+typedef int pci_power_t;
+#define PCI_D0          0
+#define PCI_D3hot       3
 static inline int notifier_from_errno(int err)
 {
     return err ? (NOTIFY_STOP_MASK | (NOTIFY_OK - err)) : NOTIFY_OK;
@@ -180,8 +202,35 @@ struct device {
     struct notifier_block *genpd_nb;
     bool genpd_on;
     int genpd_add_ret;
+    int rpm_usage;
+    unsigned int rpm_barriers;
+    void (*rpm_inflight_cb)(struct device *dev);
     unsigned int add_calls, remove_calls;
 };
+static int pci_rescan_remove_depth;
+static void pm_runtime_get_noresume(struct device *dev)
+{
+    dev->rpm_usage++;
+}
+static int pm_runtime_put(struct device *dev)
+{
+    assert(dev->rpm_usage > 0);
+    dev->rpm_usage--;
+    return 0;
+}
+static int pm_runtime_barrier(struct device *dev)
+{
+    assert(pci_rescan_remove_depth == 0);
+    assert(dev->rpm_usage > 0);
+    dev->rpm_barriers++;
+    if (dev->rpm_inflight_cb) {
+        void (*cb)(struct device *) = dev->rpm_inflight_cb;
+
+        dev->rpm_inflight_cb = NULL;
+        cb(dev);
+    }
+    return 0;
+}
 struct apple_pcie_pd {
     struct device *dev;
     struct notifier_block nb;
@@ -193,10 +242,15 @@ struct list_head {
     struct list_head *next, *prev;
 };
 #define list_for_each_entry(pos, head, member)     for (pos = container_of((head)->next, typeof(*pos), member);          &pos->member != (head);          pos = container_of(pos->member.next, typeof(*pos), member))
+#define list_for_each_entry_safe(pos, n, head, member)     for (pos = container_of((head)->next, typeof(*pos), member),          n = container_of(pos->member.next, typeof(*pos), member);          &pos->member != (head);          pos = n, n = container_of(n->member.next, typeof(*n), member))
 static void list_init(struct list_head *head)
 {
     head->next = head;
     head->prev = head;
+}
+static bool list_empty(const struct list_head *head)
+{
+    return head->next == head;
 }
 static void list_add_tail(struct list_head *entry, struct list_head *head)
 {
@@ -205,17 +259,28 @@ static void list_add_tail(struct list_head *entry, struct list_head *head)
     head->prev->next = entry;
     head->prev = entry;
 }
+static void list_del(struct list_head *entry)
+{
+    entry->next->prev = entry->prev;
+    entry->prev->next = entry->next;
+    entry->next = NULL;
+    entry->prev = NULL;
+}
 struct apple_pcie_port {
     struct list_head entry;
     unsigned int idx;
     bool link_failed;
     u8 regs[0x900];
 };
+struct pci_host_bridge;
 struct apple_pcie {
     struct device *dev;
     const struct hw_info *hw;
     u8 *base;
     struct list_head ports;
+    struct list_head hib_l1ss;
+    struct list_head hib_l1ss_rpm;
+    struct pci_host_bridge *bridge;
     bool power_retained, kernel_init, tunnel_cold_init;
     bool bus_stopped, resume_failed, link_kept;
     struct apple_pcie_pd *pds;
@@ -223,14 +288,14 @@ struct apple_pcie {
     struct apple_dart_cio *cio_dart;
     bool cio_prepared, neo_sleep_armed, t6050_down;
     unsigned int managed_sids;
-    void *t6050_port, *t6050_dart;
+    void *t6050_port, *t6050_dart, *piodma_supplier;
     u32 t6050_parked;
 };
 static bool s2idle_keep_link = true;
 static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static bool suspend_via_firmware;
 static bool link_healthy = true;
-static unsigned int radio_prepare_calls, warn_calls;
+static unsigned int radio_prepare_calls, radio_complete_calls, warn_calls;
 static u32 readl(const void *addr)
 {
     u32 v;
@@ -269,6 +334,146 @@ static int apple_radio_prepare(struct device *dev)
     (void)dev;
     radio_prepare_calls++;
     return 0;
+}
+static void apple_radio_complete(struct device *dev)
+{
+    (void)dev;
+    radio_complete_calls++;
+}
+struct pci_bus {
+    struct list_head devices;
+};
+struct pci_dev {
+    struct list_head bus_list;
+    struct pci_bus *subordinate;
+    struct device dev;
+    pci_power_t current_state;
+    u8 devfn;
+    u16 l1ss;
+    u16 lnkctl;
+    bool downstream_port;
+    bool disconnected;
+    unsigned int refs;
+    u32 cfg[128];
+    u32 first_ctl1_write;
+    bool saw_ctl1_write;
+    unsigned int lnkctl_write_calls;
+    unsigned int fail_lnkctl_write_on_call;
+    unsigned int cfg_read_calls;
+    unsigned int fail_cfg_read_on_call;
+    unsigned int cfg_write_calls;
+    unsigned int fail_cfg_write_on_call;
+};
+struct pci_host_bridge {
+    struct pci_bus *bus;
+};
+static bool require_topology_lock;
+static void pci_lock_rescan_remove(void)
+{
+    assert(pci_rescan_remove_depth == 0);
+    pci_rescan_remove_depth++;
+}
+static void pci_unlock_rescan_remove(void)
+{
+    assert(pci_rescan_remove_depth == 1);
+    pci_rescan_remove_depth--;
+}
+static bool pci_dev_is_disconnected(const struct pci_dev *pdev)
+{
+    return pdev->disconnected;
+}
+static struct pci_host_bridge *pci_host_bridge_from_priv(struct apple_pcie *pcie)
+{
+    return pcie->bridge;
+}
+static bool pcie_downstream_port(const struct pci_dev *pdev)
+{
+    return pdev->downstream_port;
+}
+static struct pci_dev *pci_dev_get(struct pci_dev *pdev)
+{
+    if (pdev)
+        pdev->refs++;
+    return pdev;
+}
+static void pci_dev_put(struct pci_dev *pdev)
+{
+    if (pdev) {
+        assert(pdev->refs > 0);
+        pdev->refs--;
+    }
+}
+static int pcibios_err_to_errno(int err)
+{
+    return err;
+}
+static int pci_read_config_dword(struct pci_dev *pdev, int pos, u32 *val)
+{
+    if (require_topology_lock)
+        assert(pci_rescan_remove_depth > 0);
+    assert((pos & 3) == 0 && (size_t)(pos >> 2) < ARRAY_SIZE(pdev->cfg));
+    pdev->cfg_read_calls++;
+    if (pdev->fail_cfg_read_on_call &&
+        pdev->cfg_read_calls == pdev->fail_cfg_read_on_call)
+        return -EIO;
+    *val = pdev->cfg[pos >> 2];
+    return 0;
+}
+static int pci_write_config_dword(struct pci_dev *pdev, int pos, u32 val)
+{
+    if (require_topology_lock)
+        assert(pci_rescan_remove_depth > 0);
+    assert((pos & 3) == 0 && (size_t)(pos >> 2) < ARRAY_SIZE(pdev->cfg));
+    pdev->cfg_write_calls++;
+    if (pdev->l1ss && pos == pdev->l1ss + PCI_L1SS_CTL1 && !pdev->saw_ctl1_write) {
+        pdev->first_ctl1_write = val;
+        pdev->saw_ctl1_write = true;
+    }
+    if (pdev->fail_cfg_write_on_call &&
+        pdev->cfg_write_calls == pdev->fail_cfg_write_on_call)
+        return -EIO;
+    pdev->cfg[pos >> 2] = val;
+    return 0;
+}
+static int pcie_capability_read_word(struct pci_dev *pdev, int pos, u16 *val)
+{
+    assert(pos == PCI_EXP_LNKCTL);
+    *val = pdev->lnkctl;
+    return 0;
+}
+static int pcie_capability_write_word(struct pci_dev *pdev, int pos, u16 val)
+{
+    assert(pos == PCI_EXP_LNKCTL);
+    pdev->lnkctl_write_calls++;
+    if (pdev->fail_lnkctl_write_on_call &&
+        pdev->lnkctl_write_calls == pdev->fail_lnkctl_write_on_call)
+        return -EIO;
+    pdev->lnkctl = val;
+    return 0;
+}
+static void pci_warn(const struct pci_dev *pdev, const char *fmt, ...)
+{
+    (void)pdev;
+    (void)fmt;
+    warn_calls++;
+}
+static bool pci_walk_bus_rec(struct pci_bus *top,
+                             int (*cb)(struct pci_dev *, void *), void *userdata)
+{
+    struct pci_dev *dev;
+
+    list_for_each_entry(dev, &top->devices, bus_list) {
+        if (cb(dev, userdata))
+            return true;
+        if (dev->subordinate && pci_walk_bus_rec(dev->subordinate, cb, userdata))
+            return true;
+    }
+    return false;
+}
+static void pci_walk_bus(struct pci_bus *top,
+                         int (*cb)(struct pci_dev *, void *), void *userdata)
+{
+    pci_walk_bus_rec(top, cb, userdata);
 }
 static int dev_pm_genpd_add_notifier(struct device *dev,
                                      struct notifier_block *nb)
@@ -325,12 +530,40 @@ static void reset_host(struct device *dev, struct apple_pcie *pcie,
     pcie->num_pds = 1;
     pcie->cio_dart = cio_dart;
     list_init(&pcie->ports);
+    list_init(&pcie->hib_l1ss);
+    list_init(&pcie->hib_l1ss_rpm);
     s2idle_keep_link = true;
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
     suspend_via_firmware = false;
     link_healthy = true;
     radio_prepare_calls = 0;
+    radio_complete_calls = 0;
     warn_calls = 0;
+}
+static u32 inflight_rpm_saved_ctl1;
+static struct pci_dev *inflight_rpm_pdev;
+static struct pci_bus *hotplug_root_bus;
+static struct pci_dev *hotplug_rp;
+static struct pci_dev *hotplug_chain_rps[8];
+static unsigned int hotplug_chain_next;
+static void inflight_rpm_save_ctl1(struct device *dev)
+{
+    (void)dev;
+    inflight_rpm_saved_ctl1 =
+        inflight_rpm_pdev->cfg[(inflight_rpm_pdev->l1ss + PCI_L1SS_CTL1) >> 2];
+}
+static void hotplug_during_barrier(struct device *dev)
+{
+    (void)dev;
+    /* Simulate pciehp enumerating a new L1SS port+endpoint while rescan lock is dropped. */
+    list_add_tail(&hotplug_rp->bus_list, &hotplug_root_bus->devices);
+}
+static void hotplug_chain_during_barrier(struct device *dev)
+{
+    (void)dev;
+    if (hotplug_chain_next < 8)
+        list_add_tail(&hotplug_chain_rps[hotplug_chain_next++]->bus_list,
+                      &hotplug_root_bus->devices);
 }
 int main(void)
 {
@@ -545,7 +778,370 @@ int main(void)
 
     #undef RESET_ADOPTED
 
-    puts("PASS: T6050 PCIe-C s2idle domain hold, release, deep sleep and prepare refusal");
+    /* Conventional reinit host: L1SS disable/restore and one-shot ASPM restore write failure. */
+    const struct hw_info *t8103_conv = match_compat("apple,pcie");
+    assert(t8103_conv && !t8103_conv->tunneled && !t8103_conv->root_bus_only);
+
+    struct pci_host_bridge bridge;
+    struct pci_bus root_bus, sub0_bus, sub1_bus;
+    struct pci_dev rp0, fn0, fn1, rp1, ep1;
+
+    #define INIT_DEV(d, dfn, l1off, sub, dsp, vid, ctl1, ctl2, lctl) do { \
+        memset(&(d), 0, sizeof(d)); \
+        (d).devfn = (dfn); \
+        (d).l1ss = (l1off); \
+        (d).subordinate = (sub); \
+        (d).downstream_port = (dsp); \
+        (d).refs = 1; \
+        (d).lnkctl = (lctl); \
+        (d).cfg[PCI_VENDOR_ID >> 2] = (vid); \
+        if (l1off) { \
+            (d).cfg[((l1off) + PCI_L1SS_CTL1) >> 2] = (ctl1); \
+            (d).cfg[((l1off) + PCI_L1SS_CTL2) >> 2] = (ctl2); \
+        } \
+    } while (0)
+
+    #define RESET_L1SS(two_links) do { \
+        reset_host(&dev, &pcie, &pd, t8103_conv, NULL); \
+        pm_suspend_target_state = PM_SUSPEND_MEM; \
+        list_init(&root_bus.devices); \
+        list_init(&sub0_bus.devices); \
+        list_init(&sub1_bus.devices); \
+        bridge.bus = &root_bus; \
+        pcie.bridge = &bridge; \
+        INIT_DEV(rp0, 0x00, 0x150, &sub0_bus, true, 0x106b, 0x000000ff, 0x28, 0x0042); \
+        INIT_DEV(fn0, 0x00, 0x160, NULL, false, 0x14e4, 0x000000ff, 0x28, 0x0042); \
+        INIT_DEV(fn1, 0x01, 0, NULL, false, 0x14e4, 0, 0, 0x0043); \
+        list_add_tail(&rp0.bus_list, &root_bus.devices); \
+        list_add_tail(&fn0.bus_list, &sub0_bus.devices); \
+        list_add_tail(&fn1.bus_list, &sub0_bus.devices); \
+        if (two_links) { \
+            INIT_DEV(rp1, 0x08, 0x150, &sub1_bus, true, 0x106b, 0x0000005f, 0x14, 0x0042); \
+            INIT_DEV(ep1, 0x00, 0x160, NULL, false, 0x14e4, 0x0000005f, 0x14, 0x0042); \
+            list_add_tail(&rp1.bus_list, &root_bus.devices); \
+            list_add_tail(&ep1.bus_list, &sub1_bus.devices); \
+        } \
+    } while (0)
+
+    /* s2idle leaves L1SS and Link Control untouched on a conventional reinit host. */
+    RESET_L1SS(false);
+    pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    apple_pcie_complete(&dev);
+    assert(radio_complete_calls == 1);
+
+    /* Deep sleep clears L1SS on prepare, preserves ASPM, and restores L1SS on complete. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+    assert(!list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL2) >> 2] == 0x28);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL2) >> 2] == 0x28);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+    assert(radio_complete_calls == 1 && warn_calls == 0);
+
+    /* Normal completion preserves PCI core's resume-time ASPM policy instead of replaying saved bits. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+    rp0.lnkctl = 0x0041;
+    fn0.lnkctl = 0x0041;
+    fn1.lnkctl = 0x0042;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.lnkctl == 0x0041 && fn0.lnkctl == 0x0041 && fn1.lnkctl == 0x0042);
+
+    /* Normal completion also preserves ASPM disabled (0) set during resume. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+    rp0.lnkctl = 0x0040;
+    fn0.lnkctl = 0x0040;
+    fn1.lnkctl = 0x0040;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.lnkctl == 0x0040 && fn0.lnkctl == 0x0040 && fn1.lnkctl == 0x0040);
+
+    /* One-shot failure on parent ASPM restore write: rollback must restore original ASPM and L1SS. */
+    RESET_L1SS(false);
+    rp0.fail_lnkctl_write_on_call = 2; /* 1 = ASPM clear succeeds, 2 = restore_aspm write fails once */
+    assert(apple_pcie_prepare(&dev) == -EIO);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+    assert(radio_complete_calls == 1 && warn_calls == 0);
+
+    /* One-shot failure on downstream function ASPM restore write: rollback restores original ASPM. */
+    RESET_L1SS(false);
+    fn1.fail_lnkctl_write_on_call = 2; /* 1 = ASPM clear succeeds, 2 = restore_aspm write fails once */
+    assert(apple_pcie_prepare(&dev) == -EIO);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+    assert(radio_complete_calls == 1 && warn_calls == 0);
+
+    /* Multi-link one-shot restore failure on second link unwinds both links cleanly. */
+    RESET_L1SS(true);
+    rp1.fail_lnkctl_write_on_call = 2;
+    assert(apple_pcie_prepare(&dev) == -EIO);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp1.lnkctl == 0x0042 && ep1.lnkctl == 0x0042);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp1.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x0000005f);
+    assert(ep1.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x0000005f);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1 && rp1.refs == 1 && ep1.refs == 1);
+    assert(radio_complete_calls == 1 && warn_calls == 0);
+
+    /* Suspend recheck clears L1SS replayed by pci_restore_state() after prepare(). */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    /* Simulate runtime resume during pci_pm_suspend() replaying saved L1SS enables. */
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    require_topology_lock = true;
+    assert(apple_pcie_suspend(&dev) == 0);
+    require_topology_lock = false;
+    assert(pci_rescan_remove_depth == 0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    require_topology_lock = true;
+    apple_pcie_complete(&dev);
+    require_topology_lock = false;
+    assert(pci_rescan_remove_depth == 0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+
+    /* Complete clears live CTL1 enables before writing saved timing, and masks PCI-PM if not D0. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    /* Firmware/resume left different timing bits in live CTL1 and endpoint in D3hot. */
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000a5;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000b5;
+    rp0.saw_ctl1_write = false;
+    fn0.saw_ctl1_write = false;
+    fn0.current_state = PCI_D3hot;
+    require_topology_lock = true;
+    apple_pcie_complete(&dev);
+    require_topology_lock = false;
+    assert(fn0.saw_ctl1_write && fn0.first_ctl1_write == 0x000000b0);
+    assert(rp0.saw_ctl1_write && rp0.first_ctl1_write == 0x000000a0);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000fc);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL2) >> 2] == 0x28);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL2) >> 2] == 0x28);
+
+    /* One-shot failure on child's final CTL1 write unwinds L1SS symmetrically on both ends. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    fn0.cfg_write_calls = 0;
+    /* enable writes on child: 1=clear CTL1, 2=CTL2, 3=CTL1 sans L1.2, 4=final CTL1 with L1.2 */
+    fn0.fail_cfg_write_on_call = 4;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(warn_calls == 1);
+    assert((rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] & PCI_L1SS_CTL1_L1SS_MASK) == 0);
+    assert((fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] & PCI_L1SS_CTL1_L1SS_MASK) == 0);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    /* Removed link (cleared subordinate or unlinked child) is skipped safely during complete(). */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    rp0.subordinate = NULL;
+    rp0.cfg_write_calls = 0;
+    fn0.cfg_write_calls = 0;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg_write_calls == 0 && fn0.cfg_write_calls == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    list_del(&fn0.bus_list);
+    rp0.cfg_write_calls = 0;
+    fn0.cfg_write_calls = 0;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg_write_calls == 0 && fn0.cfg_write_calls == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    /* Suspend recheck failure on one-shot ASPM restore write restores pre-recheck ASPM before returning error. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    rp0.lnkctl_write_calls = 0;
+    rp0.fail_lnkctl_write_on_call = 2; /* 1=clear ASPM, 2=restore_aspm fails once */
+    assert(apple_pcie_suspend(&dev) == -EIO);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    apple_pcie_complete(&dev);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+
+    /* Suspend recheck catches a link whose L1SS was off during prepare() and enabled before suspend(). */
+    RESET_L1SS(false);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(list_empty(&pcie.hib_l1ss));
+    /* Endpoint runtime-resumed during pci_pm_suspend() and replayed L1SS enables. */
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    assert(apple_pcie_suspend(&dev) == 0);
+    assert(!list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+    assert(rp0.refs == 1 && fn0.refs == 1);
+
+    /* Suspend recheck propagates config read errors on a present link instead of skipping it. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp0.dev.rpm_usage == 1 && fn0.dev.rpm_usage == 1 && fn1.dev.rpm_usage == 1);
+    fn0.cfg_read_calls = 0;
+    fn0.fail_cfg_read_on_call = 1; /* PCI_VENDOR_ID read error */
+    assert(apple_pcie_suspend(&dev) == -EIO);
+    fn0.fail_cfg_read_on_call = 0;
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss));
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    /* One-shot LNKCTL restore failure in complete() retries parent/function ASPM instead of leaving it disabled. */
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    rp0.lnkctl_write_calls = 0;
+    rp0.fail_lnkctl_write_on_call = 2; /* 1=clear ASPM, 2=restore_aspm fails once */
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss) && warn_calls == 1);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    fn1.lnkctl_write_calls = 0;
+    fn1.fail_lnkctl_write_on_call = 2; /* 1=clear ASPM, 2=restore_aspm fails once on downstream fn */
+    apple_pcie_complete(&dev);
+    assert(list_empty(&pcie.hib_l1ss) && warn_calls == 1);
+    assert(rp0.lnkctl == 0x0042 && fn0.lnkctl == 0x0042 && fn1.lnkctl == 0x0043);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    /* Runtime-PM pins balance on rollback, remove/free, and suspend-recheck discovery. */
+    RESET_L1SS(false);
+    rp0.fail_lnkctl_write_on_call = 2;
+    assert(apple_pcie_prepare(&dev) == -EIO);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    RESET_L1SS(false);
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp0.dev.rpm_usage == 1 && fn0.dev.rpm_usage == 1 && fn1.dev.rpm_usage == 1);
+    apple_pcie_hib_free_l1ss(&pcie);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    RESET_L1SS(false);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000f0;
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp0.dev.rpm_usage == 1 && fn0.dev.rpm_usage == 1 && fn1.dev.rpm_usage == 1);
+    rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] = 0x000000ff;
+    assert(apple_pcie_suspend(&dev) == 0);
+    assert(rp0.dev.rpm_usage == 1 && fn0.dev.rpm_usage == 1 && fn1.dev.rpm_usage == 1);
+    apple_pcie_complete(&dev);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    /* In-flight runtime-suspend callback is drained by pm_runtime_barrier() OUTSIDE PCI locks BEFORE L1SS is cleared! */
+    RESET_L1SS(false);
+    inflight_rpm_saved_ctl1 = 0;
+    inflight_rpm_pdev = &fn0;
+    fn0.dev.rpm_inflight_cb = inflight_rpm_save_ctl1;
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(fn0.dev.rpm_barriers == 1 && rp0.dev.rpm_barriers == 1 && fn1.dev.rpm_barriers == 1);
+    assert(inflight_rpm_saved_ctl1 == 0x000000ff); /* drained BEFORE prepare cleared L1SS to 0xf0 */
+    assert(fn0.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x000000f0);
+    apple_pcie_complete(&dev);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+
+    /* Hotplugging a new L1SS link during the unlocked barrier window re-pins and drains it before clearing L1SS! */
+    RESET_L1SS(true);
+    list_del(&rp1.bus_list); /* rp1+ep1 not present on initial pin walk */
+    hotplug_root_bus = &root_bus;
+    hotplug_rp = &rp1;
+    fn0.dev.rpm_inflight_cb = hotplug_during_barrier;
+    assert(apple_pcie_prepare(&dev) == 0);
+    assert(rp1.dev.rpm_usage == 1 && rp1.dev.rpm_barriers == 1);
+    assert(ep1.dev.rpm_usage == 1 && ep1.dev.rpm_barriers == 1);
+    assert(rp1.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x00000050);
+    assert(ep1.cfg[(0x160 + PCI_L1SS_CTL1) >> 2] == 0x00000050);
+    apple_pcie_complete(&dev);
+    assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+    assert(rp1.dev.rpm_usage == 0 && ep1.dev.rpm_usage == 0);
+    assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1 && rp1.refs == 1 && ep1.refs == 1);
+
+    /* Sustained hotplug churn exhausting the 8-pass pin/drain limit returns -EBUSY (not -EAGAIN, which dpm_prepare retries). */
+    {
+        struct pci_bus ch_sub[8];
+        struct pci_dev ch_rp[8], ch_ep[8];
+        RESET_L1SS(false);
+        hotplug_root_bus = &root_bus;
+        hotplug_chain_next = 0;
+        for (int ci = 0; ci < 8; ci++) {
+            list_init(&ch_sub[ci].devices);
+            INIT_DEV(ch_rp[ci], (u8)(0x10 + ci * 8), 0x150, &ch_sub[ci], true, 0x106b, 0x0000005f, 0x14, 0x0042);
+            INIT_DEV(ch_ep[ci], 0x00, 0x160, NULL, false, 0x14e4, 0x0000005f, 0x14, 0x0042);
+            list_add_tail(&ch_ep[ci].bus_list, &ch_sub[ci].devices);
+            ch_ep[ci].dev.rpm_inflight_cb = hotplug_chain_during_barrier;
+            hotplug_chain_rps[ci] = &ch_rp[ci];
+        }
+        fn0.dev.rpm_inflight_cb = hotplug_chain_during_barrier;
+        assert(apple_pcie_prepare(&dev) == -EBUSY);
+        assert(hotplug_chain_next == 8 && radio_complete_calls == 1);
+        assert(list_empty(&pcie.hib_l1ss) && list_empty(&pcie.hib_l1ss_rpm));
+        assert(rp0.dev.rpm_usage == 0 && fn0.dev.rpm_usage == 0 && fn1.dev.rpm_usage == 0);
+        assert(rp0.refs == 1 && fn0.refs == 1 && fn1.refs == 1);
+        assert(rp0.cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x000000ff);
+        for (int ci = 0; ci < 8; ci++) {
+            assert(ch_rp[ci].dev.rpm_usage == 0 && ch_ep[ci].dev.rpm_usage == 0);
+            assert(ch_rp[ci].refs == 1 && ch_ep[ci].refs == 1);
+            assert(ch_rp[ci].cfg[(0x150 + PCI_L1SS_CTL1) >> 2] == 0x0000005f);
+        }
+    }
+
+    #undef RESET_L1SS
+    #undef INIT_DEV
+
+    puts("PASS: T6050 PCIe-C s2idle domain hold, release, deep sleep, L1SS rollback and prepare refusal");
     return 0;
 }
 '''
@@ -682,6 +1278,10 @@ struct apple_cio_hw {
     bool sleep_removes_domains;
     bool restart_on_wake;
     bool phy_shared_with_dwc3;
+    bool strict_power_cycle;
+    bool mxwrap;
+    bool lstx_explicit;
+    bool strict_fw_ready;
     bool psd_power_cycle;
     bool stop_at_reboot;
     bool sleep_router_on_stop;
@@ -917,6 +1517,7 @@ static void apple_cio_cpu_halt(struct apple_cio *acio) { (void)acio; }
 static void apple_cio_lstx_hold(struct apple_cio *acio, bool high) { (void)acio; (void)high; }
 static void apple_cio_test_log_guards(struct apple_cio *acio) { (void)acio; }
 static void apple_cio_release_domains(struct apple_cio *acio) { (void)acio; released++; }
+static void apple_cio_power_down(struct apple_cio *acio) { apple_cio_release_domains(acio); }
 /* PRODUCTION */
 static struct device dev;
 static struct platform_device nhi;
@@ -1010,7 +1611,9 @@ def main():
                             function(acio, 'apple_cio_pciec_eligible'),
                             function(acio, 'apple_cio_pcie_tunnel_is_preinitialized')))
     code = FIXTURE.replace('/* PRODUCTION */', production)
-    s2idle_prod = '\n'.join((defines, info, matches,
+    l1ss_structs = pci[pci.index('struct apple_pcie_hib_l1ss {'):
+                       pci.index('static int apple_pcie_cfg_read_u32(')]
+    s2idle_prod = '\n'.join((defines, info, matches, l1ss_structs,
                              *(function(pci, n) for n in (
                                  'apple_pcie_pd_notify',
                                  'apple_pcie_release_domains',
@@ -1019,7 +1622,29 @@ def main():
                                  'apple_pcie_keep_link',
                                  'apple_pcie_adopted_links_ready',
                                  'apple_pcie_adopted_sleep_host',
-                                 'apple_pcie_prepare'))))
+                                 'apple_pcie_cfg_read_u32',
+                                 'apple_pcie_cfg_write_u32',
+                                 'apple_pcie_lnkctl_read',
+                                 'apple_pcie_lnkctl_write',
+                                 'apple_pcie_hib_save_lnkctl',
+                                 'apple_pcie_hib_merge_aspm',
+                                 'apple_pcie_hib_orig_fn_lnkctl',
+                                 'apple_pcie_hib_link_present',
+                                 'apple_pcie_hib_rpm_add',
+                                 'apple_pcie_hib_rpm_pin_cb',
+                                 'apple_pcie_hib_rpm_release',
+                                 'apple_pcie_link_set_l1ss',
+                                 'apple_pcie_hib_disable_l1ss_cb',
+                                 'apple_pcie_hib_free_l1ss',
+                                 'apple_pcie_hib_restore_l1ss_locked',
+                                 'apple_pcie_hib_restore_l1ss',
+                                 'apple_pcie_hib_restore_aspm',
+                                 'apple_pcie_hib_recheck_l1ss_cb',
+                                 'apple_pcie_hib_recheck_l1ss',
+                                 'apple_pcie_s2r_reinit',
+                                 'apple_pcie_prepare',
+                                 'apple_pcie_suspend',
+                                 'apple_pcie_complete'))))
     s2idle_code = S2IDLE_FIXTURE.replace('/* PRODUCTION */', s2idle_prod)
     t6050_old = '\t.mps_timers\t\t= true,\n\t.s2idle_hold_domain\t= true,\n'
     s2idle_muts = {
@@ -1060,6 +1685,128 @@ def main():
         'drop-adopted-parked-skip': (
             'if (pcie->t6050_parked & BIT(port->idx))\n\t\t\tcontinue;',
             'if (false)\n\t\t\tcontinue;'),
+        'drop-l1ss-parent-lnkctl-retain': (
+            'restore_plnkctl =\n'
+            '\t\t\t\tapple_pcie_hib_merge_aspm(plnkctl, saved->pl_lnkctl);',
+            'restore_plnkctl = plnkctl;'),
+        'drop-l1ss-fn-lnkctl-retain': (
+            'restore_fn_lnkctl[nfn] =\n'
+            '\t\t\t\t\tapple_pcie_hib_merge_aspm(fn_lnkctl[nfn], orig);',
+            '(void)orig;\n\t\t\t\trestore_fn_lnkctl[nfn] = fn_lnkctl[nfn];'),
+        'merge-l1ss-parent-aspm-on-complete': (
+            'if (rollback)\n'
+            '\t\t\trestore_plnkctl =\n'
+            '\t\t\t\tapple_pcie_hib_merge_aspm(plnkctl, saved->pl_lnkctl);',
+            'if (true)\n'
+            '\t\t\trestore_plnkctl =\n'
+            '\t\t\t\tapple_pcie_hib_merge_aspm(plnkctl, saved->pl_lnkctl);'),
+        'merge-l1ss-fn-aspm-on-complete': (
+            'if (rollback) {\n'
+            '\t\t\t\tu16 orig = apple_pcie_hib_orig_fn_lnkctl(saved,',
+            'if (true) {\n'
+            '\t\t\t\tu16 orig = apple_pcie_hib_orig_fn_lnkctl(saved,'),
+        'drop-suspend-l1ss-recheck': (
+            'if (pcie && apple_pcie_s2r_reinit(pcie) &&\n'
+            '\t    pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&\n'
+            '\t    pm_suspend_target_state != PM_SUSPEND_ON)\n'
+            '\t\treturn apple_pcie_hib_recheck_l1ss(pcie);',
+            'if (false)\n'
+            '\t\treturn apple_pcie_hib_recheck_l1ss(pcie);'),
+        'drop-recheck-aspm-restore': (
+            '\tif (ret) {\n'
+            '\t\tapple_pcie_hib_restore_aspm(parent, &cur);',
+            '\tif (ret) {'),
+        'drop-recheck-vid-err': (
+            '\tret = pcibios_err_to_errno(pci_read_config_dword(child, PCI_VENDOR_ID, &id));\n'
+            '\tif (ret) {\n'
+            '\t\twalk->err = ret;\n'
+            '\t\treturn 1;\n'
+            '\t}\n'
+            '\tif (id == U32_MAX)\n'
+            '\t\treturn 0;\n\n'
+            '\tret = apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL2, &pl_ctl2) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL1, &pl_ctl1) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL2, &cl_ctl2) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL1, &cl_ctl1);\n'
+            '\tif (ret) {\n'
+            '\t\twalk->err = ret;\n'
+            '\t\treturn 1;\n'
+            '\t}\n'
+            '\tif (!((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK))\n'
+            '\t\treturn 0;\n\n'
+            '\tlist_for_each_entry(entry, &pcie->hib_l1ss, entry) {',
+            '\tret = pcibios_err_to_errno(pci_read_config_dword(child, PCI_VENDOR_ID, &id));\n'
+            '\tif (ret || id == U32_MAX)\n'
+            '\t\treturn 0;\n\n'
+            '\tret = apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL2, &pl_ctl2) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(parent, parent->l1ss + PCI_L1SS_CTL1, &pl_ctl1) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL2, &cl_ctl2) ?:\n'
+            '\t      apple_pcie_cfg_read_u32(child, child->l1ss + PCI_L1SS_CTL1, &cl_ctl1);\n'
+            '\tif (ret) {\n'
+            '\t\twalk->err = ret;\n'
+            '\t\treturn 1;\n'
+            '\t}\n'
+            '\tif (!((pl_ctl1 | cl_ctl1) & PCI_L1SS_CTL1_L1SS_MASK))\n'
+            '\t\treturn 0;\n\n'
+            '\tlist_for_each_entry(entry, &pcie->hib_l1ss, entry) {'),
+        'drop-pcipm-d0-mask': (
+            'if (parent->current_state != PCI_D0 ||\n'
+            '\t\t    child->current_state != PCI_D0) {',
+            'if (false) {'),
+        'drop-live-ctl1-clear': (
+            'ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,\n'
+            '\t\t\t\t\t       cur_cl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);',
+            'ret = apple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,\n'
+            '\t\t\t\t\t       cl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);'),
+        'drop-partial-enable-unwind': (
+            'unwind_l1ss:\n'
+            '\t/* Keep both ends symmetrically disabled (child-first) if enable failed partway. */\n'
+            '\tapple_pcie_cfg_write_u32(child, child->l1ss + PCI_L1SS_CTL1,\n'
+            '\t\t\t\t cl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);\n'
+            '\tapple_pcie_cfg_write_u32(parent, parent->l1ss + PCI_L1SS_CTL1,\n'
+            '\t\t\t\t pl_ctl1 & ~PCI_L1SS_CTL1_L1SS_MASK);',
+            'unwind_l1ss:'),
+        'drop-restore-rescan-lock': (
+            '\tpci_lock_rescan_remove();\n'
+            '\tapple_pcie_hib_restore_l1ss_locked(pcie, rollback);',
+            '\tapple_pcie_hib_restore_l1ss_locked(pcie, rollback);'),
+        'drop-restore-link-present': (
+            'if (apple_pcie_hib_link_present(parent, child) &&',
+            'if (parent->subordinate &&'),
+        'drop-complete-parent-aspm-retry': (
+            '\t\tif (r && enable)\n'
+            '\t\t\tapple_pcie_lnkctl_write(parent, restore_plnkctl);',
+            '\t\tif (false)\n'
+            '\t\t\tapple_pcie_lnkctl_write(parent, restore_plnkctl);'),
+        'drop-complete-fn-aspm-retry': (
+            '\t\t\tif (r && enable)\n'
+            '\t\t\t\tapple_pcie_lnkctl_write(fns[i], restore_fn_lnkctl[i]);',
+            '\t\t\tif (false)\n'
+            '\t\t\t\tapple_pcie_lnkctl_write(fns[i], restore_fn_lnkctl[i]);'),
+        'drop-hib-rpm-get': (
+            '\t\t\t\tpci_walk_bus(bridge->bus, apple_pcie_hib_rpm_pin_cb,\n'
+            '\t\t\t\t\t     &walk);',
+            '\t\t\t\t(void)rpm;'),
+        'drop-hib-rpm-barrier': (
+            '\t\t\t\t\tif (!rpm->drained) {\n'
+            '\t\t\t\t\t\tpm_runtime_barrier(&rpm->pdev->dev);\n'
+            '\t\t\t\t\t\trpm->drained = true;\n'
+            '\t\t\t\t\t}',
+            '\t\t\t\t\trpm->drained = true;'),
+        'drop-hib-rpm-recheck-loop': (
+            '\t\t\t\tif (!walk.added) {',
+            '\t\t\t\tif (tries > 0 || !walk.added) {'),
+        'exhaust-returns-eagain': (
+            '\t\t\tif (tries == 8) {\n'
+            '\t\t\t\tapple_pcie_hib_rpm_release(pcie);\n'
+            '\t\t\t\tapple_radio_complete(dev);\n'
+            '\t\t\t\treturn -EBUSY;\n'
+            '\t\t\t}',
+            '\t\t\tif (tries == 8) {\n'
+            '\t\t\t\tapple_pcie_hib_rpm_release(pcie);\n'
+            '\t\t\t\tapple_radio_complete(dev);\n'
+            '\t\t\t\treturn -EAGAIN;\n'
+            '\t\t\t}'),
     }
     s2idle_cases = {'s2idle-production': s2idle_code}
     for name, (old, new) in s2idle_muts.items():

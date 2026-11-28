@@ -121,12 +121,12 @@
 
 /*
  * As on J716c, where reading pin 112 takes an SError, only the pins a node
- * names are exposed: 80 and 81, PCIe ports 0 and 1's PERST#, and 134 and 139,
- * the jack codec's interrupt and reset. A board that names more pins replaces
- * the list.
+ * names are exposed: 80 and 81, PCIe ports 0 and 1's PERST#; 134 and 139, the jack
+ * codec's interrupt and reset; 138, the Touch ID sensor's data-ready line
+ * (t6050-touchid.dtsi). A board that names more pins replaces the list.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <82 52>, <135 4>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 52>, <135 3>, <140 81>;
 };
 
 /*
@@ -392,6 +392,13 @@
 		};
 
 		stm {
+		};
+
+		/*
+		 * The trackpad's haptic engine (ADT mtp-transport/actuator). The
+		 * ADT gives it no click strength, so the firmware's is kept.
+		 */
+		actuator {
 		};
 
 		/*

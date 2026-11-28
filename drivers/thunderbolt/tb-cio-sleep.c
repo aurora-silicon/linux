@@ -27,6 +27,27 @@ static int tb_cio_check_topology(struct tb_switch *sw, bool wake)
 }
 
 /*
+ * The adapter that holds the peer at @route, found below @sw as tb_xdomain_find_by_route()
+ * finds the peer: through the adapters' pointers, which hold no reference.
+ */
+static struct tb_port *tb_cio_xdomain_port(struct tb_switch *sw, u64 route)
+{
+	struct tb_port *port, *holder;
+
+	tb_switch_for_each_port(sw, port) {
+		if (port->xdomain) {
+			if (port->xdomain->route == route)
+				return port;
+		} else if (tb_port_has_remote(port)) {
+			holder = tb_cio_xdomain_port(port->remote->sw, route);
+			if (holder)
+				return holder;
+		}
+	}
+	return NULL;
+}
+
+/*
  * A host at the other end of a link (an XDomain, such as a host-to-host cable to another
  * Mac) owns its half of it, which the router's power cycle cannot keep: release it as an
  * unplug does, its service drivers and paths with it. Nothing finds it again after the
@@ -38,6 +59,7 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 	struct tb_port *port;
 
 	tb_switch_for_each_port(sw, port) {
+		struct tb_port *holder;
 		struct tb_xdomain *xd;
 
 		if (!tb_port_is_null(port) || tb_is_upstream_port(port))
@@ -49,21 +71,23 @@ static void tb_cio_release_xdomains(struct tb *tb, struct tb_switch *sw)
 		/*
 		 * By its route, through the router tree: on the J713 the adapter iterated here
 		 * did not hold the peer itself when the release first ran (0:1's xdomain was
-		 * unset), while the route lookup finds it.
+		 * unset), while the route lookup finds it. The peer is taken off the adapter
+		 * that does hold it, before its last reference can go.
 		 */
-		xd = tb_xdomain_find_by_route(tb, tb_downstream_route(port));
-		tb_port_dbg(port, "sleep: xdomain %s, port's %s\n", xd ? "found" : "none",
-			    port->xdomain ? "set" : "unset");
-		if (!xd)
+		holder = tb_cio_xdomain_port(tb->root_switch, tb_downstream_route(port));
+		if (!holder)
 			continue;
-		tb_port_info(port, "xdomain released for the sleep\n");
+		if (holder != port)
+			tb_port_dbg(port, "sleep: xdomain held by %llx:%u\n",
+				    tb_route(holder->sw), holder->port);
+		xd = tb_xdomain_get(holder->xdomain);
+		tb_port_info(holder, "xdomain released for the sleep\n");
 		xd->is_unplugged = true;
 		tb_xdomain_remove(xd);
-		if (port->xdomain == xd)
-			port->xdomain = NULL;
+		holder->xdomain = NULL;
 		__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 		tb_xdomain_put(xd);
-		tb_port_unconfigure_xdomain(port);
+		tb_port_unconfigure_xdomain(holder);
 	}
 }
 

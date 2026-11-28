@@ -633,7 +633,7 @@ mod inline_submit_containers {
 mod render_admission_tests {
     use super::{
         check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FEW_PRIMITIVES,
-        FRAGMENT_BARRIERS, MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES,
+        FRAGMENT_BARRIERS, MAX_DIMENSION, MAX_LAYERS, PROCESS_EMPTY_TILES,
         RSRC_SPEC_HI, STAGE_PREFIXES, ZLS_METADATA_STRIDE,
     };
     const ENOENT: i32 = -2;
@@ -700,6 +700,7 @@ mod render_admission_tests {
         pub(crate) usc_base: u64,
         pub(crate) active_cores: u32,
         pub(crate) render_scs: [u16; 2],
+        pub(crate) max_tile_buffer: u32,
     }
     use super::MAX_COMMANDS;
     RENDER_ADMISSION
@@ -749,7 +750,7 @@ mod render_admission_tests {
     #[test]
     fn compressed_zls_1x_layered_and_2x_accepted() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         // 1x compressed D32F depth + stencil.
         let mut cmd = base_cmd();
         cmd.zls_ctrl = Z_COMP | S_COMP;
@@ -780,9 +781,31 @@ mod render_admission_tests {
     }
 
     #[test]
+    fn tile_buffer_limit_follows_the_context() {
+        let vm = base_vm();
+        let k32 = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
+        let k48 = Context { max_tile_buffer: 48 * 1024, ..k32 };
+        // 8 B x 32x32 x 4 samples = 32 KiB: accepted by both.
+        let mut k32_tile = base_cmd();
+        k32_tile.samples = 4;
+        assert_eq!(check_render_one(&k32, &k32_tile, &[], &[]), Ok(()));
+        assert_eq!(check_render_one(&k48, &k32_tile, &[], &[]), Ok(()));
+        // 24 B x 32x16 x 4 samples = 48 KiB, the MSAA4 tile macOS programs on the M4.
+        let mut k48_tile = k32_tile;
+        k48_tile.utile_height_px = 16;
+        k48_tile.sample_size_B = 24;
+        assert_eq!(check_render_one(&k32, &k48_tile, &[], &[]), Err(EINVAL));
+        assert_eq!(check_render_one(&k48, &k48_tile, &[], &[]), Ok(()));
+        // 28 B x 32x16 x 4 samples = 56 KiB: over both limits.
+        let mut over = k48_tile;
+        over.sample_size_B = 28;
+        assert_eq!(check_render_one(&k48, &over, &[], &[]), Err(EINVAL));
+    }
+
+    #[test]
     fn compressed_zls_invalid_ctrl_alignment_and_vm_spans_rejected() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         let valid = || {
             let mut cmd = base_cmd();
             cmd.zls_ctrl = Z_COMP | S_COMP;
@@ -839,7 +862,7 @@ mod render_admission_tests {
     #[test]
     fn submit_wide_span_batch_dedups_and_flushes_once_across_passes() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         let mut batch = SpanBatch::new();
         for pass in 0..4u64 {
             let mut cmd = base_cmd();
@@ -879,7 +902,7 @@ mod render_admission_tests {
     #[test]
     fn few_primitives_flag_admitted_in_parse_and_render_check() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         let mut r = super::render();
         r.flags = FEW_PRIMITIVES;
         assert!(super::check_stream(
@@ -916,7 +939,7 @@ mod render_admission_tests {
 
         // First flush populates the proof for epoch 1.
         let mut batch = SpanBatch::new();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         check_render(&mut batch, &ctx, &cmd, &[], &[]).unwrap();
         assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
         assert_eq!(vm.batch_calls.get(), 1);
@@ -962,7 +985,7 @@ mod render_admission_tests {
         vm.maps.remove(1);
         vm.epoch.set(Some(2));
         let mut batch = SpanBatch::new();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0], max_tile_buffer: 32 * 1024 };
         check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
         assert_eq!(batch.flush_with_proof(&vm, &mut proof), Err(ENOENT));
 

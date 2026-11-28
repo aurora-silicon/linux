@@ -38,13 +38,19 @@ pub(super) enum PreparedUserBindOp {
     Unmap(PreparedUserUnmap),
 }
 
-pub(crate) struct PreparedUserBindBatch {
+/// The prepared operations of one VM_BIND ioctl. They retain object references whose release
+/// GPUVM defers. The client's VM handle can close while they are prepared, and its teardown runs
+/// its last deferred cleanup without waiting for them, so dropping the batch releases them and
+/// then reclaims them itself, on every path.
+pub(crate) struct PreparedUserBindBatch<'a> {
+    vm: &'a Vm,
     pub(super) ops: KVec<PreparedUserBindOp>,
 }
 
-impl PreparedUserBindBatch {
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
+impl<'a> PreparedUserBindBatch<'a> {
+    pub(crate) fn new(vm: &'a Vm, capacity: usize) -> Result<Self> {
         Ok(Self {
+            vm,
             ops: KVec::with_capacity(capacity, GFP_KERNEL)?,
         })
     }
@@ -55,6 +61,13 @@ impl PreparedUserBindBatch {
         Ok(self
             .ops
             .push(PreparedUserBindOp::Unmap(unmap), GFP_KERNEL)?)
+    }
+}
+
+impl Drop for PreparedUserBindBatch<'_> {
+    fn drop(&mut self) {
+        self.ops.clear();
+        self.vm.bo_deferred_cleanup();
     }
 }
 
@@ -127,7 +140,7 @@ impl Vm {
     /// never allow a map to replace a mapping still owned by failed work.
     pub(crate) fn commit_prepared_user_bind_batch(
         &self,
-        batch: &mut PreparedUserBindBatch,
+        batch: &mut PreparedUserBindBatch<'_>,
     ) -> Result {
         if self.defer_bind_batch(batch, 0)? {
             return Ok(());

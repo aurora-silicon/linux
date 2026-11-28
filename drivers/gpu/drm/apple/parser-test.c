@@ -2089,6 +2089,12 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
 
+	/* iBoot left the panel at 60 Hz: only the 60 Hz timing, no mode set away from it. */
+	dcp->boot_rate = 60;
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_BAD);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
+	dcp->boot_rate = 0;
+
 	/* The T8142 Air internal DCP (60 Hz panel, firmware 27.0) and the T6050 dcpext keep every mode. */
 	dcp->hw.only_120hz_modes = false;
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);

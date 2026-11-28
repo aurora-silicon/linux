@@ -120,6 +120,8 @@ static struct {
 	atomic_t unhandled;
 	atomic_t sleeps;
 	atomic_t sleeping;
+	/* SEP_DIAG_TRUSTED_*, with the refusal status above it. */
+	atomic_t trusted;
 
 	struct kernfs_node *keystore_kn;
 	struct kernfs_node *touchid_kn;
@@ -717,6 +719,23 @@ static ssize_t sleep_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(sleep);
 
+static ssize_t trusted_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	int word = atomic_read(&sep_diag.trusted);
+
+	switch (word & 0xff) {
+	case SEP_DIAG_TRUSTED_READY:
+		return sysfs_emit(buf, "ready\n");
+	case SEP_DIAG_TRUSTED_REFUSED:
+		/* One word, so the status is the one this refusal stored. */
+		return sysfs_emit(buf, "refused %d\n", (s8)(word >> 8));
+	default:
+		return sysfs_emit(buf, "unknown\n");
+	}
+}
+static DEVICE_ATTR_RO(trusted);
+
 static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_abi.attr,
 	&dev_attr_profile.attr,
@@ -753,6 +772,7 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
 	&dev_attr_sleep.attr,
+	&dev_attr_trusted.attr,
 	NULL
 };
 
@@ -779,6 +799,8 @@ int sep_diag_register(struct device *dev, const char *profile,
 	sep_diag.sepos13 = sepos13;
 	sep_diag.xart = xart;
 	sep_diag.probe_ns = ktime_get_boottime_ns();
+	/* A refusal belongs to the bind that saw it. */
+	atomic_set(&sep_diag.trusted, SEP_DIAG_TRUSTED_UNKNOWN);
 
 	ret = devm_device_add_group(dev, &sep_diag_group);
 	if (ret)
@@ -1015,6 +1037,40 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 	WRITE_ONCE(sep_diag.xart_guard_list, list_loaded);
 	atomic_set(&sep_diag.xart_refusals, 0);
 	atomic_set(&sep_diag.matching, matching);
+}
+
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status)
+{
+	atomic_set(word, (state & 0xff) | ((u8)status << 8));
+}
+
+/*
+ * The latest answer wins: a success after a refusal (or the reverse) is what
+ * the next seal or unseal can expect.
+ */
+void sep_diag_set_trusted(int state, int status)
+{
+	sep_diag_set_trusted_atomic(&sep_diag.trusted, state, status);
+}
+
+/*
+ * A validated identity unlock (for example through /dev/sep-key) clears any
+ * stale refusal so a loader re-run probes again, while leaving "ready" tied
+ * to a working trusted-key unseal.
+ */
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word)
+{
+	int old = atomic_read(word);
+
+	while ((old & 0xff) == SEP_DIAG_TRUSTED_REFUSED) {
+		if (atomic_try_cmpxchg(word, &old, SEP_DIAG_TRUSTED_UNKNOWN))
+			break;
+	}
+}
+
+void sep_diag_clear_trusted_refusal(void)
+{
+	sep_diag_clear_trusted_refusal_atomic(&sep_diag.trusted);
 }
 
 /* With matching as the refusal leaves it. */

@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* J716c camera: enabled only after the loader reserves the current firmware. */
+/*
+ * The T6050 laptop camera (ISP, its three DARTs and power states). Every T6050
+ * laptop's ADT has the same isp0, dart-isp0 and ISP power states; only the
+ * sensor-type differs per board. The loader reads that sensor-type, reserves the
+ * firmware segments and enables isp0 and its three DARTs; until then those stay
+ * disabled. The ISP power states are not left to the loader: every board that
+ * includes this file registers them, keeps FAB9 as a firmware-owned vote and
+ * holds ISP_SYS on from boot, as the J714s, J716c and K116s already do. The
+ * per-block states (CPU, FE, DPRX, SECURE, BE, CLR, SENS0) have no consumer
+ * until the ISP driver probes. The sensor presets are a default a board may
+ * replace.
+ */
 / {
 	aliases {
 		isp = &isp0;

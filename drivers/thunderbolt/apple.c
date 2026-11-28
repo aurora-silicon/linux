@@ -109,7 +109,6 @@
 #include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/rtkit.h>
-#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
@@ -215,16 +214,19 @@ static const struct apple_cio_hw apple_cio_t8103_hw = {
 };
 
 /*
- * T8122 shares the T8103 ACIO register layout and DP IN policy, while deep
- * sleep removes the CIO power domains and shares the ATC PHY with DWC3. Tear
- * down a connected router before tasks freeze (ahead of DWC3's PM notifier)
- * and request fresh cable state immediately on wake; s2idle and freeze leave
- * the port up.
+ * T8122 shares the T6030 MxWrap/PHY generation and uses strict power cycling,
+ * while deep sleep removes the CIO power domains and shares the ATC PHY with
+ * DWC3. DP IN stays disabled at runtime until apple,t8122 is qualified in
+ * apple_dpin_qualified_soc.
  */
 static const struct apple_cio_hw apple_cio_t8122_hw = {
 	.sleep_removes_domains = true,
 	.restart_on_wake = true,
 	.phy_shared_with_dwc3 = true,
+	.strict_power_cycle = true,
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.strict_fw_ready = true,
 	.dp = &apple_dpin_m1,
 };
 
@@ -237,15 +239,6 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.lstx_explicit = true,
 	.strict_fw_ready = true,
 	.dp = &apple_dpin_m3,
-};
-
-/* T8122 shares the T6030 MxWrap/PHY generation; DP is unqualified. */
-static const struct apple_cio_hw apple_cio_t8122_hw = {
-	.strict_power_cycle = true,
-	.mxwrap = true,
-	.lstx_explicit = true,
-	.strict_fw_ready = true,
-	.dp = &apple_dpin_disabled,
 };
 
 /*
@@ -2855,7 +2848,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC |
-			   QUIRK_TMU_HIFI_BI;
+			   QUIRK_TMU_HIFI_BI | QUIRK_NO_RETIMER_SCAN;
 	if (anhi->nhi.host_dp_policy)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
 	if (acio->hw->no_host_clx)
@@ -4228,7 +4221,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 			if (ret)
 				return ret;
 			acio->sleep_restart_owed = true;
-			apple_cio_stop(acio);
+			apple_cio_stop(acio, APPLE_CIO_AWAKE_KEEP);
 		}
 		acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
 		return acio->reset_failed ? -EHOSTDOWN : 0;
@@ -4281,6 +4274,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		dev_dbg(acio->dev, "USB4 cable: eudo 0x%x, orientation %d -> cable info 0x%x\n",
 			data->usb4.eudo, data->orientation, acio->target_cable_info);
 		break;
+	default:
+		return -EINVAL;
 	}
 
 	if (acio->native_sleep)
@@ -5183,7 +5178,7 @@ static void apple_cio_shutdown(struct platform_device *pdev)
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
 	guard(mutex)(&acio->lock);
 	acio->target_cable_info = 0;
-	apple_cio_stop(acio);
+	apple_cio_stop(acio, APPLE_CIO_AWAKE_HOLD);
 }
 
 static void apple_cio_remove(struct platform_device *pdev)
@@ -5241,10 +5236,6 @@ static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t6030-usb4-acio",
 		.data = &apple_cio_t6030_hw,
-	},
-	{
-		.compatible = "apple,t8122-usb4-acio",
-		.data = &apple_cio_t8122_hw,
 	},
 	{
 		.compatible = "apple,t6020-usb4-acio",

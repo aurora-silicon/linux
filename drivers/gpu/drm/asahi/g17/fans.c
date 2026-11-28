@@ -20,6 +20,39 @@ int asahi_zone_temp(const char *name, int *temp)
 	return thermal_zone_get_temp(zone, temp);
 }
 
+static int asahi_zone_passive_trip(struct thermal_trip *trip, void *data)
+{
+	int *temp = data;
+
+	if (trip->type == THERMAL_TRIP_PASSIVE &&
+	    (*temp == THERMAL_TEMP_INVALID || trip->temperature < *temp))
+		*temp = trip->temperature;
+	return 0;
+}
+
+/*
+ * The lowest passive trip of the thermal zone @name: for the SoC die zone,
+ * the die temperature from which the machine sheds performance (from its ADT).
+ * -ENODATA when the zone has none.
+ */
+int asahi_zone_passive(const char *name, int *temp)
+{
+	struct thermal_zone_device *zone;
+	int passive = THERMAL_TEMP_INVALID;
+
+	/* The trip walk has no stub without the thermal core. */
+	if (!IS_ENABLED(CONFIG_THERMAL))
+		return -ENODEV;
+	zone = thermal_zone_get_zone_by_name(name);
+	if (IS_ERR_OR_NULL(zone))
+		return zone ? PTR_ERR(zone) : -ENODEV;
+	thermal_zone_for_each_trip(zone, asahi_zone_passive_trip, &passive);
+	if (passive == THERMAL_TEMP_INVALID)
+		return -ENODATA;
+	*temp = passive;
+	return 0;
+}
+
 int asahi_fans_request(struct device *dev, unsigned int permille, unsigned int min_step_rpm)
 {
 	return macsmc_hwmon_fans_request(dev, permille, min_step_rpm);

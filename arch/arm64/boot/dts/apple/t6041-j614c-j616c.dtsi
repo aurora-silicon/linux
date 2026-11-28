@@ -1689,6 +1689,10 @@
 
 	multi-touch {
 		apple,power-method = <2>;
+		/* Fingers reach a tool area of about 1010 (J616c records). */
+		apple,palm-classes;
+		apple,palm-class-tool-major = <1400>;
+		apple,palm-tool-major = <2200>;
 	};
 
 	keyboard: keyboard {

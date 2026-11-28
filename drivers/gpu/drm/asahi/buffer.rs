@@ -894,7 +894,7 @@ impl BufferManager::ver {
     pub(crate) fn grow(&self, slot: u32) {
         match self
             .0
-            .with_inner(|inner| inner.owners[slot as usize].as_ref().cloned())
+            .with_inner(|inner| crate::event::slot_owner(&inner.owners, slot))
         {
             Some(owner) => {
                 pr_err!(
