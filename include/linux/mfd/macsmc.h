@@ -133,7 +133,6 @@ struct apple_smc {
 	 * resolve only the matching pending ID; timeout never cancels SRAM use.
 	 */
 	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
-	bool port_dark_wake;
 	bool saved_pending, saved_recovery, saved_wake;
 	int saved_fault, saved_notice_error, saved_restore_error;
 	/*
@@ -165,6 +164,8 @@ struct apple_smc {
 	 * radio alone among them, and when the last sleep began.
 	 */
 	unsigned int dark_wakes, radio_dark_wakes;
+	/* MBSW bits that, alone, are a dark wake (apple,dark-wake-reasons) */
+	u64 dark_wake_mask;
 	ktime_t sleep_entry_boot, sleep_entry_mono;
 	/* MBSW's bits as this SoC numbers them, from the probe. */
 	const struct apple_smc_wake_reason *wake_reasons;

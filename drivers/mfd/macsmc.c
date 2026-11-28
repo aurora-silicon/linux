@@ -679,6 +679,31 @@ static const struct apple_smc_wake_reason *apple_smc_dt_wake_reasons(struct devi
 	return r;
 }
 
+static int apple_smc_wake_reason_bit(const struct apple_smc *smc, const char *name);
+
+/* The wake reasons, alone in a wake record, that the board takes as a dark wake. */
+static u64 apple_smc_dt_dark_wakes(struct apple_smc *smc)
+{
+	struct device_node *np = smc->dev->of_node;
+	const char *name;
+	u64 mask = 0;
+	int i, n, bit;
+
+	n = of_property_count_strings(np, "apple,dark-wake-reasons");
+	for (i = 0; i < n; i++) {
+		if (of_property_read_string_index(np, "apple,dark-wake-reasons", i, &name))
+			return 0;
+		bit = apple_smc_wake_reason_bit(smc, name);
+		if (bit < 0) {
+			dev_warn(smc->dev, "dark wake reason %s is not a wake reason here: no dark wakes\n",
+				 name);
+			return 0;
+		}
+		mask |= BIT_ULL(bit);
+	}
+	return mask;
+}
+
 static void apple_smc_write_full_wake(struct apple_smc *smc)
 {
 	int ret;
@@ -742,10 +767,11 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->dev = &pdev->dev;
 	smc->saved_enabled = apple_t6050_sleep_described() &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
-	smc->port_dark_wake = smc->saved_enabled && of_machine_is_compatible("apple,j714s");
 	/* A J714s device tree from before apple,wake-reasons */
-	if (smc->port_dark_wake && !dt_reasons)
+	if (smc->saved_enabled && !dt_reasons && of_machine_is_compatible("apple,j714s"))
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
+	if (smc->saved_enabled)
+		smc->dark_wake_mask = apple_smc_dt_dark_wakes(smc);
 	/*
 	 * J813's late notice needs the bounded, IRQ-independent transport too, as does T8103's:
 	 * its SMC hears last, after SEP and the other coprocessors stopped.
@@ -1213,20 +1239,21 @@ static bool apple_smc_port_reasons_only(const struct apple_smc *smc, u64 record)
 static void apple_smc_sleep_wait(u64 acknowledged, u32 minimum_us);
 
 /*
- * J714s: two wakes need nothing from user space, and are dark ones: the system sleeps again with
- * user space frozen and the outputs off.
+ * Wakes that need nothing from user space are dark ones: the system sleeps again with user space
+ * frozen and the outputs off. The device tree names them (apple,dark-wake-reasons): the J714s
+ * both of these, the K116s the radio's.
  *
  * - USB-C_plug alone (MBSW bit 42): the SMC wakes the AP for it about 31 s into many sleeps with a
  *   display, a dock and a charger on the ports (36 of 45 sleeps on 11-18, none of them a cable
  *   plugged or pulled), and nothing changes on any port.
  * - wifibt alone (MBSW bit 13): the N1 radio asking for the AP. No Wi-Fi or Bluetooth wake can be
- *   armed on the J714s (its drivers offer no WoWLAN and take the Bluetooth controller down for the
+ *   armed on the T6050 (its drivers offer no WoWLAN and take the Bluetooth controller down for the
  *   sleep, and the radio is reset before each sleep), so such a wake is never one a user asked for;
  *   it comes within about a second of the entry in some sleeps, most of them the first after a
  *   boot. macOS takes the same SMC wake as a DarkWake. Each re-entry resets the radio again, so at
  *   most SMC_RADIO_DARK_WAKES_MAX of them in a row.
  *
- * Only those bits alone: any other bit (the lid, the power button, the keyboard and trackpad, a
+ * Only a named bit alone: any other bit (the lid, the power button, the keyboard and trackpad, a
  * charger or a plug change of another kind, one this table doesn't name), more than one, or none
  * at all (the PMU's RTC alarm) is a full wake, and so is the wake after SMC_DARK_WAKES_MAX dark
  * ones in a row. The alarm the sleep was admitted with stays armed: the sleep controller checks it
@@ -1237,10 +1264,10 @@ static void apple_smc_sleep_wait(u64 acknowledged, u32 minimum_us);
 
 static void apple_smc_dark_wake(struct apple_smc *smc)
 {
-	int port = apple_smc_wake_reason_bit(smc, "USB-C_plug");
 	int radio = apple_smc_wake_reason_bit(smc, "wifibt");
 	bool is_radio = radio >= 0 && smc->wake_record == BIT_ULL(radio);
-	const char *why = is_radio ? "wifibt" : "USB-C_plug";
+	const struct apple_smc_wake_reason *r;
+	const char *why = "?";
 	s64 asleep_ms;
 
 	/* Already dark (a port's wake with the lid closed): counted, so the re-entry waits as after ours. */
@@ -1248,11 +1275,13 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 		smc->dark_wakes++;
 		return;
 	}
-	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
-	if (!smc->port_dark_wake)
+	/* One reason alone, and one the board names */
+	if (!smc->wake_record || !is_power_of_2(smc->wake_record) ||
+	    !(smc->wake_record & smc->dark_wake_mask))
 		return;
-	if (!is_radio && (port < 0 || smc->wake_record != BIT_ULL(port)))
-		return;
+	for (r = smc->wake_reasons; r->name; r++)
+		if (smc->wake_record == BIT_ULL(r->bit))
+			why = r->name;
 	asleep_ms = ktime_ms_delta(ktime_get_boottime(), smc->sleep_entry_boot) -
 		    ktime_ms_delta(ktime_get(), smc->sleep_entry_mono);
 	if (smc->dark_wakes >= SMC_DARK_WAKES_MAX ||

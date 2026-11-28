@@ -88,6 +88,8 @@
 	apple,wake-reason-names = "pwrbtn", "lid", "sdconn", "charger", "wifibt",
 				  "trackpadkeyboard", "acattach", "acdetach", "USB-C_plug",
 				  "USB2_plug", "USB2_wake", "aupo", "rtc";
+	/* Woken for one of these alone, the system sleeps again without user space */
+	apple,dark-wake-reasons = "wifibt";
 };
 
 /*
