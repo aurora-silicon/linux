@@ -466,7 +466,8 @@ static int radeon_uvd_validate_codec(struct radeon_cs_parser *p,
 static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 			     unsigned offset, unsigned buf_sizes[])
 {
-	int32_t *msg, msg_type, handle;
+	uint32_t msg[29];
+	int32_t msg_type, handle;
 	unsigned img_size = 0;
 	void *ptr;
 	int i, r;
@@ -476,13 +477,18 @@ static int radeon_uvd_cs_msg(struct radeon_cs_parser *p, struct radeon_bo *bo,
 		return -EINVAL;
 	}
 
+	if (offset + sizeof(msg) > radeon_bo_size(bo)) {
+		DRM_ERROR("UVD message exceeds buffer size!\n");
+		return -EINVAL;
+	}
+
 	r = radeon_bo_kmap(bo, &ptr);
 	if (r) {
 		DRM_ERROR("Failed mapping the UVD message (%d)!\n", r);
 		return r;
 	}
 
-	msg = ptr + offset;
+	radeon_bo_memcpy_from(bo, msg, ptr + offset, sizeof(msg));
 
 	msg_type = msg[1];
 	handle = msg[2];

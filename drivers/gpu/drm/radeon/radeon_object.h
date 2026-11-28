@@ -133,6 +133,33 @@ static inline u64 radeon_bo_mmap_offset(struct radeon_bo *bo)
 	return drm_vma_node_offset_addr(&bo->tbo.base.vma_node);
 }
 
+static inline void radeon_bo_memset(struct radeon_bo *bo, void *dst,
+				    int value, size_t count)
+{
+	if (bo->tbo.resource->bus.is_nonposted)
+		memset_io((void __iomem *)dst, value, count);
+	else
+		memset(dst, value, count);
+}
+
+static inline void radeon_bo_memcpy_to(struct radeon_bo *bo, void *dst,
+				       const void *src, size_t count)
+{
+	if (bo->tbo.resource->bus.is_nonposted)
+		memcpy_toio((void __iomem *)dst, src, count);
+	else
+		memcpy(dst, src, count);
+}
+
+static inline void radeon_bo_memcpy_from(struct radeon_bo *bo, void *dst,
+					 const void *src, size_t count)
+{
+	if (bo->tbo.resource->bus.is_nonposted)
+		memcpy_fromio(dst, (const void __iomem *)src, count);
+	else
+		memcpy(dst, src, count);
+}
+
 extern int radeon_bo_create(struct radeon_device *rdev,
 			    unsigned long size, int byte_align,
 			    bool kernel, u32 domain, u32 flags,
