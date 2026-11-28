@@ -158,6 +158,44 @@ impl FirmwareWait {
     }
 }
 
+#[cfg(any(CONFIG_APPLE_PMGR_MISC = "y", all(CONFIG_APPLE_PMGR_MISC = "m", MODULE)))]
+unsafe extern "C" {
+    fn apple_pmgr_gpu_tracking_start();
+    fn apple_pmgr_gpu_tracking_stop();
+    fn apple_pmgr_gpu_busy_get() -> kernel::ffi::c_int;
+    fn apple_pmgr_gpu_busy_put();
+}
+
+fn pmgr_gpu_tracking_start() {
+    #[cfg(any(CONFIG_APPLE_PMGR_MISC = "y", all(CONFIG_APPLE_PMGR_MISC = "m", MODULE)))]
+    // SAFETY: Exported symbol from reachable apple-pmgr-misc with no pointer arguments.
+    unsafe { apple_pmgr_gpu_tracking_start() };
+}
+
+fn pmgr_gpu_tracking_stop() {
+    #[cfg(any(CONFIG_APPLE_PMGR_MISC = "y", all(CONFIG_APPLE_PMGR_MISC = "m", MODULE)))]
+    // SAFETY: Matches `pmgr_gpu_tracking_start`.
+    unsafe { apple_pmgr_gpu_tracking_stop() };
+}
+
+fn pmgr_gpu_busy_get() -> Result {
+    #[cfg(any(CONFIG_APPLE_PMGR_MISC = "y", all(CONFIG_APPLE_PMGR_MISC = "m", MODULE)))]
+    {
+        // SAFETY: Exported symbol from reachable apple-pmgr-misc; lock order is state -> pmgr_misc.
+        let ret = unsafe { apple_pmgr_gpu_busy_get() };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+    }
+    Ok(())
+}
+
+fn pmgr_gpu_busy_put() {
+    #[cfg(any(CONFIG_APPLE_PMGR_MISC = "y", all(CONFIG_APPLE_PMGR_MISC = "m", MODULE)))]
+    // SAFETY: Matches `pmgr_gpu_busy_get`.
+    unsafe { apple_pmgr_gpu_busy_put() };
+}
+
 /// The ASC control page and Fender operating-point page, kept mapped until the firmware is stopped.
 pub(crate) struct AscControl(*mut u8, *mut u8);
 // SAFETY: device register pages; accesses are single 32-bit MMIO operations.
@@ -605,6 +643,8 @@ struct State {
     accepting: bool,
     submitted: u64,
     retired: u64,
+    /// Set while a PMGR fabric/DCS busy reference is held for active GPU work.
+    gpu_busy_held: bool,
     /// A fault or timeout the firmware reported (error, named slot), answered by `recover`.
     firmware_error: Option<(Error, i32)>,
     recoveries: u64,
@@ -660,6 +700,21 @@ impl State {
 
     fn running(&self) -> bool {
         !self.inflight.is_empty() || self.rendering.is_some()
+    }
+
+    fn ensure_gpu_busy(&mut self) -> Result {
+        if !self.gpu_busy_held {
+            pmgr_gpu_busy_get()?;
+            self.gpu_busy_held = true;
+        }
+        Ok(())
+    }
+
+    fn release_gpu_busy_if_idle(&mut self) {
+        if !self.running() && self.gpu_busy_held {
+            pmgr_gpu_busy_put();
+            self.gpu_busy_held = false;
+        }
     }
 
     /// Whether a queue holds any of the packet's commands.
@@ -909,6 +964,10 @@ impl Runtime {
             match result {
                 Ok(()) if paired || !self.healthy() => return,
                 Ok(()) => {}
+                Err(EAGAIN) => {
+                    self.notify.retry();
+                    return;
+                }
                 Err(EBUSY) if state.running() => return,
                 Err(err) => {
                     dev_err!(self.dev, "GPU: command publication failed {:?}\n", err);
@@ -938,12 +997,26 @@ impl Runtime {
             sampler_count: control.sampler_count,
         };
         let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
-        let submission = state.root.stage_compute(command)?;
+        // Raise fabric/DCS bandwidth before the firmware can see the new producer.
+        state.ensure_gpu_busy()?;
+        let submission = match state.root.stage_compute(command) {
+            Ok(s) => s,
+            Err(err) => {
+                state.release_gpu_busy_if_idle();
+                return Err(err);
+            }
+        };
         let ordinal = state.published + 1;
         // Commit ownership before the firmware can see the new work.
-        state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-            publication_error: None, started: Instant::now(), doomed: None, _bind: bind },
-            GFP_KERNEL)?;
+        let flight = Inflight {
+            packet: packet.clone(), last, stamp, slot, ordinal,
+            publication_error: None, started: Instant::now(), doomed: None, _bind: bind,
+        };
+        if let Err(err) = state.inflight.push(flight, GFP_KERNEL) {
+            drop(submission);
+            state.release_gpu_busy_if_idle();
+            return Err(err.into());
+        }
         packet.mark_published();
         submission.publish();
         state.pool.mark_published(slot);
@@ -996,8 +1069,23 @@ impl Runtime {
             })?;
         let ta_work = [ta + render::INITBUF_AT as u64, ta];
         let fs_work = [fs + render::OWN_BARRIER_AT as u64, fs];
-        let ta_post = state.root.stage_render(TILER, &ta_work[usize::from(!with_buffer)..])?;
-        let fs_post = state.root.stage_render(FRAGMENT, &fs_work)?;
+        // Raise fabric/DCS bandwidth before the firmware can see the new producers.
+        state.ensure_gpu_busy()?;
+        let ta_post = match state.root.stage_render(TILER, &ta_work[usize::from(!with_buffer)..]) {
+            Ok(p) => p,
+            Err(err) => {
+                state.release_gpu_busy_if_idle();
+                return Err(err);
+            }
+        };
+        let fs_post = match state.root.stage_render(FRAGMENT, &fs_work) {
+            Ok(p) => p,
+            Err(err) => {
+                drop(ta_post);
+                state.release_gpu_busy_if_idle();
+                return Err(err);
+            }
+        };
         state.rendering = Some(RenderFlight {
             packet: packet.clone(), last, bind, scene, slots, stamps,
             targets: [ta_post.target(), fs_post.target()], started: Instant::now(), doomed: None,
@@ -1548,8 +1636,12 @@ impl Runtime {
             }
             break;
         }
-        if !self.healthy() { return; }
+        if !self.healthy() {
+            state.release_gpu_busy_if_idle();
+            return;
+        }
         self.pump(state);
+        state.release_gpu_busy_if_idle();
     }
 
     /// Rolls back a failed deep-sleep prepare. If an allow-off policy record was published,
@@ -1884,6 +1976,11 @@ impl Runtime {
                 dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
             }
         }
+        if state.gpu_busy_held {
+            pmgr_gpu_busy_put();
+            state.gpu_busy_held = false;
+        }
+        pmgr_gpu_tracking_stop();
         // Keep everything the firmware could reach for the rest of the boot, halted or not:
         // its page tables still name these pages, and the boot handoff window that start()
         // keeps for the life of the boot still references the graph's tables. Releasing them
@@ -1965,6 +2062,7 @@ impl Backend {
                 return Err(e);
             }
         };
+        pmgr_gpu_tracking_start();
         *runtime.state.lock() = Some(State {
             peer, root, pool, asc, fault, queue, last,
             sequence: u64::from(head),
@@ -1986,6 +2084,7 @@ impl Backend {
             accepting: true,
             submitted: 0,
             retired: 0,
+            gpu_busy_held: false,
             firmware_error: None,
             recoveries: 0,
             recovery_window: 0,
