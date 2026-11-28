@@ -76,6 +76,7 @@ void radeon_driver_unload_kms(struct drm_device *dev)
 
 	radeon_acpi_fini(rdev);
 
+	radeon_audio_component_fini(rdev);
 	radeon_modeset_fini(rdev);
 	radeon_device_fini(rdev);
 
@@ -702,6 +703,12 @@ void radeon_driver_postclose_kms(struct drm_device *dev,
 				 struct drm_file *file_priv)
 {
 	struct radeon_device *rdev = dev->dev_private;
+
+	if (!rdev) {
+		kfree(file_priv->driver_priv);
+		file_priv->driver_priv = NULL;
+		return;
+	}
 
 	pm_runtime_get_sync(dev->dev);
 
