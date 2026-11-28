@@ -38,11 +38,11 @@ impl Object {
     fn reset_reads(&self){self.reads.set(0);}
 }
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
-mod notifier_page {pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
+mod notifier_page {pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
 mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
 #[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object,user_stamp:Object}
-struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
+struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],user_stamp:[Object;2],notifier:Object}
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
@@ -83,7 +83,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut target_arr=[0u32;hw::sizes::COMPUTE_PIPES];target_arr[0]=target;
     let mut f=Firmware{
         graph:Graph{compute:core::array::from_fn(|_|CGraph::default()),
-            render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
+            render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),user_stamp:Default::default(),notifier:Object::default()}},
         engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
@@ -95,10 +95,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,ordinal);
     f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COUNTER,0x1234);
     for stage in 0..2{f.graph.render.fw_stamp[stage].set(0,u64::from(target));}
-    f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(target));
-    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(target));
-    f.graph.render.notifier.set(notifier::CONTEXT,2);
-    f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+    f.graph.render.user_stamp[0].set(0,u64::from(target));
+    f.graph.render.user_stamp[1].set(0,u64::from(target));
     for (off,time) in [(0x600,100),(0x608,101),(0x620,102),(0x628,103)]{f.engine.flights[0].job.resources.passes[0].scene.set(off,time);}
     f
 }
@@ -158,10 +156,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.engine.fs_target=encode::stamp(n+1);
         // The render behind it finished too: shared TA/FS stamps and notifier moved on.
         for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(n+1))); }
-        f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.render.notifier.set(notifier::CONTEXT,9);
-        f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,9);
+        f.graph.render.user_stamp[0].set(0,u64::from(encode::stamp(n+1)));
+        f.graph.render.user_stamp[1].set(0,u64::from(encode::stamp(n+1)));
         f.engine.flights[0].job.resources.pools.completed=4;
         assert_eq!(f.retired(),Ok(Retirement::Full));
         // Unreached FS stamp keeps it pending.
@@ -213,8 +209,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f2.engine.ta_target=encode::stamp(40);
     f2.engine.fs_target=encode::stamp(40);
     for stage in 0..2 { f2.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
-    f2.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
-    f2.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
+    f2.graph.render.user_stamp[0].set(0,u64::from(encode::stamp(40)));
+    f2.graph.render.user_stamp[1].set(0,u64::from(encode::stamp(40)));
     f2.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
     assert_eq!(f2.retired_flight(),Ok(Some((1,Retirement::Full))));
 }
@@ -252,9 +248,13 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(fc.graph.render.fw_stamp[0].reads.get(),0);
     assert_eq!(fc.graph.render.fw_stamp[1].reads.get(),0);
     assert_eq!(fc.graph.render.notifier.reads.get(),0);
-    // Render-only retirement performs zero compute WC reads.
+    assert_eq!(fc.graph.render.user_stamp[0].reads.get(),0);
+    assert_eq!(fc.graph.render.user_stamp[1].reads.get(),0);
+    // Render-only retirement performs zero compute WC reads, and never reads the ASC-cached
+    // render notifier page.
     let mut fr=firmware(true,5);
     assert_eq!(fr.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(fr.graph.render.notifier.reads.get(),0);
     assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(),0);
     assert_eq!(fr.graph.compute[0].notifier.reads.get(),0);
     assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(),0);
@@ -268,7 +268,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
     // Unsettled notifier skips scene WC timestamp reads.
     fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(7)));
-    fp.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
+    fp.graph.render.user_stamp[1].set(0,u64::from(encode::stamp(6)));
     assert_eq!(fp.retired_flight(),Ok(None));
     assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
     // Mixed flight pending is polled once, not twice.
@@ -287,8 +287,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fmix.engine.ta_target=encode::stamp(41);
     fmix.engine.fs_target=encode::stamp(41);
     for stage in 0..2 { fmix.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
-    fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
-    fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
+    fmix.graph.render.user_stamp[0].set(0,u64::from(encode::stamp(41)));
+    fmix.graph.render.user_stamp[1].set(0,u64::from(encode::stamp(41)));
     fmix.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
     let (mut check_c,mut check_r)=([true;hw::sizes::COMPUTE_PIPES],true);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
@@ -396,10 +396,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.ta_target=t31;
     f.engine.fs_target=t31;
     for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(t31)); }
-    f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(t31));
-    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(t31));
-    f.graph.render.notifier.set(notifier::CONTEXT,2);
-    f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+    f.graph.render.user_stamp[0].set(0,u64::from(t31));
+    f.graph.render.user_stamp[1].set(0,u64::from(t31));
 
     // First unsettled poll records gate_passed_ns on hanging VM A; after ABORT_GRACE_NS, VM A aborts.
     assert_eq!(f.retired_flight(),Ok(None));

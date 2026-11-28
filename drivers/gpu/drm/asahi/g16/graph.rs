@@ -199,9 +199,9 @@ fn init_queue(
 fn init_notifier(page: &FwObject, threshold: &FwObject) -> Result {
     for engine in 0..3 {
         let off = engine * 0x200;
-        // A separate uncached threshold is legal. The TA/FS service cells keep their native
-        // offsets in the uncached render page; compute's service stamp is its queue's own
-        // uncached `user_stamp` cell, because the compute page is ASC-cached.
+        // A separate uncached threshold is legal. Completion never depends on cacheable
+        // memory: compute and render notifier pages are ASC-cached, and their service stamps
+        // live in the queues' own uncached `user_stamp` cells.
         page.write(
             off,
             &graph::notifier_image(threshold.va + engine as u64 * 8, 1),
@@ -275,11 +275,14 @@ pub(crate) struct RenderGraph {
     pub(crate) ring: [Arc<FwObject>; 2],
     #[allow(dead_code)]
     pub(crate) qscratch: [Arc<FwObject>; 2],
-    #[allow(dead_code)]
+    /// TA and FS service stamp cells, uncached and apart from the notifier page: the firmware
+    /// stores the stamp of the newest finished draw here, and render receipts read them.
     pub(crate) user_stamp: [Arc<FwObject>; 2],
     pub(crate) fw_stamp: [Arc<FwObject>; 2],
     pub(crate) sched_ctx: Arc<FwObject>,
-    /// Whole page: TA record +0, FS +0x200, service stamps +0x620/+0x630.
+    /// Whole page: TA record +0, FS +0x200. ASC-cached, as macOS 26B123 maps its notifier
+    /// records (0x443): the host writes it once before the firmware first touches it and never
+    /// reads it back.
     pub(crate) notifier: Arc<FwObject>,
     pub(crate) threshold: Arc<FwObject>,
     pub(crate) job_list: [Arc<FwObject>; 2],
@@ -302,7 +305,7 @@ impl RenderGraphSession {
             ta: QueueSession::new(o)?,
             fs: QueueSession::new(o)?,
             sched_ctx: context,
-            notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+            notifier: alloc(o, 0x1000, Class::FwCached, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [
                 alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,

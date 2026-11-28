@@ -2660,10 +2660,7 @@ impl Firmware {
                 notifier: r.notifier.va,
                 legacy_empty: r.legacy_empty.va,
                 qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-                user_stamp: [
-                    r.notifier.va + notifier_page::TA_STAMP as u64,
-                    r.notifier.va + notifier_page::FS_STAMP as u64,
-                ],
+                user_stamp: [r.user_stamp[0].va, r.user_stamp[1].va],
                 fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
                 uma_mgr: a.uma_mgr,
                 uma_aux: a.uma_aux,
@@ -2704,10 +2701,7 @@ impl Firmware {
             notifier: r.notifier.va,
             legacy_empty: r.legacy_empty.va,
             qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-            user_stamp: [
-                r.notifier.va + notifier_page::TA_STAMP as u64,
-                r.notifier.va + notifier_page::FS_STAMP as u64,
-            ],
+            user_stamp: [r.user_stamp[0].va, r.user_stamp[1].va],
             fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
             uma_mgr: a.uma_mgr,
             uma_aux: a.uma_aux,
@@ -3494,7 +3488,7 @@ impl Firmware {
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding. Always
                 // advance both TA and FS thresholds to the newest published draw ordinal
-                // so firmware never skips updating `TA_STAMP` on fast tail flights.
+                // so firmware never skips updating the TA service stamp on fast tail flights.
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {

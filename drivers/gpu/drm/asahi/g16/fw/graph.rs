@@ -121,13 +121,11 @@ pub(crate) mod notifier {
     pub(crate) const CONTEXT: usize = 0x24;
 }
 
-/// Engine records and terminal service-stamp cells in their retained notifier page.
+/// Engine records in their retained notifier page.
 pub(crate) mod notifier_page {
     pub(crate) const TA_RECORD: usize = 0;
     pub(crate) const FS_RECORD: usize = 0x200;
     pub(crate) const COMPUTE_RECORD: usize = 0x400;
-    pub(crate) const TA_STAMP: usize = 0x620;
-    pub(crate) const FS_STAMP: usize = 0x630;
 }
 
 /// Job list (0x18 bytes): u64 self VA at +8.
@@ -237,8 +235,8 @@ pub(crate) fn context_image() -> [u8; sched_ctx::SIZE] {
     s
 }
 
-/// One engine notifier record. The page holding the three records stays non-cacheable;
-/// threshold and service stamp cells occupy disjoint offsets starting at +0x600.
+/// One engine notifier record. Compute and render notifier pages are ASC-cached; their service
+/// stamps are the queues' own uncached `user_stamp` cells.
 pub(crate) fn notifier_image(threshold: u64, context: u32) -> [u8; notifier::SIZE] {
     let mut n = [0; notifier::SIZE];
     n[..8].copy_from_slice(&threshold.to_le_bytes());

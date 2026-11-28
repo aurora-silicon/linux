@@ -2373,7 +2373,7 @@ pub mod g16 {
             assert_eq!(r.fw_stamp[stage].class, Class::Shared);
         }
         assert_eq!(r.sched_ctx.class, Class::Fw);
-        assert_eq!(r.notifier.class, Class::Fw);
+        assert_eq!(r.notifier.class, Class::FwCached);
         assert_eq!(r.threshold.class, Class::Fw);
         assert_eq!(r.legacy_empty.class, Class::Shared);
         assert_eq!(r.registration_barrier.class, Class::Fw);
