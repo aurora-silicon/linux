@@ -263,6 +263,13 @@ patternProperties:
           the link again.
         maxItems: 1
 
+      card-detect-gpios:
+        description:
+          The card detect of a card reader behind this port, wired to an input
+          that can interrupt while the reader itself is powered down, so the
+          port can be powered down while the slot is empty.
+        maxItems: 1
+
       interrupt-controller: true
 
       apple,link-trained-by-bootloader:

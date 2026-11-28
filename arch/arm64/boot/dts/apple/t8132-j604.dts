@@ -301,10 +301,18 @@
 
 /*
  * The SD card reader, a GL9755 (ADT pci-bridge2/pcie-sdreader), powered by
- * the SMC's gP19 (function-sd_pwr_en).
+ * the SMC's gP19 (function-sd_pwr_en). Its card detect is the SMC's gP09
+ * (ADT pcie-sdreader: interrupt-parent smc-pmu, interrupts <9>,
+ * card-detect-polarity 1), which reports a card while the reader is off.
  */
 &port02 {
 	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+	card-detect-gpios = <&smc_gpio 0x09 GPIO_ACTIVE_HIGH>;
+};
+
+&smc_gpio {
+	interrupt-controller;
+	#interrupt-cells = <2>;
 };
 
 /*

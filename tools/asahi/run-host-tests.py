@@ -174,6 +174,11 @@ ASAHI_TESTS = {
     'bcm4377-resume-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board'), out(), PASS),
     'bcm4377-sleep-config-tests.py': [([], PASS)],
+    # The mutations are caught inside the test, which then exits 0.
+    'pcie-sd-off-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('cd-inverted', 'empty-kept-up', 'read-error'), out(), PASS),
+    'macsmc-gpio-irq-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-ack', 'stale-mode', 'any-event'), out(), PASS),
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],

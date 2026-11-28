@@ -49,6 +49,8 @@
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 #include <linux/blkdev.h>
+#include <linux/workqueue.h>
+#include <linux/interrupt.h>
 
 #include "../pci.h"
 #include "pci-host-common.h"
@@ -71,6 +73,17 @@ EXPORT_SYMBOL_GPL(apple_pcie_tunnel_unregister_notifier);
 static bool s2idle_keep_link = true;
 module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
+
+/* The card reader ports whose slot can power them down (apple_pcie_sd_init()). */
+static LIST_HEAD(apple_pcie_sd_ports);
+static DEFINE_MUTEX(apple_pcie_sd_lock);
+/* Under apple_pcie_sd_lock: from the sleep notifier's PREPARE to its POST. */
+static bool apple_pcie_sd_sleeping;
+/*
+ * Serialises the sleep notifier's registration. The notifier takes apple_pcie_sd_lock with the
+ * notifier chain held, so the chain is never entered with apple_pcie_sd_lock held.
+ */
+static DEFINE_MUTEX(apple_pcie_sd_nb_lock);
 
 /* Lets the NHI take a tunneled PCIe-C port through a deep sleep. */
 static bool cio_s2r = true;
@@ -700,6 +713,16 @@ struct apple_pcie_port {
 	bool			powered;	/* cold train: pwren raised, port not parked yet */
 	struct device		*cold_dart;	/* a parked port's DART: gated while the port is parked */
 	struct pci_saved_state	*cold_rp_state;	/* a parked port's root port, as it was before the park */
+	/* A card reader port with a card-detect line (apple_pcie_sd_init()) */
+	struct gpio_desc	*card_detect;
+	int			sd_irq;		/* card detect, enabled once the bus is scanned */
+	bool			sd_started;	/* apple_pcie_sd_start() has run */
+	bool			sd_asleep;	/* card detect off across a system sleep */
+	struct delayed_work	sd_work;
+	struct list_head	sd_entry;
+	bool			sd_off;		/* powered down for an empty slot */
+	struct pci_dev		*sd_rp_held;	/* its root port, kept active while it is down */
+	struct device		*sd_dart;	/* its DART, kept active while it is down */
 };
 
 static bool apple_radio_writer_closed(struct apple_pcie *pcie);
@@ -3124,6 +3147,429 @@ static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
 					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
+/*
+ * A card reader port powered down while its slot is empty. On the J604 macOS keeps the SD
+ * reader's link off with no card in: its root port and endpoint read all ones, and the Apple
+ * device tree routes the slot's card detect to an SMC input, so the card is seen while the
+ * reader itself has no power. An empty slot takes the reader off the bus, holds it in reset and
+ * cuts its rail; a card brings the rail back, resets the endpoint, trains the link as probe does
+ * and rescans, so the reader's driver probes it as new. The APCIe block and the port's registers
+ * stay powered throughout, as on macOS. Around a system sleep the port is powered up first, so
+ * the sleep and resume paths only ever see a port as probe left it.
+ */
+#define APPLE_PCIE_SD_DEBOUNCE_MS	200
+
+/*
+ * Once the port is stopped and its endpoint held in reset, a read of the port's DART registers
+ * can end in a synchronous external abort and an SError: on the J604 the boot stopped there,
+ * with dart-apcie2's TCR read from apple_dart_save_state(). Removing the endpoint drops the
+ * DART's last runtime PM reference, and its runtime suspend, which saves those registers, runs
+ * later from the PM workqueue, so it can land after the port is stopped. Hold the DART active
+ * from before the endpoint goes until the reader is back: nothing reads it while it is down.
+ */
+static int apple_pcie_sd_hold_dart(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				   struct pci_dev *rp)
+{
+	struct of_phandle_args args = {};
+	struct platform_device *pdev;
+	int ret;
+
+	if (port->sd_dart)
+		return 0;
+	if (!rp || !rp->subordinate)
+		return -ENODEV;
+	ret = of_map_iommu_id(pcie->dev->of_node, PCI_DEVID(rp->subordinate->number, 0), &args);
+	if (ret)
+		return ret;
+	/* No iommu-map: the port's endpoint is not behind a DART, so there is none to hold. */
+	if (!args.np)
+		return 0;
+	pdev = of_find_device_by_node(args.np);
+	of_node_put(args.np);
+	if (!pdev)
+		return -ENODEV;
+	ret = pm_runtime_resume_and_get(&pdev->dev);
+	if (ret < 0) {
+		put_device(&pdev->dev);
+		return ret;
+	}
+	port->sd_dart = &pdev->dev;
+	return 0;
+}
+
+/* With pcie->lock held: the port's link stopped, its endpoint in reset and its rail off. */
+static void apple_pcie_sd_port_off(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	WRITE_ONCE(port->link_failed, true);
+	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value_cansleep(port->perst, 1);
+	if (port->pwren_gpio)
+		gpiod_set_value_cansleep(port->pwren_gpio, 0);
+	port->sd_off = true;
+}
+
+static void apple_pcie_sd_release_rp(struct apple_pcie_port *port);
+
+static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct pci_dev *rp, *dev, *tmp;
+	int ret;
+
+	pci_lock_rescan_remove();
+	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
+	/*
+	 * With the endpoint off the root port's config space reads all ones, as on macOS, so the
+	 * PCI core must not move it between D-states until the reader is back: a childless port
+	 * runtime-suspends, and its D0 -> D3hot (and a config read's D3cold -> D0) then fail as
+	 * "device inaccessible". Keep it active, from while it still answers.
+	 */
+	if (rp && !port->sd_rp_held && pm_runtime_resume_and_get(&rp->dev) >= 0)
+		port->sd_rp_held = pci_dev_get(rp);
+	/* The port's reset takes the root port's config too: kept for the power-up. */
+	if (port->sd_rp_held)
+		pci_save_state(port->sd_rp_held);
+	ret = apple_pcie_sd_hold_dart(pcie, port, rp);
+	if (ret) {
+		/* No power-down without the DART held: the next card event tries again. */
+		apple_pcie_sd_release_rp(port);
+		pci_dev_put(rp);
+		pci_unlock_rescan_remove();
+		dev_warn(pcie->dev, "port %pOF: could not hold its DART (%d), reader stays powered\n",
+			 port->np, ret);
+		return;
+	}
+	if (rp && rp->subordinate)
+		list_for_each_entry_safe_reverse(dev, tmp, &rp->subordinate->devices, bus_list)
+			pci_stop_and_remove_bus_device(dev);
+
+	mutex_lock(&pcie->lock);
+	apple_pcie_sd_port_off(pcie, port);
+	mutex_unlock(&pcie->lock);
+
+	pci_dev_put(rp);
+	pci_unlock_rescan_remove();
+	dev_info(pcie->dev, "port %pOF: slot empty, reader powered down\n", port->np);
+}
+
+/* The reader is back (or the port goes away): its root port's runtime PM is the core's again. */
+static void apple_pcie_sd_release_rp(struct apple_pcie_port *port)
+{
+	struct pci_dev *rp = port->sd_rp_held;
+	struct device *dart = port->sd_dart;
+
+	/* After the rescan: the reader's own streams hold the DART again. */
+	port->sd_dart = NULL;
+	if (dart) {
+		pm_runtime_put(dart);
+		put_device(dart);
+	}
+	if (!rp)
+		return;
+	port->sd_rp_held = NULL;
+	pm_runtime_put(&rp->dev);
+	pci_dev_put(rp);
+}
+
+static int apple_pcie_sd_power_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct pci_dev *rp;
+	u16 lnksta = 0;
+	int attempt, ret;
+	u32 stat;
+
+	mutex_lock(&pcie->lock);
+	if (port->pwren_gpio) {
+		ret = gpiod_set_value_cansleep(port->pwren_gpio, 1);
+		if (ret)
+			goto off;
+		msleep(pcie->hw->pwren_on_ms ?: 100);
+	}
+	/* As probe does: the endpoint reset, then training with its endpoint-reset retries. */
+	ret = apple_pcie_port_reset_endpoint(pcie, port);
+	for (attempt = 0; !ret; attempt++) {
+		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+		ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+						 stat & PORT_LINKSTS_UP, 1000,
+						 link_up_timeout * USEC_PER_MSEC);
+		if (!ret || attempt == LINK_RESET_RETRIES)
+			break;
+		ret = apple_pcie_port_reset_endpoint(pcie, port);
+	}
+	if (ret)
+		goto off;
+
+	/* The link-up event of the training is not one to report. */
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	WRITE_ONCE(port->link_failed, false);
+	port->sd_off = false;
+	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
+	if (rp)
+		pcie_capability_read_word(rp, PCI_EXP_LNKSTA, &lnksta);
+	pci_dev_put(rp);
+	dev_info(pcie->dev, "port %pOF: card in, reader up: gen %u x%u, %d endpoint resets\n",
+		 port->np, (u32)FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta),
+		 (u32)FIELD_GET(PCI_EXP_LNKSTA_NLW, lnksta), attempt);
+	goto out;
+off:
+	/* As the power-down leaves it: no rail, endpoint in reset, as sd_off says. */
+	apple_pcie_sd_port_off(pcie, port);
+out:
+	mutex_unlock(&pcie->lock);
+	if (ret) {
+		/* Still off: the next card event tries again. */
+		dev_err(pcie->dev, "port %pOF: reader did not come up: %d\n", port->np, ret);
+		return ret;
+	}
+
+	pci_lock_rescan_remove();
+	/*
+	 * The root port comes back at its reset values: bus numbers 0, no window, memory
+	 * decoding off. The PCI core renumbers the bus but sets no window up for a bridge it
+	 * has enabled, so every read of the reader's BAR came back all ones. As the radio's
+	 * Neo path does before its link, the state saved at the power-down goes back first.
+	 */
+	if (port->sd_rp_held)
+		pci_restore_state(port->sd_rp_held);
+	if (bridge->bus)
+		pci_rescan_bus(bridge->bus);
+	pci_unlock_rescan_remove();
+	apple_pcie_sd_release_rp(port);
+	return 0;
+}
+
+static void apple_pcie_sd_work(struct work_struct *work)
+{
+	struct apple_pcie_port *port = container_of(to_delayed_work(work), struct apple_pcie_port,
+						    sd_work);
+	int present = gpiod_get_value_cansleep(port->card_detect);
+	bool off;
+
+	if (present < 0)
+		return;
+	off = !present;
+	if (off == port->sd_off)
+		return;
+	if (off)
+		apple_pcie_sd_power_down(port->pcie, port);
+	else
+		apple_pcie_sd_power_up(port->pcie, port);
+}
+
+static irqreturn_t apple_pcie_sd_cd_irq(int irq, void *data)
+{
+	struct apple_pcie_port *port = data;
+
+	mod_delayed_work(system_freezable_wq, &port->sd_work,
+			 msecs_to_jiffies(APPLE_PCIE_SD_DEBOUNCE_MS));
+	return IRQ_HANDLED;
+}
+
+/*
+ * A port powered down for an empty slot is powered up before a system sleep and checked after.
+ * The prepare notifiers run before the freezable workqueues freeze, so a card edge could queue
+ * the port's work again and run it beside the power-up. The card-detect interrupt, its only
+ * other source, is off from before the work is cancelled until the sleep is over.
+ */
+static int apple_pcie_sd_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_pcie_port *port;
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		mutex_lock(&apple_pcie_sd_lock);
+		apple_pcie_sd_sleeping = true;
+		list_for_each_entry(port, &apple_pcie_sd_ports, sd_entry) {
+			if (port->sd_started && !port->sd_asleep) {
+				disable_irq(port->sd_irq);
+				port->sd_asleep = true;
+			}
+			cancel_delayed_work_sync(&port->sd_work);
+			if (port->sd_off)
+				apple_pcie_sd_power_up(port->pcie, port);
+		}
+		mutex_unlock(&apple_pcie_sd_lock);
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+		mutex_lock(&apple_pcie_sd_lock);
+		apple_pcie_sd_sleeping = false;
+		list_for_each_entry(port, &apple_pcie_sd_ports, sd_entry) {
+			if (!port->sd_started)
+				continue;
+			if (port->sd_asleep) {
+				port->sd_asleep = false;
+				enable_irq(port->sd_irq);
+			}
+			mod_delayed_work(system_freezable_wq, &port->sd_work,
+					 msecs_to_jiffies(APPLE_PCIE_SD_DEBOUNCE_MS));
+		}
+		mutex_unlock(&apple_pcie_sd_lock);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block apple_pcie_sd_pm_nb = {
+	.notifier_call = apple_pcie_sd_pm_notify,
+};
+
+static void apple_pcie_sd_list(struct apple_pcie_port *port)
+{
+	bool first;
+
+	mutex_lock(&apple_pcie_sd_nb_lock);
+	mutex_lock(&apple_pcie_sd_lock);
+	first = list_empty(&apple_pcie_sd_ports);
+	list_add_tail(&port->sd_entry, &apple_pcie_sd_ports);
+	mutex_unlock(&apple_pcie_sd_lock);
+	if (first)
+		register_pm_notifier(&apple_pcie_sd_pm_nb);
+	mutex_unlock(&apple_pcie_sd_nb_lock);
+}
+
+/* Off the sleep notifier's list; a second call does nothing. */
+static void apple_pcie_sd_unlist(struct apple_pcie_port *port)
+{
+	bool last = false;
+
+	mutex_lock(&apple_pcie_sd_nb_lock);
+	mutex_lock(&apple_pcie_sd_lock);
+	if (!list_empty(&port->sd_entry)) {
+		list_del_init(&port->sd_entry);
+		last = list_empty(&apple_pcie_sd_ports);
+	}
+	mutex_unlock(&apple_pcie_sd_lock);
+	if (last)
+		unregister_pm_notifier(&apple_pcie_sd_pm_nb);
+	mutex_unlock(&apple_pcie_sd_nb_lock);
+}
+
+/*
+ * Registered before the card-detect interrupt, so devres frees the interrupt first: once the
+ * work is cancelled here nothing can queue it again. After .remove there is nothing left to put
+ * back (apple_pcie_sd_stop() did it); this covers a probe that fails after the port is set up.
+ */
+static void apple_pcie_sd_remove(void *data)
+{
+	struct apple_pcie_port *port = data;
+
+	apple_pcie_sd_unlist(port);
+	cancel_delayed_work_sync(&port->sd_work);
+	apple_pcie_sd_release_rp(port);
+}
+
+/*
+ * A port node with card-detect-gpios gets the card-detect interrupt. Without the line, or without
+ * an interrupt for it, the port stays as it is: the feature is absent, the port is not affected.
+ * apple_pcie_probe_port() has already deferred the probe while the line's provider is missing.
+ * The interrupt stays off until apple_pcie_sd_start(): nothing is decided before the bus scan.
+ */
+static void apple_pcie_sd_init(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct gpio_desc *cd;
+	int irq, ret;
+
+	if (!port->perst || !of_property_present(port->np, "card-detect-gpios"))
+		return;
+	cd = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np), "card-detect",
+				   GPIOD_IN, "SD card detect");
+	irq = IS_ERR(cd) ? PTR_ERR(cd) : gpiod_to_irq(cd);
+	if (irq == -EPROBE_DEFER) {
+		dev_warn(pcie->dev, "port %pOF: card-detect provider gone since probe, reader stays powered\n",
+			 port->np);
+		return;
+	}
+	if (irq < 0) {
+		dev_info(pcie->dev, "port %pOF: no card-detect interrupt (%d), reader stays powered\n",
+			 port->np, irq);
+		return;
+	}
+
+	port->card_detect = cd;
+	port->sd_irq = irq;
+	INIT_DELAYED_WORK(&port->sd_work, apple_pcie_sd_work);
+	INIT_LIST_HEAD(&port->sd_entry);
+	apple_pcie_sd_list(port);
+	if (devm_add_action_or_reset(pcie->dev, apple_pcie_sd_remove, port)) {
+		port->card_detect = NULL;
+		return;
+	}
+
+	ret = devm_request_threaded_irq(pcie->dev, irq, NULL, apple_pcie_sd_cd_irq,
+					IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT |
+					IRQF_NO_AUTOEN, "apple-pcie-sd-cd", port);
+	if (ret) {
+		dev_info(pcie->dev, "port %pOF: card-detect interrupt refused (%d), reader stays powered\n",
+			 port->np, ret);
+		devm_release_action(pcie->dev, apple_pcie_sd_remove, port);
+		port->card_detect = NULL;
+	}
+}
+
+/*
+ * The first look at the slot, from probe once the bus scan has enumerated the reader: the slot
+ * is read now, and from here on every card-detect edge is acted on. Under the sleep notifier's
+ * lock, so a PREPARE sees the port either not started or started with its interrupt on. Inside
+ * a system sleep the interrupt stays off and the notifier's POST turns it on and reads the slot.
+ */
+static void apple_pcie_sd_start(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	mutex_lock(&apple_pcie_sd_lock);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->card_detect || port->sd_started)
+			continue;
+		port->sd_started = true;
+		if (apple_pcie_sd_sleeping) {
+			port->sd_asleep = true;
+			continue;
+		}
+		enable_irq(port->sd_irq);
+		mod_delayed_work(system_freezable_wq, &port->sd_work, 0);
+	}
+	mutex_unlock(&apple_pcie_sd_lock);
+}
+
+/*
+ * From .remove, before the root bus goes: no card-detect edge, sleep notifier or queued work may
+ * reach the bus after this. A port down for an empty slot is then powered up, as before a system
+ * sleep, so its root port and DART go back to runtime PM while the port is up and the root port
+ * is still on the bus. A DART that saves its state against a port in reset is the SError
+ * apple_pcie_sd_hold_dart() is there to prevent.
+ */
+static void apple_pcie_sd_stop(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->card_detect)
+			continue;
+		/* Off the notifier's list first, so only this code owns the interrupt. */
+		apple_pcie_sd_unlist(port);
+		if (port->sd_started && !port->sd_asleep)
+			disable_irq(port->sd_irq);
+		port->sd_started = false;
+		port->sd_asleep = false;
+		cancel_delayed_work_sync(&port->sd_work);
+		if (port->sd_off && apple_pcie_sd_power_up(pcie, port)) {
+			/*
+			 * Still in reset: the DART keeps its runtime PM reference for good,
+			 * so it never saves its state against this port.
+			 */
+			dev_warn(pcie->dev, "port %pOF: reader stays down, its DART stays active\n",
+				 port->np);
+			put_device(port->sd_dart);
+			port->sd_dart = NULL;
+		}
+		apple_pcie_sd_release_rp(port);
+	}
+}
+
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				 struct device_node *np)
 {
@@ -3411,6 +3857,7 @@ rid2sid_ready:
 			apple_pcie_port_readl(port, PORT_LINKSTS),
 			pcie->piodma_supplier ? "waits for the bootstrap" : "blocked");
 
+	apple_pcie_sd_init(pcie, port);
 	return 0;
 
 err_teardown:
@@ -4251,6 +4698,24 @@ static int apple_pcie_probe_port(struct device_node *np)
 			return PTR_ERR(gd);
 	} else {
 		gpiod_put(gd);
+	}
+
+	/*
+	 * A card reader's card detect: wait for its provider and the provider's interrupts, so
+	 * whether the port can power down does not depend on probe order. Any other error leaves
+	 * the port powered (apple_pcie_sd_init()).
+	 */
+	gd = fwnode_gpiod_get_index(of_fwnode_handle(np), "card-detect", 0,
+				    GPIOD_ASIS, "SD card detect");
+	if (IS_ERR(gd)) {
+		if (PTR_ERR(gd) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+	} else {
+		int irq = gpiod_to_irq(gd);
+
+		gpiod_put(gd);
+		if (irq == -EPROBE_DEFER)
+			return irq;
 	}
 
 	return 0;
@@ -6094,6 +6559,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 				ret);
 		else
 			apple_pcie_neo_sleep_probe(pdev, pcie);
+		apple_pcie_sd_start(pcie);
 		return 0;
 	}
 
@@ -6102,6 +6568,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (pcie->hw->adopt_link)
 		apple_pcie_t6050_sleep_probe(pdev, pcie);
 
+	apple_pcie_sd_start(pcie);
 	apple_radio_register(pdev, pcie);
 	return 0;
 }
@@ -6665,6 +7132,9 @@ static void apple_pcie_remove(struct platform_device *pdev)
 {
 	struct pci_host_bridge *bridge = platform_get_drvdata(pdev);
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+
+	/* A card reader port's work takes the rescan lock: quiesced before it is held. */
+	apple_pcie_sd_stop(pcie);
 
 	/*
 	 * A USB4 cable pull is a surprise removal: the remote hierarchy is
