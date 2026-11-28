@@ -32,8 +32,10 @@ def main():
     struct = re.search(r'^struct apple_dart_cio \{.*?\n\};', sources[paths[4]],
                        re.M | re.S).group()
     names = ['apple_dart_cio_bank', 'apple_dart_cio_check',
-             'apple_dart_cio_prepare', 'apple_dart_cio_gapf', 'apple_dart_cio_reopen',
-             'apple_dart_cio_off', 'apple_dart_cio_on', 'apple_dart_cio_finish']
+             'apple_dart_cio_prepare_common', 'apple_dart_cio_prepare',
+             'apple_dart_cio_prepare_runtime', 'apple_dart_cio_gapf',
+             'apple_dart_cio_reopen', 'apple_dart_cio_off',
+             'apple_dart_cio_on', 'apple_dart_cio_finish']
     methods = '\n'.join(function(owner, n) for n in names)
     gate = '\n'.join(function(sources[paths[3]], n) for n in [
         'apple_dart_sleep_writer_get', 'apple_dart_sleep_writer_put', 'apple_dart_sleep_close'])

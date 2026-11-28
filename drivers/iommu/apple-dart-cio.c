@@ -111,14 +111,12 @@ int apple_dart_cio_check(struct apple_dart_cio *s, bool quiesced)
 }
 EXPORT_SYMBOL_GPL(apple_dart_cio_check);
 
-int apple_dart_cio_prepare(struct apple_dart_cio *s)
+static int apple_dart_cio_prepare_common(struct apple_dart_cio *s)
 {
 	struct apple_dart *dart;
 	unsigned long flags;
 	int ret;
 
-	if (!s || !s->owner || pm_suspend_target_state != PM_SUSPEND_MEM)
-		return -EINVAL;
 	dart = s->dart;
 	ret = pm_runtime_resume_and_get(dart->dev);
 	if (ret < 0)
@@ -153,7 +151,22 @@ int apple_dart_cio_prepare(struct apple_dart_cio *s)
 		pm_runtime_put(dart->dev);
 	return ret;
 }
+
+int apple_dart_cio_prepare(struct apple_dart_cio *s)
+{
+	if (!s || !s->owner || pm_suspend_target_state != PM_SUSPEND_MEM)
+		return -EINVAL;
+	return apple_dart_cio_prepare_common(s);
+}
 EXPORT_SYMBOL_GPL(apple_dart_cio_prepare);
+
+int apple_dart_cio_prepare_runtime(struct apple_dart_cio *s)
+{
+	if (!s || !s->owner)
+		return -EINVAL;
+	return apple_dart_cio_prepare_common(s);
+}
+EXPORT_SYMBOL_GPL(apple_dart_cio_prepare_runtime);
 
 static int apple_dart_cio_gapf(struct apple_dart_cio *s, bool on)
 {

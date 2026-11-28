@@ -23,6 +23,13 @@ struct apple_dart_cio;
 int apple_dart_cio_bind(struct device *owner, struct device *provider,
 			struct apple_dart_cio **state);
 int apple_dart_cio_prepare(struct apple_dart_cio *state);
+/*
+ * Runtime variant of apple_dart_cio_prepare(): drops the PM_SUSPEND_MEM check
+ * and leaves a successful transaction active until apple_dart_cio_finish().
+ * Callers must serialize the transaction against their device's suspend and
+ * removal paths and finish it on every exit.
+ */
+int apple_dart_cio_prepare_runtime(struct apple_dart_cio *state);
 int apple_dart_cio_check(struct apple_dart_cio *state, bool quiesced);
 int apple_dart_cio_off(struct apple_dart_cio *state);
 int apple_dart_cio_on(struct apple_dart_cio *state);
@@ -35,6 +42,11 @@ static inline int apple_dart_cio_bind(struct device *owner, struct device *provi
 }
 
 static inline int apple_dart_cio_prepare(struct apple_dart_cio *s)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_dart_cio_prepare_runtime(struct apple_dart_cio *s)
 {
 	return -EOPNOTSUPP;
 }
