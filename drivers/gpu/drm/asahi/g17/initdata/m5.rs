@@ -323,6 +323,33 @@ impl InitData {
             )
             .map_err(|_| EINVAL)?;
         }
+        // Build-wide graph words beyond the shared encoders, derived from the policy as laid out
+        // above (replacing band-relocated status-config words for policy-derived builds).
+        if let Some(words) = self.m5_policy.build_words.filter(|_| !common26) {
+            // Policy-derived status configs require board controller defaults to populate the
+            // policy words they read; fail explicitly rather than emitting a near-empty config.
+            if controller_defaults.is_none() {
+                return Err(EINVAL);
+            }
+            let core_slots = id.num_clusters.checked_mul(id.num_cores).ok_or(EOVERFLOW)?;
+            let policy_end = shared.policy.checked_add(self.m5_policy.size).ok_or(EINVAL)?;
+            let map = self.m5_status_config;
+            let config = private.status_config;
+            let config_end = config.checked_add(map.size).ok_or(EINVAL)?;
+            let mut status_config = KVec::new();
+            status_config.extend_from_slice(
+                self.object_mut(self.cluster)?.bytes_mut().get(config..config_end).ok_or(EINVAL)?,
+                GFP_KERNEL,
+            )?;
+            let bundle = self.object_mut(self.bundle)?.bytes_mut();
+            let (hw_data, rest) = bundle.split_at_mut(shared.policy);
+            let hw_slice = hw_data.get_mut(..m::M5_HW_DATA_SIZE).ok_or(EINVAL)?;
+            let policy_slice = rest.get_mut(..policy_end - shared.policy).ok_or(EINVAL)?;
+            m::encode_m5_build_words(words, board, layout, map, core_slots,
+                hw_slice, policy_slice, &mut status_config).map_err(|_| EINVAL)?;
+            self.object_mut(self.cluster)?.bytes_mut()[config..config_end]
+                .copy_from_slice(&status_config);
+        }
         if let Some(microseconds) = board.idle_standby_us {
             m::set_m5_region_idle_standby(self.object_mut(self.region_c)?.bytes_mut(), microseconds)
                 .map_err(|_| EINVAL)?;

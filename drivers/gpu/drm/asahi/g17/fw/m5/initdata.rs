@@ -1513,18 +1513,14 @@ pub(crate) const COMMON26_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
     band(0x5cc, 0x628, 0x18, Evidence::ProducerChecked),
 ];
 
-/// Status config 26A428 -> 26B123 (macOS 27.2), in 26A428 offsets. The status config grows from 0x780 to 0x790 bytes (allocation size table entry 13).
+/// Status config 26A428 -> 26B123 (27.2), in 26A428 offsets. The status config grows from
+/// 0x780 to 0x790 bytes (allocation size table entry 13).
 ///
-/// From +0x5b4 the object holds two controller blocks, at +0x5b4 and +0x610, of 0x5c bytes
-/// each. 26B123 inserts two words into each block, an override slot at block +0x28 and its
-/// value at block +0x58, so a block grows to 0x64 bytes and everything after the second one
-/// moves by 0x10, the link word and pointer (0x774/0x778 -> 0x784/0x788) and the submission
-/// history (0x73c/0x74c/0x750 -> 0x74c/0x75c/0x760) included.
-///
-/// InitData captured from macOS 27.2 on a J716s shows the link pointer at 0x788 (the word at
-/// 0x778, where 26A428 keeps it, is null) and the link word 1 at 0x784. The capture does not
-/// separate a block of 0x64 bytes from one of 0x5c, so where inside the two blocks the 0x10 bytes
-/// sit, and the history offsets that follow from the same shift, are not confirmed.
+/// For 26B123 (`policy_derived: true`), the status-config body words come directly from
+/// [`M5_26B123_STATUS_CONFIG_WORDS`] rather than relocating the 25G76 word table; these bands
+/// serve [`M5StatusConfigMap::relocate`] for the tail offsets that shift by +0x10 (submission
+/// history 0x73c/0x74c/0x750 -> 0x74c/0x75c/0x760 and link word/pointer 0x774/0x778 ->
+/// 0x784/0x788).
 pub(crate) const M5_26B123_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
     band(0x000, 0x5dc, 0, Evidence::Inferred),
     band(0x5dc, 0x608, 0x4, Evidence::Inferred),
@@ -1536,12 +1532,6 @@ pub(crate) const M5_26B123_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
 /// Status-config size of 26B123 (entry 13 of its allocation size table).
 pub(crate) const M5_26B123_STATUS_CONFIG_SIZE: usize =
     ABI_ALLOCATION_SIZES_26B123_M5[ALLOC_STATUS_CONFIG];
-
-/// The words 26B123 has and 26A428 does not, at 26B123 offsets: the override slot of each
-/// controller block (0x5dc and 0x640, zero) and its value (0x60c = 5000 and 0x670 = 0), as read
-/// from InitData captured from macOS 27.2 on a J716s.
-pub(crate) const M5_26B123_STATUS_CONFIG_INSERTED: &[(usize, u32)] =
-    &[(0x5dc, 0), (0x60c, 5000), (0x640, 0), (0x670, 0)];
 
 fn write_relocated_words(
     words: &[(usize, u32)],
@@ -1919,6 +1909,10 @@ const _: () = {
         };
         assert!(m5_policy_size(builds[index]) == layout.policy_size());
         assert!(profile.m5_status_config().size == layout.status_config_size());
+        assert!(
+            profile.m5_status_config().policy_derived
+                == m5_policy(builds[index]).build_words.is_some()
+        );
         assert!(layout.shared.policy == M5_SHARED_LAYOUT.policy);
         index += 1;
     }
@@ -2043,8 +2037,9 @@ pub(crate) struct M5StatusConfigMap {
     pub(crate) size: usize,
     /// 26A428 offset -> this build's offset; empty for 26A428 itself.
     pub(crate) bands: &'static [LayoutBand],
-    /// Words this build has and 26A428 does not, at this build's offsets.
-    pub(crate) inserted: &'static [(usize, u32)],
+    /// When true, [`encode_m5_build_words`] populates the status config directly from the laid-out
+    /// policy (preserving the link word and pointer) instead of relocating the 25G76 word table.
+    pub(crate) policy_derived: bool,
 }
 
 impl M5StatusConfigMap {
@@ -2064,13 +2059,13 @@ impl M5StatusConfigMap {
 pub(crate) const M5_26A428_STATUS_CONFIG: M5StatusConfigMap = M5StatusConfigMap {
     size: M5_STATUS_CONFIG_SIZE,
     bands: &[],
-    inserted: &[],
+    policy_derived: false,
 };
 
 pub(crate) const M5_26B123_STATUS_CONFIG: M5StatusConfigMap = M5StatusConfigMap {
     size: M5_26B123_STATUS_CONFIG_SIZE,
     bands: M5_26B123_STATUS_CONFIG_BANDS,
-    inserted: M5_26B123_STATUS_CONFIG_INSERTED,
+    policy_derived: true,
 };
 
 pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
@@ -2840,6 +2835,309 @@ pub(crate) const J775D: Board = Board {
     compute_channels: 1,
 };
 
+/// Where a word of a status config comes from ([`M5BuildWords::status_config`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum StatusConfigWord {
+    /// The policy's 32-bit word at this offset of the build's policy layout. Some sit in the
+    /// policy's byte-packed blocks, at offsets that are not word aligned.
+    Policy(usize),
+    /// The policy's byte at this offset: the status config holds the flag as a word.
+    PolicyByte(usize),
+    /// A value the policy does not hold.
+    Value(u32),
+}
+
+/// Offset of the USC count in the M5 HW data, written by [`set_m5_enabled_cores`] and optionally
+/// overridden with core slots by [`encode_m5_build_words`].
+const M5_HW_USC_COUNT: usize = 0x10a4;
+
+/// Words a firmware build takes in its M5 graph beyond the shared M5 encoders, applied build-wide
+/// across all M5 core types via [`M5PolicyMap::build_words`] and [`encode_m5_build_words`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct M5BuildWords {
+    /// When `Some(policy_offset)`, write the GPU's core slots (clusters times cores per cluster)
+    /// as the USC count in HwData +0x10a4 (replacing the enabled cores written by
+    /// `set_m5_enabled_cores`) and at `policy_offset` in the policy (where the shared encoder
+    /// leaves 0). HwData +0x268c keeps the enabled count.
+    pub(crate) policy_usc_slots_offset: Option<usize>,
+    /// Policy words the shared encoders leave zero, at the build's offsets.
+    pub(crate) policy: &'static [(usize, PolicyWord)],
+    /// The whole status config but its link word and pointer, word by word at the build's
+    /// offsets. Every other byte is zero.
+    pub(crate) status_config: &'static [(usize, StatusConfigWord)],
+}
+
+/// A policy word of [`M5BuildWords::policy`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyWord {
+    /// `len` bytes of the policy as built, from this offset.
+    Copy { from: usize, len: usize },
+    /// A 32-bit value.
+    Value(u32),
+}
+
+/// The 26B123 status config derived directly from the laid-out policy for every M5 core type
+/// (G17S, G17C, G17D): two GPU power-controller records (+0xc8 and +0xf0), two 0x2c-byte records
+/// at +0x1e8 and +0x214, the controller block at +0x5f4 and the boost block at +0x6a4. Every word
+/// but one is either taken from the policy as built, so the two cannot disagree, or is a word of
+/// the shared status config ([`m5_status_config_word`], at its 25G76 offset).
+///
+/// On the J775D policy as built today, 18 entries read zero (+0x00c, +0x0d0, +0x0e0, +0x0e4,
+/// +0x0f8, +0x108, +0x10c, +0x120, +0x14c, +0x164, +0x168, +0x1ec, +0x208, +0x218, +0x234,
+/// +0x658, +0x6d8, +0x6ec; on J714 +0x658 reads 1); verify their source offsets if a shared
+/// encoder starts populating those policy words.
+const M5_26B123_STATUS_CONFIG_WORDS: [(usize, StatusConfigWord); 80] = {
+    use StatusConfigWord::{Policy as P, PolicyByte as B, Value as V};
+    [
+        // The policy's +0x44a0 controller block, between the shared status config's +0x010 and
+        // +0x020 words.
+        (0x00c, P(0x44a0)),
+        (0x010, V(m5_status_config_word(0x010))),
+        (0x014, P(0x45b4)),
+        (0x018, P(0x45c4)),
+        (0x01c, P(0x45d0)),
+        (0x020, V(m5_status_config_word(0x020))),
+        // The two GPU power-controller records of the policy (+0x2324 and +0x2cfc), seven words
+        // each.
+        (0x0c8, P(0x23a0)),
+        (0x0cc, P(0x234c)),
+        (0x0d0, P(0x2350)),
+        (0x0d8, P(0x2380)),
+        (0x0dc, P(0x2370)),
+        (0x0e0, P(0x23d0)),
+        (0x0e4, P(0x23d8)),
+        (0x0f0, P(0x2d78)),
+        (0x0f4, P(0x2d24)),
+        (0x0f8, P(0x2d28)),
+        (0x100, P(0x2d58)),
+        (0x104, P(0x2d48)),
+        (0x108, P(0x2da8)),
+        (0x10c, P(0x2db0)),
+        // Words of the policy's +0x3fd8 block. +0x130 to +0x138 are the shared status config's
+        // +0x108 to +0x110: two of these policy words, then its own +0x110 word.
+        (0x118, P(0x401e)),
+        (0x11c, P(0x406e)),
+        (0x120, P(0x4072)),
+        (0x130, P(0x3ffe)),
+        (0x134, P(0x3fee)),
+        (0x138, V(m5_status_config_word(0x110))),
+        (0x14c, P(0x4026)),
+        // The maximum power, two gains, and the first record's last two words again.
+        (0x154, P(0xad0)),
+        (0x158, P(0xab0)),
+        (0x15c, P(0xaa0)),
+        (0x164, P(0x23d0)),
+        (0x168, P(0x23d8)),
+        (0x180, P(0x477c)),
+        // The policy's two byte-packed records at +0x41cc and +0x438c: three flags, a word, two
+        // flag and word pairs, a flag and a word, and a last word.
+        (0x1e8, B(0x41cc)),
+        (0x1ec, B(0x41cd)),
+        (0x1f0, B(0x41ce)),
+        (0x1f4, P(0x41d2)),
+        (0x1f8, B(0x41ee)),
+        (0x1fc, P(0x41f2)),
+        (0x200, B(0x420e)),
+        (0x204, P(0x4212)),
+        (0x208, P(0x42ce)),
+        (0x214, B(0x438c)),
+        (0x218, B(0x438d)),
+        (0x21c, B(0x438e)),
+        (0x220, P(0x4392)),
+        (0x224, B(0x43ae)),
+        (0x228, P(0x43b2)),
+        (0x22c, B(0x43ce)),
+        (0x230, P(0x43d2)),
+        (0x234, P(0x448e)),
+        // The controller block from +0x48ec: its words, the USC count, the four threshold slots
+        // (of which the G17D row, M5_26B123_POLICY_CONTROLLER_WORDS_G17D, writes +0x4920, +0x4928
+        // and +0x492c) and the auxiliary pair, of which the policy keeps only the second (1600);
+        // the first, 900, is validated compatible with 26B123 on J775D (absent from the policy,
+        // the shared status config, and the J775D ADT GPU node) and remains to be confirmed on
+        // G17S and G17C.
+        (0x5f4, P(0x48ec)),
+        (0x5f8, P(0x49d8)),
+        (0x5fc, P(0x490c)),
+        (0x600, P(0x4920)),
+        (0x604, P(0x4924)),
+        (0x608, P(0x4928)),
+        (0x60c, P(0x492c)),
+        (0x658, P(0x49e4)),
+        (0x65c, P(0x4ad0)),
+        (0x674, V(900)),
+        (0x678, P(0x4a14)),
+        // The boost block, from the policy's byte-packed one at +0xbf4 (+0x6ac stays 0).
+        (0x6a4, B(0xbf4)),
+        (0x6a8, P(0xbf5)),
+        (0x6b0, P(0xbfd)),
+        (0x6b4, P(0xc01)),
+        (0x6b8, P(0xc05)),
+        (0x6bc, P(0xc09)),
+        (0x6c0, P(0xc0d)),
+        (0x6c4, P(0xc11)),
+        (0x6c8, P(0xc15)),
+        (0x6cc, P(0xc19)),
+        (0x6d0, P(0xc1d)),
+        // Words of the policy's +0x4adc block, the shared status config's +0x60c word, and the
+        // two caps: the top state x 100 and the one below it.
+        (0x6d8, P(0x4adc)),
+        (0x6dc, P(0x4b24)),
+        (0x6e0, P(0x4b14)),
+        (0x6e4, V(m5_status_config_word(0x60c))),
+        (0x6e8, P(0x4b34)),
+        (0x6ec, P(0x4b4c)),
+        (0x6f8, P(0x4b30)),
+    ]
+};
+
+/// The word at `offset` of the status config every M5 build is given
+/// ([`M5_25G76_STATUS_CONFIG_WORDS`], 25G76 offsets), for a table that holds the same word at
+/// another offset. Fails to build if that config has no word there.
+const fn m5_status_config_word(offset: usize) -> u32 {
+    let mut index = 0;
+    while index < M5_25G76_STATUS_CONFIG_WORDS.len() {
+        if M5_25G76_STATUS_CONFIG_WORDS[index].0 == offset {
+            return M5_25G76_STATUS_CONFIG_WORDS[index].1;
+        }
+        index += 1;
+    }
+    panic!("no such word in the M5 status config");
+}
+
+/// The 26B123 build's words beyond the shared encoders ([`M5_26B123_POLICY`]), shared across all
+/// M5 core types.
+const M5_26B123_BUILD_WORDS: M5BuildWords = M5BuildWords {
+    policy_usc_slots_offset: Some(0x490c),
+    // After the state pointer, a copy of the GPU temperature-sensor channel masks (the 0x28 bytes
+    // from +0x4bd4, which the controller defaults write), then 1.
+    policy: &[
+        (0x828c, PolicyWord::Copy { from: 0x4bd4, len: 0x28 }),
+        (0x82b4, PolicyWord::Value(1)),
+    ],
+    status_config: &M5_26B123_STATUS_CONFIG_WORDS,
+};
+
+const _: () = {
+    if let Some(usc_offset) = M5_26B123_BUILD_WORDS.policy_usc_slots_offset {
+        assert!(usc_offset + 4 <= M5_26B123_POLICY_SIZE);
+    }
+    let mut p = 0;
+    while p < M5_26B123_BUILD_WORDS.policy.len() {
+        let (offset, word) = M5_26B123_BUILD_WORDS.policy[p];
+        match word {
+            PolicyWord::Copy { from, len } => {
+                assert!(from + len <= M5_26B123_POLICY_SIZE);
+                assert!(offset + len <= M5_26B123_POLICY_SIZE);
+            }
+            PolicyWord::Value(_) => {
+                assert!(offset + 4 <= M5_26B123_POLICY_SIZE);
+            }
+        }
+        p += 1;
+    }
+    // In order, inside the 26B123 status config, clear of its link word and pointer.
+    let words = &M5_26B123_STATUS_CONFIG_WORDS;
+    let link = match M5_26B123_STATUS_CONFIG.relocate(M5_STATUS_CONFIG_LINK_WORD) {
+        Some(link) => link,
+        None => panic!("no link word"),
+    };
+    let mut index = 0;
+    while index < words.len() {
+        let offset = words[index].0;
+        assert!(offset % 4 == 0 && offset + 4 <= link);
+        assert!(index == 0 || words[index - 1].0 < offset);
+        let source = match words[index].1 {
+            StatusConfigWord::Policy(at) => at + 4,
+            StatusConfigWord::PolicyByte(at) => at + 1,
+            StatusConfigWord::Value(_) => 0,
+        };
+        assert!(source <= M5_26B123_POLICY_SIZE);
+        index += 1;
+    }
+};
+
+/// Writes a build's `words` ([`M5PolicyMap::build_words`]) after the shared encoders and the
+/// policy's layout for the build: the USC count of HwData and the policy (`core_slots`, the GPU's
+/// clusters times its cores per cluster), the policy words, then the whole status config from the
+/// policy as built and the table's own values, keeping its link word and pointer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Build-wide M5 words update HwData, policy, and status config together from the \
+              build's layout, map, board, and GPU core slot count."
+)]
+pub(crate) fn encode_m5_build_words(
+    words: &M5BuildWords,
+    board: &Board,
+    layout: &M5Layout,
+    map: &M5StatusConfigMap,
+    core_slots: u32,
+    hw_data: &mut [u8],
+    policy: &mut [u8],
+    status_config: &mut [u8],
+) -> Result<(), InitdataError> {
+    if hw_data.len() != M5_HW_DATA_SIZE || policy.len() != layout.policy_size()
+        || status_config.len() != map.size
+    {
+        return Err(InitdataError::BufferSize);
+    }
+    if let Some(policy_usc_offset) = words.policy_usc_slots_offset {
+        if core_slots == 0 || core_slots > 128 {
+            return Err(InitdataError::InterfaceMismatch);
+        }
+        if policy_usc_offset.checked_add(4).is_none_or(|end| end > policy.len()) {
+            return Err(InitdataError::BufferSize);
+        }
+        let offset = hw_offset(board, M5_HW_USC_COUNT);
+        if offset.checked_add(4).is_none_or(|end| end > hw_data.len()) {
+            return Err(InitdataError::BufferSize);
+        }
+        put_u32(hw_data, offset, core_slots);
+        put_u32(policy, policy_usc_offset, core_slots);
+    }
+    for &(offset, word) in words.policy {
+        match word {
+            PolicyWord::Copy { from, len } => {
+                if from.checked_add(len).is_none_or(|end| end > policy.len())
+                    || offset.checked_add(len).is_none_or(|end| end > policy.len())
+                {
+                    return Err(InitdataError::BufferSize);
+                }
+                policy.copy_within(from..from + len, offset);
+            }
+            PolicyWord::Value(value) => {
+                if offset.checked_add(4).is_none_or(|end| end > policy.len()) {
+                    return Err(InitdataError::BufferSize);
+                }
+                put_u32(policy, offset, value);
+            }
+        }
+    }
+    let link_word = map.relocate(M5_STATUS_CONFIG_LINK_WORD).ok_or(InitdataError::BufferSize)?;
+    let link_ptr = map.relocate(M5_STATUS_CONFIG_LINK_PTR).ok_or(InitdataError::BufferSize)?;
+    if link_ptr != link_word + 4 {
+        return Err(InitdataError::InterfaceMismatch);
+    }
+    let mut link = [0u8; 12];
+    link.copy_from_slice(
+        status_config.get(link_word..link_word + 12).ok_or(InitdataError::BufferSize)?,
+    );
+    status_config.fill(0);
+    status_config[link_word..link_word + 12].copy_from_slice(&link);
+    for &(offset, word) in words.status_config {
+        let value = match word {
+            StatusConfigWord::Policy(at) => u32::from_le_bytes(
+                policy.get(at..at + 4).ok_or(InitdataError::BufferSize)?.try_into()
+                    .map_err(|_| InitdataError::BufferSize)?),
+            StatusConfigWord::PolicyByte(at) => {
+                u32::from(*policy.get(at).ok_or(InitdataError::BufferSize)?)
+            }
+            StatusConfigWord::Value(value) => value,
+        };
+        put_u32(status_config, offset, value);
+    }
+    Ok(())
+}
+
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
 /// J813 ADT (27.0) and its 25G76 HW data (core type 0x20 revision 5, twelve states).
 /// Bring-up: no policy controller configuration yet.
@@ -2922,7 +3220,7 @@ pub(crate) fn set_m5_enabled_cores(board: &Board, out: &mut [u8], enabled: u32)
     if enabled == 0 || enabled > 128 {
         return Err(InitdataError::InterfaceMismatch);
     }
-    put_u32(out, 0x10a4, enabled);
+    put_u32(out, hw_offset(board, M5_HW_USC_COUNT), enabled);
     put_u32(out, hw_offset(board, 0x268c), enabled);
     Ok(())
 }
@@ -3004,6 +3302,9 @@ pub(crate) struct M5PolicyMap {
     /// other core type.
     pub(crate) controller_words_by_core: &'static [(u32, &'static [(usize, u32)])],
     pub(crate) controller_words: &'static [(usize, u32)],
+    /// Words of this build's graph beyond the shared encoders ([`M5BuildWords`]), applied
+    /// build-wide across all M5 core types.
+    pub(crate) build_words: Option<&'static M5BuildWords>,
 }
 
 impl M5PolicyMap {
@@ -3035,6 +3336,7 @@ pub(crate) const M5_26A428_POLICY: M5PolicyMap = M5PolicyMap {
     bands: &[],
     controller_words_by_core: &[],
     controller_words: &[],
+    build_words: None,
 };
 
 pub(crate) const M5_26B123_POLICY: M5PolicyMap = M5PolicyMap {
@@ -3042,6 +3344,7 @@ pub(crate) const M5_26B123_POLICY: M5PolicyMap = M5PolicyMap {
     bands: M5_26B123_POLICY_BANDS,
     controller_words_by_core: &[(M5_CORE_TYPE_G17D, M5_26B123_POLICY_CONTROLLER_WORDS_G17D)],
     controller_words: M5_26B123_POLICY_CONTROLLER_WORDS,
+    build_words: Some(&M5_26B123_BUILD_WORDS),
 };
 
 /// The power-policy map of an M5 firmware build.
@@ -3788,7 +4091,9 @@ pub(crate) fn encode_m5_primary_status_b_for(
         COMMON26_STATUS_B_LINK_PTR,
         status_b + (config + link_word) as u64,
     );
-    write_m5_status_config_words(map, &mut out[config..end])?;
+    if !map.policy_derived {
+        write_m5_status_config_words(map, &mut out[config..end])?;
+    }
     put_u32(out, config + link_word, 1);
     put_u64(
         out,
@@ -3798,9 +4103,8 @@ pub(crate) fn encode_m5_primary_status_b_for(
     Ok(())
 }
 
-/// Writes the 25G76 status-config words through the 26A428 bands and then `map`, followed by
-/// the words the build inserted. For 26A428 this is
-/// `write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS, out)`.
+/// Writes the 25G76 status-config words through the 26A428 bands and then `map`. For 26A428 this
+/// is `write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS, out)`.
 fn write_m5_status_config_words(
     map: &M5StatusConfigMap,
     out: &mut [u8],
@@ -3819,12 +4123,6 @@ fn write_m5_status_config_words(
                 *out.get_mut(target).ok_or(InitdataError::BufferSize)? = byte;
             }
         }
-    }
-    for &(offset, value) in map.inserted {
-        if offset.checked_add(4).is_none_or(|end| end > out.len()) {
-            return Err(InitdataError::BufferSize);
-        }
-        put_u32(out, offset, value);
     }
     Ok(())
 }
@@ -4310,4 +4608,75 @@ pub(crate) fn encode_m5_policy_controller_defaults_j775d(out: &mut [u8]) -> Resu
         }
     }
     Ok(())
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_m5_build_words)]
+mod build_words_tests {
+    use super::*;
+    use kernel::prelude::*;
+
+    fn word_at(buf: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn builds_26b123_words_and_preserves_link_while_26a428_stays_unset() -> kernel::error::Result {
+        assert!(M5_26A428_POLICY.build_words.is_none());
+        assert!(!M5_26A428_STATUS_CONFIG.policy_derived);
+        let words = M5_26B123_POLICY.build_words.unwrap();
+        assert!(M5_26B123_STATUS_CONFIG.policy_derived);
+
+        let mut hw = KVec::from_elem(0u8, M5_HW_DATA_SIZE, GFP_KERNEL)?;
+        let mut policy = KVec::from_elem(0u8, M5_LAYOUT_26B123.policy_size(), GFP_KERNEL)?;
+        let mut status = KVec::from_elem(0xAAu8, M5_26B123_STATUS_CONFIG.size, GFP_KERNEL)?;
+
+        // Seed temperature-sensor channel masks and a distinctive link word + pointer at 0x784..0x790.
+        for i in 0..0x28usize {
+            policy[0x4bd4 + i] = (i as u8).wrapping_add(0x11);
+        }
+        put_u32(&mut policy, 0x48ec, 0x1234_5678);
+        let link_word = M5_26B123_STATUS_CONFIG.relocate(M5_STATUS_CONFIG_LINK_WORD).unwrap();
+        put_u32(&mut status, link_word, 1);
+        put_u64(&mut status, link_word + 4, 0xdead_beef_cafe_0000);
+
+        assert_eq!(
+            encode_m5_build_words(
+                words, &J775D, &M5_LAYOUT_26B123, &M5_26B123_STATUS_CONFIG,
+                0, &mut hw, &mut policy, &mut status,
+            ),
+            Err(InitdataError::InterfaceMismatch),
+        );
+        assert_eq!(
+            encode_m5_build_words(
+                words, &J775D, &M5_LAYOUT_26B123, &M5_26B123_STATUS_CONFIG,
+                129, &mut hw, &mut policy, &mut status,
+            ),
+            Err(InitdataError::InterfaceMismatch),
+        );
+
+        assert_eq!(
+            encode_m5_build_words(
+                words, &J775D, &M5_LAYOUT_26B123, &M5_26B123_STATUS_CONFIG,
+                80, &mut hw, &mut policy, &mut status,
+            ),
+            Ok(()),
+        );
+        assert_eq!(word_at(&hw, M5_HW_USC_COUNT), 80);
+        assert_eq!(word_at(&policy, 0x490c), 80);
+        assert_eq!(&policy[0x828c..0x828c + 0x28], &policy[0x4bd4..0x4bd4 + 0x28]);
+        assert_eq!(word_at(&policy, 0x82b4), 1);
+
+        // Status config cleared except mapped words and preserved link tail.
+        assert_eq!(word_at(&status, 0x000), 0);
+        assert_eq!(word_at(&status, 0x5f4), 0x1234_5678);
+        assert_eq!(word_at(&status, 0x5fc), 80);
+        assert_eq!(word_at(&status, 0x674), 900);
+        assert_eq!(word_at(&status, 0x6e4), m5_status_config_word(0x60c));
+        assert_eq!(word_at(&status, link_word), 1);
+        assert_eq!(
+            u64::from_le_bytes(status[link_word + 4..link_word + 12].try_into().unwrap()),
+            0xdead_beef_cafe_0000,
+        );
+        Ok(())
+    }
 }

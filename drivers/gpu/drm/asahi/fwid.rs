@@ -651,9 +651,13 @@ mod tests {
     #[test]
     fn m5_builds_name_their_layouts() {
         use crate::g17::fw::variant::{Firmware, M5Layouts};
-        for cfg in [&crate::hw::t6050::CONFIG, &crate::hw::t6050::CONFIG_MAX] {
+        for cfg in [
+            &crate::hw::t6050::CONFIG,
+            &crate::hw::t6050::CONFIG_MAX,
+            &crate::hw::t6050::CONFIG_ULTRA,
+        ] {
             let Firmware::Identified(builds) = cfg.firmware else {
-                panic!("the M5 Pro and Max must identify their loaded firmware");
+                panic!("the M5 Pro, Max and Ultra must identify their loaded firmware");
             };
             for (i, build) in builds.iter().enumerate() {
                 // 27.2 (26B123) moved the InitData layouts.
@@ -668,6 +672,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn m5_ultra_identifies_each_build() {
+        use crate::g17::fw::variant::{Firmware, M5Layouts};
+        let Firmware::Identified(builds) = crate::hw::t6050::CONFIG_ULTRA.firmware else {
+            panic!("the M5 Ultra must identify its loaded firmware");
+        };
+        t6050_admits_only(builds);
+        let b123 = builds
+            .iter()
+            .find(|build| build.os_version == [27, 2, 0])
+            .expect("the M5 Ultra must identify its 27.2 build");
+        let a428 = builds
+            .iter()
+            .find(|build| build.os_version == [27, 0, 0])
+            .expect("the M5 Ultra must identify its 27.0 build");
+        // Same TEXT and DATA sizes for both builds, so each is told apart by its digest and its
+        // own record offsets.
+        assert_ne!(b123.images[0].entropy, a428.images[0].entropy);
+        for (image, other) in [(&b123.images[0], a428.images), (&a428.images[0], b123.images)] {
+            assert!(lookup(other, image.text_size, image.data_size, |m| {
+                (m.entropy == image.entropy).then_some(image.text_sha256)
+            })
+            .is_none());
+            assert!(lookup(other, image.text_size, image.data_size, |_| {
+                Some(image.text_sha256)
+            })
+            .is_none());
+        }
+        // 27.2 runs the board on the 26B123 layouts, 27.0 on 26A428's; both as probed.
+        assert_eq!(b123.variant.m5_layouts, Some(M5Layouts::V26B123));
+        assert_eq!(a428.variant.m5_layouts, Some(M5Layouts::V26A428));
+        assert!(builds.iter().all(|build| build.config.is_none()));
     }
 
     fn t6050_admits_only(builds: &[crate::g17::fw::variant::Build]) {
