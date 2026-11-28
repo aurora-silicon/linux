@@ -5457,7 +5457,7 @@ static void gfx_v10_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 
 static int gfx_v10_0_init_csb(struct amdgpu_device *adev)
 {
-	adev->gfx.rlc.funcs->get_csb_buffer(adev, adev->gfx.rlc.cs_ptr);
+	amdgpu_gfx_rlc_setup_csb(adev);
 
 	/* csib */
 	if (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(10, 1, 2)) {
@@ -6858,9 +6858,16 @@ static int gfx_v10_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
 	struct amdgpu_device *adev = ring->adev;
 	struct v10_gfx_mqd *mqd = ring->mqd_ptr;
 	int mqd_idx = ring - &adev->gfx.gfx_ring[0];
+	bool np = adev->gfx.me.mqd_backup[mqd_idx] &&
+		  ring->mqd_obj->tbo.resource->bus.is_nonposted;
 
 	if (!reset && !amdgpu_in_reset(adev) && !adev->in_suspend) {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		if (np) {
+			ring->mqd_ptr = adev->gfx.me.mqd_backup[mqd_idx];
+			memset(ring->mqd_ptr, 0, sizeof(*mqd));
+		} else {
+			amdgpu_bo_memset(ring->mqd_obj, mqd, 0, sizeof(*mqd));
+		}
 		mutex_lock(&adev->srbm_mutex);
 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		amdgpu_ring_init_mqd(ring);
@@ -6875,8 +6882,16 @@ static int gfx_v10_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
 
 		nv_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
-		if (adev->gfx.me.mqd_backup[mqd_idx])
-			memcpy_fromio(adev->gfx.me.mqd_backup[mqd_idx], mqd, sizeof(*mqd));
+		if (np) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd, ring->mqd_ptr,
+					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+			ring->mqd_ptr = mqd;
+		} else if (adev->gfx.me.mqd_backup[mqd_idx]) {
+			amdgpu_bo_memcpy_from(ring->mqd_obj,
+					      adev->gfx.me.mqd_backup[mqd_idx],
+					      mqd, sizeof(*mqd));
+		}
 	} else {
 		mutex_lock(&adev->srbm_mutex);
 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
@@ -6886,8 +6901,13 @@ static int gfx_v10_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
 		nv_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 		/* restore mqd with the backup copy */
-		if (adev->gfx.me.mqd_backup[mqd_idx])
-			memcpy_toio(mqd, adev->gfx.me.mqd_backup[mqd_idx], sizeof(*mqd));
+		if (adev->gfx.me.mqd_backup[mqd_idx]) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
+					    adev->gfx.me.mqd_backup[mqd_idx],
+					    sizeof(*mqd));
+			if (np)
+				amdgpu_device_flush_hdp(adev, NULL);
+		}
 		/* reset the ring */
 		ring->wptr = 0;
 		atomic64_set((atomic64_t *)ring->wptr_cpu_addr, 0);
@@ -7148,13 +7168,20 @@ static int gfx_v10_0_kiq_init_queue(struct amdgpu_ring *ring)
 {
 	struct amdgpu_device *adev = ring->adev;
 	struct v10_compute_mqd *mqd = ring->mqd_ptr;
+	bool np = adev->gfx.kiq[0].mqd_backup &&
+		  ring->mqd_obj->tbo.resource->bus.is_nonposted;
 
 	gfx_v10_0_kiq_setting(ring);
 
 	if (amdgpu_in_reset(adev)) { /* for GPU_RESET case */
 		/* reset MQD to a clean status */
-		if (adev->gfx.kiq[0].mqd_backup)
-			memcpy_toio(mqd, adev->gfx.kiq[0].mqd_backup, sizeof(*mqd));
+		if (adev->gfx.kiq[0].mqd_backup) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
+					    adev->gfx.kiq[0].mqd_backup,
+					    sizeof(*mqd));
+			if (np)
+				amdgpu_device_flush_hdp(adev, NULL);
+		}
 
 		/* reset ring buffer */
 		ring->wptr = 0;
@@ -7162,22 +7189,40 @@ static int gfx_v10_0_kiq_init_queue(struct amdgpu_ring *ring)
 
 		mutex_lock(&adev->srbm_mutex);
 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
+		if (np)
+			ring->mqd_ptr = adev->gfx.kiq[0].mqd_backup;
 		gfx_v10_0_kiq_init_register(ring);
+		if (np)
+			ring->mqd_ptr = mqd;
 		nv_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 	} else {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		if (np) {
+			ring->mqd_ptr = adev->gfx.kiq[0].mqd_backup;
+			memset(ring->mqd_ptr, 0, sizeof(*mqd));
+		} else {
+			amdgpu_bo_memset(ring->mqd_obj, mqd, 0, sizeof(*mqd));
+		}
 		if (amdgpu_sriov_vf(adev) && adev->in_suspend)
 			amdgpu_ring_clear_ring(ring);
 		mutex_lock(&adev->srbm_mutex);
 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		amdgpu_ring_init_mqd(ring);
+		if (np) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd, ring->mqd_ptr,
+					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+		}
 		gfx_v10_0_kiq_init_register(ring);
+		if (np)
+			ring->mqd_ptr = mqd;
 		nv_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 
-		if (adev->gfx.kiq[0].mqd_backup)
-			memcpy_fromio(adev->gfx.kiq[0].mqd_backup, mqd, sizeof(*mqd));
+		if (!np && adev->gfx.kiq[0].mqd_backup)
+			amdgpu_bo_memcpy_from(ring->mqd_obj,
+					      adev->gfx.kiq[0].mqd_backup, mqd,
+					      sizeof(*mqd));
 	}
 
 	return 0;
@@ -7188,21 +7233,41 @@ static int gfx_v10_0_kcq_init_queue(struct amdgpu_ring *ring, bool restore)
 	struct amdgpu_device *adev = ring->adev;
 	struct v10_compute_mqd *mqd = ring->mqd_ptr;
 	int mqd_idx = ring - &adev->gfx.compute_ring[0];
+	bool np = adev->gfx.mec.mqd_backup[mqd_idx] &&
+		  ring->mqd_obj->tbo.resource->bus.is_nonposted;
 
 	if (!restore && !amdgpu_in_reset(adev) && !adev->in_suspend) {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		if (np) {
+			ring->mqd_ptr = adev->gfx.mec.mqd_backup[mqd_idx];
+			memset(ring->mqd_ptr, 0, sizeof(*mqd));
+		} else {
+			amdgpu_bo_memset(ring->mqd_obj, mqd, 0, sizeof(*mqd));
+		}
 		mutex_lock(&adev->srbm_mutex);
 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		amdgpu_ring_init_mqd(ring);
 		nv_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 
-		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy_fromio(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(*mqd));
+		if (np) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd, ring->mqd_ptr,
+					    sizeof(*mqd));
+			amdgpu_device_flush_hdp(adev, NULL);
+			ring->mqd_ptr = mqd;
+		} else if (adev->gfx.mec.mqd_backup[mqd_idx]) {
+			amdgpu_bo_memcpy_from(ring->mqd_obj,
+					      adev->gfx.mec.mqd_backup[mqd_idx],
+					      mqd, sizeof(*mqd));
+		}
 	} else {
 		/* restore MQD to a clean status */
-		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy_toio(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(*mqd));
+		if (adev->gfx.mec.mqd_backup[mqd_idx]) {
+			amdgpu_bo_memcpy_to(ring->mqd_obj, mqd,
+					    adev->gfx.mec.mqd_backup[mqd_idx],
+					    sizeof(*mqd));
+			if (np)
+				amdgpu_device_flush_hdp(adev, NULL);
+		}
 		/* reset ring buffer */
 		ring->wptr = 0;
 		atomic64_set((atomic64_t *)ring->wptr_cpu_addr, 0);

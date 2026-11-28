@@ -109,8 +109,13 @@ int amdgpu_gfx_rlc_init_sr(struct amdgpu_device *adev, u32 dws)
 	/* write the sr buffer */
 	src_ptr = adev->gfx.rlc.reg_list;
 	dst_ptr = adev->gfx.rlc.sr_ptr;
-	for (i = 0; i < adev->gfx.rlc.reg_list_size; i++)
-		dst_ptr[i] = cpu_to_le32(src_ptr[i]);
+	if (adev->gfx.rlc.save_restore_obj->tbo.resource->bus.is_nonposted) {
+		for (i = 0; i < adev->gfx.rlc.reg_list_size; i++)
+			writel(src_ptr[i], (void __iomem *)&dst_ptr[i]);
+	} else {
+		for (i = 0; i < adev->gfx.rlc.reg_list_size; i++)
+			dst_ptr[i] = cpu_to_le32(src_ptr[i]);
+	}
 	amdgpu_bo_kunmap(adev->gfx.rlc.save_restore_obj);
 	amdgpu_bo_unreserve(adev->gfx.rlc.save_restore_obj);
 
@@ -145,6 +150,28 @@ int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev)
 	}
 
 	return 0;
+}
+
+void amdgpu_gfx_rlc_setup_csb(struct amdgpu_device *adev)
+{
+	struct amdgpu_bo *bo = adev->gfx.rlc.clear_state_obj;
+	size_t size = adev->gfx.rlc.clear_state_size * sizeof(u32);
+	u32 *tmp;
+
+	if (!bo || !adev->gfx.rlc.cs_ptr)
+		return;
+
+	if (bo->tbo.resource->bus.is_nonposted) {
+		tmp = kvzalloc(size, GFP_KERNEL);
+		if (!tmp)
+			return;
+		adev->gfx.rlc.funcs->get_csb_buffer(adev, tmp);
+		amdgpu_bo_memcpy_to(bo, adev->gfx.rlc.cs_ptr, tmp, size);
+		kvfree(tmp);
+		return;
+	}
+
+	adev->gfx.rlc.funcs->get_csb_buffer(adev, adev->gfx.rlc.cs_ptr);
 }
 
 /**
@@ -241,9 +268,15 @@ void amdgpu_gfx_rlc_setup_cp_table(struct amdgpu_device *adev)
 			table_size = le32_to_cpu(hdr->jt_size);
 		}
 
-		for (i = 0; i < table_size; i++) {
-			dst_ptr[bo_offset + i] =
-				cpu_to_le32(le32_to_cpu(fw_data[table_offset + i]));
+		if (adev->gfx.rlc.cp_table_obj->tbo.resource->bus.is_nonposted) {
+			for (i = 0; i < table_size; i++)
+				writel(le32_to_cpu(fw_data[table_offset + i]),
+				       (void __iomem *)&dst_ptr[bo_offset + i]);
+		} else {
+			for (i = 0; i < table_size; i++) {
+				dst_ptr[bo_offset + i] =
+					cpu_to_le32(le32_to_cpu(fw_data[table_offset + i]));
+			}
 		}
 
 		bo_offset += table_size;

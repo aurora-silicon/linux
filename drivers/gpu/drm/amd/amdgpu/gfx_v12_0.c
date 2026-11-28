@@ -1940,7 +1940,7 @@ static void gfx_v12_0_enable_gui_idle_interrupt(struct amdgpu_device *adev,
 
 static int gfx_v12_0_init_csb(struct amdgpu_device *adev)
 {
-	adev->gfx.rlc.funcs->get_csb_buffer(adev, adev->gfx.rlc.cs_ptr);
+	amdgpu_gfx_rlc_setup_csb(adev);
 
 	WREG32_SOC15(GC, 0, regRLC_CSIB_ADDR_HI,
 			adev->gfx.rlc.clear_state_gpu_addr >> 32);

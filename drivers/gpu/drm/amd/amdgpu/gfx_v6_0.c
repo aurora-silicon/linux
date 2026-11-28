@@ -2502,12 +2502,28 @@ static int gfx_v6_0_rlc_init(struct amdgpu_device *adev)
 		}
 
 		/* set up the cs buffer */
-		dst_ptr = adev->gfx.rlc.cs_ptr;
+		if (adev->gfx.rlc.clear_state_obj->tbo.resource->bus.is_nonposted) {
+			dst_ptr = kvzalloc(dws * 4, GFP_KERNEL);
+			if (!dst_ptr) {
+				amdgpu_bo_kunmap(adev->gfx.rlc.clear_state_obj);
+				amdgpu_bo_unreserve(adev->gfx.rlc.clear_state_obj);
+				amdgpu_gfx_rlc_fini(adev);
+				return -ENOMEM;
+			}
+		} else {
+			dst_ptr = adev->gfx.rlc.cs_ptr;
+		}
 		reg_list_mc_addr = adev->gfx.rlc.clear_state_gpu_addr + 256;
 		dst_ptr[0] = cpu_to_le32(upper_32_bits(reg_list_mc_addr));
 		dst_ptr[1] = cpu_to_le32(lower_32_bits(reg_list_mc_addr));
 		dst_ptr[2] = cpu_to_le32(adev->gfx.rlc.clear_state_size);
 		gfx_v6_0_get_csb_buffer(adev, &dst_ptr[(256/4)]);
+		if (dst_ptr != adev->gfx.rlc.cs_ptr) {
+			amdgpu_bo_memcpy_to(adev->gfx.rlc.clear_state_obj,
+					    adev->gfx.rlc.cs_ptr,
+					    dst_ptr, dws * 4);
+			kvfree(dst_ptr);
+		}
 		amdgpu_bo_kunmap(adev->gfx.rlc.clear_state_obj);
 		amdgpu_bo_unreserve(adev->gfx.rlc.clear_state_obj);
 	}

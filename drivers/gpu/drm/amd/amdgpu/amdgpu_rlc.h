@@ -374,6 +374,7 @@ void amdgpu_gfx_rlc_enter_safe_mode(struct amdgpu_device *adev, int xcc_id);
 void amdgpu_gfx_rlc_exit_safe_mode(struct amdgpu_device *adev, int xcc_id);
 int amdgpu_gfx_rlc_init_sr(struct amdgpu_device *adev, u32 dws);
 int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev);
+void amdgpu_gfx_rlc_setup_csb(struct amdgpu_device *adev);
 int amdgpu_gfx_rlc_init_cpt(struct amdgpu_device *adev);
 void amdgpu_gfx_rlc_setup_cp_table(struct amdgpu_device *adev);
 void amdgpu_gfx_rlc_fini(struct amdgpu_device *adev);
