@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Native DMA implementation of the measured J813 Control/Alpha bootstrap.
- * Wire layout source: AppleCentauriCommon/scripts/alpha_wifi_scan.py v259.
- * Polling and bounded bootstrap rings are deliberate bring-up restrictions.
- */
+/* Apple N1 Control and Alpha ACIPC bootstrap and DMA resource management. */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>

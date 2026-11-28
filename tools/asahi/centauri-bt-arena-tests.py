@@ -56,7 +56,7 @@ struct cen_bt {
     struct hci_dev *hdev;
     void *arena, *bar;
     uintptr_t dma;
-    int lock, io_work, txq, acl_txq, le_txq;
+    int lock, io_work, txq, acl_txq, le_txq, sco_txq, iso_txq;
     unsigned int irq_count;
     bool irq_vectors, running, quiescing, host_quiesced;
     bool hci_registered, ipc_requested, asleep, sleep_registered;
@@ -312,6 +312,8 @@ struct pci_host_bridge { struct device dev; };
 #define DL_FLAG_AUTOREMOVE_CONSUMER 0
 #define HCI_PCI 1
 #define HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY 0
+#define HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED 1
+#define HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN 2
 #define INIT_WORK(work, fn) (*(work) = 0)
 #define SET_HCIDEV_DEV(hdev, dev) ((void)(hdev), (void)(dev))
 #define dev_err(...) ((void)0)
@@ -368,7 +370,9 @@ static struct hci_dev *hci_alloc_dev(void) { return &probe_hdev; }
 static int cen_hci_flush(struct hci_dev *dev) { (void)dev; return 0; }
 static int cen_hci_send(struct hci_dev *dev, struct sk_buff *skb) { (void)dev; (void)skb; return 0; }
 static int cen_hci_setup(struct hci_dev *dev) { (void)dev; return 0; }
+static int cen_hci_set_bdaddr(struct hci_dev *dev, const void *bdaddr) { (void)dev; (void)bdaddr; return 0; }
 static int cen_hci_post_init(struct hci_dev *dev) { (void)dev; return 0; }
+static void cen_hci_reset(struct hci_dev *dev) { (void)dev; }
 static int cen_hci_reset_dup_filter(struct hci_dev *dev) { (void)dev; return 0; }
 static void hci_set_quirk(struct hci_dev *dev, int quirk) { (void)dev; (void)quirk; }
 static void hci_set_drvdata(struct hci_dev *dev, void *data) { (void)dev; assert(data == active); }
@@ -417,7 +421,7 @@ def probe_stubs():
     stubs = stubs.replace('struct pci_dev { struct device dev; void *data; bool state_saved; };',
                          'struct pci_bus { int number; };\n'
                          'struct pci_dev { struct device dev; void *data; bool state_saved; struct pci_bus *bus; int devfn; };')
-    stubs = stubs.replace('struct hci_dev { int dummy; };', 'struct sk_buff;\nstruct hci_dev {\n    int bus;\n    int (*open)(struct hci_dev *), (*close)(struct hci_dev *);\n    int (*flush)(struct hci_dev *), (*setup)(struct hci_dev *);\n    int (*post_init)(struct hci_dev *), (*reset_dup_filter)(struct hci_dev *);\n    int (*send)(struct hci_dev *, struct sk_buff *);\n};')
+    stubs = stubs.replace('struct hci_dev { int dummy; };', 'struct sk_buff;\nstruct hci_dev {\n    int bus;\n    int (*open)(struct hci_dev *), (*close)(struct hci_dev *);\n    int (*flush)(struct hci_dev *), (*setup)(struct hci_dev *);\n    int (*set_bdaddr)(struct hci_dev *, const void *);\n    int (*post_init)(struct hci_dev *), (*reset_dup_filter)(struct hci_dev *);\n    void (*reset)(struct hci_dev *);\n    int (*send)(struct hci_dev *, struct sk_buff *);\n};')
     stubs = stubs.replace('static struct cen_bt *active;',
                          'static struct cen_bt *active;\nstatic bool probe_hci_registered;')
     stubs = stubs.replace('    unregisters++;',

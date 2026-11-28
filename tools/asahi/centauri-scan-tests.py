@@ -350,6 +350,8 @@ typedef uint32_t u32;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define SCAN_PASSIVE_DWELL_MS 110
+#define SCAN_LISTEN_MS 110
+#define SCAN_STATUS_INVALID_HANDLE 342
 #define msecs_to_jiffies(x) ((unsigned long)(x))
 #define time_before(a, b) ((long)((a) - (b)) < 0)
 #define time_after(a, b) time_before(b, a)
@@ -357,11 +359,11 @@ typedef uint32_t u32;
 #define min_t(type, x, y) ((type)(x) < (type)(y) ? (type)(x) : (type)(y))
 #define container_of(ptr, type, member) \
 	((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
-static void dev_warn(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
-static void dev_info(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
+static inline void put_unaligned_le16(u16 v, void *p) { memcpy(p, &v, 2); }
 static void dev_dbg(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
 
-static const u8 five_ghz[25] = { 0 };
+struct centauri_board { bool scan_tlvs; };
+static const struct centauri_board *centauri_board(void) { return NULL; }
 
 struct device { int dummy; };
 struct pci_dev { struct device dev; };
@@ -376,10 +378,16 @@ struct centauri_wifi {
 	struct cfg80211_scan_request *scan_request;
 	bool scan_abort;
 	int lock;
+	u8 scan_sequence;
 	u16 reply_status;
 	u32 channels_seen, scans_done, beacons_seen;
 	bool stopping, transport_paused;
 };
+static int run_scan_tlvs(struct centauri_wifi *w, struct cfg80211_scan_request *r)
+{
+	(void)w; (void)r;
+	return 0;
+}
 
 static unsigned long jiffies;
 static unsigned int scan_commands, stop_commands, sleep_calls, drains_seen;
@@ -398,11 +406,6 @@ static unsigned int recovery_requests;
 static void centauri_recovery_request(struct centauri *c, const char *why)
 {
 	(void)c; (void)why; recovery_requests++;
-}
-static size_t build_scan(struct centauri_wifi *w, unsigned int c, u8 *b)
-{
-	(void)w; (void)c; (void)b;
-	return 14;
 }
 static void cfg80211_scan_done(struct cfg80211_scan_request *r,
 			       struct cfg80211_scan_info *info)
@@ -557,22 +560,30 @@ typedef uint32_t u32;
 #define HCI_EVENT_PKT 4
 #define HCI_EV_CMD_STATUS 0x0f
 #define HCI_EV_CONN_COMPLETE 0x03
+#define HCI_EV_CONN_REQUEST 0x04
+#define HCI_EV_SYNC_CONN_COMPLETE 0x2c
 #define HCI_OP_CREATE_CONN 0x0405
 #define CEN_OP_CREATE_CONN 0xff7b
 #define ACL_LINK 1
+#define ESCO_LINK 2
 #define dma_rmb() ((void)0)
 #define dev_err(...) ((void)0)
 #define container_of(ptr, type, member) \
 	((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
 
 struct hci_ev_conn_complete { u8 dummy[11]; };
+struct hci_ev_conn_request { u8 dummy[10]; };
+struct hci_ev_sync_conn_complete { u8 dummy[17]; };
 struct cen_aux_spec { u16 id, slots, footer; bool receive; };
 static const struct cen_aux_spec cen_aux_specs[] = {
-	{ 2, 9, 2592, false }, { 8, 9, 2592, true },
+	{ 2, 9, 2592, false }, { 3, 9, 724, false }, { 5, 9, 260, false },
+	{ 8, 9, 2592, true },  { 9, 9, 724, true },  { 11, 9, 268, true },
 };
 struct cen_aux_state { u32 offset; u16 head, post; bool opened; };
 struct work_struct { int dummy; };
 struct sk_buff_head { unsigned int len; };
+#define HCI_EV_DISCONN_COMPLETE 0x05
+struct hci_ev_disconn_complete { u8 raw[4]; };
 struct sk_buff { u8 data[64]; u32 len; u8 pkt_type; };
 struct pci_dev { int dev; };
 struct hci_dev { struct { u32 byte_rx, err_rx; } stat; };
@@ -583,13 +594,14 @@ struct cen_bt {
 	u8 *arena;
 	int lock;
 	struct work_struct io_work;
-	struct sk_buff_head txq, acl_txq, le_txq;
-	u16 acl_tx_head, le_tx_head;
+	struct sk_buff_head txq, acl_txq, le_txq, sco_txq, iso_txq;
+	u16 acl_tx_head, le_tx_head, sco_tx_head, iso_tx_head;
 	u16 tx_head, rx_head, rx_post;
 	u16 le_rx_head, le_rx_post;
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
 	bool running, transport_paused;
 	bool connection_command_supported, connection_status_pending;
+	u16 sync_pending_wire, sync_pending_orig;
 };
 
 static u16 mock_tail[16];
@@ -611,6 +623,18 @@ static int cen_receive_acl(struct cen_bt *bt, const u8 *d, u32 l) { (void)bt; (v
 static void cen_le_rx_buffer(struct cen_bt *bt, u16 slot) { (void)bt; (void)slot; }
 static void cen_rx_buffer(struct cen_bt *bt, u16 slot) { (void)bt; (void)slot; }
 static void cen_fixup_scan_response(u8 *e, size_t l) { (void)e; (void)l; }
+static void cen_hrb_track_add(struct cen_bt *bt, u16 h, const u8 a[6]) { (void)bt; (void)h; (void)a; }
+static void cen_hrb_track_del(struct cen_bt *bt, u16 h) { (void)bt; (void)h; }
+static u8 cen_hrb_normalize_link_type(u8 ev_code, u8 link_type)
+{
+	if (link_type < 0xf0)
+		return link_type;
+	if (ev_code == HCI_EV_SYNC_CONN_COMPLETE)
+		return ESCO_LINK;
+	if (ev_code == HCI_EV_CONN_REQUEST && (link_type & 0xfe) != 0xf0)
+		return ESCO_LINK;
+	return ACL_LINK;
+}
 static struct sk_buff *bt_skb_alloc(u32 len, int flags)
 {
 	(void)flags;
@@ -746,6 +770,7 @@ def main():
             "scan_transport_stopped",
             "scan_wait_stop",
             "scan_stop_chunk",
+            "run_scan_legacy",
             "scan_worker",
         )
     )
