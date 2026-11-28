@@ -63,6 +63,8 @@ struct apple_dart {
 	u64 *locked_ttbr[2][4], *locked_owned[2][4];
 	struct apple_dart_fw_root *locked_fw[2][4];
 	struct apple_dart_fw_tree *locked_fw_tree[2];
+	phys_addr_t locked_phys[2][4];
+	struct io_pgtable_cfg *locked_cfg[2];
 	bool display_dark, display_tlb_stale;
 	DECLARE_BITMAP(display_tcr_four, 64);
 	int lock, locked_retire_err[2];

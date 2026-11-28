@@ -869,6 +869,8 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+/* No resume from disk in this control. */
+static bool dcp_hib_gated(const struct apple_dcp *d) { (void)d; return false; }
 /* The T8140 display power cycle has its own test on hardware; here it only has to be reached. */
 static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; }
 static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }

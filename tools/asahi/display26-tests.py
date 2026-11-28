@@ -97,7 +97,14 @@ int main(void) {
               '#define LATE_SYSTEM_SLEEP_PM_OPS(s, r) .suspend_late = (s), .resume_early = (r),\n')
         write(tmp, 'linux/suspend.h', '#include <stdbool.h>\n'
               'static inline bool pm_suspend_via_firmware(void) { return false; }\n'
-              'static inline bool pm_resume_via_firmware(void) { return false; }\n')
+              'static inline bool pm_resume_via_firmware(void) { return false; }\n'
+              '#define PM_POST_HIBERNATION 2\n#define PM_POST_RESTORE 6\n')
+        # The bridge restarts the PMP after a resume from disk; this harness only counts the notifier.
+        write(tmp, 'linux/notifier.h', '#pragma once\n#define NOTIFY_DONE 0\n'
+              'struct notifier_block { int (*notifier_call)(struct notifier_block *, unsigned long, void *); int priority; };\n'
+              'static int pm_notifiers;\n'
+              'static inline int register_pm_notifier(struct notifier_block *nb) { pm_notifiers++; return 0; }\n'
+              'static inline int unregister_pm_notifier(struct notifier_block *nb) { pm_notifiers--; return 0; }\n')
         # The bridge's sleep-commit stop: MMIO, RTKit and the sleep driver, reached only in a suspend.
         write(tmp, 'linux/io.h', '#include "mock.h"\n'
               'static inline u32 readl_relaxed(const volatile void __iomem *a) { assert(!"no system sleep here"); return 0; }\n'
@@ -170,13 +177,14 @@ void apple_pmp_report_wake(struct device*d,bool real){assert(!"no system sleep h
 int apple_pmp_sleep(const void*data){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_sleep_prepare(const void*data,struct apple_pmp_commit_stop*stop){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_wake(const void*data){assert(!"no system sleep here");return -EIO;}
+int apple_pmp_restore(const void*data){assert(!"no resume from disk here");return -EIO;}
 int main(void){
  struct device_node n={1},wrong={2}; struct device supplier={&n,true,0},consumer={NULL,false,0}; int data;
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  assert(apple_pmp_link_device(&consumer)==-EINVAL);
  phandle=&n;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);
  assert(apple_pmp_register(&supplier,&data)==0);
- assert(apple_pmp_register(&supplier,&data)==-EBUSY);
+ assert(apple_pmp_register(&supplier,&data)==-EBUSY);assert(pm_notifiers==1);
  supplier.bound=false;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);supplier.bound=true;
  phandle=&wrong;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);phandle=&n;
  link_fail=true;assert(apple_pmp_link_device(&consumer)==-EINVAL);assert(supplier.refs==0);link_fail=false;
@@ -192,7 +200,7 @@ int main(void){
  assert(apple_pmp_set_device_power(0xf,5,1)==0);assert(calls==3);
  assert(apple_pmp_set_device_power(0xe,5,0)==0);assert(calls==4);
  apple_pmp_unregister(&wrong);assert(pmp_data==&data);
- apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);
+ apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);assert(pm_notifiers==0);
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  puts("production PMP bridge supplier/ready/ack controls: PASS");
 }
