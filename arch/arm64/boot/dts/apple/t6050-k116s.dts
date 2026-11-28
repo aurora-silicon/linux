@@ -45,31 +45,6 @@
 };
 
 /*
- * SMC sensors, as on J714s: every readable float T* key is discovered through
- * apple,discover-temperatures in t6050-die0.dtsi, so the shared temperature
- * nodes and apple,soc-die-keys go. The T6050 SMC spells the fan mode keys
- * F0md/F1md and drives the fans itself.
- */
-#include "hwmon-common.dtsi"
-#include "hwmon-fan-dual.dtsi"
-#include "hwmon-laptop.dtsi"
-
-&smc_hwmon {
-	status = "okay";
-	/delete-property/ apple,soc-die-keys;
-	/delete-node/ temperature-TH0x;
-	/delete-node/ temperature-TB0T;
-	/delete-node/ temperature-TCHP;
-	/delete-node/ temperature-TW0P;
-	fan-F0Ac {
-		apple,fan-mode = "F0md";
-	};
-	fan-F1Ac {
-		apple,fan-mode = "F1md";
-	};
-};
-
-/*
  * The trackpad's AFE reset. The ADT names the SMC pcIO template (0x10000,
  * 0x11c0000), the same line as SMC GPIO gp1c, active low, which gpio-macsmc
  * drives; through the pcIO outputs the multi-touch interface never comes up.
