@@ -161,6 +161,19 @@ static void save_dma(const char *dir,const char *name) {
  for(unsigned int i=0;i<dma_count;i++)fprintf(out,"%u %u %u %llu\n",offset_words[i],dma_sites[i].shift,dma_sites[i].width,(unsigned long long)dma_sites[i].addr);
  fclose(out);
 }
+static void assert_seg_map(const struct avd_frame *frame, dma_addr_t address)
+{
+ const u32 *words = frame->prog->cpu;
+ u32 encoded = (u32)(address >> 8);
+ unsigned int matches = 0;
+
+ /* The fixture uses the LSR instruction format. */
+ assert(frame->ctx->dev->variant->quirks & AVD_QUIRK_LSR);
+ for (size_t i = 0; i < frame->prog_words; i++)
+  if (words[i] == encoded)
+   matches++;
+ assert(matches == 2);
+}
 int main(int argc,char **argv) {
  assert(argc==2);
  struct avd_variant variant={.revision=4,.quirks=AVD_QUIRK_LSR,.fifo_slots=15,.vp_slots={4,4,1,0}};
@@ -258,40 +271,70 @@ int main(int argc,char **argv) {
   for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
   assert(scale);}
  reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
- /* Only a frame size change clears the segmentation state in the seg buffers: each bank's
-  * when it is next taken (a busy one belongs to the hardware), and VP9_SEG_RESET goes to the
-  * first frame that uses segmentation after the change. */
- for(unsigned int i=0;i<p->nbanks;i++)memset(p->bank[i].bufs.seg.cpu,0xa5,p->bank[i].bufs.seg.size);
- /* Frame A writes a map, so no reset is owed from the earlier size changes. */
- params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
- current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
- assert(p->b==&p->bank[0]&&((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5&&!p->seg_reset);
- /* Bank 0 stays busy; the next frame is smaller and has no segmentation. */
- params.seg.flags=0;params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
- current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
- assert(p->b==&p->bank[1]&&p->seg_reset&&p->bank[0].seg_clear&&!p->bank[1].seg_clear);
- {u8 *seg=p->bank[1].bufs.seg.cpu;for(size_t j=0;j<p->bank[1].bufs.seg.size;j++)assert(!seg[j]);}
- assert(((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5);
- avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
- avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
- /* Same size again, segmentation on without a map update: the reset is still owed, and it stays
-  * owed after that frame, as the decoder would read the old map again. */
- params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED;current_dst=&dst[0].base.vb;
- {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
-  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
- frame.idx=0;assert(!avd_vp9_run(&ctx));
- assert(p->b==&p->bank[0]&&!p->bank[0].seg_clear&&p->seg_reset);
- {u8 *seg=p->bank[0].bufs.seg.cpu;for(size_t j=0;j<p->bank[0].bufs.seg.size;j++)assert(!seg[j]);}
- avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
- /* The next frame updates the map: it still gets the reset, and after it the reset is gone. */
- params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
- current_dst=&dst[1].base.vb;
- {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
-  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
- frame.idx=1;assert(!avd_vp9_run(&ctx));assert(!p->seg_reset);
- {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
-  assert(!(make_flags1(&ctx,&r)&VP9_SEG_RESET(1)));}
- avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* Both picture banks use the one current stream map at a stable size. */
+ unsigned int initial_seg = p->seg_cur;
+ struct avd_buf *old_seg = &p->seg_buf[initial_seg];
+ struct avd_buf *new_seg = &p->seg_buf[initial_seg ^ 1];
+ memset(old_seg->cpu, 0xa5, old_seg->size);
+ memset(new_seg->cpu, 0x5a, new_seg->size);
+
+ /* Frame A writes a map, clearing the outstanding reset. */
+ params.seg.flags = V4L2_VP9_SEGMENTATION_FLAG_ENABLED |
+                    V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst = &dst[0].base.vb;
+ frame.idx = 0;
+ assert(!avd_vp9_run(&ctx));
+ assert(p->b == &p->bank[0] && p->seg_cur == initial_seg && !p->seg_reset);
+ assert_seg_map(&frame, old_seg->addr);
+
+ /* A same-size frame on bank 1 reuses the map while bank 0 is still busy. */
+ params.seg.flags = V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
+ current_dst = &dst[1].base.vb;
+ frame.idx = 1;
+ assert(!avd_vp9_run(&ctx));
+ assert(p->b == &p->bank[1] && p->bank[0].busy && p->seg_cur == initial_seg);
+ assert_seg_map(&frame, old_seg->addr);
+ avd_vp9_done(&ctx, &src, &dst[1].base.vb, VB2_BUF_STATE_DONE);
+
+ /* Changing size picks and clears the spare map without altering A's map. */
+ params.seg.flags = 0;
+ params.frame_width_minus_1 = 1899;
+ params.frame_height_minus_1 = 1079;
+ assert(!avd_vp9_run(&ctx));
+ assert(p->b == &p->bank[1] && p->bank[0].busy && p->seg_reset);
+ assert(p->seg_cur == (initial_seg ^ 1));
+ assert_seg_map(&frame, new_seg->addr);
+ for (size_t j = 0; j < old_seg->size; j++)
+  assert(((u8 *)old_seg->cpu)[j] == 0xa5);
+ for (size_t j = 0; j < new_seg->size; j++)
+  assert(!((u8 *)new_seg->cpu)[j]);
+ avd_vp9_done(&ctx, &src, &dst[0].base.vb, VB2_BUF_STATE_DONE);
+ avd_vp9_done(&ctx, &src, &dst[1].base.vb, VB2_BUF_STATE_DONE);
+
+ /* A frame that keeps the new map still carries the reset and leaves it owed. */
+ params.seg.flags = V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
+ current_dst = &dst[0].base.vb;
+ struct avd_vp9_run keep = {.decode_params = &params};
+ keep.base.bufs.dst = current_dst;
+ assert(make_flags1(&ctx, &keep) & VP9_SEG_RESET(1));
+ frame.idx = 0;
+ assert(!avd_vp9_run(&ctx));
+ assert(p->b == &p->bank[0] && p->seg_cur == (initial_seg ^ 1) && p->seg_reset);
+ assert_seg_map(&frame, new_seg->addr);
+ avd_vp9_done(&ctx, &src, &dst[0].base.vb, VB2_BUF_STATE_DONE);
+
+ /* An update at the same size carries the last reset and clears the debt. */
+ params.seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst = &dst[1].base.vb;
+ keep.base.bufs.dst = current_dst;
+ assert(make_flags1(&ctx, &keep) & VP9_SEG_RESET(1));
+ frame.idx = 1;
+ assert(!avd_vp9_run(&ctx));
+ assert(p->seg_cur == (initial_seg ^ 1) && !p->seg_reset);
+ assert_seg_map(&frame, new_seg->addr);
+ assert(!(make_flags1(&ctx, &keep) & VP9_SEG_RESET(1)));
+ avd_vp9_done(&ctx, &src, &dst[1].base.vb, VB2_BUF_STATE_DONE);
+ params.seg.flags = 0;
  /* The firmware transport still needs the format's size: smaller and larger frames are refused. */
  params.frame_width_minus_1=959;params.frame_height_minus_1=539;
  current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
