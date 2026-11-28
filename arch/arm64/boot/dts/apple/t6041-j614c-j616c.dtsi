@@ -183,10 +183,14 @@
 		 *   per P cluster and 2 W for E.
 		 * - Hot at 120 C only reports; critical is the sochot level, after
 		 *   three samples.
+		 * - Below switch-on, the 21 backstop zones poll every 5 s so
+		 *   thermal_core coalesces their timers (round_jiffies_relative()
+		 *   only applies above 1 s); passive polling stays at 1 s once a
+		 *   zone reaches switch-on.
 		 */
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <48000>;
@@ -260,7 +264,7 @@
 
 		cpu-e0-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <2000>;
@@ -306,7 +310,7 @@
 
 		cpu-e1-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <2000>;
@@ -352,7 +356,7 @@
 
 		cpu-e2-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <2000>;
@@ -398,7 +402,7 @@
 
 		cpu-e3-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <2000>;
@@ -444,7 +448,7 @@
 
 		cpu-p00-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -492,7 +496,7 @@
 
 		cpu-p01-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -540,7 +544,7 @@
 
 		cpu-p02-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -588,7 +592,7 @@
 
 		cpu-p03-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -636,7 +640,7 @@
 
 		cpu-p04-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -684,7 +688,7 @@
 
 		cpu-p05-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -732,7 +736,7 @@
 
 		cpu-p10-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -780,7 +784,7 @@
 
 		cpu-p11-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -828,7 +832,7 @@
 
 		cpu-p12-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -876,7 +880,7 @@
 
 		cpu-p13-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -924,7 +928,7 @@
 
 		cpu-p14-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -972,7 +976,7 @@
 
 		cpu-p15-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			integral-time-constant-ms = <20000>;
 			critical-samples = <3>;
 			sustainable-power = <24000>;
@@ -1027,7 +1031,7 @@
 		 */
 		gpu0-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			critical-samples = <3>;
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg05 */
 
@@ -1087,7 +1091,7 @@
 
 		gpu1-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			critical-samples = <3>;
 			thermal-sensors = <&smc_hwmon 39>;	/* Tg1V */
 
@@ -1147,7 +1151,7 @@
 
 		gpu2-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			critical-samples = <3>;
 			thermal-sensors = <&smc_hwmon 46>;	/* Tg2Q */
 
@@ -1207,7 +1211,7 @@
 
 		gpu3-thermal {
 			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay = <5000>;
 			critical-samples = <3>;
 			thermal-sensors = <&smc_hwmon 54>;	/* Tg3q */
 
