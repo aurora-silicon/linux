@@ -288,7 +288,7 @@
 #define T6050_TOUCHID_FIRMWARE	"apple/mesacal-j716c.bin", "apple/msrk-j716c.bin"
 #include "t6050-touchid.dtsi"
 
-#include "t6050-j716c-isp.dtsi"
+#include "t6050-isp.dtsi"
 #include "t6050-j716c-gpu-panel.dtsi"
 
 #include "t6050-j716c-display.dtsi"
