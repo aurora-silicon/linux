@@ -18,6 +18,8 @@
 			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
 			<&pmc_soc_max>;
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+	iommus = <&ave0_dart0 0>, <&ave0_dart0 12>,
+		 <&ave0_dart1 0>, <&ave0_dart1 12>;
 };
 
 /* The loader supplies the ANE firmware and reservations. */
@@ -831,8 +833,10 @@
 /*
  * The second video encoder (ADT ave1, soc-id t6041), unique to the M4 Max.
  * Its six PMGR power states (VENC1_SYS through VENC1_ME1) live in pmgr_aux
- * (0x5028002a0..0x5028002c8). All nodes stay disabled until a bootloader
- * handoff preloads and qualifies ave1's firmware.
+ * (0x5028002a0..0x5028002c8), and it shares the VENC1-SOC-VMAX performance
+ * vote (pmc_soc_max) like ave0. It has no board wiring, so it is enabled on
+ * every M4 Max board; the boot loader reserves its preloaded firmware, sets
+ * up dart-ave1's DAPF filter, and disables it if absent from the ADT.
  */
 &pmgr_aux {
 	ps_venc1_sys: power-controller@2a0 {
@@ -842,7 +846,7 @@
 		#reset-cells = <0>;
 		label = "venc1_sys";
 		power-domains = <&ps_fab0_soc>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_venc1_dma: power-controller@2a8 {
@@ -852,7 +856,7 @@
 		#reset-cells = <0>;
 		label = "venc1_dma";
 		power-domains = <&ps_venc1_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_venc1_pipe4: power-controller@2b0 {
@@ -862,7 +866,7 @@
 		#reset-cells = <0>;
 		label = "venc1_pipe4";
 		power-domains = <&ps_venc1_dma>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_venc1_pipe5: power-controller@2b8 {
@@ -872,7 +876,7 @@
 		#reset-cells = <0>;
 		label = "venc1_pipe5";
 		power-domains = <&ps_venc1_dma>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_venc1_me0: power-controller@2c0 {
@@ -882,7 +886,7 @@
 		#reset-cells = <0>;
 		label = "venc1_me0";
 		power-domains = <&ps_venc1_dma>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_venc1_me1: power-controller@2c8 {
@@ -892,7 +896,7 @@
 		#reset-cells = <0>;
 		label = "venc1_me1";
 		power-domains = <&ps_venc1_me0>;
-		status = "disabled";
+		status = "okay";
 	};
 };
 
@@ -905,7 +909,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave1_dart0: iommu@2850a0000 {
@@ -916,7 +920,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1473 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave1: video-codec@285100000 {
@@ -932,10 +936,12 @@
 			     <AIC_IRQ 1472 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1471 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>,
-				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
-		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
-		iommus = <&ave1_dart0 0>, <&ave1_dart1 0>;
-		status = "disabled";
+				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>,
+				<&pmc_soc_max>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+		iommus = <&ave1_dart0 0>, <&ave1_dart0 12>,
+			 <&ave1_dart1 0>, <&ave1_dart1 12>;
+		status = "okay";
 	};
 };
 
@@ -998,8 +1004,7 @@
  * The first video encoder (ADT ave0, soc-id t6040), its DARTs and its power
  * domains. It has no board wiring, so it is enabled on every M4 Max board.
  * iBoot preloads its firmware; the driver refuses a firmware layout it does
- * not know at probe. The second encoder (ave1, soc-id t6041) is not
- * described.
+ * not know at probe.
  */
 &ps_venc0_sys {
 	status = "okay";
@@ -1040,10 +1045,15 @@
 #include "t6041-pmgr.dtsi"
 #include "t6041-sleep-pmgr.dtsi"
 
-/* The loader uses this alias to enable SIO after placing its firmware. */
+/*
+ * The loader uses these aliases to enable SIO after placing its firmware
+ * and to program the encoder DAPF filters (dart-ave0, dart-ave1).
+ */
 / {
 	aliases {
 		sio = &sio;
+		ave = &ave;
+		ave1 = &ave1;
 	};
 };
 
