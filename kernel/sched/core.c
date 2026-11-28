@@ -1590,6 +1590,17 @@ static unsigned int __maybe_unused sysctl_sched_uclamp_util_max = SCHED_CAPACITY
  */
 unsigned int sysctl_sched_uclamp_util_min_rt_default = SCHED_CAPACITY_SCALE;
 
+/*
+ * On asymmetric CPU capacity systems, cap SCHED_IDLE tasks (both uclamp.min
+ * and uclamp.max) at the smallest active asymmetric CPU's capacity so EAS
+ * keeps them on efficiency cores and schedutil keeps bigger clusters' clocks
+ * down when they spill over.  The cap wins over task and group requests.
+ * Enabled by default (1); set to 0 to opt out.  Symmetric systems are
+ * unaffected.
+ */
+static int sysctl_sched_uclamp_util_background = 1;
+static unsigned int uclamp_background_cap = SCHED_CAPACITY_SCALE;
+
 /* All clamps are required to be less or equal than these values */
 static struct uclamp_se uclamp_default[UCLAMP_CNT];
 
@@ -1744,7 +1755,17 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 
 	/* System default restrictions always apply */
 	if (unlikely(uc_req.value > uc_max.value))
-		return uc_max;
+		uc_req = uc_max;
+
+	if (sched_asym_cpucap_active() &&
+	    unlikely(p->policy == SCHED_IDLE) &&
+	    !rt_or_dl_task(p) &&
+	    READ_ONCE(sysctl_sched_uclamp_util_background)) {
+		unsigned int bg = READ_ONCE(uclamp_background_cap);
+
+		if (uc_req.value > bg)
+			uclamp_se_set(&uc_req, bg, false);
+	}
 
 	return uc_req;
 }
@@ -2041,6 +2062,16 @@ uclamp_update_active_tasks(struct cgroup_subsys_state *css)
 static void cpu_util_update_eff(struct cgroup_subsys_state *css);
 #endif
 
+void uclamp_update_background_cap(unsigned int cap)
+{
+	lockdep_assert_held(&sched_domains_mutex);
+
+	WRITE_ONCE(uclamp_background_cap, cap);
+	if (cap < SCHED_CAPACITY_SCALE &&
+	    READ_ONCE(sysctl_sched_uclamp_util_background))
+		sched_uclamp_enable_cpuslocked();
+}
+
 #ifdef CONFIG_SYSCTL
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static void uclamp_update_root_tg(void)
@@ -2145,6 +2176,43 @@ undo:
 	sysctl_sched_uclamp_util_max = old_max;
 	sysctl_sched_uclamp_util_min_rt_default = old_min_rt;
 	return result;
+}
+
+static int sysctl_sched_uclamp_background_handler(const struct ctl_table *table,
+						  int write, void *buffer,
+						  size_t *lenp, loff_t *ppos)
+{
+	int val = READ_ONCE(sysctl_sched_uclamp_util_background);
+	const struct ctl_table t = {
+		.procname	= table->procname,
+		.data		= &val,
+		.maxlen		= sizeof(val),
+		.extra1		= table->extra1,
+		.extra2		= table->extra2,
+	};
+	int result;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	result = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+	if (result || !write)
+		return result;
+
+	/*
+	 * Tasks pick up the new setting at their next enqueue; a CPU-bound
+	 * task that never sleeps keeps its previous effective clamp until then.
+	 */
+	cpus_read_lock();
+	sched_domains_mutex_lock();
+	WRITE_ONCE(sysctl_sched_uclamp_util_background, val);
+	if (val && sched_asym_cpucap_active() &&
+	    uclamp_background_cap < SCHED_CAPACITY_SCALE)
+		sched_uclamp_enable_cpuslocked();
+	sched_domains_mutex_unlock();
+	cpus_read_unlock();
+
+	return 0;
 }
 #endif /* CONFIG_SYSCTL */
 
@@ -4666,6 +4734,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.sum_exec_runtime		= 0;
 	p->misfit_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
+	p->se.prev_sleep_sum_runtime	= 0;
+	p->se.burst_avg			= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
 	p->se.vlag			= 0;
@@ -4873,6 +4943,15 @@ static const struct ctl_table sched_core_sysctls[] = {
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
 		.proc_handler   = sysctl_sched_uclamp_handler,
+	},
+	{
+		.procname       = "sched_util_clamp_background",
+		.data           = NULL,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = sysctl_sched_uclamp_background_handler,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = SYSCTL_ONE,
 	},
 #endif /* CONFIG_UCLAMP_TASK */
 #ifdef CONFIG_NUMA_BALANCING

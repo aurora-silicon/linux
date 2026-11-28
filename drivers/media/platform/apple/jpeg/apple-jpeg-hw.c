@@ -649,10 +649,62 @@ int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_defaults);
 
 /*
- * The T6050 sequence, in AppleJPEGDriver's order (per the macOS register
- * trace). Unlike the earlier revisions it has no plane size or pipe limit
- * registers, takes 16-bit quantisation tables and two-bit Huffman table
- * selectors, and needs 0x08c, 0x334 and IO flag bit 7. Only 4:2:0 is known.
+ * T6050 per-subsampling programming. The engine reads the input in MCUs:
+ * each plane's tile is its share of one MCU, in 8-byte columns and rows
+ * (plane 1 holds interleaved CbCr, so a 4:4:4 chroma tile is twice as wide
+ * as the luma one). The IO flags take the JPEG's own subsampling code,
+ * which sets the frame header's sampling factors.
+ *
+ * Every entry was checked on the J815 (T8142): the engine's JPEG decodes
+ * with the expected sampling factors at 640x480, 642x482, 1366x766 and
+ * 1920x1080, 42.8-47.5 dB PSNR against the source frame.
+ */
+struct aj_t6050_mode {
+	u8 codec;
+	u8 px_mode;
+	u8 io;
+	u8 mcu_w, mcu_h;
+	u8 tile0_w, tile0_h;
+	u8 tile1_w, tile1_h;	/* 0: no plane 1 */
+	u8 enc_ctrl;
+};
+
+static const struct aj_t6050_mode aj_t6050_modes[] = {
+	[AJ_SUBSAMPLING_420] = {
+		.codec = AJ_CODEC_420, .px_mode = AJ_CODEC_420, .io = AJ_IO_FLAGS_420,
+		.mcu_w = 16, .mcu_h = 16, .tile0_w = 2, .tile0_h = 16, .tile1_w = 2, .tile1_h = 8,
+		.enc_ctrl = AJ_T6050_ENC_CTRL_ENCODE,
+	},
+	[AJ_SUBSAMPLING_422] = {
+		.codec = AJ_CODEC_422, .px_mode = AJ_CODEC_422, .io = AJ_IO_FLAGS_422,
+		.mcu_w = 16, .mcu_h = 8, .tile0_w = 2, .tile0_h = 8, .tile1_w = 2, .tile1_h = 8,
+		.enc_ctrl = AJ_T6050_ENC_CTRL_ENCODE,
+	},
+	[AJ_SUBSAMPLING_444] = {
+		.codec = AJ_CODEC_444, .px_mode = AJ_CODEC_444, .io = AJ_IO_FLAGS_444,
+		.mcu_w = 8, .mcu_h = 8, .tile0_w = 1, .tile0_h = 8, .tile1_w = 2, .tile1_h = 8,
+		.enc_ctrl = AJ_T6050_ENC_CTRL_ENCODE,
+	},
+	[AJ_SUBSAMPLING_GREY] = {
+		.codec = AJ_CODEC_GREY, .px_mode = AJ_CODEC_GREY, .io = AJ_IO_FLAGS_GREY,
+		.mcu_w = 8, .mcu_h = 8, .tile0_w = 1, .tile0_h = 8,
+		.enc_ctrl = AJ_T6050_ENC_CTRL_ENCODE,
+	},
+};
+
+bool apple_jpeg_has_subsampling(const struct apple_jpeg_reg_layout *layout,
+				enum apple_jpeg_subsampling s)
+{
+	if (!layout->t6050_job)
+		return s <= AJ_SUBSAMPLING_422;
+	return s < ARRAY_SIZE(aj_t6050_modes);
+}
+EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_has_subsampling);
+
+/*
+ * The T6050 job. Unlike the earlier revisions it has no plane size or pipe
+ * limit registers, takes 16-bit quantisation tables and two-bit Huffman
+ * table selectors, and needs 0x08c, 0x334 and IO flag bit 7.
  */
 static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout *layout,
 			  const struct apple_jpeg_job *job, u64 output_end)
@@ -669,10 +721,12 @@ static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout 
 		job->luma, job->chroma, job->input_end, job->output, job->output, output_end,
 	};
 	u32 width = job->width, height = job->height;
+	const struct aj_t6050_mode *m;
 	u8 q[2][64];
 
-	if (job->is422)
-		return -EOPNOTSUPP;
+	if (job->subsampling >= ARRAY_SIZE(aj_t6050_modes))
+		return -EINVAL;
+	m = &aj_t6050_modes[job->subsampling];
 
 	aj_put(l, AJ_MODE, AJ_MODE_SETUP);
 	aj_put(l, AJ_MAIN_RUN, 0);
@@ -682,19 +736,21 @@ static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout 
 	aj_put(l, AJ_ENCODE_ENABLE, 1);
 	aj_put(l, AJ_CODEC_MODE, 1);
 	aj_put(l, AJ_DECODE_ENABLE, 0);
-	aj_put(l, AJ_CODEC, AJ_CODEC_420);
+	aj_put(l, AJ_CODEC, m->codec);
 	aj_put(l, layout->image_width, width);
 	aj_put(l, layout->image_height, height);
-	aj_put(l, AJ_T6050_PX_MODE, AJ_CODEC_420);
-	aj_put(l, AJ_PX_USE_PLANE1, 1);
+	aj_put(l, AJ_T6050_PX_MODE, m->px_mode);
+	aj_put(l, AJ_PX_USE_PLANE1, !!m->tile1_w);
 	aj_put(l, layout->timeout, apple_jpeg_timeout(width, height));
-	aj_put(l, AJ_PX_MCUS_W, DIV_ROUND_UP(width, 16));
-	aj_put(l, AJ_PX_MCUS_H, DIV_ROUND_UP(height, 16));
-	aj_put(l, AJ_PX_PLANE0_TILE_H, 2);
-	aj_put(l, AJ_PX_PLANE0_TILE_V, 16);
-	aj_put(l, AJ_PX_PLANE1_TILE_H, 2);
-	aj_put(l, AJ_PX_PLANE1_TILE_V, 8);
-	aj_put(l, AJ_T6050_ENC_CTRL, AJ_T6050_ENC_CTRL_ENCODE);
+	aj_put(l, AJ_PX_MCUS_W, DIV_ROUND_UP(width, m->mcu_w));
+	aj_put(l, AJ_PX_MCUS_H, DIV_ROUND_UP(height, m->mcu_h));
+	aj_put(l, AJ_PX_PLANE0_TILE_H, m->tile0_w);
+	aj_put(l, AJ_PX_PLANE0_TILE_V, m->tile0_h);
+	if (m->tile1_w) {
+		aj_put(l, AJ_PX_PLANE1_TILE_H, m->tile1_w);
+		aj_put(l, AJ_PX_PLANE1_TILE_V, m->tile1_h);
+	}
+	aj_put(l, AJ_T6050_ENC_CTRL, m->enc_ctrl);
 
 	/* Two planes, Y then interleaved Cb, Cr. */
 	aj_put(l, layout->encode_format, AJ_PIXEL_FORMAT_YUV_PLANES);
@@ -714,7 +770,7 @@ static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout 
 	aj_put(l, AJ_T6050_PRE_ENCODE, 0);
 
 	aj_put(l, AJ_MODE, AJ_MODE_ENCODE);
-	aj_put(l, AJ_JPEG_IO_FLAGS, AJ_IO_FLAGS_T6050 | AJ_IO_FLAGS_ORDER | AJ_IO_FLAGS_420);
+	aj_put(l, AJ_JPEG_IO_FLAGS, AJ_IO_FLAGS_T6050 | AJ_IO_FLAGS_ORDER | m->io);
 	aj_put(l, AJ_JPEG_WIDTH, width);
 	aj_put(l, AJ_JPEG_HEIGHT, height);
 	aj_put(l, AJ_RST_INTERVAL, job->restart_interval);
@@ -733,16 +789,19 @@ static int aj_build_t6050(struct aj_list *l, const struct apple_jpeg_reg_layout 
 }
 
 /*
- * Every register write of one baseline encode of two-plane (NV12 or NV16)
- * full-range input, in order, ending with the start command.
+ * Every register write of one baseline encode of full-range input (NV12 or
+ * NV16; with the T6050 job layout also NV24 and GREY), in order, ending with
+ * the start command.
  */
 int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 			 const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
 			 unsigned int max)
 {
 	u32 width = job->width, height = job->height;
-	u32 mcu_h = job->is422 ? 8 : 16;
-	u32 crows = job->is422 ? height : DIV_ROUND_UP(height, 2);
+	bool is422 = job->subsampling == AJ_SUBSAMPLING_422;
+	u32 mcu_h = apple_jpeg_mcu_rows(job->subsampling);
+	u32 crows = is422 ? height : DIV_ROUND_UP(height, 2);
+	u32 min_cstride;
 	struct aj_list l = { .w = w, .max = max };
 	u8 luma[64], chroma[64];
 	u64 output_end, addr_mask = DMA_BIT_MASK(layout->dma_addr_bits);
@@ -750,7 +809,21 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 
 	if (!width || !height || width > U16_MAX || height > U16_MAX)
 		return -EINVAL;
-	if (job->luma_stride < width || job->chroma_stride < ALIGN(width, 2))
+	if (!apple_jpeg_has_subsampling(layout, job->subsampling) ||
+	    job->subsampling > AJ_SUBSAMPLING_GREY)
+		return -EOPNOTSUPP;
+	switch (job->subsampling) {
+	case AJ_SUBSAMPLING_444:
+		min_cstride = 2 * width;
+		break;
+	case AJ_SUBSAMPLING_GREY:
+		min_cstride = 0;
+		break;
+	default:
+		min_cstride = ALIGN(width, 2);
+		break;
+	}
+	if (job->luma_stride < width || job->chroma_stride < min_cstride)
 		return -EINVAL;
 	if ((job->luma | job->chroma) & 3 || job->output & 31 || !job->output_size)
 		return -EINVAL;
@@ -779,7 +852,7 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 	aj_put(&l, AJ_ENCODE_ENABLE, 1);
 	aj_put(&l, AJ_CODEC_MODE, 1);
 	aj_put(&l, AJ_DECODE_ENABLE, 0);
-	aj_put(&l, AJ_CODEC, job->is422 ? AJ_CODEC_422 : AJ_CODEC_420);
+	aj_put(&l, AJ_CODEC, is422 ? AJ_CODEC_422 : AJ_CODEC_420);
 
 	aj_put(&l, AJ_PX_USE_PLANE1, 1);
 	aj_put(&l, AJ_PX_MCUS_W, DIV_ROUND_UP(width, 16));
@@ -804,8 +877,8 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 	aj_put_addr(&l, layout, layout->output_start0, job->output);
 	aj_put_addr(&l, layout, layout->output_start1, job->output);
 	aj_put_addr(&l, layout, layout->output_end, output_end);
-	aj_put(&l, layout->pipe_limit0, job->is422 ? 8 : 3);
-	aj_put(&l, layout->pipe_limit1, job->is422 ? 2 : 1);
+	aj_put(&l, layout->pipe_limit0, is422 ? 8 : 3);
+	aj_put(&l, layout->pipe_limit1, is422 ? 2 : 1);
 
 	/* Two planes, Y then interleaved Cb, Cr; no colour conversion. */
 	aj_put(&l, layout->encode_format, AJ_PIXEL_FORMAT_YUV_PLANES);
@@ -821,7 +894,7 @@ int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
 
 	aj_put(&l, AJ_MODE, AJ_MODE_ENCODE);
 	aj_put(&l, AJ_JPEG_IO_FLAGS, AJ_IO_FLAGS_ORDER |
-	       (job->is422 ? AJ_IO_FLAGS_422 : AJ_IO_FLAGS_420));
+	       (is422 ? AJ_IO_FLAGS_422 : AJ_IO_FLAGS_420));
 	aj_put(&l, AJ_JPEG_WIDTH, width);
 	aj_put(&l, AJ_JPEG_HEIGHT, height);
 	aj_put(&l, AJ_RST_INTERVAL, job->restart_interval);

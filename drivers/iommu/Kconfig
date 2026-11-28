@@ -81,6 +81,19 @@ config IOMMU_IO_PGTABLE_DART
 
 	  If unsure, say N here.
 
+config IOMMU_IO_PGTABLE_DART_KUNIT_TEST
+	bool "KUnit tests for Apple DART page tables" if !KUNIT_ALL_TESTS
+	depends on IOMMU_IO_PGTABLE_DART && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Enable KUnit tests for the Apple DART page table allocator. They
+	  check the table layout chosen for each format, granule and input
+	  size, the DART and DART2 PTE encodings, map/unmap/iova_to_phys
+	  across table boundaries, rejection of invalid requests and that
+	  teardown frees every table page.
+
+	  If unsure, say N here.
+
 endmenu
 
 config IOMMU_DEBUGFS
@@ -317,17 +330,19 @@ config APPLE_DART
 	  Say Y here if you are using an Apple SoC.
 
 config APPLE_DART_J713_DCP
-	bool "Retained J713 display DART support"
+	bool "Retained T8132 display DART support"
 	depends on APPLE_DART=y && ARM64_16K_PAGES
 	select MFD_SYSCON
 	help
-	  Adopt the qualified running J713 internal display DARTs. Their
-	  firmware-visible allocations, page tables and noncoherent CPU
-	  mappings remain pinned until platform reset. This limited bringup
-	  profile requires the built-in ARM64 DMA implementation; its private
-	  mapping/cache interfaces are not a modular DMA API.
+	  Adopt the inherited T8132 (M4) display DARTs when the boot loader
+	  hands over a qualified DCP firmware session. Their firmware-visible
+	  allocations, page tables and noncoherent CPU mappings remain pinned
+	  until platform reset, which requires the built-in ARM64 DMA
+	  implementation (not APPLE_DART=m).
 
-	  Leave this disabled for ordinary DART use, including APPLE_DART=m.
+	  Say Y here to support native display and its dependent GPU bring-up
+	  on T8132 Macs with a qualified DCP handoff (requires built-in
+	  APPLE_DART and 16 KiB pages).
 
 config APPLE_DART_KUNIT_TEST
 	bool "KUnit tests for Apple DART domains and commands" if !KUNIT_ALL_TESTS

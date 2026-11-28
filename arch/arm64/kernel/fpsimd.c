@@ -1571,7 +1571,7 @@ static void fpsimd_flush_cpu_state(void)
 	 * NEON and leaving streaming mode or ZA enabled may increase power
 	 * consumption.
 	 */
-	if (system_supports_sme())
+	if (system_supports_sme() && read_sysreg_s(SYS_SVCR))
 		sme_smstop();
 
 	set_thread_flag(TIF_FOREIGN_FPSTATE);

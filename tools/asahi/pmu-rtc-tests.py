@@ -3,7 +3,7 @@
 """Execute the PMU RTC callbacks against a byte-addressed W1C regmap model.
 
 C bodies and match data are extracted from the driver. The hardware model has
-independent Baku, Abbey, Stowe and Maverick addresses. This checks arithmetic, alarm transactions,
+independent Baku, Abbey, Stowe, Sera (DT-rebased Stowe) and Maverick addresses. This checks arithmetic, alarm transactions,
 shared control preservation, stale events and I/O failures, not physical wake.
 """
 import argparse
@@ -19,12 +19,13 @@ MUTATIONS = {
     'offset-seconds': ('sign_extend64(offset, 47) * 2', '(s64)offset'),
     'offset-sign': ('sign_extend64(offset, 47) * 2', '(s64)offset * 2'),
     'event-bit': ('.event_bit = BIT(1)', '.event_bit = BIT(0)'),
-    'wrong-control': ('.control = 0x2000', '.control = 0xf800'),
-    'maverick-event': ('.event = 0x14c0', '.event = 0x140c'),
+    'wrong-control': ('.base = 0x2000', '.base = 0xf800'),
+    'maverick-event': ('.event = 0xc0', '.event = 0x0c'),
     'control-event-clear': ('control &= ~rtc->hw->control_event_bit;',
                             'control |= rtc->hw->control_event_bit;'),
     'stowe-offset': ('static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {',
                      'static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {\n\t.offset_in_seconds = true,'),
+    'reg-base': ('return rtc->base + offset;', 'return rtc->hw->base + offset;'),
     'baku-limit': ('.max_delay = U32_MAX,', '.max_delay = APPLE_PMU_RTC_MAX_DELAY,'),
     'set-no-round': ('(counter + BIT(APPLE_PMU_RTC_HZ_SHIFT - 1))', '(counter)'),
     'set-negative': ('if (offset < 0 || offset', 'if (offset'),
@@ -153,7 +154,7 @@ static struct nvmem_cell offset;
 static struct rtc_device clock_model;
 static struct apple_pmu_rtc rtc;
 static struct device dev;
-enum { BAKU, ABBEY, STOWE, MAVERICK };
+enum { BAKU, ABBEY, STOWE, SERA, MAVERICK };
 static bool abbey; /* offset in 1/32768 s and monitor bit */
 static void set_counter(u64 ticks) { memcpy(map.bytes + map.counter, &ticks, 6); }
 static void set_offset(s64 ticks) {
@@ -168,17 +169,20 @@ static void reset(int v) {
                    .event = 0x2000, .bit = 2},
         [STOWE] = {.ctrl = 0xf800, .counter = 0xf802, .compare = 0xf808, .mask = 0xf80e,
                    .event = 0xf80c, .bit = 1},
+        [SERA] = {.ctrl = 0xd000, .counter = 0xd002, .compare = 0xd008, .mask = 0xd00e,
+                  .event = 0xd00c, .bit = 1},
         [MAVERICK] = {.ctrl = 0x1401, .counter = 0x1406, .compare = 0x140c, .mask = 0x14c2,
                       .event = 0x14c0, .bit = 1, .control_event = 2},
     };
     static const struct apple_pmu_rtc_hw *hw[] = {
         [BAKU] = &apple_pmu_rtc_baku, [ABBEY] = &apple_pmu_rtc_abbey,
-        [STOWE] = &apple_pmu_rtc_stowe, [MAVERICK] = &apple_pmu_rtc_maverick,
+        [STOWE] = &apple_pmu_rtc_stowe, [SERA] = &apple_pmu_rtc_stowe,
+        [MAVERICK] = &apple_pmu_rtc_maverick,
     };
     bool a = v != BAKU;
     variant = v; abbey = a; map = layout[v];
     offset = (struct nvmem_cell){0}; clock_model = (struct rtc_device){0};
-    rtc = (struct apple_pmu_rtc){.hw = hw[v],
+    rtc = (struct apple_pmu_rtc){.hw = hw[v], .base = v == SERA ? 0xd000 : hw[v]->base,
         .map = &map, .offset = &offset, .clock = &clock_model};
     dev = (struct device){.data = &rtc, .wake = true}; disabled = 0;
     /* Keep an unrelated writable bit, and each variant's monitor bit. */
@@ -336,8 +340,9 @@ static void run_variant(int v) {
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 }
 int main(void) {
-    run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(MAVERICK);
-    puts("PMU RTC: Baku, Abbey, Stowe and Maverick arithmetic, W1C transactions, Baku clock setting and fault injection passed");
+    run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(SERA);
+    run_variant(MAVERICK);
+    puts("PMU RTC: Baku, Abbey, Stowe, Sera and Maverick arithmetic, W1C transactions, Baku clock setting and fault injection passed");
     return 0;
 }
 '''
