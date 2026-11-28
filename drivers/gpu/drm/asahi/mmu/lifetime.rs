@@ -466,6 +466,38 @@ impl Vm {
         }
     }
 
+    /// Acquires `count` additional job references under one residency and lifetime lock acquisition.
+    pub(crate) fn retain_jobs(&self, count: usize, out: &mut KVec<VmJobGuard>) -> Result {
+        if count == 0 {
+            return Ok(());
+        }
+        out.reserve(count, GFP_KERNEL)?;
+        let mut leases = self.enter_residency_many(count)?;
+        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
+        let mut state = lifetime.state.lock();
+        loop {
+            if state.closed {
+                return Err(ENOENT);
+            }
+            if state.blocked {
+                return Err(EIO);
+            }
+            if !state.draining {
+                state.active = state.active.checked_add(count).ok_or(EOVERFLOW)?;
+                drop(state);
+                for _ in 0..count {
+                    let lease = leases.as_mut().and_then(|v| v.pop());
+                    let _ = out.push_within_capacity(VmJobGuard {
+                        vm: self.clone(),
+                        _residency: lease,
+                    });
+                }
+                return Ok(());
+            }
+            lifetime.changed.wait(&mut state);
+        }
+    }
+
     /// The first job of a submission may wait for a clean VM's quarantine drain.
     pub(crate) fn retain_first_job(&self) -> Result<VmJobGuard> {
         match self.retain_job() {

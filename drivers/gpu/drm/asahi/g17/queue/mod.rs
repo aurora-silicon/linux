@@ -506,10 +506,10 @@ impl<B: Backend> Queue<B> {
         guards
             .push_within_capacity(parse_guard)
             .map_err(|_| ENOMEM)?;
-        while guards.len() < pending.len() {
-            guards
-                .push_within_capacity(self.context.vm().retain_job()?)
-                .map_err(|_| ENOMEM)?;
+        if pending.len() > 1 {
+            self.context
+                .vm()
+                .retain_jobs(pending.len() - 1, &mut guards)?;
         }
         Ok((pending, guards))
     }

@@ -52,46 +52,100 @@ impl<const CAPACITY: usize> Requests<CAPACITY> {
         &self.ranges[..self.count]
     }
 
+    fn covers_bucket(&self, bucket: u8, request: Request) -> bool {
+        let slice = self.as_slice();
+        let pos = slice.partition_point(|r| (r.2, r.0) <= (bucket, request.0));
+        pos > 0 && slice[pos - 1].2 == bucket && contains(slice[pos - 1], request)
+    }
+
     fn covers(&self, request: Request) -> bool {
-        self.as_slice().iter().any(|&range| contains(range, request))
+        let needed = request.2;
+        if needed == 0 || needed & !3 != 0 {
+            return false;
+        }
+        if self.covers_bucket(3, request) {
+            return true;
+        }
+        needed != 3 && self.covers_bucket(needed, request)
     }
 
     fn insert(&mut self, request: Request) {
-        let Some(mut request) = pages(request) else {
+        let Some(request) = pages(request) else {
             self.overflow = true;
             return;
         };
         if self.covers(request) {
             return;
         }
-        // Merge only equal permissions, so an adjacent writable page never
-        // grants write access to a read-only page. Restart after each merge
-        // because it can join a range visited earlier.
-        let mut index = 0;
-        while index < self.count {
-            let range = self.ranges[index];
-            let end = request.0 + request.1;
-            let other_end = range.0 + range.1;
-            if contains(request, range)
-                || (request.2 == range.2 && request.0 <= other_end && range.0 <= end)
-            {
-                if request.2 == range.2 {
-                    let start = request.0.min(range.0);
-                    request = (start, end.max(other_end) - start, request.2);
-                }
-                self.count -= 1;
-                self.ranges[index] = self.ranges[self.count];
-                index = 0;
-            } else {
-                index += 1;
+        // Keep ranges sorted by (access, start) with disjoint, non-adjacent
+        // intervals per access bucket so lookups are O(log N) and adjacent
+        // equal-permission ranges merge without granting access across pages.
+        let access = request.2;
+        let mut merged_start = request.0;
+        let mut merged_end = request.0 + request.1;
+        let pos = self
+            .as_slice()
+            .partition_point(|r| (r.2, r.0) <= (access, merged_start));
+        let mut lo = pos;
+        if pos > 0 {
+            let prev = self.ranges[pos - 1];
+            if prev.2 == access && prev.0 + prev.1 >= merged_start {
+                lo = pos - 1;
+                merged_start = prev.0;
+                merged_end = merged_end.max(prev.0 + prev.1);
             }
         }
-        if self.count == CAPACITY {
-            self.overflow = true;
-            return;
+        let mut hi = pos;
+        while hi < self.count {
+            let next = self.ranges[hi];
+            if next.2 != access || next.0 > merged_end {
+                break;
+            }
+            merged_end = merged_end.max(next.0 + next.1);
+            hi += 1;
         }
-        self.ranges[self.count] = request;
-        self.count += 1;
+        if access == 3 {
+            // Prune strictly weaker Read/Write intervals fully covered by the
+            // merged ReadWrite interval, removing bucket 2 before bucket 1 so
+            // earlier indices remain stable.
+            for bucket in [2u8, 1u8] {
+                let p = self
+                    .as_slice()
+                    .partition_point(|r| (r.2, r.0) < (bucket, merged_start));
+                let mut q = p;
+                while q < self.count {
+                    let r = self.ranges[q];
+                    if r.2 != bucket || r.0 + r.1 > merged_end {
+                        break;
+                    }
+                    q += 1;
+                }
+                if q > p {
+                    let removed = q - p;
+                    self.ranges.copy_within(q..self.count, p);
+                    self.count -= removed;
+                    lo -= removed;
+                    hi -= removed;
+                }
+            }
+        }
+        let merged = (merged_start, merged_end - merged_start, access);
+        if lo == hi {
+            if self.count == CAPACITY {
+                self.overflow = true;
+                return;
+            }
+            self.ranges.copy_within(lo..self.count, lo + 1);
+            self.ranges[lo] = merged;
+            self.count += 1;
+        } else {
+            self.ranges[lo] = merged;
+            let extra = hi - lo - 1;
+            if extra != 0 {
+                self.ranges.copy_within(hi..self.count, lo + 1);
+                self.count -= extra;
+            }
+        }
     }
 
 }
@@ -313,7 +367,7 @@ mod tests {
         next.insert((20 * PAGE, PAGE, 1));
         next.insert((4 * PAGE, 2 * PAGE, 1));
         let missing = proof.uncovered(&next);
-        assert_eq!(missing.as_slice(), &[(20 * PAGE, PAGE, 1), (4 * PAGE, 2 * PAGE, 1)]);
+        assert_eq!(missing.as_slice(), &[(4 * PAGE, 2 * PAGE, 1), (20 * PAGE, PAGE, 1)]);
 
         // Stronger access than proven is walked again.
         assert_eq!(proof.uncovered(&requests((PAGE, 8, 2))).count, 1);
@@ -351,5 +405,30 @@ mod tests {
         let mut proof = Proof::new();
         proof.record(Some(1), ranges);
         assert!(!proof.covers(Some(1), &requests((0, PAGE, 1))));
+    }
+
+    #[test]
+    fn sorted_requests_preserve_overlap_merge_and_subsumption() {
+        let mut ranges: Requests<48> = Requests::new();
+        ranges.insert((PAGE, 4 * PAGE, 1));
+        ranges.insert((2 * PAGE, PAGE, 2));
+        // Overlapping weaker Write range must not mask the wider Read range.
+        assert!(ranges.covers((3 * PAGE, PAGE, 1)));
+        assert!(ranges.covers((2 * PAGE, PAGE, 2)));
+        assert!(!ranges.covers((2 * PAGE, PAGE, 3)));
+        // Adjacent equal-permission merge across a gap.
+        ranges.insert((6 * PAGE, PAGE, 1));
+        ranges.insert((5 * PAGE, PAGE, 1));
+        assert!(ranges.covers((PAGE, 6 * PAGE, 1)));
+        // Partial overlap with a stronger ReadWrite range keeps the uncovered weaker range.
+        ranges.insert((PAGE, 2 * PAGE, 3));
+        assert!(ranges.covers((PAGE, 6 * PAGE, 1)));
+        assert!(ranges.covers((2 * PAGE, PAGE, 3)));
+        // Stronger ReadWrite range subsumes fully covered Read/Write ranges.
+        ranges.insert((PAGE, 6 * PAGE, 3));
+        assert_eq!(ranges.as_slice(), &[(PAGE, 6 * PAGE, 3)]);
+        assert!(ranges.covers((2 * PAGE, PAGE, 1)));
+        assert!(ranges.covers((2 * PAGE, PAGE, 2)));
+        assert!(ranges.covers((PAGE, 6 * PAGE, 3)));
     }
 }
