@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Host test for batched report-ring drains and fast-path render mask clearing.
 
 Compiles the real `Rings::consume_report()` from `drivers/gpu/drm/asahi/g17/channel.rs`
