@@ -17,6 +17,8 @@
  */
 struct dcp_backlight_state {
 	u32 maximum;
+	/* Lowest level a request can reach, 0 for none: dcp_bl_set_minimum(). */
+	u32 minimum;
 	u32 target;
 	u32 level;
 	u32 fade_from;
@@ -100,6 +102,29 @@ static inline int dcp_bl_init(struct dcp_backlight_state *state, u32 maximum,
 }
 
 /*
+ * A panel node may name the lowest level a brightness request can reach
+ * (apple,min-brightness, in nits).  A request below it, zero included, is
+ * raised to it, so a brightness write alone cannot darken such a panel.
+ * Blanking, DPMS off and suspend are not requests and still present zero.
+ * A loader level below the floor stays until the first request.
+ */
+static inline int dcp_bl_set_minimum(struct dcp_backlight_state *state, u32 minimum)
+{
+	if (!state->ready)
+		return -ENODATA;
+	if (minimum >= state->maximum)
+		return -ERANGE;
+	state->minimum = minimum;
+	return 0;
+}
+
+/* The level a request for @nits reaches on this panel. */
+static inline u32 dcp_bl_floor(const struct dcp_backlight_state *state, u32 nits)
+{
+	return max(nits, state->minimum);
+}
+
+/*
  * A decoded powerlog sample can seed takeover only before Linux control.
  * It reports the level the panel shows, so the level is then known.
  */
@@ -170,6 +195,13 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		return -ENODATA;
 	if (nits > state->maximum)
 		return -ERANGE;
+	/*
+	 * A blank or suspend change arrives with the level unchanged: it is not
+	 * a request, so a loader level below the floor stays.
+	 */
+	if (nits != state->target || (state->core_blank == core_blank &&
+				      state->suspended == suspended))
+		nits = dcp_bl_floor(state, nits);
 	/* Save/restore clients may echo the reporting default without a change. */
 	if (state->preserve_inherited && !state->controlled && !state->level_known &&
 	    state->target == nits) {

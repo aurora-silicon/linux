@@ -194,6 +194,8 @@ struct dcp_fb_reference {
 struct dcp_brightness {
 	struct backlight_device *bl_dev;
 	u32 maximum;
+	/* apple,min-brightness: lowest level a request reaches, 0 for none. */
+	u32 minimum;
 	u32 dac;
 	int nits;
 	int scale;

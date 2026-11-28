@@ -7429,6 +7429,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 						   &dcp->brightness.maximum);
 			if (ret)
 				dev_err(dev, "Missing property 'apple,max-brightness'\n");
+			/* Checked and applied where the nits backlight is set up. */
+			of_property_read_u32(panel_np, "apple,min-brightness",
+					     &dcp->brightness.minimum);
 		}
 
 		dcp_panel_read_dimensions(dcp, panel_np);

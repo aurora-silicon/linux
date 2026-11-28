@@ -613,6 +613,12 @@ properties:
       apple,max-brightness:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: Maximum firmware backlight level.
+      apple,min-brightness:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        description:
+          Lowest level at which the panel shows a lit picture, in the unit
+          of apple,max-brightness.
     required:
       - compatible
     additionalProperties: false

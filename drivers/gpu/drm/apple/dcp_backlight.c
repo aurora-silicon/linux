@@ -298,6 +298,7 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 			    void (*kick)(struct apple_dcp *dcp))
 {
 	unsigned long flags;
+	int floor_ret = 0;
 	int ret;
 
 	if ((dcp->fw_compat != DCP_FIRMWARE_H17P && dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
@@ -313,6 +314,9 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 		ret = dcp_bl_init(&dcp->backlight.state, maximum,
 				  inherited_valid, inherited,
 				  default_valid, default_nits);
+		if (!ret && dcp->brightness.minimum)
+			floor_ret = dcp_bl_set_minimum(&dcp->backlight.state,
+						       dcp->brightness.minimum);
 		if (!ret && iomfb_is_m4(dcp)) {
 			/*
 			 * The J713 panel jumps to new levels, and its first
@@ -327,6 +331,12 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	mutex_unlock(&dcp->bl_register_mutex);
+	if (floor_ret)
+		dev_warn(dcp->dev, "brightness floor %u ignored for a ceiling of %u\n",
+			 dcp->brightness.minimum, maximum);
+	else if (!ret && dcp->brightness.minimum)
+		dev_info(dcp->dev, "brightness requests below %u nits are raised to %u nits\n",
+			 dcp->brightness.minimum, dcp->brightness.minimum);
 	if (!ret)
 		schedule_work(&dcp->bl_register_wq);
 	return ret;
@@ -908,6 +918,9 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		old = state->target;
 		ret = dcp_bl_request(state, bd->props.brightness,
 				     backlight_is_blank(bd), suspended);
+		/* Keep sysfs in sync with the accepted target. */
+		if (!ret)
+			bd->props.brightness = state->target;
 		/* A new level restarts the fade from the level presented last. */
 		fade = !ret && state->fading && state->target != old;
 		if (fade)
