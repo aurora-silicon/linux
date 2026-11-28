@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * What the T6050 desktops (Mac Studio J775d, Mac mini J873s) share on die 0: the onboard
+ * Ethernet on PCIe port 2, and rear USB-C ports 1-3 (ATC0-2, their PD controllers on
+ * nub-spmi-a0 at SPMI addresses 0xc, 0xa and 0x8). Each board's ADT gives the same port,
+ * bridge, PHY and HPM layout for these; only the connectors' places differ.
+ *
+ * The board file includes this before its own &pcie0 and &nub_spmi_a0 nodes (its other root
+ * ports and HPMs follow these) and defines first:
+ *   T6050_DESKTOP_HPM1_LABEL	the label of rear port 2's connector (HPM1, ATC1)
+ *   T6050_DESKTOP_HPM2_LABEL	the label of rear port 3's connector (HPM2, ATC2)
+ * The board sets &pcie0's registers, interrupts, iommu-map and bus-range, and the
+ * ethernet0 alias through which the boot loader fills the MAC address.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/*
+ * PCIe port 2: the onboard Ethernet (ADT apcie0/pci-bridge2/lan0). The boot loader powers and
+ * trains the link and numbers its secondary bus 1.
+ */
+&pcie0 {
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		/* The controller keeps no MAC address of its own */
+		ethernet0: ethernet@0,0 {
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			/* To be filled by the loader */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&nub_spmi_a0 {
+	/*
+	 * /arm-io/nub-spmi-a0/hpm0: SN201202x (ACE3), SPMI address 0xc, port-number 1.
+	 * Reserved: rear port 1 carries the DFU cable, the host's VDM reboot path and the
+	 * debug console (KIS) through usb-drd0; a probe wakes the controller and sets its
+	 * power state even when polled. No ATC0, usb-drd0 or dart-usb0 node either.
+	 */
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		status = "disabled";
+	};
+
+	/* /arm-io/nub-spmi-a0/hpm1: SN201202x (ACE3), SPMI address 0xa, port-number 2 */
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = T6050_DESKTOP_HPM1_LABEL;
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+
+	/* /arm-io/nub-spmi-a0/hpm2: SN201202x (ACE3), SPMI address 8, port-number 3 */
+	hpm2: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		status = "disabled";
+
+		connector {
+			compatible = "usb-c-connector";
+			label = T6050_DESKTOP_HPM2_LABEL;
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					hpm2_dp: endpoint {
+						remote-endpoint = <&dcpext0_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/* Rear USB-C port 2 (HPM1), USB data: ATC1's combo PHY, usb-drd1 and dart-usb1 */
+&atc1_phy {
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+/*
+ * Rear USB-C port 3 (HPM2): DisplayPort out from dcpext0 through ATC2, and USB beside it
+ * (usb-drd2, dart-usb2). The chain stays disabled: Aura's T6050 display handoff enables what
+ * dcpext0 references (phys, mux-controls, the PHY's mailbox and power domains, the typec
+ * route's HPM and its SPMI bus).
+ */
+&atc2_phy {
+	port {
+		atc2_phy_ep: endpoint {
+			remote-endpoint = <&hpm2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&hpm2_hs>;
+		};
+	};
+};
+
+&dcpext0 {
+	typec-routes {
+		route@0 {
+			port {
+				dcpext0_typec: endpoint {
+					remote-endpoint = <&hpm2_dp>;
+				};
+			};
+		};
+	};
+};

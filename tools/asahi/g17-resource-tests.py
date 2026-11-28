@@ -21,8 +21,8 @@ def admission_tests(root, source):
      return s[at:end]
     constants='\n'.join(re.search(r'pub\(crate\) const '+name+r': [^;]+;',cfg).group(0) for name in ['RENDER_SLOTS','RENDER_PAIRS_MAX','RENDER_DEPTH'])
     pairs=(source/'g17/pairs.rs').read_text()
-    assert 'const G17D_PAIRS: u8 = RENDER_PAIRS_MAX as u8;' in pairs
-    assert 'PAIRS.store(if board.g17d_forms() { G17D_PAIRS } else { 1 }, Relaxed);' in pairs
+    assert 'const MULTI_PAIRS: u8 = RENDER_PAIRS_MAX as u8;' in pairs
+    assert 'if board.clusters >= 4 {' in pairs
     at=pairs.index('const SIBLING_BACKLOG');backlog=pairs[at:pairs.index('\n}\n',pairs.index('fn sibling_backlog',at))+3]
     mmu=(source/'mmu.rs').read_text()
     limits='\n'.join(re.search(r'const '+name+r': [^;]+;',mmu).group(0) for name in ['EXECUTION_CONTEXT_MASK','MAX_EXECUTION_CONTEXTS'])
@@ -39,7 +39,7 @@ def admission_tests(root, source):
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     type KVec<T> = Vec<T>; struct InFlight;
     mod cfg {\n'''+constants+'}\n'+limits+'\n'
-    methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn usable','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
+    methods=['const fn new','fn owns_live','fn has_live_owner','fn live_owners','fn live_siblings','fn reclaimable_siblings_in','fn reclaimable_siblings(','fn promotes_reclaimable_sibling','fn can_lease_slot','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn set_owner','fn take_idle','fn acquire(','fn acquire_for','fn unavailable_released','fn total_pair_demand','fn pair_demand','fn usable','fn claim_sibling','fn can_reassign_unused_spare','fn reassign_unused_spare','fn release_unused_sibling','fn reclaim_sibling','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release(']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
     // A queue holds g17::pairs::per_owner() pairs (Backend::pairs): one, or
     // RENDER_PAIRS_MAX on G17D. Both admissions run.
@@ -177,7 +177,7 @@ def queue_tests(root, source):
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] enum DataMaster {Compute,Tiling,Fragment}
     #[derive(Clone,Copy,PartialEq,Eq,Debug)] struct Id {qid:u8,owner:u64,engine:DataMaster}
     #[derive(Clone,Copy)] struct Identity {id:Id,published:bool}
-    '''+constants+'\n'+item(s,'const fn render_reserve(')+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','reserve_for','publish','can_cancel_unpublished','cancel_unpublished'])+''.join(item(s, sig)+'\n' for sig in ['fn render_ids(', 'fn compute_room('])+'}\n'
+    '''+constants+'\n'+item(s,'const fn render_reserve(')+'\n'+item(s,'const fn queue_limit(')+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','reserve_for','publish','can_cancel_unpublished','cancel_unpublished'])+''.join(item(s, sig)+'\n' for sig in ['fn render_ids(', 'fn compute_room('])+'}\n'
     test='''
     fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],leased:0,floor:0}}
     fn main(){
@@ -315,7 +315,7 @@ def watchdog_publication_guard_tests(source):
     at = text.index('    fn timed_out(')
     body = text[at:text.index('\n    }\n', at)]
     guard = body.index('if !packet.is_published() {\n            return sched::Status::NoHang;')
-    assert guard < body.index('self.release_backlog(&packet);') < body.index('self.shared.watchdog_timeout()'), 'timed_out'
+    assert guard < body.index('self.release_backlog(&packet);') < body.index('self.shared.watchdog_timeout('), 'timed_out'
     for path, name in [('g17/runtime/render/settle.rs', 'pub(in crate::g17) fn timeout_render('),
                        ('g17/runtime/compute_control.rs', 'pub(super) fn timeout_compute(')]:
         text = (source / path).read_text()

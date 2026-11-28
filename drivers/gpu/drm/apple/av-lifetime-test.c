@@ -160,6 +160,7 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	init_waitqueue_head(&t->asrv->gen_wq);
 #endif
 	INIT_WORK(&t->asrv->start_av_service_wq, owner_fn);
+	INIT_DELAYED_WORK(&t->asrv->open_check_wq, owner_fn);
 	INIT_WORK(&t->asrv->terminate_wq, owner_fn);
 	INIT_WORK(&t->dcp->external_audio_work, av_life_owner_fn);
 	t->asrv->works_live = true;
@@ -360,26 +361,29 @@ static void av_lifetime_quiesce_once_restart_once(struct kunit *test)
 static void av_lifetime_report_after_stop(struct kunit *test)
 {
 	struct av_life_test *t = av_life_setup(test, av_life_owner_fn);
-	struct apple_epic_service svc = { };
+	/* Off the stack: the service and its pending-command table are large. */
+	struct apple_epic_service *svc = kunit_kzalloc(test, sizeof(*svc), GFP_KERNEL);
 	struct epic_service_call call = {
 		.group = cpu_to_le16(2),
 		.command = cpu_to_le32(1),
 		.magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC),
 	};
+
+	KUNIT_ASSERT_NOT_NULL(test, svc);
 	t->dcp->fw_compat = DCP_FIRMWARE_V_14_7;
 	t->dcp->external_native = true;
 	t->ep->dcp = t->dcp;
-	svc.ep = t->ep;
-	t->asrv->srv = &svc;
+	svc->ep = t->ep;
+	t->asrv->srv = svc;
 
 	av_audiosrv_quiesce(t->dcp);
 	av_audiosrv_quiesce(t->dcp);
-	av_audiosrv_report(&svc, 0, &call, sizeof(call));
+	av_audiosrv_report(svc, 0, &call, sizeof(call));
 	KUNIT_EXPECT_EQ(test, atomic_read(&t->owner_runs), 0);
 	KUNIT_EXPECT_FALSE(test, work_busy(&t->asrv->terminate_wq));
 
 	av_audiosrv_reports_restart(t->dcp);
-	av_audiosrv_report(&svc, 0, &call, sizeof(call));
+	av_audiosrv_report(svc, 0, &call, sizeof(call));
 	flush_work(&t->asrv->terminate_wq);
 	KUNIT_EXPECT_EQ(test, atomic_read(&t->owner_runs), 1);
 	av_audiosrv_quiesce(t->dcp);

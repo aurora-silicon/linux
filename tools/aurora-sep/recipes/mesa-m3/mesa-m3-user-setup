@@ -4,6 +4,7 @@
 
     mesa-m3-user-setup --home HOME [--config-home DIR] [--env | --environ FILE]
                        [--session-desktops NAMES] [--list FILE] [--root DIR]
+                       [--system-provider]
 
 The one definition of "the user's own M3 Mesa setup", used by the mesa-m3
 session hook at every login and by the installer. What counts is listed in
@@ -20,6 +21,13 @@ see the comments there.
                      as in XDG_CURRENT_DESKTOP (uwsm exports them before it reads
                      any environment file); empty or absent: unknown
   --root DIR         prefix every path with DIR (tests)
+  --system-provider  also refuse legacy /opt selectors and session flags when
+                     checking whether the real desktop will use system Mesa;
+                     an LD_LIBRARY_PATH entry then also counts when it holds
+                     only libEGL, libGLESv2, libGL, libGLX, libglapi or libgbm;
+                     entries split on ":" and ";", and a relative or empty
+                     entry makes the result "unknown"; Bash += assignments
+                     to tracked variables are unknown too
 
 Nothing is sourced or evaluated. Files are read as text and split into words
 the way a POSIX shell would (quotes, backslashes, comments, ";"), with no
@@ -79,10 +87,14 @@ def fail(msg):
 
 def parse_args(argv):
     opts = {'home': None, 'config': None, 'env': False, 'environ': None, 'list': DEFAULT_LIST, 'root': '',
-            'desktops': None}
+            'desktops': None, 'system_provider': False}
     i = 0
     while i < len(argv):
         a = argv[i]
+        if a == '--system-provider':
+            opts['system_provider'] = True
+            i += 1
+            continue
         if a == '--env':
             opts['env'] = True
             i += 1
@@ -178,9 +190,11 @@ def shell_words(line):
     return words
 
 
-def shell_assignments(line):
+def shell_assignments(line, *, append_unknown=False):
     """The NAME=VALUE words of one line of shell, environment.d or
-    /etc/environment text. None when the line cannot be split."""
+    /etc/environment text. None when the line cannot be split. With
+    append_unknown, a Bash NAME+=VALUE word is emitted with a None value,
+    since its resulting value depends on earlier assignments."""
     words = shell_words(line)
     if words is None:
         return None
@@ -189,6 +203,13 @@ def shell_assignments(line):
         m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)=(.*)$', w, re.S)
         if m:
             out.append((m.group(1), m.group(2)))
+        elif append_unknown:
+            # Arch's sh is Bash, which accepts += even in POSIX mode. Its
+            # value depends on earlier assignments; do not silently ignore
+            # a late provider override when admitting system Mesa.
+            m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\+=(.*)$', w, re.S)
+            if m:
+                out.append((m.group(1), None))
     return out
 
 
@@ -248,6 +269,18 @@ class Finder:
         for k, i in items:
             if k in ('variable', 'flag', 'prefix', 'ldpath'):
                 self.kind[i] = k
+        if opts['system_provider']:
+            # These may be left over from an active legacy session. The
+            # admission helper's clean environment cannot prove that the
+            # real desktop will use /usr while these remain in its setup.
+            # The rest choose the desktop's GL/GBM provider or its version,
+            # which the clean-environment helper never sees.
+            for name in ('LD_PRELOAD', 'LD_AUDIT', 'MESA_M3_SESSION', 'MESA_M3_PROFILE',
+                         'ASAHI_M3_EXPERIMENTAL', 'AGX_MESA_DEBUG', 'HK_DEBUG_LOG',
+                         'VK_LOADER_LAYERS_DISABLE', 'QSG_RHI_BACKEND',
+                         'GBM_BACKEND', '__GLX_VENDOR_LIBRARY_NAME', 'MESA_GL_VERSION_OVERRIDE',
+                         'MESA_GLES_VERSION_OVERRIDE', 'MESA_GLSL_VERSION_OVERRIDE'):
+                self.kind[name] = 'flag'
 
     def real(self, p):
         return self.o['root'] + p
@@ -297,11 +330,18 @@ class Finder:
 
     def ours(self, path):
         p = os.path.normpath(path) if path.startswith('/') else path
-        return p == PREFIX or p.startswith(PREFIX + '/')
+        # A system-Mesa handoff must also detect the old prefix. The normal
+        # legacy gate deliberately accepts it and keeps its original behavior.
+        return not self.o['system_provider'] and (p == PREFIX or p.startswith(PREFIX + '/'))
 
     def holds_mesa(self, d):
         r = self.real(d)
         pats = ('libgallium*', 'libEGL_mesa*', 'libvulkan_asahi*', 'dri/*_dri.so')
+        if self.o['system_provider']:
+            # Any of these replaces what the desktop loads from /usr, even
+            # without a Mesa driver of its own next to it.
+            pats += ('libEGL.so*', 'libEGL_*', 'libGLESv2.so*', 'libGL.so*', 'libGLX*',
+                     'libglapi.so*', 'libgbm.so*', 'gbm/*')
         return any(glob.glob(os.path.join(glob.escape(r), p)) for p in pats)
 
     def expand_home(self, s):
@@ -335,15 +375,60 @@ class Finder:
                 # while the other Mesa variables still point into the prefix.
                 note(place, f'{label} replaces {name} (without ${name})')
                 return
-            # Drop the references to the previous value (also ${NAME:+:$NAME}).
-            rest = re.sub(r'\$\{' + re.escape(name) + r'(?::?[-+=?][^}]*)?\}|\$' + re.escape(name) + r'(?![A-Za-z0-9_])',
-                          '', value)
-            for comp in rest.split(':'):
-                comp = self.expand_home(comp.strip())
+            n = re.escape(name)
+            strict = self.o['system_provider']
+            if not strict:
+                # Drop the references to the previous value (also ${NAME:+:$NAME}).
+                rest = re.sub(r'\$\{' + n + r'(?::?[-+=?][^}]*)?\}|\$' + n + r'(?![A-Za-z0-9_])', '', value)
+                comps = rest.split(':')
+            elif place.startswith('environment:'):
+                # Already expanded: taken literally, as glibc does.
+                comps = re.split('[:;]', value) if value != '' else []
+            else:
+                # The previous value may be empty here (unset, or cleared by an
+                # earlier file), and then "/a:$NAME" leaves "/a:", whose empty
+                # entry glibc's loader reads as the current directory. So a
+                # plain reference counts as empty, and ${NAME:+:$NAME} (which
+                # then adds nothing) is the safe form. A reference must stand
+                # alone between separators: "${NAME}/x" names a directory we
+                # cannot see. Anything else is unknown. glibc also splits on
+                # ";" and ignores a wholly empty value.
+                ref = (r'\$\{' + n + r':\+:\$\{' + n + r'\}\}|\$\{' + n + r'(?::?[-+=?][^}]*)?\}|\$' + n +
+                       r'(?![A-Za-z0-9_])')
+                plain = ('$' + name, '${' + name + '}')
+                cond = tuple('${' + name + ':+:' + r + '}' for r in plain)
+                sep = (':', ';')
+                rest, at = '', 0
+                for m in re.finditer(ref, value):
+                    t, before, after = m.group(0), value[m.start() - 1:m.start()], value[m.end():m.end() + 1]
+                    # A conditional append needs an entry before it, or it
+                    # starts the value with an empty entry.
+                    edge = ('',) + sep
+                    alone = after in edge and ((before not in edge) if t in cond else (before in edge))
+                    rest += value[at:m.start()] + ('' if alone and t in plain + cond else '\0')
+                    at = m.end()
+                rest += value[at:]
+                comps = re.split('[:;]', rest) if rest != '' else []
+            for comp in comps:
+                if strict and '\0' in comp:
+                    note(place, f'{label} uses {name} in a form whose result is not known', sure=False)
+                    continue
+                if strict and comp == '':
+                    note(place, f'{label} leaves an empty entry in {name} (the current directory)', sure=False)
+                    continue
+                # glibc takes an entry as written, spaces included, and an
+                # environment value has no ~ or $HOME left to expand.
+                if not strict:
+                    comp = self.expand_home(comp.strip())
+                elif not place.startswith('environment:'):
+                    comp = self.expand_home(comp)
                 if comp == '':
                     continue
                 if '$' in comp or '`' in comp:
                     note(place, f'{label} puts an unresolved entry in {name} ({comp})', sure=False)
+                elif not comp.startswith('/') and self.o['system_provider']:
+                    # Resolved against whatever directory the desktop starts in.
+                    note(place, f'{label} puts a relative entry in {name} ({comp})', sure=False)
                 elif comp.startswith('/') and not self.ours(comp) and self.holds_mesa(os.path.normpath(comp)):
                     note(place, f'{label} puts another Mesa in {name} ({os.path.normpath(comp)})')
             return
@@ -448,7 +533,7 @@ class Finder:
             elif is_hypr:
                 found = hyprlang_assignments(line)
             else:
-                found = shell_assignments(line)
+                found = shell_assignments(line, append_unknown=self.o['system_provider'])
                 if found is None:
                     if any(re.search(rf'(?<![A-Za-z0-9_]){re.escape(v)}(?![A-Za-z0-9_])', line) for v in names):
                         self.note(path, f'{path}:{n} cannot be split (unbalanced quotes)', sure=False)

@@ -599,3 +599,7 @@ module_platform_driver(macsmc_gpio_driver);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC GPIO driver");
+
+#if IS_ENABLED(CONFIG_GPIO_MACSMC_KUNIT_TEST)
+#include "gpio-macsmc-test.c"
+#endif

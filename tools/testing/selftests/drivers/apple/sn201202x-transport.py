@@ -87,12 +87,16 @@ static int spmi_ext_register_read(struct spmi_device *s,unsigned off,void *val,s
 }
 #define read_poll_timeout(op,ret,condition,delay,bound,sleep_before,...) ({ \
     int poll_ret=-ETIMEDOUT; \
+    (void)(delay); (void)(bound); (void)(sleep_before); \
     for(unsigned attempt=0;attempt<8;attempt++) { \
         (ret)=op(__VA_ARGS__); if(condition) { poll_ret=0; break; } \
     } poll_ret; })
+#define SN201202X_SELECT_TIMEOUT_US 100000
 #define SN201202X_ATOMIC_SELECT_MS 10
+#define usecs_to_jiffies(x) (x)
+#define max(a,b) ((a)>(b) ? (a) : (b))
 #define read_poll_timeout_atomic read_poll_timeout
-''' + function(source, "regmap_sn201202x_select_reg") + function(source, "__regmap_sn201202x_read") + r'''
+''' + function(source, "sn201202x_select_reg") + function(source, "regmap_sn201202x_select_reg") + function(source, "__regmap_sn201202x_read") + r'''
 #define regmap_sn201202x_read __regmap_sn201202x_read
 static void clean(struct spmi_device *s)
 {

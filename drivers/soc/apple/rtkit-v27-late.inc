@@ -7,7 +7,22 @@ struct apple_rtkit_v27_scope {
 	DECLARE_KFIFO(deferred, struct apple_mbox_msg, 64);
 	bool held, stopped, failed;
 	int error;
+	/*
+	 * Run once between the AP state's acknowledgment and the IOP request, interrupts off.
+	 * An error fails the idle.
+	 */
+	int (*after_ap)(void *data);
+	void *after_ap_data;
 };
+
+void apple_rtkit_v27_set_after_ap(struct apple_rtkit_v27_scope *s, int (*fn)(void *), void *data)
+{
+	if (s) {
+		s->after_ap = fn;
+		s->after_ap_data = data;
+	}
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_v27_set_after_ap);
 
 bool apple_rtkit_v27_live(struct apple_rtkit *rtk)
 {
@@ -36,7 +51,7 @@ int apple_rtkit_v27_disarm(struct apple_rtkit_v27_scope *s, bool stopped)
 	 * accepted packet just because precommit admission had to refuse.
 	 */
 	while (kfifo_get(&s->deferred, &msg))
-		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, false);
+		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, false, 0);
 	apple_mbox_release_rx(rtk->mbox);
 	module_put(s->provider_module);
 	put_device(rtk->mbox->dev);
@@ -96,7 +111,11 @@ undo:
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_arm);
 
-int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
+/*
+ * Before the commit, a pending message refuses the sleep (it is kept for the disarm). After it,
+ * the stop that follows reads the mailbox itself: a message there is left to it.
+ */
+int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s, bool committed)
 {
 	struct apple_mbox_msg msg;
 	int ret;
@@ -109,6 +128,8 @@ int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
 		return -EBUSY;
 	if (kfifo_is_full(&s->deferred))
 		return -ENOBUFS;
+	if (committed)
+		return 0;
 	ret = apple_mbox_recv_nowait(s->rtk->mbox, &msg);
 	if (ret > 0) {
 		kfifo_put(&s->deferred, msg);
@@ -117,6 +138,44 @@ int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_check);
+
+/*
+ * A second port's AP idle with interrupts off: sent, and its acknowledgment awaited by polling
+ * the port's mailbox, for at most @us. The port's tracked state is not updated.
+ */
+int apple_rtkit_v27_port_ap_idle_atomic(struct apple_rtkit *rtk, unsigned int us)
+{
+	struct apple_mbox_msg msg = {
+		.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_IDLE),
+		.msg1 = APPLE_RTKIT_EP_MGMT,
+	};
+	unsigned int i, n = us / 10;
+	int ret = -ETIMEDOUT;
+
+	for (i = 0; i < n; i++) {
+		ret = apple_mbox_send_nowait(rtk->mbox, msg);
+		if (ret != -EAGAIN && ret != -EBUSY)
+			break;
+		udelay(10);
+	}
+	if (ret)
+		return ret;
+	for (; i < n; i++) {
+		struct apple_mbox_msg in;
+
+		ret = apple_mbox_recv_nowait(rtk->mbox, &in);
+		if (ret < 0 && ret != -EBUSY)
+			return ret;
+		if (ret > 0 && in.msg1 == APPLE_RTKIT_EP_MGMT &&
+		    FIELD_GET(APPLE_RTKIT_MGMT_TYPE, in.msg0) == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK)
+			return FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, in.msg0) ==
+			       APPLE_RTKIT_PWR_STATE_IDLE ? 0 : -EPROTO;
+		udelay(10);
+	}
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_v27_port_ap_idle_atomic);
 
 int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 {
@@ -180,6 +239,11 @@ int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 				    type == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK &&
 				    arg == APPLE_RTKIT_PWR_STATE_IDLE) {
 					ap_ack = true;
+					if (s->after_ap) {
+						ret = s->after_ap(s->after_ap_data);
+						if (ret)
+							goto poison;
+					}
 				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT && iop_sent && !iop_ack &&
 					   type == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK &&
 					   arg == APPLE_RTKIT_PWR_STATE_IDLE) {
@@ -187,13 +251,21 @@ int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT && iop_sent && !done &&
 					   type == APPLE_RTKIT_MGMT_IDLE_NOTIFY && !arg) {
 					done = true;
-				} else if (apple_rtkit_oslog_owed_msg(rtk, msg.msg1, msg.msg0)) {
-					echo = msg;
-					echo_pending = true;
-				} else {
+				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT ||
+					   msg.msg1 == APPLE_RTKIT_EP_CRASHLOG ||
+					   msg.msg1 >= APPLE_RTKIT_APP_ENDPOINT_START) {
+					/* A crash, unexpected handshake, or live application RPC. */
 					kfifo_put(&s->deferred, msg);
 					ret = -EPROTO;
 					goto poison;
+				} else if (apple_rtkit_oslog_owed_msg(rtk, msg.msg1, msg.msg0) ||
+					   apple_rtkit_notification_msg(msg.msg1, msg.msg0)) {
+					/* Echo now. The ring entry can be reused after the echo. */
+					echo = msg;
+					echo_pending = true;
+				} else {
+					/* Other system messages are replayed on disarm. */
+					kfifo_put(&s->deferred, msg);
 				}
 			}
 		}

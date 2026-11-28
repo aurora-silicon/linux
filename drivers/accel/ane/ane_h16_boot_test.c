@@ -39,6 +39,8 @@ struct ane_h16_sim {
 	u32 timeout_scratch;
 	u64 timeout_head;
 	u32 lock;
+	u32 protect[3];
+	u32 protect_reads;
 	u32 fault;
 	u32 fault_address_reads;
 	u32 channel_request;
@@ -89,8 +91,10 @@ static void sim_check_dart(struct ane_h16_sim *s, enum ane_h16_window w, u32 off
 	KUNIT_ASSERT_NOT_NULL(s->test, m);
 	if (off == m->dart_fault || off == m->dart_address_lo || off == m->dart_address_hi)
 		return;
+	if (off == m->dart_protect)
+		return;
 	KUNIT_EXPECT_EQ(s->test, w, ANE_H16_DART0 + s->soc.dapf_dart);
-	KUNIT_EXPECT_TRUE(s->test, off == m->dart_protect || off == m->dart_lock);
+	KUNIT_EXPECT_EQ(s->test, off, m->dart_lock);
 }
 
 static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
@@ -114,7 +118,11 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 		sim_check_dart(s, w, off);
 		if (off == s->soc.dart_params)
 			return s->dart_params;
-		if (off == s->mmio.dart_protect || off == s->mmio.dart_lock)
+		if (off == s->mmio.dart_protect) {
+			s->protect_reads |= BIT(w - ANE_H16_DART0);
+			return s->protect[w - ANE_H16_DART0];
+		}
+		if (off == s->mmio.dart_lock)
 			return s->lock;
 		if (off == s->mmio.dart_fault)
 			return s->fault;
@@ -1128,6 +1136,29 @@ static void ane_h16_map_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->pins, 0U);
 }
 
+/* Every DART is observed; only bit 0 prevents fresh translation ownership. */
+static void ane_h16_dart_protection_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), -ENODEV);
+	KUNIT_EXPECT_EQ(test, s->protect_reads, 0U);
+	KUNIT_ASSERT_EQ(test, ane_h16_select_mmio(&s->boot), 0);
+	for (i = 0; i < 3; i++) {
+		s->protect[i] = BIT(0);
+		s->protect_reads = 0;
+		KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), -EPERM);
+		KUNIT_EXPECT_EQ(test, s->protect_reads, 7U);
+		KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, false), 0);
+		s->protect[i] = BIT(1) | BIT(2);
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->maps, 0U);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+}
+
 static void ane_h16_locked_matching_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -1146,6 +1177,7 @@ static void ane_h16_dapf_program_test(struct kunit *test)
 	unsigned int i;
 
 	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_EQ(test, s->protect_reads, 7U);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
 	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 20U);
@@ -1245,7 +1277,8 @@ static void sim_use_t8132(struct ane_h16_sim *s)
 	s->build = ane_h16_build_t8132_25g83;
 	s->soc.dapf_count = 5;
 	s->soc.has_xl = false;
-	s->expect_tuning = ARRAY_SIZE(ane_t8132_axi) + ARRAY_SIZE(ane_t8132_axi_wd) +
+	s->expect_tuning = ARRAY_SIZE(ane_t8132_axi2af) + ARRAY_SIZE(ane_t8132_axi) +
+			   ARRAY_SIZE(ane_t8132_axi_wd) +
 			   ARRAY_SIZE(ane_t8132_axi_lock);
 }
 
@@ -1285,6 +1318,26 @@ static void ane_h16_no_xl_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
 }
 
+/* H15 (T8122): no CE block, no tunables, five DAPF records, DART rev 0x200. */
+static void ane_h16_t8122_no_ce_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->build = ane_h15_build_t8122_26b123;
+	s->mmio = ane_h15_mmio_t8122[0];
+	s->dart_params = 0x2a2a0200;
+	s->soc.h16_mmio = ane_h15_mmio_t8122;
+	s->soc.h16_mmio_count = ARRAY_SIZE(ane_h15_mmio_t8122);
+	s->soc.dapf_count = 5;
+	s->soc.has_xl = false;
+	s->ce_timeout = true;
+	s->expect_tuning = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->ce_ack, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+}
+
 /* The T8132 boots with its own engine writes only: no XL or C1PPT. */
 static void ane_h16_t8132_tunables_test(struct kunit *test)
 {
@@ -1316,9 +1369,52 @@ static void ane_h16_t8132_locked_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
 }
 
+/*
+ * An aborted system suspend cycles the T8132 sub-blocks under a held
+ * ANE_SYS: the AXI2AF words lose their bit-31 load strobe, the lock and the
+ * fields stay. The locked set still matches; a changed field is refused.
+ */
+static void ane_h16_t8132_locked_strobe_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+	u32 writes;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	writes = s->tuning_writes;
+	for (i = 0; i < ARRAY_SIZE(ane_t8132_axi2af); i++)
+		s->engine[ane_t8132_axi2af[i].offset / 4] &= ~BIT(31);
+	KUNIT_EXPECT_EQ(test, s->engine[0], 0x1bU);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+	s->engine[0] ^= 0x1;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+}
+
+/*
+ * Only the AXI2AF words have the strobe: a bit-31 field further up that
+ * clears, or a lost write-disable bit, is refused.
+ */
+static void ane_h16_t8132_locked_wd_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	s->engine[0x314 / 4] &= ~BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+	s->engine[0x314 / 4] |= BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	s->engine[ane_t8132_axi_wd[0].offset / 4] = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_alloc_reuse_test),
 	KUNIT_CASE(ane_h16_happy_test),
+	KUNIT_CASE(ane_h16_dart_protection_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
 	KUNIT_CASE(ane_h16_dapf_program_test),
 	KUNIT_CASE(ane_h16_dapf_partial_test),
@@ -1326,8 +1422,11 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_dapf_five_test),
 	KUNIT_CASE(ane_h16_dapf_five_readback_test),
 	KUNIT_CASE(ane_h16_no_xl_test),
+	KUNIT_CASE(ane_h16_t8122_no_ce_test),
 	KUNIT_CASE(ane_h16_t8132_tunables_test),
 	KUNIT_CASE(ane_h16_t8132_locked_test),
+	KUNIT_CASE(ane_h16_t8132_locked_strobe_test),
+	KUNIT_CASE(ane_h16_t8132_locked_wd_test),
 	KUNIT_CASE(ane_h16_unknown_revision_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
 	KUNIT_CASE(ane_h16_native_free_test),

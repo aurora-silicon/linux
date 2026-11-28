@@ -1,54 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* J716c external display processors and USB4 display routing. */
 
-&dcpext1_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext1_dart {
-	/* Scanout and PIODMA share the first register window. */
-	reg = <0x3 0x92300000 0x0 0xc000>;
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext1 {
-	apple,bw-scratch = <&dcpext0_pmc 0 5 0x30000>;
-	apple,dcp-index = <2>;
-	apple,clock-ids;
-};
-
-&dcpext2_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext2_dart {
-	/* Scanout and PIODMA share the first register window. */
-	reg = <0x3 0x02300000 0x0 0xc000>;
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext2 {
-	apple,bw-scratch = <&dcpext0_pmc 0 5 0x34000>;
-	apple,dcp-index = <3>;
-	apple,clock-ids;
-};
-
-&dcpext3_dart {
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dispext3_dart {
-	/* Scanout and PIODMA share the first register window. */
-	reg = <0x3 0x06300000 0x0 0xc000>;
-	apple,dma-range = <0x100 0x0 0x300 0x0>;
-};
-
-&dcpext3 {
-	apple,bw-scratch = <&dcpext0_pmc 0 5 0x38000>;
-	apple,dcp-index = <4>;
-	apple,clock-ids;
-};
-
 &atc2_phy {
 		reg = <0x3 0x83000000 0x0 0x2c000>,
 		      <0x3 0x82a90000 0x0 0x4000>,

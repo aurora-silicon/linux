@@ -71,6 +71,7 @@ def controls(ROOT):
     static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route) { (void)route; return false; }
     struct apple_dcp;
     static bool dcp_is_t8132_ext(const struct apple_dcp *dcp) { (void)dcp; return false; }
+    static bool dcp_t6041_ext_v27(const struct apple_dcp *dcp) { (void)dcp; return false; }
     #define dcp_queue_typec_reconnect(dcp,delay) ((void)(dcp),(void)(delay))
     #define dev_info_once(...) ((void)0)
     #define USB_TYPEC_DP_SID 0xff01
@@ -103,8 +104,9 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
     static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
-    /* An M1/M2 crossbar is not the T8142 layout, and an M1/M2 port has no fixed-CRTC connectors. */
+    /* An M1/M2 crossbar is not the T8142 or T6041 layout, and an M1/M2 port has no fixed-CRTC connectors. */
     static bool dcp_xbar_t8142(struct mux_control *m) { (void)m;return false; }
+    static bool dcp_xbar_t6041(struct mux_control *m) { (void)m;return false; }
     static bool dcp_typec_fixed_crtcs(void) { return false; }
     /* Deactivation retires queued DP IN events and drains their work. */
     static int tb_event_cancels;
@@ -163,7 +165,14 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     pos=actual.index('static struct typec_mux_dev phy_provider')
     # route_set asks whether a tunnel holds any of the port's slots: the real helper.
     tunneled='#ifndef ARRAY_SIZE\n#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))\n#endif\n'+apple_function(ROOT,'dcp_typec_port_tunneled')
-    actual=actual[:pos]+tunneled+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
+    route_apply=apple_function(ROOT,'dcp_typec_route_apply')
+    if route_apply:
+        # The ordinary SAFE fixture supplies a leaf for the T8142-only finish
+        # path. Here set must execute the complete production apply body too.
+        stub=block(actual,'static int dcp_typec_route_apply(')
+        actual=actual.replace(stub, 'static int dcp_typec_route_apply(struct typec_mux_dev *,struct typec_mux_state *);', 1)
+        pos=actual.index('static struct typec_mux_dev phy_provider')
+    actual=actual[:pos]+tunneled+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+route_apply+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
     actual=actual.replace(block(actual,'static int display_set('),'''static int display_set(struct typec_mux_dev *m,struct typec_mux_state *s) { event('S');return dcp_typec_route_set(m,s); }''',1)
     actual=actual.replace("(void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');", "(void)m;(void)s;event('L');",1)
     actual=actual.replace('connector=(struct connector){.connected=true};','connector=(struct connector){.connected=true};',1)
@@ -391,6 +400,10 @@ def probe(root):
 #define dev_err_probe(...) (-EINVAL)
 struct fwnode_handle { int unused; };
 static int connect_error,irq_error,register_error,node_puts,mux_get_error,controller_mode;
+#define EPROBE_DEFER 517
+/* Real OF/profile combinations are covered by j613-mux-order-tests.py. */
+static bool gate_pending;
+static bool cd321x_display_gate_pending(struct tps6598x *tps) { return gate_pending; }
 static void *devm_gpiod_get_optional(void *d,const char *s,int v) { (void)d;(void)s;(void)v;return NULL; }
 static void msleep(unsigned ms) { (void)ms; }
 static bool device_is_compatible(void *d,const char *s) { (void)d;(void)s;return false; }
@@ -413,10 +426,14 @@ static unsigned msecs_to_jiffies(unsigned ms) { return ms; }
 static void queue_delayed_work(int wq,int *work,unsigned delay) { (void)wq;(void)work;(void)delay; }
 static bool device_property_read_bool(void *d,const char *p) { (void)d;(void)p;return false; }
 static void tipd_debugfs_register(struct tps6598x *t) { (void)t; }
+static void tipd_port_list_add(struct tps6598x *t) { (void)t; }
 static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(void)f;return register_error; }
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
 static int cd321x_reset_inherited_connection(struct tps6598x *t,u32 *s) { (void)t;(void)s;return 0; }
+/* J714s only: this fixture's controller never keeps its boot power state. */
+static bool __attribute__((unused)) tipd_boot_power_kept(struct tps6598x *t) { (void)t;return false; }
+static int __attribute__((unused)) tipd_boot_power_on(struct tps6598x *t,u32 *s) { (void)t;(void)s;return 0; }
 """
     helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
@@ -429,6 +446,9 @@ static void probe_initial(struct cd321x *c) {
 }
 int main(void) {
  struct cd321x c;
+ probe_initial(&c);gate_pending=true;
+ assert(tipd_init(&c.tps)==-EPROBE_DEFER&&!node_puts&&!reset_calls&&!gpio_calls);
+ gate_pending=false;
  probe_initial(&c);irq_error=-ENOSPC;phy_error=-ETIMEDOUT;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==0&&gpio_calls==0&&port.owner==&route&&port.safe_pending&&unregisters==1&&node_puts==1);
  probe_initial(&c);connect_error=-EAGAIN;role_error=-EBUSY;

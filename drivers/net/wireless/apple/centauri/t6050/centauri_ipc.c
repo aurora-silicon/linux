@@ -2,6 +2,7 @@
 
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/list.h>
 #include <linux/pm_domain.h>
@@ -28,7 +29,7 @@ struct cen_context {
 struct centauri_t6050_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
-	bool enabled[3], owned[3];
+	bool enabled[3], owned[3], domain_lease[3];
 	bool alpha_pm_domain;
 	void __iomem *bar[3];
 	struct cen_context control, alpha;
@@ -190,7 +191,7 @@ static int message(struct cen_context *ctx, void __iomem *doorbell,
 {
 	u16 head = ctx->message_head;
 	u8 *descriptor;
-	u16 tail;
+	__le16 tail;
 	int ret;
 
 	if (head >= 15 || !length || length > 512)
@@ -231,7 +232,7 @@ static int cchi_init(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
 	u8 config[4] = {9, 0, 0xff, 0xff}, *entry;
-	u16 tail;
+	__le16 tail;
 	int i, ret;
 
 	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
@@ -309,7 +310,7 @@ static struct dev_pm_domain centauri_t6050_alpha_pm_domain;
 static int enumerate_functions(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
-	int i, ret;
+	int i, ret = 0;
 
 	c->pdev->multifunction = 1;
 	pci_rescan_bus(c->pdev->bus);
@@ -334,6 +335,13 @@ static int enumerate_functions(struct centauri_t6050 *c)
 				ret = -EBUSY;
 				goto unlock;
 			}
+		}
+		/* F0 already has the independent control owner's domain lease. */
+		if (i) {
+			ret = iommu_device_use_default_domain(&ipc->function[i]->dev);
+			if (ret)
+				goto unlock;
+			ipc->domain_lease[i] = true;
 		}
 		ipc->owned[i] = true;
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
@@ -370,7 +378,8 @@ unlock:
 	return 0;
 }
 
-static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
+static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
+					   struct pci_dev **beta)
 {
 	struct centauri_t6050_ipc *ipc;
 	u32 stage;
@@ -442,9 +451,7 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
 
 	/* Publish usable shared firmware before the Beta consumer probes. */
 	smp_store_release(&c->ready, true);
-	ret = device_attach(&ipc->function[2]->dev);
-	if (ret < 0)
-		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	*beta = pci_dev_get(ipc->function[2]);
 	return 0;
 failed:
 	dev_err(&c->pdev->dev, "IPC bootstrap failed: %d (Control stage=%#x)\n",
@@ -460,41 +467,94 @@ failed:
 	return ret;
 }
 
-int centauri_t6050_start_ipc(struct centauri_t6050 *c)
+/* On success *beta may hold a reference to the Beta function, for centauri_t6050_attach_beta(). */
+int centauri_t6050_start_ipc(struct centauri_t6050 *c, struct pci_dev **beta)
 {
 	int ret;
 
 	if (!pci_trylock_rescan_remove())
 		return -EAGAIN;
-	ret = READ_ONCE(c->removing) ? -ECANCELED : centauri_t6050_start_ipc_locked(c);
+	ret = READ_ONCE(c->removing) ? -ECANCELED :
+	      centauri_t6050_start_ipc_locked(c, beta);
 	pci_unlock_rescan_remove();
-	return ret;
+	return *beta ? 0 : ret;
+}
+
+/*
+ * Under neither the rescan lock nor boot_lock: the Beta driver's probe
+ * registers a PM notifier, a suspend's notifiers wait for a rescan, and a
+ * rescan's holder (the rewake) takes boot_lock.
+ */
+void centauri_t6050_attach_beta(struct centauri_t6050 *c, struct pci_dev *beta)
+{
+	int ret = device_attach(&beta->dev);
+
+	if (ret < 0)
+		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	pci_dev_put(beta);
 }
 
 void centauri_t6050_free_ipc(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
+
+	if (!ipc)
+		return;
+	centauri_t6050_wifi_unregister(c);
+	centauri_t6050_free_irqs(&c->alpha_irqs);
+	if (!centauri_t6050_ipc_fenced(ipc)) {
+		dev_warn(&c->pdev->dev, "retaining IPC DMA after pending transaction timeout\n");
+		return;
+	}
+	centauri_t6050_release_ipc(ipc);
+	c->ipc = NULL;
+}
+
+bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc)
+{
+	bool stopped = true;
+	int i;
+
+	if (!ipc)
+		return true;
+	for (i = 0; i < 3; i++)
+		if (ipc->owned[i])
+			pci_clear_master(ipc->function[i]);
+	for (i = 0; i < 3; i++)
+		if (ipc->owned[i] && !centauri_t6050_stop_dma(ipc->function[i]))
+			stopped = false;
+	return stopped;
+}
+
+/* Discard every pointer into the unbinding control driver's executable lifetime. */
+void centauri_t6050_detach_ipc(struct centauri_t6050_ipc *ipc)
+{
+	int i;
+
+	if (!ipc)
+		return;
+	if (ipc->alpha_pm_domain) {
+		dev_pm_domain_set(&ipc->function[1]->dev, NULL);
+		ipc->alpha_pm_domain = false;
+	}
+	for (i = 0; i < 3; i++) {
+		if (ipc->bar[i])
+			pci_iounmap(ipc->function[i], ipc->bar[i]);
+		ipc->bar[i] = NULL;
+		if (ipc->enabled[i])
+			pci_disable_device(ipc->function[i]);
+		ipc->enabled[i] = false;
+	}
+}
+
+/* IRQ users must be drained and every function fenced before this release. */
+void centauri_t6050_release_ipc(struct centauri_t6050_ipc *ipc)
+{
 	struct cen_buffer *buffer, *next;
 	int i;
 
 	if (!ipc)
 		return;
-	if (ipc->owned[2] && !c->firmware_sleep)
-		device_release_driver(&ipc->function[2]->dev);
-	centauri_t6050_wifi_unregister(c);
-	centauri_t6050_free_irqs(&c->alpha_irqs);
-	for (i = 0; i < 3; i++) {
-		if (!ipc->owned[i])
-			continue;
-		pci_clear_master(ipc->function[i]);
-	}
-	for (i = 0; i < 3; i++) {
-		if (ipc->owned[i] && !centauri_t6050_stop_dma(ipc->function[i])) {
-			dev_warn(&c->pdev->dev,
-				 "retaining IPC DMA after pending transaction timeout\n");
-			return;
-		}
-	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		memzero_explicit(buffer->cpu, buffer->size);
 		dma_free_coherent(buffer->owner, buffer->size, buffer->cpu, buffer->dma);
@@ -502,17 +562,16 @@ void centauri_t6050_free_ipc(struct centauri_t6050 *c)
 		list_del(&buffer->list);
 		kfree(buffer);
 	}
-	if (ipc->alpha_pm_domain)
-		dev_pm_domain_set(&ipc->function[1]->dev, NULL);
+	centauri_t6050_detach_ipc(ipc);
 	for (i = 0; i < 3; i++) {
-		if (ipc->bar[i])
-			pci_iounmap(ipc->function[i], ipc->bar[i]);
-		if (ipc->enabled[i])
-			pci_disable_device(ipc->function[i]);
+		if (ipc->domain_lease[i]) {
+			device_lock(&ipc->function[i]->dev);
+			iommu_device_unuse_default_domain(&ipc->function[i]->dev);
+			device_unlock(&ipc->function[i]->dev);
+		}
 		pci_dev_put(ipc->function[i]);
 	}
 	kfree(ipc);
-	c->ipc = NULL;
 }
 
 int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_resources *resources)
@@ -533,4 +592,38 @@ int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_re
 	resources->mtr = ipc->alpha.mtr;
 	resources->mcr = ipc->alpha.mcr;
 	return 0;
+}
+
+struct pci_dev *centauri_t6050_ipc_alpha_dev(struct centauri_t6050 *c)
+{
+	return c->ipc ? c->ipc->function[1] : NULL;
+}
+
+static u32 control_sleep_status(struct centauri_t6050 *c)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(c->ipc->control.buffer->cpu + 0x70)));
+}
+
+int centauri_t6050_ipc_control_sleep(struct centauri_t6050 *c, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	if (!c->ipc || !c->ipc->control.buffer ||
+	    readl(c->bar + 0x8000) != 2 || readl(c->bar + 0x8050) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, c->bar + 0x9078);
+	ret = read_poll_timeout(control_sleep_status, status,
+				(asleep ? status == 3 : status <= 1) ||
+				readl(c->bar + 0x8000) != 2,
+				100, 2000000, false, c);
+	dma_rmb();
+	if (readl(c->bar + 0x8000) != 2)
+		ret = -EIO;
+	dev_dbg(&c->pdev->dev,
+		"Control ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(c->bar + 0x8000), readl(c->bar + 0x8050));
+	return ret;
 }

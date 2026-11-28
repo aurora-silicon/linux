@@ -24,6 +24,13 @@ extern void secondary_holding_pen(void);
 volatile unsigned long __section(".mmuoff.data.read")
 secondary_holding_pen_release = INVALID_HWID;
 
+/*
+ * Once set, after a sleep's commit, a core that the SoC restarts at its reset vector and that
+ * comes back to the holding pen takes the deep-sleep WFI there instead of spinning (head.S),
+ * as macOS's parked cores do. Read with the MMU off.
+ */
+volatile unsigned long __section(".mmuoff.data.read") secondary_pen_deep;
+
 static phys_addr_t cpu_release_addr[NR_CPUS];
 
 /*
@@ -162,6 +169,8 @@ static u32 spin_table_hold_generation, spin_table_held_generation[NR_CPUS];
 static bool spin_table_hold_requested;
 static bool spin_table_stop_requested;
 static bool spin_table_stop_released;
+/* Stopped CPUs released to their last WFI ahead of the others: spin_table_release_cpus() */
+static struct cpumask spin_table_cpus_early;
 
 #define SPIN_TABLE_WAIT_US	100000
 
@@ -212,6 +221,9 @@ int spin_table_hold_parked(void)
 {
 	int us, ret;
 	unsigned int cpu;
+
+	/* No CPU restarted from here to the wake may pass the pen without its own bring-up. */
+	write_pen_release(INVALID_HWID);
 
 	for_each_present_cpu(cpu)
 		WRITE_ONCE(spin_table_hold_error[cpu], 0);
@@ -265,10 +277,50 @@ int spin_table_stop_parked(void)
 	return -ETIMEDOUT;
 }
 
+/*
+ * At the commit, after spin_table_stop_parked(): the stopped CPUs in @cpus take their last WFI
+ * now, ahead of the others, which wait for spin_table_release_stopped().
+ */
+void spin_table_release_cpus(const struct cpumask *cpus)
+{
+	cpumask_or(&spin_table_cpus_early, &spin_table_cpus_early, cpus);
+	dsb(ish);
+	sev();
+}
+
+/* CPUs already tracked off will not execute another sleep CPU-off callback. */
+bool spin_table_cpu_tracked_off(unsigned int cpu)
+{
+	return cpumask_test_cpu(cpu, &spin_table_cpus_off);
+}
+
+static bool spin_table_pen_deep_armed, spin_table_pen_el1_on;
+
+void spin_table_pen_deep_arm(bool on)
+{
+	spin_table_pen_deep_armed = on;
+}
+
+/* The pen's last WFI at EL1 (2) instead of the kernel's EL (1), for the next release */
+void spin_table_pen_deep_el1(bool on)
+{
+	spin_table_pen_el1_on = on;
+}
+
+static void spin_table_pen_deep_set(unsigned long on)
+{
+	void *start = (void *)&secondary_pen_deep;
+
+	secondary_pen_deep = on;
+	dcache_clean_inval_poc((unsigned long)start, (unsigned long)start + sizeof(secondary_pen_deep));
+}
+
 /* After the commit: the stopped CPUs take their last WFI. */
 void spin_table_release_stopped(void)
 {
 	WRITE_ONCE(spin_table_stop_released, true);
+	if (spin_table_pen_deep_armed)
+		spin_table_pen_deep_set(spin_table_pen_el1_on ? 2 : 1);
 	dsb(ish);
 	sev();
 }
@@ -279,9 +331,15 @@ void spin_table_release_stopped(void)
  */
 void spin_table_stop_finished(void)
 {
+	/* Before any CPU is started again: the pen must let them boot. */
+	if (secondary_pen_deep)
+		spin_table_pen_deep_set(0);
+	/* ...but only the one its bring-up releases (cores started early wait in the pen). */
+	write_pen_release(INVALID_HWID);
 	WRITE_ONCE(spin_table_hold_requested, false);
 	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
+	cpumask_clear(&spin_table_cpus_early);
 	cpumask_or(&spin_table_cpus_off, &spin_table_cpus_off, &spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_held);
@@ -296,12 +354,14 @@ static int smp_rvbar_spin_table_cpu_boot(unsigned int cpu)
 	/* The CPU may run straight into the pen: release it before it starts. */
 	write_pen_release(mpidr);
 
-	if (cpumask_test_and_clear_cpu(cpu, &spin_table_cpus_off)) {
+	if (cpumask_test_cpu(cpu, &spin_table_cpus_off)) {
+		/*
+		 * Still off until it runs smp_rvbar_spin_table_postboot(): a start that times out
+		 * leaves it here, so another online attempt pulses it again.
+		 */
 		ret = spin_table_power->cpu_on(mpidr);
-		if (ret) {
-			cpumask_set_cpu(cpu, &spin_table_cpus_off);
+		if (ret)
 			return ret;
-		}
 	} else if (cpumask_test_cpu(cpu, &spin_table_cpus_parked)) {
 		cpumask_set_cpu(cpu, &spin_table_cpus_unpark);
 	}
@@ -363,7 +423,8 @@ static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 			cpumask_clear_cpu(cpu, &spin_table_cpus_held);
 			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
 
-			while (!READ_ONCE(spin_table_stop_released))
+			while (!READ_ONCE(spin_table_stop_released) &&
+			       !cpumask_test_cpu(cpu, &spin_table_cpus_early))
 				wfe();
 			spin_table_power->cpu_off(mpidr);
 		}
@@ -417,6 +478,15 @@ static int smp_rvbar_spin_table_cpu_kill(unsigned int cpu)
 
 static void smp_rvbar_spin_table_postboot(void)
 {
+	/*
+	 * Close the pen behind this CPU. Left at its MPIDR, the next restart at the reset vector
+	 * (after a sleep's commit, or a platform that starts every core at once at the wake)
+	 * lets it straight through the pen into secondary_startup ahead of its own bring-up,
+	 * with the secondary_data of its last boot: it then runs as that CPU with no STARTING
+	 * callbacks run, e.g. without a tick device.
+	 */
+	write_pen_release(INVALID_HWID);
+	cpumask_clear_cpu(smp_processor_id(), &spin_table_cpus_off);
 	if (READ_ONCE(spin_table_power) && spin_table_power->cpu_restore)
 		spin_table_power->cpu_restore(read_cpuid_mpidr() & MPIDR_HWID_BITMASK);
 }

@@ -3,7 +3,7 @@
 //! Atomic words avoid unsafe shared payload access; ready publishes each slot.
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::fmt::{self, Write};
-use kernel::{bindings, module_param::KernelParam};
+use kernel::bindings;
 
 pub(crate) const WORDS: usize = 24;
 const CAPACITY: usize = 16384;
@@ -174,19 +174,13 @@ unsafe extern "C" fn set(value: *const core::ffi::c_char, _: *const bindings::ke
 static OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(set), get: Some(get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_timing_buffer"
-    } else { c"aurora.g17p_timing_buffer" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    PARAM,
+    "g17p_timing_buffer",
+    ops: core::ptr::from_ref(&OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 
 // One explicit post-window snapshot. No live ring reads occur in record().
 // 0 unused, 1 requested, 2 copying, 3 complete, 4 failed; no reset until unload.
@@ -287,19 +281,13 @@ unsafe extern "C" fn completion_get(buf: *mut core::ffi::c_char,
 static COMPLETION_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(completion_set), get: Some(completion_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static COMPLETION_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_completion_buffer"
-    } else { c"aurora.g17p_completion_buffer" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&COMPLETION_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    COMPLETION_PARAM,
+    "g17p_completion_buffer",
+    ops: core::ptr::from_ref(&COMPLETION_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 
 /// Armed-only host observation gate; no additional device reads. Kind7 words:
 /// slot, front ordinal (MAX if unavailable), reason (1borrowed,2restaged,3UMA,
@@ -407,8 +395,11 @@ unsafe extern "C" fn diag_get(buf: *mut core::ffi::c_char,
     // 177838 idle-off policy (RegionC+0x30 copy), 128a68 keep-on bits.
     for (name, link) in [("powerups", 0xffff_fc00_0012_4ba0u64), ("state", 0xffff_fc00_0017_71f8),
         ("idleoff", 0xffff_fc00_0017_7838), ("keepon", 0xffff_fc00_0012_8a68)] {
-        let value = crate::g18::compat::g17p::LiveFirmwareU64Probe::new(
-            crate::g18::compat::g17p::g17p_gfx_link_to_physical(link))
+        let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(link) else {
+            let _ = writeln!(out, "{} none (no G17P fw-data region)", name);
+            continue;
+        };
+        let value = crate::g18::compat::g17p::LiveFirmwareU64Probe::new(physical)
             .and_then(|probe| probe.observe_mask(u64::MAX, 1))
             .map(|sample| sample.first);
         let _ = writeln!(out, "{} {:x?}", name, value);
@@ -449,7 +440,10 @@ unsafe extern "C" fn peek_get(buf: *mut core::ffi::c_char,
     let address = PEEK_ADDR.load(Ordering::Relaxed);
     if address < PEEK_DATA_START { return 0; }
     let page = crate::pgtable::UAT_PGSZ as u64;
-    let physical = crate::g18::compat::g17p::g17p_gfx_link_to_physical(address);
+    let Some(physical) = crate::g18::compat::g17p::g17p_gfx_link_to_physical(address) else {
+        let _ = writeln!(out, "error: no G17P fw-data region");
+        return out.used as core::ffi::c_int;
+    };
     let room = ((page - (physical & (page - 1))) / 8).min(64) as usize;
     let room = room.min(((PEEK_DATA_END - address) / 8) as usize);
     let mut values = [0u64; 64];
@@ -467,19 +461,13 @@ unsafe extern "C" fn peek_get(buf: *mut core::ffi::c_char,
 static PEEK_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(peek_set), get: Some(peek_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static PEEK_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_fw_peek"
-    } else { c"aurora.g17p_fw_peek" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PEEK_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    PEEK_PARAM,
+    "g17p_fw_peek",
+    ops: core::ptr::from_ref(&PEEK_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 /// Root-only `g17p_grid_peek`: write a byte offset (hex, 8-aligned) into the
 /// last `DIAG_GRID_SNAPSHOT` copy; reading returns up to 64 qwords from it.
 static GRID_OFFSET: AtomicUsize = AtomicUsize::new(0);
@@ -522,19 +510,13 @@ unsafe extern "C" fn grid_get(buf: *mut core::ffi::c_char,
 static GRID_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(grid_set), get: Some(grid_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static GRID_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_grid_peek"
-    } else { c"aurora.g17p_grid_peek" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&GRID_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    GRID_PARAM,
+    "g17p_grid_peek",
+    ops: core::ptr::from_ref(&GRID_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 /// Root-only `g17p_gpc_sample`: writing N (1..=400000) samples the always-on
 /// GPC performance state (sgx+0xe01000 & 0xf, J700 physical 0x4_80e0_1000)
 /// N times, sleeping ~20 us between reads; reading prints the histogram of
@@ -591,35 +573,23 @@ unsafe extern "C" fn gpc_get(buf: *mut core::ffi::c_char,
 static GPC_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(gpc_set), get: Some(gpc_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static GPC_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_gpc_sample"
-    } else { c"aurora.g17p_gpc_sample" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&GPC_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    GPC_PARAM,
+    "g17p_gpc_sample",
+    ops: core::ptr::from_ref(&GPC_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 static DIAG_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(diag_set), get: Some(diag_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static DIAG_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_diag_knobs"
-    } else { c"aurora.g17p_diag_knobs" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&DIAG_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    DIAG_PARAM,
+    "g17p_diag_knobs",
+    ops: core::ptr::from_ref(&DIAG_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 /// Opt-in `g17p_diag_knobs` bit10: one-shot log of host<->firmware traffic.
 /// Each entry is [counter | kind << 56, a, b, c]; the log stops at capacity
 /// until `g17p_msglog` is written "reset". Logging only; changes no behaviour.
@@ -726,19 +696,13 @@ unsafe extern "C" fn msglog_get(buf: *mut core::ffi::c_char,
 static MSGLOG_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(msglog_set), get: Some(msglog_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static MSGLOG_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_msglog"
-    } else { c"aurora.g17p_msglog" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&MSGLOG_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    MSGLOG_PARAM,
+    "g17p_msglog",
+    ops: core::ptr::from_ref(&MSGLOG_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);
 
 /// Opt-in bit14: request a work-ring scan before eligible render preparation.
 pub(crate) const DIAG_EARLY_RENDER_DOORBELL: u32 = 1 << 14;
@@ -914,16 +878,10 @@ unsafe extern "C" fn pstate_get(buf: *mut core::ffi::c_char,
 static PSTATE_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
     flags: 0, set: Some(pstate_set), get: Some(pstate_get), free: None,
 };
-#[link_section = "__param"]
-#[used]
-static PSTATE_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
-    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-        c"g17p_stats_pstate"
-    } else { c"aurora.g17p_stats_pstate" }),
-    #[cfg(MODULE)]
-    mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
-    #[cfg(not(MODULE))]
-    mod_: core::ptr::null_mut(),
-    ops: core::ptr::from_ref(&PSTATE_OPS), perm: 0o600, level: -1, flags: 0,
-    __bindgen_anon_1: bindings::kernel_param__bindgen_ty_1 { arg: core::ptr::null_mut() },
-});
+crate::g18::params::g18_kernel_param!(
+    PSTATE_PARAM,
+    "g17p_stats_pstate",
+    ops: core::ptr::from_ref(&PSTATE_OPS),
+    perm: 0o600,
+    arg: core::ptr::null_mut(),
+);

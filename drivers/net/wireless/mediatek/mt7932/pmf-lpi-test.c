@@ -146,6 +146,72 @@ static void mt_pmf_admission_test(struct kunit *test)
 			0);
 }
 
+/* WPA/WPA2 mixed mode: TKIP group, CCMP and TKIP pairwise, AKMs 2, 6 and 8,
+ * MFPC set so that only the group cipher decides admission.
+ */
+static const u8 mixed_rsn[] = {
+	48, 32, 1, 0, 0, 15, 172, 2, 2, 0, 0, 15, 172, 4, 0, 15, 172, 2,
+	3, 0, 0, 15, 172, 2, 0, 15, 172, 6, 0, 15, 172, 8, 128, 0,
+};
+
+static void mt_tkip_group_admission_test(struct kunit *test)
+{
+	static const u32 akms[] = { WLAN_AKM_SUITE_PSK_SHA256,
+				    WLAN_AKM_SUITE_SAE };
+	u8 ies[sizeof(mixed_rsn)];
+	unsigned int i;
+	bool pmf;
+
+	KUNIT_EXPECT_EQ(test,
+			mt7932_connect_admit(mixed_rsn, sizeof(mixed_rsn),
+					     WLAN_AKM_SUITE_PSK,
+					     NL80211_MFP_OPTIONAL, &pmf),
+			0);
+	KUNIT_EXPECT_TRUE(test, pmf);
+	memcpy(ies, mixed_rsn, sizeof(ies));
+	ies[32] = 0; /* no MFPC, as most mixed-mode APs */
+	KUNIT_EXPECT_EQ(test,
+			mt7932_connect_admit(ies, sizeof(ies),
+					     WLAN_AKM_SUITE_PSK,
+					     NL80211_MFP_NO, &pmf),
+			0);
+	KUNIT_EXPECT_FALSE(test, pmf);
+	/* A TKIP group stays refused for every other AKM; with a CCMP group
+	 * the same element admits them, so the group cipher is the reason.
+	 */
+	for (i = 0; i < ARRAY_SIZE(akms); i++) {
+		KUNIT_EXPECT_EQ(test,
+				mt7932_connect_admit(mixed_rsn,
+						     sizeof(mixed_rsn), akms[i],
+						     NL80211_MFP_OPTIONAL,
+						     &pmf),
+				-EINVAL);
+		memcpy(ies, mixed_rsn, sizeof(ies));
+		ies[7] = 4; /* CCMP group */
+		KUNIT_EXPECT_EQ(test,
+				mt7932_connect_admit(ies, sizeof(ies), akms[i],
+						     NL80211_MFP_OPTIONAL,
+						     &pmf),
+				0);
+	}
+	/* The pairwise list must still offer CCMP. */
+	memcpy(ies, mixed_rsn, sizeof(ies));
+	ies[13] = 2;
+	KUNIT_EXPECT_EQ(test,
+			mt7932_connect_admit(ies, sizeof(ies),
+					     WLAN_AKM_SUITE_PSK,
+					     NL80211_MFP_OPTIONAL, &pmf),
+			-EINVAL);
+	/* WEP-40 and other group suites stay refused on AKM 2. */
+	memcpy(ies, mixed_rsn, sizeof(ies));
+	ies[7] = 1;
+	KUNIT_EXPECT_EQ(test,
+			mt7932_connect_admit(ies, sizeof(ies),
+					     WLAN_AKM_SUITE_PSK,
+					     NL80211_MFP_OPTIONAL, &pmf),
+			-EINVAL);
+}
+
 static void mt_pmf_body_test(struct kunit *test)
 {
 	static const struct mt7932_peer_ids ids = { { 1, 2 }, { 3, 4, 5, 6 } };
@@ -442,6 +508,7 @@ static void mt_6g_tpe_golden_test(struct kunit *test)
 
 static struct kunit_case mt_pmf_lpi_cases[] = {
 	KUNIT_CASE(mt_pmf_admission_test),
+	KUNIT_CASE(mt_tkip_group_admission_test),
 	KUNIT_CASE(mt_pmf_body_test),
 	KUNIT_CASE(mt_6g_ap_test),
 	KUNIT_CASE(mt_6g_tpe_body_test),
