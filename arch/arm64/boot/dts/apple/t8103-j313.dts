@@ -192,6 +192,7 @@
 &pmgr_misc {
 	apple,fabric-min-pstate = <1>;
 	apple,dcs-min-pstate = <4>;
+	apple,disp-min-pstate = <2>;
 };
 
 /* The SMC's wake reasons (ADT smc-pmu, event_name-bitN) */
