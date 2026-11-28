@@ -52,8 +52,8 @@ driver = (root / "drivers/iommu/apple-dart.c").read_text()
 branches = closed_branches_put(driver)
 assert branches == 6, branches
 # Negative control: a branch that leaks its reference is caught.
-leak = driver.replace("\t\t\tapple_dart_sleep_writer_put(stream.dart, gate);\n\t\t\terr = err ?: ret;\n\t\t\tcontinue;",
-                      "\t\t\terr = err ?: ret;\n\t\t\tcontinue;", 1)
+leak = driver.replace("\t\t\tapple_dart_sleep_writer_put(stream.dart, gate);\n\t\t\tspin_lock_irqsave(&stream.dart->managed_lock, flags);",
+                      "\t\t\tspin_lock_irqsave(&stream.dart->managed_lock, flags);", 1)
 assert leak != driver
 try:
     closed_branches_put(leak)

@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t6050-ultra.dtsi"
+#include "t6050-studio-audio.dtsi"
 
 / {
 	compatible = "apple,j775d", "apple,t6050", "apple,arm-platform";
@@ -47,48 +48,49 @@
 		#size-cells = <2>;
 		ranges;
 	};
-
-	/*
-	 * The jack (CS42L84) and the speaker (SN012776) through the AOP's audio services. The card waits
-	 * for its CPU component, the AOP audio node, which exists only after Aura's AOP handoff.
-	 */
-	sound {
-		compatible = "apple,j775d-macaudio", "apple,macaudio";
-		model = "Mac Studio J775D";
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		dai-link@0 {
-			reg = <0>;
-			link-name = "Headphone Jack";
-
-			cpu {
-				sound-dai = <&aop_audio 0>;
-			};
-
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
-
-		dai-link@1 {
-			reg = <1>;
-			link-name = "Speaker";
-
-			cpu {
-				sound-dai = <&aop_audio 3>;
-			};
-
-			codec {
-				sound-dai = <&speaker_amp>;
-			};
-		};
-	};
 };
+
+&sound {
+	compatible = "apple,j775d-macaudio", "apple,macaudio";
+	model = "Mac Studio J775D";
+};
+
+/*
+ * The AOP, with its RTKit mailbox, its DART and the audio DMA controller, booted over the RTKit
+ * mailbox alone. This board's AOP firmware does not service the setup port: started through both,
+ * it sends nothing there and leaves the AP's message unread. The setup mailbox stays described,
+ * disabled.
+ */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&aop {
+	mboxes = <&aop_mbox>;
+	mbox-names = "mbox";
+	status = "okay";
+};
+
+/*
+ * Shared with the Mac mini: the onboard Ethernet (PCIe port 2, an RTL8127A here) and rear
+ * USB-C ports 1-3. Port 1 (HPM0, "back-right") is reserved for the debug link.
+ */
+#define T6050_DESKTOP_HPM1_LABEL "USB-C Back-right-middle"
+#define T6050_DESKTOP_HPM2_LABEL "USB-C Back-left-middle"
+#include "t6050-desktop.dtsi"
 
 /*
  * PCIe ports 2 (the onboard 10 Gb Ethernet) and 3 (the rear USB-A xHCI). The boot loader
  * powers and trains both links; it disables a port, and its DART, whose link did not come up.
+ * Port 2's node is in t6050-desktop.dtsi.
  *
  * Port 0 carries the N1 (Wi-Fi and Bluetooth), described disabled until the boot loader trains
  * it (pci@0,0 below).
@@ -123,32 +125,6 @@
 		    <0x200 &dart_apcie3 1 1>,
 		    <0x300 &dart_apcie0 1 3>;
 	bus-range = <0 3>;
-
-	port02: pci@2,0 {
-		device_type = "pci";
-		reg = <0x1000 0 0 0 0>;
-		bus-range = <1 1>;
-		apple,link-trained-by-bootloader;
-
-		#address-cells = <3>;
-		#size-cells = <2>;
-		ranges;
-
-		interrupt-controller;
-		#interrupt-cells = <1>;
-		interrupt-map-mask = <0 0 0 7>;
-		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
-				<0 0 0 2 &port02 0 0 0 1>,
-				<0 0 0 3 &port02 0 0 0 2>,
-				<0 0 0 4 &port02 0 0 0 3>;
-
-		/* The RTL8127A keeps no MAC address of its own */
-		ethernet0: ethernet@0,0 {
-			reg = <0x10000 0x0 0x0 0x0 0x0>;
-			/* To be filled by the loader */
-			local-mac-address = [00 00 00 00 00 00];
-		};
-	};
 
 	port03: pci@3,0 {
 		device_type = "pci";
@@ -239,44 +215,12 @@
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 4>, <140 81>;
 };
 
-&i2c1 {
-	/*
-	 * ADT speaker-config: playback slot 0, amp gain 20, V sense in slot 0 and I sense
-	 * in slot 2. The firmware's speaker frame is 250 BCLKs of 12 MHz (ADT
-	 * iop-audio-controller/audio-speaker), which the amp's ratio detection rejects.
-	 */
-	speaker_amp: codec@38 {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x38>;
-		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		ti,imon-slot-no = <2>;
-		ti,vmon-slot-no = <0>;
-	};
-};
-
-&i2c2 {
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Jack";
-	};
-};
-
 /*
  * The console is on the USB debug link, which drains only while a host reads
  * it; the machine also boots with nothing attached there.
  */
 &dockchannel {
 	apple,tx-never-wait;
-	status = "okay";
-};
-
-&dart_apcie2 {
 	status = "okay";
 };
 
@@ -360,92 +304,9 @@
 /*
  * The USB-C ports: rear ports 1-4 on ATC0-3 of die 0, front ports 5 and 6 on ATC0 and ATC1 of
  * die 1. The HPMs of the rear ports are on nub-spmi-a0, those of the front ports on nub-spmi-a2.
+ * Rear ports 1-3 are in t6050-desktop.dtsi; rear port 4 and the front ports follow.
  */
 &nub_spmi_a0 {
-	/*
-	 * /arm-io/nub-spmi-a0/hpm0: SN201202x (ACE3), SPMI address 0xc, port-number 1 (back-right).
-	 * Reserved: rear port 1 carries the DFU cable, the host's VDM reboot path and the
-	 * debug console (KIS) through usb-drd0; a probe wakes the controller and sets its
-	 * power state even when polled. No ATC0, usb-drd0 or dart-usb0 node either.
-	 */
-	hpm0: usb-pd@c {
-		compatible = "apple,sn201202x";
-		reg = <0xc SPMI_USID>;
-		status = "disabled";
-	};
-
-	/* /arm-io/nub-spmi-a0/hpm1: SN201202x (ACE3), SPMI address 0xa, port-number 2 */
-	hpm1: usb-pd@a {
-		compatible = "apple,sn201202x";
-		reg = <0xa SPMI_USID>;
-
-		connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Back-right-middle";
-			power-role = "dual";
-			data-role = "host";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					hpm1_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					hpm1_ss: endpoint {
-						remote-endpoint = <&atc1_phy_ep>;
-					};
-				};
-			};
-		};
-	};
-
-	/* /arm-io/nub-spmi-a0/hpm2: SN201202x (ACE3), SPMI address 8, port-number 3 */
-	hpm2: usb-pd@8 {
-		compatible = "apple,sn201202x";
-		reg = <0x8 SPMI_USID>;
-		status = "disabled";
-
-		connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Back-left-middle";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					hpm2_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					hpm2_ss: endpoint {
-						remote-endpoint = <&atc2_phy_ep>;
-					};
-				};
-
-				port@2 {
-					reg = <2>;
-					hpm2_dp: endpoint {
-						remote-endpoint = <&dcpext0_typec>;
-					};
-				};
-			};
-		};
-	};
-
 	/* /arm-io/nub-spmi-a0/hpm3: SN201202x (ACE3), SPMI address 6, port-number 4 */
 	hpm3: usb-pd@6 {
 		compatible = "apple,sn201202x";
@@ -475,9 +336,13 @@
 					};
 				};
 
-				/* The USB4 router (usb4_3_acio), the PD driver's thunderbolt-switch */
-				port@2 {
-					reg = <2>;
+				/*
+				 * The USB4 router (usb4_3_acio), the PD driver's
+				 * thunderbolt-switch; port@2 is reserved for DisplayPort
+				 * (apple,dcp-typec-routes.yaml).
+				 */
+				port@3 {
+					reg = <3>;
 					hpm3_tbt: endpoint {
 						remote-endpoint = <&usb4_3_ep>;
 					};
@@ -547,60 +412,6 @@
 					hpm5_ss: endpoint {
 						remote-endpoint = <&atc5_phy_ep>;
 					};
-				};
-			};
-		};
-	};
-};
-
-/*
- * Rear USB-C port 2 (HPM1, "back-right-middle"), USB data: ATC1's combo PHY, usb-drd1 and
- * dart-usb1.
- */
-&atc1_phy {
-	port {
-		atc1_phy_ep: endpoint {
-			remote-endpoint = <&hpm1_ss>;
-		};
-	};
-};
-
-&usb_drd1 {
-	port {
-		usb_drd1_hs: endpoint {
-			remote-endpoint = <&hpm1_hs>;
-		};
-	};
-};
-
-/*
- * Rear USB-C port 3 (HPM2, "back-left-middle", the display port): DisplayPort out from dcpext0
- * through ATC2, and USB beside it (usb-drd2, dart-usb2). The chain stays disabled: Aura's T6050
- * display handoff enables what dcpext0 references (phys, mux-controls, the PHY's mailbox and
- * power domains, the typec route's HPM and its SPMI bus).
- */
-&atc2_phy {
-	port {
-		atc2_phy_ep: endpoint {
-			remote-endpoint = <&hpm2_ss>;
-		};
-	};
-};
-
-&usb_drd2 {
-	port {
-		usb_drd2_hs: endpoint {
-			remote-endpoint = <&hpm2_hs>;
-		};
-	};
-};
-
-&dcpext0 {
-	typec-routes {
-		route@0 {
-			port {
-				dcpext0_typec: endpoint {
-					remote-endpoint = <&hpm2_dp>;
 				};
 			};
 		};
@@ -695,4 +506,40 @@
 };
 
 #define T6050_J775D
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The other three die-0 external display engines (dcpext1..3). The shared
+ * properties live in t6050-peripherals.dtsi; each empty typec-routes container
+ * asks the boot loader to write the engine's USB-C display routes from the ADT.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+#include "t6050-j775d-gpu.dtsi"

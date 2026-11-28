@@ -553,11 +553,12 @@ Kernel parameters
 			See header of arch/x86/kernel/apm_32.c.
 
 	apple_keep_idle_nop
-			[ARM64,EARLY] On T6050 and T8142, keep idle=nop.
-			These cores idle in WFI by default, and an idle=nop
-			that the boot loader appends is ignored, because the
-			kernel preserves the registers WFI loses there. With
-			this flag idle=nop spins the idle loop as elsewhere.
+			[ARM64,EARLY] On Apple M4 and later cores, keep
+			idle=nop. These cores idle in WFI by default, and an
+			idle=nop that an older boot loader appends is
+			ignored, because the kernel preserves the registers
+			WFI loses there. With this flag idle=nop spins the
+			idle loop as elsewhere.
 
 	apparmor=	[APPARMOR] Disable or enable AppArmor at boot time
 			Format: { "0" | "1" }
@@ -7627,14 +7628,6 @@ Kernel parameters
 			See Documentation/admin-guide/mm/transhuge.rst for more
 			details.
 
-	thunderbolt.dp_video_counter=
-			[HW,ARM64]
-			Format: <bool>
-			Enable diagnostic counter 0 on the DP video path's
-			host and downstream ingress hops on the right-hand
-			USB-C route of the Apple M2 Pro and M2 Max laptops. Read counters through Thunderbolt
-			debugfs. This is a load-time setting. Default: false.
-
 	thunderbolt_apple.dp_display=
 			[HW,ARM64]
 			Format: <bool>
@@ -8349,10 +8342,10 @@ Kernel parameters
 
 	user4k=		[ARM64,EARLY]
 			Format: <bool>
-			Enable the experimental per-process user page sizes
-			(4K userspace pages on a 16K or 64K kernel) built
-			with CONFIG_ARM64_USER4K_EXPERIMENTAL.
-			Default: off. While off, the private page-size
+			Enable or disable the experimental per-process user
+			page sizes (4K userspace pages on a 16K or 64K
+			kernel) built with CONFIG_ARM64_USER4K_EXPERIMENTAL.
+			Default: on. With user4k=off, the private page-size
 			prctls refuse every non-native size with EINVAL,
 			every exec uses the native page size and the 4K
 			ownership record is not reserved in page_ext.

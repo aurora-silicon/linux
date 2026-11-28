@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M4 25G83 HAL200 work-image and microsequence encoders.
+//! M4 HAL200 work-image and microsequence encoders (25G83 and 26B123 work layouts).
 //!
 //! Pure byte builders over retained firmware/client addresses. Allocation,
 //! address-range admission, owner leases, cache visibility and publication are
@@ -8,7 +8,7 @@
 
 use kernel::{prelude::*, uapi};
 
-use super::fw::graph::manager;
+use super::fw::graph::{manager, pools};
 use super::fw::work::{self, barrier, compute, fs, initbm, scene, ta, REG_RECORD};
 use super::hw;
 
@@ -67,11 +67,40 @@ pub(crate) const fn compact(gva: u64) -> u64 {
     gva.wrapping_sub(0x1000000000)
 }
 
+/// Packed UMA page-table cache (PTC) policy word written to `0xa5a1` (TA), `0xa5a9` (FS),
+/// and `0xa599` (compute): low 16 bits = min entries, bits 31..16 = mid entries, bits 63..32 =
+/// max entries.
+pub(super) const fn uma_ptc_word(min: u16, mid: u16, max: u16) -> u64 {
+    (min as u64) | ((mid as u64) << 16) | ((max as u64) << 32)
+}
+
+/// Packed DUPM resource-control word written to `0xd419` (TA), `0xd429` (FS), and `0xd411`
+/// (compute): lower and upper 32-bit resource-allocation limits.
+pub(super) const fn dupm_control_word(lo: u32, hi: u32) -> u64 {
+    (lo as u64) | ((hi as u64) << 32)
+}
+
+/// Default DUPM resource-control word shared by TA, FS and compute work items.
+pub(super) const DEFAULT_DUPM_CONTROL: u64 = dupm_control_word(1, 2);
+
+/// Default per-stage hardware control word written to `0x101e1`/`0x12099` (TA),
+/// `0x101e9`/`0x120a1` (FS), and `0x101d9`/`0x12091` (compute).
+pub(super) const STAGE_CTRL_DEFAULT: u64 = 0x1c;
+
+/// Fragment tile-state base bits (`0x16068`) for G15 and G16+ hardware, plus the required
+/// enable bit at bit 37.
+const TILE_STATE_BASE_G15: u64 = 0x36011;
+const TILE_STATE_BASE_G16: u64 = 0x3717f;
+const TILE_STATE_ENABLE_BIT: u64 = 1 << 37;
+
 #[path = "encode/compute.rs"]
 mod compute_encoder;
+use compute_encoder::put_generation;
 #[allow(unused_imports)] // Pure encoder utilities are exercised by the host ABI harness.
 pub(crate) use compute_encoder::{
-    encode_compute, init_compute_pool, preserve_compute_descriptor, ComputeEncodeError, ComputeRefs,
+    encode_compute, encode_compute_for, encode_compute_rt, init_compute_pool,
+    preserve_compute_descriptor, validate_compute_descriptor, ComputeEncodeError, ComputeRefs,
+    ComputeRt, COMPUTE_SCS_DRIVER_WORD,
 };
 
 /// Tiling geometry and register words of a render (accelerator count 2).
@@ -115,9 +144,20 @@ impl Geometry {
         Ok(())
     }
 
-    /// The geometry of render `u` with layer metadata at `heap`. The render was validated
-    /// (width, height, layers >= 1, samples 1, 2 or 4, utiles 16 or 32).
+    /// The geometry of render `u` with layer metadata at `heap` for single-cluster G16G.
     pub(crate) fn new(u: &uapi::drm_asahi_cmd_render, heap: u64) -> Self {
+        Self::new_for(u, heap, 1, 16)
+    }
+
+    /// The geometry of render `u` with layer metadata at `heap` for a GPU with `num_clusters`
+    /// clusters and `gpu_generation`. The render was validated (width, height, layers >= 1,
+    /// samples 1, 2 or 4, utiles 16 or 32).
+    pub(crate) fn new_for(
+        u: &uapi::drm_asahi_cmd_render,
+        heap: u64,
+        num_clusters: u32,
+        gpu_generation: u32,
+    ) -> Self {
         let (w, h, l) = (
             u32::from(u.width_px),
             u32::from(u.height_px),
@@ -156,7 +196,7 @@ impl Geometry {
         };
         g.utile_config = utile_w | utile_h | log2s;
         g.tilemap_bytes = align(5 * g.e * u64::from(l), 0x1000);
-        g.tpc_bytes = g.e * 8 * u64::from(l);
+        g.tpc_bytes = u64::from(num_clusters.max(1)) * g.e * 8 * u64::from(l);
         g.layer_metadata = heap + if l > 1 { 0x200 } else { 0 };
         g.layer_mode = if l == 1 {
             0x8000
@@ -172,12 +212,19 @@ impl Geometry {
         ) as u32
             | log2s << 17;
         g.tile_mode = 0x280 | u32::from(l > 1) | if empty { 1 << 16 } else { 0 };
-        g.isp_control = 0xc000 | (u.flags & (1 << 18));
-        g.native_tiles = 0x3717fu64
+        let few_primitives =
+            u.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES != 0;
+        g.isp_control = 0xc000 | (u.flags & (1 << 18)) | u32::from(few_primitives);
+        let native_tiles_base = if gpu_generation < 16 {
+            TILE_STATE_BASE_G15
+        } else {
+            TILE_STATE_BASE_G16
+        };
+        g.native_tiles = native_tiles_base
             | u64::from(l > 1) << 32
             | u64::from(g.tx.wrapping_sub(1)) << 44
             | u64::from(g.ty.wrapping_sub(1)) << 53
-            | 137438953472u64
+            | TILE_STATE_ENABLE_BIT
             | u64::from(g.utile_config & 0xf000) << 28;
         g
     }
@@ -277,6 +324,7 @@ pub(crate) fn barrier(
 mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
-    append_fs_timestamp_copies, encode_fs, encode_ta, fill_scene, initbm, render_attachments,
-    scene, scene_render, PassRefs, RenderRefs,
+    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_fs_rt, encode_ta, encode_ta_for,
+    encode_ta_rt, fill_scene, initbm, render_attachments, render_attachments_for, scene,
+    scene_prefix, scene_render, PassRefs, RenderRefs, StageRt, RENDER_SCS_ENABLE,
 };

@@ -6,12 +6,13 @@ const HOST: u64 = wire::HOST_START;
 fn emit<T>(out:&mut Vec<u8>, value:Result<T,()>)->Option<T> { out.push(u8::from(value.is_err()));value.ok() }
 fn input()->wire::Input {
     wire::Input {
-        // Independently pinned qualified C/J713 bin for this immutable byte fixture.
+        // J713 frequencies with synthetic voltage bins.
         performance: wire::Performance {
-            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470],
-            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326],
-            voltage: [125,610,645,680,725,780,825,865,895,970],
-            sram: [780,780,780,780,780,780,825,865,895,970],
+            count: 10,
+            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470,0],
+            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326,0],
+            voltage: [100,600,650,700,750,800,850,900,950,1000,0],
+            sram: [800,800,800,800,800,800,850,900,950,1000,0],
         },
         va: core::array::from_fn(|i|HOST+0x100000+i as u64*0x100000),
         channel_state:core::array::from_fn(|i|HOST+0x4000000+i as u64*0x10000),
@@ -19,6 +20,10 @@ fn input()->wire::Input {
         loader_va:core::array::from_fn(|i|if wire::LOADERS[i].length!=0 {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}else{0}),
         scratch:HOST+0xa000000,lower_uma:wire::BOOTSTRAP_START+0x200000,
         lower_parameter:wire::BOOTSTRAP_START+0x240000,ktrace_mask:0,progress_recovery:1,
+        enabled_cores: 10,
+        power_sample_clks:200_000,power_sample_us:8333,power_sample_period_ms:8,
+        timebase_khz:24_000,avg_power_filter_tc_ms:248,lowpeak_limiter_tc_ms:16,
+        lowpeak_limiter_ki_q16:134_217,lowpeak_limiter_kp_q16:33_554,coredump_copy_size:0x8000,
     }
 }
 fn init_result(buffers:&mut[Vec<u8>;wire::OBJECT_COUNT], input:&wire::Input, ceiling:u32)->Result<(),()> {

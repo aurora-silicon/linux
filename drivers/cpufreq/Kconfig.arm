@@ -32,6 +32,23 @@ config ARM_APPLE_SOC_CPUFREQ
 	  This adds the CPUFreq driver for Apple Silicon machines
 	  (e.g. Apple M1).
 
+config ARM_APPLE_SOC_CPUFREQ_KUNIT_TEST
+	bool "KUnit tests for Apple Silicon SoC CPUFreq" if !KUNIT_ALL_TESTS
+	depends on ARM_APPLE_SOC_CPUFREQ=y && KUNIT=y
+	depends on ARM64
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple Silicon CPU cluster performance state
+	  driver: the command and status register layout of each SoC, the
+	  waited-for and the lazily verified request paths, the fast
+	  die-temperature limit and its devicetree parsing, and the board
+	  thermal ownership cap. The cluster registers are ordinary memory,
+	  which the MMIO accessors of arm64 can read and write; no hardware
+	  is accessed. The policy suite skips when a CPUFreq driver is already
+	  registered.
+
+	  If unsure, say N.
+
 config ARM_ARMADA_37XX_CPUFREQ
 	tristate "Armada 37xx CPUFreq support"
 	depends on ARCH_MVEBU || COMPILE_TEST

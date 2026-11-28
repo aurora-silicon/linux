@@ -2,6 +2,7 @@
 """Retain the running Limine UKI and publish bounded experimental activation."""
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -38,16 +39,42 @@ def atomic(path, data):
     finally:
         if os.path.exists(name): os.unlink(name)
 
+def compat_lock(path):
+    """fd of the compatibility lock older Omarchy Limine tools take (/tmp/limine-global.lock).
+
+    It is created when missing (root's, 0600) and never followed through a
+    link. /tmp is world-writable, so anything else at that path (a file of
+    another user, a link, a FIFO, or a file fs.protected_regular will not let
+    root open) is refused: going on without the lock could let an older
+    Limine tool write the EFI partition at the same time."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENXIO):
+            raise ValueError(f'{path} is not root\'s own lock file ({os.strerror(error.errno)}); '
+                             'remove it and retry. Nothing was changed') from None
+        raise
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        raise ValueError(f'{path} is not root\'s own lock file (a link, another user\'s file or '
+                         'not a regular file); remove it and retry. Nothing was changed')
+    return fd
+
 @contextlib.contextmanager
-def locks(paths, timeout=30.0):
+def locks(paths, timeout=30.0, compat=()):
     deadline = time.monotonic() + timeout
     fds = []
     try:
-        for path in paths:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-            fds.append(fd)
-            if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
+        for path, required in [(p, True) for p in paths] + [(p, False) for p in compat]:
+            if required:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                fds.append(fd)
+                if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('nonregular boot lock')
+            else:
+                fd = compat_lock(path)
+                fds.append(fd)
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -115,7 +142,7 @@ def same_esp_path(left, right):
         return False
 
 def limine(args):
-    with locks(args.lock, args.lock_timeout):
+    with locks(args.lock, args.lock_timeout, args.compat_lock):
         loader = regular(args.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes()
         if b'limine.conf' not in loader: raise ValueError('EFI loader is not Limine')
         sig = b'++CONFIG_B2SUM_SIGNATURE++'
@@ -238,11 +265,16 @@ def main():
     p.add_argument('--release', default=os.uname().release)
     p.add_argument('--modules', type=Path, default=Path('/usr/lib/modules'))
     p.add_argument('--lock', type=Path, action='append')
+    p.add_argument('--compat-lock', type=Path, action='append',
+                   help='a lock in a shared directory: created if missing, refused unless a regular file of this user')
     p.add_argument('--lock-timeout', type=float, default=30.0, help='total boot-lock wait, in seconds (0..30)')
     args = p.parse_args()
     if not 0 <= args.lock_timeout <= 30:
         p.error('lock timeout must be between 0 and 30 seconds')
-    args.lock = args.lock or [Path('/run/lock/boot-partition.lock'), Path('/tmp/limine-global.lock')]
+    if not args.lock:
+        args.lock = [Path('/run/lock/boot-partition.lock')]
+        args.compat_lock = args.compat_lock or [Path('/tmp/limine-global.lock')]
+    args.compat_lock = args.compat_lock or []
     try: limine(args)
     except (OSError, ValueError, KeyError) as e: p.exit(1, f'M3 boot profile refused: {e}\n')
 

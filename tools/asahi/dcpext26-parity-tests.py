@@ -158,7 +158,8 @@ struct apple_epic_service_ops {int (*revalidate)(struct apple_epic_service *,con
 struct apple_epic_service {bool pending_open,enabled;const struct apple_epic_service_ops *ops;const char *pending_name,*pending_class;int pending_unit;u32 channel;};
 struct apple_dcp {bool ext26_services_open;struct apple_dcp_afkep *dptxep;};
 static bool dptx_native_controllers_ready(struct apple_dcp *d){return true;}
-struct apple_dcp_afkep {struct apple_dcp *dcp;unsigned num_channels;struct apple_epic_service services[2];};
+struct apple_dcp_afkep {struct apple_dcp *dcp;unsigned num_channels;struct apple_epic_service services[2];int service_wq;};
+#define wake_up_all(q) ((void)(q))
 static bool dcp_is_ext26(struct apple_dcp *d){return true;}
 static unsigned sent,published,discarded,initialized;static int fault;
 static void afk_discard_pending_open(struct apple_epic_service *s){discarded++;s->pending_open=false;}

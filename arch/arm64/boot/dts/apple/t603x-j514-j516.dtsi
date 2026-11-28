@@ -87,6 +87,7 @@
 
 &mtp {
 	status = "okay";
+	apple,rtkit-keep-running;
 };
 
 &mtp_mbox {

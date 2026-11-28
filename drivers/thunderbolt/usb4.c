@@ -1343,6 +1343,28 @@ static int usb4_port_write_data(struct tb_port *port, const void *data,
 			     dwords);
 }
 
+static int usb4_port_sb_wait_idle(struct tb_port *port)
+{
+	u32 val;
+	int ret;
+
+	ret = tb_port_read(port, &val, TB_CFG_PORT,
+			   port->cap_usb4 + PORT_CS_1, 1);
+	if (ret)
+		return ret;
+	if (!(val & PORT_CS_1_PND))
+		return 0;
+
+	ret = usb4_port_wait_for_bit(port, port->cap_usb4 + PORT_CS_1,
+				     PORT_CS_1_PND, 0, 500, USB4_PORT_SB_DELAY);
+	if (ret) {
+		tb_port_warn(port, "sideband channel still busy (PND=1)\n");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 /**
  * usb4_port_sb_read() - Read from sideband register
  * @port: USB4 port to read
@@ -1365,6 +1387,10 @@ int usb4_port_sb_read(struct tb_port *port, enum usb4_sb_target target, u8 index
 
 	if (!port->cap_usb4)
 		return -EINVAL;
+
+	ret = usb4_port_sb_wait_idle(port);
+	if (ret)
+		return ret;
 
 	val = reg;
 	val |= size << PORT_CS_1_LENGTH_SHIFT;
@@ -1418,6 +1444,10 @@ int usb4_port_sb_write(struct tb_port *port, enum usb4_sb_target target,
 
 	if (!port->cap_usb4)
 		return -EINVAL;
+
+	ret = usb4_port_sb_wait_idle(port);
+	if (ret)
+		return ret;
 
 	if (buf) {
 		ret = usb4_port_write_data(port, buf, dwords);

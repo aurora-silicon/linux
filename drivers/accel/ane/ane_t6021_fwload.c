@@ -13,7 +13,10 @@
  *      three bound instances). Segment-wise copy
  *      (__TEXT fileoff 0x4000 -> vm 0, __DATA -> its vmaddr; vmsize
  *      tail zero from the coherent alloc). Coherent memory needs no
- *      explicit cache clean.
+ *      explicit cache clean. The engine maps __TEXT read-only, at
+ *      fw_iova and at the entry alias (ane_t6021_fw_prot(), selected by
+ *      the pinned segment table); DATA and the rest stay read-write.
+ *      The kernel writes TEXT through its CPU mapping only.
  *   4. Which copy runs. By default the staged copy (own memory). The
  *      option fw_alias_reserved=1 (T6021 only) maps the copy iBoot
  *      preloaded at SEG0/SEGi; probe refuses it unless no-map
@@ -74,6 +77,7 @@
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 #include "ane_fw_validate.h"
+#include "ane_t6021_fwmap.h"
 
 MODULE_FIRMWARE(ANE_FW_SELENE_NAME);
 MODULE_FIRMWARE(ANE_FW_BIA_NAME);
@@ -236,8 +240,75 @@ static int ane_t6021_pmu_map(struct ane_t6021 *ane, struct iommu_domain *dom)
 	return ret;
 }
 
+/* The coherent allocation maps every page read-write for the engine at
+ * fw_iova. Map the __TEXT pages there again, at the same IOVA and PA,
+ * read-only. The IOVA range stays the DMA API's and the same number of
+ * bytes stays mapped, so dma_free_coherent() unmaps it as before.
+ *
+ * Each step is one 16 KiB DART leaf (the coherent allocation is 16 KiB
+ * aligned in IOVA and PA, checked below), so iommu_unmap() takes it out
+ * whole or not at all, and it syncs the IOTLB before it returns. If a page
+ * can be neither mapped read-only nor put back read-write, the range has a
+ * hole that dma_free_coherent() would trip on: then the allocation is kept
+ * (fw_buf cleared, a bounded leak on a failed probe) instead of freed.
+ */
+static int ane_t6021_fw_staged_protect(struct ane_t6021 *ane)
+{
+	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
+	struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
+	int rw = IOMMU_READ | IOMMU_WRITE;
+	size_t unmapped;
+	u64 off;
+	int ret;
+
+	if (!dom)
+		return -ENODEV;
+	if (dev_is_dma_coherent(ane->dev))
+		rw |= IOMMU_CACHE;
+	for (off = 0; off < ane->fw_size; off += ANE_T6021_FW_ALIAS_PAGE) {
+		u64 iova = ane->fw_iova + off;
+		int prot = ane_t6021_fw_prot(soc->fw->segs, ANE_FW_NSEGS, off,
+					     ANE_T6021_FW_ALIAS_PAGE, rw);
+		phys_addr_t pa;
+
+		if (prot == rw)
+			continue;
+		pa = iommu_iova_to_phys(dom, iova);
+		if (!pa || pa & (ANE_T6021_FW_ALIAS_PAGE - 1))
+			return -EFAULT;
+		unmapped = iommu_unmap(dom, iova, ANE_T6021_FW_ALIAS_PAGE);
+		if (unmapped != ANE_T6021_FW_ALIAS_PAGE) {
+			if (unmapped)
+				goto hole;
+			return -EIO;
+		}
+		ret = iommu_map(dom, iova, pa, ANE_T6021_FW_ALIAS_PAGE, prot,
+				GFP_KERNEL);
+		/* Never leave a hole for dma_free_coherent() to trip on. */
+		if (ret && iommu_map(dom, iova, pa, ANE_T6021_FW_ALIAS_PAGE, rw,
+				     GFP_KERNEL))
+			goto hole;
+		if (!ret && iommu_iova_to_phys(dom, iova) != pa)
+			ret = -EIO;
+		if (ret) {
+			dev_err(ane->dev, "fwload: TEXT +%#llx read-only map: %d\n",
+				off, ret);
+			return ret;
+		}
+	}
+	return 0;
+
+hole:
+	dev_err(ane->dev,
+		"fwload: +%#llx left unmapped, keeping the firmware buffer\n",
+		off);
+	ane->fw_buf = NULL;
+	return -EIO;
+}
+
 static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 {
+	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
 	struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
 	void __iomem *eng = ane->base[ANE_T6021_REG_ENGINE];
 	u64 rvbar = readq(eng + ANE_ASC_RVBAR);
@@ -332,7 +403,12 @@ static int ane_t6021_fw_alias_map(struct ane_t6021 *ane, bool reserved)
 				}
 				ret = iommu_map(dom, win[w].iova + o,
 						pa,
-						ANE_T6021_FW_ALIAS_PAGE, prot,
+						ANE_T6021_FW_ALIAS_PAGE,
+						ane_t6021_fw_prot(soc->fw->segs,
+								  ANE_FW_NSEGS,
+								  win[w].iova + o - entry,
+								  ANE_T6021_FW_ALIAS_PAGE,
+								  prot),
 						GFP_KERNEL);
 				if (ret) {
 					dev_err(ane->dev,
@@ -393,8 +469,11 @@ err_unmap_mapped:
 			ret = -EEXIST;
 			goto err_unmap;
 		}
-		ret = iommu_map(dom, entry + off, pa,
-				ANE_T6021_FW_ALIAS_PAGE, prot, GFP_KERNEL);
+		ret = iommu_map(dom, entry + off, pa, ANE_T6021_FW_ALIAS_PAGE,
+				ane_t6021_fw_prot(soc->fw->segs, ANE_FW_NSEGS,
+						  off, ANE_T6021_FW_ALIAS_PAGE,
+						  prot),
+				GFP_KERNEL);
 		if (ret) {
 			dev_err(ane->dev, "fwalias: iommu_map +%#llx: %d\n",
 				off, ret);
@@ -624,7 +703,9 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 		"fwload: %s PRELOAD validated + DART-mapped: entry %#llx, iova %pad size %#x\n",
 		img->name, entry, &iova, alloc_size);
 
-	ret = reserved ? 0 : ane_t6021_fw_patch(ane, buf);
+	ret = ane_t6021_fw_staged_protect(ane);
+	if (!ret && !reserved)
+		ret = ane_t6021_fw_patch(ane, buf);
 	if (!ret)
 		ret = ane_t6021_fw_alias_map(ane, reserved);
 	if (ret) {

@@ -7,10 +7,10 @@
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
  *
- * The boot NOR starts read-only. On the qualified boards (J613, J713,
- * J616s and the J700) root may opt in at runtime to bounded, verified
- * programs and 4 KiB erases inside the nvram partition; everything else
- * stays read-only. On T8140 data reads reach the whole NOR.
+ * The boot NOR starts read-only. Where the device tree describes its nvram
+ * partition and the flash is a part listed here, root may opt in at runtime
+ * to bounded, verified programs and 4 KiB erases inside that partition;
+ * everything else stays read-only. On T8140 data reads reach the whole NOR.
  */
 
 #include <linux/bitfield.h>
@@ -25,9 +25,11 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/unaligned.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
+#include <linux/string.h>
 
 #include "spi-apple-qspi-policy.h"
 
@@ -97,61 +99,6 @@ struct apple_qspi_soc {
 	bool runtime_pm;
 };
 
-/*
- * A board whose NVRAM may be written: the controller compatible, the
- * machine, the controller aperture, the nvram partition the device tree
- * must describe, the boot NOR JEDEC ID, the SR1 block-protect bits its
- * firmware leaves set at boot and the JEDEC ID of a second part, if any.
- */
-struct apple_qspi_board {
-	const char *controller;
-	const char *machine;
-	resource_size_t base;
-	u32 nvram_start;
-	u32 nvram_size;
-	u8 jedec[3];
-	u8 bp_ok;
-	u8 jedec_alt[3];
-};
-
-#define APPLE_QSPI_JEDEC_W25Q64		{ 0xef, 0x65, 0x17 }
-#define APPLE_QSPI_JEDEC_W25Q16		{ 0xef, 0x65, 0x15 }
-#define APPLE_QSPI_JEDEC_MX_2B27	{ 0xc2, 0x2b, 0x27 }
-#define APPLE_QSPI_JEDEC_GD25UF16E	{ 0xc8, 0x83, 0x15 }
-
-static const struct apple_qspi_board apple_qspi_boards[] = {
-	{ "apple,t8122-qspi", "apple,j613", 0x2a1118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	{ "apple,t8132-qspi", "apple,j713", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	/* The J715 ADT has the J713's nvram; its NOR part is assumed the same. */
-	{ "apple,t8132-qspi", "apple,j715", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	/*
-	 * The J773g ADT has the same nvram; the J604's dump omits it and the
-	 * iMacs have no ADT yet. All are assumed to carry the J713's part.
-	 */
-	{ "apple,t8132-qspi", "apple,j604", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	{ "apple,t8132-qspi", "apple,j623", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	{ "apple,t8132-qspi", "apple,j624", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	{ "apple,t8132-qspi", "apple,j773g", 0x3ad118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	/* Macronix is the ID macOS reports; a J616s also reads W25Q64 on the bus. */
-	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_MX_2B27, 0,
-	  APPLE_QSPI_JEDEC_W25Q64 },
-	/*
-	 * iBoot leaves BP0 set on the J700, over the top 64 KiB. Some J700s
-	 * carry a GigaDevice GD25UF16E, where BP0 covers the same range.
-	 */
-	{ "apple,t8140-qspi", "apple,j700", 0x385110000ULL,
-	  0x24000, 0x1d0000, APPLE_QSPI_JEDEC_W25Q16, 0x1c,
-	  APPLE_QSPI_JEDEC_GD25UF16E },
-};
-
 static DEFINE_MUTEX(apple_qspi_policy_lock);
 static bool read_only = true;
 static bool runtime_ready;
@@ -189,7 +136,7 @@ static const struct kernel_param_ops apple_qspi_read_only_ops = {
 	.get = apple_qspi_get_read_only,
 };
 module_param_cb(read_only, &apple_qspi_read_only_ops, &read_only, 0644);
-MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded NVRAM writes on qualified boards");
+MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded NVRAM writes in the nvram partition of a known part");
 
 static bool apple_qspi_opcode_is_read(u8 opcode)
 {
@@ -220,11 +167,17 @@ struct apple_qspi {
 	/* The nvram partition [window_start, window_end). */
 	u64 window_start;
 	u64 window_end;
-	/* Expected JEDEC IDs and the SR1 block-protect bits left by firmware. */
-	u8 jedec[3];
-	u8 jedec_alt[3];
-	u8 bp_ok;
+	/* The device tree describes a usable nvram partition. */
 	bool nvram_write_candidate;
+	/*
+	 * The window checked against the flash before its first program or
+	 * erase, then latched: 0 not yet, 1 passed, a negative errno refused.
+	 */
+	int qualified;
+	const char *qualify_denial;
+	/* Once qualified: the banks of the window no block protection reaches. */
+	u64 write_start;
+	u64 write_end;
 	bool write_fault;
 	void __iomem *base;
 	void __iomem *p;
@@ -718,9 +671,125 @@ static int apple_qspi_status(struct spi_mem *mem, u8 mfr, u8 sr[3])
 	return 0;
 }
 
-static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op *op)
+static int apple_qspi_read_sfdp(struct spi_mem *mem, u32 addr, u8 *buf, u32 len)
+{
+	struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(0x5a, 1),
+		SPI_MEM_OP_ADDR(3, addr, 1), SPI_MEM_OP_DUMMY(1, 1),
+		SPI_MEM_OP_DATA_IN(len, buf, 1));
+
+	return apple_qspi_transfer_op(mem, &op);
+}
+
+/*
+ * Before the first program or erase, check the window against the flash,
+ * and latch the result: the part's SFDP density must be the size the part
+ * table bounds the window with, and every bank of the window must start with
+ * a v3 NVRAM store header or be erased throughout, with at least one store.
+ * A device tree partition that is not the NVRAM, or a part of another size,
+ * admits nothing. Writes are then admitted only in the banks that the block
+ * protection found in SR1 does not reach, even in part.
+ */
+static int apple_qspi_qualify(struct spi_mem *mem, struct apple_qspi *qspi,
+			      const struct apple_qspi_part *part,
+			      const char **denial)
+{
+	unsigned long long ps, pe, ws, we;
+	u8 head[24], dword[8], sr[3];
+	u8 *buf = NULL;
+	u64 bank, at;
+	long table;
+	int state, stores = 0, ret;
+
+	if (qspi->qualified) {
+		*denial = qspi->qualify_denial;
+		return qspi->qualified < 0 ? qspi->qualified : 0;
+	}
+	ret = apple_qspi_read_sfdp(mem, 0, head, 16);
+	if (ret)
+		return ret;
+	table = apple_qspi_sfdp_basic_table(head);
+	if (table < 0) {
+		*denial = "sfdp";
+		ret = -ENODEV;
+		goto latch;
+	}
+	ret = apple_qspi_read_sfdp(mem, table, dword, sizeof(dword));
+	if (ret)
+		return ret;
+	if (apple_qspi_sfdp_size(get_unaligned_le32(&dword[4])) != part->size) {
+		*denial = "part-size";
+		ret = -ENODEV;
+		goto latch;
+	}
+	for (bank = qspi->window_start; bank < qspi->window_end;
+	     bank += APPLE_QSPI_NVRAM_BANK) {
+		ret = apple_qspi_read_array(mem, bank, head, sizeof(head));
+		if (ret)
+			goto out;
+		state = apple_qspi_nvram_bank_state(head);
+		/* Blank where a header would be is not enough: all of it. */
+		if (!state && !buf) {
+			buf = kmalloc(APPLE_QSPI_ERASE_SIZE, GFP_KERNEL);
+			if (!buf) {
+				ret = -ENOMEM;
+				goto out;
+			}
+		}
+		for (at = bank; !state && at < bank + APPLE_QSPI_NVRAM_BANK;
+		     at += APPLE_QSPI_ERASE_SIZE) {
+			ret = apple_qspi_read_array(mem, at, buf, APPLE_QSPI_ERASE_SIZE);
+			if (ret)
+				goto out;
+			if (memchr_inv(buf, 0xff, APPLE_QSPI_ERASE_SIZE))
+				state = -1;
+		}
+		if (state < 0) {
+			*denial = "window";
+			ret = -EACCES;
+			goto latch;
+		}
+		stores += state;
+	}
+	if (!stores) {
+		*denial = "window";
+		ret = -EACCES;
+		goto latch;
+	}
+	ret = apple_qspi_status(mem, part->jedec[0], sr);
+	if (ret)
+		goto out;
+	ws = qspi->window_start;
+	we = qspi->window_end;
+	if (part->bp_ok &&
+	    apple_qspi_protected_range(part->jedec[0], sr[0], part->size, &ps, &pe) &&
+	    !apple_qspi_unprotected_banks(qspi->window_start, qspi->window_end,
+					  ps, pe, &ws, &we)) {
+		*denial = "protected";
+		ret = -EACCES;
+		goto latch;
+	}
+	qspi->write_start = ws;
+	qspi->write_end = we;
+	qspi->qualified = 1;
+	dev_info(&mem->spi->dev,
+		 "nvram window [%#llx, %#llx): %d stores, writes in [%#llx, %#llx), part %02x%02x%02x\n",
+		 qspi->window_start, qspi->window_end, stores, ws, we,
+		 part->jedec[0], part->jedec[1], part->jedec[2]);
+	goto out;
+latch:
+	qspi->qualified = ret;
+	qspi->qualify_denial = *denial;
+out:
+	kfree(buf);
+	return ret;
+}
+
+static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op *op,
+				   const char **denial)
 {
 	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+	const struct apple_qspi_part *part;
+	unsigned long long ps, pe;
 	unsigned long deadline;
 	u8 id[3], before[3], after[3], sr1;
 	u8 *verify;
@@ -734,9 +803,20 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 	ret = apple_qspi_read_register(mem, 0x9f, id, sizeof(id));
 	if (ret)
 		goto out;
-	if (memcmp(id, qspi->jedec, sizeof(id)) &&
-	    (!qspi->jedec_alt[0] || memcmp(id, qspi->jedec_alt, sizeof(id)))) {
+	/* A known part, the partition within it, and checked against it. */
+	part = apple_qspi_find_part(id);
+	if (!part || qspi->window_end > part->size) {
+		*denial = part ? "part-size" : "part";
 		ret = -ENODEV;
+		goto out;
+	}
+	ret = apple_qspi_qualify(mem, qspi, part, denial);
+	if (ret)
+		goto out;
+	/* Never into a bank the protection reaches, so none is left half erased. */
+	if (op->addr.val < qspi->write_start || op->addr.val + len > qspi->write_end) {
+		*denial = "protected";
+		ret = -EACCES;
 		goto out;
 	}
 	ret = apple_qspi_status(mem, id[0], before);
@@ -744,7 +824,16 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 		goto out;
 	/* No unlocking. Conservatively refuse BP/CMP/WPS, BUSY/WEL or suspend. */
 	if (!apple_qspi_part_status_allows_write(id[0], before[0], before[1],
-						 before[2], qspi->bp_ok)) {
+						 before[2], part->bp_ok)) {
+		*denial = "status";
+		ret = -EACCES;
+		goto out;
+	}
+	/* The flash would ignore this one: refuse it rather than latch a fault. */
+	if (part->bp_ok &&
+	    apple_qspi_protected_range(id[0], before[0], part->size, &ps, &pe) &&
+	    op->addr.val < pe && op->addr.val + len > ps) {
+		*denial = "protected";
 		ret = -EACCES;
 		goto out;
 	}
@@ -884,9 +973,9 @@ static int apple_qspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		ret = 0;
 		goto out;
 	}
-	ret = apple_qspi_nvram_modify(mem, op);
+	ret = apple_qspi_nvram_modify(mem, op, &denial);
 out:
-	if (ret == -EACCES)
+	if (ret == -EACCES || ret == -ENODEV)
 		dev_warn_ratelimited(&mem->spi->dev,
 			"NVRAM denied: reason=%s opcode=%02x addr=%#llx addr_bytes=%u len=%u width=%u addr_width=%u dummy=%u dir=%u ro=%u candidate=%u fault=%u\n",
 			denial, op->cmd.opcode, (unsigned long long)op->addr.val,
@@ -922,35 +1011,19 @@ static const struct spi_controller_mem_ops apple_qspi_mem_ops = {
 	.exec_op = apple_qspi_mem_exec_op,
 };
 
-/* Keep write qualification tied to the board and its controller aperture. */
-static const struct apple_qspi_board *
-apple_qspi_nvram_write_board(struct device_node *node, resource_size_t base)
-{
-	const struct apple_qspi_board *board;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(apple_qspi_boards); i++) {
-		board = &apple_qspi_boards[i];
-		if (of_device_is_compatible(node, board->controller) &&
-		    of_machine_is_compatible(board->machine) &&
-		    base == board->base)
-			return board;
-	}
-	return NULL;
-}
-
 /*
- * The one "nvram" partition of the flash on CS0, 4 KiB aligned and within
- * three-byte addressing, since the policy only admits three-byte programs
- * and erases. Without it, no program or erase is admitted.
+ * The one "nvram" partition of the flash on CS0 that apple_qspi_window_valid()
+ * accepts: not read-only, whole NVRAM banks from a 4 KiB boundary, within
+ * three-byte addressing, since the policy only admits three-byte programs and
+ * erases. Without it, no program or erase is admitted.
  */
 static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
 {
 	struct device_node *flash, *parts, *part;
 	const char *label;
-	u32 reg[2], cells[2], cs;
+	u32 reg[2] = { 0 }, cells[2], cs;
 	u64 start = 0, end = 0;
-	int found = 0;
+	int found = 0, reg_cells = 0, ro = 0;
 
 	flash = of_get_child_by_name(dev->of_node, "flash");
 	if (!flash)
@@ -973,18 +1046,18 @@ static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
 			    strcmp(label, "nvram"))
 				continue;
 			found++;
-			if (of_property_count_u32_elems(part, "reg") == 2 &&
-			    !of_property_read_u32_array(part, "reg", reg, 2)) {
-				start = reg[0];
-				end = start + reg[1];
-			}
+			ro = of_property_read_bool(part, "read-only");
+			reg_cells = of_property_count_u32_elems(part, "reg");
+			if (reg_cells != 2 ||
+			    of_property_read_u32_array(part, "reg", reg, 2))
+				memset(reg, 0, sizeof(reg));
 		}
 	}
 	of_node_put(parts);
-	if (found != 1 || start >= end || end > 1ULL << 24 ||
-	    !IS_ALIGNED(start, APPLE_QSPI_ERASE_SIZE) ||
-	    !IS_ALIGNED(end, APPLE_QSPI_ERASE_SIZE))
-		start = end = 0;
+	if (apple_qspi_window_valid(found, reg_cells, ro, reg[0], reg[1])) {
+		start = reg[0];
+		end = start + reg[1];
+	}
 out:
 	qspi->window_start = start;
 	qspi->window_end = end;
@@ -997,7 +1070,6 @@ out:
 static int apple_qspi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct apple_qspi_board *board;
 	const struct apple_qspi_soc *soc;
 	struct spi_controller *ctlr;
 	struct apple_qspi *qspi;
@@ -1017,9 +1089,6 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	qspi->nvram_policy = true;
 	qspi->nvram_window = soc->multi_io_reads;
 	apple_qspi_nvram_window(dev, qspi);
-	if (of_device_is_compatible(dev->of_node, "apple,t8122-qspi") &&
-	    !of_machine_is_compatible("apple,j613"))
-		return -ENODEV;
 	init_completion(&qspi->done);
 	spin_lock_init(&qspi->lock);
 
@@ -1028,15 +1097,11 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "QSPIMC aperture is too small\n");
 
-	/* The device tree must describe exactly the board's nvram partition. */
-	board = apple_qspi_nvram_write_board(dev->of_node, res->start);
-	if (board && qspi->window_start == board->nvram_start &&
-	    qspi->window_end == (u64)board->nvram_start + board->nvram_size) {
-		memcpy(qspi->jedec, board->jedec, sizeof(qspi->jedec));
-		memcpy(qspi->jedec_alt, board->jedec_alt, sizeof(qspi->jedec_alt));
-		qspi->bp_ok = board->bp_ok;
-		qspi->nvram_write_candidate = true;
-	}
+	/*
+	 * The device tree's nvram partition is the write window. Each program
+	 * or erase then checks the part and that the window lies within it.
+	 */
+	qspi->nvram_write_candidate = qspi->window_start < qspi->window_end;
 	qspi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(qspi->base))
 		return PTR_ERR(qspi->base);
