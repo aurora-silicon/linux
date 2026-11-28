@@ -111,8 +111,17 @@
 	/delete-property/ mux-index;
 };
 
-&dpaudio0 {
-	status = "okay";
+/* No internal microphones, ambient light sensor, or lid. */
+&aop_audio {
+	status = "disabled";
+};
+
+&aop_als {
+	status = "disabled";
+};
+
+&aop_las {
+	status = "disabled";
 };
 
 &typec0 {

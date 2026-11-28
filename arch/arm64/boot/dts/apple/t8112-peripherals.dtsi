@@ -232,7 +232,6 @@
 		interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	m2_dart_ave_3: iommu@267044000 {
@@ -242,7 +241,6 @@
 		interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	m2_dart_dispext0_1: iommu@271300000 {
@@ -252,7 +250,6 @@
 		interrupts = <AIC_IRQ 593 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_dispext_cpu0>;
-		status = "disabled";
 	};
 
 	m2_apr: video-codec@27d000000 {
@@ -285,6 +282,7 @@
 		#iommu-cells = <1>;
 	};
 
+	/* Absent from J413 and J473 ADTs. */
 	m2_scdc: coprocessor@27e400000 {
 		compatible = "apple,t8112-scdc", "apple,scdc";
 		reg = <0x2 0x7e400000 0x0 0x6c000>,
@@ -304,6 +302,7 @@
 			<AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_scdc 0>, <&m2_dart_apr_0 0>;
 		power-domains = <&ps_scodec>;
+		status = "disabled";
 	};
 
 	m2_atc0_dpin0: displayport-input@381e50000 {

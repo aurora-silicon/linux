@@ -173,21 +173,7 @@
 	status = "okay";
 };
 
-&aop_mbox {
-       status = "okay";
-};
-
-&aop_dart {
-       status = "okay";
-};
-
-&aop_admac {
-       status = "okay";
-};
-
 &aop {
-	status = "okay";
-
 	accel {
 		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
 	};
