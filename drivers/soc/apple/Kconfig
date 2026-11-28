@@ -583,6 +583,24 @@ config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
 	  locked down by this option; lockdown= on the command line still
 	  applies.
 
+config APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST
+	tristate "KUnit tests for the Aurora boot security record" if !KUNIT_ALL_TESTS
+	depends on APPLE_AURORA_BOOT_SECURITY && KUNIT && OF_DYNAMIC
+	default KUNIT_ALL_TESTS
+	help
+	  Build boot records in the live device tree and check what the
+	  driver decides from them: which Stage 1 measurement makes the
+	  chain enforced, when a claimed "verified" state is demoted, which
+	  records are ignored, and what every file in
+	  /sys/firmware/aurora/boot_security/ shows for absent, empty,
+	  unterminated, short, long and oversized properties. The built-in
+	  init suite adds and removes a test /chosen/aurora,boot-security
+	  and skips when APPLE_AURORA_BOOT_SECURITY_LOCKDOWN is set. Both
+	  suites skip while the boot-security state is in use. The IMA
+	  submission case skips when IMA is enabled. No hardware is touched.
+
+	  If unsure, say N.
+
 endmenu
 
 endif

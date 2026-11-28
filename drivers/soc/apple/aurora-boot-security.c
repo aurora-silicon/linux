@@ -315,3 +315,36 @@ module_init(aurora_boot_security_init);
 module_exit(aurora_boot_security_exit);
 MODULE_DESCRIPTION("Report the boot chain record left by aura and U-Boot");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST)
+#include <kunit/visibility.h>
+
+#include "aurora-boot-security-test.h"
+
+const struct aurora_boot_security_test aurora_bs_test = {
+	.rec = &rec,
+	.aurora_kobj = &aurora_kobj,
+	.bs_kobj = &bs_kobj,
+	.chain_state = &chain_state,
+	.stage1_enforced = &stage1_enforced,
+	.lockdown_reason = &lockdown_reason,
+	.stage1_enforced_verified = stage1_enforced_verified,
+	.effective_state = effective_state,
+	.format_measurements = format_measurements,
+	.measure_record = measure_record,
+	.state = &state_attr,
+	.advisory = &advisory_attr,
+	.policy = &policy_attr,
+	.stage1_flavour = &stage1_flavour_attr,
+	.uefi_secure_boot = &uefi_secure_boot_attr,
+	.lockdown = &lockdown_attr,
+	.lp_coih = &lp_coih_attr,
+	.measurements = &measurements_attr,
+};
+#endif
+
+#if IS_MODULE(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST)
+EXPORT_SYMBOL_IF_KUNIT(aurora_bs_test);
+#elif IS_BUILTIN(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST)
+#include "aurora-boot-security-test.c"
+#endif
