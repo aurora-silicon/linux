@@ -395,6 +395,37 @@ pub(crate) fn spare_buffer(published: u64, slot: usize) -> bool {
     published & (1 << slot) == 0
 }
 
+/// Outcome of attempting to enable optional runtime idle power-off after `keep-powered` and
+/// the boot job already succeeded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupIdlePolicy {
+    /// Runtime idle power-off is active (`idle_off_allowed = true`).
+    AllowOff,
+    /// Keep-powered remains active: either DT power-controller calibration is absent or
+    /// `publish_idle_policy` failed before writing an allow-off record to shared memory.
+    KeepPowered,
+    /// An allow-off record was already published (`published = true`) before the failure,
+    /// leaving the active firmware policy uncertain; fail startup cleanly.
+    FailUncertain,
+}
+
+/// Decides the startup idle policy from whether DT power-controller calibration is present and
+/// the outcome of publishing and confirming `allow_off = true` (`Ok(())`, or `Err(published)`
+/// where `published` reports whether the control record was written to shared memory).
+pub(crate) const fn startup_idle_policy(
+    has_pwr_controller: bool,
+    enable_result: Result<(), bool>,
+) -> StartupIdlePolicy {
+    if !has_pwr_controller {
+        return StartupIdlePolicy::KeepPowered;
+    }
+    match enable_result {
+        Ok(()) => StartupIdlePolicy::AllowOff,
+        Err(false) => StartupIdlePolicy::KeepPowered,
+        Err(true) => StartupIdlePolicy::FailUncertain,
+    }
+}
+
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
@@ -774,5 +805,40 @@ mod tests {
         let mut empty = [0u8; COMPUTE_COMMAND_BYTES];
         assert_eq!(encode_compute_timestamps(&mut empty, 0x8000, [0; 2]), 0);
         assert!(empty.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn startup_idle_policy_handles_calibration_and_publish_errors() {
+        // Without DT power-controller calibration, keep-powered always stays active.
+        assert_eq!(
+            startup_idle_policy(false, Ok(())),
+            StartupIdlePolicy::KeepPowered
+        );
+        assert_eq!(
+            startup_idle_policy(false, Err(false)),
+            StartupIdlePolicy::KeepPowered
+        );
+        assert_eq!(
+            startup_idle_policy(false, Err(true)),
+            StartupIdlePolicy::KeepPowered
+        );
+
+        // With calibration, confirmed publication enables runtime idle power-off.
+        assert_eq!(
+            startup_idle_policy(true, Ok(())),
+            StartupIdlePolicy::AllowOff
+        );
+
+        // Pre-publication failure leaves the previously confirmed keep-powered mode intact.
+        assert_eq!(
+            startup_idle_policy(true, Err(false)),
+            StartupIdlePolicy::KeepPowered
+        );
+
+        // Post-publication failure leaves the active policy uncertain and must fail cleanly.
+        assert_eq!(
+            startup_idle_policy(true, Err(true)),
+            StartupIdlePolicy::FailUncertain
+        );
     }
 }
