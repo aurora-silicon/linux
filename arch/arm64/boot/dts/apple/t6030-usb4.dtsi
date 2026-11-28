@@ -96,7 +96,9 @@
 				<0x20 0x801f 0x4>;
 			msi-controller;
 			msi-parent = <&usb4_0_pcie>;
-			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
+			/* Its 32-vector slice of T6030's shared window (AIC 1342 + 32). */
+			msi-ranges = <&aic AIC_IRQ 1374 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <32>;
 			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
 			iommu-map-mask = <0x3f>;
 			bus-range = <0x0 0x7f>;

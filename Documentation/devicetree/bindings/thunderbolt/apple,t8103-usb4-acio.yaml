@@ -53,7 +53,7 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
-      - description: MxWrap co-processor control registers, on T8132, T8142 and T6050
+      - description: MxWrap co-processor control registers, on T6030, T8122, T8132, T8142 and T6050
       - description: PCIe router AP firmware registers, on T8142 and T6050
 
   reg-names:
@@ -116,6 +116,14 @@ properties:
       shared audio (AUSS) domain) power the ACIO co-processor complex. When
       apple,pcie-tunnel is present, the domain after them powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
+
+  post-init-providers:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 4
+    description:
+      Power-domain suppliers managed explicitly by the router, rather than
+      required before it can probe, to break their initialization dependency
+      cycle. On J613 these are the four power domains listed above.
 
   thunderbolt-switch:
     type: boolean

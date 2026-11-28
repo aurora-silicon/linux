@@ -450,6 +450,10 @@ struct cd321x_status {
 };
 
 struct cd321x {
+	struct notifier_block session_pm;
+	bool session_pm_registered;
+	bool session_pm_armed;
+	bool session_closed;
 	struct tps6598x tps;
 
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
@@ -555,6 +559,7 @@ int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
 bool tipd_replug_supported(struct tps6598x *tps);
 int tipd_replug_request(struct tps6598x *tps, u8 seconds);
+void tipd_shutdown(struct tps6598x *tps);
 int tipd_prepare(struct device *dev);
 void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
@@ -619,6 +624,7 @@ void cd321x_stop_work(struct cd321x *cd321x);
 int cd321x_reboot_close(struct cd321x *cd321x);
 int cd321x_reboot_notify(struct notifier_block *nb, unsigned long action,
 			 void *data);
+int cd321x_session_pm(struct notifier_block *nb, unsigned long event, void *unused);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 		      bool *late);

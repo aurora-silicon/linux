@@ -53,6 +53,7 @@
 #include "../pci.h"
 #include "pci-host-common.h"
 #include "pcie-apple-t8140-bootstrap.h"
+#include "pcie-apple-t8122.h"
 
 static ATOMIC_NOTIFIER_HEAD(apple_pcie_tunnel_notifiers);
 
@@ -3454,12 +3455,38 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= apple_msi_init_dev_msi_info,
 };
 
-/* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
+/* T6030-family shared AIC MSI window slice shape check. */
 static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
 					u32 aic_base)
 {
 	return base >= 0x20 && !(base & 0x1f) && base + count <= 256 &&
 	       count == 32 && aic_irq == aic_base + base;
+}
+
+/* One bit per 32-vector slice of T8122's shared MSI window: no two bridges share one. */
+static DEFINE_MUTEX(apple_t8122_msi_lock);
+static unsigned long apple_t8122_msi_claimed;
+
+static void apple_t8122_msi_release(void *data)
+{
+	mutex_lock(&apple_t8122_msi_lock);
+	clear_bit((unsigned long)data, &apple_t8122_msi_claimed);
+	mutex_unlock(&apple_t8122_msi_lock);
+}
+
+static int apple_t8122_msi_claim(struct apple_pcie *pcie, u32 base)
+{
+	unsigned long slice = base / 32;
+	bool taken;
+
+	mutex_lock(&apple_t8122_msi_lock);
+	taken = test_and_set_bit(slice, &apple_t8122_msi_claimed);
+	mutex_unlock(&apple_t8122_msi_lock);
+	if (taken) {
+		dev_err(pcie->dev, "MSI vectors %u..%u are another bridge's\n", base, base + 31);
+		return -EBUSY;
+	}
+	return devm_add_action_or_reset(pcie->dev, apple_t8122_msi_release, (void *)slice);
 }
 
 static int apple_msi_init(struct apple_pcie *pcie)
@@ -3576,35 +3603,53 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			default:
 				goto invalid_slice;
 			}
+		} else if (pcie->hw == &t8122_pciec_hw) {
+			/* The node names its slice; check its shape, not the board. */
+			if (args.args_count != 3 ||
+			    of_property_read_u32(to_of_node(fwnode),
+						 "apple,msi-vector-base", &expected_base))
+				goto invalid_slice;
+			ret = apple_t8122_msi_window(expected_base, args.args[1],
+						     pcie->nvecs);
+			if (ret < 0)
+				goto invalid_slice;
+			aic_base = ret;
+			ret = apple_t8122_msi_claim(pcie, expected_base);
+			if (ret) {
+				of_node_put(args.np);
+				return ret;	/* -EBUSY, logged by the claim */
+			}
 		} else {
 			goto invalid_slice;
 		}
 		if (args.args_count != 3 || args.args[0] != 0 ||
 		    args.args[2] != IRQ_TYPE_EDGE_RISING)
 			goto invalid_slice;
-		ret = of_property_read_u32(to_of_node(fwnode),
-					   "apple,msi-vector-base",
-					   &pcie->msi_vector_base);
-		if (!of_find_property(to_of_node(fwnode),
-				      "apple,msi-vector-base", NULL) &&
-		    aic_base == 1342 && args.args[1] == 1342 && pcie->nvecs == 512) {
-			/*
-			 * Old experimental boot DTs exposed the global window to
-			 * each host. Correct it here so old recovery kernels can
-			 * continue using the unchanged shared bootloader DT.
-			 */
+		{
+			u32 base = 0, irq = args.args[1], nvecs = pcie->nvecs;
+			bool has_base = of_property_present(to_of_node(fwnode),
+							    "apple,msi-vector-base");
+
+			if (has_base && of_property_read_u32(to_of_node(fwnode),
+							     "apple,msi-vector-base", &base))
+				goto invalid_slice;
+
+			ret = apple_pciec_msi_slice(has_base, base, expected_base, aic_base,
+						    &irq, &nvecs);
+			if (ret < 0)
+				goto invalid_slice;
+			if (ret)
+				/*
+				 * Old experimental boot DTs exposed T6030's global window to
+				 * each host. Correct it here so old recovery kernels can
+				 * continue using the unchanged shared bootloader DT.
+				 */
+				dev_info(pcie->dev, "correcting legacy MSI window to IRQ %u count 32\n",
+					 irq);
 			pcie->msi_vector_base = expected_base;
-			pcie->nvecs = 32;
-			args.args[1] += expected_base;
-			dev_info(pcie->dev, "correcting legacy MSI window to IRQ %u count 32\n",
-				 args.args[1]);
-		} else if (ret) {
-			goto invalid_slice;
+			pcie->nvecs = nvecs;
+			args.args[1] = irq;
 		}
-		if (pcie->msi_vector_base != expected_base ||
-		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
-					pcie->nvecs, args.args[1], aic_base))
-			goto invalid_slice;
 	}
 
 	/* Keep map targets within the supported 8-bit range. */

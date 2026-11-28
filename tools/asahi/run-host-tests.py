@@ -158,6 +158,7 @@ ASAHI_TESTS = {
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'atc-cio-sleep-tests.py': [(out('--output'), PASS)],
+    'pcie-apple-msi-slice-tests.py': [([], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]

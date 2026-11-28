@@ -1278,6 +1278,10 @@ struct apple_cio_hw {
     bool sleep_removes_domains;
     bool restart_on_wake;
     bool phy_shared_with_dwc3;
+    bool strict_power_cycle;
+    bool mxwrap;
+    bool lstx_explicit;
+    bool strict_fw_ready;
     bool psd_power_cycle;
     bool stop_at_reboot;
     bool sleep_router_on_stop;
@@ -1513,6 +1517,7 @@ static void apple_cio_cpu_halt(struct apple_cio *acio) { (void)acio; }
 static void apple_cio_lstx_hold(struct apple_cio *acio, bool high) { (void)acio; (void)high; }
 static void apple_cio_test_log_guards(struct apple_cio *acio) { (void)acio; }
 static void apple_cio_release_domains(struct apple_cio *acio) { (void)acio; released++; }
+static void apple_cio_power_down(struct apple_cio *acio) { apple_cio_release_domains(acio); }
 /* PRODUCTION */
 static struct device dev;
 static struct platform_device nhi;

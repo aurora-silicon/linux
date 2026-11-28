@@ -10,6 +10,7 @@
 #include <kunit/visibility.h>
 #include <linux/i2c.h>
 #include <linux/iopoll.h>
+#include <linux/suspend.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
@@ -2769,9 +2770,93 @@ static int cd321x_tbt_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+/* ACIO -> USB role -> PHY SAFE, before tasks freeze. */
+static int cd321x_session_stop(struct cd321x *cd, bool sleep)
+{
+	struct tps6598x *tps = &cd->tps;
+	struct typec_thunderbolt_switch_data data = {
+		.state = sleep ? TYPEC_THUNDERBOLT_SWITCH_SLEEP :
+			 TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
+	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+	bool active;
+	int ret;
+
+	cd321x_prepare(tps);
+	guard(mutex)(&tps->lock);
+	active = cd->state.mode == TYPEC_MODE_USB4 ||
+		 cd->state.alt == cd->port_altmode_tbt;
+	ret = typec_thunderbolt_switch_set(cd->tbt_switch, &data);
+	if (ret)
+		return ret;
+	cd->session_closed = true;
+	if (sleep && !active)
+		return 0;
+	ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+	if (!ret)
+		ret = typec_mux_set(cd->mux, &safe);
+	if (ret)
+		dev_err(tps->dev, "session quiesce failed, retaining PHY ownership: %d\n", ret);
+	else
+		dev_info(tps->dev, "USB4 session quiesced before freezer\n");
+	return ret;
+}
+
+static void cd321x_session_restore(struct cd321x *cd)
+{
+	struct typec_thunderbolt_switch_data data = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_WAKE,
+	};
+
+	scoped_guard(mutex, &cd->tps.lock) {
+		typec_thunderbolt_switch_set(cd->tbt_switch, &data);
+		if (cd->session_closed) {
+			atomic_set(&cd->restore_event, 1);
+			cd->session_closed = false;
+		}
+	}
+	cd321x_complete(&cd->tps);
+}
+
+VISIBLE_IF_KUNIT int cd321x_session_pm(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	struct cd321x *cd = container_of(nb, struct cd321x, session_pm);
+	int ret;
+
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		/* Only a switch that asked for it is stopped from here. */
+		scoped_guard(mutex, &cd->tps.lock)
+			cd->session_pm_armed =
+				typec_thunderbolt_switch_pd_ordered_stop(cd->tbt_switch);
+		if (!cd->session_pm_armed)
+			return NOTIFY_DONE;
+		ret = cd321x_session_stop(cd, true);
+		if (ret) {
+			cd321x_session_restore(cd);
+			/* The PM core skips our POST_SUSPEND after a failed PREPARE. */
+			cd->session_pm_armed = false;
+		}
+		return notifier_from_errno(ret);
+	case PM_POST_SUSPEND:
+		if (cd->session_pm_armed)
+			cd321x_session_restore(cd);
+		cd->session_pm_armed = false;
+		break;
+	}
+	return NOTIFY_OK;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_session_pm);
+
 static void cd321x_ready(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	/* The switch may bind later; each suspend asks it again. */
+	cd321x->session_pm.notifier_call = cd321x_session_pm;
+	cd321x->session_pm.priority = 100;
+	if (!register_pm_notifier(&cd321x->session_pm))
+		cd321x->session_pm_registered = true;
 
 	guard(mutex)(&tps->lock);
 	/* Include failures reported while the port was still being initialized. */
@@ -2785,6 +2870,10 @@ static void cd321x_ready(struct tps6598x *tps)
 
 VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 {
+	if (cd321x->session_pm_registered) {
+		unregister_pm_notifier(&cd321x->session_pm);
+		cd321x->session_pm_registered = false;
+	}
 	scoped_guard(mutex, &cd321x->tps.lock)
 		cd321x_pm_remove(&cd321x->pm);
 
@@ -4234,6 +4323,27 @@ err_reset_controller:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tipd_init);
+
+void tipd_shutdown(struct tps6598x *tps)
+{
+	struct cd321x *cd;
+	bool ordered;
+	int ret;
+
+	/* Only a port embedded in a struct cd321x has a USB4 session to stop. */
+	if (tps->data->tps_struct_size < sizeof(struct cd321x))
+		return;
+	cd = container_of(tps, struct cd321x, tps);
+
+	scoped_guard(mutex, &tps->lock)
+		ordered = typec_thunderbolt_switch_pd_ordered_stop(cd->tbt_switch);
+	if (!ordered)
+		return;
+	ret = cd321x_session_stop(cd, false);
+	if (ret)
+		dev_err(tps->dev, "USB4 shutdown incomplete: %d\n", ret);
+}
+EXPORT_SYMBOL_GPL(tipd_shutdown);
 
 void tipd_remove(struct tps6598x *tps)
 {
