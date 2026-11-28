@@ -2857,13 +2857,19 @@
  * DisplayPort/HDMI audio, as on the M4 Pro boards (t6040-j616s-dpaudio.dtsi).
  * The J614c's ADT has the J616s's: dcpext0's audio is dp-audio1 (SIO DMA
  * channel 0x66) and dcpext1's is dp-audio2 (0x68). The PMGR has DPA1
- * (0x238) and DPA2 (0x240) under the shared DPA_P power state.
+ * (0x238) and DPA2 (0x240) under the shared DPA_P power state. dcpext2's
+ * audio is dp-audio3 (0x6a) with DPA3 (0x248) under DPA_P, read from the
+ * J616c ADT.
  */
 &ps_dpa1 {
 	status = "okay";
 };
 
 &ps_dpa2 {
+	status = "okay";
+};
+
+&ps_dpa3 {
 	status = "okay";
 };
 
@@ -2905,6 +2911,25 @@
 			};
 		};
 	};
+
+	dpaudio3: audio-controller-3 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x6a>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa3>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio3_dcpext: endpoint {
+					remote-endpoint = <&dcpext2_audio>;
+				};
+			};
+		};
+	};
 };
 
 &dcpext0 {
@@ -2930,6 +2955,20 @@
 			reg = <0>;
 			dcpext1_audio: endpoint {
 				remote-endpoint = <&dpaudio2_dcpext>;
+			};
+		};
+	};
+};
+
+&dcpext2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext2_audio: endpoint {
+				remote-endpoint = <&dpaudio3_dcpext>;
 			};
 		};
 	};
