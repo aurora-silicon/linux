@@ -377,8 +377,21 @@ int apple_smc_enter_atomic(struct apple_smc *smc)
 	guard(mutex)(&smc->mutex);
 	int ret = apple_smc_saved_guard(smc);
 
-	if (ret)
-		return ret;
+	/*
+	 * Only the power-off and restart handlers enter atomic mode, and the
+	 * final MBSE command is all that follows. When the saved-state guard
+	 * refuses commands (a protocol fault, say), refusing this one too
+	 * would leave the machine running with no way to turn off or restart.
+	 * Skip the notification write and still enter atomic mode, so that
+	 * apple_smc_write_atomic() can send the final command.
+	 */
+	if (ret) {
+		dev_warn(smc->dev,
+			 "atomic: commands are refused (%d); only the final power command is sent\n",
+			 ret);
+		smc->atomic_mode = true;
+		return 0;
+	}
 
 	/*
 	 * Disable notifications since this is called before shutdown and no
@@ -407,9 +420,6 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 	ktime_t t0;
 	s64 us;
 
-	ret = apple_smc_saved_guard(smc);
-	if (ret)
-		return ret;
 	if (size > SMC_MAX_SIZE || size == 0)
 		return -EINVAL;
 
@@ -417,6 +427,19 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return -EIO;
 	if (!smc->atomic_mode)
 		return -EIO;
+	/*
+	 * Atomic mode only carries the final power-off or restart command (see
+	 * apple_smc_enter_atomic()), so the saved-state guard does not stop it.
+	 * A saved-state command still marked pending will not be answered in
+	 * a way anything waits for now: stop routing replies to it, so that
+	 * this command's reply is taken as this command's.
+	 */
+	ret = apple_smc_saved_guard(smc);
+	if (ret) {
+		dev_warn(smc->dev, "atomic: sending key %p4ch although commands are refused (%d)\n",
+			 &key, ret);
+		smp_store_release(&smc->saved_pending, false); /* pairs with the reply path */
+	}
 	/*
 	 * A poll timeout or a mismatched reply does not cancel the command or
 	 * release its SRAM. Its late reply does: take it if it has arrived.
