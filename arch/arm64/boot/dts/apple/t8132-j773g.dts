@@ -384,8 +384,28 @@
 	/delete-property/ apple,dma-range;
 };
 
+&ps_apcie_gp {
+	status = "okay";
+};
+
+&ps_apcie_sys_gp {
+	apple,always-on;
+	status = "okay";
+};
+
 &pcie0 {
 	/delete-property/ apple,managed-sids;
+	/* ADT mapper-apcie2 maps the Ethernet requester to DART2 stream 1. */
+	iommu-map = <0x100 &dart_apcie0 1 2>,
+		    <0x200 &dart_apcie2 1 1>;
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&port02 {
+	status = "okay";
 };
 
 #include "hwmon-common.dtsi"
