@@ -22,9 +22,12 @@
 #define IBOOT_PATTERN_STRIDE DCPEXT_STRIDE
 
 enum iboot_query_op {
+	IBOOT_SET_SURFACE = 1,
+	IBOOT_SET_POWER = 2,
 	IBOOT_GET_HPD = 3,
 	IBOOT_GET_TIMING_MODES = 4,
 	IBOOT_GET_COLOR_MODES = 5,
+	IBOOT_SET_MODE = 6,
 };
 
 /* Packed layouts from m1n1 src/dcp_iboot.h and swap_set_layer_cmd_v13_3. */
@@ -148,15 +151,25 @@ static int iboot_parse_swap_begin(const u8 *reply, size_t received, u32 *id)
 	return 0;
 }
 
-static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
+/* A mode list: a count, then as many 24-byte records. */
+static int iboot_parse_mode_count(const u8 *payload, size_t size, u32 *count)
 {
-	u32 i;
-
 	if (size < 4)
 		return -EPROTO;
 	*count = get_unaligned_le32(payload);
 	if (*count > (size - 4) / IBOOT_MODE_SIZE)
 		return -EPROTO;
+	return 0;
+}
+
+static int iboot_parse_modes(const u8 *payload, size_t size, u32 *count)
+{
+	u32 i;
+	int ret;
+
+	ret = iboot_parse_mode_count(payload, size, count);
+	if (ret)
+		return ret;
 	for (i = 0; i < *count; i++)
 		if (get_unaligned_le32(payload + 4 + i * IBOOT_MODE_SIZE) > 1)
 			return -EPROTO;
@@ -234,7 +247,13 @@ static int iboot_build_pattern_request(u32 op, const void *data, size_t data_siz
 	size_t expected;
 
 	switch (op) {
+	case 1: /* SetSurface */
+		expected = sizeof(struct iboot_layer);
+		break;
 	case 2: expected = 1; break; /* SetPower */
+	case 3 ... 5: /* GetHPD, GetTimingModes, GetColorModes */
+		expected = 0;
+		break;
 	case 6: expected = 2 * IBOOT_MODE_SIZE; break; /* SetMode */
 	case 15: expected = 0; break; /* SwapBegin */
 	case 16: expected = sizeof(struct iboot_swap_layer_v13_3); break;
@@ -401,7 +420,7 @@ static struct iboot_query *iboot_find_query(struct apple_dcp *dcp)
 	struct apple_dcp_afkep *ep = READ_ONCE(dcp->ibootep);
 	u32 i;
 
-	if (!dcp->external || !ep)
+	if ((!dcp->external && !dcp_is_iboot(dcp)) || !ep)
 		return ERR_PTR(-ENODEV);
 	for (i = 0; i < AFK_MAX_CHANNEL; i++) {
 		struct iboot_query *query = smp_load_acquire(&ep->services[i].cookie);
@@ -668,6 +687,157 @@ done:
 	return ret;
 }
 
+/*
+ * One display command of the iBoot interface, with its reply payload copied
+ * to @out (at least @min_size bytes of it; returns the bytes copied), or a
+ * setter if @out is NULL. On AFKv2 the setters answer with a transport
+ * status alone: given a reply buffer, the firmware copies an empty reply
+ * into it and asserts, so they go out without one. Only the reply's own
+ * length is checked, not that its first word repeats @op.
+ */
+static int iboot_command(struct apple_dcp *dcp, u32 op, const void *data,
+			 size_t size, void *out, size_t out_size, size_t min_size)
+{
+	struct iboot_query *query = iboot_find_query(dcp);
+	u8 request[16 + sizeof(struct iboot_swap_layer_v13_3)];
+	size_t len, received = 0;
+	u32 retcode = 0, reply_len;
+	u8 *reply = NULL;
+	int ret;
+
+	if (IS_ERR(query))
+		return PTR_ERR(query);
+	ret = iboot_build_pattern_request(op, data, size, request,
+					  sizeof(request), &len);
+	if (ret)
+		return ret;
+	if (out || !query->service->ep->wire_v2) {
+		reply = kzalloc(IBOOT_QUERY_RX_SIZE, GFP_KERNEL);
+		if (!reply)
+			return -ENOMEM;
+	}
+	ret = afk_send_command_len(query->service, EPIC_SUBTYPE_STD_SERVICE,
+				   request, len, reply,
+				   reply ? IBOOT_QUERY_RX_SIZE : 0, &retcode,
+				   &received);
+	if (!ret && retcode) {
+		dev_dbg(dcp->dev, "iBoot command %u returned %#x\n", op, retcode);
+		ret = -EIO;
+	}
+	if (ret || !out)
+		goto out;
+	reply_len = received >= 8 ? get_unaligned_le32(reply + 4) : 0;
+	if (reply_len < 8 || reply_len > received || reply_len - 8 < min_size) {
+		dev_err(dcp->dev, "iBoot: bad response length for command %u\n", op);
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = min_t(size_t, reply_len - 8, out_size);
+	memcpy(out, reply + 8, ret);
+out:
+	kfree(reply);
+	return ret;
+}
+
+int ibootep_set_power(struct apple_dcp *dcp, bool on)
+{
+	u8 power = on;
+
+	return iboot_command(dcp, IBOOT_SET_POWER, &power, sizeof(power), NULL,
+			     0, 0);
+}
+
+int ibootep_get_hpd(struct apple_dcp *dcp, u32 *timings, u32 *colors)
+{
+	u8 payload[12];
+	u32 timing_count, color_count;
+	bool hpd;
+	int ret;
+
+	ret = iboot_command(dcp, IBOOT_GET_HPD, NULL, 0, payload, sizeof(payload),
+			    sizeof(payload));
+	if (ret >= 0)
+		ret = iboot_parse_hpd(payload, ret, &hpd, &timing_count,
+				      &color_count);
+	if (ret)
+		return ret;
+	if (timings)
+		*timings = timing_count;
+	if (colors)
+		*colors = color_count;
+	return hpd;
+}
+
+static int iboot_get_modes(struct apple_dcp *dcp, u32 op, void **modes,
+			   unsigned int *count)
+{
+	u32 n;
+	u8 *buf;
+	int ret;
+
+	buf = kzalloc(IBOOT_QUERY_RX_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	ret = iboot_command(dcp, op, NULL, 0, buf, IBOOT_QUERY_RX_SIZE, 4);
+	if (ret >= 0)
+		ret = iboot_parse_mode_count(buf, ret, &n);
+	if (!ret) {
+		*modes = kmemdup(buf + 4, n * IBOOT_MODE_SIZE, GFP_KERNEL);
+		if (*modes)
+			*count = n;
+		else
+			ret = -ENOMEM;
+	}
+	kfree(buf);
+	return ret;
+}
+
+int ibootep_get_timing_modes(struct apple_dcp *dcp,
+			     struct iboot_timing_mode **modes,
+			     unsigned int *count)
+{
+	return iboot_get_modes(dcp, IBOOT_GET_TIMING_MODES, (void **)modes, count);
+}
+
+int ibootep_get_color_modes(struct apple_dcp *dcp,
+			    struct iboot_color_mode **modes, unsigned int *count)
+{
+	return iboot_get_modes(dcp, IBOOT_GET_COLOR_MODES, (void **)modes, count);
+}
+
+int ibootep_set_mode(struct apple_dcp *dcp, const struct iboot_timing_mode *timing,
+		     const struct iboot_color_mode *color)
+{
+	struct {
+		struct iboot_timing_mode timing;
+		struct iboot_color_mode color;
+	} __packed mode = { *timing, *color };
+
+	return iboot_command(dcp, IBOOT_SET_MODE, &mode, sizeof(mode), NULL, 0, 0);
+}
+
+int ibootep_set_surface(struct apple_dcp *dcp, u64 iova, u32 width, u32 height,
+			u32 stride)
+{
+	/* One linear BGRA plane, SDR, in colour space 2 as the bootloader sets. */
+	struct iboot_layer layer = {
+		.planes = { {
+			.addr = cpu_to_le64(iova),
+			.stride = cpu_to_le32(stride),
+			.addr_format = cpu_to_le32(1),
+		} },
+		.plane_count = cpu_to_le32(1),
+		.width = cpu_to_le32(width),
+		.height = cpu_to_le32(height),
+		.surface_format = cpu_to_le32(1),
+		.colorspace = cpu_to_le32(2),
+		.eotf = cpu_to_le32(1),
+	};
+
+	return iboot_command(dcp, IBOOT_SET_SURFACE, &layer, sizeof(layer), NULL,
+			     0, 0);
+}
+
 static ssize_t dcpext_modes_query_store(struct device *dev,
 				       struct device_attribute *attr,
 				       const char *buf, size_t count)
@@ -699,7 +869,7 @@ static void disp_service_init(struct apple_epic_service *service, const char *na
 	struct iboot_query *query;
 	int ret;
 
-	if (!dcp->external)
+	if (!dcp->external && !dcp_is_iboot(dcp))
 		return;
 	query = devm_kzalloc(dcp->dev, sizeof(*query), GFP_KERNEL);
 	if (!query)
@@ -710,6 +880,16 @@ static void disp_service_init(struct apple_epic_service *service, const char *na
 	ret = devm_add_action_or_reset(dcp->dev, iboot_query_cancel, query);
 	if (ret)
 		return;
+	/*
+	 * A DCP driven through this interface alone has a display driver that
+	 * sends every command (the exported ibootep_* calls); it takes no
+	 * manual queries next to them.
+	 */
+	if (dcp_is_iboot(dcp)) {
+		/* Published for iboot_find_query()'s acquire. */
+		smp_store_release(&service->cookie, query);
+		return;
+	}
 	/* Remove the sysfs entry before cancelling work during device cleanup. */
 	ret = devm_device_add_group(dcp->dev, &iboot_query_group);
 	if (ret) {
@@ -741,6 +921,19 @@ static const struct apple_epic_service_ops external_ibootep_ops[] = {
 	{}
 };
 
+/* DCP_FIRMWARE_IBOOT: the main DCP's service, or an external one's. */
+static const struct apple_epic_service_ops iboot_variant_ops[] = {
+	{
+		.name = "disp0-service",
+		.init = disp_service_init,
+	},
+	{
+		.name = "dispext-service",
+		.init = disp_service_init,
+	},
+	{}
+};
+
 int ibootep_init(struct apple_dcp *dcp)
 {
 	const struct apple_epic_service_ops *ops = ibootep_ops;
@@ -751,6 +944,8 @@ int ibootep_init(struct apple_dcp *dcp)
 		return -EBUSY;
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ops = external_ibootep_ops;
+	if (dcp_is_iboot(dcp))
+		ops = iboot_variant_ops;
 	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
 	if (IS_ERR(dcp->ibootep)) {
 		ret = PTR_ERR(dcp->ibootep);

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Unclaimed T8132 peripheral buses. */
+/*
+ * Unclaimed T8132 peripheral buses. The SPI controllers run from the 24 MHz
+ * reference like every other Apple SPI controller: no driver provides
+ * peripheral_clocks, and spi-apple needs a clock rate to divide.
+ */
 
 &soc {
 	spi4: spi@3ad110000 {
@@ -7,11 +11,26 @@
 		reg = <0x3 0xad110000 0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1058 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&peripheral_clocks 422>;
+		clocks = <&clkref>;
 		power-domains = <&ps_spi4>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 		status = "disabled";
+
+		/*
+		 * The DP855 panel timing controller (ADT /arm-io/spi4/dp855).
+		 * i2c-dp855 reads the panel management devices behind it and
+		 * shares its I2C engine with the display firmware through the
+		 * controller's lock. Boards that have it set the chip select
+		 * and enable spi4.
+		 */
+		panel_controller: panel-timing-controller@0 {
+			compatible = "parade,dp855";
+			reg = <0>;
+			spi-max-frequency = <1000000>;
+			spi-cs-setup-delay-ns = <20>;
+			spi-cs-hold-delay-ns = <20>;
+		};
 	};
 
 	nub_spmi_a1: spmi@388a08000 {
@@ -42,6 +61,7 @@
 		status = "disabled";
 	};
 
+	/* ADT /arm-io/nub-spmi1: the auxiliary PMU (pmu-aux) at USID 0xe. */
 	nub_spmi1: spmi@388614000 {
 		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
 		reg = <0x3 0x88614000 0 0x4000>,
@@ -53,7 +73,12 @@
 		#interrupt-cells = <2>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-		status = "disabled";
+
+		pmic@e {
+			compatible = "apple,club-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+			read-only;
+		};
 	};
 
 	aop_spmi1: spmi@390b14000 {
@@ -75,7 +100,7 @@
 		reg = <0x3 0xad10c000 0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1057 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&peripheral_clocks 421>;
+		clocks = <&clkref>;
 		power-domains = <&ps_spi3>;
 		#address-cells = <1>;
 		#size-cells = <0>;

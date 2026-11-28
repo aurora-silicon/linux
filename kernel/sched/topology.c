@@ -3279,6 +3279,24 @@ void free_sched_domains(cpumask_var_t doms[], unsigned int ndoms)
 	kfree(doms);
 }
 
+static void sched_uclamp_background_update(void)
+{
+	unsigned long cap = SCHED_CAPACITY_SCALE;
+	int cpu;
+
+	if (!IS_ENABLED(CONFIG_UCLAMP_TASK))
+		return;
+
+	if (sched_asym_cpucap_active()) {
+		for_each_cpu(cpu, cpu_active_mask) {
+			if (rcu_access_pointer(per_cpu(sd_asym_cpucapacity, cpu)))
+				cap = min(cap, arch_scale_cpu_capacity(cpu));
+		}
+	}
+
+	uclamp_update_background_cap(cap);
+}
+
 /*
  * Set up scheduler domains and groups.  For now this just excludes isolated
  * CPUs, but could be used to exclude other special cases in the future.
@@ -3301,8 +3319,10 @@ int __init sched_init_domains(const struct cpumask *cpu_map)
 		doms_cur = &fallback_doms;
 	cpumask_and(doms_cur[0], cpu_map, housekeeping_cpumask(HK_TYPE_DOMAIN));
 	err = build_sched_domains(doms_cur[0], NULL, &multi_llcs);
-	if (!err)
+	if (!err) {
 		sched_cache_set(multi_llcs);
+		sched_uclamp_background_update();
+	}
 
 	return err;
 }
@@ -3460,6 +3480,7 @@ match2:
 		;
 	}
 	sched_cache_set(has_multi_llcs);
+	sched_uclamp_background_update();
 
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	/* Build perf domains: */

@@ -9,7 +9,9 @@
  * Copyright The Asahi Linux Contributors
  */
 
-#define T6050_K116C
+/* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
+#define T6050_K_N1_FIRMWARE	"apple/centauri/k116c-ftab.bin"
+#define T6050_K_BOARD_ID	0x06
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -21,7 +23,27 @@
 	firmware-name = "apple/tpmtfw-k116c.bin";
 };
 
+#define T6050_K116C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
+#include "t6050-peripherals.dtsi"
+
+/* The GPU, handed over by the boot loader */
+#include "t6050-k114-k116-gpu.dtsi"
+
+/* The internal panel, handed over by the boot loader */
+#include "t6050-k114-k116-display.dtsi"
+
+/* The 16.2-inch 3456x2234 panel's active area, for the DPI only (the ADT carries none) */
 &panel {
+	compatible = "apple,panel-k116", "apple,panel";
 	width-mm = <345>;
 	height-mm = <223>;
 };
+
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k116c.bin", "apple/msrk-k116c.bin"
+#include "t6050-touchid.dtsi"
+
+/* The USB-C ports ATC1 and ATC2, as on the other K boards */
+#include "t6050-k114-k116-usb.dtsi"

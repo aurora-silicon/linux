@@ -4316,6 +4316,337 @@ static void tb_test_dp_shared_rate_debounce_deferred(struct kunit *test)
 	tb_test_dp_shared_rate_arrival(test, false, true);
 }
 
+/*
+ * A domain as tb_domain_suspend_noirq() sees it on a host that keeps its
+ * router awake through suspend-to-idle (QUIRK_NO_SYSTEM_SLEEP): a host
+ * router and a connection manager that counts its calls. There is no
+ * control channel: the paths that keep it running must not touch it.
+ */
+struct tb_test_noirq {
+	struct tb_nhi nhi;
+	struct tb_cm_ops ops;
+	struct tb *tb;
+	struct tb_switch *host;
+	unsigned int saved_flags;
+	unsigned int suspends, resumes, events;
+	enum tb_cfg_pkg_type last_event;
+	int suspend_ret;
+	unsigned int handled;
+};
+
+static int tb_test_noirq_cm_suspend(struct tb *tb)
+{
+	struct tb_test_noirq *ctx = kunit_get_current_test()->priv;
+
+	ctx->suspends++;
+	return ctx->suspend_ret;
+}
+
+static int tb_test_noirq_cm_resume(struct tb *tb)
+{
+	struct tb_test_noirq *ctx = kunit_get_current_test()->priv;
+
+	ctx->resumes++;
+	return 0;
+}
+
+static void tb_test_noirq_cm_event(struct tb *tb, enum tb_cfg_pkg_type type,
+				   const void *buf, size_t size)
+{
+	struct tb_test_noirq *ctx = kunit_get_current_test()->priv;
+
+	ctx->events++;
+	ctx->last_event = type;
+}
+
+/* The suspend in progress: to idle (the platform is not involved) or deeper. */
+#ifdef CONFIG_SUSPEND
+static unsigned int tb_test_noirq_pm_flags(void)
+{
+	return pm_suspend_global_flags;
+}
+
+static void tb_test_noirq_set_pm_flags(unsigned int flags)
+{
+	pm_suspend_global_flags = flags;
+}
+
+static void tb_test_noirq_to_idle(bool to_idle)
+{
+	pm_suspend_clear_flags();
+	if (to_idle)
+		pm_set_suspend_no_platform();
+}
+#else
+static unsigned int tb_test_noirq_pm_flags(void)
+{
+	return 0;
+}
+
+static void tb_test_noirq_set_pm_flags(unsigned int flags)
+{
+}
+
+static void tb_test_noirq_to_idle(bool to_idle)
+{
+}
+#endif
+
+static void tb_test_noirq_restore(void *data)
+{
+	struct tb_test_noirq *ctx = data;
+
+	tb_test_noirq_set_pm_flags(ctx->saved_flags);
+	put_device(&ctx->tb->dev);
+}
+
+/* The domain in a suspend-to-idle, with a host directly on port 1. */
+static struct tb_test_noirq *tb_test_noirq_alloc(struct kunit *test)
+{
+	struct tb_test_noirq *ctx;
+	struct tb_xdomain *xd;
+	struct tb *tb;
+
+	if (!IS_ENABLED(CONFIG_SUSPEND))
+		kunit_skip(test, "needs CONFIG_SUSPEND");
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	xd = kunit_kzalloc(test, sizeof(*xd), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, xd);
+	ctx->host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->host);
+
+	ctx->ops.suspend_noirq = tb_test_noirq_cm_suspend;
+	ctx->ops.resume_noirq = tb_test_noirq_cm_resume;
+	ctx->ops.handle_event = tb_test_noirq_cm_event;
+	ctx->nhi.quirks = QUIRK_NO_SYSTEM_SLEEP;
+	ctx->tb = tb;
+	tb->nhi = &ctx->nhi;
+	tb->cm_ops = &ctx->ops;
+	tb->root_switch = ctx->host;
+	ctx->host->tb = tb;
+	ctx->host->ports[1].xdomain = xd;
+	device_initialize(&tb->dev);
+	tb->dev.release = tb_test_dprx_release;
+	mutex_init(&tb->lock);
+
+	ctx->saved_flags = tb_test_noirq_pm_flags();
+	tb_test_noirq_to_idle(true);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, tb_test_noirq_restore, ctx), 0);
+
+	test->priv = ctx;
+	return ctx;
+}
+
+static bool tb_test_noirq_retain(struct tb_test_noirq *ctx)
+{
+	bool retain;
+
+	mutex_lock(&ctx->tb->lock);
+	retain = tb_domain_retain_noirq_control(ctx->tb);
+	mutex_unlock(&ctx->tb->lock);
+	return retain;
+}
+
+/* Only requests that read state are answered while the domain is suspended. */
+static void tb_test_noirq_xdp_request_types(struct kunit *test)
+{
+	unsigned int type;
+
+	for (type = 0; type < 64; type++) {
+		bool discovery = type == UUID_REQUEST_OLD || type == UUID_REQUEST ||
+				 type == PROPERTIES_REQUEST ||
+				 type == LINK_STATE_STATUS_REQUEST;
+
+		KUNIT_EXPECT_EQ_MSG(test, tb_xdp_noirq_request(type), discovery,
+				    "XDomain packet type %u", type);
+	}
+}
+
+/*
+ * The control channel stays up only for a suspend-to-idle of an awake host
+ * router whose every connection is another host.
+ */
+static void tb_test_noirq_retain_decision(struct kunit *test)
+{
+	struct tb_test_noirq *ctx = tb_test_noirq_alloc(test);
+	struct tb_port *ports = ctx->host->ports;
+	struct tb_xdomain *xd = ports[1].xdomain;
+	struct tb_port *remote;
+
+	remote = kunit_kzalloc(test, sizeof(*remote), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, remote);
+
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_retain(ctx));
+	ports[3].xdomain = xd;
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_retain(ctx));
+
+	/* A router behind any port needs the full suspend of its tunnels. */
+	ports[3].xdomain = NULL;
+	ports[3].remote = remote;
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+	ports[1].xdomain = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+
+	/* Nothing connected: nobody to answer. */
+	ports[3].remote = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+	ports[1].xdomain = xd;
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_retain(ctx));
+
+	/* A host router that sleeps with the system loses its rings. */
+	ctx->nhi.quirks = 0;
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+	ctx->nhi.quirks = QUIRK_NO_SYSTEM_SLEEP;
+
+	/* The platform may power the router down in a deeper sleep. */
+	tb_test_noirq_to_idle(false);
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+	tb_test_noirq_to_idle(true);
+
+	ctx->tb->root_switch = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_retain(ctx));
+}
+
+/*
+ * A retained control channel is neither stopped nor started (the domain has
+ * none here), and its events are dropped until the domain has resumed.
+ */
+static void tb_test_noirq_suspend_resume_retained(struct kunit *test)
+{
+	struct tb_test_noirq *ctx = tb_test_noirq_alloc(test);
+	static const enum tb_cfg_pkg_type dropped[] = {
+		TB_CFG_PKG_ERROR, TB_CFG_PKG_NOTIFY_ACK, TB_CFG_PKG_EVENT,
+		TB_CFG_PKG_ICM_EVENT,
+	};
+	struct tb *tb = ctx->tb;
+	u32 buf[4] = {};
+	int i;
+
+	KUNIT_EXPECT_TRUE(test, tb_domain_event_cb(tb, TB_CFG_PKG_EVENT, buf, sizeof(buf)));
+	KUNIT_EXPECT_EQ(test, ctx->events, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->last_event, TB_CFG_PKG_EVENT);
+
+	/* The connection manager refused: nothing is retained. */
+	ctx->suspend_ret = -EBUSY;
+	KUNIT_EXPECT_EQ(test, tb_domain_suspend_noirq(tb), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, tb->noirq_ctl_retained);
+	ctx->suspend_ret = 0;
+
+	KUNIT_ASSERT_EQ(test, tb_domain_suspend_noirq(tb), 0);
+	KUNIT_EXPECT_EQ(test, ctx->suspends, 2U);
+	KUNIT_ASSERT_TRUE(test, tb->noirq_ctl_retained);
+
+	for (i = 0; i < ARRAY_SIZE(dropped); i++)
+		KUNIT_EXPECT_TRUE(test, tb_domain_event_cb(tb, dropped[i], buf, sizeof(buf)));
+	KUNIT_EXPECT_EQ(test, ctx->events, 1U);
+
+	KUNIT_ASSERT_EQ(test, tb_domain_resume_noirq(tb), 0);
+	KUNIT_EXPECT_EQ(test, ctx->resumes, 1U);
+	KUNIT_EXPECT_FALSE(test, tb->noirq_ctl_retained);
+
+	KUNIT_EXPECT_TRUE(test, tb_domain_event_cb(tb, TB_CFG_PKG_ERROR, buf, sizeof(buf)));
+	KUNIT_EXPECT_EQ(test, ctx->events, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->last_event, TB_CFG_PKG_ERROR);
+}
+
+/* The XDomain discovery protocol and a service protocol of the test's own. */
+static const uuid_t tb_test_xdp_uuid =
+	UUID_INIT(0xb638d70e, 0x42ff, 0x40bb,
+		  0x97, 0xc2, 0x90, 0xe2, 0xc0, 0xb2, 0xff, 0x07);
+static const uuid_t tb_test_service_uuid =
+	UUID_INIT(0x4b756e69, 0x7420, 0x7465,
+		  0x73, 0x74, 0x20, 0x6e, 0x6f, 0x69, 0x72, 0x71);
+
+static int tb_test_noirq_service(const void *buf, size_t size, void *data)
+{
+	struct tb_test_noirq *ctx = data;
+
+	ctx->handled++;
+	return 1;
+}
+
+static void tb_test_noirq_unregister(void *data)
+{
+	tb_unregister_protocol_handler(data);
+}
+
+static bool tb_test_noirq_packet(struct tb_test_noirq *ctx, const uuid_t *uuid,
+				 enum tb_cfg_pkg_type pkg, u32 type)
+{
+	struct tb_xdp_header hdr = {
+		.xd_hdr.length_sn = (sizeof(hdr) - sizeof(hdr.xd_hdr)) / 4,
+		.uuid = *uuid,
+		.type = type,
+	};
+
+	return tb_xdomain_handle_request(ctx->tb, pkg, &hdr, sizeof(hdr));
+}
+
+/*
+ * While the control channel is retained nothing but a discovery request
+ * gets past the XDomain dispatch: no service protocol, no response, no
+ * discovery request that changes state.
+ */
+static void tb_test_noirq_xdomain_filter(struct kunit *test)
+{
+	static const u32 refused[] = {
+		0, UUID_RESPONSE, PROPERTIES_RESPONSE, PROPERTIES_CHANGED_REQUEST,
+		PROPERTIES_CHANGED_RESPONSE, ERROR_RESPONSE,
+		LINK_STATE_STATUS_RESPONSE, LINK_STATE_CHANGE_REQUEST,
+		LINK_STATE_CHANGE_RESPONSE, 31,
+	};
+	struct tb_test_noirq *ctx = tb_test_noirq_alloc(test);
+	struct tb_protocol_handler *handler;
+	struct tb *tb = ctx->tb;
+	int i;
+
+	handler = kunit_kzalloc(test, sizeof(*handler), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, handler);
+	handler->uuid = &tb_test_service_uuid;
+	handler->callback = tb_test_noirq_service;
+	handler->data = ctx;
+	KUNIT_ASSERT_EQ(test, tb_register_protocol_handler(handler), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, tb_test_noirq_unregister,
+							handler), 0);
+
+	/* Awake: the service sees its packets, a discovery response is not consumed. */
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_service_uuid,
+						     TB_CFG_PKG_XDOMAIN_REQ, UUID_REQUEST));
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_service_uuid,
+						     TB_CFG_PKG_XDOMAIN_RESP, UUID_RESPONSE));
+	KUNIT_EXPECT_EQ(test, ctx->handled, 2U);
+	KUNIT_EXPECT_FALSE(test, tb_test_noirq_packet(ctx, &tb_test_xdp_uuid,
+						      TB_CFG_PKG_XDOMAIN_RESP, UUID_RESPONSE));
+
+	WRITE_ONCE(tb->noirq_ctl_retained, true);
+
+	/* A service packet is dropped, whatever sits where discovery has its type. */
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_service_uuid,
+						     TB_CFG_PKG_XDOMAIN_REQ, UUID_REQUEST));
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_service_uuid,
+						     TB_CFG_PKG_XDOMAIN_RESP, UUID_RESPONSE));
+	KUNIT_EXPECT_EQ(test, ctx->handled, 2U);
+
+	/* A discovery response is consumed: no request of ours waits for one. */
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_xdp_uuid,
+						     TB_CFG_PKG_XDOMAIN_RESP, UUID_RESPONSE));
+	KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_xdp_uuid,
+						     TB_CFG_PKG_XDOMAIN_RESP, UUID_REQUEST));
+
+	/* Queueing a request takes a reference to the domain: none is queued. */
+	for (i = 0; i < ARRAY_SIZE(refused); i++) {
+		KUNIT_EXPECT_TRUE(test, tb_test_noirq_packet(ctx, &tb_test_xdp_uuid,
+							     TB_CFG_PKG_XDOMAIN_REQ,
+							     refused[i]));
+		KUNIT_EXPECT_EQ_MSG(test, kref_read(&tb->dev.kobj.kref), 1U,
+				    "XDomain request %u was queued", refused[i]);
+	}
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
@@ -4339,6 +4670,10 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_property_parse_u32_wrap),
 	KUNIT_CASE(tb_test_property_parse_recursion),
 	KUNIT_CASE(tb_test_property_parse_dir_len_underflow),
+	KUNIT_CASE(tb_test_noirq_xdp_request_types),
+	KUNIT_CASE(tb_test_noirq_retain_decision),
+	KUNIT_CASE(tb_test_noirq_suspend_resume_retained),
+	KUNIT_CASE(tb_test_noirq_xdomain_filter),
 	KUNIT_CASE(tb_test_pci_host_teardown),
 	KUNIT_CASE(tb_test_pci_host_daisy_chain),
 	KUNIT_CASE(tb_test_tunnel_dp_host_credits),

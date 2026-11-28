@@ -26,6 +26,7 @@ properties:
           - const: apple,t8142-aop-audio
           - const: apple,t8152-aop-audio
       - const: apple,t6050-aop-audio
+      - const: apple,t8152-aop-audio
 
   dmas:
     minItems: 4

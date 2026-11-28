@@ -86,6 +86,9 @@ pub(crate) struct G18UmaPoolMemory {
     low_bias: u64,
     hardware_slot: u32,
     block_stride: u64,
+    /// The client VM an application path last aliased the scratch blocks
+    /// into; None before the first.
+    client_vm: Option<u64>,
 }
 
 impl G18UmaPoolMemory {
@@ -109,8 +112,27 @@ impl G18UmaPoolMemory {
             || !self.process_aliases.is_empty() {
             return Err(EINVAL);
         }
+        self.clear_scratch_for(vm)?;
         self.alias_into_process(dev, uat, vm)?;
         Ok(core::mem::replace(&mut self.process_aliases, KVec::new()))
+    }
+
+    /// The scratch blocks hold the private memory of the last client VM's
+    /// threads. Storage released by that VM may still hold its data; clear
+    /// it before another VM maps it (construction leaves it zero). The
+    /// directory, block list, state and descriptor are kept: they name the
+    /// pool's own objects and the hardware owns their allocation cursors.
+    /// The caller proved the pool's last job retired and dropped the
+    /// previous VM's aliases. The same VM again clears nothing.
+    fn clear_scratch_for(&mut self, vm: &mmu::Vm) -> Result {
+        if self.client_vm.is_some_and(|id| id != vm.id()) {
+            for block in self.scratch.iter_mut() {
+                block.with_bytes_mut(|bytes| { bytes.fill(0); Ok(()) })?;
+            }
+            fence(Ordering::SeqCst);
+        }
+        self.client_vm = Some(vm.id());
+        Ok(())
     }
 
     /// The retained backing plan; application compute bounds its SMA pair by it.
@@ -283,6 +305,7 @@ impl G18UmaPoolMemory {
             descriptor_loaded: false,
             render: false, low_bias, hardware_slot,
             block_stride: if low_bias == 0 { BLOCK_DATA_STRIDE } else { 0x300000 },
+            client_vm: None,
         })
     }
 

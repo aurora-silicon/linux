@@ -91,6 +91,8 @@ static int dwc3_apple_set_role(struct dwc3_apple*a,enum dwc3_apple_state s){asse
 static void pm_runtime_mark_last_busy(struct device*d){}
 static void pm_runtime_put_autosuspend(struct device*d){rpm_puts++;}
 static int dwc3_host_init(struct dwc3*d){return host_error;}
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple*a){return dwc3_host_init(&a->dwc);}
 static int dwc3_gadget_init(struct dwc3*d){return gadget_error;}
 static void dwc3_host_exit(struct dwc3*d){role_exits++;}
 static void dwc3_gadget_exit(struct dwc3*d){role_exits++;}

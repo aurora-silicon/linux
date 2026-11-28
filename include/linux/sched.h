@@ -598,6 +598,14 @@ struct sched_entity {
 
 	u64				nr_migrations;
 
+	/*
+	 * Run time between sleeps: sum_exec_runtime when the task last went
+	 * to sleep, and the decaying average of the run time between two
+	 * sleeps. See wake_short_local().
+	 */
+	u64				prev_sleep_sum_runtime;
+	u64				burst_avg;
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	int				depth;
 	struct sched_entity		*parent;

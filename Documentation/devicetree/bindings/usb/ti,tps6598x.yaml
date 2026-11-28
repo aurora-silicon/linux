@@ -56,6 +56,12 @@ properties:
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
 
+  apple,sleep-ssps:
+    type: boolean
+    description:
+      Tell the controller the system's power state (SSPS) around a
+      firmware-driven suspend, S3 before it and S0 after.
+
   firmware-name:
     description: |
       Should contain the name of the default patch binary
@@ -91,6 +97,15 @@ allOf:
       properties:
         reg:
           maxItems: 1
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,cd321x
+    then:
+      properties:
+        apple,sleep-ssps: false
 
 additionalProperties: false
 

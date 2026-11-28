@@ -26,7 +26,6 @@ typedef uint32_t u32;typedef uint64_t u64;
 #define DCP_FW_VER 0
 #define dev_err(...) ((void)0)
 #define trace_iomfb_swap_submit(...) ((void)0)
-struct dc_swap_complete_resp { u32 swap_id; };
 struct dcp_swap_submit_resp { u32 ret; };
 struct dcp_swap_start_resp { u32 swap_id,ret; };
 struct apple_dcp { bool native,crashed,ext26_blocked,ext26_early_complete;u32 ext26_early_id,started_swap_id;
@@ -40,7 +39,13 @@ static void dcp_present_failed(struct apple_dcp *d) { (void)d;failures++; }
 static bool dcp_present_retires(struct apple_dcp *d) { (void)d;return true; }
 static void dcp_unarm_retained_framebuffers(struct apple_dcp *d,u32 id) { (void)d;(void)id; }
 static void dcp_drm_crtc_vblank(void *c) { (void)c;events++; }
-static void dcpep_cb_swap_complete(struct apple_dcp *d,struct dc_swap_complete_resp *r) { assert(r->swap_id==d->swap.h17p.swap.swap_id);completed++;completion_time=d->ext26_rx_ns; }
+static void dcp_swap_complete_id(struct apple_dcp *d, u32 id, bool shown)
+{
+    assert(id == d->swap.h17p.swap.swap_id);
+    assert(!shown);
+    completed++;
+    completion_time = d->ext26_rx_ns;
+}
 static u64 ktime_get(void) { return 30; }
 static u64 dcp_swap_time(void) { return 40; }
 static void dcp_swap_watchdog_arm(struct apple_dcp *d) { (void)d;watchdogs++; }

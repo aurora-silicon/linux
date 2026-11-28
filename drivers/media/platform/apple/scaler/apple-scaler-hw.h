@@ -58,6 +58,7 @@ struct asc_csc {
  * @alpha: carries an alpha channel
  * @wide: samples are 16 bits in memory (more than 8 significant bits)
  * @lossless: Apple lossless compressed 4:2:0 in one buffer (asc_lossless_geom())
+ * @msr23_only: offered only by the firmware-fronted MSR23 engine
  */
 struct asc_format {
 	u32 fourcc;
@@ -73,6 +74,7 @@ struct asc_format {
 	bool alpha;
 	bool wide;
 	bool lossless;
+	bool msr23_only;
 };
 
 /**
