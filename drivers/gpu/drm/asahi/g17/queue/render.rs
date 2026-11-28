@@ -180,6 +180,33 @@ struct Active {
     stamps_owed: bool,
 }
 
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.packet.context.dec_render_active();
+    }
+}
+
+/// A render packet parked for replay after GPU recovery. Holds the context's
+/// `render_active` count across `active -> replay -> republish/fail/drop` so
+/// `compute_direct()` never mistakes a context with parked replay renders for
+/// render-idle.
+struct ParkedReplay {
+    packet: Arc<Packet>,
+}
+
+impl ParkedReplay {
+    fn new(packet: Arc<Packet>) -> Self {
+        packet.context.inc_render_active();
+        Self { packet }
+    }
+}
+
+impl Drop for ParkedReplay {
+    fn drop(&mut self) {
+        self.packet.context.dec_render_active();
+    }
+}
+
 /// A firmware-retired, unexecuted group must hold on two observations this far
 /// apart before it is republished; a single sample may straddle an update.
 const ABANDON_GRACE_NS: u64 = 2_000_000;
@@ -255,7 +282,7 @@ pub(crate) struct Pair {
     context_update: bool,
     /// Retired, never-executed groups awaiting republication on this pair, in
     /// their original order. Nothing else is prepared on the pair before them.
-    replay: Tracker<Arc<Packet>>,
+    replay: Tracker<ParkedReplay>,
     /// Recovery generation of this pair's last executed retirement.
     executed_generation: Option<u64>,
     /// When the oldest parked group was parked or the last one republished.
@@ -482,13 +509,13 @@ impl Pair {
         self.replay.len() != 0 && crate::g17::timeout::background_stalled(self.replay_since, now)
     }
     pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
-        self.replay.front().cloned()
+        self.replay.front().map(|parked| parked.packet.clone())
     }
     pub(crate) fn finish_replay(&mut self, packet: &Arc<Packet>) -> Result {
         if !self
             .replay
             .front()
-            .is_some_and(|front| Arc::ptr_eq(front, packet))
+            .is_some_and(|front| Arc::ptr_eq(&front.packet, packet))
         {
             return Err(EIO);
         }
@@ -519,7 +546,7 @@ impl Pair {
             || self
                 .replay
                 .front()
-                .is_some_and(|front| !Arc::ptr_eq(front, packet))
+                .is_some_and(|front| !Arc::ptr_eq(&front.packet, packet))
             || !Arc::ptr_eq(&self.memory.context, &packet.context)
             || !packet.context.is_current()
         {
@@ -1256,6 +1283,7 @@ impl Pair {
         let flist_submission = self.free_list.prepare_submission(2)?;
         let pm_submission = memory.manager.prepare_submission()?;
         let published = host.next_publication()?;
+        packet.context.inc_render_active();
         self.active
             .push(Active {
                 published,
@@ -1830,7 +1858,9 @@ impl Pair {
                 .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, packet))
     }
     pub(crate) fn replay_contains(&self, packet: &Arc<Packet>) -> bool {
-        self.replay.iter().any(|replay| Arc::ptr_eq(replay, packet))
+        self.replay
+            .iter()
+            .any(|replay| Arc::ptr_eq(&replay.packet, packet))
     }
     pub(crate) fn take_deferred_timeout(&self) -> Option<(Arc<Packet>, Error)> {
         self.active.iter().find_map(|active| {
@@ -2340,9 +2370,9 @@ impl Pair {
     }
     /// The oldest parked group precedes a command waiting through `through`.
     pub(crate) fn replay_through(&self, through: Option<u64>) -> bool {
-        self.replay
-            .front()
-            .is_some_and(|packet| crate::g17::job::Order::contains(through, packet.order.sequence))
+        self.replay.front().is_some_and(|parked| {
+            crate::g17::job::Order::contains(through, parked.packet.order.sequence)
+        })
     }
 
     /// Every retained group was retired and unlinked by firmware without
@@ -2506,11 +2536,12 @@ impl Pair {
                 self.active.pop().ok_or(EIO)?;
                 continue;
             }
+            let parked = ParkedReplay::new(packet.clone());
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
             packet.reset_publication_for_replay();
             self.published_completions = None;
-            self.replay.push(packet).map_err(|_| EIO)?;
+            self.replay.push(parked).map_err(|_| EIO)?;
         }
         Ok(true)
     }
@@ -2642,7 +2673,7 @@ impl Pair {
         self.replay_since = None;
         // A descriptor prepared for the front and never published goes with it, or the pair
         // would take no work again.
-        if let Some(front) = self.replay.front().cloned() {
+        if let Some(front) = self.replay.front().map(|parked| parked.packet.clone()) {
             if self
                 .prepared
                 .as_ref()
@@ -2651,8 +2682,8 @@ impl Pair {
                 self.discard_prepared(&front)?;
             }
         }
-        while let Some(packet) = self.replay.pop() {
-            defer(Deferred::Retired(packet.completion.clone(), Err(error)))?;
+        while let Some(parked) = self.replay.pop() {
+            defer(Deferred::Retired(parked.packet.completion.clone(), Err(error)))?;
         }
         Ok(())
     }
@@ -2671,9 +2702,9 @@ impl Pair {
             self.slot,
             self.replay.len()
         );
-        for packet in self.replay.iter() {
-            if !packet.completion.guilty() {
-                packet.completion.classify(recovery::Class::Spared);
+        for parked in self.replay.iter() {
+            if !parked.packet.completion.guilty() {
+                parked.packet.completion.classify(recovery::Class::Spared);
             }
         }
         self.fail_replay(ENODATA, defer)
@@ -3042,8 +3073,8 @@ impl Pair {
             self.active.pop().ok_or(EIO)?;
         }
         self.replay_since = None;
-        while let Some(packet) = self.replay.pop() {
-            defer(Deferred::Drained(packet.completion.clone(), Err(EIO)))?;
+        while let Some(parked) = self.replay.pop() {
+            defer(Deferred::Drained(parked.packet.completion.clone(), Err(EIO)))?;
         }
         if let Some(previous) = self.previous.as_mut() {
             previous.ready = true;

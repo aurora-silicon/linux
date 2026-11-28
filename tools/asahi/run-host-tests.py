@@ -299,6 +299,10 @@ ASAHI_TESTS = {
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
+    'g17-direct-compute-render-prefix-tests.py': [([], PASS)]
+        + mutations('--mutation', ('bail-on-render-seen', 'skip-render-prefix',
+                                   'ignore-replay-parked', 'drop-active-dec',
+                                   'drop-count-on-park'), []),
     'g17-m5-multiqueue-contention-tests.py': [([], PASS)]
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',
