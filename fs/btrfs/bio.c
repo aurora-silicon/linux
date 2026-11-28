@@ -772,6 +772,26 @@ static u64 btrfs_append_map_length(struct btrfs_bio *bbio, u64 map_length)
 	return map_length;
 }
 
+/*
+ * Data reads are verified against their checksums once the bio has completed,
+ * so a large read adds the verification of all its blocks to its latency.
+ * Submit such reads in parts of this size instead: each part is verified as
+ * soon as it completes, in parallel with the other parts, so verification
+ * overlaps the transfer instead of following it.  256K keeps the per-part
+ * cost (one split and one checksum lookup) small next to the transfer.
+ */
+#define BTRFS_VERIFY_READ_PART		SZ_256K
+
+static bool btrfs_read_needs_verify(const struct btrfs_bio *bbio)
+{
+	const struct btrfs_inode *inode = bbio->inode;
+
+	return bio_op(&bbio->bio) == REQ_OP_READ && is_data_bbio(bbio) &&
+	       !bbio->is_scrub && !(inode->flags & BTRFS_INODE_NODATASUM) &&
+	       !test_bit(BTRFS_FS_STATE_NO_DATA_CSUMS,
+			 &inode->root->fs_info->fs_state);
+}
+
 static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
 {
 	struct btrfs_inode *inode = bbio->inode;
@@ -812,6 +832,8 @@ static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
 	map_length = min(map_length, length);
 	if (bbio->can_use_append)
 		map_length = btrfs_append_map_length(bbio, map_length);
+	if (btrfs_read_needs_verify(bbio))
+		map_length = min_t(u64, map_length, BTRFS_VERIFY_READ_PART);
 
 	if (map_length < length) {
 		struct btrfs_bio *split;
