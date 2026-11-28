@@ -799,6 +799,7 @@
 
 #include "t6040-j773s-usb3.dtsi"
 #include "t6040-j773s-usb-front.dtsi"
+#include "t6040-usb4-typec.dtsi"
 
 /* The video encoder, its DARTs and its power domains. */
 &ps_venc0_sys {
