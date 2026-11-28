@@ -123,6 +123,11 @@ struct ane_fw_platform {
 	 * so unlike text_pin this is computed from the image.
 	 */
 	const u8 *text_code_pin;
+	/*
+	 * Another build with this layout and these environment sections, its
+	 * code pin computed the same way (T6050: 27.2 26B8125, the K boards').
+	 */
+	const u8 *text_code_pin_alt;
 	struct ane_fw_text_env {
 		u32 offset, size;
 	} text_env[2];

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+#include <crypto/sha2.h>
 #include <kunit/test.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -183,6 +184,10 @@ static void ane_t6050_builds_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, b27_2);
 	KUNIT_EXPECT_NULL(test, b27_2->next_build);
 	KUNIT_EXPECT_NOT_NULL(test, b27_0->text_pin);
+	/* 26B8125 (the K boards) shares 26B123's layout, with its own code pin */
+	KUNIT_ASSERT_NOT_NULL(test, b27_2->text_code_pin_alt);
+	KUNIT_EXPECT_NE(test, memcmp(b27_2->text_code_pin, b27_2->text_code_pin_alt, SHA256_DIGEST_SIZE), 0);
+	KUNIT_EXPECT_NULL(test, b27_0->text_code_pin_alt);
 	for (i = 0; i < ARRAY_SIZE(builds); i++) {
 		const struct ane_fw_platform *b = builds[i];
 

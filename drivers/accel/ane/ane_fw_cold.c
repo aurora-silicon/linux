@@ -2293,6 +2293,15 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 	return 0;
 }
 
+static bool ane_fw_code_pinned(const struct ane_fw_platform *soc,
+			       const u8 code[SHA256_DIGEST_SIZE])
+{
+	return (soc->text_code_pin &&
+		!memcmp(code, soc->text_code_pin, SHA256_DIGEST_SIZE)) ||
+	       (soc->text_code_pin_alt &&
+		!memcmp(code, soc->text_code_pin_alt, SHA256_DIGEST_SIZE));
+}
+
 /*
  * Whether TEXT is the build's firmware: as loaded (text_pin, measured) or as
  * code, with the loader-filled environment sections zeroed (text_code_pin,
@@ -2338,7 +2347,7 @@ static bool ane_fw_text_pinned(const struct ane_fw_platform *soc, const u8 *text
 	}
 	sha256_update(&hash, text + pos, size - pos);
 	sha256_final(&hash, code);
-	return ok || !memcmp(code, soc->text_code_pin, SHA256_DIGEST_SIZE);
+	return ok || ane_fw_code_pinned(soc, code);
 }
 
 /*
@@ -3055,8 +3064,7 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 	if (mapped && soc->text_code_pin)
 		dev_info(&pdev->dev, "H17 ANE: firmware %s, TEXT code sha256 %*phN (%s)\n",
 			 soc->build_name ?: "?", (int)sizeof(code), code,
-			 memcmp(code, soc->text_code_pin, sizeof(code)) ?
-			 "not the code pin" : "code pin");
+			 ane_fw_code_pinned(soc, code) ? "code pin" : "not the code pin");
 	*hp = h;
 	if (ane_fw_cold_handoff_loader_ok(&h, soc))
 		return true;

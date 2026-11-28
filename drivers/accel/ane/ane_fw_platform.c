@@ -332,12 +332,26 @@ static const u8 ane_t6050_code_26b123[] = {
 	0x56, 0x63, 0xff, 0xe5, 0x89, 0x1a, 0xc7, 0x19,
 };
 
+/*
+ * The 27.2 (26B8125) build the K114/K116 MacBook Pros ship: the same image
+ * name, RTKit (3514.41.1), layout and environment sections as 26B123, other
+ * code. The pin is from the image in the 26B8125 restore image with both
+ * sections zeroed; a K114s reports the same digest for what iBoot loaded.
+ */
+static const u8 ane_t6050_code_26b8125[] = {
+	0x8d, 0x55, 0x2d, 0xcd, 0x27, 0xc4, 0xf5, 0x39,
+	0xe8, 0x9a, 0x28, 0x5c, 0x5a, 0xf8, 0x93, 0x84,
+	0x9a, 0xb8, 0xae, 0x2e, 0x3e, 0xff, 0xfe, 0xd0,
+	0xab, 0xa8, 0x94, 0x4e, 0x44, 0xe4, 0x31, 0xa8,
+};
+
 static const struct ane_fw_platform ane_t6050_platform_26b123 = {
 	ANE_T6050_PLATFORM,
-	.build_name = "27.2 26B123",
+	.build_name = "27.2 26B123/26B8125",
 	.preload_dva = { 0x10000000000, 0x100000bc000 },
 	.preload_size = { 0xbc000, 0x2b0000 },
 	.text_code_pin = ane_t6050_code_26b123,
+	.text_code_pin_alt = ane_t6050_code_26b8125,
 	.text_env = { { 0xb4f80, 0x4000 }, { 0xb8f80, 0x20 } },
 };
 
