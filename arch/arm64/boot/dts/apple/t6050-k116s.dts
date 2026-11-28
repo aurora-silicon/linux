@@ -453,6 +453,8 @@
 	power-domains = <&pmp0_gfx>;
 };
 
+#include "t6050-g17s-gpu-opp.dtsi"
+
 /*
  * The camera: the T6050 ISP as J716c and J714s describe it. From the K116sAP ADT (27.2):
  *  - isp0 reg[0] 0x380000000 (+ the arm-io range, 0x580000000) + 0x3ff0000 holds the windows
