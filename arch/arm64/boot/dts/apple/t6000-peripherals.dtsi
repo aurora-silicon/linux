@@ -2,13 +2,12 @@
 /* Additional T6000 hardware resources. Keep unqualified blocks disabled. */
 
 &{/soc} {
-	ane0_dma: dma-controller@285804000 {
+	ane0_dma: dma@285804000 {
 		compatible = "apple,t6000-ane-dma", "apple,ane-dma";
 		reg = <0x2 0x85804000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 771 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
-		status = "disabled";
 	};
 
 	aic_timebase: timer@28e148000 {
@@ -141,14 +140,13 @@
 		#iommu-cells = <1>;
 	};
 
-	ave0_dma: dma-controller@40d020000 {
+	ave0_dma: dma@40d020000 {
 		compatible = "apple,t6000-ave-dma", "apple,ave-dma";
 		reg = <0x4 0x0d020000 0x0 0x4000>,
 		      <0x4 0x0d044000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
 	};
 
 	atc0_dpin0: displayport@701e50000 {
@@ -156,7 +154,6 @@
 		reg = <0x7 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1306 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc0_dpin1: displayport@701e58000 {
@@ -164,19 +161,6 @@
 		reg = <0x7 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1307 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec0_piodma: dma-controller@722000000 {
-		compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
-		reg = <0x7 0x22000000 0x0 0x4000>,
-		      <0x7 0x22004000 0x0 0x4000>,
-		      <0x7 0x22008000 0x0 0x4000>,
-		      <0x7 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1199 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec0_dart 15>;
-		status = "disabled";
 	};
 
 	atc1_dpin0: displayport@b01e50000 {
@@ -184,7 +168,6 @@
 		reg = <0xb 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1354 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc1_dpin1: displayport@b01e58000 {
@@ -192,19 +175,6 @@
 		reg = <0xb 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1355 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec1_piodma: dma-controller@b22000000 {
-		compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
-		reg = <0xb 0x22000000 0x0 0x4000>,
-		      <0xb 0x22004000 0x0 0x4000>,
-		      <0xb 0x22008000 0x0 0x4000>,
-		      <0xb 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec1_dart 15>;
-		status = "disabled";
 	};
 
 	atc2_dpin0: displayport@f01e50000 {
@@ -212,7 +182,6 @@
 		reg = <0xf 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1402 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	atc2_dpin1: displayport@f01e58000 {
@@ -220,19 +189,6 @@
 		reg = <0xf 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1403 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec2_piodma: dma-controller@f22000000 {
-		compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
-		reg = <0xf 0x22000000 0x0 0x4000>,
-		      <0xf 0x22004000 0x0 0x4000>,
-		      <0xf 0x22008000 0x0 0x4000>,
-		      <0xf 0x20008000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1233 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec2_dart 15>;
-		status = "disabled";
 	};
 };
 
@@ -451,7 +407,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1128 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm1>;
-		status = "disabled";
 	};
 };
 

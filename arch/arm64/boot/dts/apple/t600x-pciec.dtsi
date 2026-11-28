@@ -75,6 +75,17 @@
 						<0 0 0 4 &apciec0_port 0 0 0 3>;
 			};
 		};
+
+		apciec0_piodma: dma@722000000 {
+			compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
+			reg = <0x7 0x22000000 0x0 0x4000>,
+			      <0x7 0x22004000 0x0 0x4000>,
+			      <0x7 0x22008000 0x0 0x4000>,
+			      <0x7 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1199 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&apciec0_dart 15>;
+		};
 	};
 
 	usb4_1_pcie_tunnel: usb4-pcie-tunnel-1 {
@@ -146,6 +157,17 @@
 						<0 0 0 3 &apciec1_port 0 0 0 2>,
 						<0 0 0 4 &apciec1_port 0 0 0 3>;
 			};
+		};
+
+		apciec1_piodma: dma@b22000000 {
+			compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
+			reg = <0xb 0x22000000 0x0 0x4000>,
+			      <0xb 0x22004000 0x0 0x4000>,
+			      <0xb 0x22008000 0x0 0x4000>,
+			      <0xb 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&apciec1_dart 15>;
 		};
 	};
 
@@ -219,6 +241,17 @@
 						<0 0 0 4 &apciec2_port 0 0 0 3>;
 			};
 		};
+
+		apciec2_piodma: dma@f22000000 {
+			compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
+			reg = <0xf 0x22000000 0x0 0x4000>,
+			      <0xf 0x22004000 0x0 0x4000>,
+			      <0xf 0x22008000 0x0 0x4000>,
+			      <0xf 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1233 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&apciec2_dart 15>;
+		};
 	};
 
 	usb4_3_pcie_tunnel: usb4-pcie-tunnel-3 {
@@ -289,5 +322,16 @@
 						<0 0 0 3 &apciec3_port 0 0 0 2>,
 						<0 0 0 4 &apciec3_port 0 0 0 3>;
 			};
+		};
+
+		apciec3_piodma: dma@1322000000 {
+			compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
+			reg = <0x13 0x22000000 0x0 0x4000>,
+			      <0x13 0x22004000 0x0 0x4000>,
+			      <0x13 0x22008000 0x0 0x4000>,
+			      <0x13 0x20008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1250 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&apciec3_dart 15>;
 		};
 	};
