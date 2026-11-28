@@ -51,6 +51,7 @@
 			/* Format properties will be added by the loader */
 			/* Scanned out by the internal DCP, handed off or not. */
 			display = <&dcp>;
+			panel = <&panel>;
 			status = "disabled";
 		};
 	};
