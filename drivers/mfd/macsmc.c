@@ -717,6 +717,8 @@ static void apple_smc_sleep_pmvc_report(struct apple_smc *smc)
 			smc->sleep_pmvc);
 }
 
+static atomic64_t apple_smc_bind_gen;
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -740,6 +742,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 	apple_smc_init_state(smc);
 	smc->dev = &pdev->dev;
+	smc->bind_gen = atomic64_inc_return(&apple_smc_bind_gen);
 	smc->saved_enabled = apple_t6050_sleep_described() &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
 	smc->port_dark_wake = smc->saved_enabled && of_machine_is_compatible("apple,j714s");
