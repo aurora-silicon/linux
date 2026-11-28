@@ -30,6 +30,7 @@
 };
 
 #include "t6050-peripherals.dtsi"
+#include "t6050-media.dtsi"
 
 /* The 14-inch chassis: the Neural Engine, pins, the jack, the card and the AOP; no speakers */
 #include "t6050-k114.dtsi"
