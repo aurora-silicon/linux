@@ -210,12 +210,16 @@
 		compatible = "apple,t8142-cluster-cpufreq";
 		reg = <0x2 0x10e20000 0 0x1000>;
 		#performance-domain-cells = <0>;
+		/* E lane follows the ADT ordering; no changing sample yet. */
+		apple,fast-die-effort = <&pmp_report 0>;
 	};
 
 	cpufreq_p: performance-controller@211e20000 {
 		compatible = "apple,t8142-cluster-cpufreq";
 		reg = <0x2 0x11e20000 0 0x1000>;
 		#performance-domain-cells = <0>;
+		/* P lane has been observed under Linux CPU load. */
+		apple,fast-die-effort = <&pmp_report 1>;
 	};
 
 	/*
@@ -431,87 +435,21 @@
 };
 
 /*
- * The video encoder, its two DARTs and the VENC power tree: ADT ave behind
- * dart-ave (DART + CPUDART), the same addresses, interrupts and power states
- * on both boards. The boot loader hands over iBoot's preloaded firmware
- * (memory regions, CRCs in /chosen) or disables the encoder when the ADT has
- * no preload.
+ * SIO AES engine, software keys only. It registers below the CPU's aes-ce, so
+ * it is used only when asked for by driver name.
  */
-&ps_venc_sys {
+&ps_sio {
 	status = "okay";
 };
 
-&ps_venc_dma {
+&ps_aes {
 	status = "okay";
 };
 
-&ps_venc_pipe4 {
+&sio_dart {
 	status = "okay";
 };
 
-&ps_venc_pipe5 {
-	status = "okay";
-};
-
-&ps_venc_me0 {
-	status = "okay";
-};
-
-&ps_venc_me1 {
-	status = "okay";
-};
-
-&ave_dart0 {
-	status = "okay";
-};
-
-&ave_dart1 {
-	status = "okay";
-};
-
-&ave {
-	status = "okay";
-};
-
-/*
- * The Neural Engine (ADT ane and dart-ane, the same on both boards). It stays
- * off until the first request: the firmware is started then, from the preload,
- * and system sleep cycles it cold. The boot loader hands the preload over by
- * the engine's compatible, or disables the node when there is none.
- */
-&ps_ane_sys {
-	status = "okay";
-};
-
-&ane_dart0 {
-	status = "okay";
-};
-
-&ane_dart1 {
-	status = "okay";
-};
-
-&ane_dart2 {
-	status = "okay";
-};
-
-&ane {
-	status = "okay";
-};
-
-/* Both JPEG engines and their DART (ADT jpeg0, jpeg1, dart-jpeg). */
-&ps_jpg {
-	status = "okay";
-};
-
-&jpeg_dart {
-	status = "okay";
-};
-
-&jpeg0 {
-	status = "okay";
-};
-
-&jpeg1 {
+&aes {
 	status = "okay";
 };

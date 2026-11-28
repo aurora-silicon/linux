@@ -2093,6 +2093,7 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-running.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
@@ -2149,6 +2150,15 @@ F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/apple/aop-las.py
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
+
+APPLE T8152 DCP DISPLAY DRIVER (IBOOT INTERFACE)
+M:	Thomas Glanzmann <thomas@glanzmann.de>
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/display/apple,t8152-dcp-iboot.yaml
+F:	drivers/gpu/drm/apple/iboot_drm.c
+F:	drivers/gpu/drm/apple/iomfb_iboot.*
+F:	drivers/gpu/drm/apple/t8152_*
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
@@ -2699,6 +2709,7 @@ F:	Documentation/devicetree/bindings/dma/apple,sio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,*
 F:	Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
 F:	Documentation/devicetree/bindings/sound/trivial-codec.yaml
+F:	drivers/dma/apple-sio-msg-test.c
 F:	drivers/dma/apple-sio-probe-test.c
 F:	drivers/dma/apple-sio-probe-test.dtso
 F:	drivers/dma/apple-sio-t6030-test.dtso
@@ -2774,10 +2785,13 @@ F:	Documentation/hwmon/macsmc-hwmon.rst
 F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
+F:	drivers/bluetooth/hci_bcm4377_test.c
+F:	tools/asahi/bcm4377-completion-tests.py
 F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
+F:	drivers/dma/apple-piodma-test.c
 F:	drivers/dma/apple-piodma.c
 F:	drivers/gpio/gpio-macsmc.c
 F:	drivers/hwmon/apple-aon-ptd-hwmon*.c
@@ -2799,9 +2813,13 @@ F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
 F:	drivers/nfc/.kunitconfig
 F:	drivers/nfc/apple-stockholm*.c
+F:	drivers/nvme/host/apple-kunit.c
 F:	drivers/nvme/host/apple.c
+F:	drivers/nvme/host/apple.kunitconfig
 F:	drivers/nvmem/apple-efuses.c
+F:	drivers/nvmem/apple-spmi-nvmem-test.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
+F:	drivers/nvmem/apple-spmi-nvmem.kunitconfig
 F:	drivers/phy/apple/
 F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
@@ -2879,6 +2897,7 @@ S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
 F:	drivers/media/platform/apple/scaler/
+F:	tools/media/apple-scaler/
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
@@ -25635,6 +25654,7 @@ S:	Maintained
 F:	drivers/base/property.c
 F:	drivers/base/swnode.c
 F:	drivers/base/test/swnode-devlink-test.c
+F:	drivers/base/test/swnode-managed-test.c
 F:	include/linux/fwnode.h
 F:	include/linux/property.h
 

@@ -183,6 +183,162 @@ static void afk_compact_service_call_report_test(struct kunit *test)
 }
 
 /*
+ * Replies to firmware calls wait on the endpoint's transmit queue. While it
+ * makes no progress, further calls are taken only as long as their replies
+ * fit the room of one message.
+ */
+struct compact_reply_gate {
+	struct work_struct work;
+	struct completion open;
+};
+
+static void compact_reply_gate_fn(struct work_struct *work)
+{
+	struct compact_reply_gate *gate =
+		container_of(work, struct compact_reply_gate, work);
+
+	wait_for_completion(&gate->open);
+}
+
+static int compact_call_count_cb(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t size,
+				 void *reply, size_t room)
+{
+	unsigned int *count = service->cookie;
+
+	(*count)++;
+	return 0;
+}
+
+static const struct apple_epic_service_ops compact_call_count_ops = {
+	.name = "compact-call-test",
+	.call_v2 = compact_call_count_cb,
+};
+
+static void afk_compact_call_reply_budget_test(struct kunit *test)
+{
+	/* Four calls of this size take all the room; the timestamp and sub-header precede. */
+	const size_t payload_size = AFK_COMPACT_MESSAGE_MAX / 4;
+	const size_t wire_size = 16 + payload_size;
+	struct apple_dcp_afkep *ep = test->priv;
+	struct compact_reply_gate gate;
+	struct epic_compact_sub_hdr *sub;
+	struct epic_service_call *call;
+	unsigned int handled = 0, i;
+	u8 *wire;
+
+	wire = kunit_kzalloc(test, wire_size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, wire);
+	sub = (void *)(wire + 8);
+	sub->category = 1;
+	sub->type = EPIC_SUBTYPE_STD_SERVICE;
+	call = (void *)((u8 *)(sub + 1) + sizeof(struct epic_compact_desc));
+	call->command = cpu_to_le32(4);
+	call->data_len = cpu_to_le32(payload_size - sizeof(struct epic_compact_desc) -
+				     sizeof(*call));
+	call->magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC);
+
+	ep->services[0].ops = &compact_call_count_ops;
+	ep->services[0].cookie = &handled;
+	ep->tx_wq = alloc_ordered_workqueue("afk-parser-test-tx", 0);
+	KUNIT_ASSERT_NOT_NULL(test, ep->tx_wq);
+
+	/* The queue is ordered: nothing behind the gate runs until it opens. */
+	INIT_WORK_ONSTACK(&gate.work, compact_reply_gate_fn);
+	init_completion(&gate.open);
+	queue_work(ep->tx_wq, &gate.work);
+
+	/* A call left without a reply must hold off a coordinated sleep. */
+	ep->dcp->v27_sleep_transport = true;
+	for (i = 0; i < 4; i++)
+		afk_recv_compact_message(ep, 1, wire, wire_size);
+	KUNIT_EXPECT_FALSE(test, ep->sleep_poisoned);
+	afk_recv_compact_message(ep, 1, wire, wire_size);
+	KUNIT_EXPECT_EQ(test, handled, 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 4);
+	KUNIT_EXPECT_TRUE(test, ep->sleep_poisoned);
+
+	/* A small call no longer fits either. */
+	call->data_len = cpu_to_le32(0);
+	afk_recv_compact_message(ep, 1, wire,
+				 16 + sizeof(struct epic_compact_desc) + sizeof(*call));
+	KUNIT_EXPECT_EQ(test, handled, 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 4);
+
+	/* The replies fail without a transmit ring, which frees their room. */
+	complete(&gate.open);
+	flush_workqueue(ep->tx_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 0);
+
+	afk_recv_compact_message(ep, 1, wire,
+				 16 + sizeof(struct epic_compact_desc) + sizeof(*call));
+	KUNIT_EXPECT_EQ(test, handled, 5U);
+
+	destroy_workqueue(ep->tx_wq);
+	ep->tx_wq = NULL;
+	destroy_work_on_stack(&gate.work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 0);
+}
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+#include "t8152_display.h"
+
+/*
+ * A T8152 DPTX call gets as much reply room as its request has, which the
+ * firmware sizes. A reply too short for the status word is refused, and
+ * nothing is written past its room.
+ */
+static void afk_t8152_dptx_short_reply_test(struct kunit *test)
+{
+	const size_t head = 16 + sizeof(struct epic_compact_desc) +
+			    sizeof(struct epic_service_call);
+	struct apple_dcp_afkep *ep = test->priv;
+	struct apple_epic_service *service = &ep->services[0];
+	struct epic_compact_sub_hdr *sub;
+	struct epic_service_call *call;
+	u8 request[sizeof(u32)] = {}, reply[8];
+	size_t room, i;
+	u8 *wire;
+
+	service->ops = &t8152_dptx_port_ops;
+	service->ep = ep;
+
+	/* The handler itself, with the bytes after its room watched. */
+	for (room = 0; room <= sizeof(u32); room++) {
+		memset(reply, 0xa5, sizeof(reply));
+		KUNIT_EXPECT_EQ_MSG(test,
+				    service->ops->call_v2(service, 1, 0, request, room,
+							  reply, room),
+				    room < sizeof(u32) ? -EINVAL : 0, "room %zu", room);
+		for (i = room; i < sizeof(reply); i++)
+			KUNIT_EXPECT_EQ_MSG(test, reply[i], 0xa5,
+					    "room %zu, byte %zu", room, i);
+	}
+
+	/* The whole call from the wire, its reply allocated to the request's size. */
+	wire = kunit_kzalloc(test, head + sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, wire);
+	sub = (void *)(wire + 8);
+	sub->category = 1;
+	sub->type = EPIC_SUBTYPE_STD_SERVICE;
+	call = (void *)((u8 *)(sub + 1) + sizeof(struct epic_compact_desc));
+	call->group = cpu_to_le16(1);
+	call->magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC);
+
+	ep->tx_wq = alloc_ordered_workqueue("afk-parser-test-tx", 0);
+	KUNIT_ASSERT_NOT_NULL(test, ep->tx_wq);
+	for (room = 0; room <= sizeof(u32); room++) {
+		call->data_len = cpu_to_le32(room);
+		afk_recv_compact_message(ep, 1, wire, head + room);
+		flush_workqueue(ep->tx_wq);
+	}
+	destroy_workqueue(ep->tx_wq);
+	ep->tx_wq = NULL;
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 0);
+}
+#endif
+
+/*
  * Slot reuse for re-announced compact services. The firmware re-announces a
  * service under a fresh interface on every DP relink without closing the old
  * one; afk_compact_slot() decides whether the new announcement supersedes the
@@ -287,9 +443,64 @@ static void afk_compact_siblings_kept_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, first->enabled);
 }
 
+/* Named entries (exact or cut) beat "*", regardless of table order. */
+static void afk_compact_cut_before_wildcard_test(struct kunit *test)
+{
+	static const struct apple_epic_service_ops ops[] = {
+		{ .name = "dcpav-service-epic" },
+		{
+			.name = "dcpav-audio-interface-epic",
+			.compact_full = "dcpav-audio-interface-epic:0",
+		},
+		{ .name = "*" },
+		{},
+	};
+	static const struct apple_epic_service_ops wildcard_first_ops[] = {
+		{ .name = "*" },
+		{ .name = "dcpav-service-epic" },
+		{
+			.name = "dcpav-audio-interface-epic",
+			.compact_full = "dcpav-audio-interface-epic:0",
+		},
+		{},
+	};
+	struct apple_dcp_afkep *ep = test->priv;
+
+	ep->ops = ops;
+	/* "dispext0:dcpav-audio-interface-epic:0", cut to its 31 characters */
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-audio-interface-"),
+			    &ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "x:dcpav-audio-interface-epic:0"),
+			    &ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-service-epic:0"),
+			    &ops[0]);
+	/* Anything else, cut or not, is the wildcard's. */
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "ext:dcpav-cec-interface-epic:0"),
+			    &ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-video-interface-"),
+			    &ops[2]);
+
+	/* Listing "*" first still lets named entries win, exact or cut. */
+	ep->ops = wildcard_first_ops;
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-service-epic:0"),
+			    &wildcard_first_ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "x:dcpav-audio-interface-epic:0"),
+			    &wildcard_first_ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-audio-interface-"),
+			    &wildcard_first_ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "ext:dcpav-cec-interface-epic:0"),
+			    &wildcard_first_ops[0]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-video-interface-"),
+			    &wildcard_first_ops[0]);
+}
+
 static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_service_call_report_test),
+	KUNIT_CASE(afk_compact_call_reply_budget_test),
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+	KUNIT_CASE(afk_t8152_dptx_short_reply_test),
+#endif
 	KUNIT_CASE(afk_compact_header_test),
 	KUNIT_CASE(afk_short_epic_test),
 	KUNIT_CASE(afk_short_reply_test),
@@ -297,6 +508,7 @@ static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_compact_singleton_replaces_test),
 	KUNIT_CASE(afk_compact_singleton_no_leak_test),
 	KUNIT_CASE(afk_compact_siblings_kept_test),
+	KUNIT_CASE(afk_compact_cut_before_wildcard_test),
 	{}
 };
 

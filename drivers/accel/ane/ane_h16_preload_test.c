@@ -457,4 +457,5 @@ static struct kunit_suite preload_suite = {
 };
 
 kunit_test_suite(preload_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple ANE firmware preload");
 MODULE_LICENSE("Dual MIT/GPL");

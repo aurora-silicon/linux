@@ -349,6 +349,13 @@ impl Resources<'_> {
             .expect("64-bit read failed!")
     }
 
+    /// The G14 Fender operating-point word: requested index in bits 3:0, request pending in
+    /// bit 4. Sampled while the firmware holds the GPU powered.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn operating_point(&self) -> u32 {
+        self.sgx_read32::<0xd01000>()
+    }
+
     /// Initialize the MMIO registers for the GPU.
     pub(crate) fn init_mmio(&self) -> Result {
         // Nothing to do for now...
@@ -479,6 +486,16 @@ impl Resources<'_> {
             core_masks,
             core_masks_packed,
         })
+    }
+
+    /// The MMU fault status registers of this GPU core: the status word, the address register
+    /// (`None` where the address is part of the status word) and whether it uses the G14X layout.
+    pub(crate) fn fault_registers(cfg: &'static hw::HwConfig) -> (usize, Option<usize>, bool) {
+        if cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32 {
+            (FAULT_INFO_G14X, Some(FAULT_ADDR_G14X), true)
+        } else {
+            (FAULT_INFO, None, false)
+        }
     }
 
     /// Get the fault information from the MMU status register, if one occurred.
@@ -657,6 +674,26 @@ impl G17Resources {
         Ok(true)
     }
 
+    /// Writes an M5 host command-port transaction to the SGX register block.
+    /// Only the first and last writes carry the write barrier of an ordered
+    /// MMIO write; interior writes to the same non-posted register block stay
+    /// in program order without stalling on intermediate GPU round trips.
+    fn write_m5_submission(
+        sgx: &IoMem<'_, SGX_SIZE>,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        let sgx = sgx.as_view();
+        let writes = submission.writes();
+        for (index, &(offset, value)) in writes.iter().enumerate() {
+            if index != 0 && index + 1 != writes.len() {
+                sgx.relaxed().try_write64(value, offset)?;
+            } else {
+                sgx.try_write64(value, offset)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Publishes through the M5 host command port, including the kick that
     /// makes an idle queue runnable. Core activity is not a prerequisite.
     pub(crate) fn submit_m5_work(
@@ -667,11 +704,7 @@ impl G17Resources {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        for &(offset, value) in submission.writes() {
-            sgx.try_write64(value, offset)?;
-        }
-        Ok(())
+        Self::write_m5_submission(&*sgx, submission)
     }
 
     /// [`Self::submit_m5_work`] with core gating held off across the transaction, reading the
@@ -686,17 +719,14 @@ impl G17Resources {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
-        let result = submission
-            .writes()
-            .iter()
-            .try_for_each(|&(offset, value)| sgx.try_write64(value, offset));
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
-        sgx.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let view = (&*sgx).as_view();
+        let gating = view.try_read32(G17_GATING_CONTROL)?;
+        view.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        view.try_read32(G17_GATING_CONTROL)?;
+        let result = Self::write_m5_submission(&*sgx, submission);
+        let gating = view.try_read32(G17_GATING_CONTROL)?;
+        view.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
+        view.try_read32(G17_GATING_CONTROL)?;
         result
     }
 
@@ -716,23 +746,6 @@ impl G17Resources {
             sgx.try_read64(0xc008)?,
             sgx.try_read64(0xc028)?,
         ])
-    }
-
-    /// Sample only the two owned queue configuration words through the
-    /// host tag/data port. The caller holds the device mutex and power hold.
-    pub(crate) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
-        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let sgx = (&*sgx).as_view();
-        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
-            return Err(EAGAIN);
-        }
-        let mut values = [0; 2];
-        for (value, qid) in values.iter_mut().zip(qids) {
-            let tag = crate::g17::fw::m5::queue::HardwareSubmission::configuration_tag(qid)?;
-            sgx.try_write64(tag, 0x4090)?;
-            *value = sgx.try_read64(0x4098)?;
-        }
-        Ok(values)
     }
 
     /// Registers a queue KSM slot through the firmware mailbox.

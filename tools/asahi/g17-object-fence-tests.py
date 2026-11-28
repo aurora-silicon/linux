@@ -17,6 +17,10 @@ this is not GPU execution. Checks:
   match the pool before linux#1978 (BASE) on the same random operations.
 - Source rules: every accessor that hands the address to the firmware marks it,
   and only the release path of `retain_linked_work` marks it released.
+- Cache policy (linux#3170 and its G17P follow-up): records the host rewrites
+  in place (render queue records, the compute graph, M5 scheduler pages) stay
+  uncached on every G17; work nodes and compute descriptors are uncached on M5
+  and keep their firmware-cached prefix on G17P.
 
 `--mutation` applies one known-bad change to the compiled copy; the run must
 then fail.
@@ -47,6 +51,14 @@ MUTATIONS = {
     'node-unmarked': ('context', '        self.context.expose_work();\n', ''),
     # A consumed release with an empty list does not mark the work state.
     'no-release': ('context', 'mark.released(super::channel::control_witnessed());', 'let _ = mark;'),
+    # M5 work nodes are firmware-cached again.
+    'm5-cached-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', 'UAT_PGSZ'),
+    # M5 compute descriptors are firmware-cached again.
+    'm5-cached-descriptors': ('policy-compute', 'if alloc.uat.is_m5() { 0 } else { size }', 'size'),
+    # Render queue records, which the host retargets in place, are firmware-cached again.
+    'cached-queue-records': ('policy-memory', 'GRAPH_SIZE,\n            0,\n', 'GRAPH_SIZE,\n            0x8000,\n'),
+    # G17P work nodes lose their cached prefix (the linux#3170 light-submission cost).
+    'uncached-g17p-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', '0'),
 }
 
 
@@ -148,7 +160,10 @@ pub mod mmu {
     pub struct KernelMapping { pub iova: u64 }
     impl KernelMapping {
         pub fn iova(&self) -> u64 { self.iova }
-        pub unsafe fn set_fw_cached_prefix(&self, _prefix: usize) -> (crate::Result<[u64; 2]>, bool) { (Ok([0; 2]), true) }
+        pub unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (crate::Result<[u64; 2]>, bool) {
+            assert!(prefix > 0, "set_fw_cached_prefix must not be called for prefix == 0");
+            (Ok([0; 2]), true)
+        }
     }
 }
 
@@ -355,6 +370,54 @@ pub mod now {
     fn returns(pool: &Pool) -> [u64; 3] {
         let s = snapshot(pool);
         ["unseen=", "released=", "strict="].map(|key| crate::count(&s, "workstate_returns", key))
+    }
+
+    /// Uncached pooled objects (`prefix == 0`) skip `set_fw_cached_prefix` while keeping
+    /// their pool lease, fence, return mark, reuse zeroing and retention until stop.
+    pub fn uncached_pooled() {
+        for after_release in [true, false] {
+            let next = Cell::new(1);
+            let alloc = Allocator { next: &next };
+            let pool = Pool::new(after_release).unwrap();
+            crate::forget_unmapped();
+            crate::channel::set(5, 3);
+
+            let mut ws = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert!(ws.lease.is_some(), "prefix == 0 keeps a pool lease");
+            assert_eq!(ws.return_mark().is_some(), after_release);
+            ws.bytes_mut()[0] = 0x42;
+            let ws_id = ws.id;
+            if let Some(mark) = ws.return_mark() {
+                mark.expose();
+            }
+            drop(ws);
+            assert!(!unmapped(ws_id), "prefix == 0 stays mapped on drop");
+            assert_eq!(fence(&pool, Family::WorkState, ws_id), Some(6));
+
+            // Still behind fence: a fresh object is allocated instead of reusing ws_id.
+            let fresh = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert_ne!(fresh.id, ws_id);
+            drop(fresh);
+
+            // Once the fence is met, ws_id is reused and zeroed.
+            crate::channel::set(6, 6);
+            let reused = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert_eq!(reused.id, ws_id, "prefix == 0 is reused once its fence is met");
+            assert_eq!(reused.bytes[0], 0, "reused prefix == 0 object is zeroed");
+            drop(reused);
+
+            // retain_until_stop keeps an uncached pooled object mapped until firmware stop.
+            let mut kept = pool.allocate(&alloc, Family::QueueState, mmu::UAT_PGSZ, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert!(kept.lease.is_some());
+            let kept_id = kept.id;
+            kept.retain_until_stop(&pool);
+            drop(kept);
+            assert!(!unmapped(kept_id));
+            pool.stop_after_firmware();
+            assert!(unmapped(kept_id));
+            assert!(unmapped(ws_id));
+        }
+        println!("uncached pooled: prefix == 0 skips firmware caching while keeping fencing, reuse and retention");
     }
 
     /// Each return class decides the fence; reuse never waits on a met fence.
@@ -708,6 +771,7 @@ pub mod now {
 }
 
 fn main() {
+    now::uncached_pooled();
     now::return_classes();
     now::full_family();
     let (mut allocations, mut uncached, mut overruns) = (0, 0, 0);
@@ -767,6 +831,32 @@ def source_rules(context, observation, tree):
     print('source: records and commands mark the work state; only a consumed empty-list release releases it')
 
 
+def cache_policy(context, compute, memory):
+    """The firmware-cached prefix each pooled G17 object family gets. Returns the failures."""
+    failures = []
+
+    def need(text, pattern, what):
+        if not re.search(pattern, text):
+            failures.append(what)
+
+    # Work nodes: uncached on M5, the node page cached on G17P; the counter page stays uncached.
+    need(context, r'pool\.allocate\(\s*alloc,\s*Family::WorkState,\s*2 \* UAT_PGSZ,\s*'
+         r'if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ UAT_PGSZ \},', 'work nodes: M5 uncached, G17P node page cached')
+    # M5 scheduler pages, which are zeroed and reinitialised on reuse, stay uncached.
+    need(context, r'Family::Scheduler,\s*UAT_PGSZ,\s*0,', 'M5 scheduler pages uncached')
+    # Compute descriptors: uncached on M5, cached on G17P.
+    need(compute, r'Family::Descriptor,\s*size,\s*if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ size \},',
+         'compute descriptors: M5 uncached, G17P cached')
+    # The compute graph, whose queue record is rebound in place, is an ordinary uncached allocation.
+    need(compute, r'let mut graph = alloc\.kernel\(GRAPH_SIZE \+ mmu::UAT_PGSZ, page, prot, cpu\)\?;',
+         'compute graph uncached')
+    if 'Family::QueueState' in compute:
+        failures.append('compute graph not pooled')
+    # Render queue records, retargeted and bound to work slots in place, stay uncached.
+    need(memory, r'Family::QueueState,\s*GRAPH_SIZE,\s*0,\s*prot,', 'render queue records uncached')
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
     ap.add_argument('--mutation', choices=sorted(MUTATIONS))
@@ -779,6 +869,21 @@ def main():
     base = subprocess.run(['git', '-C', str(ROOT), 'show', f'{BASE}:drivers/gpu/drm/asahi/g17/object.rs'],
                           check=True, capture_output=True, text=True).stdout
     source_rules(ctx, observation, DRIVER)
+
+    policy = {'context': ctx, 'compute': (DRIVER / 'g17/queue/compute.rs').read_text(),
+              'memory': (DRIVER / 'g17/queue/render/memory.rs').read_text()}
+    if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
+        where, old, new = MUTATIONS[args.mutation]
+        policy[where[len('policy-'):]] = replace(policy[where[len('policy-'):]], old, new)
+    failures = cache_policy(policy['context'], policy['compute'], policy['memory'])
+    for failure in failures:
+        print(f'FAIL line 0: cache policy: {failure}')
+    if failures:
+        return 1
+    print('cache policy: in-place rewritten records uncached everywhere; work nodes and compute descriptors '
+          'uncached on M5 and cached on G17P')
+    if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
+        return 0
 
     now = pool_source(obj)
     pages, methods, node = context_source(ctx)

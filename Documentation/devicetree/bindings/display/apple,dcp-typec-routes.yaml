@@ -16,17 +16,25 @@ description: |
 
   Each route index N names a typecN PHY and a typecN DP Alt Mode crossbar output
   on the DCP node. The route's graph endpoint connects to the corresponding
-  Type-C connector's display port (port@3). Two route endpoints on that port
-  mean two candidate pipelines; that alone does not imply two tunnel streams.
+  Type-C connector's display port (port@2 on T6050, port@3 on earlier SoCs). Two
+  route endpoints on that port mean two candidate pipelines; that alone does not
+  imply two tunnel streams.
 
   For a port wired to both Thunderbolt DP IN adapters, name typecN-dpin0 and
   typecN-dpin1 crossbar controls on the pipelines that can drive them. Crossbar
   mux cells 0, 1 and 2 describe the DP PHY, DP IN 0 and DP IN 1 outputs,
   respectively. The per-port prefix distinguishes multiple ATCs on one DCP.
-  Dual-stream wiring requires these two named controls and two port@3
-  endpoints. It does not describe SoC handshake or retry policy. T6050 host
-  routers have four DP IN adapters; their crossbars add typecN-dpin2 and
-  typecN-dpin3 (cells 3 and 4).
+  Dual-stream wiring requires these two named controls and two endpoints on the
+  connector's display port. It does not describe SoC handshake or retry policy.
+  T6050 host routers have four DP IN adapters; their crossbars add typecN-dpin2
+  and typecN-dpin3 (cells 3 and 4).
+
+  An empty typec-routes container asks the boot loader to write the routes
+  from the hardware's own description of its display crossbar: the phys,
+  crossbar controls, crossbar states, DPTX targets and route nodes below,
+  and the matching endpoints on each connector's display port (port@2 on
+  T6050, port@3 on earlier SoCs). Without a boot loader that does, the
+  processor has no Type-C route.
 
   Legacy typecN-usb4 names describe cell 1 on old j414/j416 DTBs. With two
   port@3 endpoints they retain the existing dual-stream wiring; cell 2 is
@@ -39,7 +47,12 @@ select:
         enum:
           - apple,dcp
           - apple,dcpext
-    typec-routes: true
+    typec-routes:
+      anyOf:
+        - required: [route@0]
+        - required: [route@1]
+        - required: [route@2]
+        - required: [route@3]
   required:
     - compatible
     - typec-routes
@@ -181,8 +194,18 @@ examples:
   - |
     #include <dt-bindings/phy/phy.h>
 
-    dcp {
+    dcp@8dc00000 {
         compatible = "apple,t6020-dcpext", "apple,dcpext";
+        reg = <0x8dc00000 0x4000>,
+              <0x8c000000 0x4000000>,
+              <0x8d320000 0x4000>,
+              <0x8d344000 0x4000>,
+              <0x8d800000 0x800000>;
+        reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+        mboxes = <&dcpext_mbox>;
+        mbox-names = "mbox";
+        iommus = <&dcpext_dart 5>;
+        apple,bw-scratch = <&pmgr_dcp 0 4 0x1220>;
         phys = <&atcphy0 PHY_TYPE_DP>;
         phy-names = "typec0";
         mux-controls = <&atcphy0_xbar 0>, <&atcphy0_xbar 1>,

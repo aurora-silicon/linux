@@ -86,6 +86,12 @@ struct apple_mbox {
 	 */
 	int rx_util_min;
 	int rx_util_min_applied;
+	/*
+	 * The receive handler runs in an IRQ thread (an RT thread) rather than
+	 * in hard IRQ context. Only then is there a thread whose minimum
+	 * utilization a consumer can set.
+	 */
+	bool rx_threaded;
 
 	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
@@ -96,6 +102,8 @@ struct apple_mbox {
 };
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index);
+/* As apple_mbox_get(), for a mailbox named by a property other than mboxes */
+struct apple_mbox *apple_mbox_get_prop(struct device *dev, const char *prop, int index);
 struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);
@@ -125,9 +133,9 @@ void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
 void apple_mbox_hold_rx(struct apple_mbox *mbox);
 void apple_mbox_release_rx(struct apple_mbox *mbox);
 /*
- * Set the minimum utilization (0..1024) the threaded receive handler runs with,
- * or -1 to restore the scheduler's default; the handler applies it to itself
- * when it next runs. Only mailboxes with a threaded receive handler support it.
+ * Set the minimum utilization (0..1024) the G17 flood-throttle receive thread
+ * runs with, or -1 to restore the scheduler's default; the thread applies it
+ * when it next wakes. Only mailboxes with a threaded receive handler support it.
  */
 int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,

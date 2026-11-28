@@ -1186,23 +1186,19 @@ int amdgpu_uvd_get_create_msg(struct amdgpu_ring *ring, uint32_t handle,
 	struct amdgpu_device *adev = ring->adev;
 	struct amdgpu_bo *bo = adev->uvd.ib_bo;
 	uint32_t *msg;
-	int i;
+	const __le32 hdr[] = {
+		cpu_to_le32(0x00000de4), cpu_to_le32(0x00000000),
+		cpu_to_le32(handle), cpu_to_le32(0x00000000),
+		cpu_to_le32(0x00000000), cpu_to_le32(0x00000000),
+		cpu_to_le32(0x00000000), cpu_to_le32(0x00000780),
+		cpu_to_le32(0x00000440), cpu_to_le32(0x00000000),
+		cpu_to_le32(0x01b37000),
+	};
 
+	/* stitch together an UVD create msg; the BO may be I/O memory */
 	msg = amdgpu_bo_kptr(bo);
-	/* stitch together an UVD create msg */
-	msg[0] = cpu_to_le32(0x00000de4);
-	msg[1] = cpu_to_le32(0x00000000);
-	msg[2] = cpu_to_le32(handle);
-	msg[3] = cpu_to_le32(0x00000000);
-	msg[4] = cpu_to_le32(0x00000000);
-	msg[5] = cpu_to_le32(0x00000000);
-	msg[6] = cpu_to_le32(0x00000000);
-	msg[7] = cpu_to_le32(0x00000780);
-	msg[8] = cpu_to_le32(0x00000440);
-	msg[9] = cpu_to_le32(0x00000000);
-	msg[10] = cpu_to_le32(0x01b37000);
-	for (i = 11; i < 1024; ++i)
-		msg[i] = cpu_to_le32(0x0);
+	amdgpu_bo_memset(bo, msg, 0, 1024 * sizeof(*msg));
+	amdgpu_bo_memcpy_to(bo, msg, hdr, sizeof(hdr));
 
 	return amdgpu_uvd_send_msg(ring, bo, true, fence);
 
@@ -1213,8 +1209,12 @@ int amdgpu_uvd_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
 {
 	struct amdgpu_device *adev = ring->adev;
 	struct amdgpu_bo *bo = NULL;
+	const __le32 hdr[] = {
+		cpu_to_le32(0x00000de4), cpu_to_le32(0x00000002),
+		cpu_to_le32(handle), cpu_to_le32(0x00000000),
+	};
 	uint32_t *msg;
-	int r, i;
+	int r;
 
 	if (direct) {
 		bo = adev->uvd.ib_bo;
@@ -1224,14 +1224,10 @@ int amdgpu_uvd_get_destroy_msg(struct amdgpu_ring *ring, uint32_t handle,
 			return r;
 	}
 
+	/* stitch together an UVD destroy msg; the BO may be I/O memory */
 	msg = amdgpu_bo_kptr(bo);
-	/* stitch together an UVD destroy msg */
-	msg[0] = cpu_to_le32(0x00000de4);
-	msg[1] = cpu_to_le32(0x00000002);
-	msg[2] = cpu_to_le32(handle);
-	msg[3] = cpu_to_le32(0x00000000);
-	for (i = 4; i < 1024; ++i)
-		msg[i] = cpu_to_le32(0x0);
+	amdgpu_bo_memset(bo, msg, 0, 1024 * sizeof(*msg));
+	amdgpu_bo_memcpy_to(bo, msg, hdr, sizeof(hdr));
 
 	r = amdgpu_uvd_send_msg(ring, bo, direct, fence);
 

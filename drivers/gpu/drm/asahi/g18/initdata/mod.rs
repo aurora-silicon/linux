@@ -102,6 +102,14 @@ const TRACE_PRINT_BUDGET: [u32; 2] = [512, 16];
 const TRACE_JOURNAL_CAPACITY: usize = 32768;
 /// b000 0x7de8 constructs type4 with counter at +4 and stamp index at +12.
 const EVENT_TYPE_RECOVERY: u32 = 4;
+/// Parameter-buffer (TVB) grow request in the 25G76 TvbGrowEventRecord
+/// layout (g17::fw::channels). The tiler waits for the reply.
+const EVENT_TYPE_TVB_GROW: u32 = 6;
+/// Device-control TvbGrowReply (g17 DeviceControlOp::TvbGrowReply).
+const DEVICE_CONTROL_OPCODE_TVB_GROW_REPLY: u32 = 0x08;
+/// Grow requests held between a drain and the session answering them. More
+/// stay in the event ring until a later drain.
+const TVB_GROW_QUEUE: usize = 4;
 
 /// `halLoadUMADesc` device words (accelerator+0x11af8..0x11b10) as native
 /// `halInitSMAEnableMask` 0xfffffe0008c41bdc derives them on J873.
@@ -166,6 +174,10 @@ pub(crate) struct G18FirmwareMemory {
     trace_printed: [u32; 2],
     trace_journal: [KVVec<G18TraceRecord>; 2],
     trace_dropped: [u32; 2],
+    /// TVB grow requests drained but not yet answered, oldest first.
+    tvb_grow: KVec<G18TvbGrowRequest>,
+    /// Primary device-control records published after the idle wake.
+    control_published: u32,
     uat: Arc<mmu::Uat>,
     /// InitData layouts of the firmware build the loader admitted.
     layouts: &'static init::G18GLayouts,
@@ -181,6 +193,18 @@ pub(crate) struct G18StatusLinks {
     pub(crate) status_b_pointer: u64,
     pub(crate) status_config_word: u32,
     pub(crate) status_config_pointer: u64,
+}
+
+/// A firmware TVB grow request (event 6): vm_slot +4, buffer_slot +8,
+/// counter +0xc, subpipe +0x10, u64 halt count (the recovery epoch) +0x14.
+/// The reply echoes every field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct G18TvbGrowRequest {
+    pub(crate) vm_slot: u32,
+    pub(crate) buffer_slot: u32,
+    pub(crate) counter: u32,
+    pub(crate) subpipe: u32,
+    pub(crate) halt_count: u64,
 }
 
 /// The status-B recovery handshake words.
@@ -238,6 +262,7 @@ impl G18FirmwareMemory {
             KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,
             KVVec::with_capacity(TRACE_JOURNAL_CAPACITY, GFP_KERNEL)?,
         ];
+        let tvb_grow = KVec::with_capacity(TVB_GROW_QUEUE, GFP_KERNEL)?;
         let mut registers = KVec::new();
         for window in init::G18G_26A428_REGISTER_WINDOWS {
             let (physical, virtual_address, span) = window.mapped_pages().map_err(|_| EINVAL)?;
@@ -418,7 +443,7 @@ impl G18FirmwareMemory {
             application_compute: None,
             completions, aliases, registers,
             report_counts: [[0; 2]; 2], completion_masks: [0; 2], trace_printed: [0; 2], uat,
-            trace_journal, trace_dropped: [0; 2], layouts,
+            trace_journal, trace_dropped: [0; 2], tvb_grow, control_published: 0, layouts,
         }), GFP_KERNEL)
     }
 
@@ -886,6 +911,26 @@ impl G18FirmwareMemory {
                         crate::g18_event_info!(role == 0 && word(0) == 1, dev.as_ref(), "G18_EVENT role={} ordinal={} type={} payload={:x?}\n",
                             role, count, word(0), [qword(4), qword(12), qword(20), qword(28), qword(36)]);
                         recovery |= word(0) == EVENT_TYPE_RECOVERY;
+                        if word(0) == EVENT_TYPE_TVB_GROW {
+                            // The session grows the PB and replies after the drain.
+                            let request = G18TvbGrowRequest {
+                                vm_slot: word(4), buffer_slot: word(8), counter: word(0xc),
+                                subpipe: word(0x10), halt_count: qword(0x14),
+                            };
+                            // A repeated request gets one reply, as on G17.
+                            if !self.tvb_grow.contains(&request) {
+                                if self.tvb_grow.len() >= TVB_GROW_QUEUE {
+                                    // Leave it in the ring: the session answers
+                                    // the queued ones first, the next drain
+                                    // takes this one. The session drains on
+                                    // every poll of its waits (poll_faults(),
+                                    // check_faults()), not on an interrupt, so
+                                    // the next drain is one poll away.
+                                    break;
+                                }
+                                self.tvb_grow.push_within_capacity(request).map_err(|_| EBUSY)?;
+                            }
+                        }
                         if role == 0 && word(0) == 1 {
                             // Original G18 b000 233a8..233d4 uses this exact
                             // type-1 prefix. Copy/validate before releasing the
@@ -909,6 +954,52 @@ impl G18FirmwareMemory {
             }
         }
         Ok(recovery)
+    }
+
+    /// The oldest drained TVB grow request not yet answered.
+    pub(crate) fn take_tvb_grow(&mut self) -> Option<G18TvbGrowRequest> {
+        if self.tvb_grow.is_empty() { None } else { self.tvb_grow.remove(0).ok() }
+    }
+
+    /// Publish the TvbGrowReply for `request` on the primary device-control
+    /// ring (g17 TvbGrowReply: opcode, grew, buffer_slot, vm_slot, counter,
+    /// subpipe, halt_count). The caller rings the EP 0x21 control doorbell.
+    pub(crate) fn reply_tvb_grow(&mut self, request: G18TvbGrowRequest, grew: bool) -> Result {
+        let [consumer, _, producer] = self.control_counters()?[0];
+        if consumer > init::CONTROL_RING_INDEX_MASK || producer > init::CONTROL_RING_INDEX_MASK {
+            return Err(EIO);
+        }
+        let next = (producer + 1) & init::CONTROL_RING_INDEX_MASK;
+        if next == consumer {
+            return Err(EBUSY);
+        }
+        let record = self.layouts.shared.control_ring[0] + producer as usize * init::CONTROL_RECORD_SIZE;
+        self.shared.with_bytes_mut(|out| {
+            let record = out.get_mut(record..record + init::CONTROL_RECORD_SIZE).ok_or(EINVAL)?;
+            init::encode_device_control_record(DEVICE_CONTROL_OPCODE_TVB_GROW_REPLY, u32::from(grew), record)
+                .map_err(|_| EINVAL)?;
+            let r = request;
+            for (offset, value) in [(0x08, r.buffer_slot), (0x0c, r.vm_slot), (0x10, r.counter),
+                                    (0x14, r.subpipe), (0x18, r.halt_count as u32),
+                                    (0x1c, (r.halt_count >> 32) as u32)] {
+                record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            Ok(())
+        })?;
+        fence(Ordering::SeqCst);
+        let producer_offset = init::G18G_26A428_PRIVATE_STATE_GRIDS[0]
+            + init::WORK_STATE_GRID_OFFSETS[init::CONTROL_CHANNEL_INDEX]
+            + init::CHANNEL_STATE_PRODUCER * init::CHANNEL_STATE_SPACING;
+        self.private.write_u32(PRIVATE_BASE + producer_offset as u64, next)?;
+        fence(Ordering::SeqCst);
+        self.control_published = self.control_published.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Device-control counters of both roles once every record published
+    /// after boot retired: the idle wake left the primary ring at 2.
+    pub(crate) fn control_retired(&self) -> [[u32; 3]; 2] {
+        [[(2 + self.control_published) & init::CONTROL_RING_INDEX_MASK; 3], [1; 3]]
     }
 
     /// Report-record totals per role and channel since construction.

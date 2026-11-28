@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J473 with macOS 27 system firmware (27.2 stub). */
+#include "t8112-j473.dts"
+
+/*
+ * The 27.2 GPU firmware keeps running through suspend-to-idle. Gating the GFX
+ * domain under it leaves the domain unable to power on at the wake, as on the
+ * t8112-j413-fw27 board.
+ */
+&ps_gfx {
+	apple,sleep-retained;
+};

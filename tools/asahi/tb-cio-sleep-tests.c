@@ -497,14 +497,11 @@ static unsigned long tb_downstream_route(struct tb_port *p)
 {
 	return (tb_route(p->sw) << 8) | (unsigned long)p->port;
 }
-static struct tb_xdomain *tb_xdomain_find_by_route(struct tb *t, unsigned long route)
+static struct tb_xdomain *tb_xdomain_get(struct tb_xdomain *xd)
 {
-	for (int i = 0; i < 2; i++)
-		if (xds[i].present && !xds[i].is_unplugged && xds[i].route == route) {
-			xds[i].refs++;
-			return &xds[i];
-		}
-	return NULL;
+	if (xd)
+		xd->refs++;
+	return xd;
 }
 static void tb_xdomain_remove(struct tb_xdomain *xd)
 {
@@ -522,10 +519,12 @@ static void tb_xdomain_put(struct tb_xdomain *xd)
 	assert(xd->refs > 0);
 	xd->refs--;
 }
+static struct tb_port *xd_unconfigured_port;
 static void tb_port_unconfigure_xdomain(struct tb_port *p)
 {
 	assert(tb.lock);
 	xd_unconfigured++;
+	xd_unconfigured_port = p;
 }
 /* Its services unbind and give back their rings: never under the domain lock. */
 static void tb_domain_unregister_unplugged_xdomains(struct tb *t)
@@ -551,6 +550,17 @@ static void add_xdomain(int i)
 	} else {
 		link[0].next = &xports[0];
 	}
+}
+/*
+ * As on the J713: the adapter that the release iterates first holds no peer, while the
+ * lookup by its route finds the one that another adapter holds.
+ */
+static struct tb_port alias;
+static void add_alias(void)
+{
+	alias = (struct tb_port){ .sw = &root, .port = xports[0].port, .null = true,
+				  .next = link[0].next };
+	link[0].next = &alias;
 }
 /* The refused path's rescan: a released peer whose link is still up is found again. */
 static int rescans, cleanups;
@@ -612,6 +622,7 @@ static void setup(void)
 	memset(xds, 0, sizeof(xds));
 	memset(xports, 0, sizeof(xports));
 	xd_unconfigured = 0;
+	xd_unconfigured_port = NULL;
 	nhi.ops = &nhi_ops;
 	nhi.quirks = 0;
 	tb = (struct tb){ .cm_ops = &tb_cm_ops,
@@ -946,6 +957,15 @@ int main(void)
 	assert(!tb_cio_sleep_prepare(&tb));
 	check_released(1);
 	assert(xd_unconfigured == 1);
+	complete();
+	cases++;
+	/* Found by the route of an adapter that does not hold it: taken off its holder. */
+	setup();
+	add_xdomain(0);
+	add_alias();
+	assert(!tb_cio_sleep_prepare(&tb));
+	check_released(0);
+	assert(!alias.xdomain && xd_unconfigured == 1 && xd_unconfigured_port == &xports[0]);
 	complete();
 	cases++;
 	/* Both at once. */

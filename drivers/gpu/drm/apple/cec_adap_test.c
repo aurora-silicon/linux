@@ -159,12 +159,13 @@ static struct dcp_cec_test_ctx *dcp_cec_test_setup(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx);
 	spin_lock_init(&ctx->lock);
 
-	ctx->dev = kunit_device_register(test, "apple-dcp-cec-kunit");
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->dev);
-
+	/*
+	 * The fakes are allocated before the device: KUnit frees in reverse
+	 * order, and the device's devres (dcp_cec_devm_release()) still uses
+	 * them when the device is unregistered.
+	 */
 	ctx->dcp = kunit_kzalloc(test, sizeof(*ctx->dcp), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->dcp);
-	ctx->dcp->dev = ctx->dev;
 	ctx->dcp->fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
 
 	ctx->ep = kunit_kzalloc(test, sizeof(*ctx->ep), GFP_KERNEL);
@@ -172,6 +173,10 @@ static struct dcp_cec_test_ctx *dcp_cec_test_setup(struct kunit *test)
 	ctx->ep->dcp = ctx->dcp;
 	ctx->ep->endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
 	ctx->ep->compact = true;
+
+	ctx->dev = kunit_device_register(test, "apple-dcp-cec-kunit");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->dev);
+	ctx->dcp->dev = ctx->dev;
 
 	ctx->port_srv.ep = ctx->ep;
 	ctx->dcp->dptxport[0].service = &ctx->port_srv;

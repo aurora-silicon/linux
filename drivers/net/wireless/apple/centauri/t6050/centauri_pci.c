@@ -401,7 +401,8 @@ static int centauri_t6050_port_cycle(struct pci_dev *endpoint)
 	if (ret)
 		goto stopped;
 	ret = pcibios_err_to_errno(pci_write_config_word(endpoint, pm + PCI_PM_CTRL,
-		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | PCI_D3hot | PCI_PM_CTRL_PME_ENABLE));
+		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | (__force u16)PCI_D3hot |
+		PCI_PM_CTRL_PME_ENABLE));
 	if (ret)
 		goto stopped;
 	usleep_range(10000, 11000);
@@ -454,6 +455,7 @@ static int centauri_t6050_cycle(struct centauri_t6050 *c)
 static void centauri_t6050_boot_worker(struct work_struct *work)
 {
 	struct centauri_t6050 *c = container_of(to_delayed_work(work), struct centauri_t6050, boot_work);
+	struct pci_dev *beta = NULL;
 	bool retry = false;
 	int ret;
 
@@ -472,7 +474,7 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 				c->boot_phase = CEN_BOOT_IPC;
 			break;
 		case CEN_BOOT_IPC:
-			ret = centauri_t6050_start_ipc(c);
+			ret = centauri_t6050_start_ipc(c, &beta);
 			if (!ret)
 				c->boot_phase = CEN_BOOT_READY;
 			break;
@@ -495,6 +497,8 @@ out:
 	if (READ_ONCE(c->removing))
 		c->boot_phase = CEN_BOOT_STOPPED;
 	mutex_unlock(&c->boot_lock);
+	if (beta)
+		centauri_t6050_attach_beta(c, beta);
 	if (retry && !READ_ONCE(c->removing))
 		queue_delayed_work(system_long_wq, &c->boot_work, msecs_to_jiffies(20));
 }
@@ -598,10 +602,10 @@ static void centauri_t6050_remove(struct pci_dev *pdev)
 }
 
 /*
- * On a healthy firmware sleep, Beta (fn 2), Alpha (fn 1), and Control (fn 0) enter ACIPC
- * host-sleep, save PCI config state, enter D3hot with PME_En, and ask pcie-apple to skip
- * the wake warm reset so the N1 firmware, Bluetooth, and (when armed) Wi-Fi association
- * survive across PERST#.
+ * On a healthy firmware sleep (WoWLAN-armed or unassociated), Beta (fn 2), Alpha (fn 1),
+ * and Control (fn 0) enter ACIPC host-sleep, save PCI config state, enter D3hot (with
+ * PME_En only when wake is armed), and ask pcie-apple to skip the wake warm reset so the
+ * N1 firmware, Bluetooth, and (when armed) Wi-Fi association survive across PERST#.
  *
  * If any function fails host-sleep or wake, or firmware is unhealthy, the driver falls back
  * to teardown and warm-reset recovery:
@@ -763,8 +767,22 @@ static bool centauri_t6050_domain_fence(struct centauri_t6050_rewake *rw)
 			pci_clear_master(fn[i]);
 	}
 	for (i = 0; i < 3; i++) {
-		if (fn[i] && !centauri_t6050_stop_dma(fn[i]))
+		bool fn_stopped = !fn[i] || centauri_t6050_stop_dma(fn[i]);
+
+		if (!fn_stopped)
 			stopped = false;
+		/*
+		 * Refresh any keep-alive PCI state saved before Control fell
+		 * back to teardown so an aborted suspend cannot restore Bus
+		 * Master or the old header onto a quiesced function whose DMA
+		 * arena was freed. Never save an unreadable/gone function
+		 * (which would snapshot 0xffff); clearing state_saved hands
+		 * suspend_noirq state save and power-state selection back to
+		 * the PCI core.
+		 */
+		if (fn[i] && i > 0 && fn[i]->state_saved &&
+		    (!fn_stopped || pci_save_state(fn[i])))
+			fn[i]->state_saved = false;
 		pci_dev_put(fn[i]);
 	}
 	return stopped;
@@ -1021,16 +1039,18 @@ void apple_centauri_sleep_mark_fallback(struct pci_dev *fn)
 }
 EXPORT_SYMBOL_GPL(apple_centauri_sleep_mark_fallback);
 
-static void centauri_t6050_set_d3hot(struct pci_dev *pdev)
+static void centauri_t6050_set_d3hot(struct pci_dev *pdev, bool pme_enable)
 {
 	u16 pmctrl;
 
 	if (!pdev || !pdev->pm_cap)
 		return;
 	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl)) {
-		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
-				      (pmctrl & ~PCI_PM_CTRL_STATE_MASK) |
-				      PCI_D3hot | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl &= ~(PCI_PM_CTRL_STATE_MASK | PCI_PM_CTRL_PME_ENABLE);
+		pmctrl |= (__force u16)PCI_D3hot;
+		if (pme_enable)
+			pmctrl |= PCI_PM_CTRL_PME_ENABLE;
+		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, pmctrl);
 		mdelay(pdev->d3hot_delay);
 	}
 }
@@ -1042,7 +1062,7 @@ static void centauri_t6050_ensure_d0(struct pci_dev *pdev)
 	if (!pdev || !pdev->pm_cap)
 		return;
 	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl) &&
-	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != PCI_D0) {
+	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != (__force u16)PCI_D0) {
 		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
 				      pmctrl & ~PCI_PM_CTRL_STATE_MASK);
 		mdelay(pdev->d3hot_delay);
@@ -1127,19 +1147,26 @@ static int centauri_t6050_suspend(struct device *dev)
 
 	c->firmware_kept = false;
 	c->control_sleep_sent = false;
+	c->keep_alive_pme = false;
 	if (!beta_fallback && c->boot_phase == CEN_BOOT_READY && c->ipc && c->wifi &&
 	    !centauri_t6050_wifi_pm_error(c) &&
+	    !centauri_t6050_wifi_pm_disconnected(c) &&
 	    readl(c->bar + 0x8000) == 2 && readl(c->bar + 0x8050) == 2) {
+		bool wifi_sleep_sent = false;
+		int unwind_err = 0, wake_ret;
 		u32 id0 = 0, id1 = 0;
 
 		fn1 = centauri_t6050_ipc_alpha_dev(c);
 		if (!fn1 || pci_read_config_dword(pdev, PCI_VENDOR_ID, &id0) ||
 		    pci_read_config_dword(fn1, PCI_VENDOR_ID, &id1) ||
 		    (id0 & 0xffff) != pdev->vendor || (id1 & 0xffff) != fn1->vendor ||
-		    id0 == ~0U || id1 == ~0U)
+		    id0 == ~0U || id1 == ~0U) {
 			ret = -ENODEV;
-		else
+		} else {
 			ret = centauri_t6050_wifi_suspend(c);
+			if (!ret)
+				wifi_sleep_sent = true;
+		}
 		if (!ret) {
 			ret = centauri_t6050_ipc_control_sleep(c, true);
 			if (!ret)
@@ -1155,13 +1182,38 @@ static int centauri_t6050_suspend(struct device *dev)
 			centauri_t6050_save_memswap(pdev, c->saved_memswap[0]);
 			centauri_t6050_save_memswap(fn1, c->saved_memswap[1]);
 			apple_pcie_t6050_sleep_keep_alive(pdev->bus->self);
+			c->keep_alive_pme = centauri_t6050_wifi_wowlan_armed(c);
 			c->firmware_kept = true;
 			dev_dbg(dev, "N1 kept alive for firmware sleep\n");
 			return 0;
 		}
 		dev_warn(dev, "N1 keep-alive suspend failed (%d); falling back to warm-reset sleep\n",
 			 ret);
-		c->control_sleep_sent = false;
+		if (c->control_sleep_sent) {
+			wake_ret = centauri_t6050_ipc_control_sleep(c, false);
+			if (wake_ret) {
+				dev_warn(dev,
+					 "Control ACIPC host wake failed during fallback (%d)\n",
+					 wake_ret);
+				unwind_err = wake_ret;
+			}
+			c->control_sleep_sent = false;
+		}
+		if (wifi_sleep_sent) {
+			wake_ret = centauri_t6050_wifi_resume(c);
+			if (wake_ret) {
+				dev_warn(dev,
+					 "Alpha host wake failed during fallback (%d)\n",
+					 wake_ret);
+				if (!unwind_err)
+					unwind_err = wake_ret;
+			}
+		}
+		if (unwind_err) {
+			centauri_t6050_wifi_mark_failed(c);
+			/* Also covers an aborted suspend where resume/rewake may not run. */
+			apple_centauri_sleep_recovery_needed(pdev, unwind_err);
+		}
 	}
 
 	ret = centauri_t6050_quiesce(c);
@@ -1188,8 +1240,8 @@ static int centauri_t6050_suspend_noirq(struct device *dev)
 	if (!c->firmware_kept || !pm_suspend_via_firmware())
 		return 0;
 	fn1 = centauri_t6050_ipc_alpha_dev(c);
-	centauri_t6050_set_d3hot(fn1);
-	centauri_t6050_set_d3hot(pdev);
+	centauri_t6050_set_d3hot(fn1, c->keep_alive_pme);
+	centauri_t6050_set_d3hot(pdev, c->keep_alive_pme);
 	return 0;
 }
 

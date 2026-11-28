@@ -6,7 +6,7 @@ name: MT7932 KUnit
 
 on:
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
     paths:
       - 'drivers/net/wireless/mediatek/mt7932/**'
       - 'drivers/pci/controller/pcie-apple*'

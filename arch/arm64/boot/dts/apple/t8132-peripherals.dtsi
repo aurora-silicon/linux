@@ -446,6 +446,7 @@
 		reg = <0x2 0x81000000 0x0 0x4000>,
 		      <0x2 0x80000000 0x0 0x1000000>,
 		      <0x2 0x810c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1147 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 1184 IRQ_TYPE_LEVEL_HIGH>;

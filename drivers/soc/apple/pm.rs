@@ -38,6 +38,9 @@ extern "C" {
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
     fn sep_pm_clear_dev_disable(dev: *mut c_void) -> c_int;
     fn sep_pm_dart_restore(dev: *mut c_void);
+    fn sep_pm_dart_prepare(dev: *mut c_void) -> c_int;
+    fn sep_pm_wait_gated(dev: *mut c_void, timeout_ms: c_uint) -> c_int;
+    fn sep_pm_platform_commit() -> bool;
     fn sep_pm_commit_prepare(
         dev: *mut c_void,
         mbox: *mut c_void,
@@ -128,6 +131,31 @@ pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<bool> {
 }
 
 /// Puts the enclave's DART back if it lost its state, before the doorbell.
+/// How long the enclave gets to gate its domain once it has answered (told at suspend).
+const GATE_TIMEOUT_MS: u32 = 5000;
+
+/// Whether a sleep core commit sends the staged SLEEP; if not, it is sent at device suspend.
+pub(crate) fn platform_commit() -> bool {
+    // SAFETY: only reads the sleep core's state.
+    unsafe { sep_pm_platform_commit() }
+}
+
+/// Whether the enclave gated itself within the bound.
+pub(crate) fn wait_gated(dev: &kernel::device::Device) -> bool {
+    // SAFETY: `dev` is the bound SEP device.
+    unsafe { sep_pm_wait_gated(dev.as_raw().cast(), GATE_TIMEOUT_MS) == 0 }
+}
+
+/// Saves the enclave's DART while it can be read, before the enclave is told.
+pub(crate) fn dart_prepare(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_dart_prepare(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
 pub(crate) fn dart_restore(dev: &kernel::device::Device) {
     // SAFETY: `dev` is the bound SEP device.
     unsafe { sep_pm_dart_restore(dev.as_raw().cast()) };

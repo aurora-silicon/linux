@@ -101,13 +101,16 @@ struct isp_surf {
 
 struct isp_message {
 	u64 arg0;
-	u64 arg1;
-	u64 arg2;
-	u64 arg3;
-	u64 arg4;
-	u64 arg5;
-	u64 arg6;
-	u64 arg7;
+	/* Written before arg0, which marks the message valid. */
+	struct_group(payload,
+		u64 arg1;
+		u64 arg2;
+		u64 arg3;
+		u64 arg4;
+		u64 arg5;
+		u64 arg6;
+		u64 arg7;
+	);
 } __packed;
 static_assert(sizeof(struct isp_message) == ISP_IPC_MESSAGE_SIZE);
 

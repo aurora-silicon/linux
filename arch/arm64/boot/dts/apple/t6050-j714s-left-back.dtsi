@@ -20,14 +20,7 @@
  * and exporting this machine's ADT tunables. Older producers leave the port reserved.
  */
 
-/*
- * The inventory gives ATC0_COMMON the FAB3 SoC domain as a parent, which is not described here.
- * ATC1's and ATC2's common domains have none: do the same. J716c enables ps_fab3_soc instead,
- * which would hand that fabric domain, and its other undescribed users, to genpd's unused
- * power-off; left out, it stays as the boot loader leaves it, on.
- */
 &ps_atc0_common {
-	/delete-property/ power-domains;
 	status = "disabled";
 };
 

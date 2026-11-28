@@ -43,16 +43,19 @@ def defines(source):
     return "".join(result)
 
 
-def run(tmp, name, program, expect_failure=False):
+def run(tmp, name, program, expect_failure=False, expect=None):
     path = tmp / (name + ".c")
     path.write_text(program)
     binary = tmp / name
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-function", str(path), "-o", str(binary)],
                    check=True)
-    result = subprocess.run([str(binary)], capture_output=expect_failure)
+    result = subprocess.run([str(binary)], capture_output=expect_failure, text=True)
     if expect_failure:
         if result.returncode == 0:
             raise RuntimeError(f"negative control passed: {name}")
+        # A control must fail on the check it is for, not on another one.
+        if expect and expect not in result.stderr:
+            raise RuntimeError(f"negative control failed elsewhere: {name}: {result.stderr.strip()}")
     else:
         result.check_returncode()
 
@@ -92,7 +95,8 @@ static void fsleep(unsigned n) { (void)n; }
 '''
     declarations = r'''
 struct apple_tunable { unsigned id; };
-struct atcphy_hw { int gen; bool usb2_only, has_usb2phy_reg, park_pipe_unlocked; u32 usb2phy_sig_host; };
+struct atcphy_hw { int gen; bool usb2_only, has_usb2phy_reg, park_pipe_unlocked; u32 usb2phy_sig_host;
+    u32 cfg_offset, sync_reset; };
 enum suspend_state { PM_SUSPEND_TO_IDLE = 1, PM_SUSPEND_MEM = 3 };
 static enum suspend_state pm_suspend_target_state;
 static bool rpm_suspended;
@@ -106,7 +110,7 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
-    bool t8103_dummy_pending, t8103_usb3_workaround;
+    bool t8103_dummy_pending, t8103_usb3_workaround, fixed_usb3, cio_only;
     unsigned tunnel_users;
     struct { bool prepared, changed, restored; } cio_sleep;
     int mode, pipe_state, lock;
@@ -122,6 +126,8 @@ struct phy { struct apple_atcphy *atc; unsigned power_count,init_count,mutex;
 struct device { struct apple_atcphy *atc; };
 static struct apple_atcphy *dev_get_drvdata(struct device *d) { return d->atc; }
 static struct apple_atcphy *phy_get_drvdata(struct phy *p) { return p->atc; }
+/* T8152 only: these rows run T8132, which never reaches it. */
+static void atcphy_lanes_down_t8152(struct apple_atcphy *a) { (void)a; assert(0); }
 static u32 core[0x24000/4], usb2[0x4000/4], pipe_regs[0x4000/4];
 static unsigned tunes[16], tune_count, reset_releases, bist_phase, writes, core_reads;
 static unsigned stall_power, stall_bist, expected_tunes, stall_sleep;
@@ -215,7 +221,7 @@ static void apple_tunable_apply(void *regs, struct apple_tunable *t)
 }
 '''
     names = ["atcphy_mode_is_cio", "atcphy_usb2_sig_host", "atcphy_t8132_dp_on",
-             "atcphy_usb2_power_off", "atcphy_power_off", "atcphy_usb2_power_on",
+             "atcphy_cfg", "atcphy_usb2_power_off", "atcphy_power_off", "atcphy_usb2_power_on",
              "atcphy_t8132_cold", "atcphy_t8132_common_start", "atcphy_t8132_phy_stop",
              "atcphy_t8132_full_stop",
              "atcphy_configure_t8132", "atcphy_usb2_set_mode", "atcphy_t8132_bist_pulse",
@@ -364,61 +370,313 @@ int main(void)
         role_program = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#define lockdep_assert_held(x) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define WARN_ON_ONCE(x) ((void)(x))
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define EPROBE_DEFER 517
+#define scoped_guard(type, lock)
 #define USB_DR_MODE_HOST 1
 #define USB_DR_MODE_PERIPHERAL 2
 #define DWC3_GCTL_PRTCAP_HOST 1
 #define DWC3_GCTL_PRTCAP_DEVICE 2
-enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
-struct device { const char *of_node; };
-struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; };
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy; int lock, state;
-    bool dt_dis_u3_susphy, host_only, sleep_ddr; };
-static int phy_error, host_calls, gadget_calls, stops, syscore;
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+enum phy_mode { PHY_MODE_INVALID, PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
+enum usb_device_speed { USB_SPEED_UNKNOWN, USB_SPEED_LOW, USB_SPEED_FULL, USB_SPEED_HIGH,
+    USB_SPEED_WIRELESS, USB_SPEED_SUPER, USB_SPEED_SUPER_PLUS };
+/* The task running the code: the glue's, or another one probing xHCI. */
+struct task_struct { int id; };
+static struct task_struct glue_task, other_task, *current_task = &glue_task, *lock_owner;
+#define current current_task
+#define lockdep_assert_held(x) assert(lock_owner == current)
+struct device { const char *of_node; bool registered, bound; };
+struct platform_device { struct device dev; };
+struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; struct platform_device *xhci;
+    enum usb_device_speed maximum_speed; };
+struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy, *role_sw; int lock, state;
+    bool dt_dis_u3_susphy, host_only, sleep_ddr, fixed_hub, sleep_phy_wait, sleep_phy_pending;
+    struct task_struct *host_start_task; bool usb3_host_owed; int usb3_host_ret;
+    enum usb_device_speed maximum_speed; };
+#define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
+static struct platform_device xhci_pdev;
+/* The xHCI model: its probe's progress, and what the PIPE and the controller do meanwhile. */
+static bool driver_registered = true, async_probe, async_race, hcrst_done, running, pipe_live, pipe_reset;
+static int phy_error, phy_calls, pre_host_phy_calls, probes, refused, host_calls, host_exits, gadget_calls;
+static int stops, syscore, pipe_resets, slp_votes, late_error;
+static bool susphy_on;
+static int validate_error, high_speed;
+/* The SuperSpeed root hub leaves the USB3 PHY to the glue, see dwc3_host_init(). */
+static const bool skip_usb3_phy_init = true;
 static bool of_device_is_compatible(const char *node, const char *name) { return !strcmp(node,name); }
-static int phy_set_mode(void *phy, int mode) { (void)phy; (void)mode; return phy_error; }
+static int phy_set_mode(void *phy, int mode) {
+    (void)phy;
+    assert(susphy_on);
+    /* A host's PIPE moves only after xHCI's reset and before it runs, under the glue lock. */
+    if (mode == PHY_MODE_USB_HOST && xhci_pdev.dev.registered)
+        assert(hcrst_done && !running && lock_owner == current);
+    phy_calls++;
+    pipe_live = !phy_error;
+    return phy_error;
+}
+static int phy_validate(void *phy, int mode, int submode, void *opts)
+{ (void)phy; assert(mode == PHY_MODE_USB_DEVICE); (void)submode; (void)opts; return validate_error; }
+/* The GUCTL1 clock write is the controller's; the speed limit is what the role logic decides. */
+static void dwc3_apple_gadget_high_speed(struct dwc3_apple *a)
+{ if (a->dwc.maximum_speed <= USB_SPEED_HIGH) return; a->dwc.maximum_speed = USB_SPEED_HIGH; high_speed++; }
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, int cap) { (void)a; (void)cap; }
-static void dwc3_enable_susphy(struct dwc3 *d, bool on) { (void)d; assert(on); }
-static int dwc3_host_init(struct dwc3 *d) { (void)d; host_calls++; return 0; }
+static void dwc3_enable_susphy(struct dwc3 *d, bool on) { susphy_on = on && !d->dis_u3_susphy_quirk; }
 static int dwc3_gadget_init(struct dwc3 *d) { (void)d; gadget_calls++; return 0; }
 static int phy_reset(void *phy) { (void)phy; return 0; }
-static void dwc3_host_exit(struct dwc3 *d) { (void)d; assert(0); }
-static void apple_sleep_usb_slp_ddr(bool on) { (void)on; assert(0); }
-static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *a) { (void)a; assert(0); }
-''' + enum(states, "dwc3_apple_state") + r'''
+static void apple_sleep_usb_slp_ddr(bool on) { slp_votes += on ? 1 : -1; }
+/* T6040 resets the PIPE it routed before xHCI starts, see dwc3_apple_usb3_mode_before_start(). */
+static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *a) { (void)a; pipe_resets++; pipe_reset = true; }
+static bool dwc3_apple_sleep_board(void) { return true; }
+static void dwc3_apple_check_hub_later(struct dwc3_apple *a) { (void)a; }
+''' + enum(states, "dwc3_apple_state") + function(states, "dwc3_apple_usb3_mode_before_start") + r'''
 static int dwc3_apple_core_start(struct dwc3_apple *a, enum dwc3_apple_state s) { (void)a; (void)s; return 0; }
 static int dwc3_apple_core_stop(struct dwc3_apple *a) { (void)a; stops++; return 0; }
 static void dwc3_apple_syscore(struct dwc3_apple *a, bool on) { (void)a; assert(on); syscore++; }
-''' + function(dwc, "dwc3_apple_set_role") + function(dwc, "dwc3_apple_init") + r'''
+static int dwc3_apple_usb3_host_route(struct dwc3 *dwc);
+static struct dwc3 *xhci_parent;
+/*
+ * xhci_plat_probe(): usb_add_hcd() on the primary HCD runs xhci_reset() (HCRST), which must not
+ * meet a live PIPE, and dwc3_xhci_plat_start() enables SUSPHY. usb_add_hcd() on the shared HCD
+ * then sets up its PHYs unless told to skip them, and runs dwc3_xhci_plat_init_quirk() before
+ * xhci_run(). Any failure tears both HCDs down, and the probe fails.
+ */
+static int xhci_plat_probe(void)
+{
+    int ret = 0;
+
+    probes++;
+    assert(!pipe_live || pipe_reset);
+    hcrst_done = true;
+    dwc3_enable_susphy(xhci_parent, true);
+    if (!skip_usb3_phy_init) {
+        ret = phy_set_mode(to_dwc3_apple(xhci_parent)->usb3_phy, PHY_MODE_USB_HOST);
+        if (ret)
+            goto fail;
+    }
+    ret = dwc3_apple_usb3_host_route(xhci_parent);
+    if (ret == -EBUSY)
+        refused++;
+    if (!ret)
+        ret = late_error;
+    if (ret)
+        goto fail;
+    running = true;
+    xhci_pdev.dev.bound = true;
+    return 0;
+fail:
+    /* xhci_stop() resets the controller on the teardown, wherever the PIPE is. */
+    hcrst_done = false;
+    return ret;
+}
+/* platform_device_add(): its probe's result does not reach the caller. */
+static int dwc3_host_init(struct dwc3 *d)
+{
+    struct dwc3_apple *a = to_dwc3_apple(d);
+
+    pre_host_phy_calls = phy_calls;
+    host_calls++;
+    if (!of_device_is_compatible(a->dev->of_node, "apple,t6040-dwc3")) {
+        assert(!susphy_on);
+        assert(!phy_calls);
+    }
+    memset(&xhci_pdev, 0, sizeof(xhci_pdev));
+    xhci_pdev.dev.registered = true;
+    xhci_parent = d;
+    d->xhci = &xhci_pdev;
+    hcrst_done = running = false;
+    if (driver_registered && !async_probe)
+        (void)xhci_plat_probe();
+    return 0;
+}
+static bool device_is_bound(struct device *dev) { return dev->bound; }
+/* device_attach(): an asynchronous probe may run first, in its own task, then this one binds. */
+static int device_attach(struct device *dev)
+{
+    if (dev->bound)
+        return 1;
+    if (!driver_registered)
+        return 0;
+    if (async_race) {
+        current_task = &other_task;
+        (void)xhci_plat_probe();
+        current_task = &glue_task;
+    }
+    return xhci_plat_probe() ? 0 : 1;
+}
+static void dwc3_host_exit(struct dwc3 *d)
+{
+    assert(d->xhci == &xhci_pdev && xhci_pdev.dev.registered);
+    host_exits++;
+    xhci_pdev.dev.registered = xhci_pdev.dev.bound = false;
+    running = hcrst_done = pipe_live = false;
+    d->xhci = NULL;
+}
+''' + "".join(function(dwc, name) for name in (
+            "dwc3_apple_route_usb3", "dwc3_apple_set_role", "dwc3_apple_usb3_host_route",
+            "dwc3_apple_host_start", "dwc3_apple_init", "dwc3_apple_start_after_sleep")) + r'''
+static void reset(struct dwc3_apple *a, const char *node, int error)
+{
+    a->dev->of_node = node;
+    a->state = DWC3_APPLE_NO_CABLE;
+    a->dwc.dis_u3_susphy_quirk = false;
+    phy_error = error;
+    phy_calls = pre_host_phy_calls = probes = refused = host_exits = 0;
+    pipe_live = running = hcrst_done = pipe_reset = false;
+    driver_registered = true;
+    async_probe = async_race = false;
+    late_error = 0;
+}
+/* A host that started: xHCI bound and running, both root hubs up. */
+static void started(struct dwc3_apple *a)
+{
+    assert(a->state == DWC3_APPLE_HOST && xhci_pdev.dev.bound && running && !host_exits);
+    a->state = DWC3_APPLE_NO_CABLE;
+    xhci_pdev.dev.registered = xhci_pdev.dev.bound = false;
+}
+/* A host that did not: no xHCI left behind, the core stopped, no host state recorded. */
+static void stopped(struct dwc3_apple *a, int s)
+{
+    assert(stops == s && host_exits == 1 && !xhci_pdev.dev.registered && !running);
+    assert(a->state == DWC3_APPLE_NO_CABLE && a->dwc.xhci == NULL);
+}
 int main(void)
 {
     struct device dev = { "apple,t8132-dwc3" };
-    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE };
-    phy_error=-ETIMEDOUT;
+    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .role_sw=&dev, .state=DWC3_APPLE_NO_CABLE,
+                            .dwc.maximum_speed=USB_SPEED_SUPER };
+    int s = 0, cores = 0;
+
+    lock_owner = &glue_task;
+    /* T8132: routed once, after HCRST, out of P3 before xHCI runs. */
+    reset(&a, "apple,t8132-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(probes==1 && phy_calls==1 && !pre_host_phy_calls);
+    assert(a.dwc.dis_u3_susphy_quirk && !susphy_on);
+    started(&a);
+    /* T6050 keeps SUSPHY. */
+    reset(&a, "apple,t6050-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores && phy_calls==1);
+    assert(!a.dwc.dis_u3_susphy_quirk && susphy_on);
+    started(&a);
+    /* T6040 routes and resets its PIPE before xHCI, which then leaves it alone. */
+    reset(&a, "apple,t6040-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(pre_host_phy_calls==1 && phy_calls==1 && pipe_resets==1);
+    started(&a);
+    /* Older Type-C ports: a USB3 failure leaves both root hubs up, USB2 only. */
+    reset(&a, "apple,t8103-dwc3", -ETIMEDOUT);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores && stops==s);
+    assert(probes==1 && phy_calls==1 && !pipe_live && !a.dwc.dis_u3_susphy_quirk);
+    started(&a);
+    /* T8132: a BIST timeout fails xHCI before it runs and reaches dwc3_apple_init(). */
+    reset(&a, "apple,t8132-dwc3", -ETIMEDOUT);
     assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ETIMEDOUT);
-    assert(!host_calls && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
-    phy_error=-EOPNOTSUPP;
-    assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EOPNOTSUPP);
-    assert(!gadget_calls && stops==2);
-    phy_error=0;
-    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST));
-    assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
-    /* A T8132 host keeps its USB3 PHY out of P3. */
-    assert(a.dwc.dis_u3_susphy_quirk);
-    dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT;
-    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==2);
-    assert(!a.dwc.dis_u3_susphy_quirk);
-    puts("ok 7 - T8132 PHY failures stop before xHCI, older fallback preserved");
+    stopped(&a, ++s);
+    assert(probes==1 && phy_calls==1 && !pre_host_phy_calls && syscore==cores && !slp_votes);
+    /* T6050: a PIPE fault the same way. */
+    reset(&a, "apple,t6050-dwc3", -EIO); a.sleep_ddr=true;
+    assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-EIO);
+    stopped(&a, ++s);
+    assert(probes==1 && phy_calls==1 && syscore==cores && !slp_votes);
+    /* T6050 after a sleep: a PHY not started yet leaves the start to the role switch. */
+    reset(&a, "apple,t6050-dwc3", -ENOLINK);
+    assert(!dwc3_apple_start_after_sleep(&a,DWC3_APPLE_HOST));
+    stopped(&a, ++s);
+    assert(a.sleep_phy_pending && !a.sleep_phy_wait && syscore==cores && !slp_votes);
+    a.sleep_phy_pending=false; a.sleep_ddr=false;
+    /* An asynchronous probe from another task is refused; the glue's own one routes. */
+    reset(&a, "apple,t6050-dwc3", 0); async_probe=async_race=true;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(probes==2 && refused==1 && phy_calls==1);
+    started(&a);
+    /* No xHCI driver yet: nothing routes the PIPE, and the probe is deferred. */
+    reset(&a, "apple,t6050-dwc3", 0); driver_registered=false;
+    assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-EPROBE_DEFER);
+    stopped(&a, ++s);
+    assert(!probes && !phy_calls);
+    /* xHCI failing after the PIPE moved is not probed again on the live PIPE. */
+    reset(&a, "apple,t6050-dwc3", 0); late_error=-ENOMEM;
+    assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ENODEV);
+    stopped(&a, ++s);
+    assert(probes==1 && phy_calls==1);
+    /* A probe outside a host start, such as a rebind, is refused and routes nothing. */
+    reset(&a, "apple,t6050-dwc3", 0); xhci_pdev.dev.registered=true; xhci_parent=&a.dwc;
+    current_task=&other_task; hcrst_done=false;
+    assert(xhci_plat_probe()==-EBUSY && !phy_calls && refused==1);
+    current_task=&glue_task; xhci_pdev.dev.registered=false;
+    /* A connection that cannot carry a SuperSpeed device still starts the gadget. */
+    reset(&a, "apple,t8132-dwc3", -EOPNOTSUPP);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==1 && syscore==++cores);
+    assert(stops==s && phy_calls==1 && !host_exits);
+    assert(high_speed==1 && a.dwc.maximum_speed==USB_SPEED_HIGH && a.maximum_speed==USB_SPEED_SUPER);
+    assert(a.state==DWC3_APPLE_DEVICE && !running);
+
+    /* The next host starts at the saved speed, after xHCI's reset. */
+    reset(&a, "apple,t8132-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER && phy_calls==1 && !pre_host_phy_calls);
+    started(&a);
+
+    /* A PHY can route USB2 while declining SuperSpeed device mode. */
+    reset(&a, "apple,t8132-dwc3", 0); validate_error=-EOPNOTSUPP;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==2 && syscore==++cores);
+    assert(phy_calls==1 && high_speed==2 && a.dwc.maximum_speed==USB_SPEED_HIGH);
+    validate_error=0;
+
+    /* A controller with no USB3 PHY also uses the saved speed on a role change. */
+    a.usb3_phy=NULL;
+    reset(&a, "apple,t8103-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER);
+    started(&a);
+    reset(&a, "apple,t8103-dwc3", 0);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==3 && syscore==++cores);
+    assert(high_speed==3 && a.dwc.maximum_speed==USB_SPEED_HIGH);
+    a.usb3_phy=&dev;
+
+    /* Other route errors still use the controller's existing error policy. */
+    reset(&a, "apple,t8132-dwc3", -EIO);
+    assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EIO);
+    assert(gadget_calls==3 && stops==++s && phy_calls==1);
+    reset(&a, "apple,t8103-dwc3", -ETIMEDOUT);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==4 && syscore==++cores);
+    assert(a.dwc.maximum_speed==USB_SPEED_SUPER && !a.dwc.dis_u3_susphy_quirk);
+    puts("ok 7 - USB3 host routed after HCRST and high-speed gadget fallback preserves host speed");
     return 0;
 }
 '''
         run(Path(directory), "dwc3-t8132", role_program)
+        controls = {
+            # The PIPE routed before dwc3_host_init() would meet xhci_reset().
+            "dwc3-usb3-before-host": ("*mode = pipe_reset_before_host ? PHY_MODE_USB_HOST : PHY_MODE_INVALID;",
+                                      "*mode = PHY_MODE_USB_HOST;", "dwc3_host_init: Assertion"),
+            # The SuperSpeed root hub routing the PHY too, as its failure tears USB2 down.
+            "dwc3-usb3-root-hub": ("static const bool skip_usb3_phy_init = true;",
+                                   "static const bool skip_usb3_phy_init = false;", "phy_calls==1"),
+            # A routing failure that no longer reaches dwc3_apple_init().
+            "dwc3-usb3-error-lost": ("\tret = appledwc->usb3_host_ret;\n", "\tret = 0;\n", "==-ETIMEDOUT"),
+            # A probe repeated after the PIPE moved, whose xhci_reset() then meets the live PIPE.
+            "dwc3-usb3-reprobe-live": ("if (!bound && appledwc->usb3_host_ret == -EINPROGRESS)",
+                                       "if (!bound && (appledwc->usb3_host_ret == -EINPROGRESS || !appledwc->usb3_host_ret))",
+                                       "xhci_plat_probe: Assertion `!pipe_live"),
+            # An asynchronous probe that routes without the glue lock.
+            "dwc3-usb3-foreign-task": ("if (READ_ONCE(appledwc->host_start_task) != current)",
+                                       "if (!READ_ONCE(appledwc->host_start_task))", "lock_owner == current"),
+        }
+        for name, (old, new, expect) in controls.items():
+            control = role_program.replace(old, new, 1)
+            assert control != role_program, name
+            run(Path(directory), name + "-negative-control", control, expect_failure=True, expect=expect)
         permissive = program.replace(
             "(!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
         assert permissive != program
@@ -734,6 +992,7 @@ static int dwc3_core_probe(struct dwc3_probe_data *d) {
 static void mutex_init(int *p) { *p=0; }
 static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;(void)port;return false; }
 static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
+static bool dwc3_apple_idle_rpm(const char *np) { (void)np;return false; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
 static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)

@@ -77,17 +77,20 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
-/* HEVC Main 10 (P010 input) is mapped for the 9003 layout only. */
+/*
+ * HEVC Main 10 (P010 input): the 9003 and the counted (26A428) layouts,
+ * whose Starts map every field that changes with bit depth. The 6070
+ * layout has none.
+ */
 static bool ave_main10_supported(const struct ave_dev *ave)
 {
-	return ave->layout && ave->layout->kind == AVE_LAYOUT_9003 &&
-	       !ave->layout->counted;
+	return ave->layout && (ave->layout->counted ||
+			       ave->layout->kind == AVE_LAYOUT_9003);
 }
 
 /*
  * Whether raw @fourcc can be encoded to @coded on @ave. P010 is only the
- * input of HEVC Main 10: H.264 has no 10-bit profile here, and the 6070
- * and 26A428 layouts have no Main 10 fields.
+ * input of HEVC Main 10: H.264 has no 10-bit profile here.
  */
 static bool ave_raw_fmt_ok(const struct ave_dev *ave, u32 coded, u32 fourcc)
 {
@@ -711,6 +714,11 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 
 	if (vb2_plane_size(vb, 0) < f->plane_fmt[0].sizeimage)
 		return -EINVAL;
+	/* MCTF copies a whole picture from data_offset on. */
+	if (ctx->mctf && V4L2_TYPE_IS_OUTPUT(vb->type) &&
+	    !ave_mctf_input_fits(vb2_plane_size(vb, 0), vb->planes[0].data_offset,
+				 ave_mctf_input_bytes(f)))
+		return -EINVAL;
 	/* Keep what the client filled in, so its layout can be checked. */
 	if (V4L2_TYPE_IS_OUTPUT(vb->type) && !vb2_get_plane_payload(vb, 0))
 		vb2_set_plane_payload(vb, 0, f->plane_fmt[0].sizeimage);
@@ -1152,7 +1160,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 		v4l2_m2m_buf_copy_metadata(s->src, dst);
 		dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
 				V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
-		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
+		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME :
+			      s->bframe ? V4L2_BUF_FLAG_BFRAME : V4L2_BUF_FLAG_PFRAME;
 		dst->sequence = ctx->dst_sequence++;
 
 		sess->done_head = (sess->done_head + 1) % AVE_MAX_SLOTS;
@@ -1525,7 +1534,8 @@ int ave_v4l2_register(struct ave_dev *ave)
 	int ret;
 
 	mutex_init(&ave->vdev_lock);
-	ave->wq = alloc_ordered_workqueue("apple-ave", WQ_MEM_RECLAIM);
+	ave->wq = alloc_ordered_workqueue("ave-%s", WQ_MEM_RECLAIM,
+					  dev_name(ave->dev));
 	if (!ave->wq)
 		return -ENOMEM;
 	INIT_WORK(&ave->irq_work, ave_irq_work);

@@ -20,17 +20,269 @@ def item(text, signature):
     return text[start:end]
 
 
+def test_g17_busy_share():
+    """Compile and run production g17 BusyShare (power.rs) with negative controls.
+
+    Returns the (t_ms, permille) reports emitted for the long-command-beside-
+    light-compositor scenario, and the (t_ms, permille or -1 for no report)
+    samples of a new burst after idle, so the C CLPC harness drives
+    apple_clpc_sample() with them end-to-end.
+    """
+    power = (ROOT / 'drivers/gpu/drm/asahi/g17/power.rs').read_text()
+    consts = '\n'.join(
+        re.search(r'^pub\(super\) const ' + name + r': u64 = [^\n]+$', power, re.M).group(0)
+        for name in ('BUSY_WINDOW_NS', 'BUSY_WINDOW_MAX_NS', 'BUSY_LONG_COMMAND_NS'))
+    struct_def = item(power, 'pub(super) struct BusyShare {')
+    impl_def = item(power, 'impl BusyShare {')
+    prod = f'{consts}\n{struct_def}\n{impl_def}\n'
+
+    harness = r'''
+#![allow(dead_code)]
+mod usage {
+    pub const NUM_ENGINES: usize = 3;
+}
+mod power {
+''' + prod + r'''
+}
+use power::{BusyShare, BUSY_LONG_COMMAND_NS};
+
+fn main() {
+    const MS: u64 = 1_000_000;
+    // Scenario 1: long 500 ms compute job running next to a light compositor.
+    // Light compositor runs 10 ms per 200 ms window (50 permille -> level 0).
+    let mut s = BusyShare::new();
+    assert_eq!(s.sample(1000 * MS, [0, 0, 0], [0, 0, 0]), None);
+    let r0 = s.sample(1200 * MS, [2 * MS, 10 * MS, 0], [0, 0, 0]).unwrap();
+    assert_eq!(r0, 50);
+    assert!(s.below_top());
+    // Compute job (500 ms) starts at t=1650 ms (after CLPC has dropped to level 0
+    // following its 400 ms down-step hold); compositor submits at t=1810 ms (210 ms
+    // after a 1600 ms window start). Must immediately report 1000 while still running.
+    let r1 = s.sample(1400 * MS, [4 * MS, 20 * MS, 0], [0, 0, 0]).unwrap();
+    assert_eq!(r1, 50);
+    let r2 = s.sample(1600 * MS, [6 * MS, 30 * MS, 0], [0, 0, 0]).unwrap();
+    assert_eq!(r2, 50);
+    let r3 = s.sample(1810 * MS, [8 * MS, 40 * MS, 0], [0, 0, 1650 * MS]).unwrap();
+    assert_eq!(r3, 1000, "long in-flight compute next to light compositor must lift to 1000");
+    assert!(!s.below_top());
+    // Still running across the next 200 ms window at t=2010 ms: holds 1000.
+    let r4 = s.sample(2010 * MS, [10 * MS, 50 * MS, 0], [0, 0, 1650 * MS]).unwrap();
+    assert_eq!(r4, 1000);
+    // Job retires at t=2150 ms (+500 ms retired). At t=2210 ms only the 140 ms in
+    // [2010, 2150] counts (700 permille), proving zero double-counting.
+    let r5 = s.sample(2210 * MS, [12 * MS, 60 * MS, 500 * MS], [0, 0, 0]).unwrap();
+    assert_eq!(r5, 700, "post-retirement window must not double-count prior in-flight time");
+    // Next window returns cleanly to compositor's 50 permille.
+    let r6 = s.sample(2410 * MS, [14 * MS, 70 * MS, 500 * MS], [0, 0, 0]).unwrap();
+    assert_eq!(r6, 50);
+
+    // Scenario 2: long command starting late in a window lifts mid-window at 50 ms.
+    let mut late = BusyShare::new();
+    assert_eq!(late.sample(1000 * MS, [0, 0, 0], [0, 0, 0]), None);
+    assert_eq!(late.sample(1200 * MS, [0, 10 * MS, 0], [0, 0, 0]), Some(50));
+    assert_eq!(late.sample(1410 * MS, [0, 20 * MS, 0], [0, 0, 1390 * MS]), Some(95));
+    assert!(late.below_top());
+    assert_eq!(late.sample(1440 * MS, [0, 22 * MS, 0], [0, 0, 1390 * MS]), Some(1000));
+    assert!(!late.below_top());
+    assert_eq!(late.sample(1460 * MS, [0, 23 * MS, 0], [0, 0, 1390 * MS]), None);
+    assert_eq!(late.sample(1610 * MS, [0, 30 * MS, 100 * MS], [0, 0, 0]), Some(400));
+
+    // Scenario 3: solo long command driven by recheck_delay_for reaches 1000 and stops.
+    let mut solo = BusyShare::new();
+    assert_eq!(solo.sample(1000 * MS, [0, 0, 0], [0, 0, 0]), None);
+    assert_eq!(solo.sample(1200 * MS, [0, 10 * MS, 0], [0, 0, 0]), Some(50));
+    let mut t = 1222 * MS;
+    let start = 1210 * MS;
+    let mut lifted = false;
+    let mut rechecks = 0;
+    for _ in 0..8 {
+        if let Some(p) = solo.sample(t, [0, 10 * MS, 0], [0, 0, start]) {
+            assert_eq!(p, 1000);
+            lifted = true;
+            break;
+        }
+        let delay = BusyShare::recheck_delay_for(t, start).unwrap();
+        assert!(delay <= BUSY_LONG_COMMAND_NS);
+        t += delay;
+        rechecks += 1;
+    }
+    // One wake-up at the long-command age, not a train of short ones.
+    assert!(lifted && !solo.below_top() && t == start + BUSY_LONG_COMMAND_NS && rechecks == 1);
+
+    // Scenario 4: short straddling command (no double count), multi-engine max, >2 s gaps.
+    let mut misc = BusyShare::new();
+    assert_eq!(misc.sample(1000 * MS, [0, 0, 0], [0, 0, 0]), None);
+    assert_eq!(misc.sample(1200 * MS, [0, 0, 0], [0, 0, 1170 * MS]), Some(150));
+    assert_eq!(misc.sample(1400 * MS, [0, 0, 40 * MS], [0, 0, 0]), Some(50));
+    assert_eq!(misc.sample(1600 * MS, [0, 120 * MS, 150 * MS], [0, 0, 0]), Some(600));
+    assert_eq!(misc.sample(5000 * MS, [0, 120 * MS, 150 * MS], [0, 0, 5000 * MS]), None);
+    assert_eq!(misc.sample(8000 * MS, [0, 120 * MS, 150 * MS], [0, 0, 5000 * MS]), Some(1000));
+
+    // Scenario 5: steady 600 permille work until 1400 ms, idle (CLPC cleared), then a
+    // new burst at 2000 ms. Closing [1300, 2000] would report a diluted 85 permille
+    // (60 ms in 700 ms); the first submission re-baselines instead and nothing is
+    // reported until a fresh 200 ms window of the new burst completes.
+    let mut burst = BusyShare::new();
+    assert_eq!(burst.sample(900 * MS, [0, 0, 0], [0, 0, 0]), None);
+    let mut idle_events = Vec::new();
+    for (t, frag) in [(1100, 120), (1300, 240)] {
+        let p = burst.sample(t * MS, [0, frag * MS, 0], [0, 0, 0]);
+        assert_eq!(p, Some(600));
+        idle_events.push((t, p));
+    }
+    burst.clear_active();
+    assert!(!burst.below_top());
+    for (t, frag) in [(2000, 300), (2048, 328), (2100, 360), (2148, 388), (2196, 417), (2200, 420)] {
+        let p = burst.sample(t * MS, [0, frag * MS, 0], [0, 0, 0]);
+        assert_eq!(p, if t < 2200 { None } else { Some(600) },
+                   "new burst after idle must not report a window diluted by the idle gap");
+        idle_events.push((t, p));
+    }
+    assert!(burst.below_top());
+
+    println!("EVENTS:1200={r0},1400={r1},1600={r2},1810={r3},2010={r4},2210={r5},2410={r6}");
+    let idle: Vec<String> =
+        idle_events.iter().map(|(t, p)| format!("{t}={}", p.map_or(-1, i64::from))).collect();
+    println!("IDLE:{}", idle.join(","));
+}
+'''
+    rustc = os.environ.get('RUSTC', 'rustc')
+    events = idle_events = None
+    with tempfile.TemporaryDirectory(prefix='asahi-g17-busy-') as tmp:
+        root = Path(tmp)
+        for name, text in [
+            ('fixed', harness),
+            ('g17-ignore-in-flight',
+             harness.replace('let long_in_flight = Self::is_long_in_flight(now_ns, oldest_in_flight);',
+                             'let _ = oldest_in_flight; let oldest_in_flight = [0; crate::usage::NUM_ENGINES];\n'
+                             '        let long_in_flight = Self::is_long_in_flight(now_ns, oldest_in_flight);')),
+            ('g17-double-count-in-flight',
+             harness.replace('let busy = delta.saturating_add(age).saturating_sub(prev_age);',
+                             'let _ = prev_age; let busy = delta.saturating_add(age);')),
+            ('g17-no-early-lift',
+             harness.replace('if self.below_top && long_in_flight {',
+                             'if false && self.below_top && long_in_flight {')),
+            ('g17-long-idle-reports',
+             harness.replace('if elapsed > BUSY_WINDOW_MAX_NS && !long_in_flight {',
+                             'if false && elapsed > BUSY_WINDOW_MAX_NS && !long_in_flight {')),
+            ('g17-idle-keeps-window',
+             harness.replace('self.start_ns = None;\n        self.in_flight_ns = [0; crate::usage::NUM_ENGINES];\n'
+                             '        self.below_top = false;',
+                             'self.below_top = false;')),
+        ]:
+            assert name == 'fixed' or text != harness, 'stale mutation: ' + name
+            src = root / (name + '.rs')
+            src.write_text(text)
+            binary = src.with_suffix('')
+            subprocess.run([rustc, '--edition=2021', '-Dwarnings', str(src), '-o', str(binary)],
+                           check=True)
+            run = subprocess.run([str(binary)], capture_output=True, text=True)
+            if name == 'fixed':
+                assert run.returncode == 0, run.stderr
+                lines = run.stdout.strip().splitlines()
+                assert len(lines) == 2 and lines[0].startswith('EVENTS:') \
+                    and lines[1].startswith('IDLE:'), lines
+                events = [tuple(int(x) for x in pair.split('='))
+                          for pair in lines[0].removeprefix('EVENTS:').split(',')]
+                idle_events = [tuple(int(x) for x in pair.split('='))
+                               for pair in lines[1].removeprefix('IDLE:').split(',')]
+                print('PASS: g17 BusyShare (in-flight long command, early lift, solo recheck, '
+                      'non-double-counting, new burst after idle)')
+            else:
+                assert run.returncode != 0, name
+                print('PASS negative control:', name)
+    return events, idle_events
+
+
+def strip_dts_comments(text):
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+        lambda m: m.group(0) if m.group(0).startswith('"') else ' ',
+        text,
+        flags=re.S,
+    )
+
+
+def dt_cells(node_text, name):
+    match = re.search(r'(?:^|[\s;])' + re.escape(name) + r'\s*=\s*([^;]*);', node_text)
+    if not match:
+        return None
+    return [int(x, 0) for x in re.findall(r'0x[0-9a-fA-F]+|\d+', match.group(1))]
+
+
+def parse_clpc_dt_gpu_busy(dts_text, node_sig):
+    clpc_node = item(strip_dts_comments(dts_text), node_sig)
+    return (
+        dt_cells(clpc_node, 'apple,gpu-busy-memory-states'),
+        dt_cells(clpc_node, 'apple,gpu-busy-permille'),
+    )
+
+
+def parse_t6050_gpu_busy(dts_text):
+    states, busy = parse_clpc_dt_gpu_busy(dts_text, 'clpc: performance-controller@1 {')
+    assert states and busy, \
+        't6050-die0.dtsi clpc node must define both gpu-busy DT properties'
+    return states, busy
+
+
+def test_t6050_dt_negative_controls(t6050_dts):
+    for prop, short in [
+        ('apple,gpu-busy-memory-states', 'states'),
+        ('apple,gpu-busy-permille', 'permille'),
+    ]:
+        pat = re.compile(r'^([ \t]*)(' + re.escape(prop) + r'\s*=[^;]*;)', re.M)
+        for kind, repl in [
+            ('delete', ''),
+            ('block-comment', r'\1/* \2 */'),
+            ('line-comment', r'\1// \2'),
+        ]:
+            mutated, count = pat.subn(repl, t6050_dts, count=1)
+            assert count == 1 and mutated != t6050_dts, f'stale mutation: {kind}-{short}'
+            try:
+                parse_t6050_gpu_busy(mutated)
+            except AssertionError:
+                print(f'PASS negative control: t6050-dt-{kind}-{short}')
+            else:
+                raise AssertionError(f'negative control passed unexpectedly: t6050-dt-{kind}-{short}')
+
+
 def main():
+    g17_events, g17_idle_events = test_g17_busy_share()
     source = (ROOT / 'drivers/soc/apple/clpc.c').read_text()
     header = (ROOT / 'include/linux/soc/apple/pmc.h').read_text()
     rail_shift = re.search(r'^#define APPLE_PMC_RAIL_SHIFT\(rail\).*$', header, re.M).group(0)
     dense_samples = re.search(r'^#define APPLE_CLPC_GPU_DENSE_SAMPLES\s.*$', source, re.M).group(0)
     reasons = '\n'.join(re.findall(r'^#define APPLE_CLPC_REASON_\w+\s.*$', source, re.M))
+    gpu_down = re.search(r'^#define APPLE_CLPC_GPU_DOWN_MS\s.*$', source, re.M).group(0)
     types = '\n'.join(item(source, s) + ';' for s in [
         'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
     tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n + ' =') + ';'
                        for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140',
-                                 'apple_clpc_hw_t6040', 'apple_clpc_hw_t6041'])
+                                 'apple_clpc_hw_t6040', 'apple_clpc_hw_t6041',
+                                 'apple_clpc_hw_t6050'])
+
+    # When t6041.dtsi supplies the GPU busy-share properties, parse and test them directly;
+    # otherwise exercise the DT parsers and ladder against the reference values.
+    dts = (ROOT / 'arch/arm64/boot/dts/apple/t6041.dtsi').read_text()
+    dt_states, dt_busy = parse_clpc_dt_gpu_busy(dts, '&clpc {')
+    assert (dt_states is None) == (dt_busy is None)
+    gpu_states = dt_states or [1, 2, 4, 5, 0, 0, 0, 3]
+    gpu_busy = dt_busy or [160, 500, 800]
+
+    # Parse T6050's shared CLPC node directly; both DT properties are required.
+    t6050_dts = (ROOT / 'arch/arm64/boot/dts/apple/t6050-die0.dtsi').read_text()
+    t6050_states, t6050_busy = parse_t6050_gpu_busy(t6050_dts)
+    test_t6050_dt_negative_controls(t6050_dts)
+
+    t6041_dt = (
+        'static const u32 t6041_gpu_states[] = {' + ', '.join(str(x) for x in gpu_states) + '};\n'
+        'static const u32 t6041_gpu_busy[] = {' + ', '.join(str(x) for x in gpu_busy) + '};\n'
+        'static const u32 t6050_gpu_states[] = {' + ', '.join(str(x) for x in t6050_states) + '};\n'
+        'static const u32 t6050_gpu_busy[] = {' + ', '.join(str(x) for x in t6050_busy) + '};\n'
+        'static const struct { unsigned long ms; unsigned int permille; } g17_long_events[] = {'
+        + ', '.join(f'{{{t}, {p}}}' for t, p in g17_events) + '};\n'
+        'static const struct { unsigned long ms; int permille; } g17_idle_events[] = {'
+        + ', '.join(f'{{{t}, {p}}}' for t, p in g17_idle_events) + '};\n')
     methods = '\n'.join(item(source, s) for s in [
         'static unsigned int apple_clpc_vote(', 'static u32 apple_clpc_floor(',
         'static bool apple_clpc_gpu_streaming(',
@@ -38,6 +290,10 @@ def main():
         'static bool apple_clpc_gpu_dense(',
         'static bool apple_clpc_gpu_limited(',
         'static void apple_clpc_gpu_floor_count(',
+        'static unsigned int apple_clpc_gpu_level(',
+        'static int apple_clpc_dt_map(',
+        'static int apple_clpc_dt_busy(',
+        'static bool apple_clpc_dt_apply(',
         'static bool apple_clpc_gpu_input_demand(',
         'static bool apple_clpc_ane_input_demand(',
         'static void apple_clpc_ane_cluster(',
@@ -47,16 +303,21 @@ def main():
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int atomic_t;
+static void atomic_set(atomic_t *v, int i) { *v = i; }
+struct device;
 #define APPLE_CLPC_LEVELS 4
 #define APPLE_CLPC_HOLD_MS 32
 #define APPLE_CLPC_SAMPLE_MS 4
 #define APPLE_CLPC_GPU_BACKOFF_MS 100
 #define HZ 1000
 #define max(a,b) ((a) > (b) ? (a) : (b))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define GENMASK(h,l) (((1u << ((h)-(l)+1))-1) << (l))
 #define BIT(n) (1u << (n))
 #define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)
@@ -64,11 +325,15 @@ typedef uint64_t u64;
 #define time_after(a,b) ((long)((a)-(b)) > 0)
 #define time_before(a,b) ((long)((a)-(b)) < 0)
 #define msecs_to_jiffies(ms) (ms)
-static int warned;
+static int warned, dt_warned;
 #define dev_warn_once(d, ...) ((void)(d), warned++)
+#define dev_warn(d, ...) ((void)(d), dt_warned++)
 enum apple_clpc_rail { APPLE_CLPC_DCS, APPLE_CLPC_SOC, APPLE_CLPC_RAILS };
 ''' + types + r'''
-struct apple_clpc_gpu { bool active; u64 sequence; };
+struct apple_clpc_gpu {
+ int lock; bool active; u64 sequence;
+ unsigned int busy; bool busy_valid; unsigned int level; unsigned long level_since;
+};
 struct apple_clpc_ane { int lock; bool active, pending; };
 #define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
 #define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
@@ -111,7 +376,11 @@ struct apple_clpc {
  struct freq_qos_request ane_qos;
  unsigned int ane_qos_khz;
  unsigned long ane_until;
+ bool has_pmc;
  bool low_power;
+ unsigned int low_power_khz;
+ unsigned int low_power_mw;
+ atomic_t idle_armed;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -135,12 +404,128 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
 #define READ_ONCE(x) (x)
 static void apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
-''' + dense_samples + '\n' + reasons + '\n' + tables + '\n' + methods + r'''
+''' + dense_samples + '\n' + reasons + '\n' + gpu_down + '\n' + tables + '\n' + methods + '\n' + t6041_dt + r'''
+// Apply DT GPU busy-share properties through the driver's parsers: the CPU map
+// stays untouched, valid GPU states/thresholds populate the ladder, states
+// above the compatible table's rail maximum are rejected, and any malformed
+// optional ladder warns and falls back to the compatible's static table.
+static struct apple_clpc_hw t6041_dt_hw;
+static void t6041_from_dt(void) {
+ static const u8 cpu[2][4] = {{5, 5, 5, 5}, {3, 3, 3, 3}}, gpu[2][4] = {{1, 2, 4, 5}, {0, 0, 0, 3}};
+ struct apple_clpc_hw out, bad = apple_clpc_hw_t6040;
+ u32 over_4bit[8] = {1, 2, 4, 5, 0, 0, 0, 16};
+ u32 t6041_over_dcs[8] = {1, 2, 4, 7, 0, 0, 0, 3};
+ u32 t6041_over_dcs6[8] = {1, 2, 4, 6, 0, 0, 0, 3};
+ u32 t6041_over_soc[8] = {1, 2, 4, 5, 0, 0, 0, 4};
+ u32 t6050_ok[8] = {1, 2, 4, 6, 0, 0, 0, 2};
+ u32 t6050_over_dcs[8] = {1, 2, 4, 7, 0, 0, 0, 2};
+ u32 t6050_over_soc[8] = {1, 2, 4, 6, 0, 0, 0, 3};
+ u32 busy[3] = {500, 160, 800};
+
+ dt_warned = 0;
+ assert(apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &t6041_dt_hw,
+                            t6041_gpu_states, ARRAY_SIZE(t6041_gpu_states),
+                            t6041_gpu_busy, ARRAY_SIZE(t6041_gpu_busy)));
+ assert(dt_warned == 0);
+ for (int r = 0; r < 2; r++)
+  for (int l = 0; l < 4; l++)
+   assert(t6041_dt_hw.map[r][l] == cpu[r][l] && t6041_dt_hw.gpu_busy[r][l] == gpu[r][l]);
+
+ // Direct parser bounds: 4-bit max, rail-specific compatible max, counts, thresholds.
+ assert(apple_clpc_dt_map(&bad, over_4bit, 8) == -EINVAL);
+ assert(apple_clpc_dt_map(&bad, over_4bit, 7) == -EINVAL);
+ assert(apple_clpc_dt_map(&bad, t6041_gpu_states, 8) == -EINVAL); // fabric 3 > T6040 max 2
+ bad = apple_clpc_hw_t6041;
+ assert(apple_clpc_dt_map(&bad, t6041_over_dcs, 8) == -EINVAL);   // DCS 7 > T6041 max 5
+ assert(apple_clpc_dt_map(&bad, t6041_over_dcs6, 8) == -EINVAL);  // DCS 6 > T6041 max 5
+ assert(apple_clpc_dt_map(&bad, t6041_over_soc, 8) == -EINVAL);   // fabric 4 > T6041 max 3
+ // T6050 rail max uses max(map[rail][top], gpu[rail]): DCS 6 from gpu[DCS], fabric 2.
+ assert(apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6050, &out,
+                            t6050_ok, 8, t6041_gpu_busy, 3));
+ assert(dt_warned == 0 && out.gpu_busy[APPLE_CLPC_DCS][3] == 6);
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6050, &out,
+                             t6050_over_dcs, 8, t6041_gpu_busy, 3));
+ assert(dt_warned == 1 && !memcmp(&out, &apple_clpc_hw_t6050, sizeof(out)));
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6050, &out,
+                             t6050_over_soc, 8, t6041_gpu_busy, 3));
+ assert(dt_warned == 2 && !memcmp(&out, &apple_clpc_hw_t6050, sizeof(out)));
+
+ // Malformed optional DT properties warn and fall back to the static soc table unchanged.
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &out,
+                             t6041_over_dcs, 8, t6041_gpu_busy, 3));
+ assert(dt_warned == 3 && !memcmp(&out, &apple_clpc_hw_t6041, sizeof(out)));
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &out,
+                             t6041_over_soc, 8, t6041_gpu_busy, 3));
+ assert(dt_warned == 4 && !memcmp(&out, &apple_clpc_hw_t6041, sizeof(out)));
+ // Valid states paired with bad permille or missing partner must not leave partial ladder.
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &out,
+                             t6041_gpu_states, 8, busy, 3));
+ assert(dt_warned == 5 && !memcmp(&out, &apple_clpc_hw_t6041, sizeof(out)));
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &out,
+                             t6041_gpu_states, 8, NULL, -EINVAL));
+ assert(dt_warned == 6 && !memcmp(&out, &apple_clpc_hw_t6041, sizeof(out)));
+ assert(!apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6041, &out,
+                             NULL, -EINVAL, t6041_gpu_busy, 3));
+ assert(dt_warned == 7 && !memcmp(&out, &apple_clpc_hw_t6041, sizeof(out)));
+ // Falling back keeps the compatible's full GPU floor even when a low busy share arrives.
+ {
+  struct apple_clpc_gpu g = {.active = true, .busy_valid = true, .busy = 100};
+  struct apple_clpc c = {.hw = &out, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &g};
+  read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; jiffies = 2900; published = ~0u;
+  apple_clpc_sample(&c);
+  assert(published == 0x35 && c.last_reason == 2);
+ }
+
+ assert(apple_clpc_dt_busy(&bad, busy, 3) == -EINVAL);
+ busy[0] = 160; busy[1] = 500; busy[2] = 1001;
+ assert(apple_clpc_dt_busy(&bad, busy, 3) == -EINVAL);
+ assert(apple_clpc_dt_busy(&bad, busy, 2) == -EINVAL);
+}
+
+static struct apple_clpc_hw t6050_dt_hw;
+static void t6050_from_dt(void) {
+ static const u8 cpu[2][4] = {{2, 4, 5, 5}, {1, 2, 2, 2}}, gpu[2][4] = {{1, 2, 4, 6}, {0, 0, 0, 2}};
+ int prev = dt_warned;
+
+ dt_warned = 0;
+ assert(apple_clpc_dt_apply(NULL, &apple_clpc_hw_t6050, &t6050_dt_hw,
+                            t6050_gpu_states, ARRAY_SIZE(t6050_gpu_states),
+                            t6050_gpu_busy, ARRAY_SIZE(t6050_gpu_busy)));
+ assert(dt_warned == 0);
+ for (int r = 0; r < 2; r++)
+  for (int l = 0; l < 4; l++)
+   assert(t6050_dt_hw.map[r][l] == cpu[r][l] && t6050_dt_hw.gpu_busy[r][l] == gpu[r][l]);
+ dt_warned = prev;
+}
+
+static void check_t6050_busy(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t6050_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ assert(c.hw->gpu_busy_mid == 160 && c.hw->gpu_busy_high == 500 && c.hw->gpu_busy_top == 800);
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ gpu.active = true; jiffies = 6000; apple_clpc_sample(&c);
+ assert(published == 0x26 && c.last_reason == 2 && gpu.level == 3);
+ gpu.active = false; jiffies = 6100; apple_clpc_sample(&c); assert(published == 0);
+ gpu.active = true; gpu.busy_valid = true; gpu.busy = 159; jiffies = 6500;
+ apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
+ gpu.busy = 160; jiffies = 6504; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 499; jiffies = 6508; apple_clpc_sample(&c); assert(published == 0x02 && gpu.level == 1);
+ gpu.busy = 500; jiffies = 6512; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 799; jiffies = 6516; apple_clpc_sample(&c); assert(published == 0x04 && gpu.level == 2);
+ gpu.busy = 800; jiffies = 6520; apple_clpc_sample(&c); assert(published == 0x26 && gpu.level == 3);
+ gpu.busy = 100;
+ for (jiffies = 6524; jiffies < 6920; jiffies += 4) {
+  apple_clpc_sample(&c); assert(published == 0x26 && gpu.level == 3);
+ }
+ jiffies = 6920; apple_clpc_sample(&c); assert(published == 0x21 && gpu.level == 0);
+ jiffies = 6952; apple_clpc_sample(&c); assert(published == 0x01 && c.last_reason == 2);
+ gpu.active = false; jiffies = 7000; apple_clpc_sample(&c); assert(published == 0 && queued_idle);
+}
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.
 static void check_t8140_ane(void) {
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.ane=&ane};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=1000; published=~0u;
@@ -153,11 +538,29 @@ static void check_t8140_ane(void) {
  jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
 }
 
+// T6050 ANE work holds DCS 6 and fabric 2 while it runs (and keeps on-time
+// idle sampling), sees a sub-sample request once, and releases after HOLD_MS.
+static void check_t6050_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6050,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ assert(c.hw->ane[APPLE_CLPC_DCS]==6 && c.hw->ane[APPLE_CLPC_SOC]==2 && c.hw->idle_on_time);
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=3000; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && c.last_reason==0);
+ ane.active=true; jiffies=3004; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32);
+ ane.active=false; ane.pending=true; jiffies=3008; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32 && !ane.pending);
+ jiffies=3012; apple_clpc_sample(&c); assert(published==0x26 && c.last_reason==16);
+ jiffies=3040; apple_clpc_sample(&c); assert(published==0 && c.last_reason==0 && queued_idle);
+}
+
 // T6040 ANE work also holds the second P cluster at its qualified frequency,
 // added on first use, for the vote hold after the last request, then drops it.
 static void check_t6040_ane(void) {
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.ane=&ane};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.has_pmc=true,.agent=1,.mask=3,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  c.ane_cpu=9; c.ane_cluster_khz=c.hw->ane_cluster_khz;
@@ -172,11 +575,150 @@ static void check_t6040_ane(void) {
  ane.active=true; jiffies=2040; apple_clpc_sample(&c); assert(qos_adds==1 && qos_min==3756000);
 }
 
+// DT GPU busy-share ladder: DCS 1, 2, 4 or 5 and fabric 0, 0, 0 or 3, split at
+// 160, 500 and 800 permille. A higher level applies at once, a lower one at the
+// first sample at least 400 ms after the last one that asked for the current
+// level or more. A table without a non-zero top DCS state falls back to @map.
+static void check_t6041_busy(void) {
+ struct apple_clpc_gpu gpu={0};
+ struct apple_clpc c={.hw=&t6041_dt_hw,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc_hw no_top = t6041_dt_hw;
+ assert(c.hw->gpu_busy_mid==160 && c.hw->gpu_busy_high==500 && c.hw->gpu_busy_top==800);
+ read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; published=~0u;
+ // No share reported: the top of the ladder, as before the busy share.
+ gpu.active=true; jiffies=3000; apple_clpc_sample(&c);
+ assert(published==0x35 && c.last_reason==2 && gpu.level==3);
+ gpu.active=false; jiffies=3100; apple_clpc_sample(&c); assert(published==0);
+ // Below gpu_busy_mid: the lowest GPU state (after a long idle, at once).
+ gpu.active=true; gpu.busy_valid=true; gpu.busy=100; jiffies=3500;
+ apple_clpc_sample(&c); assert(published==0x01 && c.last_reason==2 && gpu.level==0);
+ // Between the thresholds, going up: each level applies at the next sample.
+ gpu.busy=160; jiffies=3504; apple_clpc_sample(&c); assert(published==0x02 && gpu.level==1);
+ gpu.busy=499; jiffies=3508; apple_clpc_sample(&c); assert(published==0x02 && gpu.level==1);
+ gpu.busy=500; jiffies=3512; apple_clpc_sample(&c); assert(published==0x04 && gpu.level==2);
+ gpu.busy=799; jiffies=3516; apple_clpc_sample(&c); assert(published==0x04 && gpu.level==2);
+ gpu.busy=800; jiffies=3520; apple_clpc_sample(&c); assert(published==0x35 && gpu.level==3);
+ // Going down waits 400 ms from the last sample at the top.
+ gpu.busy=100;
+ for (jiffies=3524; jiffies<3920; jiffies+=4) {
+  apple_clpc_sample(&c); assert(published==0x35 && gpu.level==3);
+ }
+ jiffies=3919; apple_clpc_sample(&c); assert(published==0x35 && gpu.level==3);
+ // At 400 ms the DCS drops at once; the fabric state keeps HOLD_MS.
+ jiffies=3920; apple_clpc_sample(&c); assert(published==0x31 && gpu.level==0);
+ jiffies=3952; apple_clpc_sample(&c); assert(published==0x01 && c.last_reason==2);
+ // A sample that asks for the current level again restarts the 400 ms.
+ gpu.busy=600; jiffies=4000; apple_clpc_sample(&c); assert(published==0x04 && gpu.level==2);
+ gpu.busy=100; jiffies=4200; apple_clpc_sample(&c); assert(gpu.level==2);
+ gpu.busy=550; jiffies=4300; apple_clpc_sample(&c); assert(gpu.level==2);
+ gpu.busy=100; jiffies=4699; apple_clpc_sample(&c); assert(published==0x04 && gpu.level==2);
+ jiffies=4700; apple_clpc_sample(&c); assert(published==0x01 && gpu.level==0);
+ gpu.active=false; jiffies=4800; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ // Without a non-zero top DCS state, even a low reported share keeps the map top.
+ no_top.gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1] = 0;
+ c.hw = &no_top; gpu.active=true; gpu.busy_valid=true; gpu.busy=100; jiffies=4900;
+ apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==2);
+ // Same for a static table with no DT properties at all.
+ c.hw = &apple_clpc_hw_t6041; jiffies=4904;
+ apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==2);
+ gpu.active=false; jiffies=5000; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
+// End-to-end: feed g17 BusyShare's actual reports for a 500 ms compute job
+// running beside a light compositor into CLPC's T6041 ladder. CLPC drops to
+// DCS 1 / fabric 0 during light compositing, lifts IMMEDIATELY to DCS 5 /
+// fabric 3 (0x35) at t=1810 ms while the compute job is still in flight, holds
+// 0x35 while it runs, and drops back to 0x01 after it finishes + 400 ms hold.
+static void check_t6041_long_in_flight(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t6041_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ gpu.active = true;
+ // Initial burst starts at top (no share yet).
+ jiffies = 1000; apple_clpc_sample(&c);
+ assert(published == 0x35 && gpu.level == 3);
+ // Light compositor windows (1200, 1400, 1600 ms -> 50 permille) drop to DCS 1 / fabric 0.
+ assert(ARRAY_SIZE(g17_long_events) == 7);
+ for (size_t i = 0; i < 3; i++) {
+  gpu.busy = g17_long_events[i].permille; gpu.busy_valid = true;
+  jiffies = g17_long_events[i].ms; apple_clpc_sample(&c);
+ }
+ // After 400 ms down-step hold + 32 ms fabric hold, CLPC is at DCS 1 / fabric 0.
+ jiffies = 1640; apple_clpc_sample(&c);
+ assert(published == 0x01 && gpu.level == 0);
+ // At t=1810 ms (160 ms into the 500 ms compute job, still in flight!), BusyShare
+ // reports 1000 permille and CLPC lifts IMMEDIATELY to DCS 5 / fabric 3.
+ gpu.busy = g17_long_events[3].permille; gpu.busy_valid = true;
+ jiffies = g17_long_events[3].ms; apple_clpc_sample(&c);
+ assert(published == 0x35 && gpu.level == 3);
+ // Still running at t=2010 ms: stays at DCS 5 / fabric 3.
+ gpu.busy = g17_long_events[4].permille; gpu.busy_valid = true;
+ jiffies = g17_long_events[4].ms; apple_clpc_sample(&c);
+ assert(published == 0x35 && gpu.level == 3);
+ // Retires at t=2150 ms; window at t=2210 ms reports exact 700 (still in 400 ms hold).
+ gpu.busy = g17_long_events[5].permille; gpu.busy_valid = true;
+ for (jiffies = g17_long_events[5].ms; jiffies < g17_long_events[6].ms; jiffies += 4) {
+  apple_clpc_sample(&c);
+  assert(published == 0x35 && gpu.level == 3);
+ }
+ // Next light window at t=2410 ms (400 ms after last top request at 2010 ms):
+ // DCS drops immediately to 1, fabric keeps HOLD_MS (32 ms) from the 2406 ms sample.
+ gpu.busy = g17_long_events[6].permille; gpu.busy_valid = true;
+ jiffies = g17_long_events[6].ms; apple_clpc_sample(&c);
+ assert(published == 0x31 && gpu.level == 0);
+ jiffies = g17_long_events[6].ms + APPLE_CLPC_HOLD_MS; apple_clpc_sample(&c);
+ assert(published == 0x01 && gpu.level == 0);
+}
+
+// End-to-end: g17 BusyShare's samples (-1: no report) for steady 600 permille
+// work, an idle gap in which the GPU clears its activity (apple_clpc_gpu_set_active
+// false also clears busy_valid), and a new burst 600 ms later. The new burst starts
+// at the top (0x35) and stays there until a fresh 200 ms window reports; the
+// diluted 85 permille a stale window would report drops it to 0x01 at once.
+static void check_t6041_idle_burst(void) {
+ struct apple_clpc_gpu gpu = {0};
+ struct apple_clpc c = {.hw = &t6041_dt_hw, .has_pmc = true, .agent = 1, .mask = 3, .gpu = &gpu};
+ size_t i = 0, n = ARRAY_SIZE(g17_idle_events);
+ read_error = vote_error = 0; pmgr_status = 0xf0; pmp_floor = 0; published = ~0u;
+ assert(n == 8 && g17_idle_events[0].ms == 1100 && g17_idle_events[2].ms == 2000);
+ gpu.active = true; jiffies = 900; apple_clpc_sample(&c);
+ assert(published == 0x35 && gpu.level == 3);
+ for (; i < 2; i++) {
+  assert(g17_idle_events[i].permille == 600);
+  gpu.busy = g17_idle_events[i].permille; gpu.busy_valid = true;
+  jiffies = g17_idle_events[i].ms; apple_clpc_sample(&c);
+ }
+ assert(gpu.level == 2);
+ // Idle: the GPU clears its activity and CLPC forgets the share.
+ gpu.active = false; gpu.busy_valid = false;
+ for (jiffies = 1416; jiffies < 2000; jiffies += 4)
+  apple_clpc_sample(&c);
+ assert(published == 0);
+ gpu.active = true;
+ for (jiffies = 2000; jiffies <= 2200; jiffies += 4) {
+  if (i < n && g17_idle_events[i].ms == jiffies) {
+   if (g17_idle_events[i].permille >= 0) {
+    gpu.busy = g17_idle_events[i].permille; gpu.busy_valid = true;
+   }
+   i++;
+  }
+  assert(gpu.busy_valid == (jiffies >= 2200));
+  apple_clpc_sample(&c);
+  assert(published == 0x35 && gpu.level == 3);
+ }
+ assert(i == n);
+ // The stale window's diluted share would have dropped the new burst at once.
+ gpu.active = false; gpu.busy_valid = false; jiffies = 2400; apple_clpc_sample(&c);
+ gpu.active = true; gpu.busy = 85; gpu.busy_valid = true; jiffies = 3000;
+ apple_clpc_sample(&c); assert(published == 0x01 && gpu.level == 0);
+ gpu.active = false; jiffies = 3100; apple_clpc_sample(&c); assert(published == 0);
+}
+
 // T8132's G16 firmware keeps graphics powered while the GPU idles: the
 // M5/F3 floor follows the work the GPU driver reports, as on T6040.
 static void check_t8132(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
  assert(!c.hw->gpu_demand);
  read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; jiffies=0; published=~0u;
  apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
@@ -190,10 +732,10 @@ static void check_t8132(void) {
 // T6041 (M4 Max) votes DCS 5 / fabric 3 for CPU and host GPU demand without a
 // streak, samples on time while idle, preserves T6041's DCS 5 / fabric 2 ANE
 // floor, and carries the 2808 MHz Low Power ceiling.
-static void check_t6041(void) {
+static void check_t6041(const struct apple_clpc_hw *hw) {
  struct apple_clpc_gpu gpu={0};
  struct apple_clpc_ane ane={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6041,.agent=1,.mask=3,.gpu=&gpu,.ane=&ane};
+ struct apple_clpc c={.hw=hw,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu,.ane=&ane};
  c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
  c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
  assert(!c.hw->gpu_demand && c.hw->gpu_input && c.hw->sustain==0 && c.hw->idle_on_time);
@@ -219,7 +761,7 @@ static void check_t6041(void) {
 
 // A failed power-state read still protects an active graphics consumer.
 static void check_read_error(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0; warned=0;
  for (jiffies=100; jiffies<=164; jiffies+=4) apple_clpc_sample(&c);
  assert(published==0x34 && c.last_reason==4);
@@ -234,7 +776,7 @@ static void check_read_error(void) {
 }
 
 static void check_t8140(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0;
  for (jiffies=100; jiffies<=164; jiffies+=4) {
   apple_clpc_sample(&c);
@@ -257,7 +799,7 @@ static void check_t8140(void) {
 // streams, but 2+ submissions in each of 4 periods earn the GPU floor.
 static void check_t8140_dense(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.has_pmc=true,.agent=1,.mask=3,.gpu_pmgr=(void *)1,.gpu=&gpu};
  read_error=vote_error=0; pmp_floor=4; pmgr_status=0; published=~0u;
  jiffies=100; apple_clpc_sample(&c); assert(published==0 && queued_idle);
  for (jiffies=104; jiffies<=116; jiffies+=4) {
@@ -276,10 +818,27 @@ static void check_t8140_dense(void) {
  assert(c.last_reason==16);
 }
 
+// Low power samples on time only when a package power target (low_power_mw)
+// is active; a static ceiling alone or High Power-only profile stays
+// deferrable when idle.
+static void check_low_power(void) {
+ struct apple_clpc_gpu gpu={0};
+ struct apple_clpc_hw lp=apple_clpc_hw_t6040;
+ struct apple_clpc c={.hw=&lp,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu,.low_power=true};
+ read_error=vote_error=0; pmgr_status=0xf0; published=~0u;
+ jiffies=3000; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ c.low_power_khz=2808000;
+ jiffies=3004; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+ c.low_power_mw=15000;
+ jiffies=3008; apple_clpc_sample(&c); assert(published==0 && !queued_idle);
+ c.low_power=false;
+ jiffies=3012; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
 int main(void) {
  // T6040's supplier is always powered: it must NEVER substitute for work.
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.has_pmc=true,.agent=1,.mask=3,.gpu=&gpu};
  assert(!c.hw->gpu_demand);
  jiffies=0; read_error=vote_error=0; pmgr_status=0xf0; published=~0u;
  apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
@@ -299,14 +858,23 @@ int main(void) {
  assert(published==0x12 && c.last_reason==1);
  c.clusters[0].request[0]=c.clusters[0].request[1]=0;
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
+ t6041_from_dt();
+ check_t6041_busy();
+ t6050_from_dt();
+ check_t6050_busy();
+ check_t6041_long_in_flight();
+ check_t6041_idle_burst();
  check_t8132();
- check_t6041();
+ check_t6041(&apple_clpc_hw_t6041);
+ check_t6041(&t6041_dt_hw);
  check_read_error();
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
+ check_t6050_ane();
+ check_low_power();
  check_t6040_ane();
- puts("PASS: T6040, T6041 and T8132 host demand; T8140/T604x ANE, streaming, dense work, read errors and PMP backoff; idle release");
+ puts("PASS: T6040, T6041 and T8132 host demand; DT GPU busy share and down-step hold; T8140/T604x ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
     code = code.replace('#define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)', rail_shift)
@@ -331,7 +899,22 @@ int main(void) {
             ('omit-pmp-backoff', code.replace('bool released = apple_clpc_gpu_limited(clpc, now);',
                                               'bool released = (apple_clpc_gpu_limited(clpc, now), false);')),
             ('release-too-early', code.replace('msecs_to_jiffies(APPLE_CLPC_HOLD_MS)', '0')),
+            ('gpu-down-at-once', code.replace('msecs_to_jiffies(APPLE_CLPC_GPU_DOWN_MS)', '0')),
+            ('gpu-busy-ignored', code.replace('if (!gpu->busy_valid || gpu->busy >= hw->gpu_busy_top)',
+                                              'if (true || gpu->busy >= hw->gpu_busy_top)')),
+            ('gpu-no-share-uses-table', code.replace('if (!gpu->busy_valid || gpu->busy >= hw->gpu_busy_top)',
+                                                     'if (gpu->busy >= hw->gpu_busy_top)')),
+            ('gpu-busy-without-dt', code.replace('bool has_busy = hw->gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1];',
+                                                 'bool has_busy = true;')),
             ('retain-at-idle', code.replace('vote->state = 0;', '')),
+            ('dt-state-unchecked', code.replace('if (state > top || state > 15)', 'if ((void)top, false)')),
+            ('dt-rail-bound-unchecked', code.replace('if (state > top || state > 15)', 'if ((void)top, state > 15)')),
+            ('dt-gpu-rail-max-ignored', code.replace('max(hw->map[rail][APPLE_CLPC_LEVELS - 1],\n\t\t\t      hw->gpu[rail])',
+                                                     'hw->map[rail][APPLE_CLPC_LEVELS - 1]')),
+            ('dt-fallback-keeps-partial', code.replace('\t\t*out = *soc;\n\t\treturn false;', '\t\treturn false;')),
+            ('dt-fallback-silent', code.replace('dev_warn(dev,\n\t\t\t "ignoring invalid GPU busy-share states in the device tree (%d)\\n",\n\t\t\t err);',
+                                                '(void)dev; (void)err;')),
+            ('dt-busy-unordered', code.replace('cells[0] > cells[1] || ', '')),
         ]:
             # A mutation that no longer matches the driver tests nothing.
             assert name == 'fixed' or text != code, 'stale mutation: ' + name
