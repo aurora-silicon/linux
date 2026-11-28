@@ -144,9 +144,9 @@
 	 * The clusters' controllers (t6050-dieX.dtsi) assert apple,firmware-managed-thermal, which the
 	 * T6050 profile requires: the firmware keeps the voltage and PLL control. It does not lower a
 	 * cluster's requested state on its own: on J714s, under a sustained all-core load, the PMP's
-	 * fast-die effort reaches its maximum while the clusters stay at their top state, so boards
-	 * whose PMP runs give each cluster apple,fast-die-effort (t6050-j714s.dts). Other boards are
-	 * not qualified yet.
+	 * fast-die effort reaches its maximum while the clusters stay at their top state (also seen
+	 * on K116s), so each cluster gets apple,fast-die-effort (t6050-peripherals.dtsi), which
+	 * applies on every board that runs the PMP.
 	 */
 	mcluster_opp: opp-table-mcluster {
 		compatible = "operating-points-v2";

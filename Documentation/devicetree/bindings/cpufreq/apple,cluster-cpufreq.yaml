@@ -60,7 +60,9 @@ properties:
     description: |
       PMP report region and cluster effort lane. Increasing firmware effort
       imposes a maximum-frequency QoS constraint alongside thermal cooling.
-      If the PMP is unavailable, cpufreq retains its fallback ceiling.
+      If the PMP is unavailable, cpufreq retains its fallback ceiling. A
+      disabled report node means the board does not run the PMP; where the
+      limit is optional for the SoC, no limit applies then.
     items:
       - items:
           - description: PMP report region
