@@ -646,11 +646,10 @@ static unsigned int apple_clpc_cpu_state(const struct apple_clpc *clpc,
 	return clpc->hw->map[rail][q];
 }
 
-static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
-				      struct apple_clpc_cluster *cl)
+static void apple_clpc_sample_busy(struct apple_clpc *clpc,
+				   struct apple_clpc_cluster *cl)
 {
-	struct cpufreq_policy *policy;
-	unsigned int cpu, busy = 0, q, rail;
+	unsigned int cpu, busy = 0;
 
 	for_each_cpu(cpu, cl->cpus) {
 		u64 wall, idle, dw, di;
@@ -677,6 +676,16 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 				     div64_u64((dw - di) * 100, dw));
 	}
 	cl->busy = busy;
+}
+
+static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+				      struct apple_clpc_cluster *cl)
+{
+	struct cpufreq_policy *policy;
+	unsigned int busy, q, rail;
+
+	apple_clpc_sample_busy(clpc, cl);
+	busy = cl->busy;
 
 	cl->level = 0;
 	policy = cpufreq_cpu_get(cl->policy_cpu);
@@ -1163,18 +1172,58 @@ static bool apple_clpc_steps_first(unsigned int a_khz, unsigned int a_max,
 }
 
 /*
+ * Pick which cluster takes @step (-1 down, +1 up) for the low-power package
+ * power loop, and return its next frequency in @out_khz. Stepping down skips
+ * clusters below APPLE_CLPC_BUSY_PCT so a GPU or display load holding PHPC
+ * above @low_power_mw does not walk idle CPUs down to their minimum OPP;
+ * stepping back up restores every capped cluster once PHPC drops.
+ */
+static int apple_clpc_pick_profile_step(struct apple_clpc *clpc,
+					struct cpufreq_policy *const *policy,
+					int step, unsigned int *out_khz)
+{
+	unsigned int i, khz, pick_khz = 0;
+	int pick = -1;
+
+	if (!step)
+		return -1;
+	for (i = 0; i < clpc->nr_clusters; i++) {
+		struct apple_clpc_cluster *cl = &clpc->clusters[i];
+
+		if (!policy[i])
+			continue;
+		if (step < 0 && cl->busy < APPLE_CLPC_BUSY_PCT)
+			continue;
+		khz = apple_clpc_step_khz(policy[i], cl->max_khz, step > 0);
+		if (khz == cl->max_khz || khz > cl->top_khz)
+			continue;
+		if (pick < 0 ||
+		    apple_clpc_steps_first(cl->max_khz, policy[i]->cpuinfo.max_freq,
+					   clpc->clusters[pick].max_khz,
+					   policy[pick]->cpuinfo.max_freq, step > 0)) {
+			pick = i;
+			pick_khz = khz;
+		}
+	}
+	if (pick >= 0)
+		*out_khz = pick_khz;
+	return pick;
+}
+
+/*
  * The platform profile's ceilings. In the low-power profile every cluster
  * stays at or below apple_clpc_low_power_top_khz(). When @low_power_mw is set,
- * each new package power reading above it takes one table step off one
- * cluster, and each one below 90% of it puts one back, in the order of
- * apple_clpc_steps_first(). Elsewhere there is no ceiling.
+ * each new package power reading above it takes one table step off one busy
+ * cluster (busy >= APPLE_CLPC_BUSY_PCT), and each one below 90% of it puts one
+ * back on any capped cluster, in the order of apple_clpc_steps_first().
+ * Elsewhere there is no ceiling.
  */
 static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 {
 	bool low = READ_ONCE(clpc->low_power);
 	struct cpufreq_policy *policy[APPLE_CLPC_MAX_CLUSTERS] = {};
-	unsigned int i, khz, pick_khz = 0;
-	int mw, step = 0, pick = -1;
+	unsigned int i, pick_khz = 0;
+	int mw, step = 0, pick;
 
 	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
 		return;
@@ -1195,6 +1244,8 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 	for (i = 0; i < clpc->nr_clusters; i++) {
 		struct apple_clpc_cluster *cl = &clpc->clusters[i];
 
+		if (!clpc->has_pmc && low && clpc->low_power_mw)
+			apple_clpc_sample_busy(clpc, cl);
 		policy[i] = cpufreq_cpu_get(cl->policy_cpu);
 		if (!policy[i])
 			continue;
@@ -1209,19 +1260,8 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 		else if (!cl->max_khz || !clpc->low_power_mw ||
 			 cl->max_khz > cl->top_khz)
 			cl->max_khz = cl->top_khz;
-		if (!step)
-			continue;
-		khz = apple_clpc_step_khz(policy[i], cl->max_khz, step > 0);
-		if (khz == cl->max_khz || khz > cl->top_khz)
-			continue;
-		if (pick < 0 ||
-		    apple_clpc_steps_first(cl->max_khz, policy[i]->cpuinfo.max_freq,
-					   clpc->clusters[pick].max_khz,
-					   policy[pick]->cpuinfo.max_freq, step > 0)) {
-			pick = i;
-			pick_khz = khz;
-		}
 	}
+	pick = apple_clpc_pick_profile_step(clpc, policy, step, &pick_khz);
 	if (pick >= 0)
 		clpc->clusters[pick].max_khz = pick_khz;
 	for (i = 0; i < clpc->nr_clusters; i++) {
@@ -3063,11 +3103,68 @@ static void apple_clpc_floor_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0xf00u);
 }
 
+static void apple_clpc_profile_step_busy_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct cpufreq_policy *slow = apple_clpc_test_policy(test);
+	struct cpufreq_policy *fast = apple_clpc_test_policy(test);
+	struct cpufreq_policy *policies[APPLE_CLPC_MAX_CLUSTERS] = { slow, fast };
+	unsigned int next_khz = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	slow->cpuinfo.max_freq = 1500000;
+	fast->cpuinfo.max_freq = 2000000;
+	clpc->nr_clusters = 2;
+	clpc->clusters[0].top_khz = 1500000;
+	clpc->clusters[0].max_khz = 1500000;
+	clpc->clusters[1].top_khz = 2000000;
+	clpc->clusters[1].max_khz = 2000000;
+
+	/*
+	 * GPU/display holding PHPC above low_power_mw while all CPU clusters
+	 * are below APPLE_CLPC_BUSY_PCT must not step any cluster down.
+	 */
+	clpc->clusters[0].busy = 10;
+	clpc->clusters[1].busy = APPLE_CLPC_BUSY_PCT - 1;
+	KUNIT_EXPECT_EQ(test, apple_clpc_pick_profile_step(clpc, policies, -1, &next_khz), -1);
+
+	/*
+	 * Only the busy cluster is eligible to step down, even when an idle
+	 * cluster sits at a higher ceiling.
+	 */
+	clpc->clusters[0].busy = APPLE_CLPC_BUSY_PCT;
+	clpc->clusters[1].busy = 20;
+	KUNIT_EXPECT_EQ(test, apple_clpc_pick_profile_step(clpc, policies, -1, &next_khz), 0);
+	KUNIT_EXPECT_EQ(test, next_khz, 1200000u);
+
+	/* When both clusters are busy, apple_clpc_steps_first() ordering applies. */
+	clpc->clusters[0].busy = 80;
+	clpc->clusters[1].busy = 60;
+	KUNIT_EXPECT_EQ(test, apple_clpc_pick_profile_step(clpc, policies, -1, &next_khz), 1);
+	KUNIT_EXPECT_EQ(test, next_khz, 1500000u);
+
+	/*
+	 * Stepping back up when PHPC falls below 90% restores idle clusters too,
+	 * lowest ceiling first (slower cluster on a tie).
+	 */
+	clpc->clusters[0].busy = 0;
+	clpc->clusters[1].busy = 0;
+	clpc->clusters[0].max_khz = 1200000;
+	clpc->clusters[1].max_khz = 1200000;
+	KUNIT_EXPECT_EQ(test, apple_clpc_pick_profile_step(clpc, policies, 1, &next_khz), 0);
+	KUNIT_EXPECT_EQ(test, next_khz, 1500000u);
+
+	/* Zero step does nothing regardless of busy state. */
+	clpc->clusters[0].busy = 100;
+	KUNIT_EXPECT_EQ(test, apple_clpc_pick_profile_step(clpc, policies, 0, &next_khz), -1);
+}
+
 static struct kunit_case apple_clpc_policy_cases[] = {
 	KUNIT_CASE(apple_clpc_step_khz_test),
 	KUNIT_CASE(apple_clpc_steps_first_test),
 	KUNIT_CASE(apple_clpc_vote_test),
 	KUNIT_CASE(apple_clpc_floor_test),
+	KUNIT_CASE(apple_clpc_profile_step_busy_test),
 	{}
 };
 static struct kunit_suite apple_clpc_policy_suite = {
