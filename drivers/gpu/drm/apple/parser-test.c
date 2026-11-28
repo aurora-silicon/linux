@@ -1751,45 +1751,6 @@ static void parser_panel_identity_stable(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, id->metadata.serial, 2U);
 }
 
-/* Firmware 27 panel attributes name no serial; the ADT's serial is kept. */
-static void parser_panel_identity_adt_serial(struct kunit *test)
-{
-	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
-	struct dcp_panel_identity *id = kunit_kzalloc(test, sizeof(*id), GFP_KERNEL);
-	struct dcp_display_metadata fw = { .manufacturer = "APP", .name = "Apple Panel" };
-
-	KUNIT_ASSERT_NOT_NULL(test, dcp);
-	KUNIT_ASSERT_NOT_NULL(test, id);
-	dcp->panel_identity = id;
-	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
-	dcp->panel.width_mm = 302;
-	spin_lock_init(&dcp->metadata.lock);
-	id->adt = (struct dcp_display_metadata) {
-		.manufacturer = "APP", .name = "Apple Panel", .serial = 0x1234abcd,
-	};
-	dcp_panel_metadata_replace(dcp, &fw);
-	KUNIT_EXPECT_EQ(test, id->metadata.serial, 0x1234abcdU);
-
-	/* A serial the firmware reports wins over the ADT's. */
-	fw.serial = 7;
-	dcp_panel_metadata_replace(dcp, &fw);
-	KUNIT_EXPECT_EQ(test, id->metadata.serial, 7U);
-
-	/* Another product is another panel: no ADT serial. */
-	memset(id, 0, sizeof(*id));
-	id->adt = (struct dcp_display_metadata) { .manufacturer = "APP", .serial = 9 };
-	fw = (struct dcp_display_metadata) { .manufacturer = "APP", .product = 0x616 };
-	dcp_panel_metadata_replace(dcp, &fw);
-	KUNIT_EXPECT_EQ(test, id->metadata.serial, 0U);
-
-	/* A firmware text serial is kept as it is. */
-	memset(id, 0, sizeof(*id));
-	id->adt = (struct dcp_display_metadata) { .manufacturer = "APP", .serial = 9 };
-	fw = (struct dcp_display_metadata) { .manufacturer = "APP", .serial_text = "C02X" };
-	dcp_panel_metadata_replace(dcp, &fw);
-	KUNIT_EXPECT_EQ(test, id->metadata.serial, 0U);
-}
-
 static void parser_identity_emit(void *data, const char *key, u32 len,
 				 u32 type, u32 size, u32 depth)
 {
@@ -2415,7 +2376,6 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_adt_bounds),
 	KUNIT_CASE(parser_identity_bounds),
 	KUNIT_CASE(parser_panel_identity_stable),
-	KUNIT_CASE(parser_panel_identity_adt_serial),
 	KUNIT_CASE(parser_panel_identity),
 	KUNIT_CASE(parser_panel_color_target),
 	KUNIT_CASE(parser_panel_adt_color_target),

@@ -1545,14 +1545,6 @@ void dcp_panel_metadata_replace(struct apple_dcp *dcp,
 		if (!merged.week)
 			merged.week = old->week;
 	}
-	/*
-	 * Firmware 27 panel ProductAttributes carry no serial number; the ADT's
-	 * panel serial still names this panel, so keep it rather than none.
-	 */
-	if (!merged.serial && !merged.serial_text[0] && id->adt.serial &&
-	    !memcmp(merged.manufacturer, id->adt.manufacturer, 4) &&
-	    merged.product == id->adt.product)
-		merged.serial = id->adt.serial;
 	if (!id->metadata_valid || memcmp(&id->metadata, &merged, sizeof(merged))) {
 		id->metadata = merged;
 		id->metadata_valid = true;
