@@ -3,7 +3,7 @@
 //! T8122 (M3, G15G) board-default startup and bounded experiment values.
 //!
 //! The T8122 table (`m3_soc::T8122`) is complete. An omitted start parameter starts
-//! automatically only on its listed Air boards; explicit `asahi.t8122_start=0`
+//! automatically only where the boot loader handed the GPU over; explicit `asahi.t8122_start=0`
 //! remains the recovery opt-out. Resource and known-firmware admission still run.
 //! The same table values can be changed for a controlled experiment by
 //! rebooting with a parameter:
@@ -237,16 +237,16 @@ pub(crate) fn mmio_prot(read_only: u32, slot: usize) -> Prot {
 
 /// Decide, after resource admission, whether `soc` starts with the experiment values.
 ///
-/// Any SoC but T8122: Ok(None). On its listed Air boards, an omitted parameter
-/// selects the table values; explicit 0 disables startup, and invalid values fail
-/// closed. Existing backend admission still refuses an unlisted board, even
-/// with an explicit start request.
+/// Any SoC but T8122: Ok(None). Where the boot loader handed the GPU over, an
+/// omitted parameter selects the table values; explicit 0 disables startup, and
+/// invalid values fail closed. Backend admission still refuses a GPU that was not
+/// handed over, even with an explicit start request.
 pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>> {
     if !is_t8122(soc) {
         return Ok(None);
     }
     let raw = crate::m3::m3_params::t8122_params();
-    match knobs::start_for_board(&raw, crate::m3::m3_board::runtime_validated_board(soc)) {
+    match knobs::start_for_board(&raw, crate::m3::m3_board::handed_over(dev)) {
         Start::On => {}
         Start::Off => {
             if raw.values_given() {
@@ -301,8 +301,8 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
         e.mapping_count(),
         storage::IOMAP_BASE
     );
-    // J613/J615 have no SoC die temperature zone yet, so a cap above the no-feedback limit runs
-    // the fanless GPU without any temperature feedback (`m3_thermal` holds the cap but gets no
+    // J615 and J504 have no SoC die temperature zone yet, so a cap above the no-feedback limit
+    // runs the GPU without any temperature feedback (`m3_thermal` holds the cap but gets no
     // reading). The runtime cap and the firmware ceiling stay equal, because the cap is at most
     // the no-feedback limit.
     if v.pstate_cap > knobs::PSTATE_CAP {
@@ -352,11 +352,11 @@ pub(crate) fn refused(dev: &device::Device, experiment: Option<&Experiment>, sta
     }
 }
 
-/// Log that resource admission refused a T8122 start selected by board default or flag.
+/// Log that resource admission refused a T8122 start selected by the handoff default or flag.
 pub(crate) fn not_admitted(dev: &device::Device, soc: &Soc) {
     if is_t8122(soc) && knobs::start_for_board(
         &crate::m3::m3_params::t8122_params(),
-        crate::m3::m3_board::runtime_validated_board(soc),
+        crate::m3::m3_board::handed_over(dev),
     ) == Start::On {
         dev_err!(
             dev,

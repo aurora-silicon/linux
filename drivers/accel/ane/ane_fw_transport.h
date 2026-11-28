@@ -145,6 +145,12 @@ struct ane_fw_transport {
 	u8 table[ANE_FW_TABLE_SIZE];
 	size_t table_offset;
 	size_t pool_used;
+	/*
+	 * The arena range a caller places commands into itself
+	 * (ane_fw_transport_reserve()); zero-sized until it is taken.
+	 */
+	size_t placed;
+	size_t placed_size;
 	size_t shared_bytes;
 	u32 shared_count;
 	u64 terminal_messages;
@@ -371,13 +377,20 @@ ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
  */
 static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
 {
-	return t->soc->chip_family == 16 || t->soc->chip_family == 17;
+	return t->soc->chip_family >= 15;
 }
 
-/* Commands are copied into a monotonic pool arena, never external DMA memory. */
+/* ane_fw_transport_publish_at() offset that copies to the end of the arena. */
+#define ANE_FW_ARENA SIZE_MAX
+
+/*
+ * Commands are copied into the pool, never external DMA memory: by default
+ * (ANE_FW_ARENA) to the end of a monotonic arena, else to offset at of the
+ * caller's placed range (ane_fw_transport_reserve()).
+ */
 static inline int
 __ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
-			   const void *command, size_t size, u64 deadline_ns)
+			   const void *command, size_t size, u64 deadline_ns, size_t at)
 {
 	struct ane_fw_transaction *tx;
 	size_t offset;
@@ -401,11 +414,19 @@ __ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		return ane_fw_transport_fail(t, -EPROTO);
 	if (!(header & 1))
 		return -EBUSY;
-	if (t->pool_used > SIZE_MAX - (ANE_FW_SLOT_SIZE - 1))
-		return -ENOSPC;
-	offset = ALIGN(t->pool_used, ANE_FW_SLOT_SIZE);
-	if (offset > t->pool.size || size > t->pool.size - offset)
-		return -ENOSPC;
+	if (at != ANE_FW_ARENA) {
+		if (!IS_ALIGNED(at, ANE_FW_SLOT_SIZE) || at < t->placed ||
+		    at - t->placed > t->placed_size ||
+		    size > t->placed_size - (at - t->placed))
+			return -EINVAL;
+		offset = at;
+	} else {
+		if (t->pool_used > SIZE_MAX - (ANE_FW_SLOT_SIZE - 1))
+			return -ENOSPC;
+		offset = ALIGN(t->pool_used, ANE_FW_SLOT_SIZE);
+		if (offset > t->pool.size || size > t->pool.size - offset)
+			return -ENOSPC;
+	}
 	memcpy((u8 *)t->pool.cpu + offset, command, size);
 	*tx = (struct ane_fw_transaction) {
 		.dva = t->pool.dva + offset,
@@ -414,7 +435,8 @@ __ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.id = get_unaligned_le16((const u8 *)command + 4),
 		.active = true,
 	};
-	t->pool_used = offset + size;
+	if (at == ANE_FW_ARENA)
+		t->pool_used = offset + size;
 	if (ane_fw_transport_switch_safe(t))
 		ane_fw_transport_bar_context(t, (u8 *)t->pool.cpu + offset, size);
 	t->ops->store64(t->ctx, p + 8, size);
@@ -428,15 +450,22 @@ __ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 
 /* IO and DATA_CHAIN; mode and ownership commands are refused. */
 static inline int
-ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
-			 const void *command, size_t size, u64 deadline_ns)
+ane_fw_transport_publish_at(struct ane_fw_transport *t, unsigned int ch,
+			    const void *command, size_t size, u64 deadline_ns, size_t at)
 {
 	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN)
 		return -EINVAL;
 	if (command && size >= 8 &&
 	    ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
 		return -EPERM;
-	return __ane_fw_transport_publish(t, ch, command, size, deadline_ns);
+	return __ane_fw_transport_publish(t, ch, command, size, deadline_ns, at);
+}
+
+static inline int
+ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
+			 const void *command, size_t size, u64 deadline_ns)
+{
+	return ane_fw_transport_publish_at(t, ch, command, size, deadline_ns, ANE_FW_ARENA);
 }
 
 /*
@@ -453,7 +482,7 @@ ane_fw_transport_publish_pmu_base(struct ane_fw_transport *t, u64 base, u64 dead
 	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
 	put_unaligned_le64(base, command + 8);
 	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
-					  deadline_ns);
+					  deadline_ns, ANE_FW_ARENA);
 }
 
 /*
@@ -469,7 +498,7 @@ ane_fw_transport_publish_mode_stop(struct ane_fw_transport *t, u64 deadline_ns)
 		return -ENODEV;
 	put_unaligned_le16(ANE_FW_CMD_EXCLAVE_MODE_STOP, command + 4);
 	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
-					  deadline_ns);
+					  deadline_ns, ANE_FW_ARENA);
 }
 
 /* Command arena position, for ane_fw_transport_release(). */
@@ -479,16 +508,43 @@ static inline size_t ane_fw_transport_mark(const struct ane_fw_transport *t)
 }
 
 /*
+ * Take size bytes at the end of the arena, once per firmware boot, for
+ * commands the caller places and reuses itself (ane_fw_transport_publish_at()).
+ * No ane_fw_transport_release() gives the range back; a new firmware boot
+ * (ane_fw_transport_init()) does.
+ */
+static inline int ane_fw_transport_reserve(struct ane_fw_transport *t, size_t size)
+{
+	size_t offset;
+
+	if (t->error)
+		return t->error;
+	if (t->placed_size || !size || !IS_ALIGNED(size, ANE_FW_SLOT_SIZE))
+		return -EINVAL;
+	if (t->pool_used > SIZE_MAX - (ANE_FW_SLOT_SIZE - 1))
+		return -ENOSPC;
+	offset = ALIGN(t->pool_used, ANE_FW_SLOT_SIZE);
+	if (offset > t->pool.size || size > t->pool.size - offset)
+		return -ENOSPC;
+	t->placed = offset;
+	t->placed_size = size;
+	t->pool_used = offset + size;
+	return 0;
+}
+
+/*
  * Give back the arena used by every command published since @mark. The caller
  * guarantees that the firmware is done with all of them, not only that they
  * were acknowledged: an EXECUTE is done once its completion report arrived.
- * Refused while any channel still has a command in flight.
+ * Refused while any channel still has a command in flight, and below the
+ * placed range.
  */
 static inline int ane_fw_transport_release(struct ane_fw_transport *t, size_t mark)
 {
 	unsigned int ch;
 
-	if (t->error || mark > t->pool_used || mark > t->pool.size)
+	if (t->error || mark > t->pool_used || mark > t->pool.size ||
+	    (t->placed_size && mark < t->placed + t->placed_size))
 		return -EINVAL;
 	for (ch = 0; ch < ANE_FW_CHANNELS; ch++)
 		if (t->pending[ch].active)
@@ -667,7 +723,9 @@ ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes
  * firmware frees it after UNLOAD (often only during a later program), but the
  * backing stays mapped until reset: without reuse the 12 MiB quota ran out at
  * the sixth program of a boot. Only memory the firmware itself gave back by
- * FREE is served again, and only for the same tag and size.
+ * FREE, or that the host reserved for the request
+ * (ane_fw_transport_shared_reserve()), is served again, and only for the
+ * same tag and size.
  */
 static inline unsigned int
 ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
@@ -681,11 +739,80 @@ ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
 	return t->shared_count;
 }
 
+/*
+ * A new shared allocation of size bytes under tag, within the host's caps
+ * (ANE_FW_SHARED_MAX entries, ANE_FW_SHARED_TOTAL bytes): its index, live.
+ */
+static inline int ane_fw_shared_add(struct ane_fw_transport *t, size_t size, u64 tag,
+				    unsigned int *index)
+{
+	struct ane_fw_surface s = {};
+	unsigned int i;
+	int ret;
+
+	if (t->shared_count == ANE_FW_SHARED_MAX || size > ANE_FW_SHARED_TOTAL -
+	    t->shared_bytes)
+		return -ENOSPC;
+	ret = t->ops->alloc(t->ctx, size, tag, &s);
+	if (ret)
+		return ret;
+	if (!ane_fw_surface_valid(&s) || !IS_ALIGNED(s.dva, SZ_16K) ||
+	    s.size != size || ane_fw_surfaces_overlap(&s, &t->ipc) ||
+	    ane_fw_surfaces_overlap(&s, &t->pool))
+		return -EPROTO;
+	for (i = 0; i < t->shared_count; i++)
+		if (ane_fw_surfaces_overlap(&s, &t->shared[i]))
+			return -EPROTO;
+	*index = t->shared_count;
+	t->shared_tags[t->shared_count] = tag;
+	t->shared_retired[t->shared_count] = false;
+	t->shared[t->shared_count++] = s;
+	t->shared_bytes += size;
+	return 0;
+}
+
+/*
+ * Make sure a later SHAREDMALLOC request of size bytes under tag is served
+ * from memory the host already has: a retired allocation of that tag and
+ * size, or a new one made now and kept retired for it. The firmware waits
+ * for the answer to every request, with its shared-memory lock held, and a
+ * request the host cannot serve is never answered: the command behind it
+ * stalls and only a power cycle recovers the engine. A request the host
+ * knows is coming is therefore taken before the command that causes it, so
+ * running out of memory or quota (-ENOMEM, -ENOSPC) refuses that command
+ * before the firmware sees it.
+ */
+static inline int ane_fw_transport_shared_reserve(struct ane_fw_transport *t, size_t size,
+						  u32 tag)
+{
+	unsigned int i;
+	int ret;
+
+	if (t->error)
+		return t->error;
+	if (!size || !IS_ALIGNED(size, SZ_16K))
+		return -EINVAL;
+	if (ane_fw_shared_reusable(t, size, tag) < t->shared_count)
+		return 0;
+	ret = ane_fw_shared_add(t, size, tag, &i);
+	/*
+	 * An invalid surface from the backend is a host error, as it is for a
+	 * request (ane_fw_transport_shared()): its mapping is not recorded, so
+	 * retrying would map another one at every LOAD.
+	 */
+	if (ret == -EPROTO)
+		return ane_fw_transport_fail(t, ret);
+	if (ret)
+		return ret;
+	t->shared_retired[i] = true;
+	ane_fw_shared_note(t, "reserve", i);
+	return 0;
+}
+
 static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending);
 
 static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 {
-	struct ane_fw_surface s = {};
 	u64 word0, word1, word2;
 	size_t size;
 	unsigned int i;
@@ -745,33 +872,13 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 		ane_fw_shared_note(t, "reuse", i);
 		return 0;
 	}
-	if (t->shared_count == ANE_FW_SHARED_MAX || size > ANE_FW_SHARED_TOTAL -
-	    t->shared_bytes) {
-		ret = -ENOSPC;
-		goto refused;
-	}
-	ret = t->ops->alloc(t->ctx, size, word2, &s);
+	ret = ane_fw_shared_add(t, size, word2, &i);
 	if (ret)
 		goto refused;
-	if (!ane_fw_surface_valid(&s) || !IS_ALIGNED(s.dva, SZ_16K) ||
-	    s.size != size || ane_fw_surfaces_overlap(&s, &t->ipc) ||
-	    ane_fw_surfaces_overlap(&s, &t->pool)) {
-		ret = -EPROTO;
-		goto refused;
-	}
-	for (i = 0; i < t->shared_count; i++) {
-		if (ane_fw_surfaces_overlap(&s, &t->shared[i])) {
-			ret = -EPROTO;
-			goto refused;
-		}
-	}
-	t->shared_tags[t->shared_count] = word2;
-	t->shared[t->shared_count++] = s;
-	t->shared_bytes += size;
 	t->ops->store64(t->ctx, p + 8, 0);
-	t->ops->store64(t->ctx, p + 16, t->shared_count);
+	t->ops->store64(t->ctx, p + 16, i + 1);
 	t->ops->write_barrier(t->ctx);
-	t->ops->store64(t->ctx, p, s.dva | 1);
+	t->ops->store64(t->ctx, p, t->shared[i].dva | 1);
 	t->ops->write_barrier(t->ctx);
 	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
 	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);

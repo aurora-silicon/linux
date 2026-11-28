@@ -120,6 +120,8 @@ static void typec_set_data_role(struct typec_port *p,enum typec_data_role r) { (
 static void dcp_typec_pipeline_freed(void) { event('F'); }
 static void power_supply_changed(void *p) { (void)p; }
 static void tipd_debugfs_unregister(struct tps6598x *t) { (void)t; }
+/* The replug port list and its work (tipd_port_replug()) are outside these fixtures. */
+static void tipd_port_list_del(struct tps6598x *t) { (void)t; }
 static void cancel_delayed_work_sync(void *w) { (void)w; }
 static void devm_free_irq(void *d,int i,void *t) { (void)d;(void)i;(void)t; }
 static void typec_mux_put(struct typec_mux *m) { (void)m; }
@@ -156,7 +158,7 @@ struct apple_atcphy {
  void *dev; int lock;
  const struct atcphy_hw *hw;
  struct { void *usb2phy; } regs;
- bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt;
+ bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt,t8132_device;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
