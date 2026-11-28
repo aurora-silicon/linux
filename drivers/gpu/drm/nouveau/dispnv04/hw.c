@@ -328,7 +328,10 @@ nouveau_hw_save_vga_fonts(struct drm_device *dev, bool save)
 	NV_INFO(drm, "%sing VGA fonts\n", save ? "Sav" : "Restor");
 
 	/* map first 64KiB of VRAM, holds VGA fonts etc */
-	iovram = ioremap(pci_resource_start(pdev, 1), 65536);
+	if (pci_resource_flags(pdev, 1) & IORESOURCE_MEM_NONPOSTED)
+		iovram = ioremap_np(pci_resource_start(pdev, 1), 65536);
+	else
+		iovram = ioremap(pci_resource_start(pdev, 1), 65536);
 	if (!iovram) {
 		NV_ERROR(drm, "Failed to map VRAM, "
 					"cannot save/restore VGA fonts.\n");

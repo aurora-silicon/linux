@@ -1598,6 +1598,16 @@ nvkm_device_pci_resource_size(struct nvkm_device *device, enum nvkm_bar_id bar)
 	return idx >= 0 ? pci_resource_len(pdev->pdev, idx) : 0;
 }
 
+static bool
+nvkm_device_pci_resource_nonposted(struct nvkm_device *device, enum nvkm_bar_id bar)
+{
+	struct nvkm_device_pci *pdev = nvkm_device_pci(device);
+	int idx = nvkm_device_pci_resource_idx(pdev, bar);
+
+	return idx >= 0 &&
+	       !!(pci_resource_flags(pdev->pdev, idx) & IORESOURCE_MEM_NONPOSTED);
+}
+
 static int
 nvkm_device_pci_irq(struct nvkm_device *device)
 {
@@ -1645,6 +1655,7 @@ nvkm_device_pci_func = {
 	.irq = nvkm_device_pci_irq,
 	.resource_addr = nvkm_device_pci_resource_addr,
 	.resource_size = nvkm_device_pci_resource_size,
+	.resource_nonposted = nvkm_device_pci_resource_nonposted,
 	.cpu_coherent = !IS_ENABLED(CONFIG_ARM),
 };
 

@@ -4,6 +4,7 @@
 #include <core/oclass.h>
 #include <core/suspend_state.h>
 #include <core/intr.h>
+#include <linux/dma-map-ops.h>
 enum nvkm_subdev_type;
 
 enum nvkm_device_type {
@@ -98,8 +99,52 @@ struct nvkm_device_func {
 	int (*irq)(struct nvkm_device *);
 	resource_size_t (*resource_addr)(struct nvkm_device *, enum nvkm_bar_id);
 	resource_size_t (*resource_size)(struct nvkm_device *, enum nvkm_bar_id);
+	bool (*resource_nonposted)(struct nvkm_device *device, enum nvkm_bar_id bar);
 	bool cpu_coherent;
 };
+
+static inline bool
+nvkm_device_bar_nonposted(struct nvkm_device *device, enum nvkm_bar_id bar)
+{
+	return device->func->resource_nonposted &&
+	       device->func->resource_nonposted(device, bar);
+}
+
+static inline bool
+nvkm_device_addr_nonposted(struct nvkm_device *device, u64 addr, u64 size)
+{
+	static const enum nvkm_bar_id bars[] = {
+		NVKM_BAR0_PRI,
+		NVKM_BAR1_FB,
+		NVKM_BAR2_INST,
+	};
+	size_t i;
+
+	if (!device->func->resource_nonposted)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(bars); i++) {
+		resource_size_t start, len;
+
+		if (!device->func->resource_nonposted(device, bars[i]))
+			continue;
+		start = device->func->resource_addr(device, bars[i]);
+		len = device->func->resource_size(device, bars[i]);
+		if (len && addr >= start && addr - start < len &&
+		    size <= len - (addr - start))
+			return true;
+	}
+
+	return false;
+}
+
+static inline bool
+nvkm_device_is_cpu_coherent(struct nvkm_device *device)
+{
+	if (!device->func->cpu_coherent)
+		return false;
+	return !device->dev || dev_is_dma_coherent(device->dev);
+}
 
 struct nvkm_device_quirk {
 	u8 tv_pin_mask;

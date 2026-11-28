@@ -42,6 +42,7 @@ struct nvif_push {
 	u32 *cur;
 	u32 *seg;
 	u32 *end;
+	bool is_iomem;
 };
 
 static inline __must_check int
@@ -95,7 +96,10 @@ PUSH_KICK(struct nvif_push *push)
 	PUSH_ASSERT(_p->cur < _p->seg, "segment overrun"); \
 	PUSH_ASSERT(_p->cur < _p->end, "pushbuf overrun"); \
 	PUSH_PRINTF(_p, "%08x"f, _d, ##a);                 \
-	*_p->cur++ = _d;                                   \
+	if (_p->is_iomem)                                  \
+		iowrite32_native(_d, (void __force __iomem *)_p->cur++); \
+	else                                               \
+		*_p->cur++ = _d;                           \
 } while(0)
 
 #define PUSH_DATA_(X,p,m,i0,i1,d,s,f,a...) PUSH_DATA__((p), (d), "-> "#m f, ##a)
@@ -128,7 +132,10 @@ PUSH_KICK(struct nvif_push *push)
 	u32 _s = (s);                                            \
 	PUSH_ASSERT(_p->cur + _s <= _p->seg, "segment overrun"); \
 	PUSH_ASSERT(_p->cur + _s <= _p->end, "pushbuf overrun"); \
-	memcpy(_p->cur, (d), _s << 2);                           \
+	if (_p->is_iomem)                                        \
+		memcpy_toio((void __force __iomem *)_p->cur, (d), _s << 2); \
+	else                                                     \
+		memcpy(_p->cur, (d), _s << 2);                   \
 	_p->cur += _s;                                           \
 } while(0)
 #endif

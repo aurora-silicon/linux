@@ -246,8 +246,12 @@ nv40_instmem_new(struct nvkm_device *device, enum nvkm_subdev_type type, int ins
 	*pimem = &imem->base;
 
 	/* map bar */
-	imem->iomem = ioremap_wc(device->func->resource_addr(device, NVKM_BAR2_INST),
-				 device->func->resource_size(device, NVKM_BAR2_INST));
+	if (nvkm_device_bar_nonposted(device, NVKM_BAR2_INST))
+		imem->iomem = ioremap_np(device->func->resource_addr(device, NVKM_BAR2_INST),
+					 device->func->resource_size(device, NVKM_BAR2_INST));
+	else
+		imem->iomem = ioremap_wc(device->func->resource_addr(device, NVKM_BAR2_INST),
+					 device->func->resource_size(device, NVKM_BAR2_INST));
 	if (!imem->iomem) {
 		nvkm_error(&imem->base.subdev, "unable to map PRAMIN BAR\n");
 		return -EFAULT;

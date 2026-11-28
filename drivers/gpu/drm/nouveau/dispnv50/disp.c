@@ -261,6 +261,7 @@ nv50_dmac_create(struct nouveau_drm *drm,
 	dmac->push.bgn = dmac->push.mem.object.map.ptr;
 	dmac->push.cur = dmac->push.bgn;
 	dmac->push.end = dmac->push.bgn;
+	dmac->push.is_iomem = !!(dmac->push.mem.type & NVIF_MEM_VRAM);
 	dmac->max = 0x1000/4 - 1;
 
 	/* EVO channels are affected by a HW bug where the last 12 DWORDs

@@ -106,8 +106,13 @@ platform_init(struct nvkm_bios *bios, const char *name)
 
 	if ((priv = kmalloc_obj(*priv))) {
 		priv->size = pdev->romlen;
-		if (ret = -ENODEV,
-		    (priv->rom = ioremap(pdev->rom, pdev->romlen)))
+		ret = -ENODEV;
+		if (pci_resource_flags(pdev, PCI_ROM_RESOURCE) &
+		    IORESOURCE_MEM_NONPOSTED)
+			priv->rom = ioremap_np(pdev->rom, pdev->romlen);
+		else
+			priv->rom = ioremap(pdev->rom, pdev->romlen);
+		if (priv->rom)
 			return priv;
 		kfree(priv);
 	}

@@ -37,6 +37,7 @@ struct nv50_instmem {
 	u64 addr;
 
 	struct io_mapping iomap;
+	void __iomem *iomap_np;
 
 	/* Mappings that can be evicted when BAR2 space has been exhausted. */
 	struct list_head lru;
@@ -158,7 +159,8 @@ nv50_instobj_kmap(struct nv50_instobj *iobj, struct nvkm_vmm *vmm)
 		mutex_unlock(&imem->base.mutex);
 		if (!eobj)
 			break;
-		io_mapping_unmap(emap);
+		if (!imem->iomap_np)
+			io_mapping_unmap(emap);
 		nvkm_vmm_put(vmm, &ebar);
 	}
 
@@ -175,7 +177,12 @@ nv50_instobj_kmap(struct nv50_instobj *iobj, struct nvkm_vmm *vmm)
 
 	/* Make the mapping visible to the host. */
 	iobj->bar = bar;
-	iobj->map = io_mapping_map_wc(&imem->iomap, (u32)iobj->bar->addr, size);
+	if (imem->iomap_np)
+		iobj->map = (void __force *)((u8 __iomem *)imem->iomap_np +
+					     (u32)iobj->bar->addr);
+	else
+		iobj->map = io_mapping_map_wc(&imem->iomap,
+					      (u32)iobj->bar->addr, size);
 	if (!iobj->map) {
 		nvkm_warn(subdev, "PRAMIN ioremap failed\n");
 		nvkm_vmm_put(vmm, &iobj->bar);
@@ -195,8 +202,14 @@ check_io_mapping(struct nv50_instmem *imem)
 {
 	struct nvkm_device *device = imem->base.subdev.device;
 
-	if (imem->iomap.size)
+	if (imem->iomap_np || imem->iomap.size)
 		return true;
+
+	if (nvkm_device_bar_nonposted(device, NVKM_BAR2_INST)) {
+		imem->iomap_np = ioremap_np(device->func->resource_addr(device, NVKM_BAR2_INST),
+					    device->func->resource_size(device, NVKM_BAR2_INST));
+		return imem->iomap_np != NULL;
+	}
 
 	return io_mapping_init_wc(&imem->iomap,
 				  device->func->resource_addr(device, NVKM_BAR2_INST),
@@ -350,7 +363,9 @@ nv50_instobj_dtor(struct nvkm_memory *memory)
 
 	if (map) {
 		struct nvkm_vmm *vmm = nvkm_bar_bar2_vmm(imem->subdev.device);
-		io_mapping_unmap(map);
+
+		if (!iobj->imem->iomap_np)
+			io_mapping_unmap(map);
 		if (likely(vmm)) /* Can be NULL during BAR destructor. */
 			nvkm_vmm_put(vmm, &bar);
 	}
@@ -431,7 +446,9 @@ nv50_instmem_dtor(struct nvkm_instmem *base)
 {
 	struct nv50_instmem *imem = nv50_instmem(base);
 
-	if (imem->iomap.size)
+	if (imem->iomap_np)
+		iounmap(imem->iomap_np);
+	else if (imem->iomap.size)
 		io_mapping_fini(&imem->iomap);
 	return imem;
 }

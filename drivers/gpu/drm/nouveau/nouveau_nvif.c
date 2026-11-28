@@ -45,6 +45,14 @@ nvkm_client_unmap(void *priv, void __iomem *ptr, u32 size)
 static void __iomem *
 nvkm_client_map(void *priv, u64 handle, u32 size)
 {
+	struct nvif_client *client = priv;
+	struct nvkm_client *kclient = client ? client->object.priv : NULL;
+	struct nvkm_device *device =
+		kclient ? nvkm_device_find(kclient->device) : NULL;
+
+	if (device && nvkm_device_addr_nonposted(device, handle, size))
+		return ioremap_np(handle, size);
+
 	return ioremap(handle, size);
 }
 

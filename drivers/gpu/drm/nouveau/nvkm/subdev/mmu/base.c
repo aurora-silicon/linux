@@ -304,7 +304,7 @@ nvkm_mmu_host(struct nvkm_mmu *mmu)
 	 * done through BAR1.
 	 */
 	type |= NVKM_MEM_COHERENT;
-	if (device->func->cpu_coherent)
+	if (nvkm_device_is_cpu_coherent(device))
 		nvkm_mmu_type(mmu, heap, type & ~NVKM_MEM_KIND);
 
 	/* Uncached system memory. */

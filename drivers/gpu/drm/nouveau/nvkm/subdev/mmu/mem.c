@@ -133,8 +133,12 @@ int
 nvkm_mem_map_host(struct nvkm_memory *memory, void **pmap)
 {
 	struct nvkm_mem *mem = nvkm_mem(memory);
+
 	if (mem->mem) {
-		*pmap = vmap(mem->mem, mem->pages, VM_MAP, PAGE_KERNEL);
+		pgprot_t prot = mem->target == NVKM_MEM_TARGET_NCOH ?
+			pgprot_writecombine(PAGE_KERNEL) : PAGE_KERNEL;
+
+		*pmap = vmap(mem->mem, mem->pages, VM_MAP, prot);
 		return *pmap ? 0 : -EFAULT;
 	}
 	return -EINVAL;

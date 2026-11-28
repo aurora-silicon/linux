@@ -283,8 +283,12 @@ nouveau_gem_new(struct nouveau_cli *cli, u64 size, int align, uint32_t domain,
 	 */
 	nvbo->valid_domains = NOUVEAU_GEM_DOMAIN_VRAM |
 			      NOUVEAU_GEM_DOMAIN_GART;
-	if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA)
+	if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA) {
 		nvbo->valid_domains &= domain;
+		if ((domain & NOUVEAU_GEM_DOMAIN_VRAM) &&
+		    nvkm_device_bar_nonposted(nvxx_device(drm), NVKM_BAR1_FB))
+			nvbo->valid_domains |= NOUVEAU_GEM_DOMAIN_GART;
+	}
 
 	if (nvbo->no_share) {
 		nvbo->r_obj = drm_gpuvm_resv_obj(&uvmm->base);
