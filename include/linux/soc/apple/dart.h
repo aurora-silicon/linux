@@ -2,13 +2,29 @@
 #ifndef __LINUX_SOC_APPLE_DART_H__
 #define __LINUX_SOC_APPLE_DART_H__
 
+#include <linux/bits.h>
 #include <linux/kconfig.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
 struct device_node;
+
+/*
+ * Whether apple-dart keeps the firmware's root slots of a DART of @np's kind
+ * that the boot loader leaves locked (fw_mirror). Only then can a coprocessor
+ * the boot loader leaves running behind such a DART be adopted: on the plain
+ * locked path its firmware loses the mappings it runs on.
+ */
+static inline bool apple_dart_keeps_locked_roots(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6041-dart") ||
+	       of_device_is_compatible(np, "apple,t6050-dart") ||
+	       of_device_is_compatible(np, "apple,t8140-dart") ||
+	       of_device_is_compatible(np, "apple,t8142-dart");
+}
 
 /* Retained internal-display ownership is qualified only with a built-in
  * DART provider. Other consumers, including modular DART, keep the APIs below.
@@ -180,6 +196,24 @@ static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUP
 static inline int apple_dart_host_restart(struct device *dev) { return -EOPNOTSUPP; }
 #endif
 
+/*
+ * The physical range behind a buffer a co-processor's firmware names, for a CPU mapping:
+ * contiguous over every IOMMU page it touches, in DRAM outside System RAM. The flags
+ * choose what resolves a DVA: Linux's own mappings, those the firmware kept, or both.
+ */
+#define APPLE_DART_FW_LINUX	BIT(0)
+#define APPLE_DART_FW_RETAINED	BIT(1)
+#if IS_REACHABLE(CONFIG_APPLE_DART)
+int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_t size,
+			unsigned int flags, phys_addr_t *phys);
+#else
+static inline int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_t size,
+				      unsigned int flags, phys_addr_t *phys)
+{
+	return -ENODEV;
+}
+#endif
+
 /* For a consumer whose firmware gates itself around a firmware-driven suspend. */
 #if IS_REACHABLE(CONFIG_APPLE_DART)
 bool apple_dart_sleep_listed(struct device *dev);
@@ -187,12 +221,20 @@ int apple_dart_sleep_prepare(struct device *dev);
 void apple_dart_sleep_restore(struct device *dev);
 /* A display DART's streams around a display power cycle, see the DART driver. */
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush);
+/* The streams 0 to 31 a display DART has enabled; 0 if any stream above 31 is on. */
+u32 apple_dart_enabled_streams(struct device *dev);
+/* A locked display DART's TCR and TTBR words kept across a real sleep (T6041). */
+int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
 /* A GAPF slice released before its coprocessor's CPU domain comes up after a wake. */
 int apple_dart_gapf_ready(struct device *dev);
 /* A display DART whose domain goes off at runtime while others still map into it. */
-void apple_dart_power_dark(struct device *dev, bool dark);
+int apple_dart_power_dark(struct device *dev, bool dark);
 /* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
 int apple_dart_m5_restore(struct device *dev, struct device *owner);
+/* T6050: a display coprocessor's DART around its restart, the display pipe's around its domain's. */
+int apple_dart_m5_display_cycle(struct device *dev, bool on);
+int apple_dart_m5_display_snapshot(struct device *dev);
+int apple_dart_m5_display_rewrite(struct device *dev);
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
 void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
@@ -217,19 +259,34 @@ static inline int apple_dart_display_streams(struct device *dev, u32 streams, bo
 	return -ENODEV;
 }
 
+static inline u32 apple_dart_enabled_streams(struct device *dev)
+{
+	return 0;
+}
+
+static inline int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
+{
+	return -ENODEV;
+}
+
 static inline int apple_dart_gapf_ready(struct device *dev)
 {
 	return 0;
 }
 
-static inline void apple_dart_power_dark(struct device *dev, bool dark)
+static inline int apple_dart_power_dark(struct device *dev, bool dark)
 {
+	return 0;
 }
 
 static inline int apple_dart_m5_restore(struct device *dev, struct device *owner)
 {
 	return -EOPNOTSUPP;
 }
+
+static inline int apple_dart_m5_display_cycle(struct device *dev, bool on) { return -EOPNOTSUPP; }
+static inline int apple_dart_m5_display_snapshot(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_m5_display_rewrite(struct device *dev) { return -EOPNOTSUPP; }
 
 static inline int apple_dart_state_save(struct device *dev)
 {

@@ -15,6 +15,26 @@ use super::render_resources::{ComputePrograms, Programs};
 
 const _: () = assert!(uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_AS_BUILD == 1 << 2);
 
+/// The vertex, fragment and compute attachment lists a [`Parser`] keeps.
+const ATTACHMENT_KINDS: usize = 3;
+/// What a stream sets for the work commands after it: the attachment lists, the render
+/// resources (either version) and the compute resources.
+const SET_KINDS: usize = ATTACHMENT_KINDS + 2;
+
+/// The largest command stream in which every entry has an effect: as many work commands as
+/// a submission may hold, each after at most one set of each kind, and every entry at its
+/// largest. A set that a later one replaces before any work, or one after the last work
+/// command, changes nothing, so a longer stream only repeats them. The submit ioctl refuses
+/// a longer stream before copying it.
+pub(crate) const MAX_STREAM: usize = crate::file::MAX_COMMANDS_PER_SUBMISSION as usize
+    * (1 + SET_KINDS)
+    * (size_of::<uapi::drm_asahi_cmd_header>() + u16::MAX as usize);
+// kvmalloc() warns past INT_MAX. A plain kmalloc() copy warns past KMALLOC_MAX_SIZE, which depends
+// on the architecture; on arm64 with 16K pages, as Apple GPUs run, it is 32 MiB.
+const _: () = assert!(MAX_STREAM <= i32::MAX as usize);
+#[cfg(CONFIG_ARM64)]
+const _: () = assert!(MAX_STREAM <= kernel::bindings::KMALLOC_MAX_SIZE as usize);
+
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
 const MAX_SAMPLERS: u32 = 1024;
@@ -41,11 +61,12 @@ const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRA
 const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const WHOLE_ATTACHMENTS: u32 = crate::file::DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
+const MESH_OUTPUT: u32 = crate::file::DRM_ASAHI_RENDER_MESH_OUTPUT;
 /// Render flags only the M5 runtime implements.
 const M5_RENDER_FLAGS: u32 = SHADER_WRITES | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
 const RENDER_FLAGS: u32 =
     PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
-        | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
+        | STAGE_PREFIXES | WHOLE_ATTACHMENTS | MESH_OUTPUT;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -183,7 +204,7 @@ pub(crate) struct Command {
 pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     counts: [u16; 2],
-    attachments: [Attachments; 3],
+    attachments: [Attachments; ATTACHMENT_KINDS],
     render_resources: Option<Arc<Programs>>,
     compute_resources: Option<Arc<ComputePrograms>>,
 }
@@ -193,7 +214,7 @@ impl<'a> Parser<'a> {
         Self {
             bytes,
             counts: [0; 2],
-            attachments: [Attachments::EMPTY; 3],
+            attachments: [Attachments::EMPTY; ATTACHMENT_KINDS],
             render_resources: None,
             compute_resources: None,
         }
@@ -289,19 +310,21 @@ impl<'a> Parser<'a> {
                         return Err(EINVAL);
                     }
                     self.render_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL)?) };
+                        else { Some(Arc::new(Programs::parse(bytes)?, GFP_KERNEL_ACCOUNT)?) };
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2 => {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] { return Err(EINVAL); }
                     self.render_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(Programs::parse_v2(bytes)?, GFP_KERNEL)?) };
+                        else { Some(Arc::new(Programs::parse_v2(bytes)?, GFP_KERNEL_ACCOUNT)?) };
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES => {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
                         return Err(EINVAL);
                     }
                     self.compute_resources = if bytes.is_empty() { None }
-                        else { Some(Arc::new(ComputePrograms::parse(bytes)?, GFP_KERNEL)?) };
+                        else {
+                            Some(Arc::new(ComputePrograms::parse(bytes)?, GFP_KERNEL_ACCOUNT)?)
+                        };
                 }
                 _ => return Err(EINVAL),
             }
@@ -465,6 +488,9 @@ pub(crate) enum Validated {
         ray_query: [RayQueryStage; 2],
         resources: Option<Arc<Programs>>,
         plan: Option<super::render_resources::Plan>,
+        /// Bytes of the client's M5 compact window that each render pair built for this render
+        /// reserves, from the layout SUBMIT derives with the plan (`None` without an M5 plan).
+        pair_window: Option<usize>,
         attachments: [Attachments; 2],
         timestamps: [uapi::drm_asahi_timestamps; 2],
     },
@@ -472,8 +498,9 @@ pub(crate) enum Validated {
         long_job: bool,
         intersection: IntersectionTables,
         matrix_ops: bool,
-        /// The command may copy or reset queries, so it must follow the host's
-        /// timestamp publication for earlier commands.
+        /// The command may read or write a timestamp or availability word whose
+        /// host publication for an earlier command is still pending, so it must
+        /// follow that publication (no DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS).
         query_access: bool,
         /// The command's writes are visible when it completes (M5).
         visible_completion: bool,
@@ -498,9 +525,23 @@ pub(crate) enum Validated {
 }
 
 impl Validated {
+    /// A render with mesh shading: flagged DRM_ASAHI_RENDER_MESH_OUTPUT, or an M5 render whose
+    /// program table has a mesh program.
+    pub(crate) fn mesh_output(&self) -> bool {
+        matches!(self, Self::Render { pass, resources, .. }
+            if pass.mesh_output || resources.as_ref().is_some_and(|p| p.uses_mesh()))
+    }
     pub(crate) fn long_job(&self) -> bool {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job,
+        }
+    }
+    /// The compact-window bytes of each render pair kept by SUBMIT (`Render::pair_window`);
+    /// `None` for a compute command.
+    pub(crate) fn pair_window(&self) -> Option<usize> {
+        match self {
+            Self::Render { pair_window, .. } => *pair_window,
+            Self::Compute { .. } => None,
         }
     }
     pub(crate) fn allow_long_job(&mut self) {
@@ -664,6 +705,7 @@ impl Payload {
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0 && variant.few_primitives,
+                    mesh_output: cmd.flags & MESH_OUTPUT != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
                     whole_attachments: cmd.flags & WHOLE_ATTACHMENTS != 0,
@@ -730,12 +772,20 @@ impl Payload {
                     ray_query: *ray_query,
                     resources: resources.clone(),
                     plan: None,
+                    pair_window: None,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
             Self::Compute(cmd, attachments, intersection, resources) => {
-                let as_build = if m5 { false } else { super::timeout::as_build(cmd.flags).ok_or(EINVAL)? };
+                let as_build = if m5 {
+                    false
+                } else {
+                    super::timeout::as_build(
+                        cmd.flags & !crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS,
+                    )
+                    .ok_or(EINVAL)?
+                };
                 if (m5
                     && (cmd.flags
                         & !(crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX
@@ -861,5 +911,46 @@ mod attachment_tests {
         assert_eq!(list(&[(0x1_0000_0000, 0)]).validate_hint(), Err(EINVAL));
         assert_eq!(list(&[(u64::MAX - 0xfff, 0x2000)]).validate_hint(), Err(EINVAL));
         assert_eq!(list(&[]).validate_hint(), Ok(()));
+    }
+}
+
+#[kunit_tests(asahi_g17_stream)]
+mod stream_tests {
+    use super::*;
+
+    const COMMANDS: usize = crate::file::MAX_COMMANDS_PER_SUBMISSION as usize;
+
+    /// Appends a zeroed render command whose payload is `size` bytes long.
+    fn push_render(stream: &mut KVVec<u8>, size: u16) {
+        let render = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER as u16;
+        // cmd_type, size, vdm_barrier, cdm_barrier.
+        for field in [render, size, 0, 0] {
+            stream.extend_from_slice(&field.to_le_bytes(), GFP_KERNEL).unwrap();
+        }
+        stream.extend_with(size.into(), 0, GFP_KERNEL).unwrap();
+    }
+
+    fn parsed(stream: &[u8]) -> Result<usize> {
+        let mut parser = Parser::new(stream);
+        let mut count = 0;
+        while parser.next()?.is_some() {
+            count += 1;
+        }
+        parser.finish()?;
+        Ok(count)
+    }
+
+    #[test]
+    fn the_largest_work_commands_a_submission_holds_fit_the_stream_bound() {
+        assert_eq!(size_of::<uapi::drm_asahi_cmd_header>(), 8);
+        let mut stream = KVVec::new();
+        for _ in 0..COMMANDS {
+            push_render(&mut stream, u16::MAX);
+        }
+        assert_eq!(parsed(&stream), Ok(COMMANDS));
+        assert!(stream.len() <= MAX_STREAM);
+        // One more work command is refused, so the bound counts every command it may hold.
+        push_render(&mut stream, size_of::<uapi::drm_asahi_cmd_render>() as u16);
+        assert_eq!(parsed(&stream), Err(EINVAL));
     }
 }

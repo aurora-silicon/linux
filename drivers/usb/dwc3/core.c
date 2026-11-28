@@ -2962,6 +2962,10 @@ static const struct of_device_id of_dwc3_match[] = {
 	{
 		.compatible = "synopsys,dwc3"
 	},
+	{
+		/* Handed over in host mode by the bootloader, see apple,dwc3.yaml */
+		.compatible = "apple,t8152-dwc3"
+	},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, of_dwc3_match);

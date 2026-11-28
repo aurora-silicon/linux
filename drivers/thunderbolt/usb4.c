@@ -1343,6 +1343,28 @@ static int usb4_port_write_data(struct tb_port *port, const void *data,
 			     dwords);
 }
 
+static int usb4_port_sb_wait_idle(struct tb_port *port)
+{
+	u32 val;
+	int ret;
+
+	ret = tb_port_read(port, &val, TB_CFG_PORT,
+			   port->cap_usb4 + PORT_CS_1, 1);
+	if (ret)
+		return ret;
+	if (!(val & PORT_CS_1_PND))
+		return 0;
+
+	ret = usb4_port_wait_for_bit(port, port->cap_usb4 + PORT_CS_1,
+				     PORT_CS_1_PND, 0, 500, USB4_PORT_SB_DELAY);
+	if (ret) {
+		tb_port_warn(port, "sideband channel still busy (PND=1)\n");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 /**
  * usb4_port_sb_read() - Read from sideband register
  * @port: USB4 port to read
@@ -1365,6 +1387,10 @@ int usb4_port_sb_read(struct tb_port *port, enum usb4_sb_target target, u8 index
 
 	if (!port->cap_usb4)
 		return -EINVAL;
+
+	ret = usb4_port_sb_wait_idle(port);
+	if (ret)
+		return ret;
 
 	val = reg;
 	val |= size << PORT_CS_1_LENGTH_SHIFT;
@@ -1418,6 +1444,10 @@ int usb4_port_sb_write(struct tb_port *port, enum usb4_sb_target target,
 
 	if (!port->cap_usb4)
 		return -EINVAL;
+
+	ret = usb4_port_sb_wait_idle(port);
+	if (ret)
+		return ret;
 
 	if (buf) {
 		ret = usb4_port_write_data(port, buf, dwords);
@@ -3009,23 +3039,30 @@ static inline int usb4_dp_port_set_cm_ack(struct tb_port *port)
 	return __usb4_dp_port_set_cm_ack(port, true);
 }
 
+/*
+ * With @held the CM Ack just set stays set until the adapter has cleared
+ * the DPTX request, as the Apple silicon host's own OS acknowledges it;
+ * otherwise it is cleared at once, before waiting.
+ */
 static int usb4_dp_port_wait_and_clear_cm_ack(struct tb_port *port,
-					      int timeout_msec)
+					      int timeout_msec, bool held)
 {
 	ktime_t end;
 	u32 val;
 	int ret;
 
-	ret = __usb4_dp_port_set_cm_ack(port, false);
-	if (ret)
-		return ret;
+	if (!held) {
+		ret = __usb4_dp_port_set_cm_ack(port, false);
+		if (ret)
+			return ret;
+	}
 
 	end = ktime_add_ms(ktime_get(), timeout_msec);
 	do {
 		ret = tb_port_read(port, &val, TB_CFG_PORT,
 				   port->cap_adap + ADP_DP_CS_8, 1);
 		if (ret)
-			return ret;
+			goto err_held;
 
 		if (!(val & ADP_DP_CS_8_DR))
 			break;
@@ -3035,7 +3072,8 @@ static int usb4_dp_port_wait_and_clear_cm_ack(struct tb_port *port,
 
 	if (val & ADP_DP_CS_8_DR) {
 		tb_port_warn(port, "timeout waiting for DPTX request to clear\n");
-		return -ETIMEDOUT;
+		ret = -ETIMEDOUT;
+		goto err_held;
 	}
 
 	ret = tb_port_read(port, &val, TB_CFG_PORT,
@@ -3046,6 +3084,12 @@ static int usb4_dp_port_wait_and_clear_cm_ack(struct tb_port *port,
 	val &= ~ADP_DP_CS_2_CA;
 	return tb_port_write(port, &val, TB_CFG_PORT,
 			     port->cap_adap + ADP_DP_CS_2, 1);
+
+err_held:
+	/* A held CM Ack is not left set when the request does not clear. */
+	if (held)
+		__usb4_dp_port_set_cm_ack(port, false);
+	return ret;
 }
 
 /**
@@ -3088,7 +3132,8 @@ int usb4_dp_port_allocate_bandwidth(struct tb_port *port, int bw)
 	if (ret)
 		return ret;
 
-	return usb4_dp_port_wait_and_clear_cm_ack(port, 500);
+	return usb4_dp_port_wait_and_clear_cm_ack(port, 500,
+						  tb_port_dp_bw_held_ack(port));
 }
 
 /**

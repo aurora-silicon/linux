@@ -27,8 +27,9 @@ static bool dart_cio_fault(void __iomem *regs, const struct dart_cio_power *s)
 
 static int dart_cio_idle(void __iomem *regs, const struct dart_cio_power *s)
 {
-	unsigned int ports = max(FIELD_GET(GENMASK(18, 16), s->params[1]),
-				 FIELD_GET(GENMASK(22, 20), s->params[1]));
+	unsigned int rports = FIELD_GET(GENMASK(18, 16), s->params[1]);
+	unsigned int wports = FIELD_GET(GENMASK(22, 20), s->params[1]);
+	unsigned int ports = max(rports, wports);
 	u32 value;
 	int ret;
 
@@ -46,7 +47,61 @@ static int dart_cio_idle(void __iomem *regs, const struct dart_cio_power *s)
 	return dart_cio_fault(regs, s) ? -EIO : 0;
 }
 
-/* Only the v2.2/v2.3 layout is admitted; do not guess at a newer revision. */
+/*
+ * The layouts admitted: v2.2/v2.3 (T8132), and v2.4 as T6050's ACIO and PCIe-C DARTs report
+ * it. TEST: for v2.4, every register a macOS wake writes on those two DARTs (run mxt4: 0x20c,
+ * 0x210, 0x220, 0x224, 0x300, 0x308, 0x310, the partitions at 0x800, TCR at 0x1000, TTBR at
+ * 0x1400, the error mask at 0x4060 and the stream enables at 0xc00) is one this state holds,
+ * at the same offset. Do not guess at a newer revision.
+ */
+#define DART_CIO_VERSION_MIN 0x202
+#define DART_CIO_VERSION_T6050 0x204
+
+static int dart_cio_admit(void __iomem *regs, u32 *params, unsigned int streams,
+			  bool partitions)
+{
+	u32 version;
+
+	if (!streams || streams > DART_CIO_STREAMS)
+		return -EINVAL;
+	for (unsigned int i = 0; i < 4; i++)
+		params[i] = readl(regs + 4 * i);
+	version = params[2] & 0xffff;
+	if (version < DART_CIO_VERSION_MIN || version > DART_CIO_VERSION_T6050 ||
+	    FIELD_GET(GENMASK(8, 0), params[3]) != streams)
+		return -EOPNOTSUPP;
+	if (partitions && (!(params[0] & BIT(29)) ||
+			   FIELD_GET(GENMASK(24, 16), params[3]) < DART_CIO_PARTITIONS))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+/*
+ * What a capture would refuse, with nothing taken and nothing written: for an owner to ask
+ * while its sleep can still be refused with everything running. @quiesced adds the checks
+ * that need the requesters stopped. Uses @s as scratch: only before a capture.
+ */
+static int dart_cio_check(void __iomem *regs, struct dart_cio_power *s,
+			  unsigned int streams, bool partitions, bool quiesced)
+{
+	int ret;
+
+	s->valid = false;
+	ret = dart_cio_admit(regs, s->params, streams, partitions);
+	if (ret)
+		return ret;
+	s->streams = streams;
+	s->partitions = partitions ? DART_CIO_PARTITIONS : 0;
+	if ((s->params[1] & BIT(2)) && (readl(regs + 0x208) & GENMASK(4, 3)) != GENMASK(4, 3))
+		return -EPERM;
+	if (!quiesced)
+		return 0;
+	ret = dart_cio_idle(regs, s);
+	if (ret)
+		return ret;
+	return readl(regs + DART_POWER_ERROR_MASK) ? -EBUSY : 0;
+}
+
 static int dart_cio_capture(void __iomem *regs, struct dart_cio_power *s,
 			    unsigned int streams, bool partitions)
 {
@@ -55,17 +110,10 @@ static int dart_cio_capture(void __iomem *regs, struct dart_cio_power *s,
 	int ret;
 
 	s->valid = false;
-	if (!streams || streams > DART_CIO_STREAMS)
-		return -EINVAL;
-	for (unsigned int i = 0; i < ARRAY_SIZE(s->params); i++)
-		s->params[i] = readl(regs + 4 * i);
+	ret = dart_cio_admit(regs, s->params, streams, partitions);
+	if (ret)
+		return ret;
 	version = s->params[2] & 0xffff;
-	if (version < 0x202 || version > 0x203 ||
-	    FIELD_GET(GENMASK(8, 0), s->params[3]) != streams)
-		return -EOPNOTSUPP;
-	if (partitions && (!(s->params[0] & BIT(29)) ||
-			   FIELD_GET(GENMASK(24, 16), s->params[3]) < DART_CIO_PARTITIONS))
-		return -EOPNOTSUPP;
 	s->streams = streams;
 	s->partitions = partitions ? DART_CIO_PARTITIONS : 0;
 	ret = dart_cio_idle(regs, s);
@@ -123,6 +171,16 @@ static int dart_cio_disable(void __iomem *regs, const struct dart_cio_power *s)
 	if (ret)
 		return ret;
 	dart_power_mask_errors(regs, true);
+	/*
+	 * TEST: v2.4, as a macOS sleep takes T6050's ACIO and PCIe-C DARTs down (run mxt4):
+	 * between the error mask and the streams, the error status words are written 0 and
+	 * 0x4204 (v2.4's error interrupt status) all ones.
+	 */
+	if (s->common.version == DART_CIO_VERSION_T6050) {
+		for (unsigned int i = 0; i < DIV_ROUND_UP(s->streams, 32); i++)
+			writel(0, regs + DART_POWER_ERROR_PENDING + 4 * i);
+		writel(~0U, regs + 0x4204);
+	}
 	dart_cio_disable_streams(regs, s);
 	ret = dart_power_flush(regs, true);
 	return ret ?: (dart_cio_fault(regs, s) ? -EIO : 0);

@@ -94,6 +94,12 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pms";
+		/*
+		 * The PMP's firmware runs from boot until a real sleep stops it, on its own
+		 * core (pmp, "critical" in the ADT) and out of its own SRAM (pms-sram): none
+		 * of the three may be gated under it, s2idle included.
+		 */
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_pmp: power-controller@128 {
@@ -103,6 +109,7 @@
 		#reset-cells = <0>;
 		label = "pmp";
 		power-domains = <&ps_pms>;
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_pms_sram: power-controller@130 {
@@ -112,6 +119,7 @@
 		#reset-cells = <0>;
 		label = "pms-sram";
 		power-domains = <&ps_pms>;
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_fab0_piogw: power-controller@1d8 {
@@ -120,7 +128,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fab0-piogw";
-		status = "disabled";
+		apple,firmware-owned;
+		status = "okay";
 	};
 	ps_fab3_soc: power-controller@1e0 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -129,7 +138,8 @@
 		#reset-cells = <0>;
 		label = "fab3-soc";
 		power-domains = <&ps_fab0_piogw>;
-		status = "disabled";
+		apple,firmware-owned;
+		status = "okay";
 	};
 	ps_fab5_soc: power-controller@1f0 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -138,7 +148,8 @@
 		#reset-cells = <0>;
 		label = "fab5-soc";
 		power-domains = <&ps_fab0_piogw>;
-		status = "disabled";
+		apple,firmware-owned;
+		status = "okay";
 	};
 	ps_sbr: power-controller@1f8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -214,6 +225,35 @@
 		#reset-cells = <0>;
 		label = "atc1-pcie";
 		power-domains = <&ps_atc1_common>;
+		status = "disabled";
+	};
+	/*
+	 * DISPEXT2_ADMA, DISPEXT3_ADMA and DISPEXT1_ADMA, ADT power devices 75, 78 and 81:
+	 * dp-audio3's, dp-audio4's and dp-audio2's power gates, the domains of dispext2's,
+	 * dispext3's and dispext1's ADMACs and isochronous DARTs, as DISPEXT0_ADMA is dispext0's.
+	 */
+	ps_dispext2_adma: power-controller@2a8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext2_adma";
+		status = "disabled";
+	};
+	ps_dispext3_adma: power-controller@2c0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext3_adma";
+		status = "disabled";
+	};
+	ps_dispext1_adma: power-controller@2d8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext1_adma";
 		status = "disabled";
 	};
 	ps_atc2_cio: power-controller@2e8 {
@@ -324,6 +364,24 @@
 		power-domains = <&ps_atc2_cio>, <&ps_auss>;
 		status = "disabled";
 	};
+};
+
+/*
+ * The ADT's PMGR device table gives every ATC's COMMON state a fabric parent: ATC0 and ATC1
+ * hang off FAB3_SOC, ATC2 and ATC3 off FAB5_SOC. Without the link, genpd counts no
+ * powered child under the fabric while a port's PHY domains are held on, asks for the
+ * fabric to go off, and the PMGR refuses the write.
+ */
+&ps_atc1_common {
+	power-domains = <&ps_fab3_soc>;
+};
+
+&ps_atc2_common {
+	power-domains = <&ps_fab5_soc>;
+};
+
+&ps_atc3_common {
+	power-domains = <&ps_fab5_soc>;
 };
 
 &pmgr1 {
@@ -923,6 +981,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0-usb-aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		status = "disabled";
 	};
 	ps_atc0_usb: power-controller@150 {
@@ -968,12 +1027,20 @@
 		label = "gpx";
 		status = "disabled";
 	};
+	/*
+	 * The T6050 boot chain hands AFR and GFX over with an auto-PM floor of
+	 * clock-gated (PS_MIN = 4), and the power-state driver writes back the
+	 * floor it reads, holding idle GFX at state 4. macOS runs both domains
+	 * with a floor of power-gated, where idle GFX rests at state 0; request
+	 * the same for all T6050 boards inheriting these domains.
+	 */
 	ps_afr: power-controller@100 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x100 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "afr";
+		apple,min-state = <0>;
 		status = "disabled";
 	};
 	ps_gfx: power-controller@110 {
@@ -983,6 +1050,7 @@
 		#reset-cells = <0>;
 		label = "gfx";
 		power-domains = <&ps_afr>, <&ps_gpx>;
+		apple,min-state = <0>;
 		status = "disabled";
 	};
 };
@@ -1256,7 +1324,8 @@
 #else
 &{/soc} {
 #endif
-#if defined(T6050_J714C) || defined(T6050_J716C) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K116C)
+/* nub-spmi1: an M5 Max bus (t6050-soc-max.dtsi) */
+#ifdef T6050_MAX_PMIC_BUSES
 	nub_spmi1: spmi@28a054000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a054000 0x0 0x4000>,
@@ -1269,7 +1338,8 @@
 	};
 #endif
 
-#if defined(T6050_J714C) || defined(T6050_J716C) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K116C)
+/* nub-spmi4: the other bus of t6050-soc-max.dtsi */
+#ifdef T6050_MAX_PMIC_BUSES
 	nub_spmi4: spmi@28a114000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a114000 0x0 0x4000>,
@@ -1507,7 +1577,7 @@
 
 
 
-#ifndef T6050_J716C
+#if !defined(T6050_J714S) && !defined(T6050_J716C)
 	apciec0_dart: iommu@2a4000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x2 0xa4000000 0x0 0x20000>;
@@ -1549,7 +1619,8 @@
 		status = "disabled";
 	};
 
-#if !defined(T6050_J714C) && !defined(T6050_J714S) && !defined(T6050_J716C) && !defined(T6050_K114C)
+/* With ATC2's USB4 router, t6050-max.dtsi describes this DART with the router instead. */
+#ifndef T6050_ATC2_USB4_ROUTER
 	apciec2_dart: iommu@384000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x3 0x84000000 0x0 0x20000>;
@@ -1574,6 +1645,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x2 0xa324c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 
@@ -1609,6 +1682,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x2 0xab24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 
@@ -1674,6 +1749,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x3 0x8b24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 #endif
@@ -2781,6 +2858,9 @@
 		mboxes = <&dcpext1_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext1_dart 23>;
+		apple,bw-scratch = <&dcpext0_pmc 0 5 0x30000>;
+		apple,dcp-index = <2>;
+		apple,clock-ids;
 		status = "disabled";
 
 		piodma {
@@ -2793,15 +2873,17 @@
 		reg = <0x3 0x92340000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1142 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
 	dispext1_dart: iommu@392300000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
-		reg = <0x3 0x92300000 0x0 0xc000>,
-		      <0x3 0x92314000 0x0 0x4000>;
+		/* Scanout and PIODMA share the first register window, as on dart_dispext0 */
+		reg = <0x3 0x92300000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 1142 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -2810,16 +2892,21 @@
 		reg = <0x3 0x92180000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1165 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_dispext1_adma>;
 		status = "disabled";
 	};
 
+	/* dispext1's own ADMAC, which feeds its DisplayPort audio (dp-audio2), as dispext0's */
 	admac_dispext1: dma-controller@392140000 {
-		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		compatible = "apple,t6050-display-admac";
 		reg = <0x3 0x92140000 0x0 0x24000>;
 		dma-channels = <1>;
 		interrupts-extended = <&aic AIC_IRQ 0 1164 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		iommus = <&dispext1_isoc_dart 30>;
 		#dma-cells = <1>;
+		power-domains = <&ps_dispext1_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext1_ced_ssw>;
 		status = "disabled";
 	};
 
@@ -2872,6 +2959,9 @@
 		mboxes = <&dcpext2_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext2_dart 23>;
+		apple,bw-scratch = <&dcpext0_pmc 0 5 0x34000>;
+		apple,dcp-index = <3>;
+		apple,clock-ids;
 		status = "disabled";
 
 		piodma {
@@ -2884,15 +2974,17 @@
 		reg = <0x3 0x2340000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1214 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
 	dispext2_dart: iommu@302300000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
-		reg = <0x3 0x2300000 0x0 0xc000>,
-		      <0x3 0x2314000 0x0 0x4000>;
+		/* Scanout and PIODMA share the first register window, as on dart_dispext0 */
+		reg = <0x3 0x2300000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 1214 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -2901,16 +2993,21 @@
 		reg = <0x3 0x2180000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1237 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_dispext2_adma>;
 		status = "disabled";
 	};
 
+	/* dispext2's own ADMAC, which feeds its DisplayPort audio (dp-audio3), as dispext0's */
 	admac_dispext2: dma-controller@302140000 {
-		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		compatible = "apple,t6050-display-admac";
 		reg = <0x3 0x2140000 0x0 0x24000>;
 		dma-channels = <1>;
 		interrupts-extended = <&aic AIC_IRQ 0 1236 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		iommus = <&dispext2_isoc_dart 30>;
 		#dma-cells = <1>;
+		power-domains = <&ps_dispext2_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext2_ced_ssw>;
 		status = "disabled";
 	};
 
@@ -2963,6 +3060,9 @@
 		mboxes = <&dcpext3_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext3_dart 23>;
+		apple,bw-scratch = <&dcpext0_pmc 0 5 0x38000>;
+		apple,dcp-index = <4>;
+		apple,clock-ids;
 		status = "disabled";
 
 		piodma {
@@ -2975,15 +3075,17 @@
 		reg = <0x3 0x6340000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1286 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
 	dispext3_dart: iommu@306300000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
-		reg = <0x3 0x6300000 0x0 0xc000>,
-		      <0x3 0x6314000 0x0 0x4000>;
+		/* Scanout and PIODMA share the first register window, as on dart_dispext0 */
+		reg = <0x3 0x6300000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 1286 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -2992,16 +3094,21 @@
 		reg = <0x3 0x6180000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1309 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_dispext3_adma>;
 		status = "disabled";
 	};
 
+	/* dispext3's own ADMAC, which feeds its DisplayPort audio (dp-audio4), as dispext0's */
 	admac_dispext3: dma-controller@306140000 {
-		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		compatible = "apple,t6050-display-admac";
 		reg = <0x3 0x6140000 0x0 0x24000>;
 		dma-channels = <1>;
 		interrupts-extended = <&aic AIC_IRQ 0 1308 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		iommus = <&dispext3_isoc_dart 30>;
 		#dma-cells = <1>;
+		power-domains = <&ps_dispext3_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext3_ced_ssw>;
 		status = "disabled";
 	};
 
@@ -3302,6 +3409,7 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x5 0x9800000 0x0 0xc000>,
 		      <0x5 0x9810000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_ane_sys>;

@@ -77,6 +77,12 @@
 		nonposted-mmio;
 		status = "disabled";
 
+		/*
+		 * No power-domains: the router populates its DART after it has powered
+		 * its own states, and the native CIO sleep powers them off with the DART
+		 * saved. A DART in ps_atc0_cio would hold that state on through the
+		 * NHI's noirq suspend (it suspends after the NHI), and the sleep fails.
+		 */
 		usb4_0_dart: iommu@a80000 {
 			compatible = "apple,t8132-dart", "apple,t8110-dart";
 			reg = <0xa80000 0x20000>;
@@ -193,6 +199,12 @@
 		nonposted-mmio;
 		status = "disabled";
 
+		/*
+		 * No power-domains: the router populates its DART after it has powered
+		 * its own states, and the native CIO sleep powers them off with the DART
+		 * saved. A DART in ps_atc1_cio would hold that state on through the
+		 * NHI's noirq suspend (it suspends after the NHI), and the sleep fails.
+		 */
 		usb4_1_dart: iommu@a80000 {
 			compatible = "apple,t8132-dart", "apple,t8110-dart";
 			reg = <0xa80000 0x20000>;
@@ -294,6 +306,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1268 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			power-domains = <&ps_atc0_cio_pcie>;
 			/* The port's own writes, MSIs included, use these streams. */
 			apple,bypass-sids = <253 255>;
 			/* No bootloader fills this one; the tunnel's cold init needs it. */
@@ -384,6 +397,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1330 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			power-domains = <&ps_atc1_cio_pcie>;
 			/* The port's own writes, MSIs included, use these streams. */
 			apple,bypass-sids = <253 255>;
 			/* No bootloader fills this one; the tunnel's cold init needs it. */

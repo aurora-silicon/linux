@@ -5,8 +5,10 @@
 #ifndef _DOCKCHANNEL_HID_PROTOCOL_H
 #define _DOCKCHANNEL_HID_PROTOCOL_H
 
+#include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 /*
  * Interface power commands go to the comm interface as SET_REPORT feature
@@ -32,6 +34,18 @@
 #define DCHID_PM1_CMD_SIZE		4
 #define DCHID_PM2_CMD_SIZE		9
 
+/* IOKit kIOReturnBadArgument: returned when firmware rejects power method 1. */
+#define DCHID_ERR_BAD_ARGUMENT		0xe00002c2
+
+static inline bool dchid_pm1_needs_pm2_fallback(int ret, u32 retcode,
+						bool pm_explicit,
+						bool use_ring,
+						bool has_afe_reset)
+{
+	return ret == -EIO && retcode == DCHID_ERR_BAD_ARGUMENT &&
+	       !pm_explicit && !use_ring && has_afe_reset;
+}
+
 static inline void dchid_pm1_command(u8 iface, u8 state,
 				     u8 cmd[DCHID_PM1_CMD_SIZE])
 {
@@ -50,6 +64,43 @@ static inline void dchid_pm2_command(u8 iface, u8 state, bool has_changed,
 	cmd[2] = iface;
 	cmd[3] = state;
 	cmd[4] = has_changed;
+}
+
+/*
+ * Newer trackpad firmware ("SensingAlgsTrackpad26C", hid-magicmouse's TP26
+ * frames) sends no report ID: a frame is 0x5a 0x01, a frame type (2 for data),
+ * a header to offset 31, then records of 0x02, a 16-byte stream id, 0x02, two
+ * type bytes, a little-endian 16-bit length and the payload. The button
+ * stream's payload is a 32-bit word with bit 0 set while the pad is clicked.
+ */
+#define DCHID_TP26_HEADER_SIZE		31
+#define DCHID_TP26_RECORD_HDR		22
+
+static const u8 dchid_tp26_button_id[16] = {
+	0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+	0xc2, 0x87, 0x93, 0x63, 0x28, 0x29, 0xc8, 0xbf,
+};
+
+/* Whether a TP26 data frame carries a button stream record that says clicked. */
+static inline bool dchid_tp26_clicked(const u8 *data, size_t size)
+{
+	size_t pos;
+
+	if (size < DCHID_TP26_HEADER_SIZE || data[0] != 0x5a || data[1] != 0x01 ||
+	    data[2] != 2)
+		return false;
+	for (pos = DCHID_TP26_HEADER_SIZE; pos + DCHID_TP26_RECORD_HDR <= size;) {
+		u16 len = get_unaligned_le16(data + pos + 20);
+
+		if (data[pos] != 0x02 || data[pos + 17] != 0x02 ||
+		    len > size - pos - DCHID_TP26_RECORD_HDR)
+			return false;
+		if (len >= 4 && !memcmp(data + pos + 1, dchid_tp26_button_id,
+					 sizeof(dchid_tp26_button_id)))
+			return get_unaligned_le32(data + pos + DCHID_TP26_RECORD_HDR) & 1;
+		pos += DCHID_TP26_RECORD_HDR + len;
+	}
+	return false;
 }
 
 /*

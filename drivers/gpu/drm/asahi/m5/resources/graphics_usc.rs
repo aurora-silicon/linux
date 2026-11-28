@@ -110,9 +110,17 @@ impl M5GraphicsUsc {
     /// addresses, reproducing each allocation's guard reservation, so every
     /// firmware record naming the directory, free list or blocks stays valid
     /// across a render client handoff. The returned aliases must be kept for
-    /// as long as that VM may submit.
+    /// as long as that VM may submit. The caller has verified that all work
+    /// using the pool has retired.
     pub(super) fn alias_into(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
         let range = crate::m5::vm_layout::auxiliary_range(&vm.kernel_range()).ok_or(EINVAL)?;
+        // Blocks released by the previous VM may still hold its shader stack
+        // and spill data; clear them before another VM maps them. The
+        // directory and free list are allocator state that the firmware's
+        // cursors refer to, so they are kept (see below).
+        for block in self.blocks.iter_mut() {
+            block.with_bytes_mut(|out| { out.fill(0); Ok(()) })?;
+        }
         let mut aliases = KVec::new();
         let alias = |object: &mut MappedObject, size: usize, guards: usize,
                      aliases: &mut KVec<mmu::KernelMapping>| -> Result {

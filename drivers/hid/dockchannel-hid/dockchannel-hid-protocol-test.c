@@ -62,6 +62,89 @@ static void dchid_pm2_power_off_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, cmd, expected, sizeof(expected));
 }
 
+static void dchid_pm1_fallback_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test,
+			  dchid_pm1_needs_pm2_fallback(-EIO,
+						       DCHID_ERR_BAD_ARGUMENT,
+						       false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							true, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, true, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, false));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-ETIMEDOUT,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO, 0xe00002bc,
+							false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(0,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, true));
+}
+
+/* A TP26 data frame: header, one record of @id carrying the 32-bit @word. */
+static size_t dchid_tp26_frame(u8 *buf, const u8 *id, u32 word, u16 len)
+{
+	size_t pos = DCHID_TP26_HEADER_SIZE;
+
+	memset(buf, 0, DCHID_TP26_HEADER_SIZE);
+	buf[0] = 0x5a;
+	buf[1] = 0x01;
+	buf[2] = 2;
+	buf[pos] = 0x02;
+	memcpy(buf + pos + 1, id, 16);
+	buf[pos + 17] = 0x02;
+	put_unaligned_le16(len, buf + pos + 20);
+	put_unaligned_le32(word, buf + pos + DCHID_TP26_RECORD_HDR);
+	return pos + DCHID_TP26_RECORD_HDR + 4;
+}
+
+static void dchid_tp26_clicked_test(struct kunit *test)
+{
+	static const u8 contacts_id[16] = {
+		0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+		0x7e, 0xde, 0x54, 0xa8, 0x63, 0x1f, 0xdf, 0x17,
+	};
+	u8 buf[64];
+	size_t n;
+
+	n = dchid_tp26_frame(buf, dchid_tp26_button_id, 1, 4);
+	KUNIT_EXPECT_TRUE(test, dchid_tp26_clicked(buf, n));
+
+	n = dchid_tp26_frame(buf, dchid_tp26_button_id, 0, 4);
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, n));
+
+	/* Another stream with the bit set is not a click */
+	n = dchid_tp26_frame(buf, contacts_id, 1, 4);
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, n));
+
+	/* A record that runs past the frame */
+	n = dchid_tp26_frame(buf, dchid_tp26_button_id, 1, 40);
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, n));
+
+	/* Not a data frame, or not TP26 at all */
+	n = dchid_tp26_frame(buf, dchid_tp26_button_id, 1, 4);
+	buf[2] = 1;
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, n));
+	buf[2] = 2;
+	buf[0] = 0x75;
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, n));
+
+	/* Too short for the header */
+	KUNIT_EXPECT_FALSE(test, dchid_tp26_clicked(buf, DCHID_TP26_HEADER_SIZE - 1));
+}
+
 static void dchid_ring_refusal_keeps_fifo_test(struct kunit *test)
 {
 	/* A node with an MMIO FIFO receive path of its own may fall back to it. */
@@ -97,6 +180,8 @@ static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_pm2_will_change_test),
 	KUNIT_CASE(dchid_pm2_has_changed_test),
 	KUNIT_CASE(dchid_pm2_power_off_test),
+	KUNIT_CASE(dchid_pm1_fallback_test),
+	KUNIT_CASE(dchid_tp26_clicked_test),
 	KUNIT_CASE(dchid_ring_refusal_keeps_fifo_test),
 	KUNIT_CASE(dchid_ring_refusal_fails_start_without_fallback_test),
 	KUNIT_CASE(dchid_ring_success_is_not_a_refusal_test),

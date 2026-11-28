@@ -194,9 +194,9 @@ static ssize_t nvm_authenticate_show(struct device *dev,
 	return ret;
 }
 
-static void tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status)
+static int tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status)
 {
-	int i;
+	int i, ret;
 
 	tb_port_dbg(port, "reading NVM authentication status of retimers\n");
 
@@ -206,9 +206,15 @@ static void tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status
 	 * device instance.
 	 */
 	for (i = 1; i <= TB_MAX_RETIMER_INDEX; i++) {
-		if (usb4_port_retimer_nvm_authenticate_status(port, i, &status[i]))
+		ret = usb4_port_retimer_nvm_authenticate_status(port, i, &status[i]);
+		if (ret) {
+			if (ret == -ETIMEDOUT || ret == -EBUSY)
+				return ret;
 			break;
+		}
 	}
+
+	return 0;
 }
 
 static void tb_retimer_set_inbound_sbtx(struct tb_port *port)
@@ -495,6 +501,19 @@ static struct tb_retimer *tb_port_find_retimer(struct tb_port *port, u8 index)
 	return NULL;
 }
 
+/*
+ * Skip USB4 retimer sideband scanning on host routers that do not support it
+ * (macOS sends no retimer sideband operations on Apple USB4 host routers).
+ */
+static bool tb_retimer_scan_skip(struct tb_port *port)
+{
+	if (!(port->sw->tb->nhi->quirks & QUIRK_NO_RETIMER_SCAN))
+		return false;
+
+	tb_port_dbg(port, "skipping retimer scan (QUIRK_NO_RETIMER_SCAN)\n");
+	return true;
+}
+
 /**
  * tb_retimer_scan() - Scan for on-board retimers under port
  * @port: USB4 port to scan
@@ -512,6 +531,9 @@ int tb_retimer_scan(struct tb_port *port, bool add)
 	u32 status[TB_MAX_RETIMER_INDEX + 1] = {};
 	int ret, i, max, last_idx = 0;
 
+	if (tb_retimer_scan_skip(port))
+		return 0;
+
 	/*
 	 * Send broadcast RT to make sure retimer indices facing this
 	 * port are set.
@@ -524,7 +546,9 @@ int tb_retimer_scan(struct tb_port *port, bool add)
 	 * Immediately after sending enumerate retimers read the
 	 * authentication status of each retimer.
 	 */
-	tb_retimer_nvm_authenticate_status(port, status);
+	ret = tb_retimer_nvm_authenticate_status(port, status);
+	if (ret)
+		return ret;
 
 	/*
 	 * Enable sideband channel for each retimer. We can do this

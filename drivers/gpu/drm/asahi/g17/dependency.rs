@@ -138,6 +138,65 @@ impl Frontier {
     }
 }
 
+/// How a fence orders against an earlier-held one ([`FenceOrder::order`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FenceOrdering {
+    /// Same context, and it signals after the held one.
+    Later,
+    /// Same context, and it signals no later.
+    NotLater,
+    /// Another context: neither stands for the other.
+    OtherContext,
+}
+
+/// A fence that can be ordered against another, as `dma_fence_is_later()` on a shared context.
+pub(crate) trait FenceOrder {
+    fn order(&self, earlier: &Self) -> FenceOrdering;
+}
+
+/// What a consumer's scheduler job must wait for from the scheduled fences of the unfinished
+/// producers of the other engine that firmware orders it after.
+///
+/// The scheduled fences all come from that engine's one drm_sched entity, so they share a fence
+/// context and the latest stands for every earlier one: drm_sched_job_add_dependency() and
+/// dma_fence_unwrap_merge() would keep only it anyway, after comparing every pair of them. The
+/// latest is kept by comparison, so the order producers come in does not matter, and a scheduled
+/// fence of another context is waited for instead of dropped.
+pub(crate) struct ProducerWaits<'a, F> {
+    latest_scheduled: Option<&'a F>,
+}
+
+impl<'a, F: FenceOrder> ProducerWaits<'a, F> {
+    pub(crate) const fn new() -> Self {
+        Self { latest_scheduled: None }
+    }
+
+    /// The next producer's scheduled fence: `wait` gets a held one of another context.
+    pub(crate) fn producer(
+        &mut self,
+        scheduled: &'a F,
+        wait: impl FnOnce(&'a F) -> Result,
+    ) -> Result {
+        match self.latest_scheduled {
+            Some(held) => match scheduled.order(held) {
+                FenceOrdering::Later => self.latest_scheduled = Some(scheduled),
+                FenceOrdering::NotLater => {}
+                FenceOrdering::OtherContext => {
+                    wait(held)?;
+                    self.latest_scheduled = Some(scheduled);
+                }
+            },
+            None => self.latest_scheduled = Some(scheduled),
+        }
+        Ok(())
+    }
+
+    /// After the last producer: `wait` gets the latest scheduled fence, if there was a producer.
+    pub(crate) fn finish(self, wait: impl FnOnce(&'a F) -> Result) -> Result {
+        self.latest_scheduled.map_or(Ok(()), wait)
+    }
+}
+
 #[kunit_tests(asahi_g17_dependency)]
 mod tests {
     use super::*;
@@ -200,6 +259,55 @@ mod tests {
         let mut record = FailureRecord::new();
         record.note(5, 1, &Probe::new(true));
         assert_eq!(earliest(&mut record), None);
+    }
+
+    /// A fence on context `.0` with seqno `.1`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Mock(u32, u32);
+
+    impl FenceOrder for Mock {
+        fn order(&self, earlier: &Self) -> FenceOrdering {
+            if self.0 != earlier.0 {
+                FenceOrdering::OtherContext
+            } else if self.1 > earlier.1 {
+                FenceOrdering::Later
+            } else {
+                FenceOrdering::NotLater
+            }
+        }
+    }
+
+    fn waits(producers: &[Mock]) -> KVec<Mock> {
+        let mut waited = KVec::new();
+        let mut waits = ProducerWaits::new();
+        for scheduled in producers {
+            waits
+                .producer(scheduled, |fence| {
+                    waited.push(*fence, GFP_KERNEL).map_err(|_| ENOMEM)
+                })
+                .unwrap();
+        }
+        waits
+            .finish(|fence| waited.push(*fence, GFP_KERNEL).map_err(|_| ENOMEM))
+            .unwrap();
+        waited
+    }
+
+    #[test]
+    fn a_consumer_waits_for_the_latest_scheduled_producer_only() {
+        assert!(waits(&[]).is_empty());
+        let (s10, s11, s12) = (Mock(1, 10), Mock(1, 11), Mock(1, 12));
+        assert_eq!(waits(&[s10]), [s10]);
+        assert_eq!(waits(&[s10, s11, s12]), [s12]);
+        // Whatever the order they come in.
+        assert_eq!(waits(&[s12, s10, s11]), [s12]);
+    }
+
+    #[test]
+    fn a_scheduled_fence_of_another_context_is_waited_for() {
+        // A producer from another entity is not stood for by this one's fences.
+        let (a5, b7, b8) = (Mock(1, 5), Mock(2, 7), Mock(2, 8));
+        assert_eq!(waits(&[a5, b7, b8]), [a5, b8]);
     }
 
     #[test]

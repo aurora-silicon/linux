@@ -582,6 +582,19 @@ config EDAC_APPLE_SOC
 	  acknowledged and counted in the EDAC core; a source that stays asserted
 	  without status is masked.
 
+config EDAC_APPLE_SOC_KUNIT_TEST
+	tristate "KUnit tests for Apple SoC error reporting" if !KUNIT_ALL_TESTS
+	depends on EDAC_APPLE_SOC && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the Apple SoC error reporting driver: the
+	  interrupt index to error source tables, the T6041 and T8140 NI
+	  status decode and acknowledge against a fake register block, the
+	  uncorrectable error counts and the mask and backoff of lines that
+	  stay asserted.
+
+	  If unsure, say N.
+
 config EDAC_VERSALNET
 	tristate "AMD VersalNET DDR Controller"
 	depends on CDX_CONTROLLER && ARCH_ZYNQMP
