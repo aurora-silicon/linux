@@ -224,10 +224,11 @@ static const struct ave_variant ave_t8140 = {
 static const struct ave_fw_build ave_t6050_builds[] = {
 	{ "26A428", 0x154000, 0x134000, AVE_FW_TEXT_CRC_T6050_26A428, 0x4224 },
 	/*
-	 * macOS 27.3 beta 1 (iBoot 20457.60.65): TEXT is 0x4000 larger, DATA
-	 * keeps its size. It starts as 26A428 does and takes 26A428's command
-	 * layout (ave_layout_for_crc()).
+	 * 26B123 and 26C5035: TEXT is 0x4000 larger, DATA keeps its size.
+	 * Both start as 26A428 does and take 26A428's command layout
+	 * (ave_layout_for_crc()).
 	 */
+	{ "26B123", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26B123 },
 	{ "26C5035", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26C5035 },
 };
 

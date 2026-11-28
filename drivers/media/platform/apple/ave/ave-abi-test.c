@@ -1677,14 +1677,27 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t8132.builds[0].text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
 	KUNIT_EXPECT_EQ(test, ave_t8132.text_link_cell, 0U);
 	/*
-	 * The M5 Pro/Max 26A428 build: the same word, which differs per boot on
-	 * the J775D. The 26C5035 build has none set: its CRC matches as it is.
+	 * T6050 26A428 sets the per-boot TEXT word; 26B123 and 26C5035 have
+	 * none set, share the larger TEXT segment, and speak the 26A428
+	 * command layout.
 	 */
-	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 2U);
+	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 3U);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_boot_word, off);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_crc, AVE_FW_TEXT_CRC_T6050_26A428);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_size, 0x158000U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].data_size, 0x134000U);
 	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_boot_word, 0U);
-	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_crc, AVE_FW_TEXT_CRC_T6050_26C5035);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_crc, AVE_FW_TEXT_CRC_T6050_26B123);
+	KUNIT_EXPECT_TRUE(test, ave_fw_known_crc(AVE_FW_TEXT_CRC_T6050_26B123));
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6050_26B123),
+			    &ave_layout_26a428);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].text_size, 0x158000U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].data_size, 0x134000U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].text_boot_word, 0U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[2].text_crc, AVE_FW_TEXT_CRC_T6050_26C5035);
+	KUNIT_EXPECT_TRUE(test, ave_fw_known_crc(AVE_FW_TEXT_CRC_T6050_26C5035));
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6050_26C5035),
+			    &ave_layout_26a428);
 	KUNIT_EXPECT_EQ(test, ave_t6050.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
