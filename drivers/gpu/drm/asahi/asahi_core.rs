@@ -148,11 +148,7 @@ module! {
         },
         m5_thermal_governor: u32 {
             default: 9,
-            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 9 (controller and fans, no CPU ceiling)",
-        },
-        m5_thermal_target_mc: u32 {
-            default: 100000,
-            description: "M5 GPU power budget governor target for the SoC hotspot temperature computed by the SMC, in milli-degrees C (70000..104000)",
+            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 9 (controller and fans, no CPU ceiling); the controller settles the hotspot at the SoC die zone's passive trip and stays off without one",
         },
         m5_depth_msaa_compression: u32 {
             default: 1,

@@ -1446,15 +1446,20 @@ impl WorkItem<GOVERNOR_WORK> for Shared {
         // Sensor reads may sleep: take them before the device lock.
         let temp = thermal::hotspot_temperature_mc();
         let fans = this.actuators.lock().fans.boosted();
-        let (again, advice, want_fans) = {
+        let tick = {
             let mut state = this.state.lock();
-            match (*state).as_deref_mut() {
-                Some(firmware) => firmware.governor_tick(temp, fans),
-                None => (false, thermal::CpuAdvice::Release, false),
-            }
+            (*state).as_deref_mut().map(|firmware| firmware.governor_tick(temp, fans))
         };
         // Frequency QoS updates and SMC accesses may sleep: outside the device lock.
-        this.actuators.lock().apply(advice, want_fans, temp, now_ns());
+        let again = match tick {
+            Some((again, advice, want_fans)) => {
+                this.actuators.lock().apply(advice, want_fans, temp, now_ns());
+                again
+            }
+            // The firmware stopped (a fault, its recovery or an unbind): every actuator goes back
+            // at once, without the fan hold, and the work runs again until they are back.
+            None => this.actuators.lock().stop(),
+        };
         if again {
             this.queue_governor();
         }

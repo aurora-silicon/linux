@@ -466,8 +466,8 @@ fn fan_curve_enabled() -> bool {
     MOCK.lock().unwrap().fan_curve_enabled
 }
 
-fn target_mc() -> i32 {
-    90_000
+fn target_mc() -> Option<i32> {
+    Some(90_000)
 }
 
 fn fan_curve_permille(temp_mc: i32, target_mc: i32) -> i32 {
@@ -669,6 +669,69 @@ fn partial_first_curve_request_failure_cleans_up_and_blocks_handoff_until_releas
     }
     assert!(fans.boosted());
     fans.release();
+}
+
+#[test]
+fn budget_boost_is_reapplied_after_the_smc_takes_the_fans_back() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut s = MOCK.lock().unwrap();
+        s.reset();
+        s.enabled = true;
+        s.fan_boost_enabled = true;
+    }
+
+    let mut fans = FanBoost::new();
+    fans.apply(true, Some(99_000), 1_000_000_000);
+    assert_eq!(take_calls(), vec![FanCall::Budget(1000, 0)]);
+    assert_eq!(MOCK.lock().unwrap().budget_owned_mask, 0b11);
+    assert!(fans.boosted());
+
+    // Suspend, or the hwmon cell unbound and bound again, hands the fans back to the SMC behind
+    // the cache: the next governed step must ask again (a fan already at its maximum keeps it).
+    MOCK.lock().unwrap().budget_owned_mask = 0;
+    fans.apply(true, Some(99_000), 2_000_000_000);
+    assert_eq!(take_calls(), vec![FanCall::Budget(1000, FAN_CURVE_STEP_RPM)]);
+    assert_eq!(MOCK.lock().unwrap().budget_owned_mask, 0b11);
+    assert!(fans.boosted());
+    fans.release();
+}
+
+#[test]
+fn stop_releases_boosted_fans_inside_the_hold_and_reports_a_pending_release() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut s = MOCK.lock().unwrap();
+        s.reset();
+        s.enabled = true;
+        s.fan_boost_enabled = true;
+    }
+
+    let mut fans = FanBoost::new();
+    fans.apply(true, Some(99_000), 1_000_000_000);
+    assert_eq!(take_calls(), vec![FanCall::Budget(1000, 0)]);
+
+    // Not busy any more, inside the hold: a normal step keeps the fans boosted.
+    fans.apply(false, Some(99_000), 2_000_000_000);
+    assert_eq!(take_calls(), vec![]);
+    assert!(fans.boosted());
+
+    // The firmware stopped (fault, recovery or unbind): the fans go back at once.
+    assert!(!fans.stop());
+    assert_eq!(take_calls(), vec![FanCall::Budget(0, 0)]);
+    assert_eq!(MOCK.lock().unwrap().budget_owned_mask, 0);
+    assert!(!fans.boosted());
+
+    // A release the SMC refuses stays pending, so the caller runs again until it lands.
+    fans.apply(true, Some(99_000), 3_000_000_000);
+    assert_eq!(take_calls(), vec![FanCall::Budget(1000, 0)]);
+    MOCK.lock().unwrap().budget_rel_ok = false;
+    assert!(fans.stop());
+    assert_eq!(take_calls(), vec![FanCall::Budget(0, 0)]);
+    MOCK.lock().unwrap().budget_rel_ok = true;
+    assert!(!fans.stop());
+    assert_eq!(take_calls(), vec![FanCall::Budget(0, 0)]);
+    assert_eq!(MOCK.lock().unwrap().budget_owned_mask, 0);
 }
 
 #[test]
