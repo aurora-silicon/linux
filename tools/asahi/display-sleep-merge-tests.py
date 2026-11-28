@@ -56,7 +56,7 @@ assert prefix.index(v27) < prefix.index(native)
 pre = common + r'''
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
-struct apple_dcp { bool v27, native26, crashed, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
+struct apple_dcp { bool v27, native26, crashed, sleep_cold_stopped, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
 struct device { struct apple_dcp *d; };
 static int invalidations, cancellations, disables; static bool firmware;
 static void *dev_get_drvdata(struct device *v) { return v->d; }
@@ -74,6 +74,7 @@ int main(void) {
  d.v27=false; d.crashed=true; assert(dcp_platform_prepare(&dev)==-EIO && cancellations==0);
  d.crashed=false; assert(dcp_platform_prepare(&dev)==0 && cancellations==1 && disables==1 && d.ext26_pm_work_off);
  d.native26=false; d.v27=true; firmware=false; assert(dcp_platform_prepare(&dev)==42 && invalidations==1);
+ d.sleep_cold_stopped=true; firmware=true; assert(dcp_platform_prepare(&dev)==0 && invalidations==1 && cancellations==1);
 }
 '''
 for label, body, negative in [('prepare', prefix, False),
