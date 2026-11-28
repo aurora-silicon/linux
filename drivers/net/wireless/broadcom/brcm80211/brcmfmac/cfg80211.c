@@ -91,6 +91,17 @@
 #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
 
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
+/*
+ * PM2 sleep return used when nobody set a timeout, which is the normal
+ * case: cfg80211 passes -1 unless wext set one. With power save on, a
+ * BCM4388 (J604) drew 101, 102 and 106.5 mW on the Wi-Fi rail at 10, 20
+ * and 50 ms, then 123, 151.5 and 357.5 mW at 100, 200 and 2000 ms, with
+ * no ping lost at any value. On a BCM4378 (J313), 20 ms drew 329 mW less
+ * than 2000 ms for +4.3 ms average RTT. 20 ms is in the flat part of that
+ * curve. It is not read from the firmware: both chips boot with a 200 ms
+ * return, which is above the flat part.
+ */
+#define BRCMF_PS_NAP_TIMEOUT_MS		20
 
 #define BRCMF_LPAS_UNICAST_FILTER_ID	100
 #define BRCMF_LPAS_MAGIC_FILTER_ID	101
@@ -3522,6 +3533,7 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 	}
 
 	err = brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
+				timeout < 0 ? BRCMF_PS_NAP_TIMEOUT_MS :
 				min_t(u32, timeout, BRCMF_PS_MAX_TIMEOUT_MS));
 	if (err)
 		bphy_err(drvr, "Unable to set pm timeout, (%d)\n", err);
