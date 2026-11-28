@@ -273,7 +273,7 @@
 		opp-912000000 {
 			opp-hz = /bits/ 64 <912000000>;
 			opp-level = <1>;
-			opp-microwatt = <289000>;
+			opp-microwatt = <279000>;
 		};
 		opp-1260000000 {
 			opp-hz = /bits/ 64 <1260000000>;
