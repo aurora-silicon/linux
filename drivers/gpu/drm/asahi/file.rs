@@ -94,6 +94,9 @@ pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
     uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Render commands accept tile buffers of up to 48 KiB.
+pub(crate) const DRM_ASAHI_FEATURE_TILE_BUFFER_48K: u64 =
+    uapi::DRM_ASAHI_FEATURE_TILE_BUFFER_48K as u64;
 /// Compute commands may declare a stream that ends with a memory-scoped flush
 /// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
@@ -171,41 +174,20 @@ impl Drop for Vm {
             // object must not outlive the client's VM handle.
             status.release_mirror();
         }
-        if self.vm.status().is_some() {
-            // Tracked jobs can outlive their file's VM handle. Their last guard performs
-            // these unmaps once no accepted work can still dereference the mappings.
-            if let Err(error) = self
-                .vm
-                .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
-            {
-                pr_err!("Vm::Drop: deferred user unmap failed: {:?}\n", error);
-            }
-            self.vm.bo_deferred_cleanup();
-            self.gpu.vm_closed(&self.vm);
-            return;
-        }
-        // When the user Vm is dropped, verify that no user mappings exists.
-        let left_range = self.user_range.start..self.kernel_range.start;
-        let right_range = self.kernel_range.end..self.user_range.end;
-
-        if !left_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, left_range.start, left_range.range())
-                .is_err()
+        // Tracked jobs can outlive their file's VM handle: their last guard runs the
+        // teardown once no accepted work can still dereference the mappings. On
+        // untracked VMs this unmaps every user GPUVA at once without allocating or
+        // charging split nodes, so teardown succeeds even at the client's memory limit.
+        if let Err(error) = self
+            .vm
+            .unmap_user_ranges(self.user_range.clone(), self.kernel_range.clone())
         {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
+            pr_err!("Vm::Drop: user unmap failed: {:?}\n", error);
         }
-        if !right_range.is_empty()
-            && self
-                .vm
-                .unmap_range(None, right_range.start, right_range.range())
-                .is_err()
-        {
-            pr_err!("Vm::Drop: vm.unmap_range() failed\n");
-        }
-
         self.vm.bo_deferred_cleanup();
+        if self.vm.status().is_some() {
+            self.gpu.vm_closed(&self.vm);
+        }
     }
 }
 
@@ -295,13 +277,15 @@ impl SyncItem {
         in_count: u32,
         out_count: u32,
         allow_cumulative: bool,
-    ) -> Result<KVec<SyncItem>> {
+    ) -> Result<KVVec<SyncItem>> {
         let count = in_count.checked_add(out_count).ok_or(EOVERFLOW)?;
 
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         const CHUNK: usize = 8;
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        // Userspace sets the count. Charge the allocation to the caller and
+        // allow noncontiguous backing pages.
+        let mut vec = KVVec::with_capacity(count as usize, GFP_KERNEL_ACCOUNT)?;
         let mut anchor = None;
 
         // Read each record once in small stack chunks so validation and use see the
@@ -334,7 +318,7 @@ impl SyncItem {
                 }
                 vec.push(
                     Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
-                    GFP_KERNEL,
+                    GFP_KERNEL_ACCOUNT,
                 )?;
             }
             base += chunk as u32;
@@ -398,7 +382,7 @@ pub(crate) struct TableQueue {
     queue: KBox<dyn queue::Queue>,
     /// Reusable staging buffer for `SUBMIT` command buffers, avoiding per-submit heap
     /// allocations and keeping large command buffers off the kernel stack.
-    cmdbuf: KVec<u8>,
+    cmdbuf: KVVec<u8>,
     _share: Option<queue_share::Share>,
 }
 
@@ -408,13 +392,13 @@ impl TableQueue {
 
     /// Takes the cached command-buffer staging allocation so userspace copies run outside the
     /// queue mutex (preventing `queue.lock()` -> `mmap_lock` lock-order inversion).
-    fn take_cmdbuf(&mut self) -> KVec<u8> {
+    fn take_cmdbuf(&mut self) -> KVVec<u8> {
         core::mem::take(&mut self.cmdbuf)
     }
 
     /// Returns a cleared command-buffer allocation to the per-queue cache when within the
     /// reuse capacity cap; oversized buffers are dropped.
-    fn return_cmdbuf(&mut self, mut buf: KVec<u8>) {
+    fn return_cmdbuf(&mut self, mut buf: KVVec<u8>) {
         buf.clear();
         if buf.capacity() > 0
             && buf.capacity() <= Self::REUSE_CMDBUF_CAP
@@ -425,11 +409,11 @@ impl TableQueue {
     }
 }
 
-fn copy_cmdbuf_from_user(buf: &mut KVec<u8>, addr: u64, size: usize) -> Result {
+fn copy_cmdbuf_from_user(buf: &mut KVVec<u8>, addr: u64, size: usize) -> Result {
     buf.clear();
     UserSlice::new(UserPtr::from_addr(addr as usize), size)
         .reader()
-        .read_all(buf, GFP_KERNEL)
+        .read_all(buf, GFP_KERNEL_ACCOUNT)
 }
 
 impl Deref for TableQueue {
@@ -478,6 +462,18 @@ pub(crate) type DrmFile = drm::File<File>;
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
+
+/// Most VMs one file may hold at a time. Mesa creates one per file. Each VM holds kernel memory
+/// that is not charged to the client (its GPUVM, allocators and per-VM objects).
+const MAX_VMS_PER_FILE: u32 = 64;
+
+/// Takes a slot for a new VM in a file's VM table, or fails with EBUSY past
+/// [`MAX_VMS_PER_FILE`], as the ID allocator reports a full range.
+fn reserve_vm_slot<'a>(
+    vms: &'a xarray::XArray<KBox<Vm>>,
+) -> Result<xarray::Reservation<'a, KBox<Vm>>> {
+    vms.lock().reserve_limit(1..=MAX_VMS_PER_FILE, GFP_KERNEL)
+}
 
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;
@@ -761,6 +757,11 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        // Take the table slot first, so that a VM past the cap is refused before anything of it
+        // is built.
+        let vm_xa = file.inner().vms();
+        let resv = reserve_vm_slot(vm_xa.get_ref())?;
+        let id: u32 = resv.index().try_into()?;
         reg_data.gpu.admit_vm(
             device.as_ref().as_ref(),
             file.inner()
@@ -810,10 +811,6 @@ impl File {
                 }
             },
         );
-
-        let vm_xa = file.inner().vms();
-        let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
-        let id: u32 = resv.index().try_into()?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM Create\n", file_id, id);
         mod_dev_dbg!(
@@ -1855,7 +1852,7 @@ impl File {
         resv.fill(Arc::pin_init(
             new_mutex!(TableQueue {
                 queue,
-                cmdbuf: KVec::new(),
+                cmdbuf: KVVec::new(),
                 _share: share,
             }),
             GFP_KERNEL,
@@ -2073,6 +2070,38 @@ impl Drop for File {
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
         Self::mark_clients_closed(this, |_| true);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_vm_table)]
+mod vm_table_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_holds_at_most_max_vms_per_file() -> Result {
+        let vms = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let mut held = KVec::new();
+        for _ in 0..MAX_VMS_PER_FILE {
+            held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        }
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // A destroyed VM frees its slot for the next.
+        held.pop();
+        held.push(reserve_vm_slot(&vms)?, GFP_KERNEL)?;
+        assert_eq!(reserve_vm_slot(&vms).err(), Some(EBUSY));
+        // Another file's VM table has its own budget while the first is full.
+        let other = KBox::pin_init(
+            xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+            GFP_KERNEL,
+        )?;
+        let _other_slot = reserve_vm_slot(&other)?;
+        // Closing the first file releases every slot for reuse.
+        held.clear();
+        let _reused = reserve_vm_slot(&vms)?;
+        Ok(())
     }
 }
 

@@ -174,8 +174,11 @@
 
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j615.bin";
-	/* The 27.x trackpad firmware answers only the two-stage power command. */
-	apple,power-method = <2>;
+	/*
+	 * No apple,power-method: the 14.7 trackpad firmware takes only
+	 * method 1 and the 27.x firmware only method 2. dockchannel-hid
+	 * starts with method 1 and moves to method 2 when it is rejected.
+	 */
 };
 
 /* The J615 MTP firmware cannot be restarted once quiesced: hand it over running. */
@@ -237,12 +240,3 @@
 	};
 };
 
-/* ADT /arm-io/spi4/dp855; chip select = /arm-io/spi4 function-spi_cs0. */
-&spi4 {
-	cs-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_LOW>;
-	status = "okay";
-};
-
-&tcon {
-	status = "okay";
-};

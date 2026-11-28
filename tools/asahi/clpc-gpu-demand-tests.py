@@ -256,6 +256,8 @@ def main():
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int atomic_t;
+static void atomic_set(atomic_t *v, int i) { *v = i; }
 struct device;
 #define APPLE_CLPC_LEVELS 4
 #define APPLE_CLPC_HOLD_MS 32
@@ -326,6 +328,7 @@ struct apple_clpc {
  bool low_power;
  unsigned int low_power_khz;
  unsigned int low_power_mw;
+ atomic_t idle_armed;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }

@@ -110,7 +110,8 @@ fn enable_als(
     arm_ct817(aop, dev.as_ref(), svc)
 }
 
-/// Arms the CT817: its configuration, then the interval that starts the reports.
+/// Arms the CT817: interval zero, its configuration, then the interval that
+/// starts the reports.
 fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<()> {
     // The CT817 gets its calibration from the AOP driver over the setup port,
     // not as an ALS property. Only the transport can fail here; the sensor's
@@ -123,6 +124,10 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
         dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
+    // The sensor arms only on a zero to non-zero transition of the interval.
+    // It is zero at boot and stopped after a sleep, but a previous driver
+    // instance may have left it running, so write zero first every time.
+    set(ALS_PROP_INTERVAL, 0, "interval")?;
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
     set(
         ALS_PROP_BATCH_INTERVAL,
@@ -130,19 +135,24 @@ fn arm_ct817(aop: &dyn AOP, dev: &device::Device, svc: &EPICService) -> Result<(
         "batch interval",
     )?;
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
-    // The interval is zero at probe, and the wake writes it to zero first, so
-    // this is the transition that arms the sensor.
+    // The transition that arms the sensor.
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
 }
 
-/// Arms the CT817 again after system sleep.
+/// Stops the reports for system sleep and starts them again after it.
 ///
-/// The firmware stops the light sensor's reports for system sleep and does not
-/// start them again: on the J700 every read after the first wake of a boot
-/// returned the last sample from before that sleep, while the room's light
-/// changed. The sensor starts reporting only on a zero to non-zero transition
-/// of its interval, so the wake writes the interval to zero and then repeats
-/// the arming of the probe.
+/// The sensor reports on its own every `ALS_INTERVAL_US`, and each report is
+/// an AOP mailbox interrupt. In suspend-to-idle those interrupts go on and
+/// wake a CPU for a reading nobody takes, so the reports stop before the
+/// sleep, as the lid angle driver's do.
+///
+/// The CT817 needs more after the sleep: the firmware stops its reports for
+/// system sleep and does not start them again. On the J700 every read after
+/// the first wake of a boot returned the last sample from before that sleep,
+/// while the room's light changed. The sensor starts reporting only on a zero
+/// to non-zero transition of its interval, so the wake repeats the arming of
+/// the probe, which starts with an interval of zero. The other parts need only
+/// their interval back.
 #[repr(C)]
 struct PmHook {
     /// First, so that the callback finds the hook from it.
@@ -150,6 +160,12 @@ struct PmHook {
     dev: ARef<device::Device>,
     aop: Arc<dyn AOP>,
     service: EPICService,
+    /// The part arms only through the whole CT817 sequence.
+    ct817: bool,
+    /// A stop was tried for the sleep in progress. It is set before the
+    /// command goes out: a stop whose reply was lost may still have been
+    /// applied, so the wake restores the interval after every attempt.
+    stop_attempted: Atomic<bool>,
     registered: Atomic<bool>,
 }
 
@@ -163,17 +179,45 @@ unsafe extern "C" fn pm_event(
     action: usize,
     _data: *mut c_void,
 ) -> c_int {
-    if action as u32 != bindings::PM_POST_SUSPEND {
-        return bindings::NOTIFY_DONE as c_int;
-    }
     // SAFETY: `nb` is the first field of a registered `PmHook`.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let aop = hook.aop.as_ref();
-    let rearm = set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes())
-        .and_then(|_| arm_ct817(aop, &hook.dev, &hook.service));
-    match rearm {
-        Ok(()) => dev_dbg!(hook.dev, "reports armed again after sleep\n"),
-        Err(e) => dev_warn!(hook.dev, "reports not armed again after sleep: {:?}\n", e),
+    match action as u32 {
+        bindings::PM_SUSPEND_PREPARE => {
+            // A sensor that keeps reporting only costs wakeups: never refuse
+            // the sleep over it.
+            hook.stop_attempted.store(true, Relaxed);
+            match set_als_property(aop, &hook.service, ALS_PROP_INTERVAL, &0u32.to_le_bytes()) {
+                Ok(_) => dev_dbg!(hook.dev, "reports off for sleep\n"),
+                Err(e) => dev_warn!(hook.dev, "reports may be left on for sleep: {:?}\n", e),
+            }
+        }
+        bindings::PM_POST_SUSPEND => {
+            let attempted = hook.stop_attempted.xchg(false, Relaxed);
+            // The CT817 is stopped by the firmware even when the host did not
+            // stop it, so it is armed again after every sleep. The other parts
+            // get their interval back after every attempted stop, whether or
+            // not the stop's reply arrived; writing the active interval to a
+            // sensor that kept reporting changes nothing.
+            let rearm = if hook.ct817 {
+                arm_ct817(aop, &hook.dev, &hook.service)
+            } else if attempted {
+                set_als_property(
+                    aop,
+                    &hook.service,
+                    ALS_PROP_INTERVAL,
+                    &ALS_INTERVAL_US.to_le_bytes(),
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            match rearm {
+                Ok(()) => dev_dbg!(hook.dev, "reports back after sleep\n"),
+                Err(e) => dev_warn!(hook.dev, "reports not back after sleep: {:?}\n", e),
+            }
+        }
+        _ => return bindings::NOTIFY_DONE as c_int,
     }
     bindings::NOTIFY_OK as c_int
 }
@@ -223,6 +267,7 @@ impl PmHook {
         dev: &device::Device,
         aop: Arc<dyn AOP>,
         service: EPICService,
+        ct817: bool,
     ) -> Result<Pin<KBox<Self>>> {
         let hook = KBox::pin(
             Self {
@@ -234,6 +279,8 @@ impl PmHook {
                 dev: dev.into(),
                 aop,
                 service,
+                ct817,
+                stop_attempted: Atomic::new(false),
                 registered: Atomic::new(false),
             },
             GFP_KERNEL,
@@ -344,11 +391,13 @@ enum AlsIio {
 }
 
 struct IIOAopAlsDriver {
-    /// Fields are declared in teardown order: the wake hook (CT817 only)
-    /// first, then the subscription, which ends before the IIO device goes.
-    pm: Option<Pin<KBox<PmHook>>>,
+    /// Fields are declared in teardown order: the sleep hook first, then the
+    /// subscription, which ends before the IIO device goes.
+    pm: Pin<KBox<PmHook>>,
     listener: FakehidRegistration,
     _iio: AlsIio,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
 }
 
 fn register_channels<const N: usize>(
@@ -425,21 +474,28 @@ impl platform::Driver for IIOAopAlsDriver {
                 },
             )
         };
-        let pm = if offset == LUX_OFFSET_CT817 {
-            Some(PmHook::new(dev, adata, service)?)
-        } else {
-            None
-        };
+        let pm = PmHook::new(dev, adata.clone(), service, offset == LUX_OFFSET_CT817)?;
         Ok(IIOAopAlsDriver {
             pm,
             listener,
             _iio: iio,
+            aop: adata,
+            service,
         })
     }
 
-    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
-        if let Some(pm) = &this.pm {
-            pm.unregister();
+    fn unbind(dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        this.pm.unregister();
+        // The sensor keeps reporting until its interval is zero, and every
+        // report is an AOP mailbox interrupt. Stop it before the listener
+        // goes; a failure only costs those interrupts, so unbind goes on.
+        if let Err(e) = set_als_property(
+            this.aop.as_ref(),
+            &this.service,
+            ALS_PROP_INTERVAL,
+            &0u32.to_le_bytes(),
+        ) {
+            dev_warn!(dev.as_ref(), "reports not stopped at unbind: {:?}\n", e);
         }
         this.listener.unregister();
     }

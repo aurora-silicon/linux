@@ -1891,6 +1891,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec0: connector {
 			compatible = "usb-c-connector";
@@ -1929,6 +1930,7 @@
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 	};
 
 	hpm1: usb-pd@a {
@@ -1940,6 +1942,7 @@
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1981,6 +1984,7 @@
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
 		apple,event-irq-in-sleep;
+		apple,sleep-ssps;
 
 		typec2: connector {
 			compatible = "usb-c-connector";

@@ -488,9 +488,10 @@ static int centauri_resume(struct device *dev)
 
 static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, centauri_resume);
 
-/* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver needs functions
- * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and reaches function 2 only
- * through config space and its struct device for DMA.
+/* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver binds functions
+ * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and enables function 2's
+ * memory space during IPC bootstrap so centauri_beta_running() can poll Beta's BAR0 safely
+ * even when btcentauri has not probed yet.
  */
 static const struct pci_device_id centauri_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1900), .driver_data = 0x8000 },

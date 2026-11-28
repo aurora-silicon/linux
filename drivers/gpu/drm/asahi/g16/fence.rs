@@ -562,13 +562,13 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 /// contract of `tracked_submission`). Cumulative output bundles reuse the shared
 /// `g17::sync_output::SignalBundle` scope chain.
 pub(crate) struct Syncs {
-    syncs: KVec<SyncItem>,
+    syncs: KVVec<SyncItem>,
     input_count: usize,
     cumulative: Option<crate::g17::sync_output::SignalBundle>,
 }
 
 impl Syncs {
-    pub(crate) fn new(mut syncs: KVec<SyncItem>, input_count: usize) -> Self {
+    pub(crate) fn new(mut syncs: KVVec<SyncItem>, input_count: usize) -> Self {
         let cumulative = syncs.iter_mut().find_map(|sync| sync.cumulative.take());
         Self {
             syncs,

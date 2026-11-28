@@ -404,6 +404,8 @@ struct apple_dart {
 	 */
 	bool display_dark;
 	bool display_tlb_stale;
+	unsigned int display_writers;
+	unsigned int display_dark_writers;
 	DECLARE_BITMAP(display_tcr_four, DART_MAX_STREAMS);
 	/* T8020: its enabled streams and translations, saved at the display's power-down */
 	u32 display_enable;
@@ -2974,6 +2976,9 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 	 * publishing the page table or powering another DART failed.
 	 */
 	for_each_stream_map(i, domain, map) {
+		unsigned long flags;
+		bool dark;
+
 		stream.dart = map->dart;
 		for (j = 0; j < BITS_TO_LONGS(stream.dart->num_streams); j++)
 			stream.sidmap[j] = atomic_long_read(&map->sidmap[j]);
@@ -2983,10 +2988,21 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		 * Its display is powered off: publish to memory only. With its streams off
 		 * nothing walks the tables, and the TLB is invalidated before they're on.
 		 */
-		if (READ_ONCE(stream.dart->display_dark)) {
+		spin_lock_irqsave(&stream.dart->managed_lock, flags);
+		dark = stream.dart->display_dark;
+		if (dark) {
+			stream.dart->display_dark_writers++;
+			WRITE_ONCE(stream.dart->display_tlb_stale, true);
+		} else {
+			stream.dart->display_writers++;
+		}
+		spin_unlock_irqrestore(&stream.dart->managed_lock, flags);
+		if (dark) {
 			ret = stream.dart->locked ?
 				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
-			WRITE_ONCE(stream.dart->display_tlb_stale, true);
+			spin_lock_irqsave(&stream.dart->managed_lock, flags);
+			stream.dart->display_dark_writers--;
+			spin_unlock_irqrestore(&stream.dart->managed_lock, flags);
 			err = err ?: ret;
 			continue;
 		}
@@ -2998,12 +3014,18 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			ret = stream.dart->locked ?
 				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
 			apple_dart_sleep_writer_put(stream.dart, gate);
+			spin_lock_irqsave(&stream.dart->managed_lock, flags);
+			stream.dart->display_writers--;
+			spin_unlock_irqrestore(&stream.dart->managed_lock, flags);
 			err = err ?: ret;
 			continue;
 		}
 		ret = pm_runtime_resume_and_get(stream.dart->dev);
 		if (ret < 0) {
 			apple_dart_sleep_writer_put(stream.dart, gate);
+			spin_lock_irqsave(&stream.dart->managed_lock, flags);
+			stream.dart->display_writers--;
+			spin_unlock_irqrestore(&stream.dart->managed_lock, flags);
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to power DART for TLB synchronization: %d\n", ret);
 			err = err ?: ret;
@@ -3034,6 +3056,9 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			apple_dart_managed_quarantine(stream.dart);
 		pm_runtime_put(stream.dart->dev);
 		apple_dart_sleep_writer_put(stream.dart, gate);
+		spin_lock_irqsave(&stream.dart->managed_lock, flags);
+		stream.dart->display_writers--;
+		spin_unlock_irqrestore(&stream.dart->managed_lock, flags);
 		err = err ?: ret;
 	}
 	return err;
@@ -5463,11 +5488,13 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	 * faulting. Its line can be shared or still pending, so leave it alone;
 	 * apple_dart_host_power_off() waits for a handler already past this.
 	 */
-	if (READ_ONCE(dart->commands_gated) || READ_ONCE(dart->host_off))
+	if (READ_ONCE(dart->commands_gated) || READ_ONCE(dart->host_off) ||
+	    READ_ONCE(dart->display_dark))
 		return IRQ_NONE;
 	if (pm_runtime_resume_and_get(dart->dev) < 0)
 		return IRQ_NONE;
-	if (!READ_ONCE(dart->commands_gated) && !READ_ONCE(dart->host_off))
+	if (!READ_ONCE(dart->commands_gated) && !READ_ONCE(dart->host_off) &&
+	    !READ_ONCE(dart->display_dark))
 		ret = dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
 	return ret;
@@ -8454,6 +8481,101 @@ EXPORT_SYMBOL_GPL(apple_dart_gapf_ready);
  * power-up the translations saved at the power-down are written back when they were
  * lost and the DART is unlocked; lost and still locked, it stays off.
  */
+static int apple_dart_display_dark_exit(struct apple_dart *dart);
+
+/*
+ * Close admission to display DART MMIO and drain in-flight TLB flushes, map
+ * TCR readers, and fault IRQ handlers before the display domain powers down.
+ */
+static int apple_dart_display_dark_enter(struct apple_dart *dart)
+{
+	unsigned long flags;
+	unsigned int sid, tries;
+	bool entered = false;
+
+	if (!READ_ONCE(dart->display_dark)) {
+		for (sid = 0; sid < dart->num_streams; sid++)
+			__assign_bit(sid, dart->display_tcr_four,
+				     readl(dart->regs + DART_TCR(dart, sid)) &
+				     dart->hw->tcr_4level);
+		spin_lock_irqsave(&dart->managed_lock, flags);
+		if (!dart->display_dark) {
+			WRITE_ONCE(dart->display_dark, true);
+			entered = true;
+		}
+		spin_unlock_irqrestore(&dart->managed_lock, flags);
+	}
+
+	for (tries = 0; tries < 10000; tries++) {
+		bool busy;
+
+		spin_lock_irqsave(&dart->managed_lock, flags);
+		busy = dart->display_writers != 0;
+		spin_unlock_irqrestore(&dart->managed_lock, flags);
+		if (!busy)
+			break;
+		usleep_range(10, 20);
+	}
+	if (tries == 10000) {
+		if (entered)
+			apple_dart_display_dark_exit(dart);
+		dev_err(dart->dev, "display DART TLB writers did not drain before power-down\n");
+		return -EBUSY;
+	}
+
+	/* Serialize with map paths reading DART_TCR under dart->lock. */
+	spin_lock_irqsave(&dart->lock, flags);
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	if (dart->irq > 0)
+		synchronize_irq(dart->irq);
+	return 0;
+}
+
+static int apple_dart_display_dark_exit(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map all = { .dart = dart };
+	unsigned long flags;
+	unsigned int tries;
+	int ret;
+
+	bitmap_fill(all.sidmap, dart->num_streams);
+	for (tries = 0; tries < 10000; tries++) {
+		bool stale = false;
+
+		spin_lock_irqsave(&dart->managed_lock, flags);
+		if (!dart->display_dark) {
+			spin_unlock_irqrestore(&dart->managed_lock, flags);
+			return 0;
+		}
+		if (!dart->display_dark_writers) {
+			stale = READ_ONCE(dart->display_tlb_stale);
+			WRITE_ONCE(dart->display_tlb_stale, false);
+			if (!stale) {
+				WRITE_ONCE(dart->display_dark, false);
+				spin_unlock_irqrestore(&dart->managed_lock, flags);
+				return 0;
+			}
+		}
+		spin_unlock_irqrestore(&dart->managed_lock, flags);
+		if (stale) {
+			ret = dart->hw->invalidate_tlb(&all);
+			if (ret) {
+				spin_lock_irqsave(&dart->managed_lock, flags);
+				WRITE_ONCE(dart->display_tlb_stale, true);
+				spin_unlock_irqrestore(&dart->managed_lock, flags);
+				dev_err(dart->dev, "TLB invalidation at power-on failed: %d\n",
+					ret);
+				return ret;
+			}
+			continue;
+		}
+		usleep_range(10, 20);
+	}
+	dev_err(dart->dev, "display DART dark writers did not drain at power-on\n");
+	return -EBUSY;
+}
+
 static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams, bool on,
 					    bool flush)
 {
@@ -8477,6 +8599,8 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
 			ret = apple_dart_hw_reset(dart);
 			if (ret && ret != -EBUSY)
 				dev_warn(dart->dev, "reset at power-on: %d\n", ret);
+			/* Keep target streams disabled until dark drain and TLB flush succeed. */
+			writel(readl(enable) & ~streams, enable);
 			for (sid = 0; sid < dart->num_streams; sid++) {
 				for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 					writel(dart->save_ttbr[sid][idx],
@@ -8489,19 +8613,22 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
 		error = readl(dart->regs + DART_T8020_ERROR);
 		if (error & DART_T8020_ERROR_FLAG)
 			writel(error, dart->regs + DART_T8020_ERROR);
+		/*
+		 * Drain dark page-table writers and invalidate the TLB before
+		 * enabling streams or reopening DMA.
+		 */
+		scoped_guard(spinlock_irqsave, &dart->managed_lock)
+			WRITE_ONCE(dart->display_tlb_stale, true);
+		ret = apple_dart_display_dark_exit(dart);
+		if (ret)
+			return ret;
 		if (dart->display_saved)
 			writel(readl(enable) | (dart->display_enable & streams), enable);
-		/* Maps and unmaps while it was off left their invalidations to here. */
-		bitmap_fill(map.sidmap, dart->num_streams);
-		if (dart->hw->invalidate_tlb(&map))
-			dev_err(dart->dev, "TLB invalidation at power-on failed\n");
 		dart->host_off_slept = false;
 		dart->display_saved = false;
 		dart->sleep_flushed = false;
-		WRITE_ONCE(dart->display_tlb_stale, false);
-		WRITE_ONCE(dart->display_dark, false);
 		WRITE_ONCE(dart->host_off, false);
-		return ret;
+		return 0;
 	}
 
 	/*
@@ -8515,11 +8642,10 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
 		apple_dart_save_state(dart);
 		dart->display_enable = readl(enable);
 		dart->display_saved = true;
-		for (sid = 0; sid < dart->num_streams; sid++)
-			__assign_bit(sid, dart->display_tcr_four,
-				     dart->save_tcr[sid] & dart->hw->tcr_4level);
-		WRITE_ONCE(dart->display_dark, true);
 	}
+	ret = apple_dart_display_dark_enter(dart);
+	if (ret)
+		return ret;
 	writel(readl(enable) & ~streams, enable);
 	if (flush) {
 		for_each_set_bit(sid, &bits, dart->num_streams)
@@ -8554,16 +8680,17 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
  */
 int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
 {
-	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; } keep[2];
+	/* Two DARTs (DCP and display) for each of the T6041's five display processors. */
+	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; } keep[10];
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned long bits = streams;
 	unsigned int sid, idx, k, n = 0;
 
 	if (!dart)
 		return -ENODEV;
-	for (k = 0; k < 2 && keep[k].dart && keep[k].dart != dart; k++)
+	for (k = 0; k < ARRAY_SIZE(keep) && keep[k].dart && keep[k].dart != dart; k++)
 		;
-	if (k == 2)
+	if (k == ARRAY_SIZE(keep))
 		return -ENOSPC;
 	if (!save && keep[k].dart != dart)
 		return -ENOENT;
@@ -8611,15 +8738,9 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 		apple_dart_gapf_protect(dart);
 		dart->sleep_flushed = false;
 		/* Maps or unmaps while it was dark left their invalidations here. */
-		if (READ_ONCE(dart->display_tlb_stale)) {
-			struct apple_dart_stream_map all = { .dart = dart };
-
-			bitmap_fill(all.sidmap, dart->num_streams);
-			if (dart->hw->invalidate_tlb(&all))
-				dev_err(dev, "TLB invalidation at power-on failed\n");
-			WRITE_ONCE(dart->display_tlb_stale, false);
-		}
-		WRITE_ONCE(dart->display_dark, false);
+		ret = apple_dart_display_dark_exit(dart);
+		if (ret)
+			return ret;
 		writel(0, dart->regs + 0x210);
 		writel(0, dart->regs + 0x4060);
 		writel(streams, dart->regs + DART_T8110_ENABLE_STREAMS);
@@ -8629,13 +8750,9 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	if (flush && dart->sleep_flushed)
 		return 0;
 
-	if (!READ_ONCE(dart->display_dark)) {
-		for (sid = 0; sid < dart->num_streams; sid++)
-			__assign_bit(sid, dart->display_tcr_four,
-				     readl(dart->regs + DART_TCR(dart, sid)) &
-				     dart->hw->tcr_4level);
-		WRITE_ONCE(dart->display_dark, true);
-	}
+	ret = apple_dart_display_dark_enter(dart);
+	if (ret)
+		return ret;
 
 	writel(U32_MAX, dart->regs + 0x4060);
 	writel(0, dart->regs + 0x4000);
@@ -8690,30 +8807,15 @@ EXPORT_SYMBOL_GPL(apple_dart_enabled_streams);
  * into it: dark, maps reach memory only and their invalidations wait; lit, those run. Its
  * streams are left as they are. Call it dark while it's still powered.
  */
-void apple_dart_power_dark(struct device *dev, bool dark)
+int apple_dart_power_dark(struct device *dev, bool dark)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
-	unsigned int sid;
 
-	if (dark) {
-		if (READ_ONCE(dart->display_dark))
-			return;
-		for (sid = 0; sid < dart->num_streams; sid++)
-			__assign_bit(sid, dart->display_tcr_four,
-				     readl(dart->regs + DART_TCR(dart, sid)) &
-				     dart->hw->tcr_4level);
-		WRITE_ONCE(dart->display_dark, true);
-		return;
-	}
-	if (READ_ONCE(dart->display_tlb_stale)) {
-		struct apple_dart_stream_map all = { .dart = dart };
-
-		bitmap_fill(all.sidmap, dart->num_streams);
-		if (dart->hw->invalidate_tlb(&all))
-			dev_err(dev, "TLB invalidation at power-on failed\n");
-		WRITE_ONCE(dart->display_tlb_stale, false);
-	}
-	WRITE_ONCE(dart->display_dark, false);
+	if (!dart)
+		return -ENODEV;
+	if (dark)
+		return apple_dart_display_dark_enter(dart);
+	return apple_dart_display_dark_exit(dart);
 }
 EXPORT_SYMBOL_GPL(apple_dart_power_dark);
 

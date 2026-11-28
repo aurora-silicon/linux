@@ -33,6 +33,7 @@ struct centauri_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
 	void __iomem *bar[3];
+	bool enabled[3];
 	struct cen_context control, alpha;
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
 	struct cen_buffer *alpha_log;
@@ -426,7 +427,7 @@ static int enumerate_functions(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
 	u16 control;
-	int i, cap;
+	int i, cap, ret;
 	dma_addr_t msi;
 
 	pci_lock_rescan_remove();
@@ -442,6 +443,14 @@ static int enumerate_functions(struct centauri *c)
 			return -ENODEV;
 		if (!(pci_resource_flags(ipc->function[i], 0) & IORESOURCE_MEM))
 			return -ENODEV;
+		if (i) {
+			device_lock(&ipc->function[i]->dev);
+			ret = pci_enable_device_mem(ipc->function[i]);
+			device_unlock(&ipc->function[i]->dev);
+			if (ret)
+				return ret;
+			ipc->enabled[i] = true;
+		}
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
 		if (!ipc->bar[i])
 			return -ENOMEM;
@@ -558,9 +567,11 @@ failed:
  */
 bool centauri_beta_running(struct centauri *c)
 {
-	void __iomem *bar = c->ipc ? c->ipc->bar[2] : NULL;
+	struct centauri_ipc *ipc = c->ipc;
 
-	return bar && readl(bar + 0x18) == 2 && !readl(bar);
+	if (!ipc || !ipc->enabled[2] || !ipc->bar[2])
+		return false;
+	return readl(ipc->bar[2] + 0x18) == 2 && !readl(ipc->bar[2]);
 }
 
 void centauri_free_ipc(struct centauri *c)
@@ -595,6 +606,11 @@ void centauri_free_ipc(struct centauri *c)
 	for (i = 0; i < 3; i++) {
 		if (ipc->bar[i])
 			pci_iounmap(ipc->function[i], ipc->bar[i]);
+		if (ipc->enabled[i]) {
+			device_lock(&ipc->function[i]->dev);
+			pci_disable_device(ipc->function[i]);
+			device_unlock(&ipc->function[i]->dev);
+		}
 		pci_dev_put(ipc->function[i]);
 	}
 	kfree(ipc);

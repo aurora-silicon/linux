@@ -314,16 +314,6 @@
 	status = "okay";
 };
 
-&nub_spmi1 {
-	status = "okay";
-
-	pmic@e {
-		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
-		reg = <0xe SPMI_USID>;
-		read-only;
-	};
-};
-
 &i2c2 {
 	retimer@18 {
 		compatible = "apple,t8112-atcrt", "apple,atcrt";

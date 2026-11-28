@@ -11,6 +11,7 @@
 #include "ane_fw_transport.h"
 #include "ane_h16_load.h"
 #include "ane_h16_pending.h"
+#include "ane_stats.h"
 
 /*
  * Program lifecycle for one H16 firmware session: LOAD_PROGRAM, CREATE_PROCESS,
@@ -414,6 +415,14 @@ struct ane_h16_session {
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
 	spinlock_t stats_lock;
 	struct ane_h16_exec_stats stats;
+	/*
+	 * The sysfs ane_stats counters: every request published to the
+	 * firmware, failed ones included, and the union of their busy time.
+	 * Unlike stats, they never reset. One ring slot: no timeline is kept.
+	 */
+	struct ane_stats_counters sysfs_ctrs;
+	struct ane_stats_ring sysfs_ring;
+	struct ane_stats_ring_entry sysfs_slot;
 	/* Exports whose last mapping is gone, returned by export_work. */
 	spinlock_t export_lock;
 	struct list_head exports_done;

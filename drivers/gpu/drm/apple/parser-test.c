@@ -1658,6 +1658,28 @@ static void parser_panel_adt_color_target(struct kunit *test)
 	for (unsigned int i = 0; i < ARRAY_SIZE(srgb); i++)
 		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), srgb[i]);
 
+	/*
+	 * A gamut not known here (the K114s ADT says "Rec2020") gives no
+	 * target of its own: the panel is described as Display P3, the space
+	 * its surfaces are tagged with, never with zero primaries.
+	 */
+	parser_adt_synthetic_matrix(matrix, 1 << 20);
+	size = parser_adt_color_fixture(adt, sizeof(adt), "Rec2020", sizeof("Rec2020"),
+					matrix, sizeof(matrix));
+	panel = (struct dcp_panel_adt) {};
+	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
+	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
+	KUNIT_EXPECT_NULL(test, dcp_panel_gamut_color_space(panel.gamut));
+	target = dcp_panel_color_target(panel.gamut);
+	KUNIT_EXPECT_PTR_EQ(test, target, dcp_color_space_lookup("display-p3"));
+	raw = panel_color_edid(test, &metadata, target);
+	for (unsigned int i = 0; i < ARRAY_SIZE(p3); i++)
+		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), p3[i]);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 120);
+	/* A known gamut keeps its own space. */
+	KUNIT_EXPECT_PTR_EQ(test, dcp_panel_color_target(DCP_PANEL_GAMUT_SRGB),
+			    dcp_color_space_lookup("srgb"));
+
 	/* Unknown, malformed, short, wrong-version, unbounded, non-neutral or singular. */
 	for (unsigned int fault = 0; fault < 7; fault++) {
 		const char *name = fault == 0 ? "AdobeRGB" : "P3";
@@ -1849,7 +1871,7 @@ static void parser_panel_publication(struct kunit *test,
 	dcp->fw_compat = fw_compat;
 	dcp->panel.width_mm = panel.width_mm;
 	dcp->panel.height_mm = panel.height_mm;
-	dcp->panel.color_target = dcp_panel_gamut_color_space(panel.gamut);
+	dcp->panel.color_target = dcp_panel_color_target(panel.gamut);
 	id->adt = panel.identity;
 	dcp->connector = connector;
 	dcp->modes = &mode;
@@ -2069,6 +2091,12 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
+
+	/* iBoot left the panel at 60 Hz: only the 60 Hz timing, no mode set away from it. */
+	dcp->boot_rate = 60;
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_BAD);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
+	dcp->boot_rate = 0;
 
 	/* The T8142 Air internal DCP (60 Hz panel, firmware 27.0) and the T6050 dcpext keep every mode. */
 	dcp->hw.only_120hz_modes = false;

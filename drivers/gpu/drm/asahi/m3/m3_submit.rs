@@ -365,8 +365,15 @@ impl Queue {
     }
 }
 impl queue::Queue for Queue {
-    fn submit(&mut self,_reg_data:&crate::driver::AsahiRegData<'_>,_id:u64,mut syncs:KVec<file::SyncItem>,in_sync_count:usize,
-        raw:&[u8],objects:Pin<&xarray::XArray<KBox<file::Object>>>)->Result {
+    fn submit(
+        &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
+        _id: u64,
+        mut syncs: KVVec<file::SyncItem>,
+        in_sync_count: usize,
+        raw: &[u8],
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+    ) -> Result {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {

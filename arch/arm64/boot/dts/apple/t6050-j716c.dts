@@ -14,6 +14,8 @@
 /dts-v1/;
 
 #define T6050_J716C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
 /* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
 #define T6050_ATC2_USB4_ROUTER
 #include "t6050-max.dtsi"
@@ -282,49 +284,15 @@
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
-/*
- * Touch ID (ADT spi2/mesa), wired as on the J714s: the Mesa sensor (sensor-id
- * 0x3356) at 8 MHz on chip select 0, powered by NUB GPIO 21 (function-mesa_pwr),
- * data ready on AP GPIO 138. The controller's clock (ADT clock-ids 451) is the
- * 24 MHz reference.
- */
-&ps_nub_gpio {
-	status = "okay";
-};
-
-&nub_gpio0 {
-	status = "okay";
-};
-
-&ps_spi2 {
-	status = "okay";
-};
-
-&spi2 {
-	clocks = <&clkref>;
-	status = "okay";
-
-	mesa: fingerprint@0 {
-		compatible = "apple,mesa-fingerprint";
-		reg = <0>;
-		spi-max-frequency = <8000000>;
-		spi-cpol;
-		spi-cs-setup-delay-ns = <20>;
-		spi-cs-hold-delay-ns = <20>;
-		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
-		interrupt-parent = <&pinctrl_ap>;
-		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
-		/* Per-device factory data from this Mac's own iBoot system container */
-		firmware-name = "apple/mesacal-j716c.bin", "apple/msrk-j716c.bin";
-	};
-};
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-j716c.bin", "apple/msrk-j716c.bin"
+#include "t6050-touchid.dtsi"
 
 #include "t6050-j716c-isp.dtsi"
 #include "t6050-j716c-gpu-panel.dtsi"
 
 #include "t6050-j716c-display.dtsi"
 #include "t6050-j716c-left-usb4.dtsi"
-#include "t6050-j716c-sep.dtsi"
 
 #include "t6050-j716c-sleep.dtsi"
 #include "t6050-j716c-sleep-full.dtsi"
